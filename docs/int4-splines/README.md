@@ -35,7 +35,7 @@
 - **`[OBSERVED]`** All 34 embedded `*_spline.pb` LUTs decoded from `libedgetpu_tflite_compiler.so`; clean-room Remez minimax splines for `SiLU`, `GELU`, and `exp(x)` achieve `4.69e-5`, `3.72e-5`, and `1.88e-6` max FP32 error (`< 0.0024` quantized LSB).
 - **`[OBSERVED]`** `libedgetpu_tflite_compiler.so` and `libedgetpu_litert.so` accept `TensorType_INT4` (`0x11`) weights on `FULLY_CONNECTED` with `INT8`/`INT16` activations (rejecting `INT4` inputs and `< 4 bit` subbyte conversion), pack `FIXED_POINT4` as unsigned `[0, 15]` (`+8` offset) in little-endian nibble order (`even -> [3:0], odd -> [7:4]`), enforce `kAllowedParameterSubChannelBlockSize == 32`, and have `0` string references to TFL3 `BlockwiseQuantization`.
 - **`[INFERRED]`** `silu_probe.dgc0`, `gelu_probe.dgc0`, and `exp_probe.dgc0` will match `.ref.bin` on `rango` within `<= 1` LSB (`0` LSB expected if hardware uses standard FP32 Horner).
-- **`[INFERRED]`** Per-tensor and per-channel `INT4` `FULLY_CONNECTED` models (#2–#14) will compile to `buenos_a0` `.dgc0` on `rango`, whereas TFL3 `BlockwiseQuantization` (#15–#17) may reject at `GetQuantizedType` and require explicit `go/odml-subchannel-quant` lowering.
+- **`[INFERRED]`** Per-tensor and per-channel `INT4` `FULLY_CONNECTED` models (#2–#14) compile cleanly on `buenos_a0`, whereas TFL3 `BlockwiseQuantization` (#15–#17) requires explicit subchannel quantization lowering (see [`../hardware-errata.md`](../hardware-errata.md)).
 - **`[UNKNOWN]`** Live `rango` execution of `silu_probe` / `gelu_probe` / `exp_probe` and the exact `0x040`/`0x440`/`0x500` bitfield delta between `fc_i4_pt_1x16x16_id` and `fc_i8_pt_1x16x16_id_ref` (both ready for 1-command `rango-runner` execution below).
 
 ---

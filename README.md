@@ -1,30 +1,34 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/hero-banner-dark.png">
-    <source media="(prefers-color-scheme: light)" srcset=".github/assets/hero-banner-light.png">
-    <img alt="FreeTPU — Bare-metal open-source runtime, VLIW ISA, and llama.cpp backend for Google Pixel Tensor TPU" src=".github/assets/hero-banner-dark.png" width="100%">
+    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/banner-dark.jpg">
+    <source media="(prefers-color-scheme: light)" srcset=".github/assets/banner-light.jpg">
+    <img alt="FreeTPU — Bare-metal open-source runtime, VLIW ISA, and llama.cpp backend for Google Pixel Tensor TPU" src=".github/assets/banner-dark.jpg" width="100%">
   </picture>
 </p>
 
 <p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-3ECF8E?style=flat-square" alt="Apache-2.0 License"></a>
-  <img src="https://img.shields.io/badge/target-Tensor%20G5%20(buenos__a0)-38BDF8?style=flat-square" alt="Target: Tensor G5 buenos_a0">
-  <img src="https://img.shields.io/badge/runtime-C%2B%2B17%20%2F%20Zero%20.so-F0B44C?style=flat-square" alt="Runtime: C++17 Zero .so">
-  <img src="https://img.shields.io/badge/backend-llama.cpp%20EDGETPU-38BDF8?style=flat-square" alt="Backend: llama.cpp EDGETPU">
-  <a href=".github/workflows/ci.yml"><img src="https://img.shields.io/badge/CI-Build%20%26%20Clean--Room-3ECF8E?style=flat-square" alt="CI: Build & Clean-Room Audit"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-3ECF8E?style=flat-square&labelColor=11151B" alt="Apache-2.0 License"></a>
+  <img src="https://img.shields.io/badge/target-Tensor%20G5%20(buenos__a0)-38BDF8?style=flat-square&labelColor=11151B" alt="Target: Tensor G5 buenos_a0">
+  <img src="https://img.shields.io/badge/runtime-C%2B%2B17%20%2F%20Zero%20.so-F0B44C?style=flat-square&labelColor=11151B" alt="Runtime: C++17 Zero .so">
+  <img src="https://img.shields.io/badge/backend-llama.cpp%20EDGETPU-38BDF8?style=flat-square&labelColor=11151B" alt="Backend: llama.cpp EDGETPU">
+  <a href=".github/workflows/ci.yml"><img src="https://img.shields.io/badge/CI-Build%20%26%20Clean--Room-3ECF8E?style=flat-square&labelColor=11151B" alt="CI: Build & Clean-Room Audit"></a>
 </p>
 
 <p align="center">
   <a href="#60-second-quickstart">Quickstart</a> &middot;
   <a href="#architecture">Architecture</a> &middot;
   <a href="#verified-silicon--host-results">Benchmarks</a> &middot;
+  <a href="#hardware-errata--w8a16-bf16-unlock">Hardware Errata</a> &middot;
   <a href="#documentation">ISA Docs</a> &middot;
-  <a href="#clean-room-boundaries--firmware-extraction">Clean-Room Boundary</a> &middot;
-  <a href="#extracting-dive_interp_rv64bin-on-device">Extract Firmware</a>
+  <a href="#clean-room-boundaries--firmware-extraction">Clean-Room Boundary</a>
 </p>
 
 <p align="center">
   <strong>Clean-room userspace runtime, closed-form VLIW ISA synthesizer, and <code>llama.cpp</code> GGML backend driving Google Pixel Tensor G5 TPU directly over <code>/dev/edgetpu-soc</code> with zero proprietary vendor <code>.so</code> dependencies.</strong>
+</p>
+
+<p align="center">
+  <img alt="FreeTPU mascot breakdancing on its delidded IHS hood" src=".github/assets/freetpu-breakdance.gif" width="160">
 </p>
 
 ---
@@ -84,7 +88,15 @@ All hardware metrics below were measured on Google Pixel 10 Pro Fold (`rango`, T
 | **Novel Bare-Metal Multi-Tile Kernels** | `7` custom `(M, K, N)` GEMM microkernels (no TFLite compiler) | **`3,368/3,368` output bytes exact** (`max_abs_err = 0`), `420–504 us` HW (`~2.3x–3.7x` faster mean wall latency vs vendor stack) |
 | **`0x640` Minimax Splines & Fusion** | `SiLU`, `GELU`, `exp(x)` probes + `4` Mode-A fused `GEMM + SiLU/GELU` probes | **`12,288/12,288` bytes exact** (`max_abs_err = 0`, `461–600 us` HW), `+0 B` fusion overhead |
 | **`libopenbuenos` Live Silicon Self-Test** | `16x128x128`, `1x512x256`, `1x576x1536`, `16x576x576` (`INT8` & `F32 x Q8_0`) | **`max_abs_err = 0`** (`INT8`), `f32_nmse <= 1.87e-4`, `100%` token-invariant cache hits (`36/36`, `81/81`) |
+| **Native `W8A16 (BF16)` FP32-I/O GEMM** | `1x64x32` (`2,048 B` `u8` + `128 B` per-channel `FP32` scales) | **`32/32` bit-exact `FP32`** (`max_abs_err = 0.0`, `411–426 us` HW, zero Google `.so`s) |
 | **`ggml-edgetpu` Backend Ops** | `test-backend-ops -b EDGETPU -o MUL_MAT` (`Q8_0`/`F32`) | **`223/223` PASS** (`104/104` `q8_0 x f32`), `DT_NEEDED = [libdl.so, libm.so, libc.so]` |
+
+---
+
+## Hardware Errata & `W8A16 (BF16)` Unlock
+
+- **`DEQUANTIZE(INT4) -> FULLY_CONNECTED(FP32)` Compiler Deadlock ([LiteRT#12178](https://github.com/google-ai-edge/LiteRT/issues/12178))**: Live silicon ablation proves Tensor G5 (`buenos_a0`) has **no native 4-bit nibble-unpack DMA or systolic unit**. Descriptor `0x980` (`w8[21] = 1`, `w8[29:22] = zp`) is a **`1:2` hardware `UINT8 -> BFLOAT16` expander** (`BF16(float(u8 - zp))`, `16/16` exact at `398 us`), so emitting `1,024 B` of nibbles delivers `2,048 B` instead of `4,096 B` of `BF16` to the MAC and stalls execution indefinitely. **FreeTPU rule**: unpack `Q4_0` weights once at load time into cached `uint8` DMA-BUFs (same `1 B/weight` TPU DMA bandwidth as `Q8_0`), eliminating per-token CPU unpack overhead.
+- **Native `W8A16 (BF16)` FP32-I/O GEMM Unlock**: Unpacking to `2,048 B` `uint8` (`w + 8`) + `128 B` per-channel `float32` scales at `+0x800` executes **`FP32 in -> BF16 MAC (1:2 u8->BF16 weight dequant) -> per-channel FP32 scale -> FP32 out`** natively on silicon in **`411–426 us`** (`32/32` bit-exact `FP32`, `max_abs_err = 0.0`). Local LLMs get full `BF16` activation precision (zero `INT8` clipping loss) at `Q8_0` DRAM bandwidth. See [docs/hardware-errata.md](docs/hardware-errata.md).
 
 ---
 
@@ -121,6 +133,7 @@ export OPENBUENOS_DIVE_INTERP_PATH=/data/local/tmp/tpu_open_stack/dive_interp_rv
 ## Documentation
 
 - [Hardware & Driver Specs](docs/hardware-specs.md) — Tensor G5 (`buenos_a0`) geometry, `buenos.ko` ABI, rounding & SRAM layout
+- [Hardware Errata & W8A16 (BF16)](docs/hardware-errata.md) — `DEQUANTIZE(INT4)` deadlock root cause, `Q4_0` caching rule & `W8A16 (BF16)` FP32 GEMM unlock
 - [Litebuf VII Wire Protocol](docs/baremetal-vii/litebuf_vii_protocol.md) — Two-layer `0x0008 -> 0x00fe` command/response framing & 16-credit ring
 - [Multi-Tile GEMM ISA](docs/isa-gemm/multitile_gemm_isa.md) — Shadow-CSR bank, `4x4` serpentine grid, 2D DMA rewind, `DIVE`/`DWS0`/`DGC0` layout
 - [INT4 (`W4A8`) & Kernel Fusion](docs/isa-gemm/int4_and_fusion_spec.md) — `CSR 0x56`, 4-bit nibble packing (`50%` BW savings), Mode-A `GEMM + SiLU/GELU`

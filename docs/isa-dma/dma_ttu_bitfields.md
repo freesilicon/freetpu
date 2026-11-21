@@ -1,6 +1,6 @@
 # Tensor G5 (`buenos_a0`) DMA, TTU & SRAM Tiling Bitfields
 
-Exact offline-recovered `buenos_a0` DMA, Tensor Traversal Unit (TTU), DIVE IR binding, and SRAM scaling specification across **77 compiled `.dgc0` artifacts** (`3` baseline + `27` Batch 0 + `35` Batch 1 + `12` Batch 2, spanning `1 B .. 262,144 B`) cross-checked against `libedgetpu_tflite_compiler.so` (`lga_tpu_20260603.0.0`, CL `925724637`).
+Exact offline-recovered `buenos_a0` DMA, Tensor Traversal Unit (TTU), DIVE IR binding, and SRAM scaling specification across **77 compiled `.dgc0` artifacts** (`3` baseline + `27` Batch 0 + `35` Batch 1 + `12` Batch 2, spanning `1 B .. 262,144 B`).
 
 - **Machine-verified decoder**: [verify_dma_decoder.py](../../tools/verify_dma_decoder.py) (`0` failures across all `77` `.dgc0`s: `74` TPU models + `3` RV64-only `Reshape` models)
 - **Hardware config source**: `compiler__buenos_a0_config.txt` (`2` cores, `16` tiles `[4x4 snake]`, `786,432 B` narrow memory/core, `1,048,576 B` shared memory unit, `1` instruction queue, `1` DMA descriptor queue, `1` DMA data queue, `4` sync watchers)

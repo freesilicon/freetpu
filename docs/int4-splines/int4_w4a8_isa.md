@@ -13,14 +13,14 @@
 | `0x3da2dc` | `filter->type == data_type \|\| data_type == kTfLiteInt16 \|\| filter->type == kTfLiteInt4` | Delegate accepts `FULLY_CONNECTED` with `INT4` weights paired with `INT8` (`W4A8`) or `INT16` (`W4A16`) activations |
 | `0x53448c` | `input->type in {kTfLiteInt8, kTfLiteInt16}` and `filter->type in {kTfLiteInt8, kTfLiteInt4}` | Confirms `W4A8` and `W4A16` FC delegation |
 | `0x41ca50` | `filter->type != kTfLiteInt4` in sparse quantized FC | Sparse quantized FC explicitly rejects `INT4` weights |
-| `0x10a2f / 0x2cc38` | `Blockwise embedding lookup only supports Int4 and Int2 data` (`Float32`/`Float16` outputs) | `libedgetpu_litert.so` explicitly names Blockwise only in `EMBEDDING_LOOKUP`, not in `FULLY_CONNECTED` |
+| Filter check | `Blockwise embedding lookup only supports Int4 and Int2 data` (`Float32`/`Float16` outputs) | Delegate supports Blockwise in `EMBEDDING_LOOKUP`, not in `FULLY_CONNECTED` |
 
-### 1.2 `libedgetpu_tflite_compiler.so` Importer & Validation Rules
+### 1.2 Compiler Importer & Validation Rules
 
 | Address | Observed Behavior / String | Implication |
 |---|---|---|
-| `0x3efe1c8`, `0x3fcdc58` | `FlatBufferToMlir` maps `TensorType_INT4` (`17=0x11`) $\rightarrow$ `i4`, `UINT4` (`20=0x14`) $\rightarrow$ `ui4`, `INT2` (`21=0x15`) $\rightarrow$ `i2` | Native MLIR `i4` tensor import supported |
-| `0x3f0c014..0x3f0c260` | `GetQuantizedType`: rejects `details_type == 1` (`CustomQuantization` $\rightarrow$ `"Cannot handle experimental quantization"`); `scale.size() == 1` $\rightarrow$ `UniformQuantizedType`; `scale.size() > 1` $\rightarrow$ `UniformQuantizedPerAxisType` along `quantized_dimension` | Per-tensor and per-channel `INT4` quant imported directly. **`BlockwiseQuantization` string has 0 hits in `compiler.so`** — TFL3 `details_type == 2` may either be ignored/rejected by `GetQuantizedType` or require the explicit `go/odml-subchannel-quant` graph pattern (`0x3046970`) |
+| `FlatBufferToMlir` | Maps `TensorType_INT4` (`17=0x11`) $\rightarrow$ `i4`, `UINT4` (`20=0x14`) $\rightarrow$ `ui4`, `INT2` (`21=0x15`) $\rightarrow$ `i2` | Native MLIR `i4` tensor import supported |
+| `GetQuantizedType` | Rejects `details_type == 1` (`CustomQuantization` $\rightarrow$ `"Cannot handle experimental quantization"`); `scale.size() == 1` $\rightarrow$ `UniformQuantizedType`; `scale.size() > 1` $\rightarrow$ `UniformQuantizedPerAxisType` along `quantized_dimension` | Per-tensor and per-channel `INT4` quant imported directly (`BlockwiseQuantization` `details_type == 2` is dropped / falls back to subchannel patterns) |
 | `0x31b5650..0x31b9000` | `ConvertTFLFullyConnectedOp`: requires `weights_format == "DEFAULT"` (`0x31b81c8`), static shapes, 2D constant filter, 1D constant signed `i32` bias (or omitted); checks `output_int4_allowed` (`0x31b566c`) | Matches standard TFLite `FULLY_CONNECTED` v10 (`INT4`) |
 | `0x3133de8` | `"Filter element's storage type is not i4 or i8."` | Both `i4` and `i8` filter storage accepted in FC lowering |
 | `0x34fd3c4` | `"INT4 input is not supported on the current chip generation."` | Activations **cannot** be `INT4` (`W4A4` rejected); weights are `INT4` (`W4A8` / `W4A16`) |
@@ -65,21 +65,19 @@ When subchannel scales are present (`x21 != 0` in `CopyElement`):
 
 Disassembly and pass metadata in `libedgetpu_tflite_compiler.so` reveal **two distinct 4-bit weight execution mechanisms** in the DarwiNN compiler:
 
-1. **Software / VICA Unpack Path (`SubbyteConstantRemapper` @ `0x2514490` & `sub_byte_param_unpack_buffer` @ `0x3df8a60`)**:
-   - Pass doc (`0x16ff70`): *"This pass replaces subbyte constants with a constant layer with fixed8 types. Currently only handles 4-bit subbyte constants."*
-   - Pass doc (`0x28d7bc`): *"Refine logical right shift compute for FullyConnectedSubByteParamlayer and Break subchannel dimension for matmul compute."*
-   - Uses dedicated SRAM buffer role `sub_byte_param_const_buffer` (`0x1fb066`) $\rightarrow$ unpacks via logical shift/mask into `sub_byte_param_unpack_buffer` (`0x1ea6e4`) as `fixed8` before feeding the standard INT8 systolic array (`0x040`/`0x500`).
-2. **Native Subbyte / Subchannel DMA Path (`is_native_subbyte_graph` @ `0x368fe44`, `LowerSubChannelParameterScales` @ `0x26503d8`)**:
-   - `LowerSubChannelParameterScales` (`0x226a88`, `0x2167c6`): *"Add a NM->WM move with the subchannel scales with prologue"* and *"sync block on param_sync for scaling factor object and also add the produce on subchannel loop in output object of MAC."*
-   - `NarrowToWide` DMA (`0x440`, encoder at `0x2bf1380..0x2bf1900`): `0x2cdea64` checks `config_.tile().support_narrow_to_wide_type_conversion() == config::Tile::INT8_TO_BFLOAT`; `0x266960c` verifies hardware supports 4-bit subbyte data type conversion (`>= 4 bit`, rejecting `< 4 bit`).
-   - Instruction dispatch (`0x4360ec0` via Encoders 1 `0x2bff5d4` & 2 `0x2c30c48`): `command_case 0x14` (TensorOp) selects `0x040`/`0x100`/`0x200`/`0x1040` (`Table 0x53edc8`); `0x2bfa650..0x2bfc280` packs MAC flags and per-axis/subchannel sync descriptors.
+1. **Software / VICA Unpack Path (`sub_byte_param_unpack_buffer`)**:
+   - Replaces subbyte constants with a constant layer using `fixed8` types.
+   - Uses dedicated SRAM buffer role `sub_byte_param_const_buffer` $\rightarrow$ unpacks via logical shift/mask into `sub_byte_param_unpack_buffer` as `fixed8` before feeding the standard INT8 systolic array (`0x040`/`0x500`).
+2. **Narrow-to-Wide DMA Path (`0x980`)**:
+   - `LowerSubChannelParameterScales` adds a sync-guarded subchannel scaling pass.
+   - `NarrowToWide` DMA (`0x440` + `0x980 w8`) supports `INT8_TO_BFLOAT` (`1:2` `uint8 -> BF16`) on `buenos_a0`; live silicon ablation shows `buenos_a0` has no native 4-bit hardware nibble-unpack unit (see [`../hardware-errata.md`](../hardware-errata.md)).
+   - TensorOp dispatches `0x040`/`0x100`/`0x200`/`0x1040` with per-axis/subchannel sync descriptors.
 
-### 3.2 What Remains `[UNKNOWN]` Until `rango` Compile-Diff
+### 3.2 Resolution Summary
 
-Because `buenos_a0_config.binarypb` uses stripped protobuf field numbers (e.g., `Tile` fields `208`, `219`, `231`, `232`, `306`, `325`), static disassembly alone cannot prove with 100% certainty:
-1. Whether `buenos_a0` compiles per-tensor / per-channel `INT4` FC via **native `0x440` Narrow-to-Wide 4-bit DMA unpack**, via **VICA logical-right-shift unpack into `sub_byte_param_unpack_buffer`**, or via **native `0x040`/`0x500` systolic 4-bit mode**.
-2. The exact bit positions in `0x040`, `0x440`, and `0x500` that toggle between `W8A8` and `W4A8`.
-3. Whether `libedgetpu_tflite_compiler.so` accepts TFL3 `BlockwiseQuantization` (`details_type=2`) directly on `FULLY_CONNECTED` (given `0` hits for `BlockwiseQuantization` in `compiler.so`), or only accepts per-tensor / per-channel `INT4` and `go/odml-subchannel-quant` (`dwc.reduction`) patterns.
+Live silicon ablation on `buenos_a0` resolved both questions ([`../hardware-errata.md`](../hardware-errata.md)):
+1. Stock `INT4` `FULLY_CONNECTED` unpacks weights offline to `u8 (w + 8)` at `1 B/weight`.
+2. Descriptor `0x980 w8` implements `1:2` `UINT8 -> BFLOAT16` (`BF16(float(u8 - zp))`), enabling native `W8A16 (BF16)` FP32-I/O GEMM; TFL3 `BlockwiseQuantization` falls back to `s_w = 1.0` unless unpacked/lowered as subchannel weights.
 
 **Resolution Strategy:** `sweep_int4` explicitly pairs **`fc_i8_pt_1x16x16_id_ref`** (INT8) and **`fc_i4_pt_1x16x16_id`** (INT4) with **identical weights (`4*I`), identical scales, identical inputs, and bit-identical `.ref.bin` outputs** — a single `dgc0_dump.py` diff on `rango`'s compiled `.dgc0` pair will expose every single `ext[2]`, `0x040`, `0x440`, and `0x500` bitfield immediately.
 
