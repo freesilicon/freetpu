@@ -2,6 +2,10 @@
  * Fallback offline mock shim for openbuenos.h when libopenbuenos.a is not yet built.
  * Replaced automatically at link time once libopenbuenos/build/{android-arm64,host}/libopenbuenos.a exists.
  */
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "openbuenos.h"
 
 #include <math.h>
