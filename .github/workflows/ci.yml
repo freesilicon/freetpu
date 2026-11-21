@@ -1,0 +1,103 @@
+name: FreeTPU CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  host-build-and-test:
+    name: Host Build, Header Checks & Self-Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build python3-numpy
+
+      - name: Configure & build libopenbuenos (CMake)
+        run: |
+          cmake -S libopenbuenos -B build-cmake -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-cmake -j"$(nproc)"
+          ctest --test-dir build-cmake --output-on-failure
+
+      - name: Build & test libopenbuenos (Make)
+        run: |
+          make -C libopenbuenos verify-header-host host test
+          make -C libopenbuenos clean
+
+      - name: Build bare-metal runtime (Linux UAPI headers)
+        run: |
+          cmake -S runtime -B build-runtime -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-runtime -j"$(nproc)"
+          clang -x c -std=c11 -fsyntax-only -Wall -Wextra -Werror docs/baremetal-vii/litebuf_vii_wire.h
+          clang++ -x c++ -std=c++17 -fsyntax-only -Wall -Wextra -Werror docs/baremetal-vii/litebuf_vii_wire.h
+          clang -x c -std=c11 -fsyntax-only -Wall -Wextra -Werror docs/kernel-abi/gcip_uapi.h
+          clang -x c -std=c11 -fsyntax-only -Wall -Wextra -Werror docs/kernel-abi/edgetpu_buenos_uapi.h
+          clang -x c -std=c11 -fsyntax-only -Wall -Wextra -Werror docs/kernel-abi/gxp_laguna_uapi.h
+          clang -x c -std=c11 -fsyntax-only -Wall -Wextra -Werror -Ilibopenbuenos/include llama-cpp-edgetpu/openbuenos_shim.c
+
+      - name: Run Python ISA & DGC0 tool self-tests
+        run: |
+          for f in tools/dgc0/*.py tools/*.py; do
+            if [ "$(basename "$f")" != "multitile_synth.py" ]; then
+              python3 "$f" --help >/dev/null
+            fi
+          done
+          python3 tools/emit_custom_gemm.py --self-test
+          python3 tools/dgc0_builder.py --self-test
+          python3 tools/spline_0x640.py --self-test --no-emit
+          python3 tools/pack_int4.py
+          python3 tools/verify_full_isa_81.py
+          python3 tools/verify_dma_decoder.py
+          python3 tools/verify_int4_19.py
+          python3 tools/verify_fusion_lut.py
+          python3 tools/verify_patch_proof.py
+
+  clean-room-audit:
+    name: Clean-Room & OSS Boundary Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify zero forbidden binaries or private paths
+        run: |
+          python3 - <<'PY'
+          import re, subprocess, sys
+          from pathlib import Path
+
+          tracked = subprocess.check_output(["git", "ls-files"], text=True).splitlines()
+          bad_exts = (".so", ".ko", ".img", ".apk", ".gguf", ".tflite", ".dgc0", ".dmg0")
+          bad_names = ("dive_interp_rv64.bin",)
+          errors = []
+
+          for rel in tracked:
+              p = Path(rel)
+              if p.name in bad_names or p.name.endswith(bad_exts) or ".so." in p.name or rel.endswith(".bin"):
+                  errors.append(f"Forbidden binary file: {rel}")
+                  continue
+              data = p.read_bytes()
+              if data[:4] in (b"\x7fELF", b"TFL3", b"GGUF") or data[4:8] in (b"DGC0", b"DWS0", b"DGD0", b"DMG0"):
+                  errors.append(f"Forbidden binary magic in {rel}")
+                  continue
+              if p.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
+                  text = data.decode("utf-8", errors="ignore")
+                  forbidden_pats = (
+                      r"/" + r"Users/",
+                      r"saari" + r"-co",
+                      r"ro\.boot\.hw\." + r"soc\.id",
+                      r"file" + r"://",
+                  )
+                  for pat in forbidden_pats:
+                      if re.search(pat, text):
+                          errors.append(f"Forbidden pattern {pat!r} in {rel}")
+
+          if errors:
+              for e in errors:
+                  print("ERROR:", e)
+              sys.exit(1)
+          print(f"Clean-room audit PASSED across {len(tracked)} tracked files.")
+          PY
