@@ -600,7 +600,7 @@ ob_status_t device_wait_handle(ob_context* ctx,
     stats.seq = slot->seq;
     stats.model_handle = completed_entry ? completed_entry->model_handle : 0u;
     stats.vii_resp_code = slot->vii_resp_code;
-    stats.flags = ctx->mock_mode ? OB_STAT_FLAG_MOCK : 0u;
+    stats.flags = ctx->mock_mode ? static_cast<uint32_t>(OB_STAT_FLAG_MOCK) : 0u;
     stats.tiles_dispatched = 1u;
 
     result = (slot->state == CreditSlot::COMPLETED) ? OB_OK : slot->error_status;
