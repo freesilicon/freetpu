@@ -628,7 +628,8 @@ struct BaremetalSession {
       }
       if (pfds[0].revents & POLLIN) {
         uint64_t val = 0;
-        ::read(resp_efd, &val, sizeof(val));
+        ssize_t rrc = ::read(resp_efd, &val, sizeof(val));
+        (void)rrc;
       }
     }
   }
