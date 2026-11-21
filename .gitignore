@@ -1,0 +1,46 @@
+# Build artifacts
+build/
+build-*/
+*/build/
+*/build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+
+# Vendor / model / firmware / container binaries (strictly excluded)
+*.dgc0
+*.dmg0
+*.tflite
+*.gguf
+*.so.*
+*.ko
+*.img
+*.apk
+dive_interp_rv64.bin
+*.in.bin
+*.ref.bin
+*.out.bin
+
+# Upstream llama.cpp checkouts inside llama-cpp-edgetpu/
+llama-cpp-edgetpu/upstream/
+
+# OS / editor noise
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/
