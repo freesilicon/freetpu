@@ -25,7 +25,7 @@ import ssl
 import sys
 import threading
 import time
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 import uuid
 
@@ -77,6 +77,7 @@ MAX_METRIC_MODEL_LABELS = 256
 MAX_RR_CURSORS = 1024
 MAX_PROBE_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_ERROR_RESPONSE_BYTES = 1024 * 1024
+MAX_MODEL_ID_LEN = 256
 REQUEST_MEMORY_PARSE_MULTIPLIER = 4
 _API_VERSION_SUFFIX_RE = re.compile(r"/v\d+(?:alpha|beta\d*)?$")
 _LOG_CONTROL_CHAR_TABLE = str.maketrans(
@@ -134,6 +135,10 @@ def _extract_models_list(parsed: Any) -> Optional[List[str]]:
 
 class _UpstreamResponseTooLargeError(http.client.HTTPException):
     """Raised when an upstream non-streaming HTTP body exceeds the byte cap."""
+
+
+class _MemoryBudgetExceededError(Exception):
+    """Raised when buffering a response would exceed the shared router memory budget."""
 
 
 class _HeaderSizeLimitExceeded(Exception):
@@ -206,8 +211,10 @@ def _read_bounded_http_response(
     deadline: float,
     label: str = "Upstream response",
     chunk_size: int = 65536,
+    reserve_fn: Optional[Callable[[int], bool]] = None,
+    reserved_out: Optional[List[int]] = None,
 ) -> bytes:
-    """Incrementally read an HTTP response body under both a byte cap and elapsed deadline."""
+    """Incrementally read an HTTP response body under byte cap, memory budget, and elapsed deadline."""
     declared_len: Optional[int] = None
     if not resp.chunked:
         raw_len = resp.getheader("Content-Length")
@@ -222,6 +229,13 @@ def _read_bounded_http_response(
                     raise _UpstreamResponseTooLargeError(
                         f"{label} Content-Length ({declared_len} bytes) exceeded {max_bytes} byte limit"
                     )
+                if declared_len > 0 and reserve_fn is not None:
+                    if not reserve_fn(declared_len):
+                        raise _MemoryBudgetExceededError(
+                            "Router response memory budget exhausted"
+                        )
+                    if reserved_out is not None:
+                        reserved_out[0] += declared_len
     chunks: List[bytes] = []
     total = 0
     while True:
@@ -246,6 +260,13 @@ def _read_bounded_http_response(
             raise _UpstreamResponseTooLargeError(
                 f"{label} exceeded {max_bytes} byte limit"
             )
+        if reserve_fn is not None and reserved_out is not None and total > reserved_out[0]:
+            delta = total - reserved_out[0]
+            if not reserve_fn(delta):
+                raise _MemoryBudgetExceededError(
+                    "Router response memory budget exhausted"
+                )
+            reserved_out[0] += delta
         chunks.append(chunk)
     raw = b"".join(chunks)
     if (
@@ -433,6 +454,14 @@ class _BoundedSSEReader:
 
             chunk = self._resp.read1(to_read)
             if not chunk:
+                if (
+                    not self._resp.chunked
+                    and self._resp.status not in (204, 304)
+                    and not (100 <= self._resp.status < 200)
+                    and self._resp.length is not None
+                    and self._resp.length > 0
+                ):
+                    raise http.client.IncompleteRead(bytes(self._buf), self._resp.length)
                 self._eof = True
                 if self._buf:
                     if max_bytes is not None and len(self._buf) > max_bytes:
@@ -965,6 +994,8 @@ class RouterEngine:
         self._metric_models_seen: set[str] = set()
         self._req_mem_lock = threading.Lock()
         self._req_mem_used_bytes = 0
+        self._resp_mem_lock = threading.Lock()
+        self._resp_mem_used_bytes = 0
         self._poller_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._poll_thread: Optional[threading.Thread] = None
@@ -1015,6 +1046,24 @@ class RouterEngine:
             return
         with self._req_mem_lock:
             self._req_mem_used_bytes = max(0, self._req_mem_used_bytes - rel)
+
+    def try_reserve_response_memory(self, amount_bytes: int) -> bool:
+        """Atomically reserve bytes from the shared in-flight response memory budget."""
+        need = max(0, amount_bytes)
+        limit = self.config.max_total_response_memory_bytes
+        with self._resp_mem_lock:
+            if self._resp_mem_used_bytes + need > limit:
+                return False
+            self._resp_mem_used_bytes += need
+            return True
+
+    def release_response_memory(self, amount_bytes: int) -> None:
+        """Release previously reserved bytes back to the shared response memory budget."""
+        rel = max(0, amount_bytes)
+        if rel == 0:
+            return
+        with self._resp_mem_lock:
+            self._resp_mem_used_bytes = max(0, self._resp_mem_used_bytes - rel)
 
     def refresh_all_backends(self) -> None:
         for state in self._backends:
@@ -1469,7 +1518,7 @@ class RouterEngine:
         )
         event = UsageEvent(
             request_id=request_id,
-            model=model,
+            model=model[:MAX_MODEL_ID_LEN],
             backend_id=backend.config.id,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
@@ -1512,7 +1561,7 @@ class RouterEngine:
         )
         event = UsageEvent(
             request_id=request_id,
-            model=model,
+            model=model[:MAX_MODEL_ID_LEN],
             backend_id=backend_id,
             prompt_tokens=0,
             completion_tokens=0,
@@ -1792,6 +1841,61 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                     pass
         return trusted
 
+    def _validate_request_host(self) -> bool:
+        """Validate Host header against trusted listener authorities or configured public_origin."""
+        headers = getattr(self, "headers", None)
+        if headers is None:
+            return False
+        raw_host = headers.get("Host")
+        if not raw_host:
+            return False
+        host_val = raw_host.strip()
+        if (
+            not host_val
+            or any(ch.isspace() for ch in host_val)
+            or "/" in host_val
+            or "@" in host_val
+        ):
+            return False
+        cfg = self.server.engine.config
+        if cfg.public_origin:
+            pub_norm = normalize_origin(cfg.public_origin)
+            if pub_norm is not None:
+                candidate_pub = normalize_origin(f"{pub_norm[0]}://{host_val}")
+                if candidate_pub is not None and candidate_pub == pub_norm:
+                    return True
+        eff_scheme = "https" if isinstance(self.connection, ssl.SSLSocket) else "http"
+        if cfg.trust_proxy_headers:
+            xfp = headers.get("X-Forwarded-Proto")
+            if xfp:
+                candidate = xfp.split(",", 1)[0].strip().lower()
+                if candidate in VALID_URL_SCHEMES:
+                    eff_scheme = candidate
+        host_origin = normalize_origin(f"{eff_scheme}://{host_val}")
+        if host_origin is None:
+            return False
+        _, host_name, _ = host_origin
+        if host_name not in self._trusted_listener_hosts():
+            return False
+        parts = urlsplit(f"{eff_scheme}://{host_val}")
+        bound_port = int(self.server.server_address[1])
+        return parts.port is None or parts.port == bound_port
+
+    def _reject_invalid_host_if_needed(self) -> bool:
+        """Return True and send HTTP 403 if the request Host header is untrusted."""
+        if self._validate_request_host():
+            return False
+        self._send_bytes(
+            403,
+            "application/json",
+            _openai_error_body(
+                "Request Host header is not allowed by router listener policy",
+                error_type="permission_error",
+                code="invalid_host",
+            ),
+        )
+        return True
+
     def _is_same_origin(self, origin: str) -> bool:
         """Return True if `origin` matches configured `public_origin` or a trusted listener authority."""
         parsed_origin = normalize_origin(origin)
@@ -1966,6 +2070,8 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self) -> None:  # noqa: N802
         self.close_connection = True
+        if self._reject_invalid_host_if_needed():
+            return
         allowed, acao = self._resolve_cors_header()
         if not allowed or acao is None:
             self._send_bytes(
@@ -1987,6 +2093,8 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self) -> None:  # noqa: N802
+        if self._reject_invalid_host_if_needed():
+            return
         path = urlsplit(self.path).path
         ctx = self._authorize(path, "GET")
         if ctx is None:
@@ -2013,6 +2121,8 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         )
 
     def do_POST(self) -> None:  # noqa: N802
+        if self._reject_invalid_host_if_needed():
+            return
         origin_allowed, _ = self._resolve_cors_header()
         if not origin_allowed:
             self._send_bytes(
@@ -2144,12 +2254,38 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
 
-            model = str(req_payload.get("model") or "").strip()
+            raw_model = req_payload.get("model")
+            if not isinstance(raw_model, str):
+                self._send_bytes(
+                    400,
+                    "application/json",
+                    _openai_error_body(
+                        "Field 'model' must be a non-empty string",
+                        code="invalid_model_id",
+                    ),
+                )
+                return
+            model = raw_model.strip()
             if not model:
                 self._send_bytes(
                     400,
                     "application/json",
-                    _openai_error_body("Field 'model' is required"),
+                    _openai_error_body(
+                        "Field 'model' is required",
+                        code="invalid_model_id",
+                    ),
+                )
+                return
+            if len(model) > MAX_MODEL_ID_LEN or any(
+                ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F for ch in model
+            ):
+                self._send_bytes(
+                    400,
+                    "application/json",
+                    _openai_error_body(
+                        f"Field 'model' must be at most {MAX_MODEL_ID_LEN} printable characters",
+                        code="invalid_model_id",
+                    ),
                 )
                 return
 
@@ -2272,8 +2408,9 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             raw_sock: Any = None
             deadline_sock: Optional[DeadlineSocket] = None
             committed_flag = [False]
+            resp_mem_reserved = [0]
             non_stream_result: Optional[
-                Tuple[int, str, bytes, float, float, Optional[Mapping[str, Any]]]
+                Tuple[int, str, bytes, float, float, int, int]
             ] = None
             try:
                 scheme, host, port, upstream_path = _join_backend_url(
@@ -2355,7 +2492,8 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                             ),
                             latency_ms,
                             attempt_ms,
-                            None,
+                            0,
+                            0,
                         )
                     elif sse_outcome == "client_error":
                         latency_ms = (time.monotonic() - req_start) * 1000.0
@@ -2370,7 +2508,8 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                             ),
                             latency_ms,
                             attempt_ms,
-                            None,
+                            0,
+                            0,
                         )
                     else:
                         # Pre-first-token stream failure or retryable SSE error: fail over.
@@ -2414,9 +2553,34 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                             max_bytes=max_resp_bytes,
                             deadline=attempt_deadline,
                             label=f"Backend {backend.config.id!r} response",
+                            reserve_fn=engine.try_reserve_response_memory,
+                            reserved_out=resp_mem_reserved,
+                        )
+                    except _MemoryBudgetExceededError:
+                        # Shared response memory budget exhausted: request-scoped 503 without backend cooldown.
+                        if resp_mem_reserved[0] > 0:
+                            engine.release_response_memory(resp_mem_reserved[0])
+                            resp_mem_reserved[0] = 0
+                        latency_ms = (time.monotonic() - req_start) * 1000.0
+                        attempt_ms = (time.monotonic() - attempt_start) * 1000.0
+                        non_stream_result = (
+                            503,
+                            "application/json",
+                            _openai_error_body(
+                                "Router response memory budget exhausted; retry later",
+                                error_type="service_unavailable",
+                                code="server_memory_limit_reached",
+                            ),
+                            latency_ms,
+                            attempt_ms,
+                            0,
+                            0,
                         )
                     except _UpstreamResponseTooLargeError:
                         # Response-size cap is request-scoped: do not penalize backend health or fail over.
+                        if resp_mem_reserved[0] > 0:
+                            engine.release_response_memory(resp_mem_reserved[0])
+                            resp_mem_reserved[0] = 0
                         latency_ms = (time.monotonic() - req_start) * 1000.0
                         attempt_ms = (time.monotonic() - attempt_start) * 1000.0
                         non_stream_result = (
@@ -2429,32 +2593,116 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                             ),
                             latency_ms,
                             attempt_ms,
-                            None,
+                            0,
+                            0,
                         )
                     else:
-                        parsed_json_resp: Optional[Mapping[str, Any]] = None
+                        prompt_tokens_val = 0
+                        completion_tokens_val = 0
                         if 200 <= resp.status < 300:
-                            # Validate close-delimited/chunked 2xx JSON body before recording success
-                            # or forwarding downstream so truncated JSON fails over cleanly.
-                            try:
-                                loaded_resp = json.loads(raw_resp.decode("utf-8"))
-                            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                                raise http.client.IncompleteRead(raw_resp) from exc
-                            if not isinstance(loaded_resp, Mapping):
-                                raise http.client.IncompleteRead(raw_resp)
-                            parsed_json_resp = loaded_resp
-                        latency_ms = (time.monotonic() - req_start) * 1000.0
-                        attempt_ms = (time.monotonic() - attempt_start) * 1000.0
-                        content_type = resp.getheader("Content-Type") or "application/json"
-                        non_stream_result = (
-                            resp.status,
-                            content_type,
-                            raw_resp,
-                            latency_ms,
-                            attempt_ms,
-                            parsed_json_resp,
-                        )
+                            # Reserve parse overhead, validate JSON structure, extract usage, and drop parsed tree.
+                            parse_extra = len(raw_resp) * (REQUEST_MEMORY_PARSE_MULTIPLIER - 1)
+                            if parse_extra > 0:
+                                if not engine.try_reserve_response_memory(parse_extra):
+                                    if resp_mem_reserved[0] > 0:
+                                        engine.release_response_memory(resp_mem_reserved[0])
+                                        resp_mem_reserved[0] = 0
+                                    latency_ms = (time.monotonic() - req_start) * 1000.0
+                                    attempt_ms = (time.monotonic() - attempt_start) * 1000.0
+                                    non_stream_result = (
+                                        503,
+                                        "application/json",
+                                        _openai_error_body(
+                                            "Router response memory budget exhausted; retry later",
+                                            error_type="service_unavailable",
+                                            code="server_memory_limit_reached",
+                                        ),
+                                        latency_ms,
+                                        attempt_ms,
+                                        0,
+                                        0,
+                                    )
+                                    parse_extra = -1
+                                else:
+                                    resp_mem_reserved[0] += parse_extra
+                            if parse_extra >= 0:
+                                try:
+                                    resp_text = raw_resp.decode("utf-8")
+                                    _validate_json_structure(
+                                        resp_text,
+                                        max_depth=engine.config.max_json_depth,
+                                        max_nodes=engine.config.max_json_nodes,
+                                    )
+                                    loaded_resp = json.loads(resp_text)
+                                    del resp_text
+                                except _JsonStructureLimitError:
+                                    if resp_mem_reserved[0] > 0:
+                                        engine.release_response_memory(resp_mem_reserved[0])
+                                        resp_mem_reserved[0] = 0
+                                    latency_ms = (time.monotonic() - req_start) * 1000.0
+                                    attempt_ms = (time.monotonic() - attempt_start) * 1000.0
+                                    non_stream_result = (
+                                        502,
+                                        "application/json",
+                                        _openai_error_body(
+                                            "Upstream response JSON exceeded structural complexity limits",
+                                            error_type="bad_gateway",
+                                            code="response_too_large",
+                                        ),
+                                        latency_ms,
+                                        attempt_ms,
+                                        0,
+                                        0,
+                                    )
+                                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                                    raise http.client.IncompleteRead(raw_resp) from exc
+                                else:
+                                    if not isinstance(loaded_resp, Mapping):
+                                        raise http.client.IncompleteRead(raw_resp)
+                                    prompt_tokens_val, completion_tokens_val = (
+                                        _extract_non_stream_usage(
+                                            raw_resp,
+                                            est_prompt_tokens,
+                                            parsed_resp=loaded_resp,
+                                        )
+                                    )
+                                    del loaded_resp
+                                    if parse_extra > 0:
+                                        engine.release_response_memory(parse_extra)
+                                        resp_mem_reserved[0] = max(
+                                            0, resp_mem_reserved[0] - parse_extra
+                                        )
+                                    latency_ms = (time.monotonic() - req_start) * 1000.0
+                                    attempt_ms = (time.monotonic() - attempt_start) * 1000.0
+                                    content_type = (
+                                        resp.getheader("Content-Type") or "application/json"
+                                    )
+                                    non_stream_result = (
+                                        resp.status,
+                                        content_type,
+                                        raw_resp,
+                                        latency_ms,
+                                        attempt_ms,
+                                        prompt_tokens_val,
+                                        completion_tokens_val,
+                                    )
+                        else:
+                            latency_ms = (time.monotonic() - req_start) * 1000.0
+                            attempt_ms = (time.monotonic() - attempt_start) * 1000.0
+                            content_type = resp.getheader("Content-Type") or "application/json"
+                            non_stream_result = (
+                                resp.status,
+                                content_type,
+                                raw_resp,
+                                latency_ms,
+                                attempt_ms,
+                                0,
+                                0,
+                            )
             except (OSError, TimeoutError, ValueError, http.client.HTTPException) as exc:
+                if resp_mem_reserved[0] > 0:
+                    engine.release_response_memory(resp_mem_reserved[0])
+                    resp_mem_reserved[0] = 0
                 if committed_flag[0]:
                     # Downstream HTTP headers were already committed; never retry, fail over,
                     # or write a second HTTP response into the open stream.
@@ -2476,6 +2724,9 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 prev_failure = (backend.config.id, reason)
                 continue
             finally:
+                if non_stream_result is None and resp_mem_reserved[0] > 0:
+                    engine.release_response_memory(resp_mem_reserved[0])
+                    resp_mem_reserved[0] = 0
                 engine.release_backend(backend)
                 if resp is not None:
                     try:
@@ -2494,50 +2745,48 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         pass
 
             if non_stream_result is not None:
-                (
-                    resp_status,
-                    content_type,
-                    raw_resp,
-                    latency_ms,
-                    attempt_ms,
-                    parsed_json_resp,
-                ) = non_stream_result
-                if 200 <= resp_status < 300:
-                    with engine._lock:
-                        backend.record_latency(attempt_ms)
-                    prompt_tokens, completion_tokens = _extract_non_stream_usage(
+                try:
+                    (
+                        resp_status,
+                        content_type,
                         raw_resp,
-                        est_prompt_tokens,
-                        parsed_resp=parsed_json_resp,
-                    )
-                else:
-                    prompt_tokens = 0
-                    completion_tokens = 0
+                        latency_ms,
+                        attempt_ms,
+                        prompt_tokens,
+                        completion_tokens,
+                    ) = non_stream_result
+                    if 200 <= resp_status < 300:
+                        with engine._lock:
+                            backend.record_latency(attempt_ms)
 
-                engine._record_usage(
-                    request_id=req_id,
-                    model=model,
-                    backend=backend,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    latency_ms=latency_ms,
-                    ttft_ms=latency_ms if 200 <= resp_status < 300 else None,
-                    stream=stream,
-                    failovers=failovers,
-                    principal=auth_ctx.principal,
-                    status_code=resp_status,
-                )
-                # Keep downstream client write failures isolated from backend failover.
-                self._safe_send_bytes(
-                    resp_status,
-                    content_type,
-                    raw_resp,
-                    extra_headers={
-                        "X-FreeTPU-Backend": backend.config.id,
-                        "X-FreeTPU-Failovers": str(failovers),
-                        "X-FreeTPU-Request-Id": req_id,
-                    },
-                )
+                    engine._record_usage(
+                        request_id=req_id,
+                        model=model,
+                        backend=backend,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        latency_ms=latency_ms,
+                        ttft_ms=latency_ms if 200 <= resp_status < 300 else None,
+                        stream=stream,
+                        failovers=failovers,
+                        principal=auth_ctx.principal,
+                        status_code=resp_status,
+                    )
+                    # Keep downstream client write failures isolated from backend failover.
+                    self._safe_send_bytes(
+                        resp_status,
+                        content_type,
+                        raw_resp,
+                        extra_headers={
+                            "X-FreeTPU-Backend": backend.config.id,
+                            "X-FreeTPU-Failovers": str(failovers),
+                            "X-FreeTPU-Request-Id": req_id,
+                        },
+                    )
+                finally:
+                    if resp_mem_reserved[0] > 0:
+                        engine.release_response_memory(resp_mem_reserved[0])
+                        resp_mem_reserved[0] = 0
                 return
 
         total_latency_ms = (time.monotonic() - req_start) * 1000.0

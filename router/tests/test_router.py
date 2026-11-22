@@ -3900,10 +3900,10 @@ class TestFreeTPURouter(unittest.TestCase):
         router = self._track(create_router_server(cfg))
         rport = router.server_address[1]
 
-        huge_a = "huge-model-a-" + ("x" * 32768)
-        huge_b = "huge-model-b-" + ("y" * 32768)
-        seen: Dict[str, List[str]] = {huge_a: [], huge_b: []}
-        for model_name in (huge_a, huge_b, huge_a, huge_b):
+        long_a = "long-model-a-" + ("x" * 180)
+        long_b = "long-model-b-" + ("y" * 180)
+        seen: Dict[str, List[str]] = {long_a: [], long_b: []}
+        for model_name in (long_a, long_b, long_a, long_b):
             status, hdrs, _ = _http_request(
                 rport,
                 "POST",
@@ -3913,9 +3913,11 @@ class TestFreeTPURouter(unittest.TestCase):
             self.assertEqual(status, 200)
             seen[model_name].append(hdrs["x-freetpu-backend"])
 
-        self.assertEqual(seen[huge_a], ["wc-hash-a", "wc-hash-b"])
-        self.assertEqual(seen[huge_b], ["wc-hash-a", "wc-hash-b"])
-        self.assertEqual(len(router.engine._rr_cursors), 2)
+        self.assertEqual(seen[long_a], ["wc-hash-a", "wc-hash-b"])
+        self.assertEqual(seen[long_b], ["wc-hash-a", "wc-hash-b"])
+        # Programmatic select_candidates with huge model names also stores fixed 32-byte digests.
+        router.engine.select_candidates("huge-direct-" + ("z" * 32768), policy="round_robin")
+        self.assertEqual(len(router.engine._rr_cursors), 3)
         for cursor_key in router.engine._rr_cursors.keys():
             self.assertIsInstance(cursor_key, bytes)
             self.assertEqual(len(cursor_key), 32)
@@ -5653,6 +5655,315 @@ class TestFreeTPURouter(unittest.TestCase):
             router.engine._backends[0].cooldown_until_monotonic,
             time.monotonic(),
         )
+
+    def test_shared_response_memory_budget_bounds_buffered_responses(self) -> None:
+        valid_b = BackendConfig(id="ok-b", base_url="http://127.0.0.1:8081/v1")
+        with self.assertRaises(ValueError):
+            RouterConfig(backends=[valid_b], max_total_response_memory_bytes=0)
+
+        # Case 1: Both Content-Length and chunked responses exceeding the shared response
+        # memory budget return HTTP 503 WITHOUT putting the backend in cooldown.
+        for chunked in (False, True):
+            with self.subTest(chunked=chunked):
+                backend = self._track(
+                    _MockOpenAIBackend(
+                        "resp-mem-b",
+                        ["m-respmem"],
+                        oversized_non_stream_bytes=1500,
+                        oversized_non_stream_chunked=chunked,
+                    )
+                )
+                cfg = RouterConfig(
+                    host="127.0.0.1",
+                    port=0,
+                    max_response_body_bytes=65536,
+                    max_total_response_memory_bytes=1200,
+                    backends=[
+                        BackendConfig(
+                            id="resp-mem-b",
+                            type="pixel-tpu",
+                            local=True,
+                            base_url=backend.base_url,
+                        )
+                    ],
+                )
+                router = self._track(create_router_server(cfg))
+                rport = router.server_address[1]
+
+                status, hdrs, body = _http_request(
+                    rport,
+                    "POST",
+                    "/v1/chat/completions",
+                    body={
+                        "model": "m-respmem",
+                        "messages": [{"role": "user", "content": "big reply"}],
+                    },
+                )
+                self.assertEqual(status, 503)
+                self.assertIn("server_memory_limit_reached", body.decode("utf-8"))
+                self.assertEqual(hdrs["x-freetpu-failovers"], "0")
+                self.assertEqual(router.engine._resp_mem_used_bytes, 0)
+                self.assertEqual(router.engine._backends[0].inflight, 0)
+                self.assertEqual(router.engine._backends[0].cooldown_until_monotonic, 0.0)
+                self.assertTrue(router.engine._backends[0].healthy)
+
+                # Small response within budget succeeds cleanly on the same healthy backend.
+                backend.oversized_non_stream_bytes = None
+                st_ok, _, _ = _http_request(
+                    rport,
+                    "POST",
+                    "/v1/chat/completions",
+                    body={
+                        "model": "m-respmem",
+                        "messages": [{"role": "user", "content": "small reply"}],
+                    },
+                )
+                self.assertEqual(st_ok, 200)
+                self.assertEqual(router.engine._resp_mem_used_bytes, 0)
+
+    def test_local_get_endpoints_reject_untrusted_host_without_origin(self) -> None:
+        backend = self._track(_MockOpenAIBackend("host-guard-b", ["m-hostguard"]))
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            auth={"type": "bearer", "tokens": ["tok-1"]},
+            backends=[
+                BackendConfig(
+                    id="host-guard-b",
+                    base_url=backend.base_url,
+                    models=["m-hostguard"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        # DNS-rebound Host on GET /health, /metrics, /v1/models with NO Origin header -> 403!
+        for path in ("/health", "/metrics", "/v1/models"):
+            st_bad, _, bd_bad = _http_request(
+                rport,
+                "GET",
+                path,
+                headers={"Host": f"evil.example:{rport}"},
+            )
+            self.assertEqual(st_bad, 403)
+            self.assertIn("invalid_host", bd_bad.decode("utf-8"))
+            self.assertNotIn(backend.base_url, bd_bad.decode("utf-8"))
+
+        # Wrong port on loopback Host -> 403.
+        wrong_port = rport + 1 if rport < 65000 else rport - 1
+        st_wp, _, _ = _http_request(
+            rport,
+            "GET",
+            "/health",
+            headers={"Host": f"127.0.0.1:{wrong_port}"},
+        )
+        self.assertEqual(st_wp, 403)
+
+        # Legitimate loopback Host headers succeed.
+        for good_host in (f"127.0.0.1:{rport}", f"localhost:{rport}"):
+            st_ok, _, _ = _http_request(
+                rport,
+                "GET",
+                "/health",
+                headers={"Host": good_host},
+            )
+            self.assertEqual(st_ok, 200)
+
+        # Configured public_origin host also permitted on GET /health without Origin.
+        cfg_pub = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            public_origin="https://api.example.com",
+            backends=[
+                BackendConfig(
+                    id="host-guard-b",
+                    base_url=backend.base_url,
+                    models=["m-hostguard"],
+                )
+            ],
+        )
+        router_pub = self._track(create_router_server(cfg_pub))
+        rport_pub = router_pub.server_address[1]
+        st_pub_ok, _, _ = _http_request(
+            rport_pub,
+            "GET",
+            "/health",
+            headers={"Host": "api.example.com"},
+        )
+        self.assertEqual(st_pub_ok, 200)
+        st_pub_bad, _, _ = _http_request(
+            rport_pub,
+            "GET",
+            "/health",
+            headers={"Host": "other.example.com"},
+        )
+        self.assertEqual(st_pub_bad, 403)
+
+    def test_oversized_and_non_string_model_ids_rejected_before_metering(self) -> None:
+        backend = self._track(_MockOpenAIBackend("model-guard-b", ["m-ok"]))
+        jsonl_path = Path(self._tmpdir.name) / "bounded_model_usage.jsonl"
+        captured: List[UsageEvent] = []
+        usage_hook = JsonlUsageMeterHook(jsonl_path, callback=captured.append)
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            backends=[
+                BackendConfig(
+                    id="model-guard-b",
+                    base_url=backend.base_url,
+                    models=["m-ok"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg, usage_hook=usage_hook))
+        rport = router.server_address[1]
+
+        for bad_model in ("x" * 10000, 12345, ["m-ok"], "bad\nmodel", {"id": "m"}):
+            st, _, bd = _http_request(
+                rport,
+                "POST",
+                "/v1/chat/completions",
+                body={
+                    "model": bad_model,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+            self.assertEqual(st, 400)
+            self.assertIn("invalid_model_id", bd.decode("utf-8"))
+
+        # Rejected at admission before routing or writing any JSONL usage records.
+        self.assertEqual(len(backend.requests_seen), 0)
+        self.assertEqual(len(captured), 0)
+        self.assertFalse(jsonl_path.exists())
+
+        # Belt-and-suspenders: direct programmatic terminal failure clamps model length.
+        router.engine._record_terminal_failure(
+            request_id="req-clamp",
+            model="z" * 1000,
+            backend_id="none",
+            matched_backend=False,
+            status_code=503,
+            latency_ms=1.0,
+            stream=False,
+            failovers=0,
+            principal="anon",
+        )
+        self.assertEqual(len(captured), 1)
+        self.assertLessEqual(len(captured[0].model), 256)
+
+    def test_fixed_length_sse_premature_eof_after_finish_reason_marks_interrupted(
+        self,
+    ) -> None:
+        finished_chunk = json.dumps(
+            {
+                "id": "chatcmpl-fixed-sse",
+                "object": "chat.completion.chunk",
+                "model": "m-fixed-sse",
+                "choices": [
+                    {"index": 0, "delta": {"content": "Done!"}, "finish_reason": "stop"}
+                ],
+            }
+        )
+        sent_sse = f"data: {finished_chunk}\n\n".encode("utf-8")
+        declared_len = len(sent_sse) + 250  # Missing trailing usage chunk + [DONE]
+
+        srv = socket.create_server(("127.0.0.1", 0))
+        srv.settimeout(3.0)
+        port = srv.getsockname()[1]
+        stop_evt = threading.Event()
+
+        def accept_loop() -> None:
+            while not stop_evt.is_set():
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    break
+
+                def handle_one(sock: socket.socket) -> None:
+                    try:
+                        sock.settimeout(1.0)
+                        req = sock.recv(4096)
+                        if req.startswith(b"GET /v1/models"):
+                            body = json.dumps(
+                                {"object": "list", "data": [{"id": "m-fixed-sse"}]}
+                            ).encode("utf-8")
+                            sock.sendall(
+                                b"HTTP/1.1 200 OK\r\n"
+                                b"Content-Type: application/json\r\n"
+                                + f"Content-Length: {len(body)}\r\n".encode("ascii")
+                                + b"Connection: close\r\n\r\n"
+                                + body
+                            )
+                            return
+                        sock.sendall(
+                            b"HTTP/1.1 200 OK\r\n"
+                            b"Content-Type: text/event-stream; charset=utf-8\r\n"
+                            + f"Content-Length: {declared_len}\r\n".encode("ascii")
+                            + b"Connection: close\r\n\r\n"
+                            + sent_sse
+                        )
+                    except OSError:
+                        pass
+                    finally:
+                        try:
+                            sock.close()
+                        except OSError:
+                            pass
+
+                threading.Thread(target=handle_one, args=(c,), daemon=True).start()
+
+        threading.Thread(target=accept_loop, daemon=True).start()
+        try:
+            cfg = RouterConfig(
+                host="127.0.0.1",
+                port=0,
+                backends=[
+                    BackendConfig(
+                        id="fixed-sse-trunc",
+                        base_url=f"http://127.0.0.1:{port}/v1",
+                        timeout_s=2.0,
+                    )
+                ],
+            )
+            router = self._track(create_router_server(cfg))
+            rport = router.server_address[1]
+
+            conn = http.client.HTTPConnection("127.0.0.1", rport, timeout=3.0)
+            try:
+                conn.request(
+                    "POST",
+                    "/v1/chat/completions",
+                    body=json.dumps(
+                        {
+                            "model": "m-fixed-sse",
+                            "stream": True,
+                            "messages": [{"role": "user", "content": "hi"}],
+                        }
+                    ).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                )
+                resp = conn.getresponse()
+                self.assertEqual(resp.status, 200)
+                with self.assertRaises(http.client.IncompleteRead) as exc_info:
+                    resp.read()
+                partial = exc_info.exception.partial.decode("utf-8", errors="replace")
+                self.assertIn("Done!", partial)
+                self.assertIn("upstream_stream_interrupted", partial)
+            finally:
+                conn.close()
+
+            self.assertEqual(router.engine._backends[0].inflight, 0)
+            self.assertGreater(
+                router.engine._backends[0].cooldown_until_monotonic,
+                time.monotonic(),
+            )
+            m_st, _, m_bd = _http_request(rport, "GET", "/metrics")
+            self.assertEqual(m_st, 200)
+            self.assertIn('status="502"', m_bd.decode("utf-8"))
+        finally:
+            stop_evt.set()
+            srv.close()
 
 
 def run_self_tests(verbosity: int = 1) -> int:

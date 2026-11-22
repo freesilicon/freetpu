@@ -18,6 +18,7 @@ VALID_URL_SCHEMES = ("http", "https")
 BEARER_AUTH_ONLY_KEYS = ("tokens", "tokens_env", "exempt_paths")
 DEFAULT_MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024
 DEFAULT_MAX_TOTAL_REQUEST_MEMORY_BYTES = 64 * 1024 * 1024
+DEFAULT_MAX_TOTAL_RESPONSE_MEMORY_BYTES = 64 * 1024 * 1024
 DEFAULT_MAX_RESPONSE_BODY_BYTES = 16 * 1024 * 1024
 DEFAULT_MAX_HEADER_BYTES = 64 * 1024
 DEFAULT_MAX_JSON_DEPTH = 64
@@ -482,6 +483,7 @@ class RouterConfig:
     backend_idle_timeout_s: float = 300.0
     max_request_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES
     max_total_request_memory_bytes: int = DEFAULT_MAX_TOTAL_REQUEST_MEMORY_BYTES
+    max_total_response_memory_bytes: int = DEFAULT_MAX_TOTAL_RESPONSE_MEMORY_BYTES
     max_response_body_bytes: int = DEFAULT_MAX_RESPONSE_BODY_BYTES
     max_header_bytes: int = DEFAULT_MAX_HEADER_BYTES
     max_json_depth: int = DEFAULT_MAX_JSON_DEPTH
@@ -554,6 +556,11 @@ class RouterConfig:
         _validate_int_range(
             self.max_total_request_memory_bytes,
             name="max_total_request_memory_bytes",
+            min_value=1,
+        )
+        _validate_int_range(
+            self.max_total_response_memory_bytes,
+            name="max_total_response_memory_bytes",
             min_value=1,
         )
         _validate_int_range(
@@ -741,6 +748,14 @@ class RouterConfig:
                     DEFAULT_MAX_TOTAL_REQUEST_MEMORY_BYTES,
                 ),
                 name="max_total_request_memory_bytes",
+                min_value=1,
+            ),
+            max_total_response_memory_bytes=_validate_int_range(
+                raw.get(
+                    "max_total_response_memory_bytes",
+                    DEFAULT_MAX_TOTAL_RESPONSE_MEMORY_BYTES,
+                ),
+                name="max_total_response_memory_bytes",
                 min_value=1,
             ),
             max_response_body_bytes=_validate_int_range(
