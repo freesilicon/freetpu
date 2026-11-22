@@ -389,9 +389,27 @@ def _verify_file_writable_if_exists(path: Path, label: str) -> None:
         os.close(fd)
 
 
-def _validate_existing_session_store(path: Path) -> None:
-    """Validate that an existing non-empty `--config` file matches Colab's session store schema.
+def _is_valid_iso_datetime(value: Any) -> bool:
+    """Return True if `value` is a valid ISO-8601 datetime string accepted by Pydantic `datetime`."""
+    if not isinstance(value, str):
+        return False
+    s = value.strip()
+    if not s or ("T" not in s and "t" not in s and " " not in s):
+        return False
+    if s.endswith(("Z", "z")):
+        s = s[:-1] + "+00:00"
+    try:
+        datetime.fromisoformat(s)
+    except ValueError:
+        return False
+    return True
 
+
+def _validate_existing_session_store(path: Path) -> None:
+    """Validate that an existing non-empty `--config` file matches Colab's full `SessionState` schema.
+
+    Colab CLI v0.8.0 treats any deserialization failure on a single entry as an empty store and
+    truncates the whole file on the next write; fail closed here before calling Colab.
     Never includes file contents in error messages so no tokens or metadata can be leaked.
     """
     if not os.path.lexists(path):
@@ -428,6 +446,39 @@ def _validate_existing_session_store(path: Path) -> None:
             raise UntrustedPathError(
                 f"Existing session config {path} does not match the Colab session store schema."
             )
+        # Optional non-nullable string fields in `colab_cli.state.SessionState`.
+        for str_field in ("variant", "accelerator", "machine_shape"):
+            if str_field in val and not isinstance(val[str_field], str):
+                raise UntrustedPathError(
+                    f"Existing session config {path} has invalid `{str_field}` field type."
+                )
+        # Optional nullable string fields in `colab_cli.state.SessionState`.
+        for opt_str_field in ("kernel_id", "session_id", "running"):
+            if opt_str_field in val and val[opt_str_field] is not None and not isinstance(
+                val[opt_str_field], str
+            ):
+                raise UntrustedPathError(
+                    f"Existing session config {path} has invalid `{opt_str_field}` field type."
+                )
+        # Optional ISO-8601 datetime `token_expires_at: Optional[datetime]`.
+        if "token_expires_at" in val and val["token_expires_at"] is not None:
+            if not _is_valid_iso_datetime(val["token_expires_at"]):
+                raise UntrustedPathError(
+                    f"Existing session config {path} has malformed `token_expires_at` timestamp."
+                )
+        # Optional 3-tuple `last_execution: Optional[Tuple[str, Optional[str], str]]`.
+        if "last_execution" in val and val["last_execution"] is not None:
+            le = val["last_execution"]
+            if (
+                not isinstance(le, list)
+                or len(le) != 3
+                or not isinstance(le[0], str)
+                or (le[1] is not None and not isinstance(le[1], str))
+                or not isinstance(le[2], str)
+            ):
+                raise UntrustedPathError(
+                    f"Existing session config {path} has malformed `last_execution` metadata."
+                )
 
 
 def _normalize_config_path(
@@ -525,7 +576,7 @@ def _prepare_custom_script(
     out_dir: Path,
     session_base: str,
 ) -> Tuple[Path, bool]:
-    """Validate a custom Python script locally and wrap it when `colab run`'s prelude breaks syntax."""
+    """Validate a custom Python script locally and wrap it so `__file__`, `__future__`, and `__main__` work."""
     try:
         raw_bytes = script_path.read_bytes()
     except OSError as exc:
@@ -540,29 +591,8 @@ def _prepare_custom_script(
             f"Custom script {script_path} has a Python syntax error at line {exc.lineno}: {exc.msg}"
         ) from exc
 
-    has_future_import = any(
-        isinstance(node, ast.ImportFrom) and node.module == "__future__"
-        for node in tree.body
-    )
-    needs_wrapper = has_future_import or raw_bytes.startswith(b"\xef\xbb\xbf")
-    if not needs_wrapper:
-        try:
-            text_src = raw_bytes.decode("utf-8")
-        except UnicodeDecodeError:
-            needs_wrapper = True
-        else:
-            if text_src.startswith("#!"):
-                stripped = text_src.split("\n", 1)[1] if "\n" in text_src else ""
-            else:
-                stripped = text_src
-            try:
-                compile("import sys\n" + stripped, str(script_path), "exec")
-            except SyntaxError:
-                needs_wrapper = True
-
-    if not needs_wrapper:
-        return script_path, False
-
+    # Always wrap custom scripts in a thin `__main__` bootstrapper so `colab run`'s injected prelude
+    # never breaks `from __future__` / coding cookies and `__file__` is always set consistently.
     encoded = base64.b64encode(raw_bytes).decode("ascii")
     orig_name = script_path.name
     wrapper_src = (
@@ -685,7 +715,9 @@ def make_subprocess_runner(
         cmd_list = list(cmd)
         env = os.environ.copy()
         env.setdefault("COLAB_CLI_REQUEST_TIMEOUT", str(request_timeout_s))
-        env.setdefault("COLAB_CLI_ASSIGN_RETRIES", "1")
+        # Disable Colab CLI's internal allocation POST retry so an ambiguous timeout/disconnect
+        # cannot be masked by a subsequent 412 refusal that would falsely trigger v5e1 fallback.
+        env["COLAB_CLI_ASSIGN_RETRIES"] = "0"
         is_run_cmd = "run" in cmd_list
         if is_run_cmd:
             wall_timeout: Optional[float] = (
@@ -986,6 +1018,17 @@ _UNCERTAIN_ALLOC_HTTP_RE = re.compile(
     re.IGNORECASE,
 )
 
+_UNCERTAIN_ALLOC_TRANSPORT_RE = re.compile(
+    r"(?:\breadtimeout\b|\bread timed out\b|\bconnecttimeout\b|\bconnect timed out\b|"
+    r"\bconnectionerror\b|\bremotedisconnected\b|\bremote end closed connection\b|"
+    r"\bconnectionreseterror\b|\bconnection reset\b|\bconnectionabortederror\b|\bconnection aborted\b|"
+    r"\bbrokenpipeerror\b|\bbroken pipe\b|\bchunkedencodingerror\b|\bprotocolerror\b|"
+    r"\bsslerror\b|\bssleoferror\b|\bunexpected eof\b|\bproxyerror\b|\brequestexception\b|"
+    r"\bmaxretryerror\b|\bmax retries exceeded\b|\bnewconnectionerror\b|"
+    r"\bincompleteread\b|\bsocket\.timeout\b|\btimeouterror\b)",
+    re.IGNORECASE,
+)
+
 
 def is_allocation_timeout_error(
     returncode: int,
@@ -1001,7 +1044,7 @@ def is_allocation_timeout_error(
         return "[colab] session ready" not in err_lower
     if "[colab] session ready" in err_lower:
         return False
-    if "readtimeout" in err_lower or "read timed out" in err_lower:
+    if _UNCERTAIN_ALLOC_TRANSPORT_RE.search(stderr):
         return True
     return bool(_UNCERTAIN_ALLOC_HTTP_RE.search(stderr))
 
@@ -3839,7 +3882,156 @@ def run_self_test() -> int:
         assert sum_meta["proof_export"]["ok"] is False
         assert sum_meta["proof_export"]["metadata_only"] is True
 
-    print("colab_tpu_bench.py self-test PASSED (45/45 suites).")
+        # 46. Managed subprocess runner always forces COLAB_CLI_ASSIGN_RETRIES=0 even when the
+        #     caller environment sets a non-zero retry count.
+        old_retries_env = os.environ.get("COLAB_CLI_ASSIGN_RETRIES")
+        os.environ["COLAB_CLI_ASSIGN_RETRIES"] = "3"
+        try:
+            env_runner = make_subprocess_runner(request_timeout_s=10.0)
+            res_env = env_runner(
+                [sys.executable, "-c", "import os; print(os.environ['COLAB_CLI_ASSIGN_RETRIES'])"]
+            )
+            assert res_env.returncode == 0
+            assert res_env.stdout.strip() == "0"
+        finally:
+            if old_retries_env is None:
+                os.environ.pop("COLAB_CLI_ASSIGN_RETRIES", None)
+            else:
+                os.environ["COLAB_CLI_ASSIGN_RETRIES"] = old_retries_env
+
+        # 47. Full `SessionState` schema validation rejects malformed `token_expires_at`,
+        #     `last_execution`, or field types before calling Colab, while accepting valid stores.
+        schema_dir = tmp_path / "schema-check"
+        schema_dir.mkdir(mode=0o700)
+        os.chmod(schema_dir, 0o700)
+        base_entry = {
+            "name": "s1",
+            "token": "tok",
+            "url": "https://example.invalid",
+            "endpoint": "m-s-ep1",
+        }
+        bad_entries = (
+            {**base_entry, "token_expires_at": "not-a-timestamp"},
+            {**base_entry, "token_expires_at": "2026-11-22"},
+            {**base_entry, "token_expires_at": 12345},
+            {**base_entry, "variant": None},
+            {**base_entry, "kernel_id": 999},
+            {**base_entry, "last_execution": ["only-one"]},
+            {**base_entry, "last_execution": [1, None, "2026-11-22 10:00:00"]},
+        )
+        for idx_bad, bad_val in enumerate(bad_entries):
+            bad_store = schema_dir / f"bad-{idx_bad}.json"
+            bad_store.write_text(json.dumps({"s1": bad_val}), encoding="utf-8")
+            os.chmod(bad_store, 0o600)
+            rc_bs, sum_bs = run_benchmark(
+                BenchConfig(
+                    tpus=("v5e1",),
+                    config_path=bad_store,
+                    out_dir=tmp_path / f"bad-schema-out-{idx_bad}",
+                ),
+                runner=forbid_calls_runner,
+            )
+            assert rc_bs == 2, f"Expected schema rejection for case {idx_bad}: {sum_bs}"
+            assert sum_bs["status"] == "untrusted_config_path"
+
+        good_store = schema_dir / "good.json"
+        good_store.write_text(
+            json.dumps(
+                {
+                    "s1": {
+                        **base_entry,
+                        "token_expires_at": "2026-11-22T14:00:00Z",
+                        "variant": "TPU",
+                        "accelerator": "V5E1",
+                        "machine_shape": "STANDARD",
+                        "kernel_id": "k-1",
+                        "session_id": None,
+                        "last_execution": ["bench.py", None, "2026-11-22 14:00:00"],
+                        "running": None,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        os.chmod(good_store, 0o600)
+        rc_gs, sum_gs = run_benchmark(
+            BenchConfig(dry_run=True, config_path=good_store, out_dir=tmp_path / "good-schema-out"),
+            runner=low_or_bad_cu_runner("unused"),
+        )
+        assert rc_gs == 0
+        assert sum_gs["status"] == "dry_run"
+
+        # 48. Pre-READY connection drop (`ConnectionError` / `RemoteDisconnected`) does NOT
+        #     fall back to v5e1 and keeps `teardown_verified=False` (`allocation_timeout_unreconciled`).
+        def conn_drop_runner(cmd: Sequence[str]) -> CommandResult:
+            cmd_list = list(cmd)
+            base_res = base_help_usage_sessions(cmd_list)
+            if base_res is not None:
+                return base_res
+            if "run" in cmd_list:
+                return CommandResult(
+                    1,
+                    "",
+                    "[colab] Creating session 'x'...\n"
+                    "requests.exceptions.ConnectionError: ('Connection aborted.', "
+                    "RemoteDisconnected('Remote end closed connection without response'))\n",
+                )
+            raise AssertionError(f"Unexpected command: {cmd_list}")
+
+        rc_cd, sum_cd = run_benchmark(
+            BenchConfig(tpus=("v6e1", "v5e1"), out_dir=tmp_path / "alloc-conn-drop"),
+            runner=conn_drop_runner,
+        )
+        assert rc_cd == 1
+        assert len(sum_cd["attempts"]) == 1
+        assert sum_cd["attempts"][0]["tpu"] == "v6e1"
+        assert sum_cd["status"] == "allocation_timeout_unreconciled"
+        assert sum_cd["teardown_verified"] is False
+        assert is_allocation_timeout_error(1, "ConnectionResetError: Connection reset by peer")
+        assert is_allocation_timeout_error(1, "SSLError: unexpected eof while reading")
+
+        # 49. Ordinary custom Python scripts (without `from __future__`) ALSO get wrapped so
+        #     `Path(__file__)` works cleanly under `colab run`'s prelude.
+        plain_script = custom_dir / "plain_file_user.py"
+        plain_script.write_text(
+            textwrap.dedent(
+                """\
+                from pathlib import Path
+                import sys
+                assert Path(__file__).name == "plain_file_user.py"
+                assert __name__ == "__main__"
+                assert sys.argv == ["plain_file_user.py", "--ok"]
+                """
+            ),
+            encoding="utf-8",
+        )
+        rc_plain, sum_plain = run_benchmark(
+            BenchConfig(
+                dry_run=True,
+                script_path=plain_script,
+                script_args=("--ok",),
+                out_dir=tmp_path / "plain-file-out",
+            ),
+            runner=low_or_bad_cu_runner("unused"),
+        )
+        assert rc_plain == 0
+        assert sum_plain["wrapped_custom_script"] is True
+        plain_wrapper = Path(sum_plain["script"])
+        plain_prelude = (
+            "import sys, warnings\n"
+            f"sys.argv = [{plain_wrapper.name!r}, '--ok']\n"
+            "__name__ = '__main__'\n"
+            "warnings.filterwarnings('ignore', message='To exit: use')\n"
+        )
+        proc_plain = subprocess.run(
+            [sys.executable, "-c", plain_prelude + plain_wrapper.read_text(encoding="utf-8")],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc_plain.returncode == 0, f"Plain wrapped script failed: {proc_plain.stderr}"
+
+    print("colab_tpu_bench.py self-test PASSED (49/49 suites).")
     return 0
 
 
