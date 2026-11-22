@@ -4411,6 +4411,47 @@ void test_phase7_cycle3_regressions() {
     ob_context_destroy(ctx);
   }
 
+  // 8. Oversized cached hit must retire when budget shrinks below tile size,
+  //    and subsequent transient uncached uploads must increment weight_cache_misses.
+  {
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+    CHECK(ob_gemm_register_builtin_emitter(ctx, interp_file.path()) == OB_OK);
+    // Start with ample budget so a 1x1536x2048 tile (~3 MiB) is cached.
+    ctx->simulated_mem_available_bytes = 512ULL * 1024ULL * 1024ULL;
+    ctx->simulated_mem_available_set = true;
+
+    constexpr uint32_t K = 1536u, N = 2048u;
+    std::vector<float> af(K, 0.25f), cf(N, 0.0f);
+    std::vector<ob_block_q8_0_t> bq(static_cast<size_t>(N) * (K / OB_QK8_0));
+    for (auto& blk : bq) {
+      blk.d = fp32_to_fp16(0.05f);
+      std::memset(blk.qs, 3, sizeof(blk.qs));
+    }
+    ob_invoke_stats_t s{};
+    CHECK(ob_gemm_matmul_f32_q8_0(ctx, af.data(), bq.data(), cf.data(), 1u, K, N, &s) == OB_OK);
+    CHECK(ctx->weight_cache_map.size() == 1u);
+    CHECK(ctx->weight_cache_bytes >= 3ULL * 1024ULL * 1024ULL);
+    CHECK(ctx->weight_cache_misses == 1u);
+
+    // Drop budget to the 1 MiB floor (< 3 MiB tile): warm hit must retire the oversized tile.
+    ctx->simulated_mem_available_bytes = 1ULL;
+    CHECK(ob_gemm_matmul_f32_q8_0(ctx, af.data(), bq.data(), cf.data(), 1u, K, N, &s) == OB_OK);
+    CHECK(ctx->weight_cache_hits == 1u);
+    CHECK(ctx->weight_cache_evictions == 1u);
+    CHECK(ctx->weight_cache_map.empty());
+    CHECK(ctx->weight_cache_bytes == 0u);
+
+    // Next call under 1 MiB budget uses a transient uncached upload and must count a miss.
+    CHECK(ob_gemm_matmul_f32_q8_0(ctx, af.data(), bq.data(), cf.data(), 1u, K, N, &s) == OB_OK);
+    CHECK(ctx->weight_cache_misses == 2u);
+    CHECK(ctx->weight_cache_map.empty());
+    CHECK(ctx->weight_cache_bytes == 0u);
+    ob_context_destroy(ctx);
+  }
+
   std::printf("[PASS] test_phase7_cycle3_regressions (dense 16MiB cap, immutable gen+O(1) hit, warm budget shrink, refcnt timeout retention, warm SwiGLU clip guard, cpu-only tiles_dispatched=0 OK)\n");
 }
 

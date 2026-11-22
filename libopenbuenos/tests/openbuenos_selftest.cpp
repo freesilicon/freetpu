@@ -1473,10 +1473,20 @@ int run_test_swiglu(int iters, int perf_mode, const char* dive_interp_path,
       int e = std::abs(static_cast<int>(y[i]) - static_cast<int>(y_ref[i]));
       if (e > max_err) max_err = e;
     }
-    bool ok = (st == OB_OK) && (max_err == 0);
+    const bool stats_ok = (sc.tiles_dispatched == 1u) && (sw.tiles_dispatched == 1u) &&
+                          ((sc.flags & OB_STAT_FLAG_EMITTER_USED) != 0u) &&
+                          ((sw.flags & OB_STAT_FLAG_EMITTER_USED) != 0u) &&
+                          ((sc.flags & OB_STAT_FLAG_CPU_FALLBACK) == 0u) &&
+                          ((sw.flags & OB_STAT_FLAG_CPU_FALLBACK) == 0u) &&
+                          (sw.cache_hits == 1u) &&
+                          (ctx->mock_mode ||
+                           (((sc.flags & OB_STAT_FLAG_MOCK) == 0u) &&
+                            ((sw.flags & OB_STAT_FLAG_MOCK) == 0u)));
+    bool ok = (st == OB_OK) && (max_err == 0) && stats_ok;
     if (!ok) all_ok = false;
-    std::printf("swiglu[%s]: ok=%d pm=%u wl=%d max_abs_err=%d cold_us=%llu warm_hw_us=%llu warm_wall_us=%llu\n",
+    std::printf("swiglu[%s]: ok=%d pm=%u wl=%d tiles=%u/%u hits=%u flags=0x%x max_abs_err=%d cold_us=%llu warm_hw_us=%llu warm_wall_us=%llu\n",
                 c.label, ok ? 1 : 0, ctx->cfg.perf_mode, ctx->fw_wakelock_held ? 1 : 0,
+                sc.tiles_dispatched, sw.tiles_dispatched, sw.cache_hits, sw.flags,
                 max_err,
                 static_cast<unsigned long long>(sc.wall_time_us),
                 static_cast<unsigned long long>(sw.hw_execution_us),

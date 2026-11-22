@@ -485,7 +485,10 @@ void weight_cache_evict_locked(ob_context* ctx,
 
 CachedWeightTile* weight_cache_find_locked(ob_context* ctx, const WeightTileKey& key) {
   auto it = ctx->weight_cache_map.find(key);
-  if (it == ctx->weight_cache_map.end()) return nullptr;
+  if (it == ctx->weight_cache_map.end()) {
+    ctx->weight_cache_misses += 1u;
+    return nullptr;
+  }
   CachedWeightTile* t = it->second;
   if (t->lru_it != ctx->weight_cache_lru.begin()) {
     ctx->weight_cache_lru.splice(ctx->weight_cache_lru.begin(), ctx->weight_cache_lru, t->lru_it);
@@ -497,6 +500,14 @@ CachedWeightTile* weight_cache_find_locked(ob_context* ctx, const WeightTileKey&
     if (ctx->weight_cache_bytes > ctx->weight_cache_max_bytes ||
         ctx->weight_cache_map.size() > ctx->weight_cache_max_entries) {
       weight_cache_evict_locked(ctx, 0u, t, 0u);
+    }
+    const size_t t_total = t->ext2_bytes + t->outlier_cols_bytes;
+    if (t->in_cache && t_total > ctx->weight_cache_max_bytes) {
+      ctx->weight_cache_map.erase(t->key);
+      ctx->weight_cache_lru.erase(t->lru_it);
+      ctx->weight_cache_bytes -= std::min(ctx->weight_cache_bytes, t_total);
+      t->in_cache = false;
+      ctx->weight_cache_evictions += 1u;
     }
   }
   return t;
@@ -512,7 +523,6 @@ void weight_cache_insert_locked(ob_context* ctx, CachedWeightTile* tile) {
   if (ctx->weight_cache_bytes > ctx->weight_cache_peak_bytes) {
     ctx->weight_cache_peak_bytes = ctx->weight_cache_bytes;
   }
-  ctx->weight_cache_misses += 1u;
 }
 
 template <typename DrainOneFn>

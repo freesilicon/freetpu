@@ -269,7 +269,7 @@ ob_status_t ob_gemm_matmul_int8(ob_context_t *      ctx,
         memset(out_stats, 0, sizeof(*out_stats));
         out_stats->wall_time_us     = ob_shim_now_us() - t0;
         out_stats->flags            = (uint16_t)(OB_STAT_FLAG_MOCK | OB_STAT_FLAG_CPU_FALLBACK);
-        out_stats->tiles_dispatched = 1u;
+        out_stats->tiles_dispatched = 0u;
     }
     return OB_OK;
 }
@@ -312,7 +312,7 @@ ob_status_t ob_gemm_matmul_f32_q8_0(ob_context_t *      ctx,
         memset(out_stats, 0, sizeof(*out_stats));
         out_stats->wall_time_us     = ob_shim_now_us() - t0;
         out_stats->flags            = (uint16_t)(OB_STAT_FLAG_MOCK | OB_STAT_FLAG_CPU_FALLBACK);
-        out_stats->tiles_dispatched = 1u;
+        out_stats->tiles_dispatched = 0u;
     }
     return OB_OK;
 }
@@ -365,7 +365,7 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t *                  ctx,
         memset(out_stats, 0, sizeof(*out_stats));
         out_stats->wall_time_us     = ob_shim_now_us() - t0;
         out_stats->flags            = (uint16_t)(OB_STAT_FLAG_MOCK | OB_STAT_FLAG_CPU_FALLBACK);
-        out_stats->tiles_dispatched = num_jobs;
+        out_stats->tiles_dispatched = 0u;
     }
     return OB_OK;
 }
@@ -448,7 +448,7 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t *                      ctx,
         memset(out_stats, 0, sizeof(*out_stats));
         out_stats->wall_time_us     = ob_shim_now_us() - t0;
         out_stats->flags            = (uint16_t)(OB_STAT_FLAG_MOCK | OB_STAT_FLAG_CPU_FALLBACK);
-        out_stats->tiles_dispatched = 1u;
+        out_stats->tiles_dispatched = 0u;
     }
     return OB_OK;
 }
