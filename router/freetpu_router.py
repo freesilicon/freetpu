@@ -73,10 +73,59 @@ MAX_METRIC_MODEL_LABELS = 256
 MAX_RR_CURSORS = 1024
 MAX_PROBE_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_ERROR_RESPONSE_BYTES = 1024 * 1024
+REQUEST_MEMORY_PARSE_MULTIPLIER = 4
 _API_VERSION_SUFFIX_RE = re.compile(r"/v\d+(?:alpha|beta\d*)?$")
 _LOG_CONTROL_CHAR_TABLE = str.maketrans(
     {c: f"\\x{c:02x}" for c in (*range(0x00, 0x20), *range(0x7F, 0xA0))}
 )
+
+
+def _safe_probe_error(exc: BaseException) -> str:
+    """Map probe/upstream exceptions to fixed safe diagnostics without echoing secrets."""
+    if isinstance(exc, TimeoutError):
+        return "probe_timeout"
+    if isinstance(exc, _UpstreamResponseTooLargeError):
+        return "probe_response_too_large"
+    if isinstance(exc, http.client.InvalidURL):
+        return "invalid_probe_url"
+    if isinstance(exc, http.client.IncompleteRead):
+        return "probe_incomplete_response"
+    if isinstance(exc, (http.client.BadStatusLine, http.client.RemoteDisconnected)):
+        return "probe_connection_closed"
+    if isinstance(exc, http.client.HTTPException):
+        return f"probe_http_error:{type(exc).__name__}"
+    if isinstance(exc, ssl.SSLError):
+        return "probe_tls_error"
+    if isinstance(exc, ConnectionRefusedError):
+        return "probe_connection_refused"
+    if isinstance(exc, ConnectionResetError):
+        return "probe_connection_reset"
+    if isinstance(exc, OSError):
+        return f"probe_network_error:{type(exc).__name__}"
+    if isinstance(exc, ValueError):
+        return "invalid_request_header"
+    return f"probe_exception:{type(exc).__name__}"
+
+
+def _extract_models_list(parsed: Any) -> Optional[List[str]]:
+    """Validate an OpenAI `/v1/models` JSON response and return discovered model IDs."""
+    items: Optional[List[Any]] = None
+    if isinstance(parsed, Mapping):
+        raw_data = parsed.get("data")
+        if isinstance(raw_data, list):
+            items = raw_data
+    elif isinstance(parsed, list):
+        items = parsed
+    if items is None:
+        return None
+    discovered: List[str] = []
+    for item in items:
+        if not isinstance(item, Mapping):
+            return None
+        raw_id = item.get("id")
+        if isinstance(raw_id, str) and raw_id.strip():
+            discovered.append(raw_id.strip())
+    return discovered
 
 
 class _UpstreamResponseTooLargeError(http.client.HTTPException):
@@ -300,8 +349,10 @@ class _BoundedSSEReader:
             if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TimeoutError("Timed out waiting for first SSE output")
-                if self._sock is not None:
+                    raise TimeoutError("Timed out waiting for SSE data")
+                if isinstance(self._sock, DeadlineSocket):
+                    self._sock.deadline = deadline
+                elif self._sock is not None:
                     try:
                         self._sock.settimeout(remaining)
                     except OSError:
@@ -828,6 +879,8 @@ class RouterEngine:
         ]
         self._rr_cursors: OrderedDict[bytes, int] = OrderedDict()
         self._metric_models_seen: set[str] = set()
+        self._req_mem_lock = threading.Lock()
+        self._req_mem_used_bytes = 0
         self._poller_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._poll_thread: Optional[threading.Thread] = None
@@ -861,6 +914,24 @@ class RouterEngine:
                 # Keep poller resilient across transient probe errors.
                 pass
 
+    def try_reserve_request_memory(self, amount_bytes: int) -> bool:
+        """Atomically reserve bytes from the shared in-flight request memory budget."""
+        need = max(0, amount_bytes)
+        limit = self.config.max_total_request_memory_bytes
+        with self._req_mem_lock:
+            if self._req_mem_used_bytes + need > limit:
+                return False
+            self._req_mem_used_bytes += need
+            return True
+
+    def release_request_memory(self, amount_bytes: int) -> None:
+        """Release previously reserved bytes back to the shared request memory budget."""
+        rel = max(0, amount_bytes)
+        if rel == 0:
+            return
+        with self._req_mem_lock:
+            self._req_mem_used_bytes = max(0, self._req_mem_used_bytes - rel)
+
     def refresh_all_backends(self) -> None:
         for state in self._backends:
             if not state.config.enabled:
@@ -871,7 +942,7 @@ class RouterEngine:
                 with self._lock:
                     state.last_probe_unix = time.time()
                     state.healthy = False
-                    state.unhealthy_reason = f"probe_exception: {exc}"
+                    state.unhealthy_reason = _safe_probe_error(exc)
 
     def metric_model_label(
         self,
@@ -929,24 +1000,23 @@ class RouterEngine:
         timeout_s: float,
         *,
         strip_api_version: bool = False,
-    ) -> Tuple[int, Optional[Dict[str, Any]], float, Optional[str]]:
+    ) -> Tuple[int, Optional[Any], float, Optional[str]]:
         scheme, host, port, path = _join_backend_url(
             backend.base_url,
             endpoint,
             strip_api_version=strip_api_version,
         )
         headers: Dict[str, str] = {"Accept": "application/json"}
-        api_key = backend.resolved_api_key()
-        _ensure_safe_credential_transport(backend, scheme, host, api_key)
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-
         t0 = time.monotonic()
         deadline = t0 + max(0.01, timeout_s)
         conn: Optional[http.client.HTTPConnection] = None
         resp: Optional[http.client.HTTPResponse] = None
         raw_sock: Any = None
         try:
+            api_key = backend.resolved_api_key()
+            _ensure_safe_credential_transport(backend, scheme, host, api_key)
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
             rem = deadline - time.monotonic()
             if rem <= 0:
                 raise TimeoutError("Probe exceeded elapsed deadline")
@@ -969,18 +1039,18 @@ class RouterEngine:
                 chunk_size=8192,
             )
             rtt_ms = (time.monotonic() - t0) * 1000.0
-            parsed_json: Optional[Dict[str, Any]] = None
+            parsed_json: Optional[Any] = None
             if raw:
                 try:
                     loaded = json.loads(raw.decode("utf-8", errors="replace"))
-                    if isinstance(loaded, dict):
+                    if isinstance(loaded, (dict, list)):
                         parsed_json = loaded
                 except json.JSONDecodeError:
                     parsed_json = None
             return resp.status, parsed_json, rtt_ms, None
         except (OSError, TimeoutError, ValueError, http.client.HTTPException) as exc:
             rtt_ms = (time.monotonic() - t0) * 1000.0
-            return 0, None, rtt_ms, str(exc)
+            return 0, None, rtt_ms, _safe_probe_error(exc)
         finally:
             if resp is not None:
                 try:
@@ -1030,12 +1100,10 @@ class RouterEngine:
                     m_status, m_json, _, _ = self._http_get_json(
                         state.config, "/v1/models", rem
                     )
-                    if 200 <= m_status < 300 and m_json and isinstance(m_json.get("data"), list):
-                        discovered = [
-                            str(item["id"])
-                            for item in m_json["data"]
-                            if isinstance(item, Mapping) and item.get("id")
-                        ]
+                    if 200 <= m_status < 300:
+                        models_list = _extract_models_list(m_json)
+                        if models_list is not None:
+                            discovered = models_list
         else:
             rem = remaining_timeout()
             if rem <= 0:
@@ -1045,13 +1113,13 @@ class RouterEngine:
                     state.config, "/v1/models", rem
                 )
             if 200 <= status < 300:
-                probe_ok = True
-                if m_json and isinstance(m_json.get("data"), list):
-                    discovered = [
-                        str(item["id"])
-                        for item in m_json["data"]
-                        if isinstance(item, Mapping) and item.get("id")
-                    ]
+                models_list = _extract_models_list(m_json)
+                if models_list is not None:
+                    probe_ok = True
+                    discovered = models_list
+                else:
+                    probe_ok = False
+                    probe_err = "invalid_models_response"
             else:
                 probe_err = err or f"probe_http_{status}"
 
@@ -1767,76 +1835,113 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
-        raw_req, read_err = self._read_request_body(content_len)
-        if read_err is not None or raw_req is None:
-            err_status, err_code, err_msg = read_err or (
-                400,
-                "incomplete_body",
-                "Failed to read request body",
-            )
-            self._safe_send_bytes(
-                err_status,
+        engine = self.server.engine
+        parse_budget = max(1, content_len * REQUEST_MEMORY_PARSE_MULTIPLIER)
+        if not engine.try_reserve_request_memory(parse_budget):
+            self._send_bytes(
+                503,
                 "application/json",
-                _openai_error_body(err_msg, code=err_code),
+                _openai_error_body(
+                    "Router request memory budget exhausted; retry later",
+                    error_type="service_unavailable",
+                    code="server_memory_limit_reached",
+                ),
             )
             return
 
-        # Allow legitimate long-running inference/streaming responses to write cleanly.
+        reserved_mem = parse_budget
         try:
-            write_timeout = max(
-                self.server.engine.config.client_read_timeout_s,
-                self.server.engine.config.request_timeout_s,
-            )
-            self.connection.settimeout(write_timeout)
-        except OSError:
-            pass
+            raw_req, read_err = self._read_request_body(content_len)
+            if read_err is not None or raw_req is None:
+                err_status, err_code, err_msg = read_err or (
+                    400,
+                    "incomplete_body",
+                    "Failed to read request body",
+                )
+                self._safe_send_bytes(
+                    err_status,
+                    "application/json",
+                    _openai_error_body(err_msg, code=err_code),
+                )
+                return
 
-        try:
-            req_payload = json.loads(raw_req.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            self._send_bytes(
-                400,
-                "application/json",
-                _openai_error_body(f"Malformed JSON request: {exc}"),
-            )
-            return
+            # Allow legitimate long-running inference/streaming responses to write cleanly.
+            try:
+                write_timeout = max(
+                    engine.config.client_read_timeout_s,
+                    engine.config.request_timeout_s,
+                )
+                self.connection.settimeout(write_timeout)
+            except OSError:
+                pass
 
-        if not isinstance(req_payload, dict):
-            self._send_bytes(
-                400,
-                "application/json",
-                _openai_error_body("Request JSON body must be an object"),
-            )
-            return
+            try:
+                req_payload = json.loads(raw_req.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                self._send_bytes(
+                    400,
+                    "application/json",
+                    _openai_error_body(f"Malformed JSON request: {exc}"),
+                )
+                return
 
-        model = str(req_payload.get("model") or "").strip()
-        if not model:
-            self._send_bytes(
-                400,
-                "application/json",
-                _openai_error_body("Field 'model' is required"),
-            )
-            return
+            if not isinstance(req_payload, dict):
+                self._send_bytes(
+                    400,
+                    "application/json",
+                    _openai_error_body("Request JSON body must be an object"),
+                )
+                return
 
-        self._handle_inference(path, raw_req, req_payload, model, ctx)
+            model = str(req_payload.get("model") or "").strip()
+            if not model:
+                self._send_bytes(
+                    400,
+                    "application/json",
+                    _openai_error_body("Field 'model' is required"),
+                )
+                return
+
+            stream = bool(req_payload.get("stream", False))
+            est_prompt_tokens = _estimate_prompt_tokens(req_payload)
+            expected_choices = _expected_stream_choices(path, req_payload)
+            # Release the decoded JSON tree before waiting on upstream inference.
+            del req_payload
+            parse_overhead = reserved_mem - content_len
+            if parse_overhead > 0:
+                engine.release_request_memory(parse_overhead)
+                reserved_mem = content_len
+
+            self._handle_inference(
+                path,
+                raw_req,
+                model,
+                stream,
+                est_prompt_tokens,
+                expected_choices,
+                ctx,
+            )
+        finally:
+            if reserved_mem > 0:
+                engine.release_request_memory(reserved_mem)
 
     def _handle_inference(
         self,
         endpoint: str,
         raw_req: bytes,
-        req_payload: Dict[str, Any],
         model: str,
+        stream: bool,
+        est_prompt_tokens: int,
+        expected_choices: int,
         auth_ctx: AuthContext,
     ) -> None:
         engine = self.server.engine
-        stream = bool(req_payload.get("stream", False))
         req_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         req_start = time.monotonic()
         policy_override = self.headers.get("X-FreeTPU-Policy")
         if policy_override:
             policy_override = policy_override.strip()
 
-        est_prompt_tokens = _estimate_prompt_tokens(req_payload)
         failovers = 0
         last_error_status = 503
         last_error_msg = f"No healthy backend available for model {model!r}"
@@ -1948,17 +2053,13 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                     continue
 
                 if stream and 200 <= resp.status < 300:
-                    if deadline_sock is not None:
-                        # Hand deadline management to _BoundedSSEReader so post-commit
-                        # progress deadlines can reset as tokens stream.
-                        deadline_sock.deadline = None
                     sse_outcome, sse_err_status, sse_err_body = self._proxy_sse_stream(
                         resp=resp,
-                        upstream_sock=upstream_sock,
+                        upstream_sock=deadline_sock if deadline_sock is not None else upstream_sock,
                         timeout_s=timeout_s,
                         backend=backend,
                         model=model,
-                        expected_choices=_expected_stream_choices(endpoint, req_payload),
+                        expected_choices=expected_choices,
                         req_id=req_id,
                         req_start=req_start,
                         attempt_start=attempt_start,
@@ -2017,34 +2118,49 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                             MAX_ERROR_RESPONSE_BYTES,
                         )
                     )
-                    raw_resp = _read_bounded_http_response(
-                        resp,
-                        upstream_sock,
-                        max_bytes=max_resp_bytes,
-                        deadline=attempt_deadline,
-                        label=f"Backend {backend.config.id!r} response",
-                    )
-                    latency_ms = (time.monotonic() - req_start) * 1000.0
-                    attempt_ms = (time.monotonic() - attempt_start) * 1000.0
-                    content_type = resp.getheader("Content-Type") or "application/json"
-                    non_stream_result = (
-                        resp.status,
-                        content_type,
-                        raw_resp,
-                        latency_ms,
-                        attempt_ms,
-                    )
-            except (OSError, TimeoutError, http.client.HTTPException) as exc:
+                    try:
+                        raw_resp = _read_bounded_http_response(
+                            resp,
+                            upstream_sock,
+                            max_bytes=max_resp_bytes,
+                            deadline=attempt_deadline,
+                            label=f"Backend {backend.config.id!r} response",
+                        )
+                    except _UpstreamResponseTooLargeError:
+                        # Response-size cap is request-scoped: do not penalize backend health or fail over.
+                        latency_ms = (time.monotonic() - req_start) * 1000.0
+                        attempt_ms = (time.monotonic() - attempt_start) * 1000.0
+                        non_stream_result = (
+                            502,
+                            "application/json",
+                            _openai_error_body(
+                                f"Upstream response exceeded maximum size of {max_resp_bytes} bytes",
+                                error_type="bad_gateway",
+                                code="response_too_large",
+                            ),
+                            latency_ms,
+                            attempt_ms,
+                        )
+                    else:
+                        latency_ms = (time.monotonic() - req_start) * 1000.0
+                        attempt_ms = (time.monotonic() - attempt_start) * 1000.0
+                        content_type = resp.getheader("Content-Type") or "application/json"
+                        non_stream_result = (
+                            resp.status,
+                            content_type,
+                            raw_resp,
+                            latency_ms,
+                            attempt_ms,
+                        )
+            except (OSError, TimeoutError, ValueError, http.client.HTTPException) as exc:
                 if isinstance(exc, TimeoutError):
                     reason = "timeout"
                     last_error_status = 504
-                elif isinstance(exc, _UpstreamResponseTooLargeError):
-                    reason = "response_too_large"
-                    last_error_status = 502
                 else:
                     reason = "connection_error"
                     last_error_status = 502
-                last_error_msg = f"Backend {backend.config.id!r} failed: {exc}"
+                safe_detail = _safe_probe_error(exc)
+                last_error_msg = f"Backend {backend.config.id!r} failed ({safe_detail})"
                 last_error_type = "service_unavailable"
                 last_error_code = reason
                 last_error_body = None

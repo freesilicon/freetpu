@@ -81,6 +81,8 @@ class _MockOpenAIBackend(ThreadingHTTPServer):
         oversized_non_stream_chunked: bool = False,
         slow_drip_non_stream_interval_s: Optional[float] = None,
         truncate_fixed_length_response: bool = False,
+        raw_models_response: Optional[Tuple[int, str, bytes]] = None,
+        raw_health_response: Optional[Tuple[int, str, bytes]] = None,
         prompt_tokens: int = 12,
         completion_tokens: int = 8,
     ) -> None:
@@ -105,6 +107,8 @@ class _MockOpenAIBackend(ThreadingHTTPServer):
         self.oversized_non_stream_chunked = oversized_non_stream_chunked
         self.slow_drip_non_stream_interval_s = slow_drip_non_stream_interval_s
         self.truncate_fixed_length_response = truncate_fixed_length_response
+        self.raw_models_response = raw_models_response
+        self.raw_health_response = raw_health_response
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
         self.requests_seen: List[Dict[str, Any]] = []
@@ -141,6 +145,16 @@ class _MockOpenAIHandler(BaseHTTPRequestHandler):
         with self.server._lock:
             self.server.get_paths_seen.append(self.path)
         if self.path == "/health":
+            if self.server.raw_health_response is not None:
+                st, ctype, raw_body = self.server.raw_health_response
+                self.send_response(st)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(raw_body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(raw_body)
+                self.wfile.flush()
+                return
             if self.server.status_code >= 500:
                 self._send_json(
                     self.server.status_code,
@@ -150,6 +164,16 @@ class _MockOpenAIHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "ok"})
             return
         if self.path == "/v1/models":
+            if self.server.raw_models_response is not None:
+                st, ctype, raw_body = self.server.raw_models_response
+                self.send_response(st)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(raw_body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(raw_body)
+                self.wfile.flush()
+                return
             if self.server.slow_drip_probe_interval_s is not None:
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -4212,7 +4236,8 @@ class TestFreeTPURouter(unittest.TestCase):
         with self.assertRaises(ValueError):
             RouterConfig(backends=[valid_b], max_response_body_bytes=0)
 
-        # Case 1: Oversized non-streaming response (chunked and Content-Length) fails over to backup.
+        # Case 1: Oversized non-streaming response (chunked and Content-Length) returns
+        # request-scoped 502 WITHOUT putting the backend in cooldown or failing over.
         for chunked in (False, True):
             with self.subTest(oversized_chunked=chunked):
                 primary = self._track(
@@ -4257,15 +4282,30 @@ class TestFreeTPURouter(unittest.TestCase):
                         "messages": [{"role": "user", "content": "hi"}],
                     },
                 )
-                self.assertEqual(status, 200)
-                self.assertEqual(hdrs["x-freetpu-backend"], "healthy-backup")
-                self.assertEqual(hdrs["x-freetpu-failovers"], "1")
-                self.assertIn("reply-from:healthy-backup", body.decode("utf-8"))
+                self.assertEqual(status, 502)
+                self.assertEqual(hdrs["x-freetpu-backend"], "oversize-primary")
+                self.assertEqual(hdrs["x-freetpu-failovers"], "0")
+                self.assertIn("response_too_large", body.decode("utf-8"))
+                self.assertEqual(len(backup.requests_seen), 0)
                 self.assertEqual(router.engine._backends[0].inflight, 0)
-                self.assertGreater(
-                    router.engine._backends[0].cooldown_until_monotonic,
-                    time.monotonic(),
+                self.assertEqual(router.engine._backends[0].cooldown_until_monotonic, 0.0)
+                self.assertTrue(router.engine._backends[0].healthy)
+
+                # Subsequent normal-sized request still routes to healthy primary without failover.
+                primary.oversized_non_stream_bytes = None
+                status2, hdrs2, body2 = _http_request(
+                    rport,
+                    "POST",
+                    "/v1/chat/completions",
+                    body={
+                        "model": "m-bounded-resp",
+                        "messages": [{"role": "user", "content": "small follow-up"}],
+                    },
                 )
+                self.assertEqual(status2, 200)
+                self.assertEqual(hdrs2["x-freetpu-backend"], "oversize-primary")
+                self.assertEqual(hdrs2["x-freetpu-failovers"], "0")
+                self.assertIn("reply-from:oversize-primary", body2.decode("utf-8"))
 
         # Case 2: Slow-drip non-streaming response exceeds elapsed deadline and fails over cleanly.
         drip_primary = self._track(
@@ -4663,6 +4703,399 @@ class TestFreeTPURouter(unittest.TestCase):
         self.assertNotEqual(rc, 0)
         self.assertIn("port", stderr_buf.getvalue().lower())
         self.assertNotIn("topsecret", stderr_buf.getvalue())
+
+    def test_malformed_backend_api_key_rejected_and_redacted_from_health(self) -> None:
+        secret_tok = "sk-super-secret-leak-check-999"
+        # 1. Config validation rejects control chars / newlines without echoing the secret.
+        for bad_key in (f"{secret_tok}\n", f"{secret_tok}\r\nX-Inject: 1", f"{secret_tok}\x00"):
+            with self.assertRaises(ValueError) as ctx_direct:
+                BackendConfig(
+                    id="bad-key-b",
+                    base_url="http://127.0.0.1:8081/v1",
+                    api_key=bad_key,
+                )
+            self.assertNotIn(secret_tok, str(ctx_direct.exception))
+
+            with self.assertRaises(ValueError) as ctx_dict:
+                BackendConfig.from_dict(
+                    {
+                        "id": "bad-key-dict",
+                        "base_url": "http://127.0.0.1:8081/v1",
+                        "api_key": bad_key,
+                    }
+                )
+            self.assertNotIn(secret_tok, str(ctx_dict.exception))
+
+        # 2. --check-config rejects malformed api_key without echoing secret to stderr.
+        bad_cfg_path = Path(self._tmpdir.name) / "bad_api_key.json"
+        bad_cfg_path.write_text(
+            json.dumps(
+                {
+                    "backends": [
+                        {
+                            "id": "bad-key-cli",
+                            "base_url": "http://127.0.0.1:8081/v1",
+                            "api_key": f"{secret_tok}\n",
+                            "models": ["m1"],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        stderr_buf = io.StringIO()
+        with redirect_stderr(stderr_buf):
+            rc = router_main(["--check-config", "--config", str(bad_cfg_path)])
+        self.assertNotEqual(rc, 0)
+        self.assertNotIn(secret_tok, stderr_buf.getvalue())
+
+        # 3. Runtime api_key_env with trailing newline fails probe safely and NEVER leaks on /health.
+        backend = self._track(_MockOpenAIBackend("env-secret-b", ["m-env-sec"]))
+        env_var = "FREETPU_TEST_MALFORMED_BACKEND_KEY"
+        prev_env = os.environ.get(env_var)
+        os.environ[env_var] = f"{secret_tok}\n"
+        try:
+            cfg = RouterConfig(
+                host="127.0.0.1",
+                port=0,
+                backends=[
+                    BackendConfig(
+                        id="env-secret-b",
+                        base_url=backend.base_url,
+                        api_key_env=env_var,
+                        models=["m-env-sec"],
+                    )
+                ],
+            )
+            router = self._track(create_router_server(cfg, probe_on_start=True))
+            rport = router.server_address[1]
+            status, _, body = _http_request(rport, "GET", "/health")
+            self.assertEqual(status, 503)
+            body_text = body.decode("utf-8")
+            self.assertNotIn(secret_tok, body_text)
+            payload = json.loads(body_text)
+            self.assertEqual(
+                payload["backends"][0]["unhealthy_reason"], "invalid_request_header"
+            )
+        finally:
+            if prev_env is None:
+                os.environ.pop(env_var, None)
+            else:
+                os.environ[env_var] = prev_env
+
+    def test_shared_request_memory_budget_bounds_concurrent_bodies(self) -> None:
+        valid_b = BackendConfig(id="ok-b", base_url="http://127.0.0.1:8081/v1")
+        with self.assertRaises(ValueError):
+            RouterConfig(backends=[valid_b], max_total_request_memory_bytes=0)
+
+        slow_b = self._track(_MockOpenAIBackend("mem-slow-b", ["m-mem"], latency_s=0.35))
+        # Total budget 2000 bytes: first ~450-byte body needs 1800 to parse (fits), then retains
+        # ~450 bytes while waiting on upstream; concurrent second ~450-byte body needs 1800
+        # (450 + 1800 > 2000) -> immediately rejected with 503 before buffering/parsing.
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            max_total_request_memory_bytes=2000,
+            backends=[
+                BackendConfig(
+                    id="mem-slow-b",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=slow_b.base_url,
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        req_payload = {
+            "model": "m-mem",
+            "messages": [{"role": "user", "content": "x" * 380}],
+        }
+        first_result: Dict[str, Any] = {}
+
+        def send_first() -> None:
+            st, _, bd = _http_request(
+                rport, "POST", "/v1/chat/completions", body=req_payload
+            )
+            first_result["status"] = st
+            first_result["body"] = bd
+
+        t1 = threading.Thread(target=send_first, daemon=True)
+        t1.start()
+
+        # Wait until request 1 has entered the backend (meaning its body is reserved).
+        deadline = time.monotonic() + 2.0
+        while slow_b.current_inflight < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertGreaterEqual(slow_b.current_inflight, 1)
+
+        st2, _, bd2 = _http_request(
+            rport, "POST", "/v1/chat/completions", body=req_payload
+        )
+        self.assertEqual(st2, 503)
+        self.assertIn("server_memory_limit_reached", bd2.decode("utf-8"))
+
+        t1.join(timeout=3.0)
+        self.assertEqual(first_result.get("status"), 200)
+        self.assertEqual(router.engine._req_mem_used_bytes, 0)
+
+        # Once request 1 releases its budget, a subsequent request succeeds cleanly.
+        slow_b.latency_s = 0.0
+        st3, _, _ = _http_request(
+            rport, "POST", "/v1/chat/completions", body=req_payload
+        )
+        self.assertEqual(st3, 200)
+        self.assertEqual(router.engine._req_mem_used_bytes, 0)
+
+    def test_sse_enforces_deadline_during_slow_chunked_framing(self) -> None:
+        first_chunk_json = json.dumps(
+            {
+                "id": "chatcmpl-slow-frame",
+                "object": "chat.completion.chunk",
+                "model": "m-slow-frame",
+                "choices": [
+                    {"index": 0, "delta": {"content": "Hello "}, "finish_reason": None}
+                ],
+            }
+        )
+        first_sse = f"data: {first_chunk_json}\n\n".encode("utf-8")
+
+        def run_framing_server(send_first_token: bool) -> Tuple[socket.socket, int, threading.Event]:
+            srv = socket.create_server(("127.0.0.1", 0))
+            srv.settimeout(3.0)
+            stop_evt = threading.Event()
+
+            def accept_loop() -> None:
+                while not stop_evt.is_set():
+                    try:
+                        c, _ = srv.accept()
+                    except OSError:
+                        break
+
+                    def handle_conn(sock: socket.socket) -> None:
+                        try:
+                            sock.settimeout(1.0)
+                            req = sock.recv(4096)
+                            if req.startswith(b"GET /v1/models"):
+                                body = json.dumps(
+                                    {"object": "list", "data": [{"id": "m-slow-frame"}]}
+                                ).encode("utf-8")
+                                sock.sendall(
+                                    b"HTTP/1.1 200 OK\r\n"
+                                    b"Content-Type: application/json\r\n"
+                                    + f"Content-Length: {len(body)}\r\n".encode("ascii")
+                                    + b"Connection: close\r\n\r\n"
+                                    + body
+                                )
+                                return
+                            sock.sendall(
+                                b"HTTP/1.1 200 OK\r\n"
+                                b"Content-Type: text/event-stream; charset=utf-8\r\n"
+                                b"Transfer-Encoding: chunked\r\n"
+                                b"Connection: close\r\n\r\n"
+                            )
+                            if send_first_token:
+                                sock.sendall(
+                                    f"{len(first_sse):x}\r\n".encode("ascii")
+                                    + first_sse
+                                    + b"\r\n"
+                                )
+                            # Trickle chunk-size framing bytes 1 byte every 50ms without \r\n.
+                            dl = time.monotonic() + 3.0
+                            while not stop_evt.is_set() and time.monotonic() < dl:
+                                sock.sendall(b"0")
+                                time.sleep(0.05)
+                        except OSError:
+                            pass
+                        finally:
+                            try:
+                                sock.close()
+                            except OSError:
+                                pass
+
+                    threading.Thread(target=handle_conn, args=(c,), daemon=True).start()
+
+            threading.Thread(target=accept_loop, daemon=True).start()
+            return srv, srv.getsockname()[1], stop_evt
+
+        # Case 1: Post-commit slow chunk-size framing aborts strictly at progress deadline.
+        srv1, port1, stop1 = run_framing_server(send_first_token=True)
+        try:
+            cfg1 = RouterConfig(
+                host="127.0.0.1",
+                port=0,
+                backends=[
+                    BackendConfig(
+                        id="slow-frame-post",
+                        base_url=f"http://127.0.0.1:{port1}/v1",
+                        timeout_s=0.30,
+                    )
+                ],
+            )
+            router1 = self._track(create_router_server(cfg1))
+            rport1 = router1.server_address[1]
+            t0 = time.monotonic()
+            conn = http.client.HTTPConnection("127.0.0.1", rport1, timeout=3.0)
+            try:
+                conn.request(
+                    "POST",
+                    "/v1/chat/completions",
+                    body=json.dumps(
+                        {
+                            "model": "m-slow-frame",
+                            "stream": True,
+                            "messages": [{"role": "user", "content": "hi"}],
+                        }
+                    ).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                )
+                resp = conn.getresponse()
+                self.assertEqual(resp.status, 200)
+                with self.assertRaises(http.client.IncompleteRead) as exc_info:
+                    resp.read()
+                elapsed1 = time.monotonic() - t0
+                partial = exc_info.exception.partial.decode("utf-8", errors="replace")
+                self.assertIn("Hello ", partial)
+                self.assertIn("upstream_stream_interrupted", partial)
+                self.assertLess(elapsed1, 1.5)
+            finally:
+                conn.close()
+        finally:
+            stop1.set()
+            srv1.close()
+
+        # Case 2: Pre-commit slow chunk-size framing aborts strictly at deadline and fails over.
+        srv2, port2, stop2 = run_framing_server(send_first_token=False)
+        backup = self._track(_MockOpenAIBackend("healthy-sse-backup", ["m-slow-frame"]))
+        try:
+            cfg2 = RouterConfig(
+                host="127.0.0.1",
+                port=0,
+                policy="local_first",
+                backends=[
+                    BackendConfig(
+                        id="slow-frame-pre",
+                        local=True,
+                        base_url=f"http://127.0.0.1:{port2}/v1",
+                        timeout_s=0.30,
+                    ),
+                    BackendConfig(
+                        id="healthy-sse-backup",
+                        local=False,
+                        base_url=backup.base_url,
+                        timeout_s=2.0,
+                    ),
+                ],
+            )
+            router2 = self._track(create_router_server(cfg2))
+            rport2 = router2.server_address[1]
+            t1 = time.monotonic()
+            status, hdrs, body = _http_request(
+                rport2,
+                "POST",
+                "/v1/chat/completions",
+                body={
+                    "model": "m-slow-frame",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "failover pre-commit"}],
+                },
+            )
+            elapsed2 = time.monotonic() - t1
+            self.assertEqual(status, 200)
+            self.assertEqual(hdrs["x-freetpu-backend"], "healthy-sse-backup")
+            self.assertEqual(hdrs["x-freetpu-failovers"], "1")
+            self.assertLess(elapsed2, 1.5)
+        finally:
+            stop2.set()
+            srv2.close()
+
+    def test_default_models_probe_rejects_html_and_non_model_json(self) -> None:
+        html_proxy = self._track(
+            _MockOpenAIBackend(
+                "html-catchall",
+                ["m-proxy"],
+                raw_models_response=(200, "text/html", b"<html><body>OK</body></html>"),
+            )
+        )
+        bad_json_proxy = self._track(
+            _MockOpenAIBackend(
+                "non-model-json",
+                ["m-proxy"],
+                raw_models_response=(200, "application/json", b'{"status":"ok"}'),
+            )
+        )
+        explicit_health_backend = self._track(
+            _MockOpenAIBackend(
+                "explicit-health-plain",
+                ["m-proxy"],
+                raw_health_response=(200, "text/plain", b"ok"),
+            )
+        )
+        healthy_backup = self._track(_MockOpenAIBackend("good-backup", ["m-proxy"]))
+
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            backends=[
+                BackendConfig(
+                    id="html-catchall",
+                    local=True,
+                    priority=1,
+                    base_url=html_proxy.base_url,
+                    models=["m-proxy"],
+                ),
+                BackendConfig(
+                    id="non-model-json",
+                    local=True,
+                    priority=2,
+                    base_url=bad_json_proxy.base_url,
+                    models=["m-proxy"],
+                ),
+                BackendConfig(
+                    id="explicit-health-plain",
+                    local=False,
+                    priority=20,
+                    base_url=explicit_health_backend.base_url,
+                    health_path="/health",
+                    models=["m-proxy"],
+                ),
+                BackendConfig(
+                    id="good-backup",
+                    local=False,
+                    priority=10,
+                    base_url=healthy_backup.base_url,
+                    models=["m-proxy"],
+                ),
+            ],
+        )
+        router = self._track(create_router_server(cfg, probe_on_start=True))
+        rport = router.server_address[1]
+
+        states = {b.config.id: b for b in router.engine._backends}
+        # Default /v1/models probe rejects HTML and non-model JSON responses.
+        self.assertFalse(states["html-catchall"].healthy)
+        self.assertEqual(
+            states["html-catchall"].unhealthy_reason, "invalid_models_response"
+        )
+        self.assertFalse(states["non-model-json"].healthy)
+        self.assertEqual(
+            states["non-model-json"].unhealthy_reason, "invalid_models_response"
+        )
+        # Explicit health_path still accepts status-only 2xx plain-text health checks.
+        self.assertTrue(states["explicit-health-plain"].healthy)
+        self.assertTrue(states["good-backup"].healthy)
+
+        # Inference routes around the misrouted local proxies to good-backup.
+        status, hdrs, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={"model": "m-proxy", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(hdrs["x-freetpu-backend"], "good-backup")
 
 
 def run_self_tests(verbosity: int = 1) -> int:

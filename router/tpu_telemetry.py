@@ -446,13 +446,27 @@ def scrape_tpu_exporter(
             resp, upstream_sock, deadline=deadline
         ).decode("utf-8", errors="replace")
     except (OSError, TimeoutError, ValueError, http.client.HTTPException) as exc:
+        if isinstance(exc, TimeoutError):
+            safe_err = "exporter_scrape_timeout"
+        elif isinstance(exc, ssl.SSLError):
+            safe_err = "exporter_tls_error"
+        elif isinstance(exc, http.client.IncompleteRead):
+            safe_err = "exporter_incomplete_response"
+        elif isinstance(exc, http.client.HTTPException):
+            safe_err = f"exporter_http_error:{type(exc).__name__}"
+        elif isinstance(exc, ConnectionRefusedError):
+            safe_err = "exporter_connection_refused"
+        elif isinstance(exc, OSError):
+            safe_err = f"exporter_network_error:{type(exc).__name__}"
+        else:
+            safe_err = f"exporter_error:{type(exc).__name__}"
         return TpuExporterTelemetry(
             reachable=False,
             exporter_up=False,
             devices_discovered=0,
             healthy_chips=0,
             total_chips=0,
-            error=str(exc),
+            error=safe_err,
         )
     finally:
         if resp is not None:

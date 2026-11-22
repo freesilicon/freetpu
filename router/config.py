@@ -17,11 +17,30 @@ VALID_AUTH_TYPES = ("allow_all", "bearer")
 VALID_URL_SCHEMES = ("http", "https")
 BEARER_AUTH_ONLY_KEYS = ("tokens", "tokens_env", "exempt_paths")
 DEFAULT_MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024
+DEFAULT_MAX_TOTAL_REQUEST_MEMORY_BYTES = 64 * 1024 * 1024
 DEFAULT_MAX_RESPONSE_BODY_BYTES = 16 * 1024 * 1024
 DEFAULT_CLIENT_READ_TIMEOUT_S = 30.0
 DEFAULT_CLIENT_HEADER_TIMEOUT_S = 10.0
 DEFAULT_MAX_CONCURRENT_CONNECTIONS = 128
 DEFAULT_MAX_SSE_PRE_COMMIT_BYTES = 1024 * 1024
+
+
+def _has_control_chars(value: str) -> bool:
+    return any(ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F for ch in value)
+
+
+def _validate_credential_string(
+    value: Any,
+    *,
+    context: str,
+    field_name: str,
+) -> None:
+    if not isinstance(value, str):
+        raise ValueError(f"{context} field {field_name!r} must be a string")
+    if _has_control_chars(value):
+        raise ValueError(
+            f"{context} field {field_name!r} must not contain control characters or newlines"
+        )
 
 
 def _require_bool(
@@ -230,6 +249,12 @@ class BackendConfig:
             )
         _validate_int_range(self.priority, name=f"{ctx} priority", min_value=-1_000_000)
         _validate_int_range(self.weight, name=f"{ctx} weight", min_value=1)
+        if self.api_key is not None:
+            _validate_credential_string(self.api_key, context=ctx, field_name="api_key")
+        if self.api_key_env is not None:
+            _validate_credential_string(
+                self.api_key_env, context=ctx, field_name="api_key_env"
+            )
         has_credentials = bool(
             (self.api_key and self.api_key.strip())
             or (self.api_key_env and self.api_key_env.strip())
@@ -248,10 +273,18 @@ class BackendConfig:
             )
 
     def resolved_api_key(self) -> Optional[str]:
+        ctx = f"Backend {self.id!r}"
         if self.api_key:
+            _validate_credential_string(self.api_key, context=ctx, field_name="api_key")
             return self.api_key
         if self.api_key_env:
-            val = os.environ.get(self.api_key_env, "").strip()
+            raw_val = os.environ.get(self.api_key_env, "")
+            if not raw_val:
+                return None
+            _validate_credential_string(
+                raw_val, context=ctx, field_name=f"api_key_env({self.api_key_env})"
+            )
+            val = raw_val.strip()
             return val or None
         return None
 
@@ -355,6 +388,20 @@ class BackendConfig:
             raw.get("weight", 1), name=f"{ctx} weight", min_value=1
         )
 
+        api_key_raw = raw.get("api_key")
+        api_key_val: Optional[str] = None
+        if api_key_raw is not None:
+            _validate_credential_string(api_key_raw, context=ctx, field_name="api_key")
+            api_key_val = api_key_raw or None
+
+        api_key_env_raw = raw.get("api_key_env")
+        api_key_env_val: Optional[str] = None
+        if api_key_env_raw is not None:
+            _validate_credential_string(
+                api_key_env_raw, context=ctx, field_name="api_key_env"
+            )
+            api_key_env_val = api_key_env_raw.strip() or None
+
         return cls(
             id=backend_id,
             base_url=base_url,
@@ -379,10 +426,8 @@ class BackendConfig:
             ),
             max_hbm_utilization=max_hbm,
             max_duty_cycle_percent=max_duty_val,
-            api_key=str(raw["api_key"]) if raw.get("api_key") else None,
-            api_key_env=(
-                str(raw["api_key_env"]).strip() if raw.get("api_key_env") else None
-            ),
+            api_key=api_key_val,
+            api_key_env=api_key_env_val,
             allow_insecure_http=_require_bool(
                 raw, "allow_insecure_http", False, context=ctx
             ),
@@ -407,6 +452,7 @@ class RouterConfig:
     queue_pressure_threshold: int = 16
     backend_idle_timeout_s: float = 300.0
     max_request_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES
+    max_total_request_memory_bytes: int = DEFAULT_MAX_TOTAL_REQUEST_MEMORY_BYTES
     max_response_body_bytes: int = DEFAULT_MAX_RESPONSE_BODY_BYTES
     client_read_timeout_s: float = DEFAULT_CLIENT_READ_TIMEOUT_S
     client_header_timeout_s: float = DEFAULT_CLIENT_HEADER_TIMEOUT_S
@@ -469,6 +515,11 @@ class RouterConfig:
         _validate_int_range(
             self.max_request_body_bytes,
             name="max_request_body_bytes",
+            min_value=1,
+        )
+        _validate_int_range(
+            self.max_total_request_memory_bytes,
+            name="max_total_request_memory_bytes",
             min_value=1,
         )
         _validate_int_range(
@@ -623,6 +674,14 @@ class RouterConfig:
             max_request_body_bytes=_validate_int_range(
                 raw.get("max_request_body_bytes", DEFAULT_MAX_REQUEST_BODY_BYTES),
                 name="max_request_body_bytes",
+                min_value=1,
+            ),
+            max_total_request_memory_bytes=_validate_int_range(
+                raw.get(
+                    "max_total_request_memory_bytes",
+                    DEFAULT_MAX_TOTAL_REQUEST_MEMORY_BYTES,
+                ),
+                name="max_total_request_memory_bytes",
                 min_value=1,
             ),
             max_response_body_bytes=_validate_int_range(
