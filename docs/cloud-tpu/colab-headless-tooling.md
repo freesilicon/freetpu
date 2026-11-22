@@ -20,11 +20,12 @@ Google provides two official, supported headless automation surfaces for Colab r
 - Always pass global flags (`--auth`, `--config`, and `--no-public-api` when supported) **before** the subcommand:
 
 ```bash
-colab --auth=adc --config /tmp/freetpu-colab.json usage
-colab --auth=adc --config /tmp/freetpu-colab.json sessions
+mkdir -p -m 700 ~/.cache/freetpu-colab
+colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json usage
+colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json sessions
 ```
 
-> **Note:** Do not confuse `--auth={adc,oauth2}` (CLI control-plane authentication) with `colab auth` (an interactive command that injects VM-side GCP credentials into a running kernel).
+> **Note:** Do not confuse `--auth={adc,oauth2}` (CLI control-plane authentication) with `colab auth` (an interactive command that injects VM-side GCP credentials into a running kernel). For `--auth=oauth2` first-time setup, run `colab --auth=oauth2 whoami` interactively so the OAuth consent URL and code prompt are visible before scripted runs.
 
 ### Official Colab MCP (`https://colaboratory.googleapis.com/mcp`) & Public REST `v1beta`
 
@@ -32,7 +33,7 @@ The remote Streamable HTTP MCP server at `https://colaboratory.googleapis.com/mc
 
 - **Account & Discovery**: `get_subscription`, `list_runtime_specs` (pre-flight TPU eligibility)
 - **Runtime Lifecycle**: `list_runtimes`, `get_runtime`, `create_runtime` (idempotent UUID `requestId`), `delete_runtime`
-- **Kernel & Execution**: `create_session`, `list_sessions`, `delete_session`, `execute_code` (600s RPC cutoff; pass a client UUID `executionId` to reattach without re-executing)
+- **Kernel & Execution**: `create_session`, `list_sessions`, `delete_session`, `execute_code` (600s RPC cutoff; pass a client UUID `executionId` **against the same named session** to reattach to an in-flight call—runtime-targeted calls create a fresh session and cannot reattach, and reusing an `executionId` after its result has been returned re-executes the code)
 
 **Allowlist & Scope Behavior:**
 
@@ -67,31 +68,33 @@ If your GCP project still receives `403` on `colaboratory.googleapis.com/v1beta`
 
 ## 2. Operational Patterns for Zero-Waste TPU R&D
 
-1. **Pre-Flight Compute Unit (CU) Guard**: Run `colab usage` before provisioning to confirm positive `paidComputeUnitsBalance` and check active assignments. Never leak idle VMs.
-2. **State Isolation (`--config`)**: Pass `--config <run-dir>/colab-sessions.json` per worker so concurrent Track A/B agents never overwrite `~/.config/colab-cli/sessions.json`.
-3. **Ephemeral Runs (`colab run`)**: Use `colab run --tpu V6E1 script.py` for single-shot sweeps—it provisions, executes, propagates exit codes, and automatically tears down the VM on completion or error.
-4. **Graceful `v6e1 -> v5e1` Fallback**: HTTP `412` (`FAILED_PRECONDITION`, `REASON_NO_BACKENDS`, `REASON_TOO_MANY_ACTIVE_ASSIGNMENTS`, `REASON_QUOTA_EXCEEDED_USAGE_TIME`) or `400` indicates capacity/quota limits—fall back cleanly from `v6e1` (`32 GiB` HBM) to `v5e1` (`16 GiB` HBM).
+1. **Pre-Flight Compute Unit (CU) Guard**: Run `colab usage` before provisioning to parse the signed `Current balance` and check active assignments via `colab sessions`. Never leak idle VMs.
+2. **State Isolation (`--config`)**: Pass `--config <private-run-dir>/colab-sessions.json` per worker so concurrent Track A/B agents never overwrite `~/.config/colab-cli/sessions.json`. Use an absolute path or normalize relative names to avoid empty-dirname directory creation errors.
+3. **Ephemeral Runs (`colab run -- ...`)**: Use `colab run --tpu V6E1 -- script.py [args...]` for single-shot sweeps—it provisions, executes, propagates exit codes, and attempts teardown on completion or error. Verify release afterwards with `colab sessions`.
+4. **Conservative `v6e1 -> v5e1` Fallback**: Only confirmed pre-allocation refusals (e.g. HTTP `412` `FAILED_PRECONDITION`, `REASON_NO_BACKENDS`, `REASON_TOO_MANY_ACTIVE_ASSIGNMENTS`, `REASON_QUOTA_EXCEEDED_USAGE_TIME`, or `400`) fall back cleanly from `v6e1` (`32 GiB` HBM) to `v5e1` (`16 GiB` HBM). Treat `ReadTimeout` as an unknown allocation outcome and reconcile with `colab sessions` rather than blindly starting a second TPU.
 5. **Prefer `colab exec` Over `colab ssh`**: Runtime `/colab/ssh` enforces a `5`-session concurrency cap (`HTTP 429`) and a minimal `PATH`. Jupyter WebSocket `colab exec` keeps imports, XLA/PJRT/Pallas caches, and TPU device handles warm in memory across calls without hitting the SSH cap.
-6. **Deterministic Artifact Sync**: Use `colab upload` / `colab download` (`/api/contents/...`) and `colab log -s <name> -o proof.ipynb` for replayable execution notebooks instead of `drive.mount` (which blocks headless agents on interactive prompts and hits DriveFS `Errno 5` quotas).
+6. **Deterministic Artifact Sync**: Use `colab upload` / `colab download` (`/api/contents/...`) and `colab log -s <name> -o proof.ipynb` (with unique per-run session names) for replayable execution notebooks instead of `drive.mount` (which blocks headless agents on interactive prompts and hits DriveFS `Errno 5` quotas).
 
 ---
 
 ## 3. Using `tools/colab_tpu_bench.py`
 
-[`tools/colab_tpu_bench.py`](../../tools/colab_tpu_bench.py) wraps `google-colab-cli` with CU guards, isolated `--config` state, `v6e1 -> v5e1` fallback, structured probe JSON capture, and `.ipynb` proof export:
+[`tools/colab_tpu_bench.py`](../../tools/colab_tpu_bench.py) wraps `google-colab-cli` with private `0700` output/config checks, signed CU guards, isolated `--config` normalization, conservative `v6e1 -> v5e1` fallback, post-run `colab sessions` teardown verification, TPU-validated probe JSON capture, and `.ipynb` proof export:
 
 ```bash
 # Offline CI self-test (no Colab credentials or hardware required)
 python3 tools/colab_tpu_bench.py --self-test
 
-# Inspect planned commands without provisioning a VM
-python3 tools/colab_tpu_bench.py --dry-run --out-dir /tmp/freetpu-colab-dry
+# Inspect planned commands without provisioning a VM (private temp dir)
+OUT_DIR="$(mktemp -d)" && chmod 700 "$OUT_DIR"
+python3 tools/colab_tpu_bench.py --dry-run --out-dir "$OUT_DIR"
 
-# Run a live single-shot TPU probe (v6e1 with automatic v5e1 fallback)
+# Run a live single-shot TPU probe (v6e1 with automatic v5e1 fallback on refusal)
+mkdir -p -m 700 ~/.cache/freetpu-colab/proof
 python3 tools/colab_tpu_bench.py \
   --auth adc \
   --min-cu-balance 10 \
-  --out-dir /tmp/freetpu-colab-proof
+  --out-dir ~/.cache/freetpu-colab/proof
 ```
 
 Outputs in `--out-dir`:
