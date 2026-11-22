@@ -58,6 +58,10 @@ jobs:
           python3 tools/verify_chained_fusion.py
           python3 tools/verify_patch_proof.py
 
+      - name: Validate Agent Skill packaging & template self-tests
+        run: |
+          python3 tools/validate_skill.py --run-self-tests
+
   clean-room-audit:
     name: Clean-Room & OSS Boundary Audit
     runs-on: ubuntu-latest

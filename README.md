@@ -16,6 +16,7 @@
 
 <p align="center">
   <a href="#60-second-quickstart">Quickstart</a> &middot;
+  <a href="#agent-skill-claude-code--codex--antigravity--cursor">Agent Skill</a> &middot;
   <a href="#architecture">Architecture</a> &middot;
   <a href="#verified-silicon--host-results">Benchmarks</a> &middot;
   <a href="#hardware-errata--w8a16-bf16-unlock">Hardware Errata</a> &middot;
@@ -75,6 +76,29 @@ make -C runtime verify-baremetal
 ```
 
 See [llama-cpp-edgetpu/README.md](llama-cpp-edgetpu/README.md) for patching upstream `ggml-org/llama.cpp` (`b12608`).
+
+---
+
+## Agent Skill (Claude Code / Codex / Antigravity / Cursor)
+
+Install the portable [`skills/freetpu/`](skills/freetpu/SKILL.md) Agent Skill so your coding agent can author, parity-check, and benchmark custom TPU kernels on **Pixel Tensor G5 (`buenos_a0`)** or **Cloud TPU (`v5e-1` / `v6e-1`)** in one shot:
+
+```bash
+# Project-local install (Claude Code, Antigravity, Cursor, Gemini CLI)
+mkdir -p .agents/skills && ln -sfn ../../skills/freetpu .agents/skills/freetpu
+
+# Or symlink globally for Claude Code / Codex / Antigravity
+mkdir -p ~/.claude/skills ~/.codex/skills ~/.gemini/config/skills
+ln -sfn "$(pwd)/skills/freetpu" ~/.claude/skills/freetpu
+ln -sfn "$(pwd)/skills/freetpu" ~/.codex/skills/freetpu
+ln -sfn "$(pwd)/skills/freetpu" ~/.gemini/config/skills/freetpu
+```
+
+Verify skill packaging, relative links, clean-room hygiene, and starter template self-tests locally:
+
+```bash
+python3 tools/validate_skill.py --run-self-tests
+```
 
 ---
 
