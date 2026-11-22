@@ -1015,6 +1015,88 @@ def _session_still_listed(sessions_stdout: str, session_name: str) -> bool:
     return _token_present(sessions_stdout, session_name)
 
 
+MIN_COLAB_CLI_VERSION: Tuple[int, int, int] = (0, 7, 6)
+_COLAB_SEMVER_RE = re.compile(
+    r"(?i)\b(\d+)\.(\d+)\.(\d+)(?P<pre>(?:[-.]?(?:a|b|rc|dev|alpha|beta)[0-9]*))?"
+)
+
+
+def parse_colab_cli_version(output: str) -> Optional[Tuple[Tuple[int, int, int], bool, str]]:
+    """Parse a semantic version string from `colab version` output.
+
+    Returns `((major, minor, patch), is_prerelease, matched_text)` or `None`.
+    """
+    m = _COLAB_SEMVER_RE.search(output)
+    if not m:
+        return None
+    ver = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    is_pre = bool(m.group("pre"))
+    return ver, is_pre, m.group(0)
+
+
+def _check_colab_cli_version(
+    runner: Callable[[Sequence[str]], subprocess.CompletedProcess[str]],
+    colab_bin: str,
+) -> str:
+    """Enforce `google-colab-cli >= 0.7.6` before making any authenticated call.
+
+    Releases <= 0.7.5 log authorization headers and runtime-proxy tokens to
+    `~/.config/colab-cli/colab.log` under the default umask. Fail closed when
+    the version is below 0.7.6 or cannot be determined.
+    """
+    ver_res = runner([colab_bin, "version"])
+    combined = f"{ver_res.stdout}\n{ver_res.stderr}".strip()
+    if ver_res.returncode != 0:
+        raise RuntimeError(
+            f"Refusing to run authenticated Colab commands: failed to verify google-colab-cli version "
+            f"via `{colab_bin} version` (rc={ver_res.returncode}): {combined[-300:]}. "
+            f"Install google-colab-cli >= 0.7.6 (`uv tool install 'google-colab-cli>=0.7.6'`)."
+        )
+    parsed = parse_colab_cli_version(ver_res.stdout) or parse_colab_cli_version(combined)
+    if parsed is None:
+        raise RuntimeError(
+            f"Refusing to run authenticated Colab commands: could not parse google-colab-cli version "
+            f"from `{colab_bin} version` output ({combined!r}). "
+            f"Install google-colab-cli >= 0.7.6 (`uv tool install 'google-colab-cli>=0.7.6'`)."
+        )
+    ver_tuple, is_pre, ver_text = parsed
+    if ver_tuple < MIN_COLAB_CLI_VERSION or (ver_tuple == MIN_COLAB_CLI_VERSION and is_pre):
+        raise RuntimeError(
+            f"Refusing to run authenticated Colab commands: google-colab-cli >= 0.7.6 is required "
+            f"(detected {ver_text}; releases <= 0.7.5 log authorization headers and runtime-proxy tokens "
+            f"under the default umask). Upgrade via `uv tool install 'google-colab-cli>=0.7.6'` or "
+            f"`pip install -U 'google-colab-cli>=0.7.6'`."
+        )
+    return ver_text
+
+
+def _format_colab_recovery_hint(
+    colab_bin: str,
+    auth: str,
+    iso_cfg: Path,
+    session_name: str,
+    leaked_endpoints: Sequence[str],
+    orphaned_endpoints: Sequence[str],
+) -> str:
+    sessions_cmd = shlex.join([colab_bin, "--auth", auth, "--config", str(iso_cfg), "sessions"])
+    stop_cmd = shlex.join([colab_bin, "--auth", auth, "--config", str(iso_cfg), "stop", "-s", session_name])
+    mapped_leaked = [ep for ep in leaked_endpoints if ep not in orphaned_endpoints]
+    parts: List[str] = []
+    if orphaned_endpoints:
+        ep_list = ", ".join(orphaned_endpoints)
+        parts.append(
+            f"Orphaned `[?]` endpoint(s) [{ep_list}] have no local session mapping (so `colab stop -s {session_name}` "
+            f"will no-op); terminate them in Colab (https://colab.research.google.com -> Runtime -> Manage sessions) "
+            f"or via Colab's unassign endpoint (`POST /tun/m/unassign/<endpoint>`), then confirm removal with `{sessions_cmd}`."
+        )
+    if mapped_leaked or not orphaned_endpoints:
+        parts.append(
+            f"Session config preserved at {iso_cfg}; retry `{stop_cmd}` "
+            f"(or terminate via Colab Runtime -> Manage sessions) and verify with `{sessions_cmd}`."
+        )
+    return " ".join(parts)
+
+
 def _verify_and_stop_session(
     runner: Callable[[Sequence[str]], subprocess.CompletedProcess[str]],
     colab_bin: str,
@@ -1023,9 +1105,10 @@ def _verify_and_stop_session(
     session_name: str,
     pre_endpoints: Optional[Set[str]] = None,
     session_was_ready: bool = False,
-) -> Tuple[bool, Optional[str], List[str]]:
+) -> Tuple[bool, Optional[str], List[str], List[str]]:
     """Stop a Colab runtime and verify its backend endpoint disappeared.
 
+    Returns `(teardown_verified, observed_endpoint, leaked_endpoints, orphaned_endpoints)`.
     Because `colab run` is invoked with `--keep`, the local session-to-endpoint
     mapping stays intact in `iso_cfg` until we query `colab sessions`, capture
     the backend runtime endpoint, invoke `colab stop -s`, and verify that the
@@ -1056,37 +1139,44 @@ def _verify_and_stop_session(
     )
     if not needs_stop:
         if new_orphans:
-            return False, observed_endpoint, sorted(new_orphans)
-        return True, observed_endpoint, []
+            orphans_sorted = sorted(new_orphans)
+            return False, observed_endpoint, orphans_sorted, orphans_sorted
+        return True, observed_endpoint, [], []
 
     stop_res = runner([colab_bin, "--auth", auth, "--config", str(iso_cfg), "stop", "-s", session_name])
     recheck = runner([colab_bin, "--auth", auth, "--config", str(iso_cfg), "sessions"])
     if recheck.returncode != 0:
-        return False, observed_endpoint, sorted(tracked_endpoints | new_orphans)
+        return False, observed_endpoint, sorted(tracked_endpoints | new_orphans), sorted(new_orphans)
 
     recheck_entries = _parse_colab_sessions(recheck.stdout)
     recheck_endpoints: Set[str] = {ep for _, ep in recheck_entries}
+    recheck_orphans: Set[str] = {ep for name, ep in recheck_entries if name == "?"}
 
     leaked: Set[str] = set()
+    orphaned: Set[str] = set()
     for ep in tracked_endpoints | new_orphans:
         if ep in recheck_endpoints or _token_present(recheck.stdout, ep):
             leaked.add(ep)
+            if ep in recheck_orphans:
+                orphaned.add(ep)
     for name, ep in recheck_entries:
         if name == session_name:
             leaked.add(ep)
         elif name == "?" and pre_endpoints is not None and ep not in pre_endpoints:
             leaked.add(ep)
+            orphaned.add(ep)
         elif name == "?" and pre_endpoints is None and session_was_ready and not tracked_endpoints:
             leaked.add(ep)
+            orphaned.add(ep)
 
     name_still_listed = _session_still_listed(recheck.stdout, session_name)
     if leaked or name_still_listed:
-        return False, observed_endpoint, sorted(leaked)
+        return False, observed_endpoint, sorted(leaked), sorted(orphaned)
 
     if stop_res.returncode != 0 and not tracked_endpoints and pre_endpoints is None and recheck_entries:
-        return False, observed_endpoint, []
+        return False, observed_endpoint, [], []
 
-    return True, observed_endpoint, []
+    return True, observed_endpoint, [], []
 
 
 def run_colab_tpu_suites(
@@ -1156,6 +1246,7 @@ def run_colab_tpu_suites(
         }
 
     try:
+        colab_cli_version = _check_colab_cli_version(runner, colab_bin)
         usage_res = runner([colab_bin, "--auth", auth, "--config", str(iso_cfg), "usage"])
         if usage_res.returncode != 0:
             raise RuntimeError(f"colab usage preflight failed: {usage_res.stderr.strip()}")
@@ -1173,6 +1264,8 @@ def run_colab_tpu_suites(
             teardown_verified = False
             endpoint: Optional[str] = None
             leaked_endpoints: List[str] = []
+            orphaned_endpoints: List[str] = []
+            recovery_hint: Optional[str] = None
             try:
                 res = runner(cmd)
             except BaseException as exc:
@@ -1183,7 +1276,7 @@ def run_colab_tpu_suites(
                     or (interrupted is not None)
                 )
                 try:
-                    teardown_verified, endpoint, leaked_endpoints = _verify_and_stop_session(
+                    teardown_verified, endpoint, leaked_endpoints, orphaned_endpoints = _verify_and_stop_session(
                         runner,
                         colab_bin,
                         auth,
@@ -1194,20 +1287,23 @@ def run_colab_tpu_suites(
                     )
                 except BaseException:
                     preserve_tmp_dir = True
-                    recovery_cmd = shlex.join([colab_bin, "--auth", auth, "--config", str(iso_cfg), "stop", "-s", sess])
+                    recovery_hint = _format_colab_recovery_hint(
+                        colab_bin, auth, iso_cfg, sess, leaked_endpoints, orphaned_endpoints
+                    )
                     print(
-                        f"[freetpu-bench] WARNING: Colab teardown interrupted for session={sess}; "
-                        f"session config preserved at {iso_cfg} (recover via: {recovery_cmd})",
+                        f"[freetpu-bench] WARNING: Colab teardown interrupted for session={sess}. {recovery_hint}",
                         file=sys.stderr,
                     )
                     raise
                 if not teardown_verified:
                     preserve_tmp_dir = True
-                    recovery_cmd = shlex.join([colab_bin, "--auth", auth, "--config", str(iso_cfg), "stop", "-s", sess])
+                    recovery_hint = _format_colab_recovery_hint(
+                        colab_bin, auth, iso_cfg, sess, leaked_endpoints, orphaned_endpoints
+                    )
                     print(
                         f"[freetpu-bench] WARNING: Colab teardown unverified for session={sess} "
-                        f"endpoint={endpoint} leaked_endpoints={leaked_endpoints}; "
-                        f"session config preserved at {iso_cfg} (recover via: {recovery_cmd})",
+                        f"endpoint={endpoint} leaked_endpoints={leaked_endpoints} "
+                        f"orphaned_endpoints={orphaned_endpoints}. {recovery_hint}",
                         file=sys.stderr,
                     )
 
@@ -1222,10 +1318,12 @@ def run_colab_tpu_suites(
                 "returncode": res.returncode,
                 "teardown_verified": teardown_verified,
                 "leaked_endpoints": leaked_endpoints,
+                "orphaned_endpoints": orphaned_endpoints,
                 "stderr_tail": res.stderr.strip()[-600:],
             }
             if not teardown_verified:
                 attempt_rec["recovery_config"] = str(iso_cfg)
+                attempt_rec["recovery_hint"] = recovery_hint
             attempts.append(attempt_rec)
 
             if res.returncode == 0:
@@ -1236,23 +1334,27 @@ def run_colab_tpu_suites(
                     )
                 meta: Dict[str, Any] = {
                     "status": "ok",
+                    "colab_cli_version": colab_cli_version,
                     "tpu": tpu,
                     "session": sess,
                     "endpoint": endpoint,
                     "teardown_verified": teardown_verified,
                     "leaked_endpoints": leaked_endpoints,
+                    "orphaned_endpoints": orphaned_endpoints,
                     "usage_preflight": usage_res.stdout.strip(),
                     "attempts": attempts,
                 }
                 if not teardown_verified:
                     meta["recovery_config"] = str(iso_cfg)
+                    meta["recovery_hint"] = recovery_hint
                 payload["colab_meta"] = meta
                 return payload
             if idx + 1 < len(planned) and teardown_verified and is_colab_allocation_error(res.returncode, res.stderr):
                 continue
             raise RuntimeError(
                 f"Colab TPU run failed on {tpu} (rc={res.returncode}, teardown_verified={teardown_verified}, "
-                f"leaked_endpoints={leaked_endpoints}): {res.stderr.strip()[-600:]}"
+                f"leaked_endpoints={leaked_endpoints}, orphaned_endpoints={orphaned_endpoints}): "
+                f"{res.stderr.strip()[-600:]}"
             )
         raise RuntimeError(f"All Colab TPU candidates exhausted: {attempts}")
     finally:
@@ -1321,6 +1423,18 @@ def _compute_economics(
     }
 
 
+def _infer_tpu_hourly_cost_usd(device_kind: str, colab_tpu: Optional[str] = None) -> Optional[float]:
+    """Map JAX `device_kind` / Colab SKU to public GCP on-demand $/chip-hr."""
+    kind_low = " ".join(str(device_kind).lower().split())
+    if colab_tpu == "v6e1" or "v6e" in kind_low or "v6 lite" in kind_low or "trillium" in kind_low:
+        return 2.70
+    if colab_tpu == "v5e1" or "v5e" in kind_low or "v5 lite" in kind_low:
+        return 1.20
+    if "v5p" in kind_low or re.search(r"\bv5\b", kind_low):
+        return 4.20
+    return None
+
+
 def build_scorecard_rows(
     report: Dict[str, Any],
     model_gb: float = 8.0,
@@ -1344,15 +1458,7 @@ def build_scorecard_rows(
         if comp or bw:
             kind = dev_info.get("device_kind") or (colab_tpu.upper() if colab_tpu else "Cloud TPU")
             label = f"LIVE RUN: {kind} ({backend})"
-            kind_low = str(kind).lower()
-            if colab_tpu == "v6e1" or "v6e" in kind_low:
-                inferred_cost: Optional[float] = 2.70
-            elif "v5p" in kind_low:
-                inferred_cost = 4.20
-            elif colab_tpu == "v5e1" or "v5e" in kind_low or "v5 lite" in kind_low:
-                inferred_cost = 1.20
-            else:
-                inferred_cost = None
+            inferred_cost = _infer_tpu_hourly_cost_usd(str(kind), colab_tpu)
             cost_basis = f"GCP public on-demand rate (${inferred_cost:.2f}/chip-hr)" if inferred_cost else "local/unspecified"
             mem_limit = dev_info.get("hbm_bytes_limit")
             mem_str = f"{mem_limit / (1024**3):.2f} GiB HBM" if mem_limit else "TPU HBM"
@@ -1729,8 +1835,11 @@ def run_self_test() -> int:
     assert _safe_hbm_bytes_limit(_ErrMemDev()) is None
 
     for dev_kind, colab_kind, exp_cost in (
+        ("TPU v5", None, 4.20),
         ("TPU v5p", None, 4.20),
+        ("TPU v5 lite", None, 1.20),
         ("TPU v5 lite", "v5e1", 1.20),
+        ("TPU v6 lite", None, 2.70),
         ("TPU v6e", "v6e1", 2.70),
         ("TPU v4", None, None),
     ):
@@ -1833,12 +1942,48 @@ def run_self_test() -> int:
     assert "--tpu V6E1" in dry_out and "--tpu V5E1" in dry_out
     assert "--keep" in dry_out and "--emit-markers" in dry_out
 
-    # 4. Verify colab_tpu fallback + --keep + endpoint-based teardown verification
+    # 4. Verify colab CLI security minimum (>=0.7.6) is enforced BEFORE any authenticated call
+    for bad_ver_out, bad_rc in (
+        ("Version: 0.7.5\n", 0),
+        ("Version: 0.7.6rc1\n", 0),
+        ("Version: abcdef1\n", 0),
+        ("", 1),
+    ):
+        ver_calls: List[List[str]] = []
+
+        def _mock_bad_ver_runner(
+            cmd: Sequence[str], _out: str = bad_ver_out, _rc: int = bad_rc
+        ) -> subprocess.CompletedProcess[str]:
+            ver_calls.append(list(cmd))
+            if cmd[-1] == "version":
+                return subprocess.CompletedProcess(cmd, _rc, _out, "err" if _rc else "")
+            raise AssertionError(f"Authenticated command called despite bad colab version: {cmd}")
+
+        try:
+            run_colab_tpu_suites(
+                suites=["compute"],
+                quick=True,
+                colab_bin="colab",
+                auth="adc",
+                tpu_order=("v5e1",),
+                config_path=None,
+                timeout_s=120.0,
+                runner=_mock_bad_ver_runner,
+            )
+        except RuntimeError as exc:
+            assert "0.7.6" in str(exc), str(exc)
+        else:  # pragma: no cover
+            raise AssertionError(f"Expected RuntimeError for colab version {bad_ver_out!r}")
+        assert len(ver_calls) == 1 and ver_calls[0] == ["colab", "version"]
+
+    # 4a. Verify colab_tpu fallback + --keep + endpoint-based teardown verification (version 0.7.6 accepted)
     calls: List[List[str]] = []
     v5e_active = {"live": False, "endpoint": "m-s-v5e1-ok"}
 
     def _mock_colab_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess[str]:
         calls.append(list(cmd))
+        if cmd[-1] == "version":
+            return subprocess.CompletedProcess(cmd, 0, "Version: 0.7.6\n", "")
         if "usage" in cmd:
             return subprocess.CompletedProcess(cmd, 0, "Current balance: 100.0 compute units\n", "")
         if "stop" in cmd:
@@ -1883,11 +2028,14 @@ def run_self_test() -> int:
         timeout_s=120.0,
         runner=_mock_colab_runner,
     )
+    assert colab_res["colab_meta"]["colab_cli_version"] == "0.7.6"
     assert colab_res["colab_meta"]["tpu"] == "v5e1"
     assert colab_res["colab_meta"]["endpoint"] == "m-s-v5e1-ok"
     assert colab_res["colab_meta"]["teardown_verified"] is True
     assert colab_res["colab_meta"]["leaked_endpoints"] == []
+    assert colab_res["colab_meta"]["orphaned_endpoints"] == []
     assert colab_res["compute"]["peak_bf16_tflops"] == 179.36
+    assert calls[0] == ["colab", "version"]
     assert any("stop" in c for c in calls)
     assert not v5e_active["live"]
 
@@ -1895,6 +2043,8 @@ def run_self_test() -> int:
     orphan_state = {"stage": "pre", "endpoint": "m-s-leaked-01"}
 
     def _mock_orphan_leak_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if cmd[-1] == "version":
+            return subprocess.CompletedProcess(cmd, 0, "Version: 0.8.0\n", "")
         if "usage" in cmd:
             return subprocess.CompletedProcess(cmd, 0, "100.0\n", "")
         if "run" in cmd:
@@ -1913,14 +2063,12 @@ def run_self_test() -> int:
             if orphan_state["stage"] == "pre":
                 return subprocess.CompletedProcess(cmd, 0, "[colab] No active sessions found on server.\n", "")
             if orphan_state["stage"] == "running":
-                # Local state still maps session -> endpoint before stop
                 return subprocess.CompletedProcess(
                     cmd,
                     0,
                     f"[?] {orphan_state['endpoint']} | Hardware: V5E1 | Shape: Standard | Variant: TPU\n",
                     "",
                 )
-            # After failed unassign, backend still lists the runtime under `[?]`
             return subprocess.CompletedProcess(
                 cmd,
                 0,
@@ -1943,6 +2091,10 @@ def run_self_test() -> int:
         )
     assert orphan_res["colab_meta"]["teardown_verified"] is False
     assert orphan_res["colab_meta"]["leaked_endpoints"] == ["m-s-leaked-01"]
+    assert orphan_res["colab_meta"]["orphaned_endpoints"] == ["m-s-leaked-01"]
+    hint_text = orphan_res["colab_meta"]["recovery_hint"]
+    assert "m-s-leaked-01" in hint_text and "Manage sessions" in hint_text and "no-op" in hint_text
+    assert "retry `" not in hint_text
     assert "teardown unverified" in warn_buf.getvalue()
     orphan_rec = Path(orphan_res["colab_meta"]["recovery_config"])
     assert orphan_rec.parent.is_dir()
@@ -1954,6 +2106,8 @@ def run_self_test() -> int:
 
     def _mock_mapped_leak_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess[str]:
         mapped_calls.append(list(cmd))
+        if cmd[-1] == "version":
+            return subprocess.CompletedProcess(cmd, 0, "Version: 0.8.0\n", "")
         if "usage" in cmd:
             return subprocess.CompletedProcess(cmd, 0, "100.0\n", "")
         if "run" in cmd:
@@ -2003,6 +2157,8 @@ def run_self_test() -> int:
     assert mapped_res["colab_meta"]["endpoint"] == "m-s-mapped-leak"
     assert mapped_res["colab_meta"]["teardown_verified"] is False
     assert mapped_res["colab_meta"]["leaked_endpoints"] == ["m-s-mapped-leak"]
+    assert mapped_res["colab_meta"]["orphaned_endpoints"] == ["m-s-mapped-leak"]
+    assert "Manage sessions" in mapped_res["colab_meta"]["recovery_hint"]
     mapped_rec = Path(mapped_res["colab_meta"]["recovery_config"])
     assert mapped_rec.parent.is_dir()
     shutil.rmtree(mapped_rec.parent, ignore_errors=True)
@@ -2013,6 +2169,8 @@ def run_self_test() -> int:
 
     def _mock_ki_clean_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess[str]:
         ki_calls.append(list(cmd))
+        if cmd[-1] == "version":
+            return subprocess.CompletedProcess(cmd, 0, "Version: 0.8.0\n", "")
         if "--config" in cmd:
             ki_state["cfg_path"] = cmd[cmd.index("--config") + 1]
         if "usage" in cmd:
@@ -2060,6 +2218,8 @@ def run_self_test() -> int:
     ki_fail_state: Dict[str, Any] = {"stage": "pre", "cfg_path": None}
 
     def _mock_ki_unverified_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if cmd[-1] == "version":
+            return subprocess.CompletedProcess(cmd, 0, "Version: 0.8.0\n", "")
         if "--config" in cmd:
             ki_fail_state["cfg_path"] = cmd[cmd.index("--config") + 1]
         if "usage" in cmd:
@@ -2100,8 +2260,59 @@ def run_self_test() -> int:
         raise AssertionError("Expected KeyboardInterrupt to propagate")
     preserved_cfg = Path(str(ki_fail_state["cfg_path"]))
     assert preserved_cfg.is_file()
-    assert str(preserved_cfg) in ki_warn.getvalue()
+    assert "m-s-ki-leak" in ki_warn.getvalue() and "Manage sessions" in ki_warn.getvalue()
     shutil.rmtree(preserved_cfg.parent, ignore_errors=True)
+
+    # 4f. End-to-end `main()` MUST return nonzero exit status when teardown_verified is False
+    e2e_dir = Path(tempfile.mkdtemp(prefix="freetpu-bench-e2e-"))
+    try:
+        stub_colab = e2e_dir / "fake-colab"
+        stub_state = e2e_dir / "state.txt"
+        stub_colab.write_text(
+            f"#!{sys.executable}\n"
+            "import json, sys\n"
+            "from pathlib import Path\n"
+            f"state = Path({str(stub_state)!r})\n"
+            "args = sys.argv[1:]\n"
+            "if args and args[-1] == 'version':\n"
+            "    print('Version: 0.8.0')\n"
+            "elif 'usage' in args:\n"
+            "    print('100.0')\n"
+            "elif 'run' in args:\n"
+            "    state.write_text('live', encoding='utf-8')\n"
+            "    payload = {'schema': 'freetpu.bench.v1', 'compute': {'peak_bf16_tflops': 1.0}}\n"
+            f"    print({BENCH_JSON_BEGIN!r})\n"
+            "    print(json.dumps(payload))\n"
+            f"    print({BENCH_JSON_END!r})\n"
+            "    print('[colab] Session READY.', file=sys.stderr)\n"
+            "elif 'stop' in args:\n"
+            "    print('[colab] Session not found.')\n"
+            "elif 'sessions' in args:\n"
+            "    if state.exists():\n"
+            "        print('[?] m-s-orphan-e2e | Hardware: V5E1 | Shape: Standard | Variant: TPU')\n"
+            "    else:\n"
+            "        print('[colab] No active sessions found on server.')\n",
+            encoding="utf-8",
+        )
+        os.chmod(stub_colab, 0o700)
+        e2e_out = StringIO()
+        e2e_err = StringIO()
+        with redirect_stdout(e2e_out), redirect_stderr(e2e_err):
+            rc_leak = main([
+                "--suite", "compute",
+                "--backend", "colab_tpu",
+                "--colab-tpu", "v5e1",
+                "--colab-bin", str(stub_colab),
+                "--colab-config", str(e2e_dir / "sessions.json"),
+                "--json", "-",
+            ])
+        assert rc_leak == 2, rc_leak
+        e2e_report = json.loads(e2e_out.getvalue())
+        assert e2e_report["colab_meta"]["teardown_verified"] is False
+        assert e2e_report["colab_meta"]["orphaned_endpoints"] == ["m-s-orphan-e2e"]
+        assert "m-s-orphan-e2e" in e2e_err.getvalue() and "Manage sessions" in e2e_err.getvalue()
+    finally:
+        shutil.rmtree(e2e_dir, ignore_errors=True)
 
     print(
         json.dumps(
@@ -2249,6 +2460,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if not args.emit_markers and not args.json_out and not args.md_out:
         sys.stdout.write(md_text)
+
+    colab_meta = report.get("colab_meta")
+    if isinstance(colab_meta, dict) and colab_meta.get("teardown_verified") is False:
+        return 2
 
     return 0
 

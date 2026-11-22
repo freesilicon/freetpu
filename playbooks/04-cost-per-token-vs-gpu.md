@@ -33,17 +33,30 @@ python3 bench/freetpu_bench.py \
   --markdown runs/econ-b32.md
 ```
 
-### 3. Compact 4-Bit Edge Footprint (`4.0 GB` Q4 Model)
+### 3. Compact 4-Bit Edge Footprint (`4.0 GB` Packed `Q4_0` vs `8.0 GB` Pixel Tensor G5 Unpacked DMA)
 
 ```bash
+# A. Targets with native packed 4-bit weight reads (~4.0 GB per decode token)
 python3 bench/freetpu_bench.py \
   --suite all \
   --backend buenos_mock \
   --model-gb 4.0 \
   --bw-efficiency 0.70 \
   --batch-size 1 \
-  --markdown runs/econ-q4.md
+  --markdown runs/econ-q4-packed.md
+
+# B. Pixel Tensor G5 (buenos_a0) effective Q4_0 DMA footprint (~8.0 GB per decode token:
+#    FreeTPU unpacks Q4_0 weights once at load time into 1 B/weight uint8 DMA-BUFs)
+python3 bench/freetpu_bench.py \
+  --suite all \
+  --backend buenos_mock \
+  --model-gb 8.0 \
+  --bw-efficiency 0.70 \
+  --batch-size 1 \
+  --markdown runs/econ-q4-pixel-unpacked.md
 ```
+
+> **Pixel Tensor G5 `Q4_0` Note**: Because `buenos_a0` has no native 4-bit nibble-unpack DMA unit (see [`docs/hardware-errata.md`](../docs/hardware-errata.md)), FreeTPU caches unpacked `uint8` weights (`1 B/weight`). A `~4.0 GB` packed `Q4_0` 8B model therefore streams **`~8.0 GB`** of weight DMA per decode token on Pixel—use the `--model-gb 8.0` Pixel row rather than `--model-gb 4.0` (which would double Pixel `tok/s` and halve `$/1M tok`).
 
 ---
 

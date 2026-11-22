@@ -52,15 +52,21 @@ python3 bench/freetpu_bench.py \
 # Cross-build llama-bench & ggml-rpc-server for Android ARM64
 ./llama-cpp-edgetpu/build.sh android
 
-# Node 2: start clean-room EDGETPU RPC server on the dedicated USB-Ethernet link (zero Google .so)
+# Node 2: bind clean-room EDGETPU RPC server to loopback ONLY (zero Google .so)
 adb -s <node2_serial> shell "su -c 'OPENBUENOS_PERF_MODE=5 \
-  /data/local/tmp/tpu_open_stack/ggml-rpc-server -d EDGETPU -H 192.168.77.2 -p 50052 -t 4'"
+  /data/local/tmp/tpu_open_stack/ggml-rpc-server -d EDGETPU -H 127.0.0.1 -p 50052 -t 4'"
 
-# Node 1: split layers across Node 2 RPC + local EDGETPU
+# Tunnel Node 2 loopback -> host -> Node 1 loopback via ADB port forwarding
+adb -s <node2_serial> forward tcp:50052 tcp:50052
+adb -s <node1_serial> reverse tcp:50052 tcp:50052
+
+# Node 1: split layers across Node 2 RPC (over loopback tunnel) + local EDGETPU
 adb -s <node1_serial> shell "su -c 'OPENBUENOS_PERF_MODE=5 \
   /data/local/tmp/tpu_open_stack/llama-bench \
-  -m /data/local/tmp/models/model.gguf --rpc 192.168.77.2:50052 -ngl 14 -p 128 -n 32 -t 4'"
+  -m /data/local/tmp/models/model.gguf --rpc 127.0.0.1:50052 -ngl 14 -p 128 -n 32 -t 4'"
 ```
+
+> **Security Warning (`ggml-rpc-server`)**: Upstream `ggml-rpc-server` has **no client authentication or transport encryption** and runs as root here to access `/dev/edgetpu-soc`. Keep it bound to `127.0.0.1` over ADB port forwarding by default. Only bind directly to a USB-Ethernet interface (e.g. `-H 192.168.77.2`) on an **isolated, air-gapped lab test device** with firewall (`iptables`) rules restricting TCP `50052` exclusively to the intended peer IP (`192.168.77.1`).
 
 ---
 
