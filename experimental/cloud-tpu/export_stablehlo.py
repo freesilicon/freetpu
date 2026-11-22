@@ -7,19 +7,82 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
+import stat
 import subprocess
 
 import jax
 import jax.numpy as jnp
 
-IR_DIR = os.environ.get("TPU_PJRT_IR_DIR", "/tmp/tpu_pjrt_ir")
+DEFAULT_WORK_DIR = os.path.join(os.path.expanduser("~"), ".cache", "freetpu-pjrt")
+IR_DIR = os.environ.get("TPU_PJRT_IR_DIR") or os.path.join(DEFAULT_WORK_DIR, "ir")
 CPP_SRC = Path(__file__).with_name("tpu_pjrt_bench.cpp")
-CPP_PATH = os.environ.get("TPU_PJRT_CPP_PATH", "/tmp/tpu_pjrt_bench.cpp")
-BIN_PATH = os.environ.get("TPU_PJRT_BIN_PATH", "/tmp/tpu_pjrt_bench")
+BIN_PATH = os.environ.get("TPU_PJRT_BIN_PATH") or os.path.join(
+    DEFAULT_WORK_DIR, "tpu_pjrt_bench"
+)
 PJRT_HEADER_URL = (
     "https://raw.githubusercontent.com/openxla/xla/main/xla/pjrt/c/pjrt_c_api.h"
 )
+
+
+def _is_safe_existing_ancestor(ancestor: str) -> bool:
+  if not os.path.lexists(ancestor):
+    return True
+  st = os.lstat(ancestor)
+  euid = os.geteuid() if hasattr(os, "geteuid") else st.st_uid
+  if stat.S_ISLNK(st.st_mode):
+    if st.st_uid != 0 and st.st_uid != euid:
+      return False
+    st = os.stat(ancestor)
+  if not stat.S_ISDIR(st.st_mode):
+    return False
+  if st.st_uid != euid and st.st_uid != 0:
+    return False
+  if (st.st_mode & 0o022) != 0 and not (st.st_mode & stat.S_ISVTX):
+    return False
+  return True
+
+
+def ensure_private_dir(raw_dir: str) -> str:
+  """Ensure `raw_dir` exists as a non-symlink directory owned by the user with mode 0700."""
+  expanded = os.path.expanduser(raw_dir)
+  if os.path.islink(expanded):
+    raise RuntimeError(f"Refusing symlinked directory path: {raw_dir}")
+  abs_dir = os.path.abspath(expanded)
+  if not os.path.lexists(abs_dir):
+    missing = []
+    cur = abs_dir
+    while not os.path.lexists(cur):
+      missing.append(cur)
+      parent = os.path.dirname(cur)
+      if parent == cur:
+        break
+      cur = parent
+    if not _is_safe_existing_ancestor(cur):
+      raise RuntimeError(f"Refusing to create directory under untrusted parent: {cur}")
+    for d in reversed(missing):
+      try:
+        os.mkdir(d, 0o700)
+      except FileExistsError:
+        pass
+  st = os.lstat(abs_dir)
+  if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+    raise RuntimeError(f"Expected non-symlink directory, got: {abs_dir}")
+  if hasattr(os, "geteuid") and st.st_uid != os.geteuid():
+    raise RuntimeError(f"Directory {abs_dir} is not owned by current user")
+  if (st.st_mode & 0o077) != 0:
+    raise RuntimeError(
+        f"Directory {abs_dir} must have private mode 0700 (got {oct(stat.S_IMODE(st.st_mode))})"
+    )
+  return abs_dir
+
+
+def write_bytes_nofollow(path: str, data: bytes, mode: int = 0o600) -> None:
+  if os.path.islink(path):
+    raise RuntimeError(f"Refusing symlinked output path: {path}")
+  flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+  fd = os.open(path, flags, mode)
+  with os.fdopen(fd, "wb") as f:
+    f.write(data)
 
 
 def probe_header_and_live_abi(hdr_path: str) -> str:
@@ -169,7 +232,9 @@ def serialize_compile_options(backend) -> tuple[bytes, bytes]:
   return _serialize(opts_jax), _serialize(opts_min)
 
 
-def export_gemm_ir(m: int, k: int, n: int, out_dtype_tag: str, tag: str) -> bytes:
+def export_gemm_ir(
+    ir_dir: str, m: int, k: int, n: int, out_dtype_tag: str, tag: str
+) -> bytes:
   out_dtype = jnp.float32 if out_dtype_tag == "f32" else jnp.bfloat16
 
   def gemm(a, b):
@@ -184,8 +249,9 @@ def export_gemm_ir(m: int, k: int, n: int, out_dtype_tag: str, tag: str) -> byte
   if "func.func" not in mlir_text:
     mlir_text = lowered.as_text("stablehlo")
 
-  with open(os.path.join(IR_DIR, f"gemm_{tag}.mlir"), "w", encoding="utf-8") as f:
-    f.write(mlir_text)
+  write_bytes_nofollow(
+      os.path.join(ir_dir, f"gemm_{tag}.mlir"), mlir_text.encode("utf-8")
+  )
 
   bio = io.BytesIO()
   if hasattr(ir_mod, "operation") and hasattr(ir_mod.operation, "write_bytecode"):
@@ -196,20 +262,30 @@ def export_gemm_ir(m: int, k: int, n: int, out_dtype_tag: str, tag: str) -> byte
 
     mlir_bc = jax_mlir.module_to_bytecode(ir_mod)
 
-  with open(os.path.join(IR_DIR, f"gemm_{tag}.mlirbc"), "wb") as f:
-    f.write(mlir_bc)
+  write_bytes_nofollow(os.path.join(ir_dir, f"gemm_{tag}.mlirbc"), mlir_bc)
 
   print(f"Exported {tag}: .mlir={len(mlir_text)} B, .mlirbc={len(mlir_bc)} B")
   return mlir_bc
 
 
 def main() -> None:
-  os.makedirs(IR_DIR, exist_ok=True)
-  hdr_path = os.path.join(IR_DIR, "pjrt_c_api.h")
+  if CPP_SRC.is_symlink() or not CPP_SRC.is_file():
+    raise RuntimeError(f"Invalid C++ source path: {CPP_SRC}")
+
+  ir_dir = ensure_private_dir(IR_DIR)
+  bin_abs = os.path.abspath(os.path.expanduser(BIN_PATH))
+  if os.path.islink(bin_abs):
+    raise RuntimeError(f"Refusing symlinked output binary path: {bin_abs}")
+  ensure_private_dir(os.path.dirname(bin_abs))
+
+  hdr_path = os.path.join(ir_dir, "pjrt_c_api.h")
+  if os.path.islink(hdr_path):
+    raise RuntimeError(f"Refusing symlinked header target: {hdr_path}")
   subprocess.run(["curl", "-fsSL", PJRT_HEADER_URL, "-o", hdr_path], check=True)
   so_path = probe_header_and_live_abi(hdr_path)
-  with open(os.path.join(IR_DIR, "libtpu_path.txt"), "w", encoding="utf-8") as f:
-    f.write(so_path + "\n")
+  write_bytes_nofollow(
+      os.path.join(ir_dir, "libtpu_path.txt"), (so_path + "\n").encode("utf-8")
+  )
 
   try:
     backend = jax.extend.backend.get_backend()
@@ -219,10 +295,8 @@ def main() -> None:
     backend = xla_bridge.get_backend()
 
   pb_jax, pb_min = serialize_compile_options(backend)
-  with open(os.path.join(IR_DIR, "compile_options.pb"), "wb") as f:
-    f.write(pb_jax)
-  with open(os.path.join(IR_DIR, "compile_options_minimal.pb"), "wb") as f:
-    f.write(pb_min)
+  write_bytes_nofollow(os.path.join(ir_dir, "compile_options.pb"), pb_jax)
+  write_bytes_nofollow(os.path.join(ir_dir, "compile_options_minimal.pb"), pb_min)
 
   specs = [
       (1, 64, 32, "f32", "1x64x32_bf16_f32"),
@@ -231,10 +305,7 @@ def main() -> None:
       (8192, 8192, 8192, "bf16", "8192x8192x8192_bf16_bf16"),
   ]
   for m, k, n, dt, tag in specs:
-    export_gemm_ir(m, k, n, dt, tag)
-
-  if os.path.abspath(str(CPP_SRC)) != os.path.abspath(CPP_PATH):
-    shutil.copyfile(CPP_SRC, CPP_PATH)
+    export_gemm_ir(ir_dir, m, k, n, dt, tag)
 
   compile_cmd = [
       "g++",
@@ -242,17 +313,17 @@ def main() -> None:
       "-std=c++17",
       "-Wall",
       "-Wextra",
-      f"-I{IR_DIR}",
+      f"-I{ir_dir}",
       f"-DFREETPU_DEFAULT_LIBTPU_PATH={json.dumps(so_path)}",
-      CPP_PATH,
+      str(CPP_SRC),
       "-ldl",
       "-pthread",
       "-o",
-      BIN_PATH,
+      bin_abs,
   ]
   subprocess.run(compile_cmd, check=True)
-  print(f"Built binary: {BIN_PATH} ({os.path.getsize(BIN_PATH)} bytes)")
-  print(f"Run: LIBTPU_PATH={so_path} TPU_PJRT_IR_DIR={IR_DIR} {BIN_PATH}")
+  print(f"Built binary: {bin_abs} ({os.path.getsize(bin_abs)} bytes)")
+  print(f"Run: LIBTPU_PATH={so_path} TPU_PJRT_IR_DIR={ir_dir} {bin_abs}")
   print("=== EXPORT_AND_BUILD_COMPLETE ===")
 
 

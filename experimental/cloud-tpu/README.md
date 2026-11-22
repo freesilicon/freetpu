@@ -13,33 +13,35 @@ Clean-room experimental scripts and C++17 PJRT runtime prototypes validating Tra
 | `vfio_pci_survey.py` | **#4 VFIO/PCI & PJRT ABI Survey** | Read-only inspection of `/dev/vfio/*`, `tpu-info`, `jax.devices()`, dynamic `/sys/bus/pci/devices/*` (`BAR0`/`BAR4`, MSI-X, `vfio-pci`), `GetPjrtApi()` version & `struct_size`, and JAX Pallas/Mosaic TPU APIs |
 | `raw_compute_bench.py` | **#0 Raw Compute & HBM BW Baseline** | Raw `jax.lax.dot_general` BF16/INT8 GEMM sweep (`1x64x32`..`16384^3`) and HBM streaming triad bandwidth (`a + s * b`) |
 | `pallas_opt_bench.py` | **#3 Pallas GEMM+SiLU & FlashAttention** | Tile & `async_copy` double-buffering sweep on `4096^3` BF16 `GEMM + SiLU` + Triton-style `@tpu_flash_attn` causal attention vs dense XLA |
-| `llama8b_decode_bench.py` | **#2 Llama-3-8B `W8A16`/`W4A16` Decode** | Fused VMEM-dequant Pallas `W8A16` / `W4A16` + `RMSNorm` + `SwiGLU` microbenchmarks and full 32-layer resident HBM `jax.lax.scan` decode (`B=1`, `B=32`) |
-| `export_stablehlo.py` | **#1 StableHLO IR Export & C++ Build** | Exports `.mlir` + `.mlirbc` + `CompileOptionsProto`, verifies 26/26 `PJRT_Api` offsets against `libtpu.so`, fetches `pjrt_c_api.h`, and builds `/tmp/tpu_pjrt_bench` |
+| `llama8b_decode_bench.py` | **#2 Llama-3-8B `W8A16`/`W4A16` Decode** | Fused VMEM-dequant Pallas `W8A16` / `W4A16` + `RMSNorm` + `SwiGLU` microbenchmarks and full 32-layer resident HBM `jax.lax.scan` synthetic decoder-layer step (`B=1`, `B=32`) |
+| `export_stablehlo.py` | **#1 StableHLO IR Export & C++ Build** | Exports `.mlir` + `.mlirbc` + `CompileOptionsProto` into `~/.cache/freetpu-pjrt/ir`, verifies 26/26 `PJRT_Api` offsets against `libtpu.so`, fetches `pjrt_c_api.h`, and compiles checked-in `tpu_pjrt_bench.cpp` directly to `~/.cache/freetpu-pjrt/tpu_pjrt_bench` |
 | `tpu_pjrt_bench.cpp` | **#1 Zero-Python C++17 PJRT Runtime** | Standalone CUDA-like `TpuRuntime` (`dlopen(libtpu.so)` -> `GetPjrtApi()`), `/proc/self/maps` zero-`libpython` check, `1x64x32` parity, sync/async/pipelined dispatch & `8192^3` TFLOP/s |
 
 ---
 
 ## Reproducing on a Cloud TPU VM (`v5e-1` / `v6e-1`)
 
-Using `google-colab-cli` (`colab --auth=adc` with isolated `--config` and `--tpu V6E1` or `V5E1`) or directly on a Cloud TPU VM:
+Using `google-colab-cli` (`colab --auth=adc` with isolated `--config` under a private `0700` directory and `--tpu V6E1` or `V5E1`) or directly on a Cloud TPU VM:
 
 ```bash
+mkdir -p -m 700 ~/.cache/freetpu-colab ~/.cache/freetpu-pjrt/ir
+
 # Headless ephemeral single-script run (provisions -> runs -> auto-stops)
-colab --auth=adc --config /tmp/freetpu-colab.json run --tpu V6E1 experimental/cloud-tpu/raw_compute_bench.py
+colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json run --tpu V6E1 -- experimental/cloud-tpu/raw_compute_bench.py
 
 # Or run all stages inside one persistent session (export .ipynb + always stop on exit)
-colab --auth=adc --config /tmp/freetpu-colab.json new -s freetpu-tpu --tpu V5E1
-colab --auth=adc --config /tmp/freetpu-colab.json exec -s freetpu-tpu -f experimental/cloud-tpu/vfio_pci_survey.py
-colab --auth=adc --config /tmp/freetpu-colab.json exec -s freetpu-tpu -f experimental/cloud-tpu/raw_compute_bench.py
-colab --auth=adc --config /tmp/freetpu-colab.json exec -s freetpu-tpu -f experimental/cloud-tpu/pallas_opt_bench.py
-colab --auth=adc --config /tmp/freetpu-colab.json exec -s freetpu-tpu -f experimental/cloud-tpu/llama8b_decode_bench.py
-colab --auth=adc --config /tmp/freetpu-colab.json upload -s freetpu-tpu experimental/cloud-tpu/tpu_pjrt_bench.cpp /content/tpu_pjrt_bench.cpp
-colab --auth=adc --config /tmp/freetpu-colab.json upload -s freetpu-tpu experimental/cloud-tpu/export_stablehlo.py /content/export_stablehlo.py
-colab --auth=adc --config /tmp/freetpu-colab.json exec -s freetpu-tpu "import runpy; runpy.run_path('/content/export_stablehlo.py', run_name='__main__')"
-colab --auth=adc --config /tmp/freetpu-colab.json restart-kernel -s freetpu-tpu
-colab --auth=adc --config /tmp/freetpu-colab.json exec -s freetpu-tpu "import subprocess; print(subprocess.check_output('ldd /tmp/tpu_pjrt_bench && /tmp/tpu_pjrt_bench', shell=True, text=True))"
-colab --auth=adc --config /tmp/freetpu-colab.json log -s freetpu-tpu -o /tmp/freetpu-tpu-proof.ipynb
-colab --auth=adc --config /tmp/freetpu-colab.json stop -s freetpu-tpu
+colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json new -s freetpu-tpu --tpu V5E1
+colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json exec -s freetpu-tpu -f experimental/cloud-tpu/vfio_pci_survey.py
+colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json exec -s freetpu-tpu -f experimental/cloud-tpu/raw_compute_bench.py
+colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json exec -s freetpu-tpu -f experimental/cloud-tpu/pallas_opt_bench.py
+colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json exec -s freetpu-tpu -f experimental/cloud-tpu/llama8b_decode_bench.py
+colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json upload -s freetpu-tpu experimental/cloud-tpu/tpu_pjrt_bench.cpp /content/tpu_pjrt_bench.cpp
+colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json upload -s freetpu-tpu experimental/cloud-tpu/export_stablehlo.py /content/export_stablehlo.py
+colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json exec -s freetpu-tpu "import runpy; runpy.run_path('/content/export_stablehlo.py', run_name='__main__')"
+colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json restart-kernel -s freetpu-tpu
+colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json exec -s freetpu-tpu "import os, subprocess; bin_p = os.path.expanduser('~/.cache/freetpu-pjrt/tpu_pjrt_bench'); print(subprocess.check_output(['ldd', bin_p], text=True)); print(subprocess.check_output([bin_p], text=True))"
+colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json log -s freetpu-tpu -o ~/.cache/freetpu-colab/freetpu-tpu-proof.ipynb
+colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json stop -s freetpu-tpu
 ```
 
 > **Note on `v6e-1` (Trillium) availability**: An ephemeral `colab run --tpu V6E1` survey verified `GetPjrtApi() struct_size=1144, version=0.116` on a `V6E1` host (with `0000:00:05.0` occupied by the `0x1ae0:0x0042` gVNIC NIC rather than TPU, prompting dynamic `/sys/bus/pci/devices/*` scanning in `vfio_pci_survey.py`). Follow-up full-suite `V6E1` allocation requests encountered intermittent Colab `503 Service Unavailable` / `ReadTimeout` capacity limits, so full end-to-end benchmarks below are anchored on verified **`v5e-1`** silicon.
@@ -55,18 +57,19 @@ python3 experimental/cloud-tpu/llama8b_decode_bench.py
 python3 experimental/cloud-tpu/export_stablehlo.py
 
 # Stage B (Fresh process / restarted kernel with /dev/vfio/0 released; zero Python)
-ldd /tmp/tpu_pjrt_bench
-/tmp/tpu_pjrt_bench
+ldd ~/.cache/freetpu-pjrt/tpu_pjrt_bench
+~/.cache/freetpu-pjrt/tpu_pjrt_bench
 ```
 
-Or build `tpu_pjrt_bench.cpp` standalone once `pjrt_c_api.h` and `.mlirbc` artifacts exist in `/tmp/tpu_pjrt_ir`:
+Or build checked-in `tpu_pjrt_bench.cpp` standalone in a private `0700` directory once `.mlirbc` artifacts exist in `$HOME/.cache/freetpu-pjrt/ir`:
 
 ```bash
+mkdir -p -m 700 ~/.cache/freetpu-pjrt/ir
 curl -fsSL https://raw.githubusercontent.com/openxla/xla/main/xla/pjrt/c/pjrt_c_api.h \
-  -o /tmp/tpu_pjrt_ir/pjrt_c_api.h
-g++ -O3 -std=c++17 -Wall -Wextra -I/tmp/tpu_pjrt_ir \
-  experimental/cloud-tpu/tpu_pjrt_bench.cpp -ldl -pthread -o /tmp/tpu_pjrt_bench
-/tmp/tpu_pjrt_bench
+  -o ~/.cache/freetpu-pjrt/ir/pjrt_c_api.h
+g++ -O3 -std=c++17 -Wall -Wextra -I"$HOME/.cache/freetpu-pjrt/ir" \
+  experimental/cloud-tpu/tpu_pjrt_bench.cpp -ldl -pthread -o ~/.cache/freetpu-pjrt/tpu_pjrt_bench
+~/.cache/freetpu-pjrt/tpu_pjrt_bench
 ```
 
 ---
@@ -99,16 +102,16 @@ g++ -O3 -std=c++17 -Wall -Wextra -I/tmp/tpu_pjrt_ir \
   - `B=2, H=32, Q=K=2048, D=128`: **`1,386.44 us` (`49.57 TFLOP/s`)** vs dense XLA `4,913.38 us` (`13.99 TFLOP/s`) — **`3.54x` speedup**.
   - `B=1, H=32, Q=K=4096, D=128`: **`2,092.06 us` (`65.70 TFLOP/s` median / `66.65` peak)** vs dense XLA `9,436.90 us` (`14.56 TFLOP/s`) — **`4.51x` speedup** (`max_abs_err=0.015625`).
 
-### 4. Resident 32-Layer Llama-3-8B Decode (`llama8b_decode_bench.py`)
-Exact Llama-3-8B geometry (`d=4096, 32L, 32Q/8KV, head_dim=128, ff=14336`) resident in HBM via `jax.lax.scan`:
+### 4. Resident 32-Layer Llama-3-8B Synthetic Decoder-Layer Steps (`llama8b_decode_bench.py`)
+Exact Llama-3-8B hidden/FFN/GQA geometry (`d=4096, 32L, 32Q/8KV, head_dim=128, ff=14336`) resident in HBM via `jax.lax.scan`, repeatedly stepping synthetic activations across a fixed 256-entry synthetic KV cache and stopping at the final hidden state (omitting RoPE, LM-head vocabulary projection, and token sampling; throughput below is `batch / step_time` synthetic decoder-layer `steps/s`):
 - **Single-Projection `W4A16` (`int32_split8_3d`, `max_abs_err = 0.0..0.0078`)**: `QKV 1x4096->6144` **`154.93 us`** (`2.02x` vs XLA), `Gate+Up 1x4096->28672` **`389.37 us`** (`3.24x` vs XLA `1,260.84 us`), `Down 1x14336->4096` **`243.66 us`** (`1.79x` vs XLA).
 - **`W8A16` 32-Layer Resident (`6.98 GB` weights, `step0_max_abs_err=0.047` @ `B=1`)**:
-  - `B=1`: XLA **`10.254 ms/step` (`97.53 tok/s`, `684.27 GB/s` = `83.55%` HBM BW)**; Pallas `17.840 ms/step` (`56.05 tok/s`).
-  - `B=32`: XLA **`20.367 ms/step` (`1,571.15 tok/s`, `395.55 GB/s`)**; Pallas `35.045 ms/step` (`913.12 tok/s`).
+  - `B=1`: XLA **`10.254 ms/step` (`97.53 steps/s`, `684.27 GB/s` = `83.55%` HBM BW)**; Pallas `17.840 ms/step` (`56.05 steps/s`).
+  - `B=32`: XLA **`20.367 ms/step` (`1,571.15 steps/s`, `395.55 GB/s`)**; Pallas `35.045 ms/step` (`913.12 steps/s`).
 - **`W4A16` 32-Layer Resident (`3.49 GB` packed `int32` weights)**:
-  - `B=1`: Pallas **`15.529 ms/step` (`64.39 tok/s`, `227.09 GB/s`)** vs XLA `47.374 ms/step` (`21.11 tok/s`) — **`3.05x` speedup**.
-  - `B=32`: Pallas **`27.416 ms/step` (`1,167.20 tok/s`, `166.57 GB/s`)** vs XLA `63.876 ms/step` (`500.97 tok/s`) — **`2.33x` speedup**.
-  - *(Note: `W4A16` synthetic 32-layer `step0_max_abs_err` was `16.0` @ `B=1` / `8.0` @ `B=32` due to BF16 ULP magnitude over 32 layers from unscaled uniform `[0..15]-8` `-0.5` bias; single-projection `W4A16` accuracy vs XLA is `0.0..0.0078`.)*
+  - `B=1`: Pallas **`15.529 ms/step` (`64.39 steps/s`, `227.09 GB/s`)** vs XLA `47.374 ms/step` (`21.11 steps/s`) — **`3.05x` speedup**.
+  - `B=32`: Pallas **`27.416 ms/step` (`1,167.20 steps/s`, `166.57 GB/s`)** vs XLA `63.876 ms/step` (`500.97 steps/s`) — **`2.33x` speedup**.
+  - *(Note: `W4A16` synthetic 32-layer `step0_max_abs_err` vs XLA was `16.0` @ `B=1` / `8.0` @ `B=32`: `alloc_stacked_w4_weights()` multiplies asymmetric `[0..15] - 8` random nibbles (`-0.5` mean) by strictly positive per-output scales `~[0.5, 1.5] / (8 * sqrt(K))` — with `1 / sqrt(64)` residual scaling on `wo`/`wd` — causing synthetic hidden states to grow across 32 residual layers into large-exponent BF16 where 1–2 ULPs equal `8.0`–`16.0`; single-projection `W4A16` parity vs XLA is `0.0..0.0078`.)*
 
 ---
 
@@ -121,4 +124,4 @@ Exact Llama-3-8B geometry (`d=4096, 32L, 32Q/8KV, head_dim=128, ff=14336`) resid
 | **Memory & Peak BW** | Unified LPDDR (`27.59 GB/s` measured @ `1x2048x2048`) + `768 KiB` NM SRAM | `15.748 GiB` HBM2e (**`655.55 GB/s`** triad / **`684.27 GB/s`** `W8A16` 32L) + `128 MiB` VMEM |
 | **Small-Op Floor** | **`60.8–72.8 us`** chained `0xa40` fusion (`152 us` `1x2048x2048`) | **`124.5–126.9 us`** sync PJRT floor; **`32.0 us`** amortized when async-pipelined (`100x`) |
 | **Peak Matrix Compute** | `983.6 INT8 GOPS` @ `177.2 mW` (**`5.55 TOPS/W`**) | **`180.36 TFLOP/s`** BF16 (C++ PJRT) / **`350.69 TOPS`** INT8 |
-| **LLM Inference (`tok/s`)** | `Qwen2.5-1.5B-Q8_0`: `pp512 = 105.87 t/s`, `tg64 = 5.85 t/s` (`-21.5% mJ/tok` vs CPU) | `Llama-3-8B W8A16`: **`97.53 t/s`** (`B=1`) / **`1,571.15 t/s`** (`B=32`); `W4A16` Pallas: **`64.39 t/s`** (`B=1`) / **`1,167.20 t/s`** (`B=32`) |
+| **End-to-End LLM vs Synthetic Decoder Steps** | `Qwen2.5-1.5B-Q8_0` (end-to-end): `pp512 = 105.87 tok/s`, `tg64 = 5.85 tok/s` (`-21.5% mJ/tok` vs CPU) | `Llama-3-8B` (32L synthetic decoder steps/s, excludes RoPE/LM head/sampling): `W8A16` **`97.53 steps/s`** (`B=1`) / **`1,571.15 steps/s`** (`B=32`); `W4A16` Pallas: **`64.39 steps/s`** (`B=1`) / **`1,167.20 steps/s`** (`B=32`) |

@@ -1,9 +1,10 @@
 // Zero-Python C++17 PJRT TPU Runtime Prototype & GEMM Benchmark
 // Targets Colab TPU v5e-1 via direct dlopen(libtpu.so) -> GetPjrtApi().
 // Compile on Linux x86_64:
-//   g++ -O3 -std=c++17 -Wall -Wextra -I/tmp/tpu_pjrt_ir /tmp/tpu_pjrt_bench.cpp -ldl -pthread -o /tmp/tpu_pjrt_bench
+//   g++ -O3 -std=c++17 -Wall -Wextra -I"$HOME/.cache/freetpu-pjrt/ir" \
+//     experimental/cloud-tpu/tpu_pjrt_bench.cpp -ldl -pthread -o "$HOME/.cache/freetpu-pjrt/tpu_pjrt_bench"
 
-#include "pjrt_c_api.h"
+#include <pjrt_c_api.h>
 
 #include <dlfcn.h>
 
@@ -962,13 +963,23 @@ std::string resolve_libtpu_path(const std::string& ir_dir) {
 #endif
 }
 
+std::string resolve_default_ir_dir() {
+  const char* env_ir = std::getenv("TPU_PJRT_IR_DIR");
+  if (env_ir != nullptr && env_ir[0] != '\0') {
+    return env_ir;
+  }
+  const char* home = std::getenv("HOME");
+  if (home != nullptr && home[0] != '\0') {
+    return std::string(home) + "/.cache/freetpu-pjrt/ir";
+  }
+  throw std::runtime_error("Set TPU_PJRT_IR_DIR or HOME to locate PJRT IR artifacts");
+}
+
 }  // namespace
 
 int main() {
   try {
-    const char* env_ir = std::getenv("TPU_PJRT_IR_DIR");
-    const std::string ir_dir =
-        (env_ir != nullptr && env_ir[0] != '\0') ? env_ir : "/tmp/tpu_pjrt_ir";
+    const std::string ir_dir = resolve_default_ir_dir();
     const std::string libtpu_path = resolve_libtpu_path(ir_dir);
 
     TpuRuntime rt;

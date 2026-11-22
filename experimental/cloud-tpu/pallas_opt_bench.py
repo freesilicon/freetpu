@@ -85,17 +85,8 @@ CompilerParams = getattr(pltpu, "CompilerParams", None) or getattr(
 )
 print("COMPILER_PARAMS_SIG:", str(inspect.signature(CompilerParams)))
 
+# Explicit opt_level is SparseCore-only on TensorCore in JAX 0.11.2 (lowering rejects it).
 opt_levels_available = [None]
-try:
-    from jax._src.tpu_custom_call import OptLevel
-
-    members = [m for m in dir(OptLevel) if not m.startswith("_")]
-    print("OPT_LEVEL_MEMBERS:", members)
-    for name in ("O2", "O3"):
-        if hasattr(OptLevel, name):
-            opt_levels_available.append(getattr(OptLevel, name))
-except Exception as e:
-    print("OPT_LEVEL_NOTE:", repr(e))
 
 
 # ---------------------------------------------------------------------------
@@ -489,21 +480,6 @@ cp_configs = [
     ("pallas3d_1024x1024x512_rhsT", 1024, 1024, 512, True, 16 * 1024 * 1024, None, (True, True), True),
     ("pallas3d_512x1024x1024_rhsT", 512, 1024, 1024, True, 16 * 1024 * 1024, None, (True, True), True),
 ]
-for opt_lvl in opt_levels_available:
-    if opt_lvl is not None:
-        cp_configs.append(
-            (
-                f"pallas3d_1024x512x512_opt_{getattr(opt_lvl, 'name', str(opt_lvl))}",
-                1024,
-                512,
-                512,
-                False,
-                16 * 1024 * 1024,
-                opt_lvl,
-                (True, True),
-                True,
-            )
-        )
 
 for label, bm, bn, bk, rhs_t, vmem_b, opt_lvl, aif, dbc in cp_configs:
     rhs_arg = b_mat_t if rhs_t else b_mat
