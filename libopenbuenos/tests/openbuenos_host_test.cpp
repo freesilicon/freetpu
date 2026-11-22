@@ -4540,6 +4540,22 @@ void test_phase7_cycle3_regressions() {
       big_d.s_out = 1.0f; // m_down = 2^128 -> non-finite float -> must be rejected!
       CHECK(ob_gemm_swiglu_int8(ctx, xz.data(), &big_d, yz.data(), &is) == OB_ERR_INVALID_ARG);
     }
+
+    // 9e. Weight cache must charge rounded DMA-BUF slab bytes (4 KiB min), not raw payload bytes.
+    {
+      ob_config_t cfg_s = ob_config_default();
+      cfg_s.mock_mode = 1;
+      ob_context_t* sctx = nullptr;
+      CHECK(ob_context_create(&cfg_s, &sctx) == OB_OK);
+      CHECK(ob_gemm_register_builtin_emitter(sctx, interp_file.path()) == OB_OK);
+      std::vector<int8_t> as(16u, 1), bs(16u * 16u, 2);
+      std::vector<int32_t> cs(16u, 0);
+      ob_invoke_stats_t ss{};
+      CHECK(ob_gemm_matmul_int8(sctx, as.data(), bs.data(), nullptr, cs.data(), 1u, 16u, 16u, 0, 0, &ss) == OB_OK);
+      CHECK(sctx->weight_cache_map.size() == 1u);
+      CHECK(sctx->weight_cache_bytes == 4096u);
+      ob_context_destroy(sctx);
+    }
     ob_context_destroy(ctx);
   }
 

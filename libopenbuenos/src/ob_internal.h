@@ -172,6 +172,7 @@ bool        device_attach_inflight_buffers(ob_context* ctx,
                                            std::initializer_list<ob_buffer*> bufs);
 
 // Buffer pool helpers (implemented in ob_buffer_pool.cpp)
+size_t buffer_slab_size(size_t requested);
 void buffer_retain(ob_buffer* buf);
 void buffer_destroy_slab(ob_context* ctx, PooledSlab* slab);
 void buffer_pool_clear(ob_context* ctx);

@@ -2448,8 +2448,9 @@ ob_status_t ob_gemm_matmul_int8(ob_context_t* ctx,
               if (prof_on) ctx->prof.weight_pack_ns += (ob::monotonic_now_ns() - tp0);
 
               bool cacheable = false;
+              const size_t ext2_slab_bytes = ob::buffer_slab_size(ext2.size());
               ob_status_t pst = ob::weight_cache_prepare_space_locked(
-                  ctx, ext2.size(), ring_count, drain_one, &cacheable);
+                  ctx, ext2_slab_bytes, ring_count, drain_one, &cacheable);
               if (pst != OB_OK) {
                 drain_all_cleanup();
                 return pst;
@@ -2477,7 +2478,7 @@ ob_status_t ob_gemm_matmul_int8(ob_context_t* ctx,
               w_tile->hw_k = hw_k;
               w_tile->hw_n = hw_n;
               w_tile->ext2_buf = wbuf;
-              w_tile->ext2_bytes = ext2.size();
+              w_tile->ext2_bytes = wbuf->slab.alloc_size;
               if (cacheable) {
                 ob::weight_cache_insert_locked(ctx, w_tile);
               } else {
@@ -3188,8 +3189,9 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
             if (prof_on) ctx->prof.weight_pack_ns += (ob::monotonic_now_ns() - tp0);
 
             bool cacheable = false;
+            const size_t ext2_slab_bytes = ob::buffer_slab_size(ext2.size());
             ob_status_t pst = ob::weight_cache_prepare_space_locked(
-                ctx, ext2.size(), ring_count, drain_one, &cacheable);
+                ctx, ext2_slab_bytes, ring_count, drain_one, &cacheable);
             if (pst != OB_OK) {
               drain_all_cleanup();
               return pst;
@@ -3218,7 +3220,7 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
             w_tile->hw_n = hw_n;
             w_tile->row_s_b = std::move(sb_vec);
             w_tile->ext2_buf = wbuf;
-            w_tile->ext2_bytes = ext2.size();
+            w_tile->ext2_bytes = wbuf->slab.alloc_size;
             if (cacheable) {
               ob::weight_cache_insert_locked(ctx, w_tile);
             } else {
@@ -4843,8 +4845,9 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
           if (prof_on) ctx->prof.weight_pack_ns += (ob::monotonic_now_ns() - tp0);
 
           bool cacheable = false;
+          const size_t ext2_slab_bytes = ob::buffer_slab_size(ext2.size());
           ob_status_t pst = ob::weight_cache_prepare_space_locked(
-              ctx, ext2.size(), ring_count, drain_one, &cacheable);
+              ctx, ext2_slab_bytes, ring_count, drain_one, &cacheable);
           if (pst != OB_OK) {
             drain_all_cleanup();
             return pst;
@@ -4876,7 +4879,7 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
           w_tile->hw_n = N;
           w_tile->row_s_b = std::move(row_s_d);
           w_tile->ext2_buf = wbuf;
-          w_tile->ext2_bytes = ext2.size();
+          w_tile->ext2_bytes = wbuf->slab.alloc_size;
           w_tile->swiglu_s_wg = s_wg;
           w_tile->swiglu_l2_gate_max = l2_g_max;
           w_tile->swiglu_l2_gate_mean = l2_g_mean;

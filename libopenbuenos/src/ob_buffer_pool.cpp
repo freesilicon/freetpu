@@ -269,6 +269,10 @@ ob_status_t buffer_sync_end_write(ob_buffer* buf) {
 #endif
 }
 
+size_t buffer_slab_size(size_t requested) {
+  return compute_slab_size(requested);
+}
+
 void buffer_retain(ob_buffer* buf) {
   if (!buf) return;
   buf->refcnt.fetch_add(1u, std::memory_order_relaxed);
