@@ -115,10 +115,10 @@ PY
 Or prepare Python >= 3.12 with the tested TPU runtime (`jax==0.11.2`, `libtpu==0.0.50`) and run Stage A / Stage B directly on a local Cloud TPU VM:
 
 ```bash
-# Prerequisites on a fresh Cloud TPU VM (Python >= 3.12 required for jax 0.11.2)
+# Prerequisites on a fresh Cloud TPU VM (Python >= 3.12 required for jax[tpu]==0.11.2)
 python3.12 -m venv ~/.venvs/freetpu-tpu
 source ~/.venvs/freetpu-tpu/bin/activate
-python3 -m pip install --upgrade "jax[tpu]==0.11.2" "libtpu==0.0.50" numpy
+python3 -m pip install --upgrade "jax[tpu]==0.11.2" numpy
 
 # Stage A (JAX kernel active on /dev/vfio/0; ensure g++ and curl are installed)
 python3 experimental/cloud-tpu/vfio_pci_survey.py
