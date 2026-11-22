@@ -56,7 +56,6 @@ struct edgetpu_env_config {
     bool         has_priority          = false;
     uint8_t      perf_mode             = 0; // 0 -> libopenbuenos default, 1..5 = DVFS perf tier
     bool         has_perf_mode         = false;
-    bool         immutable_weights     = false; // Explicit opt-in (OPENBUENOS_IMMUTABLE_WEIGHTS=1) when caller guarantees no direct tensor->data writes
     const char * dive_interp_path      = EDGETPU_DEFAULT_DIVE_INTERP_PATH;
 };
 
@@ -90,9 +89,6 @@ static edgetpu_env_config load_env_config() {
     }
     if (const char * v = std::getenv("OPENBUENOS_PACKED_Q8")) {
         cfg.packed_q8 = (std::atoi(v) != 0);
-    }
-    if (const char * v = std::getenv("OPENBUENOS_IMMUTABLE_WEIGHTS")) {
-        cfg.immutable_weights = (std::atoi(v) != 0);
     }
     if (const char * v = std::getenv("OPENBUENOS_BATCH_SIBLINGS")) {
         cfg.batch_siblings = (std::atoi(v) != 0);
@@ -306,27 +302,11 @@ static std::shared_ptr<packed_q8_weight> repack_q8_0_to_buenos(const block_q8_0 
 // EDGETPU Backend Buffer (64B-aligned host-accessible + Q8_0 repack cache)
 // =========================================================================
 
-static std::mutex & edgetpu_live_ob_ctxs_mu() {
-    static auto * mu = new std::mutex();
-    return *mu;
-}
-
-static std::vector<ob_context_t *> & edgetpu_live_ob_ctxs() {
-    static auto * ctxs = new std::vector<ob_context_t *>();
-    return *ctxs;
-}
-
-static uint64_t next_edgetpu_weight_version() {
-    static std::atomic<uint64_t> counter{1u};
-    return counter.fetch_add(1u, std::memory_order_relaxed);
-}
-
 struct ggml_backend_edgetpu_buffer_context {
     void * data        = nullptr;
     size_t size        = 0;
     bool   owns_memory = false;
 
-    std::atomic<uint64_t> weight_version{next_edgetpu_weight_version()};
     std::atomic<bool> has_packed_entries{false};
     std::mutex cache_mu;
     std::unordered_map<const void *, std::shared_ptr<packed_q8_weight>> packed_q8_cache;
@@ -344,12 +324,6 @@ static bool is_edgetpu_buffer(ggml_backend_buffer_t buffer) {
 
 static void ggml_backend_edgetpu_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     auto * ctx = static_cast<ggml_backend_edgetpu_buffer_context *>(buffer->context);
-    if (ctx && ctx->data && ctx->size > 0u) {
-        std::lock_guard<std::mutex> lk(edgetpu_live_ob_ctxs_mu());
-        for (ob_context_t * ob_ctx : edgetpu_live_ob_ctxs()) {
-            ob_gemm_unregister_immutable_weights(ob_ctx, ctx->data, ctx->size);
-        }
-    }
     delete ctx;
 }
 
@@ -365,7 +339,6 @@ static void ggml_backend_edgetpu_buffer_memset_tensor(ggml_backend_buffer_t buff
                                                       size_t                size) {
     auto * ctx = static_cast<ggml_backend_edgetpu_buffer_context *>(buffer->context);
     std::memset(static_cast<char *>(tensor->data) + offset, value, size);
-    ctx->weight_version.store(next_edgetpu_weight_version(), std::memory_order_release);
 
     if (ctx->has_packed_entries.load(std::memory_order_acquire)) {
         std::lock_guard<std::mutex> lock(ctx->cache_mu);
@@ -383,7 +356,6 @@ static void ggml_backend_edgetpu_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                                    size_t                size) {
     auto * ctx = static_cast<ggml_backend_edgetpu_buffer_context *>(buffer->context);
     std::memcpy(static_cast<char *>(tensor->data) + offset, data, size);
-    ctx->weight_version.store(next_edgetpu_weight_version(), std::memory_order_release);
 
     // Invalidate any stale repacked weight for this tensor address (lock-free skip in default zero-dup mode).
     if (ctx->has_packed_entries.load(std::memory_order_acquire)) {
@@ -435,33 +407,11 @@ static void ggml_backend_edgetpu_buffer_get_tensor(ggml_backend_buffer_t      bu
 static bool ggml_backend_edgetpu_buffer_cpy_tensor(ggml_backend_buffer_t      buffer,
                                                    const struct ggml_tensor * src,
                                                    struct ggml_tensor *       dst) {
-    if (!buffer || !src || !dst || !src->buffer || !dst->data) {
-        return false;
-    }
-    const size_t nbytes = ggml_nbytes(src);
-    if (nbytes != ggml_nbytes(dst)) {
-        return false;
-    }
     if (ggml_backend_buffer_is_host(src->buffer)) {
-        ggml_backend_edgetpu_buffer_set_tensor(buffer, dst, src->data, 0, nbytes);
+        ggml_backend_edgetpu_buffer_set_tensor(buffer, dst, src->data, 0, ggml_nbytes(src));
         return true;
     }
-    auto * ctx = static_cast<ggml_backend_edgetpu_buffer_context *>(buffer->context);
-    if (!ctx) {
-        return false;
-    }
-    // Intercept device-to-EdgeTPU copies here so ggml_backend_tensor_copy() does not
-    // bypass our version bump and packed-weight cache invalidation via raw host writes.
-    ggml_backend_tensor_get(src, dst->data, 0, nbytes);
-    ctx->weight_version.store(next_edgetpu_weight_version(), std::memory_order_release);
-    if (ctx->has_packed_entries.load(std::memory_order_acquire)) {
-        std::lock_guard<std::mutex> lock(ctx->cache_mu);
-        ctx->packed_q8_cache.erase(dst->data);
-        if (ctx->packed_q8_cache.empty()) {
-            ctx->has_packed_entries.store(false, std::memory_order_release);
-        }
-    }
-    return true;
+    return false;
 }
 
 static void ggml_backend_edgetpu_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
@@ -469,7 +419,6 @@ static void ggml_backend_edgetpu_buffer_clear(ggml_backend_buffer_t buffer, uint
     if (ctx->data && ctx->size > 0) {
         std::memset(ctx->data, value, ctx->size);
     }
-    ctx->weight_version.store(next_edgetpu_weight_version(), std::memory_order_release);
     if (ctx->has_packed_entries.load(std::memory_order_acquire)) {
         std::lock_guard<std::mutex> lock(ctx->cache_mu);
         ctx->packed_q8_cache.clear();
@@ -479,7 +428,6 @@ static void ggml_backend_edgetpu_buffer_clear(ggml_backend_buffer_t buffer, uint
 
 static void ggml_backend_edgetpu_buffer_reset(ggml_backend_buffer_t buffer) {
     auto * ctx = static_cast<ggml_backend_edgetpu_buffer_context *>(buffer->context);
-    ctx->weight_version.store(next_edgetpu_weight_version(), std::memory_order_release);
     if (ctx->has_packed_entries.load(std::memory_order_acquire)) {
         std::lock_guard<std::mutex> lock(ctx->cache_mu);
         ctx->packed_q8_cache.clear();
@@ -604,7 +552,6 @@ struct ggml_backend_edgetpu_context {
     // Fallback repack cache for weights residing in non-EDGETPU host buffers (only when OPENBUENOS_PACKED_Q8=1)
     std::mutex fallback_cache_mu;
     std::unordered_map<const void *, std::shared_ptr<packed_q8_weight>> fallback_packed_cache;
-    std::unordered_map<const void *, std::pair<size_t, uint64_t>> immutable_weight_versions;
 
     // Cumulative execution telemetry for OPENBUENOS_VERBOSE=1 shutdown summary
     uint64_t total_graph_evals         = 0;
@@ -680,49 +627,11 @@ struct ggml_backend_edgetpu_context {
                     static_cast<unsigned long long>(pool_hits),
                     static_cast<unsigned long long>(pool_misses));
             }
-            {
-                std::lock_guard<std::mutex> lk(edgetpu_live_ob_ctxs_mu());
-                auto & live = edgetpu_live_ob_ctxs();
-                live.erase(std::remove(live.begin(), live.end(), ob_ctx), live.end());
-            }
             ob_context_destroy(ob_ctx);
             ob_ctx = nullptr;
         }
     }
 };
-
-static void ensure_immutable_weight_buffer(ggml_backend_edgetpu_context * ctx,
-                                           ggml_backend_buffer_t          buffer) {
-    // EDGETPU buffers are host-accessible (is_host() == true), so raw writes directly to
-    // tensor->data outside ggml buffer callbacks cannot be observed. Only register immutable
-    // O(1) regions when the caller explicitly opts in via OPENBUENOS_IMMUTABLE_WEIGHTS=1 and
-    // the buffer is EdgeTPU-owned weight storage.
-    if (!ctx || !ctx->ob_ctx || !ctx->env.immutable_weights || !is_edgetpu_buffer(buffer)) {
-        return;
-    }
-    auto * bctx = static_cast<ggml_backend_edgetpu_buffer_context *>(buffer->context);
-    if (!bctx || !bctx->data || bctx->size == 0u) {
-        return;
-    }
-    if (!bctx->owns_memory || buffer->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
-        auto it = ctx->immutable_weight_versions.find(bctx->data);
-        if (it != ctx->immutable_weight_versions.end()) {
-            ob_gemm_unregister_immutable_weights(ctx->ob_ctx, bctx->data, it->second.first);
-            ctx->immutable_weight_versions.erase(it);
-        }
-        return;
-    }
-    const uint64_t ver = bctx->weight_version.load(std::memory_order_acquire);
-    auto it = ctx->immutable_weight_versions.find(bctx->data);
-    if (it != ctx->immutable_weight_versions.end() &&
-        it->second.first == bctx->size &&
-        it->second.second == ver) {
-        return;
-    }
-    if (ob_gemm_register_immutable_weights(ctx->ob_ctx, bctx->data, bctx->size, ver) == OB_OK) {
-        ctx->immutable_weight_versions[bctx->data] = std::make_pair(bctx->size, ver);
-    }
-}
 
 static std::shared_ptr<packed_q8_weight> get_or_repack_q8_weight(ggml_backend_edgetpu_context * ctx,
                                                                  const ggml_tensor *            src0,
@@ -784,8 +693,6 @@ static ggml_status ggml_edgetpu_compute_forward_mul_mat(ggml_backend_edgetpu_con
 
     const int64_t r2 = ne12 / ne02;
     const int64_t r3 = ne13 / ne03;
-
-    ensure_immutable_weight_buffer(ctx, src0->buffer);
 
     uint64_t total_hw_us   = 0;
     uint64_t total_wall_us = 0;
@@ -1408,8 +1315,6 @@ static ggml_status ggml_edgetpu_compute_forward_mul_mat_id(ggml_backend_edgetpu_
     const uint8_t  is_q4_0  = (src0->type == GGML_TYPE_Q4_0) ? 1u : 0u;
 
     const auto * q8_traits = (src1->type == GGML_TYPE_Q8_0) ? ggml_get_type_traits(GGML_TYPE_Q8_0) : nullptr;
-
-    ensure_immutable_weight_buffer(ctx, src0->buffer);
 
     uint64_t total_hw_us   = 0;
     uint64_t total_wall_us = 0;
@@ -2047,10 +1952,6 @@ static int try_compute_fused_swiglu(ggml_backend_edgetpu_context * ctx,
         a_ptr = ctx->f32_a.data();
     }
 
-    ensure_immutable_weight_buffer(ctx, gate_mm->src[0]->buffer);
-    ensure_immutable_weight_buffer(ctx, up_mm->src[0]->buffer);
-    ensure_immutable_weight_buffer(ctx, down_mm->src[0]->buffer);
-
     ob_gemm_swiglu_quant_desc_t sdesc {};
     sdesc.w_gate_hk    = gate_mm->src[0]->data;
     sdesc.w_up_hk      = up_mm->src[0]->data;
@@ -2265,7 +2166,6 @@ static ggml_status ggml_backend_edgetpu_graph_compute(ggml_backend_t backend, st
 
                         ob_gemm_f32_quant_job_t jobs[MAX_SIBLINGS];
                         for (int k = 0; k < n_mm; ++k) {
-                            ensure_immutable_weight_buffer(ctx, mm_nodes[k]->src[0]->buffer);
                             jobs[k]            = {};
                             jobs[k].b_nk       = mm_nodes[k]->src[0]->data;
                             jobs[k].c_mn       = mm_needs_scratch[k]
@@ -2990,10 +2890,6 @@ ggml_backend_t ggml_backend_edgetpu_init(void) {
     auto * ctx = new ggml_backend_edgetpu_context();
     ctx->ob_ctx = ob_ctx;
     ctx->env    = env;
-    {
-        std::lock_guard<std::mutex> lk(edgetpu_live_ob_ctxs_mu());
-        edgetpu_live_ob_ctxs().push_back(ob_ctx);
-    }
 
     if (env.verbose > 0) {
         GGML_LOG_INFO(

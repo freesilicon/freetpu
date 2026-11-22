@@ -918,6 +918,11 @@ bool read_env_flag(const char* name, bool default_val) {
   return (s[0] != '0');
 }
 
+bool read_env_opt_in_one(const char* name) {
+  const char* s = std::getenv(name);
+  return (s != nullptr && s[0] == '1');
+}
+
 struct ObPowerProfile {
   uint8_t fw_priority;           // Execute +0x1c (default 0x0b; 0x00..0x01 foreground peak)
   uint8_t tpu_core_power_state;  // Execute +0x1d & WakeLock +0x02 (0x03..0x19; >=0x1a rejected)
@@ -1032,9 +1037,9 @@ ob_status_t ob_context_create(const ob_config_t* config, ob_context_t** out_ctx)
   ctx->profile_enabled = read_env_flag("OPENBUENOS_PROFILE", false);
   ctx->verbose_enabled = read_env_flag("OPENBUENOS_VERBOSE", false);
   ctx->strict_weight_hash = read_env_flag("OPENBUENOS_STRICT_WEIGHT_HASH", true);
-  ctx->large_tiles_enabled = !read_env_flag("OPENBUENOS_DISABLE_LARGE_TILES", false);
+  ctx->large_tiles_enabled = !read_env_opt_in_one("OPENBUENOS_DISABLE_LARGE_TILES");
   ctx->batched_large_tiles_enabled =
-      ctx->large_tiles_enabled && !read_env_flag("OPENBUENOS_DISABLE_BATCHED_LARGE_TILES", false);
+      ctx->large_tiles_enabled && !read_env_opt_in_one("OPENBUENOS_DISABLE_BATCHED_LARGE_TILES");
   ctx->horiz_fusion_enabled = !read_env_flag("OPENBUENOS_DISABLE_HORIZ_FUSION", false);
   ctx->swiglu_chain_enabled = !read_env_flag("OPENBUENOS_DISABLE_SWIGLU_CHAIN", false);
   ctx->swiglu_fast_chain_enabled = read_env_flag("OPENBUENOS_SWIGLU_FAST_CHAIN", false);
