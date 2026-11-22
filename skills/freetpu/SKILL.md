@@ -155,9 +155,10 @@ Use this workflow with `google-colab-cli >= 0.7.6` (redacted logs) to run Pallas
          # If cancelled mid-allocation, let `colab new` finish persisting $SESSION_ID so `colab stop` can release it by name:
          [ -n "$ALLOC_PID" ] && wait "$ALLOC_PID" 2>/dev/null || true
 
-         # Capture assigned endpoint before stopping (never read $COLAB_STATE tokens):
+         # Capture assigned endpoint before stopping and persist non-secret IDs outside the subshell:
          PRE_SESS="$(colab --auth=adc --config "$COLAB_STATE" sessions 2>/dev/null)" || PRE_SESS=""
          ENDPOINT="$(printf '%s\n' "$PRE_SESS" | awk -v s="[$SESSION_ID]" '$1 == s {print $2; exit}')"
+         ( umask 077; printf 'COLAB_STATE=%q\nSESSION_ID=%q\nENDPOINT=%q\n' "$COLAB_STATE" "$SESSION_ID" "$ENDPOINT" > "$WORK_DIR/recovery.env" )
 
          colab --auth=adc --config "$COLAB_STATE" log \
            -s "$SESSION_ID" -o "$WORK_DIR/$SESSION_ID.ipynb" || true
@@ -167,7 +168,8 @@ Use this workflow with `google-colab-cli >= 0.7.6` (redacted logs) to run Pallas
 
          # `colab sessions` catches SystemExit on ADC refresh failure when local state is empty
          # and exits 0; run `colab usage` (which propagates auth failures non-zero) and inspect
-         # `colab sessions` stderr/stdout to require a confirmed server-side teardown.
+         # `colab sessions` stderr/stdout. When ENDPOINT is known, verify that exact endpoint is
+         # gone so concurrent workers' `[?]` assignments do not trigger false failures.
          SESS_ERR="$WORK_DIR/sessions.err"
          NEW_UNNAMED=""
          TEARDOWN_RC=0
@@ -177,22 +179,24 @@ Use this workflow with `google-colab-cli >= 0.7.6` (redacted logs) to run Pallas
            TEARDOWN_RC=1
          elif grep -Eiq 'No valid default credentials|Failed to refresh' "$SESS_ERR"; then
            TEARDOWN_RC=1
+         elif [ -n "$ENDPOINT" ]; then
+           if [ "$STOP_RC" -ne 0 ] || printf '%s\n' "$SESS_OUT" | awk -v s="[$SESSION_ID]" -v e="$ENDPOINT" '$1 == s || $2 == e {found=1} END {exit !found}'; then
+             TEARDOWN_RC=1
+           fi
          else
            NEW_UNNAMED="$(printf '%s\n' "$SESS_OUT" | awk -v base="$BASE_ENDPOINTS" '
              BEGIN { n = split(base, arr, "\n"); for (i = 1; i <= n; i++) if (arr[i] != "") seen[arr[i]] = 1 }
              $1 == "[?]" && $2 != "" && !($2 in seen) { print $2 }
            ' | tr '\n' ' ' | sed 's/ *$//')"
-           if [ "$STOP_RC" -ne 0 ] \
-             || { [ -z "$ENDPOINT" ] && { [ "$RUN_RC" -eq 0 ] || [ "$CANCELLED" -eq 1 ]; }; } \
-             || [ -n "$NEW_UNNAMED" ] \
-             || printf '%s\n' "$SESS_OUT" | awk -v s="[$SESSION_ID]" -v e="$ENDPOINT" \
-                  '$1 == s || (e != "" && $2 == e) {found=1} END {exit !found}'; then
+           if [ "$STOP_RC" -ne 0 ] || [ "$RUN_RC" -eq 0 ] || [ "$CANCELLED" -eq 1 ] || [ -n "$NEW_UNNAMED" ] \
+             || printf '%s\n' "$SESS_OUT" | awk -v s="[$SESSION_ID]" '$1 == s {found=1} END {exit !found}'; then
              TEARDOWN_RC=1
            fi
          fi
 
          if [ "$TEARDOWN_RC" -ne 0 ]; then
-           echo "ERROR: TPU teardown unconfirmed for $SESSION_ID (endpoint=${ENDPOINT:-unknown}; new unnamed assignments: ${NEW_UNNAMED:-none}); re-authenticate if needed, retry colab stop with $COLAB_STATE, or terminate in Colab UI (Runtime -> Manage sessions)." >&2
+           printf 'ERROR: TPU teardown unconfirmed (session=%s endpoint=%s new_unnamed=%s).\nRecovery: colab --auth=adc --config %q stop -s %q && colab --auth=adc --config %q sessions\nIdentifiers saved in %s (or terminate in Colab UI: Runtime -> Manage sessions).\n' \
+             "$SESSION_ID" "${ENDPOINT:-unknown}" "${NEW_UNNAMED:-none}" "$COLAB_STATE" "$SESSION_ID" "$COLAB_STATE" "$WORK_DIR/recovery.env" >&2
            exit 1
          fi
          exit "$RUN_RC"
@@ -243,7 +247,7 @@ Use this workflow with `google-colab-cli >= 0.7.6` (redacted logs) to run Pallas
      ```
    - **Teardown verification**:
      - **Wrapper (`tools/colab_tpu_bench.py`)**: Inspect `$WORK_DIR/proof/summary.json` (`session_name`, `created_endpoint`, `teardown_verified`, `recovery_config`, and `recovery_command`). If `teardown_verified` is not `true`, run the recorded `recovery_command` (or stop `<session_name>` against `<recovery_config>` and verify `<created_endpoint>` is absent from `colab --auth=adc --config <recovery_config> sessions` alongside a passing `colab usage`), or terminate `<created_endpoint>` in the Colab UI (`Runtime -> Manage sessions`) if local state is no longer present.
-     - **Direct CLI (`$COLAB_STATE`)**: Verify both ADC/API health (`colab --auth=adc --config "$COLAB_STATE" usage >/dev/null`) and server-side absence of `$ENDPOINT` / `$SESSION_ID` (`colab --auth=adc --config "$COLAB_STATE" sessions` with no credential warnings on stderr), treating any auth or query failure as unconfirmed teardown. If a runtime is still listed, stop it with `colab --auth=adc --config "$COLAB_STATE" stop -s "$SESSION_ID"` (or terminate it in the Colab UI `Runtime -> Manage sessions` if local state was dropped).
+     - **Direct CLI (`$WORK_DIR/recovery.env`)**: After the subshell exits, `source "$WORK_DIR/recovery.env"` (or run the exact `Recovery:` command printed on stderr) to load `COLAB_STATE`, `SESSION_ID`, and `ENDPOINT`, then confirm `colab --auth=adc --config "$COLAB_STATE" usage >/dev/null` and that `ENDPOINT`/`SESSION_ID` are absent from `colab --auth=adc --config "$COLAB_STATE" sessions`. If a runtime survives, run the printed `colab stop` command (or terminate it in Colab UI `Runtime -> Manage sessions` if local state was dropped).
    - For multi-step interactive sessions, prefer `colab exec` (keeps XLA/PJRT caches warm) over `colab ssh` (capped at 5 sessions / HTTP 429). Use `colab download` instead of `drive.mount`.
 
 ---
