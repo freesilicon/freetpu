@@ -1,0 +1,1959 @@
+#include "pjrt_runtime.hpp"
+
+#include <algorithm>
+#include <cctype>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <dlfcn.h>
+#include <fstream>
+#include <sstream>
+#include <stdexcept>
+#include <utility>
+
+namespace cloudtpu {
+
+#define PJRT_API_HAS(api, field)                                            \
+    ((api) != nullptr &&                                                    \
+     (offsetof(PJRT_Api, field) + sizeof((api)->field) <= (api)->struct_size) && \
+     ((api)->field != nullptr))
+
+// =========================================================================
+// Scalar Conversions & Type Helpers
+// =========================================================================
+
+uint16_t f32_to_bf16(float f) {
+    uint32_t u = 0;
+    std::memcpy(&u, &f, sizeof(u));
+    if ((u & 0x7fffffffU) > 0x7f800000U) {
+        return static_cast<uint16_t>((u >> 16) | 0x0040U);
+    }
+    const uint32_t lsb = (u >> 16) & 1U;
+    u += 0x7fffU + lsb;
+    return static_cast<uint16_t>(u >> 16);
+}
+
+float bf16_to_f32(uint16_t b) {
+    const uint32_t u = static_cast<uint32_t>(b) << 16;
+    float f = 0.0f;
+    std::memcpy(&f, &u, sizeof(f));
+    return f;
+}
+
+uint16_t f32_to_f16(float f) {
+    uint32_t x = 0;
+    std::memcpy(&x, &f, sizeof(x));
+    const uint32_t sign = (x >> 16) & 0x8000U;
+    uint32_t mant = x & 0x007fffffU;
+    int32_t exp = static_cast<int32_t>((x >> 23) & 0xffU) - 127 + 15;
+
+    if (((x >> 23) & 0xffU) == 0xffU) {
+        if (mant != 0) {
+            return static_cast<uint16_t>(sign | 0x7e00U | (mant >> 13));
+        }
+        return static_cast<uint16_t>(sign | 0x7c00U);
+    }
+    if (exp <= 0) {
+        if (exp < -10) {
+            return static_cast<uint16_t>(sign);
+        }
+        mant = (mant | 0x00800000U) >> (1 - exp);
+        const uint32_t round_bits = mant & 0x00001fffU;
+        const uint32_t lsb = (mant >> 13) & 1U;
+        if (round_bits > 0x00001000U || (round_bits == 0x00001000U && lsb != 0)) {
+            mant += 0x00002000U;
+        }
+        return static_cast<uint16_t>(sign | (mant >> 13));
+    }
+    if (exp >= 31) {
+        return static_cast<uint16_t>(sign | 0x7c00U);
+    }
+    const uint32_t round_bits = mant & 0x00001fffU;
+    const uint32_t lsb = (mant >> 13) & 1U;
+    if (round_bits > 0x00001000U || (round_bits == 0x00001000U && lsb != 0)) {
+        mant += 0x00002000U;
+        if ((mant & 0x00800000U) != 0) {
+            mant = 0;
+            exp += 1;
+            if (exp >= 31) {
+                return static_cast<uint16_t>(sign | 0x7c00U);
+            }
+        }
+    }
+    return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) | (mant >> 13));
+}
+
+float f16_to_f32(uint16_t h) {
+    const uint32_t sign = static_cast<uint32_t>(h & 0x8000U) << 16;
+    uint32_t exp = (h >> 10) & 0x1fU;
+    uint32_t mant = h & 0x03ffU;
+    uint32_t out = 0;
+
+    if (exp == 0) {
+        if (mant == 0) {
+            out = sign;
+        } else {
+            exp = 1;
+            while ((mant & 0x0400U) == 0) {
+                mant <<= 1;
+                exp -= 1;
+            }
+            mant &= 0x03ffU;
+            out = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        out = sign | 0x7f800000U | (mant << 13);
+    } else {
+        out = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+    }
+    float f = 0.0f;
+    std::memcpy(&f, &out, sizeof(f));
+    return f;
+}
+
+PJRT_Buffer_Type to_pjrt_buffer_type(PjrtDType dt) {
+    switch (dt) {
+        case PjrtDType::F32: return PJRT_Buffer_Type_F32;
+        case PjrtDType::F16: return PJRT_Buffer_Type_F16;
+        case PjrtDType::BF16: return PJRT_Buffer_Type_BF16;
+        case PjrtDType::S8: return PJRT_Buffer_Type_S8;
+        case PjrtDType::U8: return PJRT_Buffer_Type_U8;
+        case PjrtDType::S16: return PJRT_Buffer_Type_S16;
+        case PjrtDType::S32: return PJRT_Buffer_Type_S32;
+        default: return PJRT_Buffer_Type_INVALID;
+    }
+}
+
+PjrtDType from_pjrt_buffer_type(PJRT_Buffer_Type dt) {
+    switch (dt) {
+        case PJRT_Buffer_Type_F32: return PjrtDType::F32;
+        case PJRT_Buffer_Type_F16: return PjrtDType::F16;
+        case PJRT_Buffer_Type_BF16: return PjrtDType::BF16;
+        case PJRT_Buffer_Type_S8: return PjrtDType::S8;
+        case PJRT_Buffer_Type_U8: return PjrtDType::U8;
+        case PJRT_Buffer_Type_S16: return PjrtDType::S16;
+        case PJRT_Buffer_Type_S32: return PjrtDType::S32;
+        default: return PjrtDType::INVALID;
+    }
+}
+
+const char* pjrt_dtype_mlir_name(PjrtDType dt) {
+    switch (dt) {
+        case PjrtDType::F32: return "f32";
+        case PjrtDType::F16: return "f16";
+        case PjrtDType::BF16: return "bf16";
+        case PjrtDType::S8: return "i8";
+        case PjrtDType::U8: return "ui8";
+        case PjrtDType::S16: return "i16";
+        case PjrtDType::S32: return "i32";
+        default: return "invalid";
+    }
+}
+
+size_t pjrt_dtype_size(PjrtDType dt) {
+    switch (dt) {
+        case PjrtDType::F32:
+        case PjrtDType::S32: return 4;
+        case PjrtDType::F16:
+        case PjrtDType::BF16:
+        case PjrtDType::S16: return 2;
+        case PjrtDType::S8:
+        case PjrtDType::U8: return 1;
+        default: return 0;
+    }
+}
+
+// =========================================================================
+// Pure C++ CompileOptionsProto Encoder
+// =========================================================================
+
+namespace {
+
+void append_varint(std::string& out, uint64_t val) {
+    while (val >= 0x80ULL) {
+        out.push_back(static_cast<char>((val & 0x7fULL) | 0x80ULL));
+        val >>= 7;
+    }
+    out.push_back(static_cast<char>(val));
+}
+
+void append_tag_varint(std::string& out, uint32_t field_number, uint64_t val) {
+    append_varint(out, (static_cast<uint64_t>(field_number) << 3) | 0ULL);
+    append_varint(out, val);
+}
+
+}  // namespace
+
+std::string encode_compile_options_proto(const PjrtCompileOptions& opts) {
+    // xla::ExecutableBuildOptionsProto
+    std::string ebo;
+    if (opts.num_replicas > 0) {
+        append_tag_varint(ebo, 4, static_cast<uint64_t>(opts.num_replicas));
+    }
+    if (opts.num_partitions > 0) {
+        append_tag_varint(ebo, 5, static_cast<uint64_t>(opts.num_partitions));
+    }
+    if (opts.use_spmd_partitioning) {
+        append_tag_varint(ebo, 6, 1);
+    }
+    if (opts.use_shardy_partitioner) {
+        append_tag_varint(ebo, 19, 1);
+    }
+
+    // xla::CompileOptionsProto { executable_build_options (field 3, length-delimited) }
+    std::string out;
+    append_varint(out, (3ULL << 3) | 2ULL);
+    append_varint(out, ebo.size());
+    out.append(ebo);
+    return out;
+}
+
+// =========================================================================
+// PjrtBuffer Helpers
+// =========================================================================
+
+void PjrtBufferDeleter::operator()(PJRT_Buffer* buf) const noexcept {
+    if (!buf || !api || !PJRT_API_HAS(api, PJRT_Buffer_Destroy)) {
+        return;
+    }
+    PJRT_Buffer_Destroy_Args args = {};
+    args.struct_size = PJRT_Buffer_Destroy_Args_STRUCT_SIZE;
+    args.buffer = buf;
+    PJRT_Error* err = api->PJRT_Buffer_Destroy(&args);
+    if (err && PJRT_API_HAS(api, PJRT_Error_Destroy)) {
+        PJRT_Error_Destroy_Args d_args = {};
+        d_args.struct_size = PJRT_Error_Destroy_Args_STRUCT_SIZE;
+        d_args.error = err;
+        api->PJRT_Error_Destroy(&d_args);
+    }
+}
+
+size_t PjrtBuffer::num_elements() const {
+    size_t n = 1;
+    for (int64_t d : dims) {
+        n *= static_cast<size_t>(d);
+    }
+    return n;
+}
+
+size_t PjrtBuffer::num_bytes() const {
+    return num_elements() * pjrt_dtype_size(dtype);
+}
+
+// =========================================================================
+// In-Process Host Mock PJRT C API + StableHLO Textual Evaluator
+// =========================================================================
+
+namespace {
+
+struct MockTensor {
+    PjrtDType dtype = PjrtDType::INVALID;
+    std::vector<int64_t> dims;
+    std::vector<uint8_t> bytes;
+
+    size_t num_elements() const {
+        size_t n = 1;
+        for (int64_t d : dims) {
+            n *= static_cast<size_t>(d);
+        }
+        return n;
+    }
+
+    void allocate(PjrtDType dt, std::vector<int64_t> shape) {
+        dtype = dt;
+        dims = std::move(shape);
+        bytes.assign(num_elements() * pjrt_dtype_size(dt), 0);
+    }
+
+    float read_f32(size_t idx) const {
+        switch (dtype) {
+            case PjrtDType::F32: {
+                float v = 0.0f;
+                std::memcpy(&v, bytes.data() + idx * 4, 4);
+                return v;
+            }
+            case PjrtDType::F16: {
+                uint16_t h = 0;
+                std::memcpy(&h, bytes.data() + idx * 2, 2);
+                return f16_to_f32(h);
+            }
+            case PjrtDType::BF16: {
+                uint16_t b = 0;
+                std::memcpy(&b, bytes.data() + idx * 2, 2);
+                return bf16_to_f32(b);
+            }
+            case PjrtDType::S8:
+                return static_cast<float>(reinterpret_cast<const int8_t*>(bytes.data())[idx]);
+            case PjrtDType::U8:
+                return static_cast<float>(bytes[idx]);
+            case PjrtDType::S16: {
+                int16_t v = 0;
+                std::memcpy(&v, bytes.data() + idx * 2, 2);
+                return static_cast<float>(v);
+            }
+            case PjrtDType::S32: {
+                int32_t v = 0;
+                std::memcpy(&v, bytes.data() + idx * 4, 4);
+                return static_cast<float>(v);
+            }
+            default:
+                return 0.0f;
+        }
+    }
+
+    void write_f32(size_t idx, float v) {
+        switch (dtype) {
+            case PjrtDType::F32:
+                std::memcpy(bytes.data() + idx * 4, &v, 4);
+                break;
+            case PjrtDType::F16: {
+                const uint16_t h = f32_to_f16(v);
+                std::memcpy(bytes.data() + idx * 2, &h, 2);
+                break;
+            }
+            case PjrtDType::BF16: {
+                const uint16_t b = f32_to_bf16(v);
+                std::memcpy(bytes.data() + idx * 2, &b, 2);
+                break;
+            }
+            case PjrtDType::S8: {
+                const int8_t iv = static_cast<int8_t>(std::lround(v));
+                std::memcpy(bytes.data() + idx, &iv, 1);
+                break;
+            }
+            case PjrtDType::U8: {
+                const uint8_t uv = static_cast<uint8_t>(std::lround(v));
+                bytes[idx] = uv;
+                break;
+            }
+            case PjrtDType::S16: {
+                const int16_t iv = static_cast<int16_t>(std::lround(v));
+                std::memcpy(bytes.data() + idx * 2, &iv, 2);
+                break;
+            }
+            case PjrtDType::S32: {
+                const int32_t iv = static_cast<int32_t>(std::lround(v));
+                std::memcpy(bytes.data() + idx * 4, &iv, 4);
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
+    int64_t read_i64(size_t idx) const {
+        switch (dtype) {
+            case PjrtDType::S32: {
+                int32_t v = 0;
+                std::memcpy(&v, bytes.data() + idx * 4, 4);
+                return v;
+            }
+            case PjrtDType::S16: {
+                int16_t v = 0;
+                std::memcpy(&v, bytes.data() + idx * 2, 2);
+                return v;
+            }
+            case PjrtDType::S8:
+                return reinterpret_cast<const int8_t*>(bytes.data())[idx];
+            case PjrtDType::U8:
+                return static_cast<int64_t>(bytes[idx]);
+            default:
+                return static_cast<int64_t>(read_f32(idx));
+        }
+    }
+
+    void write_i64(size_t idx, int64_t v) {
+        switch (dtype) {
+            case PjrtDType::S32: {
+                const int32_t iv = static_cast<int32_t>(v);
+                std::memcpy(bytes.data() + idx * 4, &iv, 4);
+                break;
+            }
+            case PjrtDType::S16: {
+                const int16_t iv = static_cast<int16_t>(v);
+                std::memcpy(bytes.data() + idx * 2, &iv, 2);
+                break;
+            }
+            case PjrtDType::S8: {
+                const int8_t iv = static_cast<int8_t>(v);
+                std::memcpy(bytes.data() + idx, &iv, 1);
+                break;
+            }
+            case PjrtDType::U8:
+                bytes[idx] = static_cast<uint8_t>(v);
+                break;
+            default:
+                write_f32(idx, static_cast<float>(v));
+                break;
+        }
+    }
+};
+
+struct MockTypeSpec {
+    PjrtDType dtype = PjrtDType::INVALID;
+    std::vector<int64_t> dims;
+};
+
+static std::string trim_copy(const std::string& s) {
+    size_t a = 0;
+    while (a < s.size() && std::isspace(static_cast<unsigned char>(s[a]))) ++a;
+    size_t b = s.size();
+    while (b > a && std::isspace(static_cast<unsigned char>(s[b - 1]))) --b;
+    return s.substr(a, b - a);
+}
+
+static PjrtDType parse_mlir_dtype(const std::string& tok) {
+    if (tok == "f32") return PjrtDType::F32;
+    if (tok == "f16") return PjrtDType::F16;
+    if (tok == "bf16") return PjrtDType::BF16;
+    if (tok == "i8" || tok == "si8") return PjrtDType::S8;
+    if (tok == "ui8") return PjrtDType::U8;
+    if (tok == "i16" || tok == "si16") return PjrtDType::S16;
+    if (tok == "i32" || tok == "si32") return PjrtDType::S32;
+    return PjrtDType::INVALID;
+}
+
+static MockTypeSpec parse_tensor_type(const std::string& spec) {
+    const size_t lt = spec.find("tensor<");
+    const size_t gt = spec.rfind('>');
+    if (lt == std::string::npos || gt == std::string::npos || gt <= lt + 7) {
+        throw std::runtime_error("MockPJRT: invalid tensor type: " + spec);
+    }
+    const std::string inner = spec.substr(lt + 7, gt - (lt + 7));
+    MockTypeSpec out;
+    size_t pos = 0;
+    std::vector<std::string> parts;
+    while (pos <= inner.size()) {
+        const size_t x = inner.find('x', pos);
+        if (x == std::string::npos) {
+            parts.push_back(inner.substr(pos));
+            break;
+        }
+        parts.push_back(inner.substr(pos, x - pos));
+        pos = x + 1;
+    }
+    if (parts.empty()) {
+        throw std::runtime_error("MockPJRT: empty tensor type: " + spec);
+    }
+    out.dtype = parse_mlir_dtype(parts.back());
+    if (out.dtype == PjrtDType::INVALID) {
+        throw std::runtime_error("MockPJRT: unsupported dtype in: " + spec);
+    }
+    for (size_t i = 0; i + 1 < parts.size(); ++i) {
+        out.dims.push_back(std::stoll(parts[i]));
+    }
+    return out;
+}
+
+static std::vector<int64_t> parse_int_list(const std::string& s) {
+    std::vector<int64_t> out;
+    size_t i = 0;
+    while (i < s.size()) {
+        if (s[i] == '-' || std::isdigit(static_cast<unsigned char>(s[i]))) {
+            size_t end = i + 1;
+            while (end < s.size() && std::isdigit(static_cast<unsigned char>(s[end]))) ++end;
+            out.push_back(std::stoll(s.substr(i, end - i)));
+            i = end;
+        } else {
+            ++i;
+        }
+    }
+    return out;
+}
+
+static std::vector<std::string> extract_ssa_refs(const std::string& s) {
+    std::vector<std::string> refs;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '%') {
+            size_t j = i + 1;
+            while (j < s.size() && (std::isalnum(static_cast<unsigned char>(s[j])) || s[j] == '_')) {
+                ++j;
+            }
+            if (j > i + 1) {
+                refs.push_back(s.substr(i, j - i));
+            }
+            i = j;
+        }
+    }
+    return refs;
+}
+
+static std::vector<size_t> compute_row_major_strides(const std::vector<int64_t>& dims) {
+    std::vector<size_t> strides(dims.size(), 1);
+    for (int i = static_cast<int>(dims.size()) - 2; i >= 0; --i) {
+        strides[i] = strides[i + 1] * static_cast<size_t>(dims[i + 1]);
+    }
+    return strides;
+}
+
+struct MockOp {
+    enum class Kind {
+        CONSTANT,
+        IOTA,
+        CONVERT,
+        ADD,
+        SUBTRACT,
+        MULTIPLY,
+        DIVIDE,
+        MAXIMUM,
+        BIT_AND,
+        SHR_LOGICAL,
+        RSQRT,
+        COSINE,
+        SINE,
+        LOGISTIC,
+        EXPONENTIAL,
+        BROADCAST_IN_DIM,
+        RESHAPE,
+        TRANSPOSE,
+        SLICE,
+        CONCATENATE,
+        DOT_GENERAL,
+        REDUCE_ADD,
+        REDUCE_MAX,
+        GATHER,
+    };
+
+    Kind kind;
+    std::string out_name;
+    MockTypeSpec out_type;
+    std::vector<std::string> inputs;
+
+    // Constant values
+    bool is_splat = true;
+    double scalar_f = 0.0;
+    int64_t scalar_i = 0;
+    std::vector<double> array_f;
+    std::vector<int64_t> array_i;
+
+    // Parameters
+    int64_t iota_dim = 0;
+    int64_t concat_dim = 0;
+    std::vector<int64_t> dims_attr;
+    std::vector<int64_t> lhs_batch;
+    std::vector<int64_t> rhs_batch;
+    std::vector<int64_t> lhs_contract;
+    std::vector<int64_t> rhs_contract;
+    std::vector<int64_t> slice_starts;
+    std::vector<int64_t> slice_limits;
+    std::vector<int64_t> slice_strides;
+    // Gather attrs
+    std::vector<int64_t> gather_offset_dims;
+    std::vector<int64_t> gather_collapsed_dims;
+    std::vector<int64_t> gather_start_index_map;
+    int64_t gather_index_vector_dim = 0;
+};
+
+struct MockProgram {
+    std::vector<std::pair<std::string, MockTypeSpec>> args;
+    std::vector<MockOp> ops;
+    std::vector<std::string> return_names;
+};
+
+static MockProgram parse_stablehlo_mlir(const std::string& mlir) {
+    MockProgram prog;
+    std::istringstream iss(mlir);
+    std::string raw_line;
+    std::vector<std::string> lines;
+    while (std::getline(iss, raw_line)) {
+        const std::string t = trim_copy(raw_line);
+        if (!t.empty()) lines.push_back(t);
+    }
+
+    for (size_t li = 0; li < lines.size(); ++li) {
+        const std::string& line = lines[li];
+        if (line.rfind("func.func", 0) == 0) {
+            const size_t p0 = line.find('(');
+            const size_t p1 = line.find(") ->", p0);
+            if (p0 == std::string::npos || p1 == std::string::npos) {
+                throw std::runtime_error("MockPJRT: failed to parse func.func header");
+            }
+            const std::string arg_str = line.substr(p0 + 1, p1 - (p0 + 1));
+            size_t pos = 0;
+            while (pos < arg_str.size()) {
+                const size_t pct = arg_str.find('%', pos);
+                if (pct == std::string::npos) break;
+                const size_t col = arg_str.find(':', pct);
+                const size_t gt = arg_str.find('>', col);
+                const std::string name = trim_copy(arg_str.substr(pct, col - pct));
+                const MockTypeSpec ts = parse_tensor_type(arg_str.substr(col + 1, gt - col));
+                prog.args.push_back({name, ts});
+                pos = gt + 1;
+            }
+            continue;
+        }
+
+        if (line.rfind("return ", 0) == 0) {
+            const size_t col = line.find(':');
+            const std::string ret_part = (col == std::string::npos) ? line.substr(7) : line.substr(7, col - 7);
+            prog.return_names = extract_ssa_refs(ret_part);
+            continue;
+        }
+
+        if (line == "}" || line.rfind("module ", 0) == 0) {
+            continue;
+        }
+
+        // Accumulate multi-line ops (e.g. "stablehlo.reduce" or "stablehlo.gather")
+        std::string stmt = line;
+        if (stmt.find("\"stablehlo.reduce\"") != std::string::npos ||
+            stmt.find("\"stablehlo.gather\"") != std::string::npos) {
+            while (li + 1 < lines.size() &&
+                   (stmt.find("->") == std::string::npos || stmt.rfind('>') < stmt.find("->"))) {
+                stmt += " " + lines[++li];
+            }
+        }
+
+        const size_t eq = stmt.find(" = ");
+        if (eq == std::string::npos) continue;
+        MockOp op;
+        op.out_name = trim_copy(stmt.substr(0, eq));
+        const std::string rhs = trim_copy(stmt.substr(eq + 3));
+
+        const size_t arrow = rhs.rfind("->");
+        const size_t colon = rhs.rfind(':');
+        if (arrow != std::string::npos) {
+            op.out_type = parse_tensor_type(rhs.substr(arrow + 2));
+        } else if (colon != std::string::npos) {
+            op.out_type = parse_tensor_type(rhs.substr(colon + 1));
+        }
+
+        if (rhs.rfind("stablehlo.constant ", 0) == 0) {
+            op.kind = MockOp::Kind::CONSTANT;
+            const size_t d0 = rhs.find("dense<");
+            const size_t d1 = rhs.rfind('>');
+            const std::string lit = trim_copy(rhs.substr(d0 + 6, d1 - (d0 + 6)));
+            const bool is_int = (op.out_type.dtype == PjrtDType::S8 || op.out_type.dtype == PjrtDType::U8 ||
+                                 op.out_type.dtype == PjrtDType::S16 || op.out_type.dtype == PjrtDType::S32);
+            if (!lit.empty() && lit.front() == '[') {
+                op.is_splat = false;
+                std::string inner = lit.substr(1, lit.size() - 2);
+                std::istringstream vs(inner);
+                std::string tok;
+                while (std::getline(vs, tok, ',')) {
+                    tok = trim_copy(tok);
+                    if (tok.empty()) continue;
+                    if (is_int) op.array_i.push_back(std::stoll(tok));
+                    else op.array_f.push_back(std::stod(tok));
+                }
+            } else {
+                op.is_splat = true;
+                if (is_int) op.scalar_i = std::stoll(lit);
+                else op.scalar_f = std::stod(lit);
+            }
+        } else if (rhs.rfind("stablehlo.iota ", 0) == 0) {
+            op.kind = MockOp::Kind::IOTA;
+            const size_t dp = rhs.find("dim = ");
+            op.iota_dim = std::stoll(rhs.substr(dp + 6));
+        } else if (rhs.rfind("stablehlo.convert ", 0) == 0) {
+            op.kind = MockOp::Kind::CONVERT;
+            op.inputs = extract_ssa_refs(rhs.substr(0, colon));
+        } else if (rhs.rfind("stablehlo.add ", 0) == 0) {
+            op.kind = MockOp::Kind::ADD;
+            op.inputs = extract_ssa_refs(rhs.substr(0, colon));
+        } else if (rhs.rfind("stablehlo.subtract ", 0) == 0) {
+            op.kind = MockOp::Kind::SUBTRACT;
+            op.inputs = extract_ssa_refs(rhs.substr(0, colon));
+        } else if (rhs.rfind("stablehlo.multiply ", 0) == 0) {
+            op.kind = MockOp::Kind::MULTIPLY;
+            op.inputs = extract_ssa_refs(rhs.substr(0, colon));
+        } else if (rhs.rfind("stablehlo.divide ", 0) == 0) {
+            op.kind = MockOp::Kind::DIVIDE;
+            op.inputs = extract_ssa_refs(rhs.substr(0, colon));
+        } else if (rhs.rfind("stablehlo.maximum ", 0) == 0) {
+            op.kind = MockOp::Kind::MAXIMUM;
+            op.inputs = extract_ssa_refs(rhs.substr(0, colon));
+        } else if (rhs.rfind("stablehlo.and ", 0) == 0) {
+            op.kind = MockOp::Kind::BIT_AND;
+            op.inputs = extract_ssa_refs(rhs.substr(0, colon));
+        } else if (rhs.rfind("stablehlo.shift_right_logical ", 0) == 0) {
+            op.kind = MockOp::Kind::SHR_LOGICAL;
+            op.inputs = extract_ssa_refs(rhs.substr(0, colon));
+        } else if (rhs.rfind("stablehlo.rsqrt ", 0) == 0) {
+            op.kind = MockOp::Kind::RSQRT;
+            op.inputs = extract_ssa_refs(rhs.substr(0, colon));
+        } else if (rhs.rfind("stablehlo.cosine ", 0) == 0) {
+            op.kind = MockOp::Kind::COSINE;
+            op.inputs = extract_ssa_refs(rhs.substr(0, colon));
+        } else if (rhs.rfind("stablehlo.sine ", 0) == 0) {
+            op.kind = MockOp::Kind::SINE;
+            op.inputs = extract_ssa_refs(rhs.substr(0, colon));
+        } else if (rhs.rfind("stablehlo.logistic ", 0) == 0) {
+            op.kind = MockOp::Kind::LOGISTIC;
+            op.inputs = extract_ssa_refs(rhs.substr(0, colon));
+        } else if (rhs.rfind("stablehlo.exponential ", 0) == 0) {
+            op.kind = MockOp::Kind::EXPONENTIAL;
+            op.inputs = extract_ssa_refs(rhs.substr(0, colon));
+        } else if (rhs.rfind("stablehlo.broadcast_in_dim ", 0) == 0) {
+            op.kind = MockOp::Kind::BROADCAST_IN_DIM;
+            const size_t dp = rhs.find("dims = [");
+            const size_t de = rhs.find(']', dp);
+            op.inputs = extract_ssa_refs(rhs.substr(0, dp));
+            op.dims_attr = parse_int_list(rhs.substr(dp + 8, de - (dp + 8)));
+        } else if (rhs.rfind("stablehlo.reshape ", 0) == 0) {
+            op.kind = MockOp::Kind::RESHAPE;
+            op.inputs = extract_ssa_refs(rhs.substr(0, colon));
+        } else if (rhs.rfind("stablehlo.transpose ", 0) == 0) {
+            op.kind = MockOp::Kind::TRANSPOSE;
+            const size_t dp = rhs.find("dims = [");
+            const size_t de = rhs.find(']', dp);
+            op.inputs = extract_ssa_refs(rhs.substr(0, dp));
+            op.dims_attr = parse_int_list(rhs.substr(dp + 8, de - (dp + 8)));
+        } else if (rhs.rfind("stablehlo.slice ", 0) == 0) {
+            op.kind = MockOp::Kind::SLICE;
+            const size_t lb = rhs.find('[');
+            const size_t rb = rhs.find(']', lb);
+            op.inputs = extract_ssa_refs(rhs.substr(0, lb));
+            std::string body = rhs.substr(lb + 1, rb - (lb + 1));
+            std::istringstream ss(body);
+            std::string item;
+            while (std::getline(ss, item, ',')) {
+                auto vals = parse_int_list(item);
+                if (vals.size() >= 3) {
+                    op.slice_starts.push_back(vals[0]);
+                    op.slice_limits.push_back(vals[1]);
+                    op.slice_strides.push_back(vals[2]);
+                }
+            }
+        } else if (rhs.rfind("stablehlo.concatenate ", 0) == 0) {
+            op.kind = MockOp::Kind::CONCATENATE;
+            const size_t dp = rhs.find("dim = ");
+            op.inputs = extract_ssa_refs(rhs.substr(0, dp));
+            op.concat_dim = std::stoll(rhs.substr(dp + 6));
+        } else if (rhs.rfind("stablehlo.dot_general ", 0) == 0) {
+            op.kind = MockOp::Kind::DOT_GENERAL;
+            const size_t bp = rhs.find("batching_dims =");
+            op.inputs = extract_ssa_refs(rhs.substr(0, bp));
+            const size_t b_l0 = rhs.find('[', bp);
+            const size_t b_l1 = rhs.find(']', b_l0);
+            const size_t b_r0 = rhs.find('[', b_l1);
+            const size_t b_r1 = rhs.find(']', b_r0);
+            op.lhs_batch = parse_int_list(rhs.substr(b_l0 + 1, b_l1 - b_l0 - 1));
+            op.rhs_batch = parse_int_list(rhs.substr(b_r0 + 1, b_r1 - b_r0 - 1));
+            const size_t cp = rhs.find("contracting_dims =", b_r1);
+            const size_t c_l0 = rhs.find('[', cp);
+            const size_t c_l1 = rhs.find(']', c_l0);
+            const size_t c_r0 = rhs.find('[', c_l1);
+            const size_t c_r1 = rhs.find(']', c_r0);
+            op.lhs_contract = parse_int_list(rhs.substr(c_l0 + 1, c_l1 - c_l0 - 1));
+            op.rhs_contract = parse_int_list(rhs.substr(c_r0 + 1, c_r1 - c_r0 - 1));
+        } else if (rhs.rfind("\"stablehlo.reduce\"", 0) == 0) {
+            op.kind = (rhs.find("stablehlo.maximum") != std::string::npos)
+                          ? MockOp::Kind::REDUCE_MAX
+                          : MockOp::Kind::REDUCE_ADD;
+            const size_t lp = rhs.find('(');
+            const size_t rp = rhs.find(')', lp);
+            op.inputs = extract_ssa_refs(rhs.substr(lp + 1, rp - lp - 1));
+            const size_t dp = rhs.find("dimensions = array<i64:");
+            const size_t de = rhs.find('>', dp);
+            op.dims_attr = parse_int_list(rhs.substr(dp + 23, de - (dp + 23)));
+        } else if (rhs.rfind("\"stablehlo.gather\"", 0) == 0) {
+            op.kind = MockOp::Kind::GATHER;
+            const size_t lp = rhs.find('(');
+            const size_t rp = rhs.find(')', lp);
+            op.inputs = extract_ssa_refs(rhs.substr(lp + 1, rp - lp - 1));
+            auto parse_named_arr = [&](const char* key) {
+                const size_t p = rhs.find(key);
+                const size_t lb = rhs.find('[', p);
+                const size_t rb = rhs.find(']', lb);
+                return parse_int_list(rhs.substr(lb + 1, rb - lb - 1));
+            };
+            op.gather_offset_dims = parse_named_arr("offset_dims");
+            op.gather_collapsed_dims = parse_named_arr("collapsed_slice_dims");
+            op.gather_start_index_map = parse_named_arr("start_index_map");
+            const size_t iv = rhs.find("index_vector_dim =");
+            op.gather_index_vector_dim = std::stoll(rhs.substr(iv + 18));
+        } else {
+            throw std::runtime_error("MockPJRT: unsupported StableHLO op: " + rhs);
+        }
+
+        prog.ops.push_back(std::move(op));
+    }
+
+    return prog;
+}
+
+static MockTensor eval_mock_op(const MockOp& op, const std::unordered_map<std::string, MockTensor>& env) {
+    MockTensor out;
+    out.allocate(op.out_type.dtype, op.out_type.dims);
+    const size_t n_out = out.num_elements();
+
+    const bool is_int = (out.dtype == PjrtDType::S8 || out.dtype == PjrtDType::U8 ||
+                         out.dtype == PjrtDType::S16 || out.dtype == PjrtDType::S32);
+
+    switch (op.kind) {
+        case MockOp::Kind::CONSTANT: {
+            if (op.is_splat) {
+                for (size_t i = 0; i < n_out; ++i) {
+                    if (is_int) out.write_i64(i, op.scalar_i);
+                    else out.write_f32(i, static_cast<float>(op.scalar_f));
+                }
+            } else {
+                for (size_t i = 0; i < n_out; ++i) {
+                    if (is_int) out.write_i64(i, op.array_i[i]);
+                    else out.write_f32(i, static_cast<float>(op.array_f[i]));
+                }
+            }
+            break;
+        }
+        case MockOp::Kind::IOTA: {
+            const auto strides = compute_row_major_strides(out.dims);
+            const int64_t dim_sz = out.dims[static_cast<size_t>(op.iota_dim)];
+            const size_t stride = strides[static_cast<size_t>(op.iota_dim)];
+            for (size_t i = 0; i < n_out; ++i) {
+                const int64_t coord = static_cast<int64_t>((i / stride) % static_cast<size_t>(dim_sz));
+                if (is_int) out.write_i64(i, coord);
+                else out.write_f32(i, static_cast<float>(coord));
+            }
+            break;
+        }
+        case MockOp::Kind::CONVERT: {
+            const MockTensor& a = env.at(op.inputs[0]);
+            const bool src_int = (a.dtype == PjrtDType::S8 || a.dtype == PjrtDType::U8 ||
+                                  a.dtype == PjrtDType::S16 || a.dtype == PjrtDType::S32);
+            for (size_t i = 0; i < n_out; ++i) {
+                if (is_int && src_int) out.write_i64(i, a.read_i64(i));
+                else if (is_int) out.write_i64(i, static_cast<int64_t>(a.read_f32(i)));
+                else if (src_int) out.write_f32(i, static_cast<float>(a.read_i64(i)));
+                else out.write_f32(i, a.read_f32(i));
+            }
+            break;
+        }
+        case MockOp::Kind::ADD:
+        case MockOp::Kind::SUBTRACT:
+        case MockOp::Kind::MULTIPLY:
+        case MockOp::Kind::DIVIDE:
+        case MockOp::Kind::MAXIMUM:
+        case MockOp::Kind::BIT_AND:
+        case MockOp::Kind::SHR_LOGICAL: {
+            const MockTensor& a = env.at(op.inputs[0]);
+            const MockTensor& b = env.at(op.inputs[1]);
+            for (size_t i = 0; i < n_out; ++i) {
+                if (is_int) {
+                    const int64_t va = a.read_i64(i);
+                    const int64_t vb = b.read_i64(i);
+                    int64_t vr = 0;
+                    if (op.kind == MockOp::Kind::ADD) vr = va + vb;
+                    else if (op.kind == MockOp::Kind::SUBTRACT) vr = va - vb;
+                    else if (op.kind == MockOp::Kind::MULTIPLY) vr = va * vb;
+                    else if (op.kind == MockOp::Kind::DIVIDE) vr = (vb != 0) ? (va / vb) : 0;
+                    else if (op.kind == MockOp::Kind::MAXIMUM) vr = std::max(va, vb);
+                    else if (op.kind == MockOp::Kind::BIT_AND) vr = (va & vb);
+                    else if (op.kind == MockOp::Kind::SHR_LOGICAL) {
+                        vr = static_cast<int64_t>(static_cast<uint64_t>(va) >> static_cast<unsigned>(vb));
+                    }
+                    out.write_i64(i, vr);
+                } else {
+                    const float va = a.read_f32(i);
+                    const float vb = b.read_f32(i);
+                    float vr = 0.0f;
+                    if (op.kind == MockOp::Kind::ADD) vr = va + vb;
+                    else if (op.kind == MockOp::Kind::SUBTRACT) vr = va - vb;
+                    else if (op.kind == MockOp::Kind::MULTIPLY) vr = va * vb;
+                    else if (op.kind == MockOp::Kind::DIVIDE) vr = va / vb;
+                    else if (op.kind == MockOp::Kind::MAXIMUM) vr = std::max(va, vb);
+                    out.write_f32(i, vr);
+                }
+            }
+            break;
+        }
+        case MockOp::Kind::RSQRT:
+        case MockOp::Kind::COSINE:
+        case MockOp::Kind::SINE:
+        case MockOp::Kind::LOGISTIC:
+        case MockOp::Kind::EXPONENTIAL: {
+            const MockTensor& a = env.at(op.inputs[0]);
+            for (size_t i = 0; i < n_out; ++i) {
+                const float va = a.read_f32(i);
+                float vr = 0.0f;
+                if (op.kind == MockOp::Kind::RSQRT) vr = 1.0f / std::sqrt(va);
+                else if (op.kind == MockOp::Kind::COSINE) vr = std::cos(va);
+                else if (op.kind == MockOp::Kind::SINE) vr = std::sin(va);
+                else if (op.kind == MockOp::Kind::LOGISTIC) vr = 1.0f / (1.0f + std::exp(-va));
+                else if (op.kind == MockOp::Kind::EXPONENTIAL) vr = std::exp(va);
+                out.write_f32(i, vr);
+            }
+            break;
+        }
+        case MockOp::Kind::RESHAPE: {
+            const MockTensor& a = env.at(op.inputs[0]);
+            out.bytes = a.bytes;
+            break;
+        }
+        case MockOp::Kind::BROADCAST_IN_DIM: {
+            const MockTensor& a = env.at(op.inputs[0]);
+            const auto out_strides = compute_row_major_strides(out.dims);
+            const auto in_strides = compute_row_major_strides(a.dims);
+            const size_t elem_sz = pjrt_dtype_size(out.dtype);
+            for (size_t i = 0; i < n_out; ++i) {
+                size_t rem = i;
+                size_t src_idx = 0;
+                std::vector<int64_t> out_coord(out.dims.size(), 0);
+                for (size_t d = 0; d < out.dims.size(); ++d) {
+                    out_coord[d] = static_cast<int64_t>(rem / out_strides[d]);
+                    rem %= out_strides[d];
+                }
+                for (size_t sd = 0; sd < a.dims.size(); ++sd) {
+                    const size_t od = static_cast<size_t>(op.dims_attr[sd]);
+                    const int64_t c = (a.dims[sd] == 1) ? 0 : out_coord[od];
+                    src_idx += static_cast<size_t>(c) * in_strides[sd];
+                }
+                std::memcpy(out.bytes.data() + i * elem_sz, a.bytes.data() + src_idx * elem_sz, elem_sz);
+            }
+            break;
+        }
+        case MockOp::Kind::TRANSPOSE: {
+            const MockTensor& a = env.at(op.inputs[0]);
+            const auto out_strides = compute_row_major_strides(out.dims);
+            const auto in_strides = compute_row_major_strides(a.dims);
+            const size_t elem_sz = pjrt_dtype_size(out.dtype);
+            for (size_t i = 0; i < n_out; ++i) {
+                size_t rem = i;
+                size_t src_idx = 0;
+                for (size_t d = 0; d < out.dims.size(); ++d) {
+                    const size_t c = rem / out_strides[d];
+                    rem %= out_strides[d];
+                    src_idx += c * in_strides[static_cast<size_t>(op.dims_attr[d])];
+                }
+                std::memcpy(out.bytes.data() + i * elem_sz, a.bytes.data() + src_idx * elem_sz, elem_sz);
+            }
+            break;
+        }
+        case MockOp::Kind::SLICE: {
+            const MockTensor& a = env.at(op.inputs[0]);
+            const auto out_strides = compute_row_major_strides(out.dims);
+            const auto in_strides = compute_row_major_strides(a.dims);
+            const size_t elem_sz = pjrt_dtype_size(out.dtype);
+            for (size_t i = 0; i < n_out; ++i) {
+                size_t rem = i;
+                size_t src_idx = 0;
+                for (size_t d = 0; d < out.dims.size(); ++d) {
+                    const size_t c = rem / out_strides[d];
+                    rem %= out_strides[d];
+                    const size_t sc = static_cast<size_t>(op.slice_starts[d]) +
+                                      c * static_cast<size_t>(op.slice_strides[d]);
+                    src_idx += sc * in_strides[d];
+                }
+                std::memcpy(out.bytes.data() + i * elem_sz, a.bytes.data() + src_idx * elem_sz, elem_sz);
+            }
+            break;
+        }
+        case MockOp::Kind::CONCATENATE: {
+            const auto out_strides = compute_row_major_strides(out.dims);
+            const size_t cdim = static_cast<size_t>(op.concat_dim);
+            const size_t elem_sz = pjrt_dtype_size(out.dtype);
+            int64_t offset = 0;
+            for (const std::string& in_name : op.inputs) {
+                const MockTensor& a = env.at(in_name);
+                const auto in_strides = compute_row_major_strides(a.dims);
+                const size_t n_in = a.num_elements();
+                for (size_t i = 0; i < n_in; ++i) {
+                    size_t rem = i;
+                    size_t dst_idx = 0;
+                    for (size_t d = 0; d < a.dims.size(); ++d) {
+                        const size_t c = rem / in_strides[d];
+                        rem %= in_strides[d];
+                        const size_t dc = (d == cdim) ? (c + static_cast<size_t>(offset)) : c;
+                        dst_idx += dc * out_strides[d];
+                    }
+                    std::memcpy(out.bytes.data() + dst_idx * elem_sz, a.bytes.data() + i * elem_sz, elem_sz);
+                }
+                offset += a.dims[cdim];
+            }
+            break;
+        }
+        case MockOp::Kind::DOT_GENERAL: {
+            const MockTensor& lhs = env.at(op.inputs[0]);
+            const MockTensor& rhs = env.at(op.inputs[1]);
+            // Supports standard 4D [B3, B2, M, K] x [B3, B2, N, K] contracting [3]x[3], batch [0,1]x[0,1]
+            // as well as general arbitrary batch/contract dims.
+            std::vector<bool> lhs_used(lhs.dims.size(), false);
+            std::vector<bool> rhs_used(rhs.dims.size(), false);
+            for (int64_t d : op.lhs_batch) lhs_used[static_cast<size_t>(d)] = true;
+            for (int64_t d : op.lhs_contract) lhs_used[static_cast<size_t>(d)] = true;
+            for (int64_t d : op.rhs_batch) rhs_used[static_cast<size_t>(d)] = true;
+            for (int64_t d : op.rhs_contract) rhs_used[static_cast<size_t>(d)] = true;
+
+            std::vector<size_t> lhs_free_dims, rhs_free_dims;
+            for (size_t d = 0; d < lhs.dims.size(); ++d) if (!lhs_used[d]) lhs_free_dims.push_back(d);
+            for (size_t d = 0; d < rhs.dims.size(); ++d) if (!rhs_used[d]) rhs_free_dims.push_back(d);
+
+            const auto lhs_strides = compute_row_major_strides(lhs.dims);
+            const auto rhs_strides = compute_row_major_strides(rhs.dims);
+            const auto out_strides = compute_row_major_strides(out.dims);
+
+            size_t contract_total = 1;
+            for (int64_t d : op.lhs_contract) contract_total *= static_cast<size_t>(lhs.dims[static_cast<size_t>(d)]);
+
+            std::vector<int64_t> contract_shape;
+            for (int64_t d : op.lhs_contract) contract_shape.push_back(lhs.dims[static_cast<size_t>(d)]);
+            const auto c_strides = compute_row_major_strides(contract_shape);
+
+            for (size_t oi = 0; oi < n_out; ++oi) {
+                size_t rem = oi;
+                std::vector<size_t> out_coord(out.dims.size(), 0);
+                for (size_t d = 0; d < out.dims.size(); ++d) {
+                    out_coord[d] = rem / out_strides[d];
+                    rem %= out_strides[d];
+                }
+                size_t lhs_base = 0;
+                size_t rhs_base = 0;
+                size_t od = 0;
+                for (size_t bi = 0; bi < op.lhs_batch.size(); ++bi, ++od) {
+                    lhs_base += out_coord[od] * lhs_strides[static_cast<size_t>(op.lhs_batch[bi])];
+                    rhs_base += out_coord[od] * rhs_strides[static_cast<size_t>(op.rhs_batch[bi])];
+                }
+                for (size_t fd : lhs_free_dims) {
+                    lhs_base += out_coord[od++] * lhs_strides[fd];
+                }
+                for (size_t fd : rhs_free_dims) {
+                    rhs_base += out_coord[od++] * rhs_strides[fd];
+                }
+
+                double acc = 0.0;
+                for (size_t ci = 0; ci < contract_total; ++ci) {
+                    size_t crem = ci;
+                    size_t l_off = 0;
+                    size_t r_off = 0;
+                    for (size_t k = 0; k < contract_shape.size(); ++k) {
+                        const size_t cc = crem / c_strides[k];
+                        crem %= c_strides[k];
+                        l_off += cc * lhs_strides[static_cast<size_t>(op.lhs_contract[k])];
+                        r_off += cc * rhs_strides[static_cast<size_t>(op.rhs_contract[k])];
+                    }
+                    acc += static_cast<double>(lhs.read_f32(lhs_base + l_off)) *
+                           static_cast<double>(rhs.read_f32(rhs_base + r_off));
+                }
+                out.write_f32(oi, static_cast<float>(acc));
+            }
+            break;
+        }
+        case MockOp::Kind::REDUCE_ADD:
+        case MockOp::Kind::REDUCE_MAX: {
+            const MockTensor& x = env.at(op.inputs[0]);
+            const MockTensor& init = env.at(op.inputs[1]);
+            const float init_val = init.read_f32(0);
+            for (size_t i = 0; i < n_out; ++i) {
+                out.write_f32(i, init_val);
+            }
+            std::vector<bool> is_red(x.dims.size(), false);
+            for (int64_t d : op.dims_attr) is_red[static_cast<size_t>(d)] = true;
+            const auto in_strides = compute_row_major_strides(x.dims);
+            const auto out_strides = compute_row_major_strides(out.dims);
+            const size_t n_in = x.num_elements();
+            for (size_t i = 0; i < n_in; ++i) {
+                size_t rem = i;
+                size_t dst_idx = 0;
+                size_t od = 0;
+                for (size_t d = 0; d < x.dims.size(); ++d) {
+                    const size_t c = rem / in_strides[d];
+                    rem %= in_strides[d];
+                    if (!is_red[d]) {
+                        dst_idx += c * out_strides[od++];
+                    }
+                }
+                const float vx = x.read_f32(i);
+                const float vo = out.read_f32(dst_idx);
+                if (op.kind == MockOp::Kind::REDUCE_ADD) out.write_f32(dst_idx, vo + vx);
+                else out.write_f32(dst_idx, std::max(vo, vx));
+            }
+            break;
+        }
+        case MockOp::Kind::GATHER: {
+            const MockTensor& operand = env.at(op.inputs[0]);
+            const MockTensor& indices = env.at(op.inputs[1]);
+            const auto op_strides = compute_row_major_strides(operand.dims);
+            const auto idx_strides = compute_row_major_strides(indices.dims);
+            const auto out_strides = compute_row_major_strides(out.dims);
+            const size_t elem_sz = pjrt_dtype_size(out.dtype);
+
+            std::vector<bool> is_offset_dim(out.dims.size(), false);
+            for (int64_t d : op.gather_offset_dims) is_offset_dim[static_cast<size_t>(d)] = true;
+            std::vector<bool> is_collapsed(operand.dims.size(), false);
+            for (int64_t d : op.gather_collapsed_dims) is_collapsed[static_cast<size_t>(d)] = true;
+            std::vector<size_t> uncollapsed_op_dims;
+            for (size_t d = 0; d < operand.dims.size(); ++d) {
+                if (!is_collapsed[d]) uncollapsed_op_dims.push_back(d);
+            }
+
+            const size_t ivec_dim = static_cast<size_t>(op.gather_index_vector_dim);
+            const bool has_ivec_dim = (ivec_dim < indices.dims.size());
+
+            for (size_t oi = 0; oi < n_out; ++oi) {
+                size_t rem = oi;
+                std::vector<size_t> out_coord(out.dims.size(), 0);
+                for (size_t d = 0; d < out.dims.size(); ++d) {
+                    out_coord[d] = rem / out_strides[d];
+                    rem %= out_strides[d];
+                }
+
+                std::vector<size_t> batch_coords;
+                std::vector<size_t> offset_coords;
+                for (size_t d = 0; d < out.dims.size(); ++d) {
+                    if (is_offset_dim[d]) offset_coords.push_back(out_coord[d]);
+                    else batch_coords.push_back(out_coord[d]);
+                }
+
+                size_t idx_base = 0;
+                size_t b_ptr = 0;
+                for (size_t d = 0; d < indices.dims.size(); ++d) {
+                    if (has_ivec_dim && d == ivec_dim) continue;
+                    idx_base += batch_coords[b_ptr++] * idx_strides[d];
+                }
+
+                std::vector<int64_t> op_coord(operand.dims.size(), 0);
+                for (size_t k = 0; k < op.gather_start_index_map.size(); ++k) {
+                    const size_t stride_k = has_ivec_dim ? idx_strides[ivec_dim] : 0;
+                    int64_t idx_val = indices.read_i64(idx_base + k * stride_k);
+                    const size_t od = static_cast<size_t>(op.gather_start_index_map[k]);
+                    idx_val = std::max<int64_t>(0, std::min<int64_t>(operand.dims[od] - 1, idx_val));
+                    op_coord[od] = idx_val;
+                }
+                for (size_t k = 0; k < offset_coords.size(); ++k) {
+                    op_coord[uncollapsed_op_dims[k]] += static_cast<int64_t>(offset_coords[k]);
+                }
+
+                size_t src_idx = 0;
+                for (size_t d = 0; d < operand.dims.size(); ++d) {
+                    src_idx += static_cast<size_t>(op_coord[d]) * op_strides[d];
+                }
+                std::memcpy(out.bytes.data() + oi * elem_sz, operand.bytes.data() + src_idx * elem_sz, elem_sz);
+            }
+            break;
+        }
+    }
+    return out;
+}
+
+// Mock PJRT C API opaque structs
+struct MockError {
+    std::string message;
+};
+struct MockEvent {};
+struct MockClient;
+struct MockDevice {
+    MockClient* client = nullptr;
+};
+struct MockDeviceDescription {};
+struct MockClient {
+    MockDevice device;
+    MockDeviceDescription desc;
+    int64_t allocated_bytes = 0;
+
+    MockClient() { device.client = this; }
+};
+struct MockBuffer {
+    MockTensor tensor;
+    MockClient* client = nullptr;
+};
+struct MockExecutable {
+    MockProgram program;
+};
+struct MockLoadedExecutable {
+    MockExecutable exec;
+};
+
+static PJRT_Error* mock_error(const std::string& msg) {
+    return reinterpret_cast<PJRT_Error*>(new MockError{msg});
+}
+
+static void mock_error_destroy(PJRT_Error_Destroy_Args* args) {
+    delete reinterpret_cast<MockError*>(args->error);
+}
+
+static void mock_error_message(PJRT_Error_Message_Args* args) {
+    const auto* e = reinterpret_cast<const MockError*>(args->error);
+    args->message = e->message.data();
+    args->message_size = e->message.size();
+}
+
+static PJRT_Error* mock_plugin_initialize(PJRT_Plugin_Initialize_Args*) { return nullptr; }
+static PJRT_Error* mock_event_destroy(PJRT_Event_Destroy_Args* args) {
+    delete reinterpret_cast<MockEvent*>(args->event);
+    return nullptr;
+}
+static PJRT_Error* mock_event_await(PJRT_Event_Await_Args*) { return nullptr; }
+
+static PJRT_Error* mock_client_create(PJRT_Client_Create_Args* args) {
+    args->client = reinterpret_cast<PJRT_Client*>(new MockClient());
+    return nullptr;
+}
+static PJRT_Error* mock_client_destroy(PJRT_Client_Destroy_Args* args) {
+    delete reinterpret_cast<MockClient*>(args->client);
+    return nullptr;
+}
+static PJRT_Error* mock_client_platform_name(PJRT_Client_PlatformName_Args* args) {
+    static const char kName[] = "tpu-mock";
+    args->platform_name = kName;
+    args->platform_name_size = sizeof(kName) - 1;
+    return nullptr;
+}
+static PJRT_Error* mock_client_platform_version(PJRT_Client_PlatformVersion_Args* args) {
+    static const char kVer[] = "mock-pjrt-0.116";
+    args->platform_version = kVer;
+    args->platform_version_size = sizeof(kVer) - 1;
+    return nullptr;
+}
+static PJRT_Error* mock_client_addressable_devices(PJRT_Client_AddressableDevices_Args* args) {
+    auto* c = reinterpret_cast<MockClient*>(args->client);
+    static thread_local PJRT_Device* dev_arr[1];
+    dev_arr[0] = reinterpret_cast<PJRT_Device*>(&c->device);
+    args->addressable_devices = dev_arr;
+    args->num_addressable_devices = 1;
+    return nullptr;
+}
+static PJRT_Error* mock_device_get_description(PJRT_Device_GetDescription_Args* args) {
+    auto* d = reinterpret_cast<MockDevice*>(args->device);
+    args->device_description = reinterpret_cast<PJRT_DeviceDescription*>(&d->client->desc);
+    return nullptr;
+}
+static PJRT_Error* mock_dev_desc_id(PJRT_DeviceDescription_Id_Args* args) {
+    args->id = 0;
+    return nullptr;
+}
+static PJRT_Error* mock_dev_desc_kind(PJRT_DeviceDescription_Kind_Args* args) {
+    static const char kKind[] = "Cloud TPU Host Mock (v5e-1)";
+    args->device_kind = kKind;
+    args->device_kind_size = sizeof(kKind) - 1;
+    return nullptr;
+}
+static PJRT_Error* mock_dev_desc_to_string(PJRT_DeviceDescription_ToString_Args* args) {
+    static const char kStr[] = "CLOUDTPU_MOCK(id=0)";
+    args->to_string = kStr;
+    args->to_string_size = sizeof(kStr) - 1;
+    return nullptr;
+}
+static PJRT_Error* mock_device_memory_stats(PJRT_Device_MemoryStats_Args* args) {
+    auto* d = reinterpret_cast<MockDevice*>(args->device);
+    auto* c = d->client;
+    args->bytes_in_use = c->allocated_bytes;
+    args->bytes_limit_is_set = true;
+    args->bytes_limit = 16909336064LL;  // 15.748 GiB (v5e-1 HBM2e nominal)
+    return nullptr;
+}
+
+static PJRT_Error* mock_buffer_from_host(PJRT_Client_BufferFromHostBuffer_Args* args) {
+    auto* c = reinterpret_cast<MockClient*>(args->client);
+    const PjrtDType dt = from_pjrt_buffer_type(args->type);
+    if (dt == PjrtDType::INVALID) {
+        return mock_error("MockPJRT: unsupported PJRT_Buffer_Type");
+    }
+    std::vector<int64_t> shape(args->dims, args->dims + args->num_dims);
+    auto* mb = new MockBuffer();
+    mb->client = c;
+    mb->tensor.allocate(dt, std::move(shape));
+    if (!mb->tensor.bytes.empty() && args->data) {
+        std::memcpy(mb->tensor.bytes.data(), args->data, mb->tensor.bytes.size());
+    }
+    c->allocated_bytes += static_cast<int64_t>(mb->tensor.bytes.size());
+    args->done_with_host_buffer = reinterpret_cast<PJRT_Event*>(new MockEvent());
+    args->buffer = reinterpret_cast<PJRT_Buffer*>(mb);
+    return nullptr;
+}
+static PJRT_Error* mock_buffer_destroy(PJRT_Buffer_Destroy_Args* args) {
+    auto* mb = reinterpret_cast<MockBuffer*>(args->buffer);
+    if (mb && mb->client) {
+        mb->client->allocated_bytes -= static_cast<int64_t>(mb->tensor.bytes.size());
+    }
+    delete mb;
+    return nullptr;
+}
+static PJRT_Error* mock_buffer_to_host(PJRT_Buffer_ToHostBuffer_Args* args) {
+    auto* mb = reinterpret_cast<MockBuffer*>(args->src);
+    if (!args->dst) {
+        args->dst_size = mb->tensor.bytes.size();
+        args->event = nullptr;
+        return nullptr;
+    }
+    if (args->dst_size < mb->tensor.bytes.size()) {
+        return mock_error("MockPJRT: ToHostBuffer dst_size too small");
+    }
+    if (!mb->tensor.bytes.empty()) {
+        std::memcpy(args->dst, mb->tensor.bytes.data(), mb->tensor.bytes.size());
+    }
+    args->event = reinterpret_cast<PJRT_Event*>(new MockEvent());
+    return nullptr;
+}
+static PJRT_Error* mock_buffer_ready_event(PJRT_Buffer_ReadyEvent_Args* args) {
+    args->event = reinterpret_cast<PJRT_Event*>(new MockEvent());
+    return nullptr;
+}
+
+static PJRT_Error* mock_client_compile(PJRT_Client_Compile_Args* args) {
+    try {
+        if (!args->compile_options || args->compile_options_size == 0) {
+            return mock_error("MockPJRT: compile_options must be non-empty (matches libtpu requirement)");
+        }
+        const std::string fmt(args->program->format, args->program->format_size);
+        if (fmt != "mlir") {
+            return mock_error("MockPJRT: expected program format 'mlir', got '" + fmt + "'");
+        }
+        const std::string code(args->program->code, args->program->code_size);
+        auto* le = new MockLoadedExecutable();
+        le->exec.program = parse_stablehlo_mlir(code);
+        args->executable = reinterpret_cast<PJRT_LoadedExecutable*>(le);
+        return nullptr;
+    } catch (const std::exception& e) {
+        return mock_error(e.what());
+    }
+}
+static PJRT_Error* mock_loaded_exec_destroy(PJRT_LoadedExecutable_Destroy_Args* args) {
+    delete reinterpret_cast<MockLoadedExecutable*>(args->executable);
+    return nullptr;
+}
+static PJRT_Error* mock_loaded_exec_get_exec(PJRT_LoadedExecutable_GetExecutable_Args* args) {
+    auto* le = reinterpret_cast<MockLoadedExecutable*>(args->loaded_executable);
+    auto* ex = new MockExecutable(le->exec);
+    args->executable = reinterpret_cast<PJRT_Executable*>(ex);
+    return nullptr;
+}
+static PJRT_Error* mock_exec_destroy(PJRT_Executable_Destroy_Args* args) {
+    delete reinterpret_cast<MockExecutable*>(args->executable);
+    return nullptr;
+}
+static PJRT_Error* mock_exec_num_outputs(PJRT_Executable_NumOutputs_Args* args) {
+    auto* ex = reinterpret_cast<MockExecutable*>(args->executable);
+    args->num_outputs = ex->program.return_names.size();
+    return nullptr;
+}
+static PJRT_Error* mock_loaded_exec_execute(PJRT_LoadedExecutable_Execute_Args* args) {
+    try {
+        auto* le = reinterpret_cast<MockLoadedExecutable*>(args->executable);
+        const MockProgram& prog = le->exec.program;
+        if (args->num_args != prog.args.size()) {
+            return mock_error("MockPJRT: argument count mismatch");
+        }
+        std::unordered_map<std::string, MockTensor> env;
+        MockClient* client = nullptr;
+        for (size_t i = 0; i < args->num_args; ++i) {
+            auto* mb = reinterpret_cast<MockBuffer*>(args->argument_lists[0][i]);
+            if (!client) client = mb->client;
+            env[prog.args[i].first] = mb->tensor;
+        }
+        for (const MockOp& op : prog.ops) {
+            env[op.out_name] = eval_mock_op(op, env);
+        }
+        for (size_t oi = 0; oi < prog.return_names.size(); ++oi) {
+            auto* out_mb = new MockBuffer();
+            out_mb->client = client;
+            out_mb->tensor = std::move(env.at(prog.return_names[oi]));
+            if (client) {
+                client->allocated_bytes += static_cast<int64_t>(out_mb->tensor.bytes.size());
+            }
+            args->output_lists[0][oi] = reinterpret_cast<PJRT_Buffer*>(out_mb);
+        }
+        if (args->device_complete_events) {
+            args->device_complete_events[0] = reinterpret_cast<PJRT_Event*>(new MockEvent());
+        }
+        return nullptr;
+    } catch (const std::exception& e) {
+        return mock_error(e.what());
+    }
+}
+
+static const PJRT_Api* get_mock_pjrt_api() {
+    static PJRT_Api api = []() {
+        PJRT_Api a = {};
+        a.struct_size = PJRT_Api_STRUCT_SIZE;
+        a.pjrt_api_version.struct_size = PJRT_Api_Version_STRUCT_SIZE;
+        a.pjrt_api_version.major_version = PJRT_API_MAJOR;
+        a.pjrt_api_version.minor_version = PJRT_API_MINOR;
+
+        a.PJRT_Error_Destroy = mock_error_destroy;
+        a.PJRT_Error_Message = mock_error_message;
+        a.PJRT_Plugin_Initialize = mock_plugin_initialize;
+        a.PJRT_Event_Destroy = mock_event_destroy;
+        a.PJRT_Event_Await = mock_event_await;
+        a.PJRT_Client_Create = mock_client_create;
+        a.PJRT_Client_Destroy = mock_client_destroy;
+        a.PJRT_Client_PlatformName = mock_client_platform_name;
+        a.PJRT_Client_PlatformVersion = mock_client_platform_version;
+        a.PJRT_Client_AddressableDevices = mock_client_addressable_devices;
+        a.PJRT_Client_Compile = mock_client_compile;
+        a.PJRT_Client_BufferFromHostBuffer = mock_buffer_from_host;
+        a.PJRT_Device_GetDescription = mock_device_get_description;
+        a.PJRT_DeviceDescription_Id = mock_dev_desc_id;
+        a.PJRT_DeviceDescription_Kind = mock_dev_desc_kind;
+        a.PJRT_DeviceDescription_ToString = mock_dev_desc_to_string;
+        a.PJRT_Device_MemoryStats = mock_device_memory_stats;
+        a.PJRT_LoadedExecutable_Destroy = mock_loaded_exec_destroy;
+        a.PJRT_LoadedExecutable_GetExecutable = mock_loaded_exec_get_exec;
+        a.PJRT_LoadedExecutable_Execute = mock_loaded_exec_execute;
+        a.PJRT_Executable_Destroy = mock_exec_destroy;
+        a.PJRT_Executable_NumOutputs = mock_exec_num_outputs;
+        a.PJRT_Buffer_Destroy = mock_buffer_destroy;
+        a.PJRT_Buffer_ToHostBuffer = mock_buffer_to_host;
+        a.PJRT_Buffer_ReadyEvent = mock_buffer_ready_event;
+        return a;
+    }();
+    return &api;
+}
+
+}  // namespace
+
+// =========================================================================
+// PjrtRuntime Implementation
+// =========================================================================
+
+PjrtRuntime::~PjrtRuntime() {
+    shutdown();
+}
+
+void PjrtRuntime::destroy_error(PJRT_Error* err) const {
+    if (!err || !api_ || !PJRT_API_HAS(api_, PJRT_Error_Destroy)) {
+        return;
+    }
+    PJRT_Error_Destroy_Args d_args = {};
+    d_args.struct_size = PJRT_Error_Destroy_Args_STRUCT_SIZE;
+    d_args.error = err;
+    api_->PJRT_Error_Destroy(&d_args);
+}
+
+void PjrtRuntime::check_error(PJRT_Error* err, const char* where) const {
+    if (!err) {
+        return;
+    }
+    std::string msg = "(no PJRT_Error_Message)";
+    if (api_ && PJRT_API_HAS(api_, PJRT_Error_Message)) {
+        PJRT_Error_Message_Args m_args = {};
+        m_args.struct_size = PJRT_Error_Message_Args_STRUCT_SIZE;
+        m_args.error = err;
+        api_->PJRT_Error_Message(&m_args);
+        if (m_args.message && m_args.message_size > 0) {
+            msg.assign(m_args.message, m_args.message_size);
+        }
+    }
+    destroy_error(err);
+    throw std::runtime_error(std::string(where) + ": " + msg);
+}
+
+std::string PjrtRuntime::resolve_libtpu_path(const std::string& override_path) const {
+    if (!override_path.empty()) {
+        return override_path;
+    }
+    if (const char* env_lib = std::getenv("LIBTPU_PATH")) {
+        if (env_lib[0] != '\0') return env_lib;
+    }
+    if (const char* env_tpu = std::getenv("TPU_LIBRARY_PATH")) {
+        if (env_tpu[0] != '\0') return env_tpu;
+    }
+    static const char* const kCandidates[] = {
+        "/usr/local/lib/python3.13/dist-packages/libtpu/libtpu.so",
+        "/usr/local/lib/python3.12/dist-packages/libtpu/libtpu.so",
+        "/usr/local/lib/python3.11/dist-packages/libtpu/libtpu.so",
+        "libtpu.so",
+    };
+    for (const char* p : kCandidates) {
+        std::ifstream f(p);
+        if (f.good()) return p;
+    }
+    return "libtpu.so";
+}
+
+void PjrtRuntime::init(const RuntimeConfig& cfg) {
+    if (is_initialized()) {
+        return;
+    }
+    cfg_ = cfg;
+    is_mock_ = cfg.mock_mode;
+
+    if (is_mock_) {
+        api_ = get_mock_pjrt_api();
+    } else {
+        setenv("GRPC_VERBOSITY", "ERROR", 0);
+        const std::string so_path = resolve_libtpu_path(cfg.libtpu_path);
+        dl_handle_ = dlopen(so_path.c_str(), RTLD_NOW | RTLD_GLOBAL);
+        if (!dl_handle_) {
+            const char* err = dlerror();
+            throw std::runtime_error("dlopen failed for '" + so_path + "': " +
+                                     (err ? err : "unknown error"));
+        }
+        using GetPjrtApiFn = const PJRT_Api* (*)();
+        auto get_pjrt_api = reinterpret_cast<GetPjrtApiFn>(dlsym(dl_handle_, "GetPjrtApi"));
+        if (!get_pjrt_api) {
+            const char* err = dlerror();
+            throw std::runtime_error(std::string("dlsym(GetPjrtApi) failed: ") +
+                                     (err ? err : "unknown error"));
+        }
+        api_ = get_pjrt_api();
+        if (!api_) {
+            throw std::runtime_error("GetPjrtApi() returned nullptr");
+        }
+    }
+
+    if (!PJRT_API_HAS(api_, PJRT_Error_Destroy) ||
+        !PJRT_API_HAS(api_, PJRT_Error_Message) ||
+        !PJRT_API_HAS(api_, PJRT_Event_Destroy) ||
+        !PJRT_API_HAS(api_, PJRT_Event_Await) ||
+        !PJRT_API_HAS(api_, PJRT_Client_Create) ||
+        !PJRT_API_HAS(api_, PJRT_Client_Destroy) ||
+        !PJRT_API_HAS(api_, PJRT_Client_AddressableDevices) ||
+        !PJRT_API_HAS(api_, PJRT_Client_Compile) ||
+        !PJRT_API_HAS(api_, PJRT_Client_BufferFromHostBuffer) ||
+        !PJRT_API_HAS(api_, PJRT_Device_GetDescription) ||
+        !PJRT_API_HAS(api_, PJRT_DeviceDescription_Kind) ||
+        !PJRT_API_HAS(api_, PJRT_LoadedExecutable_Destroy) ||
+        !PJRT_API_HAS(api_, PJRT_LoadedExecutable_GetExecutable) ||
+        !PJRT_API_HAS(api_, PJRT_LoadedExecutable_Execute) ||
+        !PJRT_API_HAS(api_, PJRT_Executable_Destroy) ||
+        !PJRT_API_HAS(api_, PJRT_Executable_NumOutputs) ||
+        !PJRT_API_HAS(api_, PJRT_Buffer_Destroy) ||
+        !PJRT_API_HAS(api_, PJRT_Buffer_ToHostBuffer)) {
+        throw std::runtime_error("Required PJRT_Api function pointer missing or outside struct_size");
+    }
+
+    has_ready_event_ = PJRT_API_HAS(api_, PJRT_Buffer_ReadyEvent);
+
+    if (PJRT_API_HAS(api_, PJRT_Plugin_Initialize)) {
+        PJRT_Plugin_Initialize_Args init_args = {};
+        init_args.struct_size = PJRT_Plugin_Initialize_Args_STRUCT_SIZE;
+        check_error(api_->PJRT_Plugin_Initialize(&init_args), "PJRT_Plugin_Initialize");
+    }
+
+    PJRT_Client_Create_Args c_args = {};
+    c_args.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
+    check_error(api_->PJRT_Client_Create(&c_args), "PJRT_Client_Create");
+    client_ = c_args.client;
+
+    if (PJRT_API_HAS(api_, PJRT_Client_PlatformName)) {
+        PJRT_Client_PlatformName_Args p_args = {};
+        p_args.struct_size = PJRT_Client_PlatformName_Args_STRUCT_SIZE;
+        p_args.client = client_;
+        check_error(api_->PJRT_Client_PlatformName(&p_args), "PJRT_Client_PlatformName");
+        platform_name_.assign(p_args.platform_name, p_args.platform_name_size);
+    }
+    if (PJRT_API_HAS(api_, PJRT_Client_PlatformVersion)) {
+        PJRT_Client_PlatformVersion_Args v_args = {};
+        v_args.struct_size = PJRT_Client_PlatformVersion_Args_STRUCT_SIZE;
+        v_args.client = client_;
+        check_error(api_->PJRT_Client_PlatformVersion(&v_args), "PJRT_Client_PlatformVersion");
+        platform_version_.assign(v_args.platform_version, v_args.platform_version_size);
+    }
+
+    PJRT_Client_AddressableDevices_Args d_args = {};
+    d_args.struct_size = PJRT_Client_AddressableDevices_Args_STRUCT_SIZE;
+    d_args.client = client_;
+    check_error(api_->PJRT_Client_AddressableDevices(&d_args), "PJRT_Client_AddressableDevices");
+    if (d_args.num_addressable_devices == 0 || !d_args.addressable_devices) {
+        throw std::runtime_error("No addressable Cloud TPU devices found");
+    }
+
+    devices_.clear();
+    device_infos_.clear();
+    for (size_t i = 0; i < d_args.num_addressable_devices; ++i) {
+        PJRT_Device* dev = d_args.addressable_devices[i];
+        devices_.push_back(dev);
+
+        PjrtDeviceInfo info;
+        info.index = static_cast<int>(i);
+
+        PJRT_Device_GetDescription_Args gd = {};
+        gd.struct_size = PJRT_Device_GetDescription_Args_STRUCT_SIZE;
+        gd.device = dev;
+        check_error(api_->PJRT_Device_GetDescription(&gd), "PJRT_Device_GetDescription");
+        PJRT_DeviceDescription* desc = gd.device_description;
+
+        if (PJRT_API_HAS(api_, PJRT_DeviceDescription_Id)) {
+            PJRT_DeviceDescription_Id_Args id_args = {};
+            id_args.struct_size = PJRT_DeviceDescription_Id_Args_STRUCT_SIZE;
+            id_args.device_description = desc;
+            check_error(api_->PJRT_DeviceDescription_Id(&id_args), "PJRT_DeviceDescription_Id");
+            info.id = id_args.id;
+        }
+        {
+            PJRT_DeviceDescription_Kind_Args k_args = {};
+            k_args.struct_size = PJRT_DeviceDescription_Kind_Args_STRUCT_SIZE;
+            k_args.device_description = desc;
+            check_error(api_->PJRT_DeviceDescription_Kind(&k_args), "PJRT_DeviceDescription_Kind");
+            info.kind.assign(k_args.device_kind, k_args.device_kind_size);
+        }
+        if (PJRT_API_HAS(api_, PJRT_DeviceDescription_ToString)) {
+            PJRT_DeviceDescription_ToString_Args ts_args = {};
+            ts_args.struct_size = PJRT_DeviceDescription_ToString_Args_STRUCT_SIZE;
+            ts_args.device_description = desc;
+            check_error(api_->PJRT_DeviceDescription_ToString(&ts_args), "PJRT_DeviceDescription_ToString");
+            info.description.assign(ts_args.to_string, ts_args.to_string_size);
+        } else {
+            info.description = info.kind;
+        }
+        if (PJRT_API_HAS(api_, PJRT_Device_MemoryStats)) {
+            PJRT_Device_MemoryStats_Args ms = {};
+            ms.struct_size = PJRT_Device_MemoryStats_Args_STRUCT_SIZE;
+            ms.device = dev;
+            PJRT_Error* ms_err = api_->PJRT_Device_MemoryStats(&ms);
+            if (!ms_err) {
+                info.hbm_bytes_in_use = ms.bytes_in_use;
+                if (ms.bytes_limit_is_set) {
+                    info.hbm_bytes_limit = ms.bytes_limit;
+                }
+            } else {
+                destroy_error(ms_err);
+            }
+        }
+        device_infos_.push_back(std::move(info));
+    }
+}
+
+void PjrtRuntime::shutdown() {
+    clear_exec_cache();
+    if (client_ && api_ && PJRT_API_HAS(api_, PJRT_Client_Destroy)) {
+        PJRT_Client_Destroy_Args args = {};
+        args.struct_size = PJRT_Client_Destroy_Args_STRUCT_SIZE;
+        args.client = client_;
+        client_ = nullptr;
+        PJRT_Error* err = api_->PJRT_Client_Destroy(&args);
+        if (err) {
+            destroy_error(err);
+        }
+    }
+    devices_.clear();
+    device_infos_.clear();
+    api_ = nullptr;
+    // Intentionally skip dlclose(dl_handle_) for libtpu singleton thread-safety.
+}
+
+const PjrtDeviceInfo& PjrtRuntime::device_info(int device_idx) const {
+    if (device_idx < 0 || device_idx >= static_cast<int>(device_infos_.size())) {
+        throw std::out_of_range("Cloud TPU device index out of range");
+    }
+    return device_infos_[static_cast<size_t>(device_idx)];
+}
+
+bool PjrtRuntime::query_memory_stats(int device_idx, size_t* free_bytes, size_t* total_bytes) const {
+    if (!is_initialized() || device_idx < 0 || device_idx >= static_cast<int>(devices_.size())) {
+        return false;
+    }
+    if (!PJRT_API_HAS(api_, PJRT_Device_MemoryStats)) {
+        return false;
+    }
+    PJRT_Device_MemoryStats_Args ms = {};
+    ms.struct_size = PJRT_Device_MemoryStats_Args_STRUCT_SIZE;
+    ms.device = devices_[static_cast<size_t>(device_idx)];
+    PJRT_Error* err = api_->PJRT_Device_MemoryStats(&ms);
+    if (err) {
+        destroy_error(err);
+        return false;
+    }
+    const int64_t limit = ms.bytes_limit_is_set
+                              ? ms.bytes_limit
+                              : device_infos_[static_cast<size_t>(device_idx)].hbm_bytes_limit;
+    const int64_t used = std::max<int64_t>(0, ms.bytes_in_use);
+    if (total_bytes) {
+        *total_bytes = limit > 0 ? static_cast<size_t>(limit) : 0;
+    }
+    if (free_bytes) {
+        *free_bytes = (limit > used) ? static_cast<size_t>(limit - used) : 0;
+    }
+    return true;
+}
+
+void PjrtRuntime::await_event(PJRT_Event* ev) {
+    if (!ev) {
+        return;
+    }
+    PJRT_Event_Await_Args a_args = {};
+    a_args.struct_size = PJRT_Event_Await_Args_STRUCT_SIZE;
+    a_args.event = ev;
+    PJRT_Error* err = api_->PJRT_Event_Await(&a_args);
+
+    PJRT_Event_Destroy_Args d_args = {};
+    d_args.struct_size = PJRT_Event_Destroy_Args_STRUCT_SIZE;
+    d_args.event = ev;
+    PJRT_Error* derr = api_->PJRT_Event_Destroy(&d_args);
+    if (err) {
+        if (derr) destroy_error(derr);
+        check_error(err, "PJRT_Event_Await");
+    }
+    check_error(derr, "PJRT_Event_Destroy");
+}
+
+void PjrtRuntime::await_buffer_ready(PJRT_Buffer* buf) {
+    if (!buf || !has_ready_event_) {
+        return;
+    }
+    PJRT_Buffer_ReadyEvent_Args r_args = {};
+    r_args.struct_size = PJRT_Buffer_ReadyEvent_Args_STRUCT_SIZE;
+    r_args.buffer = buf;
+    check_error(api_->PJRT_Buffer_ReadyEvent(&r_args), "PJRT_Buffer_ReadyEvent");
+    if (r_args.event) {
+        await_event(r_args.event);
+    }
+}
+
+PjrtBufferPtr PjrtRuntime::buffer_from_host(int device_idx,
+                                            const void* data,
+                                            PjrtDType dtype,
+                                            const std::vector<int64_t>& dims) {
+    if (device_idx < 0 || device_idx >= static_cast<int>(devices_.size())) {
+        throw std::out_of_range("buffer_from_host: device_idx out of range");
+    }
+    PJRT_Client_BufferFromHostBuffer_Args args = {};
+    args.struct_size = PJRT_Client_BufferFromHostBuffer_Args_STRUCT_SIZE;
+    args.client = client_;
+    args.data = data;
+    args.type = to_pjrt_buffer_type(dtype);
+    args.dims = dims.empty() ? nullptr : dims.data();
+    args.num_dims = dims.size();
+    args.byte_strides = nullptr;
+    args.num_byte_strides = 0;
+    args.host_buffer_semantics = PJRT_HostBufferSemantics_kImmutableUntilTransferCompletes;
+    args.device = devices_[static_cast<size_t>(device_idx)];
+    args.memory = nullptr;
+    args.device_layout = nullptr;
+
+    check_error(api_->PJRT_Client_BufferFromHostBuffer(&args), "PJRT_Client_BufferFromHostBuffer");
+    if (args.done_with_host_buffer) {
+        await_event(args.done_with_host_buffer);
+    }
+
+    auto out = std::make_shared<PjrtBuffer>();
+    out->handle = PjrtBufferHandle(args.buffer, PjrtBufferDeleter{api_});
+    out->dtype = dtype;
+    out->dims = dims;
+    return out;
+}
+
+void PjrtRuntime::buffer_to_host(PJRT_Buffer* buf, void* dst, size_t dst_size) {
+    if (!buf) {
+        throw std::runtime_error("buffer_to_host: null PJRT_Buffer");
+    }
+    PJRT_Buffer_ToHostBuffer_Args args = {};
+    args.struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE;
+    args.src = buf;
+    args.host_layout = nullptr;
+    args.dst = dst;
+    args.dst_size = dst_size;
+    check_error(api_->PJRT_Buffer_ToHostBuffer(&args), "PJRT_Buffer_ToHostBuffer");
+    if (args.event) {
+        await_event(args.event);
+    }
+}
+
+const CachedExecutable* PjrtRuntime::compile_or_get(const std::string& cache_key,
+                                                    const std::string& mlir_text,
+                                                    const PjrtCompileOptions& opts) {
+    {
+        std::lock_guard<std::mutex> lock(cache_mu_);
+        auto it = exec_cache_.find(cache_key);
+        if (it != exec_cache_.end()) {
+            cache_hits_ += 1;
+            lru_order_.splice(lru_order_.begin(), lru_order_, it->second.lru_it);
+            return &it->second.exec;
+        }
+    }
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::string opts_pb = encode_compile_options_proto(opts);
+
+    PJRT_Program prog = {};
+    prog.struct_size = PJRT_Program_STRUCT_SIZE;
+    prog.code = const_cast<char*>(mlir_text.data());
+    prog.code_size = mlir_text.size();
+    prog.format = "mlir";
+    prog.format_size = 4;
+
+    PJRT_Client_Compile_Args c_args = {};
+    c_args.struct_size = PJRT_Client_Compile_Args_STRUCT_SIZE;
+    c_args.client = client_;
+    c_args.program = &prog;
+    c_args.compile_options = opts_pb.data();
+    c_args.compile_options_size = opts_pb.size();
+
+    check_error(api_->PJRT_Client_Compile(&c_args), "PJRT_Client_Compile");
+
+    PJRT_LoadedExecutable_GetExecutable_Args ge = {};
+    ge.struct_size = PJRT_LoadedExecutable_GetExecutable_Args_STRUCT_SIZE;
+    ge.loaded_executable = c_args.executable;
+    PJRT_Error* ge_err = api_->PJRT_LoadedExecutable_GetExecutable(&ge);
+    if (ge_err || !ge.executable) {
+        PJRT_LoadedExecutable_Destroy_Args ld = {};
+        ld.struct_size = PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
+        ld.executable = c_args.executable;
+        PJRT_Error* derr = api_->PJRT_LoadedExecutable_Destroy(&ld);
+        if (derr) destroy_error(derr);
+        if (ge_err) check_error(ge_err, "PJRT_LoadedExecutable_GetExecutable");
+        throw std::runtime_error("PJRT_LoadedExecutable_GetExecutable returned null");
+    }
+
+    PJRT_Executable_NumOutputs_Args no = {};
+    no.struct_size = PJRT_Executable_NumOutputs_Args_STRUCT_SIZE;
+    no.executable = ge.executable;
+    PJRT_Error* no_err = api_->PJRT_Executable_NumOutputs(&no);
+
+    PJRT_Executable_Destroy_Args ed = {};
+    ed.struct_size = PJRT_Executable_Destroy_Args_STRUCT_SIZE;
+    ed.executable = ge.executable;
+    PJRT_Error* ed_err = api_->PJRT_Executable_Destroy(&ed);
+
+    if (no_err || ed_err) {
+        PJRT_LoadedExecutable_Destroy_Args ld = {};
+        ld.struct_size = PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
+        ld.executable = c_args.executable;
+        PJRT_Error* derr = api_->PJRT_LoadedExecutable_Destroy(&ld);
+        if (derr) destroy_error(derr);
+        if (no_err) {
+            if (ed_err) destroy_error(ed_err);
+            check_error(no_err, "PJRT_Executable_NumOutputs");
+        }
+        check_error(ed_err, "PJRT_Executable_Destroy");
+    }
+
+    const auto t1 = std::chrono::steady_clock::now();
+    const uint64_t compile_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+
+    CachedExecutable exec;
+    exec.key = cache_key;
+    exec.handle = c_args.executable;
+    exec.num_outputs = no.num_outputs;
+
+    std::lock_guard<std::mutex> lock(cache_mu_);
+    // Re-check in case another thread compiled the same key concurrently.
+    auto existing = exec_cache_.find(cache_key);
+    if (existing != exec_cache_.end()) {
+        PJRT_LoadedExecutable_Destroy_Args ld = {};
+        ld.struct_size = PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
+        ld.executable = exec.handle;
+        PJRT_Error* derr = api_->PJRT_LoadedExecutable_Destroy(&ld);
+        if (derr) destroy_error(derr);
+        cache_hits_ += 1;
+        lru_order_.splice(lru_order_.begin(), lru_order_, existing->second.lru_it);
+        return &existing->second.exec;
+    }
+
+    cache_misses_ += 1;
+    total_compile_us_ += compile_us;
+
+    const size_t cap = std::max<size_t>(1, cfg_.exec_cache_cap);
+    while (exec_cache_.size() >= cap && !lru_order_.empty()) {
+        const std::string& victim_key = lru_order_.back();
+        auto vit = exec_cache_.find(victim_key);
+        if (vit != exec_cache_.end()) {
+            PJRT_LoadedExecutable_Destroy_Args ld = {};
+            ld.struct_size = PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
+            ld.executable = vit->second.exec.handle;
+            PJRT_Error* derr = api_->PJRT_LoadedExecutable_Destroy(&ld);
+            if (derr) destroy_error(derr);
+            exec_cache_.erase(vit);
+            cache_evictions_ += 1;
+        }
+        lru_order_.pop_back();
+    }
+
+    lru_order_.push_front(cache_key);
+    CacheEntry entry;
+    entry.exec = std::move(exec);
+    entry.lru_it = lru_order_.begin();
+    auto [inserted_it, ok] = exec_cache_.emplace(cache_key, std::move(entry));
+    (void) ok;
+    return &inserted_it->second.exec;
+}
+
+void PjrtRuntime::execute(const CachedExecutable* exec,
+                          int device_idx,
+                          PJRT_Buffer* const* inputs,
+                          size_t num_inputs,
+                          std::vector<PjrtBufferPtr>& outputs,
+                          const std::vector<PjrtDType>& out_dtypes,
+                          const std::vector<std::vector<int64_t>>& out_dims,
+                          bool sync) {
+    if (!exec || !exec->handle) {
+        throw std::runtime_error("execute: null CachedExecutable");
+    }
+    if (device_idx < 0 || device_idx >= static_cast<int>(devices_.size())) {
+        throw std::out_of_range("execute: device_idx out of range");
+    }
+    if (exec->num_outputs != out_dtypes.size() || exec->num_outputs != out_dims.size()) {
+        throw std::runtime_error("execute: output count mismatch vs executable");
+    }
+
+    const auto t0 = std::chrono::steady_clock::now();
+
+    std::vector<PJRT_Buffer*> raw_outputs(exec->num_outputs, nullptr);
+    PJRT_Buffer* const* arg_lists[1] = {inputs};
+    PJRT_Buffer** const out_lists[1] = {raw_outputs.data()};
+
+    PJRT_ExecuteOptions opts = {};
+    opts.struct_size = PJRT_ExecuteOptions_STRUCT_SIZE;
+
+    PJRT_Event* dev_ev[1] = {nullptr};
+    const bool use_dev_event = sync && !has_ready_event_;
+
+    PJRT_LoadedExecutable_Execute_Args ex = {};
+    ex.struct_size = PJRT_LoadedExecutable_Execute_Args_STRUCT_SIZE;
+    ex.executable = exec->handle;
+    ex.options = &opts;
+    ex.argument_lists = arg_lists;
+    ex.num_devices = 1;
+    ex.num_args = num_inputs;
+    ex.output_lists = out_lists;
+    ex.device_complete_events = use_dev_event ? dev_ev : nullptr;
+    ex.execute_device = devices_[static_cast<size_t>(device_idx)];
+
+    check_error(api_->PJRT_LoadedExecutable_Execute(&ex), "PJRT_LoadedExecutable_Execute");
+
+    outputs.resize(exec->num_outputs);
+    for (size_t i = 0; i < exec->num_outputs; ++i) {
+        auto buf = std::make_shared<PjrtBuffer>();
+        buf->handle = PjrtBufferHandle(raw_outputs[i], PjrtBufferDeleter{api_});
+        buf->dtype = out_dtypes[i];
+        buf->dims = out_dims[i];
+        outputs[i] = std::move(buf);
+    }
+
+    if (sync) {
+        if (use_dev_event && dev_ev[0]) {
+            await_event(dev_ev[0]);
+        } else if (has_ready_event_) {
+            for (const auto& out_buf : outputs) {
+                await_buffer_ready(out_buf->handle.get());
+            }
+        }
+    }
+
+    const auto t1 = std::chrono::steady_clock::now();
+    const uint64_t exec_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+    std::lock_guard<std::mutex> lock(cache_mu_);
+    total_execute_us_ += exec_us;
+}
+
+void PjrtRuntime::clear_exec_cache() {
+    std::lock_guard<std::mutex> lock(cache_mu_);
+    for (auto& kv : exec_cache_) {
+        if (kv.second.exec.handle && api_ && PJRT_API_HAS(api_, PJRT_LoadedExecutable_Destroy)) {
+            PJRT_LoadedExecutable_Destroy_Args ld = {};
+            ld.struct_size = PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
+            ld.executable = kv.second.exec.handle;
+            PJRT_Error* derr = api_->PJRT_LoadedExecutable_Destroy(&ld);
+            if (derr) destroy_error(derr);
+        }
+    }
+    exec_cache_.clear();
+    lru_order_.clear();
+}
+
+CacheStats PjrtRuntime::cache_stats() const {
+    std::lock_guard<std::mutex> lock(cache_mu_);
+    CacheStats st;
+    st.entries = exec_cache_.size();
+    st.hits = cache_hits_;
+    st.misses = cache_misses_;
+    st.evictions = cache_evictions_;
+    st.compile_us = total_compile_us_;
+    st.execute_us = total_execute_us_;
+    return st;
+}
+
+PjrtRuntime& shared_pjrt_runtime(const RuntimeConfig* override_cfg) {
+    static std::mutex mu;
+    static PjrtRuntime rt;
+    std::lock_guard<std::mutex> lock(mu);
+    if (!rt.is_initialized() && override_cfg != nullptr) {
+        rt.init(*override_cfg);
+    }
+    return rt;
+}
+
+}  // namespace cloudtpu

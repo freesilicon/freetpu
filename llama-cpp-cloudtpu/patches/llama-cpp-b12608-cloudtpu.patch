@@ -1,0 +1,55 @@
+--- a/ggml/CMakeLists.txt
++++ b/ggml/CMakeLists.txt
+@@ -264,6 +264,7 @@
+ option(GGML_OPENVINO                        "ggml: use OPENVINO"                              OFF)
+ option(GGML_ET                              "ggml: use ET backend"                            OFF)
+ option(GGML_ET_SYSEMU                       "ggml: use ET backend via sysemu"                 OFF)
++option(GGML_CLOUDTPU                        "ggml: use Google Cloud TPU PJRT backend"         OFF)
+ 
+ option(GGML_OPENCL                          "ggml: use OpenCL"                                OFF)
+ option(GGML_OPENCL_PROFILING                "ggml: use OpenCL profiling (increases overhead)" OFF)
+@@ -344,6 +345,7 @@
+     include/ggml-webgpu.h
+     include/ggml-zendnn.h
+     include/ggml-openvino.h
++    include/ggml-cloudtpu.h
+     include/gguf.h)
+ 
+ set_target_properties(ggml PROPERTIES PUBLIC_HEADER "${GGML_PUBLIC_HEADERS}")
+--- a/ggml/src/CMakeLists.txt
++++ b/ggml/src/CMakeLists.txt
+@@ -613,6 +613,7 @@
+ ggml_add_backend(Hexagon)
+ ggml_add_backend(ZenDNN)
+ ggml_add_backend(OPENVINO)
++ggml_add_backend(CLOUDTPU)
+ 
+ foreach (target ggml-base ggml)
+     target_include_directories(${target} PUBLIC    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include> $<INSTALL_INTERFACE:include>)
+--- a/ggml/src/ggml-backend-reg.cpp
++++ b/ggml/src/ggml-backend-reg.cpp
+@@ -90,6 +90,10 @@
+ #include "ggml-et.h"
+ #endif
+ 
++#ifdef GGML_USE_CLOUDTPU
++#include "ggml-cloudtpu.h"
++#endif
++
+ namespace fs = std::filesystem;
+ 
+ static std::string path_str(const fs::path & path) {
+@@ -167,6 +171,13 @@
+ #endif
+ #ifdef GGML_USE_ET
+         register_backend(ggml_backend_et_reg());
++#endif
++#ifdef GGML_USE_CLOUDTPU
++        if (getenv("GGML_DISABLE_CLOUDTPU") == nullptr) {
++            register_backend(ggml_backend_cloudtpu_reg());
++        } else {
++            GGML_LOG_DEBUG("CLOUDTPU backend disabled by GGML_DISABLE_CLOUDTPU environment variable\n");
++        }
+ #endif
+ #ifdef GGML_USE_CPU
+         register_backend(ggml_backend_cpu_reg());
