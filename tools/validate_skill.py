@@ -223,6 +223,11 @@ def _parse_yaml_scalar_stdlib(raw: str) -> Any:
 def _parse_frontmatter_stdlib(fm_text: str) -> Dict[str, Any]:
     """Strict stdlib YAML frontmatter parser preserving non-string YAML types."""
     fm_lines = fm_text.splitlines()
+    for idx, raw_line in enumerate(fm_lines):
+        if raw_line.strip():
+            leading_ws = raw_line[: len(raw_line) - len(raw_line.lstrip(" \t"))]
+            if "\t" in leading_ws:
+                raise ValueError(f"Invalid YAML frontmatter: tab indentation at line {idx + 2}")
     data: Dict[str, Any] = {}
     i = 0
     while i < len(fm_lines):
@@ -246,7 +251,7 @@ def _parse_frontmatter_stdlib(fm_text: str) -> Dict[str, Any]:
             style = block_m.group(1)
             block: List[str] = []
             i += 1
-            while i < len(fm_lines) and (fm_lines[i].startswith((" ", "\t")) or not fm_lines[i].strip()):
+            while i < len(fm_lines) and (fm_lines[i].startswith(" ") or not fm_lines[i].strip()):
                 block.append(fm_lines[i].strip())
                 i += 1
             sep = " " if style == ">" else "\n"
@@ -257,7 +262,7 @@ def _parse_frontmatter_stdlib(fm_text: str) -> Dict[str, Any]:
         if not cleaned:
             i += 1
             indented: List[str] = []
-            while i < len(fm_lines) and (fm_lines[i].startswith((" ", "\t")) or not fm_lines[i].strip()):
+            while i < len(fm_lines) and (fm_lines[i].startswith(" ") or not fm_lines[i].strip()):
                 stripped = fm_lines[i].strip()
                 if stripped and not stripped.startswith("#"):
                     indented.append(stripped)
@@ -326,7 +331,7 @@ def _parse_frontmatter_stdlib(fm_text: str) -> Dict[str, Any]:
         i += 1
         if isinstance(val, str) and not rest.startswith(('"', "'")):
             cont: List[str] = [val]
-            while i < len(fm_lines) and fm_lines[i].startswith((" ", "\t")):
+            while i < len(fm_lines) and fm_lines[i].startswith(" "):
                 part = _strip_inline_comment(fm_lines[i])
                 if part:
                     if part == "-" or part.startswith("- ") or re.search(r":(?:\s|$)", part):
@@ -692,6 +697,10 @@ def run_validator_self_test(*, require_yaml: bool = False) -> None:
             "---\nname: freetpu\ndescription: Build and verify TPU kernels with parity before timing:\n---\n",
             "Invalid YAML frontmatter",
         ),
+        (
+            "---\nname: freetpu\ndescription: >-\n\tTab-indented folded description that easily exceeds forty characters.\n---\n",
+            "Invalid YAML frontmatter",
+        ),
     ]
     for md_text, expected in invalid_cases:
         _check_skill_md(md_text, should_pass=False, expected_substr=expected)
@@ -719,6 +728,14 @@ def run_validator_self_test(*, require_yaml: bool = False) -> None:
         assert "Invalid YAML frontmatter" in str(exc), f"Unexpected plain-scalar error: {exc}"
     else:
         raise AssertionError("stdlib parser failed to reject plain scalar containing ': '")
+    try:
+        _parse_frontmatter_stdlib(
+            "name: freetpu\ndescription: >-\n\tTab-indented folded description that easily exceeds forty characters.\n"
+        )
+    except ValueError as exc:
+        assert "tab indentation" in str(exc), f"Unexpected tab-indentation error: {exc}"
+    else:
+        raise AssertionError("stdlib parser failed to reject tab-indented folded description")
 
     fm_indented = _parse_frontmatter_stdlib(
         "name: freetpu\ndescription:\n  Indented plain string.\n"

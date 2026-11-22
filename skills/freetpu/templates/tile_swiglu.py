@@ -89,6 +89,21 @@ def _validate_operand_shapes(
         )
 
 
+def _validate_tpu_tile_config(m: int, n: int, block_m: int, block_n: int) -> None:
+    """Validate Mosaic TPU divisibility, BlockSpec lane/sublane alignment, and VMEM budget."""
+    if min(m, n, block_m, block_n) <= 0:
+        raise ValueError(f"All SwiGLU/tile dimensions must be positive: {(m, n, block_m, block_n)}")
+    if m % block_m or n % block_n:
+        raise ValueError(f"Shape ({m}, {n}) must be divisible by ({block_m}, {block_n})")
+    if block_m != m and block_m % 8 != 0:
+        raise ValueError(f"Mosaic TPU requires block_m == M or block_m % 8 == 0, got block_m={block_m}, M={m}")
+    if block_n != n and block_n % 128 != 0:
+        raise ValueError(f"Mosaic TPU requires block_n == N or block_n % 128 == 0, got block_n={block_n}, N={n}")
+    vmem_est = estimate_vmem_bytes(block_m, block_n)
+    if vmem_est > VMEM_LIMIT_BYTES:
+        raise ValueError(f"Tile ({block_m}, {block_n}) uses {vmem_est} B > {VMEM_LIMIT_BYTES} B VMEM budget")
+
+
 def build_pallas_swiglu(m: int, n: int, block_m: int, block_n: int):
     """Build a Pallas/Mosaic SwiGLU kernel lowering to `tpu_custom_call`."""
     import jax
@@ -96,11 +111,7 @@ def build_pallas_swiglu(m: int, n: int, block_m: int, block_n: int):
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
 
-    if m % block_m or n % block_n:
-        raise ValueError(f"Shape ({m}, {n}) must be divisible by ({block_m}, {block_n})")
-    vmem_est = estimate_vmem_bytes(block_m, block_n)
-    if vmem_est > VMEM_LIMIT_BYTES:
-        raise ValueError(f"Tile ({block_m}, {block_n}) uses {vmem_est} B > {VMEM_LIMIT_BYTES} B VMEM budget")
+    _validate_tpu_tile_config(m, n, block_m, block_n)
     compiler_params = _build_tpu_compiler_params(
         pltpu,
         dimension_semantics=("parallel", "parallel"),
@@ -195,6 +206,15 @@ def run_self_test() -> Dict[str, Any]:
     assert max_abs_err == 0.0, f"Tiled SwiGLU mismatch: {max_abs_err}"
     assert estimate_vmem_bytes(256, 1024) == 3 * 1024 * 1024 <= VMEM_LIMIT_BYTES
     assert estimate_vmem_bytes(2048, 1024) == 24 * 1024 * 1024 > VMEM_LIMIT_BYTES
+    _validate_tpu_tile_config(m, n, block_m, block_n)
+    _validate_tpu_tile_config(8192, 8192, 256, 1024)
+    for bad_cfg in [(64, 128, 32, 64), (120, 256, 60, 128), (8192, 8192, 2048, 1024)]:
+        try:
+            _validate_tpu_tile_config(*bad_cfg)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"Expected ValueError for invalid TPU tile config {bad_cfg}")
 
     return {
         "status": "ok",

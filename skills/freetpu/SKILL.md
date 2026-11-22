@@ -153,8 +153,6 @@ Use this workflow with `google-colab-cli >= 0.7.6` (redacted logs) to run Pallas
            PRE_SESS="$(colab --auth=adc --config "$BACKUP_STATE" sessions 2>/dev/null)" || PRE_SESS=""
          fi
          [ -z "$ENDPOINT" ] && ENDPOINT="$(printf '%s\n' "$PRE_SESS" | awk -v s="[$SESSION_ID]" '$1 == s {print $2; exit}')"
-         ( umask 077; printf 'COLAB_STATE=%q\nBACKUP_STATE=%q\nSTOP_STATE=%q\nSESSION_ID=%q\nENDPOINT=%q\n' \
-             "$COLAB_STATE" "$BACKUP_STATE" "$STOP_STATE" "$SESSION_ID" "$ENDPOINT" > "$WORK_DIR/recovery.env" )
 
          colab --auth=adc --config "$STOP_STATE" log -s "$SESSION_ID" -o "$WORK_DIR/$SESSION_ID.ipynb" || true
          STOP_RC=0
@@ -184,8 +182,10 @@ Use this workflow with `google-colab-cli >= 0.7.6` (redacted logs) to run Pallas
            fi
          fi
 
+         ( umask 077; printf 'COLAB_STATE=%q\nBACKUP_STATE=%q\nSTOP_STATE=%q\nSESSION_ID=%q\nENDPOINT=%q\nORPHAN_ENDPOINTS=%q\n' \
+             "$COLAB_STATE" "$BACKUP_STATE" "$STOP_STATE" "$SESSION_ID" "$ENDPOINT" "$NEW_UNNAMED" > "$WORK_DIR/recovery.env" )
          if [ "$TEARDOWN_RC" -ne 0 ]; then
-           printf 'ERROR: TPU teardown unconfirmed (session=%s endpoint=%s new_unnamed=%s).\nRecovery: colab --auth=adc --config %q stop -s %q && colab --auth=adc --config %q sessions\nIdentifiers saved in %s (or terminate in Colab UI: Runtime -> Manage sessions).\n' \
+           printf 'ERROR: TPU teardown unconfirmed (session=%s endpoint=%s orphan_endpoints=%s).\nRecovery: colab --auth=adc --config %q stop -s %q && colab --auth=adc --config %q sessions\nIdentifiers saved in %s (for unnamed [?] orphans, terminate in Colab Manage sessions and verify they disappear).\n' \
              "$SESSION_ID" "${ENDPOINT:-unknown}" "${NEW_UNNAMED:-none}" "$STOP_STATE" "$SESSION_ID" "$STOP_STATE" "$WORK_DIR/recovery.env" >&2
            exit 1
          fi
@@ -239,7 +239,7 @@ Use this workflow with `google-colab-cli >= 0.7.6` (redacted logs) to run Pallas
      ```
    - **Teardown verification**:
      - **Wrapper (`tools/colab_tpu_bench.py`)**: Inspect `$WORK_DIR/proof/summary.json` (`session_name`, `created_endpoint`, `teardown_verified`, `recovery_config`, and `recovery_command`). If `teardown_verified` is not `true`, run the recorded `recovery_command` (or stop `<session_name>` against `<recovery_config>` and verify `<created_endpoint>` is absent from `colab --auth=adc --config <recovery_config> sessions` alongside a passing `colab usage`), or terminate `<created_endpoint>` in the Colab UI (`Runtime -> Manage sessions`) if local state is no longer present.
-     - **Direct CLI (`$WORK_DIR/recovery.env`)**: After the subshell exits, `source "$WORK_DIR/recovery.env"` (or run the exact `Recovery:` command printed on stderr) to load `COLAB_STATE`, `BACKUP_STATE`, `STOP_STATE`, `SESSION_ID`, and `ENDPOINT`, then confirm `colab --auth=adc --config "$STOP_STATE" usage >/dev/null` and that `ENDPOINT`/`SESSION_ID` are absent from `colab --auth=adc --config "$STOP_STATE" sessions`. If a runtime survives, run the printed `colab stop` command against `$STOP_STATE` (which points to `$BACKUP_STATE` if `colab exec` pruned `$COLAB_STATE` on a 401/404 error), or terminate it in Colab UI (`Runtime -> Manage sessions`).
+     - **Direct CLI (`$WORK_DIR/recovery.env`)**: After the subshell exits, `source "$WORK_DIR/recovery.env"` (or run the printed `Recovery:` command) to load `COLAB_STATE`, `BACKUP_STATE`, `STOP_STATE`, `SESSION_ID`, `ENDPOINT`, and `ORPHAN_ENDPOINTS`, then confirm `colab --auth=adc --config "$STOP_STATE" usage >/dev/null` and that `ENDPOINT`, `SESSION_ID`, and every entry in `ORPHAN_ENDPOINTS` are absent from `colab --auth=adc --config "$STOP_STATE" sessions`. If a named runtime survives, stop it against `$STOP_STATE`; when `ENDPOINT` is empty and `ORPHAN_ENDPOINTS` is non-empty, terminate each matching `[?]` runtime in Colab (`https://colab.research.google.com/` -> `Runtime -> Manage sessions`) and re-run `colab sessions` to confirm its endpoint disappears.
    - For multi-step interactive sessions, prefer `colab exec` (keeps XLA/PJRT caches warm) over `colab ssh` (capped at 5 sessions / HTTP 429). Use `colab download` instead of `drive.mount`.
 
 ---

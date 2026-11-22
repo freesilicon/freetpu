@@ -101,6 +101,34 @@ def _validate_operand_shapes(
         )
 
 
+def _validate_tpu_tile_config(
+    m: int,
+    k: int,
+    n: int,
+    bm: int,
+    bn: int,
+    bk: int,
+    vmem_limit_bytes: Optional[int] = None,
+) -> None:
+    """Validate Mosaic TPU divisibility, lane/sublane BlockSpec alignment, K-loop depth, and VMEM budget."""
+    if min(m, k, n, bm, bn, bk) <= 0:
+        raise ValueError(f"All GEMM/tile dimensions must be positive: {(m, k, n, bm, bn, bk)}")
+    if m % bm or n % bn or k % bk:
+        raise ValueError(f"Shape ({m}, {k}, {n}) must be divisible by ({bm}, {bk}, {bn})")
+    if bm != m and bm % 8 != 0:
+        raise ValueError(f"Mosaic TPU requires bm == M or bm % 8 == 0, got bm={bm}, M={m}")
+    if bn != n and bn % 128 != 0:
+        raise ValueError(f"Mosaic TPU requires bn == N or bn % 128 == 0, got bn={bn}, N={n}")
+    if bk != k and bk % 128 != 0:
+        raise ValueError(f"Mosaic TPU requires bk == K or bk % 128 == 0, got bk={bk}, K={k}")
+    budget_bytes = vmem_limit_bytes if vmem_limit_bytes is not None else VMEM_LIMIT_BYTES
+    vmem_est = estimate_vmem_bytes(bm, bn, bk)
+    if vmem_est > budget_bytes:
+        raise ValueError(f"Tile ({bm}, {bn}, {bk}) uses {vmem_est} B > {budget_bytes} B VMEM budget")
+    if k // bk < 2:
+        raise ValueError("Double-buffered K-loop requires K // bk >= 2")
+
+
 def build_pallas_gemm_silu(
     m: int,
     k: int,
@@ -116,16 +144,8 @@ def build_pallas_gemm_silu(
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
 
-    if m % bm or n % bn or k % bk:
-        raise ValueError(f"Shape ({m}, {k}, {n}) must be divisible by ({bm}, {bk}, {bn})")
-    budget_bytes = vmem_limit_bytes if vmem_limit_bytes is not None else VMEM_LIMIT_BYTES
-    vmem_est = estimate_vmem_bytes(bm, bn, bk)
-    if vmem_est > budget_bytes:
-        raise ValueError(f"Tile ({bm}, {bn}, {bk}) uses {vmem_est} B > {budget_bytes} B VMEM budget")
-
+    _validate_tpu_tile_config(m, k, n, bm, bn, bk, vmem_limit_bytes=vmem_limit_bytes)
     num_k = k // bk
-    if num_k < 2:
-        raise ValueError("Double-buffered K-loop requires K // bk >= 2")
 
     compiler_params = _build_tpu_compiler_params(
         pltpu,
@@ -278,8 +298,22 @@ def run_self_test() -> Dict[str, Any]:
     """Offline CPU parity and VMEM budget check (no JAX/TPU hardware required)."""
     _verify_jax_053_compat()
     rng = np.random.default_rng(0)
-    m, k, n = 128, 256, 128
-    bm, bn, bk = 64, 64, 64
+    m, k, n = 128, 256, 256
+    bm, bn, bk = 64, 128, 128
+    _validate_tpu_tile_config(m, k, n, bm, bn, bk)
+    # Verify Mosaic BlockSpec minor-dim alignment rejects N=128, bn=64 and misaligned bk/bm.
+    for bad_cfg in [
+        (64, 256, 128, 32, 64, 128),
+        (128, 256, 256, 64, 128, 64),
+        (120, 256, 256, 60, 128, 128),
+        (4096, 4096, 4096, 1024, 2048, 256),
+    ]:
+        try:
+            _validate_tpu_tile_config(*bad_cfg)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"Expected ValueError for invalid TPU tile config {bad_cfg}")
     a = (rng.standard_normal((m, k)) / math.sqrt(k)).astype(np.float32)
     b = (rng.standard_normal((k, n)) / math.sqrt(k)).astype(np.float32)
 
