@@ -3,10 +3,14 @@
 // Zero Google libtpu.so dependencies.
 
 #include "opentpu.h"
+#include "ot_internal.h"
 #include "pjrt_c_api.h"
 
+#include <cctype>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <new>
 #include <string>
 #include <vector>
@@ -30,6 +34,17 @@ struct PJRT_DeviceDescription {
   std::string debug_str = "OpenTPU:0";
 };
 
+struct PJRT_TopologyDescription {
+  std::string platform_name = "tpu";
+  std::string platform_version = "OpenTPU 0.1.0";
+  PJRT_DeviceDescription* desc_ptrs[1] = {nullptr};
+  bool owned_by_client = false;
+};
+
+struct PJRT_SerializedTopology {
+  std::string data;
+};
+
 struct PJRT_Device {
   PJRT_DeviceDescription desc{};
   OtPjrtMemory mem{};
@@ -42,6 +57,7 @@ struct PJRT_Client {
   PJRT_Device device{};
   PJRT_Device* dev_ptrs[1] = {&device};
   PJRT_Memory* mem_ptrs[1] = {&device.mem.base};
+  PJRT_TopologyDescription topology{};
   std::string platform_name = "tpu";
   std::string platform_version = "OpenTPU 0.1.0";
 };
@@ -50,6 +66,7 @@ struct PJRT_Buffer {
   ot_context_t* ctx = nullptr;
   PJRT_Device* device = nullptr;
   ot_buffer_t* ot_buf = nullptr;
+  size_t logical_bytes = 0;
   PJRT_Buffer_Type dtype = PJRT_Buffer_Type_INVALID;
   std::vector<int64_t> dims;
   std::vector<int64_t> minor_to_major;
@@ -143,40 +160,297 @@ size_t dtype_bytes(PJRT_Buffer_Type t) {
   }
 }
 
-// Parse simple textual StableHLO dot_general:
-//   %arg0: tensor<MxKxbf16>, %arg1: tensor<KxNxbf16> ... dot_general ...
+std::string trim_ws(const std::string& in) {
+  size_t b = 0;
+  while (b < in.size() && std::isspace(static_cast<unsigned char>(in[b]))) ++b;
+  size_t e = in.size();
+  while (e > b && std::isspace(static_cast<unsigned char>(in[e - 1]))) --e;
+  return in.substr(b, e - b);
+}
+
+bool parse_strict_u32(const std::string& s, uint32_t* out) {
+  if (s.empty() || !out) return false;
+  uint64_t v = 0;
+  for (char ch : s) {
+    if (ch < '0' || ch > '9') return false;
+    v = v * 10u + static_cast<uint64_t>(ch - '0');
+    if (v > std::numeric_limits<uint32_t>::max()) return false;
+  }
+  if (v == 0) return false;
+  *out = static_cast<uint32_t>(v);
+  return true;
+}
+
+bool parse_bf16_2d_tensor_type(const std::string& raw, uint32_t* d0, uint32_t* d1) {
+  std::string s = trim_ws(raw);
+  if (s.size() < 12 || s.compare(0, 7, "tensor<") != 0 || s.back() != '>') return false;
+  std::string inner = s.substr(7, s.size() - 8);
+  size_t x1 = inner.find('x');
+  if (x1 == std::string::npos) return false;
+  size_t x2 = inner.find('x', x1 + 1);
+  if (x2 == std::string::npos) return false;
+  if (inner.substr(x2 + 1) != "bf16") return false;
+  return parse_strict_u32(inner.substr(0, x1), d0) &&
+         parse_strict_u32(inner.substr(x1 + 1, x2 - x1 - 1), d1);
+}
+
+bool is_valid_ssa_name(const std::string& s) {
+  if (s.size() < 2 || s[0] != '%') return false;
+  for (size_t i = 1; i < s.size(); ++i) {
+    unsigned char ch = static_cast<unsigned char>(s[i]);
+    if (!std::isalnum(ch) && ch != '_' && ch != '.' && ch != '$') return false;
+  }
+  return true;
+}
+
+std::string strip_line_comments(const std::string& s) {
+  std::string out;
+  out.reserve(s.size());
+  size_t i = 0;
+  while (i < s.size()) {
+    if (i + 1 < s.size() && s[i] == '/' && s[i + 1] == '/') {
+      while (i < s.size() && s[i] != '\n') ++i;
+      continue;
+    }
+    out.push_back(s[i++]);
+  }
+  return out;
+}
+
+// Strictly parse a single-op textual StableHLO BF16 2D matmul program:
+//   module ... {
+//     func.func [public] @main(%a: tensor<MxKxbf16>, %b: tensor<KxNxbf16>) -> tensor<MxNxbf16> {
+//       %0 = stablehlo.dot_general %a, %b, contracting_dims = [1] x [0] : (tensor<MxKxbf16>, tensor<KxNxbf16>) -> tensor<MxNxbf16>
+//       return %0 : tensor<MxNxbf16>
+//     }
+//   }
+// Rejects any extra operations, post-ops (e.g. negate/add), batching dims,
+// mismatched operand order/shapes, or unsupported attributes.
 bool parse_stablehlo_matmul(const char* code, size_t len, uint32_t* m_out,
                             uint32_t* k_out, uint32_t* n_out) {
-  if (!code || len == 0) return false;
-  std::string s(code, len);
-  if (s.find("dot_general") == std::string::npos && s.find("dot") == std::string::npos) {
+  if (!code || len == 0 || !m_out || !k_out || !n_out) return false;
+  std::string cleaned = strip_line_comments(std::string(code, len));
+
+  // Locate the single func.func definition and ensure there isn't a second function.
+  size_t fpos = cleaned.find("func.func");
+  if (fpos == std::string::npos) return false;
+  if (cleaned.find("func.func", fpos + 9) != std::string::npos) return false;
+
+  size_t lparen = cleaned.find('(', fpos);
+  if (lparen == std::string::npos) return false;
+  size_t rparen = cleaned.find(')', lparen + 1);
+  if (rparen == std::string::npos) return false;
+
+  // Parse exactly two arguments: `%arg0: tensor<MxKxbf16>, %arg1: tensor<KxNxbf16>`.
+  std::string arg_list = trim_ws(cleaned.substr(lparen + 1, rparen - lparen - 1));
+  size_t comma = arg_list.find(',');
+  if (comma == std::string::npos || arg_list.find(',', comma + 1) != std::string::npos) {
     return false;
   }
-  // Extract first two tensor<AxBxbf16> shapes
-  std::vector<std::pair<uint32_t, uint32_t>> shapes;
-  size_t pos = 0;
-  while (shapes.size() < 2) {
-    size_t t = s.find("tensor<", pos);
-    if (t == std::string::npos) break;
-    size_t gt = s.find('>', t + 7);
-    if (gt == std::string::npos) break;
-    std::string inner = s.substr(t + 7, gt - (t + 7));
-    pos = gt + 1;
-    if (inner.find("bf16") == std::string::npos) continue;
-    size_t x1 = inner.find('x');
-    if (x1 == std::string::npos) continue;
-    size_t x2 = inner.find('x', x1 + 1);
-    if (x2 == std::string::npos) continue;
-    uint32_t d0 = static_cast<uint32_t>(std::strtoul(inner.substr(0, x1).c_str(), nullptr, 10));
-    uint32_t d1 = static_cast<uint32_t>(
-        std::strtoul(inner.substr(x1 + 1, x2 - x1 - 1).c_str(), nullptr, 10));
-    if (d0 > 0 && d1 > 0) shapes.push_back({d0, d1});
+  auto parse_arg = [](const std::string& raw, std::string* ssa, uint32_t* d0, uint32_t* d1) -> bool {
+    size_t colon = raw.find(':');
+    if (colon == std::string::npos) return false;
+    *ssa = trim_ws(raw.substr(0, colon));
+    if (!is_valid_ssa_name(*ssa)) return false;
+    return parse_bf16_2d_tensor_type(raw.substr(colon + 1), d0, d1);
+  };
+  std::string arg0_ssa, arg1_ssa;
+  uint32_t m0 = 0, k0 = 0, k1 = 0, n1 = 0;
+  if (!parse_arg(arg_list.substr(0, comma), &arg0_ssa, &m0, &k0)) return false;
+  if (!parse_arg(arg_list.substr(comma + 1), &arg1_ssa, &k1, &n1)) return false;
+  if (arg0_ssa == arg1_ssa || k0 != k1) return false;
+
+  // Parse return type before `{`.
+  size_t lbrace = cleaned.find('{', rparen + 1);
+  if (lbrace == std::string::npos) return false;
+  std::string ret_sig = trim_ws(cleaned.substr(rparen + 1, lbrace - rparen - 1));
+  if (ret_sig.compare(0, 2, "->") != 0) return false;
+  std::string ret_type_str = trim_ws(ret_sig.substr(2));
+  if (!ret_type_str.empty() && ret_type_str.front() == '(' && ret_type_str.back() == ')') {
+    ret_type_str = trim_ws(ret_type_str.substr(1, ret_type_str.size() - 2));
   }
-  if (shapes.size() < 2) return false;
-  if (shapes[0].second != shapes[1].first) return false;
-  *m_out = shapes[0].first;
-  *k_out = shapes[0].second;
-  *n_out = shapes[1].second;
+  uint32_t rm = 0, rn = 0;
+  if (!parse_bf16_2d_tensor_type(ret_type_str, &rm, &rn)) return false;
+  if (rm != m0 || rn != n1) return false;
+
+  // Extract matching function body `{ ... }`.
+  int depth = 1;
+  size_t rbrace = lbrace + 1;
+  while (rbrace < cleaned.size() && depth > 0) {
+    if (cleaned[rbrace] == '{') ++depth;
+    else if (cleaned[rbrace] == '}') --depth;
+    if (depth > 0) ++rbrace;
+  }
+  if (depth != 0) return false;
+
+  // Collect non-empty body lines; must be exactly 2 statements (dot + return).
+  std::vector<std::string> stmts;
+  size_t cur = lbrace + 1;
+  while (cur < rbrace) {
+    size_t nl = cleaned.find('\n', cur);
+    if (nl == std::string::npos || nl > rbrace) nl = rbrace;
+    std::string line = trim_ws(cleaned.substr(cur, nl - cur));
+    if (!line.empty()) stmts.push_back(line);
+    cur = nl + 1;
+  }
+  if (stmts.size() != 2) return false;
+
+  // Statement 1: `%res = stablehlo.dot_general %a, %b, contracting_dims = [1] x [0] : (T0, T1) -> T2`
+  const std::string& s0 = stmts[0];
+  size_t eq = s0.find('=');
+  if (eq == std::string::npos) return false;
+  std::string res_ssa = trim_ws(s0.substr(0, eq));
+  if (!is_valid_ssa_name(res_ssa)) return false;
+
+  std::string rhs = trim_ws(s0.substr(eq + 1));
+  bool is_dot_general = false;
+  size_t op_len = 0;
+  if (rhs.compare(0, 21, "stablehlo.dot_general") == 0 &&
+      rhs.size() > 21 && std::isspace(static_cast<unsigned char>(rhs[21]))) {
+    is_dot_general = true;
+    op_len = 21;
+  } else if (rhs.compare(0, 13, "stablehlo.dot") == 0 &&
+             rhs.size() > 13 && std::isspace(static_cast<unsigned char>(rhs[13]))) {
+    is_dot_general = false;
+    op_len = 13;
+  } else {
+    return false;
+  }
+
+  size_t type_colon = rhs.find(':', op_len);
+  if (type_colon == std::string::npos) return false;
+  std::string body_part = trim_ws(rhs.substr(op_len, type_colon - op_len));
+  std::string type_part = trim_ws(rhs.substr(type_colon + 1));
+
+  // Parse operands: `%a, %b` (followed by `, ...` for dot_general).
+  size_t c1 = body_part.find(',');
+  if (c1 == std::string::npos) return false;
+  std::string op_lhs = trim_ws(body_part.substr(0, c1));
+  std::string after_lhs = trim_ws(body_part.substr(c1 + 1));
+  size_t c2 = after_lhs.find(',');
+  std::string op_rhs = trim_ws(c2 == std::string::npos ? after_lhs : after_lhs.substr(0, c2));
+  std::string attrs = c2 == std::string::npos ? std::string() : trim_ws(after_lhs.substr(c2 + 1));
+  if (op_lhs != arg0_ssa || op_rhs != arg1_ssa) return false;
+
+  if (is_dot_general) {
+    // Reject batching_dims or unexpected attributes; require contracting_dims = [1] x [0].
+    std::string compact_attrs;
+    for (char ch : attrs) {
+      if (!std::isspace(static_cast<unsigned char>(ch))) compact_attrs.push_back(ch);
+    }
+    if (compact_attrs != "contracting_dims=[1]x[0]" &&
+        compact_attrs != "batching_dims=[]x[],contracting_dims=[1]x[0]" &&
+        compact_attrs != "contracting_dims=[1]x[0],batching_dims=[]x[]") {
+      return false;
+    }
+  } else {
+    if (!attrs.empty()) return false;
+  }
+
+  // Validate op type signature: `(tensor<MxKxbf16>, tensor<KxNxbf16>) -> tensor<MxNxbf16>`.
+  size_t arrow = type_part.find("->");
+  if (arrow == std::string::npos) return false;
+  std::string in_types = trim_ws(type_part.substr(0, arrow));
+  std::string out_type = trim_ws(type_part.substr(arrow + 2));
+  if (in_types.size() < 2 || in_types.front() != '(' || in_types.back() != ')') return false;
+  in_types = trim_ws(in_types.substr(1, in_types.size() - 2));
+  size_t tc = in_types.find(',');
+  if (tc == std::string::npos || in_types.find(',', tc + 1) != std::string::npos) return false;
+  uint32_t om0 = 0, ok0 = 0, ok1 = 0, on1 = 0, omm = 0, omn = 0;
+  if (!parse_bf16_2d_tensor_type(in_types.substr(0, tc), &om0, &ok0)) return false;
+  if (!parse_bf16_2d_tensor_type(in_types.substr(tc + 1), &ok1, &on1)) return false;
+  if (!parse_bf16_2d_tensor_type(out_type, &omm, &omn)) return false;
+  if (om0 != m0 || ok0 != k0 || ok1 != k0 || on1 != n1 || omm != m0 || omn != n1) return false;
+
+  // Statement 2: `return %res : tensor<MxNxbf16>` or `func.return %res : tensor<MxNxbf16>`.
+  const std::string& s1 = stmts[1];
+  std::string ret_rest;
+  if (s1.compare(0, 7, "return ") == 0) {
+    ret_rest = trim_ws(s1.substr(7));
+  } else if (s1.compare(0, 12, "func.return ") == 0) {
+    ret_rest = trim_ws(s1.substr(12));
+  } else {
+    return false;
+  }
+  size_t rcolon = ret_rest.find(':');
+  if (rcolon == std::string::npos) return false;
+  std::string ret_ssa = trim_ws(ret_rest.substr(0, rcolon));
+  if (ret_ssa != res_ssa) return false;
+  uint32_t fm = 0, fn = 0;
+  if (!parse_bf16_2d_tensor_type(ret_rest.substr(rcolon + 1), &fm, &fn)) return false;
+  if (fm != m0 || fn != n1) return false;
+
+  // Guard against size_t overflow in BF16 buffer byte calculations.
+  auto fits_bf16 = [](uint32_t a, uint32_t b) -> bool {
+    uint64_t prod = static_cast<uint64_t>(a) * static_cast<uint64_t>(b);
+    return prod <= std::numeric_limits<size_t>::max() / sizeof(uint16_t);
+  };
+  if (!fits_bf16(m0, k0) || !fits_bf16(k0, n1) || !fits_bf16(m0, n1)) return false;
+
+  *m_out = m0;
+  *k_out = k0;
+  *n_out = n1;
+  return true;
+}
+
+bool is_dense_row_major_strides(const int64_t* dims, size_t num_dims,
+                                const int64_t* byte_strides, size_t elem_sz) {
+  int64_t expected = static_cast<int64_t>(elem_sz);
+  for (size_t i = num_dims; i > 0; --i) {
+    size_t d = i - 1;
+    if (dims[d] > 1 && byte_strides[d] != expected) return false;
+    if (dims[d] > 0) {
+      if (expected > std::numeric_limits<int64_t>::max() / dims[d]) return false;
+      expected *= dims[d];
+    }
+  }
+  return true;
+}
+
+bool is_supported_dense_layout(const PJRT_Buffer_MemoryLayout* layout,
+                               const int64_t* dims, size_t num_dims,
+                               size_t elem_sz) {
+  if (!layout) return true;
+  if (layout->type == PJRT_Buffer_MemoryLayout_Type_Tiled) {
+    if (layout->tiled.num_tiles != 0) return false;
+    if (layout->tiled.minor_to_major_size != num_dims) return false;
+    for (size_t i = 0; i < num_dims; ++i) {
+      int64_t expected_dim = static_cast<int64_t>(num_dims - 1 - i);
+      if (layout->tiled.minor_to_major[i] != expected_dim) return false;
+    }
+    return true;
+  }
+  if (layout->type == PJRT_Buffer_MemoryLayout_Type_Strides) {
+    if (layout->strides.num_byte_strides != num_dims) return false;
+    if (num_dims > 0 && !layout->strides.byte_strides) return false;
+    return is_dense_row_major_strides(dims, num_dims, layout->strides.byte_strides, elem_sz);
+  }
+  return false;
+}
+
+bool gather_strided_host_buffer(const void* data, const int64_t* dims, size_t num_dims,
+                                const int64_t* byte_strides, size_t elem_sz,
+                                size_t total_elems, std::vector<uint8_t>* out) {
+  out->assign(total_elems * elem_sz, 0);
+  if (total_elems == 0) return true;
+  const auto* base = static_cast<const uint8_t*>(data);
+  if (num_dims == 0) {
+    std::memcpy(out->data(), base, elem_sz);
+    return true;
+  }
+  std::vector<int64_t> idx(num_dims, 0);
+  for (size_t linear = 0; linear < total_elems; ++linear) {
+    int64_t byte_off = 0;
+    for (size_t d = 0; d < num_dims; ++d) {
+      byte_off += idx[d] * byte_strides[d];
+    }
+    std::memcpy(out->data() + linear * elem_sz, base + byte_off, elem_sz);
+    for (size_t i = num_dims; i > 0; --i) {
+      size_t d = i - 1;
+      if (++idx[d] < dims[d]) break;
+      idx[d] = 0;
+    }
+  }
   return true;
 }
 
@@ -254,7 +528,86 @@ PJRT_Error* ot_pjrt_client_create(PJRT_Client_Create_Args* args) {
     if (info.chip_gen == OT_CHIP_V6E) c->device.desc.kind = "TPU v6 lite";
     else c->device.desc.kind = "TPU v5 lite";
   }
+  c->topology.platform_name = c->platform_name;
+  c->topology.platform_version = c->platform_version;
+  c->topology.desc_ptrs[0] = &c->device.desc;
+  c->topology.owned_by_client = true;
   args->client = c;
+  return nullptr;
+}
+
+PJRT_Error* ot_pjrt_client_topology_description(PJRT_Client_TopologyDescription_Args* args) {
+  if (!args || !args->client) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null client");
+  args->topology = &args->client->topology;
+  return nullptr;
+}
+
+PJRT_Error* ot_pjrt_topo_destroy(PJRT_TopologyDescription_Destroy_Args* args) {
+  if (args && args->topology && !args->topology->owned_by_client) {
+    delete args->topology;
+  }
+  return nullptr;
+}
+
+PJRT_Error* ot_pjrt_topo_platform_name(PJRT_TopologyDescription_PlatformName_Args* args) {
+  if (!args || !args->topology) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null topology");
+  args->platform_name = args->topology->platform_name.c_str();
+  args->platform_name_size = args->topology->platform_name.size();
+  return nullptr;
+}
+
+PJRT_Error* ot_pjrt_topo_platform_version(PJRT_TopologyDescription_PlatformVersion_Args* args) {
+  if (!args || !args->topology) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null topology");
+  args->platform_version = args->topology->platform_version.c_str();
+  args->platform_version_size = args->topology->platform_version.size();
+  return nullptr;
+}
+
+PJRT_Error* ot_pjrt_topo_get_dev_descs(
+    PJRT_TopologyDescription_GetDeviceDescriptions_Args* args) {
+  if (!args || !args->topology) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null topology");
+  args->descriptions = args->topology->desc_ptrs;
+  args->num_descriptions = args->topology->desc_ptrs[0] ? 1 : 0;
+  return nullptr;
+}
+
+PJRT_Error* ot_pjrt_topo_attributes(PJRT_TopologyDescription_Attributes_Args* args) {
+  if (!args || !args->topology) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null topology");
+  args->attributes = nullptr;
+  args->num_attributes = 0;
+  return nullptr;
+}
+
+void ot_pjrt_serialized_topo_deleter(PJRT_SerializedTopology* s) {
+  delete s;
+}
+
+PJRT_Error* ot_pjrt_topo_serialize(PJRT_TopologyDescription_Serialize_Args* args) {
+  if (!args || !args->topology) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null topology");
+  auto* st = new (std::nothrow) PJRT_SerializedTopology();
+  if (!st) return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, "out of memory");
+  const char* kind =
+      args->topology->desc_ptrs[0] ? args->topology->desc_ptrs[0]->kind.c_str() : "unknown";
+  st->data = args->topology->platform_name + "|" + args->topology->platform_version + "|" + kind;
+  args->serialized_bytes = st->data.c_str();
+  args->serialized_bytes_size = st->data.size();
+  args->serialized_topology = st;
+  args->serialized_topology_deleter = ot_pjrt_serialized_topo_deleter;
+  return nullptr;
+}
+
+PJRT_Error* ot_pjrt_topo_fingerprint(PJRT_TopologyDescription_Fingerprint_Args* args) {
+  if (!args || !args->topology) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null topology");
+  const char* kind =
+      args->topology->desc_ptrs[0] ? args->topology->desc_ptrs[0]->kind.c_str() : "unknown";
+  std::string key =
+      args->topology->platform_name + "|" + args->topology->platform_version + "|" + kind;
+  uint64_t h = 14695981039346656037ULL;
+  for (unsigned char c : key) {
+    h ^= static_cast<uint64_t>(c);
+    h *= 1099511628211ULL;
+  }
+  args->fingerprint = h;
   return nullptr;
 }
 
@@ -356,22 +709,57 @@ PJRT_Error* ot_pjrt_client_compile(PJRT_Client_Compile_Args* args) {
 
 PJRT_Error* ot_pjrt_buffer_from_host_buffer(PJRT_Client_BufferFromHostBuffer_Args* args) {
   if (!args || !args->client) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null args");
+  if (args->num_dims > 0 && !args->dims) {
+    return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null dims");
+  }
   size_t elem_sz = dtype_bytes(args->type);
   if (elem_sz == 0) return make_err(PJRT_Error_Code_UNIMPLEMENTED, "unsupported buffer dtype");
   size_t elems = 1;
   for (size_t i = 0; i < args->num_dims; ++i) {
     if (args->dims[i] < 0) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "negative dim");
-    elems *= static_cast<size_t>(args->dims[i]);
+    size_t d = static_cast<size_t>(args->dims[i]);
+    if (d > 0 && elems > std::numeric_limits<size_t>::max() / d) {
+      return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "element count overflow");
+    }
+    elems *= d;
   }
-  size_t nbytes = elems * elem_sz;
-  if (nbytes == 0) nbytes = 1;
+  if (elems > std::numeric_limits<size_t>::max() / elem_sz) {
+    return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "byte size overflow");
+  }
+  size_t logical_bytes = elems * elem_sz;
 
+  if (args->num_byte_strides != 0) {
+    if (!args->byte_strides || args->num_byte_strides != args->num_dims) {
+      return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "invalid byte_strides");
+    }
+  }
+  if (args->device_layout &&
+      !is_supported_dense_layout(args->device_layout, args->dims, args->num_dims, elem_sz)) {
+    return make_err(PJRT_Error_Code_UNIMPLEMENTED,
+                    "unsupported device_layout (dense row-major only)");
+  }
+
+  const void* upload_ptr = args->data;
+  std::vector<uint8_t> packed_host;
+  if (elems > 0) {
+    if (!args->data) {
+      return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null host data for non-empty buffer");
+    }
+    if (args->num_byte_strides != 0 &&
+        !is_dense_row_major_strides(args->dims, args->num_dims, args->byte_strides, elem_sz)) {
+      gather_strided_host_buffer(args->data, args->dims, args->num_dims, args->byte_strides,
+                                 elem_sz, elems, &packed_host);
+      upload_ptr = packed_host.data();
+    }
+  }
+
+  size_t alloc_bytes = logical_bytes == 0 ? 1 : logical_bytes;
   ot_buffer_t* ot_buf = nullptr;
-  ot_status_t st = ot_buffer_alloc(args->client->ctx, nbytes, &ot_buf);
+  ot_status_t st = ot_buffer_alloc(args->client->ctx, alloc_bytes, &ot_buf);
   if (st != OT_OK) return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, ot_status_string(st));
 
-  if (args->data && elems > 0) {
-    st = ot_buffer_h2d(args->client->ctx, ot_buf, args->data, elems * elem_sz);
+  if (upload_ptr && logical_bytes > 0) {
+    st = ot_buffer_h2d(args->client->ctx, ot_buf, upload_ptr, logical_bytes);
     if (st != OT_OK) {
       ot_buffer_free(ot_buf);
       return make_err(PJRT_Error_Code_INTERNAL, ot_status_string(st));
@@ -386,6 +774,7 @@ PJRT_Error* ot_pjrt_buffer_from_host_buffer(PJRT_Client_BufferFromHostBuffer_Arg
   buf->ctx = args->client->ctx;
   buf->device = args->device ? args->device : &args->client->device;
   buf->ot_buf = ot_buf;
+  buf->logical_bytes = logical_bytes;
   buf->dtype = args->type;
   buf->dims.assign(args->dims, args->dims + args->num_dims);
   for (size_t i = args->num_dims; i > 0; --i) {
@@ -469,12 +858,43 @@ PJRT_Error* ot_pjrt_device_default_memory(PJRT_Device_DefaultMemory_Args* args) 
 }
 
 PJRT_Error* ot_pjrt_device_memory_stats(PJRT_Device_MemoryStats_Args* args) {
-  if (!args || !args->device) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null");
+  if (!args || !args->device || !args->device->ctx) {
+    return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null");
+  }
   ot_device_info_t info = {};
   ot_device_get_info(args->device->ctx, &info);
-  args->bytes_in_use = 0;
+  uint64_t used = 0;
+  {
+    std::lock_guard<std::mutex> lk(args->device->ctx->mu);
+    used = args->device->ctx->transport.hbm_alloc.used_bytes();
+  }
+  args->bytes_in_use = static_cast<int64_t>(used);
+  args->peak_bytes_in_use = 0;
+  args->peak_bytes_in_use_is_set = false;
+  args->num_allocs = 0;
+  args->num_allocs_is_set = false;
+  args->largest_alloc_size = 0;
+  args->largest_alloc_size_is_set = false;
   args->bytes_limit = static_cast<int64_t>(info.hbm_bytes_total);
   args->bytes_limit_is_set = true;
+  args->bytes_reserved = 0;
+  args->bytes_reserved_is_set = false;
+  args->peak_bytes_reserved = 0;
+  args->peak_bytes_reserved_is_set = false;
+  args->bytes_reservable_limit = 0;
+  args->bytes_reservable_limit_is_set = false;
+  args->largest_free_block_bytes = 0;
+  args->largest_free_block_bytes_is_set = false;
+  args->pool_bytes = 0;
+  args->pool_bytes_is_set = false;
+  args->peak_pool_bytes = 0;
+  args->peak_pool_bytes_is_set = false;
+  if (args->struct_size >=
+      offsetof(PJRT_Device_MemoryStats_Args, peak_allocated_bytes_is_set) +
+          sizeof(args->peak_allocated_bytes_is_set)) {
+    args->peak_allocated_bytes = 0;
+    args->peak_allocated_bytes_is_set = false;
+  }
   return nullptr;
 }
 
@@ -619,9 +1039,25 @@ PJRT_Error* ot_pjrt_lexec_execute(PJRT_LoadedExecutable_Execute_Args* args) {
     return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "expected 1 device and 2 matmul args");
   }
   PJRT_LoadedExecutable* le = args->executable;
+  if (le->deleted) {
+    return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "executable has been deleted");
+  }
   PJRT_Buffer* lhs = args->argument_lists[0][0];
   PJRT_Buffer* rhs = args->argument_lists[0][1];
-  if (!lhs || !rhs) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null input buffer");
+  if (!lhs || !rhs || lhs->deleted || rhs->deleted || !lhs->ot_buf || !rhs->ot_buf) {
+    return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null or deleted input buffer");
+  }
+  if (lhs->ctx != le->client->ctx || rhs->ctx != le->client->ctx) {
+    return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "input buffer belongs to another client");
+  }
+  if (lhs->dtype != PJRT_Buffer_Type_BF16 || rhs->dtype != PJRT_Buffer_Type_BF16 ||
+      lhs->dims.size() != 2 || rhs->dims.size() != 2 ||
+      lhs->dims[0] != static_cast<int64_t>(le->exec.m_dim) ||
+      lhs->dims[1] != static_cast<int64_t>(le->exec.k_dim) ||
+      rhs->dims[0] != static_cast<int64_t>(le->exec.k_dim) ||
+      rhs->dims[1] != static_cast<int64_t>(le->exec.n_dim)) {
+    return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "input buffer dtype or shape mismatch");
+  }
 
   size_t out_bytes = static_cast<size_t>(le->exec.m_dim) * le->exec.n_dim * sizeof(uint16_t);
   ot_buffer_t* ot_out = nullptr;
@@ -643,6 +1079,7 @@ PJRT_Error* ot_pjrt_lexec_execute(PJRT_LoadedExecutable_Execute_Args* args) {
   out_buf->ctx = le->client->ctx;
   out_buf->device = &le->client->device;
   out_buf->ot_buf = ot_out;
+  out_buf->logical_bytes = out_bytes;
   out_buf->dtype = PJRT_Buffer_Type_BF16;
   out_buf->dims = le->exec.out_dims;
   out_buf->minor_to_major = {1, 0};
@@ -656,7 +1093,10 @@ PJRT_Error* ot_pjrt_lexec_execute(PJRT_LoadedExecutable_Execute_Args* args) {
 
 PJRT_Error* ot_pjrt_buf_destroy(PJRT_Buffer_Destroy_Args* args) {
   if (!args || !args->buffer) return nullptr;
-  ot_buffer_free(args->buffer->ot_buf);
+  if (args->buffer->ot_buf) {
+    ot_buffer_free(args->buffer->ot_buf);
+    args->buffer->ot_buf = nullptr;
+  }
   delete args->buffer;
   return nullptr;
 }
@@ -701,7 +1141,10 @@ PJRT_Error* ot_pjrt_buf_mem_layout(PJRT_Buffer_GetMemoryLayout_Args* args) {
 
 PJRT_Error* ot_pjrt_buf_size(PJRT_Buffer_OnDeviceSizeInBytes_Args* args) {
   if (!args || !args->buffer) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null");
-  args->on_device_size_in_bytes = ot_buffer_size(args->buffer->ot_buf);
+  if (args->buffer->deleted || !args->buffer->ot_buf) {
+    return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "buffer has been deleted");
+  }
+  args->on_device_size_in_bytes = args->buffer->logical_bytes;
   return nullptr;
 }
 
@@ -720,7 +1163,13 @@ PJRT_Error* ot_pjrt_buf_memory(PJRT_Buffer_Memory_Args* args) {
 }
 
 PJRT_Error* ot_pjrt_buf_delete(PJRT_Buffer_Delete_Args* args) {
-  if (args && args->buffer) args->buffer->deleted = true;
+  if (args && args->buffer) {
+    if (args->buffer->ot_buf) {
+      ot_buffer_free(args->buffer->ot_buf);
+      args->buffer->ot_buf = nullptr;
+    }
+    args->buffer->deleted = true;
+  }
   return nullptr;
 }
 
@@ -736,7 +1185,17 @@ PJRT_Error* ot_pjrt_buf_copy_to_device(PJRT_Buffer_CopyToDevice_Args*) {
 
 PJRT_Error* ot_pjrt_buf_to_host(PJRT_Buffer_ToHostBuffer_Args* args) {
   if (!args || !args->src) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null buffer");
-  size_t need = ot_buffer_size(args->src->ot_buf);
+  if (args->src->deleted || !args->src->ot_buf) {
+    return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "buffer has been deleted");
+  }
+  size_t elem_sz = dtype_bytes(args->src->dtype);
+  if (args->host_layout &&
+      !is_supported_dense_layout(args->host_layout, args->src->dims.data(), args->src->dims.size(),
+                                 elem_sz)) {
+    return make_err(PJRT_Error_Code_UNIMPLEMENTED,
+                    "unsupported host_layout (dense row-major only)");
+  }
+  size_t need = args->src->logical_bytes;
   if (!args->dst) {
     args->dst_size = need;
     args->event = nullptr;
@@ -745,8 +1204,10 @@ PJRT_Error* ot_pjrt_buf_to_host(PJRT_Buffer_ToHostBuffer_Args* args) {
   if (args->dst_size < need) {
     return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "dst_size smaller than buffer size");
   }
-  ot_status_t st = ot_buffer_d2h(args->src->ctx, args->src->ot_buf, args->dst, need);
-  if (st != OT_OK) return make_err(PJRT_Error_Code_INTERNAL, ot_status_string(st));
+  if (need > 0) {
+    ot_status_t st = ot_buffer_d2h(args->src->ctx, args->src->ot_buf, args->dst, need);
+    if (st != OT_OK) return make_err(PJRT_Error_Code_INTERNAL, ot_status_string(st));
+  }
   args->event = new (std::nothrow) PJRT_Event{true};
   return nullptr;
 }
@@ -797,6 +1258,15 @@ PJRT_Api build_pjrt_api() {
   api.PJRT_Client_Compile = ot_pjrt_client_compile;
   api.PJRT_Client_DefaultDeviceAssignment = ot_pjrt_client_default_device_assignment;
   api.PJRT_Client_BufferFromHostBuffer = ot_pjrt_buffer_from_host_buffer;
+  api.PJRT_Client_TopologyDescription = ot_pjrt_client_topology_description;
+
+  api.PJRT_TopologyDescription_Destroy = ot_pjrt_topo_destroy;
+  api.PJRT_TopologyDescription_PlatformName = ot_pjrt_topo_platform_name;
+  api.PJRT_TopologyDescription_PlatformVersion = ot_pjrt_topo_platform_version;
+  api.PJRT_TopologyDescription_GetDeviceDescriptions = ot_pjrt_topo_get_dev_descs;
+  api.PJRT_TopologyDescription_Serialize = ot_pjrt_topo_serialize;
+  api.PJRT_TopologyDescription_Attributes = ot_pjrt_topo_attributes;
+  api.PJRT_TopologyDescription_Fingerprint = ot_pjrt_topo_fingerprint;
 
   api.PJRT_DeviceDescription_Id = ot_pjrt_devdesc_id;
   api.PJRT_DeviceDescription_ProcessIndex = ot_pjrt_devdesc_process_index;

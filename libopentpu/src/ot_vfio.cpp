@@ -38,19 +38,44 @@ void IovaAllocator::init(uint64_t base, uint64_t limit) {
 bool IovaAllocator::alloc(uint64_t size, uint64_t align, uint64_t* out_iova) {
   if (!out_iova || size == 0) return false;
   if (align == 0) align = 4096;
+  if ((align & (align - 1)) != 0) return false;
 
-  // Reuse a free block if big enough
-  for (auto& b : blocks_) {
-    if (!b.in_use && b.size >= size && (b.iova % align) == 0) {
-      b.in_use = true;
-      *out_iova = b.iova;
-      return true;
+  // Reuse a free block if big enough, splitting unused leading/trailing space.
+  for (size_t i = 0; i < blocks_.size(); ++i) {
+    if (blocks_[i].in_use) continue;
+    uint64_t b_start = blocks_[i].iova;
+    uint64_t b_size = blocks_[i].size;
+    if (b_size < size) continue;
+    uint64_t aligned = (b_start + (align - 1)) & ~(align - 1);
+    if (aligned < b_start) continue;
+    uint64_t pad = aligned - b_start;
+    if (pad > b_size || size > b_size - pad) continue;
+
+    uint64_t rem = (b_size - pad) - size;
+    if (pad > 0) {
+      blocks_[i].size = pad;
+      blocks_.insert(blocks_.begin() + static_cast<ptrdiff_t>(i + 1),
+                     IovaBlock{aligned, size, true});
+      ++i;
+    } else {
+      blocks_[i].iova = aligned;
+      blocks_[i].size = size;
+      blocks_[i].in_use = true;
     }
+    if (rem > 0) {
+      blocks_.insert(blocks_.begin() + static_cast<ptrdiff_t>(i + 1),
+                     IovaBlock{aligned + size, rem, false});
+    }
+    *out_iova = aligned;
+    return true;
   }
 
   uint64_t aligned = (next_ + (align - 1)) & ~(align - 1);
   if (aligned < next_ || aligned > limit_ || size > limit_ - aligned) {
     return false;
+  }
+  if (aligned > next_) {
+    blocks_.push_back({next_, aligned - next_, false});
   }
   blocks_.push_back({aligned, size, true});
   next_ = aligned + size;
@@ -59,9 +84,27 @@ bool IovaAllocator::alloc(uint64_t size, uint64_t align, uint64_t* out_iova) {
 }
 
 void IovaAllocator::free(uint64_t iova) {
-  for (auto& b : blocks_) {
-    if (b.in_use && b.iova == iova) {
-      b.in_use = false;
+  for (size_t i = 0; i < blocks_.size(); ++i) {
+    if (blocks_[i].in_use && blocks_[i].iova == iova) {
+      blocks_[i].in_use = false;
+      // Coalesce with next free block if contiguous.
+      if (i + 1 < blocks_.size() && !blocks_[i + 1].in_use &&
+          blocks_[i].iova + blocks_[i].size == blocks_[i + 1].iova) {
+        blocks_[i].size += blocks_[i + 1].size;
+        blocks_.erase(blocks_.begin() + static_cast<ptrdiff_t>(i + 1));
+      }
+      // Coalesce with previous free block if contiguous.
+      if (i > 0 && !blocks_[i - 1].in_use &&
+          blocks_[i - 1].iova + blocks_[i - 1].size == blocks_[i].iova) {
+        blocks_[i - 1].size += blocks_[i].size;
+        blocks_.erase(blocks_.begin() + static_cast<ptrdiff_t>(i));
+      }
+      // Trim trailing free blocks back into the bump frontier.
+      while (!blocks_.empty() && !blocks_.back().in_use &&
+             blocks_.back().iova + blocks_.back().size == next_) {
+        next_ = blocks_.back().iova;
+        blocks_.pop_back();
+      }
       return;
     }
   }
@@ -470,7 +513,8 @@ bool VfioTransport::map_dma_at(void* vaddr, uint64_t iova, uint64_t size, std::s
 bool VfioTransport::map_dma(void* vaddr, uint64_t size, uint64_t* out_iova, std::string* err) {
   if (!vaddr || size == 0 || !out_iova) return false;
   uint64_t iova = 0;
-  if (!iova_alloc.alloc(size, 4096, &iova)) {
+  uint64_t align = iommu_min_page_size >= 4096ULL ? iommu_min_page_size : 4096ULL;
+  if (!iova_alloc.alloc(size, align, &iova)) {
     if (err) *err = "IOVA arena exhausted";
     return false;
   }
@@ -548,6 +592,7 @@ bool VfioTransport::enable_bus_master(std::string* err) {
 }
 
 bool VfioTransport::init_ring_queues(std::string* err) {
+  dma_faulted = false;
   if (is_mock) return true;
 #ifndef __linux__
   (void)err;
@@ -555,6 +600,33 @@ bool VfioTransport::init_ring_queues(std::string* err) {
 #else
   if (!bar0_mmio || bar0_mapped_len < 0x12000u) {
     if (err) *err = "BAR0 MMIO ring window unavailable";
+    return false;
+  }
+
+  // Determine the effective VFIO DMA mapping alignment: max(host page size,
+  // minimum IOMMU supported page size, 4 KiB). Mapping SQ, CQ, and the status
+  // page inside one page-aligned contiguous arena preserves fixed hardware
+  // offsets (0x0000, 0x8000, 0xa000) even on 16 KiB / 64 KiB page hosts.
+  long host_ps = ::sysconf(_SC_PAGESIZE);
+  uint64_t map_granule = (host_ps > 4096) ? static_cast<uint64_t>(host_ps) : 4096ULL;
+  struct vfio_iommu_type1_info iommu_info = {};
+  iommu_info.argsz = sizeof(iommu_info);
+  if (::ioctl(container_fd, VFIO_IOMMU_GET_INFO, &iommu_info) == 0 &&
+      (iommu_info.flags & VFIO_IOMMU_INFO_PGSIZES) && iommu_info.iova_pgsizes != 0) {
+    uint64_t min_iommu_ps = iommu_info.iova_pgsizes & (~iommu_info.iova_pgsizes + 1ULL);
+    if (min_iommu_ps > map_granule) map_granule = min_iommu_ps;
+  }
+  iommu_min_page_size = map_granule;
+
+  const uint64_t ring_min_span = kStatusPageIova + kStatusPageBytes;
+  const uint64_t aligned_ring_bytes =
+      (ring_min_span + map_granule - 1ULL) & ~(map_granule - 1ULL);
+  if (aligned_ring_bytes < ring_min_span || aligned_ring_bytes > kStageBaseIova) {
+    if (err) *err = "IOMMU page size exceeds ring controller IOVA aperture";
+    return false;
+  }
+  if ((kStageBaseIova % map_granule) != 0 || (kStageBytes % map_granule) != 0) {
+    if (err) *err = "Staging DMA window is not aligned to IOMMU page size";
     return false;
   }
 
@@ -570,16 +642,17 @@ bool VfioTransport::init_ring_queues(std::string* err) {
     return reinterpret_cast<uint8_t*>(p);
   };
 
-  sq_ring_mem = map_anon_dma(kSqRingIova, kSqRingBytes);
-  cq_ring_mem = map_anon_dma(kCqRingIova, kCqRingBytes);
-  status_page_mem = reinterpret_cast<volatile uint32_t*>(
-      map_anon_dma(kStatusPageIova, kStatusPageBytes));
+  ring_arena_bytes = static_cast<size_t>(aligned_ring_bytes);
+  ring_arena_mem = map_anon_dma(kSqRingIova, ring_arena_bytes);
   host_stage_mem = map_anon_dma(kStageBaseIova, kStageBytes);
-  if (!sq_ring_mem || !cq_ring_mem || !status_page_mem || !host_stage_mem) {
+  if (!ring_arena_mem || !host_stage_mem) {
     if (err && err->empty()) *err = "Failed to map VFIO ring queue buffers";
     teardown_ring_queues();
     return false;
   }
+  sq_ring_mem = ring_arena_mem + kSqRingIova;
+  cq_ring_mem = ring_arena_mem + kCqRingIova;
+  status_page_mem = reinterpret_cast<volatile uint32_t*>(ring_arena_mem + kStatusPageIova);
   host_stage_size = kStageBytes;
   host_stage_iova = kStageBaseIova;
 
@@ -665,10 +738,10 @@ void VfioTransport::teardown_ring_queues() {
     ::munmap(p, len);
   };
   unmap_anon_dma(host_stage_mem, kStageBaseIova, host_stage_size);
-  unmap_anon_dma(const_cast<uint32_t*>(status_page_mem), kStatusPageIova, kStatusPageBytes);
-  unmap_anon_dma(cq_ring_mem, kCqRingIova, kCqRingBytes);
-  unmap_anon_dma(sq_ring_mem, kSqRingIova, kSqRingBytes);
+  unmap_anon_dma(ring_arena_mem, kSqRingIova, ring_arena_bytes);
 #endif
+  ring_arena_mem = nullptr;
+  ring_arena_bytes = 0;
   sq_ring_mem = nullptr;
   cq_ring_mem = nullptr;
   status_page_mem = nullptr;
@@ -677,10 +750,15 @@ void VfioTransport::teardown_ring_queues() {
   host_stage_iova = 0;
   sq_seq = 0;
   ring_ready = false;
+  dma_faulted = false;
 }
 
 bool VfioTransport::submit_sq_wait(const uint32_t desc[32], uint32_t timeout_ms,
                                    uint32_t cq_out[8], std::string* err) {
+  if (dma_faulted) {
+    if (err) *err = "VFIO DMA faulted after prior timeout; recreate context to reset device";
+    return false;
+  }
   if (is_mock) {
     if (cq_out) std::memset(cq_out, 0, 32);
     return true;
@@ -721,8 +799,25 @@ bool VfioTransport::submit_sq_wait(const uint32_t desc[32], uint32_t timeout_ms,
     waited_us += 10u;
   }
 
+  // Quiesce the device immediately so an in-flight descriptor cannot complete
+  // late into reused staging memory or reallocated HBM.
+  dma_faulted = true;
+  ring_ready = false;
+  if (bar0_mmio && bar0_mapped_len >= 0x12000u) {
+    write32_bar0(0x10000u, 0u);
+    write32_bar0(0x10040u, 0u);
+  }
+  uint16_t cmd = 0;
+  if (read_pci_config(0x04, &cmd, sizeof(cmd)) && (cmd & 0x0004u)) {
+    cmd &= static_cast<uint16_t>(~0x0004u);  // Clear PCI_COMMAND_MASTER
+    (void)write_pci_config(0x04, &cmd, sizeof(cmd));
+  }
+  if (device_fd >= 0) {
+    (void)::ioctl(device_fd, VFIO_DEVICE_RESET);
+  }
   if (err) {
-    *err = "SQ doorbell timeout waiting for completion seq=" + std::to_string(target_seq - 1u);
+    *err = "SQ doorbell timeout waiting for completion seq=" + std::to_string(target_seq - 1u) +
+           " (device quiesced; recreate context)";
   }
   return false;
 #endif

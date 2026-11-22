@@ -85,14 +85,18 @@ struct VfioTransport {
   bool pci_cmd_saved = false;
 
   // Bare-metal BAR0 + 0x10000 ring queues and pinned host staging DMA memory.
+  uint8_t* ring_arena_mem = nullptr;
+  size_t   ring_arena_bytes = 0;
   uint8_t* sq_ring_mem = nullptr;
   uint8_t* cq_ring_mem = nullptr;
   volatile uint32_t* status_page_mem = nullptr;
   uint8_t* host_stage_mem = nullptr;
   size_t   host_stage_size = 0;
   uint64_t host_stage_iova = 0;
+  uint64_t iommu_min_page_size = 4096ULL;
   uint32_t sq_seq = 0;
   bool ring_ready = false;
+  bool dma_faulted = false;
 
   IovaAllocator iova_alloc;
   IovaAllocator hbm_alloc;

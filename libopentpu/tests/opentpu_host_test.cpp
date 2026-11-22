@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "opentpu.h"
 #include "ot_internal.h"
+#include "ot_vliw.h"
 #include "pjrt_c_api.h"
 
-#include <cassert>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -11,15 +11,44 @@
 
 extern "C" const PJRT_Api* GetPjrtApi(void);
 
+#define OT_CHECK(expr)                                                   \
+  do {                                                                   \
+    if (!(expr)) {                                                       \
+      std::fprintf(stderr, "OT_CHECK FAILED (%s:%d): %s\n", __FILE__,    \
+                   __LINE__, #expr);                                     \
+      std::abort();                                                      \
+    }                                                                    \
+  } while (0)
+
+static void destroy_pjrt_error(const PJRT_Api* api, PJRT_Error* err) {
+  if (!err) return;
+  PJRT_Error_Destroy_Args d = {};
+  d.struct_size = PJRT_Error_Destroy_Args_STRUCT_SIZE;
+  d.error = err;
+  api->PJRT_Error_Destroy(&d);
+}
+
 static void test_iova_allocator() {
   ot::IovaAllocator alloc;
   alloc.init(0x100000ULL, 0x200000ULL);
   uint64_t a = 0, b = 0, c = 0;
-  assert(alloc.alloc(4096, 4096, &a) && a == 0x100000ULL);
-  assert(alloc.alloc(8192, 4096, &b) && b == 0x101000ULL);
-  assert(alloc.used_bytes() == 12288);
+  OT_CHECK(alloc.alloc(4096, 4096, &a) && a == 0x100000ULL);
+  OT_CHECK(alloc.alloc(8192, 4096, &b) && b == 0x101000ULL);
+  OT_CHECK(alloc.used_bytes() == 12288);
   alloc.free(a);
-  assert(alloc.alloc(4096, 4096, &c) && c == 0x100000ULL);
+  OT_CHECK(alloc.alloc(4096, 4096, &c) && c == 0x100000ULL);
+  alloc.free(c);
+  alloc.free(b);
+  OT_CHECK(alloc.used_bytes() == 0);
+
+  // Full-arena alloc -> free -> split into two 4 KiB blocks without losing capacity.
+  uint64_t full = 0, s1 = 0, s2 = 0;
+  OT_CHECK(alloc.alloc(0x100000ULL, 4096, &full) && full == 0x100000ULL);
+  OT_CHECK(!alloc.alloc(4096, 4096, &s1));
+  alloc.free(full);
+  OT_CHECK(alloc.alloc(4096, 4096, &s1) && s1 == 0x100000ULL);
+  OT_CHECK(alloc.alloc(4096, 4096, &s2) && s2 == 0x101000ULL);
+  OT_CHECK(alloc.used_bytes() == 8192);
   printf("[PASS] test_iova_allocator\n");
 }
 
@@ -36,12 +65,12 @@ static void test_bar4_descriptor_parser() {
   std::memcpy(page.data() + 0x10, proto, plen);
 
   ot::Bar4Descriptor desc;
-  assert(ot::parse_bar4_descriptor(page.data(), page.size(), &desc));
-  assert(desc.valid);
-  assert(desc.proto_len == plen);
-  assert(desc.header_word == hdr);
-  assert(desc.core_count_observed == 1);
-  assert(desc.instance_token == "TPUv5");
+  OT_CHECK(ot::parse_bar4_descriptor(page.data(), page.size(), &desc));
+  OT_CHECK(desc.valid);
+  OT_CHECK(desc.proto_len == plen);
+  OT_CHECK(desc.header_word == hdr);
+  OT_CHECK(desc.core_count_observed == 1);
+  OT_CHECK(desc.instance_token == "TPUv5");
   printf("[PASS] test_bar4_descriptor_parser\n");
 }
 
@@ -49,31 +78,51 @@ static void test_mock_dma_and_matmul() {
   ot_config_t cfg = ot_config_default();
   cfg.mock_mode = 1;
   ot_context_t* ctx = nullptr;
-  assert(ot_context_create(&cfg, &ctx) == OT_OK);
-  assert(ot_context_is_mock(ctx) == 1);
+  OT_CHECK(ot_context_create(&cfg, &ctx) == OT_OK);
+  OT_CHECK(ot_context_is_mock(ctx) == 1);
 
   ot_device_info_t info = {};
-  assert(ot_device_get_info(ctx, &info) == OT_OK);
-  assert(info.vendor_id == 0x1ae0u && info.device_id == 0x0063u);
+  OT_CHECK(ot_device_get_info(ctx, &info) == OT_OK);
+  OT_CHECK(info.vendor_id == 0x1ae0u && info.device_id == 0x0063u);
 
   ot_buffer_t* ba = nullptr;
   ot_buffer_t* bb = nullptr;
   ot_buffer_t* bc = nullptr;
   const uint32_t M = 128, K = 128, N = 128;
-  assert(ot_buffer_alloc(ctx, M * K * 2, &ba) == OT_OK);
-  assert(ot_buffer_alloc(ctx, K * N * 2, &bb) == OT_OK);
-  assert(ot_buffer_alloc(ctx, M * N * 2, &bc) == OT_OK);
+  OT_CHECK(ot_buffer_alloc(ctx, M * K * 2, &ba) == OT_OK);
+  OT_CHECK(ot_buffer_alloc(ctx, K * N * 2, &bb) == OT_OK);
+  OT_CHECK(ot_buffer_alloc(ctx, M * N * 2, &bc) == OT_OK);
 
   std::vector<uint16_t> ones(M * K, 0x3f80u);  // 1.0 bf16
-  assert(ot_buffer_h2d(ctx, ba, ones.data(), ones.size() * 2) == OT_OK);
-  assert(ot_buffer_h2d(ctx, bb, ones.data(), ones.size() * 2) == OT_OK);
-  assert(ot_matmul_bf16(ctx, ba, bb, bc, M, K, N) == OT_OK);
+  OT_CHECK(ot_buffer_h2d(ctx, ba, ones.data(), ones.size() * 2) == OT_OK);
+  OT_CHECK(ot_buffer_h2d(ctx, bb, ones.data(), ones.size() * 2) == OT_OK);
+  OT_CHECK(ot_matmul_bf16(ctx, ba, bb, bc, M, K, N) == OT_OK);
 
   std::vector<uint16_t> out(M * N, 0);
-  assert(ot_buffer_d2h(ctx, bc, out.data(), out.size() * 2) == OT_OK);
+  OT_CHECK(ot_buffer_d2h(ctx, bc, out.data(), out.size() * 2) == OT_OK);
   for (uint16_t v : out) {
-    assert(v == 0x4300u);  // 128.0 bf16
+    OT_CHECK(v == 0x4300u);  // 128.0 bf16
   }
+
+  // Cross-context buffer ownership must be rejected for H2D, D2H, and matmul.
+  ot_context_t* ctx2 = nullptr;
+  OT_CHECK(ot_context_create(&cfg, &ctx2) == OT_OK);
+  ot_buffer_t* foreign = nullptr;
+  OT_CHECK(ot_buffer_alloc(ctx2, M * K * 2, &foreign) == OT_OK);
+  OT_CHECK(ot_buffer_h2d(ctx, foreign, ones.data(), ones.size() * 2) == OT_ERR_INVALID_ARG);
+  OT_CHECK(ot_buffer_d2h(ctx, foreign, out.data(), out.size() * 2) == OT_ERR_INVALID_ARG);
+  OT_CHECK(ot_matmul_bf16(ctx, foreign, bb, bc, M, K, N) == OT_ERR_INVALID_ARG);
+  OT_CHECK(ot_matmul_bf16(ctx, ba, foreign, bc, M, K, N) == OT_ERR_INVALID_ARG);
+  OT_CHECK(ot_matmul_bf16(ctx, ba, bb, foreign, M, K, N) == OT_ERR_INVALID_ARG);
+
+  // Faulted DMA context must refuse subsequent transfers and allocations.
+  ctx2->transport.dma_faulted = true;
+  ot_buffer_t* blocked = nullptr;
+  OT_CHECK(ot_buffer_alloc(ctx2, 4096, &blocked) == OT_ERR_DEVICE);
+  OT_CHECK(ot_buffer_h2d(ctx2, foreign, ones.data(), 16) == OT_ERR_DEVICE);
+  OT_CHECK(ot_buffer_d2h(ctx2, foreign, out.data(), 16) == OT_ERR_DEVICE);
+  ot_buffer_free(foreign);
+  ot_context_destroy(ctx2);
 
   ot_buffer_free(bc);
   ot_buffer_free(bb);
@@ -85,25 +134,100 @@ static void test_mock_dma_and_matmul() {
 static void test_pjrt_api_mock() {
   setenv("OPENTPU_MOCK", "1", 1);
   const PJRT_Api* api = GetPjrtApi();
-  assert(api != nullptr);
-  assert(api->struct_size == PJRT_Api_STRUCT_SIZE);
-  assert(api->pjrt_api_version.major_version == 0);
-  assert(api->pjrt_api_version.minor_version == 116);
+  OT_CHECK(api != nullptr);
+  OT_CHECK(api->struct_size == PJRT_Api_STRUCT_SIZE);
+  OT_CHECK(api->pjrt_api_version.major_version == 0);
+  OT_CHECK(api->pjrt_api_version.minor_version == 116);
+  OT_CHECK(api->PJRT_Client_TopologyDescription != nullptr);
+  OT_CHECK(api->PJRT_TopologyDescription_PlatformName != nullptr);
+  OT_CHECK(api->PJRT_TopologyDescription_PlatformVersion != nullptr);
+  OT_CHECK(api->PJRT_TopologyDescription_GetDeviceDescriptions != nullptr);
+  OT_CHECK(api->PJRT_TopologyDescription_Serialize != nullptr);
+  OT_CHECK(api->PJRT_TopologyDescription_Attributes != nullptr);
 
   PJRT_Plugin_Initialize_Args pi = {};
   pi.struct_size = PJRT_Plugin_Initialize_Args_STRUCT_SIZE;
-  assert(api->PJRT_Plugin_Initialize(&pi) == nullptr);
+  OT_CHECK(api->PJRT_Plugin_Initialize(&pi) == nullptr);
 
   PJRT_Client_Create_Args cc = {};
   cc.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
-  assert(api->PJRT_Client_Create(&cc) == nullptr);
-  assert(cc.client != nullptr);
+  OT_CHECK(api->PJRT_Client_Create(&cc) == nullptr);
+  OT_CHECK(cc.client != nullptr);
+
+  // OpenXLA calls PJRT_Client_TopologyDescription immediately during client init.
+  PJRT_Client_TopologyDescription_Args ctd = {};
+  ctd.struct_size = PJRT_Client_TopologyDescription_Args_STRUCT_SIZE;
+  ctd.client = cc.client;
+  OT_CHECK(api->PJRT_Client_TopologyDescription(&ctd) == nullptr);
+  OT_CHECK(ctd.topology != nullptr);
+
+  PJRT_TopologyDescription_PlatformName_Args tpn = {};
+  tpn.struct_size = PJRT_TopologyDescription_PlatformName_Args_STRUCT_SIZE;
+  tpn.topology = ctd.topology;
+  OT_CHECK(api->PJRT_TopologyDescription_PlatformName(&tpn) == nullptr);
+  OT_CHECK(tpn.platform_name_size == 3 && std::memcmp(tpn.platform_name, "tpu", 3) == 0);
+
+  PJRT_TopologyDescription_GetDeviceDescriptions_Args tdd = {};
+  tdd.struct_size = PJRT_TopologyDescription_GetDeviceDescriptions_Args_STRUCT_SIZE;
+  tdd.topology = ctd.topology;
+  OT_CHECK(api->PJRT_TopologyDescription_GetDeviceDescriptions(&tdd) == nullptr);
+  OT_CHECK(tdd.num_descriptions == 1 && tdd.descriptions[0] != nullptr);
+
+  PJRT_TopologyDescription_Serialize_Args tser = {};
+  tser.struct_size = PJRT_TopologyDescription_Serialize_Args_STRUCT_SIZE;
+  tser.topology = ctd.topology;
+  OT_CHECK(api->PJRT_TopologyDescription_Serialize(&tser) == nullptr);
+  OT_CHECK(tser.serialized_bytes != nullptr && tser.serialized_bytes_size > 0);
+  tser.serialized_topology_deleter(tser.serialized_topology);
 
   PJRT_Client_AddressableDevices_Args ad = {};
   ad.struct_size = PJRT_Client_AddressableDevices_Args_STRUCT_SIZE;
   ad.client = cc.client;
-  assert(api->PJRT_Client_AddressableDevices(&ad) == nullptr);
-  assert(ad.num_addressable_devices == 1);
+  OT_CHECK(api->PJRT_Client_AddressableDevices(&ad) == nullptr);
+  OT_CHECK(ad.num_addressable_devices == 1);
+
+  // MemoryStats must initialize all *_is_set booleans even when caller passes uninitialized struct.
+  PJRT_Device_MemoryStats_Args ms;
+  std::memset(&ms, 0xaa, sizeof(ms));
+  ms.struct_size = PJRT_Device_MemoryStats_Args_STRUCT_SIZE;
+  ms.extension_start = nullptr;
+  ms.device = ad.addressable_devices[0];
+  OT_CHECK(api->PJRT_Device_MemoryStats(&ms) == nullptr);
+  OT_CHECK(ms.bytes_in_use == 0);
+  OT_CHECK(ms.bytes_limit_is_set == true);
+  OT_CHECK(ms.peak_bytes_in_use_is_set == false);
+  OT_CHECK(ms.num_allocs_is_set == false);
+  OT_CHECK(ms.largest_alloc_size_is_set == false);
+  OT_CHECK(ms.bytes_reserved_is_set == false);
+  OT_CHECK(ms.peak_bytes_reserved_is_set == false);
+  OT_CHECK(ms.bytes_reservable_limit_is_set == false);
+  OT_CHECK(ms.largest_free_block_bytes_is_set == false);
+  OT_CHECK(ms.pool_bytes_is_set == false);
+  OT_CHECK(ms.peak_pool_bytes_is_set == false);
+  OT_CHECK(ms.peak_allocated_bytes_is_set == false);
+
+  // Reject StableHLO programs with extra/unsupported post-dot operations (e.g. negate).
+  const char* bad_mlir =
+      "module @jit_neg_mm {\n"
+      "  func.func public @main(%a: tensor<4x4xbf16>, %b: tensor<4x4xbf16>) -> tensor<4x4xbf16> {\n"
+      "    %0 = stablehlo.dot_general %a, %b, contracting_dims = [1] x [0] : (tensor<4x4xbf16>, tensor<4x4xbf16>) -> tensor<4x4xbf16>\n"
+      "    %1 = stablehlo.negate %0 : tensor<4x4xbf16>\n"
+      "    return %1 : tensor<4x4xbf16>\n"
+      "  }\n"
+      "}\n";
+  PJRT_Program bad_prog = {};
+  bad_prog.struct_size = PJRT_Program_STRUCT_SIZE;
+  bad_prog.code = const_cast<char*>(bad_mlir);
+  bad_prog.code_size = std::strlen(bad_mlir);
+  bad_prog.format = "mlir";
+  bad_prog.format_size = 4;
+  PJRT_Client_Compile_Args bad_ca = {};
+  bad_ca.struct_size = PJRT_Client_Compile_Args_STRUCT_SIZE;
+  bad_ca.client = cc.client;
+  bad_ca.program = &bad_prog;
+  PJRT_Error* bad_err = api->PJRT_Client_Compile(&bad_ca);
+  OT_CHECK(bad_err != nullptr);
+  destroy_pjrt_error(api, bad_err);
 
   const char* mlir =
       "module @jit_mm {\n"
@@ -123,8 +247,112 @@ static void test_pjrt_api_mock() {
   ca.struct_size = PJRT_Client_Compile_Args_STRUCT_SIZE;
   ca.client = cc.client;
   ca.program = &prog;
-  assert(api->PJRT_Client_Compile(&ca) == nullptr);
-  assert(ca.executable != nullptr);
+  OT_CHECK(api->PJRT_Client_Compile(&ca) == nullptr);
+  OT_CHECK(ca.executable != nullptr);
+
+  // Strided & reversed host uploads must reorder elements accurately; unsupported layouts rejected.
+  uint16_t raw_2x2[4] = {0x3f80u, 0x4000u, 0x4040u, 0x4080u};  // [1, 2; 3, 4]
+  int64_t sdims[2] = {2, 2};
+  int64_t transposed_strides[2] = {2, 4};  // transpose -> [1, 3; 2, 4]
+  PJRT_Client_BufferFromHostBuffer_Args st_up = {};
+  st_up.struct_size = PJRT_Client_BufferFromHostBuffer_Args_STRUCT_SIZE;
+  st_up.client = cc.client;
+  st_up.data = raw_2x2;
+  st_up.type = PJRT_Buffer_Type_BF16;
+  st_up.dims = sdims;
+  st_up.num_dims = 2;
+  st_up.byte_strides = transposed_strides;
+  st_up.num_byte_strides = 2;
+  st_up.host_buffer_semantics = PJRT_HostBufferSemantics_kImmutableUntilTransferCompletes;
+  st_up.device = ad.addressable_devices[0];
+  OT_CHECK(api->PJRT_Client_BufferFromHostBuffer(&st_up) == nullptr);
+  if (st_up.done_with_host_buffer) {
+    PJRT_Event_Destroy_Args ed = {};
+    ed.struct_size = PJRT_Event_Destroy_Args_STRUCT_SIZE;
+    ed.event = st_up.done_with_host_buffer;
+    OT_CHECK(api->PJRT_Event_Destroy(&ed) == nullptr);
+  }
+  uint16_t out_2x2[4] = {};
+  PJRT_Buffer_ToHostBuffer_Args st_dl = {};
+  st_dl.struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE;
+  st_dl.src = st_up.buffer;
+  st_dl.dst = out_2x2;
+  st_dl.dst_size = sizeof(out_2x2);
+  OT_CHECK(api->PJRT_Buffer_ToHostBuffer(&st_dl) == nullptr);
+  if (st_dl.event) {
+    PJRT_Event_Destroy_Args ed = {};
+    ed.struct_size = PJRT_Event_Destroy_Args_STRUCT_SIZE;
+    ed.event = st_dl.event;
+    OT_CHECK(api->PJRT_Event_Destroy(&ed) == nullptr);
+  }
+  OT_CHECK(out_2x2[0] == 0x3f80u && out_2x2[1] == 0x4040u &&
+           out_2x2[2] == 0x4000u && out_2x2[3] == 0x4080u);
+
+  // Unsupported host_layout on ToHostBuffer must be rejected.
+  int64_t col_major[2] = {0, 1};
+  PJRT_Buffer_MemoryLayout bad_layout = {};
+  bad_layout.struct_size = PJRT_Buffer_MemoryLayout_STRUCT_SIZE;
+  bad_layout.type = PJRT_Buffer_MemoryLayout_Type_Tiled;
+  bad_layout.tiled.struct_size = PJRT_Buffer_MemoryLayout_Tiled_STRUCT_SIZE;
+  bad_layout.tiled.minor_to_major = col_major;
+  bad_layout.tiled.minor_to_major_size = 2;
+  st_dl.host_layout = &bad_layout;
+  PJRT_Error* hl_err = api->PJRT_Buffer_ToHostBuffer(&st_dl);
+  OT_CHECK(hl_err != nullptr);
+  destroy_pjrt_error(api, hl_err);
+
+  // Negative/reversed byte_strides pointing to the end of host allocation must read in-bounds.
+  int64_t rev_dim[1] = {4};
+  int64_t rev_stride[1] = {-2};
+  PJRT_Client_BufferFromHostBuffer_Args rev_up = {};
+  rev_up.struct_size = PJRT_Client_BufferFromHostBuffer_Args_STRUCT_SIZE;
+  rev_up.client = cc.client;
+  rev_up.data = &raw_2x2[3];
+  rev_up.type = PJRT_Buffer_Type_BF16;
+  rev_up.dims = rev_dim;
+  rev_up.num_dims = 1;
+  rev_up.byte_strides = rev_stride;
+  rev_up.num_byte_strides = 1;
+  rev_up.host_buffer_semantics = PJRT_HostBufferSemantics_kImmutableUntilTransferCompletes;
+  rev_up.device = ad.addressable_devices[0];
+  OT_CHECK(api->PJRT_Client_BufferFromHostBuffer(&rev_up) == nullptr);
+  if (rev_up.done_with_host_buffer) {
+    PJRT_Event_Destroy_Args ed = {};
+    ed.struct_size = PJRT_Event_Destroy_Args_STRUCT_SIZE;
+    ed.event = rev_up.done_with_host_buffer;
+    OT_CHECK(api->PJRT_Event_Destroy(&ed) == nullptr);
+  }
+  uint16_t rev_out[4] = {};
+  PJRT_Buffer_ToHostBuffer_Args rev_dl = {};
+  rev_dl.struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE;
+  rev_dl.src = rev_up.buffer;
+  rev_dl.dst = rev_out;
+  rev_dl.dst_size = sizeof(rev_out);
+  OT_CHECK(api->PJRT_Buffer_ToHostBuffer(&rev_dl) == nullptr);
+  if (rev_dl.event) {
+    PJRT_Event_Destroy_Args ed = {};
+    ed.struct_size = PJRT_Event_Destroy_Args_STRUCT_SIZE;
+    ed.event = rev_dl.event;
+    OT_CHECK(api->PJRT_Event_Destroy(&ed) == nullptr);
+  }
+  OT_CHECK(rev_out[0] == 0x4080u && rev_out[1] == 0x4040u &&
+           rev_out[2] == 0x4000u && rev_out[3] == 0x3f80u);
+
+  // PJRT_Buffer_Delete must immediately release device HBM before PJRT_Buffer_Destroy.
+  for (PJRT_Buffer* b : {st_up.buffer, rev_up.buffer}) {
+    PJRT_Buffer_Delete_Args del = {};
+    del.struct_size = PJRT_Buffer_Delete_Args_STRUCT_SIZE;
+    del.buffer = b;
+    OT_CHECK(api->PJRT_Buffer_Delete(&del) == nullptr);
+  }
+  OT_CHECK(api->PJRT_Device_MemoryStats(&ms) == nullptr);
+  OT_CHECK(ms.bytes_in_use == 0);
+  for (PJRT_Buffer* b : {st_up.buffer, rev_up.buffer}) {
+    PJRT_Buffer_Destroy_Args bd = {};
+    bd.struct_size = PJRT_Buffer_Destroy_Args_STRUCT_SIZE;
+    bd.buffer = b;
+    OT_CHECK(api->PJRT_Buffer_Destroy(&bd) == nullptr);
+  }
 
   std::vector<uint16_t> ones(128 * 128, 0x3f80u);
   int64_t dims[2] = {128, 128};
@@ -138,12 +366,12 @@ static void test_pjrt_api_mock() {
     a.num_dims = 2;
     a.host_buffer_semantics = PJRT_HostBufferSemantics_kImmutableUntilTransferCompletes;
     a.device = ad.addressable_devices[0];
-    assert(api->PJRT_Client_BufferFromHostBuffer(&a) == nullptr);
+    OT_CHECK(api->PJRT_Client_BufferFromHostBuffer(&a) == nullptr);
     if (a.done_with_host_buffer) {
       PJRT_Event_Destroy_Args ed = {};
       ed.struct_size = PJRT_Event_Destroy_Args_STRUCT_SIZE;
       ed.event = a.done_with_host_buffer;
-      assert(api->PJRT_Event_Destroy(&ed) == nullptr);
+      OT_CHECK(api->PJRT_Event_Destroy(&ed) == nullptr);
     }
     return a.buffer;
   };
@@ -167,13 +395,13 @@ static void test_pjrt_api_mock() {
   ex.num_args = 2;
   ex.output_lists = out_lists;
   ex.device_complete_events = dev_ev;
-  assert(api->PJRT_LoadedExecutable_Execute(&ex) == nullptr);
-  assert(outs[0] != nullptr);
+  OT_CHECK(api->PJRT_LoadedExecutable_Execute(&ex) == nullptr);
+  OT_CHECK(outs[0] != nullptr);
   if (dev_ev[0]) {
     PJRT_Event_Destroy_Args ed = {};
     ed.struct_size = PJRT_Event_Destroy_Args_STRUCT_SIZE;
     ed.event = dev_ev[0];
-    assert(api->PJRT_Event_Destroy(&ed) == nullptr);
+    OT_CHECK(api->PJRT_Event_Destroy(&ed) == nullptr);
   }
 
   std::vector<uint16_t> out_h(128 * 128, 0);
@@ -182,62 +410,60 @@ static void test_pjrt_api_mock() {
   th.src = outs[0];
   th.dst = out_h.data();
   th.dst_size = out_h.size() * 2;
-  assert(api->PJRT_Buffer_ToHostBuffer(&th) == nullptr);
+  OT_CHECK(api->PJRT_Buffer_ToHostBuffer(&th) == nullptr);
   if (th.event) {
     PJRT_Event_Destroy_Args ed = {};
     ed.struct_size = PJRT_Event_Destroy_Args_STRUCT_SIZE;
     ed.event = th.event;
-    assert(api->PJRT_Event_Destroy(&ed) == nullptr);
+    OT_CHECK(api->PJRT_Event_Destroy(&ed) == nullptr);
   }
-  for (uint16_t v : out_h) assert(v == 0x4300u);
+  for (uint16_t v : out_h) OT_CHECK(v == 0x4300u);
 
   for (PJRT_Buffer* b : {ba, bb, outs[0]}) {
     PJRT_Buffer_Destroy_Args bd = {};
     bd.struct_size = PJRT_Buffer_Destroy_Args_STRUCT_SIZE;
     bd.buffer = b;
-    assert(api->PJRT_Buffer_Destroy(&bd) == nullptr);
+    OT_CHECK(api->PJRT_Buffer_Destroy(&bd) == nullptr);
   }
   PJRT_LoadedExecutable_Destroy_Args led = {};
   led.struct_size = PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
   led.executable = ca.executable;
-  assert(api->PJRT_LoadedExecutable_Destroy(&led) == nullptr);
+  OT_CHECK(api->PJRT_LoadedExecutable_Destroy(&led) == nullptr);
 
   PJRT_Client_Destroy_Args cd = {};
   cd.struct_size = PJRT_Client_Destroy_Args_STRUCT_SIZE;
   cd.client = cc.client;
-  assert(api->PJRT_Client_Destroy(&cd) == nullptr);
+  OT_CHECK(api->PJRT_Client_Destroy(&cd) == nullptr);
   printf("[PASS] test_pjrt_api_mock\n");
 }
 
-#include "../src/ot_vliw.h"
-
 static void test_vliw_and_tiling() {
   ot::VliwBundle nop = ot::VliwBundle::nop();
-  assert(sizeof(nop) == 64);
-  assert(nop.w[15] == 0x55780000u);
+  OT_CHECK(sizeof(nop) == 64);
+  OT_CHECK(nop.w[15] == 0x55780000u);
 
   std::vector<ot::VliwBundle> prog = ot::emit_v5e_matmul_128x128_body();
-  assert(prog.size() == 58u);
-  assert(prog[6].w[0] == 0xaf003c00u);
-  assert(prog[prog.size() - 4u].w[15] == 0x55700db1u);
-  assert(prog.back().w[15] == 0x55700900u);
+  OT_CHECK(prog.size() == 58u);
+  OT_CHECK(prog[6].w[0] == 0xaf003c00u);
+  OT_CHECK(prog[prog.size() - 4u].w[15] == 0x55700db1u);
+  OT_CHECK(prog.back().w[15] == 0x55700900u);
 
   ot::OtV5eLaunchDesc desc = ot::OtV5eLaunchDesc::build(
       0x00100000ULL, 0x00200000ULL, 0x00300000ULL, 0x00400000ULL, 42u);
-  assert(sizeof(desc.bytes) == 512u);
+  OT_CHECK(sizeof(desc.bytes) == 512u);
   auto rd32 = [&](size_t off) {
     uint32_t v = 0;
     std::memcpy(&v, desc.bytes + off, sizeof(v));
     return v;
   };
-  assert(rd32(0x170u) == static_cast<uint32_t>(0x00200000ULL >> 9));
-  assert(rd32(0x174u) == static_cast<uint32_t>(0x00100000ULL >> 9));
-  assert(rd32(0x17cu) == 0xffffffffu);
-  assert(rd32(0x190u) == static_cast<uint32_t>(0x00300000ULL >> 9));
-  assert(rd32(0x1a0u) == 0x20u);
-  assert(rd32(0x1a4u) == static_cast<uint32_t>(0x00400000ULL >> 9));
-  assert(rd32(0x1e4u) == static_cast<uint32_t>(0x00400000ULL >> 9));
-  assert(rd32(0x1e8u) == 42u);
+  OT_CHECK(rd32(0x170u) == static_cast<uint32_t>(0x00200000ULL >> 9));
+  OT_CHECK(rd32(0x174u) == static_cast<uint32_t>(0x00100000ULL >> 9));
+  OT_CHECK(rd32(0x17cu) == 0xffffffffu);
+  OT_CHECK(rd32(0x190u) == static_cast<uint32_t>(0x00300000ULL >> 9));
+  OT_CHECK(rd32(0x1a0u) == 0x20u);
+  OT_CHECK(rd32(0x1a4u) == static_cast<uint32_t>(0x00400000ULL >> 9));
+  OT_CHECK(rd32(0x1e4u) == static_cast<uint32_t>(0x00400000ULL >> 9));
+  OT_CHECK(rd32(0x1e8u) == 42u);
 
   std::vector<uint16_t> src(128u * 128u), tiled(128u * 128u), dst(128u * 128u);
   for (uint32_t r = 0; r < 128u; ++r) {
@@ -246,12 +472,12 @@ static void test_vliw_and_tiling() {
     }
   }
   ot::tile_pack_128x128_bf16(src.data(), tiled.data());
-  assert(tiled[0] == src[0]);
-  assert(tiled[1] == src[128]);
-  assert(tiled[2] == src[1]);
-  assert(tiled[255] == src[128 + 127]);
+  OT_CHECK(tiled[0] == src[0]);
+  OT_CHECK(tiled[1] == src[128]);
+  OT_CHECK(tiled[2] == src[1]);
+  OT_CHECK(tiled[255] == src[128 + 127]);
   ot::tile_unpack_128x128_bf16(tiled.data(), dst.data());
-  assert(std::memcmp(src.data(), dst.data(), src.size() * sizeof(uint16_t)) == 0);
+  OT_CHECK(std::memcmp(src.data(), dst.data(), src.size() * sizeof(uint16_t)) == 0);
   printf("[PASS] test_vliw_and_tiling\n");
 }
 

@@ -117,11 +117,16 @@ ot_status_t ot_device_get_info(const ot_context_t* ctx, ot_device_info_t* out_in
 
 ot_status_t ot_buffer_alloc(ot_context_t* ctx, size_t size_bytes, ot_buffer_t** out_buf) {
   if (!ctx || !out_buf || size_bytes == 0) return OT_ERR_INVALID_ARG;
+  if (size_bytes > UINT64_MAX - 4095ULL) return OT_ERR_INVALID_ARG;
   *out_buf = nullptr;
 
   std::lock_guard<std::mutex> lk(ctx->mu);
+  if (ctx->transport.dma_faulted) {
+    ctx->last_error = "Context faulted after prior DMA timeout; recreate context";
+    return OT_ERR_DEVICE;
+  }
   uint64_t hbm_addr = 0;
-  uint64_t aligned_sz = (size_bytes + 4095ULL) & ~4095ULL;
+  uint64_t aligned_sz = (static_cast<uint64_t>(size_bytes) + 4095ULL) & ~4095ULL;
   if (!ctx->transport.hbm_alloc.alloc(aligned_sz, 4096ULL, &hbm_addr)) {
     ctx->last_error = "HBM allocator out of space";
     return OT_ERR_NO_MEMORY;
@@ -146,7 +151,10 @@ void ot_buffer_free(ot_buffer_t* buf) {
   if (!buf) return;
   if (buf->ctx) {
     std::lock_guard<std::mutex> lk(buf->ctx->mu);
-    buf->ctx->transport.hbm_alloc.free(buf->hbm_addr);
+    // Keep HBM range quarantined if the context has a faulted/timed-out DMA.
+    if (!buf->ctx->transport.dma_faulted) {
+      buf->ctx->transport.hbm_alloc.free(buf->hbm_addr);
+    }
   }
   delete buf;
 }
@@ -161,9 +169,15 @@ uint64_t ot_buffer_hbm_addr(const ot_buffer_t* buf) {
 
 ot_status_t ot_buffer_h2d(ot_context_t* ctx, ot_buffer_t* dst,
                           const void* host_src, size_t size_bytes) {
-  if (!ctx || !dst || !host_src || size_bytes > dst->size_bytes) return OT_ERR_INVALID_ARG;
+  if (!ctx || !dst || !host_src || dst->ctx != ctx || size_bytes > dst->size_bytes) {
+    return OT_ERR_INVALID_ARG;
+  }
   if (size_bytes == 0) return OT_OK;
   std::lock_guard<std::mutex> lk(ctx->mu);
+  if (ctx->transport.dma_faulted) {
+    ctx->last_error = "Context faulted after prior DMA timeout; recreate context";
+    return OT_ERR_DEVICE;
+  }
   if (ctx->info.is_mock) {
     std::memcpy(dst->mock_data.data(), host_src, size_bytes);
     if (dst->hbm_addr + size_bytes <= ctx->transport.mock_hbm.size()) {
@@ -195,7 +209,7 @@ ot_status_t ot_buffer_h2d(ot_context_t* ctx, ot_buffer_t* dst,
             ctx->transport.host_stage_iova, dst->hbm_addr + done, dma_len,
             /*is_h2d=*/true, 0x40000000u, 0x10u, 0u, ctx->cfg.timeout_ms, &err)) {
       ctx->last_error = err.empty() ? "Hardware H2D DMA failed" : err;
-      return OT_ERR_IOCTL;
+      return ctx->transport.dma_faulted ? OT_ERR_TIMEOUT : OT_ERR_IOCTL;
     }
     done += chunk;
   }
@@ -204,9 +218,15 @@ ot_status_t ot_buffer_h2d(ot_context_t* ctx, ot_buffer_t* dst,
 
 ot_status_t ot_buffer_d2h(ot_context_t* ctx, const ot_buffer_t* src,
                           void* host_dst, size_t size_bytes) {
-  if (!ctx || !src || !host_dst || size_bytes > src->size_bytes) return OT_ERR_INVALID_ARG;
+  if (!ctx || !src || !host_dst || src->ctx != ctx || size_bytes > src->size_bytes) {
+    return OT_ERR_INVALID_ARG;
+  }
   if (size_bytes == 0) return OT_OK;
   std::lock_guard<std::mutex> lk(ctx->mu);
+  if (ctx->transport.dma_faulted) {
+    ctx->last_error = "Context faulted after prior DMA timeout; recreate context";
+    return OT_ERR_DEVICE;
+  }
   if (ctx->info.is_mock) {
     if (src->hbm_addr + size_bytes <= ctx->transport.mock_hbm.size()) {
       std::memcpy(host_dst, ctx->transport.mock_hbm.data() + src->hbm_addr, size_bytes);
@@ -235,7 +255,7 @@ ot_status_t ot_buffer_d2h(ot_context_t* ctx, const ot_buffer_t* src,
             ctx->transport.host_stage_iova, src->hbm_addr + done, dma_len,
             /*is_h2d=*/false, 0x40000000u, 0x60u, 0u, ctx->cfg.timeout_ms, &err)) {
       ctx->last_error = err.empty() ? "Hardware D2H DMA failed" : err;
-      return OT_ERR_IOCTL;
+      return ctx->transport.dma_faulted ? OT_ERR_TIMEOUT : OT_ERR_IOCTL;
     }
     std::memcpy(dst_bytes + done, ctx->transport.host_stage_mem, chunk);
     done += chunk;
@@ -250,17 +270,23 @@ ot_status_t ot_matmul_bf16(ot_context_t* ctx,
                            uint32_t m_dim,
                            uint32_t k_dim,
                            uint32_t n_dim) {
-  if (!ctx || !lhs_mk || !rhs_kn || !out_mn || m_dim == 0 || k_dim == 0 || n_dim == 0) {
+  if (!ctx || !lhs_mk || !rhs_kn || !out_mn ||
+      lhs_mk->ctx != ctx || rhs_kn->ctx != ctx || out_mn->ctx != ctx ||
+      m_dim == 0 || k_dim == 0 || n_dim == 0) {
     return OT_ERR_INVALID_ARG;
   }
-  size_t need_a = static_cast<size_t>(m_dim) * k_dim * sizeof(uint16_t);
-  size_t need_b = static_cast<size_t>(k_dim) * n_dim * sizeof(uint16_t);
-  size_t need_c = static_cast<size_t>(m_dim) * n_dim * sizeof(uint16_t);
+  uint64_t need_a = static_cast<uint64_t>(m_dim) * k_dim * sizeof(uint16_t);
+  uint64_t need_b = static_cast<uint64_t>(k_dim) * n_dim * sizeof(uint16_t);
+  uint64_t need_c = static_cast<uint64_t>(m_dim) * n_dim * sizeof(uint16_t);
   if (lhs_mk->size_bytes < need_a || rhs_kn->size_bytes < need_b || out_mn->size_bytes < need_c) {
     return OT_ERR_INVALID_ARG;
   }
 
   std::lock_guard<std::mutex> lk(ctx->mu);
+  if (ctx->transport.dma_faulted) {
+    ctx->last_error = "Context faulted after prior DMA timeout; recreate context";
+    return OT_ERR_DEVICE;
+  }
   if (ctx->info.is_mock) {
     const auto* a = reinterpret_cast<const uint16_t*>(ctx->transport.mock_hbm.data() + lhs_mk->hbm_addr);
     const auto* b = reinterpret_cast<const uint16_t*>(ctx->transport.mock_hbm.data() + rhs_kn->hbm_addr);
