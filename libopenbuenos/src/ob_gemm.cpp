@@ -3477,7 +3477,8 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
               };
 
               constexpr size_t kMaxCachedOutlierCols = 24u;
-              const size_t w_budget = ob::compute_weight_cache_budget_bytes(ctx);
+              bool w_budget_refreshed = false;
+              size_t w_budget = ctx->weight_cache_max_bytes;
               for (uint32_t u = 0u; u < n_uniq; ++u) {
                 const uint32_t k_off = uniq_ptr[u];
                 const float* w_col = nullptr;
@@ -3486,20 +3487,26 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
                   if (it != w_tile->outlier_cols.end() && it->second.size() >= tn_total) {
                     w_col = it->second.data();
                   } else if (w_tile->in_cache &&
-                             w_tile->outlier_cols.size() < kMaxCachedOutlierCols &&
-                             ctx->weight_cache_bytes + static_cast<size_t>(tn_total) * sizeof(float) <= w_budget) {
-                    std::vector<float> col(tn_total);
-                    extract_col(k_off, col.data());
-                    const size_t col_bytes = col.size() * sizeof(float);
-                    auto res = w_tile->outlier_cols.emplace(k_off, std::move(col));
-                    if (res.second) {
-                      w_tile->outlier_cols_bytes += col_bytes;
-                      ctx->weight_cache_bytes += col_bytes;
-                      if (ctx->weight_cache_bytes > ctx->weight_cache_peak_bytes) {
-                        ctx->weight_cache_peak_bytes = ctx->weight_cache_bytes;
-                      }
+                             w_tile->outlier_cols.size() < kMaxCachedOutlierCols) {
+                    if (!w_budget_refreshed) {
+                      w_budget = ob::compute_weight_cache_budget_bytes(ctx);
+                      ctx->weight_cache_max_bytes = w_budget;
+                      w_budget_refreshed = true;
                     }
-                    w_col = res.first->second.data();
+                    if (ctx->weight_cache_bytes + static_cast<size_t>(tn_total) * sizeof(float) <= w_budget) {
+                      std::vector<float> col(tn_total);
+                      extract_col(k_off, col.data());
+                      const size_t col_bytes = col.size() * sizeof(float);
+                      auto res = w_tile->outlier_cols.emplace(k_off, std::move(col));
+                      if (res.second) {
+                        w_tile->outlier_cols_bytes += col_bytes;
+                        ctx->weight_cache_bytes += col_bytes;
+                        if (ctx->weight_cache_bytes > ctx->weight_cache_peak_bytes) {
+                          ctx->weight_cache_peak_bytes = ctx->weight_cache_bytes;
+                        }
+                      }
+                      w_col = res.first->second.data();
+                    }
                   }
                 }
                 if (!w_col) {

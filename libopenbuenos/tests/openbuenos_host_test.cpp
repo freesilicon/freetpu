@@ -4074,6 +4074,7 @@ void test_phase7_cycle2_regressions() {
     wg = -100;
     wd = 100;
     ob::simulate_swiglu_hw_exact(&x, d, &y);
+    CHECK(y == -128);
     // Verify INT32_MAX bias + positive MAC does not invoke signed int32 overflow UB.
     int32_t bg_max = INT32_MAX, bu_max = INT32_MAX, bd_max = INT32_MAX;
     d.bg_h = &bg_max; d.bu_h = &bu_max; d.bd_n = &bd_max;
