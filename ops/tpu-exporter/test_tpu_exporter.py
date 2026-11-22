@@ -1681,6 +1681,7 @@ TPU Device Status
                 dev_root=dev_root,
                 proc_root=proc_root,
                 tpu_info_bin=None,
+                tpu_info_timeout_s=1.0,
             )
             t = threading.Thread(target=srv.serve_forever, daemon=True)
             t.start()
