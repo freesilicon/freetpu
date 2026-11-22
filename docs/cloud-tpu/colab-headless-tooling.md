@@ -80,7 +80,9 @@ If your GCP project still receives `403` on `colaboratory.googleapis.com/v1beta`
 
 ## 3. Using `tools/colab_tpu_bench.py`
 
-[`tools/colab_tpu_bench.py`](../../tools/colab_tpu_bench.py) enforces `google-colab-cli >= 0.7.6` (redacted/private credential logging) before any authenticated command and wraps `google-colab-cli` with private `0700` output/config checks, signed CU guards, per-run isolated `--config` & dedicated recovery stores, conservative `v6e1 -> v5e1` fallback, independent inactivity (`--timeout`) and finite-default local wall-clock (`--wall-timeout`, defaulting to `--timeout + 180s` or `480s` when `--timeout 0`, with `--wall-timeout 0` opt-out) caps, bounded `colab stop` reconciliation on Ctrl+C/SIGTERM/wall-timeout or active-endpoint/listing retries, TPU-validated probe JSON capture, and `.ipynb` proof export:
+[`tools/colab_tpu_bench.py`](../../tools/colab_tpu_bench.py) enforces `google-colab-cli >= 0.7.6` (redacted/private credential logging) before any authenticated command and wraps `google-colab-cli` with private `0700` output/config checks, fresh/empty per-run `--config` enforcement (rejecting populated, hard-linked, or corrupt-lock session stores pre-flight), signed CU guards, dedicated recovery stores, conservative `v6e1 -> v5e1` fallback, independent inactivity (`--timeout`) and finite-default local wall-clock (`--wall-timeout`, defaulting to `--timeout + 180s` or `480s` when `--timeout 0`, with `--wall-timeout 0` opt-out) caps, bounded `colab stop` reconciliation on Ctrl+C/SIGTERM/wall-timeout or active-endpoint/listing retries, TPU-validated probe JSON capture, and `.ipynb` proof export.
+
+> **Local Python Requirement for `--script`:** `colab_tpu_bench.py` compiles custom `--script` files locally before provisioning a TPU so syntax errors fail with zero CU spent. Run `colab_tpu_bench.py` with a Colab-compatible Python interpreter (Python `3.12+` / `3.13` matching the target Colab TPU image) when passing scripts that use newer syntax such as PEP 695 `type` statements.
 
 ```bash
 # Offline CI self-test (no Colab credentials or hardware required)
@@ -100,8 +102,8 @@ python3 tools/colab_tpu_bench.py \
 ```
 
 Outputs in `--out-dir`:
-- `summary.json` — CU balance before run, chosen TPU (`v6e1` or `v5e1`), attempt diagnostics, and parsed probe metrics (`jax` device topology, `/dev/vfio/*`, `tpu-info`, `bf16` GEMM microbenchmark).
-- `<session>.stdout.txt` — captured remote script output.
+- `<session>.summary.json` (and latest-run `summary.json`) — CU balance before run, chosen TPU (`v6e1` or `v5e1`), attempt diagnostics, and parsed probe metrics (`jax` device topology, `/dev/vfio/*`, `tpu-info`, `bf16` GEMM microbenchmark).
+- `<session>.stdout.txt` — streamed remote script output (and `<session>.stderr.txt` on failure/cancellation).
 - `<session>.ipynb` — replayable Jupyter notebook exported via `colab log -o`.
 
 ---

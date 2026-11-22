@@ -27,6 +27,7 @@ import re
 import shlex
 import shutil
 import signal
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -579,6 +580,78 @@ def _validate_existing_session_store(path: Path) -> bool:
     return bool(parsed)
 
 
+def _verify_config_lock_acquirable(lock_path: Path) -> None:
+    """Verify Colab CLI's SQLite-backed `filelock.ReadWriteLock` can lock `lock_path` preflight.
+
+    Colab CLI 0.8.0 acquires `<config>.lock` via `filelock.ReadWriteLock` (SQLite) only AFTER
+    allocating the TPU; a corrupt, WAL-mode, or unacquirable lock file would strand a billable
+    runtime before local state or teardown runs.
+    """
+    existed = os.path.lexists(lock_path)
+    probe_path = lock_path
+    tmp_probe: Optional[Path] = None
+    if existed:
+        try:
+            st = os.lstat(lock_path)
+        except OSError as exc:
+            raise UntrustedPathError(f"Cannot stat session config lock file {lock_path}: {exc}") from exc
+        if st.st_size > 64 * 1024:
+            raise UntrustedPathError(
+                f"Session config lock file {lock_path} is unexpectedly large ({st.st_size} bytes); "
+                "refusing corrupt or non-lock database."
+            )
+    else:
+        try:
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=f".{lock_path.name}.probe.",
+                suffix=".tmp",
+                dir=str(lock_path.parent),
+            )
+            os.close(fd)
+            tmp_probe = Path(tmp_name)
+            os.chmod(tmp_probe, 0o600)
+            probe_path = tmp_probe
+        except OSError as exc:
+            raise UntrustedPathError(
+                f"Cannot create SQLite lock probe in {lock_path.parent}: {exc}"
+            ) from exc
+
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = sqlite3.connect(str(probe_path), timeout=0.5, isolation_level=None)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute("PRAGMA journal_mode").fetchone()
+            mode = str(row[0]).lower() if row and row[0] is not None else ""
+            if mode == "wal":
+                raise UntrustedPathError(
+                    f"Session config lock file {lock_path} is a WAL-mode SQLite database "
+                    "(rejected by Colab CLI's filelock.ReadWriteLock); use a fresh `--config` path."
+                )
+            conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        finally:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+    except UntrustedPathError:
+        raise
+    except sqlite3.Error as exc:
+        raise UntrustedPathError(
+            f"Session config lock file {lock_path} cannot be locked as a valid SQLite lock "
+            f"database ({exc}); remove the corrupt lock or use a fresh `--config` path."
+        ) from exc
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+        if tmp_probe is not None:
+            try:
+                tmp_probe.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def _normalize_config_path(
     config_path: Optional[Path],
     out_dir: Path,
@@ -605,6 +678,7 @@ def _normalize_config_path(
         raise UntrustedPathError(f"Refusing symlinked --config or lock path: {canonical_cfg}")
     _verify_file_writable_if_exists(canonical_cfg, "session config file")
     _verify_file_writable_if_exists(lock_path, "session config lock file")
+    _verify_config_lock_acquirable(lock_path)
     return canonical_cfg
 
 
@@ -690,8 +764,12 @@ def _prepare_custom_script(
         tree = ast.parse(raw_bytes, filename=str(script_path))
         compile(tree, str(script_path), "exec")
     except SyntaxError as exc:
+        local_py = f"Python {sys.version_info.major}.{sys.version_info.minor}"
         raise ValueError(
-            f"Custom script {script_path} has a Python syntax error at line {exc.lineno}: {exc.msg}"
+            f"Custom script {script_path} has a {local_py} syntax error at line "
+            f"{exc.lineno}: {exc.msg}. If the script uses newer Colab runtime syntax "
+            "(e.g., Python 3.12+/3.13 PEP 695 `type` statements), run `colab_tpu_bench.py` "
+            "under a Colab-compatible Python interpreter."
         ) from exc
 
     # Always wrap custom scripts in a thin `__main__` bootstrapper so `colab run`'s injected prelude
@@ -2065,6 +2143,17 @@ def run_benchmark(
         has_existing_store_entries = _validate_existing_session_store(isolated_config)
     except UntrustedPathError as exc:
         return 2, {"status": "untrusted_config_path", "error": str(exc)}
+    if has_existing_store_entries:
+        return 2, {
+            "status": "populated_config_rejected",
+            "isolated_config": str(isolated_config),
+            "error": (
+                f"Existing session config {isolated_config} already contains session mappings. "
+                "Colab CLI truncates and rewrites the store in place, which can lose unrelated "
+                "active runtime mappings if a write fails. Omit `--config` or pass a fresh "
+                "empty per-run `--config` path."
+            ),
+        }
 
     script_file = cfg.script_path
     generated_script = False
@@ -4444,19 +4533,39 @@ def run_self_test() -> int:
         shared_cfg_file.write_text(other_worker_json, encoding="utf-8")
         os.chmod(shared_cfg_file, 0o600)
 
-        rc_conc, sum_conc = run_benchmark(
+        # Populated `--config` is rejected preflight with zero mutations before contacting Colab.
+        def _forbid_pop_calls(cmd: Sequence[str]) -> CommandResult:
+            raise AssertionError(f"Populated config must be rejected before calling Colab: {cmd}")
+
+        rc_pop, sum_pop = run_benchmark(
             BenchConfig(
                 tpus=("v5e1",),
                 out_dir=shared_cfg_dir,
                 config_path=shared_cfg_file,
+            ),
+            runner=_forbid_pop_calls,
+        )
+        assert rc_pop == 2
+        assert sum_pop["status"] == "populated_config_rejected"
+        assert shared_cfg_file.read_text(encoding="utf-8") == other_worker_json
+
+        # Fresh empty `--config` runs and writes recovery config to a separate per-run file.
+        fresh_explicit_cfg = shared_cfg_dir / "fresh-explicit.json"
+        fresh_explicit_cfg.write_text("{}\n", encoding="utf-8")
+        os.chmod(fresh_explicit_cfg, 0o600)
+        rc_conc, sum_conc = run_benchmark(
+            BenchConfig(
+                tpus=("v5e1",),
+                out_dir=shared_cfg_dir,
+                config_path=fresh_explicit_cfg,
                 teardown_retries=1,
                 teardown_retry_delay_s=0.0,
             ),
             runner=leaked_runner,
         )
         assert rc_conc == 1
-        assert shared_cfg_file.read_text(encoding="utf-8") == other_worker_json
-        assert sum_conc["recovery_config"] != str(shared_cfg_file)
+        assert fresh_explicit_cfg.read_text(encoding="utf-8") == "{}\n"
+        assert sum_conc["recovery_config"] != str(fresh_explicit_cfg)
         assert Path(sum_conc["recovery_config"]).is_file()
 
         rc_d1, sum_d1 = run_benchmark(
@@ -4924,12 +5033,25 @@ def run_self_test() -> int:
             encoding="utf-8",
         )
         os.chmod(good_store, 0o600)
+        # Valid populated schema passes schema validation, then is rejected as populated preflight.
+        assert _validate_existing_session_store(good_store) is True
         rc_gs, sum_gs = run_benchmark(
             BenchConfig(dry_run=True, config_path=good_store, out_dir=tmp_path / "good-schema-out"),
+            runner=forbid_calls_runner,
+        )
+        assert rc_gs == 2
+        assert sum_gs["status"] == "populated_config_rejected"
+
+        empty_store = schema_dir / "empty.json"
+        empty_store.write_text("{}\n", encoding="utf-8")
+        os.chmod(empty_store, 0o600)
+        assert _validate_existing_session_store(empty_store) is False
+        rc_es, sum_es = run_benchmark(
+            BenchConfig(dry_run=True, config_path=empty_store, out_dir=tmp_path / "empty-schema-out"),
             runner=low_or_bad_cu_runner("unused"),
         )
-        assert rc_gs == 0
-        assert sum_gs["status"] == "dry_run"
+        assert rc_es == 0
+        assert sum_es["status"] == "dry_run"
 
         # 48. Pre-READY connection drop (`ConnectionError` / `RemoteDisconnected`) does NOT
         #     fall back to v5e1 and keeps `teardown_verified=False` (`allocation_timeout_unreconciled`).
@@ -5971,16 +6093,27 @@ def run_self_test() -> int:
             raise AssertionError(f"Unexpected cmd: {cmd}")
 
         acct_b_out = tmp_path / "acct-b-out"
-        rc_ab, sum_ab = run_benchmark(
+        # Populated store from Account A is rejected preflight with zero Colab CLI calls.
+        rc_pop_a, sum_pop_a = run_benchmark(
             BenchConfig(tpus=("v6e1",), config_path=other_acct_cfg, out_dir=acct_b_out),
+            runner=forbid_calls_runner,
+        )
+        assert rc_pop_a == 2
+        assert sum_pop_a["status"] == "populated_config_rejected"
+        assert json.loads(other_acct_cfg.read_text(encoding="utf-8")) == other_acct_payload
+
+        # Even with a fresh explicit `--config`, `colab sessions` still uses a separate throwaway
+        # listing config and cleans it up on exit.
+        fresh_acct_b_cfg = other_acct_dir / "account-b-fresh.json"
+        fresh_acct_b_cfg.write_text("{}\n", encoding="utf-8")
+        os.chmod(fresh_acct_b_cfg, 0o600)
+        rc_ab, sum_ab = run_benchmark(
+            BenchConfig(tpus=("v6e1",), config_path=fresh_acct_b_cfg, out_dir=acct_b_out),
             runner=pruning_sessions_runner,
         )
         assert rc_ab == 0, sum_ab
         assert len(sess_configs_seen) >= 2
-        assert all(Path(c).resolve() != other_acct_cfg.resolve() for c in sess_configs_seen)
-        # Account A's session mapping in `other_acct_cfg` survived completely intact!
-        assert json.loads(other_acct_cfg.read_text(encoding="utf-8")) == other_acct_payload
-        # Throwaway listing config was cleaned up on exit.
+        assert all(Path(c).resolve() != fresh_acct_b_cfg.resolve() for c in sess_configs_seen)
         assert not list(acct_b_out.glob("colab-sessions-list.*"))
 
         # 65. Reject hard-linked `--config` and `<config>.lock` files (st_nlink > 1) pre-flight.
@@ -6016,7 +6149,96 @@ def run_self_test() -> int:
         assert rc_hll == 2, f"Expected hard-linked lock rejection: {sum_hll}"
         assert sum_hll["status"] == "untrusted_config_path"
 
-    print("colab_tpu_bench.py self-test PASSED (65/65 suites).")
+        # 66. Preflight rejects corrupt, WAL-mode, oversized, or busy SQLite `.lock` files
+        #     BEFORE provisioning any TPU (while accepting valid 0-byte SQLite lock files).
+        lock_probe_dir = tmp_path / "lock-probe"
+        lock_probe_dir.mkdir(mode=0o700)
+        os.chmod(lock_probe_dir, 0o700)
+
+        corrupt_cfg = lock_probe_dir / "corrupt.json"
+        corrupt_cfg.write_text("{}\n", encoding="utf-8")
+        os.chmod(corrupt_cfg, 0o600)
+        corrupt_lock = Path(f"{corrupt_cfg}.lock")
+        corrupt_lock.write_bytes(b"not a valid sqlite database!!!")
+        os.chmod(corrupt_lock, 0o600)
+        rc_cl, sum_cl = run_benchmark(
+            BenchConfig(config_path=corrupt_cfg, out_dir=tmp_path / "out-corrupt-lock"),
+            runner=forbid_calls_runner,
+        )
+        assert rc_cl == 2, f"Expected corrupt lock rejection: {sum_cl}"
+        assert sum_cl["status"] == "untrusted_config_path"
+
+        wal_cfg = lock_probe_dir / "wal.json"
+        wal_cfg.write_text("{}\n", encoding="utf-8")
+        os.chmod(wal_cfg, 0o600)
+        wal_lock = Path(f"{wal_cfg}.lock")
+        wal_conn = sqlite3.connect(str(wal_lock))
+        try:
+            wal_conn.execute("PRAGMA journal_mode=WAL")
+            wal_conn.execute("CREATE TABLE t(x)")
+            wal_conn.commit()
+        finally:
+            wal_conn.close()
+        os.chmod(wal_lock, 0o600)
+        rc_wl, sum_wl = run_benchmark(
+            BenchConfig(config_path=wal_cfg, out_dir=tmp_path / "out-wal-lock"),
+            runner=forbid_calls_runner,
+        )
+        assert rc_wl == 2, f"Expected WAL lock rejection: {sum_wl}"
+        assert sum_wl["status"] == "untrusted_config_path"
+
+        busy_cfg = lock_probe_dir / "busy.json"
+        busy_cfg.write_text("{}\n", encoding="utf-8")
+        os.chmod(busy_cfg, 0o600)
+        busy_lock = Path(f"{busy_cfg}.lock")
+        busy_lock.write_bytes(b"")
+        os.chmod(busy_lock, 0o600)
+        holder_conn = sqlite3.connect(str(busy_lock), isolation_level=None)
+        try:
+            holder_conn.execute("BEGIN EXCLUSIVE")
+            rc_bl, sum_bl = run_benchmark(
+                BenchConfig(config_path=busy_cfg, out_dir=tmp_path / "out-busy-lock"),
+                runner=forbid_calls_runner,
+            )
+            assert rc_bl == 2, f"Expected busy lock rejection: {sum_bl}"
+            assert sum_bl["status"] == "untrusted_config_path"
+        finally:
+            if holder_conn.in_transaction:
+                holder_conn.execute("ROLLBACK")
+            holder_conn.close()
+
+        # Valid 0-byte lock file passes preflight cleanly.
+        valid_lock_cfg = lock_probe_dir / "valid-lock.json"
+        valid_lock_cfg.write_text("{}\n", encoding="utf-8")
+        os.chmod(valid_lock_cfg, 0o600)
+        valid_lock = Path(f"{valid_lock_cfg}.lock")
+        valid_lock.write_bytes(b"")
+        os.chmod(valid_lock, 0o600)
+        rc_vl, sum_vl = run_benchmark(
+            BenchConfig(dry_run=True, config_path=valid_lock_cfg, out_dir=tmp_path / "out-valid-lock"),
+            runner=low_or_bad_cu_runner("unused"),
+        )
+        assert rc_vl == 0, sum_vl
+        assert sum_vl["status"] == "dry_run"
+
+        # 67. Custom script syntax error diagnostic explicitly states the local Python version
+        #     and Colab-compatible interpreter requirement before provisioning any TPU.
+        bad_syn_script = custom_dir / "bad_syntax_compat.py"
+        bad_syn_script.write_text("def broken(:\n    pass\n", encoding="utf-8")
+        rc_bsyn, sum_bsyn = run_benchmark(
+            BenchConfig(
+                script_path=bad_syn_script,
+                out_dir=tmp_path / "out-bad-syn",
+            ),
+            runner=forbid_calls_runner,
+        )
+        assert rc_bsyn == 2, sum_bsyn
+        assert sum_bsyn["status"] == "invalid_script"
+        expected_py = f"Python {sys.version_info.major}.{sys.version_info.minor}"
+        assert expected_py in sum_bsyn["error"], sum_bsyn["error"]
+        assert "Colab-compatible Python interpreter" in sum_bsyn["error"], sum_bsyn["error"]
+
+    print("colab_tpu_bench.py self-test PASSED (67/67 suites).")
     return 0
 
 
