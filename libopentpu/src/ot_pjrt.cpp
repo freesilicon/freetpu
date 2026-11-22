@@ -19,6 +19,8 @@ struct PJRT_Event {
   bool ready = true;
 };
 
+struct PJRT_ExecuteContext {};
+
 struct OtPjrtMemory {
   PJRT_Memory base{};
   int id = 0;
@@ -692,9 +694,216 @@ PJRT_Error* ot_pjrt_client_default_device_assignment(
   return nullptr;
 }
 
+static bool pb_read_varint(const uint8_t* p, size_t len, size_t* pos, uint64_t* out) {
+  uint64_t v = 0;
+  unsigned shift = 0;
+  while (*pos < len && shift < 64) {
+    uint8_t b = p[(*pos)++];
+    v |= static_cast<uint64_t>(b & 0x7fu) << shift;
+    if ((b & 0x80u) == 0) {
+      *out = v;
+      return true;
+    }
+    shift += 7;
+  }
+  return false;
+}
+
+static bool pb_skip_field(const uint8_t* p, size_t len, size_t* pos, uint32_t wire) {
+  uint64_t tmp = 0;
+  if (wire == 0) return pb_read_varint(p, len, pos, &tmp);
+  if (wire == 1) {
+    if (len - *pos < 8) return false;
+    *pos += 8;
+    return true;
+  }
+  if (wire == 2) {
+    if (!pb_read_varint(p, len, pos, &tmp) || tmp > len - *pos) return false;
+    *pos += static_cast<size_t>(tmp);
+    return true;
+  }
+  if (wire == 5) {
+    if (len - *pos < 4) return false;
+    *pos += 4;
+    return true;
+  }
+  return false;
+}
+
+static PJRT_Error* validate_device_assignment_proto(const uint8_t* p, size_t len) {
+  size_t pos = 0;
+  size_t comp_dev_count = 0;
+  while (pos < len) {
+    uint64_t tag = 0;
+    if (!pb_read_varint(p, len, &pos, &tag)) {
+      return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed device_assignment proto");
+    }
+    uint32_t field = static_cast<uint32_t>(tag >> 3);
+    uint32_t wire = static_cast<uint32_t>(tag & 0x7u);
+    if ((field == 1 || field == 2) && wire == 0) {
+      uint64_t v = 0;
+      if (!pb_read_varint(p, len, &pos, &v)) {
+        return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed device_assignment count");
+      }
+      if (v != 0 && v != 1) {
+        return make_err(PJRT_Error_Code_UNIMPLEMENTED,
+                        "single-device OpenTPU requires 1 replica and 1 computation");
+      }
+    } else if (field == 3 && wire == 2) {
+      if (++comp_dev_count > 1) {
+        return make_err(PJRT_Error_Code_UNIMPLEMENTED,
+                        "single-device OpenTPU supports 1 computation device only");
+      }
+      uint64_t slen = 0;
+      if (!pb_read_varint(p, len, &pos, &slen) || slen > len - pos) {
+        return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed computation_devices");
+      }
+      const uint8_t* sub = p + pos;
+      size_t spos = 0;
+      size_t sub_len = static_cast<size_t>(slen);
+      size_t replica_id_count = 0;
+      while (spos < sub_len) {
+        uint64_t stag = 0;
+        if (!pb_read_varint(sub, sub_len, &spos, &stag)) {
+          return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed computation_device");
+        }
+        uint32_t sfield = static_cast<uint32_t>(stag >> 3);
+        uint32_t swire = static_cast<uint32_t>(stag & 0x7u);
+        if (sfield == 1 && swire == 0) {
+          uint64_t did = 0;
+          if (!pb_read_varint(sub, sub_len, &spos, &did)) {
+            return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed replica_device_id");
+          }
+          if (did != 0 || ++replica_id_count > 1) {
+            return make_err(PJRT_Error_Code_UNIMPLEMENTED,
+                            "single-device OpenTPU supports single device id 0 only");
+          }
+        } else if (sfield == 1 && swire == 2) {
+          uint64_t plen = 0;
+          if (!pb_read_varint(sub, sub_len, &spos, &plen) || plen > sub_len - spos) {
+            return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed packed replica_device_ids");
+          }
+          size_t pend = spos + static_cast<size_t>(plen);
+          while (spos < pend) {
+            uint64_t did = 0;
+            if (!pb_read_varint(sub, pend, &spos, &did)) {
+              return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed packed replica_device_id");
+            }
+            if (did != 0 || ++replica_id_count > 1) {
+              return make_err(PJRT_Error_Code_UNIMPLEMENTED,
+                              "single-device OpenTPU supports single device id 0 only");
+            }
+          }
+        } else if (!pb_skip_field(sub, sub_len, &spos, swire)) {
+          return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed computation_device field");
+        }
+      }
+      pos += sub_len;
+    } else if (!pb_skip_field(p, len, &pos, wire)) {
+      return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed device_assignment field");
+    }
+  }
+  return nullptr;
+}
+
+static PJRT_Error* validate_exec_build_options_proto(const uint8_t* p, size_t len) {
+  size_t pos = 0;
+  while (pos < len) {
+    uint64_t tag = 0;
+    if (!pb_read_varint(p, len, &pos, &tag)) {
+      return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed executable_build_options");
+    }
+    uint32_t field = static_cast<uint32_t>(tag >> 3);
+    uint32_t wire = static_cast<uint32_t>(tag & 0x7u);
+    if (field == 1 && wire == 0) {
+      uint64_t raw = 0;
+      if (!pb_read_varint(p, len, &pos, &raw)) {
+        return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed device_ordinal");
+      }
+      int64_t ord = static_cast<int64_t>(raw);
+      if (ord != -1 && ord != 0) {
+        return make_err(PJRT_Error_Code_INVALID_ARGUMENT,
+                        "single-device OpenTPU supports device_ordinal -1 or 0 only");
+      }
+    } else if ((field == 4 || field == 5) && wire == 0) {
+      uint64_t v = 0;
+      if (!pb_read_varint(p, len, &pos, &v)) {
+        return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed replica/partition count");
+      }
+      if (v != 0 && v != 1) {
+        return make_err(PJRT_Error_Code_UNIMPLEMENTED,
+                        "single-device OpenTPU supports num_replicas=1 and num_partitions=1 only");
+      }
+    } else if (field == 7 && wire == 2) {
+      uint64_t slen = 0;
+      if (!pb_read_varint(p, len, &pos, &slen) || slen > len - pos) {
+        return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed device_assignment");
+      }
+      PJRT_Error* err = validate_device_assignment_proto(p + pos, static_cast<size_t>(slen));
+      if (err) return err;
+      pos += static_cast<size_t>(slen);
+    } else if (!pb_skip_field(p, len, &pos, wire)) {
+      return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed executable_build_options field");
+    }
+  }
+  return nullptr;
+}
+
+static PJRT_Error* validate_single_device_compile_options(const char* data, size_t len) {
+  if (len == 0) return nullptr;
+  if (!data) {
+    return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null compile_options with nonzero size");
+  }
+  const auto* p = reinterpret_cast<const uint8_t*>(data);
+  size_t pos = 0;
+  while (pos < len) {
+    uint64_t tag = 0;
+    if (!pb_read_varint(p, len, &pos, &tag)) {
+      return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed compile_options proto");
+    }
+    uint32_t field = static_cast<uint32_t>(tag >> 3);
+    uint32_t wire = static_cast<uint32_t>(tag & 0x7u);
+    if (field == 2 && wire == 0) {
+      uint64_t tupled = 0;
+      if (!pb_read_varint(p, len, &pos, &tupled)) {
+        return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed parameter_is_tupled_arguments");
+      }
+      if (tupled != 0) {
+        return make_err(PJRT_Error_Code_UNIMPLEMENTED,
+                        "tupled arguments are not supported by OpenTPU M4");
+      }
+    } else if (field == 3 && wire == 2) {
+      uint64_t slen = 0;
+      if (!pb_read_varint(p, len, &pos, &slen) || slen > len - pos) {
+        return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed executable_build_options length");
+      }
+      PJRT_Error* err = validate_exec_build_options_proto(p + pos, static_cast<size_t>(slen));
+      if (err) return err;
+      pos += static_cast<size_t>(slen);
+    } else if (field == 6 && wire == 2) {
+      uint64_t slen = 0;
+      if (!pb_read_varint(p, len, &pos, &slen) || slen > len - pos) {
+        return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed multi_slice_config");
+      }
+      if (slen > 0) {
+        return make_err(PJRT_Error_Code_UNIMPLEMENTED,
+                        "multi-slice compilation is not supported on single-device OpenTPU");
+      }
+      pos += static_cast<size_t>(slen);
+    } else if (!pb_skip_field(p, len, &pos, wire)) {
+      return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed compile_options field");
+    }
+  }
+  return nullptr;
+}
+
 PJRT_Error* ot_pjrt_client_compile(PJRT_Client_Compile_Args* args) {
   if (!args || !args->client || !args->program) {
     return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null compile args");
+  }
+  if (PJRT_Error* opt_err = validate_single_device_compile_options(args->compile_options,
+                                                                   args->compile_options_size)) {
+    return opt_err;
   }
   const char* fmt = args->program->format;
   size_t fmt_len = args->program->format_size;
@@ -761,24 +970,25 @@ PJRT_Error* ot_pjrt_buffer_from_host_buffer(PJRT_Client_BufferFromHostBuffer_Arg
                     "unsupported device_layout (dense row-major only)");
   }
 
-  const void* upload_ptr = args->data;
-  std::vector<uint8_t> packed_host;
-  if (elems > 0) {
-    if (!args->data) {
-      return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null host data for non-empty buffer");
-    }
-    if (args->num_byte_strides != 0 &&
-        !is_dense_row_major_strides(args->dims, args->num_dims, args->byte_strides, elem_sz)) {
-      gather_strided_host_buffer(args->data, args->dims, args->num_dims, args->byte_strides,
-                                 elem_sz, elems, &packed_host);
-      upload_ptr = packed_host.data();
-    }
+  if (elems > 0 && !args->data) {
+    return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null host data for non-empty buffer");
   }
 
+  // Reserve device HBM before allocating or packing any strided host copy so oversized
+  // uploads fail immediately with RESOURCE_EXHAUSTED instead of spiking host RAM.
   size_t alloc_bytes = logical_bytes == 0 ? 1 : logical_bytes;
   ot_buffer_t* ot_buf = nullptr;
   ot_status_t st = ot_buffer_alloc(args->client->ctx, alloc_bytes, &ot_buf);
   if (st != OT_OK) return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, ot_status_string(st));
+
+  const void* upload_ptr = args->data;
+  std::vector<uint8_t> packed_host;
+  if (elems > 0 && args->num_byte_strides != 0 &&
+      !is_dense_row_major_strides(args->dims, args->num_dims, args->byte_strides, elem_sz)) {
+    gather_strided_host_buffer(args->data, args->dims, args->num_dims, args->byte_strides,
+                               elem_sz, elems, &packed_host);
+    upload_ptr = packed_host.data();
+  }
 
   if (upload_ptr && logical_bytes > 0) {
     st = ot_buffer_h2d(args->client->ctx, ot_buf, upload_ptr, logical_bytes);
@@ -1343,14 +1553,106 @@ OT_PJRT_UNIMPL(ot_pjrt_client_load, PJRT_Client_Load_Args,
                "PJRT_Client_Load not implemented in libopentpu")
 OT_PJRT_UNIMPL(ot_pjrt_compile_standalone, PJRT_Compile_Args,
                "PJRT_Compile not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_topo_create, PJRT_TopologyDescription_Create_Args,
+               "PJRT_TopologyDescription_Create not implemented in libopentpu")
 OT_PJRT_UNIMPL(ot_pjrt_topo_deserialize, PJRT_TopologyDescription_Deserialize_Args,
                "PJRT_TopologyDescription_Deserialize not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_topo_canonical_shape,
+               PJRT_TopologyDescription_MakeCanonicalShapeForMemorySpace_Args,
+               "PJRT_TopologyDescription_MakeCanonicalShapeForMemorySpace not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_topo_mem_kind_ids,
+               PJRT_TopologyDescription_GetMemorySpaceKindIds_Args,
+               "PJRT_TopologyDescription_GetMemorySpaceKindIds not implemented in libopentpu")
 OT_PJRT_UNIMPL(ot_pjrt_device_poison_exec, PJRT_Device_PoisonExecution_Args,
                "PJRT_Device_PoisonExecution not implemented in libopentpu")
 OT_PJRT_UNIMPL(ot_pjrt_device_clear_mem_stats, PJRT_Device_ClearMemoryStats_Args,
                "PJRT_Device_ClearMemoryStats not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_exec_param_mem_kinds, PJRT_Executable_ParameterMemoryKinds_Args,
+               "PJRT_Executable_ParameterMemoryKinds not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_event_create, PJRT_Event_Create_Args,
+               "PJRT_Event_Create not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_event_set, PJRT_Event_Set_Args,
+               "PJRT_Event_Set not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_copy_stream_destroy, PJRT_CopyToDeviceStream_Destroy_Args,
+               "PJRT_CopyToDeviceStream_Destroy not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_copy_stream_add_chunk, PJRT_CopyToDeviceStream_AddChunk_Args,
+               "PJRT_CopyToDeviceStream_AddChunk not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_copy_stream_total_bytes, PJRT_CopyToDeviceStream_TotalBytes_Args,
+               "PJRT_CopyToDeviceStream_TotalBytes not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_copy_stream_granule_size, PJRT_CopyToDeviceStream_GranuleSize_Args,
+               "PJRT_CopyToDeviceStream_GranuleSize not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_copy_stream_current_bytes, PJRT_CopyToDeviceStream_CurrentBytes_Args,
+               "PJRT_CopyToDeviceStream_CurrentBytes not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_async_h2d_destroy, PJRT_AsyncHostToDeviceTransferManager_Destroy_Args,
+               "PJRT_AsyncHostToDeviceTransferManager_Destroy not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_async_h2d_transfer_data,
+               PJRT_AsyncHostToDeviceTransferManager_TransferData_Args,
+               "PJRT_AsyncHostToDeviceTransferManager_TransferData not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_async_h2d_retrieve_buf,
+               PJRT_AsyncHostToDeviceTransferManager_RetrieveBuffer_Args,
+               "PJRT_AsyncHostToDeviceTransferManager_RetrieveBuffer not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_async_h2d_device, PJRT_AsyncHostToDeviceTransferManager_Device_Args,
+               "PJRT_AsyncHostToDeviceTransferManager_Device not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_async_h2d_buf_count, PJRT_AsyncHostToDeviceTransferManager_BufferCount_Args,
+               "PJRT_AsyncHostToDeviceTransferManager_BufferCount not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_async_h2d_buf_size, PJRT_AsyncHostToDeviceTransferManager_BufferSize_Args,
+               "PJRT_AsyncHostToDeviceTransferManager_BufferSize not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_async_h2d_set_err, PJRT_AsyncHostToDeviceTransferManager_SetBufferError_Args,
+               "PJRT_AsyncHostToDeviceTransferManager_SetBufferError not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_async_h2d_add_meta, PJRT_AsyncHostToDeviceTransferManager_AddMetadata_Args,
+               "PJRT_AsyncHostToDeviceTransferManager_AddMetadata not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_async_h2d_transfer_lit,
+               PJRT_AsyncHostToDeviceTransferManager_TransferLiteral_Args,
+               "PJRT_AsyncHostToDeviceTransferManager_TransferLiteral not implemented in libopentpu")
 
 #undef OT_PJRT_UNIMPL
+
+PJRT_Error* ot_pjrt_error_foreach_payload(PJRT_Error_ForEachPayload_Args* args) {
+  if (!args || !args->error) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null");
+  return nullptr;
+}
+
+PJRT_Error* ot_pjrt_device_create_async_tracking_event(
+    PJRT_Device_CreateAsyncTrackingEvent_Args* args) {
+  if (!args || !args->device) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null");
+  // OpenXLA handles a null tracking event as a valid no-op on single-device plugins.
+  args->event = nullptr;
+  return nullptr;
+}
+
+PJRT_Error* ot_pjrt_async_tracking_event_destroy(PJRT_AsyncTrackingEvent_Destroy_Args*) {
+  return nullptr;
+}
+
+PJRT_Error* ot_pjrt_device_get_attributes(PJRT_Device_GetAttributes_Args* args) {
+  if (!args || !args->device) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null");
+  args->attributes = nullptr;
+  args->num_attributes = 0;
+  args->device_attributes = nullptr;
+  args->attributes_deleter = nullptr;
+  return nullptr;
+}
+
+PJRT_Error* ot_pjrt_exec_ctx_create(PJRT_ExecuteContext_Create_Args* args) {
+  if (!args) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null");
+  args->context = new (std::nothrow) PJRT_ExecuteContext();
+  if (!args->context) return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, "out of memory");
+  return nullptr;
+}
+
+PJRT_Error* ot_pjrt_exec_ctx_destroy(PJRT_ExecuteContext_Destroy_Args* args) {
+  if (args) delete args->context;
+  return nullptr;
+}
+
+PJRT_Error* ot_pjrt_lexec_addr_device_logical_ids(
+    PJRT_LoadedExecutable_AddressableDeviceLogicalIds_Args* args) {
+  if (!args || !args->executable) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null");
+  static PJRT_LogicalDeviceIds kSingleLogicalId = {0, 0};
+  args->addressable_device_logical_ids = &kSingleLogicalId;
+  args->num_addressable_device_logical_ids = 1;
+  return nullptr;
+}
 
 PJRT_Api build_pjrt_api() {
   PJRT_Api api{};
@@ -1363,6 +1665,7 @@ PJRT_Api build_pjrt_api() {
   api.PJRT_Error_Destroy = ot_pjrt_error_destroy;
   api.PJRT_Error_Message = ot_pjrt_error_message;
   api.PJRT_Error_GetCode = ot_pjrt_error_get_code;
+  api.PJRT_Error_ForEachPayload = ot_pjrt_error_foreach_payload;
 
   api.PJRT_Plugin_Initialize = ot_pjrt_plugin_initialize;
   api.PJRT_Plugin_Attributes = ot_pjrt_plugin_attributes;
@@ -1372,6 +1675,8 @@ PJRT_Api build_pjrt_api() {
   api.PJRT_Event_Error = ot_pjrt_event_error;
   api.PJRT_Event_Await = ot_pjrt_event_await;
   api.PJRT_Event_OnReady = ot_pjrt_event_on_ready;
+  api.PJRT_Event_Create = ot_pjrt_event_create;
+  api.PJRT_Event_Set = ot_pjrt_event_set;
 
   api.PJRT_Client_Create = ot_pjrt_client_create;
   api.PJRT_Client_Destroy = ot_pjrt_client_destroy;
@@ -1399,6 +1704,7 @@ PJRT_Api build_pjrt_api() {
   api.PJRT_Client_Load = ot_pjrt_client_load;
   api.PJRT_Compile = ot_pjrt_compile_standalone;
 
+  api.PJRT_TopologyDescription_Create = ot_pjrt_topo_create;
   api.PJRT_TopologyDescription_Destroy = ot_pjrt_topo_destroy;
   api.PJRT_TopologyDescription_PlatformName = ot_pjrt_topo_platform_name;
   api.PJRT_TopologyDescription_PlatformVersion = ot_pjrt_topo_platform_version;
@@ -1407,6 +1713,8 @@ PJRT_Api build_pjrt_api() {
   api.PJRT_TopologyDescription_Deserialize = ot_pjrt_topo_deserialize;
   api.PJRT_TopologyDescription_Attributes = ot_pjrt_topo_attributes;
   api.PJRT_TopologyDescription_Fingerprint = ot_pjrt_topo_fingerprint;
+  api.PJRT_TopologyDescription_MakeCanonicalShapeForMemorySpace = ot_pjrt_topo_canonical_shape;
+  api.PJRT_TopologyDescription_GetMemorySpaceKindIds = ot_pjrt_topo_mem_kind_ids;
 
   api.PJRT_DeviceDescription_Id = ot_pjrt_devdesc_id;
   api.PJRT_DeviceDescription_ProcessIndex = ot_pjrt_devdesc_process_index;
@@ -1422,7 +1730,13 @@ PJRT_Api build_pjrt_api() {
   api.PJRT_Device_DefaultMemory = ot_pjrt_device_default_memory;
   api.PJRT_Device_MemoryStats = ot_pjrt_device_memory_stats;
   api.PJRT_Device_PoisonExecution = ot_pjrt_device_poison_exec;
+  api.PJRT_Device_CreateAsyncTrackingEvent = ot_pjrt_device_create_async_tracking_event;
+  api.PJRT_AsyncTrackingEvent_Destroy = ot_pjrt_async_tracking_event_destroy;
+  api.PJRT_Device_GetAttributes = ot_pjrt_device_get_attributes;
   api.PJRT_Device_ClearMemoryStats = ot_pjrt_device_clear_mem_stats;
+
+  api.PJRT_ExecuteContext_Create = ot_pjrt_exec_ctx_create;
+  api.PJRT_ExecuteContext_Destroy = ot_pjrt_exec_ctx_destroy;
 
   api.PJRT_Memory_Id = ot_pjrt_memory_id;
   api.PJRT_Memory_Kind = ot_pjrt_memory_kind;
@@ -1439,6 +1753,7 @@ PJRT_Api build_pjrt_api() {
   api.PJRT_Executable_SizeOfGeneratedCodeInBytes = ot_pjrt_exec_code_bytes;
   api.PJRT_Executable_GetCostAnalysis = ot_pjrt_exec_cost_analysis;
   api.PJRT_Executable_OutputMemoryKinds = ot_pjrt_exec_output_mem_kinds;
+  api.PJRT_Executable_ParameterMemoryKinds = ot_pjrt_exec_param_mem_kinds;
   api.PJRT_Executable_OutputElementTypes = ot_pjrt_exec_output_types;
   api.PJRT_Executable_OutputDimensions = ot_pjrt_exec_output_dims;
   api.PJRT_Executable_OptimizedProgram = ot_pjrt_exec_optimized_program;
@@ -1451,11 +1766,28 @@ PJRT_Api build_pjrt_api() {
   api.PJRT_LoadedExecutable_Destroy = ot_pjrt_lexec_destroy;
   api.PJRT_LoadedExecutable_GetExecutable = ot_pjrt_lexec_get_exec;
   api.PJRT_LoadedExecutable_AddressableDevices = ot_pjrt_lexec_addr_devices;
+  api.PJRT_LoadedExecutable_AddressableDeviceLogicalIds = ot_pjrt_lexec_addr_device_logical_ids;
   api.PJRT_LoadedExecutable_Delete = ot_pjrt_lexec_delete;
   api.PJRT_LoadedExecutable_IsDeleted = ot_pjrt_lexec_is_deleted;
   api.PJRT_LoadedExecutable_Execute = ot_pjrt_lexec_execute;
   api.PJRT_LoadedExecutable_GetDeviceAssignment = ot_pjrt_lexec_get_device_assignment;
   api.PJRT_LoadedExecutable_Fingerprint = ot_pjrt_lexec_fingerprint;
+
+  api.PJRT_CopyToDeviceStream_Destroy = ot_pjrt_copy_stream_destroy;
+  api.PJRT_CopyToDeviceStream_AddChunk = ot_pjrt_copy_stream_add_chunk;
+  api.PJRT_CopyToDeviceStream_TotalBytes = ot_pjrt_copy_stream_total_bytes;
+  api.PJRT_CopyToDeviceStream_GranuleSize = ot_pjrt_copy_stream_granule_size;
+  api.PJRT_CopyToDeviceStream_CurrentBytes = ot_pjrt_copy_stream_current_bytes;
+
+  api.PJRT_AsyncHostToDeviceTransferManager_Destroy = ot_pjrt_async_h2d_destroy;
+  api.PJRT_AsyncHostToDeviceTransferManager_TransferData = ot_pjrt_async_h2d_transfer_data;
+  api.PJRT_AsyncHostToDeviceTransferManager_RetrieveBuffer = ot_pjrt_async_h2d_retrieve_buf;
+  api.PJRT_AsyncHostToDeviceTransferManager_Device = ot_pjrt_async_h2d_device;
+  api.PJRT_AsyncHostToDeviceTransferManager_BufferCount = ot_pjrt_async_h2d_buf_count;
+  api.PJRT_AsyncHostToDeviceTransferManager_BufferSize = ot_pjrt_async_h2d_buf_size;
+  api.PJRT_AsyncHostToDeviceTransferManager_SetBufferError = ot_pjrt_async_h2d_set_err;
+  api.PJRT_AsyncHostToDeviceTransferManager_AddMetadata = ot_pjrt_async_h2d_add_meta;
+  api.PJRT_AsyncHostToDeviceTransferManager_TransferLiteral = ot_pjrt_async_h2d_transfer_lit;
 
   api.PJRT_Buffer_Destroy = ot_pjrt_buf_destroy;
   api.PJRT_Buffer_ElementType = ot_pjrt_buf_elem_type;

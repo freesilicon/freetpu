@@ -292,6 +292,42 @@ static void test_pjrt_api_mock() {
   ca.struct_size = PJRT_Client_Compile_Args_STRUCT_SIZE;
   ca.client = cc.client;
   ca.program = &prog;
+  // Unsupported compile_options (multi-replica, multi-partition, non-zero ordinal, tupled, malformed) must fail.
+  {
+    // field 3 (exec_build_options): field 4 (num_replicas=2)
+    const char opt_rep2[] = {0x1a, 0x02, 0x20, 0x02};
+    // field 3 (exec_build_options): field 5 (num_partitions=2)
+    const char opt_part2[] = {0x1a, 0x02, 0x28, 0x02};
+    // field 3 (exec_build_options): field 1 (device_ordinal=1)
+    const char opt_ord1[] = {0x1a, 0x02, 0x08, 0x01};
+    // field 2 (parameter_is_tupled_arguments=1)
+    const char opt_tupled[] = {0x10, 0x01};
+    // malformed truncated varint
+    const char opt_bad[] = {static_cast<char>(0x80)};
+    auto expect_compile_fail = [&](const char* opts, size_t sz, PJRT_Error_Code want) {
+      PJRT_Client_Compile_Args bad_ca = ca;
+      bad_ca.compile_options = opts;
+      bad_ca.compile_options_size = sz;
+      bad_ca.executable = nullptr;
+      PJRT_Error* e = api->PJRT_Client_Compile(&bad_ca);
+      OT_CHECK(e != nullptr);
+      PJRT_Error_GetCode_Args gc = {};
+      gc.struct_size = PJRT_Error_GetCode_Args_STRUCT_SIZE;
+      gc.error = e;
+      OT_CHECK(api->PJRT_Error_GetCode(&gc) == nullptr);
+      OT_CHECK(gc.code == want);
+      destroy_pjrt_error(api, e);
+    };
+    expect_compile_fail(opt_rep2, sizeof(opt_rep2), PJRT_Error_Code_UNIMPLEMENTED);
+    expect_compile_fail(opt_part2, sizeof(opt_part2), PJRT_Error_Code_UNIMPLEMENTED);
+    expect_compile_fail(opt_ord1, sizeof(opt_ord1), PJRT_Error_Code_INVALID_ARGUMENT);
+    expect_compile_fail(opt_tupled, sizeof(opt_tupled), PJRT_Error_Code_UNIMPLEMENTED);
+    expect_compile_fail(opt_bad, sizeof(opt_bad), PJRT_Error_Code_INVALID_ARGUMENT);
+  }
+  // Valid 1x1 compile_options must succeed.
+  const char opt_1x1[] = {0x1a, 0x06, 0x20, 0x01, 0x28, 0x01, 0x30, 0x01};
+  ca.compile_options = opt_1x1;
+  ca.compile_options_size = sizeof(opt_1x1);
   OT_CHECK(api->PJRT_Client_Compile(&ca) == nullptr);
   OT_CHECK(ca.executable != nullptr);
 
@@ -345,6 +381,54 @@ static void test_pjrt_api_mock() {
     OT_CHECK(gc.code == PJRT_Error_Code_UNIMPLEMENTED);
   }
   destroy_pjrt_error(api, cr_err);
+
+  OT_CHECK(api->PJRT_Device_CreateAsyncTrackingEvent != nullptr);
+  PJRT_Device_CreateAsyncTrackingEvent_Args te_args = {};
+  te_args.struct_size = PJRT_Device_CreateAsyncTrackingEvent_Args_STRUCT_SIZE;
+  te_args.device = ad.addressable_devices[0];
+  te_args.event = reinterpret_cast<PJRT_AsyncTrackingEvent*>(0x1);
+  OT_CHECK(api->PJRT_Device_CreateAsyncTrackingEvent(&te_args) == nullptr);
+  OT_CHECK(te_args.event == nullptr);
+
+  OT_CHECK(api->PJRT_TopologyDescription_Create != nullptr);
+  PJRT_TopologyDescription_Create_Args tc_args = {};
+  tc_args.struct_size = PJRT_TopologyDescription_Create_Args_STRUCT_SIZE;
+  PJRT_Error* tc_err = api->PJRT_TopologyDescription_Create(&tc_args);
+  OT_CHECK(tc_err != nullptr);
+  {
+    PJRT_Error_GetCode_Args gc = {};
+    gc.struct_size = PJRT_Error_GetCode_Args_STRUCT_SIZE;
+    gc.error = tc_err;
+    OT_CHECK(api->PJRT_Error_GetCode(&gc) == nullptr);
+    OT_CHECK(gc.code == PJRT_Error_Code_UNIMPLEMENTED);
+  }
+  destroy_pjrt_error(api, tc_err);
+
+  // Oversized strided upload must fail on HBM capacity before reading/packing host memory.
+  {
+    uint16_t tiny_dummy = 0;
+    int64_t huge_dims[2] = {8192, 8192};  // 128 MiB > 63 MiB mock HBM
+    int64_t huge_strides[2] = {2, 16384};
+    PJRT_Client_BufferFromHostBuffer_Args huge_up = {};
+    huge_up.struct_size = PJRT_Client_BufferFromHostBuffer_Args_STRUCT_SIZE;
+    huge_up.client = cc.client;
+    huge_up.data = &tiny_dummy;
+    huge_up.type = PJRT_Buffer_Type_BF16;
+    huge_up.dims = huge_dims;
+    huge_up.num_dims = 2;
+    huge_up.byte_strides = huge_strides;
+    huge_up.num_byte_strides = 2;
+    huge_up.host_buffer_semantics = PJRT_HostBufferSemantics_kImmutableUntilTransferCompletes;
+    huge_up.device = ad.addressable_devices[0];
+    PJRT_Error* huge_err = api->PJRT_Client_BufferFromHostBuffer(&huge_up);
+    OT_CHECK(huge_err != nullptr);
+    PJRT_Error_GetCode_Args gc = {};
+    gc.struct_size = PJRT_Error_GetCode_Args_STRUCT_SIZE;
+    gc.error = huge_err;
+    OT_CHECK(api->PJRT_Error_GetCode(&gc) == nullptr);
+    OT_CHECK(gc.code == PJRT_Error_Code_RESOURCE_EXHAUSTED);
+    destroy_pjrt_error(api, huge_err);
+  }
 
   // Strided & reversed host uploads must reorder elements accurately; unsupported layouts rejected.
   uint16_t raw_2x2[4] = {0x3f80u, 0x4000u, 0x4040u, 0x4080u};  // [1, 2; 3, 4]

@@ -185,6 +185,30 @@ bool parse_bar4_descriptor(const uint8_t* bar4_page, size_t page_len, Bar4Descri
 }
 
 #ifdef __linux__
+static inline void dma_wmb() {
+#if defined(__aarch64__)
+  asm volatile("dsb oshst" ::: "memory");
+#elif defined(__arm__)
+  asm volatile("dsb ost" ::: "memory");
+#elif defined(__x86_64__) || defined(__i386__)
+  asm volatile("sfence" ::: "memory");
+#else
+  __atomic_thread_fence(__ATOMIC_RELEASE);
+#endif
+}
+
+static inline void dma_rmb() {
+#if defined(__aarch64__)
+  asm volatile("dmb oshld" ::: "memory");
+#elif defined(__arm__)
+  asm volatile("dmb osh" ::: "memory");
+#elif defined(__x86_64__) || defined(__i386__)
+  asm volatile("lfence" ::: "memory");
+#else
+  __atomic_thread_fence(__ATOMIC_ACQUIRE);
+#endif
+}
+
 static bool is_supported_vfio_device_id(uint16_t device_id) {
   // Only TPU v5e (0x1ae0:0x0063) has a validated VFIO ring/DMA transport.
   // Documented TPU v6e (0x1ae0:0x006f) is rejected until its transport is validated.
@@ -693,17 +717,22 @@ bool VfioTransport::init_ring_queues(std::string* err) {
 
   ring_arena_bytes = static_cast<size_t>(aligned_ring_bytes);
   ring_arena_mem = map_anon_dma(kSqRingIova, ring_arena_bytes);
+  if (!ring_arena_mem) {
+    if (err && err->empty()) *err = "Failed to map VFIO ring queue arena";
+    teardown_ring_queues();
+    return false;
+  }
+  host_stage_size = kStageBytes;
+  host_stage_iova = kStageBaseIova;
   host_stage_mem = map_anon_dma(kStageBaseIova, kStageBytes);
-  if (!ring_arena_mem || !host_stage_mem) {
-    if (err && err->empty()) *err = "Failed to map VFIO ring queue buffers";
+  if (!host_stage_mem) {
+    if (err && err->empty()) *err = "Failed to map VFIO host staging window";
     teardown_ring_queues();
     return false;
   }
   sq_ring_mem = ring_arena_mem + kSqRingIova;
   cq_ring_mem = ring_arena_mem + kCqRingIova;
   status_page_mem = reinterpret_cast<volatile uint32_t*>(ring_arena_mem + kStatusPageIova);
-  host_stage_size = kStageBytes;
-  host_stage_iova = kStageBaseIova;
 
   // Disable queue before reprogramming base addresses.
   write32_bar0(0x10000u, 0u);
@@ -825,7 +854,8 @@ bool VfioTransport::submit_sq_wait(const uint32_t desc[32], uint32_t timeout_ms,
   uint32_t* sq_slot = reinterpret_cast<uint32_t*>(sq_ring_mem + idx * 128u);
   std::memcpy(sq_slot, desc, 128u);
   sq_slot[0] = sq_seq;
-  __atomic_thread_fence(__ATOMIC_RELEASE);
+  // Order DMA payload and SQ descriptor writes in outer-shareable domain before MMIO doorbell.
+  dma_wmb();
 
   uint32_t target_seq = sq_seq + 1u;
   sq_seq = target_seq;
@@ -837,12 +867,13 @@ bool VfioTransport::submit_sq_wait(const uint32_t desc[32], uint32_t timeout_ms,
   for (;;) {
     uint32_t cq_tail = __atomic_load_n(&status_page_mem[1], __ATOMIC_ACQUIRE);
     if (static_cast<int32_t>(cq_tail - target_seq) >= 0) {
-      // Order completion entry and DMA payload reads after observing cq_tail (AArch64).
-      __atomic_thread_fence(__ATOMIC_ACQUIRE);
+      // Order completion entry and DMA payload reads after observing cq_tail from PCIe device.
+      dma_rmb();
       if (cq_out) {
         const uint32_t* cq_slot = reinterpret_cast<const uint32_t*>(cq_ring_mem + idx * 32u);
         std::memcpy(cq_out, cq_slot, 32u);
       }
+      dma_wmb();
       write32_bar0(0x1002cu, target_seq);
       return true;
     }

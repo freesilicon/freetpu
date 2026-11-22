@@ -96,7 +96,9 @@ int main() {
     if (e->d_name[0] == '.') continue;
     std::string base = std::string("/sys/bus/pci/devices/") + e->d_name;
     if (read_link_base(base + "/driver") == "vfio-pci" &&
-        read_line(base + "/vendor") == "0x1ae0") {
+        read_line(base + "/vendor") == "0x1ae0" &&
+        read_line(base + "/device") == "0x0063" &&
+        read_line(base + "/class") == "0xff0000") {
       bdf = e->d_name;
       grp = read_link_base(base + "/iommu_group");
       break;
