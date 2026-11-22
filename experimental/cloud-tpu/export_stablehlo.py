@@ -112,6 +112,10 @@ def ensure_private_dir(raw_dir: str) -> str:
         os.mkdir(d, 0o700)
       except FileExistsError:
         pass
+  revalidated = _resolve_and_validate_dir_path(abs_dir)
+  if revalidated != abs_dir:
+    raise RuntimeError(f"Directory path changed across symlinks during creation: {abs_dir} -> {revalidated}")
+  abs_dir = revalidated
   st = os.lstat(abs_dir)
   if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
     raise RuntimeError(f"Expected non-symlink directory, got: {abs_dir}")

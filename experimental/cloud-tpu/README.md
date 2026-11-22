@@ -41,7 +41,7 @@ colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json run --tpu V6E1 --
     log_f="$(mktemp)"
     colab --auth=adc --config "$CFG" "$@" 2>&1 | tee "$log_f"
     local rc="${PIPESTATUS[0]}"
-    if [ "$rc" -ne 0 ] || ! grep -Fq "$marker" "$log_f"; then
+    if [ "$rc" -ne 0 ] || ! tr -d '\r' < "$log_f" | grep -Fxq "$marker"; then
       rm -f "$log_f"
       return 1
     fi
@@ -147,11 +147,11 @@ LIBTPU_PATH="$LIBTPU_PATH" ~/.cache/freetpu-pjrt/tpu_pjrt_bench
   - `B=1, H=32, Q=K=4096, D=128`: **`2,092.06 us` (`65.70 TFLOP/s` median / `66.65` peak)** vs dense XLA `9,436.90 us` (`14.56 TFLOP/s`) — **`4.51x` speedup** (`max_abs_err=0.015625`).
 
 ### 4. Resident 32-Layer Llama-3-8B Synthetic Decoder-Layer Steps (`llama8b_decode_bench.py`)
-Exact Llama-3-8B hidden/FFN/GQA geometry (`d=4096, 32L, 32Q/8KV, head_dim=128, ff=14336`) resident in HBM via `jax.lax.scan`, repeatedly stepping synthetic activations across a fixed 256-entry synthetic KV cache and stopping at the final hidden state (omitting RoPE, LM-head vocabulary projection, and token sampling; throughput below is `batch / step_time` synthetic decoder-layer `steps/s`):
+Exact Llama-3-8B hidden/FFN/GQA geometry (`d=4096, 32L, 32Q/8KV, head_dim=128, ff=14336`) resident in HBM via `jax.lax.scan`, repeatedly stepping synthetic activations across a fixed 256-entry synthetic KV cache and stopping at the final hidden state (omitting RoPE, LM-head vocabulary projection, and token sampling; throughput below is `batch / step_time` synthetic decoder-layer `steps/s`, and `GB/s` is effective decoder payload bandwidth `(weights + scales + KV bytes) / step_time` rather than measured hardware HBM bus traffic):
 - **Single-Projection `W4A16` (`int32_split8_3d`, `max_abs_err = 0.0..0.0078`)**: `QKV 1x4096->6144` **`154.93 us`** (`2.02x` vs XLA), `Gate+Up 1x4096->28672` **`389.37 us`** (`3.24x` vs XLA `1,260.84 us`), `Down 1x14336->4096` **`243.66 us`** (`1.79x` vs XLA).
 - **`W8A16` 32-Layer Resident (`6.98 GB` weights, `step0_max_abs_err=0.047` @ `B=1`)**:
-  - `B=1`: XLA **`10.254 ms/step` (`97.53 steps/s`, `684.27 GB/s` = `83.55%` HBM BW)**; Pallas `17.840 ms/step` (`56.05 steps/s`).
-  - `B=32`: XLA **`20.367 ms/step` (`1,571.15 steps/s`, `395.55 GB/s`)**; Pallas `35.045 ms/step` (`913.12 steps/s`).
+  - `B=1`: XLA **`10.254 ms/step` (`97.53 steps/s`, `684.27 GB/s` effective decoder payload throughput = `83.55%` of `819 GB/s` nominal HBM peak)**; Pallas `17.840 ms/step` (`56.05 steps/s`).
+  - `B=32`: XLA **`20.367 ms/step` (`1,571.15 steps/s`, `395.55 GB/s` effective payload throughput)**; Pallas `35.045 ms/step` (`913.12 steps/s`).
 - **`W4A16` 32-Layer Resident (`3.49 GB` packed `int32` weights)**:
   - `B=1`: Pallas **`15.529 ms/step` (`64.39 steps/s`, `227.09 GB/s`)** vs XLA `47.374 ms/step` (`21.11 steps/s`) — **`3.05x` speedup**.
   - `B=32`: Pallas **`27.416 ms/step` (`1,167.20 steps/s`, `166.57 GB/s`)** vs XLA `63.876 ms/step` (`500.97 steps/s`) — **`2.33x` speedup**.
@@ -165,7 +165,7 @@ Exact Llama-3-8B hidden/FFN/GQA geometry (`d=4096, 32L, 32Q/8KV, head_dim=128, f
 | --- | --- | --- |
 | **Kernel Transport** | `/dev/edgetpu-soc` (`buenos.ko` ABI `1.4`, Litebuf VII, 16-credit ring) | `/dev/vfio/0` (`vfio-pci`, PCI `0x1ae0:0x0063`, `BAR0=4 GiB`, `128` MSI-X) |
 | **Userspace Vendor `.so`** | **`0 B`** (`libopenbuenos` C11/C++17; `DT_NEEDED=[libdl,libm,libc]`) | **`601.67 MB`** (`libtpu.so` `0.0.50`, PJRT `0.116`) — Zero-Python C++17 verified (`MAPS_LIBPYTHON=0`) |
-| **Memory & Peak BW** | Unified LPDDR (`27.59 GB/s` measured @ `1x2048x2048`) + `768 KiB` NM SRAM | `15.748 GiB` HBM2e (**`655.55 GB/s`** triad / **`684.27 GB/s`** `W8A16` 32L) + `128 MiB` VMEM |
+| **Memory & Peak BW** | Unified LPDDR (`27.59 GB/s` measured @ `1x2048x2048`) + `768 KiB` NM SRAM | `15.748 GiB` HBM2e (**`655.55 GB/s`** streaming triad HBM BW; **`684.27 GB/s`** effective `W8A16` 32L decoder payload throughput, `83.55%` of `819 GB/s` nominal peak) + `128 MiB` VMEM |
 | **Small-Op Floor** | **`60.8–72.8 us`** chained `0xa40` fusion (`152 us` `1x2048x2048`) | **`124.5–126.9 us`** sync PJRT floor; **`32.0 us`** amortized when async-pipelined (`100x`) |
 | **Peak Matrix Compute** | `983.6 INT8 GOPS` @ `177.2 mW` (**`5.55 TOPS/W`**) | **`180.36 TFLOP/s`** BF16 (C++ PJRT) / **`350.69 TOPS`** INT8 |
 | **End-to-End LLM vs Synthetic Decoder Steps** | `Qwen2.5-1.5B-Q8_0` (end-to-end): `pp512 = 105.87 tok/s`, `tg64 = 5.85 tok/s` (`-21.5% mJ/tok` vs CPU) | `Llama-3-8B` (32L synthetic decoder steps/s, excludes RoPE/LM head/sampling): `W8A16` **`97.53 steps/s`** (`B=1`) / **`1,571.15 steps/s`** (`B=32`); `W4A16` Pallas: **`64.39 steps/s`** (`B=1`) / **`1,167.20 steps/s`** (`B=32`) |
