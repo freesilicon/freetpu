@@ -1401,9 +1401,10 @@ static void resolve_tensor_hbm(cloudtpu::PjrtRuntime& rt,
                 return;
             }
         }
-        // Uninitialized zero-filled HBM buffer (e.g. newly cleared KV cache before first write).
+        // Uninitialized zero-filled HBM buffer for newly allocated leaf/KV-cache buffers before first write.
+        // Never silently zero-init a computed graph activation node (t->op != GGML_OP_NONE).
         const cloudtpu::PjrtDType pdt = ggml_type_to_pjrt(t->type);
-        if (pdt != cloudtpu::PjrtDType::INVALID && ggml_is_contiguous(t)) {
+        if (t->op == GGML_OP_NONE && pdt != cloudtpu::PjrtDType::INVALID && ggml_is_contiguous(t)) {
             const size_t t_bytes = ggml_nbytes(t);
             std::vector<uint8_t> zeros(t_bytes, 0);
             bctx->evict_overlapping_locked(t_off, t_bytes, t_off);
@@ -1417,7 +1418,7 @@ static void resolve_tensor_hbm(cloudtpu::PjrtRuntime& rt,
             return;
         }
         throw std::runtime_error("ggml-cloudtpu: missing HBM slot for input tensor '" +
-                                 std::string(t->name) + "'");
+                                 std::string(t->name) + "' (op=" + std::string(ggml_op_desc(t)) + ")");
     }
 
     // Host tensor fallback: upload transient copy to device HBM.
@@ -1591,6 +1592,44 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
         }
     }
 
+    // Track buffer-slot reuse (ggml_gallocr liveness) so tensors still live at the end of a
+    // ggml_backend_sched split cgraph are always materialized to HBM, while overwritten dead
+    // intermediates remain fused in XLA VMEM and never clobber newer slots.
+    auto ranges_overlap = [](const struct ggml_tensor* a, const struct ggml_tensor* b) -> bool {
+        if (!a || !b || !a->buffer || a->buffer != b->buffer || !is_cloudtpu_buffer(a->buffer)) {
+            return false;
+        }
+        const uintptr_t a0 = reinterpret_cast<uintptr_t>(a->data);
+        const uintptr_t a1 = a0 + ggml_nbytes(a);
+        const uintptr_t b0 = reinterpret_cast<uintptr_t>(b->data);
+        const uintptr_t b1 = b0 + ggml_nbytes(b);
+        return a0 < b1 && b0 < a1;
+    };
+
+    const int slice_len = end_idx - start_idx;
+    std::vector<bool> overwritten_in_slice(static_cast<size_t>(slice_len), false);
+    std::vector<bool> overwritten_after_slice(static_cast<size_t>(slice_len), false);
+    for (int i = start_idx; i < end_idx; ++i) {
+        const struct ggml_tensor* ni = cgraph->nodes[i];
+        if (is_view_noop_op(ni->op)) {
+            continue;
+        }
+        for (int k = i + 1; k < end_idx; ++k) {
+            const struct ggml_tensor* nk = cgraph->nodes[k];
+            if (!is_view_noop_op(nk->op) && ranges_overlap(ni, nk)) {
+                overwritten_in_slice[static_cast<size_t>(i - start_idx)] = true;
+                break;
+            }
+        }
+        for (int k = end_idx; k < cgraph->n_nodes; ++k) {
+            const struct ggml_tensor* nk = cgraph->nodes[k];
+            if (!is_view_noop_op(nk->op) && ranges_overlap(ni, nk)) {
+                overwritten_after_slice[static_cast<size_t>(i - start_idx)] = true;
+                break;
+            }
+        }
+    }
+
     cloudtpu::GraphProgramSpec prog_spec;
     std::unordered_map<const struct ggml_tensor*, uint64_t> tensor_to_id;
     std::unordered_map<uint64_t, const struct ggml_tensor*> id_to_input_tensor;
@@ -1729,14 +1768,18 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
             }
         }
 
+        const size_t rel_idx = static_cast<size_t>(i - start_idx);
+        const bool alive_past_cgraph = !overwritten_in_slice[rel_idx] && !overwritten_after_slice[rel_idx];
         const bool is_live_out =
-            (i == end_idx - 1) ||
-            (node->op == GGML_OP_SET_ROWS) ||
-            (node->view_src != nullptr) ||
-            (consumed_inside.count(node) == 0) ||
-            (node->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
-            needed_outside.count(node) != 0 ||
-            (!node->buffer || !is_cloudtpu_buffer(node->buffer));
+            !overwritten_in_slice[rel_idx] &&
+            ((i == end_idx - 1) ||
+             (node->op == GGML_OP_SET_ROWS) ||
+             (node->view_src != nullptr) ||
+             (consumed_inside.count(node) == 0) ||
+             (node->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
+             (needed_outside.count(node) != 0) ||
+             alive_past_cgraph ||
+             (!node->buffer || !is_cloudtpu_buffer(node->buffer)));
         if (is_live_out) {
             prog_spec.output_ids.push_back(store_id);
             id_to_output_tensor[store_id] = node;
