@@ -201,7 +201,7 @@ def _read_fdinfo_flags(fdinfo_path: Path) -> Tuple[Optional[int], bool]:
 def _scan_proc_vfio_pids(
     proc_root: Path,
     vfio_paths: Sequence[str],
-) -> Tuple[Dict[str, List[int]], bool, int]:
+) -> Tuple[Dict[str, List[int]], bool, int, Dict[str, int]]:
     """Find PIDs holding active non-`O_PATH` char-device FDs matching host `/dev/vfio/<group>` `st_rdev`.
 
     Compares each `/proc/<pid>/fd/<n>` target's file mode (`S_ISCHR`), device
@@ -211,31 +211,38 @@ def _scan_proc_vfio_pids(
     open or reserve a VFIO group) are ignored while VFIO nodes bind-mounted
     under different paths are accurately matched.
 
-    Returns (pids_by_vfio_path, pid_telemetry_accessible, unreadable_pid_dirs).
-    Permission failures on /proc/<pid>/fd or fdinfo mean PID telemetry may be
-    incomplete, so callers must not confuse missing reads with zero workloads.
+    Returns `(pids_by_vfio_path, pid_telemetry_accessible, unreadable_pid_dirs, verified_rdevs)`.
+    `verified_rdevs` contains ONLY those `vfio_paths` whose host node was successfully
+    `stat()`ed as a character device (`S_ISCHR`). Callers MUST mark PID telemetry
+    unavailable (and suppress `freetpu_tpu_active_pids`) for any group missing from
+    `verified_rdevs` so a missing/unreadable/non-character `/dev/vfio/<group>` node
+    never publishes a false zero PID count as valid coverage.
     """
-    result: Dict[str, List[int]] = {p: [] for p in vfio_paths if p}
-    if not result:
-        return result, True, 0
+    unique_paths = list(dict.fromkeys(p for p in vfio_paths if p))
+    result: Dict[str, List[int]] = {}
+    verified_rdevs: Dict[str, int] = {}
+    if not unique_paths:
+        return result, True, 0, verified_rdevs
     if not proc_root.is_dir():
-        return result, False, 1
+        return result, False, 1, verified_rdevs
 
     rdev_to_paths: Dict[int, List[str]] = {}
-    for vp in result:
+    for vp in unique_paths:
         try:
             host_st = os.stat(vp)
         except OSError:
             continue
         if stat.S_ISCHR(host_st.st_mode):
+            verified_rdevs[vp] = host_st.st_rdev
+            result[vp] = []
             rdev_to_paths.setdefault(host_st.st_rdev, []).append(vp)
 
     try:
         entries = list(proc_root.iterdir())
     except PermissionError:
-        return result, False, 1
+        return result, False, 1, verified_rdevs
     except OSError:
-        return result, False, 1
+        return result, False, 1, verified_rdevs
 
     unreadable = 0
     for entry in entries:
@@ -278,7 +285,7 @@ def _scan_proc_vfio_pids(
 
     for pids in result.values():
         pids.sort()
-    return result, unreadable == 0, unreadable
+    return result, unreadable == 0, unreadable, verified_rdevs
 
 
 @dataclass
@@ -890,18 +897,6 @@ def validate_chip_id_map(
         seen_runtime_targets[rt_id] = dev.pci_bdf
 
 
-def _stat_char_rdev(path: str) -> Optional[int]:
-    if not path:
-        return None
-    try:
-        st = os.stat(path)
-    except OSError:
-        return None
-    if stat.S_ISCHR(st.st_mode):
-        return st.st_rdev
-    return None
-
-
 def _pid_holds_vfio_rdev(proc_root: Path, pid: int, target_rdev: int) -> bool:
     """Return True iff `/proc/<pid>/fd/*` contains an active non-`O_PATH` char device with `st_rdev == target_rdev`."""
     pid_dir = proc_root / str(pid)
@@ -948,17 +943,17 @@ def collect_snapshot(
         for d in devices
         if d.iommu_group
     ]
-    vfio_rdevs: Dict[str, Optional[int]] = (
-        {} if skip_pid_scan else {vp: _stat_char_rdev(vp) for vp in real_vfio_paths}
-    )
     if skip_pid_scan:
         proc_pids: Dict[str, List[int]] = {}
         proc_fd_accessible = False
+        vfio_rdevs: Dict[str, int] = {}
     else:
-        proc_pids, proc_fd_accessible, _unreadable = _scan_proc_vfio_pids(
+        proc_pids, proc_fd_accessible, _unreadable, vfio_rdevs = _scan_proc_vfio_pids(
             proc_root, real_vfio_paths
         )
 
+    runtime_budget_s = max(0.05, float(tpu_info_timeout_s))
+    runtime_deadline = time.monotonic() + runtime_budget_s
     if skip_pid_scan:
         # Sidecar / no-PID mode: query `tpu_info.metrics` directly over loopback
         # gRPC with a hard deadline ONLY. Never fall back to the `tpu-info` CLI
@@ -967,22 +962,24 @@ def collect_snapshot(
         tpu_info_ok, tpu_info_err, parsed_rows = _query_tpu_info_python_metrics(
             devices,
             addr=runtime_metrics_addr,
-            timeout_s=tpu_info_timeout_s,
+            timeout_s=runtime_budget_s,
         )
     else:
         tpu_info_ok, tpu_info_err, parsed_rows = _run_tpu_info(
             tpu_info_bin=tpu_info_bin,
-            timeout_s=tpu_info_timeout_s,
+            timeout_s=runtime_budget_s,
         )
         # If `tpu-info` CLI failed (for example due to cross-profile `/proc` EACCES
         # under containerd AppArmor), fall back to direct `tpu_info.metrics` gRPC
-        # queries over loopback with a hard deadline so live HBM/duty-cycle
-        # telemetry is still collected.
-        if not tpu_info_ok and tpu_info_bin and runtime_metrics_addr:
+        # queries ONLY within the remaining shared deadline so a stalled `libtpu`
+        # endpoint cannot double-spend the scrape timeout (e.g. 5s + 5s >= 10s)
+        # before PCI and PID metrics are returned.
+        remaining_s = runtime_deadline - time.monotonic()
+        if not tpu_info_ok and tpu_info_bin and runtime_metrics_addr and remaining_s >= 0.05:
             py_ok, _py_err, py_rows = _query_tpu_info_python_metrics(
                 devices,
                 addr=runtime_metrics_addr,
-                timeout_s=tpu_info_timeout_s,
+                timeout_s=remaining_s,
             )
             if py_ok:
                 tpu_info_ok, tpu_info_err, parsed_rows = True, None, py_rows
@@ -1085,13 +1082,16 @@ def collect_snapshot(
 
         # Upstream `tpu-info` also scans `/proc/*/fd/*` under the caller's privileges
         # and reports `PID=None` when another user's process is unreadable. Only mark
-        # PID telemetry available when the `/proc/<pid>/fd` scan succeeded without
-        # permission denials so incomplete scans never publish false zeros.
-        dev.pid_telemetry_available = proc_fd_accessible
+        # PID telemetry available when BOTH the `/proc/<pid>/fd` scan succeeded without
+        # permission denials AND this device's `/dev/vfio/<group>` character device
+        # number (`st_rdev`) was verified, so a missing/unreadable/non-char VFIO node
+        # never emits a false zero PID count as valid billing coverage.
+        dev.pid_telemetry_available = proc_fd_accessible and (host_rdev is not None)
         if not dev.pid_telemetry_available:
             overall_pid_available = False
-
-        dev.active_pids = sorted(pids)
+            dev.active_pids = []
+        else:
+            dev.active_pids = sorted(pids)
 
     runtime_telemetry: List[RuntimeTelemetry] = [
         RuntimeTelemetry(
@@ -1626,7 +1626,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--tpu-info-timeout",
         type=float,
         default=5.0,
-        help="Timeout in seconds when invoking tpu-info (default: 5.0).",
+        help="Shared total timeout in seconds for runtime telemetry (tpu-info CLI plus Python gRPC fallback; default: 5.0).",
     )
     parser.add_argument(
         "--chip-id-map",

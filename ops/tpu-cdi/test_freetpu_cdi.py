@@ -88,7 +88,9 @@ def _make_mock_pci_vfio(
         (d / "device").write_text(dev["device"] + "\n", encoding="utf-8")
         if dev.get("iommu_group"):
             grp = iommu_groups / dev["iommu_group"]
-            grp.mkdir(parents=True, exist_ok=True)
+            grp_devs = grp / "devices"
+            grp_devs.mkdir(parents=True, exist_ok=True)
+            os.symlink(str(d), grp_devs / dev["bdf"])
             os.symlink(str(grp), d / "iommu_group")
         if dev.get("driver"):
             drv = sysfs_root / "bus" / "pci" / "drivers" / dev["driver"]
@@ -1180,6 +1182,40 @@ class FreeTpuCdiTests(unittest.TestCase):
                 # 4. Mismatched /dev/vfio/vfio control device number fails closed.
                 virt_misc_dev.write_text("10:250\n", encoding="utf-8")
                 with self.assertRaisesRegex(RuntimeError, "misc/vfio/dev"):
+                    freetpu_cdi.discover_tpu_chips(sysfs_root=sysfs_root, dev_root=dev_root)
+
+    def test_rejects_missing_or_incomplete_kernel_iommu_group_membership(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sysfs_root, dev_root = _make_mock_pci_vfio(
+                root,
+                devices=[
+                    {
+                        "bdf": "0000:00:06.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                    },
+                ],
+                create_vfio_nodes=["0"],
+            )
+            with _mock_vfio_char_devices():
+                # Baseline passes when kernel iommu_groups/0/devices contains the TPU.
+                chips, _ = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                self.assertEqual(len(chips), 1)
+
+                # Removing candidate TPU entry from kernel membership list fails closed.
+                member_link = sysfs_root / "kernel" / "iommu_groups" / "0" / "devices" / "0000:00:06.0"
+                member_link.unlink()
+                with self.assertRaisesRegex(RuntimeError, "does not contain 0000:00:06.0"):
+                    freetpu_cdi.discover_tpu_chips(sysfs_root=sysfs_root, dev_root=dev_root)
+
+                # Removing the kernel iommu_groups/0/devices directory fails closed.
+                (sysfs_root / "kernel" / "iommu_groups" / "0" / "devices").rmdir()
+                with self.assertRaisesRegex(RuntimeError, "missing or unreadable"):
                     freetpu_cdi.discover_tpu_chips(sysfs_root=sysfs_root, dev_root=dev_root)
 
 

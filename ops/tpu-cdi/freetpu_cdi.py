@@ -147,9 +147,17 @@ def _make_device_node(
 def _collect_iommu_group_members(
     sysfs_root: Path,
     pci_entries: Sequence[Path],
-) -> Dict[str, set[str]]:
-    """Map every IOMMU group ID to all PCI device BDFs belonging to that group."""
+) -> Tuple[Dict[str, set[str]], Dict[str, set[str]]]:
+    """Map every IOMMU group ID to PCI BDFs seen in sysfs and verified kernel group listings.
+
+    Returns `(all_members, kernel_members)` where `kernel_members[group]` is populated
+    ONLY when `<sysfs_root>/kernel/iommu_groups/<group>/devices` exists and is readable.
+    Callers MUST require a verified `kernel_members` entry containing the candidate TPU
+    before publishing a VFIO group so a filtered or partially mounted `--sysfs-root`
+    cannot hide sibling devices in the same IOMMU group.
+    """
     members: Dict[str, set[str]] = {}
+    kernel_members: Dict[str, set[str]] = {}
     for entry in pci_entries:
         grp = _read_symlink_name(entry / "iommu_group") or ""
         if grp:
@@ -157,16 +165,21 @@ def _collect_iommu_group_members(
 
     iommu_root = sysfs_root / "kernel" / "iommu_groups"
     if iommu_root.is_dir():
-        for grp_dir in iommu_root.iterdir():
+        try:
+            grp_dirs = list(iommu_root.iterdir())
+        except OSError:
+            grp_dirs = []
+        for grp_dir in grp_dirs:
             dev_dir = grp_dir / "devices"
             if not dev_dir.is_dir():
                 continue
             try:
-                for member in dev_dir.iterdir():
-                    members.setdefault(grp_dir.name, set()).add(member.name)
+                listed = {member.name for member in dev_dir.iterdir()}
             except OSError:
                 continue
-    return members
+            kernel_members[grp_dir.name] = listed
+            members.setdefault(grp_dir.name, set()).update(listed)
+    return members, kernel_members
 
 
 _DEVNUM_RE = re.compile(r"^[0-9]+:[0-9]+$")
@@ -233,7 +246,7 @@ def discover_tpu_chips(
             )
 
     pci_entries = sorted(pci_dir.iterdir(), key=lambda p: p.name)
-    group_members = _collect_iommu_group_members(sysfs_root, pci_entries)
+    group_members, kernel_group_members = _collect_iommu_group_members(sysfs_root, pci_entries)
 
     tpu_candidates: List[Tuple[Path, str, str, str]] = []
     tpu_bdfs: set[str] = set()
@@ -267,7 +280,21 @@ def discover_tpu_chips(
                 f"TPU PCI device {entry.name} has no iommu_group in {entry}"
             )
 
-        all_in_group = group_members.get(iommu_group, set()) | {entry.name}
+        verified_kernel_members = kernel_group_members.get(iommu_group)
+        if verified_kernel_members is None:
+            raise RuntimeError(
+                f"Refusing VFIO group {iommu_group} for TPU {entry.name}: "
+                f"cannot verify full IOMMU group membership because "
+                f"{sysfs_root}/kernel/iommu_groups/{iommu_group}/devices is missing or unreadable"
+            )
+        if entry.name not in verified_kernel_members:
+            raise RuntimeError(
+                f"Refusing VFIO group {iommu_group} for TPU {entry.name}: "
+                f"kernel IOMMU group membership list "
+                f"({sysfs_root}/kernel/iommu_groups/{iommu_group}/devices) does not contain {entry.name}"
+            )
+
+        all_in_group = group_members.get(iommu_group, set()) | verified_kernel_members
         non_tpu_members = tuple(sorted(all_in_group - tpu_bdfs))
         if non_tpu_members:
             raise RuntimeError(

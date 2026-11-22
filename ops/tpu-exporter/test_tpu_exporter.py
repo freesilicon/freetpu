@@ -1309,6 +1309,135 @@ TPU Device Status
             self.assertIn('iommu_group="2",vfio_group_exclusive="false"', prom)
             self.assertIn('iommu_group="3",vfio_group_exclusive="false"', prom)
 
+    def test_unverified_vfio_node_marks_pid_telemetry_unavailable(self) -> None:
+        import stat
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sysfs_root, dev_root, proc_root = _make_mock_pci_tree(
+                root,
+                devices=[
+                    {
+                        "bdf": "0000:00:06.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                    },
+                    {
+                        "bdf": "0000:00:07.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "1",
+                    },
+                ],
+                # Only group 0 has a host /dev/vfio/0 node; group 1 node is missing,
+                # and group 0 is a regular file (non-char) unless mocked as S_ISCHR.
+                create_vfio_nodes=["0"],
+            )
+            orig_stat = os.stat
+            vfio0 = str(dev_root / "vfio" / "0")
+
+            def _only_group0_is_char(path, *args, **kwargs):
+                st = orig_stat(path, *args, **kwargs)
+                if os.fspath(path) == vfio0:
+                    fake = mock.MagicMock()
+                    fake.st_mode = stat.S_IFCHR | 0o600
+                    fake.st_rdev = os.makedev(242, 0)
+                    return fake
+                return st
+
+            with mock.patch.object(os, "stat", side_effect=_only_group0_is_char):
+                snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin=None,
+                )
+
+            by_bdf = {d.pci_bdf: d for d in snap.devices}
+            self.assertTrue(by_bdf["0000:00:06.0"].pid_telemetry_available)
+            self.assertFalse(by_bdf["0000:00:07.0"].pid_telemetry_available)
+            self.assertFalse(snap.pid_telemetry_available)
+
+            prom = tpu_exporter.format_prometheus_metrics(snap)
+            self._assert_valid_prometheus_text(prom)
+            self.assertIn('freetpu_tpu_pid_telemetry_available{chip="0",pci_bdf="0000:00:06.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/0"} 1', prom)
+            self.assertIn('freetpu_tpu_pid_telemetry_available{chip="1",pci_bdf="0000:00:07.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/1"} 0', prom)
+            self.assertIn('freetpu_tpu_active_pids{chip="0",pci_bdf="0000:00:06.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/0"} 0', prom)
+            self.assertNotIn('freetpu_tpu_active_pids{chip="1",pci_bdf="0000:00:07.0"', prom)
+
+    def test_runtime_telemetry_fallback_shares_single_scrape_deadline(self) -> None:
+        import time as _time
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sysfs_root, dev_root, proc_root = _make_mock_pci_tree(
+                root,
+                devices=[
+                    {
+                        "bdf": "0000:00:06.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                    },
+                ],
+                create_vfio_nodes=["0"],
+            )
+
+            # When CLI exhausts the shared timeout budget, Python fallback MUST be skipped
+            # rather than spending a second full timeout_s.
+            py_called = []
+
+            def _slow_cli(*args, **kwargs):
+                _time.sleep(0.25)
+                return False, "tpu-info timed out", {}
+
+            def _record_py(*args, **kwargs):
+                py_called.append(kwargs.get("timeout_s"))
+                return True, None, {}
+
+            with (
+                mock.patch.object(tpu_exporter, "_run_tpu_info", side_effect=_slow_cli),
+                mock.patch.object(tpu_exporter, "_query_tpu_info_python_metrics", side_effect=_record_py),
+            ):
+                snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin="tpu-info",
+                    tpu_info_timeout_s=0.2,
+                    runtime_metrics_addr="127.0.0.1:8431",
+                )
+            self.assertEqual(py_called, [])
+            self.assertFalse(snap.tpu_info_available)
+
+            # When CLI fails fast, Python fallback receives strictly the remaining shared budget.
+            def _fast_fail_cli(*args, **kwargs):
+                _time.sleep(0.05)
+                return False, "PermissionError", {}
+
+            with (
+                mock.patch.object(tpu_exporter, "_run_tpu_info", side_effect=_fast_fail_cli),
+                mock.patch.object(tpu_exporter, "_query_tpu_info_python_metrics", side_effect=_record_py),
+            ):
+                snap2 = tpu_exporter.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin="tpu-info",
+                    tpu_info_timeout_s=0.5,
+                    runtime_metrics_addr="127.0.0.1:8431",
+                )
+            self.assertEqual(len(py_called), 1)
+            self.assertLess(py_called[0], 0.5)
+            self.assertGreater(py_called[0], 0.05)
+            self.assertTrue(snap2.tpu_info_available)
+
     def _assert_valid_prometheus_text(self, text: str) -> None:
         lines = [ln for ln in text.splitlines() if ln.strip()]
         self.assertGreater(len(lines), 0)
