@@ -64,6 +64,10 @@ class BearerTokenAuthHook(AuthHook):
         *,
         exempt_paths: Iterable[str] = ("/health",),
     ) -> None:
+        if isinstance(tokens, (str, bytes)):
+            raise ValueError("tokens must be a list or mapping of token strings, not a scalar string")
+        if isinstance(exempt_paths, (str, bytes)):
+            raise ValueError("exempt_paths must be an iterable of path strings, not a scalar string")
         if isinstance(tokens, Mapping):
             self._token_principals: Dict[str, str] = {
                 str(tok): str(principal) for tok, principal in tokens.items() if tok

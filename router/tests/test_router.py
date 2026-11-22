@@ -317,6 +317,7 @@ class _MockTpuExporter(ThreadingHTTPServer):
         hbm_total_bytes: int = 16 * 1024**3,
         duty_cycle_percent: float = 25.0,
         generation: str = "v5e",
+        raw_body: Optional[str] = None,
     ) -> None:
         self.exporter_up = exporter_up
         self.health_status = health_status
@@ -324,6 +325,7 @@ class _MockTpuExporter(ThreadingHTTPServer):
         self.hbm_total_bytes = hbm_total_bytes
         self.duty_cycle_percent = duty_cycle_percent
         self.generation = generation
+        self.raw_body = raw_body
         super().__init__(("127.0.0.1", 0), _MockTpuExporterHandler)
 
     @property
@@ -332,6 +334,8 @@ class _MockTpuExporter(ThreadingHTTPServer):
         return f"http://{host}:{port}/metrics"
 
     def render(self) -> str:
+        if self.raw_body is not None:
+            return self.raw_body
         ratio = self.hbm_used_bytes / float(self.hbm_total_bytes)
         labels = (
             f'chip="0",pci_bdf="0000:00:04.0",device_id="0x0063",'
@@ -393,7 +397,9 @@ class _RecordingScalerHook(ScalerHook):
 
 
 def _start_server(srv: ThreadingHTTPServer) -> threading.Thread:
-    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread = threading.Thread(
+        target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+    )
     thread.start()
     return thread
 
@@ -1695,9 +1701,10 @@ class TestFreeTPURouter(unittest.TestCase):
         _, _, metrics_raw = _http_request(rport, "GET", "/metrics")
         metrics_txt = metrics_raw.decode("utf-8")
         self.assertIn(
-            'freetpu_router_requests_total{model="unknown-model",backend_id="none",status="503"} 1',
+            'freetpu_router_requests_total{model="_unknown",backend_id="none",status="503"} 1',
             metrics_txt,
         )
+        self.assertNotIn('model="unknown-model"', metrics_txt)
         self.assertIn(
             'freetpu_router_requests_total{model="m-503",backend_id="worker-503",status="503"} 1',
             metrics_txt,
@@ -1706,6 +1713,380 @@ class TestFreeTPURouter(unittest.TestCase):
             'freetpu_router_requests_total{model="m-dead",backend_id="worker-dead",status="502"} 1',
             metrics_txt,
         )
+
+    def test_metrics_model_label_bounded_for_unknown_and_wildcard_models(self) -> None:
+        known_worker = self._track(_MockOpenAIBackend("known-worker", ["known-model"]))
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            backends=[
+                BackendConfig(
+                    id="known-worker",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=known_worker.base_url,
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        # 20 unique unknown model names must collapse into one bounded "_unknown" series.
+        for idx in range(20):
+            status, _, _ = _http_request(
+                rport,
+                "POST",
+                "/v1/chat/completions",
+                body={
+                    "model": f"attacker-random-model-{idx}",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+            self.assertEqual(status, 503)
+
+        _, _, metrics_raw = _http_request(rport, "GET", "/metrics")
+        metrics_txt = metrics_raw.decode("utf-8")
+        self.assertIn(
+            'freetpu_router_requests_total{model="_unknown",backend_id="none",status="503"} 20',
+            metrics_txt,
+        )
+        self.assertNotIn("attacker-random-model-", metrics_txt)
+
+        # Wildcard backend: arbitrary client model names must collapse to "_other".
+        wc_worker = self._track(_MockOpenAIBackend("wildcard-worker", []))
+        wc_cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="round_robin",
+            backends=[
+                BackendConfig(
+                    id="wildcard-worker",
+                    type="cloud-tpu-v5e",
+                    base_url=wc_worker.base_url,
+                    models=["*"],
+                    discover_models=False,
+                )
+            ],
+        )
+        wc_router = self._track(create_router_server(wc_cfg))
+        wport = wc_router.server_address[1]
+        for idx in range(20):
+            status, _, _ = _http_request(
+                wport,
+                "POST",
+                "/v1/chat/completions",
+                body={
+                    "model": f"wildcard-arbitrary-{idx}",
+                    "messages": [{"role": "user", "content": "ok"}],
+                },
+            )
+            self.assertEqual(status, 200)
+
+        _, _, wc_metrics_raw = _http_request(wport, "GET", "/metrics")
+        wc_metrics_txt = wc_metrics_raw.decode("utf-8")
+        self.assertIn(
+            'freetpu_router_requests_total{model="_other",backend_id="wildcard-worker",status="200"} 20',
+            wc_metrics_txt,
+        )
+        self.assertNotIn("wildcard-arbitrary-", wc_metrics_txt)
+        self.assertLessEqual(len(wc_router.engine._rr_cursors), 1)
+
+    def test_scalar_bearer_tokens_and_exempt_paths_rejected(self) -> None:
+        base_backend = BackendConfig(
+            id="b1",
+            type="pixel-tpu",
+            base_url="http://127.0.0.1:8081/v1",
+        )
+        with self.assertRaises(ValueError):
+            RouterConfig(
+                backends=[base_backend],
+                auth={"type": "bearer", "tokens": "secret-scalar"},
+            )
+        with self.assertRaises(ValueError):
+            RouterConfig(
+                backends=[base_backend],
+                auth={"type": "bearer", "tokens": ["valid"], "tokens_env": "MY_TOKEN_ENV"},
+            )
+        with self.assertRaises(ValueError):
+            RouterConfig(
+                backends=[base_backend],
+                auth={"type": "bearer", "tokens": ["valid"], "exempt_paths": "/health"},
+            )
+        with self.assertRaises(ValueError):
+            BearerTokenAuthHook("secret-scalar")
+
+        bad_cfg_path = Path(self._tmpdir.name) / "scalar_tokens.json"
+        bad_cfg_path.write_text(
+            json.dumps(
+                {
+                    "auth": {"type": "bearer", "tokens": "secret-scalar"},
+                    "backends": [
+                        {
+                            "id": "b1",
+                            "base_url": "http://127.0.0.1:8081/v1",
+                            "models": ["m1"],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        stderr_buf = io.StringIO()
+        with redirect_stderr(stderr_buf):
+            rc = router_main(["--check-config", "--config", str(bad_cfg_path)])
+        self.assertNotEqual(rc, 0)
+        self.assertIn("auth.tokens", stderr_buf.getvalue())
+
+        # Direct mutation before build_hooks_from_config must also reject scalar tokens.
+        cfg = RouterConfig(
+            backends=[base_backend],
+            auth={"type": "bearer", "tokens": ["valid-token"]},
+        )
+        cfg.auth = {"type": "bearer", "tokens": "scalar-after-init"}
+        with self.assertRaises(ValueError):
+            build_hooks_from_config(cfg)
+
+    def test_sse_role_only_event_before_eof_fails_over_to_healthy_fallback(self) -> None:
+        spot = self._track(_MockOpenAIBackend("spot-role-only", ["m-role"]))
+        healthy = self._track(_MockOpenAIBackend("healthy-role-backup", ["m-role"]))
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="cheapest",
+            failure_cooldown_s=30.0,
+            backends=[
+                BackendConfig(
+                    id="spot-role-only",
+                    type="cloud-tpu-v5e",
+                    spot=True,
+                    base_url=spot.base_url,
+                    cost_per_1m_prompt_usd=0.10,
+                    cost_per_1m_completion_usd=0.10,
+                ),
+                BackendConfig(
+                    id="healthy-role-backup",
+                    type="cloud-tpu-v6e",
+                    spot=False,
+                    base_url=healthy.base_url,
+                    cost_per_1m_prompt_usd=0.50,
+                    cost_per_1m_completion_usd=0.50,
+                ),
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        # Spot sends a complete role-only SSE event and is immediately preempted (EOF).
+        role_chunk = json.dumps(
+            {
+                "id": "chatcmpl-spot",
+                "object": "chat.completion.chunk",
+                "model": "m-role",
+                "choices": [
+                    {"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}
+                ],
+            }
+        )
+        spot.raw_sse_bytes = f"data: {role_chunk}\n\n".encode("utf-8")
+
+        status, hdrs, body = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-role",
+                "stream": True,
+                "messages": [{"role": "user", "content": "survive role-only eof"}],
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(hdrs["x-freetpu-backend"], "healthy-role-backup")
+        self.assertEqual(hdrs["x-freetpu-failovers"], "1")
+        sse_text = body.decode("utf-8")
+        self.assertIn("healthy-role-backup", sse_text)
+        self.assertIn("data: [DONE]", sse_text)
+
+        # Verify role-only event followed by a valid finish_reason terminator commits cleanly
+        # and preserves the buffered role-only event in exact order.
+        router.engine._backends[0].cooldown_until_monotonic = 0.0
+        stop_chunk = json.dumps(
+            {
+                "id": "chatcmpl-spot",
+                "object": "chat.completion.chunk",
+                "model": "m-role",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+        )
+        spot.raw_sse_bytes = (
+            f"data: {role_chunk}\n\ndata: {stop_chunk}\n\ndata: [DONE]\n\n"
+        ).encode("utf-8")
+
+        status, hdrs, body = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-role",
+                "stream": True,
+                "messages": [{"role": "user", "content": "empty valid stop"}],
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(hdrs["x-freetpu-backend"], "spot-role-only")
+        self.assertEqual(hdrs["x-freetpu-failovers"], "0")
+        sse_text = body.decode("utf-8")
+        self.assertIn('"role": "assistant"', sse_text)
+        self.assertIn('"finish_reason": "stop"', sse_text)
+
+    def test_create_router_server_runs_periodic_health_polling_in_serve_forever(self) -> None:
+        backend = self._track(
+            _MockOpenAIBackend("recovering-worker", ["m-poll"], status_code=503)
+        )
+        scaler = _RecordingScalerHook()
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            health_poll_interval_s=0.05,
+            backend_idle_timeout_s=0.04,
+            backends=[
+                BackendConfig(
+                    id="recovering-worker",
+                    type="cloud-tpu-v5e",
+                    spot=True,
+                    base_url=backend.base_url,
+                )
+            ],
+        )
+        # Use create_router_server() + serve_forever() directly without calling
+        # start_background_poller() manually.
+        router = self._track(create_router_server(cfg, scaler_hook=scaler))
+        rport = router.server_address[1]
+
+        status, _, _ = _http_request(rport, "GET", "/health")
+        self.assertEqual(status, 503)
+
+        # Recover the backend; background poller started by serve_forever() must detect it
+        # and also emit idle scaler events automatically.
+        backend.status_code = 200
+        deadline = time.monotonic() + 1.5
+        recovered = False
+        while time.monotonic() < deadline:
+            st, _, _ = _http_request(rport, "GET", "/health")
+            if st == 200 and len(scaler.idle_events) >= 1:
+                recovered = True
+                break
+            time.sleep(0.05)
+
+        self.assertTrue(recovered, "Background poller did not refresh backend or idle hooks")
+        self.assertEqual(scaler.idle_events[0].backend_id, "recovering-worker")
+
+    def test_non_finite_tpu_telemetry_contained_to_affected_backend(self) -> None:
+        bad_exporter = self._track(
+            _MockTpuExporter(
+                raw_body=(
+                    "freetpu_exporter_up 1\n"
+                    "freetpu_tpu_devices_discovered NaN\n"
+                    'freetpu_tpu_health_status{chip="0"} +Inf\n'
+                    'freetpu_tpu_hbm_used_bytes{chip="0"} +Inf\n'
+                    'freetpu_tpu_hbm_total_bytes{chip="0"} 17179869184\n'
+                    'freetpu_tpu_hbm_utilization_ratio{chip="0"} NaN\n'
+                    'freetpu_tpu_active_pids{chip="0"} -Inf\n'
+                )
+            )
+        )
+        good_exporter = self._track(
+            _MockTpuExporter(
+                health_status=1,
+                hbm_used_bytes=2 * 1024**3,
+                hbm_total_bytes=16 * 1024**3,
+                duty_cycle_percent=15.0,
+            )
+        )
+        bad_tpu = self._track(_MockOpenAIBackend("tpu-bad-tele", ["m-nan"]))
+        good_tpu = self._track(_MockOpenAIBackend("tpu-good-tele", ["m-nan"]))
+
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="cheapest",
+            backends=[
+                BackendConfig(
+                    id="tpu-bad-tele",
+                    type="cloud-tpu-v5e",
+                    base_url=bad_tpu.base_url,
+                    tpu_exporter_url=bad_exporter.metrics_url,
+                    cost_per_1m_prompt_usd=0.05,
+                    cost_per_1m_completion_usd=0.05,
+                ),
+                BackendConfig(
+                    id="tpu-good-tele",
+                    type="cloud-tpu-v6e",
+                    base_url=good_tpu.base_url,
+                    tpu_exporter_url=good_exporter.metrics_url,
+                    cost_per_1m_prompt_usd=0.50,
+                    cost_per_1m_completion_usd=0.50,
+                ),
+            ],
+        )
+        # Startup initial probe must not raise and must still probe tpu-good-tele.
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        status, _, hbody = _http_request(rport, "GET", "/health")
+        self.assertEqual(status, 200)
+        hjson = json.loads(hbody)
+        self.assertEqual(hjson["healthy_backends"], 1)
+        bad_snap = next(b for b in hjson["backends"] if b["id"] == "tpu-bad-tele")
+        good_snap = next(b for b in hjson["backends"] if b["id"] == "tpu-good-tele")
+        self.assertFalse(bad_snap["healthy"])
+        self.assertEqual(bad_snap["unhealthy_reason"], "tpu_exporter_invalid_metrics")
+        self.assertTrue(good_snap["healthy"])
+
+        status, hdrs, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={"model": "m-nan", "messages": [{"role": "user", "content": "route around NaN"}]},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(hdrs["x-freetpu-backend"], "tpu-good-tele")
+
+    def test_bearer_auth_honors_explicit_empty_exempt_paths(self) -> None:
+        backend = self._track(_MockOpenAIBackend("auth-strict", ["m-strict"]))
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            auth={
+                "type": "bearer",
+                "tokens": ["strict-secret-token"],
+                "exempt_paths": [],
+            },
+            backends=[
+                BackendConfig(
+                    id="auth-strict",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=backend.base_url,
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        # With exempt_paths=[], even /health must require bearer auth.
+        status, _, _ = _http_request(rport, "GET", "/health")
+        self.assertEqual(status, 401)
+
+        status, _, _ = _http_request(
+            rport,
+            "GET",
+            "/health",
+            headers={"Authorization": "Bearer strict-secret-token"},
+        )
+        self.assertEqual(status, 200)
 
 
 def run_self_tests(verbosity: int = 1) -> int:

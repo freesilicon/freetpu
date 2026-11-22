@@ -239,6 +239,31 @@ class RouterConfig:
                 raise ValueError(
                     f"Invalid auth.type {auth_type!r}; expected one of {VALID_AUTH_TYPES}"
                 )
+        if auth_type == "bearer":
+            if "tokens" in self.auth and self.auth["tokens"] is not None:
+                raw_tokens = self.auth["tokens"]
+                if not isinstance(raw_tokens, (list, tuple)) or not all(
+                    isinstance(tok, str) and tok.strip() for tok in raw_tokens
+                ):
+                    raise ValueError(
+                        "auth.tokens must be a list of non-empty strings"
+                    )
+            if "tokens_env" in self.auth and self.auth["tokens_env"] is not None:
+                raw_env = self.auth["tokens_env"]
+                if not isinstance(raw_env, (list, tuple)) or not all(
+                    isinstance(name, str) and name.strip() for name in raw_env
+                ):
+                    raise ValueError(
+                        "auth.tokens_env must be a list of non-empty environment variable names"
+                    )
+            if "exempt_paths" in self.auth and self.auth["exempt_paths"] is not None:
+                raw_exempt = self.auth["exempt_paths"]
+                if not isinstance(raw_exempt, (list, tuple)) or not all(
+                    isinstance(path, str) and path.strip() for path in raw_exempt
+                ):
+                    raise ValueError(
+                        "auth.exempt_paths must be a list of non-empty path strings"
+                    )
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "RouterConfig":

@@ -58,6 +58,9 @@ from router.tpu_telemetry import (  # noqa: E402
 __version__ = "0.1.0"
 
 RETRYABLE_STATUS_CODES = (502, 503, 504)
+UNKNOWN_MODEL_LABEL = "_unknown"
+OTHER_MODEL_LABEL = "_other"
+MAX_METRIC_MODEL_LABELS = 256
 
 
 def _join_backend_url(base_url: str, endpoint: str) -> Tuple[str, str, int, str]:
@@ -199,6 +202,37 @@ def _extract_non_stream_usage(
     return prompt_tokens, completion_tokens
 
 
+def _sse_event_should_commit(payload_bytes: bytes) -> bool:
+    """Return True when a complete SSE data event carries output or a terminator.
+
+    Role-only / empty-delta chunks (e.g. `{"choices":[{"delta":{"role":"assistant"}}]}`)
+    are buffered so Spot preemption before the first generated token still fails over.
+    """
+    if not payload_bytes:
+        return False
+    if payload_bytes == b"[DONE]":
+        return True
+    try:
+        obj = json.loads(payload_bytes.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return True
+    if not isinstance(obj, Mapping):
+        return True
+    if _extract_choice_output_text(obj):
+        return True
+    choices = obj.get("choices")
+    if isinstance(choices, list):
+        for choice in choices:
+            if isinstance(choice, Mapping) and choice.get("finish_reason") is not None:
+                return True
+        if not choices and (
+            isinstance(obj.get("usage"), Mapping) or obj.get("error") is not None
+        ):
+            return True
+        return False
+    return True
+
+
 @dataclass
 class BackendState:
     """Mutable runtime health, latency, model inventory, and TPU telemetry for a backend."""
@@ -329,14 +363,39 @@ def build_hooks_from_config(
                 )
             resolved_auth = load_hook_from_spec(spec.strip(), auth_cfg.get("kwargs"))
         elif auth_type == "bearer":
-            tokens: List[str] = [str(t) for t in auth_cfg.get("tokens") or [] if t]
-            for env_name in auth_cfg.get("tokens_env") or []:
+            raw_tokens = auth_cfg.get("tokens")
+            tokens: List[str] = []
+            if raw_tokens is not None:
+                if not isinstance(raw_tokens, (list, tuple)) or not all(
+                    isinstance(t, str) and t.strip() for t in raw_tokens
+                ):
+                    raise ValueError("auth.tokens must be a list of non-empty strings")
+                tokens.extend(t for t in raw_tokens)
+            raw_tokens_env = auth_cfg.get("tokens_env")
+            if raw_tokens_env is not None:
+                if not isinstance(raw_tokens_env, (list, tuple)) or not all(
+                    isinstance(e, str) and e.strip() for e in raw_tokens_env
+                ):
+                    raise ValueError(
+                        "auth.tokens_env must be a list of non-empty environment variable names"
+                    )
                 import os
 
-                val = os.environ.get(str(env_name), "").strip()
-                if val:
-                    tokens.append(val)
-            exempt = auth_cfg.get("exempt_paths") or ("/health",)
+                for env_name in raw_tokens_env:
+                    val = os.environ.get(env_name.strip(), "").strip()
+                    if val:
+                        tokens.append(val)
+            if "exempt_paths" in auth_cfg and auth_cfg["exempt_paths"] is not None:
+                raw_exempt = auth_cfg["exempt_paths"]
+                if not isinstance(raw_exempt, (list, tuple)) or not all(
+                    isinstance(p, str) and p.strip() for p in raw_exempt
+                ):
+                    raise ValueError(
+                        "auth.exempt_paths must be a list of non-empty path strings"
+                    )
+                exempt: Sequence[str] = [p.strip() for p in raw_exempt]
+            else:
+                exempt = ("/health",)
             resolved_auth = BearerTokenAuthHook(tokens, exempt_paths=exempt)
         elif auth_type in (None, "allow_all"):
             resolved_auth = AllowAllAuthHook()
@@ -393,25 +452,30 @@ class RouterEngine:
             BackendState(config=b) for b in config.backends
         ]
         self._rr_cursors: Dict[str, int] = {}
+        self._metric_models_seen: set[str] = set()
+        self._poller_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._poll_thread: Optional[threading.Thread] = None
 
     def start_background_poller(self) -> None:
-        if self._poll_thread is not None and self._poll_thread.is_alive():
-            return
-        self._stop_event.clear()
-        self._poll_thread = threading.Thread(
-            target=self._poll_loop,
-            name="freetpu-router-poller",
-            daemon=True,
-        )
-        self._poll_thread.start()
+        with self._poller_lock:
+            if self._poll_thread is not None and self._poll_thread.is_alive():
+                return
+            self._stop_event.clear()
+            self._poll_thread = threading.Thread(
+                target=self._poll_loop,
+                name="freetpu-router-poller",
+                daemon=True,
+            )
+            self._poll_thread.start()
 
     def stop_background_poller(self) -> None:
-        self._stop_event.set()
-        if self._poll_thread is not None:
-            self._poll_thread.join(timeout=2.0)
+        with self._poller_lock:
+            self._stop_event.set()
+            thread = self._poll_thread
             self._poll_thread = None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
 
     def _poll_loop(self) -> None:
         while not self._stop_event.wait(self.config.health_poll_interval_s):
@@ -424,8 +488,39 @@ class RouterEngine:
 
     def refresh_all_backends(self) -> None:
         for state in self._backends:
-            if state.config.enabled:
+            if not state.config.enabled:
+                continue
+            try:
                 self.probe_backend(state)
+            except Exception as exc:
+                with self._lock:
+                    state.last_probe_unix = time.time()
+                    state.healthy = False
+                    state.unhealthy_reason = f"probe_exception: {exc}"
+
+    def metric_model_label(
+        self,
+        model: str,
+        *,
+        matched_backend: bool = False,
+    ) -> str:
+        """Map a client-supplied model name to a bounded Prometheus label."""
+        with self._lock:
+            is_known = False
+            if model and model != "*":
+                for b in self._backends:
+                    if model in b.config.models or model in b.discovered_models:
+                        is_known = True
+                        break
+            if is_known:
+                if (
+                    model in self._metric_models_seen
+                    or len(self._metric_models_seen) < MAX_METRIC_MODEL_LABELS
+                ):
+                    self._metric_models_seen.add(model)
+                    return model
+                return OTHER_MODEL_LABEL
+            return OTHER_MODEL_LABEL if matched_backend else UNKNOWN_MODEL_LABEL
 
     def check_idle_backends(self) -> None:
         now_m = time.monotonic()
@@ -668,8 +763,9 @@ class RouterEngine:
 
             # round_robin
             eligible.sort(key=lambda b: (b.config.priority, b.config.id))
-            cursor = self._rr_cursors.get(model, 0)
-            self._rr_cursors[model] = (cursor + 1) % len(eligible)
+            rr_key = self.metric_model_label(model, matched_backend=True)
+            cursor = self._rr_cursors.get(rr_key, 0)
+            self._rr_cursors[rr_key] = (cursor + 1) % len(eligible)
             offset = cursor % len(eligible)
             return eligible[offset:] + eligible[:offset]
 
@@ -761,8 +857,9 @@ class RouterEngine:
         status_code: int,
     ) -> None:
         est_cost = backend.config.estimate_cost_usd(prompt_tokens, completion_tokens)
+        metric_model = self.metric_model_label(model, matched_backend=True)
         self.metrics.record_request(
-            model=model,
+            model=metric_model,
             backend_id=backend.config.id,
             status=status_code,
             prompt_tokens=prompt_tokens,
@@ -824,6 +921,17 @@ class FreeTPURouterServer(ThreadingHTTPServer):
         self.engine = engine
         self.verbose = verbose
         super().__init__(server_address, _RouterRequestHandler)
+
+    def serve_forever(self, poll_interval: float = 0.5) -> None:
+        self.engine.start_background_poller()
+        try:
+            super().serve_forever(poll_interval=poll_interval)
+        finally:
+            self.engine.stop_background_poller()
+
+    def server_close(self) -> None:
+        self.engine.stop_background_poller()
+        super().server_close()
 
 
 class _RouterRequestHandler(BaseHTTPRequestHandler):
@@ -1158,7 +1266,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             if prev_failure is not None:
                 failovers += 1
                 engine.metrics.record_failover(
-                    model=model,
+                    model=engine.metric_model_label(model, matched_backend=True),
                     from_backend=prev_failure[0],
                     to_backend=backend.config.id,
                     reason=prev_failure[1],
@@ -1310,7 +1418,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 reason="no_healthy_backend",
             )
             engine.metrics.record_request(
-                model=model,
+                model=engine.metric_model_label(model, matched_backend=False),
                 backend_id="none",
                 status=503,
                 prompt_tokens=0,
@@ -1332,7 +1440,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             return
 
         engine.metrics.record_request(
-            model=model,
+            model=engine.metric_model_label(model, matched_backend=True),
             backend_id=last_attempted_backend.config.id,
             status=last_error_status,
             prompt_tokens=0,
@@ -1378,31 +1486,43 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         engine = self.server.engine
         pre_commit_lines: List[bytes] = []
         pre_commit_bytes = 0
+        pre_commit_events = 0
         max_pre_commit_bytes = 1024 * 1024
+        max_pre_commit_events = 64
         first_chunk_time: Optional[float] = None
-        event_has_data = False
+        pending_event_data: List[bytes] = []
 
         # Phase 1: upstream-only read through HTTPResponse.readline() (decodes chunked framing).
+        # Buffer keepalive comments and role-only/empty-delta events until generated output or
+        # a valid stream terminator arrives.
         while True:
             line = resp.readline()
             if not line:
-                # EOF before a complete SSE data event -> retryable failure.
+                # EOF before generated output or valid stream terminator -> retryable failure.
                 return False
             pre_commit_bytes += len(line)
             if pre_commit_bytes > max_pre_commit_bytes:
                 return False
             pre_commit_lines.append(line)
             if line in (b"\n", b"\r\n", b"\r"):
-                if event_has_data:
-                    first_chunk_time = time.monotonic()
-                    break
-                event_has_data = False
+                if pending_event_data:
+                    pre_commit_events += 1
+                    payload_bytes = b"\n".join(pending_event_data).strip()
+                    pending_event_data.clear()
+                    if _sse_event_should_commit(payload_bytes):
+                        first_chunk_time = time.monotonic()
+                        break
+                    if pre_commit_events >= max_pre_commit_events:
+                        return False
                 continue
             content_line = line.rstrip(b"\r\n")
             if content_line.startswith(b":"):
                 continue
-            if content_line.startswith(b"data:") and content_line[5:].strip():
-                event_has_data = True
+            if content_line.startswith(b"data:"):
+                data_val = content_line[5:]
+                if data_val.startswith(b" "):
+                    data_val = data_val[1:]
+                pending_event_data.append(data_val)
 
         # Phase 2: upstream delivered a complete SSE data event -> commit response.
         # Downstream write errors from here on must never trigger backend failover.
@@ -1660,7 +1780,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         probe_on_start=not args.no_initial_probe,
         verbose=args.verbose,
     )
-    server.engine.start_background_poller()
     bound_host, bound_port = server.server_address[:2]
     print(
         f"FreeTPU Router v{__version__} listening on http://{bound_host}:{bound_port}/v1 "
@@ -1672,7 +1791,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except KeyboardInterrupt:
         pass
     finally:
-        server.engine.stop_background_poller()
         server.server_close()
     return 0
 

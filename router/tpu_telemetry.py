@@ -17,11 +17,25 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import http.client
+import math
 import re
 import ssl
 import time
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
+
+_KNOWN_TPU_METRICS = frozenset(
+    {
+        "freetpu_exporter_up",
+        "freetpu_tpu_devices_discovered",
+        "freetpu_tpu_health_status",
+        "freetpu_tpu_hbm_used_bytes",
+        "freetpu_tpu_hbm_total_bytes",
+        "freetpu_tpu_hbm_utilization_ratio",
+        "freetpu_tpu_duty_cycle_percent",
+        "freetpu_tpu_active_pids",
+    }
+)
 
 _METRIC_LINE_RE = re.compile(
     r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?\s+([+-]?(?:[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|NaN|[+-]?Inf))(?:\s+[0-9]+)?$"
@@ -105,8 +119,13 @@ def summarize_tpu_samples(
     duty_by_chip: Dict[str, float] = {}
     pids_by_chip: Dict[str, int] = {}
     generations_seen: set[str] = set()
+    non_finite_metrics: List[str] = []
 
     for sample in samples:
+        if sample.name in _KNOWN_TPU_METRICS and not math.isfinite(sample.value):
+            non_finite_metrics.append(sample.name)
+            continue
+
         chip_key = sample.labels.get("chip", sample.labels.get("pci_bdf", "0"))
         gen = sample.labels.get("generation")
         if gen:
@@ -135,7 +154,9 @@ def summarize_tpu_samples(
         if chip_key not in hbm_ratio_by_chip:
             total = hbm_total_by_chip.get(chip_key)
             if total and total > 0:
-                hbm_ratio_by_chip[chip_key] = used / float(total)
+                ratio = used / float(total)
+                if math.isfinite(ratio):
+                    hbm_ratio_by_chip[chip_key] = ratio
 
     total_chips = max(len(health_by_chip), devices_discovered)
     healthy_chips = sum(1 for v in health_by_chip.values() if v >= 1.0)
@@ -144,7 +165,11 @@ def summarize_tpu_samples(
     duties = list(duty_by_chip.values())
 
     error_msg: Optional[str] = None
-    if not saw_exporter_up:
+    if non_finite_metrics:
+        exporter_up = False
+        bad_names = ", ".join(sorted(set(non_finite_metrics)))
+        error_msg = f"non-finite telemetry values in {bad_names}"
+    elif not saw_exporter_up:
         exporter_up = False
         error_msg = "missing freetpu_exporter_up metric"
 
@@ -177,7 +202,10 @@ def evaluate_tpu_readiness(
     if not telemetry.reachable:
         return False, "tpu_exporter_unreachable"
     if not telemetry.exporter_up:
-        if telemetry.error == "missing freetpu_exporter_up metric":
+        if telemetry.error and (
+            telemetry.error == "missing freetpu_exporter_up metric"
+            or telemetry.error.startswith("non-finite telemetry")
+        ):
             return False, "tpu_exporter_invalid_metrics"
         return False, "tpu_exporter_down"
     if telemetry.total_chips > 0 and telemetry.healthy_chips == 0:
