@@ -123,8 +123,9 @@ def xla_matmul_silu_rhs_t(a, b_t):
 
 xla_ref = xla_matmul_silu(a_mat, b_mat)
 xla_ref.block_until_ready()
-if not bool(jnp.all(jnp.isfinite(xla_ref)).item()):
-    raise RuntimeError("Part A XLA baseline produced nonfinite outputs")
+xla_ref_max = float(jnp.max(jnp.abs(xla_ref.astype(jnp.float32))))
+if not bool(jnp.all(jnp.isfinite(xla_ref)).item()) or xla_ref_max <= 0.0:
+    raise RuntimeError("Part A XLA baseline produced nonfinite or zero outputs")
 xla_med_s, xla_min_s = bench_fn(xla_matmul_silu, a_mat, b_mat, warmup=5, iters=30)
 xla_t_med_s, xla_t_min_s = bench_fn(
     xla_matmul_silu_rhs_t, a_mat, b_mat_t, warmup=5, iters=30
@@ -410,8 +411,17 @@ def make_async_copy_db_gemm_silu(
     return run
 
 
-PART_A_MAX_ABS_ERR_TOL = 0.05
-PART_B_MAX_ABS_ERR_TOL = 0.1
+PART_A_REL_ERR_TOL = 0.05
+PART_B_REL_ERR_TOL = 0.05
+
+
+def _parity_passes(max_abs_err: Optional[float], ref_max: float, all_finite: bool, rel_tol: float) -> Tuple[bool, Optional[float]]:
+    if not all_finite or max_abs_err is None or not math.isfinite(max_abs_err) or ref_max <= 0.0:
+        return False, None
+    rel_err = max_abs_err / ref_max
+    # Also enforce a tiny floor tolerance just above 1x BF16 ULP for near-zero scales.
+    abs_tol = max(rel_tol * ref_max, 1e-4)
+    return (math.isfinite(rel_err) and rel_err <= rel_tol and max_abs_err <= abs_tol), rel_err
 
 
 def run_gemm_silu_cfg(label, fn, lhs, rhs):
@@ -424,10 +434,8 @@ def run_gemm_silu_cfg(label, fn, lhs, rhs):
         max_abs_err = float(
             jnp.max(jnp.abs(out.astype(jnp.float32) - xla_ref.astype(jnp.float32)))
         )
-        parity_ok = (
-            all_finite
-            and math.isfinite(max_abs_err)
-            and max_abs_err <= PART_A_MAX_ABS_ERR_TOL
+        parity_ok, rel_err = _parity_passes(
+            max_abs_err, xla_ref_max, all_finite, PART_A_REL_ERR_TOL
         )
         med_s, min_s = bench_fn(fn, lhs, rhs, warmup=4, iters=25)
         med_tflops = FLOPS_GEMM / (med_s * 1e12)
@@ -439,6 +447,7 @@ def run_gemm_silu_cfg(label, fn, lhs, rhs):
             "parity_ok": parity_ok,
             "tpu_custom_call": has_tpu_custom_call,
             "max_abs_err": max_abs_err,
+            "rel_max_err": round(rel_err, 6) if rel_err is not None else None,
             "median_us": round(med_s * 1e6, 2),
             "min_us": round(min_s * 1e6, 2),
             "median_tflops": round(med_tflops, 2),
@@ -664,13 +673,16 @@ for B, H, Q, K, D in attn_cases:
 
     xla_attn_fn = jax.jit(lambda qq, kk, vv: xla_causal_attention(qq, kk, vv, sm_scale))
     xla_out = None
+    xla_out_max = 0.0
     xa_med_s = None
     try:
         cand_xla_out = xla_attn_fn(q_arr, k_arr, v_arr)
         cand_xla_out.block_until_ready()
-        if not bool(jnp.all(jnp.isfinite(cand_xla_out)).item()):
-            raise RuntimeError("dense XLA causal attention produced nonfinite values")
+        cand_max = float(jnp.max(jnp.abs(cand_xla_out.astype(jnp.float32))))
+        if not bool(jnp.all(jnp.isfinite(cand_xla_out)).item()) or cand_max <= 0.0:
+            raise RuntimeError("dense XLA causal attention produced nonfinite or zero values")
         xla_out = cand_xla_out
+        xla_out_max = cand_max
         xa_med_s, xa_min_s = bench_fn(xla_attn_fn, q_arr, k_arr, v_arr, warmup=3, iters=15)
         xa_rec = {
             "shape": f"B={B},H={H},Q={Q},K={K},D={D}",
@@ -720,12 +732,10 @@ for B, H, Q, K, D in attn_cases:
                 if xla_out is not None
                 else None
             )
-            parity_ok = (
-                xla_out is not None
-                and fa_finite
-                and err is not None
-                and math.isfinite(err)
-                and err <= PART_B_MAX_ABS_ERR_TOL
+            parity_ok, rel_err = (
+                _parity_passes(err, xla_out_max, fa_finite, PART_B_REL_ERR_TOL)
+                if xla_out is not None
+                else (False, None)
             )
             fa_med_s, fa_min_s = bench_fn(
                 run_fa, q_arr, k_arr, v_arr, warmup=3, iters=20
@@ -744,6 +754,7 @@ for B, H, Q, K, D in attn_cases:
                 "parity_ok": parity_ok,
                 "tpu_custom_call": has_tpu_cc,
                 "max_abs_err": err,
+                "rel_max_err": round(rel_err, 6) if rel_err is not None else None,
                 "median_us": round(fa_med_s * 1e6, 2),
                 "min_us": round(fa_min_s * 1e6, 2),
                 "effective_tflops_median": round(causal_flops / (fa_med_s * 1e12), 2),

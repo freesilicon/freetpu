@@ -87,9 +87,16 @@ def main() -> None:
       (8192, 8192, 8192, jnp.int8, jnp.int32),
       (16384, 16384, 16384, jnp.int8, jnp.int32),
   ]
+  bf16_ok = 0
+  int8_ok = 0
+  bw_ok = 0
   for case in cases:
     try:
       print("MATMUL:", json.dumps(bench_matmul(*case)))
+      if case[3] == jnp.int8:
+        int8_ok += 1
+      else:
+        bf16_ok += 1
     except Exception as e:
       print("MATMUL_ERR:", case[:3], repr(e)[:200])
 
@@ -125,10 +132,15 @@ def main() -> None:
               "peak_gb_s": round(total_b / (min_s * 1e9), 2),
           }),
       )
+      bw_ok += 1
       del x, y, s
     except Exception as e:
       print("HBM_BW_ERR:", n_elems, repr(e)[:200])
 
+  if bf16_ok < 1 or int8_ok < 1 or bw_ok < 1:
+    raise RuntimeError(
+        f"Raw TPU benchmark incomplete: bf16_ok={bf16_ok}, int8_ok={int8_ok}, bw_ok={bw_ok}"
+    )
   print("=== RAW_BENCH_COMPLETE ===")
 
 

@@ -314,9 +314,6 @@ def main() -> None:
     raise RuntimeError(f"Refusing symlinked header target: {hdr_path}")
   subprocess.run(["curl", "-fsSL", PJRT_HEADER_URL, "-o", hdr_path], check=True)
   so_path = probe_header_and_live_abi(hdr_path)
-  write_bytes_nofollow(
-      os.path.join(ir_dir, "libtpu_path.txt"), (so_path + "\n").encode("utf-8")
-  )
 
   try:
     from jax.extend import backend as jax_backend

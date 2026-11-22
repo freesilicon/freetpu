@@ -939,22 +939,10 @@ void bench_large_gemm(TpuRuntime& rt, const std::string& ir_dir, int64_t M,
   rt.tpuFreeExec(exec);
 }
 
-std::string resolve_libtpu_path(const std::string& ir_dir) {
+std::string resolve_libtpu_path() {
   const char* env_lib = std::getenv("LIBTPU_PATH");
   if (env_lib != nullptr && env_lib[0] != '\0') {
     return env_lib;
-  }
-  std::ifstream in(ir_dir + "/libtpu_path.txt");
-  std::string file_path;
-  if (in && std::getline(in, file_path)) {
-    while (!file_path.empty() &&
-           (file_path.back() == '\r' || file_path.back() == '\n' ||
-            file_path.back() == ' ' || file_path.back() == '\t')) {
-      file_path.pop_back();
-    }
-    if (!file_path.empty()) {
-      return file_path;
-    }
   }
 #ifdef FREETPU_DEFAULT_LIBTPU_PATH
   return FREETPU_DEFAULT_LIBTPU_PATH;
@@ -980,7 +968,7 @@ std::string resolve_default_ir_dir() {
 int main() {
   try {
     const std::string ir_dir = resolve_default_ir_dir();
-    const std::string libtpu_path = resolve_libtpu_path(ir_dir);
+    const std::string libtpu_path = resolve_libtpu_path();
 
     TpuRuntime rt;
     rt.tpuInit(libtpu_path);

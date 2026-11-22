@@ -1467,30 +1467,33 @@ for batch in (1, 32):
         w8_xla_fn, w8_weights, x_tok, kc, vc
     )
 
-    p_gbs = total_bytes / (p_med_s * 1e9)
+    p_ok = W8A16_MODE is not None
+    p_gbs = (total_bytes / (p_med_s * 1e9)) if p_ok else None
     x_gbs = total_bytes / (x_med_s * 1e9)
     print(
         "LLAMA8B_32L_W8A16:",
         json.dumps(
             {
+                "mode": f"{W8A16_MODE[0]}/{W8A16_MODE[1]}" if p_ok else "fallback_xla",
+                "pallas_fallback_to_xla": not p_ok,
                 "batch": batch,
                 "kv_cache_shape": [N_LAYERS, batch, N_KV_HEADS, KV_SEQ, HEAD_DIM],
                 "total_bytes_read_gb": round(total_bytes / 1e9, 4),
                 "weight_gb": round(w8_weight_bytes / 1e9, 4),
                 "kv_mb": round(kv_bytes / 1e6, 2),
-                "scan_tpu_custom_call_count": p_cc_count,
+                "scan_tpu_custom_call_count": p_cc_count if p_ok else 0,
                 "step0_max_abs_err": step0_err,
-                "pallas_compile_s": round(p_compile_s, 2),
-                "pallas_ms_per_step": round(p_med_s * 1e3, 3),
-                "pallas_tok_per_s": round(batch / p_med_s, 2),
-                "pallas_gb_s": round(p_gbs, 2),
-                "pallas_pct_819": round(100.0 * p_gbs / PEAK_HBM_GBS, 2),
+                "pallas_compile_s": round(p_compile_s, 2) if p_ok else None,
+                "pallas_ms_per_step": round(p_med_s * 1e3, 3) if p_ok else None,
+                "pallas_tok_per_s": round(batch / p_med_s, 2) if p_ok else None,
+                "pallas_gb_s": round(p_gbs, 2) if p_gbs is not None else None,
+                "pallas_pct_819": round(100.0 * p_gbs / PEAK_HBM_GBS, 2) if p_gbs is not None else None,
                 "xla_compile_s": round(x_compile_s, 2),
                 "xla_ms_per_step": round(x_med_s * 1e3, 3),
                 "xla_tok_per_s": round(batch / x_med_s, 2),
                 "xla_gb_s": round(x_gbs, 2),
                 "xla_pct_819": round(100.0 * x_gbs / PEAK_HBM_GBS, 2),
-                "speedup": round(x_med_s / p_med_s, 2),
+                "speedup": round(x_med_s / p_med_s, 2) if p_ok else None,
                 "hbm": get_hbm_stats(),
             }
         ),
@@ -1643,32 +1646,33 @@ for batch in (1, 32):
         w4_xla_fn, w4_weights, x_tok, kc, vc
     )
 
-    p_gbs = total_bytes / (p_med_s * 1e9)
+    p4_ok = W4A16_MODE is not None
+    p_gbs = (total_bytes / (p_med_s * 1e9)) if p4_ok else None
     x_gbs = total_bytes / (x_med_s * 1e9)
     print(
         "LLAMA8B_32L_W4A16:",
         json.dumps(
             {
                 "mode": W4A16_MODE or "fallback_xla",
-                "pallas_fallback_to_xla": W4A16_MODE is None,
+                "pallas_fallback_to_xla": not p4_ok,
                 "batch": batch,
                 "kv_cache_shape": [N_LAYERS, batch, N_KV_HEADS, KV_SEQ, HEAD_DIM],
                 "total_bytes_read_gb": round(total_bytes / 1e9, 4),
                 "weight_gb": round(w4_weight_bytes / 1e9, 4),
                 "kv_mb": round(kv_bytes / 1e6, 2),
-                "scan_tpu_custom_call_count": p_cc_count,
+                "scan_tpu_custom_call_count": p_cc_count if p4_ok else 0,
                 "step0_max_abs_err": step0_err,
-                "pallas_compile_s": round(p_compile_s, 2),
-                "pallas_ms_per_step": round(p_med_s * 1e3, 3),
-                "pallas_tok_per_s": round(batch / p_med_s, 2),
-                "pallas_gb_s": round(p_gbs, 2),
-                "pallas_pct_819": round(100.0 * p_gbs / PEAK_HBM_GBS, 2),
+                "pallas_compile_s": round(p_compile_s, 2) if p4_ok else None,
+                "pallas_ms_per_step": round(p_med_s * 1e3, 3) if p4_ok else None,
+                "pallas_tok_per_s": round(batch / p_med_s, 2) if p4_ok else None,
+                "pallas_gb_s": round(p_gbs, 2) if p_gbs is not None else None,
+                "pallas_pct_819": round(100.0 * p_gbs / PEAK_HBM_GBS, 2) if p_gbs is not None else None,
                 "xla_compile_s": round(x_compile_s, 2),
                 "xla_ms_per_step": round(x_med_s * 1e3, 3),
                 "xla_tok_per_s": round(batch / x_med_s, 2),
                 "xla_gb_s": round(x_gbs, 2),
                 "xla_pct_819": round(100.0 * x_gbs / PEAK_HBM_GBS, 2),
-                "speedup": round(x_med_s / p_med_s, 2),
+                "speedup": round(x_med_s / p_med_s, 2) if p4_ok else None,
                 "hbm": get_hbm_stats(),
             }
         ),
@@ -1682,4 +1686,12 @@ _KERNEL_CACHE.clear()
 gc.collect()
 jax.clear_caches()
 print("HBM_END:", json.dumps(get_hbm_stats()))
+if W8A16_MODE is None or W4A16_MODE is None:
+    print(
+        "LLAMA8B_PARTIAL:",
+        json.dumps({"w8a16_mode": W8A16_MODE, "w4a16_mode": W4A16_MODE}),
+    )
+    raise RuntimeError(
+        f"Llama8B decoder benchmark incomplete: W8A16_MODE={W8A16_MODE}, W4A16_MODE={W4A16_MODE}"
+    )
 print("=== LLAMA8B_COMPLETE ===")
