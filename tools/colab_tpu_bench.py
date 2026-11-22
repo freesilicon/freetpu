@@ -67,6 +67,17 @@ _OAUTH_PROMPT_MARKERS = (
     "eoferror",
 )
 
+_COLAB_AUTH_ERROR_MARKERS = (
+    "no valid default credentials found",
+    "to authorize colab-cli",
+    "enter the authorization code",
+    "defaultcredentialserror",
+    "could not automatically determine credentials",
+    "reauthentication is needed",
+    "failed to refresh token",
+    "invalid_grant",
+)
+
 _SAFE_SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _SESSION_LINE_RE = re.compile(r"^\[([^\]]+)\]\s+(\S+)(?:\s+\||$)")
 
@@ -326,7 +337,7 @@ def make_subprocess_runner(
             err_txt = _coerce_subprocess_text(exc.stderr)
             note = (
                 f"[colab_tpu_bench] `colab` subprocess exceeded wall timeout "
-                f"({wall_timeout:.1f}s); reconciling active sessions."
+                f"({wall_timeout:.1f}s); stopping session and reconciling active sessions."
             )
             combined_err = f"{err_txt}\n{note}".strip() if err_txt else note
             return CommandResult(
@@ -504,12 +515,19 @@ def is_capacity_or_quota_error(
     return False
 
 
+def is_wall_timeout_error(returncode: int, stderr: str) -> bool:
+    """Return True if the local `colab` subprocess hit its wall-clock deadline."""
+    if returncode == 0:
+        return False
+    return returncode == 124 or "exceeded wall timeout" in stderr.lower()
+
+
 def is_allocation_timeout_error(returncode: int, stderr: str) -> bool:
     """Return True if allocation or setup timed out with an unknown server-side outcome."""
     if returncode == 0:
         return False
     err_lower = stderr.lower()
-    if returncode == 124 or "exceeded wall timeout" in err_lower:
+    if is_wall_timeout_error(returncode, stderr):
         return "[colab] session ready" not in err_lower
     if "[colab] session ready" in err_lower:
         return False
@@ -519,6 +537,12 @@ def is_allocation_timeout_error(returncode: int, stderr: str) -> bool:
 def _contains_oauth_prompt_failure(res: CommandResult) -> bool:
     combined = f"{res.stdout}\n{res.stderr}".lower()
     return any(marker in combined for marker in _OAUTH_PROMPT_MARKERS)
+
+
+def _has_colab_auth_failure(res: CommandResult) -> bool:
+    """Return True if `colab` emitted an authentication/credential failure (even on exit 0)."""
+    combined = f"{res.stdout}\n{res.stderr}".lower()
+    return any(marker in combined for marker in _COLAB_AUTH_ERROR_MARKERS)
 
 
 def extract_probe_json(stdout: str) -> Optional[Dict[str, Any]]:
@@ -884,7 +908,7 @@ def run_benchmark(
         }
 
     sess_before_res = runner([*base_cmd, "sessions"])
-    if sess_before_res.returncode != 0:
+    if sess_before_res.returncode != 0 or _has_colab_auth_failure(sess_before_res):
         return 1, {
             "status": "sessions_check_failed",
             "returncode": sess_before_res.returncode,
@@ -903,6 +927,7 @@ def run_benchmark(
     probe_payload: Optional[Dict[str, Any]] = None
     proof_notebook: Optional[Path] = None
     allocation_timed_out = False
+    wall_timed_out = False
     maybe_allocated = False
     probe_error: Optional[str] = None
     untrusted_target_error: Optional[str] = None
@@ -912,6 +937,13 @@ def run_benchmark(
     export_returncode: Optional[int] = None
     export_error: Optional[str] = None
     export_stderr_tail: Optional[str] = None
+    forced_stop: Dict[str, Any] = {
+        "attempted": False,
+        "session": None,
+        "returncode": None,
+        "error": None,
+        "stderr_tail": None,
+    }
 
     for idx, tpu in enumerate(cfg.tpus):
         sess = f"{session_base}-{tpu}" if idx > 0 else session_base
@@ -943,18 +975,52 @@ def run_benchmark(
             probe_payload = parsed_probe
 
         ready_seen = "[colab] session ready" in res.stderr.lower()
+        wall_timeout_seen = is_wall_timeout_error(res.returncode, res.stderr)
         timeout_seen = is_allocation_timeout_error(res.returncode, res.stderr)
         confirmed_pre_alloc = (
             res.returncode != 0
             and not ready_seen
+            and not wall_timeout_seen
             and not timeout_seen
             and (
                 is_capacity_or_quota_error(res.returncode, res.stdout, res.stderr)
                 or _contains_oauth_prompt_failure(res)
             )
         )
-        if res.returncode == 0 or ready_seen or timeout_seen or not confirmed_pre_alloc:
+        if (
+            res.returncode == 0
+            or ready_seen
+            or wall_timeout_seen
+            or timeout_seen
+            or not confirmed_pre_alloc
+        ):
             maybe_allocated = True
+
+        # If `subprocess.run` killed `colab run` on wall-clock timeout, its own
+        # `finally: _teardown(...)` handler never ran; explicitly stop the session
+        # using the exact same isolated `--config` before exporting logs or checking sessions.
+        if wall_timeout_seen:
+            wall_timed_out = True
+            forced_stop["attempted"] = True
+            forced_stop["session"] = sess
+            stop_res = runner([*base_cmd, "stop", "-s", sess])
+            forced_stop["returncode"] = stop_res.returncode
+            if stop_res.stderr.strip():
+                forced_stop["stderr_tail"] = stop_res.stderr.strip()[-1000:]
+            if stop_res.returncode != 0:
+                diag = (
+                    stop_res.stderr.strip()
+                    or stop_res.stdout.strip()
+                    or "no diagnostic output"
+                )
+                forced_stop["error"] = (
+                    f"`colab stop -s {sess}` failed (rc={stop_res.returncode}): {diag}"
+                )
+            elif _has_colab_auth_failure(stop_res):
+                diag = stop_res.stderr.strip() or stop_res.stdout.strip()
+                forced_stop["error"] = (
+                    f"`colab stop -s {sess}` exited 0 with authentication error: {diag}"
+                )
 
         try:
             if res.stdout:
@@ -978,7 +1044,7 @@ def run_benchmark(
         else:
             final_rc = res.returncode
 
-        if res.returncode == 0 or ready_seen or res.returncode == 124:
+        if res.returncode == 0 or ready_seen or wall_timeout_seen:
             if chosen_tpu is None:
                 chosen_tpu = tpu
                 chosen_session = sess
@@ -1010,6 +1076,9 @@ def run_benchmark(
             allocation_timed_out = True
             break
 
+        if wall_timeout_seen:
+            break
+
         has_more = idx + 1 < len(cfg.tpus)
         if not (has_more and is_capacity_or_quota_error(res.returncode, res.stdout, res.stderr)):
             break
@@ -1023,12 +1092,17 @@ def run_benchmark(
     teardown_error: Optional[str] = None
     if maybe_allocated:
         sess_after_res = runner([*base_cmd, "sessions"])
-        if sess_after_res.returncode != 0:
+        if sess_after_res.returncode != 0 or _has_colab_auth_failure(sess_after_res):
             teardown_verified = False
-            teardown_error = (
-                f"Post-run `colab sessions` failed (rc={sess_after_res.returncode}): "
-                f"{sess_after_res.stderr.strip()}"
-            )
+            diag = sess_after_res.stderr.strip() or sess_after_res.stdout.strip()
+            if sess_after_res.returncode != 0:
+                teardown_error = (
+                    f"Post-run `colab sessions` failed (rc={sess_after_res.returncode}): {diag}"
+                )
+            else:
+                teardown_error = (
+                    f"Post-run `colab sessions` exited 0 with authentication error: {diag}"
+                )
         else:
             names_after, endpoints_after = parse_sessions_output(sess_after_res.stdout)
             new_endpoints = sorted(endpoints_after - endpoints_before)
@@ -1060,6 +1134,7 @@ def run_benchmark(
         return 2, {
             "status": "untrusted_out_dir",
             "error": untrusted_target_error,
+            "forced_stop": forced_stop,
             "teardown_verified": teardown_verified,
             "leaked_endpoints": leaked_endpoints,
             "leaked_sessions": leaked_sessions,
@@ -1080,6 +1155,10 @@ def run_benchmark(
             status = "teardown_ambiguous"
         else:
             status = "teardown_verification_failed"
+        if final_rc == 0:
+            final_rc = 1
+    elif wall_timed_out:
+        status = "wall_timeout"
         if final_rc == 0:
             final_rc = 1
     elif probe_error is not None:
@@ -1114,6 +1193,7 @@ def run_benchmark(
             "error": export_error,
             "stderr_tail": export_stderr_tail,
         },
+        "forced_stop": forced_stop,
         "teardown_verified": teardown_verified,
         "leaked_endpoints": leaked_endpoints,
         "leaked_sessions": leaked_sessions,
@@ -1699,7 +1779,192 @@ def run_self_test() -> int:
         assert sum_nz["proof_notebook"] is not None
         assert Path(sum_nz["proof_notebook"]).is_file()
 
-    print("colab_tpu_bench.py self-test PASSED (21/21 suites).")
+        # 22. Post-READY wall-clock timeout (rc=124) stops the active session using the same
+        #     isolated --config BEFORE verifying release via `colab sessions`, and never falls back.
+        wall_cmds: List[List[str]] = []
+        wall_stopped = {"done": False}
+
+        def post_ready_wall_timeout_runner(cmd: Sequence[str]) -> CommandResult:
+            cmd_list = list(cmd)
+            wall_cmds.append(cmd_list)
+            if "--help" in cmd_list or "usage" in cmd_list:
+                res = base_help_usage_sessions(cmd_list)
+                assert res is not None
+                return res
+            if "sessions" in cmd_list:
+                # Before `stop`, the TPU would still be allocated if we failed to stop it!
+                if any("run" in c for c in wall_cmds) and not wall_stopped["done"]:
+                    return CommandResult(
+                        0,
+                        "[s] tpu-v6e1-wall1 | Hardware: V6E1 | Shape: STANDARD | Variant: TPU\n",
+                        "",
+                    )
+                return CommandResult(0, "[colab] No active sessions found on server.\n", "")
+            if "run" in cmd_list:
+                return CommandResult(
+                    124,
+                    "step 1...\nstep 2...\n",
+                    "[colab] Session READY (wall-sess).\n"
+                    "[colab_tpu_bench] `colab` subprocess exceeded wall timeout (480.0s); "
+                    "stopping session and reconciling active sessions.\n",
+                )
+            if "stop" in cmd_list:
+                wall_stopped["done"] = True
+                return CommandResult(0, "[colab] Session terminated.\n", "")
+            if "log" in cmd_list:
+                out_idx = cmd_list.index("-o") + 1
+                nb = {
+                    "nbformat": 4,
+                    "cells": [
+                        {
+                            "cell_type": "markdown",
+                            "source": "**Session Created**: now\n- Endpoint: `tpu-v6e1-wall1`\n",
+                        }
+                    ],
+                }
+                Path(cmd_list[out_idx]).write_text(json.dumps(nb), encoding="utf-8")
+                return CommandResult(0, "Exported notebook.\n", "")
+            raise AssertionError(f"Unexpected command: {cmd_list}")
+
+        rc_wt, sum_wt = run_benchmark(
+            BenchConfig(tpus=("v6e1", "v5e1"), out_dir=tmp_path / "wall-timeout-post-ready"),
+            runner=post_ready_wall_timeout_runner,
+        )
+        assert rc_wt == 124
+        assert sum_wt["status"] == "wall_timeout"
+        assert sum_wt["teardown_verified"] is True
+        assert sum_wt["forced_stop"]["attempted"] is True
+        assert sum_wt["forced_stop"]["returncode"] == 0
+        assert sum_wt["forced_stop"]["error"] is None
+        assert len(sum_wt["attempts"]) == 1
+        assert sum_wt["attempts"][0]["tpu"] == "v6e1"
+        stop_indices = [i for i, c in enumerate(wall_cmds) if "stop" in c]
+        sess_indices = [i for i, c in enumerate(wall_cmds) if "sessions" in c]
+        assert len(stop_indices) == 1
+        assert len(sess_indices) == 2
+        assert stop_indices[0] < sess_indices[1]
+        stop_cmd = wall_cmds[stop_indices[0]]
+        assert "--config" in stop_cmd and sum_wt["isolated_config"] in stop_cmd
+        assert "-s" in stop_cmd and sum_wt["chosen_session"] in stop_cmd
+
+        # 23. Pre-READY wall-clock timeout (rc=124) also attempts `colab stop -s <sess>` before
+        #     verifying release, and reports `allocation_timeout` without falling back.
+        pre_wall_cmds: List[List[str]] = []
+
+        def pre_ready_wall_timeout_runner(cmd: Sequence[str]) -> CommandResult:
+            cmd_list = list(cmd)
+            pre_wall_cmds.append(cmd_list)
+            base_res = base_help_usage_sessions(cmd_list)
+            if base_res is not None:
+                return base_res
+            if "run" in cmd_list:
+                return CommandResult(
+                    124,
+                    "",
+                    "[colab] Creating session 'x'...\n"
+                    "[colab_tpu_bench] `colab` subprocess exceeded wall timeout (480.0s); "
+                    "stopping session and reconciling active sessions.\n",
+                )
+            if "stop" in cmd_list:
+                return CommandResult(0, "[colab] Session 'x' not found.\n", "")
+            if "log" in cmd_list:
+                return CommandResult(1, "", "no log")
+            raise AssertionError(f"Unexpected command: {cmd_list}")
+
+        rc_pwt, sum_pwt = run_benchmark(
+            BenchConfig(tpus=("v6e1", "v5e1"), out_dir=tmp_path / "wall-timeout-pre-ready"),
+            runner=pre_ready_wall_timeout_runner,
+        )
+        assert rc_pwt == 124
+        assert sum_pwt["status"] == "allocation_timeout"
+        assert sum_pwt["teardown_verified"] is True
+        assert sum_pwt["forced_stop"]["attempted"] is True
+        assert len(sum_pwt["attempts"]) == 1
+        assert any("stop" in c for c in pre_wall_cmds)
+
+        # 24. Post-run `colab sessions` exiting 0 with ADC auth failure on stderr (Colab CLI 0.8.0
+        #     swallowed SystemExit when local store is empty) must NOT mark teardown_verified=True.
+        adc_err_stderr = (
+            "No valid default credentials found. To authenticate, run:\n\n"
+            "  gcloud auth application-default login \\\n"
+            "      --scopes=openid,https://www.googleapis.com/auth/cloud-platform,"
+            "https://www.googleapis.com/auth/userinfo.email,"
+            "https://www.googleapis.com/auth/colaboratory\n"
+        )
+        adc_sess_calls = {"n": 0}
+
+        def post_sessions_adc_fail_runner(cmd: Sequence[str]) -> CommandResult:
+            cmd_list = list(cmd)
+            if "sessions" in cmd_list:
+                adc_sess_calls["n"] += 1
+                if adc_sess_calls["n"] == 1:
+                    return CommandResult(0, "[colab] No active sessions found on server.\n", "")
+                return CommandResult(
+                    0,
+                    "[colab] No active sessions found on server.\n",
+                    adc_err_stderr,
+                )
+            return fallback_runner(cmd_list)
+
+        rc_adc_td, sum_adc_td = run_benchmark(
+            BenchConfig(tpus=("v5e1",), out_dir=tmp_path / "post-sessions-adc-fail"),
+            runner=post_sessions_adc_fail_runner,
+        )
+        assert rc_adc_td == 1
+        assert sum_adc_td["status"] == "teardown_verification_failed"
+        assert sum_adc_td["teardown_verified"] is False
+        assert "authentication error" in (sum_adc_td["teardown_error"] or "").lower()
+
+        # Also after an uncertain allocation ReadTimeout -> allocation_timeout_unreconciled.
+        adc_to_calls = {"n": 0}
+
+        def alloc_timeout_adc_fail_runner(cmd: Sequence[str]) -> CommandResult:
+            cmd_list = list(cmd)
+            if "sessions" in cmd_list:
+                adc_to_calls["n"] += 1
+                if adc_to_calls["n"] == 1:
+                    return CommandResult(0, "[colab] No active sessions found on server.\n", "")
+                return CommandResult(
+                    0,
+                    "[colab] No active sessions found on server.\n",
+                    adc_err_stderr,
+                )
+            return timeout_runner(cmd_list)
+
+        rc_adc_to, sum_adc_to = run_benchmark(
+            BenchConfig(tpus=("v6e1", "v5e1"), out_dir=tmp_path / "alloc-to-adc-fail"),
+            runner=alloc_timeout_adc_fail_runner,
+        )
+        assert rc_adc_to == 1
+        assert sum_adc_to["status"] == "allocation_timeout_unreconciled"
+        assert sum_adc_to["teardown_verified"] is False
+
+        # 25. Pre-flight `colab sessions` exiting 0 with ADC auth failure aborts before `colab run`.
+        pre_adc_cmds: List[List[str]] = []
+
+        def pre_sessions_adc_fail_runner(cmd: Sequence[str]) -> CommandResult:
+            cmd_list = list(cmd)
+            pre_adc_cmds.append(cmd_list)
+            if "sessions" in cmd_list:
+                return CommandResult(
+                    0,
+                    "[colab] No active sessions found on server.\n",
+                    adc_err_stderr,
+                )
+            base_res = base_help_usage_sessions(cmd_list)
+            if base_res is not None:
+                return base_res
+            raise AssertionError(f"Unexpected command after pre-flight sessions auth fail: {cmd_list}")
+
+        rc_pre_adc, sum_pre_adc = run_benchmark(
+            BenchConfig(tpus=("v5e1",), out_dir=tmp_path / "pre-sessions-adc-fail"),
+            runner=pre_sessions_adc_fail_runner,
+        )
+        assert rc_pre_adc == 1
+        assert sum_pre_adc["status"] == "sessions_check_failed"
+        assert not any("run" in c for c in pre_adc_cmds)
+
+    print("colab_tpu_bench.py self-test PASSED (25/25 suites).")
     return 0
 
 

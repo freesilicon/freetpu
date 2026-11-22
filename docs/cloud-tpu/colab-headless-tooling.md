@@ -11,7 +11,7 @@ Google provides two official, supported headless automation surfaces for Colab r
 | Control Plane | Endpoint / Binary | Auth & Scopes | Best Use Case |
 | --- | --- | --- | --- |
 | **`google-colab-cli` (`colab`)** | `colab` CLI (`uv tool install google-colab-cli`) | `--auth=adc` or `--auth=oauth2` (`openid`, `cloud-platform`, `userinfo.email`, `colaboratory`) | Zero-waste `colab run` ephemeral TPU probes, persistent kernel `colab exec`, `/api/contents/` file sync, `colab log -o proof.ipynb`, `colab usage` |
-| **Official Colab MCP & Public REST `v1beta`** | `https://colaboratory.googleapis.com/mcp` & `https://colaboratory.googleapis.com/v1beta` | OAuth2 / ADC with `colaboratory` scope + allowlisted `X-Goog-User-Project` | IDE/agent MCP orchestration (`list_runtime_specs`, `create_runtime`, `execute_code`, `delete_runtime`) with UUID `requestId` & `executionId` reattachment |
+| **Official Colab MCP & Public REST `v1beta`** | `https://colaboratory.googleapis.com/mcp` & `https://colaboratory.googleapis.com/v1beta` | OAuth2 / ADC with `colaboratory` (or `colaboratory.readonly` for read-only REST discovery/inspection) + allowlisted `X-Goog-User-Project` | IDE/agent MCP orchestration (`list_runtime_specs`, `create_runtime`, `execute_code`, `delete_runtime`) with UUID `requestId` & `executionId` reattachment; Public REST `v1beta` covers subscription, runtime-spec discovery, and runtime lifecycle |
 
 ### `google-colab-cli` Dual-Path & `--no-public-api` Behavior
 
@@ -29,17 +29,18 @@ colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json sessions
 
 ### Official Colab MCP (`https://colaboratory.googleapis.com/mcp`) & Public REST `v1beta`
 
-The remote Streamable HTTP MCP server at `https://colaboratory.googleapis.com/mcp` exposes 10 tools mirroring `https://colaboratory.googleapis.com/v1beta`:
+The remote Streamable HTTP MCP server at `https://colaboratory.googleapis.com/mcp` exposes 10 tools: 6 account/discovery and runtime-lifecycle tools corresponding to Public REST `v1beta` (`https://colaboratory.googleapis.com/v1beta`), plus 4 **MCP-only** kernel session and code-execution tools that are **not** exposed by Public REST `v1beta`:
 
-- **Account & Discovery**: `get_subscription`, `list_runtime_specs` (pre-flight TPU eligibility)
-- **Runtime Lifecycle**: `list_runtimes`, `get_runtime`, `create_runtime` (idempotent UUID `requestId`), `delete_runtime`
-- **Kernel & Execution**: `create_session`, `list_sessions`, `delete_session`, `execute_code` (600s RPC cutoff; pass a client UUID `executionId` **against the same named session** to reattach to an in-flight call—runtime-targeted calls create a fresh session and cannot reattach, and reusing an `executionId` after its result has been returned re-executes the code)
+- **Account & Discovery (MCP & Public REST `v1beta`)**: `get_subscription` (`GET /v1beta/subscription`), `list_runtime_specs` (`GET /v1beta/runtimespecs`, pre-flight TPU eligibility)
+- **Runtime Lifecycle (MCP & Public REST `v1beta`)**: `list_runtimes` (`GET /v1beta/runtimes`), `get_runtime` (`GET /v1beta/runtimes/*`), `create_runtime` (`POST /v1beta/runtimes`, idempotent UUID `requestId`), `delete_runtime` (`DELETE /v1beta/runtimes/*`)
+- **Kernel & Execution (MCP-only — not in Public REST `v1beta`)**: `create_session`, `list_sessions`, `delete_session`, `execute_code` (600s RPC cutoff; pass a client UUID `executionId` **against the same named session** to reattach to an in-flight call—runtime-targeted calls create a fresh session and cannot reattach, and reusing an `executionId` after its result has been returned re-executes the code). Public REST `v1beta` alone does not expose kernel session or code-execution endpoints; use Official Colab MCP or `google-colab-cli` for headless code execution.
 
 **Allowlist & Scope Behavior:**
 
 - Unauthenticated `initialize` and `tools/list` probes on `https://colaboratory.googleapis.com/mcp` return HTTP `200` and advertise all 10 tool schemas.
-- Tool invocations (`tools/call`) and REST endpoints (`GET /v1beta/subscription`, `GET /v1beta/runtimespecs`, `POST /v1beta/runtimes`) require the `https://www.googleapis.com/auth/colaboratory` OAuth scope and an allowlisted GCP quota project (`X-Goog-User-Project`).
-- Unallowlisted or missing-scope ADC tokens receive HTTP `403` (`ACCESS_TOKEN_SCOPE_INSUFFICIENT` or `PERMISSION_DENIED`). In that case, re-mint ADC with the `colaboratory` scope:
+- Read-only REST discovery/inspection endpoints (`GET /v1beta/subscription`, `GET /v1beta/runtimespecs`, `GET /v1beta/runtimes`, `GET /v1beta/runtimes/*`) accept the narrower `https://www.googleapis.com/auth/colaboratory.readonly` OAuth scope (as well as the full `https://www.googleapis.com/auth/colaboratory` scope) plus an allowlisted GCP quota project (`X-Goog-User-Project`). Prefer `colaboratory.readonly` for discovery-only credentials so they cannot create or delete runtimes unnecessarily.
+- Mutating REST calls (`POST /v1beta/runtimes`, `DELETE /v1beta/runtimes/*`) and full MCP `tools/call` orchestration require the read/write `https://www.googleapis.com/auth/colaboratory` OAuth scope and an allowlisted GCP quota project (`X-Goog-User-Project`).
+- Unallowlisted or missing-scope ADC tokens receive HTTP `403` (`ACCESS_TOKEN_SCOPE_INSUFFICIENT` or `PERMISSION_DENIED`). Re-mint ADC with the least-privilege scope required (substitute `colaboratory.readonly` for discovery-only REST callers):
 
 ```bash
 gcloud auth application-default login \
