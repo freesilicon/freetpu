@@ -94,6 +94,20 @@ python3 -m freetpu_tile.colab_runner examples/tile_dsl/fused_gemm_silu.py --dry-
 
 ---
 
+## Verified Live Dual-Silicon Proof (`rango` + Cloud TPU `v5e-1`)
+
+Single-source kernels (`examples/tile_dsl/fused_gemm_silu.py` and `examples/tile_dsl/swiglu.py`, `M=64, K=512, N=512`) executed on **both** rooted Pixel 10 Pro Fold (`buenos_a0`, `PM=5`, `maps_has_google_tpu_libs=false`) and ephemeral Google Colab Cloud TPU (`v5e-1` `TPU v5 lite`, `jax-0.11.2`, `tpu_custom_call=True`, exported via `colab log` and auto-stopped cleanly):
+
+| Kernel (`64x512x512`) | Target Silicon | Lowering / Runtime | `hw_us` (Median / Min) | Throughput | `max_abs_err` vs `cpu_ref` | `nmse` |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| `fused_gemm_silu` (`w8a16`) | **Pixel Tensor G5 (`rango`)** | `libopenbuenos` (`PM=5`, zero Google `.so`) | `68.0 us` / `66.0 us` | `493.45 GFLOP/s` | `0.03152` | `6.42e-4` |
+| `fused_gemm_silu` (`w8a16`) | **Cloud TPU `v5e-1`** | Pallas/Mosaic (`tpu_custom_call=True`) | `182.96 us` / `166.87 us` | `183.40 GFLOP/s` | `0.01031` | `1.05e-5` |
+| `fused_gemm_silu` (`int8`) | **Pixel Tensor G5 (`rango`)** | Mode-A `0x640` spline `.dgc0` (`1,025,984 B`) | `73.0 us` / `72.0 us` | `459.65 GFLOP/s` | `1.0` ULP | `1.25e-5` |
+| `swiglu` (`w8a16`, 3-proj) | **Pixel Tensor G5 (`rango`)** | `libopenbuenos` (`PM=5`, 3 tiles) | `238.0 us` / `235.0 us` | `422.96 GFLOP/s` | `0.01587` | `4.01e-3` |
+| `swiglu` (`w8a16`, 3-proj) | **Cloud TPU `v5e-1`** | Pallas/Mosaic (`tpu_custom_call=True`) | `160.44 us` / `154.04 us` | `627.42 GFLOP/s` | `0.00162` | `3.33e-5` |
+
+---
+
 ## Agent Authoring Checklist (TileGym Pattern)
 
 1. Keep the kernel pure inside `@freetpu.tile_kernel(block_m=..., block_n=..., block_k=..., dtype=...)` using `freetpu.program_id`, `load`, `dot`, `silu`/`gelu`, `mul`, and `store`.

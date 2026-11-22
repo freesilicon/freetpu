@@ -181,10 +181,15 @@ ProcMapsAudit audit_proc_maps() {
   return audit;
 }
 
+bool is_supported_op(const std::string& op) {
+  return op == "matmul" || op == "matmul_silu" || op == "fused_matmul_silu" ||
+         op == "matmul_gelu" || op == "fused_matmul_gelu" || op == "swiglu";
+}
+
 uint32_t parse_activation(const std::string& op) {
   if (op == "matmul") return OB_ACT_NONE;
-  if (op == "matmul_silu") return OB_ACT_SILU;
-  if (op == "matmul_gelu") return OB_ACT_GELU;
+  if (op == "matmul_silu" || op == "fused_matmul_silu") return OB_ACT_SILU;
+  if (op == "matmul_gelu" || op == "fused_matmul_gelu") return OB_ACT_GELU;
   return OB_ACT_NONE;
 }
 
@@ -225,6 +230,10 @@ bool parse_args(int argc, char** argv, RunnerArgs* args, std::string* err) {
       return false;
     }
     if (!err->empty()) return false;
+  }
+  if (!is_supported_op(args->op)) {
+    *err = "Unsupported --op: " + args->op;
+    return false;
   }
   if (args->in_path.empty() || args->w_path.empty() || args->out_path.empty()) {
     *err = "--in, --w, and --out are required";

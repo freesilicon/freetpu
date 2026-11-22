@@ -378,6 +378,7 @@ def _run_adb_rango(
             m_dim, k_dim = x.shape
             n_inter = wg_nk.shape[0]
             n_out = wd_nk.shape[0] if wd_nk is not None else n_inter
+            n_dim = n_out
 
             (tmp_p / "in.bin").write_bytes(np.ascontiguousarray(x, dtype=np.float32).tobytes())
             (tmp_p / "wg.bin").write_bytes(wg_nk.tobytes())
@@ -404,6 +405,7 @@ def _run_adb_rango(
             m_dim, k_dim = a.shape
             b_nk = b if ir.rhs_transposed else b.T
             n_dim = b_nk.shape[0]
+            n_out = n_dim
 
             if ir.dtype == DType.INT8:
                 (tmp_p / "in.bin").write_bytes(np.ascontiguousarray(a, dtype=np.int8).tobytes())
@@ -565,6 +567,7 @@ def run_buenos_a0(
             m_dim, k_dim = x.shape
             n_inter = wg_nk.shape[0]
             n_out = wd_nk.shape[0] if wd_nk is not None else n_inter
+            n_dim = n_out
 
             for i in range(max(1, iters)):
                 (c_gate, c_up), st1 = sess.matmul_f32_quant_batch(
@@ -588,6 +591,7 @@ def run_buenos_a0(
             m_dim, k_dim = a.shape
             b_nk = b if ir.rhs_transposed else b.T
             n_dim = b_nk.shape[0]
+            n_out = n_dim
             flops = 2.0 * m_dim * k_dim * n_dim
 
             if ir.dtype == DType.INT8:

@@ -205,6 +205,60 @@ class TestTileDSLFrontendAndParity(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, msg=f"{rel} failed:\n{proc.stderr}\n{proc.stdout}")
             self.assertIn('"passed": true', proc.stdout)
 
+    def test_freetpu_tile_runner_host_fused_matmul_silu_mock(self) -> None:
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        runner = repo_root / "runtime" / "build" / "freetpu_tile_runner_host"
+        if not runner.is_file():
+            self.skipTest("runtime/build/freetpu_tile_runner_host not built")
+
+        from freetpu_tile.backends.cpu_ref import silu_f32
+
+        rng = np.random.default_rng(11)
+        m, k, n = 16, 64, 64
+        a = (rng.standard_normal((m, k)) * 0.5).astype(np.float32)
+        w_nk = (rng.standard_normal((n, k)) / np.sqrt(k)).astype(np.float32)
+        ref = silu_f32(a @ w_nk.T)
+
+        with tempfile.TemporaryDirectory(prefix="freetpu-runner-test-") as tmp:
+            tp = Path(tmp)
+            (tp / "a.bin").write_bytes(a.tobytes())
+            (tp / "w.bin").write_bytes(w_nk.tobytes())
+            out_p = tp / "out.bin"
+            proc = subprocess.run(
+                [
+                    str(runner),
+                    "--mock",
+                    "--op",
+                    "fused_matmul_silu",
+                    "--dtype",
+                    "w8a16",
+                    "--m",
+                    str(m),
+                    "--k",
+                    str(k),
+                    "--n",
+                    str(n),
+                    "--in",
+                    str(tp / "a.bin"),
+                    "--w",
+                    str(tp / "w.bin"),
+                    "--out",
+                    str(out_p),
+                    "--warmup",
+                    "1",
+                    "--iters",
+                    "2",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, msg=f"runner failed:\n{proc.stderr}\n{proc.stdout}")
+            got = np.frombuffer(out_p.read_bytes(), dtype=np.float32).reshape(m, n)
+            diff = np.abs(got.astype(np.float64) - ref.astype(np.float64))
+            nmse = float(np.sum(diff * diff) / max(float(np.sum(ref.astype(np.float64) ** 2)), 1e-30))
+            self.assertLess(nmse, 5e-3, msg=f"runner fused_matmul_silu nmse too high: {nmse}")
+
 
 if __name__ == "__main__":
     unittest.main()
