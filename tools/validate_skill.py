@@ -246,13 +246,39 @@ def _parse_frontmatter_stdlib(fm_text: str) -> Dict[str, Any]:
             raise ValueError(f"Invalid YAML frontmatter: duplicate key at line {line_no}")
         rest = (m.group(2) or "").strip()
 
-        block_m = re.match(r"^([>|])([0-9]*[-+]?)(?:\s+#.*)?$", rest)
-        if block_m:
+        if rest.startswith((">", "|")):
+            block_m = re.match(r"^([>|])(?:([1-9])([-+]?)|([-+]?)([1-9]?))(?:\s+#.*)?$", rest)
+            if not block_m:
+                raise ValueError(f"Invalid YAML frontmatter: invalid block scalar header at line {line_no}")
             style = block_m.group(1)
+            indent_digit = block_m.group(2) or block_m.group(5) or ""
+            block_indent: Optional[int] = int(indent_digit) if indent_digit else None
+            max_leading_blank_spaces = 0
             block: List[str] = []
             i += 1
-            while i < len(fm_lines) and (fm_lines[i].startswith(" ") or not fm_lines[i].strip()):
-                block.append(fm_lines[i].strip())
+            while i < len(fm_lines):
+                raw_block = fm_lines[i]
+                if not raw_block.strip():
+                    if block_indent is None:
+                        max_leading_blank_spaces = max(max_leading_blank_spaces, len(raw_block))
+                    i += 1
+                    continue
+                indent = len(raw_block) - len(raw_block.lstrip(" "))
+                if indent == 0:
+                    break
+                if block_indent is None:
+                    if indent < max_leading_blank_spaces:
+                        raise ValueError(
+                            f"Invalid YAML frontmatter: leading whitespace exceeds block indentation at line {i + 2}"
+                        )
+                    block_indent = indent
+                elif indent < block_indent:
+                    if raw_block.lstrip().startswith("#"):
+                        break
+                    raise ValueError(
+                        f"Invalid YAML frontmatter: dedented block scalar line at line {i + 2}"
+                    )
+                block.append(raw_block[block_indent:].strip() if style == ">" else raw_block[block_indent:])
                 i += 1
             sep = " " if style == ">" else "\n"
             data[key] = sep.join(part for part in block if part).strip()
@@ -701,6 +727,18 @@ def run_validator_self_test(*, require_yaml: bool = False) -> None:
             "---\nname: freetpu\ndescription: >-\n\tTab-indented folded description that easily exceeds forty characters.\n---\n",
             "Invalid YAML frontmatter",
         ),
+        (
+            "---\nname: freetpu\ndescription: >-\n    First line indented four spaces for a folded description.\n  Second line dedented to two spaces.\n---\n",
+            "Invalid YAML frontmatter",
+        ),
+        (
+            "---\nname: freetpu\ndescription: >-\n    \n  Line less indented than leading blank line spaces.\n---\n",
+            "Invalid YAML frontmatter",
+        ),
+        (
+            "---\nname: freetpu\ndescription: >0-\n  Invalid zero indentation indicator for folded description.\n---\n",
+            "Invalid YAML frontmatter",
+        ),
     ]
     for md_text, expected in invalid_cases:
         _check_skill_md(md_text, should_pass=False, expected_substr=expected)
@@ -736,6 +774,34 @@ def run_validator_self_test(*, require_yaml: bool = False) -> None:
         assert "tab indentation" in str(exc), f"Unexpected tab-indentation error: {exc}"
     else:
         raise AssertionError("stdlib parser failed to reject tab-indented folded description")
+    try:
+        _parse_frontmatter_stdlib(
+            "name: freetpu\ndescription: >-\n    First line indented four spaces.\n  Second line dedented to two spaces.\n"
+        )
+    except ValueError as exc:
+        assert "dedented block scalar" in str(exc), f"Unexpected dedent error: {exc}"
+    else:
+        raise AssertionError("stdlib parser failed to reject dedented folded description")
+    try:
+        _parse_frontmatter_stdlib(
+            "name: freetpu\ndescription: >-\n    \n  Indented less than leading blank spaces.\n"
+        )
+    except ValueError as exc:
+        assert "leading whitespace exceeds block indentation" in str(exc), f"Unexpected blank-indent error: {exc}"
+    else:
+        raise AssertionError("stdlib parser failed to reject leading blank line wider than block indentation")
+    fm_explicit = _parse_frontmatter_stdlib(
+        "name: freetpu\ndescription: >2-\n    First line indented four spaces.\n  Second line at explicit two spaces.\n"
+    )
+    assert fm_explicit["description"] == "First line indented four spaces. Second line at explicit two spaces.", fm_explicit
+    try:
+        _parse_frontmatter_stdlib(
+            "name: freetpu\ndescription: >2-\n    First line indented four spaces.\n Second line at one space.\n"
+        )
+    except ValueError as exc:
+        assert "dedented block scalar" in str(exc), f"Unexpected explicit-indent error: {exc}"
+    else:
+        raise AssertionError("stdlib parser failed to reject line dedented below explicit >2- indicator")
 
     fm_indented = _parse_frontmatter_stdlib(
         "name: freetpu\ndescription:\n  Indented plain string.\n"
