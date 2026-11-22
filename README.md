@@ -84,10 +84,10 @@ Run [`bench/freetpu_bench.py`](bench/freetpu_bench.py) (`nvbench` + `nvbandwidth
 
 ```bash
 # Offline host mock + local activation-hop suite
-python3 bench/freetpu_bench.py --suite all --backend buenos_mock --markdown runs/scorecard.md
+python3 bench/freetpu_bench.py --suite all --backend buenos_mock --json runs/scorecard.json --markdown runs/scorecard.md
 
 # Headless Cloud TPU (v6e-1 with automatic v5e-1 fallback) + local comms
-python3 bench/freetpu_bench.py --suite all --backend colab_tpu --markdown runs/colab-scorecard.md
+python3 bench/freetpu_bench.py --suite all --backend colab_tpu --json runs/colab-scorecard.json --markdown runs/colab-scorecard.md
 ```
 
 Copy-paste 60-second playbooks (`dgx-spark-playbooks` style):

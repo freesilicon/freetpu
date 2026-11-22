@@ -48,13 +48,38 @@ python3 bench/freetpu_bench.py \
 
 ### 3. Split-Layer Dual-Phone `llama.cpp` (`GGML_EDGETPU=ON` + `GGML_RPC=ON`)
 
+> **Security Prerequisites (`ggml-rpc-server`)**: Upstream `ggml-rpc-server` has **no client authentication or transport encryption** and runs as root here to access `/dev/edgetpu-soc`. Even when bound to `127.0.0.1` over ADB forwarding/reverse, loopback listeners are reachable by other local apps on both Node 2 and Node 1 (and by local processes on the host). **Run this recipe only on dedicated, single-purpose test devices with only trusted apps and a trusted host**, and optionally enforce UID filtering on `lo` (shown below) before launching the server. Only bind directly to a USB-Ethernet interface (e.g. `-H 192.168.77.2`) on an **isolated, air-gapped lab test device** with `iptables` rules restricting TCP `50052` exclusively to the intended peer IP (`192.168.77.1`).
+
+**Terminal 1 — Build & Start Persistent RPC Server on Node 2 (leave running):**
+
 ```bash
 # Cross-build llama-bench & ggml-rpc-server for Android ARM64
 ./llama-cpp-edgetpu/build.sh android
 
-# Node 2: bind clean-room EDGETPU RPC server to loopback ONLY (zero Google .so)
+# Optional hardening on Node 2: allow only root (UID 0) and adbd/shell (UID 2000) on loopback TCP 50052
+# (rejects untrusted Android app UIDs >= 10000 before starting the server)
+adb -s <node2_serial> shell "su -c 'iptables -N FREETPU_RPC_OUT 2>/dev/null || iptables -F FREETPU_RPC_OUT; \
+  iptables -A FREETPU_RPC_OUT -m owner --uid-owner 0 -j RETURN; \
+  iptables -A FREETPU_RPC_OUT -m owner --uid-owner 2000 -j RETURN; \
+  iptables -A FREETPU_RPC_OUT -j REJECT; \
+  iptables -C OUTPUT -o lo -p tcp --dport 50052 -j FREETPU_RPC_OUT 2>/dev/null || \
+  iptables -I OUTPUT -o lo -p tcp --dport 50052 -j FREETPU_RPC_OUT'"
+
+# Node 2: bind clean-room EDGETPU RPC server to loopback ONLY (zero Google .so); leave running in Terminal 1
 adb -s <node2_serial> shell "su -c 'OPENBUENOS_PERF_MODE=5 \
   /data/local/tmp/tpu_open_stack/ggml-rpc-server -d EDGETPU -H 127.0.0.1 -p 50052 -t 4'"
+```
+
+**Terminal 2 — Create ADB Tunnels & Run Split-Layer Benchmark on Node 1:**
+
+```bash
+# Optional hardening on Node 1: allow only root (UID 0) and adbd/shell (UID 2000) on the reversed loopback port
+adb -s <node1_serial> shell "su -c 'iptables -N FREETPU_RPC_OUT 2>/dev/null || iptables -F FREETPU_RPC_OUT; \
+  iptables -A FREETPU_RPC_OUT -m owner --uid-owner 0 -j RETURN; \
+  iptables -A FREETPU_RPC_OUT -m owner --uid-owner 2000 -j RETURN; \
+  iptables -A FREETPU_RPC_OUT -j REJECT; \
+  iptables -C OUTPUT -o lo -p tcp --dport 50052 -j FREETPU_RPC_OUT 2>/dev/null || \
+  iptables -I OUTPUT -o lo -p tcp --dport 50052 -j FREETPU_RPC_OUT'"
 
 # Tunnel Node 2 loopback -> host -> Node 1 loopback via ADB port forwarding
 adb -s <node2_serial> forward tcp:50052 tcp:50052
@@ -65,8 +90,6 @@ adb -s <node1_serial> shell "su -c 'OPENBUENOS_PERF_MODE=5 \
   /data/local/tmp/tpu_open_stack/llama-bench \
   -m /data/local/tmp/models/model.gguf --rpc 127.0.0.1:50052 -ngl 14 -p 128 -n 32 -t 4'"
 ```
-
-> **Security Warning (`ggml-rpc-server`)**: Upstream `ggml-rpc-server` has **no client authentication or transport encryption** and runs as root here to access `/dev/edgetpu-soc`. Keep it bound to `127.0.0.1` over ADB port forwarding by default. Only bind directly to a USB-Ethernet interface (e.g. `-H 192.168.77.2`) on an **isolated, air-gapped lab test device** with firewall (`iptables`) rules restricting TCP `50052` exclusively to the intended peer IP (`192.168.77.1`).
 
 ---
 

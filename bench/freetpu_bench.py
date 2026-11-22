@@ -1216,7 +1216,7 @@ def run_colab_tpu_suites(
         tmp_dir = Path(tempfile.mkdtemp(prefix="freetpu-bench-colab-"))
         iso_cfg = tmp_dir / "colab-sessions.json"
     else:
-        iso_cfg = config_path
+        iso_cfg = Path(os.path.abspath(os.path.expanduser(str(config_path))))
         iso_cfg.parent.mkdir(parents=True, exist_ok=True)
     preserve_tmp_dir = False
     session_base = f"freetpu-bench-{uuid.uuid4().hex[:8]}"
@@ -1254,11 +1254,12 @@ def run_colab_tpu_suites(
         attempts: List[Dict[str, Any]] = []
         for idx, (tpu, sess, cmd) in enumerate(planned):
             pre_res = runner([colab_bin, "--auth", auth, "--config", str(iso_cfg), "sessions"])
-            pre_endpoints: Optional[Set[str]] = (
-                {ep for _, ep in _parse_colab_sessions(pre_res.stdout)}
-                if pre_res.returncode == 0
-                else None
-            )
+            if pre_res.returncode != 0:
+                detail = (pre_res.stderr or pre_res.stdout).strip()[-600:]
+                raise RuntimeError(
+                    f"colab sessions preflight failed (rc={pre_res.returncode}) before allocating {tpu}: {detail}"
+                )
+            pre_endpoints: Set[str] = {ep for _, ep in _parse_colab_sessions(pre_res.stdout)}
             res: Optional[subprocess.CompletedProcess[str]] = None
             interrupted: Optional[BaseException] = None
             teardown_verified = False
@@ -2314,6 +2315,55 @@ def run_self_test() -> int:
     finally:
         shutil.rmtree(e2e_dir, ignore_errors=True)
 
+    # 4g. Relative `--colab-config sessions.json` MUST be normalized to an absolute path
+    rel_out = StringIO()
+    with redirect_stdout(rel_out):
+        rc_rel = main([
+            "--suite", "compute",
+            "--backend", "colab_tpu",
+            "--colab-tpu", "v5e1",
+            "--colab-config", "sessions.json",
+            "--dry-run",
+            "--json", "-",
+        ])
+    assert rc_rel == 0
+    rel_cmds = json.loads(rel_out.getvalue())["colab_meta"]["planned_commands"]
+    rel_cfg_arg = rel_cmds[0][rel_cmds[0].index("--config") + 1]
+    assert Path(rel_cfg_arg).is_absolute() and os.path.dirname(rel_cfg_arg) != ""
+    assert rel_cfg_arg == os.path.abspath("sessions.json")
+
+    # 4h. Preflight `colab sessions` failure MUST abort BEFORE `colab run` allocates a TPU
+    pre_fail_calls: List[List[str]] = []
+
+    def _mock_pre_sessions_fail_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        pre_fail_calls.append(list(cmd))
+        if cmd[-1] == "version":
+            return subprocess.CompletedProcess(cmd, 0, "Version: 0.8.0\n", "")
+        if "usage" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "100.0\n", "")
+        if "sessions" in cmd:
+            return subprocess.CompletedProcess(cmd, 1, "", "FileNotFoundError: empty parent path")
+        raise AssertionError(f"colab run must not execute after sessions preflight failure: {cmd}")
+
+    try:
+        run_colab_tpu_suites(
+            suites=["compute"],
+            quick=True,
+            colab_bin="colab",
+            auth="adc",
+            tpu_order=("v5e1",),
+            config_path=Path("sessions.json"),
+            timeout_s=120.0,
+            runner=_mock_pre_sessions_fail_runner,
+        )
+    except RuntimeError as exc:
+        assert "sessions preflight failed" in str(exc), str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("Expected RuntimeError on failed sessions preflight")
+    assert not any("run" in c for c in pre_fail_calls)
+    sess_cfg = pre_fail_calls[-1][pre_fail_calls[-1].index("--config") + 1]
+    assert Path(sess_cfg).is_absolute()
+
     print(
         json.dumps(
             {
@@ -2410,7 +2460,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             report["comms"] = run_comms_suite(args.comms_host, args.comms_port, quick=args.quick)
     elif args.backend == "colab_tpu":
         tpu_order = ("v6e1", "v5e1") if args.colab_tpu == "auto" else (args.colab_tpu,)
-        cfg_path = Path(args.colab_config) if args.colab_config else None
+        cfg_path = Path(os.path.abspath(os.path.expanduser(args.colab_config))) if args.colab_config else None
         colab_res = run_colab_tpu_suites(
             suites=suites,
             quick=args.quick,

@@ -45,8 +45,9 @@ ctest --test-dir libopenbuenos/build/cmake-host --output-on-failure
 make -C libopenbuenos verify-header android verify-android
 make -C runtime verify-baremetal
 
-# Push runner, locally extracted DIVE interpreter, and a local compiled .dgc0 + input onto your own unlocked device
-adb push runtime/build/tpu_baremetal_runner /data/local/tmp/tpu_open_stack/
+# Create the device staging directory, then push runner, DIVE interpreter, and a local .dgc0 + input
+adb shell "mkdir -p /data/local/tmp/tpu_open_stack"
+adb push runtime/build/tpu_baremetal_runner /data/local/tmp/tpu_open_stack/tpu_baremetal_runner
 adb push /path/to/local/dive_interp_rv64.bin /data/local/tmp/tpu_open_stack/dive_interp_rv64.bin
 adb push /path/to/local/model.dgc0 /data/local/tmp/tpu_open_stack/model.dgc0
 adb push /path/to/local/input.bin /data/local/tmp/tpu_open_stack/input.bin
