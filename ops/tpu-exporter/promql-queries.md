@@ -40,16 +40,38 @@ max by (generation, node, pci_bdf) (freetpu_tpu_hbm_used_bytes) / (1024 * 1024 *
 ## Billing, Chargeback & Idle Waste Detection
 
 ```promql
-# Active chip-hours accrued over 24h per physical chip (generation, node, pci_bdf):
-# chip has >= 1 active host PID (from the node collector) OR duty cycle > 1%
-# (from a workload sidecar or local collector). Both signals are aggregated to
-# the same (generation, node, pci_bdf) label set before `or` so one physical
-# chip never accrues hours across multiple collector series.
+# Per-chip active chip-hours accrued over 24h per physical chip (generation, node, pci_bdf):
+# Uses chip-specific runtime telemetry (duty cycle > 1% or allocated HBM > 0) for all
+# chips, and includes host-wide VFIO PID handles (`collector_role="node"`) ONLY for
+# chips with an exclusive (non-shared) `/dev/vfio/<group>` node so a workload opening
+# a shared VFIO group never accrues per-chip active hours for idle sibling chips.
 sum_over_time(
   (
-    clamp_max(max by (generation, node, pci_bdf) (freetpu_tpu_active_pids{collector_role="node"}) > 0, 1)
+    clamp_max(
+      max by (generation, node, pci_bdf) (
+        freetpu_tpu_active_pids{collector_role="node"}
+        and on (node, vfio_device)
+        (count by (node, vfio_device) (group by (node, vfio_device, pci_bdf) (freetpu_tpu_info)) == 1)
+      ) > 0,
+      1
+    )
     or
     ((max by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent) > 1) * 0 + 1)
+    or
+    ((max by (generation, node, pci_bdf) (freetpu_tpu_hbm_used_bytes) > 0) * 0 + 1)
+  )[24h:1m]
+) / 60
+
+# Shared-VFIO-group reservation hours over 24h (tracked at group granularity
+# `(generation, node, vfio_device)` as reservation evidence rather than per-BDF activity)
+sum_over_time(
+  clamp_max(
+    max by (generation, node, vfio_device) (
+      freetpu_tpu_active_pids{collector_role="node"}
+      and on (node, vfio_device)
+      (count by (node, vfio_device) (group by (node, vfio_device, pci_bdf) (freetpu_tpu_info)) > 1)
+    ) > 0,
+    1
   )[24h:1m]
 ) / 60
 
@@ -89,10 +111,15 @@ sum_over_time(
 
 # Duty-cycle telemetry coverage ratio per generation (0.0 - 1.0).
 # Deduplicates physical chips by (generation, node, pci_bdf) across node
-# DaemonSet and workload sidecar targets. Check coverage before extrapolating
-# utilization-adjusted costs across the fleet.
+# DaemonSet and workload sidecar targets, and supplies a `0` numerator for any
+# discovered generation with zero PCI-mapped duty-cycle readings so low-coverage
+# alerts still fire when coverage is 0.
 (
-  count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent))
+  (
+    count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent))
+    or
+    (0 * count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_info)))
+  )
   /
   count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_info))
 )
@@ -102,10 +129,13 @@ sum_over_time(
 # on `freetpu_tpu_info` (never double-counting when a node runs both the
 # DaemonSet and workload sidecars, and still counting unhealthy/unbound chips
 # that Google Cloud bills while the TPU node is READY).
-# Replace 1.20 / 2.70 with your spot/on-demand SKU rate; use Google Cloud billing
+# Replace the placeholder per-chip hourly SKU rates (v5e: 1.20, v5p: 4.20,
+# v6e: 2.70) with your contract/spot/on-demand rates; use Google Cloud billing
 # or billable node inventory for authoritative chargeback.
 (
   count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_info{generation="v5e"})) * 1.20
+  or
+  count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_info{generation="v5p"})) * 4.20
   or
   count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_info{generation="v6e"})) * 2.70
 )
@@ -114,10 +144,13 @@ sum_over_time(
 # Restricts BOTH numerator and denominator to deduplicated physical chips
 # `(generation, node, pci_bdf)` with usable, PCI-mapped
 # `freetpu_tpu_duty_cycle_percent` readings so neither partial telemetry coverage
-# nor multiple collectors per node skew the estimate. Check the telemetry
-# coverage ratio above before extrapolating fleet-wide.
+# nor multiple collectors per node skew the estimate. Replace the placeholder
+# SKU rates (v5e: 1.20, v5p: 4.20, v6e: 2.70) with your rates, and check the
+# telemetry coverage ratio above before extrapolating fleet-wide.
 (
   count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent{generation="v5e"})) * 1.20
+  or
+  count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent{generation="v5p"})) * 4.20
   or
   count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent{generation="v6e"})) * 2.70
 ) / clamp_min(sum by (generation) (max by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent) / 100), 0.01)

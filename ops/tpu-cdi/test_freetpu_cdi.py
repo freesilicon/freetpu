@@ -808,6 +808,71 @@ class FreeTpuCdiTests(unittest.TestCase):
             )
             self.assertTrue(any("hooks" in e for e in errs_dh))
 
+            # 5. Case-variant / unknown keys (Go JSON decoder matches case-insensitively!)
+            # must be rejected on deviceNodes, containerEdits, device entries, and root.
+            case_major_spec = json.loads(json.dumps(base_spec))
+            case_major_spec["devices"][0]["containerEdits"]["deviceNodes"][0]["Major"] = 242
+            case_major_spec["devices"][0]["containerEdits"]["deviceNodes"][0]["Minor"] = 99
+            errs_case_major = freetpu_cdi.verify_spec_against_host(
+                case_major_spec, sysfs_root=sysfs_root, dev_root=dev_root
+            )
+            self.assertTrue(any("Major" in e and "Minor" in e for e in errs_case_major))
+            self.assertTrue(any("Major" in e for e in freetpu_cdi.validate_cdi_spec(case_major_spec)))
+
+            case_hp_spec = json.loads(json.dumps(base_spec))
+            case_hp_spec["devices"][0]["containerEdits"]["deviceNodes"][0]["HostPath"] = str(
+                dev_root / "vfio" / "99"
+            )
+            errs_case_hp = freetpu_cdi.verify_spec_against_host(
+                case_hp_spec, sysfs_root=sysfs_root, dev_root=dev_root
+            )
+            self.assertTrue(any("HostPath" in e for e in errs_case_hp))
+
+            case_hooks_spec = json.loads(json.dumps(base_spec))
+            case_hooks_spec["containerEdits"]["Hooks"] = [
+                {"hookName": "createRuntime", "path": "/bin/sh"}
+            ]
+            errs_case_hooks = freetpu_cdi.verify_spec_against_host(
+                case_hooks_spec, sysfs_root=sysfs_root, dev_root=dev_root
+            )
+            self.assertTrue(any("Hooks" in e for e in errs_case_hooks))
+
+            case_mounts_spec = json.loads(json.dumps(base_spec))
+            case_mounts_spec["devices"][0]["containerEdits"]["Mounts"] = [
+                {"hostPath": "/tmp", "containerPath": "/dev/vfio"}
+            ]
+            errs_case_mounts = freetpu_cdi.verify_spec_against_host(
+                case_mounts_spec, sysfs_root=sysfs_root, dev_root=dev_root
+            )
+            self.assertTrue(any("Mounts" in e for e in errs_case_mounts))
+
+            # Duplicate/case-colliding JSON keys in raw spec file must fail CLI validate --check-host.
+            raw_spec_path = root / "dup-keys.json"
+            raw_spec_path.write_text(
+                json.dumps(case_major_spec),
+                encoding="utf-8",
+            )
+            script = CDI_DIR / "freetpu_cdi.py"
+            cli_dup = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "validate",
+                    str(raw_spec_path),
+                    "--check-host",
+                    "--remove-if-stale",
+                    "--sysfs-root",
+                    str(sysfs_root),
+                    "--dev-root",
+                    str(dev_root),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(cli_dup.returncode, 0)
+            self.assertFalse(raw_spec_path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

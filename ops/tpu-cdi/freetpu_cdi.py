@@ -454,6 +454,40 @@ def build_cdi_spec(
     }
 
 
+_ALLOWED_SPEC_ROOT_KEYS = frozenset(
+    {"cdiVersion", "kind", "annotations", "containerEdits", "devices"}
+)
+_ALLOWED_DEVICE_ENTRY_KEYS = frozenset({"name", "annotations", "containerEdits"})
+_ALLOWED_DEVICE_NODE_KEYS = frozenset(
+    {"path", "hostPath", "type", "major", "minor", "fileMode", "permissions", "uid", "gid"}
+)
+_HOST_VALIDATED_CONTAINER_EDITS_KEYS = frozenset({"env", "deviceNodes"})
+_HOST_VALIDATED_DEVICE_NODE_KEYS = frozenset({"path", "hostPath", "type", "permissions"})
+
+
+def _load_json_strict_keys(raw: str) -> Any:
+    """Parse JSON while rejecting duplicate keys (case-insensitively) within any object.
+
+    Containerd 2.0's Go CDI decoder matches JSON fields case-insensitively; rejecting
+    duplicate or case-colliding keys prevents smuggling shadow fields (e.g. `Major`).
+    """
+
+    def _no_duplicate_keys(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+        obj: Dict[str, Any] = {}
+        seen_lower: Dict[str, str] = {}
+        for k, v in pairs:
+            kl = k.lower()
+            if kl in seen_lower:
+                raise ValueError(
+                    f"duplicate or case-colliding JSON key {k!r} (conflicts with {seen_lower[kl]!r})"
+                )
+            seen_lower[kl] = k
+            obj[k] = v
+        return obj
+
+    return json.loads(raw, object_pairs_hook=_no_duplicate_keys)
+
+
 def _validate_container_edits(edits: Any, context: str, errors: List[str]) -> None:
     if not isinstance(edits, dict):
         errors.append(f"{context}: must be a JSON object")
@@ -480,6 +514,11 @@ def _validate_container_edits(edits: Any, context: str, errors: List[str]) -> No
                 if not isinstance(node, dict):
                     errors.append(f"{nc}: must be an object")
                     continue
+                unknown_node_keys = set(node.keys()) - _ALLOWED_DEVICE_NODE_KEYS
+                if unknown_node_keys:
+                    errors.append(
+                        f"{nc}: unsupported CDI v0.6.0 deviceNode keys: {sorted(unknown_node_keys)}"
+                    )
                 path = node.get("path")
                 if not isinstance(path, str) or not path.startswith("/"):
                     errors.append(f"{nc}.path: must be an absolute path")
@@ -543,6 +582,10 @@ def validate_cdi_spec(spec: Any) -> List[str]:
     if not isinstance(spec, dict):
         return ["CDI spec root must be a JSON object"]
 
+    unknown_root = set(spec.keys()) - _ALLOWED_SPEC_ROOT_KEYS
+    if unknown_root:
+        errors.append(f"unsupported CDI v0.6.0 root keys: {sorted(unknown_root)}")
+
     if spec.get("cdiVersion") != CDI_VERSION:
         errors.append(f"cdiVersion must be {CDI_VERSION!r}, got {spec.get('cdiVersion')!r}")
 
@@ -578,6 +621,9 @@ def validate_cdi_spec(spec: Any) -> List[str]:
         if not isinstance(dev, dict):
             errors.append(f"{dc}: must be a JSON object")
             continue
+        unknown_dev = set(dev.keys()) - _ALLOWED_DEVICE_ENTRY_KEYS
+        if unknown_dev:
+            errors.append(f"{dc}: unsupported CDI v0.6.0 device keys: {sorted(unknown_dev)}")
         name = dev.get("name")
         if not isinstance(name, str) or not _CDI_DEVICE_NAME_RE.match(name):
             errors.append(f"{dc}.name: invalid CDI device name {name!r}")
@@ -645,9 +691,6 @@ def _parse_vfio_devnums_annotation(raw: Any) -> Dict[str, str]:
     return result
 
 
-_HOST_VALIDATED_CONTAINER_EDITS_KEYS = frozenset({"env", "deviceNodes"})
-
-
 def _check_host_safe_container_edits(edits: Any, context: str, errors: List[str]) -> None:
     """Reject unchecked mounts, OCI hooks, or other non-VFIO edits in host-validated specs."""
     if not isinstance(edits, dict):
@@ -656,7 +699,17 @@ def _check_host_safe_container_edits(edits: Any, context: str, errors: List[str]
     if disallowed:
         errors.append(
             f"{context}: disallowed containerEdits in host-validated TPU spec: {disallowed} "
-            "(mounts and OCI hooks are rejected in --check-host mode)"
+            "(only exact 'env' and 'deviceNodes' keys are permitted in --check-host mode)"
+        )
+
+
+def _check_host_safe_device_node_keys(node: Dict[str, Any], context: str, errors: List[str]) -> None:
+    """Enforce exact allowlist of deviceNode keys so case-folded Go JSON fields cannot bypass checks."""
+    disallowed = sorted(set(node.keys()) - _HOST_VALIDATED_DEVICE_NODE_KEYS)
+    if disallowed:
+        errors.append(
+            f"{context}: disallowed deviceNode keys in host-validated TPU spec: {disallowed} "
+            "(explicit major/minor and non-canonical keys are rejected in --check-host mode)"
         )
 
 
@@ -668,15 +721,20 @@ def verify_spec_against_host(
 ) -> List[str]:
     """Revalidate all effective global and per-device CDI nodes against live host VFIO state.
 
-    Verifies the exact host device CDI will inject (`hostPath` or fallback `path`),
-    rejects pinned `major`/`minor` numbers, rejects unchecked `mounts` and OCI `hooks`,
-    validates global `containerEdits.deviceNodes` (which CDI applies to every selector),
-    checks that every VFIO group still maps to the exact TPU PCI BDF(s) with zero
-    non-TPU members, and flags changed char device numbers.
+    Enforces exact allowlists on root, device, containerEdits, and deviceNode keys
+    (blocking case-folded Go JSON decoder fields like `Major`, `HostPath`, `Hooks`,
+    `Mounts`), verifies the exact host device CDI will inject (`hostPath` or fallback
+    `path`), validates global `containerEdits.deviceNodes`, checks that every VFIO group
+    still maps to the exact TPU PCI BDF(s) with zero non-TPU members, and flags changed
+    char device numbers.
     """
     errors: List[str] = []
     if not isinstance(spec, dict):
         return ["CDI spec root must be a JSON object"]
+
+    unknown_root = sorted(set(spec.keys()) - _ALLOWED_SPEC_ROOT_KEYS)
+    if unknown_root:
+        errors.append(f"disallowed root keys in host-validated TPU spec: {unknown_root}")
 
     try:
         live_chips, vfio_container = discover_tpu_chips(
@@ -719,10 +777,7 @@ def verify_spec_against_host(
                 errors.append(f"{nc}: must be an object")
                 continue
             global_nodes.append(node)
-            if "major" in node or "minor" in node:
-                errors.append(
-                    f"{nc}: explicit major/minor pins device numbers and bypasses dynamic hostPath resolution"
-                )
+            _check_host_safe_device_node_keys(node, nc, errors)
             eff_host = _resolve_effective_host_path(node)
             if not eff_host.exists():
                 errors.append(f"{nc}: effective hostPath {eff_host} does not exist on host")
@@ -753,6 +808,9 @@ def verify_spec_against_host(
         if not isinstance(dev, dict):
             continue
         name = dev.get("name", f"devices[{idx}]")
+        unknown_dev = sorted(set(dev.keys()) - _ALLOWED_DEVICE_ENTRY_KEYS)
+        if unknown_dev:
+            errors.append(f"device {name!r}: disallowed device keys in host-validated TPU spec: {unknown_dev}")
         edits = dev.get("containerEdits")
         _check_host_safe_container_edits(edits, f"device {name!r} containerEdits", errors)
         dev_nodes = (
@@ -775,10 +833,7 @@ def verify_spec_against_host(
             if not isinstance(node, dict):
                 errors.append(f"{nc}: must be an object")
                 continue
-            if "major" in node or "minor" in node:
-                errors.append(
-                    f"{nc}: explicit major/minor pins device numbers and bypasses dynamic hostPath resolution"
-                )
+            _check_host_safe_device_node_keys(node, nc, errors)
             eff_host = _resolve_effective_host_path(node)
             if not eff_host.exists():
                 errors.append(f"{nc}: effective hostPath {eff_host} does not exist on host")
@@ -1102,8 +1157,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else:
             raw = Path(args.spec_path).read_text(encoding="utf-8")
         try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError as exc:
+            parsed = _load_json_strict_keys(raw)
+        except (json.JSONDecodeError, ValueError) as exc:
+            if args.check_host and args.remove_if_stale and args.spec_path != "-":
+                if _invalidate_spec(Path(args.spec_path)):
+                    sys.stderr.write(f"Removed stale CDI spec at {args.spec_path}\n")
             sys.stderr.write(f"Invalid JSON: {exc}\n")
             return 1
         errors = validate_cdi_spec(parsed)
