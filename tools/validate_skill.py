@@ -47,6 +47,30 @@ def _forbidden_text_patterns() -> Tuple[Tuple[str, str], ...]:
     )
 
 
+def _secret_redaction_patterns() -> Tuple[Tuple[str, str], ...]:
+    # Split literals so this validator does not trigger on its own source.
+    return (
+        (
+            r"-----BEGIN [A-Z ]*PRIVATE " + r"KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE " + r"KEY-----",
+            "[REDACTED_PRIVATE_KEY]",
+        ),
+        (r"-----BEGIN [A-Z ]*PRIVATE " + r"KEY-----", "[REDACTED_PRIVATE_KEY]"),
+        (r"\bgh[pousr]_[A-Za-z0-9]{20,}\b", "[REDACTED_GITHUB_TOKEN]"),
+        (r"\bgithub_pat_[A-Za-z0-9_]{20,}\b", "[REDACTED_GITHUB_TOKEN]"),
+        (r"\bAIza[0-9A-Za-z\-_]{30,}\b", "[REDACTED_API_KEY]"),
+        (r"\bsk-[A-Za-z0-9_-]{20,}\b", "[REDACTED_API_KEY]"),
+        (r"\bAKIA[0-9A-Z]{16}\b", "[REDACTED_AWS_KEY]"),
+    )
+
+
+def redact_secrets(text: str) -> str:
+    """Scrub detected secret tokens/keys before emitting diagnostics."""
+    redacted = text
+    for pat, repl in _secret_redaction_patterns():
+        redacted = re.sub(pat, repl, redacted)
+    return redacted
+
+
 def _extract_frontmatter_block(text: str) -> Tuple[str, str]:
     """Split a Markdown file with YAML frontmatter into `(frontmatter_yaml, body)`."""
     lines = text.splitlines()
@@ -241,10 +265,10 @@ def _parse_frontmatter_stdlib(fm_text: str) -> Dict[str, Any]:
                 data[key] = None
             elif indented[0] == "-" or indented[0].startswith("- "):
                 data[key] = indented
-            elif re.match(r"^[A-Za-z0-9_-]+\s*:", indented[0]):
+            elif re.match(r"^[A-Za-z0-9_-]+\s*:(?:\s|$)", indented[0]):
                 seen_nested = set()
                 for sub_line in indented:
-                    sub_m = re.match(r"^([A-Za-z0-9_-]+)\s*:", sub_line)
+                    sub_m = re.match(r"^([A-Za-z0-9_-]+)\s*:(?:\s|$)", sub_line)
                     if sub_m:
                         sub_key = sub_m.group(1)
                         if sub_key in seen_nested:
@@ -252,7 +276,36 @@ def _parse_frontmatter_stdlib(fm_text: str) -> Dict[str, Any]:
                         seen_nested.add(sub_key)
                 data[key] = {"_lines": indented}
             else:
-                raise ValueError(f"Unsupported indented block under {key!r}: {indented[0]!r}")
+                # Valid YAML permits an indented scalar or flow collection on the line after `key:`.
+                first_cleaned = _strip_inline_comment(indented[0])
+                if first_cleaned.startswith("[") or first_cleaned.startswith("{"):
+                    acc = " ".join(_strip_inline_comment(item) for item in indented).strip()
+                    data[key] = _parse_yaml_scalar_stdlib(acc)
+                elif len(indented) == 1:
+                    data[key] = _parse_yaml_scalar_stdlib(indented[0])
+                elif first_cleaned.startswith(('"', "'")):
+                    acc = " ".join(_strip_inline_comment(item) for item in indented).strip()
+                    data[key] = _parse_yaml_scalar_stdlib(acc)
+                else:
+                    parts: List[str] = []
+                    for item in indented:
+                        part = _strip_inline_comment(item)
+                        if not part:
+                            continue
+                        if part == "-" or part.startswith("- ") or re.search(r":(?:\s|$)", part):
+                            raise ValueError(
+                                f"Invalid YAML frontmatter: invalid indented scalar under {key!r}: {part!r}"
+                            )
+                        parts.append(part)
+                    if not parts:
+                        data[key] = None
+                    elif len(parts) == 1:
+                        data[key] = _parse_yaml_scalar_stdlib(parts[0])
+                    else:
+                        first_val = _parse_yaml_scalar_stdlib(parts[0])
+                        if not isinstance(first_val, str):
+                            first_val = parts[0]
+                        data[key] = " ".join([first_val, *parts[1:]])
             continue
 
         if cleaned.startswith("[") or cleaned.startswith("{"):
@@ -391,13 +444,14 @@ def validate_skill(
             )
         else:
             name = fm["name"]
+            safe_name = redact_secrets(name)
             if len(name) > MAX_SKILL_NAME_LEN or not re.match(r"^[a-z0-9]+(?:-[a-z0-9]+)*$", name):
                 errors.append(
-                    f"{skill_md}: invalid frontmatter name {name!r} "
+                    f"{skill_md}: invalid frontmatter name {safe_name!r} "
                     f"(expected lowercase hyphenated, <= {MAX_SKILL_NAME_LEN} chars)"
                 )
             elif name != skill_dir.name:
-                errors.append(f"{skill_md}: frontmatter name {name!r} != directory name {skill_dir.name!r}")
+                errors.append(f"{skill_md}: frontmatter name {safe_name!r} != directory name {skill_dir.name!r}")
 
         if "description" not in fm:
             errors.append(f"{skill_md}: missing required frontmatter field 'description'")
@@ -508,7 +562,7 @@ def validate_skill(
         if "skills/freetpu" not in readme_text or "Agent Skill" not in readme_text:
             errors.append(f"{readme_path}: missing Agent Skill quick-install section referencing skills/freetpu")
 
-    return errors
+    return [redact_secrets(err) for err in errors]
 
 
 def run_validator_self_test(*, require_yaml: bool = False) -> None:
@@ -550,6 +604,14 @@ def run_validator_self_test(*, require_yaml: bool = False) -> None:
     )
     _check_skill_md(
         "---\nname: freetpu\ndescription: Build and verify TPU kernels via https://example.com before timing.\n---\nBody\n",
+        should_pass=True,
+    )
+    _check_skill_md(
+        "---\nname: freetpu\ndescription:\n  Indented plain string description that easily exceeds forty characters.\n---\nBody\n",
+        should_pass=True,
+    )
+    _check_skill_md(
+        "---\nname: freetpu\ndescription:\n  Indented plain string description\n  continued on the next line cleanly.\n---\nBody\n",
         should_pass=True,
     )
 
@@ -643,6 +705,53 @@ def run_validator_self_test(*, require_yaml: bool = False) -> None:
     else:
         raise AssertionError("stdlib parser failed to reject plain scalar containing ': '")
 
+    fm_indented = _parse_frontmatter_stdlib(
+        "name: freetpu\ndescription:\n  Indented plain string.\n"
+    )
+    assert fm_indented["description"] == "Indented plain string.", f"Unexpected indented value: {fm_indented!r}"
+    fm_indented_multi = _parse_frontmatter_stdlib(
+        "name: freetpu\ndescription:\n  Indented plain string\n  across two lines.\n"
+    )
+    assert fm_indented_multi["description"] == "Indented plain string across two lines.", fm_indented_multi
+
+    # Verify accidentally pasted secrets in frontmatter are redacted from all emitted diagnostics.
+    fake_token = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4"
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        sdir = root / "skills" / "freetpu"
+        (sdir / "templates").mkdir(parents=True)
+        (sdir / "SKILL.md").write_text(
+            f"---\nname: {fake_token}\ndescription: Valid string description that is definitely longer than forty characters.\n---\n",
+            encoding="utf-8",
+        )
+        (sdir / "templates" / "noop.py").write_text("x = 1\n", encoding="utf-8")
+        readme = root / "README.md"
+        readme.write_text("# Agent Skill\nInstall `skills/freetpu`.\n", encoding="utf-8")
+        errs = validate_skill(root, sdir, readme, run_self_tests=False, require_yaml=require_yaml)
+        joined = "\n".join(errs)
+        assert errs and fake_token not in joined, f"Secret leaked in diagnostics: {joined!r}"
+        assert "[REDACTED_GITHUB_TOKEN]" in joined, f"Expected redaction marker in: {joined!r}"
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--repo-root",
+                str(root),
+                "--skill-dir",
+                str(sdir),
+                "--readme",
+                str(readme),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode != 0
+        assert fake_token not in proc.stdout and fake_token not in proc.stderr, (
+            f"Secret leaked in CLI output: stdout={proc.stdout!r}, stderr={proc.stderr!r}"
+        )
+        assert "[REDACTED_GITHUB_TOKEN]" in proc.stderr, f"Expected redaction marker in stderr: {proc.stderr!r}"
+
     # Verify templates using `from __future__ import annotations` are rejected (breaks `colab run` cell prepending).
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -693,7 +802,7 @@ def main() -> int:
     )
     if errors:
         for err in errors:
-            print(f"ERROR: {err}", file=sys.stderr)
+            print(f"ERROR: {redact_secrets(err)}", file=sys.stderr)
         return 1
 
     tpl_count = len(list((skill_dir / "templates").glob("*.py")))

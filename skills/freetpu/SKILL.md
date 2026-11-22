@@ -112,14 +112,20 @@ Use this workflow with `google-colab-cli >= 0.7.6` (redacted logs) to run Pallas
        --out-dir "$WORK_DIR/proof" \
        --script skills/freetpu/templates/tile_fused_gemm_silu.py
      ```
-   - Direct CLI pattern (do **not** assume default `colab run` teardown succeeded: if unassign fails, `colab run` suppresses the error, removes the local session record, and still prints `Session terminated.` while leaving the TPU billing CUs. Register a signal-safe `EXIT`/`INT`/`TERM` cleanup trap **before** launching `colab run --keep` so cancellation still releases the TPU, and verify ADC auth with `colab usage` plus server-side `colab sessions` so an ADC refresh failure swallowed by `colab sessions` on an empty store cannot look like a clean teardown):
+   - Direct CLI pattern (do **not** assume default `colab run` teardown succeeded: if unassign fails, `colab run` suppresses the error, removes the local session record, and still prints `Session terminated.` while leaving the TPU billing CUs. Snapshot existing server-side endpoints and register a signal-safe `EXIT`/`INT`/`TERM` cleanup trap **before** launching `colab run --keep` so cancellation still releases the TPU, and verify ADC auth with `colab usage` plus server-side `colab sessions`—treating any unknown endpoint after cancellation or any newly appearing unnamed `[?]` assignment as unconfirmed teardown):
      ```bash
      (
        SESSION_ID="freetpu-probe-$(date +%Y%m%d-%H%M%S)-$$"
        RUN_RC=0
        RUN_PID=""
        ENDPOINT=""
+       CANCELLED=0
        CLEANED=0
+
+       # Snapshot pre-existing server-side endpoints so cancellation before $COLAB_STATE is
+       # saved can detect any newly allocated unnamed `[?]` assignment:
+       BASE_SESS="$(colab --auth=adc --config "$COLAB_STATE" sessions 2>/dev/null)" || BASE_SESS=""
+       BASE_ENDPOINTS="$(printf '%s\n' "$BASE_SESS" | awk '$1 ~ /^\[/ && $2 != "" {print $2}')"
 
        cleanup() {
          [ "$CLEANED" -eq 1 ] && return
@@ -140,6 +146,7 @@ Use this workflow with `google-colab-cli >= 0.7.6` (redacted logs) to run Pallas
          # and exits 0; run `colab usage` (which propagates auth failures non-zero) and inspect
          # `colab sessions` stderr/stdout to require a confirmed server-side teardown.
          SESS_ERR="$WORK_DIR/sessions.err"
+         NEW_UNNAMED=""
          TEARDOWN_RC=0
          if ! colab --auth=adc --config "$COLAB_STATE" usage >/dev/null; then
            TEARDOWN_RC=1
@@ -147,21 +154,29 @@ Use this workflow with `google-colab-cli >= 0.7.6` (redacted logs) to run Pallas
            TEARDOWN_RC=1
          elif grep -Eiq 'No valid default credentials|Failed to refresh' "$SESS_ERR"; then
            TEARDOWN_RC=1
-         elif [ "$STOP_RC" -ne 0 ] \
-           || { [ "$RUN_RC" -eq 0 ] && [ -z "$ENDPOINT" ]; } \
-           || printf '%s\n' "$SESS_OUT" | awk -v s="[$SESSION_ID]" -v e="$ENDPOINT" \
-                '$1 == s || (e != "" && $2 == e) {found=1} END {exit !found}'; then
-           TEARDOWN_RC=1
+         else
+           NEW_UNNAMED="$(printf '%s\n' "$SESS_OUT" | awk -v base="$BASE_ENDPOINTS" '
+             BEGIN { n = split(base, arr, "\n"); for (i = 1; i <= n; i++) if (arr[i] != "") seen[arr[i]] = 1 }
+             $1 == "[?]" && $2 != "" && !($2 in seen) { print $2 }
+           ' | tr '\n' ' ' | sed 's/ *$//')"
+           if [ "$STOP_RC" -ne 0 ] \
+             || { [ -z "$ENDPOINT" ] && { [ "$RUN_RC" -eq 0 ] || [ "$CANCELLED" -eq 1 ]; }; } \
+             || [ -n "$NEW_UNNAMED" ] \
+             || printf '%s\n' "$SESS_OUT" | awk -v s="[$SESSION_ID]" -v e="$ENDPOINT" \
+                  '$1 == s || (e != "" && $2 == e) {found=1} END {exit !found}'; then
+             TEARDOWN_RC=1
+           fi
          fi
 
          if [ "$TEARDOWN_RC" -ne 0 ]; then
-           echo "ERROR: TPU teardown unconfirmed for $SESSION_ID (${ENDPOINT:-unknown endpoint}); re-authenticate if needed, retry colab stop with $COLAB_STATE, or terminate in Colab UI (Runtime -> Manage sessions)." >&2
+           echo "ERROR: TPU teardown unconfirmed for $SESSION_ID (endpoint=${ENDPOINT:-unknown}; new unnamed assignments: ${NEW_UNNAMED:-none}); re-authenticate if needed, retry colab stop with $COLAB_STATE, or terminate in Colab UI (Runtime -> Manage sessions)." >&2
            exit 1
          fi
          exit "$RUN_RC"
        }
 
        on_signal() {
+         CANCELLED=1
          RUN_RC="$1"
          [ -n "$RUN_PID" ] && kill -TERM "$RUN_PID" 2>/dev/null || true
          [ -n "$RUN_PID" ] && wait "$RUN_PID" 2>/dev/null || true
