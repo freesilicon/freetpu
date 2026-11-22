@@ -41,23 +41,25 @@ PROBE_JSON_END = "=== FREETPU_COLAB_PROBE_JSON_END ==="
 DEFAULT_TPU_ORDER: Tuple[str, ...] = ("v6e1", "v5e1")
 SUPPORTED_TPUS = frozenset({"v6e1", "v5e1"})
 
-_FALLBACK_ERROR_MARKERS = (
-    "412",
-    "400",
-    "readtimeout",
-    "read timed out",
-    "timed out",
+_ALLOCATION_ERROR_MARKERS = (
+    "allocation refused",
+    "backend rejected accelerator",
+    "toomanyassignmentserror",
+    "failed_precondition",
+    "precondition failed",
     "reason_no_backends",
     "reason_too_many_active_assignments",
     "reason_quota_exceeded_usage_time",
     "reason_runtime_version_unavailable",
-    "failed_precondition",
-    "allocation refused",
-    "backend rejected accelerator",
-    "too many active",
-    "no backends",
-    "capacity",
     "quota or entitlement",
+    "too many active sessions",
+    "no backends",
+)
+
+_COLAB_CONTROL_HOSTS = (
+    "colab.research.google.com",
+    "colaboratory.googleapis.com",
+    "colab.pa.googleapis.com",
 )
 
 
@@ -157,7 +159,8 @@ def detect_cli_capabilities(
     res = runner([colab_bin, "--help"])
     combined = f"{res.stdout}\n{res.stderr}"
     return {
-        "has_no_public_api": "--no-public-api" in combined,
+        "has_public_api": bool(re.search(r"(?<![A-Za-z0-9-])--public-api\b", combined)),
+        "has_no_public_api": bool(re.search(r"(?<![A-Za-z0-9-])--no-public-api\b", combined)),
         "has_config": "--config" in combined,
         "has_auth": "--auth" in combined,
     }
@@ -174,19 +177,38 @@ def build_base_cmd(
         cmd.extend(["--auth", cfg.auth])
     if caps.get("has_config", True):
         cmd.extend(["--config", str(isolated_config_path)])
-    if cfg.use_no_public_api and caps.get("has_no_public_api", False):
-        cmd.append("--no-public-api")
+    if cfg.use_no_public_api:
+        if caps.get("has_no_public_api", False):
+            cmd.append("--no-public-api")
+    else:
+        if not caps.get("has_public_api", False):
+            raise ValueError(
+                "Installed `colab` CLI does not support `--public-api`; omit `--public-api` "
+                "(or upgrade google-colab-cli) instead of silently using the tunnel backend."
+            )
+        cmd.append("--public-api")
     return cmd
 
 
 def is_capacity_or_quota_error(
     returncode: int, stdout: str, stderr: str
 ) -> bool:
-    """Return True if a failed `colab run` indicates accelerator unavailability."""
+    """Return True iff `colab run` failed during VM allocation (never after execution started)."""
+    del stdout  # Remote workload stdout must never trigger TPU re-execution.
     if returncode == 0:
         return False
-    haystack = f"{stderr}\n{stdout}".lower()
-    return any(marker in haystack for marker in _FALLBACK_ERROR_MARKERS)
+    err_lower = stderr.lower()
+    # Once `colab run` prints `[colab] Session READY (...)`, the VM was allocated
+    # and the user workload began executing; never fall back and duplicate side effects.
+    if "[colab] session ready" in err_lower:
+        return False
+    if any(marker in err_lower for marker in _ALLOCATION_ERROR_MARKERS):
+        return True
+    if ("readtimeout" in err_lower or "read timed out" in err_lower) and any(
+        host in err_lower for host in _COLAB_CONTROL_HOSTS
+    ):
+        return True
+    return False
 
 
 def extract_probe_json(stdout: str) -> Optional[Dict[str, Any]]:
@@ -330,7 +352,10 @@ def run_benchmark(
         return 2, {"error": f"Script not found: {script_file}"}
 
     caps = detect_cli_capabilities(cfg.colab_bin, runner)
-    base_cmd = build_base_cmd(cfg, caps, isolated_config)
+    try:
+        base_cmd = build_base_cmd(cfg, caps, isolated_config)
+    except ValueError as exc:
+        return 2, {"status": "unsupported_public_api_flag", "error": str(exc)}
 
     planned_commands: List[List[str]] = [[*base_cmd, "usage"]]
     for idx, tpu in enumerate(cfg.tpus):
@@ -581,12 +606,54 @@ def run_self_test() -> int:
         assert summary_dry["status"] == "dry_run"
         assert len(summary_dry["planned_commands"]) == 5
 
-        # 6. ReadTimeout on v6e1 triggers fallback to v5e1.
+        # 6. Allocation-stage Colab ReadTimeout triggers fallback, while post-allocation
+        #    workload errors (after Session READY) or arbitrary stdout numbers NEVER do.
         assert is_capacity_or_quota_error(
-            1, "", "ReadTimeout: HTTPSConnectionPool Read timed out. (read timeout=45.0)"
+            1,
+            "",
+            "[colab] Creating session 'x'...\n"
+            "ReadTimeout: HTTPSConnectionPool(host='colab.research.google.com', port=443): "
+            "Read timed out. (read timeout=45.0)",
+        )
+        assert not is_capacity_or_quota_error(
+            1,
+            "HTTP 400 / 412 / REASON_NO_BACKENDS in workload stdout",
+            "[colab] Creating session 'x'...\n[colab] Session READY (x). Executing job.py...\n"
+            "ReadTimeout: HTTPSConnectionPool(host='example.com', port=443): Read timed out.",
+        )
+        assert not is_capacity_or_quota_error(
+            1,
+            "step=400 loss=0.412",
+            "[colab] Creating session 'x'...\nRuntimeError: bad input",
         )
 
-    print("colab_tpu_bench.py self-test PASSED (5/5 suites).")
+        # 7. --public-api forwards `--public-api` when supported, and fails fast (rc=2) when unsupported.
+        pub_cmds: List[List[str]] = []
+
+        def pub_supported_runner(cmd: Sequence[str]) -> CommandResult:
+            cmd_list = list(cmd)
+            pub_cmds.append(cmd_list)
+            if "--help" in cmd_list:
+                return CommandResult(
+                    0, "Usage: colab --auth --config --public-api --no-public-api\n", ""
+                )
+            return CommandResult(0, "", "")
+
+        rc_pub_ok, sum_pub_ok = run_benchmark(
+            BenchConfig(use_no_public_api=False, dry_run=True, out_dir=tmp_path / "pub-ok"),
+            runner=pub_supported_runner,
+        )
+        assert rc_pub_ok == 0
+        assert all("--public-api" in c for c in sum_pub_ok["planned_commands"])
+
+        rc_pub_bad, sum_pub_bad = run_benchmark(
+            BenchConfig(use_no_public_api=False, dry_run=True, out_dir=tmp_path / "pub-bad"),
+            runner=low_cu_runner,
+        )
+        assert rc_pub_bad == 2
+        assert sum_pub_bad["status"] == "unsupported_public_api_flag"
+
+    print("colab_tpu_bench.py self-test PASSED (7/7 suites).")
     return 0
 
 
