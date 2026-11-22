@@ -795,7 +795,17 @@ def validate_cdi_spec(spec: Any) -> List[str]:
         else:
             _validate_container_edits(dev["containerEdits"], f"{dc}.containerEdits", errors)
             if isinstance(dev["containerEdits"], dict):
-                nodes = dev["containerEdits"].get("deviceNodes")
+                edits_dict = dev["containerEdits"]
+                has_any_edit = any(
+                    isinstance(edits_dict.get(k), list) and len(edits_dict[k]) > 0
+                    for k in ("env", "deviceNodes", "hooks", "mounts")
+                )
+                if not has_any_edit:
+                    errors.append(
+                        f"{dc}.containerEdits: must contain at least one edit "
+                        "(CDI v0.8.0 rejects empty per-device edits)"
+                    )
+                nodes = edits_dict.get("deviceNodes")
                 if isinstance(nodes, list):
                     for n in nodes:
                         if isinstance(n, dict) and isinstance(n.get("path"), str):
@@ -1323,7 +1333,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     dargs.add_argument(
         "--cap-ipc-lock",
         action="store_true",
-        help="Also emit --cap-add=IPC_LOCK (optional bypass when RLIMIT_MEMLOCK cannot be raised).",
+        help="Emit --cap-add=IPC_LOCK instead of --ulimit memlock=-1:-1 (fallback when RLIMIT_MEMLOCK cannot be raised).",
     )
     return parser
 
@@ -1488,9 +1498,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
 
     if args.command == "docker-args":
-        flags = [f"--device={CDI_KIND}={args.device}", "--ulimit memlock=-1:-1"]
+        flags = [f"--device={CDI_KIND}={args.device}"]
         if args.cap_ipc_lock:
             flags.append("--cap-add=IPC_LOCK")
+        else:
+            flags.append("--ulimit memlock=-1:-1")
         sys.stdout.write(" ".join(flags) + "\n")
         return 0
 

@@ -1731,6 +1731,8 @@ TPU Runtime Utilization
             self.assertTrue(child_pid_file.exists())
             grandchild_pid = int(child_pid_file.read_text(encoding="utf-8").strip())
             # Wait briefly for kernel process reaping after SIGKILL to process group.
+            # Treat both missing processes (ProcessLookupError) and un-reaped zombies
+            # (e.g. in containers without an init reaper) as terminated.
             import time as _time2
             deadline_reap = _time2.monotonic() + 2.0
             alive = True
@@ -1740,8 +1742,59 @@ TPU Runtime Utilization
                 except ProcessLookupError:
                     alive = False
                     break
+                proc_stat = Path(f"/proc/{grandchild_pid}/stat")
+                if proc_stat.exists():
+                    try:
+                        stat_text = proc_stat.read_text(encoding="utf-8", errors="replace")
+                        rparen = stat_text.rfind(")")
+                        if rparen != -1:
+                            state_fields = stat_text[rparen + 1 :].split()
+                            if state_fields and state_fields[0] in ("Z", "X", "x"):
+                                alive = False
+                                break
+                    except OSError:
+                        alive = False
+                        break
+                else:
+                    ps_res = subprocess.run(
+                        ["ps", "-o", "stat=", "-p", str(grandchild_pid)],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    st = ps_res.stdout.strip()
+                    if ps_res.returncode != 0 or not st or st.startswith("Z"):
+                        alive = False
+                        break
                 _time2.sleep(0.05)
             self.assertFalse(alive, f"grandchild pid {grandchild_pid} survived tpu-info timeout")
+
+            # Procfs `hidepid=2` / `hidepid=invisible` must mark PID telemetry unavailable
+            # unless the caller holds the configured bypass group (or root for default gid=0).
+            self_dir = proc_root / "self"
+            self_dir.mkdir(parents=True, exist_ok=True)
+            mountinfo = self_dir / "mountinfo"
+            mountinfo.write_text(
+                "26 20 0:23 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw,hidepid=2,gid=999999\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(tpu_exporter._procfs_hides_pids(proc_root))
+            mountinfo.write_text(
+                "26 20 0:23 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw,hidepid=invisible,gid=999999\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(tpu_exporter._procfs_hides_pids(proc_root))
+            mountinfo.write_text(
+                f"26 20 0:23 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw,hidepid=2,gid={os.getegid()}\n",
+                encoding="utf-8",
+            )
+            self.assertFalse(tpu_exporter._procfs_hides_pids(proc_root))
+            mountinfo.write_text(
+                "26 20 0:23 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw,hidepid=0\n",
+                encoding="utf-8",
+            )
+            self.assertFalse(tpu_exporter._procfs_hides_pids(proc_root))
+            mountinfo.unlink()
 
             # Oversized HTTP headers (> MAX_HTTP_HEADER_BYTES) are rejected with 431 before scrape.
             import socket as _socket

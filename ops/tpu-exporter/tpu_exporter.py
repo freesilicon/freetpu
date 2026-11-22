@@ -315,6 +315,64 @@ def _scan_proc_vfio_pids_sync(
     return (unreadable == 0 and not timed_out), unreadable + (1 if timed_out else 0)
 
 
+def _procfs_hides_pids(proc_root: Path) -> bool:
+    """Return True if procfs mount options restrict PID visibility (`hidepid`) for this caller."""
+    mountinfo_path = proc_root / "self" / "mountinfo"
+    is_real_linux_proc = sys.platform.startswith("linux") and os.fspath(proc_root) == "/proc"
+    if not mountinfo_path.exists() and not is_real_linux_proc:
+        return False
+
+    try:
+        raw = mountinfo_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return True
+
+    target_mounts = {os.fspath(proc_root), "/proc"}
+    matched_opts: Optional[List[str]] = None
+    for line in raw.splitlines():
+        if " - " not in line:
+            continue
+        left, right = line.split(" - ", 1)
+        left_fields = left.split()
+        right_fields = right.split()
+        if len(left_fields) < 6 or len(right_fields) < 3:
+            continue
+        mount_point = left_fields[4]
+        fs_type = right_fields[0]
+        if fs_type == "proc" and mount_point in target_mounts:
+            matched_opts = left_fields[5].split(",") + right_fields[2].split(",")
+
+    if matched_opts is None:
+        return is_real_linux_proc
+
+    hidepid_val: Optional[str] = None
+    gid_val: Optional[str] = None
+    for opt in matched_opts:
+        if opt.startswith("hidepid="):
+            hidepid_val = opt.split("=", 1)[1].strip().lower()
+        elif opt.startswith("gid="):
+            gid_val = opt.split("=", 1)[1].strip()
+
+    if not hidepid_val or hidepid_val in ("0", "off"):
+        return False
+
+    try:
+        caller_gids = {os.getegid(), *os.getgroups()}
+    except OSError:
+        caller_gids = {os.getegid()} if hasattr(os, "getegid") else set()
+
+    if gid_val is not None:
+        try:
+            bypass_gid = int(gid_val)
+        except ValueError:
+            return True
+        return bypass_gid not in caller_gids
+
+    # Without an explicit `gid=` mount option, Linux defaults `pid_gid` to
+    # GLOBAL_ROOT_GID (0).
+    return not (hasattr(os, "geteuid") and os.geteuid() == 0 and 0 in caller_gids)
+
+
 def _scan_proc_vfio_pids(
     proc_root: Path,
     vfio_paths: Sequence[str],
@@ -354,6 +412,9 @@ def _scan_proc_vfio_pids(
         verified_rdevs[vp] = host_st.st_rdev
         result[vp] = []
         rdev_to_paths.setdefault(host_st.st_rdev, []).append(vp)
+
+    if _procfs_hides_pids(proc_root):
+        return {vp: [] for vp in verified_rdevs}, False, 1, verified_rdevs
 
     budget_s = float(scan_timeout_s)
     if budget_s <= 0.0:

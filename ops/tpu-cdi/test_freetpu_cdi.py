@@ -477,7 +477,7 @@ class FreeTpuCdiTests(unittest.TestCase):
             text=True,
         )
         self.assertIn("--cap-add=IPC_LOCK", res_cap.stdout)
-        self.assertIn("--ulimit memlock=-1:-1", res_cap.stdout)
+        self.assertNotIn("--ulimit memlock=-1:-1", res_cap.stdout)
 
     def test_default_output_is_boot_scoped_and_dry_run_requires_stdout(self) -> None:
         self.assertEqual(freetpu_cdi.DEFAULT_OUTPUT_PATH, Path("/var/run/cdi/freetpu.json"))
@@ -1408,6 +1408,24 @@ class FreeTpuCdiTests(unittest.TestCase):
                 for dev_entry in clean_spec["devices"]:
                     self.assertNotIn("env", dev_entry["containerEdits"])
                     self.assertIn("annotations", dev_entry)
+
+                # 8. Empty per-device containerEdits is rejected (CDI v0.8.0 requires >= 1 edit per device).
+                empty_dev_spec = {
+                    "cdiVersion": "0.6.0",
+                    "kind": "freetpu.dev/tpu",
+                    "containerEdits": {
+                        "deviceNodes": [
+                            {"path": "/dev/vfio/vfio", "type": "c", "permissions": "rw"},
+                            {"path": "/dev/vfio/0", "type": "c", "permissions": "rw"},
+                        ]
+                    },
+                    "devices": [{"name": "all", "containerEdits": {}}],
+                }
+                empty_errs = freetpu_cdi.validate_cdi_spec(empty_dev_spec)
+                self.assertTrue(
+                    any("must contain at least one edit" in e for e in empty_errs),
+                    empty_errs,
+                )
 
 
 if __name__ == "__main__":
