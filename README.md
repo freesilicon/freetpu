@@ -148,6 +148,7 @@ export OPENBUENOS_DIVE_INTERP_PATH=/data/local/tmp/tpu_open_stack/dive_interp_rv
 - [Vector ALU ISA](docs/isa-vec/vector_alu_isa.md) — `stream125` FP32-RNE quantization & activation pipeline
 - [Kernel UAPI Headers](docs/kernel-abi/README.md) — Clean-room `/dev/edgetpu-soc`, `/dev/gxp`, and GCIP IIF headers
 - [`libopenbuenos` Guide](docs/libopenbuenos/README.md) & [`ggml-edgetpu` Guide](docs/llama-cpp-edgetpu/README.md)
+- [FreeTPU Router v0 Guide](docs/router/README.md) — OpenAI-compatible router across Pixel Tensor G5 clusters, local hosts, and Cloud TPU slices
 
 ---
 

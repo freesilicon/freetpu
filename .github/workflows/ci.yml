@@ -58,6 +58,12 @@ jobs:
           python3 tools/verify_chained_fusion.py
           python3 tools/verify_patch_proof.py
 
+      - name: Run FreeTPU Router self-tests
+        run: |
+          python3 router/freetpu_router.py --self-test --verbose
+          python3 router/freetpu_router.py --check-config --config router/examples/hybrid-pixel-cloud.json
+          python3 router/freetpu_router.py --check-config --config router/examples/local-pixel-cluster.json
+
   clean-room-audit:
     name: Clean-Room & OSS Boundary Audit
     runs-on: ubuntu-latest

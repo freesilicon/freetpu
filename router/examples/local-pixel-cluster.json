@@ -1,0 +1,25 @@
+{
+  "host": "127.0.0.1",
+  "port": 8080,
+  "policy": "cheapest",
+  "health_poll_interval_s": 5.0,
+  "failure_cooldown_s": 10.0,
+  "backends": [
+    {
+      "id": "pixel-g5-primary",
+      "type": "pixel-tpu",
+      "local": true,
+      "base_url": "http://127.0.0.1:8081/v1",
+      "models": ["qwen2.5-1.5b-q8_0"],
+      "priority": 10
+    },
+    {
+      "id": "workstation-llama-server",
+      "type": "local-gpu",
+      "local": true,
+      "base_url": "http://127.0.0.1:8082/v1",
+      "models": ["qwen2.5-1.5b-q8_0", "qwen2.5-32b-q4_0"],
+      "priority": 20
+    }
+  ]
+}
