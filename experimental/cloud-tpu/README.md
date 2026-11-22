@@ -32,6 +32,8 @@ mkdir -p -m 700 ~/.cache/freetpu-pjrt/ir
   set -euo pipefail
   CFG=~/.cache/freetpu-colab/sessions.json
   SESSION_ID="freetpu-raw-$(date +%s)-$$"
+  ENDPOINT=""
+  BEFORE_ENDPOINTS="$(colab --auth=adc --config "$CFG" sessions | awk '/ \| Hardware: /{print $2}' | sort -u)"
   cleanup() {
     local status=$?
     trap - EXIT
@@ -40,10 +42,26 @@ mkdir -p -m 700 ~/.cache/freetpu-pjrt/ir
       echo "ERROR: failed to stop Colab session $SESSION_ID; check 'colab --auth=adc --config $CFG sessions'" >&2
       if [ "$status" -eq 0 ]; then status=1; fi
     fi
+    local active_sessions=""
+    if ! active_sessions="$(colab --auth=adc --config "$CFG" sessions 2>&1)"; then
+      echo "ERROR: failed to verify remote Colab teardown for $SESSION_ID${ENDPOINT:+ ($ENDPOINT)}" >&2
+      if [ "$status" -eq 0 ]; then status=1; fi
+    elif printf '%s\n' "$active_sessions" | grep -Fq "[$SESSION_ID] " ||
+         { [ -n "$ENDPOINT" ] && printf '%s\n' "$active_sessions" | awk '/ \| Hardware: /{print $2}' | grep -Fxq "$ENDPOINT"; } ||
+         { [ -z "$ENDPOINT" ] && [ -n "$(comm -13 <(printf '%s\n' "$BEFORE_ENDPOINTS") <(printf '%s\n' "$active_sessions" | awk '/ \| Hardware: /{print $2}' | sort -u))" ]; }; then
+      echo "ERROR: Colab session $SESSION_ID${ENDPOINT:+ ($ENDPOINT)} is still active on server!" >&2
+      printf '%s\n' "$active_sessions" >&2
+      if [ "$status" -eq 0 ]; then status=1; fi
+    fi
     exit "$status"
   }
-  colab --auth=adc --config "$CFG" new -s "$SESSION_ID" --tpu V6E1
   trap cleanup EXIT
+  colab --auth=adc --config "$CFG" new -s "$SESSION_ID" --tpu V6E1
+  ENDPOINT="$(colab --auth=adc --config "$CFG" status -s "$SESSION_ID" | awk -v sid="[$SESSION_ID]" '/ \| Hardware: / && $1 == sid {print $2; exit}')"
+  if [ -z "$ENDPOINT" ]; then
+    echo "ERROR: failed to record server endpoint for $SESSION_ID" >&2
+    exit 1
+  fi
   log_f="$(mktemp)"
   colab --auth=adc --config "$CFG" exec -s "$SESSION_ID" --timeout 600 -f experimental/cloud-tpu/raw_compute_bench.py 2>&1 | tee "$log_f"
   rc="${PIPESTATUS[0]}"
@@ -59,6 +77,8 @@ mkdir -p -m 700 ~/.cache/freetpu-pjrt/ir
   set -euo pipefail
   CFG=~/.cache/freetpu-colab/sessions.json
   SESSION_ID="freetpu-tpu-$(date +%s)-$$"
+  ENDPOINT=""
+  BEFORE_ENDPOINTS="$(colab --auth=adc --config "$CFG" sessions | awk '/ \| Hardware: /{print $2}' | sort -u)"
   run_stage() {
     local marker="$1"; shift
     local log_f
@@ -81,10 +101,30 @@ mkdir -p -m 700 ~/.cache/freetpu-pjrt/ir
         status=1
       fi
     fi
+    local active_sessions=""
+    if ! active_sessions="$(colab --auth=adc --config "$CFG" sessions 2>&1)"; then
+      echo "ERROR: failed to verify remote Colab teardown for $SESSION_ID${ENDPOINT:+ ($ENDPOINT)}" >&2
+      if [ "$status" -eq 0 ]; then
+        status=1
+      fi
+    elif printf '%s\n' "$active_sessions" | grep -Fq "[$SESSION_ID] " ||
+         { [ -n "$ENDPOINT" ] && printf '%s\n' "$active_sessions" | awk '/ \| Hardware: /{print $2}' | grep -Fxq "$ENDPOINT"; } ||
+         { [ -z "$ENDPOINT" ] && [ -n "$(comm -13 <(printf '%s\n' "$BEFORE_ENDPOINTS") <(printf '%s\n' "$active_sessions" | awk '/ \| Hardware: /{print $2}' | sort -u))" ]; }; then
+      echo "ERROR: Colab session $SESSION_ID${ENDPOINT:+ ($ENDPOINT)} is still active on server!" >&2
+      printf '%s\n' "$active_sessions" >&2
+      if [ "$status" -eq 0 ]; then
+        status=1
+      fi
+    fi
     exit "$status"
   }
-  colab --auth=adc --config "$CFG" new -s "$SESSION_ID" --tpu V5E1
   trap cleanup EXIT
+  colab --auth=adc --config "$CFG" new -s "$SESSION_ID" --tpu V5E1
+  ENDPOINT="$(colab --auth=adc --config "$CFG" status -s "$SESSION_ID" | awk -v sid="[$SESSION_ID]" '/ \| Hardware: / && $1 == sid {print $2; exit}')"
+  if [ -z "$ENDPOINT" ]; then
+    echo "ERROR: failed to record server endpoint for $SESSION_ID" >&2
+    exit 1
+  fi
   run_stage "=== SURVEY_COMPLETE ===" exec -s "$SESSION_ID" --timeout 600 -f experimental/cloud-tpu/vfio_pci_survey.py
   run_stage "=== RAW_BENCH_COMPLETE ===" exec -s "$SESSION_ID" --timeout 600 -f experimental/cloud-tpu/raw_compute_bench.py
   run_stage "=== PALLAS_OPT_COMPLETE ===" exec -s "$SESSION_ID" --timeout 600 -f experimental/cloud-tpu/pallas_opt_bench.py
@@ -115,10 +155,10 @@ PY
 Or prepare Python >= 3.12 with the tested TPU runtime (`jax==0.11.2`, `libtpu==0.0.50`) and run Stage A / Stage B directly on a local Cloud TPU VM:
 
 ```bash
-# Prerequisites on a fresh Cloud TPU VM (Python >= 3.12 required for jax[tpu]==0.11.2)
+# Prerequisites on a fresh Cloud TPU VM (Python >= 3.12 required for jax==0.11.2)
 python3.12 -m venv ~/.venvs/freetpu-tpu
 source ~/.venvs/freetpu-tpu/bin/activate
-python3 -m pip install --upgrade "jax[tpu]==0.11.2" numpy
+python3 -m pip install --upgrade "jax==0.11.2" "jaxlib==0.11.2" "libtpu==0.0.50" requests numpy
 
 # Stage A (JAX kernel active on /dev/vfio/0; ensure g++ and curl are installed)
 python3 experimental/cloud-tpu/vfio_pci_survey.py
