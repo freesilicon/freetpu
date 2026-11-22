@@ -10,7 +10,8 @@ Clean-room experimental scripts and C++17 PJRT runtime prototypes validating Tra
 
 | File | Track B Goal | Purpose |
 | --- | --- | --- |
-| `vfio_pci_survey.py` | **#4 VFIO/PCI & PJRT ABI Survey** | Read-only inspection of `/sys/bus/pci/devices/0000:00:05.0` (`BAR0`/`BAR4`, MSI-X, `vfio-pci`), `GetPjrtApi()` version & `struct_size`, and JAX Pallas/Mosaic TPU APIs |
+| `vfio_pci_survey.py` | **#4 VFIO/PCI & PJRT ABI Survey** | Read-only inspection of `/dev/vfio/*`, `tpu-info`, `jax.devices()`, dynamic `/sys/bus/pci/devices/*` (`BAR0`/`BAR4`, MSI-X, `vfio-pci`), `GetPjrtApi()` version & `struct_size`, and JAX Pallas/Mosaic TPU APIs |
+| `raw_compute_bench.py` | **#0 Raw Compute & HBM BW Baseline** | Raw `jax.lax.dot_general` BF16/INT8 GEMM sweep (`1x64x32`..`16384^3`) and HBM streaming triad bandwidth (`a + s * b`) |
 | `pallas_opt_bench.py` | **#3 Pallas GEMM+SiLU & FlashAttention** | Tile & `async_copy` double-buffering sweep on `4096^3` BF16 `GEMM + SiLU` + Triton-style `@tpu_flash_attn` causal attention vs dense XLA |
 | `llama8b_decode_bench.py` | **#2 Llama-3-8B `W8A16`/`W4A16` Decode** | Fused VMEM-dequant Pallas `W8A16` / `W4A16` + `RMSNorm` + `SwiGLU` microbenchmarks and full 32-layer resident HBM `jax.lax.scan` decode (`B=1`, `B=32`) |
 | `export_stablehlo.py` | **#1 StableHLO IR Export & C++ Build** | Exports `.mlir` + `.mlirbc` + `CompileOptionsProto`, verifies 26/26 `PJRT_Api` offsets against `libtpu.so`, fetches `pjrt_c_api.h`, and builds `/tmp/tpu_pjrt_bench` |
@@ -20,9 +21,35 @@ Clean-room experimental scripts and C++17 PJRT runtime prototypes validating Tra
 
 ## Reproducing on a Cloud TPU VM (`v5e-1` / `v6e-1`)
 
+Using `google-colab-cli` (`colab --auth=adc` with isolated `--config` and `--tpu V6E1` or `V5E1`) or directly on a Cloud TPU VM:
+
+```bash
+# Headless ephemeral single-script run (provisions -> runs -> auto-stops)
+colab --auth=adc --config /tmp/freetpu-colab.json run --tpu V6E1 experimental/cloud-tpu/raw_compute_bench.py
+
+# Or run all stages inside one persistent session (export .ipynb + always stop on exit)
+colab --auth=adc --config /tmp/freetpu-colab.json new -s freetpu-tpu --tpu V5E1
+colab --auth=adc --config /tmp/freetpu-colab.json exec -s freetpu-tpu -f experimental/cloud-tpu/vfio_pci_survey.py
+colab --auth=adc --config /tmp/freetpu-colab.json exec -s freetpu-tpu -f experimental/cloud-tpu/raw_compute_bench.py
+colab --auth=adc --config /tmp/freetpu-colab.json exec -s freetpu-tpu -f experimental/cloud-tpu/pallas_opt_bench.py
+colab --auth=adc --config /tmp/freetpu-colab.json exec -s freetpu-tpu -f experimental/cloud-tpu/llama8b_decode_bench.py
+colab --auth=adc --config /tmp/freetpu-colab.json upload -s freetpu-tpu experimental/cloud-tpu/tpu_pjrt_bench.cpp /content/tpu_pjrt_bench.cpp
+colab --auth=adc --config /tmp/freetpu-colab.json upload -s freetpu-tpu experimental/cloud-tpu/export_stablehlo.py /content/export_stablehlo.py
+colab --auth=adc --config /tmp/freetpu-colab.json exec -s freetpu-tpu "import runpy; runpy.run_path('/content/export_stablehlo.py', run_name='__main__')"
+colab --auth=adc --config /tmp/freetpu-colab.json restart-kernel -s freetpu-tpu
+colab --auth=adc --config /tmp/freetpu-colab.json exec -s freetpu-tpu "import subprocess; print(subprocess.check_output('ldd /tmp/tpu_pjrt_bench && /tmp/tpu_pjrt_bench', shell=True, text=True))"
+colab --auth=adc --config /tmp/freetpu-colab.json log -s freetpu-tpu -o /tmp/freetpu-tpu-proof.ipynb
+colab --auth=adc --config /tmp/freetpu-colab.json stop -s freetpu-tpu
+```
+
+> **Note on `v6e-1` (Trillium) availability**: An ephemeral `colab run --tpu V6E1` survey verified `GetPjrtApi() struct_size=1144, version=0.116` on a `V6E1` host (with `0000:00:05.0` occupied by the `0x1ae0:0x0042` gVNIC NIC rather than TPU, prompting dynamic `/sys/bus/pci/devices/*` scanning in `vfio_pci_survey.py`). Follow-up full-suite `V6E1` allocation requests encountered intermittent Colab `503 Service Unavailable` / `ReadTimeout` capacity limits, so full end-to-end benchmarks below are anchored on verified **`v5e-1`** silicon.
+
+Or run Stage A / Stage B directly on a local Cloud TPU VM:
+
 ```bash
 # Stage A (JAX kernel active on /dev/vfio/0)
 python3 experimental/cloud-tpu/vfio_pci_survey.py
+python3 experimental/cloud-tpu/raw_compute_bench.py
 python3 experimental/cloud-tpu/pallas_opt_bench.py
 python3 experimental/cloud-tpu/llama8b_decode_bench.py
 python3 experimental/cloud-tpu/export_stablehlo.py

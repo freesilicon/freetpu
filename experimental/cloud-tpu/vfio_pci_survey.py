@@ -4,31 +4,54 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 print("=== #4 READ-ONLY VFIO / PCI HARDWARE SURFACE SURVEY ===")
-pci_dev = "/sys/bus/pci/devices/0000:00:05.0"
-for field in ["vendor", "device", "subsystem_vendor", "subsystem_device", "class", "revision",
-              "current_link_speed", "current_link_width", "max_link_speed", "max_link_width",
-              "numa_node", "irq", "dma_mask_bits", "consistent_dma_mask_bits", "enable"]:
-    p = os.path.join(pci_dev, field)
-    if os.path.exists(p):
-        print(f"pci.{field}: {open(p).read().strip()}")
+for path in ["/dev/vfio/", "/dev/accel*", "/dev/tpu*"]:
+    r_ls = subprocess.run(f"ls -la {path} 2>&1 || true", shell=True, text=True, capture_output=True)
+    print(f"$ ls -la {path}\n{r_ls.stdout.strip()}")
 
-res_path = os.path.join(pci_dev, "resource")
-if os.path.exists(res_path):
-    print("--- PCI BARs (start end flags) ---")
-    for idx, line in enumerate(open(res_path)):
-        parts = line.strip().split()
-        if len(parts) == 3:
-            s, e, fl = int(parts[0], 16), int(parts[1], 16), int(parts[2], 16)
-            if s or e:
-                sz = (e - s) + 1
-                print(f"  BAR{idx}: start=0x{s:016x} end=0x{e:016x} size={sz} ({sz/(1024*1024):.2f} MiB) flags=0x{fl:x}")
+r_ti = subprocess.run("tpu-info 2>&1 || python3 -m tpu_info 2>&1 || true", shell=True, text=True, capture_output=True)
+print("$ tpu-info\n" + r_ti.stdout.strip())
 
-msix = glob.glob(os.path.join(pci_dev, "msi_irqs", "*"))
-print("msi_irqs count:", len(msix))
+print("--- JAX / TPU Topology & HBM ---")
+print("Default backend:", jax.default_backend())
+for d in jax.devices():
+    print("Device:", d, "kind:", d.device_kind, "coords:", getattr(d, "coords", None))
+    try:
+        ms = {k: int(v) for k, v in d.memory_stats().items()}
+        print("memory_stats:", json.dumps(ms))
+    except Exception as e:
+        print("memory_stats err:", e)
+try:
+    print("pltpu.get_tpu_info():", pltpu.get_tpu_info())
+except Exception as e:
+    print("get_tpu_info err:", e)
 
-r = subprocess.run("lspci -s 0000:00:05.0 -vv 2>&1 || true", shell=True, text=True, capture_output=True)
-print("--- lspci -vv ---")
-print(r.stdout.strip()[:2500])
+print("--- All PCI Devices (Google / VFIO / Non-Bridge) ---")
+for pci_dev in sorted(glob.glob("/sys/bus/pci/devices/*")):
+    bdf = os.path.basename(pci_dev)
+    vendor = open(os.path.join(pci_dev, "vendor")).read().strip() if os.path.exists(os.path.join(pci_dev, "vendor")) else ""
+    device = open(os.path.join(pci_dev, "device")).read().strip() if os.path.exists(os.path.join(pci_dev, "device")) else ""
+    cls = open(os.path.join(pci_dev, "class")).read().strip() if os.path.exists(os.path.join(pci_dev, "class")) else ""
+    drv = os.path.basename(os.readlink(os.path.join(pci_dev, "driver"))) if os.path.exists(os.path.join(pci_dev, "driver")) else "none"
+    grp = os.path.basename(os.readlink(os.path.join(pci_dev, "iommu_group"))) if os.path.exists(os.path.join(pci_dev, "iommu_group")) else "none"
+    print(f"  {bdf}: vendor={vendor} device={device} class={cls} driver={drv} iommu_group={grp}")
+    if drv == "vfio-pci" or (vendor == "0x1ae0" and cls == "0xff0000"):
+        for field in ["subsystem_vendor", "subsystem_device", "revision",
+                      "current_link_speed", "current_link_width", "max_link_speed", "max_link_width",
+                      "numa_node", "irq", "dma_mask_bits", "consistent_dma_mask_bits", "enable"]:
+            p = os.path.join(pci_dev, field)
+            if os.path.exists(p):
+                print(f"    pci.{field}: {open(p).read().strip()}")
+        res_path = os.path.join(pci_dev, "resource")
+        if os.path.exists(res_path):
+            for idx, line in enumerate(open(res_path)):
+                parts = line.strip().split()
+                if len(parts) == 3:
+                    s, e, fl = int(parts[0], 16), int(parts[1], 16), int(parts[2], 16)
+                    if s or e:
+                        sz = (e - s) + 1
+                        print(f"    BAR{idx}: start=0x{s:016x} end=0x{e:016x} size={sz} ({sz/(1024*1024):.2f} MiB) flags=0x{fl:x}")
+        msix = glob.glob(os.path.join(pci_dev, "msi_irqs", "*"))
+        print("    msi_irqs count:", len(msix))
 
 print("\n=== LIBTPU / PJRT C API SURFACE ===")
 import libtpu
