@@ -9,9 +9,12 @@ parity + HBM streaming bandwidth measurement (`GB/s`) on Cloud TPU (`v5e-1` / `v
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import inspect
 import json
 import time
-from typing import Any, Dict, Tuple
+import types
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
@@ -45,6 +48,32 @@ def tiled_cpu_swiglu(
     return out
 
 
+def _build_tpu_compiler_params(
+    pltpu: Any,
+    *,
+    dimension_semantics: Tuple[str, ...],
+    disable_bounds_checks: bool = True,
+) -> Any:
+    """Build `pltpu.CompilerParams` (or legacy `TPUCompilerParams`) using only supported kwargs."""
+    compiler_params_cls = getattr(pltpu, "CompilerParams", None) or getattr(pltpu, "TPUCompilerParams", None)
+    if compiler_params_cls is None:
+        raise RuntimeError(
+            "Installed JAX Pallas TPU module exposes neither CompilerParams nor TPUCompilerParams."
+        )
+    params = inspect.signature(compiler_params_cls).parameters
+    accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    supported = set(params)
+    if dataclasses.is_dataclass(compiler_params_cls):
+        supported.update(f.name for f in dataclasses.fields(compiler_params_cls))
+
+    kwargs: Dict[str, Any] = {}
+    if accepts_var_kw or "dimension_semantics" in supported:
+        kwargs["dimension_semantics"] = dimension_semantics
+    if disable_bounds_checks and "disable_bounds_checks" in supported:
+        kwargs["disable_bounds_checks"] = True
+    return compiler_params_cls(**kwargs)
+
+
 def build_pallas_swiglu(m: int, n: int, block_m: int, block_n: int):
     """Build a Pallas/Mosaic SwiGLU kernel lowering to `tpu_custom_call`."""
     import jax
@@ -54,7 +83,11 @@ def build_pallas_swiglu(m: int, n: int, block_m: int, block_n: int):
 
     if m % block_m or n % block_n:
         raise ValueError(f"Shape ({m}, {n}) must be divisible by ({block_m}, {block_n})")
-    CompilerParams = getattr(pltpu, "CompilerParams", None) or getattr(pltpu, "TPUCompilerParams")
+    compiler_params = _build_tpu_compiler_params(
+        pltpu,
+        dimension_semantics=("parallel", "parallel"),
+        disable_bounds_checks=True,
+    )
 
     def kernel(gate_ref, up_ref, out_ref):
         g = gate_ref[...].astype(jnp.float32)
@@ -72,17 +105,42 @@ def build_pallas_swiglu(m: int, n: int, block_m: int, block_n: int):
                 pl.BlockSpec((block_m, block_n), lambda i, j: (i, j)),
             ],
             out_specs=pl.BlockSpec((block_m, block_n), lambda i, j: (i, j)),
-            compiler_params=CompilerParams(
-                dimension_semantics=("parallel", "parallel"),
-                disable_bounds_checks=True,
-            ),
+            compiler_params=compiler_params,
         )(gate, up)
 
     return run
 
 
+def _verify_compiler_params_compat() -> None:
+    """Verify CompilerParams fallback works on both modern JAX and legacy JAX 0.5.3 signatures."""
+
+    @dataclasses.dataclass(frozen=True)
+    class _ModernParams:
+        dimension_semantics: Optional[Tuple[str, ...]] = None
+        disable_bounds_checks: bool = False
+
+    @dataclasses.dataclass(frozen=True)
+    class _LegacyParams:
+        dimension_semantics: Optional[Tuple[str, ...]] = None
+
+    modern = _build_tpu_compiler_params(
+        types.SimpleNamespace(CompilerParams=_ModernParams),
+        dimension_semantics=("parallel", "parallel"),
+        disable_bounds_checks=True,
+    )
+    assert modern.dimension_semantics == ("parallel", "parallel") and modern.disable_bounds_checks is True
+
+    legacy = _build_tpu_compiler_params(
+        types.SimpleNamespace(TPUCompilerParams=_LegacyParams),
+        dimension_semantics=("parallel", "parallel"),
+        disable_bounds_checks=True,
+    )
+    assert legacy.dimension_semantics == ("parallel", "parallel")
+
+
 def run_self_test() -> Dict[str, Any]:
     """Offline NumPy parity check (no JAX/TPU hardware required)."""
+    _verify_compiler_params_compat()
     rng = np.random.default_rng(7)
     m, n = 64, 1024
     block_m, block_n = 32, 256

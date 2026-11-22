@@ -28,7 +28,21 @@ Load [references/silicon-cheatsheet.md](references/silicon-cheatsheet.md) when c
 
 Use this workflow for zero-Google-`.so` C/C++ kernels, closed-form `(M, K, N)` VLIW GEMMs, and `0x640` minimax spline fusion.
 
-> **Globally installed skill note**: If you loaded this skill via a global symlink (`~/.claude/skills/freetpu`, `~/.codex/skills/freetpu`, or `~/.gemini/config/skills/freetpu`) while working in another directory, resolve the skill's `SKILL.md` back to the FreeTPU repository root (`cd "$(dirname "$(dirname "$(dirname "$(readlink -f ~/.claude/skills/freetpu/SKILL.md)")")")"`) before running repository-relative commands below.
+> **Globally installed skill note**: If you loaded this skill via a global symlink (`~/.claude/skills/freetpu`, `~/.codex/skills/freetpu`, or `~/.gemini/config/skills/freetpu`) while working outside the FreeTPU checkout, resolve the exact `SKILL.md` path your agent loaded back to the repository root and verify the checkout before running repository-relative commands below:
+
+```bash
+# Set SKILL_MD to the exact SKILL.md path loaded by your agent
+# (e.g., ~/.claude/skills/freetpu/SKILL.md, ~/.codex/skills/freetpu/SKILL.md,
+# or ~/.gemini/config/skills/freetpu/SKILL.md):
+SKILL_MD="<path-to-loaded-SKILL.md>"
+REPO_ROOT="$(python3 -c '
+import pathlib, sys
+p = pathlib.Path(sys.argv[1]).expanduser().resolve(strict=True)
+root = p.parents[2]
+assert (root / "tools" / "emit_custom_gemm.py").is_file(), f"Not a FreeTPU checkout: {root}"
+print(root)
+' "$SKILL_MD")" && [ -n "$REPO_ROOT" ] && cd "$REPO_ROOT"
+```
 
 1. **Verify host mock runtime & C11/C++17 headers offline** (macOS/Linux, no phone required):
    ```bash

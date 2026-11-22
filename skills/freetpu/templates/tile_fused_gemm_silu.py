@@ -11,10 +11,13 @@ Features:
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import inspect
 import json
 import math
 import time
-from typing import Any, Dict, Tuple
+import types
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
@@ -55,6 +58,39 @@ def tiled_cpu_gemm_silu(a_f32: np.ndarray, b_f32: np.ndarray, bm: int, bn: int, 
     return out
 
 
+def _build_tpu_compiler_params(
+    pltpu: Any,
+    *,
+    dimension_semantics: Tuple[str, ...],
+    vmem_limit_bytes: Optional[int] = None,
+    disable_bounds_checks: bool = True,
+) -> Any:
+    """Build `pltpu.CompilerParams` (or legacy `TPUCompilerParams`) using only supported kwargs."""
+    compiler_params_cls = getattr(pltpu, "CompilerParams", None) or getattr(pltpu, "TPUCompilerParams", None)
+    if compiler_params_cls is None:
+        raise RuntimeError(
+            "Installed JAX Pallas TPU module exposes neither CompilerParams nor TPUCompilerParams."
+        )
+    params = inspect.signature(compiler_params_cls).parameters
+    accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    supported = set(params)
+    if dataclasses.is_dataclass(compiler_params_cls):
+        supported.update(f.name for f in dataclasses.fields(compiler_params_cls))
+
+    kwargs: Dict[str, Any] = {}
+    if accepts_var_kw or "dimension_semantics" in supported:
+        kwargs["dimension_semantics"] = dimension_semantics
+    if disable_bounds_checks and "disable_bounds_checks" in supported:
+        kwargs["disable_bounds_checks"] = True
+    if vmem_limit_bytes is not None:
+        if not (accepts_var_kw or "vmem_limit_bytes" in supported):
+            raise RuntimeError(
+                f"{compiler_params_cls.__name__} does not support vmem_limit_bytes on this JAX version."
+            )
+        kwargs["vmem_limit_bytes"] = vmem_limit_bytes
+    return compiler_params_cls(**kwargs)
+
+
 def build_pallas_gemm_silu(
     m: int,
     k: int,
@@ -80,7 +116,12 @@ def build_pallas_gemm_silu(
     if num_k < 2:
         raise ValueError("Double-buffered K-loop requires K // bk >= 2")
 
-    CompilerParams = getattr(pltpu, "CompilerParams", None) or getattr(pltpu, "TPUCompilerParams")
+    compiler_params = _build_tpu_compiler_params(
+        pltpu,
+        dimension_semantics=("parallel", "parallel"),
+        vmem_limit_bytes=vmem_limit_bytes,
+        disable_bounds_checks=True,
+    )
 
     def outer_kernel(a_hbm_ref, b_hbm_ref, o_ref, a_bufs, b_bufs, acc_ref, a_sems, b_sems):
         i = pl.program_id(0)
@@ -140,18 +181,46 @@ def build_pallas_gemm_silu(
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA((2,)),
             ],
-            compiler_params=CompilerParams(
-                dimension_semantics=("parallel", "parallel"),
-                disable_bounds_checks=True,
-                **({"vmem_limit_bytes": vmem_limit_bytes} if vmem_limit_bytes is not None else {}),
-            ),
+            compiler_params=compiler_params,
         )(a, b)
 
     return run
 
 
+def _verify_compiler_params_compat() -> None:
+    """Verify CompilerParams fallback works on both modern JAX and legacy JAX 0.5.3 signatures."""
+
+    @dataclasses.dataclass(frozen=True)
+    class _ModernParams:
+        dimension_semantics: Optional[Tuple[str, ...]] = None
+        vmem_limit_bytes: Optional[int] = None
+        disable_bounds_checks: bool = False
+
+    @dataclasses.dataclass(frozen=True)
+    class _LegacyParams:
+        dimension_semantics: Optional[Tuple[str, ...]] = None
+        vmem_limit_bytes: Optional[int] = None
+
+    modern = _build_tpu_compiler_params(
+        types.SimpleNamespace(CompilerParams=_ModernParams),
+        dimension_semantics=("parallel", "parallel"),
+        vmem_limit_bytes=16 * 1024 * 1024,
+        disable_bounds_checks=True,
+    )
+    assert modern.disable_bounds_checks is True and modern.vmem_limit_bytes == 16 * 1024 * 1024
+
+    legacy = _build_tpu_compiler_params(
+        types.SimpleNamespace(TPUCompilerParams=_LegacyParams),
+        dimension_semantics=("parallel", "parallel"),
+        vmem_limit_bytes=None,
+        disable_bounds_checks=True,
+    )
+    assert legacy.dimension_semantics == ("parallel", "parallel") and legacy.vmem_limit_bytes is None
+
+
 def run_self_test() -> Dict[str, Any]:
     """Offline CPU parity and VMEM budget check (no JAX/TPU hardware required)."""
+    _verify_compiler_params_compat()
     rng = np.random.default_rng(0)
     m, k, n = 128, 256, 128
     bm, bn, bk = 64, 64, 64

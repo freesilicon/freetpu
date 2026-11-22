@@ -18,7 +18,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
@@ -47,13 +47,9 @@ def numpy_fp32_rne_gemm(
     act: int,
 ) -> np.ndarray:
     """Independent NumPy reference matching Tensor G5 IEEE-754 FP32-RNE semantics."""
-    x32 = x_mk.astype(np.int32) - np.int32(zp_in)
-    w32 = w_nk.astype(np.int32)
-    acc = x32 @ w32.T + bias_n.astype(np.int32)[None, :]
-
-    real_mul = np.float32(np.float32(s_in) * np.float32(s_w) / np.float32(s_out))
-    scaled = acc.astype(np.float32) * real_mul
-    q = np.rint(scaled).astype(np.int32) + np.int32(zp_out)
+    x64 = x_mk.astype(np.int64) - np.int64(zp_in)
+    w64 = w_nk.astype(np.int64)
+    acc = x64 @ w64.T + bias_n.astype(np.int64)[None, :]
 
     qmin, qmax = -128, 127
     if act == 1:  # ACT_RELU
@@ -61,7 +57,59 @@ def numpy_fp32_rne_gemm(
     elif act == 2:  # ACT_RELU6
         qmin = max(-128, min(127, zp_out))
         qmax = max(-128, min(127, int(round(6.0 / float(np.float32(s_out)))) + zp_out))
+
+    real_mul = np.float32(np.float32(s_in) * np.float32(s_w) / np.float32(s_out))
+    scaled = acc.astype(np.float64).astype(np.float32) * real_mul
+    rounded = np.rint(scaled).astype(np.float64)
+    clamped = np.clip(rounded, float(qmin - zp_out), float(qmax - zp_out))
+    q = clamped.astype(np.int64) + np.int64(zp_out)
     return np.clip(q, qmin, qmax).astype(np.int8)
+
+
+def resolve_emission_paths(shell_path: Path, out_prefix: Path) -> Tuple[Path, Path, Path, Path]:
+    """Return output artifact paths after verifying none aliases `shell_path`."""
+    dgc0_out = Path(f"{out_prefix}.dgc0")
+    in_out = Path(f"{out_prefix}.in.bin")
+    ref_out = Path(f"{out_prefix}.ref.bin")
+    meta_out = Path(f"{out_prefix}.meta.json")
+    out_paths = (dgc0_out, in_out, ref_out, meta_out)
+
+    shell_resolved = shell_path.resolve()
+    shell_exists = shell_path.exists()
+    for out_path in out_paths:
+        out_resolved = out_path.resolve()
+        same_target = out_resolved == shell_resolved
+        if not same_target and shell_exists and out_path.exists():
+            same_target = os.path.samefile(shell_path, out_path)
+        if same_target:
+            raise ValueError(
+                f"Output path {out_path} refers to input shell {shell_path}; "
+                "choose a different --out-prefix so the input shell is not overwritten."
+            )
+    return out_paths
+
+
+def _verify_edge_cases() -> None:
+    """Verify overflow-safe FP32-RNE clamping and input-shell overwrite protection."""
+    # Accumulator=-1048576, real_mul=2048.0, zp_out=-1 -> scaled=-2^31; must clamp to -128 (never wrap in int32).
+    x_neg = np.array([[-128] * 64], dtype=np.int8)
+    w_neg = np.array([[127] * 64], dtype=np.int8)
+    b_neg = np.array([-1048576 - (-128 * 127 * 64)], dtype=np.int32)
+    out_neg = numpy_fp32_rne_gemm(x_neg, w_neg, b_neg, s_in=64.0, zp_in=0, s_w=32.0, s_out=1.0, zp_out=-1, act=0)
+    assert int(out_neg[0, 0]) == -128, f"Expected -128 on negative saturation, got {int(out_neg[0, 0])}"
+
+    # Positive saturation well beyond INT32_MAX must clamp to +127.
+    b_pos = np.array([1048576 - (-128 * 127 * 64)], dtype=np.int32)
+    out_pos = numpy_fp32_rne_gemm(x_neg, w_neg, b_pos, s_in=128.0, zp_in=0, s_w=32.0, s_out=1.0, zp_out=1, act=0)
+    assert int(out_pos[0, 0]) == 127, f"Expected 127 on positive saturation, got {int(out_pos[0, 0])}"
+
+    # Same-path emission target must be rejected before any write occurs.
+    try:
+        resolve_emission_paths(Path("probe.dgc0"), Path("probe"))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("resolve_emission_paths failed to reject overwriting input shell")
 
 
 def run_probe(
@@ -78,6 +126,15 @@ def run_probe(
     shell_path: Optional[Path],
     out_prefix: Optional[Path],
 ) -> Dict[str, Any]:
+    if (shell_path is None) != (out_prefix is None):
+        raise ValueError(
+            "Both --shell (or FREETPU_SHELL_DGC0) and --out-prefix are required together to emit .dgc0 artifacts."
+        )
+
+    out_paths: Optional[Tuple[Path, Path, Path, Path]] = None
+    if shell_path is not None and out_prefix is not None:
+        out_paths = resolve_emission_paths(shell_path, out_prefix)
+
     tools_dir = repo_root / "tools"
     for p in (str(tools_dir / "dgc0"), str(tools_dir)):
         if p not in sys.path:
@@ -150,12 +207,8 @@ def run_probe(
         "dgc0_emitted": False,
     }
 
-    if (shell_path is None) != (out_prefix is None):
-        raise ValueError(
-            "Both --shell (or FREETPU_SHELL_DGC0) and --out-prefix are required together to emit .dgc0 artifacts."
-        )
-
-    if shell_path is not None and out_prefix is not None:
+    if shell_path is not None and out_prefix is not None and out_paths is not None:
+        dgc0_out, in_out, ref_out, meta_out = out_paths
         blob, in_b, ref_b, info = ecg.emit_custom_gemm_dgc0(
             weights_nk=w,
             bias_n=b,
@@ -168,11 +221,11 @@ def run_probe(
             act=act_id,
             shell_path=shell_path,
         )
-        out_prefix.parent.mkdir(parents=True, exist_ok=True)
-        Path(f"{out_prefix}.dgc0").write_bytes(blob)
-        Path(f"{out_prefix}.in.bin").write_bytes(in_b)
-        Path(f"{out_prefix}.ref.bin").write_bytes(ref_b)
-        Path(f"{out_prefix}.meta.json").write_text(json.dumps(info, indent=2) + "\n", encoding="utf-8")
+        dgc0_out.parent.mkdir(parents=True, exist_ok=True)
+        dgc0_out.write_bytes(blob)
+        in_out.write_bytes(in_b)
+        ref_out.write_bytes(ref_b)
+        meta_out.write_text(json.dumps(info, indent=2) + "\n", encoding="utf-8")
         result["dgc0_emitted"] = True
         result["dgc0_bytes"] = len(blob)
         result["out_prefix"] = str(out_prefix)
@@ -208,6 +261,13 @@ def main() -> None:
     )
     if (shell_path is None) != (args.out_prefix is None):
         ap.error("Both --shell (or FREETPU_SHELL_DGC0) and --out-prefix must be supplied together.")
+    if shell_path is not None and args.out_prefix is not None:
+        try:
+            resolve_emission_paths(shell_path, args.out_prefix)
+        except ValueError as exc:
+            ap.error(str(exc))
+    if args.self_test:
+        _verify_edge_cases()
 
     repo_root = resolve_repo_root(args.repo_root)
     report = run_probe(

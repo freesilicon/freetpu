@@ -56,4 +56,4 @@ Compact hardware, memory-hierarchy, and errata reference for kernel authoring an
 3. **Colab Allocation Errors (`HTTP 412 / 400`)**:
    - `REASON_NO_BACKENDS` or `REASON_TOO_MANY_ACTIVE_ASSIGNMENTS` on `V6E1` during pre-allocation should fall back to `V5E1` (handled automatically by `tools/colab_tpu_bench.py`). Never fall back after `[colab] Session READY`.
 4. **CompilerParams Portability**:
-   - Recent JAX exposes `pltpu.CompilerParams`; older builds expose `pltpu.TPUCompilerParams`. Use `getattr(pltpu, "CompilerParams", None) or getattr(pltpu, "TPUCompilerParams")`.
+   - Recent JAX exposes `pltpu.CompilerParams`; older builds (e.g., JAX `0.5.3`) expose `pltpu.TPUCompilerParams` without optional newer kwargs such as `disable_bounds_checks`. Resolve `getattr(pltpu, "CompilerParams", None) or getattr(pltpu, "TPUCompilerParams")` and pass optional kwargs only when present in `inspect.signature` / `dataclasses.fields`.
