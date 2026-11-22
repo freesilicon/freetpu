@@ -129,6 +129,8 @@ class CommandCancelledError(BaseException):
         stderr_log_written: bool = False,
         log_write_error: Optional[str] = None,
         untrusted_log_error: Optional[str] = None,
+        captured_probe_text: Optional[str] = None,
+        elapsed_s: Optional[float] = None,
     ) -> None:
         super().__init__(f"Command cancelled by {signal_name}")
         self.signal_name = signal_name
@@ -139,6 +141,8 @@ class CommandCancelledError(BaseException):
         self.stderr_log_written = stderr_log_written
         self.log_write_error = log_write_error
         self.untrusted_log_error = untrusted_log_error
+        self.captured_probe_text = captured_probe_text
+        self.elapsed_s = elapsed_s
 
 
 @dataclass(frozen=True)
@@ -151,6 +155,8 @@ class CommandResult:
     stderr_log_written: bool = False
     log_write_error: Optional[str] = None
     untrusted_log_error: Optional[str] = None
+    captured_probe_text: Optional[str] = None
+    elapsed_s: Optional[float] = None
 
 
 CommandRunner = Callable[[Sequence[str]], CommandResult]
@@ -590,6 +596,7 @@ def _check_config_artifact_collision(
     """Reject `--config` (or its `.lock`) colliding with generated artifacts or `--script`."""
     candidates: List[Path] = [
         out_dir / "summary.json",
+        out_dir / f"{session_base}.summary.json",
         out_dir / "dry-run-plan.json",
         out_dir / "colab_tpu_probe_payload.py",
         out_dir / f"colab_custom_script.{session_base}.py",
@@ -598,6 +605,7 @@ def _check_config_artifact_collision(
         sess = f"{session_base}-{tpu}" if idx > 0 else session_base
         candidates.extend(
             [
+                out_dir / f"{sess}.summary.json",
                 out_dir / f"{sess}.stdout.txt",
                 out_dir / f"{sess}.stderr.txt",
                 out_dir / f"{sess}.ipynb",
@@ -1028,6 +1036,12 @@ class _BoundedStreamCapture:
             self.write_error = f"Failed finalizing local run log {self.log_path}: {exc}"
             self._close_and_unlink_tmp()
 
+    def captured_probe_text(self) -> Optional[str]:
+        """Return the separately captured complete probe block, if observed in the stream."""
+        if self._captured_probe is None:
+            return None
+        return self._captured_probe.decode("utf-8", errors="replace")
+
     def render_text(self) -> str:
         if self.total_bytes == 0:
             return ""
@@ -1088,9 +1102,11 @@ def make_subprocess_runner(
         effective_req_timeout, explicit_req = resolve_effective_request_timeout(request_timeout_s)
         if explicit_req or not (env.get("COLAB_CLI_REQUEST_TIMEOUT") or "").strip():
             env["COLAB_CLI_REQUEST_TIMEOUT"] = str(effective_req_timeout)
-        # Disable Colab CLI's internal allocation POST retry so an ambiguous timeout/disconnect
-        # cannot be masked by a subsequent 412 refusal that would falsely trigger v5e1 fallback.
-        env["COLAB_CLI_ASSIGN_RETRIES"] = "0"
+        # Preserve Colab CLI's same-request `GET /tun/m/assign?nbh=...` reconciliation on a
+        # timed-out POST (default to 1 retry if unset; never force 0 so a lost response can
+        # still be matched to its request ID). Fallback remains blocked on any uncertain error.
+        if not (env.get("COLAB_CLI_ASSIGN_RETRIES") or "").strip():
+            env["COLAB_CLI_ASSIGN_RETRIES"] = "1"
         run_session = _extract_run_session_from_cmd(cmd_list)
         is_run_cmd = run_session is not None or "run" in cmd_list
         if is_run_cmd:
@@ -1125,6 +1141,7 @@ def make_subprocess_runner(
             track_session_ready=True,
         )
 
+        started_mono = time.monotonic()
         proc = subprocess.Popen(
             cmd_list,
             stdin=subprocess.DEVNULL,
@@ -1195,6 +1212,7 @@ def make_subprocess_runner(
 
         try:
             proc.wait(timeout=wall_timeout)
+            elapsed_s = time.monotonic() - started_mono
             rc = proc.returncode if proc.returncode is not None else 1
             out_txt, err_txt = _collect_output(
                 join_timeout=5.0,
@@ -1211,9 +1229,12 @@ def make_subprocess_runner(
                 stderr_log_written=err_cap.log_written,
                 log_write_error=write_err,
                 untrusted_log_error=untrusted_err,
+                captured_probe_text=out_cap.captured_probe_text(),
+                elapsed_s=elapsed_s,
             )
         except subprocess.TimeoutExpired:
             _terminate_and_reap()
+            elapsed_s = time.monotonic() - started_mono
             timeout_label = f"{wall_timeout:.1f}s" if wall_timeout is not None else "configured"
             note = (
                 f"[colab_tpu_bench] `colab` subprocess exceeded wall timeout "
@@ -1237,9 +1258,12 @@ def make_subprocess_runner(
                 stderr_log_written=err_cap.log_written,
                 log_write_error=write_err,
                 untrusted_log_error=untrusted_err,
+                captured_probe_text=out_cap.captured_probe_text(),
+                elapsed_s=elapsed_s,
             )
         except (KeyboardInterrupt, TerminationSignal) as exc:
             _terminate_and_reap()
+            elapsed_s = time.monotonic() - started_mono
             is_sigterm = isinstance(exc, TerminationSignal)
             cancel_note = (
                 "[colab_tpu_bench] Terminated by supervisor (SIGTERM)."
@@ -1267,6 +1291,8 @@ def make_subprocess_runner(
                 stderr_log_written=err_cap.log_written,
                 log_write_error=write_err,
                 untrusted_log_error=untrusted_err,
+                captured_probe_text=out_cap.captured_probe_text(),
+                elapsed_s=elapsed_s,
             ) from exc
 
     return _run
@@ -1490,6 +1516,7 @@ def detect_cli_capabilities(
     except FileNotFoundError:
         return {
             "cli_found": False,
+            "help_ok": False,
             "has_public_api": False,
             "has_no_public_api": False,
             "has_config": True,
@@ -1498,18 +1525,24 @@ def detect_cli_capabilities(
     if res.returncode == 127:
         return {
             "cli_found": False,
+            "help_ok": False,
             "has_public_api": False,
             "has_no_public_api": False,
             "has_config": True,
             "has_auth": True,
         }
     combined = f"{res.stdout}\n{res.stderr}"
+    help_ok = res.returncode == 0 and bool(combined.strip())
     return {
         "cli_found": True,
-        "has_public_api": bool(re.search(r"(?<![A-Za-z0-9-])--public-api\b", combined)),
-        "has_no_public_api": bool(re.search(r"(?<![A-Za-z0-9-])--no-public-api\b", combined)),
-        "has_config": "--config" in combined,
-        "has_auth": "--auth" in combined,
+        "help_ok": help_ok,
+        "has_public_api": bool(help_ok and re.search(r"(?<![A-Za-z0-9-])--public-api\b", combined)),
+        "has_no_public_api": bool(
+            help_ok and re.search(r"(?<![A-Za-z0-9-])--no-public-api\b", combined)
+        ),
+        # Never drop required `--config` or `--auth` flags if `--help` failed or was truncated.
+        "has_config": True,
+        "has_auth": True,
     }
 
 
@@ -1518,7 +1551,12 @@ def build_base_cmd(
     caps: Dict[str, bool],
     isolated_config_path: Path,
 ) -> List[str]:
-    """Build the global `colab` prefix before the subcommand."""
+    """Build the global `colab` prefix before the subcommand.
+
+    Always passes explicit `--auth` and `--config` for supported `google-colab-cli >= 0.7.6`
+    releases so a failed or truncated `colab --help` can never silently fall back to CLI
+    defaults (cached OAuth2 account or the user's shared `~/.config/colab-cli/sessions.json`).
+    """
     if not cfg.use_no_public_api:
         raise ValueError(
             "`google-colab-cli` still routes `usage`, `sessions`, `run` allocation, and "
@@ -1527,10 +1565,9 @@ def build_base_cmd(
             "for Public-API-only environments."
         )
     cmd = [cfg.colab_bin]
-    if caps.get("has_auth", True) and cfg.auth:
+    if cfg.auth:
         cmd.extend(["--auth", cfg.auth])
-    if caps.get("has_config", True):
-        cmd.extend(["--config", str(isolated_config_path)])
+    cmd.extend(["--config", str(isolated_config_path)])
     if caps.get("has_no_public_api", False):
         cmd.append("--no-public-api")
     return cmd
@@ -1547,6 +1584,10 @@ def is_capacity_or_quota_error(
     # Once `colab run` prints `[colab] Session READY (...)`, the VM was allocated
     # and the user workload began executing; never fall back and duplicate side effects.
     if "[colab] session ready" in err_lower:
+        return False
+    # Never treat a run that experienced a timeout, 5xx, transport disconnect, or internal
+    # allocation retry as a clean capacity refusal even if a subsequent retry returned 412.
+    if is_allocation_timeout_error(returncode, stderr):
         return False
     in_rich_box = False
     in_std_tb = False
@@ -1591,6 +1632,7 @@ _UNCERTAIN_ALLOC_HTTP_RE = re.compile(
 
 _UNCERTAIN_ALLOC_TRANSPORT_RE = re.compile(
     r"(?:\breadtimeout\b|\bread timed out\b|\bconnecttimeout\b|\bconnect timed out\b|"
+    r"\bassignment request failed;\s*retrying\b|"
     r"\bconnectionerror\b|\bremotedisconnected\b|\bremote end closed connection\b|"
     r"\bconnectionreseterror\b|\bconnection reset\b|\bconnectionabortederror\b|\bconnection aborted\b|"
     r"\bbrokenpipeerror\b|\bbroken pipe\b|\bchunkedencodingerror\b|\bprotocolerror\b|"
@@ -1632,19 +1674,27 @@ def _has_colab_auth_failure(res: CommandResult) -> bool:
 
 
 def extract_probe_json(stdout: str) -> Optional[Dict[str, Any]]:
-    """Extract JSON payload emitted between FreeTPU probe markers."""
-    pattern = re.compile(
-        re.escape(PROBE_JSON_BEGIN) + r"\s*(.*?)\s*" + re.escape(PROBE_JSON_END),
-        re.DOTALL,
-    )
-    match = pattern.search(stdout)
-    if not match:
+    """Extract JSON payload emitted between FreeTPU probe markers.
+
+    Pairs each closing marker with its nearest preceding opening marker so a truncated
+    opening marker in a bounded head buffer can never mask an intact payload that follows.
+    """
+    if not stdout:
         return None
-    try:
-        parsed = json.loads(match.group(1))
-        return parsed if isinstance(parsed, dict) else {"value": parsed}
-    except json.JSONDecodeError:
-        return None
+    search_pos = 0
+    while True:
+        end_idx = stdout.find(PROBE_JSON_END, search_pos)
+        if end_idx == -1:
+            return None
+        begin_idx = stdout.rfind(PROBE_JSON_BEGIN, 0, end_idx)
+        if begin_idx != -1:
+            candidate = stdout[begin_idx + len(PROBE_JSON_BEGIN) : end_idx].strip()
+            try:
+                parsed = json.loads(candidate)
+                return parsed if isinstance(parsed, dict) else {"value": parsed}
+            except json.JSONDecodeError:
+                pass
+        search_pos = end_idx + len(PROBE_JSON_END)
 
 
 def validate_builtin_probe(probe_payload: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -2263,6 +2313,7 @@ def run_benchmark(
                     cancel_rc = cancel_exc.returncode
                     partial_stdout = cancel_exc.stdout
                     partial_stderr = cancel_exc.stderr
+                    cancel_probe_text = cancel_exc.captured_probe_text
                     cancel_stdout_written = cancel_exc.stdout_log_written
                     cancel_stderr_written = cancel_exc.stderr_log_written
                     if cancel_exc.untrusted_log_error:
@@ -2274,6 +2325,7 @@ def run_benchmark(
                     cancel_rc = 143 if is_sigterm else 130
                     partial_stdout = ""
                     partial_stderr = ""
+                    cancel_probe_text = None
                     cancel_stdout_written = False
                     cancel_stderr_written = False
 
@@ -2302,7 +2354,13 @@ def run_benchmark(
                 )
                 if "[colab] session ready" in partial_stderr.lower():
                     ready_seen_any = True
-                parsed_partial = extract_probe_json(partial_stdout)
+                parsed_partial = (
+                    extract_probe_json(cancel_probe_text)
+                    if cancel_probe_text is not None
+                    else None
+                )
+                if parsed_partial is None:
+                    parsed_partial = extract_probe_json(partial_stdout)
                 if parsed_partial is not None:
                     probe_payload = parsed_partial
 
@@ -2361,7 +2419,13 @@ def run_benchmark(
             }
             attempts.append(attempt_rec)
 
-            parsed_probe = extract_probe_json(res.stdout)
+            parsed_probe = (
+                extract_probe_json(res.captured_probe_text)
+                if res.captured_probe_text is not None
+                else None
+            )
+            if parsed_probe is None:
+                parsed_probe = extract_probe_json(res.stdout)
             if parsed_probe is not None:
                 probe_payload = parsed_probe
 
@@ -2372,6 +2436,17 @@ def run_benchmark(
             timeout_seen = is_allocation_timeout_error(
                 res.returncode, res.stderr, timed_out=res.timed_out
             )
+            if (
+                not timeout_seen
+                and res.returncode != 0
+                and not ready_seen
+                and res.elapsed_s is not None
+                and res.elapsed_s >= effective_request_timeout
+            ):
+                # A pre-READY failure whose duration reached the HTTP request timeout may have
+                # suffered a timed-out POST followed by an internal CLI retry returning 412;
+                # treat the outcome as uncertain and block fallback.
+                timeout_seen = True
             confirmed_pre_alloc = (
                 res.returncode != 0
                 and not ready_seen
@@ -2454,6 +2529,19 @@ def run_benchmark(
 
             has_more = idx + 1 < len(cfg.tpus)
             if not (has_more and is_capacity_or_quota_error(res.returncode, res.stdout, res.stderr)):
+                break
+
+            # Before falling back to a secondary accelerator, verify no assignment from the
+            # failed attempt materialized on the server during an internal CLI retry.
+            pre_fb_res = runner([*base_cmd, "sessions"])
+            if pre_fb_res.returncode != 0 or _has_colab_auth_failure(pre_fb_res):
+                maybe_allocated = True
+                allocation_timed_out = True
+                break
+            _, pre_fb_endpoints = parse_sessions_output(pre_fb_res.stdout)
+            if pre_fb_endpoints - endpoints_before:
+                maybe_allocated = True
+                allocation_timed_out = True
                 break
 
         # 3. Verify server-side TPU assignment release whenever an allocation may have occurred,
@@ -2552,6 +2640,18 @@ def run_benchmark(
             except UntrustedPathError as exc:
                 return rec_path, rec_cmd, str(exc)
 
+        def _find_original_store_session(endpoint: str) -> Optional[str]:
+            """Return a session name still mapped to `endpoint` in `isolated_config`, if any."""
+            candidates = list(
+                dict.fromkeys([*leaked_sessions, recovery_session, *attempted_sessions])
+            )
+            for cand in candidates:
+                if read_endpoint_from_session_store(isolated_config, cand) == endpoint:
+                    return cand
+            if leaked_sessions:
+                return leaked_sessions[0]
+            return None
+
         if maybe_allocated:
             if created_endpoint is None:
                 for sname in reversed(attempted_sessions):
@@ -2599,12 +2699,32 @@ def run_benchmark(
 
                 if query_is_auth_err or retry_idx >= max_retries:
                     teardown_verified = False
+                    seed_failure_detail: Optional[str] = None
+                    preserved_path: Optional[Path] = None
                     if created_endpoint is not None and (query_err is not None or leaked_endpoints):
-                        rec_path, rec_base, _ = _prepare_recovery_store(
+                        rec_path, rec_base, final_seed_err = _prepare_recovery_store(
                             recovery_session, created_endpoint
                         )
-                        recovery_command = shlex.join([*rec_base, "stop", "-s", recovery_session])
-                        preserved_path = rec_path
+                        if final_seed_err is None:
+                            recovery_command = shlex.join(
+                                [*rec_base, "stop", "-s", recovery_session]
+                            )
+                            preserved_path = rec_path
+                        else:
+                            orig_sess = _find_original_store_session(created_endpoint)
+                            if orig_sess is not None:
+                                recovery_command = shlex.join(
+                                    [*base_cmd, "stop", "-s", orig_sess]
+                                )
+                                preserved_path = isolated_config
+                            else:
+                                recovery_command = None
+                                seed_failure_detail = (
+                                    f"failed to seed recovery store ({final_seed_err}) and "
+                                    f"original session store {isolated_config} has no mapping for "
+                                    f"endpoint `{created_endpoint}`; stop it manually in Colab "
+                                    "Manage Sessions (https://colab.research.google.com)"
+                                )
                     elif leaked_sessions:
                         recovery_command = shlex.join([*base_cmd, "stop", "-s", recovery_session])
                         preserved_path = isolated_config
@@ -2612,19 +2732,34 @@ def run_benchmark(
                         preserved_path = isolated_config
 
                     if query_err is not None:
-                        teardown_error = query_err
-                        if recovery_command:
+                        if recovery_command and preserved_path is not None:
                             teardown_error = (
                                 f"{query_err}; per-run recovery config preserved at {preserved_path} "
                                 f"(run: `{recovery_command}`)"
                             )
+                        elif seed_failure_detail is not None:
+                            teardown_error = f"{query_err}; {seed_failure_detail}"
+                        else:
+                            teardown_error = query_err
                     else:
-                        teardown_error = (
-                            "Active Colab assignment/session remained after release retries: "
-                            f"endpoints={leaked_endpoints}, sessions={leaked_sessions}; "
-                            f"per-run recovery config preserved at {preserved_path} "
-                            f"(run: `{recovery_command}`)"
-                        )
+                        if recovery_command and preserved_path is not None:
+                            teardown_error = (
+                                "Active Colab assignment/session remained after release retries: "
+                                f"endpoints={leaked_endpoints}, sessions={leaked_sessions}; "
+                                f"per-run recovery config preserved at {preserved_path} "
+                                f"(run: `{recovery_command}`)"
+                            )
+                        elif seed_failure_detail is not None:
+                            teardown_error = (
+                                "Active Colab assignment/session remained after release retries: "
+                                f"endpoints={leaked_endpoints}, sessions={leaked_sessions}; "
+                                f"{seed_failure_detail}"
+                            )
+                        else:
+                            teardown_error = (
+                                "Active Colab assignment/session remained after release retries: "
+                                f"endpoints={leaked_endpoints}, sessions={leaked_sessions}"
+                            )
                     break
 
                 retry_idx += 1
@@ -2648,23 +2783,62 @@ def run_benchmark(
                     rec_path, rec_base, seed_err = _prepare_recovery_store(
                         recovery_session, created_endpoint
                     )
-                    retry_res, retry_err = _run_stop_cmd(recovery_session, cmd_prefix=rec_base)
-                    release_retries.append(
-                        {
-                            "attempt": retry_idx,
-                            "session": recovery_session,
-                            "endpoint": created_endpoint,
-                            "recovery_config": str(rec_path),
-                            "seed_error": seed_err,
-                            "returncode": retry_res.returncode,
-                            "error": retry_err,
-                            "stderr_tail": retry_res.stderr.strip()[-1000:]
-                            if retry_res.stderr.strip()
-                            else None,
-                        }
-                    )
+                    stopped_via_orig: Optional[str] = None
+                    if seed_err is None:
+                        retry_res, retry_err = _run_stop_cmd(recovery_session, cmd_prefix=rec_base)
+                        release_retries.append(
+                            {
+                                "attempt": retry_idx,
+                                "session": recovery_session,
+                                "endpoint": created_endpoint,
+                                "recovery_config": str(rec_path),
+                                "seed_error": None,
+                                "returncode": retry_res.returncode,
+                                "error": retry_err,
+                                "stderr_tail": retry_res.stderr.strip()[-1000:]
+                                if retry_res.stderr.strip()
+                                else None,
+                            }
+                        )
+                    else:
+                        orig_sess = _find_original_store_session(created_endpoint)
+                        if orig_sess is not None:
+                            stopped_via_orig = orig_sess
+                            retry_res, retry_err = _run_stop_cmd(orig_sess, cmd_prefix=base_cmd)
+                            release_retries.append(
+                                {
+                                    "attempt": retry_idx,
+                                    "session": orig_sess,
+                                    "endpoint": created_endpoint,
+                                    "recovery_config": str(isolated_config),
+                                    "seed_error": seed_err,
+                                    "returncode": retry_res.returncode,
+                                    "error": retry_err,
+                                    "stderr_tail": retry_res.stderr.strip()[-1000:]
+                                    if retry_res.stderr.strip()
+                                    else None,
+                                }
+                            )
+                        else:
+                            release_retries.append(
+                                {
+                                    "attempt": retry_idx,
+                                    "session": recovery_session,
+                                    "endpoint": created_endpoint,
+                                    "recovery_config": None,
+                                    "seed_error": seed_err,
+                                    "returncode": None,
+                                    "error": (
+                                        f"Skipped `colab stop` with unseeded config: {seed_err}; "
+                                        f"original store {isolated_config} has no mapping for {created_endpoint}"
+                                    ),
+                                    "stderr_tail": None,
+                                }
+                            )
                     for extra_sess in list(dict.fromkeys(leaked_sessions)):
-                        if extra_sess == recovery_session:
+                        if extra_sess == recovery_session and seed_err is None:
+                            continue
+                        if extra_sess == stopped_via_orig:
                             continue
                         extra_res, extra_err = _run_stop_cmd(extra_sess)
                         release_retries.append(
@@ -2777,6 +2951,7 @@ def run_benchmark(
         else:
             status = "failed"
 
+        run_summary_path = out_dir / f"{chosen_session or session_base}.summary.json"
         summary = {
             "status": status,
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -2785,6 +2960,7 @@ def run_benchmark(
             "effective_request_timeout_s": effective_request_timeout,
             "isolated_config": str(isolated_config),
             "recovery_config": str(recovery_config_path) if recovery_config_path else None,
+            "run_summary": str(run_summary_path),
             "usage_before": asdict(usage),
             "chosen_tpu": chosen_tpu,
             "chosen_session": chosen_session,
@@ -2813,11 +2989,10 @@ def run_benchmark(
             "attempts": attempts,
             "probe": probe_payload,
         }
+        summary_json_text = json.dumps(summary, indent=2) + "\n"
         try:
-            _write_text_nofollow(
-                out_dir / "summary.json",
-                json.dumps(summary, indent=2) + "\n",
-            )
+            _write_text_nofollow(run_summary_path, summary_json_text)
+            _write_text_nofollow(out_dir / "summary.json", summary_json_text)
         except UntrustedPathError as exc:
             return 2, {"status": "untrusted_out_dir", "error": str(exc)}
         except OSError as exc:
@@ -4523,17 +4698,25 @@ def run_self_test() -> int:
         assert sum_meta["proof_export"]["ok"] is False
         assert sum_meta["proof_export"]["metadata_only"] is True
 
-        # 46. Managed subprocess runner always forces COLAB_CLI_ASSIGN_RETRIES=0 even when the
-        #     caller environment sets a non-zero retry count.
+        # 46. Managed subprocess runner preserves same-request allocation reconciliation
+        #     (defaults COLAB_CLI_ASSIGN_RETRIES=1 when unset; honors caller setting; never forces 0).
         old_retries_env = os.environ.get("COLAB_CLI_ASSIGN_RETRIES")
-        os.environ["COLAB_CLI_ASSIGN_RETRIES"] = "3"
         try:
+            os.environ.pop("COLAB_CLI_ASSIGN_RETRIES", None)
+            env_runner_def = make_subprocess_runner(request_timeout_s=10.0)
+            res_env_def = env_runner_def(
+                [sys.executable, "-c", "import os; print(os.environ['COLAB_CLI_ASSIGN_RETRIES'])"]
+            )
+            assert res_env_def.returncode == 0
+            assert res_env_def.stdout.strip() == "1"
+
+            os.environ["COLAB_CLI_ASSIGN_RETRIES"] = "3"
             env_runner = make_subprocess_runner(request_timeout_s=10.0)
             res_env = env_runner(
                 [sys.executable, "-c", "import os; print(os.environ['COLAB_CLI_ASSIGN_RETRIES'])"]
             )
             assert res_env.returncode == 0
-            assert res_env.stdout.strip() == "0"
+            assert res_env.stdout.strip() == "3"
         finally:
             if old_retries_env is None:
                 os.environ.pop("COLAB_CLI_ASSIGN_RETRIES", None)
@@ -5124,7 +5307,355 @@ def run_self_test() -> int:
         )
         assert proc_insp.returncode == 0, f"inspect/open(__file__) script failed: {proc_insp.stderr}"
 
-    print("colab_tpu_bench.py self-test PASSED (57/57 suites).")
+        # 58. Same-request allocation reconciliation stays enabled while fallback is still blocked
+        #     after an internal retry + 412, a request-timeout-duration 412, or a materialized
+        #     assignment appearing in the pre-fallback `colab sessions` check.
+        retry_412_stderr = (
+            "WARNING: Assignment request failed; retrying in 10s\n"
+            "[colab] Allocation refused (precondition failed): 412\n"
+        )
+        assert is_allocation_timeout_error(1, retry_412_stderr)
+        assert not is_capacity_or_quota_error(1, "", retry_412_stderr)
+
+        slow_412_runs: List[str] = []
+
+        def slow_412_runner(cmd: Sequence[str]) -> CommandResult:
+            if "--help" in cmd:
+                return CommandResult(0, "Usage: colab --auth --config --no-public-api\n", "")
+            if "version" in cmd:
+                return CommandResult(0, "Version: 0.8.0\n", "")
+            if "usage" in cmd:
+                return CommandResult(
+                    0,
+                    "Current balance: 100.00 compute units\nUsage rate: 0.00 / hr\nActive assignments: 0\n",
+                    "",
+                )
+            if "sessions" in cmd:
+                return CommandResult(0, "[colab] No active sessions found on server.\n", "")
+            if "run" in cmd:
+                slow_412_runs.append(cmd[cmd.index("--tpu") + 1])
+                return CommandResult(
+                    1,
+                    "",
+                    "[colab] Allocation refused (precondition failed): 412\n",
+                    elapsed_s=65.0,
+                )
+            raise AssertionError(f"Unexpected cmd: {cmd}")
+
+        rc_s412, sum_s412 = run_benchmark(
+            BenchConfig(
+                tpus=("v6e1", "v5e1"),
+                request_timeout_s=60.0,
+                out_dir=tmp_path / "slow-412-out",
+            ),
+            runner=slow_412_runner,
+        )
+        assert slow_412_runs == ["V6E1"], f"Slow 412 must block V5E1 fallback: {slow_412_runs}"
+        assert rc_s412 != 0
+        assert sum_s412["teardown_verified"] is False
+        assert sum_s412["status"] == "allocation_timeout_unreconciled"
+
+        # Pre-fallback `colab sessions` detecting a newly materialized endpoint aborts V5E1 fallback.
+        prefb_runs: List[str] = []
+        prefb_sessions_n = {"n": 0}
+
+        def prefb_materialized_runner(cmd: Sequence[str]) -> CommandResult:
+            if "--help" in cmd:
+                return CommandResult(0, "Usage: colab --auth --config --no-public-api\n", "")
+            if "version" in cmd:
+                return CommandResult(0, "Version: 0.8.0\n", "")
+            if "usage" in cmd:
+                return CommandResult(
+                    0,
+                    "Current balance: 100.00 compute units\nUsage rate: 0.00 / hr\nActive assignments: 0\n",
+                    "",
+                )
+            if "run" in cmd:
+                prefb_runs.append(cmd[cmd.index("--tpu") + 1])
+                return CommandResult(
+                    1, "", "[colab] Allocation refused (precondition failed): 412\n", elapsed_s=5.0
+                )
+            if "sessions" in cmd:
+                prefb_sessions_n["n"] += 1
+                if prefb_sessions_n["n"] == 1:
+                    return CommandResult(0, "[colab] No active sessions found on server.\n", "")
+                return CommandResult(
+                    0,
+                    "[?] m-s-late-materialized-1 | Hardware: V6E1 | Shape: STANDARD | Variant: TPU\n",
+                    "",
+                )
+            raise AssertionError(f"Unexpected cmd: {cmd}")
+
+        rc_pfb, sum_pfb = run_benchmark(
+            BenchConfig(tpus=("v6e1", "v5e1"), out_dir=tmp_path / "prefb-mat-out"),
+            runner=prefb_materialized_runner,
+        )
+        assert prefb_runs == ["V6E1"], f"Materialized endpoint must abort fallback: {prefb_runs}"
+        assert rc_pfb != 0
+        assert sum_pfb["teardown_verified"] is False
+        assert sum_pfb["ambiguous_endpoints"] == ["m-s-late-materialized-1"]
+
+        # 59. When recovery-store seeding fails:
+        #     (a) reuse the original `--config` if it still maps the session to the endpoint;
+        #     (b) when neither recovery seeding nor original store has a mapping, skip calling
+        #         `colab stop` on an unseeded config and report seed failure + manual guidance.
+        orig_fallback_out = tmp_path / "seed-fail-orig-out"
+        orig_fallback_out.mkdir(mode=0o700)
+        os.chmod(orig_fallback_out, 0o700)
+        orig_store_cfg = orig_fallback_out / "orig-store.json"
+        orig_store_cfg.write_text("{}", encoding="utf-8")
+        os.chmod(orig_store_cfg, 0o600)
+        orig_stop_cmds: List[List[str]] = []
+        orig_state = {"stopped": False, "sessions_calls": 0, "sess": ""}
+
+        def seed_fail_orig_runner(cmd: Sequence[str]) -> CommandResult:
+            if "--help" in cmd:
+                return CommandResult(0, "Usage: colab --auth --config --no-public-api\n", "")
+            if "version" in cmd:
+                return CommandResult(0, "Version: 0.8.0\n", "")
+            if "usage" in cmd:
+                return CommandResult(
+                    0,
+                    "Current balance: 100.00 compute units\nUsage rate: 0.00 / hr\nActive assignments: 0\n",
+                    "",
+                )
+            if "run" in cmd:
+                s_name = cmd[cmd.index("-s") + 1]
+                orig_state["sess"] = s_name
+                orig_store_cfg.write_text(
+                    json.dumps(
+                        {
+                            s_name: {
+                                "name": s_name,
+                                "token": "tok",
+                                "url": "https://example.invalid",
+                                "endpoint": "m-s-orig-mapped-1",
+                            }
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return CommandResult(
+                    0,
+                    f"{PROBE_JSON_BEGIN}\n{json.dumps(sample_probe)}\n{PROBE_JSON_END}\n",
+                    f"[colab] Session READY ({s_name}). Executing...\n",
+                )
+            if "log" in cmd:
+                return CommandResult(1, "", "disk full")
+            if "sessions" in cmd:
+                orig_state["sessions_calls"] += 1
+                if orig_state["sessions_calls"] == 1 or orig_state["stopped"]:
+                    return CommandResult(0, "[colab] No active sessions found on server.\n", "")
+                return CommandResult(
+                    0,
+                    f"[{orig_state['sess']}] m-s-orig-mapped-1 | Hardware: V6E1 | Shape: STANDARD | Variant: TPU\n",
+                    "",
+                )
+            if "stop" in cmd:
+                orig_stop_cmds.append(list(cmd))
+                orig_state["stopped"] = True
+                return CommandResult(0, "[colab] Stopped.\n", "")
+            raise AssertionError(f"Unexpected cmd: {cmd}")
+
+        with _mock_patch(
+            f"{__name__}._write_recovery_session_store",
+            side_effect=OSError(28, "No space left on device"),
+        ):
+            rc_sfo, sum_sfo = run_benchmark(
+                BenchConfig(
+                    tpus=("v6e1",),
+                    config_path=orig_store_cfg,
+                    out_dir=orig_fallback_out,
+                    teardown_retries=2,
+                    teardown_retry_delay_s=0.0,
+                ),
+                runner=seed_fail_orig_runner,
+            )
+        assert len(orig_stop_cmds) == 1, orig_stop_cmds
+        assert str(orig_store_cfg.resolve()) in orig_stop_cmds[0], orig_stop_cmds[0]
+        assert sum_sfo["teardown_verified"] is True, sum_sfo
+
+        # (b) No recovery store AND original store has no mapping: never call `colab stop` with
+        #     an unseeded config and never advertise an unusable recovery_command.
+        noseed_stop_cmds: List[List[str]] = []
+        noseed_sessions_calls = {"n": 0}
+        fake_home2 = tmp_path / "noseed-home"
+        hist_dir2 = fake_home2 / ".config" / "colab-cli" / "history"
+        hist_dir2.mkdir(parents=True, mode=0o700)
+        os.chmod(fake_home2, 0o700)
+        os.chmod(fake_home2 / ".config", 0o700)
+        os.chmod(fake_home2 / ".config" / "colab-cli", 0o700)
+        os.chmod(hist_dir2, 0o700)
+        old_home2 = os.environ.get("HOME")
+        os.environ["HOME"] = str(fake_home2)
+        try:
+            def seed_fail_unmapped_runner(cmd: Sequence[str]) -> CommandResult:
+                if "--help" in cmd:
+                    return CommandResult(0, "Usage: colab --auth --config --no-public-api\n", "")
+                if "version" in cmd:
+                    return CommandResult(0, "Version: 0.8.0\n", "")
+                if "usage" in cmd:
+                    return CommandResult(
+                        0,
+                        "Current balance: 100.00 compute units\nUsage rate: 0.00 / hr\nActive assignments: 0\n",
+                        "",
+                    )
+                if "run" in cmd:
+                    s_name = cmd[cmd.index("-s") + 1]
+                    hf = hist_dir2 / f"{s_name}.jsonl"
+                    hf.write_text(
+                        json.dumps({"event_type": "session_created", "endpoint": "m-s-unmapped-77"}) + "\n",
+                        encoding="utf-8",
+                    )
+                    os.chmod(hf, 0o600)
+                    return CommandResult(
+                        0,
+                        f"{PROBE_JSON_BEGIN}\n{json.dumps(sample_probe)}\n{PROBE_JSON_END}\n",
+                        f"[colab] Session READY ({s_name}). Executing...\n",
+                    )
+                if "log" in cmd:
+                    return CommandResult(1, "", "disk full")
+                if "sessions" in cmd:
+                    noseed_sessions_calls["n"] += 1
+                    if noseed_sessions_calls["n"] == 1:
+                        return CommandResult(0, "[colab] No active sessions found on server.\n", "")
+                    return CommandResult(
+                        0,
+                        "[?] m-s-unmapped-77 | Hardware: V6E1 | Shape: STANDARD | Variant: TPU\n",
+                        "",
+                    )
+                if "stop" in cmd:
+                    noseed_stop_cmds.append(list(cmd))
+                    return CommandResult(1, "", "unseeded")
+                raise AssertionError(f"Unexpected cmd: {cmd}")
+
+            with _mock_patch(
+                f"{__name__}._write_recovery_session_store",
+                side_effect=OSError(28, "No space left on device"),
+            ):
+                rc_ns, sum_ns = run_benchmark(
+                    BenchConfig(
+                        tpus=("v6e1",),
+                        out_dir=tmp_path / "noseed-out",
+                        teardown_retries=1,
+                        teardown_retry_delay_s=0.0,
+                    ),
+                    runner=seed_fail_unmapped_runner,
+                )
+            assert noseed_stop_cmds == [], f"Must not call colab stop with unseeded config: {noseed_stop_cmds}"
+            assert rc_ns != 0
+            assert sum_ns["teardown_verified"] is False
+            assert sum_ns["recovery_command"] is None
+            assert sum_ns["recovery_config"] is None
+            assert "m-s-unmapped-77" in (sum_ns["teardown_error"] or "")
+            assert "Manage Sessions" in (sum_ns["teardown_error"] or "")
+        finally:
+            if old_home2 is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = old_home2
+
+        # 60. Failed or incomplete `colab --help` must NEVER drop `--auth` or `--config`.
+        help_fail_seen: List[List[str]] = []
+
+        def broken_help_runner(cmd: Sequence[str]) -> CommandResult:
+            help_fail_seen.append(list(cmd))
+            if "--help" in cmd:
+                return CommandResult(1, "", "transient help error")
+            if "version" in cmd:
+                return CommandResult(0, "Version: 0.8.0\n", "")
+            if "usage" in cmd:
+                return CommandResult(
+                    0,
+                    "Current balance: 1.00 compute units\nUsage rate: 0.00 / hr\nActive assignments: 0\n",
+                    "",
+                )
+            raise AssertionError(f"Unexpected cmd: {cmd}")
+
+        rc_bh, sum_bh = run_benchmark(
+            BenchConfig(auth="adc", min_cu_balance=5.0, out_dir=tmp_path / "broken-help-out"),
+            runner=broken_help_runner,
+        )
+        assert rc_bh == 1
+        assert sum_bh["status"] == "cu_budget_insufficient"
+        usage_cmds_bh = [c for c in help_fail_seen if "usage" in c]
+        assert len(usage_cmds_bh) == 1
+        assert "--auth" in usage_cmds_bh[0] and "adc" in usage_cmds_bh[0]
+        assert "--config" in usage_cmds_bh[0]
+
+        # 61. Repeated runs sharing an output directory preserve separate `<session>.summary.json`
+        #     files alongside `summary.json`.
+        shared_out = tmp_path / "shared-summary-out"
+
+        def ok_summary_runner(cmd: Sequence[str]) -> CommandResult:
+            if "--help" in cmd:
+                return CommandResult(0, "Usage: colab --auth --config --no-public-api\n", "")
+            if "version" in cmd:
+                return CommandResult(0, "Version: 0.8.0\n", "")
+            if "usage" in cmd:
+                return CommandResult(
+                    0,
+                    "Current balance: 100.00 compute units\nUsage rate: 0.00 / hr\nActive assignments: 0\n",
+                    "",
+                )
+            if "sessions" in cmd:
+                return CommandResult(0, "[colab] No active sessions found on server.\n", "")
+            if "run" in cmd:
+                s_name = cmd[cmd.index("-s") + 1]
+                return CommandResult(
+                    0,
+                    f"{PROBE_JSON_BEGIN}\n{json.dumps(sample_probe)}\n{PROBE_JSON_END}\n",
+                    f"[colab] Session READY ({s_name}). Executing...\n",
+                )
+            if "log" in cmd:
+                nb_out = Path(cmd[cmd.index("-o") + 1])
+                nb_out.write_text(
+                    json.dumps(
+                        {
+                            "nbformat": 4,
+                            "cells": [
+                                {"cell_type": "markdown", "source": "- Endpoint: `m-s-shared-ep`"},
+                                {"cell_type": "code", "source": "print('ok')"},
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return CommandResult(0, "Exported.\n", "")
+            raise AssertionError(f"Unexpected cmd: {cmd}")
+
+        rc_sh1, sum_sh1 = run_benchmark(
+            BenchConfig(tpus=("v6e1",), out_dir=shared_out), runner=ok_summary_runner
+        )
+        rc_sh2, sum_sh2 = run_benchmark(
+            BenchConfig(tpus=("v6e1",), out_dir=shared_out), runner=ok_summary_runner
+        )
+        assert rc_sh1 == 0 and rc_sh2 == 0
+        p_sum1 = Path(sum_sh1["run_summary"])
+        p_sum2 = Path(sum_sh2["run_summary"])
+        assert p_sum1 != p_sum2
+        assert p_sum1.is_file() and p_sum2.is_file()
+        assert json.loads(p_sum1.read_text(encoding="utf-8"))["chosen_session"] == sum_sh1["chosen_session"]
+        assert json.loads(p_sum2.read_text(encoding="utf-8"))["chosen_session"] == sum_sh2["chosen_session"]
+        assert (shared_out / "summary.json").is_file()
+
+        # 62. A partial opening probe marker in the truncated head buffer must NOT mask the
+        #     complete probe payload captured separately and appended after the omission banner.
+        cap_partial_head = _BoundedStreamCapture(
+            max_capture_bytes=512,
+            capture_probe=True,
+        )
+        # Place PROBE_JSON_BEGIN right near byte 240 so the 256-byte head retains BEGIN + partial
+        # JSON but cuts off before END, followed by > 2 KB of trailing output.
+        probe_block = f"{PROBE_JSON_BEGIN}\n{json.dumps(sample_probe)}\n{PROBE_JSON_END}\n"
+        cap_partial_head.feed(b"X" * 210 + probe_block.encode("utf-8") + b"Y" * 3000)
+        rendered_ph = cap_partial_head.render_text()
+        assert rendered_ph.count(PROBE_JSON_BEGIN) == 2
+        assert cap_partial_head.captured_probe_text() is not None
+        assert extract_probe_json(cap_partial_head.captured_probe_text() or "") == sample_probe
+        assert extract_probe_json(rendered_ph) == sample_probe
+
+    print("colab_tpu_bench.py self-test PASSED (62/62 suites).")
     return 0
 
 
