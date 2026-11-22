@@ -143,8 +143,9 @@ public:
     void await_buffer_ready(PJRT_Buffer* buf);
     void await_event(PJRT_Event* ev);
 
-    // Builds compile options (including DeviceAssignmentProto when num_chips > 1) for a 1D chip mesh.
-    PjrtCompileOptions make_spmd_compile_options(int num_chips) const;
+    // Builds compile options (including DeviceAssignmentProto for multi-chip SPMD or
+    // explicit single-device targeting on multi-chip hosts) for a 1D chip mesh.
+    PjrtCompileOptions make_spmd_compile_options(int num_chips, int device_idx = 0) const;
 
     // Compile StableHLO MLIR ("mlir" format) or return cached PJRT_LoadedExecutable*.
     // Thread-safe LRU cache keyed by canonical structural program key.

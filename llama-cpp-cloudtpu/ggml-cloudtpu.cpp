@@ -2515,8 +2515,12 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
                           emitted.input_bindings.size(), prog_spec.ops.size(), emitted.output_bindings.size(),
                           emitted.mlir_text.c_str());
         }
-        const cloudtpu::PjrtCompileOptions copts = rt.make_spmd_compile_options(P);
-        const cloudtpu::CachedExecutable* exec = rt.compile_or_get(emitted.cache_key, emitted.mlir_text, copts);
+        const cloudtpu::PjrtCompileOptions copts = rt.make_spmd_compile_options(P, ctx->device_index);
+        std::string exec_cache_key = emitted.cache_key;
+        if (P <= 1 && rt.device_count() > 1) {
+            exec_cache_key += "|dev=" + std::to_string(ctx->device_index);
+        }
+        const cloudtpu::CachedExecutable* exec = rt.compile_or_get(exec_cache_key, emitted.mlir_text, copts);
 
         CachedSubgraphPlan new_plan;
         new_plan.exec = exec;

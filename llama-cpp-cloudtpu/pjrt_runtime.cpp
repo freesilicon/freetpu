@@ -2149,7 +2149,7 @@ std::vector<PjrtBufferPtr> PjrtRuntime::buffer_from_host_replicated(int num_devi
     return bufs;
 }
 
-PjrtCompileOptions PjrtRuntime::make_spmd_compile_options(int num_chips) const {
+PjrtCompileOptions PjrtRuntime::make_spmd_compile_options(int num_chips, int device_idx) const {
     PjrtCompileOptions opts;
     const int n = std::max(1, std::min(num_chips, static_cast<int>(device_infos_.size())));
     if (n <= 1) {
@@ -2157,6 +2157,9 @@ PjrtCompileOptions PjrtRuntime::make_spmd_compile_options(int num_chips) const {
         opts.num_partitions = 1;
         opts.use_spmd_partitioning = true;
         opts.use_shardy_partitioner = true;
+        if (device_infos_.size() > 1 && device_idx >= 0 && device_idx < static_cast<int>(device_infos_.size())) {
+            opts.device_assignment_ids = {device_infos_[static_cast<size_t>(device_idx)].id};
+        }
     } else {
         // Explicit collective replica-SPMD across n TPU chips:
         // num_replicas = n, num_partitions = 1, explicit DeviceAssignmentProto mapping [0][0..n-1].
@@ -2386,9 +2389,10 @@ void PjrtRuntime::execute(const CachedExecutable* exec,
     ex.num_args = num_inputs;
     ex.output_lists = out_lists;
     ex.device_complete_events = use_dev_event ? dev_ev : nullptr;
-    // PJRT TPU plugins compile single-device executables with compile-time device assignment;
-    // passing nullptr avoids "execute_device not supported" errors on single-chip libtpu.so.
-    ex.execute_device = (devices_.size() > 1) ? devices_[static_cast<size_t>(device_idx)] : nullptr;
+    // PJRT TPU plugins compile single-device executables with compile-time DeviceAssignmentProto;
+    // leaving execute_device = nullptr lets libtpu.so dispatch directly to the assigned device
+    // (passing a non-null execute_device is only valid for portable executables).
+    ex.execute_device = nullptr;
 
     check_error(api_->PJRT_LoadedExecutable_Execute(&ex), "PJRT_LoadedExecutable_Execute");
 

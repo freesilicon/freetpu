@@ -52,14 +52,29 @@ Eliminating host MLIR re-emission (`SubgraphPlanCache`), replacing per-subgraph 
 
 *Note: `Meta-Llama-3.1-8B` carries `rope_freqs.weight` on CPU, causing `ggml_backend_sched` to emit 65 splits per token vs 1 split on `Qwen2.5-1.5B`; both models generate coherent verified `llama-cli` (`-c 4096`, `17 * 23 = 391`) and `llama-server` responses with `MAPS_LIBPYTHON=0`. Full `FLASH_ATTN_EXT` (`1697/1697`), `SET_ROWS` (`65/65`), `RMS_NORM` (`61/61`), and `MUL_MAT` (`44/44`) parity verified on live `TPU v5 lite`.*
 
-### M4A Multi-Chip SPMD Readiness (`v6e-8` & `tpu7x-4t`)
+### M4A Multi-Chip SPMD Live Silicon Proof (`v6e-8` Trillium, `MAPS_LIBPYTHON=0`)
 
-When `CLOUDTPU_SPMD_CHIPS=auto` (default) detects `P > 1` TPU chips, `ggml-cloudtpu` exposes a single unified `CLOUDTPU` device reporting aggregated mesh HBM (`P * per_chip_hbm`), compiles explicit replica-SPMD StableHLO v1.0 collectives (`all_reduce`, `all_gather`, `reduce_scatter`, `replica_id` + `dynamic_slice`) with `DeviceAssignmentProto` (`num_replicas=P, num_partitions=1`), and automatically shards 2D weights by `1/P` across chips (`SHARD_K` for `ffn_down`/`token_embd`, `SHARD_N` for `Q`/`K`/`V`/`O`/`ffn_gate`/`ffn_up`/`output`, fusing Megatron-LM FFN blocks down to a single `all_reduce`):
+When `CLOUDTPU_SPMD_CHIPS=auto` (default) detects `P > 1` TPU chips, `ggml-cloudtpu` exposes a single unified `CLOUDTPU` device reporting aggregated mesh HBM (`P * per_chip_hbm`), compiles explicit replica-SPMD StableHLO v1.0 collectives (`all_reduce`, `all_gather`, `reduce_scatter`, `replica_id` + `dynamic_slice`) with `DeviceAssignmentProto` (`num_replicas=P, num_partitions=1`), and automatically shards 2D weights by `1/P` across chips (`SHARD_K` for `ffn_down`/`token_embd`, `SHARD_N` for `Q`/`K`/`V`/`O`/`ffn_gate`/`ffn_up`/`output`, fusing Megatron-LM FFN blocks down to a single `all_reduce`).
+
+#### Live 8-Chip `v6e-8` Silicon Verification (`SPMD 8x TPU v6 lite`, `255,967 MB` HBM, `ldd libpython = 0`)
+- **`test_cloudtpu_host` (`CLOUDTPU_MOCK=0`):** `ALL PASSED (0 failures)` including live 4-chip & 8-chip SPMD collective (`all_reduce`/`all_gather`/`reduce_scatter`) + Megatron FFN tests (`MAPS_LIBPYTHON=0`).
+- **`test-backend-ops -b CLOUDTPU` (`CLOUDTPU_SPMD_CHIPS=8`):** **`3,820 / 3,820` PASSED** across all 8 core suites:
+  - `MUL_MAT`: `1,361/1,361` | `FLASH_ATTN_EXT`: `1,697/1,697` | `ROPE`: `287/287` | `ADD`: `153/153` | `MUL`: `140/140` | `SET_ROWS`: `65/65` | `RMS_NORM`: `61/61` | `GET_ROWS`: `56/56`.
+- **End-to-End 8-Chip GGUF Inference (`llama-bench -ngl 99 -fa 1` & `llama-cli -c 4096`):**
+
+| Model (GGUF) | Quant | Size | Chips (`P`) | `pp512` (tok/s) | `tg64` (tok/s) | `llama-cli` Coherence |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| `Qwen2.5-1.5B-Instruct` | `Q4_K_M` | `1.04 GiB` | `1` | `10,479.21` | `54.52` | Verified |
+| `Qwen2.5-1.5B-Instruct` | `Q4_K_M` | `1.04 GiB` | `8` | `5,212.55` | `12.13` | Verified |
+| `Qwen3-32B` | `Q4_K_M` | `18.40 GiB` | `8` | `2,747.30` | `7.20` | Verified coherent reasoning |
+| `Llama-3.3-70B-Instruct` | `Q4_K_M` | `39.59 GiB` | `8` | `502.72` | `2.23` | Verified (`17 * 23 = 391`) — exceeds single-chip 31.25 GiB HBM, runs sharded across 8 chips |
+
+*Note: `v6e-8` M4A baseline proves end-to-end 8-chip 32B/70B correctness & zero-Python SPMD sharding; autoregressive `tg64` throughput is currently bottlenecked by out-of-place `SET_ROWS` (`stablehlo.scatter`), per-subgraph host sync / unfused `Q4_K` dequant, and CPU `rope_freqs.weight` graph splits on Llama-3 — targeted in the next decode acceleration slice (`dynamic_update_slice` buffer donation, whole-layer fusion, VMEM-fused dequant, and async collective overlap flags).*
 
 | Target Topology (Phase 0 Baseline, PR `#15`) | Chips (`P`) | Total HBM | `Qwen3-32B` (`Q4_K_M` / `BF16`) per chip | `Llama-3.3-70B` (`Q4_K_M` / `Q8_0` / `BF16`) per chip | Verification Status |
 | --- | ---: | ---: | --- | --- | --- |
-| **`v6e-8`** (Trillium) | `8` | `256 GiB` (`32 GiB/chip`) | `~2.5 GiB` / `~8.1 GiB` | `~5.3 GiB` / `~9.4 GiB` / `~17.6 GiB` | Verified on 8-chip Host Mock (`test_cloudtpu_host`, `test-backend-ops`, bit-exact Llama-3 `llama-server` vs CPU) + live `libtpu.so` `P=1` collective compile/exec |
-| **`tpu7x-standard-4t`** (Ironwood) | `4` | `768 GiB` (`192 GiB/chip`) | `~5.0 GiB` / `~16.3 GiB` | `~10.6 GiB` / `~18.8 GiB` / `~35.3 GiB` | Verified on 4-chip Host Mock (`test_cloudtpu_host`, `test-backend-ops`, bit-exact Llama-3 `llama-server` vs CPU) + live `libtpu.so` `P=1` collective compile/exec |
+| **`v6e-8`** (Trillium) | `8` | `256 GiB` (`32 GiB/chip`) | `~2.5 GiB` / `~8.1 GiB` | `~5.3 GiB` / `~9.4 GiB` / `~17.6 GiB` | **Verified live on `v6e-8` silicon** (`test_cloudtpu_host`, `3,820/3,820` `test-backend-ops`, `Qwen3-32B`, `Llama-3.3-70B` `39.59 GiB`, `MAPS_LIBPYTHON=0`) |
+| **`tpu7x-standard-4t`** (Ironwood) | `4` (`8` logical) | `768 GiB` (`192 GiB/chip`) | `~5.0 GiB` / `~16.3 GiB` | `~10.6 GiB` / `~18.8 GiB` / `~35.3 GiB` | Verified on 4-chip & 8-chip Host Mock; live Ironwood silicon tracked in `#21` (`WAITING_FOR_QUOTA`) |
 
 ---
 
