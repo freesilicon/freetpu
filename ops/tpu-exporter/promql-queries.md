@@ -70,8 +70,10 @@ max by (generation, node, chip) (freetpu_tpu_hbm_used_bytes) / (1024 * 1024 * 10
 # scrape cadence (`5760 = 24h / 15s` scrapes). Using `max_over_time(...[15s])`
 # inside `[24h:15s]` requires a fresh sample per 15s interval (preventing
 # Prometheus's default 5m lookback delta from masking missed scrapes).
-# Values < 0.99 indicate scrape failures, missing VFIO device verification, or
-# unreadable `/proc/*/fd` scans; chips below 99% coverage are suppressed below.
+# Falling back to `max_over_time(freetpu_tpu_info{collector_role="node"}[24h])`
+# keeps chips visible as 0 coverage even if the exporter goes down and its instant
+# inventory series becomes stale (pair with independent cloud billable node
+# inventory to detect outages lasting longer than 24h).
 (
   count_over_time(
     (
@@ -81,12 +83,13 @@ max by (generation, node, chip) (freetpu_tpu_hbm_used_bytes) / (1024 * 1024 * 10
     )[24h:15s]
   )
   or
-  (0 * group by (generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node"}))
+  (0 * max by (generation, node, pci_bdf) (max_over_time(freetpu_tpu_info{collector_role="node"}[24h])))
 ) / 5760
 
-# Audit / alert: chips with incomplete 24h PID telemetry (< 99% of 5760 15s scrapes).
-# Investigate these chips before finalizing billing so missing telemetry never
-# silently under-bills an active TPU.
+# Audit / alert: chips with ANY incomplete 24h PID telemetry (< 100% of 5760 15s
+# scrapes, including full exporter outages observed during the 24h window).
+# Any chip returned here is excluded from automatic chargeback totals below and
+# must be reconciled before billing.
 (
   (
     count_over_time(
@@ -97,9 +100,22 @@ max by (generation, node, chip) (freetpu_tpu_hbm_used_bytes) / (1024 * 1024 * 10
       )[24h:15s]
     )
     or
-    (0 * group by (generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node"}))
+    (0 * max by (generation, node, pci_bdf) (max_over_time(freetpu_tpu_info{collector_role="node"}[24h])))
   ) / 5760
-) < 0.99
+) < 1
+
+# Missing 15s telemetry intervals over 24h per physical chip (0 = complete window).
+5760 - (
+  count_over_time(
+    (
+      max by (generation, node, pci_bdf) (
+        max_over_time(freetpu_tpu_active_pids{collector_role="node"}[15s])
+      )
+    )[24h:15s]
+  )
+  or
+  (0 * max by (generation, node, pci_bdf) (max_over_time(freetpu_tpu_info{collector_role="node"}[24h])))
+)
 
 # Operator-observed active chip-hours over 24h per physical chip (generation, node, pci_bdf):
 # Evaluates fresh samples at the 15s billing scrape cadence (`240 = 1h / 15s`
@@ -108,8 +124,8 @@ max by (generation, node, chip) (freetpu_tpu_hbm_used_bytes) / (1024 * 1024 * 10
 # Uses ONLY operator-controlled host VFIO PID handles (`collector_role="node"`)
 # for chips whose full `/sys/kernel/iommu_groups/<group>/devices` membership is
 # verified exclusive to that single TPU (`vfio_group_exclusive="true"`), AND
-# requires >= 99% 24h PID telemetry coverage (suppressing incomplete windows so
-# missing scans/scrapes never silently under-bill an active chip).
+# requires COMPLETE 24h PID telemetry coverage (`== 1`, all 5760/5760 scrapes)
+# so missing scans/scrapes never silently understate a chargeback total.
 sum_over_time(
   (
     max by (generation, node, pci_bdf) (
@@ -129,15 +145,16 @@ and on (generation, node, pci_bdf)
         max_over_time(freetpu_tpu_active_pids{collector_role="node"}[15s])
       )
     )[24h:15s]
-  ) / 5760 >= 0.99
+  ) / 5760 == 1
 )
 
 # Shared or non-exclusive VFIO-group reservation hours over 24h
 # (`collector_role="node"` only, evaluated at the 15s scrape cadence; routes
 # groups with `vfio_group_exclusive="false"` — including groups shared with
 # sibling TPUs, non-TPU PCI devices, or unverified IOMMU group membership — to
-# group-level reservation hours rather than per-chip chargeback). Suppressed
-# when 24h PID telemetry coverage is < 99%.
+# group-level reservation hours rather than per-chip chargeback). Requires
+# COMPLETE 24h PID telemetry coverage (`== 1`, all 5760/5760 scrapes); incomplete
+# windows are suppressed here and surfaced by the coverage audit above.
 sum_over_time(
   (
     max by (generation, node, vfio_device) (
@@ -157,7 +174,7 @@ and on (generation, node, vfio_device)
         max_over_time(freetpu_tpu_active_pids{collector_role="node"}[15s])
       )
     )[24h:15s]
-  ) / 5760 >= 0.99
+  ) / 5760 == 1
 )
 
 # Inventory-based estimated hourly TPU spend by generation across scraped nodes.

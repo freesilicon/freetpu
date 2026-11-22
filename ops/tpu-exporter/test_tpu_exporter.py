@@ -45,6 +45,10 @@ def _make_mock_pci_tree(
 
     for node in create_vfio_nodes or []:
         (vfio_dir / node).write_text("", encoding="utf-8")
+        minor = int(node) if node.isdigit() else 250
+        grp_dev = sysfs_root / "class" / "vfio" / node / "dev"
+        grp_dev.parent.mkdir(parents=True, exist_ok=True)
+        grp_dev.write_text(f"242:{minor}\n", encoding="utf-8")
 
     proc_root.mkdir(parents=True, exist_ok=True)
 
@@ -1368,6 +1372,21 @@ TPU Device Status
             self.assertIn('freetpu_tpu_pid_telemetry_available{chip="1",pci_bdf="0000:00:07.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/1"} 0', prom)
             self.assertIn('freetpu_tpu_active_pids{chip="0",pci_bdf="0000:00:06.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/0"} 0', prom)
             self.assertNotIn('freetpu_tpu_active_pids{chip="1",pci_bdf="0000:00:07.0"', prom)
+
+            # Mismatched kernel sysfs /sys/class/vfio/0/dev (242:99 vs char st_rdev 242:0)
+            # MUST also suppress PID telemetry and active PID counts for group 0.
+            (sysfs_root / "class" / "vfio" / "0" / "dev").write_text("242:99\n", encoding="utf-8")
+            with mock.patch.object(os, "stat", side_effect=_only_group0_is_char):
+                snap_mm = tpu_exporter.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin=None,
+                )
+            by_bdf_mm = {d.pci_bdf: d for d in snap_mm.devices}
+            self.assertFalse(by_bdf_mm["0000:00:06.0"].pid_telemetry_available)
+            prom_mm = tpu_exporter.format_prometheus_metrics(snap_mm)
+            self.assertNotIn('freetpu_tpu_active_pids{chip="0",pci_bdf="0000:00:06.0"', prom_mm)
 
     def test_runtime_telemetry_fallback_shares_single_scrape_deadline(self) -> None:
         import time as _time

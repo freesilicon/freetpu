@@ -198,9 +198,27 @@ def _read_fdinfo_flags(fdinfo_path: Path) -> Tuple[Optional[int], bool]:
     return None, False
 
 
+_VFIO_DEVNUM_RE = re.compile(r"^[0-9]+:[0-9]+$")
+
+
+def _read_kernel_vfio_devnum(sysfs_root: Path, group: str) -> Optional[str]:
+    """Read kernel-exported `<major>:<minor>` from sysfs for `/dev/vfio/<group>`."""
+    if not group:
+        return None
+    for path in (
+        sysfs_root / "class" / "vfio" / group / "dev",
+        sysfs_root / "devices" / "virtual" / "vfio" / group / "dev",
+    ):
+        raw = _read_text(path)
+        if raw and _VFIO_DEVNUM_RE.fullmatch(raw):
+            return raw
+    return None
+
+
 def _scan_proc_vfio_pids(
     proc_root: Path,
     vfio_paths: Sequence[str],
+    expected_devnums: Optional[Dict[str, Optional[str]]] = None,
 ) -> Tuple[Dict[str, List[int]], bool, int, Dict[str, int]]:
     """Find PIDs holding active non-`O_PATH` char-device FDs matching host `/dev/vfio/<group>` `st_rdev`.
 
@@ -213,10 +231,12 @@ def _scan_proc_vfio_pids(
 
     Returns `(pids_by_vfio_path, pid_telemetry_accessible, unreadable_pid_dirs, verified_rdevs)`.
     `verified_rdevs` contains ONLY those `vfio_paths` whose host node was successfully
-    `stat()`ed as a character device (`S_ISCHR`). Callers MUST mark PID telemetry
-    unavailable (and suppress `freetpu_tpu_active_pids`) for any group missing from
-    `verified_rdevs` so a missing/unreadable/non-character `/dev/vfio/<group>` node
-    never publishes a false zero PID count as valid coverage.
+    `stat()`ed as a character device (`S_ISCHR`) AND whose `(major, minor)` matches the
+    kernel-exported sysfs VFIO group device number (`expected_devnums[vp]`). Callers
+    MUST mark PID telemetry unavailable (and suppress `freetpu_tpu_active_pids`) for
+    any group missing from `verified_rdevs` so a missing, unreadable, non-character,
+    or mismatched/stale `/dev/vfio/<group>` node never attributes another group's
+    processes or emits a false zero PID count as valid billing coverage.
     """
     unique_paths = list(dict.fromkeys(p for p in vfio_paths if p))
     result: Dict[str, List[int]] = {}
@@ -232,10 +252,16 @@ def _scan_proc_vfio_pids(
             host_st = os.stat(vp)
         except OSError:
             continue
-        if stat.S_ISCHR(host_st.st_mode):
-            verified_rdevs[vp] = host_st.st_rdev
-            result[vp] = []
-            rdev_to_paths.setdefault(host_st.st_rdev, []).append(vp)
+        if not stat.S_ISCHR(host_st.st_mode):
+            continue
+        if expected_devnums is not None:
+            kernel_dn = expected_devnums.get(vp)
+            actual_dn = f"{os.major(host_st.st_rdev)}:{os.minor(host_st.st_rdev)}"
+            if not kernel_dn or actual_dn != kernel_dn:
+                continue
+        verified_rdevs[vp] = host_st.st_rdev
+        result[vp] = []
+        rdev_to_paths.setdefault(host_st.st_rdev, []).append(vp)
 
     try:
         entries = list(proc_root.iterdir())
@@ -943,13 +969,18 @@ def collect_snapshot(
         for d in devices
         if d.iommu_group
     ]
+    expected_vfio_devnums: Dict[str, Optional[str]] = {
+        str(dev_root / "vfio" / d.iommu_group): _read_kernel_vfio_devnum(sysfs_root, d.iommu_group)
+        for d in devices
+        if d.iommu_group
+    }
     if skip_pid_scan:
         proc_pids: Dict[str, List[int]] = {}
         proc_fd_accessible = False
         vfio_rdevs: Dict[str, int] = {}
     else:
         proc_pids, proc_fd_accessible, _unreadable, vfio_rdevs = _scan_proc_vfio_pids(
-            proc_root, real_vfio_paths
+            proc_root, real_vfio_paths, expected_devnums=expected_vfio_devnums
         )
 
     runtime_budget_s = max(0.05, float(tpu_info_timeout_s))
