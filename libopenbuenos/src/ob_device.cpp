@@ -818,6 +818,104 @@ ob_status_t device_wait_handle(ob_context* ctx,
   return result;
 }
 
+bool device_try_wait_handle(ob_context* ctx,
+                            ob_exec_handle_t handle,
+                            ob_status_t* out_status,
+                            ob_invoke_stats_t* out_stats) {
+  if (!ctx || handle == 0u) {
+    if (out_status) *out_status = OB_ERR_INVALID_ARG;
+    return true;
+  }
+
+  CachedGraph* completed_entry = nullptr;
+  ob_status_t result = OB_OK;
+  ob_invoke_stats_t stats {};
+
+  {
+    std::lock_guard<std::mutex> lk(ctx->vii_mu);
+    CreditSlot* slot = nullptr;
+    for (uint32_t i = 0; i < ctx->credit_size; ++i) {
+      if (ctx->credits[i].state != CreditSlot::FREE &&
+          ctx->credits[i].handle == handle) {
+        slot = &ctx->credits[i];
+        break;
+      }
+    }
+    if (!slot) {
+      set_last_error(ctx, "Unknown or already-completed ob_exec_handle_t");
+      if (out_status) *out_status = OB_ERR_NOT_FOUND;
+      return true;
+    }
+
+    if (ctx->mock_mode) {
+      slot->complete_time_ns = monotonic_now_ns();
+      slot->state = CreditSlot::COMPLETED;
+      slot->vii_resp_code = 0;
+      slot->error_status = OB_OK;
+    } else {
+#if defined(__linux__)
+      while (slot->state == CreditSlot::IN_FLIGHT) {
+        std::string err;
+        int rc = pop_and_demux_one_locked(ctx, false, 0u, nullptr, nullptr, &err);
+        if (rc == 0) continue;
+        if (rc == -2) {
+          // Keep the handle IN_FLIGHT so the caller's blocking wait / cleanup path
+          // retains DMA buffer ownership and retires the slot cleanly.
+          set_last_error(ctx, err);
+          return false;
+        }
+        break;
+      }
+      if (slot->state == CreditSlot::IN_FLIGHT) {
+        return false;
+      }
+      if (slot->state == CreditSlot::COMPLETED && slot->hw_execution_us > 0u) {
+        if (ctx->ema_hw_us == 0u) {
+          ctx->ema_hw_us = slot->hw_execution_us;
+        } else {
+          ctx->ema_hw_us = (ctx->ema_hw_us * 3u + slot->hw_execution_us) >> 2u;
+        }
+      }
+#else
+      return false;
+#endif
+    }
+
+    completed_entry = slot->graph_entry;
+    stats.hw_execution_us = slot->hw_execution_us;
+    uint64_t dt_ns = (slot->complete_time_ns >= slot->submit_time_ns)
+                         ? (slot->complete_time_ns - slot->submit_time_ns)
+                         : 0u;
+    stats.wall_time_us = dt_ns / 1000ULL;
+    stats.seq = slot->seq;
+    stats.model_handle = completed_entry ? completed_entry->model_handle : 0u;
+    stats.vii_resp_code = slot->vii_resp_code;
+    stats.flags = ctx->mock_mode ? static_cast<uint16_t>(OB_STAT_FLAG_MOCK) : static_cast<uint16_t>(0u);
+    stats.tiles_dispatched = 1u;
+
+    result = (slot->state == CreditSlot::COMPLETED) ? OB_OK : slot->error_status;
+    if (result != OB_OK && !slot->error_msg.empty()) {
+      set_last_error(ctx, slot->error_msg);
+    }
+
+    slot->state = CreditSlot::FREE;
+    slot->handle = 0;
+    slot->seq = 0;
+    slot->graph_entry = nullptr;
+    slot->error_msg.clear();
+    if (ctx->inflight_count > 0u) ctx->inflight_count -= 1u;
+  }
+
+  if (completed_entry) {
+    std::lock_guard<std::mutex> clk(ctx->cache_mu);
+    graph_entry_unref_locked(ctx, completed_entry);
+  }
+
+  if (out_stats) *out_stats = stats;
+  if (out_status) *out_status = result;
+  return true;
+}
+
 ob_status_t device_wait_all(ob_context* ctx, uint32_t timeout_ms) {
   if (!ctx) return OB_ERR_INVALID_ARG;
   ob_status_t first_err = OB_OK;
@@ -1062,6 +1160,20 @@ ob_status_t ob_context_create(const ob_config_t* config, ob_context_t** out_ctx)
     if (env_spin_us > 10000u) env_spin_us = 10000u;
   }
   ctx->spin_us = env_spin_us;
+  uint32_t env_threads = ob::kDefaultWorkerThreads;
+  if (read_env_u32("OPENBUENOS_THREADS", &env_threads)) {
+    if (env_threads < 1u) env_threads = 1u;
+    if (env_threads > 16u) env_threads = 16u;
+  }
+  ctx->num_threads = env_threads;
+  ctx->worker_pool.init(ctx->num_threads);
+  ctx->async_dequant_enabled = read_env_flag("OPENBUENOS_ASYNC_DEQUANT", true);
+  ctx->w8a16_mode = read_env_flag("OPENBUENOS_W8A16", false) ? 1u : 0u;
+  uint32_t env_max_out = ob::kDefaultMaxCachedOutlierCols;
+  if (read_env_u32("OPENBUENOS_MAX_OUTLIER_COLS", &env_max_out)) {
+    if (env_max_out > 1024u) env_max_out = 1024u;
+  }
+  ctx->max_cached_outlier_cols = env_max_out;
   ctx->device_path = eff.device_path;
   ctx->dma_heap_path = eff.dma_heap_path;
   ctx->mock_mode = (eff.mock_mode != 0);
@@ -1123,7 +1235,9 @@ void ob_context_destroy(ob_context_t* ctx) {
           static_cast<unsigned long long>(ps.weight_cache_budget_bytes));
     }
   }
+  ctx->async_dequant.shutdown();
   ob::gemm_release_pipeline_buffers(ctx);
+  ctx->worker_pool.shutdown();
   ob::graph_cache_clear(ctx);
   ob::shared_image_clear(ctx);
   ob::device_close(ctx);
