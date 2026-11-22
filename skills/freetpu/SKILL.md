@@ -21,12 +21,11 @@ Load [references/silicon-cheatsheet.md](references/silicon-cheatsheet.md) when c
    - **Mobile / bare-metal Edge TPU (`buenos_a0`)**: Use Workflow 1 (`libopenbuenos`, `tools/emit_custom_gemm.py`, `tools/spline_0x640.py`, `tpu_baremetal_runner`).
    - **Datacenter Cloud TPU (`v5e-1` / `v6e-1`)**: Use Workflow 2 (`google-colab-cli` / `tools/colab_tpu_bench.py`) + Workflow 3 (Pallas/Mosaic).
 3. **Parity before timing**: Always check numerical parity against NumPy `cpu_ref` (and XLA on Cloud TPU) before reporting latencies or TFLOP/s.
-4. **Resolve the FreeTPU checkout (global installs)**: Workflows 1, 2, and 3 all invoke repository-relative scripts (`tools/...`, `skills/freetpu/templates/...`, `libopenbuenos/...`). If you loaded this skill via a global symlink (`~/.claude/skills/freetpu`, `~/.codex/skills/freetpu`, or `~/.gemini/config/skills/freetpu`) while working outside the FreeTPU checkout, resolve the exact `SKILL.md` path your agent loaded back to the repository root and verify the checkout before running any workflow below:
+4. **Resolve the FreeTPU checkout root**: Workflows 1, 2, and 3 all invoke repository-relative paths (`tools/...`, `skills/freetpu/templates/...`, `libopenbuenos/...`). Whenever your working directory differs from the FreeTPU root — whether this skill was loaded via a global symlink (`~/.claude/skills/freetpu`, `~/.codex/skills/freetpu`, or `~/.gemini/config/skills/freetpu`) or via project-local parent-directory discovery (e.g., started inside `libopenbuenos/`) — resolve the exact `SKILL.md` path your agent loaded back to the checkout root and `cd` there before running any workflow below:
 
 ```bash
 # Set SKILL_MD to the exact SKILL.md path loaded by your agent
-# (e.g., ~/.claude/skills/freetpu/SKILL.md, ~/.codex/skills/freetpu/SKILL.md,
-# or ~/.gemini/config/skills/freetpu/SKILL.md):
+# (project-local e.g. ../skills/freetpu/SKILL.md, or global symlink):
 SKILL_MD="<path-to-loaded-SKILL.md>"
 REPO_ROOT="$(python3 -c '
 import pathlib, sys
@@ -117,16 +116,10 @@ Use this workflow with `google-colab-cli >= 0.7.6` (redacted logs) to run Pallas
      (
        SESSION_ID="freetpu-probe-$(date +%Y%m%d-%H%M%S)-$$"
        TPU_TYPE="${TPU_TYPE:-V6E1}"
-       RUN_RC=0
-       ALLOC_PID=""
-       RUN_PID=""
-       WD_PID=""
-       ENDPOINT=""
-       CANCELLED=0
-       CLEANED=0
+       BACKUP_STATE="$WORK_DIR/colab-state-backup.json"
+       RUN_RC=0; ALLOC_PID=""; RUN_PID=""; WD_PID=""; ENDPOINT=""; CANCELLED=0; CLEANED=0
 
-       # Build a local launcher before allocating any TPU so `colab exec --file` runs the template
-       # with clean sys.argv and a completion marker (no `colab upload` needed); abort on any write error:
+       # Build local launcher before allocating a TPU; abort on any write error:
        LAUNCHER="$WORK_DIR/$SESSION_ID.launch.py"
        if ! {
          printf 'import sys\nsys.argv = ["tile_swiglu.py"]\n' \
@@ -137,45 +130,42 @@ Use this workflow with `google-colab-cli >= 0.7.6` (redacted logs) to run Pallas
          exit 1
        fi
 
-       # Snapshot pre-existing server-side endpoints as defense-in-depth against unnamed `[?]` leaks:
        BASE_SESS="$(colab --auth=adc --config "$COLAB_STATE" sessions 2>/dev/null)" || BASE_SESS=""
        BASE_ENDPOINTS="$(printf '%s\n' "$BASE_SESS" | awk '$1 ~ /^\[/ && $2 != "" {print $2}')"
 
        cleanup() {
          [ "$CLEANED" -eq 1 ] && return
          CLEANED=1
-         # Ignore repeated INT/TERM while teardown completes so Ctrl-C cannot abort allocation wait or `colab stop`:
          trap '' INT TERM
          trap - EXIT
 
          [ -n "$WD_PID" ] && kill "$WD_PID" 2>/dev/null || true
          [ -n "$WD_PID" ] && wait "$WD_PID" 2>/dev/null || true
          WD_PID=""
-
-         # If cancelled mid-allocation, let `colab new` finish persisting $SESSION_ID so `colab stop` can release it by name:
          [ -n "$ALLOC_PID" ] && wait "$ALLOC_PID" 2>/dev/null || true
+         [ ! -f "$BACKUP_STATE" ] && [ -f "$COLAB_STATE" ] && ( umask 077; cp -p "$COLAB_STATE" "$BACKUP_STATE" ) || true
 
-         # Capture assigned endpoint before stopping and persist non-secret IDs outside the subshell:
+         # Fall back to $BACKUP_STATE if `colab exec` pruned $COLAB_STATE on a 401/404 kernel error:
+         STOP_STATE="$COLAB_STATE"
          PRE_SESS="$(colab --auth=adc --config "$COLAB_STATE" sessions 2>/dev/null)" || PRE_SESS=""
-         ENDPOINT="$(printf '%s\n' "$PRE_SESS" | awk -v s="[$SESSION_ID]" '$1 == s {print $2; exit}')"
-         ( umask 077; printf 'COLAB_STATE=%q\nSESSION_ID=%q\nENDPOINT=%q\n' "$COLAB_STATE" "$SESSION_ID" "$ENDPOINT" > "$WORK_DIR/recovery.env" )
+         if ! printf '%s\n' "$PRE_SESS" | awk -v s="[$SESSION_ID]" '$1 == s {found=1} END {exit !found}' && [ -f "$BACKUP_STATE" ]; then
+           STOP_STATE="$BACKUP_STATE"
+           PRE_SESS="$(colab --auth=adc --config "$BACKUP_STATE" sessions 2>/dev/null)" || PRE_SESS=""
+         fi
+         [ -z "$ENDPOINT" ] && ENDPOINT="$(printf '%s\n' "$PRE_SESS" | awk -v s="[$SESSION_ID]" '$1 == s {print $2; exit}')"
+         ( umask 077; printf 'COLAB_STATE=%q\nBACKUP_STATE=%q\nSTOP_STATE=%q\nSESSION_ID=%q\nENDPOINT=%q\n' \
+             "$COLAB_STATE" "$BACKUP_STATE" "$STOP_STATE" "$SESSION_ID" "$ENDPOINT" > "$WORK_DIR/recovery.env" )
 
-         colab --auth=adc --config "$COLAB_STATE" log \
-           -s "$SESSION_ID" -o "$WORK_DIR/$SESSION_ID.ipynb" || true
-
+         colab --auth=adc --config "$STOP_STATE" log -s "$SESSION_ID" -o "$WORK_DIR/$SESSION_ID.ipynb" || true
          STOP_RC=0
-         colab --auth=adc --config "$COLAB_STATE" stop -s "$SESSION_ID" || STOP_RC=$?
+         colab --auth=adc --config "$STOP_STATE" stop -s "$SESSION_ID" || STOP_RC=$?
 
-         # `colab sessions` catches SystemExit on ADC refresh failure when local state is empty
-         # and exits 0; run `colab usage` (which propagates auth failures non-zero) and inspect
-         # `colab sessions` stderr/stdout. When ENDPOINT is known, verify that exact endpoint is
-         # gone so concurrent workers' `[?]` assignments do not trigger false failures.
          SESS_ERR="$WORK_DIR/sessions.err"
          NEW_UNNAMED=""
          TEARDOWN_RC=0
-         if ! colab --auth=adc --config "$COLAB_STATE" usage >/dev/null; then
+         if ! colab --auth=adc --config "$STOP_STATE" usage >/dev/null; then
            TEARDOWN_RC=1
-         elif ! SESS_OUT="$(colab --auth=adc --config "$COLAB_STATE" sessions 2>"$SESS_ERR")"; then
+         elif ! SESS_OUT="$(colab --auth=adc --config "$STOP_STATE" sessions 2>"$SESS_ERR")"; then
            TEARDOWN_RC=1
          elif grep -Eiq 'No valid default credentials|Failed to refresh' "$SESS_ERR"; then
            TEARDOWN_RC=1
@@ -196,7 +186,7 @@ Use this workflow with `google-colab-cli >= 0.7.6` (redacted logs) to run Pallas
 
          if [ "$TEARDOWN_RC" -ne 0 ]; then
            printf 'ERROR: TPU teardown unconfirmed (session=%s endpoint=%s new_unnamed=%s).\nRecovery: colab --auth=adc --config %q stop -s %q && colab --auth=adc --config %q sessions\nIdentifiers saved in %s (or terminate in Colab UI: Runtime -> Manage sessions).\n' \
-             "$SESSION_ID" "${ENDPOINT:-unknown}" "${NEW_UNNAMED:-none}" "$COLAB_STATE" "$SESSION_ID" "$COLAB_STATE" "$WORK_DIR/recovery.env" >&2
+             "$SESSION_ID" "${ENDPOINT:-unknown}" "${NEW_UNNAMED:-none}" "$STOP_STATE" "$SESSION_ID" "$STOP_STATE" "$WORK_DIR/recovery.env" >&2
            exit 1
          fi
          exit "$RUN_RC"
@@ -206,7 +196,6 @@ Use this workflow with `google-colab-cli >= 0.7.6` (redacted logs) to run Pallas
          trap '' INT TERM
          CANCELLED=1
          RUN_RC="$1"
-         # Do not kill $ALLOC_PID during allocation; cleanup waits for $SESSION_ID to persist, then stops it by name.
          [ -n "$WD_PID" ] && kill "$WD_PID" 2>/dev/null || true
          [ -n "$RUN_PID" ] && kill -TERM "$RUN_PID" 2>/dev/null || true
          [ -n "$RUN_PID" ] && wait "$RUN_PID" 2>/dev/null || true
@@ -222,13 +211,16 @@ Use this workflow with `google-colab-cli >= 0.7.6` (redacted logs) to run Pallas
        wait "$ALLOC_PID" || RUN_RC=$?
        ALLOC_PID=""
 
+       # Back up allocation state and capture ENDPOINT before `colab exec` (which prunes state on 401/404):
+       [ -f "$COLAB_STATE" ] && ( umask 077; cp -p "$COLAB_STATE" "$BACKUP_STATE" ) || true
        if [ "$RUN_RC" -eq 0 ] && [ "$CANCELLED" -eq 0 ]; then
+         ALLOC_SESS="$(colab --auth=adc --config "$COLAB_STATE" sessions 2>/dev/null)" || ALLOC_SESS=""
+         ENDPOINT="$(printf '%s\n' "$ALLOC_SESS" | awk -v s="[$SESSION_ID]" '$1 == s {print $2; exit}')"
          EXEC_LOG="$WORK_DIR/$SESSION_ID.exec.log"
          colab --auth=adc --config "$COLAB_STATE" exec \
            -s "$SESSION_ID" --timeout 300 --file "$LAUNCHER" \
            >"$EXEC_LOG" 2>&1 &
          RUN_PID=$!
-         # Local wall-clock deadline so even a stalled kernel init routes through cleanup:
          python3 -c 'import os, signal, sys, time; time.sleep(float(sys.argv[1])); os.kill(int(sys.argv[2]), signal.SIGTERM)' \
            "${EXEC_DEADLINE_SECS:-360}" "$RUN_PID" >/dev/null 2>&1 &
          WD_PID=$!
@@ -247,7 +239,7 @@ Use this workflow with `google-colab-cli >= 0.7.6` (redacted logs) to run Pallas
      ```
    - **Teardown verification**:
      - **Wrapper (`tools/colab_tpu_bench.py`)**: Inspect `$WORK_DIR/proof/summary.json` (`session_name`, `created_endpoint`, `teardown_verified`, `recovery_config`, and `recovery_command`). If `teardown_verified` is not `true`, run the recorded `recovery_command` (or stop `<session_name>` against `<recovery_config>` and verify `<created_endpoint>` is absent from `colab --auth=adc --config <recovery_config> sessions` alongside a passing `colab usage`), or terminate `<created_endpoint>` in the Colab UI (`Runtime -> Manage sessions`) if local state is no longer present.
-     - **Direct CLI (`$WORK_DIR/recovery.env`)**: After the subshell exits, `source "$WORK_DIR/recovery.env"` (or run the exact `Recovery:` command printed on stderr) to load `COLAB_STATE`, `SESSION_ID`, and `ENDPOINT`, then confirm `colab --auth=adc --config "$COLAB_STATE" usage >/dev/null` and that `ENDPOINT`/`SESSION_ID` are absent from `colab --auth=adc --config "$COLAB_STATE" sessions`. If a runtime survives, run the printed `colab stop` command (or terminate it in Colab UI `Runtime -> Manage sessions` if local state was dropped).
+     - **Direct CLI (`$WORK_DIR/recovery.env`)**: After the subshell exits, `source "$WORK_DIR/recovery.env"` (or run the exact `Recovery:` command printed on stderr) to load `COLAB_STATE`, `BACKUP_STATE`, `STOP_STATE`, `SESSION_ID`, and `ENDPOINT`, then confirm `colab --auth=adc --config "$STOP_STATE" usage >/dev/null` and that `ENDPOINT`/`SESSION_ID` are absent from `colab --auth=adc --config "$STOP_STATE" sessions`. If a runtime survives, run the printed `colab stop` command against `$STOP_STATE` (which points to `$BACKUP_STATE` if `colab exec` pruned `$COLAB_STATE` on a 401/404 error), or terminate it in Colab UI (`Runtime -> Manage sessions`).
    - For multi-step interactive sessions, prefer `colab exec` (keeps XLA/PJRT caches warm) over `colab ssh` (capped at 5 sessions / HTTP 429). Use `colab download` instead of `drive.mount`.
 
 ---
