@@ -993,6 +993,33 @@ def verify_spec_against_host(
                 f"(spec expects PCI BDF(s) {recorded_bdfs}, host currently exposes {expected_live_bdfs})"
             )
 
+        if isinstance(name, str):
+            if name.startswith("pci-"):
+                if len(expected_live_bdfs) != 1 or name != _single_chip_selector(expected_live_bdfs[0]):
+                    expected_sel = (
+                        _single_chip_selector(expected_live_bdfs[0])
+                        if len(expected_live_bdfs) == 1
+                        else _shared_group_selector(expected_live_bdfs)
+                    )
+                    errors.append(
+                        f"device {name!r}: PCI selector name does not match verified VFIO group "
+                        f"membership {expected_live_bdfs} (expected selector {expected_sel!r})"
+                    )
+            elif name.startswith("group-pci-"):
+                expected_sel = _shared_group_selector(expected_live_bdfs)
+                if name != expected_sel:
+                    errors.append(
+                        f"device {name!r}: shared-group PCI selector name does not match verified "
+                        f"VFIO group membership {expected_live_bdfs} (expected selector {expected_sel!r})"
+                    )
+            elif name == "all":
+                all_live_bdfs = sorted(c.pci_bdf for c in live_chips)
+                if expected_live_bdfs != all_live_bdfs:
+                    errors.append(
+                        f"device 'all': exposed VFIO groups {expected_live_bdfs} do not match "
+                        f"all live host TPU chips {all_live_bdfs}"
+                    )
+
         recorded_dev_dn = _parse_vfio_devnums_annotation(ann.get("freetpu.dev/vfio-devnums"))
         for cp in matched_group_paths:
             live_dn = live_devnums_by_container_path.get(cp)

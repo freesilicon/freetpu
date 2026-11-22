@@ -128,6 +128,11 @@ spec:
   containers:
     - name: jax-tpu
       image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:latest
+      env:
+        # Fail fast if TPU initialization fails instead of falling back to CPU
+        # while holding the DRA claim and emitting no TPU runtime telemetry.
+        - name: JAX_PLATFORMS
+          value: "tpu"
       command:
         - python3
         - -c
@@ -160,3 +165,35 @@ spec:
       hostPath:
         path: /sys/devices
         type: Directory
+---
+# Restrict ingress to the workload telemetry sidecar's :9400/metrics port
+# strictly to the isolated diagnostic Prometheus scraper so other tenants in
+# the cluster cannot read this workload's HBM usage or duty cycle.
+# Requires a NetworkPolicy-enforcing CNI (e.g. GKE Dataplane V2, Cilium, or
+# Calico) plus admission controls blocking same-node tenant `hostNetwork: true`
+# Pods (since Kubernetes NetworkPolicy allows same-node traffic), or an
+# authenticating proxy such as kube-rbac-proxy (mTLS/RBAC). Adjust the
+# namespaceSelector and podSelector below to match your diagnostic Prometheus pod.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: freetpu-workload-sidecar-metrics
+  namespace: ml-workloads
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: freetpu-tpu-exporter
+      freetpu.dev/collector-role: workload-sidecar
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring-diagnostics
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus-diagnostics
+      ports:
+        - protocol: TCP
+          port: 9400

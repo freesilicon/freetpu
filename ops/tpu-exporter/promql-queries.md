@@ -196,29 +196,6 @@ and on (generation, node, vfio_device)
   or
   count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node", generation=~"v6e|v6e-pf"})) * 2.70
 )
-
-# Operator-controlled effective hourly cost per reserved/active exclusive chip by generation.
-# Uses ONLY trusted `collector_role="node"` inventory and host VFIO PID reservation
-# evidence (`freetpu_tpu_active_pids{collector_role="node"} > 0`) on verified
-# exclusive `/dev/vfio/<group>` chips (`vfio_group_exclusive="true"`). Omits
-# generations with zero active exclusive chips.
-(
-  count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node", generation="v5e"})) * 1.20
-  or
-  count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node", generation="v5p"})) * 4.20
-  or
-  count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node", generation=~"v6e|v6e-pf"})) * 2.70
-) / (
-  count by (generation) (
-    max by (generation, node, pci_bdf) (
-      freetpu_tpu_active_pids{collector_role="node"}
-      and on (generation, node, pci_bdf)
-      group by (generation, node, pci_bdf) (
-        freetpu_tpu_info{collector_role="node", vfio_group_exclusive="true"}
-      )
-    ) > 0
-  ) > 0
-)
 ```
 
 ## Workload Utilization Diagnostics & Idle Waste Detection (Diagnostic-Only / Non-Billing)
@@ -287,36 +264,5 @@ and on (generation, node, vfio_device)
   )
   /
   count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node"}))
-)
-
-# Operator-controlled single-tenant VM diagnostic (non-billing): Estimated cost
-# per utilized TPU-hour by generation (`collector_role="node"` only). Do NOT use
-# tenant sidecar readings for financial chargeback.
-(
-  count by (generation) (
-    group by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent{collector_role="node", generation="v5e"})
-    and on (generation, node, pci_bdf)
-    group by (generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node"})
-  ) * 1.20
-  or
-  count by (generation) (
-    group by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent{collector_role="node", generation="v5p"})
-    and on (generation, node, pci_bdf)
-    group by (generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node"})
-  ) * 4.20
-  or
-  count by (generation) (
-    group by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent{collector_role="node", generation=~"v6e|v6e-pf"})
-    and on (generation, node, pci_bdf)
-    group by (generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node"})
-  ) * 2.70
-) / (
-  sum by (generation) (
-    (
-      max by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent{collector_role="node"})
-      and on (generation, node, pci_bdf)
-      group by (generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node"})
-    ) / 100
-  ) > 0
 )
 ```

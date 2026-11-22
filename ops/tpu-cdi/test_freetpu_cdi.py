@@ -415,7 +415,10 @@ class FreeTpuCdiTests(unittest.TestCase):
         fake_stat.st_mode = _stat.S_IFCHR | 0o600
         fake_stat.st_rdev = os.makedev(242, 7)
 
-        with mock.patch.object(Path, "stat", return_value=fake_stat):
+        with (
+            mock.patch.object(Path, "stat", return_value=fake_stat),
+            mock.patch.object(Path, "lstat", return_value=fake_stat),
+        ):
             node = freetpu_cdi._make_device_node("/dev/vfio/0", Path("/dev/vfio/0"))
         self.assertEqual(node["path"], "/dev/vfio/0")
         self.assertEqual(node["hostPath"], "/dev/vfio/0")
@@ -708,11 +711,11 @@ class FreeTpuCdiTests(unittest.TestCase):
             )
             spec_path = root / "var" / "run" / "cdi" / "freetpu.json"
             orig_stat = Path.stat
+            orig_lstat = Path.lstat
             current_minor = {"group0": 0}
 
-            def _mock_stat(p: Path, *args, **kwargs):
-                st = orig_stat(p, *args, **kwargs)
-                if p.parent.name == "vfio" and p.name in ("vfio", "0"):
+            def _maybe_mock(p: Path, st):
+                if p.parent.name == "vfio" and p.name in ("vfio", "0") and not _stat.S_ISLNK(st.st_mode):
                     fake = mock.MagicMock()
                     fake.st_mode = _stat.S_IFCHR | 0o600
                     fake.st_rdev = (
@@ -723,7 +726,16 @@ class FreeTpuCdiTests(unittest.TestCase):
                     return fake
                 return st
 
-            with mock.patch.object(Path, "stat", autospec=True, side_effect=_mock_stat):
+            def _mock_stat(p: Path, *args, **kwargs):
+                return _maybe_mock(p, orig_stat(p, *args, **kwargs))
+
+            def _mock_lstat(p: Path, *args, **kwargs):
+                return _maybe_mock(p, orig_lstat(p, *args, **kwargs))
+
+            with (
+                mock.patch.object(Path, "stat", autospec=True, side_effect=_mock_stat),
+                mock.patch.object(Path, "lstat", autospec=True, side_effect=_mock_lstat),
+            ):
                 ok1, msg1 = freetpu_cdi.reconcile_cdi_spec(
                     spec_path, sysfs_root=sysfs_root, dev_root=dev_root
                 )
@@ -1281,6 +1293,22 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertEqual(rc, 0, err)
                 self.assertFalse(spec_out.exists())
                 self.assertIn("withdrew CDI spec", err)
+
+                # 3. Tampered PCI selector name pointing to live VFIO group fails --check-host.
+                chips_live, vfio_c = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                tampered = freetpu_cdi.build_cdi_spec(chips_live, vfio_c)
+                for dev in tampered["devices"]:
+                    if dev["name"].startswith("pci-"):
+                        dev["name"] = "pci-0000-00-99-0"
+                errs_sel = freetpu_cdi.verify_spec_against_host(
+                    tampered, sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                self.assertTrue(
+                    any("PCI selector name does not match" in e for e in errs_sel),
+                    errs_sel,
+                )
 
 
 if __name__ == "__main__":
