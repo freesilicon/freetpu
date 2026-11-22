@@ -90,6 +90,7 @@ OUT_DIR="$(mktemp -d)" && chmod 700 "$OUT_DIR"
 python3 tools/colab_tpu_bench.py --dry-run --out-dir "$OUT_DIR"
 
 # Run a live single-shot TPU probe (v6e1 with automatic v5e1 fallback on refusal)
+mkdir -p -m 700 ~/.cache/freetpu-colab
 mkdir -p -m 700 ~/.cache/freetpu-colab/proof
 python3 tools/colab_tpu_bench.py \
   --auth adc \

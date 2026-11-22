@@ -39,19 +39,26 @@ PROBE_JSON_END = "=== FREETPU_COLAB_PROBE_JSON_END ==="
 DEFAULT_TPU_ORDER: Tuple[str, ...] = ("v6e1", "v5e1")
 SUPPORTED_TPUS = frozenset({"v6e1", "v5e1"})
 
-_ALLOCATION_ERROR_MARKERS = (
-    "allocation refused",
-    "backend rejected accelerator",
-    "toomanyassignmentserror",
-    "failed_precondition",
-    "precondition failed",
-    "reason_no_backends",
-    "reason_too_many_active_assignments",
-    "reason_quota_exceeded_usage_time",
-    "reason_runtime_version_unavailable",
-    "quota or entitlement",
-    "too many active sessions",
-    "no backends",
+_ALLOCATION_DIAGNOSTIC_PATTERNS = (
+    re.compile(r"^\[colab\]\s+allocation refused\b"),
+    re.compile(
+        r"^\[colab\]\s+.*\b(reason_no_backends|reason_too_many_active_assignments|"
+        r"reason_quota_exceeded_usage_time|reason_runtime_version_unavailable|"
+        r"failed_precondition|precondition failed|quota or entitlement|"
+        r"too many active sessions|no backends|backend rejected accelerator)\b"
+    ),
+    re.compile(r"^(?:[a-z_][a-z0-9_.]*\.)?toomanyassignmentserror(?:\s*:|\s*$)"),
+    re.compile(
+        r"^(?:error:\s*)?.*\b(allocation refused|backend rejected accelerator|"
+        r"reason_no_backends|reason_too_many_active_assignments|"
+        r"reason_quota_exceeded_usage_time|reason_runtime_version_unavailable|"
+        r"too many active sessions)\b"
+    ),
+)
+
+_TRACEBACK_CODE_LINE_RE = re.compile(
+    r"^(?:[│╭╰❱─]|traceback\s*\(|file\s+\"|\d+\s+[│|]|"
+    r"(?:except|raise|try|def|class|if|elif|else|for|while|with|return|from|import)\b)"
 )
 
 _OAUTH_PROMPT_MARKERS = (
@@ -127,6 +134,32 @@ def _is_safe_existing_ancestor(ancestor: Path) -> bool:
     return True
 
 
+def _validate_existing_ancestor_chain(start_dir: Path) -> None:
+    """Validate every existing ancestor directory up to `/` (and symlink targets)."""
+    visited: Set[str] = set()
+    queue: List[Path] = [start_dir]
+    while queue:
+        cur = queue.pop()
+        while True:
+            key = str(cur)
+            if key in visited:
+                break
+            visited.add(key)
+            if os.path.lexists(cur):
+                if not _is_safe_existing_ancestor(cur):
+                    raise UntrustedPathError(
+                        f"Refusing path under untrusted ancestor {cur}"
+                    )
+                if os.path.islink(cur):
+                    resolved = Path(os.path.realpath(cur))
+                    if str(resolved) not in visited:
+                        queue.append(resolved)
+            parent = cur.parent
+            if parent == cur:
+                break
+            cur = parent
+
+
 def _ensure_private_dir(raw_path: Path) -> Path:
     """Ensure `raw_path` exists as a non-symlink directory owned by the user with mode 0700."""
     expanded = Path(os.path.expanduser(str(raw_path)))
@@ -135,7 +168,7 @@ def _ensure_private_dir(raw_path: Path) -> Path:
 
     abs_path = Path(os.path.abspath(str(expanded)))
     if not os.path.lexists(abs_path):
-        # Find deepest existing ancestor and validate it before creating missing 0700 components.
+        # Find deepest existing ancestor and validate the full chain before creating missing 0700 dirs.
         missing: List[Path] = []
         cur = abs_path
         while not os.path.lexists(cur):
@@ -144,21 +177,13 @@ def _ensure_private_dir(raw_path: Path) -> Path:
             if parent == cur:
                 break
             cur = parent
-        if not _is_safe_existing_ancestor(cur):
-            raise UntrustedPathError(
-                f"Refusing to create private directory inside untrusted parent {cur}"
-            )
+        _validate_existing_ancestor_chain(cur)
         for to_create in reversed(missing):
             try:
                 os.mkdir(to_create, 0o700)
             except FileExistsError:
                 pass
-    else:
-        parent = abs_path.parent
-        if parent != abs_path and not _is_safe_existing_ancestor(parent):
-            raise UntrustedPathError(
-                f"Refusing directory inside untrusted parent {parent}"
-            )
+    _validate_existing_ancestor_chain(abs_path.parent)
 
     try:
         st = os.lstat(abs_path)
@@ -207,6 +232,7 @@ def _ensure_dir_not_shared_writable(dir_path: Path) -> Path:
     abs_dir = Path(os.path.abspath(str(expanded)))
     if not os.path.lexists(abs_dir):
         return _ensure_private_dir(abs_dir)
+    _validate_existing_ancestor_chain(abs_dir.parent)
     st = os.lstat(abs_dir)
     if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
         raise UntrustedPathError(f"Refusing non-directory/symlink config parent: {abs_dir}")
@@ -397,7 +423,32 @@ def is_capacity_or_quota_error(
     # and the user workload began executing; never fall back and duplicate side effects.
     if "[colab] session ready" in err_lower:
         return False
-    return any(marker in err_lower for marker in _ALLOCATION_ERROR_MARKERS)
+    in_rich_box = False
+    in_std_tb = False
+    for raw_line in stderr.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        lowered = stripped.lower()
+        if stripped.startswith("╭"):
+            in_rich_box = True
+            continue
+        if in_rich_box:
+            if stripped.startswith("╰"):
+                in_rich_box = False
+            continue
+        if lowered.startswith("traceback (most recent call last):"):
+            in_std_tb = True
+            continue
+        if in_std_tb:
+            if raw_line[:1].isspace() or lowered.startswith('file "'):
+                continue
+            in_std_tb = False
+        if _TRACEBACK_CODE_LINE_RE.match(lowered):
+            continue
+        if any(pat.search(lowered) for pat in _ALLOCATION_DIAGNOSTIC_PATTERNS):
+            return True
+    return False
 
 
 def is_allocation_timeout_error(returncode: int, stderr: str) -> bool:
@@ -576,7 +627,8 @@ def default_tpu_probe_script() -> str:
             print(json.dumps(report, indent=2, sort_keys=True))
             print("{PROBE_JSON_END}")
 
-        sys.exit(exit_rc)
+        if exit_rc != 0:
+            sys.exit(exit_rc)
         """
     )
 
@@ -788,6 +840,13 @@ def run_benchmark(
     allocation_timed_out = False
     maybe_allocated = False
     probe_error: Optional[str] = None
+    untrusted_target_error: Optional[str] = None
+    artifact_write_error: Optional[str] = None
+    export_attempted = False
+    export_ok: Optional[bool] = None
+    export_returncode: Optional[int] = None
+    export_error: Optional[str] = None
+    export_stderr_tail: Optional[str] = None
 
     for idx, tpu in enumerate(cfg.tpus):
         sess = f"{session_base}-{tpu}" if idx > 0 else session_base
@@ -820,7 +879,16 @@ def run_benchmark(
 
         ready_seen = "[colab] session ready" in res.stderr.lower()
         timeout_seen = is_allocation_timeout_error(res.returncode, res.stderr)
-        if res.returncode == 0 or ready_seen or timeout_seen:
+        confirmed_pre_alloc = (
+            res.returncode != 0
+            and not ready_seen
+            and not timeout_seen
+            and (
+                is_capacity_or_quota_error(res.returncode, res.stdout, res.stderr)
+                or _contains_oauth_prompt_failure(res)
+            )
+        )
+        if res.returncode == 0 or ready_seen or timeout_seen or not confirmed_pre_alloc:
             maybe_allocated = True
 
         try:
@@ -829,7 +897,10 @@ def run_benchmark(
             if res.returncode != 0 and res.stderr:
                 _write_text_nofollow(out_dir / f"{sess}.stderr.txt", res.stderr)
         except UntrustedPathError as exc:
-            return 2, {"status": "untrusted_out_dir", "error": str(exc)}
+            untrusted_target_error = str(exc)
+            break
+        except OSError as exc:
+            artifact_write_error = f"Failed writing local run logs: {exc}"
 
         if res.returncode == 0:
             final_rc = 0
@@ -842,14 +913,24 @@ def run_benchmark(
 
             nb_path = out_dir / f"{sess}.ipynb"
             if nb_path.is_symlink() or (os.path.lexists(nb_path) and not nb_path.is_file()):
-                return 2, {
-                    "status": "untrusted_out_dir",
-                    "error": f"Refusing unsafe notebook target path: {nb_path}",
-                }
+                untrusted_target_error = f"Refusing unsafe notebook target path: {nb_path}"
+                break
+            export_attempted = True
             log_res = runner([*base_cmd, "log", "-s", sess, "-o", str(nb_path)])
+            export_returncode = log_res.returncode
+            if log_res.stderr.strip():
+                export_stderr_tail = log_res.stderr.strip()[-1000:]
             if log_res.returncode == 0 and not nb_path.is_symlink() and nb_path.is_file():
                 proof_notebook = nb_path
                 created_endpoint = extract_endpoint_from_notebook(nb_path)
+                export_ok = True
+            else:
+                export_ok = False
+                if log_res.returncode != 0:
+                    diag = log_res.stderr.strip() or log_res.stdout.strip() or "no diagnostic output"
+                    export_error = f"`colab log` failed (rc={log_res.returncode}): {diag}"
+                else:
+                    export_error = f"`colab log` exited 0 without creating notebook at {nb_path}"
             break
 
         if timeout_seen:
@@ -866,6 +947,8 @@ def run_benchmark(
     teardown_verified = not maybe_allocated
     leaked_endpoints: List[str] = []
     leaked_sessions: List[str] = []
+    ambiguous_endpoints: List[str] = []
+    other_new_endpoints: List[str] = []
     teardown_error: Optional[str] = None
     if maybe_allocated:
         sess_after_res = runner([*base_cmd, "sessions"])
@@ -877,11 +960,13 @@ def run_benchmark(
             )
         else:
             names_after, endpoints_after = parse_sessions_output(sess_after_res.stdout)
-            if created_endpoint is not None and created_endpoint in endpoints_after:
-                leaked_endpoints.append(created_endpoint)
-            for ep in sorted(endpoints_after - endpoints_before):
-                if ep not in leaked_endpoints:
-                    leaked_endpoints.append(ep)
+            new_endpoints = sorted(endpoints_after - endpoints_before)
+            if created_endpoint is not None:
+                if created_endpoint in endpoints_after:
+                    leaked_endpoints.append(created_endpoint)
+                other_new_endpoints = [ep for ep in new_endpoints if ep != created_endpoint]
+            else:
+                ambiguous_endpoints = new_endpoints
             for sname in attempted_sessions:
                 if sname in names_after and sname not in names_before:
                     leaked_sessions.append(sname)
@@ -891,8 +976,25 @@ def run_benchmark(
                     "Active Colab assignment/session remained after run: "
                     f"endpoints={leaked_endpoints}, sessions={leaked_sessions}"
                 )
+            elif ambiguous_endpoints:
+                teardown_verified = False
+                teardown_error = (
+                    "Run endpoint is unknown and new Colab assignment(s) appeared after run: "
+                    f"ambiguous_endpoints={ambiguous_endpoints}"
+                )
             else:
                 teardown_verified = True
+
+    if untrusted_target_error is not None:
+        return 2, {
+            "status": "untrusted_out_dir",
+            "error": untrusted_target_error,
+            "teardown_verified": teardown_verified,
+            "leaked_endpoints": leaked_endpoints,
+            "leaked_sessions": leaked_sessions,
+            "ambiguous_endpoints": ambiguous_endpoints,
+            "teardown_error": teardown_error,
+        }
 
     if allocation_timed_out and not teardown_verified:
         status = "allocation_timeout_unreconciled"
@@ -902,10 +1004,19 @@ def run_benchmark(
         if final_rc == 0:
             final_rc = 1
     elif not teardown_verified:
-        status = "teardown_verification_failed"
+        if ambiguous_endpoints and not leaked_endpoints and not leaked_sessions:
+            status = "teardown_ambiguous"
+        else:
+            status = "teardown_verification_failed"
         final_rc = 1
     elif probe_error is not None:
         status = "probe_validation_failed"
+        final_rc = 1
+    elif export_attempted and not export_ok:
+        status = "proof_export_failed"
+        final_rc = 1
+    elif artifact_write_error is not None:
+        status = "artifact_write_failed"
         final_rc = 1
     elif final_rc == 0:
         status = "ok"
@@ -921,11 +1032,21 @@ def run_benchmark(
         "chosen_session": chosen_session,
         "created_endpoint": created_endpoint,
         "proof_notebook": str(proof_notebook) if proof_notebook else None,
+        "proof_export": {
+            "attempted": export_attempted,
+            "ok": export_ok,
+            "returncode": export_returncode,
+            "error": export_error,
+            "stderr_tail": export_stderr_tail,
+        },
         "teardown_verified": teardown_verified,
         "leaked_endpoints": leaked_endpoints,
         "leaked_sessions": leaked_sessions,
+        "ambiguous_endpoints": ambiguous_endpoints,
+        "other_new_endpoints": other_new_endpoints,
         "teardown_error": teardown_error,
         "probe_error": probe_error,
+        "artifact_write_error": artifact_write_error,
         "attempts": attempts,
         "probe": probe_payload,
     }
@@ -936,6 +1057,11 @@ def run_benchmark(
         )
     except UntrustedPathError as exc:
         return 2, {"status": "untrusted_out_dir", "error": str(exc)}
+    except OSError as exc:
+        summary["artifact_write_error"] = summary["artifact_write_error"] or str(exc)
+        if summary["status"] == "ok":
+            summary["status"] = "artifact_write_failed"
+            final_rc = 1
     return final_rc, summary
 
 
@@ -1278,7 +1404,155 @@ def run_self_test() -> int:
         assert sum_dry_missing["colab_cli_found"] is False
         assert len(sum_dry_missing["planned_commands"]) == 7
 
-    print("colab_tpu_bench.py self-test PASSED (11/11 suites).")
+        # 12. Pre-READY non-refusal failure (e.g., local state write OSError) still runs teardown check.
+        pre_ready_cmds: List[List[str]] = []
+
+        def pre_ready_fail_runner(cmd: Sequence[str]) -> CommandResult:
+            cmd_list = list(cmd)
+            pre_ready_cmds.append(cmd_list)
+            base_res = base_help_usage_sessions(cmd_list)
+            if base_res is not None:
+                return base_res
+            if "run" in cmd_list:
+                return CommandResult(1, "", "PermissionError: cannot save ~/.config/colab-cli/sessions.json")
+            raise AssertionError(f"Unexpected command: {cmd_list}")
+
+        rc_pre, sum_pre = run_benchmark(
+            BenchConfig(tpus=("v5e1",), out_dir=tmp_path / "pre-ready-fail"),
+            runner=pre_ready_fail_runner,
+        )
+        assert rc_pre == 1
+        assert sum_pre["status"] == "failed"
+        assert sum_pre["teardown_verified"] is True
+        assert sum(1 for c in pre_ready_cmds if "sessions" in c) == 2
+
+        # 13. Rich/Typer traceback mentioning `except TooManyAssignmentsError` must NOT trigger v5e1 fallback.
+        tb_cmds: List[List[str]] = []
+
+        def rich_403_traceback_runner(cmd: Sequence[str]) -> CommandResult:
+            cmd_list = list(cmd)
+            tb_cmds.append(cmd_list)
+            base_res = base_help_usage_sessions(cmd_list)
+            if base_res is not None:
+                return base_res
+            if "run" in cmd_list:
+                return CommandResult(
+                    1,
+                    "",
+                    "╭─────────────── Traceback (most recent call last) ────────────────╮\n"
+                    "│ /pkg/colab_cli/commands/run.py:312 in run                        │\n"
+                    "│   311     except TooManyAssignmentsError:                        │\n"
+                    "│   312         typer.echo('Allocation refused')                   │\n"
+                    "╰──────────────────────────────────────────────────────────────────╯\n"
+                    "ApiError: HTTP 403 Forbidden\n",
+                )
+            raise AssertionError(f"Unexpected command: {cmd_list}")
+
+        rc_tb, sum_tb = run_benchmark(
+            BenchConfig(tpus=("v6e1", "v5e1"), out_dir=tmp_path / "rich-tb-403"),
+            runner=rich_403_traceback_runner,
+        )
+        assert rc_tb == 1
+        assert len(sum_tb["attempts"]) == 1
+        assert sum_tb["attempts"][0]["tpu"] == "v6e1"
+
+        # 14. Full ancestor chain validated for existing 0700 out_dir and explicit --config parent.
+        gw_parent = tmp_path / "gw_parent"
+        gw_parent.mkdir(mode=0o775)
+        os.chmod(gw_parent, 0o775)
+        nested_0700 = gw_parent / "private_0700"
+        nested_0700.mkdir(mode=0o700)
+        os.chmod(nested_0700, 0o700)
+        rc_anc_out, sum_anc_out = run_benchmark(
+            BenchConfig(dry_run=True, out_dir=nested_0700),
+            runner=low_or_bad_cu_runner("unused"),
+        )
+        assert rc_anc_out == 2
+        assert sum_anc_out["status"] == "untrusted_out_dir"
+
+        rc_anc_cfg, sum_anc_cfg = run_benchmark(
+            BenchConfig(
+                dry_run=True,
+                out_dir=tmp_path / "ok-out",
+                config_path=nested_0700 / "sessions.json",
+            ),
+            runner=low_or_bad_cu_runner("unused"),
+        )
+        assert rc_anc_cfg == 2
+        assert sum_anc_cfg["status"] == "untrusted_config_path"
+
+        # 15. Another worker's concurrent session does NOT fail teardown when created_endpoint is gone;
+        #     unknown created_endpoint + new endpoint is recorded as teardown_ambiguous.
+        other_calls = {"n": 0}
+
+        def other_worker_runner(cmd: Sequence[str]) -> CommandResult:
+            cmd_list = list(cmd)
+            if "sessions" in cmd_list:
+                other_calls["n"] += 1
+                if other_calls["n"] == 1:
+                    return CommandResult(0, "[colab] No active sessions found on server.\n", "")
+                return CommandResult(
+                    0,
+                    "[worker2-sess] m-s-otherworker99 | Hardware: V5E1 | Shape: STANDARD | Variant: TPU\n",
+                    "",
+                )
+            return fallback_runner(cmd_list)
+
+        rc_ow, sum_ow = run_benchmark(
+            BenchConfig(tpus=("v5e1",), out_dir=tmp_path / "other-worker"),
+            runner=other_worker_runner,
+        )
+        assert rc_ow == 0
+        assert sum_ow["status"] == "ok"
+        assert sum_ow["teardown_verified"] is True
+        assert sum_ow["other_new_endpoints"] == ["m-s-otherworker99"]
+
+        # 16. `colab log` failure surfaces diagnostics and prevents silent `ok`, and probe script has no bare sys.exit(0).
+        def log_fail_runner(cmd: Sequence[str]) -> CommandResult:
+            cmd_list = list(cmd)
+            if "log" in cmd_list:
+                return CommandResult(1, "", "colab log failed: export error")
+            return fallback_runner(cmd_list)
+
+        rc_lf, sum_lf = run_benchmark(
+            BenchConfig(tpus=("v5e1",), out_dir=tmp_path / "log-fail"),
+            runner=log_fail_runner,
+        )
+        assert rc_lf == 1
+        assert sum_lf["status"] == "proof_export_failed"
+        assert sum_lf["proof_export"]["attempted"] is True
+        assert sum_lf["proof_export"]["ok"] is False
+        assert sum_lf["proof_export"]["returncode"] == 1
+        assert "export error" in (sum_lf["proof_export"]["error"] or "")
+
+        amb_calls = {"n": 0}
+
+        def ambiguous_teardown_runner(cmd: Sequence[str]) -> CommandResult:
+            cmd_list = list(cmd)
+            if "sessions" in cmd_list:
+                amb_calls["n"] += 1
+                if amb_calls["n"] == 1:
+                    return CommandResult(0, "[colab] No active sessions found on server.\n", "")
+                return CommandResult(
+                    0,
+                    "[unknown] m-s-ambig77 | Hardware: V5E1 | Shape: STANDARD | Variant: TPU\n",
+                    "",
+                )
+            return log_fail_runner(cmd_list)
+
+        rc_amb, sum_amb = run_benchmark(
+            BenchConfig(tpus=("v5e1",), out_dir=tmp_path / "ambig-td"),
+            runner=ambiguous_teardown_runner,
+        )
+        assert rc_amb == 1
+        assert sum_amb["status"] == "teardown_ambiguous"
+        assert sum_amb["ambiguous_endpoints"] == ["m-s-ambig77"]
+        assert sum_amb["leaked_endpoints"] == []
+
+        probe_src = default_tpu_probe_script()
+        assert "if exit_rc != 0:\n    sys.exit(exit_rc)" in probe_src
+
+    print("colab_tpu_bench.py self-test PASSED (16/16 suites).")
     return 0
 
 
