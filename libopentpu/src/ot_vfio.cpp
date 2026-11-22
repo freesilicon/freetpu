@@ -707,6 +707,12 @@ bool VfioTransport::init_ring_queues(std::string* err) {
     void* p = ::mmap(nullptr, len, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) return nullptr;
+    // Prevent copy-on-write page replacement across fork() while pages are pinned by VFIO.
+    if (::madvise(p, len, MADV_DONTFORK) != 0) {
+      if (err) *err = std::string("madvise(MADV_DONTFORK) failed: ") + std::strerror(errno);
+      ::munmap(p, len);
+      return nullptr;
+    }
     std::memset(p, 0, len);
     if (!map_dma_at(p, iova, len, err)) {
       ::munmap(p, len);

@@ -692,7 +692,31 @@ static void test_pjrt_api_mock() {
     PJRT_Client_Destroy_Args cd2 = {};
     cd2.struct_size = PJRT_Client_Destroy_Args_STRUCT_SIZE;
     cd2.client = cc2.client;
+    // Verify PJRT_Memory vtable get/set_user_data and destruction cleanup callback.
+    PJRT_Device_DefaultMemory_Args dm2 = {};
+    dm2.struct_size = PJRT_Device_DefaultMemory_Args_STRUCT_SIZE;
+    dm2.device = ad2.addressable_devices[0];
+    OT_CHECK(api->PJRT_Device_DefaultMemory(&dm2) == nullptr);
+    OT_CHECK(dm2.memory != nullptr && dm2.memory->vtable != nullptr);
+    OT_CHECK(dm2.memory->vtable->get_user_data != nullptr &&
+             dm2.memory->vtable->set_user_data != nullptr);
+    static int g_mem_dtor_calls = 0;
+    g_mem_dtor_calls = 0;
+    int key_a = 1;
+    int val_a = 42;
+    auto inc_dtor = [](void* p) {
+      if (p) ++(*static_cast<int*>(p));
+    };
+    dm2.memory->vtable->set_user_data(dm2.memory, &key_a, &g_mem_dtor_calls, inc_dtor);
+    OT_CHECK(dm2.memory->vtable->get_user_data(dm2.memory, &key_a) == &g_mem_dtor_calls);
+    // Replacing same key invokes previous destructor.
+    dm2.memory->vtable->set_user_data(dm2.memory, &key_a, &val_a, nullptr);
+    OT_CHECK(g_mem_dtor_calls == 1);
+    OT_CHECK(dm2.memory->vtable->get_user_data(dm2.memory, &key_a) == &val_a);
+    // Re-attach destructor and verify PJRT_Client_Destroy invokes it.
+    dm2.memory->vtable->set_user_data(dm2.memory, &key_a, &g_mem_dtor_calls, inc_dtor);
     OT_CHECK(api->PJRT_Client_Destroy(&cd2) == nullptr);
+    OT_CHECK(g_mem_dtor_calls == 2);
   }
 
   for (PJRT_Buffer* b : {st_up.buffer, rev_up.buffer}) {

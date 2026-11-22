@@ -24,12 +24,31 @@ struct PJRT_Event {
 
 struct PJRT_ExecuteContext {};
 
+struct OtPjrtMemoryUserData {
+  const void* key = nullptr;
+  void* data = nullptr;
+  void (*dtor)(void*) = nullptr;
+};
+
 struct OtPjrtMemory {
   PJRT_Memory base{};
   int id = 0;
   std::string kind = "device";
   std::string debug_str = "TPU_HBM:0";
   PJRT_Device* device = nullptr;
+  std::mutex user_data_mu;
+  std::vector<OtPjrtMemoryUserData> user_data;
+
+  ~OtPjrtMemory() {
+    std::vector<OtPjrtMemoryUserData> entries;
+    {
+      std::lock_guard<std::mutex> lk(user_data_mu);
+      entries.swap(user_data);
+    }
+    for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
+      if (it->dtor) it->dtor(it->data);
+    }
+  }
 };
 
 struct PJRT_DeviceDescription {
@@ -133,6 +152,54 @@ const PJRT_Error_FunctionTable kErrVtable = {
     err_vtable_message,
     err_vtable_code,
     err_vtable_payload,
+};
+
+void* mem_vtable_get_user_data(PJRT_Memory* memory, const void* key) {
+  if (!memory) return nullptr;
+  auto* om = reinterpret_cast<OtPjrtMemory*>(memory);
+  std::lock_guard<std::mutex> lk(om->user_data_mu);
+  for (const auto& entry : om->user_data) {
+    if (entry.key == key) return entry.data;
+  }
+  return nullptr;
+}
+
+void mem_vtable_set_user_data(PJRT_Memory* memory, const void* key, void* data,
+                              void (*dtor)(void*)) {
+  if (!memory) return;
+  auto* om = reinterpret_cast<OtPjrtMemory*>(memory);
+  void* old_data = nullptr;
+  void (*old_dtor)(void*) = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(om->user_data_mu);
+    bool updated = false;
+    for (auto it = om->user_data.begin(); it != om->user_data.end(); ++it) {
+      if (it->key == key) {
+        old_data = it->data;
+        old_dtor = it->dtor;
+        if (!data && !dtor) {
+          om->user_data.erase(it);
+        } else {
+          it->data = data;
+          it->dtor = dtor;
+        }
+        updated = true;
+        break;
+      }
+    }
+    if (!updated && (data || dtor)) {
+      om->user_data.push_back({key, data, dtor});
+    }
+  }
+  if (old_dtor) old_dtor(old_data);
+}
+
+const PJRT_Memory_FunctionTable kMemoryVtable = {
+    PJRT_Memory_FunctionTable_STRUCT_SIZE,
+    nullptr,
+    PJRT_Memory_STRUCT_SIZE,
+    mem_vtable_get_user_data,
+    mem_vtable_set_user_data,
 };
 
 PJRT_Error* make_err(PJRT_Error_Code code, const std::string& msg) {
@@ -664,6 +731,7 @@ PJRT_Error* ot_pjrt_client_create(PJRT_Client_Create_Args* args) {
   }
   c->ctx = ctx;
   c->device.ctx = ctx;
+  c->device.mem.base.vtable = &kMemoryVtable;
   c->device.mem.device = &c->device;
   c->device.mem_ptrs[0] = &c->device.mem.base;
   c->mem_ptrs[0] = &c->device.mem.base;

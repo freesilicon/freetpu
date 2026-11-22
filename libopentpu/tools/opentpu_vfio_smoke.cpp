@@ -84,7 +84,22 @@ int main(int argc, char** argv) {
       src[i] = 0xCAFE0000u ^ static_cast<uint32_t>(i * 2654435761u);
     }
     ot_status_t h2d = ot_buffer_h2d(ctx, buf, src.data(), sz);
-    ot_status_t d2h = (h2d == OT_OK) ? ot_buffer_d2h(ctx, buf, dst.data(), sz) : h2d;
+    ot_status_t clobber_st = OT_OK;
+    if (h2d == OT_OK) {
+      // Overwrite the DMA staging window with an inverted pattern via a second HBM buffer
+      // so a stale staging window cannot masquerade as a successful D2H transfer.
+      ot_buffer_t* clobber_buf = nullptr;
+      clobber_st = ot_buffer_alloc(ctx, sz, &clobber_buf);
+      if (clobber_st == OT_OK) {
+        std::vector<uint32_t> inverted(nwords);
+        for (size_t i = 0; i < nwords; ++i) inverted[i] = ~src[i];
+        clobber_st = ot_buffer_h2d(ctx, clobber_buf, inverted.data(), sz);
+        ot_buffer_free(clobber_buf);
+      }
+    }
+    ot_status_t d2h = (h2d == OT_OK && clobber_st == OT_OK)
+                          ? ot_buffer_d2h(ctx, buf, dst.data(), sz)
+                          : (h2d != OT_OK ? h2d : clobber_st);
     if (h2d == OT_OK && d2h == OT_OK) {
       bool match = (std::memcmp(src.data(), dst.data(), sz) == 0);
       printf("M2_DMA_ROUNDTRIP size=%zu: match=%d first=0x%08x last=0x%08x\n",
