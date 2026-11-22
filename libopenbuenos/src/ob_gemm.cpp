@@ -3609,6 +3609,10 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
           const float* sb_base = p.w_tile ? p.w_tile->row_s_b.data() : p.s_b.data();
           const bool store_first_now = p.is_first_k && skip_zero_init;
           auto dequant_sub = [&](const int8_t* raw_i8, uint32_t si, uint32_t scale_d_cur) {
+            if (use_async_dq && last_dq_seq > 0u) {
+              // Ensure all earlier K-slice SPSC dequant jobs complete before writing on main thread.
+              ctx->async_dequant.wait_until(last_dq_seq);
+            }
             const uint64_t tq0 = prof_on ? ob::monotonic_now_ns() : 0u;
             const float eff_scale_d = static_cast<float>(scale_d_cur);
             const ob::FusedSubSlice& sub = p.subs[si];
