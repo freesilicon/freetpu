@@ -80,7 +80,7 @@ If your GCP project still receives `403` on `colaboratory.googleapis.com/v1beta`
 
 ## 3. Using `tools/colab_tpu_bench.py`
 
-[`tools/colab_tpu_bench.py`](../../tools/colab_tpu_bench.py) wraps `google-colab-cli` with private `0700` output/config checks, signed CU guards, isolated `--config` normalization, conservative `v6e1 -> v5e1` fallback, post-run `colab sessions` teardown verification, TPU-validated probe JSON capture, and `.ipynb` proof export:
+[`tools/colab_tpu_bench.py`](../../tools/colab_tpu_bench.py) wraps `google-colab-cli` with private `0700` output/config checks, signed CU guards, isolated `--config` normalization, conservative `v6e1 -> v5e1` fallback, independent inactivity (`--timeout`) and optional local wall-clock (`--wall-timeout`) caps, bounded `colab stop` reconciliation on Ctrl+C/wall-timeout or active-endpoint leak retries, TPU-validated probe JSON capture, and `.ipynb` proof export:
 
 ```bash
 # Offline CI self-test (no Colab credentials or hardware required)
