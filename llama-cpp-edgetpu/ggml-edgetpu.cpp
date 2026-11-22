@@ -1461,12 +1461,12 @@ static ggml_status ggml_edgetpu_compute_forward_mul_mat_id(ggml_backend_edgetpu_
                 static_cast<const char *>(ids->data) + id * ids->nb[0]);
             float * out_row = reinterpret_cast<float *>(static_cast<char *>(dst->data) + id * nb1);
 
-            if (expert < 0) {
+            if (expert == -1) {
                 std::memset(out_row, 0, static_cast<size_t>(N) * sizeof(float));
                 continue;
             }
-            if (expert >= n_expert) {
-                GGML_LOG_ERROR("ggml-edgetpu: MUL_MAT_ID expert id %d out of range [0, %lld)\n",
+            if (expert < 0 || expert >= n_expert) {
+                GGML_LOG_ERROR("ggml-edgetpu: MUL_MAT_ID expert id %d out of range [-1, %lld)\n",
                                expert, static_cast<long long>(n_expert));
                 return GGML_STATUS_FAILED;
             }
@@ -1505,13 +1505,13 @@ static ggml_status ggml_edgetpu_compute_forward_mul_mat_id(ggml_backend_edgetpu_
             const char * ids_row = static_cast<const char *>(ids->data) + iid1 * ids->nb[1];
             for (int64_t id = 0; id < n_used; ++id) {
                 const int32_t expert = *reinterpret_cast<const int32_t *>(ids_row + id * ids->nb[0]);
-                if (expert < 0) {
+                if (expert == -1) {
                     std::memset(static_cast<char *>(dst->data) + id * nb1 + iid1 * nb2,
                                 0, static_cast<size_t>(N) * sizeof(float));
                     continue;
                 }
-                if (expert >= n_expert) {
-                    GGML_LOG_ERROR("ggml-edgetpu: MUL_MAT_ID expert id %d out of range [0, %lld)\n",
+                if (expert < 0 || expert >= n_expert) {
+                    GGML_LOG_ERROR("ggml-edgetpu: MUL_MAT_ID expert id %d out of range [-1, %lld)\n",
                                    expert, static_cast<long long>(n_expert));
                     return GGML_STATUS_FAILED;
                 }
