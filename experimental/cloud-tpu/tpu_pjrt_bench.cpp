@@ -368,41 +368,64 @@ class TpuRuntime {
 
     TpuExecutable exec;
     exec.handle = c_args.executable;
-    exec.num_outputs = 1;
+    exec.num_outputs = 0;
 
-    if (PJRT_API_HAS(api_, PJRT_LoadedExecutable_GetExecutable) &&
-        PJRT_API_HAS(api_, PJRT_Executable_Destroy)) {
-      PJRT_LoadedExecutable_GetExecutable_Args ge = {};
-      ge.struct_size = PJRT_LoadedExecutable_GetExecutable_Args_STRUCT_SIZE;
-      ge.loaded_executable = exec.handle;
-      PJRT_Error* ge_err = api_->PJRT_LoadedExecutable_GetExecutable(&ge);
-      if (!ge_err && ge.executable) {
-        if (PJRT_API_HAS(api_, PJRT_Executable_NumOutputs)) {
-          PJRT_Executable_NumOutputs_Args no = {};
-          no.struct_size = PJRT_Executable_NumOutputs_Args_STRUCT_SIZE;
-          no.executable = ge.executable;
-          PJRT_Error* no_err = api_->PJRT_Executable_NumOutputs(&no);
-          if (!no_err && no.num_outputs > 0) {
-            exec.num_outputs = no.num_outputs;
-          } else if (no_err) {
-            destroyError(no_err);
-          }
-        }
-        PJRT_Executable_Destroy_Args ed = {};
-        ed.struct_size = PJRT_Executable_Destroy_Args_STRUCT_SIZE;
-        ed.executable = ge.executable;
-        PJRT_Error* ed_err = api_->PJRT_Executable_Destroy(&ed);
-        if (ed_err) destroyError(ed_err);
-      } else if (ge_err) {
-        destroyError(ge_err);
-      }
+    if (!PJRT_API_HAS(api_, PJRT_LoadedExecutable_GetExecutable) ||
+        !PJRT_API_HAS(api_, PJRT_Executable_Destroy) ||
+        !PJRT_API_HAS(api_, PJRT_Executable_NumOutputs)) {
+      tpuFreeExec(exec);
+      throw std::runtime_error(
+          "PJRT runtime missing executable output-count query APIs");
     }
+
+    PJRT_LoadedExecutable_GetExecutable_Args ge = {};
+    ge.struct_size = PJRT_LoadedExecutable_GetExecutable_Args_STRUCT_SIZE;
+    ge.loaded_executable = exec.handle;
+    PJRT_Error* ge_err = api_->PJRT_LoadedExecutable_GetExecutable(&ge);
+    if (ge_err || !ge.executable) {
+      tpuFreeExec(exec);
+      if (ge_err) checkError(ge_err, "PJRT_LoadedExecutable_GetExecutable");
+      throw std::runtime_error(
+          "PJRT_LoadedExecutable_GetExecutable returned null executable");
+    }
+
+    PJRT_Executable_NumOutputs_Args no = {};
+    no.struct_size = PJRT_Executable_NumOutputs_Args_STRUCT_SIZE;
+    no.executable = ge.executable;
+    PJRT_Error* no_err = api_->PJRT_Executable_NumOutputs(&no);
+
+    PJRT_Executable_Destroy_Args ed = {};
+    ed.struct_size = PJRT_Executable_Destroy_Args_STRUCT_SIZE;
+    ed.executable = ge.executable;
+    PJRT_Error* ed_err = api_->PJRT_Executable_Destroy(&ed);
+
+    if (no_err) {
+      if (ed_err) destroyError(ed_err);
+      tpuFreeExec(exec);
+      checkError(no_err, "PJRT_Executable_NumOutputs");
+    }
+    if (ed_err) {
+      tpuFreeExec(exec);
+      checkError(ed_err, "PJRT_Executable_Destroy");
+    }
+    if (no.num_outputs != 1) {
+      std::ostringstream oss;
+      oss << "Expected compiled PJRT executable with exactly 1 output, got "
+          << no.num_outputs;
+      tpuFreeExec(exec);
+      throw std::runtime_error(oss.str());
+    }
+    exec.num_outputs = no.num_outputs;
     return exec;
   }
 
   void tpuLaunch(const TpuExecutable& exec, PJRT_Buffer* const* inputs,
                  size_t num_inputs, PJRT_Buffer** outputs,
                  PJRT_Event** device_complete_events = nullptr) {
+    if (!exec.handle || exec.num_outputs != 1 || !outputs) {
+      throw std::runtime_error(
+          "Refusing PJRT launch on unverified or multi-output executable");
+    }
     PJRT_ExecuteOptions opts = {};
     opts.struct_size = PJRT_ExecuteOptions_STRUCT_SIZE;
     opts.context = nullptr;

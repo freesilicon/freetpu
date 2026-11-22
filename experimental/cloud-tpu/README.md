@@ -27,11 +27,25 @@ Using `google-colab-cli` (`colab --auth=adc` with isolated `--config` under a pr
 mkdir -p -m 700 ~/.cache/freetpu-colab ~/.cache/freetpu-pjrt
 mkdir -p -m 700 ~/.cache/freetpu-pjrt/ir
 
-# Single-script run inside an explicit session (verify teardown with `stop` + `sessions`)
-colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json new -s freetpu-raw --tpu V6E1
-colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json exec -s freetpu-raw --timeout 600 -f experimental/cloud-tpu/raw_compute_bench.py
-colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json stop -s freetpu-raw
-colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json sessions
+# Single-script run inside a unique session with automatic teardown verification
+(
+  set -euo pipefail
+  CFG=~/.cache/freetpu-colab/sessions.json
+  SESSION_ID="freetpu-raw-$(date +%s)-$$"
+  cleanup() {
+    local status=$?
+    trap - EXIT
+    set +e
+    if ! colab --auth=adc --config "$CFG" stop -s "$SESSION_ID"; then
+      echo "ERROR: failed to stop Colab session $SESSION_ID; check 'colab --auth=adc --config $CFG sessions'" >&2
+      if [ "$status" -eq 0 ]; then status=1; fi
+    fi
+    exit "$status"
+  }
+  colab --auth=adc --config "$CFG" new -s "$SESSION_ID" --tpu V6E1
+  trap cleanup EXIT
+  colab --auth=adc --config "$CFG" exec -s "$SESSION_ID" --timeout 600 -f experimental/cloud-tpu/raw_compute_bench.py
+)
 
 # Or run all stages inside one persistent session (verify markers + stop on exit)
 (
@@ -111,7 +125,7 @@ Or build checked-in `tpu_pjrt_bench.cpp` standalone in a private `0700` director
 ```bash
 mkdir -p -m 700 ~/.cache/freetpu-pjrt
 mkdir -p -m 700 ~/.cache/freetpu-pjrt/ir
-curl -fsSL https://raw.githubusercontent.com/openxla/xla/main/xla/pjrt/c/pjrt_c_api.h \
+curl -fsSL https://raw.githubusercontent.com/openxla/xla/0bfeeb476952fc0ae13dd38e27a9053cb1baa3ce/xla/pjrt/c/pjrt_c_api.h \
   -o ~/.cache/freetpu-pjrt/ir/pjrt_c_api.h
 LIBTPU_PATH="${TPU_LIBRARY_PATH:-$(python3 -c 'import libtpu; print(libtpu.get_library_path())')}"
 g++ -O3 -std=c++17 -Wall -Wextra -I"$HOME/.cache/freetpu-pjrt/ir" \

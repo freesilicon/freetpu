@@ -20,7 +20,8 @@ BIN_PATH = os.environ.get("TPU_PJRT_BIN_PATH") or os.path.join(
     DEFAULT_WORK_DIR, "tpu_pjrt_bench"
 )
 PJRT_HEADER_URL = (
-    "https://raw.githubusercontent.com/openxla/xla/main/xla/pjrt/c/pjrt_c_api.h"
+    "https://raw.githubusercontent.com/openxla/xla/"
+    "0bfeeb476952fc0ae13dd38e27a9053cb1baa3ce/xla/pjrt/c/pjrt_c_api.h"
 )
 
 
