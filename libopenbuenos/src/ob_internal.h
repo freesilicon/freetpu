@@ -5,9 +5,11 @@
 #include "litebuf_vii_wire.h"
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <initializer_list>
 #include <list>
 #include <mutex>
 #include <string>
@@ -17,7 +19,7 @@
 
 namespace ob {
 
-constexpr uint32_t kDefaultGraphCacheCapacity     = 256u;
+constexpr uint32_t kDefaultGraphCacheCapacity     = 512u;
 constexpr size_t   kDefaultBufferPoolMaxBytes     = 64u * 1024u * 1024u;
 constexpr size_t   kDefaultBufferPoolMaxCount     = 256u;
 constexpr size_t   kDefaultWeightCacheMaxEntries  = 4096u;
@@ -111,6 +113,7 @@ struct CachedGraph {
   ob_buffer* params_buf = nullptr;
   ob_buffer* reg_cmd_buf = nullptr;
   bool owns_image_buf = true;
+  bool owns_params_buf = true;
   uint32_t ref_count = 0;
   std::list<CachedGraph*>::iterator lru_it;
   bool in_cache = false;
@@ -124,6 +127,7 @@ struct CreditSlot {
     FAILED = 3
   };
   State state = FREE;
+  bool abandoned = false;
   ob_exec_handle_t handle = 0;
   uint32_t seq = 0;
   CachedGraph* graph_entry = nullptr;
@@ -134,6 +138,7 @@ struct CreditSlot {
   uint16_t vii_resp_code = 0;
   ob_status_t error_status = OB_OK;
   std::string error_msg;
+  std::vector<ob_buffer*> retired_bufs;
 };
 
 // Device & VII mailbox helpers (implemented in ob_device.cpp)
@@ -162,10 +167,19 @@ ob_status_t device_wait_handle(ob_context* ctx,
                                ob_invoke_stats_t* out_stats);
 
 ob_status_t device_wait_all(ob_context* ctx, uint32_t timeout_ms);
+bool        device_attach_inflight_buffers(ob_context* ctx,
+                                           ob_exec_handle_t handle,
+                                           std::initializer_list<ob_buffer*> bufs);
 
 // Buffer pool helpers (implemented in ob_buffer_pool.cpp)
+size_t buffer_slab_size(size_t requested);
+void buffer_retain(ob_buffer* buf);
 void buffer_destroy_slab(ob_context* ctx, PooledSlab* slab);
 void buffer_pool_clear(ob_context* ctx);
+ob_status_t buffer_sync_begin_read(ob_buffer* buf);
+ob_status_t buffer_sync_end_read(ob_buffer* buf);
+ob_status_t buffer_sync_begin_write(ob_buffer* buf);
+ob_status_t buffer_sync_end_write(ob_buffer* buf);
 void graph_cache_clear(ob_context* ctx);
 void shared_image_clear(ob_context* ctx);
 void gemm_release_pipeline_buffers(ob_context* ctx);
@@ -173,6 +187,22 @@ void graph_entry_unref_locked(ob_context* ctx, CachedGraph* entry);
 
 // Fast-path cache lookup by explicit u64 key without setting last_error on miss.
 bool graph_cache_lookup_u64(ob_context* ctx, uint64_t cache_key, ob_graph_t** out_graph);
+
+// Zero-alloc fast-path lookup returning CachedGraph* directly (+1 ref_count held by caller).
+bool graph_cache_lookup_entry_u64(ob_context* ctx, uint64_t cache_key, CachedGraph** out_entry);
+
+// Internal graph registration returning CachedGraph* (+1 ref_count), with optional
+// shared read-only 8 MiB zero-filled dummy params_buf for Probe-A weight-agnostic graphs.
+ob_status_t graph_register_dgc0_internal(ob_context* ctx,
+                                         const void* dgc0_bytes,
+                                         size_t dgc0_size,
+                                         uint64_t cache_key,
+                                         bool share_zero_params,
+                                         CachedGraph** out_entry,
+                                         bool* out_cache_hit);
+
+// Compute Android LMKD-safe ext[2] weight-cache byte budget (ob_gemm.cpp).
+size_t compute_weight_cache_budget_bytes(ob_context* ctx);
 
 // Submit async Execute with an optional runtime param_slice DMA-BUF override
 // (Probe-A weight-agnostic graph reuse: single model_handle per (M,K,N,D)).
@@ -184,17 +214,86 @@ ob_status_t graph_submit_async_with_params(ob_graph_t* graph,
                                            const ob_buffer* override_params,
                                            ob_exec_handle_t* out_handle);
 
+// 128-bit weight tile key (eliminates 64-bit collision risk while holding O(1) lookup).
+struct WeightTileKey {
+  uint64_t h1 = 0;
+  uint64_t h2 = 0;
+  uint64_t bytes = 0;
+
+  bool operator==(const WeightTileKey& o) const {
+    return h1 == o.h1 && h2 == o.h2 && bytes == o.bytes;
+  }
+};
+
+struct WeightTileKeyHash {
+  size_t operator()(const WeightTileKey& k) const noexcept {
+    uint64_t x = k.h1 ^ (k.h2 * 0x9e3779b97f4a7c15ULL) ^ (k.bytes * 0xbf58476d1ce4e5b9ULL);
+    x ^= (x >> 30);
+    x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= (x >> 27);
+    return static_cast<size_t>(x);
+  }
+};
+
 // Cached packed ext[2] weight tile (pinned in DMA-BUF, independent of model_handle).
 struct CachedWeightTile {
-  uint64_t key = 0;
+  WeightTileKey key{};
   uint32_t scale_d = 1;
   uint32_t hw_k = 0;
   uint32_t hw_n = 0;
   std::vector<float> row_s_b;
   ob_buffer* ext2_buf = nullptr;
   size_t ext2_bytes = 0;
+  // Lazy exact FP32 outlier-column cache (keyed by local k_off in [0, tk), length tn_total).
+  // Eliminates strided Q8_0/Q4_0 DRAM walks for recurring LLM activation sink channels.
+  std::unordered_map<uint32_t, std::vector<float>> outlier_cols;
+  size_t outlier_cols_bytes = 0;
+  // Chained SwiGLU chunk metadata (used when this tile stores packed [Wg|Wu|Wd_eff]).
+  float swiglu_s_wg = 0.0f;
+  float swiglu_l2_gate_max = 0.0f;
+  float swiglu_l2_gate_mean = 0.0f;
+  float swiglu_l2_up_max = 0.0f;
+  float swiglu_l2_up_mean = 0.0f;
+  float swiglu_l2_down_max = 0.0f;
+  float swiglu_dc_gate_max = 0.0f;
+  float swiglu_dc_up_max = 0.0f;
+  float swiglu_l1_gate_max = 0.0f;
+  float swiglu_linf_gate_max = 0.0f;
+  float swiglu_l1_up_max = 0.0f;
+  float swiglu_linf_up_max = 0.0f;
+  uint32_t swiglu_d_gate = 0;
+  uint32_t swiglu_d_up = 0;
+  uint32_t swiglu_d_mul = 0;
+  uint32_t swiglu_d_down = 0;
   std::list<CachedWeightTile*>::iterator lru_it;
   uint64_t in_use = 0;
+  bool in_cache = false;
+  bool rejected_fusion = false; // O(1) cached split decision when fused D spread > 1.5x
+  bool rejected_swiglu = false; // O(1) cached fallback when W_gate row-scale spread is extreme
+  bool swiglu_norms_only = false; // O(1) cached weight norms (0 B DMA) when activation guard rejects before packing
+};
+
+// Built-in nanosecond stage profiler accumulators (zero clock_gettime when profile_enabled=false).
+struct ProfileCounters {
+  uint64_t quant_ns = 0;
+  uint64_t hash_ns = 0;
+  uint64_t weight_pack_ns = 0;
+  uint64_t dma_sync_ns = 0;
+  uint64_t submit_ns = 0;
+  uint64_t wait_ns = 0;
+  uint64_t dequant_ns = 0;
+  uint64_t hw_us = 0;
+  uint64_t total_wall_ns = 0;
+  uint64_t calls = 0;
+  uint64_t tiles_dispatched = 0;
+  uint64_t horiz_fusions = 0;
+  uint64_t horiz_jobs_saved = 0;
+  uint64_t sat_retries = 0;
+  uint64_t spin_hits = 0;
+  uint64_t poll_waits = 0;
+  uint64_t swiglu_calls = 0;
+  uint64_t swiglu_chunks_chained = 0;
+  uint64_t swiglu_fallbacks = 0;
 };
 
 // Token-invariant weight-tile output scale ratio D and activation outlier/RMS helpers (ob_gemm.cpp).
@@ -210,6 +309,10 @@ uint32_t compute_activation_rms_shift(const int8_t* aq_tile,
                                       uint32_t tm,
                                       uint32_t tk,
                                       uint32_t hw_k);
+bool tile_output_is_saturated(const int8_t* out_data, uint32_t tm, uint32_t tn, uint32_t hw_n);
+void dequant_accum_row_f32(float* c_row, const int8_t* o_row,
+                           const float* sb_ptr, uint32_t tn, float sa_d);
+void apply_activation_inplace_f32(float* c_mn, size_t count, uint32_t act);
 
 // Clean-room C++17 Tensor G5 GEMM emitter internals (implemented in ob_gemm_emitter.cpp)
 struct GemmSynthResult {
@@ -276,11 +379,75 @@ bool is_lt_1x_dim(uint32_t d);
 // (M==64, K in {512,576,1024,1536}, N in [128..1536] step 32, K+N <= 3072).
 bool is_lt_64x_shape(uint32_t M, uint32_t K, uint32_t N);
 
+// Clean-room C++17 11-chunk zero-DRAM in-SRAM chained SwiGLU emitter (ob_gemm_emitter.cpp)
+struct SwigluSynthResult {
+  std::array<std::vector<uint8_t>, 11> chunks;
+  std::vector<uint8_t> ext0_dive;
+  std::vector<uint8_t> ext2_params;
+  uint32_t exec_field_14 = 0;
+  uint32_t dive_scratch_size = 0;
+};
+
+bool is_swiglu_shape(uint32_t M, uint32_t K, uint32_t H, uint32_t N);
+
+std::vector<uint8_t> pack_ext2_for_swiglu(uint32_t M, uint32_t K, uint32_t H, uint32_t N,
+                                          const int8_t* wg_hk, const int32_t* bg_h,
+                                          const int8_t* wu_hk, const int32_t* bu_h,
+                                          const int8_t* wd_nh, const int32_t* bd_n);
+
+ob_status_t synthesize_swiglu_parts(const ob_swiglu_int8_desc_t& desc,
+                                    SwigluSynthResult* out,
+                                    std::string* err);
+
+ob_status_t build_swiglu_dgc0(const ob_swiglu_int8_desc_t& desc,
+                              const uint8_t* dive_interp,
+                              size_t dive_interp_size,
+                              std::vector<uint8_t>* out_dgc0,
+                              SwigluSynthResult* out_parts,
+                              std::string* err);
+
+// Validate SwiGLU quantization scales and compute FP32 hardware multipliers using double
+// intermediates to avoid intermediate overflow. Returns false if any scale, multiplier,
+// or scaled SiLU spline coefficient is non-finite or non-positive.
+bool compute_swiglu_hw_multipliers(const ob_swiglu_int8_desc_t& desc,
+                                   float* out_m_gate,
+                                   float* out_m_up,
+                                   float* out_m_mul,
+                                   float* out_m_down);
+
+// Exact FP32-RNE Horner SwiGLU hardware simulator (matches rango silicon max_abs_err=0).
+void simulate_swiglu_hw_exact(const int8_t* x_mk,
+                              const ob_swiglu_int8_desc_t& desc,
+                              int8_t* y_mn);
+
+// Evaluate exact TPU piecewise-Horner SiLU on quantized gate code q_g in [-128, 127],
+// returning quantized INT8 code q_silu in [-128, 127] matching simulate_swiglu_hw_exact.
+int32_t eval_swiglu_silu_q(int32_t q_g, float s_gate);
+void build_swiglu_silu_lut(float s_gate, int8_t out_lut[256]);
+
+// RMS-calibrated 3-stage divider selection for chained SwiGLU (ob_gemm.cpp).
+void compute_swiglu_stage_dividers(uint32_t m_dim,
+                                   float rms_a,
+                                   float l2_g_max, float l2_g_mean,
+                                   float l2_u_max, float l2_u_mean,
+                                   float l2_d_max,
+                                   uint32_t* out_d_gate,
+                                   uint32_t* out_d_up,
+                                   uint32_t* out_d_mul,
+                                   uint32_t* out_d_down);
+
 ob_status_t builtin_gemm_emitter_cb(const ob_gemm_desc_t* desc,
                                     uint8_t* out_buf,
                                     size_t out_cap,
                                     size_t* out_size,
                                     void* user_data);
+
+struct ImmutableWeightRegion {
+  uintptr_t begin = 0u;
+  uintptr_t end = 0u;
+  uint64_t version = 0u;
+  uint64_t generation = 0u;
+};
 
 void set_last_error(ob_context* ctx, const std::string& msg);
 
@@ -291,6 +458,7 @@ struct ob_buffer {
   ob::PooledSlab slab{};
   size_t requested_size = 0;
   uint32_t flags = 0;
+  std::atomic<uint32_t> refcnt{1u};
 };
 
 struct ob_graph {
@@ -305,6 +473,7 @@ struct ob_context {
 
   bool mock_mode = false;
   int tpu_fd = -1;
+  int dma_heap_fd = -1;
   int resp_efd = -1;
   int err_efd = -1;
   bool wake_locked = false;
@@ -315,6 +484,20 @@ struct ob_context {
   uint8_t fw_wakelock_core = 0u;
   uint8_t fw_wakelock_mem = 0u;
   uint8_t fw_wakelock_bitset = 0u;
+  // Cached runtime env knobs (read once on ob_context_create to eliminate hot-path getenv scans)
+  bool profile_enabled = false;
+  bool verbose_enabled = false;
+  bool strict_weight_hash = false;
+  bool large_tiles_enabled = true;
+  bool batched_large_tiles_enabled = true;
+  bool horiz_fusion_enabled = true;
+  bool swiglu_chain_enabled = true;
+  bool swiglu_fast_chain_enabled = false;
+  bool swiglu_prefill_enabled = false;
+  float swiglu_max_crest = 16.0f;
+  uint32_t param_swap_slots = 1u;
+  uint32_t spin_us = 450u; // Adaptive spin window (us) before poll(resp_efd) when ema_hw_us < 600
+  uint64_t ema_hw_us = 0u; // Exponential moving average of firmware hw_execution_us
   uint32_t credit_size = OB_MAX_CREDITS;
   uint32_t fw_major = 0;
   uint32_t fw_minor = 0;
@@ -352,6 +535,9 @@ struct ob_context {
   ob::Sha256Digest shared_image_sha256{};
   size_t shared_image_size = 0;
   ob_buffer* shared_image_buf = nullptr;
+  // Shared 8 MiB zero-filled dummy ext[2] DMA-BUF for Probe-A weight-agnostic graphs
+  // (eliminates 3-5 MiB of unused dummy params DMA-BUF per cached SwiGLU/GEMM model_handle).
+  ob_buffer* shared_zero_params_buf = nullptr;
 
   // 16-credit async VII execution ring
   std::mutex vii_mu;
@@ -370,21 +556,35 @@ struct ob_context {
   std::vector<uint8_t> emitter_scratch;
   std::array<ob_buffer*, OB_MAX_CREDITS> gemm_in_bufs{};
   std::array<ob_buffer*, OB_MAX_CREDITS> gemm_out_bufs{};
+  std::array<ob_buffer*, OB_MAX_CREDITS> gemm_in_bufs_4k{};
+  std::array<ob_buffer*, OB_MAX_CREDITS> gemm_out_bufs_4k{};
 
   // Persistent packed ext[2] weight tile DMA-BUF LRU cache (Probe-A dynamic param_slice)
-  std::unordered_map<uint64_t, ob::CachedWeightTile*> weight_cache_map;
+  std::unordered_map<ob::WeightTileKey, ob::CachedWeightTile*, ob::WeightTileKeyHash> weight_cache_map;
   std::list<ob::CachedWeightTile*> weight_cache_lru;
   size_t weight_cache_bytes = 0;
-  size_t weight_cache_max_bytes = 0;   // lazily initialized (256 MiB mock / 2048 MiB HW)
+  size_t weight_cache_peak_bytes = 0;
+  size_t weight_cache_max_bytes = 0;   // lazily initialized (min(2048 MiB, MemAvailable/3) on Android)
   size_t weight_cache_max_entries = 0; // FD-safe cap (default 4096, env OPENBUENOS_WEIGHT_CACHE_ENTRIES)
+  std::vector<ob::ImmutableWeightRegion> immutable_weight_regions;
+  uint64_t next_immutable_region_gen = 1u;
+  size_t simulated_mem_available_bytes = 0; // Optional test override for LMKD budget verification
+  bool simulated_mem_available_set = false; // Allows explicitly simulating MemAvailable == 0 kB
   uint64_t weight_cache_hits = 0;
   uint64_t weight_cache_misses = 0;
+  uint64_t weight_cache_evictions = 0;
 
   // Reusable GEMM host scratch buffers (eliminates per-call malloc/free in hot loop)
   std::vector<int8_t> gemm_aq_scratch;
   std::vector<int8_t> gemm_bq_scratch;
   std::vector<int8_t> gemm_out_scratch;
   std::vector<float> gemm_wrow_scratch;
+  std::vector<float> gemm_wcol_scratch;
+  std::vector<float> gemm_sa_scratch;
+  std::vector<std::vector<std::pair<uint32_t, float>>> gemm_outliers_scratch;
+
+  // Stage profiler counters
+  ob::ProfileCounters prof{};
 
   // Diagnostics
   mutable std::mutex err_mu;

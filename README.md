@@ -41,8 +41,8 @@
 
 | Layer | Component | Responsibility |
 | --- | --- | --- |
-| **LLM Inference** | [`llama-cpp-edgetpu/`](llama-cpp-edgetpu/README.md) | `EDGETPU` GGML `ACCEL` backend (`MUL_MAT` `Q8_0` / `Q4_0` / `F32`, shared-`A` QKV & gate/up batching, 1D bias `ADD`, 64B host storage) |
-| **Open Runtime** | [`libopenbuenos/`](libopenbuenos/include/openbuenos.h) | C11/C++17 static library: `1,286.4 MHz` DVFS + FW WakeLock, FD-capped DMA-BUF pool & `O(1)` weight cache, 16-credit VII ring, `M=1` & `M=64` VLIW GEMM emitter |
+| **LLM Inference** | [`llama-cpp-edgetpu/`](llama-cpp-edgetpu/README.md) | `EDGETPU` GGML `ACCEL` backend (`MUL_MAT` & MoE `MUL_MAT_ID` `Q8_0`/`Q4_0`/`F32`, chained SwiGLU, `ROPE`/`GLU`, QKV `3->1` horizontal fusion, 1D bias `ADD`) |
+| **Open Runtime** | [`libopenbuenos/`](libopenbuenos/include/openbuenos.h) | C11/C++17 static library: `1,286.4 MHz` DVFS + FW WakeLock, adaptive user-space spin, 2-tier DMA-BUF pool & LMKD-bounded single-copy weight cache, 16-credit VII ring, `M=1`/`M=64` GEMM + 11-chunk chained SwiGLU emitter, `OPENBUENOS_PROFILE=1` |
 | **Kernel Transport** | [`runtime/`](runtime/src/tpu_baremetal_runner.cpp) | Standalone bare-metal runner & UAPI/Litebuf VII headers (`0x0008 -> 0x00fe`, `/dev/edgetpu-soc` `0xED`) |
 | **ISA Tooling** | [`tools/`](tools/emit_custom_gemm.py) | Pure-Python `DGC0` dissector/patcher, multi-tile `(M, K, N)` VLIW synthesizer, `0x640` minimax spline codec, `0xa40` chained fusion verifier, `INT4` packer |
 
@@ -85,13 +85,13 @@ All hardware metrics below were measured on Google Pixel 10 Pro Fold (`rango`, T
 | Proof Suite | Scope | Verified Result |
 | --- | --- | --- |
 | **DVFS + FW WakeLock Silicon Unlock** | `1x2048x2048` & `64x1536x1536` (`PM=5` @ `1,286.4 MHz` + Litebuf `AcquireWakeLock`) | **`27.59 GB/s`** (`152 us` HW), **`983.6 INT8 GOPS` @ `177.2 mW` = `5.55 TOPS/W`** (`307 us` HW, `max_abs_err = 0`) |
-| **Closed-Form Multi-Tile & Large-Tile ISA** | `92` compiled reference models (`81` base + `6` `lt_1x*` + `5` `lt_64x*`) | **`92/92` bit-exact** `chunk[0..6]`, `ext[0]` (`DIVE`), `ext[2]`; **`16/16`** `libopenbuenos` host suites PASS |
+| **Closed-Form Multi-Tile & Chained SwiGLU ISA** | `92` GEMM refs + `16` SwiGLU refs + `6` standalone non-PoT SwiGLU probes (`11` chunks, `sgs=1`) | **`92/92`** GEMM + **`16/16`** SwiGLU refs + **`6/6`** standalone SwiGLU probes bit-exact (`max_abs_err = 0`, up to **`952.6 GOPS`** / **`26.23 GB/s`**); **`18/18`** `libopenbuenos` host suites PASS (`openbuenos_selftest --test-swiglu` **`7/8`** live: all `4/4` INT8 & decode Q8/Q4 pass; opt-in M=64 Q4 prefill test measures `nmse=4.00e-03 > 3.5e-3`, while production `M > 8` prefill uses `lt_64x*` GEMM) |
 | **`0x640` Minimax Splines & Chained Fusion** | `SiLU`/`GELU`/`exp` + `4` Mode-A (`+0 B`) + `3` multi-op `0xa40` probes (`MLP`, `SwiGLU`, `QKV`) | **`12,288/12,288`** spline bytes + **`3/3`** chained probes (`60.8–72.8 us`, `8/8` `ext[2]` slices bit-exact, `max_abs_err = 0`) |
 | **Native `W8A16 (BF16)` FP32-I/O GEMM** | `1x64x32` (`2,048 B` `u8` + `128 B` per-channel `FP32` scales) | **`32/32` bit-exact `FP32`** (`max_abs_err = 0.0`, `411–426 us` HW, zero Google `.so`s) |
-| **`ggml-edgetpu` Backend Ops** | Live `rango` `test-backend-ops -b EDGETPU -o MUL_MAT` (`Q8_0` & `Q4_0`) | **`104/104` `q8_0`** & **`104/104` `q4_0`** PASS (`327/327` host mock), `cpu_fallback_slices = 0`, `DT_NEEDED = [libdl.so, libm.so, libc.so]` |
-| **Live LLM Throughput & Energy (`llama-bench`)** | `SmolLM2-135M-Q8_0` & `Qwen2.5-1.5B-{Q8_0,Q4_0}` (`PM=5` @ `1,286.4 MHz`, `MAPS_GOOGLE=0`) | **`SmolLM2`**: `pp512 = 563.82 t/s`, `tg64 = 17.36 t/s`; **`Qwen2.5-1.5B-Q8_0`**: `pp512 = 105.87 t/s` (**`-21.5%` system `mJ/tok` vs CPU**), `tg64 = 5.85 t/s`, **`22/22` verbatim CPU token match** |
+| **`ggml-edgetpu` Backend Ops (Dense + MoE)** | Live `rango` `test-backend-ops -b EDGETPU` (`MUL_MAT` + `MUL_MAT_ID` MoE, `Q8_0` & `Q4_0`) | **`435/435` PASS** (`104/104` `MUL_MAT q8_0`, `104/104` `MUL_MAT q4_0`, **`227/227` `MUL_MAT_ID` MoE** = `115/115 q8_0` + `112/112 q4_0`), `cpu_fallback_slices = 0`, `DT_NEEDED = [libdl.so, libm.so, libc.so]` |
+| **Live LLM Throughput, Residency & Energy (`llama-bench`)** | `SmolLM2-135M-Q8_0` & `Qwen2.5-1.5B-{Q8_0,Q4_0}` (`PM=5` @ `1,286.4 MHz`, `MAPS_GOOGLE=0`, LMKD single-copy) | **`SmolLM2`**: `pp128 = 903.81 t/s` (`2.35x`), `pp512 = 961.71 t/s` (`1.71x`), **`tg64 = 34.84 t/s` (`2.01x`)**; **`Qwen2.5-1.5B`**: prefill **`-32.9%` to `-44.6%` total SoC `mJ/tok` vs CPU** (`Q8` `-44.6%`/`-40.8%`, `Q4` `-35.0%`/`-32.9%`), warm `tg64` **`10.15`/`10.42 t/s`**, **`w_evict = 0`**, `VmRSS` **`37%–44%` smaller than CPU** |
 
-See [docs/PHASE6_PERF_REPORT.md](docs/PHASE6_PERF_REPORT.md) for the full 18-case ODPM `mJ/tok` energy matrix and silicon scaling tables.
+See [docs/PHASE7_PERF_REPORT.md](docs/PHASE7_PERF_REPORT.md) (and [Phase 6 baseline](docs/PHASE6_PERF_REPORT.md)) for the full Phase 7 host stage profile, MoE residency proofs, and 18-case ODPM `mJ/tok` sweep.
 
 ---
 
@@ -134,6 +134,8 @@ export OPENBUENOS_DIVE_INTERP_PATH=/data/local/tmp/tpu_open_stack/dive_interp_rv
 
 ## Documentation
 
+- [Phase 7 Performance & Architecture Report](docs/PHASE7_PERF_REPORT.md) — 11-chunk chained SwiGLU, adaptive spin, `435/435` dense + MoE (`MUL_MAT_ID`), `SmolLM2 tg64 = 34.84 t/s` (`2.01x`), `Qwen2.5` prefill `-32.9%` to `-44.6%` SoC `mJ/tok`, `w_evict = 0` LMKD residency
+- [Phase 7 In-SRAM Chained SwiGLU C++17 Spec](docs/isa-gemm/phase7_swiglu_cpp_spec.md) — `11`-chunk DIVE VM IR, `256 KiB` `0x940`/`0x980` parameter-ring formulas, `0x640` SiLU + `0x100` MUL CSR tables & `768 KiB` SRAM ceiling
 - [Phase 6 Performance & Energy Report](docs/PHASE6_PERF_REPORT.md) — `1,286.4 MHz` DVFS + WakeLock unlock, `983.6 GOPS` (`5.55 TOPS/W`), batched `M=64` prefill, `SmolLM2`/`Qwen2.5` benchmarks & 18-case ODPM `mJ/tok` sweep
 - [Phase 5B Live LLM Spec](docs/PHASE5_LLAMA_TPU_SPEC.md) — `Probe A` dynamic `param_slice`, `O(1)` weight cache, outlier peeling & baseline bring-up
 - [DVFS, Power States & WakeLock Spec](docs/baremetal-vii/dvfs_power_states.md) — Corrected `+0x1c..+0x20` Litebuf wire fields, `TpuCorePowerState` (`0x03..0x19`), `MemoryPowerState` (`0x01..0x15`) & FW WakeLock (`union_type=4/5`)
