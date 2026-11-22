@@ -38,8 +38,8 @@ cat runs/colab-tpu.md
 ### 2. Force a Specific Chip (`v5e1` or `v6e1`) or Inspect Planned Commands
 
 ```bash
-# Dry-run: inspect exact commands without allocating a TPU VM
-python3 bench/freetpu_bench.py --suite compute,bandwidth --backend colab_tpu --dry-run --json -
+# Dry-run: inspect exact commands without allocating a TPU VM (prints plan directly to stdout; add --json - for JSON)
+python3 bench/freetpu_bench.py --suite compute,bandwidth --backend colab_tpu --dry-run
 
 # Target v5e-1 directly (skips v6e-1 capacity probe)
 python3 bench/freetpu_bench.py \
@@ -55,13 +55,15 @@ python3 bench/freetpu_bench.py \
 ```bash
 mkdir -p -m 700 ~/.cache/freetpu-colab
 colab --auth=adc --config ~/.cache/freetpu-colab/direct.json run \
-  -s freetpu-bench-direct --tpu V5E1 --timeout 300 \
+  -s freetpu-bench-direct --tpu V5E1 --keep --timeout 300 \
   bench/freetpu_bench.py --suite compute,bandwidth --backend jax_tpu --emit-markers
-# Verify the ephemeral session was released (stop explicitly if still listed)
+# Record the backend runtime endpoint, stop the session, and verify the endpoint disappears (including under `[?]`)
+colab --auth=adc --config ~/.cache/freetpu-colab/direct.json sessions
+colab --auth=adc --config ~/.cache/freetpu-colab/direct.json stop -s freetpu-bench-direct
 colab --auth=adc --config ~/.cache/freetpu-colab/direct.json sessions
 ```
 
-`colab run` attempts to release the ephemeral TPU VM on exit, though network drops, timeouts, or CLI errors can leave a session active; always verify via `colab sessions` (and run `colab --auth=adc --config ... stop -s <session_id>` if any session remains).
+Passing `--keep` preserves the local session-to-endpoint mapping until `colab stop -s` succeeds, so a failed unassign cannot silently drop local state and leave an orphaned `[?] <endpoint>` runtime burning Compute Units. Always confirm in the final `colab sessions` output that the runtime endpoint is gone.
 
 ---
 
@@ -80,5 +82,5 @@ colab --auth=adc --config ~/.cache/freetpu-colab/direct.json sessions
 ## Operational Guardrails
 
 - **Always isolate `--colab-config` in a private `0700` dir**: Passing `--colab-config ~/.cache/freetpu-colab/...` keeps parallel benchmark runs separate from `~/.config/colab-cli/sessions.json` and avoids shared `/tmp` directories.
-- **Automatic `v6e1 -> v5e1` Fallback & Session Verification**: If Colab refuses allocation before `[colab] Session READY`, `freetpu_bench.py` falls back to `v5e1` automatically (never retrying after `[colab] Session READY` to avoid duplicate CU spend) and checks `colab sessions` / calls `colab stop -s <session>` after execution to verify teardown.
+- **Automatic `v6e1 -> v5e1` Fallback & Endpoint-Verified Teardown**: If Colab refuses allocation before `[colab] Session READY`, `freetpu_bench.py` falls back to `v5e1` automatically (never retrying after `[colab] Session READY` to avoid duplicate CU spend). It invokes `colab run --keep`, records the runtime endpoint from `colab sessions`, runs `colab stop -s <session>`, and verifies that the backend endpoint disappeared (failing verification if the endpoint persists even as an orphaned `[?]` entry).
 - **Scope Boundary**: Colab is strictly for single-chip R&D and reproducible benchmarking—never deploy public inference APIs or multi-tenant proxies on Colab runtimes.

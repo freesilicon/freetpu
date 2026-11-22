@@ -71,7 +71,7 @@ Every scorecard explicitly tags live runs as `measured` and reference rows as `p
 | **Cloud TPU `v5e-1`** | `179.36 TF/s` BF16 / `350.69 TOPS` INT8 (live, `197/394` peak) | `655.55 GB/s` triad (live, `819` peak) | **`$1.20/hr`** on-demand | Google Cloud TPU `v5e` public on-demand (`us-central1`/`us-east5`/`us-west1`: `$1.20/chip-hr`) |
 | **Cloud TPU `v6e-1` (Trillium)** | `918 TF/s` BF16 / `1,836 TOPS` INT8 (spec) | `1,638 GB/s` HBM (spec) | **`$2.70/hr`** on-demand | Google Cloud TPU `v6e` public on-demand (`us-east1`/`us-east5`: `$2.70/chip-hr`) |
 | **NVIDIA H100 SXM** | `989 TF/s` BF16 dense (spec) | `3,350 GB/s` HBM3 (spec) | **`$3.49/hr`** spec. cloud (`~$7–11/hr` hyperscaler) | NVIDIA H100 SXM datasheet (non-sparse Tensor Core) & public specialized GPU cloud rates |
-| **NVIDIA RTX 5090** | `209.5 TF/s` BF16 dense (`419 TF/s` sparse) | `1,792 GB/s` GDDR7 (spec) | **`$0.50/hr`** cloud (`~$0.20/hr` self-hosted) | NVIDIA Blackwell spec (non-sparse BF16 dense), community cloud midpoint (`$0.32–$0.80/hr`), `$1,999` FE MSRP |
+| **NVIDIA RTX 5090** | `209.5 TF/s` BF16 dense (FP32-acc) / `838 TOPS` INT8 dense (spec) | `1,792 GB/s` GDDR7 (spec) | **`$0.50/hr`** cloud (`~$0.20/hr` self-hosted) | NVIDIA RTX Blackwell architecture spec (dense non-sparse Tensor Core), community cloud midpoint (`$0.32–$0.80/hr`), `$1,999` FE MSRP |
 
 ---
 

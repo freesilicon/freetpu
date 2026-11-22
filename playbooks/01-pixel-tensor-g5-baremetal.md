@@ -41,18 +41,40 @@ ctest --test-dir libopenbuenos/build/cmake-host --output-on-failure
 
 ```bash
 # Cross-build libopenbuenos + standalone bare-metal runner for Android ARM64 (android-34)
+# (`verify-baremetal` also audits static ELF DT_NEEDED + undefined dlopen/dlsym symbols)
 make -C libopenbuenos verify-header android verify-android
 make -C runtime verify-baremetal
 
-# Push runner + locally extracted DIVE interpreter onto your own unlocked device
-adb push runtime/build/android-arm64/tpu_baremetal_runner /data/local/tmp/tpu_open_stack/
+# Push runner, locally extracted DIVE interpreter, and a local compiled .dgc0 + input onto your own unlocked device
+adb push runtime/build/tpu_baremetal_runner /data/local/tmp/tpu_open_stack/
 adb push /path/to/local/dive_interp_rv64.bin /data/local/tmp/tpu_open_stack/dive_interp_rv64.bin
-adb shell "su -c 'OPENBUENOS_DIVE_INTERP_PATH=/data/local/tmp/tpu_open_stack/dive_interp_rv64.bin \
-  OPENBUENOS_PERF_MODE=5 \
-  /data/local/tmp/tpu_open_stack/tpu_baremetal_runner --self-test'"
+adb push /path/to/local/model.dgc0 /data/local/tmp/tpu_open_stack/model.dgc0
+adb push /path/to/local/input.bin /data/local/tmp/tpu_open_stack/input.bin
 
-# Verify zero proprietary Google/vendor .so libraries loaded
-adb shell "su -c 'readelf -d /data/local/tmp/tpu_open_stack/tpu_baremetal_runner | grep NEEDED'"
+# Run bare-metal silicon benchmark and capture live /proc/<pid>/maps while the workload executes
+adb shell 'su -c "rm -f /data/local/tmp/tpu_open_stack/runner-maps.txt /data/local/tmp/tpu_open_stack/run.json; \
+  OPENBUENOS_DIVE_INTERP_PATH=/data/local/tmp/tpu_open_stack/dive_interp_rv64.bin \
+  OPENBUENOS_PERF_MODE=5 \
+  /data/local/tmp/tpu_open_stack/tpu_baremetal_runner \
+    --dgc0 /data/local/tmp/tpu_open_stack/model.dgc0 \
+    --in /data/local/tmp/tpu_open_stack/input.bin \
+    --iters 500 --json > /data/local/tmp/tpu_open_stack/run.json & \
+  pid=\$!; \
+  while kill -0 \$pid 2>/dev/null; do \
+    if grep -q tpu_baremetal_runner /proc/\$pid/maps 2>/dev/null; then \
+      cat /proc/\$pid/maps > /data/local/tmp/tpu_open_stack/runner-maps.tmp 2>/dev/null && \
+      mv /data/local/tmp/tpu_open_stack/runner-maps.tmp /data/local/tmp/tpu_open_stack/runner-maps.txt; \
+      sleep 0.05; \
+    fi; \
+  done; \
+  wait \$pid"'
+
+# Verify zero proprietary Google/vendor .so libraries loaded at runtime (/proc/<pid>/maps catches transitive + dlopen loads)
+# and confirm the runner's in-process /proc/self/maps audit reported maps_has_google_tpu_libs=false
+adb shell 'su -c "test -s /data/local/tmp/tpu_open_stack/runner-maps.txt && \
+  grep -q tpu_baremetal_runner /data/local/tmp/tpu_open_stack/runner-maps.txt && \
+  ! grep -iE \"edgetpu|darwinn|tachyon|libgxp|tflite|tensorflow|/vendor/|google\" /data/local/tmp/tpu_open_stack/runner-maps.txt && \
+  grep -q \"\\\"maps_has_google_tpu_libs\\\": false\" /data/local/tmp/tpu_open_stack/run.json"'
 ```
 
 ---
@@ -66,7 +88,7 @@ adb shell "su -c 'readelf -d /data/local/tmp/tpu_open_stack/tpu_baremetal_runner
 | **Native `W8A16 (BF16)` (`1x64x32`)** | **`411–426 us`** hw (`32/32` bit-exact `FP32`, `max_abs_err = 0.0`) | [`docs/hardware-errata.md`](../docs/hardware-errata.md) |
 | **Zero-DRAM Chained Fusion (`0xa40`)** | **`60.8–72.8 us`** hw (`fuse_fc64_silu_fc64`, `fuse_swiglu_64`, `fuse_qkv_64`) | [`docs/PHASE6_PERF_REPORT.md`](../docs/PHASE6_PERF_REPORT.md) |
 | **LLM Inference (`Qwen2.5-1.5B-Q8_0`)** | **`118.06 t/s`** `pp128`, **`5.85 t/s`** `tg64` (`-21.5%` system `mJ/tok` vs CPU on `pp512`) | [`docs/PHASE6_PERF_REPORT.md`](../docs/PHASE6_PERF_REPORT.md) |
-| **ELF `DT_NEEDED` Audit** | Strictly `[libdl.so, libm.so, libc.so]` (`0` vendor `.so`s) | [`docs/PHASE6_PERF_REPORT.md`](../docs/PHASE6_PERF_REPORT.md) |
+| **Runtime `/proc/<pid>/maps` & ELF Audit** | `maps_has_google_tpu_libs = false` (`0` vendor `.so`s mapped in `/proc/<pid>/maps`; `DT_NEEDED` strictly system libs) | [`docs/PHASE6_PERF_REPORT.md`](../docs/PHASE6_PERF_REPORT.md) |
 
 > Note: `--backend buenos_mock` measures your **host CPU** executing FreeTPU's FP32 reference GEMM/SiLU (`gemm_fp32_ref` / `fused_gemm_silu_fp32_ref`) and host INT8 FP32-RNE requantization (`row_type: measured`) alongside the published Tensor G5 silicon baseline (`row_type: published-reference`).
 

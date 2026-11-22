@@ -32,6 +32,7 @@ import math
 import os
 import platform
 import re
+import shlex
 import shutil
 import socket
 import statistics
@@ -42,10 +43,12 @@ import tempfile
 import threading
 import time
 import uuid
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from io import StringIO
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 try:
     import numpy as np
@@ -177,7 +180,7 @@ PUBLISHED_BASELINES: Tuple[ReferenceBaseline, ...] = (
         status="published-reference",
         memory_spec="32 GB GDDR7",
         peak_bf16_tflops=209.5,
-        peak_int8_tops=419.0,
+        peak_int8_tops=838.0,
         measured_bf16_tflops=None,
         measured_int8_tops=None,
         bandwidth_gbps=1792.0,
@@ -185,7 +188,7 @@ PUBLISHED_BASELINES: Tuple[ReferenceBaseline, ...] = (
         dispatch_floor_us="~5-15 us CUDA/Graph",
         hourly_cost_usd=0.50,
         pricing_basis="Specialized community GPU cloud ($0.50/GPU-hr midpoint of $0.32-$0.80/hr; $1,999 FE MSRP ~$0.20/hr self-hosted)",
-        source_citation="NVIDIA Blackwell RTX 5090 spec (dense non-sparse Tensor Core) & public community cloud pricing",
+        source_citation="NVIDIA RTX Blackwell architecture spec (dense non-sparse Tensor Core: 209.5 BF16 TF/s FP32-acc, 838 INT8 TOPS) & public community cloud pricing",
         verified_decode_tok_s=None,
         verified_decode_label=None,
     ),
@@ -368,12 +371,13 @@ def run_compute_local(backend: str, quick: bool = False) -> Dict[str, Any]:
 
     # Dispatch floor is the median latency of the smallest 1x64x32 op.
     floor_cases = [c for c in cases if c["shape"] == [1, 64, 32] and c["name"].startswith("gemm_fp32")]
-    peak_bf16 = max((c["peak_perf"] for c in cases if c["unit"] == "TFLOP/s"), default=0.0)
+    peak_fp32 = max((c["peak_perf"] for c in cases if c["unit"] == "TFLOP/s"), default=0.0)
     peak_int8 = max((c["peak_perf"] for c in cases if c["unit"] == "TOPS"), default=0.0)
     return {
         "status": "measured",
         "backend": backend,
-        "peak_bf16_tflops": round(peak_bf16, 4),
+        "peak_bf16_tflops": None,
+        "peak_fp32_tflops": round(peak_fp32, 4),
         "peak_int8_tops": round(peak_int8, 4),
         "dispatch_floor_us": floor_cases[0]["median_us"] if floor_cases else None,
         "cases": cases,
@@ -954,6 +958,7 @@ def build_colab_run_commands(
             sess,
             "--tpu",
             tpu.upper(),
+            "--keep",
             "--timeout",
             str(timeout_s),
             str(script_path),
@@ -969,9 +974,26 @@ def build_colab_run_commands(
     return cmds
 
 
+_COLAB_SESSION_LINE_RE = re.compile(r"^\s*\[([^\]]+)\]\s+(\S+)\s*\|")
+
+
+def _parse_colab_sessions(sessions_stdout: str) -> List[Tuple[str, str]]:
+    """Parse `colab sessions` lines formatted as `[name] endpoint | Hardware: ...`."""
+    entries: List[Tuple[str, str]] = []
+    for line in sessions_stdout.splitlines():
+        m = _COLAB_SESSION_LINE_RE.match(line)
+        if m:
+            entries.append((m.group(1).strip(), m.group(2).strip()))
+    return entries
+
+
+def _token_present(text: str, token: str) -> bool:
+    pat = re.compile(rf"(?<![A-Za-z0-9_-]){re.escape(token)}(?![A-Za-z0-9_-])")
+    return any(pat.search(line) for line in text.splitlines())
+
+
 def _session_still_listed(sessions_stdout: str, session_name: str) -> bool:
-    pat = re.compile(rf"(?<![A-Za-z0-9_-]){re.escape(session_name)}(?![A-Za-z0-9_-])")
-    return any(pat.search(line) for line in sessions_stdout.splitlines())
+    return _token_present(sessions_stdout, session_name)
 
 
 def _verify_and_stop_session(
@@ -980,15 +1002,72 @@ def _verify_and_stop_session(
     auth: str,
     iso_cfg: Path,
     session_name: str,
-) -> bool:
-    sess_res = runner([colab_bin, "--auth", auth, "--config", str(iso_cfg), "sessions"])
-    if sess_res.returncode != 0:
-        return False
-    if not _session_still_listed(sess_res.stdout, session_name):
-        return True
-    runner([colab_bin, "--auth", auth, "--config", str(iso_cfg), "stop", "-s", session_name])
+    pre_endpoints: Optional[Set[str]] = None,
+    session_was_ready: bool = False,
+) -> Tuple[bool, Optional[str], List[str]]:
+    """Stop a Colab runtime and verify its backend endpoint disappeared.
+
+    Because `colab run` is invoked with `--keep`, the local session-to-endpoint
+    mapping stays intact in `iso_cfg` until we query `colab sessions`, capture
+    the backend runtime endpoint, invoke `colab stop -s`, and verify that the
+    endpoint no longer appears under either `[session_name]` or `[?]`.
+    """
+    before = runner([colab_bin, "--auth", auth, "--config", str(iso_cfg), "sessions"])
+    before_ok = before.returncode == 0
+    before_entries = _parse_colab_sessions(before.stdout) if before_ok else []
+    tracked_endpoints: Set[str] = {ep for name, ep in before_entries if name == session_name}
+    if before_ok and pre_endpoints is not None:
+        new_orphans: Set[str] = {
+            ep for name, ep in before_entries if name == "?" and ep not in pre_endpoints
+        }
+    elif before_ok and session_was_ready and not tracked_endpoints:
+        new_orphans = {ep for name, ep in before_entries if name == "?"}
+    else:
+        new_orphans = set()
+
+    observed_endpoint = sorted(tracked_endpoints)[0] if tracked_endpoints else (
+        sorted(new_orphans)[0] if new_orphans else None
+    )
+
+    needs_stop = (
+        (not before_ok)
+        or bool(tracked_endpoints)
+        or _session_still_listed(before.stdout, session_name)
+        or session_was_ready
+    )
+    if not needs_stop:
+        if new_orphans:
+            return False, observed_endpoint, sorted(new_orphans)
+        return True, observed_endpoint, []
+
+    stop_res = runner([colab_bin, "--auth", auth, "--config", str(iso_cfg), "stop", "-s", session_name])
     recheck = runner([colab_bin, "--auth", auth, "--config", str(iso_cfg), "sessions"])
-    return recheck.returncode == 0 and not _session_still_listed(recheck.stdout, session_name)
+    if recheck.returncode != 0:
+        return False, observed_endpoint, sorted(tracked_endpoints | new_orphans)
+
+    recheck_entries = _parse_colab_sessions(recheck.stdout)
+    recheck_endpoints: Set[str] = {ep for _, ep in recheck_entries}
+
+    leaked: Set[str] = set()
+    for ep in tracked_endpoints | new_orphans:
+        if ep in recheck_endpoints or _token_present(recheck.stdout, ep):
+            leaked.add(ep)
+    for name, ep in recheck_entries:
+        if name == session_name:
+            leaked.add(ep)
+        elif name == "?" and pre_endpoints is not None and ep not in pre_endpoints:
+            leaked.add(ep)
+        elif name == "?" and pre_endpoints is None and session_was_ready and not tracked_endpoints:
+            leaked.add(ep)
+
+    name_still_listed = _session_still_listed(recheck.stdout, session_name)
+    if leaked or name_still_listed:
+        return False, observed_endpoint, sorted(leaked)
+
+    if stop_res.returncode != 0 and not tracked_endpoints and pre_endpoints is None and recheck_entries:
+        return False, observed_endpoint, []
+
+    return True, observed_endpoint, []
 
 
 def run_colab_tpu_suites(
@@ -1004,6 +1083,15 @@ def run_colab_tpu_suites(
 ) -> Dict[str, Any]:
     remote_suites = [s for s in suites if s in ("compute", "bandwidth")]
     if not remote_suites:
+        if dry_run:
+            return {
+                "colab_meta": {
+                    "status": "dry_run",
+                    "tpu_order": list(tpu_order),
+                    "planned_commands": [],
+                    "note": "No remote Colab suites requested (comms runs locally).",
+                }
+            }
         return {}
 
     if runner is None:
@@ -1050,13 +1138,36 @@ def run_colab_tpu_suites(
 
         attempts: List[Dict[str, Any]] = []
         for idx, (tpu, sess, cmd) in enumerate(planned):
+            pre_res = runner([colab_bin, "--auth", auth, "--config", str(iso_cfg), "sessions"])
+            pre_endpoints: Optional[Set[str]] = (
+                {ep for _, ep in _parse_colab_sessions(pre_res.stdout)}
+                if pre_res.returncode == 0
+                else None
+            )
             res = runner(cmd)
-            teardown_verified = _verify_and_stop_session(runner, colab_bin, auth, iso_cfg, sess)
+            session_was_ready = res.returncode == 0 or "[colab] session ready" in res.stderr.lower()
+            teardown_verified, endpoint, leaked_endpoints = _verify_and_stop_session(
+                runner,
+                colab_bin,
+                auth,
+                iso_cfg,
+                sess,
+                pre_endpoints=pre_endpoints,
+                session_was_ready=session_was_ready,
+            )
+            if not teardown_verified:
+                print(
+                    f"[freetpu-bench] WARNING: Colab teardown unverified for session={sess} "
+                    f"endpoint={endpoint} leaked_endpoints={leaked_endpoints}",
+                    file=sys.stderr,
+                )
             attempts.append({
                 "tpu": tpu,
                 "session": sess,
+                "endpoint": endpoint,
                 "returncode": res.returncode,
                 "teardown_verified": teardown_verified,
+                "leaked_endpoints": leaked_endpoints,
                 "stderr_tail": res.stderr.strip()[-600:],
             })
             if res.returncode == 0:
@@ -1069,15 +1180,18 @@ def run_colab_tpu_suites(
                     "status": "ok",
                     "tpu": tpu,
                     "session": sess,
+                    "endpoint": endpoint,
                     "teardown_verified": teardown_verified,
+                    "leaked_endpoints": leaked_endpoints,
                     "usage_preflight": usage_res.stdout.strip(),
                     "attempts": attempts,
                 }
                 return payload
-            if idx + 1 < len(planned) and is_colab_allocation_error(res.returncode, res.stderr):
+            if idx + 1 < len(planned) and teardown_verified and is_colab_allocation_error(res.returncode, res.stderr):
                 continue
             raise RuntimeError(
-                f"Colab TPU run failed on {tpu} (rc={res.returncode}, teardown_verified={teardown_verified}): {res.stderr.strip()[-600:]}"
+                f"Colab TPU run failed on {tpu} (rc={res.returncode}, teardown_verified={teardown_verified}, "
+                f"leaked_endpoints={leaked_endpoints}): {res.stderr.strip()[-600:]}"
             )
         raise RuntimeError(f"All Colab TPU candidates exhausted: {attempts}")
     finally:
@@ -1087,6 +1201,15 @@ def run_colab_tpu_suites(
 # ---------------------------------------------------------------------------
 # Economics & Scorecard Builder
 # ---------------------------------------------------------------------------
+
+
+def validate_economics_params(model_gb: float, bw_efficiency: float, batch_size: int) -> None:
+    if not math.isfinite(model_gb) or model_gb <= 0.0:
+        raise ValueError(f"--model-gb must be finite and > 0 (got {model_gb!r})")
+    if not math.isfinite(bw_efficiency) or not (0.0 < bw_efficiency <= 1.0):
+        raise ValueError(f"--bw-efficiency must be finite and in (0, 1] (got {bw_efficiency!r})")
+    if batch_size < 1:
+        raise ValueError(f"--batch-size must be >= 1 (got {batch_size!r})")
 
 
 def _compute_economics(
@@ -1099,6 +1222,7 @@ def _compute_economics(
     batch_size: int,
     verified_tok_s: Optional[float] = None,
 ) -> Dict[str, Optional[float]]:
+    validate_economics_params(model_gb, bw_efficiency, batch_size)
     if hourly_cost_usd is None or hourly_cost_usd <= 0.0:
         return {
             "tflops_per_dollar_hr": None,
@@ -1179,6 +1303,7 @@ def build_scorecard_rows(
             mem_str = "host RAM"
 
         bf16_tf = comp.get("peak_bf16_tflops")
+        fp32_tf = comp.get("peak_fp32_tflops")
         int8_tops = comp.get("peak_int8_tops")
         bw_gbps = bw.get("peak_triad_gbps")
         floor_us = comp.get("dispatch_floor_us")
@@ -1198,7 +1323,7 @@ def build_scorecard_rows(
             "row_type": "measured",
             "memory": mem_str,
             "bf16_tflops": bf16_tf,
-            "bf16_is_fp32_ref": backend in ("cpu", "buenos_mock"),
+            "fp32_tflops": fp32_tf,
             "int8_tops": int8_tops,
             "bw_gbps": bw_gbps,
             "dispatch_floor_us": f"{floor_us} us" if floor_us is not None else "—",
@@ -1252,7 +1377,8 @@ def render_markdown(report: Dict[str, Any]) -> str:
     batch_size = econ_cfg.get("batch_size", 1)
     rows = report.get("scorecard") or []
 
-    remote_host = (report.get("colab_meta") or {}).get("remote_host_platform")
+    colab_meta = report.get("colab_meta") or {}
+    remote_host = colab_meta.get("remote_host_platform")
     host_str = (
         f"{report.get('host_platform')} (remote: {remote_host})"
         if remote_host
@@ -1265,15 +1391,35 @@ def render_markdown(report: Dict[str, Any]) -> str:
         f"- **Timestamp (UTC)**: `{report.get('timestamp_utc')}`",
         f"- **Backend**: `{report.get('backend')}` | **Host**: `{host_str}` | **Suites**: `{', '.join(report.get('suites', []))}`",
         "",
+    ]
+
+    if colab_meta.get("status") == "dry_run":
+        planned_cmds = colab_meta.get("planned_commands") or []
+        lines.append("## Planned Colab TPU Commands (Dry Run)")
+        lines.append("")
+        if planned_cmds:
+            lines.append(f"- **TPU fallback order**: `{', '.join(colab_meta.get('tpu_order') or [])}`")
+            lines.append("")
+            lines.append("```bash")
+            for cmd in planned_cmds:
+                lines.append(shlex.join(cmd))
+            lines.append("```")
+        else:
+            lines.append(str(colab_meta.get("note") or "No remote Colab commands planned."))
+        lines.append("")
+
+    lines.extend([
         "## 1. Cross-Hardware Scorecard (`measured` vs `published-reference`)",
         "",
         "| Target | Row Type | Memory | BF16 (TF/s) | INT8 (TOPS) | Mem BW (GB/s) | Dispatch Floor | $/hr | TF/s per $ | Est. $/1M tok |",
         "| --- | --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: |",
-    ]
+    ])
 
     for r in rows:
         if r.get("bf16_tflops") is not None:
-            bf16_s = f"{r['bf16_tflops']:.2f} (fp32)" if r.get("bf16_is_fp32_ref") else f"{r['bf16_tflops']:.2f}"
+            bf16_s = f"{r['bf16_tflops']:.2f}"
+        elif r.get("fp32_tflops") is not None:
+            bf16_s = f"{r['fp32_tflops']:.2f} (fp32)"
         else:
             bf16_s = "—"
         int8_s = f"{r['int8_tops']:.2f}" if r.get("int8_tops") is not None else "—"
@@ -1372,7 +1518,8 @@ def run_self_test() -> int:
     for backend in ("cpu", "buenos_mock"):
         comp = run_compute_local(backend, quick=True)
         assert comp["status"] == "measured"
-        assert comp["peak_bf16_tflops"] > 0
+        assert comp["peak_bf16_tflops"] is None
+        assert comp["peak_fp32_tflops"] > 0
         assert comp["peak_int8_tops"] > 0
         suffix = "ref" if backend == "cpu" else "mock"
         assert any(c["name"] == f"gemm_fp32_{suffix}" and c["dtype"] == "fp32" for c in comp["cases"])
@@ -1385,7 +1532,7 @@ def run_self_test() -> int:
 
     rtx5090 = next(b for b in PUBLISHED_BASELINES if b.target_id == "nvidia_rtx_5090")
     assert rtx5090.peak_bf16_tflops == 209.5
-    assert rtx5090.peak_int8_tops == 419.0
+    assert rtx5090.peak_int8_tops == 838.0
 
     # Comms size-cap & timeout hardening
     c_sock, s_sock = socket.socketpair()
@@ -1458,23 +1605,74 @@ def run_self_test() -> int:
         "comms": comms,
     }
     report["scorecard"] = build_scorecard_rows(report)
-    assert any(r["row_type"] == "measured" for r in report["scorecard"])
+    measured_row = next(r for r in report["scorecard"] if r["row_type"] == "measured")
+    assert measured_row["bf16_tflops"] is None
+    assert measured_row["fp32_tflops"] > 0
+    assert "bf16_is_fp32_ref" not in measured_row
+    rtx5090_row = next(r for r in report["scorecard"] if r["target"] == "NVIDIA RTX 5090")
+    assert rtx5090_row["int8_tops"] == 838.0
+    assert rtx5090_row["int8_tops_per_dollar_hr"] == 1676.0
     assert sum(1 for r in report["scorecard"] if r["row_type"] == "published-reference") == 5
     md = render_markdown(report)
     assert "`measured`" in md and "`published-reference`" in md
+    assert "(fp32)" in md
     assert "Pixel Tensor G5" in md and "Cloud TPU v6e-1" in md and "NVIDIA H100 SXM" in md
 
-    # 4. Verify colab_tpu fallback + marker parsing using an in-memory mock runner
+    # 3b. Verify CLI rejects invalid economics / timeout args BEFORE running any suite or Colab
+    for bad_argv in (
+        ["--model-gb", "0", "--backend", "colab_tpu"],
+        ["--model-gb", "-2.5", "--backend", "cpu"],
+        ["--model-gb", "nan", "--backend", "cpu"],
+        ["--model-gb", "inf", "--backend", "cpu"],
+        ["--bw-efficiency", "0", "--backend", "cpu"],
+        ["--bw-efficiency", "1.5", "--backend", "cpu"],
+        ["--batch-size", "0", "--backend", "cpu"],
+        ["--colab-timeout", "-1", "--backend", "colab_tpu"],
+    ):
+        err_buf = StringIO()
+        try:
+            with redirect_stderr(err_buf):
+                main(bad_argv)
+        except SystemExit as exc:
+            assert exc.code == 2, (bad_argv, exc.code)
+        else:  # pragma: no cover
+            raise AssertionError(f"Expected SystemExit(2) for {bad_argv}")
+
+    # 3c. Verify bare `--backend colab_tpu --dry-run` prints planned commands to stdout without `--json -`
+    dry_buf = StringIO()
+    with redirect_stdout(dry_buf):
+        rc_dry = main(["--suite", "compute,bandwidth", "--backend", "colab_tpu", "--dry-run"])
+    assert rc_dry == 0
+    dry_out = dry_buf.getvalue()
+    assert "Planned Colab TPU Commands (Dry Run)" in dry_out
+    assert "--tpu V6E1" in dry_out and "--tpu V5E1" in dry_out
+    assert "--keep" in dry_out and "--emit-markers" in dry_out
+
+    # 4. Verify colab_tpu fallback + --keep + endpoint-based teardown verification
     calls: List[List[str]] = []
+    v5e_active = {"live": False, "endpoint": "m-s-v5e1-ok"}
 
     def _mock_colab_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess[str]:
         calls.append(list(cmd))
         if "usage" in cmd:
             return subprocess.CompletedProcess(cmd, 0, "Current balance: 100.0 compute units\n", "")
+        if "stop" in cmd:
+            v5e_active["live"] = False
+            return subprocess.CompletedProcess(cmd, 0, "[colab] Session terminated.\n", "")
         if "sessions" in cmd:
-            return subprocess.CompletedProcess(cmd, 0, "No active sessions.\n", "")
+            # Include an unrelated pre-existing runtime to prove we do not false-positive on it.
+            lines = ["[preexisting] m-s-other-99 | Hardware: T4 | Shape: Standard | Variant: GPU"]
+            if v5e_active["live"]:
+                run_calls = [c for c in calls if "run" in c]
+                sname = run_calls[-1][run_calls[-1].index("-s") + 1]
+                lines.append(
+                    f"[{sname}] {v5e_active['endpoint']} | Hardware: V5E1 | Shape: Standard | Variant: TPU"
+                )
+            return subprocess.CompletedProcess(cmd, 0, "\n".join(lines) + "\n", "")
+        assert "--keep" in cmd
         if "V6E1" in cmd:
             return subprocess.CompletedProcess(cmd, 1, "", "HTTP 412 REASON_NO_BACKENDS: v6e1 unavailable")
+        v5e_active["live"] = True
         payload = {
             "schema": SCHEMA_VERSION,
             "device_info": {"device_kind": "TPU v5 lite", "hbm_bytes_limit": 16 * 1024**3},
@@ -1488,7 +1686,7 @@ def run_self_test() -> int:
             },
         }
         out = f"{BENCH_JSON_BEGIN}\n{json.dumps(payload)}\n{BENCH_JSON_END}\n"
-        return subprocess.CompletedProcess(cmd, 0, out, "")
+        return subprocess.CompletedProcess(cmd, 0, out, "[colab] Session READY.\n")
 
     colab_res = run_colab_tpu_suites(
         suites=["compute"],
@@ -1501,43 +1699,122 @@ def run_self_test() -> int:
         runner=_mock_colab_runner,
     )
     assert colab_res["colab_meta"]["tpu"] == "v5e1"
+    assert colab_res["colab_meta"]["endpoint"] == "m-s-v5e1-ok"
     assert colab_res["colab_meta"]["teardown_verified"] is True
+    assert colab_res["colab_meta"]["leaked_endpoints"] == []
     assert colab_res["compute"]["peak_bf16_tflops"] == 179.36
-    assert len(calls) == 5  # usage + v6e1 fail + sessions + v5e1 ok + sessions
+    assert any("stop" in c for c in calls)
+    assert not v5e_active["live"]
 
-    # Leaked session triggers explicit stop -s
-    leaked_calls: List[List[str]] = []
-    session_stopped = {"done": False}
+    # 4b. Unassign failure where local session record is lost and runtime reappears under `[?]`
+    orphan_state = {"stage": "pre", "endpoint": "m-s-leaked-01"}
 
-    def _mock_leaked_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess[str]:
-        leaked_calls.append(list(cmd))
+    def _mock_orphan_leak_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess[str]:
         if "usage" in cmd:
             return subprocess.CompletedProcess(cmd, 0, "100.0\n", "")
+        if "run" in cmd:
+            orphan_state["stage"] = "running"
+            payload = {"schema": SCHEMA_VERSION, "compute": {"peak_bf16_tflops": 1.0}}
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                f"{BENCH_JSON_BEGIN}\n{json.dumps(payload)}\n{BENCH_JSON_END}\n",
+                "[colab] Session READY.\n",
+            )
         if "stop" in cmd:
-            session_stopped["done"] = True
-            return subprocess.CompletedProcess(cmd, 0, "stopped\n", "")
+            orphan_state["stage"] = "orphaned"
+            return subprocess.CompletedProcess(cmd, 1, "", "HTTP 500 unassign failed")
         if "sessions" in cmd:
-            if session_stopped["done"]:
-                return subprocess.CompletedProcess(cmd, 0, "No active sessions.\n", "")
-            # Find session base used in previous run call
-            run_calls = [c for c in leaked_calls if "run" in c]
-            sname = run_calls[-1][run_calls[-1].index("-s") + 1]
-            return subprocess.CompletedProcess(cmd, 0, f"{sname} active\n", "")
-        payload = {"schema": SCHEMA_VERSION, "compute": {"peak_bf16_tflops": 1.0}}
-        return subprocess.CompletedProcess(cmd, 0, f"{BENCH_JSON_BEGIN}\n{json.dumps(payload)}\n{BENCH_JSON_END}\n", "")
+            if orphan_state["stage"] == "pre":
+                return subprocess.CompletedProcess(cmd, 0, "[colab] No active sessions found on server.\n", "")
+            if orphan_state["stage"] == "running":
+                # Local state still maps session -> endpoint before stop
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    f"[?] {orphan_state['endpoint']} | Hardware: V5E1 | Shape: Standard | Variant: TPU\n",
+                    "",
+                )
+            # After failed unassign, backend still lists the runtime under `[?]`
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                f"[?] {orphan_state['endpoint']} | Hardware: V5E1 | Shape: Standard | Variant: TPU\n",
+                "",
+            )
+        raise AssertionError(f"Unexpected cmd: {cmd}")
 
-    leaked_res = run_colab_tpu_suites(
-        suites=["compute"],
-        quick=True,
-        colab_bin="colab",
-        auth="adc",
-        tpu_order=("v5e1",),
-        config_path=None,
-        timeout_s=120.0,
-        runner=_mock_leaked_runner,
-    )
-    assert session_stopped["done"] is True
-    assert leaked_res["colab_meta"]["teardown_verified"] is True
+    warn_buf = StringIO()
+    with redirect_stderr(warn_buf):
+        orphan_res = run_colab_tpu_suites(
+            suites=["compute"],
+            quick=True,
+            colab_bin="colab",
+            auth="adc",
+            tpu_order=("v5e1",),
+            config_path=None,
+            timeout_s=120.0,
+            runner=_mock_orphan_leak_runner,
+        )
+    assert orphan_res["colab_meta"]["teardown_verified"] is False
+    assert orphan_res["colab_meta"]["leaked_endpoints"] == ["m-s-leaked-01"]
+    assert "teardown unverified" in warn_buf.getvalue()
+
+    # 4c. Mapped session before stop -> unassign fails -> reappears under `[?]` -> MUST fail verification
+    mapped_calls: List[List[str]] = []
+    mapped_stage = {"step": "pre", "endpoint": "m-s-mapped-leak"}
+
+    def _mock_mapped_leak_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        mapped_calls.append(list(cmd))
+        if "usage" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "100.0\n", "")
+        if "run" in cmd:
+            mapped_stage["step"] = "post_run"
+            payload = {"schema": SCHEMA_VERSION, "compute": {"peak_bf16_tflops": 1.0}}
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                f"{BENCH_JSON_BEGIN}\n{json.dumps(payload)}\n{BENCH_JSON_END}\n",
+                "[colab] Session READY.\n",
+            )
+        if "stop" in cmd:
+            mapped_stage["step"] = "post_stop_orphaned"
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        if "sessions" in cmd:
+            if mapped_stage["step"] == "pre":
+                return subprocess.CompletedProcess(cmd, 0, "[colab] No active sessions found on server.\n", "")
+            if mapped_stage["step"] == "post_run":
+                run_calls = [c for c in mapped_calls if "run" in c]
+                sname = run_calls[-1][run_calls[-1].index("-s") + 1]
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    f"[{sname}] {mapped_stage['endpoint']} | Hardware: V5E1 | Shape: Standard | Variant: TPU\n",
+                    "",
+                )
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                f"[?] {mapped_stage['endpoint']} | Hardware: V5E1 | Shape: Standard | Variant: TPU\n",
+                "",
+            )
+        raise AssertionError(f"Unexpected cmd: {cmd}")
+
+    warn_buf2 = StringIO()
+    with redirect_stderr(warn_buf2):
+        mapped_res = run_colab_tpu_suites(
+            suites=["compute"],
+            quick=True,
+            colab_bin="colab",
+            auth="adc",
+            tpu_order=("v5e1",),
+            config_path=None,
+            timeout_s=120.0,
+            runner=_mock_mapped_leak_runner,
+        )
+    assert mapped_res["colab_meta"]["endpoint"] == "m-s-mapped-leak"
+    assert mapped_res["colab_meta"]["teardown_verified"] is False
+    assert mapped_res["colab_meta"]["leaked_endpoints"] == ["m-s-mapped-leak"]
 
     print(
         json.dumps(
@@ -1593,11 +1870,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.self_test:
         return run_self_test()
 
+    if not (0 <= args.comms_port <= 65535):
+        parser.error(f"--comms-port must be in 0..65535 (got {args.comms_port!r})")
+
     if args.comms_server:
         run_comms_server(args.comms_host, args.comms_port)
         return 0
 
-    suites = parse_suites(args.suite)
+    try:
+        validate_economics_params(args.model_gb, args.bw_efficiency, args.batch_size)
+        suites = parse_suites(args.suite)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    if not math.isfinite(args.colab_timeout) or args.colab_timeout < 0.0:
+        parser.error(f"--colab-timeout must be finite and >= 0 (got {args.colab_timeout!r})")
     report: Dict[str, Any] = {
         "schema": SCHEMA_VERSION,
         "timestamp_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
