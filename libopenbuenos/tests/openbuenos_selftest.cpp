@@ -1625,6 +1625,128 @@ int run_test_swiglu(int iters, int perf_mode, const char* dive_interp_path,
   return all_ok ? 0 : 1;
 }
 
+int run_test_w8a16(int iters, int perf_mode, const char* dive_interp_path, bool mock, bool profile) {
+  ob_config_t cfg = ob_config_default();
+  cfg.mock_mode = mock ? 1 : 0;
+  cfg.max_inflight = 16u;
+  cfg.graph_cache_capacity = 64u;
+  if (perf_mode >= 0) cfg.perf_mode = static_cast<uint32_t>(perf_mode);
+
+  ob_context_t* ctx = nullptr;
+  ob_status_t st = ob_context_create(&cfg, &ctx);
+  if (st != OB_OK || !ctx) {
+    std::fprintf(stderr, "w8a16 ob_context_create failed: %s\n", ob_status_string(st));
+    return 1;
+  }
+  if (profile) ob_context_set_profile(ctx, 1);
+  st = ob_gemm_register_builtin_emitter(ctx, dive_interp_path);
+  if (st != OB_OK) {
+    std::fprintf(stderr, "w8a16 register_builtin_emitter failed: %s (%s)\n",
+                 ob_status_string(st), ob_context_last_error(ctx));
+    ob_context_destroy(ctx);
+    return 1;
+  }
+
+  struct W8A16Case {
+    const char* label;
+    uint32_t K;
+    uint32_t N;
+    float spike_val;
+    uint32_t seed;
+  };
+  const W8A16Case cases[] = {
+      {"pt_1x1536x1536",           1536u, 1536u,     0.0f, 8401u},
+      {"pt_1x2048x2048",           2048u, 2048u,     0.0f, 8402u},
+      {"pt_1x1536x2048",           1536u, 2048u,     0.0f, 8403u},
+      {"pt_1x2048x1536",           2048u, 1536u,     0.0f, 8404u},
+      {"pt_1x1024x1024",           1024u, 1024u,     0.0f, 8405u},
+      {"pt_1x512x512",              512u,  512u,     0.0f, 8406u},
+      {"pt_1x1536x1536_spike75",   1536u, 1536u,    75.0f, 8407u},
+      {"pt_1x1536x1536_prescale50k", 1536u, 1536u, 50000.0f, 8408u},
+  };
+
+  bool all_ok = true;
+  for (const W8A16Case& tc : cases) {
+    uint64_t rng = 0x5738413600000000ULL ^ tc.seed;
+    auto next_u32 = [&]() -> uint32_t {
+      rng ^= rng << 13;
+      rng ^= rng >> 7;
+      rng ^= rng << 17;
+      return static_cast<uint32_t>(rng);
+    };
+    auto next_norm = [&]() -> float {
+      float sum = 0.0f;
+      for (int i = 0; i < 6; ++i) {
+        sum += static_cast<float>(next_u32() & 0xFFFFu) / 65536.0f - 0.5f;
+      }
+      return sum * 1.41421356f;
+    };
+
+    std::vector<float> a(tc.K);
+    for (uint32_t k = 0u; k < tc.K; ++k) a[k] = next_norm() * 0.7f;
+    if (tc.spike_val > 0.0f) {
+      a[17u] = tc.spike_val;
+      a[313u] = -tc.spike_val * 0.85f;
+      a[tc.K - 19u] = tc.spike_val * 0.6f;
+    }
+
+    std::vector<int8_t> w(static_cast<size_t>(tc.N) * tc.K);
+    for (size_t i = 0u; i < w.size(); ++i) {
+      int v = static_cast<int>(next_u32() % 255u) - 127;
+      w[i] = static_cast<int8_t>(v);
+    }
+    std::vector<float> sb(tc.N);
+    for (uint32_t n = 0u; n < tc.N; ++n) {
+      sb[n] = 0.005f + 0.025f * (static_cast<float>(next_u32() & 0x3FFu) / 1024.0f);
+    }
+
+    // Exact FP64 reference: sum_k a[k] * (w[n, k] * sb[n])
+    std::vector<double> ref(tc.N, 0.0);
+    for (uint32_t n = 0u; n < tc.N; ++n) {
+      const int8_t* wrow = w.data() + static_cast<size_t>(n) * tc.K;
+      double acc = 0.0;
+      for (uint32_t k = 0u; k < tc.K; ++k) {
+        acc += static_cast<double>(a[k]) * static_cast<double>(wrow[k]);
+      }
+      ref[n] = acc * static_cast<double>(sb[n]);
+    }
+
+    std::vector<float> out(tc.N, 0.0f);
+    ob_invoke_stats_t sc{}, sw{};
+    st = ob_gemm_matmul_f32_w8a16_tile(ctx, a.data(), w.data(), sb.data(), tc.K, tc.N, out.data(), &sc);
+    for (int it = 0; st == OB_OK && it < std::max(1, iters); ++it) {
+      st = ob_gemm_matmul_f32_w8a16_tile(ctx, a.data(), w.data(), sb.data(), tc.K, tc.N, out.data(), &sw);
+    }
+
+    bool finite_ok = true;
+    double err_sq = 0.0, ref_sq = 0.0;
+    for (uint32_t n = 0u; n < tc.N; ++n) {
+      if (!std::isfinite(out[n])) finite_ok = false;
+      const double d = static_cast<double>(out[n]) - ref[n];
+      err_sq += d * d;
+      ref_sq += ref[n] * ref[n];
+    }
+    const double rel_l2 = std::sqrt(err_sq) / std::max(std::sqrt(ref_sq), 1e-12);
+    const double gbps = (sw.hw_execution_us > 0u)
+        ? (static_cast<double>(static_cast<size_t>(tc.K) * tc.N) /
+           (static_cast<double>(sw.hw_execution_us) * 1e3))
+        : 0.0;
+    const bool ok = (st == OB_OK) && finite_ok && (rel_l2 < 5e-4);
+    if (!ok) all_ok = false;
+    std::printf("w8a16[%s]: ok=%d pm=%u wl=%d hit=%u cold_us=%llu hw_us=%llu wall_us=%llu gbps=%.2f relL2=%.3e\n",
+                tc.label, ok ? 1 : 0, ctx->cfg.perf_mode, ctx->fw_wakelock_held ? 1 : 0,
+                sw.cache_hits,
+                static_cast<unsigned long long>(sc.wall_time_us),
+                static_cast<unsigned long long>(sw.hw_execution_us),
+                static_cast<unsigned long long>(sw.wall_time_us),
+                gbps, rel_l2);
+  }
+
+  if (profile) print_profile_line("w8a16", ctx);
+  ob_context_destroy(ctx);
+  return all_ok ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1636,6 +1758,7 @@ int main(int argc, char** argv) {
   bool test_outlier_spike = false;
   bool test_quant_batch = false;
   bool test_swiglu = false;
+  bool test_w8a16 = false;
   uint32_t gemm_m = 0u, gemm_k = 0u, gemm_n = 0u;
   const char* dive_interp_path = nullptr;
   const char* dgc0_path = nullptr;
@@ -1659,6 +1782,8 @@ int main(int argc, char** argv) {
       test_quant_batch = true;
     } else if (std::strcmp(argv[i], "--test-swiglu") == 0) {
       test_swiglu = true;
+    } else if (std::strcmp(argv[i], "--test-w8a16") == 0) {
+      test_w8a16 = true;
     } else if (std::strcmp(argv[i], "--emit-gemm") == 0 && i + 3 < argc) {
       emit_gemm = true;
       gemm_m = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
@@ -1689,6 +1814,10 @@ int main(int argc, char** argv) {
       print_usage(argv[0]);
       return 2;
     }
+  }
+
+  if (test_w8a16) {
+    return run_test_w8a16(iters, perf_mode, dive_interp_path, mock, profile);
   }
 
   if (test_swiglu) {

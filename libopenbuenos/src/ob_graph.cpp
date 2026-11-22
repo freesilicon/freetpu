@@ -199,7 +199,7 @@ ob_status_t upload_and_register_graph(ob_context* ctx,
     if (st != OB_OK) break;
 
     st = ob_buffer_alloc(ctx, static_cast<size_t>(parsed.ext_dive_vm_ir.size),
-                         OB_BUF_BIDIRECTIONAL | OB_BUF_ZERO_INIT, &e->vm_ir_buf);
+                         OB_BUF_BIDIRECTIONAL, &e->vm_ir_buf);
     if (st != OB_OK) break;
     st = ob_buffer_write(e->vm_ir_buf, blob + parsed.ext_dive_vm_ir.offset,
                          static_cast<size_t>(parsed.ext_dive_vm_ir.size), 0u);
@@ -242,7 +242,7 @@ ob_status_t upload_and_register_graph(ob_context* ctx,
       break;
     }
 
-    st = ob_buffer_alloc(ctx, inner_reg_len, OB_BUF_BIDIRECTIONAL | OB_BUF_ZERO_INIT, &e->reg_cmd_buf);
+    st = ob_buffer_alloc(ctx, inner_reg_len, OB_BUF_BIDIRECTIONAL, &e->reg_cmd_buf);
     if (st != OB_OK) break;
     st = ob_buffer_write(e->reg_cmd_buf, inner_reg, inner_reg_len, 0u);
     if (st != OB_OK) break;

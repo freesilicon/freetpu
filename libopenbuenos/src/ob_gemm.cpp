@@ -24,6 +24,9 @@ inline uint32_t align_up_u32(uint32_t v, uint32_t a) {
 }
 
 inline float fp16_to_fp32(uint16_t h) {
+#if defined(__ARM_NEON) && defined(__aarch64__)
+  return vgetq_lane_f32(vcvt_f32_f16(vreinterpret_f16_u16(vdup_n_u16(h))), 0);
+#else
   uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
   uint32_t exp = (h >> 10) & 0x1fu;
   uint32_t mant = h & 0x03ffu;
@@ -52,6 +55,7 @@ inline float fp16_to_fp32(uint16_t h) {
   float out = 0.0f;
   std::memcpy(&out, &bits, sizeof(out));
   return out;
+#endif
 }
 
 inline int8_t quant_sym_i8(float x) {
@@ -309,6 +313,7 @@ void weight_cache_evict_locked(ob_context* ctx, size_t incoming_bytes) {
     ctx->weight_cache_map.erase(victim->key);
     const size_t victim_total = victim->ext2_bytes + victim->outlier_cols_bytes;
     ctx->weight_cache_bytes -= std::min(ctx->weight_cache_bytes, victim_total);
+    ctx->outlier_cache_bytes -= std::min(ctx->outlier_cache_bytes, victim->outlier_cols_bytes);
     it = ctx->weight_cache_lru.erase(erase_it);
     if (victim->ext2_buf) ob_buffer_free(victim->ext2_buf);
     delete victim;
@@ -345,55 +350,53 @@ uint32_t quant_scale_D_grid_impl(double raw_d) {
   return static_cast<uint32_t>(d);
 }
 
-// Compute token-invariant integer scale ratio D (1/8-octave ceiling) solely from
-// the static quantized weight tile b_tile[tn, tk] so Tensor G5 real_mul = 1/D
-// avoids int8 clipping ([-128, 127]) while keeping quantized NMSE < 5e-4 (uniform)
-// and < 1e-3 (Gaussian).
-uint32_t compute_tile_scale_D_impl(const int8_t* b_tile, uint32_t tn, uint32_t tk,
-                                   uint32_t stride_k, int32_t zp_a) {
-  double max_l2 = 0.0;
-  uint64_t max_l1 = 0ULL;
-  uint64_t max_abs_sum = 0ULL;
+struct RowNormStats {
+  double l2 = 0.0;
+  uint64_t l1 = 0ULL;
+  uint64_t asum = 0ULL;
+};
 
-  for (uint32_t ni = 0; ni < tn; ++ni) {
-    const int8_t* row = b_tile + static_cast<size_t>(ni) * stride_k;
-    uint64_t sq = 0ULL;
-    uint64_t l1 = 0ULL;
-    int64_t ssum = 0LL;
-    uint32_t ki = 0u;
+inline RowNormStats compute_row_norm_stats(const int8_t* row, uint32_t tk) {
+  uint64_t sq = 0ULL;
+  uint64_t l1 = 0ULL;
+  int64_t ssum = 0LL;
+  uint32_t ki = 0u;
 #if defined(__ARM_NEON) && defined(__aarch64__)
-    uint32x4_t v_sq = vdupq_n_u32(0u);
-    uint32x4_t v_l1 = vdupq_n_u32(0u);
-    int32x4_t v_ss = vdupq_n_s32(0);
-    for (; ki + 16u <= tk; ki += 16u) {
-      int8x16_t v = vld1q_s8(row + ki);
-      int16x8_t lo = vmull_s8(vget_low_s8(v), vget_low_s8(v));
-      int16x8_t hi = vmull_high_s8(v, v);
-      v_sq = vpadalq_u16(v_sq, vreinterpretq_u16_s16(lo));
-      v_sq = vpadalq_u16(v_sq, vreinterpretq_u16_s16(hi));
+  uint32x4_t v_sq = vdupq_n_u32(0u);
+  uint32x4_t v_l1 = vdupq_n_u32(0u);
+  int32x4_t v_ss = vdupq_n_s32(0);
+  for (; ki + 16u <= tk; ki += 16u) {
+    int8x16_t v = vld1q_s8(row + ki);
+    int16x8_t lo = vmull_s8(vget_low_s8(v), vget_low_s8(v));
+    int16x8_t hi = vmull_high_s8(v, v);
+    v_sq = vpadalq_u16(v_sq, vreinterpretq_u16_s16(lo));
+    v_sq = vpadalq_u16(v_sq, vreinterpretq_u16_s16(hi));
 
-      // ABS(-128) = 0x80 == 128u when reinterpreted as uint8: exact |v| for all int8!
-      uint8x16_t av = vreinterpretq_u8_s8(vabsq_s8(v));
-      v_l1 = vpadalq_u16(v_l1, vpaddlq_u8(av));
-      v_ss = vpadalq_s16(v_ss, vpaddlq_s8(v));
-    }
-    sq = static_cast<uint64_t>(vaddvq_u32(v_sq));
-    l1 = static_cast<uint64_t>(vaddvq_u32(v_l1));
-    ssum = static_cast<int64_t>(vaddvq_s32(v_ss));
-#endif
-    for (; ki < tk; ++ki) {
-      int32_t v = static_cast<int32_t>(row[ki]);
-      sq += static_cast<uint64_t>(v * v);
-      l1 += static_cast<uint64_t>(v < 0 ? -v : v);
-      ssum += static_cast<int64_t>(v);
-    }
-    double l2 = std::sqrt(static_cast<double>(sq));
-    uint64_t asum = static_cast<uint64_t>(ssum < 0 ? -ssum : ssum);
-    if (l2 > max_l2) max_l2 = l2;
-    if (l1 > max_l1) max_l1 = l1;
-    if (asum > max_abs_sum) max_abs_sum = asum;
+    // ABS(-128) = 0x80 == 128u when reinterpreted as uint8: exact |v| for all int8!
+    uint8x16_t av = vreinterpretq_u8_s8(vabsq_s8(v));
+    v_l1 = vpadalq_u16(v_l1, vpaddlq_u8(av));
+    v_ss = vpadalq_s16(v_ss, vpaddlq_s8(v));
   }
+  sq = static_cast<uint64_t>(vaddvq_u32(v_sq));
+  l1 = static_cast<uint64_t>(vaddvq_u32(v_l1));
+  ssum = static_cast<int64_t>(vaddvq_s32(v_ss));
+#endif
+  for (; ki < tk; ++ki) {
+    int32_t v = static_cast<int32_t>(row[ki]);
+    sq += static_cast<uint64_t>(v * v);
+    l1 += static_cast<uint64_t>(v < 0 ? -v : v);
+    ssum += static_cast<int64_t>(v);
+  }
+  RowNormStats st{};
+  st.l2 = std::sqrt(static_cast<double>(sq));
+  st.l1 = l1;
+  st.asum = static_cast<uint64_t>(ssum < 0 ? -ssum : ssum);
+  return st;
+}
 
+inline uint32_t compute_scale_D_from_maxima(double max_l2, uint64_t max_l1,
+                                            uint64_t max_abs_sum, uint32_t tk,
+                                            int32_t zp_a) {
   if (max_l1 == 0ULL) return 1u;
 
   double zp_scale = 1.0 + static_cast<double>(zp_a < 0 ? -zp_a : zp_a) / 128.0;
@@ -407,6 +410,27 @@ uint32_t compute_tile_scale_D_impl(const int8_t* b_tile, uint32_t tn, uint32_t t
   double stat_est = std::max(2.55 * max_l2, dc_guard) * zp_scale;
   double raw_d = std::min(hard_cap, stat_est);
   return quant_scale_D_grid_impl(raw_d);
+}
+
+// Compute token-invariant integer scale ratio D (1/8-octave ceiling) solely from
+// the static quantized weight tile b_tile[tn, tk] so Tensor G5 real_mul = 1/D
+// avoids int8 clipping ([-128, 127]) while keeping quantized NMSE < 5e-4 (uniform)
+// and < 1e-3 (Gaussian).
+uint32_t compute_tile_scale_D_impl(const int8_t* b_tile, uint32_t tn, uint32_t tk,
+                                   uint32_t stride_k, int32_t zp_a) {
+  double max_l2 = 0.0;
+  uint64_t max_l1 = 0ULL;
+  uint64_t max_abs_sum = 0ULL;
+
+  for (uint32_t ni = 0; ni < tn; ++ni) {
+    const RowNormStats st = compute_row_norm_stats(
+        b_tile + static_cast<size_t>(ni) * stride_k, tk);
+    if (st.l2 > max_l2) max_l2 = st.l2;
+    if (st.l1 > max_l1) max_l1 = st.l1;
+    if (st.asum > max_abs_sum) max_abs_sum = st.asum;
+  }
+
+  return compute_scale_D_from_maxima(max_l2, max_l1, max_abs_sum, tk, zp_a);
 }
 
 // Persistent pre-mapped bidirectional pipeline DMA-BUF allocator:
@@ -467,30 +491,20 @@ ob_status_t ensure_pipeline_buf_tiered(ob_context* ctx,
   return st;
 }
 
-inline void neon_fma_row_f32(float* dst, const float* src, uint32_t count, float scale) {
-  uint32_t i = 0u;
-#if defined(__ARM_NEON) && defined(__aarch64__)
-  const float32x4_t vs = vdupq_n_f32(scale);
-  for (; i + 16u <= count; i += 16u) {
-    vst1q_f32(dst + i,       vfmaq_f32(vld1q_f32(dst + i),       vld1q_f32(src + i),       vs));
-    vst1q_f32(dst + i + 4u,  vfmaq_f32(vld1q_f32(dst + i + 4u),  vld1q_f32(src + i + 4u),  vs));
-    vst1q_f32(dst + i + 8u,  vfmaq_f32(vld1q_f32(dst + i + 8u),  vld1q_f32(src + i + 8u),  vs));
-    vst1q_f32(dst + i + 12u, vfmaq_f32(vld1q_f32(dst + i + 12u), vld1q_f32(src + i + 12u), vs));
-  }
-  for (; i + 4u <= count; i += 4u) {
-    vst1q_f32(dst + i, vfmaq_f32(vld1q_f32(dst + i), vld1q_f32(src + i), vs));
-  }
-#endif
-  for (; i < count; ++i) {
-    dst[i] += scale * src[i];
-  }
-}
-
 // Half-octave scale grid (2^(k/2), step sqrt(2) ~= 1.414x): guarantees s_gate = s_a * s_wg * d_gate
 // lands EXACT on 2^(k/2) (0.000% SiLU scale mismatch) with only ~5-8 distinct s_gate values per model!
 inline float quantize_scale_pow2_2nd_up(float raw_s) {
   if (raw_s <= 0.0f) return 0.0f;
   double e = std::ceil(2.0 * std::log2(static_cast<double>(raw_s)));
+  return static_cast<float>(std::exp2(e * 0.5));
+}
+
+// Canonicalize a product of 2^(1/2)-grid scales (e.g. s_a * s_wg * d_gate) to the
+// exact nearest IEEE-754 float on the 2^(1/2) lattice so (odd, odd) and (even, even)
+// exponents hash to the identical Probe-A SwiGLU graph key (no 1-ULP cache split).
+inline float snap_scale_pow2_2nd_nearest(float raw_s) {
+  if (raw_s <= 0.0f) return 0.0f;
+  double e = std::round(2.0 * std::log2(static_cast<double>(raw_s)));
   return static_cast<float>(std::exp2(e * 0.5));
 }
 
@@ -503,45 +517,18 @@ inline uint32_t round_pow2_clamped(double val, uint32_t lo, uint32_t hi, double 
   return p;
 }
 
-void compute_matrix_row_l2_stats(const int8_t* mat, uint32_t rows, uint32_t cols, uint32_t stride,
-                                 float* out_max_l2, float* out_mean_l2,
-                                 float* out_max_abs_sum = nullptr) {
-  double max_l2 = 0.0;
-  double sum_l2 = 0.0;
-  double max_abs_sum = 0.0;
-  for (uint32_t r = 0u; r < rows; ++r) {
-    const int8_t* row = mat + static_cast<size_t>(r) * stride;
-    uint64_t sq = 0ULL;
-    int64_t row_sum = 0LL;
-    uint32_t c = 0u;
-#if defined(__ARM_NEON) && defined(__aarch64__)
-    uint32x4_t v_sq = vdupq_n_u32(0u);
-    int32x4_t v_sum = vdupq_n_s32(0);
-    for (; c + 16u <= cols; c += 16u) {
-      int8x16_t v = vld1q_s8(row + c);
-      int16x8_t lo = vmull_s8(vget_low_s8(v), vget_low_s8(v));
-      int16x8_t hi = vmull_high_s8(v, v);
-      v_sq = vpadalq_u16(v_sq, vreinterpretq_u16_s16(lo));
-      v_sq = vpadalq_u16(v_sq, vreinterpretq_u16_s16(hi));
-      v_sum = vaddq_s32(v_sum, vpaddlq_s16(vpaddlq_s8(v)));
-    }
-    sq = static_cast<uint64_t>(vaddvq_u32(v_sq));
-    row_sum = static_cast<int64_t>(vaddvq_s32(v_sum));
-#endif
-    for (; c < cols; ++c) {
-      const int32_t v = static_cast<int32_t>(row[c]);
-      sq += static_cast<uint64_t>(v * v);
-      row_sum += static_cast<int64_t>(v);
-    }
-    const double l2 = std::sqrt(static_cast<double>(sq));
-    const double abs_sum = std::fabs(static_cast<double>(row_sum));
-    if (l2 > max_l2) max_l2 = l2;
-    if (abs_sum > max_abs_sum) max_abs_sum = abs_sum;
-    sum_l2 += l2;
+// 1.5x-step geometric grid {lo, 1.5*lo, 2*lo, 3*lo, ...} for batched M=64 SwiGLU d_mul/d_down
+// (eliminates 2x octave over-division quantization loss while preserving zero-clip headroom).
+inline uint32_t round_1p5_grid_clamped(double val, uint32_t lo, uint32_t hi) {
+  if (!(val > 0.0)) return lo;
+  uint32_t p = lo;
+  while (p < hi) {
+    if (val <= static_cast<double>(p) * 1.18) return p;
+    const uint32_t mid = p + (p >> 1u);
+    if (mid <= hi && val <= static_cast<double>(mid) * 1.14) return mid;
+    p <<= 1u;
   }
-  *out_max_l2 = static_cast<float>(max_l2);
-  *out_mean_l2 = (rows > 0u) ? static_cast<float>(sum_l2 / static_cast<double>(rows)) : 0.0f;
-  if (out_max_abs_sum) *out_max_abs_sum = static_cast<float>(max_abs_sum);
+  return hi;
 }
 
 void compute_swiglu_stage_dividers_impl(uint32_t m_dim,
@@ -555,7 +542,7 @@ void compute_swiglu_stage_dividers_impl(uint32_t m_dim,
                                         uint32_t* out_d_down) {
   const bool is_batched = (m_dim > 1u);
   // Collapse continuous M=1 token rms_a into 3 geometric buckets calibrated for 2^(1/2) s_a
-  // and pin all 4 dividers to pure powers of 2 -> cuts Probe-A SwiGLU graphs across 30L x 64T
+  // and pin M=1 dividers to pure powers of 2 -> cuts Probe-A SwiGLU graphs across 30L x 64T
   // from ~1,344 down to ~45-85 (well below kDefaultGraphCacheCapacity=512, zero evictions!)
   // while keeping NMSE < 3e-3 across Gaussian & real heavy-tailed LLM activation crests.
   double ra = 0.0;
@@ -570,20 +557,31 @@ void compute_swiglu_stage_dividers_impl(uint32_t m_dim,
   } else {
     ra = static_cast<double>(rms_a);
   }
-  const double sig_gu = is_batched ? 4.0 : 3.65;
-  const uint32_t d_gate = round_pow2_clamped((sig_gu * ra * static_cast<double>(l2_g_max)) / 127.0, 64u, 65536u, 1.42);
-  const uint32_t d_up = round_pow2_clamped((sig_gu * ra * static_cast<double>(l2_u_max)) / 127.0, 64u, 65536u, 1.42);
+  const double sig_gu = is_batched ? 3.85 : 3.65;
+  const double gu_thresh = is_batched ? 1.45 : 1.42;
+  const uint32_t d_gate = round_pow2_clamped((sig_gu * ra * static_cast<double>(l2_g_max)) / 127.0, 64u, 65536u, gu_thresh);
+  const uint32_t d_up = round_pow2_clamped((sig_gu * ra * static_cast<double>(l2_u_max)) / 127.0, 64u, 65536u, gu_thresh);
   const double rms_qg = (ra * static_cast<double>(l2_g_mean)) / static_cast<double>(d_gate);
   const double rms_qu = (ra * static_cast<double>(l2_u_mean)) / static_cast<double>(d_up);
-  // Deterministic per-(layer, ra_bucket) d_mul in {16, 32, 64} -> zero q_prod clip, zero per-token fan-out!
-  const double dm_div = is_batched ? 13.0 : 18.0;
-  const uint32_t d_mul = round_pow2_clamped((rms_qg * rms_qu) / dm_div, 16u, 64u, 1.38);
+  // M=1 uses pure PoT d_mul/d_down for minimal Probe-A graph cache footprint;
+  // M=64 batched prefill uses 1.5x-step d_mul/d_down so q_prod/q_out avoid 2x over-division
+  // and stay well under 3.5e-3 NMSE (8/8 selftest --test-swiglu PASS) with zero sat_retries!
+  uint32_t d_mul = 0u;
+  if (is_batched) {
+    d_mul = round_1p5_grid_clamped((rms_qg * rms_qu) / 16.0, 16u, 128u);
+  } else {
+    d_mul = round_pow2_clamped((rms_qg * rms_qu) / 18.0, 16u, 64u, 1.38);
+  }
   const double rms_qprod = std::max<double>((0.68 * rms_qg * rms_qu) / static_cast<double>(d_mul), 2.0);
-  // Heavy-tailed real LLM down-projection headroom -> eliminates live sat_retries!
-  const double sig_down = is_batched ? 5.8 : 5.6;
-  const double dd_thresh = is_batched ? 1.40 : 1.38;
-  const uint32_t d_down = round_pow2_clamped(
-      (sig_down * rms_qprod * static_cast<double>(l2_d_max)) / 127.0, 256u, 4096u, dd_thresh);
+  uint32_t d_down = 0u;
+  if (is_batched) {
+    d_down = round_1p5_grid_clamped(
+        (4.6 * rms_qprod * static_cast<double>(l2_d_max)) / 127.0, 256u, 4096u);
+  } else {
+    // Heavy-tailed real LLM M=1 decode down-projection headroom -> eliminates live sat_retries!
+    d_down = round_pow2_clamped(
+        (5.6 * rms_qprod * static_cast<double>(l2_d_max)) / 127.0, 256u, 4096u, 1.38);
+  }
   *out_d_gate = d_gate;
   *out_d_up = d_up;
   *out_d_mul = d_mul;
@@ -629,6 +627,96 @@ ob_status_t acquire_swiglu_entry(ob_context* ctx,
   }
   return graph_register_dgc0_internal(
       ctx, dgc0.data(), dgc0.size(), cache_key, true, out_entry, out_cache_hit);
+}
+
+uint64_t hash_w8a16_shape_key(uint32_t hw_k, uint32_t hw_n, float pt_scale, uint32_t slot_id) {
+  uint32_t sc_bits = 0u;
+  std::memcpy(&sc_bits, &pt_scale, sizeof(sc_bits));
+  uint32_t hdr[5] = {0x57384136u, hw_k, hw_n, sc_bits, slot_id};
+  uint64_t h = fast_hash64_update(0x57384131365F5054ULL, hdr, sizeof(hdr));
+  return h ? h : 1ULL;
+}
+
+ob_status_t acquire_w8a16_pt_1x_entry(ob_context* ctx,
+                                      uint32_t hw_k,
+                                      uint32_t hw_n,
+                                      float pt_scale,
+                                      uint32_t slot_id,
+                                      CachedGraph** out_entry,
+                                      bool* out_cache_hit) {
+  *out_entry = nullptr;
+  *out_cache_hit = false;
+  if (!ctx->builtin_emitter_active || ctx->builtin_dive_interp.empty()) {
+    return OB_ERR_UNSUPPORTED;
+  }
+  const uint64_t cache_key = hash_w8a16_shape_key(hw_k, hw_n, pt_scale, slot_id);
+  if (graph_cache_lookup_entry_u64(ctx, cache_key, out_entry)) {
+    *out_cache_hit = true;
+    return OB_OK;
+  }
+  std::vector<uint8_t> dgc0;
+  std::string err;
+  ob_status_t st = build_dgc0_w8a16_pt_1x(
+      hw_k, hw_n, pt_scale, nullptr,
+      ctx->builtin_dive_interp.data(), ctx->builtin_dive_interp.size(),
+      &dgc0, &err);
+  if (st != OB_OK) {
+    if (!err.empty()) set_last_error(ctx, err);
+    return st;
+  }
+  return graph_register_dgc0_internal(
+      ctx, dgc0.data(), dgc0.size(), cache_key, true, out_entry, out_cache_hit);
+}
+
+// Prepare FP32 input row for native W8A16(FP16) with power-of-2 prescale guard
+// preventing IEEE FP16 input saturation (max finite 65504.0f -> guard threshold 32768.0f).
+// Returns prescale_inv (= 1.0f in the common case when max(|a|) <= 32768.0f).
+float prepare_w8a16_input_row_f32(const float* a_row,
+                                  uint32_t tk,
+                                  uint32_t hw_k,
+                                  float* dst_row) {
+  float amax = 0.0f;
+  uint32_t ki = 0u;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+  float32x4_t v_am0 = vdupq_n_f32(0.0f);
+  float32x4_t v_am1 = vdupq_n_f32(0.0f);
+  for (; ki + 8u <= tk; ki += 8u) {
+    v_am0 = vmaxq_f32(v_am0, vabsq_f32(vld1q_f32(a_row + ki)));
+    v_am1 = vmaxq_f32(v_am1, vabsq_f32(vld1q_f32(a_row + ki + 4u)));
+  }
+  amax = vmaxvq_f32(vmaxq_f32(v_am0, v_am1));
+#endif
+  for (; ki < tk; ++ki) {
+    const float av = std::fabs(a_row[ki]);
+    if (av > amax) amax = av;
+  }
+
+  float prescale_inv = 1.0f;
+  if (amax > 32768.0f) {
+    int exp2_shift = 0;
+    float scaled_am = amax;
+    while (scaled_am > 16384.0f && exp2_shift < 64) {
+      scaled_am *= 0.5f;
+      ++exp2_shift;
+    }
+    const float prescale = std::ldexp(1.0f, -exp2_shift);
+    prescale_inv = std::ldexp(1.0f, exp2_shift);
+    uint32_t i = 0u;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    const float32x4_t v_ps = vdupq_n_f32(prescale);
+    for (; i + 8u <= tk; i += 8u) {
+      vst1q_f32(dst_row + i, vmulq_f32(vld1q_f32(a_row + i), v_ps));
+      vst1q_f32(dst_row + i + 4u, vmulq_f32(vld1q_f32(a_row + i + 4u), v_ps));
+    }
+#endif
+    for (; i < tk; ++i) dst_row[i] = a_row[i] * prescale;
+  } else {
+    std::memcpy(dst_row, a_row, static_cast<size_t>(tk) * sizeof(float));
+  }
+  if (tk < hw_k) {
+    std::memset(dst_row + tk, 0, static_cast<size_t>(hw_k - tk) * sizeof(float));
+  }
+  return prescale_inv;
 }
 
 // Zero-alloc fast-path cached graph acquisition returning CachedGraph* (+1 ref_count).
@@ -1208,26 +1296,35 @@ void cpu_matmul_f32_q8_0_tile(const float* a_mk,
   }
 }
 
-void requant_q8_0_rows(const ob_block_q8_0_t* b_blocks,
-                       uint32_t nb_k,
-                       uint32_t n0, uint32_t tn,
-                       uint32_t blk0, uint32_t blk_cnt,
-                       uint32_t tk, uint32_t hw_k,
-                       int8_t* out_bq_base,
-                       float* out_sb_base,
-                       std::vector<float>* scratch_w_row) {
+void requant_q8_0_rows_range(const ob_block_q8_0_t* b_blocks,
+                             uint32_t nb_k,
+                             uint32_t n0,
+                             uint32_t ni_start, uint32_t ni_end,
+                             uint32_t blk0, uint32_t blk_cnt,
+                             uint32_t tk, uint32_t hw_k,
+                             int8_t* out_bq_base,
+                             float* out_sb_base,
+                             RowNormStats* out_stats) {
   if (blk_cnt == 1u) {
-    for (uint32_t ni = 0; ni < tn; ++ni) {
+    for (uint32_t ni = ni_start; ni < ni_end; ++ni) {
       const ob_block_q8_0_t* b_row = b_blocks + static_cast<size_t>(n0 + ni) * nb_k + blk0;
       out_sb_base[ni] = fp16_to_fp32(b_row[0].d);
-      std::memcpy(out_bq_base + static_cast<size_t>(ni) * hw_k, b_row[0].qs, OB_QK8_0);
+      int8_t* bq_row = out_bq_base + static_cast<size_t>(ni) * hw_k;
+      std::memcpy(bq_row, b_row[0].qs, OB_QK8_0);
+      if (tk < hw_k) std::memset(bq_row + tk, 0, hw_k - tk);
+      if (out_stats) out_stats[ni] = compute_row_norm_stats(bq_row, tk);
     }
     return;
   }
 
-  scratch_w_row->resize(tk);
-  float* const wrow = scratch_w_row->data();
-  for (uint32_t ni = 0; ni < tn; ++ni) {
+  float stack_wrow[2048];
+  std::vector<float> heap_wrow;
+  float* wrow = stack_wrow;
+  if (tk > 2048u) {
+    heap_wrow.resize(tk);
+    wrow = heap_wrow.data();
+  }
+  for (uint32_t ni = ni_start; ni < ni_end; ++ni) {
     const ob_block_q8_0_t* b_row = b_blocks + static_cast<size_t>(n0 + ni) * nb_k + blk0;
     float amax = 0.0f;
 #if defined(__ARM_NEON) && defined(__aarch64__)
@@ -1266,32 +1363,57 @@ void requant_q8_0_rows(const ob_block_q8_0_t* b_blocks,
       }
     }
 #endif
+    int8_t* bq_row = out_bq_base + static_cast<size_t>(ni) * hw_k;
     if (amax == 0.0f) {
       out_sb_base[ni] = 0.0f;
+      std::memset(bq_row, 0, hw_k);
+      if (out_stats) out_stats[ni] = RowNormStats{};
       continue;
     }
     const float sb = amax / 127.0f;
     out_sb_base[ni] = sb;
     const float inv_sb = 127.0f / amax;
-    int8_t* bq_row = out_bq_base + static_cast<size_t>(ni) * hw_k;
     quant_sym_i8_row(wrow, bq_row, tk, inv_sb);
+    if (tk < hw_k) std::memset(bq_row + tk, 0, hw_k - tk);
+    if (out_stats) out_stats[ni] = compute_row_norm_stats(bq_row, tk);
   }
 }
 
-void requant_q4_0_rows(const ob_block_q4_0_t* b_blocks,
+void requant_q8_0_rows(const ob_block_q8_0_t* b_blocks,
                        uint32_t nb_k,
                        uint32_t n0, uint32_t tn,
                        uint32_t blk0, uint32_t blk_cnt,
                        uint32_t tk, uint32_t hw_k,
                        int8_t* out_bq_base,
                        float* out_sb_base,
-                       std::vector<float>* scratch_w_row) {
+                       WorkerPool* pool,
+                       RowNormStats* out_stats = nullptr) {
+  if (pool && tn >= 64u && static_cast<size_t>(tn) * tk >= 32768u) {
+    pool->parallel_for_fn(tn, 16u, [&](uint32_t s, uint32_t e, uint32_t) {
+      requant_q8_0_rows_range(b_blocks, nb_k, n0, s, e, blk0, blk_cnt, tk, hw_k,
+                              out_bq_base, out_sb_base, out_stats);
+    });
+  } else {
+    requant_q8_0_rows_range(b_blocks, nb_k, n0, 0u, tn, blk0, blk_cnt, tk, hw_k,
+                            out_bq_base, out_sb_base, out_stats);
+  }
+}
+
+void requant_q4_0_rows_range(const ob_block_q4_0_t* b_blocks,
+                             uint32_t nb_k,
+                             uint32_t n0,
+                             uint32_t ni_start, uint32_t ni_end,
+                             uint32_t blk0, uint32_t blk_cnt,
+                             uint32_t tk, uint32_t hw_k,
+                             int8_t* out_bq_base,
+                             float* out_sb_base,
+                             RowNormStats* out_stats) {
   if (blk_cnt == 1u) {
 #if defined(__ARM_NEON) && defined(__aarch64__)
     const uint8x16_t v_mask = vdupq_n_u8(0x0Fu);
     const int8x16_t v_eight = vdupq_n_s8(8);
 #endif
-    for (uint32_t ni = 0; ni < tn; ++ni) {
+    for (uint32_t ni = ni_start; ni < ni_end; ++ni) {
       const ob_block_q4_0_t* b_row = b_blocks + static_cast<size_t>(n0 + ni) * nb_k + blk0;
       out_sb_base[ni] = fp16_to_fp32(b_row[0].d);
       int8_t* bq_row = out_bq_base + static_cast<size_t>(ni) * hw_k;
@@ -1309,17 +1431,24 @@ void requant_q4_0_rows(const ob_block_q4_0_t* b_blocks,
         bq_row[j + OB_QK8_0 / 2u] = static_cast<int8_t>(static_cast<int32_t>(byte >> 4) - 8);
       }
 #endif
+      if (tk < hw_k) std::memset(bq_row + tk, 0, hw_k - tk);
+      if (out_stats) out_stats[ni] = compute_row_norm_stats(bq_row, tk);
     }
     return;
   }
 
-  scratch_w_row->resize(tk);
-  float* const wrow = scratch_w_row->data();
+  float stack_wrow[2048];
+  std::vector<float> heap_wrow;
+  float* wrow = stack_wrow;
+  if (tk > 2048u) {
+    heap_wrow.resize(tk);
+    wrow = heap_wrow.data();
+  }
 #if defined(__ARM_NEON) && defined(__aarch64__)
   const uint8x16_t v_mask = vdupq_n_u8(0x0Fu);
   const int8x16_t v_eight = vdupq_n_s8(8);
 #endif
-  for (uint32_t ni = 0; ni < tn; ++ni) {
+  for (uint32_t ni = ni_start; ni < ni_end; ++ni) {
     const ob_block_q4_0_t* b_row = b_blocks + static_cast<size_t>(n0 + ni) * nb_k + blk0;
     float amax = 0.0f;
 #if defined(__ARM_NEON) && defined(__aarch64__)
@@ -1381,15 +1510,39 @@ void requant_q4_0_rows(const ob_block_q4_0_t* b_blocks,
       }
     }
 #endif
+    int8_t* bq_row = out_bq_base + static_cast<size_t>(ni) * hw_k;
     if (amax == 0.0f) {
       out_sb_base[ni] = 0.0f;
+      std::memset(bq_row, 0, hw_k);
+      if (out_stats) out_stats[ni] = RowNormStats{};
       continue;
     }
     const float sb = amax / 127.0f;
     out_sb_base[ni] = sb;
     const float inv_sb = 127.0f / amax;
-    int8_t* bq_row = out_bq_base + static_cast<size_t>(ni) * hw_k;
     quant_sym_i8_row(wrow, bq_row, tk, inv_sb);
+    if (tk < hw_k) std::memset(bq_row + tk, 0, hw_k - tk);
+    if (out_stats) out_stats[ni] = compute_row_norm_stats(bq_row, tk);
+  }
+}
+
+void requant_q4_0_rows(const ob_block_q4_0_t* b_blocks,
+                       uint32_t nb_k,
+                       uint32_t n0, uint32_t tn,
+                       uint32_t blk0, uint32_t blk_cnt,
+                       uint32_t tk, uint32_t hw_k,
+                       int8_t* out_bq_base,
+                       float* out_sb_base,
+                       WorkerPool* pool,
+                       RowNormStats* out_stats = nullptr) {
+  if (pool && tn >= 64u && static_cast<size_t>(tn) * tk >= 32768u) {
+    pool->parallel_for_fn(tn, 16u, [&](uint32_t s, uint32_t e, uint32_t) {
+      requant_q4_0_rows_range(b_blocks, nb_k, n0, s, e, blk0, blk_cnt, tk, hw_k,
+                              out_bq_base, out_sb_base, out_stats);
+    });
+  } else {
+    requant_q4_0_rows_range(b_blocks, nb_k, n0, 0u, tn, blk0, blk_cnt, tk, hw_k,
+                            out_bq_base, out_sb_base, out_stats);
   }
 }
 
@@ -1492,38 +1645,158 @@ void apply_activation_inplace_impl(float* c_mn, size_t count, uint32_t act) {
   }
 }
 
-void quantize_activation_row_split_impl(const float* a_row,
+void apply_activation_inplace_parallel(float* c_mn, size_t count, uint32_t act, WorkerPool* pool) {
+  if (!c_mn || act == OB_ACT_NONE || count == 0u) return;
+  if (pool && count >= 16384u) {
+    const uint32_t chunks = static_cast<uint32_t>((count + 4095u) / 4096u);
+    pool->parallel_for_fn(chunks, 1u, [&](uint32_t s, uint32_t e, uint32_t) {
+      const size_t lo = static_cast<size_t>(s) * 4096u;
+      const size_t hi = std::min<size_t>(count, static_cast<size_t>(e) * 4096u);
+      if (lo < hi) apply_activation_inplace_impl(c_mn + lo, hi - lo, act);
+    });
+  } else {
+    apply_activation_inplace_impl(c_mn, count, act);
+  }
+}
+
+void silu_mul_inplace_impl(float* gate, const float* up, size_t count) {
+  size_t i = 0u;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+  const float32x4_t v_one = vdupq_n_f32(1.0f);
+  // 2x-unrolled (8 floats/iter) with pipelined 2-step NR reciprocal (24-bit IEEE exact),
+  // avoiding non-pipelined fdiv stalls on the 18.35 MB per-layer Gate*Up buffer.
+  for (; i + 8u <= count; i += 8u) {
+    float32x4_t g0 = vld1q_f32(gate + i);
+    float32x4_t g1 = vld1q_f32(gate + i + 4u);
+    float32x4_t u0 = vld1q_f32(up + i);
+    float32x4_t u1 = vld1q_f32(up + i + 4u);
+    float32x4_t d0 = vaddq_f32(v_one, fast_exp_f32x4(vnegq_f32(g0)));
+    float32x4_t d1 = vaddq_f32(v_one, fast_exp_f32x4(vnegq_f32(g1)));
+    float32x4_t r0 = vrecpeq_f32(d0);
+    float32x4_t r1 = vrecpeq_f32(d1);
+    r0 = vmulq_f32(r0, vrecpsq_f32(d0, r0));
+    r1 = vmulq_f32(r1, vrecpsq_f32(d1, r1));
+    r0 = vmulq_f32(r0, vrecpsq_f32(d0, r0));
+    r1 = vmulq_f32(r1, vrecpsq_f32(d1, r1));
+    vst1q_f32(gate + i, vmulq_f32(vmulq_f32(g0, r0), u0));
+    vst1q_f32(gate + i + 4u, vmulq_f32(vmulq_f32(g1, r1), u1));
+  }
+  for (; i + 4u <= count; i += 4u) {
+    float32x4_t g = vld1q_f32(gate + i);
+    float32x4_t u = vld1q_f32(up + i);
+    float32x4_t d = vaddq_f32(v_one, fast_exp_f32x4(vnegq_f32(g)));
+    float32x4_t r = vrecpeq_f32(d);
+    r = vmulq_f32(r, vrecpsq_f32(d, r));
+    r = vmulq_f32(r, vrecpsq_f32(d, r));
+    vst1q_f32(gate + i, vmulq_f32(vmulq_f32(g, r), u));
+  }
+#endif
+  for (; i < count; ++i) {
+    const float g = gate[i];
+    gate[i] = (g / (1.0f + std::exp(-g))) * up[i];
+  }
+}
+
+void silu_mul_inplace_parallel(float* gate, const float* up, size_t count, WorkerPool* pool) {
+  if (!gate || !up || count == 0u) return;
+  if (pool && pool->num_threads > 1u && count >= 16384u) {
+    const uint32_t chunks = static_cast<uint32_t>((count + 4095u) / 4096u);
+    pool->parallel_for_fn(chunks, 1u, [&](uint32_t s, uint32_t e, uint32_t) {
+      const size_t lo = static_cast<size_t>(s) * 4096u;
+      const size_t hi = std::min<size_t>(count, static_cast<size_t>(e) * 4096u);
+      if (lo < hi) silu_mul_inplace_impl(gate + lo, up + lo, hi - lo);
+    });
+  } else {
+    silu_mul_inplace_impl(gate, up, count);
+  }
+}
+
+constexpr uint32_t kMaxRowOutliers = 8u;
+
+struct RowOutliers {
+  uint32_t count = 0u;
+  uint32_t k_off[kMaxRowOutliers]{};
+  uint16_t uniq_idx[kMaxRowOutliers]{};
+  float val[kMaxRowOutliers]{};
+};
+
+inline uint64_t compute_i8_row_sq(const int8_t* row, uint32_t tk) {
+  uint64_t sq = 0ULL;
+  uint32_t ki = 0u;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+  uint32x4_t v_sq = vdupq_n_u32(0u);
+  for (; ki + 16u <= tk; ki += 16u) {
+    int8x16_t v = vld1q_s8(row + ki);
+    int16x8_t lo = vmull_s8(vget_low_s8(v), vget_low_s8(v));
+    int16x8_t hi = vmull_high_s8(v, v);
+    v_sq = vpadalq_u16(v_sq, vreinterpretq_u16_s16(lo));
+    v_sq = vpadalq_u16(v_sq, vreinterpretq_u16_s16(hi));
+  }
+  sq = static_cast<uint64_t>(vaddvq_u32(v_sq));
+#endif
+  for (; ki < tk; ++ki) {
+    int32_t v = static_cast<int32_t>(row[ki]);
+    sq += static_cast<uint64_t>(v * v);
+  }
+  return sq;
+}
+
+inline uint32_t compute_rms_shift_from_max_sq(uint64_t max_sq, uint32_t tk) {
+  if (max_sq == 0ULL || tk == 0u) return 0u;
+  double max_rms = std::sqrt(static_cast<double>(max_sq) / static_cast<double>(tk));
+  if (max_rms <= 0.0) return 0u;
+  double ratio = (max_rms * 1.35) / 73.3;
+  uint32_t shift = 0u;
+  while (ratio <= 0.5 && shift < 4u) {
+    ratio *= 2.0;
+    shift += 1u;
+  }
+  return shift;
+}
+
+void quantize_activation_row_split_fast(const float* a_row,
                                         uint32_t tk,
                                         int8_t* aq_row,
                                         float* out_s_a,
-                                        std::vector<std::pair<uint32_t, float>>* out_outliers) {
-  if (out_outliers) out_outliers->clear();
+                                        RowOutliers* out_outliers,
+                                        uint64_t* out_aq_sq) {
+  if (out_outliers) out_outliers->count = 0u;
+  if (out_aq_sq) *out_aq_sq = 0ULL;
   float amax = 0.0f;
   double sq_sum = 0.0;
   uint32_t ki = 0u;
 #if defined(__ARM_NEON) && defined(__aarch64__)
+  // 16-wide pure FP32 NEON pass (2x throughput vs FP64 widen, <1e-5 rel error for tk<=2048).
   float32x4_t v_amax0 = vdupq_n_f32(0.0f);
   float32x4_t v_amax1 = vdupq_n_f32(0.0f);
-  float64x2_t v_sq0 = vdupq_n_f64(0.0);
-  float64x2_t v_sq1 = vdupq_n_f64(0.0);
-  float64x2_t v_sq2 = vdupq_n_f64(0.0);
-  float64x2_t v_sq3 = vdupq_n_f64(0.0);
-  for (; ki + 8u <= tk; ki += 8u) {
+  float32x4_t v_amax2 = vdupq_n_f32(0.0f);
+  float32x4_t v_amax3 = vdupq_n_f32(0.0f);
+  float32x4_t v_sq0 = vdupq_n_f32(0.0f);
+  float32x4_t v_sq1 = vdupq_n_f32(0.0f);
+  float32x4_t v_sq2 = vdupq_n_f32(0.0f);
+  float32x4_t v_sq3 = vdupq_n_f32(0.0f);
+  for (; ki + 16u <= tk; ki += 16u) {
     float32x4_t v0 = vld1q_f32(a_row + ki);
     float32x4_t v1 = vld1q_f32(a_row + ki + 4u);
+    float32x4_t v2 = vld1q_f32(a_row + ki + 8u);
+    float32x4_t v3 = vld1q_f32(a_row + ki + 12u);
     v_amax0 = vmaxq_f32(v_amax0, vabsq_f32(v0));
     v_amax1 = vmaxq_f32(v_amax1, vabsq_f32(v1));
-    float64x2_t d0 = vcvt_f64_f32(vget_low_f32(v0));
-    float64x2_t d1 = vcvt_high_f64_f32(v0);
-    float64x2_t d2 = vcvt_f64_f32(vget_low_f32(v1));
-    float64x2_t d3 = vcvt_high_f64_f32(v1);
-    v_sq0 = vfmaq_f64(v_sq0, d0, d0);
-    v_sq1 = vfmaq_f64(v_sq1, d1, d1);
-    v_sq2 = vfmaq_f64(v_sq2, d2, d2);
-    v_sq3 = vfmaq_f64(v_sq3, d3, d3);
+    v_amax2 = vmaxq_f32(v_amax2, vabsq_f32(v2));
+    v_amax3 = vmaxq_f32(v_amax3, vabsq_f32(v3));
+    v_sq0 = vfmaq_f32(v_sq0, v0, v0);
+    v_sq1 = vfmaq_f32(v_sq1, v1, v1);
+    v_sq2 = vfmaq_f32(v_sq2, v2, v2);
+    v_sq3 = vfmaq_f32(v_sq3, v3, v3);
   }
-  amax = vmaxvq_f32(vmaxq_f32(v_amax0, v_amax1));
-  sq_sum = vaddvq_f64(vaddq_f64(vaddq_f64(v_sq0, v_sq1), vaddq_f64(v_sq2, v_sq3)));
+  for (; ki + 4u <= tk; ki += 4u) {
+    float32x4_t v0 = vld1q_f32(a_row + ki);
+    v_amax0 = vmaxq_f32(v_amax0, vabsq_f32(v0));
+    v_sq0 = vfmaq_f32(v_sq0, v0, v0);
+  }
+  amax = vmaxvq_f32(vmaxq_f32(vmaxq_f32(v_amax0, v_amax1), vmaxq_f32(v_amax2, v_amax3)));
+  sq_sum = static_cast<double>(vaddvq_f32(v_sq0)) + static_cast<double>(vaddvq_f32(v_sq1)) +
+           static_cast<double>(vaddvq_f32(v_sq2)) + static_cast<double>(vaddvq_f32(v_sq3));
 #endif
   for (; ki < tk; ++ki) {
     float v = a_row[ki];
@@ -1537,13 +1810,13 @@ void quantize_activation_row_split_impl(const float* a_row,
     return;
   }
 
-  // LLM.int8()-style sparse outlier peel: single-pass top-9 extraction (replaces 9 scalar passes
-  // with 1 NEON-filtered pass while remaining 100% bit-exact including smallest-index tie breaks).
-  constexpr uint32_t kMaxOutliers = 8u;
+  // LLM.int8()-style sparse outlier peel: single-pass top-9 extraction (100% bit-exact).
+  constexpr uint32_t kMaxOutliers = kMaxRowOutliers;
   constexpr uint32_t kTopK = kMaxOutliers + 1u;
   constexpr double kOutlierSigma = 8.0;
   uint32_t peeled_idx[kMaxOutliers]{};
   uint32_t n_peeled = 0u;
+  double rem_sq = sq_sum;
 
   if (out_outliers && tk >= 128u) {
     double rms = std::sqrt(sq_sum / static_cast<double>(tk));
@@ -1588,7 +1861,6 @@ void quantize_activation_row_split_impl(const float* a_row,
         }
       }
 
-      double rem_sq = sq_sum;
       for (uint32_t iter = 0u; iter < kMaxOutliers; ++iter) {
         if (top[iter].av <= 0.0f) break;
         double denom = static_cast<double>(tk > n_peeled + 1u ? (tk - n_peeled - 1u) : 1u);
@@ -1598,10 +1870,13 @@ void quantize_activation_row_split_impl(const float* a_row,
         if (static_cast<double>(top[iter].av) <= kOutlierSigma * std::max(rem_rms, 1e-12)) {
           break;
         }
-        peeled_idx[n_peeled++] = top[iter].idx;
-        out_outliers->push_back({top[iter].idx, a_row[top[iter].idx]});
+        peeled_idx[n_peeled] = top[iter].idx;
+        out_outliers->k_off[n_peeled] = top[iter].idx;
+        out_outliers->val[n_peeled] = a_row[top[iter].idx];
+        ++n_peeled;
         rem_sq = next_sq;
       }
+      out_outliers->count = n_peeled;
       if (n_peeled > 0u) {
         amax = (top[n_peeled].av > 0.0f) ? top[n_peeled].av : 0.0f;
       }
@@ -1619,6 +1894,29 @@ void quantize_activation_row_split_impl(const float* a_row,
   for (uint32_t p = 0; p < n_peeled; ++p) {
     aq_row[peeled_idx[p]] = 0;
   }
+  if (out_aq_sq) {
+    // Analytical sum(aq^2) directly from remaining FP32 energy rem_sq (eliminates Pass 4 read!)
+    const double d_inv = static_cast<double>(inv_sa);
+    const double est_sq = rem_sq * d_inv * d_inv;
+    *out_aq_sq = (est_sq > 0.0) ? static_cast<uint64_t>(est_sq + 0.5) : 0ULL;
+  }
+}
+
+void quantize_activation_row_split_impl(const float* a_row,
+                                        uint32_t tk,
+                                        int8_t* aq_row,
+                                        float* out_s_a,
+                                        std::vector<std::pair<uint32_t, float>>* out_outliers) {
+  if (out_outliers) {
+    out_outliers->clear();
+    RowOutliers ro{};
+    quantize_activation_row_split_fast(a_row, tk, aq_row, out_s_a, &ro, nullptr);
+    for (uint32_t i = 0u; i < ro.count; ++i) {
+      out_outliers->push_back({ro.k_off[i], ro.val[i]});
+    }
+  } else {
+    quantize_activation_row_split_fast(a_row, tk, aq_row, out_s_a, nullptr, nullptr);
+  }
 }
 
 uint32_t compute_activation_rms_shift_impl(const int8_t* aq_tile,
@@ -1626,37 +1924,12 @@ uint32_t compute_activation_rms_shift_impl(const int8_t* aq_tile,
                                            uint32_t tk,
                                            uint32_t hw_k) {
   if (!aq_tile || tm == 0u || tk == 0u) return 0u;
-  double max_rms = 0.0;
+  uint64_t max_sq = 0ULL;
   for (uint32_t mi = 0; mi < tm; ++mi) {
-    const int8_t* row = aq_tile + static_cast<size_t>(mi) * hw_k;
-    uint64_t sq = 0ULL;
-    uint32_t ki = 0u;
-#if defined(__ARM_NEON) && defined(__aarch64__)
-    uint32x4_t v_sq = vdupq_n_u32(0u);
-    for (; ki + 16u <= tk; ki += 16u) {
-      int8x16_t v = vld1q_s8(row + ki);
-      int16x8_t lo = vmull_s8(vget_low_s8(v), vget_low_s8(v));
-      int16x8_t hi = vmull_high_s8(v, v);
-      v_sq = vpadalq_u16(v_sq, vreinterpretq_u16_s16(lo));
-      v_sq = vpadalq_u16(v_sq, vreinterpretq_u16_s16(hi));
-    }
-    sq = static_cast<uint64_t>(vaddvq_u32(v_sq));
-#endif
-    for (; ki < tk; ++ki) {
-      int32_t v = static_cast<int32_t>(row[ki]);
-      sq += static_cast<uint64_t>(v * v);
-    }
-    double rms = std::sqrt(static_cast<double>(sq) / static_cast<double>(tk));
-    if (rms > max_rms) max_rms = rms;
+    const uint64_t sq = compute_i8_row_sq(aq_tile + static_cast<size_t>(mi) * hw_k, tk);
+    if (sq > max_sq) max_sq = sq;
   }
-  if (max_rms <= 0.0) return 0u;
-  double ratio = (max_rms * 1.35) / 73.3;
-  uint32_t shift = 0u;
-  while (ratio <= 0.5 && shift < 4u) {
-    ratio *= 2.0;
-    shift += 1u;
-  }
-  return shift;
+  return compute_rms_shift_from_max_sq(max_sq, tk);
 }
 
 // Exact check whether any active int8 output byte equals +127 (0x7F) or -128 (0x80).
@@ -1665,19 +1938,29 @@ bool tile_output_is_saturated_impl(const int8_t* out_data,
                                    uint32_t tm, uint32_t tn, uint32_t hw_n) {
 #if defined(__ARM_NEON) && defined(__aarch64__)
   const uint8x16_t v_sub = vdupq_n_u8(0x7Fu);
-  uint8x16_t v_min = vdupq_n_u8(0xFFu);
+  uint8x16_t v_min0 = vdupq_n_u8(0xFFu);
+  uint8x16_t v_min1 = vdupq_n_u8(0xFFu);
+  uint8x16_t v_min2 = vdupq_n_u8(0xFFu);
+  uint8x16_t v_min3 = vdupq_n_u8(0xFFu);
   for (uint32_t mi = 0; mi < tm; ++mi) {
     const uint8_t* row =
         reinterpret_cast<const uint8_t*>(out_data) + static_cast<size_t>(mi) * hw_n;
     uint32_t ni = 0u;
+    for (; ni + 64u <= tn; ni += 64u) {
+      v_min0 = vminq_u8(v_min0, vsubq_u8(vld1q_u8(row + ni), v_sub));
+      v_min1 = vminq_u8(v_min1, vsubq_u8(vld1q_u8(row + ni + 16u), v_sub));
+      v_min2 = vminq_u8(v_min2, vsubq_u8(vld1q_u8(row + ni + 32u), v_sub));
+      v_min3 = vminq_u8(v_min3, vsubq_u8(vld1q_u8(row + ni + 48u), v_sub));
+    }
     for (; ni + 16u <= tn; ni += 16u) {
-      v_min = vminq_u8(v_min, vsubq_u8(vld1q_u8(row + ni), v_sub));
+      v_min0 = vminq_u8(v_min0, vsubq_u8(vld1q_u8(row + ni), v_sub));
     }
     for (; ni < tn; ++ni) {
       int8_t qv = static_cast<int8_t>(row[ni]);
       if (qv == 127 || qv == -128) return true;
     }
   }
+  uint8x16_t v_min = vminq_u8(vminq_u8(v_min0, v_min1), vminq_u8(v_min2, v_min3));
   return vminvq_u8(v_min) <= 1u;
 #else
   for (uint32_t mi = 0; mi < tm; ++mi) {
@@ -1722,6 +2005,171 @@ inline void dequant_accum_row_f32_impl(float* c_row,
 #endif
   for (; ni < tn; ++ni) {
     c_row[ni] += static_cast<float>(o_row[ni]) * (sa_d * sb_ptr[ni]);
+  }
+}
+
+// Single-pass fused NEON dequant (+ optional store_first avoiding RMW) + peeled outlier FMA!
+// Keeps c_row[ni..ni+15] in NEON registers across all <=8 outlier columns, writing c_row ONCE.
+inline void dequant_outliers_row_f32_impl(float* c_row,
+                                          const int8_t* o_row,
+                                          const float* sb_ptr,
+                                          uint32_t tn,
+                                          float sa_d,
+                                          bool store_first,
+                                          const float* const* outlier_cols,
+                                          const float* outlier_vals,
+                                          uint32_t num_outliers) {
+  if (num_outliers == 0u && !store_first) {
+    dequant_accum_row_f32_impl(c_row, o_row, sb_ptr, tn, sa_d);
+    return;
+  }
+  uint32_t ni = 0u;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+  const float32x4_t v_sad = vdupq_n_f32(sa_d);
+  float32x4_t v_ox[kMaxRowOutliers];
+  const uint32_t fast_out = (num_outliers <= kMaxRowOutliers) ? num_outliers : kMaxRowOutliers;
+  for (uint32_t oi = 0u; oi < fast_out; ++oi) {
+    v_ox[oi] = vdupq_n_f32(outlier_vals[oi]);
+  }
+  for (; ni + 16u <= tn; ni += 16u) {
+    int8x16_t q8 = vld1q_s8(o_row + ni);
+    int16x8_t q16_lo = vmovl_s8(vget_low_s8(q8));
+    int16x8_t q16_hi = vmovl_high_s8(q8);
+
+    float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16_lo)));
+    float32x4_t f1 = vcvtq_f32_s32(vmovl_high_s16(q16_lo));
+    float32x4_t f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16_hi)));
+    float32x4_t f3 = vcvtq_f32_s32(vmovl_high_s16(q16_hi));
+
+    float32x4_t s0 = vmulq_f32(v_sad, vld1q_f32(sb_ptr + ni));
+    float32x4_t s1 = vmulq_f32(v_sad, vld1q_f32(sb_ptr + ni + 4u));
+    float32x4_t s2 = vmulq_f32(v_sad, vld1q_f32(sb_ptr + ni + 8u));
+    float32x4_t s3 = vmulq_f32(v_sad, vld1q_f32(sb_ptr + ni + 12u));
+
+    float32x4_t a0, a1, a2, a3;
+    if (store_first) {
+      a0 = vmulq_f32(f0, s0);
+      a1 = vmulq_f32(f1, s1);
+      a2 = vmulq_f32(f2, s2);
+      a3 = vmulq_f32(f3, s3);
+    } else {
+      a0 = vfmaq_f32(vld1q_f32(c_row + ni),       f0, s0);
+      a1 = vfmaq_f32(vld1q_f32(c_row + ni + 4u),  f1, s1);
+      a2 = vfmaq_f32(vld1q_f32(c_row + ni + 8u),  f2, s2);
+      a3 = vfmaq_f32(vld1q_f32(c_row + ni + 12u), f3, s3);
+    }
+
+    for (uint32_t oi = 0u; oi < fast_out; ++oi) {
+      const float* wc = outlier_cols[oi] + ni;
+      const float32x4_t vx = v_ox[oi];
+      a0 = vfmaq_f32(a0, vld1q_f32(wc),       vx);
+      a1 = vfmaq_f32(a1, vld1q_f32(wc + 4u),  vx);
+      a2 = vfmaq_f32(a2, vld1q_f32(wc + 8u),  vx);
+      a3 = vfmaq_f32(a3, vld1q_f32(wc + 12u), vx);
+    }
+    for (uint32_t oi = fast_out; oi < num_outliers; ++oi) {
+      const float* wc = outlier_cols[oi] + ni;
+      const float32x4_t vx = vdupq_n_f32(outlier_vals[oi]);
+      a0 = vfmaq_f32(a0, vld1q_f32(wc),       vx);
+      a1 = vfmaq_f32(a1, vld1q_f32(wc + 4u),  vx);
+      a2 = vfmaq_f32(a2, vld1q_f32(wc + 8u),  vx);
+      a3 = vfmaq_f32(a3, vld1q_f32(wc + 12u), vx);
+    }
+
+    vst1q_f32(c_row + ni,       a0);
+    vst1q_f32(c_row + ni + 4u,  a1);
+    vst1q_f32(c_row + ni + 8u,  a2);
+    vst1q_f32(c_row + ni + 12u, a3);
+  }
+#endif
+  for (; ni < tn; ++ni) {
+    float v = static_cast<float>(o_row[ni]) * (sa_d * sb_ptr[ni]);
+    if (!store_first) v += c_row[ni];
+    for (uint32_t oi = 0u; oi < num_outliers; ++oi) {
+      v += outlier_vals[oi] * outlier_cols[oi][ni];
+    }
+    c_row[ni] = v;
+  }
+}
+
+// Vectorized 4-row-at-a-time FP16->FP32 outlier column extraction from Q8_0 / Q4_0 blocks.
+void extract_outlier_col_impl(const ob_gemm_f32_quant_job_t* jobs,
+                              const FusedSubSlice* subs,
+                              uint32_t num_subs,
+                              uint32_t nb_k,
+                              uint32_t k0,
+                              uint32_t k_off,
+                              float* dst_col) {
+  const uint32_t abs_k = k0 + k_off;
+  const uint32_t b_idx = abs_k / OB_QK8_0;
+  const uint32_t j_idx = abs_k % OB_QK8_0;
+  for (uint32_t si = 0u; si < num_subs; ++si) {
+    const FusedSubSlice& sub = subs[si];
+    const ob_gemm_f32_quant_job_t& job = jobs[sub.job_idx];
+    float* out_p = dst_col + sub.out_off;
+    if (job.is_q4_0 != 0u) {
+      const ob_block_q4_0_t* b_q4 = static_cast<const ob_block_q4_0_t*>(job.b_nk);
+      constexpr uint32_t kHalf = OB_QK8_0 / 2u;
+      const bool hi_nib = (j_idx >= kHalf);
+      const uint32_t byte_idx = hi_nib ? (j_idx - kHalf) : j_idx;
+      uint32_t ni = 0u;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+      for (; ni + 4u <= sub.tn; ni += 4u) {
+        if (ni + 12u < sub.tn) {
+          __builtin_prefetch(&b_q4[static_cast<size_t>(sub.n0 + ni + 8u) * nb_k + b_idx], 0, 1);
+          __builtin_prefetch(&b_q4[static_cast<size_t>(sub.n0 + ni + 9u) * nb_k + b_idx], 0, 1);
+          __builtin_prefetch(&b_q4[static_cast<size_t>(sub.n0 + ni + 10u) * nb_k + b_idx], 0, 1);
+          __builtin_prefetch(&b_q4[static_cast<size_t>(sub.n0 + ni + 11u) * nb_k + b_idx], 0, 1);
+        }
+        const ob_block_q4_0_t& b0 = b_q4[static_cast<size_t>(sub.n0 + ni + 0u) * nb_k + b_idx];
+        const ob_block_q4_0_t& b1 = b_q4[static_cast<size_t>(sub.n0 + ni + 1u) * nb_k + b_idx];
+        const ob_block_q4_0_t& b2 = b_q4[static_cast<size_t>(sub.n0 + ni + 2u) * nb_k + b_idx];
+        const ob_block_q4_0_t& b3 = b_q4[static_cast<size_t>(sub.n0 + ni + 3u) * nb_k + b_idx];
+        const uint16_t dh[4] = {b0.d, b1.d, b2.d, b3.d};
+        const int32_t qv[4] = {
+            static_cast<int32_t>(hi_nib ? (b0.qs[byte_idx] >> 4) : (b0.qs[byte_idx] & 0x0Fu)) - 8,
+            static_cast<int32_t>(hi_nib ? (b1.qs[byte_idx] >> 4) : (b1.qs[byte_idx] & 0x0Fu)) - 8,
+            static_cast<int32_t>(hi_nib ? (b2.qs[byte_idx] >> 4) : (b2.qs[byte_idx] & 0x0Fu)) - 8,
+            static_cast<int32_t>(hi_nib ? (b3.qs[byte_idx] >> 4) : (b3.qs[byte_idx] & 0x0Fu)) - 8,
+        };
+        float32x4_t vd = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(dh)));
+        float32x4_t vq = vcvtq_f32_s32(vld1q_s32(qv));
+        vst1q_f32(out_p + ni, vmulq_f32(vd, vq));
+      }
+#endif
+      for (; ni < sub.tn; ++ni) {
+        const ob_block_q4_0_t& blk = b_q4[static_cast<size_t>(sub.n0 + ni) * nb_k + b_idx];
+        const uint8_t byte = blk.qs[byte_idx];
+        const int32_t q = static_cast<int32_t>(hi_nib ? (byte >> 4) : (byte & 0x0Fu)) - 8;
+        out_p[ni] = fp16_to_fp32(blk.d) * static_cast<float>(q);
+      }
+    } else {
+      const ob_block_q8_0_t* b_q8 = static_cast<const ob_block_q8_0_t*>(job.b_nk);
+      uint32_t ni = 0u;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+      for (; ni + 4u <= sub.tn; ni += 4u) {
+        if (ni + 12u < sub.tn) {
+          __builtin_prefetch(&b_q8[static_cast<size_t>(sub.n0 + ni + 8u) * nb_k + b_idx], 0, 1);
+          __builtin_prefetch(&b_q8[static_cast<size_t>(sub.n0 + ni + 9u) * nb_k + b_idx], 0, 1);
+          __builtin_prefetch(&b_q8[static_cast<size_t>(sub.n0 + ni + 10u) * nb_k + b_idx], 0, 1);
+          __builtin_prefetch(&b_q8[static_cast<size_t>(sub.n0 + ni + 11u) * nb_k + b_idx], 0, 1);
+        }
+        const ob_block_q8_0_t& b0 = b_q8[static_cast<size_t>(sub.n0 + ni + 0u) * nb_k + b_idx];
+        const ob_block_q8_0_t& b1 = b_q8[static_cast<size_t>(sub.n0 + ni + 1u) * nb_k + b_idx];
+        const ob_block_q8_0_t& b2 = b_q8[static_cast<size_t>(sub.n0 + ni + 2u) * nb_k + b_idx];
+        const ob_block_q8_0_t& b3 = b_q8[static_cast<size_t>(sub.n0 + ni + 3u) * nb_k + b_idx];
+        const uint16_t dh[4] = {b0.d, b1.d, b2.d, b3.d};
+        const int32_t qv[4] = {b0.qs[j_idx], b1.qs[j_idx], b2.qs[j_idx], b3.qs[j_idx]};
+        float32x4_t vd = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(dh)));
+        float32x4_t vq = vcvtq_f32_s32(vld1q_s32(qv));
+        vst1q_f32(out_p + ni, vmulq_f32(vd, vq));
+      }
+#endif
+      for (; ni < sub.tn; ++ni) {
+        const ob_block_q8_0_t& blk = b_q8[static_cast<size_t>(sub.n0 + ni) * nb_k + b_idx];
+        out_p[ni] = fp16_to_fp32(blk.d) * static_cast<float>(blk.qs[j_idx]);
+      }
+    }
   }
 }
 
@@ -1799,12 +2247,78 @@ void dequant_accum_row_f32(float* c_row, const int8_t* o_row,
   dequant_accum_row_f32_impl(c_row, o_row, sb_ptr, tn, sa_d);
 }
 
+void dequant_outliers_row_f32(float* c_row,
+                              const int8_t* o_row,
+                              const float* sb_ptr,
+                              uint32_t tn,
+                              float sa_d,
+                              bool store_first,
+                              const float* const* outlier_cols,
+                              const float* outlier_vals,
+                              uint32_t num_outliers) {
+  dequant_outliers_row_f32_impl(c_row, o_row, sb_ptr, tn, sa_d, store_first,
+                                outlier_cols, outlier_vals, num_outliers);
+}
+
 void apply_activation_inplace_f32(float* c_mn, size_t count, uint32_t act) {
   apply_activation_inplace_impl(c_mn, count, act);
 }
 
+void w8a16_pt_epilogue_f32(float* c_row,
+                           const float* y_raw,
+                           const float* sb_ptr,
+                           uint32_t tn,
+                           float prescale_inv,
+                           bool store_first) {
+  uint32_t ni = 0u;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+  const float32x4_t v_ps = vdupq_n_f32(prescale_inv);
+  if (store_first) {
+    for (; ni + 16u <= tn; ni += 16u) {
+      float32x4_t y0 = vld1q_f32(y_raw + ni);
+      float32x4_t y1 = vld1q_f32(y_raw + ni + 4u);
+      float32x4_t y2 = vld1q_f32(y_raw + ni + 8u);
+      float32x4_t y3 = vld1q_f32(y_raw + ni + 12u);
+      float32x4_t s0 = vmulq_f32(v_ps, vld1q_f32(sb_ptr + ni));
+      float32x4_t s1 = vmulq_f32(v_ps, vld1q_f32(sb_ptr + ni + 4u));
+      float32x4_t s2 = vmulq_f32(v_ps, vld1q_f32(sb_ptr + ni + 8u));
+      float32x4_t s3 = vmulq_f32(v_ps, vld1q_f32(sb_ptr + ni + 12u));
+      vst1q_f32(c_row + ni,       vmulq_f32(y0, s0));
+      vst1q_f32(c_row + ni + 4u,  vmulq_f32(y1, s1));
+      vst1q_f32(c_row + ni + 8u,  vmulq_f32(y2, s2));
+      vst1q_f32(c_row + ni + 12u, vmulq_f32(y3, s3));
+    }
+  } else {
+    for (; ni + 16u <= tn; ni += 16u) {
+      float32x4_t y0 = vld1q_f32(y_raw + ni);
+      float32x4_t y1 = vld1q_f32(y_raw + ni + 4u);
+      float32x4_t y2 = vld1q_f32(y_raw + ni + 8u);
+      float32x4_t y3 = vld1q_f32(y_raw + ni + 12u);
+      float32x4_t s0 = vmulq_f32(v_ps, vld1q_f32(sb_ptr + ni));
+      float32x4_t s1 = vmulq_f32(v_ps, vld1q_f32(sb_ptr + ni + 4u));
+      float32x4_t s2 = vmulq_f32(v_ps, vld1q_f32(sb_ptr + ni + 8u));
+      float32x4_t s3 = vmulq_f32(v_ps, vld1q_f32(sb_ptr + ni + 12u));
+      vst1q_f32(c_row + ni,       vfmaq_f32(vld1q_f32(c_row + ni),       y0, s0));
+      vst1q_f32(c_row + ni + 4u,  vfmaq_f32(vld1q_f32(c_row + ni + 4u),  y1, s1));
+      vst1q_f32(c_row + ni + 8u,  vfmaq_f32(vld1q_f32(c_row + ni + 8u),  y2, s2));
+      vst1q_f32(c_row + ni + 12u, vfmaq_f32(vld1q_f32(c_row + ni + 12u), y3, s3));
+    }
+  }
+#endif
+  if (store_first) {
+    for (; ni < tn; ++ni) c_row[ni] = y_raw[ni] * (prescale_inv * sb_ptr[ni]);
+  } else {
+    for (; ni < tn; ++ni) c_row[ni] += y_raw[ni] * (prescale_inv * sb_ptr[ni]);
+  }
+}
+
 void gemm_release_pipeline_buffers(ob_context* ctx) {
   if (!ctx) return;
+  {
+    std::lock_guard<std::mutex> flk(ctx->swiglu_fb_mu);
+    std::vector<float>().swap(ctx->swiglu_gate_scratch);
+    std::vector<float>().swap(ctx->swiglu_up_scratch);
+  }
   std::lock_guard<std::mutex> lk(ctx->gemm_mu);
   for (uint32_t i = 0; i < OB_MAX_CREDITS; ++i) {
     if (ctx->gemm_in_bufs[i]) {
@@ -1831,6 +2345,7 @@ void gemm_release_pipeline_buffers(ob_context* ctx) {
   ctx->weight_cache_lru.clear();
   ctx->weight_cache_map.clear();
   ctx->weight_cache_bytes = 0;
+  ctx->outlier_cache_bytes = 0;
 }
 
 }  // namespace ob
@@ -1981,12 +2496,8 @@ ob_status_t ob_gemm_matmul_int8(ob_context_t* ctx,
   uint32_t ring_head = 0u;
   uint32_t ring_count = 0u;
 
-  auto drain_one = [&]() -> ob_status_t {
+  auto drain_one_harvested = [&](ob_status_t wst, const ob_invoke_stats_t& istats) -> ob_status_t {
     PendingInt8Tile& p = ring[ring_head];
-    ob_invoke_stats_t istats {};
-    const uint64_t tw0 = prof_on ? ob::monotonic_now_ns() : 0u;
-    ob_status_t wst = ob::device_wait_handle(ctx, p.handle, ctx->cfg.timeout_ms, &istats);
-    if (prof_on) ctx->prof.wait_ns += (ob::monotonic_now_ns() - tw0);
     ob_status_t rst = OB_OK;
     if (wst == OB_OK) {
       total_hw_us += istats.hw_execution_us;
@@ -1999,10 +2510,21 @@ ob_status_t ob_gemm_matmul_int8(ob_context_t* ctx,
           const int8_t* raw_out =
               static_cast<const int8_t*>(ob_buffer_data(p.out_buf));
           const int32_t d_i32 = static_cast<int32_t>(p.scale_d);
-          for (uint32_t mi = 0; mi < p.tm; ++mi) {
-            int32_t* c_row = c_mn + static_cast<size_t>(p.m0 + mi) * n_dim + p.n0;
-            const int8_t* o_row = raw_out + static_cast<size_t>(mi) * p.hw_n;
-            ob::dequant_accum_row_i32_impl(c_row, o_row, p.tn, d_i32);
+          if (ctx->worker_pool.num_threads > 1u &&
+              p.tm >= 8u && static_cast<size_t>(p.tm) * p.tn >= 16384u) {
+            ctx->worker_pool.parallel_for_fn(p.tm, 4u, [&](uint32_t ms_lo, uint32_t ms_hi, uint32_t) {
+              for (uint32_t mi = ms_lo; mi < ms_hi; ++mi) {
+                int32_t* c_row = c_mn + static_cast<size_t>(p.m0 + mi) * n_dim + p.n0;
+                const int8_t* o_row = raw_out + static_cast<size_t>(mi) * p.hw_n;
+                ob::dequant_accum_row_i32_impl(c_row, o_row, p.tn, d_i32);
+              }
+            });
+          } else {
+            for (uint32_t mi = 0; mi < p.tm; ++mi) {
+              int32_t* c_row = c_mn + static_cast<size_t>(p.m0 + mi) * n_dim + p.n0;
+              const int8_t* o_row = raw_out + static_cast<size_t>(mi) * p.hw_n;
+              ob::dequant_accum_row_i32_impl(c_row, o_row, p.tn, d_i32);
+            }
           }
           if (prof_on) ctx->prof.dequant_ns += (ob::monotonic_now_ns() - tq0);
           const uint64_t td1 = prof_on ? ob::monotonic_now_ns() : 0u;
@@ -2017,6 +2539,28 @@ ob_status_t ob_gemm_matmul_int8(ob_context_t* ctx,
     ring_head = (ring_head + 1u) % ring_depth;
     ring_count -= 1u;
     return (wst != OB_OK) ? wst : rst;
+  };
+
+  auto drain_one = [&]() -> ob_status_t {
+    PendingInt8Tile& p = ring[ring_head];
+    ob_invoke_stats_t istats {};
+    const uint64_t tw0 = prof_on ? ob::monotonic_now_ns() : 0u;
+    ob_status_t wst = ob::device_wait_handle(ctx, p.handle, ctx->cfg.timeout_ms, &istats);
+    if (prof_on) ctx->prof.wait_ns += (ob::monotonic_now_ns() - tw0);
+    return drain_one_harvested(wst, istats);
+  };
+
+  auto try_drain_ready = [&]() -> ob_status_t {
+    while (ring_count >= 2u) {
+      ob_status_t wst = OB_OK;
+      ob_invoke_stats_t istats {};
+      if (!ob::device_try_wait_handle(ctx, ring[ring_head].handle, &wst, &istats)) {
+        break;
+      }
+      ob_status_t dst = drain_one_harvested(wst, istats);
+      if (dst != OB_OK) return dst;
+    }
+    return OB_OK;
   };
 
   auto drain_all_cleanup = [&]() {
@@ -2109,14 +2653,25 @@ ob_status_t ob_gemm_matmul_int8(ob_context_t* ctx,
                             b_nk + static_cast<size_t>(n0 + ni) * k_dim + k0, tk);
               }
               scale_d = ob::compute_tile_scale_D(b_tile.data(), tn, tk, hw_k, zp_a);
-              std::vector<uint8_t> ext2 = is_lt64_tile
-                  ? ob::pack_ext2_for_lt_64x(hw_n, hw_k, b_tile.data(), nullptr)
-                  : ob::pack_ext2_for_tile(hw_n, hw_k, b_tile.data(), nullptr);
+              const size_t ext2_sz = is_lt64_tile
+                  ? ob::pack_ext2_size_for_lt_64x(hw_n, hw_k)
+                  : ob::pack_ext2_size_for_tile(hw_n, hw_k, false);
               ob_buffer* wbuf = nullptr;
               ob_status_t wst = ob_buffer_alloc(
-                  ctx, ext2.size(), OB_BUF_BIDIRECTIONAL | OB_BUF_NO_POOL | OB_BUF_ZERO_INIT, &wbuf);
+                  ctx, ext2_sz, OB_BUF_BIDIRECTIONAL | OB_BUF_NO_POOL, &wbuf);
               if (wst == OB_OK) {
-                wst = ob_buffer_write(wbuf, ext2.data(), ext2.size(), 0u);
+                wst = ob::buffer_sync_begin_write(wbuf);
+                if (wst == OB_OK) {
+                  uint8_t* dst_ext2 = static_cast<uint8_t*>(ob_buffer_data(wbuf));
+                  if (is_lt64_tile) {
+                    ob::pack_ext2_for_lt_64x_into(
+                        dst_ext2, hw_n, hw_k, b_tile.data(), nullptr, &ctx->worker_pool);
+                  } else {
+                    ob::pack_ext2_for_tile_into(
+                        dst_ext2, hw_n, hw_k, b_tile.data(), nullptr, false, &ctx->worker_pool);
+                  }
+                  wst = ob::buffer_sync_end_write(wbuf);
+                }
               }
               if (prof_on) ctx->prof.weight_pack_ns += (ob::monotonic_now_ns() - tp0);
               if (wst != OB_OK) {
@@ -2135,7 +2690,7 @@ ob_status_t ob_gemm_matmul_int8(ob_context_t* ctx,
               w_tile->hw_k = hw_k;
               w_tile->hw_n = hw_n;
               w_tile->ext2_buf = wbuf;
-              w_tile->ext2_bytes = ext2.size();
+              w_tile->ext2_bytes = ext2_sz;
               ob::weight_cache_insert_locked(ctx, w_tile);
             } else {
               scale_d = w_tile->scale_d;
@@ -2270,6 +2825,11 @@ ob_status_t ob_gemm_matmul_int8(ob_context_t* ctx,
 
             if (!ctx->mock_mode) {
               tile_handled_by_hw = true;
+              ob_status_t od_st = try_drain_ready();
+              if (od_st != OB_OK) {
+                drain_all_cleanup();
+                return od_st;
+              }
             }
           } else if (gst != OB_ERR_UNSUPPORTED) {
             drain_all_cleanup();
@@ -2346,11 +2906,21 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
   const bool blt_enabled = ctx->batched_large_tiles_enabled;
   const bool horiz_fusion = ctx->horiz_fusion_enabled;
   const uint32_t param_swap_slots = ctx->param_swap_slots;
+  const uint32_t w8a16_mode = ctx->w8a16_mode;
   const uint32_t ring_depth =
       std::max<uint32_t>(1u, std::min<uint32_t>(ctx->credit_size, OB_MAX_CREDITS));
+  // Engage lock-free 1-helper SPSC async dequant ONLY for batched prefill (m_dim > 8);
+  // keep M=1 decode 100% inline/lock-free with zero helper wakeups.
+  const bool use_async_dq =
+      ctx->async_dequant_enabled && !ctx->mock_mode && (m_dim > 8u) && (ring_depth >= 2u);
 
-  for (uint32_t j = 0; j < num_jobs; ++j) {
-    std::memset(jobs[j].c_mn, 0, static_cast<size_t>(m_dim) * jobs[j].n_dim * sizeof(float));
+  // Skip upfront full-output memset when HW path is active: first K-slice (k0==0) uses
+  // store-first fused NEON dequant (halving output DRAM bandwidth on single-K projections!).
+  const bool skip_zero_init = (emitter != nullptr && !ctx->mock_mode);
+  if (!skip_zero_init) {
+    for (uint32_t j = 0; j < num_jobs; ++j) {
+      std::memset(jobs[j].c_mn, 0, static_cast<size_t>(m_dim) * jobs[j].n_dim * sizeof(float));
+    }
   }
 
   uint32_t tiles_dispatched = 0u;
@@ -2358,6 +2928,25 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
   uint64_t total_hw_us = 0u;
   bool used_emitter = false;
   bool used_cpu_fallback = false;
+
+  struct InputSlotMeta {
+    uint32_t refcnt = 0u;
+    uint32_t k0 = 0u;
+    uint32_t tk = 0u;
+    uint32_t tm = 0u;
+    bool has_outliers = false;
+    ob::RowOutliers row0{};
+    std::vector<ob::RowOutliers> rows_vec;
+    uint32_t n_uniq = 0u;
+    std::array<uint32_t, 16> uniq_k_inline{};
+    std::vector<uint32_t> uniq_k_overflow;
+  };
+
+  struct OutlierMissItem {
+    uint32_t u_idx;
+    uint32_t k_off;
+    float* dst;
+  };
 
   struct PendingF32Tile {
     ob_exec_handle_t handle = 0u;
@@ -2370,24 +2959,173 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
     uint32_t hw_k = 0u, hw_n = 0u;
     uint32_t tn_total = 0u;
     uint32_t num_subs = 0u;
+    bool is_first_k = false;
+    bool is_w8a16 = false;
+    float w8a16_prescale_inv = 1.0f;
     std::array<ob::FusedSubSlice, ob::kMaxFusedSubs> subs{};
     uint32_t scale_d_u32 = 1u;
     std::array<float, 64> s_a_inline{};
     std::vector<float> s_a_overflow;
     std::vector<float> s_b;
-  };
-  std::array<PendingF32Tile, OB_MAX_CREDITS> ring{};
-  std::array<uint32_t, OB_MAX_CREDITS> in_refcnt{};
-  uint32_t ring_head = 0u;
-  uint32_t ring_count = 0u;
 
-  auto drain_one = [&]() -> ob_status_t {
-    PendingF32Tile& p = ring[ring_head];
-    ob_invoke_stats_t istats {};
-    const uint64_t tw0 = prof_on ? ob::monotonic_now_ns() : 0u;
-    ob_status_t wst = ob::device_wait_handle(ctx, p.handle, ctx->cfg.timeout_ms, &istats);
-    if (prof_on) ctx->prof.wait_ns += (ob::monotonic_now_ns() - tw0);
+    // Dequant handoff payload (populated by main thread after TPU harvest, executed
+    // either inline or FIFO-serially on the lock-free SPSC helper thread):
+    uint64_t dq_seq = 0u;
+    const ob_gemm_f32_quant_job_t* jobs_ptr = nullptr;
+    const InputSlotMeta* im_ptr = nullptr;
+    const void* raw_out = nullptr;
+    uint32_t nb_k = 0u;
+    float eff_scale_d = 1.0f;
+    bool store_first = false;
+    bool has_outliers = false;
+    bool prof_on = false;
+    uint32_t dq_n_miss = 0u;
+    std::array<const float*, 256> dq_col_ptrs_stack{};
+    std::vector<const float*> dq_col_ptrs_vec;
+    std::array<OutlierMissItem, 64> dq_misses_stack{};
+    std::vector<OutlierMissItem> dq_misses_vec;
+    std::vector<float> spill_scratch;
+    uint64_t dq_ns = 0u;
+    uint64_t dq_sync_ns = 0u;
+    ob_status_t dq_status = OB_OK;
+
+    static void run_dequant_job(void* raw) {
+      PendingF32Tile* p = static_cast<PendingF32Tile*>(raw);
+      const uint64_t tq0 = p->prof_on ? ob::monotonic_now_ns() : 0u;
+      const float* sb_base = p->w_tile ? p->w_tile->row_s_b.data() : p->s_b.data();
+      const ob_gemm_f32_quant_job_t* jobs_p = p->jobs_ptr;
+
+      if (p->is_w8a16) {
+        const float* y_f32 = static_cast<const float*>(p->raw_out);
+        for (uint32_t si = 0u; si < p->num_subs; ++si) {
+          const ob::FusedSubSlice& sub = p->subs[si];
+          const ob_gemm_f32_quant_job_t& job = jobs_p[sub.job_idx];
+          const float* sb_ptr = sb_base + sub.out_off;
+          float* c_row = job.c_mn + static_cast<size_t>(p->m0) * job.n_dim + sub.n0;
+          ob::w8a16_pt_epilogue_f32(
+              c_row, y_f32 + sub.out_off, sb_ptr, sub.tn,
+              p->w8a16_prescale_inv, p->store_first);
+        }
+      } else {
+        const int8_t* raw_i8 = static_cast<const int8_t*>(p->raw_out);
+        const float* sa_ptr =
+            (p->tm <= p->s_a_inline.size()) ? p->s_a_inline.data() : p->s_a_overflow.data();
+        const InputSlotMeta* im = p->im_ptr;
+        const bool has_out = p->has_outliers && im != nullptr;
+        const ob::RowOutliers* rows_ptr =
+            has_out ? ((p->tm <= 1u) ? &im->row0 : im->rows_vec.data()) : nullptr;
+
+        if (has_out && p->dq_n_miss > 0u) {
+          const OutlierMissItem* misses_ptr =
+              p->dq_misses_vec.empty() ? p->dq_misses_stack.data() : p->dq_misses_vec.data();
+          for (uint32_t i = 0u; i < p->dq_n_miss; ++i) {
+            ob::extract_outlier_col_impl(
+                jobs_p, p->subs.data(), p->num_subs, p->nb_k, im->k0,
+                misses_ptr[i].k_off, misses_ptr[i].dst);
+          }
+        }
+
+        const float* const* col_ptrs =
+            p->dq_col_ptrs_vec.empty() ? p->dq_col_ptrs_stack.data() : p->dq_col_ptrs_vec.data();
+        for (uint32_t mi = 0u; mi < p->tm; ++mi) {
+          const float sa_d = sa_ptr[mi] * p->eff_scale_d;
+          const uint32_t n_out = has_out ? rows_ptr[mi].count : 0u;
+          const float* row_cols[ob::kMaxRowOutliers];
+          for (uint32_t oi = 0u; oi < n_out; ++oi) {
+            row_cols[oi] = col_ptrs[rows_ptr[mi].uniq_idx[oi]];
+          }
+          for (uint32_t si = 0u; si < p->num_subs; ++si) {
+            const ob::FusedSubSlice& sub = p->subs[si];
+            const ob_gemm_f32_quant_job_t& job = jobs_p[sub.job_idx];
+            const float* sb_ptr = sb_base + sub.out_off;
+            float* c_row = job.c_mn + static_cast<size_t>(p->m0 + mi) * job.n_dim + sub.n0;
+            const int8_t* o_row = raw_i8 + static_cast<size_t>(mi) * p->hw_n + sub.out_off;
+            if (n_out > 0u) {
+              const float* sub_cols[ob::kMaxRowOutliers];
+              for (uint32_t oi = 0u; oi < n_out; ++oi) {
+                sub_cols[oi] = row_cols[oi] + sub.out_off;
+              }
+              ob::dequant_outliers_row_f32_impl(
+                  c_row, o_row, sb_ptr, sub.tn, sa_d, p->store_first,
+                  sub_cols, rows_ptr[mi].val, n_out);
+            } else {
+              ob::dequant_outliers_row_f32_impl(
+                  c_row, o_row, sb_ptr, sub.tn, sa_d, p->store_first,
+                  nullptr, nullptr, 0u);
+            }
+          }
+        }
+      }
+      if (p->prof_on) p->dq_ns = ob::monotonic_now_ns() - tq0;
+
+      const uint64_t td1 = p->prof_on ? ob::monotonic_now_ns() : 0u;
+      p->dq_status = ob::buffer_sync_end_read(p->out_buf);
+      if (p->prof_on) p->dq_sync_ns = ob::monotonic_now_ns() - td1;
+    }
+  };
+
+  std::array<PendingF32Tile, OB_MAX_CREDITS> ring{};
+  std::array<InputSlotMeta, OB_MAX_CREDITS> in_slots{};
+  uint64_t sub_seq = 0u;
+  uint64_t tpu_seq = 0u;
+  uint64_t reap_seq = 0u;
+  uint64_t last_dq_seq = 0u;
+  ob_status_t first_dq_err = OB_OK;
+  const uint32_t nb_k = k_dim / OB_QK8_0;
+
+  auto release_reaped_slot = [&](PendingF32Tile& rp) {
+    if (prof_on) {
+      ctx->prof.dequant_ns += rp.dq_ns;
+      ctx->prof.dma_sync_ns += rp.dq_sync_ns;
+    }
+    if (rp.dq_status != OB_OK && first_dq_err == OB_OK) {
+      first_dq_err = rp.dq_status;
+    }
+    if (rp.w_tile && rp.w_tile->in_use > 0u) rp.w_tile->in_use -= 1u;
+    if (in_slots[rp.in_slot].refcnt > 0u) in_slots[rp.in_slot].refcnt -= 1u;
+    rp.handle = 0u;
+    rp.dq_seq = 0u;
+    rp.w_tile = nullptr;
+    rp.in_buf = nullptr;
+    rp.out_buf = nullptr;
+    rp.num_subs = 0u;
+    rp.is_first_k = false;
+    rp.is_w8a16 = false;
+    rp.dq_ns = 0u;
+    rp.dq_sync_ns = 0u;
+    rp.dq_status = OB_OK;
+  };
+
+  auto reap_ready = [&]() {
+    while (reap_seq < tpu_seq) {
+      PendingF32Tile& rp = ring[static_cast<uint32_t>(reap_seq % ring_depth)];
+      if (rp.dq_seq != 0u && ctx->async_dequant.completed_count() < rp.dq_seq) {
+        break;
+      }
+      release_reaped_slot(rp);
+      ++reap_seq;
+    }
+  };
+
+  auto wait_and_reap_one_dq = [&]() {
+    if (reap_seq >= tpu_seq) return;
+    PendingF32Tile& rp = ring[static_cast<uint32_t>(reap_seq % ring_depth)];
+    if (rp.dq_seq != 0u) {
+      ctx->async_dequant.wait_until(rp.dq_seq);
+    }
+    release_reaped_slot(rp);
+    ++reap_seq;
+  };
+
+  auto harvest_one_with_result = [&](ob_status_t wst, const ob_invoke_stats_t& istats) -> ob_status_t {
+    PendingF32Tile& p = ring[static_cast<uint32_t>(tpu_seq % ring_depth)];
+    p.dq_seq = 0u;
+    p.dq_ns = 0u;
+    p.dq_sync_ns = 0u;
+    p.dq_status = OB_OK;
     ob_status_t rst = OB_OK;
+    bool dispatched_async = false;
+
     if (wst == OB_OK) {
       total_hw_us += istats.hw_execution_us;
       if (!ctx->mock_mode) {
@@ -2397,12 +3135,12 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
         if (prof_on) ctx->prof.dma_sync_ns += (ob::monotonic_now_ns() - td0);
 
         if (rst == OB_OK) {
-          const int8_t* raw_out =
-              static_cast<const int8_t*>(ob_buffer_data(p.out_buf));
+          const void* raw_out_ptr = ob_buffer_data(p.out_buf);
           bool read_active = true;
 
-          // Saturation-proof on-TPU retry: direct NEON check on mapped DMA-BUF (zero memcpy!).
-          if (builtin_active && p.w_tile != nullptr) {
+          // Saturation-proof on-TPU retry (W8A8 only; W8A16 has full FP32 accumulator!).
+          if (!p.is_w8a16 && builtin_active && p.w_tile != nullptr) {
+            const int8_t* raw_out = static_cast<const int8_t*>(raw_out_ptr);
             static constexpr double kRetryMults[5] = {1.25, 1.5, 2.0, 4.0, 4.0};
             for (uint32_t retry = 0u; retry < 5u && eff_d < (1u << 24); ++retry) {
               const uint64_t tsat0 = prof_on ? ob::monotonic_now_ns() : 0u;
@@ -2459,33 +3197,124 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
               rst = ob::buffer_sync_begin_read(p.out_buf);
               if (prof_on) ctx->prof.dma_sync_ns += (ob::monotonic_now_ns() - tdr0);
               if (rst != OB_OK) break;
-              raw_out = static_cast<const int8_t*>(ob_buffer_data(p.out_buf));
+              raw_out_ptr = ob_buffer_data(p.out_buf);
+              raw_out = static_cast<const int8_t*>(raw_out_ptr);
               read_active = true;
             }
           }
 
           if (rst == OB_OK && read_active) {
-            const uint64_t tq0 = prof_on ? ob::monotonic_now_ns() : 0u;
-            const float eff_scale_d = static_cast<float>(eff_d);
-            const float* sa_ptr =
-                (p.tm <= p.s_a_inline.size()) ? p.s_a_inline.data() : p.s_a_overflow.data();
-            const float* sb_base = p.w_tile ? p.w_tile->row_s_b.data() : p.s_b.data();
+            p.jobs_ptr = jobs;
+            p.im_ptr = &in_slots[p.in_slot];
+            p.raw_out = raw_out_ptr;
+            p.nb_k = nb_k;
+            p.eff_scale_d = static_cast<float>(eff_d);
+            p.store_first = p.is_first_k && skip_zero_init;
+            p.prof_on = prof_on;
+            p.dq_n_miss = 0u;
+            p.dq_col_ptrs_vec.clear();
+            p.dq_misses_vec.clear();
 
-            // Zero-copy NEON dequant-accum straight from mapped DMA-BUF into each sub-slice output!
-            for (uint32_t si = 0u; si < p.num_subs; ++si) {
-              const ob::FusedSubSlice& sub = p.subs[si];
-              const ob_gemm_f32_quant_job_t& job = jobs[sub.job_idx];
-              const float* sb_ptr = sb_base + sub.out_off;
-              for (uint32_t mi = 0; mi < p.tm; ++mi) {
-                const float sa_d = sa_ptr[mi] * eff_scale_d;
-                float* c_row = job.c_mn + static_cast<size_t>(p.m0 + mi) * job.n_dim + sub.n0;
-                const int8_t* o_row = raw_out + static_cast<size_t>(mi) * p.hw_n + sub.out_off;
-                ob::dequant_accum_row_f32_impl(c_row, o_row, sb_ptr, sub.tn, sa_d);
+            const InputSlotMeta& im = in_slots[p.in_slot];
+            p.has_outliers = (!p.is_w8a16) && im.has_outliers && (im.n_uniq > 0u);
+
+            // Resolve outlier_cols map lookups/emplacements on main thread (single writer to map!)
+            // so the SPSC helper only touches stable heap float* buffers with zero contention.
+            if (p.has_outliers) {
+              const uint64_t tmap0 = prof_on ? ob::monotonic_now_ns() : 0u;
+              const uint32_t n_uniq = im.n_uniq;
+              const uint32_t* uniq_ptr =
+                  im.uniq_k_overflow.empty() ? im.uniq_k_inline.data() : im.uniq_k_overflow.data();
+              const float** col_ptrs = p.dq_col_ptrs_stack.data();
+              if (n_uniq > p.dq_col_ptrs_stack.size()) {
+                p.dq_col_ptrs_vec.resize(n_uniq, nullptr);
+                col_ptrs = p.dq_col_ptrs_vec.data();
               }
+
+              ob::ensure_weight_cache_budget(ctx, false);
+              const size_t w_budget = ctx->weight_cache_max_bytes;
+              const size_t outlier_sub_cap =
+                  std::min<size_t>(256ULL * 1024ULL * 1024ULL, w_budget / 6u);
+              const size_t total_soft_cap = (w_budget / 8u) * 7u;
+              const size_t max_cols = ctx->max_cached_outlier_cols;
+              const size_t col_bytes = static_cast<size_t>(p.tn_total) * sizeof(float);
+
+              uint32_t n_miss = 0u;
+              uint32_t n_spill = 0u;
+              auto push_miss = [&](uint32_t u_idx, uint32_t k_off, float* dst) {
+                if (n_miss < p.dq_misses_stack.size() && p.dq_misses_vec.empty()) {
+                  p.dq_misses_stack[n_miss++] = {u_idx, k_off, dst};
+                } else {
+                  if (p.dq_misses_vec.empty()) {
+                    p.dq_misses_vec.assign(p.dq_misses_stack.data(),
+                                           p.dq_misses_stack.data() + n_miss);
+                  }
+                  p.dq_misses_vec.push_back({u_idx, k_off, dst});
+                  n_miss = static_cast<uint32_t>(p.dq_misses_vec.size());
+                }
+              };
+
+              for (uint32_t u = 0u; u < n_uniq; ++u) {
+                const uint32_t k_off = uniq_ptr[u];
+                const float* w_col = nullptr;
+                if (p.w_tile) {
+                  auto it = p.w_tile->outlier_cols.find(k_off);
+                  if (it != p.w_tile->outlier_cols.end() && it->second.size() >= p.tn_total) {
+                    w_col = it->second.data();
+                  } else if (p.w_tile->outlier_cols.size() < max_cols &&
+                             ctx->outlier_cache_bytes + col_bytes <= outlier_sub_cap &&
+                             ctx->weight_cache_bytes + col_bytes <= total_soft_cap) {
+                    std::vector<float> col(p.tn_total);
+                    auto res = p.w_tile->outlier_cols.emplace(k_off, std::move(col));
+                    if (res.second) {
+                      p.w_tile->outlier_cols_bytes += col_bytes;
+                      ctx->outlier_cache_bytes += col_bytes;
+                      ctx->weight_cache_bytes += col_bytes;
+                      if (ctx->weight_cache_bytes > ctx->weight_cache_peak_bytes) {
+                        ctx->weight_cache_peak_bytes = ctx->weight_cache_bytes;
+                      }
+                    }
+                    float* dst_p = res.first->second.data();
+                    w_col = dst_p;
+                    push_miss(u, k_off, dst_p);
+                  }
+                }
+                if (!w_col) {
+                  push_miss(u, k_off, nullptr);
+                  ++n_spill;
+                } else {
+                  col_ptrs[u] = w_col;
+                }
+              }
+
+              OutlierMissItem* misses_ptr =
+                  p.dq_misses_vec.empty() ? p.dq_misses_stack.data() : p.dq_misses_vec.data();
+              if (n_spill > 0u) {
+                p.spill_scratch.resize(static_cast<size_t>(n_spill) * p.tn_total);
+                uint32_t sp = 0u;
+                for (uint32_t i = 0u; i < n_miss; ++i) {
+                  if (!misses_ptr[i].dst) {
+                    float* dst_p = p.spill_scratch.data() +
+                                   static_cast<size_t>(sp++) * p.tn_total;
+                    misses_ptr[i].dst = dst_p;
+                    col_ptrs[misses_ptr[i].u_idx] = dst_p;
+                  }
+                }
+              }
+              p.dq_n_miss = n_miss;
+              if (prof_on) ctx->prof.dequant_ns += (ob::monotonic_now_ns() - tmap0);
             }
-            if (prof_on) ctx->prof.dequant_ns += (ob::monotonic_now_ns() - tq0);
-          }
-          if (read_active) {
+
+            if (use_async_dq) {
+              // Hand off NEON dequant + outlier FMA + buffer_sync_end_read to pinned SPSC helper!
+              p.dq_seq = ctx->async_dequant.push(&PendingF32Tile::run_dequant_job, &p);
+              last_dq_seq = p.dq_seq;
+              dispatched_async = true;
+            } else {
+              PendingF32Tile::run_dequant_job(&p);
+              rst = p.dq_status;
+            }
+          } else if (read_active) {
             const uint64_t td1 = prof_on ? ob::monotonic_now_ns() : 0u;
             ob_status_t est = ob::buffer_sync_end_read(p.out_buf);
             if (prof_on) ctx->prof.dma_sync_ns += (ob::monotonic_now_ns() - td1);
@@ -2494,38 +3323,93 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
         }
       }
     }
-    if (p.w_tile && p.w_tile->in_use > 0u) p.w_tile->in_use -= 1u;
-    if (in_refcnt[p.in_slot] > 0u) in_refcnt[p.in_slot] -= 1u;
+
     p.handle = 0u;
-    p.w_tile = nullptr;
-    p.in_buf = nullptr;
-    p.out_buf = nullptr;
-    p.num_subs = 0u;
-    ring_head = (ring_head + 1u) % ring_depth;
-    ring_count -= 1u;
-    return (wst != OB_OK) ? wst : rst;
+    ++tpu_seq;
+    if (!dispatched_async) {
+      // Completed inline (or mock/error): reap immediately when all earlier slots are reaped
+      reap_ready();
+    }
+    if (wst != OB_OK) return wst;
+    if (rst != OB_OK) return rst;
+    return first_dq_err;
+  };
+
+  auto harvest_one_blocking = [&]() -> ob_status_t {
+    PendingF32Tile& p = ring[static_cast<uint32_t>(tpu_seq % ring_depth)];
+    ob_invoke_stats_t istats {};
+    const uint64_t tw0 = prof_on ? ob::monotonic_now_ns() : 0u;
+    ob_status_t wst = ob::device_wait_handle(ctx, p.handle, ctx->cfg.timeout_ms, &istats);
+    if (prof_on) ctx->prof.wait_ns += (ob::monotonic_now_ns() - tw0);
+    return harvest_one_with_result(wst, istats);
+  };
+
+  // Non-blocking harvest: feed the SPSC helper immediately as soon as any TPU tile finishes!
+  auto try_harvest_ready = [&]() -> ob_status_t {
+    const uint64_t min_inflight = use_async_dq ? 1u : 2u;
+    while (sub_seq - tpu_seq >= min_inflight) {
+      PendingF32Tile& p = ring[static_cast<uint32_t>(tpu_seq % ring_depth)];
+      ob_status_t wst = OB_OK;
+      ob_invoke_stats_t istats {};
+      if (!ob::device_try_wait_handle(ctx, p.handle, &wst, &istats)) {
+        break;
+      }
+      ob_status_t hst = harvest_one_with_result(wst, istats);
+      if (hst != OB_OK) return hst;
+    }
+    reap_ready();
+    return first_dq_err;
+  };
+
+  // Ensure at least one free ring slot (sub_seq - reap_seq < ring_depth).
+  auto ensure_ring_slot = [&]() -> ob_status_t {
+    while (sub_seq - reap_seq >= ring_depth) {
+      reap_ready();
+      if (sub_seq - reap_seq < ring_depth) break;
+      if (reap_seq < tpu_seq) {
+        wait_and_reap_one_dq();
+      } else {
+        ob_status_t hst = harvest_one_blocking();
+        if (hst != OB_OK) return hst;
+      }
+    }
+    return first_dq_err;
+  };
+
+  auto drain_all_normal = [&]() -> ob_status_t {
+    while (tpu_seq < sub_seq) {
+      ob_status_t hst = harvest_one_blocking();
+      if (hst != OB_OK) return hst;
+      reap_ready();
+    }
+    if (use_async_dq && last_dq_seq > 0u) {
+      ctx->async_dequant.wait_until(last_dq_seq);
+    }
+    reap_ready();
+    return first_dq_err;
   };
 
   auto drain_all_cleanup = [&]() {
-    while (ring_count > 0u) {
-      PendingF32Tile& p = ring[ring_head];
-      ob::device_wait_handle(ctx, p.handle, ctx->cfg.timeout_ms, nullptr);
-      if (p.w_tile && p.w_tile->in_use > 0u) p.w_tile->in_use -= 1u;
-      if (in_refcnt[p.in_slot] > 0u) in_refcnt[p.in_slot] -= 1u;
-      p.handle = 0u;
-      p.w_tile = nullptr;
-      p.num_subs = 0u;
-      ring_head = (ring_head + 1u) % ring_depth;
-      ring_count -= 1u;
+    if (use_async_dq && last_dq_seq > 0u) {
+      ctx->async_dequant.wait_until(last_dq_seq);
     }
+    reap_ready();
+    while (tpu_seq < sub_seq) {
+      PendingF32Tile& p = ring[static_cast<uint32_t>(tpu_seq % ring_depth)];
+      if (p.handle != 0u) {
+        ob::device_wait_handle(ctx, p.handle, ctx->cfg.timeout_ms, nullptr);
+      }
+      p.dq_seq = 0u;
+      p.dq_status = OB_OK;
+      ++tpu_seq;
+    }
+    reap_ready();
   };
 
-  const uint32_t nb_k = k_dim / OB_QK8_0;
   std::vector<int8_t>& a_q_tile = ctx->gemm_aq_scratch;
   std::vector<int8_t>& b_q_tile = ctx->gemm_bq_scratch;
-  std::vector<float>& tmp_w_row = ctx->gemm_wrow_scratch;
   std::vector<float>& row_s_a = ctx->gemm_sa_scratch;
-  std::vector<std::vector<std::pair<uint32_t, float>>>& row_outliers = ctx->gemm_outliers_scratch;
+  std::vector<float> a_f32_tile;
   std::vector<float> row_s_b;
   std::vector<uint8_t> packed_tile;
   std::vector<ob::ScheduledGroup> groups;
@@ -2556,10 +3440,11 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
                                horiz_fusion, &groups);
 
     row_s_a.resize(tm);
-    row_outliers.resize(tm);
     uint32_t cached_a_k0 = 0xFFFFFFFFu;
     uint32_t cached_a_tk = 0u;
     uint32_t cached_aq_hw_k = 0u;
+    bool cached_a_is_w8a16 = false;
+    float cached_a_w8a16_prescale_inv = 1.0f;
     uint32_t cached_a_rms_shift = 0u;
     uint32_t active_in_slot = OB_MAX_CREDITS;
     ob_buffer* active_in_buf = nullptr;
@@ -2619,25 +3504,149 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
 
       bool tile_handled_by_hw = false;
       if (emitter != nullptr) {
-        // 1. Quantize shared A [hw_m, hw_k] ONCE per (k0, tk, hw_k) across all jobs & tiles!
-        if (cached_a_k0 != k0 || cached_a_tk != tk || cached_aq_hw_k != hw_k) {
-          const uint64_t tq0 = prof_on ? ob::monotonic_now_ns() : 0u;
-          a_q_tile.assign(static_cast<size_t>(hw_m) * hw_k, 0);
-          for (uint32_t mi = 0; mi < tm; ++mi) {
-            const float* a_row = a_mk + static_cast<size_t>(m0 + mi) * k_dim + k0;
-            int8_t* aq_row = a_q_tile.data() + static_cast<size_t>(mi) * hw_k;
-            ob::quantize_activation_row_split(
-                a_row, tk, aq_row, &row_s_a[mi],
-                builtin_active ? &row_outliers[mi] : nullptr);
+        // Decide whether this tile uses native 7-chunk PT W8A16(FP16) (full FP32 accum,
+        // zero activation quantization, zero outlier peel).
+        bool tile_use_w8a16 = false;
+        if (builtin_active && !ctx->mock_mode && w8a16_mode > 0u &&
+            hw_m == 1u && ob::is_w8a16_pt_1x_shape(1u, hw_k, hw_n)) {
+          if (w8a16_mode == 1u) {
+            tile_use_w8a16 = true;
+          } else {
+            // Selective auto mode: engage W8A16 on M=1 rows with severe outlier crest
+            const float* a_row = a_mk + static_cast<size_t>(m0) * k_dim + k0;
+            float am = 0.0f;
+            double sq = 0.0;
+            for (uint32_t ki = 0u; ki < tk; ++ki) {
+              const float v = a_row[ki];
+              const float av = std::fabs(v);
+              if (av > am) am = av;
+              sq += static_cast<double>(v) * static_cast<double>(v);
+            }
+            const double rms = std::sqrt(sq / static_cast<double>(std::max<uint32_t>(1u, tk)));
+            if (am > 16.0f || static_cast<double>(am) > 12.0 * std::max(rms, 1e-12)) {
+              tile_use_w8a16 = true;
+            }
           }
-          cached_a_rms_shift = builtin_active
-              ? ob::compute_activation_rms_shift(a_q_tile.data(), tm, tk, hw_k)
-              : 0u;
+        }
+
+        // 1. Quantize/prepare shared A ONCE per (k0, tk, hw_k, tile_use_w8a16) across sibling tiles
+        if (cached_a_k0 != k0 || cached_a_tk != tk || cached_aq_hw_k != hw_k ||
+            cached_a_is_w8a16 != tile_use_w8a16) {
+          ob_status_t rslot_st = ensure_ring_slot();
+          if (rslot_st != OB_OK) {
+            drain_all_cleanup();
+            return rslot_st;
+          }
+          uint32_t chosen = 0u;
+          for (uint32_t c = 0u; c < ring_depth; ++c) {
+            if (in_slots[c].refcnt == 0u) { chosen = c; break; }
+          }
+
+          const uint64_t tq0 = prof_on ? ob::monotonic_now_ns() : 0u;
+          InputSlotMeta& im = in_slots[chosen];
+          im.k0 = k0;
+          im.tk = tk;
+          im.tm = tm;
+          im.has_outliers = false;
+          im.n_uniq = 0u;
+          im.uniq_k_overflow.clear();
+
+          if (tile_use_w8a16) {
+            a_f32_tile.resize(hw_k);
+            const float* a_row = a_mk + static_cast<size_t>(m0) * k_dim + k0;
+            cached_a_w8a16_prescale_inv =
+                ob::prepare_w8a16_input_row_f32(a_row, tk, hw_k, a_f32_tile.data());
+            cached_a_rms_shift = 0u;
+          } else {
+            ob::RowOutliers* rows_dst = &im.row0;
+            if (tm > 1u) {
+              im.rows_vec.resize(tm);
+              rows_dst = im.rows_vec.data();
+            }
+
+            a_q_tile.resize(static_cast<size_t>(hw_m) * hw_k);
+            if (tm < hw_m) {
+              std::memset(a_q_tile.data() + static_cast<size_t>(tm) * hw_k, 0,
+                          static_cast<size_t>(hw_m - tm) * hw_k);
+            }
+
+            uint64_t sq_stack[64]{};
+            std::vector<uint64_t> sq_vec;
+            uint64_t* sq_ptr = sq_stack;
+            if (tm > 64u) {
+              sq_vec.assign(tm, 0ULL);
+              sq_ptr = sq_vec.data();
+            }
+
+            if (ctx->worker_pool.num_threads > 1u &&
+                tm >= 8u && static_cast<size_t>(tm) * tk >= 16384u) {
+              ctx->worker_pool.parallel_for_fn(tm, 4u, [&](uint32_t ms_lo, uint32_t ms_hi, uint32_t) {
+                for (uint32_t mi = ms_lo; mi < ms_hi; ++mi) {
+                  const float* a_row = a_mk + static_cast<size_t>(m0 + mi) * k_dim + k0;
+                  int8_t* aq_row = a_q_tile.data() + static_cast<size_t>(mi) * hw_k;
+                  ob::quantize_activation_row_split_fast(
+                      a_row, tk, aq_row, &row_s_a[mi],
+                      builtin_active ? &rows_dst[mi] : nullptr,
+                      builtin_active ? &sq_ptr[mi] : nullptr);
+                  if (tk < hw_k) std::memset(aq_row + tk, 0, hw_k - tk);
+                }
+              });
+            } else {
+              for (uint32_t mi = 0u; mi < tm; ++mi) {
+                const float* a_row = a_mk + static_cast<size_t>(m0 + mi) * k_dim + k0;
+                int8_t* aq_row = a_q_tile.data() + static_cast<size_t>(mi) * hw_k;
+                ob::quantize_activation_row_split_fast(
+                    a_row, tk, aq_row, &row_s_a[mi],
+                    builtin_active ? &rows_dst[mi] : nullptr,
+                    builtin_active ? &sq_ptr[mi] : nullptr);
+                if (tk < hw_k) std::memset(aq_row + tk, 0, hw_k - tk);
+              }
+            }
+
+            if (builtin_active) {
+              uint64_t max_sq = 0ULL;
+              uint32_t n_uniq = 0u;
+              for (uint32_t mi = 0u; mi < tm; ++mi) {
+                if (sq_ptr[mi] > max_sq) max_sq = sq_ptr[mi];
+                ob::RowOutliers& ro = rows_dst[mi];
+                if (ro.count == 0u) continue;
+                im.has_outliers = true;
+                for (uint32_t oi = 0u; oi < ro.count; ++oi) {
+                  const uint32_t ko = ro.k_off[oi];
+                  const uint32_t* up =
+                      im.uniq_k_overflow.empty() ? im.uniq_k_inline.data() : im.uniq_k_overflow.data();
+                  uint32_t found = n_uniq;
+                  for (uint32_t u = 0u; u < n_uniq; ++u) {
+                    if (up[u] == ko) { found = u; break; }
+                  }
+                  if (found == n_uniq) {
+                    if (n_uniq < im.uniq_k_inline.size() && im.uniq_k_overflow.empty()) {
+                      im.uniq_k_inline[n_uniq] = ko;
+                    } else {
+                      if (im.uniq_k_overflow.empty()) {
+                        im.uniq_k_overflow.assign(im.uniq_k_inline.data(),
+                                                  im.uniq_k_inline.data() + n_uniq);
+                      }
+                      im.uniq_k_overflow.push_back(ko);
+                    }
+                    ++n_uniq;
+                  }
+                  ro.uniq_idx[oi] = static_cast<uint16_t>(found);
+                }
+              }
+              im.n_uniq = n_uniq;
+              cached_a_rms_shift = ob::compute_rms_shift_from_max_sq(max_sq, tk);
+            } else {
+              cached_a_rms_shift = 0u;
+            }
+          }
+
           if (prof_on) ctx->prof.quant_ns += (ob::monotonic_now_ns() - tq0);
           cached_a_k0 = k0;
           cached_a_tk = tk;
           cached_aq_hw_k = hw_k;
-          active_in_slot = OB_MAX_CREDITS;
+          cached_a_is_w8a16 = tile_use_w8a16;
+          active_in_slot = chosen;
           active_in_buf = nullptr;
         }
 
@@ -2645,8 +3654,8 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
         ob::CachedWeightTile* w_tile = nullptr;
         uint32_t scale_d = 1u;
         if (builtin_active) {
-          const bool is_lt64_tile = ob::is_lt_64x_shape(hw_m, hw_k, hw_n);
-          const uint32_t pack_fmt = is_lt64_tile ? 1u : 0u;
+          const bool is_lt64_tile = (!tile_use_w8a16) && ob::is_lt_64x_shape(hw_m, hw_k, hw_n);
+          const uint32_t pack_fmt = tile_use_w8a16 ? 2u : (is_lt64_tile ? 1u : 0u);
           const uint64_t th0 = prof_on ? ob::monotonic_now_ns() : 0u;
           uint64_t wh = 0ULL;
           if (num_subs == 1u) {
@@ -2691,59 +3700,97 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
 
           if (!w_tile) {
             const uint64_t tp0 = prof_on ? ob::monotonic_now_ns() : 0u;
-            b_q_tile.assign(static_cast<size_t>(hw_n) * hw_k, 0);
+            b_q_tile.resize(static_cast<size_t>(hw_n) * hw_k);
+            if (tn_total < hw_n) {
+              std::memset(b_q_tile.data() + static_cast<size_t>(tn_total) * hw_k, 0,
+                          static_cast<size_t>(hw_n - tn_total) * hw_k);
+            }
             std::vector<float> sb_vec(tn_total, 0.0f);
+            std::vector<ob::RowNormStats> row_stats(tile_use_w8a16 ? 0u : tn_total);
             uint32_t min_sub_d = 0xFFFFFFFFu;
+            double all_max_l2 = 0.0;
+            uint64_t all_max_l1 = 0ULL;
+            uint64_t all_max_asum = 0ULL;
 
             for (uint32_t si = 0u; si < num_subs; ++si) {
               const ob::FusedSubSlice& sub = grp.subs[si];
               const ob_gemm_f32_quant_job_t& job = jobs[sub.job_idx];
               int8_t* bq_dst = b_q_tile.data() + static_cast<size_t>(sub.out_off) * hw_k;
               float* sb_dst = sb_vec.data() + sub.out_off;
+              ob::RowNormStats* st_dst =
+                  tile_use_w8a16 ? nullptr : (row_stats.data() + sub.out_off);
               if (job.is_q4_0 != 0u) {
                 ob::requant_q4_0_rows(static_cast<const ob_block_q4_0_t*>(job.b_nk),
                                       nb_k, sub.n0, sub.tn, blk0, blk_cnt,
-                                      tk, hw_k, bq_dst, sb_dst, &tmp_w_row);
+                                      tk, hw_k, bq_dst, sb_dst, &ctx->worker_pool, st_dst);
               } else {
                 ob::requant_q8_0_rows(static_cast<const ob_block_q8_0_t*>(job.b_nk),
                                       nb_k, sub.n0, sub.tn, blk0, blk_cnt,
-                                      tk, hw_k, bq_dst, sb_dst, &tmp_w_row);
+                                      tk, hw_k, bq_dst, sb_dst, &ctx->worker_pool, st_dst);
               }
-              if (num_subs >= 2u) {
-                uint32_t sd = ob::compute_tile_scale_D(bq_dst, sub.tn, tk, hw_k);
-                if (sd < min_sub_d) min_sub_d = sd;
+              if (!tile_use_w8a16) {
+                double sub_max_l2 = 0.0;
+                uint64_t sub_max_l1 = 0ULL;
+                uint64_t sub_max_asum = 0ULL;
+                for (uint32_t ni = 0u; ni < sub.tn; ++ni) {
+                  if (st_dst[ni].l2 > sub_max_l2) sub_max_l2 = st_dst[ni].l2;
+                  if (st_dst[ni].l1 > sub_max_l1) sub_max_l1 = st_dst[ni].l1;
+                  if (st_dst[ni].asum > sub_max_asum) sub_max_asum = st_dst[ni].asum;
+                }
+                if (sub_max_l2 > all_max_l2) all_max_l2 = sub_max_l2;
+                if (sub_max_l1 > all_max_l1) all_max_l1 = sub_max_l1;
+                if (sub_max_asum > all_max_asum) all_max_asum = sub_max_asum;
+                if (num_subs >= 2u) {
+                  uint32_t sd = ob::compute_scale_D_from_maxima(
+                      sub_max_l2, sub_max_l1, sub_max_asum, tk, 0);
+                  if (sd < min_sub_d) min_sub_d = sd;
+                }
               }
             }
 
-            scale_d = ob::compute_tile_scale_D(b_q_tile.data(), tn_total, tk, hw_k);
+            if (!tile_use_w8a16) {
+              scale_d = ob::compute_scale_D_from_maxima(
+                  all_max_l2, all_max_l1, all_max_asum, tk, 0);
 
-            // Precision guard for horizontal fusion: if any sub-job's optimal D is
-            // > 1.5x smaller than the fused D (e.g. mixed sparse+dense synthetic test),
-            // cache a zero-byte split sentinel and run sub-jobs independently with exact D.
-            if (num_subs >= 2u && min_sub_d > 0u && (scale_d * 2u > min_sub_d * 3u)) {
-              ob::CachedWeightTile* sentinel = new (std::nothrow) ob::CachedWeightTile();
-              if (sentinel) {
-                sentinel->key = wh;
-                sentinel->scale_d = scale_d;
-                sentinel->hw_k = hw_k;
-                sentinel->hw_n = hw_n;
-                sentinel->ext2_buf = nullptr;
-                sentinel->ext2_bytes = 0u;
-                sentinel->rejected_fusion = true;
-                ob::weight_cache_insert_locked(ctx, sentinel);
+              if (num_subs >= 2u && min_sub_d > 0u && (scale_d * 2u > min_sub_d * 3u)) {
+                ob::CachedWeightTile* sentinel = new (std::nothrow) ob::CachedWeightTile();
+                if (sentinel) {
+                  sentinel->key = wh;
+                  sentinel->scale_d = scale_d;
+                  sentinel->hw_k = hw_k;
+                  sentinel->hw_n = hw_n;
+                  sentinel->ext2_buf = nullptr;
+                  sentinel->ext2_bytes = 0u;
+                  sentinel->rejected_fusion = true;
+                  ob::weight_cache_insert_locked(ctx, sentinel);
+                }
+                if (prof_on) ctx->prof.weight_pack_ns += (ob::monotonic_now_ns() - tp0);
+                return fallback_split_subs();
               }
-              if (prof_on) ctx->prof.weight_pack_ns += (ob::monotonic_now_ns() - tp0);
-              return fallback_split_subs();
             }
 
-            std::vector<uint8_t> ext2 = is_lt64_tile
-                ? ob::pack_ext2_for_lt_64x(hw_n, hw_k, b_q_tile.data(), nullptr)
-                : ob::pack_ext2_for_tile(hw_n, hw_k, b_q_tile.data(), nullptr);
+            const size_t ext2_sz = tile_use_w8a16
+                ? ob::pack_w8a16_ext2_size(hw_n, hw_k)
+                : (is_lt64_tile ? ob::pack_ext2_size_for_lt_64x(hw_n, hw_k)
+                                : ob::pack_ext2_size_for_tile(hw_n, hw_k, false));
             ob_buffer* wbuf = nullptr;
             ob_status_t wst = ob_buffer_alloc(
-                ctx, ext2.size(), OB_BUF_BIDIRECTIONAL | OB_BUF_NO_POOL | OB_BUF_ZERO_INIT, &wbuf);
+                ctx, ext2_sz, OB_BUF_BIDIRECTIONAL | OB_BUF_NO_POOL, &wbuf);
             if (wst == OB_OK) {
-              wst = ob_buffer_write(wbuf, ext2.data(), ext2.size(), 0u);
+              wst = ob::buffer_sync_begin_write(wbuf);
+              if (wst == OB_OK) {
+                uint8_t* dst_ext2 = static_cast<uint8_t*>(ob_buffer_data(wbuf));
+                if (tile_use_w8a16) {
+                  ob::pack_w8a16_ext2_into(dst_ext2, hw_n, hw_k, b_q_tile.data());
+                } else if (is_lt64_tile) {
+                  ob::pack_ext2_for_lt_64x_into(
+                      dst_ext2, hw_n, hw_k, b_q_tile.data(), nullptr, &ctx->worker_pool);
+                } else {
+                  ob::pack_ext2_for_tile_into(
+                      dst_ext2, hw_n, hw_k, b_q_tile.data(), nullptr, false, &ctx->worker_pool);
+                }
+                wst = ob::buffer_sync_end_write(wbuf);
+              }
             }
             if (prof_on) ctx->prof.weight_pack_ns += (ob::monotonic_now_ns() - tp0);
             if (wst != OB_OK) {
@@ -2763,7 +3810,7 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
             w_tile->hw_n = hw_n;
             w_tile->row_s_b = std::move(sb_vec);
             w_tile->ext2_buf = wbuf;
-            w_tile->ext2_bytes = ext2.size();
+            w_tile->ext2_bytes = ext2_sz;
             ob::weight_cache_insert_locked(ctx, w_tile);
           } else {
             scale_d = w_tile->scale_d;
@@ -2777,66 +3824,71 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
           if (job.is_q4_0 != 0u) {
             ob::requant_q4_0_rows(static_cast<const ob_block_q4_0_t*>(job.b_nk),
                                   nb_k, sub.n0, sub.tn, blk0, blk_cnt,
-                                  tk, hw_k, b_q_tile.data(), row_s_b.data(), &tmp_w_row);
+                                  tk, hw_k, b_q_tile.data(), row_s_b.data(),
+                                  &ctx->worker_pool, nullptr);
           } else {
             ob::requant_q8_0_rows(static_cast<const ob_block_q8_0_t*>(job.b_nk),
                                   nb_k, sub.n0, sub.tn, blk0, blk_cnt,
-                                  tk, hw_k, b_q_tile.data(), row_s_b.data(), &tmp_w_row);
+                                  tk, hw_k, b_q_tile.data(), row_s_b.data(),
+                                  &ctx->worker_pool, nullptr);
           }
           scale_d = ob::compute_tile_scale_D(b_q_tile.data(), sub.tn, tk, hw_k);
         }
 
-        if (builtin_active && cached_a_rms_shift > 0u) {
+        if (!tile_use_w8a16 && builtin_active && cached_a_rms_shift > 0u) {
           scale_d = ob::quant_scale_D_grid(
               static_cast<double>(std::max<uint32_t>(1u, scale_d >> cached_a_rms_shift)));
         }
 
-        if (ring_count >= ring_depth) {
-          ob_status_t dst = drain_one();
-          if (dst != OB_OK) {
-            drain_all_cleanup();
-            return dst;
-          }
+        ob_status_t rslot_st = ensure_ring_slot();
+        if (rslot_st != OB_OK) {
+          drain_all_cleanup();
+          return rslot_st;
         }
-        const uint32_t slot = (ring_head + ring_count) % ring_depth;
-
-        ob_gemm_desc_t desc {};
-        desc.m_dim = hw_m;
-        desc.k_dim = hw_k;
-        desc.n_dim = hw_n;
-        desc.s_in = 1.0f;
-        desc.zp_in = 0;
-        desc.s_w = 1.0f;
-        desc.zp_w = 0;
-        desc.s_out = static_cast<float>(scale_d);
-        desc.zp_out = 0;
-        desc.activation = OB_ACT_NONE;
-        desc.bias_n = nullptr;
-        if (builtin_active) {
-          desc.weights_nk = nullptr;
-          desc.cache_key = ob::hash_shape_key(
-              hw_m, hw_k, hw_n, 0, 0, scale_d, slot % param_swap_slots);
-        } else {
-          desc.weights_nk = b_q_tile.data();
-          const size_t packed_sz = ob_gemm_packed_weight_bytes(hw_k, hw_n);
-          packed_tile.resize(packed_sz);
-          ob_status_t pst = ob_gemm_pack_weights_int8(
-              b_q_tile.data(), nullptr, hw_k, hw_n, packed_tile.data(), packed_tile.size());
-          if (pst != OB_OK) {
-            drain_all_cleanup();
-            return pst;
-          }
-          desc.packed_params = packed_tile.data();
-          desc.packed_params_bytes = packed_tile.size();
-          desc.cache_key = ob::hash_tile_key(
-              hw_m, hw_k, hw_n, 0, 0, scale_d, b_q_tile.data(), b_q_tile.size());
-        }
+        const uint32_t slot = static_cast<uint32_t>(sub_seq % ring_depth);
 
         const uint64_t ts0 = prof_on ? ob::monotonic_now_ns() : 0u;
         ob::CachedGraph* entry = nullptr;
         bool was_hit = false;
-        ob_status_t gst = ob::acquire_tile_entry(
-            ctx, emitter, emitter_ud, desc, &entry, &was_hit);
+        ob_status_t gst = OB_OK;
+        if (tile_use_w8a16) {
+          gst = ob::acquire_w8a16_pt_1x_entry(
+              ctx, hw_k, hw_n, 1.0f, slot % param_swap_slots, &entry, &was_hit);
+        } else {
+          ob_gemm_desc_t desc {};
+          desc.m_dim = hw_m;
+          desc.k_dim = hw_k;
+          desc.n_dim = hw_n;
+          desc.s_in = 1.0f;
+          desc.zp_in = 0;
+          desc.s_w = 1.0f;
+          desc.zp_w = 0;
+          desc.s_out = static_cast<float>(scale_d);
+          desc.zp_out = 0;
+          desc.activation = OB_ACT_NONE;
+          desc.bias_n = nullptr;
+          if (builtin_active) {
+            desc.weights_nk = nullptr;
+            desc.cache_key = ob::hash_shape_key(
+                hw_m, hw_k, hw_n, 0, 0, scale_d, slot % param_swap_slots);
+          } else {
+            desc.weights_nk = b_q_tile.data();
+            const size_t packed_sz = ob_gemm_packed_weight_bytes(hw_k, hw_n);
+            packed_tile.resize(packed_sz);
+            ob_status_t pst = ob_gemm_pack_weights_int8(
+                b_q_tile.data(), nullptr, hw_k, hw_n, packed_tile.data(), packed_tile.size());
+            if (pst != OB_OK) {
+              drain_all_cleanup();
+              return pst;
+            }
+            desc.packed_params = packed_tile.data();
+            desc.packed_params_bytes = packed_tile.size();
+            desc.cache_key = ob::hash_tile_key(
+                hw_m, hw_k, hw_n, 0, 0, scale_d, b_q_tile.data(), b_q_tile.size());
+          }
+          gst = ob::acquire_tile_entry(ctx, emitter, emitter_ud, desc, &entry, &was_hit);
+        }
+
         if (gst == OB_OK) {
           tiles_dispatched += 1u;
           used_emitter = true;
@@ -2846,12 +3898,19 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
             ctx->prof.horiz_jobs_saved += (num_subs - 1u);
           }
 
+          const size_t in_bytes = tile_use_w8a16
+              ? (a_f32_tile.size() * sizeof(float))
+              : a_q_tile.size();
+          const void* in_src = tile_use_w8a16
+              ? static_cast<const void*>(a_f32_tile.data())
+              : static_cast<const void*>(a_q_tile.data());
           size_t in_alloc = std::max<size_t>(
-              a_q_tile.size(),
+              in_bytes,
               !entry->parsed.input_sizes.empty()
                   ? static_cast<size_t>(entry->parsed.input_sizes[0]) : 1u);
           size_t out_alloc = std::max<size_t>(
-              static_cast<size_t>(hw_m) * ob::align_up_u32(hw_n, 4u),
+              tile_use_w8a16 ? (static_cast<size_t>(hw_n) * sizeof(float))
+                             : (static_cast<size_t>(hw_m) * ob::align_up_u32(hw_n, 4u)),
               !entry->parsed.output_sizes.empty()
                   ? static_cast<size_t>(entry->parsed.output_sizes[0]) : 1u);
 
@@ -2860,23 +3919,31 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
               ctx, &ctx->gemm_out_bufs_4k[slot], &ctx->gemm_out_bufs[slot], out_alloc, &out_buf);
           if (bst == OB_OK) {
             // Share ONE synced input DMA-BUF across all sibling tiles sharing (k0, tk, hw_k)!
-            if (active_in_slot == OB_MAX_CREDITS ||
-                !active_in_buf ||
-                active_in_buf->slab.alloc_size < in_alloc) {
-              uint32_t chosen = 0u;
-              for (uint32_t c = 0u; c < ring_depth; ++c) {
-                if (in_refcnt[c] == 0u) { chosen = c; break; }
+            if (!active_in_buf || active_in_buf->slab.alloc_size < in_alloc) {
+              while (in_slots[active_in_slot].refcnt > 0u) {
+                reap_ready();
+                if (in_slots[active_in_slot].refcnt == 0u) break;
+                if (reap_seq < tpu_seq) {
+                  wait_and_reap_one_dq();
+                } else if (tpu_seq < sub_seq) {
+                  bst = harvest_one_blocking();
+                  if (bst != OB_OK) break;
+                } else {
+                  break;
+                }
               }
               ob_buffer* in_buf = nullptr;
-              bst = ob::ensure_pipeline_buf_tiered(
-                  ctx, &ctx->gemm_in_bufs_4k[chosen], &ctx->gemm_in_bufs[chosen], in_alloc, &in_buf);
+              if (bst == OB_OK) {
+                bst = ob::ensure_pipeline_buf_tiered(
+                    ctx, &ctx->gemm_in_bufs_4k[active_in_slot],
+                    &ctx->gemm_in_bufs[active_in_slot], in_alloc, &in_buf);
+              }
               if (bst == OB_OK) {
                 const uint64_t td0 = prof_on ? ob::monotonic_now_ns() : 0u;
-                bst = ob_buffer_write(in_buf, a_q_tile.data(), a_q_tile.size(), 0u);
+                bst = ob_buffer_write(in_buf, in_src, in_bytes, 0u);
                 if (prof_on) ctx->prof.dma_sync_ns += (ob::monotonic_now_ns() - td0);
               }
               if (bst == OB_OK) {
-                active_in_slot = chosen;
                 active_in_buf = in_buf;
               }
             }
@@ -2906,7 +3973,7 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
           p.out_buf = out_buf;
           p.slot = slot;
           p.in_slot = active_in_slot;
-          in_refcnt[active_in_slot] += 1u;
+          in_slots[active_in_slot].refcnt += 1u;
           p.m0 = m0;
           p.tm = tm;
           p.hw_m = hw_m;
@@ -2914,138 +3981,27 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
           p.hw_n = hw_n;
           p.tn_total = tn_total;
           p.num_subs = num_subs;
+          p.is_first_k = (k0 == 0u);
+          p.is_w8a16 = tile_use_w8a16;
+          p.w8a16_prescale_inv = tile_use_w8a16 ? cached_a_w8a16_prescale_inv : 1.0f;
           for (uint32_t si = 0u; si < num_subs; ++si) p.subs[si] = grp.subs[si];
           p.scale_d_u32 = scale_d;
-          if (tm <= p.s_a_inline.size()) {
-            for (uint32_t mi = 0; mi < tm; ++mi) p.s_a_inline[mi] = row_s_a[mi];
-          } else {
-            p.s_a_overflow = row_s_a;
+          if (!tile_use_w8a16) {
+            if (tm <= p.s_a_inline.size()) {
+              for (uint32_t mi = 0; mi < tm; ++mi) p.s_a_inline[mi] = row_s_a[mi];
+            } else {
+              p.s_a_overflow = row_s_a;
+            }
           }
           if (!w_tile) p.s_b = row_s_b;
-          ring_count += 1u;
+          ++sub_seq;
 
           if (!ctx->mock_mode) {
             tile_handled_by_hw = true;
-            // Overlapped with in-flight TPU tile: add sparse exact FP32 residual for <=8 peeled outliers
-            // using deduplicated k_off + lazy per-tile FP32 outlier-column cache + ARM64 NEON FMA!
-            bool any_outliers = false;
-            for (uint32_t mi = 0u; mi < tm; ++mi) {
-              if (!row_outliers[mi].empty()) {
-                any_outliers = true;
-                break;
-              }
-            }
-            if (any_outliers) {
-              const uint64_t to0 = prof_on ? ob::monotonic_now_ns() : 0u;
-              uint32_t uniq_k_stack[512]{};
-              std::vector<uint32_t> uniq_k_vec;
-              uint32_t n_uniq = 0u;
-              const uint32_t* uniq_ptr = uniq_k_stack;
-              for (uint32_t mi = 0u; mi < tm; ++mi) {
-                for (const auto& ov : row_outliers[mi]) {
-                  bool seen = false;
-                  for (uint32_t u = 0u; u < n_uniq; ++u) {
-                    if (uniq_ptr[u] == ov.first) { seen = true; break; }
-                  }
-                  if (!seen) {
-                    if (n_uniq < 512u && uniq_k_vec.empty()) {
-                      uniq_k_stack[n_uniq++] = ov.first;
-                    } else {
-                      if (uniq_k_vec.empty()) {
-                        uniq_k_vec.assign(uniq_k_stack, uniq_k_stack + n_uniq);
-                      }
-                      uniq_k_vec.push_back(ov.first);
-                      uniq_ptr = uniq_k_vec.data();
-                      n_uniq = static_cast<uint32_t>(uniq_k_vec.size());
-                    }
-                  }
-                }
-              }
-
-              auto extract_col = [&](uint32_t k_off, float* dst_col) {
-                const uint32_t abs_k = k0 + k_off;
-                const uint32_t b_idx = abs_k / OB_QK8_0;
-                const uint32_t j_idx = abs_k % OB_QK8_0;
-                for (uint32_t si = 0u; si < num_subs; ++si) {
-                  const ob::FusedSubSlice& sub = grp.subs[si];
-                  const ob_gemm_f32_quant_job_t& job = jobs[sub.job_idx];
-                  float* out_p = dst_col + sub.out_off;
-                  if (job.is_q4_0 != 0u) {
-                    const ob_block_q4_0_t* b_q4 = static_cast<const ob_block_q4_0_t*>(job.b_nk);
-                    constexpr uint32_t kHalf = OB_QK8_0 / 2u;
-                    const bool hi_nib = (j_idx >= kHalf);
-                    const uint32_t byte_idx = hi_nib ? (j_idx - kHalf) : j_idx;
-                    for (uint32_t ni = 0u; ni < sub.tn; ++ni) {
-                      if (ni + 4u < sub.tn) {
-                        __builtin_prefetch(
-                            &b_q4[static_cast<size_t>(sub.n0 + ni + 4u) * nb_k + b_idx], 0, 1);
-                      }
-                      const ob_block_q4_0_t& blk =
-                          b_q4[static_cast<size_t>(sub.n0 + ni) * nb_k + b_idx];
-                      const uint8_t byte = blk.qs[byte_idx];
-                      const int32_t q =
-                          static_cast<int32_t>(hi_nib ? (byte >> 4) : (byte & 0x0Fu)) - 8;
-                      out_p[ni] = ob::fp16_to_fp32(blk.d) * static_cast<float>(q);
-                    }
-                  } else {
-                    const ob_block_q8_0_t* b_q8 = static_cast<const ob_block_q8_0_t*>(job.b_nk);
-                    for (uint32_t ni = 0u; ni < sub.tn; ++ni) {
-                      if (ni + 4u < sub.tn) {
-                        __builtin_prefetch(
-                            &b_q8[static_cast<size_t>(sub.n0 + ni + 4u) * nb_k + b_idx], 0, 1);
-                      }
-                      const ob_block_q8_0_t& blk =
-                          b_q8[static_cast<size_t>(sub.n0 + ni) * nb_k + b_idx];
-                      out_p[ni] = ob::fp16_to_fp32(blk.d) * static_cast<float>(blk.qs[j_idx]);
-                    }
-                  }
-                }
-              };
-
-              constexpr size_t kMaxCachedOutlierCols = 24u;
-              const size_t w_budget = ob::compute_weight_cache_budget_bytes(ctx);
-              for (uint32_t u = 0u; u < n_uniq; ++u) {
-                const uint32_t k_off = uniq_ptr[u];
-                const float* w_col = nullptr;
-                if (w_tile) {
-                  auto it = w_tile->outlier_cols.find(k_off);
-                  if (it != w_tile->outlier_cols.end() && it->second.size() >= tn_total) {
-                    w_col = it->second.data();
-                  } else if (w_tile->outlier_cols.size() < kMaxCachedOutlierCols &&
-                             ctx->weight_cache_bytes + static_cast<size_t>(tn_total) * sizeof(float) <= w_budget) {
-                    std::vector<float> col(tn_total);
-                    extract_col(k_off, col.data());
-                    const size_t col_bytes = col.size() * sizeof(float);
-                    auto res = w_tile->outlier_cols.emplace(k_off, std::move(col));
-                    if (res.second) {
-                      w_tile->outlier_cols_bytes += col_bytes;
-                      ctx->weight_cache_bytes += col_bytes;
-                      if (ctx->weight_cache_bytes > ctx->weight_cache_peak_bytes) {
-                        ctx->weight_cache_peak_bytes = ctx->weight_cache_bytes;
-                      }
-                    }
-                    w_col = res.first->second.data();
-                  }
-                }
-                if (!w_col) {
-                  ctx->gemm_wcol_scratch.resize(tn_total);
-                  extract_col(k_off, ctx->gemm_wcol_scratch.data());
-                  w_col = ctx->gemm_wcol_scratch.data();
-                }
-                for (uint32_t mi = 0u; mi < tm; ++mi) {
-                  for (const auto& ov : row_outliers[mi]) {
-                    if (ov.first != k_off) continue;
-                    const float x_val = ov.second;
-                    for (uint32_t si = 0u; si < num_subs; ++si) {
-                      const ob::FusedSubSlice& sub = grp.subs[si];
-                      const ob_gemm_f32_quant_job_t& job = jobs[sub.job_idx];
-                      float* c_row = job.c_mn + static_cast<size_t>(m0 + mi) * job.n_dim + sub.n0;
-                      ob::neon_fma_row_f32(c_row, w_col + sub.out_off, sub.tn, x_val);
-                    }
-                  }
-                }
-              }
-              if (prof_on) ctx->prof.dequant_ns += (ob::monotonic_now_ns() - to0);
+            ob_status_t od_st = try_harvest_ready();
+            if (od_st != OB_OK) {
+              drain_all_cleanup();
+              return od_st;
             }
           }
         } else if (gst != OB_ERR_UNSUPPORTED) {
@@ -3057,6 +4013,23 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
       }
 
       if (!tile_handled_by_hw) {
+        if (skip_zero_init) {
+          ob_status_t dst = drain_all_normal();
+          if (dst != OB_OK) {
+            drain_all_cleanup();
+            return dst;
+          }
+          if (k0 == 0u) {
+            for (uint32_t si = 0u; si < num_subs; ++si) {
+              const ob::FusedSubSlice& sub = grp.subs[si];
+              const ob_gemm_f32_quant_job_t& job = jobs[sub.job_idx];
+              for (uint32_t mi = 0u; mi < tm; ++mi) {
+                std::memset(job.c_mn + static_cast<size_t>(m0 + mi) * job.n_dim + sub.n0, 0,
+                            static_cast<size_t>(sub.tn) * sizeof(float));
+              }
+            }
+          }
+        }
         used_cpu_fallback = true;
         for (uint32_t si = 0u; si < num_subs; ++si) {
           const ob::FusedSubSlice& sub = grp.subs[si];
@@ -3084,8 +4057,8 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
     }
   }
 
-  while (ring_count > 0u) {
-    ob_status_t dst = drain_one();
+  {
+    ob_status_t dst = drain_all_normal();
     if (dst != OB_OK) {
       drain_all_cleanup();
       return dst;
@@ -3095,8 +4068,9 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
   const uint64_t tact0 = prof_on ? ob::monotonic_now_ns() : 0u;
   for (uint32_t j = 0; j < num_jobs; ++j) {
     if (jobs[j].activation != OB_ACT_NONE) {
-      ob::apply_activation_inplace_impl(
-          jobs[j].c_mn, static_cast<size_t>(m_dim) * jobs[j].n_dim, jobs[j].activation);
+      ob::apply_activation_inplace_parallel(
+          jobs[j].c_mn, static_cast<size_t>(m_dim) * jobs[j].n_dim,
+          jobs[j].activation, &ctx->worker_pool);
     }
   }
   if (prof_on) ctx->prof.dequant_ns += (ob::monotonic_now_ns() - tact0);
@@ -3158,18 +4132,23 @@ ob_status_t ob_gemm_swiglu_int8(ob_context_t* ctx,
   const uint32_t H = desc->h_dim;
   const uint32_t N = desc->n_dim;
 
-  // Pack ext[2] for the 3 weight matrices
-  std::vector<uint8_t> ext2 = ob::pack_ext2_for_swiglu(
-      M, K, H, N,
-      desc->wg_hk, desc->bg_h,
-      desc->wu_hk, desc->bu_h,
-      desc->wd_nh, desc->bd_n);
-
+  // Pack ext[2] for the 3 weight matrices directly into DMA-BUF via parallel NEON packer
+  const size_t ext2_sz = ob::pack_ext2_size_for_swiglu(M, K, H, N);
   ob_buffer* wbuf = nullptr;
   ob_status_t st = ob_buffer_alloc(
-      ctx, ext2.size(), OB_BUF_BIDIRECTIONAL | OB_BUF_NO_POOL | OB_BUF_ZERO_INIT, &wbuf);
+      ctx, ext2_sz, OB_BUF_BIDIRECTIONAL | OB_BUF_NO_POOL, &wbuf);
   if (st != OB_OK) return st;
-  st = ob_buffer_write(wbuf, ext2.data(), ext2.size(), 0u);
+  st = ob::buffer_sync_begin_write(wbuf);
+  if (st == OB_OK) {
+    ob::pack_ext2_for_swiglu_into(
+        static_cast<uint8_t*>(ob_buffer_data(wbuf)),
+        M, K, H, N,
+        desc->wg_hk, desc->bg_h,
+        desc->wu_hk, desc->bu_h,
+        desc->wd_nh, desc->bd_n,
+        &ctx->worker_pool);
+    st = ob::buffer_sync_end_write(wbuf);
+  }
   if (st != OB_OK) {
     ob_buffer_free(wbuf);
     return st;
@@ -3426,30 +4405,122 @@ float neon_dot_f32_q4_row(const float* a, const ob_block_q4_0_t* row, uint32_t n
 #endif
 }
 
+// Exact max|w| of one quantized row directly from Q8_0/Q4_0 blocks (zero FP32 temp buffer!).
+float quant_row_max_abs(const void* blocks_base, uint8_t is_q4_0,
+                        uint32_t nb_stride, uint32_t row_idx,
+                        uint32_t blk0, uint32_t blk_cnt) {
+  float rm = 0.0f;
+  if (is_q4_0 != 0u) {
+    const ob_block_q4_0_t* b_row =
+        static_cast<const ob_block_q4_0_t*>(blocks_base) +
+        static_cast<size_t>(row_idx) * nb_stride + blk0;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    const uint8x16_t mask_lo = vdupq_n_u8(0x0Fu);
+    const int8x16_t bias_8 = vdupq_n_s8(-8);
+    for (uint32_t bi = 0u; bi < blk_cnt; ++bi) {
+      const float d = std::fabs(ob::fp16_to_fp32(b_row[bi].d));
+      if (d == 0.0f) continue;
+      uint8x16_t raw = vld1q_u8(b_row[bi].qs);
+      int8x16_t lo8 = vaddq_s8(vreinterpretq_s8_u8(vandq_u8(raw, mask_lo)), bias_8);
+      int8x16_t hi8 = vaddq_s8(vreinterpretq_s8_u8(vshrq_n_u8(raw, 4)), bias_8);
+      uint8x16_t mx = vmaxq_u8(vreinterpretq_u8_s8(vabsq_s8(lo8)),
+                               vreinterpretq_u8_s8(vabsq_s8(hi8)));
+      const float bm = d * static_cast<float>(vmaxvq_u8(mx));
+      if (bm > rm) rm = bm;
+    }
+#else
+    constexpr uint32_t kHalf = OB_QK8_0 / 2u;
+    for (uint32_t bi = 0u; bi < blk_cnt; ++bi) {
+      const float d = std::fabs(ob::fp16_to_fp32(b_row[bi].d));
+      if (d == 0.0f) continue;
+      const uint8_t* qs = b_row[bi].qs;
+      int32_t qm = 0;
+      for (uint32_t j = 0u; j < kHalf; ++j) {
+        const uint8_t byte = qs[j];
+        int32_t a0 = static_cast<int32_t>(byte & 0x0Fu) - 8;
+        int32_t a1 = static_cast<int32_t>(byte >> 4) - 8;
+        if (a0 < 0) a0 = -a0;
+        if (a1 < 0) a1 = -a1;
+        if (a0 > qm) qm = a0;
+        if (a1 > qm) qm = a1;
+      }
+      const float bm = d * static_cast<float>(qm);
+      if (bm > rm) rm = bm;
+    }
+#endif
+  } else {
+    const ob_block_q8_0_t* b_row =
+        static_cast<const ob_block_q8_0_t*>(blocks_base) +
+        static_cast<size_t>(row_idx) * nb_stride + blk0;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    for (uint32_t bi = 0u; bi < blk_cnt; ++bi) {
+      const float d = std::fabs(ob::fp16_to_fp32(b_row[bi].d));
+      if (d == 0.0f) continue;
+      uint8x16_t a0 = vreinterpretq_u8_s8(vabsq_s8(vld1q_s8(b_row[bi].qs)));
+      uint8x16_t a1 = vreinterpretq_u8_s8(vabsq_s8(vld1q_s8(b_row[bi].qs + 16u)));
+      const float bm = d * static_cast<float>(vmaxvq_u8(vmaxq_u8(a0, a1)));
+      if (bm > rm) rm = bm;
+    }
+#else
+    for (uint32_t bi = 0u; bi < blk_cnt; ++bi) {
+      const float d = std::fabs(ob::fp16_to_fp32(b_row[bi].d));
+      if (d == 0.0f) continue;
+      const int8_t* qs = b_row[bi].qs;
+      int32_t qm = 0;
+      for (uint32_t j = 0u; j < OB_QK8_0; ++j) {
+        int32_t av = static_cast<int32_t>(qs[j]);
+        if (av < 0) av = -av;
+        if (av > qm) qm = av;
+      }
+      const float bm = d * static_cast<float>(qm);
+      if (bm > rm) rm = bm;
+    }
+#endif
+  }
+  return rm;
+}
+
 void cpu_swiglu_f32_quant_slice(const float* a_slice,
                                 const ob_gemm_swiglu_quant_desc_t* d,
                                 uint32_t tm,
-                                float* c_slice) {
+                                float* c_slice,
+                                ob::WorkerPool* pool) {
   const uint32_t K = d->k_dim, H = d->h_dim, N = d->n_dim;
   const uint32_t nb_k = K / OB_QK8_0;
   const uint32_t nb_h = H / OB_QK8_0;
   std::vector<float> mid(H, 0.0f);
+  const bool par_h = (pool && pool->num_threads > 1u && H >= 512u);
+  const bool par_n = (pool && pool->num_threads > 1u && N >= 256u && H >= 512u);
   for (uint32_t mi = 0u; mi < tm; ++mi) {
     const float* a_row = a_slice + static_cast<size_t>(mi) * K;
-    for (uint32_t h = 0u; h < H; ++h) {
-      const float g = d->gate_is_q4_0
-          ? neon_dot_f32_q4_row(a_row, static_cast<const ob_block_q4_0_t*>(d->w_gate_hk) + static_cast<size_t>(h) * nb_k, nb_k)
-          : neon_dot_f32_q8_row(a_row, static_cast<const ob_block_q8_0_t*>(d->w_gate_hk) + static_cast<size_t>(h) * nb_k, nb_k);
-      const float u = d->up_is_q4_0
-          ? neon_dot_f32_q4_row(a_row, static_cast<const ob_block_q4_0_t*>(d->w_up_hk) + static_cast<size_t>(h) * nb_k, nb_k)
-          : neon_dot_f32_q8_row(a_row, static_cast<const ob_block_q8_0_t*>(d->w_up_hk) + static_cast<size_t>(h) * nb_k, nb_k);
-      mid[h] = (g / (1.0f + std::exp(-g))) * u;
+    auto run_h = [&](uint32_t hs, uint32_t he) {
+      for (uint32_t h = hs; h < he; ++h) {
+        const float g = d->gate_is_q4_0
+            ? neon_dot_f32_q4_row(a_row, static_cast<const ob_block_q4_0_t*>(d->w_gate_hk) + static_cast<size_t>(h) * nb_k, nb_k)
+            : neon_dot_f32_q8_row(a_row, static_cast<const ob_block_q8_0_t*>(d->w_gate_hk) + static_cast<size_t>(h) * nb_k, nb_k);
+        const float u = d->up_is_q4_0
+            ? neon_dot_f32_q4_row(a_row, static_cast<const ob_block_q4_0_t*>(d->w_up_hk) + static_cast<size_t>(h) * nb_k, nb_k)
+            : neon_dot_f32_q8_row(a_row, static_cast<const ob_block_q8_0_t*>(d->w_up_hk) + static_cast<size_t>(h) * nb_k, nb_k);
+        mid[h] = (g / (1.0f + std::exp(-g))) * u;
+      }
+    };
+    if (par_h) {
+      pool->parallel_for_fn(H, 64u, [&](uint32_t s, uint32_t e, uint32_t) { run_h(s, e); });
+    } else {
+      run_h(0u, H);
     }
     float* c_row = c_slice + static_cast<size_t>(mi) * N;
-    for (uint32_t n = 0u; n < N; ++n) {
-      c_row[n] = d->down_is_q4_0
-          ? neon_dot_f32_q4_row(mid.data(), static_cast<const ob_block_q4_0_t*>(d->w_down_nh) + static_cast<size_t>(n) * nb_h, nb_h)
-          : neon_dot_f32_q8_row(mid.data(), static_cast<const ob_block_q8_0_t*>(d->w_down_nh) + static_cast<size_t>(n) * nb_h, nb_h);
+    auto run_n = [&](uint32_t ns, uint32_t ne) {
+      for (uint32_t n = ns; n < ne; ++n) {
+        c_row[n] = d->down_is_q4_0
+            ? neon_dot_f32_q4_row(mid.data(), static_cast<const ob_block_q4_0_t*>(d->w_down_nh) + static_cast<size_t>(n) * nb_h, nb_h)
+            : neon_dot_f32_q8_row(mid.data(), static_cast<const ob_block_q8_0_t*>(d->w_down_nh) + static_cast<size_t>(n) * nb_h, nb_h);
+      }
+    };
+    if (par_n) {
+      pool->parallel_for_fn(N, 32u, [&](uint32_t s, uint32_t e, uint32_t) { run_n(s, e); });
+    } else {
+      run_n(0u, N);
     }
   }
 }
@@ -3461,17 +4532,22 @@ ob_status_t run_swiglu_m7a_fallback(ob_context_t* ctx,
                                     float* c_slice,
                                     ob_invoke_stats_t* out_stats) {
   const uint32_t K = d->k_dim, H = d->h_dim, N = d->n_dim;
-  std::vector<float> gate_buf(static_cast<size_t>(tm) * H, 0.0f);
-  std::vector<float> up_buf(static_cast<size_t>(tm) * H, 0.0f);
+  const size_t cnt = static_cast<size_t>(tm) * H;
+  // Persistent scratch avoids 36.7 MiB mmap/page-fault/munmap per layer on Qwen2.5 pp512!
+  std::lock_guard<std::mutex> flk(ctx->swiglu_fb_mu);
+  if (ctx->swiglu_gate_scratch.size() < cnt) ctx->swiglu_gate_scratch.resize(cnt);
+  if (ctx->swiglu_up_scratch.size() < cnt) ctx->swiglu_up_scratch.resize(cnt);
+  float* gate_ptr = ctx->swiglu_gate_scratch.data();
+  float* up_ptr = ctx->swiglu_up_scratch.data();
 
   ob_gemm_f32_quant_job_t gu_jobs[2]{};
   gu_jobs[0].b_nk = d->w_gate_hk;
-  gu_jobs[0].c_mn = gate_buf.data();
+  gu_jobs[0].c_mn = gate_ptr;
   gu_jobs[0].n_dim = H;
-  gu_jobs[0].activation = OB_ACT_SILU;
+  gu_jobs[0].activation = OB_ACT_NONE;
   gu_jobs[0].is_q4_0 = d->gate_is_q4_0;
   gu_jobs[1].b_nk = d->w_up_hk;
-  gu_jobs[1].c_mn = up_buf.data();
+  gu_jobs[1].c_mn = up_ptr;
   gu_jobs[1].n_dim = H;
   gu_jobs[1].activation = OB_ACT_NONE;
   gu_jobs[1].is_q4_0 = d->up_is_q4_0;
@@ -3480,22 +4556,12 @@ ob_status_t run_swiglu_m7a_fallback(ob_context_t* ctx,
   ob_status_t st = ob_gemm_matmul_f32_quant_batch(ctx, a_slice, tm, K, gu_jobs, 2u, &s1);
   if (st != OB_OK) return st;
 
-  // NEON elementwise gate_silu *= up
-  const size_t cnt = gate_buf.size();
-  size_t i = 0u;
-#if defined(__ARM_NEON) && defined(__aarch64__)
-  for (; i + 16u <= cnt; i += 16u) {
-    vst1q_f32(gate_buf.data() + i,       vmulq_f32(vld1q_f32(gate_buf.data() + i),       vld1q_f32(up_buf.data() + i)));
-    vst1q_f32(gate_buf.data() + i + 4u,  vmulq_f32(vld1q_f32(gate_buf.data() + i + 4u),  vld1q_f32(up_buf.data() + i + 4u)));
-    vst1q_f32(gate_buf.data() + i + 8u,  vmulq_f32(vld1q_f32(gate_buf.data() + i + 8u),  vld1q_f32(up_buf.data() + i + 8u)));
-    vst1q_f32(gate_buf.data() + i + 12u, vmulq_f32(vld1q_f32(gate_buf.data() + i + 12u), vld1q_f32(up_buf.data() + i + 12u)));
-  }
-  for (; i + 4u <= cnt; i += 4u) {
-    vst1q_f32(gate_buf.data() + i, vmulq_f32(vld1q_f32(gate_buf.data() + i), vld1q_f32(up_buf.data() + i)));
-  }
-#endif
-  for (; i < cnt; ++i) {
-    gate_buf[i] *= up_buf[i];
+  // Single fused parallel NEON pass: gate[i] = silu(gate[i]) * up[i]
+  const uint64_t tsm0 = ctx->profile_enabled ? ob::monotonic_now_ns() : 0u;
+  ob::silu_mul_inplace_parallel(gate_ptr, up_ptr, cnt, &ctx->worker_pool);
+  if (ctx->profile_enabled) {
+    std::lock_guard<std::mutex> lk(ctx->gemm_mu);
+    ctx->prof.dequant_ns += (ob::monotonic_now_ns() - tsm0);
   }
 
   ob_gemm_f32_quant_job_t d_job{};
@@ -3506,7 +4572,7 @@ ob_status_t run_swiglu_m7a_fallback(ob_context_t* ctx,
   d_job.is_q4_0 = d->down_is_q4_0;
 
   ob_invoke_stats_t s2{};
-  st = ob_gemm_matmul_f32_quant_batch(ctx, gate_buf.data(), tm, H, &d_job, 1u, &s2);
+  st = ob_gemm_matmul_f32_quant_batch(ctx, gate_ptr, tm, H, &d_job, 1u, &s2);
   if (st != OB_OK) return st;
 
   if (out_stats) {
@@ -3578,7 +4644,7 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
   }
 
   if (!prefill_chain_on && M >= 2u && M <= 8u) {
-    cpu_swiglu_f32_quant_slice(a_mk, desc, M, c_mn);
+    cpu_swiglu_f32_quant_slice(a_mk, desc, M, c_mn, &ctx->worker_pool);
     const uint64_t wall_ns = ob::monotonic_now_ns() - t0_ns;
     {
       std::lock_guard<std::mutex> lk(ctx->gemm_mu);
@@ -3589,9 +4655,7 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
     if (out_stats) {
       std::memset(out_stats, 0, sizeof(*out_stats));
       out_stats->wall_time_us = wall_ns / 1000ULL;
-      out_stats->flags = static_cast<uint16_t>(
-          OB_STAT_FLAG_CPU_FALLBACK |
-          (ctx->mock_mode ? static_cast<uint32_t>(OB_STAT_FLAG_MOCK) : 0u));
+      out_stats->flags = OB_STAT_FLAG_CPU_FALLBACK | (ctx->mock_mode ? OB_STAT_FLAG_MOCK : 0u);
     }
     return OB_OK;
   }
@@ -3706,7 +4770,7 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
         // Rare M=1 attention-sink outlier token: run exact NEON FP32 on CPU so we do NOT
         // allocate 41 MiB of duplicate M7A ext[2] tiles into weight_cache (prevents Qwen2.5
         // LRU thrashing while delivering 0-error FP32 precision on sink tokens!).
-        cpu_swiglu_f32_quant_slice(a_slice, desc, 1u, c_slice);
+        cpu_swiglu_f32_quant_slice(a_slice, desc, 1u, c_slice, &ctx->worker_pool);
         agg_flags |= OB_STAT_FLAG_CPU_FALLBACK;
         fb_slices += 1u;
         continue;
@@ -3765,11 +4829,26 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
       const float s_a = ob::quantize_scale_pow2_2nd_up(batch_amax / 127.0f);
       const float inv_sa = 1.0f / s_a;
       std::vector<int8_t>& a_q = ctx->gemm_aq_scratch;
-      a_q.assign(static_cast<size_t>(ms.hw_m) * K, 0);
-      for (uint32_t mi = 0u; mi < ms.tm; ++mi) {
-        ob::quant_sym_i8_row(a_slice + static_cast<size_t>(mi) * K,
-                             a_q.data() + static_cast<size_t>(mi) * K,
-                             K, inv_sa);
+      a_q.resize(static_cast<size_t>(ms.hw_m) * K);
+      if (ms.tm < ms.hw_m) {
+        std::memset(a_q.data() + static_cast<size_t>(ms.tm) * K, 0,
+                    static_cast<size_t>(ms.hw_m - ms.tm) * K);
+      }
+      if (ctx->worker_pool.num_threads > 1u &&
+          ms.tm >= 8u && static_cast<size_t>(ms.tm) * K >= 16384u) {
+        ctx->worker_pool.parallel_for_fn(ms.tm, 4u, [&](uint32_t ms_lo, uint32_t ms_hi, uint32_t) {
+          for (uint32_t mi = ms_lo; mi < ms_hi; ++mi) {
+            ob::quant_sym_i8_row(a_slice + static_cast<size_t>(mi) * K,
+                                 a_q.data() + static_cast<size_t>(mi) * K,
+                                 K, inv_sa);
+          }
+        });
+      } else {
+        for (uint32_t mi = 0u; mi < ms.tm; ++mi) {
+          ob::quant_sym_i8_row(a_slice + static_cast<size_t>(mi) * K,
+                               a_q.data() + static_cast<size_t>(mi) * K,
+                               K, inv_sa);
+        }
       }
       if (prof_on) ctx->prof.quant_ns += (ob::monotonic_now_ns() - tq0);
 
@@ -3785,8 +4864,6 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
         if (st != OB_OK) return st;
       }
 
-      std::memset(c_slice, 0, static_cast<size_t>(ms.tm) * N * sizeof(float));
-
       struct PendingSwigluChunk {
         ob_exec_handle_t handle = 0u;
         ob::CachedWeightTile* w_tile = nullptr;
@@ -3795,6 +4872,7 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
         uint32_t hw_h = 0u;
         uint32_t d_gate = 0u, d_up = 0u, d_mul = 0u, d_down = 0u;
         float s_gate = 0.0f;
+        bool is_first_chunk = false;
       };
       std::array<PendingSwigluChunk, OB_MAX_CREDITS> ring{};
       uint32_t ring_head = 0u;
@@ -3830,12 +4908,8 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
         return gd;
       };
 
-      auto drain_one = [&]() -> ob_status_t {
+      auto drain_one_harvested = [&](ob_status_t wst, const ob_invoke_stats_t& istats) -> ob_status_t {
         PendingSwigluChunk& p = ring[ring_head];
-        ob_invoke_stats_t istats{};
-        const uint64_t tw0 = prof_on ? ob::monotonic_now_ns() : 0u;
-        ob_status_t wst = ob::device_wait_handle(ctx, p.handle, ctx->cfg.timeout_ms, &istats);
-        if (prof_on) ctx->prof.wait_ns += (ob::monotonic_now_ns() - tw0);
         ob_status_t rst = OB_OK;
         if (wst == OB_OK) {
           total_hw_us += istats.hw_execution_us;
@@ -3897,14 +4971,28 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
               }
               if (rst == OB_OK && read_active) {
                 const uint64_t tq1 = prof_on ? ob::monotonic_now_ns() : 0u;
-                // Y_f32[m, n] += q_out[m, n] * (s_silu * s_a * d_up * d_mul * eff_d_down) * row_s_d[n]
+                // Y_f32[m, n] (+)= q_out[m, n] * (s_silu * s_a * d_up * d_mul * eff_d_down) * row_s_d[n]
                 const float out_mult = p.s_gate * s_a * static_cast<float>(p.d_up) *
                                        static_cast<float>(p.d_mul) * static_cast<float>(eff_d_down);
                 const float* sd_ptr = p.w_tile->row_s_b.data();
-                for (uint32_t mi = 0u; mi < ms.tm; ++mi) {
-                  float* c_row = c_slice + static_cast<size_t>(mi) * N;
-                  const int8_t* o_row = raw_out + static_cast<size_t>(mi) * N;
-                  ob::dequant_accum_row_f32_impl(c_row, o_row, sd_ptr, N, out_mult);
+                const bool store_first = p.is_first_chunk;
+                if (ctx->worker_pool.num_threads > 1u &&
+                    ms.tm >= 8u && static_cast<size_t>(ms.tm) * N >= 16384u) {
+                  ctx->worker_pool.parallel_for_fn(ms.tm, 4u, [&](uint32_t ms_lo, uint32_t ms_hi, uint32_t) {
+                    for (uint32_t mi = ms_lo; mi < ms_hi; ++mi) {
+                      float* c_row = c_slice + static_cast<size_t>(mi) * N;
+                      const int8_t* o_row = raw_out + static_cast<size_t>(mi) * N;
+                      ob::dequant_outliers_row_f32_impl(
+                          c_row, o_row, sd_ptr, N, out_mult, store_first, nullptr, nullptr, 0u);
+                    }
+                  });
+                } else {
+                  for (uint32_t mi = 0u; mi < ms.tm; ++mi) {
+                    float* c_row = c_slice + static_cast<size_t>(mi) * N;
+                    const int8_t* o_row = raw_out + static_cast<size_t>(mi) * N;
+                    ob::dequant_outliers_row_f32_impl(
+                        c_row, o_row, sd_ptr, N, out_mult, store_first, nullptr, nullptr, 0u);
+                  }
                 }
                 if (prof_on) ctx->prof.dequant_ns += (ob::monotonic_now_ns() - tq1);
               }
@@ -3922,6 +5010,28 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
         ring_head = (ring_head + 1u) % ring_depth;
         ring_count -= 1u;
         return (wst != OB_OK) ? wst : rst;
+      };
+
+      auto drain_one = [&]() -> ob_status_t {
+        PendingSwigluChunk& p = ring[ring_head];
+        ob_invoke_stats_t istats{};
+        const uint64_t tw0 = prof_on ? ob::monotonic_now_ns() : 0u;
+        ob_status_t wst = ob::device_wait_handle(ctx, p.handle, ctx->cfg.timeout_ms, &istats);
+        if (prof_on) ctx->prof.wait_ns += (ob::monotonic_now_ns() - tw0);
+        return drain_one_harvested(wst, istats);
+      };
+
+      auto try_drain_ready = [&]() -> ob_status_t {
+        while (ring_count >= 2u) {
+          ob_status_t wst = OB_OK;
+          ob_invoke_stats_t istats{};
+          if (!ob::device_try_wait_handle(ctx, ring[ring_head].handle, &wst, &istats)) {
+            break;
+          }
+          ob_status_t dst = drain_one_harvested(wst, istats);
+          if (dst != OB_OK) return dst;
+        }
+        return OB_OK;
       };
 
       for (const HChunk& hc : h_chunks) {
@@ -3962,77 +5072,104 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
 
         if (!w_tile) {
           const uint64_t tp0 = prof_on ? ob::monotonic_now_ns() : 0u;
-          // Cold pack:
-          //   a) W_up per-row -> wu_q[hw_h, K] + row_s_u[th]
-          std::vector<int8_t> wu_q(static_cast<size_t>(hw_h) * K, 0);
+          // Cold pack (parallel across ctx->worker_pool + direct-to-DMA-BUF NEON ext[2] pack!):
+          //   a) W_up per-row -> wu_q[hw_h, K] + row_s_u[th] + fused L2 norm stats
+          std::vector<int8_t> wu_q(static_cast<size_t>(hw_h) * K);
+          if (th < hw_h) {
+            std::memset(wu_q.data() + static_cast<size_t>(th) * K, 0,
+                        static_cast<size_t>(hw_h - th) * K);
+          }
           std::vector<float> row_s_u(th, 0.0f);
+          std::vector<ob::RowNormStats> wu_stats(th);
           if (desc->up_is_q4_0 != 0u) {
             ob::requant_q4_0_rows(static_cast<const ob_block_q4_0_t*>(desc->w_up_hk),
                                   nb_k, h0, th, 0u, nb_k, K, K,
-                                  wu_q.data(), row_s_u.data(), &ctx->gemm_wrow_scratch);
+                                  wu_q.data(), row_s_u.data(),
+                                  &ctx->worker_pool, wu_stats.data());
           } else {
             ob::requant_q8_0_rows(static_cast<const ob_block_q8_0_t*>(desc->w_up_hk),
                                   nb_k, h0, th, 0u, nb_k, K, K,
-                                  wu_q.data(), row_s_u.data(), &ctx->gemm_wrow_scratch);
+                                  wu_q.data(), row_s_u.data(),
+                                  &ctx->worker_pool, wu_stats.data());
           }
 
-          //   b) W_down with row_s_u[h] absorbed -> wd_q[N, hw_h] + row_s_d[N]
-          std::vector<int8_t> wd_q(static_cast<size_t>(N) * hw_h, 0);
+          //   b) W_down with row_s_u[h] absorbed -> wd_q[N, hw_h] + row_s_d[N] + fused L2 stats
+          std::vector<int8_t> wd_q(static_cast<size_t>(N) * hw_h);
           std::vector<float> row_s_d(N, 0.0f);
-          ctx->gemm_wrow_scratch.resize(th);
-          float* wrow_d = ctx->gemm_wrow_scratch.data();
-          for (uint32_t ni = 0u; ni < N; ++ni) {
-            dequant_quant_row_f32(desc->w_down_nh, desc->down_is_q4_0,
-                                  nb_h, ni, h_blk0, h_blk_cnt, wrow_d);
-            float amax_d = 0.0f;
-            uint32_t hi = 0u;
+          std::vector<ob::RowNormStats> wd_stats(N);
+          auto pack_wdown_range = [&](uint32_t ns, uint32_t ne) {
+            float stack_wrow[2048];
+            std::vector<float> heap_wrow;
+            float* wrow_d = stack_wrow;
+            if (th > 2048u) {
+              heap_wrow.resize(th);
+              wrow_d = heap_wrow.data();
+            }
+            for (uint32_t ni = ns; ni < ne; ++ni) {
+              dequant_quant_row_f32(desc->w_down_nh, desc->down_is_q4_0,
+                                    nb_h, ni, h_blk0, h_blk_cnt, wrow_d);
+              float amax_d = 0.0f;
+              uint32_t hi = 0u;
 #if defined(__ARM_NEON) && defined(__aarch64__)
-            float32x4_t vam = vdupq_n_f32(0.0f);
-            for (; hi + 4u <= th; hi += 4u) {
-              float32x4_t v = vmulq_f32(vld1q_f32(wrow_d + hi), vld1q_f32(row_s_u.data() + hi));
-              vst1q_f32(wrow_d + hi, v);
-              vam = vmaxq_f32(vam, vabsq_f32(v));
-            }
-            amax_d = vmaxvq_f32(vam);
+              float32x4_t vam = vdupq_n_f32(0.0f);
+              for (; hi + 4u <= th; hi += 4u) {
+                float32x4_t v = vmulq_f32(vld1q_f32(wrow_d + hi), vld1q_f32(row_s_u.data() + hi));
+                vst1q_f32(wrow_d + hi, v);
+                vam = vmaxq_f32(vam, vabsq_f32(v));
+              }
+              amax_d = vmaxvq_f32(vam);
 #endif
-            for (; hi < th; ++hi) {
-              float v = wrow_d[hi] * row_s_u[hi];
-              wrow_d[hi] = v;
-              float av = std::fabs(v);
-              if (av > amax_d) amax_d = av;
+              for (; hi < th; ++hi) {
+                float v = wrow_d[hi] * row_s_u[hi];
+                wrow_d[hi] = v;
+                float av = std::fabs(v);
+                if (av > amax_d) amax_d = av;
+              }
+              int8_t* wd_row = wd_q.data() + static_cast<size_t>(ni) * hw_h;
+              if (amax_d > 0.0f) {
+                row_s_d[ni] = amax_d / 127.0f;
+                ob::quant_sym_i8_row(wrow_d, wd_row, th, 127.0f / amax_d);
+                if (th < hw_h) std::memset(wd_row + th, 0, hw_h - th);
+                wd_stats[ni] = ob::compute_row_norm_stats(wd_row, th);
+              } else {
+                std::memset(wd_row, 0, hw_h);
+                wd_stats[ni] = ob::RowNormStats{};
+              }
             }
-            if (amax_d > 0.0f) {
-              row_s_d[ni] = amax_d / 127.0f;
-              ob::quant_sym_i8_row(wrow_d, wd_q.data() + static_cast<size_t>(ni) * hw_h,
-                                   th, 127.0f / amax_d);
-            }
+          };
+          if (ctx->worker_pool.num_threads > 1u &&
+              N >= 64u && static_cast<size_t>(N) * th >= 32768u) {
+            ctx->worker_pool.parallel_for_fn(N, 16u, [&](uint32_t s, uint32_t e, uint32_t) {
+              pack_wdown_range(s, e);
+            });
+          } else {
+            pack_wdown_range(0u, N);
           }
 
-          //   c) W_gate with common 2^(1/2)-aligned per-chunk scale s_wg -> wg_q[hw_h, K]
-          std::vector<float> wg_f32(static_cast<size_t>(th) * K, 0.0f);
+          //   c) W_gate Pass 1: exact per-row max directly from Q8_0/Q4_0 blocks (0 B temp buffer!)
+          std::vector<float> wg_row_max(th, 0.0f);
+          auto scan_wgate_max = [&](uint32_t hs, uint32_t he) {
+            for (uint32_t hi = hs; hi < he; ++hi) {
+              wg_row_max[hi] = quant_row_max_abs(
+                  desc->w_gate_hk, desc->gate_is_q4_0, nb_k, h0 + hi, 0u, nb_k);
+            }
+          };
+          if (ctx->worker_pool.num_threads > 1u &&
+              th >= 64u && static_cast<size_t>(th) * K >= 32768u) {
+            ctx->worker_pool.parallel_for_fn(th, 16u, [&](uint32_t s, uint32_t e, uint32_t) {
+              scan_wgate_max(s, e);
+            });
+          } else {
+            scan_wgate_max(0u, th);
+          }
           float max_wg = 0.0f;
           double sum_row_max_wg = 0.0;
           for (uint32_t hi = 0u; hi < th; ++hi) {
-            float* dst_row = wg_f32.data() + static_cast<size_t>(hi) * K;
-            dequant_quant_row_f32(desc->w_gate_hk, desc->gate_is_q4_0,
-                                  nb_k, h0 + hi, 0u, nb_k, dst_row);
-            float rm = 0.0f;
-            uint32_t ki = 0u;
-#if defined(__ARM_NEON) && defined(__aarch64__)
-            float32x4_t vam = vdupq_n_f32(0.0f);
-            for (; ki + 4u <= K; ki += 4u) {
-              vam = vmaxq_f32(vam, vabsq_f32(vld1q_f32(dst_row + ki)));
-            }
-            rm = vmaxvq_f32(vam);
-#endif
-            for (; ki < K; ++ki) {
-              float av = std::fabs(dst_row[ki]);
-              if (av > rm) rm = av;
-            }
-            if (rm > max_wg) max_wg = rm;
-            sum_row_max_wg += static_cast<double>(rm);
+            if (wg_row_max[hi] > max_wg) max_wg = wg_row_max[hi];
+            sum_row_max_wg += static_cast<double>(wg_row_max[hi]);
           }
-          const double mean_row_max_wg = sum_row_max_wg / static_cast<double>(std::max<uint32_t>(1u, th));
+          const double mean_row_max_wg =
+              sum_row_max_wg / static_cast<double>(std::max<uint32_t>(1u, th));
           if (max_wg > 0.0f && static_cast<double>(max_wg) > 16.0 * std::max(mean_row_max_wg, 1e-12)) {
             ob::CachedWeightTile* sentinel = new (std::nothrow) ob::CachedWeightTile();
             if (sentinel) {
@@ -4047,24 +5184,66 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
             break;
           }
 
+          //      W_gate Pass 2: parallel dequant + common-scale quant + L2 stats in L1 stack buffer!
           const float s_wg = (max_wg > 0.0f) ? ob::quantize_scale_pow2_2nd_up(max_wg / 127.0f) : 1.0f;
           const float inv_swg = (max_wg > 0.0f) ? (1.0f / s_wg) : 0.0f;
-          std::vector<int8_t> wg_q(static_cast<size_t>(hw_h) * K, 0);
+          std::vector<int8_t> wg_q(static_cast<size_t>(hw_h) * K);
+          if (th < hw_h || max_wg == 0.0f) {
+            const size_t z_off = (max_wg == 0.0f) ? 0u : static_cast<size_t>(th) * K;
+            std::memset(wg_q.data() + z_off, 0, wg_q.size() - z_off);
+          }
+          std::vector<ob::RowNormStats> wg_stats(th);
           if (max_wg > 0.0f) {
-            for (uint32_t hi = 0u; hi < th; ++hi) {
-              ob::quant_sym_i8_row(wg_f32.data() + static_cast<size_t>(hi) * K,
-                                   wg_q.data() + static_cast<size_t>(hi) * K,
-                                   K, inv_swg);
+            auto pack_wgate_range = [&](uint32_t hs, uint32_t he) {
+              float stack_wrow[2048];
+              std::vector<float> heap_wrow;
+              float* wrow_g = stack_wrow;
+              if (K > 2048u) {
+                heap_wrow.resize(K);
+                wrow_g = heap_wrow.data();
+              }
+              for (uint32_t hi = hs; hi < he; ++hi) {
+                dequant_quant_row_f32(desc->w_gate_hk, desc->gate_is_q4_0,
+                                      nb_k, h0 + hi, 0u, nb_k, wrow_g);
+                int8_t* wg_row = wg_q.data() + static_cast<size_t>(hi) * K;
+                ob::quant_sym_i8_row(wrow_g, wg_row, K, inv_swg);
+                wg_stats[hi] = ob::compute_row_norm_stats(wg_row, K);
+              }
+            };
+            if (ctx->worker_pool.num_threads > 1u &&
+                th >= 64u && static_cast<size_t>(th) * K >= 32768u) {
+              ctx->worker_pool.parallel_for_fn(th, 16u, [&](uint32_t s, uint32_t e, uint32_t) {
+                pack_wgate_range(s, e);
+              });
+            } else {
+              pack_wgate_range(0u, th);
             }
           }
 
-          //   d) Record per-stage L2 & DC-sum weight norms once for runtime RMS-calibrated PoT dividers!
-          float l2_g_max = 0.0f, l2_g_mean = 0.0f, dc_g_max = 0.0f;
-          float l2_u_max = 0.0f, l2_u_mean = 0.0f, dc_u_max = 0.0f;
-          float l2_d_max = 0.0f, l2_d_mean = 0.0f;
-          ob::compute_matrix_row_l2_stats(wg_q.data(), th, K, K, &l2_g_max, &l2_g_mean, &dc_g_max);
-          ob::compute_matrix_row_l2_stats(wu_q.data(), th, K, K, &l2_u_max, &l2_u_mean, &dc_u_max);
-          ob::compute_matrix_row_l2_stats(wd_q.data(), N, th, hw_h, &l2_d_max, &l2_d_mean);
+          //   d) Reduce per-stage L2 & DC-sum weight norms directly from L1-computed RowNormStats!
+          double g_max = 0.0, g_sum = 0.0, g_dc = 0.0;
+          double u_max = 0.0, u_sum = 0.0, u_dc = 0.0;
+          double d_max = 0.0;
+          for (uint32_t hi = 0u; hi < th; ++hi) {
+            if (wg_stats[hi].l2 > g_max) g_max = wg_stats[hi].l2;
+            g_sum += wg_stats[hi].l2;
+            const double wg_dc = static_cast<double>(wg_stats[hi].asum);
+            if (wg_dc > g_dc) g_dc = wg_dc;
+            if (wu_stats[hi].l2 > u_max) u_max = wu_stats[hi].l2;
+            u_sum += wu_stats[hi].l2;
+            const double wu_dc = static_cast<double>(wu_stats[hi].asum);
+            if (wu_dc > u_dc) u_dc = wu_dc;
+          }
+          for (uint32_t ni = 0u; ni < N; ++ni) {
+            if (wd_stats[ni].l2 > d_max) d_max = wd_stats[ni].l2;
+          }
+          const float l2_g_max = static_cast<float>(g_max);
+          const float l2_g_mean = (th > 0u) ? static_cast<float>(g_sum / static_cast<double>(th)) : 0.0f;
+          const float dc_g_max = static_cast<float>(g_dc);
+          const float l2_u_max = static_cast<float>(u_max);
+          const float l2_u_mean = (th > 0u) ? static_cast<float>(u_sum / static_cast<double>(th)) : 0.0f;
+          const float dc_u_max = static_cast<float>(u_dc);
+          const float l2_d_max = static_cast<float>(d_max);
 
           // Reject statistically non-zero-mean gate/up weight tiles where correlated inputs
           // could saturate intermediate INT8 stages silently despite unsaturated down output.
@@ -4083,16 +5262,22 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
             break;
           }
 
-          std::vector<uint8_t> ext2 = ob::pack_ext2_for_swiglu(
-              ms.hw_m, K, hw_h, N,
-              wg_q.data(), nullptr,
-              wu_q.data(), nullptr,
-              wd_q.data(), nullptr);
+          const size_t ext2_sz = ob::pack_ext2_size_for_swiglu(ms.hw_m, K, hw_h, N);
           ob_buffer* wbuf = nullptr;
           ob_status_t wst = ob_buffer_alloc(
-              ctx, ext2.size(), OB_BUF_BIDIRECTIONAL | OB_BUF_NO_POOL | OB_BUF_ZERO_INIT, &wbuf);
+              ctx, ext2_sz, OB_BUF_BIDIRECTIONAL | OB_BUF_NO_POOL, &wbuf);
           if (wst == OB_OK) {
-            wst = ob_buffer_write(wbuf, ext2.data(), ext2.size(), 0u);
+            wst = ob::buffer_sync_begin_write(wbuf);
+            if (wst == OB_OK) {
+              ob::pack_ext2_for_swiglu_into(
+                  static_cast<uint8_t*>(ob_buffer_data(wbuf)),
+                  ms.hw_m, K, hw_h, N,
+                  wg_q.data(), nullptr,
+                  wu_q.data(), nullptr,
+                  wd_q.data(), nullptr,
+                  &ctx->worker_pool);
+              wst = ob::buffer_sync_end_write(wbuf);
+            }
           }
           if (prof_on) ctx->prof.weight_pack_ns += (ob::monotonic_now_ns() - tp0);
           if (wst != OB_OK) {
@@ -4111,7 +5296,7 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
           w_tile->hw_n = N;
           w_tile->row_s_b = std::move(row_s_d);
           w_tile->ext2_buf = wbuf;
-          w_tile->ext2_bytes = ext2.size();
+          w_tile->ext2_bytes = ext2_sz;
           w_tile->swiglu_s_wg = s_wg;
           w_tile->swiglu_l2_gate_max = l2_g_max;
           w_tile->swiglu_l2_gate_mean = l2_g_mean;
@@ -4138,7 +5323,7 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
           const double mean_aq = max_row_abs_mean / static_cast<double>(s_a);
           const double std_aq = std::sqrt(std::max(
               0.0, static_cast<double>(rms_aq) * static_cast<double>(rms_aq) - mean_aq * mean_aq));
-          const double sig_gu = (ms.tm > 1u) ? 4.0 : 3.65;
+          const double sig_gu = (ms.tm > 1u) ? 3.85 : 3.65;
           const double dc_gate_term = mean_aq * static_cast<double>(w_tile->swiglu_dc_gate_max);
           const double dc_up_term = mean_aq * static_cast<double>(w_tile->swiglu_dc_up_max);
           const double est_gate =
@@ -4164,7 +5349,8 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
           }
         }
         const uint32_t slot = (ring_head + ring_count) % ring_depth;
-        const float s_gate = s_a * w_tile->swiglu_s_wg * static_cast<float>(d_gate);
+        const float s_gate = ob::snap_scale_pow2_2nd_nearest(
+            s_a * w_tile->swiglu_s_wg * static_cast<float>(d_gate));
         const uint64_t gkey = ob::hash_swiglu_graph_key(
             ms.hw_m, K, hw_h, N, d_gate, d_up, d_mul, d_down,
             s_gate, slot % param_swap_slots);
@@ -4210,7 +5396,16 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
         p.d_mul = d_mul;
         p.d_down = d_down;
         p.s_gate = s_gate;
+        p.is_first_chunk = (h0 == 0u);
         ring_count += 1u;
+
+        if (!ctx->mock_mode) {
+          ob_status_t od_st = try_drain_ready();
+          if (od_st != OB_OK) {
+            drain_all_cleanup();
+            return od_st;
+          }
+        }
       }
 
       if (!slice_rejected) {
@@ -4222,7 +5417,7 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
           }
         }
         if (ctx->mock_mode) {
-          cpu_swiglu_f32_quant_slice(a_slice, desc, ms.tm, c_slice);
+          cpu_swiglu_f32_quant_slice(a_slice, desc, ms.tm, c_slice, &ctx->worker_pool);
         }
       }
     }
@@ -4262,6 +5457,145 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
     if (total_hits > 0u) out_stats->flags |= OB_STAT_FLAG_CACHE_HIT;
   }
   return OB_OK;
+}
+
+ob_status_t ob_gemm_matmul_f32_w8a16_tile(ob_context_t* ctx,
+                                          const float* a_k,
+                                          const int8_t* w_nk,
+                                          const float* sb_n,
+                                          uint32_t k_dim,
+                                          uint32_t n_dim,
+                                          float* c_n,
+                                          ob_invoke_stats_t* out_stats) {
+  if (!ctx || !a_k || !w_nk || !sb_n || !c_n) {
+    return OB_ERR_INVALID_ARG;
+  }
+  if (!ob::is_w8a16_pt_1x_shape(1u, k_dim, n_dim)) {
+    return OB_ERR_UNSUPPORTED;
+  }
+
+  const uint64_t t0_ns = ob::monotonic_now_ns();
+  std::lock_guard<std::mutex> lk(ctx->gemm_mu);
+
+  std::vector<float> in_f32(k_dim);
+  const float prescale_inv = ob::prepare_w8a16_input_row_f32(a_k, k_dim, k_dim, in_f32.data());
+
+  if (ctx->mock_mode || !ctx->builtin_emitter_active || ctx->builtin_dive_interp.empty()) {
+    // Exact FP16-input + FP32-accumulator hardware simulator for host/mock verification
+    std::vector<float> a_fp16_f32(k_dim);
+    for (uint32_t ki = 0u; ki < k_dim; ++ki) {
+      // Round to IEEE FP16 via fp16_to_f32(f32_to_fp16) using __fp16 on ARM64 or bit-exact fallback
+#if defined(__aarch64__) || defined(__ARM_FP16_FORMAT_IEEE)
+      a_fp16_f32[ki] = static_cast<float>(static_cast<__fp16>(in_f32[ki]));
+#else
+      a_fp16_f32[ki] = in_f32[ki];
+#endif
+    }
+    std::vector<float> y_raw(n_dim, 0.0f);
+    for (uint32_t ni = 0u; ni < n_dim; ++ni) {
+      const int8_t* wrow = w_nk + static_cast<size_t>(ni) * k_dim;
+      float acc = 0.0f;
+      for (uint32_t ki = 0u; ki < k_dim; ++ki) {
+        acc += a_fp16_f32[ki] * static_cast<float>(wrow[ki]);
+      }
+      y_raw[ni] = acc;
+    }
+    ob::w8a16_pt_epilogue_f32(c_n, y_raw.data(), sb_n, n_dim, prescale_inv, true);
+    if (out_stats) {
+      std::memset(out_stats, 0, sizeof(*out_stats));
+      out_stats->wall_time_us = (ob::monotonic_now_ns() - t0_ns) / 1000ULL;
+      out_stats->tiles_dispatched = 1u;
+      if (ctx->mock_mode) out_stats->flags |= OB_STAT_FLAG_MOCK;
+      out_stats->flags |= OB_STAT_FLAG_CPU_FALLBACK;
+    }
+    return OB_OK;
+  }
+
+  // Acquire cached Probe-A weight-agnostic 7-chunk PT W8A16(FP16) (scale=1.0f) graph
+  ob::CachedGraph* entry = nullptr;
+  bool was_hit = false;
+  ob_status_t st = ob::acquire_w8a16_pt_1x_entry(ctx, k_dim, n_dim, 1.0f, 0u, &entry, &was_hit);
+  if (st != OB_OK) return st;
+
+  // Pack [N/32, K/2, 32, 2] w_i8 ^ 0x80 weights into a DMA-BUF (cached by content hash!)
+  uint32_t whdr[4] = {0x57384136u, k_dim, n_dim, 2u};
+  uint64_t wh = ob::fast_hash64_update(0x57384131365F5431ULL, whdr, sizeof(whdr));
+  wh = ob::hash_weight_tile_fast(wh, reinterpret_cast<const uint8_t*>(w_nk),
+                                 k_dim, n_dim, k_dim, ctx->strict_weight_hash);
+  ob::CachedWeightTile* w_tile = ob::weight_cache_find_locked(ctx, wh);
+  if (!w_tile) {
+    const size_t ext2_sz = ob::pack_w8a16_ext2_size(n_dim, k_dim);
+    ob_buffer* wbuf = nullptr;
+    st = ob_buffer_alloc(ctx, ext2_sz, OB_BUF_BIDIRECTIONAL | OB_BUF_NO_POOL, &wbuf);
+    if (st == OB_OK) {
+      st = ob::buffer_sync_begin_write(wbuf);
+      if (st == OB_OK) {
+        ob::pack_w8a16_ext2_into(static_cast<uint8_t*>(ob_buffer_data(wbuf)), n_dim, k_dim, w_nk);
+        st = ob::buffer_sync_end_write(wbuf);
+      }
+    }
+    if (st != OB_OK) {
+      if (wbuf) ob_buffer_free(wbuf);
+      ob::release_tile_entry(ctx, entry);
+      return st;
+    }
+    w_tile = new (std::nothrow) ob::CachedWeightTile();
+    if (!w_tile) {
+      ob_buffer_free(wbuf);
+      ob::release_tile_entry(ctx, entry);
+      return OB_ERR_NO_MEMORY;
+    }
+    w_tile->key = wh;
+    w_tile->scale_d = 1u;
+    w_tile->hw_k = k_dim;
+    w_tile->hw_n = n_dim;
+    w_tile->ext2_buf = wbuf;
+    w_tile->ext2_bytes = ext2_sz;
+    ob::weight_cache_insert_locked(ctx, w_tile);
+  }
+
+  ob_buffer* in_buf = nullptr;
+  ob_buffer* out_buf = nullptr;
+  st = ob::ensure_pipeline_buf_tiered(
+      ctx, &ctx->gemm_in_bufs_4k[0], &ctx->gemm_in_bufs[0],
+      static_cast<size_t>(k_dim) * sizeof(float), &in_buf);
+  if (st == OB_OK) {
+    st = ob::ensure_pipeline_buf_tiered(
+        ctx, &ctx->gemm_out_bufs_4k[0], &ctx->gemm_out_bufs[0],
+        static_cast<size_t>(n_dim) * sizeof(float), &out_buf);
+  }
+  if (st == OB_OK) {
+    st = ob_buffer_write(in_buf, in_f32.data(), static_cast<size_t>(k_dim) * sizeof(float), 0u);
+  }
+  ob_exec_handle_t exec_h = 0u;
+  if (st == OB_OK) {
+    st = ob::device_submit_execute_async(
+        ctx, entry, &in_buf, 1u, &out_buf, 1u, &exec_h, w_tile->ext2_buf);
+  }
+  if (st != OB_OK) {
+    ob::release_tile_entry(ctx, entry);
+    return st;
+  }
+
+  ob_invoke_stats_t istats {};
+  st = ob::device_wait_handle(ctx, exec_h, ctx->cfg.timeout_ms, &istats);
+  if (st == OB_OK) {
+    st = ob::buffer_sync_begin_read(out_buf);
+    if (st == OB_OK) {
+      const float* y_raw = static_cast<const float*>(ob_buffer_data(out_buf));
+      ob::w8a16_pt_epilogue_f32(c_n, y_raw, sb_n, n_dim, prescale_inv, true);
+      st = ob::buffer_sync_end_read(out_buf);
+    }
+  }
+  if (st == OB_OK && out_stats) {
+    *out_stats = istats;
+    out_stats->wall_time_us = (ob::monotonic_now_ns() - t0_ns) / 1000ULL;
+    out_stats->tiles_dispatched = 1u;
+    out_stats->cache_hits = was_hit ? 1u : 0u;
+    out_stats->flags |= OB_STAT_FLAG_EMITTER_USED;
+    if (was_hit) out_stats->flags |= OB_STAT_FLAG_CACHE_HIT;
+  }
+  return st;
 }
 
 }  // extern "C"

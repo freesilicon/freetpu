@@ -504,25 +504,40 @@ struct moe_row_ref {
     int32_t iid1;
 };
 
-struct rope_single_pos_key {
-    bool    valid       = false;
-    int64_t pos         = 0;
-    int64_t ne0         = 0;
-    int     n_dims      = 0;
-    int     n_ctx_orig  = 0;
-    bool    truncate    = false;
-    float   freq_base   = 0.0f;
-    float   freq_scale  = 0.0f;
-    float   ext_factor  = 0.0f;
-    float   attn_factor = 0.0f;
-    float   beta_fast   = 0.0f;
-    float   beta_slow   = 0.0f;
+struct rope_table_key {
+    bool                 valid       = false;
+    int64_t              ne2         = 0;
+    uint64_t             pos_hash    = 0;
+    int64_t              ne0         = 0;
+    int                  n_dims      = 0;
+    int                  n_ctx_orig  = 0;
+    bool                 truncate    = false;
+    float                freq_base   = 0.0f;
+    float                freq_scale  = 0.0f;
+    float                ext_factor  = 0.0f;
+    float                attn_factor = 0.0f;
+    float                beta_fast   = 0.0f;
+    float                beta_slow   = 0.0f;
+    std::vector<int32_t> pos_copy;
 
-    bool matches(int64_t p, int64_t n0, int nd, int nco, bool tr,
+    static uint64_t hash_pos(const int32_t * pos, int64_t count) {
+        uint64_t h = 0xcbf29ce484222325ULL;
+        for (int64_t i = 0; i < count; ++i) {
+            h ^= static_cast<uint64_t>(static_cast<uint32_t>(pos[i]));
+            h *= 0x100000001b3ULL;
+        }
+        return h;
+    }
+
+    bool matches(const int32_t * pos, int64_t count, uint64_t ph, int64_t n0, int nd, int nco, bool tr,
                  float fb, float fs, float ef, float af, float bf, float bs) const {
-        return valid && pos == p && ne0 == n0 && n_dims == nd && n_ctx_orig == nco && truncate == tr &&
-               freq_base == fb && freq_scale == fs && ext_factor == ef && attn_factor == af &&
-               beta_fast == bf && beta_slow == bs;
+        if (!valid || ne2 != count || pos_hash != ph || ne0 != n0 || n_dims != nd ||
+            n_ctx_orig != nco || truncate != tr || freq_base != fb || freq_scale != fs ||
+            ext_factor != ef || attn_factor != af || beta_fast != bf || beta_slow != bs) {
+            return false;
+        }
+        return pos_copy.size() == static_cast<size_t>(count) &&
+               std::memcmp(pos_copy.data(), pos, static_cast<size_t>(count) * sizeof(int32_t)) == 0;
     }
 };
 
@@ -539,7 +554,7 @@ struct ggml_backend_edgetpu_context {
     std::vector<float>       f32_a;
     std::vector<float>       sibling_scratch;
     std::vector<float>       rope_cache;
-    rope_single_pos_key      last_rope_key;
+    rope_table_key           last_rope_key;
 
     // Reusable MoE (GGML_OP_MUL_MAT_ID) routing scratch buffers
     std::vector<int32_t>     moe_counts;
@@ -1094,64 +1109,113 @@ static ggml_status ggml_edgetpu_compute_forward_rope(ggml_backend_edgetpu_contex
     const float * freq_factors = src2 ? reinterpret_cast<const float *>(src2->data) : nullptr;
     const int32_t * pos        = reinterpret_cast<const int32_t *>(src1->data);
 
-    if (ctx->rope_cache.size() < static_cast<size_t>(ne0)) {
-        ctx->rope_cache.resize(static_cast<size_t>(ne0));
-    }
-    float * cache = ctx->rope_cache.data();
-
     const float theta_scale = std::pow(freq_base, -2.0f / static_cast<float>(n_dims));
     float corr_dims[2];
     ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, truncate, corr_dims);
 
-    const bool can_reuse_single_pos = (ne2 == 1 && freq_factors == nullptr);
-    int64_t last_i2 = -1;
-
-    for (int64_t i3 = 0; i3 < ne3; ++i3) {
-        for (int64_t i2 = 0; i2 < ne2; ++i2) {
-            if (last_i2 != i2) {
-                const int64_t p = pos[i2];
-                if (can_reuse_single_pos &&
-                    ctx->last_rope_key.matches(p, ne0, n_dims, n_ctx_orig, truncate,
-                                               freq_base, freq_scale, ext_factor, attn_factor,
-                                               beta_fast, beta_slow)) {
-                    // Reuse cached cos/sin across Q/K and all layers sharing pos[0] during decode.
-                } else {
-                    edgetpu_rope_cache_init(
-                        static_cast<float>(p), freq_scale, freq_factors, corr_dims,
-                        ne0, ext_factor, attn_factor, cache, theta_scale);
-                    if (can_reuse_single_pos) {
-                        ctx->last_rope_key = {
-                            true, p, ne0, n_dims, n_ctx_orig, truncate,
-                            freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow
-                        };
-                    } else {
-                        ctx->last_rope_key.valid = false;
-                    }
-                }
-                last_i2 = i2;
+    // Cache full cos/sin table across Q/K and all layers for both decode (ne2==1) and prefill (ne2<=2048)!
+    // Eliminates 55/56ths of trigonometric cos/sin evaluations on Qwen2.5 pp512 (28L x Q,K).
+    const bool can_cache_table = (freq_factors == nullptr && ne2 >= 1 && ne2 <= 2048 && ne0 <= 512);
+    if (can_cache_table) {
+        const size_t table_elems = static_cast<size_t>(ne2) * static_cast<size_t>(ne0);
+        if (ctx->rope_cache.size() < table_elems) {
+            ctx->rope_cache.resize(table_elems);
+        }
+        const uint64_t ph = rope_table_key::hash_pos(pos, ne2);
+        if (!ctx->last_rope_key.matches(pos, ne2, ph, ne0, n_dims, n_ctx_orig, truncate,
+                                        freq_base, freq_scale, ext_factor, attn_factor,
+                                        beta_fast, beta_slow)) {
+            for (int64_t i2 = 0; i2 < ne2; ++i2) {
+                edgetpu_rope_cache_init(
+                    static_cast<float>(pos[i2]), freq_scale, nullptr, corr_dims,
+                    ne0, ext_factor, attn_factor,
+                    ctx->rope_cache.data() + static_cast<size_t>(i2) * static_cast<size_t>(ne0),
+                    theta_scale);
             }
+            ctx->last_rope_key.valid       = true;
+            ctx->last_rope_key.ne2         = ne2;
+            ctx->last_rope_key.pos_hash    = ph;
+            ctx->last_rope_key.ne0         = ne0;
+            ctx->last_rope_key.n_dims      = n_dims;
+            ctx->last_rope_key.n_ctx_orig  = n_ctx_orig;
+            ctx->last_rope_key.truncate    = truncate;
+            ctx->last_rope_key.freq_base   = freq_base;
+            ctx->last_rope_key.freq_scale  = freq_scale;
+            ctx->last_rope_key.ext_factor  = ext_factor;
+            ctx->last_rope_key.attn_factor = attn_factor;
+            ctx->last_rope_key.beta_fast   = beta_fast;
+            ctx->last_rope_key.beta_slow   = beta_slow;
+            ctx->last_rope_key.pos_copy.assign(pos, pos + ne2);
+        }
 
-            const char * src_base = static_cast<const char *>(src0->data) + i3 * nb03 + i2 * nb02;
-            char *       dst_base = static_cast<char *>(dst->data)        + i3 * nb3  + i2 * nb2;
+        for (int64_t i3 = 0; i3 < ne3; ++i3) {
+            for (int64_t i2 = 0; i2 < ne2; ++i2) {
+                const float * cache = ctx->rope_cache.data() + static_cast<size_t>(i2) * static_cast<size_t>(ne0);
+                const char * src_base = static_cast<const char *>(src0->data) + i3 * nb03 + i2 * nb02;
+                char *       dst_base = static_cast<char *>(dst->data)        + i3 * nb3  + i2 * nb2;
 
-            for (int64_t i1 = 0; i1 < ne1; ++i1) {
-                const float * srow = reinterpret_cast<const float *>(src_base + i1 * nb01);
-                float *       drow = reinterpret_cast<float *>(dst_base + i1 * nb1);
+                for (int64_t i1 = 0; i1 < ne1; ++i1) {
+                    const float * srow = reinterpret_cast<const float *>(src_base + i1 * nb01);
+                    float *       drow = reinterpret_cast<float *>(dst_base + i1 * nb1);
 
-                if (mode == GGML_ROPE_TYPE_NEOX) {
-                    edgetpu_rotate_pairs_neox_f32(n_dims, cache, srow + n_offs, drow + n_offs);
-                } else {
-                    edgetpu_rotate_pairs_normal_f32(n_dims, cache, srow + n_offs, drow + n_offs);
+                    if (mode == GGML_ROPE_TYPE_NEOX) {
+                        edgetpu_rotate_pairs_neox_f32(n_dims, cache, srow + n_offs, drow + n_offs);
+                    } else {
+                        edgetpu_rotate_pairs_normal_f32(n_dims, cache, srow + n_offs, drow + n_offs);
+                    }
+
+                    if (drow != srow) {
+                        if (n_offs > 0) {
+                            std::memcpy(drow, srow, static_cast<size_t>(n_offs) * sizeof(float));
+                        }
+                        const int64_t tail_start = n_offs + n_dims;
+                        if (tail_start < ne0) {
+                            std::memcpy(drow + tail_start, srow + tail_start,
+                                        static_cast<size_t>(ne0 - tail_start) * sizeof(float));
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        if (ctx->rope_cache.size() < static_cast<size_t>(ne0)) {
+            ctx->rope_cache.resize(static_cast<size_t>(ne0));
+        }
+        float * cache = ctx->rope_cache.data();
+        ctx->last_rope_key.valid = false;
+        int64_t last_i2 = -1;
+
+        for (int64_t i3 = 0; i3 < ne3; ++i3) {
+            for (int64_t i2 = 0; i2 < ne2; ++i2) {
+                if (last_i2 != i2) {
+                    edgetpu_rope_cache_init(
+                        static_cast<float>(pos[i2]), freq_scale, freq_factors, corr_dims,
+                        ne0, ext_factor, attn_factor, cache, theta_scale);
+                    last_i2 = i2;
                 }
 
-                if (drow != srow) {
-                    if (n_offs > 0) {
-                        std::memcpy(drow, srow, static_cast<size_t>(n_offs) * sizeof(float));
+                const char * src_base = static_cast<const char *>(src0->data) + i3 * nb03 + i2 * nb02;
+                char *       dst_base = static_cast<char *>(dst->data)        + i3 * nb3  + i2 * nb2;
+
+                for (int64_t i1 = 0; i1 < ne1; ++i1) {
+                    const float * srow = reinterpret_cast<const float *>(src_base + i1 * nb01);
+                    float *       drow = reinterpret_cast<float *>(dst_base + i1 * nb1);
+
+                    if (mode == GGML_ROPE_TYPE_NEOX) {
+                        edgetpu_rotate_pairs_neox_f32(n_dims, cache, srow + n_offs, drow + n_offs);
+                    } else {
+                        edgetpu_rotate_pairs_normal_f32(n_dims, cache, srow + n_offs, drow + n_offs);
                     }
-                    const int64_t tail_start = n_offs + n_dims;
-                    if (tail_start < ne0) {
-                        std::memcpy(drow + tail_start, srow + tail_start,
-                                    static_cast<size_t>(ne0 - tail_start) * sizeof(float));
+
+                    if (drow != srow) {
+                        if (n_offs > 0) {
+                            std::memcpy(drow, srow, static_cast<size_t>(n_offs) * sizeof(float));
+                        }
+                        const int64_t tail_start = n_offs + n_dims;
+                        if (tail_start < ne0) {
+                            std::memcpy(drow + tail_start, srow + tail_start,
+                                        static_cast<size_t>(ne0 - tail_start) * sizeof(float));
+                        }
                     }
                 }
             }

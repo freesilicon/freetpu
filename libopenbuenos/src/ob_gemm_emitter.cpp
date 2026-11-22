@@ -22,6 +22,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(__ARM_NEON) && defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 namespace ob {
 
 namespace {
@@ -407,6 +411,100 @@ Pkt pack_csr_packet(uint32_t op, uint32_t mask,
 // 1. Parameter buffer packing (ext[2])
 // ---------------------------------------------------------------------------
 
+size_t pack_ext2_size_impl(uint32_t N, uint32_t K, bool include_bias) {
+  uint32_t k4 = pad4(K);
+  uint32_t n_blk = (N <= 32u) ? std::max<uint32_t>(8u, ((N + 7u) / 8u) * 8u) : 32u;
+  uint32_t n_groups = (N <= 32u) ? 1u : ((N + 31u) / 32u);
+  size_t grp_sz = (include_bias ? static_cast<size_t>(n_blk) * 4u : 0u) +
+                  static_cast<size_t>(k4) * static_cast<size_t>(n_blk);
+  return grp_sz * n_groups;
+}
+
+void pack_ext2_aligned_groups(uint8_t* out_base,
+                              uint32_t K,
+                              const int8_t* weights_nk,
+                              const int32_t* bias_n,
+                              bool include_bias,
+                              uint32_t g_start,
+                              uint32_t g_end) {
+  const size_t grp_sz = (include_bias ? 128u : 0u) + static_cast<size_t>(K) * 32u;
+  const uint32_t k_blocks16 = K / 16u;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+  const uint8x16_t v_80 = vdupq_n_u8(0x80u);
+#endif
+  for (uint32_t g = g_start; g < g_end; ++g) {
+    uint8_t* dst = out_base + static_cast<size_t>(g) * grp_sz;
+    const uint32_t n0 = g * 32u;
+    if (include_bias) {
+      if (bias_n) {
+        std::memcpy(dst, bias_n + n0, 32u * sizeof(int32_t));
+      } else {
+        std::memset(dst, 0, 32u * sizeof(int32_t));
+      }
+      dst += 32u * sizeof(int32_t);
+    }
+    for (uint32_t kb = 0u; kb < k_blocks16; ++kb) {
+      const uint32_t k0 = kb * 16u;
+      uint8_t* d0 = dst;
+      uint8_t* d1 = dst + 128u;
+      uint8_t* d2 = dst + 256u;
+      uint8_t* d3 = dst + 384u;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+      for (uint32_t ni = 0u; ni < 32u; ni += 4u) {
+        const uint8_t* s0 = reinterpret_cast<const uint8_t*>(
+            weights_nk + static_cast<size_t>(n0 + ni + 0u) * K + k0);
+        const uint8_t* s1 = reinterpret_cast<const uint8_t*>(
+            weights_nk + static_cast<size_t>(n0 + ni + 1u) * K + k0);
+        const uint8_t* s2 = reinterpret_cast<const uint8_t*>(
+            weights_nk + static_cast<size_t>(n0 + ni + 2u) * K + k0);
+        const uint8_t* s3 = reinterpret_cast<const uint8_t*>(
+            weights_nk + static_cast<size_t>(n0 + ni + 3u) * K + k0);
+        uint32x4_t r0 = vreinterpretq_u32_u8(veorq_u8(vld1q_u8(s0), v_80));
+        uint32x4_t r1 = vreinterpretq_u32_u8(veorq_u8(vld1q_u8(s1), v_80));
+        uint32x4_t r2 = vreinterpretq_u32_u8(veorq_u8(vld1q_u8(s2), v_80));
+        uint32x4_t r3 = vreinterpretq_u32_u8(veorq_u8(vld1q_u8(s3), v_80));
+
+        uint32x4_t t0 = vtrn1q_u32(r0, r1);
+        uint32x4_t t1 = vtrn2q_u32(r0, r1);
+        uint32x4_t t2 = vtrn1q_u32(r2, r3);
+        uint32x4_t t3 = vtrn2q_u32(r2, r3);
+
+        uint8x16_t c0 = vreinterpretq_u8_u64(vtrn1q_u64(vreinterpretq_u64_u32(t0), vreinterpretq_u64_u32(t2)));
+        uint8x16_t c1 = vreinterpretq_u8_u64(vtrn1q_u64(vreinterpretq_u64_u32(t1), vreinterpretq_u64_u32(t3)));
+        uint8x16_t c2 = vreinterpretq_u8_u64(vtrn2q_u64(vreinterpretq_u64_u32(t0), vreinterpretq_u64_u32(t2)));
+        uint8x16_t c3 = vreinterpretq_u8_u64(vtrn2q_u64(vreinterpretq_u64_u32(t1), vreinterpretq_u64_u32(t3)));
+
+        const size_t off = static_cast<size_t>(ni) * 4u;
+        vst1q_u8(d0 + off, c0);
+        vst1q_u8(d1 + off, c1);
+        vst1q_u8(d2 + off, c2);
+        vst1q_u8(d3 + off, c3);
+      }
+#else
+      for (uint32_t ni = 0u; ni < 32u; ++ni) {
+        const uint8_t* src = reinterpret_cast<const uint8_t*>(
+            weights_nk + static_cast<size_t>(n0 + ni) * K + k0);
+        uint32_t w0, w1, w2, w3;
+        std::memcpy(&w0, src, 4u);
+        std::memcpy(&w1, src + 4u, 4u);
+        std::memcpy(&w2, src + 8u, 4u);
+        std::memcpy(&w3, src + 12u, 4u);
+        w0 ^= 0x80808080u;
+        w1 ^= 0x80808080u;
+        w2 ^= 0x80808080u;
+        w3 ^= 0x80808080u;
+        const size_t off = static_cast<size_t>(ni) * 4u;
+        std::memcpy(d0 + off, &w0, 4u);
+        std::memcpy(d1 + off, &w1, 4u);
+        std::memcpy(d2 + off, &w2, 4u);
+        std::memcpy(d3 + off, &w3, 4u);
+      }
+#endif
+      dst += 512u;
+    }
+  }
+}
+
 std::vector<uint8_t> pack_ext2(uint32_t N, uint32_t K,
                                const int8_t* weights_nk,
                                const int32_t* bias_n,
@@ -424,45 +522,7 @@ std::vector<uint8_t> pack_ext2(uint32_t N, uint32_t K,
   // ((int32_t)(int8_t)w + 128) & 0xFF == ((uint8_t)w ^ 0x80u) for all 256 int8 values.
   if (weights_nk && N >= 32u && (N % 32u) == 0u && (K % 16u) == 0u) {
     out.resize(grp_sz * n_groups);
-    uint8_t* dst = out.data();
-    const uint32_t k_blocks16 = K / 16u;
-    for (uint32_t g = 0; g < n_groups; ++g) {
-      const uint32_t n0 = g * 32u;
-      if (include_bias) {
-        if (bias_n) {
-          std::memcpy(dst, bias_n + n0, 32u * sizeof(int32_t));
-        } else {
-          std::memset(dst, 0, 32u * sizeof(int32_t));
-        }
-        dst += 32u * sizeof(int32_t);
-      }
-      for (uint32_t kb = 0; kb < k_blocks16; ++kb) {
-        const uint32_t k0 = kb * 16u;
-        uint8_t* d0 = dst;
-        uint8_t* d1 = dst + 128u;
-        uint8_t* d2 = dst + 256u;
-        uint8_t* d3 = dst + 384u;
-        for (uint32_t ni = 0; ni < 32u; ++ni) {
-          const uint8_t* src = reinterpret_cast<const uint8_t*>(
-              weights_nk + static_cast<size_t>(n0 + ni) * K + k0);
-          uint32_t w0, w1, w2, w3;
-          std::memcpy(&w0, src, 4u);
-          std::memcpy(&w1, src + 4u, 4u);
-          std::memcpy(&w2, src + 8u, 4u);
-          std::memcpy(&w3, src + 12u, 4u);
-          w0 ^= 0x80808080u;
-          w1 ^= 0x80808080u;
-          w2 ^= 0x80808080u;
-          w3 ^= 0x80808080u;
-          const size_t off = static_cast<size_t>(ni) * 4u;
-          std::memcpy(d0 + off, &w0, 4u);
-          std::memcpy(d1 + off, &w1, 4u);
-          std::memcpy(d2 + off, &w2, 4u);
-          std::memcpy(d3 + off, &w3, 4u);
-        }
-        dst += 512u;
-      }
-    }
+    pack_ext2_aligned_groups(out.data(), K, weights_nk, bias_n, include_bias, 0u, n_groups);
     return out;
   }
 
@@ -2503,7 +2563,8 @@ class FbBuilder {
 
 // Build bit-exact DIVE FlatBuffer (ext[0]) cleanly from scratch (zero raw templates).
 std::vector<uint8_t> build_dive_ext0_clean(const std::array<std::vector<uint8_t>, 7>& chunks,
-                                           uint32_t M, uint32_t K, uint32_t N) {
+                                           uint32_t M, uint32_t K, uint32_t N,
+                                           uint8_t io_dt = 1u) {
   FbBuilder fb;
 
   struct ValSpec {
@@ -2515,11 +2576,11 @@ std::vector<uint8_t> build_dive_ext0_clean(const std::array<std::vector<uint8_t>
   const ValSpec val_specs[14] = {
       {{-2, 0}, 1u, 2u, "parameter_0"},
       {{-2, 0}, 1u, 2u, "scratchpad"},
-      {{static_cast<int64_t>(M), static_cast<int64_t>(K)}, 2u, 1u, "input_0"},
+      {{static_cast<int64_t>(M), static_cast<int64_t>(K)}, 2u, io_dt, "input_0"},
       {{0, 0}, 0u, 11u, "main"},
       {{0, 0}, 0u, 11u, "main.1"},
       {{0, 0}, 0u, 11u, "dive_vm_tensor_address_of.1"},
-      {{static_cast<int64_t>(M), static_cast<int64_t>(N)}, 2u, 1u, "output_0"},
+      {{static_cast<int64_t>(M), static_cast<int64_t>(N)}, 2u, io_dt, "output_0"},
       {{0, 0}, 0u, 11u, "dive_vm_tensor_address_of.3"},
       {{0, 0}, 0u, 11u, "variable_4097"},
       {{0, 0}, 0u, 11u, "variable_4099"},
@@ -2671,7 +2732,8 @@ std::vector<uint8_t> build_dgd0_clean() {
 std::vector<uint8_t> build_multi_executable_clean(uint32_t M, uint32_t K, uint32_t N,
                                                   uint32_t ext2_size,
                                                   uint32_t exec_field_14,
-                                                  uint64_t exec_hash) {
+                                                  uint64_t exec_hash,
+                                                  uint32_t io_elem_bytes = 1u) {
   FbBuilder fb;
   auto make_layer = [&](uint64_t sz, const char* name) -> uint32_t {
     uint32_t nm = fb.create_string(name);
@@ -2682,8 +2744,8 @@ std::vector<uint8_t> build_multi_executable_clean(uint32_t M, uint32_t K, uint32
     return fb.end_table();
   };
 
-  uint32_t in_layer = make_layer(static_cast<uint64_t>(M) * K, "input_0");
-  uint32_t out_layer = make_layer(static_cast<uint64_t>(M) * N, "output_0");
+  uint32_t in_layer = make_layer(static_cast<uint64_t>(M) * K * io_elem_bytes, "input_0");
+  uint32_t out_layer = make_layer(static_cast<uint64_t>(M) * N * io_elem_bytes, "output_0");
   uint32_t param_layer = make_layer(ext2_size, "main_STAND_ALONE_params_Group_0_0_2_0_0");
 
   uint32_t ins_vec = fb.create_vector_uoffsets(&in_layer, 1u);
@@ -2728,9 +2790,10 @@ std::vector<uint8_t> build_multi_executable_clean(uint32_t M, uint32_t K, uint32
 std::vector<uint8_t> build_dws0_clean(uint32_t M, uint32_t K, uint32_t N,
                                       uint32_t ext0_size, uint32_t ext1_size, uint32_t ext2_size,
                                       uint32_t scratch_sz, uint32_t exec_field_14,
-                                      uint64_t exec_hash, const char* token_str) {
+                                      uint64_t exec_hash, const char* token_str,
+                                      uint8_t io_dt = 1u, uint32_t io_elem_bytes = 1u) {
   std::vector<uint8_t> mexec =
-      build_multi_executable_clean(M, K, N, ext2_size, exec_field_14, exec_hash);
+      build_multi_executable_clean(M, K, N, ext2_size, exec_field_14, exec_hash, io_elem_bytes);
 
   FbBuilder fb;
   auto make_tref = [&](uint32_t idx) -> uint32_t {
@@ -2767,8 +2830,8 @@ std::vector<uint8_t> build_dws0_clean(uint32_t M, uint32_t K, uint32_t N,
   uint32_t scr_dims[1] = {scratch_sz};
 
   uint32_t t_offs[6]{};
-  t_offs[0] = make_tensor(in_dims, 2u, 1u, "input_0", 1u, false, 0ULL);
-  t_offs[1] = make_tensor(out_dims, 2u, 1u, "output_0", 1u, false, 0ULL);
+  t_offs[0] = make_tensor(in_dims, 2u, io_dt, "input_0", 1u, false, 0ULL);
+  t_offs[1] = make_tensor(out_dims, 2u, io_dt, "output_0", 1u, false, 0ULL);
   t_offs[2] = make_tensor(ext0_dims, 1u, 2u, "main_STAND_ALONE_dive_vm_ir_Group_0_0_2_0", 5u, true, 0ULL);
   t_offs[3] = make_tensor(ext1_dims, 1u, 2u, "main_STAND_ALONE_interpreter_Group_0_0_2_0", 5u, true, 1ULL);
   t_offs[4] = make_tensor(ext2_dims, 1u, 2u, "main_STAND_ALONE_params_Group_0_0_2_0_0", 5u, true, 2ULL);
@@ -3574,38 +3637,54 @@ bool is_lt_64x_shape_impl(uint32_t M, uint32_t K, uint32_t N) {
          (K + N) <= 3072u;
 }
 
+void pack_ext2_lt_64x_groups(uint8_t* out_base,
+                             uint32_t K,
+                             const int8_t* weights_nk,
+                             const int32_t* bias_n,
+                             uint32_t ng_start,
+                             uint32_t ng_end) {
+  const size_t grp_sz = 128u + static_cast<size_t>(K) * 8u;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+  const uint8x16_t v_80 = vdupq_n_u8(0x80u);
+#endif
+  for (uint32_t ng = ng_start; ng < ng_end; ++ng) {
+    uint8_t* dst = out_base + static_cast<size_t>(ng) * grp_sz;
+    const uint32_t n0 = ng * 8u;
+    // 128 B bias header per 8 output channels: 2 x (4 int32 + 48 B zero)
+    std::memset(dst, 0, 128u);
+    if (bias_n != nullptr) {
+      std::memcpy(dst, bias_n + n0, 16u);
+      std::memcpy(dst + 64u, bias_n + n0 + 4u, 16u);
+    }
+    dst += 128u;
+    // K/16 blocks of 8 output channels x 16 K-bytes (XOR 0x80 unsigned bias)
+    if (weights_nk != nullptr) {
+      for (uint32_t k0 = 0u; k0 < K; k0 += 16u) {
+        for (uint32_t c = 0u; c < 8u; ++c) {
+          const uint8_t* src = reinterpret_cast<const uint8_t*>(
+              weights_nk + static_cast<size_t>(n0 + c) * K + k0);
+#if defined(__ARM_NEON) && defined(__aarch64__)
+          vst1q_u8(dst, veorq_u8(vld1q_u8(src), v_80));
+#else
+          for (uint32_t i = 0u; i < 16u; ++i) {
+            dst[i] = static_cast<uint8_t>(src[i] ^ 0x80u);
+          }
+#endif
+          dst += 16u;
+        }
+      }
+    } else {
+      std::memset(dst, 0x80, static_cast<size_t>(K) * 8u);
+    }
+  }
+}
+
 std::vector<uint8_t> pack_ext2_lt_64x_impl(uint32_t N, uint32_t K,
                                            const int8_t* weights_nk,
                                            const int32_t* bias_n) {
   std::vector<uint8_t> out;
   out.resize(static_cast<size_t>(N) * K + static_cast<size_t>(N) * 16u, 0u);
-  uint8_t* dst = out.data();
-  const uint32_t n_groups = N / 8u;
-  for (uint32_t ng = 0u; ng < n_groups; ++ng) {
-    const uint32_t n0 = ng * 8u;
-    // 128 B bias header per 8 output channels: 2 x (4 int32 + 48 B zero)
-    for (uint32_t sub = 0u; sub < 2u; ++sub) {
-      if (bias_n != nullptr) {
-        std::memcpy(dst, bias_n + n0 + sub * 4u, 16u);
-      }
-      dst += 64u;
-    }
-    // K/16 blocks of 8 output channels x 16 K-bytes (XOR 0x80 unsigned bias)
-    for (uint32_t k0 = 0u; k0 < K; k0 += 16u) {
-      for (uint32_t c = 0u; c < 8u; ++c) {
-        if (weights_nk != nullptr) {
-          const uint8_t* src = reinterpret_cast<const uint8_t*>(
-              weights_nk + static_cast<size_t>(n0 + c) * K + k0);
-          for (uint32_t i = 0u; i < 16u; ++i) {
-            dst[i] = static_cast<uint8_t>(src[i] ^ 0x80u);
-          }
-        } else {
-          std::memset(dst, 0x80, 16u);
-        }
-        dst += 16u;
-      }
-    }
-  }
+  pack_ext2_lt_64x_groups(out.data(), K, weights_nk, bias_n, 0u, N / 8u);
   return out;
 }
 
@@ -4962,10 +5041,56 @@ std::vector<uint8_t> pack_ext2_for_tile(uint32_t N, uint32_t K,
   return pack_ext2(N, K, weights_nk, bias_n, include_bias);
 }
 
+size_t pack_ext2_size_for_tile(uint32_t N, uint32_t K, bool include_bias) {
+  return pack_ext2_size_impl(N, K, include_bias);
+}
+
+void pack_ext2_for_tile_into(uint8_t* dst, uint32_t N, uint32_t K,
+                             const int8_t* weights_nk,
+                             const int32_t* bias_n,
+                             bool include_bias,
+                             WorkerPool* pool) {
+  if (!dst) return;
+  if (weights_nk && N >= 32u && (N % 32u) == 0u && (K % 16u) == 0u) {
+    const uint32_t n_groups = N / 32u;
+    const size_t total_bytes = pack_ext2_size_impl(N, K, include_bias);
+    if (pool && n_groups >= 4u && total_bytes >= 65536u) {
+      pool->parallel_for_fn(n_groups, 2u, [&](uint32_t g0, uint32_t g1, uint32_t) {
+        pack_ext2_aligned_groups(dst, K, weights_nk, bias_n, include_bias, g0, g1);
+      });
+    } else {
+      pack_ext2_aligned_groups(dst, K, weights_nk, bias_n, include_bias, 0u, n_groups);
+    }
+    return;
+  }
+  std::vector<uint8_t> tmp = pack_ext2(N, K, weights_nk, bias_n, include_bias);
+  if (!tmp.empty()) std::memcpy(dst, tmp.data(), tmp.size());
+}
+
 std::vector<uint8_t> pack_ext2_for_lt_64x(uint32_t N, uint32_t K,
                                           const int8_t* weights_nk,
                                           const int32_t* bias_n) {
   return pack_ext2_lt_64x_impl(N, K, weights_nk, bias_n);
+}
+
+size_t pack_ext2_size_for_lt_64x(uint32_t N, uint32_t K) {
+  return static_cast<size_t>(N) * K + static_cast<size_t>(N) * 16u;
+}
+
+void pack_ext2_for_lt_64x_into(uint8_t* dst, uint32_t N, uint32_t K,
+                               const int8_t* weights_nk,
+                               const int32_t* bias_n,
+                               WorkerPool* pool) {
+  if (!dst) return;
+  const uint32_t n_groups = N / 8u;
+  const size_t total_bytes = pack_ext2_size_for_lt_64x(N, K);
+  if (pool && n_groups >= 8u && total_bytes >= 65536u) {
+    pool->parallel_for_fn(n_groups, 4u, [&](uint32_t ng0, uint32_t ng1, uint32_t) {
+      pack_ext2_lt_64x_groups(dst, K, weights_nk, bias_n, ng0, ng1);
+    });
+  } else {
+    pack_ext2_lt_64x_groups(dst, K, weights_nk, bias_n, 0u, n_groups);
+  }
 }
 
 ob_status_t build_dgc0_dyn_weights(const ob_gemm_desc_t& desc,
@@ -7167,24 +7292,45 @@ bool is_swiglu_shape(uint32_t M, uint32_t K, uint32_t H, uint32_t N) {
   return false;
 }
 
+size_t pack_ext2_size_for_swiglu(uint32_t M, uint32_t K, uint32_t H, uint32_t N) {
+  if (M == 64u) {
+    return pack_ext2_size_for_lt_64x(H, K) +
+           pack_ext2_size_for_lt_64x(H, K) +
+           pack_ext2_size_for_lt_64x(N, H);
+  }
+  return pack_ext2_size_for_tile(H, K, true) +
+         pack_ext2_size_for_tile(H, K, true) +
+         pack_ext2_size_for_tile(N, H, true);
+}
+
+void pack_ext2_for_swiglu_into(uint8_t* dst,
+                               uint32_t M, uint32_t K, uint32_t H, uint32_t N,
+                               const int8_t* wg_hk, const int32_t* bg_h,
+                               const int8_t* wu_hk, const int32_t* bu_h,
+                               const int8_t* wd_nh, const int32_t* bd_n,
+                               WorkerPool* pool) {
+  if (!dst) return;
+  if (M == 64u) {
+    const size_t sz_g = pack_ext2_size_for_lt_64x(H, K);
+    const size_t sz_u = pack_ext2_size_for_lt_64x(H, K);
+    pack_ext2_for_lt_64x_into(dst, H, K, wg_hk, bg_h, pool);
+    pack_ext2_for_lt_64x_into(dst + sz_g, H, K, wu_hk, bu_h, pool);
+    pack_ext2_for_lt_64x_into(dst + sz_g + sz_u, N, H, wd_nh, bd_n, pool);
+  } else {
+    const size_t sz_g = pack_ext2_size_for_tile(H, K, true);
+    const size_t sz_u = pack_ext2_size_for_tile(H, K, true);
+    pack_ext2_for_tile_into(dst, H, K, wg_hk, bg_h, true, pool);
+    pack_ext2_for_tile_into(dst + sz_g, H, K, wu_hk, bu_h, true, pool);
+    pack_ext2_for_tile_into(dst + sz_g + sz_u, N, H, wd_nh, bd_n, true, pool);
+  }
+}
+
 std::vector<uint8_t> pack_ext2_for_swiglu(uint32_t M, uint32_t K, uint32_t H, uint32_t N,
                                           const int8_t* wg_hk, const int32_t* bg_h,
                                           const int8_t* wu_hk, const int32_t* bu_h,
                                           const int8_t* wd_nh, const int32_t* bd_n) {
-  std::vector<uint8_t> e2_g = (M == 64u)
-      ? pack_ext2_lt_64x_impl(H, K, wg_hk, bg_h)
-      : pack_ext2(H, K, wg_hk, bg_h, true);
-  std::vector<uint8_t> e2_u = (M == 64u)
-      ? pack_ext2_lt_64x_impl(H, K, wu_hk, bu_h)
-      : pack_ext2(H, K, wu_hk, bu_h, true);
-  std::vector<uint8_t> e2_d = (M == 64u)
-      ? pack_ext2_lt_64x_impl(N, H, wd_nh, bd_n)
-      : pack_ext2(N, H, wd_nh, bd_n, true);
-  std::vector<uint8_t> out;
-  out.reserve(e2_g.size() + e2_u.size() + e2_d.size());
-  out.insert(out.end(), e2_g.begin(), e2_g.end());
-  out.insert(out.end(), e2_u.begin(), e2_u.end());
-  out.insert(out.end(), e2_d.begin(), e2_d.end());
+  std::vector<uint8_t> out(pack_ext2_size_for_swiglu(M, K, H, N), 0u);
+  pack_ext2_for_swiglu_into(out.data(), M, K, H, N, wg_hk, bg_h, wu_hk, bu_h, wd_nh, bd_n, nullptr);
   return out;
 }
 
@@ -7370,6 +7516,601 @@ void simulate_swiglu_hw_exact(const int8_t* x_mk,
           clip_i8_i32(rne_i32_exact(static_cast<float>(acc_d) * m_d)));
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// 13. Clean-Room 7-Chunk Per-Tensor W8A16(FP16) Weight Packer & Emitter
+//     Bit-exact against live rango w8a16_deq_i8_pt_1x1536x1536.dgc0 and
+//     1x2048x2048 wave-1 silicon oracle; full FP32 accumulator, HibDma 1:2
+//     u8->FP16 (zp=128) weight dequant, Probe-A dynamic override_params.
+// ---------------------------------------------------------------------------
+
+bool is_w8a16_pt_1x_shape(uint32_t M, uint32_t K, uint32_t N) {
+  auto valid_dim = [](uint32_t d) {
+    return d == 512u || d == 1024u || d == 1536u || d == 2048u;
+  };
+  return M == 1u && valid_dim(K) && valid_dim(N);
+}
+
+size_t pack_w8a16_ext2_size(uint32_t N, uint32_t K) {
+  return static_cast<size_t>(N) * static_cast<size_t>(K);
+}
+
+void pack_w8a16_ext2_into(uint8_t* dst, uint32_t N, uint32_t K, const int8_t* weights_nk) {
+  if (!dst || (N % 32u) != 0u || (K % 2u) != 0u) return;
+  if (!weights_nk) {
+    std::memset(dst, 0x80, static_cast<size_t>(N) * K);
+    return;
+  }
+  const uint32_t n_groups = N / 32u;
+  const uint32_t k_pairs = K / 2u;
+  const size_t grp_stride = static_cast<size_t>(k_pairs) * 64u;
+  for (uint32_t ng = 0u; ng < n_groups; ++ng) {
+    const uint32_t n0 = ng * 32u;
+    uint8_t* gdst = dst + static_cast<size_t>(ng) * grp_stride;
+    uint32_t k0 = 0u;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    const uint8x16_t v_xor = vdupq_n_u8(0x80u);
+    for (; k0 + 16u <= K; k0 += 16u) {
+      const uint32_t kp = k0 >> 1u;
+      uint8_t* b0 = gdst + static_cast<size_t>(kp + 0u) * 64u;
+      uint8_t* b1 = gdst + static_cast<size_t>(kp + 1u) * 64u;
+      uint8_t* b2 = gdst + static_cast<size_t>(kp + 2u) * 64u;
+      uint8_t* b3 = gdst + static_cast<size_t>(kp + 3u) * 64u;
+      uint8_t* b4 = gdst + static_cast<size_t>(kp + 4u) * 64u;
+      uint8_t* b5 = gdst + static_cast<size_t>(kp + 5u) * 64u;
+      uint8_t* b6 = gdst + static_cast<size_t>(kp + 6u) * 64u;
+      uint8_t* b7 = gdst + static_cast<size_t>(kp + 7u) * 64u;
+      for (uint32_t ni = 0u; ni < 32u; ni += 4u) {
+        const uint8_t* s0 = reinterpret_cast<const uint8_t*>(
+            weights_nk + static_cast<size_t>(n0 + ni + 0u) * K + k0);
+        const uint8_t* s1 = reinterpret_cast<const uint8_t*>(
+            weights_nk + static_cast<size_t>(n0 + ni + 1u) * K + k0);
+        const uint8_t* s2 = reinterpret_cast<const uint8_t*>(
+            weights_nk + static_cast<size_t>(n0 + ni + 2u) * K + k0);
+        const uint8_t* s3 = reinterpret_cast<const uint8_t*>(
+            weights_nk + static_cast<size_t>(n0 + ni + 3u) * K + k0);
+        uint16x8_t r0 = vreinterpretq_u16_u8(veorq_u8(vld1q_u8(s0), v_xor));
+        uint16x8_t r1 = vreinterpretq_u16_u8(veorq_u8(vld1q_u8(s1), v_xor));
+        uint16x8_t r2 = vreinterpretq_u16_u8(veorq_u8(vld1q_u8(s2), v_xor));
+        uint16x8_t r3 = vreinterpretq_u16_u8(veorq_u8(vld1q_u8(s3), v_xor));
+
+        uint32x4_t t0 = vreinterpretq_u32_u16(vtrn1q_u16(r0, r1));
+        uint32x4_t t1 = vreinterpretq_u32_u16(vtrn2q_u16(r0, r1));
+        uint32x4_t t2 = vreinterpretq_u32_u16(vtrn1q_u16(r2, r3));
+        uint32x4_t t3 = vreinterpretq_u32_u16(vtrn2q_u16(r2, r3));
+
+        uint64x2_t q0 = vreinterpretq_u64_u32(vtrn1q_u32(t0, t2));
+        uint64x2_t q2 = vreinterpretq_u64_u32(vtrn2q_u32(t0, t2));
+        uint64x2_t q1 = vreinterpretq_u64_u32(vtrn1q_u32(t1, t3));
+        uint64x2_t q3 = vreinterpretq_u64_u32(vtrn2q_u32(t1, t3));
+
+        const size_t off = static_cast<size_t>(ni) * 2u;
+        const uint64_t v0 = vgetq_lane_u64(q0, 0);
+        const uint64_t v4 = vgetq_lane_u64(q0, 1);
+        const uint64_t v1 = vgetq_lane_u64(q1, 0);
+        const uint64_t v5 = vgetq_lane_u64(q1, 1);
+        const uint64_t v2 = vgetq_lane_u64(q2, 0);
+        const uint64_t v6 = vgetq_lane_u64(q2, 1);
+        const uint64_t v3 = vgetq_lane_u64(q3, 0);
+        const uint64_t v7 = vgetq_lane_u64(q3, 1);
+        std::memcpy(b0 + off, &v0, 8u);
+        std::memcpy(b1 + off, &v1, 8u);
+        std::memcpy(b2 + off, &v2, 8u);
+        std::memcpy(b3 + off, &v3, 8u);
+        std::memcpy(b4 + off, &v4, 8u);
+        std::memcpy(b5 + off, &v5, 8u);
+        std::memcpy(b6 + off, &v6, 8u);
+        std::memcpy(b7 + off, &v7, 8u);
+      }
+    }
+#endif
+    for (; k0 < K; k0 += 2u) {
+      const uint32_t kp = k0 >> 1u;
+      uint8_t* blk = gdst + static_cast<size_t>(kp) * 64u;
+      for (uint32_t ni = 0u; ni < 32u; ++ni) {
+        const uint8_t* src = reinterpret_cast<const uint8_t*>(
+            weights_nk + static_cast<size_t>(n0 + ni) * K + k0);
+        blk[ni * 2u + 0u] = static_cast<uint8_t>(src[0] ^ 0x80u);
+        blk[ni * 2u + 1u] = static_cast<uint8_t>(src[1] ^ 0x80u);
+      }
+    }
+  }
+}
+
+std::vector<uint8_t> pack_w8a16_ext2(uint32_t N, uint32_t K, const int8_t* weights_nk) {
+  std::vector<uint8_t> out(pack_w8a16_ext2_size(N, K), 0x80u);
+  if (weights_nk) {
+    pack_w8a16_ext2_into(out.data(), N, K, weights_nk);
+  }
+  return out;
+}
+
+namespace {
+
+Pkt build_w8a16_240_pkt(uint32_t K) {
+  const uint64_t c = static_cast<uint64_t>(K / 64u);
+  const uint64_t cm1 = c - 1ULL;
+  const uint64_t k_iters = static_cast<uint64_t>(K / 512u);
+  const uint64_t sw_unit = static_cast<uint64_t>((2u * K) / 128u);
+  const int64_t sc = static_cast<int64_t>(cm1);
+  return {
+      {0x000000000FFFF240ULL, (2ULL * cm1) << 12},
+      {0ULL, (cm1 << 55) | (1ULL << 38)},
+      {(mask_s(-sc, 8u) << 56) | 0x8000ULL, (mask_s(-2LL * sc, 18u) << 32) | 0x1FFULL},
+      {(mask_s(-8LL * sc, 16u) << 48) | (mask_s(-4LL * sc, 19u) << 8),
+       (mask_s(-sc, 17u) << 28) | 0xFULL},
+      {(k_iters << 60) | 0x04080C0000000000ULL | (mask_s(-2LL * sc, 18u) << 4),
+       0xE020000000000000ULL},
+      {((4ULL * cm1) << 44) | 0x1000001FULL | (sw_unit << 12),
+       (mask_s(-4LL * sc, 20u) << 44) | (mask_s(-2LL * sc, 19u) << 4)},
+      {mask_s(-8LL * sc, 21u) << 20,
+       (mask_s(-2LL * sc, 19u) << 40) | mask_s(-sc, 18u)},
+      {(mask_s(-8LL * sc, 8u) << 56) | (mask_s(-4LL * sc, 20u) << 16),
+       0x0000000200001FFFULL},
+      {0x0070100000000000ULL, 0x0000000000000700ULL},
+      {0ULL, 0ULL}, {0ULL, 0ULL}, {0ULL, 0ULL},
+      {cm1 << 28, 0ULL},
+      {0ULL, 0x0000001000000000ULL},
+      {0x000000938A000000ULL, 0x0000000002000001ULL},
+      {0ULL, 0ULL}, {0ULL, 0ULL},
+      {0x01B0214000000000ULL, 0xC000000000000000ULL},
+      {0x1000000000000018ULL, 0x1FE0000007F00000ULL},
+      {0x00000007FC000000ULL, 0x0000000000000080ULL},
+  };
+}
+
+}  // namespace
+
+ob_status_t synthesize_w8a16_pt_1x_parts(uint32_t K, uint32_t N, float pt_scale,
+                                         const int8_t* weights_nk,
+                                         GemmSynthResult* out, std::string* err) {
+  if (!out || !is_w8a16_pt_1x_shape(1u, K, N) || pt_scale <= 0.0f) {
+    if (err) *err = "Unsupported W8A16 PT 1x shape or non-positive scale";
+    return OB_ERR_UNSUPPORTED;
+  }
+
+  const uint32_t k_iters = K / 512u;
+  const uint32_t n_iters = N / 512u;
+  const uint32_t k_per_core = K / 16u;
+  const uint32_t n_per_core = N / 16u;
+  const uint32_t sram_base = 2u * K;
+  const uint32_t sw_unit = sram_base / 128u;
+  const uint32_t ext2_bytes = K * N;
+  const uint32_t grp_bytes = ext2_bytes / 16u;
+
+  out->ext2_params = pack_w8a16_ext2(N, K, weights_nk);
+  out->chunks[0] = build_chunk0();
+  out->chunks[1] = build_chunk1(1u, 4u * K);
+  out->chunks[2] = build_chunk2(1u, 4u * K);
+
+  // ---------------- chunk[3] ----------------
+  PacketStream ps(10u);
+  const Pkt p240 = build_w8a16_240_pkt(K);
+  ps.emit(p240);
+  const CsrBank h3_csrs = unpack_hdr_csrs(p240);
+
+  // 4 row groups x (4x core 0x440 recv + 1x 0x980 FP32 input scatter)
+  const uint64_t b_enc_in = static_cast<uint64_t>(4u * k_per_core - 1u) * 2ULL;
+  static constexpr uint64_t kRowF3h[4] = {
+      0x0F02000000800000ULL, 0xF004000000800000ULL,
+      0x0008000000800000ULL, 0x0010000000800000ULL,
+  };
+  static constexpr uint64_t kRowF4l[4] = {0ULL, 0ULL, 0x0FULL, 0xF0ULL};
+  const uint32_t ym1_row = (K / 32u) - 1u;
+  const uint64_t f1h_980 =
+      ((0x7FC8ULL - 0x40ULL * ym1_row) << 48) | ((0x10ULL * ym1_row) << 32) | 0x20021000ULL;
+
+  for (uint32_t grp = 0u; grp < 4u; ++grp) {
+    for (uint32_t j = 0u; j < 4u; ++j) {
+      const uint32_t core_idx = grp * 4u + j;
+      const uint64_t f6h =
+          ((static_cast<uint64_t>(j) * k_iters * 0x4000ULL) << 32) |
+          0x0000000800000000ULL | (0x00800000ULL << grp);
+      const uint64_t f7l =
+          0x0000800000000000ULL | (static_cast<uint64_t>(3u - j) * k_iters * 0x40000000ULL);
+      ps.emit({
+          {(static_cast<uint64_t>(1u << core_idx) << 12) | 0x440ULL,
+           static_cast<uint64_t>(k_iters) << 40},
+          {0ULL, 0ULL},
+          {(static_cast<uint64_t>(4u * k_iters + 1u) << 16) | 0x0220ULL, 0ULL},
+          {((b_enc_in << 4) | 2ULL) << 48, 0xFFFFFDD4C0000000ULL | (b_enc_in << 8)},
+          {0x9000000FULL, 0ULL},
+          {0ULL, 0ULL},
+          {0ULL, f6h},
+          {f7l, 0ULL},
+      });
+    }
+    const uint64_t off_w = 1ULL + static_cast<uint64_t>(grp) * (K / 8u);
+    const uint64_t dst_hi = 0x02ULL + static_cast<uint64_t>(grp) * (K / 16u);
+    ps.emit({
+        {(0x0002ULL << 48) | (off_w << 32) | 0x980ULL, 0x7F008000FE0103FEULL},
+        {0x1FC020003F804000ULL, f1h_980},
+        {0ULL, (dst_hi << 40) | 0x0021FF8C00ULL},
+        {0x08000004ULL, kRowF3h[grp]},
+        {kRowF4l[grp], 0ULL},
+    });
+  }
+
+  ps.emit(pkt_680_3f9());
+  ps.emit(pkt_680_3c0(0x8000ULL));
+  ps.emit(pkt_900_bar_all());
+
+  // Broadcast converted FP16 activations (2*k_per_core B per core -> all 16 cores at SRAM 0)
+  const uint32_t bcast_iters = 2u * k_iters;
+  const uint64_t step = static_cast<uint64_t>(2u * K - 32u);
+  const uint64_t f1l_bc =
+      (mask_s(-static_cast<int64_t>(step) * 8LL, 16u) << 48) | (15ULL << 31) | 0x8000ULL;
+  const uint64_t f1h_bc = (0x0002000000000000ULL - (step << 28)) | 0xFFULL;
+  ps.emit({
+      {0x0FFFF440ULL, (static_cast<uint64_t>(bcast_iters - 1u) << 54) | (0x40ULL << 32)},
+      {f1l_bc, f1h_bc},
+      {0x60ULL, 0ULL},
+      {0x03E2000000000000ULL, 0xC0003E00ULL},
+      {0ULL, 0ULL}, {0ULL, 0ULL},
+      {0ULL, 0x08000000ULL},
+      {0x0000800000000000ULL, 0ULL},
+  });
+  const uint64_t b_enc_bc = static_cast<uint64_t>(2u * k_per_core - 1u) * 2ULL;
+  for (uint32_t g = 0u; g < 16u; ++g) {
+    const uint64_t ch_hi = ((4ULL * g + 1ULL) << 12) | 0x44CULL;
+    ps.emit({
+        {(static_cast<uint64_t>(1u << g) << 12) | 0x400ULL,
+         0x0000000200000000ULL | (static_cast<uint64_t>(sram_base) << 13)},
+        {0ULL, 0ULL}, {0ULL, 0ULL},
+        {b_enc_bc << 52, (ch_hi << 32) | (b_enc_bc << 8)},
+        {0x0000000100000800ULL, 0ULL},
+        {0ULL, 0ULL},
+        {0ULL, (0xFFFFULL << 34) | 0x80000000ULL},
+    });
+  }
+  ps.emit(pkt_680_3c0(0ULL));
+
+  // Weight receive 0x440 x16 (from HibDma 1:2 u8->FP16 stream)
+  const uint32_t k_unit = K / 2u;
+  const uint32_t k_passes = (k_unit + 11u) / 12u;
+  const uint32_t k_rem12 = k_unit % 12u;
+  const bool partial_k = (k_rem12 != 0u);
+  const uint64_t f1l_p = 0xFFA800007FFFD400ULL + (static_cast<uint64_t>(k_passes - 1u) << 31);
+  const uint64_t f1h_p = 0x0001FFFF500000FFULL | (static_cast<uint64_t>(n_iters - 1u) << 8);
+  const uint64_t p440_f2l = !partial_k
+      ? 0x0000000000006220ULL
+      : ((static_cast<uint64_t>((12u - k_rem12) * 0x40u + 0x10u) << 48) |
+         (static_cast<uint64_t>(k_rem12 - 1u) << 32) | 0x6220ULL);
+  for (uint32_t g = 0u; g < 16u; ++g) {
+    ps.emit({
+        {(static_cast<uint64_t>(1u << g) << 12) | 0x440ULL, 0x02C0000200000000ULL},
+        {f1l_p, f1h_p},
+        {p440_f2l, 0ULL},
+        {0x0FE2000000000000ULL, 0xFFFFFD84C000FE00ULL},
+        {0x9000000FULL, 0ULL},
+        {0ULL, 0ULL},
+        {0ULL, 0x40400000ULL},
+        {0x0007800000000000ULL, 0ULL},
+    });
+  }
+
+  // CSR_040: FP16xFP16 -> FP32 accumulator + per-tensor output scale (0x5B/0x5C)
+  const uint32_t r = n_iters - 1u;
+  CsrBank tgt{};
+  tgt[0x00] = ((k_passes - 1u) << 14) | 11u;
+  tgt[0x01] = r << 3;
+  if (partial_k) {
+    tgt[0x04] = (k_rem12 - 1u) << 12;
+    tgt[0x05] = 2u;
+    tgt[0x13] = 0x1Cu;
+    tgt[0x14] = (2u * k_rem12 - 2u) << 8;
+    tgt[0x15] = ((64u / k_rem12) << 8) | 0x20u;
+    tgt[0x16] = 0xCC08u;
+    tgt[0x38] = ((k_rem12 - 1u) << 19) | 0x0Cu;
+    tgt[0x39] = ((16u / k_rem12) << 20) | 0x4000u;
+    tgt[0x43] = 0x1800000u | ((r > 0u) ? 0x1100u : 0u);
+    tgt[0x44] = 0x400u | ((k_rem12 == 8u) ? 1u : 0u);
+  } else {
+    tgt[0x13] = 0x0Cu;
+    tgt[0x16] = 0xCC08u;
+    tgt[0x38] = 0x0Cu;
+    tgt[0x43] = (r > 0u) ? 0x1100u : 0u;
+  }
+  if (!partial_k) {
+    const int64_t sb = -static_cast<int64_t>(k_unit - 1u);
+    std::array<std::pair<int64_t, int64_t>, 7> a_ents = {{
+        {11, 1}, {static_cast<int64_t>(k_passes - 1u), sb}, {static_cast<int64_t>(r), sb},
+        {0, sb}, {0, sb}, {0, sb}, {0, sb},
+    }};
+    pack_stream_a(tgt, 2u, a_ents);
+  } else {
+    const int64_t st0 = static_cast<int64_t>(k_unit) - 11LL;
+    const int64_t st2 = -static_cast<int64_t>(12u * k_passes - 1u);
+    std::array<std::pair<int64_t, int64_t>, 7> a_ents = {{
+        {11, st0}, {0, 1}, {static_cast<int64_t>(k_passes - 1u), st2},
+        {static_cast<int64_t>(r), st2}, {0, st2}, {0, st2}, {0, st2},
+    }};
+    pack_stream_a(tgt, 2u, a_ents);
+  }
+  if (r == 0u) {
+    std::array<std::pair<int64_t, int64_t>, 8> h_ents{};
+    pack_stream_h(tgt, 0x2000u | sw_unit, h_ents);
+  } else {
+    const int64_t st_h = -32LL * static_cast<int64_t>(r);
+    std::array<std::pair<int64_t, int64_t>, 8> h_ents = {{
+        {32, static_cast<int64_t>(r)}, {st_h, 0}, {st_h, 0}, {st_h, 0},
+        {st_h, 0}, {st_h, 0}, {st_h, 0}, {st_h, 0},
+    }};
+    pack_stream_h(tgt, sw_unit, h_ents);
+    tgt[0x24] |= 0x10000u;
+  }
+  {
+    std::array<std::pair<int64_t, int64_t>, 7> b_ents = {{
+        {11, -44}, {static_cast<int64_t>(k_passes - 1u), -44}, {static_cast<int64_t>(r), -44},
+        {0, -44}, {0, -44}, {0, -44}, {0, -44},
+    }};
+    pack_stream_b(tgt, 0x800u, b_ents);
+  }
+  tgt[0x27] = 0x1000000u;
+  tgt[0x28] = (63u << 19) | 63u;
+  tgt[0x29] = 1u;
+  tgt[0x37] = 0x101000u;
+  tgt[0x3A] = 0x60000u;
+  tgt[0x3B] = 11u << 12;
+  tgt[0x3C] = (k_passes - 1u) << 12;
+  tgt[0x3D] = r << 12;
+  tgt[0x45] = (r == 0u) ? 0xE00063u : 0xE00061u;
+  tgt[0x46] = 0x112u;
+  tgt[0x47] = 0x10u;
+  tgt[0x48] = 0x10u;
+  tgt[0x55] = 0x081800u;
+  tgt[0x56] = 0x26u;
+  tgt[0x57] = h3_csrs[0x57];
+  tgt[0x58] = 0x68000u;
+  tgt[0x59] = 0x3FFu;
+  const uint32_t u_sc = fp32_bits_f(pt_scale);
+  tgt[0x5B] = 0x1400u | ((u_sc & 0xFFFu) << 13);
+  tgt[0x5C] = (u_sc >> 12) & 0xFFFFFu;
+  for (uint32_t reg = 0x5Du; reg < 0x62u; ++reg) {
+    tgt[reg] = h3_csrs[reg];
+  }
+
+  std::vector<std::pair<uint32_t, uint32_t>> diff0;
+  for (uint32_t reg = 0u; reg < 0x62u; ++reg) {
+    if (tgt[reg] != h3_csrs[reg]) {
+      diff0.push_back({reg, tgt[reg]});
+    }
+  }
+  ps.emit(pack_csr_packet(0x040u, 0xFFFFu, diff0, false));
+  out->chunks[3] = flits_to_bytes(ps.flits);
+
+  // ---------------- chunk[4] ----------------
+  const uint32_t c4_pid = 10u + ps.n_pkts;
+  out->chunks[4] = build_chunk4(c4_pid, ext2_bytes);
+
+  // ---------------- chunk[5] ----------------
+  PacketStream ps5(c4_pid + 1u);
+  {
+    const uint32_t rem_p = ext2_bytes % 0x20000u;
+    const uint64_t d1_p = (rem_p != 0u)
+        ? static_cast<uint64_t>(ext2_bytes / 0x20000u)
+        : static_cast<uint64_t>(ext2_bytes / 0x20000u - 1u);
+    uint64_t w3_hi = 0ULL;
+    if (rem_p != 0u) {
+      const uint64_t slack = (0x1000ULL - static_cast<uint64_t>(rem_p / 16u)) & 0xFFFULL;
+      const uint64_t slots_m1 = static_cast<uint64_t>(rem_p / 32u) - 1ULL;
+      w3_hi = (slack << 20) | (1ULL << 18) | (slots_m1 << 3);
+    }
+    ps5.emit({
+        {(1ULL << 48) | 0x940ULL, 0x3C00400078008FFFULL | (d1_p << 31)},
+        {0x0F0010001E002000ULL, (w3_hi << 32) | 0x80010800ULL},
+        {(0x3FFE004ULL << 16) | 0x0310ULL, 4ULL},
+    });
+  }
+  {
+    const uint32_t rem_g = grp_bytes % 0x20000u;
+    const uint64_t d1_g = (rem_g != 0u)
+        ? static_cast<uint64_t>(grp_bytes / 0x20000u)
+        : static_cast<uint64_t>(grp_bytes / 0x20000u - 1u);
+    uint64_t gw3_hi = 1ULL;
+    uint64_t gw4 = 0ULL;
+    if (rem_g != 0u) {
+      const uint64_t slack = (0x2000ULL - static_cast<uint64_t>(rem_g / 16u)) & 0x1FFFULL;
+      const uint64_t slots_m1 = static_cast<uint64_t>(rem_g / 32u) - 1ULL;
+      const uint64_t val34 = (slack << 21) | (1ULL << 19) | (slots_m1 << 4) | 1ULL;
+      gw3_hi = val34 & 0xFFFFFFFFULL;
+      gw4 = (val34 >> 32) & 0xFULL;
+    }
+    for (uint32_t g = 0u; g < 16u; ++g) {
+      const uint64_t byte_off = static_cast<uint64_t>(g) * grp_bytes;
+      const uint64_t sram_off8 = (byte_off % 0x40000ULL) / 8ULL;
+      const uint64_t abs64 = byte_off / 64ULL;
+      const uint32_t tb = kSnake16[g];
+      const uint64_t f3h = 0x0001000000800000ULL | ((tb < 8u) ? (1ULL << (56u + tb)) : 0ULL);
+      // 0x20200000 enables HibDma 1:2 u8->FP16 decompression with zp=128
+      const uint64_t f4l = 0x20200000ULL | ((tb >= 8u) ? (1ULL << (tb - 8u)) : 0ULL);
+      ps5.emit({
+          {(1ULL << 49) | (sram_off8 << 32) | 0x980ULL,
+           0x78008000F0011FFEULL | (d1_g << 32)},
+          {0x1E0020003C004000ULL, (gw3_hi << 32) | 0x00021000ULL},
+          {gw4, (abs64 << 42) | 0x0000020221FF8C00ULL},
+          {0x08000004ULL, f3h},
+          {f4l, 0ULL},
+      });
+    }
+  }
+  ps5.emit(pkt_680_3f9());
+  ps5.emit(pkt_900_zero());
+  ps5.emit(pkt_680_3f9(0x8000ULL));
+  ps5.emit(pkt_900_bar_all());
+  ps5.emit(pkt_680_3c0(0x8000ULL));
+  ps5.emit(pkt_900_bar_all());
+  out->chunks[5] = flits_to_bytes(ps5.flits);
+
+  // ---------------- chunk[6] ----------------
+  PacketStream ps6(c4_pid + 1u + ps5.n_pkts);
+  const uint32_t out_bytes = 4u * N;
+  {
+    const uint64_t dma_enc = static_cast<uint64_t>(out_bytes - 1u) * 8ULL;
+    ps6.emit({
+        {0x0000004300000A40ULL, 0x0000002000000000ULL},
+        {0ULL, 0ULL},
+        {0ULL, 0x0000020000000000ULL},
+        {((dma_enc & 0xFFFFULL) << 48) | (1ULL << 47), (dma_enc << 16) | (dma_enc >> 16)},
+    });
+  }
+  {
+    const uint64_t n32_out = static_cast<uint64_t>(out_bytes / 32u);
+    ps6.emit({
+        {0x9C0ULL, (n32_out - 1ULL) * 0x20ULL},
+        {0ULL, 0ULL},
+        {(31ULL << 55) | (31ULL << 50) | (1ULL << 45), 0ULL},
+        {(static_cast<uint64_t>(out_bytes / 2u) << 16) | 0x4040ULL, 0ULL},
+    });
+  }
+  const uint64_t b_enc_out = static_cast<uint64_t>(4u * n_per_core - 1u) * 2ULL;
+  for (uint32_t g = 0u; g < 16u; ++g) {
+    const uint32_t tok = 16u + g;
+    const uint64_t ch_hi = ((4ULL * tok + 1ULL) << 12) | 0x44CULL;
+    ps6.emit({
+        {(static_cast<uint64_t>(1u << g) << 12) | 0x400ULL,
+         0x0000000200000000ULL | (static_cast<uint64_t>(sram_base) << 13)},
+        {0ULL, 0ULL}, {0ULL, 0ULL},
+        {b_enc_out << 52, (ch_hi << 32) | (b_enc_out << 8)},
+        {0x0000000100000800ULL, 0ULL},
+        {0ULL, 0ULL},
+        {0ULL, 0x0004000004000000ULL},
+    });
+  }
+  for (uint32_t k = 0u; k < 16u; ++k) {
+    ps6.emit({
+        {0x900ULL, 0ULL}, {0ULL, 0ULL},
+        {static_cast<uint64_t>(1u + 2u * k) << 8, 0ULL},
+        {0ULL, 0ULL},
+        {0x0200000000000000ULL, 0x400ULL},
+    });
+  }
+  ps6.emit(pkt_680_3f9());
+  ps6.emit({
+      {0x0200FFFF00000900ULL, 0ULL}, {0ULL, 0ULL},
+      {0x2000ULL, 0ULL}, {0ULL, 0ULL},
+      {0x0200000000000000ULL, 0x180ULL},
+  });
+  ps6.emit(pkt_680(0xFFFFu, 0x000FFFF8000003C2ULL, 0x8000ULL));
+  ps6.emit(pkt_900_bar_all());
+  ps6.emit(pkt_680_3c0(0x8000ULL));
+  ps6.emit(pkt_900_bar_all());
+  ps6.emit({
+      {0x000FFFFF40000900ULL, 0xFF80000000000000ULL},
+      {0x7FFULL, 0ULL}, {0ULL, 0ULL}, {0ULL, 0ULL}, {0ULL, 0x008003E0ULL},
+  }, false);
+  out->chunks[6] = flits_to_bytes(ps6.flits);
+
+  out->ext0_dive = build_dive_ext0_clean(out->chunks, 1u, K, N, 7u);
+  out->exec_field_14 = 16u * (2u * K + 4u * (N / 16u)) + 320u;
+  out->dive_scratch_size = 192512u + 4u * (K + N);
+  return OB_OK;
+}
+
+ob_status_t build_dgc0_w8a16_pt_1x(uint32_t K, uint32_t N, float pt_scale,
+                                   const int8_t* weights_nk,
+                                   const uint8_t* dive_interp,
+                                   size_t dive_interp_size,
+                                   std::vector<uint8_t>* out_dgc0,
+                                   std::string* err) {
+  if (!dive_interp || dive_interp_size == 0u || !out_dgc0) {
+    if (err) *err = "Missing external RV64 DIVE interpreter image (ext[1])";
+    return OB_ERR_INVALID_ARG;
+  }
+  GemmSynthResult parts{};
+  ob_status_t st = synthesize_w8a16_pt_1x_parts(K, N, pt_scale, weights_nk, &parts, err);
+  if (st != OB_OK) return st;
+
+  std::vector<uint8_t> hash_in;
+  hash_in.reserve(16u + parts.ext0_dive.size() + parts.ext2_params.size());
+  uint32_t hdr_tag[4] = {0x57384136u, 1u, K, N};
+  const uint8_t* hp = reinterpret_cast<const uint8_t*>(hdr_tag);
+  hash_in.insert(hash_in.end(), hp, hp + sizeof(hdr_tag));
+  hash_in.insert(hash_in.end(), parts.ext0_dive.begin(), parts.ext0_dive.end());
+  hash_in.insert(hash_in.end(), parts.ext2_params.begin(), parts.ext2_params.end());
+  uint8_t digest[32]{};
+  sha256_compute(hash_in.data(), hash_in.size(), digest);
+
+  uint64_t exec_hash = 0ULL, model_hash = 0ULL, tok_raw = 0ULL;
+  std::memcpy(&exec_hash, digest, 8u);
+  std::memcpy(&tok_raw, digest + 8u, 8u);
+  std::memcpy(&model_hash, digest + 16u, 8u);
+  constexpr uint64_t kPow10_18 = 1000000000000000000ULL;
+  constexpr uint64_t kPow10_19 = 10000000000000000000ULL;
+  uint64_t tok_num = tok_raw % kPow10_19;
+  if (tok_num < kPow10_18) tok_num += kPow10_18;
+  char token_str[32]{};
+  std::snprintf(token_str, sizeof(token_str), "Token_%019llu",
+                static_cast<unsigned long long>(tok_num));
+
+  std::vector<uint8_t> dgd0 = build_dgd0_clean();
+  std::vector<uint8_t> dws0 = build_dws0_clean(
+      1u, K, N,
+      static_cast<uint32_t>(parts.ext0_dive.size()),
+      static_cast<uint32_t>(dive_interp_size),
+      static_cast<uint32_t>(parts.ext2_params.size()),
+      parts.dive_scratch_size,
+      parts.exec_field_14,
+      exec_hash,
+      token_str,
+      7u,
+      4u);
+
+  FbBuilder fb;
+  uint32_t dws_vec = fb.create_vector_bytes(dws0.data(), dws0.size(), 64u);
+  uint32_t dgd_vec = fb.create_vector_bytes(dgd0.data(), dgd0.size(), 4096u);
+  uint32_t eb_offs[3]{};
+  uint32_t eb_off_from_end[3]{};
+  const uint64_t eb_sizes[3] = {
+      static_cast<uint64_t>(parts.ext0_dive.size()),
+      static_cast<uint64_t>(dive_interp_size),
+      static_cast<uint64_t>(parts.ext2_params.size()),
+  };
+  for (size_t i = 0; i < 3u; ++i) {
+    fb.start_table();
+    fb.add_u64(1u, eb_sizes[i], 0ULL, true);
+    fb.add_u64(0u, 0ULL, 0ULL, true, &eb_off_from_end[i]);
+    eb_offs[i] = fb.end_table();
+  }
+  uint32_t ebs_vec = fb.create_vector_uoffsets(eb_offs, 3u);
+  fb.start_table();
+  fb.add_uoffset(7u, ebs_vec);
+  fb.add_u32(6u, 64u, 0u, true);
+  fb.add_u64(5u, kCompilerCl, 0ULL, true);
+  fb.add_u64(4u, model_hash, 0ULL, true);
+  fb.add_u32(3u, 6u, 0u, true);
+  fb.add_uoffset(1u, dgd_vec);
+  fb.add_uoffset(0u, dws_vec);
+  uint32_t root = fb.end_table();
+
+  std::vector<uint8_t> hdr = fb.finish(root, "DGC0");
+  const uint64_t ext0_off = align_up_u64(static_cast<uint64_t>(hdr.size()), 64ULL);
+  const uint64_t ext1_off = align_up_u64(ext0_off + eb_sizes[0], 64ULL);
+  const uint64_t ext2_off = align_up_u64(ext1_off + eb_sizes[1], 64ULL);
+  const uint64_t total_sz = align_up_u64(ext2_off + eb_sizes[2], 64ULL);
+  const uint64_t abs_offs[3] = {ext0_off, ext1_off, ext2_off};
+  for (size_t i = 0; i < 3u; ++i) {
+    size_t pos = hdr.size() - static_cast<size_t>(eb_off_from_end[i]);
+    std::memcpy(hdr.data() + pos, &abs_offs[i], 8u);
+  }
+
+  out_dgc0->clear();
+  out_dgc0->reserve(static_cast<size_t>(total_sz));
+  out_dgc0->insert(out_dgc0->end(), hdr.begin(), hdr.end());
+  auto append_aligned = [&](uint64_t target_off, const uint8_t* data, size_t len) {
+    if (target_off > out_dgc0->size()) {
+      out_dgc0->insert(out_dgc0->end(), static_cast<size_t>(target_off - out_dgc0->size()), 0x0Au);
+    }
+    if (len > 0u) out_dgc0->insert(out_dgc0->end(), data, data + len);
+  };
+  append_aligned(ext0_off, parts.ext0_dive.data(), parts.ext0_dive.size());
+  append_aligned(ext1_off, dive_interp, dive_interp_size);
+  append_aligned(ext2_off, parts.ext2_params.data(), parts.ext2_params.size());
+  if (total_sz > out_dgc0->size()) {
+    out_dgc0->insert(out_dgc0->end(), static_cast<size_t>(total_sz - out_dgc0->size()), 0x0Au);
+  }
+  return OB_OK;
 }
 
 }  // namespace ob
