@@ -5965,6 +5965,338 @@ class TestFreeTPURouter(unittest.TestCase):
             stop_evt.set()
             srv.close()
 
+    def test_non_boolean_stream_flag_rejected_before_routing(self) -> None:
+        backend = self._track(_MockOpenAIBackend("stream-flag-b", ["m-sflag"]))
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            backends=[
+                BackendConfig(
+                    id="stream-flag-b",
+                    base_url=backend.base_url,
+                    models=["m-sflag"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        for bad_stream in ("false", "true", 1, 0, [], {"enabled": True}):
+            st, _, bd = _http_request(
+                rport,
+                "POST",
+                "/v1/chat/completions",
+                body={
+                    "model": "m-sflag",
+                    "stream": bad_stream,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+            self.assertEqual(st, 400)
+            self.assertIn("invalid_stream_flag", bd.decode("utf-8"))
+
+        self.assertEqual(len(backend.requests_seen), 0)
+        self.assertEqual(router.engine._backends[0].cooldown_until_monotonic, 0.0)
+
+        for good_stream in (None, False, True):
+            st_ok, _, _ = _http_request(
+                rport,
+                "POST",
+                "/v1/chat/completions",
+                body={
+                    "model": "m-sflag",
+                    "stream": good_stream,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+            self.assertEqual(st_ok, 200)
+
+    def test_client_disconnect_mid_request_cancels_active_upstream_without_cooldown(
+        self,
+    ) -> None:
+        srv = socket.create_server(("127.0.0.1", 0))
+        srv.settimeout(3.0)
+        port = srv.getsockname()[1]
+        stop_evt = threading.Event()
+        upstream_started = threading.Event()
+        upstream_closed = threading.Event()
+
+        def accept_loop() -> None:
+            while not stop_evt.is_set():
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    break
+
+                def handle_one(sock: socket.socket) -> None:
+                    try:
+                        sock.settimeout(5.0)
+                        req = sock.recv(4096)
+                        if req.startswith(b"GET /v1/models"):
+                            body = json.dumps(
+                                {"object": "list", "data": [{"id": "m-active-cancel"}]}
+                            ).encode("utf-8")
+                            sock.sendall(
+                                b"HTTP/1.1 200 OK\r\n"
+                                b"Content-Type: application/json\r\n"
+                                + f"Content-Length: {len(body)}\r\n".encode("ascii")
+                                + b"Connection: close\r\n\r\n"
+                                + body
+                            )
+                            return
+                        # Simulate long prefill/generation: hold open until router closes socket.
+                        upstream_started.set()
+                        while not stop_evt.is_set():
+                            data = sock.recv(1)
+                            if not data:
+                                upstream_closed.set()
+                                break
+                    except OSError:
+                        upstream_closed.set()
+                    finally:
+                        try:
+                            sock.close()
+                        except OSError:
+                            pass
+
+                threading.Thread(target=handle_one, args=(c,), daemon=True).start()
+
+        threading.Thread(target=accept_loop, daemon=True).start()
+        backup = self._track(_MockOpenAIBackend("cancel-backup", ["m-active-cancel"]))
+        try:
+            cfg = RouterConfig(
+                host="127.0.0.1",
+                port=0,
+                policy="local_first",
+                backends=[
+                    BackendConfig(
+                        id="slow-cancel-primary",
+                        local=True,
+                        base_url=f"http://127.0.0.1:{port}/v1",
+                        timeout_s=5.0,
+                    ),
+                    BackendConfig(
+                        id="cancel-backup",
+                        local=False,
+                        base_url=backup.base_url,
+                        timeout_s=2.0,
+                    ),
+                ],
+            )
+            router = self._track(create_router_server(cfg))
+            rport = router.server_address[1]
+
+            req_body = json.dumps(
+                {
+                    "model": "m-active-cancel",
+                    "messages": [{"role": "user", "content": "cancel mid-prefill"}],
+                }
+            ).encode("utf-8")
+            sock = socket.create_connection(("127.0.0.1", rport), timeout=2.0)
+            try:
+                sock.sendall(
+                    b"POST /v1/chat/completions HTTP/1.1\r\n"
+                    + f"Host: 127.0.0.1:{rport}\r\n".encode("ascii")
+                    + b"Content-Type: application/json\r\n"
+                    + f"Content-Length: {len(req_body)}\r\n".encode("ascii")
+                    + b"Connection: close\r\n\r\n"
+                    + req_body
+                )
+                self.assertTrue(upstream_started.wait(timeout=2.0))
+            finally:
+                t_close = time.monotonic()
+                sock.close()
+
+            # Active upstream connection must be closed promptly well before the 5.0s timeout.
+            self.assertTrue(upstream_closed.wait(timeout=1.5))
+            self.assertLess(time.monotonic() - t_close, 1.5)
+
+            # Wait briefly for handler finally block to release slot.
+            dl = time.monotonic() + 1.0
+            while router.engine._backends[0].inflight > 0 and time.monotonic() < dl:
+                time.sleep(0.01)
+            self.assertEqual(router.engine._backends[0].inflight, 0)
+            self.assertEqual(router.engine._backends[0].cooldown_until_monotonic, 0.0)
+            self.assertTrue(router.engine._backends[0].healthy)
+            self.assertEqual(len(backup.requests_seen), 0)
+        finally:
+            stop_evt.set()
+            srv.close()
+
+    def test_sse_buffers_charged_to_shared_response_memory_budget_and_released(
+        self,
+    ) -> None:
+        first_tok = json.dumps(
+            {
+                "id": "chatcmpl-ssemem",
+                "object": "chat.completion.chunk",
+                "model": "m-ssemem",
+                "choices": [
+                    {"index": 0, "delta": {"content": "Hi"}, "finish_reason": None}
+                ],
+            }
+        )
+        # 1. Pre-commit SSE buffer exceeding max_total_response_memory_bytes -> 503 without cooldown.
+        primary = self._track(
+            _MockOpenAIBackend(
+                "sse-mem-primary",
+                ["m-ssemem"],
+                raw_sse_bytes=(b": " + (b"k" * 100) + b"\n") * 20,
+            )
+        )
+        backup = self._track(_MockOpenAIBackend("sse-mem-backup", ["m-ssemem"]))
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            max_sse_pre_commit_bytes=65536,
+            max_total_response_memory_bytes=1024,
+            backends=[
+                BackendConfig(
+                    id="sse-mem-primary",
+                    local=True,
+                    base_url=primary.base_url,
+                ),
+                BackendConfig(
+                    id="sse-mem-backup",
+                    local=False,
+                    base_url=backup.base_url,
+                ),
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        st_pre, hdrs_pre, bd_pre = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-ssemem",
+                "stream": True,
+                "messages": [{"role": "user", "content": "pre-commit mem cap"}],
+            },
+        )
+        self.assertEqual(st_pre, 503)
+        self.assertIn("server_memory_limit_reached", bd_pre.decode("utf-8"))
+        self.assertEqual(hdrs_pre["x-freetpu-failovers"], "0")
+        self.assertEqual(len(backup.requests_seen), 0)
+        self.assertEqual(router.engine._resp_mem_used_bytes, 0)
+        self.assertEqual(router.engine._backends[0].cooldown_until_monotonic, 0.0)
+        self.assertTrue(router.engine._backends[0].healthy)
+
+        # 2. Post-commit SSE event exceeding shared response memory budget aborts without cooldown.
+        primary.raw_sse_bytes = (
+            f"data: {first_tok}\n\n".encode("utf-8")
+            + (b"data: " + (b"X" * 100) + b"\n") * 20
+        )
+        conn = http.client.HTTPConnection("127.0.0.1", rport, timeout=3.0)
+        try:
+            conn.request(
+                "POST",
+                "/v1/chat/completions",
+                body=json.dumps(
+                    {
+                        "model": "m-ssemem",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "post-commit mem cap"}],
+                    }
+                ).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)
+            with self.assertRaises(http.client.IncompleteRead) as exc_info:
+                resp.read()
+            partial = exc_info.exception.partial.decode("utf-8", errors="replace")
+            self.assertIn("Hi", partial)
+            self.assertIn("server_memory_limit_reached", partial)
+        finally:
+            conn.close()
+        self.assertEqual(router.engine._resp_mem_used_bytes, 0)
+        self.assertEqual(router.engine._backends[0].cooldown_until_monotonic, 0.0)
+        self.assertTrue(router.engine._backends[0].healthy)
+
+        # 3. Normal SSE stream within budget succeeds and releases 100% of reserved memory.
+        primary.raw_sse_bytes = (
+            f"data: {first_tok}\n\ndata: [DONE]\n\n".encode("utf-8")
+        )
+        st_ok, _, bd_ok = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-ssemem",
+                "stream": True,
+                "messages": [{"role": "user", "content": "normal sse"}],
+            },
+        )
+        self.assertEqual(st_ok, 200)
+        self.assertIn("Hi", bd_ok.decode("utf-8"))
+        self.assertEqual(router.engine._resp_mem_used_bytes, 0)
+
+    def test_explicit_configured_listener_hostname_preserved_in_trusted_hosts(
+        self,
+    ) -> None:
+        backend = self._track(_MockOpenAIBackend("bind-host-b", ["m-bindhost"]))
+        cfg = RouterConfig(
+            host="localhost",
+            port=0,
+            cors_allowed_origins=[],
+            backends=[
+                BackendConfig(
+                    id="bind-host-b",
+                    base_url=backend.base_url,
+                    models=["m-bindhost"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+        # FreeTPURouterServer preserved configured_bind_host before HTTPServer resolved it to numeric IP.
+        self.assertEqual(router.configured_bind_host, "localhost")
+
+        # Simulate binding to a resolvable non-loopback machine hostname (e.g. "worker-node.local").
+        router.configured_bind_host = "worker-node.local"
+
+        st_get, _, _ = _http_request(
+            rport,
+            "GET",
+            "/health",
+            headers={"Host": f"worker-node.local:{rport}"},
+        )
+        self.assertEqual(st_get, 200)
+
+        st_post, _, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            headers={
+                "Host": f"worker-node.local:{rport}",
+                "Origin": f"http://worker-node.local:{rport}",
+            },
+            body={"model": "m-bindhost", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        self.assertEqual(st_post, 200)
+
+        # Wrong port and unrelated hostname are still rejected with 403.
+        wrong_port = rport + 1 if rport < 65000 else rport - 1
+        st_wp, _, _ = _http_request(
+            rport,
+            "GET",
+            "/health",
+            headers={"Host": f"worker-node.local:{wrong_port}"},
+        )
+        self.assertEqual(st_wp, 403)
+
+        st_evil, _, _ = _http_request(
+            rport,
+            "GET",
+            "/health",
+            headers={"Host": f"evil.example:{rport}"},
+        )
+        self.assertEqual(st_evil, 403)
+
 
 def run_self_tests(verbosity: int = 1) -> int:
     """Run all router tests cleanly via unittest."""

@@ -62,6 +62,7 @@ from router.hooks import (  # noqa: E402
 )
 from router.metrics import RouterMetrics  # noqa: E402
 from router.tpu_telemetry import (  # noqa: E402
+    ClientDisconnectedError,
     DeadlineSocket,
     TpuExporterTelemetry,
     evaluate_tpu_readiness,
@@ -397,10 +398,16 @@ class _BoundedSSEReader:
         upstream_sock: Any,
         *,
         chunk_size: int = 8192,
+        reserve_fn: Optional[Callable[[int], bool]] = None,
+        available_fn: Optional[Callable[[], int]] = None,
+        reserved_out: Optional[List[int]] = None,
     ) -> None:
         self._resp = resp
         self._sock = upstream_sock
         self._chunk_size = chunk_size
+        self._reserve_fn = reserve_fn
+        self._available_fn = available_fn
+        self._reserved_out = reserved_out
         self._buf = bytearray()
         self._eof = False
 
@@ -451,6 +458,9 @@ class _BoundedSSEReader:
                 if budget_left <= 0:
                     return b"", True
                 to_read = min(to_read, budget_left)
+            if self._available_fn is not None:
+                avail = self._available_fn()
+                to_read = min(to_read, max(1, avail))
 
             chunk = self._resp.read1(to_read)
             if not chunk:
@@ -471,6 +481,13 @@ class _BoundedSSEReader:
                     return out, False
                 return b"", False
 
+            if self._reserve_fn is not None:
+                if not self._reserve_fn(len(chunk)):
+                    raise _MemoryBudgetExceededError(
+                        "Router response memory budget exhausted"
+                    )
+                if self._reserved_out is not None:
+                    self._reserved_out[0] += len(chunk)
             self._buf.extend(chunk)
 
 
@@ -1056,6 +1073,11 @@ class RouterEngine:
                 return False
             self._resp_mem_used_bytes += need
             return True
+
+    def available_response_memory(self) -> int:
+        """Return currently unreserved bytes in the shared response memory budget."""
+        with self._resp_mem_lock:
+            return max(0, self.config.max_total_response_memory_bytes - self._resp_mem_used_bytes)
 
     def release_response_memory(self, amount_bytes: int) -> None:
         """Release previously reserved bytes back to the shared response memory budget."""
@@ -1721,6 +1743,7 @@ class FreeTPURouterServer(ThreadingHTTPServer):
     ) -> None:
         self.engine = engine
         self.verbose = verbose
+        self.configured_bind_host = str(server_address[0]).strip().lower().strip("[]")
         self._conn_semaphore = threading.BoundedSemaphore(
             engine.config.max_concurrent_connections
         )
@@ -1816,6 +1839,13 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
     def _trusted_listener_hosts(self) -> set[str]:
         """Return hostnames/IPs trusted as direct same-origin listener authorities."""
         trusted: set[str] = set()
+        configured_host = str(
+            getattr(self.server, "configured_bind_host", "")
+        ).strip().lower().strip("[]")
+        if configured_host and configured_host not in ("0.0.0.0", "::"):
+            trusted.add(configured_host)
+            if is_loopback_host(configured_host):
+                trusted.update({"localhost", "127.0.0.1", "::1"})
         bound_host = str(self.server.server_address[0]).strip().lower().strip("[]")
         if is_loopback_host(bound_host):
             trusted.update({"localhost", "127.0.0.1", "::1", bound_host})
@@ -2289,7 +2319,21 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
 
-            stream = bool(req_payload.get("stream", False))
+            raw_stream = req_payload.get("stream", False)
+            if raw_stream is None:
+                stream = False
+            elif isinstance(raw_stream, bool):
+                stream = raw_stream
+            else:
+                self._send_bytes(
+                    400,
+                    "application/json",
+                    _openai_error_body(
+                        "Field 'stream' must be a JSON boolean (true or false)",
+                        code="invalid_stream_flag",
+                    ),
+                )
+                return
             est_prompt_tokens = _estimate_prompt_tokens(req_payload)
             expected_choices = _expected_stream_choices(path, req_payload)
             # Release the decoded JSON tree before waiting on upstream inference.
@@ -2439,6 +2483,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         raw_sock,
                         attempt_deadline,
                         label=f"Backend {backend.config.id!r} response",
+                        client_sock=self.connection,
                     )
                     conn.sock = deadline_sock
                 resp = conn.getresponse()
@@ -2477,7 +2522,25 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                     )
                     if sse_outcome == "committed":
                         return
-                    if sse_outcome == "response_too_large":
+                    if sse_outcome == "memory_limit_exceeded":
+                        # Shared response memory budget exhausted: request-scoped 503 without backend cooldown.
+                        latency_ms = (time.monotonic() - req_start) * 1000.0
+                        attempt_ms = (time.monotonic() - attempt_start) * 1000.0
+                        non_stream_result = (
+                            503,
+                            "application/json",
+                            sse_err_body
+                            or _openai_error_body(
+                                "Router response memory budget exhausted; retry later",
+                                error_type="service_unavailable",
+                                code="server_memory_limit_reached",
+                            ),
+                            latency_ms,
+                            attempt_ms,
+                            0,
+                            0,
+                        )
+                    elif sse_outcome == "response_too_large":
                         # Pre-commit SSE size limit is request-scoped: do not penalize backend health or fail over.
                         latency_ms = (time.monotonic() - req_start) * 1000.0
                         attempt_ms = (time.monotonic() - attempt_start) * 1000.0
@@ -2699,6 +2762,26 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                 0,
                                 0,
                             )
+            except ClientDisconnectedError:
+                # Downstream client disconnected mid-wait: cancel upstream immediately
+                # via finally without penalizing backend health or triggering failover.
+                if resp_mem_reserved[0] > 0:
+                    engine.release_response_memory(resp_mem_reserved[0])
+                    resp_mem_reserved[0] = 0
+                self.close_connection = True
+                if not committed_flag[0]:
+                    engine._record_terminal_failure(
+                        request_id=req_id,
+                        model=model,
+                        backend_id=backend.config.id,
+                        matched_backend=True,
+                        status_code=499,
+                        latency_ms=(time.monotonic() - req_start) * 1000.0,
+                        stream=stream,
+                        failovers=failovers,
+                        principal=auth_ctx.principal,
+                    )
+                return
             except (OSError, TimeoutError, ValueError, http.client.HTTPException) as exc:
                 if resp_mem_reserved[0] > 0:
                     engine.release_response_memory(resp_mem_reserved[0])
@@ -2877,7 +2960,14 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         `"committed"`, `"retryable_error"`, `"client_error"`, or `"aborted"`.
         """
         engine = self.server.engine
-        sse_reader = _BoundedSSEReader(resp, upstream_sock)
+        sse_mem_box = [0]
+        sse_reader = _BoundedSSEReader(
+            resp,
+            upstream_sock,
+            reserve_fn=engine.try_reserve_response_memory,
+            available_fn=engine.available_response_memory,
+            reserved_out=sse_mem_box,
+        )
         pre_commit_lines: List[bytes] = []
         pre_commit_bytes = 0
         max_pre_commit_bytes = engine.config.max_sse_pre_commit_bytes
@@ -2886,326 +2976,388 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         pending_event_type = ""
         pre_commit_deadline = attempt_start + timeout_s
 
-        # Phase 1: upstream-only incremental read through HTTPResponse.read1().
-        # Enforce both byte cap and elapsed deadline as bytes arrive, even without newlines.
-        while True:
-            remaining_bytes = max_pre_commit_bytes - pre_commit_bytes
-            if remaining_bytes <= 0:
-                return (
-                    "response_too_large",
-                    502,
-                    _openai_error_body(
-                        f"Upstream SSE event exceeded maximum size of {max_pre_commit_bytes} bytes",
-                        error_type="bad_gateway",
-                        code="response_too_large",
-                    ),
-                )
-            line, exceeded_cap = sse_reader.readline(
-                deadline=pre_commit_deadline,
-                max_bytes=remaining_bytes,
-            )
-            if exceeded_cap:
-                return (
-                    "response_too_large",
-                    502,
-                    _openai_error_body(
-                        f"Upstream SSE event exceeded maximum size of {max_pre_commit_bytes} bytes",
-                        error_type="bad_gateway",
-                        code="response_too_large",
-                    ),
-                )
-            if not line:
-                # EOF before generated output/terminator -> retryable failure.
-                return "aborted", 502, None
-            pre_commit_bytes += len(line)
-            pre_commit_lines.append(line)
-            if line in (b"\n", b"\r\n", b"\r"):
-                if pending_event_data:
-                    payload_bytes = b"\n".join(pending_event_data).strip()
-                    ev_type = pending_event_type
-                    pending_event_data.clear()
-                    pending_event_type = ""
-                    err_info = _classify_sse_error_event(ev_type, payload_bytes)
-                    if err_info is not None:
-                        is_retryable, err_status, err_body = err_info
-                        if is_retryable:
-                            return "retryable_error", err_status, err_body
-                        return "client_error", err_status, err_body
-                    if _sse_event_should_commit(payload_bytes):
-                        first_chunk_time = time.monotonic()
-                        break
-                else:
-                    pending_event_type = ""
-                continue
-            content_line = line.rstrip(b"\r\n")
-            if content_line.startswith(b":"):
-                continue
-            if content_line.startswith(b"event:"):
-                pending_event_type = content_line[6:].strip().decode("utf-8", errors="replace")
-            elif content_line.startswith(b"data:"):
-                data_val = content_line[5:]
-                if data_val.startswith(b" "):
-                    data_val = data_val[1:]
-                pending_event_data.append(data_val)
-
-        # Phase 2: upstream delivered output or valid terminator -> commit chunked response.
-        # Downstream write errors from here on must never trigger backend failover.
-        ttft_ms: Optional[float] = (
-            (first_chunk_time - req_start) * 1000.0 if first_chunk_time else None
-        )
-        first_content_ttft_ms: Optional[float] = None
-        prompt_tokens = est_prompt_tokens
-        completion_tokens = 0
-        est_completion_chars = 0
-        saw_explicit_prompt_usage = False
-        saw_explicit_completion_usage = False
-        saw_timings_completion = False
-        saw_done_sentinel = False
-        saw_upstream_error_event = False
-        finished_choice_indices: set[int] = set()
-        upstream_read_error = False
-        size_limit_exceeded = False
-        downstream_write_error = False
-        event_data_lines: List[bytes] = []
-        current_event_type = ""
-        required_choices = max(1, expected_choices)
-
-        def process_sse_event() -> bool:
-            """Process one complete blank-line-terminated SSE event.
-
-            Returns True if the event represents meaningful generation progress
-            (resets the post-commit stall deadline).
-            """
-            nonlocal first_content_ttft_ms, prompt_tokens, completion_tokens
-            nonlocal est_completion_chars, saw_explicit_prompt_usage
-            nonlocal saw_explicit_completion_usage, saw_timings_completion
-            nonlocal saw_done_sentinel, saw_upstream_error_event, current_event_type
-            ev_type = current_event_type
-            current_event_type = ""
-            if not event_data_lines:
-                return False
-            payload_bytes = b"\n".join(event_data_lines).strip()
-            event_data_lines.clear()
-            if not payload_bytes:
-                return False
-            if payload_bytes == b"[DONE]":
-                saw_done_sentinel = True
-                return True
-            if _classify_sse_error_event(ev_type, payload_bytes) is not None:
-                saw_upstream_error_event = True
-                return False
-            try:
-                obj = json.loads(payload_bytes.decode("utf-8", errors="replace"))
-            except json.JSONDecodeError:
-                return True
-            if not isinstance(obj, Mapping):
-                return True
-            made_progress = False
-            choices = obj.get("choices")
-            if isinstance(choices, list):
-                for choice in choices:
-                    if isinstance(choice, Mapping) and choice.get("finish_reason") is not None:
-                        made_progress = True
-                        c_idx = choice.get("index")
-                        if isinstance(c_idx, int) and not isinstance(c_idx, bool) and c_idx >= 0:
-                            finished_choice_indices.add(c_idx)
-                        else:
-                            finished_choice_indices.add(len(finished_choice_indices))
-            output_txt = _extract_choice_output_text(obj)
-            if output_txt:
-                made_progress = True
-                if first_content_ttft_ms is None:
-                    first_content_ttft_ms = (time.monotonic() - req_start) * 1000.0
-                est_completion_chars += len(output_txt)
-            usage = obj.get("usage")
-            if isinstance(usage, Mapping):
-                pt = _safe_nonneg_int(usage.get("prompt_tokens"))
-                if pt is not None:
-                    prompt_tokens = pt
-                    saw_explicit_prompt_usage = True
-                    made_progress = True
-                ct = _safe_nonneg_int(usage.get("completion_tokens"))
-                if ct is not None:
-                    completion_tokens = ct
-                    saw_explicit_completion_usage = True
-                    made_progress = True
-            timings = obj.get("timings")
-            if isinstance(timings, Mapping):
-                if not saw_explicit_prompt_usage:
-                    pt = _safe_nonneg_int(timings.get("prompt_n"))
-                    if pt is not None:
-                        prompt_tokens = pt
-                if not saw_explicit_completion_usage:
-                    ct = _safe_nonneg_int(timings.get("predicted_n"))
-                    if ct is not None:
-                        completion_tokens = ct
-                        saw_timings_completion = True
-            return made_progress
-
-        def inspect_sse_line(raw_line: bytes) -> bool:
-            nonlocal current_event_type
-            if raw_line in (b"\n", b"\r\n", b"\r"):
-                return process_sse_event()
-            content_line = raw_line.rstrip(b"\r\n")
-            if content_line.startswith(b"event:"):
-                current_event_type = (
-                    content_line[6:].strip().decode("utf-8", errors="replace")
-                )
-            elif content_line.startswith(b"data:"):
-                data_val = content_line[5:]
-                if data_val.startswith(b" "):
-                    data_val = data_val[1:]
-                event_data_lines.append(data_val)
-            return False
-
-        def write_chunk(data: bytes) -> None:
-            if not data:
+        def release_sse_mem(amount: int) -> None:
+            if amount <= 0:
                 return
-            self.wfile.write(f"{len(data):x}\r\n".encode("ascii") + data + b"\r\n")
+            rel = min(amount, sse_mem_box[0])
+            if rel > 0:
+                engine.release_response_memory(rel)
+                sse_mem_box[0] -= rel
 
-        self.close_connection = True
-        _, acao = self._resolve_cors_header()
-        if committed_flag is not None:
-            committed_flag[0] = True
         try:
-            self.send_response(resp.status)
-            self.send_header(
-                "Content-Type",
-                resp.getheader("Content-Type") or "text/event-stream; charset=utf-8",
-            )
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("X-Accel-Buffering", "no")
-            self.send_header("Transfer-Encoding", "chunked")
-            self._send_cors_headers(acao)
-            self.send_header("Connection", "close")
-            self.send_header("X-FreeTPU-Backend", backend.config.id)
-            self.send_header("X-FreeTPU-Failovers", str(failovers))
-            self.send_header("X-FreeTPU-Request-Id", req_id)
-            self.end_headers()
-
-            for buffered in pre_commit_lines:
-                inspect_sse_line(buffered)
-            write_chunk(b"".join(pre_commit_lines))
-            self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            downstream_write_error = True
-
-        if not downstream_write_error and not saw_done_sentinel:
-            progress_deadline = time.monotonic() + timeout_s
-            max_event_bytes = engine.config.max_sse_pre_commit_bytes
-            event_chunk_buf = bytearray()
+            # Phase 1: upstream-only incremental read through HTTPResponse.read1().
+            # Enforce byte cap, shared memory budget, and elapsed deadline as bytes arrive.
             while True:
-                remaining_event_bytes = max_event_bytes - len(event_chunk_buf)
-                if remaining_event_bytes <= 0:
-                    size_limit_exceeded = True
-                    break
+                remaining_bytes = max_pre_commit_bytes - pre_commit_bytes
+                if remaining_bytes <= 0:
+                    return (
+                        "response_too_large",
+                        502,
+                        _openai_error_body(
+                            f"Upstream SSE event exceeded maximum size of {max_pre_commit_bytes} bytes",
+                            error_type="bad_gateway",
+                            code="response_too_large",
+                        ),
+                    )
                 try:
                     line, exceeded_cap = sse_reader.readline(
-                        deadline=progress_deadline,
-                        max_bytes=remaining_event_bytes,
+                        deadline=pre_commit_deadline,
+                        max_bytes=remaining_bytes,
                     )
-                except (OSError, TimeoutError, http.client.HTTPException):
-                    upstream_read_error = True
-                    break
+                except _MemoryBudgetExceededError:
+                    return (
+                        "memory_limit_exceeded",
+                        503,
+                        _openai_error_body(
+                            "Router response memory budget exhausted; retry later",
+                            error_type="service_unavailable",
+                            code="server_memory_limit_reached",
+                        ),
+                    )
                 if exceeded_cap:
-                    size_limit_exceeded = True
-                    break
+                    return (
+                        "response_too_large",
+                        502,
+                        _openai_error_body(
+                            f"Upstream SSE event exceeded maximum size of {max_pre_commit_bytes} bytes",
+                            error_type="bad_gateway",
+                            code="response_too_large",
+                        ),
+                    )
                 if not line:
-                    break
-                if inspect_sse_line(line):
-                    progress_deadline = time.monotonic() + timeout_s
-                event_chunk_buf.extend(line)
+                    # EOF before generated output/terminator -> retryable failure.
+                    return "aborted", 502, None
+                pre_commit_bytes += len(line)
+                pre_commit_lines.append(line)
                 if line in (b"\n", b"\r\n", b"\r"):
-                    try:
-                        write_chunk(bytes(event_chunk_buf))
-                        self.wfile.flush()
-                    except (BrokenPipeError, ConnectionResetError, OSError):
-                        downstream_write_error = True
-                        break
-                    event_chunk_buf.clear()
-                    if saw_done_sentinel:
-                        break
+                    if pending_event_data:
+                        payload_bytes = b"\n".join(pending_event_data).strip()
+                        ev_type = pending_event_type
+                        pending_event_data.clear()
+                        pending_event_type = ""
+                        err_info = _classify_sse_error_event(ev_type, payload_bytes)
+                        if err_info is not None:
+                            is_retryable, err_status, err_body = err_info
+                            if is_retryable:
+                                return "retryable_error", err_status, err_body
+                            return "client_error", err_status, err_body
+                        if _sse_event_should_commit(payload_bytes):
+                            first_chunk_time = time.monotonic()
+                            break
+                    else:
+                        pending_event_type = ""
+                    continue
+                content_line = line.rstrip(b"\r\n")
+                if content_line.startswith(b":"):
+                    continue
+                if content_line.startswith(b"event:"):
+                    pending_event_type = content_line[6:].strip().decode("utf-8", errors="replace")
+                elif content_line.startswith(b"data:"):
+                    data_val = content_line[5:]
+                    if data_val.startswith(b" "):
+                        data_val = data_val[1:]
+                    pending_event_data.append(data_val)
 
-        # Per WHATWG SSE spec, discard any incomplete (unterminated) event data at EOF
-        # rather than letting it satisfy completion checks.
-        all_choices_finished = all(
-            idx in finished_choice_indices for idx in range(required_choices)
-        )
-        stream_completed = (
-            not saw_upstream_error_event
-            and (saw_done_sentinel or all_choices_finished)
-        )
-        stream_size_exceeded = not downstream_write_error and size_limit_exceeded
-        premature_upstream_end = (
-            not downstream_write_error
-            and not stream_size_exceeded
-            and (upstream_read_error or not stream_completed)
-        )
-        if (
-            not saw_explicit_completion_usage
-            and not saw_timings_completion
-            and est_completion_chars > 0
-        ):
-            completion_tokens = max(1, (est_completion_chars + 3) // 4)
-        total_ms = (time.monotonic() - req_start) * 1000.0
-        attempt_ms = (time.monotonic() - attempt_start) * 1000.0
-        effective_ttft = (
-            first_content_ttft_ms if first_content_ttft_ms is not None else ttft_ms
-        )
-        if stream_size_exceeded:
-            # Local event size cap is request-scoped: do not penalize backend health.
-            recorded_status = 502
-        elif premature_upstream_end:
-            engine.mark_backend_failed(backend, "stream_truncated_mid_response")
-            recorded_status = 502
-        else:
-            with engine._lock:
-                backend.record_latency(attempt_ms)
-            recorded_status = resp.status
+            # Phase 2: upstream delivered output or valid terminator -> commit chunked response.
+            # Downstream write errors from here on must never trigger backend failover.
+            ttft_ms: Optional[float] = (
+                (first_chunk_time - req_start) * 1000.0 if first_chunk_time else None
+            )
+            first_content_ttft_ms: Optional[float] = None
+            prompt_tokens = est_prompt_tokens
+            completion_tokens = 0
+            est_completion_chars = 0
+            saw_explicit_prompt_usage = False
+            saw_explicit_completion_usage = False
+            saw_timings_completion = False
+            saw_done_sentinel = False
+            saw_upstream_error_event = False
+            finished_choice_indices: set[int] = set()
+            upstream_read_error = False
+            size_limit_exceeded = False
+            memory_limit_exceeded = False
+            downstream_write_error = False
+            event_data_lines: List[bytes] = []
+            current_event_type = ""
+            required_choices = max(1, expected_choices)
 
-        # Record metrics and usage before sending the final 0-chunk so callers
-        # inspecting /metrics or UsageMeterHook immediately after stream EOF see it.
-        engine._record_usage(
-            request_id=req_id,
-            model=model,
-            backend=backend,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            latency_ms=total_ms,
-            ttft_ms=effective_ttft,
-            stream=True,
-            failovers=failovers,
-            principal=principal,
-            status_code=recorded_status,
-        )
+            def process_sse_event() -> bool:
+                """Process one complete blank-line-terminated SSE event.
 
-        if not downstream_write_error:
+                Returns True if the event represents meaningful generation progress
+                (resets the post-commit stall deadline).
+                """
+                nonlocal first_content_ttft_ms, prompt_tokens, completion_tokens
+                nonlocal est_completion_chars, saw_explicit_prompt_usage
+                nonlocal saw_explicit_completion_usage, saw_timings_completion
+                nonlocal saw_done_sentinel, saw_upstream_error_event, current_event_type
+                ev_type = current_event_type
+                current_event_type = ""
+                if not event_data_lines:
+                    return False
+                payload_bytes = b"\n".join(event_data_lines).strip()
+                event_data_lines.clear()
+                if not payload_bytes:
+                    return False
+                if payload_bytes == b"[DONE]":
+                    saw_done_sentinel = True
+                    return True
+                if _classify_sse_error_event(ev_type, payload_bytes) is not None:
+                    saw_upstream_error_event = True
+                    return False
+                try:
+                    obj = json.loads(payload_bytes.decode("utf-8", errors="replace"))
+                except json.JSONDecodeError:
+                    return True
+                if not isinstance(obj, Mapping):
+                    return True
+                made_progress = False
+                choices = obj.get("choices")
+                if isinstance(choices, list):
+                    for choice in choices:
+                        if isinstance(choice, Mapping) and choice.get("finish_reason") is not None:
+                            made_progress = True
+                            c_idx = choice.get("index")
+                            if isinstance(c_idx, int) and not isinstance(c_idx, bool) and c_idx >= 0:
+                                finished_choice_indices.add(c_idx)
+                            else:
+                                finished_choice_indices.add(len(finished_choice_indices))
+                output_txt = _extract_choice_output_text(obj)
+                if output_txt:
+                    made_progress = True
+                    if first_content_ttft_ms is None:
+                        first_content_ttft_ms = (time.monotonic() - req_start) * 1000.0
+                    est_completion_chars += len(output_txt)
+                usage = obj.get("usage")
+                if isinstance(usage, Mapping):
+                    pt = _safe_nonneg_int(usage.get("prompt_tokens"))
+                    if pt is not None:
+                        prompt_tokens = pt
+                        saw_explicit_prompt_usage = True
+                        made_progress = True
+                    ct = _safe_nonneg_int(usage.get("completion_tokens"))
+                    if ct is not None:
+                        completion_tokens = ct
+                        saw_explicit_completion_usage = True
+                        made_progress = True
+                timings = obj.get("timings")
+                if isinstance(timings, Mapping):
+                    if not saw_explicit_prompt_usage:
+                        pt = _safe_nonneg_int(timings.get("prompt_n"))
+                        if pt is not None:
+                            prompt_tokens = pt
+                    if not saw_explicit_completion_usage:
+                        ct = _safe_nonneg_int(timings.get("predicted_n"))
+                        if ct is not None:
+                            completion_tokens = ct
+                            saw_timings_completion = True
+                return made_progress
+
+            def inspect_sse_line(raw_line: bytes) -> bool:
+                nonlocal current_event_type
+                if raw_line in (b"\n", b"\r\n", b"\r"):
+                    return process_sse_event()
+                content_line = raw_line.rstrip(b"\r\n")
+                if content_line.startswith(b"event:"):
+                    current_event_type = (
+                        content_line[6:].strip().decode("utf-8", errors="replace")
+                    )
+                elif content_line.startswith(b"data:"):
+                    data_val = content_line[5:]
+                    if data_val.startswith(b" "):
+                        data_val = data_val[1:]
+                    event_data_lines.append(data_val)
+                return False
+
+            def write_chunk(data: bytes) -> None:
+                if not data:
+                    return
+                self.wfile.write(f"{len(data):x}\r\n".encode("ascii") + data + b"\r\n")
+
+            self.close_connection = True
+            _, acao = self._resolve_cors_header()
+            if committed_flag is not None:
+                committed_flag[0] = True
             try:
-                if stream_size_exceeded:
-                    err_event = (
-                        b"event: error\n"
-                        b'data: {"error":{"message":"Upstream SSE event exceeded maximum size limit",'
-                        b'"type":"bad_gateway","code":"response_too_large"}}\n\n'
-                    )
-                    write_chunk(err_event)
-                    self.wfile.flush()
-                elif premature_upstream_end:
-                    # Emit SSE error event and intentionally omit the terminating 0-chunk so
-                    # HTTP/1.1 chunked clients surface premature truncation instead of clean EOF.
-                    err_event = (
-                        b"event: error\n"
-                        b'data: {"error":{"message":"Upstream stream terminated before completion",'
-                        b'"type":"server_error","code":"upstream_stream_interrupted"}}\n\n'
-                    )
-                    write_chunk(err_event)
-                    self.wfile.flush()
-                else:
-                    self.wfile.write(b"0\r\n\r\n")
-                    self.wfile.flush()
+                self.send_response(resp.status)
+                self.send_header(
+                    "Content-Type",
+                    resp.getheader("Content-Type") or "text/event-stream; charset=utf-8",
+                )
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("X-Accel-Buffering", "no")
+                self.send_header("Transfer-Encoding", "chunked")
+                self._send_cors_headers(acao)
+                self.send_header("Connection", "close")
+                self.send_header("X-FreeTPU-Backend", backend.config.id)
+                self.send_header("X-FreeTPU-Failovers", str(failovers))
+                self.send_header("X-FreeTPU-Request-Id", req_id)
+                self.end_headers()
+
+                for buffered in pre_commit_lines:
+                    inspect_sse_line(buffered)
+                write_chunk(b"".join(pre_commit_lines))
+                self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError, OSError):
                 downstream_write_error = True
+            finally:
+                # Immediately drop pre-commit buffer and release its shared memory reservation.
+                flushed_pre_bytes = pre_commit_bytes
+                pre_commit_lines.clear()
+                pre_commit_bytes = 0
+                release_sse_mem(flushed_pre_bytes)
 
-        return "committed", recorded_status, None
+            if not downstream_write_error and not saw_done_sentinel:
+                progress_deadline = time.monotonic() + timeout_s
+                max_event_bytes = engine.config.max_sse_pre_commit_bytes
+                event_chunk_buf = bytearray()
+                while True:
+                    remaining_event_bytes = max_event_bytes - len(event_chunk_buf)
+                    if remaining_event_bytes <= 0:
+                        size_limit_exceeded = True
+                        break
+                    try:
+                        line, exceeded_cap = sse_reader.readline(
+                            deadline=progress_deadline,
+                            max_bytes=remaining_event_bytes,
+                        )
+                    except ClientDisconnectedError:
+                        downstream_write_error = True
+                        break
+                    except _MemoryBudgetExceededError:
+                        memory_limit_exceeded = True
+                        break
+                    except (OSError, TimeoutError, http.client.HTTPException):
+                        upstream_read_error = True
+                        break
+                    if exceeded_cap:
+                        size_limit_exceeded = True
+                        break
+                    if not line:
+                        break
+                    if inspect_sse_line(line):
+                        progress_deadline = time.monotonic() + timeout_s
+                    event_chunk_buf.extend(line)
+                    if line in (b"\n", b"\r\n", b"\r"):
+                        try:
+                            write_chunk(bytes(event_chunk_buf))
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError, OSError):
+                            downstream_write_error = True
+                            break
+                        finally:
+                            flushed_ev_bytes = len(event_chunk_buf)
+                            event_chunk_buf.clear()
+                            release_sse_mem(flushed_ev_bytes)
+                        if saw_done_sentinel:
+                            break
+                if event_chunk_buf:
+                    rem_ev = len(event_chunk_buf)
+                    event_chunk_buf.clear()
+                    release_sse_mem(rem_ev)
+
+            # Per WHATWG SSE spec, discard any incomplete (unterminated) event data at EOF
+            # rather than letting it satisfy completion checks.
+            all_choices_finished = all(
+                idx in finished_choice_indices for idx in range(required_choices)
+            )
+            stream_completed = (
+                not saw_upstream_error_event
+                and (saw_done_sentinel or all_choices_finished)
+            )
+            stream_memory_exceeded = not downstream_write_error and memory_limit_exceeded
+            stream_size_exceeded = (
+                not downstream_write_error
+                and not stream_memory_exceeded
+                and size_limit_exceeded
+            )
+            premature_upstream_end = (
+                not downstream_write_error
+                and not stream_memory_exceeded
+                and not stream_size_exceeded
+                and (upstream_read_error or not stream_completed)
+            )
+            if (
+                not saw_explicit_completion_usage
+                and not saw_timings_completion
+                and est_completion_chars > 0
+            ):
+                completion_tokens = max(1, (est_completion_chars + 3) // 4)
+            total_ms = (time.monotonic() - req_start) * 1000.0
+            attempt_ms = (time.monotonic() - attempt_start) * 1000.0
+            effective_ttft = (
+                first_content_ttft_ms if first_content_ttft_ms is not None else ttft_ms
+            )
+            if stream_memory_exceeded:
+                # Shared memory exhaustion is request-scoped: do not penalize backend health.
+                recorded_status = 503
+            elif stream_size_exceeded:
+                # Local event size cap is request-scoped: do not penalize backend health.
+                recorded_status = 502
+            elif premature_upstream_end:
+                engine.mark_backend_failed(backend, "stream_truncated_mid_response")
+                recorded_status = 502
+            else:
+                with engine._lock:
+                    backend.record_latency(attempt_ms)
+                recorded_status = resp.status
+
+            # Record metrics and usage before sending the final 0-chunk so callers
+            # inspecting /metrics or UsageMeterHook immediately after stream EOF see it.
+            engine._record_usage(
+                request_id=req_id,
+                model=model,
+                backend=backend,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                latency_ms=total_ms,
+                ttft_ms=effective_ttft,
+                stream=True,
+                failovers=failovers,
+                principal=principal,
+                status_code=recorded_status,
+            )
+
+            if not downstream_write_error:
+                try:
+                    if stream_memory_exceeded:
+                        err_event = (
+                            b"event: error\n"
+                            b'data: {"error":{"message":"Router response memory budget exhausted; retry later",'
+                            b'"type":"service_unavailable","code":"server_memory_limit_reached"}}\n\n'
+                        )
+                        write_chunk(err_event)
+                        self.wfile.flush()
+                    elif stream_size_exceeded:
+                        err_event = (
+                            b"event: error\n"
+                            b'data: {"error":{"message":"Upstream SSE event exceeded maximum size limit",'
+                            b'"type":"bad_gateway","code":"response_too_large"}}\n\n'
+                        )
+                        write_chunk(err_event)
+                        self.wfile.flush()
+                    elif premature_upstream_end:
+                        # Emit SSE error event and intentionally omit the terminating 0-chunk so
+                        # HTTP/1.1 chunked clients surface premature truncation instead of clean EOF.
+                        err_event = (
+                            b"event: error\n"
+                            b'data: {"error":{"message":"Upstream stream terminated before completion",'
+                            b'"type":"server_error","code":"upstream_stream_interrupted"}}\n\n'
+                        )
+                        write_chunk(err_event)
+                        self.wfile.flush()
+                    else:
+                        self.wfile.write(b"0\r\n\r\n")
+                        self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    downstream_write_error = True
+
+            return "committed", recorded_status, None
+        finally:
+            pre_commit_lines.clear()
+            if sse_mem_box[0] > 0:
+                engine.release_response_memory(sse_mem_box[0])
+                sse_mem_box[0] = 0
 
 
 def create_router_server(

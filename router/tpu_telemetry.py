@@ -16,10 +16,13 @@ using the exact metric names from FreeTPU's Pillar 6 TPU exporter:
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import errno
 import http.client
 import io
 import math
 import re
+import select
+import socket
 import ssl
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -230,8 +233,12 @@ def evaluate_tpu_readiness(
 MAX_EXPORTER_RESPONSE_BYTES = 2 * 1024 * 1024
 
 
+class ClientDisconnectedError(Exception):
+    """Raised when the downstream client closes its connection during an upstream wait."""
+
+
 class _DeadlineSocketIO(io.RawIOBase):
-    """Raw socket reader that enforces an elapsed monotonic deadline on every read."""
+    """Raw socket reader enforcing an elapsed deadline and optional client cancellation."""
 
     def __init__(self, wrapper: "DeadlineSocket") -> None:
         self._wrapper = wrapper
@@ -239,9 +246,62 @@ class _DeadlineSocketIO(io.RawIOBase):
     def readable(self) -> bool:
         return True
 
+    def _wait_readable_or_cancel(self) -> None:
+        upstream = self._wrapper._sock
+        deadline = self._wrapper.deadline
+        # If TLS already decrypted buffered bytes, read immediately without blocking in select.
+        pending_fn = getattr(upstream, "pending", None)
+        if callable(pending_fn) and pending_fn() > 0:
+            return
+        while self._wrapper._watch_client and self._wrapper._client_sock is not None:
+            rem: Optional[float] = None
+            if deadline is not None:
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    raise TimeoutError(f"{self._wrapper.label} exceeded elapsed deadline")
+            client = self._wrapper._client_sock
+            try:
+                readable, _, errored = select.select(
+                    [upstream, client], [], [client], rem
+                )
+            except (OSError, ValueError):
+                try:
+                    if client.fileno() == -1:
+                        raise ClientDisconnectedError("Downstream client disconnected")
+                except (OSError, AttributeError):
+                    raise ClientDisconnectedError("Downstream client disconnected")
+                self._wrapper._watch_client = False
+                return
+            if client in errored:
+                raise ClientDisconnectedError("Downstream client disconnected")
+            if client in readable:
+                peek: Optional[bytes] = None
+                try:
+                    peek = client.recv(
+                        1, socket.MSG_PEEK | getattr(socket, "MSG_DONTWAIT", 0)
+                    )
+                except BlockingIOError:
+                    peek = None
+                except OSError as exc:
+                    if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                        peek = None
+                    else:
+                        raise ClientDisconnectedError("Downstream client disconnected") from exc
+                if peek == b"":
+                    raise ClientDisconnectedError("Downstream client disconnected")
+                if peek is not None:
+                    # Extra pipelined bytes on client socket; stop EOF-watching to avoid busy spin.
+                    self._wrapper._watch_client = False
+            if upstream in readable:
+                return
+            if not readable and not errored and deadline is not None:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"{self._wrapper.label} exceeded elapsed deadline")
+
     def readinto(self, b: Any) -> int:
         if self.closed:
             raise ValueError("I/O operation on closed file.")
+        self._wait_readable_or_cancel()
         deadline = self._wrapper.deadline
         if deadline is not None:
             rem = deadline - time.monotonic()
@@ -257,7 +317,7 @@ class _DeadlineSocketIO(io.RawIOBase):
 
 
 class DeadlineSocket:
-    """Socket wrapper enforcing an elapsed wall-clock deadline across HTTP header and body reads."""
+    """Socket wrapper enforcing an elapsed deadline and optional downstream disconnect cancellation."""
 
     def __init__(
         self,
@@ -265,10 +325,13 @@ class DeadlineSocket:
         deadline: Optional[float],
         *,
         label: str = "HTTP response",
+        client_sock: Any = None,
     ) -> None:
         self._sock = sock
         self.deadline = deadline
         self.label = label
+        self._client_sock = client_sock
+        self._watch_client = client_sock is not None
         self._io_refs = 0
         self._closed = False
 
