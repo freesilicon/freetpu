@@ -5497,6 +5497,20 @@ inline int32_t quant_clip_i8_f32(float x) {
   return q;
 }
 
+struct ScopedFeTonearest {
+  int prev_mode = FE_TONEAREST;
+  bool changed = false;
+  ScopedFeTonearest() {
+    prev_mode = std::fegetround();
+    if (prev_mode >= 0 && prev_mode != FE_TONEAREST) {
+      if (std::fesetround(FE_TONEAREST) == 0) changed = true;
+    }
+  }
+  ~ScopedFeTonearest() {
+    if (changed) (void)std::fesetround(prev_mode);
+  }
+};
+
 void apply_scale_clip_csrs(CsrBank* bank, float real_mul, float fmax = 127.0f, float fmin = -128.0f) {
   const uint32_t u_rm = fp32_bits_f(real_mul);
   const uint32_t u_max = fp32_bits_f(fmax);
@@ -5585,6 +5599,7 @@ Pkt build_op20_from_csrs(uint32_t op, uint32_t mask, const CsrBank& csrs,
 }
 
 Pkt build_op640_silu(uint32_t mask, float s_silu) {
+  ScopedFeTonearest fe_guard;
   std::vector<uint8_t> raw(208u, 0u);
   const uint64_t lo0 = ((static_cast<uint64_t>(mask) & 0xFFFFULL) << 12) | 0x640ULL;
   std::memcpy(raw.data(), &lo0, 8u);
@@ -7195,6 +7210,7 @@ std::vector<uint8_t> pack_ext2_for_swiglu(uint32_t M, uint32_t K, uint32_t H, ui
 ob_status_t synthesize_swiglu_parts(const ob_swiglu_int8_desc_t& desc,
                                     SwigluSynthResult* out,
                                     std::string* err) {
+  ScopedFeTonearest fe_guard;
   if (!out) return OB_ERR_INVALID_ARG;
   if (!is_swiglu_shape(desc.m_dim, desc.k_dim, desc.h_dim, desc.n_dim)) {
     if (err) *err = "Unsupported chained SwiGLU shape";
@@ -7317,6 +7333,7 @@ bool compute_swiglu_hw_multipliers(const ob_swiglu_int8_desc_t& d,
                                    float* out_m_up,
                                    float* out_m_mul,
                                    float* out_m_down) {
+  ScopedFeTonearest fe_guard;
   const float scales[9] = {
       d.s_in, d.s_wg, d.s_gate,
       d.s_wu, d.s_up, d.s_silu,
@@ -7356,19 +7373,7 @@ bool compute_swiglu_hw_multipliers(const ob_swiglu_int8_desc_t& d,
 void simulate_swiglu_hw_exact(const int8_t* x_mk,
                               const ob_swiglu_int8_desc_t& d,
                               int8_t* y_mn) {
-  struct ScopedFeTonearest {
-    int prev_mode = FE_TONEAREST;
-    bool changed = false;
-    ScopedFeTonearest() {
-      prev_mode = std::fegetround();
-      if (prev_mode >= 0 && prev_mode != FE_TONEAREST) {
-        if (std::fesetround(FE_TONEAREST) == 0) changed = true;
-      }
-    }
-    ~ScopedFeTonearest() {
-      if (changed) (void)std::fesetround(prev_mode);
-    }
-  } fe_guard;
+  ScopedFeTonearest fe_guard;
   const uint32_t M = d.m_dim, K = d.k_dim, H = d.h_dim, N = d.n_dim;
   float m_g = 0.0f, m_u = 0.0f, m_mul = 0.0f, m_d = 0.0f;
   if (!compute_swiglu_hw_multipliers(d, &m_g, &m_u, &m_mul, &m_d)) {
@@ -7429,11 +7434,13 @@ void simulate_swiglu_hw_exact(const int8_t* x_mk,
 
 int32_t eval_swiglu_silu_q(int32_t q_g, float s_gate) {
   if (!(s_gate > 0.0f)) return 0;
+  ScopedFeTonearest fe_guard;
   constexpr float kInf = __builtin_huge_valf();
   float silu_coeffs[8][5]{};
   for (int s = 0; s < 8; ++s) {
     for (int k = 0; k < 5; ++k) {
-      silu_coeffs[s][k] = kSwigluSiluUnitCoeffs[s][k] / s_gate;
+      silu_coeffs[s][k] = static_cast<float>(
+          static_cast<double>(kSwigluSiluUnitCoeffs[s][k]) / static_cast<double>(s_gate));
     }
   }
   const float x_g = static_cast<float>(q_g) * s_gate;
@@ -7447,11 +7454,13 @@ void build_swiglu_silu_lut(float s_gate, int8_t out_lut[256]) {
     std::memset(out_lut, 0, 256u);
     return;
   }
+  ScopedFeTonearest fe_guard;
   constexpr float kInf = __builtin_huge_valf();
   float silu_coeffs[8][5]{};
   for (int s = 0; s < 8; ++s) {
     for (int k = 0; k < 5; ++k) {
-      silu_coeffs[s][k] = kSwigluSiluUnitCoeffs[s][k] / s_gate;
+      silu_coeffs[s][k] = static_cast<float>(
+          static_cast<double>(kSwigluSiluUnitCoeffs[s][k]) / static_cast<double>(s_gate));
     }
   }
   for (int32_t q_g = -128; q_g <= 127; ++q_g) {

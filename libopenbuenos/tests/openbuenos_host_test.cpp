@@ -4113,11 +4113,11 @@ void test_phase7_cycle2_regressions() {
     ob_profile_stats_t ps{};
     CHECK(ob_context_get_profile(ctx, &ps) == OB_OK);
     // Verify BOTH paths executed: 64-row chained slice AND 10-row M7A batched fallback tail,
-    // and that ps.hw_us == st.hw_execution_us (no double-counting fallback HW time).
+    // and that neither HW time nor wall time double-counts the fallback tail.
     CHECK(ps.swiglu_chunks_chained >= 1u);
     CHECK(ps.swiglu_fallbacks == 1u);
     CHECK(ps.hw_us == st.hw_execution_us);
-    CHECK(ps.total_wall_us < 1000000000ULL);
+    CHECK(ps.total_wall_us <= st.wall_time_us + 1ULL);
     ob_context_destroy(ctx);
   }
 
