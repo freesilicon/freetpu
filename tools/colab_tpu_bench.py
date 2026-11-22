@@ -138,6 +138,8 @@ class _AssignEndpointTracker:
             if not allow_partial and (
                 _LOG_RECORD_START_RE.match(line)
                 or line.lstrip().startswith("[colab]")
+                or _ANY_REQUEST_RE.search(line)
+                or _RESPONSE_STATUS_RE.search(line)
             ):
                 self._expect_assign_body = False
                 self._in_assign_request = False
@@ -150,10 +152,6 @@ class _AssignEndpointTracker:
                     self._in_assign_request = False
                     self._assign_status_ok = False
                     return
-                if not allow_partial:
-                    # Wait across a single `)]}'` XSSI prefix line for the JSON body.
-                    if line.strip() not in ("", ")]}'"):
-                        self._expect_assign_body = False
                 return
         if _ASSIGN_REQUEST_RE.search(line):
             self._in_assign_request = True
@@ -419,8 +417,12 @@ def _ensure_private_dir(raw_path: Path) -> Path:
     return canonical_target
 
 
-def _write_text_nofollow(path: Path, text: str) -> None:
-    """Write UTF-8 text via a private temp file and atomically replace `path` (mode 0600)."""
+def _write_text_nofollow(path: Path, text: str, *, exclusive: bool = False) -> None:
+    """Write UTF-8 text via a private temp file and atomically replace `path` (mode 0600).
+
+    When `exclusive=True`, create `path` directly with `O_CREAT | O_EXCL` and raise
+    `FileExistsError` rather than overwriting an existing file.
+    """
     if path.is_symlink():
         raise UntrustedPathError(f"Refusing to write through symlink: {path}")
     canonical_parent = _ensure_dir_not_shared_writable(path.parent)
@@ -431,6 +433,30 @@ def _write_text_nofollow(path: Path, text: str) -> None:
         st = os.lstat(target)
         if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
             raise UntrustedPathError(f"Refusing unsafe existing target file {target}")
+        if exclusive:
+            raise FileExistsError(f"Refusing to overwrite existing file: {target}")
+    if exclusive:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(str(target), flags, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                if hasattr(os, "fchmod"):
+                    os.fchmod(fh.fileno(), 0o600)
+                st = os.fstat(fh.fileno())
+                if not stat.S_ISREG(st.st_mode):
+                    raise UntrustedPathError(f"Target is not a regular file: {target}")
+                if hasattr(os, "geteuid") and st.st_uid != os.geteuid():
+                    raise UntrustedPathError(f"Target file {target} has unexpected owner uid={st.st_uid}")
+                fh.write(text)
+                fh.flush()
+                os.fsync(fh.fileno())
+        except Exception:
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        return
     fd, tmp_name = tempfile.mkstemp(
         prefix=f".{target.name}.",
         suffix=".tmp",
@@ -852,6 +878,7 @@ def _check_config_artifact_collision(
         out_dir / f"{session_base}.summary.json",
         out_dir / "dry-run-plan.json",
         out_dir / "colab_tpu_probe_payload.py",
+        out_dir / f"colab_tpu_probe_payload.{session_base}.py",
         out_dir / f"colab_custom_script.{session_base}.py",
         out_dir / f"colab-sessions-list.{session_base}.json",
         out_dir / f"colab-sessions-list.{session_base}.json.lock",
@@ -2319,9 +2346,17 @@ def run_benchmark(
     generated_script = False
     wrapped_custom_script = False
     if script_file is None:
-        script_file = out_dir / "colab_tpu_probe_payload.py"
+        script_file = out_dir / f"colab_tpu_probe_payload.{session_base}.py"
         try:
-            _write_text_nofollow(script_file, default_tpu_probe_script())
+            _write_text_nofollow(script_file, default_tpu_probe_script(), exclusive=True)
+        except FileExistsError:
+            return 2, {
+                "status": "existing_probe_payload",
+                "error": (
+                    f"Refusing to overwrite existing probe payload {script_file}; "
+                    "use a fresh `--session` or `--out-dir`, or pass it explicitly via `--script`."
+                ),
+            }
         except UntrustedPathError as exc:
             return 2, {"status": "untrusted_out_dir", "error": str(exc)}
         generated_script = True
@@ -3519,7 +3554,9 @@ def run_self_test() -> int:
                     run_idx = cmd_list.index("run")
                     sep_idx = cmd_list.index("--")
                     assert sep_idx > run_idx
-                    assert cmd_list[sep_idx + 1].endswith("colab_tpu_probe_payload.py")
+                    assert re.search(
+                        r"colab_tpu_probe_payload\.[^/\\]+\.py$", cmd_list[sep_idx + 1]
+                    ), cmd_list[sep_idx + 1]
                     if "V6E1" in cmd_list:
                         return CommandResult(
                             1,
@@ -6501,6 +6538,18 @@ def run_self_test() -> int:
         )
         assert (
             extract_assigned_endpoint_from_stderr(
+                "2026-11-22 10:00:00 - colab_cli.client - DEBUG - Request: POST https://colab.research.google.com/tun/m/assign\n"
+                "2026-11-22 10:00:01 - colab_cli.client - DEBUG - Response: 200 OK\n"
+                "2026-11-22 10:00:01 - colab_cli.client - DEBUG - Response Body: )]}'\n"
+                "{\n"
+                '  "accelerator": "V6E1",\n'
+                '  "endpoint": "m-s-multiline77"\n'
+                "}\n"
+            )
+            == "m-s-multiline77"
+        )
+        assert (
+            extract_assigned_endpoint_from_stderr(
                 "[colab] Session READY (spoof-sess). Executing...\n"
                 "2026-11-22 10:00:00 - colab_cli.client - DEBUG - Request: POST https://colab.research.google.com/tun/m/assign\n"
                 "2026-11-22 10:00:01 - colab_cli.client - DEBUG - Response: 200 OK\n"
@@ -6574,7 +6623,34 @@ def run_self_test() -> int:
         assert io_fail_state["recovery_seeded"] is True
         assert io_fail_state["stopped"] is True
 
-    print("colab_tpu_bench.py self-test PASSED (69/69 suites).")
+        # 70. Default runs (including --dry-run) use per-run probe filenames and refuse to
+        #     overwrite any existing probe script in a reused output directory.
+        reuse_dir = tmp_path / "reuse-probe-dir"
+        reuse_dir.mkdir(mode=0o700)
+        os.chmod(reuse_dir, 0o700)
+        legacy_edited = reuse_dir / "colab_tpu_probe_payload.py"
+        legacy_edited.write_text("# operator edited probe\n", encoding="utf-8")
+        os.chmod(legacy_edited, 0o600)
+        rc_reuse1, sum_reuse1 = run_benchmark(
+            BenchConfig(dry_run=True, out_dir=reuse_dir, session_name="probe-reuse-s1"),
+            runner=lambda cmd: CommandResult(
+                0, "Usage: colab --auth --config --logtostderr --no-public-api\n", ""
+            ),
+        )
+        assert rc_reuse1 == 0
+        assert legacy_edited.read_text(encoding="utf-8") == "# operator edited probe\n"
+        per_run_probe = Path(sum_reuse1["script"])
+        assert per_run_probe.is_file()
+        assert per_run_probe.name.startswith("colab_tpu_probe_payload.probe-reuse-s1-")
+        per_run_probe.write_text("# operator customized per-run probe\n", encoding="utf-8")
+        try:
+            _write_text_nofollow(per_run_probe, "# overwrite attempt\n", exclusive=True)
+            raise AssertionError("Expected FileExistsError on exclusive probe write")
+        except FileExistsError:
+            pass
+        assert per_run_probe.read_text(encoding="utf-8") == "# operator customized per-run probe\n"
+
+    print("colab_tpu_bench.py self-test PASSED (70/70 suites).")
     return 0
 
 
