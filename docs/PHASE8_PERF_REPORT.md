@@ -66,7 +66,7 @@ All runs at `max_freq_mhz = 1286.4` (`PM=5` + FW WakeLock), `MAPS_GOOGLE=0`, `cp
 | `Qwen2.5-1.5B Q4` | `pp512` | `144.99` | **`180.37 ± 3.27`** `[176.98, 183.50, 180.62]` (**beats CPU `160.2–176.3`**) | `164.09` | **`+24.4%`** | `1,368 MB` / `1,460 MB` |
 | `Qwen2.5-1.5B Q4` | `tg64` | `8.98` | **`9.38 ± 1.76`** `[7.36, 10.45, 10.35]` (warm **`10.45`**) | `5.99` | **`+4.5%`** | `1,368 MB` / `1,294 MB` |
 
-*(Opt-in `W8A16=1` `Qwen2.5 Q8 tg64`: `4.96 ± 1.32 t/s`, `w_evict=0`.)*
+*(Opt-in `W8A16=1` `Qwen2.5 Q8 tg64`: `4.96 ± 1.32 t/s`, `w_evict=0`. Note on `pp128`: the combined `-p 128,512 -n 64 -r 3` run executed `pp128` first without a paired `Sync (=0)` run and showed `±21%` rep-to-rep mobile governor/thermal spread on `SmolLM2` (`[483.23, 391.01, 594.89]`); in the standalone run below (Table 3.3, same Phase 8 Async default), `SmolLM2 Q8 pp128` measured **`969.4 t/s`** vs Phase 7 standalone `907.0 t/s` (`+6.9%`, `-23.4%` SoC `mJ/tok`) and `Qwen2.5 Q4 pp128` measured **`140.1 t/s`** vs Phase 7 standalone `128.9 t/s` (`+8.7%`). Callers can also force synchronous dequant via `OPENBUENOS_ASYNC_DEQUANT=0`.)*
 
 ### 3.3 18-Case Standalone ODPM `mJ/tok` Sweep (live device telemetry) — **5/6 Prefills Lower Steady-State Energy per Token vs 4T CPU**
 

@@ -5948,30 +5948,28 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
         if (!w_tile) {
           const uint64_t tp0 = prof_on ? ob::monotonic_now_ns() : 0u;
           // Cold pack (parallel across ctx->worker_pool + direct-to-DMA-BUF NEON ext[2] pack!):
-          //   a) W_up per-row -> wu_q[hw_h, K] + row_s_u[th] + fused L2 norm stats
+          //   a) W_up per-row -> wu_q[hw_h, K] + row_s_u[th]
           std::vector<int8_t> wu_q(static_cast<size_t>(hw_h) * K);
           if (th < hw_h) {
             std::memset(wu_q.data() + static_cast<size_t>(th) * K, 0,
                         static_cast<size_t>(hw_h - th) * K);
           }
           std::vector<float> row_s_u(th, 0.0f);
-          std::vector<ob::RowNormStats> wu_stats(th);
           if (desc->up_is_q4_0 != 0u) {
             ob::requant_q4_0_rows(static_cast<const ob_block_q4_0_t*>(desc->w_up_hk),
                                   nb_k, h0, th, 0u, nb_k, K, K,
                                   wu_q.data(), row_s_u.data(),
-                                  &ctx->worker_pool, wu_stats.data());
+                                  &ctx->worker_pool);
           } else {
             ob::requant_q8_0_rows(static_cast<const ob_block_q8_0_t*>(desc->w_up_hk),
                                   nb_k, h0, th, 0u, nb_k, K, K,
                                   wu_q.data(), row_s_u.data(),
-                                  &ctx->worker_pool, wu_stats.data());
+                                  &ctx->worker_pool);
           }
 
-          //   b) W_down with row_s_u[h] absorbed -> wd_q[N, hw_h] + row_s_d[N] + fused L2 stats
+          //   b) W_down with row_s_u[h] absorbed -> wd_q[N, hw_h] + row_s_d[N]
           std::vector<int8_t> wd_q(static_cast<size_t>(N) * hw_h);
           std::vector<float> row_s_d(N, 0.0f);
-          std::vector<ob::RowNormStats> wd_stats(N);
           auto pack_wdown_range = [&](uint32_t ns, uint32_t ne) {
             float stack_wrow[2048];
             std::vector<float> heap_wrow;
@@ -6005,10 +6003,8 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
                 row_s_d[ni] = amax_d / 127.0f;
                 ob::quant_sym_i8_row(wrow_d, wd_row, th, 127.0f / amax_d);
                 if (th < hw_h) std::memset(wd_row + th, 0, hw_h - th);
-                wd_stats[ni] = ob::compute_row_norm_stats(wd_row, th);
               } else {
                 std::memset(wd_row, 0, hw_h);
-                wd_stats[ni] = ob::RowNormStats{};
               }
             }
           };
@@ -6065,7 +6061,7 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
             break;
           }
 
-          //      W_gate Pass 2: parallel dequant + common-scale quant + L2 stats in L1 stack buffer!
+          //      W_gate Pass 2: parallel dequant + common-scale quant in L1 stack buffer!
           const float s_wg = (max_wg > 0.0f) ? ob::quantize_scale_pow2_2nd_up(max_wg / 127.0f) : 1.0f;
           const float inv_swg = (max_wg > 0.0f) ? (1.0f / s_wg) : 0.0f;
           std::vector<int8_t> wg_q(static_cast<size_t>(hw_h) * K);
@@ -6073,7 +6069,6 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
             const size_t z_off = (max_wg == 0.0f) ? 0u : static_cast<size_t>(th) * K;
             std::memset(wg_q.data() + z_off, 0, wg_q.size() - z_off);
           }
-          std::vector<ob::RowNormStats> wg_stats(th);
           if (max_wg > 0.0f) {
             auto pack_wgate_range = [&](uint32_t hs, uint32_t he) {
               float stack_wrow[2048];
@@ -6088,7 +6083,6 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
                                       nb_k, h0 + hi, 0u, nb_k, wrow_g);
                 int8_t* wg_row = wg_q.data() + static_cast<size_t>(hi) * K;
                 ob::quant_sym_i8_row(wrow_g, wg_row, K, inv_swg);
-                wg_stats[hi] = ob::compute_row_norm_stats(wg_row, K);
               }
             };
             if (ctx->worker_pool.num_threads > 1u &&
@@ -6108,9 +6102,6 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
           ob::compute_matrix_row_l2_stats(wg_q.data(), th, K, K, &l2_g_max, &l2_g_mean, &dc_g_max, &l1_g_max, &linf_g_max);
           ob::compute_matrix_row_l2_stats(wu_q.data(), th, K, K, &l2_u_max, &l2_u_mean, &dc_u_max, &l1_u_max, &linf_u_max);
           ob::compute_matrix_row_l2_stats(wd_q.data(), N, th, hw_h, &l2_d_max, &l2_d_mean);
-          (void)wg_stats;
-          (void)wu_stats;
-          (void)wd_stats;
 
           // Reject statistically non-zero-mean gate/up weight tiles where correlated inputs
           // could saturate intermediate INT8 stages silently despite unsaturated down output.
