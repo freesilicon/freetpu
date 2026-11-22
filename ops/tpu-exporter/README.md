@@ -14,7 +14,7 @@
 ## Usage
 
 ```bash
-# HTTP /metrics server on :9400 (default)
+# HTTP /metrics server on localhost:9400 (default; pass --host 0.0.0.0 explicitly in containers)
 python3 ops/tpu-exporter/tpu_exporter.py --port 9400
 
 # One-shot Prometheus text exposition snapshot (CI / ephemeral Colab runs)

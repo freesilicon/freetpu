@@ -36,17 +36,27 @@ docker run --rm \
   my-jax-tpu-image:latest
 ```
 
-To inject `CAP_IPC_LOCK` and unlimited `RLIMIT_MEMLOCK` automatically via an OCI `createContainer` hook (no `--cap-add` / `--ulimit` flags required on `docker run`):
+VFIO DMA pinning requires `CAP_IPC_LOCK` and unlimited `RLIMIT_MEMLOCK` configured **before** OCI container startup (`docker run` / `podman run`), because CNCF CDI v0.6.0 does not configure capabilities or rlimits and an OCI `createContainer` hook executes after `runc` loads process settings. Use `python3 ops/tpu-cdi/freetpu_cdi.py docker-args` to emit the required flags:
 
 ```bash
-sudo install -m 0755 ops/tpu-cdi/freetpu_cdi.py /usr/local/bin/freetpu-cdi
-sudo /usr/local/bin/freetpu-cdi generate \
-  --output /etc/cdi/freetpu.json \
-  --with-oci-hook /usr/local/bin/freetpu-cdi \
-  --validate
+docker run --rm \
+  $(python3 ops/tpu-cdi/freetpu_cdi.py docker-args --device all) \
+  python:3.12-slim \
+  python3 -c "import os; print(os.listdir('/dev/vfio'))"
 ```
+
+Note on shared IOMMU groups: if multiple TPU chips share one `/dev/vfio/<iommu_group>` node, `freetpu-cdi` exposes that group strictly as a single allocation unit (`freetpu.dev/tpu=group-<iommu_group>`) plus `freetpu.dev/tpu=all` instead of misleading single-chip selectors.
 
 ## Kubernetes Manifests
 
-- [manifests/k8s-tpu-cdi-daemonset.yaml](manifests/k8s-tpu-cdi-daemonset.yaml) — Node-level DaemonSet generating `/var/run/cdi/freetpu.json` and serving Prometheus metrics on `:9400/metrics`.
-- [manifests/k8s-tpu-pod-cdi.yaml](manifests/k8s-tpu-pod-cdi.yaml) — Sample Kubernetes Pod & DRA `ResourceClaimTemplate` requesting `freetpu.dev/tpu=all` with `IPC_LOCK`.
+First create the `freetpu-ops-scripts` ConfigMap in `kube-system`:
+
+```bash
+kubectl -n kube-system create configmap freetpu-ops-scripts \
+  --from-file=ops/tpu-cdi/freetpu_cdi.py \
+  --from-file=ops/tpu-exporter/tpu_exporter.py \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+- [manifests/k8s-tpu-cdi-daemonset.yaml](manifests/k8s-tpu-cdi-daemonset.yaml) — Node-level DaemonSet generating `/var/run/cdi/freetpu.json` and serving Prometheus metrics on `:9400/metrics` (with `SYS_PTRACE` for hostPID `/proc/<pid>/fd` telemetry).
+- [manifests/k8s-tpu-pod-cdi.yaml](manifests/k8s-tpu-pod-cdi.yaml) — Sample Kubernetes `DeviceClass`, DRA `ResourceClaimTemplate`, and Pod requesting `freetpu.dev/tpu` (requires Kubernetes >= 1.32 with DRA enabled and a cluster DRA driver registered for `freetpu.dev` publishing `ResourceSlice` objects).

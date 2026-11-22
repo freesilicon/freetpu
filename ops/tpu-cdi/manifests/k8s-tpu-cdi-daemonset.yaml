@@ -1,7 +1,15 @@
 # FreeTPU Node DaemonSet:
+# Prerequisite (create the required ConfigMap in kube-system first):
+#   kubectl -n kube-system create configmap freetpu-ops-scripts \
+#     --from-file=ops/tpu-cdi/freetpu_cdi.py \
+#     --from-file=ops/tpu-exporter/tpu_exporter.py \
+#     --dry-run=client -o yaml | kubectl apply -f -
+#
 # 1. initContainer runs `freetpu_cdi.py generate` to populate /var/run/cdi/freetpu.json
-#    on every Cloud TPU node so containerd/CRI-O exposes freetpu.dev/tpu=0..N and =all.
-# 2. main container runs `tpu_exporter.py --port 9400` to serve Prometheus /metrics.
+#    on every Cloud TPU node so containerd/CRI-O exposes freetpu.dev/tpu=... CDI targets.
+# 2. main container runs `tpu_exporter.py --host 0.0.0.0 --port 9400` with SYS_PTRACE
+#    (required for /proc/<pid>/fd telemetry across hostPID containers/IPC_LOCK pods)
+#    to serve Prometheus /metrics.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -64,6 +72,10 @@ spec:
             - 0.0.0.0
             - --port
             - "9400"
+          securityContext:
+            capabilities:
+              add:
+                - SYS_PTRACE
           ports:
             - name: metrics
               containerPort: 9400

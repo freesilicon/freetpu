@@ -85,6 +85,12 @@ TPU Runtime Utilization
 |------|-----------------------|------------|
 | 0    | 8.00 GiB / 15.75 GiB  | 87.50%     |
 | 1    | 16.00 GiB / 31.25 GiB | 0.00%      |
+
+TensorCore Utilization
+| Chip | TensorCore Utilization |
+|------|------------------------|
+| 0    | 99.00%                 |
+| 1    | 75.50%                 |
 """
         rows = tpu_exporter.parse_tpu_info_output(sample)
         self.assertIn("/dev/vfio/0", rows)
@@ -92,11 +98,12 @@ TPU Runtime Utilization
         self.assertEqual(rows["/dev/vfio/1"].pids, [])
         self.assertEqual(rows["0"].hbm_used_bytes, 8 * 1024**3)
         self.assertEqual(rows["0"].hbm_total_bytes, int(round(15.75 * 1024**3)))
+        # Must NOT be overwritten by TensorCore Utilization percentages below it.
         self.assertAlmostEqual(rows["0"].duty_cycle_percent or 0.0, 87.5)
         self.assertEqual(rows["1"].hbm_used_bytes, 16 * 1024**3)
         self.assertAlmostEqual(rows["1"].duty_cycle_percent or 0.0, 0.0)
 
-    def test_discovery_filters_non_google_and_scrapes_mock_tpu_info(self) -> None:
+    def test_discovery_filters_gvnic_and_avoids_unverified_runtime_join(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             sysfs_root, dev_root, proc_root = _make_mock_pci_tree(
@@ -112,17 +119,25 @@ TPU Runtime Utilization
                     {
                         "bdf": "0000:00:05.0",
                         "vendor": "0x1ae0",
-                        "device": "0x0063",
-                        "driver": "vfio-pci",
-                        "iommu_group": "0",
-                        "numa_node": "0",
+                        "device": "0x0042",  # Google gVNIC NIC must be skipped!
+                        "driver": "gve",
                     },
                     {
                         "bdf": "0000:00:06.0",
                         "vendor": "0x1ae0",
+                        "device": "0x0063",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                        "enable": "1",
+                        "numa_node": "0",
+                    },
+                    {
+                        "bdf": "0000:00:07.0",
+                        "vendor": "0x1ae0",
                         "device": "0x006f",
                         "driver": "vfio-pci",
                         "iommu_group": "2",
+                        "enable": "0",  # idle vfio-pci TPU must still be healthy!
                         "numa_node": "0",
                     },
                 ],
@@ -134,6 +149,8 @@ TPU Runtime Utilization
             fd_dir.mkdir(parents=True, exist_ok=True)
             os.symlink(str(dev_root / "vfio" / "0"), fd_dir / "3")
 
+            # Google v6e-style output: VFIO groups 0 & 2, runtime IDs 8 & 12 (unmapped)
+            # plus TensorCore table that must not leak into duty cycle.
             mock_tpu_info = root / "mock-tpu-info.sh"
             mock_tpu_info.write_text(
                 "#!/bin/sh\n"
@@ -146,13 +163,19 @@ TPU Runtime Utilization
                 "TPU Runtime Utilization\n"
                 "| Chip | HBM Usage (GiB)       | Duty cycle |\n"
                 "|------|-----------------------|------------|\n"
-                "| 0    | 4.00 GiB / 15.75 GiB  | 64.25%     |\n"
-                "| 1    | 0.00 GiB / 31.25 GiB  | 0.00%      |\n"
+                "| 8    | 4.00 GiB / 15.75 GiB  | 64.25%     |\n"
+                "| 12   | 0.00 GiB / 31.25 GiB  | 0.00%      |\n"
+                "TensorCore Utilization\n"
+                "| Chip | TensorCore Utilization |\n"
+                "|------|------------------------|\n"
+                "| 8    | 99.00%                 |\n"
+                "| 12   | 42.00%                 |\n"
                 "EOF\n",
                 encoding="utf-8",
             )
             mock_tpu_info.chmod(0o755)
 
+            # Without verified mapping: runtime IDs 8/12 must NOT be attached or fabricated as 0.
             snap = tpu_exporter.collect_snapshot(
                 sysfs_root=sysfs_root,
                 dev_root=dev_root,
@@ -163,27 +186,40 @@ TPU Runtime Utilization
             self.assertEqual(len(snap.devices), 2)
 
             v5e = snap.devices[0]
-            self.assertEqual(v5e.pci_bdf, "0000:00:05.0")
+            self.assertEqual(v5e.pci_bdf, "0000:00:06.0")
             self.assertEqual(v5e.generation, "v5e")
             self.assertTrue(v5e.healthy)
+            self.assertTrue(v5e.pci_enabled)
             self.assertEqual(v5e.active_pids, [7777, 9001])
-            self.assertEqual(v5e.hbm_used_bytes, 4 * 1024**3)
-            self.assertAlmostEqual(v5e.duty_cycle_percent or 0.0, 64.25)
+            self.assertIsNone(v5e.hbm_used_bytes)
+            self.assertIsNone(v5e.duty_cycle_percent)
 
             v6e = snap.devices[1]
-            self.assertEqual(v6e.pci_bdf, "0000:00:06.0")
+            self.assertEqual(v6e.pci_bdf, "0000:00:07.0")
             self.assertEqual(v6e.generation, "v6e")
             self.assertTrue(v6e.healthy)
+            self.assertFalse(v6e.pci_enabled)
             self.assertEqual(v6e.active_pids, [])
-            self.assertAlmostEqual(v6e.duty_cycle_percent or 0.0, 0.0)
+            self.assertIsNone(v6e.hbm_used_bytes)
+            self.assertIsNone(v6e.duty_cycle_percent)
 
             prom = tpu_exporter.format_prometheus_metrics(snap)
             self._assert_valid_prometheus_text(prom)
             self.assertIn("freetpu_tpu_devices_discovered 2", prom)
-            self.assertIn('generation="v5e"', prom)
-            self.assertIn('generation="v6e"', prom)
-            self.assertIn('freetpu_tpu_duty_cycle_percent{chip="0",', prom)
-            self.assertIn('pid="9001"', prom)
+            self.assertIn('runtime_chip="8",pci_bdf="unmapped"} 64.25', prom)
+            self.assertNotIn('runtime_chip="8",pci_bdf="unmapped"} 99', prom)
+
+            # With verified chip_id_map, runtime readings attach deterministically.
+            snap_mapped = tpu_exporter.collect_snapshot(
+                sysfs_root=sysfs_root,
+                dev_root=dev_root,
+                proc_root=proc_root,
+                tpu_info_bin=str(mock_tpu_info),
+                chip_id_map={"0000:00:06.0": "8", "0000:00:07.0": "12"},
+            )
+            self.assertEqual(snap_mapped.devices[0].hbm_used_bytes, 4 * 1024**3)
+            self.assertAlmostEqual(snap_mapped.devices[0].duty_cycle_percent or 0.0, 64.25)
+            self.assertAlmostEqual(snap_mapped.devices[1].duty_cycle_percent or 0.0, 0.0)
 
     def test_sysfs_fallback_and_unhealthy_device(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -295,6 +331,7 @@ TPU Runtime Utilization
                 proc_root=proc_root,
                 tpu_info_bin=None,
                 tpu_info_timeout_s=2.0,
+                max_workers=2,
             )
             port = server.server_address[1]
             t = threading.Thread(target=server.serve_forever, daemon=True)
@@ -308,6 +345,122 @@ TPU Runtime Utilization
                     self.assertEqual(resp.status, 200)
                     self.assertEqual(json.loads(resp.read().decode("utf-8"))["status"], "ok")
             finally:
+                server.shutdown()
+                server.server_close()
+                t.join(timeout=2.0)
+
+    def test_unreadable_proc_fd_marks_pid_telemetry_unavailable(self) -> None:
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sysfs_root, dev_root, proc_root = _make_mock_pci_tree(
+                root,
+                devices=[
+                    {
+                        "bdf": "0000:00:05.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0063",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                        "enable": "0",
+                    }
+                ],
+                create_vfio_nodes=["0"],
+            )
+            (proc_root / "1234" / "fd").mkdir(parents=True)
+
+            orig_iterdir = Path.iterdir
+
+            def _guarded_iterdir(p: Path):
+                if p.name == "fd" and p.parent.name == "1234":
+                    raise PermissionError("simulated EACCES without CAP_SYS_PTRACE")
+                return orig_iterdir(p)
+
+            with mock.patch.object(Path, "iterdir", autospec=True, side_effect=_guarded_iterdir):
+                snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin=None,
+                )
+
+            self.assertFalse(snap.pid_telemetry_available)
+            self.assertFalse(snap.devices[0].pid_telemetry_available)
+            self.assertTrue(snap.devices[0].healthy)  # idle enable=0 still healthy
+            prom = tpu_exporter.format_prometheus_metrics(snap)
+            self.assertIn("freetpu_tpu_pid_telemetry_available{", prom)
+            self.assertIn("} 0", prom)
+            self.assertNotIn("freetpu_tpu_active_pids{", prom)
+
+    def test_http_worker_cap_rejects_excess_concurrency(self) -> None:
+        import http.client
+        import time as _time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sysfs_root, dev_root, proc_root = _make_mock_pci_tree(
+                root,
+                devices=[
+                    {
+                        "bdf": "0000:00:05.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0063",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                        "enable": "0",
+                    }
+                ],
+                create_vfio_nodes=["0"],
+            )
+            server = tpu_exporter._ExporterServer(
+                ("127.0.0.1", 0),
+                tpu_exporter._ExporterHandler,
+                sysfs_root=sysfs_root,
+                dev_root=dev_root,
+                proc_root=proc_root,
+                tpu_info_bin=None,
+                tpu_info_timeout_s=2.0,
+                max_workers=1,
+            )
+            gate = threading.Event()
+            release = threading.Event()
+            orig_scrape = server.scrape
+
+            def _slow_scrape():
+                gate.set()
+                release.wait(timeout=2.0)
+                return orig_scrape()
+
+            server.scrape = _slow_scrape  # type: ignore[method-assign]
+            port = server.server_address[1]
+            t = threading.Thread(target=server.serve_forever, daemon=True)
+            t.start()
+            try:
+                holder_status: list[int] = []
+
+                def _hold() -> None:
+                    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5.0)
+                    conn.request("GET", "/metrics")
+                    holder_status.append(conn.getresponse().status)
+                    conn.close()
+
+                t1 = threading.Thread(target=_hold, daemon=True)
+                t1.start()
+                self.assertTrue(gate.wait(timeout=2.0))
+                _time.sleep(0.05)
+
+                conn2 = http.client.HTTPConnection("127.0.0.1", port, timeout=2.0)
+                conn2.request("GET", "/healthz")
+                resp2 = conn2.getresponse()
+                self.assertEqual(resp2.status, 503)
+                conn2.close()
+
+                release.set()
+                t1.join(timeout=2.0)
+                self.assertEqual(holder_status, [200])
+            finally:
+                release.set()
                 server.shutdown()
                 server.server_close()
                 t.join(timeout=2.0)

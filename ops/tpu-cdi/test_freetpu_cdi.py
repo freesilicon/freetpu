@@ -73,6 +73,12 @@ class FreeTpuCdiTests(unittest.TestCase):
                     {
                         "bdf": "0000:00:05.0",
                         "vendor": "0x1ae0",
+                        "device": "0x0042",  # gVNIC NIC (must be skipped, no VFIO node)
+                        "driver": "gve",
+                    },
+                    {
+                        "bdf": "0000:00:06.0",
+                        "vendor": "0x1ae0",
                         "device": "0x0063",
                         "driver": "vfio-pci",
                         "iommu_group": "0",
@@ -86,6 +92,7 @@ class FreeTpuCdiTests(unittest.TestCase):
                 dev_root=dev_root,
             )
             self.assertEqual(len(chips), 1)
+            self.assertEqual(chips[0].pci_bdf, "0000:00:06.0")
             self.assertEqual(chips[0].generation, "v5e")
 
             spec = freetpu_cdi.build_cdi_spec(chips, vfio_container)
@@ -104,12 +111,18 @@ class FreeTpuCdiTests(unittest.TestCase):
                 "/dev/vfio/0",
             )
 
-    def test_generate_multi_chip_v6e_deduplicates_all_nodes(self) -> None:
+    def test_generate_multi_chip_v6e_exposes_shared_group_as_single_unit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             sysfs_root, dev_root = _make_mock_pci_vfio(
                 root,
                 devices=[
+                    {
+                        "bdf": "0000:00:04.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0042",  # gVNIC must be skipped
+                        "driver": "gve",
+                    },
                     {
                         "bdf": "0000:00:05.0",
                         "vendor": "0x1ae0",
@@ -149,8 +162,6 @@ class FreeTpuCdiTests(unittest.TestCase):
                     str(sysfs_root),
                     "--dev-root",
                     str(dev_root),
-                    "--with-oci-hook",
-                    "/usr/local/bin/freetpu-cdi",
                 ],
                 check=True,
                 capture_output=True,
@@ -160,14 +171,23 @@ class FreeTpuCdiTests(unittest.TestCase):
             spec = json.loads(out_file.read_text(encoding="utf-8"))
             self.assertEqual(freetpu_cdi.validate_cdi_spec(spec), [])
             names = [d["name"] for d in spec["devices"]]
-            self.assertEqual(names, ["0", "1", "2", "all"])
+            # Shared group 0 becomes a single unit; isolated chip 2 remains selectable alone.
+            self.assertEqual(names, ["group-0", "2", "all"])
+            self.assertNotIn("0", names)
+            self.assertNotIn("1", names)
+            self.assertEqual(
+                spec["devices"][0]["annotations"]["freetpu.dev/allocation-unit"],
+                "shared-iommu-group",
+            )
+            self.assertEqual(
+                [n["path"] for n in spec["devices"][0]["containerEdits"]["deviceNodes"]],
+                ["/dev/vfio/0"],
+            )
             all_nodes = [
                 n["path"] for n in spec["devices"][-1]["containerEdits"]["deviceNodes"]
             ]
             self.assertEqual(all_nodes, ["/dev/vfio/0", "/dev/vfio/1"])
-            self.assertEqual(
-                spec["containerEdits"]["hooks"][0]["hookName"], "createContainer"
-            )
+            self.assertNotIn("hooks", spec["containerEdits"])
 
             val_res = subprocess.run(
                 [sys.executable, str(script), "validate", str(out_file)],
@@ -177,7 +197,7 @@ class FreeTpuCdiTests(unittest.TestCase):
             )
             self.assertIn("VALID CNCF CDI v0.6.0 spec", val_res.stdout)
 
-    def test_validate_rejects_invalid_specs(self) -> None:
+    def test_validate_rejects_invalid_and_incomplete_per_device_specs(self) -> None:
         bad_version = {"cdiVersion": "0.5.0", "kind": "freetpu.dev/tpu", "devices": []}
         errs = freetpu_cdi.validate_cdi_spec(bad_version)
         self.assertTrue(any("cdiVersion" in e for e in errs))
@@ -199,6 +219,19 @@ class FreeTpuCdiTests(unittest.TestCase):
         errs2 = freetpu_cdi.validate_cdi_spec(bad_edits)
         self.assertTrue(any("bogusKey" in e for e in errs2))
 
+        # Device "0" lacks any /dev/vfio/<group> node even though "all" provides one.
+        incomplete_per_device = {
+            "cdiVersion": "0.6.0",
+            "kind": "freetpu.dev/tpu",
+            "containerEdits": {"deviceNodes": [{"path": "/dev/vfio/vfio"}]},
+            "devices": [
+                {"name": "0", "containerEdits": {"env": ["FOO=bar"]}},
+                {"name": "all", "containerEdits": {"deviceNodes": [{"path": "/dev/vfio/0"}]}},
+            ],
+        }
+        errs3 = freetpu_cdi.validate_cdi_spec(incomplete_per_device)
+        self.assertTrue(any("devices[0]" in e and "/dev/vfio/<iommu_group>" in e for e in errs3))
+
     def test_missing_vfio_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -219,37 +252,17 @@ class FreeTpuCdiTests(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 freetpu_cdi.discover_tpu_chips(sysfs_root=sysfs_root, dev_root=dev_root)
 
-    def test_oci_hook_patches_config_json(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            bundle = Path(tmp) / "bundle"
-            bundle.mkdir()
-            config_path = bundle / "config.json"
-            config_path.write_text(
-                json.dumps(
-                    {
-                        "ociVersion": "1.1.0",
-                        "process": {
-                            "capabilities": {"bounding": ["CAP_NET_BIND_SERVICE"]},
-                            "rlimits": [{"type": "RLIMIT_NOFILE", "hard": 1024, "soft": 1024}],
-                        },
-                    }
-                ),
-                encoding="utf-8",
-            )
-            script = CDI_DIR / "freetpu_cdi.py"
-            subprocess.run(
-                [sys.executable, str(script), "oci-hook"],
-                input=json.dumps({"bundle": str(bundle)}),
-                text=True,
-                check=True,
-            )
-            updated = json.loads(config_path.read_text(encoding="utf-8"))
-            for key in ("bounding", "effective", "inheritable", "permitted"):
-                self.assertIn("CAP_IPC_LOCK", updated["process"]["capabilities"][key])
-            memlock = [
-                r for r in updated["process"]["rlimits"] if r["type"] == "RLIMIT_MEMLOCK"
-            ]
-            self.assertEqual(memlock, [{"type": "RLIMIT_MEMLOCK", "hard": -1, "soft": -1}])
+    def test_docker_args_prints_required_vfio_flags(self) -> None:
+        script = CDI_DIR / "freetpu_cdi.py"
+        res = subprocess.run(
+            [sys.executable, str(script), "docker-args", "--device", "group-0"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertIn("--device=freetpu.dev/tpu=group-0", res.stdout)
+        self.assertIn("--cap-add=IPC_LOCK", res.stdout)
+        self.assertIn("--ulimit memlock=-1:-1", res.stdout)
 
 
 if __name__ == "__main__":

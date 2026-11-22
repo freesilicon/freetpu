@@ -33,7 +33,7 @@ Cloud TPU VMs expose each TPU chip as a PCI function (`vendor=0x1ae0`) bound to 
 ### Running the Exporter
 
 ```bash
-# Long-running HTTP server (Prometheus text exposition 0.0.4 on :9400/metrics)
+# Long-running HTTP server (binds 127.0.0.1:9400 by default; pass --host 0.0.0.0 in pods/containers)
 python3 ops/tpu-exporter/tpu_exporter.py --port 9400
 
 # One-shot snapshot (CI / ephemeral Cloud TPU or Colab runs)
@@ -55,13 +55,17 @@ HTTP endpoints served in server mode:
 | `freetpu_exporter_up` | gauge | — | Scrape liveness (`1`) |
 | `freetpu_tpu_devices_discovered` | gauge | — | Count of `0x1ae0` PCI TPU devices |
 | `freetpu_tpu_info` | gauge | `chip`, `pci_bdf`, `device_id`, `generation`, `vfio_device`, `vendor`, `model`, `driver`, `iommu_group`, `telemetry_source` | Static device inventory (`1`) |
-| `freetpu_tpu_health_status` | gauge | `chip`, `pci_bdf`, `device_id`, `generation`, `vfio_device` | `1` if `vfio-pci` bound, VFIO nodes present, PCI enabled |
-| `freetpu_tpu_hbm_used_bytes` | gauge | `chip`, `pci_bdf`, `device_id`, `generation`, `vfio_device` | Live HBM allocated bytes |
+| `freetpu_tpu_health_status` | gauge | `chip`, `pci_bdf`, `device_id`, `generation`, `vfio_device` | `1` if `vfio-pci` bound and VFIO nodes present (idle chips remain `1`) |
+| `freetpu_tpu_pci_enabled` | gauge | `chip`, `pci_bdf`, `device_id`, `generation`, `vfio_device` | PCI `enable` sysfs state (`1` when opened by a VFIO client, `0` when idle) |
+| `freetpu_tpu_pid_telemetry_available` | gauge | `chip`, `pci_bdf`, `device_id`, `generation`, `vfio_device` | `1` when active PID reads succeeded, `0` when `/proc/*/fd` was unreadable |
+| `freetpu_tpu_hbm_used_bytes` | gauge | `chip`, `pci_bdf`, `device_id`, `generation`, `vfio_device` | Live HBM allocated bytes (only when verified PCI<->runtime mapping exists) |
 | `freetpu_tpu_hbm_total_bytes` | gauge | `chip`, `pci_bdf`, `device_id`, `generation`, `vfio_device` | Total HBM capacity bytes |
 | `freetpu_tpu_hbm_utilization_ratio` | gauge | `chip`, `pci_bdf`, `device_id`, `generation`, `vfio_device` | `hbm_used_bytes / hbm_total_bytes` |
-| `freetpu_tpu_duty_cycle_percent` | gauge | `chip`, `pci_bdf`, `device_id`, `generation`, `vfio_device` | MXU / TensorCore duty cycle `%` |
-| `freetpu_tpu_active_pids` | gauge | `chip`, `pci_bdf`, `device_id`, `generation`, `vfio_device` | Count of active host PIDs on chip |
+| `freetpu_tpu_duty_cycle_percent` | gauge | `chip`, `pci_bdf`, `device_id`, `generation`, `vfio_device` | MXU duty cycle `%` from `TPU Runtime Utilization` |
+| `freetpu_tpu_active_pids` | gauge | `chip`, `pci_bdf`, `device_id`, `generation`, `vfio_device` | Count of active host PIDs on chip (omitted if unreadable) |
 | `freetpu_tpu_process_active` | gauge | `chip`, `pci_bdf`, `device_id`, `generation`, `vfio_device`, `pid` | Active process marker (`1`) |
+| `freetpu_tpu_runtime_hbm_used_bytes` | gauge | `runtime_chip`, `pci_bdf` | Live HBM bytes keyed by `libtpu` runtime chip ID (`pci_bdf="unmapped"` if no map) |
+| `freetpu_tpu_runtime_duty_cycle_percent` | gauge | `runtime_chip`, `pci_bdf` | MXU duty cycle `%` keyed by `libtpu` runtime chip ID |
 | `freetpu_tpu_scrape_duration_seconds` | gauge | — | Scrape duration in seconds |
 
 Telemetry source priority:
@@ -88,12 +92,13 @@ python3 ops/tpu-cdi/freetpu_cdi.py validate /etc/cdi/freetpu.json
 ```
 
 Generated CDI devices:
-- `freetpu.dev/tpu=0`, `freetpu.dev/tpu=1`, ... — Individual TPU chip `/dev/vfio/<iommu_group>` plus global `/dev/vfio/vfio`.
+- `freetpu.dev/tpu=0`, `freetpu.dev/tpu=1`, ... — Individual TPU chip `/dev/vfio/<iommu_group>` plus global `/dev/vfio/vfio` (when each chip has its own dedicated IOMMU group).
+- `freetpu.dev/tpu=group-<iommu_group>` — Shared IOMMU group allocation unit (emitted when multiple chips share one `/dev/vfio/<iommu_group>` instead of misleading per-chip selectors).
 - `freetpu.dev/tpu=all` — All discovered TPU `/dev/vfio/<iommu_group>` nodes (deduplicated) plus `/dev/vfio/vfio`.
 
 ### Docker / Podman / containerd Usage
 
-VFIO DMA pinning requires `CAP_IPC_LOCK` and unlimited `RLIMIT_MEMLOCK` inside the container:
+VFIO DMA pinning requires `CAP_IPC_LOCK` and unlimited `RLIMIT_MEMLOCK` configured **before** container creation (CNCF CDI v0.6.0 does not configure capabilities or rlimits, and runtime hooks run too late):
 
 ```bash
 docker run --rm \
@@ -104,12 +109,25 @@ docker run --rm \
   python3 -c "import os; print(sorted(os.listdir('/dev/vfio')))"
 ```
 
-For zero-flag `docker run --device=freetpu.dev/tpu=all`, install `freetpu_cdi.py` at `/usr/local/bin/freetpu-cdi` and pass `--with-oci-hook /usr/local/bin/freetpu-cdi` during `generate` so `createContainer` automatically injects `CAP_IPC_LOCK` and `RLIMIT_MEMLOCK=-1`.
+Print the exact runtime flags with:
+
+```bash
+python3 ops/tpu-cdi/freetpu_cdi.py docker-args --device all
+```
 
 ### Kubernetes Deployment
 
+First provision the `freetpu-ops-scripts` ConfigMap in `kube-system`:
+
+```bash
+kubectl -n kube-system create configmap freetpu-ops-scripts \
+  --from-file=ops/tpu-cdi/freetpu_cdi.py \
+  --from-file=ops/tpu-exporter/tpu_exporter.py \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
 - Node setup & metrics: [`ops/tpu-cdi/manifests/k8s-tpu-cdi-daemonset.yaml`](../../ops/tpu-cdi/manifests/k8s-tpu-cdi-daemonset.yaml)
-- Sample workload pod / DRA claim: [`ops/tpu-cdi/manifests/k8s-tpu-pod-cdi.yaml`](../../ops/tpu-cdi/manifests/k8s-tpu-pod-cdi.yaml)
+- Sample `DeviceClass`, DRA `ResourceClaimTemplate`, and Pod: [`ops/tpu-cdi/manifests/k8s-tpu-pod-cdi.yaml`](../../ops/tpu-cdi/manifests/k8s-tpu-pod-cdi.yaml) (requires Kubernetes >= 1.32 with DRA enabled and a cluster DRA driver publishing `ResourceSlice` objects for `freetpu.dev`)
 
 ---
 

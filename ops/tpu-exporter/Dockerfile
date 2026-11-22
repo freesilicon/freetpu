@@ -10,4 +10,4 @@ COPY tpu_exporter.py /opt/freetpu/tpu_exporter.py
 EXPOSE 9400
 
 ENTRYPOINT ["python3", "/opt/freetpu/tpu_exporter.py"]
-CMD ["--port", "9400"]
+CMD ["--host", "0.0.0.0", "--port", "9400"]

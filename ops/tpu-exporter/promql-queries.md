@@ -33,7 +33,11 @@ freetpu_tpu_hbm_used_bytes / (1024 * 1024 * 1024)
 ```promql
 # Active chip-hours accrued over 24h (chip has >= 1 active PID or duty cycle > 1%)
 sum_over_time(
-  (clamp_max(freetpu_tpu_active_pids, 1) or (freetpu_tpu_duty_cycle_percent > bool 1))[24h:1m]
+  (
+    clamp_max(freetpu_tpu_active_pids > 0, 1)
+    or
+    ((freetpu_tpu_duty_cycle_percent > 1) * 0 + 1)
+  )[24h:1m]
 ) / 60
 
 # Idle reserved chips (active PID holding /dev/vfio/* but MXU duty cycle < 2% for 15m)
@@ -42,12 +46,16 @@ sum_over_time(
 (avg_over_time(freetpu_tpu_duty_cycle_percent[15m]) < 2)
 
 # Estimated hourly TPU spend by generation (replace 1.20 / 2.70 with your spot/on-demand SKU rate)
-sum by (generation) (freetpu_tpu_health_status{generation="v5e"}) * 1.20
-+
-sum by (generation) (freetpu_tpu_health_status{generation="v6e"}) * 2.70
-
-# Effective cost per utilized TPU-hour (normalized by average MXU duty cycle)
 (
-  sum by (generation) (freetpu_tpu_health_status)
-) / clamp_min(avg by (generation) (freetpu_tpu_duty_cycle_percent) / 100, 0.01)
+  sum by (generation) (freetpu_tpu_health_status{generation="v5e"}) * 1.20
+  or
+  sum by (generation) (freetpu_tpu_health_status{generation="v6e"}) * 2.70
+)
+
+# Effective cost per utilized TPU-hour by generation (hourly spend / equivalent fully-utilized chips)
+(
+  sum by (generation) (freetpu_tpu_health_status{generation="v5e"}) * 1.20
+  or
+  sum by (generation) (freetpu_tpu_health_status{generation="v6e"}) * 2.70
+) / clamp_min(sum by (generation) (freetpu_tpu_duty_cycle_percent / 100), 0.01)
 ```

@@ -6,9 +6,8 @@ CNCF Container Device Interface (CDI) v0.6.0 specification (e.g.
 /etc/cdi/freetpu.json) exposing `freetpu.dev/tpu=0`, ..., `freetpu.dev/tpu=all`.
 
 Also provides:
-  - `validate`: strict CNCF CDI v0.6.0 structural & VFIO node validator
+  - `validate`: strict CNCF CDI v0.6.0 structural & per-device VFIO validator
   - `docker-args`: prints Docker / Podman CLI flags (including IPC_LOCK + memlock)
-  - `oci-hook`: OCI `createContainer` hook injecting CAP_IPC_LOCK + RLIMIT_MEMLOCK
 
 Zero third-party dependencies: uses Python standard library only.
 """
@@ -159,9 +158,10 @@ def discover_tpu_chips(
             continue
 
         device_id = _normalize_hex_id(_read_text(entry / "device") or "0x0000")
-        gen, model_name = TPU_PCI_DEVICES.get(
-            device_id, ("unknown", f"Google TPU ({device_id})")
-        )
+        if device_id not in TPU_PCI_DEVICES:
+            # Skip non-TPU Google PCI functions under vendor 0x1ae0 (e.g. gVNIC 0x0042).
+            continue
+        gen, model_name = TPU_PCI_DEVICES[device_id]
         driver = _read_symlink_name(entry / "driver") or "unbound"
         iommu_group = _read_symlink_name(entry / "iommu_group") or ""
         if not iommu_group:
@@ -197,7 +197,7 @@ def discover_tpu_chips(
 
     if not chips:
         raise RuntimeError(
-            f"No Google TPU PCI devices (vendor={GOOGLE_PCI_VENDOR_ID}) found under {pci_dir}"
+            f"No known Google TPU PCI devices (vendor={GOOGLE_PCI_VENDOR_ID}) found under {pci_dir}"
         )
 
     return chips, vfio_container
@@ -208,7 +208,6 @@ def build_cdi_spec(
     vfio_container_host_path: Path,
     *,
     kind: str = CDI_KIND,
-    oci_hook_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build a CNCF CDI v0.6.0 JSON specification dictionary."""
     if not chips:
@@ -223,62 +222,96 @@ def build_cdi_spec(
             "FREETPU_VFIO_CONTAINER=/dev/vfio/vfio",
         ],
     }
-    if oci_hook_path:
-        global_edits["hooks"] = [
-            {
-                "hookName": "createContainer",
-                "path": oci_hook_path,
-                "args": [os.path.basename(oci_hook_path), "oci-hook"],
-            }
-        ]
 
     devices: List[Dict[str, Any]] = []
     seen_group_nodes: Dict[str, Dict[str, Any]] = {}
+    groups: Dict[str, List[DiscoveredChip]] = {}
     all_bdfs: List[str] = []
     all_generations: List[str] = []
 
     for chip in chips:
-        node = _make_device_node(chip.vfio_container_path, chip.vfio_host_path)
-        seen_group_nodes.setdefault(chip.vfio_container_path, node)
+        groups.setdefault(chip.iommu_group, []).append(chip)
         all_bdfs.append(chip.pci_bdf)
         if chip.generation not in all_generations:
             all_generations.append(chip.generation)
 
-        devices.append(
-            {
-                "name": str(chip.index),
-                "annotations": {
-                    "freetpu.dev/pci-bdf": chip.pci_bdf,
-                    "freetpu.dev/vendor-id": chip.vendor_id,
-                    "freetpu.dev/device-id": chip.device_id,
-                    "freetpu.dev/generation": chip.generation,
-                    "freetpu.dev/model": chip.model_name,
-                    "freetpu.dev/driver": chip.driver,
-                    "freetpu.dev/iommu-group": chip.iommu_group,
-                    "freetpu.dev/recommended-cap-add": "IPC_LOCK",
-                    "freetpu.dev/recommended-ulimit-memlock": "-1",
-                },
-                "containerEdits": {
-                    "deviceNodes": [node],
-                    "env": [
-                        f"FREETPU_VISIBLE_DEVICES={chip.index}",
-                        f"FREETPU_PCI_BDFS={chip.pci_bdf}",
-                        f"FREETPU_TPU_GENERATION={chip.generation}",
-                        f"FREETPU_VFIO_DEVICES={chip.vfio_container_path}",
-                    ],
-                },
-            }
-        )
+    for iommu_group, group_chips in groups.items():
+        rep = group_chips[0]
+        node = _make_device_node(rep.vfio_container_path, rep.vfio_host_path)
+        seen_group_nodes.setdefault(rep.vfio_container_path, node)
+        group_bdfs = [c.pci_bdf for c in group_chips]
+        group_gens: List[str] = []
+        for c in group_chips:
+            if c.generation not in group_gens:
+                group_gens.append(c.generation)
+
+        if len(group_chips) == 1:
+            devices.append(
+                {
+                    "name": str(rep.index),
+                    "annotations": {
+                        "freetpu.dev/allocation-unit": "single-chip",
+                        "freetpu.dev/pci-bdf": rep.pci_bdf,
+                        "freetpu.dev/vendor-id": rep.vendor_id,
+                        "freetpu.dev/device-id": rep.device_id,
+                        "freetpu.dev/generation": rep.generation,
+                        "freetpu.dev/model": rep.model_name,
+                        "freetpu.dev/driver": rep.driver,
+                        "freetpu.dev/iommu-group": rep.iommu_group,
+                        "freetpu.dev/required-cap-add": "IPC_LOCK",
+                        "freetpu.dev/required-ulimit-memlock": "-1",
+                    },
+                    "containerEdits": {
+                        "deviceNodes": [node],
+                        "env": [
+                            f"FREETPU_VISIBLE_DEVICES={rep.index}",
+                            f"FREETPU_PCI_BDFS={rep.pci_bdf}",
+                            f"FREETPU_TPU_GENERATION={rep.generation}",
+                            f"FREETPU_VFIO_DEVICES={rep.vfio_container_path}",
+                        ],
+                    },
+                }
+            )
+        else:
+            # Expose shared IOMMU groups strictly as a single allocation unit so
+            # callers never assume device-level VFIO isolation between sibling chips.
+            devices.append(
+                {
+                    "name": f"group-{iommu_group}",
+                    "annotations": {
+                        "freetpu.dev/allocation-unit": "shared-iommu-group",
+                        "freetpu.dev/shared-iommu-group": "true",
+                        "freetpu.dev/chip-count": str(len(group_chips)),
+                        "freetpu.dev/chip-indices": ",".join(str(c.index) for c in group_chips),
+                        "freetpu.dev/pci-bdfs": ",".join(group_bdfs),
+                        "freetpu.dev/generations": ",".join(group_gens),
+                        "freetpu.dev/iommu-group": iommu_group,
+                        "freetpu.dev/required-cap-add": "IPC_LOCK",
+                        "freetpu.dev/required-ulimit-memlock": "-1",
+                    },
+                    "containerEdits": {
+                        "deviceNodes": [node],
+                        "env": [
+                            f"FREETPU_VISIBLE_DEVICES={','.join(str(c.index) for c in group_chips)}",
+                            f"FREETPU_CHIP_COUNT={len(group_chips)}",
+                            f"FREETPU_PCI_BDFS={','.join(group_bdfs)}",
+                            f"FREETPU_TPU_GENERATION={','.join(group_gens)}",
+                            f"FREETPU_VFIO_DEVICES={rep.vfio_container_path}",
+                        ],
+                    },
+                }
+            )
 
     devices.append(
         {
             "name": "all",
             "annotations": {
+                "freetpu.dev/allocation-unit": "all-devices",
                 "freetpu.dev/chip-count": str(len(chips)),
                 "freetpu.dev/pci-bdfs": ",".join(all_bdfs),
                 "freetpu.dev/generations": ",".join(all_generations),
-                "freetpu.dev/recommended-cap-add": "IPC_LOCK",
-                "freetpu.dev/recommended-ulimit-memlock": "-1",
+                "freetpu.dev/required-cap-add": "IPC_LOCK",
+                "freetpu.dev/required-ulimit-memlock": "-1",
             },
             "containerEdits": {
                 "deviceNodes": list(seen_group_nodes.values()),
@@ -298,9 +331,8 @@ def build_cdi_spec(
         "kind": kind,
         "annotations": {
             "freetpu.dev/generated-by": "freetpu-cdi",
-            "freetpu.dev/recommended-cap-add": "IPC_LOCK",
-            "freetpu.dev/recommended-ulimit-memlock": "-1",
-            "freetpu.dev/oci-memlock-hook-enabled": "true" if oci_hook_path else "false",
+            "freetpu.dev/required-cap-add": "IPC_LOCK",
+            "freetpu.dev/required-ulimit-memlock": "-1",
         },
         "containerEdits": global_edits,
         "devices": devices,
@@ -410,13 +442,15 @@ def validate_cdi_spec(spec: Any) -> List[str]:
         ):
             errors.append("annotations must be a string-to-string map")
 
-    all_device_paths: set[str] = set()
+    global_paths: set[str] = set()
     if "containerEdits" in spec:
         _validate_container_edits(spec["containerEdits"], "containerEdits", errors)
         if isinstance(spec["containerEdits"], dict):
-            for n in spec["containerEdits"].get("deviceNodes", []):
-                if isinstance(n, dict) and isinstance(n.get("path"), str):
-                    all_device_paths.add(n["path"])
+            nodes = spec["containerEdits"].get("deviceNodes")
+            if isinstance(nodes, list):
+                for n in nodes:
+                    if isinstance(n, dict) and isinstance(n.get("path"), str):
+                        global_paths.add(n["path"])
 
     devices = spec.get("devices")
     if not isinstance(devices, list) or not devices:
@@ -444,65 +478,33 @@ def validate_cdi_spec(spec: Any) -> List[str]:
             ):
                 errors.append(f"{dc}.annotations: must be a string-to-string map")
 
+        dev_paths: set[str] = set()
         if "containerEdits" not in dev:
             errors.append(f"{dc}.containerEdits: required on every CDI device")
         else:
             _validate_container_edits(dev["containerEdits"], f"{dc}.containerEdits", errors)
             if isinstance(dev["containerEdits"], dict):
-                for n in dev["containerEdits"].get("deviceNodes", []):
-                    if isinstance(n, dict) and isinstance(n.get("path"), str):
-                        all_device_paths.add(n["path"])
+                nodes = dev["containerEdits"].get("deviceNodes")
+                if isinstance(nodes, list):
+                    for n in nodes:
+                        if isinstance(n, dict) and isinstance(n.get("path"), str):
+                            dev_paths.add(n["path"])
 
-    if "/dev/vfio/vfio" not in all_device_paths:
-        errors.append("CDI spec must expose /dev/vfio/vfio container node")
-    if not any(
-        p.startswith("/dev/vfio/") and p != "/dev/vfio/vfio" for p in all_device_paths
-    ):
-        errors.append("CDI spec must expose at least one /dev/vfio/<iommu_group> device node")
+        effective_paths = global_paths | dev_paths
+        label = name if isinstance(name, str) else dc
+        if "/dev/vfio/vfio" not in effective_paths:
+            errors.append(
+                f"{dc} ({label!r}): effective containerEdits must expose /dev/vfio/vfio container node"
+            )
+        if not any(
+            p.startswith("/dev/vfio/") and p != "/dev/vfio/vfio"
+            for p in effective_paths
+        ):
+            errors.append(
+                f"{dc} ({label!r}): effective containerEdits must expose at least one /dev/vfio/<iommu_group> device node"
+            )
 
     return errors
-
-
-def patch_oci_config_for_vfio(config: Dict[str, Any]) -> Dict[str, Any]:
-    """Mutate an OCI runtime config.json dict to ensure CAP_IPC_LOCK + unlimited memlock."""
-    process = config.setdefault("process", {})
-    caps = process.setdefault("capabilities", {})
-    for cap_set in ("bounding", "effective", "inheritable", "permitted"):
-        lst = caps.setdefault(cap_set, [])
-        if isinstance(lst, list) and "CAP_IPC_LOCK" not in lst:
-            lst.append("CAP_IPC_LOCK")
-
-    rlimits = process.setdefault("rlimits", [])
-    if isinstance(rlimits, list):
-        updated = False
-        for entry in rlimits:
-            if isinstance(entry, dict) and entry.get("type") == "RLIMIT_MEMLOCK":
-                entry["hard"] = -1
-                entry["soft"] = -1
-                updated = True
-                break
-        if not updated:
-            rlimits.append({"type": "RLIMIT_MEMLOCK", "hard": -1, "soft": -1})
-
-    return config
-
-
-def _run_oci_hook() -> int:
-    """OCI createContainer hook: reads OCI state JSON on stdin and patches bundle/config.json."""
-    raw = sys.stdin.read().strip()
-    if not raw:
-        sys.stderr.write("freetpu-cdi oci-hook: expected OCI container state JSON on stdin\n")
-        return 1
-    state = json.loads(raw)
-    bundle = state.get("bundle")
-    if not bundle:
-        sys.stderr.write("freetpu-cdi oci-hook: missing 'bundle' path in OCI state\n")
-        return 1
-    config_path = Path(bundle) / "config.json"
-    config = json.loads(config_path.read_text(encoding="utf-8"))
-    patch_oci_config_for_vfio(config)
-    config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
-    return 0
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -551,11 +553,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Devfs root path (default: /dev).",
     )
     gen.add_argument(
-        "--with-oci-hook",
-        default=None,
-        help="Optional absolute path to freetpu-cdi binary for createContainer memlock/IPC_LOCK hook.",
-    )
-    gen.add_argument(
         "--allow-missing-vfio",
         action="store_true",
         help="Do not fail if /dev/vfio nodes are absent (dry-run inspection only).",
@@ -579,11 +576,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="all",
         help="CDI device selector suffix (default: all -> freetpu.dev/tpu=all).",
     )
-
-    sub.add_parser(
-        "oci-hook",
-        help="OCI createContainer hook that adds CAP_IPC_LOCK and unlimited RLIMIT_MEMLOCK.",
-    )
     return parser
 
 
@@ -602,7 +594,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 chips,
                 vfio_container,
                 kind=args.kind,
-                oci_hook_path=args.with_oci_hook,
             )
         except Exception as exc:  # noqa: BLE001
             sys.stderr.write(f"freetpu-cdi generate failed: {exc}\n")
@@ -652,9 +643,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"--device={CDI_KIND}={args.device} --cap-add=IPC_LOCK --ulimit memlock=-1:-1\n"
         )
         return 0
-
-    if args.command == "oci-hook":
-        return _run_oci_hook()
 
     return 1
 
