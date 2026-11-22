@@ -1,0 +1,97 @@
+# Cloud TPU `v5e-1` Experimental Prototypes (Track B)
+
+Clean-room experimental scripts and C++17 PJRT runtime prototypes validating Track B of [freetpu#3](https://github.com/saariuslystoned/freetpu/issues/3) on an ephemeral Google Colab `v5e-1` (`TPU v5 lite`, `15.748 GiB` HBM) runtime.
+
+> **Scope & Clean-Room Boundary**: Colab is strictly an ephemeral single-chip R&D/benchmarking sandbox (no marketplace hosting or serving). This directory ships **zero proprietary binaries** (`.so`, `.bin`, headers). Build-time C++ compilation fetches OpenXLA's Apache-2.0 `pjrt_c_api.h` directly from upstream GitHub and dynamically loads the host VM's existing `libtpu.so` via `dlopen`.
+
+---
+
+## Files
+
+| File | Track B Goal | Purpose |
+| --- | --- | --- |
+| `vfio_pci_survey.py` | **#4 VFIO/PCI & PJRT ABI Survey** | Read-only inspection of `/sys/bus/pci/devices/0000:00:05.0` (`BAR0`/`BAR4`, MSI-X, `vfio-pci`), `GetPjrtApi()` version & `struct_size`, and JAX Pallas/Mosaic TPU APIs |
+| `pallas_opt_bench.py` | **#3 Pallas GEMM+SiLU & FlashAttention** | Tile & `async_copy` double-buffering sweep on `4096^3` BF16 `GEMM + SiLU` + Triton-style `@tpu_flash_attn` causal attention vs dense XLA |
+| `llama8b_decode_bench.py` | **#2 Llama-3-8B `W8A16`/`W4A16` Decode** | Fused VMEM-dequant Pallas `W8A16` / `W4A16` + `RMSNorm` + `SwiGLU` microbenchmarks and full 32-layer resident HBM `jax.lax.scan` decode (`B=1`, `B=32`) |
+| `export_stablehlo.py` | **#1 StableHLO IR Export & C++ Build** | Exports `.mlir` + `.mlirbc` + `CompileOptionsProto`, verifies 26/26 `PJRT_Api` offsets against `libtpu.so`, fetches `pjrt_c_api.h`, and builds `/tmp/tpu_pjrt_bench` |
+| `tpu_pjrt_bench.cpp` | **#1 Zero-Python C++17 PJRT Runtime** | Standalone CUDA-like `TpuRuntime` (`dlopen(libtpu.so)` -> `GetPjrtApi()`), `/proc/self/maps` zero-`libpython` check, `1x64x32` parity, sync/async/pipelined dispatch & `8192^3` TFLOP/s |
+
+---
+
+## Reproducing on a Cloud TPU VM (`v5e-1` / `v6e-1`)
+
+```bash
+# Stage A (JAX kernel active on /dev/vfio/0)
+python3 experimental/cloud-tpu/vfio_pci_survey.py
+python3 experimental/cloud-tpu/pallas_opt_bench.py
+python3 experimental/cloud-tpu/llama8b_decode_bench.py
+python3 experimental/cloud-tpu/export_stablehlo.py
+
+# Stage B (Fresh process / restarted kernel with /dev/vfio/0 released; zero Python)
+ldd /tmp/tpu_pjrt_bench
+/tmp/tpu_pjrt_bench
+```
+
+Or build `tpu_pjrt_bench.cpp` standalone once `pjrt_c_api.h` and `.mlirbc` artifacts exist in `/tmp/tpu_pjrt_ir`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/openxla/xla/main/xla/pjrt/c/pjrt_c_api.h \
+  -o /tmp/tpu_pjrt_ir/pjrt_c_api.h
+g++ -O3 -std=c++17 -Wall -Wextra -I/tmp/tpu_pjrt_ir \
+  experimental/cloud-tpu/tpu_pjrt_bench.cpp -ldl -pthread -o /tmp/tpu_pjrt_bench
+/tmp/tpu_pjrt_bench
+```
+
+---
+
+## Verified `v5e-1` Silicon Results (`libtpu 0.0.50` / `jax 0.11.2`)
+
+### 1. PCI / VFIO & PJRT ABI Surface (`vfio_pci_survey.py`)
+- **PCI Device**: `0000:00:05.0`, `vendor=0x1ae0`, `device=0x0063`, `subsystem=0x1ae0:0x00af`, `driver=vfio-pci`, `iommu_group=0`, `dma_mask_bits=32`, `128` MSI-X vectors.
+- **MMIO BARs**: `BAR0 = 4096.00 MiB` (`0xd00000000..0xdffffffff`, `flags=0x14220c`), `BAR4 = 16.00 MiB` (`0xe00000000..0xe00ffffff`, `flags=0x14220c`).
+- **On-Chip SRAM & Compute (`TpuInfo`)**: `128 MiB` VMEM, `1 MiB` SMEM, `4` MXUs, `15.748 GiB` (`16,909,336,064 B`) usable HBM, `820 GB/s` HBM BW, `197 TF/s` BF16, `394 TOPS` INT8, `788 TOPS` INT4.
+- **PJRT C API**: `GetPjrtApi()` -> `struct_size=1144`, `version=0.116` (`libtpu.so` `601.67 MB`). All 26 required PJRT entrypoints verified inside `struct_size` and non-null.
+
+### 2. Zero-Python C++17 PJRT Runtime (`tpu_pjrt_bench.cpp`)
+- **Zero Python Proven**: `ldd` links only `libstdc++`, `libgcc_s`, `libc`, `libm`, `ld-linux`; runtime `/proc/self/maps` reports **`MAPS_LIBPYTHON=0`**.
+- **Numeric Parity (`1x64x32` `bf16->f32`)**: **`max_abs_err = 0.000000e+00`** vs C++ host reference.
+- **Dispatch Floor (`1x64x32`)**:
+  - `sync_ready_event`: **`126.94 us`** median (`115.56 us` min)
+  - `sync_device_complete`: **`124.52 us`** median (`116.43 us` min)
+  - `sync_to_host`: **`231.16 us`** median (`205.57 us` min)
+  - `async_enqueue_only`: **`28.86 us`** median (`20.68 us` min)
+  - `pipelined_100x` async queue: **`32.00 us` amortized/launch** (`3.97x` lower than per-op sync)
+- **Raw Compute (`sync_ready_event`)**:
+  - `1024^3` (`bf16->f32`): **`141.99 us`** (`15.12` / `15.93 TFLOP/s`)
+  - `4096^3` (`bf16->bf16`): **`949.31 us`** (`144.78` / `149.93 TFLOP/s`)
+  - `8192^3` (`bf16->bf16`): **`6,145.94 us`** (**`178.90 TFLOP/s`** median / **`180.36 TFLOP/s`** peak = **`91.6%`** of 197 TF/s ceiling)
+
+### 3. Pallas/Mosaic Optimization & FlashAttention (`pallas_opt_bench.py`)
+- **`4096^3` BF16 `GEMM + SiLU`**: `pltpu.make_async_copy` double-buffered `1024x1024x256` reached **`135.50 TFLOP/s` median (`138.29 TFLOP/s` peak) = `93.99%` of XLA** (`144.16 TFLOP/s`), `max_abs_err=1.22e-4`, `tpu_custom_call=True`.
+- **Causal FlashAttention (`@tpu_flash_attn`, `bs_512_1024_256`, `tpu_custom_call=True`)**:
+  - `B=2, H=32, Q=K=2048, D=128`: **`1,386.44 us` (`49.57 TFLOP/s`)** vs dense XLA `4,913.38 us` (`13.99 TFLOP/s`) — **`3.54x` speedup**.
+  - `B=1, H=32, Q=K=4096, D=128`: **`2,092.06 us` (`65.70 TFLOP/s` median / `66.65` peak)** vs dense XLA `9,436.90 us` (`14.56 TFLOP/s`) — **`4.51x` speedup** (`max_abs_err=0.015625`).
+
+### 4. Resident 32-Layer Llama-3-8B Decode (`llama8b_decode_bench.py`)
+Exact Llama-3-8B geometry (`d=4096, 32L, 32Q/8KV, head_dim=128, ff=14336`) resident in HBM via `jax.lax.scan`:
+- **Single-Projection `W4A16` (`int32_split8_3d`, `max_abs_err = 0.0..0.0078`)**: `QKV 1x4096->6144` **`154.93 us`** (`2.02x` vs XLA), `Gate+Up 1x4096->28672` **`389.37 us`** (`3.24x` vs XLA `1,260.84 us`), `Down 1x14336->4096` **`243.66 us`** (`1.79x` vs XLA).
+- **`W8A16` 32-Layer Resident (`6.98 GB` weights, `step0_max_abs_err=0.047` @ `B=1`)**:
+  - `B=1`: XLA **`10.254 ms/step` (`97.53 tok/s`, `684.27 GB/s` = `83.55%` HBM BW)**; Pallas `17.840 ms/step` (`56.05 tok/s`).
+  - `B=32`: XLA **`20.367 ms/step` (`1,571.15 tok/s`, `395.55 GB/s`)**; Pallas `35.045 ms/step` (`913.12 tok/s`).
+- **`W4A16` 32-Layer Resident (`3.49 GB` packed `int32` weights)**:
+  - `B=1`: Pallas **`15.529 ms/step` (`64.39 tok/s`, `227.09 GB/s`)** vs XLA `47.374 ms/step` (`21.11 tok/s`) — **`3.05x` speedup**.
+  - `B=32`: Pallas **`27.416 ms/step` (`1,167.20 tok/s`, `166.57 GB/s`)** vs XLA `63.876 ms/step` (`500.97 tok/s`) — **`2.33x` speedup**.
+  - *(Note: `W4A16` synthetic 32-layer `step0_max_abs_err` was `16.0` @ `B=1` / `8.0` @ `B=32` due to BF16 ULP magnitude over 32 layers from unscaled uniform `[0..15]-8` `-0.5` bias; single-projection `W4A16` accuracy vs XLA is `0.0..0.0078`.)*
+
+---
+
+## Side-by-Side Comparison vs Phase 6 Pixel Tensor G5 (`buenos_a0`)
+
+| Metric | Pixel Tensor G5 (`buenos_a0`, `PM=5 @ 1,286.4 MHz` + WakeLock) | Cloud TPU `v5e-1` (`TPU v5 lite`, live Colab proof) |
+| --- | --- | --- |
+| **Kernel Transport** | `/dev/edgetpu-soc` (`buenos.ko` ABI `1.4`, Litebuf VII, 16-credit ring) | `/dev/vfio/0` (`vfio-pci`, PCI `0x1ae0:0x0063`, `BAR0=4 GiB`, `128` MSI-X) |
+| **Userspace Vendor `.so`** | **`0 B`** (`libopenbuenos` C11/C++17; `DT_NEEDED=[libdl,libm,libc]`) | **`601.67 MB`** (`libtpu.so` `0.0.50`, PJRT `0.116`) — Zero-Python C++17 verified (`MAPS_LIBPYTHON=0`) |
+| **Memory & Peak BW** | Unified LPDDR (`27.59 GB/s` measured @ `1x2048x2048`) + `768 KiB` NM SRAM | `15.748 GiB` HBM2e (**`655.55 GB/s`** triad / **`684.27 GB/s`** `W8A16` 32L) + `128 MiB` VMEM |
+| **Small-Op Floor** | **`60.8–72.8 us`** chained `0xa40` fusion (`152 us` `1x2048x2048`) | **`124.5–126.9 us`** sync PJRT floor; **`32.0 us`** amortized when async-pipelined (`100x`) |
+| **Peak Matrix Compute** | `983.6 INT8 GOPS` @ `177.2 mW` (**`5.55 TOPS/W`**) | **`180.36 TFLOP/s`** BF16 (C++ PJRT) / **`350.69 TOPS`** INT8 |
+| **LLM Inference (`tok/s`)** | `Qwen2.5-1.5B-Q8_0`: `pp512 = 105.87 t/s`, `tg64 = 5.85 t/s` (`-21.5% mJ/tok` vs CPU) | `Llama-3-8B W8A16`: **`97.53 t/s`** (`B=1`) / **`1,571.15 t/s`** (`B=32`); `W4A16` Pallas: **`64.39 t/s`** (`B=1`) / **`1,167.20 t/s`** (`B=32`) |
