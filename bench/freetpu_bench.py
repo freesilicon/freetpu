@@ -2549,7 +2549,7 @@ def run_self_test() -> int:
     assert "Local Host Comms" in measured_all[1]["target"]
     assert measured_all[1]["half_rtt_est_us"] == f"{comms['half_rtt_floor_us']} us (half-RTT est.)"
 
-    # 3b. Verify CLI rejects invalid economics / timeout args BEFORE running any suite or Colab
+    # 3b. Verify CLI rejects invalid economics / timeout / colliding output args BEFORE running any suite or Colab
     for bad_argv in (
         ["--model-gb", "0", "--backend", "colab_tpu"],
         ["--model-gb", "-2.5", "--backend", "cpu"],
@@ -2559,6 +2559,8 @@ def run_self_test() -> int:
         ["--bw-efficiency", "1.5", "--backend", "cpu"],
         ["--batch-size", "0", "--backend", "cpu"],
         ["--colab-timeout", "-1", "--backend", "colab_tpu"],
+        ["--backend", "colab_tpu", "--json", "-", "--markdown", "-"],
+        ["--backend", "colab_tpu", "--json", "runs/same.out", "--markdown", "./runs/same.out"],
     ):
         err_buf = StringIO()
         try:
@@ -3761,6 +3763,21 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _validate_output_destinations(json_out: Optional[str], md_out: Optional[str]) -> None:
+    """Reject `--json` and `--markdown` targeting the same stdout stream or file path."""
+    if not json_out or not md_out:
+        return
+    if json_out == "-" and md_out == "-":
+        raise ValueError("--json and --markdown cannot both target stdout ('-')")
+    if json_out != "-" and md_out != "-":
+        json_real = os.path.realpath(os.path.abspath(os.path.expanduser(json_out)))
+        md_real = os.path.realpath(os.path.abspath(os.path.expanduser(md_out)))
+        if json_real == md_real:
+            raise ValueError(
+                f"--json and --markdown cannot target the same file path ({json_real!r})"
+            )
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -3778,6 +3795,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         validate_economics_params(args.model_gb, args.bw_efficiency, args.batch_size)
         suites = parse_suites(args.suite)
+        _validate_output_destinations(args.json_out, args.md_out)
     except ValueError as exc:
         parser.error(str(exc))
 

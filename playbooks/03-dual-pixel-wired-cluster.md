@@ -48,7 +48,7 @@ python3 bench/freetpu_bench.py \
 
 ### 3. Split-Layer Dual-Phone `llama.cpp` (`GGML_EDGETPU=ON` + `GGML_RPC=ON`)
 
-> **Security Prerequisites (`ggml-rpc-server`)**: Upstream `llama.cpp` `ggml-rpc-server` has **no client authentication or transport encryption** and runs as root here to access `/dev/edgetpu-soc`. Even when bound to `127.0.0.1` over ADB forwarding/reverse, loopback listeners are reachable by other local apps on both Node 2 and Node 1 (and by local processes on the host). **Run this recipe only on dedicated, single-purpose test devices with only trusted apps and a trusted host**, and optionally enforce UID filtering on `lo` (shown below) before launching the server. Only bind directly to a USB-Ethernet interface (e.g. `-H 192.168.77.2`) on an **isolated, air-gapped lab test device** with `iptables` rules restricting TCP `50052` exclusively to the intended peer IP (`192.168.77.1`).
+> **Security Prerequisites (`ggml-rpc-server` & Host ADB)**: Upstream `llama.cpp` `ggml-rpc-server` has **no client authentication or transport encryption** and runs as root here to access `/dev/edgetpu-soc`. Even when bound to `127.0.0.1` over ADB forwarding/reverse, loopback listeners are reachable by other local apps on both Node 2 and Node 1 (and by local processes on the host). **Require the host ADB control socket (`:5037`) to be bound strictly to loopback (`127.0.0.1:5037` / `[::1]:5037`, never started with `adb -a`, or strictly host-firewalled to loopback)** before running this recipe—a network-reachable ADB control socket lets remote clients reach attached phones and the root RPC service directly. **Run this recipe only on dedicated, single-purpose test devices with only trusted apps and a trusted host**, and optionally enforce UID filtering on `lo` (shown below) before launching the server. Only bind directly to a USB-Ethernet interface (e.g. `-H 192.168.77.2`) on an **isolated, air-gapped lab test device** with `iptables` rules restricting TCP `50052` exclusively to the intended peer IP (`192.168.77.1`).
 
 **Prerequisites (Build & Stage Static Binaries + Local Artifacts on Both Phones):**
 
@@ -108,8 +108,8 @@ adb -s <node1_serial> shell "su -c 'iptables -C INPUT ! -i lo -p tcp --dport 500
   iptables -C OUTPUT -o lo -p tcp --dport 50052 -j FREETPU_RPC_OUT 2>/dev/null || \
   iptables -I OUTPUT -o lo -p tcp --dport 50052 -j FREETPU_RPC_OUT'"
 
-# Tunnel Node 2 loopback -> host loopback -> Node 1 loopback explicitly
-# (`tcp:localhost:50052` enforces loopback on both ends, even if host `adb` was started with `-a`, and avoids wildcard `adbd` reverse binds)
+# Prerequisite: verify the host ADB server control socket (:5037) is loopback-only (do NOT run `adb -a` / wildcard :5037)
+# Tunnel Node 2 loopback -> host loopback -> Node 1 loopback explicitly (`tcp:localhost:50052` enforces loopback and avoids wildcard `adbd` reverse binds)
 adb -s <node2_serial> forward tcp:localhost:50052 tcp:50052
 adb -s <node1_serial> reverse tcp:localhost:50052 tcp:50052
 

@@ -14,16 +14,17 @@ Run `nvbench`-style compute and `nvbandwidth`-style HBM2e streaming benchmarks h
 
 ## 60-Second Copy-Paste Commands
 
-### 1. Pre-Flight Compute Unit Check + 1-Command Headless Run (`v6e-1` -> `v5e-1`)
+### 1. Version-Gated Headless Run (`v6e-1` -> `v5e-1`)
 
 ```bash
 # Isolate Colab session metadata in a private 0700 directory (never /tmp)
 mkdir -p -m 700 ~/.cache/freetpu-colab
 
-# Check available Compute Units before provisioning
-colab --auth=adc usage
+# Check installed CLI version first (unauthenticated; must be >= 0.7.6)
+colab version
 
 # Run compute + bandwidth remotely on Colab TPU, plus local comms, with isolated state
+# (`freetpu_bench.py` verifies `colab version >= 0.7.6` before running `colab usage` or provisioning)
 python3 bench/freetpu_bench.py \
   --suite all \
   --backend colab_tpu \
@@ -55,25 +56,61 @@ python3 bench/freetpu_bench.py \
 
 ```bash
 (
+  # 1. Fail closed BEFORE any authenticated call if `colab` on PATH is < 0.7.6
+  python3 -c '
+import re, subprocess, sys
+out = subprocess.check_output(["colab", "version"], text=True, stderr=subprocess.STDOUT)
+m = re.search(r"(?i)\b(\d+)\.(\d+)\.(\d+)(?:[-.]?(a|b|rc|dev|alpha|beta)[0-9]*)?", out)
+ver = tuple(int(m.group(i)) for i in (1, 2, 3)) if m else (0, 0, 0)
+if not m or ver < (0, 7, 6) or (ver == (0, 7, 6) and m.group(4)):
+    sys.exit(f"Refusing to authenticate: need google-colab-cli >= 0.7.6 (got {out.strip()!r})")
+' || exit 1
+
   mkdir -p -m 700 "$HOME/.cache/freetpu-colab"
   SESSION="freetpu-bench-direct-$(python3 -c 'import uuid; print(uuid.uuid4().hex[:8])')"
   COLAB_CFG="$HOME/.cache/freetpu-colab/${SESSION}.json"
+  RUN_RC=0
+  RAN_COLAB=0
 
   cleanup() {
     trap - EXIT INT TERM HUP
-    colab --auth=adc --config "$COLAB_CFG" sessions || true
-    colab --auth=adc --config "$COLAB_CFG" stop -s "$SESSION" || true
-    colab --auth=adc --config "$COLAB_CFG" sessions || true
+    [ "$RAN_COLAB" -eq 1 ] || exit "$RUN_RC"
+    BEFORE=$(colab --auth=adc --config "$COLAB_CFG" sessions 2>&1 || true)
+    EP=$(printf '%s\n' "$BEFORE" | awk -v s="[$SESSION]" '$1 == s {print $2; exit}')
+    STOP_OUT=$(colab --auth=adc --config "$COLAB_CFG" stop -s "$SESSION" 2>&1)
+    STOP_RC=$?
+    AFTER=$(colab --auth=adc --config "$COLAB_CFG" sessions 2>&1)
+    AFTER_RC=$?
+    VERIFIED=1
+    if [ "$AFTER_RC" -ne 0 ] || printf '%s\n' "$AFTER" | grep -Fq "[$SESSION]"; then
+      VERIFIED=0
+    elif [ -n "$EP" ]; then
+      printf '%s\n' "$AFTER" | grep -Fq "$EP" && VERIFIED=0
+    elif [ "$STOP_RC" -ne 0 ] || ! printf '%s\n' "$STOP_OUT" | grep -qi "session terminated"; then
+      VERIFIED=0
+    fi
+    if [ "$VERIFIED" -ne 1 ]; then
+      printf 'ERROR: Colab teardown unverified for session=%s endpoint=%s.\n' "$SESSION" "${EP:-unknown}" >&2
+      printf 'Recovery config preserved at %s; inspect and recover with:\n' "$COLAB_CFG" >&2
+      printf '  colab --auth=adc --config %s sessions\n' "$COLAB_CFG" >&2
+      printf '  colab --auth=adc --config %s stop -s %s\n' "$COLAB_CFG" "$SESSION" >&2
+      exit 1
+    fi
+    exit "$RUN_RC"
   }
-  trap cleanup EXIT INT TERM HUP
+  trap 'RUN_RC=130; cleanup' INT
+  trap 'RUN_RC=143; cleanup' TERM
+  trap 'RUN_RC=129; cleanup' HUP
+  trap 'cleanup' EXIT
 
+  RAN_COLAB=1
   COLAB_CLI_ASSIGN_RETRIES=0 colab --auth=adc --config "$COLAB_CFG" run \
     -s "$SESSION" --tpu V5E1 --keep --timeout 300 \
-    bench/freetpu_bench.py --suite compute,bandwidth --backend jax_tpu --emit-markers
+    bench/freetpu_bench.py --suite compute,bandwidth --backend jax_tpu --emit-markers || RUN_RC=$?
 )
 ```
 
-Generating a unique per-run `$SESSION` name and matching `$COLAB_CFG` file prevents a rerun after an interruption or failed stop from overwriting a previous runtime's cleanup handle, and the subshell `EXIT INT TERM HUP` trap reuses that exact `$SESSION` and `$COLAB_CFG` for teardown. Passing `--keep` preserves the local session-to-endpoint mapping until `colab stop -s "$SESSION"` succeeds, so a failed unassign cannot silently drop local state and leave an orphaned `[?] <endpoint>` runtime burning Compute Units. Always confirm in the final `colab sessions` output that the runtime endpoint is gone before removing `$COLAB_CFG`.
+The standalone recipe checks `colab version >= 0.7.6` before making any authenticated call, generates a unique per-run `$SESSION` name and matching `$COLAB_CFG` file so reruns never overwrite an earlier cleanup handle, and fails with a non-zero exit code (printing the preserved `$COLAB_CFG` recovery commands) if the runtime endpoint cannot be verified gone after `colab stop -s "$SESSION"`. Only remove `$COLAB_CFG` after confirming teardown succeeded.
 
 ---
 
