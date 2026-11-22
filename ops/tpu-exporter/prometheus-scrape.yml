@@ -1,5 +1,11 @@
-# Prometheus scrape configuration for FreeTPU tpu-exporter (DCGM-exporter equivalent).
-# Point static_configs or Kubernetes pod/node discovery at port 9400 on Cloud TPU VMs.
+# Trusted Billing & Node Prometheus scrape configuration for FreeTPU tpu-exporter.
+# Scrapes ONLY operator-controlled `collector_role="node"` targets (standalone
+# host VMs and the `kube-system` `freetpu-node-agent` DaemonSet).
+#
+# Tenant-controlled workload telemetry sidecars (`freetpu-workload-sidecar`) are
+# intentionally isolated in `ops/tpu-exporter/prometheus-scrape-diagnostics.yml`
+# for a separate diagnostic Prometheus instance so tenant scrape churn can never
+# exhaust memory or storage on the billing Prometheus server.
 
 global:
   scrape_interval: 15s
@@ -7,6 +13,8 @@ global:
 
 scrape_configs:
   - job_name: "freetpu-tpu-exporter"
+    honor_labels: false
+    follow_redirects: false
     metrics_path: /metrics
     static_configs:
       - targets:
@@ -16,7 +24,7 @@ scrape_configs:
           node: "tpu-vm-0"
           collector_role: "node"
 
-  # 1. Trusted operator-managed DaemonSet discovery (billing inventory, VFIO
+  # Trusted operator-managed DaemonSet discovery (billing inventory, VFIO
   # health, and hostPID reservation metrics).
   # Scoped strictly via Kubernetes-enforced ownership metadata (namespace,
   # DaemonSet controller, container, and port name) rather than pod-controlled
@@ -24,6 +32,7 @@ scrape_configs:
   # `honor_labels: false` so tenant pods cannot forge inventory or PID metrics.
   - job_name: "freetpu-node-exporter"
     honor_labels: false
+    follow_redirects: false
     metrics_path: /metrics
     kubernetes_sd_configs:
       - role: pod
@@ -50,93 +59,3 @@ scrape_configs:
         target_label: node
       - target_label: collector_role
         replacement: "node"
-
-  # 2. Workload telemetry sidecars (diagnostic-only live `tpu-info` HBM & MXU
-  # duty-cycle metrics).
-  # Hard-sets `collector_role="workload-sidecar"`, disables HTTP redirects
-  # (`follow_redirects: false`), scopes discovery to operator-approved workload
-  # namespaces (running/ready pods only — avoid cluster-wide tenant discovery or
-  # pool-wide `target_limit` caps that a noisy namespace could trip), enforces
-  # per-target response/sample/label limits, validates tenant-supplied label
-  # domains, strips unexpected labels, and allowlists ONLY runtime utilization
-  # and HBM metric names. Pair with a cluster NetworkPolicy restricting
-  # Prometheus egress to approved TPU workload namespaces and port 9400.
-  - job_name: "freetpu-workload-sidecar"
-    honor_labels: false
-    follow_redirects: false
-    metrics_path: /metrics
-    scrape_timeout: 10s
-    body_size_limit: 256KB
-    sample_limit: 256
-    label_limit: 20
-    label_name_length_limit: 128
-    label_value_length_limit: 256
-    kubernetes_sd_configs:
-      - role: pod
-        # Restrict discovery to operator-approved TPU workload namespace(s) (or
-        # shard one scrape job per approved namespace) instead of cluster-wide
-        # tenant pod discovery.
-        namespaces:
-          names:
-            - ml-workloads
-    relabel_configs:
-      - source_labels:
-          [
-            __meta_kubernetes_namespace,
-            __meta_kubernetes_pod_controller_kind,
-            __meta_kubernetes_pod_controller_name,
-          ]
-        action: drop
-        regex: "kube-system;DaemonSet;freetpu-node-agent"
-      - source_labels: [__meta_kubernetes_pod_phase]
-        action: keep
-        regex: "Running"
-      - source_labels: [__meta_kubernetes_pod_ready]
-        action: keep
-        regex: "true"
-      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
-        action: keep
-        regex: "true"
-      - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
-        action: keep
-        regex: "freetpu-tpu-exporter"
-      - source_labels: [__meta_kubernetes_pod_label_freetpu_dev_collector_role]
-        action: keep
-        regex: "workload-sidecar"
-      - source_labels: [__meta_kubernetes_pod_container_name]
-        action: keep
-        regex: "tpu-exporter-sidecar"
-      - source_labels: [__meta_kubernetes_pod_container_port_name]
-        action: keep
-        regex: "metrics"
-      - source_labels: [__meta_kubernetes_pod_node_name]
-        target_label: node
-      - source_labels: [__meta_kubernetes_namespace]
-        target_label: namespace
-      - source_labels: [__meta_kubernetes_pod_name]
-        target_label: pod
-      - target_label: collector_role
-        replacement: "workload-sidecar"
-    metric_relabel_configs:
-      # Keep ONLY allowlisted utilization/HBM metric names.
-      - source_labels: [__name__]
-        action: keep
-        regex: "freetpu_tpu_(runtime_)?(duty_cycle_percent|hbm_used_bytes|hbm_total_bytes|hbm_utilization_ratio)"
-      # Constrain tenant-supplied label value domains (empty allowed when a
-      # label is intentionally absent on runtime vs per-PCI series) to prevent
-      # unbounded series churn.
-      - source_labels: [generation]
-        action: keep
-        regex: "(|v2|v3|v2-v3|v4lite|v4|v5e|v5p|v6e|v6e-pf)"
-      - source_labels: [pci_bdf]
-        action: keep
-        regex: "(unmapped|[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\\.[0-7])"
-      - source_labels: [chip]
-        action: keep
-        regex: "(|[0-9]|[1-5][0-9]|6[0-3])"
-      - source_labels: [runtime_chip]
-        action: keep
-        regex: "(|[0-9]|[1-5][0-9]|6[0-3])"
-      # Strip any unexpected tenant-supplied labels before ingestion.
-      - action: labelkeep
-        regex: "(__name__|job|instance|node|namespace|pod|collector_role|generation|chip|runtime_chip|pci_bdf)"

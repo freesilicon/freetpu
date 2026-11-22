@@ -1139,6 +1139,92 @@ TPU Device Status
             self.assertEqual(snap_fb.devices[0].hbm_used_bytes, 12 * 1024**3)
             self.assertAlmostEqual(snap_fb.devices[0].duty_cycle_percent or 0.0, 71.5)
 
+            # 3. In --no-pid-scan mode, when direct runtime metrics return empty/unavailable
+            #    (e.g. before libtpu initializes), exporter MUST NOT fall back to `tpu-info` CLI.
+            empty_metrics_mod = SimpleNamespace(get_chip_usage=lambda chip_type, addr="": [])
+            with (
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "tpu_info": fake_tpu_info,
+                        "tpu_info.device": fake_device_mod,
+                        "tpu_info.metrics": empty_metrics_mod,
+                    },
+                ),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_run_tpu_info",
+                    side_effect=AssertionError("must not invoke tpu-info CLI in --no-pid-scan mode"),
+                ),
+            ):
+                snap_empty = tpu_exporter.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin="tpu-info",
+                    skip_pid_scan=True,
+                    runtime_metrics_addr="127.0.0.1:8431",
+                )
+            self.assertFalse(snap_empty.tpu_info_available)
+            self.assertEqual(len(snap_empty.devices), 1)
+            self.assertEqual(snap_empty.runtime_utilization, [])
+
+            # 4. Hanging direct `tpu_info.metrics.get_chip_usage` (in a real subprocess package)
+            #    must be terminated by hard deadline, return fallback snapshot, and release
+            #    `_ExporterServer._scrape_lock` so subsequent scrapes do not hang.
+            fake_pkg_root = root / "fake_site"
+            fake_pkg = fake_pkg_root / "tpu_info"
+            fake_pkg.mkdir(parents=True, exist_ok=True)
+            (fake_pkg / "__init__.py").write_text("", encoding="utf-8")
+            (fake_pkg / "device.py").write_text(
+                "class TpuChip:\n    V6E = 'v6e'\n", encoding="utf-8"
+            )
+            (fake_pkg / "metrics.py").write_text(
+                "import time\ndef get_chip_usage(chip_type, addr='127.0.0.1:8431'):\n    time.sleep(30)\n",
+                encoding="utf-8",
+            )
+            env_with_fake = dict(os.environ)
+            prev_pp = env_with_fake.get("PYTHONPATH", "")
+            env_with_fake["PYTHONPATH"] = (
+                f"{fake_pkg_root}{os.pathsep}{prev_pp}" if prev_pp else str(fake_pkg_root)
+            )
+            import time as _time
+
+            orig_run = tpu_exporter.subprocess.run
+
+            def _run_with_fake_pkg(cmd, *args, **kwargs):
+                kwargs.setdefault("env", env_with_fake)
+                return orig_run(cmd, *args, **kwargs)
+
+            server = tpu_exporter._ExporterServer(
+                ("127.0.0.1", 0),
+                tpu_exporter._ExporterHandler,
+                sysfs_root=sysfs_root,
+                dev_root=dev_root,
+                proc_root=proc_root,
+                tpu_info_bin="tpu-info",
+                tpu_info_timeout_s=0.25,
+                skip_pid_scan=True,
+                runtime_metrics_addr="127.0.0.1:8431",
+            )
+            try:
+                with (
+                    mock.patch("tpu_exporter.importlib.util.find_spec", return_value=object()),
+                    mock.patch("tpu_exporter.subprocess.run", side_effect=_run_with_fake_pkg),
+                ):
+                    t_start = _time.monotonic()
+                    snap_to = server.scrape()
+                    elapsed = _time.monotonic() - t_start
+                self.assertLess(elapsed, 3.0)
+                self.assertFalse(snap_to.tpu_info_available)
+                self.assertIn("timed out", snap_to.tpu_info_error or "")
+                self.assertEqual(len(snap_to.devices), 1)
+                # Scrape lock MUST be released after timeout so a subsequent scrape succeeds.
+                self.assertTrue(server._scrape_lock.acquire(blocking=False))
+                server._scrape_lock.release()
+            finally:
+                server.server_close()
+
     def _assert_valid_prometheus_text(self, text: str) -> None:
         lines = [ln for ln in text.splitlines() if ln.strip()]
         self.assertGreater(len(lines), 0)

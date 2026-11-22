@@ -4,7 +4,9 @@ These queries mirror standard NVIDIA `dcgm-exporter` dashboards for VFIO-backed 
 
 ## Fleet Inventory & Health
 
-> **Trust & deduplication note:** `prometheus-scrape.yml` splits Kubernetes scraping into a trusted `freetpu-node-exporter` job (scoped by Kubernetes-enforced `kube-system` DaemonSet `freetpu-node-agent` ownership and hard-setting `collector_role="node"`) and a `freetpu-workload-sidecar` job (hard-setting `collector_role="workload-sidecar"`, enforcing response/sample/label limits, and allowlisting only utilization/HBM series). All inventory, health, reservation, and financial/chargeback queries use **strictly** operator-controlled `collector_role="node"` series and deduplicate by `(generation, node, pci_bdf)` so tenant pods cannot fabricate billing inputs and every physical TPU chip is counted **exactly once**. Workload-sidecar utilization queries are kept in a separate diagnostic-only section.
+> **Trust & Prometheus isolation note:** FreeTPU separates scraping across two Prometheus configurations:
+> 1. **`prometheus-scrape.yml` (Trusted Billing & Node Prometheus):** Scrapes ONLY operator-controlled `collector_role="node"` targets (standalone VMs and the `kube-system` `freetpu-node-agent` DaemonSet). All fleet inventory, health, reservation, and billing/chargeback queries run on this instance and deduplicate by `(generation, node, pci_bdf)` so tenant pods cannot affect billing metrics or storage.
+> 2. **`prometheus-scrape-diagnostics.yml` (Isolated Diagnostic Prometheus):** Scrapes `freetpu-workload-sidecar` pods in `ml-workloads`, strips `pci_bdf`, and constrains `chip`/`runtime_chip` to `0-7` so tenant workloads cannot create unbounded series churn. Sidecar utilization queries below run on this separate diagnostic instance (grouping by `(generation, node, chip)` or `runtime_chip`).
 
 ```promql
 # Total discovered physical TPU chips per generation across scraped nodes
@@ -41,22 +43,22 @@ freetpu_tpu_runtime_hbm_used_bytes / (freetpu_tpu_runtime_hbm_total_bytes > 0)
 freetpu_tpu_runtime_hbm_used_bytes / (1024 * 1024 * 1024)
 ```
 
-### Per-PCI-Chip Utilization (Requires Verified `--chip-id-map` or Sysfs `chip_id`)
+### Per-Chip Utilization (Diagnostic Prometheus or Single-Tenant VM)
 
-The per-PCI-BDF utilization queries below (and the diagnostic idle-waste and coverage queries below) require a verified `--chip-id-map` (or kernel sysfs `chip_id`) binding `libtpu` runtime chip IDs to PCI BDFs. In multi-tenant Kubernetes clusters, sidecar-reported utilization is tenant-supplied and should be used for **diagnostics only**, not financial chargeback:
+On the isolated diagnostic Prometheus instance (`prometheus-scrape-diagnostics.yml`), `pci_bdf` is stripped from sidecar series to prevent tenant cardinality churn, so per-chip diagnostic queries group by `(generation, node, chip)` (requires a verified `--chip-id-map` or sysfs `chip_id` on the collector). Sidecar-reported utilization is tenant-supplied and must be used for **diagnostics only**, not financial chargeback:
 
 ```promql
-# Per-chip MXU / TensorCore duty cycle (%) deduplicated by physical chip
-max by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent)
+# Per-chip MXU / TensorCore duty cycle (%) on the diagnostic Prometheus instance
+max by (generation, node, chip) (freetpu_tpu_duty_cycle_percent)
 
 # Average cluster MXU utilization by TPU generation
-avg by (generation) (max by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent))
+avg by (generation) (max by (generation, node, chip) (freetpu_tpu_duty_cycle_percent))
 
-# HBM allocation ratio (0.0 - 1.0) per physical chip
-max by (generation, node, pci_bdf) (freetpu_tpu_hbm_utilization_ratio)
+# HBM allocation ratio (0.0 - 1.0) per chip
+max by (generation, node, chip) (freetpu_tpu_hbm_utilization_ratio)
 
-# HBM used in GiB per physical chip
-max by (generation, node, pci_bdf) (freetpu_tpu_hbm_used_bytes) / (1024 * 1024 * 1024)
+# HBM used in GiB per chip
+max by (generation, node, chip) (freetpu_tpu_hbm_used_bytes) / (1024 * 1024 * 1024)
 ```
 
 ## Billing & Chargeback (Operator-Controlled `collector_role="node"` Only)
@@ -134,13 +136,29 @@ sum_over_time(
 
 ## Workload Utilization Diagnostics & Idle Waste Detection (Diagnostic-Only / Non-Billing)
 
-> **Non-authoritative warning:** The queries below incorporate `freetpu_tpu_duty_cycle_percent` (and optionally `freetpu_tpu_hbm_used_bytes`) scraped from workload sidecars (`collector_role="workload-sidecar"`). In shared Kubernetes clusters, tenant pods control their sidecar scrape response—including `generation`, `pci_bdf`, and utilization values—so these queries are for **engineering diagnostics and advisory idle detection only** and **must not** be used for financial chargeback or billing unless restricted to an operator-controlled collector (`collector_role="node"` on single-tenant VMs with verified `--chip-id-map` or sysfs `chip_id`).
+> **Non-authoritative & deployment note:**
+> - **Diagnostic Kubernetes sidecars (`prometheus-scrape-diagnostics.yml`):** Run on a **separate diagnostic Prometheus instance** where `pci_bdf` is stripped and only low-cardinality `runtime_chip`/`chip` (`0-7`) labels are kept. Use the sidecar-native idle check below on that diagnostic instance.
+> - **Operator-controlled single-tenant hosts (`collector_role="node"`):** The `pci_bdf`-joined idle, coverage, and efficiency queries below assume both `freetpu_tpu_info` and `freetpu_tpu_duty_cycle_percent` are scraped from trusted operator-controlled `collector_role="node"` targets (single-tenant Cloud TPU VMs running `tpu-info` locally with verified `--chip-id-map` or sysfs `chip_id`). Never mix untrusted tenant sidecar scrapes into the billing Prometheus instance.
 
 ```promql
-# Diagnostic: Idle reserved chips per physical chip (generation, node, pci_bdf):
-# host-wide PID reservation (collector_role="node") persisted for the full 15m
-# window AND sufficient samples exist across the 15m window AND workload-reported
-# average MXU duty cycle < 2%.
+# Diagnostic (isolated diagnostic Prometheus, `prometheus-scrape-diagnostics.yml`):
+# Workload sidecar reporting sustained low MXU duty cycle (< 2%) across 15m per
+# runtime chip (requires >= 55 samples at 15s scrape_interval).
+(
+  max by (node, namespace, pod, runtime_chip) (
+    count_over_time(freetpu_tpu_runtime_duty_cycle_percent{collector_role="workload-sidecar"}[15m])
+  ) >= 55
+)
+  and
+(
+  max by (node, namespace, pod, runtime_chip) (
+    avg_over_time(freetpu_tpu_runtime_duty_cycle_percent{collector_role="workload-sidecar"}[15m])
+  ) < 2
+)
+
+# Operator-controlled single-tenant VM diagnostic: Idle reserved chips per
+# physical chip (generation, node, pci_bdf) where host PID reservation persisted
+# for 15m AND operator-collected duty cycle < 2%.
 # Assumes the 15s scrape_interval from prometheus-scrape.yml (60 samples / 15m;
 # requiring >= 55 samples avoids flagging newly started workloads early. Scale
 # the threshold proportionally for other scrape intervals, e.g. >= 27 for 30s).
@@ -158,25 +176,22 @@ sum_over_time(
   and
 (
   max by (generation, node, pci_bdf) (
-    count_over_time(freetpu_tpu_duty_cycle_percent[15m])
+    count_over_time(freetpu_tpu_duty_cycle_percent{collector_role="node"}[15m])
   ) >= 55
 )
   and
 (
   max by (generation, node, pci_bdf) (
-    avg_over_time(freetpu_tpu_duty_cycle_percent[15m])
+    avg_over_time(freetpu_tpu_duty_cycle_percent{collector_role="node"}[15m])
   ) < 2
 )
 
-# Diagnostic: Duty-cycle telemetry coverage ratio per generation (0.0 - 1.0).
-# Compares PCI-mapped duty-cycle series against trusted `collector_role="node"`
-# inventory and supplies a `0` numerator for discovered generations with zero
-# PCI-mapped duty-cycle readings. Non-authoritative when scraped from tenant
-# workload sidecars (restrict to `collector_role="node"` on operator-owned hosts).
+# Operator-controlled single-tenant VM diagnostic: Duty-cycle telemetry coverage
+# ratio per generation (0.0 - 1.0) across `collector_role="node"` collectors.
 (
   (
     count by (generation) (
-      group by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent)
+      group by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent{collector_role="node"})
       and on (generation, node, pci_bdf)
       group by (generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node"})
     )
@@ -187,10 +202,9 @@ sum_over_time(
   count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node"}))
 )
 
-# Diagnostic (non-billing): Self-reported efficiency ratio — estimated cost per
-# utilized TPU-hour by generation (single-tenant / operator-controlled collectors
-# only; add `collector_role="node"` to `freetpu_tpu_duty_cycle_percent` when
-# enforcing operator-only inputs). Do NOT use tenant sidecar readings for billing.
+# Operator-controlled single-tenant VM diagnostic (non-billing): Estimated cost
+# per utilized TPU-hour by generation (`collector_role="node"` only). Do NOT use
+# tenant sidecar readings for financial chargeback.
 (
   count by (generation) (
     group by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent{collector_role="node", generation="v5e"})

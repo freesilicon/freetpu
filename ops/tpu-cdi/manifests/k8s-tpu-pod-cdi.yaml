@@ -33,6 +33,7 @@ apiVersion: resource.k8s.io/v1
 kind: ResourceClaimTemplate
 metadata:
   name: freetpu-all-claim
+  namespace: ml-workloads
 spec:
   spec:
     devices:
@@ -45,6 +46,7 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: freetpu-jax-workload
+  namespace: ml-workloads
 spec:
   restartPolicy: Never
   tolerations:

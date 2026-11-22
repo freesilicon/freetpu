@@ -1,0 +1,96 @@
+# Dedicated Diagnostic Prometheus scrape configuration for FreeTPU workload
+# telemetry sidecars (`freetpu-workload-sidecar`).
+#
+# Run this configuration on a SEPARATE diagnostic Prometheus instance isolated
+# from the trusted billing/node Prometheus (`prometheus-scrape.yml`) so tenant-
+# controlled workload pods can never compete with or disrupt billing collection.
+#
+# Matches the `ml-workloads` namespace used by the sample DRA and sidecar
+# manifests (`ops/tpu-cdi/manifests/k8s-tpu-workload-telemetry-sidecar.yaml`
+# and `ops/tpu-cdi/manifests/k8s-tpu-pod-cdi*.yaml`). Adjust `namespaces.names`
+# (or shard one job per approved namespace) to match your cluster layout, and
+# pair with a cluster NetworkPolicy restricting Prometheus egress to approved
+# TPU workload namespaces and port 9400.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "freetpu-workload-sidecar"
+    honor_labels: false
+    follow_redirects: false
+    metrics_path: /metrics
+    scrape_timeout: 10s
+    body_size_limit: 256KB
+    sample_limit: 256
+    label_limit: 20
+    label_name_length_limit: 128
+    label_value_length_limit: 256
+    kubernetes_sd_configs:
+      - role: pod
+        # Restrict discovery to operator-approved TPU workload namespace(s)
+        # matching the sample manifests (`ml-workloads`), rather than cluster-
+        # wide tenant pod discovery or pool-wide `target_limit`.
+        namespaces:
+          names:
+            - ml-workloads
+    relabel_configs:
+      - source_labels:
+          [
+            __meta_kubernetes_namespace,
+            __meta_kubernetes_pod_controller_kind,
+            __meta_kubernetes_pod_controller_name,
+          ]
+        action: drop
+        regex: "kube-system;DaemonSet;freetpu-node-agent"
+      - source_labels: [__meta_kubernetes_pod_phase]
+        action: keep
+        regex: "Running"
+      - source_labels: [__meta_kubernetes_pod_ready]
+        action: keep
+        regex: "true"
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: "true"
+      - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+        action: keep
+        regex: "freetpu-tpu-exporter"
+      - source_labels: [__meta_kubernetes_pod_label_freetpu_dev_collector_role]
+        action: keep
+        regex: "workload-sidecar"
+      - source_labels: [__meta_kubernetes_pod_container_name]
+        action: keep
+        regex: "tpu-exporter-sidecar"
+      - source_labels: [__meta_kubernetes_pod_container_port_name]
+        action: keep
+        regex: "metrics"
+      - source_labels: [__meta_kubernetes_pod_node_name]
+        target_label: node
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+      - target_label: collector_role
+        replacement: "workload-sidecar"
+    metric_relabel_configs:
+      # 1. Keep ONLY allowlisted utilization/HBM metric names.
+      - source_labels: [__name__]
+        action: keep
+        regex: "freetpu_tpu_(runtime_)?(duty_cycle_percent|hbm_used_bytes|hbm_total_bytes|hbm_utilization_ratio)"
+      # 2. Enforce strictly bounded low-cardinality value domains on all kept
+      #    tenant-supplied labels (`generation` enum + `chip`/`runtime_chip` 0..7)
+      #    and strip `pci_bdf` below so a workload target cannot rotate arbitrary
+      #    BDF strings across scrapes to cause unbounded series churn.
+      - source_labels: [generation]
+        action: keep
+        regex: "(|v2|v3|v2-v3|v4lite|v4|v5e|v5p|v6e|v6e-pf)"
+      - source_labels: [chip]
+        action: keep
+        regex: "(|[0-7])"
+      - source_labels: [runtime_chip]
+        action: keep
+        regex: "(|[0-7])"
+      # 3. Strip `pci_bdf` and any unexpected tenant-supplied labels before ingestion.
+      - action: labelkeep
+        regex: "(__name__|job|instance|node|namespace|pod|collector_role|generation|chip|runtime_chip)"

@@ -16,7 +16,11 @@
 #          -t <registry>/freetpu-tpu-exporter:tpu-info ops/tpu-exporter
 #   2. containerd >= 2.0 (CDI >= 0.6.0 + CRI `CDIDevices`), Kubernetes >= 1.34
 #      with `resource.k8s.io/v1` DRA, a cluster DRA driver for `freetpu.dev`,
-#      and `DeviceClass` / `ResourceClaimTemplate` from `k8s-tpu-pod-cdi.yaml`.
+#      the `ml-workloads` namespace (`kubectl create namespace ml-workloads`),
+#      and `DeviceClass` / `ResourceClaimTemplate` from `k8s-tpu-pod-cdi.yaml`
+#      (deployed in `ml-workloads` to match `prometheus-scrape-diagnostics.yml`;
+#      adjust `metadata.namespace` and the scrape allowlist together if using a
+#      different namespace).
 #      GKE exclusive allocation requirement: this Pod reserves TPUs through a
 #      custom FreeTPU DRA ResourceClaim rather than GKE's native `google.com/tpu`
 #      extended resource. Run it ONLY on a dedicated/tainted TPU node pool where
@@ -34,6 +38,7 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: freetpu-jax-workload-with-telemetry
+  namespace: ml-workloads
   labels:
     app.kubernetes.io/name: freetpu-tpu-exporter
     freetpu.dev/collector-role: workload-sidecar

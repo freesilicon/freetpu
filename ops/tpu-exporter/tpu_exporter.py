@@ -22,6 +22,7 @@ import argparse
 from dataclasses import asdict, dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib
+import importlib.util
 import inspect
 import json
 import os
@@ -522,62 +523,51 @@ def _run_tpu_info(
     return True, None, parsed
 
 
-def _query_tpu_info_python_metrics(
-    devices: Sequence[TpuTelemetry],
-    addr: Optional[str] = "127.0.0.1:8431",
+_PY_METRICS_SUBPROCESS_HELPER = (
+    "import inspect, json, sys, tpu_info.device as d, tpu_info.metrics as m\n"
+    "chip_attr, addr, timeout_s = sys.argv[1], sys.argv[2], float(sys.argv[3])\n"
+    "chip = getattr(d.TpuChip, chip_attr)\n"
+    "sig = inspect.signature(m.get_chip_usage)\n"
+    "kw = {}\n"
+    "if 'addr' in sig.parameters:\n"
+    "    kw['addr'] = addr\n"
+    "if 'timeout' in sig.parameters:\n"
+    "    kw['timeout'] = timeout_s\n"
+    "rows = m.get_chip_usage(chip, **kw)\n"
+    "out = [\n"
+    "    {\n"
+    "        'device_id': getattr(r, 'device_id', None),\n"
+    "        'memory_usage': getattr(r, 'memory_usage', None),\n"
+    "        'total_memory': getattr(r, 'total_memory', None),\n"
+    "        'duty_cycle_pct': getattr(r, 'duty_cycle_pct', None),\n"
+    "    }\n"
+    "    for r in (rows or [])\n"
+    "]\n"
+    "sys.stdout.write(json.dumps(out))\n"
+)
+
+
+def _parse_python_usage_entries(
+    entries: Iterable[Any],
+    addr: str,
 ) -> Tuple[bool, Optional[str], Dict[str, _TpuInfoRow]]:
-    """Query `libtpu` runtime HBM & duty-cycle metrics via `tpu_info.metrics` over loopback gRPC.
-
-    Decouples live utilization collection from `/proc/*/fd/*` PID scanning and
-    `/dev/vfio/*` access so Kubernetes sidecars can run without
-    `shareProcessNamespace`, `SYS_PTRACE`, or cross-AppArmor-profile `/proc` reads.
-    """
-    if not addr:
-        return False, "runtime metrics gRPC address disabled", {}
-
-    try:
-        tpu_device_mod = importlib.import_module("tpu_info.device")
-        tpu_metrics_mod = importlib.import_module("tpu_info.metrics")
-    except Exception as exc:  # noqa: BLE001
-        return False, f"tpu_info python API unavailable: {exc}", {}
-
-    get_chip_usage = getattr(tpu_metrics_mod, "get_chip_usage", None)
-    tpu_chip_enum = getattr(tpu_device_mod, "TpuChip", None)
-    if not callable(get_chip_usage) or tpu_chip_enum is None:
-        return False, "tpu_info.metrics.get_chip_usage unavailable", {}
-
-    chip_type = None
-    for dev in devices:
-        attr = _GEN_TO_TPU_CHIP_ATTR.get(dev.generation)
-        if attr and hasattr(tpu_chip_enum, attr):
-            chip_type = getattr(tpu_chip_enum, attr)
-            break
-    if chip_type is None:
-        return False, "unable to map discovered TPU generation to tpu_info.device.TpuChip", {}
-
-    try:
-        sig = inspect.signature(get_chip_usage)
-        if "addr" in sig.parameters:
-            usage_list = get_chip_usage(chip_type, addr=addr)
-        else:
-            usage_list = get_chip_usage(chip_type)
-    except Exception as exc:  # noqa: BLE001
-        return False, f"tpu_info.metrics query failed ({addr}): {exc}", {}
-
-    if not usage_list:
-        return False, f"tpu_info.metrics returned no runtime usage rows from {addr}", {}
-
     rows: Dict[str, _TpuInfoRow] = {}
-    for item in usage_list:
-        dev_id = getattr(item, "device_id", None)
+    for item in entries:
+        if isinstance(item, dict):
+            dev_id = item.get("device_id")
+            mem_used = item.get("memory_usage")
+            mem_total = item.get("total_memory")
+            duty = item.get("duty_cycle_pct")
+        else:
+            dev_id = getattr(item, "device_id", None)
+            mem_used = getattr(item, "memory_usage", None)
+            mem_total = getattr(item, "total_memory", None)
+            duty = getattr(item, "duty_cycle_pct", None)
         if dev_id is None:
             continue
         key = str(dev_id)
         row = rows.setdefault(key, _TpuInfoRow(chip_key=key))
         row.in_util_table = True
-        mem_used = getattr(item, "memory_usage", None)
-        mem_total = getattr(item, "total_memory", None)
-        duty = getattr(item, "duty_cycle_pct", None)
         if isinstance(mem_used, (int, float)) and not isinstance(mem_used, bool) and mem_used >= 0:
             row.hbm_used_bytes = int(mem_used)
         if isinstance(mem_total, (int, float)) and not isinstance(mem_total, bool) and mem_total > 0:
@@ -588,6 +578,107 @@ def _query_tpu_info_python_metrics(
     if not rows:
         return False, f"tpu_info.metrics returned no parseable chip entries from {addr}", {}
     return True, None, rows
+
+
+def _query_tpu_info_python_metrics(
+    devices: Sequence[TpuTelemetry],
+    addr: Optional[str] = "127.0.0.1:8431",
+    timeout_s: float = 5.0,
+) -> Tuple[bool, Optional[str], Dict[str, _TpuInfoRow]]:
+    """Query `libtpu` runtime HBM & duty-cycle metrics via `tpu_info.metrics` with a hard deadline.
+
+    Decouples live utilization collection from `/proc/*/fd/*` PID scanning and
+    `/dev/vfio/*` access so Kubernetes sidecars can run without
+    `shareProcessNamespace`, `SYS_PTRACE`, or cross-AppArmor-profile `/proc` reads.
+    Runs real installed `tpu_info` queries in a deadline-bounded subprocess so an
+    unresponsive `libtpu` gRPC server (upstream client sets no RPC deadline) is
+    terminated cleanly and never holds `_ExporterServer._scrape_lock` indefinitely.
+    """
+    if not addr:
+        return False, "runtime metrics gRPC address disabled", {}
+
+    deadline_s = max(0.05, float(timeout_s))
+    chip_attr = None
+    for dev in devices:
+        candidate = _GEN_TO_TPU_CHIP_ATTR.get(dev.generation)
+        if candidate:
+            chip_attr = candidate
+            break
+    if chip_attr is None:
+        return False, "unable to map discovered TPU generation to tpu_info.device.TpuChip", {}
+
+    # Support in-memory mocked `tpu_info.metrics` modules in unit tests with a
+    # bounded worker thread; for real installed packages, execute in an isolated
+    # subprocess with a hard OS timeout so hung RPCs cannot leak threads or locks.
+    cached_metrics_mod = sys.modules.get("tpu_info.metrics")
+    if cached_metrics_mod is not None and not getattr(cached_metrics_mod, "__file__", None):
+        tpu_device_mod = sys.modules.get("tpu_info.device")
+        get_chip_usage = getattr(cached_metrics_mod, "get_chip_usage", None)
+        tpu_chip_enum = getattr(tpu_device_mod, "TpuChip", None) if tpu_device_mod is not None else None
+        if not callable(get_chip_usage) or tpu_chip_enum is None or not hasattr(tpu_chip_enum, chip_attr):
+            return False, "tpu_info.metrics.get_chip_usage unavailable", {}
+        chip_type = getattr(tpu_chip_enum, chip_attr)
+
+        box: Dict[str, Any] = {}
+        done_ev = threading.Event()
+
+        def _worker() -> None:
+            try:
+                sig = inspect.signature(get_chip_usage)
+                kw: Dict[str, Any] = {}
+                if "addr" in sig.parameters:
+                    kw["addr"] = addr
+                if "timeout" in sig.parameters:
+                    kw["timeout"] = deadline_s
+                box["rows"] = get_chip_usage(chip_type, **kw)
+            except Exception as exc:  # noqa: BLE001
+                box["error"] = exc
+            finally:
+                done_ev.set()
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        if not done_ev.wait(timeout=deadline_s):
+            return False, f"tpu_info.metrics query timed out after {deadline_s}s ({addr})", {}
+        if "error" in box:
+            return False, f"tpu_info.metrics query failed ({addr}): {box['error']}", {}
+        usage_list = box.get("rows")
+        if not usage_list:
+            return False, f"tpu_info.metrics returned no runtime usage rows from {addr}", {}
+        return _parse_python_usage_entries(usage_list, addr)
+
+    try:
+        if importlib.util.find_spec("tpu_info") is None:
+            return False, "tpu_info python API unavailable: No module named 'tpu_info'", {}
+    except Exception as exc:  # noqa: BLE001
+        return False, f"tpu_info python API unavailable: {exc}", {}
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _PY_METRICS_SUBPROCESS_HELPER, chip_attr, addr, str(deadline_s)],
+            capture_output=True,
+            text=True,
+            timeout=deadline_s,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"tpu_info.metrics query timed out after {deadline_s}s ({addr})", {}
+    except OSError as exc:
+        return False, f"tpu_info.metrics subprocess failed ({addr}): {exc}", {}
+
+    if proc.returncode != 0:
+        err_lines = (proc.stderr or proc.stdout or "").strip().splitlines()
+        err_msg = err_lines[-1] if err_lines else f"exit {proc.returncode}"
+        return False, f"tpu_info.metrics query failed ({addr}): {err_msg}", {}
+
+    try:
+        parsed_json = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        return False, f"tpu_info.metrics returned invalid JSON ({addr}): {exc}", {}
+
+    if not isinstance(parsed_json, list) or not parsed_json:
+        return False, f"tpu_info.metrics returned no runtime usage rows from {addr}", {}
+    return _parse_python_usage_entries(parsed_json, addr)
 
 
 def _resolve_tpu_device_spec(device_id: str, subsystem_device: str) -> Tuple[str, str, int]:
@@ -813,21 +904,15 @@ def collect_snapshot(
         )
 
     if skip_pid_scan:
-        # Sidecar mode: query `tpu_info.metrics` directly over loopback gRPC first
-        # so cross-AppArmor-profile `/proc` errors never break live HBM/duty-cycle metrics.
+        # Sidecar / no-PID mode: query `tpu_info.metrics` directly over loopback
+        # gRPC with a hard deadline ONLY. Never fall back to the `tpu-info` CLI
+        # subprocess because it enumerates `/proc/*/fd/*` and can trigger
+        # cross-profile AppArmor permission errors.
         tpu_info_ok, tpu_info_err, parsed_rows = _query_tpu_info_python_metrics(
             devices,
             addr=runtime_metrics_addr,
+            timeout_s=tpu_info_timeout_s,
         )
-        if not tpu_info_ok and tpu_info_bin:
-            cli_ok, cli_err, cli_rows = _run_tpu_info(
-                tpu_info_bin=tpu_info_bin,
-                timeout_s=tpu_info_timeout_s,
-            )
-            if cli_ok:
-                tpu_info_ok, tpu_info_err, parsed_rows = cli_ok, cli_err, cli_rows
-            elif cli_err and tpu_info_err and "python API unavailable" in tpu_info_err:
-                tpu_info_err = cli_err
     else:
         tpu_info_ok, tpu_info_err, parsed_rows = _run_tpu_info(
             tpu_info_bin=tpu_info_bin,
@@ -835,11 +920,13 @@ def collect_snapshot(
         )
         # If `tpu-info` CLI failed (for example due to cross-profile `/proc` EACCES
         # under containerd AppArmor), fall back to direct `tpu_info.metrics` gRPC
-        # queries over loopback so live HBM/duty-cycle telemetry is still collected.
+        # queries over loopback with a hard deadline so live HBM/duty-cycle
+        # telemetry is still collected.
         if not tpu_info_ok and tpu_info_bin and runtime_metrics_addr:
             py_ok, _py_err, py_rows = _query_tpu_info_python_metrics(
                 devices,
                 addr=runtime_metrics_addr,
+                timeout_s=tpu_info_timeout_s,
             )
             if py_ok:
                 tpu_info_ok, tpu_info_err, parsed_rows = True, None, py_rows
