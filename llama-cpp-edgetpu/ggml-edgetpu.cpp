@@ -2642,23 +2642,11 @@ static bool ggml_backend_edgetpu_device_supports_op(ggml_backend_dev_t dev, cons
             if (!b0_ok || !b1_ok) {
                 return false;
             }
-            // When whole-block SwiGLU chaining is enabled and both gate & up are fusible Q8_0/Q4_0 MUL_MATs
-            // sharing the same input (H % 32 == 0), accept ANY M (including pp128/pp512) so gate+up+GLU+down
-            // stay in one EDGETPU split for ob_gemm_swiglu_f32_quant.
-            const bool swiglu_chainable =
-                g_hot_env.fuse_swiglu.load(std::memory_order_relaxed) &&
-                !g_hot_env.packed_q8.load(std::memory_order_relaxed) &&
-                is_fusible_swiglu_mul_mat(b0) &&
-                is_fusible_swiglu_mul_mat(b1) &&
-                view_preserves_2d_identity(src0, b0) &&
-                view_preserves_2d_identity(src1, b1) &&
-                unwrap_view_src(b0->src[1]) == unwrap_view_src(b1->src[1]) &&
-                (b0->ne[0] % QK8_0) == 0;
-            if (!swiglu_chainable) {
-                const int64_t glu_max_m = g_hot_env.glu_max_m.load(std::memory_order_relaxed);
-                if (glu_max_m <= 0 || ggml_nrows(op) > glu_max_m) {
-                    return false;
-                }
+            // Enforce OPENBUENOS_EDGETPU_GLU_MAX_M unconditionally during op support checks
+            // (supports_op cannot observe downstream down-projection format to guarantee whole-block fusion).
+            const int64_t glu_max_m = g_hot_env.glu_max_m.load(std::memory_order_relaxed);
+            if (glu_max_m <= 0 || ggml_nrows(op) > glu_max_m) {
+                return false;
             }
             return true;
         }

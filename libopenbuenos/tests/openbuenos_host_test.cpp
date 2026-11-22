@@ -2347,6 +2347,28 @@ void test_quant_batch_q4_0_dvfs_and_fd_caps() {
   TempBinaryFile interp_file;
   CHECK(interp_file.write(synth_interp.data(), synth_interp.size()));
   // 1. DVFS power profiles & Litebuf FW WakeLock state machine
+  struct ScopedEnvRestore {
+    const char* name;
+    bool had_val = false;
+    std::string old_val;
+    explicit ScopedEnvRestore(const char* n) : name(n) {
+      if (const char* v = std::getenv(n)) {
+        had_val = true;
+        old_val = v;
+      }
+      ::unsetenv(n);
+    }
+    ~ScopedEnvRestore() {
+      if (had_val) {
+        ::setenv(name, old_val.c_str(), 1);
+      } else {
+        ::unsetenv(name);
+      }
+    }
+  };
+  ScopedEnvRestore guard_horiz("OPENBUENOS_DISABLE_HORIZ_FUSION");
+  ScopedEnvRestore guard_lt("OPENBUENOS_DISABLE_LARGE_TILES");
+  ScopedEnvRestore guard_blt("OPENBUENOS_DISABLE_BATCHED_LARGE_TILES");
   ::unsetenv("OPENBUENOS_PERF_MODE");
   ::unsetenv("OPENBUENOS_WAKELOCK");
   ::unsetenv("OPENBUENOS_FW_PRIORITY");
@@ -4605,6 +4627,26 @@ void test_phase7_cycle3_regressions() {
 }  // namespace
 
 int main() {
+  // Isolate host tests from caller runtime feature toggles (preserve OPENBUENOS_CORPUS_DIR).
+  static constexpr const char* kIsolatedEnvVars[] = {
+      "OPENBUENOS_DISABLE_LARGE_TILES",
+      "OPENBUENOS_DISABLE_BATCHED_LARGE_TILES",
+      "OPENBUENOS_DISABLE_HORIZ_FUSION",
+      "OPENBUENOS_DISABLE_SWIGLU_CHAIN",
+      "OPENBUENOS_SWIGLU_FAST_CHAIN",
+      "OPENBUENOS_SWIGLU_PREFILL",
+      "OPENBUENOS_SWIGLU_EXACT_CLIP_CHECK",
+      "OPENBUENOS_SWIGLU_MAX_CREST",
+      "OPENBUENOS_STRICT_WEIGHT_HASH",
+      "OPENBUENOS_WEIGHT_CACHE_MB",
+      "OPENBUENOS_PARAM_SWAP_SLOTS",
+      "OPENBUENOS_SPIN_US",
+      "OPENBUENOS_PROFILE",
+      "OPENBUENOS_VERBOSE",
+  };
+  for (const char* name : kIsolatedEnvVars) {
+    ::unsetenv(name);
+  }
   test_buffer_pool();
   test_dgc0_parser();
   test_graph_cache();
