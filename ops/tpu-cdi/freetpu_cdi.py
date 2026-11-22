@@ -129,9 +129,11 @@ def _make_device_node(
     # live char device numbers in `freetpu.dev/vfio-devnums` annotations.
     # Note: CDI v0.8.0 (containerd 2.0) resolves omitted major/minor on first
     # injection and caches them in memory until the spec file changes or is
-    # removed; run `freetpu_cdi.py sync` continuously or explicitly invalidate
-    # and regenerate the spec on any VFIO/PCI unbind, rebind, or topology change
-    # (or use a CDI runtime that resolves hostPath on every injection).
+    # removed, and refreshing a spec does not revoke device nodes already
+    # injected into running containers. Before any PCI/VFIO unbind or rebind
+    # (even on hosts running `sync`), operators MUST first stop affected
+    # consumers and withdraw/remove the CDI spec entries, then regenerate or
+    # resume `sync` after rebinding completes.
     return {
         "path": container_path,
         "hostPath": str(host_path),
@@ -1013,7 +1015,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "generate",
         help=(
             "Write a point-in-time boot/topology CNCF CDI v0.6.0 JSON snapshot "
-            "(invalidate & regenerate on any VFIO/PCI rebind or topology change, or use `sync`)."
+            "(before any VFIO/PCI unbind or rebind, stop affected consumers and "
+            "remove the CDI spec first, then regenerate after rebind)."
         ),
     )
     gen.add_argument(
@@ -1089,7 +1092,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     sync = sub.add_parser(
         "sync",
-        help="Continuously reconcile a boot-scoped CDI spec against live VFIO topology, removing stale specs on drift/error.",
+        help=(
+            "Continuously reconcile a boot-scoped CDI spec against live VFIO topology, "
+            "removing stale specs on drift/error (note: before any intentional VFIO/PCI "
+            "unbind or rebind, stop affected consumers and withdraw/remove the CDI spec "
+            "first because polling leaves a stale-minor window and does not revoke "
+            "already-injected container devices)."
+        ),
     )
     sync.add_argument(
         "--output",

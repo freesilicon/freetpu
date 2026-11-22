@@ -12,6 +12,11 @@
 #      on VFIO-backed Cloud TPU nodes (v5e, v5p, v6e).
 #   3. A cluster DRA kubelet/controller driver registered for `freetpu.dev` publishing
 #      ResourceSlices and injecting `freetpu.dev/tpu=...` CDI IDs in NodePrepareResources.
+#   4. GKE exclusive TPU allocation: on GKE, run FreeTPU DRA claims ONLY on a
+#      dedicated/tainted TPU node pool where `google.com/tpu` scheduling is
+#      unused/disabled, OR use a DRA driver that coordinates exclusive chip
+#      ownership with GKE's native `google.com/tpu` allocator to prevent
+#      concurrent double-allocation of the same VFIO group.
 ---
 apiVersion: resource.k8s.io/v1beta1
 kind: DeviceClass

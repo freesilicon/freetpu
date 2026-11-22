@@ -51,14 +51,25 @@ scrape_configs:
       - target_label: collector_role
         replacement: "node"
 
-  # 2. Workload telemetry sidecars (live `tpu-info` HBM & MXU duty-cycle metrics).
+  # 2. Workload telemetry sidecars (diagnostic-only live `tpu-info` HBM & MXU
+  # duty-cycle metrics).
   # Hard-sets `collector_role="workload-sidecar"` and allowlists ONLY runtime
   # utilization/HBM metrics via `metric_relabel_configs` so tenant pods cannot
   # submit fabricated billing inventory (`freetpu_tpu_info`), health
   # (`freetpu_tpu_health_status`), or host PID (`freetpu_tpu_active_pids`) series.
+  # Enforces strict scrape size, sample, label, and target limits (an 8-chip host
+  # emits <= 64 allowed series) so an untrusted tenant sidecar cannot exhaust
+  # memory or storage on the shared Prometheus server.
   - job_name: "freetpu-workload-sidecar"
     honor_labels: false
     metrics_path: /metrics
+    scrape_timeout: 10s
+    body_size_limit: 256KB
+    sample_limit: 256
+    target_limit: 256
+    label_limit: 20
+    label_name_length_limit: 128
+    label_value_length_limit: 256
     kubernetes_sd_configs:
       - role: pod
     relabel_configs:

@@ -17,6 +17,12 @@
 #   2. containerd >= 2.0 (CDI >= 0.6.0 + CRI `CDIDevices`), Kubernetes >= 1.34
 #      with `resource.k8s.io/v1` DRA, a cluster DRA driver for `freetpu.dev`,
 #      and `DeviceClass` / `ResourceClaimTemplate` from `k8s-tpu-pod-cdi.yaml`.
+#      GKE exclusive allocation requirement: this Pod reserves TPUs through a
+#      custom FreeTPU DRA ResourceClaim rather than GKE's native `google.com/tpu`
+#      extended resource. Run it ONLY on a dedicated/tainted TPU node pool where
+#      `google.com/tpu` scheduling is unused/disabled, OR with a DRA driver that
+#      coordinates exclusive chip ownership with GKE's native allocator (otherwise
+#      both allocators can hand out the same VFIO group concurrently).
 #   3. Replace `<registry>/freetpu-tpu-exporter:tpu-info` and the workload image
 #      with your JAX or PyTorch/XLA TPU container image.
 #   4. Note: `tpu-info` exposes `freetpu_tpu_runtime_hbm_used_bytes` and
@@ -115,6 +121,9 @@ spec:
           add:
             - IPC_LOCK
       resources:
+        # Requires exclusive TPU ownership on GKE (dedicated/tainted node pool
+        # without `google.com/tpu` workloads, or a DRA driver coordinated with
+        # GKE's native `google.com/tpu` allocator) to prevent double-allocation.
         claims:
           - name: tpu
         requests:

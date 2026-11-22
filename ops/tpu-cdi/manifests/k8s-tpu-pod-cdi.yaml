@@ -10,6 +10,11 @@
 #      driver `freetpu.dev` that publishes ResourceSlices and injects
 #      `freetpu.dev/tpu=...` CDI IDs in NodePrepareResources (`freetpu-cdi` alone writes
 #      containerd specs only).
+#   3. GKE exclusive TPU allocation: on GKE, run FreeTPU DRA claims ONLY on a
+#      dedicated/tainted TPU node pool where `google.com/tpu` scheduling is
+#      unused/disabled, OR use a DRA driver that coordinates exclusive chip
+#      ownership with GKE's native `google.com/tpu` allocator to prevent
+#      concurrent double-allocation of the same VFIO group.
 #   For older Kubernetes 1.32-1.33 clusters serving only `resource.k8s.io/v1beta1`
 #   (requires `--runtime-config=resource.k8s.io/v1beta1=true` and
 #   `DynamicResourceAllocation=true`), use `k8s-tpu-pod-cdi-v1beta1.yaml`.
