@@ -112,16 +112,26 @@ Use this workflow with `google-colab-cli >= 0.7.6` (redacted logs) to run Pallas
        --out-dir "$WORK_DIR/proof" \
        --script skills/freetpu/templates/tile_fused_gemm_silu.py
      ```
-   - Direct CLI pattern (do **not** assume default `colab run` teardown succeeded: if unassign fails, `colab run` suppresses the error, removes the local session record, and still prints `Session terminated.` while leaving the TPU billing CUs. Instead, insulate `colab new` from `INT`/`TERM` so an in-flight allocation always persists `$SESSION_ID` to `$COLAB_STATE` before honouring cancellation, then run the script with `colab upload` + `colab exec` and release by name via `colab stop` with ADC-propagating `colab usage` + `colab sessions` verification):
+   - Direct CLI pattern (do **not** assume default `colab run` teardown succeeded: if unassign fails, `colab run` suppresses the error, removes the local session record, and still prints `Session terminated.` while leaving the TPU billing CUs. Instead, build a local launcher in `$WORK_DIR`, insulate `colab new` from `INT`/`TERM` so an in-flight allocation always persists `$SESSION_ID` to `$COLAB_STATE` before honouring cancellation, execute the standalone template via `colab exec --file` under a local wall-clock watchdog (avoiding `colab upload`'s unbounded HTTP wait and tokenized URL errors), require a post-run `__FREETPU_EXEC_OK__` marker, and release by name via `colab stop` with ADC-propagating `colab usage` + `colab sessions` verification):
      ```bash
      (
        SESSION_ID="freetpu-probe-$(date +%Y%m%d-%H%M%S)-$$"
        RUN_RC=0
        ALLOC_PID=""
        RUN_PID=""
+       WD_PID=""
        ENDPOINT=""
        CANCELLED=0
        CLEANED=0
+
+       # Build a local launcher before allocating any TPU so `colab exec --file` runs the template
+       # with clean sys.argv and a completion marker (no `colab upload` needed):
+       LAUNCHER="$WORK_DIR/$SESSION_ID.launch.py"
+       {
+         printf 'import sys\nsys.argv = ["tile_swiglu.py"]\n'
+         cat skills/freetpu/templates/tile_swiglu.py
+         printf '\nprint("__FREETPU_EXEC_OK__")\n'
+       } > "$LAUNCHER"
 
        # Snapshot pre-existing server-side endpoints as defense-in-depth against unnamed `[?]` leaks:
        BASE_SESS="$(colab --auth=adc --config "$COLAB_STATE" sessions 2>/dev/null)" || BASE_SESS=""
@@ -131,6 +141,10 @@ Use this workflow with `google-colab-cli >= 0.7.6` (redacted logs) to run Pallas
          [ "$CLEANED" -eq 1 ] && return
          CLEANED=1
          trap - EXIT INT TERM
+
+         [ -n "$WD_PID" ] && kill "$WD_PID" 2>/dev/null || true
+         [ -n "$WD_PID" ] && wait "$WD_PID" 2>/dev/null || true
+         WD_PID=""
 
          # If cancelled mid-allocation, let `colab new` finish persisting $SESSION_ID so `colab stop` can release it by name:
          [ -n "$ALLOC_PID" ] && wait "$ALLOC_PID" 2>/dev/null || true
@@ -182,6 +196,7 @@ Use this workflow with `google-colab-cli >= 0.7.6` (redacted logs) to run Pallas
          CANCELLED=1
          RUN_RC="$1"
          # Do not kill $ALLOC_PID during allocation; cleanup waits for $SESSION_ID to persist, then stops it by name.
+         [ -n "$WD_PID" ] && kill "$WD_PID" 2>/dev/null || true
          [ -n "$RUN_PID" ] && kill -TERM "$RUN_PID" 2>/dev/null || true
          [ -n "$RUN_PID" ] && wait "$RUN_PID" 2>/dev/null || true
          cleanup
@@ -197,21 +212,21 @@ Use this workflow with `google-colab-cli >= 0.7.6` (redacted logs) to run Pallas
        ALLOC_PID=""
 
        if [ "$RUN_RC" -eq 0 ] && [ "$CANCELLED" -eq 0 ]; then
-         colab --auth=adc --config "$COLAB_STATE" upload \
-           -s "$SESSION_ID" skills/freetpu/templates/tile_swiglu.py /content/tile_swiglu.py &
-         RUN_PID=$!
-         wait "$RUN_PID" || RUN_RC=$?
-         RUN_PID=""
-       fi
-       if [ "$RUN_RC" -eq 0 ] && [ "$CANCELLED" -eq 0 ]; then
          EXEC_LOG="$WORK_DIR/$SESSION_ID.exec.log"
-         colab --auth=adc --config "$COLAB_STATE" exec -s "$SESSION_ID" --timeout 300 \
-           <<< 'import runpy, sys; sys.argv = ["/content/tile_swiglu.py"]; runpy.run_path("/content/tile_swiglu.py", run_name="__main__"); print("__FREETPU_EXEC_OK__")' \
+         colab --auth=adc --config "$COLAB_STATE" exec \
+           -s "$SESSION_ID" --timeout 300 --file "$LAUNCHER" \
            >"$EXEC_LOG" 2>&1 &
          RUN_PID=$!
+         # Local wall-clock deadline so even a stalled kernel init routes through cleanup:
+         python3 -c 'import os, signal, sys, time; time.sleep(float(sys.argv[1])); os.kill(int(sys.argv[2]), signal.SIGTERM)' \
+           "${EXEC_DEADLINE_SECS:-360}" "$RUN_PID" >/dev/null 2>&1 &
+         WD_PID=$!
          wait "$RUN_PID" || RUN_RC=$?
          RUN_PID=""
-         cat "$EXEC_LOG"
+         kill "$WD_PID" 2>/dev/null || true
+         wait "$WD_PID" 2>/dev/null || true
+         WD_PID=""
+         sed -E 's/([?&][^=&]*[Tt][Oo][Kk][Ee][Nn]=)[^&[:space:]]+/\1[REDACTED]/g' "$EXEC_LOG"
          if [ "$RUN_RC" -eq 0 ] && ! grep -Fxq "__FREETPU_EXEC_OK__" "$EXEC_LOG"; then
            echo "ERROR: remote TPU benchmark did not emit completion marker __FREETPU_EXEC_OK__." >&2
            RUN_RC=1
