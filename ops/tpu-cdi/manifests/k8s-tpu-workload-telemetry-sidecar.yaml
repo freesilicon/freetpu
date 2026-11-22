@@ -43,9 +43,12 @@ metadata:
     prometheus.io/path: "/metrics"
 spec:
   restartPolicy: Never
-  # Share PID namespace between workload and sidecar so /proc/<pid>/fd and
-  # tpu-info PID correlation work cleanly within the Pod.
-  shareProcessNamespace: true
+  # Share ONLY the Pod network namespace (`127.0.0.1:8431`), NOT the PID
+  # namespace (`shareProcessNamespace: false` by default). The sidecar runs
+  # with `--no-pid-scan`, zero capabilities (`drop: [ALL]`), and no `/dev/vfio`
+  # mount so containerd's default AppArmor profile never blocks runtime HBM or
+  # duty-cycle telemetry via cross-profile `/proc/<pid>/fd` reads. Host PID
+  # tracking remains isolated in the node-level `freetpu-node-agent` DaemonSet.
   tolerations:
     - key: google.com/tpu
       operator: Exists
@@ -63,10 +66,14 @@ spec:
         - 127.0.0.1
         - --health-port
         - "9401"
+        - --no-pid-scan
+        - --runtime-metrics-addr
+        - 127.0.0.1:8431
       securityContext:
+        allowPrivilegeEscalation: false
         capabilities:
-          add:
-            - SYS_PTRACE
+          drop:
+            - ALL
       ports:
         - name: metrics
           containerPort: 9400
@@ -97,17 +104,15 @@ spec:
           cpu: 200m
           memory: 256Mi
       volumeMounts:
-        # Mount only the narrow sysfs subpaths needed for PCI discovery (never
-        # whole-host /sys) so containerd's read-only /sys/fs/cgroup mount is
-        # never covered by the host's writable cgroup submount.
+        # Mount only the narrow sysfs subpaths needed for PCI generation
+        # discovery (never whole-host `/sys` and never `/dev/vfio`) so
+        # containerd's read-only `/sys/fs/cgroup` mount is never shadowed and
+        # the sidecar has zero VFIO device visibility.
         - name: sysfs-bus-pci
           mountPath: /sys/bus/pci
           readOnly: true
         - name: sysfs-devices
           mountPath: /sys/devices
-          readOnly: true
-        - name: dev-vfio
-          mountPath: /dev/vfio
           readOnly: true
   containers:
     - name: jax-tpu
@@ -144,7 +149,3 @@ spec:
       hostPath:
         path: /sys/devices
         type: Directory
-    - name: dev-vfio
-      hostPath:
-        path: /dev/vfio
-        type: DirectoryOrCreate

@@ -275,10 +275,14 @@ TPU Device Status
             )
 
             # Synthetic /proc/9001/fd/3 and /proc/7777/fd/3 -> <dev_root>/vfio/0 (char device 242:0)
+            # with real open flags (O_RDWR|O_CLOEXEC = 02000002, non-O_PATH).
             for pid_str in ("7777", "9001"):
                 fd_dir = proc_root / pid_str / "fd"
+                fdinfo_dir = proc_root / pid_str / "fdinfo"
                 fd_dir.mkdir(parents=True, exist_ok=True)
+                fdinfo_dir.mkdir(parents=True, exist_ok=True)
                 os.symlink(str(dev_root / "vfio" / "0"), fd_dir / "3")
+                (fdinfo_dir / "3").write_text("pos:\t0\nflags:\t02000002\n", encoding="utf-8")
 
             # Google v6e-style output: VFIO groups 0 & 2, runtime IDs 8 & 12 (unmapped)
             # plus TensorCore table that must not leak into duty cycle.
@@ -860,21 +864,51 @@ TPU Device Status
             decoy_reg.parent.mkdir(parents=True, exist_ok=True)
             decoy_reg.write_text("not a vfio device", encoding="utf-8")
             (proc_root / "5001" / "fd").mkdir(parents=True, exist_ok=True)
+            (proc_root / "5001" / "fdinfo").mkdir(parents=True, exist_ok=True)
             os.symlink(str(decoy_reg), proc_root / "5001" / "fd" / "3")
+            (proc_root / "5001" / "fdinfo" / "3").write_text("pos:\t0\nflags:\t02000002\n", encoding="utf-8")
 
             # PID 5002: bind-mounted char device under a completely different path (/custom/tpu0)
-            # with the SAME st_rdev (242:12) as host /dev/vfio/12 -> MUST match!
+            # with the SAME st_rdev (242:12) as host /dev/vfio/12 and real open flags -> MUST match!
             bind_mounted = root / "custom" / "tpu0"
             bind_mounted.parent.mkdir(parents=True, exist_ok=True)
             bind_mounted.write_text("", encoding="utf-8")
             (proc_root / "5002" / "fd").mkdir(parents=True, exist_ok=True)
+            (proc_root / "5002" / "fdinfo").mkdir(parents=True, exist_ok=True)
             os.symlink(str(bind_mounted), proc_root / "5002" / "fd" / "4")
+            (proc_root / "5002" / "fdinfo" / "4").write_text("pos:\t0\nflags:\t02000002\n", encoding="utf-8")
 
             # PID 5003: different char device (242:99) -> MUST NOT match.
             other_char = root / "dev" / "vfio" / "99"
             other_char.write_text("", encoding="utf-8")
             (proc_root / "5003" / "fd").mkdir(parents=True, exist_ok=True)
+            (proc_root / "5003" / "fdinfo").mkdir(parents=True, exist_ok=True)
             os.symlink(str(other_char), proc_root / "5003" / "fd" / "5")
+            (proc_root / "5003" / "fdinfo" / "5").write_text("pos:\t0\nflags:\t02000002\n", encoding="utf-8")
+
+            # PID 5004: path-only O_PATH descriptor (010000000) to host /dev/vfio/12 -> MUST NOT match!
+            (proc_root / "5004" / "fd").mkdir(parents=True, exist_ok=True)
+            (proc_root / "5004" / "fdinfo").mkdir(parents=True, exist_ok=True)
+            os.symlink(str(host_vfio12), proc_root / "5004" / "fd" / "3")
+            (proc_root / "5004" / "fdinfo" / "3").write_text(
+                "pos:\t0\nflags:\t010000000\n", encoding="utf-8"
+            )
+
+            # PID 5005: missing fdinfo for matching char device -> fail closed, MUST NOT match!
+            (proc_root / "5005" / "fd").mkdir(parents=True, exist_ok=True)
+            os.symlink(str(host_vfio12), proc_root / "5005" / "fd" / "3")
+
+            # PID 5006: holds BOTH an O_PATH fd (3) AND a real open fd (4) -> MUST match!
+            (proc_root / "5006" / "fd").mkdir(parents=True, exist_ok=True)
+            (proc_root / "5006" / "fdinfo").mkdir(parents=True, exist_ok=True)
+            os.symlink(str(host_vfio12), proc_root / "5006" / "fd" / "3")
+            (proc_root / "5006" / "fdinfo" / "3").write_text(
+                "pos:\t0\nflags:\t010000000\n", encoding="utf-8"
+            )
+            os.symlink(str(host_vfio12), proc_root / "5006" / "fd" / "4")
+            (proc_root / "5006" / "fdinfo" / "4").write_text(
+                "pos:\t0\nflags:\t02000002\n", encoding="utf-8"
+            )
 
             orig_os_stat = os.stat
             st12 = orig_os_stat(host_vfio12)
@@ -907,18 +941,18 @@ TPU Device Status
                 )
 
             self.assertTrue(snap.pid_telemetry_available)
-            self.assertEqual(snap.devices[0].active_pids, [5002])
+            self.assertEqual(snap.devices[0].active_pids, [5002, 5006])
 
-            # Even when tpu-info reports decoy PID 5001 (pathname match on regular file)
-            # alongside real holder 5002, decoy PID 5001 must NOT be merged into active_pids.
+            # Even when tpu-info reports decoy PID 5001, O_PATH PID 5004, and missing-fdinfo
+            # PID 5005 alongside real holders 5002/5006, only active non-O_PATH opens count.
             mock_cli = root / "mock-tpu-info-decoy.sh"
             mock_cli.write_text(
                 "#!/bin/sh\n"
                 "cat <<'EOF'\n"
                 "TPU Chips\n"
-                "| Chip         | Type         | Devices | PID        |\n"
-                "|--------------|--------------|---------|------------|\n"
-                "| /dev/vfio/12 | TPU v5e chip | 1       | 5001, 5002 |\n"
+                "| Chip         | Type         | Devices | PID                    |\n"
+                "|--------------|--------------|---------|------------------------|\n"
+                "| /dev/vfio/12 | TPU v5e chip | 1       | 5001, 5002, 5004, 5005 |\n"
                 "EOF\n",
                 encoding="utf-8",
             )
@@ -931,7 +965,7 @@ TPU Device Status
                     tpu_info_bin=str(mock_cli),
                 )
             self.assertTrue(snap_cli.tpu_info_available)
-            self.assertEqual(snap_cli.devices[0].active_pids, [5002])
+            self.assertEqual(snap_cli.devices[0].active_pids, [5002, 5006])
 
     def test_ambiguous_combined_sysfs_and_chip_id_map_leaves_runtime_unmapped(self) -> None:
         self.assertEqual(tpu_exporter.build_arg_parser().parse_args([]).health_host, "127.0.0.1")
@@ -992,6 +1026,118 @@ TPU Device Status
             prom = tpu_exporter.format_prometheus_metrics(snap)
             self.assertNotIn("freetpu_tpu_duty_cycle_percent{", prom)
             self.assertIn('freetpu_tpu_runtime_duty_cycle_percent{runtime_chip="0",pci_bdf="unmapped"} 75', prom)
+
+    def test_sidecar_runtime_metrics_succeed_without_proc_or_vfio_access(self) -> None:
+        from types import SimpleNamespace
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # Sidecar pod: NO /dev/vfio mounted, NO shareProcessNamespace, NO SYS_PTRACE.
+            sysfs_root, dev_root, proc_root = _make_mock_pci_tree(
+                root,
+                devices=[
+                    {
+                        "bdf": "0000:00:06.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                        "enable": "1",
+                    }
+                ],
+                create_vfio_container=False,
+                create_vfio_nodes=[],
+            )
+            (proc_root / "999" / "fd").mkdir(parents=True)
+
+            captured_calls: list[tuple[object, str]] = []
+
+            class _FakeTpuChip:
+                V6E = "v6e_enum"
+
+            def _fake_get_chip_usage(chip_type, addr="127.0.0.1:8431"):
+                captured_calls.append((chip_type, addr))
+                return [
+                    SimpleNamespace(
+                        device_id=0,
+                        memory_usage=12 * 1024**3,
+                        total_memory=32 * 1024**3,
+                        duty_cycle_pct=71.5,
+                    )
+                ]
+
+            fake_tpu_info = SimpleNamespace()
+            fake_device_mod = SimpleNamespace(TpuChip=_FakeTpuChip)
+            fake_metrics_mod = SimpleNamespace(get_chip_usage=_fake_get_chip_usage)
+
+            # 1. --no-pid-scan sidecar mode: never scans /proc and succeeds via loopback gRPC.
+            with (
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "tpu_info": fake_tpu_info,
+                        "tpu_info.device": fake_device_mod,
+                        "tpu_info.metrics": fake_metrics_mod,
+                    },
+                ),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_scan_proc_vfio_pids",
+                    side_effect=AssertionError("must not scan /proc in --no-pid-scan mode"),
+                ),
+            ):
+                snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin="tpu-info",
+                    skip_pid_scan=True,
+                    runtime_metrics_addr="127.0.0.1:8431",
+                )
+
+            self.assertTrue(snap.tpu_info_available)
+            self.assertFalse(snap.pid_telemetry_available)
+            self.assertEqual(captured_calls, [("v6e_enum", "127.0.0.1:8431")])
+            self.assertEqual(len(snap.runtime_utilization), 1)
+            self.assertEqual(snap.runtime_utilization[0].hbm_used_bytes, 12 * 1024**3)
+            self.assertAlmostEqual(snap.runtime_utilization[0].duty_cycle_percent or 0.0, 71.5)
+            prom = tpu_exporter.format_prometheus_metrics(snap)
+            self.assertIn('freetpu_tpu_runtime_duty_cycle_percent{runtime_chip="0",pci_bdf="unmapped"} 71.5', prom)
+            self.assertNotIn("freetpu_tpu_active_pids{", prom)
+
+            # 2. Default mode fallback: even if `tpu-info` CLI aborts due to cross-profile
+            #    `/proc` PermissionError under containerd AppArmor, fallback to `tpu_info.metrics`
+            #    preserves live HBM and duty-cycle telemetry.
+            failing_cli = root / "mock-apparmor-eacces-tpu-info.sh"
+            failing_cli.write_text(
+                "#!/bin/sh\necho 'PermissionError: [Errno 13] Permission denied: /proc/999/fd/3' >&2\nexit 1\n",
+                encoding="utf-8",
+            )
+            failing_cli.chmod(0o755)
+            captured_calls.clear()
+            with mock.patch.dict(
+                sys.modules,
+                {
+                    "tpu_info": fake_tpu_info,
+                    "tpu_info.device": fake_device_mod,
+                    "tpu_info.metrics": fake_metrics_mod,
+                },
+            ):
+                snap_fb = tpu_exporter.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin=str(failing_cli),
+                    skip_pid_scan=False,
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    chip_id_map={"0000:00:06.0": "0"},
+                )
+
+            self.assertTrue(snap_fb.tpu_info_available)
+            self.assertEqual(captured_calls, [("v6e_enum", "127.0.0.1:8431")])
+            self.assertEqual(snap_fb.devices[0].hbm_used_bytes, 12 * 1024**3)
+            self.assertAlmostEqual(snap_fb.devices[0].duty_cycle_percent or 0.0, 71.5)
 
     def _assert_valid_prometheus_text(self, text: str) -> None:
         lines = [ln for ln in text.splitlines() if ln.strip()]

@@ -21,6 +21,8 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import importlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -157,21 +159,59 @@ def _parse_bytes(value_str: str, unit_str: str) -> int:
     return int(round(float(value_str) * mult))
 
 
+_LINUX_O_PATH = getattr(os, "O_PATH", 0o10000000)
+
+_GEN_TO_TPU_CHIP_ATTR: Dict[str, str] = {
+    "v2": "V2",
+    "v3": "V3",
+    "v4": "V4",
+    "v4lite": "V4",
+    "v5e": "V5E",
+    "v5p": "V5P",
+    "v6e": "V6E",
+    "v6e-pf": "V6E",
+}
+
+
+def _read_fdinfo_flags(fdinfo_path: Path) -> Tuple[Optional[int], bool]:
+    """Read octal open `flags:` from `/proc/<pid>/fdinfo/<fd>`.
+
+    Returns `(flags_int_or_None, permission_denied)`. Failing closed when
+    `fdinfo` is missing or unreadable prevents unverified or `O_PATH`
+    descriptors from being counted as active VFIO reservations.
+    """
+    try:
+        text = fdinfo_path.read_text(encoding="utf-8")
+    except PermissionError:
+        return None, True
+    except OSError:
+        return None, False
+    for line in text.splitlines():
+        if line.startswith("flags:"):
+            raw = line.split(":", 1)[1].strip()
+            try:
+                return int(raw, 8), False
+            except ValueError:
+                return None, False
+    return None, False
+
+
 def _scan_proc_vfio_pids(
     proc_root: Path,
     vfio_paths: Sequence[str],
 ) -> Tuple[Dict[str, List[int]], bool, int]:
-    """Find PIDs holding open character-device FDs matching host `/dev/vfio/<group>` `st_rdev`.
+    """Find PIDs holding active non-`O_PATH` char-device FDs matching host `/dev/vfio/<group>` `st_rdev`.
 
-    Compares each `/proc/<pid>/fd/<n>` target's file mode (`S_ISCHR`) and device
-    number (`st_rdev`) against the host VFIO group character device instead of
-    matching pathnames, so regular files at `/dev/vfio/<group>` in another mount
-    namespace are ignored while VFIO nodes bind-mounted under different paths
-    are accurately matched.
+    Compares each `/proc/<pid>/fd/<n>` target's file mode (`S_ISCHR`), device
+    number (`st_rdev`), and `/proc/<pid>/fdinfo/<n>` open flags against the host
+    VFIO group character device instead of matching pathnames, so regular files
+    in other mount namespaces and path-only `O_PATH` descriptors (which do not
+    open or reserve a VFIO group) are ignored while VFIO nodes bind-mounted
+    under different paths are accurately matched.
 
     Returns (pids_by_vfio_path, pid_telemetry_accessible, unreadable_pid_dirs).
-    Permission failures on /proc/<pid>/fd mean PID telemetry may be incomplete,
-    so callers must not confuse missing reads with zero active workloads.
+    Permission failures on /proc/<pid>/fd or fdinfo mean PID telemetry may be
+    incomplete, so callers must not confuse missing reads with zero workloads.
     """
     result: Dict[str, List[int]] = {p: [] for p in vfio_paths if p}
     if not result:
@@ -222,10 +262,17 @@ def _scan_proc_vfio_pids(
             if not stat.S_ISCHR(fd_st.st_mode):
                 continue
             matched_paths = rdev_to_paths.get(fd_st.st_rdev)
-            if matched_paths:
-                for canonical in matched_paths:
-                    if pid not in result[canonical]:
-                        result[canonical].append(pid)
+            if not matched_paths:
+                continue
+            flags, perm_denied = _read_fdinfo_flags(entry / "fdinfo" / fd_link.name)
+            if perm_denied:
+                unreadable += 1
+                continue
+            if flags is None or (flags & _LINUX_O_PATH) != 0:
+                continue
+            for canonical in matched_paths:
+                if pid not in result[canonical]:
+                    result[canonical].append(pid)
 
     for pids in result.values():
         pids.sort()
@@ -475,6 +522,74 @@ def _run_tpu_info(
     return True, None, parsed
 
 
+def _query_tpu_info_python_metrics(
+    devices: Sequence[TpuTelemetry],
+    addr: Optional[str] = "127.0.0.1:8431",
+) -> Tuple[bool, Optional[str], Dict[str, _TpuInfoRow]]:
+    """Query `libtpu` runtime HBM & duty-cycle metrics via `tpu_info.metrics` over loopback gRPC.
+
+    Decouples live utilization collection from `/proc/*/fd/*` PID scanning and
+    `/dev/vfio/*` access so Kubernetes sidecars can run without
+    `shareProcessNamespace`, `SYS_PTRACE`, or cross-AppArmor-profile `/proc` reads.
+    """
+    if not addr:
+        return False, "runtime metrics gRPC address disabled", {}
+
+    try:
+        tpu_device_mod = importlib.import_module("tpu_info.device")
+        tpu_metrics_mod = importlib.import_module("tpu_info.metrics")
+    except Exception as exc:  # noqa: BLE001
+        return False, f"tpu_info python API unavailable: {exc}", {}
+
+    get_chip_usage = getattr(tpu_metrics_mod, "get_chip_usage", None)
+    tpu_chip_enum = getattr(tpu_device_mod, "TpuChip", None)
+    if not callable(get_chip_usage) or tpu_chip_enum is None:
+        return False, "tpu_info.metrics.get_chip_usage unavailable", {}
+
+    chip_type = None
+    for dev in devices:
+        attr = _GEN_TO_TPU_CHIP_ATTR.get(dev.generation)
+        if attr and hasattr(tpu_chip_enum, attr):
+            chip_type = getattr(tpu_chip_enum, attr)
+            break
+    if chip_type is None:
+        return False, "unable to map discovered TPU generation to tpu_info.device.TpuChip", {}
+
+    try:
+        sig = inspect.signature(get_chip_usage)
+        if "addr" in sig.parameters:
+            usage_list = get_chip_usage(chip_type, addr=addr)
+        else:
+            usage_list = get_chip_usage(chip_type)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"tpu_info.metrics query failed ({addr}): {exc}", {}
+
+    if not usage_list:
+        return False, f"tpu_info.metrics returned no runtime usage rows from {addr}", {}
+
+    rows: Dict[str, _TpuInfoRow] = {}
+    for item in usage_list:
+        dev_id = getattr(item, "device_id", None)
+        if dev_id is None:
+            continue
+        key = str(dev_id)
+        row = rows.setdefault(key, _TpuInfoRow(chip_key=key))
+        row.in_util_table = True
+        mem_used = getattr(item, "memory_usage", None)
+        mem_total = getattr(item, "total_memory", None)
+        duty = getattr(item, "duty_cycle_pct", None)
+        if isinstance(mem_used, (int, float)) and not isinstance(mem_used, bool) and mem_used >= 0:
+            row.hbm_used_bytes = int(mem_used)
+        if isinstance(mem_total, (int, float)) and not isinstance(mem_total, bool) and mem_total > 0:
+            row.hbm_total_bytes = int(mem_total)
+        if isinstance(duty, (int, float)) and not isinstance(duty, bool) and duty >= 0:
+            row.duty_cycle_percent = float(duty)
+
+    if not rows:
+        return False, f"tpu_info.metrics returned no parseable chip entries from {addr}", {}
+    return True, None, rows
+
+
 def _resolve_tpu_device_spec(device_id: str, subsystem_device: str) -> Tuple[str, str, int]:
     if device_id == "0x0027" and subsystem_device in LEGACY_V2_V3_SUBSYSTEM_DEVICES:
         return LEGACY_V2_V3_SUBSYSTEM_DEVICES[subsystem_device]
@@ -641,8 +756,9 @@ def _stat_char_rdev(path: str) -> Optional[int]:
 
 
 def _pid_holds_vfio_rdev(proc_root: Path, pid: int, target_rdev: int) -> bool:
-    """Return True iff `/proc/<pid>/fd/*` contains an open char device with `st_rdev == target_rdev`."""
-    fd_dir = proc_root / str(pid) / "fd"
+    """Return True iff `/proc/<pid>/fd/*` contains an active non-`O_PATH` char device with `st_rdev == target_rdev`."""
+    pid_dir = proc_root / str(pid)
+    fd_dir = pid_dir / "fd"
     try:
         fds = list(fd_dir.iterdir())
     except OSError:
@@ -652,8 +768,12 @@ def _pid_holds_vfio_rdev(proc_root: Path, pid: int, target_rdev: int) -> bool:
             fd_st = os.stat(fd_link)
         except OSError:
             continue
-        if stat.S_ISCHR(fd_st.st_mode) and fd_st.st_rdev == target_rdev:
-            return True
+        if not (stat.S_ISCHR(fd_st.st_mode) and fd_st.st_rdev == target_rdev):
+            continue
+        flags, perm_denied = _read_fdinfo_flags(pid_dir / "fdinfo" / fd_link.name)
+        if perm_denied or flags is None or (flags & _LINUX_O_PATH) != 0:
+            continue
+        return True
     return False
 
 
@@ -664,30 +784,65 @@ def collect_snapshot(
     tpu_info_bin: Optional[str] = "tpu-info",
     tpu_info_timeout_s: float = 5.0,
     chip_id_map: Optional[Dict[str, str]] = None,
+    *,
+    skip_pid_scan: bool = False,
+    runtime_metrics_addr: Optional[str] = "127.0.0.1:8431",
 ) -> ExporterSnapshot:
-    """Collect PCI/VFIO discovery, procfs PID handles, and `tpu-info` metrics."""
+    """Collect PCI/VFIO discovery, optional procfs PID handles, and `tpu-info` runtime metrics."""
     t0 = time.monotonic()
     devices = discover_tpu_devices(sysfs_root=sysfs_root, dev_root=dev_root)
     shared_vfio = _shared_vfio_paths(devices)
     validate_chip_id_map(devices, chip_id_map)
 
-    # Scan /proc/<pid>/fd for open handles to <dev_root>/vfio/<group>.
+    # Scan /proc/<pid>/fd for open handles to <dev_root>/vfio/<group> unless
+    # decoupled (`skip_pid_scan=True`, used by unprivileged workload sidecars).
     real_vfio_paths = [
         str(dev_root / "vfio" / d.iommu_group)
         for d in devices
         if d.iommu_group
     ]
-    vfio_rdevs: Dict[str, Optional[int]] = {
-        vp: _stat_char_rdev(vp) for vp in real_vfio_paths
-    }
-    proc_pids, proc_fd_accessible, _unreadable = _scan_proc_vfio_pids(
-        proc_root, real_vfio_paths
+    vfio_rdevs: Dict[str, Optional[int]] = (
+        {} if skip_pid_scan else {vp: _stat_char_rdev(vp) for vp in real_vfio_paths}
     )
+    if skip_pid_scan:
+        proc_pids: Dict[str, List[int]] = {}
+        proc_fd_accessible = False
+    else:
+        proc_pids, proc_fd_accessible, _unreadable = _scan_proc_vfio_pids(
+            proc_root, real_vfio_paths
+        )
 
-    tpu_info_ok, tpu_info_err, parsed_rows = _run_tpu_info(
-        tpu_info_bin=tpu_info_bin,
-        timeout_s=tpu_info_timeout_s,
-    )
+    if skip_pid_scan:
+        # Sidecar mode: query `tpu_info.metrics` directly over loopback gRPC first
+        # so cross-AppArmor-profile `/proc` errors never break live HBM/duty-cycle metrics.
+        tpu_info_ok, tpu_info_err, parsed_rows = _query_tpu_info_python_metrics(
+            devices,
+            addr=runtime_metrics_addr,
+        )
+        if not tpu_info_ok and tpu_info_bin:
+            cli_ok, cli_err, cli_rows = _run_tpu_info(
+                tpu_info_bin=tpu_info_bin,
+                timeout_s=tpu_info_timeout_s,
+            )
+            if cli_ok:
+                tpu_info_ok, tpu_info_err, parsed_rows = cli_ok, cli_err, cli_rows
+            elif cli_err and tpu_info_err and "python API unavailable" in tpu_info_err:
+                tpu_info_err = cli_err
+    else:
+        tpu_info_ok, tpu_info_err, parsed_rows = _run_tpu_info(
+            tpu_info_bin=tpu_info_bin,
+            timeout_s=tpu_info_timeout_s,
+        )
+        # If `tpu-info` CLI failed (for example due to cross-profile `/proc` EACCES
+        # under containerd AppArmor), fall back to direct `tpu_info.metrics` gRPC
+        # queries over loopback so live HBM/duty-cycle telemetry is still collected.
+        if not tpu_info_ok and tpu_info_bin and runtime_metrics_addr:
+            py_ok, _py_err, py_rows = _query_tpu_info_python_metrics(
+                devices,
+                addr=runtime_metrics_addr,
+            )
+            if py_ok:
+                tpu_info_ok, tpu_info_err, parsed_rows = True, None, py_rows
     util_rows = {k: r for k, r in parsed_rows.items() if r.in_util_table}
     mapped_util_keys: Dict[str, str] = {}
     overall_pid_available = True
@@ -749,11 +904,11 @@ def collect_snapshot(
                 chips_row = parsed_rows[key]
                 break
 
-        if chips_row is not None:
+        if chips_row is not None and not skip_pid_scan:
             dev.telemetry_source = "tpu-info"
-            # Verify each CLI-reported PID actually holds an open character device
-            # matching the host VFIO node's `st_rdev` (upstream `tpu-info` matches
-            # pathnames only and can pick up decoy regular files in other mount ns).
+            # Verify each CLI-reported PID actually holds an active non-O_PATH
+            # character device matching the host VFIO node's `st_rdev` (upstream
+            # `tpu-info` matches pathnames only and can pick up decoy files or O_PATH FDs).
             if host_rdev is not None:
                 for p in chips_row.pids:
                     if p not in pids and _pid_holds_vfio_rdev(proc_root, p, host_rdev):
@@ -1124,6 +1279,8 @@ class _ExporterServer(ThreadingHTTPServer):
         tpu_info_bin: Optional[str],
         tpu_info_timeout_s: float,
         chip_id_map: Optional[Dict[str, str]] = None,
+        skip_pid_scan: bool = False,
+        runtime_metrics_addr: Optional[str] = "127.0.0.1:8431",
         max_workers: int = DEFAULT_MAX_HTTP_WORKERS,
         scrape_timeout_s: float = 10.0,
     ) -> None:
@@ -1133,6 +1290,8 @@ class _ExporterServer(ThreadingHTTPServer):
         self.tpu_info_bin = tpu_info_bin
         self.tpu_info_timeout_s = tpu_info_timeout_s
         self.chip_id_map = chip_id_map
+        self.skip_pid_scan = skip_pid_scan
+        self.runtime_metrics_addr = runtime_metrics_addr
         self.scrape_timeout_s = scrape_timeout_s
         self._scrape_lock = threading.Lock()
         scrape_cap = max(1, max_workers)
@@ -1182,6 +1341,8 @@ class _ExporterServer(ThreadingHTTPServer):
                 tpu_info_bin=self.tpu_info_bin,
                 tpu_info_timeout_s=self.tpu_info_timeout_s,
                 chip_id_map=self.chip_id_map,
+                skip_pid_scan=self.skip_pid_scan,
+                runtime_metrics_addr=self.runtime_metrics_addr,
             )
         finally:
             self._scrape_lock.release()
@@ -1333,6 +1494,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--no-pid-scan",
+        action="store_true",
+        help=(
+            "Disable `/proc/*/fd` PID scanning and query `tpu_info.metrics` directly "
+            "over loopback gRPC (recommended for unprivileged workload sidecars without "
+            "`shareProcessNamespace` or `SYS_PTRACE`)."
+        ),
+    )
+    parser.add_argument(
+        "--runtime-metrics-addr",
+        default="127.0.0.1:8431",
+        help=(
+            "Loopback `libtpu` gRPC address for direct `tpu_info.metrics` queries "
+            "(default: 127.0.0.1:8431; empty string disables direct gRPC queries)."
+        ),
+    )
+    parser.add_argument(
         "--max-workers",
         type=int,
         default=DEFAULT_MAX_HTTP_WORKERS,
@@ -1345,6 +1523,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     tpu_info_bin = args.tpu_info_bin if args.tpu_info_bin else None
+    runtime_metrics_addr = args.runtime_metrics_addr if args.runtime_metrics_addr else None
     try:
         chip_id_map = _load_chip_id_map(args.chip_id_map)
         if chip_id_map:
@@ -1366,6 +1545,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 tpu_info_bin=tpu_info_bin,
                 tpu_info_timeout_s=args.tpu_info_timeout,
                 chip_id_map=chip_id_map,
+                skip_pid_scan=args.no_pid_scan,
+                runtime_metrics_addr=runtime_metrics_addr,
             )
         except ValueError as exc:
             sys.stderr.write(f"freetpu tpu-exporter error: {exc}\n")
@@ -1385,6 +1566,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         tpu_info_bin=tpu_info_bin,
         tpu_info_timeout_s=args.tpu_info_timeout,
         chip_id_map=chip_id_map,
+        skip_pid_scan=args.no_pid_scan,
+        runtime_metrics_addr=runtime_metrics_addr,
         max_workers=args.max_workers,
     )
     health_server: Optional[_HealthServer] = None
