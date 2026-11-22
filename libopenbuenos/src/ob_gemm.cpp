@@ -1029,13 +1029,10 @@ float prepare_w8a16_input_row_f32(const float* a_row,
   }
 
   float prescale_inv = 1.0f;
-  if (amax > 32768.0f) {
-    int exp2_shift = 0;
-    float scaled_am = amax;
-    while (scaled_am > 16384.0f && exp2_shift < 64) {
-      scaled_am *= 0.5f;
-      ++exp2_shift;
-    }
+  if (std::isfinite(amax) && amax > 32768.0f) {
+    int exp2 = 0;
+    (void)std::frexp(amax, &exp2);
+    const int exp2_shift = exp2 - 14;
     const float prescale = std::ldexp(1.0f, -exp2_shift);
     prescale_inv = std::ldexp(1.0f, exp2_shift);
     uint32_t i = 0u;
@@ -3643,6 +3640,7 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
                 sat = ob::tile_output_is_saturated_impl(raw_out, p.tm, p.tn_total, p.hw_n);
                 if (prof_on) ctx->prof.dequant_ns += (ob::monotonic_now_ns() - tsat0);
               } else {
+                std::array<bool, ob::kMaxFusedSubs> sub_is_sat {};
                 for (uint32_t si = 0u; si < p.num_subs; ++si) {
                   if (p.sub_done[si]) continue;
                   const ob::FusedSubSlice& sub = p.subs[si];
@@ -3650,10 +3648,16 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
                   const bool sub_sat = ob::tile_output_is_saturated_impl(
                       raw_out + sub.out_off, p.tm, sub.tn, p.hw_n);
                   if (prof_on) ctx->prof.dequant_ns += (ob::monotonic_now_ns() - tsat0);
-                  if (!sub_sat) {
-                    dequant_sub(raw_out, si, eff_d);
-                  } else {
-                    sat = true;
+                  sub_is_sat[si] = sub_sat;
+                  if (sub_sat) sat = true;
+                }
+                if (sat) {
+                  // Only inline-dequant unsaturated siblings when a saturation retry will
+                  // overwrite p.out_buf at a higher eff_d; otherwise keep them on async dequant.
+                  for (uint32_t si = 0u; si < p.num_subs; ++si) {
+                    if (!p.sub_done[si] && !sub_is_sat[si]) {
+                      dequant_sub(raw_out, si, eff_d);
+                    }
                   }
                 }
               }

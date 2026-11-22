@@ -16,13 +16,21 @@ void pin_thread_to_perf_cores() {
 #if defined(__linux__)
   // Dynamically identify non-LITTLE cores via sysfs cpufreq max frequency.
   // On Tensor G5 (rango): cpu0..1=2.246GHz (LITTLE), cpu2..6=3.052GHz (MID), cpu7=3.782GHz (BIG).
-  // Excluding min_freq cores keeps helper threads strictly on MID/BIG cores (cpu2..7).
+  // Excluding min_freq cores keeps helper threads strictly on MID/BIG cores (cpu2..7),
+  // while preserving any caller-imposed CPU affinity mask (e.g., taskset).
+  cpu_set_t inherited;
+  CPU_ZERO(&inherited);
+  if (sched_getaffinity(0, sizeof(inherited), &inherited) != 0) {
+    return;
+  }
+
+  const uint32_t max_cpus = std::min<uint32_t>(32u, static_cast<uint32_t>(CPU_SETSIZE));
   uint64_t freqs[32]{};
   bool valid[32]{};
   uint64_t min_freq = UINT64_MAX;
   uint64_t max_freq = 0ULL;
   uint32_t valid_cnt = 0u;
-  for (uint32_t cpu = 0u; cpu < 32u; ++cpu) {
+  for (uint32_t cpu = 0u; cpu < max_cpus; ++cpu) {
     char path[96]{};
     std::snprintf(path, sizeof(path),
                   "/sys/devices/system/cpu/cpu%u/cpufreq/cpuinfo_max_freq", cpu);
@@ -43,8 +51,9 @@ void pin_thread_to_perf_cores() {
   cpu_set_t cpuset;
   CPU_ZERO(&cpuset);
   uint32_t pinned_cnt = 0u;
-  for (uint32_t cpu = 0u; cpu < 32u; ++cpu) {
-    if (valid[cpu] && freqs[cpu] > min_freq) {
+  for (uint32_t cpu = 0u; cpu < max_cpus; ++cpu) {
+    if (valid[cpu] && freqs[cpu] > min_freq &&
+        CPU_ISSET(static_cast<int>(cpu), &inherited)) {
       CPU_SET(static_cast<int>(cpu), &cpuset);
       ++pinned_cnt;
     }

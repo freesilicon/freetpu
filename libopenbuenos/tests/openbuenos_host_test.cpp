@@ -5305,6 +5305,23 @@ void test_phase8b_spsc_async_dequant_and_w8a16_pt() {
       CHECK(ob_gemm_matmul_f32_w8a16_tile(
                 ctx, a_r.data(), w_r.data(), sb_r.data(), K_r, N_r, out_r.data(), &rstats) == OB_OK);
       CHECK(out_r[0] == 0.0f);
+
+      // Full finite FP32 range prescale guard (e.g., 2^81 and 2^127): must stay finite without
+      // saturating FP16 inputs to infinity.
+      a_r.assign(K_r, 0.0f);
+      w_r.assign(static_cast<size_t>(N_r) * K_r, 0);
+      a_r[0] = std::ldexp(1.0f, 81);
+      w_r[0] = 3;
+      sb_r.assign(N_r, std::ldexp(1.0f, -81));
+      CHECK(ob_gemm_matmul_f32_w8a16_tile(
+                ctx, a_r.data(), w_r.data(), sb_r.data(), K_r, N_r, out_r.data(), &rstats) == OB_OK);
+      CHECK(std::isfinite(out_r[0]) && std::fabs(out_r[0] - 3.0f) < 1e-3f);
+
+      a_r[0] = std::ldexp(1.0f, 127);
+      sb_r.assign(N_r, std::ldexp(1.0f, -125));
+      CHECK(ob_gemm_matmul_f32_w8a16_tile(
+                ctx, a_r.data(), w_r.data(), sb_r.data(), K_r, N_r, out_r.data(), &rstats) == OB_OK);
+      CHECK(std::isfinite(out_r[0]) && std::fabs(out_r[0] - 12.0f) < 1e-2f);
     }
 
     ob_context_destroy(ctx);
