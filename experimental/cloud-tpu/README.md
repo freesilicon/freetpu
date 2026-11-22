@@ -27,8 +27,11 @@ Using `google-colab-cli` (`colab --auth=adc` with isolated `--config` under a pr
 mkdir -p -m 700 ~/.cache/freetpu-colab ~/.cache/freetpu-pjrt
 mkdir -p -m 700 ~/.cache/freetpu-pjrt/ir
 
-# Headless ephemeral single-script run (provisions -> runs -> auto-stops)
-colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json run --tpu V6E1 -- experimental/cloud-tpu/raw_compute_bench.py
+# Single-script run inside an explicit session (verify teardown with `stop` + `sessions`)
+colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json new -s freetpu-raw --tpu V6E1
+colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json exec -s freetpu-raw --timeout 600 -f experimental/cloud-tpu/raw_compute_bench.py
+colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json stop -s freetpu-raw
+colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json sessions
 
 # Or run all stages inside one persistent session (verify markers + stop on exit)
 (
@@ -52,7 +55,7 @@ colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json run --tpu V6E1 --
     trap - EXIT
     set +e
     if ! colab --auth=adc --config "$CFG" stop -s "$SESSION_ID"; then
-      echo "ERROR: failed to stop Colab session $SESSION_ID" >&2
+      echo "ERROR: failed to stop Colab session $SESSION_ID; check 'colab --auth=adc --config $CFG sessions'" >&2
       if [ "$status" -eq 0 ]; then
         status=1
       fi
