@@ -44,6 +44,9 @@ SUPPORTED_TPUS = frozenset({"v6e1", "v5e1"})
 _FALLBACK_ERROR_MARKERS = (
     "412",
     "400",
+    "readtimeout",
+    "read timed out",
+    "timed out",
     "reason_no_backends",
     "reason_too_many_active_assignments",
     "reason_quota_exceeded_usage_time",
@@ -84,6 +87,7 @@ class BenchConfig:
     min_cu_balance: float = 5.0
     max_active_assignments: Optional[int] = None
     timeout_s: float = 300.0
+    request_timeout_s: float = 60.0
     use_no_public_api: bool = True
     config_path: Optional[Path] = None
     out_dir: Optional[Path] = None
@@ -93,19 +97,32 @@ class BenchConfig:
     dry_run: bool = False
 
 
+def make_subprocess_runner(request_timeout_s: float = 60.0) -> CommandRunner:
+    """Create a subprocess runner that bounds `colab` HTTP assign waits."""
+
+    def _run(cmd: Sequence[str]) -> CommandResult:
+        env = os.environ.copy()
+        env.setdefault("COLAB_CLI_REQUEST_TIMEOUT", str(request_timeout_s))
+        env.setdefault("COLAB_CLI_ASSIGN_RETRIES", "1")
+        proc = subprocess.run(
+            list(cmd),
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+        return CommandResult(
+            returncode=proc.returncode,
+            stdout=proc.stdout,
+            stderr=proc.stderr,
+        )
+
+    return _run
+
+
 def default_command_runner(cmd: Sequence[str]) -> CommandResult:
     """Execute a subprocess command and capture stdout/stderr as UTF-8."""
-    proc = subprocess.run(
-        list(cmd),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return CommandResult(
-        returncode=proc.returncode,
-        stdout=proc.stdout,
-        stderr=proc.stderr,
-    )
+    return make_subprocess_runner()(cmd)
 
 
 def parse_usage_output(text: str) -> UsageSnapshot:
@@ -265,7 +282,7 @@ def default_tpu_probe_script() -> str:
             t0 = time.perf_counter()
             for _ in range(iters):
                 out = matmul_fn(a, b)
-            out.block_until_ready()
+                out.block_until_ready()
             dt_us = ((time.perf_counter() - t0) / iters) * 1e6
             flops = 2.0 * m * k * n
             gflops = (flops / (dt_us * 1e-6)) / 1e9
@@ -293,9 +310,11 @@ def default_tpu_probe_script() -> str:
 
 def run_benchmark(
     cfg: BenchConfig,
-    runner: CommandRunner = default_command_runner,
+    runner: Optional[CommandRunner] = None,
 ) -> Tuple[int, Dict[str, Any]]:
     """Execute the pre-flight check, TPU run (with fallback), and log capture."""
+    if runner is None:
+        runner = make_subprocess_runner(cfg.request_timeout_s)
     out_dir = cfg.out_dir or Path(tempfile.mkdtemp(prefix="freetpu-colab-"))
     out_dir.mkdir(parents=True, exist_ok=True)
     isolated_config = cfg.config_path or (out_dir / "colab-sessions.json")
@@ -562,6 +581,11 @@ def run_self_test() -> int:
         assert summary_dry["status"] == "dry_run"
         assert len(summary_dry["planned_commands"]) == 5
 
+        # 6. ReadTimeout on v6e1 triggers fallback to v5e1.
+        assert is_capacity_or_quota_error(
+            1, "", "ReadTimeout: HTTPSConnectionPool Read timed out. (read timeout=45.0)"
+        )
+
     print("colab_tpu_bench.py self-test PASSED (5/5 suites).")
     return 0
 
@@ -609,6 +633,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=300.0,
         help="Inactivity timeout (seconds) passed to `colab run` (default: 300.0).",
+    )
+    parser.add_argument(
+        "--request-timeout",
+        type=float,
+        default=60.0,
+        help="HTTP request timeout (seconds) via COLAB_CLI_REQUEST_TIMEOUT (default: 60.0).",
     )
     parser.add_argument(
         "--config",
@@ -690,6 +720,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         min_cu_balance=args.min_cu_balance,
         max_active_assignments=args.max_active_assignments,
         timeout_s=args.timeout,
+        request_timeout_s=args.request_timeout,
         use_no_public_api=not args.public_api,
         config_path=args.config,
         out_dir=args.out_dir,
