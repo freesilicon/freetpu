@@ -60,10 +60,11 @@ spec:
       labels:
         app.kubernetes.io/name: freetpu-tpu-exporter
         freetpu.dev/collector-role: node
-      annotations:
-        prometheus.io/scrape: "true"
-        prometheus.io/port: "9400"
-        prometheus.io/path: "/metrics"
+      # Intentionally omit `prometheus.io/scrape` annotations so generic
+      # annotation-based scrape jobs cannot double-scrape the exporter or
+      # bypass `prometheus-scrape.yml`'s per-PID series drop rule; the trusted
+      # `freetpu-node-exporter` job discovers this DaemonSet strictly by
+      # namespace, DaemonSet controller, container, and port name.
     spec:
       hostPID: true
       affinity:
@@ -238,6 +239,19 @@ spec:
             - --interval
             - "15"
             - --unlink-on-exit
+          # Report Ready only while `/var/run/cdi/freetpu.json` exists and passes
+          # live host VFIO verification (read-only; the sync loop owns writes/cleanup).
+          readinessProbe:
+            exec:
+              command:
+                - python3
+                - /opt/freetpu/freetpu_cdi.py
+                - validate
+                - /var/run/cdi/freetpu.json
+                - --check-host
+            initialDelaySeconds: 2
+            periodSeconds: 15
+            timeoutSeconds: 5
           resources:
             requests:
               cpu: 20m
