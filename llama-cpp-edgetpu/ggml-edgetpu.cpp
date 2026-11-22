@@ -2438,9 +2438,9 @@ static bool ggml_backend_edgetpu_device_supports_op(ggml_backend_dev_t dev, cons
                 return false;
             }
 
-            // Respect explicit unquantized FP32/BF16 precision requests & Hadamard hint.
+            // Respect explicit unquantized FP32/BF16/F16 precision requests & Hadamard hint.
             const enum ggml_prec prec = ggml_prec_get_src(op, 1);
-            if (prec == GGML_PREC_F32 || prec == GGML_PREC_BF16) {
+            if (prec == GGML_PREC_F32 || prec == GGML_PREC_BF16 || prec == GGML_PREC_F16) {
                 return false;
             }
             if (ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
@@ -2512,9 +2512,9 @@ static bool ggml_backend_edgetpu_device_supports_op(ggml_backend_dev_t dev, cons
                 return false;
             }
 
-            // Respect explicit unquantized FP32/BF16 precision requests & Hadamard hint.
+            // Respect explicit unquantized FP32/BF16/F16 precision requests & Hadamard hint.
             const enum ggml_prec prec = ggml_prec_get_src(op, 1);
-            if (prec == GGML_PREC_F32 || prec == GGML_PREC_BF16) {
+            if (prec == GGML_PREC_F32 || prec == GGML_PREC_BF16 || prec == GGML_PREC_F16) {
                 return false;
             }
             if (ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_HADAMARD) {

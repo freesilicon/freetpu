@@ -4559,17 +4559,24 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
                 read_active = true;
               }
               if (rst == OB_OK && read_active) {
-                const uint64_t tq1 = prof_on ? ob::monotonic_now_ns() : 0u;
-                // Y_f32[m, n] += q_out[m, n] * (s_silu * s_a * d_up * d_mul * eff_d_down) * row_s_d[n]
-                const float out_mult = p.s_gate * s_a * static_cast<float>(p.d_up) *
-                                       static_cast<float>(p.d_mul) * static_cast<float>(eff_d_down);
-                const float* sd_ptr = p.w_tile->row_s_b.data();
-                for (uint32_t mi = 0u; mi < ms.tm; ++mi) {
-                  float* c_row = c_slice + static_cast<size_t>(mi) * N;
-                  const int8_t* o_row = raw_out + static_cast<size_t>(mi) * N;
-                  ob::dequant_accum_row_f32_impl(c_row, o_row, sd_ptr, N, out_mult);
+                const uint64_t tsatf0 = prof_on ? ob::monotonic_now_ns() : 0u;
+                const bool still_sat = ob::tile_output_is_saturated_impl(raw_out, ms.tm, N, N);
+                if (prof_on) ctx->prof.dequant_ns += (ob::monotonic_now_ns() - tsatf0);
+                if (still_sat) {
+                  slice_rejected = true;
+                } else {
+                  const uint64_t tq1 = prof_on ? ob::monotonic_now_ns() : 0u;
+                  // Y_f32[m, n] += q_out[m, n] * (s_silu * s_a * d_up * d_mul * eff_d_down) * row_s_d[n]
+                  const float out_mult = p.s_gate * s_a * static_cast<float>(p.d_up) *
+                                         static_cast<float>(p.d_mul) * static_cast<float>(eff_d_down);
+                  const float* sd_ptr = p.w_tile->row_s_b.data();
+                  for (uint32_t mi = 0u; mi < ms.tm; ++mi) {
+                    float* c_row = c_slice + static_cast<size_t>(mi) * N;
+                    const int8_t* o_row = raw_out + static_cast<size_t>(mi) * N;
+                    ob::dequant_accum_row_f32_impl(c_row, o_row, sd_ptr, N, out_mult);
+                  }
+                  if (prof_on) ctx->prof.dequant_ns += (ob::monotonic_now_ns() - tq1);
                 }
-                if (prof_on) ctx->prof.dequant_ns += (ob::monotonic_now_ns() - tq1);
               }
               if (read_active) {
                 const uint64_t td1 = prof_on ? ob::monotonic_now_ns() : 0u;
@@ -4912,6 +4919,14 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
           }
         }
         const float s_gate_cand = s_a * w_tile->swiglu_s_wg * static_cast<float>(d_gate);
+        // The 0x640 SiLU spline segment around 0 has constant term ~5.72e-5 / s_gate;
+        // route tiny/non-finite gate scales through M7A fallback so SiLU(0) stays accurate.
+        if (!(s_gate_cand >= 5.0e-4f)) {
+          pinned_w.reset();
+          drain_all_cleanup();
+          slice_rejected = true;
+          break;
+        }
 
         if (ring_count >= ring_depth) {
           ob_status_t dst = drain_one();
@@ -4919,6 +4934,11 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
             pinned_w.reset();
             drain_all_cleanup();
             return dst;
+          }
+          if (slice_rejected) {
+            pinned_w.reset();
+            drain_all_cleanup();
+            break;
           }
         }
         const uint32_t slot = (ring_head + ring_count) % ring_depth;
@@ -4982,8 +5002,12 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
             drain_all_cleanup();
             return dst;
           }
+          if (slice_rejected) {
+            drain_all_cleanup();
+            break;
+          }
         }
-        if (ctx->mock_mode) {
+        if (!slice_rejected && ctx->mock_mode) {
           cpu_swiglu_f32_quant_slice(a_slice, desc, ms.tm, c_slice);
         }
       }

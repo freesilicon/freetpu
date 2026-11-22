@@ -1462,6 +1462,7 @@ int run_test_swiglu(int iters, int perf_mode, const char* dive_interp_path,
 
     ob_invoke_stats_t sc{}, sw{};
     st = ob_gemm_swiglu_int8(ctx, x.data(), &d, y.data(), &sc);
+    if (profile) ob_context_reset_profile(ctx);
     for (int it = 0; st == OB_OK && it < std::max(1, iters); ++it) {
       st = ob_gemm_swiglu_int8(ctx, x.data(), &d, y.data(), &sw);
     }
@@ -1479,6 +1480,7 @@ int run_test_swiglu(int iters, int perf_mode, const char* dive_interp_path,
                 static_cast<unsigned long long>(sc.wall_time_us),
                 static_cast<unsigned long long>(sw.hw_execution_us),
                 static_cast<unsigned long long>(sw.wall_time_us));
+    if (profile) print_profile_line(c.label, ctx);
   }
 
   // Part B: End-to-end FP32 Q8_0 / Q4_0 ob_gemm_swiglu_f32_quant live NMSE & latency

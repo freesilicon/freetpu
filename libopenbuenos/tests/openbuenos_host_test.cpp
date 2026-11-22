@@ -4215,25 +4215,29 @@ void test_phase7_cycle3_regressions() {
       ctx->credits[0].state = ob::CreditSlot::IN_FLIGHT;
       ctx->credits[0].handle = fake_h;
       ctx->credits[0].seq = 999u;
+      ctx->inflight_count = 1u;
     }
     CHECK(ob::device_attach_inflight_buffers(ctx, fake_h, {b}) == true);
     CHECK(b->refcnt.load(std::memory_order_acquire) == 2u);
-    // Caller releases its ref; buffer stays alive inside inflight slot (refcnt=1).
-    ob_buffer_free(b);
-    CHECK(b->refcnt.load(std::memory_order_acquire) == 1u);
     CHECK(ctx->credits[0].abandoned == true);
-    // Simulate late firmware completion of abandoned command with credit_size=1:
-    // next device_submit_execute_async must reap it, free its credit, and release retired_bufs!
+    // Simulate late firmware completion of abandoned command while occupying the sole credit:
+    // the NEXT submission (ob_gemm_matmul_int8 -> device_submit_execute_async) must reclaim
+    // the sole credit, release the retained buffer (refcnt 2 -> 1), and execute cleanly!
     {
       std::lock_guard<std::mutex> lk(ctx->vii_mu);
       ctx->credits[0].state = ob::CreditSlot::COMPLETED;
-      ctx->inflight_count = 1u;
     }
     ctx->credit_size = 1u;
-    CHECK(ob::device_attach_inflight_buffers(ctx, fake_h, {}) == true);
+    CHECK(ob_gemm_register_builtin_emitter(ctx, interp_file.path()) == OB_OK);
+    std::vector<int8_t> ta(64u, 1), tb(64u * 64u, 2);
+    std::vector<int32_t> tc(64u, 0);
+    ob_invoke_stats_t ts{};
+    CHECK(ob_gemm_matmul_int8(ctx, ta.data(), tb.data(), nullptr, tc.data(), 1u, 64u, 64u, 0, 0, &ts) == OB_OK);
+    CHECK(tc[0] == 128);
     CHECK(ctx->credits[0].state == ob::CreditSlot::FREE);
     CHECK(ctx->inflight_count == 0u);
-    // Context destroy cleans up cleanly.
+    CHECK(b->refcnt.load(std::memory_order_acquire) == 1u);
+    ob_buffer_free(b);
     ob_context_destroy(ctx);
   }
 
@@ -4317,6 +4321,16 @@ void test_phase7_cycle3_regressions() {
     const double expected_dot = 128.0 * (127.0 / 128.0);
     const double expected_y0 = (expected_dot / (1.0 + std::exp(-expected_dot))) * expected_dot;
     CHECK(std::fabs(static_cast<double>(c[0]) - expected_y0) / expected_y0 < 5e-3);
+
+    // Tiny activation scale (s_gate < 5e-4) must bypass chained 0x640 SiLU spline via M7A fallback!
+    std::vector<float> a_tiny(K, 0.0f);
+    a_tiny[575] = 1.0e-6f;
+    ob_profile_stats_t pt0{}, pt1{};
+    CHECK(ob_context_get_profile(ctx, &pt0) == OB_OK);
+    CHECK(ob_gemm_swiglu_f32_quant(ctx, a_tiny.data(), &sd, c.data(), &s2) == OB_OK);
+    CHECK(ob_context_get_profile(ctx, &pt1) == OB_OK);
+    CHECK(pt1.swiglu_fallbacks == pt0.swiglu_fallbacks + 1u);
+    CHECK(pt1.swiglu_chunks_chained == pt0.swiglu_chunks_chained);
     ob_context_destroy(ctx);
   }
 
