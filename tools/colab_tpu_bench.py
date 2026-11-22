@@ -106,6 +106,93 @@ _ISO_DATETIME_RE = re.compile(
     re.ASCII,
 )
 _SESSION_LINE_RE = re.compile(r"^\[([^\]]+)\]\s+(\S+)(?:\s+\||$)")
+_ASSIGN_REQUEST_RE = re.compile(
+    r"\bRequest:\s+(?:GET|POST)\s+\S+/tun/m/assign(?:[?\s]|$)",
+    re.IGNORECASE,
+)
+_ANY_REQUEST_RE = re.compile(r"\bRequest:\s+[A-Z]+\s+\S+", re.IGNORECASE)
+_RESPONSE_STATUS_RE = re.compile(r"\bResponse:\s+(\d{3})\b", re.IGNORECASE)
+_ASSIGN_ENDPOINT_JSON_RE = re.compile(
+    r'"endpoint"\s*:\s*"([A-Za-z0-9][A-Za-z0-9._-]{0,127})"'
+)
+_LOG_RECORD_START_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}")
+
+
+class _AssignEndpointTracker:
+    """Capture a confirmed `/tun/m/assign` HTTP 200 endpoint from pre-READY CLI logs."""
+
+    def __init__(self) -> None:
+        self.endpoint: Optional[str] = None
+        self._in_assign_request = False
+        self._assign_status_ok = False
+        self._expect_assign_body = False
+        self._stopped = False
+
+    def feed_line(self, line: str, *, allow_partial: bool = False) -> None:
+        if self._stopped or self.endpoint is not None:
+            return
+        if "[colab] session ready" in line.lower():
+            self._stopped = True
+            return
+        if self._expect_assign_body:
+            if not allow_partial and (
+                _LOG_RECORD_START_RE.match(line)
+                or line.lstrip().startswith("[colab]")
+            ):
+                self._expect_assign_body = False
+                self._in_assign_request = False
+                self._assign_status_ok = False
+            else:
+                m = _ASSIGN_ENDPOINT_JSON_RE.search(line)
+                if m:
+                    self.endpoint = m.group(1)
+                    self._expect_assign_body = False
+                    self._in_assign_request = False
+                    self._assign_status_ok = False
+                    return
+                if not allow_partial:
+                    # Wait across a single `)]}'` XSSI prefix line for the JSON body.
+                    if line.strip() not in ("", ")]}'"):
+                        self._expect_assign_body = False
+                return
+        if _ASSIGN_REQUEST_RE.search(line):
+            self._in_assign_request = True
+            self._assign_status_ok = False
+            self._expect_assign_body = False
+            return
+        if _ANY_REQUEST_RE.search(line):
+            self._in_assign_request = False
+            self._assign_status_ok = False
+            self._expect_assign_body = False
+            return
+        if not self._in_assign_request:
+            return
+        status_match = _RESPONSE_STATUS_RE.search(line)
+        if status_match:
+            self._assign_status_ok = status_match.group(1) == "200"
+            return
+        if self._assign_status_ok and "Response Body:" in line:
+            _, _, remainder = line.partition("Response Body:")
+            m = _ASSIGN_ENDPOINT_JSON_RE.search(remainder)
+            if m:
+                self.endpoint = m.group(1)
+                self._in_assign_request = False
+                self._assign_status_ok = False
+                self._expect_assign_body = False
+                return
+            self._expect_assign_body = True
+
+
+def extract_assigned_endpoint_from_stderr(stderr_text: str) -> Optional[str]:
+    """Extract a confirmed `/tun/m/assign` HTTP 200 endpoint logged before `Session READY`."""
+    if not stderr_text:
+        return None
+    tracker = _AssignEndpointTracker()
+    for line in stderr_text.splitlines():
+        tracker.feed_line(line)
+        if tracker.endpoint is not None or tracker._stopped:
+            break
+    return tracker.endpoint
 
 
 class UntrustedPathError(ValueError):
@@ -132,6 +219,7 @@ class CommandCancelledError(BaseException):
         untrusted_log_error: Optional[str] = None,
         captured_probe_text: Optional[str] = None,
         elapsed_s: Optional[float] = None,
+        assigned_endpoint: Optional[str] = None,
     ) -> None:
         super().__init__(f"Command cancelled by {signal_name}")
         self.signal_name = signal_name
@@ -144,6 +232,7 @@ class CommandCancelledError(BaseException):
         self.untrusted_log_error = untrusted_log_error
         self.captured_probe_text = captured_probe_text
         self.elapsed_s = elapsed_s
+        self.assigned_endpoint = assigned_endpoint
 
 
 @dataclass(frozen=True)
@@ -159,6 +248,7 @@ class CommandResult:
     captured_probe_text: Optional[str] = None
     elapsed_s: Optional[float] = None
     pre_ready_uncertain: bool = False
+    assigned_endpoint: Optional[str] = None
 
 
 CommandRunner = Callable[[Sequence[str]], CommandResult]
@@ -1034,6 +1124,8 @@ class _BoundedStreamCapture:
         self.saw_session_ready = False
         self._uncertain_line_buf = bytearray()
         self.saw_pre_ready_uncertain = False
+        self._assign_tracker = _AssignEndpointTracker()
+        self.assigned_endpoint: Optional[str] = None
 
         self._fh: Optional[Any] = None
         self._tmp_path: Optional[Path] = None
@@ -1130,7 +1222,7 @@ class _BoundedStreamCapture:
     def _scan_ready_and_uncertain(self, chunk: bytes) -> None:
         if not self.track_session_ready and not self.track_uncertain_alloc:
             return
-        if self.track_uncertain_alloc and not self.saw_session_ready and not self.saw_pre_ready_uncertain:
+        if self.track_uncertain_alloc and not self.saw_session_ready:
             self._uncertain_line_buf.extend(chunk)
             while b"\n" in self._uncertain_line_buf:
                 nl_idx = self._uncertain_line_buf.index(b"\n")
@@ -1141,23 +1233,28 @@ class _BoundedStreamCapture:
                     self.saw_session_ready = True
                     self._uncertain_line_buf.clear()
                     break
-                if _UNCERTAIN_ALLOC_TRANSPORT_RE.search(line_text) or _UNCERTAIN_ALLOC_HTTP_RE.search(
-                    line_text
+                self._assign_tracker.feed_line(line_text)
+                if self._assign_tracker.endpoint is not None:
+                    self.assigned_endpoint = self._assign_tracker.endpoint
+                if not self.saw_pre_ready_uncertain and (
+                    _UNCERTAIN_ALLOC_TRANSPORT_RE.search(line_text)
+                    or _UNCERTAIN_ALLOC_HTTP_RE.search(line_text)
                 ):
                     self.saw_pre_ready_uncertain = True
-                    self._uncertain_line_buf.clear()
-                    break
-            if len(self._uncertain_line_buf) > 4096:
+            if not self.saw_session_ready and len(self._uncertain_line_buf) > 4096:
                 partial_text = bytes(self._uncertain_line_buf).decode("utf-8", errors="replace")
                 if "[colab] session ready" in partial_text.lower():
                     self.saw_session_ready = True
                     self._uncertain_line_buf.clear()
-                elif _UNCERTAIN_ALLOC_TRANSPORT_RE.search(
-                    partial_text
-                ) or _UNCERTAIN_ALLOC_HTTP_RE.search(partial_text):
-                    self.saw_pre_ready_uncertain = True
-                    self._uncertain_line_buf.clear()
                 else:
+                    self._assign_tracker.feed_line(partial_text, allow_partial=True)
+                    if self._assign_tracker.endpoint is not None:
+                        self.assigned_endpoint = self._assign_tracker.endpoint
+                    if not self.saw_pre_ready_uncertain and (
+                        _UNCERTAIN_ALLOC_TRANSPORT_RE.search(partial_text)
+                        or _UNCERTAIN_ALLOC_HTTP_RE.search(partial_text)
+                    ):
+                        self.saw_pre_ready_uncertain = True
                     del self._uncertain_line_buf[:-256]
         if self.track_session_ready and not self.saw_session_ready:
             combined = bytes(self._ready_overlap) + chunk.lower()
@@ -1173,16 +1270,20 @@ class _BoundedStreamCapture:
         if (
             self.track_uncertain_alloc
             and not self.saw_session_ready
-            and not self.saw_pre_ready_uncertain
             and self._uncertain_line_buf
         ):
             line_text = bytes(self._uncertain_line_buf).decode("utf-8", errors="replace")
             if "[colab] session ready" in line_text.lower():
                 self.saw_session_ready = True
-            elif _UNCERTAIN_ALLOC_TRANSPORT_RE.search(line_text) or _UNCERTAIN_ALLOC_HTTP_RE.search(
-                line_text
-            ):
-                self.saw_pre_ready_uncertain = True
+            else:
+                self._assign_tracker.feed_line(line_text)
+                if self._assign_tracker.endpoint is not None:
+                    self.assigned_endpoint = self._assign_tracker.endpoint
+                if not self.saw_pre_ready_uncertain and (
+                    _UNCERTAIN_ALLOC_TRANSPORT_RE.search(line_text)
+                    or _UNCERTAIN_ALLOC_HTTP_RE.search(line_text)
+                ):
+                    self.saw_pre_ready_uncertain = True
             self._uncertain_line_buf.clear()
 
     def feed(self, chunk: bytes) -> None:
@@ -1455,6 +1556,7 @@ def make_subprocess_runner(
                 captured_probe_text=out_cap.captured_probe_text(),
                 elapsed_s=elapsed_s,
                 pre_ready_uncertain=err_cap.saw_pre_ready_uncertain,
+                assigned_endpoint=err_cap.assigned_endpoint,
             )
         except subprocess.TimeoutExpired:
             _terminate_and_reap()
@@ -1485,6 +1587,7 @@ def make_subprocess_runner(
                 captured_probe_text=out_cap.captured_probe_text(),
                 elapsed_s=elapsed_s,
                 pre_ready_uncertain=err_cap.saw_pre_ready_uncertain,
+                assigned_endpoint=err_cap.assigned_endpoint,
             )
         except (KeyboardInterrupt, TerminationSignal) as exc:
             _terminate_and_reap()
@@ -1518,6 +1621,7 @@ def make_subprocess_runner(
                 untrusted_log_error=untrusted_err,
                 captured_probe_text=out_cap.captured_probe_text(),
                 elapsed_s=elapsed_s,
+                assigned_endpoint=err_cap.assigned_endpoint,
             ) from exc
 
     return _run
@@ -2468,11 +2572,18 @@ def run_benchmark(
             err_msg = f"`colab stop -s {sess_name}` exited 0 with authentication error: {diag}"
         return stop_res, err_msg
 
-    def _recover_session_endpoint(sess_name: str) -> Optional[str]:
+    def _recover_session_endpoint(
+        sess_name: str,
+        *,
+        stderr_text: str = "",
+        captured_endpoint: Optional[str] = None,
+    ) -> Optional[str]:
         nonlocal created_endpoint
         ep = read_endpoint_from_history(sess_name)
         if not ep:
             ep = read_endpoint_from_session_store(isolated_config, sess_name)
+        if not ep:
+            ep = captured_endpoint or extract_assigned_endpoint_from_stderr(stderr_text)
         if ep:
             created_endpoint = ep
         return ep
@@ -2559,8 +2670,13 @@ def run_benchmark(
 
     def _run_forced_stop(sess_name: str) -> Tuple[CommandResult, Optional[str]]:
         # Avoid invoking `colab stop` directly against a pre-populated user `--config`
-        # because Colab CLI's `stop` runs `sync_sessions()` and prunes other accounts' entries.
-        if has_existing_store_entries and created_endpoint is not None:
+        # because Colab CLI's `stop` runs `sync_sessions()` and prunes other accounts' entries;
+        # also seed a recovery store if the original store has no mapping (e.g., disk-full
+        # persistence failure right after allocation).
+        if created_endpoint is not None and (
+            has_existing_store_entries
+            or read_endpoint_from_session_store(isolated_config, sess_name) is None
+        ):
             _, rec_base, seed_err = _prepare_recovery_store(sess_name, created_endpoint)
             if seed_err is None:
                 return _run_stop_cmd(sess_name, cmd_prefix=rec_base)
@@ -2612,6 +2728,7 @@ def run_benchmark(
                     partial_stdout = cancel_exc.stdout
                     partial_stderr = cancel_exc.stderr
                     cancel_probe_text = cancel_exc.captured_probe_text
+                    cancel_assigned_endpoint = cancel_exc.assigned_endpoint
                     cancel_stdout_written = cancel_exc.stdout_log_written
                     cancel_stderr_written = cancel_exc.stderr_log_written
                     if cancel_exc.untrusted_log_error:
@@ -2624,6 +2741,7 @@ def run_benchmark(
                     partial_stdout = ""
                     partial_stderr = ""
                     cancel_probe_text = None
+                    cancel_assigned_endpoint = None
                     cancel_stdout_written = False
                     cancel_stderr_written = False
 
@@ -2638,7 +2756,11 @@ def run_benchmark(
                     chosen_session = sess
 
                 # Recover the allocated endpoint independently of notebook export before stop/reconcile.
-                _recover_session_endpoint(sess)
+                _recover_session_endpoint(
+                    sess,
+                    stderr_text=partial_stderr,
+                    captured_endpoint=cancel_assigned_endpoint,
+                )
 
                 cancel_note = (
                     "[colab_tpu_bench] Terminated by supervisor (SIGTERM)."
@@ -2705,9 +2827,14 @@ def run_benchmark(
             if res.log_write_error and artifact_write_error is None:
                 artifact_write_error = res.log_write_error
 
-            # Recover the allocated endpoint from Colab CLI's session_created history event
-            # independently of notebook export so an export or disk-full failure cannot hide a TPU.
-            _recover_session_endpoint(sess)
+            # Recover the allocated endpoint from Colab CLI's history, session store, or
+            # pre-READY `/tun/m/assign` HTTP 200 response log independently of notebook
+            # export so a state-persistence or disk-full failure cannot hide an active TPU.
+            _recover_session_endpoint(
+                sess,
+                stderr_text=res.stderr,
+                captured_endpoint=res.assigned_endpoint,
+            )
 
             attempt_rec = {
                 "tpu": tpu,
@@ -6359,7 +6486,95 @@ def run_self_test() -> int:
         assert "write/fsync" in (sum_enospc.get("error") or "")
         assert not list(enospc_cfg_dir.glob("*.write-probe.*"))
 
-    print("colab_tpu_bench.py self-test PASSED (68/68 suites).")
+        # 69. Endpoint recovery from pre-READY `/tun/m/assign` HTTP 200 log when local
+        #     session-store & history writes fail right after allocation (disk quota / I/O error),
+        #     while ignoring any fake `"endpoint"` printed by user workload output after `Session READY`.
+        assert (
+            extract_assigned_endpoint_from_stderr(
+                "2026-11-22 10:00:00 - colab_cli.client - DEBUG - Request: POST https://colab.research.google.com/tun/m/assign\n"
+                "2026-11-22 10:00:01 - colab_cli.client - DEBUG - Response: 200 OK\n"
+                "2026-11-22 10:00:01 - colab_cli.client - DEBUG - Response Body: )]}'\n"
+                '{"endpoint":"m-s-diskfail99","accelerator":"V6E1"}\n'
+                "OSError: [Errno 28] No space left on device\n"
+            )
+            == "m-s-diskfail99"
+        )
+        assert (
+            extract_assigned_endpoint_from_stderr(
+                "[colab] Session READY (spoof-sess). Executing...\n"
+                "2026-11-22 10:00:00 - colab_cli.client - DEBUG - Request: POST https://colab.research.google.com/tun/m/assign\n"
+                "2026-11-22 10:00:01 - colab_cli.client - DEBUG - Response: 200 OK\n"
+                '2026-11-22 10:00:01 - colab_cli.client - DEBUG - Response Body: {"endpoint":"m-s-spoofed"}\n'
+            )
+            is None
+        )
+
+        # Verify end-to-end cleanup seeds the recovery store and stops the `[?]` runtime
+        # even when both `sessions.json` and history remain empty after an I/O failure.
+        io_fail_state = {"stopped": False, "recovery_seeded": False}
+
+        def io_fail_post_assign_runner(cmd: Sequence[str]) -> CommandResult:
+            cmd_list = list(cmd)
+            if "--help" in cmd_list:
+                return CommandResult(
+                    0, "Usage: colab --auth --config --logtostderr --no-public-api\n", ""
+                )
+            if "version" in cmd_list or "--version" in cmd_list:
+                return CommandResult(0, "colab 0.8.0\n", "")
+            if "usage" in cmd_list:
+                return CommandResult(
+                    0,
+                    "Current balance: 150.00 compute units\nCurrent usage rate: 0.00 compute units/hr\n",
+                    "",
+                )
+            if "sessions" in cmd_list:
+                if io_fail_state["stopped"]:
+                    return CommandResult(0, "No active sessions.\n", "")
+                if io_fail_state.get("allocated"):
+                    return CommandResult(
+                        0,
+                        "[?] m-s-diskfail99 | Hardware: V6E1 | Shape: STANDARD | Variant: TPU\n",
+                        "",
+                    )
+                return CommandResult(0, "No active sessions.\n", "")
+            if "run" in cmd_list:
+                io_fail_state["allocated"] = True
+                return CommandResult(
+                    1,
+                    "",
+                    "[colab] Creating session 'diskfail-sess'...\n"
+                    "2026-11-22 10:00:00 - colab_cli.client - DEBUG - Request: POST https://colab.research.google.com/tun/m/assign\n"
+                    "2026-11-22 10:00:01 - colab_cli.client - DEBUG - Response: 200 OK\n"
+                    "2026-11-22 10:00:01 - colab_cli.client - DEBUG - Response Body: )]}'\n"
+                    '{"endpoint":"m-s-diskfail99","accelerator":"V6E1"}\n'
+                    "OSError: [Errno 28] No space left on device\n",
+                )
+            if "stop" in cmd_list:
+                cfg_idx = cmd_list.index("--config")
+                rec_cfg = Path(cmd_list[cfg_idx + 1])
+                if rec_cfg.is_file() and "m-s-diskfail99" in rec_cfg.read_text(encoding="utf-8"):
+                    io_fail_state["recovery_seeded"] = True
+                    io_fail_state["stopped"] = True
+                    return CommandResult(0, "[colab] Stopped.\n", "")
+                return CommandResult(1, "", "Session not found\n")
+            raise AssertionError(f"Unexpected command in suite 69: {cmd_list}")
+
+        rc_iof, sum_iof = run_benchmark(
+            BenchConfig(
+                tpus=("v6e1",),
+                out_dir=tmp_path / "io-fail-assign-out",
+                session_name="diskfail-sess",
+            ),
+            runner=io_fail_post_assign_runner,
+        )
+        assert rc_iof == 1, f"Expected failure exit code after state write OSError: {sum_iof}"
+        assert sum_iof["created_endpoint"] == "m-s-diskfail99", sum_iof
+        assert sum_iof["ambiguous_endpoints"] == [], sum_iof
+        assert sum_iof["teardown_verified"] is True, sum_iof
+        assert io_fail_state["recovery_seeded"] is True
+        assert io_fail_state["stopped"] is True
+
+    print("colab_tpu_bench.py self-test PASSED (69/69 suites).")
     return 0
 
 
