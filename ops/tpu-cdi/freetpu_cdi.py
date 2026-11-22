@@ -607,8 +607,10 @@ def _validate_container_edits(edits: Any, context: str, errors: List[str]) -> No
 
     if "env" in edits:
         env = edits["env"]
-        if not isinstance(env, list) or not all(isinstance(x, str) and "=" in x for x in env):
-            errors.append(f"{context}.env: must be a list of KEY=VALUE strings")
+        if not isinstance(env, list) or not all(
+            isinstance(x, str) and "=" in x and bool(x.split("=", 1)[0]) for x in env
+        ):
+            errors.append(f"{context}.env: must be a list of non-empty KEY=VALUE strings")
 
     if "deviceNodes" in edits:
         nodes = edits["deviceNodes"]

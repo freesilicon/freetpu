@@ -16,20 +16,20 @@
 #      Publishes boot-scoped `/var/run/cdi/freetpu.json` ONLY on TPU nodes
 #      explicitly labeled `freetpu.dev/cdi-enabled=true`.
 #      SECURITY PREREQUISITE (CVE-2026-53492 / GHSA-33vj-92qq-66hc / GCP-2026-037):
-#      Unpatched containerd 2.x releases allow a tenant with Pod creation rights
-#      to smuggle CDI annotations via untrusted container checkpoint restores and
-#      bypass DRA to access every published CDI device (including
-#      `freetpu.dev/tpu=all`). Before labeling any node `freetpu.dev/cdi-enabled=true`,
-#      verify the node runs a containerd release patched for CVE-2026-53492
-#      (`2.1.x` >= 2.1.9, `2.2.x` >= 2.2.5, `2.3.x` >= 2.3.2, or >= 2.4.0 —
-#      excluding vulnerable `2.0.x`, `2.1.0-2.1.8`, `2.2.0-2.2.4`, and
-#      `2.3.0-2.3.1` — or a distro/GKE patched build) OR that untrusted
-#      container checkpoint restores are disabled/blocked on the node.
-#      Telemetry-only installations should leave `freetpu.dev/cdi-enabled` unset.
-#      On graceful opt-out or DaemonSet deletion (`SIGTERM`), `freetpu-cdi-sync`
-#      passes `--unlink-on-exit` to remove `/var/run/cdi/freetpu.json`; after
-#      forced termination (`SIGKILL`), delete `/var/run/cdi/freetpu.json` on the
-#      host manually.
+#      Affected containerd releases (`2.1.0-2.1.8`, `2.2.0-2.2.4`, `2.3.0-2.3.1`,
+#      or vendor/GKE builds carrying checkpoint-restore backports) allow a tenant
+#      with Pod creation rights to smuggle CDI annotations via untrusted container
+#      checkpoint restores and bypass DRA to access every published CDI device
+#      (including `freetpu.dev/tpu=all`). Before labeling any node
+#      `freetpu.dev/cdi-enabled=true`, verify the node runs an unaffected or
+#      patched containerd release (upstream `2.0.x`, `2.1.x` >= 2.1.9,
+#      `2.2.x` >= 2.2.5, `2.3.x` >= 2.3.2, or >= 2.4.0; also verify vendor/GKE
+#      builds for backports) OR that untrusted container checkpoint restores are
+#      disabled/blocked on the node. Telemetry-only installations should leave
+#      `freetpu.dev/cdi-enabled` unset. On graceful opt-out or DaemonSet deletion
+#      (`SIGTERM`), `freetpu-cdi-sync` passes `--unlink-on-exit` to remove
+#      `/var/run/cdi/freetpu.json`; after forced termination (`SIGKILL`), delete
+#      `/var/run/cdi/freetpu.json` on the host manually.
 #
 # Prerequisite (create the required ConfigMap in kube-system first):
 #   kubectl -n kube-system create configmap freetpu-ops-scripts \
@@ -181,14 +181,14 @@ spec:
 # Opt-in CDI spec publisher DaemonSet.
 # Schedules ONLY on VFIO-backed TPU nodes explicitly labeled:
 #   kubectl label node <tpu-node> freetpu.dev/cdi-enabled=true
-# ONLY label nodes verified to run a containerd release patched for
-# CVE-2026-53492 (`2.1.x` >= 2.1.9, `2.2.x` >= 2.2.5, `2.3.x` >= 2.3.2, or
-# >= 2.4.0 — excluding `2.0.x`, `2.1.0-2.1.8`, `2.2.0-2.2.4`, `2.3.0-2.3.1` —
-# or a distro/GKE patched build for GHSA-33vj-92qq-66hc / GCP-2026-037) OR with
-# untrusted container checkpoint restores disabled/blocked. Removing the label
-# or deleting this DaemonSet triggers `--unlink-on-exit` on graceful shutdown
-# (`SIGTERM`); after forced termination (`SIGKILL`), delete `/var/run/cdi/freetpu.json`
-# on the host directly.
+# ONLY label nodes verified to run an unaffected or patched containerd release
+# for CVE-2026-53492 (upstream `2.0.x`, `2.1.x` >= 2.1.9, `2.2.x` >= 2.2.5,
+# `2.3.x` >= 2.3.2, or >= 2.4.0 — excluding affected `2.1.0-2.1.8`,
+# `2.2.0-2.2.4`, `2.3.0-2.3.1`, and checking vendor/GKE builds for backports
+# per GHSA-33vj-92qq-66hc / GCP-2026-037) OR with untrusted container checkpoint
+# restores disabled/blocked. Removing the label or deleting this DaemonSet
+# triggers `--unlink-on-exit` on graceful shutdown (`SIGTERM`); after forced
+# termination (`SIGKILL`), delete `/var/run/cdi/freetpu.json` on the host directly.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
