@@ -18,14 +18,14 @@
 # `/dev/accel*` v4 node pools (`tpu-v4-podslice`). Adjust `nodeAffinity` if your
 # cluster uses custom TPU node labels.
 #
-# 1. initContainer runs `freetpu_cdi.py generate` to populate boot-scoped
-#    `/var/run/cdi/freetpu.json` (and remove any stale spec on failure) before
-#    the agent becomes ready.
-# 2. `freetpu-cdi-sync` continuously revalidates live IOMMU group membership and
-#    PCI BDF bindings, regenerating `/var/run/cdi/freetpu.json` atomically on
-#    valid topology changes and unlinking it immediately if a VFIO group is
-#    reassigned or exposes a non-TPU device.
-# 3. `tpu-exporter` serves PCI/VFIO inventory and hostPID active-PID Prometheus
+# 1. `freetpu-cdi-sync` handles initial boot-scoped `/var/run/cdi/freetpu.json`
+#    publication and continuous revalidation/retries independently of
+#    `tpu-exporter`. It regenerates `/var/run/cdi/freetpu.json` atomically on
+#    valid topology changes and unlinks it immediately if a VFIO group is
+#    reassigned, missing, or exposes a non-TPU device—without blocking node
+#    telemetry when a chip is unhealthy or unbound.
+# 2. `tpu-exporter` always starts immediately and serves PCI/VFIO inventory
+#    (including unhealthy/unbound chips) and hostPID active-PID Prometheus
 #    `/metrics` on :9400 (with SYS_PTRACE + AppArmor Unconfined, required on GKE
 #    because GKE's default container AppArmor profile blocks ptrace-mediated
 #    `/proc/<pid>/fd` reads across peers with different AppArmor profiles;
@@ -73,30 +73,6 @@ spec:
         - key: google.com/tpu
           operator: Exists
           effect: NoSchedule
-      initContainers:
-        - name: freetpu-cdi-init
-          image: python:3.12-slim
-          command:
-            - python3
-            - /opt/freetpu/freetpu_cdi.py
-            - generate
-            - --output
-            - /var/run/cdi/freetpu.json
-            - --validate
-          securityContext:
-            privileged: true
-          volumeMounts:
-            - name: sysfs
-              mountPath: /sys
-              readOnly: true
-            - name: dev-vfio
-              mountPath: /dev/vfio
-              readOnly: true
-            - name: cdi-dir
-              mountPath: /var/run/cdi
-            - name: freetpu-ops
-              mountPath: /opt/freetpu
-              readOnly: true
       containers:
         - name: freetpu-cdi-sync
           image: python:3.12-slim

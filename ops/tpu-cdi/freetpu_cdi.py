@@ -645,6 +645,21 @@ def _parse_vfio_devnums_annotation(raw: Any) -> Dict[str, str]:
     return result
 
 
+_HOST_VALIDATED_CONTAINER_EDITS_KEYS = frozenset({"env", "deviceNodes"})
+
+
+def _check_host_safe_container_edits(edits: Any, context: str, errors: List[str]) -> None:
+    """Reject unchecked mounts, OCI hooks, or other non-VFIO edits in host-validated specs."""
+    if not isinstance(edits, dict):
+        return
+    disallowed = sorted(set(edits.keys()) - _HOST_VALIDATED_CONTAINER_EDITS_KEYS)
+    if disallowed:
+        errors.append(
+            f"{context}: disallowed containerEdits in host-validated TPU spec: {disallowed} "
+            "(mounts and OCI hooks are rejected in --check-host mode)"
+        )
+
+
 def verify_spec_against_host(
     spec: Any,
     *,
@@ -654,9 +669,10 @@ def verify_spec_against_host(
     """Revalidate all effective global and per-device CDI nodes against live host VFIO state.
 
     Verifies the exact host device CDI will inject (`hostPath` or fallback `path`),
-    rejects pinned `major`/`minor` numbers, validates global `containerEdits.deviceNodes`
-    (which CDI applies to every selector), checks that every VFIO group still maps to the
-    exact TPU PCI BDF(s) with zero non-TPU members, and flags changed char device numbers.
+    rejects pinned `major`/`minor` numbers, rejects unchecked `mounts` and OCI `hooks`,
+    validates global `containerEdits.deviceNodes` (which CDI applies to every selector),
+    checks that every VFIO group still maps to the exact TPU PCI BDF(s) with zero
+    non-TPU members, and flags changed char device numbers.
     """
     errors: List[str] = []
     if not isinstance(spec, dict):
@@ -692,8 +708,9 @@ def verify_spec_against_host(
             live_devnums_by_container_path[container_path] = dn
         live_by_host_resolved[str(host_p.resolve())] = (container_path, bdfs, dn)
 
-    # 1. Validate global containerEdits.deviceNodes (applied to EVERY selector).
+    # 1. Validate global containerEdits (applied to EVERY selector).
     global_edits = spec.get("containerEdits")
+    _check_host_safe_container_edits(global_edits, "containerEdits", errors)
     global_nodes: List[Dict[str, Any]] = []
     if isinstance(global_edits, dict) and isinstance(global_edits.get("deviceNodes"), list):
         for n_idx, node in enumerate(global_edits["deviceNodes"]):
@@ -731,12 +748,13 @@ def verify_spec_against_host(
     if not isinstance(devices, list) or not devices:
         return errors + ["devices must be a non-empty list"]
 
-    # 2. Validate every device's effective deviceNodes (global + per-device).
+    # 2. Validate every device's effective containerEdits and deviceNodes (global + per-device).
     for idx, dev in enumerate(devices):
         if not isinstance(dev, dict):
             continue
         name = dev.get("name", f"devices[{idx}]")
         edits = dev.get("containerEdits")
+        _check_host_safe_container_edits(edits, f"device {name!r} containerEdits", errors)
         dev_nodes = (
             edits.get("deviceNodes")
             if isinstance(edits, dict) and isinstance(edits.get("deviceNodes"), list)

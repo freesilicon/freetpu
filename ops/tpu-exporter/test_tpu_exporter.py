@@ -640,6 +640,102 @@ TPU Device Status
                 t.join(timeout=2.0)
                 th.join(timeout=2.0)
 
+    def test_shared_vfio_group_requires_pci_bdf_chip_id_map_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sysfs_root, dev_root, proc_root = _make_mock_pci_tree(
+                root,
+                devices=[
+                    {
+                        "bdf": "0000:00:05.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "12",
+                        "enable": "1",
+                    },
+                    {
+                        "bdf": "0000:00:06.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "12",  # shares /dev/vfio/12 with 0000:00:05.0
+                        "enable": "1",
+                    },
+                ],
+                create_vfio_nodes=["12"],
+            )
+
+            mock_tpu_info = root / "mock-tpu-info-shared.sh"
+            mock_tpu_info.write_text(
+                "#!/bin/sh\n"
+                "cat <<'EOF'\n"
+                "TPU Device Status\n"
+                "+-----------+---------------------------+--------------------+--------------------+-----------------------+\n"
+                "| Device ID | Memory Usage (Used/Total) | Memory Bar Gauge   | HBM Bandwidth Util | TensorCore Duty Cycle |\n"
+                "+-----------+---------------------------+--------------------+--------------------+-----------------------+\n"
+                "| 0         | 10.00 GiB / 31.25 GiB     | [|||.......] 32.0% | [||........] 20.0% | [||||||....] 60.0%    |\n"
+                "| 1         | 20.00 GiB / 31.25 GiB     | [||||||....] 64.0% | [||||......] 40.0% | [||||||||..] 80.0%    |\n"
+                "+-----------+---------------------------+--------------------+--------------------+-----------------------+\n"
+                "EOF\n",
+                encoding="utf-8",
+            )
+            mock_tpu_info.chmod(0o755)
+
+            # Ambiguous VFIO-path mapping for shared /dev/vfio/12 must be rejected.
+            with self.assertRaisesRegex(ValueError, "shared VFIO group"):
+                tpu_exporter.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin=str(mock_tpu_info),
+                    chip_id_map={"/dev/vfio/12": "0"},
+                )
+
+            # CLI must also fail cleanly (non-zero exit) on shared VFIO-path map.
+            bad_map = root / "bad-map.json"
+            bad_map.write_text(json.dumps({"/dev/vfio/12": "0"}), encoding="utf-8")
+            script = EXPORTER_DIR / "tpu_exporter.py"
+            cli_res = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "--once",
+                    "--sysfs-root",
+                    str(sysfs_root),
+                    "--dev-root",
+                    str(dev_root),
+                    "--proc-root",
+                    str(proc_root),
+                    "--tpu-info-bin",
+                    str(mock_tpu_info),
+                    "--chip-id-map",
+                    str(bad_map),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(cli_res.returncode, 0)
+            self.assertIn("shared VFIO group", cli_res.stderr)
+
+            # Explicit PCI BDF keys map each chip unambiguously without duplication.
+            snap = tpu_exporter.collect_snapshot(
+                sysfs_root=sysfs_root,
+                dev_root=dev_root,
+                proc_root=proc_root,
+                tpu_info_bin=str(mock_tpu_info),
+                chip_id_map={"0000:00:05.0": "0", "0000:00:06.0": "1"},
+            )
+            self.assertEqual(snap.devices[0].pci_bdf, "0000:00:05.0")
+            self.assertEqual(snap.devices[0].hbm_used_bytes, 10 * 1024**3)
+            self.assertAlmostEqual(snap.devices[0].duty_cycle_percent or 0.0, 60.0)
+            self.assertEqual(snap.devices[1].pci_bdf, "0000:00:06.0")
+            self.assertEqual(snap.devices[1].hbm_used_bytes, 20 * 1024**3)
+            self.assertAlmostEqual(snap.devices[1].duty_cycle_percent or 0.0, 80.0)
+            rt_map = {r.runtime_chip: r.mapped_pci_bdf for r in snap.runtime_utilization}
+            self.assertEqual(rt_map, {"0": "0000:00:05.0", "1": "0000:00:06.0"})
+
     def _assert_valid_prometheus_text(self, text: str) -> None:
         lines = [ln for ln in text.splitlines() if ln.strip()]
         self.assertGreater(len(lines), 0)

@@ -771,6 +771,43 @@ class FreeTpuCdiTests(unittest.TestCase):
             )
             self.assertTrue(any("explicit major/minor" in e for e in errs_pinned))
 
+            # 4. Global and per-device mounts and OCI hooks must be rejected in --check-host mode.
+            global_mount_spec = json.loads(json.dumps(base_spec))
+            global_mount_spec["containerEdits"]["mounts"] = [
+                {"hostPath": "/tmp", "containerPath": "/dev/vfio"}
+            ]
+            errs_gm = freetpu_cdi.verify_spec_against_host(
+                global_mount_spec, sysfs_root=sysfs_root, dev_root=dev_root
+            )
+            self.assertTrue(any("mounts" in e for e in errs_gm))
+
+            global_hook_spec = json.loads(json.dumps(base_spec))
+            global_hook_spec["containerEdits"]["hooks"] = [
+                {"hookName": "createRuntime", "path": "/bin/sh"}
+            ]
+            errs_gh = freetpu_cdi.verify_spec_against_host(
+                global_hook_spec, sysfs_root=sysfs_root, dev_root=dev_root
+            )
+            self.assertTrue(any("hooks" in e for e in errs_gh))
+
+            dev_mount_spec = json.loads(json.dumps(base_spec))
+            dev_mount_spec["devices"][0]["containerEdits"]["mounts"] = [
+                {"hostPath": "/tmp", "containerPath": "/dev/vfio"}
+            ]
+            errs_dm = freetpu_cdi.verify_spec_against_host(
+                dev_mount_spec, sysfs_root=sysfs_root, dev_root=dev_root
+            )
+            self.assertTrue(any("mounts" in e for e in errs_dm))
+
+            dev_hook_spec = json.loads(json.dumps(base_spec))
+            dev_hook_spec["devices"][0]["containerEdits"]["hooks"] = [
+                {"hookName": "createRuntime", "path": "/bin/sh"}
+            ]
+            errs_dh = freetpu_cdi.verify_spec_against_host(
+                dev_hook_spec, sysfs_root=sysfs_root, dev_root=dev_root
+            )
+            self.assertTrue(any("hooks" in e for e in errs_dh))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -533,6 +533,49 @@ def discover_tpu_devices(
     return discovered
 
 
+def _shared_vfio_paths(devices: Sequence[TpuTelemetry]) -> set[str]:
+    """Return `/dev/vfio/<group>` paths shared by more than one discovered TPU chip."""
+    counts: Dict[str, int] = {}
+    for d in devices:
+        if d.vfio_device:
+            counts[d.vfio_device] = counts.get(d.vfio_device, 0) + 1
+    return {vp for vp, count in counts.items() if count > 1}
+
+
+def validate_chip_id_map(
+    devices: Sequence[TpuTelemetry],
+    chip_id_map: Optional[Dict[str, str]],
+) -> None:
+    """Validate that `--chip-id-map` never uses a shared VFIO path or duplicates a runtime ID."""
+    if not chip_id_map:
+        return
+
+    shared_vfio = _shared_vfio_paths(devices)
+    for raw_key in chip_id_map:
+        norm_key = os.path.normpath(raw_key) if raw_key.startswith("/") else raw_key
+        if raw_key in shared_vfio or norm_key in shared_vfio:
+            raise ValueError(
+                f"--chip-id-map key {raw_key!r} targets a shared VFIO group; "
+                "use explicit PCI BDF keys for chips sharing a VFIO group"
+            )
+
+    seen_runtime_targets: Dict[str, str] = {}
+    for dev in devices:
+        mapped = chip_id_map.get(dev.pci_bdf)
+        if mapped is None and dev.vfio_device and dev.vfio_device not in shared_vfio:
+            mapped = chip_id_map.get(dev.vfio_device)
+        if mapped is None:
+            continue
+        rt_id = str(mapped)
+        prev_bdf = seen_runtime_targets.get(rt_id)
+        if prev_bdf is not None and prev_bdf != dev.pci_bdf:
+            raise ValueError(
+                f"--chip-id-map assigns runtime chip {rt_id!r} to multiple PCI BDFs "
+                f"({prev_bdf} and {dev.pci_bdf})"
+            )
+        seen_runtime_targets[rt_id] = dev.pci_bdf
+
+
 def collect_snapshot(
     sysfs_root: Path = Path("/sys"),
     dev_root: Path = Path("/dev"),
@@ -544,6 +587,8 @@ def collect_snapshot(
     """Collect PCI/VFIO discovery, procfs PID handles, and `tpu-info` metrics."""
     t0 = time.monotonic()
     devices = discover_tpu_devices(sysfs_root=sysfs_root, dev_root=dev_root)
+    shared_vfio = _shared_vfio_paths(devices)
+    validate_chip_id_map(devices, chip_id_map)
 
     # Scan /proc/<pid>/fd for open handles to <dev_root>/vfio/<group>.
     real_vfio_paths = [
@@ -566,6 +611,7 @@ def collect_snapshot(
     for dev in devices:
         dev_real_vfio = str(dev_root / "vfio" / dev.iommu_group) if dev.iommu_group else ""
         pids = list(proc_pids.get(dev_real_vfio, []))
+        is_shared_vfio = bool(dev.vfio_device and dev.vfio_device in shared_vfio)
 
         # Attach `TPU Chips` rows strictly by verified /dev/vfio/<group> or PCI BDF.
         chips_row: Optional[_TpuInfoRow] = None
@@ -581,17 +627,22 @@ def collect_snapshot(
                     pids.append(p)
 
         # Attach `TPU Runtime Utilization` rows strictly via verified hardware/map IDs
-        # (vfio_device, pci_bdf, sysfs chip_id, or explicit chip_id_map). Never infer
-        # runtime chip IDs from PCI enumeration order or IOMMU group numbers.
+        # (pci_bdf, unique non-shared vfio_device, sysfs chip_id, or explicit chip_id_map).
+        # Never infer runtime chip IDs from PCI enumeration order, IOMMU group numbers,
+        # or a VFIO path shared by multiple chips.
         verified_runtime_id = dev.runtime_chip_id
         if not verified_runtime_id and chip_id_map:
-            verified_runtime_id = chip_id_map.get(dev.pci_bdf) or chip_id_map.get(dev.vfio_device)
+            verified_runtime_id = chip_id_map.get(dev.pci_bdf)
+            if verified_runtime_id is None and not is_shared_vfio and dev.vfio_device:
+                verified_runtime_id = chip_id_map.get(dev.vfio_device)
             if verified_runtime_id is not None:
                 verified_runtime_id = str(verified_runtime_id)
         if verified_runtime_id:
             dev.runtime_chip_id = verified_runtime_id
 
-        util_candidates = [dev.vfio_device, dev.pci_bdf]
+        util_candidates: List[str] = [dev.pci_bdf]
+        if dev.vfio_device and not is_shared_vfio:
+            util_candidates.append(dev.vfio_device)
         if verified_runtime_id:
             util_candidates.append(verified_runtime_id)
 
@@ -1046,6 +1097,9 @@ class _ExporterHandler(BaseHTTPRequestHandler):
             except TimeoutError as exc:
                 self._send(503, "text/plain; charset=utf-8", f"{exc}\n")
                 return
+            except ValueError as exc:
+                self._send(500, "text/plain; charset=utf-8", f"{exc}\n")
+                return
             finally:
                 self.server._scrape_sem.release()
             self._send(
@@ -1062,6 +1116,9 @@ class _ExporterHandler(BaseHTTPRequestHandler):
                 snap = self.server.scrape()
             except TimeoutError as exc:
                 self._send(503, "text/plain; charset=utf-8", f"{exc}\n")
+                return
+            except ValueError as exc:
+                self._send(500, "text/plain; charset=utf-8", f"{exc}\n")
                 return
             finally:
                 self.server._scrape_sem.release()
@@ -1152,7 +1209,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--chip-id-map",
         type=Path,
         default=None,
-        help="Optional JSON mapping {pci_bdf_or_vfio_path: runtime_chip_id} for verified tpu-info joins.",
+        help=(
+            "Optional JSON mapping {pci_bdf_or_unique_vfio_path: runtime_chip_id} "
+            "for verified tpu-info joins (shared VFIO groups require explicit PCI BDF keys)."
+        ),
     )
     parser.add_argument(
         "--max-workers",
@@ -1167,17 +1227,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     tpu_info_bin = args.tpu_info_bin if args.tpu_info_bin else None
-    chip_id_map = _load_chip_id_map(args.chip_id_map)
+    try:
+        chip_id_map = _load_chip_id_map(args.chip_id_map)
+        if chip_id_map:
+            initial_devices = discover_tpu_devices(
+                sysfs_root=args.sysfs_root,
+                dev_root=args.dev_root,
+            )
+            validate_chip_id_map(initial_devices, chip_id_map)
+    except ValueError as exc:
+        sys.stderr.write(f"freetpu tpu-exporter error: {exc}\n")
+        return 1
 
     if args.once or args.json:
-        snap = collect_snapshot(
-            sysfs_root=args.sysfs_root,
-            dev_root=args.dev_root,
-            proc_root=args.proc_root,
-            tpu_info_bin=tpu_info_bin,
-            tpu_info_timeout_s=args.tpu_info_timeout,
-            chip_id_map=chip_id_map,
-        )
+        try:
+            snap = collect_snapshot(
+                sysfs_root=args.sysfs_root,
+                dev_root=args.dev_root,
+                proc_root=args.proc_root,
+                tpu_info_bin=tpu_info_bin,
+                tpu_info_timeout_s=args.tpu_info_timeout,
+                chip_id_map=chip_id_map,
+            )
+        except ValueError as exc:
+            sys.stderr.write(f"freetpu tpu-exporter error: {exc}\n")
+            return 1
         if args.json:
             sys.stdout.write(snapshot_to_json(snap))
         else:
