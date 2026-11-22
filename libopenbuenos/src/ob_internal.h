@@ -12,16 +12,19 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace ob {
 
-constexpr uint32_t kDefaultGraphCacheCapacity = 64u;
-constexpr size_t   kDefaultBufferPoolMaxBytes = 64u * 1024u * 1024u;
-constexpr uint32_t kDefaultTimeoutMs          = 5000u;
+constexpr uint32_t kDefaultGraphCacheCapacity     = 256u;
+constexpr size_t   kDefaultBufferPoolMaxBytes     = 64u * 1024u * 1024u;
+constexpr size_t   kDefaultBufferPoolMaxCount     = 256u;
+constexpr size_t   kDefaultWeightCacheMaxEntries  = 4096u;
+constexpr uint32_t kDefaultTimeoutMs              = 5000u;
 constexpr uint32_t kDefaultTileMaxM           = 64u;
-constexpr uint32_t kDefaultTileMaxK           = 512u;
-constexpr uint32_t kDefaultTileMaxN           = 256u;
+constexpr uint32_t kDefaultTileMaxK           = 2048u;
+constexpr uint32_t kDefaultTileMaxN           = 2048u;
 
 uint64_t monotonic_now_ns();
 
@@ -194,9 +197,19 @@ struct CachedWeightTile {
   uint64_t in_use = 0;
 };
 
-// Token-invariant weight-tile output scale ratio D (implemented in ob_gemm.cpp).
+// Token-invariant weight-tile output scale ratio D and activation outlier/RMS helpers (ob_gemm.cpp).
+uint32_t quant_scale_D_grid(double raw_d);
 uint32_t compute_tile_scale_D(const int8_t* b_tile, uint32_t tn, uint32_t tk,
                               uint32_t stride_k, int32_t zp_a = 0);
+void quantize_activation_row_split(const float* a_row,
+                                   uint32_t tk,
+                                   int8_t* aq_row,
+                                   float* out_s_a,
+                                   std::vector<std::pair<uint32_t, float>>* out_outliers);
+uint32_t compute_activation_rms_shift(const int8_t* aq_tile,
+                                      uint32_t tm,
+                                      uint32_t tk,
+                                      uint32_t hw_k);
 
 // Clean-room C++17 Tensor G5 GEMM emitter internals (implemented in ob_gemm_emitter.cpp)
 struct GemmSynthResult {
@@ -232,6 +245,37 @@ std::vector<uint8_t> pack_ext2_for_tile(uint32_t N, uint32_t K,
                                         const int8_t* weights_nk,
                                         const int32_t* bias_n);
 
+// Pack weights (+ optional bias) into exact buenos_a0 M=64 large-tile ext[2] layout
+// (8-channel groups: 128 B padded bias header + K/16 blocks of 8x16 weights ^ 0x80).
+std::vector<uint8_t> pack_ext2_for_lt_64x(uint32_t N, uint32_t K,
+                                          const int8_t* weights_nk,
+                                          const int32_t* bias_n);
+
+// Mode-A zero-overhead (+0 B) in-place chunk[5] 0x640 + HDR_DATA SiLU/GELU fusion.
+// Allows decoupled (s_mid, zp_mid) -> (s_out, zp_out) for arbitrary quantization.
+ob_status_t apply_mode_a_fusion_c5(std::vector<uint8_t>* chunk5,
+                                   uint32_t activation,
+                                   float s_mid,
+                                   int32_t zp_mid,
+                                   float s_out,
+                                   int32_t zp_out,
+                                   float* out_max_lsb_err,
+                                   std::string* err);
+
+// Exact FP32-RNE Horner simulator for chunk[5] Mode-A fused 0x640 + HDR_DATA.
+ob_status_t simulate_c5_mode_a_fused(const std::vector<uint8_t>& chunk5,
+                                     const uint8_t* u_mid,
+                                     size_t count,
+                                     int8_t* out_q8,
+                                     std::string* err);
+
+// Check whether a dimension is a proven M=1 large-tile dimension ({512,576,1024,1536,2048}).
+bool is_lt_1x_dim(uint32_t d);
+
+// Check whether (M, K, N) is a proven M=64 batched prefill large-tile shape
+// (M==64, K in {512,576,1024,1536}, N in [128..1536] step 32, K+N <= 3072).
+bool is_lt_64x_shape(uint32_t M, uint32_t K, uint32_t N);
+
 ob_status_t builtin_gemm_emitter_cb(const ob_gemm_desc_t* desc,
                                     uint8_t* out_buf,
                                     size_t out_cap,
@@ -264,6 +308,13 @@ struct ob_context {
   int resp_efd = -1;
   int err_efd = -1;
   bool wake_locked = false;
+  // Firmware VII Execute +0x1c fw_priority & Litebuf AcquireWakeLock (union_type=4) state
+  uint8_t fw_priority = 0x01u;
+  bool fw_wakelock_enabled = true;
+  bool fw_wakelock_held = false;
+  uint8_t fw_wakelock_core = 0u;
+  uint8_t fw_wakelock_mem = 0u;
+  uint8_t fw_wakelock_bitset = 0u;
   uint32_t credit_size = OB_MAX_CREDITS;
   uint32_t fw_major = 0;
   uint32_t fw_minor = 0;
@@ -324,9 +375,16 @@ struct ob_context {
   std::unordered_map<uint64_t, ob::CachedWeightTile*> weight_cache_map;
   std::list<ob::CachedWeightTile*> weight_cache_lru;
   size_t weight_cache_bytes = 0;
-  size_t weight_cache_max_bytes = 0; // lazily initialized on first use (256 MiB mock / 2048 MiB HW)
+  size_t weight_cache_max_bytes = 0;   // lazily initialized (256 MiB mock / 2048 MiB HW)
+  size_t weight_cache_max_entries = 0; // FD-safe cap (default 4096, env OPENBUENOS_WEIGHT_CACHE_ENTRIES)
   uint64_t weight_cache_hits = 0;
   uint64_t weight_cache_misses = 0;
+
+  // Reusable GEMM host scratch buffers (eliminates per-call malloc/free in hot loop)
+  std::vector<int8_t> gemm_aq_scratch;
+  std::vector<int8_t> gemm_bq_scratch;
+  std::vector<int8_t> gemm_out_scratch;
+  std::vector<float> gemm_wrow_scratch;
 
   // Diagnostics
   mutable std::mutex err_mu;

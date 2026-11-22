@@ -18,10 +18,13 @@ void print_usage(const char* argv0) {
   std::fprintf(stderr,
       "Usage:\n"
       "  %s --mock\n"
-      "  %s --dgc0 <model.dgc0> [--in <in.bin>] [--ref <ref.bin>] [--iters <N>]\n"
-      "  %s --emit-gemm <M> <K> <N> [--dive-interp <path>] [--iters <N>] [--mock]\n"
-      "  %s --probe-dyn-weights [--dive-interp <path>] [--mock]\n",
-      argv0, argv0, argv0, argv0);
+      "  %s --dgc0 <model.dgc0> [--in <in.bin>] [--ref <ref.bin>] [--iters <N>] [--perf-mode <0..5>]\n"
+      "  %s --emit-gemm <M> <K> <N> [--dive-interp <path>] [--iters <N>] [--perf-mode <0..5>] [--mock]\n"
+      "  %s --test-quant-batch [--dive-interp <path>] [--iters <N>] [--perf-mode <0..5>] [--mock]\n"
+      "  %s --probe-dyn-weights [--dive-interp <path>] [--mock]\n"
+      "  %s --test-fused-act [--dive-interp <path>] [--mock]\n"
+      "  %s --test-outlier-spike [--dive-interp <path>] [--mock]\n",
+      argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 bool read_file(const char* path, std::vector<uint8_t>* out) {
@@ -135,7 +138,7 @@ int run_mock_smoke() {
 }
 
 int run_emit_gemm(uint32_t M, uint32_t K, uint32_t N,
-                  int iters, const char* dive_interp_path, bool mock) {
+                  int iters, int perf_mode, const char* dive_interp_path, bool mock) {
   if (M == 0u || K == 0u || N == 0u) {
     std::fprintf(stderr, "--emit-gemm requires M, K, N > 0\n");
     return 2;
@@ -145,6 +148,7 @@ int run_emit_gemm(uint32_t M, uint32_t K, uint32_t N,
   cfg.mock_mode = mock ? 1 : 0;
   cfg.max_inflight = 16u;
   cfg.graph_cache_capacity = 512u;
+  if (perf_mode >= 0) cfg.perf_mode = static_cast<uint32_t>(perf_mode);
 
   ob_context_t* ctx = nullptr;
   ob_status_t st = ob_context_create(&cfg, &ctx);
@@ -161,12 +165,13 @@ int run_emit_gemm(uint32_t M, uint32_t K, uint32_t N,
     return 1;
   }
 
-  st = ob_gemm_set_tile_limits(ctx, 16u, 512u, 128u);
-  if (st != OB_OK) {
-    std::fprintf(stderr, "ob_gemm_set_tile_limits failed: %s\n", ob_status_string(st));
-    ob_context_destroy(ctx);
-    return 1;
-  }
+  // Mirror ob_gemm.cpp tile limits (M=1 lt_1x* up to 2048, M>=2 lt_64x up to 1536)
+  const char* lt_dis = std::getenv("OPENBUENOS_DISABLE_LARGE_TILES");
+  const char* blt_dis = std::getenv("OPENBUENOS_DISABLE_BATCHED_LARGE_TILES");
+  const bool lt_enabled = !(lt_dis && lt_dis[0] == '1');
+  const bool blt_enabled = lt_enabled && !(blt_dis && blt_dis[0] == '1');
+  const bool use_lt1 = lt_enabled && K >= 192u && N >= 192u && (K >= 512u || N >= 512u);
+  const bool use_lt64 = blt_enabled && M >= 2u && K >= 256u && N >= 128u;
 
   // Construct deterministic non-trivial B[N, K] where every 8-element K-block
   // has one +1 and one -1 at distinct row- and block-dependent positions.
@@ -193,13 +198,60 @@ int run_emit_gemm(uint32_t M, uint32_t K, uint32_t N,
   // |acc_tile / D| << 127 (zero clipping).
   std::vector<int8_t> a_mk(static_cast<size_t>(M) * K, 0);
   {
+    auto build_k_slices = [&](uint32_t tm_cur) -> std::vector<std::pair<uint32_t, uint32_t>> {
+      std::vector<std::pair<uint32_t, uint32_t>> ks;
+      if (tm_cur >= 2u && use_lt64) {
+        static constexpr uint32_t kSteps[4] = {1536u, 1024u, 576u, 512u};
+        uint32_t off = 0u;
+        while (off < K) {
+          uint32_t rem = K - off;
+          if (rem <= 1536u) {
+            ks.push_back({off, rem});
+            break;
+          }
+          uint32_t take = 512u;
+          for (uint32_t s : kSteps) {
+            if (s <= rem) { take = s; break; }
+          }
+          ks.push_back({off, take});
+          off += take;
+        }
+      } else if (tm_cur == 1u && use_lt1) {
+        static constexpr uint32_t kSteps[4] = {2048u, 1536u, 1024u, 512u};
+        uint32_t off = 0u;
+        while (off < K) {
+          uint32_t rem = K - off;
+          if (rem <= 2048u) {
+            ks.push_back({off, rem});
+            break;
+          }
+          uint32_t take = 512u;
+          for (uint32_t s : kSteps) {
+            if (s <= rem) { take = s; break; }
+          }
+          ks.push_back({off, take});
+          off += take;
+        }
+      } else {
+        const uint32_t k_step = (tm_cur == 1u) ? 512u : 64u;
+        for (uint32_t k0 = 0u; k0 < K; k0 += k_step) {
+          ks.push_back({k0, std::min(k_step, K - k0)});
+        }
+      }
+      return ks;
+    };
+
     uint32_t m0 = 0u;
     while (m0 < M) {
-      uint32_t tm = std::min<uint32_t>(M - m0, 16u);
-      const uint32_t k_step = (tm == 1u) ? 512u : 64u;
-      for (uint32_t k0 = 0; k0 < K; k0 += k_step) {
-        const uint32_t tk = std::min(k_step, K - k0);
-        const uint32_t D = selftest_scale_D_for_tile(tk);
+      const uint32_t rem_m = M - m0;
+      const uint32_t tm = use_lt64
+          ? ((rem_m == 1u) ? 1u : std::min<uint32_t>(rem_m, 64u))
+          : std::min<uint32_t>(rem_m, 16u);
+      auto ks = build_k_slices(tm);
+      for (const auto& kv : ks) {
+        const uint32_t k0 = kv.first;
+        const uint32_t tk = kv.second;
+        const uint32_t D = ob::compute_tile_scale_D(b_nk.data() + k0, N, tk, K, 0);
         const int32_t max_q = (D * 2u <= 120u && tk <= 64u) ? 2 : 1;
         for (uint32_t mi = 0; mi < tm; ++mi) {
           const uint32_t m = m0 + mi;
@@ -353,9 +405,9 @@ int run_emit_gemm(uint32_t M, uint32_t K, uint32_t N,
         }
       }
       f32_nmse = mse / std::max(ref_e, 1e-30);
-      if (f32_tok2_hits != f32_tok2_tiles) {
-        std::fprintf(stderr, "Expected token-invariant cache hits %u/%u on f32_q8_0, got %u/%u\n",
-                     f32_tok2_tiles, f32_tok2_tiles, f32_tok2_hits, f32_tok2_tiles);
+      if (f32_tok2_hits < last_stats.tiles_dispatched) {
+        std::fprintf(stderr, "Expected token-invariant cache hits >=%u on f32_q8_0, got %u/%u\n",
+                     last_stats.tiles_dispatched, f32_tok2_hits, f32_tok2_tiles);
         ok = false;
       }
       const double nmse_thresh = (static_cast<size_t>(M) * N < 64u) ? 1.0e-3 : 5.0e-4;
@@ -370,9 +422,12 @@ int run_emit_gemm(uint32_t M, uint32_t K, uint32_t N,
   uint64_t cache_hits_tot = 0, cache_misses_tot = 0, cache_evict_tot = 0;
   ob_context_graph_cache_stats(ctx, &cache_entries, &cache_hits_tot, &cache_misses_tot, &cache_evict_tot);
 
-  std::printf("openbuenos_selftest: ok=%d emit_gemm=%ux%ux%u iters=%d tiles=%u cache_hits=%u "
-              "models=%zu hw_us=%llu wall_us=%llu max_abs_err=%lld f32_nmse=%.2e f32_tok2_hits=%u/%u\n",
+  std::printf("openbuenos_selftest: ok=%d emit_gemm=%ux%ux%u iters=%d pm=%u core=0x%02x mem=0x%02x wl=%d "
+              "tiles=%u cache_hits=%u models=%zu hw_us=%llu wall_us=%llu max_abs_err=%lld "
+              "f32_nmse=%.2e f32_tok2_hits=%u/%u\n",
               ok ? 1 : 0, M, K, N, iters,
+              ctx->cfg.perf_mode, ctx->cfg.core_power_state, ctx->cfg.mem_power_state,
+              ctx->fw_wakelock_held ? 1 : 0,
               last_stats.tiles_dispatched, last_stats.cache_hits,
               cache_entries,
               static_cast<unsigned long long>(last_stats.hw_execution_us),
@@ -719,24 +774,468 @@ int run_probe_dyn_weights(const char* dive_interp_path, bool mock) {
   return 0;
 }
 
+int run_test_fused_act(const char* dive_interp_path, bool mock) {
+  ob_config_t cfg = ob_config_default();
+  cfg.mock_mode = mock ? 1 : 0;
+  cfg.max_inflight = 16u;
+  cfg.graph_cache_capacity = 64u;
+  ob_context_t* ctx = nullptr;
+  ob_status_t st = ob_context_create(&cfg, &ctx);
+  if (st != OB_OK || !ctx) {
+    std::fprintf(stderr, "fused-act ob_context_create failed: %s\n", ob_status_string(st));
+    return 1;
+  }
+  st = ob_gemm_register_builtin_emitter(ctx, dive_interp_path);
+  if (st != OB_OK) {
+    std::fprintf(stderr, "fused-act ob_gemm_register_builtin_emitter failed: %s (%s)\n",
+                 ob_status_string(st), ob_context_last_error(ctx));
+    ob_context_destroy(ctx);
+    return 1;
+  }
+
+  struct CaseSpec {
+    const char* name;
+    uint32_t act;
+    uint32_t M, K, N;
+    float s_in, s_w, s_out;
+    int32_t zp_out;
+  };
+  const CaseSpec cases[4] = {
+      {"silu_1x16x16",    OB_ACT_SILU, 1u,  16u,   16u, 0.0625f, 0.0625f, 0.0625f, 0},
+      {"gelu_1x16x16",    OB_ACT_GELU, 1u,  16u,   16u, 0.0625f, 0.0625f, 0.0625f, 0},
+      {"silu_1x576x1536", OB_ACT_SILU, 1u, 576u, 1536u, 0.0625f, 0.0625f, 0.0625f, 0},
+      {"gelu_1x576x1536", OB_ACT_GELU, 1u, 576u, 1536u, 0.0625f, 0.0625f, 0.0625f, 0},
+  };
+
+  bool all_ok = true;
+  for (const CaseSpec& cs : cases) {
+    // Build sparse deterministic weights so acc spans [-8.0, +7.9] cleanly
+    std::vector<int8_t> a(static_cast<size_t>(cs.M) * cs.K, 0);
+    std::vector<int8_t> w(static_cast<size_t>(cs.N) * cs.K, 0);
+    std::vector<int32_t> bias(cs.N, 0);
+    for (uint32_t k = 0; k < cs.K; ++k) {
+      a[k] = static_cast<int8_t>(static_cast<int32_t>((k * 17u + 5u) % 33u) - 16);
+    }
+    for (uint32_t n = 0; n < cs.N; ++n) {
+      // 4 active taps per row so acc * real_mul sweeps full [-120..+120] range
+      for (uint32_t t = 0; t < 4u; ++t) {
+        uint32_t k = (n * 7u + t * (cs.K / 4u)) % cs.K;
+        w[static_cast<size_t>(n) * cs.K + k] = static_cast<int8_t>(((n + t) & 1u) ? -12 : 12);
+      }
+      bias[n] = (static_cast<int32_t>(n % 240u) - 120) * 16;
+    }
+
+    ob_gemm_desc_t desc {};
+    desc.m_dim = cs.M;
+    desc.k_dim = cs.K;
+    desc.n_dim = cs.N;
+    desc.s_in = cs.s_in;
+    desc.zp_in = 0;
+    desc.s_w = cs.s_w;
+    desc.zp_w = 0;
+    desc.s_out = cs.s_out;
+    desc.zp_out = cs.zp_out;
+    desc.activation = cs.act;
+    desc.weights_nk = w.data();
+    desc.bias_n = bias.data();
+
+    ob::GemmSynthResult syn{};
+    std::string err;
+    st = ob::synthesize_gemm_parts(desc, &syn, &err);
+    std::vector<uint8_t> dgc0;
+    if (st == OB_OK) {
+      st = ob::build_dgc0_from_parts(desc, syn, ctx->builtin_dive_interp.data(),
+                                     ctx->builtin_dive_interp.size(), &dgc0, &err);
+    }
+    if (st != OB_OK) {
+      std::fprintf(stderr, "fused-act %s synth failed: %s (%s)\n",
+                   cs.name, ob_status_string(st), err.c_str());
+      all_ok = false;
+      continue;
+    }
+
+    // Compute simulated expected output from exact u_mid + Mode-A 0x640 spline
+    const float rm = (cs.s_in * cs.s_w) / cs.s_out;
+    std::vector<uint8_t> u_mid(cs.N, 0u);
+    for (uint32_t n = 0; n < cs.N; ++n) {
+      int32_t acc = bias[n];
+      for (uint32_t k = 0; k < cs.K; ++k) {
+        acc += static_cast<int32_t>(a[k]) * static_cast<int32_t>(w[static_cast<size_t>(n) * cs.K + k]);
+      }
+      int32_t q = static_cast<int32_t>(std::nearbyint(static_cast<float>(acc) * rm + static_cast<float>(cs.zp_out + 128)));
+      if (q < 0) q = 0;
+      if (q > 255) q = 255;
+      u_mid[n] = static_cast<uint8_t>(q);
+    }
+    std::vector<int8_t> ref_out(cs.N, 0);
+    st = ob::simulate_c5_mode_a_fused(syn.chunks[5], u_mid.data(), cs.N, ref_out.data(), &err);
+    if (st != OB_OK) {
+      std::fprintf(stderr, "fused-act %s sim failed: %s\n", cs.name, err.c_str());
+      all_ok = false;
+      continue;
+    }
+
+    ob_graph_t* g = nullptr;
+    ob_buffer_t* in_b = nullptr;
+    ob_buffer_t* out_b = nullptr;
+    st = ob_graph_register_dgc0(ctx, dgc0.data(), dgc0.size(), 0u, &g);
+    if (st == OB_OK) st = ob_buffer_alloc(ctx, std::max<size_t>(a.size(), 4096u), OB_BUF_TO_DEVICE | OB_BUF_ZERO_INIT, &in_b);
+    if (st == OB_OK) st = ob_buffer_alloc(ctx, std::max<size_t>(cs.N, 4096u), OB_BUF_FROM_DEVICE | OB_BUF_ZERO_INIT, &out_b);
+    if (st == OB_OK) st = ob_buffer_write(in_b, a.data(), a.size(), 0u);
+    ob_invoke_stats_t ist {};
+    if (st == OB_OK) st = ob_graph_invoke(g, &in_b, 1u, &out_b, 1u, &ist);
+
+    int max_err = 0;
+    if (st == OB_OK && !mock) {
+      std::vector<int8_t> got(cs.N, 0);
+      st = ob_buffer_read(out_b, got.data(), cs.N, 0u);
+      if (st == OB_OK) {
+        for (uint32_t n = 0; n < cs.N; ++n) {
+          int d = std::abs(static_cast<int>(got[n]) - static_cast<int>(ref_out[n]));
+          if (d > max_err) max_err = d;
+        }
+      }
+    }
+    const bool ok = (st == OB_OK) && (mock || max_err == 0);
+    if (!ok) all_ok = false;
+    std::printf("fused_act[%s]: ok=%d c5_bytes=%zu hw_us=%llu wall_us=%llu max_abs_err=%d\n",
+                cs.name, ok ? 1 : 0, syn.chunks[5].size(),
+                static_cast<unsigned long long>(ist.hw_execution_us),
+                static_cast<unsigned long long>(ist.wall_time_us),
+                mock ? -1 : max_err);
+
+    if (out_b) ob_buffer_free(out_b);
+    if (in_b) ob_buffer_free(in_b);
+    if (g) ob_graph_release(g);
+  }
+
+  ob_context_destroy(ctx);
+  return all_ok ? 0 : 1;
+}
+
+int run_test_outlier_spike(const char* dive_interp_path, bool mock) {
+  ob_config_t cfg = ob_config_default();
+  cfg.mock_mode = mock ? 1 : 0;
+  cfg.max_inflight = 16u;
+  cfg.graph_cache_capacity = 256u;
+  ob_context_t* ctx = nullptr;
+  ob_status_t st = ob_context_create(&cfg, &ctx);
+  if (st != OB_OK || !ctx) return 1;
+  st = ob_gemm_register_builtin_emitter(ctx, dive_interp_path);
+  if (st != OB_OK) {
+    std::fprintf(stderr, "outlier-spike emitter failed: %s\n", ob_context_last_error(ctx));
+    ob_context_destroy(ctx);
+    return 1;
+  }
+
+  constexpr uint32_t M = 1u, K = 1536u, N = 256u, nb_k = K / OB_QK8_0;
+  uint32_t prng = 0x51A7BEEFu;
+  auto next_g = [&]() -> float {
+    float s = 0.0f;
+    for (int i = 0; i < 6; ++i) {
+      prng = prng * 1664525u + 1013904223u;
+      s += (static_cast<float>(prng >> 8) / static_cast<float>(1u << 23)) - 1.0f;
+    }
+    return s * 0.7071f;
+  };
+
+  auto run_case = [&](const char* label, bool force_retry) -> bool {
+    std::vector<float> a(K), b_f(static_cast<size_t>(N) * K);
+    for (float& v : a) v = force_retry ? (next_g() * 0.1f) : next_g();
+    for (float& v : b_f) v = force_retry ? (next_g() * 0.1f) : next_g();
+    if (!force_retry) {
+      // 40-sigma Qwen2.5 attention-sink spike with tiny weight columns (bulk dominates!)
+      a[17] = 50.0f;
+      a[513] = -42.0f;
+      for (uint32_t n = 0; n < N; ++n) {
+        b_f[static_cast<size_t>(n) * K + 17] *= 0.02f;
+        b_f[static_cast<size_t>(n) * K + 513] *= 0.02f;
+      }
+    } else {
+      // 20 aligned spikes (>8 peel cap) + aligned super-weights -> triggers live TPU retry!
+      for (uint32_t s = 0; s < 20u; ++s) {
+        a[s * 32u] = 40.0f;
+        for (uint32_t n = 0; n < 4u; ++n) b_f[static_cast<size_t>(n) * K + s * 32u] = 2.0f;
+      }
+    }
+
+    std::vector<ob_block_q8_0_t> bq8(static_cast<size_t>(N) * nb_k);
+    std::vector<float> b_deq(static_cast<size_t>(N) * K);
+    for (uint32_t n = 0; n < N; ++n) {
+      for (uint32_t bi = 0; bi < nb_k; ++bi) {
+        float am = 0.0f;
+        for (uint32_t j = 0; j < OB_QK8_0; ++j) {
+          float av = std::fabs(b_f[static_cast<size_t>(n) * K + bi * OB_QK8_0 + j]);
+          if (av > am) am = av;
+        }
+        uint16_t dh = fp32_to_fp16(am > 0.0f ? (am / 127.0f) : 1.0f);
+        float d = fp16_to_fp32(dh);
+        ob_block_q8_0_t& blk = bq8[static_cast<size_t>(n) * nb_k + bi];
+        blk.d = dh;
+        for (uint32_t j = 0; j < OB_QK8_0; ++j) {
+          long q = (d > 0.0f) ? std::lround(b_f[static_cast<size_t>(n) * K + bi * OB_QK8_0 + j] / d) : 0L;
+          if (q < -127) q = -127;
+          if (q > 127) q = 127;
+          blk.qs[j] = static_cast<int8_t>(q);
+          b_deq[static_cast<size_t>(n) * K + bi * OB_QK8_0 + j] = d * static_cast<float>(blk.qs[j]);
+        }
+      }
+    }
+
+    std::vector<float> c(N, 0.0f);
+    ob_invoke_stats_t stats {};
+    st = ob_gemm_matmul_f32_q8_0(ctx, a.data(), bq8.data(), c.data(), M, K, N, &stats);
+    double mse = 0.0, ref_e = 0.0;
+    for (uint32_t n = 0; n < N; ++n) {
+      double ref = 0.0;
+      for (uint32_t k = 0; k < K; ++k) ref += static_cast<double>(a[k]) * static_cast<double>(b_deq[static_cast<size_t>(n) * K + k]);
+      double diff = static_cast<double>(c[n]) - ref;
+      mse += diff * diff;
+      ref_e += ref * ref;
+    }
+    double nmse = mse / std::max(ref_e, 1e-30);
+    bool ok = (st == OB_OK) &&
+              ((stats.flags & OB_STAT_FLAG_EMITTER_USED) != 0u) &&
+              (mock || (stats.flags & OB_STAT_FLAG_CPU_FALLBACK) == 0u) &&
+              (nmse < (force_retry ? 2.0e-3 : 1.5e-3)) &&
+              (mock || !force_retry || stats.tiles_dispatched >= 2u);
+    std::printf("outlier_spike[%s]: ok=%d tiles=%u hw_us=%llu wall_us=%llu nmse=%.2e cpu_fb=%d\n",
+                label, ok ? 1 : 0, stats.tiles_dispatched,
+                static_cast<unsigned long long>(stats.hw_execution_us),
+                static_cast<unsigned long long>(stats.wall_time_us),
+                nmse, (stats.flags & OB_STAT_FLAG_CPU_FALLBACK) ? 1 : 0);
+    return ok;
+  };
+
+  bool ok1 = run_case("40sigma_peel_1x1536x256", false);
+  bool ok2 = run_case("12spike_tpu_retry_1x1536x256", true);
+  ob_context_destroy(ctx);
+  return (ok1 && ok2) ? 0 : 1;
+}
+
+int run_test_quant_batch(int iters, int perf_mode, const char* dive_interp_path, bool mock) {
+  ob_config_t cfg = ob_config_default();
+  cfg.mock_mode = mock ? 1 : 0;
+  cfg.max_inflight = 16u;
+  cfg.graph_cache_capacity = 256u;
+  if (perf_mode >= 0) cfg.perf_mode = static_cast<uint32_t>(perf_mode);
+
+  ob_context_t* ctx = nullptr;
+  ob_status_t st = ob_context_create(&cfg, &ctx);
+  if (st != OB_OK || !ctx) {
+    std::fprintf(stderr, "quant-batch ob_context_create failed: %s\n", ob_status_string(st));
+    return 1;
+  }
+  st = ob_gemm_register_builtin_emitter(ctx, dive_interp_path);
+  if (st != OB_OK) {
+    std::fprintf(stderr, "quant-batch emitter failed: %s (%s)\n",
+                 ob_status_string(st), ob_context_last_error(ctx));
+    ob_context_destroy(ctx);
+    return 1;
+  }
+
+  uint32_t prng = 0x91B2C3D4u;
+  auto next_g = [&]() -> float {
+    float s = 0.0f;
+    for (int i = 0; i < 6; ++i) {
+      prng = prng * 1664525u + 1013904223u;
+      s += (static_cast<float>(prng >> 8) / static_cast<float>(1u << 23)) - 1.0f;
+    }
+    return s * 0.7071f;
+  };
+
+  auto make_q4 = [&](uint32_t K, uint32_t N,
+                     std::vector<ob_block_q4_0_t>* q4,
+                     std::vector<float>* deq) {
+    const uint32_t nb_k = K / OB_QK8_0;
+    q4->resize(static_cast<size_t>(N) * nb_k);
+    deq->resize(static_cast<size_t>(N) * K);
+    for (uint32_t n = 0; n < N; ++n) {
+      for (uint32_t bi = 0; bi < nb_k; ++bi) {
+        float tmp[OB_QK8_0];
+        float am = 0.0f;
+        for (uint32_t j = 0; j < OB_QK8_0; ++j) {
+          tmp[j] = next_g();
+          float av = std::fabs(tmp[j]);
+          if (av > am) am = av;
+        }
+        uint16_t dh = fp32_to_fp16(am > 0.0f ? (am / 7.0f) : 1.0f);
+        float d = fp16_to_fp32(dh);
+        ob_block_q4_0_t& blk = (*q4)[static_cast<size_t>(n) * nb_k + bi];
+        blk.d = dh;
+        for (uint32_t j = 0; j < 16u; ++j) {
+          long q0 = (d > 0.0f) ? std::lround(tmp[j] / d) : 0L;
+          long q1 = (d > 0.0f) ? std::lround(tmp[j + 16u] / d) : 0L;
+          if (q0 < -8) q0 = -8;
+          if (q0 > 7) q0 = 7;
+          if (q1 < -8) q1 = -8;
+          if (q1 > 7) q1 = 7;
+          blk.qs[j] = static_cast<uint8_t>((q0 + 8) | ((q1 + 8) << 4));
+          (*deq)[static_cast<size_t>(n) * K + bi * OB_QK8_0 + j] = d * static_cast<float>(q0);
+          (*deq)[static_cast<size_t>(n) * K + bi * OB_QK8_0 + j + 16u] = d * static_cast<float>(q1);
+        }
+      }
+    }
+  };
+
+  auto nmse_vs_ref = [&](const std::vector<float>& a, const std::vector<float>& b_deq,
+                         const std::vector<float>& got,
+                         uint32_t M, uint32_t K, uint32_t N, uint32_t act) -> double {
+    double mse = 0.0, re = 0.0;
+    for (uint32_t m = 0; m < M; ++m) {
+      for (uint32_t n = 0; n < N; ++n) {
+        double acc = 0.0;
+        const float* arow = a.data() + static_cast<size_t>(m) * K;
+        const float* brow = b_deq.data() + static_cast<size_t>(n) * K;
+        for (uint32_t k = 0; k < K; ++k) acc += static_cast<double>(arow[k]) * static_cast<double>(brow[k]);
+        if (act == OB_ACT_SILU) {
+          acc = acc / (1.0 + std::exp(-acc));
+        } else if (act == OB_ACT_GELU) {
+          acc = 0.5 * acc * (1.0 + std::tanh(0.7978845608028654 * (acc + 0.044715 * acc * acc * acc)));
+        }
+        double diff = static_cast<double>(got[static_cast<size_t>(m) * N + n]) - acc;
+        mse += diff * diff;
+        re += acc * acc;
+      }
+    }
+    return mse / std::max(re, 1e-30);
+  };
+
+  bool all_ok = true;
+
+  // Case 1: SmolLM2-135M M=1 Q4_0 shared-A Q+K+V (576 -> 576, 192, 192)
+  {
+    constexpr uint32_t M = 1u, K = 576u, Nq = 576u, Nkv = 192u;
+    std::vector<float> a(K);
+    for (float& v : a) v = next_g();
+    std::vector<ob_block_q4_0_t> bq, bk, bv;
+    std::vector<float> dq, dk, dv;
+    make_q4(K, Nq, &bq, &dq);
+    make_q4(K, Nkv, &bk, &dk);
+    make_q4(K, Nkv, &bv, &dv);
+    std::vector<float> cq(Nq, 0.0f), ck(Nkv, 0.0f), cv(Nkv, 0.0f);
+    ob_gemm_f32_quant_job_t jobs[3] {};
+    jobs[0] = {bq.data(), cq.data(), Nq,  OB_ACT_NONE, 1u, {0, 0, 0}};
+    jobs[1] = {bk.data(), ck.data(), Nkv, OB_ACT_NONE, 1u, {0, 0, 0}};
+    jobs[2] = {bv.data(), cv.data(), Nkv, OB_ACT_NONE, 1u, {0, 0, 0}};
+
+    ob_invoke_stats_t s_cold {}, s_warm {};
+    st = ob_gemm_matmul_f32_quant_batch(ctx, a.data(), M, K, jobs, 3u, &s_cold);
+    for (int it = 0; st == OB_OK && it < std::max(1, iters); ++it) {
+      st = ob_gemm_matmul_f32_quant_batch(ctx, a.data(), M, K, jobs, 3u, &s_warm);
+    }
+    double e_q = nmse_vs_ref(a, dq, cq, M, K, Nq, OB_ACT_NONE);
+    double e_k = nmse_vs_ref(a, dk, ck, M, K, Nkv, OB_ACT_NONE);
+    double e_v = nmse_vs_ref(a, dv, cv, M, K, Nkv, OB_ACT_NONE);
+    double max_e = std::max(e_q, std::max(e_k, e_v));
+    bool ok = (st == OB_OK) && (s_warm.tiles_dispatched == 3u) &&
+              (s_warm.cache_hits == 3u) && (max_e < 1.5e-3);
+    if (!ok) all_ok = false;
+    std::printf("quant_batch[q4_qkv_1x576]: ok=%d pm=%u wl=%d tiles=%u hits=%u cold_us=%llu warm_hw_us=%llu warm_wall_us=%llu max_nmse=%.2e\n",
+                ok ? 1 : 0, ctx->cfg.perf_mode, ctx->fw_wakelock_held ? 1 : 0,
+                s_warm.tiles_dispatched, s_warm.cache_hits,
+                static_cast<unsigned long long>(s_cold.wall_time_us),
+                static_cast<unsigned long long>(s_warm.hw_execution_us),
+                static_cast<unsigned long long>(s_warm.wall_time_us),
+                max_e);
+  }
+
+  // Case 2: SmolLM2-135M M=64 batched prefill Q4_0 shared-A Gate(SiLU) + Up (64x576x1536)
+  {
+    constexpr uint32_t M = 64u, K = 576u, N = 1536u;
+    std::vector<float> a(static_cast<size_t>(M) * K);
+    for (float& v : a) v = next_g() * 0.25f;
+    std::vector<ob_block_q4_0_t> bg, bu;
+    std::vector<float> dg, du;
+    make_q4(K, N, &bg, &dg);
+    make_q4(K, N, &bu, &du);
+    std::vector<float> cg(static_cast<size_t>(M) * N, 0.0f);
+    std::vector<float> cu(static_cast<size_t>(M) * N, 0.0f);
+    ob_gemm_f32_quant_job_t jobs[2] {};
+    jobs[0] = {bg.data(), cg.data(), N, OB_ACT_SILU, 1u, {0, 0, 0}};
+    jobs[1] = {bu.data(), cu.data(), N, OB_ACT_NONE, 1u, {0, 0, 0}};
+
+    ob_invoke_stats_t s_cold {}, s_warm {};
+    st = ob_gemm_matmul_f32_quant_batch(ctx, a.data(), M, K, jobs, 2u, &s_cold);
+    for (int it = 0; st == OB_OK && it < std::max(1, iters); ++it) {
+      st = ob_gemm_matmul_f32_quant_batch(ctx, a.data(), M, K, jobs, 2u, &s_warm);
+    }
+    double e_g = nmse_vs_ref(a, dg, cg, M, K, N, OB_ACT_SILU);
+    double e_u = nmse_vs_ref(a, du, cu, M, K, N, OB_ACT_NONE);
+    double max_e = std::max(e_g, e_u);
+    bool ok = (st == OB_OK) && (s_warm.tiles_dispatched == 2u) &&
+              (s_warm.cache_hits == 2u) && (max_e < 2.0e-3);
+    if (!ok) all_ok = false;
+    std::printf("quant_batch[q4_gate_up_64x576x1536]: ok=%d pm=%u wl=%d tiles=%u hits=%u cold_us=%llu warm_hw_us=%llu warm_wall_us=%llu max_nmse=%.2e\n",
+                ok ? 1 : 0, ctx->cfg.perf_mode, ctx->fw_wakelock_held ? 1 : 0,
+                s_warm.tiles_dispatched, s_warm.cache_hits,
+                static_cast<unsigned long long>(s_cold.wall_time_us),
+                static_cast<unsigned long long>(s_warm.hw_execution_us),
+                static_cast<unsigned long long>(s_warm.wall_time_us),
+                max_e);
+  }
+
+  // Case 3: Qwen2.5-1.5B M=64 batched prefill Q4_0 64x1536x1536 (1 lt_64x tile!)
+  {
+    constexpr uint32_t M = 64u, K = 1536u, N = 1536u;
+    std::vector<float> a(static_cast<size_t>(M) * K);
+    for (float& v : a) v = next_g() * 0.25f;
+    std::vector<ob_block_q4_0_t> bw;
+    std::vector<float> dw;
+    make_q4(K, N, &bw, &dw);
+    std::vector<float> cw(static_cast<size_t>(M) * N, 0.0f);
+    ob_gemm_f32_quant_job_t job {bw.data(), cw.data(), N, OB_ACT_NONE, 1u, {0, 0, 0}};
+
+    ob_invoke_stats_t s_cold {}, s_warm {};
+    st = ob_gemm_matmul_f32_quant_batch(ctx, a.data(), M, K, &job, 1u, &s_cold);
+    for (int it = 0; st == OB_OK && it < std::max(1, iters); ++it) {
+      st = ob_gemm_matmul_f32_quant_batch(ctx, a.data(), M, K, &job, 1u, &s_warm);
+    }
+    double e_w = nmse_vs_ref(a, dw, cw, M, K, N, OB_ACT_NONE);
+    bool ok = (st == OB_OK) && (s_warm.tiles_dispatched == 1u) &&
+              (s_warm.cache_hits == 1u) && (e_w < 2.0e-3);
+    if (!ok) all_ok = false;
+    std::printf("quant_batch[q4_prefill_64x1536x1536]: ok=%d pm=%u wl=%d tiles=%u hits=%u cold_us=%llu warm_hw_us=%llu warm_wall_us=%llu nmse=%.2e\n",
+                ok ? 1 : 0, ctx->cfg.perf_mode, ctx->fw_wakelock_held ? 1 : 0,
+                s_warm.tiles_dispatched, s_warm.cache_hits,
+                static_cast<unsigned long long>(s_cold.wall_time_us),
+                static_cast<unsigned long long>(s_warm.hw_execution_us),
+                static_cast<unsigned long long>(s_warm.wall_time_us),
+                e_w);
+  }
+
+  ob_context_destroy(ctx);
+  return all_ok ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   bool mock = false;
   bool emit_gemm = false;
   bool probe_dyn = false;
+  bool test_fused_act = false;
+  bool test_outlier_spike = false;
+  bool test_quant_batch = false;
   uint32_t gemm_m = 0u, gemm_k = 0u, gemm_n = 0u;
   const char* dive_interp_path = nullptr;
   const char* dgc0_path = nullptr;
   const char* in_path = nullptr;
   const char* ref_path = nullptr;
   int iters = 1;
+  int perf_mode = -1;
 
   for (int i = 1; i < argc; ++i) {
     if (std::strcmp(argv[i], "--mock") == 0) {
       mock = true;
     } else if (std::strcmp(argv[i], "--probe-dyn-weights") == 0) {
       probe_dyn = true;
+    } else if (std::strcmp(argv[i], "--test-fused-act") == 0) {
+      test_fused_act = true;
+    } else if (std::strcmp(argv[i], "--test-outlier-spike") == 0) {
+      test_outlier_spike = true;
+    } else if (std::strcmp(argv[i], "--test-quant-batch") == 0) {
+      test_quant_batch = true;
     } else if (std::strcmp(argv[i], "--emit-gemm") == 0 && i + 3 < argc) {
       emit_gemm = true;
       gemm_m = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
@@ -753,6 +1252,12 @@ int main(int argc, char** argv) {
     } else if (std::strcmp(argv[i], "--iters") == 0 && i + 1 < argc) {
       iters = std::atoi(argv[++i]);
       if (iters < 1) iters = 1;
+    } else if (std::strcmp(argv[i], "--perf-mode") == 0 && i + 1 < argc) {
+      perf_mode = std::atoi(argv[++i]);
+      if (perf_mode < 0 || perf_mode > 5) {
+        std::fprintf(stderr, "--perf-mode must be 0..5\n");
+        return 2;
+      }
     } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
       print_usage(argv[0]);
       return 0;
@@ -763,12 +1268,24 @@ int main(int argc, char** argv) {
     }
   }
 
+  if (test_quant_batch) {
+    return run_test_quant_batch(iters, perf_mode, dive_interp_path, mock);
+  }
+
+  if (test_outlier_spike) {
+    return run_test_outlier_spike(dive_interp_path, mock);
+  }
+
+  if (test_fused_act) {
+    return run_test_fused_act(dive_interp_path, mock);
+  }
+
   if (probe_dyn) {
     return run_probe_dyn_weights(dive_interp_path, mock);
   }
 
   if (emit_gemm) {
-    return run_emit_gemm(gemm_m, gemm_k, gemm_n, iters, dive_interp_path, mock);
+    return run_emit_gemm(gemm_m, gemm_k, gemm_n, iters, perf_mode, dive_interp_path, mock);
   }
 
   if (mock || !dgc0_path) {
@@ -776,6 +1293,7 @@ int main(int argc, char** argv) {
   }
 
   ob_config_t cfg = ob_config_default();
+  if (perf_mode >= 0) cfg.perf_mode = static_cast<uint32_t>(perf_mode);
   ob_context_t* ctx = nullptr;
   ob_status_t st = ob_context_create(&cfg, &ctx);
   if (st != OB_OK || !ctx) {

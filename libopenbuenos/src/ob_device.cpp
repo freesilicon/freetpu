@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 
 #if defined(__linux__)
@@ -261,8 +262,63 @@ ob_status_t device_open(ob_context* ctx) {
 #endif
 }
 
+void device_release_fw_wakelock(ob_context* ctx) {
+  if (!ctx || !ctx->fw_wakelock_held) return;
+  uint8_t outer_wl[64]{};
+  size_t wl_len = litebuf_build_vii_wakelock(
+      outer_wl, sizeof(outer_wl), 0,
+      ctx->fw_wakelock_core, ctx->fw_wakelock_mem, ctx->fw_wakelock_bitset);
+  if (wl_len > 0u) {
+    struct litebuf_vii_parsed_response resp {};
+    uint16_t code = 0;
+    device_submit_control(ctx, outer_wl, wl_len, &resp, &code, ctx->cfg.timeout_ms);
+  }
+  ctx->fw_wakelock_held = false;
+  ctx->fw_wakelock_core = 0u;
+  ctx->fw_wakelock_mem = 0u;
+  ctx->fw_wakelock_bitset = 0u;
+}
+
+void device_sync_fw_wakelock(ob_context* ctx) {
+  if (!ctx) return;
+  const bool want_wl = ctx->fw_wakelock_enabled && (ctx->cfg.perf_mode >= 1u);
+  const uint8_t cl =
+      (ctx->cfg.cluster_id != 0u) ? ctx->cfg.cluster_id : LITEBUF_DEFAULT_CLUSTER_ID;
+  const uint8_t bitset = static_cast<uint8_t>(1u << (cl & 7u));
+  const uint8_t core_ps = ctx->cfg.core_power_state;
+  const uint8_t mem_ps = ctx->cfg.mem_power_state;
+
+  if (ctx->fw_wakelock_held && want_wl &&
+      ctx->fw_wakelock_core == core_ps &&
+      ctx->fw_wakelock_mem == mem_ps &&
+      ctx->fw_wakelock_bitset == bitset) {
+    return;
+  }
+  if (ctx->fw_wakelock_held) {
+    device_release_fw_wakelock(ctx);
+  }
+  if (!want_wl) return;
+
+  uint8_t outer_wl[64]{};
+  size_t wl_len = litebuf_build_vii_wakelock(
+      outer_wl, sizeof(outer_wl), 1, core_ps, mem_ps, bitset);
+  if (wl_len == 0u) return;
+
+  struct litebuf_vii_parsed_response resp {};
+  uint16_t code = 0;
+  ob_status_t st = device_submit_control(
+      ctx, outer_wl, wl_len, &resp, &code, ctx->cfg.timeout_ms);
+  if (st == OB_OK) {
+    ctx->fw_wakelock_held = true;
+    ctx->fw_wakelock_core = core_ps;
+    ctx->fw_wakelock_mem = mem_ps;
+    ctx->fw_wakelock_bitset = bitset;
+  }
+}
+
 void device_close(ob_context* ctx) {
   if (!ctx) return;
+  device_release_fw_wakelock(ctx);
   destroy_credit_slots(ctx);
 #if defined(__linux__)
   if (!ctx->mock_mode) {
@@ -475,12 +531,15 @@ ob_status_t device_submit_execute_async(ob_context* ctx,
 
   uint8_t cluster = (ctx->cfg.cluster_id != 0u) ? ctx->cfg.cluster_id : entry->parsed.cluster_id;
   uint8_t outer_exec[128]{};
+  // Positional wire bytes +0x1c..+0x1f (per docs/baremetal-vii/dvfs_power_states.md):
+  //   +0x1c = fw_priority, +0x1d = tpu_core_power_state,
+  //   +0x1e = memory_power_state, +0x1f = qos_class
   size_t outer_exec_len = litebuf_build_vii_execute(
       outer_exec, sizeof(outer_exec),
       slot->exec_cmd_buf->slab.iova, static_cast<uint32_t>(inner_exec_len),
       entry->model_handle,
-      ctx->cfg.core_power_state, ctx->cfg.mem_power_state,
-      ctx->cfg.qos_class, 1u, cluster,
+      ctx->fw_priority, ctx->cfg.core_power_state,
+      ctx->cfg.mem_power_state, ctx->cfg.qos_class, cluster,
       LITEBUF_CORE_SESSION_NONE, ctx->cfg.priority);
   if (outer_exec_len == 0u) {
     set_last_error(ctx, "Failed to serialize outer VII Execute Litebuf");
@@ -600,7 +659,7 @@ ob_status_t device_wait_handle(ob_context* ctx,
     stats.seq = slot->seq;
     stats.model_handle = completed_entry ? completed_entry->model_handle : 0u;
     stats.vii_resp_code = slot->vii_resp_code;
-    stats.flags = ctx->mock_mode ? static_cast<uint32_t>(OB_STAT_FLAG_MOCK) : 0u;
+    stats.flags = ctx->mock_mode ? static_cast<uint16_t>(OB_STAT_FLAG_MOCK) : static_cast<uint16_t>(0u);
     stats.tiles_dispatched = 1u;
 
     result = (slot->state == CreditSlot::COMPLETED) ? OB_OK : slot->error_status;
@@ -649,6 +708,54 @@ ob_status_t device_wait_all(ob_context* ctx, uint32_t timeout_ms) {
 
 }  // namespace ob
 
+namespace {
+
+bool read_env_u8(const char* name, uint8_t* out) {
+  const char* s = std::getenv(name);
+  if (!s || !s[0]) return false;
+  char* end = nullptr;
+  unsigned long v = std::strtoul(s, &end, 0);
+  if (end == s || v > 255ul) return false;
+  *out = static_cast<uint8_t>(v);
+  return true;
+}
+
+struct ObPowerProfile {
+  uint8_t fw_priority;           // Execute +0x1c (default 0x0b; 0x00..0x01 foreground peak)
+  uint8_t tpu_core_power_state;  // Execute +0x1d & WakeLock +0x02 (0x03..0x19; >=0x1a rejected)
+  uint8_t memory_power_state;    // Execute +0x1e & WakeLock +0x03 (0x01..0x15; >=0x16 rejected)
+  uint8_t qos_class;             // Execute +0x1f ({0,1,2,4,5}; 3 invalid)
+};
+
+// Silicon-verified Tensor G5 (buenos_a0 / rango) power profiles (docs/baremetal-vii/dvfs_power_states.md):
+//   0: MIN      (  38.4 MHz, sleep OPP, no FW WakeLock)
+//   1: LOW      (  mid OPP,  + FW WakeLock)
+//   2: BALANCED (1113.6 MHz, + FW WakeLock)
+//   3: HIGH     (1113-1286 MHz, + FW WakeLock)
+//   4: MAX      (1286.4 MHz, mem=0x0d, 983.6 INT8 GOPS on 64x1536x1536)
+//   5: PEAK     (1286.4 MHz, mem=0x15, 27.59 GB/s, 152 us / 0.482 ms sync wall)
+static constexpr ObPowerProfile kObPowerProfiles[6] = {
+    {0x0bu, 0x03u, 0x01u, 0x01u},
+    {0x0bu, 0x0cu, 0x09u, 0x01u},
+    {0x0bu, 0x16u, 0x0du, 0x01u},
+    {0x0bu, 0x16u, 0x15u, 0x01u},
+    {0x00u, 0x19u, 0x0du, 0x01u},
+    {0x01u, 0x19u, 0x15u, 0x02u},
+};
+
+void apply_perf_mode_to_cfg(ob_config_t* cfg, uint32_t perf_mode, uint8_t* out_fw_prio) {
+  if (!cfg) return;
+  if (perf_mode > 5u) perf_mode = 5u;
+  cfg->perf_mode = static_cast<uint8_t>(perf_mode);
+  const ObPowerProfile& p = kObPowerProfiles[perf_mode];
+  cfg->core_power_state = p.tpu_core_power_state;
+  cfg->mem_power_state = p.memory_power_state;
+  cfg->qos_class = p.qos_class;
+  if (out_fw_prio) *out_fw_prio = p.fw_priority;
+}
+
+}  // namespace
+
 extern "C" {
 
 ob_config_t ob_config_default(void) {
@@ -661,11 +768,9 @@ ob_config_t ob_config_default(void) {
   cfg.graph_cache_capacity = ob::kDefaultGraphCacheCapacity;
   cfg.buffer_pool_max_bytes = static_cast<uint32_t>(ob::kDefaultBufferPoolMaxBytes);
   cfg.timeout_ms = ob::kDefaultTimeoutMs;
-  cfg.core_power_state = LITEBUF_DEFAULT_CORE_POWER_STATE;
-  cfg.mem_power_state = LITEBUF_DEFAULT_MEM_POWER_STATE;
-  cfg.qos_class = LITEBUF_DEFAULT_QOS_CLASS;
   cfg.cluster_id = 0u;  // 0 -> use .dgc0 cluster_id
   cfg.priority = 0u;
+  apply_perf_mode_to_cfg(&cfg, 5u, nullptr);  // Default: 1286.4 MHz peak OPP
   return cfg;
 }
 
@@ -673,7 +778,9 @@ ob_status_t ob_context_create(const ob_config_t* config, ob_context_t** out_ctx)
   if (!out_ctx) return OB_ERR_INVALID_ARG;
   *out_ctx = nullptr;
 
-  ob_config_t eff = ob_config_default();
+  const ob_config_t def = ob_config_default();
+  ob_config_t eff = def;
+  uint8_t fw_prio = kObPowerProfiles[5].fw_priority;
   if (config) {
     eff.mock_mode = config->mock_mode;
     if (config->device_path && config->device_path[0]) eff.device_path = config->device_path;
@@ -682,17 +789,48 @@ ob_status_t ob_context_create(const ob_config_t* config, ob_context_t** out_ctx)
     if (config->graph_cache_capacity > 0u) eff.graph_cache_capacity = config->graph_cache_capacity;
     if (config->buffer_pool_max_bytes > 0u) eff.buffer_pool_max_bytes = config->buffer_pool_max_bytes;
     if (config->timeout_ms > 0u) eff.timeout_ms = config->timeout_ms;
-    if (config->core_power_state != 0u) eff.core_power_state = config->core_power_state;
-    if (config->mem_power_state != 0u) eff.mem_power_state = config->mem_power_state;
-    if (config->qos_class != 0u) eff.qos_class = config->qos_class;
+    const bool from_default_struct = (config->struct_size == sizeof(ob_config_t));
+    if (config->perf_mode != 0u) {
+      apply_perf_mode_to_cfg(&eff, config->perf_mode, &fw_prio);
+    } else if (from_default_struct) {
+      apply_perf_mode_to_cfg(&eff, 0u, &fw_prio);
+    }
+    if (config->core_power_state != 0u && config->core_power_state != def.core_power_state) {
+      eff.core_power_state = config->core_power_state;
+    }
+    if (config->mem_power_state != 0u && config->mem_power_state != def.mem_power_state) {
+      eff.mem_power_state = config->mem_power_state;
+    }
+    if (config->qos_class != 0u && config->qos_class != def.qos_class) {
+      eff.qos_class = config->qos_class;
+    }
     eff.cluster_id = config->cluster_id;
     eff.priority = config->priority;
+  }
+  // Environment overrides take precedence over struct defaults for A/B benchmarking
+  uint8_t env_pm = 0u;
+  if (read_env_u8("OPENBUENOS_PERF_MODE", &env_pm)) {
+    apply_perf_mode_to_cfg(&eff, env_pm, &fw_prio);
+  }
+  read_env_u8("OPENBUENOS_FW_PRIORITY", &fw_prio);
+  read_env_u8("OPENBUENOS_CORE_POWER_STATE", &eff.core_power_state);
+  read_env_u8("OPENBUENOS_MEM_POWER_STATE", &eff.mem_power_state);
+  read_env_u8("OPENBUENOS_QOS_CLASS", &eff.qos_class);
+  read_env_u8("OPENBUENOS_CLUSTER_ID", &eff.cluster_id);
+  read_env_u8("OPENBUENOS_PRIORITY", &eff.priority);
+
+  bool wl_enabled = true;
+  uint8_t env_wl = 1u;
+  if (read_env_u8("OPENBUENOS_WAKELOCK", &env_wl)) {
+    wl_enabled = (env_wl != 0u);
   }
 
   ob_context* ctx = new (std::nothrow) ob_context();
   if (!ctx) return OB_ERR_NO_MEMORY;
 
   ctx->cfg = eff;
+  ctx->fw_priority = fw_prio;
+  ctx->fw_wakelock_enabled = wl_enabled;
   ctx->device_path = eff.device_path;
   ctx->dma_heap_path = eff.dma_heap_path;
   ctx->mock_mode = (eff.mock_mode != 0);
@@ -705,6 +843,7 @@ ob_status_t ob_context_create(const ob_config_t* config, ob_context_t** out_ctx)
     delete ctx;
     return st;
   }
+  ob::device_sync_fw_wakelock(ctx);
 
   *out_ctx = ctx;
   return OB_OK;
@@ -752,6 +891,16 @@ uint32_t ob_context_credit_size(const ob_context_t* ctx) {
 
 int ob_context_is_mock(const ob_context_t* ctx) {
   return (ctx && ctx->mock_mode) ? 1 : 0;
+}
+
+ob_status_t ob_context_set_perf_mode(ob_context_t* ctx, uint32_t perf_mode) {
+  if (!ctx || perf_mode > 5u) return OB_ERR_INVALID_ARG;
+  {
+    std::lock_guard<std::mutex> lk(ctx->vii_mu);
+    apply_perf_mode_to_cfg(&ctx->cfg, perf_mode, &ctx->fw_priority);
+  }
+  ob::device_sync_fw_wakelock(ctx);
+  return OB_OK;
 }
 
 }  // extern "C"

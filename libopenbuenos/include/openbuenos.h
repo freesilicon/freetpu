@@ -61,11 +61,13 @@ enum ob_buffer_flags {
   OB_BUF_ZERO_INIT     = (1u << 3)  /* Zero-fill buffer on allocation */
 };
 
-/* Fused GEMM activation enum (matches DarwiNN / TFLite FC activation codes) */
+/* Fused GEMM activation enum (matches DarwiNN / TFLite FC activation codes + Mode-A 0x640 splines) */
 enum ob_activation {
   OB_ACT_NONE  = 0u,
   OB_ACT_RELU  = 1u,
-  OB_ACT_RELU6 = 3u
+  OB_ACT_RELU6 = 3u,
+  OB_ACT_SILU  = 4u, /* Mode-A zero-overhead (+0 B) 0x640 degree-4 Horner SiLU fusion */
+  OB_ACT_GELU  = 5u  /* Mode-A zero-overhead (+0 B) 0x640 degree-4 Horner GELU-tanh fusion */
 };
 
 /* Execution stats flags */
@@ -87,18 +89,26 @@ typedef struct ob_graph   ob_graph_t;
 /* Opaque non-zero asynchronous execution handle (0 == invalid) */
 typedef uint64_t ob_exec_handle_t;
 
-/* ggml-compatible Q8_0 quantization block (34 bytes: IEEE-754 fp16 scale + 32 int8 quants) */
+/* ggml-compatible Q8_0 (34B: fp16 d + 32 int8) and Q4_0 (18B: fp16 d + 16 packed nibbles) blocks */
 #if defined(__GNUC__) || defined(__clang__)
 typedef struct __attribute__((packed)) ob_block_q8_0 {
   uint16_t d;
   int8_t   qs[OB_QK8_0];
 } ob_block_q8_0_t;
+typedef struct __attribute__((packed)) ob_block_q4_0 {
+  uint16_t d;
+  uint8_t  qs[OB_QK8_0 / 2];
+} ob_block_q4_0_t;
 #else
 #pragma pack(push, 1)
 typedef struct ob_block_q8_0 {
   uint16_t d;
   int8_t   qs[OB_QK8_0];
 } ob_block_q8_0_t;
+typedef struct ob_block_q4_0 {
+  uint16_t d;
+  uint8_t  qs[OB_QK8_0 / 2];
+} ob_block_q4_0_t;
 #pragma pack(pop)
 #endif
 
@@ -109,15 +119,16 @@ typedef struct ob_config {
   const char* device_path;           /* NULL -> "/dev/edgetpu-soc" */
   const char* dma_heap_path;         /* NULL -> "/dev/dma_heap/system" */
   uint32_t    max_inflight;          /* 0 -> default 16 (clamped to [1, OB_MAX_CREDITS]) */
-  uint32_t    graph_cache_capacity;  /* 0 -> default 64 cached registered graphs */
+  uint32_t    graph_cache_capacity;  /* 0 -> default 256 cached registered graphs */
   uint32_t    buffer_pool_max_bytes; /* 0 -> default 64 MiB pooled DMA-BUF capacity */
   uint32_t    timeout_ms;            /* 0 -> default 5000 ms */
-  uint8_t     core_power_state;      /* 0 -> default 0x0b */
-  uint8_t     mem_power_state;       /* 0 -> default 0x03 */
-  uint8_t     qos_class;             /* 0 -> default 0x01 */
+  uint8_t     core_power_state;      /* 0 -> derived from perf_mode or default */
+  uint8_t     mem_power_state;       /* 0 -> derived from perf_mode or default */
+  uint8_t     qos_class;             /* 0 -> derived from perf_mode or default */
   uint8_t     cluster_id;            /* 0 -> use .dgc0 cluster_id (default 0x02 on rango) */
   uint8_t     priority;              /* VII queue priority (default 0) */
-  uint8_t     reserved[3];
+  uint8_t     perf_mode;             /* 0 = default, 1..5 = DVFS perf tier (5 = max clocks) */
+  uint8_t     reserved[2];
 } ob_config_t;
 
 /* Execution telemetry returned by invoke / wait / matmul */
@@ -200,6 +211,7 @@ const char* ob_status_string(ob_status_t status);
 const char* ob_context_last_error(const ob_context_t* ctx);
 uint32_t    ob_context_credit_size(const ob_context_t* ctx);
 int         ob_context_is_mock(const ob_context_t* ctx);
+ob_status_t ob_context_set_perf_mode(ob_context_t* ctx, uint32_t perf_mode);
 
 /* =========================================================================
  * DMA-BUF Slab / Pool Buffer API (/dev/dma_heap/system + EDGETPU_MAP_DMABUF)
@@ -403,6 +415,31 @@ ob_status_t ob_gemm_matmul_f32_q8_0(ob_context_t*      ctx,
                                     uint32_t           k_dim,
                                     uint32_t           n_dim,
                                     ob_invoke_stats_t* out_stats);
+
+/*
+ * Batched multi-projection FP32 x {Q8_0, Q4_0} matmul sharing one input A[m_dim, k_dim]:
+ *   - `is_q4_0=1`: hashes raw ggml block_q4_0 bytes in O(1) and unpacks nibbles ONCE
+ *     on weight-cache miss directly into cached ext[2] DMA-BUF (zero per-token CPU unpack).
+ *   - `num_jobs > 1`: quantizes & outlier-peels shared A ONCE and pipelines all sibling
+ *     projections (e.g. Q/K/V or gate/up) concurrently into the 16-credit async VII ring.
+ *   - `activation`: OB_ACT_NONE, OB_ACT_SILU, or OB_ACT_GELU applied to each job's output.
+ */
+typedef struct ob_gemm_f32_quant_job {
+  const void* b_nk;       /* ob_block_q8_0_t (34B/32) or ob_block_q4_0_t (18B/32) [n_dim, k_dim] */
+  float*      c_mn;       /* output [m_dim, n_dim] row-major float32 */
+  uint32_t    n_dim;
+  uint32_t    activation; /* enum ob_activation: OB_ACT_NONE / OB_ACT_SILU / OB_ACT_GELU */
+  uint8_t     is_q4_0;    /* 0 = ob_block_q8_0_t, 1 = ob_block_q4_0_t */
+  uint8_t     reserved[3];
+} ob_gemm_f32_quant_job_t;
+
+ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t*                  ctx,
+                                           const float*                   a_mk,
+                                           uint32_t                       m_dim,
+                                           uint32_t                       k_dim,
+                                           const ob_gemm_f32_quant_job_t* jobs,
+                                           uint32_t                       num_jobs,
+                                           ob_invoke_stats_t*             out_stats);
 
 #ifdef __cplusplus
 } /* extern "C" */

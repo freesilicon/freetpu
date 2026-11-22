@@ -41,10 +41,10 @@
 
 | Layer | Component | Responsibility |
 | --- | --- | --- |
-| **LLM Inference** | [`llama-cpp-edgetpu/`](llama-cpp-edgetpu/README.md) | `EDGETPU` GGML `ACCEL` backend (`MUL_MAT` `Q8_0` / `F32`, 64B host storage, CPU glue fallback) |
-| **Open Runtime** | [`libopenbuenos/`](libopenbuenos/include/openbuenos.h) | C11/C++17 static library: DMA-BUF slab pool, LRU graph cache, 16-credit VII ring, closed-form VLIW GEMM emitter |
+| **LLM Inference** | [`llama-cpp-edgetpu/`](llama-cpp-edgetpu/README.md) | `EDGETPU` GGML `ACCEL` backend (`MUL_MAT` `Q8_0` / `Q4_0` / `F32`, shared-`A` QKV & gate/up batching, 1D bias `ADD`, 64B host storage) |
+| **Open Runtime** | [`libopenbuenos/`](libopenbuenos/include/openbuenos.h) | C11/C++17 static library: `1,286.4 MHz` DVFS + FW WakeLock, FD-capped DMA-BUF pool & `O(1)` weight cache, 16-credit VII ring, `M=1` & `M=64` VLIW GEMM emitter |
 | **Kernel Transport** | [`runtime/`](runtime/src/tpu_baremetal_runner.cpp) | Standalone bare-metal runner & UAPI/Litebuf VII headers (`0x0008 -> 0x00fe`, `/dev/edgetpu-soc` `0xED`) |
-| **ISA Tooling** | [`tools/`](tools/emit_custom_gemm.py) | Pure-Python `DGC0` dissector/patcher, multi-tile `(M, K, N)` VLIW synthesizer, `0x640` minimax spline codec, `INT4` packer |
+| **ISA Tooling** | [`tools/`](tools/emit_custom_gemm.py) | Pure-Python `DGC0` dissector/patcher, multi-tile `(M, K, N)` VLIW synthesizer, `0x640` minimax spline codec, `0xa40` chained fusion verifier, `INT4` packer |
 
 ---
 
@@ -84,12 +84,14 @@ All hardware metrics below were measured on Google Pixel 10 Pro Fold (`rango`, T
 
 | Proof Suite | Scope | Verified Result |
 | --- | --- | --- |
-| **Closed-Form Multi-Tile ISA** | `81` compiled reference models across `M=1..64, K=4..512, N=4..128` | **`81/81` bit-exact** `chunk[0..6]`, `ext[0]` (`DIVE`), `ext[2]` (`verify_full_isa_81.py`) |
-| **Novel Bare-Metal Multi-Tile Kernels** | `7` custom `(M, K, N)` GEMM microkernels (no TFLite compiler) | **`3,368/3,368` output bytes exact** (`max_abs_err = 0`), `420–504 us` HW (`~2.3x–3.7x` faster mean wall latency vs vendor stack) |
-| **`0x640` Minimax Splines & Fusion** | `SiLU`, `GELU`, `exp(x)` probes + `4` Mode-A fused `GEMM + SiLU/GELU` probes | **`12,288/12,288` bytes exact** (`max_abs_err = 0`, `461–600 us` HW), `+0 B` fusion overhead |
-| **`libopenbuenos` Live Silicon Self-Test** | `16x128x128`, `1x512x256`, `1x576x1536`, `16x576x576` (`INT8` & `F32 x Q8_0`) | **`max_abs_err = 0`** (`INT8`), `f32_nmse <= 1.87e-4`, `100%` token-invariant cache hits (`36/36`, `81/81`) |
+| **DVFS + FW WakeLock Silicon Unlock** | `1x2048x2048` & `64x1536x1536` (`PM=5` @ `1,286.4 MHz` + Litebuf `AcquireWakeLock`) | **`27.59 GB/s`** (`152 us` HW), **`983.6 INT8 GOPS` @ `177.2 mW` = `5.55 TOPS/W`** (`307 us` HW, `max_abs_err = 0`) |
+| **Closed-Form Multi-Tile & Large-Tile ISA** | `92` compiled reference models (`81` base + `6` `lt_1x*` + `5` `lt_64x*`) | **`92/92` bit-exact** `chunk[0..6]`, `ext[0]` (`DIVE`), `ext[2]`; **`16/16`** `libopenbuenos` host suites PASS |
+| **`0x640` Minimax Splines & Chained Fusion** | `SiLU`/`GELU`/`exp` + `4` Mode-A (`+0 B`) + `3` multi-op `0xa40` probes (`MLP`, `SwiGLU`, `QKV`) | **`12,288/12,288`** spline bytes + **`3/3`** chained probes (`60.8–72.8 us`, `8/8` `ext[2]` slices bit-exact, `max_abs_err = 0`) |
 | **Native `W8A16 (BF16)` FP32-I/O GEMM** | `1x64x32` (`2,048 B` `u8` + `128 B` per-channel `FP32` scales) | **`32/32` bit-exact `FP32`** (`max_abs_err = 0.0`, `411–426 us` HW, zero Google `.so`s) |
-| **`ggml-edgetpu` Backend Ops** | `test-backend-ops -b EDGETPU -o MUL_MAT` (`Q8_0`/`F32`) | **`223/223` PASS** (`104/104` `q8_0 x f32`), `DT_NEEDED = [libdl.so, libm.so, libc.so]` |
+| **`ggml-edgetpu` Backend Ops** | Live `rango` `test-backend-ops -b EDGETPU -o MUL_MAT` (`Q8_0` & `Q4_0`) | **`104/104` `q8_0`** & **`104/104` `q4_0`** PASS (`327/327` host mock), `cpu_fallback_slices = 0`, `DT_NEEDED = [libdl.so, libm.so, libc.so]` |
+| **Live LLM Throughput & Energy (`llama-bench`)** | `SmolLM2-135M-Q8_0` & `Qwen2.5-1.5B-{Q8_0,Q4_0}` (`PM=5` @ `1,286.4 MHz`, `MAPS_GOOGLE=0`) | **`SmolLM2`**: `pp512 = 563.82 t/s`, `tg64 = 17.36 t/s`; **`Qwen2.5-1.5B-Q8_0`**: `pp512 = 105.87 t/s` (**`-21.5%` system `mJ/tok` vs CPU**), `tg64 = 5.85 t/s`, **`22/22` verbatim CPU token match** |
+
+See [docs/PHASE6_PERF_REPORT.md](docs/PHASE6_PERF_REPORT.md) for the full 18-case ODPM `mJ/tok` energy matrix and silicon scaling tables.
 
 ---
 
@@ -132,6 +134,10 @@ export OPENBUENOS_DIVE_INTERP_PATH=/data/local/tmp/tpu_open_stack/dive_interp_rv
 
 ## Documentation
 
+- [Phase 6 Performance & Energy Report](docs/PHASE6_PERF_REPORT.md) — `1,286.4 MHz` DVFS + WakeLock unlock, `983.6 GOPS` (`5.55 TOPS/W`), batched `M=64` prefill, `SmolLM2`/`Qwen2.5` benchmarks & 18-case ODPM `mJ/tok` sweep
+- [Phase 5B Live LLM Spec](docs/PHASE5_LLAMA_TPU_SPEC.md) — `Probe A` dynamic `param_slice`, `O(1)` weight cache, outlier peeling & baseline bring-up
+- [DVFS, Power States & WakeLock Spec](docs/baremetal-vii/dvfs_power_states.md) — Corrected `+0x1c..+0x20` Litebuf wire fields, `TpuCorePowerState` (`0x03..0x19`), `MemoryPowerState` (`0x01..0x15`) & FW WakeLock (`union_type=4/5`)
+- [Chained Multi-Op Fusion & W8A16(BF16) Spec](docs/isa-gemm/chained_fusion_and_w8a16_spec.md) — Zero-DRAM `0xa40` chaining (`MLP`, `SwiGLU` `0x100` MUL, `QKV` concat) & `W8A16(BF16)` scaling
 - [Hardware & Driver Specs](docs/hardware-specs.md) — Tensor G5 (`buenos_a0`) geometry, `buenos.ko` ABI, rounding & SRAM layout
 - [Hardware Errata & W8A16 (BF16)](docs/hardware-errata.md) — `DEQUANTIZE(INT4)` deadlock root cause, `Q4_0` caching rule & `W8A16 (BF16)` FP32 GEMM unlock
 - [Litebuf VII Wire Protocol](docs/baremetal-vii/litebuf_vii_protocol.md) — Two-layer `0x0008 -> 0x00fe` command/response framing & 16-credit ring

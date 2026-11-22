@@ -293,9 +293,10 @@ void ob_buffer_free(ob_buffer_t* buf) {
   }
 
   std::lock_guard<std::mutex> lk(ctx->pool_mu);
-  // Evict oldest slabs until the returned slab fits within pool_max_bytes
+  // Evict oldest slabs until the returned slab fits within pool_max_bytes and FD-safe count cap
   while (!ctx->pool_lru.empty() &&
-         ctx->pool_current_bytes + slab.alloc_size > ctx->pool_max_bytes) {
+         (ctx->pool_current_bytes + slab.alloc_size > ctx->pool_max_bytes ||
+          ctx->pool_current_count >= ob::kDefaultBufferPoolMaxCount)) {
     auto victim_it = std::prev(ctx->pool_lru.end());
     size_t vsz = victim_it->alloc_size;
     auto& bucket = ctx->pool_buckets[vsz];
