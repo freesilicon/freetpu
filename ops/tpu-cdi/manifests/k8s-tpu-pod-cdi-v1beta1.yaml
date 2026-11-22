@@ -5,8 +5,11 @@
 #   1. Kubernetes API server configured with the beta DRA API group explicitly enabled:
 #        --runtime-config=resource.k8s.io/v1beta1=true
 #      and feature gate `DynamicResourceAllocation=true`.
-#   2. containerd >= 1.7 with `enable_cdi = true` and /var/run/cdi/freetpu.json populated
-#      by k8s-tpu-cdi-daemonset.yaml on VFIO-backed Cloud TPU nodes (v5e, v5p, v6e).
+#   2. containerd >= 2.0 (ships CDI >= 0.6.0 with `annotations` support, native
+#      CRI `CDIDevices` injection used by kubelet DRA, and `enable_cdi = true` by
+#      default; containerd 1.7.0 lacks both CDI v0.6.0 and CRI `CDIDevices`) and
+#      boot-scoped /var/run/cdi/freetpu.json populated by k8s-tpu-cdi-daemonset.yaml
+#      on VFIO-backed Cloud TPU nodes (v5e, v5p, v6e).
 #   3. A cluster DRA kubelet/controller driver registered for `freetpu.dev` publishing
 #      ResourceSlices and injecting `freetpu.dev/tpu=...` CDI IDs in NodePrepareResources.
 ---

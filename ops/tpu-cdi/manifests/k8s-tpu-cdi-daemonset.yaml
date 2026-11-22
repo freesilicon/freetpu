@@ -1,4 +1,12 @@
 # FreeTPU Node DaemonSet (VFIO-backed GKE Cloud TPU nodes: v5e, v5p, v6e Trillium):
+# Scope: Node-level boot-scoped CDI spec sync + PCI/VFIO inventory & hostPID
+# active-PID telemetry ONLY. This DaemonSet uses stock `python:3.12-slim` without
+# `tpu-info` and runs outside workload Pod network namespaces, so it does NOT emit
+# live HBM usage or MXU duty cycle. For live HBM + duty-cycle telemetry in
+# Kubernetes, run a `tpu-info`-enabled exporter sidecar inside each TPU workload
+# Pod so it shares `localhost:8431` with `libtpu` (see
+# `k8s-tpu-workload-telemetry-sidecar.yaml`).
+#
 # Prerequisite (create the required ConfigMap in kube-system first):
 #   kubectl -n kube-system create configmap freetpu-ops-scripts \
 #     --from-file=ops/tpu-cdi/freetpu_cdi.py \
@@ -10,12 +18,16 @@
 # `/dev/accel*` v4 node pools (`tpu-v4-podslice`). Adjust `nodeAffinity` if your
 # cluster uses custom TPU node labels.
 #
-# 1. initContainer runs `freetpu_cdi.py generate` to populate /var/run/cdi/freetpu.json
-#    on every VFIO-backed Cloud TPU node so containerd/CRI-O exposes freetpu.dev/tpu=...
-#    CDI targets.
-# 2. main container runs `tpu_exporter.py --host 0.0.0.0 --port 9400` with SYS_PTRACE
-#    (required for /proc/<pid>/fd telemetry across hostPID containers/IPC_LOCK pods)
-#    to serve Prometheus /metrics.
+# 1. initContainer runs `freetpu_cdi.py generate` to populate boot-scoped
+#    `/var/run/cdi/freetpu.json` (and remove any stale spec on failure) before
+#    the agent becomes ready.
+# 2. `freetpu-cdi-sync` continuously revalidates live IOMMU group membership and
+#    PCI BDF bindings, regenerating `/var/run/cdi/freetpu.json` atomically on
+#    valid topology changes and unlinking it immediately if a VFIO group is
+#    reassigned or exposes a non-TPU device.
+# 3. `tpu-exporter` serves PCI/VFIO inventory and hostPID active-PID Prometheus
+#    `/metrics` on :9400 (with SYS_PTRACE) and an isolated liveness/readiness
+#    endpoint on :9401 (`/healthz`) independent of scrape traffic saturation.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -79,6 +91,35 @@ spec:
               mountPath: /opt/freetpu
               readOnly: true
       containers:
+        - name: freetpu-cdi-sync
+          image: python:3.12-slim
+          command:
+            - python3
+            - /opt/freetpu/freetpu_cdi.py
+            - sync
+            - --output
+            - /var/run/cdi/freetpu.json
+            - --interval
+            - "15"
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          volumeMounts:
+            - name: sysfs
+              mountPath: /sys
+              readOnly: true
+            - name: dev-vfio
+              mountPath: /dev/vfio
+              readOnly: true
+            - name: cdi-dir
+              mountPath: /var/run/cdi
+            - name: freetpu-ops
+              mountPath: /opt/freetpu
+              readOnly: true
         - name: tpu-exporter
           image: python:3.12-slim
           command:
@@ -88,6 +129,8 @@ spec:
             - 0.0.0.0
             - --port
             - "9400"
+            - --health-port
+            - "9401"
           securityContext:
             capabilities:
               add:
@@ -96,16 +139,19 @@ spec:
             - name: metrics
               containerPort: 9400
               protocol: TCP
+            - name: health
+              containerPort: 9401
+              protocol: TCP
           readinessProbe:
             httpGet:
-              path: /healthz
-              port: metrics
+              path: /readyz
+              port: health
             initialDelaySeconds: 2
             periodSeconds: 10
           livenessProbe:
             httpGet:
               path: /healthz
-              port: metrics
+              port: health
             initialDelaySeconds: 5
             periodSeconds: 30
           resources:

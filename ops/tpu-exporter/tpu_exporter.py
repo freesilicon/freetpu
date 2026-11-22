@@ -586,11 +586,11 @@ def collect_snapshot(
             if matched_util.duty_cycle_percent is not None:
                 dev.duty_cycle_percent = matched_util.duty_cycle_percent
 
-        # If tpu-info provided the verified chip row, PIDs are authoritative even when
-        # unprivileged /proc/<pid>/fd cannot inspect other processes' FDs.
-        dev.pid_telemetry_available = (
-            (tpu_info_ok and chips_row is not None) or proc_fd_accessible
-        )
+        # Upstream `tpu-info` also scans `/proc/*/fd/*` under the caller's privileges
+        # and reports `PID=None` when another user's process is unreadable. Only mark
+        # PID telemetry available when the `/proc/<pid>/fd` scan succeeded without
+        # permission denials so incomplete scans never publish false zeros.
+        dev.pid_telemetry_available = proc_fd_accessible
         if not dev.pid_telemetry_available:
             overall_pid_available = False
 
@@ -839,7 +839,74 @@ def snapshot_to_json(snapshot: ExporterSnapshot) -> str:
 
 
 DEFAULT_MAX_HTTP_WORKERS = 16
+DEFAULT_HEALTH_RESERVED_WORKERS = 4
 DEFAULT_HTTP_SOCKET_TIMEOUT_S = 10.0
+
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    timeout = DEFAULT_HTTP_SOCKET_TIMEOUT_S
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+        if os.environ.get("FREETPU_EXPORTER_VERBOSE") == "1":
+            sys.stderr.write("%s - %s\n" % (self.address_string(), format % args))
+
+    def _send(self, status: int, content_type: str, body: str) -> None:
+        payload = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_GET(self) -> None:  # noqa: N802
+        path = self.path.split("?", 1)[0]
+        if path in ("/healthz", "/readyz", "/"):
+            self._send(200, "application/json; charset=utf-8", '{"status":"ok"}\n')
+            return
+        self._send(404, "text/plain; charset=utf-8", "not found\n")
+
+
+class _HealthServer(ThreadingHTTPServer):
+    """Dedicated lightweight liveness/readiness server isolated from scrape traffic."""
+
+    daemon_threads = True
+    allow_reuse_address = True
+    request_queue_size = 16
+
+    def __init__(
+        self,
+        server_address: Tuple[str, int],
+        max_workers: int = DEFAULT_HEALTH_RESERVED_WORKERS,
+    ) -> None:
+        self._worker_sem = threading.BoundedSemaphore(max(1, max_workers))
+        super().__init__(server_address, _HealthHandler)
+
+    def process_request(self, request: socket.socket, client_address: Any) -> None:
+        if not self._worker_sem.acquire(blocking=False):
+            try:
+                request.settimeout(1.0)
+                request.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Content-Type: text/plain; charset=utf-8\r\n"
+                    b"Content-Length: 17\r\n"
+                    b"Connection: close\r\n\r\n"
+                    b"exporter busy\r\n\r\n"
+                )
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._worker_sem.release()
+            raise
+
+    def process_request_thread(self, request: socket.socket, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._worker_sem.release()
 
 
 class _ExporterServer(ThreadingHTTPServer):
@@ -869,7 +936,13 @@ class _ExporterServer(ThreadingHTTPServer):
         self.chip_id_map = chip_id_map
         self.scrape_timeout_s = scrape_timeout_s
         self._scrape_lock = threading.Lock()
-        self._worker_sem = threading.BoundedSemaphore(max(1, max_workers))
+        scrape_cap = max(1, max_workers)
+        self._scrape_sem = threading.BoundedSemaphore(scrape_cap)
+        # Reserve extra connection slots above the scrape cap so /healthz on the
+        # main port is not rejected when scrape slots are saturated.
+        self._worker_sem = threading.BoundedSemaphore(
+            scrape_cap + DEFAULT_HEALTH_RESERVED_WORKERS
+        )
         super().__init__(server_address, request_handler_class)
 
     def process_request(self, request: socket.socket, client_address: Any) -> None:
@@ -935,11 +1008,16 @@ class _ExporterHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0]
         if path in ("/metrics", "/metrics/"):
+            if not self.server._scrape_sem.acquire(blocking=False):
+                self._send(503, "text/plain; charset=utf-8", "exporter busy\n")
+                return
             try:
                 snap = self.server.scrape()
             except TimeoutError as exc:
                 self._send(503, "text/plain; charset=utf-8", f"{exc}\n")
                 return
+            finally:
+                self.server._scrape_sem.release()
             self._send(
                 200,
                 "text/plain; version=0.0.4; charset=utf-8",
@@ -947,11 +1025,16 @@ class _ExporterHandler(BaseHTTPRequestHandler):
             )
             return
         if path in ("/metrics.json", "/json"):
+            if not self.server._scrape_sem.acquire(blocking=False):
+                self._send(503, "text/plain; charset=utf-8", "exporter busy\n")
+                return
             try:
                 snap = self.server.scrape()
             except TimeoutError as exc:
                 self._send(503, "text/plain; charset=utf-8", f"{exc}\n")
                 return
+            finally:
+                self.server._scrape_sem.release()
             self._send(200, "application/json; charset=utf-8", snapshot_to_json(snap))
             return
         if path in ("/healthz", "/readyz", "/"):
@@ -984,6 +1067,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=9400,
         help="HTTP listen port (default: 9400).",
+    )
+    parser.add_argument(
+        "--health-host",
+        default=None,
+        help="Bind address for optional dedicated health listener (default: same as --host).",
+    )
+    parser.add_argument(
+        "--health-port",
+        type=int,
+        default=None,
+        help="Optional dedicated HTTP port for /healthz and /readyz isolated from scrape saturation.",
     )
     parser.add_argument(
         "--once",
@@ -1071,6 +1165,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         chip_id_map=chip_id_map,
         max_workers=args.max_workers,
     )
+    health_server: Optional[_HealthServer] = None
+    health_thread: Optional[threading.Thread] = None
+    if args.health_port is not None:
+        health_host = args.health_host if args.health_host is not None else args.host
+        health_server = _HealthServer((health_host, args.health_port))
+        health_thread = threading.Thread(target=health_server.serve_forever, daemon=True)
+        health_thread.start()
+        sys.stderr.write(
+            f"freetpu tpu-exporter health listening on http://{health_host}:{health_server.server_address[1]}/healthz\n"
+        )
+
     sys.stderr.write(
         f"freetpu tpu-exporter listening on http://{args.host}:{server.server_address[1]}/metrics\n"
     )
@@ -1080,6 +1185,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         pass
     finally:
         server.server_close()
+        if health_server is not None:
+            health_server.shutdown()
+            health_server.server_close()
+        if health_thread is not None:
+            health_thread.join(timeout=2.0)
     return 0
 
 

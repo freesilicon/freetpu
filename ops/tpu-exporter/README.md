@@ -15,8 +15,9 @@
 ## Usage
 
 ```bash
-# HTTP /metrics server on localhost:9400 (default; pass --host 0.0.0.0 explicitly in containers)
-python3 ops/tpu-exporter/tpu_exporter.py --port 9400
+# HTTP /metrics server on localhost:9400 (default; pass --host 0.0.0.0 in containers
+# and --health-port 9401 to keep liveness/readiness probes independent of scrape saturation)
+python3 ops/tpu-exporter/tpu_exporter.py --port 9400 --health-port 9401
 
 # One-shot Prometheus text exposition snapshot (CI / ephemeral Colab runs)
 python3 ops/tpu-exporter/tpu_exporter.py --once
@@ -24,5 +25,10 @@ python3 ops/tpu-exporter/tpu_exporter.py --once
 # Structured JSON snapshot
 python3 ops/tpu-exporter/tpu_exporter.py --once --json
 ```
+
+### Live Telemetry in Kubernetes vs. Node DaemonSet
+
+- **Node DaemonSet (`ops/tpu-cdi/manifests/k8s-tpu-cdi-daemonset.yaml`):** Runs stock `python:3.12-slim` without `tpu-info` outside workload Pod network namespaces; exports **PCI/VFIO inventory and hostPID active-PID telemetry only**.
+- **Workload Sidecar (`ops/tpu-cdi/manifests/k8s-tpu-workload-telemetry-sidecar.yaml`):** Because `libtpu` serves live runtime metrics on `localhost:8431` inside each workload Pod, build the sidecar image with `docker build --build-arg INSTALL_TPU_INFO=1 -t <registry>/freetpu-tpu-exporter:tpu-info ops/tpu-exporter` and co-locate it in the TPU workload Pod.
 
 See [prometheus-scrape.yml](prometheus-scrape.yml) for Prometheus scrape configuration and [promql-queries.md](promql-queries.md) for billing and utilization PromQL queries.

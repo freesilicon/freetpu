@@ -3,14 +3,16 @@
 
 Scans /sys/bus/pci/devices/* (vendor 0x1ae0) and /dev/vfio/* on VFIO-backed
 Cloud TPU hosts (v5e, v5p, v6e Trillium bound to `vfio-pci`) to generate a
-CNCF Container Device Interface (CDI) v0.6.0 specification (e.g.
-/etc/cdi/freetpu.json) exposing `freetpu.dev/tpu=0`, ..., `freetpu.dev/tpu=all`.
+boot-scoped CNCF Container Device Interface (CDI) v0.6.0 specification
+(default: /var/run/cdi/freetpu.json) exposing `freetpu.dev/tpu=0`, ...,
+`freetpu.dev/tpu=all`.
 
 Note: Legacy `/dev/accel*` Cloud TPU hosts (e.g. Cloud TPU v4 using Google's
 `accel` driver) are not supported by VFIO CDI passthrough.
 
 Also provides:
-  - `validate`: strict CNCF CDI v0.6.0 structural & per-device VFIO validator
+  - `validate`: strict CNCF CDI v0.6.0 structural & live host VFIO validator
+  - `sync`: boot-scoped generator/reconciler that invalidates stale specs on drift
   - `docker-args`: prints Docker / Podman CLI flags (including IPC_LOCK + memlock)
 
 Zero third-party dependencies: uses Python standard library only.
@@ -24,13 +26,18 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import sys
+import tempfile
+import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 CDI_VERSION = "0.6.0"
 CDI_KIND = "freetpu.dev/tpu"
 GOOGLE_PCI_VENDOR_ID = "0x1ae0"
-DEFAULT_OUTPUT_PATH = Path("/etc/cdi/freetpu.json")
+# Boot-scoped CNCF CDI dynamic spec directory (/var/run is tmpfs on Linux so
+# stale IOMMU group assignments never persist across reboots).
+DEFAULT_OUTPUT_PATH = Path("/var/run/cdi/freetpu.json")
 
 # Known Google Cloud TPU PCI device IDs under vendor 0x1ae0.
 TPU_PCI_DEVICES: Dict[str, Tuple[str, str]] = {
@@ -552,6 +559,162 @@ def validate_cdi_spec(spec: Any) -> List[str]:
     return errors
 
 
+def verify_spec_against_host(
+    spec: Any,
+    *,
+    sysfs_root: Path = Path("/sys"),
+    dev_root: Path = Path("/dev"),
+) -> List[str]:
+    """Revalidate every VFIO group in a CDI spec against live host IOMMU membership.
+
+    Ensures each `/dev/vfio/<group>` still maps to the exact TPU PCI BDF(s) recorded
+    in the spec's annotations, remains bound to `vfio-pci`, and contains zero non-TPU
+    PCI devices.
+    """
+    errors: List[str] = []
+    if not isinstance(spec, dict):
+        return ["CDI spec root must be a JSON object"]
+
+    try:
+        live_chips, _vfio_container = discover_tpu_chips(
+            sysfs_root=sysfs_root,
+            dev_root=dev_root,
+            allow_missing_vfio=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return [f"live host VFIO discovery failed: {exc}"]
+
+    live_by_vfio: Dict[str, List[str]] = {}
+    for chip in live_chips:
+        live_by_vfio.setdefault(chip.vfio_container_path, []).append(chip.pci_bdf)
+    for bdfs in live_by_vfio.values():
+        bdfs.sort()
+
+    devices = spec.get("devices")
+    if not isinstance(devices, list) or not devices:
+        return ["devices must be a non-empty list"]
+
+    for idx, dev in enumerate(devices):
+        if not isinstance(dev, dict):
+            continue
+        name = dev.get("name", f"devices[{idx}]")
+        edits = dev.get("containerEdits")
+        nodes = edits.get("deviceNodes") if isinstance(edits, dict) else None
+        if not isinstance(nodes, list):
+            continue
+
+        vfio_paths = [
+            n["path"]
+            for n in nodes
+            if isinstance(n, dict)
+            and isinstance(n.get("path"), str)
+            and n["path"].startswith("/dev/vfio/")
+            and n["path"] != "/dev/vfio/vfio"
+        ]
+        if not vfio_paths:
+            errors.append(f"device {name!r}: no /dev/vfio/<group> deviceNodes to verify")
+            continue
+
+        expected_live_bdfs: List[str] = []
+        for vp in vfio_paths:
+            if vp not in live_by_vfio:
+                errors.append(
+                    f"device {name!r}: VFIO node {vp} is no longer a valid TPU-only VFIO group on this host"
+                )
+            else:
+                expected_live_bdfs.extend(live_by_vfio[vp])
+        expected_live_bdfs = sorted(set(expected_live_bdfs))
+
+        ann = dev.get("annotations") if isinstance(dev.get("annotations"), dict) else {}
+        recorded_bdfs: List[str] = []
+        if isinstance(ann.get("freetpu.dev/pci-bdf"), str) and ann["freetpu.dev/pci-bdf"].strip():
+            recorded_bdfs = [ann["freetpu.dev/pci-bdf"].strip()]
+        elif isinstance(ann.get("freetpu.dev/pci-bdfs"), str) and ann["freetpu.dev/pci-bdfs"].strip():
+            recorded_bdfs = sorted(
+                b.strip() for b in ann["freetpu.dev/pci-bdfs"].split(",") if b.strip()
+            )
+        else:
+            errors.append(
+                f"device {name!r}: missing freetpu.dev/pci-bdf(s) annotation required to verify VFIO group identity"
+            )
+            continue
+
+        if expected_live_bdfs and recorded_bdfs != expected_live_bdfs:
+            errors.append(
+                f"device {name!r}: stale VFIO group identity for {','.join(vfio_paths)} "
+                f"(spec expects PCI BDF(s) {recorded_bdfs}, host currently exposes {expected_live_bdfs})"
+            )
+
+    return errors
+
+
+def _write_spec_atomic(path: Path, rendered: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(rendered)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp_path, 0o644)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _invalidate_spec(path: Path) -> bool:
+    """Remove a stale CDI spec file if present. Returns True if a file was removed."""
+    try:
+        if path.exists() or path.is_symlink():
+            path.unlink()
+            return True
+    except OSError:
+        return False
+    return False
+
+
+def reconcile_cdi_spec(
+    output_path: Path,
+    *,
+    sysfs_root: Path = Path("/sys"),
+    dev_root: Path = Path("/dev"),
+    kind: str = CDI_KIND,
+) -> Tuple[bool, str]:
+    """Generate, validate, and atomically publish a live CDI spec, invalidating stale files on error."""
+    try:
+        chips, vfio_container = discover_tpu_chips(
+            sysfs_root=sysfs_root,
+            dev_root=dev_root,
+            allow_missing_vfio=False,
+        )
+        spec = build_cdi_spec(chips, vfio_container, kind=kind)
+    except Exception as exc:  # noqa: BLE001
+        removed = _invalidate_spec(output_path)
+        suffix = f" (removed stale {output_path})" if removed else ""
+        return False, f"discovery failed: {exc}{suffix}"
+
+    errors = validate_cdi_spec(spec)
+    if errors:
+        removed = _invalidate_spec(output_path)
+        suffix = f" (removed stale {output_path})" if removed else ""
+        return False, f"validation failed: {'; '.join(errors)}{suffix}"
+
+    rendered = json.dumps(spec, indent=2) + "\n"
+    try:
+        if output_path.exists() and output_path.read_text(encoding="utf-8") == rendered:
+            return True, f"unchanged ({len(chips)} chip(s), kind={kind}) at {output_path}"
+    except OSError:
+        pass
+
+    _write_spec_atomic(output_path, rendered)
+    return True, f"updated CNCF CDI v{CDI_VERSION} spec ({len(chips)} chip(s), kind={kind}) at {output_path}"
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="freetpu-cdi",
@@ -561,14 +724,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     gen = sub.add_parser(
         "generate",
-        help="Scan PCI 0x1ae0 + /dev/vfio/* and emit CNCF CDI v0.6.0 JSON.",
+        help="Scan PCI 0x1ae0 + /dev/vfio/* and emit boot-scoped CNCF CDI v0.6.0 JSON.",
     )
     gen.add_argument(
         "--output",
         "-o",
         type=Path,
         default=DEFAULT_OUTPUT_PATH,
-        help=f"Output CDI JSON path (default: {DEFAULT_OUTPUT_PATH}).",
+        help=f"Output CDI JSON path (default boot-scoped tmpfs: {DEFAULT_OUTPUT_PATH}).",
     )
     gen.add_argument(
         "--stdout",
@@ -600,7 +763,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     gen.add_argument(
         "--allow-missing-vfio",
         action="store_true",
-        help="Do not fail if /dev/vfio nodes are absent (dry-run inspection only).",
+        help="Do not fail if /dev/vfio nodes are absent (dry-run inspection only; requires --stdout).",
     )
 
     val = sub.add_parser(
@@ -610,6 +773,68 @@ def build_arg_parser() -> argparse.ArgumentParser:
     val.add_argument(
         "spec_path",
         help="Path to CDI JSON file, or '-' to read from stdin.",
+    )
+    val.add_argument(
+        "--check-host",
+        action="store_true",
+        help="Also revalidate every VFIO group's PCI BDF identity and isolation against live sysfs.",
+    )
+    val.add_argument(
+        "--remove-if-stale",
+        action="store_true",
+        help="With --check-host, unlink spec_path if live host VFIO verification fails.",
+    )
+    val.add_argument(
+        "--sysfs-root",
+        type=Path,
+        default=Path("/sys"),
+        help="Sysfs root path for --check-host (default: /sys).",
+    )
+    val.add_argument(
+        "--dev-root",
+        type=Path,
+        default=Path("/dev"),
+        help="Devfs root path for --check-host (default: /dev).",
+    )
+
+    sync = sub.add_parser(
+        "sync",
+        help="Continuously reconcile a boot-scoped CDI spec against live VFIO topology, removing stale specs on drift/error.",
+    )
+    sync.add_argument(
+        "--output",
+        "-o",
+        type=Path,
+        default=DEFAULT_OUTPUT_PATH,
+        help=f"Output CDI JSON path (default: {DEFAULT_OUTPUT_PATH}).",
+    )
+    sync.add_argument(
+        "--interval",
+        type=float,
+        default=15.0,
+        help="Revalidation interval in seconds (default: 15.0).",
+    )
+    sync.add_argument(
+        "--once",
+        action="store_true",
+        help="Run a single reconciliation pass and exit (0 if valid, 1 if invalidated).",
+    )
+    sync.add_argument(
+        "--kind",
+        default=CDI_KIND,
+        help=f"CDI vendor/class kind (default: {CDI_KIND}).",
+    )
+    sync.add_argument(
+        "--sysfs-root",
+        type=Path,
+        default=Path("/sys"),
+        help="Sysfs root path (default: /sys).",
+    )
+    sync.add_argument(
+        "--dev-root",
+        type=Path,
+        default=Path("/dev"),
+        help="Devfs root path (default: /dev).",
     )
 
     dargs = sub.add_parser(
@@ -629,6 +854,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "generate":
+        if args.allow_missing_vfio and not args.stdout:
+            sys.stderr.write(
+                "freetpu-cdi generate failed: --allow-missing-vfio is for dry-run inspection only "
+                "and requires --stdout (refusing to overwrite a live CDI spec file)\n"
+            )
+            return 1
+
         try:
             chips, vfio_container = discover_tpu_chips(
                 sysfs_root=args.sysfs_root,
@@ -641,12 +873,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 kind=args.kind,
             )
         except Exception as exc:  # noqa: BLE001
+            if not args.stdout and not args.allow_missing_vfio:
+                if _invalidate_spec(args.output):
+                    sys.stderr.write(f"Removed stale CDI spec at {args.output}\n")
             sys.stderr.write(f"freetpu-cdi generate failed: {exc}\n")
             return 1
 
         if args.validate:
             errors = validate_cdi_spec(spec)
             if errors:
+                if not args.stdout and not args.allow_missing_vfio:
+                    if _invalidate_spec(args.output):
+                        sys.stderr.write(f"Removed stale CDI spec at {args.output}\n")
                 for err in errors:
                     sys.stderr.write(f"CDI validation error: {err}\n")
                 return 1
@@ -656,8 +894,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             sys.stdout.write(rendered)
             return 0
 
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(rendered, encoding="utf-8")
+        _write_spec_atomic(args.output, rendered)
         sys.stderr.write(
             f"Wrote CNCF CDI v{CDI_VERSION} spec ({len(chips)} chip(s), kind={args.kind}) to {args.output}\n"
         )
@@ -674,13 +911,63 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             sys.stderr.write(f"Invalid JSON: {exc}\n")
             return 1
         errors = validate_cdi_spec(parsed)
+        if not errors and args.check_host:
+            errors.extend(
+                verify_spec_against_host(
+                    parsed,
+                    sysfs_root=args.sysfs_root,
+                    dev_root=args.dev_root,
+                )
+            )
         if errors:
+            if args.check_host and args.remove_if_stale and args.spec_path != "-":
+                if _invalidate_spec(Path(args.spec_path)):
+                    sys.stderr.write(f"Removed stale CDI spec at {args.spec_path}\n")
             for err in errors:
                 sys.stderr.write(f"CDI validation error: {err}\n")
             return 1
+        suffix = " (host VFIO identity verified)" if args.check_host else ""
         sys.stdout.write(
-            f"VALID CNCF CDI v{CDI_VERSION} spec ({parsed.get('kind')}, {len(parsed.get('devices', []))} device entries)\n"
+            f"VALID CNCF CDI v{CDI_VERSION} spec ({parsed.get('kind')}, {len(parsed.get('devices', []))} device entries){suffix}\n"
         )
+        return 0
+
+    if args.command == "sync":
+        if args.once:
+            ok, msg = reconcile_cdi_spec(
+                args.output,
+                sysfs_root=args.sysfs_root,
+                dev_root=args.dev_root,
+                kind=args.kind,
+            )
+            sys.stderr.write(f"freetpu-cdi sync: {msg}\n")
+            return 0 if ok else 1
+
+        stop_requested = False
+
+        def _handle_signal(_signum: int, _frame: Any) -> None:
+            nonlocal stop_requested
+            stop_requested = True
+
+        signal.signal(signal.SIGTERM, _handle_signal)
+        signal.signal(signal.SIGINT, _handle_signal)
+
+        last_msg = ""
+        interval = max(1.0, float(args.interval))
+        while not stop_requested:
+            ok, msg = reconcile_cdi_spec(
+                args.output,
+                sysfs_root=args.sysfs_root,
+                dev_root=args.dev_root,
+                kind=args.kind,
+            )
+            if msg != last_msg or not ok:
+                sys.stderr.write(f"freetpu-cdi sync: {msg}\n")
+                sys.stderr.flush()
+                last_msg = msg
+            deadline = time.monotonic() + interval
+            while not stop_requested and time.monotonic() < deadline:
+                time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
         return 0
 
     if args.command == "docker-args":

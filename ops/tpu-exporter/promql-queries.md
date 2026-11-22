@@ -45,10 +45,26 @@ sum_over_time(
   )[24h:1m]
 ) / 60
 
-# Idle reserved chips (active PID holding /dev/vfio/* but MXU duty cycle < 2% for 15m)
-(freetpu_tpu_active_pids > 0)
+# Idle reserved chips: PID reservation persisted for the full 15m window AND
+# sufficient samples exist across the 15m window AND average MXU duty cycle < 2%.
+# Assumes the 15s scrape_interval from prometheus-scrape.yml (60 samples / 15m;
+# requiring >= 55 samples avoids flagging newly started workloads early. Scale
+# the threshold proportionally for other scrape intervals, e.g. >= 27 for 30s).
+(min_over_time(freetpu_tpu_active_pids[15m]) > 0)
+  and
+(count_over_time(freetpu_tpu_active_pids[15m]) >= 55)
+  and
+(count_over_time(freetpu_tpu_duty_cycle_percent[15m]) >= 55)
   and
 (avg_over_time(freetpu_tpu_duty_cycle_percent[15m]) < 2)
+
+# Duty-cycle telemetry coverage ratio per generation (0.0 - 1.0).
+# Check coverage before extrapolating utilization-adjusted costs across the fleet.
+(
+  count by (generation) (freetpu_tpu_duty_cycle_percent)
+  /
+  count by (generation) (group by (generation, instance, pci_bdf) (freetpu_tpu_info))
+)
 
 # Inventory-based estimated hourly TPU spend by generation across scraped hosts.
 # Counts all discovered PCI chips via `freetpu_tpu_info` (including unhealthy or
@@ -62,11 +78,14 @@ sum_over_time(
   count by (generation) (group by (generation, instance, pci_bdf) (freetpu_tpu_info{generation="v6e"})) * 2.70
 )
 
-# Inventory-based effective cost per utilized TPU-hour by generation
-# (discovered-inventory hourly spend estimate / equivalent fully-utilized chips)
+# Measured-chip effective cost per utilized TPU-hour by generation.
+# Restricts BOTH numerator and denominator to chips with usable, PCI-mapped
+# `freetpu_tpu_duty_cycle_percent` readings so partial telemetry coverage never
+# inflates the estimate. Check the telemetry coverage ratio above before
+# extrapolating fleet-wide.
 (
-  count by (generation) (group by (generation, instance, pci_bdf) (freetpu_tpu_info{generation="v5e"})) * 1.20
+  count by (generation) (freetpu_tpu_duty_cycle_percent{generation="v5e"}) * 1.20
   or
-  count by (generation) (group by (generation, instance, pci_bdf) (freetpu_tpu_info{generation="v6e"})) * 2.70
+  count by (generation) (freetpu_tpu_duty_cycle_percent{generation="v6e"}) * 2.70
 ) / clamp_min(sum by (generation) (freetpu_tpu_duty_cycle_percent / 100), 0.01)
 ```

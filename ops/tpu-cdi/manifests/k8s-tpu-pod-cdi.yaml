@@ -1,8 +1,10 @@
 # Sample Kubernetes DRA workload requesting a FreeTPU CDI device (stable resource.k8s.io/v1).
 # Prerequisites:
-#   1. containerd >= 1.7 with `enable_cdi = true` (default in containerd 2.0)
-#      and /var/run/cdi/freetpu.json populated by k8s-tpu-cdi-daemonset.yaml on
-#      VFIO-backed Cloud TPU nodes (v5e, v5p, v6e Trillium).
+#   1. containerd >= 2.0 (ships CDI >= 0.6.0 with `annotations` support, native
+#      CRI `CDIDevices` injection used by kubelet DRA, and `enable_cdi = true` by
+#      default; containerd 1.7.0 lacks both CDI v0.6.0 and CRI `CDIDevices`) and
+#      boot-scoped /var/run/cdi/freetpu.json populated by k8s-tpu-cdi-daemonset.yaml
+#      on VFIO-backed Cloud TPU nodes (v5e, v5p, v6e Trillium).
 #   2. Kubernetes >= 1.34 with stable Dynamic Resource Allocation (`resource.k8s.io/v1`,
 #      enabled by default) AND a cluster DRA kubelet/controller driver registered for
 #      driver `freetpu.dev` that publishes ResourceSlices and injects

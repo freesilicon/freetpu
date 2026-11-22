@@ -502,7 +502,34 @@ TPU Process Monitor
             self.assertIn("} 0", prom)
             self.assertNotIn("freetpu_tpu_active_pids{", prom)
 
-    def test_http_worker_cap_rejects_excess_concurrency(self) -> None:
+            # Even when tpu-info returns a matching chip row with PID=None, an
+            # unreadable /proc scan MUST keep PID telemetry unavailable (no false 0).
+            mock_none_pid = root / "mock-tpu-info-none-pid.sh"
+            mock_none_pid.write_text(
+                "#!/bin/sh\n"
+                "cat <<'EOF'\n"
+                "TPU Chips\n"
+                "| Chip        | Type         | Devices | PID  |\n"
+                "|-------------|--------------|---------|------|\n"
+                "| /dev/vfio/0 | TPU v5e chip | 1       | None |\n"
+                "EOF\n",
+                encoding="utf-8",
+            )
+            mock_none_pid.chmod(0o755)
+            with mock.patch.object(Path, "iterdir", autospec=True, side_effect=_guarded_iterdir):
+                snap_with_cli = tpu_exporter.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin=str(mock_none_pid),
+                )
+            self.assertTrue(snap_with_cli.tpu_info_available)
+            self.assertFalse(snap_with_cli.pid_telemetry_available)
+            self.assertFalse(snap_with_cli.devices[0].pid_telemetry_available)
+            prom_with_cli = tpu_exporter.format_prometheus_metrics(snap_with_cli)
+            self.assertNotIn("freetpu_tpu_active_pids{", prom_with_cli)
+
+    def test_http_worker_cap_rejects_excess_scrapes_while_keeping_healthz_alive(self) -> None:
         import http.client
         import time as _time
 
@@ -532,6 +559,7 @@ TPU Process Monitor
                 tpu_info_timeout_s=2.0,
                 max_workers=1,
             )
+            health_server = tpu_exporter._HealthServer(("127.0.0.1", 0))
             gate = threading.Event()
             release = threading.Event()
             orig_scrape = server.scrape
@@ -543,8 +571,11 @@ TPU Process Monitor
 
             server.scrape = _slow_scrape  # type: ignore[method-assign]
             port = server.server_address[1]
+            health_port = health_server.server_address[1]
             t = threading.Thread(target=server.serve_forever, daemon=True)
+            th = threading.Thread(target=health_server.serve_forever, daemon=True)
             t.start()
+            th.start()
             try:
                 holder_status: list[int] = []
 
@@ -559,11 +590,26 @@ TPU Process Monitor
                 self.assertTrue(gate.wait(timeout=2.0))
                 _time.sleep(0.05)
 
-                conn2 = http.client.HTTPConnection("127.0.0.1", port, timeout=2.0)
-                conn2.request("GET", "/healthz")
-                resp2 = conn2.getresponse()
-                self.assertEqual(resp2.status, 503)
-                conn2.close()
+                # Excess concurrent /metrics scrape must be rejected with 503.
+                conn_metrics = http.client.HTTPConnection("127.0.0.1", port, timeout=2.0)
+                conn_metrics.request("GET", "/metrics")
+                resp_metrics = conn_metrics.getresponse()
+                self.assertEqual(resp_metrics.status, 503)
+                conn_metrics.close()
+
+                # /healthz on the main port stays 200 even when scrape slots are saturated.
+                conn_hz = http.client.HTTPConnection("127.0.0.1", port, timeout=2.0)
+                conn_hz.request("GET", "/healthz")
+                resp_hz = conn_hz.getresponse()
+                self.assertEqual(resp_hz.status, 200)
+                conn_hz.close()
+
+                # Dedicated health listener stays 200 independently of scrape traffic.
+                conn_dedicated = http.client.HTTPConnection("127.0.0.1", health_port, timeout=2.0)
+                conn_dedicated.request("GET", "/healthz")
+                resp_dedicated = conn_dedicated.getresponse()
+                self.assertEqual(resp_dedicated.status, 200)
+                conn_dedicated.close()
 
                 release.set()
                 t1.join(timeout=2.0)
@@ -572,7 +618,10 @@ TPU Process Monitor
                 release.set()
                 server.shutdown()
                 server.server_close()
+                health_server.shutdown()
+                health_server.server_close()
                 t.join(timeout=2.0)
+                th.join(timeout=2.0)
 
     def _assert_valid_prometheus_text(self, text: str) -> None:
         lines = [ln for ln in text.splitlines() if ln.strip()]

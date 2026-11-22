@@ -398,6 +398,176 @@ class FreeTpuCdiTests(unittest.TestCase):
         self.assertIn("--cap-add=IPC_LOCK", res.stdout)
         self.assertIn("--ulimit memlock=-1:-1", res.stdout)
 
+    def test_default_output_is_boot_scoped_and_dry_run_requires_stdout(self) -> None:
+        self.assertEqual(freetpu_cdi.DEFAULT_OUTPUT_PATH, Path("/var/run/cdi/freetpu.json"))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sysfs_root, dev_root = _make_mock_pci_vfio(
+                root,
+                devices=[
+                    {
+                        "bdf": "0000:00:05.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0063",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                    }
+                ],
+                create_vfio_container=False,
+                create_vfio_nodes=[],
+            )
+            live_spec = root / "var" / "run" / "cdi" / "freetpu.json"
+            live_spec.parent.mkdir(parents=True, exist_ok=True)
+            live_spec.write_text('{"sentinel": "keep"}\n', encoding="utf-8")
+
+            script = CDI_DIR / "freetpu_cdi.py"
+            res_fail = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "generate",
+                    "--allow-missing-vfio",
+                    "--output",
+                    str(live_spec),
+                    "--sysfs-root",
+                    str(sysfs_root),
+                    "--dev-root",
+                    str(dev_root),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(res_fail.returncode, 0)
+            self.assertIn("--stdout", res_fail.stderr)
+            # Must NEVER overwrite or remove the existing live spec on dry-run refusal.
+            self.assertEqual(live_spec.read_text(encoding="utf-8"), '{"sentinel": "keep"}\n')
+
+            res_ok = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "generate",
+                    "--allow-missing-vfio",
+                    "--stdout",
+                    "--sysfs-root",
+                    str(sysfs_root),
+                    "--dev-root",
+                    str(dev_root),
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            parsed = json.loads(res_ok.stdout)
+            self.assertEqual(parsed["cdiVersion"], "0.6.0")
+
+    def test_host_revalidation_and_sync_invalidate_stale_vfio_group_specs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sysfs_root, dev_root = _make_mock_pci_vfio(
+                root,
+                devices=[
+                    {
+                        "bdf": "0000:00:06.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0063",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                    }
+                ],
+                create_vfio_nodes=["0"],
+            )
+            spec_path = root / "var" / "run" / "cdi" / "freetpu.json"
+            script = CDI_DIR / "freetpu_cdi.py"
+
+            # Initial sync writes a valid spec.
+            ok, _msg = freetpu_cdi.reconcile_cdi_spec(
+                spec_path,
+                sysfs_root=sysfs_root,
+                dev_root=dev_root,
+            )
+            self.assertTrue(ok)
+            self.assertTrue(spec_path.exists())
+
+            # Live host validation succeeds while topology matches.
+            val_ok = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "validate",
+                    str(spec_path),
+                    "--check-host",
+                    "--sysfs-root",
+                    str(sysfs_root),
+                    "--dev-root",
+                    str(dev_root),
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertIn("host VFIO identity verified", val_ok.stdout)
+
+            # Simulate topology shift: group 0 is reassigned to a different TPU BDF
+            # (or another VFIO device) while spec still expects 0000:00:06.0 in group 0.
+            shifted_sysfs, shifted_dev = _make_mock_pci_vfio(
+                root / "shifted",
+                devices=[
+                    {
+                        "bdf": "0000:00:09.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0063",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                    }
+                ],
+                create_vfio_nodes=["0"],
+            )
+            val_stale = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "validate",
+                    str(spec_path),
+                    "--check-host",
+                    "--remove-if-stale",
+                    "--sysfs-root",
+                    str(shifted_sysfs),
+                    "--dev-root",
+                    str(shifted_dev),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(val_stale.returncode, 0)
+            self.assertIn("stale VFIO group identity", val_stale.stderr)
+            self.assertFalse(spec_path.exists())
+
+            # Re-create spec, then simulate non-TPU device entering group 0:
+            # sync must invalidate/unlink the stale spec immediately.
+            ok2, _msg2 = freetpu_cdi.reconcile_cdi_spec(
+                spec_path,
+                sysfs_root=sysfs_root,
+                dev_root=dev_root,
+            )
+            self.assertTrue(ok2)
+            self.assertTrue(spec_path.exists())
+
+            extra_non_tpu = sysfs_root / "kernel" / "iommu_groups" / "0" / "devices" / "0000:00:05.0"
+            extra_non_tpu.parent.mkdir(parents=True, exist_ok=True)
+            extra_non_tpu.write_text("", encoding="utf-8")
+
+            ok3, msg3 = freetpu_cdi.reconcile_cdi_spec(
+                spec_path,
+                sysfs_root=sysfs_root,
+                dev_root=dev_root,
+            )
+            self.assertFalse(ok3)
+            self.assertIn("removed stale", msg3)
+            self.assertFalse(spec_path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

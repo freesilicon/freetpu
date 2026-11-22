@@ -35,8 +35,9 @@ VFIO-backed Cloud TPU VMs (`v5e`, `v5p`, `v6e` Trillium) expose each TPU chip as
 ### Running the Exporter
 
 ```bash
-# Long-running HTTP server (binds 127.0.0.1:9400 by default; pass --host 0.0.0.0 in pods/containers)
-python3 ops/tpu-exporter/tpu_exporter.py --port 9400
+# Long-running HTTP server (binds 127.0.0.1:9400 by default; pass --host 0.0.0.0 in pods/containers
+# and --health-port 9401 to isolate liveness/readiness probes from scrape traffic saturation)
+python3 ops/tpu-exporter/tpu_exporter.py --port 9400 --health-port 9401
 
 # One-shot snapshot (CI / ephemeral Cloud TPU or Colab runs)
 python3 ops/tpu-exporter/tpu_exporter.py --once
@@ -48,7 +49,7 @@ python3 ops/tpu-exporter/tpu_exporter.py --once --json
 HTTP endpoints served in server mode:
 - `GET /metrics` — Prometheus text exposition format `0.0.4`
 - `GET /metrics.json` — Structured JSON telemetry snapshot
-- `GET /healthz` — Readiness/liveness probe (`{"status":"ok"}`)
+- `GET /healthz`, `GET /readyz` — Readiness/liveness probe (`{"status":"ok"}`); pass `--health-port` (e.g. `9401`) to serve probes on a dedicated listener completely independent of `/metrics` scrape saturation.
 
 ### Exported Metrics
 
@@ -80,17 +81,22 @@ See [`ops/tpu-exporter/prometheus-scrape.yml`](../../ops/tpu-exporter/prometheus
 
 ## 2. Container Passthrough via CNCF CDI (`ops/tpu-cdi/`)
 
-### Generating & Validating `/etc/cdi/freetpu.json`
+### Generating, Validating & Reconciling Boot-Scoped `/var/run/cdi/freetpu.json`
+
+`freetpu-cdi` defaults to the boot-scoped CNCF CDI dynamic directory (`/var/run/cdi/freetpu.json`, tmpfs on Linux) so stale IOMMU group assignments never persist across reboots. Avoid persisting static specs in `/etc/cdi` across reboots or PCI/VFIO topology changes.
 
 ```bash
-# Write /etc/cdi/freetpu.json and validate against CNCF CDI v0.6.0 rules
-sudo python3 ops/tpu-cdi/freetpu_cdi.py generate --output /etc/cdi/freetpu.json --validate
+# Write boot-scoped /var/run/cdi/freetpu.json and validate against CNCF CDI v0.6.0 rules
+sudo python3 ops/tpu-cdi/freetpu_cdi.py generate --output /var/run/cdi/freetpu.json --validate
 
-# Preview CDI JSON to stdout
+# Preview CDI JSON to stdout (dry-run --allow-missing-vfio requires --stdout and never writes to disk)
 python3 ops/tpu-cdi/freetpu_cdi.py generate --stdout --validate
 
-# Validate an existing CDI spec
-python3 ops/tpu-cdi/freetpu_cdi.py validate /etc/cdi/freetpu.json
+# Revalidate an existing CDI spec against live host VFIO group identity (removing it if stale)
+sudo python3 ops/tpu-cdi/freetpu_cdi.py validate /var/run/cdi/freetpu.json --check-host --remove-if-stale
+
+# Continuously reconcile /var/run/cdi/freetpu.json on live VFIO topology changes (invalidating on drift/error)
+sudo python3 ops/tpu-cdi/freetpu_cdi.py sync --output /var/run/cdi/freetpu.json --interval 15
 ```
 
 Generated CDI devices (VFIO-backed `v5e`, `v5p`, `v6e` Trillium hosts only):
@@ -99,8 +105,8 @@ Generated CDI devices (VFIO-backed `v5e`, `v5p`, `v6e` Trillium hosts only):
 - `freetpu.dev/tpu=all` — All discovered TPU `/dev/vfio/<iommu_group>` nodes (deduplicated) plus `/dev/vfio/vfio`.
 
 Safety & runtime guarantees:
-- **Full IOMMU group verification:** `freetpu-cdi` inspects every PCI member of each TPU's IOMMU group (both `/sys/bus/pci/devices/*/iommu_group` and `/sys/kernel/iommu_groups/<group>/devices/*`) and fails closed if any group also contains a non-TPU PCI device, preventing accidental VFIO exposure through any selector (including `all`).
-- **Dynamic VFIO device numbers:** Generated `deviceNodes` intentionally omit `major` and `minor` so containerd/CDI resolves live device numbers from `hostPath` at container start instead of pinning numbers that can go stale after reboots or driver rebinds.
+- **Full IOMMU group verification & live revalidation:** `freetpu-cdi` inspects every PCI member of each TPU's IOMMU group (both `/sys/bus/pci/devices/*/iommu_group` and `/sys/kernel/iommu_groups/<group>/devices/*`) and fails closed if any group also contains a non-TPU PCI device, preventing accidental VFIO exposure through any selector (including `all`). Failed regenerations unlink stale specs at `--output`, `validate --check-host --remove-if-stale` verifies each `/dev/vfio/<group>` still maps to the exact recorded PCI BDF(s), and `sync` continuously reconciles or invalidates `/var/run/cdi/freetpu.json` if group assignments change.
+- **Dynamic VFIO device numbers:** Generated `deviceNodes` intentionally omit `major` and `minor` so containerd/CDI resolves live device numbers from `hostPath` at container start instead of pinning numbers that can go stale after driver rebinds.
 
 ### Docker / Podman / containerd Usage
 
@@ -132,9 +138,10 @@ kubectl -n kube-system create configmap freetpu-ops-scripts \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
 
-- Node setup & metrics: [`ops/tpu-cdi/manifests/k8s-tpu-cdi-daemonset.yaml`](../../ops/tpu-cdi/manifests/k8s-tpu-cdi-daemonset.yaml) — targets all VFIO-backed GKE TPU node types (`tpu-v5-lite-device`, `tpu-v5-lite-podslice`, `tpu-v5p-slice`, `tpu-v6e-slice`) via `nodeAffinity` and tolerates `google.com/tpu:NoSchedule`.
-- Sample `DeviceClass`, DRA `ResourceClaimTemplate`, and Pod (stable `resource.k8s.io/v1` for Kubernetes >= 1.34, with `google.com/tpu:NoSchedule` toleration): [`ops/tpu-cdi/manifests/k8s-tpu-pod-cdi.yaml`](../../ops/tpu-cdi/manifests/k8s-tpu-pod-cdi.yaml) (requires a cluster DRA driver publishing `ResourceSlice` objects for `freetpu.dev`).
-- Legacy Kubernetes 1.32–1.33 DRA sample (`resource.k8s.io/v1beta1`): [`ops/tpu-cdi/manifests/k8s-tpu-pod-cdi-v1beta1.yaml`](../../ops/tpu-cdi/manifests/k8s-tpu-pod-cdi-v1beta1.yaml) (requires `--runtime-config=resource.k8s.io/v1beta1=true` and `DynamicResourceAllocation=true`).
+- Node setup, CDI sync & inventory/PID metrics: [`ops/tpu-cdi/manifests/k8s-tpu-cdi-daemonset.yaml`](../../ops/tpu-cdi/manifests/k8s-tpu-cdi-daemonset.yaml) — targets all VFIO-backed GKE TPU node types (`tpu-v5-lite-device`, `tpu-v5-lite-podslice`, `tpu-v5p-slice`, `tpu-v6e-slice`) via `nodeAffinity`, tolerates `google.com/tpu:NoSchedule`, continuously reconciles `/var/run/cdi/freetpu.json` via `freetpu-cdi-sync`, and exposes **PCI/VFIO inventory and hostPID active-PID metrics only** (stock `python:3.12-slim` without `tpu-info`, with liveness/readiness isolated on `:9401`).
+- Live HBM + MXU duty-cycle telemetry in Kubernetes (workload sidecar): [`ops/tpu-cdi/manifests/k8s-tpu-workload-telemetry-sidecar.yaml`](../../ops/tpu-cdi/manifests/k8s-tpu-workload-telemetry-sidecar.yaml) — because `libtpu` serves runtime metrics on `localhost:8431` inside each workload Pod's network namespace, build `ops/tpu-exporter/Dockerfile` with `--build-arg INSTALL_TPU_INFO=1` and run it as a native sidecar (`initContainers` with `restartPolicy: Always`) inside the TPU workload Pod.
+- Sample `DeviceClass`, DRA `ResourceClaimTemplate`, and Pod (stable `resource.k8s.io/v1` for Kubernetes >= 1.34 and `containerd >= 2.0`, with `google.com/tpu:NoSchedule` toleration): [`ops/tpu-cdi/manifests/k8s-tpu-pod-cdi.yaml`](../../ops/tpu-cdi/manifests/k8s-tpu-pod-cdi.yaml) (requires a cluster DRA driver publishing `ResourceSlice` objects for `freetpu.dev`; `containerd >= 2.0` is required for both CDI v0.6.0 `annotations` and kubelet CRI `CDIDevices` injection).
+- Legacy Kubernetes 1.32–1.33 DRA sample (`resource.k8s.io/v1beta1`, `containerd >= 2.0`): [`ops/tpu-cdi/manifests/k8s-tpu-pod-cdi-v1beta1.yaml`](../../ops/tpu-cdi/manifests/k8s-tpu-pod-cdi-v1beta1.yaml) (requires `--runtime-config=resource.k8s.io/v1beta1=true` and `DynamicResourceAllocation=true`).
 
 ---
 

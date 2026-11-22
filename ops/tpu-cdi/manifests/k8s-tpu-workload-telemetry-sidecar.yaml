@@ -1,0 +1,125 @@
+# Sample Kubernetes TPU workload Pod with a co-located `tpu-exporter` live
+# telemetry native sidecar (HBM usage + MXU duty cycle).
+#
+# Why a sidecar?
+#   `libtpu` serves its runtime metrics gRPC endpoint on `localhost:8431` inside
+#   the workload Pod's network namespace. A separate host-level DaemonSet cannot
+#   reach a workload Pod's `localhost:8431`. Running `tpu_exporter.py` with
+#   `tpu-info` installed as a native sidecar (`initContainers` with
+#   `restartPolicy: Always`, stable in Kubernetes >= 1.29) inside the workload
+#   Pod shares the same network namespace so `tpu-info` queries `localhost:8431`
+#   directly while terminating cleanly when the workload container exits.
+#
+# Prerequisites:
+#   1. Build and push the `tpu-info`-enabled exporter image:
+#        docker build --build-arg INSTALL_TPU_INFO=1 \
+#          -t <registry>/freetpu-tpu-exporter:tpu-info ops/tpu-exporter
+#   2. containerd >= 2.0 (CDI >= 0.6.0 + CRI `CDIDevices`), Kubernetes >= 1.34
+#      with `resource.k8s.io/v1` DRA, a cluster DRA driver for `freetpu.dev`,
+#      and `DeviceClass` / `ResourceClaimTemplate` from `k8s-tpu-pod-cdi.yaml`.
+#   3. Replace `<registry>/freetpu-tpu-exporter:tpu-info` and the workload image
+#      with your JAX or PyTorch/XLA TPU container image.
+#   4. Note: `tpu-info` exposes `freetpu_tpu_runtime_hbm_used_bytes` and
+#      `freetpu_tpu_runtime_duty_cycle_percent` keyed by `libtpu` runtime chip
+#      ID by default; mount/pass `--chip-id-map` if you also need verified
+#      per-PCI-BDF joins.
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: freetpu-jax-workload-with-telemetry
+  labels:
+    app.kubernetes.io/name: freetpu-tpu-exporter
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9400"
+    prometheus.io/path: "/metrics"
+spec:
+  restartPolicy: Never
+  # Share PID namespace between workload and sidecar so /proc/<pid>/fd and
+  # tpu-info PID correlation work cleanly within the Pod.
+  shareProcessNamespace: true
+  tolerations:
+    - key: google.com/tpu
+      operator: Exists
+      effect: NoSchedule
+  initContainers:
+    - name: tpu-exporter-sidecar
+      restartPolicy: Always
+      image: <registry>/freetpu-tpu-exporter:tpu-info
+      args:
+        - --host
+        - 0.0.0.0
+        - --port
+        - "9400"
+        - --health-port
+        - "9401"
+      securityContext:
+        capabilities:
+          add:
+            - SYS_PTRACE
+      ports:
+        - name: metrics
+          containerPort: 9400
+          protocol: TCP
+        - name: health
+          containerPort: 9401
+          protocol: TCP
+      readinessProbe:
+        httpGet:
+          path: /readyz
+          port: health
+        initialDelaySeconds: 2
+        periodSeconds: 10
+      livenessProbe:
+        httpGet:
+          path: /healthz
+          port: health
+        initialDelaySeconds: 5
+        periodSeconds: 30
+      resources:
+        requests:
+          cpu: 50m
+          memory: 96Mi
+        limits:
+          cpu: 200m
+          memory: 256Mi
+      volumeMounts:
+        - name: sysfs
+          mountPath: /sys
+          readOnly: true
+        - name: dev-vfio
+          mountPath: /dev/vfio
+          readOnly: true
+  containers:
+    - name: jax-tpu
+      image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:latest
+      command:
+        - python3
+        - -c
+        - "import jax, time; print('JAX TPU devices:', jax.devices()); time.sleep(3600)"
+      securityContext:
+        capabilities:
+          add:
+            - IPC_LOCK
+      resources:
+        claims:
+          - name: tpu
+        requests:
+          memory: "8Gi"
+          cpu: "2"
+        limits:
+          memory: "16Gi"
+          cpu: "4"
+  resourceClaims:
+    - name: tpu
+      resourceClaimTemplateName: freetpu-all-claim
+  volumes:
+    - name: sysfs
+      hostPath:
+        path: /sys
+        type: Directory
+    - name: dev-vfio
+      hostPath:
+        path: /dev/vfio
+        type: Directory
