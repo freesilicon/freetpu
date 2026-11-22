@@ -9,6 +9,7 @@ v5e/v6e workers with zero third-party dependencies (Python standard library only
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict
 from dataclasses import dataclass, field
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -65,6 +66,29 @@ RETRYABLE_STATUS_CODES = (502, 503, 504)
 UNKNOWN_MODEL_LABEL = "_unknown"
 OTHER_MODEL_LABEL = "_other"
 MAX_METRIC_MODEL_LABELS = 256
+MAX_RR_CURSORS = 1024
+MAX_PROBE_RESPONSE_BYTES = 2 * 1024 * 1024
+_CORS_ALLOWED_HEADERS = ", ".join(
+    (
+        "Authorization",
+        "Content-Type",
+        "X-FreeTPU-Policy",
+        "X-Request-ID",
+        "OpenAI-Organization",
+        "OpenAI-Project",
+        "OpenAI-Beta",
+        "X-Stainless-OS",
+        "X-Stainless-Lang",
+        "X-Stainless-Package-Version",
+        "X-Stainless-Runtime",
+        "X-Stainless-Runtime-Version",
+        "X-Stainless-Arch",
+        "X-Stainless-Retry-Count",
+        "X-Stainless-Timeout",
+        "X-Stainless-Read-Timeout",
+        "X-Stainless-Helper-Method",
+    )
+)
 
 
 def _join_backend_url(base_url: str, endpoint: str) -> Tuple[str, str, int, str]:
@@ -694,7 +718,7 @@ class RouterEngine:
         self._backends: List[BackendState] = [
             BackendState(config=b) for b in config.backends
         ]
-        self._rr_cursors: Dict[str, int] = {}
+        self._rr_cursors: OrderedDict[str, int] = OrderedDict()
         self._metric_models_seen: set[str] = set()
         self._poller_lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -804,12 +828,53 @@ class RouterEngine:
             headers["Authorization"] = f"Bearer {api_key}"
 
         t0 = time.monotonic()
+        deadline = t0 + max(0.01, timeout_s)
         conn: Optional[http.client.HTTPConnection] = None
+        resp: Optional[http.client.HTTPResponse] = None
         try:
-            conn = _open_http_connection(scheme, host, port, timeout_s)
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                raise TimeoutError("Probe exceeded elapsed deadline")
+            conn = _open_http_connection(scheme, host, port, rem)
             conn.request("GET", path, headers=headers)
+            upstream_sock = conn.sock
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                raise TimeoutError("Probe exceeded elapsed deadline")
+            if upstream_sock is not None:
+                try:
+                    upstream_sock.settimeout(rem)
+                except OSError:
+                    pass
             resp = conn.getresponse()
-            raw = resp.read()
+            if upstream_sock is None:
+                upstream_sock = getattr(getattr(resp.fp, "raw", None), "_sock", None)
+            chunks: List[bytes] = []
+            total = 0
+            while True:
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    raise TimeoutError("Probe response exceeded elapsed deadline")
+                if upstream_sock is not None:
+                    try:
+                        upstream_sock.settimeout(rem)
+                    except OSError:
+                        pass
+                budget_left = (MAX_PROBE_RESPONSE_BYTES - total) + 1
+                if budget_left <= 0:
+                    raise ValueError(
+                        f"Probe response exceeded {MAX_PROBE_RESPONSE_BYTES} byte limit"
+                    )
+                chunk = resp.read1(min(8192, budget_left))
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_PROBE_RESPONSE_BYTES:
+                    raise ValueError(
+                        f"Probe response exceeded {MAX_PROBE_RESPONSE_BYTES} byte limit"
+                    )
+                chunks.append(chunk)
+            raw = b"".join(chunks)
             rtt_ms = (time.monotonic() - t0) * 1000.0
             parsed_json: Optional[Dict[str, Any]] = None
             if raw:
@@ -820,10 +885,15 @@ class RouterEngine:
                 except json.JSONDecodeError:
                     parsed_json = None
             return resp.status, parsed_json, rtt_ms, None
-        except (OSError, TimeoutError, http.client.HTTPException) as exc:
+        except (OSError, TimeoutError, ValueError, http.client.HTTPException) as exc:
             rtt_ms = (time.monotonic() - t0) * 1000.0
             return 0, None, rtt_ms, str(exc)
         finally:
+            if resp is not None:
+                try:
+                    resp.close()
+                except OSError:
+                    pass
             if conn is not None:
                 try:
                     conn.close()
@@ -832,34 +902,47 @@ class RouterEngine:
 
     def probe_backend(self, state: BackendState) -> None:
         """Probe backend HTTP readiness, `/v1/models`, and optional `tpu-exporter`."""
-        timeout_s = self.config.probe_timeout_s
+        probe_deadline = time.monotonic() + self.config.probe_timeout_s
         probe_ok = False
         probe_err: Optional[str] = None
         rtt_ms: Optional[float] = None
         discovered: Optional[List[str]] = None
 
+        def remaining_timeout() -> float:
+            return probe_deadline - time.monotonic()
+
         if state.config.health_path:
-            status, _, rtt_ms, err = self._http_get_json(
-                state.config, state.config.health_path, timeout_s
-            )
+            rem = remaining_timeout()
+            if rem <= 0:
+                status, err = 0, "probe_deadline_exceeded"
+            else:
+                status, _, rtt_ms, err = self._http_get_json(
+                    state.config, state.config.health_path, rem
+                )
             if 200 <= status < 300:
                 probe_ok = True
             else:
                 probe_err = err or f"health_http_{status}"
             if probe_ok and state.config.discover_models:
-                m_status, m_json, _, _ = self._http_get_json(
-                    state.config, "/v1/models", timeout_s
-                )
-                if 200 <= m_status < 300 and m_json and isinstance(m_json.get("data"), list):
-                    discovered = [
-                        str(item["id"])
-                        for item in m_json["data"]
-                        if isinstance(item, Mapping) and item.get("id")
-                    ]
+                rem = remaining_timeout()
+                if rem > 0:
+                    m_status, m_json, _, _ = self._http_get_json(
+                        state.config, "/v1/models", rem
+                    )
+                    if 200 <= m_status < 300 and m_json and isinstance(m_json.get("data"), list):
+                        discovered = [
+                            str(item["id"])
+                            for item in m_json["data"]
+                            if isinstance(item, Mapping) and item.get("id")
+                        ]
         else:
-            status, m_json, rtt_ms, err = self._http_get_json(
-                state.config, "/v1/models", timeout_s
-            )
+            rem = remaining_timeout()
+            if rem <= 0:
+                status, m_json, err = 0, None, "probe_deadline_exceeded"
+            else:
+                status, m_json, rtt_ms, err = self._http_get_json(
+                    state.config, "/v1/models", rem
+                )
             if 200 <= status < 300:
                 probe_ok = True
                 if m_json and isinstance(m_json.get("data"), list):
@@ -875,9 +958,20 @@ class RouterEngine:
         tpu_ready = True
         tpu_reason: Optional[str] = None
         if state.config.tpu_exporter_url:
-            tpu_tele = scrape_tpu_exporter(
-                state.config.tpu_exporter_url, timeout_s=timeout_s
-            )
+            rem = remaining_timeout()
+            if rem <= 0:
+                tpu_tele = TpuExporterTelemetry(
+                    reachable=False,
+                    exporter_up=False,
+                    devices_discovered=0,
+                    healthy_chips=0,
+                    total_chips=0,
+                    error="Probe elapsed deadline exceeded before exporter scrape",
+                )
+            else:
+                tpu_tele = scrape_tpu_exporter(
+                    state.config.tpu_exporter_url, timeout_s=rem
+                )
             tpu_ready, tpu_reason = evaluate_tpu_readiness(
                 tpu_tele,
                 max_hbm_utilization=state.config.max_hbm_utilization,
@@ -1009,12 +1103,15 @@ class RouterEngine:
                 )
                 return eligible
 
-            # round_robin
+            # round_robin (bounded per-model LRU state, independent of metric label normalization)
             eligible.sort(key=lambda b: (b.config.priority, b.config.id))
-            rr_key = self.metric_model_label(model, matched_backend=True)
+            rr_key = model
             cursor = self._rr_cursors.get(rr_key, 0)
             if not excluded:
                 self._rr_cursors[rr_key] = (cursor + 1) % len(eligible)
+                self._rr_cursors.move_to_end(rr_key)
+                while len(self._rr_cursors) > MAX_RR_CURSORS:
+                    self._rr_cursors.popitem(last=False)
             offset = cursor % len(eligible)
             return eligible[offset:] + eligible[:offset]
 
@@ -1126,6 +1223,49 @@ class RouterEngine:
             latency_ms=round(latency_ms, 3),
             estimated_cost_usd=round(est_cost, 10),
             ttft_ms=round(ttft_ms, 3) if ttft_ms is not None else None,
+            stream=stream,
+            failovers=failovers,
+            principal=principal,
+            status_code=status_code,
+        )
+        try:
+            self.usage_hook.record_usage(event)
+        except Exception:
+            pass
+
+    def _record_terminal_failure(
+        self,
+        *,
+        request_id: str,
+        model: str,
+        backend_id: str,
+        matched_backend: bool,
+        status_code: int,
+        latency_ms: float,
+        stream: bool,
+        failovers: int,
+        principal: str,
+    ) -> None:
+        metric_model = self.metric_model_label(model, matched_backend=matched_backend)
+        self.metrics.record_request(
+            model=metric_model,
+            backend_id=backend_id,
+            status=status_code,
+            prompt_tokens=0,
+            completion_tokens=0,
+            latency_ms=latency_ms,
+            ttft_ms=None,
+            estimated_cost_usd=0.0,
+        )
+        event = UsageEvent(
+            request_id=request_id,
+            model=model,
+            backend_id=backend_id,
+            prompt_tokens=0,
+            completion_tokens=0,
+            latency_ms=round(latency_ms, 3),
+            estimated_cost_usd=0.0,
+            ttft_ms=None,
             stream=stream,
             failovers=failovers,
             principal=principal,
@@ -1435,10 +1575,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         self.send_response(204)
         self._send_cors_headers(acao)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header(
-            "Access-Control-Allow-Headers",
-            "Authorization, Content-Type, X-FreeTPU-Policy",
-        )
+        self.send_header("Access-Control-Allow-Headers", _CORS_ALLOWED_HEADERS)
         self.send_header("Content-Length", "0")
         self.send_header("Connection", "close")
         self.end_headers()
@@ -1837,15 +1974,16 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 healthy_backends=0,
                 reason="no_healthy_backend",
             )
-            engine.metrics.record_request(
-                model=engine.metric_model_label(model, matched_backend=False),
+            engine._record_terminal_failure(
+                request_id=req_id,
+                model=model,
                 backend_id="none",
-                status=503,
-                prompt_tokens=0,
-                completion_tokens=0,
+                matched_backend=False,
+                status_code=503,
                 latency_ms=total_latency_ms,
-                ttft_ms=None,
-                estimated_cost_usd=0.0,
+                stream=stream,
+                failovers=failovers,
+                principal=auth_ctx.principal,
             )
             self._safe_send_bytes(
                 503,
@@ -1859,15 +1997,16 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
-        engine.metrics.record_request(
-            model=engine.metric_model_label(model, matched_backend=True),
+        engine._record_terminal_failure(
+            request_id=req_id,
+            model=model,
             backend_id=last_attempted_backend.config.id,
-            status=last_error_status,
-            prompt_tokens=0,
-            completion_tokens=0,
+            matched_backend=True,
+            status_code=last_error_status,
             latency_ms=total_latency_ms,
-            ttft_ms=None,
-            estimated_cost_usd=0.0,
+            stream=stream,
+            failovers=failovers,
+            principal=auth_ctx.principal,
         )
         self._safe_send_bytes(
             last_error_status,
@@ -2099,7 +2238,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, OSError):
             downstream_write_error = True
 
-        if not downstream_write_error:
+        if not downstream_write_error and not saw_done_sentinel:
             progress_deadline = time.monotonic() + timeout_s
             event_chunk_buf = bytearray()
             while True:
@@ -2121,6 +2260,8 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         downstream_write_error = True
                         break
                     event_chunk_buf.clear()
+                    if saw_done_sentinel:
+                        break
 
         # Per WHATWG SSE spec, discard any incomplete (unterminated) event data at EOF
         # rather than letting it satisfy completion checks.
@@ -2217,7 +2358,8 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         description=(
             "FreeTPU Router v0 — OpenAI-compatible router for heterogeneous "
             "Pixel Tensor G5, Mac/CPU/GPU, and Cloud TPU backends."
-        )
+        ),
+        allow_abbrev=False,
     )
     parser.add_argument(
         "--config",
@@ -2232,8 +2374,13 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         help="Override routing policy (cheapest, local_first, lowest_latency, round_robin).",
     )
     parser.add_argument(
-        "--bearer-token",
-        help="Optional bearer token required on API requests (configures BearerTokenAuthHook).",
+        "--bearer-token-env",
+        action="append",
+        dest="bearer_token_envs",
+        help=(
+            "Environment variable name holding a bearer token required on API "
+            "requests (repeatable; avoids exposing live tokens in process argv)."
+        ),
     )
     parser.add_argument(
         "--cors-origin",
@@ -2289,8 +2436,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             cfg.port = args.port
         if args.policy is not None:
             cfg.policy = args.policy
-        if args.bearer_token:
-            cfg.auth = {"type": "bearer", "tokens": [args.bearer_token]}
+        if args.bearer_token_envs:
+            cfg.auth = {"type": "bearer", "tokens_env": list(args.bearer_token_envs)}
         if args.cors_origins:
             cfg.cors_allowed_origins = list(args.cors_origins)
         if args.usage_jsonl:

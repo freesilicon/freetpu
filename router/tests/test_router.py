@@ -24,6 +24,8 @@ if str(REPO_ROOT) not in sys.path:
 from router.config import BackendConfig, RouterConfig, load_config  # noqa: E402
 from router.freetpu_router import (  # noqa: E402
     FreeTPURouterServer,
+    MAX_RR_CURSORS,
+    _build_cli_parser,
     _open_http_connection,
     build_hooks_from_config,
     create_router_server,
@@ -68,6 +70,8 @@ class _MockOpenAIBackend(ThreadingHTTPServer):
         stalled_error_release_event: Optional[threading.Event] = None,
         newline_free_trickle_interval_s: Optional[float] = None,
         post_token_keepalive_interval_s: Optional[float] = None,
+        hold_after_done_event: Optional[threading.Event] = None,
+        slow_drip_probe_interval_s: Optional[float] = None,
         prompt_tokens: int = 12,
         completion_tokens: int = 8,
     ) -> None:
@@ -85,6 +89,8 @@ class _MockOpenAIBackend(ThreadingHTTPServer):
         self.stalled_error_release_event = stalled_error_release_event
         self.newline_free_trickle_interval_s = newline_free_trickle_interval_s
         self.post_token_keepalive_interval_s = post_token_keepalive_interval_s
+        self.hold_after_done_event = hold_after_done_event
+        self.slow_drip_probe_interval_s = slow_drip_probe_interval_s
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
         self.requests_seen: List[Dict[str, Any]] = []
@@ -118,6 +124,22 @@ class _MockOpenAIHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/v1/models":
+            if self.server.slow_drip_probe_interval_s is not None:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                deadline = time.monotonic() + 3.0
+                try:
+                    self.wfile.write(b"{")
+                    self.wfile.flush()
+                    while time.monotonic() < deadline:
+                        self.wfile.write(b" ")
+                        self.wfile.flush()
+                        time.sleep(self.server.slow_drip_probe_interval_s)
+                except OSError:
+                    pass
+                return
             if self.server.status_code >= 500:
                 self._send_json(
                     self.server.status_code,
@@ -324,6 +346,8 @@ class _MockOpenAIHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
+            if self.server.hold_after_done_event is not None:
+                self.server.hold_after_done_event.wait(timeout=3.0)
             return
 
         if self.path == "/v1/completions":
@@ -1862,7 +1886,7 @@ class TestFreeTPURouter(unittest.TestCase):
             wc_metrics_txt,
         )
         self.assertNotIn("wildcard-arbitrary-", wc_metrics_txt)
-        self.assertLessEqual(len(wc_router.engine._rr_cursors), 1)
+        self.assertLessEqual(len(wc_router.engine._rr_cursors), MAX_RR_CURSORS)
 
     def test_scalar_bearer_tokens_and_exempt_paths_rejected(self) -> None:
         base_backend = BackendConfig(
@@ -3371,6 +3395,351 @@ class TestFreeTPURouter(unittest.TestCase):
             'freetpu_router_requests_total{model="m-unterm",backend_id="spot-no-blank-eof",status="200"}',
             metrics_txt,
         )
+
+    def test_probe_and_exporter_enforce_elapsed_deadline_on_slow_drip(self) -> None:
+        slow_backend = self._track(
+            _MockOpenAIBackend(
+                "slow-drip-probe",
+                ["m-probe"],
+                slow_drip_probe_interval_s=0.05,
+            )
+        )
+        healthy_backend = self._track(_MockOpenAIBackend("fast-probe", ["m-probe"]))
+
+        # Also test a slow-drip TPU exporter that trickles 1 byte every 0.05s.
+        class _SlowDripExporterHandler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return None
+
+            def do_GET(self) -> None:  # noqa: N802
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                deadline = time.monotonic() + 3.0
+                try:
+                    while time.monotonic() < deadline:
+                        self.wfile.write(b"#")
+                        self.wfile.flush()
+                        time.sleep(0.05)
+                except OSError:
+                    pass
+
+        slow_exp = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _SlowDripExporterHandler))
+        slow_exp_url = f"http://127.0.0.1:{slow_exp.server_address[1]}/metrics"
+
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            probe_timeout_s=0.25,
+            backends=[
+                BackendConfig(
+                    id="slow-drip-probe",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=slow_backend.base_url,
+                ),
+                BackendConfig(
+                    id="slow-exporter-worker",
+                    type="cloud-tpu-v5e",
+                    base_url=healthy_backend.base_url,
+                    tpu_exporter_url=slow_exp_url,
+                ),
+                BackendConfig(
+                    id="fast-probe",
+                    type="cloud-tpu-v6e",
+                    base_url=healthy_backend.base_url,
+                ),
+            ],
+        )
+
+        t0 = time.monotonic()
+        router = self._track(create_router_server(cfg, probe_on_start=True))
+        elapsed = time.monotonic() - t0
+        rport = router.server_address[1]
+
+        # Must finish initial probe promptly instead of hanging for 3s per slow worker.
+        self.assertLess(elapsed, 1.8)
+        status, _, body = _http_request(rport, "GET", "/health")
+        self.assertEqual(status, 200)
+        hjson = json.loads(body)
+        snaps = {b["id"]: b for b in hjson["backends"]}
+        self.assertFalse(snaps["slow-drip-probe"]["healthy"])
+        self.assertFalse(snaps["slow-exporter-worker"]["healthy"])
+        self.assertTrue(snaps["fast-probe"]["healthy"])
+
+    def test_cli_rejects_raw_bearer_token_and_accepts_bearer_token_env(self) -> None:
+        parser = _build_cli_parser()
+        stderr_buf = io.StringIO()
+        with redirect_stderr(stderr_buf):
+            with self.assertRaises(SystemExit) as ctx:
+                parser.parse_args(["--config", "c.json", "--bearer-token", "leaked-in-argv"])
+        self.assertNotEqual(ctx.exception.code, 0)
+
+        cfg_path = Path(self._tmpdir.name) / "cli_env_auth.json"
+        cfg_path.write_text(
+            json.dumps(
+                {
+                    "backends": [
+                        {
+                            "id": "b1",
+                            "base_url": "http://127.0.0.1:8081/v1",
+                            "models": ["m1"],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        import os
+
+        env_key = "FREETPU_TEST_CLI_BEARER_TOKEN"
+        os.environ[env_key] = "env-secret-value"
+        try:
+            rc = router_main(
+                ["--check-config", "--config", str(cfg_path), "--bearer-token-env", env_key]
+            )
+            self.assertEqual(rc, 0)
+            cfg = load_config(cfg_path)
+            cfg.auth = {"type": "bearer", "tokens_env": [env_key]}
+            auth_hook, _, _ = build_hooks_from_config(cfg)
+            self.assertTrue(
+                auth_hook.authenticate(
+                    {"Authorization": "Bearer env-secret-value"}, "/v1/models", "GET"
+                ).authorized
+            )
+            self.assertFalse(
+                auth_hook.authenticate({}, "/v1/models", "GET").authorized
+            )
+        finally:
+            os.environ.pop(env_key, None)
+
+    def test_cors_preflight_allows_openai_js_sdk_headers(self) -> None:
+        backend = self._track(_MockOpenAIBackend("cors-sdk", ["m-sdk"]))
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            cors_allowed_origins=["https://sdk-app.example"],
+            backends=[
+                BackendConfig(
+                    id="cors-sdk",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=backend.base_url,
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        status, hdrs, _ = _http_request(
+            rport,
+            "OPTIONS",
+            "/v1/chat/completions",
+            headers={
+                "Origin": "https://sdk-app.example",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "authorization,content-type,x-stainless-retry-count",
+            },
+        )
+        self.assertEqual(status, 204)
+        allowed_hdrs = {
+            h.strip().lower()
+            for h in hdrs.get("access-control-allow-headers", "").split(",")
+            if h.strip()
+        }
+        for required in (
+            "authorization",
+            "content-type",
+            "x-freetpu-policy",
+            "x-stainless-retry-count",
+            "x-stainless-os",
+            "x-stainless-lang",
+            "openai-organization",
+            "openai-project",
+        ):
+            self.assertIn(required, allowed_hdrs)
+
+    def test_stream_finalizes_immediately_after_done_when_upstream_stays_open(self) -> None:
+        hold_after_done = threading.Event()
+        backend = self._track(
+            _MockOpenAIBackend(
+                "open-after-done",
+                ["m-done-open"],
+                hold_after_done_event=hold_after_done,
+            )
+        )
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            backends=[
+                BackendConfig(
+                    id="open-after-done",
+                    type="cloud-tpu-v5e",
+                    base_url=backend.base_url,
+                    timeout_s=0.35,
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        t0 = time.monotonic()
+        try:
+            status, hdrs, body = _http_request(
+                rport,
+                "POST",
+                "/v1/chat/completions",
+                body={
+                    "model": "m-done-open",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "finish on done"}],
+                },
+            )
+        finally:
+            hold_after_done.set()
+        elapsed = time.monotonic() - t0
+
+        self.assertEqual(status, 200)
+        self.assertLess(elapsed, 0.8)
+        self.assertEqual(hdrs["x-freetpu-backend"], "open-after-done")
+        self.assertIn("data: [DONE]", body.decode("utf-8"))
+        self.assertEqual(router.engine._backends[0].cooldown_until_monotonic, 0.0)
+        _, _, metrics_raw = _http_request(rport, "GET", "/metrics")
+        self.assertIn(
+            'freetpu_router_requests_total{model="m-done-open",backend_id="open-after-done",status="200"} 1',
+            metrics_raw.decode("utf-8"),
+        )
+
+    def test_round_robin_tracks_per_model_cursor_across_wildcard_backends(self) -> None:
+        wc_a = self._track(_MockOpenAIBackend("wc-a", []))
+        wc_b = self._track(_MockOpenAIBackend("wc-b", []))
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="round_robin",
+            backends=[
+                BackendConfig(
+                    id="wc-a",
+                    type="cloud-tpu-v5e",
+                    base_url=wc_a.base_url,
+                    models=["*"],
+                    discover_models=False,
+                    priority=10,
+                ),
+                BackendConfig(
+                    id="wc-b",
+                    type="cloud-tpu-v5e",
+                    base_url=wc_b.base_url,
+                    models=["*"],
+                    discover_models=False,
+                    priority=20,
+                ),
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        seen_by_model: Dict[str, List[str]] = {"wc-model-1": [], "wc-model-2": []}
+        for model_name in ("wc-model-1", "wc-model-2", "wc-model-1", "wc-model-2"):
+            status, hdrs, _ = _http_request(
+                rport,
+                "POST",
+                "/v1/chat/completions",
+                body={"model": model_name, "messages": [{"role": "user", "content": "rr"}]},
+            )
+            self.assertEqual(status, 200)
+            seen_by_model[model_name].append(hdrs["x-freetpu-backend"])
+
+        # Each wildcard model must rotate independently across both backends.
+        self.assertEqual(seen_by_model["wc-model-1"], ["wc-a", "wc-b"])
+        self.assertEqual(seen_by_model["wc-model-2"], ["wc-a", "wc-b"])
+
+        # Verify bounded LRU eviction caps _rr_cursors at MAX_RR_CURSORS.
+        for idx in range(MAX_RR_CURSORS + 50):
+            router.engine.select_candidates(f"lru-model-{idx}", policy="round_robin")
+        self.assertEqual(len(router.engine._rr_cursors), MAX_RR_CURSORS)
+
+    def test_terminal_routing_failures_emit_zero_token_usage_events(self) -> None:
+        primary_503 = self._track(
+            _MockOpenAIBackend("primary-503", ["m-fail-usage"], status_code=200)
+        )
+        backup_502 = self._track(
+            _MockOpenAIBackend("backup-502", ["m-fail-usage"], status_code=200)
+        )
+        captured: List[UsageEvent] = []
+        usage_hook = JsonlUsageMeterHook(
+            Path(self._tmpdir.name) / "terminal_failures.jsonl",
+            callback=captured.append,
+        )
+        auth_hook = BearerTokenAuthHook({"tok-outage": "ops-caller"})
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            backends=[
+                BackendConfig(
+                    id="primary-503",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=primary_503.base_url,
+                ),
+                BackendConfig(
+                    id="backup-502",
+                    type="cloud-tpu-v5e",
+                    local=False,
+                    base_url=backup_502.base_url,
+                ),
+            ],
+        )
+        router = self._track(
+            create_router_server(cfg, auth_hook=auth_hook, usage_hook=usage_hook)
+        )
+        rport = router.server_address[1]
+
+        # 1. No eligible backend -> emits zero-token UsageEvent with backend_id="none", status=503.
+        status, hdrs1, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer tok-outage"},
+            body={"model": "missing-model", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        self.assertEqual(status, 503)
+
+        # 2. All backends fail (primary 503 -> failover -> backup 502) -> emits zero-token UsageEvent.
+        primary_503.status_code = 503
+        backup_502.status_code = 502
+        status, hdrs2, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer tok-outage"},
+            body={"model": "m-fail-usage", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        self.assertEqual(status, 502)
+
+        self.assertEqual(len(captured), 2)
+        ev1, ev2 = captured
+        self.assertEqual(ev1.request_id, hdrs1["x-freetpu-request-id"])
+        self.assertEqual(ev1.principal, "ops-caller")
+        self.assertEqual(ev1.backend_id, "none")
+        self.assertEqual(ev1.status_code, 503)
+        self.assertEqual(ev1.prompt_tokens, 0)
+        self.assertEqual(ev1.completion_tokens, 0)
+        self.assertEqual(ev1.estimated_cost_usd, 0.0)
+
+        self.assertEqual(ev2.request_id, hdrs2["x-freetpu-request-id"])
+        self.assertEqual(ev2.principal, "ops-caller")
+        self.assertEqual(ev2.backend_id, "backup-502")
+        self.assertEqual(ev2.status_code, 502)
+        self.assertEqual(ev2.failovers, 1)
+        self.assertEqual(ev2.prompt_tokens, 0)
+        self.assertEqual(ev2.completion_tokens, 0)
+        self.assertEqual(ev2.estimated_cost_usd, 0.0)
 
 
 def run_self_tests(verbosity: int = 1) -> int:

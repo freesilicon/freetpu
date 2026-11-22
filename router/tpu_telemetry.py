@@ -226,6 +226,41 @@ def evaluate_tpu_readiness(
     return True, None
 
 
+MAX_EXPORTER_RESPONSE_BYTES = 2 * 1024 * 1024
+
+
+def _read_bounded_http_body(
+    resp: http.client.HTTPResponse,
+    upstream_sock: Any,
+    *,
+    deadline: float,
+    max_bytes: int = MAX_EXPORTER_RESPONSE_BYTES,
+) -> bytes:
+    """Read an HTTP response body incrementally under an elapsed wall-clock deadline."""
+    chunks: List[bytes] = []
+    total = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Exporter scrape exceeded elapsed deadline")
+        if upstream_sock is not None:
+            try:
+                upstream_sock.settimeout(remaining)
+            except OSError:
+                pass
+        budget_left = (max_bytes - total) + 1
+        if budget_left <= 0:
+            raise ValueError(f"Exporter response exceeded {max_bytes} byte limit")
+        chunk = resp.read1(min(8192, budget_left))
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise ValueError(f"Exporter response exceeded {max_bytes} byte limit")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def scrape_tpu_exporter(
     url: str,
     *,
@@ -249,17 +284,32 @@ def scrape_tpu_exporter(
     if parsed.query:
         path = f"{path}?{parsed.query}"
 
+    deadline = time.monotonic() + max(0.01, timeout_s)
     conn: Optional[http.client.HTTPConnection] = None
+    resp: Optional[http.client.HTTPResponse] = None
     try:
+        rem = deadline - time.monotonic()
+        if rem <= 0:
+            raise TimeoutError("Exporter scrape exceeded elapsed deadline")
         if scheme == "https":
             conn = http.client.HTTPSConnection(
-                host, port, timeout=timeout_s, context=ssl.create_default_context()
+                host, port, timeout=rem, context=ssl.create_default_context()
             )
         else:
-            conn = http.client.HTTPConnection(host, port, timeout=timeout_s)
+            conn = http.client.HTTPConnection(host, port, timeout=rem)
         conn.request("GET", path, headers={"Accept": "text/plain"})
+        upstream_sock = conn.sock
+        rem = deadline - time.monotonic()
+        if rem <= 0:
+            raise TimeoutError("Exporter scrape exceeded elapsed deadline")
+        if upstream_sock is not None:
+            try:
+                upstream_sock.settimeout(rem)
+            except OSError:
+                pass
         resp = conn.getresponse()
-        body = resp.read().decode("utf-8", errors="replace")
+        if upstream_sock is None:
+            upstream_sock = getattr(getattr(resp.fp, "raw", None), "_sock", None)
         if resp.status < 200 or resp.status >= 300:
             return TpuExporterTelemetry(
                 reachable=False,
@@ -269,7 +319,10 @@ def scrape_tpu_exporter(
                 total_chips=0,
                 error=f"HTTP {resp.status} from tpu-exporter",
             )
-    except (OSError, TimeoutError, http.client.HTTPException) as exc:
+        body = _read_bounded_http_body(
+            resp, upstream_sock, deadline=deadline
+        ).decode("utf-8", errors="replace")
+    except (OSError, TimeoutError, ValueError, http.client.HTTPException) as exc:
         return TpuExporterTelemetry(
             reachable=False,
             exporter_up=False,
@@ -279,6 +332,11 @@ def scrape_tpu_exporter(
             error=str(exc),
         )
     finally:
+        if resp is not None:
+            try:
+                resp.close()
+            except OSError:
+                pass
         if conn is not None:
             try:
                 conn.close()
