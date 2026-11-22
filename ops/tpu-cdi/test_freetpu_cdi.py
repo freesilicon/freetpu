@@ -71,8 +71,15 @@ def _make_mock_pci_vfio(
     vfio_dir.mkdir(parents=True, exist_ok=True)
     if create_vfio_container:
         (vfio_dir / "vfio").write_text("", encoding="utf-8")
+        misc_dev = sysfs_root / "class" / "misc" / "vfio" / "dev"
+        misc_dev.parent.mkdir(parents=True, exist_ok=True)
+        misc_dev.write_text("10:196\n", encoding="utf-8")
     for grp in create_vfio_nodes or []:
         (vfio_dir / grp).write_text("", encoding="utf-8")
+        minor = int(grp) if grp.isdigit() else 250
+        grp_dev = sysfs_root / "class" / "vfio" / grp / "dev"
+        grp_dev.parent.mkdir(parents=True, exist_ok=True)
+        grp_dev.write_text(f"242:{minor}\n", encoding="utf-8")
 
     for dev in devices:
         d = pci_devices / dev["bdf"]
@@ -728,6 +735,9 @@ class FreeTpuCdiTests(unittest.TestCase):
 
                 # Driver rebind changes /dev/vfio/0 minor from 0 -> 3 while BDF & group stay identical.
                 current_minor["group0"] = 3
+                (sysfs_root / "class" / "vfio" / "0" / "dev").write_text(
+                    "242:3\n", encoding="utf-8"
+                )
                 errs_stale = freetpu_cdi.verify_spec_against_host(
                     spec1, sysfs_root=sysfs_root, dev_root=dev_root
                 )
@@ -1095,6 +1105,82 @@ class FreeTpuCdiTests(unittest.TestCase):
                 for good_kind in ["freetpu.dev/tpu", "Example_Org.io/TPU-v6e", "a/b", "v1.org/tpu0"]:
                     spec = freetpu_cdi.build_cdi_spec(chips, vfio_container, kind=good_kind)
                     self.assertEqual(freetpu_cdi.validate_cdi_spec(spec), [])
+
+    def test_rejects_vfio_devnum_mismatch_against_kernel_sysfs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sysfs_root, dev_root = _make_mock_pci_vfio(
+                root,
+                devices=[
+                    {
+                        "bdf": "0000:00:06.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0063",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                    }
+                ],
+                create_vfio_nodes=["0"],
+            )
+
+            with _mock_vfio_char_devices():
+                chips, vfio_container = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                valid_spec = freetpu_cdi.build_cdi_spec(chips, vfio_container)
+                self.assertEqual(
+                    freetpu_cdi.verify_spec_against_host(
+                        valid_spec, sysfs_root=sysfs_root, dev_root=dev_root
+                    ),
+                    [],
+                )
+
+                # 1. Stale/mismatched /dev/vfio/0 (242:0) vs kernel /sys/class/vfio/0/dev (242:99):
+                #    BOTH discovery AND host validation (even with matching annotation) MUST reject!
+                (sysfs_root / "class" / "vfio" / "0" / "dev").write_text(
+                    "242:99\n", encoding="utf-8"
+                )
+                with self.assertRaisesRegex(RuntimeError, "does not match kernel sysfs group 0"):
+                    freetpu_cdi.discover_tpu_chips(sysfs_root=sysfs_root, dev_root=dev_root)
+
+                errs_mismatch = freetpu_cdi.verify_spec_against_host(
+                    valid_spec, sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                self.assertTrue(
+                    any("does not match kernel sysfs group 0" in e for e in errs_mismatch),
+                    errs_mismatch,
+                )
+
+                # 2. Missing kernel /sys/class/vfio/0/dev (and virtual fallback) fails closed.
+                (sysfs_root / "class" / "vfio" / "0" / "dev").unlink()
+                with self.assertRaisesRegex(RuntimeError, "Unable to verify kernel device number"):
+                    freetpu_cdi.discover_tpu_chips(sysfs_root=sysfs_root, dev_root=dev_root)
+
+                # 3. Canonical /sys/devices/virtual/vfio/<group>/dev fallback works when
+                #    /sys/class/vfio is not mounted (narrow DaemonSet mounts).
+                virt_group_dev = sysfs_root / "devices" / "virtual" / "vfio" / "0" / "dev"
+                virt_group_dev.parent.mkdir(parents=True, exist_ok=True)
+                virt_group_dev.write_text("242:0\n", encoding="utf-8")
+                (sysfs_root / "class" / "misc" / "vfio" / "dev").unlink()
+                virt_misc_dev = sysfs_root / "devices" / "virtual" / "misc" / "vfio" / "dev"
+                virt_misc_dev.parent.mkdir(parents=True, exist_ok=True)
+                virt_misc_dev.write_text("10:196\n", encoding="utf-8")
+
+                chips_virt, _ = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                self.assertEqual(len(chips_virt), 1)
+                self.assertEqual(
+                    freetpu_cdi.verify_spec_against_host(
+                        valid_spec, sysfs_root=sysfs_root, dev_root=dev_root
+                    ),
+                    [],
+                )
+
+                # 4. Mismatched /dev/vfio/vfio control device number fails closed.
+                virt_misc_dev.write_text("10:250\n", encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "misc/vfio/dev"):
+                    freetpu_cdi.discover_tpu_chips(sysfs_root=sysfs_root, dev_root=dev_root)
 
 
 if __name__ == "__main__":

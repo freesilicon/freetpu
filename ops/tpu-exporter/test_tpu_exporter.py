@@ -63,7 +63,9 @@ def _make_mock_pci_tree(
             (d / "chip_id").write_text(dev["chip_id"] + "\n", encoding="utf-8")
         if dev.get("iommu_group"):
             grp = iommu_groups / dev["iommu_group"]
-            grp.mkdir(parents=True, exist_ok=True)
+            grp_devs = grp / "devices"
+            grp_devs.mkdir(parents=True, exist_ok=True)
+            (grp_devs / bdf).write_text("", encoding="utf-8")
             os.symlink(str(grp), d / "iommu_group")
         if dev.get("driver"):
             drv_dir = sysfs_root / "bus" / "pci" / "drivers" / dev["driver"]
@@ -1224,6 +1226,88 @@ TPU Device Status
                 server._scrape_lock.release()
             finally:
                 server.server_close()
+
+    def test_vfio_group_exclusive_requires_verified_full_iommu_group_membership(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sysfs_root, dev_root, proc_root = _make_mock_pci_tree(
+                root,
+                devices=[
+                    # Chip 0 (group 0): sole member of /sys/kernel/iommu_groups/0/devices -> exclusive=True
+                    {
+                        "bdf": "0000:00:05.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0063",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                    },
+                    # Chip 1 (group 1): shares IOMMU group 1 with a non-TPU PCI device -> exclusive=False
+                    {
+                        "bdf": "0000:00:06.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0063",
+                        "driver": "vfio-pci",
+                        "iommu_group": "1",
+                    },
+                    {
+                        "bdf": "0000:00:06.1",
+                        "vendor": "0x1af4",
+                        "device": "0x1041",
+                        "driver": "vfio-pci",
+                        "iommu_group": "1",
+                    },
+                    # Chip 2 (group 2): missing /sys/kernel/iommu_groups/2/devices -> fail closed exclusive=False
+                    {
+                        "bdf": "0000:00:07.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0063",
+                        "driver": "vfio-pci",
+                        "iommu_group": "2",
+                    },
+                    # Chips 3 & 4 (group 3): two TPUs sharing IOMMU group 3 -> both exclusive=False
+                    {
+                        "bdf": "0000:00:08.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "3",
+                    },
+                    {
+                        "bdf": "0000:00:09.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "3",
+                    },
+                ],
+                create_vfio_nodes=["0", "1", "2", "3"],
+            )
+            # Remove /sys/kernel/iommu_groups/2/devices to simulate unreadable/missing group dir.
+            grp2_devs = sysfs_root / "kernel" / "iommu_groups" / "2" / "devices"
+            for child in list(grp2_devs.iterdir()):
+                child.unlink()
+            grp2_devs.rmdir()
+
+            snap = tpu_exporter.collect_snapshot(
+                sysfs_root=sysfs_root,
+                dev_root=dev_root,
+                proc_root=proc_root,
+                tpu_info_bin=None,
+            )
+            by_bdf = {d.pci_bdf: d for d in snap.devices}
+            self.assertTrue(by_bdf["0000:00:05.0"].vfio_group_exclusive)
+            self.assertFalse(by_bdf["0000:00:06.0"].vfio_group_exclusive)
+            self.assertFalse(by_bdf["0000:00:07.0"].vfio_group_exclusive)
+            self.assertFalse(by_bdf["0000:00:08.0"].vfio_group_exclusive)
+            self.assertFalse(by_bdf["0000:00:09.0"].vfio_group_exclusive)
+
+            prom = tpu_exporter.format_prometheus_metrics(snap)
+            self._assert_valid_prometheus_text(prom)
+            self.assertIn('pci_bdf="0000:00:05.0"', prom)
+            self.assertIn('iommu_group="0",vfio_group_exclusive="true"', prom)
+            self.assertIn('iommu_group="1",vfio_group_exclusive="false"', prom)
+            self.assertIn('iommu_group="2",vfio_group_exclusive="false"', prom)
+            self.assertIn('iommu_group="3",vfio_group_exclusive="false"', prom)
 
     def _assert_valid_prometheus_text(self, text: str) -> None:
         lines = [ln for ln in text.splitlines() if ln.strip()]

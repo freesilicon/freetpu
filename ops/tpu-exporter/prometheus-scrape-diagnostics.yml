@@ -79,18 +79,19 @@ scrape_configs:
         action: keep
         regex: "freetpu_tpu_(runtime_)?(duty_cycle_percent|hbm_used_bytes|hbm_total_bytes|hbm_utilization_ratio)"
       # 2. Enforce strictly bounded low-cardinality value domains on all kept
-      #    tenant-supplied labels (`generation` enum + `chip`/`runtime_chip` 0..7)
-      #    and strip `pci_bdf` below so a workload target cannot rotate arbitrary
-      #    BDF strings across scrapes to cause unbounded series churn.
+      #    tenant-supplied labels (`generation` enum + `chip`/`runtime_chip`
+      #    0..63, covering single-host v4/v5e/v5p/v6e logical IDs including
+      #    non-contiguous IDs such as 8 and 12) and strip `pci_bdf` below so a
+      #    workload target cannot rotate arbitrary BDF strings across scrapes.
       - source_labels: [generation]
         action: keep
         regex: "(|v2|v3|v2-v3|v4lite|v4|v5e|v5p|v6e|v6e-pf)"
       - source_labels: [chip]
         action: keep
-        regex: "(|[0-7])"
+        regex: "(|[0-9]|[1-5][0-9]|6[0-3])"
       - source_labels: [runtime_chip]
         action: keep
-        regex: "(|[0-7])"
+        regex: "(|[0-9]|[1-5][0-9]|6[0-3])"
       # 3. Strip `pci_bdf` and any unexpected tenant-supplied labels before ingestion.
       - action: labelkeep
         regex: "(__name__|job|instance|node|namespace|pod|collector_role|generation|chip|runtime_chip)"

@@ -169,6 +169,33 @@ def _collect_iommu_group_members(
     return members
 
 
+_DEVNUM_RE = re.compile(r"^[0-9]+:[0-9]+$")
+
+
+def _read_kernel_vfio_devnum(sysfs_root: Path, *, group: Optional[str] = None) -> Optional[str]:
+    """Read kernel-exported `<major>:<minor>` from sysfs for `/dev/vfio/<group>` or `/dev/vfio/vfio`.
+
+    Checks `/sys/class/...` first and falls back to the identical canonical
+    `/sys/devices/virtual/...` path (used inside minimal container mounts that
+    mount `/sys/devices` read-only without mounting `/sys/class`).
+    """
+    if group is None:
+        candidates = (
+            sysfs_root / "class" / "misc" / "vfio" / "dev",
+            sysfs_root / "devices" / "virtual" / "misc" / "vfio" / "dev",
+        )
+    else:
+        candidates = (
+            sysfs_root / "class" / "vfio" / group / "dev",
+            sysfs_root / "devices" / "virtual" / "vfio" / group / "dev",
+        )
+    for path in candidates:
+        raw = _read_text(path)
+        if raw and _DEVNUM_RE.fullmatch(raw):
+            return raw
+    return None
+
+
 def discover_tpu_chips(
     sysfs_root: Path = Path("/sys"),
     dev_root: Path = Path("/dev"),
@@ -188,9 +215,21 @@ def discover_tpu_chips(
                 "(freetpu-cdi requires VFIO-backed Cloud TPUs using vfio-pci; "
                 "/dev/accel* hosts such as Cloud TPU v4 are not supported)"
             )
-        if _stat_char_devnum(vfio_container) is None:
+        actual_container_dn = _stat_char_devnum(vfio_container)
+        if actual_container_dn is None:
             raise RuntimeError(
                 f"VFIO control node is not a character device: {vfio_container}"
+            )
+        kernel_container_dn = _read_kernel_vfio_devnum(sysfs_root, group=None)
+        if kernel_container_dn is None:
+            raise RuntimeError(
+                f"Unable to verify kernel device number for VFIO control node {vfio_container} "
+                f"(missing {sysfs_root}/class/misc/vfio/dev and {sysfs_root}/devices/virtual/misc/vfio/dev)"
+            )
+        if actual_container_dn != kernel_container_dn:
+            raise RuntimeError(
+                f"VFIO control node {vfio_container} device number {actual_container_dn!r} "
+                f"does not match kernel sysfs misc/vfio/dev {kernel_container_dn!r}"
             )
 
     pci_entries = sorted(pci_dir.iterdir(), key=lambda p: p.name)
@@ -242,9 +281,23 @@ def discover_tpu_chips(
                 raise FileNotFoundError(
                     f"VFIO group node not found for {entry.name}: {vfio_host_path}"
                 )
-            if _stat_char_devnum(vfio_host_path) is None:
+            actual_group_dn = _stat_char_devnum(vfio_host_path)
+            if actual_group_dn is None:
                 raise RuntimeError(
                     f"VFIO group node for {entry.name} is not a character device: {vfio_host_path}"
+                )
+            kernel_group_dn = _read_kernel_vfio_devnum(sysfs_root, group=iommu_group)
+            if kernel_group_dn is None:
+                raise RuntimeError(
+                    f"Unable to verify kernel device number for VFIO group {iommu_group} ({entry.name}): "
+                    f"missing {sysfs_root}/class/vfio/{iommu_group}/dev and "
+                    f"{sysfs_root}/devices/virtual/vfio/{iommu_group}/dev"
+                )
+            if actual_group_dn != kernel_group_dn:
+                raise RuntimeError(
+                    f"VFIO group node {vfio_host_path} for {entry.name} has device number "
+                    f"{actual_group_dn!r}, which does not match kernel sysfs group {iommu_group} "
+                    f"device number {kernel_group_dn!r}"
                 )
 
         chips.append(

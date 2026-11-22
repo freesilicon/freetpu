@@ -105,6 +105,7 @@ class TpuTelemetry:
     pid_telemetry_available: bool = True
     runtime_chip_id: Optional[str] = None
     telemetry_source: str = "sysfs-fallback"
+    vfio_group_exclusive: bool = False
 
 
 @dataclass
@@ -687,6 +688,44 @@ def _resolve_tpu_device_spec(device_id: str, subsystem_device: str) -> Tuple[str
     return TPU_PCI_DEVICES[device_id]
 
 
+def _collect_iommu_group_membership(
+    sysfs_root: Path,
+    pci_entries: Sequence[Path],
+) -> Tuple[Dict[str, set[str]], Dict[str, bool]]:
+    """Collect full PCI member sets per IOMMU group across sysfs.
+
+    Returns `(members_by_group, group_devices_dir_readable)`. A group is only
+    considered verifiable for exclusivity when its authoritative
+    `/sys/kernel/iommu_groups/<group>/devices` directory was present and readable.
+    """
+    members: Dict[str, set[str]] = {}
+    readable: Dict[str, bool] = {}
+
+    for entry in pci_entries:
+        grp = _read_symlink_name(entry / "iommu_group") or ""
+        if grp:
+            members.setdefault(grp, set()).add(entry.name)
+
+    iommu_root = sysfs_root / "kernel" / "iommu_groups"
+    if iommu_root.is_dir():
+        try:
+            grp_dirs = list(iommu_root.iterdir())
+        except OSError:
+            grp_dirs = []
+        for grp_dir in grp_dirs:
+            dev_dir = grp_dir / "devices"
+            if not dev_dir.is_dir():
+                continue
+            try:
+                grp_members = {m.name for m in dev_dir.iterdir()}
+            except OSError:
+                continue
+            readable[grp_dir.name] = True
+            members.setdefault(grp_dir.name, set()).update(grp_members)
+
+    return members, readable
+
+
 def discover_tpu_devices(
     sysfs_root: Path = Path("/sys"),
     dev_root: Path = Path("/dev"),
@@ -696,11 +735,16 @@ def discover_tpu_devices(
     if not pci_dir.is_dir():
         return []
 
+    pci_entries = sorted(pci_dir.iterdir(), key=lambda p: p.name)
+    group_members, group_dir_readable = _collect_iommu_group_membership(
+        sysfs_root, pci_entries
+    )
+
     vfio_container_present = (dev_root / "vfio" / "vfio").exists()
     discovered: List[TpuTelemetry] = []
     legacy_by_base_addr: Dict[str, TpuTelemetry] = {}
 
-    for entry in sorted(pci_dir.iterdir(), key=lambda p: p.name):
+    for entry in pci_entries:
         vendor_raw = _read_text(entry / "vendor")
         if not vendor_raw:
             continue
@@ -762,6 +806,17 @@ def discover_tpu_devices(
                     existing.hbm_total_bytes = nominal_hbm if nominal_hbm > 0 else None
                 continue
 
+        # A VFIO group is exclusive to this TPU ONLY when we verified the full
+        # kernel `/sys/kernel/iommu_groups/<group>/devices` membership and it
+        # contains strictly this single PCI BDF (no sibling TPUs or non-TPU devices).
+        full_members = group_members.get(iommu_group, set()) | ({entry.name} if iommu_group else set())
+        vfio_group_exclusive = (
+            driver == "vfio-pci"
+            and bool(iommu_group)
+            and group_dir_readable.get(iommu_group, False)
+            and full_members == {entry.name}
+        )
+
         chip = TpuTelemetry(
             chip_index=len(discovered),
             pci_bdf=entry.name,
@@ -783,6 +838,7 @@ def discover_tpu_devices(
             hbm_nominal_bytes=nominal_hbm,
             duty_cycle_percent=None,
             runtime_chip_id=runtime_chip_id,
+            vfio_group_exclusive=vfio_group_exclusive,
         )
         discovered.append(chip)
         if device_id in LEGACY_DUAL_FUNCTION_DEVICE_IDS:
@@ -1152,6 +1208,7 @@ def format_prometheus_metrics(snapshot: ExporterSnapshot) -> str:
             "model": d.model_name,
             "driver": d.driver,
             "iommu_group": d.iommu_group or "none",
+            "vfio_group_exclusive": "true" if d.vfio_group_exclusive else "false",
             "telemetry_source": d.telemetry_source,
         }
         info_samples.append((info_labels, "1"))

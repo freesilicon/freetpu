@@ -6,7 +6,7 @@ These queries mirror standard NVIDIA `dcgm-exporter` dashboards for VFIO-backed 
 
 > **Trust & Prometheus isolation note:** FreeTPU separates scraping across two Prometheus configurations:
 > 1. **`prometheus-scrape.yml` (Trusted Billing & Node Prometheus):** Scrapes ONLY operator-controlled `collector_role="node"` targets (standalone VMs and the `kube-system` `freetpu-node-agent` DaemonSet). All fleet inventory, health, reservation, and billing/chargeback queries run on this instance and deduplicate by `(generation, node, pci_bdf)` so tenant pods cannot affect billing metrics or storage.
-> 2. **`prometheus-scrape-diagnostics.yml` (Isolated Diagnostic Prometheus):** Scrapes `freetpu-workload-sidecar` pods in `ml-workloads`, strips `pci_bdf`, and constrains `chip`/`runtime_chip` to `0-7` so tenant workloads cannot create unbounded series churn. Sidecar utilization queries below run on this separate diagnostic instance (grouping by `(generation, node, chip)` or `runtime_chip`).
+> 2. **`prometheus-scrape-diagnostics.yml` (Isolated Diagnostic Prometheus):** Scrapes `freetpu-workload-sidecar` pods in `ml-workloads`, strips `pci_bdf`, and constrains `chip`/`runtime_chip` to `0-63` (covering v4/v5e/v5p/v6e runtime device IDs while bounding cardinality) so tenant workloads cannot create unbounded series churn. Sidecar utilization queries below run on this separate diagnostic instance (grouping by `(generation, node, chip)` or `runtime_chip`).
 
 ```promql
 # Total discovered physical TPU chips per generation across scraped nodes
@@ -66,34 +66,84 @@ max by (generation, node, chip) (freetpu_tpu_hbm_used_bytes) / (1024 * 1024 * 10
 > **Trust boundary:** Every financial, reservation-hour, and estimated-spend query in this section reads **exclusively** from operator-controlled `collector_role="node"` series (`freetpu_tpu_info` and `freetpu_tpu_active_pids` from the trusted `freetpu-node-exporter` DaemonSet or standalone host VM scrape). Tenant-supplied workload sidecar metrics (`collector_role="workload-sidecar"`) are **excluded** because a pod on a TPU node controls its HTTP scrape payload and can report arbitrary `generation`, `pci_bdf`, or utilization values for chips on that node. These queries do not require `--chip-id-map`.
 
 ```promql
-# Operator-observed active chip-hours over 24h per physical chip (generation, node, pci_bdf):
-# Uses ONLY operator-controlled host VFIO PID handles (`collector_role="node"`)
-# for chips with an exclusive (non-shared) `/dev/vfio/<group>` node so a workload
-# opening a shared VFIO group never accrues per-chip hours for idle sibling chips
-# and tenant sidecar responses can never alter chargeback hours.
-sum_over_time(
-  clamp_max(
+# 24h PID telemetry coverage ratio per physical chip (0.0 - 1.0).
+# Values < 0.99 indicate scrape failures or unreadable `/proc/*/fd` scans;
+# chips below 99% coverage are suppressed from the 24h chargeback queries below.
+(
+  count_over_time(
     max by (generation, node, pci_bdf) (
       freetpu_tpu_active_pids{collector_role="node"}
-      and on (node, vfio_device)
-      (count by (node, vfio_device) (group by (node, vfio_device, pci_bdf) (freetpu_tpu_info{collector_role="node"})) == 1)
-    ) > 0,
-    1
+    )[24h:1m]
+  )
+  or
+  (0 * group by (generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node"}))
+) / 1440
+
+# Audit / alert: chips with incomplete 24h PID telemetry (< 99% of 1440 minutes).
+# Investigate these chips before finalizing billing so missing telemetry never
+# silently under-bills an active TPU.
+(
+  (
+    count_over_time(
+      max by (generation, node, pci_bdf) (
+        freetpu_tpu_active_pids{collector_role="node"}
+      )[24h:1m]
+    )
+    or
+    (0 * group by (generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node"}))
+  ) / 1440
+) < 0.99
+
+# Operator-observed active chip-hours over 24h per physical chip (generation, node, pci_bdf):
+# Uses ONLY operator-controlled host VFIO PID handles (`collector_role="node"`)
+# for chips whose full `/sys/kernel/iommu_groups/<group>/devices` membership is
+# verified exclusive to that single TPU (`vfio_group_exclusive="true"`), AND
+# requires >= 99% 24h PID telemetry coverage (suppressing incomplete windows so
+# missing scans/scrapes never silently under-bill an active chip).
+sum_over_time(
+  (
+    max by (generation, node, pci_bdf) (
+      freetpu_tpu_active_pids{collector_role="node"}
+      and on (generation, node, pci_bdf)
+      group by (generation, node, pci_bdf) (
+        freetpu_tpu_info{collector_role="node", vfio_group_exclusive="true"}
+      )
+    ) > bool 0
   )[24h:1m]
 ) / 60
+and on (generation, node, pci_bdf)
+(
+  count_over_time(
+    max by (generation, node, pci_bdf) (
+      freetpu_tpu_active_pids{collector_role="node"}
+    )[24h:1m]
+  ) / 1440 >= 0.99
+)
 
-# Shared-VFIO-group reservation hours over 24h (operator-controlled `collector_role="node"` only;
-# tracked at group granularity `(generation, node, vfio_device)` rather than per-BDF activity)
+# Shared or non-exclusive VFIO-group reservation hours over 24h
+# (`collector_role="node"` only; routes groups with `vfio_group_exclusive="false"`
+# — including groups shared with sibling TPUs, non-TPU PCI devices, or unverified
+# IOMMU group membership — to group-level reservation hours rather than per-chip
+# chargeback). Suppressed when 24h PID telemetry coverage is < 99%.
 sum_over_time(
-  clamp_max(
+  (
     max by (generation, node, vfio_device) (
       freetpu_tpu_active_pids{collector_role="node"}
-      and on (node, vfio_device)
-      (count by (node, vfio_device) (group by (node, vfio_device, pci_bdf) (freetpu_tpu_info{collector_role="node"})) > 1)
-    ) > 0,
-    1
+      and on (generation, node, pci_bdf)
+      group by (generation, node, pci_bdf) (
+        freetpu_tpu_info{collector_role="node", vfio_group_exclusive="false"}
+      )
+    ) > bool 0
   )[24h:1m]
 ) / 60
+and on (generation, node, vfio_device)
+(
+  count_over_time(
+    max by (generation, node, vfio_device) (
+      freetpu_tpu_active_pids{collector_role="node"}
+    )[24h:1m]
+  ) / 1440 >= 0.99
+)
 
 # Inventory-based estimated hourly TPU spend by generation across scraped nodes.
 # Counts each trusted physical PCI chip ONCE via `collector_role="node"` and
@@ -115,8 +165,9 @@ sum_over_time(
 
 # Operator-controlled effective hourly cost per reserved/active exclusive chip by generation.
 # Uses ONLY trusted `collector_role="node"` inventory and host VFIO PID reservation
-# evidence (`freetpu_tpu_active_pids{collector_role="node"} > 0`) on exclusive
-# `/dev/vfio/<group>` chips. Omits generations with zero active exclusive chips.
+# evidence (`freetpu_tpu_active_pids{collector_role="node"} > 0`) on verified
+# exclusive `/dev/vfio/<group>` chips (`vfio_group_exclusive="true"`). Omits
+# generations with zero active exclusive chips.
 (
   count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node", generation="v5e"})) * 1.20
   or
@@ -127,8 +178,10 @@ sum_over_time(
   count by (generation) (
     max by (generation, node, pci_bdf) (
       freetpu_tpu_active_pids{collector_role="node"}
-      and on (node, vfio_device)
-      (count by (node, vfio_device) (group by (node, vfio_device, pci_bdf) (freetpu_tpu_info{collector_role="node"})) == 1)
+      and on (generation, node, pci_bdf)
+      group by (generation, node, pci_bdf) (
+        freetpu_tpu_info{collector_role="node", vfio_group_exclusive="true"}
+      )
     ) > 0
   ) > 0
 )
@@ -137,7 +190,7 @@ sum_over_time(
 ## Workload Utilization Diagnostics & Idle Waste Detection (Diagnostic-Only / Non-Billing)
 
 > **Non-authoritative & deployment note:**
-> - **Diagnostic Kubernetes sidecars (`prometheus-scrape-diagnostics.yml`):** Run on a **separate diagnostic Prometheus instance** where `pci_bdf` is stripped and only low-cardinality `runtime_chip`/`chip` (`0-7`) labels are kept. Use the sidecar-native idle check below on that diagnostic instance.
+> - **Diagnostic Kubernetes sidecars (`prometheus-scrape-diagnostics.yml`):** Run on a **separate diagnostic Prometheus instance** where `pci_bdf` is stripped and only low-cardinality `runtime_chip`/`chip` (`0-63`) labels are kept. Use the sidecar-native idle check below on that diagnostic instance.
 > - **Operator-controlled single-tenant hosts (`collector_role="node"`):** The `pci_bdf`-joined idle, coverage, and efficiency queries below assume both `freetpu_tpu_info` and `freetpu_tpu_duty_cycle_percent` are scraped from trusted operator-controlled `collector_role="node"` targets (single-tenant Cloud TPU VMs running `tpu-info` locally with verified `--chip-id-map` or sysfs `chip_id`). Never mix untrusted tenant sidecar scrapes into the billing Prometheus instance.
 
 ```promql

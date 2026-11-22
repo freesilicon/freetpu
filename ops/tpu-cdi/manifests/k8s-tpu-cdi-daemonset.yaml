@@ -172,6 +172,9 @@ spec:
             - name: sysfs-devices
               mountPath: /sys/devices
               readOnly: true
+            - name: sysfs-iommu-groups
+              mountPath: /sys/kernel/iommu_groups
+              readOnly: true
             - name: dev-vfio
               mountPath: /dev/vfio
               readOnly: true
@@ -205,3 +208,34 @@ spec:
         - name: freetpu-ops
           configMap:
             name: freetpu-ops-scripts
+---
+# Restrict ingress to the node exporter's :9400/metrics port strictly to the
+# trusted billing Prometheus scraper so tenant workloads cannot read host TPU
+# process IDs/activity or compete for the exporter's bounded scrape worker pool.
+# Requires a CNI enforcing Kubernetes NetworkPolicy (e.g. GKE Dataplane V2,
+# Cilium, or Calico); on clusters without NetworkPolicy enforcement, front :9400
+# with an authenticating proxy such as kube-rbac-proxy (mTLS/RBAC). Adjust the
+# namespaceSelector and podSelector below to match your billing Prometheus pod.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: freetpu-node-agent-metrics
+  namespace: kube-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: freetpu-tpu-exporter
+      freetpu.dev/collector-role: node
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - protocol: TCP
+          port: 9400
