@@ -241,13 +241,38 @@ bool parse_stablehlo_matmul(const char* code, size_t len, uint32_t* m_out,
   if (!code || len == 0 || !m_out || !k_out || !n_out) return false;
   std::string cleaned = strip_line_comments(std::string(code, len));
 
-  // Locate the single func.func definition and ensure there isn't a second function.
+  // Locate the single top-level `func.func [public] @main` definition and ensure no second function.
   size_t fpos = cleaned.find("func.func");
   if (fpos == std::string::npos) return false;
   if (cleaned.find("func.func", fpos + 9) != std::string::npos) return false;
+  if (fpos > 0 && !std::isspace(static_cast<unsigned char>(cleaned[fpos - 1])) &&
+      cleaned[fpos - 1] != '{') {
+    return false;
+  }
+  if (fpos + 9 >= cleaned.size() || !std::isspace(static_cast<unsigned char>(cleaned[fpos + 9]))) {
+    return false;
+  }
+  // Verify func.func sits at module top level (brace depth 0 for bare func or 1 inside `module {`).
+  int pre_depth = 0;
+  for (size_t i = 0; i < fpos; ++i) {
+    if (cleaned[i] == '{') ++pre_depth;
+    else if (cleaned[i] == '}') {
+      if (pre_depth == 0) return false;
+      --pre_depth;
+    }
+  }
+  if (pre_depth > 1) return false;
 
-  size_t lparen = cleaned.find('(', fpos);
+  size_t lparen = cleaned.find('(', fpos + 9);
   if (lparen == std::string::npos) return false;
+  std::string fn_hdr = trim_ws(cleaned.substr(fpos + 9, lparen - (fpos + 9)));
+  if (fn_hdr != "@main") {
+    if (fn_hdr.compare(0, 6, "public") != 0 || fn_hdr.size() <= 6 ||
+        !std::isspace(static_cast<unsigned char>(fn_hdr[6])) ||
+        trim_ws(fn_hdr.substr(6)) != "@main") {
+      return false;
+    }
+  }
   size_t rparen = cleaned.find(')', lparen + 1);
   if (rparen == std::string::npos) return false;
 
@@ -622,8 +647,14 @@ PJRT_Error* ot_pjrt_client_create(PJRT_Client_Create_Args* args) {
   ot_context_t* ctx = nullptr;
   ot_status_t st = ot_context_create(&cfg, &ctx);
   if (st != OT_OK) {
-    return make_err(PJRT_Error_Code_INTERNAL,
-                    std::string("ot_context_create failed: ") + ot_status_string(st));
+    const char* detail = ot_context_last_error(nullptr);
+    std::string msg = std::string("ot_context_create failed: ") + ot_status_string(st);
+    if (detail && detail[0] != '\0') {
+      msg += " (";
+      msg += detail;
+      msg += ")";
+    }
+    return make_err(PJRT_Error_Code_INTERNAL, msg);
   }
 
   auto* c = new (std::nothrow) PJRT_Client();

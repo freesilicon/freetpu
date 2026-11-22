@@ -13,11 +13,11 @@
 
 namespace {
 
-void check_maps() {
+bool check_maps() {
   std::ifstream ifs("/proc/self/maps");
   if (!ifs.is_open()) {
-    printf("MAPS_LIBTPU=0 MAPS_LIBPYTHON=0 (non-proc host)\n");
-    return;
+    printf("MAPS_CHECK=SKIPPED (/proc/self/maps unavailable on this host)\n");
+    return true;
   }
   std::string line;
   int libtpu_cnt = 0;
@@ -27,12 +27,20 @@ void check_maps() {
     if (line.find("libpython") != std::string::npos) libpython_cnt++;
   }
   printf("MAPS_LIBTPU=%d MAPS_LIBPYTHON=%d\n", libtpu_cnt, libpython_cnt);
+  if (libtpu_cnt > 0 || libpython_cnt > 0) {
+    fprintf(stderr, "ERROR: forbidden dependency mapped (MAPS_LIBTPU=%d MAPS_LIBPYTHON=%d)\n",
+            libtpu_cnt, libpython_cnt);
+    return false;
+  }
+  return true;
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-  check_maps();
+  if (!check_maps()) {
+    return 3;
+  }
 
   ot_config_t cfg = ot_config_default();
   if (argc > 1 && std::strcmp(argv[1], "--mock") == 0) {
@@ -42,7 +50,11 @@ int main(int argc, char** argv) {
   ot_context_t* ctx = nullptr;
   ot_status_t st = ot_context_create(&cfg, &ctx);
   if (st != OT_OK) {
-    fprintf(stderr, "ot_context_create failed: %s\n", ot_status_string(st));
+    const char* detail = ot_context_last_error(nullptr);
+    fprintf(stderr, "ot_context_create failed: %s%s%s\n",
+            ot_status_string(st),
+            (detail && detail[0]) ? " — " : "",
+            (detail && detail[0]) ? detail : "");
     return 1;
   }
 

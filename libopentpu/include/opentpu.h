@@ -80,6 +80,7 @@ ot_status_t ot_context_create(const ot_config_t* config, ot_context_t** out_ctx)
 void        ot_context_destroy(ot_context_t* ctx);
 
 const char* ot_status_string(ot_status_t status);
+/* Pass NULL to retrieve the last ot_context_create() error on the calling thread. */
 const char* ot_context_last_error(const ot_context_t* ctx);
 int         ot_context_is_mock(const ot_context_t* ctx);
 

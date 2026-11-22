@@ -28,6 +28,8 @@ inline uint16_t f32_to_bf16(float f) {
   return static_cast<uint16_t>(u >> 16);
 }
 
+thread_local std::string g_last_create_error;
+
 }  // namespace
 
 extern "C" {
@@ -59,23 +61,32 @@ const char* ot_status_string(ot_status_t status) {
 }
 
 ot_status_t ot_context_create(const ot_config_t* config, ot_context_t** out_ctx) {
-  if (!out_ctx) return OT_ERR_INVALID_ARG;
+  g_last_create_error.clear();
+  if (!out_ctx) {
+    g_last_create_error = "out_ctx must be non-null";
+    return OT_ERR_INVALID_ARG;
+  }
   *out_ctx = nullptr;
 
   ot_config_t cfg = ot_config_default();
   if (config) {
     if (config->struct_size != 0 && config->struct_size != sizeof(ot_config_t)) {
+      g_last_create_error = "invalid ot_config_t struct_size";
       return OT_ERR_INVALID_ARG;
     }
     cfg = *config;
   }
 
   auto* ctx = new (std::nothrow) ot_context();
-  if (!ctx) return OT_ERR_NO_MEMORY;
+  if (!ctx) {
+    g_last_create_error = "failed to allocate ot_context";
+    return OT_ERR_NO_MEMORY;
+  }
   ctx->cfg = cfg;
 
   std::string err;
   if (!ctx->transport.open_device(cfg, &ctx->info, &err)) {
+    g_last_create_error = err.empty() ? "VFIO device open failed" : err;
     delete ctx;
     return OT_ERR_DEVICE;
   }
@@ -110,7 +121,7 @@ void ot_context_destroy(ot_context_t* ctx) {
 }
 
 const char* ot_context_last_error(const ot_context_t* ctx) {
-  if (!ctx) return "";
+  if (!ctx) return g_last_create_error.c_str();
   return ctx->last_error.c_str();
 }
 

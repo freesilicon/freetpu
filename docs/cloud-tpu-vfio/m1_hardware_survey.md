@@ -65,8 +65,7 @@ Observed at the `/dev/vfio/*` kernel boundary during a full `PJRT_Client_Create`
   - `VFIO_DEVICE_RESET` leaves `BAR0 + 0x1001c` (`sq_head`) and `+0x10028` (`cq_tail`) non-zero across runs; zeroing `BAR0 + 0x10018 = 0`, `+0x1002c = 0`, and `+0x10044 = 0` after setting `+0x10000 = 1` clears stale ring pointers so `seq=0` finishes in **`~10 us`** with zero `BAR0 + 0x0a...` CSR writes required.
 - **`op=0x04` PCIe <-> HBM DMA Descriptor (128 B SQ Entry)**:
   - `qwords = len / 8`: `w[8] = ((qwords & 0xffff) << 16) | 0x1001`, `w[9] = 0x00400000 | (qwords >> 16)`.
-  - Host IOVA bits `[31:0]` / `[63:32]` in `w[10..]` (supporting both `<4 GiB` and `>=4 GiB` host IOVAs).
-  - HBM `[35:32]` high bits encoded in `w[25]` (`D2H`: `0x00104000 | hi`) or `w[27]` (`H2D`: `0x40000000 | hi`).
+  - Host IOVA high bits `[63:32]` in `w[10]`, and low bits `[31:0]` in `w[24]` for `H2D` (`w[25] = 0x00604000`, `w[26] = dev_addr[31:0]`, `w[27] = dst_flags_hi | dev_addr[35:32]`) or in `w[26]` for `D2H` (`w[24] = dev_addr[31:0]`, `w[25] = 0x00104000 | dev_addr[35:32]`, `w[27] = 0x40000000`), supporting both `<4 GiB` and `>=4 GiB` host IOVAs.
   - Verified usable HBM aperture from `0x0_00100000` through `0x3_ef000000`, with **`match=1`** byte-exact round-trips across `4 KiB`, `64 KiB`, and `1 MiB` (`opentpu_vfio_smoke`, `MAPS_LIBTPU=0`, `MAPS_LIBPYTHON=0`) and over `GetPjrtApi()` (`PJRT_Client_BufferFromHostBuffer` / `PJRT_Buffer_ToHostBuffer`, `64 KiB` `match=1`).
 
 ## 5. `v5e-1` `512 B` Launch Descriptor, `{1,0:T(2,128)}` Tiling & 512-bit VLIW Matmul

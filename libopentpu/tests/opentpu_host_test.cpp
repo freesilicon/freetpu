@@ -138,6 +138,13 @@ static void test_mock_dma_and_matmul() {
   ot_context_destroy(ctx_small);
   ot_buffer_free(fits);
 
+  // Failed ot_context_create must expose diagnostic via ot_context_last_error(nullptr).
+  ot_config_t bad_cfg = ot_config_default();
+  bad_cfg.struct_size = 1;
+  ot_context_t* bad_ctx = nullptr;
+  OT_CHECK(ot_context_create(&bad_cfg, &bad_ctx) == OT_ERR_INVALID_ARG);
+  OT_CHECK(std::strlen(ot_context_last_error(nullptr)) > 0);
+
   // Faulted DMA context must refuse subsequent transfers and allocations.
   ctx2->transport.dma_faulted = true;
   ot_buffer_t* blocked = nullptr;
@@ -375,6 +382,25 @@ static void test_pjrt_api_mock() {
     PJRT_Error* hi_err = api->PJRT_Client_Compile(&ca_hi);
     OT_CHECK(hi_err != nullptr);
     destroy_pjrt_error(api, hi_err);
+
+    // Non-@main helper function must be rejected even if body is a valid matmul.
+    const char* mlir_helper =
+        "module {\n"
+        "  func.func @helper(%a: tensor<128x128xbf16>, %b: tensor<128x128xbf16>) -> tensor<128x128xbf16> {\n"
+        "    %0 = stablehlo.dot_general %a, %b, contracting_dims = [1] x [0] : (tensor<128x128xbf16>, tensor<128x128xbf16>) -> tensor<128x128xbf16>\n"
+        "    return %0 : tensor<128x128xbf16>\n"
+        "  }\n"
+        "}\n";
+    PJRT_Program p_hlp = prog;
+    p_hlp.code = const_cast<char*>(mlir_helper);
+    p_hlp.code_size = std::strlen(mlir_helper);
+    PJRT_Client_Compile_Args ca_hlp = {};
+    ca_hlp.struct_size = PJRT_Client_Compile_Args_STRUCT_SIZE;
+    ca_hlp.client = cc.client;
+    ca_hlp.program = &p_hlp;
+    PJRT_Error* hlp_err = api->PJRT_Client_Compile(&ca_hlp);
+    OT_CHECK(hlp_err != nullptr);
+    destroy_pjrt_error(api, hlp_err);
   }
 
   // Valid 1x1 compile_options (including field 9 device_assignment for device 0) must succeed.
