@@ -307,13 +307,13 @@ static std::shared_ptr<packed_q8_weight> repack_q8_0_to_buenos(const block_q8_0 
 // =========================================================================
 
 static std::mutex & edgetpu_live_ob_ctxs_mu() {
-    static std::mutex mu;
-    return mu;
+    static auto * mu = new std::mutex();
+    return *mu;
 }
 
 static std::vector<ob_context_t *> & edgetpu_live_ob_ctxs() {
-    static std::vector<ob_context_t *> ctxs;
-    return ctxs;
+    static auto * ctxs = new std::vector<ob_context_t *>();
+    return *ctxs;
 }
 
 static uint64_t next_edgetpu_weight_version() {

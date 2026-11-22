@@ -481,8 +481,20 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t*                  ctx,
  *
  * Executes gate -> 0x640 SiLU * up (0x100 MUL) -> down entirely inside Tensor G5
  * TPU SRAM in a single VII launch per H-chunk on supported LLM shapes:
- *   - SmolLM2-135M (K=576, H=1536, N=576): 1 VII call at M=1, 3 calls at M=64
- *   - Qwen2.5-1.5B (K=1536, H=8960, N=1536): 9 H=1024 chunks at M=1, 18 H=512 at M=64
+ *   - SmolLM2-135M (K=576, H=1536, N=576): 1 VII call at M=1; 3 calls at M=64
+ *     when chained prefill is enabled
+ *   - Qwen2.5-1.5B (K=1536, H=8960, N=1536): 9 H=1024 chunks at M=1; 18 H=512
+ *     chunks at M=64 when chained prefill is enabled
+ *
+ * Execution routing by M:
+ *   - M == 1: chained in-SRAM execution (subject to the clipping guards below).
+ *   - 2 <= M <= 8 (default): exact NEON FP32 CPU fallback to preserve small-prompt
+ *     KV-cache precision without allocating extra weight-cache tiles.
+ *   - M > 8 (default): separate batched M7A lt_64x* GEMMs on TPU.
+ *   - Opt-in chained M=64 prefill: requires OPENBUENOS_SWIGLU_PREFILL=1, batched
+ *     large tiles enabled (default on unless OPENBUENOS_DISABLE_BATCHED_LARGE_TILES=1),
+ *     Q8_0 weights for all three projections (gate, up, and down), and passing the
+ *     activation/norm clipping guards below.
  *
  * Automatically handles arbitrary M (chunking M > 64 internally), exact CPU FP32
  * reference in mock_mode=1, and clean M7A batched fallback for unsupported shapes,

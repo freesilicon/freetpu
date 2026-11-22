@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cfenv>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -5480,11 +5481,20 @@ constexpr float kSwigluSiluUnitCoeffs[8][5] = {
 };
 
 inline int32_t quant_clip_i8_f32(float x) {
-  // Clamp NaN-safely in float before casting to int32_t so |x| >= 2^31 cannot overflow INT32.
-  float r = std::nearbyint(x);
-  if (!(r >= -128.0f)) return -128;
-  if (r > 127.0f) return 127;
-  return static_cast<int32_t>(r);
+  // Exact IEEE-754 round-to-nearest-even independent of the calling thread's FP rounding mode,
+  // clamped NaN-safely before casting to int32_t so |x| >= 2^31 cannot overflow INT32.
+  if (!(x >= -128.0f)) return -128;
+  if (x >= 127.0f) return 127;
+  const double d = static_cast<double>(x);
+  const double lo = std::floor(d);
+  const double frac = d - lo;
+  int32_t q = static_cast<int32_t>(lo);
+  if (frac > 0.5 || (frac == 0.5 && (q & 1) != 0)) {
+    q += 1;
+  }
+  if (q < -128) return -128;
+  if (q > 127) return 127;
+  return q;
 }
 
 void apply_scale_clip_csrs(CsrBank* bank, float real_mul, float fmax = 127.0f, float fmin = -128.0f) {
@@ -7346,6 +7356,19 @@ bool compute_swiglu_hw_multipliers(const ob_swiglu_int8_desc_t& d,
 void simulate_swiglu_hw_exact(const int8_t* x_mk,
                               const ob_swiglu_int8_desc_t& d,
                               int8_t* y_mn) {
+  struct ScopedFeTonearest {
+    int prev_mode = FE_TONEAREST;
+    bool changed = false;
+    ScopedFeTonearest() {
+      prev_mode = std::fegetround();
+      if (prev_mode >= 0 && prev_mode != FE_TONEAREST) {
+        if (std::fesetround(FE_TONEAREST) == 0) changed = true;
+      }
+    }
+    ~ScopedFeTonearest() {
+      if (changed) (void)std::fesetround(prev_mode);
+    }
+  } fe_guard;
   const uint32_t M = d.m_dim, K = d.k_dim, H = d.h_dim, N = d.n_dim;
   float m_g = 0.0f, m_u = 0.0f, m_mul = 0.0f, m_d = 0.0f;
   if (!compute_swiglu_hw_multipliers(d, &m_g, &m_u, &m_mul, &m_d)) {

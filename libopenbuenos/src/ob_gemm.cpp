@@ -4164,7 +4164,7 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
   uint32_t total_hits = 0u;
   uint64_t chained_chunks = 0u;
   uint64_t fb_slices = 0u;
-  uint16_t agg_flags = ctx->mock_mode ? OB_STAT_FLAG_MOCK : 0u;
+  uint16_t agg_flags = ctx->mock_mode ? static_cast<uint16_t>(OB_STAT_FLAG_MOCK) : static_cast<uint16_t>(0u);
 
   const uint32_t nb_k = K / OB_QK8_0;
   const uint32_t nb_h = H / OB_QK8_0;
