@@ -24,7 +24,8 @@ Backends:
                   `--config` state and automatic v6e1 -> v5e1 capacity fallback.
 """
 
-from __future__ import annotations
+# Note: Do not add `from __future__` imports to this file; `colab run` prepends
+# executable prelude statements before compiling the script as one kernel cell.
 
 import argparse
 import json
@@ -2363,6 +2364,15 @@ def run_self_test() -> int:
     assert not any("run" in c for c in pre_fail_calls)
     sess_cfg = pre_fail_calls[-1][pre_fail_calls[-1].index("--config") + 1]
     assert Path(sess_cfg).is_absolute()
+
+    # 5. Verify this script compiles and loads under a `colab run` executable prelude
+    src_text = Path(__file__).read_text(encoding="utf-8")
+    compile("import os\nos.environ['X'] = '1'\n" + src_text, "colab_cell", "exec")
+    compiled_cell = compile("_colab_prelude = 1\n" + src_text, "colab_cell", "exec")
+    cell_ns: Dict[str, Any] = {"__name__": "colab_cell_test"}
+    exec(compiled_cell, cell_ns)
+    assert callable(cell_ns.get("run_jax_tpu_suites"))
+    assert callable(cell_ns.get("main"))
 
     print(
         json.dumps(
