@@ -1152,6 +1152,8 @@ def reconcile_cdi_spec(
     kind: str = CDI_KIND,
 ) -> Tuple[bool, str]:
     """Generate, validate, and atomically publish a live CDI spec, invalidating stale files on error."""
+    if not isinstance(kind, str) or not _CDI_KIND_RE.match(kind):
+        return False, f"Invalid CDI kind {kind!r} (existing spec preserved)"
     try:
         chips, vfio_container = discover_tpu_chips(
             sysfs_root=sysfs_root,
@@ -1352,6 +1354,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "generate":
+        if not isinstance(args.kind, str) or not _CDI_KIND_RE.match(args.kind):
+            sys.stderr.write(f"freetpu-cdi generate failed: Invalid CDI kind {args.kind!r}\n")
+            return 1
         if args.allow_missing_vfio and not args.stdout:
             sys.stderr.write(
                 "freetpu-cdi generate failed: --allow-missing-vfio is for dry-run inspection only "
@@ -1455,6 +1460,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
 
     if args.command == "sync":
+        if not isinstance(args.kind, str) or not _CDI_KIND_RE.match(args.kind):
+            sys.stderr.write(f"freetpu-cdi sync failed: Invalid CDI kind {args.kind!r}\n")
+            return 1
         if args.once:
             ok, msg = reconcile_cdi_spec(
                 args.output,

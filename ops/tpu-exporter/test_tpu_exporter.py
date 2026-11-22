@@ -1817,6 +1817,17 @@ TPU Runtime Utilization
                 encoding="utf-8",
             )
             self.assertFalse(tpu_exporter._procfs_hides_pids(proc_root))
+            # `hidepid=ptraceable` / `4` checks ptrace before `gid=`, so even matching gid must fail closed.
+            mountinfo.write_text(
+                f"26 20 0:23 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw,hidepid=ptraceable,gid={os.getegid()}\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(tpu_exporter._procfs_hides_pids(proc_root))
+            mountinfo.write_text(
+                f"26 20 0:23 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw,hidepid=4,gid={os.getegid()}\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(tpu_exporter._procfs_hides_pids(proc_root))
             mountinfo.write_text(
                 "26 20 0:23 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw,hidepid=0\n",
                 encoding="utf-8",

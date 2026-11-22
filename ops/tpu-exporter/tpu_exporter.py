@@ -356,6 +356,17 @@ def _procfs_hides_pids(proc_root: Path) -> bool:
     if not hidepid_val or hidepid_val in ("0", "off"):
         return False
 
+    # Linux `hidepid=ptraceable` (numeric 4, HIDEPID_NOT_PTRACEABLE) applies a
+    # ptrace visibility check BEFORE considering `gid=`; fail closed so restricted
+    # ptrace never produces a silent undercount marked available.
+    if hidepid_val in ("4", "ptraceable"):
+        return True
+    try:
+        if (int(hidepid_val, 0) & 4) != 0:
+            return True
+    except ValueError:
+        pass
+
     try:
         caller_gids = {os.getegid(), *os.getgroups()}
     except OSError:

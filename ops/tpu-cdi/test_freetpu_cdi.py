@@ -1450,6 +1450,47 @@ class FreeTpuCdiTests(unittest.TestCase):
                     for dn in dev_entry["containerEdits"]["deviceNodes"]:
                         self.assertTrue(dn["hostPath"].startswith("/"))
 
+                # 10. Invalid `--kind` in `generate` or `sync` fails without unlinking an existing spec.
+                existing_out = root / "published_freetpu.json"
+                existing_out.write_text('{"keep": true}\n', encoding="utf-8")
+                ok_bad_k, msg_bad_k = freetpu_cdi.reconcile_cdi_spec(
+                    existing_out, sysfs_root=sysfs_root, dev_root=dev_root, kind="badkind"
+                )
+                self.assertFalse(ok_bad_k)
+                self.assertIn("Invalid CDI kind", msg_bad_k)
+                self.assertTrue(existing_out.exists())
+                rc_gen_bad = freetpu_cdi.main(
+                    [
+                        "generate",
+                        "--sysfs-root",
+                        str(sysfs_root),
+                        "--dev-root",
+                        str(dev_root),
+                        "--output",
+                        str(existing_out),
+                        "--kind",
+                        "badkind",
+                    ]
+                )
+                self.assertEqual(rc_gen_bad, 1)
+                self.assertTrue(existing_out.exists())
+                rc_sync_bad = freetpu_cdi.main(
+                    [
+                        "sync",
+                        "--once",
+                        "--sysfs-root",
+                        str(sysfs_root),
+                        "--dev-root",
+                        str(dev_root),
+                        "--output",
+                        str(existing_out),
+                        "--kind",
+                        "badkind",
+                    ]
+                )
+                self.assertEqual(rc_sync_bad, 1)
+                self.assertTrue(existing_out.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
