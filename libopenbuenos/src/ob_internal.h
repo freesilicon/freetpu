@@ -486,6 +486,7 @@ void w8a16_pt_epilogue_f32(float* c_row,
                            uint32_t tn,
                            float prescale_inv,
                            bool store_first);
+float round_f32_to_fp16_f32(float x);
 
 // Clean-room C++17 11-chunk zero-DRAM in-SRAM chained SwiGLU emitter (ob_gemm_emitter.cpp)
 struct SwigluSynthResult {

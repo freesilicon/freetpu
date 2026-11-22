@@ -68,7 +68,7 @@ All runs at `max_freq_mhz = 1286.4` (`PM=5` + FW WakeLock), `MAPS_GOOGLE=0`, `cp
 
 *(Opt-in `W8A16=1` / `auto` `Qwen2.5 Q8 tg64`: `4.96 ± 1.32` / `4.56 ± 1.10 t/s`, `w_evict=0`.)*
 
-### 3.3 18-Case Standalone ODPM `mJ/tok` Sweep (live device telemetry) — **5/6 Prefills Beat 4T CPU**
+### 3.3 18-Case Standalone ODPM `mJ/tok` Sweep (live device telemetry) — **5/6 Prefills Lower Steady-State Energy per Token vs 4T CPU**
 
 | Workload | CPU `t/s` | CPU SS / INT `mJ/tok` | TPU `t/s` | TPU `P_tot` (`TPU/CPU/MEM`) | TPU SS `mJ/tok` (**`TPU`** / **`Total`**) | TPU INT `mJ/tok` (`Total`) | SS / INT vs CPU | `VmRSS` TPU vs CPU |
 |---|---:|---:|---|---:|---|---|---|---|

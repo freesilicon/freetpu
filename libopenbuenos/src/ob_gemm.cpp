@@ -58,6 +58,45 @@ inline float fp16_to_fp32(uint16_t h) {
 #endif
 }
 
+inline uint16_t fp32_to_fp16_rne(float x) {
+  uint32_t bits = 0u;
+  std::memcpy(&bits, &x, sizeof(bits));
+  const uint32_t sign = (bits >> 16) & 0x8000u;
+  const uint32_t exp_raw = (bits >> 23) & 0xFFu;
+  const uint32_t mant = bits & 0x007FFFFFu;
+  if (exp_raw == 0xFFu) {
+    if (mant == 0u) return static_cast<uint16_t>(sign | 0x7C00u);
+    return static_cast<uint16_t>(sign | 0x7E00u | (mant >> 13));
+  }
+  int32_t exp = static_cast<int32_t>(exp_raw) - 127 + 15;
+  if (exp <= 0) {
+    if (exp < -10) return static_cast<uint16_t>(sign);
+    const uint32_t m = mant | 0x00800000u;
+    const uint32_t shift = static_cast<uint32_t>(14 - exp);
+    const uint32_t half_bit = 1u << (shift - 1u);
+    const uint32_t rem = m & ((1u << shift) - 1u);
+    uint32_t q = m >> shift;
+    if (rem > half_bit || (rem == half_bit && (q & 1u) != 0u)) {
+      q += 1u;
+    }
+    return static_cast<uint16_t>(sign | q);
+  }
+  if (exp >= 31) {
+    return static_cast<uint16_t>(sign | 0x7C00u);
+  }
+  const uint32_t rem = mant & 0x1FFFu;
+  uint32_t q = mant >> 13;
+  if (rem > 0x1000u || (rem == 0x1000u && (q & 1u) != 0u)) {
+    q += 1u;
+    if (q == 0x0400u) {
+      q = 0u;
+      exp += 1;
+      if (exp >= 31) return static_cast<uint16_t>(sign | 0x7C00u);
+    }
+  }
+  return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) | q);
+}
+
 inline int8_t quant_sym_i8(float x) {
   long q = std::lround(x);
   if (q < -127) q = -127;
@@ -2262,6 +2301,10 @@ void dequant_outliers_row_f32(float* c_row,
 
 void apply_activation_inplace_f32(float* c_mn, size_t count, uint32_t act) {
   apply_activation_inplace_impl(c_mn, count, act);
+}
+
+float round_f32_to_fp16_f32(float x) {
+  return fp16_to_fp32(fp32_to_fp16_rne(x));
 }
 
 void w8a16_pt_epilogue_f32(float* c_row,
@@ -5485,11 +5528,11 @@ ob_status_t ob_gemm_matmul_f32_w8a16_tile(ob_context_t* ctx,
     // Exact FP16-input + FP32-accumulator hardware simulator for host/mock verification
     std::vector<float> a_fp16_f32(k_dim);
     for (uint32_t ki = 0u; ki < k_dim; ++ki) {
-      // Round to IEEE FP16 via fp16_to_f32(f32_to_fp16) using __fp16 on ARM64 or bit-exact fallback
+      // Exact IEEE-754 RNE FP16 round trip on every architecture (ARM64 and portable x86/host)
 #if defined(__aarch64__) || defined(__ARM_FP16_FORMAT_IEEE)
       a_fp16_f32[ki] = static_cast<float>(static_cast<__fp16>(in_f32[ki]));
 #else
-      a_fp16_f32[ki] = in_f32[ki];
+      a_fp16_f32[ki] = ob::round_f32_to_fp16_f32(in_f32[ki]);
 #endif
     }
     std::vector<float> y_raw(n_dim, 0.0f);

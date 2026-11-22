@@ -776,9 +776,10 @@ bool device_try_wait_handle(ob_context* ctx,
         int rc = pop_and_demux_one_locked(ctx, false, 0u, nullptr, nullptr, &err);
         if (rc == 0) continue;
         if (rc == -2) {
+          // Keep the handle IN_FLIGHT so the caller's blocking wait / cleanup path
+          // retains DMA buffer ownership and retires the slot cleanly.
           set_last_error(ctx, err);
-          if (out_status) *out_status = OB_ERR_IOCTL;
-          return true;
+          return false;
         }
         break;
       }
@@ -793,8 +794,7 @@ bool device_try_wait_handle(ob_context* ctx,
         }
       }
 #else
-      if (out_status) *out_status = OB_ERR_UNSUPPORTED;
-      return true;
+      return false;
 #endif
     }
 

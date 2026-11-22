@@ -4506,6 +4506,30 @@ void test_phase8b_spsc_async_dequant_and_w8a16_pt() {
     }
     const double rel_l2 = std::sqrt(err_sq) / std::max(std::sqrt(ref_sq), 1e-12);
     CHECK(rel_l2 < 5e-4);
+
+    // FP16-vs-FP32 rounding contract: 1.0f and 1.0001f both round to 1.0 in IEEE FP16, so
+    // dot([1.0, 1.0001, 0...], [1, -1, 0...]) MUST cancel to exact 0.0f on every architecture.
+    {
+      CHECK(ob::round_f32_to_fp16_f32(1.0f) == 1.0f);
+      CHECK(ob::round_f32_to_fp16_f32(1.0001f) == 1.0f);
+      CHECK(ob::round_f32_to_fp16_f32(-1.0001f) == -1.0f);
+      // Subnormal preservation: 2^-15 (3.0517578125e-5) must not flush to zero.
+      const float sub_val = 3.0517578125e-5f;
+      CHECK(ob::round_f32_to_fp16_f32(sub_val) == sub_val);
+
+      constexpr uint32_t K_r = 512u, N_r = 512u;
+      std::vector<float> a_r(K_r, 0.0f), sb_r(N_r, 1.0f), out_r(N_r, 99.0f);
+      std::vector<int8_t> w_r(static_cast<size_t>(N_r) * K_r, 0);
+      a_r[0] = 1.0f;
+      a_r[1] = 1.0001f;
+      w_r[0] = 1;
+      w_r[1] = -1;
+      ob_invoke_stats_t rstats{};
+      CHECK(ob_gemm_matmul_f32_w8a16_tile(
+                ctx, a_r.data(), w_r.data(), sb_r.data(), K_r, N_r, out_r.data(), &rstats) == OB_OK);
+      CHECK(out_r[0] == 0.0f);
+    }
+
     ob_context_destroy(ctx);
   }
 
