@@ -80,7 +80,7 @@ If your GCP project still receives `403` on `colaboratory.googleapis.com/v1beta`
 
 ## 3. Using `tools/colab_tpu_bench.py`
 
-[`tools/colab_tpu_bench.py`](../../tools/colab_tpu_bench.py) enforces `google-colab-cli >= 0.7.6` (redacted/private credential logging) before any authenticated command and wraps `google-colab-cli` with private `0700` output/config checks, signed CU guards, per-run isolated `--config` & dedicated recovery stores, conservative `v6e1 -> v5e1` fallback, independent inactivity (`--timeout`) and optional local wall-clock (`--wall-timeout`) caps, bounded `colab stop` reconciliation on Ctrl+C/SIGTERM/wall-timeout or active-endpoint/listing retries, TPU-validated probe JSON capture, and `.ipynb` proof export:
+[`tools/colab_tpu_bench.py`](../../tools/colab_tpu_bench.py) enforces `google-colab-cli >= 0.7.6` (redacted/private credential logging) before any authenticated command and wraps `google-colab-cli` with private `0700` output/config checks, signed CU guards, per-run isolated `--config` & dedicated recovery stores, conservative `v6e1 -> v5e1` fallback, independent inactivity (`--timeout`) and finite-default local wall-clock (`--wall-timeout`, defaulting to `--timeout + 180s` or `480s` when `--timeout 0`, with `--wall-timeout 0` opt-out) caps, bounded `colab stop` reconciliation on Ctrl+C/SIGTERM/wall-timeout or active-endpoint/listing retries, TPU-validated probe JSON capture, and `.ipynb` proof export:
 
 ```bash
 # Offline CI self-test (no Colab credentials or hardware required)

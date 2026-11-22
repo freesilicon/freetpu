@@ -46,6 +46,9 @@ PROBE_JSON_END = "=== FREETPU_COLAB_PROBE_JSON_END ==="
 
 DEFAULT_TPU_ORDER: Tuple[str, ...] = ("v6e1", "v5e1")
 SUPPORTED_TPUS = frozenset({"v6e1", "v5e1"})
+DEFAULT_REQUEST_TIMEOUT_S: float = 60.0
+DEFAULT_STARTUP_OVERHEAD_S: float = 180.0
+DEFAULT_UNBOUNDED_INACTIVITY_WALL_TIMEOUT_S: float = 480.0
 MIN_COLAB_CLI_VERSION: Tuple[int, int, int] = (0, 7, 6)
 _VERSION_RE = re.compile(
     r"\b(\d+)\.(\d+)\.(\d+)(?:(?:\.?post\d+)|([.-]?(?:a|b|rc|alpha|beta|dev|pre)\w*))?",
@@ -149,7 +152,7 @@ class BenchConfig:
     max_active_assignments: Optional[int] = None
     timeout_s: float = 300.0
     wall_timeout_s: Optional[float] = None
-    request_timeout_s: float = 60.0
+    request_timeout_s: Optional[float] = None
     teardown_retries: int = 2
     teardown_retry_delay_s: float = 2.0
     use_no_public_api: bool = True
@@ -705,8 +708,52 @@ def check_colab_cli_version(
     return True, parsed, None, res.returncode
 
 
+def resolve_effective_wall_timeout(
+    timeout_s: float,
+    wall_timeout_s: Optional[float],
+) -> Optional[float]:
+    """Compute the effective local wall-clock deadline for `colab run`.
+
+    - Explicit `wall_timeout_s == 0`: opt-out (unbounded local wall time).
+    - Explicit `wall_timeout_s > 0`: exact local wall-clock cap.
+    - Omitted (`wall_timeout_s is None`): finite default (`timeout_s + 180s` when `timeout_s > 0`,
+      or `480s` when `timeout_s == 0`) so a stalled kernel setup cell cannot leak Compute Units.
+    """
+    if wall_timeout_s is not None:
+        return wall_timeout_s if wall_timeout_s > 0 else None
+    if timeout_s > 0:
+        return timeout_s + DEFAULT_STARTUP_OVERHEAD_S
+    return DEFAULT_UNBOUNDED_INACTIVITY_WALL_TIMEOUT_S
+
+
+def resolve_effective_request_timeout(
+    request_timeout_s: Optional[float],
+) -> Tuple[float, bool]:
+    """Return `(effective_request_timeout_s, explicit_override)` honoring explicit flag over env."""
+    if request_timeout_s is not None:
+        if not math.isfinite(request_timeout_s) or request_timeout_s <= 0:
+            raise ValueError(
+                f"`--request-timeout` must be finite and > 0 (got {request_timeout_s!r})."
+            )
+        return request_timeout_s, True
+    raw_env = os.environ.get("COLAB_CLI_REQUEST_TIMEOUT")
+    if raw_env is not None and raw_env.strip():
+        try:
+            env_val = float(raw_env.strip())
+        except ValueError as exc:
+            raise ValueError(
+                f"Inherited `COLAB_CLI_REQUEST_TIMEOUT` must be a finite positive number (got {raw_env!r})."
+            ) from exc
+        if not math.isfinite(env_val) or env_val <= 0:
+            raise ValueError(
+                f"Inherited `COLAB_CLI_REQUEST_TIMEOUT` must be finite and > 0 (got {raw_env!r})."
+            )
+        return env_val, False
+    return DEFAULT_REQUEST_TIMEOUT_S, False
+
+
 def make_subprocess_runner(
-    request_timeout_s: float = 60.0,
+    request_timeout_s: Optional[float] = None,
     run_wall_timeout_s: Optional[float] = None,
 ) -> CommandRunner:
     """Create a non-interactive subprocess runner that captures stdout/stderr incrementally."""
@@ -714,7 +761,9 @@ def make_subprocess_runner(
     def _run(cmd: Sequence[str]) -> CommandResult:
         cmd_list = list(cmd)
         env = os.environ.copy()
-        env.setdefault("COLAB_CLI_REQUEST_TIMEOUT", str(request_timeout_s))
+        effective_req_timeout, explicit_req = resolve_effective_request_timeout(request_timeout_s)
+        if explicit_req or not (env.get("COLAB_CLI_REQUEST_TIMEOUT") or "").strip():
+            env["COLAB_CLI_REQUEST_TIMEOUT"] = str(effective_req_timeout)
         # Disable Colab CLI's internal allocation POST retry so an ambiguous timeout/disconnect
         # cannot be masked by a subsequent 412 refusal that would falsely trigger v5e1 fallback.
         env["COLAB_CLI_ASSIGN_RETRIES"] = "0"
@@ -726,7 +775,7 @@ def make_subprocess_runner(
                 else None
             )
         else:
-            wall_timeout = max(request_timeout_s * 2.0, 120.0)
+            wall_timeout = max(effective_req_timeout * 2.0, 120.0)
 
         proc = subprocess.Popen(
             cmd_list,
@@ -1264,10 +1313,12 @@ def run_benchmark(
             "status": "invalid_timeout",
             "error": f"`--wall-timeout` must be finite and >= 0 (got {cfg.wall_timeout_s!r}).",
         }
-    if not math.isfinite(cfg.request_timeout_s) or cfg.request_timeout_s <= 0:
+    try:
+        effective_request_timeout, _ = resolve_effective_request_timeout(cfg.request_timeout_s)
+    except ValueError as exc:
         return 2, {
             "status": "invalid_timeout",
-            "error": f"`--request-timeout` must be finite and > 0 (got {cfg.request_timeout_s!r}).",
+            "error": str(exc),
         }
     if not math.isfinite(cfg.teardown_retry_delay_s) or cfg.teardown_retry_delay_s < 0:
         return 2, {
@@ -1278,13 +1329,9 @@ def run_benchmark(
             ),
         }
 
+    effective_wall_timeout = resolve_effective_wall_timeout(cfg.timeout_s, cfg.wall_timeout_s)
     using_default_runner = runner is None
     if runner is None:
-        effective_wall_timeout = (
-            cfg.wall_timeout_s
-            if cfg.wall_timeout_s is not None and cfg.wall_timeout_s > 0
-            else None
-        )
         runner = make_subprocess_runner(
             cfg.request_timeout_s,
             run_wall_timeout_s=effective_wall_timeout,
@@ -1420,6 +1467,9 @@ def run_benchmark(
             "tpus": list(cfg.tpus),
             "timeout_s": cfg.timeout_s,
             "wall_timeout_s": cfg.wall_timeout_s,
+            "effective_wall_timeout_s": effective_wall_timeout,
+            "request_timeout_s": cfg.request_timeout_s,
+            "effective_request_timeout_s": effective_request_timeout,
             "planned_commands": planned_commands,
         }
         try:
@@ -2144,6 +2194,8 @@ def run_benchmark(
             "status": status,
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "colab_cli_version": cli_version,
+            "effective_wall_timeout_s": effective_wall_timeout,
+            "effective_request_timeout_s": effective_request_timeout,
             "isolated_config": str(isolated_config),
             "recovery_config": str(recovery_config_path) if recovery_config_path else None,
             "usage_before": asdict(usage),
@@ -4031,7 +4083,72 @@ def run_self_test() -> int:
         )
         assert proc_plain.returncode == 0, f"Plain wrapped script failed: {proc_plain.stderr}"
 
-    print("colab_tpu_bench.py self-test PASSED (49/49 suites).")
+        # 50. Omitted `--wall-timeout` uses a finite default (bounding stalled kernel setup),
+        #     while explicit `--wall-timeout 0` opts out cleanly.
+        assert resolve_effective_wall_timeout(300.0, None) == 480.0
+        assert resolve_effective_wall_timeout(0.0, None) == 480.0
+        assert resolve_effective_wall_timeout(300.0, 0.0) is None
+        assert resolve_effective_wall_timeout(300.0, 900.0) == 900.0
+
+        rc_def_wt, sum_def_wt = run_benchmark(
+            BenchConfig(dry_run=True, timeout_s=300.0, wall_timeout_s=None, out_dir=tmp_path / "def-wt"),
+            runner=low_or_bad_cu_runner("unused"),
+        )
+        assert rc_def_wt == 0
+        assert sum_def_wt["effective_wall_timeout_s"] == 480.0
+
+        rc_opt_wt, sum_opt_wt = run_benchmark(
+            BenchConfig(dry_run=True, timeout_s=300.0, wall_timeout_s=0.0, out_dir=tmp_path / "opt-wt"),
+            runner=low_or_bad_cu_runner("unused"),
+        )
+        assert rc_opt_wt == 0
+        assert sum_opt_wt["effective_wall_timeout_s"] is None
+
+        # 51. Explicit `--request-timeout` overrides inherited COLAB_CLI_REQUEST_TIMEOUT, while
+        #     omitting `--request-timeout` preserves a valid inherited environment value.
+        old_req_env = os.environ.get("COLAB_CLI_REQUEST_TIMEOUT")
+        os.environ["COLAB_CLI_REQUEST_TIMEOUT"] = "300"
+        try:
+            explicit_runner = make_subprocess_runner(request_timeout_s=10.0)
+            res_exp = explicit_runner(
+                [sys.executable, "-c", "import os; print(os.environ['COLAB_CLI_REQUEST_TIMEOUT'])"]
+            )
+            assert res_exp.returncode == 0
+            assert res_exp.stdout.strip() == "10.0"
+
+            inherited_runner = make_subprocess_runner(request_timeout_s=None)
+            res_inh = inherited_runner(
+                [sys.executable, "-c", "import os; print(os.environ['COLAB_CLI_REQUEST_TIMEOUT'])"]
+            )
+            assert res_inh.returncode == 0
+            assert res_inh.stdout.strip() == "300"
+
+            parsed_default_req = build_parser().parse_args([])
+            assert parsed_default_req.request_timeout is None
+            parsed_explicit_req = build_parser().parse_args(["--request-timeout", "10"])
+            assert parsed_explicit_req.request_timeout == 10.0
+
+            rc_inh_dry, sum_inh_dry = run_benchmark(
+                BenchConfig(dry_run=True, request_timeout_s=None, out_dir=tmp_path / "inh-req"),
+                runner=low_or_bad_cu_runner("unused"),
+            )
+            assert rc_inh_dry == 0
+            assert sum_inh_dry["effective_request_timeout_s"] == 300.0
+
+            os.environ["COLAB_CLI_REQUEST_TIMEOUT"] = "nan"
+            rc_bad_env, sum_bad_env = run_benchmark(
+                BenchConfig(dry_run=True, request_timeout_s=None, out_dir=tmp_path / "bad-env-req"),
+                runner=forbid_calls_runner,
+            )
+            assert rc_bad_env == 2
+            assert sum_bad_env["status"] == "invalid_timeout"
+        finally:
+            if old_req_env is None:
+                os.environ.pop("COLAB_CLI_REQUEST_TIMEOUT", None)
+            else:
+                os.environ["COLAB_CLI_REQUEST_TIMEOUT"] = old_req_env
+
+    print("colab_tpu_bench.py self-test PASSED (51/51 suites).")
     return 0
 
 
@@ -4084,15 +4201,20 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help=(
-            "Optional local wall-clock cap (seconds) for the `colab run` subprocess "
-            "(default: unset / 0 = no local wall-clock cap; independent of --timeout)."
+            "Local wall-clock cap (seconds) for the `colab run` subprocess "
+            "(default: --timeout + 180s when --timeout > 0, or 480s when --timeout 0, "
+            "to bound stalled kernel startup; pass 0 to explicitly opt out)."
         ),
     )
     parser.add_argument(
         "--request-timeout",
         type=float,
-        default=60.0,
-        help="HTTP request timeout (seconds) via COLAB_CLI_REQUEST_TIMEOUT (default: 60.0).",
+        default=None,
+        help=(
+            "HTTP request timeout (seconds) via COLAB_CLI_REQUEST_TIMEOUT "
+            "(explicit flag overrides inherited environment; omitted preserves inherited "
+            "COLAB_CLI_REQUEST_TIMEOUT or defaults to 60.0)."
+        ),
     )
     parser.add_argument(
         "--config",
