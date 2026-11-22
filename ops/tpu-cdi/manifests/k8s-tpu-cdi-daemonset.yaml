@@ -1,14 +1,24 @@
 # FreeTPU Node DaemonSets (VFIO-backed GKE Standard / self-managed Cloud TPU nodes: v5e, v5p, v6e Trillium):
 # Cluster prerequisite: requires **GKE Standard** (or self-managed Kubernetes);
-# **GKE Autopilot** blocks `hostPath` mounts and `hostPID` at admission. On GKE
-# Autopilot, run `tpu_exporter.py --no-pid-scan` in the workload's network
-# namespace instead of deploying host DaemonSets.
+# **GKE Autopilot** blocks `hostPath` mounts at admission. On GKE Autopilot, run
+# `tpu_exporter.py --no-pid-scan` in the workload's network namespace instead of
+# deploying host DaemonSets.
 # Scope:
 #   1. `DaemonSet/freetpu-node-agent` (default on VFIO-backed TPU nodes):
-#      PCI/VFIO inventory & hostPID active-PID Prometheus telemetry ONLY (does NOT
-#      mount `/var/run/cdi` or publish CDI specs). Uses stock `python:3.12-slim`
-#      without `tpu-info` and runs outside workload Pod network namespaces, so it
-#      does NOT emit live HBM usage or MXU duty cycle. For live HBM + duty-cycle
+#      PCI/VFIO hardware inventory & readiness Prometheus telemetry ONLY (does
+#      NOT mount `/var/run/cdi`, publish CDI specs, or enable `hostPID` /
+#      `CAP_SYS_PTRACE` / `/proc` PID scanning by default). Because GKE Standard
+#      accepts `NetworkPolicy` objects even when policy enforcement is disabled,
+#      host PID telemetry is intentionally disabled by default (`--no-pid-scan
+#      --tpu-info-bin ""`) so unauthenticated `:9400` scrapes never expose host
+#      process IDs on clusters without enforced NetworkPolicy. To opt into host
+#      PID telemetry (`freetpu_tpu_active_pids`) on a cluster with verified
+#      NetworkPolicy enforcement (or behind an authenticating proxy such as
+#      `kube-rbac-proxy` with `--host 127.0.0.1`), add `hostPID: true`,
+#      `CAP_SYS_PTRACE`, `securityContext.appArmorProfile.type: Unconfined` (on
+#      GKE), and remove `--no-pid-scan`. Uses stock `python:3.12-slim` without
+#      `tpu-info` and runs outside workload Pod network namespaces, so it does
+#      NOT emit live HBM usage or MXU duty cycle. For live HBM + duty-cycle
 #      telemetry, run `tpu_exporter.py` with `tpu-info` inside the same network
 #      namespace as `libtpu` (`127.0.0.1:8431`, e.g. on standalone TPU VMs or
 #      with `--no-pid-scan` in an operator-managed Pod sidecar).
@@ -66,7 +76,6 @@ spec:
       # `freetpu-node-exporter` job discovers this DaemonSet strictly by
       # namespace, DaemonSet controller, container, and port name.
     spec:
-      hostPID: true
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -97,16 +106,9 @@ spec:
             - 127.0.0.1
             - --health-port
             - "9401"
-          securityContext:
-            # Required on GKE alongside hostPID + SYS_PTRACE: GKE's default
-            # AppArmor profile restricts ptrace-mediated /proc/<pid>/fd reads
-            # to peers sharing the same profile, which otherwise blocks reads
-            # of host processes and suppresses host-wide PID telemetry.
-            appArmorProfile:
-              type: Unconfined
-            capabilities:
-              add:
-                - SYS_PTRACE
+            - --no-pid-scan
+            - --tpu-info-bin
+            - ""
           ports:
             - name: metrics
               containerPort: 9400
@@ -308,17 +310,18 @@ spec:
             name: freetpu-ops-scripts
 ---
 # Restrict ingress to the node exporter's :9400/metrics port strictly to the
-# trusted billing Prometheus scraper so tenant workloads cannot read host TPU
-# process IDs/activity or compete for the exporter's bounded scrape worker pool.
-# Requires a CNI enforcing Kubernetes NetworkPolicy (e.g. GKE Dataplane V2,
-# Cilium, or Calico); note that Kubernetes NetworkPolicy always permits traffic
-# originating from the exporter's own node, so on CNIs that treat same-node
-# `hostNetwork: true` pods as node traffic, also forbid tenant `hostNetwork: true`
-# pods via admission controls (e.g. ValidatingAdmissionPolicy) OR front :9400
-# with an authenticating proxy such as kube-rbac-proxy (mTLS/RBAC). On clusters
-# without NetworkPolicy enforcement, always front :9400 with an authenticating
-# proxy. Adjust the namespaceSelector and podSelector below to match your
-# billing Prometheus pod.
+# trusted monitoring Prometheus scraper so tenant workloads cannot compete for
+# the exporter's bounded scrape worker pool (or read host PID metrics if an
+# operator explicitly opts into hostPID scanning). Requires a CNI enforcing
+# Kubernetes NetworkPolicy (e.g. GKE Dataplane V2, Cilium, or Calico); note
+# that Kubernetes NetworkPolicy always permits traffic originating from the
+# exporter's own node, so on CNIs that treat same-node `hostNetwork: true` pods
+# as node traffic, also forbid tenant `hostNetwork: true` pods via admission
+# controls (e.g. ValidatingAdmissionPolicy) OR bind `--host 127.0.0.1` behind
+# an authenticating proxy such as kube-rbac-proxy (mTLS/RBAC). On clusters
+# without NetworkPolicy enforcement, bind `--host 127.0.0.1` behind an
+# authenticating proxy before opting into host PID telemetry. Adjust the
+# namespaceSelector and podSelector below to match your Prometheus pod.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

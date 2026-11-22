@@ -1688,6 +1688,29 @@ TPU Device Status
                 )
             self.assertFalse(snap_disabled.tpu_info_available)
 
+            # Negative classic/dashboard `tpu-info` readings must be omitted (never
+            # parsed as positive magnitudes via unsigned regex search).
+            neg_classic = """
+TPU Runtime Utilization
++------+------------------------+------------+
+| Chip | HBM Usage              | Duty Cycle |
++------+------------------------+------------+
+| 0    | -1.00 GiB / 32.00 GiB  | -1.00%     |
+| 1    | 4.00 GiB / -32.00 GiB  | 0.00%      |
+| 2    | 8.00 GiB / 32.00 GiB   | 42.50%     |
++------+------------------------+------------+
+"""
+            neg_rows = tpu_exporter.parse_tpu_info_output(neg_classic)
+            self.assertIsNone(neg_rows["0"].hbm_used_bytes)
+            self.assertIsNone(neg_rows["0"].hbm_total_bytes)
+            self.assertIsNone(neg_rows["0"].duty_cycle_percent)
+            self.assertIsNone(neg_rows["1"].hbm_used_bytes)
+            self.assertIsNone(neg_rows["1"].hbm_total_bytes)
+            self.assertEqual(neg_rows["1"].duty_cycle_percent, 0.0)
+            self.assertEqual(neg_rows["2"].hbm_used_bytes, 8 * 1024**3)
+            self.assertEqual(neg_rows["2"].hbm_total_bytes, 32 * 1024**3)
+            self.assertEqual(neg_rows["2"].duty_cycle_percent, 42.5)
+
             # Oversized HTTP headers (> MAX_HTTP_HEADER_BYTES) are rejected with 431 before scrape.
             import socket as _socket
 

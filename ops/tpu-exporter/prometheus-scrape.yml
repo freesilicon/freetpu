@@ -25,8 +25,8 @@ scrape_configs:
         action: drop
         regex: "freetpu_tpu_process_active"
 
-  # Trusted operator-managed DaemonSet discovery (billing inventory, VFIO
-  # health, and hostPID reservation metrics).
+  # Trusted operator-managed DaemonSet discovery (PCI/VFIO inventory, VFIO
+  # health, and opt-in hostPID metrics).
   # Scoped strictly via Kubernetes-enforced ownership metadata (namespace,
   # DaemonSet controller, container, and port name) rather than pod-controlled
   # labels or annotations, and hard-sets `collector_role="node"` with

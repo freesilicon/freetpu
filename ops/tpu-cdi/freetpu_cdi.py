@@ -14,7 +14,7 @@ Note: Legacy `/dev/accel*` Cloud TPU hosts (e.g. Cloud TPU v4 using Google's
 Also provides:
   - `validate`: strict CNCF CDI v0.6.0 structural & live host VFIO validator
   - `sync`: boot-scoped generator/reconciler that invalidates stale specs on drift
-  - `docker-args`: prints Docker / Podman CLI flags (including IPC_LOCK + memlock)
+  - `docker-args`: prints Docker / Podman CLI flags (memlock default; optional IPC_LOCK)
 
 Zero third-party dependencies: uses Python standard library only.
 """
@@ -454,7 +454,7 @@ def build_cdi_spec(
                 "freetpu.dev/model": rep.model_name,
                 "freetpu.dev/driver": rep.driver,
                 "freetpu.dev/iommu-group": rep.iommu_group,
-                "freetpu.dev/required-cap-add": "IPC_LOCK",
+                "freetpu.dev/optional-cap-add": "IPC_LOCK",
                 "freetpu.dev/required-ulimit-memlock": "-1",
             }
             devnums_str = _format_vfio_devnums([(rep.vfio_container_path, group_devnum)])
@@ -487,7 +487,7 @@ def build_cdi_spec(
                 "freetpu.dev/pci-bdfs": ",".join(group_bdfs),
                 "freetpu.dev/generations": ",".join(group_gens),
                 "freetpu.dev/iommu-group": iommu_group,
-                "freetpu.dev/required-cap-add": "IPC_LOCK",
+                "freetpu.dev/optional-cap-add": "IPC_LOCK",
                 "freetpu.dev/required-ulimit-memlock": "-1",
             }
             devnums_str = _format_vfio_devnums([(rep.vfio_container_path, group_devnum)])
@@ -515,7 +515,7 @@ def build_cdi_spec(
         "freetpu.dev/chip-count": str(len(chips)),
         "freetpu.dev/pci-bdfs": ",".join(sorted(all_bdfs)),
         "freetpu.dev/generations": ",".join(all_generations),
-        "freetpu.dev/required-cap-add": "IPC_LOCK",
+        "freetpu.dev/optional-cap-add": "IPC_LOCK",
         "freetpu.dev/required-ulimit-memlock": "-1",
     }
     all_devnums = _format_vfio_devnums(list(seen_group_devnums.items()))
@@ -541,7 +541,7 @@ def build_cdi_spec(
 
     root_ann: Dict[str, str] = {
         "freetpu.dev/generated-by": "freetpu-cdi",
-        "freetpu.dev/required-cap-add": "IPC_LOCK",
+        "freetpu.dev/optional-cap-add": "IPC_LOCK",
         "freetpu.dev/required-ulimit-memlock": "-1",
     }
     # Record live VFIO char major:minor in spec annotations (while keeping
@@ -1298,6 +1298,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="all",
         help="CDI device selector suffix (default: all -> freetpu.dev/tpu=all).",
     )
+    dargs.add_argument(
+        "--cap-ipc-lock",
+        action="store_true",
+        help="Also emit --cap-add=IPC_LOCK (optional bypass when RLIMIT_MEMLOCK cannot be raised).",
+    )
     return parser
 
 
@@ -1461,9 +1466,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
 
     if args.command == "docker-args":
-        sys.stdout.write(
-            f"--device={CDI_KIND}={args.device} --cap-add=IPC_LOCK --ulimit memlock=-1:-1\n"
-        )
+        flags = [f"--device={CDI_KIND}={args.device}", "--ulimit memlock=-1:-1"]
+        if args.cap_ipc_lock:
+            flags.append("--cap-add=IPC_LOCK")
+        sys.stdout.write(" ".join(flags) + "\n")
         return 0
 
     return 1

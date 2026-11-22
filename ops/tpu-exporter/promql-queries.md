@@ -55,8 +55,8 @@ max by (cluster, generation, node, pci_bdf) (
   freetpu_tpu_duty_cycle_percent{collector_role=~"node|workload"}
 )
 
-# Average cluster MXU utilization by TPU generation
-avg by (generation) (
+# Average cluster MXU utilization by cluster and TPU generation
+avg by (cluster, generation) (
   max by (cluster, generation, node, pci_bdf) (
     freetpu_tpu_duty_cycle_percent{collector_role=~"node|workload"}
   )

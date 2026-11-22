@@ -467,8 +467,17 @@ class FreeTpuCdiTests(unittest.TestCase):
             text=True,
         )
         self.assertIn("--device=freetpu.dev/tpu=group-0", res.stdout)
-        self.assertIn("--cap-add=IPC_LOCK", res.stdout)
         self.assertIn("--ulimit memlock=-1:-1", res.stdout)
+        self.assertNotIn("--cap-add=IPC_LOCK", res.stdout)
+
+        res_cap = subprocess.run(
+            [sys.executable, str(script), "docker-args", "--device", "group-0", "--cap-ipc-lock"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertIn("--cap-add=IPC_LOCK", res_cap.stdout)
+        self.assertIn("--ulimit memlock=-1:-1", res_cap.stdout)
 
     def test_default_output_is_boot_scoped_and_dry_run_requires_stdout(self) -> None:
         self.assertEqual(freetpu_cdi.DEFAULT_OUTPUT_PATH, Path("/var/run/cdi/freetpu.json"))

@@ -28,10 +28,9 @@ sudo python3 ops/tpu-cdi/freetpu_cdi.py validate /var/run/cdi/freetpu.json --che
 With boot-scoped `/var/run/cdi/freetpu.json` generated (and CDI enabled in Docker, Podman, or unaffected/patched containerd `2.0.x` / `2.1.x >= 2.1.9` / `2.2.x >= 2.2.5` / `2.3.x >= 2.3.2` / `>= 2.4.0`):
 
 ```bash
-# Attach all TPU chips on the host with VFIO memlock + CAP_IPC_LOCK
+# Attach all TPU chips on the host with a sufficient VFIO memlock limit
 docker run --rm \
   --device=freetpu.dev/tpu=all \
-  --cap-add=IPC_LOCK \
   --ulimit memlock=-1:-1 \
   python:3.12-slim \
   python3 -c "import os; print(os.listdir('/dev/vfio'))"
@@ -41,7 +40,6 @@ docker run --rm \
 # (set TPU_VISIBLE_CHIPS to the host chip index corresponding to the selected VFIO group, plus single-chip bounds):
 docker run --rm \
   --device=freetpu.dev/tpu=pci-0000-00-06-0 \
-  --cap-add=IPC_LOCK \
   --ulimit memlock=-1:-1 \
   -e TPU_CHIPS_PER_HOST_BOUNDS=1,1,1 \
   -e TPU_HOST_BOUNDS=1,1,1 \
@@ -49,7 +47,7 @@ docker run --rm \
   my-jax-tpu-image:latest
 ```
 
-VFIO DMA pinning requires `CAP_IPC_LOCK` and unlimited `RLIMIT_MEMLOCK` configured **before** OCI container startup (`docker run` / `podman run`), because CNCF CDI v0.6.0 does not configure capabilities or rlimits and an OCI `createContainer` hook executes after `runc` loads process settings. Use `python3 ops/tpu-cdi/freetpu_cdi.py docker-args` to emit the required flags:
+Linux VFIO type1 DMA pinning requires a sufficient `RLIMIT_MEMLOCK` configured **before** OCI container startup (`docker run` / `podman run`), because CNCF CDI v0.6.0 does not configure rlimits or capabilities and an OCI `createContainer` hook executes after `runc` loads process settings. `--ulimit memlock=-1:-1` (or a bounded limit covering the workload's pinned DMA buffers) works without extra Linux capabilities; `--cap-add=IPC_LOCK` is only needed as an optional bypass (`docker-args --cap-ipc-lock`) when the runtime cannot raise `RLIMIT_MEMLOCK`. Use `python3 ops/tpu-cdi/freetpu_cdi.py docker-args` to emit the recommended flags:
 
 ```bash
 docker run --rm \
@@ -62,7 +60,7 @@ Note on IOMMU groups & stable selectors: single-chip selectors use stable PCI BD
 
 ## Kubernetes Manifests
 
-> **Prerequisite (GKE Standard / self-managed clusters only):** The node DaemonSets below require `hostPath` mounts (`/sys/...`, `/dev/vfio`, `/var/run/cdi`) and `hostPID` + `SYS_PTRACE` for host-level PID telemetry. They require **GKE Standard** (or a self-managed Kubernetes cluster) and are **not** compatible with **GKE Autopilot**, whose admission policy blocks `hostPath` volumes and `hostPID`. On GKE Autopilot, use workload-side `tpu_exporter.py --no-pid-scan` telemetry (sharing `127.0.0.1:8431` with `libtpu`) instead of host DaemonSets.
+> **Prerequisite (GKE Standard / self-managed clusters only):** The node DaemonSets below require `hostPath` mounts (`/sys/...`, `/dev/vfio`, `/var/run/cdi`). They require **GKE Standard** (or a self-managed Kubernetes cluster) and are **not** compatible with **GKE Autopilot**, whose admission policy blocks `hostPath` volumes. On GKE Autopilot, use workload-side `tpu_exporter.py --no-pid-scan` telemetry (sharing `127.0.0.1:8431` with `libtpu`) instead of host DaemonSets.
 
 First create the `freetpu-ops-scripts` ConfigMap in `kube-system`:
 
@@ -73,4 +71,4 @@ kubectl -n kube-system create configmap freetpu-ops-scripts \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
 
-- [manifests/k8s-tpu-cdi-daemonset.yaml](manifests/k8s-tpu-cdi-daemonset.yaml) — Node-level DaemonSets targeting VFIO-backed GKE TPU node pools (`tpu-v5-lite-device`, `tpu-v5-lite-podslice`, `tpu-v5p-slice`, `tpu-v6e-slice`): `freetpu-node-agent` runs by default to serve **PCI/VFIO inventory (`vfio_group_exclusive`) + hostPID active-PID metrics only** on `:9400/metrics` (with `SYS_PTRACE` + `appArmorProfile.type: Unconfined` for GKE host `/proc/<pid>/fd` reads and isolated loopback liveness/readiness probes on `127.0.0.1:9401`, without publishing CDI specs), plus a `NetworkPolicy` (`freetpu-node-agent-metrics`) restricting `:9400` ingress strictly to the trusted `monitoring` Prometheus scraper (pair with admission controls forbidding tenant `hostNetwork: true` pods or an authenticating proxy like `kube-rbac-proxy`, because Kubernetes `NetworkPolicy` allows same-node traffic); a separate opt-in `freetpu-cdi-sync` DaemonSet (`--unlink-on-exit`) publishes boot-scoped `/var/run/cdi/freetpu.json` ONLY on nodes explicitly labeled `freetpu.dev/cdi-enabled=true` after verifying containerd is not an affected CVE-2026-53492 release (upstream affected: `2.1.0–2.1.8`, `2.2.0–2.2.4`, `2.3.0–2.3.1`; fixed in `2.1.9`, `2.2.5`, `2.3.2`, `>= 2.4.0`; upstream `2.0.x` lacks the affected checkpoint-restore path, though vendor/GKE builds should still be verified for backports) or blocking untrusted checkpoint restores. For Kubernetes DRA scheduling, pair the published CDI specs with a cluster DRA driver registered for `freetpu.dev` (and on GKE, coordinate exclusive chip ownership or use a dedicated TPU pool without `google.com/tpu` scheduling).
+- [manifests/k8s-tpu-cdi-daemonset.yaml](manifests/k8s-tpu-cdi-daemonset.yaml) — Node-level DaemonSets targeting VFIO-backed GKE TPU node pools (`tpu-v5-lite-device`, `tpu-v5-lite-podslice`, `tpu-v5p-slice`, `tpu-v6e-slice`): `freetpu-node-agent` runs by default with `--no-pid-scan --tpu-info-bin ""` (no `hostPID`, no `CAP_SYS_PTRACE`, no `Unconfined` AppArmor) to serve **PCI/VFIO hardware inventory (`vfio_group_exclusive`) and VFIO readiness only** on `:9400/metrics` (with isolated loopback liveness/readiness probes on `127.0.0.1:9401`, without publishing CDI specs), plus a `NetworkPolicy` (`freetpu-node-agent-metrics`) restricting `:9400` ingress to the trusted `monitoring` Prometheus scraper. Because GKE Standard accepts `NetworkPolicy` objects even when policy enforcement is disabled, host PID telemetry (`freetpu_tpu_active_pids`) is an explicit opt-in: enable `hostPID: true`, `CAP_SYS_PTRACE`, `appArmorProfile.type: Unconfined` (on GKE), and remove `--no-pid-scan` only on clusters with verified NetworkPolicy enforcement (paired with admission controls forbidding tenant `hostNetwork: true` pods) or with `--host 127.0.0.1` fronted by an authenticating proxy such as `kube-rbac-proxy`. A separate opt-in `freetpu-cdi-sync` DaemonSet (`--unlink-on-exit`) publishes boot-scoped `/var/run/cdi/freetpu.json` ONLY on nodes explicitly labeled `freetpu.dev/cdi-enabled=true` after verifying containerd is not an affected CVE-2026-53492 release (upstream affected: `2.1.0–2.1.8`, `2.2.0–2.2.4`, `2.3.0–2.3.1`; fixed in `2.1.9`, `2.2.5`, `2.3.2`, `>= 2.4.0`; upstream `2.0.x` lacks the affected checkpoint-restore path, though vendor/GKE builds should still be verified for backports) or blocking untrusted checkpoint restores. For Kubernetes DRA scheduling, pair the published CDI specs with a cluster DRA driver registered for `freetpu.dev` (and on GKE, coordinate exclusive chip ownership or use a dedicated TPU pool without `google.com/tpu` scheduling).

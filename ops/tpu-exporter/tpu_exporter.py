@@ -26,6 +26,7 @@ import importlib.util
 import inspect
 import io
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -74,10 +75,10 @@ _UNIT_MULTIPLIERS: Dict[str, int] = {
 }
 
 _MEM_PAIR_RE = re.compile(
-    r"([0-9]+(?:\.[0-9]+)?)\s*([KMGT]?i?B)\s*/\s*([0-9]+(?:\.[0-9]+)?)\s*([KMGT]?i?B)",
+    r"(?<![0-9A-Za-z._+-])([+-]?[0-9]+(?:\.[0-9]+)?)\s*([KMGT]?i?B)\s*/\s*([+-]?[0-9]+(?:\.[0-9]+)?)\s*([KMGT]?i?B)",
     re.IGNORECASE,
 )
-_PCT_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*%")
+_PCT_RE = re.compile(r"(?<![0-9A-Za-z._+-])([+-]?[0-9]+(?:\.[0-9]+)?)\s*%")
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
 
@@ -537,10 +538,15 @@ def parse_tpu_info_output(output: str) -> Dict[str, _TpuInfoRow]:
             mem_match = _MEM_PAIR_RE.search(mem_text)
             pct_match = _PCT_RE.search(duty_text)
             if mem_match:
-                row.hbm_used_bytes = _parse_bytes(mem_match.group(1), mem_match.group(2))
-                row.hbm_total_bytes = _parse_bytes(mem_match.group(3), mem_match.group(4))
+                used_bytes = _parse_bytes(mem_match.group(1), mem_match.group(2))
+                total_bytes = _parse_bytes(mem_match.group(3), mem_match.group(4))
+                if used_bytes >= 0 and total_bytes > 0:
+                    row.hbm_used_bytes = used_bytes
+                    row.hbm_total_bytes = total_bytes
             if pct_match:
-                row.duty_cycle_percent = float(pct_match.group(1))
+                pct_val = float(pct_match.group(1))
+                if math.isfinite(pct_val) and pct_val >= 0.0:
+                    row.duty_cycle_percent = pct_val
         elif section == "device_status":
             row = rows.setdefault(chip_key, _TpuInfoRow(chip_key=chip_key))
             row.in_util_table = True
@@ -549,12 +555,17 @@ def parse_tpu_info_output(output: str) -> Dict[str, _TpuInfoRow]:
             if mem_idx < len(cells):
                 mem_match = _MEM_PAIR_RE.search(cells[mem_idx])
                 if mem_match:
-                    row.hbm_used_bytes = _parse_bytes(mem_match.group(1), mem_match.group(2))
-                    row.hbm_total_bytes = _parse_bytes(mem_match.group(3), mem_match.group(4))
+                    used_bytes = _parse_bytes(mem_match.group(1), mem_match.group(2))
+                    total_bytes = _parse_bytes(mem_match.group(3), mem_match.group(4))
+                    if used_bytes >= 0 and total_bytes > 0:
+                        row.hbm_used_bytes = used_bytes
+                        row.hbm_total_bytes = total_bytes
             if duty_idx < len(cells):
                 pct_match = _PCT_RE.search(cells[duty_idx])
                 if pct_match:
-                    row.duty_cycle_percent = float(pct_match.group(1))
+                    pct_val = float(pct_match.group(1))
+                    if math.isfinite(pct_val) and pct_val >= 0.0:
+                        row.duty_cycle_percent = pct_val
         elif section == "chips":
             row = rows.setdefault(chip_key, _TpuInfoRow(chip_key=chip_key))
             row.in_chips_table = True
