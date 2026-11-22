@@ -132,7 +132,7 @@ adb -s <node1_serial> shell "su -c 'OPENBUENOS_DIVE_INTERP_PATH=/data/local/tmp/
 
 | Transport Path | Observed `16 KB–64 KB` RTT / Hop | Throughput Regime | Notes |
 | --- | --- | --- | --- |
-| **Loopback TCP (`127.0.0.1`)** | `~20–45 us` 1-way (`~40–90 us` RTT) | `~1–3 GB/s` | Baseline software stack floor |
+| **Loopback TCP (`127.0.0.1`)** | `~20–45 us` half-RTT est. (`~40–90 us` RTT) | `~1–3 GB/s` | Baseline software stack floor (ping-pong `RTT / 2` estimate) |
 | **Loopback `ggml-rpc` (`rango`)** | `512–1,774 us` RPC RTT | — | `pp128 = 45.50 t/s` (`Qwen2.5-1.5B-Q8_0`) |
 | **USB 2.0 ADB Double-Hop Bridge** | `5,159–10,874 us` RPC RTT | `<40 MB/s` | Bottlenecked by USB 2.0 hub + ADB relay |
 | **USB-C 2.5GbE Direct Ethernet** | `<500 us` target | `~0.25–0.30 GB/s` | `0.3125 GB/s` raw line-rate ceiling (half-duplex ping-pong) |

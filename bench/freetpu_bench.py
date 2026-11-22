@@ -101,13 +101,18 @@ class ReferenceBaseline:
     verified_decode_label: Optional[str] = None
 
 
+def _gib_to_decimal_gb(gib: float) -> float:
+    """Convert a GiB capacity (2^30 bytes) to decimal GB (10^9 bytes) to match `--model-gb`."""
+    return (gib * (1024**3)) / 1e9
+
+
 PUBLISHED_BASELINES: Tuple[ReferenceBaseline, ...] = (
     ReferenceBaseline(
         target_id="pixel_tensor_g5",
         display_name="Pixel Tensor G5 (buenos_a0)",
         status="published-reference",
         memory_spec="15.6 GiB LPDDR (unified)",
-        memory_gb=16.75,  # 15.6 GiB in decimal GB (matching --model-gb)
+        memory_gb=_gib_to_decimal_gb(15.6),
         peak_bf16_tflops=None,
         peak_int8_tops=None,
         measured_bf16_tflops=None,
@@ -125,8 +130,8 @@ PUBLISHED_BASELINES: Tuple[ReferenceBaseline, ...] = (
         target_id="cloud_tpu_v5e_1",
         display_name="Cloud TPU v5e-1",
         status="published-reference",
-        memory_spec="16 GB HBM2e",
-        memory_gb=16.0,
+        memory_spec="16 GiB HBM2e",
+        memory_gb=_gib_to_decimal_gb(16.0),
         peak_bf16_tflops=197.0,
         peak_int8_tops=394.0,
         measured_bf16_tflops=179.36,
@@ -144,8 +149,8 @@ PUBLISHED_BASELINES: Tuple[ReferenceBaseline, ...] = (
         target_id="cloud_tpu_v6e_1",
         display_name="Cloud TPU v6e-1 (Trillium)",
         status="published-reference",
-        memory_spec="32 GB HBM2e",
-        memory_gb=32.0,
+        memory_spec="31.25 GiB HBM2e (32 GiB)",
+        memory_gb=_gib_to_decimal_gb(31.25),
         peak_bf16_tflops=918.0,
         peak_int8_tops=1836.0,
         measured_bf16_tflops=None,
@@ -163,8 +168,8 @@ PUBLISHED_BASELINES: Tuple[ReferenceBaseline, ...] = (
         target_id="nvidia_h100_sxm",
         display_name="NVIDIA H100 SXM",
         status="published-reference",
-        memory_spec="80 GB HBM3",
-        memory_gb=80.0,
+        memory_spec="80 GiB HBM3",
+        memory_gb=_gib_to_decimal_gb(80.0),
         peak_bf16_tflops=989.0,
         peak_int8_tops=1979.0,
         measured_bf16_tflops=None,
@@ -182,8 +187,8 @@ PUBLISHED_BASELINES: Tuple[ReferenceBaseline, ...] = (
         target_id="nvidia_rtx_5090",
         display_name="NVIDIA RTX 5090",
         status="published-reference",
-        memory_spec="32 GB GDDR7",
-        memory_gb=32.0,
+        memory_spec="32 GiB GDDR7",
+        memory_gb=_gib_to_decimal_gb(32.0),
         peak_bf16_tflops=209.5,
         peak_int8_tops=838.0,
         measured_bf16_tflops=None,
@@ -584,7 +589,7 @@ def run_comms_suite(
     port: int = 0,
     quick: bool = False,
 ) -> Dict[str, Any]:
-    """Measure PP/MoE activation-hop RTT, 1-way hop latency, and throughput."""
+    """Measure PP/MoE activation-hop RTT, half-RTT ping-pong estimate, and throughput."""
     payload_sizes = (
         [16 * 1024, 64 * 1024]
         if quick
@@ -632,14 +637,16 @@ def run_comms_suite(
                     rtt_us.append((time.perf_counter_ns() - t0) / 1e3)
 
                 st_rtt = _stats_summary(rtt_us)
-                one_way_med_us = st_rtt["median_us"] / 2.0
+                # Ping-pong echo includes server turnaround and both directions, so RTT/2
+                # is a half-RTT estimate rather than a measured directional one-way latency.
+                half_rtt_med_us = st_rtt["median_us"] / 2.0
                 # Ping-pong transfers `2 * size` bytes per RTT.
                 bidir_gbps = ((2.0 * size) / max(st_rtt["median_us"] * 1e-6, 1e-9)) / 1e9
                 peak_bidir_gbps = ((2.0 * size) / max(st_rtt["min_us"] * 1e-6, 1e-9)) / 1e9
                 cases.append({
                     "payload_bytes": size,
                     "payload_label": f"{size // 1024} KB" if size < 1024 * 1024 else f"{size // (1024 * 1024)} MB",
-                    "one_way_median_us": round(one_way_med_us, 3),
+                    "half_rtt_median_us": round(half_rtt_med_us, 3),
                     "rtt_min_us": st_rtt["min_us"],
                     "rtt_median_us": st_rtt["median_us"],
                     "rtt_p95_us": st_rtt["p95_us"],
@@ -654,14 +661,18 @@ def run_comms_suite(
         if srv is not None:
             srv.close()
 
-    small_hop = cases[0]["one_way_median_us"] if cases else None
+    small_half_rtt = cases[0]["half_rtt_median_us"] if cases else None
     peak_gbps = max((c["peak_gbps"] for c in cases), default=0.0)
     return {
         "status": "measured",
         "host_platform": f"{platform.system()}-{platform.machine()}",
         "transport": transport,
         "target": f"{host}:{port}",
-        "hop_floor_us": small_hop,
+        "half_rtt_floor_us": small_half_rtt,
+        "latency_basis": (
+            "half-RTT ping-pong estimate (RTT/2; includes server turnaround and both directions, "
+            "not measured directional one-way latency)"
+        ),
         "peak_gbps": round(peak_gbps, 3),
         "cases": cases,
     }
@@ -1131,10 +1142,16 @@ def _format_colab_recovery_hint(
             f"(could belong to this run or another concurrent workload on the same account); "
             f"inspect `{sessions_cmd}` and Colab Runtime -> Manage sessions to confirm ownership before terminating any runtime."
         )
-    if mapped_leaked or (not orphaned_endpoints and not unattributed_endpoints):
+    if mapped_leaked:
         parts.append(
             f"Session config preserved at {iso_cfg}; retry `{stop_cmd}` "
             f"(or inspect Colab Runtime -> Manage sessions) and verify with `{sessions_cmd}`."
+        )
+    elif not orphaned_endpoints and not unattributed_endpoints:
+        parts.append(
+            f"Allocation/teardown outcome could not be confirmed (a runtime may still be provisioning); "
+            f"session config preserved at {iso_cfg}. Re-check `{sessions_cmd}` (and Colab Runtime -> "
+            f"Manage sessions) after provisioning settles, and retry `{stop_cmd}` if `{session_name}` appears."
         )
     return " ".join(parts)
 
@@ -1273,11 +1290,14 @@ def _verify_and_stop_session(
         or session_was_ready
     )
     if not needs_stop:
-        if new_unattributed and not definitive_refusal:
-            # Ambiguous allocation failure (e.g. ReadTimeout or HTTP 503) followed by a new `[?]`
-            # assignment: server may have allocated a runtime before the client error.
+        if not definitive_refusal:
+            # Ambiguous failure (e.g. ReadTimeout, HTTP 502/503/504, connection reset, or
+            # non-refusal error before `[colab] Session READY`): even when the first `colab
+            # sessions` check shows zero new endpoints, server-side provisioning may still be
+            # in progress and appear moments later. Keep teardown unverified, preserve state,
+            # block fallback, and surface recovery guidance to re-check after provisioning settles.
             return False, observed_endpoint, [], [], sorted(new_unattributed)
-        # Definitive allocation refusal did not create a runtime for this run;
+        # Definitive allocation refusal (e.g. HTTP 412) did not create a runtime for this run;
         # keep any concurrently started `[?]` assignments unattributed so fallback is not blocked.
         return True, observed_endpoint, [], [], sorted(new_unattributed)
 
@@ -1326,6 +1346,14 @@ def _verify_and_stop_session(
 
     if not tracked_endpoints and unattributed:
         return False, observed_endpoint, [], [], sorted(unattributed)
+
+    if not tracked_endpoints and not definitive_refusal:
+        if not before_ok and stop_res.returncode != 0:
+            return False, observed_endpoint, [], [], sorted(unattributed)
+        if before_ok and not _session_still_listed(before.stdout, session_name):
+            # Neither `before` nor a local session name confirmed ownership of a stopped endpoint
+            # (e.g. interrupted while provisioning was still in flight). Keep teardown unverified.
+            return False, observed_endpoint, [], [], sorted(unattributed)
 
     if stop_res.returncode != 0 and not tracked_endpoints and pre_endpoints is None and recheck_entries:
         return False, observed_endpoint, [], [], sorted(unattributed)
@@ -1598,8 +1626,8 @@ def _compute_economics(
     weights_exceed_memory = (memory_gb is not None) and (model_gb > memory_gb)
     single_device_fits: Optional[bool] = (not weights_exceed_memory) if memory_gb is not None else None
     projection_note = (
-        f"unavailable: {model_gb:g} GB weights exceed {memory_gb:g} GB single-device memory (requires sharding/offload)"
-        if weights_exceed_memory
+        f"unavailable: {model_gb:g} GB weights exceed {memory_gb:.2f} GB single-device memory (requires sharding/offload)"
+        if weights_exceed_memory and memory_gb is not None
         else None
     )
     if hourly_cost_usd is None or hourly_cost_usd <= 0.0:
@@ -1642,6 +1670,18 @@ def _compute_economics(
     }
 
 
+def _infer_tpu_fallback_memory_gib(device_kind: str, colab_tpu: Optional[str] = None) -> Optional[float]:
+    """Return documented usable HBM capacity in GiB when JAX `memory_stats()` is unavailable."""
+    kind_low = " ".join(str(device_kind).lower().split())
+    if colab_tpu == "v6e1" or "v6e" in kind_low or "v6 lite" in kind_low or "trillium" in kind_low:
+        return 31.25
+    if colab_tpu == "v5e1" or "v5e" in kind_low or "v5 lite" in kind_low:
+        return 16.0
+    if "v5p" in kind_low or re.search(r"\bv5\b", kind_low):
+        return 95.0
+    return None
+
+
 def _infer_tpu_hourly_cost_usd(device_kind: str, colab_tpu: Optional[str] = None) -> Optional[float]:
     """Map JAX `device_kind` / Colab SKU to public GCP on-demand $/chip-hr."""
     kind_low = " ".join(str(device_kind).lower().split())
@@ -1680,12 +1720,17 @@ def build_scorecard_rows(
             inferred_cost = _infer_tpu_hourly_cost_usd(str(kind), colab_tpu)
             cost_basis = f"GCP public on-demand rate (${inferred_cost:.2f}/chip-hr)" if inferred_cost else "local/unspecified"
             mem_limit = dev_info.get("hbm_bytes_limit")
-            mem_str = f"{mem_limit / (1024**3):.2f} GiB HBM" if mem_limit else "TPU HBM"
+            fallback_gib = _infer_tpu_fallback_memory_gib(str(kind), colab_tpu)
+            mem_str = (
+                f"{mem_limit / (1024**3):.2f} GiB HBM"
+                if mem_limit
+                else (f"{fallback_gib:g} GiB HBM (spec)" if fallback_gib is not None else "TPU HBM")
+            )
             # Compare against --model-gb in matching decimal GB (reserve GiB strictly for display).
             live_mem_gb_exact: Optional[float] = (
                 (float(mem_limit) / 1e9)
                 if mem_limit
-                else (16.0 if colab_tpu == "v5e1" else (32.0 if colab_tpu == "v6e1" else None))
+                else (_gib_to_decimal_gb(fallback_gib) if fallback_gib is not None else None)
             )
             live_mem_gb: Optional[float] = round(live_mem_gb_exact, 2) if live_mem_gb_exact is not None else None
 
@@ -1716,7 +1761,7 @@ def build_scorecard_rows(
                 "bw_gbps": bw_gbps,
                 "dispatch_floor_us": f"{floor_us} us" if floor_us is not None else "—",
                 # Local TCP comms never runs on remote TPU ICI; attribute separately below.
-                "hop_latency_us": "—",
+                "half_rtt_est_us": "—",
                 "hourly_cost_usd": inferred_cost,
                 "pricing_basis": cost_basis,
                 **econ,
@@ -1728,7 +1773,7 @@ def build_scorecard_rows(
         if comms:
             comms_host = comms.get("host_platform") or host_platform
             comms_transport = comms.get("transport") or "tcp"
-            hop_us = comms.get("hop_floor_us")
+            half_rtt_us = comms.get("half_rtt_floor_us")
             econ = _compute_economics(
                 bf16_tflops=None,
                 int8_tops=None,
@@ -1747,7 +1792,7 @@ def build_scorecard_rows(
                 "int8_tops": None,
                 "bw_gbps": None,
                 "dispatch_floor_us": "—",
-                "hop_latency_us": f"{hop_us} us" if hop_us is not None else "—",
+                "half_rtt_est_us": f"{half_rtt_us} us (half-RTT est.)" if half_rtt_us is not None else "—",
                 "comms_host_platform": comms_host,
                 "comms_transport": comms_transport,
                 "comms_target": comms.get("target"),
@@ -1774,7 +1819,7 @@ def build_scorecard_rows(
         int32_ref_tops = comp.get("peak_int32_ref_tops")
         bw_gbps = bw.get("peak_triad_gbps")
         floor_us = comp.get("dispatch_floor_us")
-        hop_us = comms.get("hop_floor_us")
+        half_rtt_us = comms.get("half_rtt_floor_us")
 
         econ = _compute_economics(
             bf16_tflops=bf16_tf,
@@ -1795,7 +1840,7 @@ def build_scorecard_rows(
             "int32_ref_tops": int32_ref_tops,
             "bw_gbps": bw_gbps,
             "dispatch_floor_us": f"{floor_us} us" if floor_us is not None else "—",
-            "hop_latency_us": f"{hop_us} us" if hop_us is not None else "—",
+            "half_rtt_est_us": f"{half_rtt_us} us (half-RTT est.)" if half_rtt_us is not None else "—",
             "hourly_cost_usd": inferred_cost,
             "pricing_basis": cost_basis,
             **econ,
@@ -1827,7 +1872,7 @@ def build_scorecard_rows(
             "target": base.display_name,
             "row_type": base.status,
             "memory": base.memory_spec,
-            "memory_gb": base.memory_gb,
+            "memory_gb": round(base.memory_gb, 2),
             "bf16_tflops": bf16_ref,
             "bf16_is_measured": base.measured_bf16_tflops is not None,
             "int8_tops": int8_ref,
@@ -1835,7 +1880,7 @@ def build_scorecard_rows(
             "bw_gbps": base.bandwidth_gbps,
             "bw_basis": base.bandwidth_basis,
             "dispatch_floor_us": base.dispatch_floor_us,
-            "hop_latency_us": "60-512 us (local/USB-C)" if base.target_id == "pixel_tensor_g5" else "ICI / NVLink / PCIe",
+            "half_rtt_est_us": "60-512 us (local/USB-C)" if base.target_id == "pixel_tensor_g5" else "ICI / NVLink / PCIe",
             "hourly_cost_usd": base.hourly_cost_usd,
             "pricing_basis": base.pricing_basis,
             "source_citation": base.source_citation,
@@ -1997,14 +2042,18 @@ def render_markdown(report: Dict[str, Any]) -> str:
         lines.extend([
             f"## 4. Live `comms` Suite (`nccl-tests`-style, `{comms.get('transport')}`)",
             "",
-            "| Payload | 1-Way Hop Median (us) | RTT Median (us) | RTT p95 (us) | Median Bidir (GB/s) | Peak Bidir (GB/s) |",
+            "| Payload | Half-RTT Est. Median (us) | RTT Median (us) | RTT p95 (us) | Median Bidir (GB/s) | Peak Bidir (GB/s) |",
             "| --- | ---: | ---: | ---: | ---: | ---: |",
         ])
         for c in comms.get("cases", []):
             lines.append(
-                f"| `{c['payload_label']}` | {c['one_way_median_us']:.2f} | {c['rtt_median_us']:.2f} | {c['rtt_p95_us']:.2f} | {c['median_gbps']:.3f} | {c['peak_gbps']:.3f} |"
+                f"| `{c['payload_label']}` | {c['half_rtt_median_us']:.2f} | {c['rtt_median_us']:.2f} | {c['rtt_p95_us']:.2f} | {c['median_gbps']:.3f} | {c['peak_gbps']:.3f} |"
             )
-        lines.append("")
+        lines.extend([
+            "",
+            "> **Ping-Pong Half-RTT Note**: `Half-RTT Est.` is `RTT / 2` from the TCP send-and-echo probe (includes server turnaround and both directions; it is a ping-pong latency estimate, not a measured directional one-way latency on asymmetric links).",
+            "",
+        ])
 
     lines.extend([
         "## 5. Published Pricing & Hardware Citations",
@@ -2144,8 +2193,11 @@ def run_self_test() -> int:
 
     comms = run_comms_suite(host="127.0.0.1", port=0, quick=True)
     assert comms["status"] == "measured"
-    assert comms["hop_floor_us"] is not None and comms["hop_floor_us"] > 0
+    assert comms["half_rtt_floor_us"] is not None and comms["half_rtt_floor_us"] > 0
+    assert "half-RTT" in comms["latency_basis"]
     assert len(comms["cases"]) == 2
+    assert "half_rtt_median_us" in comms["cases"][0]
+    assert "one_way_median_us" not in comms["cases"][0]
 
     # 3. Verify scorecard + Markdown/JSON rendering + clean-room output
     report = {
@@ -2178,6 +2230,7 @@ def run_self_test() -> int:
     assert "989.00 (peak-spec)" in md and "3350.00 (peak-spec)" in md
     assert "27.96 (measured DMA)" in md and "3x eff 2-pass" in md
     assert "3x eff /" in md and "5x actual 2-pass" in md
+    assert "Half-RTT Est. Median (us)" in md and "1-Way Hop Median" not in md
     assert "Pixel Tensor G5" in md and "Cloud TPU v6e-1" in md and "NVIDIA H100 SXM" in md
 
     # 3d. Verify single-device projections are suppressed when model_gb exceeds device memory capacity
@@ -2203,31 +2256,84 @@ def run_self_test() -> int:
     big_md = render_markdown(big_report)
     assert "N/A (>mem)" in big_md
 
-    # Live v6e row with 31.25 GiB usable HBM (~33.55 decimal GB) MUST fit --model-gb 32
-    v6e_live_rows = build_scorecard_rows(
+    # Live v6e (with and without memory_stats) and v6e reference MUST agree in decimal GB (~33.55 GB for 31.25 GiB)
+    v6e_live_33 = build_scorecard_rows(
         {
             "backend": "jax_tpu",
             "device_info": {"device_kind": "TPU v6 lite", "hbm_bytes_limit": int(31.25 * 1024**3)},
             "compute": {"peak_bf16_tflops": 900.0},
             "bandwidth": {"peak_triad_gbps": 1400.0},
         },
-        model_gb=32.0,
+        model_gb=33.0,
     )
-    assert v6e_live_rows[0]["memory"] == "31.25 GiB HBM"
-    assert v6e_live_rows[0]["single_device_fits"] is True
-    assert v6e_live_rows[0]["est_decode_tok_s"] is not None and v6e_live_rows[0]["est_decode_tok_s"] > 0
-    assert v6e_live_rows[0]["usd_per_1m_tokens_model"] is not None and v6e_live_rows[0]["usd_per_1m_tokens_model"] > 0
-    v6e_over_rows = build_scorecard_rows(
+    v6e_fallback_33 = build_scorecard_rows(
+        {
+            "backend": "colab_tpu",
+            "colab_meta": {"tpu": "v6e1"},
+            "device_info": {"device_kind": "TPU v6 lite", "hbm_bytes_limit": None},
+            "compute": {"peak_bf16_tflops": 900.0},
+            "bandwidth": {"peak_triad_gbps": 1400.0},
+        },
+        model_gb=33.0,
+    )
+    v6e_ref_33 = next(r for r in v6e_live_33 if r["target"] == "Cloud TPU v6e-1 (Trillium)")
+    assert v6e_live_33[0]["memory"] == "31.25 GiB HBM"
+    assert v6e_fallback_33[0]["memory"] == "31.25 GiB HBM (spec)"
+    for v6_row in (v6e_live_33[0], v6e_fallback_33[0], v6e_ref_33):
+        assert v6_row["memory_gb"] == 33.55, v6_row
+        assert v6_row["single_device_fits"] is True, v6_row
+        assert v6_row["est_decode_tok_s"] is not None and v6_row["est_decode_tok_s"] > 0, v6_row
+        assert v6_row["usd_per_1m_tokens_model"] is not None and v6_row["usd_per_1m_tokens_model"] > 0, v6_row
+
+    v6e_live_34 = build_scorecard_rows(
         {
             "backend": "jax_tpu",
             "device_info": {"device_kind": "TPU v6 lite", "hbm_bytes_limit": int(31.25 * 1024**3)},
             "compute": {"peak_bf16_tflops": 900.0},
             "bandwidth": {"peak_triad_gbps": 1400.0},
         },
-        model_gb=35.0,
+        model_gb=34.0,
     )
-    assert v6e_over_rows[0]["single_device_fits"] is False
-    assert v6e_over_rows[0]["usd_per_1m_tokens_model"] is None
+    v6e_fallback_34 = build_scorecard_rows(
+        {
+            "backend": "colab_tpu",
+            "colab_meta": {"tpu": "v6e1"},
+            "device_info": {"device_kind": "TPU v6 lite", "hbm_bytes_limit": None},
+            "compute": {"peak_bf16_tflops": 900.0},
+            "bandwidth": {"peak_triad_gbps": 1400.0},
+        },
+        model_gb=34.0,
+    )
+    v6e_ref_34 = next(r for r in v6e_live_34 if r["target"] == "Cloud TPU v6e-1 (Trillium)")
+    for v6_row in (v6e_live_34[0], v6e_fallback_34[0], v6e_ref_34):
+        assert v6_row["single_device_fits"] is False, v6_row
+        assert v6_row["usd_per_1m_tokens_model"] is None, v6_row
+
+    # Live v5e (with and without memory_stats) and v5e reference MUST agree (~17.18 decimal GB for 16 GiB)
+    v5e_live_17 = build_scorecard_rows(
+        {
+            "backend": "jax_tpu",
+            "device_info": {"device_kind": "TPU v5 lite", "hbm_bytes_limit": 16 * 1024**3},
+            "compute": {"peak_bf16_tflops": 179.36},
+            "bandwidth": {"peak_triad_gbps": 655.55},
+        },
+        model_gb=17.0,
+    )
+    v5e_fallback_17 = build_scorecard_rows(
+        {
+            "backend": "colab_tpu",
+            "colab_meta": {"tpu": "v5e1"},
+            "device_info": {"device_kind": "TPU v5 lite", "hbm_bytes_limit": None},
+            "compute": {"peak_bf16_tflops": 179.36},
+            "bandwidth": {"peak_triad_gbps": 655.55},
+        },
+        model_gb=17.0,
+    )
+    v5e_ref_17 = next(r for r in v5e_live_17 if r["target"] == "Cloud TPU v5e-1")
+    for v5_row in (v5e_live_17[0], v5e_fallback_17[0], v5e_ref_17):
+        assert v5_row["memory_gb"] == 17.18, v5_row
+        assert v5_row["single_device_fits"] is True, v5_row
+        assert v5_row["usd_per_1m_tokens_model"] is not None, v5_row
 
     # 3a. Verify colab_tpu scorecard never attaches local TCP comms to a Cloud TPU row
     colab_comms_only = build_scorecard_rows({
@@ -2241,7 +2347,7 @@ def run_self_test() -> int:
     assert "Cloud TPU" not in measured_comms_only[0]["target"]
     assert measured_comms_only[0]["memory"] == "host RAM"
     assert measured_comms_only[0]["comms_transport"] == "tcp_loopback"
-    assert measured_comms_only[0]["hop_latency_us"] == f"{comms['hop_floor_us']} us"
+    assert measured_comms_only[0]["half_rtt_est_us"] == f"{comms['half_rtt_floor_us']} us (half-RTT est.)"
 
     colab_all_rows = build_scorecard_rows({
         "backend": "colab_tpu",
@@ -2254,9 +2360,9 @@ def run_self_test() -> int:
     measured_all = [r for r in colab_all_rows if r["row_type"] == "measured"]
     assert len(measured_all) == 2
     assert "TPU v5 lite" in measured_all[0]["target"]
-    assert measured_all[0]["hop_latency_us"] == "—"
+    assert measured_all[0]["half_rtt_est_us"] == "—"
     assert "Local Host Comms" in measured_all[1]["target"]
-    assert measured_all[1]["hop_latency_us"] == f"{comms['hop_floor_us']} us"
+    assert measured_all[1]["half_rtt_est_us"] == f"{comms['half_rtt_floor_us']} us (half-RTT est.)"
 
     # 3b. Verify CLI rejects invalid economics / timeout args BEFORE running any suite or Colab
     for bad_argv in (
@@ -2921,59 +3027,106 @@ def run_self_test() -> int:
     finally:
         shutil.rmtree(oauth_dir, ignore_errors=True)
 
-    # 4m. Ambiguous allocation failure (ReadTimeout / HTTP 503) followed by new `[?]` entry MUST
-    # keep teardown_verified=False, block v5e fallback, and surface inspect-and-confirm recovery hint
-    for ambig_err_msg in ("ReadTimeout: read timed out waiting for assign", "HTTP 503 Service Unavailable"):
-        ambig_calls: List[List[str]] = []
-        ambig_state: Dict[str, Any] = {"tried": False, "cfg": None}
+    # 4m. Ambiguous allocation failure (ReadTimeout / HTTP 503) MUST keep teardown_verified=False,
+    # block v5e fallback, preserve temp state, and surface recovery guidance BOTH when a new `[?]`
+    # entry appears immediately AND when the first `colab sessions` check is still empty!
+    for post_sessions_mode in ("new_unattributed", "empty"):
+        for ambig_err_msg in ("ReadTimeout: read timed out waiting for assign", "HTTP 503 Service Unavailable"):
+            ambig_calls: List[List[str]] = []
+            ambig_state: Dict[str, Any] = {"tried": False, "cfg": None}
 
-        def _mock_ambig_runner(
-            cmd: Sequence[str], _msg: str = ambig_err_msg
-        ) -> subprocess.CompletedProcess[str]:
-            ambig_calls.append(list(cmd))
-            if "--config" in cmd:
-                ambig_state["cfg"] = cmd[cmd.index("--config") + 1]
-            if cmd[-1] == "version":
-                return subprocess.CompletedProcess(cmd, 0, "Version: 0.8.0\n", "")
-            if "usage" in cmd:
-                return subprocess.CompletedProcess(cmd, 0, "100.0\n", "")
-            if "sessions" in cmd:
-                if ambig_state["tried"]:
-                    return subprocess.CompletedProcess(
-                        cmd,
-                        0,
-                        "[?] m-s-ambig-timeout | Hardware: V6E1 | Shape: Standard | Variant: TPU\n",
-                        "",
+            def _mock_ambig_runner(
+                cmd: Sequence[str],
+                _msg: str = ambig_err_msg,
+                _mode: str = post_sessions_mode,
+            ) -> subprocess.CompletedProcess[str]:
+                ambig_calls.append(list(cmd))
+                if "--config" in cmd:
+                    ambig_state["cfg"] = cmd[cmd.index("--config") + 1]
+                if cmd[-1] == "version":
+                    return subprocess.CompletedProcess(cmd, 0, "Version: 0.8.0\n", "")
+                if "usage" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, "100.0\n", "")
+                if "sessions" in cmd:
+                    if ambig_state["tried"] and _mode == "new_unattributed":
+                        return subprocess.CompletedProcess(
+                            cmd,
+                            0,
+                            "[?] m-s-ambig-timeout | Hardware: V6E1 | Shape: Standard | Variant: TPU\n",
+                            "",
+                        )
+                    return subprocess.CompletedProcess(cmd, 0, "[colab] No active sessions found on server.\n", "")
+                if "V6E1" in cmd:
+                    ambig_state["tried"] = True
+                    return subprocess.CompletedProcess(cmd, 1, "", _msg)
+                raise AssertionError(f"Must NOT fall back to v5e1 after ambiguous failure: {cmd}")
+
+            ambig_err = StringIO()
+            try:
+                with redirect_stderr(ambig_err):
+                    run_colab_tpu_suites(
+                        suites=["compute"],
+                        quick=True,
+                        colab_bin="colab",
+                        auth="adc",
+                        tpu_order=("v6e1", "v5e1"),
+                        config_path=None,
+                        timeout_s=120.0,
+                        runner=_mock_ambig_runner,
                     )
-                return subprocess.CompletedProcess(cmd, 0, "[colab] No active sessions found on server.\n", "")
-            if "V6E1" in cmd:
-                ambig_state["tried"] = True
-                return subprocess.CompletedProcess(cmd, 1, "", _msg)
-            raise AssertionError(f"Must NOT fall back to v5e1 after ambiguous failure: {cmd}")
+            except RuntimeError as exc:
+                assert "teardown_verified=False" in str(exc), str(exc)
+            else:  # pragma: no cover
+                raise AssertionError("Expected RuntimeError after ambiguous allocation failure")
+            assert not any("V5E1" in c for c in ambig_calls)
+            err_txt = ambig_err.getvalue()
+            if post_sessions_mode == "new_unattributed":
+                assert "m-s-ambig-timeout" in err_txt and "confirm ownership before" in err_txt, err_txt
+            else:
+                assert "still be provisioning" in err_txt and "Re-check" in err_txt, err_txt
+            ambig_cfg = Path(str(ambig_state["cfg"]))
+            assert ambig_cfg.parent.is_dir()
+            shutil.rmtree(ambig_cfg.parent, ignore_errors=True)
 
-        ambig_err = StringIO()
-        try:
-            with redirect_stderr(ambig_err):
-                run_colab_tpu_suites(
-                    suites=["compute"],
-                    quick=True,
-                    colab_bin="colab",
-                    auth="adc",
-                    tpu_order=("v6e1", "v5e1"),
-                    config_path=None,
-                    timeout_s=120.0,
-                    runner=_mock_ambig_runner,
-                )
-        except RuntimeError as exc:
-            assert "teardown_verified=False" in str(exc), str(exc)
-        else:  # pragma: no cover
-            raise AssertionError("Expected RuntimeError after ambiguous allocation failure")
-        assert not any("V5E1" in c for c in ambig_calls)
-        assert "m-s-ambig-timeout" in ambig_err.getvalue()
-        assert "confirm ownership before" in ambig_err.getvalue()
-        ambig_cfg = Path(str(ambig_state["cfg"]))
-        assert ambig_cfg.parent.is_dir()
-        shutil.rmtree(ambig_cfg.parent, ignore_errors=True)
+    # 4m2. Interrupt during allocation with empty `colab sessions` MUST keep teardown_verified=False
+    ki_empty_state: Dict[str, Any] = {"cfg": None}
+
+    def _mock_ki_empty_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if "--config" in cmd:
+            ki_empty_state["cfg"] = cmd[cmd.index("--config") + 1]
+        if cmd[-1] == "version":
+            return subprocess.CompletedProcess(cmd, 0, "Version: 0.8.0\n", "")
+        if "usage" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "100.0\n", "")
+        if "run" in cmd:
+            raise KeyboardInterrupt()
+        if "stop" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "[colab] Session not found.\n", "")
+        if "sessions" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "[colab] No active sessions found on server.\n", "")
+        raise AssertionError(f"Unexpected cmd: {cmd}")
+
+    ki_empty_err = StringIO()
+    try:
+        with redirect_stderr(ki_empty_err):
+            run_colab_tpu_suites(
+                suites=["compute"],
+                quick=True,
+                colab_bin="colab",
+                auth="adc",
+                tpu_order=("v6e1",),
+                config_path=None,
+                timeout_s=120.0,
+                runner=_mock_ki_empty_runner,
+            )
+    except KeyboardInterrupt:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError("Expected KeyboardInterrupt to propagate")
+    assert "still be provisioning" in ki_empty_err.getvalue()
+    ki_empty_cfg = Path(str(ki_empty_state["cfg"]))
+    assert ki_empty_cfg.parent.is_dir()
+    shutil.rmtree(ki_empty_cfg.parent, ignore_errors=True)
 
     # 4n. Hung `colab run` (e.g. kernel init stall) MUST hit host-side deadline and run teardown
     hang_dir = Path(tempfile.mkdtemp(prefix="freetpu-bench-hang-"))
