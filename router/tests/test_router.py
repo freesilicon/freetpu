@@ -80,6 +80,7 @@ class _MockOpenAIBackend(ThreadingHTTPServer):
         oversized_non_stream_bytes: Optional[int] = None,
         oversized_non_stream_chunked: bool = False,
         slow_drip_non_stream_interval_s: Optional[float] = None,
+        truncate_fixed_length_response: bool = False,
         prompt_tokens: int = 12,
         completion_tokens: int = 8,
     ) -> None:
@@ -103,6 +104,7 @@ class _MockOpenAIBackend(ThreadingHTTPServer):
         self.oversized_non_stream_bytes = oversized_non_stream_bytes
         self.oversized_non_stream_chunked = oversized_non_stream_chunked
         self.slow_drip_non_stream_interval_s = slow_drip_non_stream_interval_s
+        self.truncate_fixed_length_response = truncate_fixed_length_response
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
         self.requests_seen: List[Dict[str, Any]] = []
@@ -395,6 +397,19 @@ class _MockOpenAIHandler(BaseHTTPRequestHandler):
                     },
                 },
             )
+            return
+
+        if self.server.truncate_fixed_length_response:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", "200")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                self.wfile.write(b'{"id":"chatcmpl-trun')
+                self.wfile.flush()
+            except OSError:
+                pass
             return
 
         if self.server.slow_drip_non_stream_interval_s is not None:
@@ -4479,6 +4494,175 @@ class TestFreeTPURouter(unittest.TestCase):
         self.assertTrue(captured[1].stream)
         self.assertEqual(captured[2].status_code, 400)
         self.assertFalse(captured[2].stream)
+
+    def test_truncated_fixed_length_upstream_response_fails_over_to_backup(self) -> None:
+        primary = self._track(
+            _MockOpenAIBackend(
+                "trunc-primary",
+                ["m-trunc-fixed"],
+                truncate_fixed_length_response=True,
+            )
+        )
+        backup = self._track(_MockOpenAIBackend("healthy-backup", ["m-trunc-fixed"]))
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            backends=[
+                BackendConfig(
+                    id="trunc-primary",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=primary.base_url,
+                ),
+                BackendConfig(
+                    id="healthy-backup",
+                    type="cloud-tpu-v5e",
+                    local=False,
+                    base_url=backup.base_url,
+                ),
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        status, hdrs, body = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-trunc-fixed",
+                "messages": [{"role": "user", "content": "check truncation failover"}],
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(hdrs["x-freetpu-backend"], "healthy-backup")
+        self.assertEqual(hdrs["x-freetpu-failovers"], "1")
+        self.assertIn("reply-from:healthy-backup", body.decode("utf-8"))
+        self.assertEqual(router.engine._backends[0].inflight, 0)
+        self.assertGreater(
+            router.engine._backends[0].cooldown_until_monotonic,
+            time.monotonic(),
+        )
+
+    def test_probe_and_exporter_enforce_deadline_while_reading_slow_drip_headers(
+        self,
+    ) -> None:
+        srv = socket.create_server(("127.0.0.1", 0))
+        srv.settimeout(3.0)
+        port = srv.getsockname()[1]
+        stop_evt = threading.Event()
+
+        def serve_trickle_headers() -> None:
+            while not stop_evt.is_set():
+                try:
+                    client, _ = srv.accept()
+                except OSError:
+                    break
+
+                def handle_one(c: socket.socket) -> None:
+                    try:
+                        c.settimeout(1.0)
+                        c.recv(4096)
+                        c.sendall(b"HTTP/1.1 200 OK\r\n")
+                        deadline = time.monotonic() + 3.0
+                        idx = 0
+                        while not stop_evt.is_set() and time.monotonic() < deadline:
+                            c.sendall(f"X-Slow-Hdr-{idx}: val\r\n".encode("ascii"))
+                            idx += 1
+                            time.sleep(0.05)
+                    except OSError:
+                        pass
+                    finally:
+                        try:
+                            c.close()
+                        except OSError:
+                            pass
+
+                threading.Thread(target=handle_one, args=(client,), daemon=True).start()
+
+        server_thread = threading.Thread(target=serve_trickle_headers, daemon=True)
+        server_thread.start()
+        try:
+            # 1. TPU exporter scrape aborts strictly at elapsed deadline during slow headers.
+            t0 = time.monotonic()
+            telem = scrape_tpu_exporter(
+                f"http://127.0.0.1:{port}/metrics", timeout_s=0.25
+            )
+            elapsed_exp = time.monotonic() - t0
+            self.assertFalse(telem.reachable)
+            self.assertLess(elapsed_exp, 1.0)
+
+            # 2. Backend HTTP probe also aborts strictly at elapsed deadline during slow headers.
+            cfg = RouterConfig(
+                host="127.0.0.1",
+                port=0,
+                probe_timeout_s=0.25,
+                backends=[
+                    BackendConfig(
+                        id="slow-hdr-backend",
+                        base_url=f"http://127.0.0.1:{port}/v1",
+                        models=["m-slow-hdr"],
+                    )
+                ],
+            )
+            t1 = time.monotonic()
+            router = self._track(create_router_server(cfg, probe_on_start=True))
+            elapsed_probe = time.monotonic() - t1
+            self.assertFalse(router.engine._backends[0].healthy)
+            self.assertLess(elapsed_probe, 1.0)
+        finally:
+            stop_evt.set()
+            srv.close()
+
+    def test_invalid_backend_and_exporter_url_ports_rejected(self) -> None:
+        bad_urls = (
+            "http://127.0.0.1:99999/v1",
+            "http://127.0.0.1:0/v1",
+            "http://127.0.0.1:abc/v1",
+            "http://user:topsecret@127.0.0.1:99999/v1",
+        )
+        for bad_url in bad_urls:
+            with self.assertRaises(ValueError) as ctx_b:
+                BackendConfig(id="bad-port-b", base_url=bad_url)
+            self.assertNotIn("topsecret", str(ctx_b.exception))
+
+            with self.assertRaises(ValueError) as ctx_e:
+                BackendConfig(
+                    id="bad-port-e",
+                    base_url="http://127.0.0.1:8081/v1",
+                    tpu_exporter_url=bad_url,
+                )
+            self.assertNotIn("topsecret", str(ctx_e.exception))
+
+        # Direct scrape_tpu_exporter call with invalid port fails closed without uncaught ValueError.
+        bad_telem = scrape_tpu_exporter("http://127.0.0.1:99999/metrics", timeout_s=0.5)
+        self.assertFalse(bad_telem.reachable)
+        self.assertIn("port", (bad_telem.error or "").lower())
+
+        # --check-config rejects invalid backend/exporter ports before runtime startup.
+        bad_cfg_path = Path(self._tmpdir.name) / "bad_url_port.json"
+        bad_cfg_path.write_text(
+            json.dumps(
+                {
+                    "backends": [
+                        {
+                            "id": "bad-port-cli",
+                            "base_url": "http://127.0.0.1:8081/v1",
+                            "tpu_exporter_url": "http://user:topsecret@127.0.0.1:70000/metrics",
+                            "models": ["m1"],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        stderr_buf = io.StringIO()
+        with redirect_stderr(stderr_buf):
+            rc = router_main(["--check-config", "--config", str(bad_cfg_path)])
+        self.assertNotEqual(rc, 0)
+        self.assertIn("port", stderr_buf.getvalue().lower())
+        self.assertNotIn("topsecret", stderr_buf.getvalue())
 
 
 def run_self_tests(verbosity: int = 1) -> int:

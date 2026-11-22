@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import http.client
+import io
 import math
 import re
 import ssl
@@ -229,6 +230,91 @@ def evaluate_tpu_readiness(
 MAX_EXPORTER_RESPONSE_BYTES = 2 * 1024 * 1024
 
 
+class _DeadlineSocketIO(io.RawIOBase):
+    """Raw socket reader that enforces an elapsed monotonic deadline on every read."""
+
+    def __init__(self, wrapper: "DeadlineSocket") -> None:
+        self._wrapper = wrapper
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, b: Any) -> int:
+        if self.closed:
+            raise ValueError("I/O operation on closed file.")
+        deadline = self._wrapper.deadline
+        if deadline is not None:
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                raise TimeoutError(f"{self._wrapper.label} exceeded elapsed deadline")
+            self._wrapper._sock.settimeout(rem)
+        return self._wrapper._sock.recv_into(b)
+
+    def close(self) -> None:
+        if not self.closed:
+            super().close()
+            self._wrapper._decref_io()
+
+
+class DeadlineSocket:
+    """Socket wrapper enforcing an elapsed wall-clock deadline across HTTP header and body reads."""
+
+    def __init__(
+        self,
+        sock: Any,
+        deadline: Optional[float],
+        *,
+        label: str = "HTTP response",
+    ) -> None:
+        self._sock = sock
+        self.deadline = deadline
+        self.label = label
+        self._io_refs = 0
+        self._closed = False
+
+    def makefile(
+        self,
+        mode: str = "r",
+        buffering: Optional[int] = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        if "b" in mode and "r" in mode and "w" not in mode and "+" not in mode:
+            self._io_refs += 1
+            raw = _DeadlineSocketIO(self)
+            buf_size = (
+                buffering
+                if (isinstance(buffering, int) and buffering > 0)
+                else io.DEFAULT_BUFFER_SIZE
+            )
+            return io.BufferedReader(raw, buffer_size=buf_size)
+        return self._sock.makefile(mode, buffering, *args, **kwargs)
+
+    def settimeout(self, timeout: Optional[float]) -> None:
+        if self.deadline is not None:
+            rem = self.deadline - time.monotonic()
+            if rem <= 0:
+                raise TimeoutError(f"{self.label} exceeded elapsed deadline")
+            effective = min(timeout, rem) if timeout is not None else rem
+            self._sock.settimeout(effective)
+        else:
+            self._sock.settimeout(timeout)
+
+    def _decref_io(self) -> None:
+        if self._io_refs > 0:
+            self._io_refs -= 1
+        if self._io_refs == 0 and self._closed:
+            self._sock.close()
+
+    def close(self) -> None:
+        self._closed = True
+        if self._io_refs <= 0:
+            self._sock.close()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._sock, name)
+
+
 def _read_bounded_http_body(
     resp: http.client.HTTPResponse,
     upstream_sock: Any,
@@ -237,6 +323,20 @@ def _read_bounded_http_body(
     max_bytes: int = MAX_EXPORTER_RESPONSE_BYTES,
 ) -> bytes:
     """Read an HTTP response body incrementally under an elapsed wall-clock deadline."""
+    declared_len: Optional[int] = None
+    if not resp.chunked:
+        raw_len = resp.getheader("Content-Length")
+        if raw_len is not None:
+            try:
+                parsed_len = int(raw_len.strip())
+            except ValueError:
+                parsed_len = -1
+            if parsed_len >= 0:
+                declared_len = parsed_len
+                if declared_len > max_bytes:
+                    raise ValueError(
+                        f"Exporter response exceeded {max_bytes} byte limit"
+                    )
     chunks: List[bytes] = []
     total = 0
     while True:
@@ -258,7 +358,13 @@ def _read_bounded_http_body(
         if total > max_bytes:
             raise ValueError(f"Exporter response exceeded {max_bytes} byte limit")
         chunks.append(chunk)
-    return b"".join(chunks)
+    raw = b"".join(chunks)
+    if not resp.chunked and resp.status not in (204, 304) and not (100 <= resp.status < 200):
+        if resp.length is not None and resp.length > 0:
+            raise http.client.IncompleteRead(raw, resp.length)
+        if declared_len is not None and len(raw) < declared_len:
+            raise http.client.IncompleteRead(raw, declared_len - len(raw))
+    return raw
 
 
 def scrape_tpu_exporter(
@@ -279,7 +385,27 @@ def scrape_tpu_exporter(
             total_chips=0,
             error=f"Invalid tpu_exporter_url: {url!r}",
         )
-    port = parsed.port or (443 if scheme == "https" else 80)
+    try:
+        parsed_port = parsed.port
+    except ValueError as exc:
+        return TpuExporterTelemetry(
+            reachable=False,
+            exporter_up=False,
+            devices_discovered=0,
+            healthy_chips=0,
+            total_chips=0,
+            error=f"Invalid tpu_exporter_url port: {exc}",
+        )
+    if parsed_port is not None and not (1 <= parsed_port <= 65535):
+        return TpuExporterTelemetry(
+            reachable=False,
+            exporter_up=False,
+            devices_discovered=0,
+            healthy_chips=0,
+            total_chips=0,
+            error=f"Invalid tpu_exporter_url port: {parsed_port}",
+        )
+    port = parsed_port or (443 if scheme == "https" else 80)
     path = parsed.path or "/metrics"
     if parsed.query:
         path = f"{path}?{parsed.query}"
@@ -287,6 +413,7 @@ def scrape_tpu_exporter(
     deadline = time.monotonic() + max(0.01, timeout_s)
     conn: Optional[http.client.HTTPConnection] = None
     resp: Optional[http.client.HTTPResponse] = None
+    raw_sock: Any = None
     try:
         rem = deadline - time.monotonic()
         if rem <= 0:
@@ -298,18 +425,14 @@ def scrape_tpu_exporter(
         else:
             conn = http.client.HTTPConnection(host, port, timeout=rem)
         conn.request("GET", path, headers={"Accept": "text/plain"})
-        upstream_sock = conn.sock
+        raw_sock = conn.sock
         rem = deadline - time.monotonic()
         if rem <= 0:
             raise TimeoutError("Exporter scrape exceeded elapsed deadline")
-        if upstream_sock is not None:
-            try:
-                upstream_sock.settimeout(rem)
-            except OSError:
-                pass
+        if raw_sock is not None:
+            conn.sock = DeadlineSocket(raw_sock, deadline, label="Exporter scrape")
         resp = conn.getresponse()
-        if upstream_sock is None:
-            upstream_sock = getattr(getattr(resp.fp, "raw", None), "_sock", None)
+        upstream_sock = raw_sock
         if resp.status < 200 or resp.status >= 300:
             return TpuExporterTelemetry(
                 reachable=False,
@@ -340,6 +463,11 @@ def scrape_tpu_exporter(
         if conn is not None:
             try:
                 conn.close()
+            except OSError:
+                pass
+        if raw_sock is not None:
+            try:
+                raw_sock.close()
             except OSError:
                 pass
 

@@ -97,17 +97,14 @@ def is_loopback_host(host: str) -> bool:
 def sanitize_url(url: str) -> str:
     """Strip any userinfo credentials from a URL before logging or displaying."""
     parts = urlsplit(url)
-    if not parts.username and not parts.password:
+    if "@" not in parts.netloc:
         return url
-    host = parts.hostname or ""
-    if ":" in host and not host.startswith("["):
-        host = f"[{host}]"
-    netloc = f"{host}:{parts.port}" if parts.port else host
-    return parts._replace(netloc=netloc).geturl()
+    _, hostport = parts.netloc.rsplit("@", 1)
+    return parts._replace(netloc=hostport).geturl()
 
 
 def validate_http_url(url: str, *, field_name: str = "url") -> str:
-    """Validate that a backend or exporter URL uses an explicit http/https scheme and host."""
+    """Validate that a backend or exporter URL uses an explicit http/https scheme, host, and port."""
     cleaned = url.strip()
     parts = urlsplit(cleaned)
     scheme = parts.scheme.lower()
@@ -119,6 +116,17 @@ def validate_http_url(url: str, *, field_name: str = "url") -> str:
     if not parts.hostname:
         raise ValueError(
             f"Invalid {field_name} {sanitize_url(cleaned)!r}: missing hostname"
+        )
+    try:
+        port = parts.port
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid {field_name} {sanitize_url(cleaned)!r}: invalid port ({exc})"
+        ) from exc
+    if port is not None and not (1 <= port <= 65535):
+        raise ValueError(
+            f"Invalid {field_name} {sanitize_url(cleaned)!r}: "
+            f"port {port} out of range 1..65535"
         )
     return cleaned
 

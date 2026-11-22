@@ -58,6 +58,7 @@ from router.hooks import (  # noqa: E402
 )
 from router.metrics import RouterMetrics  # noqa: E402
 from router.tpu_telemetry import (  # noqa: E402
+    DeadlineSocket,
     TpuExporterTelemetry,
     evaluate_tpu_readiness,
     scrape_tpu_exporter,
@@ -92,16 +93,20 @@ def _read_bounded_http_response(
     chunk_size: int = 65536,
 ) -> bytes:
     """Incrementally read an HTTP response body under both a byte cap and elapsed deadline."""
-    raw_len = resp.getheader("Content-Length")
-    if raw_len is not None:
-        try:
-            declared_len = int(raw_len.strip())
-        except ValueError:
-            declared_len = -1
-        if declared_len > max_bytes:
-            raise _UpstreamResponseTooLargeError(
-                f"{label} Content-Length ({declared_len} bytes) exceeded {max_bytes} byte limit"
-            )
+    declared_len: Optional[int] = None
+    if not resp.chunked:
+        raw_len = resp.getheader("Content-Length")
+        if raw_len is not None:
+            try:
+                parsed_len = int(raw_len.strip())
+            except ValueError:
+                parsed_len = -1
+            if parsed_len >= 0:
+                declared_len = parsed_len
+                if declared_len > max_bytes:
+                    raise _UpstreamResponseTooLargeError(
+                        f"{label} Content-Length ({declared_len} bytes) exceeded {max_bytes} byte limit"
+                    )
     chunks: List[bytes] = []
     total = 0
     while True:
@@ -127,7 +132,17 @@ def _read_bounded_http_response(
                 f"{label} exceeded {max_bytes} byte limit"
             )
         chunks.append(chunk)
-    return b"".join(chunks)
+    raw = b"".join(chunks)
+    if (
+        not resp.chunked
+        and resp.status not in (204, 304)
+        and not (100 <= resp.status < 200)
+    ):
+        if resp.length is not None and resp.length > 0:
+            raise http.client.IncompleteRead(raw, resp.length)
+        if declared_len is not None and len(raw) < declared_len:
+            raise http.client.IncompleteRead(raw, declared_len - len(raw))
+    return raw
 _CORS_ALLOWED_HEADERS = ", ".join(
     (
         "Authorization",
@@ -930,24 +945,21 @@ class RouterEngine:
         deadline = t0 + max(0.01, timeout_s)
         conn: Optional[http.client.HTTPConnection] = None
         resp: Optional[http.client.HTTPResponse] = None
+        raw_sock: Any = None
         try:
             rem = deadline - time.monotonic()
             if rem <= 0:
                 raise TimeoutError("Probe exceeded elapsed deadline")
             conn = _open_http_connection(scheme, host, port, rem)
             conn.request("GET", path, headers=headers)
-            upstream_sock = conn.sock
+            raw_sock = conn.sock
             rem = deadline - time.monotonic()
             if rem <= 0:
                 raise TimeoutError("Probe exceeded elapsed deadline")
-            if upstream_sock is not None:
-                try:
-                    upstream_sock.settimeout(rem)
-                except OSError:
-                    pass
+            if raw_sock is not None:
+                conn.sock = DeadlineSocket(raw_sock, deadline, label="Probe response")
             resp = conn.getresponse()
-            if upstream_sock is None:
-                upstream_sock = getattr(getattr(resp.fp, "raw", None), "_sock", None)
+            upstream_sock = raw_sock
             raw = _read_bounded_http_response(
                 resp,
                 upstream_sock,
@@ -978,6 +990,11 @@ class RouterEngine:
             if conn is not None:
                 try:
                     conn.close()
+                except OSError:
+                    pass
+            if raw_sock is not None:
+                try:
+                    raw_sock.close()
                 except OSError:
                     pass
 
@@ -1880,6 +1897,8 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             last_attempted_backend = backend
             conn: Optional[http.client.HTTPConnection] = None
             resp: Optional[http.client.HTTPResponse] = None
+            raw_sock: Any = None
+            deadline_sock: Optional[DeadlineSocket] = None
             non_stream_result: Optional[Tuple[int, str, bytes, float, float]] = None
             try:
                 scheme, host, port, upstream_path = _join_backend_url(
@@ -1899,20 +1918,19 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                     headers["Authorization"] = f"Bearer {api_key}"
 
                 conn.request("POST", upstream_path, body=raw_req, headers=headers)
-                upstream_sock = conn.sock
+                raw_sock = conn.sock
                 rem_hdr = attempt_deadline - time.monotonic()
                 if rem_hdr <= 0:
                     raise TimeoutError("Upstream response headers exceeded elapsed deadline")
-                if upstream_sock is not None:
-                    try:
-                        upstream_sock.settimeout(rem_hdr)
-                    except OSError:
-                        pass
-                resp = conn.getresponse()
-                if upstream_sock is None:
-                    upstream_sock = getattr(
-                        getattr(resp.fp, "raw", None), "_sock", None
+                if raw_sock is not None:
+                    deadline_sock = DeadlineSocket(
+                        raw_sock,
+                        attempt_deadline,
+                        label=f"Backend {backend.config.id!r} response",
                     )
+                    conn.sock = deadline_sock
+                resp = conn.getresponse()
+                upstream_sock = raw_sock
 
                 if resp.status in RETRYABLE_STATUS_CODES:
                     # Fail over immediately without waiting to drain a potentially stalled error body.
@@ -1930,6 +1948,10 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                     continue
 
                 if stream and 200 <= resp.status < 300:
+                    if deadline_sock is not None:
+                        # Hand deadline management to _BoundedSSEReader so post-commit
+                        # progress deadlines can reset as tokens stream.
+                        deadline_sock.deadline = None
                     sse_outcome, sse_err_status, sse_err_body = self._proxy_sse_stream(
                         resp=resp,
                         upstream_sock=upstream_sock,
@@ -2040,6 +2062,11 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 if conn is not None:
                     try:
                         conn.close()
+                    except OSError:
+                        pass
+                if raw_sock is not None:
+                    try:
+                        raw_sock.close()
                     except OSError:
                         pass
 
