@@ -2473,7 +2473,8 @@ ob_status_t ob_gemm_matmul_int8(ob_context_t* ctx,
               std::memcpy(b_tile.data() + static_cast<size_t>(ni) * hw_k,
                           b_nk + static_cast<size_t>(n0 + ni) * k_dim + k0, tk);
             }
-            scale_d = ob::compute_tile_scale_D(b_tile.data(), tn, tk, hw_k, zp_a);
+            // Preserve exact unit output scale (s_out = 1.0f) for custom pluggable emitters.
+            scale_d = 1u;
           }
 
           ob::PinnedWeightTile pinned_w(w_tile);
@@ -4611,6 +4612,10 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
             drain_all_cleanup();
             return pst;
           }
+          if (slice_rejected) {
+            drain_all_cleanup();
+            break;
+          }
 
           ob_buffer* wbuf = nullptr;
           ob_status_t wst = ob_buffer_alloc(
@@ -4813,7 +4818,9 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
         ring_count += 1u;
       }
 
-      if (!slice_rejected) {
+      if (slice_rejected) {
+        drain_all_cleanup();
+      } else {
         while (ring_count > 0u) {
           ob_status_t dst = drain_one();
           if (dst != OB_OK) {
