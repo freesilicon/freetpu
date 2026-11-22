@@ -28,6 +28,7 @@ from router.freetpu_router import (  # noqa: E402
     MAX_RR_CURSORS,
     _apply_cli_overrides,
     _build_cli_parser,
+    _join_backend_url,
     _open_http_connection,
     _safe_nonneg_int,
     build_hooks_from_config,
@@ -76,6 +77,9 @@ class _MockOpenAIBackend(ThreadingHTTPServer):
         hold_after_done_event: Optional[threading.Event] = None,
         slow_drip_probe_interval_s: Optional[float] = None,
         custom_non_stream_payload: Optional[Dict[str, Any]] = None,
+        oversized_non_stream_bytes: Optional[int] = None,
+        oversized_non_stream_chunked: bool = False,
+        slow_drip_non_stream_interval_s: Optional[float] = None,
         prompt_tokens: int = 12,
         completion_tokens: int = 8,
     ) -> None:
@@ -96,9 +100,13 @@ class _MockOpenAIBackend(ThreadingHTTPServer):
         self.hold_after_done_event = hold_after_done_event
         self.slow_drip_probe_interval_s = slow_drip_probe_interval_s
         self.custom_non_stream_payload = custom_non_stream_payload
+        self.oversized_non_stream_bytes = oversized_non_stream_bytes
+        self.oversized_non_stream_chunked = oversized_non_stream_chunked
+        self.slow_drip_non_stream_interval_s = slow_drip_non_stream_interval_s
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
         self.requests_seen: List[Dict[str, Any]] = []
+        self.get_paths_seen: List[str] = []
         self.current_inflight = 0
         self.peak_inflight = 0
         self._lock = threading.Lock()
@@ -128,6 +136,17 @@ class _MockOpenAIHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def do_GET(self) -> None:  # noqa: N802
+        with self.server._lock:
+            self.server.get_paths_seen.append(self.path)
+        if self.path == "/health":
+            if self.server.status_code >= 500:
+                self._send_json(
+                    self.server.status_code,
+                    {"error": {"message": "worker unhealthy"}},
+                )
+                return
+            self._send_json(200, {"status": "ok"})
+            return
         if self.path == "/v1/models":
             if self.server.slow_drip_probe_interval_s is not None:
                 self.send_response(200)
@@ -376,6 +395,50 @@ class _MockOpenAIHandler(BaseHTTPRequestHandler):
                     },
                 },
             )
+            return
+
+        if self.server.slow_drip_non_stream_interval_s is not None:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            deadline = time.monotonic() + 3.0
+            try:
+                self.wfile.write(b"{")
+                self.wfile.flush()
+                while time.monotonic() < deadline:
+                    self.wfile.write(b" ")
+                    self.wfile.flush()
+                    time.sleep(self.server.slow_drip_non_stream_interval_s)
+            except OSError:
+                pass
+            return
+
+        if self.server.oversized_non_stream_bytes is not None:
+            pad = "x" * self.server.oversized_non_stream_bytes
+            body = json.dumps({"choices": [{"message": {"content": pad}}]}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            if self.server.oversized_non_stream_chunked:
+                self.send_header("Transfer-Encoding", "chunked")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                try:
+                    for off in range(0, len(body), 512):
+                        self._write_chunk(body[off : off + 512])
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.wfile.flush()
+                except OSError:
+                    pass
+            else:
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                    self.wfile.flush()
+                except OSError:
+                    pass
             return
 
         if self.server.custom_non_stream_payload is not None:
@@ -4126,6 +4189,296 @@ class TestFreeTPURouter(unittest.TestCase):
             self.assertEqual(ev.status_code, 200)
             self.assertGreater(ev.prompt_tokens, 0)
             self.assertGreater(ev.completion_tokens, 0)
+
+    def test_non_streaming_response_enforces_byte_cap_and_elapsed_deadline_with_failover(
+        self,
+    ) -> None:
+        valid_b = BackendConfig(id="ok-b", base_url="http://127.0.0.1:8081/v1")
+        with self.assertRaises(ValueError):
+            RouterConfig(backends=[valid_b], max_response_body_bytes=0)
+
+        # Case 1: Oversized non-streaming response (chunked and Content-Length) fails over to backup.
+        for chunked in (False, True):
+            with self.subTest(oversized_chunked=chunked):
+                primary = self._track(
+                    _MockOpenAIBackend(
+                        "oversize-primary",
+                        ["m-bounded-resp"],
+                        oversized_non_stream_bytes=4096,
+                        oversized_non_stream_chunked=chunked,
+                    )
+                )
+                backup = self._track(
+                    _MockOpenAIBackend("healthy-backup", ["m-bounded-resp"])
+                )
+                cfg = RouterConfig(
+                    host="127.0.0.1",
+                    port=0,
+                    policy="local_first",
+                    max_response_body_bytes=1024,
+                    backends=[
+                        BackendConfig(
+                            id="oversize-primary",
+                            type="pixel-tpu",
+                            local=True,
+                            base_url=primary.base_url,
+                        ),
+                        BackendConfig(
+                            id="healthy-backup",
+                            type="cloud-tpu-v5e",
+                            local=False,
+                            base_url=backup.base_url,
+                        ),
+                    ],
+                )
+                router = self._track(create_router_server(cfg))
+                rport = router.server_address[1]
+                status, hdrs, body = _http_request(
+                    rport,
+                    "POST",
+                    "/v1/chat/completions",
+                    body={
+                        "model": "m-bounded-resp",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(hdrs["x-freetpu-backend"], "healthy-backup")
+                self.assertEqual(hdrs["x-freetpu-failovers"], "1")
+                self.assertIn("reply-from:healthy-backup", body.decode("utf-8"))
+                self.assertEqual(router.engine._backends[0].inflight, 0)
+                self.assertGreater(
+                    router.engine._backends[0].cooldown_until_monotonic,
+                    time.monotonic(),
+                )
+
+        # Case 2: Slow-drip non-streaming response exceeds elapsed deadline and fails over cleanly.
+        drip_primary = self._track(
+            _MockOpenAIBackend(
+                "drip-primary",
+                ["m-drip-resp"],
+                slow_drip_non_stream_interval_s=0.05,
+            )
+        )
+        drip_backup = self._track(_MockOpenAIBackend("drip-backup", ["m-drip-resp"]))
+        cfg_drip = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            backends=[
+                BackendConfig(
+                    id="drip-primary",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=drip_primary.base_url,
+                    timeout_s=0.25,
+                ),
+                BackendConfig(
+                    id="drip-backup",
+                    type="cloud-tpu-v5e",
+                    local=False,
+                    base_url=drip_backup.base_url,
+                    timeout_s=2.0,
+                ),
+            ],
+        )
+        router_drip = self._track(create_router_server(cfg_drip))
+        rport_drip = router_drip.server_address[1]
+        t0 = time.monotonic()
+        status, hdrs, body = _http_request(
+            rport_drip,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-drip-resp",
+                "messages": [{"role": "user", "content": "slow drip"}],
+            },
+        )
+        elapsed = time.monotonic() - t0
+        self.assertEqual(status, 200)
+        self.assertEqual(hdrs["x-freetpu-backend"], "drip-backup")
+        self.assertEqual(hdrs["x-freetpu-failovers"], "1")
+        self.assertLess(elapsed, 1.5)
+        self.assertEqual(router_drip.engine._backends[0].inflight, 0)
+
+    def test_explicit_health_path_resolves_independently_of_api_version(self) -> None:
+        self.assertEqual(
+            _join_backend_url(
+                "http://127.0.0.1:8000/v1", "/health", strip_api_version=True
+            )[3],
+            "/health",
+        )
+        self.assertEqual(
+            _join_backend_url(
+                "http://proxy.local/vllm/v1", "/health", strip_api_version=True
+            )[3],
+            "/vllm/health",
+        )
+        self.assertEqual(
+            _join_backend_url(
+                "http://127.0.0.1:8000/v1", "/v1/models", strip_api_version=True
+            )[3],
+            "/v1/models",
+        )
+        self.assertEqual(
+            _join_backend_url(
+                "http://127.0.0.1:8000/v1",
+                "/v1/chat/completions",
+                strip_api_version=False,
+            )[3],
+            "/v1/chat/completions",
+        )
+
+        # End-to-end: mock backend serves /health (200) and /v1/models (200), while /v1/health is 404.
+        backend = self._track(_MockOpenAIBackend("vllm-health-root", ["m-vllm"]))
+        self.assertTrue(backend.base_url.endswith("/v1"))
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            backends=[
+                BackendConfig(
+                    id="vllm-health-root",
+                    type="cloud-tpu-v5e",
+                    base_url=backend.base_url,
+                    health_path="/health",
+                    discover_models=True,
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+        self.assertIn("/health", backend.get_paths_seen)
+        self.assertNotIn("/v1/health", backend.get_paths_seen)
+        self.assertTrue(router.engine._backends[0].healthy)
+
+        status, hdrs, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={"model": "m-vllm", "messages": [{"role": "user", "content": "ping"}]},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(hdrs["x-freetpu-backend"], "vllm-health-root")
+
+    def test_verbose_access_logs_escape_control_characters(self) -> None:
+        backend = self._track(_MockOpenAIBackend("log-safe-b", ["m-log"]))
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            backends=[
+                BackendConfig(
+                    id="log-safe-b",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=backend.base_url,
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg, verbose=True))
+        rport = router.server_address[1]
+
+        stderr_buf = io.StringIO()
+        with redirect_stderr(stderr_buf):
+            with socket.create_connection(("127.0.0.1", rport), timeout=2.0) as sock:
+                raw_req = (
+                    b"GET /health?q=\x1b[31mRED\x7f\x9b HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+                sock.sendall(raw_req)
+                while sock.recv(4096):
+                    pass
+
+        logged = stderr_buf.getvalue()
+        self.assertIn("\\x1b[31mRED\\x7f\\x9b", logged)
+        self.assertNotIn("\x1b", logged)
+        self.assertNotIn("\x7f", logged)
+        self.assertNotIn("\x9b", logged)
+
+    def test_streaming_request_errors_preserve_stream_true_in_usage_events(self) -> None:
+        backend = self._track(_MockOpenAIBackend("err-stream-b", ["m-stream-err"]))
+        captured: List[UsageEvent] = []
+        usage_hook = JsonlUsageMeterHook(
+            Path(self._tmpdir.name) / "stream_err_usage.jsonl",
+            callback=captured.append,
+        )
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            backends=[
+                BackendConfig(
+                    id="err-stream-b",
+                    type="cloud-tpu-v5e",
+                    base_url=backend.base_url,
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg, usage_hook=usage_hook))
+        rport = router.server_address[1]
+
+        # 1. Streaming request hitting upstream HTTP 400 -> UsageEvent.stream is True.
+        backend.status_code = 400
+        status_1, _, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-stream-err",
+                "stream": True,
+                "messages": [{"role": "user", "content": "bad stream req"}],
+            },
+        )
+        self.assertEqual(status_1, 400)
+
+        # 2. Streaming request hitting pre-output SSE client error -> UsageEvent.stream is True.
+        backend.status_code = 200
+        client_err = json.dumps(
+            {
+                "error": {
+                    "message": "context length exceeded",
+                    "type": "invalid_request_error",
+                    "code": 400,
+                }
+            }
+        )
+        backend.raw_sse_bytes = f"data: {client_err}\n\ndata: [DONE]\n\n".encode("utf-8")
+        status_2, _, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-stream-err",
+                "stream": True,
+                "messages": [{"role": "user", "content": "too long stream"}],
+            },
+        )
+        self.assertEqual(status_2, 400)
+
+        # 3. Non-streaming request hitting upstream HTTP 400 -> UsageEvent.stream is False.
+        backend.status_code = 400
+        backend.raw_sse_bytes = None
+        status_3, _, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-stream-err",
+                "stream": False,
+                "messages": [{"role": "user", "content": "bad non-stream req"}],
+            },
+        )
+        self.assertEqual(status_3, 400)
+
+        self.assertEqual(len(captured), 3)
+        self.assertEqual(captured[0].status_code, 400)
+        self.assertTrue(captured[0].stream)
+        self.assertEqual(captured[1].status_code, 400)
+        self.assertTrue(captured[1].stream)
+        self.assertEqual(captured[2].status_code, 400)
+        self.assertFalse(captured[2].stream)
 
 
 def run_self_tests(verbosity: int = 1) -> int:

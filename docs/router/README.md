@@ -22,14 +22,13 @@ python3 router/freetpu_router.py --config router/examples/hybrid-pixel-cloud.jso
 export OPENAI_BASE_URL=http://localhost:8080/v1
 export OPENAI_API_KEY=local-dev
 
+# Inspect discovered models (when using llama-server, pass `--alias <id>` to advertise
+# a fixed model ID, or pick the discovered ID directly from /v1/models):
 curl -s http://localhost:8080/v1/models | jq .
+MODEL_ID=$(curl -s http://localhost:8080/v1/models | python3 -c 'import sys, json; data = json.load(sys.stdin).get("data") or []; print(data[0]["id"] if data else "")')
 curl -s http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{
-    "model": "qwen2.5-1.5b-q8_0",
-    "messages": [{"role": "user", "content": "Hello from FreeTPU Router!"}],
-    "stream": true
-  }'
+  -d "$(MODEL_ID="$MODEL_ID" python3 -c 'import json, os; print(json.dumps({"model": os.environ["MODEL_ID"], "messages": [{"role": "user", "content": "Hello from FreeTPU Router!"}], "stream": True}))')"
 ```
 
 ---

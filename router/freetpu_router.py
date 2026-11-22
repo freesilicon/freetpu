@@ -17,6 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
 from pathlib import Path
+import re
 import ssl
 import sys
 import threading
@@ -70,6 +71,63 @@ OTHER_MODEL_LABEL = "_other"
 MAX_METRIC_MODEL_LABELS = 256
 MAX_RR_CURSORS = 1024
 MAX_PROBE_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_ERROR_RESPONSE_BYTES = 1024 * 1024
+_API_VERSION_SUFFIX_RE = re.compile(r"/v\d+(?:alpha|beta\d*)?$")
+_LOG_CONTROL_CHAR_TABLE = str.maketrans(
+    {c: f"\\x{c:02x}" for c in (*range(0x00, 0x20), *range(0x7F, 0xA0))}
+)
+
+
+class _UpstreamResponseTooLargeError(http.client.HTTPException):
+    """Raised when an upstream non-streaming HTTP body exceeds the byte cap."""
+
+
+def _read_bounded_http_response(
+    resp: http.client.HTTPResponse,
+    upstream_sock: Any,
+    *,
+    max_bytes: int,
+    deadline: float,
+    label: str = "Upstream response",
+    chunk_size: int = 65536,
+) -> bytes:
+    """Incrementally read an HTTP response body under both a byte cap and elapsed deadline."""
+    raw_len = resp.getheader("Content-Length")
+    if raw_len is not None:
+        try:
+            declared_len = int(raw_len.strip())
+        except ValueError:
+            declared_len = -1
+        if declared_len > max_bytes:
+            raise _UpstreamResponseTooLargeError(
+                f"{label} Content-Length ({declared_len} bytes) exceeded {max_bytes} byte limit"
+            )
+    chunks: List[bytes] = []
+    total = 0
+    while True:
+        rem = deadline - time.monotonic()
+        if rem <= 0:
+            raise TimeoutError(f"{label} exceeded elapsed deadline")
+        if upstream_sock is not None:
+            try:
+                upstream_sock.settimeout(rem)
+            except OSError:
+                pass
+        budget_left = (max_bytes - total) + 1
+        if budget_left <= 0:
+            raise _UpstreamResponseTooLargeError(
+                f"{label} exceeded {max_bytes} byte limit"
+            )
+        chunk = resp.read1(min(chunk_size, budget_left))
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise _UpstreamResponseTooLargeError(
+                f"{label} exceeded {max_bytes} byte limit"
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
 _CORS_ALLOWED_HEADERS = ", ".join(
     (
         "Authorization",
@@ -93,19 +151,28 @@ _CORS_ALLOWED_HEADERS = ", ".join(
 )
 
 
-def _join_backend_url(base_url: str, endpoint: str) -> Tuple[str, str, int, str]:
+def _join_backend_url(
+    base_url: str,
+    endpoint: str,
+    *,
+    strip_api_version: bool = False,
+) -> Tuple[str, str, int, str]:
     validated = validate_http_url(base_url, field_name="backend base_url")
     parsed = urlsplit(validated)
     scheme = parsed.scheme.lower()
     host = parsed.hostname or ""
     port = parsed.port or (443 if scheme == "https" else 80)
     base_path = parsed.path.rstrip("/")
-    if endpoint.startswith("/v1/") and base_path.endswith("/v1"):
-        full_path = base_path + endpoint[3:]
-    elif endpoint == "/v1" and base_path.endswith("/v1"):
+    ep = endpoint if endpoint.startswith("/") else "/" + endpoint
+    if strip_api_version:
+        base_root = _API_VERSION_SUFFIX_RE.sub("", base_path)
+        full_path = base_root + ep
+    elif ep.startswith("/v1/") and base_path.endswith("/v1"):
+        full_path = base_path + ep[3:]
+    elif ep == "/v1" and base_path.endswith("/v1"):
         full_path = base_path
     else:
-        full_path = base_path + endpoint
+        full_path = base_path + ep
     return scheme, host, port, full_path or "/"
 
 
@@ -845,8 +912,14 @@ class RouterEngine:
         backend: BackendConfig,
         endpoint: str,
         timeout_s: float,
+        *,
+        strip_api_version: bool = False,
     ) -> Tuple[int, Optional[Dict[str, Any]], float, Optional[str]]:
-        scheme, host, port, path = _join_backend_url(backend.base_url, endpoint)
+        scheme, host, port, path = _join_backend_url(
+            backend.base_url,
+            endpoint,
+            strip_api_version=strip_api_version,
+        )
         headers: Dict[str, str] = {"Accept": "application/json"}
         api_key = backend.resolved_api_key()
         _ensure_safe_credential_transport(backend, scheme, host, api_key)
@@ -875,32 +948,14 @@ class RouterEngine:
             resp = conn.getresponse()
             if upstream_sock is None:
                 upstream_sock = getattr(getattr(resp.fp, "raw", None), "_sock", None)
-            chunks: List[bytes] = []
-            total = 0
-            while True:
-                rem = deadline - time.monotonic()
-                if rem <= 0:
-                    raise TimeoutError("Probe response exceeded elapsed deadline")
-                if upstream_sock is not None:
-                    try:
-                        upstream_sock.settimeout(rem)
-                    except OSError:
-                        pass
-                budget_left = (MAX_PROBE_RESPONSE_BYTES - total) + 1
-                if budget_left <= 0:
-                    raise ValueError(
-                        f"Probe response exceeded {MAX_PROBE_RESPONSE_BYTES} byte limit"
-                    )
-                chunk = resp.read1(min(8192, budget_left))
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > MAX_PROBE_RESPONSE_BYTES:
-                    raise ValueError(
-                        f"Probe response exceeded {MAX_PROBE_RESPONSE_BYTES} byte limit"
-                    )
-                chunks.append(chunk)
-            raw = b"".join(chunks)
+            raw = _read_bounded_http_response(
+                resp,
+                upstream_sock,
+                max_bytes=MAX_PROBE_RESPONSE_BYTES,
+                deadline=deadline,
+                label="Probe response",
+                chunk_size=8192,
+            )
             rtt_ms = (time.monotonic() - t0) * 1000.0
             parsed_json: Optional[Dict[str, Any]] = None
             if raw:
@@ -943,7 +998,10 @@ class RouterEngine:
                 status, err = 0, "probe_deadline_exceeded"
             else:
                 status, _, rtt_ms, err = self._http_get_json(
-                    state.config, state.config.health_path, rem
+                    state.config,
+                    state.config.health_path,
+                    rem,
+                    strip_api_version=True,
                 )
             if 200 <= status < 300:
                 probe_ok = True
@@ -1473,7 +1531,10 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         if self.server.verbose:
-            sys.stderr.write(f"{self.address_string()} - {format % args}\n")
+            message = (format % args).translate(_LOG_CONTROL_CHAR_TABLE)
+            sys.stderr.write(
+                f"{self.address_string()} - - [{self.log_date_time_string()}] {message}\n"
+            )
 
     def _resolve_cors_header(self) -> Tuple[bool, Optional[str]]:
         """Check request Origin against explicit `cors_allowed_origins`.
@@ -1825,6 +1886,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                     backend.config.base_url, endpoint
                 )
                 timeout_s = backend.config.timeout_s or engine.config.request_timeout_s
+                attempt_deadline = attempt_start + timeout_s
                 conn = _open_http_connection(scheme, host, port, timeout_s)
                 headers = {
                     "Content-Type": "application/json",
@@ -1838,6 +1900,14 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
 
                 conn.request("POST", upstream_path, body=raw_req, headers=headers)
                 upstream_sock = conn.sock
+                rem_hdr = attempt_deadline - time.monotonic()
+                if rem_hdr <= 0:
+                    raise TimeoutError("Upstream response headers exceeded elapsed deadline")
+                if upstream_sock is not None:
+                    try:
+                        upstream_sock.settimeout(rem_hdr)
+                    except OSError:
+                        pass
                 resp = conn.getresponse()
                 if upstream_sock is None:
                     upstream_sock = getattr(
@@ -1917,7 +1987,21 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         continue
                 else:
                     # Non-streaming response (or non-retryable error status such as 4xx)
-                    raw_resp = resp.read()
+                    max_resp_bytes = (
+                        engine.config.max_response_body_bytes
+                        if 200 <= resp.status < 300
+                        else min(
+                            engine.config.max_response_body_bytes,
+                            MAX_ERROR_RESPONSE_BYTES,
+                        )
+                    )
+                    raw_resp = _read_bounded_http_response(
+                        resp,
+                        upstream_sock,
+                        max_bytes=max_resp_bytes,
+                        deadline=attempt_deadline,
+                        label=f"Backend {backend.config.id!r} response",
+                    )
                     latency_ms = (time.monotonic() - req_start) * 1000.0
                     attempt_ms = (time.monotonic() - attempt_start) * 1000.0
                     content_type = resp.getheader("Content-Type") or "application/json"
@@ -1929,8 +2013,15 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         attempt_ms,
                     )
             except (OSError, TimeoutError, http.client.HTTPException) as exc:
-                reason = "timeout" if isinstance(exc, TimeoutError) else "connection_error"
-                last_error_status = 504 if isinstance(exc, TimeoutError) else 502
+                if isinstance(exc, TimeoutError):
+                    reason = "timeout"
+                    last_error_status = 504
+                elif isinstance(exc, _UpstreamResponseTooLargeError):
+                    reason = "response_too_large"
+                    last_error_status = 502
+                else:
+                    reason = "connection_error"
+                    last_error_status = 502
                 last_error_msg = f"Backend {backend.config.id!r} failed: {exc}"
                 last_error_type = "service_unavailable"
                 last_error_code = reason
@@ -1974,7 +2065,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                     completion_tokens=completion_tokens,
                     latency_ms=latency_ms,
                     ttft_ms=latency_ms if 200 <= resp_status < 300 else None,
-                    stream=False,
+                    stream=stream,
                     failovers=failovers,
                     principal=auth_ctx.principal,
                     status_code=resp_status,

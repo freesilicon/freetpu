@@ -17,6 +17,7 @@ VALID_AUTH_TYPES = ("allow_all", "bearer")
 VALID_URL_SCHEMES = ("http", "https")
 BEARER_AUTH_ONLY_KEYS = ("tokens", "tokens_env", "exempt_paths")
 DEFAULT_MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024
+DEFAULT_MAX_RESPONSE_BODY_BYTES = 16 * 1024 * 1024
 DEFAULT_CLIENT_READ_TIMEOUT_S = 30.0
 DEFAULT_CLIENT_HEADER_TIMEOUT_S = 10.0
 DEFAULT_MAX_CONCURRENT_CONNECTIONS = 128
@@ -398,6 +399,7 @@ class RouterConfig:
     queue_pressure_threshold: int = 16
     backend_idle_timeout_s: float = 300.0
     max_request_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES
+    max_response_body_bytes: int = DEFAULT_MAX_RESPONSE_BODY_BYTES
     client_read_timeout_s: float = DEFAULT_CLIENT_READ_TIMEOUT_S
     client_header_timeout_s: float = DEFAULT_CLIENT_HEADER_TIMEOUT_S
     max_concurrent_connections: int = DEFAULT_MAX_CONCURRENT_CONNECTIONS
@@ -459,6 +461,11 @@ class RouterConfig:
         _validate_int_range(
             self.max_request_body_bytes,
             name="max_request_body_bytes",
+            min_value=1,
+        )
+        _validate_int_range(
+            self.max_response_body_bytes,
+            name="max_response_body_bytes",
             min_value=1,
         )
         _validate_finite_number(
@@ -608,6 +615,11 @@ class RouterConfig:
             max_request_body_bytes=_validate_int_range(
                 raw.get("max_request_body_bytes", DEFAULT_MAX_REQUEST_BODY_BYTES),
                 name="max_request_body_bytes",
+                min_value=1,
+            ),
+            max_response_body_bytes=_validate_int_range(
+                raw.get("max_response_body_bytes", DEFAULT_MAX_RESPONSE_BODY_BYTES),
+                name="max_response_body_bytes",
                 min_value=1,
             ),
             client_read_timeout_s=_validate_finite_number(
