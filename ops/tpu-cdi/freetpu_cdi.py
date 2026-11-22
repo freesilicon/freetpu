@@ -170,12 +170,17 @@ def discover_tpu_chips(
         raise FileNotFoundError(f"PCI sysfs directory not found: {pci_dir}")
 
     vfio_container = dev_root / "vfio" / "vfio"
-    if not vfio_container.exists() and not allow_missing_vfio:
-        raise FileNotFoundError(
-            f"VFIO control device not found: {vfio_container} "
-            "(freetpu-cdi requires VFIO-backed Cloud TPUs using vfio-pci; "
-            "/dev/accel* hosts such as Cloud TPU v4 are not supported)"
-        )
+    if not allow_missing_vfio:
+        if not vfio_container.exists():
+            raise FileNotFoundError(
+                f"VFIO control device not found: {vfio_container} "
+                "(freetpu-cdi requires VFIO-backed Cloud TPUs using vfio-pci; "
+                "/dev/accel* hosts such as Cloud TPU v4 are not supported)"
+            )
+        if _stat_char_devnum(vfio_container) is None:
+            raise RuntimeError(
+                f"VFIO control node is not a character device: {vfio_container}"
+            )
 
     pci_entries = sorted(pci_dir.iterdir(), key=lambda p: p.name)
     group_members = _collect_iommu_group_members(sysfs_root, pci_entries)
@@ -221,10 +226,15 @@ def discover_tpu_chips(
             )
 
         vfio_host_path = dev_root / "vfio" / iommu_group
-        if not vfio_host_path.exists() and not allow_missing_vfio:
-            raise FileNotFoundError(
-                f"VFIO group node not found for {entry.name}: {vfio_host_path}"
-            )
+        if not allow_missing_vfio:
+            if not vfio_host_path.exists():
+                raise FileNotFoundError(
+                    f"VFIO group node not found for {entry.name}: {vfio_host_path}"
+                )
+            if _stat_char_devnum(vfio_host_path) is None:
+                raise RuntimeError(
+                    f"VFIO group node for {entry.name} is not a character device: {vfio_host_path}"
+                )
 
         chips.append(
             DiscoveredChip(
@@ -918,15 +928,23 @@ def _write_spec_atomic(path: Path, rendered: str) -> None:
         raise
 
 
-def _invalidate_spec(path: Path) -> bool:
-    """Remove a stale CDI spec file if present. Returns True if a file was removed."""
+def _invalidate_spec(path: Path) -> Tuple[bool, Optional[str]]:
+    """Remove a stale CDI spec file if present. Returns (removed, cleanup_error)."""
     try:
         if path.exists() or path.is_symlink():
             path.unlink()
-            return True
-    except OSError:
-        return False
-    return False
+            return True, None
+    except OSError as exc:
+        return False, str(exc)
+    return False, None
+
+
+def _format_invalidation_suffix(path: Path, removed: bool, cleanup_err: Optional[str]) -> str:
+    if removed:
+        return f" (removed stale {path})"
+    if cleanup_err:
+        return f" (FAILED to remove stale {path}: {cleanup_err})"
+    return ""
 
 
 def reconcile_cdi_spec(
@@ -945,14 +963,14 @@ def reconcile_cdi_spec(
         )
         spec = build_cdi_spec(chips, vfio_container, kind=kind)
     except Exception as exc:  # noqa: BLE001
-        removed = _invalidate_spec(output_path)
-        suffix = f" (removed stale {output_path})" if removed else ""
+        removed, cleanup_err = _invalidate_spec(output_path)
+        suffix = _format_invalidation_suffix(output_path, removed, cleanup_err)
         return False, f"discovery failed: {exc}{suffix}"
 
     errors = validate_cdi_spec(spec)
     if errors:
-        removed = _invalidate_spec(output_path)
-        suffix = f" (removed stale {output_path})" if removed else ""
+        removed, cleanup_err = _invalidate_spec(output_path)
+        suffix = _format_invalidation_suffix(output_path, removed, cleanup_err)
         return False, f"validation failed: {'; '.join(errors)}{suffix}"
 
     rendered = json.dumps(spec, indent=2) + "\n"
@@ -962,7 +980,13 @@ def reconcile_cdi_spec(
     except OSError:
         pass
 
-    _write_spec_atomic(output_path, rendered)
+    try:
+        _write_spec_atomic(output_path, rendered)
+    except OSError as exc:
+        removed, cleanup_err = _invalidate_spec(output_path)
+        suffix = _format_invalidation_suffix(output_path, removed, cleanup_err)
+        return False, f"publication failed: {exc}{suffix}"
+
     return True, f"updated CNCF CDI v{CDI_VERSION} spec ({len(chips)} chip(s), kind={kind}) at {output_path}"
 
 
@@ -1125,8 +1149,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
         except Exception as exc:  # noqa: BLE001
             if not args.stdout and not args.allow_missing_vfio:
-                if _invalidate_spec(args.output):
+                removed, cleanup_err = _invalidate_spec(args.output)
+                if removed:
                     sys.stderr.write(f"Removed stale CDI spec at {args.output}\n")
+                elif cleanup_err:
+                    sys.stderr.write(f"Failed to remove stale CDI spec at {args.output}: {cleanup_err}\n")
             sys.stderr.write(f"freetpu-cdi generate failed: {exc}\n")
             return 1
 
@@ -1134,8 +1161,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             errors = validate_cdi_spec(spec)
             if errors:
                 if not args.stdout and not args.allow_missing_vfio:
-                    if _invalidate_spec(args.output):
+                    removed, cleanup_err = _invalidate_spec(args.output)
+                    if removed:
                         sys.stderr.write(f"Removed stale CDI spec at {args.output}\n")
+                    elif cleanup_err:
+                        sys.stderr.write(f"Failed to remove stale CDI spec at {args.output}: {cleanup_err}\n")
                 for err in errors:
                     sys.stderr.write(f"CDI validation error: {err}\n")
                 return 1
@@ -1145,7 +1175,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             sys.stdout.write(rendered)
             return 0
 
-        _write_spec_atomic(args.output, rendered)
+        try:
+            _write_spec_atomic(args.output, rendered)
+        except OSError as exc:
+            removed, cleanup_err = _invalidate_spec(args.output)
+            if removed:
+                sys.stderr.write(f"Removed stale CDI spec at {args.output}\n")
+            elif cleanup_err:
+                sys.stderr.write(f"Failed to remove stale CDI spec at {args.output}: {cleanup_err}\n")
+            sys.stderr.write(f"freetpu-cdi generate failed to publish {args.output}: {exc}\n")
+            return 1
         sys.stderr.write(
             f"Wrote CNCF CDI v{CDI_VERSION} spec ({len(chips)} chip(s), kind={args.kind}) to {args.output}\n"
         )
@@ -1160,8 +1199,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             parsed = _load_json_strict_keys(raw)
         except (json.JSONDecodeError, ValueError) as exc:
             if args.check_host and args.remove_if_stale and args.spec_path != "-":
-                if _invalidate_spec(Path(args.spec_path)):
+                removed, cleanup_err = _invalidate_spec(Path(args.spec_path))
+                if removed:
                     sys.stderr.write(f"Removed stale CDI spec at {args.spec_path}\n")
+                elif cleanup_err:
+                    sys.stderr.write(f"Failed to remove stale CDI spec at {args.spec_path}: {cleanup_err}\n")
             sys.stderr.write(f"Invalid JSON: {exc}\n")
             return 1
         errors = validate_cdi_spec(parsed)
@@ -1175,8 +1217,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
         if errors:
             if args.check_host and args.remove_if_stale and args.spec_path != "-":
-                if _invalidate_spec(Path(args.spec_path)):
+                removed, cleanup_err = _invalidate_spec(Path(args.spec_path))
+                if removed:
                     sys.stderr.write(f"Removed stale CDI spec at {args.spec_path}\n")
+                elif cleanup_err:
+                    sys.stderr.write(f"Failed to remove stale CDI spec at {args.spec_path}: {cleanup_err}\n")
             for err in errors:
                 sys.stderr.write(f"CDI validation error: {err}\n")
             return 1
@@ -1209,12 +1254,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         last_msg = ""
         interval = max(1.0, float(args.interval))
         while not stop_requested:
-            ok, msg = reconcile_cdi_spec(
-                args.output,
-                sysfs_root=args.sysfs_root,
-                dev_root=args.dev_root,
-                kind=args.kind,
-            )
+            try:
+                ok, msg = reconcile_cdi_spec(
+                    args.output,
+                    sysfs_root=args.sysfs_root,
+                    dev_root=args.dev_root,
+                    kind=args.kind,
+                )
+            except Exception as exc:  # noqa: BLE001
+                removed, cleanup_err = _invalidate_spec(args.output)
+                suffix = _format_invalidation_suffix(args.output, removed, cleanup_err)
+                ok = False
+                msg = f"unexpected sync error: {exc}{suffix}"
             if msg != last_msg or not ok:
                 sys.stderr.write(f"freetpu-cdi sync: {msg}\n")
                 sys.stderr.flush()

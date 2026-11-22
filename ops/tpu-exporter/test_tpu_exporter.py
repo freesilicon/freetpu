@@ -272,7 +272,7 @@ TPU Device Status
                 create_vfio_nodes=["0", "2"],
             )
 
-            # Synthetic /proc/9001/fd/3 -> <dev_root>/vfio/0
+            # Synthetic /proc/9001/fd/3 -> <dev_root>/vfio/0 (mocked as char device 242:0)
             fd_dir = proc_root / "9001" / "fd"
             fd_dir.mkdir(parents=True, exist_ok=True)
             os.symlink(str(dev_root / "vfio" / "0"), fd_dir / "3")
@@ -303,13 +303,37 @@ TPU Device Status
             )
             mock_tpu_info.chmod(0o755)
 
+            import stat as _stat
+            from unittest import mock
+
+            orig_os_stat = os.stat
+            vfio0_st = orig_os_stat(dev_root / "vfio" / "0")
+            vfio2_st = orig_os_stat(dev_root / "vfio" / "2")
+            vfio0_id = (vfio0_st.st_dev, vfio0_st.st_ino)
+            vfio2_id = (vfio2_st.st_dev, vfio2_st.st_ino)
+
+            def _char_stat(path_arg, *args, **kwargs):
+                st = orig_os_stat(path_arg, *args, **kwargs)
+                if (st.st_dev, st.st_ino) == vfio0_id:
+                    fake = mock.MagicMock()
+                    fake.st_mode = _stat.S_IFCHR | 0o600
+                    fake.st_rdev = os.makedev(242, 0)
+                    return fake
+                if (st.st_dev, st.st_ino) == vfio2_id:
+                    fake = mock.MagicMock()
+                    fake.st_mode = _stat.S_IFCHR | 0o600
+                    fake.st_rdev = os.makedev(242, 2)
+                    return fake
+                return st
+
             # Without verified mapping: runtime IDs 8/12 must NOT be attached or fabricated as 0.
-            snap = tpu_exporter.collect_snapshot(
-                sysfs_root=sysfs_root,
-                dev_root=dev_root,
-                proc_root=proc_root,
-                tpu_info_bin=str(mock_tpu_info),
-            )
+            with mock.patch("tpu_exporter.os.stat", side_effect=_char_stat):
+                snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin=str(mock_tpu_info),
+                )
             self.assertTrue(snap.tpu_info_available)
             self.assertEqual(len(snap.devices), 2)
 
@@ -805,6 +829,82 @@ TPU Device Status
             self.assertEqual(v3.hbm_total_bytes, 32 * 1024**3)
             self.assertTrue(v3.pci_enabled)
             self.assertFalse(v3.healthy)
+
+    def test_proc_vfio_pid_matches_by_char_dev_rdev_not_pathname(self) -> None:
+        import stat as _stat
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sysfs_root, dev_root, proc_root = _make_mock_pci_tree(
+                root,
+                devices=[
+                    {
+                        "bdf": "0000:00:06.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0063",
+                        "driver": "vfio-pci",
+                        "iommu_group": "12",
+                        "enable": "1",
+                    }
+                ],
+                create_vfio_nodes=["12"],
+            )
+            host_vfio12 = dev_root / "vfio" / "12"
+
+            # PID 5001: regular file at a decoy /dev/vfio/12 path (different mount ns) -> MUST NOT match.
+            decoy_reg = root / "container_ns" / "dev" / "vfio" / "12"
+            decoy_reg.parent.mkdir(parents=True, exist_ok=True)
+            decoy_reg.write_text("not a vfio device", encoding="utf-8")
+            (proc_root / "5001" / "fd").mkdir(parents=True, exist_ok=True)
+            os.symlink(str(decoy_reg), proc_root / "5001" / "fd" / "3")
+
+            # PID 5002: bind-mounted char device under a completely different path (/custom/tpu0)
+            # with the SAME st_rdev (242:12) as host /dev/vfio/12 -> MUST match!
+            bind_mounted = root / "custom" / "tpu0"
+            bind_mounted.parent.mkdir(parents=True, exist_ok=True)
+            bind_mounted.write_text("", encoding="utf-8")
+            (proc_root / "5002" / "fd").mkdir(parents=True, exist_ok=True)
+            os.symlink(str(bind_mounted), proc_root / "5002" / "fd" / "4")
+
+            # PID 5003: different char device (242:99) -> MUST NOT match.
+            other_char = root / "dev" / "vfio" / "99"
+            other_char.write_text("", encoding="utf-8")
+            (proc_root / "5003" / "fd").mkdir(parents=True, exist_ok=True)
+            os.symlink(str(other_char), proc_root / "5003" / "fd" / "5")
+
+            orig_os_stat = os.stat
+            st12 = orig_os_stat(host_vfio12)
+            st_bind = orig_os_stat(bind_mounted)
+            st_other = orig_os_stat(other_char)
+            ids_12 = {(st12.st_dev, st12.st_ino), (st_bind.st_dev, st_bind.st_ino)}
+            id_other = (st_other.st_dev, st_other.st_ino)
+
+            def _mock_os_stat(path_arg, *args, **kwargs):
+                st = orig_os_stat(path_arg, *args, **kwargs)
+                key = (st.st_dev, st.st_ino)
+                if key in ids_12:
+                    fake = mock.MagicMock()
+                    fake.st_mode = _stat.S_IFCHR | 0o600
+                    fake.st_rdev = os.makedev(242, 12)
+                    return fake
+                if key == id_other:
+                    fake = mock.MagicMock()
+                    fake.st_mode = _stat.S_IFCHR | 0o600
+                    fake.st_rdev = os.makedev(242, 99)
+                    return fake
+                return st
+
+            with mock.patch("tpu_exporter.os.stat", side_effect=_mock_os_stat):
+                snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin=None,
+                )
+
+            self.assertTrue(snap.pid_telemetry_available)
+            self.assertEqual(snap.devices[0].active_pids, [5002])
 
     def _assert_valid_prometheus_text(self, text: str) -> None:
         lines = [ln for ln in text.splitlines() if ln.strip()]

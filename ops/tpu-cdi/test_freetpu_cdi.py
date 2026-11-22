@@ -3,18 +3,53 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 CDI_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(CDI_DIR))
 
 import freetpu_cdi  # noqa: E402
+
+
+@contextlib.contextmanager
+def _mock_vfio_char_devices():
+    """Patch Path.stat so synthetic `<dev_root>/vfio/*` files behave as real Linux char devices."""
+    orig_stat = Path.stat
+
+    def _char_stat(p: Path, *args, **kwargs):
+        st = orig_stat(p, *args, **kwargs)
+        if p.parent.name == "vfio":
+            fake = mock.MagicMock()
+            fake.st_mode = stat.S_IFCHR | 0o600
+            if p.name == "vfio":
+                fake.st_rdev = os.makedev(10, 196)
+            elif p.name.isdigit():
+                fake.st_rdev = os.makedev(242, int(p.name))
+            else:
+                fake.st_rdev = os.makedev(242, 250)
+            return fake
+        return st
+
+    with mock.patch.object(Path, "stat", autospec=True, side_effect=_char_stat):
+        yield
+
+
+def _run_cli_inproc(argv: list[str]) -> tuple[int, str, str]:
+    out = io.StringIO()
+    err = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = freetpu_cdi.main(argv)
+    return rc, out.getvalue(), err.getvalue()
 
 
 def _make_mock_pci_vfio(
@@ -87,17 +122,18 @@ class FreeTpuCdiTests(unittest.TestCase):
                 create_vfio_nodes=["0"],
             )
 
-            chips, vfio_container = freetpu_cdi.discover_tpu_chips(
-                sysfs_root=sysfs_root,
-                dev_root=dev_root,
-            )
-            self.assertEqual(len(chips), 1)
-            self.assertEqual(chips[0].pci_bdf, "0000:00:06.0")
-            self.assertEqual(chips[0].generation, "v5e")
+            with _mock_vfio_char_devices():
+                chips, vfio_container = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                )
+                self.assertEqual(len(chips), 1)
+                self.assertEqual(chips[0].pci_bdf, "0000:00:06.0")
+                self.assertEqual(chips[0].generation, "v5e")
 
-            spec = freetpu_cdi.build_cdi_spec(chips, vfio_container)
-            errors = freetpu_cdi.validate_cdi_spec(spec)
-            self.assertEqual(errors, [])
+                spec = freetpu_cdi.build_cdi_spec(chips, vfio_container)
+                errors = freetpu_cdi.validate_cdi_spec(spec)
+                self.assertEqual(errors, [])
 
             self.assertEqual(spec["cdiVersion"], "0.6.0")
             self.assertEqual(spec["kind"], "freetpu.dev/tpu")
@@ -156,25 +192,21 @@ class FreeTpuCdiTests(unittest.TestCase):
                 create_vfio_nodes=["0", "1"],
             )
 
-            out_file = root / "etc" / "cdi" / "freetpu.json"
-            script = CDI_DIR / "freetpu_cdi.py"
-            subprocess.run(
-                [
-                    sys.executable,
-                    str(script),
-                    "generate",
-                    "--output",
-                    str(out_file),
-                    "--validate",
-                    "--sysfs-root",
-                    str(sysfs_root),
-                    "--dev-root",
-                    str(dev_root),
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
+            out_file = root / "var" / "run" / "cdi" / "freetpu.json"
+            with _mock_vfio_char_devices():
+                rc, _stdout, stderr = _run_cli_inproc(
+                    [
+                        "generate",
+                        "--output",
+                        str(out_file),
+                        "--validate",
+                        "--sysfs-root",
+                        str(sysfs_root),
+                        "--dev-root",
+                        str(dev_root),
+                    ]
+                )
+                self.assertEqual(rc, 0, stderr)
 
             spec = json.loads(out_file.read_text(encoding="utf-8"))
             self.assertEqual(freetpu_cdi.validate_cdi_spec(spec), [])
@@ -200,6 +232,7 @@ class FreeTpuCdiTests(unittest.TestCase):
             self.assertEqual(all_nodes, ["/dev/vfio/0", "/dev/vfio/1"])
             self.assertNotIn("hooks", spec["containerEdits"])
 
+            script = CDI_DIR / "freetpu_cdi.py"
             val_res = subprocess.run(
                 [sys.executable, str(script), "validate", str(out_file)],
                 check=True,
@@ -292,8 +325,9 @@ class FreeTpuCdiTests(unittest.TestCase):
                 ],
                 create_vfio_nodes=["0", "1"],
             )
-            with self.assertRaisesRegex(RuntimeError, "non-TPU PCI device.*0000:00:05.0"):
-                freetpu_cdi.discover_tpu_chips(sysfs_root=sysfs_root, dev_root=dev_root)
+            with _mock_vfio_char_devices():
+                with self.assertRaisesRegex(RuntimeError, "non-TPU PCI device.*0000:00:05.0"):
+                    freetpu_cdi.discover_tpu_chips(sysfs_root=sysfs_root, dev_root=dev_root)
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -314,8 +348,9 @@ class FreeTpuCdiTests(unittest.TestCase):
             extra_dev = sysfs_root / "kernel" / "iommu_groups" / "0" / "devices" / "0000:00:09.0"
             extra_dev.parent.mkdir(parents=True, exist_ok=True)
             extra_dev.write_text("", encoding="utf-8")
-            with self.assertRaisesRegex(RuntimeError, "0000:00:09.0"):
-                freetpu_cdi.discover_tpu_chips(sysfs_root=sysfs_root, dev_root=dev_root)
+            with _mock_vfio_char_devices():
+                with self.assertRaisesRegex(RuntimeError, "0000:00:09.0"):
+                    freetpu_cdi.discover_tpu_chips(sysfs_root=sysfs_root, dev_root=dev_root)
 
         # Direct build_cdi_spec defense-in-depth check.
         bad_chip = freetpu_cdi.DiscoveredChip(
@@ -350,8 +385,9 @@ class FreeTpuCdiTests(unittest.TestCase):
                 ],
                 create_vfio_nodes=["0"],
             )
-            with self.assertRaisesRegex(RuntimeError, "vfio-pci"):
-                freetpu_cdi.discover_tpu_chips(sysfs_root=sysfs_root, dev_root=dev_root)
+            with _mock_vfio_char_devices():
+                with self.assertRaisesRegex(RuntimeError, "vfio-pci"):
+                    freetpu_cdi.discover_tpu_chips(sysfs_root=sysfs_root, dev_root=dev_root)
 
     def test_device_nodes_omit_major_minor_for_char_devices(self) -> None:
         import stat as _stat
@@ -494,95 +530,86 @@ class FreeTpuCdiTests(unittest.TestCase):
                 create_vfio_nodes=["0"],
             )
             spec_path = root / "var" / "run" / "cdi" / "freetpu.json"
-            script = CDI_DIR / "freetpu_cdi.py"
 
-            # Initial sync writes a valid spec.
-            ok, _msg = freetpu_cdi.reconcile_cdi_spec(
-                spec_path,
-                sysfs_root=sysfs_root,
-                dev_root=dev_root,
-            )
-            self.assertTrue(ok)
-            self.assertTrue(spec_path.exists())
+            with _mock_vfio_char_devices():
+                # Initial sync writes a valid spec.
+                ok, _msg = freetpu_cdi.reconcile_cdi_spec(
+                    spec_path,
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                )
+                self.assertTrue(ok)
+                self.assertTrue(spec_path.exists())
 
-            # Live host validation succeeds while topology matches.
-            val_ok = subprocess.run(
-                [
-                    sys.executable,
-                    str(script),
-                    "validate",
-                    str(spec_path),
-                    "--check-host",
-                    "--sysfs-root",
-                    str(sysfs_root),
-                    "--dev-root",
-                    str(dev_root),
-                ],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            self.assertIn("host VFIO identity verified", val_ok.stdout)
+                # Live host validation succeeds while topology matches.
+                rc_ok, out_ok, err_ok = _run_cli_inproc(
+                    [
+                        "validate",
+                        str(spec_path),
+                        "--check-host",
+                        "--sysfs-root",
+                        str(sysfs_root),
+                        "--dev-root",
+                        str(dev_root),
+                    ]
+                )
+                self.assertEqual(rc_ok, 0, err_ok)
+                self.assertIn("host VFIO identity verified", out_ok)
 
-            # Simulate topology shift on the same host (same dev_root, shifted sysfs):
-            # group 0 is reassigned to a different TPU BDF while spec still expects
-            # 0000:00:06.0 in group 0.
-            shifted_sysfs, _unused_dev = _make_mock_pci_vfio(
-                root / "shifted",
-                devices=[
-                    {
-                        "bdf": "0000:00:09.0",
-                        "vendor": "0x1ae0",
-                        "device": "0x0063",
-                        "driver": "vfio-pci",
-                        "iommu_group": "0",
-                    }
-                ],
-                create_vfio_nodes=["0"],
-            )
-            val_stale = subprocess.run(
-                [
-                    sys.executable,
-                    str(script),
-                    "validate",
-                    str(spec_path),
-                    "--check-host",
-                    "--remove-if-stale",
-                    "--sysfs-root",
-                    str(shifted_sysfs),
-                    "--dev-root",
-                    str(dev_root),
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertNotEqual(val_stale.returncode, 0)
-            self.assertIn("stale VFIO group identity", val_stale.stderr)
-            self.assertFalse(spec_path.exists())
+                # Simulate topology shift on the same host (same dev_root, shifted sysfs):
+                # group 0 is reassigned to a different TPU BDF while spec still expects
+                # 0000:00:06.0 in group 0.
+                shifted_sysfs, _unused_dev = _make_mock_pci_vfio(
+                    root / "shifted",
+                    devices=[
+                        {
+                            "bdf": "0000:00:09.0",
+                            "vendor": "0x1ae0",
+                            "device": "0x0063",
+                            "driver": "vfio-pci",
+                            "iommu_group": "0",
+                        }
+                    ],
+                    create_vfio_nodes=["0"],
+                )
+                rc_stale, _out_stale, err_stale = _run_cli_inproc(
+                    [
+                        "validate",
+                        str(spec_path),
+                        "--check-host",
+                        "--remove-if-stale",
+                        "--sysfs-root",
+                        str(shifted_sysfs),
+                        "--dev-root",
+                        str(dev_root),
+                    ]
+                )
+                self.assertNotEqual(rc_stale, 0)
+                self.assertIn("stale VFIO group identity", err_stale)
+                self.assertFalse(spec_path.exists())
 
-            # Re-create spec, then simulate non-TPU device entering group 0:
-            # sync must invalidate/unlink the stale spec immediately.
-            ok2, _msg2 = freetpu_cdi.reconcile_cdi_spec(
-                spec_path,
-                sysfs_root=sysfs_root,
-                dev_root=dev_root,
-            )
-            self.assertTrue(ok2)
-            self.assertTrue(spec_path.exists())
+                # Re-create spec, then simulate non-TPU device entering group 0:
+                # sync must invalidate/unlink the stale spec immediately.
+                ok2, _msg2 = freetpu_cdi.reconcile_cdi_spec(
+                    spec_path,
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                )
+                self.assertTrue(ok2)
+                self.assertTrue(spec_path.exists())
 
-            extra_non_tpu = sysfs_root / "kernel" / "iommu_groups" / "0" / "devices" / "0000:00:05.0"
-            extra_non_tpu.parent.mkdir(parents=True, exist_ok=True)
-            extra_non_tpu.write_text("", encoding="utf-8")
+                extra_non_tpu = sysfs_root / "kernel" / "iommu_groups" / "0" / "devices" / "0000:00:05.0"
+                extra_non_tpu.parent.mkdir(parents=True, exist_ok=True)
+                extra_non_tpu.write_text("", encoding="utf-8")
 
-            ok3, msg3 = freetpu_cdi.reconcile_cdi_spec(
-                spec_path,
-                sysfs_root=sysfs_root,
-                dev_root=dev_root,
-            )
-            self.assertFalse(ok3)
-            self.assertIn("removed stale", msg3)
-            self.assertFalse(spec_path.exists())
+                ok3, msg3 = freetpu_cdi.reconcile_cdi_spec(
+                    spec_path,
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                )
+                self.assertFalse(ok3)
+                self.assertIn("removed stale", msg3)
+                self.assertFalse(spec_path.exists())
 
     def test_selectors_stay_bound_to_physical_chip_when_earlier_chip_disappears(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -608,38 +635,39 @@ class FreeTpuCdiTests(unittest.TestCase):
                 create_vfio_nodes=["0", "1"],
             )
             spec_path = root / "var" / "run" / "cdi" / "freetpu.json"
-            ok1, _ = freetpu_cdi.reconcile_cdi_spec(spec_path, sysfs_root=sysfs_2, dev_root=dev_2)
-            self.assertTrue(ok1)
-            spec1 = json.loads(spec_path.read_text(encoding="utf-8"))
-            self.assertEqual(
-                [d["name"] for d in spec1["devices"]],
-                ["pci-0000-00-05-0", "pci-0000-00-06-0", "all"],
-            )
+            with _mock_vfio_char_devices():
+                ok1, _ = freetpu_cdi.reconcile_cdi_spec(spec_path, sysfs_root=sysfs_2, dev_root=dev_2)
+                self.assertTrue(ok1)
+                spec1 = json.loads(spec_path.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    [d["name"] for d in spec1["devices"]],
+                    ["pci-0000-00-05-0", "pci-0000-00-06-0", "all"],
+                )
 
-            # Earlier chip 0000:00:05.0 disappears; 0000:00:06.0 remains.
-            sysfs_1, dev_1 = _make_mock_pci_vfio(
-                root / "one",
-                devices=[
-                    {
-                        "bdf": "0000:00:06.0",
-                        "vendor": "0x1ae0",
-                        "device": "0x0063",
-                        "driver": "vfio-pci",
-                        "iommu_group": "1",
-                    }
-                ],
-                create_vfio_nodes=["1"],
-            )
-            ok2, _ = freetpu_cdi.reconcile_cdi_spec(spec_path, sysfs_root=sysfs_1, dev_root=dev_1)
-            self.assertTrue(ok2)
-            spec2 = json.loads(spec_path.read_text(encoding="utf-8"))
-            names2 = [d["name"] for d in spec2["devices"]]
-            self.assertEqual(names2, ["pci-0000-00-06-0", "all"])
-            self.assertNotIn("pci-0000-00-05-0", names2)
-            self.assertEqual(
-                spec2["devices"][0]["annotations"]["freetpu.dev/pci-bdf"],
-                "0000:00:06.0",
-            )
+                # Earlier chip 0000:00:05.0 disappears; 0000:00:06.0 remains.
+                sysfs_1, dev_1 = _make_mock_pci_vfio(
+                    root / "one",
+                    devices=[
+                        {
+                            "bdf": "0000:00:06.0",
+                            "vendor": "0x1ae0",
+                            "device": "0x0063",
+                            "driver": "vfio-pci",
+                            "iommu_group": "1",
+                        }
+                    ],
+                    create_vfio_nodes=["1"],
+                )
+                ok2, _ = freetpu_cdi.reconcile_cdi_spec(spec_path, sysfs_root=sysfs_1, dev_root=dev_1)
+                self.assertTrue(ok2)
+                spec2 = json.loads(spec_path.read_text(encoding="utf-8"))
+                names2 = [d["name"] for d in spec2["devices"]]
+                self.assertEqual(names2, ["pci-0000-00-06-0", "all"])
+                self.assertNotIn("pci-0000-00-05-0", names2)
+                self.assertEqual(
+                    spec2["devices"][0]["annotations"]["freetpu.dev/pci-bdf"],
+                    "0000:00:06.0",
+                )
 
     def test_reconcile_refreshes_spec_when_vfio_char_devnums_change(self) -> None:
         import stat as _stat
@@ -738,141 +766,181 @@ class FreeTpuCdiTests(unittest.TestCase):
                 ],
                 create_vfio_nodes=["0", "99"],
             )
-            chips, vfio_container = freetpu_cdi.discover_tpu_chips(
-                sysfs_root=sysfs_root, dev_root=dev_root
-            )
-            base_spec = freetpu_cdi.build_cdi_spec(chips, vfio_container)
-            self.assertEqual(
-                freetpu_cdi.verify_spec_against_host(
-                    base_spec, sysfs_root=sysfs_root, dev_root=dev_root
-                ),
-                [],
-            )
+            with _mock_vfio_char_devices():
+                chips, vfio_container = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                base_spec = freetpu_cdi.build_cdi_spec(chips, vfio_container)
+                self.assertEqual(
+                    freetpu_cdi.verify_spec_against_host(
+                        base_spec, sysfs_root=sysfs_root, dev_root=dev_root
+                    ),
+                    [],
+                )
 
-            # 1. Tampered per-device hostPath pointing to /dev/vfio/99 while path says /dev/vfio/0.
-            tampered_hp = json.loads(json.dumps(base_spec))
-            tampered_hp["devices"][0]["containerEdits"]["deviceNodes"][0]["hostPath"] = str(
-                dev_root / "vfio" / "99"
-            )
-            errs_hp = freetpu_cdi.verify_spec_against_host(
-                tampered_hp, sysfs_root=sysfs_root, dev_root=dev_root
-            )
-            self.assertTrue(any("not a verified TPU-only VFIO group" in e for e in errs_hp))
+                # 1. Tampered per-device hostPath pointing to /dev/vfio/99 while path says /dev/vfio/0.
+                tampered_hp = json.loads(json.dumps(base_spec))
+                tampered_hp["devices"][0]["containerEdits"]["deviceNodes"][0]["hostPath"] = str(
+                    dev_root / "vfio" / "99"
+                )
+                errs_hp = freetpu_cdi.verify_spec_against_host(
+                    tampered_hp, sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                self.assertTrue(any("not a verified TPU-only VFIO group" in e for e in errs_hp))
 
-            # 2. Rogue device added to global containerEdits.deviceNodes (affects every selector).
-            rogue_global = json.loads(json.dumps(base_spec))
-            rogue_global["containerEdits"]["deviceNodes"].append(
-                {
-                    "path": "/dev/vfio/99",
-                    "hostPath": str(dev_root / "vfio" / "99"),
-                    "type": "c",
-                    "permissions": "rw",
-                }
-            )
-            errs_global = freetpu_cdi.verify_spec_against_host(
-                rogue_global, sysfs_root=sysfs_root, dev_root=dev_root
-            )
-            self.assertTrue(any("unauthorized host device" in e for e in errs_global))
+                # 2. Rogue device added to global containerEdits.deviceNodes (affects every selector).
+                rogue_global = json.loads(json.dumps(base_spec))
+                rogue_global["containerEdits"]["deviceNodes"].append(
+                    {
+                        "path": "/dev/vfio/99",
+                        "hostPath": str(dev_root / "vfio" / "99"),
+                        "type": "c",
+                        "permissions": "rw",
+                    }
+                )
+                errs_global = freetpu_cdi.verify_spec_against_host(
+                    rogue_global, sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                self.assertTrue(any("unauthorized host device" in e for e in errs_global))
 
-            # 3. Explicit pinned major/minor on a VFIO node must be rejected by --check-host.
-            pinned_spec = json.loads(json.dumps(base_spec))
-            pinned_spec["devices"][0]["containerEdits"]["deviceNodes"][0]["major"] = 242
-            pinned_spec["devices"][0]["containerEdits"]["deviceNodes"][0]["minor"] = 99
-            errs_pinned = freetpu_cdi.verify_spec_against_host(
-                pinned_spec, sysfs_root=sysfs_root, dev_root=dev_root
-            )
-            self.assertTrue(any("explicit major/minor" in e for e in errs_pinned))
+                # 3. Explicit pinned major/minor on a VFIO node must be rejected by --check-host.
+                pinned_spec = json.loads(json.dumps(base_spec))
+                pinned_spec["devices"][0]["containerEdits"]["deviceNodes"][0]["major"] = 242
+                pinned_spec["devices"][0]["containerEdits"]["deviceNodes"][0]["minor"] = 99
+                errs_pinned = freetpu_cdi.verify_spec_against_host(
+                    pinned_spec, sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                self.assertTrue(any("explicit major/minor" in e for e in errs_pinned))
 
-            # 4. Global and per-device mounts and OCI hooks must be rejected in --check-host mode.
-            global_mount_spec = json.loads(json.dumps(base_spec))
-            global_mount_spec["containerEdits"]["mounts"] = [
-                {"hostPath": "/tmp", "containerPath": "/dev/vfio"}
-            ]
-            errs_gm = freetpu_cdi.verify_spec_against_host(
-                global_mount_spec, sysfs_root=sysfs_root, dev_root=dev_root
-            )
-            self.assertTrue(any("mounts" in e for e in errs_gm))
+                # 4. Global and per-device mounts and OCI hooks must be rejected in --check-host mode.
+                global_mount_spec = json.loads(json.dumps(base_spec))
+                global_mount_spec["containerEdits"]["mounts"] = [
+                    {"hostPath": "/tmp", "containerPath": "/dev/vfio"}
+                ]
+                errs_gm = freetpu_cdi.verify_spec_against_host(
+                    global_mount_spec, sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                self.assertTrue(any("mounts" in e for e in errs_gm))
 
-            global_hook_spec = json.loads(json.dumps(base_spec))
-            global_hook_spec["containerEdits"]["hooks"] = [
-                {"hookName": "createRuntime", "path": "/bin/sh"}
-            ]
-            errs_gh = freetpu_cdi.verify_spec_against_host(
-                global_hook_spec, sysfs_root=sysfs_root, dev_root=dev_root
-            )
-            self.assertTrue(any("hooks" in e for e in errs_gh))
+                global_hook_spec = json.loads(json.dumps(base_spec))
+                global_hook_spec["containerEdits"]["hooks"] = [
+                    {"hookName": "createRuntime", "path": "/bin/sh"}
+                ]
+                errs_gh = freetpu_cdi.verify_spec_against_host(
+                    global_hook_spec, sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                self.assertTrue(any("hooks" in e for e in errs_gh))
 
-            dev_mount_spec = json.loads(json.dumps(base_spec))
-            dev_mount_spec["devices"][0]["containerEdits"]["mounts"] = [
-                {"hostPath": "/tmp", "containerPath": "/dev/vfio"}
-            ]
-            errs_dm = freetpu_cdi.verify_spec_against_host(
-                dev_mount_spec, sysfs_root=sysfs_root, dev_root=dev_root
-            )
-            self.assertTrue(any("mounts" in e for e in errs_dm))
+                dev_mount_spec = json.loads(json.dumps(base_spec))
+                dev_mount_spec["devices"][0]["containerEdits"]["mounts"] = [
+                    {"hostPath": "/tmp", "containerPath": "/dev/vfio"}
+                ]
+                errs_dm = freetpu_cdi.verify_spec_against_host(
+                    dev_mount_spec, sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                self.assertTrue(any("mounts" in e for e in errs_dm))
 
-            dev_hook_spec = json.loads(json.dumps(base_spec))
-            dev_hook_spec["devices"][0]["containerEdits"]["hooks"] = [
-                {"hookName": "createRuntime", "path": "/bin/sh"}
-            ]
-            errs_dh = freetpu_cdi.verify_spec_against_host(
-                dev_hook_spec, sysfs_root=sysfs_root, dev_root=dev_root
-            )
-            self.assertTrue(any("hooks" in e for e in errs_dh))
+                dev_hook_spec = json.loads(json.dumps(base_spec))
+                dev_hook_spec["devices"][0]["containerEdits"]["hooks"] = [
+                    {"hookName": "createRuntime", "path": "/bin/sh"}
+                ]
+                errs_dh = freetpu_cdi.verify_spec_against_host(
+                    dev_hook_spec, sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                self.assertTrue(any("hooks" in e for e in errs_dh))
 
-            # 5. Case-variant / unknown keys (Go JSON decoder matches case-insensitively!)
-            # must be rejected on deviceNodes, containerEdits, device entries, and root.
-            case_major_spec = json.loads(json.dumps(base_spec))
-            case_major_spec["devices"][0]["containerEdits"]["deviceNodes"][0]["Major"] = 242
-            case_major_spec["devices"][0]["containerEdits"]["deviceNodes"][0]["Minor"] = 99
-            errs_case_major = freetpu_cdi.verify_spec_against_host(
-                case_major_spec, sysfs_root=sysfs_root, dev_root=dev_root
-            )
-            self.assertTrue(any("Major" in e and "Minor" in e for e in errs_case_major))
-            self.assertTrue(any("Major" in e for e in freetpu_cdi.validate_cdi_spec(case_major_spec)))
+                # 5. Case-variant / unknown keys (Go JSON decoder matches case-insensitively!)
+                # must be rejected on deviceNodes, containerEdits, device entries, and root.
+                case_major_spec = json.loads(json.dumps(base_spec))
+                case_major_spec["devices"][0]["containerEdits"]["deviceNodes"][0]["Major"] = 242
+                case_major_spec["devices"][0]["containerEdits"]["deviceNodes"][0]["Minor"] = 99
+                errs_case_major = freetpu_cdi.verify_spec_against_host(
+                    case_major_spec, sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                self.assertTrue(any("Major" in e and "Minor" in e for e in errs_case_major))
+                self.assertTrue(
+                    any("Major" in e for e in freetpu_cdi.validate_cdi_spec(case_major_spec))
+                )
 
-            case_hp_spec = json.loads(json.dumps(base_spec))
-            case_hp_spec["devices"][0]["containerEdits"]["deviceNodes"][0]["HostPath"] = str(
-                dev_root / "vfio" / "99"
-            )
-            errs_case_hp = freetpu_cdi.verify_spec_against_host(
-                case_hp_spec, sysfs_root=sysfs_root, dev_root=dev_root
-            )
-            self.assertTrue(any("HostPath" in e for e in errs_case_hp))
+                case_hp_spec = json.loads(json.dumps(base_spec))
+                case_hp_spec["devices"][0]["containerEdits"]["deviceNodes"][0]["HostPath"] = str(
+                    dev_root / "vfio" / "99"
+                )
+                errs_case_hp = freetpu_cdi.verify_spec_against_host(
+                    case_hp_spec, sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                self.assertTrue(any("HostPath" in e for e in errs_case_hp))
 
-            case_hooks_spec = json.loads(json.dumps(base_spec))
-            case_hooks_spec["containerEdits"]["Hooks"] = [
-                {"hookName": "createRuntime", "path": "/bin/sh"}
-            ]
-            errs_case_hooks = freetpu_cdi.verify_spec_against_host(
-                case_hooks_spec, sysfs_root=sysfs_root, dev_root=dev_root
-            )
-            self.assertTrue(any("Hooks" in e for e in errs_case_hooks))
+                case_hooks_spec = json.loads(json.dumps(base_spec))
+                case_hooks_spec["containerEdits"]["Hooks"] = [
+                    {"hookName": "createRuntime", "path": "/bin/sh"}
+                ]
+                errs_case_hooks = freetpu_cdi.verify_spec_against_host(
+                    case_hooks_spec, sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                self.assertTrue(any("Hooks" in e for e in errs_case_hooks))
 
-            case_mounts_spec = json.loads(json.dumps(base_spec))
-            case_mounts_spec["devices"][0]["containerEdits"]["Mounts"] = [
-                {"hostPath": "/tmp", "containerPath": "/dev/vfio"}
-            ]
-            errs_case_mounts = freetpu_cdi.verify_spec_against_host(
-                case_mounts_spec, sysfs_root=sysfs_root, dev_root=dev_root
-            )
-            self.assertTrue(any("Mounts" in e for e in errs_case_mounts))
+                case_mounts_spec = json.loads(json.dumps(base_spec))
+                case_mounts_spec["devices"][0]["containerEdits"]["Mounts"] = [
+                    {"hostPath": "/tmp", "containerPath": "/dev/vfio"}
+                ]
+                errs_case_mounts = freetpu_cdi.verify_spec_against_host(
+                    case_mounts_spec, sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                self.assertTrue(any("Mounts" in e for e in errs_case_mounts))
 
-            # Duplicate/case-colliding JSON keys in raw spec file must fail CLI validate --check-host.
-            raw_spec_path = root / "dup-keys.json"
-            raw_spec_path.write_text(
-                json.dumps(case_major_spec),
-                encoding="utf-8",
+                # Duplicate/case-colliding JSON keys in raw spec file must fail CLI validate --check-host.
+                raw_spec_path = root / "dup-keys.json"
+                raw_spec_path.write_text(
+                    json.dumps(case_major_spec),
+                    encoding="utf-8",
+                )
+                rc_dup, _out_dup, _err_dup = _run_cli_inproc(
+                    [
+                        "validate",
+                        str(raw_spec_path),
+                        "--check-host",
+                        "--remove-if-stale",
+                        "--sysfs-root",
+                        str(sysfs_root),
+                        "--dev-root",
+                        str(dev_root),
+                    ]
+                )
+                self.assertNotEqual(rc_dup, 0)
+                self.assertFalse(raw_spec_path.exists())
+
+    def test_regular_file_at_vfio_path_rejected_in_live_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # Plain regular files (NOT char devices) at /dev/vfio/vfio and /dev/vfio/12.
+            sysfs_root, dev_root = _make_mock_pci_vfio(
+                root,
+                devices=[
+                    {
+                        "bdf": "0000:00:06.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0063",
+                        "driver": "vfio-pci",
+                        "iommu_group": "12",
+                    }
+                ],
+                create_vfio_container=True,
+                create_vfio_nodes=["12"],
             )
+            with self.assertRaisesRegex(RuntimeError, "not a character device"):
+                freetpu_cdi.discover_tpu_chips(sysfs_root=sysfs_root, dev_root=dev_root)
+
+            # Real subprocess CLI generate must also reject regular files cleanly.
             script = CDI_DIR / "freetpu_cdi.py"
-            cli_dup = subprocess.run(
+            out_path = root / "var" / "run" / "cdi" / "freetpu.json"
+            res = subprocess.run(
                 [
                     sys.executable,
                     str(script),
-                    "validate",
-                    str(raw_spec_path),
-                    "--check-host",
-                    "--remove-if-stale",
+                    "generate",
+                    "--output",
+                    str(out_path),
                     "--sysfs-root",
                     str(sysfs_root),
                     "--dev-root",
@@ -882,8 +950,83 @@ class FreeTpuCdiTests(unittest.TestCase):
                 text=True,
                 check=False,
             )
-            self.assertNotEqual(cli_dup.returncode, 0)
-            self.assertFalse(raw_spec_path.exists())
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("not a character device", res.stderr)
+            self.assertFalse(out_path.exists())
+
+            # Host validation against regular files must also fail.
+            with _mock_vfio_char_devices():
+                chips, vfio_container = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                spec = freetpu_cdi.build_cdi_spec(chips, vfio_container)
+            errs = freetpu_cdi.verify_spec_against_host(
+                spec, sysfs_root=sysfs_root, dev_root=dev_root
+            )
+            self.assertTrue(any("not a character device" in e for e in errs))
+
+    def test_reconcile_invalidates_stale_spec_on_publication_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sysfs_root, dev_root = _make_mock_pci_vfio(
+                root,
+                devices=[
+                    {
+                        "bdf": "0000:00:06.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0063",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                    }
+                ],
+                create_vfio_nodes=["0"],
+            )
+            spec_path = root / "var" / "run" / "cdi" / "freetpu.json"
+            spec_path.parent.mkdir(parents=True, exist_ok=True)
+            spec_path.write_text('{"stale": "old-group"}\n', encoding="utf-8")
+
+            with _mock_vfio_char_devices():
+                # 1. Publication OSError (e.g. ENOSPC on /run) must unlink stale spec without raising.
+                with mock.patch.object(
+                    freetpu_cdi,
+                    "_write_spec_atomic",
+                    side_effect=OSError("No space left on device"),
+                ):
+                    ok, msg = freetpu_cdi.reconcile_cdi_spec(
+                        spec_path, sysfs_root=sysfs_root, dev_root=dev_root
+                    )
+                self.assertFalse(ok)
+                self.assertIn("publication failed", msg)
+                self.assertIn("removed stale", msg)
+                self.assertFalse(spec_path.exists())
+
+                # 2. If cleanup unlink also fails, error message explicitly reports cleanup failure.
+                spec_path.write_text('{"stale": "stuck"}\n', encoding="utf-8")
+                with (
+                    mock.patch.object(
+                        freetpu_cdi,
+                        "_write_spec_atomic",
+                        side_effect=OSError("No space left on device"),
+                    ),
+                    mock.patch.object(
+                        freetpu_cdi,
+                        "_invalidate_spec",
+                        return_value=(False, "Permission denied"),
+                    ),
+                ):
+                    ok2, msg2 = freetpu_cdi.reconcile_cdi_spec(
+                        spec_path, sysfs_root=sysfs_root, dev_root=dev_root
+                    )
+                self.assertFalse(ok2)
+                self.assertIn("FAILED to remove stale", msg2)
+                self.assertIn("Permission denied", msg2)
+
+                # 3. Once disk space recovers, next retry publishes cleanly.
+                ok3, msg3 = freetpu_cdi.reconcile_cdi_spec(
+                    spec_path, sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                self.assertTrue(ok3, msg3)
+                self.assertTrue(spec_path.exists())
 
 
 if __name__ == "__main__":

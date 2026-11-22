@@ -23,6 +23,28 @@ min by (generation, node, pci_bdf) (freetpu_tpu_health_status) == 0
 
 ## Compute & HBM Utilization
 
+### Runtime-Keyed Utilization (Works Out-of-the-Box with Default Sidecar)
+
+The default workload sidecar (`k8s-tpu-workload-telemetry-sidecar.yaml`) runs without `--chip-id-map` and publishes live `libtpu` readings under `freetpu_tpu_runtime_*`:
+
+```promql
+# Per-runtime-chip MXU / TensorCore duty cycle (%) — works out of the box
+freetpu_tpu_runtime_duty_cycle_percent
+
+# Average runtime MXU utilization (%) per node
+avg by (node) (freetpu_tpu_runtime_duty_cycle_percent)
+
+# HBM allocation ratio (0.0 - 1.0) per runtime chip
+freetpu_tpu_runtime_hbm_used_bytes / (freetpu_tpu_runtime_hbm_total_bytes > 0)
+
+# HBM used in GiB per runtime chip
+freetpu_tpu_runtime_hbm_used_bytes / (1024 * 1024 * 1024)
+```
+
+### Per-PCI-Chip Utilization (Requires Verified `--chip-id-map` or Sysfs `chip_id`)
+
+The per-PCI-BDF utilization queries below (and the per-PCI billing, idle-waste, coverage, and cost-per-utilized-TPU-hour queries in the next section) require a verified `--chip-id-map` (or kernel sysfs `chip_id`) binding `libtpu` runtime chip IDs to PCI BDFs:
+
 ```promql
 # Per-chip MXU / TensorCore duty cycle (%) deduplicated by physical chip
 max by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent)
@@ -38,6 +60,8 @@ max by (generation, node, pci_bdf) (freetpu_tpu_hbm_used_bytes) / (1024 * 1024 *
 ```
 
 ## Billing, Chargeback & Idle Waste Detection
+
+> **Prerequisite:** Queries referencing `freetpu_tpu_duty_cycle_percent` or `freetpu_tpu_hbm_used_bytes` require a verified `--chip-id-map` (or sysfs `chip_id`) on the telemetry collector so runtime readings attach to physical PCI BDFs. Inventory-only spend (`freetpu_tpu_info`) and host PID queries (`freetpu_tpu_active_pids`) do not require `--chip-id-map`.
 
 ```promql
 # Per-chip active chip-hours accrued over 24h per physical chip (generation, node, pci_bdf):
@@ -143,15 +167,17 @@ sum_over_time(
 # Measured-chip effective cost per utilized TPU-hour by generation.
 # Restricts BOTH numerator and denominator to deduplicated physical chips
 # `(generation, node, pci_bdf)` with usable, PCI-mapped
-# `freetpu_tpu_duty_cycle_percent` readings so neither partial telemetry coverage
-# nor multiple collectors per node skew the estimate. Replace the placeholder
-# SKU rates (v5e: 1.20, v5p: 4.20, v6e: 2.70) with your rates, and check the
-# telemetry coverage ratio above before extrapolating fleet-wide.
+# `freetpu_tpu_duty_cycle_percent` readings, and filters strictly to positive
+# total utilization (`> 0`) so zero-utilization generations are omitted rather
+# than reporting a synthetic finite cost and low positive utilizations divide by
+# their true measured value. Replace the placeholder SKU rates (v5e: 1.20,
+# v5p: 4.20, v6e: 2.70) with your rates, and check the telemetry coverage ratio
+# above before extrapolating fleet-wide.
 (
   count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent{generation="v5e"})) * 1.20
   or
   count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent{generation="v5p"})) * 4.20
   or
   count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent{generation="v6e"})) * 2.70
-) / clamp_min(sum by (generation) (max by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent) / 100), 0.01)
+) / (sum by (generation) (max by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent) / 100) > 0)
 ```

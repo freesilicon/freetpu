@@ -161,18 +161,32 @@ def _scan_proc_vfio_pids(
     proc_root: Path,
     vfio_paths: Sequence[str],
 ) -> Tuple[Dict[str, List[int]], bool, int]:
-    """Find PIDs holding open file descriptors to any /dev/vfio/<group> node.
+    """Find PIDs holding open character-device FDs matching host `/dev/vfio/<group>` `st_rdev`.
+
+    Compares each `/proc/<pid>/fd/<n>` target's file mode (`S_ISCHR`) and device
+    number (`st_rdev`) against the host VFIO group character device instead of
+    matching pathnames, so regular files at `/dev/vfio/<group>` in another mount
+    namespace are ignored while VFIO nodes bind-mounted under different paths
+    are accurately matched.
 
     Returns (pids_by_vfio_path, pid_telemetry_accessible, unreadable_pid_dirs).
     Permission failures on /proc/<pid>/fd mean PID telemetry may be incomplete,
     so callers must not confuse missing reads with zero active workloads.
     """
-    targets = {os.path.normpath(p): p for p in vfio_paths if p}
     result: Dict[str, List[int]] = {p: [] for p in vfio_paths if p}
-    if not targets:
+    if not result:
         return result, True, 0
     if not proc_root.is_dir():
         return result, False, 1
+
+    rdev_to_paths: Dict[int, List[str]] = {}
+    for vp in result:
+        try:
+            host_st = os.stat(vp)
+        except OSError:
+            continue
+        if stat.S_ISCHR(host_st.st_mode):
+            rdev_to_paths.setdefault(host_st.st_rdev, []).append(vp)
 
     try:
         entries = list(proc_root.iterdir())
@@ -195,18 +209,23 @@ def _scan_proc_vfio_pids(
         except OSError:
             # Process may have exited concurrently; not an access denial.
             continue
+        if not rdev_to_paths:
+            continue
         for fd_link in fds:
             try:
-                target = os.path.normpath(os.readlink(fd_link))
+                fd_st = os.stat(fd_link)
             except PermissionError:
                 unreadable += 1
                 continue
             except OSError:
                 continue
-            if target in targets:
-                canonical = targets[target]
-                if pid not in result[canonical]:
-                    result[canonical].append(pid)
+            if not stat.S_ISCHR(fd_st.st_mode):
+                continue
+            matched_paths = rdev_to_paths.get(fd_st.st_rdev)
+            if matched_paths:
+                for canonical in matched_paths:
+                    if pid not in result[canonical]:
+                        result[canonical].append(pid)
 
     for pids in result.values():
         pids.sort()
