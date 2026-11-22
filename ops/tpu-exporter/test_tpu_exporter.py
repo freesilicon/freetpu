@@ -903,12 +903,13 @@ TPU Device Status
                 create_vfio_container=False,
                 create_vfio_nodes=[],
             )
-            snap = tpu_exporter.collect_snapshot(
-                sysfs_root=sysfs_root,
-                dev_root=dev_root,
-                proc_root=proc_root,
-                tpu_info_bin=None,
-            )
+            with _mock_vfio_char_lstat():
+                snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin=None,
+                )
             # 4 PCI functions -> exactly 2 physical chips (1 v2 + 1 v3).
             self.assertEqual(len(snap.devices), 2)
 
@@ -1377,6 +1378,7 @@ TPU Device Status
                         "device": "0x006f",
                         "driver": "vfio-pci",
                         "iommu_group": "3",
+                        "enable": "2",
                     },
                     {
                         "bdf": "0000:00:09.0",
@@ -1385,8 +1387,23 @@ TPU Device Status
                         "driver": "vfio-pci",
                         "iommu_group": "3",
                     },
+                    # Chip 5 (group 4): TPU bound to vfio-pci sharing IOMMU group with host-driver endpoint -> healthy=False
+                    {
+                        "bdf": "0000:00:0a.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "4",
+                    },
+                    {
+                        "bdf": "0000:00:0a.1",
+                        "vendor": "0x1af4",
+                        "device": "0x1041",
+                        "driver": "virtio-pci",
+                        "iommu_group": "4",
+                    },
                 ],
-                create_vfio_nodes=["0", "1", "2", "3"],
+                create_vfio_nodes=["0", "1", "2", "3", "4"],
             )
             # Remove /sys/kernel/iommu_groups/2/devices to simulate unreadable/missing group dir.
             grp2_devs = sysfs_root / "kernel" / "iommu_groups" / "2" / "devices"
@@ -1394,18 +1411,29 @@ TPU Device Status
                 child.unlink()
             grp2_devs.rmdir()
 
-            snap = tpu_exporter.collect_snapshot(
-                sysfs_root=sysfs_root,
-                dev_root=dev_root,
-                proc_root=proc_root,
-                tpu_info_bin=None,
-            )
+            with _mock_vfio_char_lstat():
+                snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin=None,
+                )
             by_bdf = {d.pci_bdf: d for d in snap.devices}
             self.assertTrue(by_bdf["0000:00:05.0"].vfio_group_exclusive)
+            self.assertTrue(by_bdf["0000:00:05.0"].healthy)
             self.assertFalse(by_bdf["0000:00:06.0"].vfio_group_exclusive)
+            self.assertTrue(by_bdf["0000:00:06.0"].healthy)
             self.assertFalse(by_bdf["0000:00:07.0"].vfio_group_exclusive)
+            self.assertFalse(by_bdf["0000:00:07.0"].healthy)
             self.assertFalse(by_bdf["0000:00:08.0"].vfio_group_exclusive)
+            self.assertTrue(by_bdf["0000:00:08.0"].healthy)
+            # Sysfs PCI enable count > 1 (e.g. "2") must report pci_enabled=True.
+            self.assertTrue(by_bdf["0000:00:08.0"].pci_enabled)
             self.assertFalse(by_bdf["0000:00:09.0"].vfio_group_exclusive)
+            self.assertTrue(by_bdf["0000:00:09.0"].healthy)
+            # Non-viable VFIO group (sibling endpoint bound to host driver) must report healthy=False.
+            self.assertFalse(by_bdf["0000:00:0a.0"].vfio_group_exclusive)
+            self.assertFalse(by_bdf["0000:00:0a.0"].healthy)
 
             prom = tpu_exporter.format_prometheus_metrics(snap)
             self._assert_valid_prometheus_text(prom)

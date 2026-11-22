@@ -9,19 +9,25 @@
 #      NOT mount `/var/run/cdi`, publish CDI specs, or enable `hostPID` /
 #      `CAP_SYS_PTRACE` / `/proc` PID scanning by default). Because GKE Standard
 #      accepts `NetworkPolicy` objects even when policy enforcement is disabled,
-#      host PID telemetry is intentionally disabled by default (`--no-pid-scan
-#      --tpu-info-bin ""`) so unauthenticated `:9400` scrapes never expose host
-#      process IDs on clusters without enforced NetworkPolicy. To opt into host
-#      PID telemetry (`freetpu_tpu_active_pids`) on a cluster with verified
-#      NetworkPolicy enforcement (or behind an authenticating proxy such as
-#      `kube-rbac-proxy` with `--host 127.0.0.1`), add `hostPID: true`,
-#      `CAP_SYS_PTRACE`, `securityContext.appArmorProfile.type: Unconfined` (on
-#      GKE), and remove `--no-pid-scan`. Uses stock `python:3.12-slim` without
-#      `tpu-info` and runs outside workload Pod network namespaces, so it does
-#      NOT emit live HBM usage or MXU duty cycle. For live HBM + duty-cycle
-#      telemetry, run `tpu_exporter.py` with `tpu-info` inside the same network
-#      namespace as `libtpu` (`127.0.0.1:8431`, e.g. on standalone TPU VMs or
-#      with `--no-pid-scan` in an operator-managed Pod sidecar).
+#      two safeguards apply:
+#      (a) SHARED-CLUSTER PREREQUISITE (applies to inventory-only mode as well):
+#          enforced NetworkPolicy (e.g. GKE Dataplane V2, Cilium, or Calico)
+#          paired with admission controls forbidding tenant `hostNetwork: true`
+#          pods—OR binding `--host 127.0.0.1` behind an authenticating proxy
+#          such as `kube-rbac-proxy`—is required on shared/multi-tenant clusters
+#          so tenant workloads cannot starve the exporter's bounded `:9400`
+#          scrape worker pool while loopback `/healthz`/`/readyz` stays green.
+#      (b) Host PID telemetry is disabled by default (`--no-pid-scan
+#          --tpu-info-bin ""`) so `:9400` never exposes host PIDs unless an
+#          operator explicitly opts in after verifying the ingress isolation
+#          above (add `hostPID: true`, `CAP_SYS_PTRACE`,
+#          `securityContext.appArmorProfile.type: Unconfined` on GKE, and remove
+#          `--no-pid-scan`). Uses stock `python:3.12-slim` without `tpu-info`
+#          and runs outside workload Pod network namespaces, so it does NOT emit
+#          live HBM usage or MXU duty cycle. For live HBM + duty-cycle telemetry,
+#          run `tpu_exporter.py` with `tpu-info` inside the same network
+#          namespace as `libtpu` (`127.0.0.1:8431`, e.g. on standalone TPU VMs
+#          or with `--no-pid-scan` in an operator-managed Pod sidecar).
 #   2. `DaemonSet/freetpu-cdi-sync` (OPT-IN CDI publisher):
 #      Publishes boot-scoped `/var/run/cdi/freetpu.json` ONLY on TPU nodes
 #      explicitly labeled `freetpu.dev/cdi-enabled=true`.
@@ -317,18 +323,18 @@ spec:
             name: freetpu-ops-scripts
 ---
 # Restrict ingress to the node exporter's :9400/metrics port strictly to the
-# trusted monitoring Prometheus scraper so tenant workloads cannot compete for
-# the exporter's bounded scrape worker pool (or read host PID metrics if an
-# operator explicitly opts into hostPID scanning). Requires a CNI enforcing
-# Kubernetes NetworkPolicy (e.g. GKE Dataplane V2, Cilium, or Calico); note
-# that Kubernetes NetworkPolicy always permits traffic originating from the
-# exporter's own node, so on CNIs that treat same-node `hostNetwork: true` pods
-# as node traffic, also forbid tenant `hostNetwork: true` pods via admission
-# controls (e.g. ValidatingAdmissionPolicy) OR bind `--host 127.0.0.1` behind
-# an authenticating proxy such as kube-rbac-proxy (mTLS/RBAC). On clusters
-# without NetworkPolicy enforcement, bind `--host 127.0.0.1` behind an
-# authenticating proxy before opting into host PID telemetry. Adjust the
-# namespaceSelector and podSelector below to match your Prometheus pod.
+# trusted monitoring Prometheus scraper so tenant workloads cannot starve the
+# exporter's bounded scrape worker pool (even in default inventory-only mode) or
+# read host PID metrics if an operator explicitly opts into hostPID scanning.
+# SHARED-CLUSTER PREREQUISITE: requires a CNI enforcing Kubernetes NetworkPolicy
+# (e.g. GKE Dataplane V2, Cilium, or Calico) PLUS admission controls forbidding
+# tenant `hostNetwork: true` pods (since Kubernetes NetworkPolicy permits traffic
+# originating from the exporter's own node)—OR binding `--host 127.0.0.1` behind
+# an authenticating proxy such as kube-rbac-proxy (mTLS/RBAC). On GKE Standard
+# clusters without NetworkPolicy enforcement, always bind `--host 127.0.0.1`
+# behind an authenticating proxy on shared clusters (including inventory-only
+# mode). Adjust the namespaceSelector and podSelector below to match your
+# Prometheus pod.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

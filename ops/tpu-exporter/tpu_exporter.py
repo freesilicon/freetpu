@@ -949,6 +949,46 @@ def _collect_iommu_group_membership(
     return members, readable
 
 
+_VFIO_VIABLE_DRIVERS = frozenset({"vfio-pci", "pci-stub", "pcieport"})
+
+
+def _is_vfio_group_viable(
+    sysfs_root: Path,
+    iommu_group: str,
+    group_members: Dict[str, set[str]],
+    group_dir_readable: Dict[str, bool],
+) -> bool:
+    """Return True iff every endpoint in the IOMMU group is unbound or bound to a VFIO/stub driver.
+
+    Linux VFIO refuses to attach a group if any non-bridge device in that IOMMU
+    group remains bound to a host driver. Fail closed when the authoritative
+    `/sys/kernel/iommu_groups/<group>/devices` directory is missing/unreadable.
+    """
+    if not iommu_group or not group_dir_readable.get(iommu_group, False):
+        return False
+    members = group_members.get(iommu_group, set())
+    if not members:
+        return False
+    pci_dir = sysfs_root / "bus" / "pci" / "devices"
+    iommu_dev_root = sysfs_root / "kernel" / "iommu_groups" / iommu_group / "devices"
+    for member_bdf in members:
+        member_path = pci_dir / member_bdf
+        if not member_path.exists():
+            alt_path = iommu_dev_root / member_bdf
+            if alt_path.is_dir():
+                member_path = alt_path
+            else:
+                return False
+        class_raw = _normalize_hex_id(_read_text(member_path / "class") or "")
+        # Linux VFIO ignores PCI host/PCIe bridges (0x0600xx / 0x0604xx) for viability.
+        if class_raw.startswith("0x0604") or class_raw.startswith("0x0600"):
+            continue
+        member_driver = _read_symlink_name(member_path / "driver")
+        if member_driver and member_driver not in _VFIO_VIABLE_DRIVERS:
+            return False
+    return True
+
+
 def discover_tpu_devices(
     sysfs_root: Path = Path("/sys"),
     dev_root: Path = Path("/dev"),
@@ -992,7 +1032,12 @@ def discover_tpu_devices(
         driver = _read_symlink_name(entry / "driver") or "unbound"
         iommu_group = _read_symlink_name(entry / "iommu_group") or ""
         enable_raw = _read_text(entry / "enable")
-        pci_enabled = enable_raw == "1"
+        pci_enabled = False
+        if enable_raw is not None:
+            try:
+                pci_enabled = int(enable_raw, 0) > 0
+            except ValueError:
+                pci_enabled = False
         runtime_chip_id = _read_text(entry / "chip_id") or None
 
         numa_raw = _read_text(entry / "numa_node")
@@ -1015,13 +1060,17 @@ def discover_tpu_devices(
             and vfio_group_dn == kernel_group_dn
         )
 
-        # On vfio-pci, PCI `enable` is 0 while idle (no process holds /dev/vfio/*);
-        # readiness requires vfio-pci binding plus verified non-symlink character
-        # device nodes matching kernel sysfs major:minor for both /dev/vfio/vfio
-        # and /dev/vfio/<group>.
+        # On vfio-pci, PCI `enable` is 0 while idle; VFIO readiness requires
+        # vfio-pci binding, a viable IOMMU group (no sibling endpoint bound to
+        # a conflicting host driver), and verified non-symlink character device
+        # nodes matching kernel sysfs major:minor for /dev/vfio/vfio and /dev/vfio/<group>.
+        vfio_group_viable = _is_vfio_group_viable(
+            sysfs_root, iommu_group, group_members, group_dir_readable
+        )
         healthy = (
             driver == "vfio-pci"
             and bool(iommu_group)
+            and vfio_group_viable
             and vfio_group_verified
             and vfio_container_verified
         )
@@ -1502,13 +1551,13 @@ def format_prometheus_metrics(snapshot: ExporterSnapshot) -> str:
     )
     add_metric(
         "freetpu_tpu_health_status",
-        "VFIO TPU chip readiness on VFIO-backed hosts (1 = vfio-pci bound and /dev/vfio nodes present; idle chips stay ready; 0 on non-VFIO /dev/accel* hosts).",
+        "VFIO TPU chip readiness on VFIO-backed hosts (1 = vfio-pci bound, viable IOMMU group, and verified /dev/vfio nodes; idle chips stay ready; 0 on non-VFIO /dev/accel* hosts).",
         "gauge",
         health_samples,
     )
     add_metric(
         "freetpu_tpu_pci_enabled",
-        "PCI sysfs enable reference state (1 = actively enabled by open VFIO handle, 0 = idle).",
+        "PCI sysfs enable state (1 when sysfs enable reference count > 0, 0 otherwise).",
         "gauge",
         pci_enabled_samples,
     )
