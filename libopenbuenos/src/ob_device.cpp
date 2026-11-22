@@ -39,6 +39,10 @@ ob_status_t init_credit_slots(ob_context* ctx) {
 
 void destroy_credit_slots(ob_context* ctx) {
   for (uint32_t i = 0; i < OB_MAX_CREDITS; ++i) {
+    for (ob_buffer* rb : ctx->credits[i].retired_bufs) {
+      if (rb) ob_buffer_free(rb);
+    }
+    ctx->credits[i].retired_bufs.clear();
     if (ctx->credits[i].exec_cmd_buf) {
       ob_buffer_free(ctx->credits[i].exec_cmd_buf);
       ctx->credits[i].exec_cmd_buf = nullptr;
@@ -321,7 +325,6 @@ void device_sync_fw_wakelock(ob_context* ctx) {
 void device_close(ob_context* ctx) {
   if (!ctx) return;
   device_release_fw_wakelock(ctx);
-  destroy_credit_slots(ctx);
 #if defined(__linux__)
   if (!ctx->mock_mode) {
     if (ctx->wake_locked && ctx->tpu_fd >= 0) {
@@ -346,6 +349,7 @@ void device_close(ob_context* ctx) {
     }
   }
 #endif
+  destroy_credit_slots(ctx);
 }
 
 ob_status_t device_submit_control(ob_context* ctx,
@@ -602,6 +606,7 @@ ob_status_t device_wait_handle(ob_context* ctx,
   if (!ctx || handle == 0u) return OB_ERR_INVALID_ARG;
 
   CachedGraph* completed_entry = nullptr;
+  std::vector<ob_buffer*> retired_to_free;
   ob_status_t result = OB_OK;
   ob_invoke_stats_t stats {};
 
@@ -722,6 +727,8 @@ ob_status_t device_wait_handle(ob_context* ctx,
     slot->seq = 0;
     slot->graph_entry = nullptr;
     slot->error_msg.clear();
+    retired_to_free = std::move(slot->retired_bufs);
+    slot->retired_bufs.clear();
     if (ctx->inflight_count > 0u) ctx->inflight_count -= 1u;
   }
 
@@ -729,6 +736,9 @@ ob_status_t device_wait_handle(ob_context* ctx,
   if (completed_entry) {
     std::lock_guard<std::mutex> clk(ctx->cache_mu);
     graph_entry_unref_locked(ctx, completed_entry);
+  }
+  for (ob_buffer* rb : retired_to_free) {
+    if (rb) ob_buffer_free(rb);
   }
 
   if (out_stats) *out_stats = stats;
@@ -754,6 +764,30 @@ ob_status_t device_wait_all(ob_context* ctx, uint32_t timeout_ms) {
     if (st != OB_OK && first_err == OB_OK) first_err = st;
   }
   return first_err;
+}
+
+bool device_attach_inflight_buffers(ob_context* ctx,
+                                    ob_exec_handle_t handle,
+                                    std::initializer_list<ob_buffer*> bufs) {
+  if (!ctx || handle == 0u) return false;
+  std::lock_guard<std::mutex> lk(ctx->vii_mu);
+  CreditSlot* slot = nullptr;
+  for (uint32_t i = 0; i < ctx->credit_size; ++i) {
+    if (ctx->credits[i].state != CreditSlot::FREE &&
+        ctx->credits[i].handle == handle) {
+      slot = &ctx->credits[i];
+      break;
+    }
+  }
+  if (!slot) return false;
+  for (ob_buffer* b : bufs) {
+    if (!b) continue;
+    if (std::find(slot->retired_bufs.begin(), slot->retired_bufs.end(), b) ==
+        slot->retired_bufs.end()) {
+      slot->retired_bufs.push_back(b);
+    }
+  }
+  return true;
 }
 
 }  // namespace ob
@@ -899,7 +933,7 @@ ob_status_t ob_context_create(const ob_config_t* config, ob_context_t** out_ctx)
   ctx->fw_wakelock_enabled = wl_enabled;
   ctx->profile_enabled = read_env_flag("OPENBUENOS_PROFILE", false);
   ctx->verbose_enabled = read_env_flag("OPENBUENOS_VERBOSE", false);
-  ctx->strict_weight_hash = read_env_flag("OPENBUENOS_STRICT_WEIGHT_HASH", false);
+  ctx->strict_weight_hash = read_env_flag("OPENBUENOS_STRICT_WEIGHT_HASH", true);
   ctx->large_tiles_enabled = !read_env_flag("OPENBUENOS_DISABLE_LARGE_TILES", false);
   ctx->batched_large_tiles_enabled =
       ctx->large_tiles_enabled && !read_env_flag("OPENBUENOS_DISABLE_BATCHED_LARGE_TILES", false);

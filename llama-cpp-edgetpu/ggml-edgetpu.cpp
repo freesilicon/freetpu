@@ -916,6 +916,41 @@ static inline const struct ggml_tensor * unwrap_view_src(const struct ggml_tenso
     return t;
 }
 
+static inline bool view_preserves_2d_identity(const struct ggml_tensor * t,
+                                              const struct ggml_tensor * producer) {
+    if (!t || !producer) {
+        return false;
+    }
+    const struct ggml_tensor * cur = t;
+    for (int depth = 0; depth < 4 && cur != nullptr; ++depth) {
+        if (cur == producer) {
+            return ggml_is_contiguous(t) &&
+                   t->type == producer->type &&
+                   t->data == producer->data &&
+                   t->ne[0] == producer->ne[0] &&
+                   ggml_nrows(t) == ggml_nrows(producer);
+        }
+        if (cur->op == GGML_OP_PERMUTE || cur->op == GGML_OP_TRANSPOSE) {
+            return false;
+        }
+        if (!ggml_is_contiguous(cur) || cur->view_offs != 0 ||
+            cur->type != producer->type || cur->ne[0] != producer->ne[0] ||
+            ggml_nrows(cur) != ggml_nrows(producer)) {
+            return false;
+        }
+        if (cur->view_src != nullptr) {
+            cur = cur->view_src;
+            continue;
+        }
+        if ((cur->op == GGML_OP_RESHAPE || cur->op == GGML_OP_VIEW) && cur->src[0] != nullptr) {
+            cur = cur->src[0];
+            continue;
+        }
+        break;
+    }
+    return false;
+}
+
 static inline void add_bias_1d_row(float * __restrict y, const float * __restrict x, const float * __restrict bias, int64_t n_cols) {
     int64_t c = 0;
 #if defined(__ARM_NEON)
@@ -1700,14 +1735,18 @@ static int try_compute_fused_swiglu(ggml_backend_edgetpu_context * ctx,
         struct ggml_tensor * dmm = comp[3];
         const struct ggml_tensor * g0 = unwrap_view_src(glu->src[0]);
         const struct ggml_tensor * g1 = unwrap_view_src(glu->src[1]);
-        if (g0 == mm0 && g1 == mm1) {
+        if (g0 == mm0 && g1 == mm1 &&
+            view_preserves_2d_identity(glu->src[0], mm0) &&
+            view_preserves_2d_identity(glu->src[1], mm1)) {
             gate_mm = mm0;
             up_mm   = mm1;
-        } else if (g0 == mm1 && g1 == mm0) {
+        } else if (g0 == mm1 && g1 == mm0 &&
+                   view_preserves_2d_identity(glu->src[0], mm1) &&
+                   view_preserves_2d_identity(glu->src[1], mm0)) {
             gate_mm = mm1;
             up_mm   = mm0;
         }
-        if (gate_mm && up_mm && unwrap_view_src(dmm->src[1]) == glu) {
+        if (gate_mm && up_mm && view_preserves_2d_identity(dmm->src[1], glu)) {
             down_mm   = dmm;
             inter[0]  = gate_mm;
             inter[1]  = up_mm;
@@ -1741,8 +1780,17 @@ static int try_compute_fused_swiglu(ggml_backend_edgetpu_context * ctx,
             struct ggml_tensor * dmm       = comp[4];
             const struct ggml_tensor * m0  = unwrap_view_src(mul->src[0]);
             const struct ggml_tensor * m1  = unwrap_view_src(mul->src[1]);
-            const bool mul_ok = (m0 == silu && m1 == cand_up) || (m0 == cand_up && m1 == silu);
-            if (cand_gate && mul_ok && unwrap_view_src(dmm->src[1]) == mul) {
+            const bool mul_ok =
+                (m0 == silu && m1 == cand_up &&
+                 view_preserves_2d_identity(mul->src[0], silu) &&
+                 view_preserves_2d_identity(mul->src[1], cand_up)) ||
+                (m0 == cand_up && m1 == silu &&
+                 view_preserves_2d_identity(mul->src[0], cand_up) &&
+                 view_preserves_2d_identity(mul->src[1], silu));
+            if (cand_gate &&
+                view_preserves_2d_identity(silu->src[0], cand_gate) &&
+                mul_ok &&
+                view_preserves_2d_identity(dmm->src[1], mul)) {
                 gate_mm  = cand_gate;
                 up_mm    = cand_up;
                 down_mm  = dmm;
@@ -1768,9 +1816,14 @@ static int try_compute_fused_swiglu(ggml_backend_edgetpu_context * ctx,
     }
 
     const struct ggml_tensor * x = gate_mm->src[1];
-    if (up_mm->src[1]->data != x->data ||
+    if (!x || !up_mm->src[1] ||
+        !ggml_is_contiguous(x) || !ggml_is_contiguous(up_mm->src[1]) ||
+        x->type != up_mm->src[1]->type ||
+        up_mm->src[1]->data != x->data ||
         up_mm->src[1]->ne[0] != x->ne[0] ||
-        up_mm->src[1]->ne[1] != x->ne[1]) {
+        up_mm->src[1]->ne[1] != x->ne[1] ||
+        x->ne[2] != 1 || x->ne[3] != 1 ||
+        up_mm->src[1]->ne[2] != 1 || up_mm->src[1]->ne[3] != 1) {
         return 0;
     }
 
@@ -2398,6 +2451,7 @@ static bool ggml_backend_edgetpu_device_supports_op(ggml_backend_dev_t dev, cons
                 return false;
             }
             if (src0->nb[0] != ggml_type_size(src0->type) ||
+                (src0->ne[1] > 1 && src0->nb[1] != ggml_row_size(src0->type, src0->ne[0])) ||
                 src1->nb[0] != ggml_type_size(src1->type) ||
                 ids->nb[0]  != sizeof(int32_t) ||
                 op->nb[0]   != sizeof(float)) {
@@ -2547,6 +2601,8 @@ static bool ggml_backend_edgetpu_device_supports_op(ggml_backend_dev_t dev, cons
                 !g_hot_env.packed_q8.load(std::memory_order_relaxed) &&
                 is_fusible_swiglu_mul_mat(b0) &&
                 is_fusible_swiglu_mul_mat(b1) &&
+                view_preserves_2d_identity(src0, b0) &&
+                view_preserves_2d_identity(src1, b1) &&
                 unwrap_view_src(b0->src[1]) == unwrap_view_src(b1->src[1]) &&
                 (b0->ne[0] % QK8_0) == 0;
             if (!swiglu_chainable) {
@@ -2575,7 +2631,9 @@ static bool ggml_backend_edgetpu_device_supports_op(ggml_backend_dev_t dev, cons
                 return false;
             }
             const struct ggml_tensor * base = unwrap_view_src(src0);
-            return base && is_fusible_swiglu_mul_mat(base) && (base->ne[0] % QK8_0) == 0 &&
+            return base && is_fusible_swiglu_mul_mat(base) &&
+                   view_preserves_2d_identity(src0, base) &&
+                   (base->ne[0] % QK8_0) == 0 &&
                    ggml_backend_edgetpu_device_supports_op(dev, base);
         }
 
@@ -2602,12 +2660,22 @@ static bool ggml_backend_edgetpu_device_supports_op(ggml_backend_dev_t dev, cons
             // Accept ONLY SwiGLU gate*up elementwise MUL (one input is SILU(gate_mm), other is up_mm sharing input x).
             const struct ggml_tensor * b0 = unwrap_view_src(src0);
             const struct ggml_tensor * b1 = unwrap_view_src(src1);
-            auto is_silu_mul_pair = [&](const struct ggml_tensor * silu_t, const struct ggml_tensor * up_t) -> bool {
+            auto is_silu_mul_pair = [&](const struct ggml_tensor * raw_silu,
+                                        const struct ggml_tensor * raw_up,
+                                        const struct ggml_tensor * silu_t,
+                                        const struct ggml_tensor * up_t) -> bool {
                 if (!silu_t || !up_t || silu_t->op != GGML_OP_UNARY || ggml_get_unary_op(silu_t) != GGML_UNARY_OP_SILU) {
+                    return false;
+                }
+                if (!view_preserves_2d_identity(raw_silu, silu_t) ||
+                    !view_preserves_2d_identity(raw_up, up_t)) {
                     return false;
                 }
                 const struct ggml_tensor * gate_t = unwrap_view_src(silu_t->src[0]);
                 if (!gate_t || !is_fusible_swiglu_mul_mat(gate_t) || !is_fusible_swiglu_mul_mat(up_t)) {
+                    return false;
+                }
+                if (!view_preserves_2d_identity(silu_t->src[0], gate_t)) {
                     return false;
                 }
                 if (unwrap_view_src(gate_t->src[1]) != unwrap_view_src(up_t->src[1]) || (gate_t->ne[0] % QK8_0) != 0) {
@@ -2616,7 +2684,7 @@ static bool ggml_backend_edgetpu_device_supports_op(ggml_backend_dev_t dev, cons
                 return ggml_backend_edgetpu_device_supports_op(dev, gate_t) &&
                        ggml_backend_edgetpu_device_supports_op(dev, up_t);
             };
-            return is_silu_mul_pair(b0, b1) || is_silu_mul_pair(b1, b0);
+            return is_silu_mul_pair(src0, src1, b0, b1) || is_silu_mul_pair(src1, src0, b1, b0);
         }
 
         // Explicitly return false for RMS_NORM, SOFT_MAX, FLASH_ATTN, GET_ROWS, etc.

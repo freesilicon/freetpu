@@ -3869,6 +3869,186 @@ void test_phase7b_swiglu_chaining_2tier_and_outlier_cache() {
               ran_corpus_parity ? " + 5/5 BIT-EXACT external corpus parity" : "; external 5-probe parity skipped without OPENBUENOS_CORPUS_DIR");
 }
 
+void test_phase7_cycle2_regressions() {
+  std::vector<uint8_t> synth_interp = make_synthetic_dive_interp(0xC2u);
+  TempBinaryFile interp_file;
+  CHECK(interp_file.write(synth_interp.data(), synth_interp.size()));
+
+  const uint16_t d_one = fp32_to_fp16(1.0f);
+  const uint16_t d_1_128 = fp32_to_fp16(1.0f / 128.0f);
+
+  // 1. Balanced 128 +/-1 correlated activation + 1 outlier (dc_term == 0, rms_aq < 56) with
+  //    matching +/-1/128 gate/up rows and single-channel W_down: must NOT silently clip!
+  {
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+    CHECK(ob_gemm_register_builtin_emitter(ctx, interp_file.path()) == OB_OK);
+
+    constexpr uint32_t K = 576u, H = 1536u, N = 576u;
+    const uint32_t nb_k = K / OB_QK8_0;
+    const uint32_t nb_h = H / OB_QK8_0;
+    std::vector<ob_block_q8_0_t> wg(static_cast<size_t>(H) * nb_k);
+    std::vector<ob_block_q8_0_t> wu(static_cast<size_t>(H) * nb_k);
+    std::vector<ob_block_q8_0_t> wd(static_cast<size_t>(N) * nb_h);
+    std::memset(wg.data(), 0, wg.size() * sizeof(ob_block_q8_0_t));
+    std::memset(wu.data(), 0, wu.size() * sizeof(ob_block_q8_0_t));
+    std::memset(wd.data(), 0, wd.size() * sizeof(ob_block_q8_0_t));
+
+    // Zero-mean correlated pattern on row 0 across first 128 entries (+/-1/128)
+    for (uint32_t bk = 0u; bk < 4u; ++bk) {
+      wg[bk].d = d_1_128;
+      wu[bk].d = d_1_128;
+      for (uint32_t j = 0u; j < OB_QK8_0; ++j) {
+        int8_t v = ((bk * OB_QK8_0 + j) & 1u) ? -127 : 127; // 127 * (1/128) ~ +/-1
+        wg[bk].qs[j] = v;
+        wu[bk].qs[j] = v;
+      }
+    }
+    // Mild background noise on remaining hidden rows so l2_g_max ~ norm of row 0
+    for (uint32_t h = 1u; h < H; ++h) {
+      wg[static_cast<size_t>(h) * nb_k].d = fp32_to_fp16(1.0f / 2048.0f);
+      wg[static_cast<size_t>(h) * nb_k].qs[0] = 64;
+      wu[static_cast<size_t>(h) * nb_k].d = fp32_to_fp16(1.0f / 2048.0f);
+      wu[static_cast<size_t>(h) * nb_k].qs[0] = 64;
+    }
+    wd[0].d = d_one;
+    wd[0].qs[0] = 1; // selects only channel 0 -> unsaturated output even when ch 0 clips
+
+    std::vector<float> a(K, 0.0f);
+    for (uint32_t k = 0u; k < 128u; ++k) {
+      a[k] = (k & 1u) ? -1.0f : 1.0f;
+    }
+    a[200] = 3.0f; // raises batch_amax so rms_aq ~ 20 < 56 while dc == 0!
+    std::vector<float> c(N, 0.0f);
+    ob_gemm_swiglu_quant_desc_t sd{wg.data(), wu.data(), wd.data(), 1u, K, H, N, 0u, 0u, 0u, 0u};
+    ob_invoke_stats_t st{};
+    CHECK(ob_gemm_swiglu_f32_quant(ctx, a.data(), &sd, c.data(), &st) == OB_OK);
+    ob_profile_stats_t gp{};
+    CHECK(ob_context_get_profile(ctx, &gp) == OB_OK);
+    CHECK(gp.swiglu_fallbacks >= 1u);
+    CHECK(gp.swiglu_chunks_chained == 0u);
+    const double expected_dot = 128.0 * (127.0 / 128.0);
+    const double expected_y0 = (expected_dot / (1.0 + std::exp(-expected_dot))) * expected_dot;
+    CHECK(std::fabs(static_cast<double>(c[0]) - expected_y0) / expected_y0 < 5e-3);
+
+    ob_context_destroy(ctx);
+  }
+
+  // 2. Weight-cache strict 128-bit hashing: changing 1 unsampled interior row on >16 KiB tile
+  //    must miss and recompute instead of reusing stale weights.
+  {
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+    CHECK(ob_gemm_register_builtin_emitter(ctx, interp_file.path()) == OB_OK);
+    CHECK(ctx->strict_weight_hash == true);
+
+    constexpr uint32_t K = 512u, N = 128u; // 64 KiB (> 16 KiB strided probe threshold!)
+    std::vector<int8_t> a(K, 1), b(static_cast<size_t>(N) * K, 0);
+    std::vector<int32_t> c1(N, 0), c2(N, 0);
+    b[static_cast<size_t>(3u) * K + 77u] = 10; // interior row 3, offset 77
+    ob_invoke_stats_t s1{}, s2{};
+    CHECK(ob_gemm_matmul_int8(ctx, a.data(), b.data(), nullptr, c1.data(), 1u, K, N, 0, 0, &s1) == OB_OK);
+    CHECK(c1[3] == 10);
+    b[static_cast<size_t>(3u) * K + 77u] = 42; // mutate interior byte in-place
+    CHECK(ob_gemm_matmul_int8(ctx, a.data(), b.data(), nullptr, c2.data(), 1u, K, N, 0, 0, &s2) == OB_OK);
+    CHECK(c2[3] == 42);
+    CHECK(s2.cache_hits == 0u);
+    ob_context_destroy(ctx);
+  }
+
+  // 3. Budget recovery after transient memory pressure + pinned SwiGLU cap enforcement
+  {
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    cfg.max_inflight = 16u;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+    CHECK(ob_gemm_register_builtin_emitter(ctx, interp_file.path()) == OB_OK);
+
+    // Budget must dip under simulated pressure and recover when memory frees up.
+    ctx->simulated_mem_available_bytes = 48ULL * 1024u * 1024u; // 16 MiB cap
+    const size_t low_cap = ob::compute_weight_cache_budget_bytes(ctx);
+    CHECK(low_cap <= 16ULL * 1024u * 1024u);
+    ctx->simulated_mem_available_bytes = 512ULL * 1024u * 1024u; // recovers >= 170 MiB
+    const size_t rec_cap = ob::compute_weight_cache_budget_bytes(ctx);
+    CHECK(rec_cap > 100ULL * 1024u * 1024u);
+
+    // Cold 9-chunk Qwen2.5 SwiGLU under strict 16 MiB cap must NEVER exceed weight_cache_max_bytes!
+    ctx->simulated_mem_available_bytes = 48ULL * 1024u * 1024u;
+    constexpr uint32_t K = 1536u, H = 8960u, N = 1536u;
+    const uint32_t nb_k = K / OB_QK8_0, nb_h = H / OB_QK8_0;
+    std::vector<ob_block_q4_0_t> wg(static_cast<size_t>(H) * nb_k),
+        wu(static_cast<size_t>(H) * nb_k), wd(static_cast<size_t>(N) * nb_h);
+    std::memset(wg.data(), 0, wg.size() * sizeof(ob_block_q4_0_t));
+    std::memset(wu.data(), 0, wu.size() * sizeof(ob_block_q4_0_t));
+    std::memset(wd.data(), 0, wd.size() * sizeof(ob_block_q4_0_t));
+    std::vector<float> a(K, 0.1f), c(N, 0.0f);
+    ob_gemm_swiglu_quant_desc_t sd{wg.data(), wu.data(), wd.data(), 1u, K, H, N, 1u, 1u, 1u, 1u};
+    ob_invoke_stats_t ss{};
+    CHECK(ob_gemm_swiglu_f32_quant(ctx, a.data(), &sd, c.data(), &ss) == OB_OK);
+    CHECK(ctx->weight_cache_bytes <= ctx->weight_cache_max_bytes);
+    CHECK(ctx->weight_cache_peak_bytes <= ctx->weight_cache_max_bytes);
+
+    ob_context_destroy(ctx);
+  }
+
+  // 4. Huge FP32 simulation saturation clamps safely to +/-127 / -128 without INT32 overflow UB
+  {
+    int8_t x = 100, wg = 100, wu = 100, wd = 100, y = 0;
+    ob_swiglu_int8_desc_t d{};
+    d.m_dim = 1u; d.k_dim = 1u; d.h_dim = 1u; d.n_dim = 1u;
+    d.s_in = 1.0f; d.s_wg = 1e6f; d.s_gate = 1.0f;
+    d.s_wu = 1e6f; d.s_up = 1.0f; d.s_silu = 1e-12f;
+    d.s_prod = 1e-20f; d.s_wd = 1e10f; d.s_out = 1e-22f;
+    d.wg_hk = &wg; d.wu_hk = &wu; d.wd_nh = &wd;
+    ob::simulate_swiglu_hw_exact(&x, d, &y);
+    CHECK(y == 127);
+    wd = -100;
+    ob::simulate_swiglu_hw_exact(&x, d, &y);
+    CHECK(y == -128);
+    wg = -100;
+    wd = 100;
+    ob::simulate_swiglu_hw_exact(&x, d, &y);
+    // Negative gate clamps cleanly within INT8 without overflow UB
+    CHECK(y >= -128 && y <= 127);
+  }
+
+  // 5. Mixed chained + tail fallback SwiGLU profile must not double-count fallback HW/wall time
+  {
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+    CHECK(ob_gemm_register_builtin_emitter(ctx, interp_file.path()) == OB_OK);
+    ctx->swiglu_prefill_enabled = true;
+
+    constexpr uint32_t M = 66u, K = 576u, H = 512u, N = 576u; // 64 chained + 2 fallback tail!
+    std::vector<ob_block_q8_0_t> wg(static_cast<size_t>(H) * (K / OB_QK8_0));
+    std::vector<ob_block_q8_0_t> wu(static_cast<size_t>(H) * (K / OB_QK8_0));
+    std::vector<ob_block_q8_0_t> wd(static_cast<size_t>(N) * (H / OB_QK8_0));
+    for (auto& b : wg) { b.d = fp32_to_fp16(0.01f); std::memset(b.qs, 1, OB_QK8_0); }
+    for (auto& b : wu) { b.d = fp32_to_fp16(0.01f); std::memset(b.qs, 1, OB_QK8_0); }
+    for (auto& b : wd) { b.d = fp32_to_fp16(0.01f); std::memset(b.qs, 1, OB_QK8_0); }
+    std::vector<float> a(static_cast<size_t>(M) * K, 0.05f), c(static_cast<size_t>(M) * N, 0.0f);
+    ob_gemm_swiglu_quant_desc_t sd{wg.data(), wu.data(), wd.data(), M, K, H, N, 0u, 0u, 0u, 0u};
+    ob_invoke_stats_t st{};
+    CHECK(ob_gemm_swiglu_f32_quant(ctx, a.data(), &sd, c.data(), &st) == OB_OK);
+    ob_profile_stats_t ps{};
+    CHECK(ob_context_get_profile(ctx, &ps) == OB_OK);
+    // Notice mock_mode HW_US is 0 or fallback hw; crucially ps.hw_us == st.hw_execution_us (not 2x fallback!)
+    CHECK(ps.swiglu_fallbacks >= 1u);
+    CHECK(ps.hw_us == st.hw_execution_us);
+    CHECK(ps.total_wall_us < 1000000000ULL);
+    ob_context_destroy(ctx);
+  }
+
+  std::printf("[PASS] test_phase7_cycle2_regressions (balanced-corr fallback, 128-bit interior cache miss, LMKD budget recovery & pinned SwiGLU cap, float clamp, mixed profile OK)\n");
+}
+
 }  // namespace
 
 int main() {
@@ -3890,9 +4070,10 @@ int main() {
   test_quant_batch_q4_0_dvfs_and_fd_caps();
   test_phase7a_neon_horiz_fusion_profiler_and_lmkd();
   test_phase7b_swiglu_chaining_2tier_and_outlier_cache();
+  test_phase7_cycle2_regressions();
 
   if (g_failures == 0) {
-    std::printf("ALL LIBOPENBUENOS HOST TESTS PASSED (18/18 suites)\n");
+    std::printf("ALL LIBOPENBUENOS HOST TESTS PASSED (19/19 suites)\n");
     return 0;
   }
   std::fprintf(stderr, "LIBOPENBUENOS HOST TESTS FAILED (%d failures)\n", g_failures);

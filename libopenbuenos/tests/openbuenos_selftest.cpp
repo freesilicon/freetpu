@@ -1606,9 +1606,10 @@ int run_test_swiglu(int iters, int perf_mode, const char* dive_interp_path,
       st = ob_gemm_swiglu_f32_quant(ctx, a.data(), &sd, c_out.data(), &sw);
     }
     double nmse = swiglu_ref_nmse(a, gd, ud, dd, c_out, fc.M, fc.K, fc.H, fc.N);
+    const bool expect_chained = !(fc.is_q4 != 0u && fc.M > 8u);
     bool ok = (st == OB_OK) &&
-              (sw.tiles_dispatched == fc.exp_chunks) &&
-              (sw.cache_hits == fc.exp_chunks) &&
+              (expect_chained ? (sw.tiles_dispatched == fc.exp_chunks && sw.cache_hits == fc.exp_chunks)
+                              : (sw.tiles_dispatched > 0u && sw.cache_hits == sw.tiles_dispatched)) &&
               (nmse < 3.5e-3);
     if (!ok) all_ok = false;
     std::printf("swiglu[%s]: ok=%d pm=%u wl=%d chunks=%u hits=%u cold_us=%llu warm_hw_us=%llu warm_wall_us=%llu nmse=%.2e\n",

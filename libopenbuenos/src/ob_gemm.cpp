@@ -131,32 +131,68 @@ inline uint64_t fast_hash64_update(uint64_t h, const void* data, size_t len) {
   return h;
 }
 
-// Fast content-only weight-tile hash for ext[2] DMA-BUF LRU cache lookup.
-// - Small tiles (<= 16 KiB) or strict_hash=true: hashes every byte.
-// - Large tiles (e.g. 256 KiB..4 MiB lt_1x* weights): O(1) strided content
-//   fingerprint (16 rows x 16 B + head/tail 64 B = 384 B, 18 cache lines).
-//   Avoids cold DRAM cache-line churn on CPU while staying pointer-agnostic.
-uint64_t hash_weight_tile_fast(uint64_t h,
-                               const uint8_t* base,
-                               size_t row_stride_bytes,
-                               uint32_t tn,
-                               size_t row_bytes,
-                               bool strict_hash) {
-  if (tn == 0u || row_bytes == 0u) return h == 0u ? 1u : h;
+struct WeightHash128 {
+  uint64_t h1 = 0x14650fb0739d0383ULL;
+  uint64_t h2 = 0x517cc1b727220a95ULL;
+  uint64_t bytes = 0ULL;
+};
+
+inline void hash128_update(WeightHash128* st, const void* data, size_t len) {
+  const uint64_t next_h1 = fast_hash64_update(st->h1, data, len);
+  uint64_t h2 = st->h2 ^ (static_cast<uint64_t>(len) * 0x9e3779b97f4a7c15ULL);
+  const uint8_t* p = static_cast<const uint8_t*>(data);
+  size_t i = 0;
+  for (; i + 8u <= len; i += 8u) {
+    uint64_t w = 0ULL;
+    std::memcpy(&w, p + i, 8u);
+    h2 ^= (w << 19) | (w >> 45);
+    h2 *= 0x94d049bb133111ebULL;
+    h2 ^= (h2 >> 29);
+  }
+  if (i < len) {
+    uint64_t tail = 0ULL;
+    std::memcpy(&tail, p + i, len - i);
+    h2 ^= tail ^ (static_cast<uint64_t>(len - i) << 51);
+    h2 *= 0xbf58476d1ce4e5b9ULL;
+    h2 ^= (h2 >> 33);
+  }
+  st->h1 = next_h1;
+  st->h2 = h2 ^ (next_h1 >> 17);
+  st->bytes += static_cast<uint64_t>(len);
+}
+
+inline WeightTileKey finalize_weight_key(const WeightHash128& st) {
+  WeightTileKey k;
+  k.h1 = (st.h1 == 0ULL) ? 1ULL : st.h1;
+  k.h2 = (st.h2 == 0ULL) ? 1ULL : st.h2;
+  k.bytes = st.bytes;
+  return k;
+}
+
+// Content weight-tile hash for ext[2] DMA-BUF LRU cache lookup (128-bit key).
+// - Default (strict_hash=true) or small tiles (<= 16 KiB): hashes every byte.
+// - Explicit opt-out strict_hash=false on large tiles (> 16 KiB): strided 64-row fingerprint + edges.
+void hash_weight_tile_fast(WeightHash128* st,
+                           const uint8_t* base,
+                           size_t row_stride_bytes,
+                           uint32_t tn,
+                           size_t row_bytes,
+                           bool strict_hash) {
+  if (tn == 0u || row_bytes == 0u) return;
   const size_t total_bytes = static_cast<size_t>(tn) * row_bytes;
   if (total_bytes <= 16384u || strict_hash) {
     for (uint32_t ni = 0; ni < tn; ++ni) {
-      h = fast_hash64_update(h, base + static_cast<size_t>(ni) * row_stride_bytes, row_bytes);
+      hash128_update(st, base + static_cast<size_t>(ni) * row_stride_bytes, row_bytes);
     }
-    return h == 0u ? 1u : h;
+    return;
   }
 
   const size_t edge_len = std::min<size_t>(row_bytes, 64u);
-  h = fast_hash64_update(h, base, edge_len);
+  hash128_update(st, base, edge_len);
   const uint8_t* last_row = base + static_cast<size_t>(tn - 1u) * row_stride_bytes;
-  h = fast_hash64_update(h, last_row + (row_bytes - edge_len), edge_len);
+  hash128_update(st, last_row + (row_bytes - edge_len), edge_len);
 
-  constexpr uint32_t kNumProbes = 16u;
+  constexpr uint32_t kNumProbes = 64u;
   const size_t probe_len = std::min<size_t>(row_bytes, 16u);
   const size_t max_off = row_bytes - probe_len;
   for (uint32_t s = 0; s < kNumProbes; ++s) {
@@ -166,9 +202,8 @@ uint64_t hash_weight_tile_fast(uint64_t h,
     const size_t off = (max_off > 0u)
         ? static_cast<size_t>((static_cast<uint64_t>(s) * 2654435761ULL) % (max_off + 1u))
         : 0u;
-    h = fast_hash64_update(h, base + static_cast<size_t>(ni) * row_stride_bytes + off, probe_len);
+    hash128_update(st, base + static_cast<size_t>(ni) * row_stride_bytes + off, probe_len);
   }
-  return h == 0u ? 1u : h;
 }
 
 uint64_t hash_tile_key(uint32_t m, uint32_t k, uint32_t n,
@@ -240,9 +275,6 @@ size_t compute_weight_cache_budget_bytes_impl(ob_context* ctx) {
         ? (256u * 1024u * 1024u)
         : (2048u * 1024u * 1024u);
   }
-  if (ctx->weight_cache_max_bytes > 0u && ctx->weight_cache_max_bytes < base_cap) {
-    base_cap = ctx->weight_cache_max_bytes;
-  }
   size_t mem_avail = ctx->simulated_mem_available_bytes;
   if (mem_avail == 0u && !ctx->mock_mode) {
     mem_avail = read_system_mem_available_bytes();
@@ -263,11 +295,9 @@ size_t compute_weight_cache_budget_bytes_impl(ob_context* ctx) {
 }
 
 void ensure_weight_cache_budget(ob_context* ctx, bool refresh_meminfo = false) {
-  if (ctx->weight_cache_max_bytes == 0u || refresh_meminfo) {
-    const size_t eff = compute_weight_cache_budget_bytes_impl(ctx);
-    if (ctx->weight_cache_max_bytes == 0u || eff < ctx->weight_cache_max_bytes) {
-      ctx->weight_cache_max_bytes = eff;
-    }
+  if (ctx->weight_cache_max_bytes == 0u || refresh_meminfo ||
+      ctx->simulated_mem_available_bytes > 0u) {
+    ctx->weight_cache_max_bytes = compute_weight_cache_budget_bytes_impl(ctx);
   }
   if (ctx->weight_cache_max_entries == 0u) {
     const char* env_e = std::getenv("OPENBUENOS_WEIGHT_CACHE_ENTRIES");
@@ -282,7 +312,7 @@ void ensure_weight_cache_budget(ob_context* ctx, bool refresh_meminfo = false) {
   }
 }
 
-CachedWeightTile* weight_cache_find_locked(ob_context* ctx, uint64_t key) {
+CachedWeightTile* weight_cache_find_locked(ob_context* ctx, const WeightTileKey& key) {
   auto it = ctx->weight_cache_map.find(key);
   if (it == ctx->weight_cache_map.end()) return nullptr;
   CachedWeightTile* t = it->second;
@@ -295,8 +325,9 @@ CachedWeightTile* weight_cache_find_locked(ob_context* ctx, uint64_t key) {
 
 void weight_cache_evict_locked(ob_context* ctx, size_t incoming_bytes) {
   const bool periodic_refresh =
-      (!ctx->mock_mode || ctx->simulated_mem_available_bytes > 0u) &&
-      ((ctx->weight_cache_misses & 31u) == 0u);
+      (ctx->simulated_mem_available_bytes > 0u) ||
+      (!ctx->mock_mode && ((ctx->weight_cache_misses & 31u) == 0u ||
+                           ctx->weight_cache_bytes + incoming_bytes > ctx->weight_cache_max_bytes));
   ensure_weight_cache_budget(ctx, periodic_refresh);
   auto it = ctx->weight_cache_lru.end();
   while ((ctx->weight_cache_bytes + incoming_bytes > ctx->weight_cache_max_bytes ||
@@ -309,6 +340,7 @@ void weight_cache_evict_locked(ob_context* ctx, size_t incoming_bytes) {
     ctx->weight_cache_map.erase(victim->key);
     const size_t victim_total = victim->ext2_bytes + victim->outlier_cols_bytes;
     ctx->weight_cache_bytes -= std::min(ctx->weight_cache_bytes, victim_total);
+    victim->in_cache = false;
     it = ctx->weight_cache_lru.erase(erase_it);
     if (victim->ext2_buf) ob_buffer_free(victim->ext2_buf);
     delete victim;
@@ -320,12 +352,39 @@ void weight_cache_insert_locked(ob_context* ctx, CachedWeightTile* tile) {
   weight_cache_evict_locked(ctx, tile->ext2_bytes);
   ctx->weight_cache_lru.push_front(tile);
   tile->lru_it = ctx->weight_cache_lru.begin();
+  tile->in_cache = true;
   ctx->weight_cache_map[tile->key] = tile;
   ctx->weight_cache_bytes += tile->ext2_bytes;
   if (ctx->weight_cache_bytes > ctx->weight_cache_peak_bytes) {
     ctx->weight_cache_peak_bytes = ctx->weight_cache_bytes;
   }
   ctx->weight_cache_misses += 1u;
+}
+
+template <typename DrainOneFn>
+ob_status_t weight_cache_prepare_space_locked(ob_context* ctx,
+                                              size_t incoming_bytes,
+                                              uint32_t& ring_count,
+                                              DrainOneFn& drain_one,
+                                              bool* out_cacheable) {
+  ensure_weight_cache_budget(ctx, true);
+  if (incoming_bytes > ctx->weight_cache_max_bytes) {
+    weight_cache_evict_locked(ctx, ctx->weight_cache_max_bytes);
+    *out_cacheable = false;
+    return OB_OK;
+  }
+  weight_cache_evict_locked(ctx, incoming_bytes);
+  while ((ctx->weight_cache_bytes + incoming_bytes > ctx->weight_cache_max_bytes ||
+          ctx->weight_cache_map.size() >= ctx->weight_cache_max_entries) &&
+         ring_count > 0u) {
+    ob_status_t dst = drain_one();
+    if (dst != OB_OK) return dst;
+    weight_cache_evict_locked(ctx, incoming_bytes);
+  }
+  *out_cacheable =
+      (ctx->weight_cache_bytes + incoming_bytes <= ctx->weight_cache_max_bytes) &&
+      (ctx->weight_cache_map.size() < ctx->weight_cache_max_entries);
+  return OB_OK;
 }
 
 uint32_t quant_scale_D_grid_impl(double raw_d) {
@@ -505,18 +564,26 @@ inline uint32_t round_pow2_clamped(double val, uint32_t lo, uint32_t hi, double 
 
 void compute_matrix_row_l2_stats(const int8_t* mat, uint32_t rows, uint32_t cols, uint32_t stride,
                                  float* out_max_l2, float* out_mean_l2,
-                                 float* out_max_abs_sum = nullptr) {
+                                 float* out_max_abs_sum = nullptr,
+                                 float* out_max_l1 = nullptr,
+                                 float* out_max_linf = nullptr) {
   double max_l2 = 0.0;
   double sum_l2 = 0.0;
   double max_abs_sum = 0.0;
+  double max_l1 = 0.0;
+  double max_linf = 0.0;
   for (uint32_t r = 0u; r < rows; ++r) {
     const int8_t* row = mat + static_cast<size_t>(r) * stride;
     uint64_t sq = 0ULL;
     int64_t row_sum = 0LL;
+    uint64_t row_l1 = 0ULL;
+    uint32_t row_linf = 0u;
     uint32_t c = 0u;
 #if defined(__ARM_NEON) && defined(__aarch64__)
     uint32x4_t v_sq = vdupq_n_u32(0u);
     int32x4_t v_sum = vdupq_n_s32(0);
+    uint32x4_t v_l1 = vdupq_n_u32(0u);
+    int16x8_t v_linf = vdupq_n_s16(0);
     for (; c + 16u <= cols; c += 16u) {
       int8x16_t v = vld1q_s8(row + c);
       int16x8_t lo = vmull_s8(vget_low_s8(v), vget_low_s8(v));
@@ -524,24 +591,40 @@ void compute_matrix_row_l2_stats(const int8_t* mat, uint32_t rows, uint32_t cols
       v_sq = vpadalq_u16(v_sq, vreinterpretq_u16_s16(lo));
       v_sq = vpadalq_u16(v_sq, vreinterpretq_u16_s16(hi));
       v_sum = vaddq_s32(v_sum, vpaddlq_s16(vpaddlq_s8(v)));
+      int16x8_t a_lo = vabsq_s16(vmovl_s8(vget_low_s8(v)));
+      int16x8_t a_hi = vabsq_s16(vmovl_high_s8(v));
+      v_l1 = vpadalq_u16(v_l1, vreinterpretq_u16_s16(a_lo));
+      v_l1 = vpadalq_u16(v_l1, vreinterpretq_u16_s16(a_hi));
+      v_linf = vmaxq_s16(v_linf, vmaxq_s16(a_lo, a_hi));
     }
     sq = static_cast<uint64_t>(vaddvq_u32(v_sq));
     row_sum = static_cast<int64_t>(vaddvq_s32(v_sum));
+    row_l1 = static_cast<uint64_t>(vaddvq_u32(v_l1));
+    row_linf = static_cast<uint32_t>(vmaxvq_s16(v_linf));
 #endif
     for (; c < cols; ++c) {
       const int32_t v = static_cast<int32_t>(row[c]);
+      const uint32_t av = static_cast<uint32_t>(v < 0 ? -v : v);
       sq += static_cast<uint64_t>(v * v);
       row_sum += static_cast<int64_t>(v);
+      row_l1 += static_cast<uint64_t>(av);
+      if (av > row_linf) row_linf = av;
     }
     const double l2 = std::sqrt(static_cast<double>(sq));
     const double abs_sum = std::fabs(static_cast<double>(row_sum));
+    const double l1_d = static_cast<double>(row_l1);
+    const double linf_d = static_cast<double>(row_linf);
     if (l2 > max_l2) max_l2 = l2;
     if (abs_sum > max_abs_sum) max_abs_sum = abs_sum;
+    if (l1_d > max_l1) max_l1 = l1_d;
+    if (linf_d > max_linf) max_linf = linf_d;
     sum_l2 += l2;
   }
   *out_max_l2 = static_cast<float>(max_l2);
   *out_mean_l2 = (rows > 0u) ? static_cast<float>(sum_l2 / static_cast<double>(rows)) : 0.0f;
   if (out_max_abs_sum) *out_max_abs_sum = static_cast<float>(max_abs_sum);
+  if (out_max_l1) *out_max_l1 = static_cast<float>(max_l1);
+  if (out_max_linf) *out_max_linf = static_cast<float>(max_linf);
 }
 
 void compute_swiglu_stage_dividers_impl(uint32_t m_dim,
@@ -2091,13 +2174,14 @@ ob_status_t ob_gemm_matmul_int8(ob_context_t* ctx,
             const bool is_lt64_tile = ob::is_lt_64x_shape(hw_m, hw_k, hw_n);
             const uint32_t pack_fmt = is_lt64_tile ? 1u : 0u;
             const uint64_t th0 = prof_on ? ob::monotonic_now_ns() : 0u;
-            uint64_t wh = 0x49385F5754494C45ULL; // "I8_WTILE"
+            ob::WeightHash128 wh_st{};
             uint32_t whdr[6] = {tn, tk, hw_k, hw_n, static_cast<uint32_t>(zp_a), pack_fmt};
-            wh = ob::fast_hash64_update(wh, whdr, sizeof(whdr));
-            wh = ob::hash_weight_tile_fast(
-                wh,
+            ob::hash128_update(&wh_st, whdr, sizeof(whdr));
+            ob::hash_weight_tile_fast(
+                &wh_st,
                 reinterpret_cast<const uint8_t*>(b_nk + static_cast<size_t>(n0) * k_dim + k0),
                 static_cast<size_t>(k_dim), tn, static_cast<size_t>(tk), strict_hash);
+            const ob::WeightTileKey wh = ob::finalize_weight_key(wh_st);
             w_tile = ob::weight_cache_find_locked(ctx, wh);
             if (prof_on) ctx->prof.hash_ns += (ob::monotonic_now_ns() - th0);
 
@@ -2648,40 +2732,43 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
           const bool is_lt64_tile = ob::is_lt_64x_shape(hw_m, hw_k, hw_n);
           const uint32_t pack_fmt = is_lt64_tile ? 1u : 0u;
           const uint64_t th0 = prof_on ? ob::monotonic_now_ns() : 0u;
-          uint64_t wh = 0ULL;
+          ob::WeightHash128 wh_st{};
           if (num_subs == 1u) {
             const ob::FusedSubSlice& sub = grp.subs[0];
             const ob_gemm_f32_quant_job_t& job = jobs[sub.job_idx];
             const bool is_q4 = (job.is_q4_0 != 0u);
-            wh = is_q4 ? 0x51345F5754494C45ULL : 0x51385F5754494C45ULL; // "Q4_WTILE" / "Q8_WTILE"
+            const uint64_t tag = is_q4 ? 0x51345F5754494C45ULL : 0x51385F5754494C45ULL;
             uint32_t whdr[5] = {sub.tn, tk, hw_k, hw_n, pack_fmt};
-            wh = ob::fast_hash64_update(wh, whdr, sizeof(whdr));
+            ob::hash128_update(&wh_st, &tag, sizeof(tag));
+            ob::hash128_update(&wh_st, whdr, sizeof(whdr));
             const size_t blk_sz = is_q4 ? sizeof(ob_block_q4_0_t) : sizeof(ob_block_q8_0_t);
             const size_t row_blk_bytes = static_cast<size_t>(blk_cnt) * blk_sz;
             const size_t row_stride_bytes = static_cast<size_t>(nb_k) * blk_sz;
             const uint8_t* raw_base = static_cast<const uint8_t*>(job.b_nk) +
                                       (static_cast<size_t>(sub.n0) * nb_k + blk0) * blk_sz;
-            wh = ob::hash_weight_tile_fast(wh, raw_base, row_stride_bytes, sub.tn,
-                                           row_blk_bytes, strict_hash);
+            ob::hash_weight_tile_fast(&wh_st, raw_base, row_stride_bytes, sub.tn,
+                                      row_blk_bytes, strict_hash);
           } else {
-            wh = 0x465553455F575431ULL; // "FUSE_WT1"
+            const uint64_t tag = 0x465553455F575431ULL;
             uint32_t fhdr[5] = {num_subs, tk, hw_k, hw_n, pack_fmt};
-            wh = ob::fast_hash64_update(wh, fhdr, sizeof(fhdr));
+            ob::hash128_update(&wh_st, &tag, sizeof(tag));
+            ob::hash128_update(&wh_st, fhdr, sizeof(fhdr));
             for (uint32_t si = 0u; si < num_subs; ++si) {
               const ob::FusedSubSlice& sub = grp.subs[si];
               const ob_gemm_f32_quant_job_t& job = jobs[sub.job_idx];
               const bool is_q4 = (job.is_q4_0 != 0u);
               uint32_t shdr[3] = {sub.tn, sub.out_off, is_q4 ? 1u : 0u};
-              wh = ob::fast_hash64_update(wh, shdr, sizeof(shdr));
+              ob::hash128_update(&wh_st, shdr, sizeof(shdr));
               const size_t blk_sz = is_q4 ? sizeof(ob_block_q4_0_t) : sizeof(ob_block_q8_0_t);
               const size_t row_blk_bytes = static_cast<size_t>(blk_cnt) * blk_sz;
               const size_t row_stride_bytes = static_cast<size_t>(nb_k) * blk_sz;
               const uint8_t* raw_base = static_cast<const uint8_t*>(job.b_nk) +
                                         (static_cast<size_t>(sub.n0) * nb_k + blk0) * blk_sz;
-              wh = ob::hash_weight_tile_fast(wh, raw_base, row_stride_bytes, sub.tn,
-                                             row_blk_bytes, strict_hash);
+              ob::hash_weight_tile_fast(&wh_st, raw_base, row_stride_bytes, sub.tn,
+                                        row_blk_bytes, strict_hash);
             }
           }
+          const ob::WeightTileKey wh = ob::finalize_weight_key(wh_st);
           w_tile = ob::weight_cache_find_locked(ctx, wh);
           if (prof_on) ctx->prof.hash_ns += (ob::monotonic_now_ns() - th0);
 
@@ -3230,8 +3317,18 @@ ob_status_t ob_gemm_swiglu_int8(ob_context_t* ctx,
 
   ob_invoke_stats_t istats {};
   st = ob::device_wait_handle(ctx, exec_h, ctx->cfg.timeout_ms, &istats);
+  if (st != OB_OK) {
+    if (ob::device_attach_inflight_buffers(ctx, exec_h, {wbuf, in_buf, out_buf})) {
+      if (ctx->gemm_in_bufs_4k[0] == in_buf) ctx->gemm_in_bufs_4k[0] = nullptr;
+      if (ctx->gemm_in_bufs[0] == in_buf) ctx->gemm_in_bufs[0] = nullptr;
+      if (ctx->gemm_out_bufs_4k[0] == out_buf) ctx->gemm_out_bufs_4k[0] = nullptr;
+      if (ctx->gemm_out_bufs[0] == out_buf) ctx->gemm_out_bufs[0] = nullptr;
+    } else {
+      ob_buffer_free(wbuf);
+    }
+    return st;
+  }
   ob_buffer_free(wbuf);
-  if (st != OB_OK) return st;
 
   if (ctx->mock_mode) {
     ob::simulate_swiglu_hw_exact(x_mk, *desc, y_mn);
@@ -3426,6 +3523,136 @@ float neon_dot_f32_q4_row(const float* a, const ob_block_q4_0_t* row, uint32_t n
 #endif
 }
 
+inline int64_t dot_i8_row_exact(const int8_t* a, const int8_t* b, uint32_t K) {
+#if defined(__ARM_NEON) && defined(__aarch64__)
+  int32x4_t acc0 = vdupq_n_s32(0);
+  int32x4_t acc1 = vdupq_n_s32(0);
+  uint32_t k = 0u;
+  for (; k + 16u <= K; k += 16u) {
+    int8x16_t va = vld1q_s8(a + k);
+    int8x16_t vb = vld1q_s8(b + k);
+    acc0 = vaddq_s32(acc0, vpaddlq_s16(vmull_s8(vget_low_s8(va), vget_low_s8(vb))));
+    acc1 = vaddq_s32(acc1, vpaddlq_s16(vmull_high_s8(va, vb)));
+  }
+  int64_t s = static_cast<int64_t>(vaddvq_s32(vaddq_s32(acc0, acc1)));
+  for (; k < K; ++k) s += static_cast<int64_t>(a[k]) * static_cast<int64_t>(b[k]);
+  return s;
+#else
+  int64_t s = 0LL;
+  for (uint32_t k = 0u; k < K; ++k) s += static_cast<int64_t>(a[k]) * static_cast<int64_t>(b[k]);
+  return s;
+#endif
+}
+
+// Verify intermediate gate, up, and product ranges across all rows of a SwiGLU chunk.
+// Allows at most a 2x power-of-2 divider adjustment when borderline Gaussian tail channels
+// exceed 127 (up to 254), and rejects to M7A fallback whenever any intermediate stage
+// would still clip (eliminating silent correlated saturation).
+bool swiglu_chunk_clips_or_tunes(const ob_gemm_swiglu_quant_desc_t* desc,
+                                 const int8_t* a_q,
+                                 uint32_t tm,
+                                 uint32_t K,
+                                 uint32_t nb_k,
+                                 uint32_t h0,
+                                 uint32_t th,
+                                 float s_a,
+                                 float s_wg,
+                                 uint32_t* io_d_gate,
+                                 uint32_t* io_d_up,
+                                 uint32_t* io_d_mul,
+                                 std::vector<float>* wrow_scratch) {
+  wrow_scratch->resize(K);
+  float* wrow = wrow_scratch->data();
+  std::vector<int8_t> wg_row(K, 0);
+  std::vector<int8_t> wu_row(K, 0);
+  const float inv_swg = (s_wg > 0.0f) ? (1.0f / s_wg) : 0.0f;
+
+  // Store per-(h, m) accumulators only if we need a second pass? No, pass 1 tracks max|acc_g| and max|acc_u|;
+  // usually 0 extra pass for pass=1, or at most 1 fast re-check if d_gate/d_up bumped!
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    const uint32_t dg = *io_d_gate;
+    const uint32_t du = *io_d_up;
+    const uint32_t dm = *io_d_mul;
+    const float s_gate = s_a * s_wg * static_cast<float>(dg);
+
+    int64_t worst_g = 0;
+    int64_t worst_u = 0;
+    int64_t worst_prod = 0;
+    for (uint32_t hi = 0u; hi < th; ++hi) {
+      dequant_quant_row_f32(desc->w_gate_hk, desc->gate_is_q4_0, nb_k, h0 + hi, 0u, nb_k, wrow);
+      if (inv_swg > 0.0f) {
+        ob::quant_sym_i8_row(wrow, wg_row.data(), K, inv_swg);
+      } else {
+        std::memset(wg_row.data(), 0, K);
+      }
+      float dummy_su = 0.0f;
+      if (desc->up_is_q4_0 != 0u) {
+        ob::requant_q4_0_rows(static_cast<const ob_block_q4_0_t*>(desc->w_up_hk),
+                              nb_k, h0 + hi, 1u, 0u, nb_k, K, K,
+                              wu_row.data(), &dummy_su, wrow_scratch);
+      } else {
+        ob::requant_q8_0_rows(static_cast<const ob_block_q8_0_t*>(desc->w_up_hk),
+                              nb_k, h0 + hi, 1u, 0u, nb_k, K, K,
+                              wu_row.data(), &dummy_su, wrow_scratch);
+      }
+      for (uint32_t mi = 0u; mi < tm; ++mi) {
+        const int8_t* aq = a_q + static_cast<size_t>(mi) * K;
+        const int64_t acc_g = dot_i8_row_exact(aq, wg_row.data(), K);
+        const int64_t acc_u = dot_i8_row_exact(aq, wu_row.data(), K);
+        const int64_t ag = acc_g < 0 ? -acc_g : acc_g;
+        const int64_t au = acc_u < 0 ? -acc_u : acc_u;
+        if (ag > worst_g) worst_g = ag;
+        if (au > worst_u) worst_u = au;
+        if (ag > 254LL * static_cast<int64_t>(dg) || au > 254LL * static_cast<int64_t>(du)) {
+          return true;
+        }
+        const float gr = std::nearbyint(static_cast<float>(acc_g) / static_cast<float>(dg));
+        const float ur = std::nearbyint(static_cast<float>(acc_u) / static_cast<float>(du));
+        const int32_t q_g = (gr < -128.0f) ? -128 : ((gr > 127.0f) ? 127 : static_cast<int32_t>(gr));
+        const int32_t q_u = (ur < -128.0f) ? -128 : ((ur > 127.0f) ? 127 : static_cast<int32_t>(ur));
+        const int32_t q_silu = ob::eval_swiglu_silu_q(q_g, s_gate);
+        const int64_t prod = static_cast<int64_t>(q_silu) * static_cast<int64_t>(q_u);
+        const int64_t ap = prod < 0 ? -prod : prod;
+        if (ap > worst_prod) worst_prod = ap;
+        if (ap > 254LL * 64LL) {
+          return true;
+        }
+      }
+    }
+
+    const bool g_ok = (worst_g <= 127LL * static_cast<int64_t>(dg));
+    const bool u_ok = (worst_u <= 127LL * static_cast<int64_t>(du));
+    const bool m_ok = (worst_prod <= 127LL * static_cast<int64_t>(dm));
+    if (g_ok && u_ok && m_ok) return false;
+    if (attempt > 0) return true;
+
+    bool changed = false;
+    if (!g_ok) {
+      if (dg >= 65536u || worst_g > 127LL * static_cast<int64_t>(dg << 1u)) return true;
+      *io_d_gate = dg << 1u;
+      changed = true;
+    }
+    if (!u_ok) {
+      if (du >= 65536u || worst_u > 127LL * static_cast<int64_t>(du << 1u)) return true;
+      *io_d_up = du << 1u;
+      changed = true;
+    }
+    if (!m_ok) {
+      uint32_t next_dm = dm;
+      while (next_dm < 64u && worst_prod > 127LL * static_cast<int64_t>(next_dm)) {
+        next_dm <<= 1u;
+      }
+      if (worst_prod > 127LL * static_cast<int64_t>(next_dm) && !changed) return true;
+      if (next_dm != dm) {
+        *io_d_mul = next_dm;
+        changed = true;
+      }
+    }
+    if (!changed) return true;
+  }
+  return true;
+}
+
 void cpu_swiglu_f32_quant_slice(const float* a_slice,
                                 const ob_gemm_swiglu_quant_desc_t* d,
                                 uint32_t tm,
@@ -3562,7 +3789,9 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
   // Default: chain M==1 decode; route tiny prompts (2<=M<=8) to exact NEON FP32 CPU (preserves
   // exact BOS/attention-sink KV cache precision with 0 B weight-cache allocation!); keep M>8
   // prefill on faster lt_64x* GEMM unless opt-in OPENBUENOS_SWIGLU_PREFILL=1 is enabled.
-  if (!can_chain_shape || (M > 8u && !prefill_chain_on)) {
+  const bool any_q4 =
+      (desc->gate_is_q4_0 != 0u) || (desc->up_is_q4_0 != 0u) || (desc->down_is_q4_0 != 0u);
+  if (!can_chain_shape || (M > 8u && (!prefill_chain_on || any_q4))) {
     ob_invoke_stats_t fb{};
     ob_status_t st = run_swiglu_m7a_fallback(ctx, a_mk, desc, M, c_mn, &fb);
     if (st == OB_OK) {
@@ -3610,7 +3839,7 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
     if (rem == 1u) {
       m_slices.push_back({m0, 1u, 1u});
       m0 += 1u;
-    } else if (rem >= 16u && prefill_chain_on) {
+    } else if (rem >= 16u && prefill_chain_on && !any_q4) {
       const uint32_t tm = std::min<uint32_t>(64u, rem);
       m_slices.push_back({m0, tm, 64u});
       m0 += tm;
@@ -3621,6 +3850,9 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
   }
 
   uint64_t total_hw_us = 0u;
+  uint64_t chained_hw_us = 0u;
+  uint64_t fb_wall_ns = 0u;
+  bool ran_cpu_fb_slice = false;
   uint32_t total_tiles = 0u;
   uint32_t total_hits = 0u;
   uint64_t chained_chunks = 0u;
@@ -3709,10 +3941,13 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
         cpu_swiglu_f32_quant_slice(a_slice, desc, 1u, c_slice);
         agg_flags |= OB_STAT_FLAG_CPU_FALLBACK;
         fb_slices += 1u;
+        ran_cpu_fb_slice = true;
         continue;
       }
       ob_invoke_stats_t fb{};
+      const uint64_t fbt0 = ob::monotonic_now_ns();
       ob_status_t st = run_swiglu_m7a_fallback(ctx, a_slice, desc, ms.tm, c_slice, &fb);
+      fb_wall_ns += (ob::monotonic_now_ns() - fbt0);
       if (st != OB_OK) return st;
       total_hw_us += fb.hw_execution_us;
       total_tiles += fb.tiles_dispatched;
@@ -3771,6 +4006,19 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
                              a_q.data() + static_cast<size_t>(mi) * K,
                              K, inv_sa);
       }
+      uint32_t amax_aq = 0u;
+      uint64_t max_l1_aq = 0ULL;
+      for (uint32_t mi = 0u; mi < ms.tm; ++mi) {
+        const int8_t* aq_row = a_q.data() + static_cast<size_t>(mi) * K;
+        uint64_t r_l1 = 0ULL;
+        for (uint32_t ki = 0u; ki < K; ++ki) {
+          const int32_t qv = static_cast<int32_t>(aq_row[ki]);
+          const uint32_t av = static_cast<uint32_t>(qv < 0 ? -qv : qv);
+          r_l1 += av;
+          if (av > amax_aq) amax_aq = av;
+        }
+        if (r_l1 > max_l1_aq) max_l1_aq = r_l1;
+      }
       if (prof_on) ctx->prof.quant_ns += (ob::monotonic_now_ns() - tq0);
 
       // Upload shared input DMA-BUF ONCE for all H-chunks in this M-slice!
@@ -3804,7 +4052,13 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
         while (ring_count > 0u) {
           PendingSwigluChunk& p = ring[ring_head];
           ob::device_wait_handle(ctx, p.handle, ctx->cfg.timeout_ms, nullptr);
-          if (p.w_tile && p.w_tile->in_use > 0u) p.w_tile->in_use -= 1u;
+          if (p.w_tile) {
+            if (p.w_tile->in_use > 0u) p.w_tile->in_use -= 1u;
+            if (!p.w_tile->in_cache && p.w_tile->in_use == 0u) {
+              if (p.w_tile->ext2_buf) ob_buffer_free(p.w_tile->ext2_buf);
+              delete p.w_tile;
+            }
+          }
           p = PendingSwigluChunk{};
           ring_head = (ring_head + 1u) % ring_depth;
           ring_count -= 1u;
@@ -3839,6 +4093,7 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
         ob_status_t rst = OB_OK;
         if (wst == OB_OK) {
           total_hw_us += istats.hw_execution_us;
+          chained_hw_us += istats.hw_execution_us;
           if (!ctx->mock_mode) {
             uint32_t eff_d_down = p.d_down;
             const uint64_t td0 = prof_on ? ob::monotonic_now_ns() : 0u;
@@ -3887,6 +4142,7 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
                 if (prof_on) ctx->prof.wait_ns += (ob::monotonic_now_ns() - trw0);
                 if (rst != OB_OK) break;
                 total_hw_us += rstats.hw_execution_us;
+                chained_hw_us += rstats.hw_execution_us;
 
                 const uint64_t tdr0 = prof_on ? ob::monotonic_now_ns() : 0u;
                 rst = ob::buffer_sync_begin_read(p.out_buf);
@@ -3917,7 +4173,13 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
             }
           }
         }
-        if (p.w_tile && p.w_tile->in_use > 0u) p.w_tile->in_use -= 1u;
+        if (p.w_tile) {
+          if (p.w_tile->in_use > 0u) p.w_tile->in_use -= 1u;
+          if (!p.w_tile->in_cache && p.w_tile->in_use == 0u) {
+            if (p.w_tile->ext2_buf) ob_buffer_free(p.w_tile->ext2_buf);
+            delete p.w_tile;
+          }
+        }
         p = PendingSwigluChunk{};
         ring_head = (ring_head + 1u) % ring_depth;
         ring_count -= 1u;
@@ -3933,12 +4195,14 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
 
         // 1. O(1) content hash of (W_gate[h0..], W_up[h0..], W_down[:, h0..])
         const uint64_t th0 = prof_on ? ob::monotonic_now_ns() : 0u;
-        uint64_t wh = 0x5357474C555F5731ULL; // "SWGLU_W1"
+        ob::WeightHash128 wh_st{};
+        const uint64_t wh_tag = 0x5357474C555F5731ULL; // "SWGLU_W1"
         uint32_t whdr[8] = {
             ms.hw_m, K, th, hw_h, N,
             desc->gate_is_q4_0, desc->up_is_q4_0, desc->down_is_q4_0
         };
-        wh = ob::fast_hash64_update(wh, whdr, sizeof(whdr));
+        ob::hash128_update(&wh_st, &wh_tag, sizeof(wh_tag));
+        ob::hash128_update(&wh_st, whdr, sizeof(whdr));
         const uint8_t* g_ptr = static_cast<const uint8_t*>(desc->w_gate_hk) +
                                static_cast<size_t>(h0) * g_row_bytes;
         const uint8_t* u_ptr = static_cast<const uint8_t*>(desc->w_up_hk) +
@@ -3947,10 +4211,11 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
             desc->down_is_q4_0 ? sizeof(ob_block_q4_0_t) : sizeof(ob_block_q8_0_t);
         const uint8_t* d_ptr = static_cast<const uint8_t*>(desc->w_down_nh) +
                                static_cast<size_t>(h_blk0) * d_blk_sz;
-        wh = ob::hash_weight_tile_fast(wh, g_ptr, g_row_bytes, th, g_row_bytes, strict_hash);
-        wh = ob::hash_weight_tile_fast(wh, u_ptr, u_row_bytes, th, u_row_bytes, strict_hash);
-        wh = ob::hash_weight_tile_fast(wh, d_ptr, d_row_bytes, N,
-                                       static_cast<size_t>(h_blk_cnt) * d_blk_sz, strict_hash);
+        ob::hash_weight_tile_fast(&wh_st, g_ptr, g_row_bytes, th, g_row_bytes, strict_hash);
+        ob::hash_weight_tile_fast(&wh_st, u_ptr, u_row_bytes, th, u_row_bytes, strict_hash);
+        ob::hash_weight_tile_fast(&wh_st, d_ptr, d_row_bytes, N,
+                                  static_cast<size_t>(h_blk_cnt) * d_blk_sz, strict_hash);
+        const ob::WeightTileKey wh = ob::finalize_weight_key(wh_st);
         ob::CachedWeightTile* w_tile = ob::weight_cache_find_locked(ctx, wh);
         if (prof_on) ctx->prof.hash_ns += (ob::monotonic_now_ns() - th0);
 
@@ -4034,12 +4299,16 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
           }
           const double mean_row_max_wg = sum_row_max_wg / static_cast<double>(std::max<uint32_t>(1u, th));
           if (max_wg > 0.0f && static_cast<double>(max_wg) > 16.0 * std::max(mean_row_max_wg, 1e-12)) {
-            ob::CachedWeightTile* sentinel = new (std::nothrow) ob::CachedWeightTile();
-            if (sentinel) {
-              sentinel->key = wh;
-              sentinel->ext2_bytes = 0u;
-              sentinel->rejected_swiglu = true;
-              ob::weight_cache_insert_locked(ctx, sentinel);
+            bool sentinel_ok = false;
+            if (ob::weight_cache_prepare_space_locked(ctx, 0u, ring_count, drain_one, &sentinel_ok) == OB_OK &&
+                sentinel_ok) {
+              ob::CachedWeightTile* sentinel = new (std::nothrow) ob::CachedWeightTile();
+              if (sentinel) {
+                sentinel->key = wh;
+                sentinel->ext2_bytes = 0u;
+                sentinel->rejected_swiglu = true;
+                ob::weight_cache_insert_locked(ctx, sentinel);
+              }
             }
             if (prof_on) ctx->prof.weight_pack_ns += (ob::monotonic_now_ns() - tp0);
             drain_all_cleanup();
@@ -4058,24 +4327,28 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
             }
           }
 
-          //   d) Record per-stage L2 & DC-sum weight norms once for runtime RMS-calibrated PoT dividers!
-          float l2_g_max = 0.0f, l2_g_mean = 0.0f, dc_g_max = 0.0f;
-          float l2_u_max = 0.0f, l2_u_mean = 0.0f, dc_u_max = 0.0f;
+          //   d) Record per-stage L2, DC-sum, L1, and Linf weight norms once for runtime divider selection & exact saturation guards!
+          float l2_g_max = 0.0f, l2_g_mean = 0.0f, dc_g_max = 0.0f, l1_g_max = 0.0f, linf_g_max = 0.0f;
+          float l2_u_max = 0.0f, l2_u_mean = 0.0f, dc_u_max = 0.0f, l1_u_max = 0.0f, linf_u_max = 0.0f;
           float l2_d_max = 0.0f, l2_d_mean = 0.0f;
-          ob::compute_matrix_row_l2_stats(wg_q.data(), th, K, K, &l2_g_max, &l2_g_mean, &dc_g_max);
-          ob::compute_matrix_row_l2_stats(wu_q.data(), th, K, K, &l2_u_max, &l2_u_mean, &dc_u_max);
+          ob::compute_matrix_row_l2_stats(wg_q.data(), th, K, K, &l2_g_max, &l2_g_mean, &dc_g_max, &l1_g_max, &linf_g_max);
+          ob::compute_matrix_row_l2_stats(wu_q.data(), th, K, K, &l2_u_max, &l2_u_mean, &dc_u_max, &l1_u_max, &linf_u_max);
           ob::compute_matrix_row_l2_stats(wd_q.data(), N, th, hw_h, &l2_d_max, &l2_d_mean);
 
           // Reject statistically non-zero-mean gate/up weight tiles where correlated inputs
           // could saturate intermediate INT8 stages silently despite unsaturated down output.
           if ((l2_g_max > 0.0f && dc_g_max > 5.5f * l2_g_max) ||
               (l2_u_max > 0.0f && dc_u_max > 5.5f * l2_u_max)) {
-            ob::CachedWeightTile* sentinel = new (std::nothrow) ob::CachedWeightTile();
-            if (sentinel) {
-              sentinel->key = wh;
-              sentinel->ext2_bytes = 0u;
-              sentinel->rejected_swiglu = true;
-              ob::weight_cache_insert_locked(ctx, sentinel);
+            bool sentinel_ok = false;
+            if (ob::weight_cache_prepare_space_locked(ctx, 0u, ring_count, drain_one, &sentinel_ok) == OB_OK &&
+                sentinel_ok) {
+              ob::CachedWeightTile* sentinel = new (std::nothrow) ob::CachedWeightTile();
+              if (sentinel) {
+                sentinel->key = wh;
+                sentinel->ext2_bytes = 0u;
+                sentinel->rejected_swiglu = true;
+                ob::weight_cache_insert_locked(ctx, sentinel);
+              }
             }
             if (prof_on) ctx->prof.weight_pack_ns += (ob::monotonic_now_ns() - tp0);
             drain_all_cleanup();
@@ -4088,13 +4361,22 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
               wg_q.data(), nullptr,
               wu_q.data(), nullptr,
               wd_q.data(), nullptr);
+          if (prof_on) ctx->prof.weight_pack_ns += (ob::monotonic_now_ns() - tp0);
+
+          bool cacheable = false;
+          ob_status_t pst = ob::weight_cache_prepare_space_locked(
+              ctx, ext2.size(), ring_count, drain_one, &cacheable);
+          if (pst != OB_OK) {
+            drain_all_cleanup();
+            return pst;
+          }
+
           ob_buffer* wbuf = nullptr;
           ob_status_t wst = ob_buffer_alloc(
               ctx, ext2.size(), OB_BUF_BIDIRECTIONAL | OB_BUF_NO_POOL | OB_BUF_ZERO_INIT, &wbuf);
           if (wst == OB_OK) {
             wst = ob_buffer_write(wbuf, ext2.data(), ext2.size(), 0u);
           }
-          if (prof_on) ctx->prof.weight_pack_ns += (ob::monotonic_now_ns() - tp0);
           if (wst != OB_OK) {
             if (wbuf) ob_buffer_free(wbuf);
             drain_all_cleanup();
@@ -4120,8 +4402,24 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
           w_tile->swiglu_l2_down_max = l2_d_max;
           w_tile->swiglu_dc_gate_max = dc_g_max;
           w_tile->swiglu_dc_up_max = dc_u_max;
-          ob::weight_cache_insert_locked(ctx, w_tile);
+          w_tile->swiglu_l1_gate_max = l1_g_max;
+          w_tile->swiglu_linf_gate_max = linf_g_max;
+          w_tile->swiglu_l1_up_max = l1_u_max;
+          w_tile->swiglu_linf_up_max = linf_u_max;
+          if (cacheable) {
+            ob::weight_cache_insert_locked(ctx, w_tile);
+          } else {
+            w_tile->in_cache = false;
+          }
         }
+
+        auto discard_unsubmitted_wtile = [&]() {
+          if (w_tile && !w_tile->in_cache && w_tile->in_use == 0u) {
+            if (w_tile->ext2_buf) ob_buffer_free(w_tile->ext2_buf);
+            delete w_tile;
+            w_tile = nullptr;
+          }
+        };
 
         const float rms_aq = static_cast<float>(max_row_rms / static_cast<double>(s_a));
         uint32_t d_gate = 0u, d_up = 0u, d_mul = 0u, d_down = 0u;
@@ -4132,39 +4430,56 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
             w_tile->swiglu_l2_down_max,
             &d_gate, &d_up, &d_mul, &d_down);
 
-        // Guard against silent intermediate INT8 clipping in gate/up projections on correlated
+        // Guard against silent intermediate INT8 clipping in gate/up/mul stages on correlated
         // or low-crest dense activations before submitting any VII chunks.
         {
           const double mean_aq = max_row_abs_mean / static_cast<double>(s_a);
-          const double std_aq = std::sqrt(std::max(
-              0.0, static_cast<double>(rms_aq) * static_cast<double>(rms_aq) - mean_aq * mean_aq));
-          const double sig_gu = (ms.tm > 1u) ? 4.0 : 3.65;
           const double dc_gate_term = mean_aq * static_cast<double>(w_tile->swiglu_dc_gate_max);
           const double dc_up_term = mean_aq * static_cast<double>(w_tile->swiglu_dc_up_max);
-          const double est_gate =
-              dc_gate_term + sig_gu * std_aq * static_cast<double>(w_tile->swiglu_l2_gate_max);
-          const double est_up =
-              dc_up_term + sig_gu * std_aq * static_cast<double>(w_tile->swiglu_l2_up_max);
-          if (rms_aq > 56.0f ||
-              dc_gate_term > 64.0 * static_cast<double>(d_gate) ||
-              dc_up_term > 64.0 * static_cast<double>(d_up) ||
-              est_gate > 250.0 * static_cast<double>(d_gate) ||
-              est_up > 250.0 * static_cast<double>(d_up)) {
+          const double l2_aq = static_cast<double>(rms_aq) * std::sqrt(static_cast<double>(K));
+          const double ub_g = std::min({
+              l2_aq * static_cast<double>(w_tile->swiglu_l2_gate_max),
+              static_cast<double>(max_l1_aq) * static_cast<double>(w_tile->swiglu_linf_gate_max),
+              static_cast<double>(amax_aq) * static_cast<double>(w_tile->swiglu_l1_gate_max),
+          });
+          const double ub_u = std::min({
+              l2_aq * static_cast<double>(w_tile->swiglu_l2_up_max),
+              static_cast<double>(max_l1_aq) * static_cast<double>(w_tile->swiglu_linf_up_max),
+              static_cast<double>(amax_aq) * static_cast<double>(w_tile->swiglu_l1_up_max),
+          });
+          bool reject_clip = (rms_aq > 56.0f) ||
+                             (dc_gate_term > 64.0 * static_cast<double>(d_gate)) ||
+                             (dc_up_term > 64.0 * static_cast<double>(d_up));
+          if (!reject_clip) {
+            const bool holder_proven =
+                (ub_g <= 127.0 * static_cast<double>(d_gate)) &&
+                (ub_u <= 127.0 * static_cast<double>(d_up)) &&
+                ((127LL * 127LL) <= 127LL * static_cast<int64_t>(d_mul));
+            if (!holder_proven) {
+              reject_clip = swiglu_chunk_clips_or_tunes(
+                  desc, a_q.data(), ms.tm, K, nb_k, h0, th, s_a, w_tile->swiglu_s_wg,
+                  &d_gate, &d_up, &d_mul, &ctx->gemm_wrow_scratch);
+            }
+          }
+          if (reject_clip) {
+            discard_unsubmitted_wtile();
             drain_all_cleanup();
             slice_rejected = true;
             break;
           }
         }
+        const float s_gate_cand = s_a * w_tile->swiglu_s_wg * static_cast<float>(d_gate);
 
         if (ring_count >= ring_depth) {
           ob_status_t dst = drain_one();
           if (dst != OB_OK) {
+            discard_unsubmitted_wtile();
             drain_all_cleanup();
             return dst;
           }
         }
         const uint32_t slot = (ring_head + ring_count) % ring_depth;
-        const float s_gate = s_a * w_tile->swiglu_s_wg * static_cast<float>(d_gate);
+        const float s_gate = s_gate_cand;
         const uint64_t gkey = ob::hash_swiglu_graph_key(
             ms.hw_m, K, hw_h, N, d_gate, d_up, d_mul, d_down,
             s_gate, slot % param_swap_slots);
@@ -4175,6 +4490,7 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
         bool was_hit = false;
         ob_status_t gst = ob::acquire_swiglu_entry(ctx, gd, gkey, &entry, &was_hit);
         if (gst != OB_OK) {
+          discard_unsubmitted_wtile();
           drain_all_cleanup();
           return gst;
         }
@@ -4194,6 +4510,7 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
         if (prof_on) ctx->prof.submit_ns += (ob::monotonic_now_ns() - ts0);
         if (bst != OB_OK) {
           ob::release_tile_entry(ctx, entry);
+          discard_unsubmitted_wtile();
           drain_all_cleanup();
           return bst;
         }
@@ -4229,7 +4546,9 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
 
     if (slice_rejected) {
       ob_invoke_stats_t fb{};
+      const uint64_t fbt0 = ob::monotonic_now_ns();
       ob_status_t st = run_swiglu_m7a_fallback(ctx, a_slice, desc, ms.tm, c_slice, &fb);
+      fb_wall_ns += (ob::monotonic_now_ns() - fbt0);
       if (st != OB_OK) return st;
       total_hw_us += fb.hw_execution_us;
       total_tiles += fb.tiles_dispatched;
@@ -4247,8 +4566,10 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
     ctx->prof.swiglu_fallbacks += fb_slices;
     if (chained_chunks > 0u) {
       ctx->prof.tiles_dispatched += chained_chunks;
-      ctx->prof.hw_us += total_hw_us;
-      ctx->prof.total_wall_ns += wall_ns;
+      ctx->prof.hw_us += chained_hw_us;
+    }
+    if (chained_chunks > 0u || ran_cpu_fb_slice) {
+      ctx->prof.total_wall_ns += (wall_ns > fb_wall_ns) ? (wall_ns - fb_wall_ns) : 0ULL;
     }
   }
 

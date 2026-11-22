@@ -5479,15 +5479,12 @@ constexpr float kSwigluSiluUnitCoeffs[8][5] = {
     {0.0f, 1.0f, 0.0f, 0.0f, 0.0f},
 };
 
-inline int32_t rne_i32_exact(float x) {
-  // IEEE-754 round-to-nearest-even matching TPU hardware & numpy.rint
-  return static_cast<int32_t>(std::nearbyint(x));
-}
-
-inline int32_t clip_i8_i32(int32_t v) {
-  if (v < -128) return -128;
-  if (v > 127) return 127;
-  return v;
+inline int32_t quant_clip_i8_f32(float x) {
+  // Clamp NaN-safely in float before casting to int32_t so |x| >= 2^31 cannot overflow INT32.
+  float r = std::nearbyint(x);
+  if (!(r >= -128.0f)) return -128;
+  if (r > 127.0f) return 127;
+  return static_cast<int32_t>(r);
 }
 
 void apply_scale_clip_csrs(CsrBank* bank, float real_mul, float fmax = 127.0f, float fmin = -128.0f) {
@@ -7343,16 +7340,13 @@ void simulate_swiglu_hw_exact(const int8_t* x_mk,
           acc_u += xv * static_cast<int32_t>(wu_row[k]);
         }
       }
-      const int32_t q_g = clip_i8_i32(rne_i32_exact(static_cast<float>(acc_g) * m_g));
-      const int32_t q_u = clip_i8_i32(rne_i32_exact(static_cast<float>(acc_u) * m_u));
+      const int32_t q_g = quant_clip_i8_f32(static_cast<float>(acc_g) * m_g);
+      const int32_t q_u = quant_clip_i8_f32(static_cast<float>(acc_u) * m_u);
       const float x_g = static_cast<float>(q_g) * d.s_gate;
       const float y_silu = eval_0x640_horner_scalar(x_g, silu_coeffs, kSwigluSiluBps, -11.6f, kInf);
-      int32_t u_silu = rne_i32_exact(y_silu) + 128;
-      if (u_silu < 0) u_silu = 0;
-      if (u_silu > 255) u_silu = 255;
-      const int32_t q_silu = u_silu - 128;
+      const int32_t q_silu = quant_clip_i8_f32(y_silu);
       p_row[h] = static_cast<int8_t>(
-          clip_i8_i32(rne_i32_exact(static_cast<float>(q_silu * q_u) * m_mul)));
+          quant_clip_i8_f32(static_cast<float>(q_silu * q_u) * m_mul));
     }
   }
   for (uint32_t m = 0u; m < M; ++m) {
@@ -7367,9 +7361,23 @@ void simulate_swiglu_hw_exact(const int8_t* x_mk,
         }
       }
       y_row[n] = static_cast<int8_t>(
-          clip_i8_i32(rne_i32_exact(static_cast<float>(acc_d) * m_d)));
+          quant_clip_i8_f32(static_cast<float>(acc_d) * m_d));
     }
   }
+}
+
+int32_t eval_swiglu_silu_q(int32_t q_g, float s_gate) {
+  if (!(s_gate > 0.0f)) return 0;
+  constexpr float kInf = __builtin_huge_valf();
+  float silu_coeffs[8][5]{};
+  for (int s = 0; s < 8; ++s) {
+    for (int k = 0; k < 5; ++k) {
+      silu_coeffs[s][k] = kSwigluSiluUnitCoeffs[s][k] / s_gate;
+    }
+  }
+  const float x_g = static_cast<float>(q_g) * s_gate;
+  const float y_silu = eval_0x640_horner_scalar(x_g, silu_coeffs, kSwigluSiluBps, -11.6f, kInf);
+  return quant_clip_i8_f32(y_silu);
 }
 
 }  // namespace ob
