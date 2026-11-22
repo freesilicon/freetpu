@@ -17,12 +17,13 @@ COMMON_CXXFLAGS := -std=c++17 -O2 -Wall -Wextra -Werror -fno-exceptions -fno-rtt
 ANDROID_CXXFLAGS := $(COMMON_CXXFLAGS) -fPIE
 ANDROID_LDFLAGS  := -pie -static-libstdc++ -Wl,--as-needed -lm
 HOST_CXXFLAGS    := $(COMMON_CXXFLAGS)
-HOST_LDFLAGS     := -lm
+HOST_LDFLAGS     := -lm -lpthread
 
 SRCS := \
 	$(THIS_DIR)/src/ob_sha256.cpp \
 	$(THIS_DIR)/src/ob_dgc0.cpp \
 	$(THIS_DIR)/src/ob_buffer_pool.cpp \
+	$(THIS_DIR)/src/ob_worker_pool.cpp \
 	$(THIS_DIR)/src/ob_device.cpp \
 	$(THIS_DIR)/src/ob_graph.cpp \
 	$(THIS_DIR)/src/ob_gemm_emitter.cpp \

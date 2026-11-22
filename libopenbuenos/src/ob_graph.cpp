@@ -27,7 +27,7 @@ void destroy_cached_graph_resources(ob_context* ctx, CachedGraph* entry) {
     entry->model_handle = 0u;
   }
   if (entry->reg_cmd_buf) ob_buffer_free(entry->reg_cmd_buf);
-  if (entry->params_buf) ob_buffer_free(entry->params_buf);
+  if (entry->params_buf && entry->owns_params_buf) ob_buffer_free(entry->params_buf);
   if (entry->vm_ir_buf) ob_buffer_free(entry->vm_ir_buf);
   if (entry->image_buf && entry->owns_image_buf) ob_buffer_free(entry->image_buf);
   if (entry->scratch_buf) ob_buffer_free(entry->scratch_buf);
@@ -133,9 +133,50 @@ ob_status_t acquire_image_buf(ob_context* ctx,
   return OB_OK;
 }
 
+constexpr size_t kSharedZeroParamsBytes = 8u * 1024u * 1024u;
+
+ob_status_t acquire_shared_zero_params_buf(ob_context* ctx,
+                                           size_t needed_bytes,
+                                           ob_buffer** out_buf,
+                                           bool* out_owned) {
+  *out_buf = nullptr;
+  *out_owned = true;
+  const char* env = std::getenv("OPENBUENOS_SHARE_ZERO_PARAMS");
+  if ((env && env[0] == '0' && env[1] == '\0') || needed_bytes > kSharedZeroParamsBytes) {
+    return OB_ERR_UNSUPPORTED;
+  }
+  {
+    std::lock_guard<std::mutex> lk(ctx->cache_mu);
+    if (ctx->shared_zero_params_buf) {
+      *out_buf = ctx->shared_zero_params_buf;
+      *out_owned = false;
+      return OB_OK;
+    }
+  }
+  ob_buffer* buf = nullptr;
+  ob_status_t st = ob_buffer_alloc(
+      ctx, kSharedZeroParamsBytes,
+      OB_BUF_BIDIRECTIONAL | OB_BUF_NO_POOL | OB_BUF_ZERO_INIT, &buf);
+  if (st != OB_OK) return st;
+  {
+    std::lock_guard<std::mutex> lk(ctx->cache_mu);
+    if (!ctx->shared_zero_params_buf) {
+      ctx->shared_zero_params_buf = buf;
+      *out_buf = buf;
+      *out_owned = false;
+      return OB_OK;
+    }
+    ob_buffer_free(buf);
+    *out_buf = ctx->shared_zero_params_buf;
+    *out_owned = false;
+    return OB_OK;
+  }
+}
+
 ob_status_t upload_and_register_graph(ob_context* ctx,
                                       const uint8_t* blob,
                                       const ParsedDgc0& parsed,
+                                      bool share_zero_params,
                                       CachedGraph** out_entry) {
   *out_entry = nullptr;
   CachedGraph* e = new (std::nothrow) CachedGraph();
@@ -158,7 +199,7 @@ ob_status_t upload_and_register_graph(ob_context* ctx,
     if (st != OB_OK) break;
 
     st = ob_buffer_alloc(ctx, static_cast<size_t>(parsed.ext_dive_vm_ir.size),
-                         OB_BUF_BIDIRECTIONAL | OB_BUF_ZERO_INIT, &e->vm_ir_buf);
+                         OB_BUF_BIDIRECTIONAL, &e->vm_ir_buf);
     if (st != OB_OK) break;
     st = ob_buffer_write(e->vm_ir_buf, blob + parsed.ext_dive_vm_ir.offset,
                          static_cast<size_t>(parsed.ext_dive_vm_ir.size), 0u);
@@ -167,12 +208,24 @@ ob_status_t upload_and_register_graph(ob_context* ctx,
     struct litebuf_dive_buffer_slice param_slice {};
     uint32_t param_count = 0u;
     if (parsed.has_params) {
-      st = ob_buffer_alloc(ctx, static_cast<size_t>(parsed.ext_params.size),
-                           OB_BUF_BIDIRECTIONAL | OB_BUF_ZERO_INIT, &e->params_buf);
-      if (st != OB_OK) break;
-      st = ob_buffer_write(e->params_buf, blob + parsed.ext_params.offset,
-                           static_cast<size_t>(parsed.ext_params.size), 0u);
-      if (st != OB_OK) break;
+      bool shared_ok = false;
+      if (share_zero_params) {
+        ob_status_t sst = acquire_shared_zero_params_buf(
+            ctx, static_cast<size_t>(parsed.ext_params.size),
+            &e->params_buf, &e->owns_params_buf);
+        if (sst == OB_OK) {
+          shared_ok = true;
+        }
+      }
+      if (!shared_ok) {
+        e->owns_params_buf = true;
+        st = ob_buffer_alloc(ctx, static_cast<size_t>(parsed.ext_params.size),
+                             OB_BUF_BIDIRECTIONAL | OB_BUF_ZERO_INIT, &e->params_buf);
+        if (st != OB_OK) break;
+        st = ob_buffer_write(e->params_buf, blob + parsed.ext_params.offset,
+                             static_cast<size_t>(parsed.ext_params.size), 0u);
+        if (st != OB_OK) break;
+      }
       param_slice.address = e->params_buf->slab.iova;
       param_slice.size_bytes = parsed.ext_params.size;
       param_count = 1u;
@@ -189,7 +242,7 @@ ob_status_t upload_and_register_graph(ob_context* ctx,
       break;
     }
 
-    st = ob_buffer_alloc(ctx, inner_reg_len, OB_BUF_BIDIRECTIONAL | OB_BUF_ZERO_INIT, &e->reg_cmd_buf);
+    st = ob_buffer_alloc(ctx, inner_reg_len, OB_BUF_BIDIRECTIONAL, &e->reg_cmd_buf);
     if (st != OB_OK) break;
     st = ob_buffer_write(e->reg_cmd_buf, inner_reg, inner_reg_len, 0u);
     if (st != OB_OK) break;
@@ -233,6 +286,13 @@ ob_status_t upload_and_register_graph(ob_context* ctx,
       break;
     }
     e->model_handle = reg_resp.handle;
+    // RegisterModel is synchronous; return the 4 KiB inner registration command
+    // buffer to the slab pool immediately so subsequent registrations reuse it
+    // (zero per-graph FD retention and immediate buffer-pool hits).
+    if (e->reg_cmd_buf) {
+      ob_buffer_free(e->reg_cmd_buf);
+      e->reg_cmd_buf = nullptr;
+    }
   } while (false);
 
   if (st != OB_OK) {
@@ -276,13 +336,17 @@ void shared_image_clear(ob_context* ctx) {
     ob_buffer_free(ctx->shared_image_buf);
     ctx->shared_image_buf = nullptr;
   }
+  if (ctx->shared_zero_params_buf) {
+    ob_buffer_free(ctx->shared_zero_params_buf);
+    ctx->shared_zero_params_buf = nullptr;
+  }
   ctx->has_shared_image = false;
   ctx->shared_image_size = 0;
 }
 
-bool graph_cache_lookup_u64(ob_context* ctx, uint64_t cache_key, ob_graph_t** out_graph) {
-  if (!ctx || cache_key == 0u || !out_graph) return false;
-  *out_graph = nullptr;
+bool graph_cache_lookup_entry_u64(ob_context* ctx, uint64_t cache_key, CachedGraph** out_entry) {
+  if (!ctx || cache_key == 0u || !out_entry) return false;
+  *out_entry = nullptr;
   CacheKey key {};
   key.is_u64 = true;
   key.u64_key = cache_key;
@@ -292,12 +356,24 @@ bool graph_cache_lookup_u64(ob_context* ctx, uint64_t cache_key, ob_graph_t** ou
   if (it == ctx->cache_map.end()) return false;
 
   CachedGraph* entry = it->second;
-  ctx->cache_lru.splice(ctx->cache_lru.begin(), ctx->cache_lru, entry->lru_it);
+  if (entry->lru_it != ctx->cache_lru.begin()) {
+    ctx->cache_lru.splice(ctx->cache_lru.begin(), ctx->cache_lru, entry->lru_it);
+  }
   entry->ref_count += 1u;
   ctx->cache_hits += 1u;
+  *out_entry = entry;
+  return true;
+}
+
+bool graph_cache_lookup_u64(ob_context* ctx, uint64_t cache_key, ob_graph_t** out_graph) {
+  if (!ctx || cache_key == 0u || !out_graph) return false;
+  *out_graph = nullptr;
+  CachedGraph* entry = nullptr;
+  if (!graph_cache_lookup_entry_u64(ctx, cache_key, &entry)) return false;
 
   ob_graph* handle = new (std::nothrow) ob_graph();
   if (!handle) {
+    std::lock_guard<std::mutex> lk(ctx->cache_mu);
     entry->ref_count -= 1u;
     ctx->cache_hits -= 1u;
     return false;
@@ -335,6 +411,101 @@ ob_status_t graph_submit_async_with_params(ob_graph_t* graph,
   return st;
 }
 
+ob_status_t graph_register_dgc0_internal(ob_context* ctx,
+                                         const void* dgc0_bytes,
+                                         size_t dgc0_size,
+                                         uint64_t cache_key,
+                                         bool share_zero_params,
+                                         CachedGraph** out_entry,
+                                         bool* out_cache_hit) {
+  if (!ctx || !out_entry) return OB_ERR_INVALID_ARG;
+  *out_entry = nullptr;
+  if (out_cache_hit) *out_cache_hit = false;
+
+  CacheKey key {};
+  if (cache_key != 0u) {
+    key.is_u64 = true;
+    key.u64_key = cache_key;
+  } else {
+    if (!dgc0_bytes || dgc0_size == 0u) return OB_ERR_INVALID_ARG;
+    key.is_u64 = false;
+    sha256_compute(dgc0_bytes, dgc0_size, key.sha256.bytes.data());
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(ctx->cache_mu);
+    auto it = ctx->cache_map.find(key);
+    if (it != ctx->cache_map.end()) {
+      CachedGraph* entry = it->second;
+      ctx->cache_lru.splice(ctx->cache_lru.begin(), ctx->cache_lru, entry->lru_it);
+      entry->ref_count += 1u;
+      ctx->cache_hits += 1u;
+      *out_entry = entry;
+      if (out_cache_hit) *out_cache_hit = true;
+      return OB_OK;
+    }
+  }
+
+  if (!dgc0_bytes || dgc0_size == 0u) {
+    set_last_error(ctx, "Cache miss requires non-empty dgc0_bytes");
+    return OB_ERR_INVALID_ARG;
+  }
+
+  const uint8_t* bytes = static_cast<const uint8_t*>(dgc0_bytes);
+  ParsedDgc0 parsed;
+  std::string err;
+  ob_status_t st = parse_dgc0_buffer(bytes, dgc0_size, &parsed, &err);
+  if (st != OB_OK) {
+    set_last_error(ctx, err);
+    return st;
+  }
+
+  CachedGraph* new_entry = nullptr;
+  st = upload_and_register_graph(ctx, bytes, parsed, share_zero_params, &new_entry);
+  if (st != OB_OK &&
+      (st == OB_ERR_FW_ERROR || st == OB_ERR_NO_MEMORY || st == OB_ERR_IOCTL)) {
+    size_t evicted = 0u;
+    {
+      std::lock_guard<std::mutex> lk(ctx->cache_mu);
+      if (!ctx->cache_lru.empty()) {
+        size_t batch = std::max<size_t>(16u, ctx->cache_lru.size() / 4u);
+        evicted = evict_unreferenced_batch_locked(ctx, batch);
+      }
+    }
+    if (evicted > 0u) {
+      st = upload_and_register_graph(ctx, bytes, parsed, share_zero_params, &new_entry);
+    }
+  }
+  if (st != OB_OK) return st;
+
+  new_entry->key = key;
+
+  {
+    std::lock_guard<std::mutex> lk(ctx->cache_mu);
+    auto it = ctx->cache_map.find(key);
+    if (it != ctx->cache_map.end()) {
+      CachedGraph* existing = it->second;
+      ctx->cache_lru.splice(ctx->cache_lru.begin(), ctx->cache_lru, existing->lru_it);
+      existing->ref_count += 1u;
+      ctx->cache_hits += 1u;
+      *out_entry = existing;
+      if (out_cache_hit) *out_cache_hit = true;
+      destroy_cached_graph_resources(ctx, new_entry);
+    } else {
+      ctx->cache_misses += 1u;
+      new_entry->ref_count = 1u;
+      new_entry->in_cache = true;
+      ctx->cache_lru.push_front(new_entry);
+      new_entry->lru_it = ctx->cache_lru.begin();
+      ctx->cache_map[key] = new_entry;
+      evict_lru_locked(ctx);
+      *out_entry = new_entry;
+      if (out_cache_hit) *out_cache_hit = false;
+    }
+  }
+  return OB_OK;
+}
+
 }  // namespace ob
 
 extern "C" {
@@ -347,108 +518,20 @@ ob_status_t ob_graph_register_dgc0(ob_context_t* ctx,
   if (!ctx || !out_graph) return OB_ERR_INVALID_ARG;
   *out_graph = nullptr;
 
-  // Build cache key: explicit non-zero cache_key or SHA-256 of .dgc0 payload
-  ob::CacheKey key {};
-  if (cache_key != 0u) {
-    key.is_u64 = true;
-    key.u64_key = cache_key;
-  } else {
-    if (!dgc0_bytes || dgc0_size == 0u) return OB_ERR_INVALID_ARG;
-    key.is_u64 = false;
-    ob::sha256_compute(dgc0_bytes, dgc0_size, key.sha256.bytes.data());
-  }
-
-  // Fast path: check persistent LRU cache first
-  {
-    std::lock_guard<std::mutex> lk(ctx->cache_mu);
-    auto it = ctx->cache_map.find(key);
-    if (it != ctx->cache_map.end()) {
-      ob::CachedGraph* entry = it->second;
-      // Promote to MRU front
-      ctx->cache_lru.splice(ctx->cache_lru.begin(), ctx->cache_lru, entry->lru_it);
-      entry->ref_count += 1u;
-      ctx->cache_hits += 1u;
-
-      ob_graph* handle = new (std::nothrow) ob_graph();
-      if (!handle) {
-        entry->ref_count -= 1u;
-        return OB_ERR_NO_MEMORY;
-      }
-      handle->entry = entry;
-      handle->was_cache_hit = true;
-      *out_graph = handle;
-      return OB_OK;
-    }
-  }
-
-  // Cache miss: parse & register outside cache_mu to keep registration responsive
-  if (!dgc0_bytes || dgc0_size == 0u) {
-    ob::set_last_error(ctx, "Cache miss requires non-empty dgc0_bytes");
-    return OB_ERR_INVALID_ARG;
-  }
-
-  const uint8_t* bytes = static_cast<const uint8_t*>(dgc0_bytes);
-  ob::ParsedDgc0 parsed;
-  std::string err;
-  ob_status_t st = ob::parse_dgc0_buffer(bytes, dgc0_size, &parsed, &err);
-  if (st != OB_OK) {
-    ob::set_last_error(ctx, err);
-    return st;
-  }
-
-  ob::CachedGraph* new_entry = nullptr;
-  st = ob::upload_and_register_graph(ctx, bytes, parsed, &new_entry);
-  if (st != OB_OK &&
-      (st == OB_ERR_FW_ERROR || st == OB_ERR_NO_MEMORY || st == OB_ERR_IOCTL)) {
-    // Defensive recovery: if firmware/IOMMU hits a registered-model or DMA-BUF ceiling
-    // below cache_capacity, evict a batch of unreferenced LRU entries and retry once.
-    size_t evicted = 0u;
-    {
-      std::lock_guard<std::mutex> lk(ctx->cache_mu);
-      if (!ctx->cache_lru.empty()) {
-        size_t batch = std::max<size_t>(16u, ctx->cache_lru.size() / 4u);
-        evicted = ob::evict_unreferenced_batch_locked(ctx, batch);
-      }
-    }
-    if (evicted > 0u) {
-      st = ob::upload_and_register_graph(ctx, bytes, parsed, &new_entry);
-    }
-  }
+  ob::CachedGraph* entry = nullptr;
+  bool was_hit = false;
+  ob_status_t st = ob::graph_register_dgc0_internal(
+      ctx, dgc0_bytes, dgc0_size, cache_key, false, &entry, &was_hit);
   if (st != OB_OK) return st;
-
-  new_entry->key = key;
 
   ob_graph* handle = new (std::nothrow) ob_graph();
   if (!handle) {
-    ob::destroy_cached_graph_resources(ctx, new_entry);
+    std::lock_guard<std::mutex> lk(ctx->cache_mu);
+    ob::graph_entry_unref_locked(ctx, entry);
     return OB_ERR_NO_MEMORY;
   }
-
-  {
-    std::lock_guard<std::mutex> lk(ctx->cache_mu);
-    // Double-check if another thread raced and inserted the same key
-    auto it = ctx->cache_map.find(key);
-    if (it != ctx->cache_map.end()) {
-      ob::CachedGraph* existing = it->second;
-      ctx->cache_lru.splice(ctx->cache_lru.begin(), ctx->cache_lru, existing->lru_it);
-      existing->ref_count += 1u;
-      ctx->cache_hits += 1u;
-      handle->entry = existing;
-      handle->was_cache_hit = true;
-      ob::destroy_cached_graph_resources(ctx, new_entry);
-    } else {
-      ctx->cache_misses += 1u;
-      new_entry->ref_count = 1u;
-      new_entry->in_cache = true;
-      ctx->cache_lru.push_front(new_entry);
-      new_entry->lru_it = ctx->cache_lru.begin();
-      ctx->cache_map[key] = new_entry;
-      ob::evict_lru_locked(ctx);
-      handle->entry = new_entry;
-      handle->was_cache_hit = false;
-    }
-  }
-
+  handle->entry = entry;
+  handle->was_cache_hit = was_hit;
   *out_graph = handle;
   return OB_OK;
 }
