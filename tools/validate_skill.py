@@ -54,7 +54,7 @@ def _extract_frontmatter_block(text: str) -> Tuple[str, str]:
         raise ValueError("SKILL.md must start with YAML frontmatter delimiter '---'")
     end_idx = None
     for idx in range(1, len(lines)):
-        if lines[idx].strip() in ("---", "..."):
+        if lines[idx].strip() == "---":
             end_idx = idx
             break
     if end_idx is None:
@@ -529,6 +529,10 @@ def run_validator_self_test(*, require_yaml: bool = False) -> None:
         (
             '---\nname: freetpu\ndescription: "unclosed or extra", "quoted strings exceeding forty characters"\n---\n',
             "",
+        ),
+        (
+            '---\nname: freetpu\ndescription: "Valid length description closed with YAML document-end dots instead of ---."\n...\nBody\n',
+            "missing closing YAML frontmatter delimiter",
         ),
     ]
     for md_text, expected in invalid_cases:

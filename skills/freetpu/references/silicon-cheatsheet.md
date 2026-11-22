@@ -55,5 +55,6 @@ Compact hardware, memory-hierarchy, and errata reference for kernel authoring an
    - Both Python (`jax.jit`) and Zero-Python C++17 PJRT hit `~125 us` `sync_ready_event` per tiny op (`1x64x32`). Fuse activations (`GEMM+SiLU`, `SwiGLU`, `RMSNorm`) or pipeline async launches (`32 us` amortized).
 3. **Colab Allocation Errors (`HTTP 412 / 400`)**:
    - `REASON_NO_BACKENDS` or `REASON_TOO_MANY_ACTIVE_ASSIGNMENTS` on `V6E1` during pre-allocation should fall back to `V5E1` (handled automatically by `tools/colab_tpu_bench.py`). Never fall back after `[colab] Session READY`.
-4. **CompilerParams Portability**:
+4. **CompilerParams & MemorySpace Portability**:
    - Recent JAX exposes `pltpu.CompilerParams`; older builds (e.g., JAX `0.5.3`) expose `pltpu.TPUCompilerParams` without optional newer kwargs such as `disable_bounds_checks`. Resolve `getattr(pltpu, "CompilerParams", None) or getattr(pltpu, "TPUCompilerParams")` and pass optional kwargs only when present in `inspect.signature` / `dataclasses.fields`.
+   - Use `pl.BlockSpec(memory_space=pl.ANY)` (supported on both JAX `0.5.3` and newer JAX) rather than `pltpu.HBM` for explicit HBM DMA inputs.

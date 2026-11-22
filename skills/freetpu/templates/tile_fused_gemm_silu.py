@@ -11,6 +11,7 @@ Features:
 from __future__ import annotations
 
 import argparse
+import ast
 import dataclasses
 import inspect
 import json
@@ -170,8 +171,8 @@ def build_pallas_gemm_silu(
             out_shape=jax.ShapeDtypeStruct((m, n), jnp.bfloat16),
             grid=(m // bm, n // bn),
             in_specs=[
-                pl.BlockSpec(memory_space=pltpu.HBM),
-                pl.BlockSpec(memory_space=pltpu.HBM),
+                pl.BlockSpec(memory_space=pl.ANY),
+                pl.BlockSpec(memory_space=pl.ANY),
             ],
             out_specs=pl.BlockSpec((bm, bn), lambda i, j: (i, j)),
             scratch_shapes=[
@@ -187,8 +188,8 @@ def build_pallas_gemm_silu(
     return run
 
 
-def _verify_compiler_params_compat() -> None:
-    """Verify CompilerParams fallback works on both modern JAX and legacy JAX 0.5.3 signatures."""
+def _verify_jax_053_compat() -> None:
+    """Verify CompilerParams and Pallas TPU symbols stay compatible with JAX 0.5.3+."""
 
     @dataclasses.dataclass(frozen=True)
     class _ModernParams:
@@ -217,10 +218,29 @@ def _verify_compiler_params_compat() -> None:
     )
     assert legacy.dimension_semantics == ("parallel", "parallel") and legacy.vmem_limit_bytes is None
 
+    # JAX 0.5.3 exposes `pl.ANY` for HBM BlockSpecs (not `pltpu.HBM`).
+    tree = ast.parse(inspect.getsource(build_pallas_gemm_silu))
+    pltpu_attrs = {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "pltpu"
+    }
+    pl_attrs = {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "pl"
+    }
+    jax_053_pltpu_surface = {"VMEM", "SemaphoreType", "make_async_copy"}
+    assert "HBM" not in pltpu_attrs, f"Unsupported JAX 0.5.3 attribute pltpu.HBM found: {pltpu_attrs}"
+    assert pltpu_attrs <= jax_053_pltpu_surface, (
+        f"Unexpected pltpu attributes outside JAX 0.5.3 surface: {pltpu_attrs - jax_053_pltpu_surface}"
+    )
+    assert "ANY" in pl_attrs, f"Expected pl.ANY memory_space in build_pallas_gemm_silu, got pl attrs {pl_attrs}"
+
 
 def run_self_test() -> Dict[str, Any]:
     """Offline CPU parity and VMEM budget check (no JAX/TPU hardware required)."""
-    _verify_compiler_params_compat()
+    _verify_jax_053_compat()
     rng = np.random.default_rng(0)
     m, k, n = 128, 256, 128
     bm, bn, bk = 64, 64, 64

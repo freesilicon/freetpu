@@ -21,14 +21,7 @@ Load [references/silicon-cheatsheet.md](references/silicon-cheatsheet.md) when c
    - **Mobile / bare-metal Edge TPU (`buenos_a0`)**: Use Workflow 1 (`libopenbuenos`, `tools/emit_custom_gemm.py`, `tools/spline_0x640.py`, `tpu_baremetal_runner`).
    - **Datacenter Cloud TPU (`v5e-1` / `v6e-1`)**: Use Workflow 2 (`google-colab-cli` / `tools/colab_tpu_bench.py`) + Workflow 3 (Pallas/Mosaic).
 3. **Parity before timing**: Always check numerical parity against NumPy `cpu_ref` (and XLA on Cloud TPU) before reporting latencies or TFLOP/s.
-
----
-
-## Workflow 1: Pixel Tensor G5 (`buenos_a0`) Bare-Metal & Host Mock
-
-Use this workflow for zero-Google-`.so` C/C++ kernels, closed-form `(M, K, N)` VLIW GEMMs, and `0x640` minimax spline fusion.
-
-> **Globally installed skill note**: If you loaded this skill via a global symlink (`~/.claude/skills/freetpu`, `~/.codex/skills/freetpu`, or `~/.gemini/config/skills/freetpu`) while working outside the FreeTPU checkout, resolve the exact `SKILL.md` path your agent loaded back to the repository root and verify the checkout before running repository-relative commands below:
+4. **Resolve the FreeTPU checkout (global installs)**: Workflows 1, 2, and 3 all invoke repository-relative scripts (`tools/...`, `skills/freetpu/templates/...`, `libopenbuenos/...`). If you loaded this skill via a global symlink (`~/.claude/skills/freetpu`, `~/.codex/skills/freetpu`, or `~/.gemini/config/skills/freetpu`) while working outside the FreeTPU checkout, resolve the exact `SKILL.md` path your agent loaded back to the repository root and verify the checkout before running any workflow below:
 
 ```bash
 # Set SKILL_MD to the exact SKILL.md path loaded by your agent
@@ -43,6 +36,12 @@ assert (root / "tools" / "emit_custom_gemm.py").is_file(), f"Not a FreeTPU check
 print(root)
 ' "$SKILL_MD")" && [ -n "$REPO_ROOT" ] && cd "$REPO_ROOT"
 ```
+
+---
+
+## Workflow 1: Pixel Tensor G5 (`buenos_a0`) Bare-Metal & Host Mock
+
+Use this workflow for zero-Google-`.so` C/C++ kernels, closed-form `(M, K, N)` VLIW GEMMs, and `0x640` minimax spline fusion.
 
 1. **Verify host mock runtime & C11/C++17 headers offline** (macOS/Linux, no phone required):
    ```bash
