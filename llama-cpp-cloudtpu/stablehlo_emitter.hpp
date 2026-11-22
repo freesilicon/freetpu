@@ -12,6 +12,8 @@ enum class TensorStorageKind {
     DENSE = 0,
     Q8_0_SPLIT,  // Split into (qs: [B3, B2, N, K/32, 32] S8, d: [B3, B2, N, K/32] F16)
     Q4_0_SPLIT,  // Split into (qs: [B3, B2, N, K/32, 16] U8, d: [B3, B2, N, K/32] F16)
+    Q4_K_SPLIT,  // Split into (qs: [B3, B2, N, K/32, 16] U8, d_eff: [B3, B2, N, K/32] F32, m_eff: [B3, B2, N, K/32] F32)
+    Q6_K_SPLIT,  // Split into (qs: [B3, B2, N, K/16, 16] S8, d_eff: [B3, B2, N, K/16] F32)
 };
 
 // Row-major tensor descriptor (GGML ne[0..3] maps to row-major dims[0..3] = {ne3, ne2, ne1, ne0}).
@@ -35,10 +37,15 @@ enum class CloudOpKind {
     SWIGLU,
     SOFT_MAX,
     GET_ROWS,
+    SET_ROWS,
     ADD,
     MUL,
+    SCALE,
     CPY,
     RESHAPE,
+    TRANSPOSE,
+    SLICE,
+    FLASH_ATTN_EXT,
 };
 
 struct RopeParams {
@@ -60,6 +67,12 @@ struct SoftMaxParams {
     float max_bias = 0.0f;
 };
 
+struct FlashAttnParams {
+    float scale = 1.0f;
+    float max_bias = 0.0f;
+    float logit_softcap = 0.0f;
+};
+
 struct OpNodeSpec {
     CloudOpKind kind = CloudOpKind::MUL_MAT;
     std::vector<uint64_t> src_ids;  // TensorSpec::id references (graph inputs or earlier op outputs)
@@ -68,9 +81,16 @@ struct OpNodeSpec {
     // Op-specific parameters
     bool high_precision = false;  // MUL_MAT: GGML_PREC_F32
     float eps = 1e-5f;            // RMS_NORM
+    float scale = 1.0f;           // SCALE
+    float bias = 0.0f;            // SCALE
     int32_t glu_swapped = 0;      // SWIGLU single-input split swap
+    int64_t perm[4] = {0, 1, 2, 3};  // TRANSPOSE (row-major StableHLO axis permutation)
+    std::vector<int64_t> slice_reshape;  // SLICE: optional pre-slice reshape dims
+    std::vector<int64_t> slice_starts;   // SLICE: start indices
+    std::vector<int64_t> slice_limits;   // SLICE: exclusive end indices
     RopeParams rope;
     SoftMaxParams soft_max;
+    FlashAttnParams flash_attn;
 };
 
 struct GraphProgramSpec {
@@ -81,7 +101,7 @@ struct GraphProgramSpec {
 
 struct PjrtInputBinding {
     uint64_t tensor_id = 0;
-    int part = 0;  // 0 = dense or quant qs, 1 = quant d scales
+    int part = 0;  // 0 = dense or quant qs, 1 = quant d scales, 2 = quant m mins (Q4_K)
     PjrtDType dtype = PjrtDType::F32;
     std::vector<int64_t> dims;
 };

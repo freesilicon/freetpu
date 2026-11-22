@@ -136,6 +136,7 @@ PJRT_Buffer_Type to_pjrt_buffer_type(PjrtDType dt) {
         case PjrtDType::U8: return PJRT_Buffer_Type_U8;
         case PjrtDType::S16: return PJRT_Buffer_Type_S16;
         case PjrtDType::S32: return PJRT_Buffer_Type_S32;
+        case PjrtDType::S64: return PJRT_Buffer_Type_S64;
         default: return PJRT_Buffer_Type_INVALID;
     }
 }
@@ -149,6 +150,7 @@ PjrtDType from_pjrt_buffer_type(PJRT_Buffer_Type dt) {
         case PJRT_Buffer_Type_U8: return PjrtDType::U8;
         case PJRT_Buffer_Type_S16: return PjrtDType::S16;
         case PJRT_Buffer_Type_S32: return PjrtDType::S32;
+        case PJRT_Buffer_Type_S64: return PjrtDType::S64;
         default: return PjrtDType::INVALID;
     }
 }
@@ -162,12 +164,14 @@ const char* pjrt_dtype_mlir_name(PjrtDType dt) {
         case PjrtDType::U8: return "ui8";
         case PjrtDType::S16: return "i16";
         case PjrtDType::S32: return "i32";
+        case PjrtDType::S64: return "i64";
         default: return "invalid";
     }
 }
 
 size_t pjrt_dtype_size(PjrtDType dt) {
     switch (dt) {
+        case PjrtDType::S64: return 8;
         case PjrtDType::F32:
         case PjrtDType::S32: return 4;
         case PjrtDType::F16:
@@ -312,6 +316,11 @@ struct MockTensor {
                 std::memcpy(&v, bytes.data() + idx * 4, 4);
                 return static_cast<float>(v);
             }
+            case PjrtDType::S64: {
+                int64_t v = 0;
+                std::memcpy(&v, bytes.data() + idx * 8, 8);
+                return static_cast<float>(v);
+            }
             default:
                 return 0.0f;
         }
@@ -352,6 +361,11 @@ struct MockTensor {
                 std::memcpy(bytes.data() + idx * 4, &iv, 4);
                 break;
             }
+            case PjrtDType::S64: {
+                const int64_t iv = static_cast<int64_t>(std::llround(v));
+                std::memcpy(bytes.data() + idx * 8, &iv, 8);
+                break;
+            }
             default:
                 break;
         }
@@ -359,6 +373,11 @@ struct MockTensor {
 
     int64_t read_i64(size_t idx) const {
         switch (dtype) {
+            case PjrtDType::S64: {
+                int64_t v = 0;
+                std::memcpy(&v, bytes.data() + idx * 8, 8);
+                return v;
+            }
             case PjrtDType::S32: {
                 int32_t v = 0;
                 std::memcpy(&v, bytes.data() + idx * 4, 4);
@@ -380,6 +399,9 @@ struct MockTensor {
 
     void write_i64(size_t idx, int64_t v) {
         switch (dtype) {
+            case PjrtDType::S64:
+                std::memcpy(bytes.data() + idx * 8, &v, 8);
+                break;
             case PjrtDType::S32: {
                 const int32_t iv = static_cast<int32_t>(v);
                 std::memcpy(bytes.data() + idx * 4, &iv, 4);
@@ -426,6 +448,7 @@ static PjrtDType parse_mlir_dtype(const std::string& tok) {
     if (tok == "ui8") return PjrtDType::U8;
     if (tok == "i16" || tok == "si16") return PjrtDType::S16;
     if (tok == "i32" || tok == "si32") return PjrtDType::S32;
+    if (tok == "i64" || tok == "si64") return PjrtDType::S64;
     return PjrtDType::INVALID;
 }
 
@@ -519,6 +542,7 @@ struct MockOp {
         SINE,
         LOGISTIC,
         EXPONENTIAL,
+        TANH,
         BROADCAST_IN_DIM,
         RESHAPE,
         TRANSPOSE,
@@ -528,6 +552,7 @@ struct MockOp {
         REDUCE_ADD,
         REDUCE_MAX,
         GATHER,
+        SCATTER_3D_ROWS,
     };
 
     Kind kind;
@@ -610,10 +635,11 @@ static MockProgram parse_stablehlo_mlir(const std::string& mlir) {
             continue;
         }
 
-        // Accumulate multi-line ops (e.g. "stablehlo.reduce" or "stablehlo.gather")
+        // Accumulate multi-line ops (e.g. "stablehlo.reduce", "stablehlo.gather", "stablehlo.scatter")
         std::string stmt = line;
         if (stmt.find("\"stablehlo.reduce\"") != std::string::npos ||
-            stmt.find("\"stablehlo.gather\"") != std::string::npos) {
+            stmt.find("\"stablehlo.gather\"") != std::string::npos ||
+            stmt.find("\"stablehlo.scatter\"") != std::string::npos) {
             while (li + 1 < lines.size() &&
                    (stmt.find("->") == std::string::npos || stmt.rfind('>') < stmt.find("->"))) {
                 stmt += " " + lines[++li];
@@ -640,7 +666,8 @@ static MockProgram parse_stablehlo_mlir(const std::string& mlir) {
             const size_t d1 = rhs.rfind('>');
             const std::string lit = trim_copy(rhs.substr(d0 + 6, d1 - (d0 + 6)));
             const bool is_int = (op.out_type.dtype == PjrtDType::S8 || op.out_type.dtype == PjrtDType::U8 ||
-                                 op.out_type.dtype == PjrtDType::S16 || op.out_type.dtype == PjrtDType::S32);
+                                 op.out_type.dtype == PjrtDType::S16 || op.out_type.dtype == PjrtDType::S32 ||
+                                 op.out_type.dtype == PjrtDType::S64);
             if (!lit.empty() && lit.front() == '[') {
                 op.is_splat = false;
                 std::string inner = lit.substr(1, lit.size() - 2);
@@ -699,6 +726,9 @@ static MockProgram parse_stablehlo_mlir(const std::string& mlir) {
             op.inputs = extract_ssa_refs(rhs.substr(0, colon));
         } else if (rhs.rfind("stablehlo.exponential ", 0) == 0) {
             op.kind = MockOp::Kind::EXPONENTIAL;
+            op.inputs = extract_ssa_refs(rhs.substr(0, colon));
+        } else if (rhs.rfind("stablehlo.tanh ", 0) == 0) {
+            op.kind = MockOp::Kind::TANH;
             op.inputs = extract_ssa_refs(rhs.substr(0, colon));
         } else if (rhs.rfind("stablehlo.broadcast_in_dim ", 0) == 0) {
             op.kind = MockOp::Kind::BROADCAST_IN_DIM;
@@ -779,6 +809,11 @@ static MockProgram parse_stablehlo_mlir(const std::string& mlir) {
             op.gather_start_index_map = parse_named_arr("start_index_map");
             const size_t iv = rhs.find("index_vector_dim =");
             op.gather_index_vector_dim = std::stoll(rhs.substr(iv + 18));
+        } else if (rhs.rfind("\"stablehlo.scatter\"", 0) == 0) {
+            op.kind = MockOp::Kind::SCATTER_3D_ROWS;
+            const size_t lp = rhs.find('(');
+            const size_t rp = rhs.find(')', lp);
+            op.inputs = extract_ssa_refs(rhs.substr(lp + 1, rp - lp - 1));
         } else {
             throw std::runtime_error("MockPJRT: unsupported StableHLO op: " + rhs);
         }
@@ -795,7 +830,8 @@ static MockTensor eval_mock_op(const MockOp& op, const std::unordered_map<std::s
     const size_t n_out = out.num_elements();
 
     const bool is_int = (out.dtype == PjrtDType::S8 || out.dtype == PjrtDType::U8 ||
-                         out.dtype == PjrtDType::S16 || out.dtype == PjrtDType::S32);
+                         out.dtype == PjrtDType::S16 || out.dtype == PjrtDType::S32 ||
+                         out.dtype == PjrtDType::S64);
 
     switch (op.kind) {
         case MockOp::Kind::CONSTANT: {
@@ -826,7 +862,8 @@ static MockTensor eval_mock_op(const MockOp& op, const std::unordered_map<std::s
         case MockOp::Kind::CONVERT: {
             const MockTensor& a = env.at(op.inputs[0]);
             const bool src_int = (a.dtype == PjrtDType::S8 || a.dtype == PjrtDType::U8 ||
-                                  a.dtype == PjrtDType::S16 || a.dtype == PjrtDType::S32);
+                                  a.dtype == PjrtDType::S16 || a.dtype == PjrtDType::S32 ||
+                                  a.dtype == PjrtDType::S64);
             for (size_t i = 0; i < n_out; ++i) {
                 if (is_int && src_int) out.write_i64(i, a.read_i64(i));
                 else if (is_int) out.write_i64(i, static_cast<int64_t>(a.read_f32(i)));
@@ -877,7 +914,8 @@ static MockTensor eval_mock_op(const MockOp& op, const std::unordered_map<std::s
         case MockOp::Kind::COSINE:
         case MockOp::Kind::SINE:
         case MockOp::Kind::LOGISTIC:
-        case MockOp::Kind::EXPONENTIAL: {
+        case MockOp::Kind::EXPONENTIAL:
+        case MockOp::Kind::TANH: {
             const MockTensor& a = env.at(op.inputs[0]);
             for (size_t i = 0; i < n_out; ++i) {
                 const float va = a.read_f32(i);
@@ -887,6 +925,7 @@ static MockTensor eval_mock_op(const MockOp& op, const std::unordered_map<std::s
                 else if (op.kind == MockOp::Kind::SINE) vr = std::sin(va);
                 else if (op.kind == MockOp::Kind::LOGISTIC) vr = 1.0f / (1.0f + std::exp(-va));
                 else if (op.kind == MockOp::Kind::EXPONENTIAL) vr = std::exp(va);
+                else if (op.kind == MockOp::Kind::TANH) vr = std::tanh(va);
                 out.write_f32(i, vr);
             }
             break;
@@ -1134,6 +1173,46 @@ static MockTensor eval_mock_op(const MockOp& op, const std::unordered_map<std::s
                     src_idx += static_cast<size_t>(op_coord[d]) * op_strides[d];
                 }
                 std::memcpy(out.bytes.data() + oi * elem_sz, operand.bytes.data() + src_idx * elem_sz, elem_sz);
+            }
+            break;
+        }
+        case MockOp::Kind::SCATTER_3D_ROWS: {
+            // operand: [B3, B2, R, D], scatter_indices: [B3, B2, N_upd, 3], updates: [B3, B2, N_upd, D]
+            const MockTensor& operand = env.at(op.inputs[0]);
+            const MockTensor& indices = env.at(op.inputs[1]);
+            const MockTensor& updates = env.at(op.inputs[2]);
+            out.bytes = operand.bytes;
+            const size_t elem_sz = pjrt_dtype_size(out.dtype);
+            const auto out_strides = compute_row_major_strides(out.dims);
+            const auto upd_strides = compute_row_major_strides(updates.dims);
+            const auto idx_strides = compute_row_major_strides(indices.dims);
+            const int64_t B3 = updates.dims[0];
+            const int64_t B2 = updates.dims[1];
+            const int64_t N_upd = updates.dims[2];
+            const int64_t D = updates.dims[3];
+            for (int64_t b3 = 0; b3 < B3; ++b3) {
+                for (int64_t b2 = 0; b2 < B2; ++b2) {
+                    for (int64_t ni = 0; ni < N_upd; ++ni) {
+                        const size_t ibase = static_cast<size_t>(b3) * idx_strides[0] +
+                                             static_cast<size_t>(b2) * idx_strides[1] +
+                                             static_cast<size_t>(ni) * idx_strides[2];
+                        const int64_t c0 = indices.read_i64(ibase + 0);
+                        const int64_t c1 = indices.read_i64(ibase + 1);
+                        const int64_t c2 = indices.read_i64(ibase + 2);
+                        if (c0 < 0 || c0 >= out.dims[0] || c1 < 0 || c1 >= out.dims[1] || c2 < 0 || c2 >= out.dims[2]) {
+                            continue;
+                        }
+                        const size_t dst_row = static_cast<size_t>(c0) * out_strides[0] +
+                                               static_cast<size_t>(c1) * out_strides[1] +
+                                               static_cast<size_t>(c2) * out_strides[2];
+                        const size_t src_row = static_cast<size_t>(b3) * upd_strides[0] +
+                                               static_cast<size_t>(b2) * upd_strides[1] +
+                                               static_cast<size_t>(ni) * upd_strides[2];
+                        std::memcpy(out.bytes.data() + dst_row * elem_sz,
+                                    updates.bytes.data() + src_row * elem_sz,
+                                    static_cast<size_t>(D) * elem_sz);
+                    }
+                }
             }
             break;
         }

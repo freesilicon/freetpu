@@ -22,6 +22,7 @@ enum class PjrtDType {
     U8,
     S16,
     S32,
+    S64,
 };
 
 PJRT_Buffer_Type to_pjrt_buffer_type(PjrtDType dt);
