@@ -107,7 +107,7 @@ PUBLISHED_BASELINES: Tuple[ReferenceBaseline, ...] = (
         display_name="Pixel Tensor G5 (buenos_a0)",
         status="published-reference",
         memory_spec="15.6 GiB LPDDR (unified)",
-        memory_gb=15.6,
+        memory_gb=16.75,  # 15.6 GiB in decimal GB (matching --model-gb)
         peak_bf16_tflops=None,
         peak_int8_tops=None,
         measured_bf16_tflops=None,
@@ -1238,7 +1238,20 @@ def _verify_and_stop_session(
     as `unattributed_endpoints` so unrelated concurrent runtimes are never
     recommended for blind termination.
     """
-    before = runner([colab_bin, "--auth", auth, "--config", str(iso_cfg), "sessions"])
+    def _run_teardown_cmd(cmd: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        try:
+            return runner(cmd)
+        except subprocess.TimeoutExpired as exc:
+            out_s = exc.output.decode("utf-8", errors="replace") if isinstance(exc.output, bytes) else (exc.output or "")
+            err_s = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+            return subprocess.CompletedProcess(
+                list(cmd),
+                124,
+                out_s,
+                f"timed out after {exc.timeout}s: {err_s}".strip(),
+            )
+
+    before = _run_teardown_cmd([colab_bin, "--auth", auth, "--config", str(iso_cfg), "sessions"])
     before_ok = before.returncode == 0
     before_entries = _parse_colab_sessions(before.stdout) if before_ok else []
     tracked_endpoints: Set[str] = {ep for name, ep in before_entries if name == session_name}
@@ -1268,8 +1281,8 @@ def _verify_and_stop_session(
         # keep any concurrently started `[?]` assignments unattributed so fallback is not blocked.
         return True, observed_endpoint, [], [], sorted(new_unattributed)
 
-    stop_res = runner([colab_bin, "--auth", auth, "--config", str(iso_cfg), "stop", "-s", session_name])
-    recheck = runner([colab_bin, "--auth", auth, "--config", str(iso_cfg), "sessions"])
+    stop_res = _run_teardown_cmd([colab_bin, "--auth", auth, "--config", str(iso_cfg), "stop", "-s", session_name])
+    recheck = _run_teardown_cmd([colab_bin, "--auth", auth, "--config", str(iso_cfg), "sessions"])
     if recheck.returncode != 0:
         return False, observed_endpoint, sorted(tracked_endpoints), [], sorted(new_unattributed)
 
@@ -1668,11 +1681,13 @@ def build_scorecard_rows(
             cost_basis = f"GCP public on-demand rate (${inferred_cost:.2f}/chip-hr)" if inferred_cost else "local/unspecified"
             mem_limit = dev_info.get("hbm_bytes_limit")
             mem_str = f"{mem_limit / (1024**3):.2f} GiB HBM" if mem_limit else "TPU HBM"
-            live_mem_gb: Optional[float] = (
-                round(mem_limit / (1024**3), 2)
+            # Compare against --model-gb in matching decimal GB (reserve GiB strictly for display).
+            live_mem_gb_exact: Optional[float] = (
+                (float(mem_limit) / 1e9)
                 if mem_limit
                 else (16.0 if colab_tpu == "v5e1" else (32.0 if colab_tpu == "v6e1" else None))
             )
+            live_mem_gb: Optional[float] = round(live_mem_gb_exact, 2) if live_mem_gb_exact is not None else None
 
             bf16_tf = comp.get("peak_bf16_tflops")
             fp32_tf = comp.get("peak_fp32_tflops")
@@ -1688,7 +1703,7 @@ def build_scorecard_rows(
                 model_gb=model_gb,
                 bw_efficiency=bw_efficiency,
                 batch_size=batch_size,
-                memory_gb=live_mem_gb,
+                memory_gb=live_mem_gb_exact,
             )
             tpu_row: Dict[str, Any] = {
                 "target": label,
@@ -2187,6 +2202,32 @@ def run_self_test() -> int:
     assert h100_big["usd_per_1m_tokens_model"] is not None and h100_big["usd_per_1m_tokens_model"] > 0
     big_md = render_markdown(big_report)
     assert "N/A (>mem)" in big_md
+
+    # Live v6e row with 31.25 GiB usable HBM (~33.55 decimal GB) MUST fit --model-gb 32
+    v6e_live_rows = build_scorecard_rows(
+        {
+            "backend": "jax_tpu",
+            "device_info": {"device_kind": "TPU v6 lite", "hbm_bytes_limit": int(31.25 * 1024**3)},
+            "compute": {"peak_bf16_tflops": 900.0},
+            "bandwidth": {"peak_triad_gbps": 1400.0},
+        },
+        model_gb=32.0,
+    )
+    assert v6e_live_rows[0]["memory"] == "31.25 GiB HBM"
+    assert v6e_live_rows[0]["single_device_fits"] is True
+    assert v6e_live_rows[0]["est_decode_tok_s"] is not None and v6e_live_rows[0]["est_decode_tok_s"] > 0
+    assert v6e_live_rows[0]["usd_per_1m_tokens_model"] is not None and v6e_live_rows[0]["usd_per_1m_tokens_model"] > 0
+    v6e_over_rows = build_scorecard_rows(
+        {
+            "backend": "jax_tpu",
+            "device_info": {"device_kind": "TPU v6 lite", "hbm_bytes_limit": int(31.25 * 1024**3)},
+            "compute": {"peak_bf16_tflops": 900.0},
+            "bandwidth": {"peak_triad_gbps": 1400.0},
+        },
+        model_gb=35.0,
+    )
+    assert v6e_over_rows[0]["single_device_fits"] is False
+    assert v6e_over_rows[0]["usd_per_1m_tokens_model"] is None
 
     # 3a. Verify colab_tpu scorecard never attaches local TCP comms to a Cloud TPU row
     colab_comms_only = build_scorecard_rows({
@@ -2991,6 +3032,54 @@ def run_self_test() -> int:
         assert not hang_state.exists()
     finally:
         shutil.rmtree(hang_dir, ignore_errors=True)
+
+    # 4o. Timeout on initial post-run `colab sessions` lookup MUST still attempt `colab stop -s` + recheck
+    to_calls: List[List[str]] = []
+    to_state = {"sessions_calls": 0, "stopped": False}
+
+    def _mock_sessions_timeout_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        to_calls.append(list(cmd))
+        if cmd[-1] == "version":
+            return subprocess.CompletedProcess(cmd, 0, "Version: 0.8.0\n", "")
+        if "usage" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "100.0\n", "")
+        if "run" in cmd:
+            payload = {"schema": SCHEMA_VERSION, "compute": {"peak_bf16_tflops": 179.36}}
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                f"{BENCH_JSON_BEGIN}\n{json.dumps(payload)}\n{BENCH_JSON_END}\n",
+                "[colab] Session READY.\n",
+            )
+        if "stop" in cmd:
+            to_state["stopped"] = True
+            return subprocess.CompletedProcess(cmd, 0, "[colab] Session terminated.\n", "")
+        if "sessions" in cmd:
+            to_state["sessions_calls"] += 1
+            if to_state["sessions_calls"] == 1:
+                # Preflight sessions check succeeds
+                return subprocess.CompletedProcess(cmd, 0, "[colab] No active sessions found on server.\n", "")
+            if to_state["sessions_calls"] == 2:
+                # First post-run sessions lookup times out!
+                raise subprocess.TimeoutExpired(cmd=list(cmd), timeout=90.0)
+            # Post-stop recheck confirms server has zero active sessions
+            return subprocess.CompletedProcess(cmd, 0, "[colab] No active sessions found on server.\n", "")
+        raise AssertionError(f"Unexpected cmd: {cmd}")
+
+    to_res = run_colab_tpu_suites(
+        suites=["compute"],
+        quick=True,
+        colab_bin="colab",
+        auth="adc",
+        tpu_order=("v5e1",),
+        config_path=None,
+        timeout_s=120.0,
+        runner=_mock_sessions_timeout_runner,
+    )
+    assert to_state["stopped"] is True
+    assert any("stop" in c for c in to_calls)
+    assert to_state["sessions_calls"] == 3
+    assert to_res["colab_meta"]["teardown_verified"] is True
 
     # 5. Verify this script compiles and loads under a `colab run` executable prelude
     src_text = Path(__file__).read_text(encoding="utf-8")

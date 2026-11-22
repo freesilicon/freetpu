@@ -44,7 +44,7 @@ python3 bench/freetpu_bench.py \
   --markdown runs/comms-wired.md
 ```
 
-*(If testing over an `adb` USB bridge instead of native USB-Ethernet, run `adb -s <node2_serial> forward tcp:50055 tcp:50055` for a desktop driver—and when Node 1 is a second Pixel, also bind a loopback-only reverse tunnel `adb -s <node1_serial> reverse tcp:127.0.0.1:50055 tcp:50055` and drop non-loopback ingress on TCP `50055`—then point the driver at `--comms-host 127.0.0.1 --comms-port 50055`.)*
+*(If testing over an `adb` USB bridge instead of native USB-Ethernet, run `adb -s <node2_serial> forward tcp:localhost:50055 tcp:50055` for a desktop driver—and when Node 1 is a second Pixel, also bind a loopback-only reverse tunnel `adb -s <node1_serial> reverse tcp:localhost:50055 tcp:50055` and drop non-loopback ingress on TCP `50055`—then point the driver at `--comms-host 127.0.0.1 --comms-port 50055`.)*
 
 ### 3. Split-Layer Dual-Phone `llama.cpp` (`GGML_EDGETPU=ON` + `GGML_RPC=ON`)
 
@@ -108,9 +108,10 @@ adb -s <node1_serial> shell "su -c 'iptables -C INPUT ! -i lo -p tcp --dport 500
   iptables -C OUTPUT -o lo -p tcp --dport 50052 -j FREETPU_RPC_OUT 2>/dev/null || \
   iptables -I OUTPUT -o lo -p tcp --dport 50052 -j FREETPU_RPC_OUT'"
 
-# Tunnel Node 2 loopback -> host -> Node 1 loopback explicitly (bind 127.0.0.1, never bare wildcard tcp:50052)
-adb -s <node2_serial> forward tcp:50052 tcp:50052
-adb -s <node1_serial> reverse tcp:127.0.0.1:50052 tcp:50052
+# Tunnel Node 2 loopback -> host loopback -> Node 1 loopback explicitly
+# (`tcp:localhost:50052` enforces loopback on both ends, even if host `adb` was started with `-a`, and avoids wildcard `adbd` reverse binds)
+adb -s <node2_serial> forward tcp:localhost:50052 tcp:50052
+adb -s <node1_serial> reverse tcp:localhost:50052 tcp:50052
 
 # Verify Node 1 listener is bound strictly to loopback (fail if listening on 0.0.0.0, *, or [::])
 adb -s <node1_serial> shell "su -c 'listen=\$(ss -Htlpn sport = :50052); \
