@@ -57,6 +57,8 @@ Note on IOMMU groups & stable selectors: single-chip selectors use stable PCI BD
 
 ## Kubernetes Manifests
 
+> **Prerequisite (GKE Standard / self-managed clusters only):** The node DaemonSets below require `hostPath` mounts (`/sys/...`, `/dev/vfio`, `/var/run/cdi`) and `hostPID` + `SYS_PTRACE` for host-level PID telemetry. They require **GKE Standard** (or a self-managed Kubernetes cluster) and are **not** compatible with **GKE Autopilot**, whose admission policy blocks `hostPath` volumes and `hostPID`. On GKE Autopilot, use workload-side `tpu_exporter.py --no-pid-scan` telemetry (sharing `127.0.0.1:8431` with `libtpu`) instead of host DaemonSets.
+
 First create the `freetpu-ops-scripts` ConfigMap in `kube-system`:
 
 ```bash

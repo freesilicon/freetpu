@@ -1,4 +1,8 @@
-# FreeTPU Node DaemonSets (VFIO-backed GKE Cloud TPU nodes: v5e, v5p, v6e Trillium):
+# FreeTPU Node DaemonSets (VFIO-backed GKE Standard / self-managed Cloud TPU nodes: v5e, v5p, v6e Trillium):
+# Cluster prerequisite: requires **GKE Standard** (or self-managed Kubernetes);
+# **GKE Autopilot** blocks `hostPath` mounts and `hostPID` at admission. On GKE
+# Autopilot, run `tpu_exporter.py --no-pid-scan` in the workload's network
+# namespace instead of deploying host DaemonSets.
 # Scope:
 #   1. `DaemonSet/freetpu-node-agent` (default on VFIO-backed TPU nodes):
 #      PCI/VFIO inventory & hostPID active-PID Prometheus telemetry ONLY (does NOT

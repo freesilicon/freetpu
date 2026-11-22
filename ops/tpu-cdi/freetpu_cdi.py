@@ -893,6 +893,11 @@ def verify_spec_against_host(
             if not eff_host.exists():
                 errors.append(f"{nc}: effective hostPath {eff_host} does not exist on host")
                 continue
+            if _stat_char_devnum(eff_host) is None:
+                errors.append(
+                    f"{nc}: effective hostPath {eff_host} is not a non-symlink character device"
+                )
+                continue
             resolved_host = str(eff_host.resolve())
             if resolved_host != live_container_resolved or node.get("path") != "/dev/vfio/vfio":
                 errors.append(
@@ -933,7 +938,8 @@ def verify_spec_against_host(
         matched_group_paths: List[str] = []
         expected_live_bdfs: List[str] = []
         has_container_node = any(
-            str(_resolve_effective_host_path(gn).resolve()) == live_container_resolved
+            _stat_char_devnum(_resolve_effective_host_path(gn)) is not None
+            and str(_resolve_effective_host_path(gn).resolve()) == live_container_resolved
             and gn.get("path") == "/dev/vfio/vfio"
             for gn in global_nodes
             if _resolve_effective_host_path(gn).exists()
@@ -948,6 +954,11 @@ def verify_spec_against_host(
             eff_host = _resolve_effective_host_path(node)
             if not eff_host.exists():
                 errors.append(f"{nc}: effective hostPath {eff_host} does not exist on host")
+                continue
+            if _stat_char_devnum(eff_host) is None:
+                errors.append(
+                    f"{nc}: effective hostPath {eff_host} is not a non-symlink character device"
+                )
                 continue
             resolved_host = str(eff_host.resolve())
             if resolved_host == live_container_resolved:

@@ -1321,6 +1321,19 @@ class FreeTpuCdiTests(unittest.TestCase):
                     errs_type,
                 )
 
+                # 5. Symlinked hostPath in a spec pointing to a live char node fails --check-host.
+                sym_node = dev_root / "vfio" / "sym0"
+                os.symlink(str(dev_root / "vfio" / "0"), sym_node)
+                sym_spec = freetpu_cdi.build_cdi_spec(chips_live, vfio_c)
+                sym_spec["devices"][0]["containerEdits"]["deviceNodes"][0]["hostPath"] = str(sym_node)
+                errs_sym = freetpu_cdi.verify_spec_against_host(
+                    sym_spec, sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                self.assertTrue(
+                    any("not a non-symlink character device" in e for e in errs_sym),
+                    errs_sym,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

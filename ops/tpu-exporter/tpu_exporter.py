@@ -201,17 +201,35 @@ def _read_fdinfo_flags(fdinfo_path: Path) -> Tuple[Optional[int], bool]:
 _VFIO_DEVNUM_RE = re.compile(r"^[0-9]+:[0-9]+$")
 
 
-def _read_kernel_vfio_devnum(sysfs_root: Path, group: str) -> Optional[str]:
-    """Read kernel-exported `<major>:<minor>` from sysfs for `/dev/vfio/<group>`."""
-    if not group:
-        return None
-    for path in (
-        sysfs_root / "class" / "vfio" / group / "dev",
-        sysfs_root / "devices" / "virtual" / "vfio" / group / "dev",
-    ):
+def _read_kernel_vfio_devnum(sysfs_root: Path, group: Optional[str] = None) -> Optional[str]:
+    """Read kernel-exported `<major>:<minor>` from sysfs for `/dev/vfio/<group>` or `/dev/vfio/vfio`."""
+    if group is None:
+        candidates = (
+            sysfs_root / "class" / "misc" / "vfio" / "dev",
+            sysfs_root / "devices" / "virtual" / "misc" / "vfio" / "dev",
+        )
+    else:
+        if not group:
+            return None
+        candidates = (
+            sysfs_root / "class" / "vfio" / group / "dev",
+            sysfs_root / "devices" / "virtual" / "vfio" / group / "dev",
+        )
+    for path in candidates:
         raw = _read_text(path)
         if raw and _VFIO_DEVNUM_RE.fullmatch(raw):
             return raw
+    return None
+
+
+def _stat_non_symlink_char_devnum(path: Path) -> Optional[str]:
+    """Return '<major>:<minor>' iff `path` itself (not a symlink) is a character device."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    if stat.S_ISCHR(st.st_mode):
+        return f"{os.major(st.st_rdev)}:{os.minor(st.st_rdev)}"
     return None
 
 
@@ -249,7 +267,7 @@ def _scan_proc_vfio_pids(
     rdev_to_paths: Dict[int, List[str]] = {}
     for vp in unique_paths:
         try:
-            host_st = os.stat(vp)
+            host_st = os.lstat(vp)
         except OSError:
             continue
         if not stat.S_ISCHR(host_st.st_mode):
@@ -773,7 +791,15 @@ def discover_tpu_devices(
         sysfs_root, pci_entries
     )
 
-    vfio_container_present = (dev_root / "vfio" / "vfio").exists()
+    vfio_container_path = dev_root / "vfio" / "vfio"
+    vfio_container_present = vfio_container_path.exists()
+    vfio_container_dn = _stat_non_symlink_char_devnum(vfio_container_path)
+    kernel_container_dn = _read_kernel_vfio_devnum(sysfs_root, group=None)
+    vfio_container_verified = bool(
+        vfio_container_dn is not None
+        and kernel_container_dn is not None
+        and vfio_container_dn == kernel_container_dn
+    )
     discovered: List[TpuTelemetry] = []
     legacy_by_base_addr: Dict[str, TpuTelemetry] = {}
 
@@ -808,20 +834,24 @@ def discover_tpu_devices(
         vfio_path_obj = (dev_root / "vfio" / iommu_group) if iommu_group else None
         vfio_device = f"/dev/vfio/{iommu_group}" if iommu_group else ""
         vfio_present = bool(vfio_path_obj and vfio_path_obj.exists())
-        vfio_is_char = False
-        if vfio_path_obj and vfio_present:
-            try:
-                vfio_is_char = stat.S_ISCHR(vfio_path_obj.stat().st_mode)
-            except OSError:
-                vfio_is_char = False
+        vfio_group_dn = _stat_non_symlink_char_devnum(vfio_path_obj) if vfio_path_obj else None
+        vfio_is_char = vfio_group_dn is not None
+        kernel_group_dn = _read_kernel_vfio_devnum(sysfs_root, iommu_group) if iommu_group else None
+        vfio_group_verified = bool(
+            vfio_group_dn is not None
+            and kernel_group_dn is not None
+            and vfio_group_dn == kernel_group_dn
+        )
 
         # On vfio-pci, PCI `enable` is 0 while idle (no process holds /dev/vfio/*);
-        # readiness depends on driver binding and VFIO device nodes, not active opens.
+        # readiness requires vfio-pci binding plus verified non-symlink character
+        # device nodes matching kernel sysfs major:minor for both /dev/vfio/vfio
+        # and /dev/vfio/<group>.
         healthy = (
             driver == "vfio-pci"
             and bool(iommu_group)
-            and vfio_present
-            and vfio_container_present
+            and vfio_group_verified
+            and vfio_container_verified
         )
 
         # Group dual-core legacy TPU v2/v3 (0x0027) PCI functions sharing the same
@@ -1000,20 +1030,47 @@ def collect_snapshot(
             tpu_info_bin=tpu_info_bin,
             timeout_s=runtime_budget_s,
         )
-        # If `tpu-info` CLI failed (for example due to cross-profile `/proc` EACCES
-        # under containerd AppArmor), fall back to direct `tpu_info.metrics` gRPC
-        # queries ONLY within the remaining shared deadline so a stalled `libtpu`
-        # endpoint cannot double-spend the scrape timeout (e.g. 5s + 5s >= 10s)
-        # before PCI and PID metrics are returned.
+        # If `tpu-info` CLI failed OR exited cleanly with only inventory/`N/A` rows
+        # (no live HBM/duty-cycle readings, e.g. when its default endpoint differs from
+        # `--runtime-metrics-addr`), fall back to direct `tpu_info.metrics` gRPC queries
+        # ONLY within the remaining shared deadline so a stalled `libtpu` endpoint
+        # cannot double-spend the scrape timeout before PCI and PID metrics are returned.
+        has_live_util = any(
+            r.in_util_table
+            and (
+                r.hbm_used_bytes is not None
+                or r.hbm_total_bytes is not None
+                or r.duty_cycle_percent is not None
+            )
+            for r in parsed_rows.values()
+        )
         remaining_s = runtime_deadline - time.monotonic()
-        if not tpu_info_ok and tpu_info_bin and runtime_metrics_addr and remaining_s >= 0.05:
+        if (
+            (not tpu_info_ok or not has_live_util)
+            and tpu_info_bin
+            and runtime_metrics_addr
+            and remaining_s >= 0.05
+        ):
             py_ok, _py_err, py_rows = _query_tpu_info_python_metrics(
                 devices,
                 addr=runtime_metrics_addr,
                 timeout_s=remaining_s,
             )
             if py_ok:
-                tpu_info_ok, tpu_info_err, parsed_rows = True, None, py_rows
+                merged_rows = dict(parsed_rows)
+                for k, py_r in py_rows.items():
+                    existing = merged_rows.get(k)
+                    if existing is not None:
+                        if py_r.hbm_used_bytes is not None:
+                            existing.hbm_used_bytes = py_r.hbm_used_bytes
+                        if py_r.hbm_total_bytes is not None:
+                            existing.hbm_total_bytes = py_r.hbm_total_bytes
+                        if py_r.duty_cycle_percent is not None:
+                            existing.duty_cycle_percent = py_r.duty_cycle_percent
+                        existing.in_util_table = True
+                    else:
+                        merged_rows[k] = py_r
+                tpu_info_ok, tpu_info_err, parsed_rows = True, None, merged_rows
     util_rows = {k: r for k, r in parsed_rows.items() if r.in_util_table}
     mapped_util_keys: Dict[str, str] = {}
     overall_pid_available = True

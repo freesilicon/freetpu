@@ -3,21 +3,48 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 import urllib.request
 
 EXPORTER_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(EXPORTER_DIR))
 
 import tpu_exporter  # noqa: E402
+
+
+@contextlib.contextmanager
+def _mock_vfio_char_lstat():
+    """Patch os.lstat so synthetic non-symlink `<dev_root>/vfio/*` files behave as char devices."""
+    orig_lstat = os.lstat
+
+    def _char_lstat(path_arg, *args, **kwargs):
+        st = orig_lstat(path_arg, *args, **kwargs)
+        p = Path(os.fspath(path_arg))
+        if p.parent.name == "vfio" and not stat.S_ISLNK(st.st_mode):
+            fake = mock.MagicMock()
+            fake.st_mode = stat.S_IFCHR | 0o600
+            if p.name == "vfio":
+                fake.st_rdev = os.makedev(10, 196)
+            elif p.name.isdigit():
+                fake.st_rdev = os.makedev(242, int(p.name))
+            else:
+                fake.st_rdev = os.makedev(242, 250)
+            return fake
+        return st
+
+    with mock.patch("tpu_exporter.os.lstat", side_effect=_char_lstat):
+        yield
 
 
 def _make_mock_pci_tree(
@@ -42,6 +69,9 @@ def _make_mock_pci_tree(
     vfio_dir.mkdir(parents=True, exist_ok=True)
     if create_vfio_container:
         (vfio_dir / "vfio").write_text("", encoding="utf-8")
+        misc_dev = sysfs_root / "class" / "misc" / "vfio" / "dev"
+        misc_dev.parent.mkdir(parents=True, exist_ok=True)
+        misc_dev.write_text("10:196\n", encoding="utf-8")
 
     for node in create_vfio_nodes or []:
         (vfio_dir / node).write_text("", encoding="utf-8")
@@ -320,13 +350,15 @@ TPU Device Status
             from unittest import mock
 
             orig_os_stat = os.stat
+            orig_os_lstat = os.lstat
             vfio0_st = orig_os_stat(dev_root / "vfio" / "0")
             vfio2_st = orig_os_stat(dev_root / "vfio" / "2")
+            vfioc_st = orig_os_stat(dev_root / "vfio" / "vfio")
             vfio0_id = (vfio0_st.st_dev, vfio0_st.st_ino)
             vfio2_id = (vfio2_st.st_dev, vfio2_st.st_ino)
+            vfioc_id = (vfioc_st.st_dev, vfioc_st.st_ino)
 
-            def _char_stat(path_arg, *args, **kwargs):
-                st = orig_os_stat(path_arg, *args, **kwargs)
+            def _maybe_char(st):
                 if (st.st_dev, st.st_ino) == vfio0_id:
                     fake = mock.MagicMock()
                     fake.st_mode = _stat.S_IFCHR | 0o600
@@ -337,10 +369,25 @@ TPU Device Status
                     fake.st_mode = _stat.S_IFCHR | 0o600
                     fake.st_rdev = os.makedev(242, 2)
                     return fake
+                if (st.st_dev, st.st_ino) == vfioc_id:
+                    fake = mock.MagicMock()
+                    fake.st_mode = _stat.S_IFCHR | 0o600
+                    fake.st_rdev = os.makedev(10, 196)
+                    return fake
                 return st
 
+            def _char_stat(path_arg, *args, **kwargs):
+                return _maybe_char(orig_os_stat(path_arg, *args, **kwargs))
+
+            def _char_lstat(path_arg, *args, **kwargs):
+                st = orig_os_lstat(path_arg, *args, **kwargs)
+                return st if _stat.S_ISLNK(st.st_mode) else _maybe_char(st)
+
             # Without verified mapping: runtime IDs 8/12 must NOT be attached or fabricated as 0.
-            with mock.patch("tpu_exporter.os.stat", side_effect=_char_stat):
+            with (
+                mock.patch("tpu_exporter.os.stat", side_effect=_char_stat),
+                mock.patch("tpu_exporter.os.lstat", side_effect=_char_lstat),
+            ):
                 snap = tpu_exporter.collect_snapshot(
                     sysfs_root=sysfs_root,
                     dev_root=dev_root,
@@ -412,12 +459,13 @@ TPU Device Status
                 create_vfio_nodes=["0"],  # group 1 node intentionally absent
             )
 
-            snap = tpu_exporter.collect_snapshot(
-                sysfs_root=sysfs_root,
-                dev_root=dev_root,
-                proc_root=proc_root,
-                tpu_info_bin=str(root / "nonexistent-tpu-info"),
-            )
+            with _mock_vfio_char_lstat():
+                snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin=str(root / "nonexistent-tpu-info"),
+                )
             self.assertFalse(snap.tpu_info_available)
             self.assertEqual(len(snap.devices), 2)
             self.assertTrue(snap.devices[0].healthy)
@@ -542,7 +590,10 @@ TPU Device Status
                     raise PermissionError("simulated EACCES without CAP_SYS_PTRACE")
                 return orig_iterdir(p)
 
-            with mock.patch.object(Path, "iterdir", autospec=True, side_effect=_guarded_iterdir):
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.object(Path, "iterdir", autospec=True, side_effect=_guarded_iterdir),
+            ):
                 snap = tpu_exporter.collect_snapshot(
                     sysfs_root=sysfs_root,
                     dev_root=dev_root,
@@ -938,7 +989,28 @@ TPU Device Status
                     return fake
                 return st
 
-            with mock.patch("tpu_exporter.os.stat", side_effect=_mock_os_stat):
+            orig_os_lstat = os.lstat
+
+            def _mock_os_lstat(path_arg, *args, **kwargs):
+                st = orig_os_lstat(path_arg, *args, **kwargs)
+                if not _stat.S_ISLNK(st.st_mode):
+                    key = (st.st_dev, st.st_ino)
+                    if key in ids_12:
+                        fake = mock.MagicMock()
+                        fake.st_mode = _stat.S_IFCHR | 0o600
+                        fake.st_rdev = os.makedev(242, 12)
+                        return fake
+                    if key == id_other:
+                        fake = mock.MagicMock()
+                        fake.st_mode = _stat.S_IFCHR | 0o600
+                        fake.st_rdev = os.makedev(242, 99)
+                        return fake
+                return st
+
+            with (
+                mock.patch("tpu_exporter.os.stat", side_effect=_mock_os_stat),
+                mock.patch("tpu_exporter.os.lstat", side_effect=_mock_os_lstat),
+            ):
                 snap = tpu_exporter.collect_snapshot(
                     sysfs_root=sysfs_root,
                     dev_root=dev_root,
@@ -963,7 +1035,10 @@ TPU Device Status
                 encoding="utf-8",
             )
             mock_cli.chmod(0o755)
-            with mock.patch("tpu_exporter.os.stat", side_effect=_mock_os_stat):
+            with (
+                mock.patch("tpu_exporter.os.stat", side_effect=_mock_os_stat),
+                mock.patch("tpu_exporter.os.lstat", side_effect=_mock_os_lstat),
+            ):
                 snap_cli = tpu_exporter.collect_snapshot(
                     sysfs_root=sysfs_root,
                     dev_root=dev_root,
@@ -1342,18 +1417,44 @@ TPU Device Status
                 create_vfio_nodes=["0"],
             )
             orig_stat = os.stat
+            orig_lstat = os.lstat
             vfio0 = str(dev_root / "vfio" / "0")
+            vfio_ctrl = str(dev_root / "vfio" / "vfio")
 
-            def _only_group0_is_char(path, *args, **kwargs):
+            def _only_group0_is_char_stat(path, *args, **kwargs):
                 st = orig_stat(path, *args, **kwargs)
                 if os.fspath(path) == vfio0:
                     fake = mock.MagicMock()
                     fake.st_mode = stat.S_IFCHR | 0o600
                     fake.st_rdev = os.makedev(242, 0)
                     return fake
+                if os.fspath(path) == vfio_ctrl:
+                    fake = mock.MagicMock()
+                    fake.st_mode = stat.S_IFCHR | 0o600
+                    fake.st_rdev = os.makedev(10, 196)
+                    return fake
                 return st
 
-            with mock.patch.object(os, "stat", side_effect=_only_group0_is_char):
+            def _only_group0_is_char_lstat(path, *args, **kwargs):
+                st = orig_lstat(path, *args, **kwargs)
+                if stat.S_ISLNK(st.st_mode):
+                    return st
+                if os.fspath(path) == vfio0:
+                    fake = mock.MagicMock()
+                    fake.st_mode = stat.S_IFCHR | 0o600
+                    fake.st_rdev = os.makedev(242, 0)
+                    return fake
+                if os.fspath(path) == vfio_ctrl:
+                    fake = mock.MagicMock()
+                    fake.st_mode = stat.S_IFCHR | 0o600
+                    fake.st_rdev = os.makedev(10, 196)
+                    return fake
+                return st
+
+            with (
+                mock.patch("tpu_exporter.os.stat", side_effect=_only_group0_is_char_stat),
+                mock.patch("tpu_exporter.os.lstat", side_effect=_only_group0_is_char_lstat),
+            ):
                 snap = tpu_exporter.collect_snapshot(
                     sysfs_root=sysfs_root,
                     dev_root=dev_root,
@@ -1362,6 +1463,8 @@ TPU Device Status
                 )
 
             by_bdf = {d.pci_bdf: d for d in snap.devices}
+            self.assertTrue(by_bdf["0000:00:06.0"].healthy)
+            self.assertFalse(by_bdf["0000:00:07.0"].healthy)
             self.assertTrue(by_bdf["0000:00:06.0"].pid_telemetry_available)
             self.assertFalse(by_bdf["0000:00:07.0"].pid_telemetry_available)
             self.assertFalse(snap.pid_telemetry_available)
@@ -1374,9 +1477,12 @@ TPU Device Status
             self.assertNotIn('freetpu_tpu_active_pids{chip="1",pci_bdf="0000:00:07.0"', prom)
 
             # Mismatched kernel sysfs /sys/class/vfio/0/dev (242:99 vs char st_rdev 242:0)
-            # MUST also suppress PID telemetry and active PID counts for group 0.
+            # MUST mark the device unhealthy AND suppress PID telemetry and active PID counts.
             (sysfs_root / "class" / "vfio" / "0" / "dev").write_text("242:99\n", encoding="utf-8")
-            with mock.patch.object(os, "stat", side_effect=_only_group0_is_char):
+            with (
+                mock.patch("tpu_exporter.os.stat", side_effect=_only_group0_is_char_stat),
+                mock.patch("tpu_exporter.os.lstat", side_effect=_only_group0_is_char_lstat),
+            ):
                 snap_mm = tpu_exporter.collect_snapshot(
                     sysfs_root=sysfs_root,
                     dev_root=dev_root,
@@ -1384,6 +1490,7 @@ TPU Device Status
                     tpu_info_bin=None,
                 )
             by_bdf_mm = {d.pci_bdf: d for d in snap_mm.devices}
+            self.assertFalse(by_bdf_mm["0000:00:06.0"].healthy)
             self.assertFalse(by_bdf_mm["0000:00:06.0"].pid_telemetry_available)
             prom_mm = tpu_exporter.format_prometheus_metrics(snap_mm)
             self.assertNotIn('freetpu_tpu_active_pids{chip="0",pci_bdf="0000:00:06.0"', prom_mm)
@@ -1456,6 +1563,58 @@ TPU Device Status
             self.assertLess(py_called[0], 0.5)
             self.assertGreater(py_called[0], 0.05)
             self.assertTrue(snap2.tpu_info_available)
+
+            # When CLI exits 0 with ONLY inventory/N/A rows (no live utilization),
+            # preserve inventory rows and query configured runtime_metrics_addr within remaining budget.
+            py_called.clear()
+
+            def _cli_inventory_only(*args, **kwargs):
+                return (
+                    True,
+                    None,
+                    {
+                        "/dev/vfio/0": tpu_exporter._TpuInfoRow(
+                            chip_key="/dev/vfio/0",
+                            chip_type="TPU v6e chip",
+                            pids=[],
+                            in_chips_table=True,
+                        )
+                    },
+                )
+
+            def _py_live_util(*args, **kwargs):
+                py_called.append(kwargs.get("addr"))
+                return (
+                    True,
+                    None,
+                    {
+                        "0": tpu_exporter._TpuInfoRow(
+                            chip_key="0",
+                            hbm_used_bytes=4 * 1024**3,
+                            hbm_total_bytes=32 * 1024**3,
+                            duty_cycle_percent=55.0,
+                            in_util_table=True,
+                        )
+                    },
+                )
+
+            with (
+                mock.patch.object(tpu_exporter, "_run_tpu_info", side_effect=_cli_inventory_only),
+                mock.patch.object(tpu_exporter, "_query_tpu_info_python_metrics", side_effect=_py_live_util),
+            ):
+                snap3 = tpu_exporter.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin="tpu-info",
+                    tpu_info_timeout_s=0.5,
+                    runtime_metrics_addr="127.0.0.1:9999",
+                )
+            self.assertEqual(py_called, ["127.0.0.1:9999"])
+            self.assertTrue(snap3.tpu_info_available)
+            self.assertEqual(len(snap3.runtime_utilization), 1)
+            self.assertEqual(snap3.runtime_utilization[0].hbm_used_bytes, 4 * 1024**3)
+            self.assertAlmostEqual(snap3.runtime_utilization[0].duty_cycle_percent or 0.0, 55.0)
 
     def _assert_valid_prometheus_text(self, text: str) -> None:
         lines = [ln for ln in text.splitlines() if ln.strip()]
