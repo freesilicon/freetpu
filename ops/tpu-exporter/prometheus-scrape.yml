@@ -1,0 +1,72 @@
+# Trusted Node Prometheus scrape configuration for FreeTPU tpu-exporter.
+# Scrapes ONLY operator-controlled `collector_role="node"` targets (standalone
+# host VMs and the `kube-system` `freetpu-node-agent` DaemonSet).
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "freetpu-tpu-exporter"
+    honor_labels: false
+    follow_redirects: false
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - "127.0.0.1:9400"
+        labels:
+          cluster: "cloud-tpu-v5e-v6e"
+          node: "tpu-vm-0"
+          collector_role: "node"
+    metric_relabel_configs:
+      # Drop per-PID series so tenant process churn never drives billing TSDB
+      # cardinality; chargeback queries use aggregated `freetpu_tpu_active_pids`.
+      - source_labels: [__name__]
+        action: drop
+        regex: "freetpu_tpu_process_active"
+
+  # Trusted operator-managed DaemonSet discovery (PCI/VFIO inventory, VFIO
+  # health, and opt-in hostPID metrics).
+  # Scoped strictly via Kubernetes-enforced ownership metadata (namespace,
+  # DaemonSet controller, container, and port name) rather than pod-controlled
+  # labels or annotations, and hard-sets `collector_role="node"` with
+  # `honor_labels: false` so tenant pods cannot forge inventory or PID metrics.
+  - job_name: "freetpu-node-exporter"
+    honor_labels: false
+    follow_redirects: false
+    metrics_path: /metrics
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names:
+            - kube-system
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_namespace]
+        action: keep
+        regex: "kube-system"
+      - source_labels: [__meta_kubernetes_pod_controller_kind]
+        action: keep
+        regex: "DaemonSet"
+      - source_labels: [__meta_kubernetes_pod_controller_name]
+        action: keep
+        regex: "freetpu-node-agent"
+      - source_labels: [__meta_kubernetes_pod_container_name]
+        action: keep
+        regex: "tpu-exporter"
+      - source_labels: [__meta_kubernetes_pod_container_port_name]
+        action: keep
+        regex: "metrics"
+      - source_labels: [__meta_kubernetes_pod_node_name]
+        target_label: node
+      # Replace with each cluster's unique name so multi-cluster scrapes never
+      # merge identically named nodes or PCI BDFs in fleet PromQL queries.
+      - target_label: cluster
+        replacement: "cloud-tpu-k8s"
+      - target_label: collector_role
+        replacement: "node"
+    metric_relabel_configs:
+      # Drop per-PID series so tenant process churn never drives billing TSDB
+      # cardinality; chargeback queries use aggregated `freetpu_tpu_active_pids`.
+      - source_labels: [__name__]
+        action: drop
+        regex: "freetpu_tpu_process_active"
