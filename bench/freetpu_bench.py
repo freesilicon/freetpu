@@ -407,16 +407,29 @@ def run_bandwidth_local(backend: str, quick: bool = False) -> Dict[str, Any]:
             np.add(a, c, out=c)
             samples_us.append((time.perf_counter_ns() - t0) / 1e3)
 
-        total_bytes = count * 4 * 3  # 2 reads + 1 write
+        tensor_bytes = count * 4
+        effective_triad_bytes = tensor_bytes * 3  # Logical STREAM triad (2 reads + 1 write)
+        actual_traffic_bytes = tensor_bytes * 5   # Two-pass NumPy: mul(b,s->c) [1R+1W] + add(a,c->c) [2R+1W]
         st = _stats_summary(samples_us)
-        med_gbps = (total_bytes / max(st["median_us"] * 1e-6, 1e-9)) / 1e9
-        peak_gbps = (total_bytes / max(st["min_us"] * 1e-6, 1e-9)) / 1e9
+        med_s = max(st["median_us"] * 1e-6, 1e-9)
+        min_s = max(st["min_us"] * 1e-6, 1e-9)
+        med_eff_gbps = (effective_triad_bytes / med_s) / 1e9
+        peak_eff_gbps = (effective_triad_bytes / min_s) / 1e9
+        med_act_gbps = (actual_traffic_bytes / med_s) / 1e9
+        peak_act_gbps = (actual_traffic_bytes / min_s) / 1e9
         triad_cases.append({
-            "name": "triad_fp32",
-            "tensor_bytes": count * 4,
-            "total_traffic_bytes": total_bytes,
-            "median_gbps": round(med_gbps, 3),
-            "peak_gbps": round(peak_gbps, 3),
+            "name": "triad_fp32_2pass",
+            "tensor_bytes": tensor_bytes,
+            "effective_triad_bytes": effective_triad_bytes,
+            "actual_traffic_bytes": actual_traffic_bytes,
+            "traffic_model": "two_pass_numpy_5x_actual_3x_effective",
+            "median_effective_gbps": round(med_eff_gbps, 3),
+            "peak_effective_gbps": round(peak_eff_gbps, 3),
+            "median_actual_gbps": round(med_act_gbps, 3),
+            "peak_actual_gbps": round(peak_act_gbps, 3),
+            "median_gbps": round(med_eff_gbps, 3),
+            "peak_gbps": round(peak_eff_gbps, 3),
+            "bandwidth_basis": "effective 3x STREAM triad (2-pass NumPy executes 5x array traffic)",
             **st,
         })
 
@@ -441,12 +454,16 @@ def run_bandwidth_local(backend: str, quick: bool = False) -> Dict[str, Any]:
             **st,
         })
 
-    peak_bw = max((c["peak_gbps"] for c in triad_cases), default=0.0)
+    peak_eff_bw = max((c["peak_effective_gbps"] for c in triad_cases), default=0.0)
+    peak_act_bw = max((c["peak_actual_gbps"] for c in triad_cases), default=0.0)
     h2d_floor = xfer_cases[0]["median_us"] if xfer_cases else None
     return {
         "status": "measured",
         "backend": backend,
-        "peak_triad_gbps": round(peak_bw, 3),
+        "bandwidth_basis": "effective 3x STREAM triad (local 2-pass NumPy executes 5x array traffic)",
+        "peak_triad_gbps": round(peak_eff_bw, 3),
+        "peak_effective_triad_gbps": round(peak_eff_bw, 3),
+        "peak_actual_traffic_gbps": round(peak_act_bw, 3),
         "host_device_floor_us": h2d_floor,
         "triad_cases": triad_cases,
         "transfer_cases": xfer_cases,
@@ -613,6 +630,7 @@ def run_comms_suite(
     peak_gbps = max((c["peak_gbps"] for c in cases), default=0.0)
     return {
         "status": "measured",
+        "host_platform": f"{platform.system()}-{platform.machine()}",
         "transport": transport,
         "target": f"{host}:{port}",
         "hop_floor_us": small_hop,
@@ -882,6 +900,7 @@ def run_jax_tpu_suites(suites: Sequence[str], quick: bool = False, allow_jax_cpu
         results["bandwidth"] = {
             "status": "measured",
             "backend": "jax_tpu",
+            "bandwidth_basis": "fused 3x STREAM triad (2R+1W on TPU HBM)",
             "peak_triad_gbps": round(max((c["peak_gbps"] for c in triad_cases), default=0.0), 3),
             "host_device_floor_us": xfer_cases[0]["median_us"] if xfer_cases else None,
             "triad_cases": triad_cases,
@@ -1102,10 +1121,14 @@ def run_colab_tpu_suites(
             return subprocess.run(list(cmd), capture_output=True, text=True, env=env, check=False)
         runner = _default_runner
 
-    tmp_ctx = tempfile.TemporaryDirectory(prefix="freetpu-bench-colab-")
-    tmp_dir = Path(tmp_ctx.name)
-    iso_cfg = config_path or (tmp_dir / "colab-sessions.json")
-    iso_cfg.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dir: Optional[Path] = None
+    if config_path is None:
+        tmp_dir = Path(tempfile.mkdtemp(prefix="freetpu-bench-colab-"))
+        iso_cfg = tmp_dir / "colab-sessions.json"
+    else:
+        iso_cfg = config_path
+        iso_cfg.parent.mkdir(parents=True, exist_ok=True)
+    preserve_tmp_dir = False
     session_base = f"freetpu-bench-{uuid.uuid4().hex[:8]}"
     script_path = Path(__file__).resolve()
 
@@ -1122,7 +1145,8 @@ def run_colab_tpu_suites(
     )
 
     if dry_run:
-        tmp_ctx.cleanup()
+        if tmp_dir is not None:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
         return {
             "colab_meta": {
                 "status": "dry_run",
@@ -1144,24 +1168,54 @@ def run_colab_tpu_suites(
                 if pre_res.returncode == 0
                 else None
             )
-            res = runner(cmd)
-            session_was_ready = res.returncode == 0 or "[colab] session ready" in res.stderr.lower()
-            teardown_verified, endpoint, leaked_endpoints = _verify_and_stop_session(
-                runner,
-                colab_bin,
-                auth,
-                iso_cfg,
-                sess,
-                pre_endpoints=pre_endpoints,
-                session_was_ready=session_was_ready,
-            )
-            if not teardown_verified:
-                print(
-                    f"[freetpu-bench] WARNING: Colab teardown unverified for session={sess} "
-                    f"endpoint={endpoint} leaked_endpoints={leaked_endpoints}",
-                    file=sys.stderr,
+            res: Optional[subprocess.CompletedProcess[str]] = None
+            interrupted: Optional[BaseException] = None
+            teardown_verified = False
+            endpoint: Optional[str] = None
+            leaked_endpoints: List[str] = []
+            try:
+                res = runner(cmd)
+            except BaseException as exc:
+                interrupted = exc
+            finally:
+                session_was_ready = (
+                    (res is not None and (res.returncode == 0 or "[colab] session ready" in res.stderr.lower()))
+                    or (interrupted is not None)
                 )
-            attempts.append({
+                try:
+                    teardown_verified, endpoint, leaked_endpoints = _verify_and_stop_session(
+                        runner,
+                        colab_bin,
+                        auth,
+                        iso_cfg,
+                        sess,
+                        pre_endpoints=pre_endpoints,
+                        session_was_ready=session_was_ready,
+                    )
+                except BaseException:
+                    preserve_tmp_dir = True
+                    recovery_cmd = shlex.join([colab_bin, "--auth", auth, "--config", str(iso_cfg), "stop", "-s", sess])
+                    print(
+                        f"[freetpu-bench] WARNING: Colab teardown interrupted for session={sess}; "
+                        f"session config preserved at {iso_cfg} (recover via: {recovery_cmd})",
+                        file=sys.stderr,
+                    )
+                    raise
+                if not teardown_verified:
+                    preserve_tmp_dir = True
+                    recovery_cmd = shlex.join([colab_bin, "--auth", auth, "--config", str(iso_cfg), "stop", "-s", sess])
+                    print(
+                        f"[freetpu-bench] WARNING: Colab teardown unverified for session={sess} "
+                        f"endpoint={endpoint} leaked_endpoints={leaked_endpoints}; "
+                        f"session config preserved at {iso_cfg} (recover via: {recovery_cmd})",
+                        file=sys.stderr,
+                    )
+
+            if interrupted is not None:
+                raise interrupted
+            assert res is not None
+
+            attempt_rec: Dict[str, Any] = {
                 "tpu": tpu,
                 "session": sess,
                 "endpoint": endpoint,
@@ -1169,14 +1223,18 @@ def run_colab_tpu_suites(
                 "teardown_verified": teardown_verified,
                 "leaked_endpoints": leaked_endpoints,
                 "stderr_tail": res.stderr.strip()[-600:],
-            })
+            }
+            if not teardown_verified:
+                attempt_rec["recovery_config"] = str(iso_cfg)
+            attempts.append(attempt_rec)
+
             if res.returncode == 0:
                 payload = extract_bench_json(res.stdout)
                 if payload is None:
                     raise RuntimeError(
                         f"Colab session {sess} exited 0 without {BENCH_JSON_BEGIN} payload."
                     )
-                payload["colab_meta"] = {
+                meta: Dict[str, Any] = {
                     "status": "ok",
                     "tpu": tpu,
                     "session": sess,
@@ -1186,6 +1244,9 @@ def run_colab_tpu_suites(
                     "usage_preflight": usage_res.stdout.strip(),
                     "attempts": attempts,
                 }
+                if not teardown_verified:
+                    meta["recovery_config"] = str(iso_cfg)
+                payload["colab_meta"] = meta
                 return payload
             if idx + 1 < len(planned) and teardown_verified and is_colab_allocation_error(res.returncode, res.stderr):
                 continue
@@ -1195,7 +1256,8 @@ def run_colab_tpu_suites(
             )
         raise RuntimeError(f"All Colab TPU candidates exhausted: {attempts}")
     finally:
-        tmp_ctx.cleanup()
+        if tmp_dir is not None and not preserve_tmp_dir:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1274,9 +1336,12 @@ def build_scorecard_rows(
     backend = report.get("backend", "cpu")
     colab_tpu = (report.get("colab_meta") or {}).get("tpu")
 
-    # 1. Live measured row
-    if comp or bw or comms:
-        if backend in ("jax_tpu", "colab_tpu"):
+    host_platform = report.get("host_platform") or f"{platform.system()}-{platform.machine()}"
+
+    # 1. Live measured row(s)
+    if backend in ("jax_tpu", "colab_tpu"):
+        # Only emit a TPU row when actual TPU compute or bandwidth results exist.
+        if comp or bw:
             kind = dev_info.get("device_kind") or (colab_tpu.upper() if colab_tpu else "Cloud TPU")
             label = f"LIVE RUN: {kind} ({backend})"
             kind_low = str(kind).lower()
@@ -1291,7 +1356,74 @@ def build_scorecard_rows(
             cost_basis = f"GCP public on-demand rate (${inferred_cost:.2f}/chip-hr)" if inferred_cost else "local/unspecified"
             mem_limit = dev_info.get("hbm_bytes_limit")
             mem_str = f"{mem_limit / (1024**3):.2f} GiB HBM" if mem_limit else "TPU HBM"
-        elif backend == "buenos_mock":
+
+            bf16_tf = comp.get("peak_bf16_tflops")
+            fp32_tf = comp.get("peak_fp32_tflops")
+            int8_tops = comp.get("peak_int8_tops")
+            bw_gbps = bw.get("peak_triad_gbps")
+            floor_us = comp.get("dispatch_floor_us")
+
+            econ = _compute_economics(
+                bf16_tflops=bf16_tf,
+                int8_tops=int8_tops,
+                bw_gbps=bw_gbps,
+                hourly_cost_usd=inferred_cost,
+                model_gb=model_gb,
+                bw_efficiency=bw_efficiency,
+                batch_size=batch_size,
+            )
+            tpu_row: Dict[str, Any] = {
+                "target": label,
+                "row_type": "measured",
+                "memory": mem_str,
+                "bf16_tflops": bf16_tf,
+                "fp32_tflops": fp32_tf,
+                "int8_tops": int8_tops,
+                "bw_gbps": bw_gbps,
+                "dispatch_floor_us": f"{floor_us} us" if floor_us is not None else "—",
+                # Local TCP comms never runs on remote TPU ICI; attribute separately below.
+                "hop_latency_us": "—",
+                "hourly_cost_usd": inferred_cost,
+                "pricing_basis": cost_basis,
+                **econ,
+            }
+            if bw.get("bandwidth_basis"):
+                tpu_row["bw_basis"] = bw["bandwidth_basis"]
+            rows.append(tpu_row)
+
+        if comms:
+            comms_host = comms.get("host_platform") or host_platform
+            comms_transport = comms.get("transport") or "tcp"
+            hop_us = comms.get("hop_floor_us")
+            econ = _compute_economics(
+                bf16_tflops=None,
+                int8_tops=None,
+                bw_gbps=None,
+                hourly_cost_usd=None,
+                model_gb=model_gb,
+                bw_efficiency=bw_efficiency,
+                batch_size=batch_size,
+            )
+            rows.append({
+                "target": f"LIVE RUN: Local Host Comms ({comms_host}, {comms_transport})",
+                "row_type": "measured",
+                "memory": "host RAM",
+                "bf16_tflops": None,
+                "fp32_tflops": None,
+                "int8_tops": None,
+                "bw_gbps": None,
+                "dispatch_floor_us": "—",
+                "hop_latency_us": f"{hop_us} us" if hop_us is not None else "—",
+                "comms_host_platform": comms_host,
+                "comms_transport": comms_transport,
+                "comms_target": comms.get("target"),
+                "comms_peak_gbps": comms.get("peak_gbps"),
+                "hourly_cost_usd": None,
+                "pricing_basis": f"local host comms ({comms_transport})",
+                **econ,
+            })
+    elif comp or bw or comms:
+        if backend == "buenos_mock":
             label = f"LIVE RUN: Host CPU via buenos_mock ({platform.machine()})"
             inferred_cost = None
             cost_basis = "host mock (zero TPU silicon)"
@@ -1318,7 +1450,7 @@ def build_scorecard_rows(
             bw_efficiency=bw_efficiency,
             batch_size=batch_size,
         )
-        rows.append({
+        host_row: Dict[str, Any] = {
             "target": label,
             "row_type": "measured",
             "memory": mem_str,
@@ -1331,7 +1463,12 @@ def build_scorecard_rows(
             "hourly_cost_usd": inferred_cost,
             "pricing_basis": cost_basis,
             **econ,
-        })
+        }
+        if bw.get("bandwidth_basis"):
+            host_row["bw_basis"] = bw["bandwidth_basis"]
+        if comms:
+            host_row["comms_transport"] = comms.get("transport")
+        rows.append(host_row)
 
     # 2. Published reference rows
     for base in PUBLISHED_BASELINES:
@@ -1465,8 +1602,18 @@ def render_markdown(report: Dict[str, Any]) -> str:
         ])
         for c in bw.get("triad_cases", []):
             mb = c["tensor_bytes"] / (1024 * 1024)
+            if "effective_triad_bytes" in c and "actual_traffic_bytes" in c:
+                eff_mb = c["effective_triad_bytes"] / (1024 * 1024)
+                act_mb = c["actual_traffic_bytes"] / (1024 * 1024)
+                traffic_s = f"{mb:.1f} MiB tensor ({eff_mb:.1f} MiB 3x eff / {act_mb:.1f} MiB 5x actual 2-pass)"
+                med_s = f"{c['median_effective_gbps']:.3f} eff ({c['median_actual_gbps']:.3f} act)"
+                peak_s = f"{c['peak_effective_gbps']:.3f} eff ({c['peak_actual_gbps']:.3f} act)"
+            else:
+                traffic_s = f"{mb:.1f} MiB tensor ({c['total_traffic_bytes'] / (1024*1024):.1f} MiB 3x fused)"
+                med_s = f"{c['median_gbps']:.3f}"
+                peak_s = f"{c['peak_gbps']:.3f}"
             lines.append(
-                f"| `{c['name']}` | {mb:.1f} MiB tensor ({c['total_traffic_bytes'] / (1024*1024):.1f} MiB 3x) | {c['median_us']:.2f} | {c['median_gbps']:.3f} | {c['peak_gbps']:.3f} |"
+                f"| `{c['name']}` | {traffic_s} | {c['median_us']:.2f} | {med_s} | {peak_s} |"
             )
         for c in bw.get("transfer_cases", []):
             lines.append(
@@ -1529,6 +1676,14 @@ def run_self_test() -> int:
         bw = run_bandwidth_local(backend, quick=True)
         assert bw["status"] == "measured"
         assert bw["peak_triad_gbps"] > 0
+        assert bw["peak_effective_triad_gbps"] == bw["peak_triad_gbps"]
+        assert bw["peak_actual_traffic_gbps"] > bw["peak_effective_triad_gbps"]
+        for tc in bw["triad_cases"]:
+            assert tc["name"] == "triad_fp32_2pass"
+            assert tc["effective_triad_bytes"] == tc["tensor_bytes"] * 3
+            assert tc["actual_traffic_bytes"] == tc["tensor_bytes"] * 5
+            assert "total_traffic_bytes" not in tc
+            assert tc["peak_actual_gbps"] > tc["peak_effective_gbps"]
 
     rtx5090 = next(b for b in PUBLISHED_BASELINES if b.target_id == "nvidia_rtx_5090")
     assert rtx5090.peak_bf16_tflops == 209.5
@@ -1616,7 +1771,37 @@ def run_self_test() -> int:
     md = render_markdown(report)
     assert "`measured`" in md and "`published-reference`" in md
     assert "(fp32)" in md
+    assert "3x eff /" in md and "5x actual 2-pass" in md
     assert "Pixel Tensor G5" in md and "Cloud TPU v6e-1" in md and "NVIDIA H100 SXM" in md
+
+    # 3a. Verify colab_tpu scorecard never attaches local TCP comms to a Cloud TPU row
+    colab_comms_only = build_scorecard_rows({
+        "backend": "colab_tpu",
+        "host_platform": "TestHost-arm64",
+        "comms": comms,
+    })
+    measured_comms_only = [r for r in colab_comms_only if r["row_type"] == "measured"]
+    assert len(measured_comms_only) == 1
+    assert "Local Host Comms" in measured_comms_only[0]["target"]
+    assert "Cloud TPU" not in measured_comms_only[0]["target"]
+    assert measured_comms_only[0]["memory"] == "host RAM"
+    assert measured_comms_only[0]["comms_transport"] == "tcp_loopback"
+    assert measured_comms_only[0]["hop_latency_us"] == f"{comms['hop_floor_us']} us"
+
+    colab_all_rows = build_scorecard_rows({
+        "backend": "colab_tpu",
+        "host_platform": "TestHost-arm64",
+        "colab_meta": {"tpu": "v5e1"},
+        "device_info": {"device_kind": "TPU v5 lite", "hbm_bytes_limit": 16 * 1024**3},
+        "compute": {"peak_bf16_tflops": 179.36, "dispatch_floor_us": 125.0},
+        "comms": comms,
+    })
+    measured_all = [r for r in colab_all_rows if r["row_type"] == "measured"]
+    assert len(measured_all) == 2
+    assert "TPU v5 lite" in measured_all[0]["target"]
+    assert measured_all[0]["hop_latency_us"] == "—"
+    assert "Local Host Comms" in measured_all[1]["target"]
+    assert measured_all[1]["hop_latency_us"] == f"{comms['hop_floor_us']} us"
 
     # 3b. Verify CLI rejects invalid economics / timeout args BEFORE running any suite or Colab
     for bad_argv in (
@@ -1759,6 +1944,9 @@ def run_self_test() -> int:
     assert orphan_res["colab_meta"]["teardown_verified"] is False
     assert orphan_res["colab_meta"]["leaked_endpoints"] == ["m-s-leaked-01"]
     assert "teardown unverified" in warn_buf.getvalue()
+    orphan_rec = Path(orphan_res["colab_meta"]["recovery_config"])
+    assert orphan_rec.parent.is_dir()
+    shutil.rmtree(orphan_rec.parent, ignore_errors=True)
 
     # 4c. Mapped session before stop -> unassign fails -> reappears under `[?]` -> MUST fail verification
     mapped_calls: List[List[str]] = []
@@ -1815,6 +2003,105 @@ def run_self_test() -> int:
     assert mapped_res["colab_meta"]["endpoint"] == "m-s-mapped-leak"
     assert mapped_res["colab_meta"]["teardown_verified"] is False
     assert mapped_res["colab_meta"]["leaked_endpoints"] == ["m-s-mapped-leak"]
+    mapped_rec = Path(mapped_res["colab_meta"]["recovery_config"])
+    assert mapped_rec.parent.is_dir()
+    shutil.rmtree(mapped_rec.parent, ignore_errors=True)
+
+    # 4d. Ctrl-C (KeyboardInterrupt) during `colab run --keep` MUST stop the retained runtime
+    ki_calls: List[List[str]] = []
+    ki_state = {"live": False, "cfg_path": None}
+
+    def _mock_ki_clean_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        ki_calls.append(list(cmd))
+        if "--config" in cmd:
+            ki_state["cfg_path"] = cmd[cmd.index("--config") + 1]
+        if "usage" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "100.0\n", "")
+        if "run" in cmd:
+            ki_state["live"] = True
+            Path(str(ki_state["cfg_path"])).write_text("{}", encoding="utf-8")
+            raise KeyboardInterrupt()
+        if "stop" in cmd:
+            ki_state["live"] = False
+            return subprocess.CompletedProcess(cmd, 0, "[colab] Session terminated.\n", "")
+        if "sessions" in cmd:
+            if ki_state["live"]:
+                run_calls = [c for c in ki_calls if "run" in c]
+                sname = run_calls[-1][run_calls[-1].index("-s") + 1]
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    f"[{sname}] m-s-ki-clean | Hardware: V5E1 | Shape: Standard | Variant: TPU\n",
+                    "",
+                )
+            return subprocess.CompletedProcess(cmd, 0, "[colab] No active sessions found on server.\n", "")
+        raise AssertionError(f"Unexpected cmd: {cmd}")
+
+    try:
+        run_colab_tpu_suites(
+            suites=["compute"],
+            quick=True,
+            colab_bin="colab",
+            auth="adc",
+            tpu_order=("v5e1",),
+            config_path=None,
+            timeout_s=120.0,
+            runner=_mock_ki_clean_runner,
+        )
+    except KeyboardInterrupt:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError("Expected KeyboardInterrupt to propagate")
+    assert any("stop" in c for c in ki_calls)
+    assert ki_state["live"] is False
+    assert not Path(str(ki_state["cfg_path"])).parent.exists()
+
+    # 4e. Ctrl-C where teardown fails MUST preserve the temp session config for manual recovery
+    ki_fail_state: Dict[str, Any] = {"stage": "pre", "cfg_path": None}
+
+    def _mock_ki_unverified_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if "--config" in cmd:
+            ki_fail_state["cfg_path"] = cmd[cmd.index("--config") + 1]
+        if "usage" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "100.0\n", "")
+        if "run" in cmd:
+            ki_fail_state["stage"] = "live"
+            Path(str(ki_fail_state["cfg_path"])).write_text('{"sess": {"endpoint": "m-s-ki-leak"}}', encoding="utf-8")
+            raise KeyboardInterrupt()
+        if "stop" in cmd:
+            return subprocess.CompletedProcess(cmd, 1, "", "HTTP 503 unavailable")
+        if "sessions" in cmd:
+            if ki_fail_state["stage"] == "pre":
+                return subprocess.CompletedProcess(cmd, 0, "[colab] No active sessions found on server.\n", "")
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                "[?] m-s-ki-leak | Hardware: V5E1 | Shape: Standard | Variant: TPU\n",
+                "",
+            )
+        raise AssertionError(f"Unexpected cmd: {cmd}")
+
+    ki_warn = StringIO()
+    try:
+        with redirect_stderr(ki_warn):
+            run_colab_tpu_suites(
+                suites=["compute"],
+                quick=True,
+                colab_bin="colab",
+                auth="adc",
+                tpu_order=("v5e1",),
+                config_path=None,
+                timeout_s=120.0,
+                runner=_mock_ki_unverified_runner,
+            )
+    except KeyboardInterrupt:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError("Expected KeyboardInterrupt to propagate")
+    preserved_cfg = Path(str(ki_fail_state["cfg_path"]))
+    assert preserved_cfg.is_file()
+    assert str(preserved_cfg) in ki_warn.getvalue()
+    shutil.rmtree(preserved_cfg.parent, ignore_errors=True)
 
     print(
         json.dumps(
@@ -1853,7 +2140,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--comms-host", default="127.0.0.1", help="Target host for comms suite")
     p.add_argument("--comms-port", type=int, default=0, help="Target port for comms suite (0 = local loopback)")
     p.add_argument("--comms-server", action="store_true", help="Start TCP activation-hop server and block")
-    p.add_argument("--colab-bin", default=None, help="Path to google-colab-cli (`colab`) binary")
+    p.add_argument("--colab-bin", default=None, help="Path to google-colab-cli (>=0.7.6) `colab` binary")
     p.add_argument("--colab-auth", default="adc", choices=("adc", "oauth2"), help="Colab CLI auth strategy")
     p.add_argument("--colab-tpu", default="auto", choices=("auto", "v6e1", "v5e1"), help="Colab TPU target")
     p.add_argument("--colab-config", default=None, help="Isolated `--config` path for Colab session state")
@@ -1967,4 +2254,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)

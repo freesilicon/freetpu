@@ -7,7 +7,8 @@ Run `nvbench`-style compute and `nvbandwidth`-style HBM2e streaming benchmarks h
 ## Prerequisites
 
 - `python3` + `numpy` locally.
-- [`google-colab-cli`](https://github.com/googlecolab/google-colab-cli) (`colab`) installed and authenticated (`--auth=adc` or `--auth=oauth2`) with Colab Pro+ / Compute Units.
+- [`google-colab-cli`](https://github.com/googlecolab/google-colab-cli) **`>= 0.7.6`** (`colab`) installed and authenticated (`--auth=adc` or `--auth=oauth2`) with Colab Pro+ / Compute Units.
+  - **Security minimum**: Releases `< 0.7.6` (including `0.7.5`) log authorization headers and runtime-proxy tokens into `~/.config/colab-cli/colab.log` under the default umask (`--colab-config` only relocates the session file). Install or upgrade with `uv tool install 'google-colab-cli>=0.7.6'` or `pip install -U 'google-colab-cli>=0.7.6'` so logs are redacted and owner-only (`0600`).
 
 ---
 
@@ -81,6 +82,7 @@ Passing `--keep` preserves the local session-to-endpoint mapping until `colab st
 
 ## Operational Guardrails
 
+- **Require `google-colab-cli >= 0.7.6`**: Older releases (`<= 0.7.5`) write authorization headers and runtime-proxy tokens to `~/.config/colab-cli/colab.log` under a default umask; `0.7.6+` redacts credentials and locks log permissions to the owner.
 - **Always isolate `--colab-config` in a private `0700` dir**: Passing `--colab-config ~/.cache/freetpu-colab/...` keeps parallel benchmark runs separate from `~/.config/colab-cli/sessions.json` and avoids shared `/tmp` directories.
-- **Automatic `v6e1 -> v5e1` Fallback & Endpoint-Verified Teardown**: If Colab refuses allocation before `[colab] Session READY`, `freetpu_bench.py` falls back to `v5e1` automatically (never retrying after `[colab] Session READY` to avoid duplicate CU spend). It invokes `colab run --keep`, records the runtime endpoint from `colab sessions`, runs `colab stop -s <session>`, and verifies that the backend endpoint disappeared (failing verification if the endpoint persists even as an orphaned `[?]` entry).
+- **Automatic `v6e1 -> v5e1` Fallback & Endpoint-Verified Teardown**: If Colab refuses allocation before `[colab] Session READY`, `freetpu_bench.py` falls back to `v5e1` automatically (never retrying after `[colab] Session READY` to avoid duplicate CU spend). It invokes `colab run --keep`, records the runtime endpoint from `colab sessions`, runs `colab stop -s <session>` (including in a `finally` block on `KeyboardInterrupt`), and verifies that the backend endpoint disappeared (preserving the recovery session file and failing verification if the endpoint persists even as an orphaned `[?]` entry).
 - **Scope Boundary**: Colab is strictly for single-chip R&D and reproducible benchmarking—never deploy public inference APIs or multi-tenant proxies on Colab runtimes.

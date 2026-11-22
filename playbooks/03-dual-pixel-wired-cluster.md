@@ -77,6 +77,6 @@ adb -s <node1_serial> shell "su -c 'OPENBUENOS_PERF_MODE=5 \
 
 ## Clean-Room & Topology Checks
 
-- **Verify zero vendor `.so`s on RPC server**: read `/proc/$pid/maps` inside the device shell without host subshell expansion and verify the read succeeded before asserting zero vendor matches:
-  `adb -s <node2_serial> shell 'su -c "pid=\$(pidof -s ggml-rpc-server) && [ -n \"\$pid\" ] && cat /proc/\$pid/maps"' | tee /tmp/rpc-maps.txt >/dev/null && test -s /tmp/rpc-maps.txt && ! grep -E "edgetpu|darwinn|google" /tmp/rpc-maps.txt`
+- **Verify zero vendor `.so`s on RPC server**: read `/proc/$pid/maps` inside the device shell without host subshell expansion or predictable `/tmp` files, and verify the read succeeded before asserting zero vendor matches:
+  `maps=$(adb -s <node2_serial> shell 'su -c "pid=\$(pidof -s ggml-rpc-server) && [ -n \"\$pid\" ] && cat /proc/\$pid/maps"') && [ -n "$maps" ] && ! printf '%s\n' "$maps" | grep -iE "edgetpu|darwinn|tachyon|libgxp|tflite|tensorflow|/vendor/|google"`
 - **Avoid USB 2.0 hubs**: Check link speed (`ioreg` on macOS or `lsusb -t` on Linux) — USB 2.0 (`480 Mbps`) turns weight streaming and PP activation hops into the primary bottleneck.
