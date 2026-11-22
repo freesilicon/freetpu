@@ -35,6 +35,7 @@ import platform
 import re
 import shlex
 import shutil
+import signal
 import socket
 import statistics
 import struct
@@ -481,11 +482,16 @@ COMMS_READ_TIMEOUT_S = 15.0
 MAX_COMMS_CONCURRENT_CONNS = 8
 
 
-def _recv_exact(sock: socket.socket, nbytes: int) -> bytes:
+def _recv_exact(sock: socket.socket, nbytes: int, deadline: Optional[float] = None) -> bytes:
     buf = bytearray(nbytes)
     view = memoryview(buf)
     got = 0
     while got < nbytes:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                raise socket.timeout("Frame receive deadline exceeded")
+            sock.settimeout(remaining)
         n = sock.recv_into(view[got:])
         if n == 0:
             raise EOFError("Socket closed while reading activation payload")
@@ -504,16 +510,21 @@ def _handle_comms_conn(
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except OSError:
             pass
-        conn.settimeout(read_timeout_s)
         while True:
+            conn.settimeout(read_timeout_s)
             first = conn.recv(1)
             if not first:
                 break
-            hdr = first + _recv_exact(conn, 7)
+            frame_deadline = time.monotonic() + read_timeout_s
+            hdr = first + _recv_exact(conn, 7, deadline=frame_deadline)
             (size,) = struct.unpack("!Q", hdr)
             if size == 0 or size > max_payload_bytes:
                 break
-            payload = _recv_exact(conn, size)
+            payload = _recv_exact(conn, size, deadline=frame_deadline)
+            remaining = frame_deadline - time.monotonic()
+            if remaining <= 0.0:
+                raise socket.timeout("Frame send deadline exceeded")
+            conn.settimeout(remaining)
             conn.sendall(hdr + payload)
     except (OSError, EOFError, socket.timeout):
         pass
@@ -1098,6 +1109,10 @@ def _format_colab_recovery_hint(
     return " ".join(parts)
 
 
+class _ColabSigtermInterrupt(BaseException):
+    """Raised when SIGTERM arrives during a retained Colab TPU run."""
+
+
 def _verify_and_stop_session(
     runner: Callable[[Sequence[str]], subprocess.CompletedProcess[str]],
     colab_bin: str,
@@ -1106,14 +1121,18 @@ def _verify_and_stop_session(
     session_name: str,
     pre_endpoints: Optional[Set[str]] = None,
     session_was_ready: bool = False,
-) -> Tuple[bool, Optional[str], List[str], List[str]]:
+) -> Tuple[bool, Optional[str], List[str], List[str], List[str]]:
     """Stop a Colab runtime and verify its backend endpoint disappeared.
 
-    Returns `(teardown_verified, observed_endpoint, leaked_endpoints, orphaned_endpoints)`.
+    Returns `(teardown_verified, observed_endpoint, leaked_endpoints,
+    orphaned_endpoints, unattributed_endpoints)`.
     Because `colab run` is invoked with `--keep`, the local session-to-endpoint
     mapping stays intact in `iso_cfg` until we query `colab sessions`, capture
     the backend runtime endpoint, invoke `colab stop -s`, and verify that the
     endpoint no longer appears under either `[session_name]` or `[?]`.
+    When this run's named endpoint is known, teardown verification is scoped to
+    that endpoint so unrelated concurrent `[?]` sessions are reported as
+    `unattributed_endpoints` rather than false-positive leaks.
     """
     before = runner([colab_bin, "--auth", auth, "--config", str(iso_cfg), "sessions"])
     before_ok = before.returncode == 0
@@ -1141,13 +1160,15 @@ def _verify_and_stop_session(
     if not needs_stop:
         if new_orphans:
             orphans_sorted = sorted(new_orphans)
-            return False, observed_endpoint, orphans_sorted, orphans_sorted
-        return True, observed_endpoint, [], []
+            return False, observed_endpoint, orphans_sorted, orphans_sorted, []
+        return True, observed_endpoint, [], [], []
 
     stop_res = runner([colab_bin, "--auth", auth, "--config", str(iso_cfg), "stop", "-s", session_name])
     recheck = runner([colab_bin, "--auth", auth, "--config", str(iso_cfg), "sessions"])
     if recheck.returncode != 0:
-        return False, observed_endpoint, sorted(tracked_endpoints | new_orphans), sorted(new_orphans)
+        leaked_fallback = sorted(tracked_endpoints) if tracked_endpoints else sorted(new_orphans)
+        orphans_fallback = [] if tracked_endpoints else sorted(new_orphans)
+        return False, observed_endpoint, leaked_fallback, orphans_fallback, []
 
     recheck_entries = _parse_colab_sessions(recheck.stdout)
     recheck_endpoints: Set[str] = {ep for _, ep in recheck_entries}
@@ -1155,29 +1176,45 @@ def _verify_and_stop_session(
 
     leaked: Set[str] = set()
     orphaned: Set[str] = set()
-    for ep in tracked_endpoints | new_orphans:
-        if ep in recheck_endpoints or _token_present(recheck.stdout, ep):
-            leaked.add(ep)
-            if ep in recheck_orphans:
+    unattributed: Set[str] = set()
+
+    if tracked_endpoints:
+        # This run's endpoint is known: verify that endpoint specifically.
+        for ep in tracked_endpoints:
+            if ep in recheck_endpoints or _token_present(recheck.stdout, ep):
+                leaked.add(ep)
+                if ep in recheck_orphans:
+                    orphaned.add(ep)
+        for name, ep in recheck_entries:
+            if name == session_name:
+                leaked.add(ep)
+            elif name == "?" and pre_endpoints is not None and ep not in pre_endpoints and ep not in tracked_endpoints:
+                unattributed.add(ep)
+    else:
+        # Named endpoint was never observed: fail closed on newly appearing `[?]` runtimes.
+        for ep in new_orphans:
+            if ep in recheck_endpoints or _token_present(recheck.stdout, ep):
+                leaked.add(ep)
+                if ep in recheck_orphans:
+                    orphaned.add(ep)
+        for name, ep in recheck_entries:
+            if name == session_name:
+                leaked.add(ep)
+            elif name == "?" and pre_endpoints is not None and ep not in pre_endpoints:
+                leaked.add(ep)
                 orphaned.add(ep)
-    for name, ep in recheck_entries:
-        if name == session_name:
-            leaked.add(ep)
-        elif name == "?" and pre_endpoints is not None and ep not in pre_endpoints:
-            leaked.add(ep)
-            orphaned.add(ep)
-        elif name == "?" and pre_endpoints is None and session_was_ready and not tracked_endpoints:
-            leaked.add(ep)
-            orphaned.add(ep)
+            elif name == "?" and pre_endpoints is None and session_was_ready:
+                leaked.add(ep)
+                orphaned.add(ep)
 
     name_still_listed = _session_still_listed(recheck.stdout, session_name)
     if leaked or name_still_listed:
-        return False, observed_endpoint, sorted(leaked), sorted(orphaned)
+        return False, observed_endpoint, sorted(leaked), sorted(orphaned), sorted(unattributed)
 
     if stop_res.returncode != 0 and not tracked_endpoints and pre_endpoints is None and recheck_entries:
-        return False, observed_endpoint, [], []
+        return False, observed_endpoint, [], [], sorted(unattributed)
 
-    return True, observed_endpoint, [], []
+    return True, observed_endpoint, [], [], sorted(unattributed)
 
 
 def run_colab_tpu_suites(
@@ -1267,50 +1304,86 @@ def run_colab_tpu_suites(
             endpoint: Optional[str] = None
             leaked_endpoints: List[str] = []
             orphaned_endpoints: List[str] = []
+            unattributed_endpoints: List[str] = []
             recovery_hint: Optional[str] = None
+
+            install_sigterm = (
+                hasattr(signal, "SIGTERM") and threading.current_thread() is threading.main_thread()
+            )
+            prev_sigterm: Any = None
+            sigterm_state = {"in_teardown": False, "deferred": False}
+
+            def _sigterm_handler(_signum: int, _frame: Any) -> None:
+                if sigterm_state["in_teardown"]:
+                    sigterm_state["deferred"] = True
+                    return
+                raise _ColabSigtermInterrupt("Received SIGTERM during Colab TPU run")
+
+            if install_sigterm:
+                prev_sigterm = signal.getsignal(signal.SIGTERM)
+                signal.signal(signal.SIGTERM, _sigterm_handler)
             try:
-                res = runner(cmd)
-            except BaseException as exc:
-                interrupted = exc
-            finally:
-                session_was_ready = (
-                    (res is not None and (res.returncode == 0 or "[colab] session ready" in res.stderr.lower()))
-                    or (interrupted is not None)
-                )
                 try:
-                    teardown_verified, endpoint, leaked_endpoints, orphaned_endpoints = _verify_and_stop_session(
-                        runner,
-                        colab_bin,
-                        auth,
-                        iso_cfg,
-                        sess,
-                        pre_endpoints=pre_endpoints,
-                        session_was_ready=session_was_ready,
+                    res = runner(cmd)
+                except BaseException as exc:
+                    interrupted = exc
+                finally:
+                    sigterm_state["in_teardown"] = True
+                    session_was_ready = (
+                        (res is not None and (res.returncode == 0 or "[colab] session ready" in res.stderr.lower()))
+                        or (interrupted is not None)
                     )
-                except BaseException:
-                    preserve_tmp_dir = True
-                    recovery_hint = _format_colab_recovery_hint(
-                        colab_bin, auth, iso_cfg, sess, leaked_endpoints, orphaned_endpoints
-                    )
-                    print(
-                        f"[freetpu-bench] WARNING: Colab teardown interrupted for session={sess}. {recovery_hint}",
-                        file=sys.stderr,
-                    )
-                    raise
-                if not teardown_verified:
-                    preserve_tmp_dir = True
-                    recovery_hint = _format_colab_recovery_hint(
-                        colab_bin, auth, iso_cfg, sess, leaked_endpoints, orphaned_endpoints
-                    )
-                    print(
-                        f"[freetpu-bench] WARNING: Colab teardown unverified for session={sess} "
-                        f"endpoint={endpoint} leaked_endpoints={leaked_endpoints} "
-                        f"orphaned_endpoints={orphaned_endpoints}. {recovery_hint}",
-                        file=sys.stderr,
-                    )
+                    try:
+                        (
+                            teardown_verified,
+                            endpoint,
+                            leaked_endpoints,
+                            orphaned_endpoints,
+                            unattributed_endpoints,
+                        ) = _verify_and_stop_session(
+                            runner,
+                            colab_bin,
+                            auth,
+                            iso_cfg,
+                            sess,
+                            pre_endpoints=pre_endpoints,
+                            session_was_ready=session_was_ready,
+                        )
+                    except BaseException:
+                        preserve_tmp_dir = True
+                        recovery_hint = _format_colab_recovery_hint(
+                            colab_bin, auth, iso_cfg, sess, leaked_endpoints, orphaned_endpoints
+                        )
+                        print(
+                            f"[freetpu-bench] WARNING: Colab teardown interrupted for session={sess}. {recovery_hint}",
+                            file=sys.stderr,
+                        )
+                        raise
+                    if not teardown_verified:
+                        preserve_tmp_dir = True
+                        recovery_hint = _format_colab_recovery_hint(
+                            colab_bin, auth, iso_cfg, sess, leaked_endpoints, orphaned_endpoints
+                        )
+                        print(
+                            f"[freetpu-bench] WARNING: Colab teardown unverified for session={sess} "
+                            f"endpoint={endpoint} leaked_endpoints={leaked_endpoints} "
+                            f"orphaned_endpoints={orphaned_endpoints}. {recovery_hint}",
+                            file=sys.stderr,
+                        )
+                    elif unattributed_endpoints:
+                        print(
+                            f"[freetpu-bench] INFO: Verified teardown of session={sess} endpoint={endpoint}; "
+                            f"observed unattributed concurrent session(s)={unattributed_endpoints} (not terminated).",
+                            file=sys.stderr,
+                        )
+            finally:
+                if install_sigterm:
+                    signal.signal(signal.SIGTERM, prev_sigterm)
 
             if interrupted is not None:
                 raise interrupted
+            if sigterm_state["deferred"]:
+                raise _ColabSigtermInterrupt("Received SIGTERM during Colab teardown")
             assert res is not None
 
             attempt_rec: Dict[str, Any] = {
@@ -1321,6 +1394,7 @@ def run_colab_tpu_suites(
                 "teardown_verified": teardown_verified,
                 "leaked_endpoints": leaked_endpoints,
                 "orphaned_endpoints": orphaned_endpoints,
+                "unattributed_endpoints": unattributed_endpoints,
                 "stderr_tail": res.stderr.strip()[-600:],
             }
             if not teardown_verified:
@@ -1343,6 +1417,7 @@ def run_colab_tpu_suites(
                     "teardown_verified": teardown_verified,
                     "leaked_endpoints": leaked_endpoints,
                     "orphaned_endpoints": orphaned_endpoints,
+                    "unattributed_endpoints": unattributed_endpoints,
                     "usage_preflight": usage_res.stdout.strip(),
                     "attempts": attempts,
                 }
@@ -1615,6 +1690,21 @@ def build_scorecard_rows(
     return rows
 
 
+def _short_bw_basis_tag(row: Dict[str, Any]) -> str:
+    basis = str(row.get("bw_basis") or "").lower()
+    if row.get("row_type") == "measured":
+        if "2-pass" in basis:
+            return "3x eff 2-pass"
+        return "measured triad"
+    if "weight dma" in basis:
+        return "measured DMA"
+    if "triad" in basis and "measured" in basis:
+        return "measured triad"
+    if "measured" in basis:
+        return "measured"
+    return "peak-spec"
+
+
 def render_markdown(report: Dict[str, Any]) -> str:
     econ_cfg = report.get("economics_assumptions") or {}
     model_gb = econ_cfg.get("model_gb", 8.0)
@@ -1661,14 +1751,23 @@ def render_markdown(report: Dict[str, Any]) -> str:
     ])
 
     for r in rows:
+        is_live = r.get("row_type") == "measured"
         if r.get("bf16_tflops") is not None:
-            bf16_s = f"{r['bf16_tflops']:.2f}"
+            bf16_tag = "measured" if (is_live or r.get("bf16_is_measured")) else "peak-spec"
+            bf16_s = f"{r['bf16_tflops']:.2f} ({bf16_tag})"
         elif r.get("fp32_tflops") is not None:
             bf16_s = f"{r['fp32_tflops']:.2f} (fp32)"
         else:
             bf16_s = "—"
-        int8_s = f"{r['int8_tops']:.2f}" if r.get("int8_tops") is not None else "—"
-        bw_s = f"{r['bw_gbps']:.2f}" if r.get("bw_gbps") is not None else "—"
+        if r.get("int8_tops") is not None:
+            int8_tag = "measured" if (is_live or r.get("int8_is_measured")) else "peak-spec"
+            int8_s = f"{r['int8_tops']:.2f} ({int8_tag})"
+        else:
+            int8_s = "—"
+        if r.get("bw_gbps") is not None:
+            bw_s = f"{r['bw_gbps']:.2f} ({_short_bw_basis_tag(r)})"
+        else:
+            bw_s = "—"
         cost_s = f"${r['hourly_cost_usd']:.2f}" if r.get("hourly_cost_usd") is not None else "—"
         tf_d_s = f"{r['tflops_per_dollar_hr']:.1f}" if r.get("tflops_per_dollar_hr") is not None else (
             f"{r['int8_tops_per_dollar_hr']:.1f} (I8)" if r.get("int8_tops_per_dollar_hr") is not None else "—"
@@ -1748,7 +1847,7 @@ def render_markdown(report: Dict[str, Any]) -> str:
         "",
     ])
     for b in PUBLISHED_BASELINES:
-        lines.append(f"- **{b.display_name}**: {b.pricing_basis} — *{b.source_citation}*.")
+        lines.append(f"- **{b.display_name}**: {b.pricing_basis}; BW basis: {b.bandwidth_basis} — *{b.source_citation}*.")
     lines.append("")
     return "\n".join(lines)
 
@@ -1824,6 +1923,29 @@ def run_self_test() -> int:
     assert not t_to.is_alive()
     c_to.close()
 
+    # Slow-drip partial TCP frame MUST hit overall frame deadline (cannot hold worker slot forever)
+    c_drip, s_drip = socket.socketpair()
+    t_drip = threading.Thread(
+        target=_handle_comms_conn,
+        args=(s_drip, None, 1024, 0.12),
+        daemon=True,
+    )
+    t_drip.start()
+    c_drip.sendall(struct.pack("!Q", 64))
+    t_drip_start = time.monotonic()
+    for _ in range(15):
+        if not t_drip.is_alive():
+            break
+        try:
+            c_drip.sendall(b"x")
+        except OSError:
+            break
+        time.sleep(0.03)
+    t_drip.join(timeout=1.5)
+    assert not t_drip.is_alive()
+    assert time.monotonic() - t_drip_start < 1.0
+    c_drip.close()
+
     # _safe_hbm_bytes_limit + TPU kind pricing discrimination (v5p vs v5e vs v6e)
     class _NoneMemDev:
         def memory_stats(self) -> None:
@@ -1882,6 +2004,9 @@ def run_self_test() -> int:
     md = render_markdown(report)
     assert "`measured`" in md and "`published-reference`" in md
     assert "(fp32)" in md
+    assert "179.36 (measured)" in md and "655.55 (measured triad)" in md
+    assert "989.00 (peak-spec)" in md and "3350.00 (peak-spec)" in md
+    assert "27.96 (measured DMA)" in md and "3x eff 2-pass" in md
     assert "3x eff /" in md and "5x actual 2-pass" in md
     assert "Pixel Tensor G5" in md and "Cloud TPU v6e-1" in md and "NVIDIA H100 SXM" in md
 
@@ -2365,6 +2490,127 @@ def run_self_test() -> int:
     sess_cfg = pre_fail_calls[-1][pre_fail_calls[-1].index("--config") + 1]
     assert Path(sess_cfg).is_absolute()
 
+    # 4i. Unrelated concurrent `[?]` session MUST NOT fail teardown when this run's named endpoint disappeared
+    conc_calls: List[List[str]] = []
+    conc_state = {"stage": "pre", "ours": "m-s-ours-clean", "other": "m-s-concurrent-browser"}
+
+    def _mock_concurrent_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        conc_calls.append(list(cmd))
+        if cmd[-1] == "version":
+            return subprocess.CompletedProcess(cmd, 0, "Version: 0.8.0\n", "")
+        if "usage" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "100.0\n", "")
+        if "run" in cmd:
+            conc_state["stage"] = "post_run"
+            payload = {"schema": SCHEMA_VERSION, "compute": {"peak_bf16_tflops": 1.0}}
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                f"{BENCH_JSON_BEGIN}\n{json.dumps(payload)}\n{BENCH_JSON_END}\n",
+                "[colab] Session READY.\n",
+            )
+        if "stop" in cmd:
+            conc_state["stage"] = "post_stop"
+            return subprocess.CompletedProcess(cmd, 0, "[colab] Session terminated.\n", "")
+        if "sessions" in cmd:
+            if conc_state["stage"] == "pre":
+                return subprocess.CompletedProcess(cmd, 0, "[colab] No active sessions found on server.\n", "")
+            if conc_state["stage"] == "post_run":
+                run_calls = [c for c in conc_calls if "run" in c]
+                sname = run_calls[-1][run_calls[-1].index("-s") + 1]
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    (
+                        f"[{sname}] {conc_state['ours']} | Hardware: V5E1 | Shape: Standard | Variant: TPU\n"
+                        f"[?] {conc_state['other']} | Hardware: T4 | Shape: Standard | Variant: GPU\n"
+                    ),
+                    "",
+                )
+            # After stop: our endpoint is GONE, concurrent unrelated [?] session remains
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                f"[?] {conc_state['other']} | Hardware: T4 | Shape: Standard | Variant: GPU\n",
+                "",
+            )
+        raise AssertionError(f"Unexpected cmd: {cmd}")
+
+    conc_err = StringIO()
+    with redirect_stderr(conc_err):
+        conc_res = run_colab_tpu_suites(
+            suites=["compute"],
+            quick=True,
+            colab_bin="colab",
+            auth="adc",
+            tpu_order=("v5e1",),
+            config_path=None,
+            timeout_s=120.0,
+            runner=_mock_concurrent_runner,
+        )
+    assert conc_res["colab_meta"]["endpoint"] == "m-s-ours-clean"
+    assert conc_res["colab_meta"]["teardown_verified"] is True
+    assert conc_res["colab_meta"]["leaked_endpoints"] == []
+    assert conc_res["colab_meta"]["orphaned_endpoints"] == []
+    assert conc_res["colab_meta"]["unattributed_endpoints"] == ["m-s-concurrent-browser"]
+    assert "unattributed concurrent" in conc_err.getvalue()
+
+    # 4j. SIGTERM during `colab run --keep` MUST run teardown (and defer a second SIGTERM during stop)
+    if hasattr(signal, "SIGTERM") and threading.current_thread() is threading.main_thread():
+        sig_calls: List[List[str]] = []
+        sig_state = {"live": False, "second_sent": False}
+        orig_handler = signal.getsignal(signal.SIGTERM)
+
+        def _mock_sigterm_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess[str]:
+            sig_calls.append(list(cmd))
+            if cmd[-1] == "version":
+                return subprocess.CompletedProcess(cmd, 0, "Version: 0.8.0\n", "")
+            if "usage" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, "100.0\n", "")
+            if "run" in cmd:
+                sig_state["live"] = True
+                os.kill(os.getpid(), signal.SIGTERM)
+                raise AssertionError("SIGTERM should have interrupted runner")
+            if "stop" in cmd:
+                if not sig_state["second_sent"]:
+                    sig_state["second_sent"] = True
+                    # A second SIGTERM during teardown MUST NOT abort cleanup mid-flight
+                    os.kill(os.getpid(), signal.SIGTERM)
+                sig_state["live"] = False
+                return subprocess.CompletedProcess(cmd, 0, "[colab] Session terminated.\n", "")
+            if "sessions" in cmd:
+                if sig_state["live"]:
+                    run_calls = [c for c in sig_calls if "run" in c]
+                    sname = run_calls[-1][run_calls[-1].index("-s") + 1]
+                    return subprocess.CompletedProcess(
+                        cmd,
+                        0,
+                        f"[{sname}] m-s-sigterm-clean | Hardware: V5E1 | Shape: Standard | Variant: TPU\n",
+                        "",
+                    )
+                return subprocess.CompletedProcess(cmd, 0, "[colab] No active sessions found on server.\n", "")
+            raise AssertionError(f"Unexpected cmd: {cmd}")
+
+        try:
+            run_colab_tpu_suites(
+                suites=["compute"],
+                quick=True,
+                colab_bin="colab",
+                auth="adc",
+                tpu_order=("v5e1",),
+                config_path=None,
+                timeout_s=120.0,
+                runner=_mock_sigterm_runner,
+            )
+        except _ColabSigtermInterrupt:
+            pass
+        else:  # pragma: no cover
+            raise AssertionError("Expected _ColabSigtermInterrupt to propagate")
+        assert any("stop" in c for c in sig_calls)
+        assert sig_state["second_sent"] is True
+        assert sig_state["live"] is False
+        assert signal.getsignal(signal.SIGTERM) == orig_handler
+
     # 5. Verify this script compiles and loads under a `colab run` executable prelude
     src_text = Path(__file__).read_text(encoding="utf-8")
     compile("import os\nos.environ['X'] = '1'\n" + src_text, "colab_cell", "exec")
@@ -2533,3 +2779,5 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except KeyboardInterrupt:
         raise SystemExit(130)
+    except _ColabSigtermInterrupt:
+        raise SystemExit(143)
