@@ -66,10 +66,10 @@ python3 bench/freetpu_bench.py \
 
 1. **Compute Efficiency (`TFLOP/s per $/hr`)**:
    $$\text{TFLOP/s per \$/hr} = \frac{\text{BF16 TFLOP/s}}{\text{Hourly Cost (\$/hr)}}$$
-2. **Memory-Bandwidth-Bound Decode Throughput (`tok/s`)**:
+2. **Memory-Bandwidth-Bound Decode Throughput (`tok/s`)** *(single-device, requires $M_{\text{weights\_GB}} \le M_{\text{device\_GB}}$)*:
    $$\text{est\_tok/s} = \frac{\text{BW}_{\text{GB/s}} \times \eta_{\text{BW}} \times B}{M_{\text{weights\_GB}}}$$
-   Default parameters: $M_{\text{weights\_GB}} = 8.0\text{ GB}$ (Llama-3-8B W8A16), $\eta_{\text{BW}} = 0.70$, $B = 1$ (pass `--batch-size 32` for batched serving).
-3. **Normalized Token Cost (`$/1M decode tokens`)**:
+   Default parameters: $M_{\text{weights\_GB}} = 8.0\text{ GB}$ (Llama-3-8B W8A16), $\eta_{\text{BW}} = 0.70$, $B = 1$ (pass `--batch-size 32` for batched serving). When `--model-gb` exceeds a target's known single-device memory capacity (for example, `--model-gb 40` on a `32 GB` RTX 5090 or `16 GB` TPU `v5e-1`), `freetpu-bench` marks the single-device projection unavailable (`null` in JSON, `N/A (>mem)` in Markdown) rather than pricing an unmodeled multi-device or offloaded setup.
+3. **Normalized Token Cost (`$/1M decode tokens`)** *(when single-device weights fit in memory)*:
    $$\text{\$/1M tok} = \frac{\text{Hourly Cost (\$/hr)}}{\text{est\_tok/s} \times 3600} \times 10^6$$
 
 ---

@@ -86,6 +86,7 @@ class ReferenceBaseline:
     display_name: str
     status: str  # Always "published-reference" for reference table rows
     memory_spec: str
+    memory_gb: float
     peak_bf16_tflops: Optional[float]
     peak_int8_tops: Optional[float]
     measured_bf16_tflops: Optional[float]
@@ -106,6 +107,7 @@ PUBLISHED_BASELINES: Tuple[ReferenceBaseline, ...] = (
         display_name="Pixel Tensor G5 (buenos_a0)",
         status="published-reference",
         memory_spec="15.6 GiB LPDDR (unified)",
+        memory_gb=15.6,
         peak_bf16_tflops=None,
         peak_int8_tops=None,
         measured_bf16_tflops=None,
@@ -124,6 +126,7 @@ PUBLISHED_BASELINES: Tuple[ReferenceBaseline, ...] = (
         display_name="Cloud TPU v5e-1",
         status="published-reference",
         memory_spec="16 GB HBM2e",
+        memory_gb=16.0,
         peak_bf16_tflops=197.0,
         peak_int8_tops=394.0,
         measured_bf16_tflops=179.36,
@@ -142,6 +145,7 @@ PUBLISHED_BASELINES: Tuple[ReferenceBaseline, ...] = (
         display_name="Cloud TPU v6e-1 (Trillium)",
         status="published-reference",
         memory_spec="32 GB HBM2e",
+        memory_gb=32.0,
         peak_bf16_tflops=918.0,
         peak_int8_tops=1836.0,
         measured_bf16_tflops=None,
@@ -160,6 +164,7 @@ PUBLISHED_BASELINES: Tuple[ReferenceBaseline, ...] = (
         display_name="NVIDIA H100 SXM",
         status="published-reference",
         memory_spec="80 GB HBM3",
+        memory_gb=80.0,
         peak_bf16_tflops=989.0,
         peak_int8_tops=1979.0,
         measured_bf16_tflops=None,
@@ -178,6 +183,7 @@ PUBLISHED_BASELINES: Tuple[ReferenceBaseline, ...] = (
         display_name="NVIDIA RTX 5090",
         status="published-reference",
         memory_spec="32 GB GDDR7",
+        memory_gb=32.0,
         peak_bf16_tflops=209.5,
         peak_int8_tops=838.0,
         measured_bf16_tflops=None,
@@ -1137,19 +1143,76 @@ class _ColabSigtermInterrupt(BaseException):
     """Raised when SIGTERM arrives during a retained Colab TPU run."""
 
 
-def _default_colab_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess[str]:
-    """Run a Colab CLI command non-interactively so OAuth prompts cannot hang on hidden stdin."""
+COLAB_PROVISIONING_GRACE_S = 180.0
+COLAB_CONTROL_TIMEOUT_S = 90.0
+COLAB_UNBOUNDED_FALLBACK_DEADLINE_S = 1800.0
+
+
+def _terminate_proc_group(proc: subprocess.Popen[str]) -> Tuple[str, str]:
+    """Terminate and reap a child process (and its session group on POSIX)."""
+    try:
+        if os.name == "posix":
+            os.killpg(proc.pid, signal.SIGTERM)
+        else:
+            proc.terminate()
+    except OSError:
+        pass
+    try:
+        return proc.communicate(timeout=3.0)
+    except subprocess.TimeoutExpired:
+        try:
+            if os.name == "posix":
+                os.killpg(proc.pid, signal.SIGKILL)
+            else:
+                proc.kill()
+        except OSError:
+            pass
+        return proc.communicate()
+
+
+def _default_colab_runner(
+    cmd: Sequence[str],
+    timeout_s: Optional[float] = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run a Colab CLI command non-interactively with an optional host-side deadline."""
     env = os.environ.copy()
     env.setdefault("COLAB_CLI_REQUEST_TIMEOUT", "60")
     env.setdefault("COLAB_CLI_ASSIGN_RETRIES", "1")
-    return subprocess.run(
-        list(cmd),
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        env=env,
-        check=False,
-    )
+    popen_kwargs: Dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "env": env,
+    }
+    if os.name == "posix":
+        popen_kwargs["start_new_session"] = True
+    proc = subprocess.Popen(list(cmd), **popen_kwargs)
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        out, err = _terminate_proc_group(proc)
+        raise subprocess.TimeoutExpired(cmd=list(cmd), timeout=float(timeout_s or 0.0), output=out, stderr=err)
+    except BaseException:
+        _terminate_proc_group(proc)
+        raise
+    return subprocess.CompletedProcess(list(cmd), proc.returncode, stdout, stderr)
+
+
+def _make_default_colab_runner(
+    run_timeout_s: float,
+    provisioning_grace_s: float = COLAB_PROVISIONING_GRACE_S,
+    control_timeout_s: float = COLAB_CONTROL_TIMEOUT_S,
+) -> Callable[[Sequence[str]], subprocess.CompletedProcess[str]]:
+    """Build a non-interactive Colab runner with a host-side wall-clock deadline."""
+    base_run = run_timeout_s if run_timeout_s > 0.0 else COLAB_UNBOUNDED_FALLBACK_DEADLINE_S
+    run_deadline = base_run + max(0.0, provisioning_grace_s)
+
+    def _runner(cmd: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        limit = run_deadline if "run" in cmd else control_timeout_s
+        return _default_colab_runner(cmd, timeout_s=limit)
+
+    return _runner
 
 
 def _verify_and_stop_session(
@@ -1282,7 +1345,7 @@ def run_colab_tpu_suites(
         return {}
 
     if runner is None:
-        runner = _default_colab_runner
+        runner = _make_default_colab_runner(timeout_s)
 
     tmp_dir: Optional[Path] = None
     if config_path is None:
@@ -1429,6 +1492,12 @@ def run_colab_tpu_suites(
                     signal.signal(signal.SIGTERM, prev_sigterm)
 
             if interrupted is not None:
+                if isinstance(interrupted, subprocess.TimeoutExpired):
+                    raise RuntimeError(
+                        f"Colab TPU run exceeded host-side deadline ({interrupted.timeout:.1f}s) on {tpu} "
+                        f"(teardown_verified={teardown_verified}, endpoint={endpoint}, "
+                        f"leaked_endpoints={leaked_endpoints}, unattributed_endpoints={unattributed_endpoints})"
+                    ) from interrupted
                 raise interrupted
             if sigterm_state["deferred"]:
                 raise _ColabSigtermInterrupt("Received SIGTERM during Colab teardown")
@@ -1510,8 +1579,16 @@ def _compute_economics(
     bw_efficiency: float,
     batch_size: int,
     verified_tok_s: Optional[float] = None,
-) -> Dict[str, Optional[float]]:
+    memory_gb: Optional[float] = None,
+) -> Dict[str, Any]:
     validate_economics_params(model_gb, bw_efficiency, batch_size)
+    weights_exceed_memory = (memory_gb is not None) and (model_gb > memory_gb)
+    single_device_fits: Optional[bool] = (not weights_exceed_memory) if memory_gb is not None else None
+    projection_note = (
+        f"unavailable: {model_gb:g} GB weights exceed {memory_gb:g} GB single-device memory (requires sharding/offload)"
+        if weights_exceed_memory
+        else None
+    )
     if hourly_cost_usd is None or hourly_cost_usd <= 0.0:
         return {
             "tflops_per_dollar_hr": None,
@@ -1520,16 +1597,18 @@ def _compute_economics(
             "est_decode_tok_s": None,
             "usd_per_1m_tokens_model": None,
             "usd_per_1m_tokens_verified": None,
+            "single_device_fits": single_device_fits,
+            "cost_projection_note": projection_note,
         }
     tf_per_dollar = round(bf16_tflops / hourly_cost_usd, 2) if bf16_tflops is not None else None
     int8_per_dollar = round(int8_tops / hourly_cost_usd, 2) if int8_tops is not None else None
     gbps_per_dollar = round(bw_gbps / hourly_cost_usd, 2) if bw_gbps is not None else None
 
-    # Weight-bandwidth-limited decode model:
-    # Effective batch_size increases tokens emitted per weight pass until compute bound.
+    # Weight-bandwidth-limited single-device decode model:
+    # Suppress single-device projections when active weights alone exceed target memory capacity.
     est_tok_s: Optional[float] = None
     usd_per_1m_model: Optional[float] = None
-    if bw_gbps is not None and bw_gbps > 0.0:
+    if not weights_exceed_memory and bw_gbps is not None and bw_gbps > 0.0:
         est_tok_s = round(((bw_gbps * bw_efficiency) / model_gb) * max(1, batch_size), 2)
         if est_tok_s > 0.0:
             usd_per_1m_model = round((hourly_cost_usd / (est_tok_s * 3600.0)) * 1e6, 3)
@@ -1545,6 +1624,8 @@ def _compute_economics(
         "est_decode_tok_s": est_tok_s,
         "usd_per_1m_tokens_model": usd_per_1m_model,
         "usd_per_1m_tokens_verified": usd_per_1m_verified,
+        "single_device_fits": single_device_fits,
+        "cost_projection_note": projection_note,
     }
 
 
@@ -1587,6 +1668,11 @@ def build_scorecard_rows(
             cost_basis = f"GCP public on-demand rate (${inferred_cost:.2f}/chip-hr)" if inferred_cost else "local/unspecified"
             mem_limit = dev_info.get("hbm_bytes_limit")
             mem_str = f"{mem_limit / (1024**3):.2f} GiB HBM" if mem_limit else "TPU HBM"
+            live_mem_gb: Optional[float] = (
+                round(mem_limit / (1024**3), 2)
+                if mem_limit
+                else (16.0 if colab_tpu == "v5e1" else (32.0 if colab_tpu == "v6e1" else None))
+            )
 
             bf16_tf = comp.get("peak_bf16_tflops")
             fp32_tf = comp.get("peak_fp32_tflops")
@@ -1602,11 +1688,13 @@ def build_scorecard_rows(
                 model_gb=model_gb,
                 bw_efficiency=bw_efficiency,
                 batch_size=batch_size,
+                memory_gb=live_mem_gb,
             )
             tpu_row: Dict[str, Any] = {
                 "target": label,
                 "row_type": "measured",
                 "memory": mem_str,
+                "memory_gb": live_mem_gb,
                 "bf16_tflops": bf16_tf,
                 "fp32_tflops": fp32_tf,
                 "int8_tops": int8_tops,
@@ -1718,11 +1806,13 @@ def build_scorecard_rows(
             bw_efficiency=bw_efficiency,
             batch_size=batch_size,
             verified_tok_s=base.verified_decode_tok_s,
+            memory_gb=base.memory_gb,
         )
         rows.append({
             "target": base.display_name,
             "row_type": base.status,
             "memory": base.memory_spec,
+            "memory_gb": base.memory_gb,
             "bf16_tflops": bf16_ref,
             "bf16_is_measured": base.measured_bf16_tflops is not None,
             "int8_tops": int8_ref,
@@ -1827,14 +1917,19 @@ def render_markdown(report: Dict[str, Any]) -> str:
             f"{r['int8_tops_per_dollar_hr']:.1f} (I8)" if r.get("int8_tops_per_dollar_hr") is not None else "—"
         )
         tok_cost = r.get("usd_per_1m_tokens_model")
-        tok_s = f"${tok_cost:.2f}" if tok_cost is not None else "—"
+        if tok_cost is not None:
+            tok_s = f"${tok_cost:.2f}"
+        elif r.get("single_device_fits") is False:
+            tok_s = "N/A (>mem)"
+        else:
+            tok_s = "—"
         lines.append(
             f"| {r['target']} | `{r['row_type']}` | {r['memory']} | {bf16_s} | {int8_s} | {bw_s} | {r['dispatch_floor_us']} | {cost_s} | {tf_d_s} | {tok_s} |"
         )
 
     lines.extend([
         "",
-        f"> **Normalized `$/1M tok` Assumptions**: `{model_gb:.1f} GB` active weight read per token (e.g. Llama-3-8B W8A16), `{bw_eff * 100:.0f}%` memory-bandwidth decode efficiency, `batch_size={batch_size}` (`tok/s = BW * eff * B / model_gb`). Published references distinguish peak spec vs verified silicon runs. Local host `(int32-widened ref)` cells widen `int8 -> int32` operands inside the timed NumPy matmul (including conversion overhead) rather than executing native INT8 accelerator ops.",
+        f"> **Normalized `$/1M tok` Assumptions**: `{model_gb:.1f} GB` active weight read per token (e.g. Llama-3-8B W8A16), `{bw_eff * 100:.0f}%` memory-bandwidth decode efficiency, `batch_size={batch_size}` (`tok/s = BW * eff * B / model_gb`). Published references distinguish peak spec vs verified silicon runs. Single-device projections show `N/A (>mem)` when `model_gb` exceeds a target's known memory capacity (multi-device sharding or offload required). Local host `(int32-widened ref)` cells widen `int8 -> int32` operands inside the timed NumPy matmul (including conversion overhead) rather than executing native INT8 accelerator ops.",
         "",
     ])
 
@@ -2069,6 +2164,29 @@ def run_self_test() -> int:
     assert "27.96 (measured DMA)" in md and "3x eff 2-pass" in md
     assert "3x eff /" in md and "5x actual 2-pass" in md
     assert "Pixel Tensor G5" in md and "Cloud TPU v6e-1" in md and "NVIDIA H100 SXM" in md
+
+    # 3d. Verify single-device projections are suppressed when model_gb exceeds device memory capacity
+    big_report = dict(report)
+    big_report["economics_assumptions"] = {"model_gb": 40.0, "bw_efficiency": 0.70, "batch_size": 1}
+    big_report["scorecard"] = build_scorecard_rows(big_report, model_gb=40.0)
+    by_target = {r["target"]: r for r in big_report["scorecard"]}
+    for small_target in (
+        "Pixel Tensor G5 (buenos_a0)",
+        "Cloud TPU v5e-1",
+        "Cloud TPU v6e-1 (Trillium)",
+        "NVIDIA RTX 5090",
+    ):
+        row = by_target[small_target]
+        assert row["single_device_fits"] is False, (small_target, row)
+        assert row["est_decode_tok_s"] is None, (small_target, row)
+        assert row["usd_per_1m_tokens_model"] is None, (small_target, row)
+        assert row["cost_projection_note"] and "exceed" in row["cost_projection_note"]
+    h100_big = by_target["NVIDIA H100 SXM"]
+    assert h100_big["single_device_fits"] is True
+    assert h100_big["est_decode_tok_s"] is not None and h100_big["est_decode_tok_s"] > 0
+    assert h100_big["usd_per_1m_tokens_model"] is not None and h100_big["usd_per_1m_tokens_model"] > 0
+    big_md = render_markdown(big_report)
+    assert "N/A (>mem)" in big_md
 
     # 3a. Verify colab_tpu scorecard never attaches local TCP comms to a Cloud TPU row
     colab_comms_only = build_scorecard_rows({
@@ -2815,6 +2933,64 @@ def run_self_test() -> int:
         ambig_cfg = Path(str(ambig_state["cfg"]))
         assert ambig_cfg.parent.is_dir()
         shutil.rmtree(ambig_cfg.parent, ignore_errors=True)
+
+    # 4n. Hung `colab run` (e.g. kernel init stall) MUST hit host-side deadline and run teardown
+    hang_dir = Path(tempfile.mkdtemp(prefix="freetpu-bench-hang-"))
+    try:
+        hang_stub = hang_dir / "fake-colab-hang"
+        hang_state = hang_dir / "state.txt"
+        hang_stopped = hang_dir / "stopped.txt"
+        hang_stub.write_text(
+            f"#!{sys.executable}\n"
+            "import sys, time\n"
+            "from pathlib import Path\n"
+            f"state = Path({str(hang_state)!r})\n"
+            f"stopped = Path({str(hang_stopped)!r})\n"
+            "args = sys.argv[1:]\n"
+            "if args and args[-1] == 'version':\n"
+            "    print('Version: 0.8.0')\n"
+            "elif 'usage' in args:\n"
+            "    print('100.0')\n"
+            "elif 'run' in args:\n"
+            "    sname = args[args.index('-s') + 1]\n"
+            "    state.write_text(sname, encoding='utf-8')\n"
+            "    time.sleep(15.0)\n"
+            "elif 'stop' in args:\n"
+            "    stopped.write_text('stopped', encoding='utf-8')\n"
+            "    if state.exists():\n"
+            "        state.unlink()\n"
+            "    print('[colab] Session terminated.')\n"
+            "elif 'sessions' in args:\n"
+            "    if state.exists():\n"
+            "        sname = state.read_text(encoding='utf-8').strip()\n"
+            "        print(f'[{sname}] m-s-hung-kernel | Hardware: V6E1 | Shape: Standard | Variant: TPU')\n"
+            "    else:\n"
+            "        print('[colab] No active sessions found on server.')\n",
+            encoding="utf-8",
+        )
+        os.chmod(hang_stub, 0o700)
+        t_hang = time.monotonic()
+        try:
+            run_colab_tpu_suites(
+                suites=["compute"],
+                quick=True,
+                colab_bin=str(hang_stub),
+                auth="adc",
+                tpu_order=("v6e1", "v5e1"),
+                config_path=hang_dir / "sessions.json",
+                timeout_s=0.15,
+                runner=_make_default_colab_runner(run_timeout_s=0.15, provisioning_grace_s=0.05, control_timeout_s=5.0),
+            )
+        except RuntimeError as exc:
+            assert "host-side deadline" in str(exc), str(exc)
+            assert "teardown_verified=True" in str(exc), str(exc)
+        else:  # pragma: no cover
+            raise AssertionError("Expected RuntimeError when colab run exceeds host-side deadline")
+        assert time.monotonic() - t_hang < 3.0
+        assert hang_stopped.is_file()
+        assert not hang_state.exists()
+    finally:
+        shutil.rmtree(hang_dir, ignore_errors=True)
 
     # 5. Verify this script compiles and loads under a `colab run` executable prelude
     src_text = Path(__file__).read_text(encoding="utf-8")

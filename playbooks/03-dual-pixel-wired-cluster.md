@@ -44,7 +44,7 @@ python3 bench/freetpu_bench.py \
   --markdown runs/comms-wired.md
 ```
 
-*(If testing over an `adb` USB bridge instead of native USB-Ethernet, run `adb -s <node2_serial> forward tcp:50055 tcp:50055` for a desktop driver—and also run `adb -s <node1_serial> reverse tcp:50055 tcp:50055` when Node 1 is a second Pixel—then point the driver at `--comms-host 127.0.0.1 --comms-port 50055`.)*
+*(If testing over an `adb` USB bridge instead of native USB-Ethernet, run `adb -s <node2_serial> forward tcp:50055 tcp:50055` for a desktop driver—and when Node 1 is a second Pixel, also bind a loopback-only reverse tunnel `adb -s <node1_serial> reverse tcp:127.0.0.1:50055 tcp:50055` and drop non-loopback ingress on TCP `50055`—then point the driver at `--comms-host 127.0.0.1 --comms-port 50055`.)*
 
 ### 3. Split-Layer Dual-Phone `llama.cpp` (`GGML_EDGETPU=ON` + `GGML_RPC=ON`)
 
@@ -92,22 +92,33 @@ adb -s <node2_serial> shell "su -c 'OPENBUENOS_DIVE_INTERP_PATH=/data/local/tmp/
   /data/local/tmp/tpu_open_stack/ggml-rpc-server -d EDGETPU -H 127.0.0.1 -p 50052 -t 4'"
 ```
 
-**Terminal 2 — Create ADB Tunnels & Run Split-Layer Benchmark on Node 1:**
+**Terminal 2 — Create Loopback-Only ADB Tunnels, Verify Listener, & Run Split-Layer Benchmark on Node 1:**
 
 ```bash
-# Optional hardening on Node 1: allow only root (UID 0) and adbd/shell (UID 2000) on the reversed loopback port
-adb -s <node1_serial> shell "su -c 'iptables -N FREETPU_RPC_OUT 2>/dev/null || iptables -F FREETPU_RPC_OUT; \
+# Hardening on Node 1: drop any non-loopback IPv4/IPv6 ingress to TCP 50052 AND allow only root (UID 0)
+# and adbd/shell (UID 2000) to connect over loopback before opening the reverse tunnel
+adb -s <node1_serial> shell "su -c 'iptables -C INPUT ! -i lo -p tcp --dport 50052 -j DROP 2>/dev/null || \
+  iptables -I INPUT ! -i lo -p tcp --dport 50052 -j DROP; \
+  ip6tables -C INPUT ! -i lo -p tcp --dport 50052 -j DROP 2>/dev/null || \
+  ip6tables -I INPUT ! -i lo -p tcp --dport 50052 -j DROP; \
+  iptables -N FREETPU_RPC_OUT 2>/dev/null || iptables -F FREETPU_RPC_OUT; \
   iptables -A FREETPU_RPC_OUT -m owner --uid-owner 0 -j RETURN; \
   iptables -A FREETPU_RPC_OUT -m owner --uid-owner 2000 -j RETURN; \
   iptables -A FREETPU_RPC_OUT -j REJECT; \
   iptables -C OUTPUT -o lo -p tcp --dport 50052 -j FREETPU_RPC_OUT 2>/dev/null || \
   iptables -I OUTPUT -o lo -p tcp --dport 50052 -j FREETPU_RPC_OUT'"
 
-# Tunnel Node 2 loopback -> host -> Node 1 loopback via ADB port forwarding
+# Tunnel Node 2 loopback -> host -> Node 1 loopback explicitly (bind 127.0.0.1, never bare wildcard tcp:50052)
 adb -s <node2_serial> forward tcp:50052 tcp:50052
-adb -s <node1_serial> reverse tcp:50052 tcp:50052
+adb -s <node1_serial> reverse tcp:127.0.0.1:50052 tcp:50052
 
-# Node 1: split layers across Node 2 RPC (over loopback tunnel) + local EDGETPU
+# Verify Node 1 listener is bound strictly to loopback (fail if listening on 0.0.0.0, *, or [::])
+adb -s <node1_serial> shell "su -c 'listen=\$(ss -Htlpn sport = :50052); \
+  printf \"%s\n\" \"\$listen\"; \
+  printf \"%s\n\" \"\$listen\" | grep -qE \"(127\\.0\\.0\\.1|\\[::1\\]):50052\" && \
+  ! printf \"%s\n\" \"\$listen\" | grep -qE \"(0\\.0\\.0\\.0|\\*|\\[::\\]):50052\"'"
+
+# Node 1: split layers across Node 2 RPC (over verified loopback tunnel) + local EDGETPU
 adb -s <node1_serial> shell "su -c 'OPENBUENOS_DIVE_INTERP_PATH=/data/local/tmp/tpu_open_stack/dive_interp_rv64.bin \
   OPENBUENOS_PERF_MODE=5 \
   /data/local/tmp/tpu_open_stack/llama-bench \
