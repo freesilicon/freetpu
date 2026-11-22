@@ -112,10 +112,11 @@ Use this workflow with `google-colab-cli >= 0.7.6` (redacted logs) to run Pallas
        --out-dir "$WORK_DIR/proof" \
        --script skills/freetpu/templates/tile_fused_gemm_silu.py
      ```
-   - Direct CLI pattern (do **not** assume default `colab run` teardown succeeded: if unassign fails, `colab run` suppresses the error, removes the local session record, and still prints `Session terminated.` while leaving the TPU billing CUs. Instead, build a local launcher in `$WORK_DIR`, insulate `colab new` from `INT`/`TERM` so an in-flight allocation always persists `$SESSION_ID` to `$COLAB_STATE` before honouring cancellation, execute the standalone template via `colab exec --file` under a local wall-clock watchdog (avoiding `colab upload`'s unbounded HTTP wait and tokenized URL errors), require a post-run `__FREETPU_EXEC_OK__` marker, and release by name via `colab stop` with ADC-propagating `colab usage` + `colab sessions` verification):
+   - Direct CLI pattern (automatic `v6e1 -> v5e1` fallback is provided by `tools/colab_tpu_bench.py`; the direct CLI recipe runs a single selected `TPU_TYPE`, defaulting to `V6E1` — set `TPU_TYPE=V5E1` when `V6E1` quota or capacity is unavailable. Do **not** assume default `colab run` teardown succeeded: if unassign fails, `colab run` suppresses the error, removes the local session record, and still prints `Session terminated.` while leaving the TPU billing CUs. Instead, build a local launcher in `$WORK_DIR`, insulate `colab new` and `cleanup()` from `INT`/`TERM` so cancellation waits for `$SESSION_ID` to persist and finishes teardown uninterrupted, execute via `colab exec --file` under a local wall-clock watchdog, require `__FREETPU_EXEC_OK__`, and release by name via `colab stop` with ADC-propagating `colab usage` + `colab sessions` verification):
      ```bash
      (
        SESSION_ID="freetpu-probe-$(date +%Y%m%d-%H%M%S)-$$"
+       TPU_TYPE="${TPU_TYPE:-V6E1}"
        RUN_RC=0
        ALLOC_PID=""
        RUN_PID=""
@@ -140,7 +141,9 @@ Use this workflow with `google-colab-cli >= 0.7.6` (redacted logs) to run Pallas
        cleanup() {
          [ "$CLEANED" -eq 1 ] && return
          CLEANED=1
-         trap - EXIT INT TERM
+         # Ignore repeated INT/TERM while teardown completes so Ctrl-C cannot abort allocation wait or `colab stop`:
+         trap '' INT TERM
+         trap - EXIT
 
          [ -n "$WD_PID" ] && kill "$WD_PID" 2>/dev/null || true
          [ -n "$WD_PID" ] && wait "$WD_PID" 2>/dev/null || true
@@ -193,6 +196,7 @@ Use this workflow with `google-colab-cli >= 0.7.6` (redacted logs) to run Pallas
        }
 
        on_signal() {
+         trap '' INT TERM
          CANCELLED=1
          RUN_RC="$1"
          # Do not kill $ALLOC_PID during allocation; cleanup waits for $SESSION_ID to persist, then stops it by name.
@@ -206,7 +210,7 @@ Use this workflow with `google-colab-cli >= 0.7.6` (redacted logs) to run Pallas
        trap 'on_signal 143' TERM
        trap 'cleanup' EXIT
 
-       ( trap '' INT TERM; exec colab --auth=adc --config "$COLAB_STATE" new -s "$SESSION_ID" --tpu V6E1 ) &
+       ( trap '' INT TERM; exec colab --auth=adc --config "$COLAB_STATE" new -s "$SESSION_ID" --tpu "$TPU_TYPE" ) &
        ALLOC_PID=$!
        wait "$ALLOC_PID" || RUN_RC=$?
        ALLOC_PID=""
@@ -234,7 +238,9 @@ Use this workflow with `google-colab-cli >= 0.7.6` (redacted logs) to run Pallas
        fi
      )
      ```
-   - **Teardown verification**: After every run (wrapper or direct CLI), verify both ADC/API health (`colab --auth=adc --config "$COLAB_STATE" usage >/dev/null`) and server-side session absence (`colab --auth=adc --config "$COLAB_STATE" sessions` with no credential warnings on stderr), and treat any auth or query failure as unconfirmed teardown. If a runtime is still listed, stop it with `colab --auth=adc --config "$COLAB_STATE" stop -s "$SESSION_ID"` (when `$COLAB_STATE` still holds `$SESSION_ID`); if local session state was already dropped (e.g., by default `colab run`), terminate the orphaned runtime immediately in the Colab UI (`Runtime -> Manage sessions`).
+   - **Teardown verification**:
+     - **Wrapper (`tools/colab_tpu_bench.py`)**: Inspect `$WORK_DIR/proof/summary.json` (`session_name`, `created_endpoint`, `teardown_verified`, `recovery_config`, and `recovery_command`). If `teardown_verified` is not `true`, run the recorded `recovery_command` (or stop `<session_name>` against `<recovery_config>` and verify `<created_endpoint>` is absent from `colab --auth=adc --config <recovery_config> sessions` alongside a passing `colab usage`), or terminate `<created_endpoint>` in the Colab UI (`Runtime -> Manage sessions`) if local state is no longer present.
+     - **Direct CLI (`$COLAB_STATE`)**: Verify both ADC/API health (`colab --auth=adc --config "$COLAB_STATE" usage >/dev/null`) and server-side absence of `$ENDPOINT` / `$SESSION_ID` (`colab --auth=adc --config "$COLAB_STATE" sessions` with no credential warnings on stderr), treating any auth or query failure as unconfirmed teardown. If a runtime is still listed, stop it with `colab --auth=adc --config "$COLAB_STATE" stop -s "$SESSION_ID"` (or terminate it in the Colab UI `Runtime -> Manage sessions` if local state was dropped).
    - For multi-step interactive sessions, prefer `colab exec` (keeps XLA/PJRT caches warm) over `colab ssh` (capped at 5 sessions / HTTP 429). Use `colab download` instead of `drive.mount`.
 
 ---
