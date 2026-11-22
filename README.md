@@ -152,6 +152,7 @@ export OPENBUENOS_DIVE_INTERP_PATH=/data/local/tmp/tpu_open_stack/dive_interp_rv
 - [Vector ALU ISA](docs/isa-vec/vector_alu_isa.md) — `stream125` FP32-RNE quantization & activation pipeline
 - [Kernel UAPI Headers](docs/kernel-abi/README.md) — Clean-room `/dev/edgetpu-soc`, `/dev/gxp`, and GCIP IIF headers
 - [`libopenbuenos` Guide](docs/libopenbuenos/README.md) & [`ggml-edgetpu` Guide](docs/llama-cpp-edgetpu/README.md)
+- [Headless Colab TPU Tooling](docs/cloud-tpu/colab-headless-tooling.md) — Track B `v6e-1`/`v5e-1` headless harness (`tools/colab_tpu_bench.py`), Colab MCP/`v1beta` contract & Track C boundaries
 
 ---
 
