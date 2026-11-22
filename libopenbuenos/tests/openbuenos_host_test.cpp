@@ -3198,20 +3198,42 @@ void test_phase7b_swiglu_chaining_2tier_and_outlier_cache() {
     for (const SwigluProbeCase& pc : probes) {
       std::string base = kProbeDir + "/" + pc.name;
     std::vector<uint8_t> ref_dgc0, in_bin, ref_out;
-    CHECK(read_file((base + ".dgc0").c_str(), &ref_dgc0));
-    CHECK(read_file((base + ".in.bin").c_str(), &in_bin));
-    CHECK(read_file((base + ".ref.bin").c_str(), &ref_out));
+    const bool ok_dgc0 = read_file((base + ".dgc0").c_str(), &ref_dgc0);
+    const bool ok_in = read_file((base + ".in.bin").c_str(), &in_bin);
+    const bool ok_ref = read_file((base + ".ref.bin").c_str(), &ref_out);
+    const size_t expect_in_sz = static_cast<size_t>(pc.M) * pc.K;
+    const size_t expect_out_sz = static_cast<size_t>(pc.M) * pc.N;
+    CHECK(ok_dgc0);
+    CHECK(ok_in);
+    CHECK(ok_ref);
+    CHECK(in_bin.size() == expect_in_sz);
+    CHECK(ref_out.size() == expect_out_sz);
+    if (!ok_dgc0 || !ok_in || !ok_ref ||
+        in_bin.size() != expect_in_sz || ref_out.size() != expect_out_sz) {
+      continue;
+    }
 
     ob::ParsedDgc0 ref_parsed{};
     std::string perr;
-    CHECK(ob::parse_dgc0_buffer(ref_dgc0.data(), ref_dgc0.size(), &ref_parsed, &perr) == OB_OK);
+    const bool parsed_ok = (ob::parse_dgc0_buffer(ref_dgc0.data(), ref_dgc0.size(), &ref_parsed, &perr) == OB_OK);
+    CHECK(parsed_ok);
+    if (!parsed_ok ||
+        ref_parsed.ext_dive_vm_ir.offset + ref_parsed.ext_dive_vm_ir.size > ref_dgc0.size() ||
+        ref_parsed.ext_params.offset + ref_parsed.ext_params.size > ref_dgc0.size()) {
+      CHECK(false);
+      continue;
+    }
     const uint8_t* ref_ext0 = ref_dgc0.data() + ref_parsed.ext_dive_vm_ir.offset;
     const size_t ref_ext0_sz = static_cast<size_t>(ref_parsed.ext_dive_vm_ir.size);
     const uint8_t* ref_ext2 = ref_dgc0.data() + ref_parsed.ext_params.offset;
     const size_t ref_ext2_sz = static_cast<size_t>(ref_parsed.ext_params.size);
 
     std::vector<std::vector<uint8_t>> ref_chunks;
-    CHECK(extract_dive_chunks_n(ref_ext0, ref_ext0_sz, 11u, &ref_chunks));
+    const bool chunks_extracted = extract_dive_chunks_n(ref_ext0, ref_ext0_sz, 11u, &ref_chunks);
+    CHECK(chunks_extracted && ref_chunks.size() == 11u);
+    if (!chunks_extracted || ref_chunks.size() != 11u) {
+      continue;
+    }
 
     // Unpack [Wg|Wu|Wd] directly from probe ext[2]
     const size_t p_gate = (pc.M == 64u)
@@ -3222,6 +3244,9 @@ void test_phase7b_swiglu_chaining_2tier_and_outlier_cache() {
         ? (static_cast<size_t>(pc.N) * (pc.H + 16u))
         : (static_cast<size_t>(pc.N) * (pc.H + 4u));
     CHECK(ref_ext2_sz == p_gate + p_up + p_down);
+    if (ref_ext2_sz != p_gate + p_up + p_down) {
+      continue;
+    }
 
     std::vector<int8_t> wg, wu, wd;
     std::vector<int32_t> bg, bu, bd;
