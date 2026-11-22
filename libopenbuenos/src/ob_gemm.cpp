@@ -376,23 +376,26 @@ uint64_t hash_shape_key(uint32_t hw_m, uint32_t hw_k, uint32_t hw_n,
   return h == 0u ? 1u : h;
 }
 
-size_t read_system_mem_available_bytes() {
+bool read_system_mem_available_bytes(size_t* out_bytes) {
+  if (!out_bytes) return false;
+  *out_bytes = 0u;
 #if defined(__linux__)
   std::FILE* f = std::fopen("/proc/meminfo", "r");
-  if (!f) return 0u;
+  if (!f) return false;
   char line[256];
-  size_t avail_bytes = 0u;
+  bool found = false;
   while (std::fgets(line, sizeof(line), f)) {
     unsigned long long kb = 0ULL;
     if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
-      avail_bytes = static_cast<size_t>(kb) * 1024u;
+      *out_bytes = static_cast<size_t>(kb) * 1024u;
+      found = true;
       break;
     }
   }
   std::fclose(f);
-  return avail_bytes;
+  return found;
 #else
-  return 0u;
+  return false;
 #endif
 }
 
@@ -411,16 +414,20 @@ size_t compute_weight_cache_budget_bytes_impl(ob_context* ctx) {
         ? (256u * 1024u * 1024u)
         : (2048u * 1024u * 1024u);
   }
-  size_t mem_avail = ctx->simulated_mem_available_bytes;
-  if (mem_avail == 0u && !ctx->mock_mode) {
-    mem_avail = read_system_mem_available_bytes();
-    if (mem_avail > 0u) {
+  bool have_mem_avail = false;
+  size_t mem_avail = 0u;
+  if (ctx->simulated_mem_available_bytes > 0u || ctx->simulated_mem_available_set) {
+    have_mem_avail = true;
+    mem_avail = ctx->simulated_mem_available_bytes;
+  } else if (!ctx->mock_mode) {
+    if (read_system_mem_available_bytes(&mem_avail)) {
+      have_mem_avail = true;
       // /proc/meminfo MemAvailable excludes our own unswappable DMA-BUF cache;
       // add weight_cache_bytes back so our own cache cannot self-ratchet downward.
       mem_avail += ctx->weight_cache_bytes;
     }
   }
-  if (mem_avail > 0u) {
+  if (have_mem_avail) {
     // Android LMKD-safe ceiling: never let cached ext[2] DMA-BUFs exceed MemAvailable / 3.
     const size_t lmkd_cap = mem_avail / 3u;
     if (lmkd_cap < base_cap) {
@@ -432,7 +439,7 @@ size_t compute_weight_cache_budget_bytes_impl(ob_context* ctx) {
 
 void ensure_weight_cache_budget(ob_context* ctx, bool refresh_meminfo = false) {
   if (ctx->weight_cache_max_bytes == 0u || refresh_meminfo ||
-      ctx->simulated_mem_available_bytes > 0u) {
+      ctx->simulated_mem_available_bytes > 0u || ctx->simulated_mem_available_set) {
     ctx->weight_cache_max_bytes = compute_weight_cache_budget_bytes_impl(ctx);
   }
   if (ctx->weight_cache_max_entries == 0u) {
@@ -450,16 +457,16 @@ void ensure_weight_cache_budget(ob_context* ctx, bool refresh_meminfo = false) {
 
 void weight_cache_evict_locked(ob_context* ctx,
                                size_t incoming_bytes,
-                               const CachedWeightTile* keep = nullptr) {
+                               const CachedWeightTile* keep = nullptr,
+                               size_t incoming_entries = 1u) {
   const bool periodic_refresh =
-      (ctx->simulated_mem_available_bytes > 0u) ||
+      (ctx->simulated_mem_available_bytes > 0u || ctx->simulated_mem_available_set) ||
       (!ctx->mock_mode && ((ctx->weight_cache_misses & 31u) == 0u ||
                            ctx->weight_cache_bytes + incoming_bytes > ctx->weight_cache_max_bytes));
   ensure_weight_cache_budget(ctx, periodic_refresh);
   auto it = ctx->weight_cache_lru.end();
   while ((ctx->weight_cache_bytes + incoming_bytes > ctx->weight_cache_max_bytes ||
-          (incoming_bytes > 0u && ctx->weight_cache_map.size() >= ctx->weight_cache_max_entries) ||
-          ctx->weight_cache_map.size() > ctx->weight_cache_max_entries) &&
+          ctx->weight_cache_map.size() + incoming_entries > ctx->weight_cache_max_entries) &&
          it != ctx->weight_cache_lru.begin()) {
     --it;
     CachedWeightTile* victim = *it;
@@ -484,12 +491,12 @@ CachedWeightTile* weight_cache_find_locked(ob_context* ctx, const WeightTileKey&
     ctx->weight_cache_lru.splice(ctx->weight_cache_lru.begin(), ctx->weight_cache_lru, t->lru_it);
   }
   ctx->weight_cache_hits += 1u;
-  if ((ctx->simulated_mem_available_bytes > 0u) ||
+  if ((ctx->simulated_mem_available_bytes > 0u || ctx->simulated_mem_available_set) ||
       (!ctx->mock_mode && (ctx->weight_cache_hits & 63u) == 0u)) {
     ensure_weight_cache_budget(ctx, true);
     if (ctx->weight_cache_bytes > ctx->weight_cache_max_bytes ||
         ctx->weight_cache_map.size() > ctx->weight_cache_max_entries) {
-      weight_cache_evict_locked(ctx, 0u, t);
+      weight_cache_evict_locked(ctx, 0u, t, 0u);
     }
   }
   return t;

@@ -557,6 +557,7 @@ struct ob_context {
   std::vector<ob::ImmutableWeightRegion> immutable_weight_regions;
   uint64_t next_immutable_region_gen = 1u;
   size_t simulated_mem_available_bytes = 0; // Optional test override for LMKD budget verification
+  bool simulated_mem_available_set = false; // Allows explicitly simulating MemAvailable == 0 kB
   uint64_t weight_cache_hits = 0;
   uint64_t weight_cache_misses = 0;
   uint64_t weight_cache_evictions = 0;

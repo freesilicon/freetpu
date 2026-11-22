@@ -56,6 +56,7 @@ struct edgetpu_env_config {
     bool         has_priority          = false;
     uint8_t      perf_mode             = 0; // 0 -> libopenbuenos default, 1..5 = DVFS perf tier
     bool         has_perf_mode         = false;
+    bool         immutable_weights     = false; // Explicit opt-in (OPENBUENOS_IMMUTABLE_WEIGHTS=1) when caller guarantees no direct tensor->data writes
     const char * dive_interp_path      = EDGETPU_DEFAULT_DIVE_INTERP_PATH;
 };
 
@@ -89,6 +90,9 @@ static edgetpu_env_config load_env_config() {
     }
     if (const char * v = std::getenv("OPENBUENOS_PACKED_Q8")) {
         cfg.packed_q8 = (std::atoi(v) != 0);
+    }
+    if (const char * v = std::getenv("OPENBUENOS_IMMUTABLE_WEIGHTS")) {
+        cfg.immutable_weights = (std::atoi(v) != 0);
     }
     if (const char * v = std::getenv("OPENBUENOS_BATCH_SIBLINGS")) {
         cfg.batch_siblings = (std::atoi(v) != 0);
@@ -667,7 +671,11 @@ struct ggml_backend_edgetpu_context {
 
 static void ensure_immutable_weight_buffer(ggml_backend_edgetpu_context * ctx,
                                            ggml_backend_buffer_t          buffer) {
-    if (!ctx || !ctx->ob_ctx || !is_edgetpu_buffer(buffer)) {
+    // EDGETPU buffers are host-accessible (is_host() == true), so ggml_backend_tensor_copy()
+    // from device-only buffers can write directly into dst->data without invoking our buffer
+    // callbacks. Only register immutable O(1) regions when the caller explicitly opts in via
+    // OPENBUENOS_IMMUTABLE_WEIGHTS=1 and the buffer is EdgeTPU-owned weight storage.
+    if (!ctx || !ctx->ob_ctx || !ctx->env.immutable_weights || !is_edgetpu_buffer(buffer)) {
         return;
     }
     auto * bctx = static_cast<ggml_backend_edgetpu_buffer_context *>(buffer->context);

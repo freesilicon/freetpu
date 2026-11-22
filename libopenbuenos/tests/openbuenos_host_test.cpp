@@ -4013,8 +4013,12 @@ void test_phase7_cycle2_regressions() {
     wg = -100;
     wd = 100;
     ob::simulate_swiglu_hw_exact(&x, d, &y);
-    // Negative gate clamps cleanly within INT8 without overflow UB
-    CHECK(y >= -128 && y <= 127);
+    // Verify INT32_MAX bias + positive MAC does not invoke signed int32 overflow UB.
+    int32_t bg_max = INT32_MAX, bu_max = INT32_MAX, bd_max = INT32_MAX;
+    d.bg_h = &bg_max; d.bu_h = &bu_max; d.bd_n = &bd_max;
+    wg = 100; wu = 100; wd = 100;
+    ob::simulate_swiglu_hw_exact(&x, d, &y);
+    CHECK(y == 127);
   }
 
   // 5. Mixed chained + tail fallback SwiGLU profile must not double-count fallback HW/wall time
@@ -4178,6 +4182,13 @@ void test_phase7_cycle3_regressions() {
     CHECK(ob_gemm_matmul_f32_quant_batch(ctx, a.data(), 1u, K, &warm_job, 1u, &ws) == OB_OK);
     CHECK(ctx->weight_cache_hits == hits_before + 1u);
     CHECK(ctx->weight_cache_bytes <= 16ULL * 1024u * 1024u);
+
+    // Explicit MemAvailable == 0 kB MUST still apply the pressure cap (1 MiB floor), not skip it!
+    ctx->simulated_mem_available_bytes = 0u;
+    ctx->simulated_mem_available_set = true;
+    CHECK(ob::compute_weight_cache_budget_bytes(ctx) == 1ULL * 1024u * 1024u);
+    ctx->simulated_mem_available_set = false;
+
     ob_context_destroy(ctx);
   }
 

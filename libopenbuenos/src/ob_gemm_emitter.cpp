@@ -7329,15 +7329,15 @@ void simulate_swiglu_hw_exact(const int8_t* x_mk,
     const int8_t* x_row = x_mk + static_cast<size_t>(m) * K;
     int8_t* p_row = q_prod.data() + static_cast<size_t>(m) * H;
     for (uint32_t h = 0u; h < H; ++h) {
-      int32_t acc_g = d.bg_h ? d.bg_h[h] : 0;
-      int32_t acc_u = d.bu_h ? d.bu_h[h] : 0;
+      int64_t acc_g = d.bg_h ? static_cast<int64_t>(d.bg_h[h]) : 0LL;
+      int64_t acc_u = d.bu_h ? static_cast<int64_t>(d.bu_h[h]) : 0LL;
       const int8_t* wg_row = d.wg_hk ? (d.wg_hk + static_cast<size_t>(h) * K) : nullptr;
       const int8_t* wu_row = d.wu_hk ? (d.wu_hk + static_cast<size_t>(h) * K) : nullptr;
       if (wg_row && wu_row) {
         for (uint32_t k = 0u; k < K; ++k) {
-          const int32_t xv = static_cast<int32_t>(x_row[k]);
-          acc_g += xv * static_cast<int32_t>(wg_row[k]);
-          acc_u += xv * static_cast<int32_t>(wu_row[k]);
+          const int64_t xv = static_cast<int64_t>(x_row[k]);
+          acc_g += xv * static_cast<int64_t>(wg_row[k]);
+          acc_u += xv * static_cast<int64_t>(wu_row[k]);
         }
       }
       const int32_t q_g = quant_clip_i8_f32(static_cast<float>(acc_g) * m_g);
@@ -7353,11 +7353,11 @@ void simulate_swiglu_hw_exact(const int8_t* x_mk,
     const int8_t* p_row = q_prod.data() + static_cast<size_t>(m) * H;
     int8_t* y_row = y_mn + static_cast<size_t>(m) * N;
     for (uint32_t n = 0u; n < N; ++n) {
-      int32_t acc_d = d.bd_n ? d.bd_n[n] : 0;
+      int64_t acc_d = d.bd_n ? static_cast<int64_t>(d.bd_n[n]) : 0LL;
       const int8_t* wd_row = d.wd_nh ? (d.wd_nh + static_cast<size_t>(n) * H) : nullptr;
       if (wd_row) {
         for (uint32_t h = 0u; h < H; ++h) {
-          acc_d += static_cast<int32_t>(p_row[h]) * static_cast<int32_t>(wd_row[h]);
+          acc_d += static_cast<int64_t>(p_row[h]) * static_cast<int64_t>(wd_row[h]);
         }
       }
       y_row[n] = static_cast<int8_t>(
