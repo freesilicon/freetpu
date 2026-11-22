@@ -44,27 +44,27 @@ python3 bench/freetpu_bench.py \
   --markdown runs/comms-wired.md
 ```
 
-*(If testing over an `adb` USB bridge instead of native USB-Ethernet, run `adb -s <node2_serial> forward tcp:50055 tcp:50055` and point `--comms-host 127.0.0.1 --comms-port 50055`.)*
+*(If testing over an `adb` USB bridge instead of native USB-Ethernet, run `adb -s <node2_serial> forward tcp:50055 tcp:50055` for a desktop driver—and also run `adb -s <node1_serial> reverse tcp:50055 tcp:50055` when Node 1 is a second Pixel—then point the driver at `--comms-host 127.0.0.1 --comms-port 50055`.)*
 
 ### 3. Split-Layer Dual-Phone `llama.cpp` (`GGML_EDGETPU=ON` + `GGML_RPC=ON`)
 
-> **Security Prerequisites (`rpc-server`)**: Upstream `llama.cpp` `rpc-server` has **no client authentication or transport encryption** and runs as root here to access `/dev/edgetpu-soc`. Even when bound to `127.0.0.1` over ADB forwarding/reverse, loopback listeners are reachable by other local apps on both Node 2 and Node 1 (and by local processes on the host). **Run this recipe only on dedicated, single-purpose test devices with only trusted apps and a trusted host**, and optionally enforce UID filtering on `lo` (shown below) before launching the server. Only bind directly to a USB-Ethernet interface (e.g. `-H 192.168.77.2`) on an **isolated, air-gapped lab test device** with `iptables` rules restricting TCP `50052` exclusively to the intended peer IP (`192.168.77.1`).
+> **Security Prerequisites (`ggml-rpc-server`)**: Upstream `llama.cpp` `ggml-rpc-server` has **no client authentication or transport encryption** and runs as root here to access `/dev/edgetpu-soc`. Even when bound to `127.0.0.1` over ADB forwarding/reverse, loopback listeners are reachable by other local apps on both Node 2 and Node 1 (and by local processes on the host). **Run this recipe only on dedicated, single-purpose test devices with only trusted apps and a trusted host**, and optionally enforce UID filtering on `lo` (shown below) before launching the server. Only bind directly to a USB-Ethernet interface (e.g. `-H 192.168.77.2`) on an **isolated, air-gapped lab test device** with `iptables` rules restricting TCP `50052` exclusively to the intended peer IP (`192.168.77.1`).
 
 **Prerequisites (Build & Stage Static Binaries + Local Artifacts on Both Phones):**
 
 Requires upstream `ggml-org/llama.cpp` (`b12608`, see [`llama-cpp-edgetpu/README.md`](../llama-cpp-edgetpu/README.md)), Android NDK r26, your locally extracted `dive_interp_rv64.bin`, and a quantized `.gguf` model on your host.
 
 ```bash
-# 1. Cross-build static Android ARM64 base tree, then enable GGML_RPC=ON for rpc-server + llama-bench
+# 1. Cross-build static Android ARM64 base tree, then reconfigure existing build dir with GGML_RPC=ON
 ./llama-cpp-edgetpu/build.sh android
-cmake -B llama-cpp-edgetpu/build-android-arm64 -DGGML_RPC=ON
-cmake --build llama-cpp-edgetpu/build-android-arm64 --target rpc-server llama-bench -j
+cmake llama-cpp-edgetpu/build-android-arm64 -DGGML_RPC=ON
+cmake --build llama-cpp-edgetpu/build-android-arm64 --target ggml-rpc-server llama-bench -j
 
-# 2. Stage static rpc-server + DIVE interpreter on Node 2 (zero vendor .so; libopenbuenos is statically linked)
+# 2. Stage static ggml-rpc-server + DIVE interpreter on Node 2 (zero vendor .so; libopenbuenos is statically linked)
 adb -s <node2_serial> shell "mkdir -p /data/local/tmp/tpu_open_stack"
-adb -s <node2_serial> push llama-cpp-edgetpu/build-android-arm64/bin/rpc-server /data/local/tmp/tpu_open_stack/rpc-server
+adb -s <node2_serial> push llama-cpp-edgetpu/build-android-arm64/bin/ggml-rpc-server /data/local/tmp/tpu_open_stack/ggml-rpc-server
 adb -s <node2_serial> push /path/to/local/dive_interp_rv64.bin /data/local/tmp/tpu_open_stack/dive_interp_rv64.bin
-adb -s <node2_serial> shell "chmod +x /data/local/tmp/tpu_open_stack/rpc-server"
+adb -s <node2_serial> shell "chmod +x /data/local/tmp/tpu_open_stack/ggml-rpc-server"
 
 # 3. Stage static llama-bench + DIVE interpreter + your local .gguf model on Node 1
 adb -s <node1_serial> shell "mkdir -p /data/local/tmp/tpu_open_stack /data/local/tmp/models"
@@ -89,7 +89,7 @@ adb -s <node2_serial> shell "su -c 'iptables -N FREETPU_RPC_OUT 2>/dev/null || i
 # Node 2: bind clean-room EDGETPU RPC server to loopback ONLY (zero Google .so); leave running in Terminal 1
 adb -s <node2_serial> shell "su -c 'OPENBUENOS_DIVE_INTERP_PATH=/data/local/tmp/tpu_open_stack/dive_interp_rv64.bin \
   OPENBUENOS_PERF_MODE=5 \
-  /data/local/tmp/tpu_open_stack/rpc-server -d EDGETPU -H 127.0.0.1 -p 50052 -t 4'"
+  /data/local/tmp/tpu_open_stack/ggml-rpc-server -d EDGETPU -H 127.0.0.1 -p 50052 -t 4'"
 ```
 
 **Terminal 2 — Create ADB Tunnels & Run Split-Layer Benchmark on Node 1:**
@@ -130,5 +130,5 @@ adb -s <node1_serial> shell "su -c 'OPENBUENOS_DIVE_INTERP_PATH=/data/local/tmp/
 ## Clean-Room & Topology Checks
 
 - **Verify zero vendor `.so`s on RPC server**: read `/proc/$pid/maps` inside the device shell without host subshell expansion or predictable `/tmp` files, and verify the read succeeded before asserting zero vendor matches:
-  `maps=$(adb -s <node2_serial> shell 'su -c "pid=\$(pidof -s rpc-server) && [ -n \"\$pid\" ] && cat /proc/\$pid/maps"') && [ -n "$maps" ] && ! printf '%s\n' "$maps" | grep -iE "edgetpu|darwinn|tachyon|libgxp|tflite|tensorflow|/vendor/|google"`
+  `maps=$(adb -s <node2_serial> shell 'su -c "pid=\$(pidof -s ggml-rpc-server) && [ -n \"\$pid\" ] && cat /proc/\$pid/maps"') && [ -n "$maps" ] && ! printf '%s\n' "$maps" | grep -iE "edgetpu|darwinn|tachyon|libgxp|tflite|tensorflow|/vendor/|google"`
 - **Avoid USB 2.0 hubs**: Check link speed (`ioreg` on macOS or `lsusb -t` on Linux) — USB 2.0 (`480 Mbps`) turns weight streaming and PP activation hops into the primary bottleneck.

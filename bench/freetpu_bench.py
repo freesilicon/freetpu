@@ -1089,6 +1089,7 @@ def _format_colab_recovery_hint(
     session_name: str,
     leaked_endpoints: Sequence[str],
     orphaned_endpoints: Sequence[str],
+    unattributed_endpoints: Sequence[str] = (),
 ) -> str:
     sessions_cmd = shlex.join([colab_bin, "--auth", auth, "--config", str(iso_cfg), "sessions"])
     stop_cmd = shlex.join([colab_bin, "--auth", auth, "--config", str(iso_cfg), "stop", "-s", session_name])
@@ -1097,20 +1098,43 @@ def _format_colab_recovery_hint(
     if orphaned_endpoints:
         ep_list = ", ".join(orphaned_endpoints)
         parts.append(
-            f"Orphaned `[?]` endpoint(s) [{ep_list}] have no local session mapping (so `colab stop -s {session_name}` "
-            f"will no-op); terminate them in Colab (https://colab.research.google.com -> Runtime -> Manage sessions) "
-            f"or via Colab's unassign endpoint (`POST /tun/m/unassign/<endpoint>`), then confirm removal with `{sessions_cmd}`."
+            f"Confirmed owned orphaned `[?]` endpoint(s) [{ep_list}] have no local session mapping "
+            f"(so `colab stop -s {session_name}` will no-op); terminate them in Colab "
+            f"(https://colab.research.google.com -> Runtime -> Manage sessions) or via Colab's "
+            f"unassign endpoint (`POST /tun/m/unassign/<endpoint>`), then confirm removal with `{sessions_cmd}`."
         )
-    if mapped_leaked or not orphaned_endpoints:
+    if unattributed_endpoints:
+        unattr_list = ", ".join(unattributed_endpoints)
+        parts.append(
+            f"Unattributed `[?]` endpoint(s) [{unattr_list}] appeared without an established session mapping "
+            f"(could belong to this run or another concurrent workload on the same account); "
+            f"inspect `{sessions_cmd}` and Colab Runtime -> Manage sessions to confirm ownership before terminating any runtime."
+        )
+    if mapped_leaked or (not orphaned_endpoints and not unattributed_endpoints):
         parts.append(
             f"Session config preserved at {iso_cfg}; retry `{stop_cmd}` "
-            f"(or terminate via Colab Runtime -> Manage sessions) and verify with `{sessions_cmd}`."
+            f"(or inspect Colab Runtime -> Manage sessions) and verify with `{sessions_cmd}`."
         )
     return " ".join(parts)
 
 
 class _ColabSigtermInterrupt(BaseException):
     """Raised when SIGTERM arrives during a retained Colab TPU run."""
+
+
+def _default_colab_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess[str]:
+    """Run a Colab CLI command non-interactively so OAuth prompts cannot hang on hidden stdin."""
+    env = os.environ.copy()
+    env.setdefault("COLAB_CLI_REQUEST_TIMEOUT", "60")
+    env.setdefault("COLAB_CLI_ASSIGN_RETRIES", "1")
+    return subprocess.run(
+        list(cmd),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
 
 
 def _verify_and_stop_session(
@@ -1130,26 +1154,25 @@ def _verify_and_stop_session(
     mapping stays intact in `iso_cfg` until we query `colab sessions`, capture
     the backend runtime endpoint, invoke `colab stop -s`, and verify that the
     endpoint no longer appears under either `[session_name]` or `[?]`.
-    When this run's named endpoint is known, teardown verification is scoped to
-    that endpoint so unrelated concurrent `[?]` sessions are reported as
-    `unattributed_endpoints` rather than false-positive leaks.
+    Only endpoints mapped to `session_name` are classified as confirmed leaks;
+    newly appearing `[?]` endpoints without established ownership are recorded
+    as `unattributed_endpoints` so unrelated concurrent runtimes are never
+    recommended for blind termination.
     """
     before = runner([colab_bin, "--auth", auth, "--config", str(iso_cfg), "sessions"])
     before_ok = before.returncode == 0
     before_entries = _parse_colab_sessions(before.stdout) if before_ok else []
     tracked_endpoints: Set[str] = {ep for name, ep in before_entries if name == session_name}
     if before_ok and pre_endpoints is not None:
-        new_orphans: Set[str] = {
+        new_unattributed: Set[str] = {
             ep for name, ep in before_entries if name == "?" and ep not in pre_endpoints
         }
     elif before_ok and session_was_ready and not tracked_endpoints:
-        new_orphans = {ep for name, ep in before_entries if name == "?"}
+        new_unattributed = {ep for name, ep in before_entries if name == "?"}
     else:
-        new_orphans = set()
+        new_unattributed = set()
 
-    observed_endpoint = sorted(tracked_endpoints)[0] if tracked_endpoints else (
-        sorted(new_orphans)[0] if new_orphans else None
-    )
+    observed_endpoint = sorted(tracked_endpoints)[0] if tracked_endpoints else None
 
     needs_stop = (
         (not before_ok)
@@ -1158,17 +1181,14 @@ def _verify_and_stop_session(
         or session_was_ready
     )
     if not needs_stop:
-        if new_orphans:
-            orphans_sorted = sorted(new_orphans)
-            return False, observed_endpoint, orphans_sorted, orphans_sorted, []
-        return True, observed_endpoint, [], [], []
+        # Allocation did not create a named session for this run (e.g. HTTP 412 refusal);
+        # keep any concurrently started `[?]` assignments unattributed so fallback is not blocked.
+        return True, observed_endpoint, [], [], sorted(new_unattributed)
 
     stop_res = runner([colab_bin, "--auth", auth, "--config", str(iso_cfg), "stop", "-s", session_name])
     recheck = runner([colab_bin, "--auth", auth, "--config", str(iso_cfg), "sessions"])
     if recheck.returncode != 0:
-        leaked_fallback = sorted(tracked_endpoints) if tracked_endpoints else sorted(new_orphans)
-        orphans_fallback = [] if tracked_endpoints else sorted(new_orphans)
-        return False, observed_endpoint, leaked_fallback, orphans_fallback, []
+        return False, observed_endpoint, sorted(tracked_endpoints), [], sorted(new_unattributed)
 
     recheck_entries = _parse_colab_sessions(recheck.stdout)
     recheck_endpoints: Set[str] = {ep for _, ep in recheck_entries}
@@ -1179,7 +1199,7 @@ def _verify_and_stop_session(
     unattributed: Set[str] = set()
 
     if tracked_endpoints:
-        # This run's endpoint is known: verify that endpoint specifically.
+        # This run's endpoint ownership is confirmed: verify that endpoint specifically.
         for ep in tracked_endpoints:
             if ep in recheck_endpoints or _token_present(recheck.stdout, ep):
                 leaked.add(ep)
@@ -1191,25 +1211,25 @@ def _verify_and_stop_session(
             elif name == "?" and pre_endpoints is not None and ep not in pre_endpoints and ep not in tracked_endpoints:
                 unattributed.add(ep)
     else:
-        # Named endpoint was never observed: fail closed on newly appearing `[?]` runtimes.
-        for ep in new_orphans:
+        # No named endpoint was captured: keep `[?]` assignments unattributed (unconfirmed ownership),
+        # while marking teardown unverified because this run reached ready/interrupted state.
+        for ep in new_unattributed:
             if ep in recheck_endpoints or _token_present(recheck.stdout, ep):
-                leaked.add(ep)
-                if ep in recheck_orphans:
-                    orphaned.add(ep)
+                unattributed.add(ep)
         for name, ep in recheck_entries:
             if name == session_name:
                 leaked.add(ep)
             elif name == "?" and pre_endpoints is not None and ep not in pre_endpoints:
-                leaked.add(ep)
-                orphaned.add(ep)
+                unattributed.add(ep)
             elif name == "?" and pre_endpoints is None and session_was_ready:
-                leaked.add(ep)
-                orphaned.add(ep)
+                unattributed.add(ep)
 
     name_still_listed = _session_still_listed(recheck.stdout, session_name)
     if leaked or name_still_listed:
         return False, observed_endpoint, sorted(leaked), sorted(orphaned), sorted(unattributed)
+
+    if not tracked_endpoints and unattributed:
+        return False, observed_endpoint, [], [], sorted(unattributed)
 
     if stop_res.returncode != 0 and not tracked_endpoints and pre_endpoints is None and recheck_entries:
         return False, observed_endpoint, [], [], sorted(unattributed)
@@ -1242,12 +1262,7 @@ def run_colab_tpu_suites(
         return {}
 
     if runner is None:
-        def _default_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess[str]:
-            env = os.environ.copy()
-            env.setdefault("COLAB_CLI_REQUEST_TIMEOUT", "60")
-            env.setdefault("COLAB_CLI_ASSIGN_RETRIES", "1")
-            return subprocess.run(list(cmd), capture_output=True, text=True, env=env, check=False)
-        runner = _default_runner
+        runner = _default_colab_runner
 
     tmp_dir: Optional[Path] = None
     if config_path is None:
@@ -1287,7 +1302,13 @@ def run_colab_tpu_suites(
         colab_cli_version = _check_colab_cli_version(runner, colab_bin)
         usage_res = runner([colab_bin, "--auth", auth, "--config", str(iso_cfg), "usage"])
         if usage_res.returncode != 0:
-            raise RuntimeError(f"colab usage preflight failed: {usage_res.stderr.strip()}")
+            detail = (usage_res.stderr or usage_res.stdout).strip()[-600:]
+            signin_hint = (
+                f"Run `{shlex.join([colab_bin, '--auth', 'oauth2', 'usage'])}` interactively first to complete OAuth sign-in."
+                if auth == "oauth2"
+                else "Ensure ADC credentials are valid (e.g. `gcloud auth application-default login` with Colab scopes) or switch to `--colab-auth oauth2` after interactive sign-in."
+            )
+            raise RuntimeError(f"colab usage preflight failed (non-interactive): {detail}. {signin_hint}")
 
         attempts: List[Dict[str, Any]] = []
         for idx, (tpu, sess, cmd) in enumerate(planned):
@@ -1352,7 +1373,7 @@ def run_colab_tpu_suites(
                     except BaseException:
                         preserve_tmp_dir = True
                         recovery_hint = _format_colab_recovery_hint(
-                            colab_bin, auth, iso_cfg, sess, leaked_endpoints, orphaned_endpoints
+                            colab_bin, auth, iso_cfg, sess, leaked_endpoints, orphaned_endpoints, unattributed_endpoints
                         )
                         print(
                             f"[freetpu-bench] WARNING: Colab teardown interrupted for session={sess}. {recovery_hint}",
@@ -1362,12 +1383,13 @@ def run_colab_tpu_suites(
                     if not teardown_verified:
                         preserve_tmp_dir = True
                         recovery_hint = _format_colab_recovery_hint(
-                            colab_bin, auth, iso_cfg, sess, leaked_endpoints, orphaned_endpoints
+                            colab_bin, auth, iso_cfg, sess, leaked_endpoints, orphaned_endpoints, unattributed_endpoints
                         )
                         print(
                             f"[freetpu-bench] WARNING: Colab teardown unverified for session={sess} "
                             f"endpoint={endpoint} leaked_endpoints={leaked_endpoints} "
-                            f"orphaned_endpoints={orphaned_endpoints}. {recovery_hint}",
+                            f"orphaned_endpoints={orphaned_endpoints} "
+                            f"unattributed_endpoints={unattributed_endpoints}. {recovery_hint}",
                             file=sys.stderr,
                         )
                     elif unattributed_endpoints:
@@ -2217,10 +2239,11 @@ def run_self_test() -> int:
             runner=_mock_orphan_leak_runner,
         )
     assert orphan_res["colab_meta"]["teardown_verified"] is False
-    assert orphan_res["colab_meta"]["leaked_endpoints"] == ["m-s-leaked-01"]
-    assert orphan_res["colab_meta"]["orphaned_endpoints"] == ["m-s-leaked-01"]
+    assert orphan_res["colab_meta"]["leaked_endpoints"] == []
+    assert orphan_res["colab_meta"]["orphaned_endpoints"] == []
+    assert orphan_res["colab_meta"]["unattributed_endpoints"] == ["m-s-leaked-01"]
     hint_text = orphan_res["colab_meta"]["recovery_hint"]
-    assert "m-s-leaked-01" in hint_text and "Manage sessions" in hint_text and "no-op" in hint_text
+    assert "m-s-leaked-01" in hint_text and "confirm ownership before" in hint_text
     assert "retry `" not in hint_text
     assert "teardown unverified" in warn_buf.getvalue()
     orphan_rec = Path(orphan_res["colab_meta"]["recovery_config"])
@@ -2436,8 +2459,8 @@ def run_self_test() -> int:
         assert rc_leak == 2, rc_leak
         e2e_report = json.loads(e2e_out.getvalue())
         assert e2e_report["colab_meta"]["teardown_verified"] is False
-        assert e2e_report["colab_meta"]["orphaned_endpoints"] == ["m-s-orphan-e2e"]
-        assert "m-s-orphan-e2e" in e2e_err.getvalue() and "Manage sessions" in e2e_err.getvalue()
+        assert e2e_report["colab_meta"]["unattributed_endpoints"] == ["m-s-orphan-e2e"]
+        assert "m-s-orphan-e2e" in e2e_err.getvalue() and "confirm ownership before" in e2e_err.getvalue()
     finally:
         shutil.rmtree(e2e_dir, ignore_errors=True)
 
@@ -2610,6 +2633,96 @@ def run_self_test() -> int:
         assert sig_state["second_sent"] is True
         assert sig_state["live"] is False
         assert signal.getsignal(signal.SIGTERM) == orig_handler
+
+    # 4k. Refused v6e allocation while a concurrent `[?]` runtime appears MUST keep it unattributed and fall back to v5e
+    ref_calls: List[List[str]] = []
+    ref_state = {"v6e_tried": False, "v5e_live": False}
+
+    def _mock_refused_with_concurrent_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        ref_calls.append(list(cmd))
+        if cmd[-1] == "version":
+            return subprocess.CompletedProcess(cmd, 0, "Version: 0.8.0\n", "")
+        if "usage" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "100.0\n", "")
+        if "stop" in cmd:
+            ref_state["v5e_live"] = False
+            return subprocess.CompletedProcess(cmd, 0, "[colab] Session terminated.\n", "")
+        if "sessions" in cmd:
+            lines: List[str] = []
+            if ref_state["v6e_tried"]:
+                # Another workload started concurrently under the same account -> `[?]`
+                lines.append("[?] m-s-other-workload | Hardware: T4 | Shape: Standard | Variant: GPU")
+            if ref_state["v5e_live"]:
+                run_calls = [c for c in ref_calls if "run" in c]
+                sname = run_calls[-1][run_calls[-1].index("-s") + 1]
+                lines.append(f"[{sname}] m-s-v5e-fallback | Hardware: V5E1 | Shape: Standard | Variant: TPU")
+            out_s = ("\n".join(lines) + "\n") if lines else "[colab] No active sessions found on server.\n"
+            return subprocess.CompletedProcess(cmd, 0, out_s, "")
+        if "V6E1" in cmd:
+            ref_state["v6e_tried"] = True
+            return subprocess.CompletedProcess(cmd, 1, "", "HTTP 412 REASON_NO_BACKENDS: v6e1 unavailable")
+        ref_state["v5e_live"] = True
+        payload = {"schema": SCHEMA_VERSION, "compute": {"peak_bf16_tflops": 179.36}}
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            f"{BENCH_JSON_BEGIN}\n{json.dumps(payload)}\n{BENCH_JSON_END}\n",
+            "[colab] Session READY.\n",
+        )
+
+    ref_err = StringIO()
+    with redirect_stderr(ref_err):
+        ref_res = run_colab_tpu_suites(
+            suites=["compute"],
+            quick=True,
+            colab_bin="colab",
+            auth="adc",
+            tpu_order=("v6e1", "v5e1"),
+            config_path=None,
+            timeout_s=120.0,
+            runner=_mock_refused_with_concurrent_runner,
+        )
+    assert ref_res["colab_meta"]["tpu"] == "v5e1"
+    assert ref_res["colab_meta"]["teardown_verified"] is True
+    assert ref_res["colab_meta"]["leaked_endpoints"] == []
+    assert ref_res["colab_meta"]["attempts"][0]["unattributed_endpoints"] == ["m-s-other-workload"]
+    assert "terminate" not in ref_err.getvalue().lower() or "not terminated" in ref_err.getvalue().lower()
+
+    # 4l. Non-interactive `_default_colab_runner` MUST pass stdin=DEVNULL so OAuth prompts cannot hang
+    oauth_dir = Path(tempfile.mkdtemp(prefix="freetpu-bench-oauth-"))
+    try:
+        oauth_stub = oauth_dir / "fake-colab-oauth"
+        oauth_stub.write_text(
+            f"#!{sys.executable}\n"
+            "import sys\n"
+            "args = sys.argv[1:]\n"
+            "if args and args[-1] == 'version':\n"
+            "    print('Version: 0.8.0')\n"
+            "elif 'usage' in args:\n"
+            "    print('Open https://accounts.google.com/... and enter code:')\n"
+            "    input('Enter verification code: ')\n",
+            encoding="utf-8",
+        )
+        os.chmod(oauth_stub, 0o700)
+        t_oauth = time.monotonic()
+        try:
+            run_colab_tpu_suites(
+                suites=["compute"],
+                quick=True,
+                colab_bin=str(oauth_stub),
+                auth="oauth2",
+                tpu_order=("v5e1",),
+                config_path=oauth_dir / "sessions.json",
+                timeout_s=30.0,
+                runner=_default_colab_runner,
+            )
+        except RuntimeError as exc:
+            assert "interactively" in str(exc) and "oauth2" in str(exc), str(exc)
+        else:  # pragma: no cover
+            raise AssertionError("Expected RuntimeError when OAuth prompt hits EOF on DEVNULL stdin")
+        assert time.monotonic() - t_oauth < 5.0
+    finally:
+        shutil.rmtree(oauth_dir, ignore_errors=True)
 
     # 5. Verify this script compiles and loads under a `colab run` executable prelude
     src_text = Path(__file__).read_text(encoding="utf-8")
