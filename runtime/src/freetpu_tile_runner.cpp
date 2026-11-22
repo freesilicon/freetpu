@@ -98,11 +98,47 @@ uint16_t fp32_to_fp16(float f) {
   uint32_t bits = 0u;
   std::memcpy(&bits, &f, sizeof(bits));
   uint32_t sign = (bits >> 16) & 0x8000u;
-  int32_t exp = static_cast<int32_t>((bits >> 23) & 0xFFu) - 127 + 15;
+  uint32_t exp_u = (bits >> 23) & 0xFFu;
   uint32_t mant = bits & 0x7FFFFFu;
-  if (exp <= 0) return static_cast<uint16_t>(sign);
-  if (exp >= 31) return static_cast<uint16_t>(sign | 0x7C00u);
-  return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) | (mant >> 13));
+
+  if (exp_u == 0xFFu) {
+    if (mant == 0u) return static_cast<uint16_t>(sign | 0x7C00u);
+    uint32_t nan_mant = mant >> 13;
+    if (nan_mant == 0u) nan_mant = 1u;
+    return static_cast<uint16_t>(sign | 0x7E00u | nan_mant);
+  }
+
+  int32_t exp = static_cast<int32_t>(exp_u) - 127 + 15;
+  if (exp >= 31) {
+    return static_cast<uint16_t>(sign | 0x7C00u);
+  }
+
+  if (exp <= 0) {
+    if (exp < -10) {
+      return static_cast<uint16_t>(sign);
+    }
+    uint32_t sig = mant | 0x800000u;
+    uint32_t shift = static_cast<uint32_t>(14 - exp);
+    uint32_t sub_mant = sig >> shift;
+    uint32_t rem = sig & ((1u << shift) - 1u);
+    uint32_t half = 1u << (shift - 1u);
+    if (rem > half || (rem == half && (sub_mant & 1u) != 0u)) {
+      ++sub_mant;
+    }
+    return static_cast<uint16_t>(sign | sub_mant);
+  }
+
+  uint32_t h_mant = mant >> 13;
+  uint32_t rem = mant & 0x1FFFu;
+  if (rem > 0x1000u || (rem == 0x1000u && (h_mant & 1u) != 0u)) {
+    ++h_mant;
+    if (h_mant == 0x0400u) {
+      h_mant = 0u;
+      ++exp;
+      if (exp >= 31) return static_cast<uint16_t>(sign | 0x7C00u);
+    }
+  }
+  return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) | h_mant);
 }
 
 float fp16_to_fp32(uint16_t h) {
@@ -111,7 +147,17 @@ float fp16_to_fp32(uint16_t h) {
   uint32_t mant = h & 0x03FFu;
   uint32_t bits = 0u;
   if (exp == 0u) {
-    bits = sign;
+    if (mant == 0u) {
+      bits = sign;
+    } else {
+      int32_t fexp = 127 - 14;
+      while ((mant & 0x0400u) == 0u) {
+        mant <<= 1u;
+        --fexp;
+      }
+      mant &= 0x03FFu;
+      bits = sign | (static_cast<uint32_t>(fexp) << 23) | (mant << 13);
+    }
   } else if (exp == 31u) {
     bits = sign | 0x7F800000u | (mant << 13);
   } else {

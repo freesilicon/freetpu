@@ -425,10 +425,10 @@ class OpenBuenosSession:
     ) -> Tuple[np.ndarray, ObInvokeStats]:
         a = np.ascontiguousarray(a_mk, dtype=np.int8)
         b = np.ascontiguousarray(b_nk, dtype=np.int8)
-        m_dim, k_dim = a.shape
-        n_dim, b_k = b.shape
         if a.ndim != 2 or b.ndim != 2:
             raise ValueError(f"Expected 2D tensors, got A={a.shape}, B_nk={b.shape}")
+        m_dim, k_dim = a.shape
+        n_dim, b_k = b.shape
         if b_k != k_dim:
             raise ValueError(f"Shape mismatch: A={a.shape}, B_nk={b.shape}")
         bias_arr: Optional[np.ndarray] = None
@@ -466,6 +466,8 @@ class OpenBuenosSession:
         activations: Sequence[int],
     ) -> Tuple[list[np.ndarray], ObInvokeStats]:
         a = np.ascontiguousarray(a_mk, dtype=np.float32)
+        if a.ndim != 2:
+            raise ValueError(f"Expected 2D [M, K] input tensor, got shape {a.shape}")
         m_dim, k_dim = a.shape
         k_pad = ((k_dim + OB_QK8_0 - 1) // OB_QK8_0) * OB_QK8_0
         if k_pad != k_dim:
@@ -481,11 +483,16 @@ class OpenBuenosSession:
         outputs: list[np.ndarray] = []
         jobs = (ObGemmF32QuantJob * num_jobs)()
         for idx, (w_nk, act) in enumerate(zip(weights_nk_list, activations)):
-            q_bytes, w_k_pad = pack_f32_to_q8_0_bytes(w_nk)
+            w_arr = np.asarray(w_nk, dtype=np.float32)
+            if w_arr.ndim != 2:
+                raise ValueError(f"Expected 2D [N, K] weight array, got shape {w_arr.shape}")
+            if w_arr.shape[1] != k_dim:
+                raise ValueError(f"Weight K mismatch: expected {k_dim}, got {w_arr.shape[1]}")
+            q_bytes, w_k_pad = pack_f32_to_q8_0_bytes(w_arr)
             if w_k_pad != k_pad:
-                raise ValueError(f"Weight K mismatch: expected {k_dim}, got {w_nk.shape[1]}")
+                raise ValueError(f"Weight K mismatch: expected {k_dim}, got {w_arr.shape[1]}")
             packed_buffers.append(q_bytes)
-            n_dim = w_nk.shape[0]
+            n_dim = w_arr.shape[0]
             out_arr = np.zeros((m_dim, n_dim), dtype=np.float32)
             outputs.append(out_arr)
             jobs[idx].b_nk = ctypes.cast(ctypes.c_char_p(q_bytes), ctypes.c_void_p)
@@ -525,17 +532,28 @@ class OpenBuenosSession:
         zp_out: int,
         activation: int,
     ) -> bytes:
+        if m_dim <= 0 or k_dim <= 0 or n_dim <= 0:
+            raise ValueError(
+                f"synthesize_dgc0 dimensions must be positive, got m={m_dim}, k={k_dim}, n={n_dim}"
+            )
+        w = np.ascontiguousarray(weights_nk, dtype=np.int8)
+        if w.shape != (n_dim, k_dim):
+            raise ValueError(
+                f"weights_nk must have shape ({n_dim}, {k_dim}), got {w.shape}"
+            )
+        if bias_n is not None:
+            b = np.ascontiguousarray(bias_n, dtype=np.int32)
+            if b.shape != (n_dim,):
+                raise ValueError(
+                    f"bias_n must have shape ({n_dim},), got {b.shape}"
+                )
+        else:
+            b = np.zeros((n_dim,), dtype=np.int32)
         if not self.emitter_registered:
             raise RuntimeError(
                 "ob_gemm_synthesize_dgc0 requires a loaded RV64 DIVE interpreter image "
                 "(set OPENBUENOS_DIVE_INTERP_PATH)"
             )
-        w = np.ascontiguousarray(weights_nk, dtype=np.int8)
-        b = (
-            np.ascontiguousarray(bias_n, dtype=np.int32)
-            if bias_n is not None
-            else np.zeros((n_dim,), dtype=np.int32)
-        )
         desc = ObGemmDesc()
         desc.m_dim = m_dim
         desc.k_dim = k_dim

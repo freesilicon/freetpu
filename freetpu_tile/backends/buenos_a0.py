@@ -134,6 +134,83 @@ def _synthesize_mode_a_spline(
     }
 
 
+def _resolve_effective_mock(mock: Optional[bool], *, has_adb_serial: bool) -> bool:
+    """Resolve effective mock mode while preserving an explicit mock=False override."""
+    if mock is not None:
+        return bool(mock)
+    env_mock = os.environ.get("OPENBUENOS_MOCK", "").strip()
+    if env_mock == "1":
+        return True
+    if env_mock == "0":
+        return False
+    if has_adb_serial:
+        return False
+    return not Path("/dev/edgetpu-soc").exists()
+
+
+def _mode_a_fallback_reason(
+    act_name: str,
+    *,
+    s_in: float,
+    s_w: float,
+    s_out: float,
+    zp_out: int,
+    s_mid: float,
+    zp_mid: int,
+    domain: Tuple[float, float] = (-11.1, 11.1),
+) -> Optional[str]:
+    """Return a Mode-B fallback reason if Mode-A 0x640 would saturate or clip distinct outputs."""
+    from .cpu_ref import gelu_tanh_f32, silu_f32
+
+    if s_out <= 0.0 or s_mid <= 0.0 or s_in <= 0.0 or s_w <= 0.0:
+        return "non_positive_scale"
+    if zp_out < -128 or zp_out > 127:
+        return "zp_out_out_of_int8_range"
+
+    if act_name == "silu":
+        min_val = -0.2784645427610738
+        x_min = -1.2784645427610738
+        max_deriv = 1.10
+        act_scalar = lambda v: float(silu_f32(np.array([v], dtype=np.float64))[0])
+    elif act_name == "gelu":
+        min_val = -0.1700404099869362
+        x_min = -0.7517915241492578
+        max_deriv = 1.13
+        act_scalar = lambda v: float(gelu_tanh_f32(np.array([v], dtype=np.float64))[0])
+    else:
+        return f"unsupported_activation:{act_name}"
+
+    if (min_val / float(s_out) + float(zp_out)) < -128.0:
+        return "negative_output_saturation"
+
+    x_mid_lo = float(np.float32((-128 - zp_mid) * np.float32(s_mid)))
+    x_mid_hi = float(np.float32((127 - zp_mid) * np.float32(s_mid)))
+    lo_eff = max(float(domain[0]), x_mid_lo)
+    hi_eff = min(float(domain[1]), x_mid_hi)
+    if not (lo_eff < hi_eff):
+        return "empty_intermediate_domain"
+
+    # Guard positive preactivation clipping: hi_eff must already saturate output to INT8 +127
+    # so preactivations above hi_eff do not collapse distinct outputs to a sub-saturated code.
+    if (act_scalar(hi_eff) / float(s_out) + float(zp_out)) < 126.5:
+        return "positive_preactivation_clip"
+
+    # Guard negative preactivation clipping: all x < lo_eff collapse to lo_eff, so f(lo_eff)
+    # must already be within 0.5 output LSB of both f(-inf)=0 and the dip minimum if lo_eff > x_min.
+    f_lo = act_scalar(lo_eff)
+    neg_clip_delta = abs(f_lo)
+    if lo_eff > x_min:
+        neg_clip_delta = max(neg_clip_delta, abs(f_lo - min_val))
+    if (neg_clip_delta / float(s_out)) > 0.5:
+        return "negative_preactivation_clip"
+
+    # Guard intermediate quantization step error when s_mid > s_in * s_w.
+    if s_mid > float(s_in * s_w) and (max_deriv * (0.5 * s_mid) / float(s_out) + 0.05) >= 1.0:
+        return "intermediate_step_too_coarse"
+
+    return None
+
+
 def _eval_mode_b_on_acc_i32(
     acc_i32: np.ndarray,
     *,
@@ -247,14 +324,24 @@ def lower_buenos_a0(
     if act_name is not None:
         s_mid = max(float(qparams.s_in * qparams.s_w), float(qparams.s_out))
         zp_mid = int(qparams.zp_out)
-        # Mode-A 0x640 cannot represent saturating negative tails when min_val/s_out + zp_out < -128.
-        # Fall back to Mode-B two-stage INT32->FP32->INT8 requantization to preserve requested s_out/zp_out.
-        min_val = -0.2784645427610738 if act_name == "silu" else -0.1700404099869362
-        if (min_val / float(qparams.s_out) + qparams.zp_out) < -128.0:
+        # Mode-A 0x640 uses an 8-bit intermediate (s_mid, zp_mid) over [-11.1, 11.1].
+        # Fall back to Mode-B two-stage INT32->FP32->INT8 requantization whenever Mode-A
+        # would saturate negative outputs or clip preactivations that still yield distinct outputs.
+        fallback_reason = _mode_a_fallback_reason(
+            act_name,
+            s_in=float(qparams.s_in),
+            s_w=float(qparams.s_w),
+            s_out=float(qparams.s_out),
+            zp_out=int(qparams.zp_out),
+            s_mid=s_mid,
+            zp_mid=zp_mid,
+        )
+        if fallback_reason is not None:
             mode_b_meta = {
                 "activation": act_name,
                 "s_out": float(qparams.s_out),
                 "zp_out": int(qparams.zp_out),
+                "reason": fallback_reason,
             }
         else:
             spline_meta = _synthesize_mode_a_spline(
@@ -556,6 +643,7 @@ def run_buenos_a0(
     lowered = lower_buenos_a0(ir, shapes, quant=qparams)
 
     serial = adb_serial or os.environ.get("FREETPU_ADB_SERIAL", "").strip()
+    effective_mock = _resolve_effective_mock(mock, has_adb_serial=bool(serial))
     if dry_run:
         clean_meta = {k: v for k, v in lowered.summary.items() if k != "_spline_runtime"}
         return ExecutionResult(
@@ -572,7 +660,7 @@ def run_buenos_a0(
             metadata=clean_meta,
         )
 
-    if serial and mock is not True:
+    if serial and not effective_mock:
         res = _run_adb_rango(
             ir,
             inputs,
@@ -589,7 +677,7 @@ def run_buenos_a0(
 
     # Host ctypes libopenbuenos path (OPENBUENOS_MOCK=1 or local Linux /dev/edgetpu-soc)
     t0 = time.perf_counter()
-    with OpenBuenosSession(mock=mock, perf_mode=perf_mode) as sess:
+    with OpenBuenosSession(mock=effective_mock, perf_mode=perf_mode) as sess:
         hw_samples: List[float] = []
         last_stats = None
 

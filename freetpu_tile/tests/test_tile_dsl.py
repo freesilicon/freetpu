@@ -16,6 +16,20 @@ from freetpu_tile.backends.cpu_ref import quantize_w8a16_weights
 from freetpu_tile.colab_runner import CmdRes, run_colab_tile_kernel
 
 
+def _resolve_example_script(filename: str) -> Path:
+    """Resolve example script from a repo checkout or installed wheel package data."""
+    pkg_root = Path(__file__).resolve().parent.parent
+    repo_candidate = pkg_root.parent / "examples" / "tile_dsl" / filename
+    if repo_candidate.is_file():
+        return repo_candidate
+    packaged_candidate = pkg_root / "_packaged_examples" / filename
+    if packaged_candidate.is_file():
+        return packaged_candidate
+    raise FileNotFoundError(
+        f"Example fixture {filename!r} not found in {repo_candidate} or {packaged_candidate}"
+    )
+
+
 class TestTileDSLFrontendAndParity(unittest.TestCase):
     def setUp(self) -> None:
         os.environ["OPENBUENOS_MOCK"] = "1"
@@ -156,8 +170,7 @@ class TestTileDSLFrontendAndParity(unittest.TestCase):
             k_bad.lower(shapes={"a": (64, 300), "b": (300, 512)}, target="cloud_tpu_pallas")
 
     def test_colab_runner_isolated_config_and_fallback_offline(self) -> None:
-        repo_root = Path(__file__).resolve().parent.parent.parent
-        example = repo_root / "examples" / "tile_dsl" / "fused_gemm_silu.py"
+        example = _resolve_example_script("fused_gemm_silu.py")
         cmds: list[list[str]] = []
 
         def fake_runner(cmd: list[str] | tuple[str, ...]) -> CmdRes:
@@ -193,16 +206,16 @@ class TestTileDSLFrontendAndParity(unittest.TestCase):
                 self.assertIn(str(iso_cfg), c)
 
     def test_example_scripts_cli_offline(self) -> None:
-        repo_root = Path(__file__).resolve().parent.parent.parent
-        for rel in ("examples/tile_dsl/fused_gemm_silu.py", "examples/tile_dsl/swiglu.py"):
+        for name in ("fused_gemm_silu.py", "swiglu.py"):
+            script = _resolve_example_script(name)
             proc = subprocess.run(
-                [sys.executable, str(repo_root / rel), "--target", "all", "--iters", "2"],
+                [sys.executable, str(script), "--target", "all", "--iters", "2"],
                 capture_output=True,
                 text=True,
                 env={**os.environ, "OPENBUENOS_MOCK": "1"},
                 check=False,
             )
-            self.assertEqual(proc.returncode, 0, msg=f"{rel} failed:\n{proc.stderr}\n{proc.stdout}")
+            self.assertEqual(proc.returncode, 0, msg=f"{name} failed:\n{proc.stderr}\n{proc.stdout}")
             self.assertIn('"passed": true', proc.stdout)
 
     def test_freetpu_tile_runner_host_fused_matmul_silu_mock(self) -> None:
@@ -374,8 +387,7 @@ class TestTileDSLFrontendAndParity(unittest.TestCase):
         )
         self.assertTrue(np.array_equal(exact_acc, alg_acc))
 
-        repo_root = Path(__file__).resolve().parent.parent.parent
-        example = repo_root / "examples" / "tile_dsl" / "fused_gemm_silu.py"
+        example = _resolve_example_script("fused_gemm_silu.py")
         with tempfile.TemporaryDirectory(prefix="freetpu-colab-cli-") as tmp:
             rc = colab_main([
                 str(example),
@@ -505,6 +517,364 @@ class TestTileDSLFrontendAndParity(unittest.TestCase):
                 self.assertEqual(p_zw.returncode, 0, msg=p_zw.stderr)
                 got_zw = np.frombuffer(out_zw.read_bytes(), dtype=np.int8).reshape(16, 64)
                 self.assertTrue(np.array_equal(got_zw, ref_zw))
+
+    def test_synthesize_dgc0_validates_weight_and_bias_shapes(self) -> None:
+        from unittest import mock
+
+        from freetpu_tile.libopenbuenos_bridge import OB_ACT_NONE, OpenBuenosSession
+
+        with OpenBuenosSession(mock=True) as sess:
+            sess.emitter_registered = True
+            with mock.patch.object(
+                sess.bridge.lib, "ob_gemm_synthesize_dgc0"
+            ) as native_synth:
+                # Wrong weights_nk shape (undersized rows)
+                with self.assertRaises(ValueError):
+                    sess.synthesize_dgc0(
+                        m_dim=1,
+                        k_dim=16,
+                        n_dim=16,
+                        weights_nk=np.zeros((8, 16), dtype=np.int8),
+                        bias_n=np.zeros((16,), dtype=np.int32),
+                        s_in=0.0625,
+                        zp_in=0,
+                        s_w=0.0625,
+                        s_out=0.0625,
+                        zp_out=0,
+                        activation=OB_ACT_NONE,
+                    )
+                # Wrong weights_nk shape (undersized cols)
+                with self.assertRaises(ValueError):
+                    sess.synthesize_dgc0(
+                        m_dim=1,
+                        k_dim=16,
+                        n_dim=16,
+                        weights_nk=np.zeros((16, 8), dtype=np.int8),
+                        bias_n=np.zeros((16,), dtype=np.int32),
+                        s_in=0.0625,
+                        zp_in=0,
+                        s_w=0.0625,
+                        s_out=0.0625,
+                        zp_out=0,
+                        activation=OB_ACT_NONE,
+                    )
+                # Wrong bias_n shape (undersized 1D and wrong rank 2D)
+                with self.assertRaises(ValueError):
+                    sess.synthesize_dgc0(
+                        m_dim=1,
+                        k_dim=16,
+                        n_dim=16,
+                        weights_nk=np.zeros((16, 16), dtype=np.int8),
+                        bias_n=np.zeros((4,), dtype=np.int32),
+                        s_in=0.0625,
+                        zp_in=0,
+                        s_w=0.0625,
+                        s_out=0.0625,
+                        zp_out=0,
+                        activation=OB_ACT_NONE,
+                    )
+                with self.assertRaises(ValueError):
+                    sess.synthesize_dgc0(
+                        m_dim=1,
+                        k_dim=16,
+                        n_dim=16,
+                        weights_nk=np.zeros((16, 16), dtype=np.int8),
+                        bias_n=np.zeros((16, 1), dtype=np.int32),
+                        s_in=0.0625,
+                        zp_in=0,
+                        s_w=0.0625,
+                        s_out=0.0625,
+                        zp_out=0,
+                        activation=OB_ACT_NONE,
+                    )
+                # Non-positive dimensions
+                with self.assertRaises(ValueError):
+                    sess.synthesize_dgc0(
+                        m_dim=0,
+                        k_dim=16,
+                        n_dim=16,
+                        weights_nk=np.zeros((16, 16), dtype=np.int8),
+                        bias_n=None,
+                        s_in=0.0625,
+                        zp_in=0,
+                        s_w=0.0625,
+                        s_out=0.0625,
+                        zp_out=0,
+                        activation=OB_ACT_NONE,
+                    )
+                native_synth.assert_not_called()
+
+    def test_openbuenos_mock_env_prevents_adb_dispatch_unless_explicit_mock_false(self) -> None:
+        from unittest import mock
+
+        @freetpu.tile_kernel(block_m=16, block_n=64, block_k=64, dtype="int8")
+        def k_mm(a, b, out):
+            freetpu.store(out, freetpu.dot(a, b))
+
+        a = np.zeros((16, 64), dtype=np.int8)
+        b = np.zeros((64, 64), dtype=np.int8)
+
+        # 1. OPENBUENOS_MOCK=1 + FREETPU_ADB_SERIAL set + mock=None -> MUST NOT dispatch over ADB
+        with mock.patch.dict(
+            os.environ,
+            {"OPENBUENOS_MOCK": "1", "FREETPU_ADB_SERIAL": "fake-adb-device"},
+            clear=False,
+        ):
+            with mock.patch(
+                "freetpu_tile.backends.buenos_a0._run_adb_rango",
+                side_effect=AssertionError("ADB must not be called when OPENBUENOS_MOCK=1"),
+            ) as adb_mock:
+                res = k_mm.run(a, b, target="buenos_a0", iters=1, warmup=0)
+                self.assertTrue(res.mock)
+                adb_mock.assert_not_called()
+
+        # 2. OPENBUENOS_MOCK=1 + FREETPU_ADB_SERIAL set + explicit mock=False -> MUST dispatch over ADB
+        sentinel = freetpu.ExecutionResult(
+            target=freetpu.Target.BUENOS_A0,
+            op_kind=freetpu.OpKind.MATMUL,
+            dtype=freetpu.DType.INT8,
+            output=np.zeros((16, 64), dtype=np.int8),
+            hw_us=10.0,
+            wall_us=12.0,
+            mock=False,
+        )
+        with mock.patch.dict(
+            os.environ,
+            {"OPENBUENOS_MOCK": "1", "FREETPU_ADB_SERIAL": "fake-adb-device"},
+            clear=False,
+        ):
+            with mock.patch(
+                "freetpu_tile.backends.buenos_a0._run_adb_rango",
+                return_value=sentinel,
+            ) as adb_mock:
+                res_live = k_mm.run(a, b, target="buenos_a0", mock=False, iters=1, warmup=0)
+                self.assertFalse(res_live.mock)
+                adb_mock.assert_called_once()
+
+        # 3. OPENBUENOS_MOCK unset + FREETPU_ADB_SERIAL set + mock=None -> dispatches over ADB
+        env_no_mock = dict(os.environ)
+        env_no_mock.pop("OPENBUENOS_MOCK", None)
+        env_no_mock["FREETPU_ADB_SERIAL"] = "fake-adb-device"
+        with mock.patch.dict(os.environ, env_no_mock, clear=True):
+            with mock.patch(
+                "freetpu_tile.backends.buenos_a0._run_adb_rango",
+                return_value=sentinel,
+            ) as adb_mock:
+                res_adb = k_mm.run(a, b, target="buenos_a0", iters=1, warmup=0)
+                self.assertFalse(res_adb.mock)
+                adb_mock.assert_called_once()
+
+    def test_fused_int8_mode_b_prevents_preactivation_clipping(self) -> None:
+        # Exact regression case: s_in=s_w=0.0625, s_out=0.01, zp=0
+        # Preactivations near 1.27 (~code 99), 2.0 (~code 127), and -10.0 (~code 0) must stay distinct.
+        q_clip = freetpu.QuantParams(
+            s_in=0.0625, zp_in=0, s_w=0.0625, zp_w=0, s_out=0.01, zp_out=0
+        )
+
+        # Construct exact accumulators via row-0 of a @ b:
+        #   s_in * s_w = 1/256 = 0.00390625
+        #   acc = 325  -> x = 1.26953125 -> SiLU(x)/0.01 = 99.11 -> code 99
+        #   acc = 512  -> x = 2.0        -> SiLU(x)/0.01 = 176.16 -> code 127
+        #   acc = -2560 -> x = -10.0     -> SiLU(x)/0.01 = -0.045 -> code 0
+        a = np.zeros((16, 64), dtype=np.int8)
+        b = np.zeros((64, 64), dtype=np.int8)
+        # Col 0: sum = 5 * 65 = 325
+        a[0, :5] = 65
+        b[:5, 0] = 1
+        # Col 1: sum = 8 * 64 = 512
+        a[0, 5:13] = 64
+        b[5:13, 1] = 1
+        # Col 2: sum = 32 * (-80) = -2560
+        a[0, 13:45] = -80
+        b[13:45, 2] = 1
+
+        for act_fn in (freetpu.silu, freetpu.gelu):
+            @freetpu.tile_kernel(block_m=16, block_n=64, block_k=64, dtype="int8", quant=q_clip)
+            def k_act(lhs, rhs, out):
+                freetpu.store(out, act_fn(freetpu.dot(lhs, rhs)))
+
+            rep = k_act.parity_check(
+                a, b, targets=["cpu_ref", "buenos_a0"], quant=q_clip, mock=True, max_abs_tol=1.0
+            )
+            self.assertTrue(rep.passed, msg=f"{act_fn.__name__} preactivation clip parity failed: {rep.parity}")
+            b_res = rep.results["buenos_a0"]
+            self.assertIsNone(b_res.metadata["mode_a_0x640_spline"])
+            self.assertIsNotNone(b_res.metadata["mode_b_requantize"])
+            out_b = b_res.output
+            out_ref = rep.results["cpu_ref"].output
+            if act_fn is freetpu.silu:
+                self.assertEqual(int(out_ref[0, 0]), 99)
+                self.assertEqual(int(out_ref[0, 1]), 127)
+                self.assertEqual(int(out_ref[0, 2]), 0)
+            self.assertLessEqual(abs(int(out_b[0, 0]) - int(out_ref[0, 0])), 1)
+            self.assertLessEqual(abs(int(out_b[0, 1]) - int(out_ref[0, 1])), 1)
+            self.assertLessEqual(abs(int(out_b[0, 2]) - int(out_ref[0, 2])), 1)
+            self.assertNotEqual(int(out_b[0, 0]), int(out_b[0, 1]))
+
+        # Large s_out where spline domain cap (+11.1) would clip before output saturation (+127 * 0.2 = 25.4)
+        q_wide = freetpu.QuantParams(
+            s_in=0.5, zp_in=0, s_w=0.5, zp_w=0, s_out=0.2, zp_out=0
+        )
+
+        @freetpu.tile_kernel(block_m=16, block_n=64, block_k=64, dtype="int8", quant=q_wide)
+        def k_wide(lhs, rhs, out):
+            freetpu.store(out, freetpu.silu(freetpu.dot(lhs, rhs)))
+
+        a_w = np.zeros((16, 64), dtype=np.int8)
+        b_w = np.zeros((64, 64), dtype=np.int8)
+        a_w[0, 0] = 60  # acc=60 -> x=15.0 -> SiLU(15)/0.2 = 75
+        b_w[0, 0] = 1
+        a_w[0, 1] = 100  # acc=100 -> x=25.0 -> SiLU(25)/0.2 = 125
+        b_w[1, 1] = 1
+        rep_w = k_wide.parity_check(
+            a_w, b_w, targets=["cpu_ref", "buenos_a0"], quant=q_wide, mock=True, max_abs_tol=1.0
+        )
+        self.assertTrue(rep_w.passed, msg=f"Wide s_out Mode-B fallback failed: {rep_w.parity}")
+        self.assertIsNotNone(rep_w.results["buenos_a0"].metadata["mode_b_requantize"])
+
+    def test_pallas_rejects_mismatched_shapes_and_aligns_large_row_blocks(self) -> None:
+        @freetpu.tile_kernel(block_m=64, block_n=512, block_k=512, dtype="bf16")
+        def k_gemm(a, b, out):
+            freetpu.store(out, freetpu.dot(a, b))
+
+        @freetpu.tile_kernel(block_m=64, block_n=512, block_k=512, dtype="bf16", rhs_transposed=True)
+        def k_gemm_t(a, b, out):
+            freetpu.store(out, freetpu.dot(a, b))
+
+        # GEMM contracting dimension mismatch (normal and rhs_transposed)
+        with self.assertRaises(ValueError):
+            k_gemm.lower(shapes={"a": (64, 512), "b": (1024, 512)}, target="cloud_tpu_pallas")
+        with self.assertRaises(ValueError):
+            k_gemm.run(
+                np.zeros((64, 512), dtype=np.float32),
+                np.zeros((1024, 512), dtype=np.float32),
+                target="cloud_tpu_pallas",
+                dry_run=True,
+            )
+        with self.assertRaises(ValueError):
+            k_gemm_t.lower(shapes={"a": (64, 512), "b": (512, 1024)}, target="cloud_tpu_pallas")
+
+        # SwiGLU contracting & gate/up width mismatches (normal and rhs_transposed)
+        @freetpu.tile_kernel(block_m=64, block_n=512, block_k=512, dtype="bf16")
+        def k_swiglu(x, wg, wu, wd, out):
+            g = freetpu.silu(freetpu.dot(x, wg))
+            u = freetpu.dot(x, wu)
+            freetpu.store(out, freetpu.dot(g * u, wd))
+
+        # Gate contracting mismatch
+        with self.assertRaises(ValueError):
+            k_swiglu.lower(
+                shapes={"x": (64, 512), "wg": (1024, 512), "wu": (512, 512), "wd": (512, 512)},
+                target="cloud_tpu_pallas",
+            )
+        # Up contracting mismatch
+        with self.assertRaises(ValueError):
+            k_swiglu.lower(
+                shapes={"x": (64, 512), "wg": (512, 512), "wu": (1024, 512), "wd": (512, 512)},
+                target="cloud_tpu_pallas",
+            )
+        # Gate vs up width mismatch
+        with self.assertRaises(ValueError):
+            k_swiglu.lower(
+                shapes={"x": (64, 512), "wg": (512, 512), "wu": (512, 1024), "wd": (512, 512)},
+                target="cloud_tpu_pallas",
+            )
+        # Down contracting mismatch
+        with self.assertRaises(ValueError):
+            k_swiglu.lower(
+                shapes={"x": (64, 512), "wg": (512, 512), "wu": (512, 512), "wd": (1024, 512)},
+                target="cloud_tpu_pallas",
+            )
+
+        @freetpu.tile_kernel(block_m=64, block_n=512, block_k=512, dtype="bf16", rhs_transposed=True)
+        def k_swiglu_t(x, wg, wu, wd, out):
+            g = freetpu.silu(freetpu.dot(x, wg))
+            u = freetpu.dot(x, wu)
+            freetpu.store(out, freetpu.dot(g * u, wd))
+
+        with self.assertRaises(ValueError):
+            k_swiglu_t.lower(
+                shapes={"x": (64, 512), "wg": (512, 512), "wu": (1024, 512), "wd": (512, 512)},
+                target="cloud_tpu_pallas",
+            )
+
+        # Row block alignment above 128: block_m=130 with M=256 must align bm to 136 (divisible by 8)
+        @freetpu.tile_kernel(block_m=130, block_n=512, block_k=512, dtype="bf16")
+        def k_large_bm(a, b, out):
+            freetpu.store(out, freetpu.dot(a, b))
+
+        lowered = k_large_bm.lower(shapes={"a": (256, 512), "b": (512, 512)}, target="cloud_tpu_pallas")
+        self.assertEqual(lowered.summary["block_m"], 136)
+        self.assertEqual(lowered.summary["block_m"] % 8, 0)
+        self.assertEqual(lowered.summary["m_pad"], 272)
+        self.assertEqual(lowered.summary["m_pad"] % lowered.summary["block_m"], 0)
+        self.assertEqual(lowered.summary["grid"][0], 2)
+        assert lowered.source_code is not None
+        self.assertIn("pl.BlockSpec((136, 512)", lowered.source_code)
+
+    def test_runner_host_preserves_fp16_subnormal_weight_scales(self) -> None:
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        runner_host = repo_root / "runtime" / "build" / "freetpu_tile_runner_host"
+        if not runner_host.is_file():
+            self.skipTest("runtime/build/freetpu_tile_runner_host not built")
+
+        rng = np.random.default_rng(2026)
+        m, k, n = 16, 64, 64
+        a = (rng.standard_normal((m, k)) * 10.0).astype(np.float32)
+        # Max weight magnitude ~0.005 -> Q8 scale ~3.94e-5 (IEEE-754 FP16 subnormal!)
+        w_nk = rng.uniform(-0.005, 0.005, size=(n, k)).astype(np.float32)
+        ref = (a @ w_nk.T).astype(np.float32)
+        self.assertGreater(float(np.max(np.abs(ref))), 1e-2)
+
+        with tempfile.TemporaryDirectory(prefix="freetpu-subnormal-test-") as tmp:
+            tp = Path(tmp)
+            (tp / "a.bin").write_bytes(a.tobytes())
+            (tp / "w.bin").write_bytes(w_nk.tobytes())
+            out_p = tp / "out.bin"
+            proc = subprocess.run(
+                [
+                    str(runner_host),
+                    "--mock",
+                    "--op",
+                    "matmul",
+                    "--dtype",
+                    "w8a16",
+                    "--m",
+                    str(m),
+                    "--k",
+                    str(k),
+                    "--n",
+                    str(n),
+                    "--in",
+                    str(tp / "a.bin"),
+                    "--w",
+                    str(tp / "w.bin"),
+                    "--out",
+                    str(out_p),
+                    "--warmup",
+                    "1",
+                    "--iters",
+                    "1",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, msg=f"runner failed:\n{proc.stderr}\n{proc.stdout}")
+            got = np.frombuffer(out_p.read_bytes(), dtype=np.float32).reshape(m, n)
+            self.assertGreater(float(np.max(np.abs(got))), 0.0, msg="Subnormal FP16 scale was flushed to zero!")
+            diff = got.astype(np.float64) - ref.astype(np.float64)
+            nmse = float(np.sum(diff * diff) / max(float(np.sum(ref.astype(np.float64) ** 2)), 1e-30))
+            self.assertLess(nmse, 5e-3, msg=f"Subnormal weight scale nmse too high: {nmse}")
+
+    def test_packaging_tpu_extra_and_example_resolution(self) -> None:
+        self.assertTrue(_resolve_example_script("fused_gemm_silu.py").is_file())
+        self.assertTrue(_resolve_example_script("swiglu.py").is_file())
+        pyproject = Path(__file__).resolve().parent.parent.parent / "pyproject.toml"
+        if pyproject.is_file():
+            text = pyproject.read_text(encoding="utf-8")
+            self.assertIn('tpu = ["jax[tpu]"]', text)
+            self.assertIn("freetpu_tile._packaged_examples", text)
 
 
 if __name__ == "__main__":

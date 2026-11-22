@@ -32,12 +32,28 @@ from .cpu_ref import quantize_w8a16_weights
 
 
 def _align_m_pallas(m_dim: int, block_m: int) -> Tuple[int, int]:
-    """Return (m_pad, bm) satisfying Cloud TPU Mosaic MXU 8-row minimum alignment."""
-    bm = max(8, block_m)
-    if bm < 128 and bm % 8 != 0:
-        bm = ((bm + 7) // 8) * 8
+    """Return (m_pad, bm) satisfying Cloud TPU Mosaic MXU 8-row alignment at every size."""
+    if m_dim <= 0:
+        raise ValueError(f"Cloud TPU Pallas requires positive M dimension, got {m_dim}")
+    if block_m <= 0:
+        raise ValueError(f"Cloud TPU Pallas requires positive block_m, got {block_m}")
+    bm = ((max(8, block_m) + 7) // 8) * 8
     m_pad = max(bm, ((m_dim + bm - 1) // bm) * bm)
     return m_pad, bm
+
+
+def _require_2d_shape(name: str, shapes: Dict[str, Tuple[int, ...]]) -> Tuple[int, int]:
+    if name not in shapes:
+        raise ValueError(f"Cloud TPU Pallas missing tensor shape for {name!r}")
+    shape = shapes[name]
+    if len(shape) != 2:
+        raise ValueError(f"Cloud TPU Pallas requires 2D tensor for {name!r}, got shape {shape}")
+    d0, d1 = int(shape[0]), int(shape[1])
+    if d0 <= 0 or d1 <= 0:
+        raise ValueError(
+            f"Cloud TPU Pallas requires positive dimensions for {name!r}, got shape {shape}"
+        )
+    return d0, d1
 
 
 def _validate_pallas_blocks(
@@ -91,13 +107,47 @@ def generate_pallas_source(
     if ir.op_kind == OpKind.SWIGLU:
         x_name = ir.swiglu_roles["x"]
         wg_name = ir.swiglu_roles["w_gate"]
-        a_shape = shapes[x_name]
-        m_dim, k_dim = int(a_shape[0]), int(a_shape[1])
-        wg_shape = shapes[wg_name]
-        n_inter = int(wg_shape[0] if ir.rhs_transposed else wg_shape[1])
+        wu_name = ir.swiglu_roles["w_up"]
+        m_dim, k_dim = _require_2d_shape(x_name, shapes)
+        wg0, wg1 = _require_2d_shape(wg_name, shapes)
+        wu0, wu1 = _require_2d_shape(wu_name, shapes)
+        if ir.rhs_transposed:
+            n_inter, wg_k = wg0, wg1
+            wu_n, wu_k = wu0, wu1
+        else:
+            wg_k, n_inter = wg0, wg1
+            wu_k, wu_n = wu0, wu1
+        if wg_k != k_dim:
+            raise ValueError(
+                f"Cloud TPU Pallas SwiGLU gate contracting dimension mismatch: "
+                f"{x_name}={shapes[x_name]} vs {wg_name}={shapes[wg_name]} "
+                f"(rhs_transposed={ir.rhs_transposed})"
+            )
+        if wu_k != k_dim:
+            raise ValueError(
+                f"Cloud TPU Pallas SwiGLU up contracting dimension mismatch: "
+                f"{x_name}={shapes[x_name]} vs {wu_name}={shapes[wu_name]} "
+                f"(rhs_transposed={ir.rhs_transposed})"
+            )
+        if wu_n != n_inter:
+            raise ValueError(
+                f"Cloud TPU Pallas SwiGLU gate/up width mismatch: "
+                f"{wg_name}={shapes[wg_name]} (width {n_inter}) vs "
+                f"{wu_name}={shapes[wu_name]} (width {wu_n})"
+            )
         if ir.has_down_proj:
-            wd_shape = shapes[ir.swiglu_roles["w_down"]]
-            n_out = int(wd_shape[0] if ir.rhs_transposed else wd_shape[1])
+            wd_name = ir.swiglu_roles["w_down"]
+            wd0, wd1 = _require_2d_shape(wd_name, shapes)
+            if ir.rhs_transposed:
+                n_out, wd_k = wd0, wd1
+            else:
+                wd_k, n_out = wd0, wd1
+            if wd_k != n_inter:
+                raise ValueError(
+                    f"Cloud TPU Pallas SwiGLU down contracting dimension mismatch: "
+                    f"intermediate width={n_inter} vs {wd_name}={shapes[wd_name]} "
+                    f"(rhs_transposed={ir.rhs_transposed})"
+                )
         else:
             n_out = n_inter
         m_pad, bm, bn_inter, bk = _validate_pallas_blocks(
@@ -114,10 +164,18 @@ def generate_pallas_source(
         n_dim = n_out
     else:
         a_name, b_name = ir.gemm_roles if len(ir.gemm_roles) == 2 else (ir.input_names[0], ir.input_names[1])
-        a_shape = shapes[a_name]
-        b_shape = shapes[b_name]
-        m_dim, k_dim = int(a_shape[0]), int(a_shape[1])
-        n_dim = int(b_shape[0] if ir.rhs_transposed else b_shape[1])
+        m_dim, k_dim = _require_2d_shape(a_name, shapes)
+        b0, b1 = _require_2d_shape(b_name, shapes)
+        if ir.rhs_transposed:
+            n_dim, b_k = b0, b1
+        else:
+            b_k, n_dim = b0, b1
+        if b_k != k_dim:
+            raise ValueError(
+                f"Cloud TPU Pallas GEMM contracting dimension mismatch: "
+                f"{a_name}={shapes[a_name]} vs {b_name}={shapes[b_name]} "
+                f"(rhs_transposed={ir.rhs_transposed})"
+            )
         m_pad, bm, bn, bk = _validate_pallas_blocks(
             m_dim, k_dim, n_dim, ir.block_spec.block_m, ir.block_spec.block_n, ir.block_spec.block_k
         )
