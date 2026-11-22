@@ -293,20 +293,33 @@ bool parse_stablehlo_matmul(const char* code, size_t len, uint32_t* m_out,
   }
   if (depth != 0) return false;
 
-  // Collect non-empty body lines; must be exactly 2 statements (dot + return).
-  std::vector<std::string> stmts;
-  size_t cur = lbrace + 1;
-  while (cur < rbrace) {
-    size_t nl = cleaned.find('\n', cur);
-    if (nl == std::string::npos || nl > rbrace) nl = rbrace;
-    std::string line = trim_ws(cleaned.substr(cur, nl - cur));
-    if (!line.empty()) stmts.push_back(line);
-    cur = nl + 1;
-  }
-  if (stmts.size() != 2) return false;
+  // Split function body into exactly two statements (dot op + return), treating line breaks
+  // as ordinary whitespace so wrapped StableHLO ops compile cleanly.
+  std::string body = trim_ws(cleaned.substr(lbrace + 1, rbrace - lbrace - 1));
+  auto find_return_pos = [](const std::string& text) -> size_t {
+    for (size_t i = 0; i < text.size(); ++i) {
+      bool at_boundary = (i == 0 || std::isspace(static_cast<unsigned char>(text[i - 1])));
+      if (!at_boundary) continue;
+      if (text.compare(i, 11, "func.return") == 0 &&
+          (i + 11 == text.size() || std::isspace(static_cast<unsigned char>(text[i + 11])))) {
+        return i;
+      }
+      if (text.compare(i, 6, "return") == 0 &&
+          (i + 6 == text.size() || std::isspace(static_cast<unsigned char>(text[i + 6])))) {
+        return i;
+      }
+    }
+    return std::string::npos;
+  };
+  size_t ret_pos = find_return_pos(body);
+  if (ret_pos == std::string::npos) return false;
+  std::string s0 = trim_ws(body.substr(0, ret_pos));
+  std::string s1 = trim_ws(body.substr(ret_pos));
+  if (s0.empty() || s1.empty()) return false;
+  // Ensure there is no trailing statement or nested return inside s1.
+  if (s1.find('=') != std::string::npos) return false;
 
   // Statement 1: `%res = stablehlo.dot_general %a, %b, contracting_dims = [1] x [0] : (T0, T1) -> T2`
-  const std::string& s0 = stmts[0];
   size_t eq = s0.find('=');
   if (eq == std::string::npos) return false;
   std::string res_ssa = trim_ws(s0.substr(0, eq));
@@ -410,12 +423,13 @@ bool parse_stablehlo_matmul(const char* code, size_t len, uint32_t* m_out,
   if (om0 != m0 || ok0 != k0 || ok1 != k0 || on1 != n1 || omm != m0 || omn != n1) return false;
 
   // Statement 2: `return %res : tensor<MxNxbf16>` or `func.return %res : tensor<MxNxbf16>`.
-  const std::string& s1 = stmts[1];
   std::string ret_rest;
-  if (s1.compare(0, 7, "return ") == 0) {
-    ret_rest = trim_ws(s1.substr(7));
-  } else if (s1.compare(0, 12, "func.return ") == 0) {
-    ret_rest = trim_ws(s1.substr(12));
+  if (s1.compare(0, 6, "return") == 0 && s1.size() > 6 &&
+      std::isspace(static_cast<unsigned char>(s1[6]))) {
+    ret_rest = trim_ws(s1.substr(6));
+  } else if (s1.compare(0, 11, "func.return") == 0 && s1.size() > 11 &&
+             std::isspace(static_cast<unsigned char>(s1[11]))) {
+    ret_rest = trim_ws(s1.substr(11));
   } else {
     return false;
   }
@@ -475,30 +489,64 @@ bool is_supported_dense_layout(const PJRT_Buffer_MemoryLayout* layout,
   return false;
 }
 
-bool gather_strided_host_buffer(const void* data, const int64_t* dims, size_t num_dims,
-                                const int64_t* byte_strides, size_t elem_sz,
-                                size_t total_elems, std::vector<uint8_t>* out) {
-  out->assign(total_elems * elem_sz, 0);
-  if (total_elems == 0) return true;
+PJRT_Error* upload_strided_host_buffer(ot_context_t* ctx, ot_buffer_t* dst_buf,
+                                       const void* data, const int64_t* dims, size_t num_dims,
+                                       const int64_t* byte_strides, size_t elem_sz,
+                                       size_t total_elems) {
+  if (total_elems == 0) return nullptr;
   const auto* base = static_cast<const uint8_t*>(data);
   if (num_dims == 0) {
-    std::memcpy(out->data(), base, elem_sz);
-    return true;
+    ot_status_t st = ot::buffer_h2d_offset(ctx, dst_buf, 0, base, elem_sz);
+    return (st == OT_OK) ? nullptr : make_err(PJRT_Error_Code_INTERNAL, ot_status_string(st));
   }
+
+  // Bound host packing scratch to <= 4 MiB so large strided uploads never spike host RAM
+  // or abort under -fno-exceptions; keep every non-final chunk 8-byte aligned for H2D DMA.
+  static constexpr size_t kMaxStridedChunkBytes = 4u * 1024u * 1024u;
+  size_t total_bytes = total_elems * elem_sz;
+  size_t target_bytes = (total_bytes < kMaxStridedChunkBytes) ? total_bytes : kMaxStridedChunkBytes;
+  size_t chunk_elems = target_bytes / elem_sz;
+  if (chunk_elems == 0) chunk_elems = 1;
+  // Round chunk element count down so chunk_bytes is a multiple of 8 whenever total_elems > chunk.
+  if (elem_sz < 8u && chunk_elems < total_elems) {
+    size_t align_elems = 8u / elem_sz;
+    if (chunk_elems >= align_elems) {
+      chunk_elems = (chunk_elems / align_elems) * align_elems;
+    }
+  }
+  size_t scratch_bytes = chunk_elems * elem_sz;
+  auto* scratch = static_cast<uint8_t*>(std::malloc(scratch_bytes));
+  if (!scratch) {
+    return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, "failed to allocate strided upload staging chunk");
+  }
+
   std::vector<int64_t> idx(num_dims, 0);
-  for (size_t linear = 0; linear < total_elems; ++linear) {
-    int64_t byte_off = 0;
-    for (size_t d = 0; d < num_dims; ++d) {
-      byte_off += idx[d] * byte_strides[d];
+  size_t linear = 0;
+  while (linear < total_elems) {
+    size_t batch_elems = total_elems - linear;
+    if (batch_elems > chunk_elems) batch_elems = chunk_elems;
+    for (size_t i = 0; i < batch_elems; ++i) {
+      int64_t byte_off = 0;
+      for (size_t d = 0; d < num_dims; ++d) {
+        byte_off += idx[d] * byte_strides[d];
+      }
+      std::memcpy(scratch + i * elem_sz, base + byte_off, elem_sz);
+      for (size_t k = num_dims; k > 0; --k) {
+        size_t d = k - 1;
+        if (++idx[d] < dims[d]) break;
+        idx[d] = 0;
+      }
     }
-    std::memcpy(out->data() + linear * elem_sz, base + byte_off, elem_sz);
-    for (size_t i = num_dims; i > 0; --i) {
-      size_t d = i - 1;
-      if (++idx[d] < dims[d]) break;
-      idx[d] = 0;
+    ot_status_t st =
+        ot::buffer_h2d_offset(ctx, dst_buf, linear * elem_sz, scratch, batch_elems * elem_sz);
+    if (st != OT_OK) {
+      std::free(scratch);
+      return make_err(PJRT_Error_Code_INTERNAL, ot_status_string(st));
     }
+    linear += batch_elems;
   }
-  return true;
+  std::free(scratch);
+  return nullptr;
 }
 
 void ot_pjrt_error_destroy(PJRT_Error_Destroy_Args* args) {
@@ -1095,20 +1143,22 @@ PJRT_Error* ot_pjrt_buffer_from_host_buffer(PJRT_Client_BufferFromHostBuffer_Arg
   ot_status_t st = ot_buffer_alloc(args->client->ctx, alloc_bytes, &ot_buf);
   if (st != OT_OK) return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, ot_status_string(st));
 
-  const void* upload_ptr = args->data;
-  std::vector<uint8_t> packed_host;
-  if (elems > 0 && args->num_byte_strides != 0 &&
-      !is_dense_row_major_strides(args->dims, args->num_dims, args->byte_strides, elem_sz)) {
-    gather_strided_host_buffer(args->data, args->dims, args->num_dims, args->byte_strides,
-                               elem_sz, elems, &packed_host);
-    upload_ptr = packed_host.data();
-  }
-
-  if (upload_ptr && logical_bytes > 0) {
-    st = ot_buffer_h2d(args->client->ctx, ot_buf, upload_ptr, logical_bytes);
-    if (st != OT_OK) {
-      ot_buffer_free(ot_buf);
-      return make_err(PJRT_Error_Code_INTERNAL, ot_status_string(st));
+  if (elems > 0) {
+    if (args->num_byte_strides != 0 &&
+        !is_dense_row_major_strides(args->dims, args->num_dims, args->byte_strides, elem_sz)) {
+      PJRT_Error* up_err = upload_strided_host_buffer(
+          args->client->ctx, ot_buf, args->data, args->dims, args->num_dims, args->byte_strides,
+          elem_sz, elems);
+      if (up_err) {
+        ot_buffer_free(ot_buf);
+        return up_err;
+      }
+    } else {
+      st = ot_buffer_h2d(args->client->ctx, ot_buf, args->data, logical_bytes);
+      if (st != OT_OK) {
+        ot_buffer_free(ot_buf);
+        return make_err(PJRT_Error_Code_INTERNAL, ot_status_string(st));
+      }
     }
   }
 
@@ -1748,12 +1798,14 @@ PJRT_Error* ot_pjrt_async_tracking_event_destroy(PJRT_AsyncTrackingEvent_Destroy
   return nullptr;
 }
 
+void ot_pjrt_device_attributes_deleter(PJRT_Device_Attributes*) {}
+
 PJRT_Error* ot_pjrt_device_get_attributes(PJRT_Device_GetAttributes_Args* args) {
   if (!args || !args->device) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null");
   args->attributes = nullptr;
   args->num_attributes = 0;
   args->device_attributes = nullptr;
-  args->attributes_deleter = nullptr;
+  args->attributes_deleter = ot_pjrt_device_attributes_deleter;
   return nullptr;
 }
 

@@ -134,8 +134,9 @@ static void test_mock_dma_and_matmul() {
   OT_CHECK(ot_buffer_alloc(ctx_small, 300ULL * 1024ULL, &too_big) == OT_ERR_NO_MEMORY);
   ot_buffer_t* fits = nullptr;
   OT_CHECK(ot_buffer_alloc(ctx_small, 128ULL * 1024ULL, &fits) == OT_OK);
-  ot_buffer_free(fits);
+  // Destroying context before freeing an outstanding buffer must remain safe.
   ot_context_destroy(ctx_small);
+  ot_buffer_free(fits);
 
   // Faulted DMA context must refuse subsequent transfers and allocations.
   ctx2->transport.dma_faulted = true;
@@ -331,12 +332,15 @@ static void test_pjrt_api_mock() {
     expect_compile_fail(opt_bad, sizeof(opt_bad), PJRT_Error_Code_INVALID_ARGUMENT);
   }
 
-  // Explicit precision = [DEFAULT, DEFAULT] must be accepted; HIGH precision rejected.
+  // Explicit precision = [DEFAULT, DEFAULT] and line-wrapped dot_general must be accepted; HIGH precision rejected.
   {
     const char* mlir_default_prec =
         "module {\n"
         "  func.func @main(%a: tensor<128x128xbf16>, %b: tensor<128x128xbf16>) -> tensor<128x128xbf16> {\n"
-        "    %0 = stablehlo.dot_general %a, %b, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<128x128xbf16>, tensor<128x128xbf16>) -> tensor<128x128xbf16>\n"
+        "    %0 = stablehlo.dot_general %a, %b,\n"
+        "      contracting_dims = [1] x [0],\n"
+        "      precision = [DEFAULT, DEFAULT]\n"
+        "      : (tensor<128x128xbf16>, tensor<128x128xbf16>) -> tensor<128x128xbf16>\n"
         "    return %0 : tensor<128x128xbf16>\n"
         "  }\n"
         "}\n";
@@ -439,6 +443,15 @@ static void test_pjrt_api_mock() {
   te_args.event = reinterpret_cast<PJRT_AsyncTrackingEvent*>(0x1);
   OT_CHECK(api->PJRT_Device_CreateAsyncTrackingEvent(&te_args) == nullptr);
   OT_CHECK(te_args.event == nullptr);
+
+  // PJRT_Device_GetAttributes must supply a non-null callable deleter even when empty.
+  OT_CHECK(api->PJRT_Device_GetAttributes != nullptr);
+  PJRT_Device_GetAttributes_Args ga_args = {};
+  ga_args.struct_size = PJRT_Device_GetAttributes_Args_STRUCT_SIZE;
+  ga_args.device = ad.addressable_devices[0];
+  OT_CHECK(api->PJRT_Device_GetAttributes(&ga_args) == nullptr);
+  OT_CHECK(ga_args.attributes_deleter != nullptr);
+  ga_args.attributes_deleter(ga_args.device_attributes);
 
   OT_CHECK(api->PJRT_TopologyDescription_Create != nullptr);
   PJRT_TopologyDescription_Create_Args tc_args = {};

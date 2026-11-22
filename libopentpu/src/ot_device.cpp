@@ -95,6 +95,16 @@ ot_status_t ot_context_create(const ot_config_t* config, ot_context_t** out_ctx)
 
 void ot_context_destroy(ot_context_t* ctx) {
   if (!ctx) return;
+  {
+    std::lock_guard<std::mutex> lk(ctx->mu);
+    for (ot_buffer_t* b : ctx->live_buffers) {
+      if (b) {
+        b->ctx = nullptr;
+        b->hbm_addr = 0;
+      }
+    }
+    ctx->live_buffers.clear();
+  }
   ctx->transport.close_device();
   delete ctx;
 }
@@ -143,6 +153,7 @@ ot_status_t ot_buffer_alloc(ot_context_t* ctx, size_t size_bytes, ot_buffer_t** 
   if (ctx->info.is_mock) {
     buf->mock_data.assign(size_bytes, 0);
   }
+  ctx->live_buffers.push_back(buf);
   *out_buf = buf;
   return OT_OK;
 }
@@ -151,6 +162,9 @@ void ot_buffer_free(ot_buffer_t* buf) {
   if (!buf) return;
   if (buf->ctx) {
     std::lock_guard<std::mutex> lk(buf->ctx->mu);
+    auto& live = buf->ctx->live_buffers;
+    auto it = std::find(live.begin(), live.end(), buf);
+    if (it != live.end()) live.erase(it);
     // Keep HBM range quarantined if the context has a faulted/timed-out DMA.
     if (!buf->ctx->transport.dma_faulted) {
       buf->ctx->transport.hbm_alloc.free(buf->hbm_addr);
@@ -167,9 +181,14 @@ uint64_t ot_buffer_hbm_addr(const ot_buffer_t* buf) {
   return buf ? buf->hbm_addr : 0;
 }
 
-ot_status_t ot_buffer_h2d(ot_context_t* ctx, ot_buffer_t* dst,
-                          const void* host_src, size_t size_bytes) {
-  if (!ctx || !dst || !host_src || dst->ctx != ctx || size_bytes > dst->size_bytes) {
+}  // extern "C"
+
+namespace ot {
+
+ot_status_t buffer_h2d_offset(ot_context_t* ctx, ot_buffer_t* dst, size_t dst_offset,
+                              const void* host_src, size_t size_bytes) {
+  if (!ctx || !dst || !host_src || dst->ctx != ctx || dst_offset > dst->size_bytes ||
+      size_bytes > dst->size_bytes - dst_offset) {
     return OT_ERR_INVALID_ARG;
   }
   if (size_bytes == 0) return OT_OK;
@@ -179,13 +198,17 @@ ot_status_t ot_buffer_h2d(ot_context_t* ctx, ot_buffer_t* dst,
     return OT_ERR_DEVICE;
   }
   if (ctx->info.is_mock) {
-    std::memcpy(dst->mock_data.data(), host_src, size_bytes);
-    if (dst->hbm_addr + size_bytes <= ctx->transport.mock_hbm.size()) {
-      std::memcpy(ctx->transport.mock_hbm.data() + dst->hbm_addr, host_src, size_bytes);
+    std::memcpy(dst->mock_data.data() + dst_offset, host_src, size_bytes);
+    if (dst->hbm_addr + dst_offset + size_bytes <= ctx->transport.mock_hbm.size()) {
+      std::memcpy(ctx->transport.mock_hbm.data() + dst->hbm_addr + dst_offset, host_src, size_bytes);
     }
     return OT_OK;
   }
 
+  if ((dst_offset % 8u) != 0) {
+    ctx->last_error = "Hardware H2D destination offset must be 8-byte aligned";
+    return OT_ERR_INVALID_ARG;
+  }
   if (!ctx->transport.host_stage_mem || ctx->transport.host_stage_size == 0) {
     ctx->last_error = "DMA staging buffer not initialized";
     return OT_ERR_DEVICE;
@@ -202,12 +225,13 @@ ot_status_t ot_buffer_h2d(ot_context_t* ctx, ot_buffer_t* dst,
       dma_len = chunk & ~static_cast<size_t>(7u);
     }
     if (dma_len > chunk) {
-      if (done + chunk < dst->size_bytes) {
+      if (dst_offset + done + chunk < dst->size_bytes) {
         // Partial H2D write ending mid-qword inside a larger buffer: read-modify-write
         // the trailing 8-byte HBM word so untouched suffix bytes are preserved.
         size_t tail_off = chunk & ~static_cast<size_t>(7u);
         if (!ctx->transport.dma_transfer_sync(
-                ctx->transport.host_stage_iova + tail_off, dst->hbm_addr + done + tail_off, 8u,
+                ctx->transport.host_stage_iova + tail_off,
+                dst->hbm_addr + dst_offset + done + tail_off, 8u,
                 /*is_h2d=*/false, 0x40000000u, 0x60u, 0u, ctx->cfg.timeout_ms, &err)) {
           ctx->last_error = err.empty() ? "Hardware H2D tail preserve D2H failed" : err;
           return ctx->transport.dma_faulted ? OT_ERR_TIMEOUT : OT_ERR_IOCTL;
@@ -218,7 +242,7 @@ ot_status_t ot_buffer_h2d(ot_context_t* ctx, ot_buffer_t* dst,
     }
     std::memcpy(ctx->transport.host_stage_mem, src_bytes + done, chunk);
     if (!ctx->transport.dma_transfer_sync(
-            ctx->transport.host_stage_iova, dst->hbm_addr + done, dma_len,
+            ctx->transport.host_stage_iova, dst->hbm_addr + dst_offset + done, dma_len,
             /*is_h2d=*/true, 0x40000000u, 0x10u, 0u, ctx->cfg.timeout_ms, &err)) {
       ctx->last_error = err.empty() ? "Hardware H2D DMA failed" : err;
       return ctx->transport.dma_faulted ? OT_ERR_TIMEOUT : OT_ERR_IOCTL;
@@ -226,6 +250,15 @@ ot_status_t ot_buffer_h2d(ot_context_t* ctx, ot_buffer_t* dst,
     done += chunk;
   }
   return OT_OK;
+}
+
+}  // namespace ot
+
+extern "C" {
+
+ot_status_t ot_buffer_h2d(ot_context_t* ctx, ot_buffer_t* dst,
+                          const void* host_src, size_t size_bytes) {
+  return ot::buffer_h2d_offset(ctx, dst, 0, host_src, size_bytes);
 }
 
 ot_status_t ot_buffer_d2h(ot_context_t* ctx, const ot_buffer_t* src,

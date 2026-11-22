@@ -127,6 +127,9 @@ struct VfioTransport {
   void write32_bar0(uint64_t off, uint32_t val);
 };
 
+ot_status_t buffer_h2d_offset(ot_context_t* ctx, ot_buffer_t* dst, size_t dst_offset,
+                              const void* host_src, size_t size_bytes);
+
 }  // namespace ot
 
 struct ot_buffer {
@@ -143,6 +146,7 @@ struct ot_context {
   ot_device_info_t info{};
   ot::VfioTransport transport{};
   ot::Bar4Descriptor bar4_desc{};
+  std::vector<ot_buffer_t*> live_buffers;
   std::string last_error;
 };
 

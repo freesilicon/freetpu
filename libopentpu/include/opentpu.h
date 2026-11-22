@@ -85,7 +85,10 @@ int         ot_context_is_mock(const ot_context_t* ctx);
 
 ot_status_t ot_device_get_info(const ot_context_t* ctx, ot_device_info_t* out_info);
 
-/* IOMMU-mapped host staging & HBM device buffer management */
+/* IOMMU-mapped host staging & HBM device buffer management.
+ * Callers should free buffers before destroying their owning context; any
+ * outstanding buffers are detached during ot_context_destroy() so a later
+ * ot_buffer_free() remains safe, though transfers on detached handles fail. */
 ot_status_t ot_buffer_alloc(ot_context_t* ctx, size_t size_bytes, ot_buffer_t** out_buf);
 void        ot_buffer_free(ot_buffer_t* buf);
 size_t      ot_buffer_size(const ot_buffer_t* buf);
