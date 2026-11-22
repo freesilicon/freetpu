@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -133,12 +134,27 @@ def _synthesize_mode_a_spline(
     }
 
 
+def _eval_mode_b_on_acc_i32(
+    acc_i32: np.ndarray,
+    *,
+    act_name: str,
+    s_in: float,
+    s_w: float,
+    s_out: float,
+    zp_out: int,
+) -> np.ndarray:
+    from freetpu_tile.backends.cpu_ref import gelu_tanh_f32, silu_f32
+
+    x_fp32 = acc_i32.astype(np.float32) * np.float32(s_in * s_w)
+    y_fp32 = silu_f32(x_fp32) if act_name == "silu" else gelu_tanh_f32(x_fp32)
+    return np.clip(np.rint(y_fp32 / float(s_out)) + float(zp_out), -128, 127).astype(np.int8)
+
+
 def _eval_spline_on_acc_i32(
     acc_i32: np.ndarray,
     *,
     s_in: float,
     s_w: float,
-    s_out: float,
     zp_out: int,
     spline_info: Dict[str, Any],
 ) -> np.ndarray:
@@ -146,8 +162,7 @@ def _eval_spline_on_acc_i32(
     import spline_0x640 as sp  # type: ignore
 
     # Replicate Mode-A chunk[5] hardware dataflow:
-    #   1) MAC quantizes acc to intermediate uint8 u_mid at (s_mid = s_in*s_w, zp_mid = zp_out)
-    #      or directly when s_mid = max(s_in*s_w, s_out)
+    #   1) MAC quantizes acc to intermediate uint8 u_mid at (s_mid = max(s_in*s_w, s_out), zp_mid = zp_out)
     s_mid = float(spline_info["s_mid"])
     zp_mid = int(spline_info["zp_mid"])
     real_mul = np.float32(np.float32(s_in * s_w) / np.float32(s_mid))
@@ -174,14 +189,17 @@ def lower_buenos_a0(
     quant: Optional[QuantParams] = None,
 ) -> LoweredArtifact:
     """Lower TileKernelIR into buenos_a0 VLIW chunks, 0x640 spline, and libopenbuenos plan."""
+    if ir.op_kind == OpKind.SWIGLU and ir.dtype == DType.INT8:
+        raise ValueError("INT8 dtype is not supported for swiglu; use dtype='w8a16' or dtype='bf16'")
+
     _ensure_tools_on_path()
     import emit_custom_gemm as ecg  # type: ignore
     import multitile_synth as ms  # type: ignore
 
     qparams = quant or ir.quant
-    first_in = shapes[ir.input_names[0]]
-    m_dim, k_dim = int(first_in[0]), int(first_in[1])
     if ir.op_kind == OpKind.SWIGLU:
+        first_in = shapes[ir.swiglu_roles["x"]]
+        m_dim, k_dim = int(first_in[0]), int(first_in[1])
         wg_shape = shapes[ir.swiglu_roles["w_gate"]]
         n_inter = int(wg_shape[0] if ir.rhs_transposed else wg_shape[1])
         if ir.has_down_proj:
@@ -190,7 +208,10 @@ def lower_buenos_a0(
         else:
             n_dim = n_inter
     else:
-        b_shape = shapes[ir.input_names[1]]
+        a_name, b_name = ir.gemm_roles if len(ir.gemm_roles) == 2 else (ir.input_names[0], ir.input_names[1])
+        first_in = shapes[a_name]
+        b_shape = shapes[b_name]
+        m_dim, k_dim = int(first_in[0]), int(first_in[1])
         n_dim = int(b_shape[0] if ir.rhs_transposed else b_shape[1])
         n_inter = n_dim
 
@@ -222,24 +243,29 @@ def lower_buenos_a0(
     elif ir.op_kind == OpKind.FUSED_MATMUL_GELU:
         act_name = "gelu"
 
+    mode_b_meta: Optional[Dict[str, Any]] = None
     if act_name is not None:
         s_mid = max(float(qparams.s_in * qparams.s_w), float(qparams.s_out))
         zp_mid = int(qparams.zp_out)
-        # Ensure s_mid covers activation dynamic range without negative saturation
+        # Mode-A 0x640 cannot represent saturating negative tails when min_val/s_out + zp_out < -128.
+        # Fall back to Mode-B two-stage INT32->FP32->INT8 requantization to preserve requested s_out/zp_out.
         min_val = -0.2784645427610738 if act_name == "silu" else -0.1700404099869362
-        s_out_eff = float(qparams.s_out)
-        if (min_val / s_out_eff + qparams.zp_out) < -128.0:
-            s_out_eff = max(s_out_eff, abs(min_val) / max(1.0, 127.0 + qparams.zp_out))
-        spline_meta = _synthesize_mode_a_spline(
-            act_name,
-            s_mid=s_mid,
-            zp_mid=zp_mid,
-            s_out=s_out_eff,
-            zp_out=qparams.zp_out,
-        )
-        spline_meta["s_mid"] = s_mid
-        spline_meta["zp_mid"] = zp_mid
-        spline_meta["s_out_eff"] = s_out_eff
+        if (min_val / float(qparams.s_out) + qparams.zp_out) < -128.0:
+            mode_b_meta = {
+                "activation": act_name,
+                "s_out": float(qparams.s_out),
+                "zp_out": int(qparams.zp_out),
+            }
+        else:
+            spline_meta = _synthesize_mode_a_spline(
+                act_name,
+                s_mid=s_mid,
+                zp_mid=zp_mid,
+                s_out=float(qparams.s_out),
+                zp_out=qparams.zp_out,
+            )
+            spline_meta["s_mid"] = s_mid
+            spline_meta["zp_mid"] = zp_mid
 
     dgc0_bytes: Optional[bytes] = None
     shell_env = os.environ.get("FREETPU_SHELL_DGC0", "").strip()
@@ -284,6 +310,7 @@ def lower_buenos_a0(
             else None
         ),
         "dgc0_emitted_bytes": len(dgc0_bytes) if dgc0_bytes is not None else 0,
+        "mode_b_requantize": mode_b_meta,
     }
     if spline_meta is not None:
         summary["_spline_runtime"] = spline_meta
@@ -323,7 +350,7 @@ def _run_adb_rango(
         if res.returncode != 0 or not local_runner.is_file():
             raise RuntimeError(f"Failed building Android ARM64 freetpu_tile_runner:\n{res.stderr}")
 
-    remote_dir = "/data/local/tmp/freetpu_tile_run"
+    remote_dir = f"/data/local/tmp/freetpu_tile_run/{uuid.uuid4().hex[:12]}"
     remote_runner = "/data/local/tmp/tpu_open_stack/freetpu_tile_runner"
 
     def _adb(*cmd_args: str) -> subprocess.CompletedProcess[str]:
@@ -334,133 +361,153 @@ def _run_adb_rango(
             check=False,
         )
 
-    # Ensure remote workspace and runner binary
-    _adb("shell", f"mkdir -p {remote_dir}")
-    push_r = _adb("push", str(local_runner), remote_runner)
-    if push_r.returncode != 0:
-        raise RuntimeError(f"adb push runner failed: {push_r.stderr}")
-    _adb("shell", f"chmod 0755 {remote_runner}")
-
-    with tempfile.TemporaryDirectory(prefix="freetpu-adb-") as tmp:
-        tmp_p = Path(tmp)
-        cmd_parts: List[str] = [
-            remote_runner,
-            "--op",
-            ir.op_kind.value,
-            "--dtype",
-            ir.dtype.value,
-            "--warmup",
-            str(warmup),
-            "--iters",
-            str(iters),
-            "--perf-mode",
-            str(perf_mode),
-        ]
-
-        if ir.op_kind == OpKind.SWIGLU:
-            x = np.asarray(inputs[ir.swiglu_roles["x"]], dtype=np.float32)
-            wg_name = ir.swiglu_roles["w_gate"]
-            wu_name = ir.swiglu_roles["w_up"]
-            wd_name = ir.swiglu_roles.get("w_down")
-
-            def _to_f32_nk(arr: np.ndarray, name: str) -> np.ndarray:
-                a = np.asarray(arr)
-                if a.dtype == np.int8 and scales and name in scales:
-                    s = np.asarray(scales[name], dtype=np.float32)
-                    a = a.astype(np.float32) * (s[:, None] if ir.rhs_transposed else s[None, :])
-                else:
-                    a = a.astype(np.float32)
-                return np.ascontiguousarray(a if ir.rhs_transposed else a.T, dtype=np.float32)
-
-            wg_nk = _to_f32_nk(inputs[wg_name], wg_name)
-            wu_nk = _to_f32_nk(inputs[wu_name], wu_name)
-            wd_nk = _to_f32_nk(inputs[wd_name], wd_name) if wd_name else None
-            m_dim, k_dim = x.shape
-            n_inter = wg_nk.shape[0]
-            n_out = wd_nk.shape[0] if wd_nk is not None else n_inter
-            n_dim = n_out
-
-            (tmp_p / "in.bin").write_bytes(np.ascontiguousarray(x, dtype=np.float32).tobytes())
-            (tmp_p / "wg.bin").write_bytes(wg_nk.tobytes())
-            (tmp_p / "wu.bin").write_bytes(wu_nk.tobytes())
-            for fn in ("in.bin", "wg.bin", "wu.bin"):
-                _adb("push", str(tmp_p / fn), f"{remote_dir}/{fn}")
-            if wd_nk is not None:
-                (tmp_p / "wd.bin").write_bytes(wd_nk.tobytes())
-                _adb("push", str(tmp_p / "wd.bin"), f"{remote_dir}/wd.bin")
-            cmd_parts.extend([
-                "--m", str(m_dim),
-                "--k", str(k_dim),
-                "--n", str(n_out),
-                "--n-inter", str(n_inter),
-                "--in", f"{remote_dir}/in.bin",
-                "--w", f"{remote_dir}/wg.bin",
-                "--w-up", f"{remote_dir}/wu.bin",
-                "--w-down", f"{remote_dir}/wd.bin",
-                "--out", f"{remote_dir}/out.bin",
-            ])
-        else:
-            a = np.asarray(inputs[ir.input_names[0]])
-            b = np.asarray(inputs[ir.input_names[1]])
-            m_dim, k_dim = a.shape
-            b_nk = b if ir.rhs_transposed else b.T
-            n_dim = b_nk.shape[0]
-            n_out = n_dim
-
-            if ir.dtype == DType.INT8:
-                (tmp_p / "in.bin").write_bytes(np.ascontiguousarray(a, dtype=np.int8).tobytes())
-                (tmp_p / "w.bin").write_bytes(np.ascontiguousarray(b_nk, dtype=np.int8).tobytes())
-                _adb("push", str(tmp_p / "in.bin"), f"{remote_dir}/in.bin")
-                _adb("push", str(tmp_p / "w.bin"), f"{remote_dir}/w.bin")
-                if bias is not None:
-                    (tmp_p / "bias.bin").write_bytes(np.ascontiguousarray(bias, dtype=np.int32).tobytes())
-                    _adb("push", str(tmp_p / "bias.bin"), f"{remote_dir}/bias.bin")
-                    cmd_parts.extend(["--bias", f"{remote_dir}/bias.bin"])
-                cmd_parts.extend([
-                    "--s-in", str(quant.s_in),
-                    "--zp-in", str(quant.zp_in),
-                    "--s-w", str(quant.s_w),
-                    "--s-out", str(quant.s_out),
-                    "--zp-out", str(quant.zp_out),
-                ])
-            else:
-                if b_nk.dtype == np.int8 and scales and ir.input_names[1] in scales:
-                    s = np.asarray(scales[ir.input_names[1]], dtype=np.float32)
-                    b_f = b_nk.astype(np.float32) * s[:, None]
-                else:
-                    b_f = b_nk.astype(np.float32)
-                (tmp_p / "in.bin").write_bytes(np.ascontiguousarray(a, dtype=np.float32).tobytes())
-                (tmp_p / "w.bin").write_bytes(np.ascontiguousarray(b_f, dtype=np.float32).tobytes())
-                _adb("push", str(tmp_p / "in.bin"), f"{remote_dir}/in.bin")
-                _adb("push", str(tmp_p / "w.bin"), f"{remote_dir}/w.bin")
-
-            cmd_parts.extend([
-                "--m", str(m_dim),
-                "--k", str(k_dim),
-                "--n", str(n_dim),
-                "--in", f"{remote_dir}/in.bin",
-                "--w", f"{remote_dir}/w.bin",
-                "--out", f"{remote_dir}/out.bin",
-            ])
-
-        shell_cmd = " ".join(cmd_parts)
-        exec_res = _adb("shell", f"su -c '{shell_cmd}'")
-        if exec_res.returncode != 0:
-            # Fallback without su if shell already has /dev/edgetpu-soc access
-            exec_res = _adb("shell", shell_cmd)
-        if exec_res.returncode != 0:
+    def _adb_checked(*cmd_args: str) -> subprocess.CompletedProcess[str]:
+        res = _adb(*cmd_args)
+        if res.returncode != 0:
             raise RuntimeError(
-                f"rango execution failed (rc={exec_res.returncode}):\nstdout={exec_res.stdout}\nstderr={exec_res.stderr}"
+                f"adb {' '.join(cmd_args)} failed (rc={res.returncode}): {res.stderr.strip() or res.stdout.strip()}"
             )
-        report = json.loads(exec_res.stdout)
-        pull_r = _adb("pull", f"{remote_dir}/out.bin", str(tmp_p / "out.bin"))
-        if pull_r.returncode != 0:
-            raise RuntimeError(f"adb pull out.bin failed: {pull_r.stderr}")
-        out_raw = (tmp_p / "out.bin").read_bytes()
-        if ir.dtype == DType.INT8:
-            out_arr = np.frombuffer(out_raw, dtype=np.int8).reshape(m_dim, n_dim).copy()
-        else:
-            out_arr = np.frombuffer(out_raw, dtype=np.float32).reshape(m_dim, n_dim).copy()
+        return res
+
+    # Ensure remote workspace and runner binary
+    _adb_checked("shell", f"mkdir -p {remote_dir}")
+    try:
+        _adb_checked("push", str(local_runner), remote_runner)
+        _adb_checked("shell", f"chmod 0755 {remote_runner}")
+
+        with tempfile.TemporaryDirectory(prefix="freetpu-adb-") as tmp:
+            tmp_p = Path(tmp)
+            cmd_parts: List[str] = [
+                remote_runner,
+                "--op",
+                ir.op_kind.value,
+                "--dtype",
+                ir.dtype.value,
+                "--warmup",
+                str(warmup),
+                "--iters",
+                str(iters),
+                "--perf-mode",
+                str(perf_mode),
+            ]
+
+            if ir.op_kind == OpKind.SWIGLU:
+                if bias is not None:
+                    raise ValueError("bias is not supported for op_kind='swiglu'")
+                x = np.asarray(inputs[ir.swiglu_roles["x"]], dtype=np.float32)
+                wg_name = ir.swiglu_roles["w_gate"]
+                wu_name = ir.swiglu_roles["w_up"]
+                wd_name = ir.swiglu_roles.get("w_down")
+
+                def _to_f32_nk(arr: np.ndarray, name: str) -> np.ndarray:
+                    a = np.asarray(arr)
+                    if a.dtype == np.int8 and scales and name in scales:
+                        s = np.asarray(scales[name], dtype=np.float32)
+                        a = a.astype(np.float32) * (s[:, None] if ir.rhs_transposed else s[None, :])
+                    else:
+                        a = a.astype(np.float32)
+                    return np.ascontiguousarray(a if ir.rhs_transposed else a.T, dtype=np.float32)
+
+                wg_nk = _to_f32_nk(inputs[wg_name], wg_name)
+                wu_nk = _to_f32_nk(inputs[wu_name], wu_name)
+                wd_nk = _to_f32_nk(inputs[wd_name], wd_name) if wd_name else None
+                m_dim, k_dim = x.shape
+                n_inter = wg_nk.shape[0]
+                n_out = wd_nk.shape[0] if wd_nk is not None else n_inter
+                n_dim = n_out
+
+                (tmp_p / "in.bin").write_bytes(np.ascontiguousarray(x, dtype=np.float32).tobytes())
+                (tmp_p / "wg.bin").write_bytes(wg_nk.tobytes())
+                (tmp_p / "wu.bin").write_bytes(wu_nk.tobytes())
+                for fn in ("in.bin", "wg.bin", "wu.bin"):
+                    _adb_checked("push", str(tmp_p / fn), f"{remote_dir}/{fn}")
+                cmd_parts.extend([
+                    "--m", str(m_dim),
+                    "--k", str(k_dim),
+                    "--n", str(n_out),
+                    "--n-inter", str(n_inter),
+                    "--in", f"{remote_dir}/in.bin",
+                    "--w", f"{remote_dir}/wg.bin",
+                    "--w-up", f"{remote_dir}/wu.bin",
+                ])
+                if wd_nk is not None:
+                    (tmp_p / "wd.bin").write_bytes(wd_nk.tobytes())
+                    _adb_checked("push", str(tmp_p / "wd.bin"), f"{remote_dir}/wd.bin")
+                    cmd_parts.extend(["--w-down", f"{remote_dir}/wd.bin"])
+                cmd_parts.extend(["--out", f"{remote_dir}/out.bin"])
+            else:
+                a_name, b_name = ir.gemm_roles if len(ir.gemm_roles) == 2 else (ir.input_names[0], ir.input_names[1])
+                a = np.asarray(inputs[a_name])
+                b = np.asarray(inputs[b_name])
+                m_dim, k_dim = a.shape
+                b_nk = b if ir.rhs_transposed else b.T
+                n_dim = b_nk.shape[0]
+                n_out = n_dim
+
+                if bias is not None:
+                    bias_arr = np.asarray(bias)
+                    if bias_arr.ndim != 1 or bias_arr.shape[0] != n_dim:
+                        raise ValueError(f"bias must have shape ({n_dim},), got {bias_arr.shape}")
+                    if ir.dtype != DType.INT8:
+                        raise ValueError(
+                            f"ADB buenos_a0 runner does not support bias for dtype={ir.dtype.value}; use dtype='int8' or cpu_ref"
+                        )
+
+                if ir.dtype == DType.INT8:
+                    (tmp_p / "in.bin").write_bytes(np.ascontiguousarray(a, dtype=np.int8).tobytes())
+                    (tmp_p / "w.bin").write_bytes(np.ascontiguousarray(b_nk, dtype=np.int8).tobytes())
+                    _adb_checked("push", str(tmp_p / "in.bin"), f"{remote_dir}/in.bin")
+                    _adb_checked("push", str(tmp_p / "w.bin"), f"{remote_dir}/w.bin")
+                    if bias is not None:
+                        (tmp_p / "bias.bin").write_bytes(np.ascontiguousarray(bias, dtype=np.int32).tobytes())
+                        _adb_checked("push", str(tmp_p / "bias.bin"), f"{remote_dir}/bias.bin")
+                        cmd_parts.extend(["--bias", f"{remote_dir}/bias.bin"])
+                    cmd_parts.extend([
+                        "--s-in", str(quant.s_in),
+                        "--zp-in", str(quant.zp_in),
+                        "--s-w", str(quant.s_w),
+                        "--zp-w", str(quant.zp_w),
+                        "--s-out", str(quant.s_out),
+                        "--zp-out", str(quant.zp_out),
+                    ])
+                else:
+                    if b_nk.dtype == np.int8 and scales and b_name in scales:
+                        s = np.asarray(scales[b_name], dtype=np.float32)
+                        b_f = b_nk.astype(np.float32) * s[:, None]
+                    else:
+                        b_f = b_nk.astype(np.float32)
+                    (tmp_p / "in.bin").write_bytes(np.ascontiguousarray(a, dtype=np.float32).tobytes())
+                    (tmp_p / "w.bin").write_bytes(np.ascontiguousarray(b_f, dtype=np.float32).tobytes())
+                    _adb_checked("push", str(tmp_p / "in.bin"), f"{remote_dir}/in.bin")
+                    _adb_checked("push", str(tmp_p / "w.bin"), f"{remote_dir}/w.bin")
+
+                cmd_parts.extend([
+                    "--m", str(m_dim),
+                    "--k", str(k_dim),
+                    "--n", str(n_dim),
+                    "--in", f"{remote_dir}/in.bin",
+                    "--w", f"{remote_dir}/w.bin",
+                    "--out", f"{remote_dir}/out.bin",
+                ])
+
+            shell_cmd = " ".join(cmd_parts)
+            exec_res = _adb("shell", f"su -c '{shell_cmd}'")
+            if exec_res.returncode != 0:
+                # Fallback without su if shell already has /dev/edgetpu-soc access
+                exec_res = _adb("shell", shell_cmd)
+            if exec_res.returncode != 0:
+                raise RuntimeError(
+                    f"rango execution failed (rc={exec_res.returncode}):\nstdout={exec_res.stdout}\nstderr={exec_res.stderr}"
+                )
+            report = json.loads(exec_res.stdout)
+            _adb_checked("pull", f"{remote_dir}/out.bin", str(tmp_p / "out.bin"))
+            out_raw = (tmp_p / "out.bin").read_bytes()
+            if ir.dtype == DType.INT8:
+                out_arr = np.frombuffer(out_raw, dtype=np.int8).reshape(m_dim, n_dim).copy()
+            else:
+                out_arr = np.frombuffer(out_raw, dtype=np.float32).reshape(m_dim, n_dim).copy()
+    finally:
+        _adb("shell", f"rm -rf {remote_dir}")
 
     hw_us = float(report.get("hw_us", 0.0))
     min_hw_us = float(report.get("min_hw_us", hw_us))
@@ -547,6 +594,8 @@ def run_buenos_a0(
         last_stats = None
 
         if ir.op_kind == OpKind.SWIGLU:
+            if bias is not None:
+                raise ValueError("bias is not supported for op_kind='swiglu'")
             x = np.asarray(inputs[ir.swiglu_roles["x"]], dtype=np.float32)
             wg_name = ir.swiglu_roles["w_gate"]
             wu_name = ir.swiglu_roles["w_up"]
@@ -586,18 +635,34 @@ def run_buenos_a0(
                 2.0 * m_dim * n_inter * n_out if wd_nk is not None else 0.0
             )
         else:
-            a = np.asarray(inputs[ir.input_names[0]])
-            b = np.asarray(inputs[ir.input_names[1]])
+            a_name, b_name = ir.gemm_roles if len(ir.gemm_roles) == 2 else (ir.input_names[0], ir.input_names[1])
+            a = np.asarray(inputs[a_name])
+            b = np.asarray(inputs[b_name])
             m_dim, k_dim = a.shape
             b_nk = b if ir.rhs_transposed else b.T
             n_dim = b_nk.shape[0]
             n_out = n_dim
             flops = 2.0 * m_dim * k_dim * n_dim
 
+            if bias is not None:
+                bias_arr = np.asarray(bias)
+                if bias_arr.ndim != 1 or bias_arr.shape[0] != n_dim:
+                    raise ValueError(f"bias must have shape ({n_dim},), got {bias_arr.shape}")
+                if ir.dtype != DType.INT8 and ir.op_kind != OpKind.MATMUL:
+                    raise ValueError(
+                        f"buenos_a0 does not support bias on fused {ir.op_kind.value} for dtype={ir.dtype.value}; "
+                        "use dtype='int8' or cpu_ref"
+                    )
+
             if ir.dtype == DType.INT8:
-                acc_i32, last_stats = sess.matmul_int8(
-                    a, b_nk, bias_n=bias, zp_a=qparams.zp_in, zp_b=qparams.zp_w
-                )
+                for _ in range(max(0, warmup)):
+                    sess.matmul_int8(a, b_nk, bias_n=bias, zp_a=qparams.zp_in, zp_b=qparams.zp_w)
+                t0 = time.perf_counter()
+                for _ in range(max(1, iters)):
+                    acc_i32, last_stats = sess.matmul_int8(
+                        a, b_nk, bias_n=bias, zp_a=qparams.zp_in, zp_b=qparams.zp_w
+                    )
+                    hw_samples.append(float(last_stats.hw_execution_us))
                 if ir.op_kind == OpKind.MATMUL:
                     real_mul = np.float32(np.float32(qparams.s_in * qparams.s_w) / np.float32(qparams.s_out))
                     out_arr = np.clip(
@@ -606,24 +671,36 @@ def run_buenos_a0(
                         127,
                     ).astype(np.int8)
                 else:
-                    spline_rt = lowered.summary["_spline_runtime"]
-                    out_arr = _eval_spline_on_acc_i32(
-                        acc_i32,
-                        s_in=qparams.s_in,
-                        s_w=qparams.s_w,
-                        s_out=spline_rt["s_out_eff"],
-                        zp_out=qparams.zp_out,
-                        spline_info=spline_rt,
-                    )
-                hw_samples.append(float(last_stats.hw_execution_us))
+                    spline_rt = lowered.summary.get("_spline_runtime")
+                    if spline_rt is not None:
+                        out_arr = _eval_spline_on_acc_i32(
+                            acc_i32,
+                            s_in=qparams.s_in,
+                            s_w=qparams.s_w,
+                            zp_out=qparams.zp_out,
+                            spline_info=spline_rt,
+                        )
+                    else:
+                        mode_b = lowered.summary["mode_b_requantize"]
+                        out_arr = _eval_mode_b_on_acc_i32(
+                            acc_i32,
+                            act_name=str(mode_b["activation"]),
+                            s_in=qparams.s_in,
+                            s_w=qparams.s_w,
+                            s_out=qparams.s_out,
+                            zp_out=qparams.zp_out,
+                        )
             else:
-                if b_nk.dtype == np.int8 and scales and ir.input_names[1] in scales:
-                    s = np.asarray(scales[ir.input_names[1]], dtype=np.float32)
+                if b_nk.dtype == np.int8 and scales and b_name in scales:
+                    s = np.asarray(scales[b_name], dtype=np.float32)
                     b_f = b_nk.astype(np.float32) * s[:, None]
                 else:
                     b_f = b_nk.astype(np.float32)
                 ob_act = _op_to_ob_act(ir.op_kind)
                 a_f = np.ascontiguousarray(a, dtype=np.float32)
+                for _ in range(max(0, warmup)):
+                    sess.matmul_f32_quant_batch(a_f, [b_f], [ob_act])
+                t0 = time.perf_counter()
                 for _ in range(max(1, iters)):
                     (out_arr,), last_stats = sess.matmul_f32_quant_batch(a_f, [b_f], [ob_act])
                     hw_samples.append(float(last_stats.hw_execution_us))

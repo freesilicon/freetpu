@@ -84,12 +84,16 @@ def generate_pallas_source(
     quant: Optional[QuantParams] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     """Emit self-contained JAX Pallas/Mosaic Python source for TileKernelIR."""
-    qparams = quant or ir.quant
-    a_shape = shapes[ir.input_names[0]]
-    m_dim, k_dim = int(a_shape[0]), int(a_shape[1])
+    if ir.op_kind == OpKind.SWIGLU and ir.dtype == DType.INT8:
+        raise ValueError("INT8 dtype is not supported for swiglu; use dtype='w8a16' or dtype='bf16'")
 
+    qparams = quant or ir.quant
     if ir.op_kind == OpKind.SWIGLU:
-        wg_shape = shapes[ir.swiglu_roles["w_gate"]]
+        x_name = ir.swiglu_roles["x"]
+        wg_name = ir.swiglu_roles["w_gate"]
+        a_shape = shapes[x_name]
+        m_dim, k_dim = int(a_shape[0]), int(a_shape[1])
+        wg_shape = shapes[wg_name]
         n_inter = int(wg_shape[0] if ir.rhs_transposed else wg_shape[1])
         if ir.has_down_proj:
             wd_shape = shapes[ir.swiglu_roles["w_down"]]
@@ -109,7 +113,10 @@ def generate_pallas_source(
             bn_down, bk_down, grid_down = bn_inter, bk, None
         n_dim = n_out
     else:
-        b_shape = shapes[ir.input_names[1]]
+        a_name, b_name = ir.gemm_roles if len(ir.gemm_roles) == 2 else (ir.input_names[0], ir.input_names[1])
+        a_shape = shapes[a_name]
+        b_shape = shapes[b_name]
+        m_dim, k_dim = int(a_shape[0]), int(a_shape[1])
         n_dim = int(b_shape[0] if ir.rhs_transposed else b_shape[1])
         m_pad, bm, bn, bk = _validate_pallas_blocks(
             m_dim, k_dim, n_dim, ir.block_spec.block_m, ir.block_spec.block_n, ir.block_spec.block_k
@@ -152,11 +159,30 @@ def generate_pallas_source(
             in_params = "a, b"
 
         if ir.dtype == DType.INT8:
-            dot_expr = (
-                "jax.lax.dot_general(a_tile, b_tile, (((1,), (1,)), ((), ())), preferred_element_type=jnp.int32).astype(jnp.float32)"
+            dot_raw = (
+                "jax.lax.dot_general(a_tile, b_tile, (((1,), (1,)), ((), ())), preferred_element_type=jnp.int32)"
                 if rhs_t
-                else "jnp.dot(a_tile, b_tile, preferred_element_type=jnp.int32).astype(jnp.float32)"
+                else "jnp.dot(a_tile, b_tile, preferred_element_type=jnp.int32)"
             )
+            zp_in = int(qparams.zp_in)
+            zp_w = int(qparams.zp_w)
+            if zp_in == 0 and zp_w == 0:
+                dot_block = f"prod = ({dot_raw}).astype(jnp.float32)"
+            else:
+                terms = [f"acc_corr = {dot_raw}"]
+                if zp_w != 0:
+                    terms.append("acc_corr = acc_corr - (" + repr(zp_w) + ") * jnp.sum(a_tile.astype(jnp.int32), axis=1, keepdims=True)")
+                if zp_in != 0:
+                    b_sum_expr = (
+                        "jnp.sum(b_tile.astype(jnp.int32), axis=1)[None, :]"
+                        if rhs_t
+                        else "jnp.sum(b_tile.astype(jnp.int32), axis=0, keepdims=True)"
+                    )
+                    terms.append(f"acc_corr = acc_corr - ({zp_in!r}) * {b_sum_expr}")
+                if zp_in != 0 and zp_w != 0:
+                    terms.append(f"acc_corr = acc_corr + ({cur_bk * zp_in * zp_w!r})")
+                terms.append("prod = acc_corr.astype(jnp.float32)")
+                dot_block = "\n        ".join(terms)
             scale_scale = float(qparams.s_in * qparams.s_w)
             epilogue_pre = f"v = acc_ref[...] * {scale_scale!r}\n            o_ref[...] = {epi}"
         else:
@@ -165,6 +191,7 @@ def generate_pallas_source(
                 if rhs_t
                 else "jnp.dot(a_tile, b_tile, preferred_element_type=jnp.float32)"
             )
+            dot_block = f"prod = {dot_expr}"
             epilogue_pre = f"v = acc_ref[...]\n            o_ref[...] = {epi}"
 
         b_spec_str = (
@@ -178,7 +205,7 @@ def generate_pallas_source(
             "        k_idx = pl.program_id(2)",
             "        a_tile = a_ref[...]",
             f"        {deq}",
-            f"        prod = {dot_expr}",
+            f"        {dot_block}",
             "",
             "        @pl.when(k_idx == 0)",
             "        def _init():",
@@ -339,12 +366,18 @@ def run_cloud_tpu_pallas(
     inputs: Dict[str, Any],
     *,
     quant: Optional[QuantParams] = None,
+    bias: Optional[np.ndarray] = None,
     scales: Optional[Dict[str, np.ndarray]] = None,
     warmup: int = 4,
     iters: int = 20,
     dry_run: bool = False,
 ) -> ExecutionResult:
     """Lower and (when JAX+TPU is present and dry_run=False) execute on Cloud TPU Pallas/Mosaic."""
+    if bias is not None:
+        raise ValueError(
+            "cloud_tpu_pallas backend does not support bias on GEMM kernels; "
+            "omit `bias` or target `cpu_ref` / supported `buenos_a0` paths"
+        )
     shapes = {k: tuple(np.asarray(v).shape) for k, v in inputs.items()}
     lowered = lower_cloud_tpu_pallas(ir, shapes, quant=quant)
     meta = dict(lowered.summary)
@@ -420,8 +453,9 @@ def run_cloud_tpu_pallas(
         if ir.has_down_proj:
             args_j.extend(_prep_w(ir.swiglu_roles["w_down"]))
     else:
-        a_j = _pad_a(inputs[ir.input_names[0]])
-        args_j = [a_j, *_prep_w(ir.input_names[1])]
+        a_name, b_name = ir.gemm_roles if len(ir.gemm_roles) == 2 else (ir.input_names[0], ir.input_names[1])
+        a_j = _pad_a(inputs[a_name])
+        args_j = [a_j, *_prep_w(b_name)]
 
     jax.block_until_ready(args_j)
     lowered_hlo = run_kernel.lower(*args_j).as_text()

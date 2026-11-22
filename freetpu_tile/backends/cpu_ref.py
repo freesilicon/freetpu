@@ -144,6 +144,10 @@ def run_cpu_ref(
     t0 = time.perf_counter()
 
     if ir.op_kind == OpKind.SWIGLU:
+        if ir.dtype == DType.INT8:
+            raise ValueError("INT8 dtype is not supported for swiglu; use dtype='w8a16' or dtype='bf16'")
+        if bias is not None:
+            raise ValueError("bias is not supported for op_kind='swiglu'")
         x_name = ir.swiglu_roles["x"]
         wg_name = ir.swiglu_roles["w_gate"]
         wu_name = ir.swiglu_roles["w_up"]
@@ -194,12 +198,17 @@ def run_cpu_ref(
         n_out = out.shape[1]
         flops = (4.0 * m_dim * k_dim * n_inter) + (2.0 * m_dim * n_inter * n_out if ir.has_down_proj else 0.0)
     else:
-        a_name, b_name = ir.input_names[0], ir.input_names[1]
+        a_name, b_name = ir.gemm_roles if len(ir.gemm_roles) == 2 else (ir.input_names[0], ir.input_names[1])
         a = np.asarray(inputs[a_name])
         b = np.asarray(inputs[b_name])
         m_dim, k_dim = a.shape
         n_dim = b.shape[0] if ir.rhs_transposed else b.shape[1]
         flops = 2.0 * m_dim * k_dim * n_dim
+
+        if bias is not None:
+            bias_arr = np.asarray(bias)
+            if bias_arr.ndim != 1 or bias_arr.shape[0] != n_dim:
+                raise ValueError(f"bias must have shape ({n_dim},), got {bias_arr.shape}")
 
         if ir.dtype == DType.INT8:
             acc = _int8_gemm_acc(

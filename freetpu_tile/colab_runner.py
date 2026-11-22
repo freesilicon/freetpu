@@ -258,6 +258,13 @@ def run_colab_tile_kernel(
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    forwarded_after_sep: Tuple[str, ...] = ()
+    if "--" in raw_argv:
+        sep = raw_argv.index("--")
+        forwarded_after_sep = tuple(raw_argv[sep + 1 :])
+        raw_argv = raw_argv[:sep]
+
     ap = argparse.ArgumentParser(description="Run a FreeTPU @tile_kernel script headlessly on Colab TPU.")
     ap.add_argument("script", type=Path, help="Local Python @tile_kernel script to run on Colab TPU.")
     ap.add_argument("--tpu", default="v6e1", choices=("v6e1", "v5e1"))
@@ -267,11 +274,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--session", default=None)
     ap.add_argument("--timeout", type=float, default=300.0)
     ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("script_args", nargs="*", help="Arguments passed to the remote script.")
-    args = ap.parse_args(argv)
+    ap.add_argument("script_args", nargs="*", help="Arguments passed to the remote script (prefer passing after `--`).")
+    args = ap.parse_args(raw_argv)
 
     tpus = (args.tpu,) if (args.no_fallback or args.tpu != "v6e1") else ("v6e1", "v5e1")
-    extra_args = tuple(args.script_args) if args.script_args else ("--target", "cloud_tpu_pallas")
+    combined_args = (*args.script_args, *forwarded_after_sep)
+    extra_args = combined_args if combined_args else ("--target", "cloud_tpu_pallas")
     rc, summary = run_colab_tile_kernel(
         args.script,
         script_args=extra_args,

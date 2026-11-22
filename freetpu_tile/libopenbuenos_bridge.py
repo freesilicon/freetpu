@@ -129,6 +129,34 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def _copy_build_tree(src_dir: Path, docs_dir: Optional[Path], dst_root: Path) -> Path:
+    import shutil
+
+    dst_lib = dst_root / "libopenbuenos"
+    dst_lib.mkdir(parents=True, exist_ok=True)
+    for rel in ("Makefile", "CMakeLists.txt"):
+        f = src_dir / rel
+        if f.is_file():
+            shutil.copy2(f, dst_lib / rel)
+    for sub in ("include", "src"):
+        s = src_dir / sub
+        d = dst_lib / sub
+        if s.is_dir():
+            if d.exists():
+                shutil.rmtree(d)
+            shutil.copytree(s, d)
+    if docs_dir is not None and docs_dir.is_dir():
+        dst_docs = dst_root / "docs"
+        for sub in ("baremetal-vii", "kernel-abi"):
+            s = docs_dir / sub
+            d = dst_docs / sub
+            if s.is_dir():
+                if d.exists():
+                    shutil.rmtree(d)
+                shutil.copytree(s, d)
+    return dst_lib
+
+
 def find_libopenbuenos_path(build_if_missing: bool = True) -> Optional[Path]:
     """Locate (or optionally build via make) the libopenbuenos shared library."""
     env_p = os.environ.get("OPENBUENOS_LIB_PATH", "").strip()
@@ -139,24 +167,38 @@ def find_libopenbuenos_path(build_if_missing: bool = True) -> Optional[Path]:
 
     root = _repo_root()
     ext = "dylib" if platform.system() == "Darwin" else "so"
+    cache_root = Path.home() / ".cache" / "freetpu" / "build_tree"
+    cache_src = cache_root / "libopenbuenos"
     candidates = [
         root / "libopenbuenos" / "build" / "host" / f"libopenbuenos.{ext}",
         root / "build-cmake" / f"libopenbuenos.{ext}",
         root / "libopenbuenos" / "build" / "cmake-host" / f"libopenbuenos.{ext}",
+        cache_src / "build" / "host" / f"libopenbuenos.{ext}",
     ]
     for cand in candidates:
         if cand.is_file():
             return cand
 
-    if build_if_missing and (root / "libopenbuenos" / "Makefile").is_file():
+    src_dir = root / "libopenbuenos"
+    docs_dir = root / "docs"
+    if not docs_dir.is_dir():
+        pkg_docs = Path(__file__).resolve().parent / "_packaged_docs"
+        if pkg_docs.is_dir():
+            docs_dir = pkg_docs
+    if build_if_missing and (src_dir / "Makefile").is_file():
+        in_site_packages = "site-packages" in src_dir.parts or "dist-packages" in src_dir.parts
+        build_dir = src_dir if (os.access(src_dir, os.W_OK) and not in_site_packages) else cache_src
+        if build_dir is cache_src:
+            build_dir = _copy_build_tree(src_dir, docs_dir, cache_root)
         res = subprocess.run(
-            ["make", "-C", str(root / "libopenbuenos"), "host-shared"],
+            ["make", "-C", str(build_dir), "host-shared"],
             capture_output=True,
             text=True,
             check=False,
         )
-        if res.returncode == 0 and candidates[0].is_file():
-            return candidates[0]
+        built = build_dir / "build" / "host" / f"libopenbuenos.{ext}"
+        if res.returncode == 0 and built.is_file():
+            return built
     return None
 
 
@@ -385,13 +427,17 @@ class OpenBuenosSession:
         b = np.ascontiguousarray(b_nk, dtype=np.int8)
         m_dim, k_dim = a.shape
         n_dim, b_k = b.shape
+        if a.ndim != 2 or b.ndim != 2:
+            raise ValueError(f"Expected 2D tensors, got A={a.shape}, B_nk={b.shape}")
         if b_k != k_dim:
             raise ValueError(f"Shape mismatch: A={a.shape}, B_nk={b.shape}")
-        bias_arr = (
-            np.ascontiguousarray(bias_n, dtype=np.int32)
-            if bias_n is not None
-            else None
-        )
+        bias_arr: Optional[np.ndarray] = None
+        if bias_n is not None:
+            bias_arr = np.ascontiguousarray(bias_n, dtype=np.int32)
+            if bias_arr.ndim != 1 or bias_arr.shape[0] != n_dim:
+                raise ValueError(
+                    f"INT8 bias_n must have shape ({n_dim},), got {bias_arr.shape}"
+                )
         c_out = np.zeros((m_dim, n_dim), dtype=np.int32)
         stats = ObInvokeStats()
         st = self.bridge.lib.ob_gemm_matmul_int8(

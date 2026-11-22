@@ -52,6 +52,7 @@ struct RunnerArgs {
   float s_in = 0.03125f;
   int32_t zp_in = 0;
   float s_w = 0.015625f;
+  int32_t zp_w = 0;
   float s_out = 0.0625f;
   int32_t zp_out = 0;
   int warmup = 3;
@@ -219,6 +220,7 @@ bool parse_args(int argc, char** argv, RunnerArgs* args, std::string* err) {
     else if (a == "--s-in") args->s_in = std::stof(next("--s-in"));
     else if (a == "--zp-in") args->zp_in = std::stoi(next("--zp-in"));
     else if (a == "--s-w") args->s_w = std::stof(next("--s-w"));
+    else if (a == "--zp-w") args->zp_w = std::stoi(next("--zp-w"));
     else if (a == "--s-out") args->s_out = std::stof(next("--s-out"));
     else if (a == "--zp-out") args->zp_out = std::stoi(next("--zp-out"));
     else if (a == "--warmup") args->warmup = std::stoi(next("--warmup"));
@@ -274,11 +276,15 @@ int main(int argc, char** argv) {
     return 1;
   }
   if (args.op == "swiglu") {
-    if (args.w_up_path.empty() || args.w_down_path.empty()) {
-      std::fprintf(stderr, "freetpu_tile_runner: swiglu requires --w-up and --w-down\n");
+    if (args.w_up_path.empty()) {
+      std::fprintf(stderr, "freetpu_tile_runner: swiglu requires --w-up\n");
       return 2;
     }
-    if (!read_bin(args.w_up_path, &w_up_bytes, &err) || !read_bin(args.w_down_path, &w_down_bytes, &err)) {
+    if (!read_bin(args.w_up_path, &w_up_bytes, &err)) {
+      std::fprintf(stderr, "freetpu_tile_runner: %s\n", err.c_str());
+      return 1;
+    }
+    if (!args.w_down_path.empty() && !read_bin(args.w_down_path, &w_down_bytes, &err)) {
       std::fprintf(stderr, "freetpu_tile_runner: %s\n", err.c_str());
       return 1;
     }
@@ -330,71 +336,134 @@ int main(int argc, char** argv) {
     }
 
     std::vector<int32_t> bias_i32(args.n, 0);
-    if (!bias_bytes.empty() && bias_bytes.size() == static_cast<size_t>(args.n) * 4u) {
+    if (!bias_bytes.empty()) {
+      const size_t expected_bias = static_cast<size_t>(args.n) * 4u;
+      if (bias_bytes.size() != expected_bias) {
+        std::fprintf(stderr, "int32 bias size mismatch: %zu (exp %zu)\n",
+                     bias_bytes.size(), expected_bias);
+        ob_context_destroy(ctx);
+        return 2;
+      }
       std::memcpy(bias_i32.data(), bias_bytes.data(), bias_bytes.size());
     }
 
-    ob_gemm_desc_t desc{};
-    desc.m_dim = args.m;
-    desc.k_dim = args.k;
-    desc.n_dim = args.n;
-    desc.s_in = args.s_in;
-    desc.zp_in = args.zp_in;
-    desc.s_w = args.s_w;
-    desc.zp_w = 0;
-    desc.s_out = args.s_out;
-    desc.zp_out = args.zp_out;
-    desc.activation = parse_activation(args.op);
-    desc.weights_nk = reinterpret_cast<const int8_t*>(w_bytes.data());
-    desc.bias_n = bias_i32.data();
+    if (!emitter_registered && args.mock) {
+      // Host mock mode without an RV64 DIVE image: compute exact INT32 accumulators via ob_gemm_matmul_int8
+      // and apply requested activation + output quantization cleanly.
+      const auto* a_ptr = reinterpret_cast<const int8_t*>(in_bytes.data());
+      const auto* b_ptr = reinterpret_cast<const int8_t*>(w_bytes.data());
+      const int32_t* bias_ptr = bias_bytes.empty() ? nullptr : bias_i32.data();
+      std::vector<int32_t> acc_i32(static_cast<size_t>(args.m) * args.n, 0);
+      for (int i = 0; st == OB_OK && i < args.warmup; ++i) {
+        ob_invoke_stats_t ws{};
+        st = ob_gemm_matmul_int8(ctx, a_ptr, b_ptr, bias_ptr, acc_i32.data(),
+                                 args.m, args.k, args.n, args.zp_in, args.zp_w, &ws);
+      }
+      for (int i = 0; st == OB_OK && i < std::max(1, args.iters); ++i) {
+        ob_invoke_stats_t is{};
+        auto t0 = std::chrono::steady_clock::now();
+        st = ob_gemm_matmul_int8(ctx, a_ptr, b_ptr, bias_ptr, acc_i32.data(),
+                                 args.m, args.k, args.n, args.zp_in, args.zp_w, &is);
+        auto t1 = std::chrono::steady_clock::now();
+        double wall_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+        hw_us_samples.push_back(static_cast<double>(is.hw_execution_us));
+        wall_us_samples.push_back(wall_us);
+        tiles_dispatched = is.tiles_dispatched;
+        cache_hits = is.cache_hits;
+      }
+      std::vector<int8_t> out_i8(acc_i32.size(), 0);
+      if (st == OB_OK) {
+        const uint32_t act = parse_activation(args.op);
+        const float in_scale = args.s_in * args.s_w;
+        const float real_mul = in_scale / args.s_out;
+        for (size_t idx = 0; idx < acc_i32.size(); ++idx) {
+          float qf = 0.0f;
+          if (act == OB_ACT_NONE) {
+            qf = static_cast<float>(acc_i32[idx]) * real_mul + static_cast<float>(args.zp_out);
+          } else {
+            double x = static_cast<double>(static_cast<float>(acc_i32[idx]) * in_scale);
+            double y = x;
+            if (act == OB_ACT_SILU) {
+              double xc = std::clamp(x, -80.0, 80.0);
+              y = x / (1.0 + std::exp(-xc));
+            } else if (act == OB_ACT_GELU) {
+              constexpr double kSqrt2OverPi = 0.7978845608028654;
+              y = 0.5 * x * (1.0 + std::tanh(kSqrt2OverPi * (x + 0.044715 * x * x * x)));
+            }
+            qf = static_cast<float>(y / static_cast<double>(args.s_out) + static_cast<double>(args.zp_out));
+          }
+          double rounded = std::nearbyint(static_cast<double>(qf));
+          if (rounded < -128.0) rounded = -128.0;
+          if (rounded > 127.0) rounded = 127.0;
+          out_i8[idx] = static_cast<int8_t>(static_cast<int>(rounded));
+        }
+      }
+      if (st != OB_OK || !write_bin(args.out_path, out_i8.data(), out_i8.size(), &err)) {
+        ok = false;
+      }
+    } else {
+      ob_gemm_desc_t desc{};
+      desc.m_dim = args.m;
+      desc.k_dim = args.k;
+      desc.n_dim = args.n;
+      desc.s_in = args.s_in;
+      desc.zp_in = args.zp_in;
+      desc.s_w = args.s_w;
+      desc.zp_w = args.zp_w;
+      desc.s_out = args.s_out;
+      desc.zp_out = args.zp_out;
+      desc.activation = parse_activation(args.op);
+      desc.weights_nk = reinterpret_cast<const int8_t*>(w_bytes.data());
+      desc.bias_n = bias_i32.data();
 
-    size_t req_sz = 0u;
-    st = ob_gemm_synthesize_dgc0(ctx, &desc, nullptr, 0u, &req_sz);
-    std::vector<uint8_t> dgc0(req_sz, 0u);
-    if (st == OB_ERR_OVERFLOW && req_sz > 0u) {
-      st = ob_gemm_synthesize_dgc0(ctx, &desc, dgc0.data(), dgc0.size(), &req_sz);
-    }
-    if (st != OB_OK) {
-      std::fprintf(stderr, "ob_gemm_synthesize_dgc0 failed: %s (%s)\n",
-                   ob_status_string(st), ob_context_last_error(ctx));
-      ob_context_destroy(ctx);
-      return 1;
-    }
-    dgc0_bytes = req_sz;
+      size_t req_sz = 0u;
+      st = ob_gemm_synthesize_dgc0(ctx, &desc, nullptr, 0u, &req_sz);
+      std::vector<uint8_t> dgc0(req_sz, 0u);
+      if (st == OB_ERR_OVERFLOW && req_sz > 0u) {
+        st = ob_gemm_synthesize_dgc0(ctx, &desc, dgc0.data(), dgc0.size(), &req_sz);
+      }
+      if (st != OB_OK) {
+        std::fprintf(stderr, "ob_gemm_synthesize_dgc0 failed: %s (%s)\n",
+                     ob_status_string(st), ob_context_last_error(ctx));
+        ob_context_destroy(ctx);
+        return 1;
+      }
+      dgc0_bytes = req_sz;
 
-    ob_graph_t* g = nullptr;
-    st = ob_graph_register_dgc0(ctx, dgc0.data(), dgc0.size(), 0u, &g);
-    ob_buffer_t* in_buf = nullptr;
-    ob_buffer_t* out_buf = nullptr;
-    if (st == OB_OK) st = ob_buffer_alloc(ctx, std::max<size_t>(expected_in, 4096u), OB_BUF_TO_DEVICE | OB_BUF_ZERO_INIT, &in_buf);
-    if (st == OB_OK) st = ob_buffer_alloc(ctx, std::max<size_t>(static_cast<size_t>(args.m) * args.n, 4096u), OB_BUF_FROM_DEVICE | OB_BUF_ZERO_INIT, &out_buf);
-    if (st == OB_OK) st = ob_buffer_write(in_buf, in_bytes.data(), expected_in, 0u);
+      ob_graph_t* g = nullptr;
+      st = ob_graph_register_dgc0(ctx, dgc0.data(), dgc0.size(), 0u, &g);
+      ob_buffer_t* in_buf = nullptr;
+      ob_buffer_t* out_buf = nullptr;
+      if (st == OB_OK) st = ob_buffer_alloc(ctx, std::max<size_t>(expected_in, 4096u), OB_BUF_TO_DEVICE | OB_BUF_ZERO_INIT, &in_buf);
+      if (st == OB_OK) st = ob_buffer_alloc(ctx, std::max<size_t>(static_cast<size_t>(args.m) * args.n, 4096u), OB_BUF_FROM_DEVICE | OB_BUF_ZERO_INIT, &out_buf);
+      if (st == OB_OK) st = ob_buffer_write(in_buf, in_bytes.data(), expected_in, 0u);
 
-    for (int i = 0; st == OB_OK && i < args.warmup; ++i) {
-      ob_invoke_stats_t ws{};
-      st = ob_graph_invoke(g, &in_buf, 1u, &out_buf, 1u, &ws);
-    }
-    for (int i = 0; st == OB_OK && i < std::max(1, args.iters); ++i) {
-      ob_invoke_stats_t is{};
-      auto t0 = std::chrono::steady_clock::now();
-      st = ob_graph_invoke(g, &in_buf, 1u, &out_buf, 1u, &is);
-      auto t1 = std::chrono::steady_clock::now();
-      double wall_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
-      hw_us_samples.push_back(static_cast<double>(is.hw_execution_us));
-      wall_us_samples.push_back(wall_us);
-      tiles_dispatched = 1u;
-    }
+      for (int i = 0; st == OB_OK && i < args.warmup; ++i) {
+        ob_invoke_stats_t ws{};
+        st = ob_graph_invoke(g, &in_buf, 1u, &out_buf, 1u, &ws);
+      }
+      for (int i = 0; st == OB_OK && i < std::max(1, args.iters); ++i) {
+        ob_invoke_stats_t is{};
+        auto t0 = std::chrono::steady_clock::now();
+        st = ob_graph_invoke(g, &in_buf, 1u, &out_buf, 1u, &is);
+        auto t1 = std::chrono::steady_clock::now();
+        double wall_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+        hw_us_samples.push_back(static_cast<double>(is.hw_execution_us));
+        wall_us_samples.push_back(wall_us);
+        tiles_dispatched = 1u;
+      }
 
-    std::vector<uint8_t> out_data(static_cast<size_t>(args.m) * args.n, 0u);
-    if (st == OB_OK) {
-      st = ob_buffer_read(out_buf, out_data.data(), out_data.size(), 0u);
+      std::vector<uint8_t> out_data(static_cast<size_t>(args.m) * args.n, 0u);
+      if (st == OB_OK) {
+        st = ob_buffer_read(out_buf, out_data.data(), out_data.size(), 0u);
+      }
+      if (st != OB_OK || !write_bin(args.out_path, out_data.data(), out_data.size(), &err)) {
+        ok = false;
+      }
+      if (out_buf) ob_buffer_free(out_buf);
+      if (in_buf) ob_buffer_free(in_buf);
+      if (g) ob_graph_release(g);
     }
-    if (st != OB_OK || !write_bin(args.out_path, out_data.data(), out_data.size(), &err)) {
-      ok = false;
-    }
-    if (out_buf) ob_buffer_free(out_buf);
-    if (in_buf) ob_buffer_free(in_buf);
-    if (g) ob_graph_release(g);
   } else {
     // w8a16 / bf16 path using Q8_0 weights + FP32 activations via ob_gemm_matmul_f32_quant_batch
     const uint32_t k_pad = ((args.k + OB_QK8_0 - 1u) / OB_QK8_0) * OB_QK8_0;
@@ -421,11 +490,17 @@ int main(int argc, char** argv) {
     };
 
     if (args.op == "swiglu") {
+      const bool has_down = !args.w_down_path.empty();
+      if (!has_down && args.n != args.n_inter) {
+        std::fprintf(stderr, "2-proj swiglu requires --n (%u) == --n-inter (%u)\n", args.n, args.n_inter);
+        ob_context_destroy(ctx);
+        return 2;
+      }
       const uint32_t inter_pad = ((args.n_inter + OB_QK8_0 - 1u) / OB_QK8_0) * OB_QK8_0;
       std::vector<ob_block_q8_0_t> q_gate, q_up, q_down;
       if (!load_q8(w_bytes, args.n_inter, args.k, k_pad, &q_gate) ||
           !load_q8(w_up_bytes, args.n_inter, args.k, k_pad, &q_up) ||
-          !load_q8(w_down_bytes, args.n, args.n_inter, inter_pad, &q_down)) {
+          (has_down && !load_q8(w_down_bytes, args.n, args.n_inter, inter_pad, &q_down))) {
         std::fprintf(stderr, "swiglu weight byte size mismatch\n");
         ob_context_destroy(ctx);
         return 2;
@@ -438,12 +513,26 @@ int main(int argc, char** argv) {
       ob_gemm_f32_quant_job_t gu_jobs[2]{};
       gu_jobs[0] = {q_gate.data(), c_gate.data(), args.n_inter, OB_ACT_SILU, 0u, {0, 0, 0}};
       gu_jobs[1] = {q_up.data(), c_up.data(), args.n_inter, OB_ACT_NONE, 0u, {0, 0, 0}};
-      ob_gemm_f32_quant_job_t down_job{q_down.data(), c_out.data(), args.n, OB_ACT_NONE, 0u, {0, 0, 0}};
+      ob_gemm_f32_quant_job_t down_job{};
+      if (has_down) {
+        down_job = {q_down.data(), c_out.data(), args.n, OB_ACT_NONE, 0u, {0, 0, 0}};
+      }
 
       auto run_once = [&](ob_invoke_stats_t* s_tot) -> ob_status_t {
         ob_invoke_stats_t s1{}, s2{};
         ob_status_t r = ob_gemm_matmul_f32_quant_batch(ctx, a_padded.data(), args.m, k_pad, gu_jobs, 2u, &s1);
         if (r != OB_OK) return r;
+        if (!has_down) {
+          for (uint32_t m = 0; m < args.m; ++m) {
+            for (uint32_t j = 0; j < args.n_inter; ++j) {
+              c_out[static_cast<size_t>(m) * args.n + j] =
+                  c_gate[static_cast<size_t>(m) * args.n_inter + j] *
+                  c_up[static_cast<size_t>(m) * args.n_inter + j];
+            }
+          }
+          if (s_tot) *s_tot = s1;
+          return OB_OK;
+        }
         for (uint32_t m = 0; m < args.m; ++m) {
           for (uint32_t j = 0; j < args.n_inter; ++j) {
             hidden[static_cast<size_t>(m) * inter_pad + j] =

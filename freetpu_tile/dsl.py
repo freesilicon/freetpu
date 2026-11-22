@@ -145,6 +145,7 @@ def load(
         attrs["tile_shape"] = tuple(int(s) for s in shape)
     if index is not None:
         attrs["index"] = repr(index)
+        attrs["index_expr"] = index
     tv = TileValue(vid=vid, op="load", attrs=attrs)
     tracer.values[vid] = tv
     tracer.ops.append(TileOp(op="load", inputs=(tensor.name,), output=vid, attrs=attrs))
@@ -188,14 +189,51 @@ def store(out: TileTensorProxy, val: TileValue, index: Any = None) -> None:
     attrs: Dict[str, Any] = {"param": out.name}
     if index is not None:
         attrs["index"] = repr(index)
+        attrs["index_expr"] = index
     tracer.ops.append(TileOp(op="store", inputs=(val.vid,), output=out.name, attrs=attrs))
     tracer.stored_output = (out.name, val)
 
 
-def _trace_param_source(val: TileValue) -> str:
+def _trace_param_source(val: TileValue) -> TileValue:
     if val.op == "load":
-        return str(val.attrs["param"])
+        return val
     raise ValueError(f"Expected loaded tensor parameter, got op={val.op}")
+
+
+def _validate_load_index(
+    idx: Any,
+    role: str,
+    *,
+    rhs_transposed: bool,
+) -> None:
+    if idx is None:
+        return
+    if not isinstance(idx, tuple) or len(idx) != 2:
+        raise ValueError(
+            f"Unsupported load index {idx!r} for {role}; expected None or a 2D (row, col) tile selector"
+        )
+    r_idx, c_idx = idx
+    if role == "lhs":
+        if r_idx != PidExpr(0) or c_idx is not None:
+            raise ValueError(
+                f"Unsupported LHS tile load index {idx!r}; expected (program_id(0), None) or None"
+            )
+    else:
+        expected = (PidExpr(1), None) if rhs_transposed else (None, PidExpr(1))
+        if (r_idx, c_idx) != expected:
+            raise ValueError(
+                f"Unsupported RHS tile load index {idx!r} (rhs_transposed={rhs_transposed}); "
+                f"expected {expected!r} or None"
+            )
+
+
+def _validate_store_index(idx: Any) -> None:
+    if idx is None:
+        return
+    if idx != (PidExpr(0), PidExpr(1)):
+        raise ValueError(
+            f"Unsupported store tile index {idx!r}; expected (program_id(0), program_id(1)) or None"
+        )
 
 
 def _canonicalize_ir(
@@ -232,32 +270,56 @@ def _canonicalize_ir(
 
     input_names = tuple(p for p in param_names if p != out_name)
 
+    store_ops = [op for op in tracer.ops if op.op == "store"]
+    if len(store_ops) != 1:
+        raise ValueError(f"@tile_kernel {fn.__name__} must perform exactly one store(), found {len(store_ops)}")
+    _validate_store_index(store_ops[0].attrs.get("index_expr"))
+
     # Pattern match & fuse canonical Tile IR
     explicit_rhs_t = rhs_transposed
+    gemm_roles: Tuple[str, str] = ()
     swiglu_roles: Dict[str, str] = {}
     has_down_proj = False
+    lhs_loads: List[TileValue] = []
+    rhs_loads: List[TileValue] = []
+    proj_transposes: List[bool] = []
+    used_ops: set[str] = {store_ops[0].output}
 
-    def _check_dot_pair(node: TileValue) -> Tuple[str, str]:
-        nonlocal explicit_rhs_t
+    def _dot_pair_nodes(node: TileValue) -> Tuple[TileValue, TileValue, bool]:
         if node.op != "dot" or len(node.inputs) != 2:
             raise ValueError(f"Expected dot(lhs, rhs), got {node.op}")
-        if "rhs_transposed" in node.attrs:
-            explicit_rhs_t = bool(node.attrs["rhs_transposed"])
-        return _trace_param_source(node.inputs[0]), _trace_param_source(node.inputs[1])
+        eff_t = (
+            bool(node.attrs["rhs_transposed"])
+            if "rhs_transposed" in node.attrs
+            else rhs_transposed
+        )
+        proj_transposes.append(eff_t)
+        lhs_ld = _trace_param_source(node.inputs[0])
+        rhs_ld = _trace_param_source(node.inputs[1])
+        lhs_loads.append(lhs_ld)
+        rhs_loads.append(rhs_ld)
+        used_ops.update((node.vid, lhs_ld.vid, rhs_ld.vid))
+        return lhs_ld, rhs_ld, eff_t
 
     def _match_gated_mul(node: TileValue) -> Optional[Tuple[str, str, str]]:
         if node.op != "mul" or len(node.inputs) != 2:
             return None
         lhs, rhs = node.inputs[0], node.inputs[1]
         if lhs.op == "silu" and lhs.inputs[0].op == "dot" and rhs.op == "dot":
-            x1, wg = _check_dot_pair(lhs.inputs[0])
-            x2, wu = _check_dot_pair(rhs)
+            used_ops.update((node.vid, lhs.vid))
+            x1_ld, wg_ld, _ = _dot_pair_nodes(lhs.inputs[0])
+            x2_ld, wu_ld, _ = _dot_pair_nodes(rhs)
+            x1, wg = str(x1_ld.attrs["param"]), str(wg_ld.attrs["param"])
+            x2, wu = str(x2_ld.attrs["param"]), str(wu_ld.attrs["param"])
             if x1 != x2:
                 raise ValueError(f"SwiGLU gate and up projections must share input tensor: {x1} vs {x2}")
             return x1, wg, wu
         if rhs.op == "silu" and rhs.inputs[0].op == "dot" and lhs.op == "dot":
-            x1, wg = _check_dot_pair(rhs.inputs[0])
-            x2, wu = _check_dot_pair(lhs)
+            used_ops.update((node.vid, rhs.vid))
+            x1_ld, wg_ld, _ = _dot_pair_nodes(rhs.inputs[0])
+            x2_ld, wu_ld, _ = _dot_pair_nodes(lhs)
+            x1, wg = str(x1_ld.attrs["param"]), str(wg_ld.attrs["param"])
+            x2, wu = str(x2_ld.attrs["param"]), str(wu_ld.attrs["param"])
             if x1 != x2:
                 raise ValueError(f"SwiGLU gate and up projections must share input tensor: {x1} vs {x2}")
             return x1, wg, wu
@@ -269,19 +331,32 @@ def _canonicalize_ir(
         matched_mul = _match_gated_mul(lhs_node)
         if matched_mul is not None:
             x_name, wg_name, wu_name = matched_mul
-            wd_name = _trace_param_source(rhs_node)
+            wd_ld = _trace_param_source(rhs_node)
+            down_t = (
+                bool(store_val.attrs["rhs_transposed"])
+                if "rhs_transposed" in store_val.attrs
+                else rhs_transposed
+            )
+            proj_transposes.append(down_t)
+            rhs_loads.append(wd_ld)
+            used_ops.update((store_val.vid, wd_ld.vid))
             op_kind = OpKind.SWIGLU
             has_down_proj = True
-            swiglu_roles = {"x": x_name, "w_gate": wg_name, "w_up": wu_name, "w_down": wd_name}
+            swiglu_roles = {"x": x_name, "w_gate": wg_name, "w_up": wu_name, "w_down": str(wd_ld.attrs["param"])}
         else:
-            _check_dot_pair(store_val)
+            lhs_ld, rhs_ld, explicit_rhs_t = _dot_pair_nodes(store_val)
             op_kind = OpKind.MATMUL
+            gemm_roles = (str(lhs_ld.attrs["param"]), str(rhs_ld.attrs["param"]))
     elif store_val.op == "silu" and store_val.inputs[0].op == "dot":
-        _check_dot_pair(store_val.inputs[0])
+        used_ops.add(store_val.vid)
+        lhs_ld, rhs_ld, explicit_rhs_t = _dot_pair_nodes(store_val.inputs[0])
         op_kind = OpKind.FUSED_MATMUL_SILU
+        gemm_roles = (str(lhs_ld.attrs["param"]), str(rhs_ld.attrs["param"]))
     elif store_val.op == "gelu" and store_val.inputs[0].op == "dot":
-        _check_dot_pair(store_val.inputs[0])
+        used_ops.add(store_val.vid)
+        lhs_ld, rhs_ld, explicit_rhs_t = _dot_pair_nodes(store_val.inputs[0])
         op_kind = OpKind.FUSED_MATMUL_GELU
+        gemm_roles = (str(lhs_ld.attrs["param"]), str(rhs_ld.attrs["param"]))
     else:
         matched_mul = _match_gated_mul(store_val)
         if matched_mul is not None:
@@ -295,6 +370,53 @@ def _canonicalize_ir(
                 "Supported core patterns: matmul, fused matmul+silu, fused matmul+gelu, swiglu."
             )
 
+    if op_kind == OpKind.SWIGLU:
+        if len(set(proj_transposes)) > 1:
+            raise ValueError(
+                "SwiGLU projections must use a consistent rhs_transposed layout across gate, up, and down dots"
+            )
+        if proj_transposes:
+            explicit_rhs_t = proj_transposes[0]
+        if dtype == DType.INT8:
+            raise ValueError("INT8 dtype is not supported for swiglu; use dtype='w8a16' or dtype='bf16'")
+
+    for ld in lhs_loads:
+        _validate_load_index(ld.attrs.get("index_expr"), "lhs", rhs_transposed=explicit_rhs_t)
+        ts = ld.attrs.get("tile_shape")
+        if ts is not None and tuple(ts) != (block_spec.block_m, block_spec.block_k):
+            raise ValueError(
+                f"LHS load tile_shape {tuple(ts)} must match block_spec ({block_spec.block_m}, {block_spec.block_k})"
+            )
+    for ld in rhs_loads:
+        _validate_load_index(ld.attrs.get("index_expr"), "rhs", rhs_transposed=explicit_rhs_t)
+        ts = ld.attrs.get("tile_shape")
+        if ts is not None and op_kind != OpKind.SWIGLU:
+            expected_rhs_ts = (
+                (block_spec.block_n, block_spec.block_k)
+                if explicit_rhs_t
+                else (block_spec.block_k, block_spec.block_n)
+            )
+            if tuple(ts) != expected_rhs_ts:
+                raise ValueError(
+                    f"RHS load tile_shape {tuple(ts)} must match expected {expected_rhs_ts}"
+                )
+
+    for op_node in tracer.ops:
+        if op_node.op != "store" and op_node.output not in used_ops:
+            raise ValueError(
+                f"Unsupported unused or unlowerable op in @tile_kernel: {op_node.op} ({op_node.output})"
+            )
+
+    sanitized_ops = tuple(
+        TileOp(
+            op=o.op,
+            inputs=o.inputs,
+            output=o.output,
+            attrs={k: v for k, v in o.attrs.items() if k != "index_expr"},
+        )
+        for o in tracer.ops
+    )
+
     return TileKernelIR(
         name=fn.__name__,
         op_kind=op_kind,
@@ -303,9 +425,10 @@ def _canonicalize_ir(
         rhs_transposed=explicit_rhs_t,
         input_names=input_names,
         output_name=out_name,
-        ops=tuple(tracer.ops),
+        ops=sanitized_ops,
         quant=quant,
         has_down_proj=has_down_proj,
+        gemm_roles=gemm_roles,
         swiglu_roles=swiglu_roles,
     )
 
@@ -398,6 +521,7 @@ class TileKernel:
                 self.ir,
                 inputs,
                 quant=quant,
+                bias=bias,
                 scales=scales,
                 warmup=warmup,
                 iters=iters,

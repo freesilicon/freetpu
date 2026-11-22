@@ -110,6 +110,7 @@ class TileKernelIR:
     ops: Tuple[TileOp, ...]
     quant: QuantParams = field(default_factory=QuantParams)
     has_down_proj: bool = False
+    gemm_roles: Tuple[str, str] = ()  # (lhs_param, rhs_param) for MATMUL / FUSED_MATMUL_*
     swiglu_roles: Dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -126,6 +127,7 @@ class TileKernelIR:
             "input_names": list(self.input_names),
             "output_name": self.output_name,
             "has_down_proj": self.has_down_proj,
+            "gemm_roles": list(self.gemm_roles),
             "swiglu_roles": dict(self.swiglu_roles),
             "ops": [
                 {"op": o.op, "inputs": list(o.inputs), "output": o.output, "attrs": dict(o.attrs)}

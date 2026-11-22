@@ -16,5 +16,27 @@ dependencies = [
 [project.optional-dependencies]
 tpu = ["jax"]
 
-[tool.setuptools.packages.find]
-include = ["freetpu_tile*"]
+[tool.setuptools]
+include-package-data = true
+packages = [
+    "freetpu_tile",
+    "freetpu_tile.backends",
+    "freetpu_tile.tests",
+    "freetpu_tile._packaged_docs",
+    "tools",
+    "tools.dgc0",
+    "libopenbuenos",
+    "libopenbuenos.include",
+    "libopenbuenos.src",
+]
+
+[tool.setuptools.package-dir]
+"freetpu_tile._packaged_docs" = "docs"
+
+[tool.setuptools.package-data]
+tools = ["*.py"]
+"tools.dgc0" = ["*.py"]
+libopenbuenos = ["Makefile", "CMakeLists.txt"]
+"libopenbuenos.include" = ["*.h"]
+"libopenbuenos.src" = ["*.cpp", "*.h"]
+"freetpu_tile._packaged_docs" = ["baremetal-vii/*.h", "kernel-abi/*.h"]
