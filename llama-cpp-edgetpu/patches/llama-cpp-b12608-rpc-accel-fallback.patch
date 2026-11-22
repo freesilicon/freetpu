@@ -1,6 +1,8 @@
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index e4a84cb..6745af0 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
-@@ -1427,10 +1427,27 @@
+@@ -1427,10 +1427,27 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device,
  
  class rpc_server {
  public:
@@ -30,7 +32,7 @@
      }
      ~rpc_server();
  
-@@ -1464,6 +1481,7 @@
+@@ -1464,6 +1481,7 @@ public:
  
  private:
      void sync_all_backends();
@@ -38,7 +40,7 @@
      void comm_free_device(uint32_t dev_id);
      static bool comm_allreduce_pairwise(void * comm_ctx_v, ggml_tensor ** tensors);
      static bool comm_bootstrap_exchange(void * user_data, const void * send_buf, void * recv_buf, size_t size);
-@@ -1499,6 +1517,8 @@
+@@ -1499,6 +1517,8 @@ private:
  
      std::vector<ggml_backend_t> backends;
      const char * cache_dir;
@@ -47,10 +49,107 @@
      std::unordered_set<ggml_backend_buffer_t> buffers;
      // computed graphs cached per backend, keyed by uid
      std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
-@@ -2179,6 +2199,53 @@
-     }
-     result->view_offs = tensor->view_offs;
+@@ -2181,6 +2201,162 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
      return result;
+ }
+ 
++static bool rpc_cpu_fallback_op_allowed(const ggml_tensor * node) {
++    if (node == nullptr) {
++        return true;
++    }
++    switch (node->op) {
++        case GGML_OP_NONE:
++        case GGML_OP_DUP:
++        case GGML_OP_ADD:
++        case GGML_OP_ADD_ID:
++        case GGML_OP_ACC:
++        case GGML_OP_SUB:
++        case GGML_OP_MUL:
++        case GGML_OP_DIV:
++        case GGML_OP_SQR:
++        case GGML_OP_SQRT:
++        case GGML_OP_LOG:
++        case GGML_OP_SIN:
++        case GGML_OP_COS:
++        case GGML_OP_SUM:
++        case GGML_OP_SUM_ROWS:
++        case GGML_OP_CUMSUM:
++        case GGML_OP_MEAN:
++        case GGML_OP_ARGMAX:
++        case GGML_OP_COUNT_EQUAL:
++        case GGML_OP_REPEAT:
++        case GGML_OP_CONCAT:
++        case GGML_OP_NORM:
++        case GGML_OP_RMS_NORM:
++        case GGML_OP_GROUP_NORM:
++        case GGML_OP_L2_NORM:
++        case GGML_OP_MUL_MAT:
++        case GGML_OP_MUL_MAT_ID:
++        case GGML_OP_OUT_PROD:
++        case GGML_OP_SCALE:
++        case GGML_OP_SET:
++        case GGML_OP_CPY:
++        case GGML_OP_CONT:
++        case GGML_OP_RESHAPE:
++        case GGML_OP_VIEW:
++        case GGML_OP_PERMUTE:
++        case GGML_OP_TRANSPOSE:
++        case GGML_OP_GET_ROWS:
++        case GGML_OP_SET_ROWS:
++        case GGML_OP_DIAG:
++        case GGML_OP_SOFT_MAX:
++        case GGML_OP_ROPE:
++        case GGML_OP_CLAMP:
++        case GGML_OP_CONV_TRANSPOSE_1D:
++        case GGML_OP_IM2COL:
++        case GGML_OP_IM2COL_3D:
++        case GGML_OP_COL2IM_1D:
++        case GGML_OP_CONV_2D:
++        case GGML_OP_CONV_3D:
++        case GGML_OP_CONV_2D_DW:
++        case GGML_OP_CONV_TRANSPOSE_2D:
++        case GGML_OP_POOL_1D:
++        case GGML_OP_POOL_2D:
++        case GGML_OP_UPSCALE:
++        case GGML_OP_PAD:
++        case GGML_OP_PAD_REFLECT_1D:
++        case GGML_OP_ROLL:
++        case GGML_OP_ARANGE:
++        case GGML_OP_TIMESTEP_EMBEDDING:
++        case GGML_OP_ARGSORT:
++        case GGML_OP_TOP_K:
++        case GGML_OP_LEAKY_RELU:
++        case GGML_OP_TRI:
++        case GGML_OP_FILL:
++        case GGML_OP_FLASH_ATTN_EXT:
++        case GGML_OP_SSM_CONV:
++        case GGML_OP_SSM_SCAN:
++        case GGML_OP_WIN_PART:
++        case GGML_OP_WIN_UNPART:
++        case GGML_OP_GET_REL_POS:
++        case GGML_OP_ADD_REL_POS:
++        case GGML_OP_RWKV_WKV6:
++        case GGML_OP_GATED_LINEAR_ATTN:
++        case GGML_OP_RWKV_WKV7:
++        case GGML_OP_SOLVE_TRI:
++        case GGML_OP_GATED_DELTA_NET:
++        case GGML_OP_LIGHTNING_INDEXER:
++        case GGML_OP_DSV4_HC_COMB:
++        case GGML_OP_DSV4_HC_PRE:
++        case GGML_OP_DSV4_HC_POST:
++        case GGML_OP_TOP_K_MASK:
++            return true;
++        case GGML_OP_UNARY: {
++            const int32_t uop = ggml_get_op_params_i32(node, 0);
++            return uop >= 0 && uop < GGML_UNARY_OP_COUNT;
++        }
++        case GGML_OP_GLU: {
++            const int32_t gop = ggml_get_op_params_i32(node, 0);
++            return gop >= 0 && gop < GGML_GLU_OP_COUNT;
++        }
++        default:
++            return false;
++    }
 +}
 +
 +ggml_status rpc_server::compute_graph_with_accel_fallback(uint32_t device, ggml_cgraph * graph) {
@@ -90,6 +189,16 @@
 +                ggml_backend_synchronize(backend);
 +            }
 +        } else {
++            for (int k = i; k < j; ++k) {
++                ggml_tensor * node = graph->nodes[k];
++                if (node != nullptr && !rpc_cpu_fallback_op_allowed(node)) {
++                    const uint32_t op_u = (uint32_t) node->op;
++                    const char * op_s = op_u < GGML_OP_COUNT ? ggml_op_name(node->op) : "INVALID";
++                    LOG_ERROR("[%s] rejecting disallowed CPU fallback op %d (%s)\n",
++                              __func__, (int) node->op, op_s);
++                    return GGML_STATUS_FAILED;
++                }
++            }
 +            status = ggml_backend_graph_compute(cpu_fallback, &sub);
 +        }
 +        if (status != GGML_STATUS_SUCCESS) {
@@ -98,28 +207,40 @@
 +        i = j;
 +    }
 +    return GGML_STATUS_SUCCESS;
- }
- 
++}
++
  bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
-@@ -2266,7 +2333,7 @@
+     // serialization format:
+     // | device (4 bytes) | uid (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
+@@ -2266,8 +2442,11 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
      }
      const std::chrono::duration<double, std::milli> deserialize_ms = std::chrono::steady_clock::now() - t_deserialize;
  
 -    ggml_status status = ggml_backend_graph_compute_async(backends[device], graph);
+-    GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
 +    ggml_status status = compute_graph_with_accel_fallback(device, graph);
-     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
++    if (status != GGML_STATUS_SUCCESS) {
++        LOG_ERROR("[%s] device: %u, graph compute failed/rejected (status=%d)\n", __func__, device, (int) status);
++        return false;
++    }
      sg.graph = graph;
      LOG_DBG3("[%s] device: %u, graph build: %.3f ms\n", __func__, device, deserialize_ms.count());
-@@ -2285,7 +2352,7 @@
+     return true;
+@@ -2285,8 +2464,11 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
      }
      ggml_cgraph * graph = it->second.graph;
      LOG_DBG("[%s] device: %u, uid: %" PRIu64 "\n", __func__, device, request.uid);
 -    ggml_status status = ggml_backend_graph_compute_async(backends[device], graph);
+-    GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
 +    ggml_status status = compute_graph_with_accel_fallback(device, graph);
-     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
++    if (status != GGML_STATUS_SUCCESS) {
++        LOG_ERROR("[%s] device: %u, graph compute failed/rejected (status=%d)\n", __func__, device, (int) status);
++        return false;
++    }
      return true;
  }
-@@ -2655,11 +2722,15 @@
+ 
+@@ -2655,11 +2837,15 @@ rpc_server::~rpc_server() {
      for (auto buffer : buffers) {
          ggml_backend_buffer_free(buffer);
      }
@@ -137,7 +258,7 @@
      uint8_t cmd;
      if (!sock->recv_data(&cmd, 1)) {
          return;
-@@ -3047,7 +3118,7 @@
+@@ -3047,7 +3233,7 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
              return;
          }
          LOG_INFO("Accepted client connection\n");

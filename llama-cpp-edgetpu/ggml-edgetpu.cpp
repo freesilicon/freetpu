@@ -1018,6 +1018,7 @@ static void ggml_backend_edgetpu_device_get_memory(ggml_backend_dev_t dev, size_
         ? static_cast<size_t>(pages) * static_cast<size_t>(page_size)
         : 0;
     size_t avail_bytes = 0;
+    bool   have_avail  = false;
 
     if (FILE * f = std::fopen("/proc/meminfo", "r")) {
         char line[256];
@@ -1027,13 +1028,14 @@ static void ggml_backend_edgetpu_device_get_memory(ggml_backend_dev_t dev, size_
                 total_bytes = static_cast<size_t>(kb) * 1024u;
             } else if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
                 avail_bytes = static_cast<size_t>(kb) * 1024u;
+                have_avail  = true;
                 break;
             }
         }
         std::fclose(f);
     }
     *total = total_bytes;
-    *free  = avail_bytes > 0 ? avail_bytes : total_bytes;
+    *free  = have_avail ? avail_bytes : total_bytes;
 #else
     *free  = 0;
     *total = 0;
