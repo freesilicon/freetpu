@@ -29,7 +29,12 @@ HEAD_DIM = 128
 KV_DIM = N_KV_HEADS * HEAD_DIM  # 1024
 FF_DIM = 14336
 KV_SEQ = 256
-PEAK_HBM_GBS = 819.0
+try:
+    _TPU_INFO = pltpu.get_tpu_info()
+    PEAK_HBM_GBS = round(float(getattr(_TPU_INFO, "mem_bw_bytes_per_second", 819e9)) / 1e9, 2)
+except Exception:
+    _TPU_INFO = None
+    PEAK_HBM_GBS = 819.0
 RMS_EPS = 1e-5
 
 PROJECTIONS = [
@@ -98,7 +103,7 @@ def bench_donated_decode(fn, weights, x, k_cache, v_cache, warmup=3, iters=12):
     return float(np.median(ts)), float(np.min(ts)), x_out, k_cache, v_cache
 
 
-print("=== LLAMA-3-8B W8A16 & W4A16 DECODE BENCHMARK (TPU v5e-1) ===")
+print(f"=== LLAMA-3-8B W8A16 & W4A16 DECODE BENCHMARK ({jax.devices()[0].device_kind}, peak_hbm_gbs={PEAK_HBM_GBS}) ===")
 print(
     "VERSIONS:",
     json.dumps(
@@ -1004,17 +1009,19 @@ for proj_name, k_dim, n_dim in PROJECTIONS:
         x_in.block_until_ready()
 
         # --- W8A16 ---
-        pallas_w8 = jax.jit(lambda xx: tpu_w8a16_linear(xx, w_i8, s8_kern, bk=BEST_W8_BK, bn=BEST_W8_BN))
-        xla_w8 = jax.jit(lambda xx: xla_w8a16_linear(xx, w_i8, s8_1d))
+        pallas_w8 = jax.jit(
+            lambda xx, ww, ss: tpu_w8a16_linear(xx, ww, ss, bk=BEST_W8_BK, bn=BEST_W8_BN)
+        )
+        xla_w8 = jax.jit(lambda xx, ww, ss: xla_w8a16_linear(xx, ww, ss))
 
-        has_cc_w8 = "tpu_custom_call" in pallas_w8.lower(x_in).as_text()
-        out_p8 = pallas_w8(x_in)
-        out_x8 = xla_w8(x_in)
+        has_cc_w8 = "tpu_custom_call" in pallas_w8.lower(x_in, w_i8, s8_kern).as_text()
+        out_p8 = pallas_w8(x_in, w_i8, s8_kern)
+        out_x8 = xla_w8(x_in, w_i8, s8_1d)
         jax.block_until_ready((out_p8, out_x8))
         err_w8 = float(jnp.max(jnp.abs(out_p8.astype(jnp.float32) - out_x8.astype(jnp.float32))))
 
-        p8_med_s, p8_min_s = bench_fn(pallas_w8, x_in, warmup=3, iters=12)
-        x8_med_s, x8_min_s = bench_fn(xla_w8, x_in, warmup=3, iters=12)
+        p8_med_s, p8_min_s = bench_fn(pallas_w8, x_in, w_i8, s8_kern, warmup=3, iters=12)
+        x8_med_s, x8_min_s = bench_fn(xla_w8, x_in, w_i8, s8_1d, warmup=3, iters=12)
         bytes_w8 = float(w_i8.nbytes + s8_kern.nbytes + x_in.nbytes + out_p8.nbytes)
         p8_gbs = bytes_w8 / (p8_med_s * 1e9)
         x8_gbs = bytes_w8 / (x8_med_s * 1e9)
@@ -1044,27 +1051,27 @@ for proj_name, k_dim, n_dim in PROJECTIONS:
 
         # --- W4A16 ---
         pallas_w4 = jax.jit(
-            lambda xx: tpu_w4a16_linear(
-                xx, w_i4, s4_kern, n_dim, bk=BEST_W4_BK, bn_packed=BEST_W4_BNP
+            lambda xx, ww, ss: tpu_w4a16_linear(
+                xx, ww, ss, n_dim, bk=BEST_W4_BK, bn_packed=BEST_W4_BNP
             )
         )
         if W4A16_MODE == "uint8_split2":
-            xla_w4 = jax.jit(lambda xx: xla_w4_uint8_ref(xx, w_i4, s4_base))
+            xla_w4 = jax.jit(lambda xx, ww, ss: xla_w4_uint8_ref(xx, ww, ss))
         else:
             xla_w4 = jax.jit(
-                lambda xx: xla_w4_int32_ref(
-                    xx, w_i4, s4_base, tile_packed=(W4A16_MODE == "int32_direct2d")
+                lambda xx, ww, ss: xla_w4_int32_ref(
+                    xx, ww, ss, tile_packed=(W4A16_MODE == "int32_direct2d")
                 )
             )
 
-        has_cc_w4 = "tpu_custom_call" in pallas_w4.lower(x_in).as_text()
-        out_p4 = pallas_w4(x_in)
-        out_x4 = xla_w4(x_in)
+        has_cc_w4 = "tpu_custom_call" in pallas_w4.lower(x_in, w_i4, s4_kern).as_text()
+        out_p4 = pallas_w4(x_in, w_i4, s4_kern)
+        out_x4 = xla_w4(x_in, w_i4, s4_base)
         jax.block_until_ready((out_p4, out_x4))
         err_w4 = float(jnp.max(jnp.abs(out_p4.astype(jnp.float32) - out_x4.astype(jnp.float32))))
 
-        p4_med_s, p4_min_s = bench_fn(pallas_w4, x_in, warmup=3, iters=12)
-        x4_med_s, x4_min_s = bench_fn(xla_w4, x_in, warmup=3, iters=12)
+        p4_med_s, p4_min_s = bench_fn(pallas_w4, x_in, w_i4, s4_kern, warmup=3, iters=12)
+        x4_med_s, x4_min_s = bench_fn(xla_w4, x_in, w_i4, s4_base, warmup=3, iters=12)
         bytes_w4 = float(w_i4.nbytes + s4_kern.nbytes + x_in.nbytes + out_p4.nbytes)
         p4_gbs = bytes_w4 / (p4_med_s * 1e9)
         x4_gbs = bytes_w4 / (x4_med_s * 1e9)
@@ -1102,21 +1109,21 @@ for batch in (1, 32):
     xr = jax.random.normal(jax.random.PRNGKey(60 + batch), (batch, D_MODEL), dtype=jnp.bfloat16)
     g1 = jax.random.uniform(jax.random.PRNGKey(61), (D_MODEL,), minval=0.8, maxval=1.2, dtype=jnp.bfloat16)
     g1n = g1[None, :]
-    pr_fn = jax.jit(lambda a: tpu_rmsnorm(a, g1n, g1))
-    xr_fn = jax.jit(lambda a: xla_rmsnorm(a, g1))
-    pr_out = pr_fn(xr)
-    xr_out = xr_fn(xr)
+    pr_fn = jax.jit(lambda a, gn, g: tpu_rmsnorm(a, gn, g))
+    xr_fn = jax.jit(lambda a, g: xla_rmsnorm(a, g))
+    pr_out = pr_fn(xr, g1n, g1)
+    xr_out = xr_fn(xr, g1)
     jax.block_until_ready((pr_out, xr_out))
     rms_err = float(jnp.max(jnp.abs(pr_out.astype(jnp.float32) - xr_out.astype(jnp.float32))))
-    pr_med, _ = bench_fn(pr_fn, xr, warmup=3, iters=12)
-    xr_med, _ = bench_fn(xr_fn, xr, warmup=3, iters=12)
+    pr_med, _ = bench_fn(pr_fn, xr, g1n, g1, warmup=3, iters=12)
+    xr_med, _ = bench_fn(xr_fn, xr, g1, warmup=3, iters=12)
     print(
         "OP_MICROBENCH:",
         json.dumps(
             {
                 "op": "RMSNorm",
                 "shape": f"{batch}x{D_MODEL}",
-                "tpu_custom_call": "tpu_custom_call" in pr_fn.lower(xr).as_text(),
+                "tpu_custom_call": "tpu_custom_call" in pr_fn.lower(xr, g1n, g1).as_text(),
                 "max_abs_err": rms_err,
                 "pallas_us": round(pr_med * 1e6, 2),
                 "xla_us": round(xr_med * 1e6, 2),

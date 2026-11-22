@@ -938,16 +938,38 @@ void bench_large_gemm(TpuRuntime& rt, const std::string& ir_dir, int64_t M,
   rt.tpuFreeExec(exec);
 }
 
+std::string resolve_libtpu_path(const std::string& ir_dir) {
+  const char* env_lib = std::getenv("LIBTPU_PATH");
+  if (env_lib != nullptr && env_lib[0] != '\0') {
+    return env_lib;
+  }
+  std::ifstream in(ir_dir + "/libtpu_path.txt");
+  std::string file_path;
+  if (in && std::getline(in, file_path)) {
+    while (!file_path.empty() &&
+           (file_path.back() == '\r' || file_path.back() == '\n' ||
+            file_path.back() == ' ' || file_path.back() == '\t')) {
+      file_path.pop_back();
+    }
+    if (!file_path.empty()) {
+      return file_path;
+    }
+  }
+#ifdef FREETPU_DEFAULT_LIBTPU_PATH
+  return FREETPU_DEFAULT_LIBTPU_PATH;
+#else
+  return "/usr/local/lib/python3.13/dist-packages/libtpu/libtpu.so";
+#endif
+}
+
 }  // namespace
 
 int main() {
   try {
-    const char* env_lib = std::getenv("LIBTPU_PATH");
-    const std::string libtpu_path =
-        env_lib ? env_lib
-                : "/usr/local/lib/python3.13/dist-packages/libtpu/libtpu.so";
     const char* env_ir = std::getenv("TPU_PJRT_IR_DIR");
-    const std::string ir_dir = env_ir ? env_ir : "/tmp/tpu_pjrt_ir";
+    const std::string ir_dir =
+        (env_ir != nullptr && env_ir[0] != '\0') ? env_ir : "/tmp/tpu_pjrt_ir";
+    const std::string libtpu_path = resolve_libtpu_path(ir_dir);
 
     TpuRuntime rt;
     rt.tpuInit(libtpu_path);

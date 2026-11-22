@@ -3,6 +3,7 @@
 
 import ctypes
 import io
+import json
 import os
 from pathlib import Path
 import re
@@ -21,7 +22,7 @@ PJRT_HEADER_URL = (
 )
 
 
-def probe_header_and_live_abi(hdr_path: str) -> None:
+def probe_header_and_live_abi(hdr_path: str) -> str:
   hdr_txt = open(hdr_path, "r", encoding="utf-8").read()
   m_maj = re.search(r"#define\s+PJRT_API_MAJOR\s+(\d+)", hdr_txt)
   m_min = re.search(r"#define\s+PJRT_API_MINOR\s+(\d+)", hdr_txt)
@@ -128,6 +129,7 @@ def probe_header_and_live_abi(hdr_path: str) -> None:
     )
     if not m_tr:
       raise RuntimeError(f"Missing PJRT_DEFINE_STRUCT_TRAITS for {sname}")
+  return so_path
 
 
 def serialize_compile_options(backend) -> tuple[bytes, bytes]:
@@ -205,7 +207,9 @@ def main() -> None:
   os.makedirs(IR_DIR, exist_ok=True)
   hdr_path = os.path.join(IR_DIR, "pjrt_c_api.h")
   subprocess.run(["curl", "-fsSL", PJRT_HEADER_URL, "-o", hdr_path], check=True)
-  probe_header_and_live_abi(hdr_path)
+  so_path = probe_header_and_live_abi(hdr_path)
+  with open(os.path.join(IR_DIR, "libtpu_path.txt"), "w", encoding="utf-8") as f:
+    f.write(so_path + "\n")
 
   try:
     backend = jax.extend.backend.get_backend()
@@ -239,6 +243,7 @@ def main() -> None:
       "-Wall",
       "-Wextra",
       f"-I{IR_DIR}",
+      f"-DFREETPU_DEFAULT_LIBTPU_PATH={json.dumps(so_path)}",
       CPP_PATH,
       "-ldl",
       "-pthread",
@@ -247,6 +252,7 @@ def main() -> None:
   ]
   subprocess.run(compile_cmd, check=True)
   print(f"Built binary: {BIN_PATH} ({os.path.getsize(BIN_PATH)} bytes)")
+  print(f"Run: LIBTPU_PATH={so_path} TPU_PJRT_IR_DIR={IR_DIR} {BIN_PATH}")
   print("=== EXPORT_AND_BUILD_COMPLETE ===")
 
 
