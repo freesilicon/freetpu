@@ -94,7 +94,14 @@ _COLAB_AUTH_ERROR_MARKERS = (
     "invalid_grant",
 )
 
-_SAFE_SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_SAFE_SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z", re.ASCII)
+_SAFE_STORED_SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z", re.ASCII)
+_ISO_DATETIME_RE = re.compile(
+    r"^(?P<date>\d{4}-\d{2}-\d{2})[Tt ](?P<hm>\d{2}:\d{2})"
+    r"(?::(?P<sec>\d{2})(?:\.(?P<frac>\d{1,9}))?)?"
+    r"(?P<tz>[Zz]|(?P<tz_sign>[+-])(?P<tz_h>\d{2}):?(?P<tz_m>\d{2}))?\Z",
+    re.ASCII,
+)
 _SESSION_LINE_RE = re.compile(r"^\[([^\]]+)\]\s+(\S+)(?:\s+\||$)")
 
 
@@ -368,7 +375,7 @@ def _ensure_dir_not_shared_writable(dir_path: Path) -> Path:
 
 
 def _verify_file_writable_if_exists(path: Path, label: str) -> None:
-    """Verify an existing file is a user-owned regular non-symlink file openable for writing."""
+    """Verify an existing file is a user-owned, non-shared-writable regular non-symlink file."""
     if not os.path.lexists(path):
         return
     try:
@@ -383,26 +390,55 @@ def _verify_file_writable_if_exists(path: Path, label: str) -> None:
         raise UntrustedPathError(
             f"{label} {path} is not owned by current user (uid={st.st_uid})"
         )
+    if (st.st_mode & 0o022) != 0:
+        raise UntrustedPathError(
+            f"{label} {path} must not be group/world-writable (mode={oct(stat.S_IMODE(st.st_mode))})"
+        )
     flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(path, flags)
     except OSError as exc:
         raise UntrustedPathError(f"{label} {path} is not writable: {exc}") from exc
-    else:
+    try:
+        fst = os.fstat(fd)
+        if not stat.S_ISREG(fst.st_mode):
+            raise UntrustedPathError(f"Refusing non-regular {label}: {path}")
+        if hasattr(os, "geteuid") and fst.st_uid != os.geteuid():
+            raise UntrustedPathError(
+                f"{label} {path} is not owned by current user (uid={fst.st_uid})"
+            )
+        if (fst.st_mode & 0o022) != 0:
+            raise UntrustedPathError(
+                f"{label} {path} must not be group/world-writable (mode={oct(stat.S_IMODE(fst.st_mode))})"
+            )
+    finally:
         os.close(fd)
 
 
 def _is_valid_iso_datetime(value: Any) -> bool:
-    """Return True if `value` is a valid ISO-8601 datetime string accepted by Pydantic `datetime`."""
+    """Return True if `value` matches Pydantic/speedate RFC-3339 datetime validation."""
     if not isinstance(value, str):
         return False
-    s = value.strip()
-    if not s or ("T" not in s and "t" not in s and " " not in s):
+    m = _ISO_DATETIME_RE.fullmatch(value)
+    if not m:
         return False
-    if s.endswith(("Z", "z")):
-        s = s[:-1] + "+00:00"
+    tz_part = ""
+    if m.group("tz"):
+        if m.group("tz") in ("Z", "z"):
+            tz_part = "+00:00"
+        else:
+            tz_h = int(m.group("tz_h"))
+            tz_m = int(m.group("tz_m"))
+            if tz_h > 23 or tz_m > 59:
+                return False
+            tz_part = f"{m.group('tz_sign')}{tz_h:02d}:{tz_m:02d}"
+    time_part = m.group("hm")
+    if m.group("sec") is not None:
+        time_part += f":{m.group('sec')}"
+        if m.group("frac") is not None:
+            time_part += f".{m.group('frac')[:6]}"
     try:
-        datetime.fromisoformat(s)
+        datetime.fromisoformat(f"{m.group('date')}T{time_part}{tz_part}")
     except ValueError:
         return False
     return True
@@ -434,9 +470,15 @@ def _validate_existing_session_store(path: Path) -> None:
             f"Existing session config {path} must be a JSON object mapping session names to entries."
         )
     for key, val in parsed.items():
-        if not isinstance(key, str) or not key or not isinstance(val, dict):
+        if (
+            not isinstance(key, str)
+            or not key
+            or ".." in key
+            or not _SAFE_STORED_SESSION_RE.fullmatch(key)
+            or not isinstance(val, dict)
+        ):
             raise UntrustedPathError(
-                f"Existing session config {path} contains an invalid session store entry."
+                f"Existing session config {path} contains an invalid or unsafe session store entry."
             )
         if (
             not isinstance(val.get("name"), str)
@@ -1347,11 +1389,14 @@ def run_benchmark(
                 ),
             }
 
-    if cfg.session_name is not None and not _SAFE_SESSION_RE.match(cfg.session_name):
+    if cfg.session_name is not None and (
+        not _SAFE_SESSION_RE.fullmatch(cfg.session_name) or ".." in cfg.session_name
+    ):
         return 2, {
             "status": "invalid_session_name",
             "error": (
-                f"Session prefix {cfg.session_name!r} must match [A-Za-z0-9][A-Za-z0-9._-]{{0,63}}."
+                f"Session prefix {cfg.session_name!r} must match [A-Za-z0-9][A-Za-z0-9._-]{{0,63}} "
+                "and must not contain '..'."
             ),
         }
 
@@ -4148,7 +4193,112 @@ def run_self_test() -> int:
             else:
                 os.environ["COLAB_CLI_REQUEST_TIMEOUT"] = old_req_env
 
-    print("colab_tpu_bench.py self-test PASSED (51/51 suites).")
+        # 52. Reject group/world-writable `--config` or `.lock` files and unsafe stored session names
+        #     (path separators, `..`, leading `.`, NUL) before invoking Colab CLI.
+        safe_parent = tmp_path / "perm-check"
+        safe_parent.mkdir(mode=0o700)
+        for bad_mode, tag in ((0o660, "grp-writable"), (0o602, "world-writable")):
+            bad_mode_cfg = safe_parent / f"{tag}.json"
+            bad_mode_cfg.write_text("{}", encoding="utf-8")
+            os.chmod(bad_mode_cfg, bad_mode)
+            rc_perm, sum_perm = run_benchmark(
+                BenchConfig(config_path=bad_mode_cfg, out_dir=tmp_path / f"out-{tag}"),
+                runner=forbid_calls_runner,
+            )
+            assert rc_perm == 2, f"Expected mode {oct(bad_mode)} config rejection: {sum_perm}"
+            assert sum_perm["status"] == "untrusted_config_path"
+
+        lock_parent = tmp_path / "lock-perm-check"
+        lock_parent.mkdir(mode=0o700)
+        ok_cfg_bad_lock = lock_parent / "sessions.json"
+        ok_cfg_bad_lock.write_text("{}", encoding="utf-8")
+        os.chmod(ok_cfg_bad_lock, 0o600)
+        bad_lock = Path(f"{ok_cfg_bad_lock}.lock")
+        bad_lock.write_text("", encoding="utf-8")
+        os.chmod(bad_lock, 0o660)
+        rc_lock_perm, sum_lock_perm = run_benchmark(
+            BenchConfig(config_path=ok_cfg_bad_lock, out_dir=tmp_path / "out-lock-perm"),
+            runner=forbid_calls_runner,
+        )
+        assert rc_lock_perm == 2, f"Expected group-writable lock rejection: {sum_lock_perm}"
+        assert sum_lock_perm["status"] == "untrusted_config_path"
+
+        for idx_bad, unsafe_name in enumerate(
+            ("../escape", "a/b", "a\\b", ".hidden", "foo..bar", "bad\x00name")
+        ):
+            unsafe_cfg = safe_parent / f"unsafe-name-{idx_bad}.json"
+            unsafe_cfg.write_text(
+                json.dumps(
+                    {
+                        unsafe_name: {
+                            "name": unsafe_name,
+                            "token": "tok",
+                            "url": "https://example.invalid",
+                            "endpoint": "m-s-unsafe",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.chmod(unsafe_cfg, 0o600)
+            rc_uname, sum_uname = run_benchmark(
+                BenchConfig(config_path=unsafe_cfg, out_dir=tmp_path / f"out-uname-{idx_bad}"),
+                runner=forbid_calls_runner,
+            )
+            assert rc_uname == 2, f"Expected unsafe stored name {unsafe_name!r} rejected: {sum_uname}"
+            assert sum_uname["status"] == "untrusted_config_path"
+
+        # 53. Match Colab/Pydantic RFC-3339 datetime validation for `token_expires_at`
+        #     (reject hour-only timestamps, whitespace padding, compact ISO, bad tz offsets).
+        for bad_ts in (
+            "2026-11-22T14",
+            "2026-11-22T14Z",
+            "2026-11-22T14+00:00",
+            " 2026-11-22T14:30:00Z ",
+            "2026-11-22T14:30:00+25:00",
+            "2026-11-22T14:30:00+00:60",
+            "2026-11-22T14:30:00+00",
+            "20261122T143000Z",
+            "2026-02-29T14:30:00Z",
+            "2026-11-22T14:30:00Z\n",
+        ):
+            assert not _is_valid_iso_datetime(bad_ts), f"Should reject {bad_ts!r}"
+        for good_ts in (
+            "2026-11-22T14:30",
+            "2026-11-22T14:30Z",
+            "2026-11-22T14:30:00",
+            "2026-11-22T14:30:00Z",
+            "2026-11-22T14:30:00.123456Z",
+            "2026-11-22T14:30:00.123456789Z",
+            "2026-11-22 14:30:00-0500",
+            "2024-02-29T14:30:00+05:30",
+        ):
+            assert _is_valid_iso_datetime(good_ts), f"Should accept {good_ts!r}"
+
+        hour_only_cfg = safe_parent / "hour-only-ts.json"
+        hour_only_cfg.write_text(
+            json.dumps(
+                {
+                    "keep-me": {
+                        "name": "keep-me",
+                        "token": "tok",
+                        "url": "https://example.invalid",
+                        "endpoint": "m-s-keep",
+                        "token_expires_at": "2026-11-22T14",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        os.chmod(hour_only_cfg, 0o600)
+        rc_hr, sum_hr = run_benchmark(
+            BenchConfig(config_path=hour_only_cfg, out_dir=tmp_path / "out-hour-only"),
+            runner=forbid_calls_runner,
+        )
+        assert rc_hr == 2, f"Expected hour-only timestamp rejected: {sum_hr}"
+        assert sum_hr["status"] == "untrusted_config_path"
+
+    print("colab_tpu_bench.py self-test PASSED (53/53 suites).")
     return 0
 
 
