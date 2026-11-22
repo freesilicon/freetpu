@@ -30,6 +30,7 @@ metadata:
   name: freetpu-jax-workload-with-telemetry
   labels:
     app.kubernetes.io/name: freetpu-tpu-exporter
+    freetpu.dev/collector-role: workload-sidecar
   annotations:
     prometheus.io/scrape: "true"
     prometheus.io/port: "9400"

@@ -4,7 +4,8 @@
 Scans /sys/bus/pci/devices/* (vendor 0x1ae0) and /dev/vfio/* on VFIO-backed
 Cloud TPU hosts (v5e, v5p, v6e Trillium bound to `vfio-pci`) to generate a
 boot-scoped CNCF Container Device Interface (CDI) v0.6.0 specification
-(default: /var/run/cdi/freetpu.json) exposing `freetpu.dev/tpu=0`, ...,
+(default: /var/run/cdi/freetpu.json) exposing stable hardware-backed selectors
+`freetpu.dev/tpu=pci-<bdf>`, `freetpu.dev/tpu=group-pci-...`, and
 `freetpu.dev/tpu=all`.
 
 Note: Legacy `/dev/accel*` Cloud TPU hosts (e.g. Cloud TPU v4 using Google's
@@ -27,6 +28,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import stat
 import sys
 import tempfile
 import time
@@ -248,6 +250,38 @@ def discover_tpu_chips(
     return chips, vfio_container
 
 
+def _pci_bdf_token(pci_bdf: str) -> str:
+    """Convert a PCI BDF (e.g. 0000:00:06.0) into a CDI-safe hardware token."""
+    return re.sub(r"[^a-zA-Z0-9]+", "-", pci_bdf.strip()).strip("-")
+
+
+def _single_chip_selector(pci_bdf: str) -> str:
+    return f"pci-{_pci_bdf_token(pci_bdf)}"
+
+
+def _shared_group_selector(pci_bdfs: Sequence[str]) -> str:
+    tokens = [_pci_bdf_token(b) for b in sorted(pci_bdfs)]
+    return f"group-pci-{'_'.join(tokens)}"
+
+
+def _stat_char_devnum(path: Path) -> Optional[str]:
+    """Return '<major>:<minor>' if path is a character device, else None."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    if stat.S_ISCHR(st.st_mode):
+        return f"{os.major(st.st_rdev)}:{os.minor(st.st_rdev)}"
+    return None
+
+
+def _format_vfio_devnums(entries: Sequence[Tuple[str, Optional[str]]]) -> Optional[str]:
+    pairs = sorted((container_path, dn) for container_path, dn in entries if dn)
+    if not pairs:
+        return None
+    return ",".join(f"{cp}={dn}" for cp, dn in pairs)
+
+
 def build_cdi_spec(
     chips: Sequence[DiscoveredChip],
     vfio_container_host_path: Path,
@@ -265,6 +299,7 @@ def build_cdi_spec(
                 f"IOMMU group contains non-TPU device(s): {', '.join(chip.non_tpu_group_members)}"
             )
 
+    container_devnum = _stat_char_devnum(vfio_container_host_path)
     global_edits: Dict[str, Any] = {
         "deviceNodes": [
             _make_device_node("/dev/vfio/vfio", vfio_container_host_path),
@@ -277,6 +312,7 @@ def build_cdi_spec(
 
     devices: List[Dict[str, Any]] = []
     seen_group_nodes: Dict[str, Dict[str, Any]] = {}
+    seen_group_devnums: Dict[str, Optional[str]] = {}
     groups: Dict[str, List[DiscoveredChip]] = {}
     all_bdfs: List[str] = []
     all_generations: List[str] = []
@@ -291,32 +327,39 @@ def build_cdi_spec(
         rep = group_chips[0]
         node = _make_device_node(rep.vfio_container_path, rep.vfio_host_path)
         seen_group_nodes.setdefault(rep.vfio_container_path, node)
-        group_bdfs = [c.pci_bdf for c in group_chips]
+        group_devnum = _stat_char_devnum(rep.vfio_host_path)
+        seen_group_devnums.setdefault(rep.vfio_container_path, group_devnum)
+        group_bdfs = sorted(c.pci_bdf for c in group_chips)
         group_gens: List[str] = []
         for c in group_chips:
             if c.generation not in group_gens:
                 group_gens.append(c.generation)
 
         if len(group_chips) == 1:
+            selector = _single_chip_selector(rep.pci_bdf)
+            ann: Dict[str, str] = {
+                "freetpu.dev/allocation-unit": "single-chip",
+                "freetpu.dev/pci-bdf": rep.pci_bdf,
+                "freetpu.dev/vendor-id": rep.vendor_id,
+                "freetpu.dev/device-id": rep.device_id,
+                "freetpu.dev/generation": rep.generation,
+                "freetpu.dev/model": rep.model_name,
+                "freetpu.dev/driver": rep.driver,
+                "freetpu.dev/iommu-group": rep.iommu_group,
+                "freetpu.dev/required-cap-add": "IPC_LOCK",
+                "freetpu.dev/required-ulimit-memlock": "-1",
+            }
+            devnums_str = _format_vfio_devnums([(rep.vfio_container_path, group_devnum)])
+            if devnums_str:
+                ann["freetpu.dev/vfio-devnums"] = devnums_str
             devices.append(
                 {
-                    "name": str(rep.index),
-                    "annotations": {
-                        "freetpu.dev/allocation-unit": "single-chip",
-                        "freetpu.dev/pci-bdf": rep.pci_bdf,
-                        "freetpu.dev/vendor-id": rep.vendor_id,
-                        "freetpu.dev/device-id": rep.device_id,
-                        "freetpu.dev/generation": rep.generation,
-                        "freetpu.dev/model": rep.model_name,
-                        "freetpu.dev/driver": rep.driver,
-                        "freetpu.dev/iommu-group": rep.iommu_group,
-                        "freetpu.dev/required-cap-add": "IPC_LOCK",
-                        "freetpu.dev/required-ulimit-memlock": "-1",
-                    },
+                    "name": selector,
+                    "annotations": ann,
                     "containerEdits": {
                         "deviceNodes": [node],
                         "env": [
-                            f"FREETPU_VISIBLE_DEVICES={rep.index}",
+                            f"FREETPU_CDI_DEVICE={selector}",
                             f"FREETPU_PCI_BDFS={rep.pci_bdf}",
                             f"FREETPU_TPU_GENERATION={rep.generation}",
                             f"FREETPU_VFIO_DEVICES={rep.vfio_container_path}",
@@ -325,26 +368,31 @@ def build_cdi_spec(
                 }
             )
         else:
-            # Expose shared IOMMU groups strictly as a single allocation unit so
-            # callers never assume device-level VFIO isolation between sibling chips.
+            # Expose shared IOMMU groups strictly as a single hardware-backed
+            # allocation unit so callers never assume device-level VFIO isolation
+            # between sibling chips and selectors never shift onto different chips.
+            selector = _shared_group_selector(group_bdfs)
+            ann = {
+                "freetpu.dev/allocation-unit": "shared-iommu-group",
+                "freetpu.dev/shared-iommu-group": "true",
+                "freetpu.dev/chip-count": str(len(group_chips)),
+                "freetpu.dev/pci-bdfs": ",".join(group_bdfs),
+                "freetpu.dev/generations": ",".join(group_gens),
+                "freetpu.dev/iommu-group": iommu_group,
+                "freetpu.dev/required-cap-add": "IPC_LOCK",
+                "freetpu.dev/required-ulimit-memlock": "-1",
+            }
+            devnums_str = _format_vfio_devnums([(rep.vfio_container_path, group_devnum)])
+            if devnums_str:
+                ann["freetpu.dev/vfio-devnums"] = devnums_str
             devices.append(
                 {
-                    "name": f"group-{iommu_group}",
-                    "annotations": {
-                        "freetpu.dev/allocation-unit": "shared-iommu-group",
-                        "freetpu.dev/shared-iommu-group": "true",
-                        "freetpu.dev/chip-count": str(len(group_chips)),
-                        "freetpu.dev/chip-indices": ",".join(str(c.index) for c in group_chips),
-                        "freetpu.dev/pci-bdfs": ",".join(group_bdfs),
-                        "freetpu.dev/generations": ",".join(group_gens),
-                        "freetpu.dev/iommu-group": iommu_group,
-                        "freetpu.dev/required-cap-add": "IPC_LOCK",
-                        "freetpu.dev/required-ulimit-memlock": "-1",
-                    },
+                    "name": selector,
+                    "annotations": ann,
                     "containerEdits": {
                         "deviceNodes": [node],
                         "env": [
-                            f"FREETPU_VISIBLE_DEVICES={','.join(str(c.index) for c in group_chips)}",
+                            f"FREETPU_CDI_DEVICE={selector}",
                             f"FREETPU_CHIP_COUNT={len(group_chips)}",
                             f"FREETPU_PCI_BDFS={','.join(group_bdfs)}",
                             f"FREETPU_TPU_GENERATION={','.join(group_gens)}",
@@ -354,23 +402,28 @@ def build_cdi_spec(
                 }
             )
 
+    all_ann: Dict[str, str] = {
+        "freetpu.dev/allocation-unit": "all-devices",
+        "freetpu.dev/chip-count": str(len(chips)),
+        "freetpu.dev/pci-bdfs": ",".join(sorted(all_bdfs)),
+        "freetpu.dev/generations": ",".join(all_generations),
+        "freetpu.dev/required-cap-add": "IPC_LOCK",
+        "freetpu.dev/required-ulimit-memlock": "-1",
+    }
+    all_devnums = _format_vfio_devnums(list(seen_group_devnums.items()))
+    if all_devnums:
+        all_ann["freetpu.dev/vfio-devnums"] = all_devnums
+
     devices.append(
         {
             "name": "all",
-            "annotations": {
-                "freetpu.dev/allocation-unit": "all-devices",
-                "freetpu.dev/chip-count": str(len(chips)),
-                "freetpu.dev/pci-bdfs": ",".join(all_bdfs),
-                "freetpu.dev/generations": ",".join(all_generations),
-                "freetpu.dev/required-cap-add": "IPC_LOCK",
-                "freetpu.dev/required-ulimit-memlock": "-1",
-            },
+            "annotations": all_ann,
             "containerEdits": {
                 "deviceNodes": list(seen_group_nodes.values()),
                 "env": [
-                    f"FREETPU_VISIBLE_DEVICES={','.join(str(c.index) for c in chips)}",
+                    "FREETPU_CDI_DEVICE=all",
                     f"FREETPU_CHIP_COUNT={len(chips)}",
-                    f"FREETPU_PCI_BDFS={','.join(all_bdfs)}",
+                    f"FREETPU_PCI_BDFS={','.join(sorted(all_bdfs))}",
                     f"FREETPU_TPU_GENERATION={','.join(all_generations)}",
                     f"FREETPU_VFIO_DEVICES={','.join(seen_group_nodes.keys())}",
                 ],
@@ -378,14 +431,24 @@ def build_cdi_spec(
         }
     )
 
+    root_ann: Dict[str, str] = {
+        "freetpu.dev/generated-by": "freetpu-cdi",
+        "freetpu.dev/required-cap-add": "IPC_LOCK",
+        "freetpu.dev/required-ulimit-memlock": "-1",
+    }
+    # Record live VFIO char major:minor in spec annotations (while keeping
+    # deviceNodes free of pinned major/minor) so driver rebinds that change
+    # dynamic VFIO minors produce a spec update that invalidates CDI's cache.
+    root_devnums = _format_vfio_devnums(
+        [("/dev/vfio/vfio", container_devnum), *seen_group_devnums.items()]
+    )
+    if root_devnums:
+        root_ann["freetpu.dev/vfio-devnums"] = root_devnums
+
     return {
         "cdiVersion": CDI_VERSION,
         "kind": kind,
-        "annotations": {
-            "freetpu.dev/generated-by": "freetpu-cdi",
-            "freetpu.dev/required-cap-add": "IPC_LOCK",
-            "freetpu.dev/required-ulimit-memlock": "-1",
-        },
+        "annotations": root_ann,
         "containerEdits": global_edits,
         "devices": devices,
     }
@@ -559,24 +622,48 @@ def validate_cdi_spec(spec: Any) -> List[str]:
     return errors
 
 
+def _resolve_effective_host_path(node: Dict[str, Any]) -> Path:
+    """Return the host path CDI actually resolves (`hostPath`, falling back to `path`)."""
+    raw = node.get("hostPath")
+    if isinstance(raw, str) and raw:
+        return Path(raw)
+    return Path(str(node.get("path", "")))
+
+
+def _parse_vfio_devnums_annotation(raw: Any) -> Dict[str, str]:
+    result: Dict[str, str] = {}
+    if not isinstance(raw, str) or not raw.strip():
+        return result
+    for part in raw.split(","):
+        if "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        k = k.strip()
+        v = v.strip()
+        if k and v:
+            result[k] = v
+    return result
+
+
 def verify_spec_against_host(
     spec: Any,
     *,
     sysfs_root: Path = Path("/sys"),
     dev_root: Path = Path("/dev"),
 ) -> List[str]:
-    """Revalidate every VFIO group in a CDI spec against live host IOMMU membership.
+    """Revalidate all effective global and per-device CDI nodes against live host VFIO state.
 
-    Ensures each `/dev/vfio/<group>` still maps to the exact TPU PCI BDF(s) recorded
-    in the spec's annotations, remains bound to `vfio-pci`, and contains zero non-TPU
-    PCI devices.
+    Verifies the exact host device CDI will inject (`hostPath` or fallback `path`),
+    rejects pinned `major`/`minor` numbers, validates global `containerEdits.deviceNodes`
+    (which CDI applies to every selector), checks that every VFIO group still maps to the
+    exact TPU PCI BDF(s) with zero non-TPU members, and flags changed char device numbers.
     """
     errors: List[str] = []
     if not isinstance(spec, dict):
         return ["CDI spec root must be a JSON object"]
 
     try:
-        live_chips, _vfio_container = discover_tpu_chips(
+        live_chips, vfio_container = discover_tpu_chips(
             sysfs_root=sysfs_root,
             dev_root=dev_root,
             allow_missing_vfio=False,
@@ -584,47 +671,129 @@ def verify_spec_against_host(
     except Exception as exc:  # noqa: BLE001
         return [f"live host VFIO discovery failed: {exc}"]
 
-    live_by_vfio: Dict[str, List[str]] = {}
+    live_container_resolved = str(vfio_container.resolve())
+    live_by_host_resolved: Dict[str, Tuple[str, List[str], Optional[str]]] = {}
+    live_devnums_by_container_path: Dict[str, str] = {}
+    container_dn = _stat_char_devnum(vfio_container)
+    if container_dn:
+        live_devnums_by_container_path["/dev/vfio/vfio"] = container_dn
+
+    groups_bdfs: Dict[str, List[str]] = {}
+    groups_host: Dict[str, Path] = {}
     for chip in live_chips:
-        live_by_vfio.setdefault(chip.vfio_container_path, []).append(chip.pci_bdf)
-    for bdfs in live_by_vfio.values():
+        groups_bdfs.setdefault(chip.vfio_container_path, []).append(chip.pci_bdf)
+        groups_host.setdefault(chip.vfio_container_path, chip.vfio_host_path)
+
+    for container_path, bdfs in groups_bdfs.items():
         bdfs.sort()
+        host_p = groups_host[container_path]
+        dn = _stat_char_devnum(host_p)
+        if dn:
+            live_devnums_by_container_path[container_path] = dn
+        live_by_host_resolved[str(host_p.resolve())] = (container_path, bdfs, dn)
+
+    # 1. Validate global containerEdits.deviceNodes (applied to EVERY selector).
+    global_edits = spec.get("containerEdits")
+    global_nodes: List[Dict[str, Any]] = []
+    if isinstance(global_edits, dict) and isinstance(global_edits.get("deviceNodes"), list):
+        for n_idx, node in enumerate(global_edits["deviceNodes"]):
+            nc = f"containerEdits.deviceNodes[{n_idx}]"
+            if not isinstance(node, dict):
+                errors.append(f"{nc}: must be an object")
+                continue
+            global_nodes.append(node)
+            if "major" in node or "minor" in node:
+                errors.append(
+                    f"{nc}: explicit major/minor pins device numbers and bypasses dynamic hostPath resolution"
+                )
+            eff_host = _resolve_effective_host_path(node)
+            if not eff_host.exists():
+                errors.append(f"{nc}: effective hostPath {eff_host} does not exist on host")
+                continue
+            resolved_host = str(eff_host.resolve())
+            if resolved_host != live_container_resolved or node.get("path") != "/dev/vfio/vfio":
+                errors.append(
+                    f"{nc}: global deviceNode exposes unauthorized host device {eff_host} "
+                    f"(expected only {vfio_container} mapped to /dev/vfio/vfio)"
+                )
+
+    # Check root recorded char devnums whenever host VFIO nodes are char devices.
+    root_ann = spec.get("annotations") if isinstance(spec.get("annotations"), dict) else {}
+    recorded_root_devnums = _parse_vfio_devnums_annotation(root_ann.get("freetpu.dev/vfio-devnums"))
+    for cp, live_dn in live_devnums_by_container_path.items():
+        if recorded_root_devnums.get(cp) != live_dn:
+            errors.append(
+                f"annotations[freetpu.dev/vfio-devnums]: stale or missing device number for {cp} "
+                f"(spec recorded {recorded_root_devnums.get(cp)!r}, host has {live_dn!r})"
+            )
 
     devices = spec.get("devices")
     if not isinstance(devices, list) or not devices:
-        return ["devices must be a non-empty list"]
+        return errors + ["devices must be a non-empty list"]
 
+    # 2. Validate every device's effective deviceNodes (global + per-device).
     for idx, dev in enumerate(devices):
         if not isinstance(dev, dict):
             continue
         name = dev.get("name", f"devices[{idx}]")
         edits = dev.get("containerEdits")
-        nodes = edits.get("deviceNodes") if isinstance(edits, dict) else None
-        if not isinstance(nodes, list):
-            continue
+        dev_nodes = (
+            edits.get("deviceNodes")
+            if isinstance(edits, dict) and isinstance(edits.get("deviceNodes"), list)
+            else []
+        )
 
-        vfio_paths = [
-            n["path"]
-            for n in nodes
-            if isinstance(n, dict)
-            and isinstance(n.get("path"), str)
-            and n["path"].startswith("/dev/vfio/")
-            and n["path"] != "/dev/vfio/vfio"
-        ]
-        if not vfio_paths:
-            errors.append(f"device {name!r}: no /dev/vfio/<group> deviceNodes to verify")
-            continue
-
+        matched_group_paths: List[str] = []
         expected_live_bdfs: List[str] = []
-        for vp in vfio_paths:
-            if vp not in live_by_vfio:
-                errors.append(
-                    f"device {name!r}: VFIO node {vp} is no longer a valid TPU-only VFIO group on this host"
-                )
-            else:
-                expected_live_bdfs.extend(live_by_vfio[vp])
-        expected_live_bdfs = sorted(set(expected_live_bdfs))
+        has_container_node = any(
+            str(_resolve_effective_host_path(gn).resolve()) == live_container_resolved
+            and gn.get("path") == "/dev/vfio/vfio"
+            for gn in global_nodes
+            if _resolve_effective_host_path(gn).exists()
+        )
 
+        for n_idx, node in enumerate(dev_nodes):
+            nc = f"device {name!r} deviceNodes[{n_idx}]"
+            if not isinstance(node, dict):
+                errors.append(f"{nc}: must be an object")
+                continue
+            if "major" in node or "minor" in node:
+                errors.append(
+                    f"{nc}: explicit major/minor pins device numbers and bypasses dynamic hostPath resolution"
+                )
+            eff_host = _resolve_effective_host_path(node)
+            if not eff_host.exists():
+                errors.append(f"{nc}: effective hostPath {eff_host} does not exist on host")
+                continue
+            resolved_host = str(eff_host.resolve())
+            if resolved_host == live_container_resolved:
+                if node.get("path") != "/dev/vfio/vfio":
+                    errors.append(
+                        f"{nc}: VFIO container {eff_host} must map to /dev/vfio/vfio, got {node.get('path')!r}"
+                    )
+                else:
+                    has_container_node = True
+                continue
+            if resolved_host not in live_by_host_resolved:
+                errors.append(
+                    f"{nc}: effective hostPath {eff_host} is not a verified TPU-only VFIO group on this host"
+                )
+                continue
+            live_cp, live_bdfs, _live_dn = live_by_host_resolved[resolved_host]
+            if node.get("path") != live_cp:
+                errors.append(
+                    f"{nc}: container path {node.get('path')!r} does not match host VFIO group {live_cp!r} for {eff_host}"
+                )
+            matched_group_paths.append(live_cp)
+            expected_live_bdfs.extend(live_bdfs)
+
+        if not has_container_node:
+            errors.append(f"device {name!r}: effective deviceNodes missing live VFIO container {vfio_container}")
+        if not matched_group_paths:
+            errors.append(f"device {name!r}: no verified host /dev/vfio/<group> deviceNodes to verify")
+            continue
+
+        expected_live_bdfs = sorted(set(expected_live_bdfs))
         ann = dev.get("annotations") if isinstance(dev.get("annotations"), dict) else {}
         recorded_bdfs: List[str] = []
         if isinstance(ann.get("freetpu.dev/pci-bdf"), str) and ann["freetpu.dev/pci-bdf"].strip():
@@ -639,11 +808,20 @@ def verify_spec_against_host(
             )
             continue
 
-        if expected_live_bdfs and recorded_bdfs != expected_live_bdfs:
+        if recorded_bdfs != expected_live_bdfs:
             errors.append(
-                f"device {name!r}: stale VFIO group identity for {','.join(vfio_paths)} "
+                f"device {name!r}: stale VFIO group identity for {','.join(matched_group_paths)} "
                 f"(spec expects PCI BDF(s) {recorded_bdfs}, host currently exposes {expected_live_bdfs})"
             )
+
+        recorded_dev_dn = _parse_vfio_devnums_annotation(ann.get("freetpu.dev/vfio-devnums"))
+        for cp in matched_group_paths:
+            live_dn = live_devnums_by_container_path.get(cp)
+            if live_dn and recorded_dev_dn.get(cp) != live_dn:
+                errors.append(
+                    f"device {name!r}: stale or missing VFIO device number for {cp} "
+                    f"(spec recorded {recorded_dev_dn.get(cp)!r}, host has {live_dn!r})"
+                )
 
     return errors
 

@@ -4,17 +4,21 @@ These queries mirror standard NVIDIA `dcgm-exporter` dashboards for VFIO-backed 
 
 ## Fleet Inventory & Health
 
+> **Deduplication note:** `prometheus-scrape.yml` attaches a stable `node` label (and `collector_role="node"|"workload-sidecar"`) to every scraped target. The fleet inventory, health, coverage, and spend queries below deduplicate by `(generation, node, pci_bdf)` so running both the node DaemonSet and one or more workload telemetry sidecars on the same node counts every physical TPU chip **exactly once**.
+
 ```promql
-# Total discovered TPU chips per generation across scraped hosts (deduplicated per chip)
+# Total discovered physical TPU chips per generation across scraped nodes
 count by (generation) (
-  group by (generation, instance, pci_bdf) (freetpu_tpu_info)
+  group by (generation, node, pci_bdf) (freetpu_tpu_info)
 )
 
-# Total VFIO-ready TPU chips per generation across the cluster
-sum by (generation) (freetpu_tpu_health_status == 1)
+# Total VFIO-ready physical TPU chips per generation across the cluster
+count by (generation) (
+  min by (generation, node, pci_bdf) (freetpu_tpu_health_status) == 1
+)
 
 # Unhealthy or unbound TPU chips (vfio-pci / /dev/vfio/<group> missing)
-freetpu_tpu_health_status == 0
+min by (generation, node, pci_bdf) (freetpu_tpu_health_status) == 0
 ```
 
 ## Compute & HBM Utilization
@@ -59,33 +63,37 @@ sum_over_time(
 (avg_over_time(freetpu_tpu_duty_cycle_percent[15m]) < 2)
 
 # Duty-cycle telemetry coverage ratio per generation (0.0 - 1.0).
-# Check coverage before extrapolating utilization-adjusted costs across the fleet.
+# Deduplicates physical chips by (generation, node, pci_bdf) across node
+# DaemonSet and workload sidecar targets. Check coverage before extrapolating
+# utilization-adjusted costs across the fleet.
 (
-  count by (generation) (freetpu_tpu_duty_cycle_percent)
+  count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent))
   /
-  count by (generation) (group by (generation, instance, pci_bdf) (freetpu_tpu_info))
+  count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_info))
 )
 
-# Inventory-based estimated hourly TPU spend by generation across scraped hosts.
-# Counts all discovered PCI chips via `freetpu_tpu_info` (including unhealthy or
-# unbound chips that Google Cloud still bills while the TPU node is READY),
-# deduplicated per (generation, instance, pci_bdf) against label churn.
+# Inventory-based estimated hourly TPU spend by generation across scraped nodes.
+# Counts each physical PCI chip ONCE via `group by (generation, node, pci_bdf)`
+# on `freetpu_tpu_info` (never double-counting when a node runs both the
+# DaemonSet and workload sidecars, and still counting unhealthy/unbound chips
+# that Google Cloud bills while the TPU node is READY).
 # Replace 1.20 / 2.70 with your spot/on-demand SKU rate; use Google Cloud billing
 # or billable node inventory for authoritative chargeback.
 (
-  count by (generation) (group by (generation, instance, pci_bdf) (freetpu_tpu_info{generation="v5e"})) * 1.20
+  count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_info{generation="v5e"})) * 1.20
   or
-  count by (generation) (group by (generation, instance, pci_bdf) (freetpu_tpu_info{generation="v6e"})) * 2.70
+  count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_info{generation="v6e"})) * 2.70
 )
 
 # Measured-chip effective cost per utilized TPU-hour by generation.
-# Restricts BOTH numerator and denominator to chips with usable, PCI-mapped
-# `freetpu_tpu_duty_cycle_percent` readings so partial telemetry coverage never
-# inflates the estimate. Check the telemetry coverage ratio above before
-# extrapolating fleet-wide.
+# Restricts BOTH numerator and denominator to deduplicated physical chips
+# `(generation, node, pci_bdf)` with usable, PCI-mapped
+# `freetpu_tpu_duty_cycle_percent` readings so neither partial telemetry coverage
+# nor multiple collectors per node skew the estimate. Check the telemetry
+# coverage ratio above before extrapolating fleet-wide.
 (
-  count by (generation) (freetpu_tpu_duty_cycle_percent{generation="v5e"}) * 1.20
+  count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent{generation="v5e"})) * 1.20
   or
-  count by (generation) (freetpu_tpu_duty_cycle_percent{generation="v6e"}) * 2.70
-) / clamp_min(sum by (generation) (freetpu_tpu_duty_cycle_percent / 100), 0.01)
+  count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent{generation="v6e"})) * 2.70
+) / clamp_min(sum by (generation) (max by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent) / 100), 0.01)
 ```

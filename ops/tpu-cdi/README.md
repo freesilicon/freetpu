@@ -33,9 +33,9 @@ docker run --rm \
   python:3.12-slim \
   python3 -c "import os; print(os.listdir('/dev/vfio'))"
 
-# Attach only chip 0
+# Attach a single TPU chip by its stable PCI BDF selector (never shifts if another chip disappears)
 docker run --rm \
-  --device=freetpu.dev/tpu=0 \
+  --device=freetpu.dev/tpu=pci-0000-00-06-0 \
   --cap-add=IPC_LOCK \
   --ulimit memlock=-1:-1 \
   my-jax-tpu-image:latest
@@ -50,7 +50,7 @@ docker run --rm \
   python3 -c "import os; print(os.listdir('/dev/vfio'))"
 ```
 
-Note on IOMMU groups: if multiple TPU chips share one `/dev/vfio/<iommu_group>` node, `freetpu-cdi` exposes that group strictly as a single allocation unit (`freetpu.dev/tpu=group-<iommu_group>`) plus `freetpu.dev/tpu=all` instead of misleading single-chip selectors. If any TPU's IOMMU group also contains a non-TPU PCI device, `freetpu-cdi` fails closed rather than publishing any selector (including `all`) that would expose that non-TPU device.
+Note on IOMMU groups & stable selectors: single-chip selectors use stable PCI BDF names (`freetpu.dev/tpu=pci-<bdf>`) so a disappearing chip retires its selector instead of reassigning it to a different chip. If multiple TPU chips share one `/dev/vfio/<iommu_group>` node, `freetpu-cdi` exposes that group strictly as a single allocation unit (`freetpu.dev/tpu=group-pci-<bdf1>_<bdf2>`) plus `freetpu.dev/tpu=all`. If any TPU's IOMMU group also contains a non-TPU PCI device, `freetpu-cdi` fails closed rather than publishing any selector (including `all`) that would expose that non-TPU device. Live VFIO char `major:minor` numbers are tracked in `freetpu.dev/vfio-devnums` annotations (while omitted from `deviceNodes`) so `sync` triggers a spec refresh for containerd 2.0 / CDI 0.8.0 whenever driver rebinds change dynamic VFIO minors.
 
 ## Kubernetes Manifests
 
@@ -63,7 +63,7 @@ kubectl -n kube-system create configmap freetpu-ops-scripts \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
 
-- [manifests/k8s-tpu-cdi-daemonset.yaml](manifests/k8s-tpu-cdi-daemonset.yaml) — Node-level DaemonSet targeting VFIO-backed GKE TPU node pools (`tpu-v5-lite-device`, `tpu-v5-lite-podslice`, `tpu-v5p-slice`, `tpu-v6e-slice`), reconciling boot-scoped `/var/run/cdi/freetpu.json` via `freetpu-cdi-sync`, and serving **PCI/VFIO inventory + hostPID active-PID metrics only** on `:9400/metrics` with isolated liveness/readiness probes on `:9401`.
+- [manifests/k8s-tpu-cdi-daemonset.yaml](manifests/k8s-tpu-cdi-daemonset.yaml) — Node-level DaemonSet targeting VFIO-backed GKE TPU node pools (`tpu-v5-lite-device`, `tpu-v5-lite-podslice`, `tpu-v5p-slice`, `tpu-v6e-slice`), reconciling boot-scoped `/var/run/cdi/freetpu.json` via `freetpu-cdi-sync`, and serving **PCI/VFIO inventory + hostPID active-PID metrics only** on `:9400/metrics` (with `SYS_PTRACE` + `appArmorProfile.type: Unconfined` for GKE host `/proc/<pid>/fd` reads) and isolated liveness/readiness probes on `:9401`.
 - [manifests/k8s-tpu-workload-telemetry-sidecar.yaml](manifests/k8s-tpu-workload-telemetry-sidecar.yaml) — Workload Pod with a `tpu-info`-enabled native sidecar sharing `localhost:8431` with `libtpu` for live HBM usage and MXU duty-cycle metrics in Kubernetes.
 - [manifests/k8s-tpu-pod-cdi.yaml](manifests/k8s-tpu-pod-cdi.yaml) — Sample Kubernetes `DeviceClass`, DRA `ResourceClaimTemplate`, and Pod (`resource.k8s.io/v1`, Kubernetes >= 1.34, `containerd >= 2.0`, with `google.com/tpu:NoSchedule` toleration) requesting `freetpu.dev/tpu` (requires a cluster DRA driver registered for `freetpu.dev` publishing `ResourceSlice` objects).
 - [manifests/k8s-tpu-pod-cdi-v1beta1.yaml](manifests/k8s-tpu-pod-cdi-v1beta1.yaml) — Legacy Kubernetes 1.32–1.33 DRA sample (`resource.k8s.io/v1beta1`, `containerd >= 2.0`, requires `--runtime-config=resource.k8s.io/v1beta1=true` and `DynamicResourceAllocation=true`).

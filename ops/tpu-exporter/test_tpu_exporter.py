@@ -104,13 +104,16 @@ TensorCore Utilization
         self.assertAlmostEqual(rows["1"].duty_cycle_percent or 0.0, 0.0)
 
     def test_parse_tpu_info_dashboard_device_status_and_process_monitor(self) -> None:
+        # Upstream tpu-info uses literal `|` characters inside `[|||||.....]` gauges
+        # even inside ASCII `|` tables (tpu_info/cli_helper.py:ascii_bar_gauge).
         dashboard = """
 \x1b[1mTPU Device Status\x1b[0m
 +-----------+---------------------------+--------------------+--------------------+-----------------------+
 | Device ID | Memory Usage (Used/Total) | Memory Bar Gauge   | HBM Bandwidth Util | TensorCore Duty Cycle |
 +-----------+---------------------------+--------------------+--------------------+-----------------------+
-| 0         | 8.00 GiB / 15.75 GiB      | [#####.....] 50.8% | [##........] 20.0% | [########..] 87.5%    |
+| 0         | 8.00 GiB / 15.75 GiB      | [|||||.....] 50.8% | [||........] 20.0% | [|||||||||.] 87.5%    |
 | 1         | N/A                       | [..........] N/A   | [..........] N/A   | [..........] N/A      |
+| 2         | 15.75 GiB / 15.75 GiB     | [||||||||||] 100.0%| [||||||....] 60.0% | [||||||||||] 100.0%   |
 +-----------+---------------------------+--------------------+--------------------+-----------------------+
 
 TPU Process Monitor
@@ -129,6 +132,10 @@ TPU Process Monitor
         # Must read TensorCore Duty Cycle (87.5%), not Memory Bar Gauge (50.8%) or HBM BW (20.0%).
         self.assertAlmostEqual(rows["0"].duty_cycle_percent or 0.0, 87.5)
 
+        # Fully-filled 10-pipe `[||||||||||]` gauges must also parse cleanly.
+        self.assertIn("2", rows)
+        self.assertAlmostEqual(rows["2"].duty_cycle_percent or 0.0, 100.0)
+
         # N/A rows must stay unset (None), never fabricated as 0.
         self.assertIn("1", rows)
         self.assertIsNone(rows["1"].hbm_used_bytes)
@@ -140,6 +147,16 @@ TPU Process Monitor
         self.assertEqual(rows["/dev/vfio/0"].pids, [4242])
         self.assertIn("/dev/vfio/2", rows)
         self.assertEqual(rows["/dev/vfio/2"].pids, [])
+
+        # Also verify Unicode box-drawing borders with literal `|` gauges inside cells.
+        unicode_dash = """
+TPU Device Status
+│ Device ID │ Memory Usage (Used/Total) │ Memory Bar Gauge   │ HBM Bandwidth Util │ TensorCore Duty Cycle │
+│ 0         │ 4.00 GiB / 16.00 GiB      │ [|||.......] 25.0% │ [|.........] 10.0% │ [||||||....] 62.5%    │
+"""
+        u_rows = tpu_exporter.parse_tpu_info_output(unicode_dash)
+        self.assertEqual(u_rows["0"].hbm_used_bytes, 4 * 1024**3)
+        self.assertAlmostEqual(u_rows["0"].duty_cycle_percent or 0.0, 62.5)
 
     def test_unparseable_and_na_tpu_info_leaves_utilization_unset(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

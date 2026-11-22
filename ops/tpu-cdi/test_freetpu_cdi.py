@@ -102,7 +102,7 @@ class FreeTpuCdiTests(unittest.TestCase):
             self.assertEqual(spec["cdiVersion"], "0.6.0")
             self.assertEqual(spec["kind"], "freetpu.dev/tpu")
             names = [d["name"] for d in spec["devices"]]
-            self.assertEqual(names, ["0", "all"])
+            self.assertEqual(names, ["pci-0000-00-06-0", "all"])
             self.assertEqual(
                 spec["containerEdits"]["deviceNodes"][0]["path"], "/dev/vfio/vfio"
             )
@@ -179,10 +179,13 @@ class FreeTpuCdiTests(unittest.TestCase):
             spec = json.loads(out_file.read_text(encoding="utf-8"))
             self.assertEqual(freetpu_cdi.validate_cdi_spec(spec), [])
             names = [d["name"] for d in spec["devices"]]
-            # Shared group 0 becomes a single unit; isolated chip 2 remains selectable alone.
-            self.assertEqual(names, ["group-0", "2", "all"])
-            self.assertNotIn("0", names)
-            self.assertNotIn("1", names)
+            # Shared group 0 becomes a single hardware-backed unit; isolated chip 0000:00:07.0 uses its stable PCI selector.
+            self.assertEqual(
+                names,
+                ["group-pci-0000-00-05-0_0000-00-06-0", "pci-0000-00-07-0", "all"],
+            )
+            self.assertNotIn("pci-0000-00-05-0", names)
+            self.assertNotIn("pci-0000-00-06-0", names)
             self.assertEqual(
                 spec["devices"][0]["annotations"]["freetpu.dev/allocation-unit"],
                 "shared-iommu-group",
@@ -509,9 +512,10 @@ class FreeTpuCdiTests(unittest.TestCase):
             )
             self.assertIn("host VFIO identity verified", val_ok.stdout)
 
-            # Simulate topology shift: group 0 is reassigned to a different TPU BDF
-            # (or another VFIO device) while spec still expects 0000:00:06.0 in group 0.
-            shifted_sysfs, shifted_dev = _make_mock_pci_vfio(
+            # Simulate topology shift on the same host (same dev_root, shifted sysfs):
+            # group 0 is reassigned to a different TPU BDF while spec still expects
+            # 0000:00:06.0 in group 0.
+            shifted_sysfs, _unused_dev = _make_mock_pci_vfio(
                 root / "shifted",
                 devices=[
                     {
@@ -535,7 +539,7 @@ class FreeTpuCdiTests(unittest.TestCase):
                     "--sysfs-root",
                     str(shifted_sysfs),
                     "--dev-root",
-                    str(shifted_dev),
+                    str(dev_root),
                 ],
                 capture_output=True,
                 text=True,
@@ -567,6 +571,205 @@ class FreeTpuCdiTests(unittest.TestCase):
             self.assertFalse(ok3)
             self.assertIn("removed stale", msg3)
             self.assertFalse(spec_path.exists())
+
+    def test_selectors_stay_bound_to_physical_chip_when_earlier_chip_disappears(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sysfs_2, dev_2 = _make_mock_pci_vfio(
+                root / "two",
+                devices=[
+                    {
+                        "bdf": "0000:00:05.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0063",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                    },
+                    {
+                        "bdf": "0000:00:06.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0063",
+                        "driver": "vfio-pci",
+                        "iommu_group": "1",
+                    },
+                ],
+                create_vfio_nodes=["0", "1"],
+            )
+            spec_path = root / "var" / "run" / "cdi" / "freetpu.json"
+            ok1, _ = freetpu_cdi.reconcile_cdi_spec(spec_path, sysfs_root=sysfs_2, dev_root=dev_2)
+            self.assertTrue(ok1)
+            spec1 = json.loads(spec_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                [d["name"] for d in spec1["devices"]],
+                ["pci-0000-00-05-0", "pci-0000-00-06-0", "all"],
+            )
+
+            # Earlier chip 0000:00:05.0 disappears; 0000:00:06.0 remains.
+            sysfs_1, dev_1 = _make_mock_pci_vfio(
+                root / "one",
+                devices=[
+                    {
+                        "bdf": "0000:00:06.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0063",
+                        "driver": "vfio-pci",
+                        "iommu_group": "1",
+                    }
+                ],
+                create_vfio_nodes=["1"],
+            )
+            ok2, _ = freetpu_cdi.reconcile_cdi_spec(spec_path, sysfs_root=sysfs_1, dev_root=dev_1)
+            self.assertTrue(ok2)
+            spec2 = json.loads(spec_path.read_text(encoding="utf-8"))
+            names2 = [d["name"] for d in spec2["devices"]]
+            self.assertEqual(names2, ["pci-0000-00-06-0", "all"])
+            self.assertNotIn("pci-0000-00-05-0", names2)
+            self.assertEqual(
+                spec2["devices"][0]["annotations"]["freetpu.dev/pci-bdf"],
+                "0000:00:06.0",
+            )
+
+    def test_reconcile_refreshes_spec_when_vfio_char_devnums_change(self) -> None:
+        import stat as _stat
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sysfs_root, dev_root = _make_mock_pci_vfio(
+                root,
+                devices=[
+                    {
+                        "bdf": "0000:00:06.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0063",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                    }
+                ],
+                create_vfio_nodes=["0"],
+            )
+            spec_path = root / "var" / "run" / "cdi" / "freetpu.json"
+            orig_stat = Path.stat
+            current_minor = {"group0": 0}
+
+            def _mock_stat(p: Path, *args, **kwargs):
+                st = orig_stat(p, *args, **kwargs)
+                if p.parent.name == "vfio" and p.name in ("vfio", "0"):
+                    fake = mock.MagicMock()
+                    fake.st_mode = _stat.S_IFCHR | 0o600
+                    fake.st_rdev = (
+                        os.makedev(10, 196)
+                        if p.name == "vfio"
+                        else os.makedev(242, current_minor["group0"])
+                    )
+                    return fake
+                return st
+
+            with mock.patch.object(Path, "stat", autospec=True, side_effect=_mock_stat):
+                ok1, msg1 = freetpu_cdi.reconcile_cdi_spec(
+                    spec_path, sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                self.assertTrue(ok1)
+                self.assertIn("updated", msg1)
+                spec1 = json.loads(spec_path.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    spec1["annotations"]["freetpu.dev/vfio-devnums"],
+                    "/dev/vfio/0=242:0,/dev/vfio/vfio=10:196",
+                )
+                # deviceNodes must still omit major/minor.
+                self.assertNotIn("major", spec1["devices"][0]["containerEdits"]["deviceNodes"][0])
+
+                # No change -> unchanged.
+                ok_same, msg_same = freetpu_cdi.reconcile_cdi_spec(
+                    spec_path, sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                self.assertTrue(ok_same)
+                self.assertIn("unchanged", msg_same)
+
+                # Driver rebind changes /dev/vfio/0 minor from 0 -> 3 while BDF & group stay identical.
+                current_minor["group0"] = 3
+                errs_stale = freetpu_cdi.verify_spec_against_host(
+                    spec1, sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                self.assertTrue(any("242:3" in e for e in errs_stale))
+
+                ok2, msg2 = freetpu_cdi.reconcile_cdi_spec(
+                    spec_path, sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                self.assertTrue(ok2)
+                self.assertIn("updated", msg2)
+                spec2 = json.loads(spec_path.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    spec2["annotations"]["freetpu.dev/vfio-devnums"],
+                    "/dev/vfio/0=242:3,/dev/vfio/vfio=10:196",
+                )
+                self.assertEqual(
+                    freetpu_cdi.verify_spec_against_host(
+                        spec2, sysfs_root=sysfs_root, dev_root=dev_root
+                    ),
+                    [],
+                )
+
+    def test_check_host_validates_effective_host_path_global_nodes_and_pinned_devnums(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sysfs_root, dev_root = _make_mock_pci_vfio(
+                root,
+                devices=[
+                    {
+                        "bdf": "0000:00:06.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0063",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                    }
+                ],
+                create_vfio_nodes=["0", "99"],
+            )
+            chips, vfio_container = freetpu_cdi.discover_tpu_chips(
+                sysfs_root=sysfs_root, dev_root=dev_root
+            )
+            base_spec = freetpu_cdi.build_cdi_spec(chips, vfio_container)
+            self.assertEqual(
+                freetpu_cdi.verify_spec_against_host(
+                    base_spec, sysfs_root=sysfs_root, dev_root=dev_root
+                ),
+                [],
+            )
+
+            # 1. Tampered per-device hostPath pointing to /dev/vfio/99 while path says /dev/vfio/0.
+            tampered_hp = json.loads(json.dumps(base_spec))
+            tampered_hp["devices"][0]["containerEdits"]["deviceNodes"][0]["hostPath"] = str(
+                dev_root / "vfio" / "99"
+            )
+            errs_hp = freetpu_cdi.verify_spec_against_host(
+                tampered_hp, sysfs_root=sysfs_root, dev_root=dev_root
+            )
+            self.assertTrue(any("not a verified TPU-only VFIO group" in e for e in errs_hp))
+
+            # 2. Rogue device added to global containerEdits.deviceNodes (affects every selector).
+            rogue_global = json.loads(json.dumps(base_spec))
+            rogue_global["containerEdits"]["deviceNodes"].append(
+                {
+                    "path": "/dev/vfio/99",
+                    "hostPath": str(dev_root / "vfio" / "99"),
+                    "type": "c",
+                    "permissions": "rw",
+                }
+            )
+            errs_global = freetpu_cdi.verify_spec_against_host(
+                rogue_global, sysfs_root=sysfs_root, dev_root=dev_root
+            )
+            self.assertTrue(any("unauthorized host device" in e for e in errs_global))
+
+            # 3. Explicit pinned major/minor on a VFIO node must be rejected by --check-host.
+            pinned_spec = json.loads(json.dumps(base_spec))
+            pinned_spec["devices"][0]["containerEdits"]["deviceNodes"][0]["major"] = 242
+            pinned_spec["devices"][0]["containerEdits"]["deviceNodes"][0]["minor"] = 99
+            errs_pinned = freetpu_cdi.verify_spec_against_host(
+                pinned_spec, sysfs_root=sysfs_root, dev_root=dev_root
+            )
+            self.assertTrue(any("explicit major/minor" in e for e in errs_pinned))
 
 
 if __name__ == "__main__":

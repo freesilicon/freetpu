@@ -13,8 +13,14 @@ scrape_configs:
           - "127.0.0.1:9400"
         labels:
           cluster: "cloud-tpu-v5e-v6e"
+          node: "tpu-vm-0"
+          collector_role: "node"
 
-  # Kubernetes DaemonSet pod discovery (scrape pods annotated with prometheus.io/scrape: "true").
+  # Kubernetes DaemonSet + workload-sidecar pod discovery
+  # (scrapes pods annotated with prometheus.io/scrape: "true").
+  # Both `node` and `collector_role` labels are preserved so PromQL inventory
+  # and spend queries deduplicate physical chips per (generation, node, pci_bdf)
+  # even when a node runs both the DaemonSet and one or more workload sidecars.
   - job_name: "kubernetes-freetpu-exporter"
     kubernetes_sd_configs:
       - role: pod
@@ -36,3 +42,5 @@ scrape_configs:
         target_label: __address__
       - source_labels: [__meta_kubernetes_pod_node_name]
         target_label: node
+      - source_labels: [__meta_kubernetes_pod_label_freetpu_dev_collector_role]
+        target_label: collector_role

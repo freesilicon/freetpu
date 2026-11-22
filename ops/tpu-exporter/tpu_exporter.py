@@ -216,6 +216,44 @@ class _TpuInfoRow:
     in_util_table: bool = False
 
 
+def _split_table_cells(line: str) -> Optional[List[str]]:
+    """Split a Rich Unicode or ASCII table row into cells without splitting inside `[...]` gauges.
+
+    Upstream `tpu-info` renders bar gauges with literal `|` characters (e.g.
+    `[|||||.....] 50.8%`). Splitting naively on every `|` corrupts column indices.
+    """
+    if any(ch in line for ch in ("│", "┃", "║")):
+        trimmed = re.sub(r"^[│┃║]+|[│┃║]+$", "", line.strip())
+        return [c.strip() for c in re.split(r"[│┃║]", trimmed)]
+
+    if "|" not in line:
+        return None
+
+    trimmed = line.strip()
+    if trimmed.startswith("|"):
+        trimmed = trimmed[1:]
+    if trimmed.endswith("|"):
+        trimmed = trimmed[:-1]
+
+    cells: List[str] = []
+    buf: List[str] = []
+    bracket_depth = 0
+    for ch in trimmed:
+        if ch == "[":
+            bracket_depth += 1
+            buf.append(ch)
+        elif ch == "]":
+            bracket_depth = max(0, bracket_depth - 1)
+            buf.append(ch)
+        elif ch == "|" and bracket_depth == 0:
+            cells.append("".join(buf).strip())
+            buf = []
+        else:
+            buf.append(ch)
+    cells.append("".join(buf).strip())
+    return cells
+
+
 def parse_tpu_info_output(output: str) -> Dict[str, _TpuInfoRow]:
     """Parse `tpu-info` stdout tables (both Unicode box and ASCII pipe styles).
 
@@ -258,15 +296,7 @@ def parse_tpu_info_output(output: str) -> Dict[str, _TpuInfoRow]:
             section = "other"
             continue
 
-        normalized = (
-            line.replace("│", "|")
-            .replace("┃", "|")
-            .replace("║", "|")
-        )
-        if "|" not in normalized:
-            continue
-
-        cells = [c.strip() for c in normalized.strip("|").split("|")]
+        cells = _split_table_cells(line)
         if not cells or all(not c or set(c) <= set("-=─━═+┼ ") for c in cells):
             continue
 
