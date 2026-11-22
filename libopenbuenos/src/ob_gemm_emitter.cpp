@@ -419,6 +419,53 @@ std::vector<uint8_t> pack_ext2(uint32_t N, uint32_t K,
   size_t grp_sz = (include_bias ? static_cast<size_t>(n_blk) * 4u : 0u) +
                   static_cast<size_t>(k4) * static_cast<size_t>(n_blk);
   std::vector<uint8_t> out;
+
+  // Fast bit-exact path for aligned LLM dimensions (N % 32 == 0, K % 16 == 0, non-null weights):
+  // ((int32_t)(int8_t)w + 128) & 0xFF == ((uint8_t)w ^ 0x80u) for all 256 int8 values.
+  if (weights_nk && N >= 32u && (N % 32u) == 0u && (K % 16u) == 0u) {
+    out.resize(grp_sz * n_groups);
+    uint8_t* dst = out.data();
+    const uint32_t k_blocks16 = K / 16u;
+    for (uint32_t g = 0; g < n_groups; ++g) {
+      const uint32_t n0 = g * 32u;
+      if (include_bias) {
+        if (bias_n) {
+          std::memcpy(dst, bias_n + n0, 32u * sizeof(int32_t));
+        } else {
+          std::memset(dst, 0, 32u * sizeof(int32_t));
+        }
+        dst += 32u * sizeof(int32_t);
+      }
+      for (uint32_t kb = 0; kb < k_blocks16; ++kb) {
+        const uint32_t k0 = kb * 16u;
+        uint8_t* d0 = dst;
+        uint8_t* d1 = dst + 128u;
+        uint8_t* d2 = dst + 256u;
+        uint8_t* d3 = dst + 384u;
+        for (uint32_t ni = 0; ni < 32u; ++ni) {
+          const uint8_t* src = reinterpret_cast<const uint8_t*>(
+              weights_nk + static_cast<size_t>(n0 + ni) * K + k0);
+          uint32_t w0, w1, w2, w3;
+          std::memcpy(&w0, src, 4u);
+          std::memcpy(&w1, src + 4u, 4u);
+          std::memcpy(&w2, src + 8u, 4u);
+          std::memcpy(&w3, src + 12u, 4u);
+          w0 ^= 0x80808080u;
+          w1 ^= 0x80808080u;
+          w2 ^= 0x80808080u;
+          w3 ^= 0x80808080u;
+          const size_t off = static_cast<size_t>(ni) * 4u;
+          std::memcpy(d0 + off, &w0, 4u);
+          std::memcpy(d1 + off, &w1, 4u);
+          std::memcpy(d2 + off, &w2, 4u);
+          std::memcpy(d3 + off, &w3, 4u);
+        }
+        dst += 512u;
+      }
+    }
+    return out;
+  }
+
   out.reserve(grp_sz * n_groups);
 
   for (uint32_t g = 0; g < n_groups; ++g) {
@@ -5399,6 +5446,1930 @@ ob_status_t builtin_gemm_emitter_cb(const ob_gemm_desc_t* desc,
   }
   std::memcpy(out_buf, dgc0.data(), dgc0.size());
   return OB_OK;
+}
+
+// ---------------------------------------------------------------------------
+// 12. Clean-Room 11-Chunk Zero-DRAM In-SRAM Chained SwiGLU Synthesizer
+//     (gate -> 0x640 SiLU * up [0x100 MUL] -> down, single VII launch)
+//     Supports proven LLM decode & prefill shapes:
+//       M=1 : (576, 512, 576), (576, 1536, 576), (1536, 512, 1536), (1536, 1024, 1536)
+//       M=64: (576, 512, 576), (1536, 512, 1536)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr float kSwigluSiluBps[7] = {
+    -6.1918535232543945f,
+    -3.113853931427002f,
+    -0.7166378498077393f,
+    1.0220223665237427f,
+    3.214235782623291f,
+    6.553915500640869f,
+    12.300000190734863f,
+};
+
+constexpr float kSwigluSiluUnitCoeffs[8][5] = {
+    {-0.370022177696228f, -0.14004893600940704f, -0.02006860077381134f, -0.0012858827831223607f, -3.100011235801503e-05f},
+    {-0.6562100052833557f, -0.26750609278678894f, -0.03700931742787361f, -0.001571062603034079f, 2.259612301713787e-05f},
+    {0.018058594316244125f, 0.5728806853294373f, 0.363774836063385f, 0.0851035863161087f, 0.007186070084571838f},
+    {5.7220458984375e-05f, 0.5000313520431519f, 0.2489282339811325f, -0.0001401097106281668f, -0.017839739099144936f},
+    {0.01684805378317833f, 0.42960694432258606f, 0.36192697286605835f, -0.08451402187347412f, 0.0071176812052726746f},
+    {-0.6919266581535339f, 1.2996355295181274f, -0.04768627509474754f, 0.0031246759463101625f, -6.095305070630275e-05f},
+    {-0.30064311623573303f, 1.1088173389434814f, -0.014867686666548252f, 0.0009060873999260366f, -2.0734756617457606e-05f},
+    {0.0f, 1.0f, 0.0f, 0.0f, 0.0f},
+};
+
+inline int32_t rne_i32_exact(float x) {
+  // IEEE-754 round-to-nearest-even matching TPU hardware & numpy.rint
+  return static_cast<int32_t>(std::nearbyint(x));
+}
+
+inline int32_t clip_i8_i32(int32_t v) {
+  if (v < -128) return -128;
+  if (v > 127) return 127;
+  return v;
+}
+
+void apply_scale_clip_csrs(CsrBank* bank, float real_mul, float fmax = 127.0f, float fmin = -128.0f) {
+  const uint32_t u_rm = fp32_bits_f(real_mul);
+  const uint32_t u_max = fp32_bits_f(fmax);
+  const uint32_t u_min = fp32_bits_f(fmin);
+  const uint32_t bf_min = u_min >> 16u;
+  (*bank)[0x5B] = (u_rm & 0xFFFu) << 13u;
+  (*bank)[0x5C] = ((u_rm >> 12u) & 0xFFFFFu) | ((u_max & 0xFu) << 21u);
+  (*bank)[0x5D] = (u_max >> 4u) & 0x1FFFFFFu;
+  (*bank)[0x5E] = ((bf_min & 1u) << 24u) | ((u_max >> 29u) & 0x7u);
+  (*bank)[0x5F] = bf_min >> 1u;
+}
+
+Pkt pack_csr_packet_ef(uint32_t op, uint32_t mask,
+                       const std::vector<std::pair<uint32_t, uint32_t>>& items,
+                       uint32_t ef_lo) {
+  std::vector<uint32_t> u32s;
+  u32s.reserve(items.size());
+  for (const auto& kv : items) {
+    u32s.push_back(((kv.second & 0x1FFFFFFu) << 7u) | (kv.first & 0x7Fu));
+  }
+  const uint32_t n_csrs = static_cast<uint32_t>(u32s.size());
+  const uint32_t tw = 2u * n_csrs + 1u;
+  const uint64_t first_u32 = u32s.empty() ? 0ULL : static_cast<uint64_t>(u32s[0]);
+  const uint64_t lo0 = ((static_cast<uint64_t>(mask) & 0xFFFFULL) << 12) | (op & 0xFFFu);
+  const uint64_t hi0 = (first_u32 << 32) | ((static_cast<uint64_t>(tw) & 0xFFFULL) << 12) |
+                       (static_cast<uint64_t>(ef_lo) & 0xFFFULL);
+  Pkt flits;
+  flits.push_back({lo0, hi0});
+  for (size_t i = 1u; i < u32s.size(); i += 4u) {
+    uint64_t w0 = (i + 0u < u32s.size()) ? u32s[i + 0u] : 0u;
+    uint64_t w1 = (i + 1u < u32s.size()) ? u32s[i + 1u] : 0u;
+    uint64_t w2 = (i + 2u < u32s.size()) ? u32s[i + 2u] : 0u;
+    uint64_t w3 = (i + 3u < u32s.size()) ? u32s[i + 3u] : 0u;
+    flits.push_back({w0 | (w1 << 32), w2 | (w3 << 32)});
+  }
+  return flits;
+}
+
+std::vector<std::pair<uint32_t, uint32_t>> diff_csr_bank_with_scales(const CsrBank& cur,
+                                                                     const CsrBank& tgt,
+                                                                     bool force_scales) {
+  std::vector<std::pair<uint32_t, uint32_t>> items;
+  items.reserve(72u);
+  for (uint32_t r = 0u; r < 0x62u; ++r) {
+    const bool is_scale_reg = (r >= 0x5Bu && r <= 0x5Fu);
+    if (tgt[r] != cur[r] || (force_scales && is_scale_reg)) {
+      items.push_back({r, tgt[r]});
+    }
+  }
+  return items;
+}
+
+Pkt build_op20_from_csrs(uint32_t op, uint32_t mask, const CsrBank& csrs,
+                         uint64_t f17_lo, uint64_t f17_hi,
+                         uint64_t f18_lo, uint64_t f18_hi,
+                         uint64_t f19_lo, uint64_t f19_hi,
+                         float scale, float fmin, float fmax,
+                         int32_t zp0, int32_t zp1, int32_t zpo,
+                         uint32_t ef_lo = 0u) {
+  std::vector<uint8_t> raw(320u, 0u);
+  const uint64_t lo0 = ((static_cast<uint64_t>(mask) & 0xFFFFULL) << 12) | (op & 0xFFFu);
+  std::memcpy(raw.data(), &lo0, 8u);
+  if (ef_lo != 0u) {
+    set_bits_le(raw.data(), raw.size(), 64u, 12u, ef_lo & 0xFFFu);
+  }
+  for (uint32_t r = 0u; r < 0x62u; ++r) {
+    set_bits_le(raw.data(), raw.size(), 77u + 25u * r, 25u, csrs[r]);
+  }
+  std::memcpy(raw.data() + 17u * 16u + 0u, &f17_lo, 8u);
+  std::memcpy(raw.data() + 17u * 16u + 8u, &f17_hi, 8u);
+  std::memcpy(raw.data() + 18u * 16u + 0u, &f18_lo, 8u);
+  std::memcpy(raw.data() + 18u * 16u + 8u, &f18_hi, 8u);
+  std::memcpy(raw.data() + 19u * 16u + 0u, &f19_lo, 8u);
+  std::memcpy(raw.data() + 19u * 16u + 8u, &f19_hi, 8u);
+
+  const uint32_t b17 = 17u * 128u;
+  if (zp0 >= 0) {
+    set_bits_le(raw.data(), raw.size(), b17 + 64u, 8u, static_cast<uint32_t>(zp0) & 0xFFu);
+  }
+  set_bits_le(raw.data(), raw.size(), b17 + 80u, 8u, static_cast<uint32_t>(zp1) & 0xFFu);
+  set_bits_le(raw.data(), raw.size(), b17 + 189u, 32u, fp32_bits_f(scale));
+  set_bits_le(raw.data(), raw.size(), b17 + 222u, 32u, fp32_bits_f(fmax));
+  set_bits_le(raw.data(), raw.size(), b17 + 259u, 32u, fp32_bits_f(fmin));
+  set_bits_le(raw.data(), raw.size(), b17 + 328u, 8u, static_cast<uint32_t>(zpo) & 0xFFu);
+  return bytes_to_flits(raw);
+}
+
+Pkt build_op640_silu(uint32_t mask, float s_silu) {
+  std::vector<uint8_t> raw(208u, 0u);
+  const uint64_t lo0 = ((static_cast<uint64_t>(mask) & 0xFFFFULL) << 12) | 0x640ULL;
+  std::memcpy(raw.data(), &lo0, 8u);
+  uint32_t idx = 0u;
+  for (int s = 0; s < 8; ++s) {
+    for (int k = 0; k < 5; ++k, ++idx) {
+      const float c = kSwigluSiluUnitCoeffs[s][k] / s_silu;
+      set_bits_le(raw.data(), raw.size(), 76u + 32u * idx, 32u, fp32_bits_f(c));
+    }
+  }
+  for (int j = 0; j < 7; ++j, ++idx) {
+    set_bits_le(raw.data(), raw.size(), 76u + 32u * idx, 32u, fp32_bits_f(kSwigluSiluBps[j]));
+  }
+  set_bits_le(raw.data(), raw.size(), 76u + 32u * 47u, 16u, 0x7804ULL);
+  return bytes_to_flits(raw);
+}
+
+Pkt pkt_940_params_ring(uint64_t off, uint32_t P, bool is_big_1536) {
+  const uint64_t sram_off16 = (off % 0x40000ULL) / 16ULL;
+  const uint64_t w0 = (1ULL << 48) | (sram_off16 << 32) | 0x940ULL;
+  const uint64_t d1 = static_cast<uint64_t>(P) / 0x20000ULL;
+  const uint64_t w1 = 0x3C00400078008FFFULL | (d1 << 31);
+  const uint64_t w2 = 0x0F0010001E002000ULL;
+  const uint32_t rem = P % 0x20000u;
+  uint64_t w3_hi = 0ULL;
+  if (rem != 0u) {
+    const uint64_t slack = (0x1000ULL - static_cast<uint64_t>(rem / 16u)) & 0xFFFULL;
+    const uint64_t slots_m1 = static_cast<uint64_t>(rem / 32u) - 1ULL;
+    w3_hi = (slack << 20) | (1ULL << 18) | (slots_m1 << 3);
+  }
+  const uint64_t w3 = (w3_hi << 32) | 0x80010800ULL;
+  const uint64_t w4_hi = (off < 0x40000ULL)
+      ? (0x3FFE004ULL + (off >> 5))
+      : (0x2000004ULL + ((off - 0x40000ULL) >> 5));
+  const uint64_t w4 = (w4_hi << 16) | (is_big_1536 ? 0x0310ULL : 0x0311ULL);
+  return {{w0, w1}, {w2, w3}, {w4, 4ULL}};
+}
+
+Pkt pkt_980_params_ring(uint64_t off, uint32_t g, uint32_t grp_bytes,
+                        bool is_m64, uint32_t ch1_base) {
+  const uint64_t byte_off = off + static_cast<uint64_t>(g) * grp_bytes;
+  const uint64_t sram_off8 = (byte_off % 0x40000ULL) / 8ULL;
+  const uint64_t w0 = (1ULL << 49) | (sram_off8 << 32) | 0x980ULL;
+  const uint64_t d1 = static_cast<uint64_t>(grp_bytes) / 0x20000ULL;
+  const uint64_t w1 = 0x78008000F0011FFEULL | (d1 << 32);
+  const uint64_t w2 = 0x1E0020003C004000ULL;
+  const uint32_t rem = grp_bytes % 0x20000u;
+  uint64_t w3_hi = 1ULL;
+  uint64_t w4 = 0ULL;
+  if (rem != 0u) {
+    const uint64_t slack = (0x2000ULL - static_cast<uint64_t>(rem / 16u)) & 0x1FFFULL;
+    const uint64_t slots_m1 = static_cast<uint64_t>(rem / 32u) - 1ULL;
+    const uint64_t val34 = (slack << 21) | (1ULL << 19) | (slots_m1 << 4) | 1ULL;
+    w3_hi = val34 & 0xFFFFFFFFULL;
+    w4 = (val34 >> 32) & 0xFULL;
+  }
+  const uint64_t w3 = (w3_hi << 32) | 0x00021000ULL;
+  const uint64_t abs64 = byte_off / 64ULL;
+  const uint64_t w5 = (abs64 << 42) | 0x0000020221FF8C00ULL;
+  uint64_t w6 = 0ULL, w7 = 0ULL, w8 = 0ULL;
+  if (is_m64) {
+    w6 = (static_cast<uint64_t>(ch1_base * 4u) << 32) | 0x58000004ULL;
+    w7 = 0x0181000000C00000ULL;
+    w8 = 0ULL;
+  } else {
+    const uint32_t tb = kSnake16[g];
+    w6 = 0x0000000008000004ULL;
+    w7 = 0x0001000000800000ULL | ((tb < 8u) ? (1ULL << (56u + tb)) : 0ULL);
+    w8 = (tb >= 8u) ? (1ULL << (tb - 8u)) : 0ULL;
+  }
+  return {{w0, w1}, {w2, w3}, {w4, w5}, {w6, w7}, {w8, 0ULL}};
+}
+
+std::vector<uint8_t> build_chunk_a40_stage(uint32_t pid, uint32_t nbytes, uint32_t tag_byte) {
+  const uint64_t dma_enc = static_cast<uint64_t>(nbytes - 1u) * 8ULL;
+  const uint64_t f3_lo = (dma_enc << 48) | (1ULL << 47);
+  const uint64_t f3_hi = (dma_enc >> 16) | (dma_enc << 16);
+  const uint64_t f0_lo = (static_cast<uint64_t>(tag_byte) << 32) |
+                         ((static_cast<uint64_t>(pid) & 0xFFFFULL) << 12) | 0xA40ULL;
+  std::vector<Flit> fl = {
+      {f0_lo, 0x0000002000000000ULL},
+      {0ULL, 0ULL},
+      {0ULL, 0x0000020000000000ULL},
+      {f3_lo, f3_hi},
+  };
+  return flits_to_bytes(fl);
+}
+
+// Helper: build the M=1 GEMM compute CsrBank for (1, K_in, N_out) writing at sw_out_unit * 128.
+CsrBank build_m1_gemm_csr_bank(uint32_t K_in, uint32_t N_out,
+                               uint32_t n_iters, uint32_t sw_out_unit,
+                               bool fast_bcast, uint32_t k_cores,
+                               float real_mul, const CsrBank& ref_h3) {
+  const uint32_t k_unit = K_in / 4u;
+  const uint32_t k_passes = (k_unit + 11u) / 12u;
+  const bool partial_k = ((k_unit % 12u) != 0u);
+  const uint32_t r = n_iters - 1u;
+
+  CsrBank tgt = build_compute_csr_state(1u, K_in, 32u, real_mul, 0, 1.0f, 1.0f, 0,
+                                        kActNone, true, sw_out_unit, ref_h3, N_out);
+  tgt[0x01] = r << 3u;
+  if (!partial_k) {
+    const int64_t st_back_k = -static_cast<int64_t>(k_unit - 1u);
+    std::array<std::pair<int64_t, int64_t>, 7> a_ents = {{
+        {11, 1}, {static_cast<int64_t>(k_passes - 1u), st_back_k},
+        {static_cast<int64_t>(r), st_back_k}, {0, st_back_k},
+        {0, st_back_k}, {0, st_back_k}, {0, st_back_k},
+    }};
+    pack_stream_a(tgt, 2u, a_ents);
+  } else {
+    const int64_t st0 = static_cast<int64_t>(k_unit) - 11LL;
+    const int64_t st2 = -static_cast<int64_t>(12u * k_passes - 1u);
+    std::array<std::pair<int64_t, int64_t>, 7> a_ents = {{
+        {11, st0}, {0, 1}, {static_cast<int64_t>(k_passes - 1u), st2},
+        {static_cast<int64_t>(r), st2}, {0, st2}, {0, st2}, {0, st2},
+    }};
+    pack_stream_a(tgt, 2u, a_ents);
+  }
+  if (r == 0u) {
+    std::array<std::pair<int64_t, int64_t>, 8> h_ents{};
+    pack_stream_h(tgt, 0x2000u | sw_out_unit, h_ents);
+  } else {
+    const int64_t st_back = -8LL * static_cast<int64_t>(r);
+    std::array<std::pair<int64_t, int64_t>, 8> h_ents = {{
+        {8, static_cast<int64_t>(r)}, {st_back, 0}, {st_back, 0}, {st_back, 0},
+        {st_back, 0}, {st_back, 0}, {st_back, 0}, {st_back, 0},
+    }};
+    pack_stream_h(tgt, sw_out_unit, h_ents);
+    tgt[0x24] |= 0x10000u;
+  }
+  {
+    std::array<std::pair<int64_t, int64_t>, 7> b_ents = {{
+        {11, -44}, {static_cast<int64_t>(k_passes - 1u), -44},
+        {static_cast<int64_t>(r), -44}, {0, -44}, {0, -44}, {0, -44}, {0, -44},
+    }};
+    pack_stream_b(tgt, 0x800u, b_ents);
+  }
+  tgt[0x3C] = (k_passes - 1u) << 12u;
+  tgt[0x3D] = r << 12u;
+  tgt[0x43] = (partial_k ? 0x1800000u : 0u) | ((r > 0u) ? 0x1100u : 0u);
+  tgt[0x45] = (r == 0u) ? 0xE00063u : 0xE00061u;
+  tgt[0x46] = 0x12u + (fast_bcast ? (k_cores << 4u) : 0u);
+  apply_scale_clip_csrs(&tgt, real_mul, 127.0f, -128.0f);
+  return tgt;
+}
+
+// Helper: emit M=1 param SRAM OP_440 x n_cores + OP_500 bias loader.
+void emit_m1_gemm_param_440_500(PacketStream* ps, uint32_t K_in,
+                                uint32_t n_cores, uint32_t n_iters,
+                                bool wait_fast_bcast, uint32_t k_cores) {
+  const uint32_t n_mask = (1u << n_cores) - 1u;
+  const uint32_t k_unit = K_in / 4u;
+  const uint32_t k_passes = (k_unit + 11u) / 12u;
+  const uint32_t k_rem12 = k_unit % 12u;
+  const uint64_t p_field = 0xFE0ULL;
+  const uint64_t p440_f0h = 0x02C0000200000000ULL;
+  const uint64_t f1l_p = 0xFFA800007FFFD400ULL + (static_cast<uint64_t>(k_passes - 1u) << 31);
+  const uint64_t f1h_p = (static_cast<uint64_t>(2u * n_iters - 1u) << 48) | 0x0000FFFF500000FFULL;
+  const uint64_t p440_f2l = (k_rem12 == 0u)
+      ? 0x0000000000006220ULL
+      : ((static_cast<uint64_t>((12u - k_rem12) * 0x40u + 0x10u) << 48) |
+         (static_cast<uint64_t>(k_rem12 - 1u) << 32) | 0x6220ULL);
+  const uint64_t p440_f2h = 0x0320000000031400ULL;
+  const uint64_t p440_f3l = ((p_field + 2ULL) << 48) | ((p_field << 24) | 0x200ULL);
+  const uint64_t p440_f3h = 0xFFFFFD84C0000000ULL | (p_field << 4);
+  for (uint32_t g = 0u; g < n_cores; ++g) {
+    ps->emit({
+        {(static_cast<uint64_t>(1u << g) << 12) | 0x440ULL, p440_f0h},
+        {f1l_p, f1h_p},
+        {p440_f2l, p440_f2h},
+        {p440_f3l, p440_f3h},
+        {0x9000000FULL, 0ULL},
+        {0ULL, 0ULL},
+        {0ULL, 0x40400000ULL},
+        {0x0007800000000000ULL, 0ULL},
+    });
+  }
+  Pkt f500(std::begin(kBaseOp500), std::end(kBaseOp500));
+  f500[0].lo = (static_cast<uint64_t>(n_mask) << 12) | 0x500ULL;
+  f500[1].lo = static_cast<uint64_t>(n_iters - 1u) << 23;
+  f500[3].lo = 0xFFC80000FFFE4000ULL | (static_cast<uint64_t>(2u * n_iters - 1u) << 32);
+  const uint64_t tok_wait = wait_fast_bcast ? static_cast<uint64_t>(k_cores + 1u) : 1ULL;
+  f500[5].lo = (f500[5].lo & 0x7FFFFFFFFFFFFFFFULL) | ((tok_wait & 1ULL) << 63);
+  f500[5].hi = 0xD402000000000000ULL | (static_cast<uint64_t>(k_passes) << 24) | (tok_wait >> 1);
+  ps->emit(f500);
+}
+
+// Helper: build M=1 SiLU OP20_0x200 (reads/writes sram_gate, clips [-11.6, +inf], zp=128).
+Pkt build_m1_silu_op20(uint32_t h_iters, uint32_t h_mask, float s_gate, uint32_t sw_gate) {
+  Pkt hdr = build_lt_hdr_data(h_iters, h_mask, s_gate, 0, sw_gate);
+  std::vector<uint8_t> raw = flits_to_bytes(hdr);
+  const uint32_t b17 = 17u * 128u;
+  constexpr float kInf = __builtin_huge_valf();
+  set_bits_le(raw.data(), raw.size(), b17 + 80u, 8u, 128u);
+  set_bits_le(raw.data(), raw.size(), b17 + 189u, 32u, fp32_bits_f(s_gate));
+  set_bits_le(raw.data(), raw.size(), b17 + 222u, 32u, fp32_bits_f(kInf));
+  set_bits_le(raw.data(), raw.size(), b17 + 259u, 32u, fp32_bits_f(-11.6f));
+  set_bits_le(raw.data(), raw.size(), b17 + 328u, 8u, 128u);
+  return bytes_to_flits(raw);
+}
+
+// Helper: build M=1 MUL CsrBank (for h_iters in {1, 2, 3}).
+CsrBank build_m1_mul_csr_bank(uint32_t h_iters, uint32_t sram_gate, uint32_t sram_up,
+                              uint32_t sram_dst, float m_mul) {
+  CsrBank b{};
+  if (h_iters == 1u) {
+    b[0x00] = 0x4000u;
+    b[0x05] = sram_gate << 4u;
+    b[0x06] = 0x100008u;
+    b[0x07] = 0x1F80000u;
+    b[0x08] = 0x7FFu;
+    b[0x09] = 0x400u;
+    b[0x0B] = 0x3FFFEu;
+    b[0x0C] = 0x20000u;
+    b[0x0E] = 0x1FFFF00u;
+    b[0x0F] = 0x1000000u;
+    b[0x11] = 0x1FF8000u;
+    b[0x12] = 0x7Fu;
+    b[0x13] = 0x154u;
+    b[0x16] = 0x3FC08u;
+    b[0x17] = 0x2000u | (sram_dst / 128u);
+    b[0x27] = 0x1000000u;
+    b[0x28] = 0xF8000Fu;
+    b[0x29] = (sram_up / 64u) << 20u;
+    b[0x2A] = 0x2000u;
+    b[0x2B] = 0x20u;
+    b[0x2C] = 0x1FFFF0u;
+    b[0x2D] = 0x1F00000u;
+    b[0x2E] = 0xFFFu;
+    b[0x2F] = 0x1FFF800u;
+    b[0x30] = 0x7u;
+    b[0x31] = 0x7FFFCu;
+    b[0x32] = 0x1FC0000u;
+    b[0x33] = 0x3FFu;
+    b[0x34] = 0x1FFFE00u;
+    b[0x35] = 0x1u;
+    b[0x36] = 0x1FFFFu;
+    b[0x37] = 0x1000u;
+    b[0x3B] = 0x1000u;
+    b[0x43] = 0x20000u;
+    b[0x55] = 0x85000u;
+    b[0x56] = 0x100E00u;
+    b[0x57] = 0x800u;
+    b[0x58] = 0x4000u;
+    b[0x59] = 0x1EFu;
+    b[0x61] = 0x200u;
+  } else if (h_iters == 2u) {
+    b = build_m1_mul_csr_bank(1u, 0u, 0u, 0u, m_mul);
+    b[0x05] = 0u;
+    b[0x09] = 0xC00u;
+    b[0x0C] = 0x60000u;
+    b[0x10] = 0x1u;
+    b[0x17] = 0x2000u;
+    b[0x29] = 0u;
+    b[0x55] = 0x185000u;
+  } else {
+    // h_iters == 3 (first 64 B via OP20_0x100; 3rd 32 B via CSR_0x100(7))
+    b = build_m1_mul_csr_bank(1u, sram_gate, sram_up, sram_dst, m_mul);
+    b[0x00] = 0xC000u;
+    b[0x06] = 0x300008u;
+    b[0x07] = 0x1E80000u;
+    b[0x09] = 0xC00u;
+    b[0x0B] = 0x3FFFAu;
+    b[0x0C] = 0x60000u;
+    b[0x0E] = 0x1FFFD00u;
+    b[0x10] = 0x1u;
+    b[0x11] = 0x1FE8000u;
+    b[0x28] = 0x1F8001Fu;
+    b[0x2B] = 0x60u;
+    b[0x2C] = 0x1FFFD0u;
+    b[0x2D] = 0x1D00000u;
+    b[0x2F] = 0x1FFE800u;
+    b[0x31] = 0x7FFF4u;
+    b[0x32] = 0x1F40000u;
+    b[0x34] = 0x1FFFA00u;
+    b[0x36] = 0x1FFFDu;
+    b[0x3B] = 0x3000u;
+  }
+  apply_scale_clip_csrs(&b, m_mul, 127.0f, -128.0f);
+  return b;
+}
+
+Pkt build_m1_mul_csr_iters3_tail(uint32_t mask, uint32_t sram_gate, uint32_t sram_up,
+                                 CsrBank* out_updated) {
+  const std::vector<std::pair<uint32_t, uint32_t>> items = {
+      {0x00u, 0x4000u},
+      {0x05u, (sram_gate + 64u) << 4u},
+      {0x06u, 0x100008u},
+      {0x07u, 0x1F80000u},
+      {0x09u, 0x1400u},
+      {0x0Bu, 0x3FFFEu},
+      {0x0Cu, 0xA0000u},
+      {0x0Eu, 0x1FFFF00u},
+      {0x10u, 0x2u},
+      {0x11u, 0x1FF8000u},
+      {0x16u, 0x103FC08u},
+      {0x28u, 0xF8000Fu},
+      {0x29u, ((sram_up + 64u) / 64u) << 20u},
+      {0x2Bu, 0x20u},
+      {0x2Cu, 0x1FFFF0u},
+      {0x2Du, 0x1F00000u},
+      {0x2Fu, 0x1FFF800u},
+      {0x31u, 0x7FFFCu},
+      {0x32u, 0x1FC0000u},
+      {0x34u, 0x1FFFE00u},
+      {0x36u, 0x1FFFFu},
+      {0x3Bu, 0x1000u},
+      {0x55u, 0x105000u},
+  };
+  if (out_updated) {
+    for (const auto& kv : items) (*out_updated)[kv.first] = kv.second;
+  }
+  return pack_csr_packet_ef(0x100u, mask, items, 0x000u);
+}
+
+void synthesize_swiglu_1x_chunks(uint32_t K, uint32_t H, uint32_t N,
+                                 const ob_swiglu_int8_desc_t& d,
+                                 uint32_t p_gate, uint32_t p_up, uint32_t p_down,
+                                 std::array<std::vector<uint8_t>, 11>* out_chunks,
+                                 uint32_t* out_field14) {
+  uint32_t k_cores = 16u, k_iters = 1u;
+  uint32_t h_cores = 16u, h_iters = 1u;
+  uint32_t n_cores = 16u, n_iters = 1u;
+  lt_pick_cores(K, &k_cores, &k_iters);
+  lt_pick_cores(H, &h_cores, &h_iters);
+  lt_pick_cores(N, &n_cores, &n_iters);
+
+  const uint32_t k_mask = (1u << k_cores) - 1u;
+  const uint32_t h_mask = (1u << h_cores) - 1u;
+  const uint32_t n_mask = (1u << n_cores) - 1u;
+  const uint32_t k_per_core = 32u * k_iters;
+  const uint32_t h_per_core = 32u * h_iters;
+  const uint32_t n_per_core = 32u * n_iters;
+
+  const uint32_t sw_k = (K + 127u) / 128u;
+  const uint32_t sw_h = (H + 127u) / 128u;
+  const uint32_t sram_in_tmp = sw_k * 128u;
+  const uint32_t sw_gate = sw_k;
+  const uint32_t sram_gate = sw_gate * 128u;
+  const uint32_t sw_up = (h_iters == 3u) ? std::max<uint32_t>(sw_k + 1u, sw_h) : (sw_k + 1u);
+  const uint32_t sram_up = sw_up * 128u;
+  const uint32_t sram_prod = (h_iters == 3u) ? sram_up : sram_gate;
+  const uint32_t sw_out = sw_h;
+  const uint32_t sram_out = sw_out * 128u;
+
+  const float m_gate = (d.s_in * d.s_wg) / d.s_gate;
+  const float m_up = (d.s_in * d.s_wu) / d.s_up;
+  const float m_mul = (d.s_silu * d.s_up) / d.s_prod;
+  const float m_down = (d.s_prod * d.s_wd) / d.s_out;
+  const bool fast_kh = (k_cores == h_cores);
+  const bool fast_hn = (h_cores == n_cores);
+  const bool is_big_1536 = (h_iters == 3u);
+
+  (*out_chunks)[0] = build_chunk0();
+  (*out_chunks)[1] = build_chunk1(1u, K);
+  (*out_chunks)[2] = build_chunk2(1u, K);
+
+  // ---------------- chunk[3]: input load + MSB flip + K bcast + gate GEMM ----------------
+  PacketStream ps3(10u);
+  ps3.emit(pkt_680_3c0(0x8000ULL));
+  ps3.emit(pkt_900_bar_all());
+  if (k_iters == 1u) {
+    ps3.emit({
+        {(static_cast<uint64_t>(k_mask) << 12) | 0x440ULL,
+         0x0000000200000000ULL | (static_cast<uint64_t>(sram_in_tmp) << 13)},
+        {0ULL, 0ULL}, {0ULL, 0ULL},
+        {0x03E0000000000000ULL, 0x0000000000003E00ULL},
+        {0ULL, 0ULL}, {0ULL, 0ULL},
+        {0ULL, 0x00400000ULL},
+        {0x0000800000000000ULL, 0ULL},
+    });
+    for (uint32_t g = 0u; g < k_cores; ++g) {
+      uint32_t tb = kSnake16[g];
+      uint64_t f0l = (0x0002ULL << 48) | ((1ULL + 4ULL * g) << 32) | 0x980ULL;
+      uint64_t f2h = ((0x02ULL + 2ULL * g) << 40) | 0x021FF8C00ULL;
+      uint64_t f3h = 0x0001000000800000ULL | ((tb < 8u) ? (1ULL << (56u + tb)) : 0ULL);
+      uint64_t f4l = (tb >= 8u) ? (1ULL << (tb - 8u)) : 0ULL;
+      ps3.emit({{f0l, 0ULL}, {0ULL, 0x20021000ULL}, {0ULL, f2h}, {0x08000004ULL, f3h}, {f4l, 0ULL}});
+    }
+  } else {
+    uint32_t ym1 = k_iters - 1u;
+    Flit f1 = dma_2d_rewind_f1(32u * ym1);
+    ps3.emit({
+        {(static_cast<uint64_t>(k_mask) << 12) | 0x440ULL,
+         (static_cast<uint64_t>(ym1) << 54) | (0x40ULL << 32) | (static_cast<uint64_t>(sram_in_tmp) << 13)},
+        f1, {0x20ULL, 0ULL},
+        {0x03E2000000000000ULL, 0x0000000000003E00ULL},
+        {0ULL, 0ULL}, {0ULL, 0ULL},
+        {0ULL, 0x00400000ULL},
+        {0x0000800000000000ULL, 0ULL},
+    });
+    uint64_t f1h_980 = ((0x7FC8ULL - 0x40ULL * ym1) << 48) |
+                       ((0x10ULL * ym1) << 32) | 0x20021000ULL;
+    for (uint32_t g = 0u; g < k_cores; ++g) {
+      uint32_t tb = kSnake16[g];
+      uint64_t f0l = (0x0002ULL << 48) | ((1ULL + 4ULL * k_iters * g) << 32) | 0x980ULL;
+      uint64_t f2h = ((0x02ULL + 2ULL * k_iters * g) << 40) | 0x021FF8C00ULL;
+      uint64_t f3h = 0x0001000000800000ULL | ((tb < 8u) ? (1ULL << (56u + tb)) : 0ULL);
+      uint64_t f4l = (tb >= 8u) ? (1ULL << (tb - 8u)) : 0ULL;
+      ps3.emit({
+          {f0l, 0x7F008000FE0103FEULL},
+          {0x1FC020003F804000ULL, f1h_980},
+          {0ULL, f2h},
+          {0x08000004ULL, f3h},
+          {f4l, 0ULL},
+      });
+    }
+  }
+  ps3.emit(pkt_680_3f9());
+  ps3.emit(pkt_680_3f9());
+  ps3.emit(build_op5c0(1u, 32u, true));
+  ps3.emit(build_op4c0(1u, 32u, true));
+  ps3.emit(pkt_680_3e0());
+  Pkt p640_in = build_op640(K, d.s_in, 0);
+  p640_in[0].lo = (static_cast<uint64_t>(k_mask) << 12) | 0x640ULL;
+  ps3.emit(p640_in);
+  for (const Pkt& p6 : build_lt_6c0s(k_mask, k_iters, sram_in_tmp)) ps3.emit(p6);
+  Pkt hdr3 = build_lt_hdr_data(k_iters, k_mask, d.s_in, 0, sw_k);
+  ps3.emit(hdr3);
+  CsrBank h3_csrs = unpack_hdr_csrs(hdr3);
+  CsrBank cur_csrs = h3_csrs;
+  if (k_iters == 3u) {
+    ps3.emit(build_lt_vica_csr_iters3(k_mask, sram_in_tmp, &cur_csrs));
+  }
+
+  // Broadcast K activations from k_cores -> h_cores (tracking cumulative sync tokens!)
+  C3SyncInfo sync{};
+  uint32_t ch1_tok = 0u;
+  uint32_t ch2_tok = 0u;
+  const uint64_t dst_bits_h = snake_mask_bits(h_mask);
+  ps3.emit(pkt_680_3f9());
+  ps3.emit(pkt_680_3f9());
+  if (k_iters > 1u) ps3.emit(pkt_680_3f9());
+  if (fast_kh) {
+    if (h_cores < 16u) emit_tile_barriers_for_mask(&ps3, h_mask, 0x0D000000ULL);
+    sync.c3_44c += k_cores;
+    sync.c3_dst_cnt = h_cores;
+    uint64_t f6_r = (h_cores == 16u) ? 0x08000000ULL : 0x20000000ULL;
+    uint64_t f6_s = (h_cores == 16u) ? 0x80000000ULL : 0x200000000ULL;
+    uint64_t step = static_cast<uint64_t>(K - 32u);
+    uint64_t f1l = (mask_s(-static_cast<int64_t>(step) * 8LL, 16u) << 48) |
+                   (static_cast<uint64_t>(k_cores - 1u) << 31) | 0x8000ULL;
+    uint64_t f1h = (0x0002000000000000ULL - (step << 28)) | 0xFFULL;
+    ps3.emit({
+        {(static_cast<uint64_t>(h_mask) << 12) | 0x440ULL,
+         (static_cast<uint64_t>(k_iters - 1u) << 54) | (0x40ULL << 32)},
+        {f1l, f1h}, {0x60ULL, 0ULL},
+        {0x03E2000000000000ULL, 0xC0003E00ULL},
+        {0ULL, 0ULL}, {0ULL, 0ULL},
+        {0ULL, f6_r}, {0x0000800000000000ULL, 0ULL},
+    });
+    uint64_t b_enc = static_cast<uint64_t>(k_per_core - 1u) * 2ULL;
+    for (uint32_t g = 0u; g < k_cores; ++g) {
+      uint64_t ch_hi = ((4ULL * ch1_tok + 1ULL) << 12) | 0x44CULL;
+      ch1_tok += 1u;
+      ps3.emit({
+          {(static_cast<uint64_t>(1u << g) << 12) | 0x400ULL,
+           0x0000000200000000ULL | (static_cast<uint64_t>(sram_in_tmp) << 13)},
+          {0ULL, 0ULL}, {0ULL, 0ULL},
+          {b_enc << 52, (ch_hi << 32) | (b_enc << 8)},
+          {0x0000000100000000ULL | (0x80ULL * k_cores), 0ULL},
+          {0ULL, 0ULL},
+          {0ULL, (dst_bits_h << 34) | f6_s},
+      });
+    }
+    ps3.emit(pkt_680_3c0(0ULL));
+  } else {
+    emit_tile_barriers_for_mask(&ps3, h_mask, 0x0D000000ULL);
+    uint32_t ym1 = k_iters - 1u;
+    Flit f1_k = dma_2d_rewind_f1(32u * ym1);
+    uint64_t b_enc = static_cast<uint64_t>(k_per_core - 1u) * 2ULL;
+    for (uint32_t g = 0u; g < k_cores; ++g) {
+      bool use_ch2 = ((g % 2u) == 1u);
+      uint32_t dst_off = g * k_per_core;
+      uint64_t ch_hi = 0ULL, f6_r = 0ULL, f6_s = 0ULL;
+      uint32_t op_recv = 0x440u;
+      if (use_ch2) {
+        ch_hi = ((4ULL * ch2_tok + 1ULL) << 12) | 0x48CULL;
+        ch2_tok += 1u;
+        sync.c3_48c += 1u;
+        op_recv = 0x480u;
+        f6_r = 0x20000000ULL;
+        f6_s = 0x200000000ULL;
+      } else {
+        ch_hi = ((4ULL * ch1_tok + 1ULL) << 12) | 0x44CULL;
+        ch1_tok += 1u;
+        sync.c3_44c += 1u;
+        sync.c3_dst_cnt = h_cores;
+        op_recv = 0x440u;
+        f6_r = 0x08000000ULL;
+        f6_s = 0x080000000ULL;
+      }
+      ps3.emit({
+          {(static_cast<uint64_t>(h_mask) << 12) | op_recv,
+           (static_cast<uint64_t>(ym1) << 54) | (0x40ULL << 32) | (static_cast<uint64_t>(dst_off) << 13)},
+          f1_k, {0x20ULL, 0ULL},
+          {0x03E2000000000000ULL, 0xC0003E00ULL},
+          {0ULL, 0ULL}, {0ULL, 0ULL},
+          {0ULL, f6_r}, {0x0000800000000000ULL, 0ULL},
+      });
+      ps3.emit({
+          {(static_cast<uint64_t>(1u << g) << 12) | 0x400ULL,
+           0x0000000200000000ULL | (static_cast<uint64_t>(sram_in_tmp) << 13)},
+          {0ULL, 0ULL}, {0ULL, 0ULL},
+          {b_enc << 52, (ch_hi << 32) | (b_enc << 8)},
+          {0x0000000100000080ULL, 0ULL}, {0ULL, 0ULL},
+          {0ULL, (dst_bits_h << 34) | f6_s},
+      });
+    }
+    ps3.emit(pkt_680_3c0(0x8000ULL));
+    ps3.emit(pkt_900_bar_all());
+    ps3.emit(pkt_680_3f9());
+    ps3.emit(pkt_900_zero());
+    ps3.emit(pkt_680_3f9());
+    ps3.emit(pkt_680_3c0(0ULL));
+  }
+
+  // Gate GEMM (K -> H, writes sram_gate = sw_gate * 128)
+  emit_m1_gemm_param_440_500(&ps3, K, h_cores, h_iters, fast_kh, k_cores);
+  CsrBank gate_csrs = build_m1_gemm_csr_bank(K, H, h_iters, sw_gate, fast_kh, k_cores, m_gate, h3_csrs);
+  ps3.emit(pack_csr_packet_ef(0x040u, h_mask, diff_csr_bank_with_scales(cur_csrs, gate_csrs, true), 0x000u));
+  cur_csrs = gate_csrs;
+  (*out_chunks)[3] = flits_to_bytes(ps3.flits);
+
+  // ---------------- chunk[4]: gate param DMA (0xa40, tag 0x22) ----------------
+  const uint32_t c4_pid = 10u + ps3.n_pkts;
+  (*out_chunks)[4] = build_chunk_a40_stage(c4_pid, p_gate, 0x22u);
+
+  // ---------------- chunk[5]: gate param ring + [optional SiLU if h_iters==3] + up GEMM ----------------
+  PacketStream ps5(c4_pid + 1u);
+  ps5.emit(pkt_940_params_ring(0ULL, p_gate, is_big_1536));
+  const uint32_t grp_gate = p_gate / h_cores;
+  for (uint32_t g = 0u; g < h_cores; ++g) {
+    ps5.emit(pkt_980_params_ring(0ULL, g, grp_gate, false, 0u));
+  }
+  ps5.emit(pkt_680_3f9());
+  ps5.emit(pkt_900_zero());
+  ps5.emit(pkt_680_3f9(0x8000ULL));
+  ps5.emit(pkt_900_bar_all());
+
+  if (h_iters == 3u) {
+    // 1x576x1536x576: run SiLU on sram_gate BEFORE up GEMM (VICA LUT placed at sram=K to preserve X!)
+    ps5.emit(pkt_680_3f9());
+    Pkt p5c0_s = build_op5c0(1u, 32u, true);
+    p5c0_s[3].lo = 0x0200000000000000ULL | (static_cast<uint64_t>(K) << 35);
+    ps5.emit(p5c0_s);
+    Pkt p4c0_s = build_op4c0(1u, 32u, true);
+    p4c0_s[0].hi = 0x0000000200000000ULL | (static_cast<uint64_t>(K) << 13);
+    ps5.emit(p4c0_s);
+    ps5.emit(pkt_680_3e0());
+    ps5.emit(build_op640_silu(h_mask, d.s_silu));
+    Pkt silu_op20 = build_m1_silu_op20(3u, h_mask, d.s_gate, sw_gate);
+    ps5.emit(silu_op20);
+    cur_csrs = unpack_hdr_csrs(silu_op20);
+    ps5.emit(build_lt_vica_csr_iters3(h_mask, sram_gate, &cur_csrs));
+    ps5.emit(pkt_680_3f9());
+    ps5.emit(pkt_680_3f9());
+    ps5.emit(pkt_900_zero());
+    ps5.emit(pkt_680_3f9());
+    ps5.emit(pkt_680_3c0(0ULL));
+    emit_m1_gemm_param_440_500(&ps5, K, h_cores, h_iters, false, k_cores);
+    CsrBank up_csrs = build_m1_gemm_csr_bank(K, H, h_iters, sw_up, false, k_cores, m_up, h3_csrs);
+    ps5.emit(pack_csr_packet_ef(0x040u, h_mask, diff_csr_bank_with_scales(cur_csrs, up_csrs, true), 0x000u));
+    cur_csrs = up_csrs;
+  } else {
+    if (!fast_kh) {
+      ps5.emit(pkt_900_zero());
+      ps5.emit(pkt_680_3f9());
+    }
+    ps5.emit(pkt_680_3c0(0ULL));
+    emit_m1_gemm_param_440_500(&ps5, K, h_cores, h_iters, false, k_cores);
+    CsrBank up_csrs = build_m1_gemm_csr_bank(K, H, h_iters, sw_up, false, k_cores, m_up, h3_csrs);
+    ps5.emit(build_op20_from_csrs(
+        0x040u, h_mask, up_csrs,
+        0x0000216000000000ULL, 0xC0D0000000800080ULL,
+        0x00000000000000FFULL, 0x10BF800007800000ULL,
+        0x0000000618000000ULL, 0x0000000001008000ULL,
+        m_up, -128.0f, 127.0f, 128, 128, 128));
+    cur_csrs = up_csrs;
+  }
+  (*out_chunks)[5] = flits_to_bytes(ps5.flits);
+
+  // ---------------- chunk[6]: up param DMA (0xa40, tag 0x42) ----------------
+  const uint32_t c6_pid = c4_pid + 1u + ps5.n_pkts;
+  (*out_chunks)[6] = build_chunk_a40_stage(c6_pid, p_up, 0x42u);
+
+  // ---------------- chunk[7]: up param ring + [SiLU] + MUL + H bcast + down GEMM ----------------
+  PacketStream ps7(c6_pid + 1u);
+  ps7.emit(pkt_940_params_ring(static_cast<uint64_t>(p_gate), p_up, is_big_1536));
+  const uint32_t grp_up = p_up / h_cores;
+  for (uint32_t g = 0u; g < h_cores; ++g) {
+    ps7.emit(pkt_980_params_ring(static_cast<uint64_t>(p_gate), g, grp_up, false, 0u));
+  }
+  ps7.emit(pkt_680_3f9());
+  ps7.emit(pkt_900_zero());
+  ps7.emit(pkt_680_3f9(0x8000ULL));
+  ps7.emit(pkt_900_bar_all());
+  ps7.emit(pkt_680_3f9());
+
+  if (h_iters == 3u) {
+    // 1x576x1536x576: MUL via OP20_0x100 + CSR_0x100(7)
+    CsrBank mul_csrs = build_m1_mul_csr_bank(3u, sram_gate, sram_up, sram_prod, m_mul);
+    ps7.emit(build_op20_from_csrs(
+        0x100u, h_mask, mul_csrs,
+        0x7000214000000000ULL, 0xC008000000800080ULL,
+        0x000000000000007BULL, 0x10BF800007B00000ULL,
+        0x0000000618000000ULL, 0x0000000000008000ULL,
+        m_mul, -128.0f, 127.0f, 128, 128, 128));
+    cur_csrs = mul_csrs;
+    ps7.emit(build_m1_mul_csr_iters3_tail(h_mask, sram_gate, sram_up, &cur_csrs));
+  } else {
+    // Run SiLU on sram_gate, then MUL via CSR_0x100
+    ps7.emit(build_op5c0(1u, 32u, true));
+    ps7.emit(build_op4c0(1u, 32u, true));
+    ps7.emit(pkt_680_3e0());
+    ps7.emit(build_op640_silu(h_mask, d.s_silu));
+    if (h_iters == 2u) {
+      for (const Pkt& p6 : build_lt_6c0s(h_mask, 2u, sram_gate)) ps7.emit(p6);
+    }
+    Pkt silu_op20 = build_m1_silu_op20(h_iters, h_mask, d.s_gate, sw_gate);
+    ps7.emit(silu_op20);
+    cur_csrs = unpack_hdr_csrs(silu_op20);
+    ps7.emit(pkt_680_3f9());
+    ps7.emit(pkt_680_3f9());
+    if (h_iters == 2u) {
+      ps7.emit(pkt_680_3f9());
+      // 6 indirect 0x6c0 packets (j=0,1: src0=sram_gate+32*j, dst=sram_gate+32*j, src1=sram_up+32*j)
+      const uint64_t lo6c0 = (static_cast<uint64_t>(h_mask) << 12) | 0x6C0ULL;
+      for (uint32_t j = 0u; j < 2u; ++j) {
+        const uint64_t bank_bit = (1ULL << j) << 56;
+        ps7.emit({{lo6c0, bank_bit | (static_cast<uint64_t>(sram_gate + 32u * j) << 16) | 0x8000ULL}});
+        ps7.emit({{lo6c0, bank_bit | (static_cast<uint64_t>(sram_gate + 32u * j) << 16) | 0x8400ULL}});
+        ps7.emit({{lo6c0, bank_bit | (static_cast<uint64_t>(sram_up + 32u * j) << 16) | 0x8200ULL}});
+      }
+    }
+    CsrBank mul_csrs = build_m1_mul_csr_bank(h_iters, sram_gate, sram_up, sram_prod, m_mul);
+    const uint32_t mul_ef = (h_iters == 2u) ? 0x070u : 0x000u;
+    ps7.emit(pack_csr_packet_ef(0x100u, h_mask, diff_csr_bank_with_scales(cur_csrs, mul_csrs, true), mul_ef));
+    cur_csrs = mul_csrs;
+  }
+
+  // Broadcast H product activations from h_cores (at sram_prod) -> n_cores (at 0x0000)
+  const uint64_t dst_bits_n = snake_mask_bits(n_mask);
+  ps7.emit(pkt_680_3f9());
+  ps7.emit(pkt_680_3f9());
+  ps7.emit(pkt_680_3f9());
+  if (fast_hn) {
+    sync.c3_44c += h_cores;
+    sync.c3_dst_cnt = n_cores;
+    const uint64_t f6_r = (n_cores == 16u) ? 0x08000000ULL : 0x20000000ULL;
+    const uint64_t f6_s = (n_cores == 16u) ? 0x80000000ULL : 0x200000000ULL;
+    if (h_iters == 1u) {
+      Flit f1 = dma_2d_rewind_f1(32u * (h_cores - 1u));
+      ps7.emit({
+          {(static_cast<uint64_t>(n_mask) << 12) | 0x440ULL,
+           (static_cast<uint64_t>(h_cores - 1u) << 54) | (0x40ULL << 32)},
+          f1, {0x20ULL, 0ULL},
+          {0x03E0000000000000ULL, 0x40003E00ULL},
+          {0ULL, 0ULL}, {0ULL, 0ULL},
+          {0ULL, f6_r}, {0x0000800000000000ULL, 0ULL},
+      });
+    } else {
+      uint64_t step = static_cast<uint64_t>(H - 32u);
+      uint64_t f1l = (mask_s(-static_cast<int64_t>(step) * 8LL, 16u) << 48) |
+                     (static_cast<uint64_t>(h_cores - 1u) << 31) | 0x8000ULL;
+      uint64_t f1h = (0x0002000000000000ULL - (step << 28)) | 0xFFULL;
+      ps7.emit({
+          {(static_cast<uint64_t>(n_mask) << 12) | 0x440ULL,
+           (static_cast<uint64_t>(h_iters - 1u) << 54) | (0x40ULL << 32)},
+          {f1l, f1h}, {0x60ULL, 0ULL},
+          {0x03E2000000000000ULL, 0xC0003E00ULL},
+          {0ULL, 0ULL}, {0ULL, 0ULL},
+          {0ULL, f6_r}, {0x0000800000000000ULL, 0ULL},
+      });
+    }
+    const uint64_t b_enc = static_cast<uint64_t>(h_per_core - 1u) * 2ULL;
+    for (uint32_t g = 0u; g < h_cores; ++g) {
+      uint64_t ch_hi = ((4ULL * ch1_tok + 1ULL) << 12) | 0x44CULL;
+      ch1_tok += 1u;
+      ps7.emit({
+          {(static_cast<uint64_t>(1u << g) << 12) | 0x400ULL,
+           0x0000000200000000ULL | (static_cast<uint64_t>(sram_prod) << 13)},
+          {0ULL, 0ULL}, {0ULL, 0ULL},
+          {b_enc << 52, (ch_hi << 32) | (b_enc << 8)},
+          {0x0000000100000000ULL | (0x80ULL * h_cores), 0ULL},
+          {0ULL, 0ULL},
+          {0ULL, (dst_bits_n << 34) | f6_s},
+      });
+    }
+    ps7.emit(pkt_680_3c0(0ULL));
+  } else {
+    emit_tile_barriers_for_mask(&ps7, h_mask, 0x09000000ULL);
+    emit_tile_barriers_for_mask(&ps7, n_mask, 0x0D000000ULL);
+    emit_tile_barriers_for_mask(&ps7, n_mask, 0x0F000000ULL);
+    const uint32_t ym1 = (h_iters > 1u) ? (h_iters - 1u) : 0u;
+    const Flit f1_h = (h_iters > 1u) ? dma_2d_rewind_f1(32u * ym1) : Flit{0ULL, 0ULL};
+    const uint64_t b_enc = static_cast<uint64_t>(h_per_core - 1u) * 2ULL;
+    for (uint32_t g = 0u; g < h_cores; ++g) {
+      bool use_ch2 = ((g % 2u) == 1u);
+      uint32_t dst_off = g * h_per_core;
+      uint64_t ch_hi = 0ULL, f6_r = 0ULL, f6_s = 0ULL, bar_hi = 0ULL, bar_lo = 0ULL;
+      uint32_t op_recv = 0x440u;
+      if (use_ch2) {
+        ch_hi = ((4ULL * ch2_tok + 1ULL) << 12) | 0x480ULL;
+        ch2_tok += 1u;
+        sync.c3_ch2 += 2u;
+        op_recv = 0x480u;
+        f6_r = 0x20000000ULL;
+        f6_s = 0x200000000ULL;
+        bar_hi = 0x0001002000000040ULL;
+        bar_lo = 0x20000000ULL;
+      } else {
+        ch_hi = ((4ULL * ch1_tok + 1ULL) << 12) | 0x440ULL;
+        ch1_tok += 1u;
+        sync.c3_440_ch1 += 1u;
+        op_recv = 0x440u;
+        f6_r = 0x10000000ULL;
+        f6_s = 0x100000000ULL;
+        bar_hi = 0x0001001000000040ULL;
+        bar_lo = 0x10000000ULL;
+      }
+      if (h_iters == 1u) {
+        ps7.emit({
+            {(static_cast<uint64_t>(n_mask) << 12) | op_recv,
+             0x0000000200000000ULL | (static_cast<uint64_t>(dst_off) << 13)},
+            {0ULL, 0ULL}, {0ULL, 0ULL},
+            {0x03E0000000000000ULL, 0xC0003E00ULL},
+            {0ULL, 0ULL}, {0ULL, 0ULL},
+            {0ULL, f6_r}, {0x0000800000000000ULL, 0ULL},
+        });
+      } else {
+        ps7.emit({
+            {(static_cast<uint64_t>(n_mask) << 12) | op_recv,
+             (static_cast<uint64_t>(ym1) << 54) | (0x40ULL << 32) | (static_cast<uint64_t>(dst_off) << 13)},
+            f1_h, {0x20ULL, 0ULL},
+            {0x03E2000000000000ULL, 0xC0003E00ULL},
+            {0ULL, 0ULL}, {0ULL, 0ULL},
+            {0ULL, f6_r}, {0x0000800000000000ULL, 0ULL},
+        });
+      }
+      ps7.emit({
+          {(static_cast<uint64_t>(1u << g) << 12) | 0x400ULL,
+           0x0000000200000000ULL | (static_cast<uint64_t>(sram_prod) << 13)},
+          {0ULL, 0ULL}, {0ULL, 0ULL},
+          {b_enc << 52, (ch_hi << 32) | (b_enc << 8)},
+          {0x0000000100000080ULL, 0ULL}, {0ULL, 0ULL},
+          {0ULL, (dst_bits_n << 34) | f6_s},
+      });
+      uint32_t bar_mask = 1u << std::min<uint32_t>(g, n_cores - 1u);
+      ps7.emit(pkt_680(bar_mask, bar_hi, bar_lo));
+    }
+    ps7.emit(pkt_680_3c0(0x8000ULL));
+    ps7.emit(pkt_900_bar_all());
+    ps7.emit(pkt_680_3f9());
+    ps7.emit(pkt_900_zero());
+    ps7.emit(pkt_680_3f9());
+    ps7.emit(pkt_680_3c0(0ULL));
+  }
+
+  // Down GEMM (H -> N, writes sram_out = sw_out * 128)
+  emit_m1_gemm_param_440_500(&ps7, H, n_cores, n_iters, fast_hn, h_cores);
+  CsrBank down_csrs = build_m1_gemm_csr_bank(H, N, n_iters, sw_out, fast_hn, h_cores, m_down, h3_csrs);
+  ps7.emit(pack_csr_packet_ef(0x040u, n_mask, diff_csr_bank_with_scales(cur_csrs, down_csrs, true), 0x000u));
+  (*out_chunks)[7] = flits_to_bytes(ps7.flits);
+
+  // ---------------- chunk[8]: down param DMA (0xa40, tag 0x62) ----------------
+  const uint32_t c8_pid = c6_pid + 1u + ps7.n_pkts;
+  (*out_chunks)[8] = build_chunk_a40_stage(c8_pid, p_down, 0x62u);
+
+  // ---------------- chunk[9]: down param ring + output MSB-flip ----------------
+  PacketStream ps9(c8_pid + 1u);
+  const uint64_t off_down = static_cast<uint64_t>(p_gate) + static_cast<uint64_t>(p_up);
+  ps9.emit(pkt_940_params_ring(off_down, p_down, is_big_1536));
+  const uint32_t grp_down = p_down / n_cores;
+  for (uint32_t g = 0u; g < n_cores; ++g) {
+    ps9.emit(pkt_980_params_ring(off_down, g, grp_down, false, 0u));
+  }
+  ps9.emit(pkt_680_3f9());
+  ps9.emit(pkt_900_zero());
+  ps9.emit(pkt_680_3f9(0x8000ULL));
+  ps9.emit(pkt_900_bar_all());
+  ps9.emit(pkt_680_3f9());
+  ps9.emit(build_op5c0(1u, 32u, true));
+  ps9.emit(build_op4c0(1u, 32u, true));
+  ps9.emit(pkt_680_3e0());
+  Pkt p640_out = build_op640(N, d.s_out, 0);
+  p640_out[0].lo = (static_cast<uint64_t>(n_mask) << 12) | 0x640ULL;
+  ps9.emit(p640_out);
+  for (const Pkt& p6 : build_lt_6c0s(n_mask, n_iters, sram_out)) ps9.emit(p6);
+  ps9.emit(build_lt_hdr_data(n_iters, n_mask, d.s_out, 0, sw_out));
+  if (n_iters == 3u) {
+    ps9.emit(build_lt_vica_csr_iters3(n_mask, sram_out, nullptr));
+  }
+  ps9.emit(pkt_680_3f9());
+  if (n_iters > 1u) ps9.emit(pkt_680_3f9());
+  ps9.emit(pkt_680_3c0(0x8000ULL));
+  ps9.emit(pkt_900_bar_all());
+  (*out_chunks)[9] = flits_to_bytes(ps9.flits);
+
+  // ---------------- chunk[10]: output DMA + gather + halt ----------------
+  PacketStream ps10(c8_pid + 1u + ps9.n_pkts);
+  {
+    const uint64_t dma_enc = static_cast<uint64_t>(N - 1u) * 8ULL;
+    const uint64_t f3_lo = (dma_enc << 48) | (1ULL << 47);
+    const uint64_t f3_hi = (dma_enc << 16) | (dma_enc >> 16);
+    ps10.emit({
+        {0x0000008300000A40ULL, 0x0000002000000000ULL},
+        {0ULL, 0ULL},
+        {0ULL, 0x0000020000000000ULL},
+        {f3_lo, f3_hi},
+    });
+  }
+  {
+    const uint64_t n32 = static_cast<uint64_t>(N / 32u);
+    const uint64_t f4h = (n32 - 1ULL) * 0x20ULL;
+    const uint64_t f6l = (31ULL << 55) | (31ULL << 50) | (1ULL << 45);
+    const uint64_t f7l = (static_cast<uint64_t>(N / 2u) << 16) | 0x4040ULL;
+    ps10.emit({{0x9C0ULL, f4h}, {0ULL, 0ULL}, {f6l, 0ULL}, {f7l, 0ULL}});
+  }
+  const uint64_t f4l_b7 = 0x0000000100000000ULL | (0x80ULL * n_cores);
+  const uint64_t b_enc_out = static_cast<uint64_t>(n_per_core - 1u) * 2ULL;
+  for (uint32_t g = 0u; g < n_cores; ++g) {
+    const uint32_t tok = sync.c3_440_ch1 + g + ((g < sync.c3_dst_cnt) ? sync.c3_44c : 0u);
+    const uint64_t ch_hi = ((4ULL * tok + 1ULL) << 12) | 0x44CULL;
+    ps10.emit({
+        {(static_cast<uint64_t>(1u << g) << 12) | 0x400ULL,
+         0x0000000200000000ULL | (static_cast<uint64_t>(sram_out) << 13)},
+        {0ULL, 0ULL}, {0ULL, 0ULL},
+        {b_enc_out << 52, (ch_hi << 32) | (b_enc_out << 8)},
+        {f4l_b7, 0ULL}, {0ULL, 0ULL},
+        {0ULL, 0x0004000004000000ULL},
+    });
+  }
+  const uint32_t b5_0 = sync.c3_440_ch1 + 1u;
+  for (uint32_t k = 0u; k < n_cores; ++k) {
+    ps10.emit({
+        {0x900ULL, 0ULL}, {0ULL, 0ULL},
+        {static_cast<uint64_t>(b5_0 + 2u * k) << 8, 0ULL},
+        {0ULL, 0ULL},
+        {0x0200000000000000ULL, 0x400ULL},
+    });
+  }
+  const uint32_t c1_tot = b5_0 + 2u * n_cores - 1u;
+  const bool has_ch2 = (sync.c3_ch2 > 0u) || (sync.c3_48c > 0u);
+  const uint64_t ch2_byte = has_ch2 ? 0x06ULL : 0x02ULL;
+  ps10.emit(pkt_680_3f9());
+  ps10.emit({
+      {(ch2_byte << 56) | 0x0000FFFF00000900ULL, 0ULL},
+      {0ULL, 0ULL},
+      {(static_cast<uint64_t>(sync.c3_ch2) << 32) | (static_cast<uint64_t>(c1_tot) << 8), 0ULL},
+      {0ULL, 0ULL},
+      {ch2_byte << 56, 0x180ULL},
+  });
+  ps10.emit(pkt_680(0xFFFFu, 0x000FFFF8000003C0ULL | ch2_byte, 0x8000ULL));
+  ps10.emit(pkt_900_bar_all());
+  ps10.emit(pkt_680_3c0(0x8000ULL));
+  ps10.emit(pkt_900_bar_all());
+  ps10.emit({
+      {0x000FFFFF40000900ULL, 0xFF80000000000000ULL},
+      {0x7FFULL, 0ULL}, {0ULL, 0ULL}, {0ULL, 0ULL}, {0ULL, 0x008003E0ULL},
+  }, false);
+  (*out_chunks)[10] = flits_to_bytes(ps10.flits);
+
+  *out_field14 = 32768u;
+}
+
+// Helper: build M=64 GEMM compute CsrBank for (64, K_in, N_out) on core 0.
+CsrBank build_m64_gemm_csr_bank(uint32_t K_in, uint32_t N_out, float real_mul,
+                                bool is_up_reuse, const CsrBank& h3_ref) {
+  const uint32_t k_inner = (K_in == 576u) ? 18u : 16u;
+  const uint32_t k_passes = K_in / (k_inner * 16u);
+  const uint32_t n8 = N_out / 8u;
+  CsrBank q_base = build_compute_csr_state(64u, K_in, 32u, real_mul, 0, 1.0f, 1.0f, 0,
+                                           kActNone, true, 0u, h3_ref, N_out);
+  CsrBank tgt = h3_ref;
+  tgt[0x00] = 0x3C000u | (k_inner - 1u);
+  tgt[0x01] = ((n8 - 1u) << 17u) | (((k_passes / 2u) - 1u) << 4u) | 8u;
+  {
+    const int64_t st_a0 = static_cast<int64_t>(K_in / 4u) - 4LL * static_cast<int64_t>(k_inner - 1u);
+    const int64_t st_a1 = -(15LL * static_cast<int64_t>(K_in / 4u) - 4LL);
+    const int64_t st_a2 = -(16LL * static_cast<int64_t>(K_in / 4u) - 4LL);
+    std::array<std::pair<int64_t, int64_t>, 7> a_ents = {{
+        {static_cast<int64_t>(k_inner - 1u), st_a0},
+        {15, st_a1},
+        {static_cast<int64_t>(k_passes - 1u), st_a2},
+        {static_cast<int64_t>(n8 - 1u), st_a2},
+        {0, st_a2}, {0, st_a2}, {0, st_a2},
+    }};
+    pack_stream_a(tgt, 8u, a_ents);
+  }
+  {
+    const int64_t st_h0 = static_cast<int64_t>(N_out / 4u);
+    const int64_t st_h1 = -(15LL * st_h0 - 2LL);
+    const int64_t st_h2 = -(16LL * st_h0 - 2LL);
+    std::array<std::pair<int64_t, int64_t>, 8> h_ents = {{
+        {st_h0, 15}, {st_h1, static_cast<int64_t>(n8 - 1u)},
+        {st_h2, 0}, {st_h2, 0}, {st_h2, 0}, {st_h2, 0}, {st_h2, 0}, {st_h2, 0x300000},
+    }};
+    pack_stream_h(tgt, 0u, h_ents);
+  }
+  {
+    const int64_t st_b = -4LL * static_cast<int64_t>(k_inner - 1u);
+    std::array<std::pair<int64_t, int64_t>, 7> b_ents = {{
+        {static_cast<int64_t>(k_inner - 1u), st_b},
+        {15, st_b},
+        {static_cast<int64_t>(k_passes - 1u), st_b},
+        {static_cast<int64_t>(n8 - 1u), st_b},
+        {0, st_b}, {0, st_b}, {0, st_b},
+    }};
+    pack_stream_b(tgt, 0x800u, b_ents);
+  }
+  tgt[0x13] = 0x1Cu;
+  tgt[0x16] = 0x3FC14u;
+  tgt[0x27] = 0x1000000u;
+  tgt[0x28] = 0x380003u;
+  tgt[0x37] = 0x201000u;
+  tgt[0x38] = k_inner;
+  tgt[0x3A] = (k_inner / 2u) << 16u;
+  tgt[0x3B] = (k_inner - 1u) << 12u;
+  tgt[0x3C] = 0xF002u;
+  tgt[0x3D] = ((k_passes - 1u) << 12u) | 0xFE2u;
+  tgt[0x3E] = ((n8 - 1u) << 12u) | 0xFE2u;
+  tgt[0x3F] = 0xFE2u;
+  tgt[0x40] = 0xFE2u;
+  tgt[0x41] = 0xFE2u;
+  tgt[0x42] = 0xFE2u;
+  tgt[0x43] = 0x1u;
+  tgt[0x45] = 0xE000A3u;
+  tgt[0x46] = is_up_reuse ? (0x14u + ((k_passes / 2u) << 11u)) : 0x14u;
+  tgt[0x48] = is_up_reuse ? (q_base[0x48] | 0x400000u) : q_base[0x48];
+  tgt[0x49] = q_base[0x49];
+  tgt[0x4A] = q_base[0x4A];
+  tgt[0x55] = 0x781800u;
+  tgt[0x56] = 0x100080u;
+  tgt[0x58] = 0xAC000u;
+  tgt[0x59] = 0x3FFu;
+  tgt[0x61] = q_base[0x61];
+  apply_scale_clip_csrs(&tgt, real_mul, 127.0f, -128.0f);
+  return tgt;
+}
+
+void emit_m64_gemm_440_500_6c0(PacketStream* ps, uint32_t K_in, uint32_t N_out,
+                               uint32_t src_sram, uint32_t dst_sram, bool is_up_reuse) {
+  const uint32_t k_inner = (K_in == 576u) ? 18u : 16u;
+  const uint32_t k_passes = K_in / (k_inner * 16u);
+  const uint32_t n8 = N_out / 8u;
+  const uint64_t kp_half = static_cast<uint64_t>(k_passes / 2u);
+  const uint64_t f0h = (static_cast<uint64_t>(k_inner - 1u) << 54) | 0x0000000200000000ULL;
+  const uint64_t f1l = (mask_s(-static_cast<int64_t>(k_inner - 1u) * 8LL, 16u) << 48) |
+                       ((kp_half - 1ULL) << 32) | 0xFFFF0000ULL |
+                       mask_s(-static_cast<int64_t>(k_inner - 1u) * 0x400LL, 16u);
+  const uint64_t f1h = (static_cast<uint64_t>(2u * n8 - 1u) << 48) |
+                       (mask_s(-static_cast<int64_t>(k_inner - 1u) * 16LL, 24u) << 24) | 0xFFULL;
+  const uint64_t f2l = (static_cast<uint64_t>(k_inner / 2u) << 12) | 0x220ULL;
+  const uint64_t f2h = ((static_cast<uint64_t>(k_inner) * 0x40ULL + 0x220ULL) << 48) |
+                       (static_cast<uint64_t>(k_inner) * 0x4000ULL + 0x21400ULL);
+  uint64_t f3h = 0xFFFFFD84C000FE00ULL;
+  uint64_t f4l = 0xFFFFFF419000000FULL;
+  uint64_t f4h = 0xFFFFFFD06C000003ULL;
+  uint64_t f5l = 0x3FFFFFF41D000000ULL;
+  if (is_up_reuse) {
+    const uint64_t v = static_cast<uint64_t>(k_passes - 1u);
+    f3h = (v << 48) | 0x0000FD84C000FE00ULL;
+    f4l = 0x00003F4190000008ULL + (v << 46);
+    f4h = 0x80000FD06C000002ULL + (v << 44);
+    f5l = 0x200003F41D000000ULL + (v << 42);
+  }
+  ps->emit({
+      {0x0000000000001440ULL, f0h},
+      {f1l, f1h}, {f2l, f2h},
+      {0x0FE2000FE0000200ULL, f3h},
+      {f4l, f4h},
+      {f5l, 0x0000000003C00000ULL},
+      {0ULL, 0x0000000060400000ULL},
+      {0x0007800000000000ULL, 0ULL},
+  });
+
+  const uint64_t b5_f0h = 0x80000000ULL | (static_cast<uint64_t>((k_inner / 2u) + 4u) << 15);
+  const uint64_t b5_f1l = static_cast<uint64_t>(n8 - 1u) << 23;
+  const uint64_t b5_f3l = 0xFFC80000FFFE4000ULL | (static_cast<uint64_t>(2u * n8 - 1u) << 32);
+  const uint64_t b5_f5h = 0xD402000000000000ULL | (static_cast<uint64_t>(k_passes) << 24) |
+                          (is_up_reuse ? static_cast<uint64_t>(n8 * (k_passes / 2u)) : 0ULL);
+  const uint64_t b5_f6l = is_up_reuse ? 0x000900000080000FULL : 0x0009000000FFFFFFULL;
+  ps->emit({
+      {0x0000000000001500ULL, b5_f0h},
+      {b5_f1l, 0x0288000000000000ULL},
+      {0x0040000000000000ULL, 0x0000120003800010ULL},
+      {b5_f3l, 0x200007FFF900003FULL},
+      {0x0000420C0000FFFFULL, 0ULL},
+      {0x9394000000000000ULL, b5_f5h},
+      {b5_f6l, 0ULL},
+      {0ULL, 0ULL},
+      {0x0F09000000000000ULL, 0ULL},
+  });
+
+  for (uint32_t j = 0u; j < 4u; ++j) {
+    ps->emit({{
+        0x00016C0ULL,
+        ((1ULL << j) << 56) | (static_cast<uint64_t>(src_sram + 16u * K_in * j) << 16) | 0x8000ULL,
+    }});
+    ps->emit({{
+        0x00016C0ULL,
+        ((1ULL << j) << 56) | (static_cast<uint64_t>(dst_sram + 16u * N_out * j) << 16) | 0x8400ULL,
+    }});
+  }
+}
+
+Pkt build_op5c0_m64_lut(uint32_t lut_sram) {
+  Pkt pkt = build_op5c0(64u, 32u, true);
+  pkt[3].lo = 0x0200000000000000ULL | (static_cast<uint64_t>((lut_sram / 512u) & 0xFFu) << 44);
+  return pkt;
+}
+
+Pkt build_op4c0_m64_lut(uint32_t lut_sram) {
+  Pkt pkt = build_op4c0(64u, 32u, true);
+  pkt[0].hi = 0x0000000200000000ULL | (static_cast<uint64_t>((lut_sram / 2048u) & 0x3Fu) << 24);
+  return pkt;
+}
+
+Pkt build_m64_silu_op20(uint32_t H, float s_gate) {
+  Pkt hdr = build_hdr_m64(0x0001u, H, H, s_gate, 0);
+  std::vector<uint8_t> raw = flits_to_bytes(hdr);
+  const uint32_t b17 = 17u * 128u;
+  constexpr float kInf = __builtin_huge_valf();
+  set_bits_le(raw.data(), raw.size(), b17 + 80u, 8u, 128u);
+  set_bits_le(raw.data(), raw.size(), b17 + 189u, 32u, fp32_bits_f(s_gate));
+  set_bits_le(raw.data(), raw.size(), b17 + 222u, 32u, fp32_bits_f(kInf));
+  set_bits_le(raw.data(), raw.size(), b17 + 259u, 32u, fp32_bits_f(-11.6f));
+  set_bits_le(raw.data(), raw.size(), b17 + 328u, 8u, 128u);
+  return bytes_to_flits(raw);
+}
+
+void synthesize_swiglu_64x_chunks(uint32_t K, uint32_t H, uint32_t N,
+                                  const ob_swiglu_int8_desc_t& d,
+                                  uint32_t p_gate, uint32_t p_up, uint32_t p_down,
+                                  std::array<std::vector<uint8_t>, 11>* out_chunks,
+                                  uint32_t* out_field14) {
+  const uint32_t k_cores = (K == 576u) ? 9u : 16u;
+  const uint32_t k_iters = (K == 576u) ? 2u : (K / 512u);
+  const uint32_t k_mask = (1u << k_cores) - 1u;
+  const uint32_t k_per_core = K / k_cores;
+  const uint32_t n8_out = N / 8u;
+
+  // Core 0 SRAM layout:
+  //   K=576 : buf_gate=0x0000, buf_in=0x8000, buf_up=0x11000, buf_out=0x8000, buf_scatter=0x0000
+  //   K=1536: buf_in=0x0000, buf_gate=0x18000, buf_up=0x20000, buf_out=0x0000, buf_scatter=0x18000
+  const uint32_t buf_in = (K == 576u) ? (64u * H) : 0u;
+  const uint32_t buf_gate = (K == 576u) ? 0u : (64u * K);
+  const uint32_t buf_up = 64u * K + 64u * H;
+  const uint32_t buf_out = buf_in;
+  const uint32_t buf_scatter = buf_gate;
+
+  const float m_gate = (d.s_in * d.s_wg) / d.s_gate;
+  const float m_up = (d.s_in * d.s_wu) / d.s_up;
+  const float m_mul = (d.s_silu * d.s_up) / d.s_prod;
+  const float m_down = (d.s_prod * d.s_wd) / d.s_out;
+
+  (*out_chunks)[0] = build_chunk0();
+  (*out_chunks)[1] = build_chunk1_m64(64u, K);
+  (*out_chunks)[2] = build_chunk2(64u, K);
+
+  // ---------------- chunk[3]: load + MSB flip + gather + gate GEMM + 0x940(gate) ----------------
+  PacketStream ps3(10u);
+  ps3.emit(pkt_680_3c0(0x8000ULL));
+  ps3.emit(pkt_900_bar_all());
+  const uint32_t ym1 = k_iters - 1u;
+  const Flit f1_row = dma_2d_rewind_f1_ym1(ym1);
+  const uint64_t f1h_980 = ((0x7FC8ULL - 0x40ULL * ym1) << 48) |
+                           ((0x10ULL * ym1) << 32) | 0x20021000ULL;
+  for (uint32_t r = 0u; r < 64u; ++r) {
+    const uint64_t sram_off = static_cast<uint64_t>(buf_gate) + static_cast<uint64_t>(r) * k_per_core;
+    ps3.emit({
+        {(static_cast<uint64_t>(k_mask) << 12) | 0x440ULL,
+         (static_cast<uint64_t>(ym1) << 54) | (0x40ULL << 32) | (sram_off << 13)},
+        f1_row, {0x20ULL, 0ULL},
+        {0x03E2000000000000ULL, 0x0000000000003E00ULL},
+        {0ULL, 0ULL}, {0ULL, 0ULL},
+        {0ULL, 0x00400000ULL}, {0x0000800000000000ULL, 0ULL},
+    });
+    for (uint32_t g = 0u; g < k_cores; ++g) {
+      const uint32_t tb = kSnake16[g];
+      const uint64_t byte_off = static_cast<uint64_t>(r) * K + static_cast<uint64_t>(g) * k_per_core;
+      const uint64_t off_w = (1ULL + byte_off / 8ULL) & 0xFFFULL;
+      const uint64_t f0l = (0x0002ULL << 48) | (off_w << 32) | 0x980ULL;
+      const uint64_t f2h = ((0x02ULL + byte_off / 16ULL) << 40) | 0x021FF8C00ULL;
+      const uint64_t f3h = 0x0001000000800000ULL | ((tb < 8u) ? (1ULL << (56u + tb)) : 0ULL);
+      const uint64_t f4l = (tb >= 8u) ? (1ULL << (tb - 8u)) : 0ULL;
+      ps3.emit({
+          {f0l, 0x7F008000FE0103FEULL},
+          {0x1FC020003F804000ULL, f1h_980},
+          {0ULL, f2h},
+          {0x08000004ULL, f3h},
+          {f4l, 0ULL},
+      });
+    }
+  }
+  ps3.emit(pkt_680_3f9());
+  ps3.emit(pkt_680_3f9());
+
+  ps3.emit(build_op5c0_m64_lut(buf_gate + 64u * k_per_core));
+  ps3.emit(build_op4c0_m64_lut(buf_gate + 64u * k_per_core));
+  ps3.emit(pkt_680_3e0());
+  Pkt p640_in = build_op640(k_per_core, d.s_in, 0);
+  p640_in[0].lo = (static_cast<uint64_t>(k_mask) << 12) | 0x640ULL;
+  ps3.emit(p640_in);
+  for (uint32_t j = 0u; j < 4u; ++j) {
+    ps3.emit({{
+        (static_cast<uint64_t>(k_mask) << 12) | 0x6C0ULL,
+        ((1ULL << j) << 56) | (static_cast<uint64_t>(buf_gate + 16u * k_per_core * j) << 16) | 0x8000ULL,
+    }});
+    ps3.emit({{
+        0x00016C0ULL,
+        ((1ULL << j) << 56) | (static_cast<uint64_t>(buf_in + 16u * K * j) << 16) | 0x8400ULL,
+    }});
+  }
+  for (uint32_t g = 1u; g < k_cores; ++g) {
+    for (uint32_t j = 0u; j < 4u; ++j) {
+      ps3.emit({{
+          (static_cast<uint64_t>(1u << g) << 12) | 0x6C0ULL,
+          ((1ULL << j) << 56) |
+              (static_cast<uint64_t>(buf_in + 16u * K * j + g * k_per_core) << 16) | 0x8400ULL,
+      }});
+    }
+  }
+  Pkt hdr3 = build_hdr_m64(k_mask, k_per_core, K, d.s_in, 0);
+  ps3.emit(hdr3);
+  CsrBank h3_csrs = unpack_hdr_csrs(hdr3);
+  ps3.emit(pkt_900_zero());
+
+  // Gather cores 1..k_cores-1 -> core 0 at buf_in
+  ps3.emit(pkt_680_3c0(0ULL));
+  const uint64_t val16 = mask_s(-(63LL * static_cast<int64_t>(K / 32u) + static_cast<int64_t>(k_iters - 1u)), 16u);
+  const uint64_t S = static_cast<uint64_t>((K - k_per_core + 32u) / 32u);
+  const uint64_t f1_tr_lo = ((val16 & 0xFFULL) << 56) | (63ULL << 31) | (S << 15);
+  const uint64_t f1_tr_hi = (mask_s(-static_cast<int64_t>(K / 64u), 9u) << 40) |
+                            ((2ULL * S) << 32) | ((val16 >> 8) & 0xFFULL);
+  const uint64_t f0h_tr_hi = (static_cast<uint64_t>(ym1) << 54) | (0x40ULL << 32);
+  uint32_t ch1_tok = 0u, ch2_tok = 0u;
+  for (uint32_t idx_g = 0u; idx_g + 1u < k_cores; ++idx_g) {
+    const uint32_t g = idx_g + 1u;
+    const uint64_t addr = static_cast<uint64_t>(buf_in + g * k_per_core);
+    const uint64_t f0h_tr = f0h_tr_hi | (addr << 13);
+    const bool use_ch2 = ((idx_g % 2u) == 0u);
+    uint64_t op_r = 0ULL, f6_r = 0ULL, f3_ch = 0ULL, f6_s = 0ULL, bar_hi = 0ULL, bar_lo = 0ULL;
+    if (use_ch2) {
+      uint64_t tok = 4ULL * ch2_tok + 2ULL;
+      ch2_tok += 1u;
+      op_r = 0x480ULL; f6_r = 0x20000000ULL;
+      f3_ch = (tok << 44) | 0x0000048000003E00ULL;
+      f6_s = 0x0000000600000000ULL;
+      bar_hi = 0x0001002000000040ULL; bar_lo = 0x20000000ULL;
+    } else {
+      uint64_t tok = 4ULL * ch1_tok + 2ULL;
+      ch1_tok += 1u;
+      op_r = 0x440ULL; f6_r = 0x00400000ULL;
+      f3_ch = (tok << 44) | 0x0000044000003E00ULL;
+      f6_s = 0x0000000404000000ULL;
+      bar_hi = 0x0001001000000040ULL; bar_lo = 0x10000000ULL;
+    }
+    ps3.emit({
+        {0x0001000ULL | op_r, f0h_tr},
+        {f1_tr_lo, f1_tr_hi}, {0x60ULL, 0ULL},
+        {0x03E2000000000000ULL, 0x3E00ULL}, {0ULL, 0ULL}, {0ULL, 0ULL},
+        {0ULL, f6_r}, {0x0000800000000000ULL, 0ULL},
+    });
+    ps3.emit({
+        {(static_cast<uint64_t>(1u << g) << 12) | 0x400ULL, f0h_tr},
+        {f1_tr_lo, f1_tr_hi}, {0x60ULL, 0ULL},
+        {0x03E0000000000000ULL, f3_ch},
+        {0x0000000100000080ULL, 0ULL}, {0ULL, 0ULL},
+        {0ULL, f6_s},
+    });
+    ps3.emit({{0x0001680ULL, bar_hi}, {bar_lo, 0ULL}});
+  }
+  ps3.emit(pkt_680(0xFFFFu, 0x000F1E30000003C0ULL, 0x8000ULL));
+  ps3.emit({
+      {0x0000FFFF00000900ULL, 0xFF80000040000000ULL},
+      {0x7FULL, 0ULL}, {0ULL, 0ULL}, {0ULL, 0ULL}, {0ULL, 0ULL},
+  });
+  ps3.emit(pkt_680_3f9());
+  ps3.emit(pkt_680_3c0(0x8000ULL));
+  ps3.emit(pkt_900_bar_all());
+
+  // Gate GEMM (K -> H, buf_in -> buf_gate)
+  emit_m64_gemm_440_500_6c0(&ps3, K, H, buf_in, buf_gate, false);
+  CsrBank gate_csrs = build_m64_gemm_csr_bank(K, H, m_gate, false, h3_csrs);
+  {
+    std::vector<std::pair<uint32_t, uint32_t>> diff = diff_csr_bank_with_scales(h3_csrs, gate_csrs, true);
+    ps3.emit(pack_csr_packet_ef(0x040u, 0x0001u, diff, 0x050u));
+  }
+  ps3.emit(pkt_940_params_ring(0ULL, p_gate, false));
+  (*out_chunks)[3] = flits_to_bytes(ps3.flits);
+
+  // ---------------- chunk[4]: gate param DMA (0xa40, tag 0x22) ----------------
+  const uint32_t c4_pid = 10u + ps3.n_pkts;
+  (*out_chunks)[4] = build_chunk_a40_stage(c4_pid, p_gate, 0x22u);
+
+  // ---------------- chunk[5]: gate 0x980 + up GEMM (OP20_0x040) + 0x940(up) ----------------
+  const uint32_t ch1_base = 4u * ch1_tok + 1u;
+  PacketStream ps5(c4_pid + 1u);
+  ps5.emit(pkt_980_params_ring(0ULL, 0u, p_gate, true, ch1_base));
+  ps5.emit(pkt_680_3c0(0x8000ULL));
+  ps5.emit(pkt_900_bar_all());
+  emit_m64_gemm_440_500_6c0(&ps5, K, H, buf_in, buf_up, true);
+  CsrBank up_csrs = build_m64_gemm_csr_bank(K, H, m_up, true, h3_csrs);
+  ps5.emit(build_op20_from_csrs(
+      0x040u, 0x0001u, up_csrs,
+      0x0401E06000000000ULL, 0xC158000000800080ULL,
+      0x00000000000000FFULL, 0x10BF800007800000ULL,
+      0x0000000618000000ULL, 0x0000000001008000ULL,
+      m_up, -128.0f, 127.0f, 128, 128, 128, 0x050u));
+  ps5.emit(pkt_940_params_ring(static_cast<uint64_t>(p_gate), p_up, false));
+  (*out_chunks)[5] = flits_to_bytes(ps5.flits);
+
+  // ---------------- chunk[6]: up param DMA (0xa40, tag 0x42) ----------------
+  const uint32_t c6_pid = c4_pid + 1u + ps5.n_pkts;
+  (*out_chunks)[6] = build_chunk_a40_stage(c6_pid, p_up, 0x42u);
+
+  // ---------------- chunk[7]: up 0x980 + SiLU + MUL + down GEMM + 0x940(down) ----------------
+  PacketStream ps7(c6_pid + 1u);
+  ps7.emit(pkt_980_params_ring(static_cast<uint64_t>(p_gate), 0u, p_up, true, ch1_base));
+  ps7.emit(pkt_680_3f9());
+
+  // SiLU on buf_gate (64 x 512)
+  const uint32_t silu_lut = (buf_gate == 0u) ? (64u * H) : 0u;
+  ps7.emit(build_op5c0_m64_lut(silu_lut));
+  ps7.emit(build_op4c0_m64_lut(silu_lut));
+  ps7.emit(pkt_680_3e0());
+  ps7.emit(build_op640_silu(0x0001u, d.s_silu));
+  for (uint32_t j = 0u; j < 4u; ++j) {
+    const uint64_t bank_bit = (1ULL << j) << 56;
+    const uint64_t addr = static_cast<uint64_t>(buf_gate + 16u * H * j) << 16;
+    ps7.emit({{0x00016C0ULL, bank_bit | addr | 0x8000ULL}});
+    ps7.emit({{0x00016C0ULL, bank_bit | addr | 0x8400ULL}});
+  }
+  Pkt silu_op20 = build_m64_silu_op20(H, d.s_gate);
+  ps7.emit(silu_op20);
+  CsrBank cur_csrs = unpack_hdr_csrs(silu_op20);
+  ps7.emit(pkt_680_3f9());
+  ps7.emit(pkt_680_3f9());
+
+  // Elementwise MUL on core 0 (64 x 512: src0=buf_gate, src1=buf_up -> dst=buf_gate)
+  for (uint32_t j = 0u; j < 4u; ++j) {
+    const uint64_t bank_bit = (1ULL << j) << 56;
+    const uint64_t a_g = static_cast<uint64_t>(buf_gate + 0x80u * j) << 16;
+    const uint64_t a_u = static_cast<uint64_t>(buf_up + 0x80u * j) << 16;
+    ps7.emit({{0x00016C0ULL, bank_bit | a_g | 0x8000ULL}});
+    ps7.emit({{0x00016C0ULL, bank_bit | a_g | 0x8400ULL}});
+    ps7.emit({{0x00016C0ULL, bank_bit | a_u | 0x8200ULL}});
+  }
+  {
+    CsrBank mul_csrs = cur_csrs;
+    static constexpr std::pair<uint32_t, uint32_t> kM64MulRegs[] = {
+        {0x00u, 0x1C000u}, {0x02u, 0xFC0u},    {0x06u, 0x700008u}, {0x07u, 0x1C80000u},
+        {0x08u, 0x7FFu},   {0x09u, 0x6400u},   {0x0Au, 0x0u},      {0x0Bu, 0x3FFF2u},
+        {0x0Cu, 0x320000u},{0x0Du, 0x0u},      {0x0Eu, 0x1FFF900u},{0x10u, 0x3F000Cu},
+        {0x11u, 0xC8000u}, {0x12u, 0x7Eu},     {0x13u, 0x154u},    {0x18u, 0x7E00u},
+        {0x19u, 0x1F82000u},{0x1Au, 0x0u},     {0x1Bu, 0xFC10u},   {0x1Cu, 0x100000u},
+        {0x1Du, 0x7Eu},    {0x1Eu, 0x7E0800u}, {0x1Fu, 0x0u},      {0x20u, 0x3F04u},
+        {0x21u, 0x1040000u},{0x23u, 0x1F8200u},{0x24u, 0x10000u},  {0x27u, 0x1000000u},
+        {0x28u, 0x1F8003Fu},{0x29u, 0x1u},     {0x2Au, 0x2000u},   {0x2Bu, 0xE0u},
+        {0x2Cu, 0x1E00190u},{0x2Du, 0x1900003u},{0x2Eu, 0xFC0u},   {0x2Fu, 0x1C0C800u},
+        {0x30u, 0x7u},     {0x31u, 0x7E064u},  {0x32u, 0x640000u}, {0x33u, 0x3F0u},
+        {0x34u, 0x1F03200u},{0x35u, 0x1u},     {0x36u, 0x1F819u},  {0x37u, 0x3000u},
+        {0x3Bu, 0x1FF000u},{0x3Cu, 0x0u},      {0x43u, 0x20000u},  {0x45u, 0x0u},
+        {0x46u, 0x0u},     {0x47u, 0x0u},      {0x48u, 0x0u},      {0x56u, 0x100E00u},
+    };
+    for (const auto& kv : kM64MulRegs) mul_csrs[kv.first] = kv.second;
+    apply_scale_clip_csrs(&mul_csrs, m_mul, 127.0f, -128.0f);
+    ps7.emit(pack_csr_packet_ef(0x100u, 0x0001u, diff_csr_bank_with_scales(cur_csrs, mul_csrs, true), 0x070u));
+    cur_csrs = mul_csrs;
+  }
+  ps7.emit(pkt_680_3f9());
+  ps7.emit(pkt_680_3f9());
+  ps7.emit(pkt_680_3c0(0x8000ULL));
+  ps7.emit(pkt_900_bar_all());
+
+  // Down GEMM (H=512 -> N, buf_gate -> buf_out)
+  emit_m64_gemm_440_500_6c0(&ps7, H, N, buf_gate, buf_out, false);
+  CsrBank down_csrs = build_m64_gemm_csr_bank(H, N, m_down, false, h3_csrs);
+  down_csrs[0x02] = 0u;
+  down_csrs[0x29] = 0u;
+  ps7.emit(pack_csr_packet_ef(0x040u, 0x0001u, diff_csr_bank_with_scales(cur_csrs, down_csrs, true), 0x050u));
+  const uint64_t off_down = static_cast<uint64_t>(p_gate) + static_cast<uint64_t>(p_up);
+  ps7.emit(pkt_940_params_ring(off_down, p_down, false));
+  (*out_chunks)[7] = flits_to_bytes(ps7.flits);
+
+  // ---------------- chunk[8]: down param DMA (0xa40, tag 0x62) ----------------
+  const uint32_t c8_pid = c6_pid + 1u + ps7.n_pkts;
+  (*out_chunks)[8] = build_chunk_a40_stage(c8_pid, p_down, 0x62u);
+
+  // ---------------- chunk[9]: down 0x980 + output VICA + 0x3c0 + scatter ----------------
+  PacketStream ps9(c8_pid + 1u);
+  ps9.emit(pkt_980_params_ring(off_down, 0u, p_down, true, ch1_base));
+  ps9.emit(pkt_680_3f9());
+  const uint32_t out_lut = (buf_out == 0u) ? (64u * N) : 0u;
+  ps9.emit(build_op5c0_m64_lut(out_lut));
+  ps9.emit(build_op4c0_m64_lut(out_lut));
+  ps9.emit(pkt_680_3e0());
+  Pkt p640_out = build_op640(N, d.s_out, 0);
+  p640_out[0].lo = 0x0001640ULL;
+  ps9.emit(p640_out);
+  for (uint32_t j = 0u; j < 4u; ++j) {
+    const uint64_t bank_bit = (1ULL << j) << 56;
+    const uint64_t addr = static_cast<uint64_t>(buf_out + 16u * N * j) << 16;
+    ps9.emit({{0x00016C0ULL, bank_bit | addr | 0x8000ULL}});
+    ps9.emit({{0x00016C0ULL, bank_bit | addr | 0x8400ULL}});
+  }
+  ps9.emit(build_hdr_m64(0x0001u, N, N, d.s_out, 0));
+  ps9.emit(pkt_680_3f9());
+  ps9.emit(pkt_680_3f9());
+  ps9.emit(pkt_680_3c0(0x8000ULL));
+  ps9.emit(pkt_900_bar_all());
+
+  // Output transpose/repack OP_3C0 on core 0 (buf_out -> buf_scatter)
+  {
+    const uint64_t v3c0 = static_cast<uint64_t>(32u * N - 8u);
+    const uint64_t dst_enc = static_cast<uint64_t>(buf_scatter) * 0x40ULL;
+    ps9.emit({
+        {0x00000000000013C0ULL, (static_cast<uint64_t>(N / 32u) << 40) | (static_cast<uint64_t>(buf_out) << 13)},
+        {0ULL, 0ULL},
+        {0x20ULL, ((dst_enc & 0xFFFFULL) << 48) |
+                      (static_cast<uint64_t>(N * 16u - 4u) << 32) |
+                      (static_cast<uint64_t>(N * 16u - 4u) << 12)},
+        {(static_cast<uint64_t>(N / 16u) << 16) | (dst_enc >> 16), 0ULL},
+        {0x0000400000000000ULL, (v3c0 & 0xFFFULL) << 52},
+        {(v3c0 << 8) | (v3c0 >> 12), 0ULL},
+        {0ULL, 0ULL}, {0ULL, 0ULL}, {0ULL, 0ULL}, {0ULL, 0ULL},
+        {0ULL, 0ULL}, {0ULL, 0ULL}, {0ULL, 0ULL}, {0ULL, 0ULL},
+    });
+  }
+
+  // Scatter 4xN slices from core 0 (at buf_out) -> cores 1..15 (at buf_scatter)
+  const Flit f1_out = dma_2d_rewind_f1_ym1(n8_out - 1u);
+  ps9.emit({
+      {0x000000000FFFE440ULL,
+       (static_cast<uint64_t>(n8_out - 1u) << 54) | (0x40ULL << 32) |
+           (static_cast<uint64_t>(buf_scatter) << 13)},
+      f1_out, {0x20ULL, 0ULL},
+      {0x03E2000000000000ULL, 0x3E00ULL},
+      {0ULL, 0ULL}, {0ULL, 0ULL},
+      {0ULL, 0x00400000ULL}, {0x0000800000000000ULL, 0ULL},
+  });
+  for (uint32_t g = 1u; g < 16u; ++g) {
+    const uint32_t tb = kSnake16[g];
+    const uint64_t f6_dst = (1ULL << (34u + tb)) | 0x04000000ULL;
+    const uint64_t src_addr = static_cast<uint64_t>(buf_out) + static_cast<uint64_t>(g) * (4u * N);
+    ps9.emit({
+        {0x0000000000001400ULL,
+         (static_cast<uint64_t>(n8_out - 1u) << 54) | (0x40ULL << 32) | (src_addr << 13)},
+        f1_out, {0x20ULL, 0ULL},
+        {0x03E0000000000000ULL, (static_cast<uint64_t>(ch1_base) << 44) | 0x0000044000003E00ULL},
+        {0x0000000100000080ULL, 0ULL}, {0ULL, 0ULL},
+        {0ULL, f6_dst},
+    });
+  }
+  ps9.emit({{0x000000000FFFE680ULL, 0x0001001000000040ULL}, {0x10000000ULL, 0ULL}});
+  ps9.emit(pkt_680_3c0(0ULL));
+  (*out_chunks)[9] = flits_to_bytes(ps9.flits);
+
+  // ---------------- chunk[10]: output DMA + gather from buf_scatter + halt ----------------
+  PacketStream ps10(c8_pid + 1u + ps9.n_pkts);
+  const uint32_t out_bytes = 64u * N;
+  {
+    const uint64_t dma_enc = static_cast<uint64_t>(out_bytes - 1u) * 8ULL;
+    const uint64_t f3_lo = (dma_enc << 48) | (1ULL << 47);
+    const uint64_t f3_hi = (dma_enc >> 16) | (dma_enc << 16);
+    ps10.emit({
+        {0x0000008300000A40ULL, 0x0000002000000000ULL},
+        {0ULL, 0ULL},
+        {0ULL, 0x0000020000000000ULL},
+        {f3_lo, f3_hi},
+    });
+  }
+  ps10.emit({
+      {0x9C0ULL, static_cast<uint64_t>(out_bytes - 32u)},
+      {0ULL, 0ULL},
+      {0x0FFC200000000000ULL, 0ULL},
+      {(static_cast<uint64_t>(N * 32u) << 16) | 0x4040ULL, 0ULL},
+  });
+  const uint64_t b_enc = static_cast<uint64_t>(4u * N - 1u) * 2ULL;
+  const uint32_t c10_tok_base = ch1_base + 0x3Cu;
+  for (uint32_t g = 0u; g < 16u; ++g) {
+    const uint64_t tok_g = static_cast<uint64_t>(c10_tok_base + 4u * g);
+    ps10.emit({
+        {(static_cast<uint64_t>(1u << g) << 12) | 0x400ULL,
+         0x0000000200000000ULL | (static_cast<uint64_t>(buf_scatter) << 13)},
+        {0ULL, 0ULL}, {0ULL, 0ULL},
+        {(b_enc & 0xFFFULL) << 52, (tok_g << 44) | 0x0000044C00000000ULL | (b_enc << 8) | (b_enc >> 12)},
+        {0x0000000100000080ULL, 0ULL}, {0ULL, 0ULL},
+        {0ULL, 0x0004000004000000ULL},
+    });
+  }
+  const uint32_t c10_900_base = ch1_tok + 16u;
+  for (uint32_t g = 0u; g < 16u; ++g) {
+    ps10.emit({
+        {0x900ULL, 0ULL}, {0ULL, 0ULL},
+        {static_cast<uint64_t>(c10_900_base + 2u * g) << 8, 0ULL},
+        {0ULL, 0ULL},
+        {0x0200000000000000ULL, 0x400ULL},
+    });
+  }
+  ps10.emit(pkt_680_3f9());
+  ps10.emit({
+      {0x0600FFFF00000900ULL, 0ULL}, {0ULL, 0ULL},
+      {(static_cast<uint64_t>(ch2_tok * 2u) << 32) | (static_cast<uint64_t>(c10_900_base + 31u) << 8), 0ULL},
+      {0ULL, 0ULL},
+      {0x0600000000000000ULL, 0x180ULL},
+  });
+  ps10.emit(pkt_680(0xFFFFu, 0x000FFFF8000003C6ULL, 0x8000ULL));
+  ps10.emit(pkt_900_bar_all());
+  ps10.emit(pkt_680_3c0(0x8000ULL));
+  ps10.emit(pkt_900_bar_all());
+  ps10.emit({
+      {0x000FFFFF40000900ULL, 0xFF80000000000000ULL},
+      {0x7FFULL, 0ULL}, {0ULL, 0ULL}, {0ULL, 0ULL}, {0ULL, 0x008003E0ULL},
+  }, false);
+  (*out_chunks)[10] = flits_to_bytes(ps10.flits);
+
+  *out_field14 = 1024u * (std::max(K, N) + 2u * H) + 320u;
+}
+
+std::vector<uint8_t> build_dive_ext0_11chunk(const std::array<std::vector<uint8_t>, 11>& chunks,
+                                             uint32_t M, uint32_t K, uint32_t N,
+                                             uint32_t p_gate, uint32_t p_up) {
+  FbBuilder fb;
+  struct ValSpec {
+    std::vector<int64_t> dims;
+    uint8_t dt;
+    const char* name;
+  };
+  const ValSpec val_specs[16] = {
+      {{-2}, 2u, "parameter_0"},
+      {{-2}, 2u, "scratchpad"},
+      {{static_cast<int64_t>(M), static_cast<int64_t>(K)}, 1u, "input_0"},
+      {{}, 11u, "main"},
+      {{}, 11u, "main.1"},
+      {{}, 11u, "dive_vm_tensor_address_of.1"},
+      {{static_cast<int64_t>(M), static_cast<int64_t>(N)}, 1u, "output_0"},
+      {{}, 11u, "dive_vm_tensor_address_of.3"},
+      {{}, 11u, "variable_4097"},
+      {{}, 11u, "variable_4099"},
+      {{}, 11u, "variable_1"},
+      {{}, 11u, "variable_5"},
+      {{}, 11u, "variable_5.1"},
+      {{}, 11u, "variable_5.2"},
+      {{}, 11u, "variable_5.3"},
+      {{}, 11u, "variable_5.4"},
+  };
+  uint32_t val_offs[16]{};
+  for (size_t i = 0u; i < 16u; ++i) {
+    uint32_t d_off = fb.create_vector_i64(val_specs[i].dims.data(), val_specs[i].dims.size());
+    uint32_t n_off = fb.create_string(val_specs[i].name);
+    fb.start_table();
+    fb.add_i32(3u, -1, 0);
+    fb.add_uoffset(2u, n_off);
+    fb.add_uoffset(0u, d_off);
+    fb.add_u8(1u, val_specs[i].dt, 0u);
+    val_offs[i] = fb.end_table();
+  }
+  uint32_t fn_vals = fb.create_vector_uoffsets(val_offs, 16u);
+  const int32_t in_id = 2;
+  const int32_t out_id = 6;
+  uint32_t fn_ins = fb.create_vector_i32(&in_id, 1u);
+  uint32_t fn_outs = fb.create_vector_i32(&out_id, 1u);
+
+  enum DetKind { kDetNone, kDetDisp, kDetPut, kDetAdd };
+  struct OpSpec {
+    uint8_t ot;
+    DetKind det;
+    uint32_t a;
+    uint32_t b;
+    uint32_t c;
+    int32_t in0;
+    int32_t out0;
+    const char* name;
+  };
+  const OpSpec op_specs[32] = {
+      {59u, kDetNone, 0u, 0u, 0u, 0, 3, "main"},
+      {59u, kDetNone, 0u, 0u, 0u, 1, 4, "main"},
+      {61u, kDetNone, 0u, 0u, 0u, 2, -1, "dive_vm_tensor_cache_clean_invalidate"},
+      {59u, kDetNone, 0u, 0u, 0u, 2, 5, "dive_vm_tensor_address_of"},
+      {59u, kDetNone, 0u, 0u, 0u, 6, 7, "dive_vm_tensor_address_of.2"},
+      {61u, kDetNone, 0u, 0u, 0u, 6, -1, "dive_vm_tensor_cache_clean_invalidate.1"},
+      {47u, kDetDisp, 0u, 0u, 0u, -1, -1, "program_prolog_hw_instructions_0"},
+      {25u, kDetNone, 0u, 0u, 0u, 5, 8, "_tpu_input_from_input_0::0"},
+      {25u, kDetNone, 0u, 0u, 0u, 7, 9, "_tpu_output_from_output_0::0"},
+      {25u, kDetNone, 0u, 0u, 0u, 3, 10, "parameter_0"},
+      {25u, kDetNone, 0u, 0u, 0u, 8, 11, "4097->5"},
+      {47u, kDetDisp, 1u, 1u, 0u, -1, -1, "before_flexible_dma__tpu_input_from_input_0_hw_instructions_1"},
+      {50u, kDetPut, 2u, 37u, 64u, 11, -1, "_tpu_input_from_input_0"},
+      {47u, kDetDisp, 2u, 2u, 0u, -1, -1, "after_request_flexible_dma__tpu_input_from_input_0_hw_instructions_2"},
+      {25u, kDetNone, 0u, 0u, 0u, 10, 12, "1->5"},
+      {47u, kDetDisp, 3u, 3u, 0u, -1, -1, "before_flexible_dma_gate::parameter_hw_instructions_3"},
+      {50u, kDetPut, 4u, 37u, 64u, 12, -1, "gate::parameter"},
+      {47u, kDetDisp, 4u, 4u, 0u, -1, -1, "after_request_flexible_dma_gate::parameter_hw_instructions_4"},
+      {3u, kDetAdd, p_gate, 0u, 0u, 10, 13, "1 <- alu_op(5)"},
+      {47u, kDetDisp, 5u, 5u, 0u, -1, -1, "before_flexible_dma_up::parameter_hw_instructions_5"},
+      {50u, kDetPut, 6u, 37u, 64u, 13, -1, "up::parameter"},
+      {47u, kDetDisp, 6u, 6u, 0u, -1, -1, "after_request_flexible_dma_up::parameter_hw_instructions_6"},
+      {3u, kDetAdd, p_gate + p_up, 0u, 0u, 10, 14, "1 <- alu_op(5)"},
+      {47u, kDetDisp, 7u, 7u, 0u, -1, -1, "before_flexible_dma_output_0.conv::parameter_hw_instructions_7"},
+      {50u, kDetPut, 8u, 37u, 64u, 14, -1, "output_0.conv::parameter"},
+      {47u, kDetDisp, 8u, 8u, 0u, -1, -1, "after_request_flexible_dma_output_0.conv::parameter_hw_instructions_8"},
+      {25u, kDetNone, 0u, 0u, 0u, 9, 15, "4099->5"},
+      {47u, kDetDisp, 9u, 9u, 0u, -1, -1, "before_flexible_dma__tpu_output_from_output_0_hw_instructions_9"},
+      {50u, kDetPut, 10u, 37u, 64u, 15, -1, "_tpu_output_from_output_0"},
+      {47u, kDetDisp, 10u, 10u, 0u, -1, -1, "after_request_flexible_dma__tpu_output_from_output_0_hw_instructions_10;finish_and_sleep_hw_instructions_11"},
+      {51u, kDetNone, 0u, 0u, 0u, -1, -1, "halt"},
+      {61u, kDetNone, 0u, 0u, 0u, 6, -1, "dive_vm_tensor_cache_clean_invalidate.2"},
+  };
+  uint32_t op_offs[32]{};
+  for (size_t i = 0u; i < 32u; ++i) {
+    const OpSpec& op = op_specs[i];
+    fb.start_table();
+    if (op.det == kDetDisp) {
+      fb.add_u32(1u, op.b, 0u);
+      fb.add_u32(0u, op.a, 0u);
+    } else if (op.det == kDetPut) {
+      fb.add_u64(1u, static_cast<uint64_t>(op.b), 0ULL);
+      fb.add_u32(2u, op.c, 0u);
+      fb.add_u32(0u, op.a, 0u);
+    } else if (op.det == kDetAdd) {
+      fb.add_u32(0u, op.a, 0u, true);
+    }
+    uint32_t det_off = fb.end_table();
+    uint32_t in_off = (op.in0 >= 0) ? fb.create_vector_i32(&op.in0, 1u) : fb.create_vector_i32(nullptr, 0u);
+    uint32_t out_off = (op.out0 >= 0) ? fb.create_vector_i32(&op.out0, 1u) : fb.create_vector_i32(nullptr, 0u);
+    uint32_t nm_off = fb.create_string(op.name);
+    fb.start_table();
+    fb.add_uoffset(4u, nm_off);
+    fb.add_uoffset(3u, out_off);
+    fb.add_uoffset(2u, in_off);
+    fb.add_uoffset(1u, det_off);
+    fb.add_u8(0u, op.ot, 0u);
+    op_offs[i] = fb.end_table();
+  }
+  uint32_t fn_ops = fb.create_vector_uoffsets(op_offs, 32u);
+  uint32_t fn_nm = fb.create_string("main");
+  fb.start_table();
+  fb.add_uoffset(4u, fn_nm);
+  fb.add_uoffset(3u, fn_ops);
+  fb.add_uoffset(2u, fn_outs);
+  fb.add_uoffset(1u, fn_ins);
+  fb.add_uoffset(0u, fn_vals);
+  uint32_t fn_off = fb.end_table();
+  uint32_t funcs_vec = fb.create_vector_uoffsets(&fn_off, 1u);
+  uint32_t mod_name = fb.create_string("");
+
+  uint32_t chunk_offs[11]{};
+  for (size_t i = 0u; i < 11u; ++i) {
+    uint32_t b_off = fb.create_vector_bytes(chunks[i].data(), chunks[i].size(), 32u);
+    fb.start_table();
+    fb.add_uoffset(0u, b_off);
+    chunk_offs[i] = fb.end_table();
+  }
+  uint32_t chunks_vec = fb.create_vector_uoffsets(chunk_offs, 11u);
+  const int32_t port_in = 2, port_out = 6, port_param = 0, port_scr = 1;
+  uint32_t p_in = fb.create_vector_i32(&port_in, 1u);
+  uint32_t p_out = fb.create_vector_i32(&port_out, 1u);
+  uint32_t p_param = fb.create_vector_i32(&port_param, 1u);
+  uint32_t p_scr = fb.create_vector_i32(&port_scr, 1u);
+  uint32_t p_var = fb.create_vector_i32(nullptr, 0u);
+  fb.start_table();
+  fb.add_uoffset(8u, p_var);
+  fb.add_uoffset(7u, p_scr);
+  fb.add_uoffset(6u, p_param);
+  fb.add_uoffset(5u, p_out);
+  fb.add_uoffset(4u, p_in);
+  fb.add_uoffset(3u, chunks_vec);
+  fb.add_uoffset(2u, mod_name);
+  fb.add_uoffset(1u, funcs_vec);
+  return fb.finish(fb.end_table(), "DIVE");
+}
+
+}  // namespace
+
+bool is_swiglu_shape(uint32_t M, uint32_t K, uint32_t H, uint32_t N) {
+  if (M == 1u) {
+    return (K == 576u && N == 576u && (H == 512u || H == 1536u)) ||
+           (K == 1536u && N == 1536u && (H == 512u || H == 1024u));
+  }
+  if (M == 64u) {
+    return (K == 576u && N == 576u && H == 512u) ||
+           (K == 1536u && N == 1536u && H == 512u);
+  }
+  return false;
+}
+
+std::vector<uint8_t> pack_ext2_for_swiglu(uint32_t M, uint32_t K, uint32_t H, uint32_t N,
+                                          const int8_t* wg_hk, const int32_t* bg_h,
+                                          const int8_t* wu_hk, const int32_t* bu_h,
+                                          const int8_t* wd_nh, const int32_t* bd_n) {
+  std::vector<uint8_t> e2_g = (M == 64u)
+      ? pack_ext2_lt_64x_impl(H, K, wg_hk, bg_h)
+      : pack_ext2(H, K, wg_hk, bg_h, true);
+  std::vector<uint8_t> e2_u = (M == 64u)
+      ? pack_ext2_lt_64x_impl(H, K, wu_hk, bu_h)
+      : pack_ext2(H, K, wu_hk, bu_h, true);
+  std::vector<uint8_t> e2_d = (M == 64u)
+      ? pack_ext2_lt_64x_impl(N, H, wd_nh, bd_n)
+      : pack_ext2(N, H, wd_nh, bd_n, true);
+  std::vector<uint8_t> out;
+  out.reserve(e2_g.size() + e2_u.size() + e2_d.size());
+  out.insert(out.end(), e2_g.begin(), e2_g.end());
+  out.insert(out.end(), e2_u.begin(), e2_u.end());
+  out.insert(out.end(), e2_d.begin(), e2_d.end());
+  return out;
+}
+
+ob_status_t synthesize_swiglu_parts(const ob_swiglu_int8_desc_t& desc,
+                                    SwigluSynthResult* out,
+                                    std::string* err) {
+  if (!out) return OB_ERR_INVALID_ARG;
+  if (!is_swiglu_shape(desc.m_dim, desc.k_dim, desc.h_dim, desc.n_dim)) {
+    if (err) *err = "Unsupported chained SwiGLU shape";
+    return OB_ERR_UNSUPPORTED;
+  }
+  if (desc.s_in <= 0.0f || desc.s_wg <= 0.0f || desc.s_gate <= 0.0f ||
+      desc.s_wu <= 0.0f || desc.s_up <= 0.0f || desc.s_silu <= 0.0f ||
+      desc.s_prod <= 0.0f || desc.s_wd <= 0.0f || desc.s_out <= 0.0f) {
+    if (err) *err = "All SwiGLU quantization scales must be strictly positive";
+    return OB_ERR_INVALID_ARG;
+  }
+
+  const uint32_t M = desc.m_dim;
+  const uint32_t K = desc.k_dim;
+  const uint32_t H = desc.h_dim;
+  const uint32_t N = desc.n_dim;
+  const uint32_t p_gate = (M == 64u) ? (H * (K + 16u)) : (H * (K + 4u));
+  const uint32_t p_up = p_gate;
+  const uint32_t p_down = (M == 64u) ? (N * (H + 16u)) : (N * (H + 4u));
+
+  out->ext2_params = pack_ext2_for_swiglu(M, K, H, N,
+                                          desc.wg_hk, desc.bg_h,
+                                          desc.wu_hk, desc.bu_h,
+                                          desc.wd_nh, desc.bd_n);
+  if (M == 64u) {
+    synthesize_swiglu_64x_chunks(K, H, N, desc, p_gate, p_up, p_down,
+                                 &out->chunks, &out->exec_field_14);
+  } else {
+    synthesize_swiglu_1x_chunks(K, H, N, desc, p_gate, p_up, p_down,
+                                &out->chunks, &out->exec_field_14);
+  }
+  out->ext0_dive = build_dive_ext0_11chunk(out->chunks, M, K, N, p_gate, p_up);
+  const uint32_t mk_4k = static_cast<uint32_t>(align_up_u64(static_cast<uint64_t>(M) * K, 4096ULL));
+  out->dive_scratch_size = 196608u + ((M == 64u) ? (2u * mk_4k) : 0u);
+  return OB_OK;
+}
+
+ob_status_t build_swiglu_dgc0(const ob_swiglu_int8_desc_t& desc,
+                              const uint8_t* dive_interp,
+                              size_t dive_interp_size,
+                              std::vector<uint8_t>* out_dgc0,
+                              SwigluSynthResult* out_parts,
+                              std::string* err) {
+  if (!dive_interp || dive_interp_size == 0u || !out_dgc0) return OB_ERR_INVALID_ARG;
+  SwigluSynthResult local_parts{};
+  SwigluSynthResult* parts = out_parts ? out_parts : &local_parts;
+  ob_status_t st = synthesize_swiglu_parts(desc, parts, err);
+  if (st != OB_OK) return st;
+
+  // Deterministic unique hashes from ext[0] + prefix of ext[2]
+  std::vector<uint8_t> hash_in;
+  const size_t p_pref = std::min<size_t>(4096u, parts->ext2_params.size());
+  hash_in.reserve(parts->ext0_dive.size() + p_pref);
+  hash_in.insert(hash_in.end(), parts->ext0_dive.begin(), parts->ext0_dive.end());
+  hash_in.insert(hash_in.end(), parts->ext2_params.begin(), parts->ext2_params.begin() + p_pref);
+  uint8_t dig[32]{};
+  sha256_compute(hash_in.data(), hash_in.size(), dig);
+  uint64_t exec_hash = 0ULL;
+  uint64_t model_hash = 0ULL;
+  std::memcpy(&exec_hash, dig, 8u);
+  std::memcpy(&model_hash, dig + 16u, 8u);
+  char token_str[32]{};
+  std::snprintf(token_str, sizeof(token_str), "Token_%019llu",
+                static_cast<unsigned long long>(exec_hash % 10000000000000000000ULL));
+
+  std::vector<uint8_t> dgd0 = build_dgd0_clean();
+  std::vector<uint8_t> dws0 = build_dws0_clean(
+      desc.m_dim, desc.k_dim, desc.n_dim,
+      static_cast<uint32_t>(parts->ext0_dive.size()),
+      static_cast<uint32_t>(dive_interp_size),
+      static_cast<uint32_t>(parts->ext2_params.size()),
+      parts->dive_scratch_size, parts->exec_field_14,
+      exec_hash, token_str);
+
+  FbBuilder fb;
+  uint32_t dws_vec = fb.create_vector_bytes(dws0.data(), dws0.size(), 64u);
+  uint32_t dgd_vec = fb.create_vector_bytes(dgd0.data(), dgd0.size(), 4096u);
+  uint32_t eb_offs[3]{};
+  uint32_t eb_off_from_end[3]{};
+  const uint64_t eb_sizes[3] = {
+      static_cast<uint64_t>(parts->ext0_dive.size()),
+      static_cast<uint64_t>(dive_interp_size),
+      static_cast<uint64_t>(parts->ext2_params.size()),
+  };
+  for (size_t i = 0u; i < 3u; ++i) {
+    fb.start_table();
+    fb.add_u64(1u, eb_sizes[i], 0ULL, true);
+    fb.add_u64(0u, 0ULL, 0ULL, true, &eb_off_from_end[i]);
+    eb_offs[i] = fb.end_table();
+  }
+  uint32_t ebs_vec = fb.create_vector_uoffsets(eb_offs, 3u);
+  fb.start_table();
+  fb.add_uoffset(7u, ebs_vec);
+  fb.add_u32(6u, 64u, 0u, true);
+  fb.add_u64(5u, kCompilerCl, 0ULL, true);
+  fb.add_u64(4u, model_hash, 0ULL, true);
+  fb.add_u32(3u, 6u, 0u, true);
+  fb.add_uoffset(1u, dgd_vec);
+  fb.add_uoffset(0u, dws_vec);
+  std::vector<uint8_t> hdr = fb.finish(fb.end_table(), "DGC0");
+
+  const uint64_t off0 = align_up_u64(static_cast<uint64_t>(hdr.size()), 64ULL);
+  const uint64_t off1 = align_up_u64(off0 + eb_sizes[0], 64ULL);
+  const uint64_t off2 = align_up_u64(off1 + eb_sizes[1], 64ULL);
+  const uint64_t total_sz = align_up_u64(off2 + eb_sizes[2], 64ULL);
+  const uint64_t abs_offs[3] = {off0, off1, off2};
+  for (size_t i = 0u; i < 3u; ++i) {
+    size_t pos = hdr.size() - static_cast<size_t>(eb_off_from_end[i]);
+    std::memcpy(hdr.data() + pos, &abs_offs[i], 8u);
+  }
+
+  out_dgc0->assign(static_cast<size_t>(total_sz), 0u);
+  std::memcpy(out_dgc0->data(), hdr.data(), hdr.size());
+  std::memcpy(out_dgc0->data() + off0, parts->ext0_dive.data(), parts->ext0_dive.size());
+  std::memcpy(out_dgc0->data() + off1, dive_interp, dive_interp_size);
+  std::memcpy(out_dgc0->data() + off2, parts->ext2_params.data(), parts->ext2_params.size());
+  return OB_OK;
+}
+
+void simulate_swiglu_hw_exact(const int8_t* x_mk,
+                              const ob_swiglu_int8_desc_t& d,
+                              int8_t* y_mn) {
+  const uint32_t M = d.m_dim, K = d.k_dim, H = d.h_dim, N = d.n_dim;
+  const float m_g = (d.s_in * d.s_wg) / d.s_gate;
+  const float m_u = (d.s_in * d.s_wu) / d.s_up;
+  const float m_mul = (d.s_silu * d.s_up) / d.s_prod;
+  const float m_d = (d.s_prod * d.s_wd) / d.s_out;
+  constexpr float kInf = __builtin_huge_valf();
+
+  float silu_coeffs[8][5]{};
+  for (int s = 0; s < 8; ++s) {
+    for (int k = 0; k < 5; ++k) {
+      silu_coeffs[s][k] = kSwigluSiluUnitCoeffs[s][k] / d.s_silu;
+    }
+  }
+
+  std::vector<int8_t> q_prod(static_cast<size_t>(M) * H, 0);
+  for (uint32_t m = 0u; m < M; ++m) {
+    const int8_t* x_row = x_mk + static_cast<size_t>(m) * K;
+    int8_t* p_row = q_prod.data() + static_cast<size_t>(m) * H;
+    for (uint32_t h = 0u; h < H; ++h) {
+      int32_t acc_g = d.bg_h ? d.bg_h[h] : 0;
+      int32_t acc_u = d.bu_h ? d.bu_h[h] : 0;
+      const int8_t* wg_row = d.wg_hk ? (d.wg_hk + static_cast<size_t>(h) * K) : nullptr;
+      const int8_t* wu_row = d.wu_hk ? (d.wu_hk + static_cast<size_t>(h) * K) : nullptr;
+      if (wg_row && wu_row) {
+        for (uint32_t k = 0u; k < K; ++k) {
+          const int32_t xv = static_cast<int32_t>(x_row[k]);
+          acc_g += xv * static_cast<int32_t>(wg_row[k]);
+          acc_u += xv * static_cast<int32_t>(wu_row[k]);
+        }
+      }
+      const int32_t q_g = clip_i8_i32(rne_i32_exact(static_cast<float>(acc_g) * m_g));
+      const int32_t q_u = clip_i8_i32(rne_i32_exact(static_cast<float>(acc_u) * m_u));
+      const float x_g = static_cast<float>(q_g) * d.s_gate;
+      const float y_silu = eval_0x640_horner_scalar(x_g, silu_coeffs, kSwigluSiluBps, -11.6f, kInf);
+      int32_t u_silu = rne_i32_exact(y_silu) + 128;
+      if (u_silu < 0) u_silu = 0;
+      if (u_silu > 255) u_silu = 255;
+      const int32_t q_silu = u_silu - 128;
+      p_row[h] = static_cast<int8_t>(
+          clip_i8_i32(rne_i32_exact(static_cast<float>(q_silu * q_u) * m_mul)));
+    }
+  }
+  for (uint32_t m = 0u; m < M; ++m) {
+    const int8_t* p_row = q_prod.data() + static_cast<size_t>(m) * H;
+    int8_t* y_row = y_mn + static_cast<size_t>(m) * N;
+    for (uint32_t n = 0u; n < N; ++n) {
+      int32_t acc_d = d.bd_n ? d.bd_n[n] : 0;
+      const int8_t* wd_row = d.wd_nh ? (d.wd_nh + static_cast<size_t>(n) * H) : nullptr;
+      if (wd_row) {
+        for (uint32_t h = 0u; h < H; ++h) {
+          acc_d += static_cast<int32_t>(p_row[h]) * static_cast<int32_t>(wd_row[h]);
+        }
+      }
+      y_row[n] = static_cast<int8_t>(
+          clip_i8_i32(rne_i32_exact(static_cast<float>(acc_d) * m_d)));
+    }
+  }
 }
 
 }  // namespace ob

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -186,6 +187,7 @@ ob_status_t device_open(ob_context* ctx) {
                             std::to_string(errno));
     return OB_ERR_DEVICE;
   }
+  ctx->dma_heap_fd = ::open(ctx->dma_heap_path.c_str(), O_RDONLY | O_CLOEXEC);
 
   uint64_t dev_credits = OB_MAX_CREDITS;
   if (::ioctl(ctx->tpu_fd, EDGETPU_GET_CREDIT_SIZE, &dev_credits) != 0) {
@@ -333,6 +335,10 @@ void device_close(ob_context* ctx) {
     if (ctx->resp_efd >= 0) {
       ::close(ctx->resp_efd);
       ctx->resp_efd = -1;
+    }
+    if (ctx->dma_heap_fd >= 0) {
+      ::close(ctx->dma_heap_fd);
+      ctx->dma_heap_fd = -1;
     }
     if (ctx->tpu_fd >= 0) {
       ::close(ctx->tpu_fd);
@@ -622,8 +628,22 @@ ob_status_t device_wait_handle(ob_context* ctx,
     } else {
 #if defined(__linux__)
       uint32_t wait_ms = (timeout_ms > 0) ? timeout_ms : ctx->cfg.timeout_ms;
-      uint64_t deadline_ns =
-          monotonic_now_ns() + static_cast<uint64_t>(wait_ms) * 1000000ULL;
+      const uint64_t wait_start_ns = monotonic_now_ns();
+      const uint64_t deadline_ns =
+          wait_start_ns + static_cast<uint64_t>(wait_ms) * 1000000ULL;
+
+      // Adaptive bounded user-space spin before poll(resp_efd):
+      // eliminates 150-350 us kernel wake/schedule jitter when TPU finishes in 40-400 us
+      // (covers both SmolLM2 ~266 us and Qwen2.5 SwiGLU ~215-350 us chunks),
+      // while sleeping in poll() immediately for long ops (ema_hw_us >= 600 us) or spin_us == 0.
+      const bool allow_spin = (ctx->spin_us > 0u) &&
+                              (ctx->ema_hw_us == 0u || ctx->ema_hw_us < 600u);
+      const uint64_t spin_deadline_ns = allow_spin
+          ? std::min<uint64_t>(deadline_ns,
+                               wait_start_ns + static_cast<uint64_t>(ctx->spin_us) * 1000ULL)
+          : 0u;
+      bool used_poll = false;
+      uint32_t spin_iters = 0u;
 
       while (slot->state == CreditSlot::IN_FLIGHT) {
         std::string err;
@@ -637,10 +657,40 @@ ob_status_t device_wait_handle(ob_context* ctx,
         }
         if (slot->state != CreditSlot::IN_FLIGHT) break;
 
+        if (allow_spin && !used_poll) {
+          uint64_t now_ns = monotonic_now_ns();
+          if (now_ns < spin_deadline_ns) {
+            ++spin_iters;
+            // Pace non-blocking ioctl probes every ~4 us to avoid kernel lock contention
+            // with the IRQ handler while catching completion within <= 4 us.
+            const uint64_t next_probe_ns = std::min<uint64_t>(spin_deadline_ns, now_ns + 4000ULL);
+            while (monotonic_now_ns() < next_probe_ns) {
+#if defined(__aarch64__)
+              asm volatile("yield" ::: "memory");
+#elif defined(__x86_64__)
+              asm volatile("pause" ::: "memory");
+#endif
+            }
+            continue;
+          }
+        }
+
+        used_poll = true;
+        ctx->prof.poll_waits += 1u;
         ob_status_t pst = poll_eventfds_locked(ctx, deadline_ns, &err);
         if (pst != OB_OK) {
           set_last_error(ctx, err);
           return pst;
+        }
+      }
+      if (!used_poll && spin_iters > 0u) {
+        ctx->prof.spin_hits += 1u;
+      }
+      if (slot->state == CreditSlot::COMPLETED && slot->hw_execution_us > 0u) {
+        if (ctx->ema_hw_us == 0u) {
+          ctx->ema_hw_us = slot->hw_execution_us;
+        } else {
+          ctx->ema_hw_us = (ctx->ema_hw_us * 3u + slot->hw_execution_us) >> 2u;
         }
       }
 #else
@@ -718,6 +768,22 @@ bool read_env_u8(const char* name, uint8_t* out) {
   if (end == s || v > 255ul) return false;
   *out = static_cast<uint8_t>(v);
   return true;
+}
+
+bool read_env_u32(const char* name, uint32_t* out) {
+  const char* s = std::getenv(name);
+  if (!s || !s[0]) return false;
+  char* end = nullptr;
+  unsigned long v = std::strtoul(s, &end, 0);
+  if (end == s || v > 0xfffffffful) return false;
+  *out = static_cast<uint32_t>(v);
+  return true;
+}
+
+bool read_env_flag(const char* name, bool default_val) {
+  const char* s = std::getenv(name);
+  if (!s || !s[0]) return default_val;
+  return (s[0] != '0');
 }
 
 struct ObPowerProfile {
@@ -831,6 +897,33 @@ ob_status_t ob_context_create(const ob_config_t* config, ob_context_t** out_ctx)
   ctx->cfg = eff;
   ctx->fw_priority = fw_prio;
   ctx->fw_wakelock_enabled = wl_enabled;
+  ctx->profile_enabled = read_env_flag("OPENBUENOS_PROFILE", false);
+  ctx->verbose_enabled = read_env_flag("OPENBUENOS_VERBOSE", false);
+  ctx->strict_weight_hash = read_env_flag("OPENBUENOS_STRICT_WEIGHT_HASH", false);
+  ctx->large_tiles_enabled = !read_env_flag("OPENBUENOS_DISABLE_LARGE_TILES", false);
+  ctx->batched_large_tiles_enabled =
+      ctx->large_tiles_enabled && !read_env_flag("OPENBUENOS_DISABLE_BATCHED_LARGE_TILES", false);
+  ctx->horiz_fusion_enabled = !read_env_flag("OPENBUENOS_DISABLE_HORIZ_FUSION", false);
+  ctx->swiglu_chain_enabled = !read_env_flag("OPENBUENOS_DISABLE_SWIGLU_CHAIN", false);
+  ctx->swiglu_prefill_enabled = read_env_flag("OPENBUENOS_SWIGLU_PREFILL", false);
+  if (const char* s = std::getenv("OPENBUENOS_SWIGLU_MAX_CREST"); s && s[0]) {
+    char* end = nullptr;
+    float v = std::strtof(s, &end);
+    if (end != s && v >= 0.0f) {
+      ctx->swiglu_max_crest = v;
+    }
+  }
+  uint32_t env_swap_slots = 1u;
+  if (read_env_u32("OPENBUENOS_PARAM_SWAP_SLOTS", &env_swap_slots)) {
+    if (env_swap_slots < 1u) env_swap_slots = 1u;
+    if (env_swap_slots > OB_MAX_CREDITS) env_swap_slots = OB_MAX_CREDITS;
+  }
+  ctx->param_swap_slots = env_swap_slots;
+  uint32_t env_spin_us = 450u;
+  if (read_env_u32("OPENBUENOS_SPIN_US", &env_spin_us)) {
+    if (env_spin_us > 10000u) env_spin_us = 10000u;
+  }
+  ctx->spin_us = env_spin_us;
   ctx->device_path = eff.device_path;
   ctx->dma_heap_path = eff.dma_heap_path;
   ctx->mock_mode = (eff.mock_mode != 0);
@@ -852,6 +945,46 @@ ob_status_t ob_context_create(const ob_config_t* config, ob_context_t** out_ctx)
 void ob_context_destroy(ob_context_t* ctx) {
   if (!ctx) return;
   ob::device_wait_all(ctx, ctx->cfg.timeout_ms);
+  if (ctx->profile_enabled || (ctx->verbose_enabled && (ctx->prof.calls > 0u || ctx->prof.swiglu_calls > 0u))) {
+    ob_profile_stats_t ps {};
+    if (ob_context_get_profile(ctx, &ps) == OB_OK) {
+      std::fprintf(
+          stderr,
+          "libopenbuenos: profile calls=%llu tiles=%llu horiz_fusions=%llu horiz_saved=%llu "
+          "swiglu_calls=%llu swiglu_chained=%llu swiglu_fb=%llu "
+          "hw_us=%llu wall_us=%llu quant_us=%llu hash_us=%llu pack_us=%llu dma_sync_us=%llu "
+          "submit_us=%llu wait_us=%llu dequant_us=%llu sat_retries=%llu spin_hits=%llu "
+          "poll_waits=%llu pool_hits=%llu pool_misses=%llu w_hits=%llu w_misses=%llu "
+          "w_evict=%llu w_bytes=%llu w_peak_bytes=%llu w_budget_bytes=%llu\n",
+          static_cast<unsigned long long>(ps.calls),
+          static_cast<unsigned long long>(ps.tiles_dispatched),
+          static_cast<unsigned long long>(ps.horiz_fusions),
+          static_cast<unsigned long long>(ps.horiz_jobs_saved),
+          static_cast<unsigned long long>(ps.swiglu_calls),
+          static_cast<unsigned long long>(ps.swiglu_chunks_chained),
+          static_cast<unsigned long long>(ps.swiglu_fallbacks),
+          static_cast<unsigned long long>(ps.hw_us),
+          static_cast<unsigned long long>(ps.total_wall_us),
+          static_cast<unsigned long long>(ps.quant_us),
+          static_cast<unsigned long long>(ps.hash_us),
+          static_cast<unsigned long long>(ps.weight_pack_us),
+          static_cast<unsigned long long>(ps.dma_sync_us),
+          static_cast<unsigned long long>(ps.submit_us),
+          static_cast<unsigned long long>(ps.wait_us),
+          static_cast<unsigned long long>(ps.dequant_us),
+          static_cast<unsigned long long>(ps.sat_retries),
+          static_cast<unsigned long long>(ps.spin_hits),
+          static_cast<unsigned long long>(ps.poll_waits),
+          static_cast<unsigned long long>(ps.pool_hits),
+          static_cast<unsigned long long>(ps.pool_misses),
+          static_cast<unsigned long long>(ps.weight_cache_hits),
+          static_cast<unsigned long long>(ps.weight_cache_misses),
+          static_cast<unsigned long long>(ps.weight_cache_evictions),
+          static_cast<unsigned long long>(ps.weight_cache_bytes),
+          static_cast<unsigned long long>(ps.weight_cache_peak_bytes),
+          static_cast<unsigned long long>(ps.weight_cache_budget_bytes));
+    }
+  }
   ob::gemm_release_pipeline_buffers(ctx);
   ob::graph_cache_clear(ctx);
   ob::shared_image_clear(ctx);
@@ -900,6 +1033,64 @@ ob_status_t ob_context_set_perf_mode(ob_context_t* ctx, uint32_t perf_mode) {
     apply_perf_mode_to_cfg(&ctx->cfg, perf_mode, &ctx->fw_priority);
   }
   ob::device_sync_fw_wakelock(ctx);
+  return OB_OK;
+}
+
+ob_status_t ob_context_set_profile(ob_context_t* ctx, int enable) {
+  if (!ctx) return OB_ERR_INVALID_ARG;
+  std::lock_guard<std::mutex> lk(ctx->gemm_mu);
+  ctx->profile_enabled = (enable != 0);
+  return OB_OK;
+}
+
+ob_status_t ob_context_get_profile(const ob_context_t* ctx, ob_profile_stats_t* out_profile) {
+  if (!ctx || !out_profile) return OB_ERR_INVALID_ARG;
+  std::memset(out_profile, 0, sizeof(*out_profile));
+  ob_context* mctx = const_cast<ob_context*>(ctx);
+  {
+    std::lock_guard<std::mutex> glk(mctx->gemm_mu);
+    out_profile->quant_us = mctx->prof.quant_ns / 1000ULL;
+    out_profile->hash_us = mctx->prof.hash_ns / 1000ULL;
+    out_profile->weight_pack_us = mctx->prof.weight_pack_ns / 1000ULL;
+    out_profile->dma_sync_us = mctx->prof.dma_sync_ns / 1000ULL;
+    out_profile->submit_us = mctx->prof.submit_ns / 1000ULL;
+    out_profile->wait_us = mctx->prof.wait_ns / 1000ULL;
+    out_profile->dequant_us = mctx->prof.dequant_ns / 1000ULL;
+    out_profile->hw_us = mctx->prof.hw_us;
+    out_profile->total_wall_us = mctx->prof.total_wall_ns / 1000ULL;
+    out_profile->calls = mctx->prof.calls;
+    out_profile->tiles_dispatched = mctx->prof.tiles_dispatched;
+    out_profile->horiz_fusions = mctx->prof.horiz_fusions;
+    out_profile->horiz_jobs_saved = mctx->prof.horiz_jobs_saved;
+    out_profile->sat_retries = mctx->prof.sat_retries;
+    out_profile->weight_cache_hits = mctx->weight_cache_hits;
+    out_profile->weight_cache_misses = mctx->weight_cache_misses;
+    out_profile->weight_cache_bytes = mctx->weight_cache_bytes;
+    out_profile->weight_cache_peak_bytes = mctx->weight_cache_peak_bytes;
+    out_profile->weight_cache_budget_bytes = ob::compute_weight_cache_budget_bytes(mctx);
+    out_profile->weight_cache_evictions = mctx->weight_cache_evictions;
+    out_profile->swiglu_calls = mctx->prof.swiglu_calls;
+    out_profile->swiglu_chunks_chained = mctx->prof.swiglu_chunks_chained;
+    out_profile->swiglu_fallbacks = mctx->prof.swiglu_fallbacks;
+    {
+      std::lock_guard<std::mutex> vlk(mctx->vii_mu);
+      out_profile->spin_hits = mctx->prof.spin_hits;
+      out_profile->poll_waits = mctx->prof.poll_waits;
+    }
+    {
+      std::lock_guard<std::mutex> plk(mctx->pool_mu);
+      out_profile->pool_hits = mctx->pool_hits;
+      out_profile->pool_misses = mctx->pool_misses;
+    }
+  }
+  return OB_OK;
+}
+
+ob_status_t ob_context_reset_profile(ob_context_t* ctx) {
+  if (!ctx) return OB_ERR_INVALID_ARG;
+  std::lock_guard<std::mutex> glk(ctx->gemm_mu);
+  std::lock_guard<std::mutex> vlk(ctx->vii_mu);
+  ctx->prof = ob::ProfileCounters{};
   return OB_OK;
 }
 

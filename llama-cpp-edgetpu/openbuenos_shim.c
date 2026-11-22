@@ -2,10 +2,6 @@
  * Fallback offline mock shim for openbuenos.h when libopenbuenos.a is not yet built.
  * Replaced automatically at link time once libopenbuenos/build/{android-arm64,host}/libopenbuenos.a exists.
  */
-#ifndef _POSIX_C_SOURCE
-#define _POSIX_C_SOURCE 200809L
-#endif
-
 #include "openbuenos.h"
 
 #include <math.h>
@@ -126,6 +122,21 @@ int ob_context_is_mock(const ob_context_t * ctx) {
 
 ob_status_t ob_context_set_perf_mode(ob_context_t * ctx, uint32_t perf_mode) {
     (void)perf_mode;
+    return ctx ? OB_OK : OB_ERR_INVALID_ARG;
+}
+
+ob_status_t ob_context_set_profile(ob_context_t * ctx, int enable) {
+    (void)enable;
+    return ctx ? OB_OK : OB_ERR_INVALID_ARG;
+}
+
+ob_status_t ob_context_get_profile(const ob_context_t * ctx, ob_profile_stats_t * out_profile) {
+    if (!ctx || !out_profile) return OB_ERR_INVALID_ARG;
+    memset(out_profile, 0, sizeof(*out_profile));
+    return OB_OK;
+}
+
+ob_status_t ob_context_reset_profile(ob_context_t * ctx) {
     return ctx ? OB_OK : OB_ERR_INVALID_ARG;
 }
 
@@ -349,6 +360,64 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t *                  ctx,
         out_stats->wall_time_us     = ob_shim_now_us() - t0;
         out_stats->flags            = (uint16_t)(OB_STAT_FLAG_MOCK | OB_STAT_FLAG_CPU_FALLBACK);
         out_stats->tiles_dispatched = num_jobs;
+    }
+    return OB_OK;
+}
+
+ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t *                      ctx,
+                                     const float *                       a_mk,
+                                     const ob_gemm_swiglu_quant_desc_t * desc,
+                                     float *                             c_mn,
+                                     ob_invoke_stats_t *                 out_stats) {
+    if (!ctx || !a_mk || !desc || !c_mn || !desc->w_gate_hk || !desc->w_up_hk || !desc->w_down_nh ||
+        desc->m_dim == 0u || desc->k_dim == 0u || desc->h_dim == 0u || desc->n_dim == 0u ||
+        (desc->k_dim % OB_QK8_0) != 0u || (desc->h_dim % OB_QK8_0) != 0u) {
+        return OB_ERR_INVALID_ARG;
+    }
+    const uint64_t t0 = ob_shim_now_us();
+    const size_t mh = (size_t)desc->m_dim * desc->h_dim;
+    float * gate_buf = (float *)malloc(mh * sizeof(float));
+    float * up_buf   = (float *)malloc(mh * sizeof(float));
+    if (!gate_buf || !up_buf) {
+        free(gate_buf);
+        free(up_buf);
+        return OB_ERR_NO_MEMORY;
+    }
+    ob_gemm_f32_quant_job_t gu_jobs[2];
+    memset(gu_jobs, 0, sizeof(gu_jobs));
+    gu_jobs[0].b_nk    = desc->w_gate_hk;
+    gu_jobs[0].c_mn    = gate_buf;
+    gu_jobs[0].n_dim   = desc->h_dim;
+    gu_jobs[0].is_q4_0 = desc->gate_is_q4_0;
+    gu_jobs[1].b_nk    = desc->w_up_hk;
+    gu_jobs[1].c_mn    = up_buf;
+    gu_jobs[1].n_dim   = desc->h_dim;
+    gu_jobs[1].is_q4_0 = desc->up_is_q4_0;
+
+    ob_status_t st = ob_gemm_matmul_f32_quant_batch(ctx, a_mk, desc->m_dim, desc->k_dim, gu_jobs, 2u, NULL);
+    if (st == OB_OK) {
+        for (size_t i = 0; i < mh; ++i) {
+            const float g = gate_buf[i];
+            gate_buf[i] = (g / (1.0f + expf(-g))) * up_buf[i];
+        }
+        ob_gemm_f32_quant_job_t down_job;
+        memset(&down_job, 0, sizeof(down_job));
+        down_job.b_nk    = desc->w_down_nh;
+        down_job.c_mn    = c_mn;
+        down_job.n_dim   = desc->n_dim;
+        down_job.is_q4_0 = desc->down_is_q4_0;
+        st = ob_gemm_matmul_f32_quant_batch(ctx, gate_buf, desc->m_dim, desc->h_dim, &down_job, 1u, NULL);
+    }
+    free(gate_buf);
+    free(up_buf);
+    if (st != OB_OK) {
+        return st;
+    }
+    if (out_stats) {
+        memset(out_stats, 0, sizeof(*out_stats));
+        out_stats->wall_time_us     = ob_shim_now_us() - t0;
+        out_stats->flags            = (uint16_t)(OB_STAT_FLAG_MOCK | OB_STAT_FLAG_CPU_FALLBACK);
+        out_stats->tiles_dispatched = 1u;
     }
     return OB_OK;
 }

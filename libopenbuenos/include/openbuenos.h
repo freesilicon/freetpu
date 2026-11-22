@@ -143,6 +143,37 @@ typedef struct ob_invoke_stats {
   uint32_t cache_hits;      /* Number of graph cache hits during operation */
 } ob_invoke_stats_t;
 
+/* Built-in microsecond stage profiler (enable via OPENBUENOS_PROFILE=1 or ob_context_set_profile) */
+typedef struct ob_profile_stats {
+  uint64_t quant_us;                  /* Activation quantization + outlier peel + RMS shift */
+  uint64_t hash_us;                   /* Weight tile hashing + cache lookup */
+  uint64_t weight_pack_us;            /* Cold Q4_0/Q8_0/INT8 requant + ext[2] pack + upload */
+  uint64_t dma_sync_us;               /* Input/output DMA-BUF write/read/sync time */
+  uint64_t submit_us;                 /* Graph acquire + VII async command submit ioctl */
+  uint64_t wait_us;                   /* Host wait/spin/poll for VII completion */
+  uint64_t dequant_us;                /* Sat check + int8->f32 dequant/accum + outlier + act */
+  uint64_t hw_us;                     /* Cumulative TPU firmware-reported execution_us */
+  uint64_t total_wall_us;             /* Cumulative ob_gemm_matmul_* wall time */
+  uint64_t calls;                     /* Number of matmul calls executed */
+  uint64_t tiles_dispatched;          /* Total hardware/mock tiles dispatched */
+  uint64_t horiz_fusions;             /* Horizontal multi-job weight-concat fusions */
+  uint64_t horiz_jobs_saved;          /* VII tile launches eliminated by horizontal fusion */
+  uint64_t sat_retries;               /* On-TPU saturation retries */
+  uint64_t spin_hits;                 /* VII completions harvested during user-space spin */
+  uint64_t poll_waits;                /* Kernel poll(resp_efd) sleeps */
+  uint64_t pool_hits;                 /* Snapshot of buffer pool hits */
+  uint64_t pool_misses;               /* Snapshot of buffer pool misses */
+  uint64_t weight_cache_hits;         /* Snapshot of ext[2] weight tile cache hits */
+  uint64_t weight_cache_misses;       /* Snapshot of ext[2] weight tile cache misses */
+  uint64_t weight_cache_bytes;        /* Current resident ext[2] DMA-BUF bytes */
+  uint64_t weight_cache_peak_bytes;   /* Peak resident ext[2] DMA-BUF bytes */
+  uint64_t weight_cache_budget_bytes; /* Effective LMKD-safe ext[2] DMA-BUF byte cap */
+  uint64_t weight_cache_evictions;    /* Cumulative weight cache LRU evictions */
+  uint64_t swiglu_calls;              /* Number of ob_gemm_swiglu_* calls executed */
+  uint64_t swiglu_chunks_chained;     /* Single-VII in-SRAM SwiGLU chunks dispatched */
+  uint64_t swiglu_fallbacks;          /* SwiGLU calls routed via M7A batched fallback */
+} ob_profile_stats_t;
+
 /* Parsed .dgc0 container metadata */
 typedef struct ob_dgc0_info {
   uint32_t num_inputs;
@@ -212,6 +243,9 @@ const char* ob_context_last_error(const ob_context_t* ctx);
 uint32_t    ob_context_credit_size(const ob_context_t* ctx);
 int         ob_context_is_mock(const ob_context_t* ctx);
 ob_status_t ob_context_set_perf_mode(ob_context_t* ctx, uint32_t perf_mode);
+ob_status_t ob_context_set_profile(ob_context_t* ctx, int enable);
+ob_status_t ob_context_get_profile(const ob_context_t* ctx, ob_profile_stats_t* out_profile);
+ob_status_t ob_context_reset_profile(ob_context_t* ctx);
 
 /* =========================================================================
  * DMA-BUF Slab / Pool Buffer API (/dev/dma_heap/system + EDGETPU_MAP_DMABUF)
@@ -440,6 +474,79 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t*                  ctx,
                                            const ob_gemm_f32_quant_job_t* jobs,
                                            uint32_t                       num_jobs,
                                            ob_invoke_stats_t*             out_stats);
+
+/*
+ * Chained zero-DRAM in-SRAM SwiGLU MLP block for llama.cpp (ggml-edgetpu):
+ *   C[m, n] = ((SiLU(A @ W_gate^T) * (A @ W_up^T)) @ W_down^T)[m, n]
+ *
+ * Executes gate -> 0x640 SiLU * up (0x100 MUL) -> down entirely inside Tensor G5
+ * TPU SRAM in a single VII launch per H-chunk on supported LLM shapes:
+ *   - SmolLM2-135M (K=576, H=1536, N=576): 1 VII call at M=1, 3 calls at M=64
+ *   - Qwen2.5-1.5B (K=1536, H=8960, N=1536): 9 H=1024 chunks at M=1, 18 H=512 at M=64
+ *
+ * Automatically handles arbitrary M (chunking M > 64 internally), exact CPU FP32
+ * reference in mock_mode=1, and clean M7A batched fallback for unsupported shapes,
+ * extreme outlier rows, or OPENBUENOS_DISABLE_SWIGLU_CHAIN=1.
+ */
+typedef struct ob_gemm_swiglu_quant_desc {
+  const void* w_gate_hk;    /* [h_dim, k_dim] contiguous ob_block_q8_0_t or ob_block_q4_0_t */
+  const void* w_up_hk;      /* [h_dim, k_dim] contiguous ob_block_q8_0_t or ob_block_q4_0_t */
+  const void* w_down_nh;    /* [n_dim, h_dim] contiguous ob_block_q8_0_t or ob_block_q4_0_t */
+  uint32_t    m_dim;        /* arbitrary M (handles M=1, M=64, M=128, M=512, etc.) */
+  uint32_t    k_dim;        /* k_dim % 32 == 0 */
+  uint32_t    h_dim;        /* h_dim % 32 == 0 */
+  uint32_t    n_dim;
+  uint8_t     gate_is_q4_0; /* 0 = Q8_0, 1 = Q4_0 */
+  uint8_t     up_is_q4_0;   /* 0 = Q8_0, 1 = Q4_0 */
+  uint8_t     down_is_q4_0; /* 0 = Q8_0, 1 = Q4_0 */
+  uint8_t     reserved;
+} ob_gemm_swiglu_quant_desc_t;
+
+ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t*                      ctx,
+                                     const float*                       a_mk,
+                                     const ob_gemm_swiglu_quant_desc_t* desc,
+                                     float*                             c_mn,
+                                     ob_invoke_stats_t*                 out_stats);
+
+/*
+ * Exact INT8 single-VII chained SwiGLU descriptor (for selftest & bit-exact silicon proof):
+ *   gate  = clip_i8(rne((X @ Wg^T + Bg) * (s_in * s_wg / s_gate)))
+ *   up    = clip_i8(rne((X @ Wu^T + Bu) * (s_in * s_wu / s_up)))
+ *   silu  = clip_i8(rne(Horner_SiLU(gate * s_gate) / s_silu))
+ *   prod  = clip_i8(rne((silu * up) * (s_silu * s_up / s_prod)))
+ *   out   = clip_i8(rne((prod @ Wd^T + Bd) * (s_prod * s_wd / s_out)))
+ *
+ * Supported exact single-VII shapes:
+ *   M=1 : (576, 512, 576), (576, 1536, 576), (1536, 512, 1536), (1536, 1024, 1536)
+ *   M=64: (576, 512, 576), (1536, 512, 1536)
+ */
+typedef struct ob_swiglu_int8_desc {
+  uint32_t       m_dim;
+  uint32_t       k_dim;
+  uint32_t       h_dim;
+  uint32_t       n_dim;
+  const int8_t*  wg_hk;  /* [h_dim, k_dim] row-major int8 */
+  const int32_t* bg_h;   /* optional [h_dim] int32 (may be NULL -> 0) */
+  const int8_t*  wu_hk;  /* [h_dim, k_dim] row-major int8 */
+  const int32_t* bu_h;   /* optional [h_dim] int32 (may be NULL -> 0) */
+  const int8_t*  wd_nh;  /* [n_dim, h_dim] row-major int8 */
+  const int32_t* bd_n;   /* optional [n_dim] int32 (may be NULL -> 0) */
+  float          s_in;
+  float          s_wg;
+  float          s_gate;
+  float          s_wu;
+  float          s_up;
+  float          s_silu;
+  float          s_prod;
+  float          s_wd;
+  float          s_out;
+} ob_swiglu_int8_desc_t;
+
+ob_status_t ob_gemm_swiglu_int8(ob_context_t*                ctx,
+                                const int8_t*                x_mk,
+                                const ob_swiglu_int8_desc_t* desc,
+                                int8_t*                      y_mn,
+                                ob_invoke_stats_t*           out_stats);
 
 #ifdef __cplusplus
 } /* extern "C" */
