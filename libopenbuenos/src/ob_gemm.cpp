@@ -840,7 +840,7 @@ void compute_swiglu_stage_dividers_impl(uint32_t m_dim,
   const double sig_down = is_batched ? 5.8 : 5.6;
   const double dd_thresh = is_batched ? 1.40 : 1.38;
   const uint32_t d_down = round_pow2_clamped(
-      (sig_down * rms_qprod * static_cast<double>(l2_d_max)) / 127.0, 256u, 4096u, dd_thresh);
+      (sig_down * rms_qprod * static_cast<double>(l2_d_max)) / 127.0, 16u, 4096u, dd_thresh);
   *out_d_gate = d_gate;
   *out_d_up = d_up;
   *out_d_mul = d_mul;
