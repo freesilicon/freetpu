@@ -17,6 +17,9 @@
 
 struct PJRT_Event {
   bool ready = true;
+  bool has_error = false;
+  PJRT_Error_Code error_code = PJRT_Error_Code_OK;
+  std::string error_msg;
 };
 
 struct PJRT_ExecuteContext {};
@@ -339,19 +342,56 @@ bool parse_stablehlo_matmul(const char* code, size_t len, uint32_t* m_out,
   std::string attrs = c2 == std::string::npos ? std::string() : trim_ws(after_lhs.substr(c2 + 1));
   if (op_lhs != arg0_ssa || op_rhs != arg1_ssa) return false;
 
+  // Split comma-separated attributes outside [...] brackets.
+  auto split_attrs = [](const std::string& raw) -> std::vector<std::string> {
+    std::vector<std::string> out;
+    std::string cur;
+    int bracket_depth = 0;
+    for (char ch : raw) {
+      if (std::isspace(static_cast<unsigned char>(ch))) continue;
+      if (ch == '[') ++bracket_depth;
+      else if (ch == ']') --bracket_depth;
+      if (ch == ',' && bracket_depth == 0) {
+        if (!cur.empty()) out.push_back(cur);
+        cur.clear();
+      } else {
+        cur.push_back(ch);
+      }
+    }
+    if (!cur.empty()) out.push_back(cur);
+    return out;
+  };
+
+  auto attr_list = split_attrs(attrs);
   if (is_dot_general) {
-    // Reject batching_dims or unexpected attributes; require contracting_dims = [1] x [0].
-    std::string compact_attrs;
-    for (char ch : attrs) {
-      if (!std::isspace(static_cast<unsigned char>(ch))) compact_attrs.push_back(ch);
+    bool saw_contracting = false;
+    bool saw_batching = false;
+    bool saw_precision = false;
+    for (const auto& a : attr_list) {
+      if (a == "contracting_dims=[1]x[0]") {
+        if (saw_contracting) return false;
+        saw_contracting = true;
+      } else if (a == "batching_dims=[]x[]") {
+        if (saw_batching) return false;
+        saw_batching = true;
+      } else if (a == "precision=[DEFAULT,DEFAULT]") {
+        if (saw_precision) return false;
+        saw_precision = true;
+      } else {
+        return false;
+      }
     }
-    if (compact_attrs != "contracting_dims=[1]x[0]" &&
-        compact_attrs != "batching_dims=[]x[],contracting_dims=[1]x[0]" &&
-        compact_attrs != "contracting_dims=[1]x[0],batching_dims=[]x[]") {
-      return false;
-    }
+    if (!saw_contracting) return false;
   } else {
-    if (!attrs.empty()) return false;
+    bool saw_precision = false;
+    for (const auto& a : attr_list) {
+      if (a == "precision=[DEFAULT,DEFAULT]") {
+        if (saw_precision) return false;
+        saw_precision = true;
+      } else {
+        return false;
+      }
+    }
   }
 
   // Validate op type signature: `(tensor<MxKxbf16>, tensor<KxNxbf16>) -> tensor<MxNxbf16>`.
@@ -498,12 +538,30 @@ PJRT_Error* ot_pjrt_event_is_ready(PJRT_Event_IsReady_Args* args) {
   return nullptr;
 }
 
-PJRT_Error* ot_pjrt_event_error(PJRT_Event_Error_Args*) { return nullptr; }
-PJRT_Error* ot_pjrt_event_await(PJRT_Event_Await_Args*) { return nullptr; }
+PJRT_Error* ot_pjrt_event_error(PJRT_Event_Error_Args* args) {
+  if (!args || !args->event) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null event");
+  if (args->event->has_error) {
+    return make_err(args->event->error_code, args->event->error_msg);
+  }
+  return nullptr;
+}
+
+PJRT_Error* ot_pjrt_event_await(PJRT_Event_Await_Args* args) {
+  if (!args || !args->event) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null event");
+  if (args->event->has_error) {
+    return make_err(args->event->error_code, args->event->error_msg);
+  }
+  return nullptr;
+}
 
 PJRT_Error* ot_pjrt_event_on_ready(PJRT_Event_OnReady_Args* args) {
-  if (!args || !args->callback) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null callback");
-  args->callback(nullptr, args->user_arg);
+  if (!args || !args->event || !args->callback) {
+    return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null event or callback");
+  }
+  PJRT_Error* err = args->event->has_error
+                        ? make_err(args->event->error_code, args->event->error_msg)
+                        : nullptr;
+  args->callback(err, args->user_arg);
   return nullptr;
 }
 
@@ -825,6 +883,13 @@ static PJRT_Error* validate_exec_build_options_proto(const uint8_t* p, size_t le
         return make_err(PJRT_Error_Code_INVALID_ARGUMENT,
                         "single-device OpenTPU supports device_ordinal -1 or 0 only");
       }
+    } else if (field == 2 && wire == 2) {
+      uint64_t slen = 0;
+      if (!pb_read_varint(p, len, &pos, &slen) || slen > len - pos) {
+        return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed result_layout");
+      }
+      return make_err(PJRT_Error_Code_UNIMPLEMENTED,
+                      "explicit result_layout is not supported (OpenTPU M4 produces dense row-major only)");
     } else if ((field == 4 || field == 5) && wire == 0) {
       uint64_t v = 0;
       if (!pb_read_varint(p, len, &pos, &v)) {
@@ -834,7 +899,16 @@ static PJRT_Error* validate_exec_build_options_proto(const uint8_t* p, size_t le
         return make_err(PJRT_Error_Code_UNIMPLEMENTED,
                         "single-device OpenTPU supports num_replicas=1 and num_partitions=1 only");
       }
-    } else if (field == 7 && wire == 2) {
+    } else if (field == 7 && wire == 0) {
+      uint64_t auto_spmd = 0;
+      if (!pb_read_varint(p, len, &pos, &auto_spmd)) {
+        return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed use_auto_spmd_partitioning");
+      }
+      if (auto_spmd != 0) {
+        return make_err(PJRT_Error_Code_UNIMPLEMENTED,
+                        "auto-SPMD partitioning is not supported on single-device OpenTPU");
+      }
+    } else if (field == 9 && wire == 2) {
       uint64_t slen = 0;
       if (!pb_read_varint(p, len, &pos, &slen) || slen > len - pos) {
         return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed device_assignment");
@@ -842,6 +916,15 @@ static PJRT_Error* validate_exec_build_options_proto(const uint8_t* p, size_t le
       PJRT_Error* err = validate_device_assignment_proto(p + pos, static_cast<size_t>(slen));
       if (err) return err;
       pos += static_cast<size_t>(slen);
+    } else if (field == 10 && wire == 0) {
+      uint64_t alias_pass = 0;
+      if (!pb_read_varint(p, len, &pos, &alias_pass)) {
+        return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed alias_passthrough_params");
+      }
+      if (alias_pass != 0) {
+        return make_err(PJRT_Error_Code_UNIMPLEMENTED,
+                        "alias_passthrough_params is not supported by OpenTPU M4");
+      }
     } else if (!pb_skip_field(p, len, &pos, wire)) {
       return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed executable_build_options field");
     }
@@ -863,7 +946,14 @@ static PJRT_Error* validate_single_device_compile_options(const char* data, size
     }
     uint32_t field = static_cast<uint32_t>(tag >> 3);
     uint32_t wire = static_cast<uint32_t>(tag & 0x7u);
-    if (field == 2 && wire == 0) {
+    if (field == 1 && wire == 2) {
+      uint64_t slen = 0;
+      if (!pb_read_varint(p, len, &pos, &slen) || slen > len - pos) {
+        return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed argument_layouts");
+      }
+      return make_err(PJRT_Error_Code_UNIMPLEMENTED,
+                      "explicit argument_layouts are not supported (OpenTPU M4 uses dense row-major only)");
+    } else if (field == 2 && wire == 0) {
       uint64_t tupled = 0;
       if (!pb_read_varint(p, len, &pos, &tupled)) {
         return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed parameter_is_tupled_arguments");
@@ -900,6 +990,11 @@ static PJRT_Error* validate_single_device_compile_options(const char* data, size
 PJRT_Error* ot_pjrt_client_compile(PJRT_Client_Compile_Args* args) {
   if (!args || !args->client || !args->program) {
     return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null compile args");
+  }
+  if (!ot_context_is_mock(args->client->ctx)) {
+    return make_err(PJRT_Error_Code_UNIMPLEMENTED,
+                    "OpenTPU M4 live-VFIO MXU execution is not yet available "
+                    "(standalone clean-room IMEM boot stub pending); compile supported in mock mode only");
   }
   if (PJRT_Error* opt_err = validate_single_device_compile_options(args->compile_options,
                                                                    args->compile_options_size)) {
@@ -940,6 +1035,25 @@ PJRT_Error* ot_pjrt_client_compile(PJRT_Client_Compile_Args* args) {
 
 PJRT_Error* ot_pjrt_buffer_from_host_buffer(PJRT_Client_BufferFromHostBuffer_Args* args) {
   if (!args || !args->client) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null args");
+
+  // Per PJRT contract, non-null `memory` takes precedence over `device`.
+  PJRT_Device* target_device = nullptr;
+  if (args->memory) {
+    if (args->memory != &args->client->device.mem.base) {
+      return make_err(PJRT_Error_Code_INVALID_ARGUMENT,
+                      "destination memory does not belong to this client");
+    }
+    target_device = &args->client->device;
+  } else if (args->device) {
+    if (args->device != &args->client->device) {
+      return make_err(PJRT_Error_Code_INVALID_ARGUMENT,
+                      "destination device does not belong to this client");
+    }
+    target_device = &args->client->device;
+  } else {
+    target_device = &args->client->device;
+  }
+
   if (args->num_dims > 0 && !args->dims) {
     return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null dims");
   }
@@ -1004,7 +1118,7 @@ PJRT_Error* ot_pjrt_buffer_from_host_buffer(PJRT_Client_BufferFromHostBuffer_Arg
     return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, "out of memory");
   }
   buf->ctx = args->client->ctx;
-  buf->device = args->device ? args->device : &args->client->device;
+  buf->device = target_device;
   buf->ot_buf = ot_buf;
   buf->logical_bytes = logical_bytes;
   buf->dtype = args->type;
@@ -1014,7 +1128,7 @@ PJRT_Error* ot_pjrt_buffer_from_host_buffer(PJRT_Client_BufferFromHostBuffer_Arg
   }
 
   args->buffer = buf;
-  args->done_with_host_buffer = new (std::nothrow) PJRT_Event{true};
+  args->done_with_host_buffer = new (std::nothrow) PJRT_Event();
   return nullptr;
 }
 
@@ -1342,7 +1456,9 @@ PJRT_Error* ot_pjrt_lexec_execute(PJRT_LoadedExecutable_Execute_Args* args) {
                       le->exec.m_dim, le->exec.k_dim, le->exec.n_dim);
   if (st != OT_OK) {
     ot_buffer_free(ot_out);
-    return make_err(PJRT_Error_Code_INTERNAL, ot_status_string(st));
+    PJRT_Error_Code code =
+        (st == OT_ERR_UNSUPPORTED) ? PJRT_Error_Code_UNIMPLEMENTED : PJRT_Error_Code_INTERNAL;
+    return make_err(code, ot_status_string(st));
   }
 
   auto* out_buf = new (std::nothrow) PJRT_Buffer();
@@ -1360,7 +1476,7 @@ PJRT_Error* ot_pjrt_lexec_execute(PJRT_LoadedExecutable_Execute_Args* args) {
 
   args->output_lists[0][0] = out_buf;
   if (args->device_complete_events) {
-    args->device_complete_events[0] = new (std::nothrow) PJRT_Event{true};
+    args->device_complete_events[0] = new (std::nothrow) PJRT_Event();
   }
   return nullptr;
 }
@@ -1482,7 +1598,7 @@ PJRT_Error* ot_pjrt_buf_to_host(PJRT_Buffer_ToHostBuffer_Args* args) {
     ot_status_t st = ot_buffer_d2h(args->src->ctx, args->src->ot_buf, args->dst, need);
     if (st != OT_OK) return make_err(PJRT_Error_Code_INTERNAL, ot_status_string(st));
   }
-  args->event = new (std::nothrow) PJRT_Event{true};
+  args->event = new (std::nothrow) PJRT_Event();
   return nullptr;
 }
 
@@ -1493,8 +1609,16 @@ PJRT_Error* ot_pjrt_buf_is_on_cpu(PJRT_Buffer_IsOnCpu_Args* args) {
 }
 
 PJRT_Error* ot_pjrt_buf_ready_event(PJRT_Buffer_ReadyEvent_Args* args) {
-  if (!args) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null");
-  args->event = new (std::nothrow) PJRT_Event{true};
+  if (!args || !args->buffer) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null buffer");
+  auto* ev = new (std::nothrow) PJRT_Event();
+  if (!ev) return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, "out of memory");
+  ev->ready = true;
+  if (args->buffer->deleted || !args->buffer->ot_buf) {
+    ev->has_error = true;
+    ev->error_code = PJRT_Error_Code_INVALID_ARGUMENT;
+    ev->error_msg = "buffer has been deleted";
+  }
+  args->event = ev;
   return nullptr;
 }
 

@@ -300,6 +300,10 @@ static void test_pjrt_api_mock() {
     const char opt_part2[] = {0x1a, 0x02, 0x28, 0x02};
     // field 3 (exec_build_options): field 1 (device_ordinal=1)
     const char opt_ord1[] = {0x1a, 0x02, 0x08, 0x01};
+    // field 3 (exec_build_options): field 2 (result_layout = non-empty ShapeProto)
+    const char opt_res_layout[] = {0x1a, 0x04, 0x12, 0x02, 0x08, 0x01};
+    // field 3 (exec_build_options): field 9 (device_assignment: 1x1 targeting device 1)
+    const char opt_da_dev1[] = {0x1a, 0x0a, 0x4a, 0x08, 0x08, 0x01, 0x10, 0x01, 0x1a, 0x02, 0x08, 0x01};
     // field 2 (parameter_is_tupled_arguments=1)
     const char opt_tupled[] = {0x10, 0x01};
     // malformed truncated varint
@@ -321,11 +325,57 @@ static void test_pjrt_api_mock() {
     expect_compile_fail(opt_rep2, sizeof(opt_rep2), PJRT_Error_Code_UNIMPLEMENTED);
     expect_compile_fail(opt_part2, sizeof(opt_part2), PJRT_Error_Code_UNIMPLEMENTED);
     expect_compile_fail(opt_ord1, sizeof(opt_ord1), PJRT_Error_Code_INVALID_ARGUMENT);
+    expect_compile_fail(opt_res_layout, sizeof(opt_res_layout), PJRT_Error_Code_UNIMPLEMENTED);
+    expect_compile_fail(opt_da_dev1, sizeof(opt_da_dev1), PJRT_Error_Code_UNIMPLEMENTED);
     expect_compile_fail(opt_tupled, sizeof(opt_tupled), PJRT_Error_Code_UNIMPLEMENTED);
     expect_compile_fail(opt_bad, sizeof(opt_bad), PJRT_Error_Code_INVALID_ARGUMENT);
   }
-  // Valid 1x1 compile_options must succeed.
-  const char opt_1x1[] = {0x1a, 0x06, 0x20, 0x01, 0x28, 0x01, 0x30, 0x01};
+
+  // Explicit precision = [DEFAULT, DEFAULT] must be accepted; HIGH precision rejected.
+  {
+    const char* mlir_default_prec =
+        "module {\n"
+        "  func.func @main(%a: tensor<128x128xbf16>, %b: tensor<128x128xbf16>) -> tensor<128x128xbf16> {\n"
+        "    %0 = stablehlo.dot_general %a, %b, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<128x128xbf16>, tensor<128x128xbf16>) -> tensor<128x128xbf16>\n"
+        "    return %0 : tensor<128x128xbf16>\n"
+        "  }\n"
+        "}\n";
+    PJRT_Program p_def = prog;
+    p_def.code = const_cast<char*>(mlir_default_prec);
+    p_def.code_size = std::strlen(mlir_default_prec);
+    PJRT_Client_Compile_Args ca_def = {};
+    ca_def.struct_size = PJRT_Client_Compile_Args_STRUCT_SIZE;
+    ca_def.client = cc.client;
+    ca_def.program = &p_def;
+    OT_CHECK(api->PJRT_Client_Compile(&ca_def) == nullptr);
+    OT_CHECK(ca_def.executable != nullptr);
+    PJRT_LoadedExecutable_Destroy_Args led = {};
+    led.struct_size = PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
+    led.executable = ca_def.executable;
+    OT_CHECK(api->PJRT_LoadedExecutable_Destroy(&led) == nullptr);
+
+    const char* mlir_high_prec =
+        "module {\n"
+        "  func.func @main(%a: tensor<128x128xbf16>, %b: tensor<128x128xbf16>) -> tensor<128x128xbf16> {\n"
+        "    %0 = stablehlo.dot_general %a, %b, contracting_dims = [1] x [0], precision = [HIGH, HIGH] : (tensor<128x128xbf16>, tensor<128x128xbf16>) -> tensor<128x128xbf16>\n"
+        "    return %0 : tensor<128x128xbf16>\n"
+        "  }\n"
+        "}\n";
+    PJRT_Program p_hi = prog;
+    p_hi.code = const_cast<char*>(mlir_high_prec);
+    p_hi.code_size = std::strlen(mlir_high_prec);
+    PJRT_Client_Compile_Args ca_hi = {};
+    ca_hi.struct_size = PJRT_Client_Compile_Args_STRUCT_SIZE;
+    ca_hi.client = cc.client;
+    ca_hi.program = &p_hi;
+    PJRT_Error* hi_err = api->PJRT_Client_Compile(&ca_hi);
+    OT_CHECK(hi_err != nullptr);
+    destroy_pjrt_error(api, hi_err);
+  }
+
+  // Valid 1x1 compile_options (including field 9 device_assignment for device 0) must succeed.
+  const char opt_1x1[] = {0x1a, 0x10, 0x20, 0x01, 0x28, 0x01, 0x30, 0x01,
+                          0x4a, 0x08, 0x08, 0x01, 0x10, 0x01, 0x1a, 0x02, 0x08, 0x00};
   ca.compile_options = opt_1x1;
   ca.compile_options_size = sizeof(opt_1x1);
   OT_CHECK(api->PJRT_Client_Compile(&ca) == nullptr);
@@ -527,6 +577,85 @@ static void test_pjrt_api_mock() {
   }
   OT_CHECK(api->PJRT_Device_MemoryStats(&ms) == nullptr);
   OT_CHECK(ms.bytes_in_use == 0);
+
+  // ReadyEvent on a deleted buffer must report an immediate error through Event_Error/Await/OnReady.
+  {
+    PJRT_Buffer_ReadyEvent_Args re = {};
+    re.struct_size = PJRT_Buffer_ReadyEvent_Args_STRUCT_SIZE;
+    re.buffer = st_up.buffer;
+    OT_CHECK(api->PJRT_Buffer_ReadyEvent(&re) == nullptr);
+    OT_CHECK(re.event != nullptr);
+    PJRT_Event_Error_Args ee = {};
+    ee.struct_size = PJRT_Event_Error_Args_STRUCT_SIZE;
+    ee.event = re.event;
+    PJRT_Error* ev_err = api->PJRT_Event_Error(&ee);
+    OT_CHECK(ev_err != nullptr);
+    destroy_pjrt_error(api, ev_err);
+    PJRT_Event_Await_Args ea = {};
+    ea.struct_size = PJRT_Event_Await_Args_STRUCT_SIZE;
+    ea.event = re.event;
+    PJRT_Error* aw_err = api->PJRT_Event_Await(&ea);
+    OT_CHECK(aw_err != nullptr);
+    destroy_pjrt_error(api, aw_err);
+    PJRT_Event_Destroy_Args ed = {};
+    ed.struct_size = PJRT_Event_Destroy_Args_STRUCT_SIZE;
+    ed.event = re.event;
+    OT_CHECK(api->PJRT_Event_Destroy(&ed) == nullptr);
+  }
+
+  // Non-null `memory` takes precedence over `device`, and foreign device/memory must be rejected.
+  {
+    PJRT_Client_Create_Args cc2 = {};
+    cc2.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
+    OT_CHECK(api->PJRT_Client_Create(&cc2) == nullptr);
+    PJRT_Client_AddressableDevices_Args ad2 = {};
+    ad2.struct_size = PJRT_Client_AddressableDevices_Args_STRUCT_SIZE;
+    ad2.client = cc2.client;
+    OT_CHECK(api->PJRT_Client_AddressableDevices(&ad2) == nullptr);
+    PJRT_Device_DefaultMemory_Args dm1 = {};
+    dm1.struct_size = PJRT_Device_DefaultMemory_Args_STRUCT_SIZE;
+    dm1.device = ad.addressable_devices[0];
+    OT_CHECK(api->PJRT_Device_DefaultMemory(&dm1) == nullptr);
+
+    // Foreign device without memory -> rejected.
+    PJRT_Client_BufferFromHostBuffer_Args fdev = {};
+    fdev.struct_size = PJRT_Client_BufferFromHostBuffer_Args_STRUCT_SIZE;
+    fdev.client = cc.client;
+    fdev.data = raw_2x2;
+    fdev.type = PJRT_Buffer_Type_BF16;
+    fdev.dims = sdims;
+    fdev.num_dims = 2;
+    fdev.host_buffer_semantics = PJRT_HostBufferSemantics_kImmutableUntilTransferCompletes;
+    fdev.device = ad2.addressable_devices[0];
+    PJRT_Error* fd_err = api->PJRT_Client_BufferFromHostBuffer(&fdev);
+    OT_CHECK(fd_err != nullptr);
+    destroy_pjrt_error(api, fd_err);
+
+    // Client's own memory + foreign device -> memory wins and buffer records client 1's device.
+    fdev.memory = dm1.memory;
+    OT_CHECK(api->PJRT_Client_BufferFromHostBuffer(&fdev) == nullptr);
+    PJRT_Buffer_Device_Args bdev = {};
+    bdev.struct_size = PJRT_Buffer_Device_Args_STRUCT_SIZE;
+    bdev.buffer = fdev.buffer;
+    OT_CHECK(api->PJRT_Buffer_Device(&bdev) == nullptr);
+    OT_CHECK(bdev.device == ad.addressable_devices[0]);
+    if (fdev.done_with_host_buffer) {
+      PJRT_Event_Destroy_Args ed = {};
+      ed.struct_size = PJRT_Event_Destroy_Args_STRUCT_SIZE;
+      ed.event = fdev.done_with_host_buffer;
+      OT_CHECK(api->PJRT_Event_Destroy(&ed) == nullptr);
+    }
+    PJRT_Buffer_Destroy_Args bd = {};
+    bd.struct_size = PJRT_Buffer_Destroy_Args_STRUCT_SIZE;
+    bd.buffer = fdev.buffer;
+    OT_CHECK(api->PJRT_Buffer_Destroy(&bd) == nullptr);
+
+    PJRT_Client_Destroy_Args cd2 = {};
+    cd2.struct_size = PJRT_Client_Destroy_Args_STRUCT_SIZE;
+    cd2.client = cc2.client;
+    OT_CHECK(api->PJRT_Client_Destroy(&cd2) == nullptr);
+  }
+
   for (PJRT_Buffer* b : {st_up.buffer, rev_up.buffer}) {
     PJRT_Buffer_Destroy_Args bd = {};
     bd.struct_size = PJRT_Buffer_Destroy_Args_STRUCT_SIZE;
