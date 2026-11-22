@@ -1212,7 +1212,10 @@ int run_test_quant_batch(int iters, int perf_mode, const char* dive_interp_path,
     double e_v = nmse_vs_ref(a, dv, cv, M, K, Nkv, OB_ACT_NONE);
     double max_e = std::max(e_q, std::max(e_k, e_v));
     bool ok = (st == OB_OK) && (s_warm.tiles_dispatched == exp_qkv_tiles) &&
-              (s_warm.cache_hits == exp_qkv_tiles) && (max_e < 1.5e-3);
+              (s_warm.cache_hits == exp_qkv_tiles) &&
+              std::isfinite(e_q) && (e_q < 1.5e-3) &&
+              std::isfinite(e_k) && (e_k < 1.5e-3) &&
+              std::isfinite(e_v) && (e_v < 1.5e-3);
     if (!ok) all_ok = false;
     std::printf("quant_batch[q4_qkv_1x576]: ok=%d pm=%u wl=%d tiles=%u hits=%u cold_us=%llu warm_hw_us=%llu warm_wall_us=%llu max_nmse=%.2e\n",
                 ok ? 1 : 0, ctx->cfg.perf_mode, ctx->fw_wakelock_held ? 1 : 0,
@@ -1251,7 +1254,10 @@ int run_test_quant_batch(int iters, int perf_mode, const char* dive_interp_path,
     double e_v = nmse_vs_ref(a, dv, cv, M, K, Nkv, OB_ACT_NONE);
     double max_e = std::max(e_q, std::max(e_k, e_v));
     bool ok = (st == OB_OK) && (s_warm.tiles_dispatched == exp_qkv_tiles) &&
-              (s_warm.cache_hits == exp_qkv_tiles) && (max_e < 1.5e-3);
+              (s_warm.cache_hits == exp_qkv_tiles) &&
+              std::isfinite(e_q) && (e_q < 1.5e-3) &&
+              std::isfinite(e_k) && (e_k < 1.5e-3) &&
+              std::isfinite(e_v) && (e_v < 1.5e-3);
     if (!ok) all_ok = false;
     std::printf("quant_batch[q8_qkv_1x1536]: ok=%d pm=%u wl=%d tiles=%u hits=%u cold_us=%llu warm_hw_us=%llu warm_wall_us=%llu max_nmse=%.2e\n",
                 ok ? 1 : 0, ctx->cfg.perf_mode, ctx->fw_wakelock_held ? 1 : 0,
@@ -1292,7 +1298,10 @@ int run_test_quant_batch(int iters, int perf_mode, const char* dive_interp_path,
     double e_v = nmse_vs_ref(a, dv, cv, M, K, Nkv, OB_ACT_NONE);
     double max_e = std::max(e_q, std::max(e_k, e_v));
     bool ok = (st == OB_OK) && (s_warm.tiles_dispatched == exp_qkv_tiles) &&
-              (s_warm.cache_hits == exp_qkv_tiles) && (max_e < 2.0e-3);
+              (s_warm.cache_hits == exp_qkv_tiles) &&
+              std::isfinite(e_q) && (e_q < 2.0e-3) &&
+              std::isfinite(e_k) && (e_k < 2.0e-3) &&
+              std::isfinite(e_v) && (e_v < 2.0e-3);
     if (!ok) all_ok = false;
     std::printf("quant_batch[q4_qkv_64x576]: ok=%d pm=%u wl=%d tiles=%u hits=%u cold_us=%llu warm_hw_us=%llu warm_wall_us=%llu max_nmse=%.2e\n",
                 ok ? 1 : 0, ctx->cfg.perf_mode, ctx->fw_wakelock_held ? 1 : 0,
@@ -1329,7 +1338,9 @@ int run_test_quant_batch(int iters, int perf_mode, const char* dive_interp_path,
     double e_u = nmse_vs_ref(a, du, cu, M, K, N, OB_ACT_NONE);
     double max_e = std::max(e_g, e_u);
     bool ok = (st == OB_OK) && (s_warm.tiles_dispatched == 2u) &&
-              (s_warm.cache_hits == 2u) && (max_e < 2.0e-3);
+              (s_warm.cache_hits == 2u) &&
+              std::isfinite(e_g) && (e_g < 2.0e-3) &&
+              std::isfinite(e_u) && (e_u < 2.0e-3);
     if (!ok) all_ok = false;
     std::printf("quant_batch[q4_gate_up_64x576x1536]: ok=%d pm=%u wl=%d tiles=%u hits=%u cold_us=%llu warm_hw_us=%llu warm_wall_us=%llu max_nmse=%.2e\n",
                 ok ? 1 : 0, ctx->cfg.perf_mode, ctx->fw_wakelock_held ? 1 : 0,
@@ -1391,7 +1402,8 @@ int run_test_swiglu(int iters, int perf_mode, const char* dive_interp_path,
     return 1;
   }
   if (profile) ob_context_set_profile(ctx, 1);
-  // Enable opt-in M=64 SwiGLU chaining inside --test-swiglu so both M=1 and M=64 shapes are verified
+  // Enable opt-in fast SwiGLU chaining + M=64 prefill inside --test-swiglu so M=1 and M=64 shapes are verified
+  ctx->swiglu_fast_chain_enabled = true;
   ctx->swiglu_prefill_enabled = true;
   st = ob_gemm_register_builtin_emitter(ctx, dive_interp_path);
   if (st != OB_OK) {
@@ -1451,6 +1463,7 @@ int run_test_swiglu(int iters, int perf_mode, const char* dive_interp_path,
 
     ob_invoke_stats_t sc{}, sw{};
     st = ob_gemm_swiglu_int8(ctx, x.data(), &d, y.data(), &sc);
+    if (profile) ob_context_reset_profile(ctx);
     for (int it = 0; st == OB_OK && it < std::max(1, iters); ++it) {
       st = ob_gemm_swiglu_int8(ctx, x.data(), &d, y.data(), &sw);
     }
@@ -1460,14 +1473,25 @@ int run_test_swiglu(int iters, int perf_mode, const char* dive_interp_path,
       int e = std::abs(static_cast<int>(y[i]) - static_cast<int>(y_ref[i]));
       if (e > max_err) max_err = e;
     }
-    bool ok = (st == OB_OK) && (max_err == 0);
+    const bool stats_ok = (sc.tiles_dispatched == 1u) && (sw.tiles_dispatched == 1u) &&
+                          ((sc.flags & OB_STAT_FLAG_EMITTER_USED) != 0u) &&
+                          ((sw.flags & OB_STAT_FLAG_EMITTER_USED) != 0u) &&
+                          ((sc.flags & OB_STAT_FLAG_CPU_FALLBACK) == 0u) &&
+                          ((sw.flags & OB_STAT_FLAG_CPU_FALLBACK) == 0u) &&
+                          (sw.cache_hits == 1u) &&
+                          (ctx->mock_mode ||
+                           (((sc.flags & OB_STAT_FLAG_MOCK) == 0u) &&
+                            ((sw.flags & OB_STAT_FLAG_MOCK) == 0u)));
+    bool ok = (st == OB_OK) && (max_err == 0) && stats_ok;
     if (!ok) all_ok = false;
-    std::printf("swiglu[%s]: ok=%d pm=%u wl=%d max_abs_err=%d cold_us=%llu warm_hw_us=%llu warm_wall_us=%llu\n",
+    std::printf("swiglu[%s]: ok=%d pm=%u wl=%d tiles=%u/%u hits=%u flags=0x%x max_abs_err=%d cold_us=%llu warm_hw_us=%llu warm_wall_us=%llu\n",
                 c.label, ok ? 1 : 0, ctx->cfg.perf_mode, ctx->fw_wakelock_held ? 1 : 0,
+                sc.tiles_dispatched, sw.tiles_dispatched, sw.cache_hits, sw.flags,
                 max_err,
                 static_cast<unsigned long long>(sc.wall_time_us),
                 static_cast<unsigned long long>(sw.hw_execution_us),
                 static_cast<unsigned long long>(sw.wall_time_us));
+    if (profile) print_profile_line(c.label, ctx);
   }
 
   // Part B: End-to-end FP32 Q8_0 / Q4_0 ob_gemm_swiglu_f32_quant live NMSE & latency
@@ -1602,13 +1626,27 @@ int run_test_swiglu(int iters, int perf_mode, const char* dive_interp_path,
     ob_invoke_stats_t sc{}, sw{};
     st = ob_gemm_swiglu_f32_quant(ctx, a.data(), &sd, c_out.data(), &sc);
     if (profile) ob_context_reset_profile(ctx);
-    for (int it = 0; st == OB_OK && it < std::max(1, iters); ++it) {
+    ob_profile_stats_t p0{}, p1{};
+    (void)ob_context_get_profile(ctx, &p0);
+    const int warm_iters = std::max(1, iters);
+    for (int it = 0; st == OB_OK && it < warm_iters; ++it) {
       st = ob_gemm_swiglu_f32_quant(ctx, a.data(), &sd, c_out.data(), &sw);
     }
+    (void)ob_context_get_profile(ctx, &p1);
+    const uint64_t d_chained = p1.swiglu_chunks_chained - p0.swiglu_chunks_chained;
+    const uint64_t d_fb = p1.swiglu_fallbacks - p0.swiglu_fallbacks;
     double nmse = swiglu_ref_nmse(a, gd, ud, dd, c_out, fc.M, fc.K, fc.H, fc.N);
+    const bool expect_chained = !(fc.is_q4 != 0u && fc.M > 8u);
     bool ok = (st == OB_OK) &&
-              (sw.tiles_dispatched == fc.exp_chunks) &&
-              (sw.cache_hits == fc.exp_chunks) &&
+              (expect_chained
+                   ? (sw.tiles_dispatched == fc.exp_chunks &&
+                      sw.cache_hits == fc.exp_chunks &&
+                      d_chained == static_cast<uint64_t>(warm_iters) * fc.exp_chunks &&
+                      d_fb == 0u)
+                   : (sw.tiles_dispatched > 0u &&
+                      sw.cache_hits == sw.tiles_dispatched &&
+                      d_chained == 0u &&
+                      d_fb == static_cast<uint64_t>(warm_iters))) &&
               (nmse < 3.5e-3);
     if (!ok) all_ok = false;
     std::printf("swiglu[%s]: ok=%d pm=%u wl=%d chunks=%u hits=%u cold_us=%llu warm_hw_us=%llu warm_wall_us=%llu nmse=%.2e\n",

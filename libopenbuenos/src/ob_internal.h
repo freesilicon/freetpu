@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <initializer_list>
 #include <list>
 #include <mutex>
 #include <pthread.h>
@@ -219,6 +220,7 @@ struct CreditSlot {
     FAILED = 3
   };
   State state = FREE;
+  bool abandoned = false;
   ob_exec_handle_t handle = 0;
   uint32_t seq = 0;
   CachedGraph* graph_entry = nullptr;
@@ -229,6 +231,7 @@ struct CreditSlot {
   uint16_t vii_resp_code = 0;
   ob_status_t error_status = OB_OK;
   std::string error_msg;
+  std::vector<ob_buffer*> retired_bufs;
 };
 
 // Device & VII mailbox helpers (implemented in ob_device.cpp)
@@ -265,8 +268,13 @@ bool        device_try_wait_handle(ob_context* ctx,
                                    ob_invoke_stats_t* out_stats);
 
 ob_status_t device_wait_all(ob_context* ctx, uint32_t timeout_ms);
+bool        device_attach_inflight_buffers(ob_context* ctx,
+                                           ob_exec_handle_t handle,
+                                           std::initializer_list<ob_buffer*> bufs);
 
 // Buffer pool helpers (implemented in ob_buffer_pool.cpp)
+size_t buffer_slab_size(size_t requested);
+void buffer_retain(ob_buffer* buf);
 void buffer_destroy_slab(ob_context* ctx, PooledSlab* slab);
 void buffer_pool_clear(ob_context* ctx);
 ob_status_t buffer_sync_begin_read(ob_buffer* buf);
@@ -307,9 +315,30 @@ ob_status_t graph_submit_async_with_params(ob_graph_t* graph,
                                            const ob_buffer* override_params,
                                            ob_exec_handle_t* out_handle);
 
+// 128-bit weight tile key (eliminates 64-bit collision risk while holding O(1) lookup).
+struct WeightTileKey {
+  uint64_t h1 = 0;
+  uint64_t h2 = 0;
+  uint64_t bytes = 0;
+
+  bool operator==(const WeightTileKey& o) const {
+    return h1 == o.h1 && h2 == o.h2 && bytes == o.bytes;
+  }
+};
+
+struct WeightTileKeyHash {
+  size_t operator()(const WeightTileKey& k) const noexcept {
+    uint64_t x = k.h1 ^ (k.h2 * 0x9e3779b97f4a7c15ULL) ^ (k.bytes * 0xbf58476d1ce4e5b9ULL);
+    x ^= (x >> 30);
+    x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= (x >> 27);
+    return static_cast<size_t>(x);
+  }
+};
+
 // Cached packed ext[2] weight tile (pinned in DMA-BUF, independent of model_handle).
 struct CachedWeightTile {
-  uint64_t key = 0;
+  WeightTileKey key{};
   uint32_t scale_d = 1;
   uint32_t hw_k = 0;
   uint32_t hw_n = 0;
@@ -329,14 +358,20 @@ struct CachedWeightTile {
   float swiglu_l2_down_max = 0.0f;
   float swiglu_dc_gate_max = 0.0f;
   float swiglu_dc_up_max = 0.0f;
+  float swiglu_l1_gate_max = 0.0f;
+  float swiglu_linf_gate_max = 0.0f;
+  float swiglu_l1_up_max = 0.0f;
+  float swiglu_linf_up_max = 0.0f;
   uint32_t swiglu_d_gate = 0;
   uint32_t swiglu_d_up = 0;
   uint32_t swiglu_d_mul = 0;
   uint32_t swiglu_d_down = 0;
   std::list<CachedWeightTile*>::iterator lru_it;
   uint64_t in_use = 0;
+  bool in_cache = false;
   bool rejected_fusion = false; // O(1) cached split decision when fused D spread > 1.5x
   bool rejected_swiglu = false; // O(1) cached fallback when W_gate row-scale spread is extreme
+  bool swiglu_norms_only = false; // O(1) cached weight norms (0 B DMA) when activation guard rejects before packing
 };
 
 // Built-in nanosecond stage profiler accumulators (zero clock_gettime when profile_enabled=false).
@@ -522,10 +557,24 @@ ob_status_t build_swiglu_dgc0(const ob_swiglu_int8_desc_t& desc,
                               SwigluSynthResult* out_parts,
                               std::string* err);
 
+// Validate SwiGLU quantization scales and compute FP32 hardware multipliers using double
+// intermediates to avoid intermediate overflow. Returns false if any scale, multiplier,
+// or scaled SiLU spline coefficient is non-finite or non-positive.
+bool compute_swiglu_hw_multipliers(const ob_swiglu_int8_desc_t& desc,
+                                   float* out_m_gate,
+                                   float* out_m_up,
+                                   float* out_m_mul,
+                                   float* out_m_down);
+
 // Exact FP32-RNE Horner SwiGLU hardware simulator (matches rango silicon max_abs_err=0).
 void simulate_swiglu_hw_exact(const int8_t* x_mk,
                               const ob_swiglu_int8_desc_t& desc,
                               int8_t* y_mn);
+
+// Evaluate exact TPU piecewise-Horner SiLU on quantized gate code q_g in [-128, 127],
+// returning quantized INT8 code q_silu in [-128, 127] matching simulate_swiglu_hw_exact.
+int32_t eval_swiglu_silu_q(int32_t q_g, float s_gate);
+void build_swiglu_silu_lut(float s_gate, int8_t out_lut[256]);
 
 // RMS-calibrated 3-stage divider selection for chained SwiGLU (ob_gemm.cpp).
 void compute_swiglu_stage_dividers(uint32_t m_dim,
@@ -544,6 +593,13 @@ ob_status_t builtin_gemm_emitter_cb(const ob_gemm_desc_t* desc,
                                     size_t* out_size,
                                     void* user_data);
 
+struct ImmutableWeightRegion {
+  uintptr_t begin = 0u;
+  uintptr_t end = 0u;
+  uint64_t version = 0u;
+  uint64_t generation = 0u;
+};
+
 void set_last_error(ob_context* ctx, const std::string& msg);
 
 }  // namespace ob
@@ -553,6 +609,7 @@ struct ob_buffer {
   ob::PooledSlab slab{};
   size_t requested_size = 0;
   uint32_t flags = 0;
+  std::atomic<uint32_t> refcnt{1u};
 };
 
 struct ob_graph {
@@ -586,6 +643,7 @@ struct ob_context {
   bool batched_large_tiles_enabled = true;
   bool horiz_fusion_enabled = true;
   bool swiglu_chain_enabled = true;
+  bool swiglu_fast_chain_enabled = false;
   bool swiglu_prefill_enabled = false;
   float swiglu_max_crest = 16.0f;
   uint32_t param_swap_slots = 1u;
@@ -657,14 +715,17 @@ struct ob_context {
   std::array<ob_buffer*, OB_MAX_CREDITS> gemm_out_bufs_4k{};
 
   // Persistent packed ext[2] weight tile DMA-BUF LRU cache (Probe-A dynamic param_slice)
-  std::unordered_map<uint64_t, ob::CachedWeightTile*> weight_cache_map;
+  std::unordered_map<ob::WeightTileKey, ob::CachedWeightTile*, ob::WeightTileKeyHash> weight_cache_map;
   std::list<ob::CachedWeightTile*> weight_cache_lru;
   size_t weight_cache_bytes = 0;
   size_t weight_cache_peak_bytes = 0;
   size_t weight_cache_max_bytes = 0;   // lazily initialized (min(2048 MiB, MemAvailable/3) on Android)
   size_t weight_cache_max_entries = 0; // FD-safe cap (default 4096, env OPENBUENOS_WEIGHT_CACHE_ENTRIES)
   size_t outlier_cache_bytes = 0;      // Separate tracked total of cached FP32 outlier columns
+  std::vector<ob::ImmutableWeightRegion> immutable_weight_regions;
+  uint64_t next_immutable_region_gen = 1u;
   size_t simulated_mem_available_bytes = 0; // Optional test override for LMKD budget verification
+  bool simulated_mem_available_set = false; // Allows explicitly simulating MemAvailable == 0 kB
   uint64_t weight_cache_hits = 0;
   uint64_t weight_cache_misses = 0;
   uint64_t weight_cache_evictions = 0;

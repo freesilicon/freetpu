@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cfenv>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -5604,16 +5605,36 @@ constexpr float kSwigluSiluUnitCoeffs[8][5] = {
     {0.0f, 1.0f, 0.0f, 0.0f, 0.0f},
 };
 
-inline int32_t rne_i32_exact(float x) {
-  // IEEE-754 round-to-nearest-even matching TPU hardware & numpy.rint
-  return static_cast<int32_t>(std::nearbyint(x));
+inline int32_t quant_clip_i8_f32(float x) {
+  // Exact IEEE-754 round-to-nearest-even independent of the calling thread's FP rounding mode,
+  // clamped NaN-safely before casting to int32_t so |x| >= 2^31 cannot overflow INT32.
+  if (!(x >= -128.0f)) return -128;
+  if (x >= 127.0f) return 127;
+  const double d = static_cast<double>(x);
+  const double lo = std::floor(d);
+  const double frac = d - lo;
+  int32_t q = static_cast<int32_t>(lo);
+  if (frac > 0.5 || (frac == 0.5 && (q & 1) != 0)) {
+    q += 1;
+  }
+  if (q < -128) return -128;
+  if (q > 127) return 127;
+  return q;
 }
 
-inline int32_t clip_i8_i32(int32_t v) {
-  if (v < -128) return -128;
-  if (v > 127) return 127;
-  return v;
-}
+struct ScopedFeTonearest {
+  int prev_mode = FE_TONEAREST;
+  bool changed = false;
+  ScopedFeTonearest() {
+    prev_mode = std::fegetround();
+    if (prev_mode >= 0 && prev_mode != FE_TONEAREST) {
+      if (std::fesetround(FE_TONEAREST) == 0) changed = true;
+    }
+  }
+  ~ScopedFeTonearest() {
+    if (changed) (void)std::fesetround(prev_mode);
+  }
+};
 
 void apply_scale_clip_csrs(CsrBank* bank, float real_mul, float fmax = 127.0f, float fmin = -128.0f) {
   const uint32_t u_rm = fp32_bits_f(real_mul);
@@ -5703,13 +5724,15 @@ Pkt build_op20_from_csrs(uint32_t op, uint32_t mask, const CsrBank& csrs,
 }
 
 Pkt build_op640_silu(uint32_t mask, float s_silu) {
+  ScopedFeTonearest fe_guard;
   std::vector<uint8_t> raw(208u, 0u);
   const uint64_t lo0 = ((static_cast<uint64_t>(mask) & 0xFFFFULL) << 12) | 0x640ULL;
   std::memcpy(raw.data(), &lo0, 8u);
   uint32_t idx = 0u;
   for (int s = 0; s < 8; ++s) {
     for (int k = 0; k < 5; ++k, ++idx) {
-      const float c = kSwigluSiluUnitCoeffs[s][k] / s_silu;
+      const float c = static_cast<float>(
+          static_cast<double>(kSwigluSiluUnitCoeffs[s][k]) / static_cast<double>(s_silu));
       set_bits_le(raw.data(), raw.size(), 76u + 32u * idx, 32u, fp32_bits_f(c));
     }
   }
@@ -6048,10 +6071,8 @@ void synthesize_swiglu_1x_chunks(uint32_t K, uint32_t H, uint32_t N,
   const uint32_t sw_out = sw_h;
   const uint32_t sram_out = sw_out * 128u;
 
-  const float m_gate = (d.s_in * d.s_wg) / d.s_gate;
-  const float m_up = (d.s_in * d.s_wu) / d.s_up;
-  const float m_mul = (d.s_silu * d.s_up) / d.s_prod;
-  const float m_down = (d.s_prod * d.s_wd) / d.s_out;
+  float m_gate = 0.0f, m_up = 0.0f, m_mul = 0.0f, m_down = 0.0f;
+  (void)compute_swiglu_hw_multipliers(d, &m_gate, &m_up, &m_mul, &m_down);
   const bool fast_kh = (k_cores == h_cores);
   const bool fast_hn = (h_cores == n_cores);
   const bool is_big_1536 = (h_iters == 3u);
@@ -6755,10 +6776,8 @@ void synthesize_swiglu_64x_chunks(uint32_t K, uint32_t H, uint32_t N,
   const uint32_t buf_out = buf_in;
   const uint32_t buf_scatter = buf_gate;
 
-  const float m_gate = (d.s_in * d.s_wg) / d.s_gate;
-  const float m_up = (d.s_in * d.s_wu) / d.s_up;
-  const float m_mul = (d.s_silu * d.s_up) / d.s_prod;
-  const float m_down = (d.s_prod * d.s_wd) / d.s_out;
+  float m_gate = 0.0f, m_up = 0.0f, m_mul = 0.0f, m_down = 0.0f;
+  (void)compute_swiglu_hw_multipliers(d, &m_gate, &m_up, &m_mul, &m_down);
 
   (*out_chunks)[0] = build_chunk0();
   (*out_chunks)[1] = build_chunk1_m64(64u, K);
@@ -7337,15 +7356,14 @@ std::vector<uint8_t> pack_ext2_for_swiglu(uint32_t M, uint32_t K, uint32_t H, ui
 ob_status_t synthesize_swiglu_parts(const ob_swiglu_int8_desc_t& desc,
                                     SwigluSynthResult* out,
                                     std::string* err) {
+  ScopedFeTonearest fe_guard;
   if (!out) return OB_ERR_INVALID_ARG;
   if (!is_swiglu_shape(desc.m_dim, desc.k_dim, desc.h_dim, desc.n_dim)) {
     if (err) *err = "Unsupported chained SwiGLU shape";
     return OB_ERR_UNSUPPORTED;
   }
-  if (desc.s_in <= 0.0f || desc.s_wg <= 0.0f || desc.s_gate <= 0.0f ||
-      desc.s_wu <= 0.0f || desc.s_up <= 0.0f || desc.s_silu <= 0.0f ||
-      desc.s_prod <= 0.0f || desc.s_wd <= 0.0f || desc.s_out <= 0.0f) {
-    if (err) *err = "All SwiGLU quantization scales must be strictly positive";
+  if (!compute_swiglu_hw_multipliers(desc, nullptr, nullptr, nullptr, nullptr)) {
+    if (err) *err = "All SwiGLU quantization scales, derived multipliers, and spline coefficients must be finite and strictly positive";
     return OB_ERR_INVALID_ARG;
   }
 
@@ -7456,20 +7474,65 @@ ob_status_t build_swiglu_dgc0(const ob_swiglu_int8_desc_t& desc,
   return OB_OK;
 }
 
+bool compute_swiglu_hw_multipliers(const ob_swiglu_int8_desc_t& d,
+                                   float* out_m_gate,
+                                   float* out_m_up,
+                                   float* out_m_mul,
+                                   float* out_m_down) {
+  ScopedFeTonearest fe_guard;
+  const float scales[9] = {
+      d.s_in, d.s_wg, d.s_gate,
+      d.s_wu, d.s_up, d.s_silu,
+      d.s_prod, d.s_wd, d.s_out
+  };
+  for (float s : scales) {
+    if (!(std::isfinite(s) && s > 0.0f)) return false;
+  }
+  auto ratio_f32 = [](float a, float b, float c) -> float {
+    const double r = (static_cast<double>(a) * static_cast<double>(b)) / static_cast<double>(c);
+    return static_cast<float>(r);
+  };
+  const float mg = ratio_f32(d.s_in, d.s_wg, d.s_gate);
+  const float mu = ratio_f32(d.s_in, d.s_wu, d.s_up);
+  const float mm = ratio_f32(d.s_silu, d.s_up, d.s_prod);
+  const float md = ratio_f32(d.s_prod, d.s_wd, d.s_out);
+  if (!(std::isfinite(mg) && mg > 0.0f &&
+        std::isfinite(mu) && mu > 0.0f &&
+        std::isfinite(mm) && mm > 0.0f &&
+        std::isfinite(md) && md > 0.0f)) {
+    return false;
+  }
+  for (int s = 0; s < 8; ++s) {
+    for (int k = 0; k < 5; ++k) {
+      const float c = static_cast<float>(
+          static_cast<double>(kSwigluSiluUnitCoeffs[s][k]) / static_cast<double>(d.s_silu));
+      if (!std::isfinite(c)) return false;
+    }
+  }
+  if (out_m_gate) *out_m_gate = mg;
+  if (out_m_up) *out_m_up = mu;
+  if (out_m_mul) *out_m_mul = mm;
+  if (out_m_down) *out_m_down = md;
+  return true;
+}
+
 void simulate_swiglu_hw_exact(const int8_t* x_mk,
                               const ob_swiglu_int8_desc_t& d,
                               int8_t* y_mn) {
+  ScopedFeTonearest fe_guard;
   const uint32_t M = d.m_dim, K = d.k_dim, H = d.h_dim, N = d.n_dim;
-  const float m_g = (d.s_in * d.s_wg) / d.s_gate;
-  const float m_u = (d.s_in * d.s_wu) / d.s_up;
-  const float m_mul = (d.s_silu * d.s_up) / d.s_prod;
-  const float m_d = (d.s_prod * d.s_wd) / d.s_out;
+  float m_g = 0.0f, m_u = 0.0f, m_mul = 0.0f, m_d = 0.0f;
+  if (!compute_swiglu_hw_multipliers(d, &m_g, &m_u, &m_mul, &m_d)) {
+    std::memset(y_mn, 0, static_cast<size_t>(M) * N);
+    return;
+  }
   constexpr float kInf = __builtin_huge_valf();
 
   float silu_coeffs[8][5]{};
   for (int s = 0; s < 8; ++s) {
     for (int k = 0; k < 5; ++k) {
-      silu_coeffs[s][k] = kSwigluSiluUnitCoeffs[s][k] / d.s_silu;
+      silu_coeffs[s][k] = static_cast<float>(
+          static_cast<double>(kSwigluSiluUnitCoeffs[s][k]) / static_cast<double>(d.s_silu));
     }
   }
 
@@ -7478,43 +7541,78 @@ void simulate_swiglu_hw_exact(const int8_t* x_mk,
     const int8_t* x_row = x_mk + static_cast<size_t>(m) * K;
     int8_t* p_row = q_prod.data() + static_cast<size_t>(m) * H;
     for (uint32_t h = 0u; h < H; ++h) {
-      int32_t acc_g = d.bg_h ? d.bg_h[h] : 0;
-      int32_t acc_u = d.bu_h ? d.bu_h[h] : 0;
+      int64_t acc_g = d.bg_h ? static_cast<int64_t>(d.bg_h[h]) : 0LL;
+      int64_t acc_u = d.bu_h ? static_cast<int64_t>(d.bu_h[h]) : 0LL;
       const int8_t* wg_row = d.wg_hk ? (d.wg_hk + static_cast<size_t>(h) * K) : nullptr;
       const int8_t* wu_row = d.wu_hk ? (d.wu_hk + static_cast<size_t>(h) * K) : nullptr;
       if (wg_row && wu_row) {
         for (uint32_t k = 0u; k < K; ++k) {
-          const int32_t xv = static_cast<int32_t>(x_row[k]);
-          acc_g += xv * static_cast<int32_t>(wg_row[k]);
-          acc_u += xv * static_cast<int32_t>(wu_row[k]);
+          const int64_t xv = static_cast<int64_t>(x_row[k]);
+          acc_g += xv * static_cast<int64_t>(wg_row[k]);
+          acc_u += xv * static_cast<int64_t>(wu_row[k]);
         }
       }
-      const int32_t q_g = clip_i8_i32(rne_i32_exact(static_cast<float>(acc_g) * m_g));
-      const int32_t q_u = clip_i8_i32(rne_i32_exact(static_cast<float>(acc_u) * m_u));
+      const int32_t q_g = quant_clip_i8_f32(static_cast<float>(acc_g) * m_g);
+      const int32_t q_u = quant_clip_i8_f32(static_cast<float>(acc_u) * m_u);
       const float x_g = static_cast<float>(q_g) * d.s_gate;
       const float y_silu = eval_0x640_horner_scalar(x_g, silu_coeffs, kSwigluSiluBps, -11.6f, kInf);
-      int32_t u_silu = rne_i32_exact(y_silu) + 128;
-      if (u_silu < 0) u_silu = 0;
-      if (u_silu > 255) u_silu = 255;
-      const int32_t q_silu = u_silu - 128;
+      const int32_t q_silu = quant_clip_i8_f32(y_silu);
       p_row[h] = static_cast<int8_t>(
-          clip_i8_i32(rne_i32_exact(static_cast<float>(q_silu * q_u) * m_mul)));
+          quant_clip_i8_f32(static_cast<float>(q_silu * q_u) * m_mul));
     }
   }
   for (uint32_t m = 0u; m < M; ++m) {
     const int8_t* p_row = q_prod.data() + static_cast<size_t>(m) * H;
     int8_t* y_row = y_mn + static_cast<size_t>(m) * N;
     for (uint32_t n = 0u; n < N; ++n) {
-      int32_t acc_d = d.bd_n ? d.bd_n[n] : 0;
+      int64_t acc_d = d.bd_n ? static_cast<int64_t>(d.bd_n[n]) : 0LL;
       const int8_t* wd_row = d.wd_nh ? (d.wd_nh + static_cast<size_t>(n) * H) : nullptr;
       if (wd_row) {
         for (uint32_t h = 0u; h < H; ++h) {
-          acc_d += static_cast<int32_t>(p_row[h]) * static_cast<int32_t>(wd_row[h]);
+          acc_d += static_cast<int64_t>(p_row[h]) * static_cast<int64_t>(wd_row[h]);
         }
       }
       y_row[n] = static_cast<int8_t>(
-          clip_i8_i32(rne_i32_exact(static_cast<float>(acc_d) * m_d)));
+          quant_clip_i8_f32(static_cast<float>(acc_d) * m_d));
     }
+  }
+}
+
+int32_t eval_swiglu_silu_q(int32_t q_g, float s_gate) {
+  if (!(s_gate > 0.0f)) return 0;
+  ScopedFeTonearest fe_guard;
+  constexpr float kInf = __builtin_huge_valf();
+  float silu_coeffs[8][5]{};
+  for (int s = 0; s < 8; ++s) {
+    for (int k = 0; k < 5; ++k) {
+      silu_coeffs[s][k] = static_cast<float>(
+          static_cast<double>(kSwigluSiluUnitCoeffs[s][k]) / static_cast<double>(s_gate));
+    }
+  }
+  const float x_g = static_cast<float>(q_g) * s_gate;
+  const float y_silu = eval_0x640_horner_scalar(x_g, silu_coeffs, kSwigluSiluBps, -11.6f, kInf);
+  return quant_clip_i8_f32(y_silu);
+}
+
+void build_swiglu_silu_lut(float s_gate, int8_t out_lut[256]) {
+  if (!out_lut) return;
+  if (!(s_gate > 0.0f)) {
+    std::memset(out_lut, 0, 256u);
+    return;
+  }
+  ScopedFeTonearest fe_guard;
+  constexpr float kInf = __builtin_huge_valf();
+  float silu_coeffs[8][5]{};
+  for (int s = 0; s < 8; ++s) {
+    for (int k = 0; k < 5; ++k) {
+      silu_coeffs[s][k] = static_cast<float>(
+          static_cast<double>(kSwigluSiluUnitCoeffs[s][k]) / static_cast<double>(s_gate));
+    }
+  }
+  for (int32_t q_g = -128; q_g <= 127; ++q_g) {
+    const float x_g = static_cast<float>(q_g) * s_gate;
+    const float y_silu = eval_0x640_horner_scalar(x_g, silu_coeffs, kSwigluSiluBps, -11.6f, kInf);
+    out_lut[q_g + 128] = static_cast<int8_t>(quant_clip_i8_f32(y_silu));
   }
 }
 

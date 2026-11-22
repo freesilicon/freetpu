@@ -575,8 +575,11 @@ void test_llm_size_matmuls() {
     ob_invoke_stats_t stats {};
     CHECK(ob_gemm_matmul_int8(ctx, a.data(), b.data(), bias.data(), c.data(),
                               M, K, N, 0, 0, &stats) == OB_OK);
-    // 1 M-tile * (2048/512=4 K-tiles) * (2048/256=8 N-tiles) = 32 tiles
-    CHECK(stats.tiles_dispatched == 32u);
+    // 1 M-tile * (2048/512=4 K-tiles) * (2048/256=8 N-tiles) = 32 CPU fallback tiles
+    // (builtin emitter does not synthesize M=2 512x256 tiles, so hardware dispatches == 0).
+    CHECK((stats.flags & OB_STAT_FLAG_CPU_FALLBACK) != 0u);
+    CHECK((stats.flags & OB_STAT_FLAG_EMITTER_USED) == 0u);
+    CHECK(stats.tiles_dispatched == 0u);
 
     // Spot-check 64 distributed outputs against exact reference
     for (uint32_t m = 0; m < M; ++m) {
@@ -630,8 +633,10 @@ void test_llm_size_matmuls() {
     ob_invoke_stats_t stats {};
     CHECK(ob_gemm_matmul_f32_q8_0(ctx, a.data(), b.data(), c.data(),
                                   M, K, N, &stats) == OB_OK);
-    uint32_t expected_tiles = ((K + 511u) / 512u) * ((N + 255u) / 256u);
-    CHECK(stats.tiles_dispatched == expected_tiles);
+    // No emitter registered in this CPU accumulation test -> hardware dispatches == 0.
+    CHECK((stats.flags & OB_STAT_FLAG_CPU_FALLBACK) != 0u);
+    CHECK((stats.flags & OB_STAT_FLAG_EMITTER_USED) == 0u);
+    CHECK(stats.tiles_dispatched == 0u);
 
     // Verify distributed rows against independent fp64 reference
     double max_abs_err = 0.0;
@@ -2342,6 +2347,28 @@ void test_quant_batch_q4_0_dvfs_and_fd_caps() {
   TempBinaryFile interp_file;
   CHECK(interp_file.write(synth_interp.data(), synth_interp.size()));
   // 1. DVFS power profiles & Litebuf FW WakeLock state machine
+  struct ScopedEnvRestore {
+    const char* name;
+    bool had_val = false;
+    std::string old_val;
+    explicit ScopedEnvRestore(const char* n) : name(n) {
+      if (const char* v = std::getenv(n)) {
+        had_val = true;
+        old_val = v;
+      }
+      ::unsetenv(n);
+    }
+    ~ScopedEnvRestore() {
+      if (had_val) {
+        ::setenv(name, old_val.c_str(), 1);
+      } else {
+        ::unsetenv(name);
+      }
+    }
+  };
+  ScopedEnvRestore guard_horiz("OPENBUENOS_DISABLE_HORIZ_FUSION");
+  ScopedEnvRestore guard_lt("OPENBUENOS_DISABLE_LARGE_TILES");
+  ScopedEnvRestore guard_blt("OPENBUENOS_DISABLE_BATCHED_LARGE_TILES");
   ::unsetenv("OPENBUENOS_PERF_MODE");
   ::unsetenv("OPENBUENOS_WAKELOCK");
   ::unsetenv("OPENBUENOS_FW_PRIORITY");
@@ -3171,20 +3198,42 @@ void test_phase7b_swiglu_chaining_2tier_and_outlier_cache() {
     for (const SwigluProbeCase& pc : probes) {
       std::string base = kProbeDir + "/" + pc.name;
     std::vector<uint8_t> ref_dgc0, in_bin, ref_out;
-    CHECK(read_file((base + ".dgc0").c_str(), &ref_dgc0));
-    CHECK(read_file((base + ".in.bin").c_str(), &in_bin));
-    CHECK(read_file((base + ".ref.bin").c_str(), &ref_out));
+    const bool ok_dgc0 = read_file((base + ".dgc0").c_str(), &ref_dgc0);
+    const bool ok_in = read_file((base + ".in.bin").c_str(), &in_bin);
+    const bool ok_ref = read_file((base + ".ref.bin").c_str(), &ref_out);
+    const size_t expect_in_sz = static_cast<size_t>(pc.M) * pc.K;
+    const size_t expect_out_sz = static_cast<size_t>(pc.M) * pc.N;
+    CHECK(ok_dgc0);
+    CHECK(ok_in);
+    CHECK(ok_ref);
+    CHECK(in_bin.size() == expect_in_sz);
+    CHECK(ref_out.size() == expect_out_sz);
+    if (!ok_dgc0 || !ok_in || !ok_ref ||
+        in_bin.size() != expect_in_sz || ref_out.size() != expect_out_sz) {
+      continue;
+    }
 
     ob::ParsedDgc0 ref_parsed{};
     std::string perr;
-    CHECK(ob::parse_dgc0_buffer(ref_dgc0.data(), ref_dgc0.size(), &ref_parsed, &perr) == OB_OK);
+    const bool parsed_ok = (ob::parse_dgc0_buffer(ref_dgc0.data(), ref_dgc0.size(), &ref_parsed, &perr) == OB_OK);
+    CHECK(parsed_ok);
+    if (!parsed_ok ||
+        ref_parsed.ext_dive_vm_ir.offset + ref_parsed.ext_dive_vm_ir.size > ref_dgc0.size() ||
+        ref_parsed.ext_params.offset + ref_parsed.ext_params.size > ref_dgc0.size()) {
+      CHECK(false);
+      continue;
+    }
     const uint8_t* ref_ext0 = ref_dgc0.data() + ref_parsed.ext_dive_vm_ir.offset;
     const size_t ref_ext0_sz = static_cast<size_t>(ref_parsed.ext_dive_vm_ir.size);
     const uint8_t* ref_ext2 = ref_dgc0.data() + ref_parsed.ext_params.offset;
     const size_t ref_ext2_sz = static_cast<size_t>(ref_parsed.ext_params.size);
 
     std::vector<std::vector<uint8_t>> ref_chunks;
-    CHECK(extract_dive_chunks_n(ref_ext0, ref_ext0_sz, 11u, &ref_chunks));
+    const bool chunks_extracted = extract_dive_chunks_n(ref_ext0, ref_ext0_sz, 11u, &ref_chunks);
+    CHECK(chunks_extracted && ref_chunks.size() == 11u);
+    if (!chunks_extracted || ref_chunks.size() != 11u) {
+      continue;
+    }
 
     // Unpack [Wg|Wu|Wd] directly from probe ext[2]
     const size_t p_gate = (pc.M == 64u)
@@ -3195,6 +3244,9 @@ void test_phase7b_swiglu_chaining_2tier_and_outlier_cache() {
         ? (static_cast<size_t>(pc.N) * (pc.H + 16u))
         : (static_cast<size_t>(pc.N) * (pc.H + 4u));
     CHECK(ref_ext2_sz == p_gate + p_up + p_down);
+    if (ref_ext2_sz != p_gate + p_up + p_down) {
+      continue;
+    }
 
     std::vector<int8_t> wg, wu, wd;
     std::vector<int32_t> bg, bu, bd;
@@ -3350,6 +3402,7 @@ void test_phase7b_swiglu_chaining_2tier_and_outlier_cache() {
   //    HARDWARE-EXACT FP32 NMSE PROOF + Fallback Gates
   // -------------------------------------------------------------------------
   ::unsetenv("OPENBUENOS_DISABLE_SWIGLU_CHAIN");
+  ::unsetenv("OPENBUENOS_SWIGLU_FAST_CHAIN");
   ::unsetenv("OPENBUENOS_SWIGLU_MAX_CREST");
   ::unsetenv("OPENBUENOS_WEIGHT_CACHE_MB");
 
@@ -3359,6 +3412,7 @@ void test_phase7b_swiglu_chaining_2tier_and_outlier_cache() {
   cfg.graph_cache_capacity = 256u;
   ob_context_t* ctx = nullptr;
   CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+  ctx->swiglu_fast_chain_enabled = true;
   ob_context_set_profile(ctx, 1);
   CHECK(ob_gemm_register_builtin_emitter(ctx, interp_file.path()) == OB_OK);
 
@@ -3648,7 +3702,9 @@ void test_phase7b_swiglu_chaining_2tier_and_outlier_cache() {
     CHECK(ob_context_get_profile(ctx, &p_before) == OB_OK);
     CHECK(ob_gemm_swiglu_f32_quant(ctx, a_spike.data(), &sd, c_spike.data(), &sq1) == OB_OK);
     CHECK(ob_context_get_profile(ctx, &p_after) == OB_OK);
-    CHECK(p_after.swiglu_fallbacks == p_before.swiglu_fallbacks + 1u);
+    CHECK((sq1.flags & OB_STAT_FLAG_CPU_FALLBACK) != 0u);
+    CHECK(sq1.tiles_dispatched == 0u);
+    CHECK(p_after.swiglu_fallbacks == p_before.swiglu_fallbacks); // CPU-only outlier path is not M7A TPU fallback!
     CHECK(ctx->weight_cache_map.size() == w_before_spike); // ZERO duplicate M7A weight-cache pollution!
 
     // Small prompt (M=7, default !swiglu_prefill_enabled) runs exact NEON FP32 on CPU:
@@ -3869,11 +3925,731 @@ void test_phase7b_swiglu_chaining_2tier_and_outlier_cache() {
               ran_corpus_parity ? " + 5/5 BIT-EXACT external corpus parity" : "; external 5-probe parity skipped without OPENBUENOS_CORPUS_DIR");
 }
 
+void test_phase7_cycle2_regressions() {
+  std::vector<uint8_t> synth_interp = make_synthetic_dive_interp(0xC2u);
+  TempBinaryFile interp_file;
+  CHECK(interp_file.write(synth_interp.data(), synth_interp.size()));
 
-// ---------------------------------------------------------------------------
-// Test 19: Phase 8A Persistent WorkerPool, Parallel NEON Pack/Dequant+Outliers,
-//          M=64 SwiGLU Divider Fix (<3.5e-3 NMSE) & Persistent M7A Scratch
-// ---------------------------------------------------------------------------
+  const uint16_t d_one = fp32_to_fp16(1.0f);
+  const uint16_t d_1_128 = fp32_to_fp16(1.0f / 128.0f);
+
+  // 1. Balanced 128 +/-1 correlated activation + 1 outlier (dc_term == 0, rms_aq < 56) with
+  //    matching +/-1/128 gate/up rows and single-channel W_down: must NOT silently clip!
+  {
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+    CHECK(ob_gemm_register_builtin_emitter(ctx, interp_file.path()) == OB_OK);
+
+    constexpr uint32_t K = 576u, H = 1536u, N = 576u;
+    const uint32_t nb_k = K / OB_QK8_0;
+    const uint32_t nb_h = H / OB_QK8_0;
+    std::vector<ob_block_q8_0_t> wg(static_cast<size_t>(H) * nb_k);
+    std::vector<ob_block_q8_0_t> wu(static_cast<size_t>(H) * nb_k);
+    std::vector<ob_block_q8_0_t> wd(static_cast<size_t>(N) * nb_h);
+    std::memset(wg.data(), 0, wg.size() * sizeof(ob_block_q8_0_t));
+    std::memset(wu.data(), 0, wu.size() * sizeof(ob_block_q8_0_t));
+    std::memset(wd.data(), 0, wd.size() * sizeof(ob_block_q8_0_t));
+
+    // Zero-mean correlated pattern on row 0 across first 128 entries (+/-1/128)
+    for (uint32_t bk = 0u; bk < 4u; ++bk) {
+      wg[bk].d = d_1_128;
+      wu[bk].d = d_1_128;
+      for (uint32_t j = 0u; j < OB_QK8_0; ++j) {
+        int8_t v = ((bk * OB_QK8_0 + j) & 1u) ? -127 : 127; // 127 * (1/128) ~ +/-1
+        wg[bk].qs[j] = v;
+        wu[bk].qs[j] = v;
+      }
+    }
+    // Mild background noise on remaining hidden rows so l2_g_max ~ norm of row 0
+    for (uint32_t h = 1u; h < H; ++h) {
+      wg[static_cast<size_t>(h) * nb_k].d = fp32_to_fp16(1.0f / 2048.0f);
+      wg[static_cast<size_t>(h) * nb_k].qs[0] = 64;
+      wu[static_cast<size_t>(h) * nb_k].d = fp32_to_fp16(1.0f / 2048.0f);
+      wu[static_cast<size_t>(h) * nb_k].qs[0] = 64;
+    }
+    wd[0].d = d_one;
+    wd[0].qs[0] = 1; // selects only channel 0 -> unsaturated output even when ch 0 clips
+
+    std::vector<float> a(K, 0.0f);
+    for (uint32_t k = 0u; k < 128u; ++k) {
+      a[k] = (k & 1u) ? -1.0f : 1.0f;
+    }
+    a[200] = 3.0f; // raises batch_amax so rms_aq ~ 20 < 56 while dc == 0!
+    std::vector<float> c(N, 0.0f);
+    ob_gemm_swiglu_quant_desc_t sd{wg.data(), wu.data(), wd.data(), 1u, K, H, N, 0u, 0u, 0u, 0u};
+    ob_invoke_stats_t st{};
+    CHECK(ob_gemm_swiglu_f32_quant(ctx, a.data(), &sd, c.data(), &st) == OB_OK);
+    ob_profile_stats_t gp{};
+    CHECK(ob_context_get_profile(ctx, &gp) == OB_OK);
+    CHECK(gp.swiglu_fallbacks >= 1u);
+    CHECK(gp.swiglu_chunks_chained == 0u);
+    const double expected_dot = 128.0 * (127.0 / 128.0);
+    const double expected_y0 = (expected_dot / (1.0 + std::exp(-expected_dot))) * expected_dot;
+    CHECK(std::fabs(static_cast<double>(c[0]) - expected_y0) / expected_y0 < 5e-3);
+
+    ob_context_destroy(ctx);
+  }
+
+  // 2. Weight-cache strict 128-bit hashing: changing 1 unsampled interior row on >16 KiB tile
+  //    must miss and recompute instead of reusing stale weights.
+  {
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+    CHECK(ob_gemm_register_builtin_emitter(ctx, interp_file.path()) == OB_OK);
+    CHECK(ctx->strict_weight_hash == true);
+
+    constexpr uint32_t K = 512u, N = 128u; // 64 KiB (> 16 KiB strided probe threshold!)
+    std::vector<int8_t> a(K, 1), b(static_cast<size_t>(N) * K, 0);
+    std::vector<int32_t> c1(N, 0), c2(N, 0);
+    b[static_cast<size_t>(3u) * K + 77u] = 10; // interior row 3, offset 77
+    ob_invoke_stats_t s1{}, s2{};
+    CHECK(ob_gemm_matmul_int8(ctx, a.data(), b.data(), nullptr, c1.data(), 1u, K, N, 0, 0, &s1) == OB_OK);
+    CHECK(c1[3] == 10);
+    b[static_cast<size_t>(3u) * K + 77u] = 42; // mutate interior byte in-place
+    CHECK(ob_gemm_matmul_int8(ctx, a.data(), b.data(), nullptr, c2.data(), 1u, K, N, 0, 0, &s2) == OB_OK);
+    CHECK(c2[3] == 42);
+    CHECK(s2.cache_hits == 0u);
+    ob_context_destroy(ctx);
+  }
+
+  // 3. Budget recovery after transient memory pressure + pinned SwiGLU cap enforcement
+  {
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    cfg.max_inflight = 16u;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+    CHECK(ob_gemm_register_builtin_emitter(ctx, interp_file.path()) == OB_OK);
+
+    // Budget must dip under simulated pressure and recover when memory frees up.
+    ctx->simulated_mem_available_bytes = 48ULL * 1024u * 1024u; // 16 MiB cap
+    const size_t low_cap = ob::compute_weight_cache_budget_bytes(ctx);
+    CHECK(low_cap <= 16ULL * 1024u * 1024u);
+    ctx->simulated_mem_available_bytes = 512ULL * 1024u * 1024u; // recovers >= 170 MiB
+    const size_t rec_cap = ob::compute_weight_cache_budget_bytes(ctx);
+    CHECK(rec_cap > 100ULL * 1024u * 1024u);
+
+    // Cold 9-chunk Qwen2.5 SwiGLU under strict 16 MiB cap must NEVER exceed weight_cache_max_bytes!
+    ctx->simulated_mem_available_bytes = 48ULL * 1024u * 1024u;
+    ctx->swiglu_fast_chain_enabled = true;
+    constexpr uint32_t K = 1536u, H = 8960u, N = 1536u;
+    const uint32_t nb_k = K / OB_QK8_0, nb_h = H / OB_QK8_0;
+    std::vector<ob_block_q4_0_t> wg(static_cast<size_t>(H) * nb_k),
+        wu(static_cast<size_t>(H) * nb_k), wd(static_cast<size_t>(N) * nb_h);
+    const uint16_t d_q4 = fp32_to_fp16(0.025f);
+    uint32_t lcg = 0x13579BDFu;
+    auto next_nib = [&]() -> uint8_t {
+      // Zero-mean bell-shaped Q4_0 nibble in [2, 14] (signed [-6, +6], crest ~3.2 like real LLM weights).
+      lcg = lcg * 1664525u + 1013904223u;
+      const uint32_t a0 = (lcg >> 24) % 5u;
+      lcg = lcg * 1664525u + 1013904223u;
+      const uint32_t a1 = (lcg >> 24) % 5u;
+      lcg = lcg * 1664525u + 1013904223u;
+      const uint32_t a2 = (lcg >> 24) % 5u;
+      return static_cast<uint8_t>(2u + a0 + a1 + a2);
+    };
+    auto fill_q4 = [&](std::vector<ob_block_q4_0_t>& v) {
+      for (auto& b : v) {
+        b.d = d_q4;
+        for (uint32_t j = 0u; j < sizeof(b.qs); ++j) {
+          b.qs[j] = static_cast<uint8_t>(next_nib() | (next_nib() << 4));
+        }
+      }
+    };
+    fill_q4(wg);
+    fill_q4(wu);
+    fill_q4(wd);
+    // Zero-mean bell-shaped activation row (rms_aq < 40, crest ~3.2) so all 9 chunks take the chained path.
+    std::vector<float> a(K, 0.0f), c(N, 0.0f);
+    for (uint32_t i = 0u; i < K; ++i) {
+      a[i] = (static_cast<float>(next_nib()) - 8.0f) * 0.2f;
+    }
+    ob_gemm_swiglu_quant_desc_t sd{wg.data(), wu.data(), wd.data(), 1u, K, H, N, 1u, 1u, 1u, 0u};
+    ob_invoke_stats_t ss{};
+    CHECK(ob_gemm_swiglu_f32_quant(ctx, a.data(), &sd, c.data(), &ss) == OB_OK);
+    ob_profile_stats_t pcap{};
+    CHECK(ob_context_get_profile(ctx, &pcap) == OB_OK);
+    CHECK(pcap.swiglu_chunks_chained == 9u);
+    CHECK(pcap.swiglu_fallbacks == 0u);
+    CHECK(ctx->weight_cache_evictions > 0u);
+    CHECK(ctx->weight_cache_bytes <= ctx->weight_cache_max_bytes);
+    CHECK(ctx->weight_cache_peak_bytes <= ctx->weight_cache_max_bytes);
+
+    ob_context_destroy(ctx);
+  }
+
+  // 4. Huge FP32 simulation saturation clamps safely to +/-127 / -128 without INT32 overflow UB
+  {
+    int8_t x = 100, wg = 100, wu = 100, wd = 100, y = 0;
+    ob_swiglu_int8_desc_t d{};
+    d.m_dim = 1u; d.k_dim = 1u; d.h_dim = 1u; d.n_dim = 1u;
+    d.s_in = 1.0f; d.s_wg = 1e6f; d.s_gate = 1.0f;
+    d.s_wu = 1e6f; d.s_up = 1.0f; d.s_silu = 1e-12f;
+    d.s_prod = 1e-20f; d.s_wd = 1e10f; d.s_out = 1e-22f;
+    d.wg_hk = &wg; d.wu_hk = &wu; d.wd_nh = &wd;
+    ob::simulate_swiglu_hw_exact(&x, d, &y);
+    CHECK(y == 127);
+    wd = -100;
+    ob::simulate_swiglu_hw_exact(&x, d, &y);
+    CHECK(y == -128);
+    wg = -100;
+    wd = 100;
+    ob::simulate_swiglu_hw_exact(&x, d, &y);
+    CHECK(y == -128);
+    // Verify INT32_MAX bias + positive MAC does not invoke signed int32 overflow UB.
+    int32_t bg_max = INT32_MAX, bu_max = INT32_MAX, bd_max = INT32_MAX;
+    d.bg_h = &bg_max; d.bu_h = &bu_max; d.bd_n = &bd_max;
+    wg = 100; wu = 100; wd = 100;
+    ob::simulate_swiglu_hw_exact(&x, d, &y);
+    CHECK(y == 127);
+  }
+
+  // 5. Mixed chained + tail fallback SwiGLU profile must not double-count fallback HW/wall time
+  {
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+    CHECK(ob_gemm_register_builtin_emitter(ctx, interp_file.path()) == OB_OK);
+    ctx->swiglu_prefill_enabled = true;
+    ctx->swiglu_fast_chain_enabled = true;
+
+    constexpr uint32_t M = 74u, K = 576u, H = 512u, N = 576u; // 64 chained + 10 M7A fallback tail!
+    std::vector<ob_block_q8_0_t> wg(static_cast<size_t>(H) * (K / OB_QK8_0));
+    std::vector<ob_block_q8_0_t> wu(static_cast<size_t>(H) * (K / OB_QK8_0));
+    std::vector<ob_block_q8_0_t> wd(static_cast<size_t>(N) * (H / OB_QK8_0));
+    const uint16_t d_q8 = fp32_to_fp16(0.01f);
+    for (auto& b : wg) { b.d = d_q8; for (uint32_t j = 0u; j < OB_QK8_0; ++j) b.qs[j] = (j & 1u) ? 2 : -2; }
+    for (auto& b : wu) { b.d = d_q8; for (uint32_t j = 0u; j < OB_QK8_0; ++j) b.qs[j] = (j & 1u) ? -2 : 2; }
+    for (auto& b : wd) { b.d = d_q8; for (uint32_t j = 0u; j < OB_QK8_0; ++j) b.qs[j] = (j & 1u) ? 2 : -2; }
+    std::vector<float> a(static_cast<size_t>(M) * K, 0.0f), c(static_cast<size_t>(M) * N, 0.0f);
+    for (uint32_t r = 0u; r < M; ++r) {
+      for (uint32_t ki = 0u; ki < K; ++ki) {
+        a[static_cast<size_t>(r) * K + ki] =
+            ((ki & 15u) == 0u) ? ((ki & 16u) ? 0.5f : -0.5f) : ((ki & 1u) ? 0.05f : -0.05f);
+      }
+    }
+    ob_gemm_swiglu_quant_desc_t sd{wg.data(), wu.data(), wd.data(), M, K, H, N, 0u, 0u, 0u, 0u};
+    ob_invoke_stats_t st{};
+    CHECK(ob_gemm_swiglu_f32_quant(ctx, a.data(), &sd, c.data(), &st) == OB_OK);
+    ob_profile_stats_t ps{};
+    CHECK(ob_context_get_profile(ctx, &ps) == OB_OK);
+    // Verify BOTH paths executed: 64-row chained slice AND 10-row M7A batched fallback tail,
+    // and that neither HW time nor wall time double-counts the fallback tail.
+    CHECK(ps.swiglu_chunks_chained >= 1u);
+    CHECK(ps.swiglu_fallbacks == 1u);
+    CHECK(ps.hw_us == st.hw_execution_us);
+    CHECK(ps.total_wall_us <= st.wall_time_us + 1ULL);
+    ob_context_destroy(ctx);
+  }
+
+  std::printf("[PASS] test_phase7_cycle2_regressions (balanced-corr fallback, 128-bit interior cache miss, LMKD budget recovery & pinned SwiGLU cap, float clamp, mixed profile OK)\n");
+}
+
+void test_phase7_cycle3_regressions() {
+  std::vector<uint8_t> synth_interp = make_synthetic_dive_interp(0xC3u);
+  TempBinaryFile interp_file;
+  CHECK(interp_file.write(synth_interp.data(), synth_interp.size()));
+
+  // 1. Dense GEMM single-call 16 MiB cap enforcement (6 distinct 3 MiB tiles in one batched call)
+  {
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    cfg.max_inflight = 16u;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+    CHECK(ob_gemm_register_builtin_emitter(ctx, interp_file.path()) == OB_OK);
+    ctx->simulated_mem_available_bytes = 48ULL * 1024u * 1024u; // 16 MiB budget
+    const size_t budget = ob::compute_weight_cache_budget_bytes(ctx);
+    CHECK(budget == 16ULL * 1024u * 1024u);
+
+    constexpr uint32_t K = 1536u, N = 2048u; // ~3 MiB per ext[2] tile
+    constexpr uint32_t nb_k = K / OB_QK8_0;
+    std::vector<float> a(K, 0.25f);
+    std::vector<std::vector<ob_block_q4_0_t>> weights(6u);
+    std::vector<std::vector<float>> outputs(6u, std::vector<float>(N, 0.0f));
+    ob_gemm_f32_quant_job_t jobs[6]{};
+    for (uint32_t i = 0u; i < 6u; ++i) {
+      weights[i].resize(static_cast<size_t>(N) * nb_k);
+      std::memset(weights[i].data(), 0, weights[i].size() * sizeof(ob_block_q4_0_t));
+      const uint16_t dh = fp32_to_fp16(0.05f + 0.01f * static_cast<float>(i));
+      weights[i][0].d = dh;
+      weights[i][0].qs[0] = static_cast<uint8_t>(0x33u + i);
+      jobs[i] = {weights[i].data(), outputs[i].data(), N, OB_ACT_NONE, 1u, {0, 0, 0}};
+    }
+    ob_invoke_stats_t st{};
+    CHECK(ob_gemm_matmul_f32_quant_batch(ctx, a.data(), 1u, K, jobs, 6u, &st) == OB_OK);
+    CHECK(ctx->weight_cache_bytes <= budget);
+    CHECK(ctx->weight_cache_peak_bytes <= budget);
+    ob_context_destroy(ctx);
+  }
+
+  // 2. Immutable weight O(1) hit + version bump miss + distinct buffer non-collision + past-end safety
+  {
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+    CHECK(ob_gemm_register_builtin_emitter(ctx, interp_file.path()) == OB_OK);
+
+    constexpr uint32_t K = 512u, N = 128u;
+    std::vector<int8_t> a(K, 1);
+    std::vector<int8_t> b1(static_cast<size_t>(N) * K, 0);
+    std::vector<int8_t> b2(static_cast<size_t>(N) * K, 0);
+    std::vector<int32_t> c1(N, 0), c2(N, 0), c3(N, 0);
+    b1[static_cast<size_t>(3u) * K + 77u] = 10;
+    b2[static_cast<size_t>(3u) * K + 77u] = 25;
+
+    CHECK(ob_gemm_register_immutable_weights(ctx, b1.data(), b1.size(), 1u) == OB_OK);
+    CHECK(ob_gemm_register_immutable_weights(ctx, b2.data(), b2.size(), 1u) == OB_OK);
+
+    ob_invoke_stats_t s1{}, s2{}, s3{}, s4{};
+    CHECK(ob_gemm_matmul_int8(ctx, a.data(), b1.data(), nullptr, c1.data(), 1u, K, N, 0, 0, &s1) == OB_OK);
+    CHECK(c1[3] == 10);
+    // Distinct buffer with identical version=1 must NOT collide in weight cache!
+    CHECK(ob_gemm_matmul_int8(ctx, a.data(), b2.data(), nullptr, c2.data(), 1u, K, N, 0, 0, &s2) == OB_OK);
+    CHECK(c2[3] == 25);
+    const uint64_t hits_before = ctx->weight_cache_hits;
+    // Mutate interior byte WITHOUT version bump: O(1) immutable lookup skips byte scan -> weight cache hit!
+    b1[static_cast<size_t>(3u) * K + 77u] = 42;
+    CHECK(ob_gemm_matmul_int8(ctx, a.data(), b1.data(), nullptr, c3.data(), 1u, K, N, 0, 0, &s3) == OB_OK);
+    CHECK(ctx->weight_cache_hits == hits_before + 1u);
+    // Bump version -> must miss weight cache and recompute with new value!
+    const uint64_t misses_before = ctx->weight_cache_misses;
+    CHECK(ob_gemm_register_immutable_weights(ctx, b1.data(), b1.size(), 2u) == OB_OK);
+    CHECK(ob_gemm_matmul_int8(ctx, a.data(), b1.data(), nullptr, c3.data(), 1u, K, N, 0, 0, &s4) == OB_OK);
+    CHECK(ctx->weight_cache_misses == misses_before + 1u);
+    CHECK(c3[3] == 42);
+    // Unregister b1 -> back to strict content hashing; mutating b1 now causes a miss.
+    CHECK(ob_gemm_unregister_immutable_weights(ctx, b1.data(), b1.size()) == OB_OK);
+    b1[static_cast<size_t>(3u) * K + 77u] = 55;
+    const uint64_t misses_after_unreg = ctx->weight_cache_misses;
+    CHECK(ob_gemm_matmul_int8(ctx, a.data(), b1.data(), nullptr, c3.data(), 1u, K, N, 0, 0, &s4) == OB_OK);
+    CHECK(ctx->weight_cache_misses == misses_after_unreg + 1u);
+    CHECK(c3[3] == 55);
+
+    // Re-registering the SAME address with the SAME initial version=1 after unregister MUST
+    // receive a fresh generation identity (no stale hit from the previous allocation lifetime!).
+    b1[static_cast<size_t>(3u) * K + 77u] = 77;
+    CHECK(ob_gemm_register_immutable_weights(ctx, b1.data(), b1.size(), 1u) == OB_OK);
+    const uint64_t misses_before_rereg = ctx->weight_cache_misses;
+    CHECK(ob_gemm_matmul_int8(ctx, a.data(), b1.data(), nullptr, c3.data(), 1u, K, N, 0, 0, &s4) == OB_OK);
+    CHECK(ctx->weight_cache_misses == misses_before_rereg + 1u);
+    CHECK(c3[3] == 77);
+
+    ob_context_destroy(ctx);
+  }
+
+  // 2b. Warm inference enforces a shrinking weight-cache budget under memory pressure
+  {
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    cfg.max_inflight = 16u;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+    CHECK(ob_gemm_register_builtin_emitter(ctx, interp_file.path()) == OB_OK);
+    ctx->simulated_mem_available_bytes = 192ULL * 1024u * 1024u; // 64 MiB cap
+
+    constexpr uint32_t K = 1536u, N = 2048u; // ~3 MiB per ext[2] tile
+    constexpr uint32_t nb_k = K / OB_QK8_0;
+    std::vector<float> a(K, 0.25f);
+    std::vector<std::vector<ob_block_q4_0_t>> weights(8u);
+    std::vector<std::vector<float>> outputs(8u, std::vector<float>(N, 0.0f));
+    for (uint32_t i = 0u; i < 8u; ++i) {
+      weights[i].resize(static_cast<size_t>(N) * nb_k);
+      std::memset(weights[i].data(), 0, weights[i].size() * sizeof(ob_block_q4_0_t));
+      weights[i][0].d = fp32_to_fp16(0.05f + 0.01f * static_cast<float>(i));
+      weights[i][0].qs[0] = static_cast<uint8_t>(0x40u + i);
+      ob_gemm_f32_quant_job_t job{weights[i].data(), outputs[i].data(), N, OB_ACT_NONE, 1u, {0, 0, 0}};
+      ob_invoke_stats_t st{};
+      CHECK(ob_gemm_matmul_f32_quant_batch(ctx, a.data(), 1u, K, &job, 1u, &st) == OB_OK);
+    }
+    CHECK(ctx->weight_cache_bytes > 16ULL * 1024u * 1024u);
+
+    // Shrink MemAvailable so effective budget drops to 16 MiB, then run a warm cache hit:
+    // hit path must refresh the budget and evict idle entries down to <= 16 MiB!
+    ctx->simulated_mem_available_bytes = 48ULL * 1024u * 1024u; // 16 MiB cap
+    const uint64_t hits_before = ctx->weight_cache_hits;
+    ob_gemm_f32_quant_job_t warm_job{weights[0].data(), outputs[0].data(), N, OB_ACT_NONE, 1u, {0, 0, 0}};
+    ob_invoke_stats_t ws{};
+    CHECK(ob_gemm_matmul_f32_quant_batch(ctx, a.data(), 1u, K, &warm_job, 1u, &ws) == OB_OK);
+    CHECK(ctx->weight_cache_hits == hits_before + 1u);
+    CHECK(ctx->weight_cache_bytes <= 16ULL * 1024u * 1024u);
+
+    // Explicit MemAvailable == 0 kB MUST still apply the pressure cap (1 MiB floor), not skip it!
+    ctx->simulated_mem_available_bytes = 0u;
+    ctx->simulated_mem_available_set = true;
+    CHECK(ob::compute_weight_cache_budget_bytes(ctx) == 1ULL * 1024u * 1024u);
+    ctx->simulated_mem_available_set = false;
+
+    ob_context_destroy(ctx);
+  }
+
+  // 3. Refcounted buffer retention across inflight timeout attachment
+  {
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+
+    ob_buffer_t* b = nullptr;
+    CHECK(ob_buffer_alloc(ctx, 4096u, OB_BUF_BIDIRECTIONAL | OB_BUF_NO_POOL, &b) == OB_OK);
+    CHECK(b != nullptr && b->refcnt.load(std::memory_order_acquire) == 1u);
+    ob::buffer_retain(b);
+    CHECK(b->refcnt.load(std::memory_order_acquire) == 2u);
+    // First free drops refcnt to 1 without freeing the slab/object.
+    ob_buffer_free(b);
+    CHECK(b->refcnt.load(std::memory_order_acquire) == 1u);
+    CHECK(ob_buffer_data(b) != nullptr);
+    // Attach to a mock inflight credit slot -> retains another ref (refcnt=2).
+    ob_exec_handle_t fake_h = 0x12345678u;
+    {
+      std::lock_guard<std::mutex> lk(ctx->vii_mu);
+      ctx->credits[0].state = ob::CreditSlot::IN_FLIGHT;
+      ctx->credits[0].handle = fake_h;
+      ctx->credits[0].seq = 999u;
+      ctx->inflight_count = 1u;
+    }
+    CHECK(ob::device_attach_inflight_buffers(ctx, fake_h, {b}) == true);
+    CHECK(b->refcnt.load(std::memory_order_acquire) == 2u);
+    CHECK(ctx->credits[0].abandoned == true);
+    // Simulate late firmware completion of abandoned command while occupying the sole credit:
+    // the NEXT submission (ob_gemm_matmul_int8 -> device_submit_execute_async) must reclaim
+    // the sole credit, release the retained buffer (refcnt 2 -> 1), and execute cleanly!
+    {
+      std::lock_guard<std::mutex> lk(ctx->vii_mu);
+      ctx->credits[0].state = ob::CreditSlot::COMPLETED;
+    }
+    ctx->credit_size = 1u;
+    CHECK(ob_gemm_register_builtin_emitter(ctx, interp_file.path()) == OB_OK);
+    std::vector<int8_t> ta(64u, 1), tb(64u * 64u, 2);
+    std::vector<int32_t> tc(64u, 0);
+    ob_invoke_stats_t ts{};
+    CHECK(ob_gemm_matmul_int8(ctx, ta.data(), tb.data(), nullptr, tc.data(), 1u, 64u, 64u, 0, 0, &ts) == OB_OK);
+    CHECK(tc[0] == 128);
+    CHECK(ctx->credits[0].state == ob::CreditSlot::FREE);
+    CHECK(ctx->inflight_count == 0u);
+    CHECK(b->refcnt.load(std::memory_order_acquire) == 1u);
+    ob_buffer_free(b);
+    ob_context_destroy(ctx);
+  }
+
+  // 3b. build_swiglu_silu_lut matches eval_swiglu_silu_q bit-for-bit across all 256 INT8 codes
+  {
+    int8_t lut[256]{};
+    for (float sg : {0.02f, 0.0442f, 0.11f, 0.25f}) {
+      ob::build_swiglu_silu_lut(sg, lut);
+      for (int32_t q = -128; q <= 127; ++q) {
+        CHECK(static_cast<int32_t>(lut[q + 128]) == ob::eval_swiglu_silu_q(q, sg));
+      }
+    }
+  }
+
+  // 4. Default SwiGLU chains only when O(K) Holder bounds prove zero clipping (zero CPU MACs!),
+  //    routes unproven/correlated warm activations straight to M7A TPU fallback, and rejects null weights in INT8 API.
+  {
+    constexpr uint32_t K = 576u, H = 1536u, N = 576u;
+    const uint32_t nb_k = K / OB_QK8_0;
+    const uint32_t nb_h = H / OB_QK8_0;
+    const uint16_t d_1_128 = fp32_to_fp16(1.0f / 128.0f);
+    const uint16_t d_one = fp32_to_fp16(1.0f);
+
+    std::vector<ob_block_q8_0_t> wg(static_cast<size_t>(H) * nb_k);
+    std::vector<ob_block_q8_0_t> wu(static_cast<size_t>(H) * nb_k);
+    std::vector<ob_block_q8_0_t> wd(static_cast<size_t>(N) * nb_h);
+    std::memset(wg.data(), 0, wg.size() * sizeof(ob_block_q8_0_t));
+    std::memset(wu.data(), 0, wu.size() * sizeof(ob_block_q8_0_t));
+    std::memset(wd.data(), 0, wd.size() * sizeof(ob_block_q8_0_t));
+    for (uint32_t h = 0u; h < H; ++h) {
+      const uint32_t bk0 = (h == 0u) ? 0u : (4u + (h % 14u));
+      const uint32_t bk_cnt = (h == 0u) ? 4u : 1u;
+      for (uint32_t b = 0u; b < bk_cnt; ++b) {
+        ob_block_q8_0_t& bg = wg[static_cast<size_t>(h) * nb_k + bk0 + b];
+        ob_block_q8_0_t& bu = wu[static_cast<size_t>(h) * nb_k + bk0 + b];
+        bg.d = d_1_128;
+        bu.d = d_1_128;
+        for (uint32_t j = 0u; j < OB_QK8_0; ++j) {
+          const int8_t v = ((b * OB_QK8_0 + j) & 1u) ? -127 : 127;
+          bg.qs[j] = v;
+          bu.qs[j] = v;
+        }
+      }
+    }
+    wd[0].d = d_one;
+    wd[0].qs[0] = 1;
+
+    // Cold sparse input: 3 nonzero entries -> crest=13.86 <= 16, l1_aq <= 381, ub <= 48,387 <= 127*512,
+    // and max_prod <= 8128 = 127*64, so O(K) Holder bound proves zero clipping in default mode (zero CPU MACs!).
+    std::vector<float> a_holder(K, 0.0f);
+    for (uint32_t k = 128u; k < 131u; ++k) {
+      a_holder[k] = (k & 1u) ? -0.5f : 0.5f;
+    }
+
+    // Warm clipping input: aligned with row 0 on [0..128) (+/-1.0) + spike 3.0 ->
+    // fails Holder bound; default mode routes directly to M7A TPU fallback with zero CPU recomputation!
+    std::vector<float> a_clip(K, 0.0f);
+    for (uint32_t k = 0u; k < 128u; ++k) {
+      a_clip[k] = (k & 1u) ? -1.0f : 1.0f;
+    }
+    a_clip[575] = 3.0f;
+
+    ob_gemm_swiglu_quant_desc_t sd{wg.data(), wu.data(), wd.data(), 1u, K, H, N, 0u, 0u, 0u, 0u};
+    std::vector<float> c(N, 0.0f);
+
+    ::unsetenv("OPENBUENOS_SWIGLU_FAST_CHAIN");
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    cfg.max_inflight = 1u; // Also exercises 1-credit pinned weight tile path!
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+    CHECK(ctx->swiglu_fast_chain_enabled == false);
+    CHECK(ob_gemm_register_builtin_emitter(ctx, interp_file.path()) == OB_OK);
+
+    // Public ob_gemm_swiglu_int8 must reject any missing weight matrix consistently.
+    {
+      std::vector<int8_t> ix(64u, 1), iy(64u, 0), iw(64u * 64u, 1);
+      ob_swiglu_int8_desc_t id{};
+      id.m_dim = 1u; id.k_dim = 64u; id.h_dim = 64u; id.n_dim = 64u;
+      id.s_in = 1.0f; id.s_wg = 1.0f; id.s_gate = 1.0f;
+      id.s_wu = 1.0f; id.s_up = 1.0f; id.s_silu = 1.0f;
+      id.s_prod = 1.0f; id.s_wd = 1.0f; id.s_out = 1.0f;
+      id.wg_hk = nullptr; id.wu_hk = iw.data(); id.wd_nh = iw.data();
+      CHECK(ob_gemm_swiglu_int8(ctx, ix.data(), &id, iy.data(), nullptr) == OB_ERR_INVALID_ARG);
+      id.wg_hk = iw.data(); id.wu_hk = nullptr; id.wd_nh = iw.data();
+      CHECK(ob_gemm_swiglu_int8(ctx, ix.data(), &id, iy.data(), nullptr) == OB_ERR_INVALID_ARG);
+      id.wg_hk = iw.data(); id.wu_hk = iw.data(); id.wd_nh = nullptr;
+      CHECK(ob_gemm_swiglu_int8(ctx, ix.data(), &id, iy.data(), nullptr) == OB_ERR_INVALID_ARG);
+      // Non-finite scales (NaN / +Inf) must be rejected before synthesis.
+      id.wd_nh = iw.data();
+      id.s_gate = std::numeric_limits<float>::quiet_NaN();
+      CHECK(ob_gemm_swiglu_int8(ctx, ix.data(), &id, iy.data(), nullptr) == OB_ERR_INVALID_ARG);
+      id.s_gate = std::numeric_limits<float>::infinity();
+      CHECK(ob_gemm_swiglu_int8(ctx, ix.data(), &id, iy.data(), nullptr) == OB_ERR_INVALID_ARG);
+    }
+
+    // Cold rejected activation caches 0-byte weight norms so a repeat fallback skips weight conversion,
+    // and a later Holder-proven activation cleanly upgrades the entry to a packed chained tile.
+    ob_invoke_stats_t s0{}, s1{}, s2{};
+    CHECK(ob_gemm_swiglu_f32_quant(ctx, a_clip.data(), &sd, c.data(), &s0) == OB_OK);
+    const uint64_t hits_after_cold_rej = ctx->weight_cache_hits;
+    const uint64_t misses_after_cold_rej = ctx->weight_cache_misses;
+    CHECK(ob_gemm_swiglu_f32_quant(ctx, a_clip.data(), &sd, c.data(), &s0) == OB_OK);
+    CHECK(ctx->weight_cache_hits > hits_after_cold_rej);
+    CHECK(ctx->weight_cache_misses == misses_after_cold_rej);
+
+    CHECK(ob_gemm_swiglu_f32_quant(ctx, a_holder.data(), &sd, c.data(), &s1) == OB_OK);
+    ob_profile_stats_t p1{}, p2{};
+    CHECK(ob_context_get_profile(ctx, &p1) == OB_OK);
+    CHECK(p1.swiglu_chunks_chained == 1u && p1.swiglu_fallbacks == 2u);
+
+    CHECK(ob_gemm_swiglu_f32_quant(ctx, a_clip.data(), &sd, c.data(), &s2) == OB_OK);
+    CHECK(ob_context_get_profile(ctx, &p2) == OB_OK);
+    CHECK(p2.swiglu_chunks_chained == 1u && p2.swiglu_fallbacks == 3u);
+    const double expected_dot = 128.0 * (127.0 / 128.0);
+    const double expected_y0 = (expected_dot / (1.0 + std::exp(-expected_dot))) * expected_dot;
+    CHECK(std::fabs(static_cast<double>(c[0]) - expected_y0) / expected_y0 < 5e-3);
+
+    // Tiny activation scale (s_gate < 5e-4, normal crest/RMS) must bypass chained 0x640 SiLU spline via M7A fallback!
+    std::vector<float> a_tiny(K, 0.0f);
+    for (uint32_t k = 0u; k < 10u; ++k) a_tiny[560u + k] = 1.0e-6f;
+    ob_profile_stats_t pt0{}, pt1{};
+    CHECK(ob_context_get_profile(ctx, &pt0) == OB_OK);
+    CHECK(ob_gemm_swiglu_f32_quant(ctx, a_tiny.data(), &sd, c.data(), &s2) == OB_OK);
+    CHECK(ob_context_get_profile(ctx, &pt1) == OB_OK);
+    CHECK(pt1.swiglu_fallbacks == pt0.swiglu_fallbacks + 1u);
+    CHECK(pt1.swiglu_chunks_chained == pt0.swiglu_chunks_chained);
+    ob_context_destroy(ctx);
+  }
+
+  // 7. CPU-only fallback without an emitter must NOT increment tiles_dispatched.
+  {
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+    CHECK(ob_gemm_register_emitter(ctx, nullptr, nullptr) == OB_OK);
+
+    std::vector<float> af(64u, 0.25f), cf(64u, 0.0f);
+    std::vector<ob_block_q8_0_t> bq(64u * 2u);
+    for (auto& blk : bq) {
+      blk.d = fp32_to_fp16(0.5f);
+      std::memset(blk.qs, 2, sizeof(blk.qs));
+    }
+    ob_invoke_stats_t sf{};
+    CHECK(ob_gemm_matmul_f32_q8_0(ctx, af.data(), bq.data(), cf.data(), 1u, 64u, 64u, &sf) == OB_OK);
+    CHECK(sf.tiles_dispatched == 0u);
+    CHECK((sf.flags & OB_STAT_FLAG_CPU_FALLBACK) != 0u);
+    CHECK((sf.flags & OB_STAT_FLAG_EMITTER_USED) == 0u);
+    CHECK(std::fabs(cf[0] - 16.0f) < 1e-4f);
+
+    std::vector<int8_t> ai(64u, 2), bi(64u * 64u, 3);
+    std::vector<int32_t> ci(64u, 0);
+    ob_invoke_stats_t si{};
+    CHECK(ob_gemm_matmul_int8(ctx, ai.data(), bi.data(), nullptr, ci.data(), 1u, 64u, 64u, 0, 0, &si) == OB_OK);
+    CHECK(si.tiles_dispatched == 0u);
+    CHECK((si.flags & OB_STAT_FLAG_CPU_FALLBACK) != 0u);
+    CHECK((si.flags & OB_STAT_FLAG_EMITTER_USED) == 0u);
+    CHECK(ci[0] == 384);
+
+    ob_profile_stats_t ps{};
+    CHECK(ob_context_get_profile(ctx, &ps) == OB_OK);
+    CHECK(ps.tiles_dispatched == 0u);
+    ob_context_destroy(ctx);
+  }
+
+  // 8. Oversized cached hit must retire when budget shrinks below tile size,
+  //    and subsequent transient uncached uploads must increment weight_cache_misses.
+  {
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+    CHECK(ob_gemm_register_builtin_emitter(ctx, interp_file.path()) == OB_OK);
+    // Start with ample budget so a 1x1536x2048 tile (~3 MiB) is cached.
+    ctx->simulated_mem_available_bytes = 512ULL * 1024ULL * 1024ULL;
+    ctx->simulated_mem_available_set = true;
+
+    constexpr uint32_t K = 1536u, N = 2048u;
+    std::vector<float> af(K, 0.25f), cf(N, 0.0f);
+    std::vector<ob_block_q8_0_t> bq(static_cast<size_t>(N) * (K / OB_QK8_0));
+    for (auto& blk : bq) {
+      blk.d = fp32_to_fp16(0.05f);
+      std::memset(blk.qs, 3, sizeof(blk.qs));
+    }
+    ob_invoke_stats_t s{};
+    CHECK(ob_gemm_matmul_f32_q8_0(ctx, af.data(), bq.data(), cf.data(), 1u, K, N, &s) == OB_OK);
+    CHECK(ctx->weight_cache_map.size() == 1u);
+    CHECK(ctx->weight_cache_bytes >= 3ULL * 1024ULL * 1024ULL);
+    CHECK(ctx->weight_cache_misses == 1u);
+
+    // Drop budget to the 1 MiB floor (< 3 MiB tile): warm hit must retire the oversized tile.
+    ctx->simulated_mem_available_bytes = 1ULL;
+    CHECK(ob_gemm_matmul_f32_q8_0(ctx, af.data(), bq.data(), cf.data(), 1u, K, N, &s) == OB_OK);
+    CHECK(ctx->weight_cache_hits == 1u);
+    CHECK(ctx->weight_cache_evictions == 1u);
+    CHECK(ctx->weight_cache_map.empty());
+    CHECK(ctx->weight_cache_bytes == 0u);
+
+    // Next call under 1 MiB budget uses a transient uncached upload and must count a miss.
+    CHECK(ob_gemm_matmul_f32_q8_0(ctx, af.data(), bq.data(), cf.data(), 1u, K, N, &s) == OB_OK);
+    CHECK(ctx->weight_cache_misses == 2u);
+    CHECK(ctx->weight_cache_map.empty());
+    CHECK(ctx->weight_cache_bytes == 0u);
+    ob_context_destroy(ctx);
+  }
+
+  // 9. Exact INT8 SwiGLU stage profiling + single fallback count per multi-slice invocation.
+  {
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+    CHECK(ob_gemm_register_builtin_emitter(ctx, interp_file.path()) == OB_OK);
+    CHECK(ob_context_set_profile(ctx, 1) == OB_OK);
+    CHECK(ob_context_reset_profile(ctx) == OB_OK);
+
+    // 9a. Exact INT8 SwiGLU must populate stage timings when profiling is enabled.
+    constexpr uint32_t K = 576u, H = 1536u, N = 576u;
+    std::vector<int8_t> xi(64u * K, 1), wg(512u * K, 1), wu(512u * K, 1), wd(N * 512u, 1), yi(64u * N, 0);
+    ob_swiglu_int8_desc_t id{};
+    id.m_dim = 64u; id.k_dim = K; id.h_dim = 512u; id.n_dim = N;
+    id.s_in = 0.01f; id.s_wg = 0.01f; id.s_gate = 0.05f;
+    id.s_wu = 0.01f; id.s_up = 0.05f; id.s_silu = 0.05f;
+    id.s_prod = 0.05f; id.s_wd = 0.01f; id.s_out = 0.05f;
+    id.wg_hk = wg.data(); id.wu_hk = wu.data(); id.wd_nh = wd.data();
+    ob_invoke_stats_t is{};
+    for (int iter = 0; iter < 8; ++iter) {
+      CHECK(ob_gemm_swiglu_int8(ctx, xi.data(), &id, yi.data(), &is) == OB_OK);
+    }
+    ob_profile_stats_t pi{};
+    CHECK(ob_context_get_profile(ctx, &pi) == OB_OK);
+    CHECK(pi.swiglu_calls == 8u);
+    CHECK(ctx->prof.weight_pack_ns > 0u);
+    CHECK(ctx->prof.submit_ns > 0u);
+    CHECK(ctx->prof.dma_sync_ns > 0u);
+    CHECK(ctx->prof.total_wall_ns > 0u);
+
+    // 9b. Multi-slice prefill fallback (M=66 = 64 + 2, high RMS) must count 1 fallback call, not 2.
+    ctx->swiglu_prefill_enabled = true;
+    ctx->batched_large_tiles_enabled = true;
+    constexpr uint32_t M66 = 66u;
+    std::vector<float> a66(static_cast<size_t>(M66) * K, 1.0f);
+    std::vector<float> c66(static_cast<size_t>(M66) * N, 0.0f);
+    std::vector<ob_block_q8_0_t> bq_g(static_cast<size_t>(H) * (K / OB_QK8_0));
+    std::vector<ob_block_q8_0_t> bq_d(static_cast<size_t>(N) * (H / OB_QK8_0));
+    for (auto& blk : bq_g) { blk.d = fp32_to_fp16(0.02f); std::memset(blk.qs, 2, sizeof(blk.qs)); }
+    for (auto& blk : bq_d) { blk.d = fp32_to_fp16(0.02f); std::memset(blk.qs, 2, sizeof(blk.qs)); }
+    ob_gemm_swiglu_quant_desc_t sd66{};
+    sd66.m_dim = M66; sd66.k_dim = K; sd66.h_dim = H; sd66.n_dim = N;
+    sd66.w_gate_hk = bq_g.data();
+    sd66.w_up_hk = bq_g.data();
+    sd66.w_down_nh = bq_d.data();
+    ob_profile_stats_t pf0{}, pf1{};
+    CHECK(ob_context_get_profile(ctx, &pf0) == OB_OK);
+    CHECK(ob_gemm_swiglu_f32_quant(ctx, a66.data(), &sd66, c66.data(), &is) == OB_OK);
+    CHECK(ob_context_get_profile(ctx, &pf1) == OB_OK);
+    CHECK(pf1.swiglu_fallbacks == pf0.swiglu_fallbacks + 1u);
+
+    // 9c. M=64 horizontal scheduler must keep narrow padded output tails (e.g. 64->128) on lt_64x TPU path.
+    CHECK(ob_gemm_set_tile_limits(ctx, 64u, 576u, 1536u) == OB_OK);
+    constexpr uint32_t M64 = 64u, N1 = 1536u, N2 = 1600u;
+    std::vector<float> a64(static_cast<size_t>(M64) * K, 0.25f);
+    std::vector<float> c_n1(static_cast<size_t>(M64) * N1, 0.0f);
+    std::vector<float> c_n2(static_cast<size_t>(M64) * N2, 0.0f);
+    std::vector<ob_block_q8_0_t> b_n1(static_cast<size_t>(N1) * (K / OB_QK8_0));
+    std::vector<ob_block_q8_0_t> b_n2(static_cast<size_t>(N2) * (K / OB_QK8_0));
+    for (auto& blk : b_n1) { blk.d = fp32_to_fp16(0.02f); std::memset(blk.qs, 2, sizeof(blk.qs)); }
+    for (auto& blk : b_n2) { blk.d = fp32_to_fp16(0.02f); std::memset(blk.qs, 2, sizeof(blk.qs)); }
+    ob_gemm_f32_quant_job_t jobs2[2]{};
+    jobs2[0].b_nk = b_n1.data(); jobs2[0].c_mn = c_n1.data(); jobs2[0].n_dim = N1;
+    jobs2[1].b_nk = b_n2.data(); jobs2[1].c_mn = c_n2.data(); jobs2[1].n_dim = N2;
+    ob_invoke_stats_t s64_tail{};
+    CHECK(ob_gemm_matmul_f32_quant_batch(ctx, a64.data(), M64, K, jobs2, 2u, &s64_tail) == OB_OK);
+    CHECK(s64_tail.tiles_dispatched == 3u);
+    CHECK((s64_tail.flags & OB_STAT_FLAG_EMITTER_USED) != 0u);
+
+    // 9d. Exact INT8 SwiGLU scale ratios must not overflow float intermediates (2^64 * 2^64 / 2^64)
+    //     and must reject non-finite derived hardware multipliers.
+    {
+      constexpr float k2p64 = 18446744073709551616.0f;
+      std::vector<int8_t> xz(K, 0), wgz(H * K, 0), wuz(H * K, 0), wdz(N * H, 0), yz(N, 7);
+      ob_swiglu_int8_desc_t big_d{};
+      big_d.m_dim = 1u; big_d.k_dim = K; big_d.h_dim = H; big_d.n_dim = N;
+      big_d.s_in = 1.0f; big_d.s_wg = 1.0f; big_d.s_gate = 1.0f;
+      big_d.s_wu = 1.0f; big_d.s_up = 1.0f; big_d.s_silu = 1.0f;
+      big_d.s_prod = k2p64; big_d.s_wd = k2p64; big_d.s_out = k2p64;
+      big_d.wg_hk = wgz.data(); big_d.wu_hk = wuz.data(); big_d.wd_nh = wdz.data();
+      CHECK(ob_gemm_swiglu_int8(ctx, xz.data(), &big_d, yz.data(), &is) == OB_OK);
+      CHECK(yz[0] == 0);
+      big_d.s_out = 1.0f; // m_down = 2^128 -> non-finite float -> must be rejected!
+      CHECK(ob_gemm_swiglu_int8(ctx, xz.data(), &big_d, yz.data(), &is) == OB_ERR_INVALID_ARG);
+    }
+
+    // 9e. Weight cache must charge rounded DMA-BUF slab bytes (4 KiB min), not raw payload bytes.
+    {
+      ob_config_t cfg_s = ob_config_default();
+      cfg_s.mock_mode = 1;
+      ob_context_t* sctx = nullptr;
+      CHECK(ob_context_create(&cfg_s, &sctx) == OB_OK);
+      CHECK(ob_gemm_register_builtin_emitter(sctx, interp_file.path()) == OB_OK);
+      std::vector<int8_t> as(16u, 1), bs(16u * 16u, 2);
+      std::vector<int32_t> cs(16u, 0);
+      ob_invoke_stats_t ss{};
+      CHECK(ob_gemm_matmul_int8(sctx, as.data(), bs.data(), nullptr, cs.data(), 1u, 16u, 16u, 0, 0, &ss) == OB_OK);
+      CHECK(sctx->weight_cache_map.size() == 1u);
+      CHECK(sctx->weight_cache_bytes == 4096u);
+      ob_context_destroy(sctx);
+    }
+    ob_context_destroy(ctx);
+  }
+
+  std::printf("[PASS] test_phase7_cycle3_regressions (dense 16MiB cap, immutable gen+O(1) hit, warm budget shrink, refcnt timeout retention, warm SwiGLU clip guard, cpu-only tiles_dispatched=0, int8 stage prof & single fallback count OK)\n");
+}
+
 void test_phase8a_overlapped_neon_worker_pool_and_swiglu_m64() {
   // 1. Persistent WorkerPool correctness across thread counts {1, 2, 4, 8} + clean shutdown
   for (uint32_t nt : {1u, 2u, 4u, 8u}) {
@@ -4159,6 +4935,7 @@ void test_phase8a_overlapped_neon_worker_pool_and_swiglu_m64() {
     CHECK(ifile19b.write(si19b.data(), si19b.size()));
     CHECK(ob_gemm_register_builtin_emitter(ctx, ifile19b.path()) == OB_OK);
     ctx->swiglu_prefill_enabled = true;
+    ctx->swiglu_fast_chain_enabled = true;
     std::vector<float> c_ref(static_cast<size_t>(M) * N, 0.0f);
     ob_gemm_swiglu_quant_desc_t sd{};
     sd.w_gate_hk = g4.data(); sd.w_up_hk = u4.data(); sd.w_down_nh = d4.data();
@@ -4540,6 +5317,30 @@ void test_phase8b_spsc_async_dequant_and_w8a16_pt() {
 }  // namespace
 
 int main() {
+  // Isolate host tests from caller runtime feature toggles (preserve OPENBUENOS_CORPUS_DIR).
+  static constexpr const char* kIsolatedEnvVars[] = {
+      "OPENBUENOS_DISABLE_LARGE_TILES",
+      "OPENBUENOS_DISABLE_BATCHED_LARGE_TILES",
+      "OPENBUENOS_DISABLE_HORIZ_FUSION",
+      "OPENBUENOS_DISABLE_SWIGLU_CHAIN",
+      "OPENBUENOS_SWIGLU_FAST_CHAIN",
+      "OPENBUENOS_SWIGLU_PREFILL",
+      "OPENBUENOS_SWIGLU_EXACT_CLIP_CHECK",
+      "OPENBUENOS_SWIGLU_MAX_CREST",
+      "OPENBUENOS_STRICT_WEIGHT_HASH",
+      "OPENBUENOS_WEIGHT_CACHE_MB",
+      "OPENBUENOS_PARAM_SWAP_SLOTS",
+      "OPENBUENOS_SPIN_US",
+      "OPENBUENOS_THREADS",
+      "OPENBUENOS_ASYNC_DEQUANT",
+      "OPENBUENOS_W8A16",
+      "OPENBUENOS_MAX_OUTLIER_COLS",
+      "OPENBUENOS_PROFILE",
+      "OPENBUENOS_VERBOSE",
+  };
+  for (const char* name : kIsolatedEnvVars) {
+    ::unsetenv(name);
+  }
   test_buffer_pool();
   test_dgc0_parser();
   test_graph_cache();
@@ -4558,11 +5359,13 @@ int main() {
   test_quant_batch_q4_0_dvfs_and_fd_caps();
   test_phase7a_neon_horiz_fusion_profiler_and_lmkd();
   test_phase7b_swiglu_chaining_2tier_and_outlier_cache();
+  test_phase7_cycle2_regressions();
+  test_phase7_cycle3_regressions();
   test_phase8a_overlapped_neon_worker_pool_and_swiglu_m64();
   test_phase8b_spsc_async_dequant_and_w8a16_pt();
 
   if (g_failures == 0) {
-    std::printf("ALL LIBOPENBUENOS HOST TESTS PASSED (20/20 suites)\n");
+    std::printf("ALL LIBOPENBUENOS HOST TESTS PASSED (22/22 suites)\n");
     return 0;
   }
   std::fprintf(stderr, "LIBOPENBUENOS HOST TESTS FAILED (%d failures)\n", g_failures);

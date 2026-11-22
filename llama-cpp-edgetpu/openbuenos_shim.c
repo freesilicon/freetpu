@@ -10,6 +10,7 @@
 #include "openbuenos.h"
 
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -268,7 +269,7 @@ ob_status_t ob_gemm_matmul_int8(ob_context_t *      ctx,
         memset(out_stats, 0, sizeof(*out_stats));
         out_stats->wall_time_us     = ob_shim_now_us() - t0;
         out_stats->flags            = (uint16_t)(OB_STAT_FLAG_MOCK | OB_STAT_FLAG_CPU_FALLBACK);
-        out_stats->tiles_dispatched = 1u;
+        out_stats->tiles_dispatched = 0u;
     }
     return OB_OK;
 }
@@ -311,7 +312,7 @@ ob_status_t ob_gemm_matmul_f32_q8_0(ob_context_t *      ctx,
         memset(out_stats, 0, sizeof(*out_stats));
         out_stats->wall_time_us     = ob_shim_now_us() - t0;
         out_stats->flags            = (uint16_t)(OB_STAT_FLAG_MOCK | OB_STAT_FLAG_CPU_FALLBACK);
-        out_stats->tiles_dispatched = 1u;
+        out_stats->tiles_dispatched = 0u;
     }
     return OB_OK;
 }
@@ -364,7 +365,27 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t *                  ctx,
         memset(out_stats, 0, sizeof(*out_stats));
         out_stats->wall_time_us     = ob_shim_now_us() - t0;
         out_stats->flags            = (uint16_t)(OB_STAT_FLAG_MOCK | OB_STAT_FLAG_CPU_FALLBACK);
-        out_stats->tiles_dispatched = num_jobs;
+        out_stats->tiles_dispatched = 0u;
+    }
+    return OB_OK;
+}
+
+ob_status_t ob_gemm_register_immutable_weights(ob_context_t * ctx,
+                                               const void *   base,
+                                               size_t         size,
+                                               uint64_t       version) {
+    if (!ctx || !base || size == 0u) {
+        return OB_ERR_INVALID_ARG;
+    }
+    (void)version;
+    return OB_OK;
+}
+
+ob_status_t ob_gemm_unregister_immutable_weights(ob_context_t * ctx,
+                                                 const void *   base,
+                                                 size_t         size) {
+    if (!ctx || (!base && size != 0u)) {
+        return OB_ERR_INVALID_ARG;
     }
     return OB_OK;
 }
@@ -380,9 +401,14 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t *                      ctx,
         return OB_ERR_INVALID_ARG;
     }
     const uint64_t t0 = ob_shim_now_us();
-    const size_t mh = (size_t)desc->m_dim * desc->h_dim;
-    float * gate_buf = (float *)malloc(mh * sizeof(float));
-    float * up_buf   = (float *)malloc(mh * sizeof(float));
+    if ((size_t)desc->m_dim > SIZE_MAX / sizeof(float) ||
+        (size_t)desc->h_dim > (SIZE_MAX / sizeof(float)) / (size_t)desc->m_dim) {
+        return OB_ERR_INVALID_ARG;
+    }
+    const size_t mh = (size_t)desc->m_dim * (size_t)desc->h_dim;
+    const size_t scratch_bytes = mh * sizeof(float);
+    float * gate_buf = (float *)malloc(scratch_bytes);
+    float * up_buf   = (float *)malloc(scratch_bytes);
     if (!gate_buf || !up_buf) {
         free(gate_buf);
         free(up_buf);
@@ -422,7 +448,7 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t *                      ctx,
         memset(out_stats, 0, sizeof(*out_stats));
         out_stats->wall_time_us     = ob_shim_now_us() - t0;
         out_stats->flags            = (uint16_t)(OB_STAT_FLAG_MOCK | OB_STAT_FLAG_CPU_FALLBACK);
-        out_stats->tiles_dispatched = 1u;
+        out_stats->tiles_dispatched = 0u;
     }
     return OB_OK;
 }
