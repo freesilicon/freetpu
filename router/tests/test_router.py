@@ -7,6 +7,7 @@ import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
+import os
 from pathlib import Path
 import socket
 import sys
@@ -25,8 +26,10 @@ from router.config import BackendConfig, RouterConfig, load_config  # noqa: E402
 from router.freetpu_router import (  # noqa: E402
     FreeTPURouterServer,
     MAX_RR_CURSORS,
+    _apply_cli_overrides,
     _build_cli_parser,
     _open_http_connection,
+    _safe_nonneg_int,
     build_hooks_from_config,
     create_router_server,
     main as router_main,
@@ -72,6 +75,7 @@ class _MockOpenAIBackend(ThreadingHTTPServer):
         post_token_keepalive_interval_s: Optional[float] = None,
         hold_after_done_event: Optional[threading.Event] = None,
         slow_drip_probe_interval_s: Optional[float] = None,
+        custom_non_stream_payload: Optional[Dict[str, Any]] = None,
         prompt_tokens: int = 12,
         completion_tokens: int = 8,
     ) -> None:
@@ -91,6 +95,7 @@ class _MockOpenAIBackend(ThreadingHTTPServer):
         self.post_token_keepalive_interval_s = post_token_keepalive_interval_s
         self.hold_after_done_event = hold_after_done_event
         self.slow_drip_probe_interval_s = slow_drip_probe_interval_s
+        self.custom_non_stream_payload = custom_non_stream_payload
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
         self.requests_seen: List[Dict[str, Any]] = []
@@ -371,6 +376,10 @@ class _MockOpenAIHandler(BaseHTTPRequestHandler):
                     },
                 },
             )
+            return
+
+        if self.server.custom_non_stream_payload is not None:
+            self._send_json(200, self.server.custom_non_stream_payload)
             return
 
         self._send_json(
@@ -3740,6 +3749,383 @@ class TestFreeTPURouter(unittest.TestCase):
         self.assertEqual(ev2.prompt_tokens, 0)
         self.assertEqual(ev2.completion_tokens, 0)
         self.assertEqual(ev2.estimated_cost_usd, 0.0)
+
+    def test_round_robin_cursor_keys_are_fixed_size_hashes(self) -> None:
+        wc_a = self._track(_MockOpenAIBackend("wc-hash-a", ["m-a"]))
+        wc_b = self._track(_MockOpenAIBackend("wc-hash-b", ["m-b"]))
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="round_robin",
+            backends=[
+                BackendConfig(
+                    id="wc-hash-a",
+                    type="cloud-tpu-v5e",
+                    base_url=wc_a.base_url,
+                    models=["*"],
+                    discover_models=False,
+                    priority=10,
+                ),
+                BackendConfig(
+                    id="wc-hash-b",
+                    type="cloud-tpu-v5e",
+                    base_url=wc_b.base_url,
+                    models=["*"],
+                    discover_models=False,
+                    priority=20,
+                ),
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        huge_a = "huge-model-a-" + ("x" * 32768)
+        huge_b = "huge-model-b-" + ("y" * 32768)
+        seen: Dict[str, List[str]] = {huge_a: [], huge_b: []}
+        for model_name in (huge_a, huge_b, huge_a, huge_b):
+            status, hdrs, _ = _http_request(
+                rport,
+                "POST",
+                "/v1/chat/completions",
+                body={"model": model_name, "messages": [{"role": "user", "content": "rr"}]},
+            )
+            self.assertEqual(status, 200)
+            seen[model_name].append(hdrs["x-freetpu-backend"])
+
+        self.assertEqual(seen[huge_a], ["wc-hash-a", "wc-hash-b"])
+        self.assertEqual(seen[huge_b], ["wc-hash-a", "wc-hash-b"])
+        self.assertEqual(len(router.engine._rr_cursors), 2)
+        for cursor_key in router.engine._rr_cursors.keys():
+            self.assertIsInstance(cursor_key, bytes)
+            self.assertEqual(len(cursor_key), 32)
+
+    def test_post_commit_sse_event_size_budget_enforced(self) -> None:
+        first_tok = json.dumps(
+            {
+                "id": "chatcmpl-postcap",
+                "object": "chat.completion.chunk",
+                "model": "m-postcap",
+                "choices": [
+                    {"index": 0, "delta": {"content": "Hello "}, "finish_reason": None}
+                ],
+            }
+        )
+        # Case A: valid first token, then oversized line with no newline (>1024 bytes).
+        oversized_no_nl = (
+            f"data: {first_tok}\n\n".encode("utf-8")
+            + b"data: "
+            + (b"A" * 4096)
+        )
+        # Case B: valid first token, then multi-line unterminated event exceeding 1024 bytes.
+        oversized_multiline = (
+            f"data: {first_tok}\n\n".encode("utf-8")
+            + (b"data: " + (b"B" * 100) + b"\n") * 20
+        )
+
+        for label, payload_bytes in (
+            ("no_newline", oversized_no_nl),
+            ("multiline", oversized_multiline),
+        ):
+            with self.subTest(case=label):
+                backend = self._track(
+                    _MockOpenAIBackend(
+                        f"oversize-{label}",
+                        ["m-postcap"],
+                        raw_sse_bytes=payload_bytes,
+                    )
+                )
+                cfg = RouterConfig(
+                    host="127.0.0.1",
+                    port=0,
+                    policy="local_first",
+                    max_sse_pre_commit_bytes=1024,
+                    backends=[
+                        BackendConfig(
+                            id=f"oversize-{label}",
+                            type="cloud-tpu-v5e",
+                            base_url=backend.base_url,
+                            timeout_s=2.0,
+                        )
+                    ],
+                )
+                router = self._track(create_router_server(cfg))
+                rport = router.server_address[1]
+
+                conn = http.client.HTTPConnection("127.0.0.1", rport, timeout=3.0)
+                try:
+                    req_body = json.dumps(
+                        {
+                            "model": "m-postcap",
+                            "stream": True,
+                            "messages": [{"role": "user", "content": "hi"}],
+                        }
+                    ).encode("utf-8")
+                    conn.request(
+                        "POST",
+                        "/v1/chat/completions",
+                        body=req_body,
+                        headers={"Content-Type": "application/json"},
+                    )
+                    resp = conn.getresponse()
+                    self.assertEqual(resp.status, 200)
+                    with self.assertRaises(http.client.IncompleteRead) as exc_info:
+                        resp.read()
+                    partial = exc_info.exception.partial.decode("utf-8", errors="replace")
+                    self.assertIn("Hello ", partial)
+                    self.assertIn("upstream_stream_interrupted", partial)
+                finally:
+                    conn.close()
+
+                self.assertEqual(router.engine._backends[0].inflight, 0)
+                self.assertGreater(
+                    router.engine._backends[0].cooldown_until_monotonic,
+                    time.monotonic(),
+                )
+                m_status, _, m_body = _http_request(rport, "GET", "/metrics")
+                self.assertEqual(m_status, 200)
+                self.assertIn('status="502"', m_body.decode("utf-8"))
+
+    def test_cli_bearer_token_env_preserves_exempt_paths(self) -> None:
+        backend = self._track(_MockOpenAIBackend("cli-auth-b", ["m-cli-auth"]))
+        cfg_path = Path(self._tmpdir.name) / "auth_no_exempt.json"
+        cfg_path.write_text(
+            json.dumps(
+                {
+                    "host": "127.0.0.1",
+                    "port": 0,
+                    "policy": "local_first",
+                    "auth": {
+                        "type": "bearer",
+                        "tokens": ["old-config-token"],
+                        "exempt_paths": [],
+                    },
+                    "backends": [
+                        {
+                            "id": "cli-auth-b",
+                            "base_url": backend.base_url,
+                            "models": ["m-cli-auth"],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        env_key = "FREETPU_TEST_CLI_PRESERVE_EXEMPT"
+        prev_val = os.environ.get(env_key)
+        os.environ[env_key] = "env-override-secret"
+        try:
+            argv = [
+                "--check-config",
+                "--config",
+                str(cfg_path),
+                "--bearer-token-env",
+                env_key,
+            ]
+            self.assertEqual(router_main(argv), 0)
+
+            args = _build_cli_parser().parse_args(argv)
+            cfg = load_config(args.config)
+            _apply_cli_overrides(cfg, args)
+            cfg.validate()
+            self.assertEqual(cfg.auth.get("exempt_paths"), [])
+            self.assertEqual(cfg.auth.get("tokens_env"), [env_key])
+
+            router = self._track(create_router_server(cfg))
+            rport = router.server_address[1]
+
+            # /health must remain authenticated because exempt_paths=[] was preserved.
+            status_unauth, _, _ = _http_request(rport, "GET", "/health")
+            self.assertEqual(status_unauth, 401)
+
+            status_old, _, _ = _http_request(
+                rport,
+                "GET",
+                "/health",
+                headers={"Authorization": "Bearer old-config-token"},
+            )
+            self.assertEqual(status_old, 401)
+
+            status_ok, _, _ = _http_request(
+                rport,
+                "GET",
+                "/health",
+                headers={"Authorization": "Bearer env-override-secret"},
+            )
+            self.assertEqual(status_ok, 200)
+        finally:
+            if prev_val is None:
+                os.environ.pop(env_key, None)
+            else:
+                os.environ[env_key] = prev_val
+
+    def test_invalid_backend_and_router_timeouts_rejected(self) -> None:
+        for bad_timeout in (0, -1, -0.5, float("nan"), float("inf"), True, False, "30"):
+            with self.assertRaises(ValueError):
+                BackendConfig(
+                    id="bad-timeout-direct",
+                    base_url="http://127.0.0.1:8081/v1",
+                    timeout_s=bad_timeout,  # type: ignore[arg-type]
+                )
+            with self.assertRaises(ValueError):
+                BackendConfig.from_dict(
+                    {
+                        "id": "bad-timeout-dict",
+                        "base_url": "http://127.0.0.1:8081/v1",
+                        "timeout_s": bad_timeout,
+                    }
+                )
+
+        valid_backend = BackendConfig(id="ok-b", base_url="http://127.0.0.1:8081/v1")
+        for field_name, bad_val in (
+            ("probe_timeout_s", 0),
+            ("probe_timeout_s", -2.0),
+            ("probe_timeout_s", float("nan")),
+            ("probe_timeout_s", True),
+            ("request_timeout_s", 0),
+            ("request_timeout_s", float("inf")),
+            ("health_poll_interval_s", -1.0),
+            ("failure_cooldown_s", -0.1),
+            ("client_read_timeout_s", 0.0),
+            ("client_header_timeout_s", -1.0),
+            ("backend_idle_timeout_s", 0.0),
+        ):
+            with self.assertRaises(ValueError):
+                RouterConfig(backends=[valid_backend], **{field_name: bad_val})  # type: ignore[arg-type]
+            with self.assertRaises(ValueError):
+                RouterConfig.from_dict(
+                    {
+                        "backends": [
+                            {"id": "ok-b", "base_url": "http://127.0.0.1:8081/v1"}
+                        ],
+                        field_name: bad_val,
+                    }
+                )
+
+        bad_cfg_path = Path(self._tmpdir.name) / "bad_backend_timeout.json"
+        bad_cfg_path.write_text(
+            json.dumps(
+                {
+                    "backends": [
+                        {
+                            "id": "neg-timeout",
+                            "base_url": "http://127.0.0.1:8081/v1",
+                            "timeout_s": -5,
+                            "models": ["m1"],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        stderr_buf = io.StringIO()
+        with redirect_stderr(stderr_buf):
+            rc = router_main(["--check-config", "--config", str(bad_cfg_path)])
+        self.assertNotEqual(rc, 0)
+        self.assertIn("timeout_s", stderr_buf.getvalue())
+
+    def test_malformed_usage_and_timings_counts_fallback_without_aborting(self) -> None:
+        # Direct parser edge cases.
+        self.assertEqual(_safe_nonneg_int(0), 0)
+        self.assertEqual(_safe_nonneg_int(42), 42)
+        self.assertEqual(_safe_nonneg_int(12.0), 12)
+        self.assertEqual(_safe_nonneg_int(" 19 "), 19)
+        for bad in (None, True, False, -1, 1.5, float("nan"), float("inf"), "N/A", "²", {}):
+            self.assertIsNone(_safe_nonneg_int(bad))
+
+        non_stream_payload = {
+            "id": "chatcmpl-malformed-usage",
+            "object": "chat.completion",
+            "model": "m-malformed",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "Completed answer with twenty characters!",
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": "N/A", "completion_tokens": -4},
+            "timings": {"prompt_n": True, "predicted_n": "bad"},
+        }
+        sse_tok = json.dumps(
+            {
+                "id": "chatcmpl-malformed-sse",
+                "object": "chat.completion.chunk",
+                "model": "m-malformed",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": "Streamed text that must still succeed"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": {}, "completion_tokens": "oops"},
+                "timings": {"prompt_n": -1, "predicted_n": False},
+            }
+        )
+        backend = self._track(
+            _MockOpenAIBackend(
+                "malformed-counts-b",
+                ["m-malformed"],
+                custom_non_stream_payload=non_stream_payload,
+                raw_sse_bytes=f"data: {sse_tok}\n\ndata: [DONE]\n\n".encode("utf-8"),
+            )
+        )
+        captured: List[UsageEvent] = []
+        usage_hook = JsonlUsageMeterHook(
+            Path(self._tmpdir.name) / "malformed_counts.jsonl",
+            callback=captured.append,
+        )
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            backends=[
+                BackendConfig(
+                    id="malformed-counts-b",
+                    type="cloud-tpu-v5e",
+                    base_url=backend.base_url,
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg, usage_hook=usage_hook))
+        rport = router.server_address[1]
+
+        # 1. Non-streaming response succeeds with HTTP 200 and estimated token fallback.
+        status_ns, _, body_ns = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-malformed",
+                "messages": [{"role": "user", "content": "hello malformed usage"}],
+            },
+        )
+        self.assertEqual(status_ns, 200)
+        self.assertIn("Completed answer", body_ns.decode("utf-8"))
+
+        # 2. Streaming response succeeds cleanly with HTTP 200 and estimated token fallback.
+        status_s, _, body_s = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-malformed",
+                "stream": True,
+                "messages": [{"role": "user", "content": "hello malformed sse usage"}],
+            },
+        )
+        self.assertEqual(status_s, 200)
+        self.assertIn("Streamed text that must still succeed", body_s.decode("utf-8"))
+        self.assertIn("data: [DONE]", body_s.decode("utf-8"))
+
+        self.assertEqual(len(captured), 2)
+        for ev in captured:
+            self.assertEqual(ev.status_code, 200)
+            self.assertGreater(ev.prompt_tokens, 0)
+            self.assertGreater(ev.completion_tokens, 0)
 
 
 def run_self_tests(verbosity: int = 1) -> int:

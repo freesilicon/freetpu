@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
@@ -36,6 +37,45 @@ def _require_bool(
         raise ValueError(
             f"{context} field {key!r} must be a JSON boolean (true/false), got {val!r}"
         )
+    return val
+
+
+def _validate_finite_number(
+    val: Any,
+    *,
+    name: str,
+    min_value: Optional[float] = None,
+    strictly_greater: bool = False,
+    max_value: Optional[float] = None,
+) -> float:
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        raise ValueError(f"{name} must be a finite number, got {val!r}")
+    fval = float(val)
+    if not math.isfinite(fval):
+        raise ValueError(f"{name} must be finite, got {val!r}")
+    if min_value is not None:
+        if strictly_greater and fval <= min_value:
+            raise ValueError(f"{name} must be > {min_value}, got {val!r}")
+        if not strictly_greater and fval < min_value:
+            raise ValueError(f"{name} must be >= {min_value}, got {val!r}")
+    if max_value is not None and fval > max_value:
+        raise ValueError(f"{name} must be <= {max_value}, got {val!r}")
+    return fval
+
+
+def _validate_int_range(
+    val: Any,
+    *,
+    name: str,
+    min_value: int,
+    max_value: Optional[int] = None,
+) -> int:
+    if isinstance(val, bool) or not isinstance(val, int):
+        raise ValueError(f"{name} must be an integer, got {val!r}")
+    if val < min_value:
+        raise ValueError(f"{name} must be >= {min_value}, got {val!r}")
+    if max_value is not None and val > max_value:
+        raise ValueError(f"{name} must be <= {max_value}, got {val!r}")
     return val
 
 
@@ -136,6 +176,51 @@ class BackendConfig:
                 self.tpu_exporter_url,
                 field_name=f"backend {self.id!r} tpu_exporter_url",
             )
+        ctx = f"Backend {self.id!r}"
+        _validate_finite_number(
+            self.cost_per_1m_prompt_usd,
+            name=f"{ctx} cost_per_1m_prompt_usd",
+            min_value=0.0,
+        )
+        _validate_finite_number(
+            self.cost_per_1m_completion_usd,
+            name=f"{ctx} cost_per_1m_completion_usd",
+            min_value=0.0,
+        )
+        _validate_finite_number(
+            self.max_hbm_utilization,
+            name=f"{ctx} max_hbm_utilization",
+            min_value=0.0,
+            strictly_greater=True,
+            max_value=1.0,
+        )
+        if self.max_duty_cycle_percent is not None:
+            _validate_finite_number(
+                self.max_duty_cycle_percent,
+                name=f"{ctx} max_duty_cycle_percent",
+                min_value=0.0,
+                strictly_greater=True,
+                max_value=100.0,
+            )
+        if self.max_inflight is not None:
+            _validate_int_range(
+                self.max_inflight, name=f"{ctx} max_inflight", min_value=1
+            )
+        if self.timeout_s is not None:
+            _validate_finite_number(
+                self.timeout_s,
+                name=f"{ctx} timeout_s",
+                min_value=0.0,
+                strictly_greater=True,
+            )
+        if self.latency_hint_ms is not None:
+            _validate_finite_number(
+                self.latency_hint_ms,
+                name=f"{ctx} latency_hint_ms",
+                min_value=0.0,
+            )
+        _validate_int_range(self.priority, name=f"{ctx} priority", min_value=-1_000_000)
+        _validate_int_range(self.weight, name=f"{ctx} weight", min_value=1)
         has_credentials = bool(
             (self.api_key and self.api_key.strip())
             or (self.api_key_env and self.api_key_env.strip())
@@ -190,40 +275,76 @@ class BackendConfig:
         models = [str(m).strip() for m in models_raw if str(m).strip()]
 
         cost_shared = raw.get("cost_per_1m_tokens_usd")
-        prompt_cost = float(
+        prompt_cost = _validate_finite_number(
             raw.get(
                 "cost_per_1m_prompt_usd",
                 cost_shared if cost_shared is not None else 0.0,
-            )
+            ),
+            name=f"{ctx} cost_per_1m_prompt_usd",
+            min_value=0.0,
         )
-        completion_cost = float(
+        completion_cost = _validate_finite_number(
             raw.get(
                 "cost_per_1m_completion_usd",
                 cost_shared if cost_shared is not None else 0.0,
-            )
+            ),
+            name=f"{ctx} cost_per_1m_completion_usd",
+            min_value=0.0,
         )
-        if prompt_cost < 0 or completion_cost < 0:
-            raise ValueError(f"Backend {backend_id!r} costs must be non-negative")
 
-        max_hbm = float(raw.get("max_hbm_utilization", 0.95))
-        if not (0.0 < max_hbm <= 1.0):
-            raise ValueError(
-                f"Backend {backend_id!r} max_hbm_utilization must be in (0, 1]"
-            )
+        max_hbm = _validate_finite_number(
+            raw.get("max_hbm_utilization", 0.95),
+            name=f"{ctx} max_hbm_utilization",
+            min_value=0.0,
+            strictly_greater=True,
+            max_value=1.0,
+        )
 
         max_duty = raw.get("max_duty_cycle_percent")
-        max_duty_val = float(max_duty) if max_duty is not None else None
+        max_duty_val = (
+            _validate_finite_number(
+                max_duty,
+                name=f"{ctx} max_duty_cycle_percent",
+                min_value=0.0,
+                strictly_greater=True,
+                max_value=100.0,
+            )
+            if max_duty is not None
+            else None
+        )
 
         max_inf = raw.get("max_inflight")
-        max_inf_val = int(max_inf) if max_inf is not None else None
-        if max_inf_val is not None and max_inf_val <= 0:
-            raise ValueError(f"Backend {backend_id!r} max_inflight must be > 0")
+        max_inf_val = (
+            _validate_int_range(max_inf, name=f"{ctx} max_inflight", min_value=1)
+            if max_inf is not None
+            else None
+        )
 
         timeout_raw = raw.get("timeout_s")
-        timeout_val = float(timeout_raw) if timeout_raw is not None else None
+        timeout_val: Optional[float] = None
+        if timeout_raw is not None:
+            timeout_val = _validate_finite_number(
+                timeout_raw,
+                name=f"{ctx} timeout_s",
+                min_value=0.0,
+                strictly_greater=True,
+            )
 
         lat_hint_raw = raw.get("latency_hint_ms")
-        lat_hint_val = float(lat_hint_raw) if lat_hint_raw is not None else None
+        lat_hint_val: Optional[float] = None
+        if lat_hint_raw is not None:
+            lat_hint_val = _validate_finite_number(
+                lat_hint_raw,
+                name=f"{ctx} latency_hint_ms",
+                min_value=0.0,
+            )
+
+        priority_val = _validate_int_range(
+            raw.get("priority", 100), name=f"{ctx} priority", min_value=-1_000_000
+        )
+        weight_val = _validate_int_range(
+            raw.get("weight", 1), name=f"{ctx} weight", min_value=1
+        )
 
         return cls(
             id=backend_id,
@@ -235,8 +356,8 @@ class BackendConfig:
             discover_models=_require_bool(raw, "discover_models", True, context=ctx),
             cost_per_1m_prompt_usd=prompt_cost,
             cost_per_1m_completion_usd=completion_cost,
-            priority=int(raw.get("priority", 100)),
-            weight=max(1, int(raw.get("weight", 1))),
+            priority=priority_val,
+            weight=weight_val,
             max_inflight=max_inf_val,
             timeout_s=timeout_val,
             health_path=(
@@ -300,24 +421,68 @@ class RouterConfig:
             if b.id in seen_ids:
                 raise ValueError(f"Duplicate backend id {b.id!r}")
             seen_ids.add(b.id)
-        if not (0 <= self.port <= 65535):
-            raise ValueError(f"Invalid port {self.port}")
-        if self.health_poll_interval_s <= 0:
-            raise ValueError("health_poll_interval_s must be > 0")
-        if self.failure_cooldown_s < 0:
-            raise ValueError("failure_cooldown_s must be >= 0")
-        if self.request_timeout_s <= 0:
-            raise ValueError("request_timeout_s must be > 0")
-        if self.max_request_body_bytes <= 0:
-            raise ValueError("max_request_body_bytes must be > 0")
-        if self.client_read_timeout_s <= 0:
-            raise ValueError("client_read_timeout_s must be > 0")
-        if self.client_header_timeout_s <= 0:
-            raise ValueError("client_header_timeout_s must be > 0")
-        if self.max_concurrent_connections <= 0:
-            raise ValueError("max_concurrent_connections must be > 0")
-        if self.max_sse_pre_commit_bytes <= 0:
-            raise ValueError("max_sse_pre_commit_bytes must be > 0")
+        _validate_int_range(self.port, name="port", min_value=0, max_value=65535)
+        _validate_finite_number(
+            self.health_poll_interval_s,
+            name="health_poll_interval_s",
+            min_value=0.0,
+            strictly_greater=True,
+        )
+        _validate_finite_number(
+            self.failure_cooldown_s,
+            name="failure_cooldown_s",
+            min_value=0.0,
+        )
+        _validate_finite_number(
+            self.request_timeout_s,
+            name="request_timeout_s",
+            min_value=0.0,
+            strictly_greater=True,
+        )
+        _validate_finite_number(
+            self.probe_timeout_s,
+            name="probe_timeout_s",
+            min_value=0.0,
+            strictly_greater=True,
+        )
+        _validate_int_range(
+            self.queue_pressure_threshold,
+            name="queue_pressure_threshold",
+            min_value=1,
+        )
+        _validate_finite_number(
+            self.backend_idle_timeout_s,
+            name="backend_idle_timeout_s",
+            min_value=0.0,
+            strictly_greater=True,
+        )
+        _validate_int_range(
+            self.max_request_body_bytes,
+            name="max_request_body_bytes",
+            min_value=1,
+        )
+        _validate_finite_number(
+            self.client_read_timeout_s,
+            name="client_read_timeout_s",
+            min_value=0.0,
+            strictly_greater=True,
+        )
+        _validate_finite_number(
+            self.client_header_timeout_s,
+            name="client_header_timeout_s",
+            min_value=0.0,
+            strictly_greater=True,
+        )
+        _validate_int_range(
+            self.max_concurrent_connections,
+            name="max_concurrent_connections",
+            min_value=1,
+        )
+        _validate_int_range(
+            self.max_sse_pre_commit_bytes,
+            name="max_sse_pre_commit_bytes",
+            min_value=1,
+        )
         if isinstance(self.cors_allowed_origins, (str, bytes)):
             raise ValueError("cors_allowed_origins must be a list of origin strings")
         normalized_origins: List[str] = []
@@ -402,28 +567,70 @@ class RouterConfig:
         return cls(
             backends=backends,
             host=str(raw.get("host", "127.0.0.1")),
-            port=int(raw.get("port", 8080)),
+            port=_validate_int_range(
+                raw.get("port", 8080), name="port", min_value=0, max_value=65535
+            ),
             policy=str(raw.get("policy", "local_first")),
-            health_poll_interval_s=float(raw.get("health_poll_interval_s", 10.0)),
-            failure_cooldown_s=float(raw.get("failure_cooldown_s", 15.0)),
-            request_timeout_s=float(raw.get("request_timeout_s", 120.0)),
-            probe_timeout_s=float(raw.get("probe_timeout_s", 3.0)),
-            queue_pressure_threshold=int(raw.get("queue_pressure_threshold", 16)),
-            backend_idle_timeout_s=float(raw.get("backend_idle_timeout_s", 300.0)),
-            max_request_body_bytes=int(
-                raw.get("max_request_body_bytes", DEFAULT_MAX_REQUEST_BODY_BYTES)
+            health_poll_interval_s=_validate_finite_number(
+                raw.get("health_poll_interval_s", 10.0),
+                name="health_poll_interval_s",
+                min_value=0.0,
+                strictly_greater=True,
             ),
-            client_read_timeout_s=float(
-                raw.get("client_read_timeout_s", DEFAULT_CLIENT_READ_TIMEOUT_S)
+            failure_cooldown_s=_validate_finite_number(
+                raw.get("failure_cooldown_s", 15.0),
+                name="failure_cooldown_s",
+                min_value=0.0,
             ),
-            client_header_timeout_s=float(
-                raw.get("client_header_timeout_s", DEFAULT_CLIENT_HEADER_TIMEOUT_S)
+            request_timeout_s=_validate_finite_number(
+                raw.get("request_timeout_s", 120.0),
+                name="request_timeout_s",
+                min_value=0.0,
+                strictly_greater=True,
             ),
-            max_concurrent_connections=int(
-                raw.get("max_concurrent_connections", DEFAULT_MAX_CONCURRENT_CONNECTIONS)
+            probe_timeout_s=_validate_finite_number(
+                raw.get("probe_timeout_s", 3.0),
+                name="probe_timeout_s",
+                min_value=0.0,
+                strictly_greater=True,
             ),
-            max_sse_pre_commit_bytes=int(
-                raw.get("max_sse_pre_commit_bytes", DEFAULT_MAX_SSE_PRE_COMMIT_BYTES)
+            queue_pressure_threshold=_validate_int_range(
+                raw.get("queue_pressure_threshold", 16),
+                name="queue_pressure_threshold",
+                min_value=1,
+            ),
+            backend_idle_timeout_s=_validate_finite_number(
+                raw.get("backend_idle_timeout_s", 300.0),
+                name="backend_idle_timeout_s",
+                min_value=0.0,
+                strictly_greater=True,
+            ),
+            max_request_body_bytes=_validate_int_range(
+                raw.get("max_request_body_bytes", DEFAULT_MAX_REQUEST_BODY_BYTES),
+                name="max_request_body_bytes",
+                min_value=1,
+            ),
+            client_read_timeout_s=_validate_finite_number(
+                raw.get("client_read_timeout_s", DEFAULT_CLIENT_READ_TIMEOUT_S),
+                name="client_read_timeout_s",
+                min_value=0.0,
+                strictly_greater=True,
+            ),
+            client_header_timeout_s=_validate_finite_number(
+                raw.get("client_header_timeout_s", DEFAULT_CLIENT_HEADER_TIMEOUT_S),
+                name="client_header_timeout_s",
+                min_value=0.0,
+                strictly_greater=True,
+            ),
+            max_concurrent_connections=_validate_int_range(
+                raw.get("max_concurrent_connections", DEFAULT_MAX_CONCURRENT_CONNECTIONS),
+                name="max_concurrent_connections",
+                min_value=1,
+            ),
+            max_sse_pre_commit_bytes=_validate_int_range(
+                raw.get("max_sse_pre_commit_bytes", DEFAULT_MAX_SSE_PRE_COMMIT_BYTES),
+                name="max_sse_pre_commit_bytes",
+                min_value=1,
             ),
             cors_allowed_origins=cors_origins,
             auth=dict(raw_auth or {}),

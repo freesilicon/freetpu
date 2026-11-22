@@ -11,9 +11,11 @@ from __future__ import annotations
 import argparse
 from collections import OrderedDict
 from dataclasses import dataclass, field
+import hashlib
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import math
 from pathlib import Path
 import ssl
 import sys
@@ -318,6 +320,24 @@ def _extract_choice_output_text(obj: Mapping[str, Any]) -> str:
     return "".join(parts)
 
 
+def _safe_nonneg_int(val: Any) -> Optional[int]:
+    """Parse a non-negative integer count without raising on malformed telemetry."""
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, int):
+        return val if val >= 0 else None
+    if isinstance(val, float):
+        if math.isfinite(val) and val >= 0.0 and val.is_integer():
+            return int(val)
+        return None
+    if isinstance(val, str):
+        cleaned = val.strip()
+        if cleaned.isascii() and cleaned.isdigit():
+            return int(cleaned)
+        return None
+    return None
+
+
 def _extract_non_stream_usage(
     raw_resp: bytes,
     est_prompt_tokens: int,
@@ -336,21 +356,27 @@ def _extract_non_stream_usage(
 
     usage = parsed_resp.get("usage")
     if isinstance(usage, Mapping):
-        if usage.get("prompt_tokens") is not None:
-            prompt_tokens = int(usage["prompt_tokens"])
+        pt = _safe_nonneg_int(usage.get("prompt_tokens"))
+        if pt is not None:
+            prompt_tokens = pt
             saw_prompt = True
-        if usage.get("completion_tokens") is not None:
-            completion_tokens = int(usage["completion_tokens"])
+        ct = _safe_nonneg_int(usage.get("completion_tokens"))
+        if ct is not None:
+            completion_tokens = ct
             saw_completion = True
 
     timings = parsed_resp.get("timings")
     if isinstance(timings, Mapping):
-        if not saw_prompt and timings.get("prompt_n") is not None:
-            prompt_tokens = int(timings["prompt_n"])
-            saw_prompt = True
-        if not saw_completion and timings.get("predicted_n") is not None:
-            completion_tokens = int(timings["predicted_n"])
-            saw_completion = True
+        if not saw_prompt:
+            pt = _safe_nonneg_int(timings.get("prompt_n"))
+            if pt is not None:
+                prompt_tokens = pt
+                saw_prompt = True
+        if not saw_completion:
+            ct = _safe_nonneg_int(timings.get("predicted_n"))
+            if ct is not None:
+                completion_tokens = ct
+                saw_completion = True
 
     if not saw_completion:
         output_txt = _extract_choice_output_text(parsed_resp)
@@ -718,7 +744,7 @@ class RouterEngine:
         self._backends: List[BackendState] = [
             BackendState(config=b) for b in config.backends
         ]
-        self._rr_cursors: OrderedDict[str, int] = OrderedDict()
+        self._rr_cursors: OrderedDict[bytes, int] = OrderedDict()
         self._metric_models_seen: set[str] = set()
         self._poller_lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -1103,9 +1129,9 @@ class RouterEngine:
                 )
                 return eligible
 
-            # round_robin (bounded per-model LRU state, independent of metric label normalization)
+            # round_robin (bounded per-model LRU with fixed 32-byte SHA-256 keys)
             eligible.sort(key=lambda b: (b.config.priority, b.config.id))
-            rr_key = model
+            rr_key = hashlib.sha256(model.encode("utf-8", errors="replace")).digest()
             cursor = self._rr_cursors.get(rr_key, 0)
             if not excluded:
                 self._rr_cursors[rr_key] = (cursor + 1) % len(eligible)
@@ -2176,20 +2202,27 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 est_completion_chars += len(output_txt)
             usage = obj.get("usage")
             if isinstance(usage, Mapping):
-                made_progress = True
-                if usage.get("prompt_tokens") is not None:
-                    prompt_tokens = int(usage["prompt_tokens"])
+                pt = _safe_nonneg_int(usage.get("prompt_tokens"))
+                if pt is not None:
+                    prompt_tokens = pt
                     saw_explicit_prompt_usage = True
-                if usage.get("completion_tokens") is not None:
-                    completion_tokens = int(usage["completion_tokens"])
+                    made_progress = True
+                ct = _safe_nonneg_int(usage.get("completion_tokens"))
+                if ct is not None:
+                    completion_tokens = ct
                     saw_explicit_completion_usage = True
+                    made_progress = True
             timings = obj.get("timings")
             if isinstance(timings, Mapping):
-                if not saw_explicit_prompt_usage and timings.get("prompt_n") is not None:
-                    prompt_tokens = int(timings["prompt_n"])
-                if not saw_explicit_completion_usage and timings.get("predicted_n") is not None:
-                    completion_tokens = int(timings["predicted_n"])
-                    saw_timings_completion = True
+                if not saw_explicit_prompt_usage:
+                    pt = _safe_nonneg_int(timings.get("prompt_n"))
+                    if pt is not None:
+                        prompt_tokens = pt
+                if not saw_explicit_completion_usage:
+                    ct = _safe_nonneg_int(timings.get("predicted_n"))
+                    if ct is not None:
+                        completion_tokens = ct
+                        saw_timings_completion = True
             return made_progress
 
         def inspect_sse_line(raw_line: bytes) -> bool:
@@ -2240,11 +2273,22 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
 
         if not downstream_write_error and not saw_done_sentinel:
             progress_deadline = time.monotonic() + timeout_s
+            max_event_bytes = engine.config.max_sse_pre_commit_bytes
             event_chunk_buf = bytearray()
             while True:
+                remaining_event_bytes = max_event_bytes - len(event_chunk_buf)
+                if remaining_event_bytes <= 0:
+                    upstream_read_error = True
+                    break
                 try:
-                    line, _ = sse_reader.readline(deadline=progress_deadline)
+                    line, exceeded_cap = sse_reader.readline(
+                        deadline=progress_deadline,
+                        max_bytes=remaining_event_bytes,
+                    )
                 except (OSError, TimeoutError, http.client.HTTPException):
+                    upstream_read_error = True
+                    break
+                if exceeded_cap:
                     upstream_read_error = True
                     break
                 if not line:
@@ -2416,6 +2460,29 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _apply_cli_overrides(cfg: RouterConfig, args: argparse.Namespace) -> None:
+    """Apply explicit CLI flag overrides onto a loaded `RouterConfig`."""
+    if args.host is not None:
+        cfg.host = args.host
+    if args.port is not None:
+        cfg.port = args.port
+    if args.policy is not None:
+        cfg.policy = args.policy
+    if args.bearer_token_envs:
+        existing_auth = cfg.auth if isinstance(cfg.auth, Mapping) else {}
+        new_auth: Dict[str, Any] = {
+            "type": "bearer",
+            "tokens_env": list(args.bearer_token_envs),
+        }
+        if "exempt_paths" in existing_auth:
+            new_auth["exempt_paths"] = existing_auth["exempt_paths"]
+        cfg.auth = new_auth
+    if args.cors_origins:
+        cfg.cors_allowed_origins = list(args.cors_origins)
+    if args.usage_jsonl:
+        cfg.usage_meter = {"type": "jsonl", "jsonl_path": str(args.usage_jsonl)}
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = _build_cli_parser()
     args = parser.parse_args(argv)
@@ -2430,18 +2497,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     try:
         cfg = load_config(args.config)
-        if args.host is not None:
-            cfg.host = args.host
-        if args.port is not None:
-            cfg.port = args.port
-        if args.policy is not None:
-            cfg.policy = args.policy
-        if args.bearer_token_envs:
-            cfg.auth = {"type": "bearer", "tokens_env": list(args.bearer_token_envs)}
-        if args.cors_origins:
-            cfg.cors_allowed_origins = list(args.cors_origins)
-        if args.usage_jsonl:
-            cfg.usage_meter = {"type": "jsonl", "jsonl_path": str(args.usage_jsonl)}
+        _apply_cli_overrides(cfg, args)
         cfg.validate()
         if args.check_config:
             build_hooks_from_config(cfg)
