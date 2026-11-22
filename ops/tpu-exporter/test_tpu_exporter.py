@@ -1835,6 +1835,56 @@ TPU Runtime Utilization
             self.assertFalse(tpu_exporter._procfs_hides_pids(proc_root))
             mountinfo.unlink()
 
+            # Server mode must handle SIGTERM cleanly (e.g. when running as container PID 1).
+            srv_proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(EXPORTER_DIR / "tpu_exporter.py"),
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    "0",
+                    "--health-host",
+                    "127.0.0.1",
+                    "--health-port",
+                    "0",
+                    "--sysfs-root",
+                    str(sysfs_root),
+                    "--dev-root",
+                    str(dev_root),
+                    "--proc-root",
+                    str(proc_root),
+                    "--no-pid-scan",
+                    "--tpu-info-bin",
+                    "",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                assert srv_proc.stderr is not None
+                ready_lines = []
+                for _ in range(2):
+                    line = srv_proc.stderr.readline()
+                    ready_lines.append(line)
+                    if "listening on" in line and "/metrics" in line:
+                        break
+                self.assertTrue(
+                    any("/metrics" in ln for ln in ready_lines),
+                    f"exporter did not report readiness: {ready_lines!r}",
+                )
+                srv_proc.terminate()
+                rc = srv_proc.wait(timeout=3.0)
+                self.assertEqual(rc, 0)
+            finally:
+                if srv_proc.poll() is None:
+                    srv_proc.kill()
+                    srv_proc.wait(timeout=2.0)
+                for p in (srv_proc.stdout, srv_proc.stderr):
+                    if p is not None:
+                        p.close()
+
             # Oversized HTTP headers (> MAX_HTTP_HEADER_BYTES) are rejected with 431 before scrape.
             import socket as _socket
 

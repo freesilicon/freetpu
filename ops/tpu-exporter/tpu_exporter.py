@@ -2088,14 +2088,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"freetpu tpu-exporter health listening on http://{health_host}:{health_server.server_address[1]}/healthz\n"
         )
 
-    sys.stderr.write(
-        f"freetpu tpu-exporter listening on http://{args.host}:{server.server_address[1]}/metrics\n"
-    )
+    prev_sigterm = None
+    if threading.current_thread() is threading.main_thread():
+        def _handle_sigterm(_signum: int, _frame: Any) -> None:
+            raise KeyboardInterrupt
+
+        prev_sigterm = signal.signal(signal.SIGTERM, _handle_sigterm)
     try:
+        sys.stderr.write(
+            f"freetpu tpu-exporter listening on http://{args.host}:{server.server_address[1]}/metrics\n"
+        )
+        sys.stderr.flush()
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        if prev_sigterm is not None:
+            signal.signal(signal.SIGTERM, prev_sigterm)
         server.server_close()
         if health_server is not None:
             health_server.shutdown()

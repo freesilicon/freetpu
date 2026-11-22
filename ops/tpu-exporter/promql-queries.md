@@ -12,11 +12,12 @@ count by (generation) (
   group by (cluster, generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node"})
 )
 
-# Total VFIO-ready physical TPU chips per generation across the cluster (VFIO-backed generations)
-count by (generation) (
+# Total VFIO-ready physical TPU chips per generation across the cluster (VFIO-backed generations;
+# preserves 0 when all discovered chips in a generation are unhealthy)
+sum by (generation) (
   min by (cluster, generation, node, pci_bdf) (
     freetpu_tpu_health_status{collector_role="node", generation=~"v5e|v5p|v6e|v6e-pf"}
-  ) == 1
+  ) == bool 1
 )
 
 # Unhealthy or unbound VFIO-backed TPU chips (vfio-pci / /dev/vfio/<group> missing or unverified;
