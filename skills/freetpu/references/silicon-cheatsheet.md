@@ -50,7 +50,7 @@ Compact hardware, memory-hierarchy, and errata reference for kernel authoring an
 ## 4. Cloud TPU (`v5e-1` / `v6e-1`) Pallas/Mosaic Pitfalls
 
 1. **VMEM OOM (`> 16 MiB`)**:
-   - Double-buffered `(2, bm, bk)` + `(2, bk, bn)` `bf16` input tiles, `(bm, bn)` `f32` accumulators, and the `(bm, bn)` `bf16` output block must fit inside `16 MiB` (`1024x2048x512` needs `18 MiB` and overflows; `1024x1024x256` needs `8 MiB` and `1024x512x512` needs `6 MiB`, fitting cleanly and hitting `135.5 TFLOP/s` on `v5e-1`).
+   - Double-buffered `(2, bm, bk)` + `(2, bk, bn)` `bf16` input tiles, `(bm, bn)` `f32` accumulators, and double-buffered `(2, bm, bn)` `bf16` output windows must fit inside `16 MiB` (`1024x2048x256` needs `19 MiB` and overflows; `1024x1024x256` needs `10 MiB` and `1024x512x512` needs `7 MiB`, fitting cleanly and hitting `135.5 TFLOP/s` on `v5e-1`).
 2. **PJRT Dispatch Floor (`115–135 us`)**:
    - Both Python (`jax.jit`) and Zero-Python C++17 PJRT hit `~125 us` `sync_ready_event` per tiny op (`1x64x32`). Fuse activations (`GEMM+SiLU`, `SwiGLU`, `RMSNorm`) or pipeline async launches (`32 us` amortized).
 3. **Colab Allocation Errors (`HTTP 412 / 400`)**:

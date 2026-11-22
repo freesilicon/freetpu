@@ -24,12 +24,12 @@ VMEM_LIMIT_BYTES = 16 * 1024 * 1024
 
 
 def estimate_vmem_bytes(bm: int, bn: int, bk: int) -> int:
-    """Return VMEM footprint for 2-slot BF16 A/B buffers, FP32 accumulator, and BF16 output tile."""
+    """Return VMEM footprint for 2-slot BF16 A/B buffers, FP32 accumulator, and 2-slot BF16 output."""
     a_db = 2 * bm * bk * 2
     b_db = 2 * bk * bn * 2
     acc = bm * bn * 4
-    out = bm * bn * 2
-    return a_db + b_db + acc + out
+    out_db = 2 * bm * bn * 2
+    return a_db + b_db + acc + out_db
 
 
 def cpu_ref_gemm_silu(a_f32: np.ndarray, b_f32: np.ndarray) -> np.ndarray:
@@ -287,10 +287,12 @@ def run_self_test() -> Dict[str, Any]:
     tiled = tiled_cpu_gemm_silu(a, b, bm, bn, bk)
     max_abs_err = float(np.max(np.abs(ref - tiled)))
     vmem_4096_tile = estimate_vmem_bytes(1024, 1024, 256)
-    vmem_overflow_tile = estimate_vmem_bytes(1024, 2048, 512)
+    vmem_overflow_bk256 = estimate_vmem_bytes(1024, 2048, 256)
+    vmem_overflow_bk512 = estimate_vmem_bytes(1024, 2048, 512)
     assert max_abs_err < 1e-6, f"CPU tiled parity failed: max_abs_err={max_abs_err}"
-    assert vmem_4096_tile == 8 * 1024 * 1024 and vmem_4096_tile <= VMEM_LIMIT_BYTES
-    assert vmem_overflow_tile == 18 * 1024 * 1024 and vmem_overflow_tile > VMEM_LIMIT_BYTES
+    assert vmem_4096_tile == 10 * 1024 * 1024 and vmem_4096_tile <= VMEM_LIMIT_BYTES
+    assert vmem_overflow_bk256 == 19 * 1024 * 1024 and vmem_overflow_bk256 > VMEM_LIMIT_BYTES
+    assert vmem_overflow_bk512 == 22 * 1024 * 1024 and vmem_overflow_bk512 > VMEM_LIMIT_BYTES
 
     return {
         "status": "ok",

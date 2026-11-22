@@ -40,7 +40,11 @@ def _credential_patterns() -> Tuple[Tuple[str, str, str], ...]:
             "private key material",
             "[REDACTED_PRIVATE_KEY]",
         ),
-        (r"-----BEGIN [A-Z ]*PRIVATE " + r"KEY-----", "private key material", "[REDACTED_PRIVATE_KEY]"),
+        (
+            r"-----BEGIN [A-Z ]*PRIVATE " + r"KEY-----[\s\S]*",
+            "private key material",
+            "[REDACTED_UNTERMINATED_PRIVATE_KEY_BLOCK]",
+        ),
         (r"\bgh[pousr]_[A-Za-z0-9]{20,}\b", "GitHub token", "[REDACTED_GITHUB_TOKEN]"),
         (r"\bgithub_pat_[A-Za-z0-9_]{20,}\b", "GitHub fine-grained token", "[REDACTED_GITHUB_TOKEN]"),
         (r"\bAIza[0-9A-Za-z\-_]{30,}\b", "Google API key", "[REDACTED_API_KEY]"),
@@ -816,6 +820,36 @@ def run_validator_self_test(*, require_yaml: bool = False) -> None:
         assert pem_body_secret not in joined, f"PEM body leaked across [-400:] cut: {joined!r}"
         assert tok_tail_secret not in joined, f"Token suffix leaked across [-400:] cut: {joined!r}"
         assert "[REDACTED_GITHUB_TOKEN]" in joined, f"Expected token redaction marker in: {joined!r}"
+
+    # Verify unterminated private-key blocks (no END marker) suppress all trailing body bytes.
+    unterm_secret = "UNTERMINATED_KEY_BODY_SECRET_6677889900"
+    unterm_text = "prefix\n-----BEGIN RSA PRIVATE " + "KEY-----\n" + unterm_secret + "\nMORE_KEY_BYTES\n"
+    redacted_unterm = redact_secrets(unterm_text)
+    assert unterm_secret not in redacted_unterm and "MORE_KEY_BYTES" not in redacted_unterm, redacted_unterm
+    assert "[REDACTED_UNTERMINATED_PRIVATE_KEY_BLOCK]" in redacted_unterm, redacted_unterm
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        sdir = root / "skills" / "freetpu"
+        (sdir / "templates").mkdir(parents=True)
+        (sdir / "SKILL.md").write_text(
+            "---\nname: freetpu\ndescription: Valid string description that is definitely longer than forty characters.\n---\n",
+            encoding="utf-8",
+        )
+        (sdir / "templates" / "unterm_key_fail.py").write_text(
+            "import sys\n"
+            f"sys.stderr.write('err\\n-----BEGIN PRIVATE ' + 'KEY-----\\n{unterm_secret}\\nTAIL_SECRET_LINE\\n')\n"
+            "sys.exit(1)\n",
+            encoding="utf-8",
+        )
+        readme = root / "README.md"
+        readme.write_text("# Agent Skill\nInstall `skills/freetpu`.\n", encoding="utf-8")
+        errs = validate_skill(root, sdir, readme, run_self_tests=True, require_yaml=require_yaml)
+        joined = "\n".join(errs)
+        assert any("Template self-test failed" in e for e in errs), errs
+        assert unterm_secret not in joined and "TAIL_SECRET_LINE" not in joined, (
+            f"Unterminated private-key body leaked in diagnostic: {joined!r}"
+        )
+        assert "[REDACTED_UNTERMINATED_PRIVATE_KEY_BLOCK]" in joined, joined
 
     # Verify malformed YAML frontmatter with a pasted secret never leaks raw source excerpts or clipped suffixes.
     clipped_suffix = "CLIPPED_SECRET_SUFFIX_554433221100"

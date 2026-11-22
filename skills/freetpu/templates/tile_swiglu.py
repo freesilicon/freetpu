@@ -18,6 +18,12 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 
 V5E_PEAK_HBM_GBS = 820.0
+VMEM_LIMIT_BYTES = 16 * 1024 * 1024
+
+
+def estimate_vmem_bytes(block_m: int, block_n: int) -> int:
+    """Return VMEM footprint for 2-slot BF16 gate, up, and output window buffers."""
+    return 3 * 2 * block_m * block_n * 2
 
 
 def cpu_ref_swiglu(gate_f32: np.ndarray, up_f32: np.ndarray) -> np.ndarray:
@@ -92,6 +98,9 @@ def build_pallas_swiglu(m: int, n: int, block_m: int, block_n: int):
 
     if m % block_m or n % block_n:
         raise ValueError(f"Shape ({m}, {n}) must be divisible by ({block_m}, {block_n})")
+    vmem_est = estimate_vmem_bytes(block_m, block_n)
+    if vmem_est > VMEM_LIMIT_BYTES:
+        raise ValueError(f"Tile ({block_m}, {block_n}) uses {vmem_est} B > {VMEM_LIMIT_BYTES} B VMEM budget")
     compiler_params = _build_tpu_compiler_params(
         pltpu,
         dimension_semantics=("parallel", "parallel"),
@@ -184,6 +193,8 @@ def run_self_test() -> Dict[str, Any]:
     tiled = tiled_cpu_swiglu(gate, up, block_m, block_n)
     max_abs_err = float(np.max(np.abs(ref - tiled)))
     assert max_abs_err == 0.0, f"Tiled SwiGLU mismatch: {max_abs_err}"
+    assert estimate_vmem_bytes(256, 1024) == 3 * 1024 * 1024 <= VMEM_LIMIT_BYTES
+    assert estimate_vmem_bytes(2048, 1024) == 24 * 1024 * 1024 > VMEM_LIMIT_BYTES
 
     return {
         "status": "ok",
