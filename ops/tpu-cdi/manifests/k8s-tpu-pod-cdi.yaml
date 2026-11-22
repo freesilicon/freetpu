@@ -1,0 +1,47 @@
+# Sample Kubernetes workload requesting a FreeTPU CDI device.
+# Requires containerd >= 1.7 with `enable_cdi = true` (default in containerd 2.0)
+# and /var/run/cdi/freetpu.json (or /etc/cdi/freetpu.json) populated by freetpu-cdi.
+---
+apiVersion: resource.k8s.io/v1beta1
+kind: ResourceClaimTemplate
+metadata:
+  name: freetpu-all-claim
+spec:
+  spec:
+    devices:
+      requests:
+        - name: tpu
+          deviceClassName: freetpu.dev
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: freetpu-jax-workload
+  annotations:
+    # For containerd CRI / Podman kube play direct CDI injection without DRA:
+    cdi.k8s.io/vfio-tpu: "freetpu.dev/tpu=all"
+spec:
+  restartPolicy: Never
+  containers:
+    - name: jax-tpu
+      image: python:3.12-slim
+      command:
+        - python3
+        - -c
+        - "import os; print('VFIO nodes:', sorted(os.listdir('/dev/vfio')))"
+      securityContext:
+        capabilities:
+          add:
+            - IPC_LOCK
+      resources:
+        claims:
+          - name: tpu
+        requests:
+          memory: "8Gi"
+          cpu: "2"
+        limits:
+          memory: "16Gi"
+          cpu: "4"
+  resourceClaims:
+    - name: tpu
+      resourceClaimTemplateName: freetpu-all-claim

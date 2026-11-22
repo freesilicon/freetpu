@@ -1,0 +1,115 @@
+# FreeTPU Node DaemonSet:
+# 1. initContainer runs `freetpu_cdi.py generate` to populate /var/run/cdi/freetpu.json
+#    on every Cloud TPU node so containerd/CRI-O exposes freetpu.dev/tpu=0..N and =all.
+# 2. main container runs `tpu_exporter.py --port 9400` to serve Prometheus /metrics.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: freetpu-node-agent
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: freetpu-tpu-exporter
+    app.kubernetes.io/component: tpu-ops
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: freetpu-tpu-exporter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: freetpu-tpu-exporter
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9400"
+        prometheus.io/path: "/metrics"
+    spec:
+      hostPID: true
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu-v5-lite-podslice
+      tolerations:
+        - key: google.com/tpu
+          operator: Exists
+          effect: NoSchedule
+      initContainers:
+        - name: freetpu-cdi-init
+          image: python:3.12-slim
+          command:
+            - python3
+            - /opt/freetpu/freetpu_cdi.py
+            - generate
+            - --output
+            - /var/run/cdi/freetpu.json
+            - --validate
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: sysfs
+              mountPath: /sys
+              readOnly: true
+            - name: dev-vfio
+              mountPath: /dev/vfio
+              readOnly: true
+            - name: cdi-dir
+              mountPath: /var/run/cdi
+            - name: freetpu-ops
+              mountPath: /opt/freetpu
+              readOnly: true
+      containers:
+        - name: tpu-exporter
+          image: python:3.12-slim
+          command:
+            - python3
+            - /opt/freetpu/tpu_exporter.py
+            - --host
+            - 0.0.0.0
+            - --port
+            - "9400"
+          ports:
+            - name: metrics
+              containerPort: 9400
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          volumeMounts:
+            - name: sysfs
+              mountPath: /sys
+              readOnly: true
+            - name: dev-vfio
+              mountPath: /dev/vfio
+              readOnly: true
+            - name: freetpu-ops
+              mountPath: /opt/freetpu
+              readOnly: true
+      volumes:
+        - name: sysfs
+          hostPath:
+            path: /sys
+            type: Directory
+        - name: dev-vfio
+          hostPath:
+            path: /dev/vfio
+            type: Directory
+        - name: cdi-dir
+          hostPath:
+            path: /var/run/cdi
+            type: DirectoryOrCreate
+        - name: freetpu-ops
+          configMap:
+            name: freetpu-ops-scripts
