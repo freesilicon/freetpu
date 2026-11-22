@@ -162,7 +162,10 @@ def build_pallas_gemm_silu(
                 acc_ref[...] += prod
 
         v = acc_ref[...]
-        o_ref[...] = (v * jax.nn.sigmoid(v)).astype(jnp.bfloat16)
+        # Express sigmoid via exp/add/div instead of jax.nn.sigmoid (logistic_p),
+        # which JAX 0.5.3 Mosaic cannot lower.
+        sig = 1.0 / (1.0 + jnp.exp(-v))
+        o_ref[...] = (v * sig).astype(jnp.bfloat16)
 
     @jax.jit
     def run(a, b):
@@ -236,6 +239,14 @@ def _verify_jax_053_compat() -> None:
         f"Unexpected pltpu attributes outside JAX 0.5.3 surface: {pltpu_attrs - jax_053_pltpu_surface}"
     )
     assert "ANY" in pl_attrs, f"Expected pl.ANY memory_space in build_pallas_gemm_silu, got pl attrs {pl_attrs}"
+    nn_attrs = {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Attribute) and node.value.attr == "nn"
+    }
+    assert not (nn_attrs & {"sigmoid", "silu"}), (
+        f"Avoid jax.nn.sigmoid/silu (logistic_p) inside JAX 0.5.3 Mosaic kernel: {nn_attrs}"
+    )
 
 
 def run_self_test() -> Dict[str, Any]:

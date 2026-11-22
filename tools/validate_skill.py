@@ -31,6 +31,24 @@ MAX_SKILL_MD_LINES = 300
 MAX_SKILL_NAME_LEN = 64
 
 
+def _credential_patterns() -> Tuple[Tuple[str, str, str], ...]:
+    # Single source of truth for both clean-room credential detection and diagnostic redaction.
+    # Split literals so this validator does not trigger on its own source.
+    return (
+        (
+            r"-----BEGIN [A-Z ]*PRIVATE " + r"KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE " + r"KEY-----",
+            "private key material",
+            "[REDACTED_PRIVATE_KEY]",
+        ),
+        (r"-----BEGIN [A-Z ]*PRIVATE " + r"KEY-----", "private key material", "[REDACTED_PRIVATE_KEY]"),
+        (r"\bgh[pousr]_[A-Za-z0-9]{20,}\b", "GitHub token", "[REDACTED_GITHUB_TOKEN]"),
+        (r"\bgithub_pat_[A-Za-z0-9_]{20,}\b", "GitHub fine-grained token", "[REDACTED_GITHUB_TOKEN]"),
+        (r"\bAIza[0-9A-Za-z\-_]{30,}\b", "Google API key", "[REDACTED_API_KEY]"),
+        (r"\bsk-[A-Za-z0-9_-]{20,}\b", "API secret key", "[REDACTED_API_KEY]"),
+        (r"\bAKIA[0-9A-Z]{16}\b", "AWS access key ID", "[REDACTED_AWS_KEY]"),
+    )
+
+
 def _forbidden_text_patterns() -> Tuple[Tuple[str, str], ...]:
     # Split literals so this validator does not trigger on its own source.
     return (
@@ -40,33 +58,13 @@ def _forbidden_text_patterns() -> Tuple[Tuple[str, str], ...]:
         (r"\bspark" + r"-[12]\b", "internal host reference"),
         (r"ro\.boot\.hw\." + r"soc\.id", "device-specific property"),
         (r"file" + r"://", "local file URI"),
-        (r"-----BEGIN [A-Z ]*PRIVATE " + r"KEY-----", "private key material"),
-        (r"\bghp_[A-Za-z0-9]{20,}\b", "GitHub personal access token"),
-        (r"\bgithub_pat_[A-Za-z0-9_]{20,}\b", "GitHub fine-grained token"),
-        (r"\bAIza[0-9A-Za-z\-_]{30,}\b", "Google API key"),
-    )
-
-
-def _secret_redaction_patterns() -> Tuple[Tuple[str, str], ...]:
-    # Split literals so this validator does not trigger on its own source.
-    return (
-        (
-            r"-----BEGIN [A-Z ]*PRIVATE " + r"KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE " + r"KEY-----",
-            "[REDACTED_PRIVATE_KEY]",
-        ),
-        (r"-----BEGIN [A-Z ]*PRIVATE " + r"KEY-----", "[REDACTED_PRIVATE_KEY]"),
-        (r"\bgh[pousr]_[A-Za-z0-9]{20,}\b", "[REDACTED_GITHUB_TOKEN]"),
-        (r"\bgithub_pat_[A-Za-z0-9_]{20,}\b", "[REDACTED_GITHUB_TOKEN]"),
-        (r"\bAIza[0-9A-Za-z\-_]{30,}\b", "[REDACTED_API_KEY]"),
-        (r"\bsk-[A-Za-z0-9_-]{20,}\b", "[REDACTED_API_KEY]"),
-        (r"\bAKIA[0-9A-Z]{16}\b", "[REDACTED_AWS_KEY]"),
-    )
+    ) + tuple((pat, label) for pat, label, _ in _credential_patterns())
 
 
 def redact_secrets(text: str) -> str:
     """Scrub detected secret tokens/keys before emitting diagnostics."""
     redacted = text
-    for pat, repl in _secret_redaction_patterns():
+    for pat, _, repl in _credential_patterns():
         redacted = re.sub(pat, repl, redacted)
     return redacted
 
@@ -751,6 +749,31 @@ def run_validator_self_test(*, require_yaml: bool = False) -> None:
             f"Secret leaked in CLI output: stdout={proc.stdout!r}, stderr={proc.stderr!r}"
         )
         assert "[REDACTED_GITHUB_TOKEN]" in proc.stderr, f"Expected redaction marker in stderr: {proc.stderr!r}"
+
+    # Verify every recognized credential family is caught in Markdown body text AND redacted.
+    body_secrets = (
+        ("gho_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4", "GitHub token", "[REDACTED_GITHUB_TOKEN]"),
+        ("sk-" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4", "API secret key", "[REDACTED_API_KEY]"),
+        ("AKIA" + "0123456789ABCDEF", "AWS access key ID", "[REDACTED_AWS_KEY]"),
+    )
+    for tok, label, placeholder in body_secrets:
+        assert redact_secrets(f"token={tok}") == f"token={placeholder}"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sdir = root / "skills" / "freetpu"
+            (sdir / "templates").mkdir(parents=True)
+            (sdir / "SKILL.md").write_text(
+                "---\nname: freetpu\ndescription: Valid string description that is definitely longer than forty characters.\n---\n"
+                f"Body accidentally containing {tok}\n",
+                encoding="utf-8",
+            )
+            (sdir / "templates" / "noop.py").write_text("x = 1\n", encoding="utf-8")
+            readme = root / "README.md"
+            readme.write_text("# Agent Skill\nInstall `skills/freetpu`.\n", encoding="utf-8")
+            errs = validate_skill(root, sdir, readme, run_self_tests=False, require_yaml=require_yaml)
+            joined = "\n".join(errs)
+            assert any(label in e for e in errs), f"Expected clean-room detection for {label}, got: {errs}"
+            assert tok not in joined, f"Credential leaked in diagnostic: {joined!r}"
 
     # Verify templates using `from __future__ import annotations` are rejected (breaks `colab run` cell prepending).
     with tempfile.TemporaryDirectory() as tmp:

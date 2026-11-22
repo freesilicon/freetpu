@@ -7,6 +7,7 @@ parity + HBM streaming bandwidth measurement (`GB/s`) on Cloud TPU (`v5e-1` / `v
 """
 
 import argparse
+import ast
 import dataclasses
 import inspect
 import json
@@ -90,7 +91,10 @@ def build_pallas_swiglu(m: int, n: int, block_m: int, block_n: int):
     def kernel(gate_ref, up_ref, out_ref):
         g = gate_ref[...].astype(jnp.float32)
         u = up_ref[...].astype(jnp.float32)
-        out_ref[...] = ((g * jax.nn.sigmoid(g)) * u).astype(jnp.bfloat16)
+        # Express sigmoid via exp/add/div instead of jax.nn.sigmoid (logistic_p),
+        # which JAX 0.5.3 Mosaic cannot lower.
+        sig = 1.0 / (1.0 + jnp.exp(-g))
+        out_ref[...] = ((g * sig) * u).astype(jnp.bfloat16)
 
     @jax.jit
     def run(gate, up):
@@ -135,6 +139,17 @@ def _verify_compiler_params_compat() -> None:
     )
     assert legacy.dimension_semantics == ("parallel", "parallel")
 
+    # Avoid jax.nn.sigmoid/silu (logistic_p) inside JAX 0.5.3 Mosaic kernels.
+    tree = ast.parse(inspect.getsource(build_pallas_swiglu))
+    nn_attrs = {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Attribute) and node.value.attr == "nn"
+    }
+    assert not (nn_attrs & {"sigmoid", "silu"}), (
+        f"Avoid jax.nn.sigmoid/silu (logistic_p) inside JAX 0.5.3 Mosaic kernel: {nn_attrs}"
+    )
+
 
 def run_self_test() -> Dict[str, Any]:
     """Offline NumPy parity check (no JAX/TPU hardware required)."""
@@ -177,7 +192,8 @@ def run_tpu_benchmark(m: int, n: int, block_m: int, block_n: int, iters: int) ->
     def xla_swiglu(g, u):
         gf = g.astype(jnp.float32)
         uf = u.astype(jnp.float32)
-        return ((gf * jax.nn.sigmoid(gf)) * uf).astype(jnp.bfloat16)
+        sig = 1.0 / (1.0 + jnp.exp(-gf))
+        return ((gf * sig) * uf).astype(jnp.bfloat16)
 
     pallas_fn = build_pallas_swiglu(m, n, block_m, block_n)
     has_tpu_custom_call = "tpu_custom_call" in pallas_fn.lower(gate, up).as_text()

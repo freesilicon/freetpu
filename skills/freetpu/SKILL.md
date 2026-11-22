@@ -112,18 +112,18 @@ Use this workflow with `google-colab-cli >= 0.7.6` (redacted logs) to run Pallas
        --out-dir "$WORK_DIR/proof" \
        --script skills/freetpu/templates/tile_fused_gemm_silu.py
      ```
-   - Direct CLI pattern (do **not** assume default `colab run` teardown succeeded: if unassign fails, `colab run` suppresses the error, removes the local session record, and still prints `Session terminated.` while leaving the TPU billing CUs. Snapshot existing server-side endpoints and register a signal-safe `EXIT`/`INT`/`TERM` cleanup trap **before** launching `colab run --keep` so cancellation still releases the TPU, and verify ADC auth with `colab usage` plus server-side `colab sessions`—treating any unknown endpoint after cancellation or any newly appearing unnamed `[?]` assignment as unconfirmed teardown):
+   - Direct CLI pattern (do **not** assume default `colab run` teardown succeeded: if unassign fails, `colab run` suppresses the error, removes the local session record, and still prints `Session terminated.` while leaving the TPU billing CUs. Instead, insulate `colab new` from `INT`/`TERM` so an in-flight allocation always persists `$SESSION_ID` to `$COLAB_STATE` before honouring cancellation, then run the script with `colab upload` + `colab exec` and release by name via `colab stop` with ADC-propagating `colab usage` + `colab sessions` verification):
      ```bash
      (
        SESSION_ID="freetpu-probe-$(date +%Y%m%d-%H%M%S)-$$"
        RUN_RC=0
+       ALLOC_PID=""
        RUN_PID=""
        ENDPOINT=""
        CANCELLED=0
        CLEANED=0
 
-       # Snapshot pre-existing server-side endpoints so cancellation before $COLAB_STATE is
-       # saved can detect any newly allocated unnamed `[?]` assignment:
+       # Snapshot pre-existing server-side endpoints as defense-in-depth against unnamed `[?]` leaks:
        BASE_SESS="$(colab --auth=adc --config "$COLAB_STATE" sessions 2>/dev/null)" || BASE_SESS=""
        BASE_ENDPOINTS="$(printf '%s\n' "$BASE_SESS" | awk '$1 ~ /^\[/ && $2 != "" {print $2}')"
 
@@ -131,6 +131,9 @@ Use this workflow with `google-colab-cli >= 0.7.6` (redacted logs) to run Pallas
          [ "$CLEANED" -eq 1 ] && return
          CLEANED=1
          trap - EXIT INT TERM
+
+         # If cancelled mid-allocation, let `colab new` finish persisting $SESSION_ID so `colab stop` can release it by name:
+         [ -n "$ALLOC_PID" ] && wait "$ALLOC_PID" 2>/dev/null || true
 
          # Capture assigned endpoint before stopping (never read $COLAB_STATE tokens):
          PRE_SESS="$(colab --auth=adc --config "$COLAB_STATE" sessions 2>/dev/null)" || PRE_SESS=""
@@ -178,6 +181,7 @@ Use this workflow with `google-colab-cli >= 0.7.6` (redacted logs) to run Pallas
        on_signal() {
          CANCELLED=1
          RUN_RC="$1"
+         # Do not kill $ALLOC_PID during allocation; cleanup waits for $SESSION_ID to persist, then stops it by name.
          [ -n "$RUN_PID" ] && kill -TERM "$RUN_PID" 2>/dev/null || true
          [ -n "$RUN_PID" ] && wait "$RUN_PID" 2>/dev/null || true
          cleanup
@@ -187,15 +191,28 @@ Use this workflow with `google-colab-cli >= 0.7.6` (redacted logs) to run Pallas
        trap 'on_signal 143' TERM
        trap 'cleanup' EXIT
 
-       colab --auth=adc --config "$COLAB_STATE" run \
-         -s "$SESSION_ID" --tpu V6E1 --timeout 300 --keep \
-         -- skills/freetpu/templates/tile_swiglu.py &
-       RUN_PID=$!
-       wait "$RUN_PID" || RUN_RC=$?
-       RUN_PID=""
+       ( trap '' INT TERM; exec colab --auth=adc --config "$COLAB_STATE" new -s "$SESSION_ID" --tpu V6E1 ) &
+       ALLOC_PID=$!
+       wait "$ALLOC_PID" || RUN_RC=$?
+       ALLOC_PID=""
+
+       if [ "$RUN_RC" -eq 0 ] && [ "$CANCELLED" -eq 0 ]; then
+         colab --auth=adc --config "$COLAB_STATE" upload \
+           -s "$SESSION_ID" skills/freetpu/templates/tile_swiglu.py /content/tile_swiglu.py &
+         RUN_PID=$!
+         wait "$RUN_PID" || RUN_RC=$?
+         RUN_PID=""
+       fi
+       if [ "$RUN_RC" -eq 0 ] && [ "$CANCELLED" -eq 0 ]; then
+         colab --auth=adc --config "$COLAB_STATE" exec -s "$SESSION_ID" --timeout 300 \
+           <<< 'import runpy, sys; sys.argv = ["/content/tile_swiglu.py"]; runpy.run_path("/content/tile_swiglu.py", run_name="__main__")' &
+         RUN_PID=$!
+         wait "$RUN_PID" || RUN_RC=$?
+         RUN_PID=""
+       fi
      )
      ```
-   - **Teardown verification**: After every run (wrapper or direct CLI), verify both ADC/API health (`colab --auth=adc --config "$COLAB_STATE" usage >/dev/null`) and server-side session absence (`colab --auth=adc --config "$COLAB_STATE" sessions` with no credential warnings on stderr), and treat any auth or query failure as unconfirmed teardown. If a runtime is still listed, stop it with `colab --auth=adc --config "$COLAB_STATE" stop -s "$SESSION_ID"` (when `--keep` preserved `$COLAB_STATE`); if local session state was already dropped by a non-`--keep` `colab run`, terminate the orphaned runtime immediately in the Colab UI (`Runtime -> Manage sessions`).
+   - **Teardown verification**: After every run (wrapper or direct CLI), verify both ADC/API health (`colab --auth=adc --config "$COLAB_STATE" usage >/dev/null`) and server-side session absence (`colab --auth=adc --config "$COLAB_STATE" sessions` with no credential warnings on stderr), and treat any auth or query failure as unconfirmed teardown. If a runtime is still listed, stop it with `colab --auth=adc --config "$COLAB_STATE" stop -s "$SESSION_ID"` (when `$COLAB_STATE` still holds `$SESSION_ID`); if local session state was already dropped (e.g., by default `colab run`), terminate the orphaned runtime immediately in the Colab UI (`Runtime -> Manage sessions`).
    - For multi-step interactive sessions, prefer `colab exec` (keeps XLA/PJRT caches warm) over `colab ssh` (capped at 5 sessions / HTTP 429). Use `colab download` instead of `drive.mount`.
 
 ---
