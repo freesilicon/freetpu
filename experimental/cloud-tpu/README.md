@@ -24,7 +24,8 @@ Clean-room experimental scripts and C++17 PJRT runtime prototypes validating Tra
 Using `google-colab-cli` (`colab --auth=adc` with isolated `--config` under a private `0700` directory and `--tpu V6E1` or `V5E1`) or directly on a Cloud TPU VM:
 
 ```bash
-mkdir -p -m 700 ~/.cache/freetpu-colab ~/.cache/freetpu-pjrt/ir
+mkdir -p -m 700 ~/.cache/freetpu-colab ~/.cache/freetpu-pjrt
+mkdir -p -m 700 ~/.cache/freetpu-pjrt/ir
 
 # Headless ephemeral single-script run (provisions -> runs -> auto-stops)
 colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json run --tpu V6E1 -- experimental/cloud-tpu/raw_compute_bench.py
@@ -64,6 +65,7 @@ ldd ~/.cache/freetpu-pjrt/tpu_pjrt_bench
 Or build checked-in `tpu_pjrt_bench.cpp` standalone in a private `0700` directory once `.mlirbc` artifacts exist in `$HOME/.cache/freetpu-pjrt/ir`:
 
 ```bash
+mkdir -p -m 700 ~/.cache/freetpu-pjrt
 mkdir -p -m 700 ~/.cache/freetpu-pjrt/ir
 curl -fsSL https://raw.githubusercontent.com/openxla/xla/main/xla/pjrt/c/pjrt_c_api.h \
   -o ~/.cache/freetpu-pjrt/ir/pjrt_c_api.h

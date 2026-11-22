@@ -6,6 +6,7 @@ import json
 import time
 
 import jax
+from jax.extend import backend as jax_backend
 import jax.numpy as jnp
 import numpy as np
 
@@ -19,7 +20,7 @@ def main() -> None:
     except Exception:
       pass
   print("VERSIONS:", json.dumps(pkgs))
-  be = jax.extend.backend.get_backend()
+  be = jax_backend.get_backend()
   print("PJRT_PLATFORM:", be.platform, "VERSION:", be.platform_version.replace("\n", " | "))
   for d in jax.devices():
     ms = {k: int(v) for k, v in d.memory_stats().items()}

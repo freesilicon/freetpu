@@ -42,6 +42,29 @@ def _is_safe_existing_ancestor(ancestor: str) -> bool:
   return True
 
 
+def _validate_existing_ancestor_chain(start_dir: str) -> None:
+  """Validate every existing ancestor directory up to `/` (and symlink targets)."""
+  visited: set[str] = set()
+  queue: list[str] = [start_dir]
+  while queue:
+    cur = queue.pop()
+    while cur and cur not in visited:
+      visited.add(cur)
+      if os.path.lexists(cur):
+        if not _is_safe_existing_ancestor(cur):
+          raise RuntimeError(
+              f"Refusing directory under untrusted ancestor: {cur}"
+          )
+        if os.path.islink(cur):
+          resolved = os.path.realpath(cur)
+          if resolved not in visited:
+            queue.append(resolved)
+      parent = os.path.dirname(cur)
+      if parent == cur:
+        break
+      cur = parent
+
+
 def ensure_private_dir(raw_dir: str) -> str:
   """Ensure `raw_dir` exists as a non-symlink directory owned by the user with mode 0700."""
   expanded = os.path.expanduser(raw_dir)
@@ -57,13 +80,13 @@ def ensure_private_dir(raw_dir: str) -> str:
       if parent == cur:
         break
       cur = parent
-    if not _is_safe_existing_ancestor(cur):
-      raise RuntimeError(f"Refusing to create directory under untrusted parent: {cur}")
+    _validate_existing_ancestor_chain(cur)
     for d in reversed(missing):
       try:
         os.mkdir(d, 0o700)
       except FileExistsError:
         pass
+  _validate_existing_ancestor_chain(os.path.dirname(abs_dir))
   st = os.lstat(abs_dir)
   if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
     raise RuntimeError(f"Expected non-symlink directory, got: {abs_dir}")
@@ -288,7 +311,9 @@ def main() -> None:
   )
 
   try:
-    backend = jax.extend.backend.get_backend()
+    from jax.extend import backend as jax_backend
+
+    backend = jax_backend.get_backend()
   except Exception:
     from jax._src import xla_bridge
 
