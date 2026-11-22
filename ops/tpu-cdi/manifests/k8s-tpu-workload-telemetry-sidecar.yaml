@@ -86,8 +86,14 @@ spec:
           cpu: 200m
           memory: 256Mi
       volumeMounts:
-        - name: sysfs
-          mountPath: /sys
+        # Mount only the narrow sysfs subpaths needed for PCI discovery (never
+        # whole-host /sys) so containerd's read-only /sys/fs/cgroup mount is
+        # never covered by the host's writable cgroup submount.
+        - name: sysfs-bus-pci
+          mountPath: /sys/bus/pci
+          readOnly: true
+        - name: sysfs-devices
+          mountPath: /sys/devices
           readOnly: true
         - name: dev-vfio
           mountPath: /dev/vfio
@@ -116,11 +122,15 @@ spec:
     - name: tpu
       resourceClaimTemplateName: freetpu-all-claim
   volumes:
-    - name: sysfs
+    - name: sysfs-bus-pci
       hostPath:
-        path: /sys
+        path: /sys/bus/pci
+        type: Directory
+    - name: sysfs-devices
+      hostPath:
+        path: /sys/devices
         type: Directory
     - name: dev-vfio
       hostPath:
         path: /dev/vfio
-        type: Directory
+        type: DirectoryOrCreate

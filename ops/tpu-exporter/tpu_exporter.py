@@ -37,7 +37,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 GOOGLE_PCI_VENDOR_ID = "0x1ae0"
 
 # Known Google Cloud TPU PCI device IDs under vendor 0x1ae0.
-# Values: (generation_slug, display_name, nominal_hbm_bytes)
+# Values: (generation_slug, display_name, nominal_hbm_bytes_per_physical_chip)
 TPU_PCI_DEVICES: Dict[str, Tuple[str, str, int]] = {
     "0x0027": ("v2-v3", "TPU v2/v3", 16 * 1024**3),
     "0x0056": ("v4lite", "TPU v4lite", 8 * 1024**3),
@@ -46,6 +46,15 @@ TPU_PCI_DEVICES: Dict[str, Tuple[str, str, int]] = {
     "0x0063": ("v5e", "TPU v5e", 16 * 1024**3),
     "0x006e": ("v6e-pf", "TPU v6e (PF)", 32 * 1024**3),
     "0x006f": ("v6e", "TPU v6e (Trillium)", 32 * 1024**3),
+}
+
+# Legacy Cloud TPU v2/v3 (0x0027) expose two PCI core functions per physical chip
+# under the same base PCI address (`DDDD:BB:DD.0` and `.1`). Subsystem device ID
+# distinguishes v2 (2x8 GiB = 16 GiB/chip) from v3 (2x16 GiB = 32 GiB/chip).
+LEGACY_DUAL_FUNCTION_DEVICE_IDS = frozenset({"0x0027"})
+LEGACY_V2_V3_SUBSYSTEM_DEVICES: Dict[str, Tuple[str, str, int]] = {
+    "0x004e": ("v2", "TPU v2", 16 * 1024**3),
+    "0x004f": ("v3", "TPU v3", 32 * 1024**3),
 }
 
 _UNIT_MULTIPLIERS: Dict[str, int] = {
@@ -447,6 +456,12 @@ def _run_tpu_info(
     return True, None, parsed
 
 
+def _resolve_tpu_device_spec(device_id: str, subsystem_device: str) -> Tuple[str, str, int]:
+    if device_id == "0x0027" and subsystem_device in LEGACY_V2_V3_SUBSYSTEM_DEVICES:
+        return LEGACY_V2_V3_SUBSYSTEM_DEVICES[subsystem_device]
+    return TPU_PCI_DEVICES[device_id]
+
+
 def discover_tpu_devices(
     sysfs_root: Path = Path("/sys"),
     dev_root: Path = Path("/dev"),
@@ -458,6 +473,7 @@ def discover_tpu_devices(
 
     vfio_container_present = (dev_root / "vfio" / "vfio").exists()
     discovered: List[TpuTelemetry] = []
+    legacy_by_base_addr: Dict[str, TpuTelemetry] = {}
 
     for entry in sorted(pci_dir.iterdir(), key=lambda p: p.name):
         vendor_raw = _read_text(entry / "vendor")
@@ -471,7 +487,8 @@ def discover_tpu_devices(
         if device_id not in TPU_PCI_DEVICES:
             # Filter out non-TPU Google PCI functions (e.g. gVNIC 0x0042).
             continue
-        gen, model_name, nominal_hbm = TPU_PCI_DEVICES[device_id]
+        subsystem_device = _normalize_hex_id(_read_text(entry / "subsystem_device") or "")
+        gen, model_name, nominal_hbm = _resolve_tpu_device_spec(device_id, subsystem_device)
         driver = _read_symlink_name(entry / "driver") or "unbound"
         iommu_group = _read_symlink_name(entry / "iommu_group") or ""
         enable_raw = _read_text(entry / "enable")
@@ -505,30 +522,46 @@ def discover_tpu_devices(
             and vfio_container_present
         )
 
-        discovered.append(
-            TpuTelemetry(
-                chip_index=len(discovered),
-                pci_bdf=entry.name,
-                vendor_id=vendor_id,
-                device_id=device_id,
-                generation=gen,
-                model_name=model_name,
-                driver=driver,
-                iommu_group=iommu_group,
-                vfio_device=vfio_device,
-                vfio_present=vfio_present,
-                vfio_is_char=vfio_is_char,
-                vfio_container_present=vfio_container_present,
-                pci_enabled=pci_enabled,
-                numa_node=numa_node,
-                healthy=healthy,
-                hbm_used_bytes=None,
-                hbm_total_bytes=nominal_hbm if nominal_hbm > 0 else None,
-                hbm_nominal_bytes=nominal_hbm,
-                duty_cycle_percent=None,
-                runtime_chip_id=runtime_chip_id,
-            )
+        # Group dual-core legacy TPU v2/v3 (0x0027) PCI functions sharing the same
+        # base PCI address (`DDDD:BB:DD`) into one physical chip record.
+        if device_id in LEGACY_DUAL_FUNCTION_DEVICE_IDS:
+            base_addr = entry.name.rsplit(".", 1)[0]
+            existing = legacy_by_base_addr.get(base_addr)
+            if existing is not None:
+                existing.pci_enabled = existing.pci_enabled or pci_enabled
+                existing.healthy = existing.healthy and healthy
+                if existing.generation == "v2-v3" and gen != "v2-v3":
+                    existing.generation = gen
+                    existing.model_name = model_name
+                    existing.hbm_nominal_bytes = nominal_hbm
+                    existing.hbm_total_bytes = nominal_hbm if nominal_hbm > 0 else None
+                continue
+
+        chip = TpuTelemetry(
+            chip_index=len(discovered),
+            pci_bdf=entry.name,
+            vendor_id=vendor_id,
+            device_id=device_id,
+            generation=gen,
+            model_name=model_name,
+            driver=driver,
+            iommu_group=iommu_group,
+            vfio_device=vfio_device,
+            vfio_present=vfio_present,
+            vfio_is_char=vfio_is_char,
+            vfio_container_present=vfio_container_present,
+            pci_enabled=pci_enabled,
+            numa_node=numa_node,
+            healthy=healthy,
+            hbm_used_bytes=None,
+            hbm_total_bytes=nominal_hbm if nominal_hbm > 0 else None,
+            hbm_nominal_bytes=nominal_hbm,
+            duty_cycle_percent=None,
+            runtime_chip_id=runtime_chip_id,
         )
+        discovered.append(chip)
+        if device_id in LEGACY_DUAL_FUNCTION_DEVICE_IDS:
+            legacy_by_base_addr[entry.name.rsplit(".", 1)[0]] = chip
 
     return discovered
 

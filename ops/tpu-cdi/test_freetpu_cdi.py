@@ -389,6 +389,18 @@ class FreeTpuCdiTests(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 freetpu_cdi.discover_tpu_chips(sysfs_root=sysfs_root, dev_root=dev_root)
 
+            # With an empty /dev/vfio directory (as created by DirectoryOrCreate when
+            # vfio-pci failed to initialize), reconcile_cdi_spec must invalidate any stale spec.
+            stale_spec = root / "var" / "run" / "cdi" / "freetpu.json"
+            stale_spec.parent.mkdir(parents=True, exist_ok=True)
+            stale_spec.write_text('{"stale": true}\n', encoding="utf-8")
+            ok, msg = freetpu_cdi.reconcile_cdi_spec(
+                stale_spec, sysfs_root=sysfs_root, dev_root=dev_root
+            )
+            self.assertFalse(ok)
+            self.assertIn("removed stale", msg)
+            self.assertFalse(stale_spec.exists())
+
     def test_docker_args_prints_required_vfio_flags(self) -> None:
         script = CDI_DIR / "freetpu_cdi.py"
         res = subprocess.run(

@@ -20,7 +20,7 @@ VFIO-backed Cloud TPU VMs (`v5e`, `v5p`, `v6e` Trillium) expose each TPU chip as
 
 | PCI Device ID | Generation | Model Label | Nominal HBM / Chip | Host Interface & Support Scope |
 | --- | --- | --- | --- | --- |
-| `0x0027` | `v2-v3` | TPU v2/v3 | 16 GiB | `/dev/accel*` (PCI inventory only; VFIO CDI & health N/A) |
+| `0x0027` (`subsys 0x004e` / `0x004f`) | `v2` / `v3` | TPU v2 / TPU v3 | 16 GiB / 32 GiB | `/dev/accel*` (PCI inventory only, dual PCI functions grouped per chip; VFIO CDI & health N/A) |
 | `0x0056` | `v4lite` | TPU v4lite | 8 GiB | `/dev/accel*` (PCI inventory only; VFIO CDI & health N/A) |
 | `0x005e` | `v4` | TPU v4 | 32 GiB | `/dev/accel*` (PCI inventory only; VFIO CDI & health N/A) |
 | `0x0062` | `v5p` | TPU v5p | 95 GiB | `vfio-pci` (`/dev/vfio/*`, full exporter + CDI) |

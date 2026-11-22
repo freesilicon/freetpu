@@ -92,8 +92,17 @@ spec:
               cpu: 100m
               memory: 64Mi
           volumeMounts:
-            - name: sysfs
-              mountPath: /sys
+            # Mount only the narrow sysfs subpaths needed for PCI and IOMMU
+            # discovery (never whole-host /sys) so containerd's read-only
+            # /sys/fs/cgroup mount is never shadowed by a writable host cgroup.
+            - name: sysfs-bus-pci
+              mountPath: /sys/bus/pci
+              readOnly: true
+            - name: sysfs-devices
+              mountPath: /sys/devices
+              readOnly: true
+            - name: sysfs-iommu-groups
+              mountPath: /sys/kernel/iommu_groups
               readOnly: true
             - name: dev-vfio
               mountPath: /dev/vfio
@@ -151,8 +160,11 @@ spec:
               cpu: 200m
               memory: 128Mi
           volumeMounts:
-            - name: sysfs
-              mountPath: /sys
+            - name: sysfs-bus-pci
+              mountPath: /sys/bus/pci
+              readOnly: true
+            - name: sysfs-devices
+              mountPath: /sys/devices
               readOnly: true
             - name: dev-vfio
               mountPath: /dev/vfio
@@ -161,14 +173,25 @@ spec:
               mountPath: /opt/freetpu
               readOnly: true
       volumes:
-        - name: sysfs
+        - name: sysfs-bus-pci
           hostPath:
-            path: /sys
+            path: /sys/bus/pci
+            type: Directory
+        - name: sysfs-devices
+          hostPath:
+            path: /sys/devices
+            type: Directory
+        - name: sysfs-iommu-groups
+          hostPath:
+            path: /sys/kernel/iommu_groups
             type: Directory
         - name: dev-vfio
           hostPath:
+            # DirectoryOrCreate lets the DaemonSet start even if vfio-pci failed
+            # to initialize so tpu-exporter can still report unhealthy chips and
+            # freetpu-cdi-sync can invalidate any stale CDI spec.
             path: /dev/vfio
-            type: Directory
+            type: DirectoryOrCreate
         - name: cdi-dir
           hostPath:
             path: /var/run/cdi

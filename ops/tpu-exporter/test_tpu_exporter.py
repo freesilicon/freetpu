@@ -54,6 +54,8 @@ def _make_mock_pci_tree(
         d.mkdir(parents=True, exist_ok=True)
         (d / "vendor").write_text(dev["vendor"] + "\n", encoding="utf-8")
         (d / "device").write_text(dev["device"] + "\n", encoding="utf-8")
+        if "subsystem_device" in dev:
+            (d / "subsystem_device").write_text(dev["subsystem_device"] + "\n", encoding="utf-8")
         (d / "enable").write_text(dev.get("enable", "1") + "\n", encoding="utf-8")
         if "numa_node" in dev:
             (d / "numa_node").write_text(dev["numa_node"] + "\n", encoding="utf-8")
@@ -735,6 +737,74 @@ TPU Device Status
             self.assertAlmostEqual(snap.devices[1].duty_cycle_percent or 0.0, 80.0)
             rt_map = {r.runtime_chip: r.mapped_pci_bdf for r in snap.runtime_utilization}
             self.assertEqual(rt_map, {"0": "0000:00:05.0", "1": "0000:00:06.0"})
+
+    def test_legacy_0x0027_groups_dual_functions_and_resolves_v2_v3_subsystem(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sysfs_root, dev_root, proc_root = _make_mock_pci_tree(
+                root,
+                devices=[
+                    # One TPU v2 chip (subsystem 0x004e) exposing two PCI core functions (.0 and .1).
+                    {
+                        "bdf": "0000:00:04.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0027",
+                        "subsystem_device": "0x004e",
+                        "driver": "accel",
+                        "enable": "1",
+                    },
+                    {
+                        "bdf": "0000:00:04.1",
+                        "vendor": "0x1ae0",
+                        "device": "0x0027",
+                        "subsystem_device": "0x004e",
+                        "driver": "accel",
+                        "enable": "1",
+                    },
+                    # One TPU v3 chip (subsystem 0x004f) exposing two PCI core functions (.0 and .1).
+                    {
+                        "bdf": "0000:00:05.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0027",
+                        "subsystem_device": "0x004f",
+                        "driver": "accel",
+                        "enable": "0",
+                    },
+                    {
+                        "bdf": "0000:00:05.1",
+                        "vendor": "0x1ae0",
+                        "device": "0x0027",
+                        "subsystem_device": "0x004f",
+                        "driver": "accel",
+                        "enable": "1",
+                    },
+                ],
+                create_vfio_container=False,
+                create_vfio_nodes=[],
+            )
+            snap = tpu_exporter.collect_snapshot(
+                sysfs_root=sysfs_root,
+                dev_root=dev_root,
+                proc_root=proc_root,
+                tpu_info_bin=None,
+            )
+            # 4 PCI functions -> exactly 2 physical chips (1 v2 + 1 v3).
+            self.assertEqual(len(snap.devices), 2)
+
+            v2 = snap.devices[0]
+            self.assertEqual(v2.pci_bdf, "0000:00:04.0")
+            self.assertEqual(v2.generation, "v2")
+            self.assertEqual(v2.model_name, "TPU v2")
+            self.assertEqual(v2.hbm_total_bytes, 16 * 1024**3)
+            self.assertFalse(v2.healthy)
+
+            v3 = snap.devices[1]
+            self.assertEqual(v3.pci_bdf, "0000:00:05.0")
+            self.assertEqual(v3.generation, "v3")
+            self.assertEqual(v3.model_name, "TPU v3")
+            self.assertEqual(v3.hbm_total_bytes, 32 * 1024**3)
+            self.assertTrue(v3.pci_enabled)
+            self.assertFalse(v3.healthy)
 
     def _assert_valid_prometheus_text(self, text: str) -> None:
         lines = [ln for ln in text.splitlines() if ln.strip()]
