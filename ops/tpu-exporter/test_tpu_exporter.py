@@ -583,16 +583,17 @@ TPU Device Status
             )
             (proc_root / "1234" / "fd").mkdir(parents=True)
 
-            orig_iterdir = Path.iterdir
+            orig_scandir = os.scandir
 
-            def _guarded_iterdir(p: Path):
-                if p.name == "fd" and p.parent.name == "1234":
+            def _guarded_scandir(p):
+                pp = Path(os.fspath(p))
+                if pp.name == "fd" and pp.parent.name == "1234":
                     raise PermissionError("simulated EACCES without CAP_SYS_PTRACE")
-                return orig_iterdir(p)
+                return orig_scandir(p)
 
             with (
                 _mock_vfio_char_lstat(),
-                mock.patch.object(Path, "iterdir", autospec=True, side_effect=_guarded_iterdir),
+                mock.patch("tpu_exporter.os.scandir", side_effect=_guarded_scandir),
             ):
                 snap = tpu_exporter.collect_snapshot(
                     sysfs_root=sysfs_root,
@@ -609,6 +610,17 @@ TPU Device Status
             self.assertIn("} 0", prom)
             self.assertNotIn("freetpu_tpu_active_pids{", prom)
 
+            # Bounded FD scan timeout marks PID telemetry unavailable without throwing.
+            with _mock_vfio_char_lstat():
+                _, ok_to, unrd_to, _ = tpu_exporter._scan_proc_vfio_pids(
+                    proc_root,
+                    [str(dev_root / "vfio" / "0")],
+                    expected_devnums={str(dev_root / "vfio" / "0"): "242:0"},
+                    scan_timeout_s=-1.0,
+                )
+            self.assertFalse(ok_to)
+            self.assertGreaterEqual(unrd_to, 1)
+
             # Even when tpu-info returns a matching chip row with PID=None, an
             # unreadable /proc scan MUST keep PID telemetry unavailable (no false 0).
             mock_none_pid = root / "mock-tpu-info-none-pid.sh"
@@ -623,7 +635,10 @@ TPU Device Status
                 encoding="utf-8",
             )
             mock_none_pid.chmod(0o755)
-            with mock.patch.object(Path, "iterdir", autospec=True, side_effect=_guarded_iterdir):
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch("tpu_exporter.os.scandir", side_effect=_guarded_scandir),
+            ):
                 snap_with_cli = tpu_exporter.collect_snapshot(
                     sysfs_root=sysfs_root,
                     dev_root=dev_root,

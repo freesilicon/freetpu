@@ -12,13 +12,18 @@ count by (generation) (
   group by (generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node"})
 )
 
-# Total VFIO-ready physical TPU chips per generation across the cluster
+# Total VFIO-ready physical TPU chips per generation across the cluster (VFIO-backed generations)
 count by (generation) (
-  min by (generation, node, pci_bdf) (freetpu_tpu_health_status{collector_role="node"}) == 1
+  min by (generation, node, pci_bdf) (
+    freetpu_tpu_health_status{collector_role="node", generation=~"v5e|v5p|v6e|v6e-pf"}
+  ) == 1
 )
 
-# Unhealthy or unbound TPU chips (vfio-pci / /dev/vfio/<group> missing)
-min by (generation, node, pci_bdf) (freetpu_tpu_health_status{collector_role="node"}) == 0
+# Unhealthy or unbound VFIO-backed TPU chips (vfio-pci / /dev/vfio/<group> missing or unverified;
+# excludes legacy /dev/accel* v2/v3/v4 hosts where VFIO readiness is inapplicable)
+min by (generation, node, pci_bdf) (
+  freetpu_tpu_health_status{collector_role="node", generation=~"v5e|v5p|v6e|v6e-pf"}
+) == 0
 ```
 
 ## Compute & HBM Utilization (Hosts Running `tpu-info`)

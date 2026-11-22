@@ -632,8 +632,10 @@ def _validate_container_edits(edits: Any, context: str, errors: List[str]) -> No
                     hp = node["hostPath"]
                     if not isinstance(hp, str) or not hp.startswith("/"):
                         errors.append(f"{nc}.hostPath: must be an absolute path")
-                if "type" in node and node["type"] not in _ALLOWED_DEVICE_TYPES:
-                    errors.append(f"{nc}.type: invalid device type {node['type']!r}")
+                if "type" in node:
+                    node_type = node["type"]
+                    if not isinstance(node_type, str) or node_type not in _ALLOWED_DEVICE_TYPES:
+                        errors.append(f"{nc}.type: invalid device type {node_type!r}")
                 if "permissions" in node:
                     perm = node["permissions"]
                     if (
@@ -676,8 +678,9 @@ def _validate_container_edits(edits: Any, context: str, errors: List[str]) -> No
                 if not isinstance(h, dict):
                     errors.append(f"{hc}: must be an object")
                     continue
-                if h.get("hookName") not in _ALLOWED_HOOK_NAMES:
-                    errors.append(f"{hc}.hookName: invalid OCI hookName {h.get('hookName')!r}")
+                hook_name = h.get("hookName")
+                if not isinstance(hook_name, str) or hook_name not in _ALLOWED_HOOK_NAMES:
+                    errors.append(f"{hc}.hookName: invalid OCI hookName {hook_name!r}")
                 if not isinstance(h.get("path"), str) or not h["path"].startswith("/"):
                     errors.append(f"{hc}.path: must be an absolute executable path")
 

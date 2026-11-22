@@ -18,5 +18,9 @@ COPY tpu_exporter.py /opt/freetpu/tpu_exporter.py
 
 EXPOSE 9400
 
-ENTRYPOINT ["python3", "/opt/freetpu/tpu_exporter.py"]
-CMD ["--host", "0.0.0.0", "--port", "9400", "--health-host", "127.0.0.1", "--health-port", "9401"]
+# Default bind and loopback health flags live in ENTRYPOINT so passing extra
+# runtime flags (e.g. `--no-pid-scan --runtime-metrics-addr 127.0.0.1:8431`)
+# preserves `--host 0.0.0.0` and `--health-port 9401` while still allowing
+# explicit flag overrides via CMD/args.
+ENTRYPOINT ["python3", "/opt/freetpu/tpu_exporter.py", "--host", "0.0.0.0", "--port", "9400", "--health-host", "127.0.0.1", "--health-port", "9401"]
+CMD []

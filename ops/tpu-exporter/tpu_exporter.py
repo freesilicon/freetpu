@@ -233,28 +233,22 @@ def _stat_non_symlink_char_devnum(path: Path) -> Optional[str]:
     return None
 
 
+DEFAULT_PROC_SCAN_TIMEOUT_S = 2.0
+
+
 def _scan_proc_vfio_pids(
     proc_root: Path,
     vfio_paths: Sequence[str],
     expected_devnums: Optional[Dict[str, Optional[str]]] = None,
+    scan_timeout_s: float = DEFAULT_PROC_SCAN_TIMEOUT_S,
 ) -> Tuple[Dict[str, List[int]], bool, int, Dict[str, int]]:
     """Find PIDs holding active non-`O_PATH` char-device FDs matching host `/dev/vfio/<group>` `st_rdev`.
 
-    Compares each `/proc/<pid>/fd/<n>` target's file mode (`S_ISCHR`), device
-    number (`st_rdev`), and `/proc/<pid>/fdinfo/<n>` open flags against the host
-    VFIO group character device instead of matching pathnames, so regular files
-    in other mount namespaces and path-only `O_PATH` descriptors (which do not
-    open or reserve a VFIO group) are ignored while VFIO nodes bind-mounted
-    under different paths are accurately matched.
-
-    Returns `(pids_by_vfio_path, pid_telemetry_accessible, unreadable_pid_dirs, verified_rdevs)`.
-    `verified_rdevs` contains ONLY those `vfio_paths` whose host node was successfully
-    `stat()`ed as a character device (`S_ISCHR`) AND whose `(major, minor)` matches the
-    kernel-exported sysfs VFIO group device number (`expected_devnums[vp]`). Callers
-    MUST mark PID telemetry unavailable (and suppress `freetpu_tpu_active_pids`) for
-    any group missing from `verified_rdevs` so a missing, unreadable, non-character,
-    or mismatched/stale `/dev/vfio/<group>` node never attributes another group's
-    processes or emits a false zero PID count as valid billing coverage.
+    Streams `/proc` and `/proc/<pid>/fd` with `os.scandir()` (avoiding O(open_fds)
+    `Path` list allocations on hosts with high `RLIMIT_NOFILE`) and enforces a hard
+    `scan_timeout_s` budget. If any `/proc/<pid>/fd` directory is unreadable or the
+    scan exceeds its time budget, marks `pid_telemetry_accessible=False` so PCI
+    inventory is still returned without publishing false zero PID counts.
     """
     unique_paths = list(dict.fromkeys(p for p in vfio_paths if p))
     result: Dict[str, List[int]] = {}
@@ -281,55 +275,72 @@ def _scan_proc_vfio_pids(
         result[vp] = []
         rdev_to_paths.setdefault(host_st.st_rdev, []).append(vp)
 
+    deadline = time.monotonic() + max(0.0, float(scan_timeout_s))
+    timed_out = False
+    unreadable = 0
+    fd_checks = 0
+
     try:
-        entries = list(proc_root.iterdir())
+        proc_iter = os.scandir(proc_root)
     except PermissionError:
         return result, False, 1, verified_rdevs
     except OSError:
         return result, False, 1, verified_rdevs
 
-    unreadable = 0
-    for entry in entries:
-        if not entry.name.isdigit():
-            continue
-        pid = int(entry.name)
-        fd_dir = entry / "fd"
-        try:
-            fds = list(fd_dir.iterdir())
-        except PermissionError:
-            unreadable += 1
-            continue
-        except OSError:
-            # Process may have exited concurrently; not an access denial.
-            continue
-        if not rdev_to_paths:
-            continue
-        for fd_link in fds:
+    with proc_iter:
+        for entry in proc_iter:
+            if not entry.name.isdigit():
+                continue
+            if time.monotonic() > deadline:
+                timed_out = True
+                break
+            pid = int(entry.name)
+            fd_dir_path = os.path.join(entry.path, "fd")
             try:
-                fd_st = os.stat(fd_link)
+                fd_iter = os.scandir(fd_dir_path)
             except PermissionError:
                 unreadable += 1
                 continue
             except OSError:
+                # Process may have exited concurrently; not an access denial.
                 continue
-            if not stat.S_ISCHR(fd_st.st_mode):
-                continue
-            matched_paths = rdev_to_paths.get(fd_st.st_rdev)
-            if not matched_paths:
-                continue
-            flags, perm_denied = _read_fdinfo_flags(entry / "fdinfo" / fd_link.name)
-            if perm_denied:
-                unreadable += 1
-                continue
-            if flags is None or (flags & _LINUX_O_PATH) != 0:
-                continue
-            for canonical in matched_paths:
-                if pid not in result[canonical]:
-                    result[canonical].append(pid)
+            with fd_iter:
+                if not rdev_to_paths:
+                    continue
+                for fd_entry in fd_iter:
+                    fd_checks += 1
+                    if (fd_checks & 0xFF) == 0 and time.monotonic() > deadline:
+                        timed_out = True
+                        break
+                    try:
+                        fd_st = os.stat(fd_entry.path)
+                    except PermissionError:
+                        unreadable += 1
+                        continue
+                    except OSError:
+                        continue
+                    if not stat.S_ISCHR(fd_st.st_mode):
+                        continue
+                    matched_paths = rdev_to_paths.get(fd_st.st_rdev)
+                    if not matched_paths:
+                        continue
+                    flags, perm_denied = _read_fdinfo_flags(
+                        Path(entry.path) / "fdinfo" / fd_entry.name
+                    )
+                    if perm_denied:
+                        unreadable += 1
+                        continue
+                    if flags is None or (flags & _LINUX_O_PATH) != 0:
+                        continue
+                    for canonical in matched_paths:
+                        if pid not in result[canonical]:
+                            result[canonical].append(pid)
+            if timed_out:
+                break
 
     for pids in result.values():
         pids.sort()
-    return result, unreadable == 0, unreadable, verified_rdevs
+    return result, (unreadable == 0 and not timed_out), unreadable + (1 if timed_out else 0), verified_rdevs
 
 
 @dataclass
@@ -953,25 +964,36 @@ def validate_chip_id_map(
         seen_runtime_targets[rt_id] = dev.pci_bdf
 
 
-def _pid_holds_vfio_rdev(proc_root: Path, pid: int, target_rdev: int) -> bool:
+def _pid_holds_vfio_rdev(
+    proc_root: Path,
+    pid: int,
+    target_rdev: int,
+    scan_timeout_s: float = DEFAULT_PROC_SCAN_TIMEOUT_S,
+) -> bool:
     """Return True iff `/proc/<pid>/fd/*` contains an active non-`O_PATH` char device with `st_rdev == target_rdev`."""
     pid_dir = proc_root / str(pid)
     fd_dir = pid_dir / "fd"
+    deadline = time.monotonic() + max(0.0, float(scan_timeout_s))
     try:
-        fds = list(fd_dir.iterdir())
+        fd_iter = os.scandir(fd_dir)
     except OSError:
         return False
-    for fd_link in fds:
-        try:
-            fd_st = os.stat(fd_link)
-        except OSError:
-            continue
-        if not (stat.S_ISCHR(fd_st.st_mode) and fd_st.st_rdev == target_rdev):
-            continue
-        flags, perm_denied = _read_fdinfo_flags(pid_dir / "fdinfo" / fd_link.name)
-        if perm_denied or flags is None or (flags & _LINUX_O_PATH) != 0:
-            continue
-        return True
+    checks = 0
+    with fd_iter:
+        for fd_entry in fd_iter:
+            checks += 1
+            if (checks & 0xFF) == 0 and time.monotonic() > deadline:
+                return False
+            try:
+                fd_st = os.stat(fd_entry.path)
+            except OSError:
+                continue
+            if not (stat.S_ISCHR(fd_st.st_mode) and fd_st.st_rdev == target_rdev):
+                continue
+            flags, perm_denied = _read_fdinfo_flags(pid_dir / "fdinfo" / fd_entry.name)
+            if perm_denied or flags is None or (flags & _LINUX_O_PATH) != 0:
+                continue
+            return True
     return False
 
 

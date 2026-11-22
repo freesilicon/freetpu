@@ -1334,6 +1334,24 @@ class FreeTpuCdiTests(unittest.TestCase):
                     errs_sym,
                 )
 
+                # 6. Non-string/unhashable JSON fields in type/hookName produce validation errors (no TypeError).
+                malformed_spec = {
+                    "cdiVersion": "0.6.0",
+                    "kind": "freetpu.dev/tpu",
+                    "devices": [
+                        {
+                            "name": "all",
+                            "containerEdits": {
+                                "deviceNodes": [{"path": "/dev/vfio/0", "type": ["c"]}],
+                                "hooks": [{"hookName": {"bad": 1}, "path": "/bin/true"}],
+                            },
+                        }
+                    ],
+                }
+                mal_errs = freetpu_cdi.validate_cdi_spec(malformed_spec)
+                self.assertTrue(any("invalid device type" in e for e in mal_errs), mal_errs)
+                self.assertTrue(any("invalid OCI hookName" in e for e in mal_errs), mal_errs)
+
 
 if __name__ == "__main__":
     unittest.main()
