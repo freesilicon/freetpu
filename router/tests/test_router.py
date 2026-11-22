@@ -2969,7 +2969,8 @@ class TestFreeTPURouter(unittest.TestCase):
         router = self._track(create_router_server(cfg))
         rport = router.server_address[1]
 
-        # 1. Partial line exceeding max_sse_pre_commit_bytes (1024) with ZERO newlines -> fail over.
+        # 1. Partial line exceeding max_sse_pre_commit_bytes (1024) with ZERO newlines ->
+        #    returns request-scoped 502 WITHOUT cooling down primary or failing over to paid backup.
         bad_primary.raw_sse_bytes = b":" + (b"x" * 4096)
         status, hdrs, body = _http_request(
             rport,
@@ -2981,13 +2982,15 @@ class TestFreeTPURouter(unittest.TestCase):
                 "messages": [{"role": "user", "content": "byte cap without newline"}],
             },
         )
-        self.assertEqual(status, 200)
-        self.assertEqual(hdrs["x-freetpu-backend"], "good-nonl-backup")
-        self.assertEqual(hdrs["x-freetpu-failovers"], "1")
-        self.assertIn("good-nonl-backup", body.decode("utf-8"))
+        self.assertEqual(status, 502)
+        self.assertEqual(hdrs["x-freetpu-backend"], "no-nl-primary")
+        self.assertEqual(hdrs["x-freetpu-failovers"], "0")
+        self.assertIn("response_too_large", body.decode("utf-8"))
+        self.assertEqual(len(healthy.requests_seen), 0)
+        self.assertEqual(router.engine._backends[0].cooldown_until_monotonic, 0.0)
+        self.assertTrue(router.engine._backends[0].healthy)
 
         # 2. Slow trickle without newlines (1 byte every 0.05s) hits 0.30s elapsed deadline -> fail over.
-        router.engine._backends[0].cooldown_until_monotonic = 0.0
         bad_primary.raw_sse_bytes = None
         bad_primary.newline_free_trickle_interval_s = 0.05
         t0 = time.monotonic()
@@ -3974,15 +3977,14 @@ class TestFreeTPURouter(unittest.TestCase):
                         resp.read()
                     partial = exc_info.exception.partial.decode("utf-8", errors="replace")
                     self.assertIn("Hello ", partial)
-                    self.assertIn("upstream_stream_interrupted", partial)
+                    self.assertIn("response_too_large", partial)
                 finally:
                     conn.close()
 
+                # Local post-commit event size cap is request-scoped: backend stays healthy & NOT in cooldown.
                 self.assertEqual(router.engine._backends[0].inflight, 0)
-                self.assertGreater(
-                    router.engine._backends[0].cooldown_until_monotonic,
-                    time.monotonic(),
-                )
+                self.assertEqual(router.engine._backends[0].cooldown_until_monotonic, 0.0)
+                self.assertTrue(router.engine._backends[0].healthy)
                 m_status, _, m_body = _http_request(rport, "GET", "/metrics")
                 self.assertEqual(m_status, 200)
                 self.assertIn('status="502"', m_body.decode("utf-8"))
@@ -5096,6 +5098,322 @@ class TestFreeTPURouter(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(hdrs["x-freetpu-backend"], "good-backup")
+
+    def test_cumulative_header_bytes_capped_with_431_before_auth(self) -> None:
+        backend = self._track(_MockOpenAIBackend("hdr-cap-b", ["m-hdr"]))
+        auth_calls: List[str] = []
+
+        class _CountingAuth(BearerTokenAuthHook):
+            def authenticate(self, headers, path, method):  # type: ignore[override]
+                auth_calls.append(path)
+                return super().authenticate(headers, path, method)
+
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            max_header_bytes=2048,
+            backends=[
+                BackendConfig(
+                    id="hdr-cap-b",
+                    base_url=backend.base_url,
+                    models=["m-hdr"],
+                )
+            ],
+        )
+        router = self._track(
+            create_router_server(cfg, auth_hook=_CountingAuth({"secret": "u"}))
+        )
+        rport = router.server_address[1]
+
+        # Many small headers totaling >2048 bytes (well under CPython's 65536/line limit).
+        big_headers = "".join(f"X-Pad-{i}: " + ("a" * 120) + "\r\n" for i in range(30))
+        raw_req = (
+            "GET /health HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{rport}\r\n"
+            + big_headers
+            + "Connection: close\r\n\r\n"
+        ).encode("ascii")
+
+        with socket.create_connection(("127.0.0.1", rport), timeout=2.0) as sock:
+            sock.sendall(raw_req)
+            resp_chunks = []
+            while True:
+                try:
+                    data = sock.recv(4096)
+                except ConnectionResetError:
+                    break
+                if not data:
+                    break
+                resp_chunks.append(data)
+        raw_resp = b"".join(resp_chunks).decode("utf-8", errors="replace")
+        self.assertTrue(raw_resp.startswith("HTTP/1.1 431 "))
+        self.assertIn("request_header_fields_too_large", raw_resp)
+        # Rejected before authentication hook ever runs.
+        self.assertEqual(auth_calls, [])
+
+        # Normal request under cap still succeeds.
+        status_ok, _, _ = _http_request(
+            rport,
+            "GET",
+            "/health",
+            headers={"Authorization": "Bearer secret"},
+        )
+        self.assertEqual(status_ok, 200)
+
+    def test_dense_json_containers_and_deep_nesting_rejected_before_json_loads(self) -> None:
+        backend = self._track(_MockOpenAIBackend("json-guard-b", ["m-jguard"]))
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            max_json_depth=16,
+            max_json_nodes=500,
+            backends=[
+                BackendConfig(
+                    id="json-guard-b",
+                    base_url=backend.base_url,
+                    models=["m-jguard"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        # 1. Dense container array exceeding max_json_nodes (500) -> HTTP 400 before json.loads.
+        dense_body = (
+            '{"model":"m-jguard","messages":['
+            + ",".join(["[]"] * 600)
+            + "]}"
+        ).encode("utf-8")
+        conn = http.client.HTTPConnection("127.0.0.1", rport, timeout=2.0)
+        try:
+            conn.request(
+                "POST",
+                "/v1/chat/completions",
+                body=dense_body,
+                headers={"Content-Type": "application/json"},
+            )
+            resp = conn.getresponse()
+            raw = resp.read().decode("utf-8")
+            self.assertEqual(resp.status, 400)
+            self.assertIn("json_complexity_limit_exceeded", raw)
+        finally:
+            conn.close()
+
+        # 2. Deeply nested containers exceeding max_json_depth (16) -> HTTP 400.
+        deep_body = (
+            '{"model":"m-jguard","x":' + ("[" * 25) + "0" + ("]" * 25) + "}"
+        ).encode("utf-8")
+        conn = http.client.HTTPConnection("127.0.0.1", rport, timeout=2.0)
+        try:
+            conn.request(
+                "POST",
+                "/v1/chat/completions",
+                body=deep_body,
+                headers={"Content-Type": "application/json"},
+            )
+            resp = conn.getresponse()
+            raw = resp.read().decode("utf-8")
+            self.assertEqual(resp.status, 400)
+            self.assertIn("json_complexity_limit_exceeded", raw)
+        finally:
+            conn.close()
+
+        # 3. Legitimate request with a large string (including brackets/commas inside quotes) passes.
+        status_ok, _, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-jguard",
+                "messages": [
+                    {"role": "user", "content": ("[{},]" * 500)}
+                ],
+            },
+        )
+        self.assertEqual(status_ok, 200)
+        self.assertEqual(len(backend.requests_seen), 1)
+
+    def test_client_disconnect_during_primary_timeout_skips_fallback(self) -> None:
+        primary = self._track(
+            _MockOpenAIBackend(
+                "slow-primary",
+                ["m-cancel-retry"],
+                latency_s=0.45,
+            )
+        )
+        fallback = self._track(
+            _MockOpenAIBackend("paid-fallback", ["m-cancel-retry"])
+        )
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            backends=[
+                BackendConfig(
+                    id="slow-primary",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=primary.base_url,
+                    timeout_s=0.25,
+                ),
+                BackendConfig(
+                    id="paid-fallback",
+                    type="cloud-tpu-v5e",
+                    local=False,
+                    base_url=fallback.base_url,
+                    timeout_s=2.0,
+                ),
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        req_body = json.dumps(
+            {
+                "model": "m-cancel-retry",
+                "messages": [{"role": "user", "content": "cancel before failover"}],
+            }
+        ).encode("utf-8")
+        sock = socket.create_connection(("127.0.0.1", rport), timeout=2.0)
+        try:
+            sock.sendall(
+                b"POST /v1/chat/completions HTTP/1.1\r\n"
+                + f"Host: 127.0.0.1:{rport}\r\n".encode("ascii")
+                + b"Content-Type: application/json\r\n"
+                + f"Content-Length: {len(req_body)}\r\n".encode("ascii")
+                + b"Connection: close\r\n\r\n"
+                + req_body
+            )
+            # Wait until primary has received the request, then disconnect client before timeout.
+            dl = time.monotonic() + 2.0
+            while len(primary.requests_seen) == 0 and time.monotonic() < dl:
+                time.sleep(0.01)
+            self.assertEqual(len(primary.requests_seen), 1)
+        finally:
+            sock.close()
+
+        # Wait past primary's 0.25s timeout so the retry check runs.
+        time.sleep(0.45)
+        self.assertEqual(len(fallback.requests_seen), 0)
+        self.assertEqual(router.engine._backends[0].inflight, 0)
+        self.assertEqual(router.engine._backends[1].inflight, 0)
+
+    def test_same_origin_browser_post_allowed_with_empty_cors_allowlist(self) -> None:
+        backend = self._track(_MockOpenAIBackend("same-orig-b", ["m-sameorig"]))
+
+        # 1. Direct same-origin POST (Origin matches Host) allowed with empty cors_allowed_origins.
+        cfg_direct = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            cors_allowed_origins=[],
+            backends=[
+                BackendConfig(
+                    id="same-orig-b",
+                    base_url=backend.base_url,
+                    models=["m-sameorig"],
+                )
+            ],
+        )
+        router_direct = self._track(create_router_server(cfg_direct))
+        rport = router_direct.server_address[1]
+
+        st_same, hdrs_same, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            headers={"Origin": f"http://127.0.0.1:{rport}"},
+            body={"model": "m-sameorig", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        self.assertEqual(st_same, 200)
+        self.assertNotIn("access-control-allow-origin", hdrs_same)
+
+        # Cross-origin POST is still rejected with 403.
+        st_cross, _, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            headers={"Origin": "https://evil.example.com"},
+            body={"model": "m-sameorig", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        self.assertEqual(st_cross, 403)
+
+        # Scheme mismatch (https Origin on plain HTTP without trust_proxy_headers) is rejected.
+        st_scheme, _, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            headers={
+                "Origin": f"https://127.0.0.1:{rport}",
+                "X-Forwarded-Proto": "https",
+            },
+            body={"model": "m-sameorig", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        self.assertEqual(st_scheme, 403)
+
+        # 2. Reverse proxy TLS termination with configured public_origin allows same-origin POST.
+        cfg_pub = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            cors_allowed_origins=[],
+            public_origin="https://chat.example.com",
+            backends=[
+                BackendConfig(
+                    id="same-orig-b",
+                    base_url=backend.base_url,
+                    models=["m-sameorig"],
+                )
+            ],
+        )
+        router_pub = self._track(create_router_server(cfg_pub))
+        rport_pub = router_pub.server_address[1]
+
+        st_pub_ok, _, _ = _http_request(
+            rport_pub,
+            "POST",
+            "/v1/chat/completions",
+            headers={"Origin": "https://chat.example.com"},
+            body={"model": "m-sameorig", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        self.assertEqual(st_pub_ok, 200)
+
+        st_pub_bad, _, _ = _http_request(
+            rport_pub,
+            "POST",
+            "/v1/chat/completions",
+            headers={"Origin": "https://other.example.com"},
+            body={"model": "m-sameorig", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        self.assertEqual(st_pub_bad, 403)
+
+        # 3. Trusted proxy X-Forwarded-Proto allows HTTPS same-origin when trust_proxy_headers=True.
+        cfg_proxy = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            cors_allowed_origins=[],
+            trust_proxy_headers=True,
+            backends=[
+                BackendConfig(
+                    id="same-orig-b",
+                    base_url=backend.base_url,
+                    models=["m-sameorig"],
+                )
+            ],
+        )
+        router_proxy = self._track(create_router_server(cfg_proxy))
+        rport_proxy = router_proxy.server_address[1]
+
+        st_proxy_ok, _, _ = _http_request(
+            rport_proxy,
+            "POST",
+            "/v1/chat/completions",
+            headers={
+                "Host": "ui.example.com",
+                "Origin": "https://ui.example.com",
+                "X-Forwarded-Proto": "https",
+            },
+            body={"model": "m-sameorig", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        self.assertEqual(st_proxy_ok, 200)
 
 
 def run_self_tests(verbosity: int = 1) -> int:

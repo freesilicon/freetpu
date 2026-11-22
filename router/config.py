@@ -19,6 +19,9 @@ BEARER_AUTH_ONLY_KEYS = ("tokens", "tokens_env", "exempt_paths")
 DEFAULT_MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024
 DEFAULT_MAX_TOTAL_REQUEST_MEMORY_BYTES = 64 * 1024 * 1024
 DEFAULT_MAX_RESPONSE_BODY_BYTES = 16 * 1024 * 1024
+DEFAULT_MAX_HEADER_BYTES = 64 * 1024
+DEFAULT_MAX_JSON_DEPTH = 64
+DEFAULT_MAX_JSON_NODES = 32768
 DEFAULT_CLIENT_READ_TIMEOUT_S = 30.0
 DEFAULT_CLIENT_HEADER_TIMEOUT_S = 10.0
 DEFAULT_MAX_CONCURRENT_CONNECTIONS = 128
@@ -120,6 +123,32 @@ def sanitize_url(url: str) -> str:
         return url
     _, hostport = parts.netloc.rsplit("@", 1)
     return parts._replace(netloc=hostport).geturl()
+
+
+def normalize_origin(origin: str) -> Optional[tuple[str, str, int]]:
+    """Parse and normalize an HTTP(S) origin to `(scheme, hostname, port)`, or None if invalid."""
+    cleaned = origin.strip()
+    if not cleaned or any(ch.isspace() for ch in cleaned):
+        return None
+    parts = urlsplit(cleaned)
+    scheme = parts.scheme.lower()
+    if scheme not in VALID_URL_SCHEMES:
+        return None
+    if parts.username is not None or parts.password is not None or "@" in parts.netloc:
+        return None
+    if parts.path not in ("", "/") or parts.query or parts.fragment:
+        return None
+    host = (parts.hostname or "").lower()
+    if not host:
+        return None
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    if port is not None and not (1 <= port <= 65535):
+        return None
+    resolved_port = port if port is not None else (443 if scheme == "https" else 80)
+    return scheme, host, resolved_port
 
 
 def validate_http_url(url: str, *, field_name: str = "url") -> str:
@@ -454,11 +483,16 @@ class RouterConfig:
     max_request_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES
     max_total_request_memory_bytes: int = DEFAULT_MAX_TOTAL_REQUEST_MEMORY_BYTES
     max_response_body_bytes: int = DEFAULT_MAX_RESPONSE_BODY_BYTES
+    max_header_bytes: int = DEFAULT_MAX_HEADER_BYTES
+    max_json_depth: int = DEFAULT_MAX_JSON_DEPTH
+    max_json_nodes: int = DEFAULT_MAX_JSON_NODES
     client_read_timeout_s: float = DEFAULT_CLIENT_READ_TIMEOUT_S
     client_header_timeout_s: float = DEFAULT_CLIENT_HEADER_TIMEOUT_S
     max_concurrent_connections: int = DEFAULT_MAX_CONCURRENT_CONNECTIONS
     max_sse_pre_commit_bytes: int = DEFAULT_MAX_SSE_PRE_COMMIT_BYTES
     cors_allowed_origins: List[str] = field(default_factory=list)
+    public_origin: Optional[str] = None
+    trust_proxy_headers: bool = False
     auth: Dict[str, Any] = field(default_factory=dict)
     usage_meter: Dict[str, Any] = field(default_factory=dict)
     scaler: Dict[str, Any] = field(default_factory=dict)
@@ -527,6 +561,31 @@ class RouterConfig:
             name="max_response_body_bytes",
             min_value=1,
         )
+        _validate_int_range(
+            self.max_header_bytes,
+            name="max_header_bytes",
+            min_value=1,
+        )
+        _validate_int_range(
+            self.max_json_depth,
+            name="max_json_depth",
+            min_value=1,
+        )
+        _validate_int_range(
+            self.max_json_nodes,
+            name="max_json_nodes",
+            min_value=1,
+        )
+        if not isinstance(self.trust_proxy_headers, bool):
+            raise ValueError(
+                f"trust_proxy_headers must be a boolean, got {self.trust_proxy_headers!r}"
+            )
+        if self.public_origin is not None:
+            if not isinstance(self.public_origin, str) or normalize_origin(self.public_origin) is None:
+                raise ValueError(
+                    f"Invalid public_origin {self.public_origin!r}; expected 'http(s)://host[:port]'"
+                )
+            self.public_origin = self.public_origin.strip().rstrip("/")
         _validate_finite_number(
             self.client_read_timeout_s,
             name="client_read_timeout_s",
@@ -689,6 +748,21 @@ class RouterConfig:
                 name="max_response_body_bytes",
                 min_value=1,
             ),
+            max_header_bytes=_validate_int_range(
+                raw.get("max_header_bytes", DEFAULT_MAX_HEADER_BYTES),
+                name="max_header_bytes",
+                min_value=1,
+            ),
+            max_json_depth=_validate_int_range(
+                raw.get("max_json_depth", DEFAULT_MAX_JSON_DEPTH),
+                name="max_json_depth",
+                min_value=1,
+            ),
+            max_json_nodes=_validate_int_range(
+                raw.get("max_json_nodes", DEFAULT_MAX_JSON_NODES),
+                name="max_json_nodes",
+                min_value=1,
+            ),
             client_read_timeout_s=_validate_finite_number(
                 raw.get("client_read_timeout_s", DEFAULT_CLIENT_READ_TIMEOUT_S),
                 name="client_read_timeout_s",
@@ -712,6 +786,14 @@ class RouterConfig:
                 min_value=1,
             ),
             cors_allowed_origins=cors_origins,
+            public_origin=(
+                str(raw["public_origin"]).strip()
+                if raw.get("public_origin") is not None
+                else None
+            ),
+            trust_proxy_headers=_require_bool(
+                raw, "trust_proxy_headers", False, context="RouterConfig"
+            ),
             auth=dict(raw_auth or {}),
             usage_meter=dict(raw.get("usage_meter") or {}),
             scaler=dict(raw.get("scaler") or {}),

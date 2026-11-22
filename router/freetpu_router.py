@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 from collections import OrderedDict
 from dataclasses import dataclass, field
+import errno
 import hashlib
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,6 +19,8 @@ import json
 import math
 from pathlib import Path
 import re
+import select
+import socket
 import ssl
 import sys
 import threading
@@ -38,6 +41,7 @@ from router.config import (  # noqa: E402
     VALID_URL_SCHEMES,
     is_loopback_host,
     load_config,
+    normalize_origin,
     sanitize_url,
     validate_http_url,
 )
@@ -130,6 +134,55 @@ def _extract_models_list(parsed: Any) -> Optional[List[str]]:
 
 class _UpstreamResponseTooLargeError(http.client.HTTPException):
     """Raised when an upstream non-streaming HTTP body exceeds the byte cap."""
+
+
+class _HeaderSizeLimitExceeded(Exception):
+    """Raised when cumulative inbound request header bytes exceed the configured cap."""
+
+
+class _JsonStructureLimitError(ValueError):
+    """Raised when inbound JSON exceeds nesting depth or structural node budgets."""
+
+
+# Linear-time (non-backtracking) tokenizer skipping quoted strings in C speed.
+_JSON_STRUCT_TOKEN_RE = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*"|[\[\]{},:]|"')
+
+
+def _validate_json_structure(
+    text: str,
+    *,
+    max_depth: int,
+    max_nodes: int,
+) -> None:
+    """Validate JSON nesting depth and container/element count before `json.loads()`."""
+    depth = 0
+    nodes = 0
+    for match in _JSON_STRUCT_TOKEN_RE.finditer(text):
+        tok = match.group(0)
+        ch = tok[0]
+        if ch == '"':
+            if len(tok) == 1:
+                # Unclosed string literal; let json.loads report exact JSONDecodeError.
+                return
+            continue
+        if ch in "{[":
+            depth += 1
+            if depth > max_depth:
+                raise _JsonStructureLimitError(
+                    f"JSON nesting depth exceeds maximum limit of {max_depth}"
+                )
+            nodes += 1
+        elif ch in "}]":
+            if depth > 0:
+                depth -= 1
+            continue
+        else:
+            # ',' or ':'
+            nodes += 1
+        if nodes > max_nodes:
+            raise _JsonStructureLimitError(
+                f"JSON structure exceeds maximum limit of {max_nodes} elements"
+            )
 
 
 def _read_bounded_http_response(
@@ -1464,38 +1517,68 @@ def _openai_error_body(
 
 
 class _DeadlineReader:
-    """Buffered reader wrapper enforcing a strict wall-clock deadline on header lines."""
+    """Buffered reader wrapper enforcing a wall-clock deadline and cumulative header byte cap."""
 
-    def __init__(self, raw_rfile: Any, sock: Any, deadline: float) -> None:
+    def __init__(
+        self,
+        raw_rfile: Any,
+        sock: Any,
+        deadline: float,
+        *,
+        max_header_bytes: int,
+    ) -> None:
         self._raw = raw_rfile
         self._sock = sock
         self._deadline = deadline
+        self._max_header_bytes = max_header_bytes
+        self._header_bytes_read = 0
         self._buf = bytearray()
 
     def readline(self, limit: int = -1) -> bytes:
         max_len = limit if limit is not None and limit >= 0 else None
         read_fn = getattr(self._raw, "read1", self._raw.read)
         while True:
+            budget_left = self._max_header_bytes - self._header_bytes_read
+            if budget_left <= 0:
+                raise _HeaderSizeLimitExceeded("Request headers exceeded maximum byte limit")
             nl_idx = self._buf.find(b"\n")
             if nl_idx != -1:
                 end = nl_idx + 1
                 if max_len is not None and end > max_len:
                     end = max_len
+                if end > budget_left:
+                    raise _HeaderSizeLimitExceeded(
+                        "Request headers exceeded maximum byte limit"
+                    )
                 out = bytes(self._buf[:end])
                 del self._buf[:end]
+                self._header_bytes_read += len(out)
                 return out
+            if len(self._buf) > budget_left:
+                raise _HeaderSizeLimitExceeded("Request headers exceeded maximum byte limit")
             if max_len is not None and len(self._buf) >= max_len:
+                if max_len > budget_left:
+                    raise _HeaderSizeLimitExceeded(
+                        "Request headers exceeded maximum byte limit"
+                    )
                 out = bytes(self._buf[:max_len])
                 del self._buf[:max_len]
+                self._header_bytes_read += len(out)
                 return out
             remaining = self._deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("Client header read timed out")
             self._sock.settimeout(remaining)
-            chunk = read_fn(4096)
+            to_read = min(4096, (budget_left - len(self._buf)) + 1)
+            chunk = read_fn(to_read)
             if not chunk:
+                if len(self._buf) > budget_left:
+                    raise _HeaderSizeLimitExceeded(
+                        "Request headers exceeded maximum byte limit"
+                    )
                 out = bytes(self._buf)
                 self._buf.clear()
+                self._header_bytes_read += len(out)
                 return out
             self._buf.extend(chunk)
 
@@ -1612,7 +1695,36 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         header_deadline = (
             time.monotonic() + self.server.engine.config.client_header_timeout_s
         )
-        self.rfile = _DeadlineReader(self.rfile, self.connection, header_deadline)
+        self.rfile = _DeadlineReader(
+            self.rfile,
+            self.connection,
+            header_deadline,
+            max_header_bytes=self.server.engine.config.max_header_bytes,
+        )
+
+    def handle_one_request(self) -> None:
+        try:
+            super().handle_one_request()
+        except _HeaderSizeLimitExceeded:
+            self.close_connection = True
+            if not hasattr(self, "requestline"):
+                self.requestline = ""
+            if not hasattr(self, "headers"):
+                self.headers = http.client.HTTPMessage()
+            self._safe_send_bytes(
+                431,
+                "application/json",
+                _openai_error_body(
+                    "Request headers exceed maximum size of "
+                    f"{self.server.engine.config.max_header_bytes} bytes",
+                    error_type="invalid_request_error",
+                    code="request_header_fields_too_large",
+                ),
+            )
+            try:
+                self.connection.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         if self.server.verbose:
@@ -1621,23 +1733,80 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 f"{self.address_string()} - - [{self.log_date_time_string()}] {message}\n"
             )
 
+    def _is_same_origin(self, origin: str) -> bool:
+        """Return True if `origin` matches configured `public_origin` or validated request authority."""
+        parsed_origin = normalize_origin(origin)
+        if parsed_origin is None:
+            return False
+        cfg = self.server.engine.config
+        if cfg.public_origin:
+            pub_norm = normalize_origin(cfg.public_origin)
+            if pub_norm is not None and parsed_origin == pub_norm:
+                return True
+        headers = getattr(self, "headers", None)
+        if headers is None:
+            return False
+        raw_host = headers.get("Host")
+        if not raw_host:
+            return False
+        host_val = raw_host.strip()
+        if not host_val or any(ch.isspace() for ch in host_val) or "/" in host_val or "@" in host_val:
+            return False
+        eff_scheme = "https" if isinstance(self.connection, ssl.SSLSocket) else "http"
+        if cfg.trust_proxy_headers:
+            xfp = headers.get("X-Forwarded-Proto")
+            if xfp:
+                candidate = xfp.split(",", 1)[0].strip().lower()
+                if candidate in VALID_URL_SCHEMES:
+                    eff_scheme = candidate
+        host_origin = normalize_origin(f"{eff_scheme}://{host_val}")
+        return host_origin is not None and parsed_origin == host_origin
+
+    def _is_client_disconnected(self) -> bool:
+        """Non-blocking probe detecting whether the downstream client closed its TCP socket."""
+        sock = getattr(self, "connection", None)
+        if sock is None:
+            return True
+        try:
+            readable, _, errored = select.select([sock], [], [sock], 0.0)
+        except (OSError, ValueError):
+            return True
+        if errored:
+            return True
+        if not readable:
+            return False
+        try:
+            peek = sock.recv(1, socket.MSG_PEEK | getattr(socket, "MSG_DONTWAIT", 0))
+        except BlockingIOError:
+            return False
+        except OSError as exc:
+            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                return False
+            return True
+        return peek == b""
+
     def _resolve_cors_header(self) -> Tuple[bool, Optional[str]]:
-        """Check request Origin against explicit `cors_allowed_origins`.
+        """Check request Origin against explicit `cors_allowed_origins` and same-origin authority.
 
         Returns `(allowed, acao_header_value)`. Non-browser requests without an
-        `Origin` header are allowed with `acao_header_value=None`.
+        `Origin` header and same-origin requests are allowed with
+        `acao_header_value=None` unless also explicitly allowlisted for CORS.
         """
-        raw_origin = self.headers.get("Origin")
+        headers = getattr(self, "headers", None)
+        if headers is None:
+            return True, None
+        raw_origin = headers.get("Origin")
         if raw_origin is None:
             return True, None
         origin = raw_origin.strip()
         allowed = self.server.engine.config.cors_allowed_origins
-        if not allowed:
-            return False, None
-        if "*" in allowed:
-            return True, "*"
-        if origin.rstrip("/") in allowed:
-            return True, origin
+        if allowed:
+            if "*" in allowed:
+                return True, "*"
+            if origin.rstrip("/") in allowed:
+                return True, origin
+        if self._is_same_origin(origin):
+            return True, None
         return False, None
 
     def _send_cors_headers(self, acao: Optional[str]) -> None:
@@ -1876,7 +2045,24 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 pass
 
             try:
-                req_payload = json.loads(raw_req.decode("utf-8"))
+                req_text = raw_req.decode("utf-8")
+                _validate_json_structure(
+                    req_text,
+                    max_depth=engine.config.max_json_depth,
+                    max_nodes=engine.config.max_json_nodes,
+                )
+                req_payload = json.loads(req_text)
+                del req_text
+            except _JsonStructureLimitError as exc:
+                self._send_bytes(
+                    400,
+                    "application/json",
+                    _openai_error_body(
+                        str(exc),
+                        code="json_complexity_limit_exceeded",
+                    ),
+                )
+                return
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                 self._send_bytes(
                     400,
@@ -1955,6 +2141,22 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         tried_ids: set[str] = set()
 
         while True:
+            if tried_ids and self._is_client_disconnected():
+                # Caller already cancelled; do not start billable fallback generation.
+                self.close_connection = True
+                if last_attempted_backend is not None:
+                    engine._record_terminal_failure(
+                        request_id=req_id,
+                        model=model,
+                        backend_id=last_attempted_backend.config.id,
+                        matched_backend=True,
+                        status_code=499,
+                        latency_ms=(time.monotonic() - req_start) * 1000.0,
+                        stream=stream,
+                        failovers=failovers,
+                        principal=auth_ctx.principal,
+                    )
+                return
             candidates = engine.select_candidates(
                 model,
                 policy=policy_override,
@@ -2069,7 +2271,23 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                     )
                     if sse_outcome == "committed":
                         return
-                    if sse_outcome == "client_error":
+                    if sse_outcome == "response_too_large":
+                        # Pre-commit SSE size limit is request-scoped: do not penalize backend health or fail over.
+                        latency_ms = (time.monotonic() - req_start) * 1000.0
+                        attempt_ms = (time.monotonic() - attempt_start) * 1000.0
+                        non_stream_result = (
+                            502,
+                            "application/json",
+                            sse_err_body
+                            or _openai_error_body(
+                                "Upstream SSE response exceeded maximum size limit",
+                                error_type="bad_gateway",
+                                code="response_too_large",
+                            ),
+                            latency_ms,
+                            attempt_ms,
+                        )
+                    elif sse_outcome == "client_error":
                         latency_ms = (time.monotonic() - req_start) * 1000.0
                         attempt_ms = (time.monotonic() - attempt_start) * 1000.0
                         non_stream_result = (
@@ -2327,13 +2545,31 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         while True:
             remaining_bytes = max_pre_commit_bytes - pre_commit_bytes
             if remaining_bytes <= 0:
-                return "aborted", 502, None
+                return (
+                    "response_too_large",
+                    502,
+                    _openai_error_body(
+                        f"Upstream SSE event exceeded maximum size of {max_pre_commit_bytes} bytes",
+                        error_type="bad_gateway",
+                        code="response_too_large",
+                    ),
+                )
             line, exceeded_cap = sse_reader.readline(
                 deadline=pre_commit_deadline,
                 max_bytes=remaining_bytes,
             )
-            if exceeded_cap or not line:
-                # Byte cap exceeded or EOF before generated output/terminator -> retryable failure.
+            if exceeded_cap:
+                return (
+                    "response_too_large",
+                    502,
+                    _openai_error_body(
+                        f"Upstream SSE event exceeded maximum size of {max_pre_commit_bytes} bytes",
+                        error_type="bad_gateway",
+                        code="response_too_large",
+                    ),
+                )
+            if not line:
+                # EOF before generated output/terminator -> retryable failure.
                 return "aborted", 502, None
             pre_commit_bytes += len(line)
             pre_commit_lines.append(line)
@@ -2382,6 +2618,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         saw_upstream_error_event = False
         finished_choice_indices: set[int] = set()
         upstream_read_error = False
+        size_limit_exceeded = False
         downstream_write_error = False
         event_data_lines: List[bytes] = []
         current_event_type = ""
@@ -2512,7 +2749,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             while True:
                 remaining_event_bytes = max_event_bytes - len(event_chunk_buf)
                 if remaining_event_bytes <= 0:
-                    upstream_read_error = True
+                    size_limit_exceeded = True
                     break
                 try:
                     line, exceeded_cap = sse_reader.readline(
@@ -2523,7 +2760,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                     upstream_read_error = True
                     break
                 if exceeded_cap:
-                    upstream_read_error = True
+                    size_limit_exceeded = True
                     break
                 if not line:
                     break
@@ -2550,8 +2787,10 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             not saw_upstream_error_event
             and (saw_done_sentinel or all_choices_finished)
         )
+        stream_size_exceeded = not downstream_write_error and size_limit_exceeded
         premature_upstream_end = (
             not downstream_write_error
+            and not stream_size_exceeded
             and (upstream_read_error or not stream_completed)
         )
         if (
@@ -2565,7 +2804,10 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         effective_ttft = (
             first_content_ttft_ms if first_content_ttft_ms is not None else ttft_ms
         )
-        if premature_upstream_end:
+        if stream_size_exceeded:
+            # Local event size cap is request-scoped: do not penalize backend health.
+            recorded_status = 502
+        elif premature_upstream_end:
             engine.mark_backend_failed(backend, "stream_truncated_mid_response")
             recorded_status = 502
         else:
@@ -2591,7 +2833,15 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
 
         if not downstream_write_error:
             try:
-                if premature_upstream_end:
+                if stream_size_exceeded:
+                    err_event = (
+                        b"event: error\n"
+                        b'data: {"error":{"message":"Upstream SSE event exceeded maximum size limit",'
+                        b'"type":"bad_gateway","code":"response_too_large"}}\n\n'
+                    )
+                    write_chunk(err_event)
+                    self.wfile.flush()
+                elif premature_upstream_end:
                     # Emit SSE error event and intentionally omit the terminating 0-chunk so
                     # HTTP/1.1 chunked clients surface premature truncation instead of clean EOF.
                     err_event = (
