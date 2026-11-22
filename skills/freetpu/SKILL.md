@@ -96,7 +96,7 @@ Use this workflow with `google-colab-cli >= 0.7.6` (redacted logs) to run Pallas
    ```
    - Abort if `Current balance` is below your run budget (e.g., `< 5.0` CUs).
    - Always keep `--config "$COLAB_STATE"` inside your private `WORK_DIR` (`0700`) so parallel workers never clobber `~/.config/colab-cli/sessions.json` and shared `/tmp` state files cannot pre-exist under another owner.
-   - Pass `--no-public-api` when targeting `/tun/m/*` tunnel auth on unallowlisted GCP quota projects.
+   - `google-colab-cli v0.8.0` already uses `/tun/m` directly and does not accept `--no-public-api`; omit `--no-public-api` on releases that lack that option (pass it only on older releases exposing the Public API selector when targeting `/tun/m/*` on unallowlisted GCP quota projects).
 
 2. **Run ephemeral probe with verified teardown and `v6e1 -> v5e1` fallback**:
    - Preferred wrapper (`tools/colab_tpu_bench.py`):
@@ -112,21 +112,38 @@ Use this workflow with `google-colab-cli >= 0.7.6` (redacted logs) to run Pallas
        --out-dir "$WORK_DIR/proof" \
        --script skills/freetpu/templates/tile_fused_gemm_silu.py
      ```
-   - Direct CLI pattern (do **not** assume default `colab run` teardown succeeded: if unassign fails, `colab run` suppresses the error, removes the local session record, and still prints `Session terminated.` while leaving the TPU billing CUs. Pass `--keep` so `$COLAB_STATE` retains the session record, stop explicitly, and verify server-side with `colab sessions`):
+   - Direct CLI pattern (do **not** assume default `colab run` teardown succeeded: if unassign fails, `colab run` suppresses the error, removes the local session record, and still prints `Session terminated.` while leaving the TPU billing CUs. Pass `--keep`, capture the assigned endpoint from `colab sessions`, stop explicitly, and **fail non-zero** if `colab stop` fails, the post-stop `colab sessions` query fails, or the endpoint is still listed):
      ```bash
      SESSION_ID="freetpu-probe-$(date +%Y%m%d-%H%M%S)-$$"
      RUN_RC=0
      colab --auth=adc --config "$COLAB_STATE" run \
        -s "$SESSION_ID" --tpu V6E1 --timeout 300 --keep \
        -- skills/freetpu/templates/tile_swiglu.py || RUN_RC=$?
+     # Record assigned endpoint from `colab sessions` before stopping (never read $COLAB_STATE tokens):
+     PRE_SESS="$(colab --auth=adc --config "$COLAB_STATE" sessions)" || PRE_SESS=""
+     ENDPOINT="$(printf '%s\n' "$PRE_SESS" | awk -v s="[$SESSION_ID]" '$1 == s {print $2; exit}')"
      colab --auth=adc --config "$COLAB_STATE" log \
        -s "$SESSION_ID" -o "$WORK_DIR/$SESSION_ID.ipynb" || true
-     colab --auth=adc --config "$COLAB_STATE" stop -s "$SESSION_ID"
-     # Verify server-side that no billable TPU runtime remains active:
-     colab --auth=adc --config "$COLAB_STATE" sessions
-     (exit "$RUN_RC")
+     STOP_RC=0
+     colab --auth=adc --config "$COLAB_STATE" stop -s "$SESSION_ID" || STOP_RC=$?
+     # Require a successful server-side query confirming the endpoint is no longer allocated:
+     TEARDOWN_RC=0
+     if ! SESS_OUT="$(colab --auth=adc --config "$COLAB_STATE" sessions)"; then
+       TEARDOWN_RC=1
+     elif [ "$STOP_RC" -ne 0 ] \
+       || { [ "$RUN_RC" -eq 0 ] && [ -z "$ENDPOINT" ]; } \
+       || printf '%s\n' "$SESS_OUT" | awk -v s="[$SESSION_ID]" -v e="$ENDPOINT" \
+            '$1 == s || (e != "" && $2 == e) {found=1} END {exit !found}'; then
+       TEARDOWN_RC=1
+     fi
+     if [ "$TEARDOWN_RC" -ne 0 ]; then
+       echo "ERROR: TPU teardown unconfirmed for $SESSION_ID (${ENDPOINT:-unknown endpoint}); retry colab stop with $COLAB_STATE or terminate in Colab UI (Runtime -> Manage sessions)." >&2
+       (exit 1)
+     else
+       (exit "$RUN_RC")
+     fi
      ```
-   - **Teardown verification**: After every run (wrapper or direct CLI), check `colab --auth=adc --config "$COLAB_STATE" sessions` to confirm no TPU runtime remains active on the server. If a runtime is still listed, stop it with `colab --auth=adc --config "$COLAB_STATE" stop -s "$SESSION_ID"` (when `--keep` preserved `$COLAB_STATE`); if local session state was already dropped by a non-`--keep` `colab run`, terminate the orphaned runtime immediately in the Colab UI (`Runtime -> Manage sessions`).
+   - **Teardown verification**: After every run (wrapper or direct CLI), verify via `colab --auth=adc --config "$COLAB_STATE" sessions` that the assigned endpoint is absent from server-side sessions and treat unconfirmed teardown as a hard failure. If a runtime is still listed, stop it with `colab --auth=adc --config "$COLAB_STATE" stop -s "$SESSION_ID"` (when `--keep` preserved `$COLAB_STATE`); if local session state was already dropped by a non-`--keep` `colab run`, terminate the orphaned runtime immediately in the Colab UI (`Runtime -> Manage sessions`).
    - For multi-step interactive sessions, prefer `colab exec` (keeps XLA/PJRT caches warm) over `colab ssh` (capped at 5 sessions / HTTP 429). Use `colab download` instead of `drive.mount`.
 
 ---

@@ -189,6 +189,10 @@ def _parse_yaml_scalar_stdlib(raw: str) -> Any:
         return float(val.replace("_", ""))
     if re.match(r"^[+-]?\.(?:inf|nan)$", lower):
         return float(lower.replace(".", ""))
+    if re.search(r":(?:\s|$)", val):
+        raise ValueError(
+            f"Invalid YAML frontmatter: unquoted plain scalar contains ': ' or trailing ':': {val!r}"
+        )
     return val
 
 
@@ -271,8 +275,10 @@ def _parse_frontmatter_stdlib(fm_text: str) -> Dict[str, Any]:
             while i < len(fm_lines) and fm_lines[i].startswith((" ", "\t")):
                 part = _strip_inline_comment(fm_lines[i])
                 if part:
-                    if part == "-" or part.startswith("- ") or re.match(r"^[A-Za-z0-9_-]+\s*:", part):
-                        raise ValueError(f"Unsupported nested YAML structure under {key!r}: {part!r}")
+                    if part == "-" or part.startswith("- ") or re.search(r":(?:\s|$)", part):
+                        raise ValueError(
+                            f"Invalid YAML frontmatter: invalid plain scalar continuation under {key!r}: {part!r}"
+                        )
                     cont.append(part)
                 i += 1
             val = " ".join(cont)
@@ -535,6 +541,14 @@ def run_validator_self_test(*, require_yaml: bool = False) -> None:
         '---\nname: freetpu\ndescription: "[Quoted string with brackets that easily exceeds forty characters]"\n---\nBody\n',
         should_pass=True,
     )
+    _check_skill_md(
+        '---\nname: freetpu\ndescription: "Build and verify TPU kernels: run parity before timing."\n---\nBody\n',
+        should_pass=True,
+    )
+    _check_skill_md(
+        "---\nname: freetpu\ndescription: Build and verify TPU kernels via https://example.com before timing.\n---\nBody\n",
+        should_pass=True,
+    )
 
     # Non-string descriptions must be rejected (inline list, multi-line list, block list, mapping, scalar)
     invalid_cases = [
@@ -590,6 +604,14 @@ def run_validator_self_test(*, require_yaml: bool = False) -> None:
             '---\nname: freetpu\nname: freetpu\ndescription: "Valid description that is definitely longer than forty characters."\n---\n',
             "duplicate key",
         ),
+        (
+            "---\nname: freetpu\ndescription: Build and verify TPU kernels: run parity before timing.\n---\n",
+            "Invalid YAML frontmatter",
+        ),
+        (
+            "---\nname: freetpu\ndescription: Build and verify TPU kernels with parity before timing:\n---\n",
+            "Invalid YAML frontmatter",
+        ),
     ]
     for md_text, expected in invalid_cases:
         _check_skill_md(md_text, should_pass=False, expected_substr=expected)
@@ -609,6 +631,14 @@ def run_validator_self_test(*, require_yaml: bool = False) -> None:
         assert "duplicate key" in str(exc), f"Unexpected duplicate-key error: {exc}"
     else:
         raise AssertionError("stdlib parser failed to reject duplicate description key")
+    try:
+        _parse_frontmatter_stdlib(
+            "name: freetpu\ndescription: Build and verify TPU kernels: run parity before timing.\n"
+        )
+    except ValueError as exc:
+        assert "Invalid YAML frontmatter" in str(exc), f"Unexpected plain-scalar error: {exc}"
+    else:
+        raise AssertionError("stdlib parser failed to reject plain scalar containing ': '")
 
 
 def main() -> int:
