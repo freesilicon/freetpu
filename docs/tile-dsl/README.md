@@ -58,9 +58,9 @@ print(lowered.source_code)  # Emits pl.pallas_call + pl.BlockSpec + pltpu.VMEM
 | Surface | Supported | Lowering Target |
 | --- | --- | --- |
 | **Core Ops** | `matmul`, `fused_matmul_silu`, `fused_matmul_gelu`, `swiglu` | Pattern-fused from symbolic `@tile_kernel` DAG (`dot`, `silu`, `gelu`, `mul`, `store`) |
-| **Dtypes** | `bf16`, `w8a16`, `int8` | Shared `QuantParams` & per-channel `W8A16` scale handling |
+| **Dtypes** | `bf16` (`cpu_ref`, `cloud_tpu_pallas`), `w8a16`, `int8` | Shared `QuantParams` & per-channel `W8A16` scale handling (`buenos_a0` rejects `bf16` explicitly) |
 | **`cpu_ref`** | Pure NumPy | IEEE BF16-rounded / FP32-RNE deterministic parity reference |
-| **`buenos_a0`** | Edge TPU Tensor G5 | `tools/emit_custom_gemm.py` + `tools/multitile_synth.py` VLIW chunks, Mode-A `+0 B` `0x640` minimax splines (`tools/spline_0x640.py`), `libopenbuenos` `ctypes` C-API (`OPENBUENOS_MOCK=1` or `/dev/edgetpu-soc`) |
+| **`buenos_a0`** | Edge TPU Tensor G5 (`w8a16`, `int8`) | `tools/emit_custom_gemm.py` + `tools/multitile_synth.py` VLIW chunks, Mode-A `+0 B` `0x640` minimax splines (`tools/spline_0x640.py`), `libopenbuenos` `ctypes` C-API (`OPENBUENOS_MOCK=1` or `/dev/edgetpu-soc`) |
 | **`cloud_tpu_pallas`** | Cloud TPU `v5e-1` / `v6e-1` | JAX Pallas/Mosaic (`pl.pallas_call`, `pl.BlockSpec`, `pltpu.VMEM`, `CompilerParams` -> `tpu_custom_call`) |
 
 ---
@@ -69,7 +69,7 @@ print(lowered.source_code)  # Emits pl.pallas_call + pl.BlockSpec + pltpu.VMEM
 
 ### Edge TPU (`buenos_a0` / Pixel Tensor G5 via ADB)
 
-Build the zero-Google-`.so` Android ARM64 runner and run the single-source example against `/dev/edgetpu-soc` (`PM=5` @ `1,286.4 MHz` + FW WakeLock):
+Build the zero-Google-`.so` Android ARM64 runner and run the single-source example against `/dev/edgetpu-soc` (`PM=5` @ `1,286.4 MHz` + FW WakeLock). For wheel installations, point `FREETPU_TILE_RUNNER_PATH` (or `runner_path=...`) at the prebuilt `freetpu_tile_runner` binary:
 
 ```bash
 make -C runtime tile-runner verify-tile-runner

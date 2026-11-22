@@ -266,8 +266,13 @@ def lower_buenos_a0(
     quant: Optional[QuantParams] = None,
 ) -> LoweredArtifact:
     """Lower TileKernelIR into buenos_a0 VLIW chunks, 0x640 spline, and libopenbuenos plan."""
+    if ir.dtype == DType.BF16:
+        raise ValueError(
+            "buenos_a0 backend does not support native BF16 weights (only 'int8' and 'w8a16'); "
+            "use dtype='w8a16' on buenos_a0 or target='cloud_tpu_pallas'/'cpu_ref' for BF16"
+        )
     if ir.op_kind == OpKind.SWIGLU and ir.dtype == DType.INT8:
-        raise ValueError("INT8 dtype is not supported for swiglu; use dtype='w8a16' or dtype='bf16'")
+        raise ValueError("INT8 dtype is not supported for swiglu; use dtype='w8a16'")
 
     _ensure_tools_on_path()
     import emit_custom_gemm as ecg  # type: ignore
@@ -413,6 +418,39 @@ def lower_buenos_a0(
     )
 
 
+def _resolve_adb_runner_path(runner_path: Optional[str | Path] = None) -> Path:
+    explicit = str(runner_path).strip() if runner_path is not None else os.environ.get("FREETPU_TILE_RUNNER_PATH", "").strip()
+    if explicit:
+        resolved = Path(explicit).expanduser()
+        if not resolved.is_file():
+            raise FileNotFoundError(f"Configured freetpu_tile_runner not found: {resolved}")
+        return resolved
+
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    local_runner = repo_root / "runtime" / "build" / "freetpu_tile_runner"
+    if local_runner.is_file():
+        return local_runner
+
+    runtime_dir = repo_root / "runtime"
+    if not (runtime_dir / "Makefile").is_file():
+        raise FileNotFoundError(
+            "Android ARM64 freetpu_tile_runner binary not found (wheel installation does not include "
+            "runtime build sources). Build it from a FreeTPU source checkout with "
+            "'make -C runtime tile-runner' and set FREETPU_TILE_RUNNER_PATH=/path/to/freetpu_tile_runner "
+            "(or pass runner_path=...)."
+        )
+
+    res = subprocess.run(
+        ["make", "-C", str(runtime_dir), "tile-runner"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if res.returncode != 0 or not local_runner.is_file():
+        raise RuntimeError(f"Failed building Android ARM64 freetpu_tile_runner:\n{res.stderr}")
+    return local_runner
+
+
 def _run_adb_rango(
     ir: TileKernelIR,
     inputs: Dict[str, Any],
@@ -424,18 +462,14 @@ def _run_adb_rango(
     warmup: int,
     iters: int,
     perf_mode: int,
+    runner_path: Optional[str | Path] = None,
 ) -> ExecutionResult:
-    repo_root = Path(__file__).resolve().parent.parent.parent
-    local_runner = repo_root / "runtime" / "build" / "freetpu_tile_runner"
-    if not local_runner.is_file():
-        res = subprocess.run(
-            ["make", "-C", str(repo_root / "runtime"), "tile-runner"],
-            capture_output=True,
-            text=True,
-            check=False,
+    if ir.dtype == DType.BF16:
+        raise ValueError(
+            "buenos_a0 backend does not support native BF16 weights (only 'int8' and 'w8a16'); "
+            "use dtype='w8a16' on buenos_a0 or target='cloud_tpu_pallas'/'cpu_ref' for BF16"
         )
-        if res.returncode != 0 or not local_runner.is_file():
-            raise RuntimeError(f"Failed building Android ARM64 freetpu_tile_runner:\n{res.stderr}")
+    local_runner = _resolve_adb_runner_path(runner_path)
 
     remote_dir = f"/data/local/tmp/freetpu_tile_run/{uuid.uuid4().hex[:12]}"
     remote_runner = "/data/local/tmp/tpu_open_stack/freetpu_tile_runner"
@@ -600,7 +634,9 @@ def _run_adb_rango(
     min_hw_us = float(report.get("min_hw_us", hw_us))
     wall_us = float(report.get("wall_us", hw_us))
     if ir.op_kind == OpKind.SWIGLU:
-        flops = 4.0 * m_dim * k_dim * n_inter + 2.0 * m_dim * n_inter * n_out
+        flops = 4.0 * m_dim * k_dim * n_inter + (
+            2.0 * m_dim * n_inter * n_out if ir.has_down_proj else 0.0
+        )
     else:
         flops = 2.0 * m_dim * k_dim * n_dim
     denom_s = max(hw_us * 1e-6, 1e-12)
@@ -631,6 +667,7 @@ def run_buenos_a0(
     bias: Optional[np.ndarray] = None,
     scales: Optional[Dict[str, np.ndarray]] = None,
     adb_serial: Optional[str] = None,
+    runner_path: Optional[str | Path] = None,
     mock: Optional[bool] = None,
     warmup: int = 2,
     iters: int = 10,
@@ -671,6 +708,7 @@ def run_buenos_a0(
             warmup=warmup,
             iters=iters,
             perf_mode=perf_mode,
+            runner_path=runner_path,
         )
         res.lowered = lowered
         return res

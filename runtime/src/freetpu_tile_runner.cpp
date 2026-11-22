@@ -283,6 +283,10 @@ bool parse_args(int argc, char** argv, RunnerArgs* args, std::string* err) {
     *err = "Unsupported --op: " + args->op;
     return false;
   }
+  if (args->dtype != "int8" && args->dtype != "w8a16") {
+    *err = "Unsupported --dtype for buenos_a0 runner: " + args->dtype + " (supported: int8, w8a16)";
+    return false;
+  }
   if (args->in_path.empty() || args->w_path.empty() || args->out_path.empty()) {
     *err = "--in, --w, and --out are required";
     return false;

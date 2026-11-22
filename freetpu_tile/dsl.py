@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -492,6 +493,7 @@ class TileKernel:
         bias: Optional[np.ndarray] = None,
         scales: Optional[Dict[str, np.ndarray]] = None,
         adb_serial: Optional[str] = None,
+        runner_path: Optional[str | Path] = None,
         mock: Optional[bool] = None,
         warmup: int = 3,
         iters: int = 10,
@@ -510,6 +512,7 @@ class TileKernel:
                 bias=bias,
                 scales=scales,
                 adb_serial=adb_serial,
+                runner_path=runner_path,
                 mock=mock,
                 warmup=warmup,
                 iters=iters,
@@ -548,6 +551,7 @@ class TileKernel:
         bias: Optional[np.ndarray] = None,
         scales: Optional[Dict[str, np.ndarray]] = None,
         adb_serial: Optional[str] = None,
+        runner_path: Optional[str | Path] = None,
         mock: Optional[bool] = None,
         warmup: int = 3,
         iters: int = 10,
@@ -587,6 +591,7 @@ class TileKernel:
                 bias=bias,
                 scales=scales,
                 adb_serial=adb_serial,
+                runner_path=runner_path,
                 mock=mock,
                 warmup=warmup,
                 iters=iters,

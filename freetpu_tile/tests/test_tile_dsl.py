@@ -110,20 +110,41 @@ class TestTileDSLFrontendAndParity(unittest.TestCase):
         self.assertLess(rep_w8.parity["buenos_a0"]["nmse"], 2e-3)
         self.assertTrue(rep_w8.results["buenos_a0"].mock)
 
+        @freetpu.tile_kernel(block_m=64, block_n=512, block_k=512, dtype="w8a16")
+        def k_mm_gelu_w8(lhs, rhs, out):
+            freetpu.store(out, freetpu.gelu(freetpu.dot(lhs, rhs)))
+
+        rep_w8_gelu = k_mm_gelu_w8.parity_check(
+            a,
+            q_w,
+            targets=["cpu_ref", "buenos_a0", "cloud_tpu_pallas"],
+            dry_run_targets=["cloud_tpu_pallas"],
+            scales={"rhs": s_w},
+            mock=True,
+            iters=2,
+        )
+        self.assertTrue(rep_w8_gelu.passed, msg=f"W8A16 GELU parity failed: {rep_w8_gelu.parity}")
+        self.assertLess(rep_w8_gelu.parity["buenos_a0"]["nmse"], 2e-3)
+
         @freetpu.tile_kernel(block_m=64, block_n=512, block_k=512, dtype="bf16")
         def k_mm_gelu(lhs, rhs, out):
             freetpu.store(out, freetpu.gelu(freetpu.dot(lhs, rhs)))
 
+        # buenos_a0 must explicitly reject native BF16 rather than silently Q8_0-quantizing weights
+        with self.assertRaises(ValueError):
+            k_mm_gelu.lower(a, b_f, target="buenos_a0")
+        with self.assertRaises(ValueError):
+            k_mm_gelu.run(a, b_f, target="buenos_a0", mock=True)
+
+        # cpu_ref and cloud_tpu_pallas continue to support BF16 cleanly
         rep_bf = k_mm_gelu.parity_check(
             a,
             b_f,
-            targets=["cpu_ref", "buenos_a0", "cloud_tpu_pallas"],
+            targets=["cpu_ref", "cloud_tpu_pallas"],
             dry_run_targets=["cloud_tpu_pallas"],
-            mock=True,
             iters=2,
         )
         self.assertTrue(rep_bf.passed, msg=f"BF16 parity failed: {rep_bf.parity}")
-        self.assertLess(rep_bf.parity["buenos_a0"]["nmse"], 2e-3)
 
     def test_swiglu_mock_parity_and_pallas_lowering(self) -> None:
         rng = np.random.default_rng(7)
@@ -301,12 +322,12 @@ class TestTileDSLFrontendAndParity(unittest.TestCase):
                 bias=np.zeros((512,), dtype=np.int32),
             )
 
-        @freetpu.tile_kernel(block_m=64, block_n=512, block_k=512, dtype="bf16")
-        def k_bf16_silu(lhs, rhs, out):
+        @freetpu.tile_kernel(block_m=64, block_n=512, block_k=512, dtype="w8a16")
+        def k_w8_silu(lhs, rhs, out):
             freetpu.store(out, freetpu.silu(freetpu.dot(lhs, rhs)))
 
         with self.assertRaises(ValueError):
-            k_bf16_silu.run(
+            k_w8_silu.run(
                 np.zeros((64, 512), dtype=np.float32),
                 np.zeros((512, 512), dtype=np.float32),
                 target="buenos_a0",
@@ -875,6 +896,102 @@ class TestTileDSLFrontendAndParity(unittest.TestCase):
             text = pyproject.read_text(encoding="utf-8")
             self.assertIn('tpu = ["jax[tpu]"]', text)
             self.assertIn("freetpu_tile._packaged_examples", text)
+
+    def test_colab_embedded_args_and_adb_runner_path_and_2proj_flops(self) -> None:
+        from unittest import mock
+
+        # 1. Script args colliding with colab run flags (--keep, --timeout) stay inside bundle SCRIPT_ARGS
+        example = _resolve_example_script("fused_gemm_silu.py")
+        with tempfile.TemporaryDirectory(prefix="freetpu-colab-args-") as tmp:
+            tp = Path(tmp)
+            rc, summary = run_colab_tile_kernel(
+                example,
+                script_args=("--target", "cloud_tpu_pallas", "--keep", "--timeout", "999"),
+                out_dir=tp,
+                dry_run=True,
+            )
+            self.assertEqual(rc, 0)
+            run_cmds = [c for c in summary["planned_commands"] if "run" in c]
+            self.assertTrue(run_cmds)
+            for c in run_cmds:
+                self.assertNotIn("--keep", c)
+                self.assertNotIn("999", c)
+            bundle_src = Path(summary["bundle_path"]).read_text(encoding="utf-8")
+            self.assertIn("'--keep'", bundle_src)
+            self.assertIn("'999'", bundle_src)
+
+        # 2. Prebuilt runner path (env/kwarg) works without runtime tree + 2-proj SwiGLU FLOPs exclude down_proj
+        @freetpu.tile_kernel(block_m=64, block_n=64, block_k=64, dtype="w8a16")
+        def k_2proj_w8(x, wg, wu, out):
+            freetpu.store(out, freetpu.silu(freetpu.dot(x, wg)) * freetpu.dot(x, wu))
+
+        with tempfile.TemporaryDirectory(prefix="freetpu-adb-2proj-") as tmp:
+            tp = Path(tmp)
+            fake_runner = tp / "custom_runner"
+            fake_runner.write_bytes(b"#!/bin/sh\n")
+            x = np.ones((16, 64), dtype=np.float32)
+            wg = np.ones((64, 64), dtype=np.float32)
+            wu = np.ones((64, 64), dtype=np.float32)
+
+            def _fake_adb(cmd, **_kw):
+                c = list(cmd)
+                if "shell" in c and any("custom_runner" in s or "freetpu_tile_runner" in s for s in c):
+                    return subprocess.CompletedProcess(
+                        c, 0, '{"ok":true,"hw_us":1000.0,"min_hw_us":1000.0,"wall_us":1000.0}', ""
+                    )
+                if "pull" in c:
+                    Path(c[-1]).write_bytes(np.zeros((16, 64), dtype=np.float32).tobytes())
+                return subprocess.CompletedProcess(c, 0, "", "")
+
+            with mock.patch("freetpu_tile.backends.buenos_a0.subprocess.run", side_effect=_fake_adb):
+                res = k_2proj_w8.run(
+                    x, wg, wu,
+                    target="buenos_a0",
+                    adb_serial="fake-serial",
+                    runner_path=fake_runner,
+                    mock=False,
+                )
+            # 2-proj SwiGLU FLOPs = 4 * M * K * N_inter = 4 * 16 * 64 * 64 = 262,144 FLOPs
+            # At hw_us = 1000 us (1e-3 s), gflops = 262,144 / 1e-3 / 1e9 = 0.000262 -> rounds to 0.0
+            # Verify directly with larger 64x512x512 -> 4*64*512*512 = 67,108,864 FLOPs -> 67.109 GFLOP/s (not 100.663!)
+            x_big = np.ones((64, 512), dtype=np.float32)
+            wg_big = np.ones((512, 512), dtype=np.float32)
+            wu_big = np.ones((512, 512), dtype=np.float32)
+
+            def _fake_adb_big(cmd, **_kw):
+                c = list(cmd)
+                if "shell" in c and any("freetpu_tile_runner" in s for s in c):
+                    return subprocess.CompletedProcess(
+                        c, 0, '{"ok":true,"hw_us":1000.0,"min_hw_us":1000.0,"wall_us":1000.0}', ""
+                    )
+                if "pull" in c:
+                    Path(c[-1]).write_bytes(np.zeros((64, 512), dtype=np.float32).tobytes())
+                return subprocess.CompletedProcess(c, 0, "", "")
+
+            with mock.patch.dict(os.environ, {"FREETPU_TILE_RUNNER_PATH": str(fake_runner)}):
+                with mock.patch("freetpu_tile.backends.buenos_a0.subprocess.run", side_effect=_fake_adb_big):
+                    res_big = k_2proj_w8.run(
+                        x_big, wg_big, wu_big,
+                        target="buenos_a0",
+                        adb_serial="fake-serial",
+                        mock=False,
+                    )
+            self.assertAlmostEqual(res_big.gflops or 0.0, 67.109, places=2)
+            self.assertIsNotNone(res.output)
+
+        # 3. Host runner rejects --dtype bf16 explicitly
+        runner_host = Path(__file__).resolve().parent.parent.parent / "runtime" / "build" / "freetpu_tile_runner_host"
+        if runner_host.is_file():
+            proc = subprocess.run(
+                [
+                    str(runner_host), "--mock", "--op", "matmul", "--dtype", "bf16",
+                    "--m", "16", "--k", "64", "--n", "64",
+                    "--in", "/dev/null", "--w", "/dev/null", "--out", "/dev/null",
+                ],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(proc.returncode, 2)
+            self.assertIn("Unsupported --dtype", proc.stderr)
 
 
 if __name__ == "__main__":

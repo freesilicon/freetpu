@@ -29,7 +29,9 @@ TR_SRC := $(THIS_DIR)/src/freetpu_tile_runner.cpp
 OB_ANDROID_LIB := $(ROOT)/libopenbuenos/build/android-arm64/libopenbuenos.a
 OB_HOST_LIB := $(ROOT)/libopenbuenos/build/host/libopenbuenos.a
 
-.PHONY: all clean verify-headers verify-baremetal tile-runner tile-runner-host verify-tile-runner
+.PHONY: all clean verify-headers verify-baremetal tile-runner tile-runner-host verify-tile-runner FORCE
+
+FORCE:
 
 all: $(BM_OUT)
 
@@ -37,10 +39,10 @@ $(BM_OUT): $(BM_SRC) $(BM_HDRS)
 	@mkdir -p $(dir $(BM_OUT))
 	$(CXX) $(CXXFLAGS) $(BM_SRC) -o $(BM_OUT) $(BAREMETAL_LDFLAGS)
 
-$(OB_ANDROID_LIB):
+$(OB_ANDROID_LIB): FORCE
 	$(MAKE) -C $(ROOT)/libopenbuenos android
 
-$(OB_HOST_LIB):
+$(OB_HOST_LIB): FORCE
 	$(MAKE) -C $(ROOT)/libopenbuenos host
 
 tile-runner: $(TR_OUT)

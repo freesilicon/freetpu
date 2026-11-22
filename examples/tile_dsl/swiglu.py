@@ -99,7 +99,12 @@ def main(argv: List[str] | None = None) -> int:
     kernel = build_swiglu_kernel(block_m=64, block_n=512, block_k=512, dtype=args.dtype)
 
     if args.target == "all":
-        dry_targets: List[str] = ["buenos_a0", "cloud_tpu_pallas"] if args.dry_run else []
+        targets: List[str] = (
+            ["cpu_ref", "cloud_tpu_pallas"]
+            if args.dtype == "bf16"
+            else ["cpu_ref", "buenos_a0", "cloud_tpu_pallas"]
+        )
+        dry_targets: List[str] = [t for t in targets if t != "cpu_ref"] if args.dry_run else []
         if not args.dry_run:
             try:
                 import jax  # type: ignore
@@ -113,7 +118,7 @@ def main(argv: List[str] | None = None) -> int:
             wg,
             wu,
             wd,
-            targets=["cpu_ref", "buenos_a0", "cloud_tpu_pallas"],
+            targets=targets,
             dry_run_targets=dry_targets,
             scales=scales,
             adb_serial=args.adb_serial,

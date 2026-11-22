@@ -89,8 +89,12 @@ def is_capacity_error(returncode: int, stderr: str) -> bool:
     return any(m in low for m in _ALLOCATION_ERROR_MARKERS)
 
 
-def build_remote_bundle(script_path: Path, pkg_root: Optional[Path] = None) -> str:
-    """Create a clean-room single-file wrapper bundling `freetpu_tile/` + `script_path`."""
+def build_remote_bundle(
+    script_path: Path,
+    pkg_root: Optional[Path] = None,
+    script_args: Sequence[str] = (),
+) -> str:
+    """Create a clean-room single-file wrapper bundling `freetpu_tile/` + `script_path` + `script_args`."""
     pkg_dir = pkg_root or Path(__file__).resolve().parent
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tf:
@@ -102,6 +106,7 @@ def build_remote_bundle(script_path: Path, pkg_root: Optional[Path] = None) -> s
     b64_pkg = base64.b64encode(buf.getvalue()).decode("ascii")
     script_src = script_path.read_text(encoding="utf-8")
     b64_script = base64.b64encode(script_src.encode("utf-8")).decode("ascii")
+    embedded_args = [str(a) for a in script_args]
 
     return textwrap.dedent(
         f"""\
@@ -116,6 +121,7 @@ def build_remote_bundle(script_path: Path, pkg_root: Optional[Path] = None) -> s
 
         PKG_B64 = {b64_pkg!r}
         SCRIPT_B64 = {b64_script!r}
+        SCRIPT_ARGS = {embedded_args!r}
 
         with tempfile.TemporaryDirectory(prefix="freetpu-colab-") as tmp:
             tmp_p = Path(tmp)
@@ -124,7 +130,7 @@ def build_remote_bundle(script_path: Path, pkg_root: Optional[Path] = None) -> s
             script_file = tmp_p / {script_path.name!r}
             script_file.write_bytes(base64.b64decode(SCRIPT_B64))
             sys.path.insert(0, str(tmp_p))
-            sys.argv = [str(script_file), *sys.argv[1:]]
+            sys.argv = [str(script_file), *SCRIPT_ARGS, *sys.argv[1:]]
             ns = {{"__name__": "__main__", "__file__": str(script_file)}}
             exec(compile(script_file.read_text(encoding="utf-8"), str(script_file), "exec"), ns, ns)
         """
@@ -157,7 +163,10 @@ def run_colab_tile_kernel(
     sess_base = session_name or f"freetpu-tile-{uuid.uuid4().hex[:8]}"
 
     bundle_path = work_dir / f"bundle_{script_path.stem}.py"
-    bundle_path.write_text(build_remote_bundle(script_path), encoding="utf-8")
+    bundle_path.write_text(
+        build_remote_bundle(script_path, script_args=script_args),
+        encoding="utf-8",
+    )
 
     prefix = [resolved_bin, "--auth", auth, "--config", str(iso_cfg)]
     planned: List[List[str]] = [[*prefix, "usage"]]
@@ -173,7 +182,6 @@ def run_colab_tile_kernel(
             "--timeout",
             str(timeout_s),
             str(bundle_path),
-            *script_args,
         ])
         planned.append([*prefix, "log", "-s", sess, "-o", str(work_dir / f"{sess}.ipynb")])
 
@@ -181,6 +189,7 @@ def run_colab_tile_kernel(
         summary = {
             "status": "dry_run",
             "script": str(script_path),
+            "script_args": list(script_args),
             "bundle_path": str(bundle_path),
             "isolated_config": str(iso_cfg),
             "tpus": list(tpus),
@@ -216,7 +225,6 @@ def run_colab_tile_kernel(
             "--timeout",
             str(timeout_s),
             str(bundle_path),
-            *script_args,
         ]
         res = exec_runner(cmd)
         attempts.append({

@@ -107,10 +107,14 @@ def main(argv: List[str] | None = None) -> int:
     )
 
     if args.target == "all":
-        targets: List[str] = ["cpu_ref", "buenos_a0", "cloud_tpu_pallas"]
+        targets: List[str] = (
+            ["cpu_ref", "cloud_tpu_pallas"]
+            if args.dtype == "bf16"
+            else ["cpu_ref", "buenos_a0", "cloud_tpu_pallas"]
+        )
         dry_targets: List[str] = ["cloud_tpu_pallas"] if args.dry_run else []
         if args.dry_run:
-            dry_targets = ["buenos_a0", "cloud_tpu_pallas"]
+            dry_targets = [t for t in targets if t != "cpu_ref"]
         else:
             # Locally without JAX TPU, automatically dry-run cloud_tpu_pallas if JAX TPU absent
             try:
