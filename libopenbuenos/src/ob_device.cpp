@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -38,6 +39,10 @@ ob_status_t init_credit_slots(ob_context* ctx) {
 
 void destroy_credit_slots(ob_context* ctx) {
   for (uint32_t i = 0; i < OB_MAX_CREDITS; ++i) {
+    for (ob_buffer* rb : ctx->credits[i].retired_bufs) {
+      if (rb) ob_buffer_free(rb);
+    }
+    ctx->credits[i].retired_bufs.clear();
     if (ctx->credits[i].exec_cmd_buf) {
       ob_buffer_free(ctx->credits[i].exec_cmd_buf);
       ctx->credits[i].exec_cmd_buf = nullptr;
@@ -186,6 +191,7 @@ ob_status_t device_open(ob_context* ctx) {
                             std::to_string(errno));
     return OB_ERR_DEVICE;
   }
+  ctx->dma_heap_fd = ::open(ctx->dma_heap_path.c_str(), O_RDONLY | O_CLOEXEC);
 
   uint64_t dev_credits = OB_MAX_CREDITS;
   if (::ioctl(ctx->tpu_fd, EDGETPU_GET_CREDIT_SIZE, &dev_credits) != 0) {
@@ -319,7 +325,6 @@ void device_sync_fw_wakelock(ob_context* ctx) {
 void device_close(ob_context* ctx) {
   if (!ctx) return;
   device_release_fw_wakelock(ctx);
-  destroy_credit_slots(ctx);
 #if defined(__linux__)
   if (!ctx->mock_mode) {
     if (ctx->wake_locked && ctx->tpu_fd >= 0) {
@@ -334,12 +339,17 @@ void device_close(ob_context* ctx) {
       ::close(ctx->resp_efd);
       ctx->resp_efd = -1;
     }
+    if (ctx->dma_heap_fd >= 0) {
+      ::close(ctx->dma_heap_fd);
+      ctx->dma_heap_fd = -1;
+    }
     if (ctx->tpu_fd >= 0) {
       ::close(ctx->tpu_fd);
       ctx->tpu_fd = -1;
     }
   }
 #endif
+  destroy_credit_slots(ctx);
 }
 
 ob_status_t device_submit_control(ob_context* ctx,
@@ -507,6 +517,54 @@ ob_status_t device_submit_execute_async(ob_context* ctx,
     return OB_ERR_OVERFLOW;
   }
 
+  std::vector<CachedGraph*> reaped_entries;
+  std::vector<ob_buffer*> reaped_bufs;
+  {
+    std::lock_guard<std::mutex> lk(ctx->vii_mu);
+#if defined(__linux__)
+    if (!ctx->mock_mode) {
+      bool has_abandoned = false;
+      for (uint32_t i = 0; i < ctx->credit_size; ++i) {
+        if (ctx->credits[i].state == CreditSlot::IN_FLIGHT && ctx->credits[i].abandoned) {
+          has_abandoned = true;
+          break;
+        }
+      }
+      while (has_abandoned) {
+        std::string rerr;
+        if (pop_and_demux_one_locked(ctx, false, 0u, nullptr, nullptr, &rerr) != 0) break;
+      }
+    }
+#endif
+    for (uint32_t i = 0; i < ctx->credit_size; ++i) {
+      CreditSlot& s = ctx->credits[i];
+      if (s.abandoned &&
+          (s.state == CreditSlot::COMPLETED || s.state == CreditSlot::FAILED)) {
+        if (s.graph_entry) reaped_entries.push_back(s.graph_entry);
+        for (ob_buffer* rb : s.retired_bufs) {
+          if (rb) reaped_bufs.push_back(rb);
+        }
+        s.retired_bufs.clear();
+        s.state = CreditSlot::FREE;
+        s.abandoned = false;
+        s.handle = 0;
+        s.seq = 0;
+        s.graph_entry = nullptr;
+        s.error_msg.clear();
+        if (ctx->inflight_count > 0u) ctx->inflight_count -= 1u;
+      }
+    }
+  }
+  if (!reaped_entries.empty()) {
+    std::lock_guard<std::mutex> clk(ctx->cache_mu);
+    for (CachedGraph* ge : reaped_entries) {
+      graph_entry_unref_locked(ctx, ge);
+    }
+  }
+  for (ob_buffer* rb : reaped_bufs) {
+    ob_buffer_free(rb);
+  }
+
   std::lock_guard<std::mutex> lk(ctx->vii_mu);
   if (ctx->inflight_count >= ctx->credit_size) {
     set_last_error(ctx, "All VII execution credits occupied (max_inflight=" +
@@ -574,6 +632,7 @@ ob_status_t device_submit_execute_async(ob_context* ctx,
 
   const ob_exec_handle_t handle = ctx->next_exec_handle++;
   slot->state = CreditSlot::IN_FLIGHT;
+  slot->abandoned = false;
   slot->handle = handle;
   slot->seq = seq;
   slot->graph_entry = entry;
@@ -596,6 +655,8 @@ ob_status_t device_wait_handle(ob_context* ctx,
   if (!ctx || handle == 0u) return OB_ERR_INVALID_ARG;
 
   CachedGraph* completed_entry = nullptr;
+  std::vector<CachedGraph*> reaped_entries;
+  std::vector<ob_buffer*> retired_to_free;
   ob_status_t result = OB_OK;
   ob_invoke_stats_t stats {};
 
@@ -622,8 +683,22 @@ ob_status_t device_wait_handle(ob_context* ctx,
     } else {
 #if defined(__linux__)
       uint32_t wait_ms = (timeout_ms > 0) ? timeout_ms : ctx->cfg.timeout_ms;
-      uint64_t deadline_ns =
-          monotonic_now_ns() + static_cast<uint64_t>(wait_ms) * 1000000ULL;
+      const uint64_t wait_start_ns = monotonic_now_ns();
+      const uint64_t deadline_ns =
+          wait_start_ns + static_cast<uint64_t>(wait_ms) * 1000000ULL;
+
+      // Adaptive bounded user-space spin before poll(resp_efd):
+      // eliminates 150-350 us kernel wake/schedule jitter when TPU finishes in 40-400 us
+      // (covers both SmolLM2 ~266 us and Qwen2.5 SwiGLU ~215-350 us chunks),
+      // while sleeping in poll() immediately for long ops (ema_hw_us >= 600 us) or spin_us == 0.
+      const bool allow_spin = (ctx->spin_us > 0u) &&
+                              (ctx->ema_hw_us == 0u || ctx->ema_hw_us < 600u);
+      const uint64_t spin_deadline_ns = allow_spin
+          ? std::min<uint64_t>(deadline_ns,
+                               wait_start_ns + static_cast<uint64_t>(ctx->spin_us) * 1000ULL)
+          : 0u;
+      bool used_poll = false;
+      uint32_t spin_iters = 0u;
 
       while (slot->state == CreditSlot::IN_FLIGHT) {
         std::string err;
@@ -637,10 +712,40 @@ ob_status_t device_wait_handle(ob_context* ctx,
         }
         if (slot->state != CreditSlot::IN_FLIGHT) break;
 
+        if (allow_spin && !used_poll) {
+          uint64_t now_ns = monotonic_now_ns();
+          if (now_ns < spin_deadline_ns) {
+            ++spin_iters;
+            // Pace non-blocking ioctl probes every ~4 us to avoid kernel lock contention
+            // with the IRQ handler while catching completion within <= 4 us.
+            const uint64_t next_probe_ns = std::min<uint64_t>(spin_deadline_ns, now_ns + 4000ULL);
+            while (monotonic_now_ns() < next_probe_ns) {
+#if defined(__aarch64__)
+              asm volatile("yield" ::: "memory");
+#elif defined(__x86_64__)
+              asm volatile("pause" ::: "memory");
+#endif
+            }
+            continue;
+          }
+        }
+
+        used_poll = true;
+        ctx->prof.poll_waits += 1u;
         ob_status_t pst = poll_eventfds_locked(ctx, deadline_ns, &err);
         if (pst != OB_OK) {
           set_last_error(ctx, err);
           return pst;
+        }
+      }
+      if (!used_poll && spin_iters > 0u) {
+        ctx->prof.spin_hits += 1u;
+      }
+      if (slot->state == CreditSlot::COMPLETED && slot->hw_execution_us > 0u) {
+        if (ctx->ema_hw_us == 0u) {
+          ctx->ema_hw_us = slot->hw_execution_us;
+        } else {
+          ctx->ema_hw_us = (ctx->ema_hw_us * 3u + slot->hw_execution_us) >> 2u;
         }
       }
 #else
@@ -668,6 +773,132 @@ ob_status_t device_wait_handle(ob_context* ctx,
     }
 
     slot->state = CreditSlot::FREE;
+    slot->abandoned = false;
+    slot->handle = 0;
+    slot->seq = 0;
+    slot->graph_entry = nullptr;
+    slot->error_msg.clear();
+    retired_to_free = std::move(slot->retired_bufs);
+    slot->retired_bufs.clear();
+    if (ctx->inflight_count > 0u) ctx->inflight_count -= 1u;
+
+    for (uint32_t i = 0; i < ctx->credit_size; ++i) {
+      CreditSlot& s = ctx->credits[i];
+      if (s.abandoned &&
+          (s.state == CreditSlot::COMPLETED || s.state == CreditSlot::FAILED)) {
+        if (s.graph_entry) reaped_entries.push_back(s.graph_entry);
+        for (ob_buffer* rb : s.retired_bufs) {
+          if (rb) retired_to_free.push_back(rb);
+        }
+        s.retired_bufs.clear();
+        s.state = CreditSlot::FREE;
+        s.abandoned = false;
+        s.handle = 0;
+        s.seq = 0;
+        s.graph_entry = nullptr;
+        s.error_msg.clear();
+        if (ctx->inflight_count > 0u) ctx->inflight_count -= 1u;
+      }
+    }
+  }
+
+  // Release graph refs outside vii_mu to respect cache_mu -> vii_mu lock order
+  if (completed_entry || !reaped_entries.empty()) {
+    std::lock_guard<std::mutex> clk(ctx->cache_mu);
+    if (completed_entry) graph_entry_unref_locked(ctx, completed_entry);
+    for (CachedGraph* ge : reaped_entries) {
+      graph_entry_unref_locked(ctx, ge);
+    }
+  }
+  for (ob_buffer* rb : retired_to_free) {
+    if (rb) ob_buffer_free(rb);
+  }
+
+  if (out_stats) *out_stats = stats;
+  return result;
+}
+
+bool device_try_wait_handle(ob_context* ctx,
+                            ob_exec_handle_t handle,
+                            ob_status_t* out_status,
+                            ob_invoke_stats_t* out_stats) {
+  if (!ctx || handle == 0u) {
+    if (out_status) *out_status = OB_ERR_INVALID_ARG;
+    return true;
+  }
+
+  CachedGraph* completed_entry = nullptr;
+  ob_status_t result = OB_OK;
+  ob_invoke_stats_t stats {};
+
+  {
+    std::lock_guard<std::mutex> lk(ctx->vii_mu);
+    CreditSlot* slot = nullptr;
+    for (uint32_t i = 0; i < ctx->credit_size; ++i) {
+      if (ctx->credits[i].state != CreditSlot::FREE &&
+          ctx->credits[i].handle == handle) {
+        slot = &ctx->credits[i];
+        break;
+      }
+    }
+    if (!slot) {
+      set_last_error(ctx, "Unknown or already-completed ob_exec_handle_t");
+      if (out_status) *out_status = OB_ERR_NOT_FOUND;
+      return true;
+    }
+
+    if (ctx->mock_mode) {
+      slot->complete_time_ns = monotonic_now_ns();
+      slot->state = CreditSlot::COMPLETED;
+      slot->vii_resp_code = 0;
+      slot->error_status = OB_OK;
+    } else {
+#if defined(__linux__)
+      while (slot->state == CreditSlot::IN_FLIGHT) {
+        std::string err;
+        int rc = pop_and_demux_one_locked(ctx, false, 0u, nullptr, nullptr, &err);
+        if (rc == 0) continue;
+        if (rc == -2) {
+          // Keep the handle IN_FLIGHT so the caller's blocking wait / cleanup path
+          // retains DMA buffer ownership and retires the slot cleanly.
+          set_last_error(ctx, err);
+          return false;
+        }
+        break;
+      }
+      if (slot->state == CreditSlot::IN_FLIGHT) {
+        return false;
+      }
+      if (slot->state == CreditSlot::COMPLETED && slot->hw_execution_us > 0u) {
+        if (ctx->ema_hw_us == 0u) {
+          ctx->ema_hw_us = slot->hw_execution_us;
+        } else {
+          ctx->ema_hw_us = (ctx->ema_hw_us * 3u + slot->hw_execution_us) >> 2u;
+        }
+      }
+#else
+      return false;
+#endif
+    }
+
+    completed_entry = slot->graph_entry;
+    stats.hw_execution_us = slot->hw_execution_us;
+    uint64_t dt_ns = (slot->complete_time_ns >= slot->submit_time_ns)
+                         ? (slot->complete_time_ns - slot->submit_time_ns)
+                         : 0u;
+    stats.wall_time_us = dt_ns / 1000ULL;
+    stats.seq = slot->seq;
+    stats.model_handle = completed_entry ? completed_entry->model_handle : 0u;
+    stats.vii_resp_code = slot->vii_resp_code;
+    stats.flags = ctx->mock_mode ? static_cast<uint16_t>(OB_STAT_FLAG_MOCK) : static_cast<uint16_t>(0u);
+    stats.tiles_dispatched = 1u;
+
+    result = (slot->state == CreditSlot::COMPLETED) ? OB_OK : slot->error_status;
+    if (result != OB_OK && !slot->error_msg.empty()) {
+      set_last_error(ctx, slot->error_msg);
+    }
+
+    slot->state = CreditSlot::FREE;
     slot->handle = 0;
     slot->seq = 0;
     slot->graph_entry = nullptr;
@@ -675,14 +906,14 @@ ob_status_t device_wait_handle(ob_context* ctx,
     if (ctx->inflight_count > 0u) ctx->inflight_count -= 1u;
   }
 
-  // Release graph ref outside vii_mu to respect cache_mu -> vii_mu lock order
   if (completed_entry) {
     std::lock_guard<std::mutex> clk(ctx->cache_mu);
     graph_entry_unref_locked(ctx, completed_entry);
   }
 
   if (out_stats) *out_stats = stats;
-  return result;
+  if (out_status) *out_status = result;
+  return true;
 }
 
 ob_status_t device_wait_all(ob_context* ctx, uint32_t timeout_ms) {
@@ -706,6 +937,55 @@ ob_status_t device_wait_all(ob_context* ctx, uint32_t timeout_ms) {
   return first_err;
 }
 
+bool device_attach_inflight_buffers(ob_context* ctx,
+                                    ob_exec_handle_t handle,
+                                    std::initializer_list<ob_buffer*> bufs) {
+  if (!ctx || handle == 0u) return false;
+  CachedGraph* reaped_entry = nullptr;
+  std::vector<ob_buffer*> reaped_bufs;
+  {
+    std::lock_guard<std::mutex> lk(ctx->vii_mu);
+    CreditSlot* slot = nullptr;
+    for (uint32_t i = 0; i < ctx->credit_size; ++i) {
+      if (ctx->credits[i].state != CreditSlot::FREE &&
+          ctx->credits[i].handle == handle) {
+        slot = &ctx->credits[i];
+        break;
+      }
+    }
+    if (!slot) return false;
+    slot->abandoned = true;
+    for (ob_buffer* b : bufs) {
+      if (!b) continue;
+      if (std::find(slot->retired_bufs.begin(), slot->retired_bufs.end(), b) ==
+          slot->retired_bufs.end()) {
+        buffer_retain(b);
+        slot->retired_bufs.push_back(b);
+      }
+    }
+    if (slot->state == CreditSlot::COMPLETED || slot->state == CreditSlot::FAILED) {
+      reaped_entry = slot->graph_entry;
+      reaped_bufs = std::move(slot->retired_bufs);
+      slot->retired_bufs.clear();
+      slot->state = CreditSlot::FREE;
+      slot->abandoned = false;
+      slot->handle = 0;
+      slot->seq = 0;
+      slot->graph_entry = nullptr;
+      slot->error_msg.clear();
+      if (ctx->inflight_count > 0u) ctx->inflight_count -= 1u;
+    }
+  }
+  if (reaped_entry) {
+    std::lock_guard<std::mutex> clk(ctx->cache_mu);
+    graph_entry_unref_locked(ctx, reaped_entry);
+  }
+  for (ob_buffer* rb : reaped_bufs) {
+    if (rb) ob_buffer_free(rb);
+  }
+  return true;
+}
+
 }  // namespace ob
 
 namespace {
@@ -718,6 +998,27 @@ bool read_env_u8(const char* name, uint8_t* out) {
   if (end == s || v > 255ul) return false;
   *out = static_cast<uint8_t>(v);
   return true;
+}
+
+bool read_env_u32(const char* name, uint32_t* out) {
+  const char* s = std::getenv(name);
+  if (!s || !s[0]) return false;
+  char* end = nullptr;
+  unsigned long v = std::strtoul(s, &end, 0);
+  if (end == s || v > 0xfffffffful) return false;
+  *out = static_cast<uint32_t>(v);
+  return true;
+}
+
+bool read_env_flag(const char* name, bool default_val) {
+  const char* s = std::getenv(name);
+  if (!s || !s[0]) return default_val;
+  return (s[0] != '0');
+}
+
+bool read_env_opt_in_one(const char* name) {
+  const char* s = std::getenv(name);
+  return (s != nullptr && s[0] == '1');
 }
 
 struct ObPowerProfile {
@@ -831,6 +1132,48 @@ ob_status_t ob_context_create(const ob_config_t* config, ob_context_t** out_ctx)
   ctx->cfg = eff;
   ctx->fw_priority = fw_prio;
   ctx->fw_wakelock_enabled = wl_enabled;
+  ctx->profile_enabled = read_env_flag("OPENBUENOS_PROFILE", false);
+  ctx->verbose_enabled = read_env_flag("OPENBUENOS_VERBOSE", false);
+  ctx->strict_weight_hash = read_env_flag("OPENBUENOS_STRICT_WEIGHT_HASH", true);
+  ctx->large_tiles_enabled = !read_env_opt_in_one("OPENBUENOS_DISABLE_LARGE_TILES");
+  ctx->batched_large_tiles_enabled =
+      ctx->large_tiles_enabled && !read_env_opt_in_one("OPENBUENOS_DISABLE_BATCHED_LARGE_TILES");
+  ctx->horiz_fusion_enabled = !read_env_flag("OPENBUENOS_DISABLE_HORIZ_FUSION", false);
+  ctx->swiglu_chain_enabled = !read_env_flag("OPENBUENOS_DISABLE_SWIGLU_CHAIN", false);
+  ctx->swiglu_fast_chain_enabled = read_env_flag("OPENBUENOS_SWIGLU_FAST_CHAIN", false);
+  ctx->swiglu_prefill_enabled = read_env_flag("OPENBUENOS_SWIGLU_PREFILL", false);
+  if (const char* s = std::getenv("OPENBUENOS_SWIGLU_MAX_CREST"); s && s[0]) {
+    char* end = nullptr;
+    float v = std::strtof(s, &end);
+    if (end != s && v >= 0.0f) {
+      ctx->swiglu_max_crest = v;
+    }
+  }
+  uint32_t env_swap_slots = 1u;
+  if (read_env_u32("OPENBUENOS_PARAM_SWAP_SLOTS", &env_swap_slots)) {
+    if (env_swap_slots < 1u) env_swap_slots = 1u;
+    if (env_swap_slots > OB_MAX_CREDITS) env_swap_slots = OB_MAX_CREDITS;
+  }
+  ctx->param_swap_slots = env_swap_slots;
+  uint32_t env_spin_us = 450u;
+  if (read_env_u32("OPENBUENOS_SPIN_US", &env_spin_us)) {
+    if (env_spin_us > 10000u) env_spin_us = 10000u;
+  }
+  ctx->spin_us = env_spin_us;
+  uint32_t env_threads = ob::kDefaultWorkerThreads;
+  if (read_env_u32("OPENBUENOS_THREADS", &env_threads)) {
+    if (env_threads < 1u) env_threads = 1u;
+    if (env_threads > 16u) env_threads = 16u;
+  }
+  ctx->num_threads = env_threads;
+  ctx->worker_pool.init(ctx->num_threads);
+  ctx->async_dequant_enabled = read_env_flag("OPENBUENOS_ASYNC_DEQUANT", true);
+  ctx->w8a16_mode = read_env_flag("OPENBUENOS_W8A16", false) ? 1u : 0u;
+  uint32_t env_max_out = ob::kDefaultMaxCachedOutlierCols;
+  if (read_env_u32("OPENBUENOS_MAX_OUTLIER_COLS", &env_max_out)) {
+    if (env_max_out > 1024u) env_max_out = 1024u;
+  }
+  ctx->max_cached_outlier_cols = env_max_out;
   ctx->device_path = eff.device_path;
   ctx->dma_heap_path = eff.dma_heap_path;
   ctx->mock_mode = (eff.mock_mode != 0);
@@ -852,7 +1195,49 @@ ob_status_t ob_context_create(const ob_config_t* config, ob_context_t** out_ctx)
 void ob_context_destroy(ob_context_t* ctx) {
   if (!ctx) return;
   ob::device_wait_all(ctx, ctx->cfg.timeout_ms);
+  if (ctx->profile_enabled || (ctx->verbose_enabled && (ctx->prof.calls > 0u || ctx->prof.swiglu_calls > 0u))) {
+    ob_profile_stats_t ps {};
+    if (ob_context_get_profile(ctx, &ps) == OB_OK) {
+      std::fprintf(
+          stderr,
+          "libopenbuenos: profile calls=%llu tiles=%llu horiz_fusions=%llu horiz_saved=%llu "
+          "swiglu_calls=%llu swiglu_chained=%llu swiglu_fb=%llu "
+          "hw_us=%llu wall_us=%llu quant_us=%llu hash_us=%llu pack_us=%llu dma_sync_us=%llu "
+          "submit_us=%llu wait_us=%llu dequant_us=%llu sat_retries=%llu spin_hits=%llu "
+          "poll_waits=%llu pool_hits=%llu pool_misses=%llu w_hits=%llu w_misses=%llu "
+          "w_evict=%llu w_bytes=%llu w_peak_bytes=%llu w_budget_bytes=%llu\n",
+          static_cast<unsigned long long>(ps.calls),
+          static_cast<unsigned long long>(ps.tiles_dispatched),
+          static_cast<unsigned long long>(ps.horiz_fusions),
+          static_cast<unsigned long long>(ps.horiz_jobs_saved),
+          static_cast<unsigned long long>(ps.swiglu_calls),
+          static_cast<unsigned long long>(ps.swiglu_chunks_chained),
+          static_cast<unsigned long long>(ps.swiglu_fallbacks),
+          static_cast<unsigned long long>(ps.hw_us),
+          static_cast<unsigned long long>(ps.total_wall_us),
+          static_cast<unsigned long long>(ps.quant_us),
+          static_cast<unsigned long long>(ps.hash_us),
+          static_cast<unsigned long long>(ps.weight_pack_us),
+          static_cast<unsigned long long>(ps.dma_sync_us),
+          static_cast<unsigned long long>(ps.submit_us),
+          static_cast<unsigned long long>(ps.wait_us),
+          static_cast<unsigned long long>(ps.dequant_us),
+          static_cast<unsigned long long>(ps.sat_retries),
+          static_cast<unsigned long long>(ps.spin_hits),
+          static_cast<unsigned long long>(ps.poll_waits),
+          static_cast<unsigned long long>(ps.pool_hits),
+          static_cast<unsigned long long>(ps.pool_misses),
+          static_cast<unsigned long long>(ps.weight_cache_hits),
+          static_cast<unsigned long long>(ps.weight_cache_misses),
+          static_cast<unsigned long long>(ps.weight_cache_evictions),
+          static_cast<unsigned long long>(ps.weight_cache_bytes),
+          static_cast<unsigned long long>(ps.weight_cache_peak_bytes),
+          static_cast<unsigned long long>(ps.weight_cache_budget_bytes));
+    }
+  }
+  ctx->async_dequant.shutdown();
   ob::gemm_release_pipeline_buffers(ctx);
+  ctx->worker_pool.shutdown();
   ob::graph_cache_clear(ctx);
   ob::shared_image_clear(ctx);
   ob::device_close(ctx);
@@ -900,6 +1285,64 @@ ob_status_t ob_context_set_perf_mode(ob_context_t* ctx, uint32_t perf_mode) {
     apply_perf_mode_to_cfg(&ctx->cfg, perf_mode, &ctx->fw_priority);
   }
   ob::device_sync_fw_wakelock(ctx);
+  return OB_OK;
+}
+
+ob_status_t ob_context_set_profile(ob_context_t* ctx, int enable) {
+  if (!ctx) return OB_ERR_INVALID_ARG;
+  std::lock_guard<std::mutex> lk(ctx->gemm_mu);
+  ctx->profile_enabled = (enable != 0);
+  return OB_OK;
+}
+
+ob_status_t ob_context_get_profile(const ob_context_t* ctx, ob_profile_stats_t* out_profile) {
+  if (!ctx || !out_profile) return OB_ERR_INVALID_ARG;
+  std::memset(out_profile, 0, sizeof(*out_profile));
+  ob_context* mctx = const_cast<ob_context*>(ctx);
+  {
+    std::lock_guard<std::mutex> glk(mctx->gemm_mu);
+    out_profile->quant_us = mctx->prof.quant_ns / 1000ULL;
+    out_profile->hash_us = mctx->prof.hash_ns / 1000ULL;
+    out_profile->weight_pack_us = mctx->prof.weight_pack_ns / 1000ULL;
+    out_profile->dma_sync_us = mctx->prof.dma_sync_ns / 1000ULL;
+    out_profile->submit_us = mctx->prof.submit_ns / 1000ULL;
+    out_profile->wait_us = mctx->prof.wait_ns / 1000ULL;
+    out_profile->dequant_us = mctx->prof.dequant_ns / 1000ULL;
+    out_profile->hw_us = mctx->prof.hw_us;
+    out_profile->total_wall_us = mctx->prof.total_wall_ns / 1000ULL;
+    out_profile->calls = mctx->prof.calls;
+    out_profile->tiles_dispatched = mctx->prof.tiles_dispatched;
+    out_profile->horiz_fusions = mctx->prof.horiz_fusions;
+    out_profile->horiz_jobs_saved = mctx->prof.horiz_jobs_saved;
+    out_profile->sat_retries = mctx->prof.sat_retries;
+    out_profile->weight_cache_hits = mctx->weight_cache_hits;
+    out_profile->weight_cache_misses = mctx->weight_cache_misses;
+    out_profile->weight_cache_bytes = mctx->weight_cache_bytes;
+    out_profile->weight_cache_peak_bytes = mctx->weight_cache_peak_bytes;
+    out_profile->weight_cache_budget_bytes = ob::compute_weight_cache_budget_bytes(mctx);
+    out_profile->weight_cache_evictions = mctx->weight_cache_evictions;
+    out_profile->swiglu_calls = mctx->prof.swiglu_calls;
+    out_profile->swiglu_chunks_chained = mctx->prof.swiglu_chunks_chained;
+    out_profile->swiglu_fallbacks = mctx->prof.swiglu_fallbacks;
+    {
+      std::lock_guard<std::mutex> vlk(mctx->vii_mu);
+      out_profile->spin_hits = mctx->prof.spin_hits;
+      out_profile->poll_waits = mctx->prof.poll_waits;
+    }
+    {
+      std::lock_guard<std::mutex> plk(mctx->pool_mu);
+      out_profile->pool_hits = mctx->pool_hits;
+      out_profile->pool_misses = mctx->pool_misses;
+    }
+  }
+  return OB_OK;
+}
+
+ob_status_t ob_context_reset_profile(ob_context_t* ctx) {
+  if (!ctx) return OB_ERR_INVALID_ARG;
+  std::lock_guard<std::mutex> glk(ctx->gemm_mu);
+  std::lock_guard<std::mutex> vlk(ctx->vii_mu);
+  ctx->prof = ob::ProfileCounters{};
   return OB_OK;
 }
 
