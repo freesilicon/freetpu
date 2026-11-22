@@ -59,6 +59,8 @@ def _make_mock_pci_tree(
         (d / "enable").write_text(dev.get("enable", "1") + "\n", encoding="utf-8")
         if "numa_node" in dev:
             (d / "numa_node").write_text(dev["numa_node"] + "\n", encoding="utf-8")
+        if "chip_id" in dev:
+            (d / "chip_id").write_text(dev["chip_id"] + "\n", encoding="utf-8")
         if dev.get("iommu_group"):
             grp = iommu_groups / dev["iommu_group"]
             grp.mkdir(parents=True, exist_ok=True)
@@ -272,10 +274,11 @@ TPU Device Status
                 create_vfio_nodes=["0", "2"],
             )
 
-            # Synthetic /proc/9001/fd/3 -> <dev_root>/vfio/0 (mocked as char device 242:0)
-            fd_dir = proc_root / "9001" / "fd"
-            fd_dir.mkdir(parents=True, exist_ok=True)
-            os.symlink(str(dev_root / "vfio" / "0"), fd_dir / "3")
+            # Synthetic /proc/9001/fd/3 and /proc/7777/fd/3 -> <dev_root>/vfio/0 (char device 242:0)
+            for pid_str in ("7777", "9001"):
+                fd_dir = proc_root / pid_str / "fd"
+                fd_dir.mkdir(parents=True, exist_ok=True)
+                os.symlink(str(dev_root / "vfio" / "0"), fd_dir / "3")
 
             # Google v6e-style output: VFIO groups 0 & 2, runtime IDs 8 & 12 (unmapped)
             # plus TensorCore table that must not leak into duty cycle.
@@ -905,6 +908,90 @@ TPU Device Status
 
             self.assertTrue(snap.pid_telemetry_available)
             self.assertEqual(snap.devices[0].active_pids, [5002])
+
+            # Even when tpu-info reports decoy PID 5001 (pathname match on regular file)
+            # alongside real holder 5002, decoy PID 5001 must NOT be merged into active_pids.
+            mock_cli = root / "mock-tpu-info-decoy.sh"
+            mock_cli.write_text(
+                "#!/bin/sh\n"
+                "cat <<'EOF'\n"
+                "TPU Chips\n"
+                "| Chip         | Type         | Devices | PID        |\n"
+                "|--------------|--------------|---------|------------|\n"
+                "| /dev/vfio/12 | TPU v5e chip | 1       | 5001, 5002 |\n"
+                "EOF\n",
+                encoding="utf-8",
+            )
+            mock_cli.chmod(0o755)
+            with mock.patch("tpu_exporter.os.stat", side_effect=_mock_os_stat):
+                snap_cli = tpu_exporter.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin=str(mock_cli),
+                )
+            self.assertTrue(snap_cli.tpu_info_available)
+            self.assertEqual(snap_cli.devices[0].active_pids, [5002])
+
+    def test_ambiguous_combined_sysfs_and_chip_id_map_leaves_runtime_unmapped(self) -> None:
+        self.assertEqual(tpu_exporter.build_arg_parser().parse_args([]).health_host, "127.0.0.1")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sysfs_root, dev_root, proc_root = _make_mock_pci_tree(
+                root,
+                devices=[
+                    {
+                        "bdf": "0000:00:05.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0063",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                        "chip_id": "0",  # sysfs assigns runtime ID 0 to chip A
+                    },
+                    {
+                        "bdf": "0000:00:06.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0063",
+                        "driver": "vfio-pci",
+                        "iommu_group": "1",
+                    },
+                ],
+                create_vfio_nodes=["0", "1"],
+            )
+            mock_cli = root / "mock-tpu-info-ambig.sh"
+            mock_cli.write_text(
+                "#!/bin/sh\n"
+                "cat <<'EOF'\n"
+                "TPU Device Status\n"
+                "+-----------+---------------------------+--------------------+--------------------+-----------------------+\n"
+                "| Device ID | Memory Usage (Used/Total) | Memory Bar Gauge   | HBM Bandwidth Util | TensorCore Duty Cycle |\n"
+                "+-----------+---------------------------+--------------------+--------------------+-----------------------+\n"
+                "| 0         | 10.00 GiB / 16.00 GiB     | [||||||....] 62.5% | [|||.......] 30.0% | [||||||||..] 75.0%    |\n"
+                "+-----------+---------------------------+--------------------+--------------------+-----------------------+\n"
+                "EOF\n",
+                encoding="utf-8",
+            )
+            mock_cli.chmod(0o755)
+
+            # Explicit map assigns runtime ID 0 to chip B while sysfs assigns 0 to chip A:
+            # collision must leave BOTH chips without per-PCI metrics and keep row 0 unmapped.
+            snap = tpu_exporter.collect_snapshot(
+                sysfs_root=sysfs_root,
+                dev_root=dev_root,
+                proc_root=proc_root,
+                tpu_info_bin=str(mock_cli),
+                chip_id_map={"0000:00:06.0": "0"},
+            )
+            self.assertIsNone(snap.devices[0].hbm_used_bytes)
+            self.assertIsNone(snap.devices[0].duty_cycle_percent)
+            self.assertIsNone(snap.devices[1].hbm_used_bytes)
+            self.assertIsNone(snap.devices[1].duty_cycle_percent)
+            self.assertEqual(len(snap.runtime_utilization), 1)
+            self.assertEqual(snap.runtime_utilization[0].runtime_chip, "0")
+            self.assertIsNone(snap.runtime_utilization[0].mapped_pci_bdf)
+            prom = tpu_exporter.format_prometheus_metrics(snap)
+            self.assertNotIn("freetpu_tpu_duty_cycle_percent{", prom)
+            self.assertIn('freetpu_tpu_runtime_duty_cycle_percent{runtime_chip="0",pci_bdf="unmapped"} 75', prom)
 
     def _assert_valid_prometheus_text(self, text: str) -> None:
         lines = [ln for ln in text.splitlines() if ln.strip()]

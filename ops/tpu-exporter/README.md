@@ -5,7 +5,7 @@
 ## What It Discovers & Exports
 
 1. **PCI & VFIO Topology (`/sys/bus/pci/devices/*` + `/dev/vfio/*`)**
-   - Filters Google PCI vendor `0x1ae0` and maps known TPU device IDs (`0x0027`, `0x0056`, `0x005e`, `0x0062`, `0x0063`, `0x006e`, `0x006f`).
+   - Filters Google PCI vendor `0x1ae0` and maps known TPU device IDs (`0x0027`, `0x0056`, `0x005e`, `0x0062`, `0x0063`, `0x006e`, `0x006f`). Note: upstream `tpu-info` omits v6e PF `0x006e` (recognizing v6e VF `0x006f`), so PF-only `0x006e` hosts export sysfs/VFIO inventory and active PIDs without `tpu-info` HBM/duty-cycle metrics.
    - Resolves IOMMU group, bound kernel driver (`vfio-pci`), `/dev/vfio/<group>` node, and `/dev/vfio/vfio` container readiness on VFIO-backed hosts.
 2. **Runtime Telemetry (`tpu-info` + `/proc/*/fd` fallback)**
    - Parses both modern `tpu-info` dashboard (`TPU Device Status`, `TPU Process Monitor`) and classic (`TPU Chips`, `TPU Runtime Utilization`) tables for HBM used/total bytes, MXU/TensorCore duty cycle `%`, and active PIDs.

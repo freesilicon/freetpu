@@ -121,6 +121,8 @@ spec:
             - 0.0.0.0
             - --port
             - "9400"
+            - --health-host
+            - 127.0.0.1
             - --health-port
             - "9401"
           securityContext:
@@ -137,19 +139,23 @@ spec:
             - name: metrics
               containerPort: 9400
               protocol: TCP
-            - name: health
-              containerPort: 9401
-              protocol: TCP
+          # Health listener binds strictly to 127.0.0.1:9401 (never exposed on
+          # the pod network) and is checked via local exec probes so remote pods
+          # cannot exhaust health slots or trigger spurious liveness restarts.
           readinessProbe:
-            httpGet:
-              path: /readyz
-              port: health
+            exec:
+              command:
+                - python3
+                - -c
+                - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9401/readyz', timeout=2).read()"
             initialDelaySeconds: 2
             periodSeconds: 10
           livenessProbe:
-            httpGet:
-              path: /healthz
-              port: health
+            exec:
+              command:
+                - python3
+                - -c
+                - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9401/healthz', timeout=2).read()"
             initialDelaySeconds: 5
             periodSeconds: 30
           resources:

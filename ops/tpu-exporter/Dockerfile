@@ -16,7 +16,7 @@ RUN if [ "$INSTALL_TPU_INFO" = "1" ]; then \
 WORKDIR /opt/freetpu
 COPY tpu_exporter.py /opt/freetpu/tpu_exporter.py
 
-EXPOSE 9400 9401
+EXPOSE 9400
 
 ENTRYPOINT ["python3", "/opt/freetpu/tpu_exporter.py"]
-CMD ["--host", "0.0.0.0", "--port", "9400", "--health-port", "9401"]
+CMD ["--host", "0.0.0.0", "--port", "9400", "--health-host", "127.0.0.1", "--health-port", "9401"]

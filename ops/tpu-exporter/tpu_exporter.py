@@ -628,6 +628,35 @@ def validate_chip_id_map(
         seen_runtime_targets[rt_id] = dev.pci_bdf
 
 
+def _stat_char_rdev(path: str) -> Optional[int]:
+    if not path:
+        return None
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    if stat.S_ISCHR(st.st_mode):
+        return st.st_rdev
+    return None
+
+
+def _pid_holds_vfio_rdev(proc_root: Path, pid: int, target_rdev: int) -> bool:
+    """Return True iff `/proc/<pid>/fd/*` contains an open char device with `st_rdev == target_rdev`."""
+    fd_dir = proc_root / str(pid) / "fd"
+    try:
+        fds = list(fd_dir.iterdir())
+    except OSError:
+        return False
+    for fd_link in fds:
+        try:
+            fd_st = os.stat(fd_link)
+        except OSError:
+            continue
+        if stat.S_ISCHR(fd_st.st_mode) and fd_st.st_rdev == target_rdev:
+            return True
+    return False
+
+
 def collect_snapshot(
     sysfs_root: Path = Path("/sys"),
     dev_root: Path = Path("/dev"),
@@ -648,6 +677,9 @@ def collect_snapshot(
         for d in devices
         if d.iommu_group
     ]
+    vfio_rdevs: Dict[str, Optional[int]] = {
+        vp: _stat_char_rdev(vp) for vp in real_vfio_paths
+    }
     proc_pids, proc_fd_accessible, _unreadable = _scan_proc_vfio_pids(
         proc_root, real_vfio_paths
     )
@@ -660,10 +692,55 @@ def collect_snapshot(
     mapped_util_keys: Dict[str, str] = {}
     overall_pid_available = True
 
+    # Combine sysfs `chip_id` and explicit `--chip-id-map` across all discovered chips
+    # first so any runtime chip ID (or utilization key) claimed by >1 physical chip is
+    # detected as ambiguous and left keyed strictly by runtime ID (`pci_bdf="unmapped"`).
+    resolved_rt_ids: Dict[str, Optional[str]] = {}
+    rt_id_claimants: Dict[str, List[str]] = {}
+    prospective_util_key: Dict[str, Optional[str]] = {}
+    util_key_claimants: Dict[str, List[str]] = {}
+
+    for dev in devices:
+        is_shared_vfio = bool(dev.vfio_device and dev.vfio_device in shared_vfio)
+        verified_runtime_id = dev.runtime_chip_id
+        if not verified_runtime_id and chip_id_map:
+            mapped = chip_id_map.get(dev.pci_bdf)
+            if mapped is None and not is_shared_vfio and dev.vfio_device:
+                mapped = chip_id_map.get(dev.vfio_device)
+            if mapped is not None:
+                verified_runtime_id = str(mapped)
+        resolved_rt_ids[dev.pci_bdf] = verified_runtime_id
+        if verified_runtime_id:
+            rt_id_claimants.setdefault(verified_runtime_id, []).append(dev.pci_bdf)
+
+    ambiguous_rt_ids = {rt for rt, bdfs in rt_id_claimants.items() if len(bdfs) > 1}
+
+    for dev in devices:
+        is_shared_vfio = bool(dev.vfio_device and dev.vfio_device in shared_vfio)
+        rt_id = resolved_rt_ids.get(dev.pci_bdf)
+        if rt_id in ambiguous_rt_ids:
+            rt_id = None
+        util_candidates: List[str] = [dev.pci_bdf]
+        if dev.vfio_device and not is_shared_vfio:
+            util_candidates.append(dev.vfio_device)
+        if rt_id:
+            util_candidates.append(rt_id)
+
+        matched_key: Optional[str] = None
+        for key in util_candidates:
+            if key and key in util_rows:
+                matched_key = key
+                break
+        prospective_util_key[dev.pci_bdf] = matched_key
+        if matched_key is not None:
+            util_key_claimants.setdefault(matched_key, []).append(dev.pci_bdf)
+
+    ambiguous_util_keys = {k for k, bdfs in util_key_claimants.items() if len(bdfs) > 1}
+
     for dev in devices:
         dev_real_vfio = str(dev_root / "vfio" / dev.iommu_group) if dev.iommu_group else ""
         pids = list(proc_pids.get(dev_real_vfio, []))
-        is_shared_vfio = bool(dev.vfio_device and dev.vfio_device in shared_vfio)
+        host_rdev = vfio_rdevs.get(dev_real_vfio) if dev_real_vfio else None
 
         # Attach `TPU Chips` rows strictly by verified /dev/vfio/<group> or PCI BDF.
         chips_row: Optional[_TpuInfoRow] = None
@@ -674,36 +751,25 @@ def collect_snapshot(
 
         if chips_row is not None:
             dev.telemetry_source = "tpu-info"
-            for p in chips_row.pids:
-                if p not in pids:
-                    pids.append(p)
+            # Verify each CLI-reported PID actually holds an open character device
+            # matching the host VFIO node's `st_rdev` (upstream `tpu-info` matches
+            # pathnames only and can pick up decoy regular files in other mount ns).
+            if host_rdev is not None:
+                for p in chips_row.pids:
+                    if p not in pids and _pid_holds_vfio_rdev(proc_root, p, host_rdev):
+                        pids.append(p)
 
-        # Attach `TPU Runtime Utilization` rows strictly via verified hardware/map IDs
-        # (pci_bdf, unique non-shared vfio_device, sysfs chip_id, or explicit chip_id_map).
-        # Never infer runtime chip IDs from PCI enumeration order, IOMMU group numbers,
-        # or a VFIO path shared by multiple chips.
-        verified_runtime_id = dev.runtime_chip_id
-        if not verified_runtime_id and chip_id_map:
-            verified_runtime_id = chip_id_map.get(dev.pci_bdf)
-            if verified_runtime_id is None and not is_shared_vfio and dev.vfio_device:
-                verified_runtime_id = chip_id_map.get(dev.vfio_device)
-            if verified_runtime_id is not None:
-                verified_runtime_id = str(verified_runtime_id)
-        if verified_runtime_id:
-            dev.runtime_chip_id = verified_runtime_id
+        rt_id = resolved_rt_ids.get(dev.pci_bdf)
+        if rt_id in ambiguous_rt_ids:
+            dev.runtime_chip_id = None
+        elif rt_id:
+            dev.runtime_chip_id = rt_id
 
-        util_candidates: List[str] = [dev.pci_bdf]
-        if dev.vfio_device and not is_shared_vfio:
-            util_candidates.append(dev.vfio_device)
-        if verified_runtime_id:
-            util_candidates.append(verified_runtime_id)
-
+        matched_key = prospective_util_key.get(dev.pci_bdf)
         matched_util: Optional[_TpuInfoRow] = None
-        for key in util_candidates:
-            if key and key in util_rows:
-                matched_util = util_rows[key]
-                mapped_util_keys[key] = dev.pci_bdf
-                break
+        if matched_key is not None and matched_key not in ambiguous_util_keys:
+            matched_util = util_rows[matched_key]
+            mapped_util_keys[matched_key] = dev.pci_bdf
 
         if matched_util is not None:
             if (
@@ -1209,14 +1275,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--health-host",
-        default=None,
-        help="Bind address for optional dedicated health listener (default: same as --host).",
+        default="127.0.0.1",
+        help="Bind address for optional dedicated health listener (default: 127.0.0.1, loopback-only).",
     )
     parser.add_argument(
         "--health-port",
         type=int,
         default=None,
-        help="Optional dedicated HTTP port for /healthz and /readyz isolated from scrape saturation.",
+        help="Optional dedicated loopback HTTP port for /healthz and /readyz isolated from scrape and pod-network traffic.",
     )
     parser.add_argument(
         "--once",
@@ -1324,7 +1390,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     health_server: Optional[_HealthServer] = None
     health_thread: Optional[threading.Thread] = None
     if args.health_port is not None:
-        health_host = args.health_host if args.health_host is not None else args.host
+        health_host = args.health_host
         health_server = _HealthServer((health_host, args.health_port))
         health_thread = threading.Thread(target=health_server.serve_forever, daemon=True)
         health_thread.start()
