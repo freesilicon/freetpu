@@ -4,21 +4,21 @@ These queries mirror standard NVIDIA `dcgm-exporter` dashboards for VFIO-backed 
 
 ## Fleet Inventory & Health
 
-> **Deduplication note:** `prometheus-scrape.yml` attaches a stable `node` label (and `collector_role="node"|"workload-sidecar"`) to every scraped target. The fleet inventory, health, coverage, and spend queries below deduplicate by `(generation, node, pci_bdf)` so running both the node DaemonSet and one or more workload telemetry sidecars on the same node counts every physical TPU chip **exactly once**.
+> **Trust & deduplication note:** `prometheus-scrape.yml` splits Kubernetes scraping into a trusted `freetpu-node-exporter` job (scoped by Kubernetes-enforced `kube-system` DaemonSet `freetpu-node-agent` ownership and hard-setting `collector_role="node"`) and a `freetpu-workload-sidecar` job (hard-setting `collector_role="workload-sidecar"` and allowlisting only utilization/HBM series). The inventory, health, reservation, coverage, and spend queries below filter trusted node inventory with `collector_role="node"` and deduplicate by `(generation, node, pci_bdf)` so tenant pods cannot fabricate inventory or host PIDs and every physical TPU chip is counted **exactly once**.
 
 ```promql
 # Total discovered physical TPU chips per generation across scraped nodes
 count by (generation) (
-  group by (generation, node, pci_bdf) (freetpu_tpu_info)
+  group by (generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node"})
 )
 
 # Total VFIO-ready physical TPU chips per generation across the cluster
 count by (generation) (
-  min by (generation, node, pci_bdf) (freetpu_tpu_health_status) == 1
+  min by (generation, node, pci_bdf) (freetpu_tpu_health_status{collector_role="node"}) == 1
 )
 
 # Unhealthy or unbound TPU chips (vfio-pci / /dev/vfio/<group> missing)
-min by (generation, node, pci_bdf) (freetpu_tpu_health_status) == 0
+min by (generation, node, pci_bdf) (freetpu_tpu_health_status{collector_role="node"}) == 0
 ```
 
 ## Compute & HBM Utilization
@@ -75,14 +75,22 @@ sum_over_time(
       max by (generation, node, pci_bdf) (
         freetpu_tpu_active_pids{collector_role="node"}
         and on (node, vfio_device)
-        (count by (node, vfio_device) (group by (node, vfio_device, pci_bdf) (freetpu_tpu_info)) == 1)
+        (count by (node, vfio_device) (group by (node, vfio_device, pci_bdf) (freetpu_tpu_info{collector_role="node"})) == 1)
       ) > 0,
       1
     )
     or
-    ((max by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent) > 1) * 0 + 1)
+    (
+      ((max by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent) > 1) * 0 + 1)
+      and on (generation, node, pci_bdf)
+      group by (generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node"})
+    )
     or
-    ((max by (generation, node, pci_bdf) (freetpu_tpu_hbm_used_bytes) > 0) * 0 + 1)
+    (
+      ((max by (generation, node, pci_bdf) (freetpu_tpu_hbm_used_bytes) > 0) * 0 + 1)
+      and on (generation, node, pci_bdf)
+      group by (generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node"})
+    )
   )[24h:1m]
 ) / 60
 
@@ -93,7 +101,7 @@ sum_over_time(
     max by (generation, node, vfio_device) (
       freetpu_tpu_active_pids{collector_role="node"}
       and on (node, vfio_device)
-      (count by (node, vfio_device) (group by (node, vfio_device, pci_bdf) (freetpu_tpu_info)) > 1)
+      (count by (node, vfio_device) (group by (node, vfio_device, pci_bdf) (freetpu_tpu_info{collector_role="node"})) > 1)
     ) > 0,
     1
   )[24h:1m]
@@ -134,50 +142,77 @@ sum_over_time(
 )
 
 # Duty-cycle telemetry coverage ratio per generation (0.0 - 1.0).
-# Deduplicates physical chips by (generation, node, pci_bdf) across node
-# DaemonSet and workload sidecar targets, and supplies a `0` numerator for any
-# discovered generation with zero PCI-mapped duty-cycle readings so low-coverage
-# alerts still fire when coverage is 0.
+# Restricts inventory to trusted node DaemonSet series (`collector_role="node"`),
+# deduplicates physical chips by (generation, node, pci_bdf), and supplies a `0`
+# numerator for any discovered generation with zero PCI-mapped duty-cycle readings
+# so low-coverage alerts still fire when coverage is 0.
 (
   (
-    count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent))
+    count by (generation) (
+      group by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent)
+      and on (generation, node, pci_bdf)
+      group by (generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node"})
+    )
     or
-    (0 * count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_info)))
+    (0 * count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node"})))
   )
   /
-  count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_info))
+  count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node"}))
 )
 
 # Inventory-based estimated hourly TPU spend by generation across scraped nodes.
-# Counts each physical PCI chip ONCE via `group by (generation, node, pci_bdf)`
-# on `freetpu_tpu_info` (never double-counting when a node runs both the
-# DaemonSet and workload sidecars, and still counting unhealthy/unbound chips
-# that Google Cloud bills while the TPU node is READY).
+# Counts each trusted physical PCI chip ONCE via `collector_role="node"` and
+# `group by (generation, node, pci_bdf)` on `freetpu_tpu_info` (never trusting
+# tenant sidecar inventory, never double-counting, and still counting
+# unhealthy/unbound chips that Google Cloud bills while the TPU node is READY).
+# Includes PF-only Trillium nodes (`generation="v6e-pf"`, PCI 0x006e) at the
+# Trillium rate alongside VF Trillium nodes (`generation="v6e"`, PCI 0x006f).
 # Replace the placeholder per-chip hourly SKU rates (v5e: 1.20, v5p: 4.20,
-# v6e: 2.70) with your contract/spot/on-demand rates; use Google Cloud billing
-# or billable node inventory for authoritative chargeback.
+# v6e/v6e-pf: 2.70) with your contract/spot/on-demand rates; use Google Cloud
+# billing or billable node inventory for authoritative chargeback.
 (
-  count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_info{generation="v5e"})) * 1.20
+  count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node", generation="v5e"})) * 1.20
   or
-  count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_info{generation="v5p"})) * 4.20
+  count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node", generation="v5p"})) * 4.20
   or
-  count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_info{generation="v6e"})) * 2.70
+  count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node", generation=~"v6e|v6e-pf"})) * 2.70
 )
 
 # Measured-chip effective cost per utilized TPU-hour by generation.
-# Restricts BOTH numerator and denominator to deduplicated physical chips
-# `(generation, node, pci_bdf)` with usable, PCI-mapped
-# `freetpu_tpu_duty_cycle_percent` readings, and filters strictly to positive
+# Restricts BOTH numerator and denominator to deduplicated, node-verified
+# physical chips `(generation, node, pci_bdf)` with usable, PCI-mapped
+# `freetpu_tpu_duty_cycle_percent` readings (including PF-only `v6e-pf` when a
+# PF-aware collector reports duty cycle), and filters strictly to positive
 # total utilization (`> 0`) so zero-utilization generations are omitted rather
 # than reporting a synthetic finite cost and low positive utilizations divide by
 # their true measured value. Replace the placeholder SKU rates (v5e: 1.20,
-# v5p: 4.20, v6e: 2.70) with your rates, and check the telemetry coverage ratio
-# above before extrapolating fleet-wide.
+# v5p: 4.20, v6e/v6e-pf: 2.70) with your rates, and check the telemetry coverage
+# ratio above before extrapolating fleet-wide.
 (
-  count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent{generation="v5e"})) * 1.20
+  count by (generation) (
+    group by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent{generation="v5e"})
+    and on (generation, node, pci_bdf)
+    group by (generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node"})
+  ) * 1.20
   or
-  count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent{generation="v5p"})) * 4.20
+  count by (generation) (
+    group by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent{generation="v5p"})
+    and on (generation, node, pci_bdf)
+    group by (generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node"})
+  ) * 4.20
   or
-  count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent{generation="v6e"})) * 2.70
-) / (sum by (generation) (max by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent) / 100) > 0)
+  count by (generation) (
+    group by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent{generation=~"v6e|v6e-pf"})
+    and on (generation, node, pci_bdf)
+    group by (generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node"})
+  ) * 2.70
+) / (
+  sum by (generation) (
+    (
+      max by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent)
+      and on (generation, node, pci_bdf)
+      group by (generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node"})
+    ) / 100
+  ) > 0
+)
 ```

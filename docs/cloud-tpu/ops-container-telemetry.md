@@ -88,17 +88,18 @@ See [`ops/tpu-exporter/prometheus-scrape.yml`](../../ops/tpu-exporter/prometheus
 `freetpu-cdi` defaults to the boot-scoped CNCF CDI dynamic directory (`/var/run/cdi/freetpu.json`, tmpfs on Linux) so stale IOMMU group assignments never persist across reboots. Avoid persisting static specs in `/etc/cdi` across reboots or PCI/VFIO topology changes.
 
 ```bash
-# Write boot-scoped /var/run/cdi/freetpu.json and validate against CNCF CDI v0.6.0 rules
+# Recommended on mutable hosts: continuously reconcile /var/run/cdi/freetpu.json
+# (rewrites on VFIO minor/topology change so CDI 0.8.0 drops cached devnums; unlinks on drift/error)
+sudo python3 ops/tpu-cdi/freetpu_cdi.py sync --output /var/run/cdi/freetpu.json --interval 15
+
+# One-shot boot/topology snapshot (MUST be removed and regenerated on any VFIO/PCI rebind or topology change)
 sudo python3 ops/tpu-cdi/freetpu_cdi.py generate --output /var/run/cdi/freetpu.json --validate
 
 # Preview CDI JSON to stdout (dry-run --allow-missing-vfio requires --stdout and never writes to disk)
 python3 ops/tpu-cdi/freetpu_cdi.py generate --stdout --validate
 
-# Revalidate an existing CDI spec against live host VFIO group identity (removing it if stale)
+# Revalidate an existing CDI spec against live host VFIO group identity and char st_rdev (removing it if stale)
 sudo python3 ops/tpu-cdi/freetpu_cdi.py validate /var/run/cdi/freetpu.json --check-host --remove-if-stale
-
-# Continuously reconcile /var/run/cdi/freetpu.json on live VFIO topology changes (invalidating on drift/error)
-sudo python3 ops/tpu-cdi/freetpu_cdi.py sync --output /var/run/cdi/freetpu.json --interval 15
 ```
 
 Generated CDI devices (VFIO-backed `v5e`, `v5p`, `v6e` Trillium hosts only):
@@ -108,7 +109,7 @@ Generated CDI devices (VFIO-backed `v5e`, `v5p`, `v6e` Trillium hosts only):
 
 Safety & runtime guarantees:
 - **Full IOMMU group verification & live host revalidation:** `freetpu-cdi` inspects every PCI member of each TPU's IOMMU group (both `/sys/bus/pci/devices/*/iommu_group` and `/sys/kernel/iommu_groups/<group>/devices/*`) and fails closed if any group also contains a non-TPU PCI device, preventing accidental VFIO exposure through any selector (including `all`). Failed regenerations unlink stale specs at `--output`, `validate --check-host --remove-if-stale` verifies all effective global and per-device `hostPath` nodes against live host VFIO groups (rejecting pinned `major`/`minor` numbers, unauthorized global nodes, and unchecked `mounts` or OCI `hooks`), and `sync` continuously reconciles or invalidates `/var/run/cdi/freetpu.json` if group assignments change.
-- **Dynamic VFIO device numbers & CDI cache refresh:** Generated `deviceNodes` intentionally omit `major` and `minor` so containerd/CDI resolves live device numbers from `hostPath` at container start, while live observed char device numbers are recorded in `freetpu.dev/vfio-devnums` annotations so a driver rebind that changes dynamic VFIO minors updates the spec on disk and triggers containerd 2.0 / CDI 0.8.0 to refresh its device cache.
+- **Dynamic VFIO device numbers & CDI v0.8.0 cache invalidation:** Generated `deviceNodes` intentionally omit static `major`/`minor` numbers, while live observed char device numbers (`st_rdev`) are recorded in `freetpu.dev/vfio-devnums` annotations. Because CDI v0.8.0 (containerd 2.0) resolves omitted `major`/`minor` numbers on **first injection** and caches them in the loaded device entry until the spec file changes or is removed, a driver rebind without a spec refresh can leave subsequent containers injecting stale minor numbers (potentially pointing to a reassigned IOMMU group). Operators **must** either run `freetpu_cdi.py sync` continuously (as in `k8s-tpu-cdi-daemonset.yaml`), explicitly invalidate (remove) and regenerate `/var/run/cdi/freetpu.json` as part of every PCI/VFIO unbind, rebind, or topology change when using one-shot `generate`, or use a CDI runtime that re-resolves `hostPath` device numbers on every injection.
 
 ### Docker / Podman / containerd Usage
 

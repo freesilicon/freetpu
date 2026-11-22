@@ -146,7 +146,7 @@ class FreeTpuCdiTests(unittest.TestCase):
                 spec["devices"][0]["containerEdits"]["deviceNodes"][0]["path"],
                 "/dev/vfio/0",
             )
-            # Device numbers must be omitted so CDI resolves them dynamically at container start.
+            # Device numbers are omitted from deviceNodes (with live st_rdev tracked in annotations to invalidate CDI caches on rebind).
             for node in (
                 spec["containerEdits"]["deviceNodes"]
                 + spec["devices"][0]["containerEdits"]["deviceNodes"]
@@ -1027,6 +1027,74 @@ class FreeTpuCdiTests(unittest.TestCase):
                 )
                 self.assertTrue(ok3, msg3)
                 self.assertTrue(spec_path.exists())
+
+    def test_custom_kind_grammar_matches_cdi_runtime_parser(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sysfs_root, dev_root = _make_mock_pci_vfio(
+                root,
+                devices=[
+                    {
+                        "bdf": "0000:00:06.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0063",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                    }
+                ],
+                create_vfio_nodes=["0"],
+            )
+            with _mock_vfio_char_devices():
+                chips, vfio_container = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                base_spec = freetpu_cdi.build_cdi_spec(chips, vfio_container)
+
+                # Invalid CDI kinds rejected by containerd's CDI parser (digit-leading vendor/class, trailing punctuation).
+                invalid_kinds = [
+                    "1vendor/tpu",
+                    "freetpu.dev/1tpu",
+                    "0example.com/0tpu",
+                    "freetpu.dev-/tpu",
+                    "freetpu.dev/tpu_",
+                    ".freetpu.dev/tpu",
+                    "freetpu.dev/.tpu",
+                ]
+                for bad_kind in invalid_kinds:
+                    with self.assertRaisesRegex(ValueError, "Invalid CDI kind"):
+                        freetpu_cdi.build_cdi_spec(chips, vfio_container, kind=bad_kind)
+
+                    bad_spec = json.loads(json.dumps(base_spec))
+                    bad_spec["kind"] = bad_kind
+                    errs = freetpu_cdi.validate_cdi_spec(bad_spec)
+                    self.assertTrue(
+                        any("kind" in e for e in errs),
+                        f"expected validate_cdi_spec to reject kind={bad_kind!r}, got {errs}",
+                    )
+
+                    out_path = root / "var" / "run" / "cdi" / "bad.json"
+                    rc, _out, err = _run_cli_inproc(
+                        [
+                            "generate",
+                            "--kind",
+                            bad_kind,
+                            "--validate",
+                            "--output",
+                            str(out_path),
+                            "--sysfs-root",
+                            str(sysfs_root),
+                            "--dev-root",
+                            str(dev_root),
+                        ]
+                    )
+                    self.assertNotEqual(rc, 0, f"CLI generate should reject kind={bad_kind!r}")
+                    self.assertIn("Invalid CDI kind", err)
+                    self.assertFalse(out_path.exists())
+
+                # Valid CDI kinds accepted by containerd's CDI parser.
+                for good_kind in ["freetpu.dev/tpu", "Example_Org.io/TPU-v6e", "a/b", "v1.org/tpu0"]:
+                    spec = freetpu_cdi.build_cdi_spec(chips, vfio_container, kind=good_kind)
+                    self.assertEqual(freetpu_cdi.validate_cdi_spec(spec), [])
 
 
 if __name__ == "__main__":

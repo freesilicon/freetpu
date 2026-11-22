@@ -1,23 +1,26 @@
 # `freetpu-cdi` — Open CNCF CDI Toolkit for Cloud TPUs
 
-`freetpu_cdi.py` is an open, zero-dependency CNCF Container Device Interface (CDI v0.6.0) spec generator for VFIO-backed Google Cloud TPUs (`v5e`, `v5p`, `v6e` Trillium bound to `vfio-pci`, analogous to `nvidia-ctk cdi generate`). It scans `/sys/bus/pci/devices/*` (`vendor=0x1ae0`) and `/dev/vfio/*`, verifies full IOMMU group isolation, omits static `major`/`minor` numbers so CDI resolves live VFIO device numbers from `hostPath` at container start, and emits a boot-scoped spec at `/var/run/cdi/freetpu.json` (tmpfs, cleared across reboots) so Docker, Podman, containerd (`>= 2.0`), and Kubernetes can attach TPU chips cleanly without privileged host-network/host-device hacks.
+`freetpu_cdi.py` is an open, zero-dependency CNCF Container Device Interface (CDI v0.6.0) spec generator for VFIO-backed Google Cloud TPUs (`v5e`, `v5p`, `v6e` Trillium bound to `vfio-pci`, analogous to `nvidia-ctk cdi generate`). It scans `/sys/bus/pci/devices/*` (`vendor=0x1ae0`) and `/dev/vfio/*`, verifies full IOMMU group isolation, omits static `major`/`minor` numbers from `deviceNodes` while tracking live char device numbers in `freetpu.dev/vfio-devnums` annotations, and emits a boot-scoped spec at `/var/run/cdi/freetpu.json` (tmpfs, cleared across reboots) so Docker, Podman, containerd (`>= 2.0`), and Kubernetes can attach TPU chips cleanly without privileged host-network/host-device hacks.
 
 > **Scope note:** Legacy `/dev/accel*` Cloud TPU hosts (e.g. Cloud TPU `v2`, `v3`, `v4` using Google's `accel` driver instead of `vfio-pci`) are not supported by VFIO CDI passthrough.
+
+> **CDI v0.8.0 (containerd 2.0) rebind safety:** CDI v0.8.0 resolves omitted `major`/`minor` device numbers on **first injection** and caches them in the loaded device entry until the spec file on disk changes or is removed. On any host where PCI/VFIO drivers may be unbound or rebound, run `freetpu_cdi.py sync` continuously (as configured in `k8s-tpu-cdi-daemonset.yaml`). If you use the one-shot `generate` workflow instead, you **must** invalidate (unlink) and regenerate `/var/run/cdi/freetpu.json` as part of any PCI/VFIO unbind, rebind, or topology change (or use a CDI runtime that re-resolves `hostPath` device numbers on every injection).
 
 ## Quickstart
 
 ```bash
-# 1. Generate and validate boot-scoped /var/run/cdi/freetpu.json on a Cloud TPU VM
+# 1. Recommended on mutable hosts: continuously reconcile /var/run/cdi/freetpu.json
+#    (atomically rewrites on VFIO minor/topology change so CDI drops cached devnums; removes if unsafe)
+sudo python3 ops/tpu-cdi/freetpu_cdi.py sync --output /var/run/cdi/freetpu.json --interval 15
+
+# 2. One-shot boot/topology snapshot (MUST be removed and regenerated on any VFIO/PCI rebind or topology change)
 sudo python3 ops/tpu-cdi/freetpu_cdi.py generate --output /var/run/cdi/freetpu.json --validate
 
-# 2. Preview to stdout without writing /var/run/cdi (dry-run --allow-missing-vfio requires --stdout)
+# 3. Preview to stdout without writing /var/run/cdi (dry-run --allow-missing-vfio requires --stdout)
 python3 ops/tpu-cdi/freetpu_cdi.py generate --stdout --validate
 
-# 3. Validate an existing CDI spec against CDI v0.6.0 AND live host VFIO group identity
+# 4. Validate an existing CDI spec against CDI v0.6.0, live host VFIO group identity, and live st_rdev
 sudo python3 ops/tpu-cdi/freetpu_cdi.py validate /var/run/cdi/freetpu.json --check-host --remove-if-stale
-
-# 4. Continuously reconcile /var/run/cdi/freetpu.json (atomically updates on change, removes if stale/unsafe)
-sudo python3 ops/tpu-cdi/freetpu_cdi.py sync --output /var/run/cdi/freetpu.json --interval 15
 ```
 
 ## Docker / Podman / nerdctl Passthrough
@@ -50,7 +53,7 @@ docker run --rm \
   python3 -c "import os; print(os.listdir('/dev/vfio'))"
 ```
 
-Note on IOMMU groups & stable selectors: single-chip selectors use stable PCI BDF names (`freetpu.dev/tpu=pci-<bdf>`) so a disappearing chip retires its selector instead of reassigning it to a different chip. If multiple TPU chips share one `/dev/vfio/<iommu_group>` node, `freetpu-cdi` exposes that group strictly as a single allocation unit (`freetpu.dev/tpu=group-pci-<bdf1>_<bdf2>`) plus `freetpu.dev/tpu=all`. If any TPU's IOMMU group also contains a non-TPU PCI device, `freetpu-cdi` fails closed rather than publishing any selector (including `all`) that would expose that non-TPU device. Live VFIO char `major:minor` numbers are tracked in `freetpu.dev/vfio-devnums` annotations (while omitted from `deviceNodes`) so `sync` triggers a spec refresh for containerd 2.0 / CDI 0.8.0 whenever driver rebinds change dynamic VFIO minors.
+Note on IOMMU groups & stable selectors: single-chip selectors use stable PCI BDF names (`freetpu.dev/tpu=pci-<bdf>`) so a disappearing chip retires its selector instead of reassigning it to a different chip. If multiple TPU chips share one `/dev/vfio/<iommu_group>` node, `freetpu-cdi` exposes that group strictly as a single allocation unit (`freetpu.dev/tpu=group-pci-<bdf1>_<bdf2>`) plus `freetpu.dev/tpu=all`. If any TPU's IOMMU group also contains a non-TPU PCI device, `freetpu-cdi` fails closed rather than publishing any selector (including `all`) that would expose that non-TPU device. Live VFIO char `major:minor` numbers are tracked in `freetpu.dev/vfio-devnums` annotations (while omitted from `deviceNodes`) so `sync` rewrites `/var/run/cdi/freetpu.json` whenever driver rebinds change dynamic VFIO minors, forcing containerd 2.0 / CDI 0.8.0 to drop its first-injection cached device numbers; one-shot `generate` requires explicit invalidation and regeneration on any driver rebind or topology change.
 
 ## Kubernetes Manifests
 

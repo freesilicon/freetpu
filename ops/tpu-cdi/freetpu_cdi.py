@@ -52,9 +52,11 @@ TPU_PCI_DEVICES: Dict[str, Tuple[str, str]] = {
     "0x006f": ("v6e", "TPU v6e (Trillium)"),
 }
 
-# CNCF CDI v0.6.0 spec grammar rules.
+# CNCF CDI v0.6.0 / v0.8.0 parser grammar (ValidateVendorName / ValidateClassName):
+# vendor and class must each start with an ASCII letter, contain only
+# [A-Za-z0-9_.-], and end with an ASCII letter or digit.
 _CDI_KIND_RE = re.compile(
-    r"^[a-z0-9]+([.-][a-z0-9]+)*/[a-zA-Z0-9]+([._-][a-zA-Z0-9]+)*$"
+    r"^[A-Za-z](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?/[A-Za-z](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?$"
 )
 _CDI_DEVICE_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
 _ALLOWED_CONTAINER_EDITS_KEYS = frozenset(
@@ -122,9 +124,14 @@ def _make_device_node(
     *,
     permissions: str = "rw",
 ) -> Dict[str, Any]:
-    # Omit major and minor intentionally: Linux allocates VFIO group minor
-    # numbers dynamically and independently of IOMMU group IDs, so CDI must
-    # resolve live device numbers from hostPath at container injection time.
+    # Omit static major/minor from deviceNodes (Linux allocates VFIO group minor
+    # numbers dynamically and independently of IOMMU group IDs), while recording
+    # live char device numbers in `freetpu.dev/vfio-devnums` annotations.
+    # Note: CDI v0.8.0 (containerd 2.0) resolves omitted major/minor on first
+    # injection and caches them in memory until the spec file changes or is
+    # removed; run `freetpu_cdi.py sync` continuously or explicitly invalidate
+    # and regenerate the spec on any VFIO/PCI unbind, rebind, or topology change
+    # (or use a CDI runtime that resolves hostPath on every injection).
     return {
         "path": container_path,
         "hostPath": str(host_path),
@@ -299,6 +306,11 @@ def build_cdi_spec(
     kind: str = CDI_KIND,
 ) -> Dict[str, Any]:
     """Build a CNCF CDI v0.6.0 JSON specification dictionary."""
+    if not isinstance(kind, str) or not _CDI_KIND_RE.match(kind):
+        raise ValueError(
+            f"Invalid CDI kind {kind!r}: vendor and class must each start with an ASCII letter, "
+            "contain only [A-Za-z0-9_.-], and end with an ASCII letter or digit"
+        )
     if not chips:
         raise ValueError("Cannot build CDI spec with zero discovered TPU chips")
 
@@ -999,7 +1011,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     gen = sub.add_parser(
         "generate",
-        help="Scan PCI 0x1ae0 + /dev/vfio/* and emit boot-scoped CNCF CDI v0.6.0 JSON.",
+        help=(
+            "Write a point-in-time boot/topology CNCF CDI v0.6.0 JSON snapshot "
+            "(invalidate & regenerate on any VFIO/PCI rebind or topology change, or use `sync`)."
+        ),
     )
     gen.add_argument(
         "--output",
