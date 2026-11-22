@@ -123,7 +123,9 @@ adb -s <node1_serial> shell "su -c 'OPENBUENOS_DIVE_INTERP_PATH=/data/local/tmp/
 | **Loopback TCP (`127.0.0.1`)** | `~20–45 us` 1-way (`~40–90 us` RTT) | `~1–3 GB/s` | Baseline software stack floor |
 | **Loopback `ggml-rpc` (`rango`)** | `512–1,774 us` RPC RTT | — | `pp128 = 45.50 t/s` (`Qwen2.5-1.5B-Q8_0`) |
 | **USB 2.0 ADB Double-Hop Bridge** | `5,159–10,874 us` RPC RTT | `<40 MB/s` | Bottlenecked by USB 2.0 hub + ADB relay |
-| **USB-C 3.2 NCM / 2.5GbE Direct** | `<500 us` target | `~0.3–1.1 GB/s` | Eliminates ADB double-hop for `>16 GB` models |
+| **USB-C 2.5GbE Direct Ethernet** | `<500 us` target | `~0.25–0.30 GB/s` | `0.3125 GB/s` raw line-rate ceiling (half-duplex ping-pong) |
+| **USB-C 5GbE Direct Ethernet** | `<500 us` target | `~0.50–0.60 GB/s` | `0.625 GB/s` raw line-rate ceiling (half-duplex ping-pong) |
+| **USB-C 3.2 NCM Direct (Gadget)** | `<500 us` target | `~0.4–0.5 GB/s` (Gen 1 `5 Gbps`) / `~0.8–1.1 GB/s` (Gen 2 `10 Gbps`) | Depends on negotiated USB 3.2 link speed; eliminates ADB double-hop |
 
 ---
 

@@ -64,7 +64,7 @@ BENCH_JSON_END = "=== FREETPU_BENCH_JSON_END ==="
 VALID_SUITES = ("compute", "bandwidth", "comms")
 VALID_BACKENDS = ("cpu", "buenos_mock", "jax_tpu", "colab_tpu")
 
-_ALLOCATION_ERROR_MARKERS = (
+_DEFINITIVE_ALLOCATION_REFUSAL_MARKERS = (
     "allocation refused",
     "backend rejected accelerator",
     "toomanyassignmentserror",
@@ -77,9 +77,6 @@ _ALLOCATION_ERROR_MARKERS = (
     "quota or entitlement",
     "too many active sessions",
     "no backends",
-    "read timed out",
-    "readtimeout",
-    "503",
 )
 
 
@@ -296,7 +293,7 @@ def run_compute_local(backend: str, quick: bool = False) -> Dict[str, Any]:
             **st,
         })
 
-        # 2. INT8 GEMM (FP32-RNE requantization on buenos_mock)
+        # 2. INT32-widened integer GEMM reference from INT8 operands (+ FP32-RNE requant on buenos_mock)
         a_i8 = rng.integers(-64, 64, size=(m, k), dtype=np.int8)
         b_i8 = rng.integers(-64, 64, size=(k, n), dtype=np.int8)
         scale = np.float32(1.0 / max(1, k))
@@ -314,10 +311,16 @@ def run_compute_local(backend: str, quick: bool = False) -> Dict[str, Any]:
         st = _stats_summary(samples_us)
         med_s = max(st["median_us"] * 1e-6, 1e-9)
         min_s = max(st["min_us"] * 1e-6, 1e-9)
+        int_basis = (
+            "INT32-widened ref from INT8 + FP32-RNE requant (includes operand widening overhead)"
+            if backend == "buenos_mock"
+            else "INT32-widened ref from INT8 (includes operand widening overhead)"
+        )
         cases.append({
-            "name": "gemm_int8",
+            "name": "gemm_int32_ref_from_int8" if backend == "cpu" else "gemm_int32_mock_from_int8",
             "shape": [m, k, n],
-            "dtype": "int8",
+            "dtype": "int8->int32_ref" if backend == "cpu" else "int8->int32_rne_mock",
+            "precision_basis": int_basis,
             "unit": "TOPS",
             "median_perf": round((flops / med_s) / 1e12, 6),
             "peak_perf": round((flops / min_s) / 1e12, 6),
@@ -374,13 +377,20 @@ def run_compute_local(backend: str, quick: bool = False) -> Dict[str, Any]:
     # Dispatch floor is the median latency of the smallest 1x64x32 op.
     floor_cases = [c for c in cases if c["shape"] == [1, 64, 32] and c["name"].startswith("gemm_fp32")]
     peak_fp32 = max((c["peak_perf"] for c in cases if c["unit"] == "TFLOP/s"), default=0.0)
-    peak_int8 = max((c["peak_perf"] for c in cases if c["unit"] == "TOPS"), default=0.0)
+    peak_int32_ref = max((c["peak_perf"] for c in cases if c["unit"] == "TOPS"), default=0.0)
+    int_basis = (
+        "INT32-widened ref from INT8 + FP32-RNE requant (includes operand widening overhead)"
+        if backend == "buenos_mock"
+        else "INT32-widened ref from INT8 (includes operand widening overhead)"
+    )
     return {
         "status": "measured",
         "backend": backend,
         "peak_bf16_tflops": None,
         "peak_fp32_tflops": round(peak_fp32, 4),
-        "peak_int8_tops": round(peak_int8, 4),
+        "peak_int8_tops": None,
+        "peak_int32_ref_tops": round(peak_int32_ref, 4),
+        "int_precision_basis": int_basis,
         "dispatch_floor_us": floor_cases[0]["median_us"] if floor_cases else None,
         "cases": cases,
     }
@@ -955,12 +965,17 @@ def extract_bench_json(stdout: str) -> Optional[Dict[str, Any]]:
 
 
 def is_colab_allocation_error(returncode: int, stderr: str) -> bool:
+    """Return True only for definitive allocation refusals where no runtime was assigned.
+
+    Ambiguous failures (timeouts, HTTP 502/503/504, connection resets) return False
+    because the server may have created a billable runtime before the error.
+    """
     if returncode == 0:
         return False
     low = stderr.lower()
     if "[colab] session ready" in low:
         return False
-    return any(marker in low for marker in _ALLOCATION_ERROR_MARKERS)
+    return any(marker in low for marker in _DEFINITIVE_ALLOCATION_REFUSAL_MARKERS)
 
 
 def build_colab_run_commands(
@@ -1145,6 +1160,7 @@ def _verify_and_stop_session(
     session_name: str,
     pre_endpoints: Optional[Set[str]] = None,
     session_was_ready: bool = False,
+    definitive_refusal: bool = False,
 ) -> Tuple[bool, Optional[str], List[str], List[str], List[str]]:
     """Stop a Colab runtime and verify its backend endpoint disappeared.
 
@@ -1181,7 +1197,11 @@ def _verify_and_stop_session(
         or session_was_ready
     )
     if not needs_stop:
-        # Allocation did not create a named session for this run (e.g. HTTP 412 refusal);
+        if new_unattributed and not definitive_refusal:
+            # Ambiguous allocation failure (e.g. ReadTimeout or HTTP 503) followed by a new `[?]`
+            # assignment: server may have allocated a runtime before the client error.
+            return False, observed_endpoint, [], [], sorted(new_unattributed)
+        # Definitive allocation refusal did not create a runtime for this run;
         # keep any concurrently started `[?]` assignments unattributed so fallback is not blocked.
         return True, observed_endpoint, [], [], sorted(new_unattributed)
 
@@ -1354,6 +1374,11 @@ def run_colab_tpu_suites(
                         (res is not None and (res.returncode == 0 or "[colab] session ready" in res.stderr.lower()))
                         or (interrupted is not None)
                     )
+                    definitive_refusal = (
+                        res is not None
+                        and interrupted is None
+                        and is_colab_allocation_error(res.returncode, res.stderr)
+                    )
                     try:
                         (
                             teardown_verified,
@@ -1369,6 +1394,7 @@ def run_colab_tpu_suites(
                             sess,
                             pre_endpoints=pre_endpoints,
                             session_was_ready=session_was_ready,
+                            definitive_refusal=definitive_refusal,
                         )
                     except BaseException:
                         preserve_tmp_dir = True
@@ -1642,6 +1668,7 @@ def build_scorecard_rows(
         bf16_tf = comp.get("peak_bf16_tflops")
         fp32_tf = comp.get("peak_fp32_tflops")
         int8_tops = comp.get("peak_int8_tops")
+        int32_ref_tops = comp.get("peak_int32_ref_tops")
         bw_gbps = bw.get("peak_triad_gbps")
         floor_us = comp.get("dispatch_floor_us")
         hop_us = comms.get("hop_floor_us")
@@ -1662,6 +1689,7 @@ def build_scorecard_rows(
             "bf16_tflops": bf16_tf,
             "fp32_tflops": fp32_tf,
             "int8_tops": int8_tops,
+            "int32_ref_tops": int32_ref_tops,
             "bw_gbps": bw_gbps,
             "dispatch_floor_us": f"{floor_us} us" if floor_us is not None else "—",
             "hop_latency_us": f"{hop_us} us" if hop_us is not None else "—",
@@ -1669,6 +1697,8 @@ def build_scorecard_rows(
             "pricing_basis": cost_basis,
             **econ,
         }
+        if comp.get("int_precision_basis"):
+            host_row["int_precision_basis"] = comp["int_precision_basis"]
         if bw.get("bandwidth_basis"):
             host_row["bw_basis"] = bw["bandwidth_basis"]
         if comms:
@@ -1784,6 +1814,8 @@ def render_markdown(report: Dict[str, Any]) -> str:
         if r.get("int8_tops") is not None:
             int8_tag = "measured" if (is_live or r.get("int8_is_measured")) else "peak-spec"
             int8_s = f"{r['int8_tops']:.2f} ({int8_tag})"
+        elif r.get("int32_ref_tops") is not None:
+            int8_s = f"{r['int32_ref_tops']:.2f} (int32-widened ref)"
         else:
             int8_s = "—"
         if r.get("bw_gbps") is not None:
@@ -1802,7 +1834,7 @@ def render_markdown(report: Dict[str, Any]) -> str:
 
     lines.extend([
         "",
-        f"> **Normalized `$/1M tok` Assumptions**: `{model_gb:.1f} GB` active weight read per token (e.g. Llama-3-8B W8A16), `{bw_eff * 100:.0f}%` memory-bandwidth decode efficiency, `batch_size={batch_size}` (`tok/s = BW * eff * B / model_gb`). Published references distinguish peak spec vs verified silicon runs.",
+        f"> **Normalized `$/1M tok` Assumptions**: `{model_gb:.1f} GB` active weight read per token (e.g. Llama-3-8B W8A16), `{bw_eff * 100:.0f}%` memory-bandwidth decode efficiency, `batch_size={batch_size}` (`tok/s = BW * eff * B / model_gb`). Published references distinguish peak spec vs verified silicon runs. Local host `(int32-widened ref)` cells widen `int8 -> int32` operands inside the timed NumPy matmul (including conversion overhead) rather than executing native INT8 accelerator ops.",
         "",
     ])
 
@@ -1896,9 +1928,12 @@ def run_self_test() -> int:
         assert comp["status"] == "measured"
         assert comp["peak_bf16_tflops"] is None
         assert comp["peak_fp32_tflops"] > 0
-        assert comp["peak_int8_tops"] > 0
+        assert comp["peak_int8_tops"] is None
+        assert comp["peak_int32_ref_tops"] > 0
+        assert "INT32-widened ref" in comp["int_precision_basis"]
         suffix = "ref" if backend == "cpu" else "mock"
         assert any(c["name"] == f"gemm_fp32_{suffix}" and c["dtype"] == "fp32" for c in comp["cases"])
+        assert any(c["name"] == f"gemm_int32_{suffix}_from_int8" and "int32" in c["dtype"] for c in comp["cases"])
         assert any(c["name"] == f"fused_gemm_silu_fp32_{suffix}" for c in comp["cases"])
         assert any(c["name"] == f"gemm_w8a16_dequant_fp32_{suffix}" for c in comp["cases"])
 
@@ -2018,6 +2053,9 @@ def run_self_test() -> int:
     measured_row = next(r for r in report["scorecard"] if r["row_type"] == "measured")
     assert measured_row["bf16_tflops"] is None
     assert measured_row["fp32_tflops"] > 0
+    assert measured_row["int8_tops"] is None
+    assert measured_row["int32_ref_tops"] > 0
+    assert "INT32-widened ref" in measured_row["int_precision_basis"]
     assert "bf16_is_fp32_ref" not in measured_row
     rtx5090_row = next(r for r in report["scorecard"] if r["target"] == "NVIDIA RTX 5090")
     assert rtx5090_row["int8_tops"] == 838.0
@@ -2025,7 +2063,7 @@ def run_self_test() -> int:
     assert sum(1 for r in report["scorecard"] if r["row_type"] == "published-reference") == 5
     md = render_markdown(report)
     assert "`measured`" in md and "`published-reference`" in md
-    assert "(fp32)" in md
+    assert "(fp32)" in md and "(int32-widened ref)" in md
     assert "179.36 (measured)" in md and "655.55 (measured triad)" in md
     assert "989.00 (peak-spec)" in md and "3350.00 (peak-spec)" in md
     assert "27.96 (measured DMA)" in md and "3x eff 2-pass" in md
@@ -2723,6 +2761,60 @@ def run_self_test() -> int:
         assert time.monotonic() - t_oauth < 5.0
     finally:
         shutil.rmtree(oauth_dir, ignore_errors=True)
+
+    # 4m. Ambiguous allocation failure (ReadTimeout / HTTP 503) followed by new `[?]` entry MUST
+    # keep teardown_verified=False, block v5e fallback, and surface inspect-and-confirm recovery hint
+    for ambig_err_msg in ("ReadTimeout: read timed out waiting for assign", "HTTP 503 Service Unavailable"):
+        ambig_calls: List[List[str]] = []
+        ambig_state: Dict[str, Any] = {"tried": False, "cfg": None}
+
+        def _mock_ambig_runner(
+            cmd: Sequence[str], _msg: str = ambig_err_msg
+        ) -> subprocess.CompletedProcess[str]:
+            ambig_calls.append(list(cmd))
+            if "--config" in cmd:
+                ambig_state["cfg"] = cmd[cmd.index("--config") + 1]
+            if cmd[-1] == "version":
+                return subprocess.CompletedProcess(cmd, 0, "Version: 0.8.0\n", "")
+            if "usage" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, "100.0\n", "")
+            if "sessions" in cmd:
+                if ambig_state["tried"]:
+                    return subprocess.CompletedProcess(
+                        cmd,
+                        0,
+                        "[?] m-s-ambig-timeout | Hardware: V6E1 | Shape: Standard | Variant: TPU\n",
+                        "",
+                    )
+                return subprocess.CompletedProcess(cmd, 0, "[colab] No active sessions found on server.\n", "")
+            if "V6E1" in cmd:
+                ambig_state["tried"] = True
+                return subprocess.CompletedProcess(cmd, 1, "", _msg)
+            raise AssertionError(f"Must NOT fall back to v5e1 after ambiguous failure: {cmd}")
+
+        ambig_err = StringIO()
+        try:
+            with redirect_stderr(ambig_err):
+                run_colab_tpu_suites(
+                    suites=["compute"],
+                    quick=True,
+                    colab_bin="colab",
+                    auth="adc",
+                    tpu_order=("v6e1", "v5e1"),
+                    config_path=None,
+                    timeout_s=120.0,
+                    runner=_mock_ambig_runner,
+                )
+        except RuntimeError as exc:
+            assert "teardown_verified=False" in str(exc), str(exc)
+        else:  # pragma: no cover
+            raise AssertionError("Expected RuntimeError after ambiguous allocation failure")
+        assert not any("V5E1" in c for c in ambig_calls)
+        assert "m-s-ambig-timeout" in ambig_err.getvalue()
+        assert "confirm ownership before" in ambig_err.getvalue()
+        ambig_cfg = Path(str(ambig_state["cfg"]))
+        assert ambig_cfg.parent.is_dir()
+        shutil.rmtree(ambig_cfg.parent, ignore_errors=True)
 
     # 5. Verify this script compiles and loads under a `colab run` executable prelude
     src_text = Path(__file__).read_text(encoding="utf-8")
