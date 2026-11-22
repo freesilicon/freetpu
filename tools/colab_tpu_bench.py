@@ -619,7 +619,7 @@ def _verify_config_lock_acquirable(lock_path: Path) -> None:
     conn: Optional[sqlite3.Connection] = None
     try:
         conn = sqlite3.connect(str(probe_path), timeout=0.5, isolation_level=None)
-        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("BEGIN EXCLUSIVE")
         try:
             row = conn.execute("PRAGMA journal_mode").fetchone()
             mode = str(row[0]).lower() if row and row[0] is not None else ""
@@ -652,6 +652,45 @@ def _verify_config_lock_acquirable(lock_path: Path) -> None:
                 pass
 
 
+def _verify_config_volume_writable(parent_dir: Path, cfg_name: str) -> None:
+    """Write and fsync a small private probe file on the `--config` volume before provisioning.
+
+    Colab CLI 0.8.0 allocates the TPU before writing and syncing the session entry; catching
+    ENOSPC / EDQUOT / EROFS here prevents stranding an unidentified billable TPU assignment.
+    """
+    probe_path = parent_dir / f".{cfg_name}.write-probe.{uuid.uuid4().hex[:12]}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = -1
+    created = False
+    try:
+        fd = os.open(probe_path, flags, 0o600)
+        created = True
+        payload = b"\0" * 4096
+        written = 0
+        while written < len(payload):
+            n = os.write(fd, payload[written:])
+            if n <= 0:
+                raise OSError("short write during config volume probe")
+            written += n
+        os.fsync(fd)
+    except OSError as exc:
+        raise UntrustedPathError(
+            f"Config directory {parent_dir} failed write/fsync preflight probe ({exc}); "
+            "free disk quota or choose a writable `--config` volume."
+        ) from exc
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if created:
+            try:
+                probe_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def _normalize_config_path(
     config_path: Optional[Path],
     out_dir: Path,
@@ -678,6 +717,7 @@ def _normalize_config_path(
         raise UntrustedPathError(f"Refusing symlinked --config or lock path: {canonical_cfg}")
     _verify_file_writable_if_exists(canonical_cfg, "session config file")
     _verify_file_writable_if_exists(lock_path, "session config lock file")
+    _verify_config_volume_writable(canonical_parent, canonical_cfg.name)
     _verify_config_lock_acquirable(lock_path)
     return canonical_cfg
 
@@ -6207,6 +6247,23 @@ def run_self_test() -> int:
                 holder_conn.execute("ROLLBACK")
             holder_conn.close()
 
+        # A held SQLite READ transaction (`BEGIN DEFERRED` + `SELECT`) must ALSO block
+        # `BEGIN EXCLUSIVE` preflight so a persistent reader cannot deadlock Colab CLI.
+        reader_conn = sqlite3.connect(str(busy_lock), isolation_level=None)
+        try:
+            reader_conn.execute("BEGIN DEFERRED")
+            reader_conn.execute("SELECT count(*) FROM sqlite_master").fetchall()
+            rc_rl, sum_rl = run_benchmark(
+                BenchConfig(config_path=busy_cfg, out_dir=tmp_path / "out-reader-lock"),
+                runner=forbid_calls_runner,
+            )
+            assert rc_rl == 2, f"Expected held reader lock rejection: {sum_rl}"
+            assert sum_rl["status"] == "untrusted_config_path"
+        finally:
+            if reader_conn.in_transaction:
+                reader_conn.execute("ROLLBACK")
+            reader_conn.close()
+
         # Valid 0-byte lock file passes preflight cleanly.
         valid_lock_cfg = lock_probe_dir / "valid-lock.json"
         valid_lock_cfg.write_text("{}\n", encoding="utf-8")
@@ -6238,7 +6295,31 @@ def run_self_test() -> int:
         assert expected_py in sum_bsyn["error"], sum_bsyn["error"]
         assert "Colab-compatible Python interpreter" in sum_bsyn["error"], sum_bsyn["error"]
 
-    print("colab_tpu_bench.py self-test PASSED (67/67 suites).")
+        # 68. Config-volume write/fsync preflight probe catches ENOSPC/EDQUOT before provisioning
+        #     any TPU and cleans up its temporary probe file.
+        enospc_cfg_dir = tmp_path / "enospc-cfg-dir"
+        enospc_cfg_dir.mkdir(mode=0o700)
+        os.chmod(enospc_cfg_dir, 0o700)
+        enospc_cfg = enospc_cfg_dir / "empty-on-full-vol.json"
+        enospc_cfg.write_text("{}\n", encoding="utf-8")
+        os.chmod(enospc_cfg, 0o600)
+        with _mock_patch(
+            "os.fsync",
+            side_effect=OSError(28, "No space left on device"),
+        ):
+            rc_enospc, sum_enospc = run_benchmark(
+                BenchConfig(
+                    config_path=enospc_cfg,
+                    out_dir=tmp_path / "out-enospc-cfg",
+                ),
+                runner=forbid_calls_runner,
+            )
+        assert rc_enospc == 2, f"Expected ENOSPC config probe failure: {sum_enospc}"
+        assert sum_enospc["status"] == "untrusted_config_path"
+        assert "write/fsync" in (sum_enospc.get("error") or "")
+        assert not list(enospc_cfg_dir.glob("*.write-probe.*"))
+
+    print("colab_tpu_bench.py self-test PASSED (68/68 suites).")
     return 0
 
 
