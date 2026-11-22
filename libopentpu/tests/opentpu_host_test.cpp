@@ -343,7 +343,9 @@ static void test_pjrt_api_mock() {
   {
     const char* mlir_default_prec =
         "module {\n"
-        "  func.func @main(%a: tensor<128x128xbf16>, %b: tensor<128x128xbf16>) -> tensor<128x128xbf16> {\n"
+        "  func.func public @main(%a: tensor<128x128xbf16> {jax.arg_info = \"a\"},\n"
+        "                         %b: tensor<128x128xbf16> {mhlo.layout_mode = \"default\"})\n"
+        "      -> (tensor<128x128xbf16> {jax.result_info = \"\"}) {\n"
         "    %0 = stablehlo.dot_general %a, %b,\n"
         "      contracting_dims = [1] x [0],\n"
         "      precision = [DEFAULT, DEFAULT]\n"

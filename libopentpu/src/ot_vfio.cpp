@@ -472,25 +472,21 @@ bool VfioTransport::open_device(const ot_config_t& cfg, ot_device_info_t* info, 
     return false;
   }
 
-  // Clear any stale MSI-X eventfd bindings so polling mode starts clean.
+  // Disable any active MSI-X interrupt bindings without enabling or reserving vectors
+  // for polling-only transfers (count=0 + DATA_NONE|ACTION_TRIGGER per Linux VFIO).
   struct vfio_irq_info irqi = {};
   irqi.argsz = sizeof(irqi);
   irqi.index = VFIO_PCI_MSIX_IRQ_INDEX;
   uint32_t msix_cnt = 0;
   if (::ioctl(device_fd, VFIO_DEVICE_GET_IRQ_INFO, &irqi) == 0) {
     msix_cnt = irqi.count;
-    if (msix_cnt > 0 && msix_cnt <= 256) {
-      std::vector<uint8_t> set_buf(sizeof(struct vfio_irq_set) + msix_cnt * sizeof(int), 0);
-      auto* irq_set = reinterpret_cast<struct vfio_irq_set*>(set_buf.data());
-      irq_set->argsz = static_cast<uint32_t>(set_buf.size());
-      irq_set->flags = VFIO_IRQ_SET_DATA_EVENTFD | VFIO_IRQ_SET_ACTION_TRIGGER;
-      irq_set->index = VFIO_PCI_MSIX_IRQ_INDEX;
-      irq_set->start = 0;
-      irq_set->count = msix_cnt;
-      int* fds = reinterpret_cast<int*>(irq_set->data);
-      for (uint32_t i = 0; i < msix_cnt; ++i) fds[i] = -1;
-      ::ioctl(device_fd, VFIO_DEVICE_SET_IRQS, irq_set);
-    }
+    struct vfio_irq_set irq_set = {};
+    irq_set.argsz = sizeof(irq_set);
+    irq_set.flags = VFIO_IRQ_SET_DATA_NONE | VFIO_IRQ_SET_ACTION_TRIGGER;
+    irq_set.index = VFIO_PCI_MSIX_IRQ_INDEX;
+    irq_set.start = 0;
+    irq_set.count = 0;
+    (void)::ioctl(device_fd, VFIO_DEVICE_SET_IRQS, &irq_set);
   }
 
   std::snprintf(info->bdf, sizeof(info->bdf), "%s", pci.bdf.c_str());

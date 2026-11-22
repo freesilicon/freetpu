@@ -340,21 +340,94 @@ bool parse_stablehlo_matmul(const char* code, size_t len, uint32_t* m_out,
       return false;
     }
   }
-  size_t rparen = cleaned.find(')', lparen + 1);
+  // Find matching closing ')' for argument list, skipping any nested '{...}' attribute dicts.
+  auto find_matching_delim = [](const std::string& s, size_t open_pos, char open_ch,
+                                char close_ch) -> size_t {
+    int depth = 1;
+    bool in_str = false;
+    for (size_t i = open_pos + 1; i < s.size(); ++i) {
+      char c = s[i];
+      if (in_str) {
+        if (c == '\\' && i + 1 < s.size()) {
+          ++i;
+          continue;
+        }
+        if (c == '"') in_str = false;
+        continue;
+      }
+      if (c == '"') {
+        in_str = true;
+      } else if (c == open_ch) {
+        ++depth;
+      } else if (c == close_ch) {
+        if (--depth == 0) return i;
+      }
+    }
+    return std::string::npos;
+  };
+  auto is_benign_mlir_attr_dict = [](const std::string& dict) -> bool {
+    // Reject attribute dicts carrying semantic sharding/aliasing/non-default layout constraints.
+    if (dict.find("sharding") != std::string::npos ||
+        dict.find("aliasing") != std::string::npos ||
+        dict.find("memory_space") != std::string::npos) {
+      return false;
+    }
+    size_t lm = dict.find("layout_mode");
+    if (lm != std::string::npos && dict.find("\"default\"", lm) == std::string::npos) {
+      return false;
+    }
+    return true;
+  };
+  auto strip_type_attr_dict = [&](const std::string& raw, std::string* type_out) -> bool {
+    std::string t = trim_ws(raw);
+    size_t ob = t.find('{');
+    if (ob == std::string::npos) {
+      *type_out = t;
+      return true;
+    }
+    size_t cb = find_matching_delim(t, ob, '{', '}');
+    if (cb == std::string::npos || !trim_ws(t.substr(cb + 1)).empty()) return false;
+    std::string dict = t.substr(ob, cb - ob + 1);
+    if (!is_benign_mlir_attr_dict(dict)) return false;
+    *type_out = trim_ws(t.substr(0, ob));
+    return true;
+  };
+
+  size_t rparen = find_matching_delim(cleaned, lparen, '(', ')');
   if (rparen == std::string::npos) return false;
 
-  // Parse exactly two arguments: `%arg0: tensor<MxKxbf16>, %arg1: tensor<KxNxbf16>`.
+  // Parse exactly two arguments: `%arg0: tensor<MxKxbf16> [{...}], %arg1: tensor<KxNxbf16> [{...}]`.
   std::string arg_list = trim_ws(cleaned.substr(lparen + 1, rparen - lparen - 1));
-  size_t comma = arg_list.find(',');
-  if (comma == std::string::npos || arg_list.find(',', comma + 1) != std::string::npos) {
-    return false;
+  size_t comma = std::string::npos;
+  {
+    int bdepth = 0;
+    bool in_str = false;
+    for (size_t i = 0; i < arg_list.size(); ++i) {
+      char c = arg_list[i];
+      if (in_str) {
+        if (c == '\\' && i + 1 < arg_list.size()) { ++i; continue; }
+        if (c == '"') in_str = false;
+        continue;
+      }
+      if (c == '"') in_str = true;
+      else if (c == '{' || c == '(' || c == '[' || c == '<') ++bdepth;
+      else if (c == '}' || c == ')' || c == ']' || c == '>') --bdepth;
+      else if (c == ',' && bdepth == 0) {
+        if (comma != std::string::npos) return false;  // > 2 arguments
+        comma = i;
+      }
+    }
   }
-  auto parse_arg = [](const std::string& raw, std::string* ssa, uint32_t* d0, uint32_t* d1) -> bool {
+  if (comma == std::string::npos) return false;
+
+  auto parse_arg = [&](const std::string& raw, std::string* ssa, uint32_t* d0, uint32_t* d1) -> bool {
     size_t colon = raw.find(':');
     if (colon == std::string::npos) return false;
     *ssa = trim_ws(raw.substr(0, colon));
     if (!is_valid_ssa_name(*ssa)) return false;
-    return parse_bf16_2d_tensor_type(raw.substr(colon + 1), d0, d1);
+    std::string type_only;
+    if (!strip_type_attr_dict(raw.substr(colon + 1), &type_only)) return false;
+    return parse_bf16_2d_tensor_type(type_only, d0, d1);
   };
   std::string arg0_ssa, arg1_ssa;
   uint32_t m0 = 0, k0 = 0, k1 = 0, n1 = 0;
@@ -362,18 +435,49 @@ bool parse_stablehlo_matmul(const char* code, size_t len, uint32_t* m_out,
   if (!parse_arg(arg_list.substr(comma + 1), &arg1_ssa, &k1, &n1)) return false;
   if (arg0_ssa == arg1_ssa || k0 != k1) return false;
 
-  // Parse return type before `{`.
-  size_t lbrace = cleaned.find('{', rparen + 1);
-  if (lbrace == std::string::npos) return false;
-  std::string ret_sig = trim_ws(cleaned.substr(rparen + 1, lbrace - rparen - 1));
-  if (ret_sig.compare(0, 2, "->") != 0) return false;
-  std::string ret_type_str = trim_ws(ret_sig.substr(2));
-  if (!ret_type_str.empty() && ret_type_str.front() == '(' && ret_type_str.back() == ')') {
-    ret_type_str = trim_ws(ret_type_str.substr(1, ret_type_str.size() - 2));
+  // Parse return signature `-> (tensor<MxNxbf16> [{...}])` or `-> tensor<MxNxbf16> [{...}]`
+  // plus optional `attributes { ... }` before locating the function body `{`.
+  size_t pos = rparen + 1;
+  auto skip_ws_at = [&](size_t& p) {
+    while (p < cleaned.size() && std::isspace(static_cast<unsigned char>(cleaned[p]))) ++p;
+  };
+  skip_ws_at(pos);
+  if (cleaned.compare(pos, 2, "->") != 0) return false;
+  pos += 2;
+  skip_ws_at(pos);
+
+  std::string ret_type_raw;
+  if (pos < cleaned.size() && cleaned[pos] == '(') {
+    size_t ret_rparen = find_matching_delim(cleaned, pos, '(', ')');
+    if (ret_rparen == std::string::npos) return false;
+    ret_type_raw = cleaned.substr(pos + 1, ret_rparen - pos - 1);
+    pos = ret_rparen + 1;
+  } else {
+    size_t end_gt = cleaned.find('>', pos);
+    if (end_gt == std::string::npos) return false;
+    ret_type_raw = cleaned.substr(pos, end_gt - pos + 1);
+    pos = end_gt + 1;
   }
+  std::string ret_type_str;
+  if (!strip_type_attr_dict(ret_type_raw, &ret_type_str)) return false;
   uint32_t rm = 0, rn = 0;
   if (!parse_bf16_2d_tensor_type(ret_type_str, &rm, &rn)) return false;
   if (rm != m0 || rn != n1) return false;
+
+  skip_ws_at(pos);
+  if (cleaned.compare(pos, 10, "attributes") == 0 &&
+      pos + 10 < cleaned.size() && std::isspace(static_cast<unsigned char>(cleaned[pos + 10]))) {
+    pos += 10;
+    skip_ws_at(pos);
+    if (pos >= cleaned.size() || cleaned[pos] != '{') return false;
+    size_t attr_end = find_matching_delim(cleaned, pos, '{', '}');
+    if (attr_end == std::string::npos) return false;
+    if (!is_benign_mlir_attr_dict(cleaned.substr(pos, attr_end - pos + 1))) return false;
+    pos = attr_end + 1;
+    skip_ws_at(pos);
+  }
+  if (pos >= cleaned.size() || cleaned[pos] != '{') return false;
+  size_t lbrace = pos;
 
   // Extract matching function body `{ ... }`.
   int depth = 1;
