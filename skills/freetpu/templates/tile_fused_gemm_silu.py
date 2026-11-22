@@ -189,16 +189,32 @@ def run_tpu_benchmark(m: int, k: int, n: int, bm: int, bn: int, bk: int, iters: 
 
     pallas_fn = build_pallas_gemm_silu(m, k, n, bm, bn, bk)
     has_tpu_custom_call = "tpu_custom_call" in pallas_fn.lower(a, b).as_text()
+    if not has_tpu_custom_call:
+        raise RuntimeError("Pallas GEMM+SiLU kernel did not lower to native `tpu_custom_call`")
 
     ref_xla = xla_fn(a, b)
     out_pallas = pallas_fn(a, b)
     jax.block_until_ready((ref_xla, out_pallas))
-    max_abs_err_xla = float(jnp.max(jnp.abs(out_pallas.astype(jnp.float32) - ref_xla.astype(jnp.float32))))
+    out_f32 = np.asarray(out_pallas.astype(jnp.float32), dtype=np.float32)
+    ref_xla_f32 = np.asarray(ref_xla.astype(jnp.float32), dtype=np.float32)
+    if not np.all(np.isfinite(out_f32)):
+        raise RuntimeError("Pallas GEMM+SiLU produced non-finite values")
+    max_abs_err_xla = float(np.max(np.abs(out_f32 - ref_xla_f32)))
+    xla_tol = max(0.02, 0.02 * float(np.max(np.abs(ref_xla_f32))))
+    if max_abs_err_xla > xla_tol:
+        raise RuntimeError(
+            f"Pallas GEMM+SiLU parity vs XLA failed: max_abs_err={max_abs_err_xla} > tol={xla_tol}"
+        )
 
     # Check a corner slice against NumPy FP32 cpu_ref to guard against global scale bugs.
     sl = min(64, m, n)
     cpu_slice = cpu_ref_gemm_silu(np.asarray(a[:sl], dtype=np.float32), np.asarray(b[:, :sl], dtype=np.float32))
-    max_abs_err_cpu = float(np.max(np.abs(np.asarray(out_pallas[:sl, :sl], dtype=np.float32) - cpu_slice)))
+    max_abs_err_cpu = float(np.max(np.abs(out_f32[:sl, :sl] - cpu_slice)))
+    cpu_tol = max(0.05, 0.03 * float(np.max(np.abs(cpu_slice))))
+    if max_abs_err_cpu > cpu_tol:
+        raise RuntimeError(
+            f"Pallas GEMM+SiLU parity vs NumPy cpu_ref failed: max_abs_err={max_abs_err_cpu} > tol={cpu_tol}"
+        )
 
     def _bench(fn) -> Tuple[float, float]:
         for _ in range(4):

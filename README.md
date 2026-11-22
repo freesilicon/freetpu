@@ -85,7 +85,9 @@ Install the portable [`skills/freetpu/`](skills/freetpu/SKILL.md) Agent Skill so
 
 ```bash
 # Project-local install (Claude Code, Antigravity, Cursor, Gemini CLI)
-mkdir -p .agents/skills && ln -sfn ../../skills/freetpu .agents/skills/freetpu
+mkdir -p .agents/skills .claude/skills
+ln -sfn ../../skills/freetpu .agents/skills/freetpu
+ln -sfn ../../skills/freetpu .claude/skills/freetpu
 
 # Or symlink globally for Claude Code / Codex / Antigravity
 mkdir -p ~/.claude/skills ~/.codex/skills ~/.gemini/config/skills

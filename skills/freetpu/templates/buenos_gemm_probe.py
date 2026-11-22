@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -149,6 +150,11 @@ def run_probe(
         "dgc0_emitted": False,
     }
 
+    if (shell_path is None) != (out_prefix is None):
+        raise ValueError(
+            "Both --shell (or FREETPU_SHELL_DGC0) and --out-prefix are required together to emit .dgc0 artifacts."
+        )
+
     if shell_path is not None and out_prefix is not None:
         blob, in_b, ref_b, info = ecg.emit_custom_gemm_dgc0(
             weights_nk=w,
@@ -187,9 +193,21 @@ def main() -> None:
     ap.add_argument("--s-out", type=float, default=0.05)
     ap.add_argument("--zp-out", type=int, default=19)
     ap.add_argument("--act", choices=("NONE", "RELU", "RELU6"), default="RELU")
-    ap.add_argument("--shell", type=Path, default=None, help="User-extracted local template DGC0 shell")
+    ap.add_argument(
+        "--shell",
+        type=Path,
+        default=None,
+        help="User-extracted local template DGC0 shell (or set FREETPU_SHELL_DGC0)",
+    )
     ap.add_argument("--out-prefix", type=Path, default=None, help="Prefix for emitted .dgc0/.in.bin/.ref.bin")
     args = ap.parse_args()
+
+    env_shell = os.environ.get("FREETPU_SHELL_DGC0", "").strip()
+    shell_path = args.shell if args.shell is not None else (
+        Path(env_shell) if env_shell and not args.self_test else None
+    )
+    if (shell_path is None) != (args.out_prefix is None):
+        ap.error("Both --shell (or FREETPU_SHELL_DGC0) and --out-prefix must be supplied together.")
 
     repo_root = resolve_repo_root(args.repo_root)
     report = run_probe(
@@ -203,7 +221,7 @@ def main() -> None:
         s_out=args.s_out,
         zp_out=args.zp_out,
         act_name=args.act,
-        shell_path=args.shell,
+        shell_path=shell_path,
         out_prefix=args.out_prefix,
     )
     print(json.dumps(report, indent=2))

@@ -44,7 +44,12 @@ Use this workflow for zero-Google-`.so` C/C++ kernels, closed-form `(M, K, N)` V
    ```
    - `tools/emit_custom_gemm.py` synthesizes `chunk[0..6]` and packed `ext[2]` (`int32` bias + `[K/4, N_blk, 4]` `uint8` `w + 128`) using IEEE-754 **FP32 Round-Half-to-Even (RNE)** (`np.rint`), matching `buenos_a0` hardware rather than fixed-point RHU.
    - `tools/spline_0x640.py` synthesizes 208-byte `0x640` (`LoadCoefficientTables`) 8-segment degree-4 Remez minimax splines (`SiLU`, `GELU`, `exp`) with zero-overhead Mode-A fusion.
-   - To emit a runnable `.dgc0` + `.in.bin` + `.ref.bin` bundle locally, pass a user-extracted shell via `--shell /path/to/local_shell.dgc0` (or `FREETPU_SHELL_DGC0`).
+   - To emit a runnable `.dgc0` + `.in.bin` + `.ref.bin` bundle locally, supply both a user-extracted shell (`--shell` or `FREETPU_SHELL_DGC0`) and `--out-prefix`:
+     ```bash
+     python3 skills/freetpu/templates/buenos_gemm_probe.py \
+       --shell /path/to/local_shell.dgc0 \
+       --out-prefix /tmp/freetpu_probe
+     ```
 
 3. **Cross-build and prove on physical Tensor G5 silicon** (unlocked Android ARM64 device):
    ```bash
@@ -89,13 +94,15 @@ Use this workflow to run Pallas/Mosaic or JAX/PJRT benchmarks on Colab TPUs with
        --out-dir /tmp/freetpu-colab-proof \
        --script skills/freetpu/templates/tile_fused_gemm_silu.py
      ```
-   - Direct CLI pattern (`colab run` provisions, runs, propagates exit code, and auto-stops the VM even on error):
+   - Direct CLI pattern (`colab run` provisions, runs, propagates exit code, and auto-stops the VM even on error; use a fresh session name per run and create the export directory first):
      ```bash
+     SESSION_ID="freetpu-probe-$(date +%Y%m%d-%H%M%S)"
+     mkdir -p -m 700 /tmp/freetpu-colab-proof
      colab --auth=adc --config /tmp/freetpu-colab.json run \
-       -s freetpu-probe --tpu V6E1 --timeout 300 \
+       -s "$SESSION_ID" --tpu V6E1 --timeout 300 \
        skills/freetpu/templates/tile_swiglu.py
      colab --auth=adc --config /tmp/freetpu-colab.json log \
-       -s freetpu-probe -o /tmp/freetpu-colab-proof/proof.ipynb
+       -s "$SESSION_ID" -o /tmp/freetpu-colab-proof/proof.ipynb
      ```
    - For multi-step interactive sessions, prefer `colab exec` (keeps XLA/PJRT caches warm) over `colab ssh` (capped at 5 sessions / HTTP 429). Use `colab download` instead of `drive.mount`.
 

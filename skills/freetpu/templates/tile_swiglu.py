@@ -125,11 +125,32 @@ def run_tpu_benchmark(m: int, n: int, block_m: int, block_n: int, iters: int) ->
 
     pallas_fn = build_pallas_swiglu(m, n, block_m, block_n)
     has_tpu_custom_call = "tpu_custom_call" in pallas_fn.lower(gate, up).as_text()
+    if not has_tpu_custom_call:
+        raise RuntimeError("Pallas SwiGLU kernel did not lower to native `tpu_custom_call`")
 
     ref_xla = xla_swiglu(gate, up)
     out_pallas = pallas_fn(gate, up)
     jax.block_until_ready((ref_xla, out_pallas))
-    max_abs_err = float(jnp.max(jnp.abs(out_pallas.astype(jnp.float32) - ref_xla.astype(jnp.float32))))
+    out_f32 = np.asarray(out_pallas.astype(jnp.float32), dtype=np.float32)
+    ref_xla_f32 = np.asarray(ref_xla.astype(jnp.float32), dtype=np.float32)
+    if not np.all(np.isfinite(out_f32)):
+        raise RuntimeError("Pallas SwiGLU produced non-finite values")
+    max_abs_err = float(np.max(np.abs(out_f32 - ref_xla_f32)))
+    if max_abs_err != 0.0:
+        raise RuntimeError(f"Pallas SwiGLU parity vs XLA failed (expected bit-exact 0.0): max_abs_err={max_abs_err}")
+
+    sl_m = min(64, m)
+    sl_n = min(64, n)
+    cpu_slice = cpu_ref_swiglu(
+        np.asarray(gate[:sl_m, :sl_n], dtype=np.float32),
+        np.asarray(up[:sl_m, :sl_n], dtype=np.float32),
+    )
+    max_abs_err_cpu = float(np.max(np.abs(out_f32[:sl_m, :sl_n] - cpu_slice)))
+    cpu_tol = max(0.05, 0.03 * float(np.max(np.abs(cpu_slice))))
+    if max_abs_err_cpu > cpu_tol:
+        raise RuntimeError(
+            f"Pallas SwiGLU parity vs NumPy cpu_ref failed: max_abs_err={max_abs_err_cpu} > tol={cpu_tol}"
+        )
 
     def _bench(fn) -> Tuple[float, float]:
         for _ in range(5):
@@ -157,6 +178,7 @@ def run_tpu_benchmark(m: int, n: int, block_m: int, block_n: int, iters: int) ->
         "tile": [block_m, block_n],
         "tpu_custom_call": has_tpu_custom_call,
         "max_abs_err_vs_xla": max_abs_err,
+        "max_abs_err_vs_cpu_slice": max_abs_err_cpu,
         "total_hbm_mb": round(total_bytes / 1e6, 2),
         "median_us": round(p_med_s * 1e6, 2),
         "min_us": round(p_min_s * 1e6, 2),
