@@ -1260,8 +1260,15 @@ def _format_colab_recovery_hint(
     return " ".join(parts)
 
 
-class _ColabSigtermInterrupt(BaseException):
-    """Raised when SIGTERM arrives during a retained Colab TPU run."""
+class _ColabSignalInterrupt(BaseException):
+    """Raised when a termination signal (SIGTERM or SIGHUP) arrives during a retained Colab TPU run."""
+
+    def __init__(self, signum: int, message: str = "") -> None:
+        self.signum = signum
+        super().__init__(message or f"Received signal {signum} during Colab TPU run")
+
+
+_ColabSigtermInterrupt = _ColabSignalInterrupt
 
 
 COLAB_PROVISIONING_GRACE_S = 180.0
@@ -1575,28 +1582,32 @@ def run_colab_tpu_suites(
             unattributed_endpoints: List[str] = []
             recovery_hint: Optional[str] = None
 
-            install_sigterm = (
-                hasattr(signal, "SIGTERM") and threading.current_thread() is threading.main_thread()
-            )
-            prev_sigterm: Any = None
-            sigterm_state = {"in_teardown": False, "deferred": False}
+            guarded_signals: List[int] = []
+            if threading.current_thread() is threading.main_thread():
+                for sig_name in ("SIGTERM", "SIGHUP"):
+                    sig_val = getattr(signal, sig_name, None)
+                    if sig_val is not None:
+                        guarded_signals.append(sig_val)
+            prev_handlers: Dict[int, Any] = {}
+            sig_state: Dict[str, Any] = {"in_teardown": False, "deferred_signum": None}
 
-            def _sigterm_handler(_signum: int, _frame: Any) -> None:
-                if sigterm_state["in_teardown"]:
-                    sigterm_state["deferred"] = True
+            def _termination_signal_handler(signum: int, _frame: Any) -> None:
+                if sig_state["in_teardown"]:
+                    if sig_state["deferred_signum"] is None:
+                        sig_state["deferred_signum"] = signum
                     return
-                raise _ColabSigtermInterrupt("Received SIGTERM during Colab TPU run")
+                raise _ColabSignalInterrupt(signum, f"Received signal {signum} during Colab TPU run")
 
-            if install_sigterm:
-                prev_sigterm = signal.getsignal(signal.SIGTERM)
-                signal.signal(signal.SIGTERM, _sigterm_handler)
+            for sig_val in guarded_signals:
+                prev_handlers[sig_val] = signal.getsignal(sig_val)
+                signal.signal(sig_val, _termination_signal_handler)
             try:
                 try:
                     res = runner(cmd)
                 except BaseException as exc:
                     interrupted = exc
                 finally:
-                    sigterm_state["in_teardown"] = True
+                    sig_state["in_teardown"] = True
                     session_was_ready = (
                         (res is not None and (res.returncode == 0 or "[colab] session ready" in res.stderr.lower()))
                         or (interrupted is not None)
@@ -1652,8 +1663,8 @@ def run_colab_tpu_suites(
                             file=sys.stderr,
                         )
             finally:
-                if install_sigterm:
-                    signal.signal(signal.SIGTERM, prev_sigterm)
+                for sig_val, prev_h in prev_handlers.items():
+                    signal.signal(sig_val, prev_h)
 
             if interrupted is not None:
                 if isinstance(interrupted, subprocess.TimeoutExpired):
@@ -1663,8 +1674,9 @@ def run_colab_tpu_suites(
                         f"leaked_endpoints={leaked_endpoints}, unattributed_endpoints={unattributed_endpoints})"
                     ) from interrupted
                 raise interrupted
-            if sigterm_state["deferred"]:
-                raise _ColabSigtermInterrupt("Received SIGTERM during Colab teardown")
+            if sig_state["deferred_signum"] is not None:
+                d_sig = int(sig_state["deferred_signum"])
+                raise _ColabSignalInterrupt(d_sig, f"Received signal {d_sig} during Colab teardown")
             assert res is not None
 
             attempt_rec: Dict[str, Any] = {
@@ -3054,61 +3066,67 @@ def run_self_test() -> int:
     assert conc_res["colab_meta"]["unattributed_endpoints"] == ["m-s-concurrent-browser"]
     assert "unattributed concurrent" in conc_err.getvalue()
 
-    # 4j. SIGTERM during `colab run --keep` MUST run teardown (and defer a second SIGTERM during stop)
-    if hasattr(signal, "SIGTERM") and threading.current_thread() is threading.main_thread():
-        sig_calls: List[List[str]] = []
-        sig_state = {"live": False, "second_sent": False}
-        orig_handler = signal.getsignal(signal.SIGTERM)
+    # 4j. SIGTERM and SIGHUP during `colab run --keep` MUST run teardown (and defer a second signal during stop)
+    if threading.current_thread() is threading.main_thread():
+        for sig_name in ("SIGTERM", "SIGHUP"):
+            target_sig = getattr(signal, sig_name, None)
+            if target_sig is None:
+                continue
+            sig_calls: List[List[str]] = []
+            sig_state = {"live": False, "second_sent": False}
+            orig_handler = signal.getsignal(target_sig)
 
-        def _mock_sigterm_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess[str]:
-            sig_calls.append(list(cmd))
-            if cmd[-1] == "version":
-                return subprocess.CompletedProcess(cmd, 0, "Version: 0.8.0\n", "")
-            if "usage" in cmd:
-                return subprocess.CompletedProcess(cmd, 0, "100.0\n", "")
-            if "run" in cmd:
-                sig_state["live"] = True
-                os.kill(os.getpid(), signal.SIGTERM)
-                raise AssertionError("SIGTERM should have interrupted runner")
-            if "stop" in cmd:
-                if not sig_state["second_sent"]:
-                    sig_state["second_sent"] = True
-                    # A second SIGTERM during teardown MUST NOT abort cleanup mid-flight
-                    os.kill(os.getpid(), signal.SIGTERM)
-                sig_state["live"] = False
-                return subprocess.CompletedProcess(cmd, 0, "[colab] Session terminated.\n", "")
-            if "sessions" in cmd:
-                if sig_state["live"]:
-                    run_calls = [c for c in sig_calls if "run" in c]
-                    sname = run_calls[-1][run_calls[-1].index("-s") + 1]
-                    return subprocess.CompletedProcess(
-                        cmd,
-                        0,
-                        f"[{sname}] m-s-sigterm-clean | Hardware: V5E1 | Shape: Standard | Variant: TPU\n",
-                        "",
-                    )
-                return subprocess.CompletedProcess(cmd, 0, "[colab] No active sessions found on server.\n", "")
-            raise AssertionError(f"Unexpected cmd: {cmd}")
+            def _mock_signal_runner(
+                cmd: Sequence[str], _sig: int = target_sig, _name: str = sig_name
+            ) -> subprocess.CompletedProcess[str]:
+                sig_calls.append(list(cmd))
+                if cmd[-1] == "version":
+                    return subprocess.CompletedProcess(cmd, 0, "Version: 0.8.0\n", "")
+                if "usage" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, "100.0\n", "")
+                if "run" in cmd:
+                    sig_state["live"] = True
+                    os.kill(os.getpid(), _sig)
+                    raise AssertionError(f"{_name} should have interrupted runner")
+                if "stop" in cmd:
+                    if not sig_state["second_sent"]:
+                        sig_state["second_sent"] = True
+                        # A second termination signal during teardown MUST NOT abort cleanup mid-flight
+                        os.kill(os.getpid(), _sig)
+                    sig_state["live"] = False
+                    return subprocess.CompletedProcess(cmd, 0, "[colab] Session terminated.\n", "")
+                if "sessions" in cmd:
+                    if sig_state["live"]:
+                        run_calls = [c for c in sig_calls if "run" in c]
+                        sname = run_calls[-1][run_calls[-1].index("-s") + 1]
+                        return subprocess.CompletedProcess(
+                            cmd,
+                            0,
+                            f"[{sname}] m-s-{_name.lower()}-clean | Hardware: V5E1 | Shape: Standard | Variant: TPU\n",
+                            "",
+                        )
+                    return subprocess.CompletedProcess(cmd, 0, "[colab] No active sessions found on server.\n", "")
+                raise AssertionError(f"Unexpected cmd: {cmd}")
 
-        try:
-            run_colab_tpu_suites(
-                suites=["compute"],
-                quick=True,
-                colab_bin="colab",
-                auth="adc",
-                tpu_order=("v5e1",),
-                config_path=None,
-                timeout_s=120.0,
-                runner=_mock_sigterm_runner,
-            )
-        except _ColabSigtermInterrupt:
-            pass
-        else:  # pragma: no cover
-            raise AssertionError("Expected _ColabSigtermInterrupt to propagate")
-        assert any("stop" in c for c in sig_calls)
-        assert sig_state["second_sent"] is True
-        assert sig_state["live"] is False
-        assert signal.getsignal(signal.SIGTERM) == orig_handler
+            try:
+                run_colab_tpu_suites(
+                    suites=["compute"],
+                    quick=True,
+                    colab_bin="colab",
+                    auth="adc",
+                    tpu_order=("v5e1",),
+                    config_path=None,
+                    timeout_s=120.0,
+                    runner=_mock_signal_runner,
+                )
+            except _ColabSignalInterrupt as exc:
+                assert exc.signum == target_sig, (exc.signum, target_sig)
+            else:  # pragma: no cover
+                raise AssertionError(f"Expected _ColabSignalInterrupt({sig_name}) to propagate")
+            assert any("stop" in c for c in sig_calls)
+            assert sig_state["second_sent"] is True
+            assert sig_state["live"] is False
+            assert signal.getsignal(target_sig) == orig_handler
 
     # 4k. Refused v6e allocation while a concurrent `[?]` runtime appears MUST keep it unattributed and fall back to v5e
     ref_calls: List[List[str]] = []
@@ -3858,5 +3876,5 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except KeyboardInterrupt:
         raise SystemExit(130)
-    except _ColabSigtermInterrupt:
-        raise SystemExit(143)
+    except _ColabSignalInterrupt as exc:
+        raise SystemExit(128 + exc.signum)

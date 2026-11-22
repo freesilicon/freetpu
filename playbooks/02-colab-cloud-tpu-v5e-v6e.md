@@ -54,17 +54,26 @@ python3 bench/freetpu_bench.py \
 ### 3. Direct `colab run` Invocation (Zero Wrapper)
 
 ```bash
-mkdir -p -m 700 ~/.cache/freetpu-colab
-colab --auth=adc --config ~/.cache/freetpu-colab/direct.json run \
-  -s freetpu-bench-direct --tpu V5E1 --keep --timeout 300 \
-  bench/freetpu_bench.py --suite compute,bandwidth --backend jax_tpu --emit-markers
-# Record the backend runtime endpoint, stop the session, and verify the endpoint disappears (including under `[?]`)
-colab --auth=adc --config ~/.cache/freetpu-colab/direct.json sessions
-colab --auth=adc --config ~/.cache/freetpu-colab/direct.json stop -s freetpu-bench-direct
-colab --auth=adc --config ~/.cache/freetpu-colab/direct.json sessions
+(
+  mkdir -p -m 700 "$HOME/.cache/freetpu-colab"
+  SESSION="freetpu-bench-direct-$(python3 -c 'import uuid; print(uuid.uuid4().hex[:8])')"
+  COLAB_CFG="$HOME/.cache/freetpu-colab/${SESSION}.json"
+
+  cleanup() {
+    trap - EXIT INT TERM HUP
+    colab --auth=adc --config "$COLAB_CFG" sessions || true
+    colab --auth=adc --config "$COLAB_CFG" stop -s "$SESSION" || true
+    colab --auth=adc --config "$COLAB_CFG" sessions || true
+  }
+  trap cleanup EXIT INT TERM HUP
+
+  COLAB_CLI_ASSIGN_RETRIES=0 colab --auth=adc --config "$COLAB_CFG" run \
+    -s "$SESSION" --tpu V5E1 --keep --timeout 300 \
+    bench/freetpu_bench.py --suite compute,bandwidth --backend jax_tpu --emit-markers
+)
 ```
 
-Passing `--keep` preserves the local session-to-endpoint mapping until `colab stop -s` succeeds, so a failed unassign cannot silently drop local state and leave an orphaned `[?] <endpoint>` runtime burning Compute Units. Always confirm in the final `colab sessions` output that the runtime endpoint is gone.
+Generating a unique per-run `$SESSION` name and matching `$COLAB_CFG` file prevents a rerun after an interruption or failed stop from overwriting a previous runtime's cleanup handle, and the subshell `EXIT INT TERM HUP` trap reuses that exact `$SESSION` and `$COLAB_CFG` for teardown. Passing `--keep` preserves the local session-to-endpoint mapping until `colab stop -s "$SESSION"` succeeds, so a failed unassign cannot silently drop local state and leave an orphaned `[?] <endpoint>` runtime burning Compute Units. Always confirm in the final `colab sessions` output that the runtime endpoint is gone before removing `$COLAB_CFG`.
 
 ---
 
@@ -84,5 +93,5 @@ Passing `--keep` preserves the local session-to-endpoint mapping until `colab st
 
 - **Require `google-colab-cli >= 0.7.6`**: Older releases (`<= 0.7.5`) write authorization headers and runtime-proxy tokens to `~/.config/colab-cli/colab.log` under a default umask; `0.7.6+` redacts credentials and locks log permissions to the owner.
 - **Always isolate `--colab-config` in a private `0700` dir**: Passing `--colab-config ~/.cache/freetpu-colab/...` keeps parallel benchmark runs separate from `~/.config/colab-cli/sessions.json` and avoids shared `/tmp` directories.
-- **Automatic `v6e1 -> v5e1` Fallback & Endpoint-Verified Teardown**: If Colab refuses allocation before `[colab] Session READY`, `freetpu_bench.py` falls back to `v5e1` automatically (never retrying after `[colab] Session READY` to avoid duplicate CU spend). It invokes `colab run --keep`, records the runtime endpoint from `colab sessions`, runs `colab stop -s <session>` (including in a `finally` block on `KeyboardInterrupt`), and verifies that the backend endpoint disappeared (preserving the recovery session file and failing verification if the endpoint persists even as an orphaned `[?]` entry).
+- **Automatic `v6e1 -> v5e1` Fallback & Endpoint-Verified Teardown**: If Colab refuses allocation before `[colab] Session READY`, `freetpu_bench.py` falls back to `v5e1` automatically (never retrying after `[colab] Session READY` to avoid duplicate CU spend). It invokes `colab run --keep`, records the runtime endpoint from `colab sessions`, runs `colab stop -s <session>` (including in a `finally` block on `KeyboardInterrupt`, `SIGTERM`, and `SIGHUP`), and verifies that the backend endpoint disappeared (preserving the recovery session file and failing verification if the endpoint persists even as an orphaned `[?]` entry).
 - **Scope Boundary**: Colab is strictly for single-chip R&D and reproducible benchmarking—never deploy public inference APIs or multi-tenant proxies on Colab runtimes.
