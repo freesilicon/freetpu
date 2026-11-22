@@ -810,12 +810,17 @@ def _check_host_safe_container_edits(edits: Any, context: str, errors: List[str]
 
 
 def _check_host_safe_device_node_keys(node: Dict[str, Any], context: str, errors: List[str]) -> None:
-    """Enforce exact allowlist of deviceNode keys so case-folded Go JSON fields cannot bypass checks."""
+    """Enforce exact allowlist of deviceNode keys and character-device type for VFIO host validation."""
     disallowed = sorted(set(node.keys()) - _HOST_VALIDATED_DEVICE_NODE_KEYS)
     if disallowed:
         errors.append(
             f"{context}: disallowed deviceNode keys in host-validated TPU spec: {disallowed} "
             "(explicit major/minor and non-canonical keys are rejected in --check-host mode)"
+        )
+    node_type = node.get("type")
+    if node_type is not None and node_type not in ("", "c"):
+        errors.append(
+            f"{context}: VFIO deviceNode type must be omitted or 'c' (character device), got {node_type!r}"
         )
 
 

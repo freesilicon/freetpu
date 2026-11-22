@@ -5,8 +5,9 @@
 #      mount `/var/run/cdi` or publish CDI specs). Uses stock `python:3.12-slim`
 #      without `tpu-info` and runs outside workload Pod network namespaces, so it
 #      does NOT emit live HBM usage or MXU duty cycle. For live HBM + duty-cycle
-#      telemetry in Kubernetes, run a `tpu-info`-enabled exporter sidecar inside
-#      each TPU workload Pod (`k8s-tpu-workload-telemetry-sidecar.yaml`).
+#      telemetry, run `tpu_exporter.py` with `tpu-info` inside the same network
+#      namespace as `libtpu` (`127.0.0.1:8431`, e.g. on standalone TPU VMs or
+#      with `--no-pid-scan` in an operator-managed Pod sidecar).
 #   2. `DaemonSet/freetpu-cdi-sync` (OPT-IN CDI publisher):
 #      Publishes boot-scoped `/var/run/cdi/freetpu.json` ONLY on TPU nodes
 #      explicitly labeled `freetpu.dev/cdi-enabled=true`.

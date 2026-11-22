@@ -1,11 +1,6 @@
-# Trusted Billing & Node Prometheus scrape configuration for FreeTPU tpu-exporter.
+# Trusted Node Prometheus scrape configuration for FreeTPU tpu-exporter.
 # Scrapes ONLY operator-controlled `collector_role="node"` targets (standalone
 # host VMs and the `kube-system` `freetpu-node-agent` DaemonSet).
-#
-# Tenant-controlled workload telemetry sidecars (`freetpu-workload-sidecar`) are
-# intentionally isolated in `ops/tpu-exporter/prometheus-scrape-diagnostics.yml`
-# for a separate diagnostic Prometheus instance so tenant scrape churn can never
-# exhaust memory or storage on the billing Prometheus server.
 
 global:
   scrape_interval: 15s

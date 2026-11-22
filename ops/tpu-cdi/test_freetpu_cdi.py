@@ -1310,6 +1310,17 @@ class FreeTpuCdiTests(unittest.TestCase):
                     errs_sel,
                 )
 
+                # 4. Non-character deviceNode type (e.g. 'b') fails --check-host.
+                bad_type = freetpu_cdi.build_cdi_spec(chips_live, vfio_c)
+                bad_type["devices"][0]["containerEdits"]["deviceNodes"][0]["type"] = "b"
+                errs_type = freetpu_cdi.verify_spec_against_host(
+                    bad_type, sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                self.assertTrue(
+                    any("must be omitted or 'c'" in e for e in errs_type),
+                    errs_type,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
