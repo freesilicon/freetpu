@@ -4769,7 +4769,6 @@ ob_status_t ob_gemm_swiglu_int8(ob_context_t* ctx,
   const uint32_t N = desc->n_dim;
 
   // Pack ext[2] for the 3 weight matrices directly into DMA-BUF via parallel NEON packer
-  const uint64_t tp0 = prof_on ? ob::monotonic_now_ns() : 0u;
   const size_t ext2_sz = ob::pack_ext2_size_for_swiglu(M, K, H, N);
   ob_buffer* wbuf = nullptr;
   ob_status_t st = ob_buffer_alloc(
@@ -4790,7 +4789,7 @@ ob_status_t ob_gemm_swiglu_int8(ob_context_t* ctx,
     st = ob::buffer_sync_end_write(wbuf);
     if (prof_on) {
       const uint64_t total_dw_ns = ob::monotonic_now_ns() - tdw0;
-      ctx->prof.weight_pack_ns += tp_pack_ns + (tp_pack0 - tp0);
+      ctx->prof.weight_pack_ns += tp_pack_ns;
       ctx->prof.dma_sync_ns += (total_dw_ns > tp_pack_ns) ? (total_dw_ns - tp_pack_ns) : 0u;
     }
   } else if (prof_on) {

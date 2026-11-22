@@ -182,7 +182,7 @@ Although compiler enum names say `INT8_TO_BFLOAT`, live `rango` Wave-1 outputs (
 
 ### 5.2 Wave-1 Live `rango` `PM=5` Benchmark Table (`#202`)
 
-| Model (`sgs = 1` for all) | Shape `(M,K,N)` | Chunks | `ext[2]` Bytes | `hw_us` med (min) | Wall (ms) | `ext[2]` GB/s | GOPS | `relL2` vs FP32 | `relL2` vs BF16 | `relL2` vs FP16/Acc Sim |
+| Model (`sgs = 1` for all) | Shape `(M,K,N)` | Chunks | `ext[2]` Bytes | `hw_us` med (min) | Wall (ms) | Total DMA GB/s | GOPS | `relL2` vs FP32 | `relL2` vs BF16 | `relL2` vs FP16/Acc Sim |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | `huff_q4like_1x1536x1536_i8` *(W8A8 ctrl)* | `1×1536×1536` | 7 | `2,359,296` | `99` (`97`) | `0.430` | `23.86` | `47.66` | *(INT8 err ≤ 1)* | — | — |
 | `huff_gauss_1x1536x1536_i8` *(W8A8 ctrl)* | `1×1536×1536` | 7 | `2,359,296` | `111` (`100`) | `0.388` | `21.28` | `42.51` | *(INT8 err = 0)* | — | — |
@@ -195,6 +195,8 @@ Although compiler enum names say `INT8_TO_BFLOAT`, live `rango` Wave-1 outputs (
 | `w8a16_hybrid_i8_1x1536x1536` *(PC)* | `1×1536×1536` | 9 | `2,365,440` | `142` (`140`) | `0.470` | `16.74` | `33.23` | `2.671e-4` | `1.540e-3` | `1.357e-5` *(FP16 mid)* |
 | `w8a16_deq_i8_1x2048x2048` *(PC)* | `1×2048×2048` | 9 | `4,202,496` | **`233`** (`232`) | `0.584` | **`18.11`** | `36.00` | `2.803e-4` | `1.419e-3` | `1.231e-7` *(FP16 mid)* |
 | **`w8a16_deq_i8_64x1536x1536`** *(Prefill!)* | **`64×1536×1536`** | 9 | `2,365,440` | **`589`** (`587`) | `0.965` | `5.35` | **`512.72`** | **`2.778e-4`** | `1.511e-3` | `1.043e-5` *(FP16 mid)* |
+
+*Note:* `Total DMA GB/s = (ext[2] + in_bytes + out_bytes) / hw_us` (where `in_bytes = M*K` and `out_bytes = M*N` for INT8 controls, or `4*M*K` and `4*M*N` for FP32-I/O W8A16). For `64×1536×1536`, total DMA is `(2,365,440 + 393,216 + 393,216) / 589 us = 5.35 GB/s` (parameter-only `ext[2] / hw_us = 4.02 GB/s`).
 
 ### 5.3 Universal `W8A16` `ext[2]` Weight Packing Contract (`[CAUSALLY_PROVEN]`)
 
