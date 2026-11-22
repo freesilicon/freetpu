@@ -369,6 +369,26 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t *                  ctx,
     return OB_OK;
 }
 
+ob_status_t ob_gemm_register_immutable_weights(ob_context_t * ctx,
+                                               const void *   base,
+                                               size_t         size,
+                                               uint64_t       version) {
+    if (!ctx || !base || size == 0u) {
+        return OB_ERR_INVALID_ARG;
+    }
+    (void)version;
+    return OB_OK;
+}
+
+ob_status_t ob_gemm_unregister_immutable_weights(ob_context_t * ctx,
+                                                 const void *   base,
+                                                 size_t         size) {
+    if (!ctx || (!base && size != 0u)) {
+        return OB_ERR_INVALID_ARG;
+    }
+    return OB_OK;
+}
+
 ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t *                      ctx,
                                      const float *                       a_mk,
                                      const ob_gemm_swiglu_quant_desc_t * desc,

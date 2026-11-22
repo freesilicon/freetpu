@@ -542,6 +542,17 @@ typedef struct ob_swiglu_int8_desc {
   float          s_out;
 } ob_swiglu_int8_desc_t;
 
+#define OB_GEMM_WEIGHT_FLAG_IMMUTABLE 1u
+
+ob_status_t ob_gemm_register_immutable_weights(ob_context_t* ctx,
+                                               const void*   base,
+                                               size_t        size,
+                                               uint64_t      version);
+
+ob_status_t ob_gemm_unregister_immutable_weights(ob_context_t* ctx,
+                                                 const void*   base,
+                                                 size_t        size);
+
 ob_status_t ob_gemm_swiglu_int8(ob_context_t*                ctx,
                                 const int8_t*                x_mk,
                                 const ob_swiglu_int8_desc_t* desc,

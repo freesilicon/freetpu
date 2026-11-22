@@ -269,6 +269,11 @@ ob_status_t buffer_sync_end_write(ob_buffer* buf) {
 #endif
 }
 
+void buffer_retain(ob_buffer* buf) {
+  if (!buf) return;
+  buf->refcnt.fetch_add(1u, std::memory_order_relaxed);
+}
+
 }  // namespace ob
 
 extern "C" {
@@ -360,6 +365,9 @@ ob_status_t ob_buffer_alloc(ob_context_t* ctx,
 
 void ob_buffer_free(ob_buffer_t* buf) {
   if (!buf) return;
+  if (buf->refcnt.fetch_sub(1u, std::memory_order_acq_rel) > 1u) {
+    return;
+  }
   ob_context* ctx = buf->ctx;
   ob::PooledSlab slab = buf->slab;
   uint32_t flags = buf->flags;

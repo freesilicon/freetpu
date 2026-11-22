@@ -784,6 +784,7 @@ bool device_attach_inflight_buffers(ob_context* ctx,
     if (!b) continue;
     if (std::find(slot->retired_bufs.begin(), slot->retired_bufs.end(), b) ==
         slot->retired_bufs.end()) {
+      buffer_retain(b);
       slot->retired_bufs.push_back(b);
     }
   }
@@ -940,6 +941,7 @@ ob_status_t ob_context_create(const ob_config_t* config, ob_context_t** out_ctx)
   ctx->horiz_fusion_enabled = !read_env_flag("OPENBUENOS_DISABLE_HORIZ_FUSION", false);
   ctx->swiglu_chain_enabled = !read_env_flag("OPENBUENOS_DISABLE_SWIGLU_CHAIN", false);
   ctx->swiglu_prefill_enabled = read_env_flag("OPENBUENOS_SWIGLU_PREFILL", false);
+  ctx->swiglu_exact_clip_check = read_env_flag("OPENBUENOS_SWIGLU_EXACT_CLIP_CHECK", false);
   if (const char* s = std::getenv("OPENBUENOS_SWIGLU_MAX_CREST"); s && s[0]) {
     char* end = nullptr;
     float v = std::strtof(s, &end);

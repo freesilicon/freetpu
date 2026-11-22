@@ -4049,6 +4049,226 @@ void test_phase7_cycle2_regressions() {
   std::printf("[PASS] test_phase7_cycle2_regressions (balanced-corr fallback, 128-bit interior cache miss, LMKD budget recovery & pinned SwiGLU cap, float clamp, mixed profile OK)\n");
 }
 
+void test_phase7_cycle3_regressions() {
+  std::vector<uint8_t> synth_interp = make_synthetic_dive_interp(0xC3u);
+  TempBinaryFile interp_file;
+  CHECK(interp_file.write(synth_interp.data(), synth_interp.size()));
+
+  // 1. Dense GEMM single-call 16 MiB cap enforcement (6 distinct 3 MiB tiles in one batched call)
+  {
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    cfg.max_inflight = 16u;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+    CHECK(ob_gemm_register_builtin_emitter(ctx, interp_file.path()) == OB_OK);
+    ctx->simulated_mem_available_bytes = 48ULL * 1024u * 1024u; // 16 MiB budget
+    const size_t budget = ob::compute_weight_cache_budget_bytes(ctx);
+    CHECK(budget == 16ULL * 1024u * 1024u);
+
+    constexpr uint32_t K = 1536u, N = 2048u; // ~3 MiB per ext[2] tile
+    constexpr uint32_t nb_k = K / OB_QK8_0;
+    std::vector<float> a(K, 0.25f);
+    std::vector<std::vector<ob_block_q4_0_t>> weights(6u);
+    std::vector<std::vector<float>> outputs(6u, std::vector<float>(N, 0.0f));
+    ob_gemm_f32_quant_job_t jobs[6]{};
+    for (uint32_t i = 0u; i < 6u; ++i) {
+      weights[i].resize(static_cast<size_t>(N) * nb_k);
+      std::memset(weights[i].data(), 0, weights[i].size() * sizeof(ob_block_q4_0_t));
+      const uint16_t dh = fp32_to_fp16(0.05f + 0.01f * static_cast<float>(i));
+      weights[i][0].d = dh;
+      weights[i][0].qs[0] = static_cast<uint8_t>(0x33u + i);
+      jobs[i] = {weights[i].data(), outputs[i].data(), N, OB_ACT_NONE, 1u, {0, 0, 0}};
+    }
+    ob_invoke_stats_t st{};
+    CHECK(ob_gemm_matmul_f32_quant_batch(ctx, a.data(), 1u, K, jobs, 6u, &st) == OB_OK);
+    CHECK(ctx->weight_cache_bytes <= budget);
+    CHECK(ctx->weight_cache_peak_bytes <= budget);
+    ob_context_destroy(ctx);
+  }
+
+  // 2. Immutable weight O(1) hit + version bump miss + distinct buffer non-collision + past-end safety
+  {
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+    CHECK(ob_gemm_register_builtin_emitter(ctx, interp_file.path()) == OB_OK);
+
+    constexpr uint32_t K = 512u, N = 128u;
+    std::vector<int8_t> a(K, 1);
+    std::vector<int8_t> b1(static_cast<size_t>(N) * K, 0);
+    std::vector<int8_t> b2(static_cast<size_t>(N) * K, 0);
+    std::vector<int32_t> c1(N, 0), c2(N, 0), c3(N, 0);
+    b1[static_cast<size_t>(3u) * K + 77u] = 10;
+    b2[static_cast<size_t>(3u) * K + 77u] = 25;
+
+    CHECK(ob_gemm_register_immutable_weights(ctx, b1.data(), b1.size(), 1u) == OB_OK);
+    CHECK(ob_gemm_register_immutable_weights(ctx, b2.data(), b2.size(), 1u) == OB_OK);
+
+    ob_invoke_stats_t s1{}, s2{}, s3{}, s4{};
+    CHECK(ob_gemm_matmul_int8(ctx, a.data(), b1.data(), nullptr, c1.data(), 1u, K, N, 0, 0, &s1) == OB_OK);
+    CHECK(c1[3] == 10);
+    // Distinct buffer with identical version=1 must NOT collide in weight cache!
+    CHECK(ob_gemm_matmul_int8(ctx, a.data(), b2.data(), nullptr, c2.data(), 1u, K, N, 0, 0, &s2) == OB_OK);
+    CHECK(c2[3] == 25);
+    const uint64_t hits_before = ctx->weight_cache_hits;
+    // Mutate interior byte WITHOUT version bump: O(1) immutable lookup skips byte scan -> weight cache hit!
+    b1[static_cast<size_t>(3u) * K + 77u] = 42;
+    CHECK(ob_gemm_matmul_int8(ctx, a.data(), b1.data(), nullptr, c3.data(), 1u, K, N, 0, 0, &s3) == OB_OK);
+    CHECK(ctx->weight_cache_hits == hits_before + 1u);
+    // Bump version -> must miss weight cache and recompute with new value!
+    const uint64_t misses_before = ctx->weight_cache_misses;
+    CHECK(ob_gemm_register_immutable_weights(ctx, b1.data(), b1.size(), 2u) == OB_OK);
+    CHECK(ob_gemm_matmul_int8(ctx, a.data(), b1.data(), nullptr, c3.data(), 1u, K, N, 0, 0, &s4) == OB_OK);
+    CHECK(ctx->weight_cache_misses == misses_before + 1u);
+    CHECK(c3[3] == 42);
+    // Unregister b1 -> back to strict content hashing; mutating b1 now causes a miss.
+    CHECK(ob_gemm_unregister_immutable_weights(ctx, b1.data(), b1.size()) == OB_OK);
+    b1[static_cast<size_t>(3u) * K + 77u] = 55;
+    const uint64_t misses_after_unreg = ctx->weight_cache_misses;
+    CHECK(ob_gemm_matmul_int8(ctx, a.data(), b1.data(), nullptr, c3.data(), 1u, K, N, 0, 0, &s4) == OB_OK);
+    CHECK(ctx->weight_cache_misses == misses_after_unreg + 1u);
+    CHECK(c3[3] == 55);
+
+    ob_context_destroy(ctx);
+  }
+
+  // 3. Refcounted buffer retention across inflight timeout attachment
+  {
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+
+    ob_buffer_t* b = nullptr;
+    CHECK(ob_buffer_alloc(ctx, 4096u, OB_BUF_BIDIRECTIONAL | OB_BUF_NO_POOL, &b) == OB_OK);
+    CHECK(b != nullptr && b->refcnt.load(std::memory_order_acquire) == 1u);
+    ob::buffer_retain(b);
+    CHECK(b->refcnt.load(std::memory_order_acquire) == 2u);
+    // First free drops refcnt to 1 without freeing the slab/object.
+    ob_buffer_free(b);
+    CHECK(b->refcnt.load(std::memory_order_acquire) == 1u);
+    CHECK(ob_buffer_data(b) != nullptr);
+    // Attach to a mock inflight credit slot -> retains another ref (refcnt=2).
+    ob_exec_handle_t fake_h = 0x12345678u;
+    {
+      std::lock_guard<std::mutex> lk(ctx->vii_mu);
+      ctx->credits[0].state = ob::CreditSlot::IN_FLIGHT;
+      ctx->credits[0].handle = fake_h;
+      ctx->credits[0].seq = 999u;
+    }
+    CHECK(ob::device_attach_inflight_buffers(ctx, fake_h, {b}) == true);
+    CHECK(b->refcnt.load(std::memory_order_acquire) == 2u);
+    // Caller releases its ref; buffer stays alive inside inflight slot (refcnt=1).
+    ob_buffer_free(b);
+    CHECK(b->refcnt.load(std::memory_order_acquire) == 1u);
+    // Context destroy drains/frees retired_bufs cleanly.
+    ob_context_destroy(ctx);
+  }
+
+  // 4. Warm SwiGLU skips CPU clip scan on benign warm calls; OPENBUENOS_SWIGLU_EXACT_CLIP_CHECK=1 catches warm clip
+  {
+    constexpr uint32_t K = 576u, H = 1536u, N = 576u;
+    const uint32_t nb_k = K / OB_QK8_0;
+    const uint32_t nb_h = H / OB_QK8_0;
+    const uint16_t d_1_128 = fp32_to_fp16(1.0f / 128.0f);
+    const uint16_t d_one = fp32_to_fp16(1.0f);
+
+    std::vector<ob_block_q8_0_t> wg(static_cast<size_t>(H) * nb_k);
+    std::vector<ob_block_q8_0_t> wu(static_cast<size_t>(H) * nb_k);
+    std::vector<ob_block_q8_0_t> wd(static_cast<size_t>(N) * nb_h);
+    std::memset(wg.data(), 0, wg.size() * sizeof(ob_block_q8_0_t));
+    std::memset(wu.data(), 0, wu.size() * sizeof(ob_block_q8_0_t));
+    std::memset(wd.data(), 0, wd.size() * sizeof(ob_block_q8_0_t));
+    // Row 0 has +/-1/128 on first 128 entries; remaining rows have same norm on disjoint blocks
+    // so max_wg <= 16*mean_row_max_wg and dc_g_max == 0.
+    for (uint32_t h = 0u; h < H; ++h) {
+      const uint32_t bk0 = (h == 0u) ? 0u : (4u + (h % 14u));
+      const uint32_t bk_cnt = (h == 0u) ? 4u : 1u;
+      for (uint32_t b = 0u; b < bk_cnt; ++b) {
+        ob_block_q8_0_t& bg = wg[static_cast<size_t>(h) * nb_k + bk0 + b];
+        ob_block_q8_0_t& bu = wu[static_cast<size_t>(h) * nb_k + bk0 + b];
+        bg.d = d_1_128;
+        bu.d = d_1_128;
+        for (uint32_t j = 0u; j < OB_QK8_0; ++j) {
+          const int8_t v = ((b * OB_QK8_0 + j) & 1u) ? -127 : 127;
+          bg.qs[j] = v;
+          bu.qs[j] = v;
+        }
+      }
+    }
+    wd[0].d = d_one;
+    wd[0].qs[0] = 1;
+
+    // Cold benign input: orthogonal to row 0 (zeros on [0..128), balanced +/-0.1 on [128..576)),
+    // crest < 10, rms_aq < 42, zero clipping -> populates weight cache with swiglu_needs_exact_check=false.
+    std::vector<float> a_benign(K, 0.0f);
+    for (uint32_t k = 128u; k < K; ++k) {
+      a_benign[k] = ((k % 4u) < 2u) ? 0.1f : -0.1f;
+    }
+    a_benign[575] = 0.5f;
+
+    // Crafted warm clipping input: aligned with row 0 on [0..128) (+/-1.0) + spike 3.0 ->
+    // rms_aq ~ 20 <= 42, crest ~ 6.4 <= 10, dc == 0, but exact dot with row 0 clips!
+    std::vector<float> a_clip(K, 0.0f);
+    for (uint32_t k = 0u; k < 128u; ++k) {
+      a_clip[k] = (k & 1u) ? -1.0f : 1.0f;
+    }
+    a_clip[575] = 3.0f;
+
+    ob_gemm_swiglu_quant_desc_t sd{wg.data(), wu.data(), wd.data(), 1u, K, H, N, 0u, 0u, 0u, 0u};
+    std::vector<float> c(N, 0.0f);
+
+    // 4a: Default (OPENBUENOS_SWIGLU_EXACT_CLIP_CHECK unset): warm call skips CPU exact scan -> chained!
+    ::unsetenv("OPENBUENOS_SWIGLU_EXACT_CLIP_CHECK");
+    {
+      ob_config_t cfg = ob_config_default();
+      cfg.mock_mode = 1;
+      ob_context_t* ctx = nullptr;
+      CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+      CHECK(ob_gemm_register_builtin_emitter(ctx, interp_file.path()) == OB_OK);
+      CHECK(ctx->swiglu_exact_clip_check == false);
+
+      ob_invoke_stats_t s1{}, s2{};
+      CHECK(ob_gemm_swiglu_f32_quant(ctx, a_benign.data(), &sd, c.data(), &s1) == OB_OK);
+      ob_profile_stats_t p1{}, p2{};
+      CHECK(ob_context_get_profile(ctx, &p1) == OB_OK);
+      CHECK(p1.swiglu_chunks_chained == 1u && p1.swiglu_fallbacks == 0u);
+
+      CHECK(ob_gemm_swiglu_f32_quant(ctx, a_clip.data(), &sd, c.data(), &s2) == OB_OK);
+      CHECK(ob_context_get_profile(ctx, &p2) == OB_OK);
+      CHECK(p2.swiglu_chunks_chained == 2u && p2.swiglu_fallbacks == 0u);
+      ob_context_destroy(ctx);
+    }
+
+    // 4b: OPENBUENOS_SWIGLU_EXACT_CLIP_CHECK=1: warm call decodes cached ext[2], catches clip -> fallback!
+    ::setenv("OPENBUENOS_SWIGLU_EXACT_CLIP_CHECK", "1", 1);
+    {
+      ob_config_t cfg = ob_config_default();
+      cfg.mock_mode = 1;
+      ob_context_t* ctx = nullptr;
+      CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+      CHECK(ob_gemm_register_builtin_emitter(ctx, interp_file.path()) == OB_OK);
+      CHECK(ctx->swiglu_exact_clip_check == true);
+
+      ob_invoke_stats_t s1{}, s2{};
+      CHECK(ob_gemm_swiglu_f32_quant(ctx, a_benign.data(), &sd, c.data(), &s1) == OB_OK);
+      ob_profile_stats_t p1{}, p2{};
+      CHECK(ob_context_get_profile(ctx, &p1) == OB_OK);
+      CHECK(p1.swiglu_chunks_chained == 1u && p1.swiglu_fallbacks == 0u);
+
+      CHECK(ob_gemm_swiglu_f32_quant(ctx, a_clip.data(), &sd, c.data(), &s2) == OB_OK);
+      CHECK(ob_context_get_profile(ctx, &p2) == OB_OK);
+      CHECK(p2.swiglu_chunks_chained == 1u && p2.swiglu_fallbacks == 1u);
+      ob_context_destroy(ctx);
+    }
+    ::unsetenv("OPENBUENOS_SWIGLU_EXACT_CLIP_CHECK");
+  }
+
+  std::printf("[PASS] test_phase7_cycle3_regressions (dense 16MiB cap, immutable O(1) hit+version miss, refcnt timeout retention, warm SwiGLU skip + EXACT_CLIP_CHECK=1 OK)\n");
+}
+
 }  // namespace
 
 int main() {
@@ -4071,9 +4291,10 @@ int main() {
   test_phase7a_neon_horiz_fusion_profiler_and_lmkd();
   test_phase7b_swiglu_chaining_2tier_and_outlier_cache();
   test_phase7_cycle2_regressions();
+  test_phase7_cycle3_regressions();
 
   if (g_failures == 0) {
-    std::printf("ALL LIBOPENBUENOS HOST TESTS PASSED (19/19 suites)\n");
+    std::printf("ALL LIBOPENBUENOS HOST TESTS PASSED (20/20 suites)\n");
     return 0;
   }
   std::fprintf(stderr, "LIBOPENBUENOS HOST TESTS FAILED (%d failures)\n", g_failures);
