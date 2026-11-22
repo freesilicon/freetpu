@@ -1304,12 +1304,6 @@ TPU Device Status
             )
             import time as _time
 
-            orig_run = tpu_exporter.subprocess.run
-
-            def _run_with_fake_pkg(cmd, *args, **kwargs):
-                kwargs.setdefault("env", env_with_fake)
-                return orig_run(cmd, *args, **kwargs)
-
             server = tpu_exporter._ExporterServer(
                 ("127.0.0.1", 0),
                 tpu_exporter._ExporterHandler,
@@ -1324,7 +1318,7 @@ TPU Device Status
             try:
                 with (
                     mock.patch("tpu_exporter.importlib.util.find_spec", return_value=object()),
-                    mock.patch("tpu_exporter.subprocess.run", side_effect=_run_with_fake_pkg),
+                    mock.patch.dict(os.environ, {"PYTHONPATH": env_with_fake["PYTHONPATH"]}),
                 ):
                     t_start = _time.monotonic()
                     snap_to = server.scrape()
@@ -1715,6 +1709,39 @@ TPU Runtime Utilization
             parser = tpu_exporter.build_arg_parser()
             self.assertTrue(parser.parse_args(["--no-pid-scan"]).no_pid_scan)
             self.assertFalse(parser.parse_args(["--no-pid-scan", "--pid-scan"]).no_pid_scan)
+
+            # Timing out a `tpu-info` CLI process must kill its entire process group
+            # (including grandchildren spawned without their own timeout).
+            child_pid_file = root / "grandchild.pid"
+            stalling_cli = root / "stalling-tpu-info"
+            stalling_cli.write_text(
+                f"#!{sys.executable}\n"
+                "import subprocess, sys, time\n"
+                "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+                f"open({str(child_pid_file)!r}, 'w').write(str(child.pid))\n"
+                "child.wait()\n",
+                encoding="utf-8",
+            )
+            stalling_cli.chmod(0o755)
+            ok_stall, err_stall, _rows_stall = tpu_exporter._run_tpu_info(
+                str(stalling_cli), timeout_s=0.5
+            )
+            self.assertFalse(ok_stall)
+            self.assertIn("timed out", (err_stall or "").lower())
+            self.assertTrue(child_pid_file.exists())
+            grandchild_pid = int(child_pid_file.read_text(encoding="utf-8").strip())
+            # Wait briefly for kernel process reaping after SIGKILL to process group.
+            import time as _time2
+            deadline_reap = _time2.monotonic() + 2.0
+            alive = True
+            while _time2.monotonic() < deadline_reap:
+                try:
+                    os.kill(grandchild_pid, 0)
+                except ProcessLookupError:
+                    alive = False
+                    break
+                _time2.sleep(0.05)
+            self.assertFalse(alive, f"grandchild pid {grandchild_pid} survived tpu-info timeout")
 
             # Oversized HTTP headers (> MAX_HTTP_HEADER_BYTES) are rejected with 431 before scrape.
             import socket as _socket

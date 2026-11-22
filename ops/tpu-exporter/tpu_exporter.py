@@ -31,6 +31,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -599,6 +600,56 @@ def parse_tpu_info_output(output: str) -> Dict[str, _TpuInfoRow]:
     return rows
 
 
+def _terminate_process_group(proc: subprocess.Popen[str]) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        pass
+    for pipe in (proc.stdout, proc.stderr):
+        if pipe is not None:
+            try:
+                pipe.close()
+            except OSError:
+                pass
+
+
+def _run_subprocess_bounded(
+    cmd: Sequence[str],
+    *,
+    timeout_s: float,
+    env: Optional[Dict[str, str]] = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run a child command in its own process group and kill the full group on timeout."""
+    proc = subprocess.Popen(
+        list(cmd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout_s)
+        return subprocess.CompletedProcess(
+            args=list(cmd),
+            returncode=proc.returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
+    except BaseException:
+        _terminate_process_group(proc)
+        raise
+
+
 def _run_tpu_info(
     tpu_info_bin: Optional[str],
     timeout_s: float,
@@ -619,12 +670,9 @@ def _run_tpu_info(
     run_env.setdefault("COLUMNS", "240")
     run_env.setdefault("NO_COLOR", "1")
     try:
-        proc = subprocess.run(
+        proc = _run_subprocess_bounded(
             [resolved],
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-            check=False,
+            timeout_s=timeout_s,
             env=run_env,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -772,12 +820,9 @@ def _query_tpu_info_python_metrics(
         return False, f"tpu_info python API unavailable: {exc}", {}
 
     try:
-        proc = subprocess.run(
+        proc = _run_subprocess_bounded(
             [sys.executable, "-c", _PY_METRICS_SUBPROCESS_HELPER, chip_attr, addr, str(deadline_s)],
-            capture_output=True,
-            text=True,
-            timeout=deadline_s,
-            check=False,
+            timeout_s=deadline_s,
         )
     except subprocess.TimeoutExpired:
         return False, f"tpu_info.metrics query timed out after {deadline_s}s ({addr})", {}
