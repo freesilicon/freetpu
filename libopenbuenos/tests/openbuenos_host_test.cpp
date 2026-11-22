@@ -4131,6 +4131,53 @@ void test_phase7_cycle3_regressions() {
     CHECK(ctx->weight_cache_misses == misses_after_unreg + 1u);
     CHECK(c3[3] == 55);
 
+    // Re-registering the SAME address with the SAME initial version=1 after unregister MUST
+    // receive a fresh generation identity (no stale hit from the previous allocation lifetime!).
+    b1[static_cast<size_t>(3u) * K + 77u] = 77;
+    CHECK(ob_gemm_register_immutable_weights(ctx, b1.data(), b1.size(), 1u) == OB_OK);
+    const uint64_t misses_before_rereg = ctx->weight_cache_misses;
+    CHECK(ob_gemm_matmul_int8(ctx, a.data(), b1.data(), nullptr, c3.data(), 1u, K, N, 0, 0, &s4) == OB_OK);
+    CHECK(ctx->weight_cache_misses == misses_before_rereg + 1u);
+    CHECK(c3[3] == 77);
+
+    ob_context_destroy(ctx);
+  }
+
+  // 2b. Warm inference enforces a shrinking weight-cache budget under memory pressure
+  {
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    cfg.max_inflight = 16u;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+    CHECK(ob_gemm_register_builtin_emitter(ctx, interp_file.path()) == OB_OK);
+    ctx->simulated_mem_available_bytes = 192ULL * 1024u * 1024u; // 64 MiB cap
+
+    constexpr uint32_t K = 1536u, N = 2048u; // ~3 MiB per ext[2] tile
+    constexpr uint32_t nb_k = K / OB_QK8_0;
+    std::vector<float> a(K, 0.25f);
+    std::vector<std::vector<ob_block_q4_0_t>> weights(8u);
+    std::vector<std::vector<float>> outputs(8u, std::vector<float>(N, 0.0f));
+    for (uint32_t i = 0u; i < 8u; ++i) {
+      weights[i].resize(static_cast<size_t>(N) * nb_k);
+      std::memset(weights[i].data(), 0, weights[i].size() * sizeof(ob_block_q4_0_t));
+      weights[i][0].d = fp32_to_fp16(0.05f + 0.01f * static_cast<float>(i));
+      weights[i][0].qs[0] = static_cast<uint8_t>(0x40u + i);
+      ob_gemm_f32_quant_job_t job{weights[i].data(), outputs[i].data(), N, OB_ACT_NONE, 1u, {0, 0, 0}};
+      ob_invoke_stats_t st{};
+      CHECK(ob_gemm_matmul_f32_quant_batch(ctx, a.data(), 1u, K, &job, 1u, &st) == OB_OK);
+    }
+    CHECK(ctx->weight_cache_bytes > 16ULL * 1024u * 1024u);
+
+    // Shrink MemAvailable so effective budget drops to 16 MiB, then run a warm cache hit:
+    // hit path must refresh the budget and evict idle entries down to <= 16 MiB!
+    ctx->simulated_mem_available_bytes = 48ULL * 1024u * 1024u; // 16 MiB cap
+    const uint64_t hits_before = ctx->weight_cache_hits;
+    ob_gemm_f32_quant_job_t warm_job{weights[0].data(), outputs[0].data(), N, OB_ACT_NONE, 1u, {0, 0, 0}};
+    ob_invoke_stats_t ws{};
+    CHECK(ob_gemm_matmul_f32_quant_batch(ctx, a.data(), 1u, K, &warm_job, 1u, &ws) == OB_OK);
+    CHECK(ctx->weight_cache_hits == hits_before + 1u);
+    CHECK(ctx->weight_cache_bytes <= 16ULL * 1024u * 1024u);
     ob_context_destroy(ctx);
   }
 
@@ -4167,7 +4214,7 @@ void test_phase7_cycle3_regressions() {
     ob_context_destroy(ctx);
   }
 
-  // 4. Warm SwiGLU skips CPU clip scan on benign warm calls; OPENBUENOS_SWIGLU_EXACT_CLIP_CHECK=1 catches warm clip
+  // 4. Warm SwiGLU always enforces clipping check whenever Holder bounds fail (reusing cached ext[2])
   {
     constexpr uint32_t K = 576u, H = 1536u, N = 576u;
     const uint32_t nb_k = K / OB_QK8_0;
@@ -4181,8 +4228,6 @@ void test_phase7_cycle3_regressions() {
     std::memset(wg.data(), 0, wg.size() * sizeof(ob_block_q8_0_t));
     std::memset(wu.data(), 0, wu.size() * sizeof(ob_block_q8_0_t));
     std::memset(wd.data(), 0, wd.size() * sizeof(ob_block_q8_0_t));
-    // Row 0 has +/-1/128 on first 128 entries; remaining rows have same norm on disjoint blocks
-    // so max_wg <= 16*mean_row_max_wg and dc_g_max == 0.
     for (uint32_t h = 0u; h < H; ++h) {
       const uint32_t bk0 = (h == 0u) ? 0u : (4u + (h % 14u));
       const uint32_t bk_cnt = (h == 0u) ? 4u : 1u;
@@ -4201,16 +4246,15 @@ void test_phase7_cycle3_regressions() {
     wd[0].d = d_one;
     wd[0].qs[0] = 1;
 
-    // Cold benign input: orthogonal to row 0 (zeros on [0..128), balanced +/-0.1 on [128..576)),
-    // crest < 10, rms_aq < 42, zero clipping -> populates weight cache with swiglu_needs_exact_check=false.
+    // Cold benign input: orthogonal to row 0 -> chains cleanly and warms weight cache.
     std::vector<float> a_benign(K, 0.0f);
     for (uint32_t k = 128u; k < K; ++k) {
       a_benign[k] = ((k % 4u) < 2u) ? 0.1f : -0.1f;
     }
     a_benign[575] = 0.5f;
 
-    // Crafted warm clipping input: aligned with row 0 on [0..128) (+/-1.0) + spike 3.0 ->
-    // rms_aq ~ 20 <= 42, crest ~ 6.4 <= 10, dc == 0, but exact dot with row 0 clips!
+    // Warm clipping input: aligned with row 0 on [0..128) (+/-1.0) + spike 3.0 ->
+    // fails Holder bound; exact check from cached ext[2] MUST catch intermediate clip and fall back!
     std::vector<float> a_clip(K, 0.0f);
     for (uint32_t k = 0u; k < 128u; ++k) {
       a_clip[k] = (k & 1u) ? -1.0f : 1.0f;
@@ -4220,53 +4264,29 @@ void test_phase7_cycle3_regressions() {
     ob_gemm_swiglu_quant_desc_t sd{wg.data(), wu.data(), wd.data(), 1u, K, H, N, 0u, 0u, 0u, 0u};
     std::vector<float> c(N, 0.0f);
 
-    // 4a: Default (OPENBUENOS_SWIGLU_EXACT_CLIP_CHECK unset): warm call skips CPU exact scan -> chained!
-    ::unsetenv("OPENBUENOS_SWIGLU_EXACT_CLIP_CHECK");
-    {
-      ob_config_t cfg = ob_config_default();
-      cfg.mock_mode = 1;
-      ob_context_t* ctx = nullptr;
-      CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
-      CHECK(ob_gemm_register_builtin_emitter(ctx, interp_file.path()) == OB_OK);
-      CHECK(ctx->swiglu_exact_clip_check == false);
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    cfg.max_inflight = 1u; // Also exercises 1-credit pinned weight tile path!
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+    CHECK(ob_gemm_register_builtin_emitter(ctx, interp_file.path()) == OB_OK);
 
-      ob_invoke_stats_t s1{}, s2{};
-      CHECK(ob_gemm_swiglu_f32_quant(ctx, a_benign.data(), &sd, c.data(), &s1) == OB_OK);
-      ob_profile_stats_t p1{}, p2{};
-      CHECK(ob_context_get_profile(ctx, &p1) == OB_OK);
-      CHECK(p1.swiglu_chunks_chained == 1u && p1.swiglu_fallbacks == 0u);
+    ob_invoke_stats_t s1{}, s2{};
+    CHECK(ob_gemm_swiglu_f32_quant(ctx, a_benign.data(), &sd, c.data(), &s1) == OB_OK);
+    ob_profile_stats_t p1{}, p2{};
+    CHECK(ob_context_get_profile(ctx, &p1) == OB_OK);
+    CHECK(p1.swiglu_chunks_chained == 1u && p1.swiglu_fallbacks == 0u);
 
-      CHECK(ob_gemm_swiglu_f32_quant(ctx, a_clip.data(), &sd, c.data(), &s2) == OB_OK);
-      CHECK(ob_context_get_profile(ctx, &p2) == OB_OK);
-      CHECK(p2.swiglu_chunks_chained == 2u && p2.swiglu_fallbacks == 0u);
-      ob_context_destroy(ctx);
-    }
-
-    // 4b: OPENBUENOS_SWIGLU_EXACT_CLIP_CHECK=1: warm call decodes cached ext[2], catches clip -> fallback!
-    ::setenv("OPENBUENOS_SWIGLU_EXACT_CLIP_CHECK", "1", 1);
-    {
-      ob_config_t cfg = ob_config_default();
-      cfg.mock_mode = 1;
-      ob_context_t* ctx = nullptr;
-      CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
-      CHECK(ob_gemm_register_builtin_emitter(ctx, interp_file.path()) == OB_OK);
-      CHECK(ctx->swiglu_exact_clip_check == true);
-
-      ob_invoke_stats_t s1{}, s2{};
-      CHECK(ob_gemm_swiglu_f32_quant(ctx, a_benign.data(), &sd, c.data(), &s1) == OB_OK);
-      ob_profile_stats_t p1{}, p2{};
-      CHECK(ob_context_get_profile(ctx, &p1) == OB_OK);
-      CHECK(p1.swiglu_chunks_chained == 1u && p1.swiglu_fallbacks == 0u);
-
-      CHECK(ob_gemm_swiglu_f32_quant(ctx, a_clip.data(), &sd, c.data(), &s2) == OB_OK);
-      CHECK(ob_context_get_profile(ctx, &p2) == OB_OK);
-      CHECK(p2.swiglu_chunks_chained == 1u && p2.swiglu_fallbacks == 1u);
-      ob_context_destroy(ctx);
-    }
-    ::unsetenv("OPENBUENOS_SWIGLU_EXACT_CLIP_CHECK");
+    CHECK(ob_gemm_swiglu_f32_quant(ctx, a_clip.data(), &sd, c.data(), &s2) == OB_OK);
+    CHECK(ob_context_get_profile(ctx, &p2) == OB_OK);
+    CHECK(p2.swiglu_chunks_chained == 1u && p2.swiglu_fallbacks == 1u);
+    const double expected_dot = 128.0 * (127.0 / 128.0);
+    const double expected_y0 = (expected_dot / (1.0 + std::exp(-expected_dot))) * expected_dot;
+    CHECK(std::fabs(static_cast<double>(c[0]) - expected_y0) / expected_y0 < 5e-3);
+    ob_context_destroy(ctx);
   }
 
-  std::printf("[PASS] test_phase7_cycle3_regressions (dense 16MiB cap, immutable O(1) hit+version miss, refcnt timeout retention, warm SwiGLU skip + EXACT_CLIP_CHECK=1 OK)\n");
+  std::printf("[PASS] test_phase7_cycle3_regressions (dense 16MiB cap, immutable gen+O(1) hit, warm budget shrink, refcnt timeout retention, warm SwiGLU clip guard OK)\n");
 }
 
 }  // namespace

@@ -268,7 +268,6 @@ struct CachedWeightTile {
   bool in_cache = false;
   bool rejected_fusion = false; // O(1) cached split decision when fused D spread > 1.5x
   bool rejected_swiglu = false; // O(1) cached fallback when W_gate row-scale spread is extreme
-  bool swiglu_needs_exact_check = false; // sticky flag when dynamic divider tuning adjusted this chunk
 };
 
 // Built-in nanosecond stage profiler accumulators (zero clock_gettime when profile_enabled=false).
@@ -434,6 +433,7 @@ struct ImmutableWeightRegion {
   uintptr_t begin = 0u;
   uintptr_t end = 0u;
   uint64_t version = 0u;
+  uint64_t generation = 0u;
 };
 
 void set_last_error(ob_context* ctx, const std::string& msg);
@@ -480,7 +480,6 @@ struct ob_context {
   bool horiz_fusion_enabled = true;
   bool swiglu_chain_enabled = true;
   bool swiglu_prefill_enabled = false;
-  bool swiglu_exact_clip_check = false;
   float swiglu_max_crest = 16.0f;
   uint32_t param_swap_slots = 1u;
   uint32_t spin_us = 450u; // Adaptive spin window (us) before poll(resp_efd) when ema_hw_us < 600
@@ -554,6 +553,7 @@ struct ob_context {
   size_t weight_cache_max_bytes = 0;   // lazily initialized (min(2048 MiB, MemAvailable/3) on Android)
   size_t weight_cache_max_entries = 0; // FD-safe cap (default 4096, env OPENBUENOS_WEIGHT_CACHE_ENTRIES)
   std::vector<ob::ImmutableWeightRegion> immutable_weight_regions;
+  uint64_t next_immutable_region_gen = 1u;
   size_t simulated_mem_available_bytes = 0; // Optional test override for LMKD budget verification
   uint64_t weight_cache_hits = 0;
   uint64_t weight_cache_misses = 0;

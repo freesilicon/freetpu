@@ -1212,7 +1212,10 @@ int run_test_quant_batch(int iters, int perf_mode, const char* dive_interp_path,
     double e_v = nmse_vs_ref(a, dv, cv, M, K, Nkv, OB_ACT_NONE);
     double max_e = std::max(e_q, std::max(e_k, e_v));
     bool ok = (st == OB_OK) && (s_warm.tiles_dispatched == exp_qkv_tiles) &&
-              (s_warm.cache_hits == exp_qkv_tiles) && (max_e < 1.5e-3);
+              (s_warm.cache_hits == exp_qkv_tiles) &&
+              std::isfinite(e_q) && (e_q < 1.5e-3) &&
+              std::isfinite(e_k) && (e_k < 1.5e-3) &&
+              std::isfinite(e_v) && (e_v < 1.5e-3);
     if (!ok) all_ok = false;
     std::printf("quant_batch[q4_qkv_1x576]: ok=%d pm=%u wl=%d tiles=%u hits=%u cold_us=%llu warm_hw_us=%llu warm_wall_us=%llu max_nmse=%.2e\n",
                 ok ? 1 : 0, ctx->cfg.perf_mode, ctx->fw_wakelock_held ? 1 : 0,
@@ -1251,7 +1254,10 @@ int run_test_quant_batch(int iters, int perf_mode, const char* dive_interp_path,
     double e_v = nmse_vs_ref(a, dv, cv, M, K, Nkv, OB_ACT_NONE);
     double max_e = std::max(e_q, std::max(e_k, e_v));
     bool ok = (st == OB_OK) && (s_warm.tiles_dispatched == exp_qkv_tiles) &&
-              (s_warm.cache_hits == exp_qkv_tiles) && (max_e < 1.5e-3);
+              (s_warm.cache_hits == exp_qkv_tiles) &&
+              std::isfinite(e_q) && (e_q < 1.5e-3) &&
+              std::isfinite(e_k) && (e_k < 1.5e-3) &&
+              std::isfinite(e_v) && (e_v < 1.5e-3);
     if (!ok) all_ok = false;
     std::printf("quant_batch[q8_qkv_1x1536]: ok=%d pm=%u wl=%d tiles=%u hits=%u cold_us=%llu warm_hw_us=%llu warm_wall_us=%llu max_nmse=%.2e\n",
                 ok ? 1 : 0, ctx->cfg.perf_mode, ctx->fw_wakelock_held ? 1 : 0,
@@ -1292,7 +1298,10 @@ int run_test_quant_batch(int iters, int perf_mode, const char* dive_interp_path,
     double e_v = nmse_vs_ref(a, dv, cv, M, K, Nkv, OB_ACT_NONE);
     double max_e = std::max(e_q, std::max(e_k, e_v));
     bool ok = (st == OB_OK) && (s_warm.tiles_dispatched == exp_qkv_tiles) &&
-              (s_warm.cache_hits == exp_qkv_tiles) && (max_e < 2.0e-3);
+              (s_warm.cache_hits == exp_qkv_tiles) &&
+              std::isfinite(e_q) && (e_q < 2.0e-3) &&
+              std::isfinite(e_k) && (e_k < 2.0e-3) &&
+              std::isfinite(e_v) && (e_v < 2.0e-3);
     if (!ok) all_ok = false;
     std::printf("quant_batch[q4_qkv_64x576]: ok=%d pm=%u wl=%d tiles=%u hits=%u cold_us=%llu warm_hw_us=%llu warm_wall_us=%llu max_nmse=%.2e\n",
                 ok ? 1 : 0, ctx->cfg.perf_mode, ctx->fw_wakelock_held ? 1 : 0,
@@ -1329,7 +1338,9 @@ int run_test_quant_batch(int iters, int perf_mode, const char* dive_interp_path,
     double e_u = nmse_vs_ref(a, du, cu, M, K, N, OB_ACT_NONE);
     double max_e = std::max(e_g, e_u);
     bool ok = (st == OB_OK) && (s_warm.tiles_dispatched == 2u) &&
-              (s_warm.cache_hits == 2u) && (max_e < 2.0e-3);
+              (s_warm.cache_hits == 2u) &&
+              std::isfinite(e_g) && (e_g < 2.0e-3) &&
+              std::isfinite(e_u) && (e_u < 2.0e-3);
     if (!ok) all_ok = false;
     std::printf("quant_batch[q4_gate_up_64x576x1536]: ok=%d pm=%u wl=%d tiles=%u hits=%u cold_us=%llu warm_hw_us=%llu warm_wall_us=%llu max_nmse=%.2e\n",
                 ok ? 1 : 0, ctx->cfg.perf_mode, ctx->fw_wakelock_held ? 1 : 0,

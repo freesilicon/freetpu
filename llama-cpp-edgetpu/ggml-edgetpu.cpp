@@ -1109,7 +1109,7 @@ static void edgetpu_rope_cache_init(float         theta_base,
 static inline void edgetpu_rotate_pairs_neox_f32(int64_t n_dims, const float * cache, const float * src, float * dst) {
     const int64_t half = n_dims / 2;
     int64_t ic = 0;
-#if defined(__ARM_NEON)
+#if defined(__ARM_NEON) && defined(__aarch64__)
     for (; ic + 4 <= half; ic += 4) {
         const float32x4x2_t cs = vld2q_f32(cache + 2 * ic);
         const float32x4_t   x0 = vld1q_f32(src + ic);
@@ -1145,7 +1145,7 @@ static inline void edgetpu_rotate_pairs_neox_f32(int64_t n_dims, const float * c
 
 static inline void edgetpu_rotate_pairs_normal_f32(int64_t n_dims, const float * cache, const float * src, float * dst) {
     int64_t i0 = 0;
-#if defined(__ARM_NEON)
+#if defined(__ARM_NEON) && defined(__aarch64__)
     for (; i0 + 8 <= n_dims; i0 += 8) {
         const float32x4x2_t cs = vld2q_f32(cache + i0);
         const float32x4x2_t x  = vld2q_f32(src + i0);
@@ -1261,7 +1261,7 @@ static ggml_status ggml_edgetpu_compute_forward_rope(ggml_backend_edgetpu_contex
     return GGML_STATUS_SUCCESS;
 }
 
-#if defined(__ARM_NEON)
+#if defined(__ARM_NEON) && defined(__aarch64__)
 // High-accuracy (< 2 ULP) vectorized expf for ARM64 NEON (Cody-Waite + degree-5 minimax).
 static inline float32x4_t edgetpu_vexpq_f32(float32x4_t x) {
     const float32x4_t v_min   = vdupq_n_f32(-87.3f);
@@ -1301,7 +1301,7 @@ static inline void swiglu_f32_row(float * __restrict dst,
                                   const float * __restrict up,
                                   int64_t n) {
     int64_t i = 0;
-#if defined(__ARM_NEON)
+#if defined(__ARM_NEON) && defined(__aarch64__)
     const float32x4_t v_one = vdupq_n_f32(1.0f);
     for (; i + 8 <= n; i += 8) {
         const float32x4_t g0 = vld1q_f32(gate + i);
@@ -1670,7 +1670,7 @@ static ggml_status ggml_edgetpu_compute_forward_silu(ggml_backend_edgetpu_contex
     float *       y = reinterpret_cast<float *>(dst->data);
 
     int64_t i = 0;
-#if defined(__ARM_NEON)
+#if defined(__ARM_NEON) && defined(__aarch64__)
     const float32x4_t v_one = vdupq_n_f32(1.0f);
     for (; i + 4 <= n; i += 4) {
         const float32x4_t g = vld1q_f32(x + i);

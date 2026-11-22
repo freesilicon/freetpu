@@ -212,6 +212,7 @@ bool lookup_immutable_region_locked(const ob_context* ctx,
                                     uint32_t tn,
                                     size_t row_bytes,
                                     uint64_t* out_version,
+                                    uint64_t* out_generation,
                                     uint64_t* out_offset) {
   if (!ctx || !ptr || tn == 0u || row_bytes == 0u || ctx->immutable_weight_regions.empty()) {
     return false;
@@ -228,6 +229,7 @@ bool lookup_immutable_region_locked(const ob_context* ctx,
     if (addr >= r.begin && addr <= r.end &&
         span_bytes <= static_cast<size_t>(r.end - addr)) {
       *out_version = r.version;
+      *out_generation = r.generation;
       *out_offset = static_cast<uint64_t>(addr - r.begin);
       return true;
     }
@@ -243,13 +245,15 @@ void hash_weight_tile_for_ctx(const ob_context* ctx,
                               size_t row_bytes,
                               bool strict_hash) {
   uint64_t reg_ver = 0u;
+  uint64_t reg_gen = 0u;
   uint64_t reg_off = 0u;
   if (lookup_immutable_region_locked(
-          ctx, base, row_stride_bytes, tn, row_bytes, &reg_ver, &reg_off)) {
-    const uint64_t imm_hdr[7] = {
+          ctx, base, row_stride_bytes, tn, row_bytes, &reg_ver, &reg_gen, &reg_off)) {
+    const uint64_t imm_hdr[8] = {
         0x494D4D5554575431ULL, // "IMMUTWT1"
         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(base)),
         reg_ver,
+        reg_gen,
         reg_off,
         static_cast<uint64_t>(row_stride_bytes),
         static_cast<uint64_t>(tn),
@@ -260,6 +264,34 @@ void hash_weight_tile_for_ctx(const ob_context* ctx,
   }
   hash_weight_tile_fast(st, base, row_stride_bytes, tn, row_bytes, strict_hash);
 }
+
+struct PinnedWeightTile {
+  CachedWeightTile* tile = nullptr;
+  PinnedWeightTile() = default;
+  explicit PinnedWeightTile(CachedWeightTile* t) : tile(t) {
+    if (tile) tile->in_use += 1u;
+  }
+  PinnedWeightTile(const PinnedWeightTile&) = delete;
+  PinnedWeightTile& operator=(const PinnedWeightTile&) = delete;
+  void reset(CachedWeightTile* t = nullptr) {
+    if (tile == t) return;
+    if (tile) {
+      if (tile->in_use > 0u) tile->in_use -= 1u;
+      if (!tile->in_cache && tile->in_use == 0u) {
+        if (tile->ext2_buf) ob_buffer_free(tile->ext2_buf);
+        delete tile;
+      }
+    }
+    tile = t;
+    if (tile) tile->in_use += 1u;
+  }
+  CachedWeightTile* release() {
+    CachedWeightTile* t = tile;
+    tile = nullptr;
+    return t;
+  }
+  ~PinnedWeightTile() { reset(); }
+};
 
 struct ScopedBufferRef {
   ob_buffer* buf = nullptr;
@@ -416,18 +448,9 @@ void ensure_weight_cache_budget(ob_context* ctx, bool refresh_meminfo = false) {
   }
 }
 
-CachedWeightTile* weight_cache_find_locked(ob_context* ctx, const WeightTileKey& key) {
-  auto it = ctx->weight_cache_map.find(key);
-  if (it == ctx->weight_cache_map.end()) return nullptr;
-  CachedWeightTile* t = it->second;
-  if (t->lru_it != ctx->weight_cache_lru.begin()) {
-    ctx->weight_cache_lru.splice(ctx->weight_cache_lru.begin(), ctx->weight_cache_lru, t->lru_it);
-  }
-  ctx->weight_cache_hits += 1u;
-  return t;
-}
-
-void weight_cache_evict_locked(ob_context* ctx, size_t incoming_bytes) {
+void weight_cache_evict_locked(ob_context* ctx,
+                               size_t incoming_bytes,
+                               const CachedWeightTile* keep = nullptr) {
   const bool periodic_refresh =
       (ctx->simulated_mem_available_bytes > 0u) ||
       (!ctx->mock_mode && ((ctx->weight_cache_misses & 31u) == 0u ||
@@ -435,11 +458,12 @@ void weight_cache_evict_locked(ob_context* ctx, size_t incoming_bytes) {
   ensure_weight_cache_budget(ctx, periodic_refresh);
   auto it = ctx->weight_cache_lru.end();
   while ((ctx->weight_cache_bytes + incoming_bytes > ctx->weight_cache_max_bytes ||
-          ctx->weight_cache_map.size() >= ctx->weight_cache_max_entries) &&
+          (incoming_bytes > 0u && ctx->weight_cache_map.size() >= ctx->weight_cache_max_entries) ||
+          ctx->weight_cache_map.size() > ctx->weight_cache_max_entries) &&
          it != ctx->weight_cache_lru.begin()) {
     --it;
     CachedWeightTile* victim = *it;
-    if (victim->in_use > 0u) continue;
+    if (victim == keep || victim->in_use > 0u) continue;
     auto erase_it = it;
     ctx->weight_cache_map.erase(victim->key);
     const size_t victim_total = victim->ext2_bytes + victim->outlier_cols_bytes;
@@ -450,6 +474,25 @@ void weight_cache_evict_locked(ob_context* ctx, size_t incoming_bytes) {
     delete victim;
     ctx->weight_cache_evictions += 1u;
   }
+}
+
+CachedWeightTile* weight_cache_find_locked(ob_context* ctx, const WeightTileKey& key) {
+  auto it = ctx->weight_cache_map.find(key);
+  if (it == ctx->weight_cache_map.end()) return nullptr;
+  CachedWeightTile* t = it->second;
+  if (t->lru_it != ctx->weight_cache_lru.begin()) {
+    ctx->weight_cache_lru.splice(ctx->weight_cache_lru.begin(), ctx->weight_cache_lru, t->lru_it);
+  }
+  ctx->weight_cache_hits += 1u;
+  if ((ctx->simulated_mem_available_bytes > 0u) ||
+      (!ctx->mock_mode && (ctx->weight_cache_hits & 63u) == 0u)) {
+    ensure_weight_cache_budget(ctx, true);
+    if (ctx->weight_cache_bytes > ctx->weight_cache_max_bytes ||
+        ctx->weight_cache_map.size() > ctx->weight_cache_max_entries) {
+      weight_cache_evict_locked(ctx, 0u, t);
+    }
+  }
+  return t;
 }
 
 void weight_cache_insert_locked(ob_context* ctx, CachedWeightTile* tile) {
@@ -2039,13 +2082,19 @@ ob_status_t ob_gemm_register_immutable_weights(ob_context_t* ctx,
 
   std::lock_guard<std::mutex> lk(ctx->gemm_mu);
   auto& regions = ctx->immutable_weight_regions;
+  for (const ob::ImmutableWeightRegion& r : regions) {
+    if (r.begin == begin && r.end == end && r.version == version) {
+      return OB_OK;
+    }
+  }
   regions.erase(
       std::remove_if(regions.begin(), regions.end(),
                      [&](const ob::ImmutableWeightRegion& r) {
                        return r.begin < end && begin < r.end;
                      }),
       regions.end());
-  regions.push_back(ob::ImmutableWeightRegion{begin, end, version});
+  const uint64_t gen = ctx->next_immutable_region_gen++;
+  regions.push_back(ob::ImmutableWeightRegion{begin, end, version, gen});
   return OB_OK;
 }
 
@@ -2420,18 +2469,12 @@ ob_status_t ob_gemm_matmul_int8(ob_context_t* ctx,
             scale_d = ob::compute_tile_scale_D(b_tile.data(), tn, tk, hw_k, zp_a);
           }
 
-          auto discard_unsubmitted_wtile = [&]() {
-            if (w_tile && !w_tile->in_cache && w_tile->in_use == 0u) {
-              if (w_tile->ext2_buf) ob_buffer_free(w_tile->ext2_buf);
-              delete w_tile;
-              w_tile = nullptr;
-            }
-          };
+          ob::PinnedWeightTile pinned_w(w_tile);
 
           if (ring_count >= ring_depth) {
             ob_status_t dst = drain_one();
             if (dst != OB_OK) {
-              discard_unsubmitted_wtile();
+              pinned_w.reset();
               drain_all_cleanup();
               return dst;
             }
@@ -2461,7 +2504,7 @@ ob_status_t ob_gemm_matmul_int8(ob_context_t* ctx,
             ob_status_t pst = ob_gemm_pack_weights_int8(
                 b_tile.data(), nullptr, hw_k, hw_n, packed_tile.data(), packed_tile.size());
             if (pst != OB_OK) {
-              discard_unsubmitted_wtile();
+              pinned_w.reset();
               drain_all_cleanup();
               return pst;
             }
@@ -2527,15 +2570,14 @@ ob_status_t ob_gemm_matmul_int8(ob_context_t* ctx,
             if (prof_on) ctx->prof.submit_ns += (ob::monotonic_now_ns() - ts0);
             if (bst != OB_OK) {
               ob::release_tile_entry(ctx, entry);
-              discard_unsubmitted_wtile();
+              pinned_w.reset();
               drain_all_cleanup();
               return bst;
             }
 
             PendingInt8Tile& p = ring[slot];
             p.handle = exec_h;
-            p.w_tile = w_tile;
-            if (w_tile) w_tile->in_use += 1u;
+            p.w_tile = pinned_w.release();
             p.in_buf = active_in_buf;
             if (p.in_buf) ob::buffer_retain(p.in_buf);
             p.out_buf = out_buf;
@@ -2556,7 +2598,7 @@ ob_status_t ob_gemm_matmul_int8(ob_context_t* ctx,
               tile_handled_by_hw = true;
             }
           } else {
-            discard_unsubmitted_wtile();
+            pinned_w.reset();
             if (gst != OB_ERR_UNSUPPORTED) {
               drain_all_cleanup();
               return gst;
@@ -3129,18 +3171,12 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
               static_cast<double>(std::max<uint32_t>(1u, scale_d >> cached_a_rms_shift)));
         }
 
-        auto discard_unsubmitted_wtile = [&]() {
-          if (w_tile && !w_tile->in_cache && w_tile->in_use == 0u) {
-            if (w_tile->ext2_buf) ob_buffer_free(w_tile->ext2_buf);
-            delete w_tile;
-            w_tile = nullptr;
-          }
-        };
+        ob::PinnedWeightTile pinned_w(w_tile);
 
         if (ring_count >= ring_depth) {
           ob_status_t dst = drain_one();
           if (dst != OB_OK) {
-            discard_unsubmitted_wtile();
+            pinned_w.reset();
             drain_all_cleanup();
             return dst;
           }
@@ -3170,7 +3206,7 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
           ob_status_t pst = ob_gemm_pack_weights_int8(
               b_q_tile.data(), nullptr, hw_k, hw_n, packed_tile.data(), packed_tile.size());
           if (pst != OB_OK) {
-            discard_unsubmitted_wtile();
+            pinned_w.reset();
             drain_all_cleanup();
             return pst;
           }
@@ -3242,15 +3278,14 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
           if (prof_on) ctx->prof.submit_ns += (ob::monotonic_now_ns() - ts0);
           if (bst != OB_OK) {
             ob::release_tile_entry(ctx, entry);
-            discard_unsubmitted_wtile();
+            pinned_w.reset();
             drain_all_cleanup();
             return bst;
           }
 
           PendingF32Tile& p = ring[slot];
           p.handle = exec_h;
-          p.w_tile = w_tile;
-          if (w_tile) w_tile->in_use += 1u;
+          p.w_tile = pinned_w.release();
           p.in_buf = active_in_buf;
           if (p.in_buf) ob::buffer_retain(p.in_buf);
           p.out_buf = out_buf;
@@ -3401,7 +3436,7 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
             }
           }
         } else {
-          discard_unsubmitted_wtile();
+          pinned_w.reset();
           if (gst != OB_ERR_UNSUPPORTED) {
             drain_all_cleanup();
             return gst;
@@ -4560,7 +4595,6 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
                                      static_cast<size_t>(h_blk_cnt) * d_blk_sz, strict_hash);
         const ob::WeightTileKey wh = ob::finalize_weight_key(wh_st);
         ob::CachedWeightTile* w_tile = ob::weight_cache_find_locked(ctx, wh);
-        const bool was_cache_hit = (w_tile != nullptr);
         if (prof_on) ctx->prof.hash_ns += (ob::monotonic_now_ns() - th0);
 
         if (w_tile && w_tile->rejected_swiglu) {
@@ -4761,13 +4795,7 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
           cold_wu_q = std::move(wu_q);
         }
 
-        auto discard_unsubmitted_wtile = [&]() {
-          if (w_tile && !w_tile->in_cache && w_tile->in_use == 0u) {
-            if (w_tile->ext2_buf) ob_buffer_free(w_tile->ext2_buf);
-            delete w_tile;
-            w_tile = nullptr;
-          }
-        };
+        ob::PinnedWeightTile pinned_w(w_tile);
 
         const float rms_aq = static_cast<float>(max_row_rms / static_cast<double>(s_a));
         uint32_t d_gate = 0u, d_up = 0u, d_mul = 0u, d_down = 0u;
@@ -4834,33 +4862,17 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
                 holder_proven = true;
               }
             }
-            const bool need_exact_check =
-                !holder_proven &&
-                (!was_cache_hit ||
-                 ctx->swiglu_exact_clip_check ||
-                 w_tile->swiglu_needs_exact_check ||
-                 rms_aq > 42.0f ||
-                 max_row_crest > 10.0f ||
-                 dc_gate_term > 16.0 * static_cast<double>(d_gate) ||
-                 dc_up_term > 16.0 * static_cast<double>(d_up));
-            if (need_exact_check) {
-              const uint32_t orig_dg = d_gate;
-              const uint32_t orig_du = d_up;
-              const uint32_t orig_dm = d_mul;
+            if (!holder_proven) {
               const int8_t* cold_wg_ptr = cold_wg_q.empty() ? nullptr : cold_wg_q.data();
               const int8_t* cold_wu_ptr = cold_wu_q.empty() ? nullptr : cold_wu_q.data();
               reject_clip = swiglu_chunk_clips_or_tunes(
                   ctx, w_tile, cold_wg_ptr, cold_wu_ptr, a_q.data(),
                   ms.tm, ms.hw_m, K, hw_h, th, s_a, w_tile->swiglu_s_wg,
                   &d_gate, &d_up, &d_mul);
-              if (!reject_clip &&
-                  (d_gate != orig_dg || d_up != orig_du || d_mul != orig_dm)) {
-                w_tile->swiglu_needs_exact_check = true;
-              }
             }
           }
           if (reject_clip) {
-            discard_unsubmitted_wtile();
+            pinned_w.reset();
             drain_all_cleanup();
             slice_rejected = true;
             break;
@@ -4871,7 +4883,7 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
         if (ring_count >= ring_depth) {
           ob_status_t dst = drain_one();
           if (dst != OB_OK) {
-            discard_unsubmitted_wtile();
+            pinned_w.reset();
             drain_all_cleanup();
             return dst;
           }
@@ -4888,7 +4900,7 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
         bool was_hit = false;
         ob_status_t gst = ob::acquire_swiglu_entry(ctx, gd, gkey, &entry, &was_hit);
         if (gst != OB_OK) {
-          discard_unsubmitted_wtile();
+          pinned_w.reset();
           drain_all_cleanup();
           return gst;
         }
@@ -4908,15 +4920,14 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
         if (prof_on) ctx->prof.submit_ns += (ob::monotonic_now_ns() - ts0);
         if (bst != OB_OK) {
           ob::release_tile_entry(ctx, entry);
-          discard_unsubmitted_wtile();
+          pinned_w.reset();
           drain_all_cleanup();
           return bst;
         }
 
         PendingSwigluChunk& p = ring[slot];
         p.handle = exec_h;
-        p.w_tile = w_tile;
-        w_tile->in_use += 1u;
+        p.w_tile = pinned_w.release();
         p.in_buf = shared_in_buf;
         ob::buffer_retain(p.in_buf);
         p.out_buf = out_buf;
