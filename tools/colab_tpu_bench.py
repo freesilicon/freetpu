@@ -389,6 +389,47 @@ def _verify_file_writable_if_exists(path: Path, label: str) -> None:
         os.close(fd)
 
 
+def _validate_existing_session_store(path: Path) -> None:
+    """Validate that an existing non-empty `--config` file matches Colab's session store schema.
+
+    Never includes file contents in error messages so no tokens or metadata can be leaked.
+    """
+    if not os.path.lexists(path):
+        return
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise UntrustedPathError(f"Cannot read session config file {path}: {exc}") from exc
+    if not raw.strip():
+        return
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise UntrustedPathError(
+            f"Existing session config {path} is not a valid Colab session store JSON file."
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise UntrustedPathError(
+            f"Existing session config {path} must be a JSON object mapping session names to entries."
+        )
+    for key, val in parsed.items():
+        if not isinstance(key, str) or not key or not isinstance(val, dict):
+            raise UntrustedPathError(
+                f"Existing session config {path} contains an invalid session store entry."
+            )
+        if (
+            not isinstance(val.get("name"), str)
+            or val.get("name") != key
+            or not isinstance(val.get("token"), str)
+            or not isinstance(val.get("url"), str)
+            or not isinstance(val.get("endpoint"), str)
+            or not val.get("endpoint")
+        ):
+            raise UntrustedPathError(
+                f"Existing session config {path} does not match the Colab session store schema."
+            )
+
+
 def _normalize_config_path(
     config_path: Optional[Path],
     out_dir: Path,
@@ -434,8 +475,9 @@ def _check_config_artifact_collision(
     out_dir: Path,
     session_base: str,
     tpus: Sequence[str],
+    script_path: Optional[Path] = None,
 ) -> Optional[str]:
-    """Reject `--config` (or its `.lock`) colliding with any file generated under `out_dir`."""
+    """Reject `--config` (or its `.lock`) colliding with generated artifacts or `--script`."""
     candidates: List[Path] = [
         out_dir / "summary.json",
         out_dir / "dry-run-plan.json",
@@ -453,12 +495,16 @@ def _check_config_artifact_collision(
                 out_dir / f"colab-recovery.{sess}.json.lock",
             ]
         )
+    if script_path is not None:
+        expanded_script = Path(os.path.expanduser(str(script_path)))
+        candidates.append(expanded_script)
+        candidates.append(Path(os.path.realpath(str(expanded_script))))
     lock_path = Path(f"{isolated_config}.lock")
     for check_path, label in ((isolated_config, "--config"), (lock_path, "--config lock")):
         for artifact in candidates:
             if _paths_collide(check_path, artifact):
                 return (
-                    f"{label} path {check_path} collides with generated artifact {artifact}; "
+                    f"{label} path {check_path} collides with {artifact}; "
                     "choose a distinct session store filename."
                 )
         if _paths_collide(check_path.parent, out_dir):
@@ -525,7 +571,11 @@ def _prepare_custom_script(
         f"_ft_name = {orig_name!r}\n"
         "if _ft_sys.argv:\n"
         "    _ft_sys.argv[0] = _ft_name\n"
-        "_ft_ns = {'__name__': '__main__', '__file__': _ft_name, '__package__': None}\n"
+        "_ft_main = _ft_sys.modules.get('__main__')\n"
+        "_ft_ns = _ft_main.__dict__ if _ft_main is not None else globals()\n"
+        "_ft_ns['__name__'] = '__main__'\n"
+        "_ft_ns['__file__'] = _ft_name\n"
+        "_ft_ns['__package__'] = None\n"
         "exec(compile(_ft_src, _ft_name, 'exec'), _ft_ns)\n"
     )
     wrapper_path = out_dir / f"colab_custom_script.{session_base}.py"
@@ -792,27 +842,40 @@ def parse_sessions_output(text: str) -> Tuple[Set[str], Set[str]]:
     return names, endpoints
 
 
-def extract_endpoint_from_notebook(nb_path: Path) -> Optional[str]:
-    """Extract server endpoint ID recorded in a `colab log -o *.ipynb` session header."""
+def inspect_exported_notebook(nb_path: Path) -> Tuple[Optional[str], bool]:
+    """Return `(endpoint_id, has_workload_code_cell)` from a `colab log -o *.ipynb` export."""
     if nb_path.is_symlink() or not nb_path.is_file():
-        return None
+        return None, False
     try:
         data = json.loads(nb_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return None
+        return None, False
     cells = data.get("cells")
     if not isinstance(cells, list):
-        return None
+        return None, False
+    endpoint: Optional[str] = None
+    has_code_cell = False
     for cell in cells:
-        if not isinstance(cell, dict) or cell.get("cell_type") != "markdown":
+        if not isinstance(cell, dict):
             continue
+        cell_type = cell.get("cell_type")
         src = cell.get("source", "")
         if isinstance(src, list):
             src = "".join(str(part) for part in src)
-        m = re.search(r"-\s*Endpoint:\s*`?([^`\s\n]+)`?", str(src))
-        if m:
-            return m.group(1)
-    return None
+        src_str = str(src)
+        if cell_type == "markdown" and endpoint is None:
+            m = re.search(r"-\s*Endpoint:\s*`?([^`\s\n]+)`?", src_str)
+            if m:
+                endpoint = m.group(1)
+        elif cell_type == "code" and src_str.strip():
+            has_code_cell = True
+    return endpoint, has_code_cell
+
+
+def extract_endpoint_from_notebook(nb_path: Path) -> Optional[str]:
+    """Extract server endpoint ID recorded in a `colab log -o *.ipynb` session header."""
+    endpoint, _ = inspect_exported_notebook(nb_path)
+    return endpoint
 
 
 def detect_cli_capabilities(
@@ -915,13 +978,22 @@ def is_wall_timeout_error(res: CommandResult) -> bool:
     return bool(res.timed_out)
 
 
+_UNCERTAIN_ALLOC_HTTP_RE = re.compile(
+    r"(?:\bhttp(?:\s+error)?\s*(?:502|503|504)\b|"
+    r"\b(?:502|503|504)\s+(?:server error|bad gateway|service unavailable|gateway time-?out)\b|"
+    r"\bstatus(?:\s+code)?\s*[=:]\s*(?:502|503|504)\b|"
+    r"\b(?:bad gateway|service unavailable|gateway time-?out)\b)",
+    re.IGNORECASE,
+)
+
+
 def is_allocation_timeout_error(
     returncode: int,
     stderr: str,
     *,
     timed_out: bool = False,
 ) -> bool:
-    """Return True if allocation or setup timed out with an unknown server-side outcome."""
+    """Return True if allocation or setup ended with an uncertain server-side outcome."""
     if returncode == 0 and not timed_out:
         return False
     err_lower = stderr.lower()
@@ -929,7 +1001,9 @@ def is_allocation_timeout_error(
         return "[colab] session ready" not in err_lower
     if "[colab] session ready" in err_lower:
         return False
-    return "readtimeout" in err_lower or "read timed out" in err_lower
+    if "readtimeout" in err_lower or "read timed out" in err_lower:
+        return True
+    return bool(_UNCERTAIN_ALLOC_HTTP_RE.search(stderr))
 
 
 def _contains_oauth_prompt_failure(res: CommandResult) -> bool:
@@ -1218,10 +1292,15 @@ def run_benchmark(
         return 2, {"status": "untrusted_config_path", "error": str(exc)}
 
     collision_err = _check_config_artifact_collision(
-        isolated_config, out_dir, session_base, cfg.tpus
+        isolated_config, out_dir, session_base, cfg.tpus, script_path=cfg.script_path
     )
     if collision_err is not None:
         return 2, {"status": "config_artifact_collision", "error": collision_err}
+
+    try:
+        _validate_existing_session_store(isolated_config)
+    except UntrustedPathError as exc:
+        return 2, {"status": "untrusted_config_path", "error": str(exc)}
 
     script_file = cfg.script_path
     generated_script = False
@@ -1394,6 +1473,7 @@ def run_benchmark(
     created_endpoint: Optional[str] = None
     probe_payload: Optional[Dict[str, Any]] = None
     proof_notebook: Optional[Path] = None
+    metadata_notebook: Optional[Path] = None
     allocation_timed_out = False
     wall_timed_out = False
     interrupted = False
@@ -1405,6 +1485,7 @@ def run_benchmark(
     artifact_write_error: Optional[str] = None
     export_attempted = False
     export_ok: Optional[bool] = None
+    export_metadata_only = False
     export_returncode: Optional[int] = None
     export_error: Optional[str] = None
     export_stderr_tail: Optional[str] = None
@@ -1461,8 +1542,9 @@ def run_benchmark(
         return stop_res, err_msg
 
     def _export_session_log(sess_name: str) -> None:
-        nonlocal export_attempted, export_ok, export_returncode, export_error, export_stderr_tail
-        nonlocal proof_notebook, created_endpoint, untrusted_target_error
+        nonlocal export_attempted, export_ok, export_metadata_only
+        nonlocal export_returncode, export_error, export_stderr_tail
+        nonlocal proof_notebook, metadata_notebook, created_endpoint, untrusted_target_error
         nb_path = out_dir / f"{sess_name}.ipynb"
         if nb_path.is_symlink() or (os.path.lexists(nb_path) and not nb_path.is_file()):
             untrusted_target_error = f"Refusing unsafe notebook target path: {nb_path}"
@@ -1474,17 +1556,31 @@ def run_benchmark(
             sig_rc, sig_name = _record_cleanup_signal(exc)
             export_returncode = sig_rc
             export_ok = False
+            export_metadata_only = False
             export_error = f"`colab log` interrupted by {sig_name}"
             return
         export_returncode = log_res.returncode
         if log_res.stderr.strip():
             export_stderr_tail = log_res.stderr.strip()[-1000:]
         if log_res.returncode == 0 and not nb_path.is_symlink() and nb_path.is_file():
-            proof_notebook = nb_path
-            created_endpoint = extract_endpoint_from_notebook(nb_path)
-            export_ok = True
+            created_endpoint, has_code_cell = inspect_exported_notebook(nb_path)
+            if has_code_cell:
+                proof_notebook = nb_path
+                metadata_notebook = None
+                export_ok = True
+                export_metadata_only = False
+            else:
+                proof_notebook = None
+                metadata_notebook = nb_path
+                export_ok = False
+                export_metadata_only = True
+                export_error = (
+                    f"Exported notebook {nb_path} contains only session metadata and no "
+                    "workload code cell (incomplete proof)."
+                )
         else:
             export_ok = False
+            export_metadata_only = False
             if log_res.returncode != 0:
                 diag = log_res.stderr.strip() or log_res.stdout.strip() or "no diagnostic output"
                 export_error = f"`colab log` failed (rc={log_res.returncode}): {diag}"
@@ -2012,9 +2108,11 @@ def run_benchmark(
             "chosen_session": chosen_session,
             "created_endpoint": created_endpoint,
             "proof_notebook": str(proof_notebook) if proof_notebook else None,
+            "metadata_notebook": str(metadata_notebook) if metadata_notebook else None,
             "proof_export": {
                 "attempted": export_attempted,
                 "ok": export_ok,
+                "metadata_only": export_metadata_only,
                 "returncode": export_returncode,
                 "error": export_error,
                 "stderr_tail": export_stderr_tail,
@@ -2190,7 +2288,11 @@ def run_self_test() -> int:
                             {
                                 "cell_type": "markdown",
                                 "source": "**Session Created**: now\n- Endpoint: `tpu-v5e1-ep1`\n",
-                            }
+                            },
+                            {
+                                "cell_type": "code",
+                                "source": "print('probe')\n",
+                            },
                         ],
                     }
                     Path(cmd_list[out_idx]).write_text(json.dumps(nb), encoding="utf-8")
@@ -2698,6 +2800,11 @@ def run_self_test() -> int:
         assert rc_wt == 124
         assert sum_wt["status"] == "wall_timeout"
         assert sum_wt["teardown_verified"] is True
+        assert sum_wt["created_endpoint"] == "tpu-v6e1-wall1"
+        assert sum_wt["proof_notebook"] is None
+        assert sum_wt["metadata_notebook"] is not None
+        assert sum_wt["proof_export"]["ok"] is False
+        assert sum_wt["proof_export"]["metadata_only"] is True
         assert sum_wt["forced_stop"]["attempted"] is True
         assert sum_wt["forced_stop"]["returncode"] == 0
         assert sum_wt["forced_stop"]["error"] is None
@@ -2882,6 +2989,11 @@ def run_self_test() -> int:
         assert rc_int == 130
         assert sum_int["status"] == "interrupted"
         assert sum_int["teardown_verified"] is True
+        assert sum_int["created_endpoint"] == "tpu-v6e1-int1"
+        assert sum_int["proof_notebook"] is None
+        assert sum_int["metadata_notebook"] is not None
+        assert sum_int["proof_export"]["ok"] is False
+        assert sum_int["proof_export"]["metadata_only"] is True
         assert sum_int["forced_stop"]["attempted"] is True
         assert sum_int["forced_stop"]["returncode"] == 0
         assert len(sum_int["attempts"]) == 1
@@ -3437,7 +3549,19 @@ def run_self_test() -> int:
             assert sum_tdsig["teardown_verified"] is True
             assert (td_sig_out / "summary.json").is_file()
 
-        # 40. Read-only existing `--config` or `.lock` file is rejected BEFORE provisioning.
+        # 40. Read-only existing `--config` or `.lock` file is rejected BEFORE provisioning
+        #     (works both for non-root OS permission checks and root/CAP_DAC_OVERRIDE containers).
+        from unittest.mock import patch as _mock_patch
+
+        def _kernel_denies_write(path: Path) -> bool:
+            try:
+                fd = os.open(path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+            except PermissionError:
+                return True
+            else:
+                os.close(fd)
+                return False
+
         ro_dir = tmp_path / "readonly-cfg-dir"
         ro_dir.mkdir(mode=0o700)
         os.chmod(ro_dir, 0o700)
@@ -3445,16 +3569,29 @@ def run_self_test() -> int:
         ro_cfg.write_text("{}\n", encoding="utf-8")
         os.chmod(ro_cfg, 0o400)
         try:
-            rc_ro, sum_ro = run_benchmark(
-                BenchConfig(
-                    tpus=("v5e1",),
-                    out_dir=tmp_path / "ro-out-1",
-                    config_path=ro_cfg,
-                ),
-                runner=forbid_calls_runner,
-            )
-            assert rc_ro == 2
-            assert sum_ro["status"] == "untrusted_config_path"
+            if _kernel_denies_write(ro_cfg):
+                rc_ro, sum_ro = run_benchmark(
+                    BenchConfig(
+                        tpus=("v5e1",),
+                        out_dir=tmp_path / "ro-out-1",
+                        config_path=ro_cfg,
+                    ),
+                    runner=forbid_calls_runner,
+                )
+                assert rc_ro == 2
+                assert sum_ro["status"] == "untrusted_config_path"
+            else:
+                with _mock_patch("os.open", side_effect=PermissionError("read-only")):
+                    rc_ro, sum_ro = run_benchmark(
+                        BenchConfig(
+                            tpus=("v5e1",),
+                            out_dir=tmp_path / "ro-out-1",
+                            config_path=ro_cfg,
+                        ),
+                        runner=forbid_calls_runner,
+                    )
+                    assert rc_ro == 2
+                    assert sum_ro["status"] == "untrusted_config_path"
         finally:
             os.chmod(ro_cfg, 0o600)
 
@@ -3463,16 +3600,29 @@ def run_self_test() -> int:
         ro_lock.write_text("", encoding="utf-8")
         os.chmod(ro_lock, 0o400)
         try:
-            rc_rol, sum_rol = run_benchmark(
-                BenchConfig(
-                    tpus=("v5e1",),
-                    out_dir=tmp_path / "ro-out-2",
-                    config_path=ro_lock_cfg,
-                ),
-                runner=forbid_calls_runner,
-            )
-            assert rc_rol == 2
-            assert sum_rol["status"] == "untrusted_config_path"
+            if _kernel_denies_write(ro_lock):
+                rc_rol, sum_rol = run_benchmark(
+                    BenchConfig(
+                        tpus=("v5e1",),
+                        out_dir=tmp_path / "ro-out-2",
+                        config_path=ro_lock_cfg,
+                    ),
+                    runner=forbid_calls_runner,
+                )
+                assert rc_rol == 2
+                assert sum_rol["status"] == "untrusted_config_path"
+            else:
+                with _mock_patch("os.open", side_effect=PermissionError("read-only lock")):
+                    rc_rol, sum_rol = run_benchmark(
+                        BenchConfig(
+                            tpus=("v5e1",),
+                            out_dir=tmp_path / "ro-out-2",
+                            config_path=ro_lock_cfg,
+                        ),
+                        runner=forbid_calls_runner,
+                    )
+                    assert rc_rol == 2
+                    assert sum_rol["status"] == "untrusted_config_path"
         finally:
             os.chmod(ro_lock, 0o600)
 
@@ -3481,7 +3631,10 @@ def run_self_test() -> int:
         coll_dir = tmp_path / "collision-dir"
         coll_dir.mkdir(mode=0o700)
         os.chmod(coll_dir, 0o700)
-        existing_sessions_in_summary = '{"other-worker": {"endpoint": "m-s-keep"}}\n'
+        existing_sessions_in_summary = (
+            '{"other-worker": {"name": "other-worker", "token": "t", '
+            '"url": "https://example.invalid", "endpoint": "m-s-keep"}}\n'
+        )
         (coll_dir / "summary.json").write_text(existing_sessions_in_summary, encoding="utf-8")
         os.chmod(coll_dir / "summary.json", 0o600)
 
@@ -3505,8 +3658,8 @@ def run_self_test() -> int:
         assert not (coll_dir / "colab_tpu_probe_payload.py").exists()
         assert not (coll_dir / "dry-run-plan.json").exists()
 
-        # 42. Custom scripts with `from __future__ import annotations` are wrapped so they compile
-        #     and execute cleanly after `colab run`'s prelude; syntax errors fail pre-provision.
+        # 42. Custom scripts with `from __future__ import annotations` are wrapped and run in
+        #     the real `__main__` module namespace (pickle-safe); syntax errors fail pre-provision.
         custom_dir = tmp_path / "custom-scripts"
         custom_dir.mkdir(mode=0o700)
         os.chmod(custom_dir, 0o700)
@@ -3516,6 +3669,7 @@ def run_self_test() -> int:
                 """\
                 #!/usr/bin/env python3
                 from __future__ import annotations
+                import pickle
                 import sys
 
                 def make_box(val: int) -> Box:
@@ -3528,7 +3682,9 @@ def run_self_test() -> int:
                 assert __name__ == "__main__"
                 assert __file__ == "future_bench.py"
                 assert sys.argv == ["future_bench.py", "--iters", "3"]
-                assert make_box(7).v == 7
+                b = make_box(7)
+                assert b.v == 7
+                assert pickle.loads(pickle.dumps(b)).v == 7
                 """
             ),
             encoding="utf-8",
@@ -3547,7 +3703,7 @@ def run_self_test() -> int:
         wrapper_file = Path(sum_fut["script"])
         assert wrapper_file != future_script
         assert wrapper_file.is_file()
-        # Simulate exact `colab run` v0.8.0 prelude + wrapped script compilation & execution!
+        # Simulate exact `colab run` v0.8.0 prelude + wrapped script in a real Python __main__!
         colab_prelude = (
             "import sys, warnings\n"
             f"sys.argv = [{wrapper_file.name!r}, '--iters', '3']\n"
@@ -3555,11 +3711,13 @@ def run_self_test() -> int:
             "warnings.filterwarnings('ignore', message='To exit: use')\n"
         )
         combined_payload = colab_prelude + wrapper_file.read_text(encoding="utf-8")
-        old_argv = sys.argv[:]
-        try:
-            exec(compile(combined_payload, str(wrapper_file), "exec"), {})
-        finally:
-            sys.argv = old_argv
+        proc_fut = subprocess.run(
+            [sys.executable, "-c", combined_payload],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc_fut.returncode == 0, f"Wrapped script failed: {proc_fut.stderr}"
 
         bad_syntax_script = custom_dir / "broken.py"
         bad_syntax_script.write_text("def broken(:\n    pass\n", encoding="utf-8")
@@ -3575,7 +3733,113 @@ def run_self_test() -> int:
         assert sum_bsyn["status"] == "invalid_script"
         assert "syntax error" in (sum_bsyn["error"] or "").lower()
 
-    print("colab_tpu_bench.py self-test PASSED (42/42 suites).")
+        # 43. `--config` aliasing `--script` OR pointing to unrelated/non-session files is
+        #     rejected BEFORE calling Colab (without truncating or leaking file contents).
+        orig_future_src = future_script.read_text(encoding="utf-8")
+        rc_alias, sum_alias = run_benchmark(
+            BenchConfig(
+                tpus=("v5e1",),
+                script_path=future_script,
+                config_path=future_script,
+                out_dir=tmp_path / "alias-script-out",
+            ),
+            runner=forbid_calls_runner,
+        )
+        assert rc_alias == 2
+        assert sum_alias["status"] == "config_artifact_collision"
+        assert future_script.read_text(encoding="utf-8") == orig_future_src
+
+        non_session_py = custom_dir / "notes.txt"
+        secret_sentinel = "DO_NOT_LEAK_THIS_CONTENT_999"
+        non_session_py.write_text(f"plain text {secret_sentinel}\n", encoding="utf-8")
+        rc_unrel_txt, sum_unrel_txt = run_benchmark(
+            BenchConfig(
+                tpus=("v5e1",),
+                config_path=non_session_py,
+                out_dir=tmp_path / "unrel-txt-out",
+            ),
+            runner=forbid_calls_runner,
+        )
+        assert rc_unrel_txt == 2
+        assert sum_unrel_txt["status"] == "untrusted_config_path"
+        assert secret_sentinel not in json.dumps(sum_unrel_txt)
+
+        non_session_json = custom_dir / "not-a-store.json"
+        non_session_json.write_text('{"status": "ok", "chosen_tpu": "v6e1"}\n', encoding="utf-8")
+        rc_unrel_js, sum_unrel_js = run_benchmark(
+            BenchConfig(
+                tpus=("v5e1",),
+                config_path=non_session_json,
+                out_dir=tmp_path / "unrel-json-out",
+            ),
+            runner=forbid_calls_runner,
+        )
+        assert rc_unrel_js == 2
+        assert sum_unrel_js["status"] == "untrusted_config_path"
+
+        # 44. Pre-READY HTTP 504 Gateway Timeout on allocation POST does NOT fall back to v5e1
+        #     and keeps `teardown_verified=False` (`allocation_timeout_unreconciled`).
+        def gateway_504_runner(cmd: Sequence[str]) -> CommandResult:
+            cmd_list = list(cmd)
+            base_res = base_help_usage_sessions(cmd_list)
+            if base_res is not None:
+                return base_res
+            if "run" in cmd_list:
+                return CommandResult(
+                    1,
+                    "",
+                    "[colab] Creating session 'x'...\n"
+                    "ColabRequestError: 504 Server Error: Gateway Timeout for url: "
+                    "https://colab.research.google.com/tun/m/assign\n",
+                )
+            raise AssertionError(f"Unexpected command: {cmd_list}")
+
+        rc_504, sum_504 = run_benchmark(
+            BenchConfig(tpus=("v6e1", "v5e1"), out_dir=tmp_path / "alloc-504"),
+            runner=gateway_504_runner,
+        )
+        assert rc_504 == 1
+        assert len(sum_504["attempts"]) == 1
+        assert sum_504["attempts"][0]["tpu"] == "v6e1"
+        assert sum_504["status"] == "allocation_timeout_unreconciled"
+        assert sum_504["teardown_verified"] is False
+        assert is_allocation_timeout_error(1, "HTTP 502 Bad Gateway")
+        assert is_allocation_timeout_error(1, "503 Server Error: Service Unavailable")
+        assert not is_allocation_timeout_error(1, 'File "/pkg/run.py", line 504, in run')
+
+        # 45. Metadata-only exported notebook (no workload code cell) on a clean rc=0 run
+        #     still verifies teardown using its endpoint, but marks proof incomplete.
+        def metadata_only_log_runner(cmd: Sequence[str]) -> CommandResult:
+            cmd_list = list(cmd)
+            if "log" in cmd_list:
+                out_idx = cmd_list.index("-o") + 1
+                nb = {
+                    "nbformat": 4,
+                    "cells": [
+                        {
+                            "cell_type": "markdown",
+                            "source": "**Session Created**: now\n- Endpoint: `tpu-v5e1-ep1`\n",
+                        }
+                    ],
+                }
+                Path(cmd_list[out_idx]).write_text(json.dumps(nb), encoding="utf-8")
+                return CommandResult(0, "Exported notebook.\n", "")
+            return fallback_runner(cmd_list)
+
+        rc_meta, sum_meta = run_benchmark(
+            BenchConfig(tpus=("v5e1",), out_dir=tmp_path / "metadata-only-proof"),
+            runner=metadata_only_log_runner,
+        )
+        assert rc_meta == 1
+        assert sum_meta["status"] == "proof_export_failed"
+        assert sum_meta["teardown_verified"] is True
+        assert sum_meta["created_endpoint"] == "tpu-v5e1-ep1"
+        assert sum_meta["proof_notebook"] is None
+        assert sum_meta["metadata_notebook"] is not None
+        assert sum_meta["proof_export"]["ok"] is False
+        assert sum_meta["proof_export"]["metadata_only"] is True
+
+    print("colab_tpu_bench.py self-test PASSED (45/45 suites).")
     return 0
 
 
