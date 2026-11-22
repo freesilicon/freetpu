@@ -1992,6 +1992,16 @@ static int try_compute_fused_swiglu(ggml_backend_edgetpu_context * ctx,
             continue;
         }
         const struct ggml_tensor * ht = cgraph->visited_hash_set.keys[h];
+        bool is_internal_node = false;
+        for (int j = start_idx; j <= end_idx; ++j) {
+            if (cgraph->nodes[j] == ht) {
+                is_internal_node = true;
+                break;
+            }
+        }
+        if (is_internal_node) {
+            continue;
+        }
         if (tensor_aliases_inter(ht)) {
             return 0;
         }

@@ -2996,10 +2996,10 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
               ? std::max<uint32_t>(128u, (std::min<uint32_t>(max_n, 1536u) / 32u) * 32u)
               : std::min<uint32_t>(max_n, 2048u);
           uint32_t sh_k = 0u, sh_n = 0u;
-          if (hw_m == 64u && sub.tn >= 128u) {
+          if (hw_m == 64u) {
             sh_k = ob::ceil_lt_64x_k_dim(tk);
             sh_n = std::max<uint32_t>(128u, ob::align_up_u32(sub.tn, 32u));
-            if (sh_k > 0u && sh_k <= k_cap && ob::is_lt_64x_shape(64u, sh_k, sh_n)) {
+            if (sh_k > 0u && sh_k <= k_cap && sh_n <= n_cap && ob::is_lt_64x_shape(64u, sh_k, sh_n)) {
               rects.push_back({k0, tk, sub.n0, sub.tn, sh_k, sh_n});
             }
           } else if (hw_m == 1u && ob::try_lt_1x_hw_dims(tk, sub.tn, k_cap, n_cap, &sh_k, &sh_n)) {
@@ -3939,59 +3939,67 @@ ob_status_t run_swiglu_m7a_fallback(ob_context_t* ctx,
                                     float* c_slice,
                                     ob_invoke_stats_t* out_stats) {
   const uint32_t K = d->k_dim, H = d->h_dim, N = d->n_dim;
-  std::vector<float> gate_buf(static_cast<size_t>(tm) * H, 0.0f);
-  std::vector<float> up_buf(static_cast<size_t>(tm) * H, 0.0f);
+  constexpr uint32_t kMaxFallbackM = 64u;
+  const uint32_t buf_m = std::min<uint32_t>(tm, kMaxFallbackM);
+  std::vector<float> gate_buf(static_cast<size_t>(buf_m) * H, 0.0f);
+  std::vector<float> up_buf(static_cast<size_t>(buf_m) * H, 0.0f);
 
-  ob_gemm_f32_quant_job_t gu_jobs[2]{};
-  gu_jobs[0].b_nk = d->w_gate_hk;
-  gu_jobs[0].c_mn = gate_buf.data();
-  gu_jobs[0].n_dim = H;
-  gu_jobs[0].activation = OB_ACT_SILU;
-  gu_jobs[0].is_q4_0 = d->gate_is_q4_0;
-  gu_jobs[1].b_nk = d->w_up_hk;
-  gu_jobs[1].c_mn = up_buf.data();
-  gu_jobs[1].n_dim = H;
-  gu_jobs[1].activation = OB_ACT_NONE;
-  gu_jobs[1].is_q4_0 = d->up_is_q4_0;
+  for (uint32_t m0 = 0u; m0 < tm; m0 += kMaxFallbackM) {
+    const uint32_t sm = std::min<uint32_t>(kMaxFallbackM, tm - m0);
+    const float* a_sub = a_slice + static_cast<size_t>(m0) * K;
+    float* c_sub = c_slice + static_cast<size_t>(m0) * N;
 
-  ob_invoke_stats_t s1{};
-  ob_status_t st = ob_gemm_matmul_f32_quant_batch(ctx, a_slice, tm, K, gu_jobs, 2u, &s1);
-  if (st != OB_OK) return st;
+    ob_gemm_f32_quant_job_t gu_jobs[2]{};
+    gu_jobs[0].b_nk = d->w_gate_hk;
+    gu_jobs[0].c_mn = gate_buf.data();
+    gu_jobs[0].n_dim = H;
+    gu_jobs[0].activation = OB_ACT_SILU;
+    gu_jobs[0].is_q4_0 = d->gate_is_q4_0;
+    gu_jobs[1].b_nk = d->w_up_hk;
+    gu_jobs[1].c_mn = up_buf.data();
+    gu_jobs[1].n_dim = H;
+    gu_jobs[1].activation = OB_ACT_NONE;
+    gu_jobs[1].is_q4_0 = d->up_is_q4_0;
 
-  // NEON elementwise gate_silu *= up
-  const size_t cnt = gate_buf.size();
-  size_t i = 0u;
+    ob_invoke_stats_t s1{};
+    ob_status_t st = ob_gemm_matmul_f32_quant_batch(ctx, a_sub, sm, K, gu_jobs, 2u, &s1);
+    if (st != OB_OK) return st;
+
+    // NEON elementwise gate_silu *= up
+    const size_t cnt = static_cast<size_t>(sm) * H;
+    size_t i = 0u;
 #if defined(__ARM_NEON) && defined(__aarch64__)
-  for (; i + 16u <= cnt; i += 16u) {
-    vst1q_f32(gate_buf.data() + i,       vmulq_f32(vld1q_f32(gate_buf.data() + i),       vld1q_f32(up_buf.data() + i)));
-    vst1q_f32(gate_buf.data() + i + 4u,  vmulq_f32(vld1q_f32(gate_buf.data() + i + 4u),  vld1q_f32(up_buf.data() + i + 4u)));
-    vst1q_f32(gate_buf.data() + i + 8u,  vmulq_f32(vld1q_f32(gate_buf.data() + i + 8u),  vld1q_f32(up_buf.data() + i + 8u)));
-    vst1q_f32(gate_buf.data() + i + 12u, vmulq_f32(vld1q_f32(gate_buf.data() + i + 12u), vld1q_f32(up_buf.data() + i + 12u)));
-  }
-  for (; i + 4u <= cnt; i += 4u) {
-    vst1q_f32(gate_buf.data() + i, vmulq_f32(vld1q_f32(gate_buf.data() + i), vld1q_f32(up_buf.data() + i)));
-  }
+    for (; i + 16u <= cnt; i += 16u) {
+      vst1q_f32(gate_buf.data() + i,       vmulq_f32(vld1q_f32(gate_buf.data() + i),       vld1q_f32(up_buf.data() + i)));
+      vst1q_f32(gate_buf.data() + i + 4u,  vmulq_f32(vld1q_f32(gate_buf.data() + i + 4u),  vld1q_f32(up_buf.data() + i + 4u)));
+      vst1q_f32(gate_buf.data() + i + 8u,  vmulq_f32(vld1q_f32(gate_buf.data() + i + 8u),  vld1q_f32(up_buf.data() + i + 8u)));
+      vst1q_f32(gate_buf.data() + i + 12u, vmulq_f32(vld1q_f32(gate_buf.data() + i + 12u), vld1q_f32(up_buf.data() + i + 12u)));
+    }
+    for (; i + 4u <= cnt; i += 4u) {
+      vst1q_f32(gate_buf.data() + i, vmulq_f32(vld1q_f32(gate_buf.data() + i), vld1q_f32(up_buf.data() + i)));
+    }
 #endif
-  for (; i < cnt; ++i) {
-    gate_buf[i] *= up_buf[i];
-  }
+    for (; i < cnt; ++i) {
+      gate_buf[i] *= up_buf[i];
+    }
 
-  ob_gemm_f32_quant_job_t d_job{};
-  d_job.b_nk = d->w_down_nh;
-  d_job.c_mn = c_slice;
-  d_job.n_dim = N;
-  d_job.activation = OB_ACT_NONE;
-  d_job.is_q4_0 = d->down_is_q4_0;
+    ob_gemm_f32_quant_job_t d_job{};
+    d_job.b_nk = d->w_down_nh;
+    d_job.c_mn = c_sub;
+    d_job.n_dim = N;
+    d_job.activation = OB_ACT_NONE;
+    d_job.is_q4_0 = d->down_is_q4_0;
 
-  ob_invoke_stats_t s2{};
-  st = ob_gemm_matmul_f32_quant_batch(ctx, gate_buf.data(), tm, H, &d_job, 1u, &s2);
-  if (st != OB_OK) return st;
+    ob_invoke_stats_t s2{};
+    st = ob_gemm_matmul_f32_quant_batch(ctx, gate_buf.data(), sm, H, &d_job, 1u, &s2);
+    if (st != OB_OK) return st;
 
-  if (out_stats) {
-    out_stats->hw_execution_us += s1.hw_execution_us + s2.hw_execution_us;
-    out_stats->tiles_dispatched += s1.tiles_dispatched + s2.tiles_dispatched;
-    out_stats->cache_hits += s1.cache_hits + s2.cache_hits;
-    out_stats->flags |= (s1.flags | s2.flags);
+    if (out_stats) {
+      out_stats->hw_execution_us += s1.hw_execution_us + s2.hw_execution_us;
+      out_stats->tiles_dispatched += s1.tiles_dispatched + s2.tiles_dispatched;
+      out_stats->cache_hits += s1.cache_hits + s2.cache_hits;
+      out_stats->flags |= (s1.flags | s2.flags);
+    }
   }
   return OB_OK;
 }
@@ -4110,8 +4118,7 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
   uint32_t total_hits = 0u;
   uint64_t chained_chunks = 0u;
   uint64_t fb_slices = 0u;
-  uint16_t agg_flags = OB_STAT_FLAG_EMITTER_USED;
-  if (ctx->mock_mode) agg_flags |= OB_STAT_FLAG_MOCK;
+  uint16_t agg_flags = ctx->mock_mode ? OB_STAT_FLAG_MOCK : 0u;
 
   const uint32_t nb_k = K / OB_QK8_0;
   const uint32_t nb_h = H / OB_QK8_0;
@@ -4886,6 +4893,7 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
         }
         total_tiles += 1u;
         chained_chunks += 1u;
+        agg_flags |= OB_STAT_FLAG_EMITTER_USED;
         if (was_hit) total_hits += 1u;
 
         ob_buffer* out_buf = nullptr;
