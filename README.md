@@ -41,6 +41,7 @@
 
 | Layer | Component | Responsibility |
 | --- | --- | --- |
+| **Tile DSL** | [`freetpu_tile/`](docs/tile-dsl/README.md) | Clean-room `@freetpu.tile_kernel` frontend lowering one kernel (`matmul`, `GEMM+SiLU/GELU`, `SwiGLU`; `BF16`/`INT8`/`W8A16`) to `buenos_a0`, Cloud TPU Pallas (`tpu_custom_call`), and `cpu_ref` |
 | **LLM Inference** | [`llama-cpp-edgetpu/`](llama-cpp-edgetpu/README.md) | `EDGETPU` GGML `ACCEL` backend (`MUL_MAT` `Q8_0` / `Q4_0` / `F32`, shared-`A` QKV & gate/up batching, 1D bias `ADD`, 64B host storage) |
 | **Open Runtime** | [`libopenbuenos/`](libopenbuenos/include/openbuenos.h) | C11/C++17 static library: `1,286.4 MHz` DVFS + FW WakeLock, FD-capped DMA-BUF pool & `O(1)` weight cache, 16-credit VII ring, `M=1` & `M=64` VLIW GEMM emitter |
 | **Kernel Transport** | [`runtime/`](runtime/src/tpu_baremetal_runner.cpp) | Standalone bare-metal runner & UAPI/Litebuf VII headers (`0x0008 -> 0x00fe`, `/dev/edgetpu-soc` `0xED`) |
@@ -65,6 +66,10 @@ ctest --test-dir libopenbuenos/build/cmake-host --output-on-failure
 python3 tools/emit_custom_gemm.py --self-test
 python3 tools/spline_0x640.py --self-test --no-emit
 python3 tools/pack_int4.py
+
+# 3. Run FreeTPU Tile DSL offline unit & parity tests (cpu_ref vs buenos_a0 mock vs Cloud TPU Pallas dry-run)
+OPENBUENOS_MOCK=1 python3 -m freetpu_tile --self-test
+OPENBUENOS_MOCK=1 python3 examples/tile_dsl/fused_gemm_silu.py --target all
 ```
 
 To cross-build `libopenbuenos.a`, `tpu_baremetal_runner`, and `llama.cpp` (`llama-cli` / `llama-bench` / `test-backend-ops`) for Android ARM64 (`android-34`):
@@ -134,6 +139,7 @@ export OPENBUENOS_DIVE_INTERP_PATH=/data/local/tmp/tpu_open_stack/dive_interp_rv
 
 ## Documentation
 
+- [FreeTPU Tile DSL (`@freetpu.tile_kernel`) Guide](docs/tile-dsl/README.md) — Single-source Python Tile IR lowering to `buenos_a0`, Cloud TPU Pallas (`tpu_custom_call`), and `cpu_ref`
 - [Phase 6 Performance & Energy Report](docs/PHASE6_PERF_REPORT.md) — `1,286.4 MHz` DVFS + WakeLock unlock, `983.6 GOPS` (`5.55 TOPS/W`), batched `M=64` prefill, `SmolLM2`/`Qwen2.5` benchmarks & 18-case ODPM `mJ/tok` sweep
 - [Phase 5B Live LLM Spec](docs/PHASE5_LLAMA_TPU_SPEC.md) — `Probe A` dynamic `param_slice`, `O(1)` weight cache, outlier peeling & baseline bring-up
 - [DVFS, Power States & WakeLock Spec](docs/baremetal-vii/dvfs_power_states.md) — Corrected `+0x1c..+0x20` Litebuf wire fields, `TpuCorePowerState` (`0x03..0x19`), `MemoryPowerState` (`0x01..0x15`) & FW WakeLock (`union_type=4/5`)

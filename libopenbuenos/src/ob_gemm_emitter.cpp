@@ -5475,4 +5475,14 @@ ob_status_t ob_gemm_register_builtin_emitter(ob_context_t* ctx,
   return OB_OK;
 }
 
+ob_status_t ob_gemm_synthesize_dgc0(ob_context_t* ctx,
+                                    const ob_gemm_desc_t* desc,
+                                    uint8_t* out_buf,
+                                    size_t out_cap,
+                                    size_t* out_size) {
+  if (!ctx || !desc || !out_size) return OB_ERR_INVALID_ARG;
+  std::lock_guard<std::mutex> lk(ctx->gemm_mu);
+  return ob::builtin_gemm_emitter_cb(desc, out_buf, out_cap, out_size, ctx);
+}
+
 }  // extern "C"

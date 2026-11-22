@@ -26,7 +26,13 @@ jobs:
 
       - name: Build & test libopenbuenos (Make)
         run: |
-          make -C libopenbuenos verify-header-host host test
+          make -C libopenbuenos verify-header-host host host-shared test
+
+      - name: Run FreeTPU Tile DSL offline unit & parity tests
+        run: |
+          OPENBUENOS_MOCK=1 python3 -m freetpu_tile --self-test
+          OPENBUENOS_MOCK=1 python3 examples/tile_dsl/fused_gemm_silu.py --target all --iters 2 >/dev/null
+          OPENBUENOS_MOCK=1 python3 examples/tile_dsl/swiglu.py --target all --iters 2 >/dev/null
           make -C libopenbuenos clean
 
       - name: Build bare-metal runtime (Linux UAPI headers)

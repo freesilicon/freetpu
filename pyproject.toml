@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "freetpu-tile"
+version = "0.1.0"
+description = "Clean-room Python Tile DSL (@freetpu.tile_kernel) lowering to Edge TPU (buenos_a0) and Cloud TPU (Pallas/Mosaic)"
+readme = "docs/tile-dsl/README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+tpu = ["jax"]
+
+[tool.setuptools.packages.find]
+include = ["freetpu_tile*"]

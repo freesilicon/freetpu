@@ -41,25 +41,36 @@ HOST_OBJS    := $(patsubst $(THIS_DIR)/src/%.cpp,$(HOST_DIR)/obj/%.o,$(SRCS))
 ANDROID_OBJS := $(patsubst $(THIS_DIR)/src/%.cpp,$(ANDROID_DIR)/obj/%.o,$(SRCS))
 
 HOST_LIB     := $(HOST_DIR)/libopenbuenos.a
+HOST_SO_EXT  := $(if $(filter Darwin,$(shell uname -s)),dylib,so)
+HOST_SHARED  := $(HOST_DIR)/libopenbuenos.$(HOST_SO_EXT)
 HOST_TEST    := $(HOST_DIR)/openbuenos_host_test
 ANDROID_LIB  := $(ANDROID_DIR)/libopenbuenos.a
+ANDROID_SHARED := $(ANDROID_DIR)/libopenbuenos.so
 ANDROID_TEST := $(ANDROID_DIR)/openbuenos_selftest
 
-.PHONY: all host android test verify-header verify-header-host verify-android verify clean
+.PHONY: all host host-shared android android-shared test verify-header verify-header-host verify-android verify clean
 
 all: host android
 
 host: $(HOST_LIB) $(HOST_TEST)
 
+host-shared: $(HOST_SHARED)
+
 android: $(ANDROID_LIB) $(ANDROID_TEST)
+
+android-shared: $(ANDROID_SHARED)
 
 $(HOST_DIR)/obj/%.o: $(THIS_DIR)/src/%.cpp $(HDRS)
 	@mkdir -p $(dir $@)
-	$(HOST_CXX) $(HOST_CXXFLAGS) -c $< -o $@
+	$(HOST_CXX) $(HOST_CXXFLAGS) -fPIC -c $< -o $@
 
 $(HOST_LIB): $(HOST_OBJS)
 	@mkdir -p $(dir $@)
 	$(HOST_AR) rcs $@ $(HOST_OBJS)
+
+$(HOST_SHARED): $(HOST_OBJS)
+	@mkdir -p $(dir $@)
+	$(HOST_CXX) -shared $(HOST_OBJS) -o $@ $(HOST_LDFLAGS)
 
 $(HOST_TEST): $(THIS_DIR)/tests/openbuenos_host_test.cpp $(HOST_LIB) $(HDRS)
 	@mkdir -p $(dir $@)
@@ -67,11 +78,15 @@ $(HOST_TEST): $(THIS_DIR)/tests/openbuenos_host_test.cpp $(HOST_LIB) $(HDRS)
 
 $(ANDROID_DIR)/obj/%.o: $(THIS_DIR)/src/%.cpp $(HDRS)
 	@mkdir -p $(dir $@)
-	$(ANDROID_CXX) $(ANDROID_CXXFLAGS) -c $< -o $@
+	$(ANDROID_CXX) $(ANDROID_CXXFLAGS) -fPIC -c $< -o $@
 
 $(ANDROID_LIB): $(ANDROID_OBJS)
 	@mkdir -p $(dir $@)
 	$(ANDROID_AR) rcs $@ $(ANDROID_OBJS)
+
+$(ANDROID_SHARED): $(ANDROID_OBJS)
+	@mkdir -p $(dir $@)
+	$(ANDROID_CXX) -shared $(ANDROID_OBJS) -o $@ -static-libstdc++ -Wl,--as-needed -lm
 
 $(ANDROID_TEST): $(THIS_DIR)/tests/openbuenos_selftest.cpp $(ANDROID_LIB) $(HDRS)
 	@mkdir -p $(dir $@)

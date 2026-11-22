@@ -441,6 +441,20 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t*                  ctx,
                                            uint32_t                       num_jobs,
                                            ob_invoke_stats_t*             out_stats);
 
+/*
+ * Synthesize a complete Tensor G5 (buenos_a0) .dgc0 binary directly from an
+ * `ob_gemm_desc_t` using the registered builtin emitter (including Mode-A
+ * 0x640 degree-4 Remez spline fusion for OB_ACT_SILU / OB_ACT_GELU).
+ *
+ * Returns OB_ERR_OVERFLOW and writes required byte size to `*out_size` when
+ * `out_buf == NULL` or `out_cap` is smaller than the synthesized container.
+ */
+ob_status_t ob_gemm_synthesize_dgc0(ob_context_t*         ctx,
+                                    const ob_gemm_desc_t* desc,
+                                    uint8_t*              out_buf,
+                                    size_t                out_cap,
+                                    size_t*               out_size);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

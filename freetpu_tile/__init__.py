@@ -1,0 +1,51 @@
+"""FreeTPU Tile DSL: Single-source Python Tile kernels for Edge TPU (buenos_a0) and Cloud TPU (Pallas)."""
+
+from .dsl import (
+    TileKernel,
+    add,
+    cdiv,
+    dot,
+    gelu,
+    load,
+    mul,
+    program_id,
+    silu,
+    store,
+    tile_kernel,
+)
+from .ir import (
+    DType,
+    ExecutionResult,
+    LoweredArtifact,
+    OpKind,
+    ParityReport,
+    QuantParams,
+    Target,
+    TileBlockSpec,
+    TileKernelIR,
+    TileOp,
+)
+
+__all__ = [
+    "DType",
+    "ExecutionResult",
+    "LoweredArtifact",
+    "OpKind",
+    "ParityReport",
+    "QuantParams",
+    "Target",
+    "TileBlockSpec",
+    "TileKernel",
+    "TileKernelIR",
+    "TileOp",
+    "add",
+    "cdiv",
+    "dot",
+    "gelu",
+    "load",
+    "mul",
+    "program_id",
+    "silu",
+    "store",
+    "tile_kernel",
+]

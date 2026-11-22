@@ -23,13 +23,43 @@ BM_HDRS := $(THIS_DIR)/src/json_util.hpp \
            $(ROOT)/docs/kernel-abi/gcip_uapi.h \
            $(ROOT)/docs/kernel-abi/gxp_laguna_uapi.h
 
-.PHONY: all clean verify-headers verify-baremetal
+TR_OUT := $(THIS_DIR)/build/freetpu_tile_runner
+TR_HOST_OUT := $(THIS_DIR)/build/freetpu_tile_runner_host
+TR_SRC := $(THIS_DIR)/src/freetpu_tile_runner.cpp
+OB_ANDROID_LIB := $(ROOT)/libopenbuenos/build/android-arm64/libopenbuenos.a
+OB_HOST_LIB := $(ROOT)/libopenbuenos/build/host/libopenbuenos.a
+
+.PHONY: all clean verify-headers verify-baremetal tile-runner tile-runner-host verify-tile-runner
 
 all: $(BM_OUT)
 
 $(BM_OUT): $(BM_SRC) $(BM_HDRS)
 	@mkdir -p $(dir $(BM_OUT))
 	$(CXX) $(CXXFLAGS) $(BM_SRC) -o $(BM_OUT) $(BAREMETAL_LDFLAGS)
+
+$(OB_ANDROID_LIB):
+	$(MAKE) -C $(ROOT)/libopenbuenos android
+
+$(OB_HOST_LIB):
+	$(MAKE) -C $(ROOT)/libopenbuenos host
+
+tile-runner: $(TR_OUT)
+
+$(TR_OUT): $(TR_SRC) $(ROOT)/libopenbuenos/include/openbuenos.h $(OB_ANDROID_LIB)
+	@mkdir -p $(dir $(TR_OUT))
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Werror -fPIE -I$(ROOT)/libopenbuenos/include $(TR_SRC) $(OB_ANDROID_LIB) -o $(TR_OUT) $(BAREMETAL_LDFLAGS) -lm
+
+tile-runner-host: $(TR_HOST_OUT)
+
+$(TR_HOST_OUT): $(TR_SRC) $(ROOT)/libopenbuenos/include/openbuenos.h $(OB_HOST_LIB)
+	@mkdir -p $(dir $(TR_HOST_OUT))
+	clang++ -std=c++17 -O2 -Wall -Wextra -Werror -I$(ROOT)/libopenbuenos/include $(TR_SRC) $(OB_HOST_LIB) -o $(TR_HOST_OUT) -lm
+
+verify-tile-runner: $(TR_OUT)
+	file $(TR_OUT)
+	$(READELF) -d $(TR_OUT)
+	! $(READELF) -d $(TR_OUT) | grep -iE 'lib(log|tachyon|edgetpu|darwinn|gxp|tflite|tensorflow)|/vendor/'
+	! $(NM) -u $(TR_OUT) | grep -E '\bdlopen\b|\bdlsym\b|\bdlclose\b|\bdlerror\b'
 
 verify-headers:
 	$(CC) -x c -std=c11 -fsyntax-only -Wall -Wextra -Werror $(INCS) $(ROOT)/docs/baremetal-vii/litebuf_vii_wire.h
