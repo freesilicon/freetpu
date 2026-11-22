@@ -208,7 +208,9 @@ def evaluate_tpu_readiness(
         ):
             return False, "tpu_exporter_invalid_metrics"
         return False, "tpu_exporter_down"
-    if telemetry.total_chips > 0 and telemetry.healthy_chips == 0:
+    if telemetry.total_chips <= 0:
+        return False, "tpu_no_devices_discovered"
+    if telemetry.healthy_chips == 0:
         return False, "tpu_unhealthy"
     if (
         telemetry.max_hbm_utilization_ratio is not None
@@ -231,9 +233,9 @@ def scrape_tpu_exporter(
 ) -> TpuExporterTelemetry:
     """Fetch and parse `/metrics` from a `tpu-exporter` HTTP(S) endpoint."""
     parsed = urlsplit(url)
-    scheme = (parsed.scheme or "http").lower()
+    scheme = parsed.scheme.lower()
     host = parsed.hostname
-    if not host:
+    if scheme not in ("http", "https") or not host:
         return TpuExporterTelemetry(
             reachable=False,
             exporter_up=False,

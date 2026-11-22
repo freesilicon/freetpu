@@ -12,8 +12,12 @@ from urllib.parse import urlsplit
 
 VALID_POLICIES = ("cheapest", "local_first", "lowest_latency", "round_robin")
 VALID_AUTH_TYPES = ("allow_all", "bearer")
+VALID_URL_SCHEMES = ("http", "https")
+BEARER_AUTH_ONLY_KEYS = ("tokens", "tokens_env", "exempt_paths")
 DEFAULT_MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024
 DEFAULT_CLIENT_READ_TIMEOUT_S = 30.0
+DEFAULT_CLIENT_HEADER_TIMEOUT_S = 10.0
+DEFAULT_MAX_CONCURRENT_CONNECTIONS = 128
 
 
 def sanitize_url(url: str) -> str:
@@ -26,6 +30,23 @@ def sanitize_url(url: str) -> str:
         host = f"[{host}]"
     netloc = f"{host}:{parts.port}" if parts.port else host
     return parts._replace(netloc=netloc).geturl()
+
+
+def validate_http_url(url: str, *, field_name: str = "url") -> str:
+    """Validate that a backend or exporter URL uses an explicit http/https scheme and host."""
+    cleaned = url.strip()
+    parts = urlsplit(cleaned)
+    scheme = parts.scheme.lower()
+    if scheme not in VALID_URL_SCHEMES:
+        raise ValueError(
+            f"Invalid {field_name} {sanitize_url(cleaned)!r}: "
+            f"scheme must be one of {VALID_URL_SCHEMES}"
+        )
+    if not parts.hostname:
+        raise ValueError(
+            f"Invalid {field_name} {sanitize_url(cleaned)!r}: missing hostname"
+        )
+    return cleaned
 
 
 @dataclass
@@ -54,6 +75,21 @@ class BackendConfig:
     latency_hint_ms: Optional[float] = None
     enabled: bool = True
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        if not self.id or not self.id.strip():
+            raise ValueError("Backend 'id' must be non-empty")
+        self.base_url = validate_http_url(
+            self.base_url, field_name=f"backend {self.id!r} base_url"
+        ).rstrip("/")
+        if self.tpu_exporter_url:
+            self.tpu_exporter_url = validate_http_url(
+                self.tpu_exporter_url,
+                field_name=f"backend {self.id!r} tpu_exporter_url",
+            )
 
     def resolved_api_key(self) -> Optional[str]:
         if self.api_key:
@@ -176,6 +212,8 @@ class RouterConfig:
     backend_idle_timeout_s: float = 300.0
     max_request_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES
     client_read_timeout_s: float = DEFAULT_CLIENT_READ_TIMEOUT_S
+    client_header_timeout_s: float = DEFAULT_CLIENT_HEADER_TIMEOUT_S
+    max_concurrent_connections: int = DEFAULT_MAX_CONCURRENT_CONNECTIONS
     cors_allowed_origins: List[str] = field(default_factory=list)
     auth: Dict[str, Any] = field(default_factory=dict)
     usage_meter: Dict[str, Any] = field(default_factory=dict)
@@ -191,6 +229,7 @@ class RouterConfig:
             )
         seen_ids: set[str] = set()
         for b in self.backends:
+            b.validate()
             if b.id in seen_ids:
                 raise ValueError(f"Duplicate backend id {b.id!r}")
             seen_ids.add(b.id)
@@ -206,6 +245,10 @@ class RouterConfig:
             raise ValueError("max_request_body_bytes must be > 0")
         if self.client_read_timeout_s <= 0:
             raise ValueError("client_read_timeout_s must be > 0")
+        if self.client_header_timeout_s <= 0:
+            raise ValueError("client_header_timeout_s must be > 0")
+        if self.max_concurrent_connections <= 0:
+            raise ValueError("max_concurrent_connections must be > 0")
         if isinstance(self.cors_allowed_origins, (str, bytes)):
             raise ValueError("cors_allowed_origins must be a list of origin strings")
         normalized_origins: List[str] = []
@@ -264,6 +307,12 @@ class RouterConfig:
                     raise ValueError(
                         "auth.exempt_paths must be a list of non-empty path strings"
                     )
+        else:
+            misplaced = [k for k in BEARER_AUTH_ONLY_KEYS if k in self.auth]
+            if misplaced:
+                raise ValueError(
+                    f"Bearer auth settings {misplaced!r} require auth.type='bearer'"
+                )
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "RouterConfig":
@@ -297,6 +346,12 @@ class RouterConfig:
             ),
             client_read_timeout_s=float(
                 raw.get("client_read_timeout_s", DEFAULT_CLIENT_READ_TIMEOUT_S)
+            ),
+            client_header_timeout_s=float(
+                raw.get("client_header_timeout_s", DEFAULT_CLIENT_HEADER_TIMEOUT_S)
+            ),
+            max_concurrent_connections=int(
+                raw.get("max_concurrent_connections", DEFAULT_MAX_CONCURRENT_CONNECTIONS)
             ),
             cors_allowed_origins=cors_origins,
             auth=dict(raw_auth or {}),

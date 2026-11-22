@@ -26,12 +26,15 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from router.config import (  # noqa: E402
+    BEARER_AUTH_ONLY_KEYS,
     BackendConfig,
     RouterConfig,
     VALID_AUTH_TYPES,
     VALID_POLICIES,
+    VALID_URL_SCHEMES,
     load_config,
     sanitize_url,
+    validate_http_url,
 )
 from router.hooks import (  # noqa: E402
     AllowAllAuthHook,
@@ -64,9 +67,10 @@ MAX_METRIC_MODEL_LABELS = 256
 
 
 def _join_backend_url(base_url: str, endpoint: str) -> Tuple[str, str, int, str]:
-    parsed = urlsplit(base_url)
-    scheme = (parsed.scheme or "http").lower()
-    host = parsed.hostname or "127.0.0.1"
+    validated = validate_http_url(base_url, field_name="backend base_url")
+    parsed = urlsplit(validated)
+    scheme = parsed.scheme.lower()
+    host = parsed.hostname or ""
     port = parsed.port or (443 if scheme == "https" else 80)
     base_path = parsed.path.rstrip("/")
     if endpoint.startswith("/v1/") and base_path.endswith("/v1"):
@@ -84,18 +88,24 @@ def _open_http_connection(
     port: int,
     timeout_s: float,
 ) -> http.client.HTTPConnection:
-    if scheme == "https":
+    normalized = scheme.lower()
+    if normalized == "https":
         return http.client.HTTPSConnection(
             host,
             port,
             timeout=timeout_s,
             context=ssl.create_default_context(),
         )
-    return http.client.HTTPConnection(host, port, timeout=timeout_s)
+    if normalized == "http":
+        return http.client.HTTPConnection(host, port, timeout=timeout_s)
+    raise ValueError(
+        f"Unsupported backend URL scheme {scheme!r}; expected one of {VALID_URL_SCHEMES}"
+    )
 
 
 def _estimate_prompt_tokens(payload: Mapping[str, Any]) -> int:
     total_chars = 0
+    explicit_tokens = 0
     messages = payload.get("messages")
     if isinstance(messages, list):
         for msg in messages:
@@ -115,9 +125,16 @@ def _estimate_prompt_tokens(payload: Mapping[str, Any]) -> int:
         for item in prompt:
             if isinstance(item, str):
                 total_chars += len(item)
-    if total_chars == 0:
-        return 0
-    return max(1, (total_chars + 3) // 4)
+            elif isinstance(item, int) and not isinstance(item, bool):
+                explicit_tokens += 1
+            elif isinstance(item, list):
+                explicit_tokens += sum(
+                    1
+                    for tok in item
+                    if isinstance(tok, int) and not isinstance(tok, bool)
+                )
+    char_tokens = max(1, (total_chars + 3) // 4) if total_chars > 0 else 0
+    return explicit_tokens + char_tokens
 
 
 def _extract_choice_output_text(obj: Mapping[str, Any]) -> str:
@@ -361,6 +378,11 @@ def build_hooks_from_config(
                     f"Invalid auth.type {auth_type!r} when auth.hook is configured; "
                     "omit 'type' or set 'custom'"
                 )
+            misplaced = [k for k in BEARER_AUTH_ONLY_KEYS if k in auth_cfg]
+            if misplaced:
+                raise ValueError(
+                    f"Bearer auth settings {misplaced!r} require auth.type='bearer'"
+                )
             resolved_auth = load_hook_from_spec(spec.strip(), auth_cfg.get("kwargs"))
         elif auth_type == "bearer":
             raw_tokens = auth_cfg.get("tokens")
@@ -398,6 +420,11 @@ def build_hooks_from_config(
                 exempt = ("/health",)
             resolved_auth = BearerTokenAuthHook(tokens, exempt_paths=exempt)
         elif auth_type in (None, "allow_all"):
+            misplaced = [k for k in BEARER_AUTH_ONLY_KEYS if k in auth_cfg]
+            if misplaced:
+                raise ValueError(
+                    f"Bearer auth settings {misplaced!r} require auth.type='bearer'"
+                )
             resolved_auth = AllowAllAuthHook()
         else:
             raise ValueError(
@@ -705,17 +732,21 @@ class RouterEngine:
         model: str,
         *,
         policy: Optional[str] = None,
+        exclude_ids: Optional[Sequence[str] | set[str]] = None,
     ) -> List[BackendState]:
         active_policy = policy or self.config.policy
         if active_policy not in VALID_POLICIES:
             active_policy = self.config.policy
+        excluded = set(exclude_ids) if exclude_ids else set()
 
         now_m = time.monotonic()
         with self._lock:
             eligible = [
                 b
                 for b in self._backends
-                if b.is_eligible(now_m) and b.supports_model(model)
+                if b.config.id not in excluded
+                and b.is_eligible(now_m)
+                and b.supports_model(model)
             ]
             if not eligible:
                 return []
@@ -765,7 +796,8 @@ class RouterEngine:
             eligible.sort(key=lambda b: (b.config.priority, b.config.id))
             rr_key = self.metric_model_label(model, matched_backend=True)
             cursor = self._rr_cursors.get(rr_key, 0)
-            self._rr_cursors[rr_key] = (cursor + 1) % len(eligible)
+            if not excluded:
+                self._rr_cursors[rr_key] = (cursor + 1) % len(eligible)
             offset = cursor % len(eligible)
             return eligible[offset:] + eligible[:offset]
 
@@ -905,6 +937,86 @@ def _openai_error_body(
     return (json.dumps(payload) + "\n").encode("utf-8")
 
 
+class _DeadlineReader:
+    """Buffered reader wrapper enforcing a strict wall-clock deadline on header lines."""
+
+    def __init__(self, raw_rfile: Any, sock: Any, deadline: float) -> None:
+        self._raw = raw_rfile
+        self._sock = sock
+        self._deadline = deadline
+        self._buf = bytearray()
+
+    def readline(self, limit: int = -1) -> bytes:
+        max_len = limit if limit is not None and limit >= 0 else None
+        read_fn = getattr(self._raw, "read1", self._raw.read)
+        while True:
+            nl_idx = self._buf.find(b"\n")
+            if nl_idx != -1:
+                end = nl_idx + 1
+                if max_len is not None and end > max_len:
+                    end = max_len
+                out = bytes(self._buf[:end])
+                del self._buf[:end]
+                return out
+            if max_len is not None and len(self._buf) >= max_len:
+                out = bytes(self._buf[:max_len])
+                del self._buf[:max_len]
+                return out
+            remaining = self._deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Client header read timed out")
+            self._sock.settimeout(remaining)
+            chunk = read_fn(4096)
+            if not chunk:
+                out = bytes(self._buf)
+                self._buf.clear()
+                return out
+            self._buf.extend(chunk)
+
+    def read1(self, n: int = -1) -> bytes:
+        if self._buf:
+            if n is None or n < 0:
+                out = bytes(self._buf)
+                self._buf.clear()
+                return out
+            out = bytes(self._buf[:n])
+            del self._buf[:n]
+            return out
+        read_fn = getattr(self._raw, "read1", self._raw.read)
+        return read_fn(n)
+
+    def read(self, n: int = -1) -> bytes:
+        if n is None or n < 0:
+            prefix = bytes(self._buf)
+            self._buf.clear()
+            return prefix + self._raw.read()
+        out = bytearray(self._buf[:n])
+        del self._buf[: len(out)]
+        while len(out) < n:
+            chunk = self._raw.read(n - len(out))
+            if not chunk:
+                break
+            out.extend(chunk)
+        return bytes(out)
+
+    def close(self) -> None:
+        self._raw.close()
+
+
+_OVERLOAD_503_BODY = _openai_error_body(
+    "Server connection limit reached; retry later",
+    error_type="service_unavailable",
+    code="server_overloaded",
+)
+_OVERLOAD_503_RAW = (
+    b"HTTP/1.1 503 Service Unavailable\r\n"
+    b"Content-Type: application/json\r\n"
+    + f"Content-Length: {len(_OVERLOAD_503_BODY)}\r\n".encode("ascii")
+    + b"Connection: close\r\n\r\n"
+    + _OVERLOAD_503_BODY
+)
+
+
 class FreeTPURouterServer(ThreadingHTTPServer):
     """Multi-threaded stdlib HTTP server hosting `RouterEngine`."""
 
@@ -920,7 +1032,37 @@ class FreeTPURouterServer(ThreadingHTTPServer):
     ) -> None:
         self.engine = engine
         self.verbose = verbose
+        self._conn_semaphore = threading.BoundedSemaphore(
+            engine.config.max_concurrent_connections
+        )
         super().__init__(server_address, _RouterRequestHandler)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self._conn_semaphore.acquire(blocking=False):
+            try:
+                request.setblocking(False)
+                request.send(_OVERLOAD_503_RAW)
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._conn_semaphore.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._conn_semaphore.release()
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        _, exc_val, _ = sys.exc_info()
+        if isinstance(exc_val, (BrokenPipeError, ConnectionResetError)) and not self.verbose:
+            return
+        super().handle_error(request, client_address)
 
     def serve_forever(self, poll_interval: float = 0.5) -> None:
         self.engine.start_background_poller()
@@ -939,8 +1081,12 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def setup(self) -> None:
-        self.timeout = self.server.engine.config.client_read_timeout_s
+        self.timeout = self.server.engine.config.client_header_timeout_s
         super().setup()
+        header_deadline = (
+            time.monotonic() + self.server.engine.config.client_header_timeout_s
+        )
+        self.rfile = _DeadlineReader(self.rfile, self.connection, header_deadline)
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         if self.server.verbose:
@@ -1232,7 +1378,6 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         if policy_override:
             policy_override = policy_override.strip()
 
-        candidates = engine.select_candidates(model, policy=policy_override)
         est_prompt_tokens = _estimate_prompt_tokens(req_payload)
         failovers = 0
         last_error_status = 503
@@ -1244,14 +1389,32 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         last_attempted_backend: Optional[BackendState] = None
         prev_failure: Optional[Tuple[str, str]] = None
         pressure_checked = False
+        tried_ids: set[str] = set()
 
-        for backend in candidates:
-            attempt_start = time.monotonic()
-            total_inflight_now = engine.try_reserve_backend(
-                backend, now_monotonic=attempt_start
+        while True:
+            candidates = engine.select_candidates(
+                model,
+                policy=policy_override,
+                exclude_ids=tried_ids,
             )
-            if total_inflight_now is None:
-                continue
+            backend: Optional[BackendState] = None
+            total_inflight_now: Optional[int] = None
+            attempt_start = time.monotonic()
+            for cand in candidates:
+                if cand.config.id in tried_ids:
+                    continue
+                attempt_start = time.monotonic()
+                reserved = engine.try_reserve_backend(
+                    cand, now_monotonic=attempt_start
+                )
+                if reserved is not None:
+                    backend = cand
+                    total_inflight_now = reserved
+                    break
+            if backend is None or total_inflight_now is None:
+                break
+
+            tried_ids.add(backend.config.id)
 
             if not pressure_checked:
                 pressure_checked = True
@@ -1275,6 +1438,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
 
             last_attempted_backend = backend
             conn: Optional[http.client.HTTPConnection] = None
+            resp: Optional[http.client.HTTPResponse] = None
             non_stream_result: Optional[Tuple[int, str, bytes, float, float]] = None
             try:
                 scheme, host, port, upstream_path = _join_backend_url(
@@ -1292,7 +1456,12 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                     headers["Authorization"] = f"Bearer {api_key}"
 
                 conn.request("POST", upstream_path, body=raw_req, headers=headers)
+                upstream_sock = conn.sock
                 resp = conn.getresponse()
+                if upstream_sock is None:
+                    upstream_sock = getattr(
+                        getattr(resp.fp, "raw", None), "_sock", None
+                    )
 
                 if resp.status in RETRYABLE_STATUS_CODES:
                     reason = f"http_{resp.status}"
@@ -1313,6 +1482,8 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 if stream and 200 <= resp.status < 300:
                     completed = self._proxy_sse_stream(
                         resp=resp,
+                        upstream_sock=upstream_sock,
+                        timeout_s=timeout_s,
                         backend=backend,
                         model=model,
                         req_id=req_id,
@@ -1363,6 +1534,11 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 continue
             finally:
                 engine.release_backend(backend)
+                if resp is not None:
+                    try:
+                        resp.close()
+                    except OSError:
+                        pass
                 if conn is not None:
                     try:
                         conn.close()
@@ -1469,6 +1645,8 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         self,
         *,
         resp: http.client.HTTPResponse,
+        upstream_sock: Any,
+        timeout_s: float,
         backend: BackendState,
         model: str,
         req_id: str,
@@ -1478,10 +1656,15 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         est_prompt_tokens: int,
         principal: str,
     ) -> bool:
-        """Buffer until first complete SSE data event before committing 200 OK.
+        """Buffer until first generated output or terminator before committing 200 OK.
+
+        Uses HTTP/1.1 chunked transfer encoding for the committed SSE response so
+        premature upstream disconnects omit the terminating `0\\r\\n\\r\\n` chunk (in
+        addition to emitting an SSE error event) and are surfaced to HTTP clients
+        as incomplete streams rather than clean completions.
 
         Returns True if headers/stream were committed to the downstream client,
-        or False if upstream closed or sent no complete data event before commit.
+        or False if upstream closed or sent no qualifying output before commit.
         """
         engine = self.server.engine
         pre_commit_lines: List[bytes] = []
@@ -1491,11 +1674,19 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         max_pre_commit_events = 64
         first_chunk_time: Optional[float] = None
         pending_event_data: List[bytes] = []
+        pre_commit_deadline = attempt_start + timeout_s
 
         # Phase 1: upstream-only read through HTTPResponse.readline() (decodes chunked framing).
-        # Buffer keepalive comments and role-only/empty-delta events until generated output or
-        # a valid stream terminator arrives.
+        # Enforce a total elapsed deadline so continuous keepalive comments cannot stall forever.
         while True:
+            remaining = pre_commit_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Timed out waiting for first SSE output")
+            if upstream_sock is not None:
+                try:
+                    upstream_sock.settimeout(remaining)
+                except OSError:
+                    pass
             line = resp.readline()
             if not line:
                 # EOF before generated output or valid stream terminator -> retryable failure.
@@ -1524,7 +1715,14 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                     data_val = data_val[1:]
                 pending_event_data.append(data_val)
 
-        # Phase 2: upstream delivered a complete SSE data event -> commit response.
+        # Restore per-read upstream socket timeout for post-commit streaming.
+        if upstream_sock is not None:
+            try:
+                upstream_sock.settimeout(timeout_s)
+            except OSError:
+                pass
+
+        # Phase 2: upstream delivered output or valid terminator -> commit chunked response.
         # Downstream write errors from here on must never trigger backend failover.
         ttft_ms: Optional[float] = (
             (first_chunk_time - req_start) * 1000.0 if first_chunk_time else None
@@ -1535,17 +1733,23 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         est_completion_chars = 0
         saw_explicit_prompt_usage = False
         saw_explicit_completion_usage = False
+        stream_completed = False
+        upstream_read_error = False
+        downstream_write_error = False
         event_data_lines: List[bytes] = []
 
         def process_sse_event() -> None:
             nonlocal first_content_ttft_ms, prompt_tokens, completion_tokens
             nonlocal est_completion_chars, saw_explicit_prompt_usage
-            nonlocal saw_explicit_completion_usage
+            nonlocal saw_explicit_completion_usage, stream_completed
             if not event_data_lines:
                 return
             payload_bytes = b"\n".join(event_data_lines).strip()
             event_data_lines.clear()
-            if not payload_bytes or payload_bytes == b"[DONE]":
+            if not payload_bytes:
+                return
+            if payload_bytes == b"[DONE]":
+                stream_completed = True
                 return
             try:
                 obj = json.loads(payload_bytes.decode("utf-8", errors="replace"))
@@ -1553,6 +1757,12 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 return
             if not isinstance(obj, Mapping):
                 return
+            choices = obj.get("choices")
+            if isinstance(choices, list):
+                for choice in choices:
+                    if isinstance(choice, Mapping) and choice.get("finish_reason") is not None:
+                        stream_completed = True
+                        break
             output_txt = _extract_choice_output_text(obj)
             if output_txt:
                 if first_content_ttft_ms is None:
@@ -1589,6 +1799,11 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                     data_val = data_val[1:]
                 event_data_lines.append(data_val)
 
+        def write_chunk(data: bytes) -> None:
+            if not data:
+                return
+            self.wfile.write(f"{len(data):x}\r\n".encode("ascii") + data + b"\r\n")
+
         self.close_connection = True
         _, acao = self._resolve_cors_header()
         try:
@@ -1599,6 +1814,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             )
             self.send_header("Cache-Control", "no-cache")
             self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Transfer-Encoding", "chunked")
             self._send_cors_headers(acao)
             self.send_header("Connection", "close")
             self.send_header("X-FreeTPU-Backend", backend.config.id)
@@ -1608,51 +1824,92 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
 
             for buffered in pre_commit_lines:
                 inspect_sse_line(buffered)
-                self.wfile.write(buffered)
+            write_chunk(b"".join(pre_commit_lines))
             self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            downstream_write_error = True
 
+        if not downstream_write_error:
+            event_chunk_buf = bytearray()
             while True:
-                line = resp.readline()
+                try:
+                    line = resp.readline()
+                except (OSError, TimeoutError, http.client.HTTPException):
+                    upstream_read_error = True
+                    break
                 if not line:
                     break
                 inspect_sse_line(line)
-                self.wfile.write(line)
+                event_chunk_buf.extend(line)
                 if line in (b"\n", b"\r\n", b"\r"):
+                    try:
+                        write_chunk(bytes(event_chunk_buf))
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        downstream_write_error = True
+                        break
+                    event_chunk_buf.clear()
+
+            if event_chunk_buf and not downstream_write_error:
+                try:
+                    write_chunk(bytes(event_chunk_buf))
                     self.wfile.flush()
-            self.wfile.flush()
-        except (
-            BrokenPipeError,
-            ConnectionResetError,
-            OSError,
-            TimeoutError,
-            http.client.HTTPException,
-        ):
-            # Client disconnected or upstream closed mid-stream after first complete event.
-            pass
-        finally:
-            process_sse_event()
-            if not saw_explicit_completion_usage and est_completion_chars > 0:
-                completion_tokens = max(1, (est_completion_chars + 3) // 4)
-            total_ms = (time.monotonic() - req_start) * 1000.0
-            attempt_ms = (time.monotonic() - attempt_start) * 1000.0
-            effective_ttft = (
-                first_content_ttft_ms if first_content_ttft_ms is not None else ttft_ms
-            )
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    downstream_write_error = True
+
+        process_sse_event()
+        premature_upstream_end = (
+            not downstream_write_error
+            and (upstream_read_error or not stream_completed)
+        )
+        if not saw_explicit_completion_usage and est_completion_chars > 0:
+            completion_tokens = max(1, (est_completion_chars + 3) // 4)
+        total_ms = (time.monotonic() - req_start) * 1000.0
+        attempt_ms = (time.monotonic() - attempt_start) * 1000.0
+        effective_ttft = (
+            first_content_ttft_ms if first_content_ttft_ms is not None else ttft_ms
+        )
+        if premature_upstream_end:
+            engine.mark_backend_failed(backend, "stream_truncated_mid_response")
+            recorded_status = 502
+        else:
             with engine._lock:
                 backend.record_latency(attempt_ms)
-            engine._record_usage(
-                request_id=req_id,
-                model=model,
-                backend=backend,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                latency_ms=total_ms,
-                ttft_ms=effective_ttft,
-                stream=True,
-                failovers=failovers,
-                principal=principal,
-                status_code=resp.status,
-            )
+            recorded_status = resp.status
+
+        # Record metrics and usage before sending the final 0-chunk so callers
+        # inspecting /metrics or UsageMeterHook immediately after stream EOF see it.
+        engine._record_usage(
+            request_id=req_id,
+            model=model,
+            backend=backend,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            latency_ms=total_ms,
+            ttft_ms=effective_ttft,
+            stream=True,
+            failovers=failovers,
+            principal=principal,
+            status_code=recorded_status,
+        )
+
+        if not downstream_write_error:
+            try:
+                if premature_upstream_end:
+                    # Emit SSE error event and intentionally omit the terminating 0-chunk so
+                    # HTTP/1.1 chunked clients surface premature truncation instead of clean EOF.
+                    err_event = (
+                        b"event: error\n"
+                        b'data: {"error":{"message":"Upstream stream terminated before completion",'
+                        b'"type":"server_error","code":"upstream_stream_interrupted"}}\n\n'
+                    )
+                    write_chunk(err_event)
+                    self.wfile.flush()
+                else:
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                downstream_write_error = True
 
         return True
 
