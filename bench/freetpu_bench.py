@@ -426,9 +426,39 @@ def run_compute_local(backend: str, quick: bool = False) -> Dict[str, Any]:
     }
 
 
+# Minimum total 3-array working set (a, b, c) required for the host main-memory (DRAM)
+# bandwidth summary so cache-resident trials do not inflate the scorecard Mem BW column.
+MIN_DRAM_WORKING_SET_BYTES = 128 * 1024 * 1024  # 128 MiB (3 x 64 MiB = 192 MiB exceeds desktop LLCs)
+
+
+def _summarize_local_dram_bandwidth(
+    triad_cases: Sequence[Dict[str, Any]],
+    min_working_set_bytes: int = MIN_DRAM_WORKING_SET_BYTES,
+) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """Return `(peak_dram_eff_gbps, peak_dram_act_gbps, peak_array_eff_gbps)`.
+
+    Only triad trials whose 3-array working set meets `min_working_set_bytes`
+    contribute to the main-memory DRAM summary; smaller cache-resident sizes
+    remain visible as array-throughput measurements.
+    """
+    dram_cases = [
+        c
+        for c in triad_cases
+        if int(c.get("working_set_bytes", int(c.get("tensor_bytes", 0)) * 3)) >= min_working_set_bytes
+    ]
+    peak_dram_eff = max((float(c["peak_effective_gbps"]) for c in dram_cases), default=None)
+    peak_dram_act = max((float(c["peak_actual_gbps"]) for c in dram_cases), default=None)
+    peak_array_eff = max((float(c["peak_effective_gbps"]) for c in triad_cases), default=None)
+    return (
+        round(peak_dram_eff, 3) if peak_dram_eff is not None else None,
+        round(peak_dram_act, 3) if peak_dram_act is not None else None,
+        round(peak_array_eff, 3) if peak_array_eff is not None else None,
+    )
+
+
 def run_bandwidth_local(backend: str, quick: bool = False) -> Dict[str, Any]:
     _require_numpy()
-    sizes_mb = [2, 8] if quick else [4, 16, 64]
+    sizes_mb = [4, 64] if quick else [4, 16, 64]
     iters = 3 if quick else 6
 
     triad_cases: List[Dict[str, Any]] = []
@@ -450,6 +480,8 @@ def run_bandwidth_local(backend: str, quick: bool = False) -> Dict[str, Any]:
             samples_us.append((time.perf_counter_ns() - t0) / 1e3)
 
         tensor_bytes = count * 4
+        working_set_bytes = tensor_bytes * 3  # 3 live arrays (a, b, c)
+        exceeds_llc = working_set_bytes >= MIN_DRAM_WORKING_SET_BYTES
         effective_triad_bytes = tensor_bytes * 3  # Logical STREAM triad (2 reads + 1 write)
         actual_traffic_bytes = tensor_bytes * 5   # Two-pass NumPy: mul(b,s->c) [1R+1W] + add(a,c->c) [2R+1W]
         st = _stats_summary(samples_us)
@@ -462,6 +494,9 @@ def run_bandwidth_local(backend: str, quick: bool = False) -> Dict[str, Any]:
         triad_cases.append({
             "name": "triad_fp32_2pass",
             "tensor_bytes": tensor_bytes,
+            "working_set_bytes": working_set_bytes,
+            "memory_regime": "main_memory_dram" if exceeds_llc else "array_throughput_cache_bounded",
+            "included_in_mem_bw_summary": exceeds_llc,
             "effective_triad_bytes": effective_triad_bytes,
             "actual_traffic_bytes": actual_traffic_bytes,
             "traffic_model": "two_pass_numpy_5x_actual_3x_effective",
@@ -496,16 +531,20 @@ def run_bandwidth_local(backend: str, quick: bool = False) -> Dict[str, Any]:
             **st,
         })
 
-    peak_eff_bw = max((c["peak_effective_gbps"] for c in triad_cases), default=0.0)
-    peak_act_bw = max((c["peak_actual_gbps"] for c in triad_cases), default=0.0)
+    peak_eff_bw, peak_act_bw, peak_array_eff_bw = _summarize_local_dram_bandwidth(triad_cases)
     h2d_floor = xfer_cases[0]["median_us"] if xfer_cases else None
     return {
         "status": "measured",
         "backend": backend,
-        "bandwidth_basis": "effective 3x STREAM triad (local 2-pass NumPy executes 5x array traffic)",
-        "peak_triad_gbps": round(peak_eff_bw, 3),
-        "peak_effective_triad_gbps": round(peak_eff_bw, 3),
-        "peak_actual_traffic_gbps": round(peak_act_bw, 3),
+        "bandwidth_basis": (
+            "effective 3x STREAM triad on main-memory working set (>=128 MiB 3-array WS; "
+            "local 2-pass NumPy executes 5x array traffic; smaller sizes kept as array-throughput)"
+        ),
+        "summary_min_working_set_bytes": MIN_DRAM_WORKING_SET_BYTES,
+        "peak_triad_gbps": peak_eff_bw,
+        "peak_effective_triad_gbps": peak_eff_bw,
+        "peak_actual_traffic_gbps": peak_act_bw,
+        "peak_array_throughput_gbps": peak_array_eff_bw,
         "host_device_floor_us": h2d_floor,
         "triad_cases": triad_cases,
         "transfer_cases": xfer_cases,
@@ -713,6 +752,20 @@ def _safe_hbm_bytes_limit(dev: Any) -> Optional[int]:
     return None
 
 
+def _jax_bandwidth_metadata(jax_backend: str) -> Tuple[str, str, bool]:
+    """Return `(memory_label, bandwidth_basis, measure_accelerator_transfers)` for a JAX backend."""
+    b = str(jax_backend).lower()
+    if b == "tpu":
+        return "TPU HBM", "fused 3x STREAM triad (2R+1W on TPU HBM)", True
+    if b == "gpu":
+        return "GPU HBM/VRAM", "fused 3x STREAM triad (2R+1W on GPU memory)", True
+    return (
+        "host RAM",
+        f"fused 3x STREAM triad (2R+1W on host RAM via JAX {b} backend; accelerator H2D/D2H skipped)",
+        False,
+    )
+
+
 def run_jax_tpu_suites(suites: Sequence[str], quick: bool = False, allow_jax_cpu: bool = False) -> Dict[str, Any]:
     import jax  # type: ignore
     import jax.numpy as jnp  # type: ignore
@@ -726,15 +779,16 @@ def run_jax_tpu_suites(suites: Sequence[str], quick: bool = False, allow_jax_cpu
         )
 
     dev = devices[0]
-    dev_kind = getattr(dev, "device_kind", backend_name)
+    actual_platform = str(getattr(dev, "platform", backend_name) or backend_name).lower()
+    dev_kind = getattr(dev, "device_kind", actual_platform)
 
     results: Dict[str, Any] = {
         "device_info": {
             "jax_version": getattr(jax, "__version__", "unknown"),
-            "default_backend": backend_name,
+            "default_backend": actual_platform,
             "device_kind": dev_kind,
             "device_count": len(devices),
-            "hbm_bytes_limit": _safe_hbm_bytes_limit(dev),
+            "hbm_bytes_limit": _safe_hbm_bytes_limit(dev) if actual_platform != "cpu" else None,
         }
     }
 
@@ -881,7 +935,8 @@ def run_jax_tpu_suites(suites: Sequence[str], quick: bool = False, allow_jax_cpu
         floor_cases = [c for c in cases if c["shape"] == [1, 64, 32]]
         results["compute"] = {
             "status": "measured",
-            "backend": "jax_tpu",
+            "backend": f"jax_{actual_platform}",
+            "jax_backend": actual_platform,
             "peak_bf16_tflops": round(max((c["peak_perf"] for c in cases if c["unit"] == "TFLOP/s"), default=0.0), 3),
             "peak_int8_tops": round(max((c["peak_perf"] for c in cases if c["unit"] == "TOPS"), default=0.0), 3),
             "dispatch_floor_us": floor_cases[0]["median_us"] if floor_cases else None,
@@ -890,6 +945,7 @@ def run_jax_tpu_suites(suites: Sequence[str], quick: bool = False, allow_jax_cpu
 
     if "bandwidth" in suites:
         _require_numpy()
+        mem_label, bw_basis, measure_transfers = _jax_bandwidth_metadata(actual_platform)
         key = jax.random.PRNGKey(1)
         # 64 MB, 256 MB, 1024 MB BF16 tensors (in elements of 2 bytes)
         sizes_mb = [64, 256] if quick else [64, 256, 1024]
@@ -919,6 +975,7 @@ def run_jax_tpu_suites(suites: Sequence[str], quick: bool = False, allow_jax_cpu
             total_bytes = elems * 2 * 3  # 2 reads + 1 write
             triad_cases.append({
                 "name": "triad_bf16",
+                "memory_space": mem_label,
                 "tensor_bytes": elems * 2,
                 "total_traffic_bytes": total_bytes,
                 "median_gbps": round((total_bytes / max(st["median_us"] * 1e-6, 1e-9)) / 1e9, 3),
@@ -927,43 +984,52 @@ def run_jax_tpu_suites(suites: Sequence[str], quick: bool = False, allow_jax_cpu
             })
             del a, b
 
-        # Host <-> Device transfer overhead
+        # Host <-> Device transfer overhead (skip on JAX CPU where both sides are host RAM)
         xfer_cases: List[Dict[str, Any]] = []
-        for nbytes in ([4096, 4 * 1024 * 1024] if quick else [4096, 65536, 4 * 1024 * 1024]):
-            host_arr = np.ones(nbytes // 2, dtype=np.float16)
-            h2d_samples, d2h_samples = [], []
-            for _ in range(iters):
-                t0 = time.perf_counter_ns()
-                d_arr = jax.device_put(host_arr, dev)
-                d_arr.block_until_ready()
-                h2d_samples.append((time.perf_counter_ns() - t0) / 1e3)
-                t1 = time.perf_counter_ns()
-                _ = np.asarray(d_arr)
-                d2h_samples.append((time.perf_counter_ns() - t1) / 1e3)
-            st_h2d = _stats_summary(h2d_samples)
-            st_d2h = _stats_summary(d2h_samples)
-            xfer_cases.append({
-                "name": "h2d_device_put",
-                "bytes": nbytes,
-                "median_gbps": round((nbytes / max(st_h2d["median_us"] * 1e-6, 1e-9)) / 1e9, 3),
-                **st_h2d,
-            })
-            xfer_cases.append({
-                "name": "d2h_to_host",
-                "bytes": nbytes,
-                "median_gbps": round((nbytes / max(st_d2h["median_us"] * 1e-6, 1e-9)) / 1e9, 3),
-                **st_d2h,
-            })
+        if measure_transfers:
+            for nbytes in ([4096, 4 * 1024 * 1024] if quick else [4096, 65536, 4 * 1024 * 1024]):
+                host_arr = np.ones(nbytes // 2, dtype=np.float16)
+                h2d_samples, d2h_samples = [], []
+                for _ in range(iters):
+                    t0 = time.perf_counter_ns()
+                    d_arr = jax.device_put(host_arr, dev)
+                    d_arr.block_until_ready()
+                    h2d_samples.append((time.perf_counter_ns() - t0) / 1e3)
+                    t1 = time.perf_counter_ns()
+                    _ = np.asarray(d_arr)
+                    d2h_samples.append((time.perf_counter_ns() - t1) / 1e3)
+                st_h2d = _stats_summary(h2d_samples)
+                st_d2h = _stats_summary(d2h_samples)
+                xfer_cases.append({
+                    "name": "h2d_device_put",
+                    "bytes": nbytes,
+                    "median_gbps": round((nbytes / max(st_h2d["median_us"] * 1e-6, 1e-9)) / 1e9, 3),
+                    **st_h2d,
+                })
+                xfer_cases.append({
+                    "name": "d2h_to_host",
+                    "bytes": nbytes,
+                    "median_gbps": round((nbytes / max(st_d2h["median_us"] * 1e-6, 1e-9)) / 1e9, 3),
+                    **st_d2h,
+                })
 
-        results["bandwidth"] = {
+        bw_res: Dict[str, Any] = {
             "status": "measured",
-            "backend": "jax_tpu",
-            "bandwidth_basis": "fused 3x STREAM triad (2R+1W on TPU HBM)",
+            "backend": f"jax_{actual_platform}",
+            "jax_backend": actual_platform,
+            "memory_space": mem_label,
+            "bandwidth_basis": bw_basis,
             "peak_triad_gbps": round(max((c["peak_gbps"] for c in triad_cases), default=0.0), 3),
             "host_device_floor_us": xfer_cases[0]["median_us"] if xfer_cases else None,
             "triad_cases": triad_cases,
             "transfer_cases": xfer_cases,
         }
+        if not measure_transfers:
+            bw_res["transfer_note"] = (
+                f"Skipped on JAX {actual_platform} backend (both sides reside in host RAM; "
+                "no host<->accelerator transfer)."
+            )
+        results["bandwidth"] = bw_res
 
     return results
 
@@ -1257,6 +1323,20 @@ def _make_default_colab_runner(
     return _runner
 
 
+def _stop_confirmed_termination(stop_res: subprocess.CompletedProcess[str]) -> bool:
+    """Return True only when `colab stop -s` explicitly confirmed terminating a session.
+
+    `google-colab-cli` exits 0 with `[colab] Session '<name>' not found.` when no
+    local mapping exists, so exit code 0 alone does not prove a runtime was stopped.
+    """
+    if stop_res.returncode != 0:
+        return False
+    combined = f"{stop_res.stdout}\n{stop_res.stderr}".lower()
+    if "not found" in combined:
+        return False
+    return "session terminated" in combined
+
+
 def _verify_and_stop_session(
     runner: Callable[[Sequence[str]], subprocess.CompletedProcess[str]],
     colab_bin: str,
@@ -1372,16 +1452,18 @@ def _verify_and_stop_session(
     if not tracked_endpoints and unattributed:
         return False, observed_endpoint, [], [], sorted(unattributed)
 
+    stop_confirmed = _stop_confirmed_termination(stop_res)
     if not tracked_endpoints and not definitive_refusal:
-        if not before_ok and stop_res.returncode != 0:
+        if not stop_confirmed:
+            # No endpoint was observed before stop AND `colab stop -s` did not confirm
+            # terminating a mapped runtime (e.g. interrupted before local state was saved,
+            # or initial listing failed while provisioning was still pending). Keep teardown
+            # unverified so recovery guidance is preserved.
             return False, observed_endpoint, [], [], sorted(unattributed)
         if before_ok and not _session_still_listed(before.stdout, session_name):
             # Neither `before` nor a local session name confirmed ownership of a stopped endpoint
             # (e.g. interrupted while provisioning was still in flight). Keep teardown unverified.
             return False, observed_endpoint, [], [], sorted(unattributed)
-
-    if stop_res.returncode != 0 and not tracked_endpoints and pre_endpoints is None and recheck_entries:
-        return False, observed_endpoint, [], [], sorted(unattributed)
 
     return True, observed_endpoint, [], [], sorted(unattributed)
 
@@ -1738,18 +1820,28 @@ def build_scorecard_rows(
 
     # 1. Live measured row(s)
     if backend in ("jax_tpu", "colab_tpu"):
-        # Only emit a TPU row when actual TPU compute or bandwidth results exist.
+        # Only emit a TPU/JAX row when actual compute or bandwidth results exist.
         if comp or bw:
+            jax_default_backend = str(dev_info.get("default_backend") or "").lower()
+            is_jax_cpu = backend == "jax_tpu" and jax_default_backend == "cpu"
             kind = dev_info.get("device_kind") or (colab_tpu.upper() if colab_tpu else "Cloud TPU")
-            label = f"LIVE RUN: {kind} ({backend})"
-            inferred_cost = _infer_tpu_hourly_cost_usd(str(kind), colab_tpu)
-            cost_basis = f"GCP public on-demand rate (${inferred_cost:.2f}/chip-hr)" if inferred_cost else "local/unspecified"
-            mem_limit = dev_info.get("hbm_bytes_limit")
-            fallback_gib = _infer_tpu_fallback_memory_gib(str(kind), colab_tpu)
+            label = f"LIVE RUN: {kind} (jax_cpu)" if is_jax_cpu else f"LIVE RUN: {kind} ({backend})"
+            inferred_cost = None if is_jax_cpu else _infer_tpu_hourly_cost_usd(str(kind), colab_tpu)
+            cost_basis = (
+                "local host CPU (JAX --allow-jax-cpu)"
+                if is_jax_cpu
+                else (f"GCP public on-demand rate (${inferred_cost:.2f}/chip-hr)" if inferred_cost else "local/unspecified")
+            )
+            mem_limit = None if is_jax_cpu else dev_info.get("hbm_bytes_limit")
+            fallback_gib = None if is_jax_cpu else _infer_tpu_fallback_memory_gib(str(kind), colab_tpu)
             mem_str = (
-                f"{mem_limit / (1024**3):.2f} GiB HBM"
-                if mem_limit
-                else (f"{fallback_gib:g} GiB HBM (spec)" if fallback_gib is not None else "TPU HBM")
+                "host RAM (JAX CPU)"
+                if is_jax_cpu
+                else (
+                    f"{mem_limit / (1024**3):.2f} GiB HBM"
+                    if mem_limit
+                    else (f"{fallback_gib:g} GiB HBM (spec)" if fallback_gib is not None else "TPU HBM")
+                )
             )
             # Compare against --model-gb in matching decimal GB (reserve GiB strictly for display).
             live_mem_gb_exact: Optional[float] = (
@@ -2043,14 +2135,20 @@ def render_markdown(report: Dict[str, Any]) -> str:
         ])
         for c in bw.get("triad_cases", []):
             mb = c["tensor_bytes"] / (1024 * 1024)
+            regime_tag = ""
+            if c.get("memory_regime") == "array_throughput_cache_bounded":
+                regime_tag = " [array-throughput]"
+            elif c.get("memory_regime") == "main_memory_dram":
+                regime_tag = " [DRAM summary]"
             if "effective_triad_bytes" in c and "actual_traffic_bytes" in c:
                 eff_mb = c["effective_triad_bytes"] / (1024 * 1024)
                 act_mb = c["actual_traffic_bytes"] / (1024 * 1024)
-                traffic_s = f"{mb:.1f} MiB tensor ({eff_mb:.1f} MiB 3x eff / {act_mb:.1f} MiB 5x actual 2-pass)"
+                traffic_s = f"{mb:.1f} MiB tensor ({eff_mb:.1f} MiB 3x eff / {act_mb:.1f} MiB 5x actual 2-pass){regime_tag}"
                 med_s = f"{c['median_effective_gbps']:.3f} eff ({c['median_actual_gbps']:.3f} act)"
                 peak_s = f"{c['peak_effective_gbps']:.3f} eff ({c['peak_actual_gbps']:.3f} act)"
             else:
-                traffic_s = f"{mb:.1f} MiB tensor ({c['total_traffic_bytes'] / (1024*1024):.1f} MiB 3x fused)"
+                mem_space = f", {c['memory_space']}" if c.get("memory_space") else ""
+                traffic_s = f"{mb:.1f} MiB tensor ({c['total_traffic_bytes'] / (1024*1024):.1f} MiB 3x fused{mem_space}){regime_tag}"
                 med_s = f"{c['median_gbps']:.3f}"
                 peak_s = f"{c['peak_gbps']:.3f}"
             lines.append(
@@ -2060,6 +2158,8 @@ def render_markdown(report: Dict[str, Any]) -> str:
             lines.append(
                 f"| `{c['name']}` | {c['bytes']} B | {c['median_us']:.2f} | {c['median_gbps']:.3f} | — |"
             )
+        if bw.get("transfer_note"):
+            lines.extend(["", f"> **Transfer Note**: {bw['transfer_note']}"])
         lines.append("")
 
     comms = report.get("comms")
@@ -2123,15 +2223,30 @@ def run_self_test() -> int:
 
         bw = run_bandwidth_local(backend, quick=True)
         assert bw["status"] == "measured"
-        assert bw["peak_triad_gbps"] > 0
+        assert bw["peak_triad_gbps"] is not None and bw["peak_triad_gbps"] > 0
         assert bw["peak_effective_triad_gbps"] == bw["peak_triad_gbps"]
         assert bw["peak_actual_traffic_gbps"] > bw["peak_effective_triad_gbps"]
+        assert any(not tc["included_in_mem_bw_summary"] for tc in bw["triad_cases"])
+        assert any(tc["included_in_mem_bw_summary"] for tc in bw["triad_cases"])
         for tc in bw["triad_cases"]:
             assert tc["name"] == "triad_fp32_2pass"
+            assert tc["working_set_bytes"] == tc["tensor_bytes"] * 3
             assert tc["effective_triad_bytes"] == tc["tensor_bytes"] * 3
             assert tc["actual_traffic_bytes"] == tc["tensor_bytes"] * 5
             assert "total_traffic_bytes" not in tc
             assert tc["peak_actual_gbps"] > tc["peak_effective_gbps"]
+
+    # 2b. Verify main-memory DRAM summary excludes smaller cache-resident trials
+    dram_eff, dram_act, arr_eff = _summarize_local_dram_bandwidth([
+        {"tensor_bytes": 4 * 1024 * 1024, "working_set_bytes": 12 * 1024 * 1024, "peak_effective_gbps": 320.0, "peak_actual_gbps": 533.3},
+        {"tensor_bytes": 16 * 1024 * 1024, "working_set_bytes": 48 * 1024 * 1024, "peak_effective_gbps": 185.0, "peak_actual_gbps": 308.3},
+        {"tensor_bytes": 64 * 1024 * 1024, "working_set_bytes": 192 * 1024 * 1024, "peak_effective_gbps": 44.5, "peak_actual_gbps": 74.2},
+    ])
+    assert dram_eff == 44.5 and dram_act == 74.2 and arr_eff == 320.0
+    only_cache_eff, only_cache_act, only_cache_arr = _summarize_local_dram_bandwidth([
+        {"tensor_bytes": 4 * 1024 * 1024, "working_set_bytes": 12 * 1024 * 1024, "peak_effective_gbps": 320.0, "peak_actual_gbps": 533.3},
+    ])
+    assert only_cache_eff is None and only_cache_act is None and only_cache_arr == 320.0
 
     rtx5090 = next(b for b in PUBLISHED_BASELINES if b.target_id == "nvidia_rtx_5090")
     assert rtx5090.peak_bf16_tflops == 209.5
@@ -3259,6 +3374,54 @@ def run_self_test() -> int:
     assert to_state["sessions_calls"] == 3
     assert to_res["colab_meta"]["teardown_verified"] is True
 
+    # 4o2. Interrupted before local mapping saved + first teardown `colab sessions` fails +
+    # `colab stop -s` exits 0 with "not found" + empty recheck MUST stay teardown_verified=False
+    unobs_state: Dict[str, Any] = {"sessions_calls": 0, "cfg": None}
+
+    def _mock_unobserved_stop_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if "--config" in cmd:
+            unobs_state["cfg"] = cmd[cmd.index("--config") + 1]
+        if cmd[-1] == "version":
+            return subprocess.CompletedProcess(cmd, 0, "Version: 0.8.0\n", "")
+        if "usage" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "100.0\n", "")
+        if "run" in cmd:
+            raise KeyboardInterrupt()
+        if "stop" in cmd:
+            sname = cmd[cmd.index("-s") + 1]
+            return subprocess.CompletedProcess(cmd, 0, f"[colab] Session '{sname}' not found.\n", "")
+        if "sessions" in cmd:
+            unobs_state["sessions_calls"] += 1
+            if unobs_state["sessions_calls"] == 1:
+                return subprocess.CompletedProcess(cmd, 0, "[colab] No active sessions found on server.\n", "")
+            if unobs_state["sessions_calls"] == 2:
+                raise subprocess.TimeoutExpired(cmd=list(cmd), timeout=90.0)
+            return subprocess.CompletedProcess(cmd, 0, "[colab] No active sessions found on server.\n", "")
+        raise AssertionError(f"Unexpected cmd: {cmd}")
+
+    unobs_err = StringIO()
+    try:
+        with redirect_stderr(unobs_err):
+            run_colab_tpu_suites(
+                suites=["compute"],
+                quick=True,
+                colab_bin="colab",
+                auth="adc",
+                tpu_order=("v6e1",),
+                config_path=None,
+                timeout_s=120.0,
+                runner=_mock_unobserved_stop_runner,
+            )
+    except KeyboardInterrupt:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError("Expected KeyboardInterrupt to propagate")
+    assert "teardown unverified" in unobs_err.getvalue()
+    assert "still be provisioning" in unobs_err.getvalue()
+    unobs_cfg = Path(str(unobs_state["cfg"]))
+    assert unobs_cfg.parent.is_dir()
+    shutil.rmtree(unobs_cfg.parent, ignore_errors=True)
+
     # 4p. `_default_colab_runner` MUST force COLAB_CLI_ASSIGN_RETRIES=0 (overriding ambient env)
     # and a retried timeout + HTTP 412 refusal MUST NOT be treated as a definitive refusal
     prev_retries = os.environ.get("COLAB_CLI_ASSIGN_RETRIES")
@@ -3305,6 +3468,114 @@ def run_self_test() -> int:
             sys.modules["jax"] = prev_jax  # type: ignore[assignment]
         else:
             sys.modules.pop("jax", None)
+
+    # 4r. Combined `--suite compute,comms --backend colab_tpu` MUST run comms BEFORE provisioning
+    # Colab so an unreachable peer fails fast without invoking Colab or discarding TPU results
+    probe_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe_sock.bind(("127.0.0.1", 0))
+    closed_port = probe_sock.getsockname()[1]
+    probe_sock.close()
+    spy_dir = Path(tempfile.mkdtemp(prefix="freetpu-bench-comms-first-"))
+    try:
+        spy_marker = spy_dir / "colab_invoked.txt"
+        spy_colab = spy_dir / "spy-colab"
+        spy_colab.write_text(
+            f"#!{sys.executable}\n"
+            "from pathlib import Path\n"
+            f"Path({str(spy_marker)!r}).write_text('invoked', encoding='utf-8')\n"
+            "raise SystemExit(99)\n",
+            encoding="utf-8",
+        )
+        os.chmod(spy_colab, 0o700)
+        try:
+            main([
+                "--suite", "compute,comms",
+                "--backend", "colab_tpu",
+                "--colab-bin", str(spy_colab),
+                "--comms-host", "127.0.0.1",
+                "--comms-port", str(closed_port),
+                "--quick",
+            ])
+        except OSError:
+            pass
+        else:  # pragma: no cover
+            raise AssertionError("Expected OSError on refused comms port")
+        assert not spy_marker.exists(), "Colab CLI must NOT be invoked when comms probe fails"
+    finally:
+        shutil.rmtree(spy_dir, ignore_errors=True)
+
+    # 4s. JAX CPU (`--allow-jax-cpu`) bandwidth MUST use host RAM labels and skip accelerator H2D/D2H
+    cpu_mem, cpu_basis, cpu_xfer = _jax_bandwidth_metadata("cpu")
+    assert cpu_mem == "host RAM" and "TPU HBM" not in cpu_basis and cpu_xfer is False
+    tpu_mem, tpu_basis, tpu_xfer = _jax_bandwidth_metadata("tpu")
+    assert tpu_mem == "TPU HBM" and "TPU HBM" in tpu_basis and tpu_xfer is True
+
+    import types
+
+    class _FakeJaxArray:
+        def __init__(self, arr: Any) -> None:
+            self._arr = arr
+
+        def block_until_ready(self) -> "_FakeJaxArray":
+            return self
+
+        def __mul__(self, other: Any) -> "_FakeJaxArray":
+            return _FakeJaxArray(self._arr * other)
+
+        def __rmul__(self, other: Any) -> "_FakeJaxArray":
+            return _FakeJaxArray(other * self._arr)
+
+        def __add__(self, other: Any) -> "_FakeJaxArray":
+            other_arr = other._arr if isinstance(other, _FakeJaxArray) else other
+            return _FakeJaxArray(self._arr + other_arr)
+
+    class _FakeCpuDev:
+        platform = "cpu"
+        device_kind = "cpu"
+
+    fake_jnp = types.SimpleNamespace(bfloat16=np.float32)
+    fake_jax = types.SimpleNamespace(
+        __version__="0.0.0-stub",
+        devices=lambda: [_FakeCpuDev()],
+        default_backend=lambda: "cpu",
+        jit=lambda fn: fn,
+        random=types.SimpleNamespace(
+            PRNGKey=lambda seed: seed,
+            normal=lambda _key, shape, dtype=np.float32: _FakeJaxArray(np.ones((64,), dtype=np.float32)),
+        ),
+        device_put=lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("device_put must be skipped on JAX CPU")),
+        numpy=fake_jnp,
+    )
+    had_jax_s = "jax" in sys.modules
+    prev_jax_s = sys.modules.get("jax")
+    had_jnp_s = "jax.numpy" in sys.modules
+    prev_jnp_s = sys.modules.get("jax.numpy")
+    sys.modules["jax"] = fake_jax  # type: ignore[assignment]
+    sys.modules["jax.numpy"] = fake_jnp  # type: ignore[assignment]
+    try:
+        jax_cpu_res = run_jax_tpu_suites(["bandwidth"], quick=True, allow_jax_cpu=True)
+    finally:
+        if had_jax_s:
+            sys.modules["jax"] = prev_jax_s  # type: ignore[assignment]
+        else:
+            sys.modules.pop("jax", None)
+        if had_jnp_s:
+            sys.modules["jax.numpy"] = prev_jnp_s  # type: ignore[assignment]
+        else:
+            sys.modules.pop("jax.numpy", None)
+    assert jax_cpu_res["device_info"]["default_backend"] == "cpu"
+    assert jax_cpu_res["device_info"]["hbm_bytes_limit"] is None
+    bw_cpu = jax_cpu_res["bandwidth"]
+    assert bw_cpu["backend"] == "jax_cpu"
+    assert bw_cpu["memory_space"] == "host RAM"
+    assert "TPU HBM" not in bw_cpu["bandwidth_basis"]
+    assert bw_cpu["transfer_cases"] == []
+    assert bw_cpu["host_device_floor_us"] is None
+    assert "Skipped on JAX cpu backend" in bw_cpu["transfer_note"]
+    jax_cpu_rows = build_scorecard_rows({"backend": "jax_tpu", **jax_cpu_res})
+    assert jax_cpu_rows[0]["memory"] == "host RAM (JAX CPU)"
+    assert "TPU HBM" not in jax_cpu_rows[0]["memory"]
+    assert "(jax_cpu)" in jax_cpu_rows[0]["target"]
 
     # 5. Verify this script compiles and loads under a `colab run` executable prelude
     src_text = Path(__file__).read_text(encoding="utf-8")
@@ -3405,12 +3676,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if "comms" in suites:
             report["comms"] = run_comms_suite(args.comms_host, args.comms_port, quick=args.quick)
     elif args.backend == "jax_tpu":
+        if "comms" in suites:
+            report["comms"] = run_comms_suite(args.comms_host, args.comms_port, quick=args.quick)
         if "compute" in suites or "bandwidth" in suites:
             jax_res = run_jax_tpu_suites(suites, quick=args.quick, allow_jax_cpu=args.allow_jax_cpu)
             report.update(jax_res)
-        if "comms" in suites:
-            report["comms"] = run_comms_suite(args.comms_host, args.comms_port, quick=args.quick)
     elif args.backend == "colab_tpu":
+        # Run local/wired TCP comms probe BEFORE provisioning a paid Colab TPU so a
+        # broken link never wastes Compute Units or discards completed TPU measurements.
+        if "comms" in suites and not args.dry_run:
+            report["comms"] = run_comms_suite(args.comms_host, args.comms_port, quick=args.quick)
         tpu_order = ("v6e1", "v5e1") if args.colab_tpu == "auto" else (args.colab_tpu,)
         cfg_path = Path(os.path.abspath(os.path.expanduser(args.colab_config))) if args.colab_config else None
         colab_res = run_colab_tpu_suites(
@@ -3428,8 +3703,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 report[key] = colab_res[key]
         if "host_platform" in colab_res and "colab_meta" in report:
             report["colab_meta"]["remote_host_platform"] = colab_res["host_platform"]
-        if "comms" in suites and not args.dry_run:
-            report["comms"] = run_comms_suite(args.comms_host, args.comms_port, quick=args.quick)
 
     report["scorecard"] = build_scorecard_rows(
         report,
