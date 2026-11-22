@@ -237,11 +237,15 @@ class ClientDisconnectedError(Exception):
     """Raised when the downstream client closes its connection during an upstream wait."""
 
 
+_MSG_DONTWAIT = getattr(socket, "MSG_DONTWAIT", 0)
+
+
 class _DeadlineSocketIO(io.RawIOBase):
     """Raw socket reader enforcing an elapsed deadline and optional client cancellation."""
 
     def __init__(self, wrapper: "DeadlineSocket") -> None:
         self._wrapper = wrapper
+        self._nonblocking_configured = False
 
     def readable(self) -> bool:
         return True
@@ -253,62 +257,113 @@ class _DeadlineSocketIO(io.RawIOBase):
         pending_fn = getattr(upstream, "pending", None)
         if callable(pending_fn) and pending_fn() > 0:
             return
-        while self._wrapper._watch_client and self._wrapper._client_sock is not None:
+        while True:
             rem: Optional[float] = None
             if deadline is not None:
                 rem = deadline - time.monotonic()
                 if rem <= 0:
                     raise TimeoutError(f"{self._wrapper.label} exceeded elapsed deadline")
-            client = self._wrapper._client_sock
-            try:
-                readable, _, errored = select.select(
-                    [upstream, client], [], [client], rem
-                )
-            except (OSError, ValueError):
+            if self._wrapper._watch_client and self._wrapper._client_sock is not None:
+                client = self._wrapper._client_sock
                 try:
-                    if client.fileno() == -1:
-                        raise ClientDisconnectedError("Downstream client disconnected")
-                except (OSError, AttributeError):
-                    raise ClientDisconnectedError("Downstream client disconnected")
-                self._wrapper._watch_client = False
-                return
-            if client in errored:
-                raise ClientDisconnectedError("Downstream client disconnected")
-            if client in readable:
-                peek: Optional[bytes] = None
-                try:
-                    peek = client.recv(
-                        1, socket.MSG_PEEK | getattr(socket, "MSG_DONTWAIT", 0)
+                    readable, _, errored = select.select(
+                        [upstream, client], [], [client], rem
                     )
-                except BlockingIOError:
-                    peek = None
-                except OSError as exc:
-                    if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
-                        peek = None
-                    else:
-                        raise ClientDisconnectedError("Downstream client disconnected") from exc
-                if peek == b"":
-                    raise ClientDisconnectedError("Downstream client disconnected")
-                if peek is not None:
-                    # Extra pipelined bytes on client socket; stop EOF-watching to avoid busy spin.
+                except (OSError, ValueError):
+                    try:
+                        if client.fileno() == -1:
+                            raise ClientDisconnectedError("Downstream client disconnected")
+                    except (OSError, AttributeError):
+                        raise ClientDisconnectedError("Downstream client disconnected")
                     self._wrapper._watch_client = False
-            if upstream in readable:
-                return
-            if not readable and not errored and deadline is not None:
-                if time.monotonic() >= deadline:
+                    continue
+                if client in errored:
+                    raise ClientDisconnectedError("Downstream client disconnected")
+                if client in readable:
+                    peek: Optional[bytes] = None
+                    try:
+                        peek = client.recv(
+                            1, socket.MSG_PEEK | _MSG_DONTWAIT
+                        )
+                    except BlockingIOError:
+                        peek = None
+                    except OSError as exc:
+                        if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                            peek = None
+                        else:
+                            raise ClientDisconnectedError("Downstream client disconnected") from exc
+                    if peek == b"":
+                        raise ClientDisconnectedError("Downstream client disconnected")
+                    if peek is not None:
+                        # Extra pipelined bytes on client socket; stop EOF-watching to avoid busy spin.
+                        self._wrapper._watch_client = False
+                if upstream in readable:
+                    return
+                if not readable and not errored and deadline is not None:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"{self._wrapper.label} exceeded elapsed deadline")
+            else:
+                readable, _, _ = select.select([upstream], [], [], rem)
+                if upstream in readable:
+                    return
+                if deadline is not None and time.monotonic() >= deadline:
                     raise TimeoutError(f"{self._wrapper.label} exceeded elapsed deadline")
 
     def readinto(self, b: Any) -> int:
         if self.closed:
             raise ValueError("I/O operation on closed file.")
+        wrapper = self._wrapper
+        upstream = wrapper._sock
+        deadline = wrapper.deadline
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError(f"{wrapper.label} exceeded elapsed deadline")
+
+        if not wrapper._is_ssl:
+            if not self._nonblocking_configured:
+                try:
+                    upstream.settimeout(0.0)
+                    self._nonblocking_configured = True
+                except OSError:
+                    pass
+            if self._nonblocking_configured:
+                while True:
+                    try:
+                        n = upstream.recv_into(b)
+                        if (
+                            n > 0
+                            and wrapper._watch_client
+                            and wrapper._check_client_on_fast_read
+                            and wrapper._client_sock is not None
+                        ):
+                            client = wrapper._client_sock
+                            try:
+                                r_cli, _, e_cli = select.select([client], [], [client], 0.0)
+                                if e_cli:
+                                    raise ClientDisconnectedError("Downstream client disconnected")
+                                if r_cli:
+                                    peek = client.recv(1, socket.MSG_PEEK | _MSG_DONTWAIT)
+                                    if peek == b"":
+                                        raise ClientDisconnectedError("Downstream client disconnected")
+                                    wrapper._watch_client = False
+                            except ClientDisconnectedError:
+                                raise
+                            except (OSError, ValueError):
+                                pass
+                        return n
+                    except BlockingIOError:
+                        pass
+                    except OSError as exc:
+                        if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                            raise
+                    self._wait_readable_or_cancel()
+
         self._wait_readable_or_cancel()
-        deadline = self._wrapper.deadline
         if deadline is not None:
             rem = deadline - time.monotonic()
             if rem <= 0:
-                raise TimeoutError(f"{self._wrapper.label} exceeded elapsed deadline")
-            self._wrapper._sock.settimeout(rem)
-        return self._wrapper._sock.recv_into(b)
+                raise TimeoutError(f"{wrapper.label} exceeded elapsed deadline")
+            upstream.settimeout(rem)
+        return upstream.recv_into(b)
 
     def close(self) -> None:
         if not self.closed:
@@ -332,6 +387,8 @@ class DeadlineSocket:
         self.label = label
         self._client_sock = client_sock
         self._watch_client = client_sock is not None
+        self._check_client_on_fast_read = client_sock is not None
+        self._is_ssl = isinstance(sock, ssl.SSLSocket)
         self._io_refs = 0
         self._closed = False
 

@@ -9,7 +9,7 @@ v5e/v6e workers with zero third-party dependencies (Python standard library only
 from __future__ import annotations
 
 import argparse
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 import errno
 import hashlib
@@ -20,6 +20,7 @@ import math
 from pathlib import Path
 import re
 import select
+import selectors
 import socket
 import ssl
 import sys
@@ -411,6 +412,12 @@ class _BoundedSSEReader:
         self._buf = bytearray()
         self._eof = False
 
+    def drain_buffer(self) -> Tuple[bytes, bool]:
+        """Return any buffered unread bytes and EOF flag, clearing internal buffer."""
+        out = bytes(self._buf)
+        self._buf.clear()
+        return out, self._eof
+
     def readline(
         self,
         *,
@@ -532,21 +539,21 @@ def _extract_choice_output_text(obj: Mapping[str, Any]) -> str:
         return ""
     parts: List[str] = []
     for choice in choices:
-        if not isinstance(choice, Mapping):
+        if not (isinstance(choice, dict) or isinstance(choice, Mapping)):
             continue
         text_val = choice.get("text")
         if isinstance(text_val, str) and text_val:
             parts.append(text_val)
         for container_key in ("delta", "message"):
             container = choice.get(container_key)
-            if not isinstance(container, Mapping):
+            if not (isinstance(container, dict) or isinstance(container, Mapping)):
                 continue
             for text_key in ("content", "refusal", "reasoning_content", "reasoning"):
                 val = container.get(text_key)
                 if isinstance(val, str) and val:
                     parts.append(val)
             func_call = container.get("function_call")
-            if isinstance(func_call, Mapping):
+            if isinstance(func_call, dict) or isinstance(func_call, Mapping):
                 for fk in ("name", "arguments"):
                     fval = func_call.get(fk)
                     if isinstance(fval, str) and fval:
@@ -554,10 +561,10 @@ def _extract_choice_output_text(obj: Mapping[str, Any]) -> str:
             tool_calls = container.get("tool_calls")
             if isinstance(tool_calls, list):
                 for tc in tool_calls:
-                    if not isinstance(tc, Mapping):
+                    if not (isinstance(tc, dict) or isinstance(tc, Mapping)):
                         continue
                     fn = tc.get("function")
-                    if isinstance(fn, Mapping):
+                    if isinstance(fn, dict) or isinstance(fn, Mapping):
                         for fk in ("name", "arguments"):
                             fval = fn.get(fk)
                             if isinstance(fval, str) and fval:
@@ -984,6 +991,35 @@ def build_hooks_from_config(
     return resolved_auth, resolved_usage, resolved_scaler
 
 
+class _BackendSlotLease:
+    """RAII lease guaranteeing an acquired backend in-flight slot is released once."""
+
+    __slots__ = ("_engine", "_state", "_released")
+
+    def __init__(self, engine: "RouterEngine", state: BackendState) -> None:
+        self._engine = engine
+        self._state = state
+        self._released = False
+
+    def release(self) -> None:
+        if not self._released:
+            self._released = True
+            self._engine.release_backend(self._state)
+
+    def __enter__(self) -> "_BackendSlotLease":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.release()
+
+    def __del__(self) -> None:
+        if not getattr(self, "_released", True):
+            try:
+                self.release()
+            except Exception:
+                pass
+
+
 class RouterEngine:
     """Core routing, health polling, TPU telemetry, and failover engine."""
 
@@ -1161,7 +1197,10 @@ class RouterEngine:
             endpoint,
             strip_api_version=strip_api_version,
         )
-        headers: Dict[str, str] = {"Accept": "application/json"}
+        headers: Dict[str, str] = {
+            "Accept": "application/json",
+            "Connection": "close",
+        }
         t0 = time.monotonic()
         deadline = t0 + max(0.01, timeout_s)
         conn: Optional[http.client.HTTPConnection] = None
@@ -1350,7 +1389,24 @@ class RouterEngine:
             state.total_requests += 1
             state.last_used_monotonic = now_m
             state.idle_notified = False
-        return self.metrics.inc_inflight(state.config.id)
+        try:
+            return self.metrics.inc_inflight(state.config.id)
+        except BaseException:
+            with self._lock:
+                state.inflight = max(0, state.inflight - 1)
+            raise
+
+    def reserve_backend_lease(
+        self,
+        state: BackendState,
+        *,
+        now_monotonic: Optional[float] = None,
+    ) -> Optional[Tuple[_BackendSlotLease, int]]:
+        """Reserve an in-flight slot and return `(lease, total_inflight)`."""
+        reserved = self.try_reserve_backend(state, now_monotonic=now_monotonic)
+        if reserved is None:
+            return None
+        return _BackendSlotLease(self, state), reserved
 
     def release_backend(self, state: BackendState) -> None:
         """Release one in-flight slot; start idle timing when in-flight drops to zero."""
@@ -1728,11 +1784,481 @@ _OVERLOAD_503_RAW = (
 )
 
 
+_MSG_DONTWAIT = getattr(socket, "MSG_DONTWAIT", 0)
+
+
+class _SSEReactorTask:
+    """State for a committed plain-TCP SSE stream pumped by `_SSEReactor`."""
+
+    __slots__ = (
+        "upstream_sock",
+        "client_sock",
+        "engine",
+        "sse_buf",
+        "raw_buf",
+        "chunked",
+        "chunk_left",
+        "remaining_content_length",
+        "max_event_bytes",
+        "timeout_s",
+        "progress_deadline",
+        "sse_mem_box",
+        "on_event_fn",
+        "event_data_lines",
+        "current_event_type",
+        "scan_pos",
+        "event_start",
+        "saw_done_sentinel",
+        "upstream_read_error",
+        "downstream_write_error",
+        "size_limit_exceeded",
+        "memory_limit_exceeded",
+        "eof",
+        "done_event",
+        "client_registered",
+    )
+
+    def __init__(
+        self,
+        *,
+        upstream_sock: socket.socket,
+        client_sock: socket.socket,
+        engine: RouterEngine,
+        sse_buf: bytearray,
+        raw_buf: bytearray,
+        chunked: bool,
+        chunk_left: Optional[int],
+        remaining_content_length: Optional[int],
+        max_event_bytes: int,
+        timeout_s: float,
+        progress_deadline: float,
+        sse_mem_box: List[int],
+        on_event_fn: Callable[[], bool],
+        event_data_lines: List[bytes],
+        current_event_type: str,
+    ) -> None:
+        self.upstream_sock = upstream_sock
+        self.client_sock = client_sock
+        self.engine = engine
+        self.sse_buf = sse_buf
+        self.raw_buf = raw_buf
+        self.chunked = chunked
+        self.chunk_left = chunk_left
+        self.remaining_content_length = remaining_content_length
+        self.max_event_bytes = max_event_bytes
+        self.timeout_s = timeout_s
+        self.progress_deadline = progress_deadline
+        self.sse_mem_box = sse_mem_box
+        self.on_event_fn = on_event_fn
+        self.event_data_lines = event_data_lines
+        self.current_event_type = current_event_type
+        self.scan_pos = 0
+        self.event_start = 0
+        self.saw_done_sentinel = False
+        self.upstream_read_error = False
+        self.downstream_write_error = False
+        self.size_limit_exceeded = False
+        self.memory_limit_exceeded = False
+        self.eof = False
+        self.done_event = threading.Event()
+        self.client_registered = False
+
+
+class _SSEReactor:
+    """Single-thread `selectors` event loop pumping committed SSE streams at scale."""
+
+    def __init__(self) -> None:
+        self._selector = selectors.DefaultSelector()
+        self._wake_r, self._wake_w = socket.socketpair()
+        self._wake_r.setblocking(False)
+        self._wake_w.setblocking(False)
+        self._selector.register(self._wake_r, selectors.EVENT_READ, data=None)
+        self._pending_lock = threading.Lock()
+        self._pending: deque[_SSEReactorTask] = deque()
+        self._active: set[_SSEReactorTask] = set()
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._start_lock = threading.Lock()
+
+    def start(self) -> None:
+        with self._start_lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop_event.clear()
+            self._thread = threading.Thread(
+                target=self._run,
+                name="freetpu-sse-reactor",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        try:
+            self._wake_w.send(b"\x00")
+        except OSError:
+            pass
+        thread: Optional[threading.Thread]
+        with self._start_lock:
+            thread = self._thread
+            self._thread = None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+        for sock in (self._wake_r, self._wake_w):
+            try:
+                self._selector.unregister(sock)
+            except (KeyError, ValueError):
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+        try:
+            self._selector.close()
+        except OSError:
+            pass
+
+    def submit(self, task: _SSEReactorTask) -> None:
+        if self._stop_event.is_set():
+            task.downstream_write_error = True
+            task.done_event.set()
+            return
+        self.start()
+        with self._pending_lock:
+            self._pending.append(task)
+        try:
+            self._wake_w.send(b"\x01")
+        except BlockingIOError:
+            pass
+        except OSError:
+            pass
+
+    def _release_mem(self, task: _SSEReactorTask, amount: int) -> None:
+        if amount <= 0:
+            return
+        rel = min(amount, task.sse_mem_box[0])
+        if rel > 0:
+            task.engine.release_response_memory(rel)
+            task.sse_mem_box[0] -= rel
+
+    def _finish_task(self, task: _SSEReactorTask) -> None:
+        self._active.discard(task)
+        try:
+            self._selector.unregister(task.upstream_sock)
+        except (KeyError, ValueError):
+            pass
+        if task.client_registered:
+            try:
+                self._selector.unregister(task.client_sock)
+            except (KeyError, ValueError):
+                pass
+            task.client_registered = False
+        if task.sse_buf:
+            rem = len(task.sse_buf)
+            task.sse_buf.clear()
+            self._release_mem(task, rem)
+        if task.raw_buf:
+            rem = len(task.raw_buf)
+            task.raw_buf.clear()
+            self._release_mem(task, rem)
+        task.done_event.set()
+
+    def _decode_chunked(self, task: _SSEReactorTask) -> None:
+        raw = task.raw_buf
+        while raw:
+            if task.chunk_left is None:
+                nl = raw.find(b"\n")
+                if nl == -1:
+                    if len(raw) > 4096:
+                        task.upstream_read_error = True
+                    return
+                line = bytes(raw[: nl + 1])
+                del raw[: nl + 1]
+                self._release_mem(task, len(line))
+                semi = line.find(b";")
+                size_bytes = line[:semi] if semi != -1 else line
+                try:
+                    size = int(size_bytes.strip(), 16)
+                except ValueError:
+                    task.upstream_read_error = True
+                    return
+                if size < 0:
+                    task.upstream_read_error = True
+                    return
+                if size == 0:
+                    task.eof = True
+                    return
+                task.chunk_left = size
+            if task.chunk_left > 0:
+                take = min(task.chunk_left, len(raw))
+                if take == 0:
+                    return
+                task.sse_buf.extend(raw[:take])
+                del raw[:take]
+                task.chunk_left -= take
+            if task.chunk_left == 0:
+                if not raw:
+                    return
+                if raw[0] == 13:
+                    if len(raw) < 2:
+                        return
+                    if raw[1] == 10:
+                        del raw[:2]
+                        self._release_mem(task, 2)
+                    else:
+                        task.upstream_read_error = True
+                        return
+                elif raw[0] == 10:
+                    del raw[:1]
+                    self._release_mem(task, 1)
+                else:
+                    task.upstream_read_error = True
+                    return
+                task.chunk_left = None
+
+    def _process_sse_buf(self, task: _SSEReactorTask) -> bool:
+        """Scan complete SSE events in `task.sse_buf` and flush as one HTTP chunk.
+
+        Returns True if the task has reached a terminal state.
+        """
+        buf = task.sse_buf
+        flush_end = 0
+        while True:
+            nl_idx = buf.find(b"\n", task.scan_pos)
+            if nl_idx == -1:
+                if len(buf) - task.event_start > task.max_event_bytes:
+                    task.size_limit_exceeded = True
+                break
+            line_end = nl_idx + 1
+            if line_end - task.event_start > task.max_event_bytes:
+                task.size_limit_exceeded = True
+                break
+            line_len = line_end - task.scan_pos
+            if line_len == 1 or (line_len == 2 and buf[task.scan_pos] == 13):
+                ev_type = task.current_event_type
+                task.current_event_type = ""
+                made_progress, is_done = task.on_event_fn(ev_type, task.event_data_lines)
+                task.event_data_lines.clear()
+                if is_done:
+                    task.saw_done_sentinel = True
+                if made_progress:
+                    task.progress_deadline = time.monotonic() + task.timeout_s
+                task.event_start = line_end
+                flush_end = line_end
+                task.scan_pos = line_end
+                if task.saw_done_sentinel:
+                    break
+            else:
+                content_end = line_end - 1
+                if content_end > task.scan_pos and buf[content_end - 1] == 13:
+                    content_end -= 1
+                if buf.startswith(b"data:", task.scan_pos):
+                    data_start = task.scan_pos + 5
+                    if data_start < content_end and buf[data_start] == 32:
+                        data_start += 1
+                    task.event_data_lines.append(bytes(buf[data_start:content_end]))
+                elif buf.startswith(b"event:", task.scan_pos):
+                    task.current_event_type = (
+                        bytes(buf[task.scan_pos + 6 : content_end])
+                        .strip()
+                        .decode("utf-8", errors="replace")
+                    )
+                task.scan_pos = line_end
+
+        if flush_end > 0:
+            payload = bytes(buf[:flush_end])
+            del buf[:flush_end]
+            task.scan_pos -= flush_end
+            task.event_start -= flush_end
+            self._release_mem(task, flush_end)
+            try:
+                task.client_sock.sendall(
+                    f"{flush_end:x}\r\n".encode("ascii") + payload + b"\r\n"
+                )
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                task.downstream_write_error = True
+                return True
+
+        return (
+            task.saw_done_sentinel
+            or task.size_limit_exceeded
+            or task.upstream_read_error
+            or task.memory_limit_exceeded
+            or task.downstream_write_error
+            or task.eof
+        )
+
+    def _on_upstream_ready(self, task: _SSEReactorTask) -> None:
+        while True:
+            avail = task.engine.available_response_memory()
+            if task.chunked:
+                rem_ev_cap = (task.max_event_bytes - (len(task.sse_buf) - task.event_start)) + 1
+                to_read = min(65536, max(1, avail), max(1, rem_ev_cap))
+            else:
+                rem_ev_cap = (task.max_event_bytes - (len(task.sse_buf) - task.event_start)) + 1
+                to_read = min(65536, max(1, avail), max(1, rem_ev_cap))
+                if task.remaining_content_length is not None:
+                    if task.remaining_content_length <= 0:
+                        task.eof = True
+                        self._finish_task(task)
+                        return
+                    to_read = min(to_read, task.remaining_content_length)
+            try:
+                chunk = task.upstream_sock.recv(to_read)
+            except BlockingIOError:
+                return
+            except OSError as exc:
+                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    return
+                task.upstream_read_error = True
+                self._finish_task(task)
+                return
+
+            if not chunk:
+                if task.chunked:
+                    task.upstream_read_error = True
+                elif (
+                    task.remaining_content_length is not None
+                    and task.remaining_content_length > 0
+                ):
+                    task.upstream_read_error = True
+                task.eof = True
+                if self._process_sse_buf(task) or task.eof:
+                    self._finish_task(task)
+                return
+
+            if not task.engine.try_reserve_response_memory(len(chunk)):
+                task.memory_limit_exceeded = True
+                self._finish_task(task)
+                return
+            task.sse_mem_box[0] += len(chunk)
+
+            if task.chunked:
+                task.raw_buf.extend(chunk)
+                self._decode_chunked(task)
+            else:
+                if task.remaining_content_length is not None:
+                    task.remaining_content_length = max(
+                        0, task.remaining_content_length - len(chunk)
+                    )
+                    if task.remaining_content_length == 0:
+                        task.eof = True
+                task.sse_buf.extend(chunk)
+
+            if self._process_sse_buf(task):
+                self._finish_task(task)
+                return
+
+    def _on_client_event(self, task: _SSEReactorTask) -> None:
+        try:
+            peek = task.client_sock.recv(1, socket.MSG_PEEK | _MSG_DONTWAIT)
+        except BlockingIOError:
+            return
+        except OSError as exc:
+            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                return
+            task.downstream_write_error = True
+            self._finish_task(task)
+            return
+        if peek == b"":
+            task.downstream_write_error = True
+            self._finish_task(task)
+            return
+        # Client sent extra pipelined bytes; stop watching client readability.
+        if task.client_registered:
+            try:
+                self._selector.unregister(task.client_sock)
+            except (KeyError, ValueError):
+                pass
+            task.client_registered = False
+
+    def _drain_pending(self) -> None:
+        while True:
+            with self._pending_lock:
+                if not self._pending:
+                    return
+                task = self._pending.popleft()
+            try:
+                if task.chunked and task.raw_buf:
+                    self._decode_chunked(task)
+                if self._process_sse_buf(task):
+                    self._finish_task(task)
+                    continue
+                task.upstream_sock.setblocking(False)
+                self._selector.register(
+                    task.upstream_sock, selectors.EVENT_READ, data=("up", task)
+                )
+                try:
+                    self._selector.register(
+                        task.client_sock, selectors.EVENT_READ, data=("cli", task)
+                    )
+                    task.client_registered = True
+                except (OSError, ValueError):
+                    task.downstream_write_error = True
+                    self._finish_task(task)
+                    continue
+                self._active.add(task)
+            except Exception:
+                task.upstream_read_error = True
+                self._finish_task(task)
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            self._drain_pending()
+            now_m = time.monotonic()
+            timeout: Optional[float] = None
+            if self._active:
+                earliest = min(t.progress_deadline for t in self._active)
+                timeout = max(0.0, earliest - now_m)
+            try:
+                events = self._selector.select(timeout=timeout)
+            except OSError:
+                break
+            now_m = time.monotonic()
+            for key, _ in events:
+                tag = key.data
+                if tag is None:
+                    try:
+                        while self._wake_r.recv(4096):
+                            pass
+                    except BlockingIOError:
+                        pass
+                    except OSError:
+                        pass
+                    continue
+                kind, task = tag
+                if task not in self._active:
+                    continue
+                try:
+                    if kind == "up":
+                        self._on_upstream_ready(task)
+                    else:
+                        self._on_client_event(task)
+                except Exception:
+                    task.upstream_read_error = True
+                    self._finish_task(task)
+            if self._active:
+                expired = [t for t in self._active if now_m >= t.progress_deadline]
+                for task in expired:
+                    task.upstream_read_error = True
+                    self._finish_task(task)
+
+        for task in list(self._active):
+            task.downstream_write_error = True
+            self._finish_task(task)
+        with self._pending_lock:
+            while self._pending:
+                task = self._pending.popleft()
+                task.downstream_write_error = True
+                task.done_event.set()
+
+
 class FreeTPURouterServer(ThreadingHTTPServer):
     """Multi-threaded stdlib HTTP server hosting `RouterEngine`."""
 
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 1024
 
     def __init__(
         self,
@@ -1747,6 +2273,7 @@ class FreeTPURouterServer(ThreadingHTTPServer):
         self._conn_semaphore = threading.BoundedSemaphore(
             engine.config.max_concurrent_connections
         )
+        self.sse_reactor = _SSEReactor()
         super().__init__(server_address, _RouterRequestHandler)
 
     def process_request(self, request: Any, client_address: Any) -> None:
@@ -1778,12 +2305,15 @@ class FreeTPURouterServer(ThreadingHTTPServer):
 
     def serve_forever(self, poll_interval: float = 0.5) -> None:
         self.engine.start_background_poller()
+        self.sse_reactor.start()
         try:
             super().serve_forever(poll_interval=poll_interval)
         finally:
+            self.sse_reactor.stop()
             self.engine.stop_background_poller()
 
     def server_close(self) -> None:
+        self.sse_reactor.stop()
         self.engine.stop_background_poller()
         super().server_close()
 
@@ -1791,6 +2321,7 @@ class FreeTPURouterServer(ThreadingHTTPServer):
 class _RouterRequestHandler(BaseHTTPRequestHandler):
     server: FreeTPURouterServer
     protocol_version = "HTTP/1.1"
+    disable_nagle_algorithm = True
 
     def setup(self) -> None:
         self.timeout = self.server.engine.config.client_header_timeout_s
@@ -2408,55 +2939,56 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 exclude_ids=tried_ids,
             )
             backend: Optional[BackendState] = None
+            slot_lease: Optional[_BackendSlotLease] = None
             total_inflight_now: Optional[int] = None
             attempt_start = time.monotonic()
             for cand in candidates:
                 if cand.config.id in tried_ids:
                     continue
                 attempt_start = time.monotonic()
-                reserved = engine.try_reserve_backend(
+                lease_res = engine.reserve_backend_lease(
                     cand, now_monotonic=attempt_start
                 )
-                if reserved is not None:
+                if lease_res is not None:
+                    slot_lease, total_inflight_now = lease_res
                     backend = cand
-                    total_inflight_now = reserved
                     break
-            if backend is None or total_inflight_now is None:
+            if backend is None or slot_lease is None or total_inflight_now is None:
                 break
 
-            tried_ids.add(backend.config.id)
-
-            if not pressure_checked:
-                pressure_checked = True
-                if total_inflight_now >= engine.config.queue_pressure_threshold:
-                    engine._emit_queue_pressure(
-                        model=model,
-                        active_inflight=total_inflight_now,
-                        healthy_backends=len(candidates),
-                        reason="inflight_threshold_exceeded",
-                    )
-
-            if prev_failure is not None:
-                failovers += 1
-                engine.metrics.record_failover(
-                    model=engine.metric_model_label(model, matched_backend=True),
-                    from_backend=prev_failure[0],
-                    to_backend=backend.config.id,
-                    reason=prev_failure[1],
-                )
-                prev_failure = None
-
-            last_attempted_backend = backend
+            non_stream_result: Optional[
+                Tuple[int, str, bytes, float, float, int, int]
+            ] = None
             conn: Optional[http.client.HTTPConnection] = None
             resp: Optional[http.client.HTTPResponse] = None
             raw_sock: Any = None
             deadline_sock: Optional[DeadlineSocket] = None
             committed_flag = [False]
             resp_mem_reserved = [0]
-            non_stream_result: Optional[
-                Tuple[int, str, bytes, float, float, int, int]
-            ] = None
             try:
+                tried_ids.add(backend.config.id)
+
+                if not pressure_checked:
+                    pressure_checked = True
+                    if total_inflight_now >= engine.config.queue_pressure_threshold:
+                        engine._emit_queue_pressure(
+                            model=model,
+                            active_inflight=total_inflight_now,
+                            healthy_backends=len(candidates),
+                            reason="inflight_threshold_exceeded",
+                        )
+
+                if prev_failure is not None:
+                    failovers += 1
+                    engine.metrics.record_failover(
+                        model=engine.metric_model_label(model, matched_backend=True),
+                        from_backend=prev_failure[0],
+                        to_backend=backend.config.id,
+                        reason=prev_failure[1],
+                    )
+                    prev_failure = None
+
+                last_attempted_backend = backend
                 scheme, host, port, upstream_path = _join_backend_url(
                     backend.config.base_url, endpoint
                 )
@@ -2466,6 +2998,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 headers = {
                     "Content-Type": "application/json",
                     "Accept": "text/event-stream" if stream else "application/json",
+                    "Connection": "close",
                     "X-FreeTPU-Request-Id": req_id,
                 }
                 api_key = backend.config.resolved_api_key()
@@ -2475,6 +3008,11 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
 
                 conn.request("POST", upstream_path, body=raw_req, headers=headers)
                 raw_sock = conn.sock
+                if raw_sock is not None:
+                    try:
+                        raw_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    except OSError:
+                        pass
                 rem_hdr = attempt_deadline - time.monotonic()
                 if rem_hdr <= 0:
                     raise TimeoutError("Upstream response headers exceeded elapsed deadline")
@@ -2810,7 +3348,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 if non_stream_result is None and resp_mem_reserved[0] > 0:
                     engine.release_response_memory(resp_mem_reserved[0])
                     resp_mem_reserved[0] = 0
-                engine.release_backend(backend)
+                slot_lease.release()
                 if resp is not None:
                     try:
                         resp.close()
@@ -3081,41 +3619,86 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             current_event_type = ""
             required_choices = max(1, expected_choices)
 
-            def process_sse_event() -> bool:
+            def process_sse_event_from(
+                ev_type: str,
+                data_lines: List[bytes],
+            ) -> Tuple[bool, bool]:
                 """Process one complete blank-line-terminated SSE event.
 
-                Returns True if the event represents meaningful generation progress
-                (resets the post-commit stall deadline).
+                Returns `(made_progress, saw_done)`.
                 """
                 nonlocal first_content_ttft_ms, prompt_tokens, completion_tokens
                 nonlocal est_completion_chars, saw_explicit_prompt_usage
                 nonlocal saw_explicit_completion_usage, saw_timings_completion
-                nonlocal saw_done_sentinel, saw_upstream_error_event, current_event_type
-                ev_type = current_event_type
-                current_event_type = ""
-                if not event_data_lines:
-                    return False
-                payload_bytes = b"\n".join(event_data_lines).strip()
-                event_data_lines.clear()
+                nonlocal saw_done_sentinel, saw_upstream_error_event
+                if not data_lines:
+                    return False, False
+                payload_bytes = (
+                    data_lines[0].strip()
+                    if len(data_lines) == 1
+                    else b"\n".join(data_lines).strip()
+                )
                 if not payload_bytes:
-                    return False
+                    return False, False
                 if payload_bytes == b"[DONE]":
                     saw_done_sentinel = True
-                    return True
-                if _classify_sse_error_event(ev_type, payload_bytes) is not None:
-                    saw_upstream_error_event = True
-                    return False
+                    return True, True
+                # Fast passthrough path for ordinary streaming delta chunks once TTFT
+                # is already recorded: skip full JSON decode unless the payload may
+                # carry error, usage, timings, or a non-null finish_reason.
+                if (
+                    first_content_ttft_ms is not None
+                    and not ev_type
+                    and b'"error"' not in payload_bytes
+                    and b'"usage"' not in payload_bytes
+                    and b'"timings"' not in payload_bytes
+                    and b'"object":"error"' not in payload_bytes
+                    and b'"object": "error"' not in payload_bytes
+                    and (
+                        required_choices == 1
+                        and (
+                            b'"finish_reason":null' in payload_bytes
+                            or b'"finish_reason": null' in payload_bytes
+                        )
+                    )
+                ):
+                    est_completion_chars += max(4, len(payload_bytes) // 16)
+                    return (
+                        b'"delta":{}' not in payload_bytes
+                        and b'"delta": {}' not in payload_bytes
+                    ), False
                 try:
-                    obj = json.loads(payload_bytes.decode("utf-8", errors="replace"))
+                    obj = json.loads(payload_bytes)
+                except UnicodeDecodeError:
+                    try:
+                        obj = json.loads(payload_bytes.decode("utf-8", errors="replace"))
+                    except json.JSONDecodeError:
+                        if ev_type.strip().lower() == "error":
+                            saw_upstream_error_event = True
+                            return False, False
+                        return True, False
                 except json.JSONDecodeError:
-                    return True
-                if not isinstance(obj, Mapping):
-                    return True
+                    if ev_type.strip().lower() == "error":
+                        saw_upstream_error_event = True
+                        return False, False
+                    return True, False
+                if not isinstance(obj, dict):
+                    if ev_type.strip().lower() == "error":
+                        saw_upstream_error_event = True
+                        return False, False
+                    return True, False
+                if (
+                    ev_type.strip().lower() == "error"
+                    or obj.get("error") is not None
+                    or obj.get("object") == "error"
+                ):
+                    saw_upstream_error_event = True
+                    return False, False
                 made_progress = False
                 choices = obj.get("choices")
                 if isinstance(choices, list):
                     for choice in choices:
-                        if isinstance(choice, Mapping) and choice.get("finish_reason") is not None:
+                        if isinstance(choice, dict) and choice.get("finish_reason") is not None:
                             made_progress = True
                             c_idx = choice.get("index")
                             if isinstance(c_idx, int) and not isinstance(c_idx, bool) and c_idx >= 0:
@@ -3129,7 +3712,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         first_content_ttft_ms = (time.monotonic() - req_start) * 1000.0
                     est_completion_chars += len(output_txt)
                 usage = obj.get("usage")
-                if isinstance(usage, Mapping):
+                if isinstance(usage, dict):
                     pt = _safe_nonneg_int(usage.get("prompt_tokens"))
                     if pt is not None:
                         prompt_tokens = pt
@@ -3141,7 +3724,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         saw_explicit_completion_usage = True
                         made_progress = True
                 timings = obj.get("timings")
-                if isinstance(timings, Mapping):
+                if isinstance(timings, dict):
                     if not saw_explicit_prompt_usage:
                         pt = _safe_nonneg_int(timings.get("prompt_n"))
                         if pt is not None:
@@ -3151,6 +3734,14 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         if ct is not None:
                             completion_tokens = ct
                             saw_timings_completion = True
+                return made_progress, False
+
+            def process_sse_event() -> bool:
+                nonlocal current_event_type
+                ev_type = current_event_type
+                current_event_type = ""
+                made_progress, _ = process_sse_event_from(ev_type, event_data_lines)
+                event_data_lines.clear()
                 return made_progress
 
             def inspect_sse_line(raw_line: bytes) -> bool:
@@ -3172,7 +3763,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             def write_chunk(data: bytes) -> None:
                 if not data:
                     return
-                self.wfile.write(f"{len(data):x}\r\n".encode("ascii") + data + b"\r\n")
+                self.connection.sendall(f"{len(data):x}\r\n".encode("ascii") + data + b"\r\n")
 
             self.close_connection = True
             _, acao = self._resolve_cors_header()
@@ -3197,7 +3788,6 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 for buffered in pre_commit_lines:
                     inspect_sse_line(buffered)
                 write_chunk(b"".join(pre_commit_lines))
-                self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError, OSError):
                 downstream_write_error = True
             finally:
@@ -3208,53 +3798,190 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 release_sse_mem(flushed_pre_bytes)
 
             if not downstream_write_error and not saw_done_sentinel:
+                if isinstance(upstream_sock, DeadlineSocket):
+                    upstream_sock._check_client_on_fast_read = False
                 progress_deadline = time.monotonic() + timeout_s
                 max_event_bytes = engine.config.max_sse_pre_commit_bytes
-                event_chunk_buf = bytearray()
-                while True:
-                    remaining_event_bytes = max_event_bytes - len(event_chunk_buf)
-                    if remaining_event_bytes <= 0:
-                        size_limit_exceeded = True
-                        break
-                    try:
-                        line, exceeded_cap = sse_reader.readline(
-                            deadline=progress_deadline,
-                            max_bytes=remaining_event_bytes,
-                        )
-                    except ClientDisconnectedError:
-                        downstream_write_error = True
-                        break
-                    except _MemoryBudgetExceededError:
-                        memory_limit_exceeded = True
-                        break
-                    except (OSError, TimeoutError, http.client.HTTPException):
-                        upstream_read_error = True
-                        break
-                    if exceeded_cap:
-                        size_limit_exceeded = True
-                        break
-                    if not line:
-                        break
-                    if inspect_sse_line(line):
-                        progress_deadline = time.monotonic() + timeout_s
-                    event_chunk_buf.extend(line)
-                    if line in (b"\n", b"\r\n", b"\r"):
+                rem_bytes, phase2_eof = sse_reader.drain_buffer()
+
+                raw_tcp_sock = (
+                    upstream_sock._sock
+                    if isinstance(upstream_sock, DeadlineSocket)
+                    else upstream_sock
+                )
+                reactor = getattr(self.server, "sse_reactor", None)
+                use_reactor = (
+                    not phase2_eof
+                    and reactor is not None
+                    and isinstance(raw_tcp_sock, socket.socket)
+                    and not isinstance(raw_tcp_sock, ssl.SSLSocket)
+                    and isinstance(self.connection, socket.socket)
+                    and not isinstance(self.connection, ssl.SSLSocket)
+                    and not resp.isclosed()
+                )
+                if use_reactor:
+                    fp_extra = b""
+                    fp = getattr(resp, "fp", None)
+                    if fp is not None and hasattr(fp, "peek"):
                         try:
-                            write_chunk(bytes(event_chunk_buf))
-                            self.wfile.flush()
-                        except (BrokenPipeError, ConnectionResetError, OSError):
+                            peeked = fp.peek()
+                            if peeked:
+                                fp_extra = fp.read1(len(peeked))
+                        except OSError:
+                            fp_extra = b""
+                    if fp_extra:
+                        if not engine.try_reserve_response_memory(len(fp_extra)):
+                            memory_limit_exceeded = True
+                            use_reactor = False
+                        else:
+                            sse_mem_box[0] += len(fp_extra)
+
+                    if use_reactor:
+                        if resp.chunked:
+                            sse_buf = bytearray(rem_bytes)
+                            raw_buf = bytearray(fp_extra)
+                            rem_len = None
+                        else:
+                            sse_buf = bytearray(rem_bytes)
+                            if fp_extra:
+                                sse_buf.extend(fp_extra)
+                            raw_buf = bytearray()
+                            if (
+                                resp.status not in (204, 304)
+                                and not (100 <= resp.status < 200)
+                                and resp.length is not None
+                            ):
+                                rem_len = max(0, resp.length - len(fp_extra))
+                            else:
+                                rem_len = None
+
+                        task = _SSEReactorTask(
+                            upstream_sock=raw_tcp_sock,
+                            client_sock=self.connection,
+                            engine=engine,
+                            sse_buf=sse_buf,
+                            raw_buf=raw_buf,
+                            chunked=bool(resp.chunked),
+                            chunk_left=resp.chunk_left if resp.chunked else None,
+                            remaining_content_length=rem_len,
+                            max_event_bytes=max_event_bytes,
+                            timeout_s=timeout_s,
+                            progress_deadline=progress_deadline,
+                            sse_mem_box=sse_mem_box,
+                            on_event_fn=process_sse_event_from,
+                            event_data_lines=event_data_lines,
+                            current_event_type=current_event_type,
+                        )
+                        reactor.submit(task)
+                        task.done_event.wait()
+                        saw_done_sentinel = task.saw_done_sentinel
+                        upstream_read_error = task.upstream_read_error
+                        downstream_write_error = task.downstream_write_error
+                        size_limit_exceeded = task.size_limit_exceeded
+                        memory_limit_exceeded = task.memory_limit_exceeded
+                if not use_reactor and not memory_limit_exceeded:
+                    phase2_buf = bytearray(rem_bytes)
+                    scan_pos = 0
+                    event_start = 0
+                    while True:
+                        flush_end = 0
+                        while True:
+                            nl_idx = phase2_buf.find(b"\n", scan_pos)
+                            if nl_idx == -1:
+                                if len(phase2_buf) - event_start > max_event_bytes:
+                                    size_limit_exceeded = True
+                                break
+                            line_end = nl_idx + 1
+                            if line_end - event_start > max_event_bytes:
+                                size_limit_exceeded = True
+                                break
+                            line_len = line_end - scan_pos
+                            if line_len == 1 or (line_len == 2 and phase2_buf[scan_pos] == 13):
+                                if process_sse_event():
+                                    progress_deadline = time.monotonic() + timeout_s
+                                event_start = line_end
+                                flush_end = line_end
+                                scan_pos = line_end
+                                if saw_done_sentinel:
+                                    break
+                            else:
+                                content_end = line_end - 1
+                                if content_end > scan_pos and phase2_buf[content_end - 1] == 13:
+                                    content_end -= 1
+                                if phase2_buf.startswith(b"data:", scan_pos):
+                                    data_start = scan_pos + 5
+                                    if data_start < content_end and phase2_buf[data_start] == 32:
+                                        data_start += 1
+                                    event_data_lines.append(bytes(phase2_buf[data_start:content_end]))
+                                elif phase2_buf.startswith(b"event:", scan_pos):
+                                    current_event_type = (
+                                        bytes(phase2_buf[scan_pos + 6 : content_end])
+                                        .strip()
+                                        .decode("utf-8", errors="replace")
+                                    )
+                                scan_pos = line_end
+
+                        if flush_end > 0:
+                            try:
+                                write_chunk(bytes(phase2_buf[:flush_end]))
+                            except (BrokenPipeError, ConnectionResetError, OSError):
+                                downstream_write_error = True
+                                break
+                            finally:
+                                del phase2_buf[:flush_end]
+                                scan_pos -= flush_end
+                                event_start -= flush_end
+                                release_sse_mem(flush_end)
+
+                        if saw_done_sentinel or size_limit_exceeded or phase2_eof:
+                            break
+
+                        rem = progress_deadline - time.monotonic()
+                        if rem <= 0:
+                            upstream_read_error = True
+                            break
+                        if isinstance(upstream_sock, DeadlineSocket):
+                            upstream_sock.deadline = progress_deadline
+                        elif upstream_sock is not None:
+                            try:
+                                upstream_sock.settimeout(rem)
+                            except OSError:
+                                pass
+
+                        avail = engine.available_response_memory()
+                        rem_ev_cap = (max_event_bytes - (len(phase2_buf) - event_start)) + 1
+                        to_read = min(65536, max(1, avail), max(1, rem_ev_cap))
+                        try:
+                            chunk = resp.read1(to_read)
+                        except ClientDisconnectedError:
                             downstream_write_error = True
                             break
-                        finally:
-                            flushed_ev_bytes = len(event_chunk_buf)
-                            event_chunk_buf.clear()
-                            release_sse_mem(flushed_ev_bytes)
-                        if saw_done_sentinel:
+                        except (OSError, TimeoutError, http.client.HTTPException):
+                            upstream_read_error = True
                             break
-                if event_chunk_buf:
-                    rem_ev = len(event_chunk_buf)
-                    event_chunk_buf.clear()
-                    release_sse_mem(rem_ev)
+
+                        if not chunk:
+                            if (
+                                not resp.chunked
+                                and resp.status not in (204, 304)
+                                and not (100 <= resp.status < 200)
+                                and resp.length is not None
+                                and resp.length > 0
+                            ):
+                                upstream_read_error = True
+                            phase2_eof = True
+                            break
+
+                        if not engine.try_reserve_response_memory(len(chunk)):
+                            memory_limit_exceeded = True
+                            break
+                        sse_mem_box[0] += len(chunk)
+                        phase2_buf.extend(chunk)
+
+                    if phase2_buf:
+                        rem_ev = len(phase2_buf)
+                        phase2_buf.clear()
+                        release_sse_mem(rem_ev)
 
             # Per WHATWG SSE spec, discard any incomplete (unterminated) event data at EOF
             # rather than letting it satisfy completion checks.

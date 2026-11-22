@@ -63,6 +63,7 @@ jobs:
           python3 router/freetpu_router.py --self-test --verbose
           python3 router/freetpu_router.py --check-config --config router/examples/hybrid-pixel-cloud.json
           python3 router/freetpu_router.py --check-config --config router/examples/local-pixel-cluster.json
+          python3 router/freetpu_router.py --check-config --config router/examples/cloud-tpu-v6e8-high-batch.json
 
   clean-room-audit:
     name: Clean-Room & OSS Boundary Audit

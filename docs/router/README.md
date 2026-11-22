@@ -53,7 +53,9 @@ Inference responses include observability headers:
 
 ## Sample Multi-Backend Configuration
 
-See [`router/examples/hybrid-pixel-cloud.json`](../../router/examples/hybrid-pixel-cloud.json) and [`router/examples/local-pixel-cluster.json`](../../router/examples/local-pixel-cluster.json).
+See [`router/examples/hybrid-pixel-cloud.json`](../../router/examples/hybrid-pixel-cloud.json), [`router/examples/local-pixel-cluster.json`](../../router/examples/local-pixel-cluster.json), and [`router/examples/cloud-tpu-v6e8-high-batch.json`](../../router/examples/cloud-tpu-v6e8-high-batch.json).
+
+For Cloud TPU `v6e-8` high-concurrency (`c=64–128`) static bucketing, async multi-step scheduling, and W8A8/W8A16 launch presets, see [`vllm-tpu-v6e8-batch-scaling.md`](vllm-tpu-v6e8-batch-scaling.md).
 
 ```json
 {

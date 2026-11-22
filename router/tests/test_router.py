@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import gc
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
@@ -10,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -6296,6 +6299,390 @@ class TestFreeTPURouter(unittest.TestCase):
             headers={"Host": f"evil.example:{rport}"},
         )
         self.assertEqual(st_evil, 403)
+
+    def test_sse_active_inflight_zero_after_all_termination_paths(self) -> None:
+        def wait_inflight_zero(router: FreeTPURouterServer, timeout_s: float = 1.5) -> None:
+            deadline = time.monotonic() + timeout_s
+            while time.monotonic() < deadline:
+                _, health = router.engine.health_payload()
+                if health["active_inflight"] == 0 and all(
+                    b["inflight"] == 0 for b in health["backends"]
+                ):
+                    break
+                time.sleep(0.01)
+            _, health = router.engine.health_payload()
+            self.assertEqual(health["active_inflight"], 0)
+            for b in health["backends"]:
+                self.assertEqual(b["inflight"], 0)
+            self.assertEqual(router.engine._resp_mem_used_bytes, 0)
+            _, _, metrics_txt = _http_request(
+                router.server_address[1], "GET", "/metrics"
+            )
+            self.assertIn(
+                'freetpu_router_active_inflight{backend_id="leak-b"} 0',
+                metrics_txt.decode("utf-8"),
+            )
+
+        backend = self._track(
+            _MockOpenAIBackend("leak-b", ["m-leak"], chunked_keepalive_sse=True)
+        )
+        hold_ev = threading.Event()
+        backend.keepalive_hold_event = hold_ev
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            request_timeout_s=0.4,
+            failure_cooldown_s=0.05,
+            backends=[
+                BackendConfig(
+                    id="leak-b",
+                    base_url=backend.base_url,
+                    models=["m-leak"],
+                    timeout_s=0.4,
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        # 1. Normal SSE completion while upstream keeps TCP socket open (keep-alive)
+        st, _, body = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-leak",
+                "stream": True,
+                "messages": [{"role": "user", "content": "normal keepalive"}],
+            },
+        )
+        self.assertEqual(st, 200)
+        self.assertIn("data: [DONE]", body.decode("utf-8"))
+        hold_ev.set()
+        wait_inflight_zero(router)
+
+        # 2. Client mid-stream disconnect after reading first chunk
+        backend.chunked_keepalive_sse = False
+        backend.post_token_keepalive_interval_s = 0.02
+        req_body = json.dumps(
+            {
+                "model": "m-leak",
+                "stream": True,
+                "messages": [{"role": "user", "content": "mid cancel"}],
+            }
+        ).encode("utf-8")
+        cli = socket.create_connection(("127.0.0.1", rport), timeout=2.0)
+        try:
+            cli.sendall(
+                b"POST /v1/chat/completions HTTP/1.1\r\n"
+                + f"Host: 127.0.0.1:{rport}\r\n".encode("ascii")
+                + b"Content-Type: application/json\r\n"
+                + f"Content-Length: {len(req_body)}\r\n".encode("ascii")
+                + b"Connection: close\r\n\r\n"
+                + req_body
+            )
+            chunk = cli.recv(4096)
+            self.assertIn(b"200 OK", chunk)
+        finally:
+            cli.close()
+        wait_inflight_zero(router)
+
+        # 3. Post-commit keep-alive stall timeout
+        conn = http.client.HTTPConnection("127.0.0.1", rport, timeout=3.0)
+        try:
+            conn.request(
+                "POST",
+                "/v1/chat/completions",
+                body=req_body,
+                headers={"Content-Type": "application/json"},
+            )
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)
+            with self.assertRaises(http.client.IncompleteRead):
+                resp.read()
+        finally:
+            conn.close()
+        wait_inflight_zero(router)
+
+        # 4. Upstream premature abort before first token -> 502
+        abort_backend = self._track(
+            _MockOpenAIBackend(
+                "leak-abort-b",
+                ["m-leak-abort"],
+                abort_stream_before_first_token=True,
+            )
+        )
+        cfg_abort = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            request_timeout_s=0.4,
+            failure_cooldown_s=0.05,
+            backends=[
+                BackendConfig(
+                    id="leak-abort-b",
+                    base_url=abort_backend.base_url,
+                    models=["m-leak-abort"],
+                    timeout_s=0.4,
+                )
+            ],
+        )
+        router_abort = self._track(create_router_server(cfg_abort))
+        st_abort, _, _ = _http_request(
+            router_abort.server_address[1],
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-leak-abort",
+                "stream": True,
+                "messages": [{"role": "user", "content": "abort"}],
+            },
+        )
+        self.assertEqual(st_abort, 502)
+        self.assertEqual(router_abort.engine.health_payload()[1]["active_inflight"], 0)
+        self.assertEqual(router_abort.engine._backends[0].inflight, 0)
+
+        # 5. Lease garbage collection safety net
+        router.engine._backends[0].cooldown_until_monotonic = 0.0
+        router.engine._backends[0].healthy = True
+        lease_res = router.engine.reserve_backend_lease(router.engine._backends[0])
+        self.assertIsNotNone(lease_res)
+        self.assertEqual(router.engine.metrics.total_inflight(), 1)
+        del lease_res
+        gc.collect()
+        wait_inflight_zero(router)
+
+        # 6. Concurrent mixed batch (normal + client mid-stream cancel)
+        ok_backend = self._track(_MockOpenAIBackend("leak-mix-b", ["m-leak-mix"]))
+        cfg_mix = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            backends=[
+                BackendConfig(
+                    id="leak-mix-b",
+                    base_url=ok_backend.base_url,
+                    models=["m-leak-mix"],
+                )
+            ],
+        )
+        router_mix = self._track(create_router_server(cfg_mix))
+        mport = router_mix.server_address[1]
+        mix_body = json.dumps(
+            {
+                "model": "m-leak-mix",
+                "stream": True,
+                "messages": [{"role": "user", "content": "mix"}],
+            }
+        ).encode("utf-8")
+        errors: List[Exception] = []
+
+        def run_ok() -> None:
+            try:
+                s, _, bd = _http_request(
+                    mport,
+                    "POST",
+                    "/v1/chat/completions",
+                    body={
+                        "model": "m-leak-mix",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "ok"}],
+                    },
+                )
+                if s != 200 or b"[DONE]" not in bd:
+                    errors.append(AssertionError(f"Unexpected ok response {s}"))
+            except Exception as exc:
+                errors.append(exc)
+
+        def run_cancel() -> None:
+            try:
+                c = socket.create_connection(("127.0.0.1", mport), timeout=2.0)
+                c.sendall(
+                    b"POST /v1/chat/completions HTTP/1.1\r\n"
+                    + f"Host: 127.0.0.1:{mport}\r\n".encode("ascii")
+                    + b"Content-Type: application/json\r\n"
+                    + f"Content-Length: {len(mix_body)}\r\n".encode("ascii")
+                    + b"Connection: close\r\n\r\n"
+                    + mix_body
+                )
+                c.recv(512)
+                c.close()
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=run_ok if i % 2 == 0 else run_cancel, daemon=True)
+            for i in range(24)
+        ]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(timeout=5.0)
+        self.assertEqual(errors, [])
+        dl = time.monotonic() + 1.5
+        while router_mix.engine.health_payload()[1]["active_inflight"] > 0 and time.monotonic() < dl:
+            time.sleep(0.01)
+        self.assertEqual(router_mix.engine.health_payload()[1]["active_inflight"], 0)
+        self.assertEqual(router_mix.engine._backends[0].inflight, 0)
+        self.assertEqual(router_mix.engine._resp_mem_used_bytes, 0)
+
+    def test_sse_concurrency_scaling_c1_to_c128_overhead_and_no_leak(self) -> None:
+        num_tokens = 128
+        upstream_script = """
+import asyncio, json, socket, sys
+
+TOKENS = int(sys.argv[1])
+CHUNKS = [
+    ("data: " + json.dumps({"id": "chatcmpl-bench", "object": "chat.completion.chunk", "model": "m-bench", "choices": [{"index": 0, "delta": {"content": f"t{i} "}, "finish_reason": None}]}) + "\\n\\n").encode()
+    for i in range(TOKENS - 1)
+] + [
+    ("data: " + json.dumps({"id": "chatcmpl-bench", "object": "chat.completion.chunk", "model": "m-bench", "choices": [{"index": 0, "delta": {"content": "end"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 10, "completion_tokens": TOKENS}}) + "\\n\\n").encode(),
+    b"data: [DONE]\\n\\n",
+]
+
+async def handle(reader, writer):
+    sock = writer.get_extra_info("socket")
+    if sock is not None:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    try:
+        hdr = await reader.readuntil(b"\\r\\n\\r\\n")
+        cl = 0
+        for line in hdr.decode("latin1").split("\\r\\n"):
+            if line.lower().startswith("content-length:"):
+                cl = int(line.split(":", 1)[1].strip())
+        if cl:
+            await reader.readexactly(cl)
+        if b"GET /v1/models" in hdr:
+            body = b'{"object":"list","data":[{"id":"m-bench","object":"model"}]}'
+            writer.write(
+                b"HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\n"
+                + f"Content-Length: {len(body)}\\r\\nConnection: close\\r\\n\\r\\n".encode()
+                + body
+            )
+            await writer.drain()
+            return
+        writer.write(
+            b"HTTP/1.1 200 OK\\r\\nContent-Type: text/event-stream\\r\\n"
+            b"Cache-Control: no-cache\\r\\nConnection: close\\r\\n\\r\\n"
+        )
+        await writer.drain()
+        for chunk in CHUNKS:
+            writer.write(chunk)
+            await writer.drain()
+            await asyncio.sleep(0.002)
+    except Exception:
+        pass
+    finally:
+        writer.close()
+
+async def main():
+    srv = await asyncio.start_server(handle, "127.0.0.1", 0, backlog=1024)
+    print(srv.sockets[0].getsockname()[1], flush=True)
+    async with srv:
+        await srv.serve_forever()
+
+asyncio.run(main())
+"""
+        up_proc = subprocess.Popen(
+            [sys.executable, "-c", upstream_script, str(num_tokens)],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert up_proc.stdout is not None
+            up_port = int(up_proc.stdout.readline().strip())
+            cfg = RouterConfig(
+                host="127.0.0.1",
+                port=0,
+                policy="lowest_latency",
+                max_concurrent_connections=512,
+                queue_pressure_threshold=256,
+                backends=[
+                    BackendConfig(
+                        id="bench-upstream",
+                        base_url=f"http://127.0.0.1:{up_port}/v1",
+                        models=["m-bench"],
+                    )
+                ],
+            )
+            router = self._track(create_router_server(cfg))
+            rport = router.server_address[1]
+
+            req_body = json.dumps(
+                {
+                    "model": "m-bench",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "benchmark"}],
+                }
+            ).encode("utf-8")
+
+            def make_raw_req(port: int) -> bytes:
+                return (
+                    f"POST /v1/chat/completions HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1:{port}\r\n"
+                    f"Content-Type: application/json\r\n"
+                    f"Content-Length: {len(req_body)}\r\n"
+                    f"Connection: close\r\n\r\n"
+                ).encode("ascii") + req_body
+
+            async def stream_one(port: int, raw_req: bytes) -> Tuple[int, bool]:
+                r, w = await asyncio.open_connection("127.0.0.1", port)
+                sock = w.get_extra_info("socket")
+                if sock is not None:
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                w.write(raw_req)
+                await w.drain()
+                await r.readuntil(b"\r\n\r\n")
+                chunks = 0
+                saw_done = False
+                while True:
+                    line = await r.readline()
+                    if not line:
+                        break
+                    if line.startswith(b"data: "):
+                        if line.strip() == b"data: [DONE]":
+                            saw_done = True
+                        else:
+                            chunks += 1
+                w.close()
+                return chunks, saw_done
+
+            async def run_batch(port: int, concurrency: int) -> float:
+                raw_req = make_raw_req(port)
+                t0 = time.perf_counter()
+                results = await asyncio.gather(
+                    *[stream_one(port, raw_req) for _ in range(concurrency)]
+                )
+                wall_ms = (time.perf_counter() - t0) * 1000.0
+                for chunks, saw_done in results:
+                    self.assertEqual(chunks, num_tokens)
+                    self.assertTrue(saw_done)
+                return wall_ms
+
+            # Warmup
+            asyncio.run(run_batch(up_port, 1))
+            asyncio.run(run_batch(rport, 1))
+
+            for concurrency in (1, 8, 16, 64, 128):
+                direct_ms = asyncio.run(run_batch(up_port, concurrency))
+                router_ms = asyncio.run(run_batch(rport, concurrency))
+                per_chunk_overhead_ms = (router_ms - direct_ms) / float(num_tokens)
+                self.assertLess(
+                    per_chunk_overhead_ms,
+                    0.5,
+                    f"c={concurrency} overhead {per_chunk_overhead_ms:.3f} ms/chunk "
+                    f"(router={router_ms:.1f}ms, direct={direct_ms:.1f}ms)",
+                )
+                _, health = router.engine.health_payload()
+                self.assertEqual(health["active_inflight"], 0)
+                self.assertEqual(health["backends"][0]["inflight"], 0)
+                self.assertEqual(router.engine._resp_mem_used_bytes, 0)
+        finally:
+            if up_proc.stdout is not None:
+                up_proc.stdout.close()
+            up_proc.terminate()
+            up_proc.wait(timeout=3)
 
 
 def run_self_tests(verbosity: int = 1) -> int:
