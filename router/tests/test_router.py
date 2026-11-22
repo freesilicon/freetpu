@@ -14,6 +14,7 @@ import sys
 import tempfile
 import threading
 import time
+import tracemalloc
 import unittest
 from contextlib import redirect_stderr
 from typing import Any, Dict, List, Optional, Tuple
@@ -31,6 +32,7 @@ from router.freetpu_router import (  # noqa: E402
     _join_backend_url,
     _open_http_connection,
     _safe_nonneg_int,
+    _validate_json_structure,
     build_hooks_from_config,
     create_router_server,
     main as router_main,
@@ -81,6 +83,7 @@ class _MockOpenAIBackend(ThreadingHTTPServer):
         oversized_non_stream_chunked: bool = False,
         slow_drip_non_stream_interval_s: Optional[float] = None,
         truncate_fixed_length_response: bool = False,
+        close_delimited_truncated_json: bool = False,
         raw_models_response: Optional[Tuple[int, str, bytes]] = None,
         raw_health_response: Optional[Tuple[int, str, bytes]] = None,
         prompt_tokens: int = 12,
@@ -107,6 +110,7 @@ class _MockOpenAIBackend(ThreadingHTTPServer):
         self.oversized_non_stream_chunked = oversized_non_stream_chunked
         self.slow_drip_non_stream_interval_s = slow_drip_non_stream_interval_s
         self.truncate_fixed_length_response = truncate_fixed_length_response
+        self.close_delimited_truncated_json = close_delimited_truncated_json
         self.raw_models_response = raw_models_response
         self.raw_health_response = raw_health_response
         self.prompt_tokens = prompt_tokens
@@ -421,6 +425,18 @@ class _MockOpenAIHandler(BaseHTTPRequestHandler):
                     },
                 },
             )
+            return
+
+        if self.server.close_delimited_truncated_json:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                self.wfile.write(b'{"id":"cmpl","choices":[')
+                self.wfile.flush()
+            except OSError:
+                pass
             return
 
         if self.server.truncate_fixed_length_response:
@@ -5327,6 +5343,46 @@ class TestFreeTPURouter(unittest.TestCase):
         self.assertEqual(st_same, 200)
         self.assertNotIn("access-control-allow-origin", hdrs_same)
 
+        # Loopback alias localhost:<bound_port> is also a trusted listener authority.
+        st_localhost, _, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            headers={
+                "Host": f"localhost:{rport}",
+                "Origin": f"http://localhost:{rport}",
+            },
+            body={"model": "m-sameorig", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        self.assertEqual(st_localhost, 200)
+
+        # DNS-rebound Host matching Origin on loopback listener MUST be rejected with 403!
+        st_rebind, _, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            headers={
+                "Host": f"evil.example:{rport}",
+                "Origin": f"http://evil.example:{rport}",
+            },
+            body={"model": "m-sameorig", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        self.assertEqual(st_rebind, 403)
+
+        # Port mismatch on loopback Host matching Origin is rejected with 403.
+        wrong_port = rport + 1 if rport < 65000 else rport - 1
+        st_wrong_port, _, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            headers={
+                "Host": f"127.0.0.1:{wrong_port}",
+                "Origin": f"http://127.0.0.1:{wrong_port}",
+            },
+            body={"model": "m-sameorig", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        self.assertEqual(st_wrong_port, 403)
+
         # Cross-origin POST is still rejected with 403.
         st_cross, _, _ = _http_request(
             rport,
@@ -5385,7 +5441,8 @@ class TestFreeTPURouter(unittest.TestCase):
         )
         self.assertEqual(st_pub_bad, 403)
 
-        # 3. Trusted proxy X-Forwarded-Proto allows HTTPS same-origin when trust_proxy_headers=True.
+        # 3. Even with trust_proxy_headers=True, an untrusted external Host without public_origin is rejected;
+        #    trusted listener host with X-Forwarded-Proto=https succeeds.
         cfg_proxy = RouterConfig(
             host="127.0.0.1",
             port=0,
@@ -5402,7 +5459,7 @@ class TestFreeTPURouter(unittest.TestCase):
         router_proxy = self._track(create_router_server(cfg_proxy))
         rport_proxy = router_proxy.server_address[1]
 
-        st_proxy_ok, _, _ = _http_request(
+        st_proxy_rebind, _, _ = _http_request(
             rport_proxy,
             "POST",
             "/v1/chat/completions",
@@ -5413,7 +5470,189 @@ class TestFreeTPURouter(unittest.TestCase):
             },
             body={"model": "m-sameorig", "messages": [{"role": "user", "content": "hi"}]},
         )
-        self.assertEqual(st_proxy_ok, 200)
+        self.assertEqual(st_proxy_rebind, 403)
+
+        st_proxy_trusted, _, _ = _http_request(
+            rport_proxy,
+            "POST",
+            "/v1/chat/completions",
+            headers={
+                "Host": f"127.0.0.1:{rport_proxy}",
+                "Origin": f"https://127.0.0.1:{rport_proxy}",
+                "X-Forwarded-Proto": "https",
+            },
+            body={"model": "m-sameorig", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        self.assertEqual(st_proxy_trusted, 200)
+
+    def test_json_structure_scanner_escape_heavy_string_bounded_memory(self) -> None:
+        # 50,000 escaped quote/backslash groups (~300 KiB): O(1) working memory, zero regex stack.
+        escape_heavy = (
+            '{"model":"m-esc","messages":[{"role":"user","content":"'
+            + ('\\"\\\\\\"' * 50_000)
+            + '"}]}'
+        )
+        tracemalloc.start()
+        try:
+            _validate_json_structure(escape_heavy, max_depth=64, max_nodes=32768)
+            _, peak_bytes = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak_bytes, 64 * 1024)
+
+        # Live end-to-end request with escape-heavy content succeeds cleanly.
+        backend = self._track(_MockOpenAIBackend("esc-b", ["m-esc"]))
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            backends=[
+                BackendConfig(
+                    id="esc-b",
+                    base_url=backend.base_url,
+                    models=["m-esc"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+        status, _, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-esc",
+                "messages": [{"role": "user", "content": ('"\\"' * 2000)}],
+            },
+        )
+        self.assertEqual(status, 200)
+
+    def test_committed_sse_huge_usage_string_no_failover_or_duplicate_response(self) -> None:
+        # 5000-digit decimal string exceeds Python's int_max_str_digits (4300) and must return None safely.
+        self.assertIsNone(_safe_nonneg_int("9" * 5000))
+
+        tok1 = json.dumps(
+            {
+                "id": "chatcmpl-huge-usage",
+                "object": "chat.completion.chunk",
+                "model": "m-huge-usage",
+                "choices": [
+                    {"index": 0, "delta": {"content": "Hello "}, "finish_reason": None}
+                ],
+            }
+        )
+        tok2 = json.dumps(
+            {
+                "id": "chatcmpl-huge-usage",
+                "object": "chat.completion.chunk",
+                "model": "m-huge-usage",
+                "choices": [
+                    {"index": 0, "delta": {"content": "world"}, "finish_reason": "stop"}
+                ],
+                "usage": {
+                    "prompt_tokens": "9" * 5000,
+                    "completion_tokens": "8" * 5000,
+                },
+            }
+        )
+        primary = self._track(
+            _MockOpenAIBackend(
+                "primary-huge-usage",
+                ["m-huge-usage"],
+                raw_sse_bytes=f"data: {tok1}\n\ndata: {tok2}\n\ndata: [DONE]\n\n".encode(
+                    "utf-8"
+                ),
+            )
+        )
+        backup = self._track(_MockOpenAIBackend("backup-huge-usage", ["m-huge-usage"]))
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            backends=[
+                BackendConfig(
+                    id="primary-huge-usage",
+                    local=True,
+                    base_url=primary.base_url,
+                ),
+                BackendConfig(
+                    id="backup-huge-usage",
+                    local=False,
+                    base_url=backup.base_url,
+                ),
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        status, hdrs, body = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-huge-usage",
+                "stream": True,
+                "messages": [{"role": "user", "content": "huge usage digits"}],
+            },
+        )
+        text = body.decode("utf-8")
+        self.assertEqual(status, 200)
+        self.assertEqual(hdrs["x-freetpu-backend"], "primary-huge-usage")
+        self.assertEqual(hdrs["x-freetpu-failovers"], "0")
+        self.assertIn("Hello ", text)
+        self.assertIn("world", text)
+        self.assertIn("data: [DONE]", text)
+        self.assertNotIn("HTTP/1.1 ", text)
+        self.assertEqual(len(backup.requests_seen), 0)
+
+    def test_close_delimited_truncated_json_200_fails_over_to_backup(self) -> None:
+        primary = self._track(
+            _MockOpenAIBackend(
+                "trunc-json-primary",
+                ["m-trunc-json"],
+                close_delimited_truncated_json=True,
+            )
+        )
+        backup = self._track(_MockOpenAIBackend("healthy-json-backup", ["m-trunc-json"]))
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            backends=[
+                BackendConfig(
+                    id="trunc-json-primary",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=primary.base_url,
+                ),
+                BackendConfig(
+                    id="healthy-json-backup",
+                    type="cloud-tpu-v5e",
+                    local=False,
+                    base_url=backup.base_url,
+                ),
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        status, hdrs, body = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-trunc-json",
+                "messages": [{"role": "user", "content": "truncated close-delimited json"}],
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(hdrs["x-freetpu-backend"], "healthy-json-backup")
+        self.assertEqual(hdrs["x-freetpu-failovers"], "1")
+        self.assertIn("reply-from:healthy-json-backup", body.decode("utf-8"))
+        self.assertEqual(router.engine._backends[0].inflight, 0)
+        self.assertGreater(
+            router.engine._backends[0].cooldown_until_monotonic,
+            time.monotonic(),
+        )
 
 
 def run_self_tests(verbosity: int = 1) -> int:

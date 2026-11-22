@@ -144,45 +144,58 @@ class _JsonStructureLimitError(ValueError):
     """Raised when inbound JSON exceeds nesting depth or structural node budgets."""
 
 
-# Linear-time (non-backtracking) tokenizer skipping quoted strings in C speed.
-_JSON_STRUCT_TOKEN_RE = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*"|[\[\]{},:]|"')
-
-
 def _validate_json_structure(
     text: str,
     *,
     max_depth: int,
     max_nodes: int,
 ) -> None:
-    """Validate JSON nesting depth and container/element count before `json.loads()`."""
+    """Validate JSON nesting depth and container/element count in O(1) working memory."""
+    n = len(text)
+    i = 0
     depth = 0
     nodes = 0
-    for match in _JSON_STRUCT_TOKEN_RE.finditer(text):
-        tok = match.group(0)
-        ch = tok[0]
+    while i < n:
+        ch = text[i]
         if ch == '"':
-            if len(tok) == 1:
-                # Unclosed string literal; let json.loads report exact JSONDecodeError.
-                return
+            # Skip quoted strings via C-level str.find with zero regex backtracking state.
+            i += 1
+            while True:
+                q = text.find('"', i)
+                if q == -1:
+                    # Unclosed string literal; let json.loads report exact JSONDecodeError.
+                    return
+                bs = 0
+                j = q - 1
+                while j >= i and text[j] == "\\":
+                    bs += 1
+                    j -= 1
+                if (bs & 1) == 0:
+                    i = q + 1
+                    break
+                i = q + 1
             continue
-        if ch in "{[":
+        if ch == "{" or ch == "[":
             depth += 1
             if depth > max_depth:
                 raise _JsonStructureLimitError(
                     f"JSON nesting depth exceeds maximum limit of {max_depth}"
                 )
             nodes += 1
-        elif ch in "}]":
+            if nodes > max_nodes:
+                raise _JsonStructureLimitError(
+                    f"JSON structure exceeds maximum limit of {max_nodes} elements"
+                )
+        elif ch == "}" or ch == "]":
             if depth > 0:
                 depth -= 1
-            continue
-        else:
-            # ',' or ':'
+        elif ch == "," or ch == ":":
             nodes += 1
-        if nodes > max_nodes:
-            raise _JsonStructureLimitError(
-                f"JSON structure exceeds maximum limit of {max_nodes} elements"
-            )
+            if nodes > max_nodes:
+                raise _JsonStructureLimitError(
+                    f"JSON structure exceeds maximum limit of {max_nodes} elements"
+                )
+        i += 1
 
 
 def _read_bounded_http_response(
@@ -506,6 +519,9 @@ def _extract_choice_output_text(obj: Mapping[str, Any]) -> str:
     return "".join(parts)
 
 
+_MAX_SAFE_INT_DIGITS = 18
+
+
 def _safe_nonneg_int(val: Any) -> Optional[int]:
     """Parse a non-negative integer count without raising on malformed telemetry."""
     if val is None or isinstance(val, bool):
@@ -514,12 +530,23 @@ def _safe_nonneg_int(val: Any) -> Optional[int]:
         return val if val >= 0 else None
     if isinstance(val, float):
         if math.isfinite(val) and val >= 0.0 and val.is_integer():
-            return int(val)
+            try:
+                return int(val)
+            except (ValueError, OverflowError):
+                return None
         return None
     if isinstance(val, str):
         cleaned = val.strip()
-        if cleaned.isascii() and cleaned.isdigit():
-            return int(cleaned)
+        if (
+            cleaned
+            and len(cleaned) <= _MAX_SAFE_INT_DIGITS
+            and cleaned.isascii()
+            and cleaned.isdigit()
+        ):
+            try:
+                return int(cleaned)
+            except (ValueError, OverflowError):
+                return None
         return None
     return None
 
@@ -527,18 +554,22 @@ def _safe_nonneg_int(val: Any) -> Optional[int]:
 def _extract_non_stream_usage(
     raw_resp: bytes,
     est_prompt_tokens: int,
+    *,
+    parsed_resp: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[int, int]:
     """Extract `(prompt_tokens, completion_tokens)` preferring upstream counts."""
     prompt_tokens = est_prompt_tokens
     completion_tokens = 0
     saw_prompt = False
     saw_completion = False
-    try:
-        parsed_resp = json.loads(raw_resp.decode("utf-8", errors="replace"))
-    except json.JSONDecodeError:
-        return prompt_tokens, completion_tokens
-    if not isinstance(parsed_resp, Mapping):
-        return prompt_tokens, completion_tokens
+    if parsed_resp is None:
+        try:
+            loaded = json.loads(raw_resp.decode("utf-8", errors="replace"))
+        except json.JSONDecodeError:
+            return prompt_tokens, completion_tokens
+        if not isinstance(loaded, Mapping):
+            return prompt_tokens, completion_tokens
+        parsed_resp = loaded
 
     usage = parsed_resp.get("usage")
     if isinstance(usage, Mapping):
@@ -1733,8 +1764,36 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 f"{self.address_string()} - - [{self.log_date_time_string()}] {message}\n"
             )
 
+    def _trusted_listener_hosts(self) -> set[str]:
+        """Return hostnames/IPs trusted as direct same-origin listener authorities."""
+        trusted: set[str] = set()
+        bound_host = str(self.server.server_address[0]).strip().lower().strip("[]")
+        if is_loopback_host(bound_host):
+            trusted.update({"localhost", "127.0.0.1", "::1", bound_host})
+        elif bound_host in ("0.0.0.0", "::", ""):
+            trusted.update({"localhost", "127.0.0.1", "::1"})
+            sock = getattr(self, "connection", None)
+            if sock is not None:
+                try:
+                    local_ip = str(sock.getsockname()[0]).strip().lower().strip("[]")
+                    if local_ip:
+                        trusted.add(local_ip)
+                except OSError:
+                    pass
+        else:
+            trusted.add(bound_host)
+            sock = getattr(self, "connection", None)
+            if sock is not None:
+                try:
+                    local_ip = str(sock.getsockname()[0]).strip().lower().strip("[]")
+                    if local_ip:
+                        trusted.add(local_ip)
+                except OSError:
+                    pass
+        return trusted
+
     def _is_same_origin(self, origin: str) -> bool:
-        """Return True if `origin` matches configured `public_origin` or validated request authority."""
+        """Return True if `origin` matches configured `public_origin` or a trusted listener authority."""
         parsed_origin = normalize_origin(origin)
         if parsed_origin is None:
             return False
@@ -1760,7 +1819,13 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 if candidate in VALID_URL_SCHEMES:
                     eff_scheme = candidate
         host_origin = normalize_origin(f"{eff_scheme}://{host_val}")
-        return host_origin is not None and parsed_origin == host_origin
+        if host_origin is None or parsed_origin != host_origin:
+            return False
+        _, host_name, host_port = host_origin
+        bound_port = int(self.server.server_address[1])
+        if host_name not in self._trusted_listener_hosts():
+            return False
+        return host_port == bound_port
 
     def _is_client_disconnected(self) -> bool:
         """Non-blocking probe detecting whether the downstream client closed its TCP socket."""
@@ -2206,7 +2271,10 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             resp: Optional[http.client.HTTPResponse] = None
             raw_sock: Any = None
             deadline_sock: Optional[DeadlineSocket] = None
-            non_stream_result: Optional[Tuple[int, str, bytes, float, float]] = None
+            committed_flag = [False]
+            non_stream_result: Optional[
+                Tuple[int, str, bytes, float, float, Optional[Mapping[str, Any]]]
+            ] = None
             try:
                 scheme, host, port, upstream_path = _join_backend_url(
                     backend.config.base_url, endpoint
@@ -2268,6 +2336,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         failovers=failovers,
                         est_prompt_tokens=est_prompt_tokens,
                         principal=auth_ctx.principal,
+                        committed_flag=committed_flag,
                     )
                     if sse_outcome == "committed":
                         return
@@ -2286,6 +2355,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                             ),
                             latency_ms,
                             attempt_ms,
+                            None,
                         )
                     elif sse_outcome == "client_error":
                         latency_ms = (time.monotonic() - req_start) * 1000.0
@@ -2300,6 +2370,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                             ),
                             latency_ms,
                             attempt_ms,
+                            None,
                         )
                     else:
                         # Pre-first-token stream failure or retryable SSE error: fail over.
@@ -2358,8 +2429,20 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                             ),
                             latency_ms,
                             attempt_ms,
+                            None,
                         )
                     else:
+                        parsed_json_resp: Optional[Mapping[str, Any]] = None
+                        if 200 <= resp.status < 300:
+                            # Validate close-delimited/chunked 2xx JSON body before recording success
+                            # or forwarding downstream so truncated JSON fails over cleanly.
+                            try:
+                                loaded_resp = json.loads(raw_resp.decode("utf-8"))
+                            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                                raise http.client.IncompleteRead(raw_resp) from exc
+                            if not isinstance(loaded_resp, Mapping):
+                                raise http.client.IncompleteRead(raw_resp)
+                            parsed_json_resp = loaded_resp
                         latency_ms = (time.monotonic() - req_start) * 1000.0
                         attempt_ms = (time.monotonic() - attempt_start) * 1000.0
                         content_type = resp.getheader("Content-Type") or "application/json"
@@ -2369,8 +2452,14 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                             raw_resp,
                             latency_ms,
                             attempt_ms,
+                            parsed_json_resp,
                         )
             except (OSError, TimeoutError, ValueError, http.client.HTTPException) as exc:
+                if committed_flag[0]:
+                    # Downstream HTTP headers were already committed; never retry, fail over,
+                    # or write a second HTTP response into the open stream.
+                    self.close_connection = True
+                    return
                 if isinstance(exc, TimeoutError):
                     reason = "timeout"
                     last_error_status = 504
@@ -2405,14 +2494,21 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         pass
 
             if non_stream_result is not None:
-                resp_status, content_type, raw_resp, latency_ms, attempt_ms = (
-                    non_stream_result
-                )
+                (
+                    resp_status,
+                    content_type,
+                    raw_resp,
+                    latency_ms,
+                    attempt_ms,
+                    parsed_json_resp,
+                ) = non_stream_result
                 if 200 <= resp_status < 300:
                     with engine._lock:
                         backend.record_latency(attempt_ms)
                     prompt_tokens, completion_tokens = _extract_non_stream_usage(
-                        raw_resp, est_prompt_tokens
+                        raw_resp,
+                        est_prompt_tokens,
+                        parsed_resp=parsed_json_resp,
                     )
                 else:
                     prompt_tokens = 0
@@ -2517,6 +2613,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         failovers: int,
         est_prompt_tokens: int,
         principal: str,
+        committed_flag: Optional[List[bool]] = None,
     ) -> Tuple[str, int, Optional[bytes]]:
         """Buffer until first generated output or terminator before committing 200 OK.
 
@@ -2719,6 +2816,8 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
 
         self.close_connection = True
         _, acao = self._resolve_cors_header()
+        if committed_flag is not None:
+            committed_flag[0] = True
         try:
             self.send_response(resp.status)
             self.send_header(
