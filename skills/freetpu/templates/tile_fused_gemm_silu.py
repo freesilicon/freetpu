@@ -91,6 +91,16 @@ def _build_tpu_compiler_params(
     return compiler_params_cls(**kwargs)
 
 
+def _validate_operand_shapes(
+    a_shape: Tuple[int, ...], b_shape: Tuple[int, ...], m: int, k: int, n: int
+) -> None:
+    """Reject operands whose shapes do not match the compiled GEMM kernel shape."""
+    if a_shape != (m, k) or b_shape != (k, n):
+        raise ValueError(
+            f"Expected operand shapes ({m}, {k}) and ({k}, {n}), got {a_shape} and {b_shape}"
+        )
+
+
 def build_pallas_gemm_silu(
     m: int,
     k: int,
@@ -169,6 +179,7 @@ def build_pallas_gemm_silu(
 
     @jax.jit
     def run(a, b):
+        _validate_operand_shapes(a.shape, b.shape, m, k, n)
         return pl.pallas_call(
             outer_kernel,
             out_shape=jax.ShapeDtypeStruct((m, n), jnp.bfloat16),
@@ -247,6 +258,20 @@ def _verify_jax_053_compat() -> None:
     assert not (nn_attrs & {"sigmoid", "silu"}), (
         f"Avoid jax.nn.sigmoid/silu (logistic_p) inside JAX 0.5.3 Mosaic kernel: {nn_attrs}"
     )
+
+    # Verify compiled-shape guard rejects larger matching K (and mismatched M/N).
+    _validate_operand_shapes((128, 256), (256, 128), 128, 256, 128)
+    for bad_a, bad_b in [
+        ((128, 512), (512, 128)),
+        ((256, 256), (256, 128)),
+        ((128, 256), (256, 256)),
+    ]:
+        try:
+            _validate_operand_shapes(bad_a, bad_b, 128, 256, 128)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"Expected ValueError for mismatched shapes {bad_a}, {bad_b}")
 
 
 def run_self_test() -> Dict[str, Any]:

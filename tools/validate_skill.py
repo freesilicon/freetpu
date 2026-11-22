@@ -144,7 +144,7 @@ def _flow_depth(raw: str, open_ch: str, close_ch: str) -> int:
             elif ch == close_ch:
                 depth -= 1
                 if depth < 0:
-                    raise ValueError(f"Unbalanced YAML flow collection: {raw!r}")
+                    raise ValueError("Invalid YAML frontmatter: unbalanced flow collection")
         i += 1
     return depth
 
@@ -162,10 +162,10 @@ def _parse_single_quoted_yaml(val: str) -> str:
                 continue
             if i == len(val) - 1:
                 return "".join(chars)
-            raise ValueError(f"Unexpected trailing characters after single-quoted YAML scalar: {val!r}")
+            raise ValueError("Invalid YAML frontmatter: unexpected trailing characters after single-quoted scalar")
         chars.append(ch)
         i += 1
-    raise ValueError(f"Unterminated single-quoted YAML scalar: {val!r}")
+    raise ValueError("Invalid YAML frontmatter: unterminated single-quoted scalar")
 
 
 def _parse_yaml_scalar_stdlib(raw: str) -> Any:
@@ -177,22 +177,22 @@ def _parse_yaml_scalar_stdlib(raw: str) -> Any:
         try:
             decoded = json.loads(val)
         except json.JSONDecodeError as exc:
-            raise ValueError(f"Invalid double-quoted YAML scalar {val!r}: {exc}") from exc
+            raise ValueError(f"Invalid YAML frontmatter: invalid double-quoted scalar ({exc.msg})") from exc
         if not isinstance(decoded, str):
-            raise ValueError(f"Expected string for double-quoted YAML scalar: {val!r}")
+            raise ValueError("Invalid YAML frontmatter: expected string for double-quoted scalar")
         return decoded
     if val.startswith("'"):
         return _parse_single_quoted_yaml(val)
     if val.startswith("["):
         if _flow_depth(val, "[", "]") != 0 or not val.endswith("]"):
-            raise ValueError(f"Malformed YAML flow sequence: {val!r}")
+            raise ValueError("Invalid YAML frontmatter: malformed flow sequence")
         return [val]
     if val.startswith("{"):
         if _flow_depth(val, "{", "}") != 0 or not val.endswith("}"):
-            raise ValueError(f"Malformed YAML flow mapping: {val!r}")
+            raise ValueError("Invalid YAML frontmatter: malformed flow mapping")
         return {"_raw": val}
     if val == "-" or val.startswith(("- ", "!", "&", "*", "%", "@", "`", ",", "?", ":")):
-        raise ValueError(f"Unsupported YAML frontmatter value syntax: {val!r}")
+        raise ValueError("Invalid YAML frontmatter: unsupported value syntax")
 
     lower = val.lower()
     if lower in ("null", "~"):
@@ -212,9 +212,7 @@ def _parse_yaml_scalar_stdlib(raw: str) -> Any:
     if re.match(r"^[+-]?\.(?:inf|nan)$", lower):
         return float(lower.replace(".", ""))
     if re.search(r":(?:\s|$)", val):
-        raise ValueError(
-            f"Invalid YAML frontmatter: unquoted plain scalar contains ': ' or trailing ':': {val!r}"
-        )
+        raise ValueError("Invalid YAML frontmatter: unquoted plain scalar contains ': ' or trailing ':'")
     return val
 
 
@@ -225,17 +223,18 @@ def _parse_frontmatter_stdlib(fm_text: str) -> Dict[str, Any]:
     i = 0
     while i < len(fm_lines):
         line = fm_lines[i]
+        line_no = i + 2  # 1-based line number in SKILL.md (line 1 is opening '---')
         if not line.strip() or line.lstrip().startswith("#"):
             i += 1
             continue
         if line[0].isspace():
-            raise ValueError(f"Unexpected indentation in YAML frontmatter: {line!r}")
+            raise ValueError(f"Invalid YAML frontmatter: unexpected indentation at line {line_no}")
         m = re.match(r"^([A-Za-z0-9_-]+)\s*:(?:\s+(.*)|\s*)$", line)
         if not m:
-            raise ValueError(f"Unsupported YAML frontmatter line: {line!r}")
+            raise ValueError(f"Invalid YAML frontmatter: unsupported syntax at line {line_no}")
         key = m.group(1)
         if key in data:
-            raise ValueError(f"Invalid YAML frontmatter: duplicate key {key!r}")
+            raise ValueError(f"Invalid YAML frontmatter: duplicate key at line {line_no}")
         rest = (m.group(2) or "").strip()
 
         block_m = re.match(r"^([>|])([0-9]*[-+]?)(?:\s+#.*)?$", rest)
@@ -270,7 +269,7 @@ def _parse_frontmatter_stdlib(fm_text: str) -> Dict[str, Any]:
                     if sub_m:
                         sub_key = sub_m.group(1)
                         if sub_key in seen_nested:
-                            raise ValueError(f"Invalid YAML frontmatter: duplicate key {sub_key!r} under {key!r}")
+                            raise ValueError(f"Invalid YAML frontmatter: duplicate nested key near line {line_no}")
                         seen_nested.add(sub_key)
                 data[key] = {"_lines": indented}
             else:
@@ -292,7 +291,7 @@ def _parse_frontmatter_stdlib(fm_text: str) -> Dict[str, Any]:
                             continue
                         if part == "-" or part.startswith("- ") or re.search(r":(?:\s|$)", part):
                             raise ValueError(
-                                f"Invalid YAML frontmatter: invalid indented scalar under {key!r}: {part!r}"
+                                f"Invalid YAML frontmatter: invalid indented scalar near line {line_no}"
                             )
                         parts.append(part)
                     if not parts:
@@ -313,7 +312,7 @@ def _parse_frontmatter_stdlib(fm_text: str) -> Dict[str, Any]:
             i += 1
             while _flow_depth(acc, open_ch, close_ch) > 0:
                 if i >= len(fm_lines):
-                    raise ValueError(f"Unterminated YAML flow collection for {key!r}")
+                    raise ValueError(f"Invalid YAML frontmatter: unterminated flow collection at line {line_no}")
                 acc = f"{acc} {_strip_inline_comment(fm_lines[i])}".strip()
                 i += 1
             data[key] = _parse_yaml_scalar_stdlib(acc)
@@ -328,7 +327,7 @@ def _parse_frontmatter_stdlib(fm_text: str) -> Dict[str, Any]:
                 if part:
                     if part == "-" or part.startswith("- ") or re.search(r":(?:\s|$)", part):
                         raise ValueError(
-                            f"Invalid YAML frontmatter: invalid plain scalar continuation under {key!r}: {part!r}"
+                            f"Invalid YAML frontmatter: invalid plain scalar continuation near line {i + 2}"
                         )
                     cont.append(part)
                 i += 1
@@ -375,6 +374,19 @@ def _load_yaml_unique_keys(fm_text: str) -> Any:
     return yaml.load(fm_text, Loader=_UniqueKeySafeLoader)
 
 
+def _format_yaml_error(exc: Exception) -> str:
+    """Format a YAML error with error type and location only (never raw source excerpts)."""
+    err_name = type(exc).__name__
+    mark = getattr(exc, "problem_mark", None) or getattr(exc, "context_mark", None)
+    loc = ""
+    if mark is not None and hasattr(mark, "line") and hasattr(mark, "column"):
+        loc = f" at line {mark.line + 2}, col {mark.column + 1}"
+    problem = getattr(exc, "problem", None)
+    if isinstance(problem, str) and problem.startswith("found duplicate key"):
+        return f"Invalid YAML frontmatter: duplicate key ({err_name}{loc})"
+    return f"Invalid YAML frontmatter ({err_name}{loc})"
+
+
 def parse_frontmatter(text: str, *, require_yaml: bool = False) -> Tuple[Dict[str, Any], str]:
     """Parse YAML frontmatter with PyYAML when available (or strict typed stdlib fallback)."""
     fm_text, body = _extract_frontmatter_block(text)
@@ -382,7 +394,7 @@ def parse_frontmatter(text: str, *, require_yaml: bool = False) -> Tuple[Dict[st
         try:
             parsed = _load_yaml_unique_keys(fm_text)
         except yaml.YAMLError as exc:
-            raise ValueError(f"Invalid YAML frontmatter: {exc}") from exc
+            raise ValueError(_format_yaml_error(exc)) from exc
         if parsed is None:
             parsed = {}
         if not isinstance(parsed, dict):
@@ -804,6 +816,42 @@ def run_validator_self_test(*, require_yaml: bool = False) -> None:
         assert pem_body_secret not in joined, f"PEM body leaked across [-400:] cut: {joined!r}"
         assert tok_tail_secret not in joined, f"Token suffix leaked across [-400:] cut: {joined!r}"
         assert "[REDACTED_GITHUB_TOKEN]" in joined, f"Expected token redaction marker in: {joined!r}"
+
+    # Verify malformed YAML frontmatter with a pasted secret never leaks raw source excerpts or clipped suffixes.
+    clipped_suffix = "CLIPPED_SECRET_SUFFIX_554433221100"
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        sdir = root / "skills" / "freetpu"
+        (sdir / "templates").mkdir(parents=True)
+        (sdir / "SKILL.md").write_text(
+            "---\n"
+            "name: freetpu\n"
+            f'description: "prefix {"x" * 60} ghp_{clipped_suffix}" trailing_junk\n'
+            "---\n",
+            encoding="utf-8",
+        )
+        (sdir / "templates" / "noop.py").write_text("x = 1\n", encoding="utf-8")
+        readme = root / "README.md"
+        readme.write_text("# Agent Skill\nInstall `skills/freetpu`.\n", encoding="utf-8")
+        errs = validate_skill(root, sdir, readme, run_self_tests=False, require_yaml=require_yaml)
+        joined = "\n".join(errs)
+        assert errs and clipped_suffix not in joined, f"Raw YAML excerpt leaked secret suffix: {joined!r}"
+
+    # Also verify _format_yaml_error directly with a MarkedYAMLError-shaped exception whose __str__ leaks a clipped excerpt.
+    class _FakeMark:
+        line = 1
+        column = 12
+
+    class _FakeMarkedYAMLError(Exception):
+        problem = "expected <block end>, but found '<scalar>'"
+        problem_mark = _FakeMark()
+
+        def __str__(self) -> str:
+            return f"scanner error\n  ...{clipped_suffix}\" trailing_junk\n"
+
+    formatted = _format_yaml_error(_FakeMarkedYAMLError())
+    assert clipped_suffix not in formatted, f"_format_yaml_error leaked excerpt: {formatted!r}"
+    assert "line 3, col 13" in formatted and "_FakeMarkedYAMLError" in formatted, formatted
 
     # Verify templates using `from __future__ import annotations` are rejected (breaks `colab run` cell prepending).
     with tempfile.TemporaryDirectory() as tmp:

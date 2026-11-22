@@ -73,6 +73,16 @@ def _build_tpu_compiler_params(
     return compiler_params_cls(**kwargs)
 
 
+def _validate_operand_shapes(
+    gate_shape: Tuple[int, ...], up_shape: Tuple[int, ...], m: int, n: int
+) -> None:
+    """Reject operands whose shapes do not match the compiled SwiGLU kernel shape."""
+    if gate_shape != (m, n) or up_shape != (m, n):
+        raise ValueError(
+            f"Expected operand shapes ({m}, {n}) and ({m}, {n}), got {gate_shape} and {up_shape}"
+        )
+
+
 def build_pallas_swiglu(m: int, n: int, block_m: int, block_n: int):
     """Build a Pallas/Mosaic SwiGLU kernel lowering to `tpu_custom_call`."""
     import jax
@@ -98,6 +108,7 @@ def build_pallas_swiglu(m: int, n: int, block_m: int, block_n: int):
 
     @jax.jit
     def run(gate, up):
+        _validate_operand_shapes(gate.shape, up.shape, m, n)
         return pl.pallas_call(
             kernel,
             out_shape=jax.ShapeDtypeStruct((m, n), jnp.bfloat16),
@@ -149,6 +160,15 @@ def _verify_compiler_params_compat() -> None:
     assert not (nn_attrs & {"sigmoid", "silu"}), (
         f"Avoid jax.nn.sigmoid/silu (logistic_p) inside JAX 0.5.3 Mosaic kernel: {nn_attrs}"
     )
+
+    _validate_operand_shapes((64, 1024), (64, 1024), 64, 1024)
+    for bad_g, bad_u in [((128, 1024), (128, 1024)), ((64, 1024), (64, 512))]:
+        try:
+            _validate_operand_shapes(bad_g, bad_u, 64, 1024)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"Expected ValueError for mismatched shapes {bad_g}, {bad_u}")
 
 
 def run_self_test() -> Dict[str, Any]:

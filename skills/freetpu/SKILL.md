@@ -126,13 +126,16 @@ Use this workflow with `google-colab-cli >= 0.7.6` (redacted logs) to run Pallas
        CLEANED=0
 
        # Build a local launcher before allocating any TPU so `colab exec --file` runs the template
-       # with clean sys.argv and a completion marker (no `colab upload` needed):
+       # with clean sys.argv and a completion marker (no `colab upload` needed); abort on any write error:
        LAUNCHER="$WORK_DIR/$SESSION_ID.launch.py"
-       {
-         printf 'import sys\nsys.argv = ["tile_swiglu.py"]\n'
-         cat skills/freetpu/templates/tile_swiglu.py
-         printf '\nprint("__FREETPU_EXEC_OK__")\n'
-       } > "$LAUNCHER"
+       if ! {
+         printf 'import sys\nsys.argv = ["tile_swiglu.py"]\n' \
+           && cat skills/freetpu/templates/tile_swiglu.py \
+           && printf '\nprint("__FREETPU_EXEC_OK__")\n'
+       } > "$LAUNCHER"; then
+         echo "ERROR: failed to assemble launcher $LAUNCHER; aborting before TPU allocation." >&2
+         exit 1
+       fi
 
        # Snapshot pre-existing server-side endpoints as defense-in-depth against unnamed `[?]` leaks:
        BASE_SESS="$(colab --auth=adc --config "$COLAB_STATE" sessions 2>/dev/null)" || BASE_SESS=""
