@@ -5345,6 +5345,19 @@ void test_phase8b_spsc_async_dequant_and_w8a16_pt() {
       ob::quantize_activation_row_split(a_big.data(), 256u, aq_big.data(), &sa_big, &outliers_big);
       CHECK(outliers_big.size() == 1u && outliers_big[0].first == 7u && outliers_big[0].second == 2e20f);
       CHECK(aq_big[7u] == 0 && aq_big[0u] == 127);
+
+      // High-contrast 2-spike row (50.01f, 0.001f, 1e-6f): FP64 energy recompute on outlier entry
+      // must peel both spikes and preserve the small 1e-6f values.
+      std::vector<float> a_hc(512u, 1e-6f);
+      a_hc[3u] = 50.01f;
+      a_hc[19u] = 0.001f;
+      std::vector<int8_t> aq_hc(512u, 0);
+      float sa_hc = 0.0f;
+      std::vector<std::pair<uint32_t, float>> outliers_hc;
+      ob::quantize_activation_row_split(a_hc.data(), 512u, aq_hc.data(), &sa_hc, &outliers_hc);
+      CHECK(outliers_hc.size() == 2u);
+      CHECK(outliers_hc[0].first == 3u && outliers_hc[1].first == 19u);
+      CHECK(aq_hc[3u] == 0 && aq_hc[19u] == 0 && aq_hc[0u] == 127);
     }
 
     ob_context_destroy(ctx);

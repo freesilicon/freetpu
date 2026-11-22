@@ -2138,14 +2138,23 @@ void quantize_activation_row_split_fast(const float* a_row,
     if (av > amax) amax = av;
     sq_sum += static_cast<double>(v) * static_cast<double>(v);
   }
-  if (!std::isfinite(sq_sum) && std::isfinite(amax)) {
-    // Recompute activation energy in FP64 when large finite inputs (e.g., >= 1e20f)
-    // overflow FP32 squaring in the NEON fast path.
-    sq_sum = 0.0;
+  auto recompute_sq_fp64 = [&]() -> double {
+    double s = 0.0;
     for (uint32_t i = 0u; i < tk; ++i) {
       const double dv = static_cast<double>(a_row[i]);
-      sq_sum += dv * dv;
+      s += dv * dv;
     }
+    return s;
+  };
+  bool sq_is_fp64 = false;
+#if !(defined(__ARM_NEON) && defined(__aarch64__))
+  sq_is_fp64 = true;
+#endif
+  if ((!std::isfinite(sq_sum) || sq_sum == 0.0) && std::isfinite(amax) && amax > 0.0f) {
+    // Recompute activation energy in FP64 when large or tiny finite inputs overflow or
+    // underflow FP32 squaring in the NEON fast path.
+    sq_sum = recompute_sq_fp64();
+    sq_is_fp64 = true;
   }
   if (amax == 0.0f) {
     std::memset(aq_row, 0, tk);
@@ -2164,6 +2173,13 @@ void quantize_activation_row_split_fast(const float* a_row,
   if (out_outliers && tk >= 128u) {
     double rms = std::sqrt(sq_sum / static_cast<double>(tk));
     if (static_cast<double>(amax) > kOutlierSigma * std::max(rms, 1e-12)) {
+      if (!sq_is_fp64) {
+        // Recompute exact FP64 energy before peeling so subtracting a dominant outlier's
+        // square cannot lose smaller activations to FP32 rounding error.
+        sq_sum = recompute_sq_fp64();
+        rem_sq = sq_sum;
+        sq_is_fp64 = true;
+      }
       struct Cand {
         float av;
         uint32_t idx;
