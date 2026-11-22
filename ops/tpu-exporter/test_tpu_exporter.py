@@ -103,6 +103,115 @@ TensorCore Utilization
         self.assertEqual(rows["1"].hbm_used_bytes, 16 * 1024**3)
         self.assertAlmostEqual(rows["1"].duty_cycle_percent or 0.0, 0.0)
 
+    def test_parse_tpu_info_dashboard_device_status_and_process_monitor(self) -> None:
+        dashboard = """
+\x1b[1mTPU Device Status\x1b[0m
++-----------+---------------------------+--------------------+--------------------+-----------------------+
+| Device ID | Memory Usage (Used/Total) | Memory Bar Gauge   | HBM Bandwidth Util | TensorCore Duty Cycle |
++-----------+---------------------------+--------------------+--------------------+-----------------------+
+| 0         | 8.00 GiB / 15.75 GiB      | [#####.....] 50.8% | [##........] 20.0% | [########..] 87.5%    |
+| 1         | N/A                       | [..........] N/A   | [..........] N/A   | [..........] N/A      |
++-----------+---------------------------+--------------------+--------------------+-----------------------+
+
+TPU Process Monitor
++-----------+-------------------------+------+--------------+-------------------+
+| Device ID | Device Path / VFIO Path | PID  | Process Name | Memory Allocation |
++-----------+-------------------------+------+--------------+-------------------+
+| 0         | /dev/vfio/0             | 4242 | python3      | 8.00 GiB          |
+| 1         | /dev/vfio/2             | None | N/A          | N/A               |
++-----------+-------------------------+------+--------------+-------------------+
+"""
+        rows = tpu_exporter.parse_tpu_info_output(dashboard)
+        self.assertIn("0", rows)
+        self.assertTrue(rows["0"].in_util_table)
+        self.assertEqual(rows["0"].hbm_used_bytes, 8 * 1024**3)
+        self.assertEqual(rows["0"].hbm_total_bytes, int(round(15.75 * 1024**3)))
+        # Must read TensorCore Duty Cycle (87.5%), not Memory Bar Gauge (50.8%) or HBM BW (20.0%).
+        self.assertAlmostEqual(rows["0"].duty_cycle_percent or 0.0, 87.5)
+
+        # N/A rows must stay unset (None), never fabricated as 0.
+        self.assertIn("1", rows)
+        self.assertIsNone(rows["1"].hbm_used_bytes)
+        self.assertIsNone(rows["1"].hbm_total_bytes)
+        self.assertIsNone(rows["1"].duty_cycle_percent)
+
+        self.assertIn("/dev/vfio/0", rows)
+        self.assertTrue(rows["/dev/vfio/0"].in_chips_table)
+        self.assertEqual(rows["/dev/vfio/0"].pids, [4242])
+        self.assertIn("/dev/vfio/2", rows)
+        self.assertEqual(rows["/dev/vfio/2"].pids, [])
+
+    def test_unparseable_and_na_tpu_info_leaves_utilization_unset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sysfs_root, dev_root, proc_root = _make_mock_pci_tree(
+                root,
+                devices=[
+                    {
+                        "bdf": "0000:00:06.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0063",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                        "enable": "1",
+                    }
+                ],
+                create_vfio_nodes=["0"],
+            )
+
+            # Case 1: tpu-info exits 0 with unrecognized format (must NOT fabricate 0s).
+            unknown_cli = root / "mock-unknown-tpu-info.sh"
+            unknown_cli.write_text(
+                "#!/bin/sh\necho 'Some Future Unrecognized Dashboard Format'\n",
+                encoding="utf-8",
+            )
+            unknown_cli.chmod(0o755)
+
+            snap_unknown = tpu_exporter.collect_snapshot(
+                sysfs_root=sysfs_root,
+                dev_root=dev_root,
+                proc_root=proc_root,
+                tpu_info_bin=str(unknown_cli),
+                chip_id_map={"0000:00:06.0": "0"},
+            )
+            self.assertFalse(snap_unknown.tpu_info_available)
+            self.assertIsNone(snap_unknown.devices[0].hbm_used_bytes)
+            self.assertIsNone(snap_unknown.devices[0].duty_cycle_percent)
+            prom_unknown = tpu_exporter.format_prometheus_metrics(snap_unknown)
+            self.assertNotIn("freetpu_tpu_hbm_used_bytes{", prom_unknown)
+            self.assertNotIn("freetpu_tpu_duty_cycle_percent{", prom_unknown)
+
+            # Case 2: Dashboard outputs TPU Device Status with N/A readings (must stay unset).
+            na_cli = root / "mock-na-tpu-info.sh"
+            na_cli.write_text(
+                "#!/bin/sh\n"
+                "cat <<'EOF'\n"
+                "TPU Device Status\n"
+                "+-----------+---------------------------+--------------------+--------------------+-----------------------+\n"
+                "| Device ID | Memory Usage (Used/Total) | Memory Bar Gauge   | HBM Bandwidth Util | TensorCore Duty Cycle |\n"
+                "+-----------+---------------------------+--------------------+--------------------+-----------------------+\n"
+                "| 0         | N/A                       | [..........] N/A   | [..........] N/A   | [..........] N/A      |\n"
+                "+-----------+---------------------------+--------------------+--------------------+-----------------------+\n"
+                "EOF\n",
+                encoding="utf-8",
+            )
+            na_cli.chmod(0o755)
+
+            snap_na = tpu_exporter.collect_snapshot(
+                sysfs_root=sysfs_root,
+                dev_root=dev_root,
+                proc_root=proc_root,
+                tpu_info_bin=str(na_cli),
+                chip_id_map={"0000:00:06.0": "0"},
+            )
+            self.assertTrue(snap_na.tpu_info_available)
+            self.assertIsNone(snap_na.devices[0].hbm_used_bytes)
+            self.assertIsNone(snap_na.devices[0].duty_cycle_percent)
+            self.assertEqual(snap_na.runtime_utilization, [])
+            prom_na = tpu_exporter.format_prometheus_metrics(snap_na)
+            self.assertNotIn("freetpu_tpu_hbm_used_bytes{", prom_na)
+            self.assertNotIn("freetpu_tpu_duty_cycle_percent{", prom_na)
+
     def test_discovery_filters_gvnic_and_avoids_unverified_runtime_join(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

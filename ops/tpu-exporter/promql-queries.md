@@ -1,11 +1,16 @@
 # FreeTPU Prometheus Billing & Utilization PromQL Queries
 
-These queries mirror standard NVIDIA `dcgm-exporter` dashboards for Cloud TPU (`v4`, `v5e`, `v5p`, `v6e` Trillium) telemetry exposed by `ops/tpu-exporter/tpu_exporter.py`.
+These queries mirror standard NVIDIA `dcgm-exporter` dashboards for VFIO-backed Cloud TPU (`v5e`, `v5p`, `v6e` Trillium) telemetry exposed by `ops/tpu-exporter/tpu_exporter.py`. (Legacy `/dev/accel*` Cloud TPU v4 hosts are recognized in `freetpu_tpu_info` PCI inventory only; VFIO health and `/dev/vfio/*` PID metrics apply to VFIO-backed hosts.)
 
 ## Fleet Inventory & Health
 
 ```promql
-# Total healthy TPU chips per generation across the cluster
+# Total discovered TPU chips per generation across scraped hosts (deduplicated per chip)
+count by (generation) (
+  group by (generation, instance, pci_bdf) (freetpu_tpu_info)
+)
+
+# Total VFIO-ready TPU chips per generation across the cluster
 sum by (generation) (freetpu_tpu_health_status == 1)
 
 # Unhealthy or unbound TPU chips (vfio-pci / /dev/vfio/<group> missing)
@@ -45,17 +50,23 @@ sum_over_time(
   and
 (avg_over_time(freetpu_tpu_duty_cycle_percent[15m]) < 2)
 
-# Estimated hourly TPU spend by generation (replace 1.20 / 2.70 with your spot/on-demand SKU rate)
+# Inventory-based estimated hourly TPU spend by generation across scraped hosts.
+# Counts all discovered PCI chips via `freetpu_tpu_info` (including unhealthy or
+# unbound chips that Google Cloud still bills while the TPU node is READY),
+# deduplicated per (generation, instance, pci_bdf) against label churn.
+# Replace 1.20 / 2.70 with your spot/on-demand SKU rate; use Google Cloud billing
+# or billable node inventory for authoritative chargeback.
 (
-  sum by (generation) (freetpu_tpu_health_status{generation="v5e"}) * 1.20
+  count by (generation) (group by (generation, instance, pci_bdf) (freetpu_tpu_info{generation="v5e"})) * 1.20
   or
-  sum by (generation) (freetpu_tpu_health_status{generation="v6e"}) * 2.70
+  count by (generation) (group by (generation, instance, pci_bdf) (freetpu_tpu_info{generation="v6e"})) * 2.70
 )
 
-# Effective cost per utilized TPU-hour by generation (hourly spend / equivalent fully-utilized chips)
+# Inventory-based effective cost per utilized TPU-hour by generation
+# (discovered-inventory hourly spend estimate / equivalent fully-utilized chips)
 (
-  sum by (generation) (freetpu_tpu_health_status{generation="v5e"}) * 1.20
+  count by (generation) (group by (generation, instance, pci_bdf) (freetpu_tpu_info{generation="v5e"})) * 1.20
   or
-  sum by (generation) (freetpu_tpu_health_status{generation="v6e"}) * 2.70
+  count by (generation) (group by (generation, instance, pci_bdf) (freetpu_tpu_info{generation="v6e"})) * 2.70
 ) / clamp_min(sum by (generation) (freetpu_tpu_duty_cycle_percent / 100), 0.01)
 ```

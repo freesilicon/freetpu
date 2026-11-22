@@ -1,6 +1,8 @@
 # `freetpu-cdi` — Open CNCF CDI Toolkit for Cloud TPUs
 
-`freetpu_cdi.py` is an open, zero-dependency CNCF Container Device Interface (CDI v0.6.0) spec generator for Google Cloud TPUs (analogous to `nvidia-ctk cdi generate`). It scans `/sys/bus/pci/devices/*` (`vendor=0x1ae0`) and `/dev/vfio/*`, and emits `/etc/cdi/freetpu.json` so Docker, Podman, containerd, and Kubernetes can attach TPU chips cleanly without privileged host-network/host-device hacks.
+`freetpu_cdi.py` is an open, zero-dependency CNCF Container Device Interface (CDI v0.6.0) spec generator for VFIO-backed Google Cloud TPUs (`v5e`, `v5p`, `v6e` Trillium bound to `vfio-pci`, analogous to `nvidia-ctk cdi generate`). It scans `/sys/bus/pci/devices/*` (`vendor=0x1ae0`) and `/dev/vfio/*`, verifies full IOMMU group isolation, omits static `major`/`minor` numbers so CDI resolves live VFIO device numbers from `hostPath` at container start, and emits `/etc/cdi/freetpu.json` so Docker, Podman, containerd, and Kubernetes can attach TPU chips cleanly without privileged host-network/host-device hacks.
+
+> **Scope note:** Legacy `/dev/accel*` Cloud TPU hosts (e.g. Cloud TPU `v2`, `v3`, `v4` using Google's `accel` driver instead of `vfio-pci`) are not supported by VFIO CDI passthrough.
 
 ## Quickstart
 
@@ -45,7 +47,7 @@ docker run --rm \
   python3 -c "import os; print(os.listdir('/dev/vfio'))"
 ```
 
-Note on shared IOMMU groups: if multiple TPU chips share one `/dev/vfio/<iommu_group>` node, `freetpu-cdi` exposes that group strictly as a single allocation unit (`freetpu.dev/tpu=group-<iommu_group>`) plus `freetpu.dev/tpu=all` instead of misleading single-chip selectors.
+Note on IOMMU groups: if multiple TPU chips share one `/dev/vfio/<iommu_group>` node, `freetpu-cdi` exposes that group strictly as a single allocation unit (`freetpu.dev/tpu=group-<iommu_group>`) plus `freetpu.dev/tpu=all` instead of misleading single-chip selectors. If any TPU's IOMMU group also contains a non-TPU PCI device, `freetpu-cdi` fails closed rather than publishing any selector (including `all`) that would expose that non-TPU device.
 
 ## Kubernetes Manifests
 
@@ -58,5 +60,6 @@ kubectl -n kube-system create configmap freetpu-ops-scripts \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
 
-- [manifests/k8s-tpu-cdi-daemonset.yaml](manifests/k8s-tpu-cdi-daemonset.yaml) — Node-level DaemonSet generating `/var/run/cdi/freetpu.json` and serving Prometheus metrics on `:9400/metrics` (with `SYS_PTRACE` for hostPID `/proc/<pid>/fd` telemetry).
-- [manifests/k8s-tpu-pod-cdi.yaml](manifests/k8s-tpu-pod-cdi.yaml) — Sample Kubernetes `DeviceClass`, DRA `ResourceClaimTemplate`, and Pod requesting `freetpu.dev/tpu` (requires Kubernetes >= 1.32 with DRA enabled and a cluster DRA driver registered for `freetpu.dev` publishing `ResourceSlice` objects).
+- [manifests/k8s-tpu-cdi-daemonset.yaml](manifests/k8s-tpu-cdi-daemonset.yaml) — Node-level DaemonSet targeting VFIO-backed GKE TPU node pools (`tpu-v5-lite-device`, `tpu-v5-lite-podslice`, `tpu-v5p-slice`, `tpu-v6e-slice`), generating `/var/run/cdi/freetpu.json` and serving Prometheus metrics on `:9400/metrics` (with `SYS_PTRACE` for hostPID `/proc/<pid>/fd` telemetry).
+- [manifests/k8s-tpu-pod-cdi.yaml](manifests/k8s-tpu-pod-cdi.yaml) — Sample Kubernetes `DeviceClass`, DRA `ResourceClaimTemplate`, and Pod (`resource.k8s.io/v1`, Kubernetes >= 1.34, with `google.com/tpu:NoSchedule` toleration) requesting `freetpu.dev/tpu` (requires a cluster DRA driver registered for `freetpu.dev` publishing `ResourceSlice` objects).
+- [manifests/k8s-tpu-pod-cdi-v1beta1.yaml](manifests/k8s-tpu-pod-cdi-v1beta1.yaml) — Legacy Kubernetes 1.32–1.33 DRA sample (`resource.k8s.io/v1beta1`, requires `--runtime-config=resource.k8s.io/v1beta1=true` and `DynamicResourceAllocation=true`).

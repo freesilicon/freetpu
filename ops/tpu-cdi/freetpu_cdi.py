@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """FreeTPU Open CNCF CDI Spec Generator & Container Passthrough Toolkit.
 
-Scans /sys/bus/pci/devices/* (vendor 0x1ae0) and /dev/vfio/* to generate a
+Scans /sys/bus/pci/devices/* (vendor 0x1ae0) and /dev/vfio/* on VFIO-backed
+Cloud TPU hosts (v5e, v5p, v6e Trillium bound to `vfio-pci`) to generate a
 CNCF Container Device Interface (CDI) v0.6.0 specification (e.g.
 /etc/cdi/freetpu.json) exposing `freetpu.dev/tpu=0`, ..., `freetpu.dev/tpu=all`.
+
+Note: Legacy `/dev/accel*` Cloud TPU hosts (e.g. Cloud TPU v4 using Google's
+`accel` driver) are not supported by VFIO CDI passthrough.
 
 Also provides:
   - `validate`: strict CNCF CDI v0.6.0 structural & per-device VFIO validator
@@ -20,7 +24,6 @@ import json
 import os
 from pathlib import Path
 import re
-import stat
 import sys
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -46,7 +49,7 @@ _CDI_KIND_RE = re.compile(
 )
 _CDI_DEVICE_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
 _ALLOWED_CONTAINER_EDITS_KEYS = frozenset(
-    {"env", "deviceNodes", "hooks", "mounts", "intelRdt"}
+    {"env", "deviceNodes", "hooks", "mounts"}
 )
 _ALLOWED_HOOK_NAMES = frozenset(
     {
@@ -74,8 +77,7 @@ class DiscoveredChip:
     iommu_group: str
     vfio_host_path: Path
     vfio_container_path: str
-    major: Optional[int]
-    minor: Optional[int]
+    non_tpu_group_members: Tuple[str, ...] = ()
 
 
 def _normalize_hex_id(raw: str) -> str:
@@ -105,33 +107,46 @@ def _read_symlink_name(path: Path) -> Optional[str]:
     return None
 
 
-def _device_major_minor(path: Path) -> Tuple[Optional[int], Optional[int]]:
-    try:
-        st = path.stat()
-    except OSError:
-        return None, None
-    if stat.S_ISCHR(st.st_mode):
-        return os.major(st.st_rdev), os.minor(st.st_rdev)
-    return None, None
-
-
 def _make_device_node(
     container_path: str,
     host_path: Path,
     *,
     permissions: str = "rw",
 ) -> Dict[str, Any]:
-    node: Dict[str, Any] = {
+    # Omit major and minor intentionally: Linux allocates VFIO group minor
+    # numbers dynamically and independently of IOMMU group IDs, so CDI must
+    # resolve live device numbers from hostPath at container injection time.
+    return {
         "path": container_path,
         "hostPath": str(host_path),
         "type": "c",
         "permissions": permissions,
     }
-    major, minor = _device_major_minor(host_path)
-    if major is not None and minor is not None:
-        node["major"] = major
-        node["minor"] = minor
-    return node
+
+
+def _collect_iommu_group_members(
+    sysfs_root: Path,
+    pci_entries: Sequence[Path],
+) -> Dict[str, set[str]]:
+    """Map every IOMMU group ID to all PCI device BDFs belonging to that group."""
+    members: Dict[str, set[str]] = {}
+    for entry in pci_entries:
+        grp = _read_symlink_name(entry / "iommu_group") or ""
+        if grp:
+            members.setdefault(grp, set()).add(entry.name)
+
+    iommu_root = sysfs_root / "kernel" / "iommu_groups"
+    if iommu_root.is_dir():
+        for grp_dir in iommu_root.iterdir():
+            dev_dir = grp_dir / "devices"
+            if not dev_dir.is_dir():
+                continue
+            try:
+                for member in dev_dir.iterdir():
+                    members.setdefault(grp_dir.name, set()).add(member.name)
+            except OSError:
+                continue
+    return members
 
 
 def discover_tpu_chips(
@@ -140,7 +155,7 @@ def discover_tpu_chips(
     *,
     allow_missing_vfio: bool = False,
 ) -> Tuple[List[DiscoveredChip], Path]:
-    """Scan sysfs for Google 0x1ae0 PCI devices and resolve /dev/vfio/* nodes."""
+    """Scan sysfs for VFIO-backed Google 0x1ae0 TPU PCI devices and /dev/vfio/* nodes."""
     pci_dir = sysfs_root / "bus" / "pci" / "devices"
     if not pci_dir.is_dir():
         raise FileNotFoundError(f"PCI sysfs directory not found: {pci_dir}")
@@ -148,11 +163,17 @@ def discover_tpu_chips(
     vfio_container = dev_root / "vfio" / "vfio"
     if not vfio_container.exists() and not allow_missing_vfio:
         raise FileNotFoundError(
-            f"VFIO control device not found: {vfio_container} (is vfio-pci loaded?)"
+            f"VFIO control device not found: {vfio_container} "
+            "(freetpu-cdi requires VFIO-backed Cloud TPUs using vfio-pci; "
+            "/dev/accel* hosts such as Cloud TPU v4 are not supported)"
         )
 
-    chips: List[DiscoveredChip] = []
-    for entry in sorted(pci_dir.iterdir(), key=lambda p: p.name):
+    pci_entries = sorted(pci_dir.iterdir(), key=lambda p: p.name)
+    group_members = _collect_iommu_group_members(sysfs_root, pci_entries)
+
+    tpu_candidates: List[Tuple[Path, str, str, str]] = []
+    tpu_bdfs: set[str] = set()
+    for entry in pci_entries:
         vendor_raw = _read_text(entry / "vendor")
         if not vendor_raw or _normalize_hex_id(vendor_raw) != GOOGLE_PCI_VENDOR_ID:
             continue
@@ -162,7 +183,18 @@ def discover_tpu_chips(
             # Skip non-TPU Google PCI functions under vendor 0x1ae0 (e.g. gVNIC 0x0042).
             continue
         gen, model_name = TPU_PCI_DEVICES[device_id]
+        tpu_candidates.append((entry, device_id, gen, model_name))
+        tpu_bdfs.add(entry.name)
+
+    chips: List[DiscoveredChip] = []
+    for entry, device_id, gen, model_name in tpu_candidates:
         driver = _read_symlink_name(entry / "driver") or "unbound"
+        if driver != "vfio-pci" and not allow_missing_vfio:
+            raise RuntimeError(
+                f"TPU PCI device {entry.name} is bound to driver {driver!r}, not 'vfio-pci' "
+                "(freetpu-cdi supports VFIO-backed Cloud TPUs only; /dev/accel* hosts are not supported)"
+            )
+
         iommu_group = _read_symlink_name(entry / "iommu_group") or ""
         if not iommu_group:
             if allow_missing_vfio:
@@ -171,13 +203,20 @@ def discover_tpu_chips(
                 f"TPU PCI device {entry.name} has no iommu_group in {entry}"
             )
 
+        all_in_group = group_members.get(iommu_group, set()) | {entry.name}
+        non_tpu_members = tuple(sorted(all_in_group - tpu_bdfs))
+        if non_tpu_members:
+            raise RuntimeError(
+                f"Refusing VFIO group {iommu_group} for TPU {entry.name}: "
+                f"IOMMU group also exposes non-TPU PCI device(s): {', '.join(non_tpu_members)}"
+            )
+
         vfio_host_path = dev_root / "vfio" / iommu_group
         if not vfio_host_path.exists() and not allow_missing_vfio:
             raise FileNotFoundError(
                 f"VFIO group node not found for {entry.name}: {vfio_host_path}"
             )
 
-        major, minor = _device_major_minor(vfio_host_path)
         chips.append(
             DiscoveredChip(
                 index=len(chips),
@@ -190,8 +229,7 @@ def discover_tpu_chips(
                 iommu_group=iommu_group,
                 vfio_host_path=vfio_host_path,
                 vfio_container_path=f"/dev/vfio/{iommu_group}",
-                major=major,
-                minor=minor,
+                non_tpu_group_members=non_tpu_members,
             )
         )
 
@@ -212,6 +250,13 @@ def build_cdi_spec(
     """Build a CNCF CDI v0.6.0 JSON specification dictionary."""
     if not chips:
         raise ValueError("Cannot build CDI spec with zero discovered TPU chips")
+
+    for chip in chips:
+        if chip.non_tpu_group_members:
+            raise ValueError(
+                f"Refusing VFIO group {chip.iommu_group} for TPU {chip.pci_bdf}: "
+                f"IOMMU group contains non-TPU device(s): {', '.join(chip.non_tpu_group_members)}"
+            )
 
     global_edits: Dict[str, Any] = {
         "deviceNodes": [

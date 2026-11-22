@@ -110,6 +110,14 @@ class FreeTpuCdiTests(unittest.TestCase):
                 spec["devices"][0]["containerEdits"]["deviceNodes"][0]["path"],
                 "/dev/vfio/0",
             )
+            # Device numbers must be omitted so CDI resolves them dynamically at container start.
+            for node in (
+                spec["containerEdits"]["deviceNodes"]
+                + spec["devices"][0]["containerEdits"]["deviceNodes"]
+                + spec["devices"][-1]["containerEdits"]["deviceNodes"]
+            ):
+                self.assertNotIn("major", node)
+                self.assertNotIn("minor", node)
 
     def test_generate_multi_chip_v6e_exposes_shared_group_as_single_unit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -231,6 +239,132 @@ class FreeTpuCdiTests(unittest.TestCase):
         }
         errs3 = freetpu_cdi.validate_cdi_spec(incomplete_per_device)
         self.assertTrue(any("devices[0]" in e and "/dev/vfio/<iommu_group>" in e for e in errs3))
+
+        # intelRdt was introduced in CDI v0.7.0 and must be rejected in v0.6.0 specs.
+        intel_rdt_spec = {
+            "cdiVersion": "0.6.0",
+            "kind": "freetpu.dev/tpu",
+            "containerEdits": {
+                "deviceNodes": [{"path": "/dev/vfio/vfio"}],
+                "intelRdt": {"closID": "tpu"},
+            },
+            "devices": [
+                {
+                    "name": "0",
+                    "containerEdits": {"deviceNodes": [{"path": "/dev/vfio/0"}]},
+                }
+            ],
+        }
+        errs4 = freetpu_cdi.validate_cdi_spec(intel_rdt_spec)
+        self.assertTrue(any("intelRdt" in e for e in errs4))
+
+    def test_rejects_vfio_group_with_non_tpu_devices_and_non_vfio_driver(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # Group 0 contains both a recognized TPU and a non-TPU PCI function bound to vfio-pci.
+            sysfs_root, dev_root = _make_mock_pci_vfio(
+                root,
+                devices=[
+                    {
+                        "bdf": "0000:00:05.0",
+                        "vendor": "0x1af4",
+                        "device": "0x1041",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                    },
+                    {
+                        "bdf": "0000:00:06.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0063",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                    },
+                    {
+                        "bdf": "0000:00:07.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0063",
+                        "driver": "vfio-pci",
+                        "iommu_group": "1",
+                    },
+                ],
+                create_vfio_nodes=["0", "1"],
+            )
+            with self.assertRaisesRegex(RuntimeError, "non-TPU PCI device.*0000:00:05.0"):
+                freetpu_cdi.discover_tpu_chips(sysfs_root=sysfs_root, dev_root=dev_root)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # Non-TPU member listed only under /sys/kernel/iommu_groups/<group>/devices/.
+            sysfs_root, dev_root = _make_mock_pci_vfio(
+                root,
+                devices=[
+                    {
+                        "bdf": "0000:00:06.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0063",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                    }
+                ],
+                create_vfio_nodes=["0"],
+            )
+            extra_dev = sysfs_root / "kernel" / "iommu_groups" / "0" / "devices" / "0000:00:09.0"
+            extra_dev.parent.mkdir(parents=True, exist_ok=True)
+            extra_dev.write_text("", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "0000:00:09.0"):
+                freetpu_cdi.discover_tpu_chips(sysfs_root=sysfs_root, dev_root=dev_root)
+
+        # Direct build_cdi_spec defense-in-depth check.
+        bad_chip = freetpu_cdi.DiscoveredChip(
+            index=0,
+            pci_bdf="0000:00:06.0",
+            vendor_id="0x1ae0",
+            device_id="0x0063",
+            generation="v5e",
+            model_name="TPU v5e",
+            driver="vfio-pci",
+            iommu_group="0",
+            vfio_host_path=Path("/dev/vfio/0"),
+            vfio_container_path="/dev/vfio/0",
+            non_tpu_group_members=("0000:00:05.0",),
+        )
+        with self.assertRaisesRegex(ValueError, "non-TPU"):
+            freetpu_cdi.build_cdi_spec([bad_chip], Path("/dev/vfio/vfio"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # Cloud TPU v4 bound to accel driver (non-vfio-pci) must fail closed.
+            sysfs_root, dev_root = _make_mock_pci_vfio(
+                root,
+                devices=[
+                    {
+                        "bdf": "0000:00:06.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x005e",
+                        "driver": "accel",
+                        "iommu_group": "0",
+                    }
+                ],
+                create_vfio_nodes=["0"],
+            )
+            with self.assertRaisesRegex(RuntimeError, "vfio-pci"):
+                freetpu_cdi.discover_tpu_chips(sysfs_root=sysfs_root, dev_root=dev_root)
+
+    def test_device_nodes_omit_major_minor_for_char_devices(self) -> None:
+        import stat as _stat
+        from unittest import mock
+
+        fake_stat = mock.MagicMock()
+        fake_stat.st_mode = _stat.S_IFCHR | 0o600
+        fake_stat.st_rdev = os.makedev(242, 7)
+
+        with mock.patch.object(Path, "stat", return_value=fake_stat):
+            node = freetpu_cdi._make_device_node("/dev/vfio/0", Path("/dev/vfio/0"))
+        self.assertEqual(node["path"], "/dev/vfio/0")
+        self.assertEqual(node["hostPath"], "/dev/vfio/0")
+        self.assertEqual(node["type"], "c")
+        self.assertNotIn("major", node)
+        self.assertNotIn("minor", node)
 
     def test_missing_vfio_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

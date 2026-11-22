@@ -2,10 +2,16 @@
 """FreeTPU Prometheus Telemetry Exporter (DCGM-exporter equivalent for Cloud TPUs).
 
 Discovers Google TPU PCI devices (vendor 0x1ae0) under /sys/bus/pci/devices/*
-and their /dev/vfio/* IOMMU device nodes, scrapes live HBM usage, MXU duty
-cycle, active PIDs, and chip health via `tpu-info` (with pure sysfs/procfs
-fallback), and serves Prometheus text exposition format 0.0.4 on HTTP
-`/metrics`, or prints a one-shot snapshot with `--once` / `--json`.
+and their /dev/vfio/* IOMMU device nodes on VFIO-backed Cloud TPU VMs (v5e,
+v5p, v6e Trillium), scrapes live HBM usage, MXU duty cycle, active PIDs, and
+VFIO chip readiness via `tpu-info` (with pure sysfs/procfs fallback), and serves
+Prometheus text exposition format 0.0.4 on HTTP `/metrics`, or prints a one-shot
+snapshot with `--once` / `--json`.
+
+Note: Legacy `/dev/accel*` Cloud TPU hosts (e.g. TPU v2/v3/v4 using the `accel`
+driver instead of `vfio-pci`) are recognized in PCI inventory, but VFIO
+readiness (`freetpu_tpu_health_status`) and `/dev/vfio/*` PID tracking are
+scoped to VFIO-backed hosts.
 
 Zero third-party dependencies: uses Python standard library only.
 """
@@ -59,6 +65,7 @@ _MEM_PAIR_RE = re.compile(
     re.IGNORECASE,
 )
 _PCT_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*%")
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
 
 @dataclass
@@ -212,14 +219,19 @@ class _TpuInfoRow:
 def parse_tpu_info_output(output: str) -> Dict[str, _TpuInfoRow]:
     """Parse `tpu-info` stdout tables (both Unicode box and ASCII pipe styles).
 
-    Only reads PID/device rows from `TPU Chips` and HBM/duty-cycle rows from
-    `TPU Runtime Utilization`, keeping `TensorCore Utilization` tables isolated.
+    Supports both:
+    - Modern `tpu-info` dashboard tables: `TPU Device Status` (Memory Usage +
+      TensorCore Duty Cycle, ignoring Memory Bar Gauge / HBM Bandwidth Util
+      percentages) and `TPU Process Monitor` (Device Path / VFIO Path + PID).
+    - Classic `tpu-info` tables: `TPU Chips` and `TPU Runtime Utilization`,
+      keeping standalone `TensorCore Utilization` tables isolated.
     """
     rows: Dict[str, _TpuInfoRow] = {}
     section = "unknown"
+    col_map: Dict[str, int] = {}
 
     for raw_line in output.splitlines():
-        line = raw_line.strip()
+        line = _ANSI_RE.sub("", raw_line).strip()
         if not line:
             continue
         lower = line.lower()
@@ -227,11 +239,18 @@ def parse_tpu_info_output(output: str) -> Dict[str, _TpuInfoRow]:
             ch in line for ch in ("|", "│", "┃", "║", "┌", "┏", "└", "┗", "├", "┝", "+", "─", "━", "═")
         )
         if not is_box_or_table:
+            col_map = {}
             if "tpu chips" in lower:
                 section = "chips"
                 continue
             if "tpu runtime utilization" in lower:
                 section = "utilization"
+                continue
+            if "tpu device status" in lower:
+                section = "device_status"
+                continue
+            if "tpu process monitor" in lower:
+                section = "process_monitor"
                 continue
             if "tensorcore" in lower or "tensor core" in lower or "utilization" in lower:
                 section = "other"
@@ -254,36 +273,100 @@ def parse_tpu_info_output(output: str) -> Dict[str, _TpuInfoRow]:
         first_lower = cells[0].lower()
         if first_lower in ("core", "tensorcore", "tensorcore id"):
             section = "other"
+            col_map = {}
             continue
-        if first_lower in ("chip", "device", "tpu"):
+        if first_lower in ("chip", "device", "device id", "id", "tpu"):
+            for idx, col_hdr in enumerate(cells):
+                hdr = col_hdr.lower()
+                if "memory usage" in hdr or "hbm usage" in hdr:
+                    col_map["mem"] = idx
+                elif "duty cycle" in hdr:
+                    col_map["duty"] = idx
+                elif "path" in hdr or "vfio" in hdr:
+                    col_map["path"] = idx
+                elif hdr == "pid":
+                    col_map["pid"] = idx
+            continue
+
+        if section not in ("chips", "utilization", "device_status", "process_monitor"):
             continue
 
         chip_key = cells[0]
         if not chip_key:
+            # Handle wrapped multi-line Rich headers where col 0 is blank.
+            for idx, col_hdr in enumerate(cells):
+                hdr = col_hdr.lower()
+                if "mem" not in col_map and ("memory usage" in hdr or "hbm usage" in hdr):
+                    col_map["mem"] = idx
+                elif "duty" not in col_map and "duty cycle" in hdr:
+                    col_map["duty"] = idx
+                elif "path" not in col_map and ("path" in hdr or "vfio" in hdr):
+                    col_map["path"] = idx
+                elif "pid" not in col_map and hdr == "pid":
+                    col_map["pid"] = idx
             continue
-
-        if section not in ("chips", "utilization"):
-            continue
-
-        row = rows.setdefault(chip_key, _TpuInfoRow(chip_key=chip_key))
 
         if section == "utilization":
+            row = rows.setdefault(chip_key, _TpuInfoRow(chip_key=chip_key))
             row.in_util_table = True
-            joined = " | ".join(cells[1:])
-            mem_match = _MEM_PAIR_RE.search(joined)
-            pct_match = _PCT_RE.search(joined)
+            mem_idx = col_map.get("mem")
+            duty_idx = col_map.get("duty")
+            mem_text = (
+                cells[mem_idx]
+                if mem_idx is not None and mem_idx < len(cells)
+                else " | ".join(cells[1:])
+            )
+            duty_text = (
+                cells[duty_idx]
+                if duty_idx is not None and duty_idx < len(cells)
+                else " | ".join(cells[1:])
+            )
+            mem_match = _MEM_PAIR_RE.search(mem_text)
+            pct_match = _PCT_RE.search(duty_text)
             if mem_match:
                 row.hbm_used_bytes = _parse_bytes(mem_match.group(1), mem_match.group(2))
                 row.hbm_total_bytes = _parse_bytes(mem_match.group(3), mem_match.group(4))
             if pct_match:
                 row.duty_cycle_percent = float(pct_match.group(1))
+        elif section == "device_status":
+            row = rows.setdefault(chip_key, _TpuInfoRow(chip_key=chip_key))
+            row.in_util_table = True
+            mem_idx = col_map.get("mem", 1)
+            duty_idx = col_map.get("duty", 4)
+            if mem_idx < len(cells):
+                mem_match = _MEM_PAIR_RE.search(cells[mem_idx])
+                if mem_match:
+                    row.hbm_used_bytes = _parse_bytes(mem_match.group(1), mem_match.group(2))
+                    row.hbm_total_bytes = _parse_bytes(mem_match.group(3), mem_match.group(4))
+            if duty_idx < len(cells):
+                pct_match = _PCT_RE.search(cells[duty_idx])
+                if pct_match:
+                    row.duty_cycle_percent = float(pct_match.group(1))
         elif section == "chips":
+            row = rows.setdefault(chip_key, _TpuInfoRow(chip_key=chip_key))
             row.in_chips_table = True
             if len(cells) >= 2 and cells[1]:
                 row.chip_type = cells[1]
             # PID is typically the last column in `TPU Chips`.
-            if len(cells) >= 4:
-                pid_cell = cells[-1]
+            pid_idx = col_map.get("pid", len(cells) - 1 if len(cells) >= 4 else -1)
+            if 0 <= pid_idx < len(cells):
+                pid_cell = cells[pid_idx]
+                for tok in re.findall(r"\b[0-9]+\b", pid_cell):
+                    pid = int(tok)
+                    if pid not in row.pids:
+                        row.pids.append(pid)
+        elif section == "process_monitor":
+            path_idx = col_map.get("path", 1)
+            pid_idx = col_map.get("pid", 2)
+            if path_idx >= len(cells):
+                continue
+            dev_path = cells[path_idx]
+            if not dev_path or dev_path.lower() in ("n/a", "none"):
+                continue
+            row = rows.setdefault(dev_path, _TpuInfoRow(chip_key=dev_path))
+            row.in_chips_table = True
+            if pid_idx < len(cells):
+                pid_cell = cells[pid_idx]
                 for tok in re.findall(r"\b[0-9]+\b", pid_cell):
                     pid = int(tok)
                     if pid not in row.pids:
@@ -308,6 +391,9 @@ def _run_tpu_info(
     elif not os.path.exists(resolved):
         return False, f"{resolved} does not exist", {}
 
+    run_env = dict(os.environ)
+    run_env.setdefault("COLUMNS", "240")
+    run_env.setdefault("NO_COLOR", "1")
     try:
         proc = subprocess.run(
             [resolved],
@@ -315,6 +401,7 @@ def _run_tpu_info(
             text=True,
             timeout=timeout_s,
             check=False,
+            env=run_env,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, str(exc), {}
@@ -325,6 +412,8 @@ def _run_tpu_info(
         return False, err_msg, {}
 
     parsed = parse_tpu_info_output(proc.stdout)
+    if not parsed:
+        return False, "no recognized tpu-info tables in output", {}
     return True, None, parsed
 
 
@@ -484,18 +573,18 @@ def collect_snapshot(
                 break
 
         if matched_util is not None:
-            dev.telemetry_source = "tpu-info"
+            if (
+                matched_util.hbm_used_bytes is not None
+                or matched_util.hbm_total_bytes is not None
+                or matched_util.duty_cycle_percent is not None
+            ):
+                dev.telemetry_source = "tpu-info"
             if matched_util.hbm_used_bytes is not None:
                 dev.hbm_used_bytes = matched_util.hbm_used_bytes
             if matched_util.hbm_total_bytes is not None:
                 dev.hbm_total_bytes = matched_util.hbm_total_bytes
             if matched_util.duty_cycle_percent is not None:
                 dev.duty_cycle_percent = matched_util.duty_cycle_percent
-        elif tpu_info_ok and not util_rows:
-            # tpu-info ran cleanly and reported zero active runtime allocations.
-            dev.telemetry_source = "tpu-info"
-            dev.hbm_used_bytes = 0
-            dev.duty_cycle_percent = 0.0
 
         # If tpu-info provided the verified chip row, PIDs are authoritative even when
         # unprivileged /proc/<pid>/fd cannot inspect other processes' FDs.
@@ -516,6 +605,11 @@ def collect_snapshot(
             duty_cycle_percent=row.duty_cycle_percent,
         )
         for key, row in util_rows.items()
+        if (
+            row.hbm_used_bytes is not None
+            or row.hbm_total_bytes is not None
+            or row.duty_cycle_percent is not None
+        )
     ]
 
     elapsed = time.monotonic() - t0
@@ -666,7 +760,7 @@ def format_prometheus_metrics(snapshot: ExporterSnapshot) -> str:
     )
     add_metric(
         "freetpu_tpu_health_status",
-        "TPU chip readiness (1 = vfio-pci bound and VFIO nodes present; idle chips stay ready).",
+        "VFIO TPU chip readiness on VFIO-backed hosts (1 = vfio-pci bound and /dev/vfio nodes present; idle chips stay ready; 0 on non-VFIO /dev/accel* hosts).",
         "gauge",
         health_samples,
     )

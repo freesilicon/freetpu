@@ -1,12 +1,18 @@
-# FreeTPU Node DaemonSet:
+# FreeTPU Node DaemonSet (VFIO-backed GKE Cloud TPU nodes: v5e, v5p, v6e Trillium):
 # Prerequisite (create the required ConfigMap in kube-system first):
 #   kubectl -n kube-system create configmap freetpu-ops-scripts \
 #     --from-file=ops/tpu-cdi/freetpu_cdi.py \
 #     --from-file=ops/tpu-exporter/tpu_exporter.py \
 #     --dry-run=client -o yaml | kubectl apply -f -
 #
+# Targets VFIO-backed GKE TPU node pools (`tpu-v5-lite-device`,
+# `tpu-v5-lite-podslice`, `tpu-v5p-slice`, `tpu-v6e-slice`); excludes legacy
+# `/dev/accel*` v4 node pools (`tpu-v4-podslice`). Adjust `nodeAffinity` if your
+# cluster uses custom TPU node labels.
+#
 # 1. initContainer runs `freetpu_cdi.py generate` to populate /var/run/cdi/freetpu.json
-#    on every Cloud TPU node so containerd/CRI-O exposes freetpu.dev/tpu=... CDI targets.
+#    on every VFIO-backed Cloud TPU node so containerd/CRI-O exposes freetpu.dev/tpu=...
+#    CDI targets.
 # 2. main container runs `tpu_exporter.py --host 0.0.0.0 --port 9400` with SYS_PTRACE
 #    (required for /proc/<pid>/fd telemetry across hostPID containers/IPC_LOCK pods)
 #    to serve Prometheus /metrics.
@@ -32,8 +38,18 @@ spec:
         prometheus.io/path: "/metrics"
     spec:
       hostPID: true
-      nodeSelector:
-        cloud.google.com/gke-tpu-accelerator: tpu-v5-lite-podslice
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: cloud.google.com/gke-tpu-accelerator
+                    operator: In
+                    values:
+                      - tpu-v5-lite-device
+                      - tpu-v5-lite-podslice
+                      - tpu-v5p-slice
+                      - tpu-v6e-slice
       tolerations:
         - key: google.com/tpu
           operator: Exists

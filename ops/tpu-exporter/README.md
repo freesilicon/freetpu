@@ -1,14 +1,15 @@
 # `tpu-exporter` — Prometheus Telemetry for Cloud TPUs
 
-`tpu_exporter.py` is a zero-dependency Python 3 Prometheus exporter (analogous to NVIDIA `dcgm-exporter`) for Google Cloud TPU VMs (`v4`, `v5e`, `v5p`, `v6e` Trillium).
+`tpu_exporter.py` is a zero-dependency Python 3 Prometheus exporter (analogous to NVIDIA `dcgm-exporter`) for VFIO-backed Google Cloud TPU VMs (`v5e`, `v5p`, `v6e` Trillium). Legacy `/dev/accel*` Cloud TPU hosts (`v2`, `v3`, `v4` using Google's `accel` driver) are recognized in PCI inventory (`freetpu_tpu_info`), while VFIO readiness (`freetpu_tpu_health_status`) and `/dev/vfio/*` PID scanning apply to VFIO-backed hosts.
 
 ## What It Discovers & Exports
 
 1. **PCI & VFIO Topology (`/sys/bus/pci/devices/*` + `/dev/vfio/*`)**
    - Filters Google PCI vendor `0x1ae0` and maps known TPU device IDs (`0x0027`, `0x0056`, `0x005e`, `0x0062`, `0x0063`, `0x006e`, `0x006f`).
-   - Resolves IOMMU group, bound kernel driver (`vfio-pci`), `/dev/vfio/<group>` node, and `/dev/vfio/vfio` container readiness.
+   - Resolves IOMMU group, bound kernel driver (`vfio-pci`), `/dev/vfio/<group>` node, and `/dev/vfio/vfio` container readiness on VFIO-backed hosts.
 2. **Runtime Telemetry (`tpu-info` + `/proc/*/fd` fallback)**
-   - Scrapes HBM used/total bytes, MXU duty cycle `%`, active PIDs, and chip health status (`freetpu_tpu_health_status`).
+   - Parses both modern `tpu-info` dashboard (`TPU Device Status`, `TPU Process Monitor`) and classic (`TPU Chips`, `TPU Runtime Utilization`) tables for HBM used/total bytes, MXU/TensorCore duty cycle `%`, and active PIDs.
+   - Leaves utilization metrics unset when `tpu-info` reports `N/A` or unrecognized output (never fabricates zero utilization).
    - Falls back cleanly to sysfs + `/proc/<pid>/fd` VFIO handle scanning when `tpu-info` is unavailable.
 
 ## Usage
