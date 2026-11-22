@@ -2624,19 +2624,37 @@ void w8a16_pt_epilogue_f32(float* c_row,
                            uint32_t tn,
                            float prescale_inv,
                            bool store_first) {
+  if (prescale_inv != 1.0f) {
+    // Use FP64 intermediate so prescale_inv * sb_ptr[ni] never overflows FP32 when
+    // the combined output y_raw[ni] * prescale_inv * sb_ptr[ni] is finite.
+    const double d_ps = static_cast<double>(prescale_inv);
+    if (store_first) {
+      for (uint32_t ni = 0u; ni < tn; ++ni) {
+        c_row[ni] = static_cast<float>(
+            static_cast<double>(y_raw[ni]) * (d_ps * static_cast<double>(sb_ptr[ni])));
+      }
+    } else {
+      for (uint32_t ni = 0u; ni < tn; ++ni) {
+        c_row[ni] = static_cast<float>(
+            static_cast<double>(c_row[ni]) +
+            static_cast<double>(y_raw[ni]) * (d_ps * static_cast<double>(sb_ptr[ni])));
+      }
+    }
+    return;
+  }
+
   uint32_t ni = 0u;
 #if defined(__ARM_NEON) && defined(__aarch64__)
-  const float32x4_t v_ps = vdupq_n_f32(prescale_inv);
   if (store_first) {
     for (; ni + 16u <= tn; ni += 16u) {
       float32x4_t y0 = vld1q_f32(y_raw + ni);
       float32x4_t y1 = vld1q_f32(y_raw + ni + 4u);
       float32x4_t y2 = vld1q_f32(y_raw + ni + 8u);
       float32x4_t y3 = vld1q_f32(y_raw + ni + 12u);
-      float32x4_t s0 = vmulq_f32(v_ps, vld1q_f32(sb_ptr + ni));
-      float32x4_t s1 = vmulq_f32(v_ps, vld1q_f32(sb_ptr + ni + 4u));
-      float32x4_t s2 = vmulq_f32(v_ps, vld1q_f32(sb_ptr + ni + 8u));
-      float32x4_t s3 = vmulq_f32(v_ps, vld1q_f32(sb_ptr + ni + 12u));
+      float32x4_t s0 = vld1q_f32(sb_ptr + ni);
+      float32x4_t s1 = vld1q_f32(sb_ptr + ni + 4u);
+      float32x4_t s2 = vld1q_f32(sb_ptr + ni + 8u);
+      float32x4_t s3 = vld1q_f32(sb_ptr + ni + 12u);
       vst1q_f32(c_row + ni,       vmulq_f32(y0, s0));
       vst1q_f32(c_row + ni + 4u,  vmulq_f32(y1, s1));
       vst1q_f32(c_row + ni + 8u,  vmulq_f32(y2, s2));
@@ -2648,10 +2666,10 @@ void w8a16_pt_epilogue_f32(float* c_row,
       float32x4_t y1 = vld1q_f32(y_raw + ni + 4u);
       float32x4_t y2 = vld1q_f32(y_raw + ni + 8u);
       float32x4_t y3 = vld1q_f32(y_raw + ni + 12u);
-      float32x4_t s0 = vmulq_f32(v_ps, vld1q_f32(sb_ptr + ni));
-      float32x4_t s1 = vmulq_f32(v_ps, vld1q_f32(sb_ptr + ni + 4u));
-      float32x4_t s2 = vmulq_f32(v_ps, vld1q_f32(sb_ptr + ni + 8u));
-      float32x4_t s3 = vmulq_f32(v_ps, vld1q_f32(sb_ptr + ni + 12u));
+      float32x4_t s0 = vld1q_f32(sb_ptr + ni);
+      float32x4_t s1 = vld1q_f32(sb_ptr + ni + 4u);
+      float32x4_t s2 = vld1q_f32(sb_ptr + ni + 8u);
+      float32x4_t s3 = vld1q_f32(sb_ptr + ni + 12u);
       vst1q_f32(c_row + ni,       vfmaq_f32(vld1q_f32(c_row + ni),       y0, s0));
       vst1q_f32(c_row + ni + 4u,  vfmaq_f32(vld1q_f32(c_row + ni + 4u),  y1, s1));
       vst1q_f32(c_row + ni + 8u,  vfmaq_f32(vld1q_f32(c_row + ni + 8u),  y2, s2));
@@ -2660,9 +2678,9 @@ void w8a16_pt_epilogue_f32(float* c_row,
   }
 #endif
   if (store_first) {
-    for (; ni < tn; ++ni) c_row[ni] = y_raw[ni] * (prescale_inv * sb_ptr[ni]);
+    for (; ni < tn; ++ni) c_row[ni] = y_raw[ni] * sb_ptr[ni];
   } else {
-    for (; ni < tn; ++ni) c_row[ni] += y_raw[ni] * (prescale_inv * sb_ptr[ni]);
+    for (; ni < tn; ++ni) c_row[ni] += y_raw[ni] * sb_ptr[ni];
   }
 }
 

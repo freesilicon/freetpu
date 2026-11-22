@@ -5323,6 +5323,19 @@ void test_phase8b_spsc_async_dequant_and_w8a16_pt() {
                 ctx, a_r.data(), w_r.data(), sb_r.data(), K_r, N_r, out_r.data(), &rstats) == OB_OK);
       CHECK(std::isfinite(out_r[0]) && std::fabs(out_r[0] - 12.0f) < 1e-2f);
 
+      // Epilogue scale product overflow guard: prescale_inv=2^114 * sb=2^14 would overflow FP32,
+      // while y_raw=2^-6 yields finite 2^122.
+      a_r.assign(K_r, 0.0f);
+      w_r.assign(static_cast<size_t>(N_r) * K_r, 0);
+      a_r[0] = std::ldexp(1.0f, 127);
+      a_r[1] = std::ldexp(1.0f, 108);
+      w_r[1] = 1;
+      sb_r.assign(N_r, std::ldexp(1.0f, 14));
+      CHECK(ob_gemm_matmul_f32_w8a16_tile(
+                ctx, a_r.data(), w_r.data(), sb_r.data(), K_r, N_r, out_r.data(), &rstats) == OB_OK);
+      CHECK(std::isfinite(out_r[0]) && out_r[0] == std::ldexp(1.0f, 122));
+      CHECK(std::isfinite(out_r[1]) && out_r[1] == 0.0f);
+
       // Large finite activation energy (>= 1e20f) must preserve FP64 sum-of-squares and outlier peeling.
       std::vector<float> a_big(256u, 1e18f);
       a_big[7u] = 2e20f;
