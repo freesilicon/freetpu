@@ -22,6 +22,23 @@ DEFAULT_MAX_CONCURRENT_CONNECTIONS = 128
 DEFAULT_MAX_SSE_PRE_COMMIT_BYTES = 1024 * 1024
 
 
+def _require_bool(
+    raw: Mapping[str, Any],
+    key: str,
+    default: bool,
+    *,
+    context: str,
+) -> bool:
+    if key not in raw:
+        return default
+    val = raw[key]
+    if not isinstance(val, bool):
+        raise ValueError(
+            f"{context} field {key!r} must be a JSON boolean (true/false), got {val!r}"
+        )
+    return val
+
+
 def is_loopback_host(host: str) -> bool:
     """Return True if `host` is a loopback hostname (`localhost`) or IP (`127.0.0.0/8`, `::1`)."""
     cleaned = host.strip().lower().rstrip(".")
@@ -99,6 +116,18 @@ class BackendConfig:
     def validate(self) -> None:
         if not self.id or not self.id.strip():
             raise ValueError("Backend 'id' must be non-empty")
+        for field_name in (
+            "local",
+            "spot",
+            "discover_models",
+            "allow_insecure_http",
+            "enabled",
+        ):
+            val = getattr(self, field_name)
+            if not isinstance(val, bool):
+                raise ValueError(
+                    f"Backend {self.id!r} field {field_name!r} must be a boolean, got {val!r}"
+                )
         self.base_url = validate_http_url(
             self.base_url, field_name=f"backend {self.id!r} base_url"
         ).rstrip("/")
@@ -116,7 +145,7 @@ class BackendConfig:
             has_credentials
             and parts.scheme.lower() == "http"
             and not is_loopback_host(parts.hostname or "")
-            and not self.allow_insecure_http
+            and self.allow_insecure_http is not True
         ):
             raise ValueError(
                 f"Backend {self.id!r} configures bearer credentials over plaintext HTTP "
@@ -150,8 +179,9 @@ class BackendConfig:
         if not base_url:
             raise ValueError(f"Backend {backend_id!r} requires a non-empty 'base_url'")
         btype = str(raw.get("type", "generic")).strip() or "generic"
+        ctx = f"Backend {backend_id!r}"
         if "local" in raw:
-            is_local = bool(raw["local"])
+            is_local = _require_bool(raw, "local", False, context=ctx)
         else:
             lowered = btype.lower()
             is_local = lowered.startswith(("pixel", "local", "mac", "edge"))
@@ -200,9 +230,9 @@ class BackendConfig:
             base_url=base_url,
             type=btype,
             local=is_local,
-            spot=bool(raw.get("spot", False)),
+            spot=_require_bool(raw, "spot", False, context=ctx),
             models=models,
-            discover_models=bool(raw.get("discover_models", True)),
+            discover_models=_require_bool(raw, "discover_models", True, context=ctx),
             cost_per_1m_prompt_usd=prompt_cost,
             cost_per_1m_completion_usd=completion_cost,
             priority=int(raw.get("priority", 100)),
@@ -223,9 +253,11 @@ class BackendConfig:
             api_key_env=(
                 str(raw["api_key_env"]).strip() if raw.get("api_key_env") else None
             ),
-            allow_insecure_http=bool(raw.get("allow_insecure_http", False)),
+            allow_insecure_http=_require_bool(
+                raw, "allow_insecure_http", False, context=ctx
+            ),
             latency_hint_ms=lat_hint_val,
-            enabled=bool(raw.get("enabled", True)),
+            enabled=_require_bool(raw, "enabled", True, context=ctx),
             metadata=dict(raw.get("metadata") or {}),
         )
 

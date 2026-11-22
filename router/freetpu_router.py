@@ -115,7 +115,7 @@ def _ensure_safe_credential_transport(
         api_key
         and scheme.lower() == "http"
         and not is_loopback_host(host)
-        and not backend.allow_insecure_http
+        and backend.allow_insecure_http is not True
     ):
         raise ValueError(
             f"Refusing to send bearer credentials for backend {backend.id!r} over "
@@ -336,11 +336,108 @@ def _extract_non_stream_usage(
     return prompt_tokens, completion_tokens
 
 
-def _sse_event_should_commit(payload_bytes: bytes) -> bool:
-    """Return True when a complete SSE data event carries output or a terminator.
+_NON_RETRYABLE_SSE_ERROR_TYPES = frozenset(
+    {
+        "invalid_request_error",
+        "bad_request_error",
+        "authentication_error",
+        "permission_error",
+        "not_found_error",
+        "unprocessable_entity_error",
+    }
+)
+_NON_RETRYABLE_SSE_ERROR_CODES = frozenset(
+    {
+        "context_length_exceeded",
+        "invalid_request_error",
+        "bad_request",
+        "model_not_found",
+        "invalid_api_key",
+    }
+)
 
-    Role-only / empty-delta chunks (e.g. `{"choices":[{"delta":{"role":"assistant"}}]}`)
-    are buffered so Spot preemption before the first generated token still fails over.
+
+def _classify_sse_error_event(
+    event_type: str,
+    payload_bytes: bytes,
+) -> Optional[Tuple[bool, int, bytes]]:
+    """Classify an upstream SSE error event before committing a 200 stream.
+
+    Returns `None` if the event is not an error event, otherwise returns
+    `(is_retryable, http_status, json_body_bytes)`.
+    """
+    is_event_err = event_type.strip().lower() == "error"
+    parsed: Any = None
+    if payload_bytes and payload_bytes != b"[DONE]":
+        try:
+            parsed = json.loads(payload_bytes.decode("utf-8", errors="replace"))
+        except json.JSONDecodeError:
+            parsed = None
+
+    has_err_obj = isinstance(parsed, Mapping) and (
+        parsed.get("error") is not None or parsed.get("object") == "error"
+    )
+    if not is_event_err and not has_err_obj:
+        return None
+
+    err_mapping: Mapping[str, Any] = {}
+    if isinstance(parsed, Mapping):
+        inner = parsed.get("error")
+        if isinstance(inner, Mapping):
+            err_mapping = inner
+        else:
+            err_mapping = parsed
+
+    raw_status: Optional[int] = None
+    for candidate_map in (err_mapping, parsed if isinstance(parsed, Mapping) else {}):
+        for key in ("status", "http_status", "status_code", "code"):
+            val = candidate_map.get(key)
+            if isinstance(val, int) and not isinstance(val, bool) and 400 <= val <= 599:
+                raw_status = val
+                break
+        if raw_status is not None:
+            break
+
+    err_type = str(err_mapping.get("type") or "").strip().lower()
+    err_code = str(err_mapping.get("code") or "").strip().lower()
+    is_client_error = (
+        (raw_status is not None and 400 <= raw_status < 500 and raw_status != 429)
+        or err_type in _NON_RETRYABLE_SSE_ERROR_TYPES
+        or err_code in _NON_RETRYABLE_SSE_ERROR_CODES
+    )
+
+    if is_client_error:
+        status_code = raw_status if (raw_status is not None and 400 <= raw_status < 500) else 400
+        is_retryable = False
+    else:
+        status_code = (
+            raw_status
+            if (raw_status is not None and (500 <= raw_status <= 599 or raw_status == 429))
+            else 502
+        )
+        is_retryable = True
+
+    if isinstance(parsed, Mapping) and parsed.get("error") is not None:
+        body = (json.dumps(parsed) + "\n").encode("utf-8")
+    elif isinstance(parsed, Mapping):
+        msg = str(parsed.get("message") or "Upstream SSE error")
+        body = _openai_error_body(
+            msg,
+            error_type=err_type or ("invalid_request_error" if is_client_error else "server_error"),
+            code=err_code or None,
+        )
+    else:
+        raw_msg = payload_bytes.decode("utf-8", errors="replace").strip() or "Upstream SSE error"
+        body = _openai_error_body(raw_msg, error_type="server_error", code="upstream_sse_error")
+
+    return is_retryable, status_code, body
+
+
+def _sse_event_should_commit(payload_bytes: bytes) -> bool:
+    """Return True when a complete non-error SSE data event carries output or a terminator.
+
+    Role-only, empty-delta, and prompt-progress chunks are buffered so Spot
+    preemption before the first generated token still fails over.
     """
     if not payload_bytes:
         return False
@@ -352,6 +449,8 @@ def _sse_event_should_commit(payload_bytes: bytes) -> bool:
         return True
     if not isinstance(obj, Mapping):
         return True
+    if obj.get("error") is not None or obj.get("object") == "error":
+        return False
     if _extract_choice_output_text(obj):
         return True
     choices = obj.get("choices")
@@ -359,10 +458,10 @@ def _sse_event_should_commit(payload_bytes: bytes) -> bool:
         for choice in choices:
             if isinstance(choice, Mapping) and choice.get("finish_reason") is not None:
                 return True
-        if not choices and (
-            isinstance(obj.get("usage"), Mapping) or obj.get("error") is not None
-        ):
+        if not choices and isinstance(obj.get("usage"), Mapping):
             return True
+        return False
+    if "prompt_progress" in obj:
         return False
     return True
 
@@ -1598,7 +1697,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                     continue
 
                 if stream and 200 <= resp.status < 300:
-                    completed = self._proxy_sse_stream(
+                    sse_outcome, sse_err_status, sse_err_body = self._proxy_sse_stream(
                         resp=resp,
                         upstream_sock=upstream_sock,
                         timeout_s=timeout_s,
@@ -1612,34 +1711,60 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         est_prompt_tokens=est_prompt_tokens,
                         principal=auth_ctx.principal,
                     )
-                    if completed:
+                    if sse_outcome == "committed":
                         return
-                    # Pre-first-token stream failure: fail over to next candidate.
-                    reason = "stream_aborted_before_first_token"
-                    last_error_status = 502
-                    last_error_msg = (
-                        f"Backend {backend.config.id!r} aborted stream before first token"
+                    if sse_outcome == "client_error":
+                        latency_ms = (time.monotonic() - req_start) * 1000.0
+                        attempt_ms = (time.monotonic() - attempt_start) * 1000.0
+                        non_stream_result = (
+                            sse_err_status,
+                            "application/json",
+                            sse_err_body
+                            or _openai_error_body(
+                                "Upstream rejected request",
+                                error_type="invalid_request_error",
+                            ),
+                            latency_ms,
+                            attempt_ms,
+                        )
+                    else:
+                        # Pre-first-token stream failure or retryable SSE error: fail over.
+                        if sse_outcome == "retryable_error":
+                            reason = "upstream_sse_error"
+                            last_error_status = sse_err_status
+                            last_error_msg = (
+                                f"Backend {backend.config.id!r} returned SSE error ({sse_err_status})"
+                            )
+                            last_error_type = "server_error"
+                            last_error_code = "upstream_sse_error"
+                            last_error_body = sse_err_body
+                            last_error_content_type = "application/json"
+                        else:
+                            reason = "stream_aborted_before_first_token"
+                            last_error_status = 502
+                            last_error_msg = (
+                                f"Backend {backend.config.id!r} aborted stream before first token"
+                            )
+                            last_error_type = "bad_gateway"
+                            last_error_code = "upstream_stream_error"
+                            last_error_body = None
+                            last_error_content_type = "application/json"
+                        engine.mark_backend_failed(backend, reason)
+                        prev_failure = (backend.config.id, reason)
+                        continue
+                else:
+                    # Non-streaming response (or non-retryable error status such as 4xx)
+                    raw_resp = resp.read()
+                    latency_ms = (time.monotonic() - req_start) * 1000.0
+                    attempt_ms = (time.monotonic() - attempt_start) * 1000.0
+                    content_type = resp.getheader("Content-Type") or "application/json"
+                    non_stream_result = (
+                        resp.status,
+                        content_type,
+                        raw_resp,
+                        latency_ms,
+                        attempt_ms,
                     )
-                    last_error_type = "bad_gateway"
-                    last_error_code = "upstream_stream_error"
-                    last_error_body = None
-                    last_error_content_type = "application/json"
-                    engine.mark_backend_failed(backend, reason)
-                    prev_failure = (backend.config.id, reason)
-                    continue
-
-                # Non-streaming response (or non-retryable error status such as 4xx)
-                raw_resp = resp.read()
-                latency_ms = (time.monotonic() - req_start) * 1000.0
-                attempt_ms = (time.monotonic() - attempt_start) * 1000.0
-                content_type = resp.getheader("Content-Type") or "application/json"
-                non_stream_result = (
-                    resp.status,
-                    content_type,
-                    raw_resp,
-                    latency_ms,
-                    attempt_ms,
-                )
             except (OSError, TimeoutError, http.client.HTTPException) as exc:
                 reason = "timeout" if isinstance(exc, TimeoutError) else "connection_error"
                 last_error_status = 504 if isinstance(exc, TimeoutError) else 502
@@ -1775,29 +1900,27 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         failovers: int,
         est_prompt_tokens: int,
         principal: str,
-    ) -> bool:
+    ) -> Tuple[str, int, Optional[bytes]]:
         """Buffer until first generated output or terminator before committing 200 OK.
 
         Uses incremental bounded reads via `_BoundedSSEReader` during pre-output
-        buffering so partial lines without newlines cannot exceed the byte cap or
-        stall past the elapsed deadline. Uses HTTP/1.1 chunked transfer encoding
-        for the committed SSE response so premature upstream disconnects omit the
-        terminating `0\\r\\n\\r\\n` chunk (in addition to emitting an SSE error event)
-        and are surfaced to HTTP clients as incomplete streams rather than clean
-        completions.
+        buffering (governed by byte and time limits, without an arbitrary event
+        count cap so prompt-progress streams succeed), classifies pre-commit SSE
+        error events so retryable backend errors fail over and client errors pass
+        through without marking success, and enforces a post-commit progress
+        deadline that ignores keepalive comments.
 
-        Returns True if headers/stream were committed to the downstream client,
-        or False if upstream closed or sent no qualifying output before commit.
+        Returns `(outcome, status_code, error_body)` where `outcome` is one of
+        `"committed"`, `"retryable_error"`, `"client_error"`, or `"aborted"`.
         """
         engine = self.server.engine
         sse_reader = _BoundedSSEReader(resp, upstream_sock)
         pre_commit_lines: List[bytes] = []
         pre_commit_bytes = 0
-        pre_commit_events = 0
         max_pre_commit_bytes = engine.config.max_sse_pre_commit_bytes
-        max_pre_commit_events = 64
         first_chunk_time: Optional[float] = None
         pending_event_data: List[bytes] = []
+        pending_event_type = ""
         pre_commit_deadline = attempt_start + timeout_s
 
         # Phase 1: upstream-only incremental read through HTTPResponse.read1().
@@ -1805,42 +1928,44 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         while True:
             remaining_bytes = max_pre_commit_bytes - pre_commit_bytes
             if remaining_bytes <= 0:
-                return False
+                return "aborted", 502, None
             line, exceeded_cap = sse_reader.readline(
                 deadline=pre_commit_deadline,
                 max_bytes=remaining_bytes,
             )
             if exceeded_cap or not line:
                 # Byte cap exceeded or EOF before generated output/terminator -> retryable failure.
-                return False
+                return "aborted", 502, None
             pre_commit_bytes += len(line)
             pre_commit_lines.append(line)
             if line in (b"\n", b"\r\n", b"\r"):
                 if pending_event_data:
-                    pre_commit_events += 1
                     payload_bytes = b"\n".join(pending_event_data).strip()
+                    ev_type = pending_event_type
                     pending_event_data.clear()
+                    pending_event_type = ""
+                    err_info = _classify_sse_error_event(ev_type, payload_bytes)
+                    if err_info is not None:
+                        is_retryable, err_status, err_body = err_info
+                        if is_retryable:
+                            return "retryable_error", err_status, err_body
+                        return "client_error", err_status, err_body
                     if _sse_event_should_commit(payload_bytes):
                         first_chunk_time = time.monotonic()
                         break
-                    if pre_commit_events >= max_pre_commit_events:
-                        return False
+                else:
+                    pending_event_type = ""
                 continue
             content_line = line.rstrip(b"\r\n")
             if content_line.startswith(b":"):
                 continue
-            if content_line.startswith(b"data:"):
+            if content_line.startswith(b"event:"):
+                pending_event_type = content_line[6:].strip().decode("utf-8", errors="replace")
+            elif content_line.startswith(b"data:"):
                 data_val = content_line[5:]
                 if data_val.startswith(b" "):
                     data_val = data_val[1:]
                 pending_event_data.append(data_val)
-
-        # Restore per-read upstream socket timeout for post-commit streaming.
-        if upstream_sock is not None:
-            try:
-                upstream_sock.settimeout(timeout_s)
-            except OSError:
-                pass
 
         # Phase 2: upstream delivered output or valid terminator -> commit chunked response.
         # Downstream write errors from here on must never trigger backend failover.
@@ -1853,36 +1978,52 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         est_completion_chars = 0
         saw_explicit_prompt_usage = False
         saw_explicit_completion_usage = False
+        saw_timings_completion = False
         saw_done_sentinel = False
+        saw_upstream_error_event = False
         finished_choice_indices: set[int] = set()
         upstream_read_error = False
         downstream_write_error = False
         event_data_lines: List[bytes] = []
+        current_event_type = ""
         required_choices = max(1, expected_choices)
 
-        def process_sse_event() -> None:
+        def process_sse_event() -> bool:
+            """Process one complete blank-line-terminated SSE event.
+
+            Returns True if the event represents meaningful generation progress
+            (resets the post-commit stall deadline).
+            """
             nonlocal first_content_ttft_ms, prompt_tokens, completion_tokens
             nonlocal est_completion_chars, saw_explicit_prompt_usage
-            nonlocal saw_explicit_completion_usage, saw_done_sentinel
+            nonlocal saw_explicit_completion_usage, saw_timings_completion
+            nonlocal saw_done_sentinel, saw_upstream_error_event, current_event_type
+            ev_type = current_event_type
+            current_event_type = ""
             if not event_data_lines:
-                return
+                return False
             payload_bytes = b"\n".join(event_data_lines).strip()
             event_data_lines.clear()
             if not payload_bytes:
-                return
+                return False
             if payload_bytes == b"[DONE]":
                 saw_done_sentinel = True
-                return
+                return True
+            if _classify_sse_error_event(ev_type, payload_bytes) is not None:
+                saw_upstream_error_event = True
+                return False
             try:
                 obj = json.loads(payload_bytes.decode("utf-8", errors="replace"))
             except json.JSONDecodeError:
-                return
+                return True
             if not isinstance(obj, Mapping):
-                return
+                return True
+            made_progress = False
             choices = obj.get("choices")
             if isinstance(choices, list):
                 for choice in choices:
                     if isinstance(choice, Mapping) and choice.get("finish_reason") is not None:
+                        made_progress = True
                         c_idx = choice.get("index")
                         if isinstance(c_idx, int) and not isinstance(c_idx, bool) and c_idx >= 0:
                             finished_choice_indices.add(c_idx)
@@ -1890,11 +2031,13 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                             finished_choice_indices.add(len(finished_choice_indices))
             output_txt = _extract_choice_output_text(obj)
             if output_txt:
+                made_progress = True
                 if first_content_ttft_ms is None:
                     first_content_ttft_ms = (time.monotonic() - req_start) * 1000.0
                 est_completion_chars += len(output_txt)
             usage = obj.get("usage")
             if isinstance(usage, Mapping):
+                made_progress = True
                 if usage.get("prompt_tokens") is not None:
                     prompt_tokens = int(usage["prompt_tokens"])
                     saw_explicit_prompt_usage = True
@@ -1905,24 +2048,26 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             if isinstance(timings, Mapping):
                 if not saw_explicit_prompt_usage and timings.get("prompt_n") is not None:
                     prompt_tokens = int(timings["prompt_n"])
-                    saw_explicit_prompt_usage = True
-                if (
-                    not saw_explicit_completion_usage
-                    and timings.get("predicted_n") is not None
-                ):
+                if not saw_explicit_completion_usage and timings.get("predicted_n") is not None:
                     completion_tokens = int(timings["predicted_n"])
-                    saw_explicit_completion_usage = True
+                    saw_timings_completion = True
+            return made_progress
 
-        def inspect_sse_line(raw_line: bytes) -> None:
+        def inspect_sse_line(raw_line: bytes) -> bool:
+            nonlocal current_event_type
             if raw_line in (b"\n", b"\r\n", b"\r"):
-                process_sse_event()
-                return
+                return process_sse_event()
             content_line = raw_line.rstrip(b"\r\n")
-            if content_line.startswith(b"data:"):
+            if content_line.startswith(b"event:"):
+                current_event_type = (
+                    content_line[6:].strip().decode("utf-8", errors="replace")
+                )
+            elif content_line.startswith(b"data:"):
                 data_val = content_line[5:]
                 if data_val.startswith(b" "):
                     data_val = data_val[1:]
                 event_data_lines.append(data_val)
+            return False
 
         def write_chunk(data: bytes) -> None:
             if not data:
@@ -1955,16 +2100,18 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             downstream_write_error = True
 
         if not downstream_write_error:
+            progress_deadline = time.monotonic() + timeout_s
             event_chunk_buf = bytearray()
             while True:
                 try:
-                    line, _ = sse_reader.readline()
+                    line, _ = sse_reader.readline(deadline=progress_deadline)
                 except (OSError, TimeoutError, http.client.HTTPException):
                     upstream_read_error = True
                     break
                 if not line:
                     break
-                inspect_sse_line(line)
+                if inspect_sse_line(line):
+                    progress_deadline = time.monotonic() + timeout_s
                 event_chunk_buf.extend(line)
                 if line in (b"\n", b"\r\n", b"\r"):
                     try:
@@ -1975,23 +2122,24 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         break
                     event_chunk_buf.clear()
 
-            if event_chunk_buf and not downstream_write_error:
-                try:
-                    write_chunk(bytes(event_chunk_buf))
-                    self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    downstream_write_error = True
-
-        process_sse_event()
+        # Per WHATWG SSE spec, discard any incomplete (unterminated) event data at EOF
+        # rather than letting it satisfy completion checks.
         all_choices_finished = all(
             idx in finished_choice_indices for idx in range(required_choices)
         )
-        stream_completed = saw_done_sentinel or all_choices_finished
+        stream_completed = (
+            not saw_upstream_error_event
+            and (saw_done_sentinel or all_choices_finished)
+        )
         premature_upstream_end = (
             not downstream_write_error
             and (upstream_read_error or not stream_completed)
         )
-        if not saw_explicit_completion_usage and est_completion_chars > 0:
+        if (
+            not saw_explicit_completion_usage
+            and not saw_timings_completion
+            and est_completion_chars > 0
+        ):
             completion_tokens = max(1, (est_completion_chars + 3) // 4)
         total_ms = (time.monotonic() - req_start) * 1000.0
         attempt_ms = (time.monotonic() - attempt_start) * 1000.0
@@ -2040,7 +2188,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError, OSError):
                 downstream_write_error = True
 
-        return True
+        return "committed", recorded_status, None
 
 
 def create_router_server(

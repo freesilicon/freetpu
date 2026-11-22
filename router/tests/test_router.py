@@ -67,6 +67,7 @@ class _MockOpenAIBackend(ThreadingHTTPServer):
         stalled_error_body: bool = False,
         stalled_error_release_event: Optional[threading.Event] = None,
         newline_free_trickle_interval_s: Optional[float] = None,
+        post_token_keepalive_interval_s: Optional[float] = None,
         prompt_tokens: int = 12,
         completion_tokens: int = 8,
     ) -> None:
@@ -83,6 +84,7 @@ class _MockOpenAIBackend(ThreadingHTTPServer):
         self.stalled_error_body = stalled_error_body
         self.stalled_error_release_event = stalled_error_release_event
         self.newline_free_trickle_interval_s = newline_free_trickle_interval_s
+        self.post_token_keepalive_interval_s = post_token_keepalive_interval_s
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
         self.requests_seen: List[Dict[str, Any]] = []
@@ -235,6 +237,28 @@ class _MockOpenAIHandler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "close")
             self.end_headers()
+            if self.server.post_token_keepalive_interval_s is not None:
+                first_tok = json.dumps(
+                    {
+                        "id": "chatcmpl-stall",
+                        "object": "chat.completion.chunk",
+                        "model": model,
+                        "choices": [
+                            {"index": 0, "delta": {"content": "Hello "}, "finish_reason": None}
+                        ],
+                    }
+                )
+                deadline = time.monotonic() + 3.0
+                try:
+                    self.wfile.write(f"data: {first_tok}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+                    while time.monotonic() < deadline:
+                        self.wfile.write(b": keep-alive\n\n")
+                        self.wfile.flush()
+                        time.sleep(self.server.post_token_keepalive_interval_s)
+                except OSError:
+                    pass
+                return
             if self.server.newline_free_trickle_interval_s is not None:
                 deadline = time.monotonic() + 3.0
                 try:
@@ -2917,6 +2941,436 @@ class TestFreeTPURouter(unittest.TestCase):
             base_url="http://10.0.0.5:8081/v1",
         )
         self.assertIsNone(unauth_remote.api_key)
+
+    def test_non_boolean_backend_flags_rejected(self) -> None:
+        # Quoted "false" in JSON must NOT coerce via bool("false") == True.
+        with self.assertRaises(ValueError):
+            BackendConfig.from_dict(
+                {
+                    "id": "quoted-optout",
+                    "base_url": "http://10.0.0.5:8081/v1",
+                    "api_key": "secret",
+                    "allow_insecure_http": "false",
+                }
+            )
+        for flag_name, bad_val in (
+            ("allow_insecure_http", "true"),
+            ("allow_insecure_http", 1),
+            ("enabled", "false"),
+            ("spot", "false"),
+            ("local", "true"),
+            ("discover_models", "false"),
+        ):
+            with self.assertRaises(ValueError):
+                BackendConfig.from_dict(
+                    {
+                        "id": f"bad-{flag_name}",
+                        "base_url": "http://127.0.0.1:8081/v1",
+                        flag_name: bad_val,
+                    }
+                )
+
+        # Direct Python instantiation with non-bool must also fail closed.
+        with self.assertRaises(ValueError):
+            BackendConfig(
+                id="direct-bad-bool",
+                base_url="http://10.0.0.5:8081/v1",
+                api_key="secret",
+                allow_insecure_http="false",  # type: ignore[arg-type]
+            )
+
+        bad_cfg_path = Path(self._tmpdir.name) / "quoted_insecure_http.json"
+        bad_cfg_path.write_text(
+            json.dumps(
+                {
+                    "backends": [
+                        {
+                            "id": "remote-tpu",
+                            "base_url": "http://10.0.0.5:8081/v1",
+                            "api_key": "secret",
+                            "allow_insecure_http": "false",
+                            "models": ["m1"],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        stderr_buf = io.StringIO()
+        with redirect_stderr(stderr_buf):
+            rc = router_main(["--check-config", "--config", str(bad_cfg_path)])
+        self.assertNotEqual(rc, 0)
+        self.assertIn("JSON boolean", stderr_buf.getvalue())
+
+    def test_pre_commit_sse_error_event_classification_and_failover(self) -> None:
+        primary = self._track(_MockOpenAIBackend("vllm-primary", ["m-sse-err"]))
+        backup = self._track(_MockOpenAIBackend("vllm-backup", ["m-sse-err"]))
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="cheapest",
+            failure_cooldown_s=30.0,
+            backends=[
+                BackendConfig(
+                    id="vllm-primary",
+                    type="cloud-tpu-v5e",
+                    spot=True,
+                    base_url=primary.base_url,
+                    cost_per_1m_prompt_usd=0.10,
+                    cost_per_1m_completion_usd=0.10,
+                ),
+                BackendConfig(
+                    id="vllm-backup",
+                    type="cloud-tpu-v6e",
+                    base_url=backup.base_url,
+                    cost_per_1m_prompt_usd=0.50,
+                    cost_per_1m_completion_usd=0.50,
+                ),
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        # 1. Retryable 500 error inside HTTP 200 SSE stream -> fails over to healthy backup.
+        server_err = json.dumps(
+            {
+                "error": {
+                    "message": "vLLM worker internal generation error",
+                    "type": "server_error",
+                    "code": 500,
+                }
+            }
+        )
+        primary.raw_sse_bytes = f"data: {server_err}\n\ndata: [DONE]\n\n".encode("utf-8")
+
+        status, hdrs, body = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-sse-err",
+                "stream": True,
+                "messages": [{"role": "user", "content": "failover on 500 sse"}],
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(hdrs["x-freetpu-backend"], "vllm-backup")
+        self.assertEqual(hdrs["x-freetpu-failovers"], "1")
+        self.assertIn("vllm-backup", body.decode("utf-8"))
+
+        # 2. Non-retryable 400 client error inside HTTP 200 SSE stream -> passed through as 400
+        #    without failing over or cooling down primary.
+        router.engine._backends[0].cooldown_until_monotonic = 0.0
+        backup_before = len(backup.requests_seen)
+        client_err = json.dumps(
+            {
+                "error": {
+                    "message": "maximum context length exceeded",
+                    "type": "invalid_request_error",
+                    "code": 400,
+                }
+            }
+        )
+        primary.raw_sse_bytes = f"data: {client_err}\n\ndata: [DONE]\n\n".encode("utf-8")
+
+        status, hdrs, body = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-sse-err",
+                "stream": True,
+                "messages": [{"role": "user", "content": "too long"}],
+            },
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(hdrs["x-freetpu-backend"], "vllm-primary")
+        self.assertEqual(hdrs["x-freetpu-failovers"], "0")
+        self.assertIn("context length exceeded", body.decode("utf-8"))
+        self.assertEqual(len(backup.requests_seen), backup_before)
+        self.assertEqual(router.engine._backends[0].cooldown_until_monotonic, 0.0)
+
+    def test_committed_stream_expires_on_post_token_keepalive_stall(self) -> None:
+        stalling = self._track(
+            _MockOpenAIBackend(
+                "stalling-after-tok1",
+                ["m-poststall"],
+                post_token_keepalive_interval_s=0.05,
+            )
+        )
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            backends=[
+                BackendConfig(
+                    id="stalling-after-tok1",
+                    type="cloud-tpu-v5e",
+                    base_url=stalling.base_url,
+                    timeout_s=0.30,
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        t0 = time.monotonic()
+        conn = http.client.HTTPConnection("127.0.0.1", rport, timeout=3.0)
+        try:
+            body_bytes = json.dumps(
+                {
+                    "model": "m-poststall",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "stall after tok1"}],
+                }
+            ).encode("utf-8")
+            conn.request(
+                "POST",
+                "/v1/chat/completions",
+                body=body_bytes,
+                headers={"Content-Type": "application/json"},
+            )
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)
+            with self.assertRaises(http.client.IncompleteRead) as ctx:
+                resp.read()
+            self.assertIn(b"Hello ", ctx.exception.partial)
+            self.assertIn(b"upstream_stream_interrupted", ctx.exception.partial)
+        finally:
+            conn.close()
+        elapsed = time.monotonic() - t0
+
+        self.assertLess(elapsed, 1.5)
+        time.sleep(0.05)
+        self.assertEqual(router.engine._backends[0].inflight, 0)
+        _, _, metrics_raw = _http_request(rport, "GET", "/metrics")
+        self.assertIn(
+            'freetpu_router_requests_total{model="m-poststall",backend_id="stalling-after-tok1",status="502"} 1',
+            metrics_raw.decode("utf-8"),
+        )
+
+    def test_streamed_timings_per_token_records_latest_cumulative_count(self) -> None:
+        timings_chunks = [
+            {
+                "id": "chatcmpl-timings",
+                "object": "chat.completion.chunk",
+                "model": "m-timings",
+                "choices": [{"index": 0, "delta": {"content": "one "}, "finish_reason": None}],
+                "timings": {"prompt_n": 30, "predicted_n": 1},
+            },
+            {
+                "id": "chatcmpl-timings",
+                "object": "chat.completion.chunk",
+                "model": "m-timings",
+                "choices": [{"index": 0, "delta": {"content": "two "}, "finish_reason": None}],
+                "timings": {"prompt_n": 30, "predicted_n": 2},
+            },
+            {
+                "id": "chatcmpl-timings",
+                "object": "chat.completion.chunk",
+                "model": "m-timings",
+                "choices": [{"index": 0, "delta": {"content": "three"}, "finish_reason": "stop"}],
+                "timings": {"prompt_n": 30, "predicted_n": 12},
+            },
+        ]
+        worker = self._track(
+            _MockOpenAIBackend("llama-timings", ["m-timings"], custom_sse_chunks=timings_chunks)
+        )
+        captured: List[UsageEvent] = []
+        usage_hook = JsonlUsageMeterHook(
+            Path(self._tmpdir.name) / "timings.jsonl", callback=captured.append
+        )
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            backends=[
+                BackendConfig(
+                    id="llama-timings",
+                    type="cloud-tpu-v5e",
+                    base_url=worker.base_url,
+                    cost_per_1m_prompt_usd=1.0,
+                    cost_per_1m_completion_usd=2.0,
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg, usage_hook=usage_hook))
+        rport = router.server_address[1]
+
+        status, _, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-timings",
+                "stream": True,
+                "messages": [{"role": "user", "content": "timings per token"}],
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0].prompt_tokens, 30)
+        self.assertEqual(captured[0].completion_tokens, 12)
+        # Cost: 30 * 1.0 / 1e6 + 12 * 2.0 / 1e6 = 0.000054
+        self.assertAlmostEqual(captured[0].estimated_cost_usd, 0.000054, places=8)
+
+        # Explicit OpenAI usage chunk overrides earlier timings and is not overwritten later.
+        worker.custom_sse_chunks = timings_chunks + [
+            {
+                "id": "chatcmpl-timings",
+                "object": "chat.completion.chunk",
+                "model": "m-timings",
+                "choices": [],
+                "usage": {"prompt_tokens": 30, "completion_tokens": 15},
+            }
+        ]
+        status, _, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-timings",
+                "stream": True,
+                "messages": [{"role": "user", "content": "usage beats timings"}],
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(len(captured), 2)
+        self.assertEqual(captured[1].completion_tokens, 15)
+
+    def test_long_prompt_progress_stream_beyond_64_events_succeeds(self) -> None:
+        primary = self._track(_MockOpenAIBackend("llama-progress", ["m-prog"]))
+        backup = self._track(_MockOpenAIBackend("paid-backup", ["m-prog"]))
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            backends=[
+                BackendConfig(
+                    id="llama-progress",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=primary.base_url,
+                ),
+                BackendConfig(
+                    id="paid-backup",
+                    type="cloud-tpu-v6e",
+                    local=False,
+                    base_url=backup.base_url,
+                    cost_per_1m_prompt_usd=1.0,
+                    cost_per_1m_completion_usd=2.0,
+                ),
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        # Emit 80 prompt_progress events (> old 64-event cap) before the first token.
+        parts = [
+            f'data: {json.dumps({"prompt_progress": {"total": 80, "processed": i}, "choices": []})}\n\n'
+            for i in range(1, 81)
+        ]
+        final_chunk = json.dumps(
+            {
+                "id": "chatcmpl-prog",
+                "object": "chat.completion.chunk",
+                "model": "m-prog",
+                "choices": [{"index": 0, "delta": {"content": "done-after-80"}, "finish_reason": "stop"}],
+            }
+        )
+        parts.append(f"data: {final_chunk}\n\n")
+        parts.append("data: [DONE]\n\n")
+        primary.raw_sse_bytes = "".join(parts).encode("utf-8")
+
+        status, hdrs, body = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-prog",
+                "stream": True,
+                "messages": [{"role": "user", "content": "long prompt"}],
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(hdrs["x-freetpu-backend"], "llama-progress")
+        self.assertEqual(hdrs["x-freetpu-failovers"], "0")
+        self.assertIn("done-after-80", body.decode("utf-8"))
+        self.assertEqual(len(backup.requests_seen), 0)
+        self.assertEqual(router.engine._backends[0].cooldown_until_monotonic, 0.0)
+
+    def test_unterminated_final_sse_event_discarded_and_flagged_truncated(self) -> None:
+        spot = self._track(_MockOpenAIBackend("spot-no-blank-eof", ["m-unterm"]))
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            failure_cooldown_s=30.0,
+            backends=[
+                BackendConfig(
+                    id="spot-no-blank-eof",
+                    type="cloud-tpu-v5e",
+                    spot=True,
+                    base_url=spot.base_url,
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        ev1 = json.dumps(
+            {
+                "id": "chatcmpl-unterm",
+                "object": "chat.completion.chunk",
+                "model": "m-unterm",
+                "choices": [{"index": 0, "delta": {"content": "Hello "}, "finish_reason": None}],
+            }
+        )
+        ev2_unterminated = json.dumps(
+            {
+                "id": "chatcmpl-unterm",
+                "object": "chat.completion.chunk",
+                "model": "m-unterm",
+                "choices": [{"index": 0, "delta": {"content": "world"}, "finish_reason": "stop"}],
+            }
+        )
+        # Note ONLY ONE trailing '\n' on ev2 (missing SSE terminating blank line '\n\n')!
+        spot.raw_sse_bytes = f"data: {ev1}\n\ndata: {ev2_unterminated}\n".encode("utf-8")
+
+        conn = http.client.HTTPConnection("127.0.0.1", rport, timeout=5.0)
+        try:
+            body_bytes = json.dumps(
+                {
+                    "model": "m-unterm",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "missing blank line at eof"}],
+                }
+            ).encode("utf-8")
+            conn.request(
+                "POST",
+                "/v1/chat/completions",
+                body=body_bytes,
+                headers={"Content-Type": "application/json"},
+            )
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)
+            with self.assertRaises(http.client.IncompleteRead) as ctx:
+                resp.read()
+            self.assertIn(b"Hello ", ctx.exception.partial)
+            self.assertIn(b"upstream_stream_interrupted", ctx.exception.partial)
+        finally:
+            conn.close()
+
+        _, _, metrics_raw = _http_request(rport, "GET", "/metrics")
+        metrics_txt = metrics_raw.decode("utf-8")
+        self.assertIn(
+            'freetpu_router_requests_total{model="m-unterm",backend_id="spot-no-blank-eof",status="502"} 1',
+            metrics_txt,
+        )
+        self.assertNotIn(
+            'freetpu_router_requests_total{model="m-unterm",backend_id="spot-no-blank-eof",status="200"}',
+            metrics_txt,
+        )
 
 
 def run_self_tests(verbosity: int = 1) -> int:
