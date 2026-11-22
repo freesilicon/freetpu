@@ -1,0 +1,64 @@
+# Prometheus alerting rules for FreeTPU Cloud TPU fleets (ops/tpu-exporter/tpu_exporter.py).
+groups:
+  - name: freetpu-tpu-alerts
+    rules:
+      - alert: TpuHbmOOMWarning
+        expr: |
+          (
+            freetpu_tpu_hbm_utilization_ratio > 0.95
+          )
+          or
+          (
+            freetpu_tpu_runtime_hbm_used_bytes
+            / (freetpu_tpu_runtime_hbm_total_bytes > 0) > 0.95
+          )
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TPU HBM utilization above 95% on {{ $labels.node }} ({{ $labels.pci_bdf }})"
+          description: >-
+            TPU HBM usage exceeded 95% of capacity for 1 minute. Trigger dynamic
+            batch-size reduction, KV cache eviction, or re-sharding before OOM.
+
+      - alert: TpuMxuDutyCycleCollapse
+        expr: |
+          (
+            avg_over_time(freetpu_tpu_duty_cycle_percent[5m]) < 10
+          )
+          or
+          (
+            avg_over_time(freetpu_tpu_runtime_duty_cycle_percent[5m]) < 10
+          )
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "TPU MXU duty cycle collapsed (<10%) on {{ $labels.node }}"
+          description: >-
+            TensorCore / MXU duty cycle remained below 10% over 5 minutes while
+            runtime telemetry is active. Investigate input-pipeline stalls or
+            ICI collective barriers.
+
+      - alert: TpuPcieAerFault
+        expr: increase(freetpu_pcie_aer_fatal_total[1m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Fatal PCIe AER fault detected on {{ $labels.node }} ({{ $labels.pci_bdf }})"
+          description: >-
+            Unrecoverable PCIe Advanced Error Reporting (AER) fatal error count
+            increased on TPU device {{ $labels.pci_bdf }}. Cordon the node and
+            run hardware diagnostics / reboot.
+
+      - alert: GcpSpotPreemption
+        expr: gcp_metadata_preempted_status == 1
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "GCP Spot preemption notice active on {{ $labels.node }}"
+          description: >-
+            GCP instance metadata reported preempted=TRUE. Trigger asynchronous
+            checkpointing (e.g. Orbax) immediately before VM termination.

@@ -1910,6 +1910,344 @@ TPU Runtime Utilization
                 srv.shutdown()
                 srv.server_close()
 
+    def test_direct_grpc_runtime_metric_service_no_subprocess_and_graceful_fallback(self) -> None:
+        from types import SimpleNamespace
+        import tpu_exporter as _te
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sysfs_root, dev_root, proc_root = _make_mock_pci_tree(
+                root,
+                devices=[
+                    {
+                        "bdf": "0000:00:0b.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "3",
+                        "chip_id": "0",
+                    },
+                    {
+                        "bdf": "0000:00:0c.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0075",  # tpu7x (pending live HW confirmation #21)
+                        "driver": "vfio-pci",
+                        "iommu_group": "2",
+                        "chip_id": "1",
+                    },
+                ],
+                create_vfio_nodes=["3", "2"],
+            )
+
+            created_channels: list[str] = []
+            rpc_calls: list[tuple[str, float]] = []
+
+            class _FakeGrpc:
+                @staticmethod
+                def insecure_channel(addr: str):
+                    created_channels.append(addr)
+                    return SimpleNamespace(addr=addr)
+
+            class _FakeMetricRequest:
+                def __init__(self, metric_name: str):
+                    self.metric_name = metric_name
+
+            def _make_item(chip_id: int, *, as_int=None, as_double=None):
+                gauge = SimpleNamespace(as_int=as_int, as_double=as_double)
+                attr = SimpleNamespace(value=SimpleNamespace(int_value=chip_id, string_value=""))
+                return SimpleNamespace(attribute=attr, gauge=gauge)
+
+            class _FakeStub:
+                def __init__(self, channel):
+                    self.channel = channel
+
+                def GetRuntimeMetric(self, req, timeout=None):
+                    rpc_calls.append((req.metric_name, float(timeout or 0)))
+                    if req.metric_name == "tpu.runtime.hbm.memory.usage.bytes":
+                        items = [
+                            _make_item(0, as_int=16 * 1024**3),
+                            _make_item(1, as_int=64 * 1024**3),
+                        ]
+                    elif req.metric_name == "tpu.runtime.hbm.memory.total.bytes":
+                        items = [
+                            _make_item(0, as_int=32 * 1024**3),
+                            _make_item(1, as_int=192 * 1024**3),
+                        ]
+                    elif req.metric_name == "tpu.runtime.tensorcore.dutycycle.percent":
+                        items = [
+                            _make_item(0, as_double=72.5),
+                            _make_item(1, as_double=88.0),
+                        ]
+                    elif req.metric_name == "tpu.runtime.hbm.memory.bandwidth.utilization.percent":
+                        items = [
+                            _make_item(0, as_double=63.2),
+                            _make_item(1, as_double=41.0),
+                        ]
+                    else:
+                        items = []
+                    return SimpleNamespace(metric=SimpleNamespace(metrics=items))
+
+            fake_pb2 = SimpleNamespace(MetricRequest=_FakeMetricRequest)
+            fake_pb2_grpc = SimpleNamespace(RuntimeMetricServiceStub=_FakeStub)
+
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.dict(_te._GRPC_CHANNELS, {}, clear=True),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "grpc": _FakeGrpc,
+                        "tpu_info": SimpleNamespace(),
+                        "tpu_info.proto": SimpleNamespace(),
+                        "tpu_info.proto.tpu_metric_service_pb2": fake_pb2,
+                        "tpu_info.proto.tpu_metric_service_pb2_grpc": fake_pb2_grpc,
+                    },
+                ),
+                mock.patch.object(
+                    _te,
+                    "_run_tpu_info",
+                    side_effect=AssertionError("must not spawn tpu-info subprocess when direct gRPC succeeds"),
+                ),
+            ):
+                snap1 = _te.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin="tpu-info",
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=root / "no-shm",
+                )
+                snap2 = _te.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin="tpu-info",
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=root / "no-shm",
+                )
+
+            self.assertTrue(snap1.tpu_info_available)
+            self.assertTrue(snap2.tpu_info_available)
+            # Persistent channel reused across scrapes.
+            self.assertEqual(created_channels, ["127.0.0.1:8431"])
+            self.assertEqual(snap1.devices[0].telemetry_source, "libtpu-grpc")
+            self.assertEqual(snap1.devices[0].hbm_used_bytes, 16 * 1024**3)
+            self.assertAlmostEqual(snap1.devices[0].duty_cycle_percent or 0.0, 72.5)
+            self.assertAlmostEqual(
+                snap1.devices[0].hbm_bandwidth_utilization_percent or 0.0, 63.2
+            )
+            self.assertEqual(snap1.devices[1].generation, "tpu7x")
+            self.assertEqual(snap1.devices[1].hbm_used_bytes, 64 * 1024**3)
+            self.assertEqual(snap1.devices[1].hbm_total_bytes, 192 * 1024**3)
+
+            prom = _te.format_prometheus_metrics(snap1)
+            self._assert_valid_prometheus_text(prom)
+            self.assertIn("freetpu_tpu_hbm_bandwidth_utilization_percent{", prom)
+            self.assertIn("freetpu_tpu_runtime_hbm_bandwidth_utilization_percent{", prom)
+
+            # When grpcio is absent, _query_grpc_runtime_metrics fails gracefully without raising.
+            with mock.patch.object(_te, "_load_grpc_runtime_modules", return_value=None):
+                ok_fb, err_fb, rows_fb = _te._query_grpc_runtime_metrics(snap1.devices)
+            self.assertFalse(ok_fb)
+            self.assertIn("unavailable", err_fb or "")
+            self.assertEqual(rows_fb, {})
+
+    def test_shm_seqlock_mmap_reader_including_torn_read_retry(self) -> None:
+        import struct
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            shm_root = root / "shm"
+            shm_root.mkdir(parents=True, exist_ok=True)
+            sysfs_root, dev_root, proc_root = _make_mock_pci_tree(
+                root,
+                devices=[
+                    {
+                        "bdf": "0000:00:0b.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "3",
+                    }
+                ],
+                create_vfio_nodes=["3"],
+            )
+
+            shm_file = shm_root / "freetpu_metrics_0000:00:0b.0"
+            payload = struct.pack(
+                "<IIQQQQQ",
+                tpu_exporter.FREETPU_SHM_MAGIC,
+                tpu_exporter.FREETPU_SHM_VERSION,
+                4,  # even seq
+                32 * 1024**3,  # hbm_allocated_bytes
+                18 * 1024**3,  # hbm_used_bytes
+                987654321,  # mxu_active_cycles
+                104857600,  # dma_bytes_transferred
+            )
+            shm_file.write_bytes(payload)
+
+            with _mock_vfio_char_lstat():
+                snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin=None,
+                    shm_root=shm_root,
+                )
+            d = snap.devices[0]
+            self.assertEqual(d.telemetry_source, "libopentpu-shm")
+            self.assertEqual(d.hbm_used_bytes, 18 * 1024**3)
+            self.assertEqual(d.hbm_total_bytes, 32 * 1024**3)
+            self.assertEqual(d.mxu_active_cycles, 987654321)
+            self.assertEqual(d.dma_bytes_transferred, 104857600)
+            prom = tpu_exporter.format_prometheus_metrics(snap)
+            self._assert_valid_prometheus_text(prom)
+            self.assertIn("freetpu_tpu_shm_hbm_allocated_bytes{", prom)
+            self.assertIn("freetpu_tpu_mxu_active_cycles_total{", prom)
+            self.assertIn("freetpu_tpu_dma_bytes_transferred_total{", prom)
+
+            # Torn read on attempt 1 (seq1=4, seq2=6) must retry and succeed on attempt 2 (seq=6).
+            seq_reads = iter([(4,), (6,), (6,)])
+            orig_seq_struct = tpu_exporter._SHM_SEQ_STRUCT
+
+            class _SeqProxy:
+                def unpack_from(self, buf, offset=0):
+                    try:
+                        return next(seq_reads)
+                    except StopIteration:
+                        return orig_seq_struct.unpack_from(buf, offset)
+
+            with mock.patch.object(tpu_exporter, "_SHM_SEQ_STRUCT", _SeqProxy()):
+                res_torn = tpu_exporter.read_shm_seqlock_metrics("0000:00:0b.0", shm_root=shm_root)
+            self.assertIsNotNone(res_torn)
+            assert res_torn is not None
+            self.assertEqual(res_torn.hbm_used_bytes, 18 * 1024**3)
+
+            # Persistent odd seq (crashed writer) must fail closed within max_retries.
+            shm_file.write_bytes(
+                struct.pack(
+                    "<IIQQQQQ",
+                    tpu_exporter.FREETPU_SHM_MAGIC,
+                    tpu_exporter.FREETPU_SHM_VERSION,
+                    5,  # odd = write in progress
+                    32 * 1024**3,
+                    18 * 1024**3,
+                    1,
+                    2,
+                )
+            )
+            self.assertIsNone(
+                tpu_exporter.read_shm_seqlock_metrics(
+                    "0000:00:0b.0", shm_root=shm_root, max_retries=4
+                )
+            )
+
+            # Bad magic must fail closed.
+            shm_file.write_bytes(
+                struct.pack("<IIQQQQQ", 0xDEADBEEF, 1, 2, 0, 0, 0, 0)
+            )
+            self.assertIsNone(
+                tpu_exporter.read_shm_seqlock_metrics("0000:00:0b.0", shm_root=shm_root)
+            )
+
+    def test_sysfs_pcie_aer_counters_gcp_preemption_and_alerts_yaml(self) -> None:
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sysfs_root, dev_root, proc_root = _make_mock_pci_tree(
+                root,
+                devices=[
+                    {
+                        "bdf": "0000:00:0b.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "3",
+                    },
+                    {
+                        "bdf": "0000:80:00.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "5",
+                    },
+                ],
+                create_vfio_nodes=["3", "5"],
+            )
+            # Linux sysfs key-value format with TOTAL_ERR_* on chip 0, plain integer on chip 1.
+            pci0 = sysfs_root / "bus" / "pci" / "devices" / "0000:00:0b.0"
+            (pci0 / "aer_dev_correctable").write_text(
+                "RxErr 2\nBadTLP 1\nTOTAL_ERR_COR 3\n", encoding="utf-8"
+            )
+            (pci0 / "aer_dev_fatal").write_text(
+                "DLP 0\nTLP 1\nTOTAL_ERR_FATAL 1\n", encoding="utf-8"
+            )
+            pci1 = sysfs_root / "bus" / "pci" / "devices" / "0000:80:00.0"
+            (pci1 / "aer_dev_correctable").write_text("0\n", encoding="utf-8")
+            (pci1 / "aer_dev_fatal").write_text("0\n", encoding="utf-8")
+
+            # Local mock GCP metadata server checking `Metadata-Flavor: Google`.
+            preempt_state = {"val": "TRUE"}
+
+            class _MetaHandler(BaseHTTPRequestHandler):
+                def log_message(self, format, *args):  # noqa: A002
+                    pass
+
+                def do_GET(self):  # noqa: N802
+                    if self.headers.get("Metadata-Flavor") != "Google":
+                        self.send_response(403)
+                        self.end_headers()
+                        return
+                    body = preempt_state["val"].encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+            meta_srv = ThreadingHTTPServer(("127.0.0.1", 0), _MetaHandler)
+            meta_t = threading.Thread(target=meta_srv.serve_forever, daemon=True)
+            meta_t.start()
+            try:
+                meta_url = f"http://127.0.0.1:{meta_srv.server_address[1]}/computeMetadata/v1/instance/preempted"
+                with _mock_vfio_char_lstat():
+                    snap = tpu_exporter.collect_snapshot(
+                        sysfs_root=sysfs_root,
+                        dev_root=dev_root,
+                        proc_root=proc_root,
+                        tpu_info_bin=None,
+                        shm_root=root / "no-shm",
+                        gcp_metadata_preemption=True,
+                        gcp_metadata_url=meta_url,
+                        gcp_metadata_timeout_s=1.0,
+                    )
+                self.assertEqual(snap.devices[0].aer_correctable_total, 3)
+                self.assertEqual(snap.devices[0].aer_fatal_total, 1)
+                self.assertEqual(snap.devices[1].aer_correctable_total, 0)
+                self.assertEqual(snap.devices[1].aer_fatal_total, 0)
+                self.assertEqual(snap.gcp_preempted_status, 1)
+
+                prom = tpu_exporter.format_prometheus_metrics(snap)
+                self._assert_valid_prometheus_text(prom)
+                self.assertIn('freetpu_pcie_aer_correctable_total{chip="0",pci_bdf="0000:00:0b.0"', prom)
+                self.assertIn('freetpu_pcie_aer_fatal_total{chip="0",pci_bdf="0000:00:0b.0"', prom)
+                self.assertIn("gcp_metadata_preempted_status 1", prom)
+            finally:
+                meta_srv.shutdown()
+                meta_srv.server_close()
+                meta_t.join(timeout=2.0)
+
+            alerts_path = EXPORTER_DIR / "prometheus-alerts.yml"
+            self.assertTrue(alerts_path.is_file())
+            alerts_text = alerts_path.read_text(encoding="utf-8")
+            for rule_name in (
+                "TpuHbmOOMWarning",
+                "TpuMxuDutyCycleCollapse",
+                "TpuPcieAerFault",
+                "GcpSpotPreemption",
+            ):
+                self.assertIn(rule_name, alerts_text)
+
     def _assert_valid_prometheus_text(self, text: str) -> None:
         lines = [ln for ln in text.splitlines() if ln.strip()]
         self.assertGreater(len(lines), 0)

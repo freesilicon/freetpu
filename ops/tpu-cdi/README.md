@@ -1,6 +1,6 @@
 # `freetpu-cdi` — Open CNCF CDI Toolkit for Cloud TPUs
 
-`freetpu_cdi.py` is an open, zero-dependency CNCF Container Device Interface (CDI v0.6.0) spec generator for VFIO-backed Google Cloud TPUs (`v5e`, `v5p`, `v6e` Trillium bound to `vfio-pci`, analogous to `nvidia-ctk cdi generate`). It scans `/sys/bus/pci/devices/*` (`vendor=0x1ae0`) and `/dev/vfio/*`, verifies full IOMMU group isolation, omits static `major`/`minor` numbers from `deviceNodes` while tracking live char device numbers in `freetpu.dev/vfio-devnums` annotations, and emits a boot-scoped spec at `/var/run/cdi/freetpu.json` (tmpfs, cleared across reboots) so Docker, Podman, containerd (`2.0.x`, `2.1.x >= 2.1.9`, `2.2.x >= 2.2.5`, `2.3.x >= 2.3.2`, or `>= 2.4.0` — excluding CVE-2026-53492 affected `2.1.0–2.1.8`, `2.2.0–2.2.4`, `2.3.0–2.3.1`), and Kubernetes can attach TPU chips cleanly without privileged host-network/host-device hacks.
+`freetpu_cdi.py` is an open, zero-dependency CNCF Container Device Interface (CDI v1.1.0) spec generator for VFIO-backed Google Cloud TPUs (`v5e`, `v5p`, `v6e` Trillium, and `tpu7x` pending live hardware confirmation `#21`). It scans `/sys/bus/pci/devices/*` (`vendor=0x1ae0`), auto-detects Linux 6.8+ `iommufd` (`/dev/iommu` + `/dev/vfio/devices/vfioN`) vs legacy VFIO (`/dev/vfio/vfio` + `/dev/vfio/<iommu_group>`), verifies full IOMMU group isolation, omits static `major`/`minor` numbers from `deviceNodes` while tracking live char device numbers in `freetpu.dev/vfio-devnums` annotations, groups multi-root hosts (e.g. `v6e-8` `0000:00` vs `0000:80`) into NUMA-aware 4-chip slices (`numa0`, `numa1`, `0-3`, `4-7`), injects isolated `libtpu` environment overrides (`MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353`, `TPU_HOST_BOUNDS=1,1,1`, slice-scoped `TPU_CHIPS_PER_HOST_BOUNDS`, `TPU_VISIBLE_DEVICES`, `TPU_SKIP_MDS_QUERY=1`) so single-host containers do **not** require `--net=host`, and emits a boot-scoped spec at `/var/run/cdi/freetpu.json` (tmpfs, cleared across reboots).
 
 > **Scope note:** Legacy `/dev/accel*` Cloud TPU hosts (e.g. Cloud TPU `v2`, `v3`, `v4` using Google's `accel` driver instead of `vfio-pci`) are not supported by VFIO CDI passthrough.
 
@@ -37,19 +37,19 @@ docker run --rm \
   python:3.12-slim \
   python3 -c "import os; print(os.listdir('/dev/vfio'))"
 
-# Attach a single TPU chip by its stable PCI BDF selector (never shifts if another chip disappears).
-# On multi-chip VMs, also configure libtpu for the selected chip subset before initializing JAX/libtpu
-# (set TPU_VISIBLE_CHIPS to the host chip index corresponding to the selected VFIO group, plus single-chip bounds):
+# Attach a NUMA-aligned 4-chip slice on a v6e-8 WITHOUT --net=host (CDI v1.1.0 injects
+# MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353, TPU_HOST_BOUNDS=1,1,1,
+# TPU_CHIPS_PER_HOST_BOUNDS=2,2,1, TPU_VISIBLE_DEVICES, and TPU_SKIP_MDS_QUERY=1):
 docker run --rm \
-  --device=freetpu.dev/tpu=pci-0000-00-06-0 \
+  --device=freetpu.dev/tpu=numa0 \
   --ulimit memlock=-1:-1 \
-  -e TPU_CHIPS_PER_HOST_BOUNDS=1,1,1 \
-  -e TPU_HOST_BOUNDS=1,1,1 \
-  -e TPU_VISIBLE_CHIPS=0 \
   my-jax-tpu-image:latest
+
+# Or pass --network-mode host when generating/printing args for explicit multi-host slices:
+python3 ops/tpu-cdi/freetpu_cdi.py generate --network-mode host --output /var/run/cdi/freetpu.json --validate
 ```
 
-Linux VFIO type1 DMA pinning requires a sufficient `RLIMIT_MEMLOCK` configured **before** OCI container startup (`docker run` / `podman run`), because CNCF CDI v0.6.0 does not configure rlimits or capabilities and an OCI `createContainer` hook executes after `runc` loads process settings. `--ulimit memlock=-1:-1` (or a bounded limit covering the workload's pinned DMA buffers) works without extra Linux capabilities; `--cap-add=IPC_LOCK` is only needed as an optional bypass (`docker-args --cap-ipc-lock`) when the runtime cannot raise `RLIMIT_MEMLOCK`. Use `python3 ops/tpu-cdi/freetpu_cdi.py docker-args` to emit the recommended flags:
+Linux VFIO type1 DMA pinning requires a sufficient `RLIMIT_MEMLOCK` configured **before** OCI container startup (`docker run` / `podman run`), because CNCF CDI does not configure rlimits or capabilities and an OCI `createContainer` hook executes after `runc` loads process settings. `--ulimit memlock=-1:-1` (or a bounded limit covering the workload's pinned DMA buffers) works without extra Linux capabilities; `--cap-add=IPC_LOCK` is only needed as an optional bypass (`docker-args --cap-ipc-lock`) when the runtime cannot raise `RLIMIT_MEMLOCK`. Use `python3 ops/tpu-cdi/freetpu_cdi.py docker-args` to emit the recommended flags:
 
 ```bash
 docker run --rm \
@@ -73,4 +73,5 @@ kubectl -n kube-system create configmap freetpu-ops-scripts \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
 
+- [manifests/k8s-tpu-dra-example.yaml](manifests/k8s-tpu-dra-example.yaml) — Starter Kubernetes DRA `DeviceClass`, `ResourceSlice` (v6e-8 `0000:00` NUMA 0 vs `0000:80` NUMA 1), `ResourceClaimTemplate`, and network-isolated 4-chip `Pod` (no `hostNetwork: true`).
 - [manifests/k8s-tpu-cdi-daemonset.yaml](manifests/k8s-tpu-cdi-daemonset.yaml) — Node-level DaemonSets targeting VFIO-backed GKE TPU node pools (`tpu-v5-lite-device`, `tpu-v5-lite-podslice`, `tpu-v5p-slice`, `tpu-v6e-slice`): `freetpu-node-agent` runs by default with `--no-pid-scan --tpu-info-bin ""` (no `hostPID`, no `CAP_SYS_PTRACE`, no `Unconfined` AppArmor) to serve **PCI/VFIO hardware inventory (`vfio_group_exclusive`) and VFIO readiness only** on `:9400/metrics` (with isolated loopback liveness/readiness probes on `127.0.0.1:9401`, without publishing CDI specs), plus a `NetworkPolicy` (`freetpu-node-agent-metrics`) restricting `:9400` ingress to the trusted `monitoring` Prometheus scraper. Because GKE Standard accepts `NetworkPolicy` objects even when policy enforcement is disabled, on shared/multi-tenant clusters (including default inventory-only mode) enforced NetworkPolicy plus admission controls forbidding tenant `hostNetwork: true` pods—or binding `--host 127.0.0.1` behind an authenticating proxy such as `kube-rbac-proxy`—is a prerequisite so tenant workloads cannot starve the exporter's bounded `:9400` scrape worker pool. Host PID telemetry (`freetpu_tpu_active_pids`) is an additional explicit opt-in: enable `hostPID: true`, `CAP_SYS_PTRACE`, `appArmorProfile.type: Unconfined` (on GKE), and remove `--no-pid-scan` only after verifying that ingress isolation. A separate opt-in `freetpu-cdi-sync` DaemonSet (`--unlink-on-exit`) publishes boot-scoped `/var/run/cdi/freetpu.json` ONLY on nodes explicitly labeled `freetpu.dev/cdi-enabled=true` after verifying containerd is not an affected CVE-2026-53492 release (upstream affected: `2.1.0–2.1.8`, `2.2.0–2.2.4`, `2.3.0–2.3.1`; fixed in `2.1.9`, `2.2.5`, `2.3.2`, `>= 2.4.0`; upstream `2.0.x` lacks the affected checkpoint-restore path, though vendor/GKE builds should still be verified for backports) or blocking untrusted checkpoint restores. On **GKE Standard**, `freetpu-node-agent` provides host PCI/VFIO telemetry (with opt-in `freetpu-cdi-sync` available on explicitly labeled nodes, while GKE schedules TPUs natively via `google.com/tpu` rather than DRA—GKE DRA currently supports GPUs only). On **self-managed Kubernetes** clusters, pair published CDI specs with a cluster DRA driver registered for `freetpu.dev`. Because CDI device injection does not configure `RLIMIT_MEMLOCK` or capabilities and Kubernetes Pods have no `--ulimit` field, also verify each TPU workload's effective memlock limit before running VFIO workloads—on self-managed nodes inheriting a restrictive systemd memlock limit, raise the container runtime's memlock limit (e.g. `LimitMEMLOCK=infinity` in `containerd.service` or containerd's default OCI spec) or grant an approved `IPC_LOCK` capability to TPU workload containers.

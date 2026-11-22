@@ -3,17 +3,27 @@
 
 Discovers Google TPU PCI devices (vendor 0x1ae0) under /sys/bus/pci/devices/*
 and their /dev/vfio/* IOMMU device nodes on VFIO-backed Cloud TPU VMs (v5e,
-v5p, v6e Trillium), scrapes live HBM usage, MXU duty cycle, active PIDs, and
-VFIO chip readiness via `tpu-info` (with pure sysfs/procfs fallback), and serves
-Prometheus text exposition format 0.0.4 on HTTP `/metrics`, or prints a one-shot
-snapshot with `--once` / `--json`.
+v5p, v6e Trillium, and tpu7x pending live HW confirmation), scrapes:
+  - Direct `libtpu` gRPC / `RuntimeMetricService` (`localhost:8431`) when
+    `grpcio` and protobuf stubs are available (with graceful fallback and zero
+    unconditional `tpu-info` subprocess churn)
+  - Lockless SeqLock `/dev/shm/freetpu_metrics_<bdf>` `mmap` telemetry for
+    bare-metal `libopentpu.so` (`ops/tpu-exporter/freetpu_metrics_shm.h`)
+  - Pure `libtpu`-free sysfs PCIe AER counters (`aer_dev_correctable`,
+    `aer_dev_fatal`)
+  - Optional GCP Spot preemption metadata gauge
+  - Legacy `tpu-info` CLI / Python fallback and `/proc/<pid>/fd` VFIO handles
+
+and serves Prometheus text exposition format 0.0.4 on HTTP `/metrics`, or
+prints a one-shot snapshot with `--once` / `--json`.
 
 Note: Legacy `/dev/accel*` Cloud TPU hosts (e.g. TPU v2/v3/v4 using the `accel`
 driver instead of `vfio-pci`) are recognized in PCI inventory, but VFIO
 readiness (`freetpu_tpu_health_status`) and `/dev/vfio/*` PID tracking are
 scoped to VFIO-backed hosts.
 
-Zero third-party dependencies: uses Python standard library only.
+Zero third-party dependencies required: uses Python standard library only
+(with optional `grpcio` / `tpu_metric_service` proto stubs for direct gRPC).
 """
 
 from __future__ import annotations
@@ -27,6 +37,7 @@ import inspect
 import io
 import json
 import math
+import mmap
 import os
 from pathlib import Path
 import re
@@ -34,11 +45,14 @@ import shutil
 import signal
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import threading
 import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+import urllib.error
+import urllib.request
 
 GOOGLE_PCI_VENDOR_ID = "0x1ae0"
 
@@ -52,6 +66,7 @@ TPU_PCI_DEVICES: Dict[str, Tuple[str, str, int]] = {
     "0x0063": ("v5e", "TPU v5e", 16 * 1024**3),
     "0x006e": ("v6e-pf", "TPU v6e (PF)", 32 * 1024**3),
     "0x006f": ("v6e", "TPU v6e (Trillium)", 32 * 1024**3),
+    "0x0075": ("tpu7x", "TPU tpu7x (Ironwood, pending live hardware confirmation #21)", 192 * 1024**3),
 }
 
 # Legacy Cloud TPU v2/v3 (0x0027) expose two PCI core functions per physical chip
@@ -82,6 +97,26 @@ _MEM_PAIR_RE = re.compile(
 _PCT_RE = re.compile(r"(?<![0-9A-Za-z._+-])([+-]?[0-9]+(?:\.[0-9]+)?)\s*%")
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
+FREETPU_SHM_MAGIC = 0x46545055
+FREETPU_SHM_VERSION = 1
+_SHM_HEADER_STRUCT = struct.Struct("<IIQ")
+_SHM_PAYLOAD_STRUCT = struct.Struct("<QQQQ")
+_SHM_SEQ_STRUCT = struct.Struct("<Q")
+_SHM_FULL_STRUCT = struct.Struct("<IIQQQQQ")  # 48 bytes; matches freetpu_shm_metrics_v1
+
+DEFAULT_GCP_METADATA_PREEMPTED_URL = (
+    "http://metadata.google.internal/computeMetadata/v1/instance/preempted"
+)
+
+
+@dataclass
+class ShmMetrics:
+    hbm_allocated_bytes: int
+    hbm_used_bytes: int
+    mxu_active_cycles: int
+    dma_bytes_transferred: int
+    seq: int
+
 
 @dataclass
 class TpuTelemetry:
@@ -109,6 +144,12 @@ class TpuTelemetry:
     runtime_chip_id: Optional[str] = None
     telemetry_source: str = "sysfs-fallback"
     vfio_group_exclusive: bool = False
+    hbm_bandwidth_utilization_percent: Optional[float] = None
+    aer_correctable_total: Optional[int] = None
+    aer_fatal_total: Optional[int] = None
+    shm_hbm_allocated_bytes: Optional[int] = None
+    mxu_active_cycles: Optional[int] = None
+    dma_bytes_transferred: Optional[int] = None
 
 
 @dataclass
@@ -118,6 +159,7 @@ class RuntimeTelemetry:
     hbm_used_bytes: Optional[int]
     hbm_total_bytes: Optional[int]
     duty_cycle_percent: Optional[float]
+    hbm_bandwidth_utilization_percent: Optional[float] = None
 
 
 @dataclass
@@ -129,6 +171,7 @@ class ExporterSnapshot:
     pid_telemetry_available: bool
     devices: List[TpuTelemetry]
     runtime_utilization: List[RuntimeTelemetry] = field(default_factory=list)
+    gcp_preempted_status: Optional[int] = None
 
 
 def _normalize_hex_id(raw: str) -> str:
@@ -469,6 +512,7 @@ class _TpuInfoRow:
     hbm_used_bytes: Optional[int] = None
     hbm_total_bytes: Optional[int] = None
     duty_cycle_percent: Optional[float] = None
+    hbm_bw_util_percent: Optional[float] = None
     in_chips_table: bool = False
     in_util_table: bool = False
 
@@ -916,6 +960,288 @@ def _query_tpu_info_python_metrics(
     return _parse_python_usage_entries(parsed_json, addr)
 
 
+_GRPC_CHANNEL_LOCK = threading.Lock()
+_GRPC_CHANNELS: Dict[str, Any] = {}
+_GRPC_METRIC_NAMES = (
+    "tpu.runtime.tensorcore.dutycycle.percent",
+    "tpu.runtime.hbm.memory.usage.bytes",
+    "tpu.runtime.hbm.memory.total.bytes",
+    "tpu.runtime.hbm.memory.bandwidth.utilization.percent",
+)
+
+
+def _import_optional_module(name: str) -> Optional[Any]:
+    if name in sys.modules:
+        return sys.modules[name]
+    try:
+        return importlib.import_module(name)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _load_grpc_runtime_modules() -> Optional[Tuple[Any, Any, Any]]:
+    grpc_mod = _import_optional_module("grpc")
+    if grpc_mod is None:
+        return None
+    for pb2_name, pb2_grpc_name in (
+        ("tpu_info.proto.tpu_metric_service_pb2", "tpu_info.proto.tpu_metric_service_pb2_grpc"),
+        ("tpu_metric_service_pb2", "tpu_metric_service_pb2_grpc"),
+    ):
+        pb2 = _import_optional_module(pb2_name)
+        pb2_grpc = _import_optional_module(pb2_grpc_name)
+        if pb2 is not None and pb2_grpc is not None:
+            return grpc_mod, pb2, pb2_grpc
+    return None
+
+
+def _get_grpc_channel(grpc_mod: Any, addr: str) -> Any:
+    with _GRPC_CHANNEL_LOCK:
+        channel = _GRPC_CHANNELS.get(addr)
+        if channel is None:
+            channel = grpc_mod.insecure_channel(addr)
+            _GRPC_CHANNELS[addr] = channel
+        return channel
+
+
+def _extract_grpc_chip_id(metric_item: Any) -> Optional[str]:
+    attr = getattr(metric_item, "attribute", None)
+    if attr is None:
+        return None
+    val = getattr(attr, "value", None)
+    if val is not None:
+        str_val = getattr(val, "string_value", None)
+        if isinstance(str_val, str) and str_val.strip():
+            return str_val.strip()
+        int_val = getattr(val, "int_value", None)
+        if isinstance(int_val, int) and not isinstance(int_val, bool):
+            return str(int_val)
+    for key_attr in ("device_id", "chip_id", "int_value", "string_value"):
+        v = getattr(attr, key_attr, None)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    return None
+
+
+def _extract_grpc_gauge_value(metric_item: Any) -> Optional[float]:
+    gauge = getattr(metric_item, "gauge", None)
+    if gauge is None:
+        return None
+    for field_name in ("as_double", "as_float", "as_int", "value"):
+        raw = getattr(gauge, field_name, None)
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            # In protobuf3, distinguish unset 0 if gauge has WhichOneof('value').
+            which_fn = getattr(gauge, "WhichOneof", None)
+            if callable(which_fn):
+                try:
+                    selected = which_fn("value")
+                    if selected and selected != field_name:
+                        continue
+                except Exception:  # noqa: BLE001
+                    pass
+            if math.isfinite(float(raw)):
+                return float(raw)
+    return None
+
+
+def _query_grpc_runtime_metrics(
+    devices: Sequence[TpuTelemetry],
+    addr: Optional[str] = "127.0.0.1:8431",
+    timeout_s: float = 5.0,
+) -> Tuple[bool, Optional[str], Dict[str, _TpuInfoRow]]:
+    """Query `libtpu` RuntimeMetricService directly in-process over gRPC (`localhost:8431`).
+
+    Eliminates `tpu-info` CLI/Python subprocess churn and works cleanly when
+    `grpcio` and `tpu_metric_service` proto stubs are installed. Falls back
+    gracefully when `grpcio` or proto stubs are unavailable.
+    """
+    if not addr:
+        return False, "runtime metrics gRPC address disabled", {}
+    del devices  # RuntimeMetricService exposes all active chips on the endpoint.
+
+    mods = _load_grpc_runtime_modules()
+    if mods is None:
+        return False, "grpcio/tpu_metric_service stubs unavailable", {}
+    grpc_mod, pb2, pb2_grpc = mods
+
+    stub_cls = getattr(pb2_grpc, "RuntimeMetricServiceStub", None)
+    req_cls = getattr(pb2, "MetricRequest", None)
+    if stub_cls is None or req_cls is None:
+        return False, "RuntimeMetricServiceStub or MetricRequest missing from proto stubs", {}
+
+    deadline = time.monotonic() + max(0.05, float(timeout_s))
+    try:
+        channel = _get_grpc_channel(grpc_mod, addr)
+        stub = stub_cls(channel)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"gRPC channel init failed ({addr}): {exc}", {}
+
+    rpc_fn = getattr(stub, "GetRuntimeMetric", None)
+    if not callable(rpc_fn):
+        return False, "RuntimeMetricServiceStub.GetRuntimeMetric unavailable", {}
+
+    rows: Dict[str, _TpuInfoRow] = {}
+    last_err: Optional[str] = None
+    any_rpc_ok = False
+    for metric_name in _GRPC_METRIC_NAMES:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.01:
+            last_err = f"gRPC RuntimeMetricService timed out ({addr})"
+            break
+        try:
+            resp = rpc_fn(req_cls(metric_name=metric_name), timeout=remaining)
+            any_rpc_ok = True
+        except Exception as exc:  # noqa: BLE001
+            last_err = f"gRPC GetRuntimeMetric({metric_name}) failed ({addr}): {exc}"
+            continue
+
+        metric_obj = getattr(resp, "metric", None)
+        entries = getattr(metric_obj, "metrics", None) if metric_obj is not None else None
+        if not entries:
+            continue
+        for item in entries:
+            chip_id = _extract_grpc_chip_id(item)
+            val = _extract_grpc_gauge_value(item)
+            if chip_id is None or val is None or val < 0.0:
+                continue
+            row = rows.setdefault(chip_id, _TpuInfoRow(chip_key=chip_id))
+            row.in_util_table = True
+            if metric_name == "tpu.runtime.hbm.memory.usage.bytes":
+                row.hbm_used_bytes = int(round(val))
+            elif metric_name == "tpu.runtime.hbm.memory.total.bytes" and val > 0:
+                row.hbm_total_bytes = int(round(val))
+            elif metric_name == "tpu.runtime.tensorcore.dutycycle.percent":
+                row.duty_cycle_percent = float(val)
+            elif metric_name == "tpu.runtime.hbm.memory.bandwidth.utilization.percent":
+                row.hbm_bw_util_percent = float(val)
+
+    if not rows:
+        if not any_rpc_ok and last_err:
+            return False, last_err, {}
+        return False, last_err or f"gRPC RuntimeMetricService returned no live metrics from {addr}", {}
+    return True, None, rows
+
+
+def read_shm_seqlock_metrics(
+    pci_bdf: str,
+    shm_root: Optional[Path] = Path("/dev/shm"),
+    *,
+    max_retries: int = 64,
+) -> Optional[ShmMetrics]:
+    """Read bare-metal `libopentpu.so` telemetry from `/dev/shm/freetpu_metrics_<bdf>` via lockless SeqLock mmap."""
+    if shm_root is None or not pci_bdf:
+        return None
+    if "/" in pci_bdf or "\\" in pci_bdf or ".." in pci_bdf:
+        return None
+
+    shm_path = Path(shm_root) / f"freetpu_metrics_{pci_bdf}"
+    try:
+        st = os.lstat(shm_path)
+    except OSError:
+        return None
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        return None
+    if st.st_size < _SHM_FULL_STRUCT.size:
+        return None
+
+    try:
+        fd = os.open(shm_path, os.O_RDONLY)
+    except OSError:
+        return None
+    mm: Optional[mmap.mmap] = None
+    try:
+        fd_st = os.fstat(fd)
+        if fd_st.st_size < _SHM_FULL_STRUCT.size:
+            return None
+        mm = mmap.mmap(fd, _SHM_FULL_STRUCT.size, access=mmap.ACCESS_READ)
+        for _ in range(max(1, max_retries)):
+            magic, version, seq1 = _SHM_HEADER_STRUCT.unpack_from(mm, 0)
+            if magic != FREETPU_SHM_MAGIC or version != FREETPU_SHM_VERSION:
+                return None
+            if (seq1 & 1) != 0:
+                time.sleep(0)
+                continue
+            hbm_alloc, hbm_used, mxu_cycles, dma_bytes = _SHM_PAYLOAD_STRUCT.unpack_from(mm, 16)
+            (seq2,) = _SHM_SEQ_STRUCT.unpack_from(mm, 8)
+            if seq1 == seq2:
+                return ShmMetrics(
+                    hbm_allocated_bytes=hbm_alloc,
+                    hbm_used_bytes=hbm_used,
+                    mxu_active_cycles=mxu_cycles,
+                    dma_bytes_transferred=dma_bytes,
+                    seq=seq1,
+                )
+        return None
+    except (OSError, ValueError, struct.error):
+        return None
+    finally:
+        if mm is not None:
+            try:
+                mm.close()
+            except OSError:
+                pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _parse_sysfs_aer_file(path: Path) -> Optional[int]:
+    """Parse Linux sysfs PCIe AER file (`aer_dev_correctable` or `aer_dev_fatal`)."""
+    raw = _read_text(path)
+    if raw is None or not raw:
+        return None
+    try:
+        val = int(raw, 0)
+        return val if val >= 0 else None
+    except ValueError:
+        pass
+
+    subtotal = 0
+    saw_field = False
+    for line in raw.splitlines():
+        parts = line.strip().split()
+        if len(parts) != 2:
+            continue
+        key, num_str = parts
+        try:
+            count = int(num_str, 0)
+        except ValueError:
+            continue
+        if count < 0:
+            continue
+        if key.upper().startswith("TOTAL_ERR_"):
+            return count
+        subtotal += count
+        saw_field = True
+    return subtotal if saw_field else None
+
+
+def read_pcie_aer_counters(pci_entry: Path) -> Tuple[Optional[int], Optional[int]]:
+    """Read pure `libtpu`-free sysfs PCIe AER correctable and fatal error counts."""
+    return (
+        _parse_sysfs_aer_file(pci_entry / "aer_dev_correctable"),
+        _parse_sysfs_aer_file(pci_entry / "aer_dev_fatal"),
+    )
+
+
+def query_gcp_preemption_status(
+    url: str = DEFAULT_GCP_METADATA_PREEMPTED_URL,
+    timeout_s: float = 0.5,
+) -> Optional[int]:
+    """Query GCP instance preemption metadata (`1` if preempted, `0` if healthy, `None` if unavailable)."""
+    req = urllib.request.Request(url, headers={"Metadata-Flavor": "Google"})
+    try:
+        with urllib.request.urlopen(req, timeout=max(0.05, float(timeout_s))) as resp:
+            body = resp.read(256).decode("utf-8", errors="replace").strip().lower()
+    except (OSError, urllib.error.URLError, ValueError):
+        return None
+    if body == "true":
+        return 1
+    if body == "false":
+        return 0
+    return None
+
+
 def _resolve_tpu_device_spec(device_id: str, subsystem_device: str) -> Tuple[str, str, int]:
     if device_id == "0x0027" and subsystem_device in LEGACY_V2_V3_SUBSYSTEM_DEVICES:
         return LEGACY_V2_V3_SUBSYSTEM_DEVICES[subsystem_device]
@@ -1112,6 +1438,8 @@ def discover_tpu_devices(
             and full_members == {entry.name}
         )
 
+        aer_correctable, aer_fatal = read_pcie_aer_counters(entry)
+
         chip = TpuTelemetry(
             chip_index=len(discovered),
             pci_bdf=entry.name,
@@ -1134,6 +1462,8 @@ def discover_tpu_devices(
             duty_cycle_percent=None,
             runtime_chip_id=runtime_chip_id,
             vfio_group_exclusive=vfio_group_exclusive,
+            aer_correctable_total=aer_correctable,
+            aer_fatal_total=aer_fatal,
         )
         discovered.append(chip)
         if device_id in LEGACY_DUAL_FUNCTION_DEVICE_IDS:
@@ -1190,6 +1520,41 @@ MAX_HTTP_HEADER_BYTES = 16384
 HTTP_HEADER_READ_TIMEOUT_S = 2.0
 
 
+def _has_live_utilization(rows: Dict[str, _TpuInfoRow]) -> bool:
+    return any(
+        r.in_util_table
+        and (
+            r.hbm_used_bytes is not None
+            or r.hbm_total_bytes is not None
+            or r.duty_cycle_percent is not None
+            or r.hbm_bw_util_percent is not None
+        )
+        for r in rows.values()
+    )
+
+
+def _merge_runtime_rows(
+    base_rows: Dict[str, _TpuInfoRow],
+    extra_rows: Dict[str, _TpuInfoRow],
+) -> Dict[str, _TpuInfoRow]:
+    merged = dict(base_rows)
+    for k, r in extra_rows.items():
+        existing = merged.get(k)
+        if existing is not None:
+            if r.hbm_used_bytes is not None:
+                existing.hbm_used_bytes = r.hbm_used_bytes
+            if r.hbm_total_bytes is not None:
+                existing.hbm_total_bytes = r.hbm_total_bytes
+            if r.duty_cycle_percent is not None:
+                existing.duty_cycle_percent = r.duty_cycle_percent
+            if r.hbm_bw_util_percent is not None:
+                existing.hbm_bw_util_percent = r.hbm_bw_util_percent
+            existing.in_util_table = True
+        else:
+            merged[k] = r
+    return merged
+
+
 def collect_snapshot(
     sysfs_root: Path = Path("/sys"),
     dev_root: Path = Path("/dev"),
@@ -1200,8 +1565,12 @@ def collect_snapshot(
     *,
     skip_pid_scan: bool = False,
     runtime_metrics_addr: Optional[str] = DEFAULT_RUNTIME_METRICS_ADDR,
+    shm_root: Optional[Path] = Path("/dev/shm"),
+    gcp_metadata_preemption: bool = False,
+    gcp_metadata_url: str = DEFAULT_GCP_METADATA_PREEMPTED_URL,
+    gcp_metadata_timeout_s: float = 0.5,
 ) -> ExporterSnapshot:
-    """Collect PCI/VFIO discovery, optional procfs PID handles, and `tpu-info` runtime metrics."""
+    """Collect PCI/VFIO discovery, SeqLock SHM, AER counters, optional procfs PIDs, and gRPC/`tpu-info` metrics."""
     t0 = time.monotonic()
     devices = discover_tpu_devices(sysfs_root=sysfs_root, dev_root=dev_root)
     shared_vfio = _shared_vfio_paths(devices)
@@ -1233,67 +1602,76 @@ def collect_snapshot(
     explicit_non_default_runtime_addr = bool(
         runtime_metrics_addr and runtime_metrics_addr != DEFAULT_RUNTIME_METRICS_ADDR
     )
+    runtime_source_label = "tpu-info"
     if not tpu_info_bin:
-        # Empty/None `--tpu-info-bin` explicitly disables all `tpu-info` runtime
-        # telemetry (both CLI and Python gRPC) across every mode.
+        # Empty/None `--tpu-info-bin` explicitly disables `libtpu` runtime
+        # telemetry (direct gRPC, `tpu_info.metrics`, and CLI) across every mode.
         tpu_info_ok, tpu_info_err, parsed_rows = False, "tpu-info disabled", {}
     elif skip_pid_scan or explicit_non_default_runtime_addr:
         # Sidecar / no-PID mode OR explicit non-default `--runtime-metrics-addr`:
-        # query `tpu_info.metrics` directly at `runtime_metrics_addr` with a hard
-        # deadline. Never run the `tpu-info` CLI subprocess against its hardcoded
-        # default port 8431 when an explicit non-default runtime endpoint was
-        # configured (or when PID scanning is disabled).
-        tpu_info_ok, tpu_info_err, parsed_rows = _query_tpu_info_python_metrics(
+        # try direct in-process gRPC first, then fall back to `tpu_info.metrics`
+        # within the remaining deadline. Never spawn the `tpu-info` CLI subprocess.
+        tpu_info_ok, tpu_info_err, parsed_rows = _query_grpc_runtime_metrics(
             devices,
             addr=runtime_metrics_addr,
             timeout_s=runtime_budget_s,
         )
+        if tpu_info_ok:
+            runtime_source_label = "libtpu-grpc"
+        else:
+            remaining_s = runtime_deadline - time.monotonic()
+            if remaining_s >= 0.05:
+                tpu_info_ok, tpu_info_err, parsed_rows = _query_tpu_info_python_metrics(
+                    devices,
+                    addr=runtime_metrics_addr,
+                    timeout_s=remaining_s,
+                )
     else:
-        tpu_info_ok, tpu_info_err, parsed_rows = _run_tpu_info(
-            tpu_info_bin=tpu_info_bin,
-            timeout_s=runtime_budget_s,
-        )
-        # If `tpu-info` CLI failed OR exited cleanly with only inventory/`N/A` rows
-        # (no live HBM/duty-cycle readings, e.g. when its default endpoint differs from
-        # `--runtime-metrics-addr`), fall back to direct `tpu_info.metrics` gRPC queries
-        # ONLY within the remaining shared deadline so a stalled `libtpu` endpoint
-        # cannot double-spend the scrape timeout before PCI and PID metrics are returned.
-        has_live_util = any(
-            r.in_util_table
-            and (
-                r.hbm_used_bytes is not None
-                or r.hbm_total_bytes is not None
-                or r.duty_cycle_percent is not None
-            )
-            for r in parsed_rows.values()
-        )
-        remaining_s = runtime_deadline - time.monotonic()
-        if (
-            (not tpu_info_ok or not has_live_util)
-            and tpu_info_bin
-            and runtime_metrics_addr
-            and remaining_s >= 0.05
-        ):
-            py_ok, _py_err, py_rows = _query_tpu_info_python_metrics(
+        # Prefer direct in-process `RuntimeMetricService` gRPC over spawning
+        # `tpu-info` subprocesses when default `"tpu-info"` is configured; if a
+        # caller supplied an explicit CLI script/path (e.g. custom binary or test
+        # fixture) or gRPC stubs/endpoint are unavailable, fall back cleanly within
+        # the single shared scrape deadline.
+        custom_cli_path = os.path.sep in tpu_info_bin
+        tpu_info_ok = False
+        tpu_info_err = None
+        parsed_rows = {}
+        if not custom_cli_path and runtime_metrics_addr:
+            tpu_info_ok, tpu_info_err, parsed_rows = _query_grpc_runtime_metrics(
                 devices,
                 addr=runtime_metrics_addr,
+                timeout_s=runtime_budget_s,
+            )
+            if tpu_info_ok and _has_live_utilization(parsed_rows):
+                runtime_source_label = "libtpu-grpc"
+
+        remaining_s = runtime_deadline - time.monotonic()
+        if (not tpu_info_ok or not _has_live_utilization(parsed_rows)) and remaining_s >= 0.05:
+            cli_ok, cli_err, cli_rows = _run_tpu_info(
+                tpu_info_bin=tpu_info_bin,
                 timeout_s=remaining_s,
             )
-            if py_ok:
-                merged_rows = dict(parsed_rows)
-                for k, py_r in py_rows.items():
-                    existing = merged_rows.get(k)
-                    if existing is not None:
-                        if py_r.hbm_used_bytes is not None:
-                            existing.hbm_used_bytes = py_r.hbm_used_bytes
-                        if py_r.hbm_total_bytes is not None:
-                            existing.hbm_total_bytes = py_r.hbm_total_bytes
-                        if py_r.duty_cycle_percent is not None:
-                            existing.duty_cycle_percent = py_r.duty_cycle_percent
-                        existing.in_util_table = True
-                    else:
-                        merged_rows[k] = py_r
-                tpu_info_ok, tpu_info_err, parsed_rows = True, None, merged_rows
+            if cli_ok:
+                tpu_info_ok = True
+                tpu_info_err = None
+                parsed_rows = _merge_runtime_rows(parsed_rows, cli_rows) if parsed_rows else cli_rows
+            elif not tpu_info_ok:
+                tpu_info_err = cli_err
+
+            remaining_s = runtime_deadline - time.monotonic()
+            if (
+                (not tpu_info_ok or not _has_live_utilization(parsed_rows))
+                and runtime_metrics_addr
+                and remaining_s >= 0.05
+            ):
+                py_ok, _py_err, py_rows = _query_tpu_info_python_metrics(
+                    devices,
+                    addr=runtime_metrics_addr,
+                    timeout_s=remaining_s,
+                )
+                if py_ok:
+                    parsed_rows = _merge_runtime_rows(parsed_rows, py_rows)
+                    tpu_info_ok, tpu_info_err = True, None
     util_rows = {k: r for k, r in parsed_rows.items() if r.in_util_table}
     mapped_util_keys: Dict[str, str] = {}
     overall_pid_available = True
@@ -1356,7 +1734,7 @@ def collect_snapshot(
                 break
 
         if chips_row is not None and not skip_pid_scan:
-            dev.telemetry_source = "tpu-info"
+            dev.telemetry_source = runtime_source_label
 
         rt_id = resolved_rt_ids.get(dev.pci_bdf)
         if rt_id in ambiguous_rt_ids:
@@ -1375,14 +1753,32 @@ def collect_snapshot(
                 matched_util.hbm_used_bytes is not None
                 or matched_util.hbm_total_bytes is not None
                 or matched_util.duty_cycle_percent is not None
+                or matched_util.hbm_bw_util_percent is not None
             ):
-                dev.telemetry_source = "tpu-info"
+                dev.telemetry_source = runtime_source_label
             if matched_util.hbm_used_bytes is not None:
                 dev.hbm_used_bytes = matched_util.hbm_used_bytes
             if matched_util.hbm_total_bytes is not None:
                 dev.hbm_total_bytes = matched_util.hbm_total_bytes
             if matched_util.duty_cycle_percent is not None:
                 dev.duty_cycle_percent = matched_util.duty_cycle_percent
+            if matched_util.hbm_bw_util_percent is not None:
+                dev.hbm_bandwidth_utilization_percent = matched_util.hbm_bw_util_percent
+
+        # Bare-metal libopentpu.so SeqLock /dev/shm/freetpu_metrics_<bdf> telemetry.
+        shm = read_shm_seqlock_metrics(dev.pci_bdf, shm_root=shm_root)
+        if shm is not None:
+            dev.shm_hbm_allocated_bytes = shm.hbm_allocated_bytes
+            dev.mxu_active_cycles = shm.mxu_active_cycles
+            dev.dma_bytes_transferred = shm.dma_bytes_transferred
+            if dev.hbm_used_bytes is None:
+                dev.hbm_used_bytes = shm.hbm_used_bytes
+            if shm.hbm_allocated_bytes > 0 and (
+                dev.hbm_total_bytes is None or dev.telemetry_source == "sysfs-fallback"
+            ):
+                dev.hbm_total_bytes = shm.hbm_allocated_bytes
+            if dev.telemetry_source == "sysfs-fallback":
+                dev.telemetry_source = "libopentpu-shm"
 
         # Upstream `tpu-info` also scans `/proc/*/fd/*` under the caller's privileges
         # and reports `PID=None` when another user's process is unreadable. Only mark
@@ -1404,14 +1800,23 @@ def collect_snapshot(
             hbm_used_bytes=row.hbm_used_bytes,
             hbm_total_bytes=row.hbm_total_bytes,
             duty_cycle_percent=row.duty_cycle_percent,
+            hbm_bandwidth_utilization_percent=row.hbm_bw_util_percent,
         )
         for key, row in util_rows.items()
         if (
             row.hbm_used_bytes is not None
             or row.hbm_total_bytes is not None
             or row.duty_cycle_percent is not None
+            or row.hbm_bw_util_percent is not None
         )
     ]
+
+    gcp_preempted: Optional[int] = None
+    if gcp_metadata_preemption:
+        gcp_preempted = query_gcp_preemption_status(
+            url=gcp_metadata_url,
+            timeout_s=gcp_metadata_timeout_s,
+        )
 
     elapsed = time.monotonic() - t0
     return ExporterSnapshot(
@@ -1422,6 +1827,7 @@ def collect_snapshot(
         pid_telemetry_available=overall_pid_available,
         devices=devices,
         runtime_utilization=runtime_telemetry,
+        gcp_preempted_status=gcp_preempted,
     )
 
 
@@ -1493,7 +1899,13 @@ def format_prometheus_metrics(snapshot: ExporterSnapshot) -> str:
     hbm_used_samples: List[Tuple[Dict[str, Any], str]] = []
     hbm_total_samples: List[Tuple[Dict[str, Any], str]] = []
     hbm_ratio_samples: List[Tuple[Dict[str, Any], str]] = []
+    hbm_bw_samples: List[Tuple[Dict[str, Any], str]] = []
     duty_samples: List[Tuple[Dict[str, Any], str]] = []
+    aer_corr_samples: List[Tuple[Dict[str, Any], str]] = []
+    aer_fatal_samples: List[Tuple[Dict[str, Any], str]] = []
+    shm_hbm_alloc_samples: List[Tuple[Dict[str, Any], str]] = []
+    mxu_cycles_samples: List[Tuple[Dict[str, Any], str]] = []
+    dma_bytes_samples: List[Tuple[Dict[str, Any], str]] = []
     pid_avail_samples: List[Tuple[Dict[str, Any], str]] = []
     pid_count_samples: List[Tuple[Dict[str, Any], str]] = []
     pid_active_samples: List[Tuple[Dict[str, Any], str]] = []
@@ -1531,8 +1943,20 @@ def format_prometheus_metrics(snapshot: ExporterSnapshot) -> str:
         ):
             ratio = d.hbm_used_bytes / float(d.hbm_total_bytes)
             hbm_ratio_samples.append((base_labels, _fmt_float(ratio)))
+        if d.hbm_bandwidth_utilization_percent is not None:
+            hbm_bw_samples.append((base_labels, _fmt_float(d.hbm_bandwidth_utilization_percent)))
         if d.duty_cycle_percent is not None:
             duty_samples.append((base_labels, _fmt_float(d.duty_cycle_percent)))
+        if d.aer_correctable_total is not None:
+            aer_corr_samples.append((base_labels, str(d.aer_correctable_total)))
+        if d.aer_fatal_total is not None:
+            aer_fatal_samples.append((base_labels, str(d.aer_fatal_total)))
+        if d.shm_hbm_allocated_bytes is not None:
+            shm_hbm_alloc_samples.append((base_labels, str(d.shm_hbm_allocated_bytes)))
+        if d.mxu_active_cycles is not None:
+            mxu_cycles_samples.append((base_labels, str(d.mxu_active_cycles)))
+        if d.dma_bytes_transferred is not None:
+            dma_bytes_samples.append((base_labels, str(d.dma_bytes_transferred)))
 
         if d.pid_telemetry_available:
             pid_count_samples.append((base_labels, str(len(d.active_pids))))
@@ -1542,6 +1966,7 @@ def format_prometheus_metrics(snapshot: ExporterSnapshot) -> str:
     runtime_hbm_used: List[Tuple[Dict[str, Any], str]] = []
     runtime_hbm_total: List[Tuple[Dict[str, Any], str]] = []
     runtime_duty: List[Tuple[Dict[str, Any], str]] = []
+    runtime_hbm_bw: List[Tuple[Dict[str, Any], str]] = []
     for rt in snapshot.runtime_utilization:
         rt_labels = {
             "runtime_chip": rt.runtime_chip,
@@ -1553,6 +1978,8 @@ def format_prometheus_metrics(snapshot: ExporterSnapshot) -> str:
             runtime_hbm_total.append((rt_labels, str(rt.hbm_total_bytes)))
         if rt.duty_cycle_percent is not None:
             runtime_duty.append((rt_labels, _fmt_float(rt.duty_cycle_percent)))
+        if rt.hbm_bandwidth_utilization_percent is not None:
+            runtime_hbm_bw.append((rt_labels, _fmt_float(rt.hbm_bandwidth_utilization_percent)))
 
     add_metric(
         "freetpu_tpu_info",
@@ -1597,10 +2024,46 @@ def format_prometheus_metrics(snapshot: ExporterSnapshot) -> str:
         hbm_ratio_samples,
     )
     add_metric(
+        "freetpu_tpu_hbm_bandwidth_utilization_percent",
+        "TPU HBM memory bandwidth utilization percentage (0 to 100).",
+        "gauge",
+        hbm_bw_samples,
+    )
+    add_metric(
         "freetpu_tpu_duty_cycle_percent",
         "TPU MXU duty cycle utilization percentage (0 to 100).",
         "gauge",
         duty_samples,
+    )
+    add_metric(
+        "freetpu_pcie_aer_correctable_total",
+        "Cumulative PCIe Advanced Error Reporting (AER) correctable error count from sysfs.",
+        "counter",
+        aer_corr_samples,
+    )
+    add_metric(
+        "freetpu_pcie_aer_fatal_total",
+        "Cumulative PCIe Advanced Error Reporting (AER) fatal error count from sysfs.",
+        "counter",
+        aer_fatal_samples,
+    )
+    add_metric(
+        "freetpu_tpu_shm_hbm_allocated_bytes",
+        "Bare-metal libopentpu.so shared-memory HBM pool capacity in bytes.",
+        "gauge",
+        shm_hbm_alloc_samples,
+    )
+    add_metric(
+        "freetpu_tpu_mxu_active_cycles_total",
+        "Cumulative MXU active cycles reported via libopentpu.so SeqLock shared memory.",
+        "counter",
+        mxu_cycles_samples,
+    )
+    add_metric(
+        "freetpu_tpu_dma_bytes_transferred_total",
+        "Cumulative DMA bytes transferred reported via libopentpu.so SeqLock shared memory.",
+        "counter",
+        dma_bytes_samples,
     )
     add_metric(
         "freetpu_tpu_active_pids",
@@ -1632,6 +2095,19 @@ def format_prometheus_metrics(snapshot: ExporterSnapshot) -> str:
         "gauge",
         runtime_duty,
     )
+    add_metric(
+        "freetpu_tpu_runtime_hbm_bandwidth_utilization_percent",
+        "TPU Runtime Utilization HBM bandwidth utilization percentage keyed by libtpu runtime chip ID.",
+        "gauge",
+        runtime_hbm_bw,
+    )
+    if snapshot.gcp_preempted_status is not None:
+        add_metric(
+            "gcp_metadata_preempted_status",
+            "GCP Spot/Preemptible VM preemption status from instance metadata (1 = preempted, 0 = active).",
+            "gauge",
+            [({}, str(snapshot.gcp_preempted_status))],
+        )
 
     return "\n".join(lines) + "\n"
 
@@ -1729,6 +2205,10 @@ class _ExporterServer(ThreadingHTTPServer):
         chip_id_map: Optional[Dict[str, str]] = None,
         skip_pid_scan: bool = False,
         runtime_metrics_addr: Optional[str] = "127.0.0.1:8431",
+        shm_root: Optional[Path] = Path("/dev/shm"),
+        gcp_metadata_preemption: bool = False,
+        gcp_metadata_url: str = DEFAULT_GCP_METADATA_PREEMPTED_URL,
+        gcp_metadata_timeout_s: float = 0.5,
         max_workers: int = DEFAULT_MAX_HTTP_WORKERS,
         scrape_timeout_s: float = 10.0,
     ) -> None:
@@ -1740,6 +2220,10 @@ class _ExporterServer(ThreadingHTTPServer):
         self.chip_id_map = chip_id_map
         self.skip_pid_scan = skip_pid_scan
         self.runtime_metrics_addr = runtime_metrics_addr
+        self.shm_root = shm_root
+        self.gcp_metadata_preemption = gcp_metadata_preemption
+        self.gcp_metadata_url = gcp_metadata_url
+        self.gcp_metadata_timeout_s = gcp_metadata_timeout_s
         self.scrape_timeout_s = scrape_timeout_s
         self._scrape_lock = threading.Lock()
         scrape_cap = max(1, max_workers)
@@ -1791,6 +2275,10 @@ class _ExporterServer(ThreadingHTTPServer):
                 chip_id_map=self.chip_id_map,
                 skip_pid_scan=self.skip_pid_scan,
                 runtime_metrics_addr=self.runtime_metrics_addr,
+                shm_root=self.shm_root,
+                gcp_metadata_preemption=self.gcp_metadata_preemption,
+                gcp_metadata_url=self.gcp_metadata_url,
+                gcp_metadata_timeout_s=self.gcp_metadata_timeout_s,
             )
         finally:
             self._scrape_lock.release()
@@ -2013,9 +2501,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--runtime-metrics-addr",
         default="127.0.0.1:8431",
         help=(
-            "Loopback `libtpu` gRPC address for direct `tpu_info.metrics` queries "
+            "Loopback `libtpu` gRPC address for direct RuntimeMetricService queries "
             "(default: 127.0.0.1:8431; empty string disables direct gRPC queries)."
         ),
+    )
+    parser.add_argument(
+        "--shm-root",
+        type=Path,
+        default=Path("/dev/shm"),
+        help="Shared-memory directory for libopentpu.so SeqLock files (default: /dev/shm).",
+    )
+    parser.add_argument(
+        "--gcp-metadata-preemption",
+        action="store_true",
+        default=False,
+        help="Opt-in fast poll of GCP Spot/Preemptible instance metadata for gcp_metadata_preempted_status.",
+    )
+    parser.add_argument(
+        "--gcp-metadata-url",
+        default=DEFAULT_GCP_METADATA_PREEMPTED_URL,
+        help=f"Override GCP metadata preemption URL (default: {DEFAULT_GCP_METADATA_PREEMPTED_URL}).",
+    )
+    parser.add_argument(
+        "--gcp-metadata-timeout",
+        type=float,
+        default=0.5,
+        help="Fast timeout in seconds for GCP metadata preemption queries (default: 0.5).",
     )
     parser.add_argument(
         "--max-workers",
@@ -2054,6 +2565,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 chip_id_map=chip_id_map,
                 skip_pid_scan=args.no_pid_scan,
                 runtime_metrics_addr=runtime_metrics_addr,
+                shm_root=args.shm_root,
+                gcp_metadata_preemption=args.gcp_metadata_preemption,
+                gcp_metadata_url=args.gcp_metadata_url,
+                gcp_metadata_timeout_s=args.gcp_metadata_timeout,
             )
         except ValueError as exc:
             sys.stderr.write(f"freetpu tpu-exporter error: {exc}\n")
@@ -2075,6 +2590,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         chip_id_map=chip_id_map,
         skip_pid_scan=args.no_pid_scan,
         runtime_metrics_addr=runtime_metrics_addr,
+        shm_root=args.shm_root,
+        gcp_metadata_preemption=args.gcp_metadata_preemption,
+        gcp_metadata_url=args.gcp_metadata_url,
+        gcp_metadata_timeout_s=args.gcp_metadata_timeout,
         max_workers=args.max_workers,
     )
     health_server: Optional[_HealthServer] = None

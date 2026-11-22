@@ -46,6 +46,15 @@
 #      (`SIGTERM`), `freetpu-cdi-sync` passes `--unlink-on-exit` to remove
 #      `/var/run/cdi/freetpu.json`; after forced termination (`SIGKILL`), delete
 #      `/var/run/cdi/freetpu.json` on the host manually.
+#      On Linux 6.8+ `iommufd` hosts, `freetpu_cdi.py` auto-detects `/dev/iommu`
+#      and emits `/dev/iommu` + `/dev/vfio/devices/vfioN` (mount `/dev/iommu`
+#      and `/dev/vfio/devices` into `freetpu-cdi-sync` if running on `iommufd`
+#      nodes). In default `--network-mode isolated`, CDI v1.1.0 injects
+#      `MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353`, `TPU_HOST_BOUNDS=1,1,1`,
+#      slice-scoped `TPU_CHIPS_PER_HOST_BOUNDS`, `TPU_VISIBLE_DEVICES`, and
+#      `TPU_SKIP_MDS_QUERY=1` so single-host TPU pods do NOT require
+#      `hostNetwork: true` and can share a `v6e-8` across NUMA slices without
+#      port `8353` collisions.
 #      VFIO MEMLOCK PREREQUISITE: CDI device injection does not configure
 #      `RLIMIT_MEMLOCK` or Linux capabilities, and Kubernetes Pods have no
 #      `--ulimit` field. On self-managed nodes inheriting a restrictive systemd
@@ -265,6 +274,8 @@ spec:
             - /var/run/cdi/freetpu.json
             - --interval
             - "15"
+            - --network-mode
+            - isolated
             - --unlink-on-exit
           # Report Ready only while `/var/run/cdi/freetpu.json` exists and passes
           # live host VFIO verification (read-only; the sync loop owns writes/cleanup).
