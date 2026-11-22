@@ -540,9 +540,10 @@ def validate_skill(
                 check=False,
             )
             if proc.returncode != 0:
+                redacted_out = redact_secrets((proc.stderr or proc.stdout).strip())
                 errors.append(
                     f"Template self-test failed ({rel}, rc={proc.returncode}): "
-                    f"{(proc.stderr or proc.stdout).strip()[-400:]}"
+                    f"{redacted_out[-400:]}"
                 )
                 continue
             try:
@@ -774,6 +775,35 @@ def run_validator_self_test(*, require_yaml: bool = False) -> None:
             joined = "\n".join(errs)
             assert any(label in e for e in errs), f"Expected clean-room detection for {label}, got: {errs}"
             assert tok not in joined, f"Credential leaked in diagnostic: {joined!r}"
+
+    # Verify failed self-test output is redacted in FULL before the [-400:] tail cut.
+    pem_body_secret = "MIIE_SYNTHETIC_SECRET_BODY_DO_NOT_LEAK_9876543210"
+    tok_tail_secret = "Z9y8X7w6V5u4T3s2R1q0P9o8N7m6"
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        sdir = root / "skills" / "freetpu"
+        (sdir / "templates").mkdir(parents=True)
+        (sdir / "SKILL.md").write_text(
+            "---\nname: freetpu\ndescription: Valid string description that is definitely longer than forty characters.\n---\n",
+            encoding="utf-8",
+        )
+        # Emit a PEM block whose header starts before the last 400 chars and a token straddling the -400 cutoff.
+        (sdir / "templates" / "leaky_fail.py").write_text(
+            "import sys\n"
+            f"pem = '-----BEGIN RSA PRIVATE ' + 'KEY-----\\n' + ('A' * 300) + '{pem_body_secret}\\n-----END RSA PRIVATE ' + 'KEY-----\\n'\n"
+            f"tok = 'ghp_' + '{tok_tail_secret}'\n"
+            "sys.stderr.write(pem + tok + ('x' * 390))\n"
+            "sys.exit(1)\n",
+            encoding="utf-8",
+        )
+        readme = root / "README.md"
+        readme.write_text("# Agent Skill\nInstall `skills/freetpu`.\n", encoding="utf-8")
+        errs = validate_skill(root, sdir, readme, run_self_tests=True, require_yaml=require_yaml)
+        joined = "\n".join(errs)
+        assert any("Template self-test failed" in e for e in errs), f"Expected self-test failure, got: {errs}"
+        assert pem_body_secret not in joined, f"PEM body leaked across [-400:] cut: {joined!r}"
+        assert tok_tail_secret not in joined, f"Token suffix leaked across [-400:] cut: {joined!r}"
+        assert "[REDACTED_GITHUB_TOKEN]" in joined, f"Expected token redaction marker in: {joined!r}"
 
     # Verify templates using `from __future__ import annotations` are rejected (breaks `colab run` cell prepending).
     with tempfile.TemporaryDirectory() as tmp:

@@ -204,11 +204,18 @@ Use this workflow with `google-colab-cli >= 0.7.6` (redacted logs) to run Pallas
          RUN_PID=""
        fi
        if [ "$RUN_RC" -eq 0 ] && [ "$CANCELLED" -eq 0 ]; then
+         EXEC_LOG="$WORK_DIR/$SESSION_ID.exec.log"
          colab --auth=adc --config "$COLAB_STATE" exec -s "$SESSION_ID" --timeout 300 \
-           <<< 'import runpy, sys; sys.argv = ["/content/tile_swiglu.py"]; runpy.run_path("/content/tile_swiglu.py", run_name="__main__")' &
+           <<< 'import runpy, sys; sys.argv = ["/content/tile_swiglu.py"]; runpy.run_path("/content/tile_swiglu.py", run_name="__main__"); print("__FREETPU_EXEC_OK__")' \
+           >"$EXEC_LOG" 2>&1 &
          RUN_PID=$!
          wait "$RUN_PID" || RUN_RC=$?
          RUN_PID=""
+         cat "$EXEC_LOG"
+         if [ "$RUN_RC" -eq 0 ] && ! grep -Fxq "__FREETPU_EXEC_OK__" "$EXEC_LOG"; then
+           echo "ERROR: remote TPU benchmark did not emit completion marker __FREETPU_EXEC_OK__." >&2
+           RUN_RC=1
+         fi
        fi
      )
      ```
