@@ -642,10 +642,22 @@ def run_comms_server(bind_host: str, port: int) -> None:
         srv.close()
 
 
+def _comms_roundtrip(cli: socket.socket, msg: bytes, timeout_s: float) -> bytes:
+    """Send one framed payload and read the echoed response within a single absolute deadline."""
+    deadline = time.monotonic() + timeout_s
+    remaining = deadline - time.monotonic()
+    if remaining <= 0.0:
+        raise socket.timeout("Comms request deadline exceeded")
+    cli.settimeout(remaining)
+    cli.sendall(msg)
+    return _recv_exact(cli, len(msg), deadline=deadline)
+
+
 def run_comms_suite(
     host: str = "127.0.0.1",
     port: int = 0,
     quick: bool = False,
+    response_timeout_s: float = COMMS_READ_TIMEOUT_S,
 ) -> Dict[str, Any]:
     """Measure PP/MoE activation-hop RTT, half-RTT ping-pong estimate, and throughput."""
     payload_sizes = (
@@ -677,21 +689,18 @@ def run_comms_suite(
 
     cases: List[Dict[str, Any]] = []
     try:
-        with socket.create_connection((host, port), timeout=15.0) as cli:
+        with socket.create_connection((host, port), timeout=response_timeout_s) as cli:
             cli.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             for size in payload_sizes:
                 msg = struct.pack("!Q", size) + (b"\x5a" * size)
-                expected_len = len(msg)
-                # Warmup
+                # Warmup (bounded by per-response absolute deadline)
                 for _ in range(2):
-                    cli.sendall(msg)
-                    _ = _recv_exact(cli, expected_len)
+                    _ = _comms_roundtrip(cli, msg, response_timeout_s)
 
                 rtt_us: List[float] = []
                 for _ in range(iters):
                     t0 = time.perf_counter_ns()
-                    cli.sendall(msg)
-                    _ = _recv_exact(cli, expected_len)
+                    _ = _comms_roundtrip(cli, msg, response_timeout_s)
                     rtt_us.append((time.perf_counter_ns() - t0) / 1e3)
 
                 st_rtt = _stats_summary(rtt_us)
@@ -712,6 +721,7 @@ def run_comms_suite(
                     "peak_gbps": round(peak_bidir_gbps, 3),
                 })
             # Clean shutdown signal
+            cli.settimeout(response_timeout_s)
             cli.sendall(struct.pack("!Q", 0))
     finally:
         if srv_thread is not None:
@@ -771,15 +781,21 @@ def run_jax_tpu_suites(suites: Sequence[str], quick: bool = False, allow_jax_cpu
     import jax.numpy as jnp  # type: ignore
 
     devices = jax.devices()
-    backend_name = jax.default_backend()
-    if backend_name != "tpu" and not allow_jax_cpu:
-        raise RuntimeError(
-            f"JAX default backend is {backend_name!r}, not 'tpu'. "
-            "Use `--backend colab_tpu` for remote Colab TPU or pass `--allow-jax-cpu`."
-        )
-
+    backend_name = str(jax.default_backend() or "").lower()
     dev = devices[0]
     actual_platform = str(getattr(dev, "platform", backend_name) or backend_name).lower()
+    if actual_platform != "tpu":
+        if not (allow_jax_cpu and actual_platform == "cpu"):
+            detail = (
+                " (`--allow-jax-cpu` permits only the JAX 'cpu' backend, not GPU/CUDA)."
+                if allow_jax_cpu
+                else " or pass `--allow-jax-cpu` on a CPU-only host."
+            )
+            raise RuntimeError(
+                f"JAX backend/platform is {actual_platform!r}, not 'tpu'. "
+                f"Use `--backend colab_tpu` for remote Colab TPU{detail}"
+            )
+
     dev_kind = getattr(dev, "device_kind", actual_platform)
 
     results: Dict[str, Any] = {
@@ -1822,27 +1838,44 @@ def build_scorecard_rows(
     if backend in ("jax_tpu", "colab_tpu"):
         # Only emit a TPU/JAX row when actual compute or bandwidth results exist.
         if comp or bw:
-            jax_default_backend = str(dev_info.get("default_backend") or "").lower()
+            jax_default_backend = str(
+                dev_info.get("default_backend") or bw.get("jax_backend") or comp.get("jax_backend") or ""
+            ).lower()
             is_jax_cpu = backend == "jax_tpu" and jax_default_backend == "cpu"
+            is_jax_non_tpu = backend == "jax_tpu" and bool(jax_default_backend) and jax_default_backend != "tpu"
             kind = dev_info.get("device_kind") or (colab_tpu.upper() if colab_tpu else "Cloud TPU")
-            label = f"LIVE RUN: {kind} (jax_cpu)" if is_jax_cpu else f"LIVE RUN: {kind} ({backend})"
-            inferred_cost = None if is_jax_cpu else _infer_tpu_hourly_cost_usd(str(kind), colab_tpu)
+            label = (
+                f"LIVE RUN: {kind} (jax_{jax_default_backend})"
+                if is_jax_non_tpu
+                else f"LIVE RUN: {kind} ({backend})"
+            )
+            inferred_cost = None if is_jax_non_tpu else _infer_tpu_hourly_cost_usd(str(kind), colab_tpu)
             cost_basis = (
                 "local host CPU (JAX --allow-jax-cpu)"
                 if is_jax_cpu
-                else (f"GCP public on-demand rate (${inferred_cost:.2f}/chip-hr)" if inferred_cost else "local/unspecified")
+                else (
+                    f"local JAX {jax_default_backend} (non-TPU)"
+                    if is_jax_non_tpu
+                    else (f"GCP public on-demand rate (${inferred_cost:.2f}/chip-hr)" if inferred_cost else "local/unspecified")
+                )
             )
             mem_limit = None if is_jax_cpu else dev_info.get("hbm_bytes_limit")
-            fallback_gib = None if is_jax_cpu else _infer_tpu_fallback_memory_gib(str(kind), colab_tpu)
-            mem_str = (
-                "host RAM (JAX CPU)"
-                if is_jax_cpu
-                else (
+            fallback_gib = None if is_jax_non_tpu else _infer_tpu_fallback_memory_gib(str(kind), colab_tpu)
+            if is_jax_cpu:
+                mem_str = "host RAM (JAX CPU)"
+            elif is_jax_non_tpu:
+                non_tpu_space = str(bw.get("memory_space") or f"JAX {jax_default_backend} memory")
+                mem_str = (
+                    f"{mem_limit / (1024**3):.2f} GiB {non_tpu_space}"
+                    if mem_limit
+                    else non_tpu_space
+                )
+            else:
+                mem_str = (
                     f"{mem_limit / (1024**3):.2f} GiB HBM"
                     if mem_limit
                     else (f"{fallback_gib:g} GiB HBM (spec)" if fallback_gib is not None else "TPU HBM")
                 )
-            )
             # Compare against --model-gb in matching decimal GB (reserve GiB strictly for display).
             live_mem_gb_exact: Optional[float] = (
                 (float(mem_limit) / 1e9)
@@ -3576,6 +3609,83 @@ def run_self_test() -> int:
     assert jax_cpu_rows[0]["memory"] == "host RAM (JAX CPU)"
     assert "TPU HBM" not in jax_cpu_rows[0]["memory"]
     assert "(jax_cpu)" in jax_cpu_rows[0]["target"]
+
+    # 4t. `--allow-jax-cpu` MUST NOT admit GPU/CUDA backends, and scorecard MUST NOT label GPU as TPU HBM
+    class _FakeGpuDev:
+        platform = "gpu"
+        device_kind = "NVIDIA RTX 5090"
+
+    fake_gpu_jax = types.SimpleNamespace(
+        __version__="0.0.0-stub",
+        devices=lambda: [_FakeGpuDev()],
+        default_backend=lambda: "gpu",
+        numpy=fake_jnp,
+    )
+    sys.modules["jax"] = fake_gpu_jax  # type: ignore[assignment]
+    sys.modules["jax.numpy"] = fake_jnp  # type: ignore[assignment]
+    try:
+        try:
+            run_jax_tpu_suites(["bandwidth"], quick=True, allow_jax_cpu=True)
+        except RuntimeError as exc:
+            assert "gpu" in str(exc).lower() and "cpu" in str(exc).lower(), str(exc)
+        else:  # pragma: no cover
+            raise AssertionError("Expected RuntimeError when JAX platform is 'gpu' even with allow_jax_cpu=True")
+    finally:
+        if had_jax_s:
+            sys.modules["jax"] = prev_jax_s  # type: ignore[assignment]
+        else:
+            sys.modules.pop("jax", None)
+        if had_jnp_s:
+            sys.modules["jax.numpy"] = prev_jnp_s  # type: ignore[assignment]
+        else:
+            sys.modules.pop("jax.numpy", None)
+
+    gpu_rows = build_scorecard_rows({
+        "backend": "jax_tpu",
+        "device_info": {"default_backend": "gpu", "device_kind": "NVIDIA RTX 5090", "hbm_bytes_limit": None},
+        "bandwidth": {"jax_backend": "gpu", "memory_space": "GPU HBM/VRAM", "peak_triad_gbps": 1500.0},
+    })
+    assert "TPU HBM" not in gpu_rows[0]["memory"] and "GPU" in gpu_rows[0]["memory"]
+    assert "(jax_gpu)" in gpu_rows[0]["target"]
+
+    # 4u. Comms client MUST enforce an absolute per-response deadline against a trickle peer
+    trickle_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    trickle_srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    trickle_srv.bind(("127.0.0.1", 0))
+    trickle_srv.listen(1)
+    trickle_port = trickle_srv.getsockname()[1]
+    trickle_stop = threading.Event()
+
+    def _trickle_peer() -> None:
+        try:
+            conn, _ = trickle_srv.accept()
+            with conn:
+                conn.settimeout(1.0)
+                _ = conn.recv(65536)
+                while not trickle_stop.is_set():
+                    try:
+                        conn.sendall(b"\x00")
+                    except OSError:
+                        break
+                    time.sleep(0.03)
+        except OSError:
+            pass
+
+    t_trickle = threading.Thread(target=_trickle_peer, daemon=True)
+    t_trickle.start()
+    t_start_trickle = time.monotonic()
+    try:
+        try:
+            run_comms_suite("127.0.0.1", trickle_port, quick=True, response_timeout_s=0.12)
+        except socket.timeout:
+            pass
+        else:  # pragma: no cover
+            raise AssertionError("Expected socket.timeout against slow-trickle comms peer")
+        assert time.monotonic() - t_start_trickle < 1.5
+    finally:
+        trickle_stop.set()
+        trickle_srv.close()
+        t_trickle.join(timeout=2.0)
 
     # 5. Verify this script compiles and loads under a `colab run` executable prelude
     src_text = Path(__file__).read_text(encoding="utf-8")

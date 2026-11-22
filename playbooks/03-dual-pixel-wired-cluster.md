@@ -113,13 +113,13 @@ adb -s <node1_serial> shell "su -c 'iptables -C INPUT ! -i lo -p tcp --dport 500
 adb -s <node2_serial> forward tcp:localhost:50052 tcp:50052
 adb -s <node1_serial> reverse tcp:localhost:50052 tcp:50052
 
-# Verify Node 1 listener is bound strictly to loopback (fail if listening on 0.0.0.0, *, or [::])
-adb -s <node1_serial> shell "su -c 'listen=\$(ss -Htlpn sport = :50052); \
+# Verify Node 1 listener on TCP 50052 (0xC384) via kernel procfs (works on production Android builds without `ss`).
+# Require >=1 loopback LISTEN (0A) socket and zero non-loopback/wildcard listeners; chain with `&&` so `llama-bench`
+# does NOT run if listener verification fails.
+adb -s <node1_serial> shell "su -c 'listen=\$(grep -ihE \"^[[:space:]]*[0-9]+:[[:space:]]+[0-9A-F]+:C384[[:space:]]+[0-9A-F]+:0000[[:space:]]+0A[[:space:]]\" /proc/net/tcp /proc/net/tcp6 2>/dev/null); \
   printf \"%s\n\" \"\$listen\"; \
-  printf \"%s\n\" \"\$listen\" | grep -qE \"(127\\.0\\.0\\.1|\\[::1\\]):50052\" && \
-  ! printf \"%s\n\" \"\$listen\" | grep -qE \"(0\\.0\\.0\\.0|\\*|\\[::\\]):50052\"'"
-
-# Node 1: split layers across Node 2 RPC (over verified loopback tunnel) + local EDGETPU
+  printf \"%s\n\" \"\$listen\" | grep -qiE \"^[[:space:]]*[0-9]+:[[:space:]]+(0100007F|00000000000000000000000001000000|0000000000000000FFFF00000100007F):C384[[:space:]]\" && \
+  ! printf \"%s\n\" \"\$listen\" | grep -qivE \"^[[:space:]]*[0-9]+:[[:space:]]+(0100007F|00000000000000000000000001000000|0000000000000000FFFF00000100007F):C384[[:space:]]\"'" && \
 adb -s <node1_serial> shell "su -c 'OPENBUENOS_DIVE_INTERP_PATH=/data/local/tmp/tpu_open_stack/dive_interp_rv64.bin \
   OPENBUENOS_PERF_MODE=5 \
   /data/local/tmp/tpu_open_stack/llama-bench \
