@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,21 @@ DEFAULT_MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024
 DEFAULT_CLIENT_READ_TIMEOUT_S = 30.0
 DEFAULT_CLIENT_HEADER_TIMEOUT_S = 10.0
 DEFAULT_MAX_CONCURRENT_CONNECTIONS = 128
+DEFAULT_MAX_SSE_PRE_COMMIT_BYTES = 1024 * 1024
+
+
+def is_loopback_host(host: str) -> bool:
+    """Return True if `host` is a loopback hostname (`localhost`) or IP (`127.0.0.0/8`, `::1`)."""
+    cleaned = host.strip().lower().rstrip(".")
+    if cleaned.startswith("[") and cleaned.endswith("]"):
+        cleaned = cleaned[1:-1]
+    if cleaned == "localhost":
+        return True
+    addr_str = cleaned.split("%", 1)[0]
+    try:
+        return ipaddress.ip_address(addr_str).is_loopback
+    except ValueError:
+        return False
 
 
 def sanitize_url(url: str) -> str:
@@ -72,6 +88,7 @@ class BackendConfig:
     max_duty_cycle_percent: Optional[float] = None
     api_key: Optional[str] = None
     api_key_env: Optional[str] = None
+    allow_insecure_http: bool = False
     latency_hint_ms: Optional[float] = None
     enabled: bool = True
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -89,6 +106,22 @@ class BackendConfig:
             self.tpu_exporter_url = validate_http_url(
                 self.tpu_exporter_url,
                 field_name=f"backend {self.id!r} tpu_exporter_url",
+            )
+        has_credentials = bool(
+            (self.api_key and self.api_key.strip())
+            or (self.api_key_env and self.api_key_env.strip())
+        )
+        parts = urlsplit(self.base_url)
+        if (
+            has_credentials
+            and parts.scheme.lower() == "http"
+            and not is_loopback_host(parts.hostname or "")
+            and not self.allow_insecure_http
+        ):
+            raise ValueError(
+                f"Backend {self.id!r} configures bearer credentials over plaintext HTTP "
+                f"to non-loopback host {parts.hostname!r}; use 'https://' or explicitly "
+                "set 'allow_insecure_http': true"
             )
 
     def resolved_api_key(self) -> Optional[str]:
@@ -190,6 +223,7 @@ class BackendConfig:
             api_key_env=(
                 str(raw["api_key_env"]).strip() if raw.get("api_key_env") else None
             ),
+            allow_insecure_http=bool(raw.get("allow_insecure_http", False)),
             latency_hint_ms=lat_hint_val,
             enabled=bool(raw.get("enabled", True)),
             metadata=dict(raw.get("metadata") or {}),
@@ -214,6 +248,7 @@ class RouterConfig:
     client_read_timeout_s: float = DEFAULT_CLIENT_READ_TIMEOUT_S
     client_header_timeout_s: float = DEFAULT_CLIENT_HEADER_TIMEOUT_S
     max_concurrent_connections: int = DEFAULT_MAX_CONCURRENT_CONNECTIONS
+    max_sse_pre_commit_bytes: int = DEFAULT_MAX_SSE_PRE_COMMIT_BYTES
     cors_allowed_origins: List[str] = field(default_factory=list)
     auth: Dict[str, Any] = field(default_factory=dict)
     usage_meter: Dict[str, Any] = field(default_factory=dict)
@@ -249,6 +284,8 @@ class RouterConfig:
             raise ValueError("client_header_timeout_s must be > 0")
         if self.max_concurrent_connections <= 0:
             raise ValueError("max_concurrent_connections must be > 0")
+        if self.max_sse_pre_commit_bytes <= 0:
+            raise ValueError("max_sse_pre_commit_bytes must be > 0")
         if isinstance(self.cors_allowed_origins, (str, bytes)):
             raise ValueError("cors_allowed_origins must be a list of origin strings")
         normalized_origins: List[str] = []
@@ -352,6 +389,9 @@ class RouterConfig:
             ),
             max_concurrent_connections=int(
                 raw.get("max_concurrent_connections", DEFAULT_MAX_CONCURRENT_CONNECTIONS)
+            ),
+            max_sse_pre_commit_bytes=int(
+                raw.get("max_sse_pre_commit_bytes", DEFAULT_MAX_SSE_PRE_COMMIT_BYTES)
             ),
             cors_allowed_origins=cors_origins,
             auth=dict(raw_auth or {}),

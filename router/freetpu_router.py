@@ -32,6 +32,7 @@ from router.config import (  # noqa: E402
     VALID_AUTH_TYPES,
     VALID_POLICIES,
     VALID_URL_SCHEMES,
+    is_loopback_host,
     load_config,
     sanitize_url,
     validate_http_url,
@@ -101,6 +102,122 @@ def _open_http_connection(
     raise ValueError(
         f"Unsupported backend URL scheme {scheme!r}; expected one of {VALID_URL_SCHEMES}"
     )
+
+
+def _ensure_safe_credential_transport(
+    backend: BackendConfig,
+    scheme: str,
+    host: str,
+    api_key: Optional[str],
+) -> None:
+    """Refuse to transmit backend bearer tokens over plaintext HTTP to non-loopback hosts."""
+    if (
+        api_key
+        and scheme.lower() == "http"
+        and not is_loopback_host(host)
+        and not backend.allow_insecure_http
+    ):
+        raise ValueError(
+            f"Refusing to send bearer credentials for backend {backend.id!r} over "
+            f"plaintext HTTP to non-loopback host {host!r}; use 'https://' or set "
+            "'allow_insecure_http': true"
+        )
+
+
+def _expected_stream_choices(endpoint: str, req_payload: Mapping[str, Any]) -> int:
+    raw_n = req_payload.get("n", 1)
+    n_val = (
+        raw_n
+        if isinstance(raw_n, int) and not isinstance(raw_n, bool) and raw_n >= 1
+        else 1
+    )
+    if endpoint == "/v1/completions":
+        prompt = req_payload.get("prompt")
+        if isinstance(prompt, list) and prompt:
+            if all(isinstance(item, (str, list)) for item in prompt):
+                return len(prompt) * n_val
+    return n_val
+
+
+class _BoundedSSEReader:
+    """Incremental SSE line reader decoding HTTP framing via `HTTPResponse.read1()`.
+
+    Enforces optional wall-clock deadlines and byte caps on every incremental
+    read so partial lines without newlines cannot exceed the byte cap or stall
+    past the deadline.
+    """
+
+    def __init__(
+        self,
+        resp: http.client.HTTPResponse,
+        upstream_sock: Any,
+        *,
+        chunk_size: int = 8192,
+    ) -> None:
+        self._resp = resp
+        self._sock = upstream_sock
+        self._chunk_size = chunk_size
+        self._buf = bytearray()
+        self._eof = False
+
+    def readline(
+        self,
+        *,
+        deadline: Optional[float] = None,
+        max_bytes: Optional[int] = None,
+    ) -> Tuple[bytes, bool]:
+        """Read one SSE line (`...\\n`) or EOF (`b""`).
+
+        Returns `(line, exceeded_max_bytes)`. Raises `TimeoutError` if `deadline`
+        expires before a newline or EOF arrives.
+        """
+        while True:
+            nl_idx = self._buf.find(b"\n")
+            if nl_idx != -1:
+                end = nl_idx + 1
+                if max_bytes is not None and end > max_bytes:
+                    return b"", True
+                out = bytes(self._buf[:end])
+                del self._buf[:end]
+                return out, False
+
+            if max_bytes is not None and len(self._buf) > max_bytes:
+                return b"", True
+
+            if self._eof:
+                out = bytes(self._buf)
+                self._buf.clear()
+                return out, False
+
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Timed out waiting for first SSE output")
+                if self._sock is not None:
+                    try:
+                        self._sock.settimeout(remaining)
+                    except OSError:
+                        pass
+
+            to_read = self._chunk_size
+            if max_bytes is not None:
+                budget_left = (max_bytes - len(self._buf)) + 1
+                if budget_left <= 0:
+                    return b"", True
+                to_read = min(to_read, budget_left)
+
+            chunk = self._resp.read1(to_read)
+            if not chunk:
+                self._eof = True
+                if self._buf:
+                    if max_bytes is not None and len(self._buf) > max_bytes:
+                        return b"", True
+                    out = bytes(self._buf)
+                    self._buf.clear()
+                    return out, False
+                return b"", False
+
+            self._buf.extend(chunk)
 
 
 def _estimate_prompt_tokens(payload: Mapping[str, Any]) -> int:
@@ -583,6 +700,7 @@ class RouterEngine:
         scheme, host, port, path = _join_backend_url(backend.base_url, endpoint)
         headers: Dict[str, str] = {"Accept": "application/json"}
         api_key = backend.resolved_api_key()
+        _ensure_safe_credential_transport(backend, scheme, host, api_key)
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
 
@@ -1452,6 +1570,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                     "X-FreeTPU-Request-Id": req_id,
                 }
                 api_key = backend.config.resolved_api_key()
+                _ensure_safe_credential_transport(backend.config, scheme, host, api_key)
                 if api_key:
                     headers["Authorization"] = f"Bearer {api_key}"
 
@@ -1464,17 +1583,16 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                     )
 
                 if resp.status in RETRYABLE_STATUS_CODES:
+                    # Fail over immediately without waiting to drain a potentially stalled error body.
                     reason = f"http_{resp.status}"
-                    err_body = resp.read()
-                    err_ct = resp.getheader("Content-Type") or "application/json"
                     last_error_status = resp.status
                     last_error_msg = (
                         f"Backend {backend.config.id!r} returned {resp.status}"
                     )
                     last_error_type = "service_unavailable"
                     last_error_code = "backend_unavailable"
-                    last_error_body = err_body or None
-                    last_error_content_type = err_ct
+                    last_error_body = None
+                    last_error_content_type = "application/json"
                     engine.mark_backend_failed(backend, reason)
                     prev_failure = (backend.config.id, reason)
                     continue
@@ -1486,6 +1604,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         timeout_s=timeout_s,
                         backend=backend,
                         model=model,
+                        expected_choices=_expected_stream_choices(endpoint, req_payload),
                         req_id=req_id,
                         req_start=req_start,
                         attempt_start=attempt_start,
@@ -1649,6 +1768,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         timeout_s: float,
         backend: BackendState,
         model: str,
+        expected_choices: int,
         req_id: str,
         req_start: float,
         attempt_start: float,
@@ -1658,42 +1778,42 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
     ) -> bool:
         """Buffer until first generated output or terminator before committing 200 OK.
 
-        Uses HTTP/1.1 chunked transfer encoding for the committed SSE response so
-        premature upstream disconnects omit the terminating `0\\r\\n\\r\\n` chunk (in
-        addition to emitting an SSE error event) and are surfaced to HTTP clients
-        as incomplete streams rather than clean completions.
+        Uses incremental bounded reads via `_BoundedSSEReader` during pre-output
+        buffering so partial lines without newlines cannot exceed the byte cap or
+        stall past the elapsed deadline. Uses HTTP/1.1 chunked transfer encoding
+        for the committed SSE response so premature upstream disconnects omit the
+        terminating `0\\r\\n\\r\\n` chunk (in addition to emitting an SSE error event)
+        and are surfaced to HTTP clients as incomplete streams rather than clean
+        completions.
 
         Returns True if headers/stream were committed to the downstream client,
         or False if upstream closed or sent no qualifying output before commit.
         """
         engine = self.server.engine
+        sse_reader = _BoundedSSEReader(resp, upstream_sock)
         pre_commit_lines: List[bytes] = []
         pre_commit_bytes = 0
         pre_commit_events = 0
-        max_pre_commit_bytes = 1024 * 1024
+        max_pre_commit_bytes = engine.config.max_sse_pre_commit_bytes
         max_pre_commit_events = 64
         first_chunk_time: Optional[float] = None
         pending_event_data: List[bytes] = []
         pre_commit_deadline = attempt_start + timeout_s
 
-        # Phase 1: upstream-only read through HTTPResponse.readline() (decodes chunked framing).
-        # Enforce a total elapsed deadline so continuous keepalive comments cannot stall forever.
+        # Phase 1: upstream-only incremental read through HTTPResponse.read1().
+        # Enforce both byte cap and elapsed deadline as bytes arrive, even without newlines.
         while True:
-            remaining = pre_commit_deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("Timed out waiting for first SSE output")
-            if upstream_sock is not None:
-                try:
-                    upstream_sock.settimeout(remaining)
-                except OSError:
-                    pass
-            line = resp.readline()
-            if not line:
-                # EOF before generated output or valid stream terminator -> retryable failure.
+            remaining_bytes = max_pre_commit_bytes - pre_commit_bytes
+            if remaining_bytes <= 0:
+                return False
+            line, exceeded_cap = sse_reader.readline(
+                deadline=pre_commit_deadline,
+                max_bytes=remaining_bytes,
+            )
+            if exceeded_cap or not line:
+                # Byte cap exceeded or EOF before generated output/terminator -> retryable failure.
                 return False
             pre_commit_bytes += len(line)
-            if pre_commit_bytes > max_pre_commit_bytes:
-                return False
             pre_commit_lines.append(line)
             if line in (b"\n", b"\r\n", b"\r"):
                 if pending_event_data:
@@ -1733,15 +1853,17 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         est_completion_chars = 0
         saw_explicit_prompt_usage = False
         saw_explicit_completion_usage = False
-        stream_completed = False
+        saw_done_sentinel = False
+        finished_choice_indices: set[int] = set()
         upstream_read_error = False
         downstream_write_error = False
         event_data_lines: List[bytes] = []
+        required_choices = max(1, expected_choices)
 
         def process_sse_event() -> None:
             nonlocal first_content_ttft_ms, prompt_tokens, completion_tokens
             nonlocal est_completion_chars, saw_explicit_prompt_usage
-            nonlocal saw_explicit_completion_usage, stream_completed
+            nonlocal saw_explicit_completion_usage, saw_done_sentinel
             if not event_data_lines:
                 return
             payload_bytes = b"\n".join(event_data_lines).strip()
@@ -1749,7 +1871,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             if not payload_bytes:
                 return
             if payload_bytes == b"[DONE]":
-                stream_completed = True
+                saw_done_sentinel = True
                 return
             try:
                 obj = json.loads(payload_bytes.decode("utf-8", errors="replace"))
@@ -1761,8 +1883,11 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             if isinstance(choices, list):
                 for choice in choices:
                     if isinstance(choice, Mapping) and choice.get("finish_reason") is not None:
-                        stream_completed = True
-                        break
+                        c_idx = choice.get("index")
+                        if isinstance(c_idx, int) and not isinstance(c_idx, bool) and c_idx >= 0:
+                            finished_choice_indices.add(c_idx)
+                        else:
+                            finished_choice_indices.add(len(finished_choice_indices))
             output_txt = _extract_choice_output_text(obj)
             if output_txt:
                 if first_content_ttft_ms is None:
@@ -1833,7 +1958,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             event_chunk_buf = bytearray()
             while True:
                 try:
-                    line = resp.readline()
+                    line, _ = sse_reader.readline()
                 except (OSError, TimeoutError, http.client.HTTPException):
                     upstream_read_error = True
                     break
@@ -1858,6 +1983,10 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                     downstream_write_error = True
 
         process_sse_event()
+        all_choices_finished = all(
+            idx in finished_choice_indices for idx in range(required_choices)
+        )
+        stream_completed = saw_done_sentinel or all_choices_finished
         premature_upstream_end = (
             not downstream_write_error
             and (upstream_read_error or not stream_completed)

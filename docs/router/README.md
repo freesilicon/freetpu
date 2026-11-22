@@ -137,6 +137,7 @@ For both non-streaming JSON and SSE (`stream: true`) requests:
 - For SSE streams, downstream `200 OK` headers are held until the first complete upstream SSE data event arrives, preventing partial-stream corruption on pre-first-token preemption or keepalive-only aborts.
 - Browser cross-origin access is disabled by default (`cors_allowed_origins: []`); untrusted `Origin` headers on inference `POST`s are rejected with `403`. Opt in explicitly via `"cors_allowed_origins"` in config or `--cors-origin`.
 - Inbound request bodies are bounded by `max_request_body_bytes` (default 10 MiB) and `client_read_timeout_s` (default 30s).
+- Authenticated non-loopback backends (`api_key` or `api_key_env` on a non-loopback host) require `https://` unless `"allow_insecure_http": true` is explicitly set on the backend.
 
 ---
 
