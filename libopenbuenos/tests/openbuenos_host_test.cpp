@@ -3655,7 +3655,9 @@ void test_phase7b_swiglu_chaining_2tier_and_outlier_cache() {
     CHECK(ob_context_get_profile(ctx, &p_before) == OB_OK);
     CHECK(ob_gemm_swiglu_f32_quant(ctx, a_spike.data(), &sd, c_spike.data(), &sq1) == OB_OK);
     CHECK(ob_context_get_profile(ctx, &p_after) == OB_OK);
-    CHECK(p_after.swiglu_fallbacks == p_before.swiglu_fallbacks + 1u);
+    CHECK((sq1.flags & OB_STAT_FLAG_CPU_FALLBACK) != 0u);
+    CHECK(sq1.tiles_dispatched == 0u);
+    CHECK(p_after.swiglu_fallbacks == p_before.swiglu_fallbacks); // CPU-only outlier path is not M7A TPU fallback!
     CHECK(ctx->weight_cache_map.size() == w_before_spike); // ZERO duplicate M7A weight-cache pollution!
 
     // Small prompt (M=7, default !swiglu_prefill_enabled) runs exact NEON FP32 on CPU:
@@ -4363,9 +4365,9 @@ void test_phase7_cycle3_regressions() {
     const double expected_y0 = (expected_dot / (1.0 + std::exp(-expected_dot))) * expected_dot;
     CHECK(std::fabs(static_cast<double>(c[0]) - expected_y0) / expected_y0 < 5e-3);
 
-    // Tiny activation scale (s_gate < 5e-4) must bypass chained 0x640 SiLU spline via M7A fallback!
+    // Tiny activation scale (s_gate < 5e-4, normal crest/RMS) must bypass chained 0x640 SiLU spline via M7A fallback!
     std::vector<float> a_tiny(K, 0.0f);
-    a_tiny[575] = 1.0e-6f;
+    for (uint32_t k = 0u; k < 10u; ++k) a_tiny[560u + k] = 1.0e-6f;
     ob_profile_stats_t pt0{}, pt1{};
     CHECK(ob_context_get_profile(ctx, &pt0) == OB_OK);
     CHECK(ob_gemm_swiglu_f32_quant(ctx, a_tiny.data(), &sd, c.data(), &s2) == OB_OK);
@@ -4452,7 +4454,62 @@ void test_phase7_cycle3_regressions() {
     ob_context_destroy(ctx);
   }
 
-  std::printf("[PASS] test_phase7_cycle3_regressions (dense 16MiB cap, immutable gen+O(1) hit, warm budget shrink, refcnt timeout retention, warm SwiGLU clip guard, cpu-only tiles_dispatched=0 OK)\n");
+  // 9. Exact INT8 SwiGLU stage profiling + single fallback count per multi-slice invocation.
+  {
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+    CHECK(ob_gemm_register_builtin_emitter(ctx, interp_file.path()) == OB_OK);
+    CHECK(ob_context_set_profile(ctx, 1) == OB_OK);
+    CHECK(ob_context_reset_profile(ctx) == OB_OK);
+
+    // 9a. Exact INT8 SwiGLU must populate stage timings when profiling is enabled.
+    constexpr uint32_t K = 576u, H = 1536u, N = 576u;
+    std::vector<int8_t> xi(K, 1), wg(H * K, 1), wu(H * K, 1), wd(N * H, 1), yi(N, 0);
+    ob_swiglu_int8_desc_t id{};
+    id.m_dim = 1u; id.k_dim = K; id.h_dim = H; id.n_dim = N;
+    id.s_in = 0.01f; id.s_wg = 0.01f; id.s_gate = 0.05f;
+    id.s_wu = 0.01f; id.s_up = 0.05f; id.s_silu = 0.05f;
+    id.s_prod = 0.05f; id.s_wd = 0.01f; id.s_out = 0.05f;
+    id.wg_hk = wg.data(); id.wu_hk = wu.data(); id.wd_nh = wd.data();
+    ob_invoke_stats_t is{};
+    for (int iter = 0; iter < 8; ++iter) {
+      CHECK(ob_gemm_swiglu_int8(ctx, xi.data(), &id, yi.data(), &is) == OB_OK);
+    }
+    ob_profile_stats_t pi{};
+    CHECK(ob_context_get_profile(ctx, &pi) == OB_OK);
+    CHECK(pi.swiglu_calls == 8u);
+    CHECK(ctx->prof.weight_pack_ns > 0u);
+    CHECK(ctx->prof.submit_ns > 0u);
+    CHECK(ctx->prof.dma_sync_ns > 0u);
+    CHECK(ctx->prof.wait_ns > 0u);
+    CHECK(ctx->prof.total_wall_ns > 0u);
+
+    // 9b. Multi-slice prefill fallback (M=66 = 64 + 2, high RMS) must count 1 fallback call, not 2.
+    ctx->swiglu_prefill_enabled = true;
+    ctx->batched_large_tiles_enabled = true;
+    constexpr uint32_t M66 = 66u;
+    std::vector<float> a66(static_cast<size_t>(M66) * K, 1.0f);
+    std::vector<float> c66(static_cast<size_t>(M66) * N, 0.0f);
+    std::vector<ob_block_q8_0_t> bq_g(static_cast<size_t>(H) * (K / OB_QK8_0));
+    std::vector<ob_block_q8_0_t> bq_d(static_cast<size_t>(N) * (H / OB_QK8_0));
+    for (auto& blk : bq_g) { blk.d = fp32_to_fp16(0.02f); std::memset(blk.qs, 2, sizeof(blk.qs)); }
+    for (auto& blk : bq_d) { blk.d = fp32_to_fp16(0.02f); std::memset(blk.qs, 2, sizeof(blk.qs)); }
+    ob_gemm_swiglu_quant_desc_t sd66{};
+    sd66.m_dim = M66; sd66.k_dim = K; sd66.h_dim = H; sd66.n_dim = N;
+    sd66.w_gate_hk = bq_g.data();
+    sd66.w_up_hk = bq_g.data();
+    sd66.w_down_nh = bq_d.data();
+    ob_profile_stats_t pf0{}, pf1{};
+    CHECK(ob_context_get_profile(ctx, &pf0) == OB_OK);
+    CHECK(ob_gemm_swiglu_f32_quant(ctx, a66.data(), &sd66, c66.data(), &is) == OB_OK);
+    CHECK(ob_context_get_profile(ctx, &pf1) == OB_OK);
+    CHECK(pf1.swiglu_fallbacks == pf0.swiglu_fallbacks + 1u);
+    ob_context_destroy(ctx);
+  }
+
+  std::printf("[PASS] test_phase7_cycle3_regressions (dense 16MiB cap, immutable gen+O(1) hit, warm budget shrink, refcnt timeout retention, warm SwiGLU clip guard, cpu-only tiles_dispatched=0, int8 stage prof & single fallback count OK)\n");
 }
 
 }  // namespace

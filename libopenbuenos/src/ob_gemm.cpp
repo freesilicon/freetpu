@@ -3625,17 +3625,21 @@ ob_status_t ob_gemm_swiglu_int8(ob_context_t* ctx,
   const uint32_t N = desc->n_dim;
 
   // Pack ext[2] for the 3 weight matrices
+  const uint64_t tp0 = prof_on ? ob::monotonic_now_ns() : 0u;
   std::vector<uint8_t> ext2 = ob::pack_ext2_for_swiglu(
       M, K, H, N,
       desc->wg_hk, desc->bg_h,
       desc->wu_hk, desc->bu_h,
       desc->wd_nh, desc->bd_n);
+  if (prof_on) ctx->prof.weight_pack_ns += (ob::monotonic_now_ns() - tp0);
 
   ob_buffer* wbuf = nullptr;
   ob_status_t st = ob_buffer_alloc(
       ctx, ext2.size(), OB_BUF_BIDIRECTIONAL | OB_BUF_NO_POOL | OB_BUF_ZERO_INIT, &wbuf);
   if (st != OB_OK) return st;
+  const uint64_t tdw0 = prof_on ? ob::monotonic_now_ns() : 0u;
   st = ob_buffer_write(wbuf, ext2.data(), ext2.size(), 0u);
+  if (prof_on) ctx->prof.dma_sync_ns += (ob::monotonic_now_ns() - tdw0);
   if (st != OB_OK) {
     ob_buffer_free(wbuf);
     return st;
@@ -3662,10 +3666,12 @@ ob_status_t ob_gemm_swiglu_int8(ob_context_t* ctx,
   graph_desc.wd_nh = nullptr;
   graph_desc.bd_n = nullptr;
 
+  const uint64_t ts0 = prof_on ? ob::monotonic_now_ns() : 0u;
   ob::CachedGraph* entry = nullptr;
   bool was_hit = false;
   st = ob::acquire_swiglu_entry(ctx, graph_desc, gkey, &entry, &was_hit);
   if (st != OB_OK) {
+    if (prof_on) ctx->prof.submit_ns += (ob::monotonic_now_ns() - ts0);
     ob_buffer_free(wbuf);
     return st;
   }
@@ -3680,13 +3686,23 @@ ob_status_t ob_gemm_swiglu_int8(ob_context_t* ctx,
     st = ob::ensure_pipeline_buf_tiered(
         ctx, &ctx->gemm_out_bufs_4k[0], &ctx->gemm_out_bufs[0], out_bytes, &out_buf);
   }
+  uint64_t in_sync_ns = 0u;
   if (st == OB_OK) {
+    const uint64_t tdi0 = prof_on ? ob::monotonic_now_ns() : 0u;
     st = ob_buffer_write(in_buf, x_mk, in_bytes, 0u);
+    if (prof_on) {
+      in_sync_ns = ob::monotonic_now_ns() - tdi0;
+      ctx->prof.dma_sync_ns += in_sync_ns;
+    }
   }
 
   ob_exec_handle_t exec_h = 0u;
   if (st == OB_OK) {
     st = ob::device_submit_execute_async(ctx, entry, &in_buf, 1u, &out_buf, 1u, &exec_h, wbuf);
+  }
+  if (prof_on) {
+    const uint64_t submit_total = ob::monotonic_now_ns() - ts0;
+    ctx->prof.submit_ns += (submit_total > in_sync_ns) ? (submit_total - in_sync_ns) : 0u;
   }
   if (st != OB_OK) {
     ob::release_tile_entry(ctx, entry);
@@ -3695,7 +3711,9 @@ ob_status_t ob_gemm_swiglu_int8(ob_context_t* ctx,
   }
 
   ob_invoke_stats_t istats {};
+  const uint64_t tw0 = prof_on ? ob::monotonic_now_ns() : 0u;
   st = ob::device_wait_handle(ctx, exec_h, ctx->cfg.timeout_ms, &istats);
+  if (prof_on) ctx->prof.wait_ns += (ob::monotonic_now_ns() - tw0);
   if (st != OB_OK) {
     if (ob::device_attach_inflight_buffers(ctx, exec_h, {wbuf, in_buf, out_buf})) {
       if (ctx->gemm_in_bufs_4k[0] == in_buf) {
@@ -3723,7 +3741,9 @@ ob_status_t ob_gemm_swiglu_int8(ob_context_t* ctx,
   if (ctx->mock_mode) {
     ob::simulate_swiglu_hw_exact(x_mk, *desc, y_mn);
   } else {
+    const uint64_t tdo0 = prof_on ? ob::monotonic_now_ns() : 0u;
     st = ob_buffer_read(out_buf, y_mn, out_bytes, 0u);
+    if (prof_on) ctx->prof.dma_sync_ns += (ob::monotonic_now_ns() - tdo0);
     if (st != OB_OK) return st;
   }
 
@@ -3733,7 +3753,6 @@ ob_status_t ob_gemm_swiglu_int8(ob_context_t* ctx,
   ctx->prof.tiles_dispatched += 1u;
   ctx->prof.hw_us += istats.hw_execution_us;
   ctx->prof.total_wall_ns += wall_ns;
-  (void)prof_on;
 
   if (out_stats) {
     std::memset(out_stats, 0, sizeof(*out_stats));
@@ -4067,7 +4086,9 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
     if (st == OB_OK) {
       std::lock_guard<std::mutex> lk(ctx->gemm_mu);
       ctx->prof.swiglu_calls += 1u;
-      ctx->prof.swiglu_fallbacks += 1u;
+      if ((fb.flags & OB_STAT_FLAG_EMITTER_USED) != 0u) {
+        ctx->prof.swiglu_fallbacks += 1u;
+      }
     }
     if (out_stats) {
       *out_stats = fb;
@@ -4082,7 +4103,6 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
     {
       std::lock_guard<std::mutex> lk(ctx->gemm_mu);
       ctx->prof.swiglu_calls += 1u;
-      ctx->prof.swiglu_fallbacks += 1u;
       ctx->prof.total_wall_ns += wall_ns;
     }
     if (out_stats) {
@@ -4216,7 +4236,6 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
         // LRU thrashing while delivering 0-error FP32 precision on sink tokens!).
         cpu_swiglu_f32_quant_slice(a_slice, desc, 1u, c_slice);
         agg_flags |= OB_STAT_FLAG_CPU_FALLBACK;
-        fb_slices += 1u;
         ran_cpu_fb_slice = true;
         continue;
       }
@@ -4229,7 +4248,9 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
       total_tiles += fb.tiles_dispatched;
       total_hits += fb.cache_hits;
       agg_flags |= fb.flags;
-      fb_slices += 1u;
+      if ((fb.flags & OB_STAT_FLAG_EMITTER_USED) != 0u) {
+        fb_slices += 1u;
+      }
       continue;
     }
 
@@ -4970,7 +4991,9 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
       total_tiles += fb.tiles_dispatched;
       total_hits += fb.cache_hits;
       agg_flags |= fb.flags;
-      fb_slices += 1u;
+      if ((fb.flags & OB_STAT_FLAG_EMITTER_USED) != 0u) {
+        fb_slices += 1u;
+      }
     }
   }
 
@@ -4979,7 +5002,9 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
     std::lock_guard<std::mutex> lk(ctx->gemm_mu);
     ctx->prof.swiglu_calls += 1u;
     ctx->prof.swiglu_chunks_chained += chained_chunks;
-    ctx->prof.swiglu_fallbacks += fb_slices;
+    if (fb_slices > 0u) {
+      ctx->prof.swiglu_fallbacks += 1u;
+    }
     if (chained_chunks > 0u) {
       ctx->prof.tiles_dispatched += chained_chunks;
       ctx->prof.hw_us += chained_hw_us;
