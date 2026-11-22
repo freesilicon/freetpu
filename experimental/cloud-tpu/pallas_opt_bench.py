@@ -559,7 +559,7 @@ if ok_part_a:
                 "best_pallas": best_a,
                 "xla_ref": xla_summary,
                 "gap_ratio_xla_over_pallas": round(
-                    best_a["median_us"] / xla_summary["median_us"], 3
+                    xla_summary["median_us"] / best_a["median_us"], 3
                 ),
             }
         ),

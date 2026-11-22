@@ -31,18 +31,22 @@ mkdir -p -m 700 ~/.cache/freetpu-pjrt/ir
 colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json run --tpu V6E1 -- experimental/cloud-tpu/raw_compute_bench.py
 
 # Or run all stages inside one persistent session (export .ipynb + always stop on exit)
-colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json new -s freetpu-tpu --tpu V5E1
-colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json exec -s freetpu-tpu -f experimental/cloud-tpu/vfio_pci_survey.py
-colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json exec -s freetpu-tpu -f experimental/cloud-tpu/raw_compute_bench.py
-colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json exec -s freetpu-tpu -f experimental/cloud-tpu/pallas_opt_bench.py
-colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json exec -s freetpu-tpu -f experimental/cloud-tpu/llama8b_decode_bench.py
-colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json upload -s freetpu-tpu experimental/cloud-tpu/tpu_pjrt_bench.cpp /content/tpu_pjrt_bench.cpp
-colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json upload -s freetpu-tpu experimental/cloud-tpu/export_stablehlo.py /content/export_stablehlo.py
-colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json exec -s freetpu-tpu "import runpy; runpy.run_path('/content/export_stablehlo.py', run_name='__main__')"
-colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json restart-kernel -s freetpu-tpu
-colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json exec -s freetpu-tpu "import os, subprocess; bin_p = os.path.expanduser('~/.cache/freetpu-pjrt/tpu_pjrt_bench'); print(subprocess.check_output(['ldd', bin_p], text=True)); print(subprocess.check_output([bin_p], text=True))"
-colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json log -s freetpu-tpu -o ~/.cache/freetpu-colab/freetpu-tpu-proof.ipynb
-colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json stop -s freetpu-tpu
+(
+  set -euo pipefail
+  CFG=~/.cache/freetpu-colab/sessions.json
+  colab --auth=adc --config "$CFG" new -s freetpu-tpu --tpu V5E1
+  trap 'colab --auth=adc --config "$CFG" stop -s freetpu-tpu || true' EXIT
+  colab --auth=adc --config "$CFG" exec -s freetpu-tpu -f experimental/cloud-tpu/vfio_pci_survey.py
+  colab --auth=adc --config "$CFG" exec -s freetpu-tpu -f experimental/cloud-tpu/raw_compute_bench.py
+  colab --auth=adc --config "$CFG" exec -s freetpu-tpu -f experimental/cloud-tpu/pallas_opt_bench.py
+  colab --auth=adc --config "$CFG" exec -s freetpu-tpu -f experimental/cloud-tpu/llama8b_decode_bench.py
+  colab --auth=adc --config "$CFG" upload -s freetpu-tpu experimental/cloud-tpu/tpu_pjrt_bench.cpp /content/tpu_pjrt_bench.cpp
+  colab --auth=adc --config "$CFG" upload -s freetpu-tpu experimental/cloud-tpu/export_stablehlo.py /content/export_stablehlo.py
+  colab --auth=adc --config "$CFG" exec -s freetpu-tpu "import runpy; runpy.run_path('/content/export_stablehlo.py', run_name='__main__')"
+  colab --auth=adc --config "$CFG" restart-kernel -s freetpu-tpu
+  colab --auth=adc --config "$CFG" exec -s freetpu-tpu "import os, subprocess; bin_p = os.path.expanduser('~/.cache/freetpu-pjrt/tpu_pjrt_bench'); print(subprocess.check_output(['ldd', bin_p], text=True)); print(subprocess.check_output([bin_p], text=True))"
+  colab --auth=adc --config "$CFG" log -s freetpu-tpu -o ~/.cache/freetpu-colab/freetpu-tpu-proof.ipynb
+)
 ```
 
 > **Note on `v6e-1` (Trillium) availability**: An ephemeral `colab run --tpu V6E1` survey verified `GetPjrtApi() struct_size=1144, version=0.116` on a `V6E1` host (with `0000:00:05.0` occupied by the `0x1ae0:0x0042` gVNIC NIC rather than TPU, prompting dynamic `/sys/bus/pci/devices/*` scanning in `vfio_pci_survey.py`). Follow-up full-suite `V6E1` allocation requests encountered intermittent Colab `503 Service Unavailable` / `ReadTimeout` capacity limits, so full end-to-end benchmarks below are anchored on verified **`v5e-1`** silicon.

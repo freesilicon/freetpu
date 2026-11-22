@@ -108,6 +108,16 @@ def write_bytes_nofollow(path: str, data: bytes, mode: int = 0o600) -> None:
     f.write(data)
 
 
+def resolve_tpu_library_path() -> str:
+  """Resolve the TPU library using JAX's precedence (`TPU_LIBRARY_PATH` before `libtpu`)."""
+  env_path = os.environ.get("TPU_LIBRARY_PATH")
+  if env_path and os.path.exists(env_path):
+    return env_path
+  import libtpu  # noqa: WPS433
+
+  return libtpu.get_library_path()
+
+
 def probe_header_and_live_abi(hdr_path: str) -> str:
   hdr_txt = open(hdr_path, "r", encoding="utf-8").read()
   m_maj = re.search(r"#define\s+PJRT_API_MAJOR\s+(\d+)", hdr_txt)
@@ -153,9 +163,7 @@ def probe_header_and_live_abi(hdr_path: str) -> str:
   ]
   fn_offsets = {name: 40 + 8 * idx for idx, name in enumerate(fields)}
 
-  import libtpu  # noqa: WPS433
-
-  so_path = libtpu.get_library_path()
+  so_path = resolve_tpu_library_path()
   lib = ctypes.CDLL(so_path)
   lib.GetPjrtApi.restype = ctypes.c_void_p
   api_ptr = lib.GetPjrtApi()
