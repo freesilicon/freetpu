@@ -44,7 +44,14 @@ mkdir -p -m 700 ~/.cache/freetpu-pjrt/ir
   }
   colab --auth=adc --config "$CFG" new -s "$SESSION_ID" --tpu V6E1
   trap cleanup EXIT
-  colab --auth=adc --config "$CFG" exec -s "$SESSION_ID" --timeout 600 -f experimental/cloud-tpu/raw_compute_bench.py
+  log_f="$(mktemp)"
+  colab --auth=adc --config "$CFG" exec -s "$SESSION_ID" --timeout 600 -f experimental/cloud-tpu/raw_compute_bench.py 2>&1 | tee "$log_f"
+  rc="${PIPESTATUS[0]}"
+  if [ "$rc" -ne 0 ] || ! tr -d '\r' < "$log_f" | grep -Fxq "=== RAW_BENCH_COMPLETE ==="; then
+    rm -f "$log_f"
+    exit 1
+  fi
+  rm -f "$log_f"
 )
 
 # Or run all stages inside one persistent session (verify markers + stop on exit)
@@ -105,10 +112,15 @@ PY
 
 > **Note on `v6e-1` (Trillium) availability**: An ephemeral `colab run --tpu V6E1` survey verified `GetPjrtApi() struct_size=1144, version=0.116` on a `V6E1` host (with `0000:00:05.0` occupied by the `0x1ae0:0x0042` gVNIC NIC rather than TPU, prompting dynamic `/sys/bus/pci/devices/*` scanning in `vfio_pci_survey.py`). Follow-up full-suite `V6E1` allocation requests encountered intermittent Colab `503 Service Unavailable` / `ReadTimeout` capacity limits, so full end-to-end benchmarks below are anchored on verified **`v5e-1`** silicon.
 
-Or run Stage A / Stage B directly on a local Cloud TPU VM:
+Or prepare Python >= 3.12 with the tested TPU runtime (`jax==0.11.2`, `libtpu==0.0.50`) and run Stage A / Stage B directly on a local Cloud TPU VM:
 
 ```bash
-# Stage A (JAX kernel active on /dev/vfio/0)
+# Prerequisites on a fresh Cloud TPU VM (Python >= 3.12 required for jax 0.11.2)
+python3.12 -m venv ~/.venvs/freetpu-tpu
+source ~/.venvs/freetpu-tpu/bin/activate
+python3 -m pip install --upgrade "jax[tpu]==0.11.2" "libtpu==0.0.50" numpy
+
+# Stage A (JAX kernel active on /dev/vfio/0; ensure g++ and curl are installed)
 python3 experimental/cloud-tpu/vfio_pci_survey.py
 python3 experimental/cloud-tpu/raw_compute_bench.py
 python3 experimental/cloud-tpu/pallas_opt_bench.py
@@ -127,7 +139,11 @@ mkdir -p -m 700 ~/.cache/freetpu-pjrt
 mkdir -p -m 700 ~/.cache/freetpu-pjrt/ir
 curl -fsSL https://raw.githubusercontent.com/openxla/xla/0bfeeb476952fc0ae13dd38e27a9053cb1baa3ce/xla/pjrt/c/pjrt_c_api.h \
   -o ~/.cache/freetpu-pjrt/ir/pjrt_c_api.h
-LIBTPU_PATH="${TPU_LIBRARY_PATH:-$(python3 -c 'import libtpu; print(libtpu.get_library_path())')}"
+if [ -n "${TPU_LIBRARY_PATH:-}" ] && [ -f "$TPU_LIBRARY_PATH" ]; then
+  LIBTPU_PATH="$TPU_LIBRARY_PATH"
+else
+  LIBTPU_PATH="$(python3 -c 'import libtpu; print(libtpu.get_library_path())')"
+fi
 g++ -O3 -std=c++17 -Wall -Wextra -I"$HOME/.cache/freetpu-pjrt/ir" \
   experimental/cloud-tpu/tpu_pjrt_bench.cpp -ldl -pthread -o ~/.cache/freetpu-pjrt/tpu_pjrt_bench
 LIBTPU_PATH="$LIBTPU_PATH" ~/.cache/freetpu-pjrt/tpu_pjrt_bench

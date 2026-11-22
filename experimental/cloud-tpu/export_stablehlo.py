@@ -141,7 +141,7 @@ def write_bytes_nofollow(path: str, data: bytes, mode: int = 0o600) -> None:
 def resolve_tpu_library_path() -> str:
   """Resolve the TPU library using JAX's precedence (`TPU_LIBRARY_PATH` before `libtpu`)."""
   env_path = os.environ.get("TPU_LIBRARY_PATH")
-  if env_path and os.path.exists(env_path):
+  if env_path and os.path.isfile(env_path):
     return env_path
   import libtpu  # noqa: WPS433
 
