@@ -202,7 +202,19 @@ ot_status_t ot_buffer_h2d(ot_context_t* ctx, ot_buffer_t* dst,
       dma_len = chunk & ~static_cast<size_t>(7u);
     }
     if (dma_len > chunk) {
-      std::memset(ctx->transport.host_stage_mem + chunk, 0, dma_len - chunk);
+      if (done + chunk < dst->size_bytes) {
+        // Partial H2D write ending mid-qword inside a larger buffer: read-modify-write
+        // the trailing 8-byte HBM word so untouched suffix bytes are preserved.
+        size_t tail_off = chunk & ~static_cast<size_t>(7u);
+        if (!ctx->transport.dma_transfer_sync(
+                ctx->transport.host_stage_iova + tail_off, dst->hbm_addr + done + tail_off, 8u,
+                /*is_h2d=*/false, 0x40000000u, 0x60u, 0u, ctx->cfg.timeout_ms, &err)) {
+          ctx->last_error = err.empty() ? "Hardware H2D tail preserve D2H failed" : err;
+          return ctx->transport.dma_faulted ? OT_ERR_TIMEOUT : OT_ERR_IOCTL;
+        }
+      } else {
+        std::memset(ctx->transport.host_stage_mem + chunk, 0, dma_len - chunk);
+      }
     }
     std::memcpy(ctx->transport.host_stage_mem, src_bytes + done, chunk);
     if (!ctx->transport.dma_transfer_sync(

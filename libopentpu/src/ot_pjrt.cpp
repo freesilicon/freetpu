@@ -45,6 +45,10 @@ struct PJRT_SerializedTopology {
   std::string data;
 };
 
+struct PJRT_DeviceAssignmentSerialized {
+  std::string data;
+};
+
 struct PJRT_Device {
   PJRT_DeviceDescription desc{};
   OtPjrtMemory mem{};
@@ -75,6 +79,7 @@ struct PJRT_Buffer {
 
 struct PJRT_Executable {
   std::string name = "opentpu_matmul";
+  std::string fingerprint;
   uint32_t m_dim = 0;
   uint32_t k_dim = 0;
   uint32_t n_dim = 0;
@@ -691,10 +696,25 @@ PJRT_Error* ot_pjrt_client_compile(PJRT_Client_Compile_Args* args) {
   if (!args || !args->client || !args->program) {
     return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null compile args");
   }
+  const char* fmt = args->program->format;
+  size_t fmt_len = args->program->format_size;
+  if (!fmt || fmt_len != 4 || std::memcmp(fmt, "mlir", 4) != 0) {
+    return make_err(PJRT_Error_Code_UNIMPLEMENTED,
+                    "OpenTPU M4 supports program format 'mlir' (textual StableHLO) only");
+  }
+  if (args->program->code && args->program->code_size >= 4 &&
+      static_cast<unsigned char>(args->program->code[0]) == 'M' &&
+      static_cast<unsigned char>(args->program->code[1]) == 'L' &&
+      static_cast<unsigned char>(args->program->code[2]) == 0xefu &&
+      static_cast<unsigned char>(args->program->code[3]) == 'R') {
+    return make_err(PJRT_Error_Code_UNIMPLEMENTED,
+                    "OpenTPU M4 is zero-dependency and does not yet decode binary MLIR bytecode "
+                    "(portable StableHLO artifacts); pass textual StableHLO MLIR");
+  }
   uint32_t m = 0, k = 0, n = 0;
   if (!parse_stablehlo_matmul(args->program->code, args->program->code_size, &m, &k, &n)) {
     return make_err(PJRT_Error_Code_UNIMPLEMENTED,
-                    "OpenTPU currently lowers textual StableHLO bf16 dot_general");
+                    "OpenTPU M4 lowers single-op textual StableHLO bf16 dot_general only");
   }
   auto* le = new (std::nothrow) PJRT_LoadedExecutable();
   if (!le) return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, "out of memory");
@@ -703,6 +723,8 @@ PJRT_Error* ot_pjrt_client_compile(PJRT_Client_Compile_Args* args) {
   le->exec.k_dim = k;
   le->exec.n_dim = n;
   le->exec.out_dims = {static_cast<int64_t>(m), static_cast<int64_t>(n)};
+  le->exec.fingerprint = "opentpu_bf16_matmul_" + std::to_string(m) + "x" +
+                         std::to_string(k) + "x" + std::to_string(n);
   args->executable = le;
   return nullptr;
 }
@@ -861,12 +883,12 @@ PJRT_Error* ot_pjrt_device_memory_stats(PJRT_Device_MemoryStats_Args* args) {
   if (!args || !args->device || !args->device->ctx) {
     return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null");
   }
-  ot_device_info_t info = {};
-  ot_device_get_info(args->device->ctx, &info);
   uint64_t used = 0;
+  uint64_t limit = 0;
   {
     std::lock_guard<std::mutex> lk(args->device->ctx->mu);
     used = args->device->ctx->transport.hbm_alloc.used_bytes();
+    limit = args->device->ctx->transport.hbm_alloc.capacity_bytes();
   }
   args->bytes_in_use = static_cast<int64_t>(used);
   args->peak_bytes_in_use = 0;
@@ -875,7 +897,7 @@ PJRT_Error* ot_pjrt_device_memory_stats(PJRT_Device_MemoryStats_Args* args) {
   args->num_allocs_is_set = false;
   args->largest_alloc_size = 0;
   args->largest_alloc_size_is_set = false;
-  args->bytes_limit = static_cast<int64_t>(info.hbm_bytes_total);
+  args->bytes_limit = static_cast<int64_t>(limit);
   args->bytes_limit_is_set = true;
   args->bytes_reserved = 0;
   args->bytes_reserved_is_set = false;
@@ -942,7 +964,17 @@ PJRT_Error* ot_pjrt_memory_addr_devices(PJRT_Memory_AddressableByDevices_Args* a
   return nullptr;
 }
 
-PJRT_Error* ot_pjrt_exec_destroy(PJRT_Executable_Destroy_Args*) { return nullptr; }
+PJRT_Error* ot_pjrt_exec_destroy(PJRT_Executable_Destroy_Args* args) {
+  if (args) delete args->executable;
+  return nullptr;
+}
+
+PJRT_Error* ot_pjrt_exec_fingerprint(PJRT_Executable_Fingerprint_Args* args) {
+  if (!args || !args->executable) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null");
+  args->executable_fingerprint = args->executable->fingerprint.c_str();
+  args->executable_fingerprint_size = args->executable->fingerprint.size();
+  return nullptr;
+}
 
 PJRT_Error* ot_pjrt_exec_name(PJRT_Executable_Name_Args* args) {
   if (!args || !args->executable) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null");
@@ -1012,7 +1044,39 @@ PJRT_Error* ot_pjrt_lexec_destroy(PJRT_LoadedExecutable_Destroy_Args* args) {
 
 PJRT_Error* ot_pjrt_lexec_get_exec(PJRT_LoadedExecutable_GetExecutable_Args* args) {
   if (!args || !args->loaded_executable) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null");
-  args->executable = &args->loaded_executable->exec;
+  auto* copy = new (std::nothrow) PJRT_Executable(args->loaded_executable->exec);
+  if (!copy) return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, "out of memory");
+  args->executable = copy;
+  return nullptr;
+}
+
+void ot_pjrt_device_assignment_deleter(PJRT_DeviceAssignmentSerialized* da) {
+  delete da;
+}
+
+PJRT_Error* ot_pjrt_lexec_get_device_assignment(
+    PJRT_LoadedExecutable_GetDeviceAssignment_Args* args) {
+  if (!args || !args->executable) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null");
+  auto* da = new (std::nothrow) PJRT_DeviceAssignmentSerialized();
+  if (!da) return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, "out of memory");
+  // Valid xla::DeviceAssignmentProto wire encoding for 1 replica x 1 computation -> device 0:
+  //   field 1 (replica_count = 1): 0x08 0x01
+  //   field 2 (computation_count = 1): 0x10 0x01
+  //   field 3 (computation_devices[0] = { field 1 (replica_device_ids = [0]) }): 0x1a 0x02 0x08 0x00
+  static constexpr char kSingleDeviceAssignmentProto[8] = {
+      0x08, 0x01, 0x10, 0x01, 0x1a, 0x02, 0x08, 0x00};
+  da->data.assign(kSingleDeviceAssignmentProto, sizeof(kSingleDeviceAssignmentProto));
+  args->serialized_bytes = da->data.c_str();
+  args->serialized_bytes_size = da->data.size();
+  args->serialized_device_assignment = da;
+  args->serialized_device_assignment_deleter = ot_pjrt_device_assignment_deleter;
+  return nullptr;
+}
+
+PJRT_Error* ot_pjrt_lexec_fingerprint(PJRT_LoadedExecutable_Fingerprint_Args* args) {
+  if (!args || !args->executable) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null");
+  args->executable_fingerprint = args->executable->exec.fingerprint.c_str();
+  args->executable_fingerprint_size = args->executable->exec.fingerprint.size();
   return nullptr;
 }
 
@@ -1299,6 +1363,7 @@ PJRT_Api build_pjrt_api() {
   api.PJRT_Executable_OutputMemoryKinds = ot_pjrt_exec_output_mem_kinds;
   api.PJRT_Executable_OutputElementTypes = ot_pjrt_exec_output_types;
   api.PJRT_Executable_OutputDimensions = ot_pjrt_exec_output_dims;
+  api.PJRT_Executable_Fingerprint = ot_pjrt_exec_fingerprint;
 
   api.PJRT_LoadedExecutable_Destroy = ot_pjrt_lexec_destroy;
   api.PJRT_LoadedExecutable_GetExecutable = ot_pjrt_lexec_get_exec;
@@ -1306,6 +1371,8 @@ PJRT_Api build_pjrt_api() {
   api.PJRT_LoadedExecutable_Delete = ot_pjrt_lexec_delete;
   api.PJRT_LoadedExecutable_IsDeleted = ot_pjrt_lexec_is_deleted;
   api.PJRT_LoadedExecutable_Execute = ot_pjrt_lexec_execute;
+  api.PJRT_LoadedExecutable_GetDeviceAssignment = ot_pjrt_lexec_get_device_assignment;
+  api.PJRT_LoadedExecutable_Fingerprint = ot_pjrt_lexec_fingerprint;
 
   api.PJRT_Buffer_Destroy = ot_pjrt_buf_destroy;
   api.PJRT_Buffer_ElementType = ot_pjrt_buf_elem_type;

@@ -776,7 +776,7 @@ bool VfioTransport::submit_sq_wait(const uint32_t desc[32], uint32_t timeout_ms,
   uint32_t* sq_slot = reinterpret_cast<uint32_t*>(sq_ring_mem + idx * 128u);
   std::memcpy(sq_slot, desc, 128u);
   sq_slot[0] = sq_seq;
-  __sync_synchronize();
+  __atomic_thread_fence(__ATOMIC_RELEASE);
 
   uint32_t target_seq = sq_seq + 1u;
   sq_seq = target_seq;
@@ -786,8 +786,10 @@ bool VfioTransport::submit_sq_wait(const uint32_t desc[32], uint32_t timeout_ms,
   uint32_t budget_us = (timeout_ms ? timeout_ms : 5000u) * 1000u;
   uint32_t waited_us = 0;
   while (waited_us <= budget_us) {
-    __sync_synchronize();
-    if (status_page_mem[1] >= target_seq) {
+    uint32_t cq_tail = __atomic_load_n(&status_page_mem[1], __ATOMIC_ACQUIRE);
+    if (static_cast<int32_t>(cq_tail - target_seq) >= 0) {
+      // Order completion entry and DMA payload reads after observing cq_tail (AArch64).
+      __atomic_thread_fence(__ATOMIC_ACQUIRE);
       if (cq_out) {
         const uint32_t* cq_slot = reinterpret_cast<const uint32_t*>(cq_ring_mem + idx * 32u);
         std::memcpy(cq_out, cq_slot, 32u);

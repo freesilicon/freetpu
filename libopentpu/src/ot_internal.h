@@ -39,6 +39,7 @@ class IovaAllocator {
   bool alloc(uint64_t size, uint64_t align, uint64_t* out_iova);
   void free(uint64_t iova);
   uint64_t used_bytes() const;
+  uint64_t capacity_bytes() const { return limit_ > base_ ? (limit_ - base_) : 0; }
 
  private:
   uint64_t base_ = 0;

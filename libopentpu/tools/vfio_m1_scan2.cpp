@@ -108,17 +108,49 @@ int main() {
     return 1;
   }
 
-  int container = open("/dev/vfio/vfio", O_RDWR);
-  int group = open(("/dev/vfio/" + grp).c_str(), O_RDWR);
-  ioctl(group, VFIO_GROUP_SET_CONTAINER, &container);
-  ioctl(container, VFIO_SET_IOMMU, VFIO_TYPE1v2_IOMMU);
+  int container = open("/dev/vfio/vfio", O_RDWR | O_CLOEXEC);
+  if (container < 0) {
+    fprintf(stderr, "open(/dev/vfio/vfio) failed: %s\n", strerror(errno));
+    return 1;
+  }
+  int group = open(("/dev/vfio/" + grp).c_str(), O_RDWR | O_CLOEXEC);
+  if (group < 0) {
+    fprintf(stderr, "open(/dev/vfio/%s) failed: %s\n", grp.c_str(), strerror(errno));
+    close(container);
+    return 1;
+  }
+  if (ioctl(group, VFIO_GROUP_SET_CONTAINER, &container) < 0) {
+    fprintf(stderr, "VFIO_GROUP_SET_CONTAINER failed: %s\n", strerror(errno));
+    close(group);
+    close(container);
+    return 1;
+  }
+  if (ioctl(container, VFIO_SET_IOMMU, VFIO_TYPE1v2_IOMMU) < 0 &&
+      ioctl(container, VFIO_SET_IOMMU, VFIO_TYPE1_IOMMU) < 0) {
+    fprintf(stderr, "VFIO_SET_IOMMU failed: %s\n", strerror(errno));
+    close(group);
+    close(container);
+    return 1;
+  }
   int dev = ioctl(group, VFIO_GROUP_GET_DEVICE_FD, bdf.c_str());
+  if (dev < 0) {
+    fprintf(stderr, "VFIO_GROUP_GET_DEVICE_FD(%s) failed: %s\n", bdf.c_str(), strerror(errno));
+    close(group);
+    close(container);
+    return 1;
+  }
 
   struct vfio_region_info r0 = {}, r4 = {};
   r0.argsz = sizeof(r0); r0.index = VFIO_PCI_BAR0_REGION_INDEX;
   r4.argsz = sizeof(r4); r4.index = VFIO_PCI_BAR4_REGION_INDEX;
-  ioctl(dev, VFIO_DEVICE_GET_REGION_INFO, &r0);
-  ioctl(dev, VFIO_DEVICE_GET_REGION_INFO, &r4);
+  if (ioctl(dev, VFIO_DEVICE_GET_REGION_INFO, &r0) < 0 ||
+      ioctl(dev, VFIO_DEVICE_GET_REGION_INFO, &r4) < 0) {
+    fprintf(stderr, "VFIO_DEVICE_GET_REGION_INFO failed: %s\n", strerror(errno));
+    close(dev);
+    close(group);
+    close(container);
+    return 1;
+  }
 
   printf("=== BAR4 FULL FIRST 4 KiB NONZERO DUMP ===\n");
   void* m4 = mmap(nullptr, r4.size, PROT_READ | PROT_WRITE, MAP_SHARED, dev, r4.offset);

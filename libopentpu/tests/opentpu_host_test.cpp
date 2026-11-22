@@ -194,6 +194,8 @@ static void test_pjrt_api_mock() {
   ms.device = ad.addressable_devices[0];
   OT_CHECK(api->PJRT_Device_MemoryStats(&ms) == nullptr);
   OT_CHECK(ms.bytes_in_use == 0);
+  // Mock arena is 64 MiB minus 1 MiB reserved prefix = 63 MiB allocatable.
+  OT_CHECK(ms.bytes_limit == static_cast<int64_t>(63ULL * 1024ULL * 1024ULL));
   OT_CHECK(ms.bytes_limit_is_set == true);
   OT_CHECK(ms.peak_bytes_in_use_is_set == false);
   OT_CHECK(ms.num_allocs_is_set == false);
@@ -229,6 +231,27 @@ static void test_pjrt_api_mock() {
   OT_CHECK(bad_err != nullptr);
   destroy_pjrt_error(api, bad_err);
 
+  // Binary MLIR bytecode (ML\xefR) must return UNIMPLEMENTED explicitly.
+  const char bc_bytes[8] = {'M', 'L', static_cast<char>(0xef), 'R', 0, 0, 0, 0};
+  PJRT_Program bc_prog = {};
+  bc_prog.struct_size = PJRT_Program_STRUCT_SIZE;
+  bc_prog.code = const_cast<char*>(bc_bytes);
+  bc_prog.code_size = sizeof(bc_bytes);
+  bc_prog.format = "mlir";
+  bc_prog.format_size = 4;
+  PJRT_Client_Compile_Args bc_ca = {};
+  bc_ca.struct_size = PJRT_Client_Compile_Args_STRUCT_SIZE;
+  bc_ca.client = cc.client;
+  bc_ca.program = &bc_prog;
+  PJRT_Error* bc_err = api->PJRT_Client_Compile(&bc_ca);
+  OT_CHECK(bc_err != nullptr);
+  PJRT_Error_GetCode_Args bc_code = {};
+  bc_code.struct_size = PJRT_Error_GetCode_Args_STRUCT_SIZE;
+  bc_code.error = bc_err;
+  OT_CHECK(api->PJRT_Error_GetCode(&bc_code) == nullptr);
+  OT_CHECK(bc_code.code == PJRT_Error_Code_UNIMPLEMENTED);
+  destroy_pjrt_error(api, bc_err);
+
   const char* mlir =
       "module @jit_mm {\n"
       "  func.func public @main(%a: tensor<128x128xbf16>, %b: tensor<128x128xbf16>) -> tensor<128x128xbf16> {\n"
@@ -249,6 +272,24 @@ static void test_pjrt_api_mock() {
   ca.program = &prog;
   OT_CHECK(api->PJRT_Client_Compile(&ca) == nullptr);
   OT_CHECK(ca.executable != nullptr);
+
+  // PJRT_LoadedExecutable_GetDeviceAssignment must return a valid 1x1 proto with deleter.
+  OT_CHECK(api->PJRT_LoadedExecutable_GetDeviceAssignment != nullptr);
+  PJRT_LoadedExecutable_GetDeviceAssignment_Args gda = {};
+  gda.struct_size = PJRT_LoadedExecutable_GetDeviceAssignment_Args_STRUCT_SIZE;
+  gda.executable = ca.executable;
+  OT_CHECK(api->PJRT_LoadedExecutable_GetDeviceAssignment(&gda) == nullptr);
+  OT_CHECK(gda.serialized_bytes != nullptr && gda.serialized_bytes_size == 8);
+  OT_CHECK(gda.serialized_device_assignment != nullptr &&
+           gda.serialized_device_assignment_deleter != nullptr);
+  gda.serialized_device_assignment_deleter(gda.serialized_device_assignment);
+
+  // PJRT_LoadedExecutable_GetExecutable must return an independently owned handle.
+  PJRT_LoadedExecutable_GetExecutable_Args ge = {};
+  ge.struct_size = PJRT_LoadedExecutable_GetExecutable_Args_STRUCT_SIZE;
+  ge.loaded_executable = ca.executable;
+  OT_CHECK(api->PJRT_LoadedExecutable_GetExecutable(&ge) == nullptr);
+  OT_CHECK(ge.executable != nullptr);
 
   // Strided & reversed host uploads must reorder elements accurately; unsupported layouts rejected.
   uint16_t raw_2x2[4] = {0x3f80u, 0x4000u, 0x4040u, 0x4080u};  // [1, 2; 3, 4]
@@ -429,6 +470,17 @@ static void test_pjrt_api_mock() {
   led.struct_size = PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
   led.executable = ca.executable;
   OT_CHECK(api->PJRT_LoadedExecutable_Destroy(&led) == nullptr);
+
+  // Independently owned PJRT_Executable handle must stay valid after LoadedExecutable destruction.
+  PJRT_Executable_OutputDimensions_Args od = {};
+  od.struct_size = PJRT_Executable_OutputDimensions_Args_STRUCT_SIZE;
+  od.executable = ge.executable;
+  OT_CHECK(api->PJRT_Executable_OutputDimensions(&od) == nullptr);
+  OT_CHECK(od.num_outputs == 1 && od.dim_sizes[0] == 2 && od.dims[0] == 128 && od.dims[1] == 128);
+  PJRT_Executable_Destroy_Args edest = {};
+  edest.struct_size = PJRT_Executable_Destroy_Args_STRUCT_SIZE;
+  edest.executable = ge.executable;
+  OT_CHECK(api->PJRT_Executable_Destroy(&edest) == nullptr);
 
   PJRT_Client_Destroy_Args cd = {};
   cd.struct_size = PJRT_Client_Destroy_Args_STRUCT_SIZE;
