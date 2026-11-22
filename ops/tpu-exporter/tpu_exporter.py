@@ -1056,7 +1056,11 @@ def collect_snapshot(
     explicit_non_default_runtime_addr = bool(
         runtime_metrics_addr and runtime_metrics_addr != DEFAULT_RUNTIME_METRICS_ADDR
     )
-    if skip_pid_scan or explicit_non_default_runtime_addr:
+    if not tpu_info_bin:
+        # Empty/None `--tpu-info-bin` explicitly disables all `tpu-info` runtime
+        # telemetry (both CLI and Python gRPC) across every mode.
+        tpu_info_ok, tpu_info_err, parsed_rows = False, "tpu-info disabled", {}
+    elif skip_pid_scan or explicit_non_default_runtime_addr:
         # Sidecar / no-PID mode OR explicit non-default `--runtime-metrics-addr`:
         # query `tpu_info.metrics` directly at `runtime_metrics_addr` with a hard
         # deadline. Never run the `tpu-info` CLI subprocess against its hardcoded

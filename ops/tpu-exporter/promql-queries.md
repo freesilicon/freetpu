@@ -4,64 +4,73 @@ These queries mirror standard NVIDIA `dcgm-exporter` dashboards for VFIO-backed 
 
 ## Fleet Inventory & Health
 
-All queries read from operator-controlled `collector_role="node"` targets (standalone Cloud TPU VMs and the `kube-system` `freetpu-node-agent` DaemonSet) and deduplicate by `(generation, node, pci_bdf)`.
+All fleet inventory and VFIO health queries read exclusively from operator-controlled `collector_role="node"` targets (standalone Cloud TPU VMs and the `kube-system` `freetpu-node-agent` DaemonSet) and deduplicate by `(cluster, generation, node, pci_bdf)` so multi-cluster scrapes with overlapping node names never merge distinct chips.
 
 ```promql
-# Total discovered physical TPU chips per generation across scraped nodes
+# Total discovered physical TPU chips per generation across scraped clusters/nodes
 count by (generation) (
-  group by (generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node"})
+  group by (cluster, generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node"})
 )
 
 # Total VFIO-ready physical TPU chips per generation across the cluster (VFIO-backed generations)
 count by (generation) (
-  min by (generation, node, pci_bdf) (
+  min by (cluster, generation, node, pci_bdf) (
     freetpu_tpu_health_status{collector_role="node", generation=~"v5e|v5p|v6e|v6e-pf"}
   ) == 1
 )
 
 # Unhealthy or unbound VFIO-backed TPU chips (vfio-pci / /dev/vfio/<group> missing or unverified;
 # excludes legacy /dev/accel* v2/v3/v4 hosts where VFIO readiness is inapplicable)
-min by (generation, node, pci_bdf) (
+min by (cluster, generation, node, pci_bdf) (
   freetpu_tpu_health_status{collector_role="node", generation=~"v5e|v5p|v6e|v6e-pf"}
 ) == 0
 ```
 
-## Compute & HBM Utilization (Hosts Running `tpu-info`)
+## Compute & HBM Utilization (Hosts & Operator-Managed Workload Collectors Running `tpu-info`)
 
-On standalone Cloud TPU VMs (or operator-controlled containers sharing the workload's loopback `libtpu` endpoint `127.0.0.1:8431`) with `tpu-info` installed:
+Live HBM and MXU duty-cycle metrics come from either:
+- Standalone Cloud TPU VMs running `tpu-info` (`collector_role="node"`), or
+- Operator-managed workload-namespace collectors running `tpu_exporter.py --no-pid-scan --runtime-metrics-addr 127.0.0.1:8431` scraped under a dedicated `collector_role="workload"` label (kept separate from `collector_role="node"` so workload-collector inventory/VFIO samples never mix into node fleet queries).
 
 ```promql
 # Per-runtime-chip MXU / TensorCore duty cycle (%) — works without --chip-id-map
-freetpu_tpu_runtime_duty_cycle_percent{collector_role="node"}
+freetpu_tpu_runtime_duty_cycle_percent{collector_role=~"node|workload"}
 
-# Average runtime MXU utilization (%) per node
-avg by (node) (freetpu_tpu_runtime_duty_cycle_percent{collector_role="node"})
+# Average runtime MXU utilization (%) per cluster and node
+avg by (cluster, node) (freetpu_tpu_runtime_duty_cycle_percent{collector_role=~"node|workload"})
 
 # HBM allocation ratio (0.0 - 1.0) per runtime chip
-freetpu_tpu_runtime_hbm_used_bytes{collector_role="node"}
-  / (freetpu_tpu_runtime_hbm_total_bytes{collector_role="node"} > 0)
+freetpu_tpu_runtime_hbm_used_bytes{collector_role=~"node|workload"}
+  / (freetpu_tpu_runtime_hbm_total_bytes{collector_role=~"node|workload"} > 0)
 
 # HBM used in GiB per runtime chip
-freetpu_tpu_runtime_hbm_used_bytes{collector_role="node"} / (1024 * 1024 * 1024)
+freetpu_tpu_runtime_hbm_used_bytes{collector_role=~"node|workload"} / (1024 * 1024 * 1024)
 ```
 
 When `--chip-id-map` or sysfs `chip_id` provides a verified physical chip mapping:
 
 ```promql
 # Per-physical-chip MXU / TensorCore duty cycle (%)
-max by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent{collector_role="node"})
+max by (cluster, generation, node, pci_bdf) (
+  freetpu_tpu_duty_cycle_percent{collector_role=~"node|workload"}
+)
 
 # Average cluster MXU utilization by TPU generation
 avg by (generation) (
-  max by (generation, node, pci_bdf) (freetpu_tpu_duty_cycle_percent{collector_role="node"})
+  max by (cluster, generation, node, pci_bdf) (
+    freetpu_tpu_duty_cycle_percent{collector_role=~"node|workload"}
+  )
 )
 
 # HBM allocation ratio (0.0 - 1.0) per physical chip
-max by (generation, node, pci_bdf) (freetpu_tpu_hbm_utilization_ratio{collector_role="node"})
+max by (cluster, generation, node, pci_bdf) (
+  freetpu_tpu_hbm_utilization_ratio{collector_role=~"node|workload"}
+)
 
 # HBM used in GiB per physical chip
-max by (generation, node, pci_bdf) (freetpu_tpu_hbm_used_bytes{collector_role="node"})
-  / (1024 * 1024 * 1024)
+max by (cluster, generation, node, pci_bdf) (
+  freetpu_tpu_hbm_used_bytes{collector_role=~"node|workload"}
+) / (1024 * 1024 * 1024)
 ```
 
 ## Host VFIO Process Activity & Inventory Cost Estimates (Observational)
@@ -72,28 +81,28 @@ max by (generation, node, pci_bdf) (freetpu_tpu_hbm_used_bytes{collector_role="n
 
 ```promql
 # Chips with missing/unverified host PID telemetry (unreadable /proc or unverified /dev/vfio/<group>)
-min by (generation, node, pci_bdf) (
+min by (cluster, generation, node, pci_bdf) (
   freetpu_tpu_pid_telemetry_available{collector_role="node"}
 ) == 0
 
 # Currently observed chips with an open host /dev/vfio/<group> handle
-max by (generation, node, pci_bdf) (
+max by (cluster, generation, node, pci_bdf) (
   freetpu_tpu_active_pids{collector_role="node"}
 ) > 0
 
-# Inventory-based estimated hourly TPU spend by generation across scraped nodes.
+# Inventory-based estimated hourly TPU spend by generation across scraped clusters/nodes.
 # Counts each physical PCI chip ONCE via `collector_role="node"` and
-# `group by (generation, node, pci_bdf)` on `freetpu_tpu_info` (including
+# `group by (cluster, generation, node, pci_bdf)` on `freetpu_tpu_info` (including
 # unhealthy/unbound chips that Google Cloud bills while the TPU node is READY).
 # Includes PF-only Trillium nodes (`generation="v6e-pf"`, PCI 0x006e) at the
 # Trillium rate alongside VF Trillium nodes (`generation="v6e"`, PCI 0x006f).
 # Replace the placeholder per-chip hourly SKU rates (v5e: 1.20, v5p: 4.20,
 # v6e/v6e-pf: 2.70) with your contract/spot/on-demand rates.
 (
-  count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node", generation="v5e"})) * 1.20
+  count by (generation) (group by (cluster, generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node", generation="v5e"})) * 1.20
   or
-  count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node", generation="v5p"})) * 4.20
+  count by (generation) (group by (cluster, generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node", generation="v5p"})) * 4.20
   or
-  count by (generation) (group by (generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node", generation=~"v6e|v6e-pf"})) * 2.70
+  count by (generation) (group by (cluster, generation, node, pci_bdf) (freetpu_tpu_info{collector_role="node", generation=~"v6e|v6e-pf"})) * 2.70
 )
 ```

@@ -1671,6 +1671,23 @@ TPU Device Status
             self.assertEqual(py_called, ["127.0.0.1:9999"])
             self.assertTrue(snap4.tpu_info_available)
 
+            # Empty/None `tpu_info_bin` disables Python gRPC runtime telemetry even in
+            # `--no-pid-scan` or explicit `--runtime-metrics-addr` mode.
+            with mock.patch.object(
+                tpu_exporter,
+                "_query_tpu_info_python_metrics",
+                side_effect=AssertionError("must not query Python metrics when tpu_info_bin is disabled"),
+            ):
+                snap_disabled = tpu_exporter.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin=None,
+                    skip_pid_scan=True,
+                    runtime_metrics_addr="127.0.0.1:9999",
+                )
+            self.assertFalse(snap_disabled.tpu_info_available)
+
             # Oversized HTTP headers (> MAX_HTTP_HEADER_BYTES) are rejected with 431 before scrape.
             import socket as _socket
 

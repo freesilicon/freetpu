@@ -58,6 +58,10 @@ scrape_configs:
         regex: "metrics"
       - source_labels: [__meta_kubernetes_pod_node_name]
         target_label: node
+      # Replace with each cluster's unique name so multi-cluster scrapes never
+      # merge identically named nodes or PCI BDFs in fleet PromQL queries.
+      - target_label: cluster
+        replacement: "cloud-tpu-k8s"
       - target_label: collector_role
         replacement: "node"
     metric_relabel_configs:
