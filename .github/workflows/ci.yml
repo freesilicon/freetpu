@@ -57,6 +57,14 @@ jobs:
           python3 tools/verify_fusion_lut.py
           python3 tools/verify_chained_fusion.py
           python3 tools/verify_patch_proof.py
+          python3 tools/colab_tpu_bench.py --self-test
+
+      - name: Run Cloud TPU ops exporter & CDI self-tests
+        run: |
+          python3 ops/tpu-exporter/tpu_exporter.py --help >/dev/null
+          python3 ops/tpu-cdi/freetpu_cdi.py --help >/dev/null
+          python3 ops/tpu-exporter/test_tpu_exporter.py -v
+          python3 ops/tpu-cdi/test_freetpu_cdi.py -v
 
   clean-room-audit:
     name: Clean-Room & OSS Boundary Audit

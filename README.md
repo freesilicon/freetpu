@@ -45,6 +45,7 @@
 | **Open Runtime** | [`libopenbuenos/`](libopenbuenos/include/openbuenos.h) | C11/C++17 static library: `1,286.4 MHz` DVFS + FW WakeLock, perf-core-pinned SPSC async dequant, clean-room 7-chunk PT `W8A16(FP16)` (`FP32` acc), adaptive spin, 2-tier DMA-BUF pool & LMKD single-copy weight cache, `M=1`/`M=64` GEMM + 11-chunk chained SwiGLU emitter |
 | **Kernel Transport** | [`runtime/`](runtime/src/tpu_baremetal_runner.cpp) | Standalone bare-metal runner & UAPI/Litebuf VII headers (`0x0008 -> 0x00fe`, `/dev/edgetpu-soc` `0xED`) |
 | **ISA Tooling** | [`tools/`](tools/emit_custom_gemm.py) | Pure-Python `DGC0` dissector/patcher, multi-tile `(M, K, N)` VLIW synthesizer, `0x640` minimax spline codec, `0xa40` chained fusion verifier, `INT4` packer |
+| **Cloud TPU Ops** | [`ops/`](docs/cloud-tpu/ops-container-telemetry.md) | Zero-dep Prometheus [`tpu-exporter`](ops/tpu-exporter/README.md) (`0x1ae0` + VFIO + `tpu-info`) & CNCF CDI `v0.6.0` [`freetpu-cdi`](ops/tpu-cdi/README.md) Docker/K8s passthrough |
 
 ---
 
@@ -154,6 +155,8 @@ export OPENBUENOS_DIVE_INTERP_PATH=/data/local/tmp/tpu_open_stack/dive_interp_rv
 - [Vector ALU ISA](docs/isa-vec/vector_alu_isa.md) — `stream125` FP32-RNE quantization & activation pipeline
 - [Kernel UAPI Headers](docs/kernel-abi/README.md) — Clean-room `/dev/edgetpu-soc`, `/dev/gxp`, and GCIP IIF headers
 - [`libopenbuenos` Guide](docs/libopenbuenos/README.md) & [`ggml-edgetpu` Guide](docs/llama-cpp-edgetpu/README.md)
+- [Headless Colab TPU Tooling](docs/cloud-tpu/colab-headless-tooling.md) — Track B `v6e-1`/`v5e-1` headless harness (`tools/colab_tpu_bench.py`), Colab MCP/`v1beta` contract & Track C boundaries
+- [Cloud TPU Ops: Container CDI & Prometheus Telemetry](docs/cloud-tpu/ops-container-telemetry.md) — Zero-dep `tpu-exporter` (`:9400/metrics`) & `freetpu-cdi` CNCF CDI `v0.6.0` (`freetpu.dev/tpu=all`) Docker/K8s manifests
 
 ---
 
