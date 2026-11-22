@@ -30,12 +30,13 @@
 
 - **Claimed (`supports_op == true`)**:
   - `GGML_OP_MUL_MAT` (`dst == F32`, contiguous non-permuted inputs, default precision):
-    - `Q8_0 x F32` (`K % 32 == 0`) -> `ob_gemm_matmul_f32_q8_0` (or pre-packed buenos `ob_gemm_matmul_int8` when `OPENBUENOS_PACKED_Q8=1`)
+    - `Q8_0 x F32` and native `Q4_0 x F32` (`K % 32 == 0`) -> `ob_gemm_matmul_f32_quant_batch` (shared-`A` sibling batching across `Q/K/V` and `gate/up` when `OPENBUENOS_BATCH_SIBLINGS=1`) or `ob_gemm_matmul_f32_q8_0`
     - `Q8_0 x Q8_0` (`K % 32 == 0`) -> dequantize activations + `ob_gemm_matmul_f32_q8_0`
     - `F32 x F32` (`K % 4 == 0`, `N >= 8`) -> dynamic per-row symmetric INT8 quantization -> `ob_gemm_matmul_int8` -> F32 dequantize
+  - Post-`MUL_MAT` 1D bias `GGML_OP_ADD` (keeps Qwen2.5 QKV bias projections in one unified `EDGETPU` graph split).
   - No-op view/sentinel ops (`GGML_OP_NONE`, `RESHAPE`, `VIEW`, `PERMUTE`, `TRANSPOSE`).
 - **Routed automatically to ARM64 CPU (`supports_op == false`)**:
-  - `RMS_NORM`, `ROPE`, `SOFT_MAX`, `MUL_MAT_ID`, `GET_ROWS`, `ADD`, `MUL`, `SILU`, non-contiguous/permuted views, and explicit `GGML_PREC_F32`/`GGML_PREC_BF16` precision requests.
+  - `RMS_NORM`, `ROPE`, `SOFT_MAX`, `MUL_MAT_ID`, `GET_ROWS`, general `ADD`, `MUL`, `SILU`, non-contiguous/permuted views, and explicit `GGML_PREC_F32`/`GGML_PREC_BF16` precision requests.
 - **Buffer Type (`ggml_backend_edgetpu_buffer_type`)**:
   - 64-byte aligned host-accessible primary storage (`is_host == true`) so ARM64 CPU glue ops read model tensors with zero copy.
   - At `set_tensor` on `GGML_BACKEND_BUFFER_USAGE_WEIGHTS` `Q8_0` tensors (or lazily on cache miss), repacks weights into Tensor G5 `buenos_a0` `ext[2]` layout (`int32[n_pad] + uint8[K/4, n_pad, 4]` encoded `(w + 128) & 0xff`) via `ob_gemm_pack_weights_int8` plus per-row scales.
@@ -45,6 +46,8 @@
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `OPENBUENOS_MOCK` | `0` on Android, `1` on host | `1` runs offline/mock `libopenbuenos` without `/dev/edgetpu-soc` |
+| `OPENBUENOS_PERF_MODE` | `5` (`1,286.4 MHz` + FW WakeLock) | DVFS performance tier (`0..5`; `5` unlocks peak `1,286.4 MHz` + WakeLock) |
+| `OPENBUENOS_BATCH_SIBLINGS` | `1` | `1` batches sibling `Q/K/V` and `gate/up` projections via `ob_gemm_matmul_f32_quant_batch` |
 | `OPENBUENOS_VERBOSE` | `0` | `1` logs backend init, weight repacks, per-op `(M, K, N)`, tiles, cache hits, `hw_us` / `wall_us` |
 | `OPENBUENOS_MIN_ELEMENTS` | `0` | Minimum `M * K * N * batch` work threshold; smaller `MUL_MAT` ops fall back to CPU |
 | `OPENBUENOS_PACKED_Q8` | `0` | `1` routes `Q8_0 x F32` through the pre-packed per-row INT8 `ob_gemm_matmul_int8` path |
@@ -114,15 +117,23 @@ OB=libopenbuenos
 
 ### 4.1 Host Tests (Linked Directly Against `libopenbuenos/build/host/libopenbuenos.a`)
 
-1. **Upstream `test-backend-ops -b EDGETPU -o MUL_MAT`**:
+1. **Upstream `test-backend-ops -b EDGETPU -o MUL_MAT` (Host Mock)**:
    ```text
    OPENBUENOS_MOCK=1 ./build-host/bin/test-backend-ops -b EDGETPU -o MUL_MAT
    Backend 1/2: EDGETPU
      Device description: Pixel Tensor G5 (buenos_a0)
-     223/223 tests passed
+     327/327 tests passed
      Backend EDGETPU: OK
    ```
-2. **Pre-packed `Q8_0` INT8 mode (`OPENBUENOS_PACKED_Q8=1`)**:
+2. **Live `rango` Silicon `test-backend-ops` (`PM=5` @ `1,286.4 MHz`, `MAPS_GOOGLE=0`, `cpu_fallback_slices=0`)**:
+   - `type_a=q8_0,type_b=f32`: **`104/104` supported ops PASS** (`12.1 s` total, `hw_us=0.92 s`, `99.87%` cache hit rate, `175.1 mW` TPU).
+   - `type_a=q4_0,type_b=f32`: **`104/104` supported ops PASS** (`23.5 s` total, `hw_us=0.84 s`, `99.82%` cache hit rate, `154.4 mW` TPU).
+3. **Live `rango` `llama-bench` (`PM=5` @ `1,286.4 MHz`, `-p 128,512 -n 64 -r 3`)**:
+   - `SmolLM2-135M-Q8_0`: `pp128 = 384.00 t/s`, `pp512 = 563.82 t/s`, `tg64 = 17.36 t/s`.
+   - `Qwen2.5-1.5B-Q8_0`: `pp128 = 118.06 t/s`, `pp512 = 105.87 t/s` (`-21.5%` steady-state system `mJ/tok` vs 4-thread ARM64 CPU), `tg64 = 5.85 t/s`, **`22/22` verbatim CPU token match**.
+   - `Qwen2.5-1.5B-Q4_0`: `pp128 = 118.55 t/s`, `pp512 = 93.94 t/s`, `tg64 = 5.55 t/s` (`7.16 t/s` cold).
+   - Full 18-case ODPM energy table in [`docs/PHASE6_PERF_REPORT.md`](../PHASE6_PERF_REPORT.md).
+4. **Pre-packed `Q8_0` INT8 mode (`OPENBUENOS_PACKED_Q8=1`)**:
    ```text
    OPENBUENOS_MOCK=1 OPENBUENOS_PACKED_Q8=1 ./build-host/bin/test-backend-ops -b EDGETPU -o MUL_MAT -p "type_a=q8_0,type_b=f32"
    Backend 1/2: EDGETPU

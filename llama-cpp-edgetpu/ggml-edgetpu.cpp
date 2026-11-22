@@ -26,17 +26,40 @@ constexpr uint32_t     EDGETPU_DEFAULT_POOL_MAX_BYTES   = 128u * 1024u * 1024u;
 constexpr const char * EDGETPU_DEFAULT_DIVE_INTERP_PATH = "/data/local/tmp/tpu_open_stack/dive_interp_rv64.bin";
 
 struct edgetpu_env_config {
-    bool         mock_mode        = false;
-    int          verbose          = 0;
-    bool         packed_q8        = false;
-    uint64_t     min_elements     = 0;
-    uint32_t     cache_cap        = EDGETPU_DEFAULT_CACHE_CAP;
-    uint32_t     pool_max_bytes   = EDGETPU_DEFAULT_POOL_MAX_BYTES;
-    uint32_t     tile_max_m       = 0; // 0 -> inherit libopenbuenos tuned silicon defaults
-    uint32_t     tile_max_k       = 0;
-    uint32_t     tile_max_n       = 0;
-    const char * dive_interp_path = EDGETPU_DEFAULT_DIVE_INTERP_PATH;
+    bool         mock_mode             = false;
+    int          verbose               = 0;
+    bool         packed_q8             = false;
+    bool         batch_siblings        = true;
+    uint64_t     min_elements          = 0;
+    uint32_t     cache_cap             = EDGETPU_DEFAULT_CACHE_CAP;
+    uint32_t     pool_max_bytes        = EDGETPU_DEFAULT_POOL_MAX_BYTES;
+    uint32_t     tile_max_m            = 0; // 0 -> inherit libopenbuenos tuned silicon defaults
+    uint32_t     tile_max_k            = 0;
+    uint32_t     tile_max_n            = 0;
+    uint8_t      core_power_state      = 0; // 0 -> libopenbuenos default / perf_mode
+    uint8_t      mem_power_state       = 0; // 0 -> libopenbuenos default / perf_mode
+    uint8_t      qos_class             = 0; // 0 -> libopenbuenos default / perf_mode
+    uint8_t      cluster_id            = 0; // 0 -> .dgc0 default
+    uint8_t      priority              = 0;
+    bool         has_priority          = false;
+    uint8_t      perf_mode             = 0; // 0 -> libopenbuenos default, 1..5 = DVFS perf tier
+    bool         has_perf_mode         = false;
+    const char * dive_interp_path      = EDGETPU_DEFAULT_DIVE_INTERP_PATH;
 };
+
+static bool parse_env_u8(const char * name, uint8_t * out) {
+    if (const char * v = std::getenv(name)) {
+        if (v[0] != '\0') {
+            char * end = nullptr;
+            const unsigned long parsed = std::strtoul(v, &end, 0);
+            if (end != v && parsed <= 0xFFul) {
+                *out = static_cast<uint8_t>(parsed);
+                return true;
+            }
+        }
+    }
+    return false;
+}
 
 static edgetpu_env_config load_env_config() {
     edgetpu_env_config cfg;
@@ -54,6 +77,9 @@ static edgetpu_env_config load_env_config() {
     }
     if (const char * v = std::getenv("OPENBUENOS_PACKED_Q8")) {
         cfg.packed_q8 = (std::atoi(v) != 0);
+    }
+    if (const char * v = std::getenv("OPENBUENOS_BATCH_SIBLINGS")) {
+        cfg.batch_siblings = (std::atoi(v) != 0);
     }
     if (const char * v = std::getenv("OPENBUENOS_MIN_ELEMENTS")) {
         const long long parsed = std::atoll(v);
@@ -91,6 +117,12 @@ static edgetpu_env_config load_env_config() {
             cfg.tile_max_n = static_cast<uint32_t>(parsed);
         }
     }
+    parse_env_u8("OPENBUENOS_CORE_POWER_STATE", &cfg.core_power_state);
+    parse_env_u8("OPENBUENOS_MEM_POWER_STATE",  &cfg.mem_power_state);
+    parse_env_u8("OPENBUENOS_QOS_CLASS",        &cfg.qos_class);
+    parse_env_u8("OPENBUENOS_CLUSTER_ID",       &cfg.cluster_id);
+    cfg.has_priority  = parse_env_u8("OPENBUENOS_PRIORITY",  &cfg.priority);
+    cfg.has_perf_mode = parse_env_u8("OPENBUENOS_PERF_MODE", &cfg.perf_mode);
     if (const char * v = std::getenv("OPENBUENOS_DIVE_INTERP_PATH")) {
         if (v[0] != '\0') {
             cfg.dive_interp_path = v;
@@ -142,6 +174,10 @@ static void quantize_f32_rows_to_i8(const float * src,
         }
     }
 }
+
+static_assert(QK4_0 == QK8_0, "ggml-edgetpu requires QK4_0 == QK8_0 == 32");
+static_assert(sizeof(block_q8_0) == sizeof(ob_block_q8_0_t), "block_q8_0 must match ob_block_q8_0_t");
+static_assert(sizeof(block_q4_0) == sizeof(ob_block_q4_0_t), "block_q4_0 must match ob_block_q4_0_t");
 
 struct packed_q8_weight {
     uint32_t            k_dim = 0;
@@ -414,6 +450,9 @@ struct ggml_backend_edgetpu_context {
     uint64_t total_tile_cache_hits     = 0;
     uint64_t total_hw_us               = 0;
     uint64_t total_wall_us             = 0;
+    uint64_t total_batched_groups      = 0;
+    uint64_t total_batched_ops         = 0;
+    uint64_t total_bias_adds           = 0;
 
     ~ggml_backend_edgetpu_context() {
         if (ob_ctx) {
@@ -436,6 +475,7 @@ struct ggml_backend_edgetpu_context {
                                                  : 0.0;
                 GGML_LOG_INFO(
                     "ggml-edgetpu: summary mock=%d calls=%llu slices=%llu emitter_slices=%llu cpu_fallback_slices=%llu "
+                    "batched_groups=%llu batched_ops=%llu bias_adds=%llu "
                     "tiles=%llu tile_hits=%llu hw_us=%llu wall_us=%llu "
                     "cache_entries=%zu cache_hits=%llu cache_misses=%llu cache_evictions=%llu cache_hit_rate=%.2f%% "
                     "pool_bytes=%zu pool_count=%zu pool_hits=%llu pool_misses=%llu\n",
@@ -444,6 +484,9 @@ struct ggml_backend_edgetpu_context {
                     static_cast<unsigned long long>(total_slice_calls),
                     static_cast<unsigned long long>(total_emitter_slices),
                     static_cast<unsigned long long>(total_cpu_fallback_slices),
+                    static_cast<unsigned long long>(total_batched_groups),
+                    static_cast<unsigned long long>(total_batched_ops),
+                    static_cast<unsigned long long>(total_bias_adds),
                     static_cast<unsigned long long>(total_tiles_dispatched),
                     static_cast<unsigned long long>(total_tile_cache_hits),
                     static_cast<unsigned long long>(total_hw_us),
@@ -539,7 +582,7 @@ static ggml_status ggml_edgetpu_compute_forward_mul_mat(ggml_backend_edgetpu_con
             ob_invoke_stats_t stats {};
             ob_status_t st = OB_OK;
 
-            if (src0->type == GGML_TYPE_Q8_0) {
+            if (src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_Q4_0) {
                 const float * a_f32 = nullptr;
                 if (src1->type == GGML_TYPE_F32) {
                     a_f32 = reinterpret_cast<const float *>(src1_ptr);
@@ -556,7 +599,22 @@ static ggml_status ggml_edgetpu_compute_forward_mul_mat(ggml_backend_edgetpu_con
                     return GGML_STATUS_FAILED;
                 }
 
-                if (ctx->env.packed_q8) {
+                if (src0->type == GGML_TYPE_Q4_0) {
+                    // Native zero-copy raw Q4_0 dispatch into libopenbuenos O(1) content-hashed ext[2] DMA-BUF LRU
+                    // (unpacks nibbles once on cache miss; zero per-token CPU unpack, zero duplicate host RAM).
+                    ob_gemm_f32_quant_job_t job {};
+                    job.b_nk       = src0_ptr;
+                    job.c_mn       = dst_ptr;
+                    job.n_dim      = N;
+                    job.activation = OB_ACT_NONE;
+                    job.is_q4_0    = 1u;
+                    st = ob_gemm_matmul_f32_quant_batch(ctx->ob_ctx, a_f32, M, K, &job, 1u, &stats);
+                    if (st != OB_OK) {
+                        GGML_LOG_ERROR("ggml-edgetpu: ob_gemm_matmul_f32_quant_batch (Q4_0 M=%u,K=%u,N=%u) failed: %s\n",
+                                       M, K, N, ob_status_string(st));
+                        return GGML_STATUS_FAILED;
+                    }
+                } else if (ctx->env.packed_q8) {
                     // Per-row packed INT8 path using pre-packed buenos weights + ob_gemm_matmul_int8.
                     auto packed = get_or_repack_q8_weight(ctx, src0, src0_ptr, K, N);
                     if (!packed) {
@@ -700,6 +758,59 @@ static void ggml_backend_edgetpu_free(ggml_backend_t backend) {
     delete backend;
 }
 
+static ggml_status ggml_edgetpu_compute_forward_add_bias(ggml_backend_edgetpu_context * ctx,
+                                                         struct ggml_tensor *           dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->ne[0] == dst->ne[0] && src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1);
+
+    const int64_t n_cols = dst->ne[0];
+    const int64_t n_rows = ggml_nrows(dst);
+    const float * x      = reinterpret_cast<const float *>(src0->data);
+    const float * bias   = reinterpret_cast<const float *>(src1->data);
+    float *       y      = reinterpret_cast<float *>(dst->data);
+
+    for (int64_t r = 0; r < n_rows; ++r) {
+        const float * xr = x + r * n_cols;
+        float *       yr = y + r * n_cols;
+        for (int64_t c = 0; c < n_cols; ++c) {
+            yr[c] = xr[c] + bias[c];
+        }
+    }
+
+    ctx->total_bias_adds += 1;
+    return GGML_STATUS_SUCCESS;
+}
+
+static bool is_batchable_sibling_mul_mat(const struct ggml_tensor * node,
+                                         const struct ggml_tensor * shared_src1) {
+    if (!node || node->op != GGML_OP_MUL_MAT || node->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const struct ggml_tensor * src0 = node->src[0];
+    const struct ggml_tensor * src1 = node->src[1];
+    if (!src0 || !src1) {
+        return false;
+    }
+    if ((src0->type != GGML_TYPE_Q8_0 && src0->type != GGML_TYPE_Q4_0) || src1->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
+        return false;
+    }
+    if (shared_src1) {
+        if (src1->data != shared_src1->data || src1->ne[0] != shared_src1->ne[0] || src1->ne[1] != shared_src1->ne[1]) {
+            return false;
+        }
+    }
+    if (node->data == src1->data) {
+        return false;
+    }
+    return true;
+}
+
 static ggml_status ggml_backend_edgetpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     auto * ctx = static_cast<ggml_backend_edgetpu_context *>(backend->context);
 
@@ -712,7 +823,127 @@ static ggml_status ggml_backend_edgetpu_graph_compute(ggml_backend_t backend, st
 
         switch (node->op) {
             case GGML_OP_MUL_MAT: {
+                // Collect sibling Q/K/V or up/gate MUL_MATs sharing the same input activation src1,
+                // deferring intervening post-MUL_MAT 1D bias ADDs until the sibling group completes.
+                if (ctx->env.batch_siblings && !ctx->env.packed_q8 && is_batchable_sibling_mul_mat(node, nullptr)) {
+                    constexpr int MAX_SIBLINGS = 8;
+                    struct ggml_tensor * mm_nodes[MAX_SIBLINGS];
+                    struct ggml_tensor * deferred_adds[MAX_SIBLINGS];
+                    int n_mm  = 0;
+                    int n_add = 0;
+                    const struct ggml_tensor * shared_x = node->src[1];
+                    mm_nodes[n_mm++] = node;
+
+                    int j = i + 1;
+                    while (j < cgraph->n_nodes && n_mm < MAX_SIBLINGS) {
+                        struct ggml_tensor * next = cgraph->nodes[j];
+                        if ((next->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+                            next->op == GGML_OP_NONE ||
+                            next->op == GGML_OP_RESHAPE ||
+                            next->op == GGML_OP_VIEW ||
+                            next->op == GGML_OP_PERMUTE ||
+                            next->op == GGML_OP_TRANSPOSE) {
+                            ++j;
+                            continue;
+                        }
+                        if (next->op == GGML_OP_ADD && n_add < MAX_SIBLINGS) {
+                            bool depends_on_group = false;
+                            for (int k = 0; k < n_mm; ++k) {
+                                if (next->src[0] == mm_nodes[k]) {
+                                    depends_on_group = true;
+                                    break;
+                                }
+                            }
+                            if (depends_on_group && next->data != shared_x->data) {
+                                deferred_adds[n_add++] = next;
+                                ++j;
+                                continue;
+                            }
+                            break;
+                        }
+                        if (is_batchable_sibling_mul_mat(next, shared_x)) {
+                            bool hazard = false;
+                            for (int k = 0; k < n_mm; ++k) {
+                                if (next->src[0]->data == mm_nodes[k]->data ||
+                                    next->data == mm_nodes[k]->src[0]->data) {
+                                    hazard = true;
+                                    break;
+                                }
+                            }
+                            if (hazard) {
+                                break;
+                            }
+                            mm_nodes[n_mm++] = next;
+                            ++j;
+                            continue;
+                        }
+                        break;
+                    }
+
+                    if (n_mm > 1) {
+                        ctx->total_batched_groups += 1;
+                        ctx->total_batched_ops    += static_cast<uint64_t>(n_mm);
+
+                        ob_gemm_f32_quant_job_t jobs[MAX_SIBLINGS];
+                        for (int k = 0; k < n_mm; ++k) {
+                            jobs[k]            = {};
+                            jobs[k].b_nk       = mm_nodes[k]->src[0]->data;
+                            jobs[k].c_mn       = reinterpret_cast<float *>(mm_nodes[k]->data);
+                            jobs[k].n_dim      = static_cast<uint32_t>(mm_nodes[k]->src[0]->ne[1]);
+                            jobs[k].activation = OB_ACT_NONE;
+                            jobs[k].is_q4_0    = (mm_nodes[k]->src[0]->type == GGML_TYPE_Q4_0) ? 1u : 0u;
+                        }
+                        ob_invoke_stats_t bstats {};
+                        const ob_status_t bst = ob_gemm_matmul_f32_quant_batch(
+                            ctx->ob_ctx,
+                            reinterpret_cast<const float *>(shared_x->data),
+                            static_cast<uint32_t>(shared_x->ne[1]),
+                            static_cast<uint32_t>(shared_x->ne[0]),
+                            jobs,
+                            static_cast<uint32_t>(n_mm),
+                            &bstats);
+                        if (bst != OB_OK) {
+                            GGML_LOG_ERROR("ggml-edgetpu: ob_gemm_matmul_f32_quant_batch(n=%d,M=%lld,K=%lld) failed: %s\n",
+                                           n_mm, (long long)shared_x->ne[1], (long long)shared_x->ne[0],
+                                           ob_status_string(bst));
+                            return GGML_STATUS_FAILED;
+                        }
+                        ctx->total_mul_mat_calls    += static_cast<uint64_t>(n_mm);
+                        ctx->total_slice_calls      += static_cast<uint64_t>(n_mm);
+                        ctx->total_tiles_dispatched += bstats.tiles_dispatched;
+                        ctx->total_tile_cache_hits  += bstats.cache_hits;
+                        ctx->total_hw_us            += bstats.hw_execution_us;
+                        ctx->total_wall_us          += bstats.wall_time_us;
+                        if (bstats.flags & OB_STAT_FLAG_EMITTER_USED) {
+                            ctx->total_emitter_slices += static_cast<uint64_t>(n_mm);
+                        }
+                        if (bstats.flags & OB_STAT_FLAG_CPU_FALLBACK) {
+                            ctx->total_cpu_fallback_slices += static_cast<uint64_t>(n_mm);
+                            if (!ctx->env.mock_mode && ctx->total_cpu_fallback_slices <= 8) {
+                                GGML_LOG_WARN("ggml-edgetpu: CPU fallback in sibling batch(n=%d,M=%lld,K=%lld,flags=0x%x)\n",
+                                              n_mm, (long long)shared_x->ne[1], (long long)shared_x->ne[0],
+                                              static_cast<unsigned>(bstats.flags));
+                            }
+                        }
+                        for (int k = 0; k < n_add; ++k) {
+                            const ggml_status st = ggml_edgetpu_compute_forward_add_bias(ctx, deferred_adds[k]);
+                            if (st != GGML_STATUS_SUCCESS) {
+                                return st;
+                            }
+                        }
+                        i = j - 1;
+                        break;
+                    }
+                }
+
                 const ggml_status st = ggml_edgetpu_compute_forward_mul_mat(ctx, node);
+                if (st != GGML_STATUS_SUCCESS) {
+                    return st;
+                }
+                break;
+            }
+            case GGML_OP_ADD: {
+                const ggml_status st = ggml_edgetpu_compute_forward_add_bias(ctx, node);
                 if (st != GGML_STATUS_SUCCESS) {
                     return st;
                 }
@@ -870,12 +1101,13 @@ static bool ggml_backend_edgetpu_device_supports_op(ggml_backend_dev_t dev, cons
             }
 
             // Supported quant / precision regimes:
-            //   - Q8_0 x F32  (K % 32 == 0)
-            //   - Q8_0 x Q8_0 (K % 32 == 0)
-            //   - F32  x F32  (dynamic per-row INT8 quantize -> buenos INT8 GEMM -> F32 dequantize;
-            //                  requires K % 4 == 0 and N >= 8 matching Tensor G5's 8-channel n_pad width)
+            //   - Q8_0 x F32 / Q8_0 (K % 32 == 0)
+            //   - Q4_0 x F32 / Q8_0 (K % 32 == 0; lossless block-32 unpack into bounded scratch -> ext[2] DMA-BUF LRU)
+            //   - F32  x F32        (dynamic per-row INT8 quantize -> buenos INT8 GEMM -> F32 dequantize;
+            //                        requires K % 4 == 0 and N >= 8 matching Tensor G5's 8-channel n_pad width)
             bool dtype_ok = false;
-            if (src0->type == GGML_TYPE_Q8_0 && (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_Q8_0)) {
+            if ((src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_Q4_0) &&
+                (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_Q8_0)) {
                 dtype_ok = ((K % QK8_0) == 0);
             } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
                 dtype_ok = ((K % 4) == 0 && N >= 8);
@@ -897,6 +1129,29 @@ static bool ggml_backend_edgetpu_device_supports_op(ggml_backend_dev_t dev, cons
                 }
             }
 
+            return true;
+        }
+
+        case GGML_OP_ADD: {
+            const struct ggml_tensor * src0 = op->src[0];
+            const struct ggml_tensor * src1 = op->src[1];
+            if (!src0 || !src1) {
+                return false;
+            }
+            // Accept ONLY post-MUL_MAT 1D F32 bias broadcast [N, 1, 1, 1] whose producer MUL_MAT runs on EDGETPU,
+            // keeping Qwen2.5 Q/K/V projections in a single EDGETPU split for sibling async batching.
+            if (op->type != GGML_TYPE_F32 || src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32) {
+                return false;
+            }
+            if (src0->op != GGML_OP_MUL_MAT || !ggml_backend_edgetpu_device_supports_op(dev, src0)) {
+                return false;
+            }
+            if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(op)) {
+                return false;
+            }
+            if (src1->ne[0] != src0->ne[0] || src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
+                return false;
+            }
             return true;
         }
 
@@ -992,6 +1247,24 @@ ggml_backend_t ggml_backend_edgetpu_init(void) {
     ob_cfg.mock_mode             = env.mock_mode ? 1 : 0;
     ob_cfg.graph_cache_capacity  = env.cache_cap;
     ob_cfg.buffer_pool_max_bytes = env.pool_max_bytes;
+    if (env.core_power_state != 0u) {
+        ob_cfg.core_power_state = env.core_power_state;
+    }
+    if (env.mem_power_state != 0u) {
+        ob_cfg.mem_power_state = env.mem_power_state;
+    }
+    if (env.qos_class != 0u) {
+        ob_cfg.qos_class = env.qos_class;
+    }
+    if (env.cluster_id != 0u) {
+        ob_cfg.cluster_id = env.cluster_id;
+    }
+    if (env.has_priority) {
+        ob_cfg.priority = env.priority;
+    }
+    if (env.has_perf_mode) {
+        ob_cfg.perf_mode = env.perf_mode;
+    }
 
     ob_context_t * ob_ctx = nullptr;
     ob_status_t st = ob_context_create(&ob_cfg, &ob_ctx);
@@ -1040,7 +1313,8 @@ ggml_backend_t ggml_backend_edgetpu_init(void) {
         GGML_LOG_INFO(
             "ggml-edgetpu: initialized Pixel Tensor G5 (buenos_a0) "
             "[mock=%d, emitter=%d, interp=%s, credits=%u, cache_cap=%u, pool_mb=%u, "
-            "tile_limits=(%u,%u,%u), min_elements=%llu, packed_q8=%d, libopenbuenos=%d]\n",
+            "tile_limits=(%u,%u,%u), pwr=(perf=%u,core=0x%02x,mem=0x%02x,qos=0x%02x,prio=%u), "
+            "batch_siblings=%d, min_elements=%llu, packed_q8=%d, libopenbuenos=%d]\n",
             ob_context_is_mock(ob_ctx),
             emitter_ok ? 1 : 0,
             env.mock_mode ? "(mock)" : interp_path,
@@ -1048,6 +1322,12 @@ ggml_backend_t ggml_backend_edgetpu_init(void) {
             env.cache_cap,
             env.pool_max_bytes / (1024u * 1024u),
             env.tile_max_m, env.tile_max_k, env.tile_max_n,
+            static_cast<unsigned>(ob_cfg.perf_mode),
+            static_cast<unsigned>(ob_cfg.core_power_state),
+            static_cast<unsigned>(ob_cfg.mem_power_state),
+            static_cast<unsigned>(ob_cfg.qos_class),
+            static_cast<unsigned>(ob_cfg.priority),
+            env.batch_siblings ? 1 : 0,
             static_cast<unsigned long long>(env.min_elements),
             env.packed_q8 ? 1 : 0,
             GGML_EDGETPU_LINKED_LIBOPENBUENOS);

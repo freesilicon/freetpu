@@ -48,9 +48,19 @@ Clean-room GGML `ACCEL` backend (`EDGETPU`, device `"Pixel Tensor G5 (buenos_a0)
 | --- | --- | --- |
 | `OPENBUENOS_MOCK` | `0` on Android, `1` on host | `1` runs offline mock `libopenbuenos` without `/dev/edgetpu-soc` |
 | `OPENBUENOS_DIVE_INTERP_PATH` | `/data/local/tmp/tpu_open_stack/dive_interp_rv64.bin` | Path to user-extracted RV64 DIVE interpreter image (`ext[1]`) |
+| `OPENBUENOS_PERF_MODE` | `5` (`1,286.4 MHz` + FW WakeLock) | DVFS performance tier (`0..5`); `0` = `38.4 MHz` sleep, `5` = peak `1,286.4 MHz` |
+| `OPENBUENOS_BATCH_SIBLINGS` | `1` | `1` batches sibling `Q/K/V` and `gate/up` `MUL_MAT` ops via `ob_gemm_matmul_f32_quant_batch` |
 | `OPENBUENOS_VERBOSE` | `0` | `1` logs backend init, tile counts, cache hits, `hw_us` / `wall_us` |
 | `OPENBUENOS_MIN_ELEMENTS` | `0` | Minimum `M * K * N * batch` work threshold; smaller ops fall back to CPU |
 | `OPENBUENOS_PACKED_Q8` | `0` | `1` routes `Q8_0 x F32` through pre-packed per-row INT8 `ob_gemm_matmul_int8` |
 | `GGML_DISABLE_EDGETPU` | unset | Set `1` to disable `EDGETPU` registration for pure CPU baselines |
 
-See [docs/llama-cpp-edgetpu/README.md](../docs/llama-cpp-edgetpu/README.md) for architecture details and test outputs.
+### Verified Phase 6 Results (`rango`, `PM=5` @ `1,286.4 MHz`, `MAPS_GOOGLE=0`)
+
+- **Host `test-backend-ops -b EDGETPU -o MUL_MAT` (`OPENBUENOS_MOCK=1`)**: **`327/327` PASS**
+- **Live Silicon `test-backend-ops`**: **`104/104` `q8_0 x f32`** & **`104/104` `q4_0 x f32`** PASS (`cpu_fallback_slices=0`)
+- **`SmolLM2-135M-Q8_0`**: `pp512 = 563.82 t/s`, `pp128 = 384.00 t/s`, `tg64 = 17.36 t/s`
+- **`Qwen2.5-1.5B-Q8_0`**: `pp512 = 105.87 t/s` (**`-21.5%` steady-state system `mJ/tok` vs 4-thread ARM64 CPU**), `tg64 = 5.85 t/s`, **`22/22` verbatim CPU token match**
+- **`Qwen2.5-1.5B-Q4_0`**: `pp128 = 118.55 t/s`, `pp512 = 93.94 t/s`, `tg64 = 5.55 t/s` (`7.16 t/s` cold)
+
+See [docs/llama-cpp-edgetpu/README.md](../docs/llama-cpp-edgetpu/README.md) and [docs/PHASE6_PERF_REPORT.md](../docs/PHASE6_PERF_REPORT.md) for full architecture details, energy tables, and test outputs.

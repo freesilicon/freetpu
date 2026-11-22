@@ -24,10 +24,11 @@ Reusable C/C++ runtime library (`libopenbuenos.a`) driving Pixel 10 Pro Fold (`r
    - Supports up to `OB_MAX_CREDITS = 16` concurrent in-flight Litebuf VII commands (`EDGETPU_GET_CREDIT_SIZE = 16`), each backed by a pre-allocated 4 KiB inner-DIVE Execute DMA-BUF.
    - Enforces `buenos.ko`'s 32-bit `seq` constraint (`seq >> 32 == 0`) and demuxes out-of-order `EDGETPU_VII_LITEBUF_RESPONSE` completions over `eventfd` (`RESPDATA` + `FATAL_ERROR`).
    - Returns `OB_ERR_BUSY` when all credits are occupied.
-5. **Buenos Weight Packing & Tiled LLM GEMM (`ob_gemm_*`)**:
-   - `ob_gemm_pack_weights_int8` emits exact `ext[2]` layout: `int32[n_pad]` little-endian bias + `uint8[k_pad/4, n_pad, 4]` weights (`(w + 128) & 0xff`, padded channels `n >= N` raw `0x00`, `n_pad = ceil(N/8)*8`). Verified 320/320 byte-identical to `work/device-runner/fc.dgc0` `ext[2]`.
-   - `ob_gemm_register_emitter(ctx, fn, user_data)` snaps in a clean-room `(M, K, N)` `.dgc0` emitter (e.g. from `gemm-multitile`) with configurable tile ceilings (`ob_gemm_set_tile_limits`, default `64x512x256`).
-   - `ob_gemm_matmul_int8` and `ob_gemm_matmul_f32_q8_0` automatically decompose arbitrary LLM shapes (`M=1..64, K=2048..4096, N=2048..11008`) into tile dispatches, with exact CPU reference fallback when `mock_mode=1` or no emitter is attached.
+5. **Buenos Weight Packing, DVFS + FW WakeLock & Tiled LLM GEMM (`ob_gemm_*`)**:
+   - **DVFS Power Profiles (`0..5`, default `5`) & Firmware WakeLock (`ob_context_set_perf_mode`)**: Corrected `+0x1c..+0x20` Litebuf wire mapping (`fw_priority`, `tpu_core_power_state`, `memory_power_state`, `qos_class`, `cluster_id`) + Litebuf `AcquireWakeLock` (`union_type=4`, `bitset=0x04`) / `ReleaseWakeLock` (`union_type=5`). Unlocks full **`1,286.4 MHz`** OPP (`27.59 GB/s` sustained weight BW on `1x2048x2048` at `152 us hw`, **`983.6 INT8 GOPS` @ `177.2 mW` = `5.55 TOPS/W`** on `64x1536x1536`). See [`docs/baremetal-vii/dvfs_power_states.md`](../baremetal-vii/dvfs_power_states.md).
+   - **Built-in Clean-Room C++17 VLIW Emitter (`ob_gemm_register_builtin_emitter`)**: Synthesizes multi-tile (`81/81`), `M=1` hardware-looped `lt_1x*` (`6/6`, up to `2048x2048`), `M=64` batched prefill `lt_64x*` (`5/5`, up to `64x1536x1536`), and Mode-A zero-overhead (`+0 B`) fused `GEMM + SiLU/GELU` kernels directly in C++17 (**92/92 bit-exact** parity).
+   - **Native `Q8_0` & `Q4_0` + Shared-`A` Batched Async Dispatch (`ob_gemm_matmul_f32_quant_batch`)**: Dispatches sibling `Q/K/V` and `gate/up` projections with a single activation quantization pass, `O(1)` strided-hash weight DMA-BUF caching (FD-capped at `<= 4096` weight tiles + `<= 256` pooled slabs), outlier channel peeling + RMS `D`-downshift + `{1.25x, 1.5x, 2.0x, 4.0x, 4.0x}` saturation retry.
+   - `ob_gemm_pack_weights_int8` emits exact `ext[2]` layout (`int32[n_pad]` LE bias + `uint8[k_pad/4, n_pad, 4]` `(w + 128) & 0xff`, padded channels raw `0x00`).
 
 ---
 
@@ -105,16 +106,14 @@ SRC=libopenbuenos
 
 ---
 
-## Verified Test Summary (Offline Host + NDK r26 Cross-Build)
+## Verified Test Summary (Offline Host + NDK r26 Cross-Build + Live `rango` Silicon)
 
 - **Header checks**: `openbuenos.h` passes `-fsyntax-only -Wall -Wextra -Werror` under host `clang` (C11/C++17) and NDK r26 `aarch64-linux-android34-clang{,++}` (C11/C++17), plus pure C11 link smoke test.
-- **Host unit tests (`openbuenos_host_test`, 7/7 suites passed)**:
-  - `test_buffer_pool`: slab allocation, 4K-aligned IOVA, pool hit reuse, capacity eviction, read/write/sync.
-  - `test_dgc0_parser`: parsed real `fc.dgc0` (`16->16`, `ext[2]=320B`), `add.dgc0` (`2x4096->4096`, no params), `custom_gemm_microkernel.dgc0` (`16->32`, `ext[2]=640B`), plus corrupt container rejection.
-  - `test_graph_cache`: SHA-256 and explicit `cache_key` hits, LRU eviction, handle lifecycle.
-  - `test_async_16_credit_ring`: 16 concurrent submits, 17th `OB_ERR_BUSY`, out-of-order wait on slot #7, slot reuse, `ob_graph_wait_all` drain.
-  - `test_weight_packing_parity`: 320/320 byte-exact match vs `fc.dgc0` `ext[2]` + `N=20 -> n_pad=24` `0x00` channel padding parity.
-  - `test_pluggable_emitter_tiling`: 4-tile dispatch via `ob_gemm_register_emitter`, 4/4 graph cache hits on repeat token, exact int32 output match.
-  - `test_llm_size_matmuls`: `2048x2048` INT8 (exact 0 error, 32 tiles), `2048x2048` F32xQ8_0 (`max_abs_err=1.09e-06`, 32 tiles), `4096x11008` F32xQ8_0 (`max_abs_err=1.54e-06..1.90e-06`, 344 tiles).
+- **Host unit tests (`openbuenos_host_test`, 16/16 suites passed)**:
+  - Suites 1–10: `test_buffer_pool`, `test_dgc0_parser`, `test_graph_cache`, `test_async_16_credit_ring`, `test_weight_packing_parity`, `test_pluggable_emitter_tiling`, `test_llm_size_matmuls`, `test_builtin_emitter_81_parity` (`81/81`), `test_token_invariant_caching_and_async_pipeline`, `test_quantized_tpu_nmse` (`NMSE < 5e-4` uniform, `< 1e-3` Gaussian, `0` clips).
+  - Suites 11–16 (Phase 6): `test_lt_1x_6_parity` (`6/6` bit-exact + 8 LLM cross-shapes), `test_mode_a_fused_silu_gelu` (`+0 B` SiLU/GELU `176/176` exact, `worst_lsb=0.0283`), `test_lt_1x_tiling_and_cache`, `test_outlier_spike_and_rms_shift` (`40-sigma` peel + retry), `test_lt_64x_batched_prefill_parity` (`5/5` bit-exact -> **`92/92` total** + `pack_fmt` cache separation), `test_quant_batch_q4_0_dvfs_and_fd_caps` (`PM=0..5` + FW WakeLock, native `Q4_0`, shared-`A` QKV & gate/up at `M=1` & `M=64`, FD caps).
+- **Live `rango` silicon (`openbuenos_selftest`, `PM=5` @ `1,286.4 MHz`, zero Google `.so`s)**:
+  - `1x2048x2048`: `150 us hw` (`27.96 GB/s`), `395 us wall` (`27.2x` hw speedup vs `PM=0`).
+  - `64x1536x1536`: `304 us hw` (`993.4 INT8 GOPS` INT8; `318 us hw`, `f32_nmse=1.87e-4` F32xQ8_0).
 - **Android ARM64 ELF audit (`llvm-readelf -d` / `llvm-nm -u`)**:
-  - `openbuenos_selftest`: `ELF 64-bit LSB pie executable, ARM aarch64`, `DT_NEEDED = [libdl.so, libc.so]`, zero Google/vendor `.so`, zero `dlopen`/`dlsym`/`dlclose`/`dlerror`.
+  - `openbuenos_selftest`: `ELF 64-bit LSB pie executable, ARM aarch64`, `DT_NEEDED = [libdl.so, libm.so, libc.so]`, zero Google/vendor `.so`, zero `dlopen`/`dlsym`/`dlclose`/`dlerror`.

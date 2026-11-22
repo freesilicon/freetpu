@@ -2,7 +2,7 @@
 
 Clean-room specification of the DarwiNN / EdgeTPU Litebuf VII mailbox wire protocol on Pixel 10 Pro (`rango`, Buenos A0), allowing zero-Google-`.so` execution directly over `/dev/edgetpu-soc` (`0xED`) and `/dev/dma_heap/system`.
 
-Companion header: [`litebuf_vii_wire.h`](litebuf_vii_wire.h).
+Companion header: [`litebuf_vii_wire.h`](litebuf_vii_wire.h). For full DVFS power states, firmware WakeLock (`AcquireWakeLock`/`ReleaseWakeLock`), and the corrected `+0x1c..+0x20` `Execute` wire offsets, see [`dvfs_power_states.md`](dvfs_power_states.md).
 
 ---
 
@@ -15,7 +15,7 @@ Every graph registration and inference uses a **two-layer** Litebuf payload:
    - Passed by userspace pointer/size in `struct edgetpu_vii_litebuf_command_ioctl` (`EDGETPU_VII_LITEBUF_COMMAND`, `0xc038ed25`).
    - Kernel handling in `buenos.ko.decomp.c`:
      - `litebuf_size == 0`: emits 128B mailbox command `type = 3` (`EDGETPU_VII_LITEBUF_NULL_COMMAND`).
-     - `1 <= litebuf_size <= 96`: copies inline into `runtime_command`0..96)`, mailbox `type = 0` (`EDGETPU_VII_LITEBUF_RUNTIME_COMMAND`). Applies to `Execute` (`80 B`), `UnregisterModel` (`32 B`), `AcquireWakeLock` (`32 B`), `ReleaseWakeLock` (`32 B`).
+     - `1 <= litebuf_size <= 96`: copies inline into `runtime_command[0..96)`, mailbox `type = 0` (`EDGETPU_VII_LITEBUF_RUNTIME_COMMAND`). Applies to `Execute` (`80 B`), `UnregisterModel` (`32 B`), `AcquireWakeLock` (`32 B`), `ReleaseWakeLock` (`32 B`).
      - `litebuf_size > 96`: kernel allocates DMA memory (`edgetpu_iremap_alloc`), copies userspace `litebuf_address` into it, writes `{(__u32)dma_addr, (__u32)size}` into `large_runtime_command`, mailbox `type = 1` (`EDGETPU_VII_LITEBUF_LARGE_RUNTIME_COMMAND`). Applies to `RegisterModel` (`144 B` with `"Unknown"` model id).
 2. **Inner DIVE Runtime Layer (`silicon.dive.api.runtime_commands`)**:
    - Schema ID `0x00fe`, alignment `16` bytes, `int32_t` relative offsets, `uint32_t` sizes.

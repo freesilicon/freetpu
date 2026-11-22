@@ -55,6 +55,7 @@ jobs:
           python3 tools/verify_dma_decoder.py
           python3 tools/verify_int4_19.py
           python3 tools/verify_fusion_lut.py
+          python3 tools/verify_chained_fusion.py
           python3 tools/verify_patch_proof.py
 
   clean-room-audit:

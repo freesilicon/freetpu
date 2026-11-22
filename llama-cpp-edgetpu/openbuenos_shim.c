@@ -124,6 +124,11 @@ int ob_context_is_mock(const ob_context_t * ctx) {
     return ctx ? ctx->mock_mode : 1;
 }
 
+ob_status_t ob_context_set_perf_mode(ob_context_t * ctx, uint32_t perf_mode) {
+    (void)perf_mode;
+    return ctx ? OB_OK : OB_ERR_INVALID_ARG;
+}
+
 ob_status_t ob_context_buffer_pool_stats(const ob_context_t * ctx,
                                          size_t *             out_pooled_bytes,
                                          size_t *             out_pooled_count,
@@ -291,6 +296,59 @@ ob_status_t ob_gemm_matmul_f32_q8_0(ob_context_t *      ctx,
         out_stats->wall_time_us     = ob_shim_now_us() - t0;
         out_stats->flags            = (uint16_t)(OB_STAT_FLAG_MOCK | OB_STAT_FLAG_CPU_FALLBACK);
         out_stats->tiles_dispatched = 1u;
+    }
+    return OB_OK;
+}
+
+ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t *                  ctx,
+                                           const float *                   a_mk,
+                                           uint32_t                        m_dim,
+                                           uint32_t                        k_dim,
+                                           const ob_gemm_f32_quant_job_t * jobs,
+                                           uint32_t                        num_jobs,
+                                           ob_invoke_stats_t *             out_stats) {
+    if (!ctx || !a_mk || !jobs || num_jobs == 0u || m_dim == 0u || k_dim == 0u || (k_dim % OB_QK8_0) != 0u) {
+        return OB_ERR_INVALID_ARG;
+    }
+    const uint64_t t0 = ob_shim_now_us();
+    const uint32_t n_blocks = k_dim / OB_QK8_0;
+    for (uint32_t j = 0; j < num_jobs; ++j) {
+        const ob_gemm_f32_quant_job_t * job = &jobs[j];
+        if (!job->b_nk || !job->c_mn || job->n_dim == 0u) {
+            return OB_ERR_INVALID_ARG;
+        }
+        if (job->is_q4_0 == 0u) {
+            ob_status_t st = ob_gemm_matmul_f32_q8_0(ctx, a_mk, job->b_nk, job->c_mn, m_dim, k_dim, job->n_dim, NULL);
+            if (st != OB_OK) return st;
+        } else {
+            const ob_block_q4_0_t * blocks = (const ob_block_q4_0_t *)job->b_nk;
+            for (uint32_t m = 0; m < m_dim; ++m) {
+                const float * a_row = a_mk + (size_t)m * k_dim;
+                float *       c_row = job->c_mn + (size_t)m * job->n_dim;
+                for (uint32_t n = 0; n < job->n_dim; ++n) {
+                    const ob_block_q4_0_t * b_row = blocks + (size_t)n * n_blocks;
+                    float sum = 0.0f;
+                    for (uint32_t b = 0; b < n_blocks; ++b) {
+                        const float d = ob_shim_fp16_to_fp32(b_row[b].d);
+                        const float * a_blk = a_row + (size_t)b * OB_QK8_0;
+                        float bsum = 0.0f;
+                        for (uint32_t i = 0; i < OB_QK8_0 / 2u; ++i) {
+                            const uint8_t byte = b_row[b].qs[i];
+                            bsum += a_blk[i] * (float)((int)(byte & 0x0Fu) - 8);
+                            bsum += a_blk[i + OB_QK8_0 / 2u] * (float)((int)(byte >> 4) - 8);
+                        }
+                        sum += d * bsum;
+                    }
+                    c_row[n] = sum;
+                }
+            }
+        }
+    }
+    if (out_stats) {
+        memset(out_stats, 0, sizeof(*out_stats));
+        out_stats->wall_time_us     = ob_shim_now_us() - t0;
+        out_stats->flags            = (uint16_t)(OB_STAT_FLAG_MOCK | OB_STAT_FLAG_CPU_FALLBACK);
+        out_stats->tiles_dispatched = num_jobs;
     }
     return OB_OK;
 }
