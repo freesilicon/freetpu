@@ -1288,6 +1288,70 @@ PJRT_Error* ot_pjrt_buf_ready_event(PJRT_Buffer_ReadyEvent_Args* args) {
   return nullptr;
 }
 
+#define OT_PJRT_UNIMPL(fn_name, ArgsT, msg)                                       \
+  PJRT_Error* fn_name(ArgsT*) {                                                   \
+    return make_err(PJRT_Error_Code_UNIMPLEMENTED, msg);                          \
+  }
+
+OT_PJRT_UNIMPL(ot_pjrt_exec_optimized_program, PJRT_Executable_OptimizedProgram_Args,
+               "PJRT_Executable_OptimizedProgram not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_exec_serialize, PJRT_Executable_Serialize_Args,
+               "PJRT_Executable_Serialize not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_exec_deserialize_and_load, PJRT_Executable_DeserializeAndLoad_Args,
+               "PJRT_Executable_DeserializeAndLoad not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_exec_compiled_mem_stats, PJRT_Executable_GetCompiledMemoryStats_Args,
+               "PJRT_Executable_GetCompiledMemoryStats not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_exec_compile_options, PJRT_Executable_GetCompileOptions_Args,
+               "PJRT_Executable_GetCompileOptions not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_buf_copy_raw_to_host, PJRT_Buffer_CopyRawToHost_Args,
+               "PJRT_Buffer_CopyRawToHost not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_buf_copy_raw_to_host_future, PJRT_Buffer_CopyRawToHostFuture_Args,
+               "PJRT_Buffer_CopyRawToHostFuture not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_buf_copy_to_memory, PJRT_Buffer_CopyToMemory_Args,
+               "PJRT_Buffer_CopyToMemory not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_buf_unsafe_ptr, PJRT_Buffer_UnsafePointer_Args,
+               "PJRT_Buffer_UnsafePointer not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_buf_inc_ext_ref, PJRT_Buffer_IncreaseExternalReferenceCount_Args,
+               "PJRT_Buffer_IncreaseExternalReferenceCount not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_buf_dec_ext_ref, PJRT_Buffer_DecreaseExternalReferenceCount_Args,
+               "PJRT_Buffer_DecreaseExternalReferenceCount not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_buf_opaque_ptr, PJRT_Buffer_OpaqueDeviceMemoryDataPointer_Args,
+               "PJRT_Buffer_OpaqueDeviceMemoryDataPointer not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_buf_donate_ctrl, PJRT_Buffer_DonateWithControlDependency_Args,
+               "PJRT_Buffer_DonateWithControlDependency not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_buf_bitcast, PJRT_Buffer_Bitcast_Args,
+               "PJRT_Buffer_Bitcast not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_client_create_view, PJRT_Client_CreateViewOfDeviceBuffer_Args,
+               "PJRT_Client_CreateViewOfDeviceBuffer not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_client_create_async_h2d, PJRT_Client_CreateBuffersForAsyncHostToDevice_Args,
+               "PJRT_Client_CreateBuffersForAsyncHostToDevice not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_client_dma_map, PJRT_Client_DmaMap_Args,
+               "PJRT_Client_DmaMap not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_client_dma_unmap, PJRT_Client_DmaUnmap_Args,
+               "PJRT_Client_DmaUnmap not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_client_create_uninit_buf, PJRT_Client_CreateUninitializedBuffer_Args,
+               "PJRT_Client_CreateUninitializedBuffer not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_client_update_global_proc, PJRT_Client_UpdateGlobalProcessInfo_Args,
+               "PJRT_Client_UpdateGlobalProcessInfo not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_client_create_alias_buf, PJRT_Client_CreateAliasBuffer_Args,
+               "PJRT_Client_CreateAliasBuffer not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_client_fulfill_alias_buf, PJRT_Client_FulfillAliasBuffer_Args,
+               "PJRT_Client_FulfillAliasBuffer not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_client_create_error_buf, PJRT_Client_CreateErrorBuffer_Args,
+               "PJRT_Client_CreateErrorBuffer not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_client_load, PJRT_Client_Load_Args,
+               "PJRT_Client_Load not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_compile_standalone, PJRT_Compile_Args,
+               "PJRT_Compile not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_topo_deserialize, PJRT_TopologyDescription_Deserialize_Args,
+               "PJRT_TopologyDescription_Deserialize not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_device_poison_exec, PJRT_Device_PoisonExecution_Args,
+               "PJRT_Device_PoisonExecution not implemented in libopentpu")
+OT_PJRT_UNIMPL(ot_pjrt_device_clear_mem_stats, PJRT_Device_ClearMemoryStats_Args,
+               "PJRT_Device_ClearMemoryStats not implemented in libopentpu")
+
+#undef OT_PJRT_UNIMPL
+
 PJRT_Api build_pjrt_api() {
   PJRT_Api api{};
   api.struct_size = PJRT_Api_STRUCT_SIZE;
@@ -1323,12 +1387,24 @@ PJRT_Api build_pjrt_api() {
   api.PJRT_Client_DefaultDeviceAssignment = ot_pjrt_client_default_device_assignment;
   api.PJRT_Client_BufferFromHostBuffer = ot_pjrt_buffer_from_host_buffer;
   api.PJRT_Client_TopologyDescription = ot_pjrt_client_topology_description;
+  api.PJRT_Client_CreateViewOfDeviceBuffer = ot_pjrt_client_create_view;
+  api.PJRT_Client_CreateBuffersForAsyncHostToDevice = ot_pjrt_client_create_async_h2d;
+  api.PJRT_Client_DmaMap = ot_pjrt_client_dma_map;
+  api.PJRT_Client_DmaUnmap = ot_pjrt_client_dma_unmap;
+  api.PJRT_Client_CreateUninitializedBuffer = ot_pjrt_client_create_uninit_buf;
+  api.PJRT_Client_UpdateGlobalProcessInfo = ot_pjrt_client_update_global_proc;
+  api.PJRT_Client_CreateAliasBuffer = ot_pjrt_client_create_alias_buf;
+  api.PJRT_Client_FulfillAliasBuffer = ot_pjrt_client_fulfill_alias_buf;
+  api.PJRT_Client_CreateErrorBuffer = ot_pjrt_client_create_error_buf;
+  api.PJRT_Client_Load = ot_pjrt_client_load;
+  api.PJRT_Compile = ot_pjrt_compile_standalone;
 
   api.PJRT_TopologyDescription_Destroy = ot_pjrt_topo_destroy;
   api.PJRT_TopologyDescription_PlatformName = ot_pjrt_topo_platform_name;
   api.PJRT_TopologyDescription_PlatformVersion = ot_pjrt_topo_platform_version;
   api.PJRT_TopologyDescription_GetDeviceDescriptions = ot_pjrt_topo_get_dev_descs;
   api.PJRT_TopologyDescription_Serialize = ot_pjrt_topo_serialize;
+  api.PJRT_TopologyDescription_Deserialize = ot_pjrt_topo_deserialize;
   api.PJRT_TopologyDescription_Attributes = ot_pjrt_topo_attributes;
   api.PJRT_TopologyDescription_Fingerprint = ot_pjrt_topo_fingerprint;
 
@@ -1345,6 +1421,8 @@ PJRT_Api build_pjrt_api() {
   api.PJRT_Device_AddressableMemories = ot_pjrt_device_addr_memories;
   api.PJRT_Device_DefaultMemory = ot_pjrt_device_default_memory;
   api.PJRT_Device_MemoryStats = ot_pjrt_device_memory_stats;
+  api.PJRT_Device_PoisonExecution = ot_pjrt_device_poison_exec;
+  api.PJRT_Device_ClearMemoryStats = ot_pjrt_device_clear_mem_stats;
 
   api.PJRT_Memory_Id = ot_pjrt_memory_id;
   api.PJRT_Memory_Kind = ot_pjrt_memory_kind;
@@ -1363,6 +1441,11 @@ PJRT_Api build_pjrt_api() {
   api.PJRT_Executable_OutputMemoryKinds = ot_pjrt_exec_output_mem_kinds;
   api.PJRT_Executable_OutputElementTypes = ot_pjrt_exec_output_types;
   api.PJRT_Executable_OutputDimensions = ot_pjrt_exec_output_dims;
+  api.PJRT_Executable_OptimizedProgram = ot_pjrt_exec_optimized_program;
+  api.PJRT_Executable_Serialize = ot_pjrt_exec_serialize;
+  api.PJRT_Executable_DeserializeAndLoad = ot_pjrt_exec_deserialize_and_load;
+  api.PJRT_Executable_GetCompiledMemoryStats = ot_pjrt_exec_compiled_mem_stats;
+  api.PJRT_Executable_GetCompileOptions = ot_pjrt_exec_compile_options;
   api.PJRT_Executable_Fingerprint = ot_pjrt_exec_fingerprint;
 
   api.PJRT_LoadedExecutable_Destroy = ot_pjrt_lexec_destroy;
@@ -1386,9 +1469,18 @@ PJRT_Api build_pjrt_api() {
   api.PJRT_Buffer_Delete = ot_pjrt_buf_delete;
   api.PJRT_Buffer_IsDeleted = ot_pjrt_buf_is_deleted;
   api.PJRT_Buffer_CopyToDevice = ot_pjrt_buf_copy_to_device;
+  api.PJRT_Buffer_CopyToMemory = ot_pjrt_buf_copy_to_memory;
   api.PJRT_Buffer_ToHostBuffer = ot_pjrt_buf_to_host;
+  api.PJRT_Buffer_CopyRawToHost = ot_pjrt_buf_copy_raw_to_host;
+  api.PJRT_Buffer_CopyRawToHostFuture = ot_pjrt_buf_copy_raw_to_host_future;
   api.PJRT_Buffer_IsOnCpu = ot_pjrt_buf_is_on_cpu;
   api.PJRT_Buffer_ReadyEvent = ot_pjrt_buf_ready_event;
+  api.PJRT_Buffer_UnsafePointer = ot_pjrt_buf_unsafe_ptr;
+  api.PJRT_Buffer_IncreaseExternalReferenceCount = ot_pjrt_buf_inc_ext_ref;
+  api.PJRT_Buffer_DecreaseExternalReferenceCount = ot_pjrt_buf_dec_ext_ref;
+  api.PJRT_Buffer_OpaqueDeviceMemoryDataPointer = ot_pjrt_buf_opaque_ptr;
+  api.PJRT_Buffer_DonateWithControlDependency = ot_pjrt_buf_donate_ctrl;
+  api.PJRT_Buffer_Bitcast = ot_pjrt_buf_bitcast;
   return api;
 }
 

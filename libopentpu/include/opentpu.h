@@ -40,7 +40,7 @@ typedef enum ot_status {
 typedef enum ot_chip_gen {
   OT_CHIP_UNKNOWN = 0,
   OT_CHIP_V5E     = 1, /* PCI 0x1ae0:0x0063 */
-  OT_CHIP_V6E     = 2, /* PCI 0x1ae0:0x0066 (probed dynamically) */
+  OT_CHIP_V6E     = 2, /* PCI 0x1ae0:0x006f (documented; transport not yet validated) */
   OT_CHIP_TPU7X   = 3
 } ot_chip_gen_t;
 

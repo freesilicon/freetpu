@@ -293,6 +293,16 @@ ot_status_t ot_matmul_bf16(ot_context_t* ctx,
   if (lhs_mk->size_bytes < need_a || rhs_kn->size_bytes < need_b || out_mn->size_bytes < need_c) {
     return OT_ERR_INVALID_ARG;
   }
+  auto ranges_overlap = [](const ot_buffer_t* x, const ot_buffer_t* y) -> bool {
+    if (x == y) return true;
+    if (x->size_bytes == 0 || y->size_bytes == 0) return false;
+    uint64_t x_end = x->hbm_addr + x->size_bytes;
+    uint64_t y_end = y->hbm_addr + y->size_bytes;
+    return x->hbm_addr < y_end && y->hbm_addr < x_end;
+  };
+  if (ranges_overlap(out_mn, lhs_mk) || ranges_overlap(out_mn, rhs_kn)) {
+    return OT_ERR_INVALID_ARG;
+  }
 
   std::lock_guard<std::mutex> lk(ctx->mu);
   if (ctx->transport.dma_faulted) {

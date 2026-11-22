@@ -115,6 +115,28 @@ static void test_mock_dma_and_matmul() {
   OT_CHECK(ot_matmul_bf16(ctx, ba, foreign, bc, M, K, N) == OT_ERR_INVALID_ARG);
   OT_CHECK(ot_matmul_bf16(ctx, ba, bb, foreign, M, K, N) == OT_ERR_INVALID_ARG);
 
+  // Overlapping output and input buffers must be rejected without mutating inputs.
+  OT_CHECK(ot_matmul_bf16(ctx, ba, bb, ba, M, K, N) == OT_ERR_INVALID_ARG);
+  OT_CHECK(ot_matmul_bf16(ctx, ba, bb, bb, M, K, N) == OT_ERR_INVALID_ARG);
+  // Identical lhs and rhs into a disjoint output remains valid.
+  OT_CHECK(ot_matmul_bf16(ctx, ba, ba, bc, M, K, N) == OT_OK);
+
+  // Explicit smaller HBM budget in mock mode clamps capacity and enforces OT_ERR_NOMEM.
+  ot_config_t cfg_small = ot_config_default();
+  cfg_small.mock_mode = 1;
+  cfg_small.hbm_budget_bytes = 256ULL * 1024ULL;
+  ot_context_t* ctx_small = nullptr;
+  OT_CHECK(ot_context_create(&cfg_small, &ctx_small) == OT_OK);
+  ot_device_info_t small_info = {};
+  OT_CHECK(ot_device_get_info(ctx_small, &small_info) == OT_OK);
+  OT_CHECK(small_info.hbm_bytes_total == 256ULL * 1024ULL);
+  ot_buffer_t* too_big = nullptr;
+  OT_CHECK(ot_buffer_alloc(ctx_small, 300ULL * 1024ULL, &too_big) == OT_ERR_NO_MEMORY);
+  ot_buffer_t* fits = nullptr;
+  OT_CHECK(ot_buffer_alloc(ctx_small, 128ULL * 1024ULL, &fits) == OT_OK);
+  ot_buffer_free(fits);
+  ot_context_destroy(ctx_small);
+
   // Faulted DMA context must refuse subsequent transfers and allocations.
   ctx2->transport.dma_faulted = true;
   ot_buffer_t* blocked = nullptr;
@@ -290,6 +312,39 @@ static void test_pjrt_api_mock() {
   ge.loaded_executable = ca.executable;
   OT_CHECK(api->PJRT_LoadedExecutable_GetExecutable(&ge) == nullptr);
   OT_CHECK(ge.executable != nullptr);
+
+  // Directly-invoked optional PJRT callbacks must be populated and return UNIMPLEMENTED.
+  OT_CHECK(api->PJRT_Executable_OptimizedProgram != nullptr);
+  PJRT_Program opt_prog = {};
+  opt_prog.struct_size = PJRT_Program_STRUCT_SIZE;
+  PJRT_Executable_OptimizedProgram_Args opt_args = {};
+  opt_args.struct_size = PJRT_Executable_OptimizedProgram_Args_STRUCT_SIZE;
+  opt_args.executable = ge.executable;
+  opt_args.program = &opt_prog;
+  PJRT_Error* opt_err = api->PJRT_Executable_OptimizedProgram(&opt_args);
+  OT_CHECK(opt_err != nullptr);
+  {
+    PJRT_Error_GetCode_Args gc = {};
+    gc.struct_size = PJRT_Error_GetCode_Args_STRUCT_SIZE;
+    gc.error = opt_err;
+    OT_CHECK(api->PJRT_Error_GetCode(&gc) == nullptr);
+    OT_CHECK(gc.code == PJRT_Error_Code_UNIMPLEMENTED);
+  }
+  destroy_pjrt_error(api, opt_err);
+
+  OT_CHECK(api->PJRT_Buffer_CopyRawToHost != nullptr);
+  PJRT_Buffer_CopyRawToHost_Args cr_args = {};
+  cr_args.struct_size = PJRT_Buffer_CopyRawToHost_Args_STRUCT_SIZE;
+  PJRT_Error* cr_err = api->PJRT_Buffer_CopyRawToHost(&cr_args);
+  OT_CHECK(cr_err != nullptr);
+  {
+    PJRT_Error_GetCode_Args gc = {};
+    gc.struct_size = PJRT_Error_GetCode_Args_STRUCT_SIZE;
+    gc.error = cr_err;
+    OT_CHECK(api->PJRT_Error_GetCode(&gc) == nullptr);
+    OT_CHECK(gc.code == PJRT_Error_Code_UNIMPLEMENTED);
+  }
+  destroy_pjrt_error(api, cr_err);
 
   // Strided & reversed host uploads must reorder elements accurately; unsupported layouts rejected.
   uint16_t raw_2x2[4] = {0x3f80u, 0x4000u, 0x4040u, 0x4080u};  // [1, 2; 3, 4]

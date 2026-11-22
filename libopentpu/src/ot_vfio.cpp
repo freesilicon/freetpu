@@ -3,6 +3,7 @@
 #include "ot_vliw.h"
 
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -184,6 +185,12 @@ bool parse_bar4_descriptor(const uint8_t* bar4_page, size_t page_len, Bar4Descri
 }
 
 #ifdef __linux__
+static bool is_supported_vfio_device_id(uint16_t device_id) {
+  // Only TPU v5e (0x1ae0:0x0063) has a validated VFIO ring/DMA transport.
+  // Documented TPU v6e (0x1ae0:0x006f) is rejected until its transport is validated.
+  return device_id == 0x0063u;
+}
+
 static std::string sysfs_read_line(const std::string& path) {
   int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd < 0) return "";
@@ -233,6 +240,20 @@ static bool discover_linux_tpu(const char* preferred_bdf, PciDiscoveryEntry* out
     std::string grp_str = sysfs_read_link_base(base + "/iommu_group");
 
     if (drv == "vfio-pci" && vid == 0x1ae0ULL && cls == 0xff0000ULL) {
+      if (!is_supported_vfio_device_id(static_cast<uint16_t>(did))) {
+        if (preferred_bdf && preferred_bdf[0] != '\0') {
+          if (err) {
+            char msg[160];
+            std::snprintf(msg, sizeof(msg),
+                          "Unsupported TPU PCI device %s (0x%04x:0x%04x); only validated v5e (0x1ae0:0x0063) is supported",
+                          bdf.c_str(), static_cast<unsigned>(vid), static_cast<unsigned>(did));
+            *err = msg;
+          }
+          ::closedir(dir);
+          return false;
+        }
+        continue;
+      }
       out->bdf = bdf;
       out->vendor_id = static_cast<uint16_t>(vid);
       out->device_id = static_cast<uint16_t>(did);
@@ -246,7 +267,7 @@ static bool discover_linux_tpu(const char* preferred_bdf, PciDiscoveryEntry* out
   ::closedir(dir);
 
   if (!found && err) {
-    *err = "No vfio-pci Google Cloud TPU (vendor=0x1ae0, class=0xff0000) discovered";
+    *err = "No supported vfio-pci Google Cloud TPU (0x1ae0:0x0063, class=0xff0000) discovered";
   }
   return found;
 }
@@ -255,6 +276,8 @@ static bool discover_linux_tpu(const char* preferred_bdf, PciDiscoveryEntry* out
 bool VfioTransport::open_device(const ot_config_t& cfg, ot_device_info_t* info, std::string* err) {
   if (!info) return false;
   std::memset(info, 0, sizeof(*info));
+
+  static constexpr uint64_t kHbmAllocBase = 0x00100000ULL;
 
   if (cfg.mock_mode) {
     is_mock = true;
@@ -269,7 +292,6 @@ bool VfioTransport::open_device(const ot_config_t& cfg, ot_device_info_t* info, 
     info->bar0_size = 0x100000000ULL;
     info->bar4_size = 0x1000000ULL;
     info->msix_vectors = 128u;
-    info->hbm_bytes_total = cfg.hbm_budget_bytes ? cfg.hbm_budget_bytes : 16909336064ULL;
     info->vmem_bytes = 128ULL * 1024ULL * 1024ULL;
     info->smem_bytes = 1024ULL * 1024ULL;
     info->num_mxus = 4u;
@@ -278,10 +300,16 @@ bool VfioTransport::open_device(const ot_config_t& cfg, ot_device_info_t* info, 
 
     mock_bar0.assign(128u * 1024u, 0);
     mock_bar4.assign(64u * 1024u, 0);
-    // Mock 64 MiB HBM backing store for offline tests
+    // Mock 64 MiB HBM backing store for offline tests; honor smaller explicit budgets.
     mock_hbm.assign(64ULL * 1024ULL * 1024ULL, 0);
+    uint64_t mock_max_usable = mock_hbm.size() - kHbmAllocBase;
+    uint64_t usable_bytes = mock_max_usable;
+    if (cfg.hbm_budget_bytes > 0 && cfg.hbm_budget_bytes < usable_bytes) {
+      usable_bytes = cfg.hbm_budget_bytes;
+    }
     iova_alloc.init(0x100000ULL, 0xf0000000ULL);
-    hbm_alloc.init(0x00100000ULL, mock_hbm.size());
+    hbm_alloc.init(kHbmAllocBase, kHbmAllocBase + usable_bytes);
+    info->hbm_bytes_total = hbm_alloc.capacity_bytes();
     return true;
   }
 
@@ -343,9 +371,6 @@ bool VfioTransport::open_device(const ot_config_t& cfg, ot_device_info_t* info, 
     return false;
   }
 
-  // Best-effort device function reset to ensure clean ring state across runs.
-  (void)::ioctl(device_fd, VFIO_DEVICE_RESET);
-
   struct vfio_region_info r0 = {}, r4 = {}, rcfg = {};
   r0.argsz = sizeof(r0);
   r0.index = VFIO_PCI_BAR0_REGION_INDEX;
@@ -368,6 +393,25 @@ bool VfioTransport::open_device(const ot_config_t& cfg, ot_device_info_t* info, 
   bar4_size = r4.size;
   cfg_offset = rcfg.offset;
   cfg_size = rcfg.size;
+
+  // Re-verify live PCI vendor/device ID from config space before resetting or programming.
+  uint16_t live_vid = 0, live_did = 0;
+  if (!read_pci_config(0x00, &live_vid, sizeof(live_vid)) ||
+      !read_pci_config(0x02, &live_did, sizeof(live_did)) ||
+      live_vid != 0x1ae0u || !is_supported_vfio_device_id(live_did)) {
+    if (err) {
+      char msg[160];
+      std::snprintf(msg, sizeof(msg),
+                    "Refusing to reset/program unsupported VFIO PCI device (0x%04x:0x%04x); only 0x1ae0:0x0063 is validated",
+                    static_cast<unsigned>(live_vid), static_cast<unsigned>(live_did));
+      *err = msg;
+    }
+    close_device();
+    return false;
+  }
+
+  // Best-effort device function reset to ensure clean ring state across runs.
+  (void)::ioctl(device_fd, VFIO_DEVICE_RESET);
 
   if (bar4_size > 0 && (r4.flags & VFIO_REGION_INFO_FLAG_MMAP)) {
     void* p4 = ::mmap(nullptr, static_cast<size_t>(bar4_size), PROT_READ | PROT_WRITE,
@@ -433,7 +477,7 @@ bool VfioTransport::open_device(const ot_config_t& cfg, ot_device_info_t* info, 
   info->iommu_group = pci.iommu_group;
   if (pci.device_id == 0x0063u) {
     info->chip_gen = OT_CHIP_V5E;
-  } else if (pci.device_id == 0x0066u || pci.device_id == 0x0065u) {
+  } else if (pci.device_id == 0x006fu) {
     info->chip_gen = OT_CHIP_V6E;
   } else {
     info->chip_gen = OT_CHIP_UNKNOWN;
@@ -441,7 +485,6 @@ bool VfioTransport::open_device(const ot_config_t& cfg, ot_device_info_t* info, 
   info->bar0_size = bar0_size;
   info->bar4_size = bar4_size;
   info->msix_vectors = msix_cnt;
-  info->hbm_bytes_total = cfg.hbm_budget_bytes ? cfg.hbm_budget_bytes : 16909336064ULL;
   info->vmem_bytes = 128ULL * 1024ULL * 1024ULL;
   info->smem_bytes = 1024ULL * 1024ULL;
   info->num_mxus = 4u;
@@ -450,9 +493,15 @@ bool VfioTransport::open_device(const ot_config_t& cfg, ot_device_info_t* info, 
 
   // Reserve 0x0000..0x00100000 for ring queues + 0x00100000..0x00500000 for staging.
   iova_alloc.init(0x00800000ULL, 0xf0000000ULL);
-  // 15.748 GiB usable HBM starts at 0x00100000; usable top ends before 0x3ef000000.
-  uint64_t hbm_limit = info->hbm_bytes_total < 0x3f0000000ULL ? info->hbm_bytes_total : 0x3ef000000ULL;
-  hbm_alloc.init(0x00100000ULL, hbm_limit);
+  // Usable HBM starts at kHbmAllocBase (0x00100000) and ends unconditionally at 0x3ef000000.
+  static constexpr uint64_t kHbmUsableTop = 0x3ef000000ULL;
+  static constexpr uint64_t kHbmUsableMaxBytes = kHbmUsableTop - kHbmAllocBase;
+  uint64_t usable_bytes = kHbmUsableMaxBytes;
+  if (cfg.hbm_budget_bytes > 0 && cfg.hbm_budget_bytes < usable_bytes) {
+    usable_bytes = cfg.hbm_budget_bytes;
+  }
+  hbm_alloc.init(kHbmAllocBase, kHbmAllocBase + usable_bytes);
+  info->hbm_bytes_total = hbm_alloc.capacity_bytes();
 
   if (!init_ring_queues(err)) {
     close_device();
@@ -783,9 +832,9 @@ bool VfioTransport::submit_sq_wait(const uint32_t desc[32], uint32_t timeout_ms,
   write32_bar0(0x10018u, target_seq);
   write32_bar0(0x10044u, 0u);
 
-  uint32_t budget_us = (timeout_ms ? timeout_ms : 5000u) * 1000u;
-  uint32_t waited_us = 0;
-  while (waited_us <= budget_us) {
+  const auto timeout = std::chrono::milliseconds(timeout_ms ? timeout_ms : 5000u);
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  for (;;) {
     uint32_t cq_tail = __atomic_load_n(&status_page_mem[1], __ATOMIC_ACQUIRE);
     if (static_cast<int32_t>(cq_tail - target_seq) >= 0) {
       // Order completion entry and DMA payload reads after observing cq_tail (AArch64).
@@ -797,8 +846,10 @@ bool VfioTransport::submit_sq_wait(const uint32_t desc[32], uint32_t timeout_ms,
       write32_bar0(0x1002cu, target_seq);
       return true;
     }
+    if (std::chrono::steady_clock::now() >= deadline) {
+      break;
+    }
     ::usleep(10);
-    waited_us += 10u;
   }
 
   // Quiesce the device immediately so an in-flight descriptor cannot complete
