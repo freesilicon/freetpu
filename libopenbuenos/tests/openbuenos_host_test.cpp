@@ -575,8 +575,11 @@ void test_llm_size_matmuls() {
     ob_invoke_stats_t stats {};
     CHECK(ob_gemm_matmul_int8(ctx, a.data(), b.data(), bias.data(), c.data(),
                               M, K, N, 0, 0, &stats) == OB_OK);
-    // 1 M-tile * (2048/512=4 K-tiles) * (2048/256=8 N-tiles) = 32 tiles
-    CHECK(stats.tiles_dispatched == 32u);
+    // 1 M-tile * (2048/512=4 K-tiles) * (2048/256=8 N-tiles) = 32 CPU fallback tiles
+    // (builtin emitter does not synthesize M=2 512x256 tiles, so hardware dispatches == 0).
+    CHECK((stats.flags & OB_STAT_FLAG_CPU_FALLBACK) != 0u);
+    CHECK((stats.flags & OB_STAT_FLAG_EMITTER_USED) == 0u);
+    CHECK(stats.tiles_dispatched == 0u);
 
     // Spot-check 64 distributed outputs against exact reference
     for (uint32_t m = 0; m < M; ++m) {
@@ -630,8 +633,10 @@ void test_llm_size_matmuls() {
     ob_invoke_stats_t stats {};
     CHECK(ob_gemm_matmul_f32_q8_0(ctx, a.data(), b.data(), c.data(),
                                   M, K, N, &stats) == OB_OK);
-    uint32_t expected_tiles = ((K + 511u) / 512u) * ((N + 255u) / 256u);
-    CHECK(stats.tiles_dispatched == expected_tiles);
+    // No emitter registered in this CPU accumulation test -> hardware dispatches == 0.
+    CHECK((stats.flags & OB_STAT_FLAG_CPU_FALLBACK) != 0u);
+    CHECK((stats.flags & OB_STAT_FLAG_EMITTER_USED) == 0u);
+    CHECK(stats.tiles_dispatched == 0u);
 
     // Verify distributed rows against independent fp64 reference
     double max_abs_err = 0.0;
@@ -4370,7 +4375,43 @@ void test_phase7_cycle3_regressions() {
     ob_context_destroy(ctx);
   }
 
-  std::printf("[PASS] test_phase7_cycle3_regressions (dense 16MiB cap, immutable gen+O(1) hit, warm budget shrink, refcnt timeout retention, warm SwiGLU clip guard OK)\n");
+  // 7. CPU-only fallback without an emitter must NOT increment tiles_dispatched.
+  {
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+    CHECK(ob_gemm_register_emitter(ctx, nullptr, nullptr) == OB_OK);
+
+    std::vector<float> af(64u, 0.25f), cf(64u, 0.0f);
+    std::vector<ob_block_q8_0_t> bq(64u * 2u);
+    for (auto& blk : bq) {
+      blk.d = fp32_to_fp16(0.5f);
+      std::memset(blk.qs, 2, sizeof(blk.qs));
+    }
+    ob_invoke_stats_t sf{};
+    CHECK(ob_gemm_matmul_f32_q8_0(ctx, af.data(), bq.data(), cf.data(), 1u, 64u, 64u, &sf) == OB_OK);
+    CHECK(sf.tiles_dispatched == 0u);
+    CHECK((sf.flags & OB_STAT_FLAG_CPU_FALLBACK) != 0u);
+    CHECK((sf.flags & OB_STAT_FLAG_EMITTER_USED) == 0u);
+    CHECK(std::fabs(cf[0] - 16.0f) < 1e-4f);
+
+    std::vector<int8_t> ai(64u, 2), bi(64u * 64u, 3);
+    std::vector<int32_t> ci(64u, 0);
+    ob_invoke_stats_t si{};
+    CHECK(ob_gemm_matmul_int8(ctx, ai.data(), bi.data(), nullptr, ci.data(), 1u, 64u, 64u, 0, 0, &si) == OB_OK);
+    CHECK(si.tiles_dispatched == 0u);
+    CHECK((si.flags & OB_STAT_FLAG_CPU_FALLBACK) != 0u);
+    CHECK((si.flags & OB_STAT_FLAG_EMITTER_USED) == 0u);
+    CHECK(ci[0] == 384);
+
+    ob_profile_stats_t ps{};
+    CHECK(ob_context_get_profile(ctx, &ps) == OB_OK);
+    CHECK(ps.tiles_dispatched == 0u);
+    ob_context_destroy(ctx);
+  }
+
+  std::printf("[PASS] test_phase7_cycle3_regressions (dense 16MiB cap, immutable gen+O(1) hit, warm budget shrink, refcnt timeout retention, warm SwiGLU clip guard, cpu-only tiles_dispatched=0 OK)\n");
 }
 
 }  // namespace

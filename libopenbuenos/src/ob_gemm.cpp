@@ -2379,7 +2379,6 @@ ob_status_t ob_gemm_matmul_int8(ob_context_t* ctx,
       const uint32_t tn = tr.tn;
       const uint32_t hw_k = tr.hw_k;
       const uint32_t hw_n = tr.hw_n;
-      tiles_dispatched += 1u;
 
       bool tile_handled_by_hw = false;
       if (emitter != nullptr) {
@@ -2604,6 +2603,7 @@ ob_status_t ob_gemm_matmul_int8(ob_context_t* ctx,
             p.tn = tn;
             p.hw_n = hw_n;
             p.scale_d = scale_d;
+            tiles_dispatched += 1u;
             ring_count += 1u;
 
             if (!ctx->mock_mode) {
@@ -2790,9 +2790,10 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
               if (!sat) break;
 
               const uint64_t tde0 = prof_on ? ob::monotonic_now_ns() : 0u;
-              ob::buffer_sync_end_read(p.out_buf);
+              rst = ob::buffer_sync_end_read(p.out_buf);
               if (prof_on) ctx->prof.dma_sync_ns += (ob::monotonic_now_ns() - tde0);
               read_active = false;
+              if (rst != OB_OK) break;
 
               ctx->prof.sat_retries += 1u;
               eff_d = ob::quant_scale_D_grid(
@@ -2815,7 +2816,6 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
               rst = ob::acquire_tile_entry(ctx, emitter, emitter_ud, rdesc, &rentry, &rhit);
               if (rst != OB_OK) break;
               if (rhit) cache_hits += 1u;
-              tiles_dispatched += 1u;
               ob_exec_handle_t rh = 0u;
               rst = ob::device_submit_execute_async(
                   ctx, rentry,
@@ -2827,6 +2827,7 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
                 ob::release_tile_entry(ctx, rentry);
                 break;
               }
+              tiles_dispatched += 1u;
               ob_invoke_stats_t rstats {};
               const uint64_t trw0 = prof_on ? ob::monotonic_now_ns() : 0u;
               rst = ob::device_wait_handle(ctx, rh, ctx->cfg.timeout_ms, &rstats);
@@ -3275,7 +3276,6 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
         ob_status_t gst = ob::acquire_tile_entry(
             ctx, emitter, emitter_ud, desc, &entry, &was_hit);
         if (gst == OB_OK) {
-          tiles_dispatched += 1u;
           used_emitter = true;
           if (was_hit) cache_hits += 1u;
           if (num_subs >= 2u) {
@@ -3361,6 +3361,7 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
             p.s_a_overflow = row_s_a;
           }
           if (!w_tile) p.s_b = row_s_b;
+          tiles_dispatched += 1u;
           ring_count += 1u;
 
           if (!ctx->mock_mode) {
@@ -3495,8 +3496,6 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
             return gst;
           }
         }
-      } else {
-        tiles_dispatched += 1u;
       }
 
       if (!tile_handled_by_hw) {
@@ -4383,9 +4382,10 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
                 if (!sat) break;
 
                 const uint64_t tde0 = prof_on ? ob::monotonic_now_ns() : 0u;
-                ob::buffer_sync_end_read(p.out_buf);
+                rst = ob::buffer_sync_end_read(p.out_buf);
                 if (prof_on) ctx->prof.dma_sync_ns += (ob::monotonic_now_ns() - tde0);
                 read_active = false;
+                if (rst != OB_OK) break;
 
                 ctx->prof.sat_retries += 1u;
                 eff_d_down <<= 1u;
@@ -4400,8 +4400,6 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
                 rst = ob::acquire_swiglu_entry(ctx, rdesc, rkey, &rentry, &rhit);
                 if (rst != OB_OK) break;
                 if (rhit) total_hits += 1u;
-                total_tiles += 1u;
-                chained_chunks += 1u;
                 ob_exec_handle_t rh = 0u;
                 rst = ob::device_submit_execute_async(
                     ctx, rentry, &p.in_buf, 1u, &p.out_buf, 1u, &rh, p.w_tile->ext2_buf);
@@ -4410,6 +4408,8 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
                   ob::release_tile_entry(ctx, rentry);
                   break;
                 }
+                total_tiles += 1u;
+                chained_chunks += 1u;
                 ob_invoke_stats_t rstats{};
                 const uint64_t trw0 = prof_on ? ob::monotonic_now_ns() : 0u;
                 rst = ob::device_wait_handle(ctx, rh, ctx->cfg.timeout_ms, &rstats);
@@ -4891,8 +4891,6 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
           drain_all_cleanup();
           return gst;
         }
-        total_tiles += 1u;
-        chained_chunks += 1u;
         agg_flags |= OB_STAT_FLAG_EMITTER_USED;
         if (was_hit) total_hits += 1u;
 
@@ -4912,6 +4910,8 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
           drain_all_cleanup();
           return bst;
         }
+        total_tiles += 1u;
+        chained_chunks += 1u;
 
         PendingSwigluChunk& p = ring[slot];
         p.handle = exec_h;
