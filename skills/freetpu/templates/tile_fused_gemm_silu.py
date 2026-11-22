@@ -8,8 +8,6 @@ Features:
   - Supports `--self-test` offline on any machine using pure NumPy (zero JAX/TPU required).
 """
 
-from __future__ import annotations
-
 import argparse
 import ast
 import dataclasses
@@ -26,11 +24,12 @@ VMEM_LIMIT_BYTES = 16 * 1024 * 1024
 
 
 def estimate_vmem_bytes(bm: int, bn: int, bk: int) -> int:
-    """Return scratch VMEM footprint for 2-slot BF16 A/B double buffers + FP32 accumulator."""
+    """Return VMEM footprint for 2-slot BF16 A/B buffers, FP32 accumulator, and BF16 output tile."""
     a_db = 2 * bm * bk * 2
     b_db = 2 * bk * bn * 2
     acc = bm * bn * 4
-    return a_db + b_db + acc
+    out = bm * bn * 2
+    return a_db + b_db + acc + out
 
 
 def cpu_ref_gemm_silu(a_f32: np.ndarray, b_f32: np.ndarray) -> np.ndarray:
@@ -99,7 +98,7 @@ def build_pallas_gemm_silu(
     bm: int,
     bn: int,
     bk: int,
-    vmem_limit_bytes: int | None = None,
+    vmem_limit_bytes: Optional[int] = None,
 ):
     """Build a double-buffered Pallas/Mosaic `GEMM + SiLU` kernel for Cloud TPU."""
     import jax
@@ -109,9 +108,10 @@ def build_pallas_gemm_silu(
 
     if m % bm or n % bn or k % bk:
         raise ValueError(f"Shape ({m}, {k}, {n}) must be divisible by ({bm}, {bk}, {bn})")
+    budget_bytes = vmem_limit_bytes if vmem_limit_bytes is not None else VMEM_LIMIT_BYTES
     vmem_est = estimate_vmem_bytes(bm, bn, bk)
-    if vmem_est > VMEM_LIMIT_BYTES:
-        raise ValueError(f"Tile ({bm}, {bn}, {bk}) uses {vmem_est} B > {VMEM_LIMIT_BYTES} B VMEM budget")
+    if vmem_est > budget_bytes:
+        raise ValueError(f"Tile ({bm}, {bn}, {bk}) uses {vmem_est} B > {budget_bytes} B VMEM budget")
 
     num_k = k // bk
     if num_k < 2:
@@ -251,8 +251,10 @@ def run_self_test() -> Dict[str, Any]:
     tiled = tiled_cpu_gemm_silu(a, b, bm, bn, bk)
     max_abs_err = float(np.max(np.abs(ref - tiled)))
     vmem_4096_tile = estimate_vmem_bytes(1024, 1024, 256)
+    vmem_overflow_tile = estimate_vmem_bytes(1024, 2048, 512)
     assert max_abs_err < 1e-6, f"CPU tiled parity failed: max_abs_err={max_abs_err}"
-    assert vmem_4096_tile <= VMEM_LIMIT_BYTES
+    assert vmem_4096_tile == 8 * 1024 * 1024 and vmem_4096_tile <= VMEM_LIMIT_BYTES
+    assert vmem_overflow_tile == 18 * 1024 * 1024 and vmem_overflow_tile > VMEM_LIMIT_BYTES
 
     return {
         "status": "ok",

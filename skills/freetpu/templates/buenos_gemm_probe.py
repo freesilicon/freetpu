@@ -11,8 +11,6 @@ Exercises FreeTPU's clean-room ISA tools (`tools/emit_custom_gemm.py` and
      (using a locally extracted user DGC0 shell; never bundled in the repo).
 """
 
-from __future__ import annotations
-
 import argparse
 import json
 import os

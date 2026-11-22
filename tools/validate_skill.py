@@ -472,6 +472,9 @@ def validate_skill(
         src = tpl.read_text(encoding="utf-8")
         try:
             ast.parse(src, filename=str(rel))
+            # `colab run` prepends executable statements before script text and compiles as one cell,
+            # which fails with SyntaxError if a template uses `from __future__ import ...`.
+            compile("import sys\n" + src, str(rel), "exec")
         except SyntaxError as exc:
             errors.append(f"Syntax error in template {rel}: {exc}")
             continue
@@ -639,6 +642,25 @@ def run_validator_self_test(*, require_yaml: bool = False) -> None:
         assert "Invalid YAML frontmatter" in str(exc), f"Unexpected plain-scalar error: {exc}"
     else:
         raise AssertionError("stdlib parser failed to reject plain scalar containing ': '")
+
+    # Verify templates using `from __future__ import annotations` are rejected (breaks `colab run` cell prepending).
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        sdir = root / "skills" / "freetpu"
+        (sdir / "templates").mkdir(parents=True)
+        (sdir / "SKILL.md").write_text(
+            "---\nname: freetpu\ndescription: Valid string description that is definitely longer than forty characters.\n---\n",
+            encoding="utf-8",
+        )
+        (sdir / "templates" / "bad_future.py").write_text(
+            "from __future__ import annotations\nx: int = 1\n", encoding="utf-8"
+        )
+        readme = root / "README.md"
+        readme.write_text("# Agent Skill\nInstall `skills/freetpu`.\n", encoding="utf-8")
+        errs = validate_skill(root, sdir, readme, run_self_tests=False, require_yaml=require_yaml)
+        assert any("Syntax error in template" in e for e in errs), (
+            f"Expected SyntaxError rejection for future import template, got: {errs}"
+        )
 
 
 def main() -> int:

@@ -6,8 +6,6 @@ Supports `--self-test` offline on any host with pure NumPy, and full `tpu_custom
 parity + HBM streaming bandwidth measurement (`GB/s`) on Cloud TPU (`v5e-1` / `v6e-1`).
 """
 
-from __future__ import annotations
-
 import argparse
 import dataclasses
 import inspect
