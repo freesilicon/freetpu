@@ -1,0 +1,147 @@
+{
+  "bracket": "bracket1_32b",
+  "model": "Qwen/Qwen3-32B",
+  "warmup_s": 0.4,
+  "warmup_sample": {
+    "ttft_ms": 157.56,
+    "total_s": 0.4023,
+    "gen_s": 0.2447,
+    "prompt_tokens": 17,
+    "completion_tokens": 32,
+    "tok_s": 79.54,
+    "decode_tok_s": 126.66,
+    "saw_done": true,
+    "router_backend_header": "cloud-tpu-v6e-8-spot",
+    "sample_text": "<think>\nOkay, the user wants me to count from 1 to 16. Let me start by making sure I understand the request correctly. They just"
+  },
+  "single_stream": {
+    "median_ttft_ms": 17.99,
+    "median_decode_tok_s": 124.91,
+    "runs": [
+      {
+        "ttft_ms": 61.46,
+        "total_s": 1.0775,
+        "gen_s": 1.0161,
+        "prompt_tokens": 46,
+        "completion_tokens": 128,
+        "tok_s": 118.79,
+        "decode_tok_s": 124.99,
+        "saw_done": true,
+        "router_backend_header": "cloud-tpu-v6e-8-spot",
+        "sample_text": "<think>\nOkay, so I need to explain how systolic arrays, HBM memory bandwidth, and ICI torus interconnects interact during autoregressive LLM decoding. Let me st"
+      },
+      {
+        "ttft_ms": 17.99,
+        "total_s": 1.0347,
+        "gen_s": 1.0167,
+        "prompt_tokens": 46,
+        "completion_tokens": 128,
+        "tok_s": 123.71,
+        "decode_tok_s": 124.91,
+        "saw_done": true,
+        "router_backend_header": "cloud-tpu-v6e-8-spot",
+        "sample_text": "<think>\nOkay, so I need to explain how systolic arrays, HBM memory bandwidth, and ICI torus interconnects interact during autoregressive LLM decoding. Let me st"
+      },
+      {
+        "ttft_ms": 17.78,
+        "total_s": 1.0347,
+        "gen_s": 1.0169,
+        "prompt_tokens": 46,
+        "completion_tokens": 128,
+        "tok_s": 123.71,
+        "decode_tok_s": 124.89,
+        "saw_done": true,
+        "router_backend_header": "cloud-tpu-v6e-8-spot",
+        "sample_text": "<think>\nOkay, so I need to explain how systolic arrays, HBM memory bandwidth, and ICI torus interconnects interact during autoregressive LLM decoding. Let me st"
+      }
+    ]
+  },
+  "batched": [
+    {
+      "concurrency": 8,
+      "ok_count": 8,
+      "error_count": 0,
+      "errors": [],
+      "wall_s": 1.159,
+      "total_completion_tokens": 1024,
+      "aggregate_tok_s": 883.29,
+      "median_ttft_ms": 80.66,
+      "usd_per_1m_out_spot": 2.0378,
+      "usd_per_1m_out_flex": 3.3964
+    },
+    {
+      "concurrency": 16,
+      "ok_count": 16,
+      "error_count": 0,
+      "errors": [],
+      "wall_s": 2.149,
+      "total_completion_tokens": 2048,
+      "aggregate_tok_s": 953.17,
+      "median_ttft_ms": 167.72,
+      "usd_per_1m_out_spot": 1.8884,
+      "usd_per_1m_out_flex": 3.1474
+    }
+  ],
+  "best_usd_per_1m_out_spot": 1.8884,
+  "best_usd_per_1m_out_flex": 3.1474,
+  "tpu_exporter_snapshot": {
+    "hbm_used_gib": 0.0,
+    "hbm_total_gib": 256.0,
+    "avg_duty_cycle_percent": null,
+    "max_duty_cycle_percent": null
+  },
+  "router_health_snapshot": {
+    "status": "ok",
+    "version": "0.1.0",
+    "policy": "lowest_latency",
+    "healthy_backends": 1,
+    "total_backends": 1,
+    "active_inflight": 26,
+    "backends": [
+      {
+        "id": "cloud-tpu-v6e-8-spot",
+        "type": "cloud-tpu-v6e",
+        "local": false,
+        "spot": true,
+        "enabled": true,
+        "base_url": "http://127.0.0.1:8000/v1",
+        "healthy": true,
+        "unhealthy_reason": null,
+        "in_cooldown": false,
+        "inflight": 26,
+        "models": [
+          "Qwen/Qwen3-32B"
+        ],
+        "latency_ms": 5603.892,
+        "last_probe_rtt_ms": 1.351,
+        "cost_per_1m_prompt_usd": 0.0,
+        "cost_per_1m_completion_usd": 0.0,
+        "total_requests": 28,
+        "total_failures": 0,
+        "tpu_telemetry": {
+          "reachable": true,
+          "exporter_up": true,
+          "devices_discovered": 8,
+          "healthy_chips": 8,
+          "total_chips": 8,
+          "max_hbm_utilization_ratio": null,
+          "avg_hbm_utilization_ratio": null,
+          "hbm_used_bytes": null,
+          "hbm_total_bytes": 274877906944,
+          "avg_duty_cycle_percent": null,
+          "max_duty_cycle_percent": null,
+          "active_pids": 8,
+          "generations": [
+            "v6e"
+          ],
+          "scraped_at_unix": 1795327038.5428908,
+          "error": null
+        },
+        "metadata": {
+          "silicon": "Cloud TPU v6e-8 (Trillium)",
+          "hbm_gib": 256
+        }
+      }
+    ]
+  }
+}

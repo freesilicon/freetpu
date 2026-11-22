@@ -1,0 +1,210 @@
+{
+  "op_kind": "swiglu",
+  "dtype": "bf16",
+  "shapes": {
+    "x": [
+      64,
+      512
+    ],
+    "w_gate": [
+      512,
+      512
+    ],
+    "w_up": [
+      512,
+      512
+    ],
+    "w_down": [
+      512,
+      512
+    ]
+  },
+  "reference_target": "cpu_ref",
+  "passed": true,
+  "targets": {
+    "cpu_ref": {
+      "target": "cpu_ref",
+      "op_kind": "swiglu",
+      "dtype": "bf16",
+      "silicon": "host-cpu",
+      "stack": "numpy-2.2.6",
+      "mock": false,
+      "hw_us": null,
+      "min_hw_us": null,
+      "wall_us": 6325.72,
+      "gflops": 15.913,
+      "tflops": 0.01591,
+      "metadata": {}
+    },
+    "cloud_tpu_pallas": {
+      "target": "cloud_tpu_pallas",
+      "op_kind": "swiglu",
+      "dtype": "bf16",
+      "silicon": "TPU v6 lite",
+      "stack": "jax-0.6.2 (pallas/tpu_custom_call=True)",
+      "mock": false,
+      "hw_us": 147.83,
+      "min_hw_us": 143.19,
+      "wall_us": 147.83,
+      "gflops": 680.94,
+      "tflops": 0.68094,
+      "metadata": {
+        "backend": "cloud_tpu_pallas",
+        "op_kind": "swiglu",
+        "dtype": "bf16",
+        "m_orig": 64,
+        "m_pad": 64,
+        "k": 512,
+        "n": 512,
+        "block_m": 64,
+        "block_n": 512,
+        "block_k": 512,
+        "grid": [
+          1,
+          1,
+          1
+        ],
+        "grid_down": [
+          1,
+          1,
+          1
+        ],
+        "rhs_transposed": false,
+        "tpu_custom_call_expected": true,
+        "ast_verified": true,
+        "tpu_custom_call": true
+      }
+    }
+  },
+  "parity": {
+    "cloud_tpu_pallas": {
+      "status": "checked",
+      "ok": true,
+      "max_abs_err": 0.001953125,
+      "mean_abs_err": 0.00016134159841385554,
+      "nmse": 1.5648931199141088e-05
+    }
+  },
+  "ir": {
+    "name": "swiglu_mlp",
+    "op_kind": "swiglu",
+    "dtype": "bf16",
+    "block_spec": {
+      "block_m": 64,
+      "block_n": 512,
+      "block_k": 512
+    },
+    "rhs_transposed": false,
+    "input_names": [
+      "x",
+      "w_gate",
+      "w_up",
+      "w_down"
+    ],
+    "output_name": "out",
+    "has_down_proj": true,
+    "gemm_roles": [],
+    "swiglu_roles": {
+      "x": "x",
+      "w_gate": "w_gate",
+      "w_up": "w_up",
+      "w_down": "w_down"
+    },
+    "ops": [
+      {
+        "op": "load",
+        "inputs": [
+          "x"
+        ],
+        "output": "arg_x",
+        "attrs": {
+          "param": "x"
+        }
+      },
+      {
+        "op": "load",
+        "inputs": [
+          "w_gate"
+        ],
+        "output": "arg_w_gate",
+        "attrs": {
+          "param": "w_gate"
+        }
+      },
+      {
+        "op": "dot",
+        "inputs": [
+          "arg_x",
+          "arg_w_gate"
+        ],
+        "output": "v0",
+        "attrs": {}
+      },
+      {
+        "op": "silu",
+        "inputs": [
+          "v0"
+        ],
+        "output": "v1",
+        "attrs": {}
+      },
+      {
+        "op": "load",
+        "inputs": [
+          "w_up"
+        ],
+        "output": "arg_w_up",
+        "attrs": {
+          "param": "w_up"
+        }
+      },
+      {
+        "op": "dot",
+        "inputs": [
+          "arg_x",
+          "arg_w_up"
+        ],
+        "output": "v2",
+        "attrs": {}
+      },
+      {
+        "op": "mul",
+        "inputs": [
+          "v1",
+          "v2"
+        ],
+        "output": "v3",
+        "attrs": {}
+      },
+      {
+        "op": "load",
+        "inputs": [
+          "w_down"
+        ],
+        "output": "arg_w_down",
+        "attrs": {
+          "param": "w_down"
+        }
+      },
+      {
+        "op": "dot",
+        "inputs": [
+          "v3",
+          "arg_w_down"
+        ],
+        "output": "v4",
+        "attrs": {}
+      },
+      {
+        "op": "store",
+        "inputs": [
+          "v4"
+        ],
+        "output": "out",
+        "attrs": {
+          "param": "out"
+        }
+      }
+    ]
+  }
+}
