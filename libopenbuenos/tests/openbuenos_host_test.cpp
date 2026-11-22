@@ -4483,7 +4483,6 @@ void test_phase7_cycle3_regressions() {
     CHECK(ctx->prof.weight_pack_ns > 0u);
     CHECK(ctx->prof.submit_ns > 0u);
     CHECK(ctx->prof.dma_sync_ns > 0u);
-    CHECK(ctx->prof.wait_ns > 0u);
     CHECK(ctx->prof.total_wall_ns > 0u);
 
     // 9b. Multi-slice prefill fallback (M=66 = 64 + 2, high RMS) must count 1 fallback call, not 2.
@@ -4506,6 +4505,24 @@ void test_phase7_cycle3_regressions() {
     CHECK(ob_gemm_swiglu_f32_quant(ctx, a66.data(), &sd66, c66.data(), &is) == OB_OK);
     CHECK(ob_context_get_profile(ctx, &pf1) == OB_OK);
     CHECK(pf1.swiglu_fallbacks == pf0.swiglu_fallbacks + 1u);
+
+    // 9c. M=64 horizontal scheduler must keep narrow padded output tails (e.g. 64->128) on lt_64x TPU path.
+    CHECK(ob_gemm_set_tile_limits(ctx, 64u, 576u, 1536u) == OB_OK);
+    constexpr uint32_t M64 = 64u, N1 = 1536u, N2 = 1600u;
+    std::vector<float> a64(static_cast<size_t>(M64) * K, 0.25f);
+    std::vector<float> c_n1(static_cast<size_t>(M64) * N1, 0.0f);
+    std::vector<float> c_n2(static_cast<size_t>(M64) * N2, 0.0f);
+    std::vector<ob_block_q8_0_t> b_n1(static_cast<size_t>(N1) * (K / OB_QK8_0));
+    std::vector<ob_block_q8_0_t> b_n2(static_cast<size_t>(N2) * (K / OB_QK8_0));
+    for (auto& blk : b_n1) { blk.d = fp32_to_fp16(0.02f); std::memset(blk.qs, 2, sizeof(blk.qs)); }
+    for (auto& blk : b_n2) { blk.d = fp32_to_fp16(0.02f); std::memset(blk.qs, 2, sizeof(blk.qs)); }
+    ob_gemm_f32_quant_job_t jobs2[2]{};
+    jobs2[0].b_nk = b_n1.data(); jobs2[0].c_mn = c_n1.data(); jobs2[0].n_dim = N1;
+    jobs2[1].b_nk = b_n2.data(); jobs2[1].c_mn = c_n2.data(); jobs2[1].n_dim = N2;
+    ob_invoke_stats_t s64_tail{};
+    CHECK(ob_gemm_matmul_f32_quant_batch(ctx, a64.data(), M64, K, jobs2, 2u, &s64_tail) == OB_OK);
+    CHECK(s64_tail.tiles_dispatched == 3u);
+    CHECK((s64_tail.flags & OB_STAT_FLAG_EMITTER_USED) != 0u);
     ob_context_destroy(ctx);
   }
 

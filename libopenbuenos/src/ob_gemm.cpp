@@ -1284,7 +1284,7 @@ void build_scheduled_groups(uint32_t hw_m,
       }
       for (ScheduledGroup& b : bins) {
         const uint32_t hn = std::max<uint32_t>(128u, align_up_u32(b.tn_total, 32u));
-        if (b.tn_total >= 128u && is_lt_64x_shape(64u, hk, hn)) {
+        if (is_lt_64x_shape(64u, hk, hn)) {
           b.hw_n = hn;
           out->push_back(b);
         } else {
@@ -2556,6 +2556,7 @@ ob_status_t ob_gemm_matmul_int8(ob_context_t* ctx,
             ob_buffer* out_buf = nullptr;
             ob_status_t bst = ob::ensure_pipeline_buf_tiered(
                 ctx, &ctx->gemm_out_bufs_4k[slot], &ctx->gemm_out_bufs[slot], out_alloc, &out_buf);
+            uint64_t in_sync_ns = 0u;
             if (bst == OB_OK) {
               if (active_in_slot == OB_MAX_CREDITS ||
                   !active_in_buf ||
@@ -2570,7 +2571,10 @@ ob_status_t ob_gemm_matmul_int8(ob_context_t* ctx,
                 if (bst == OB_OK) {
                   const uint64_t td0 = prof_on ? ob::monotonic_now_ns() : 0u;
                   bst = ob_buffer_write(in_buf, a_tile.data(), a_tile.size(), 0u);
-                  if (prof_on) ctx->prof.dma_sync_ns += (ob::monotonic_now_ns() - td0);
+                  if (prof_on) {
+                    in_sync_ns = ob::monotonic_now_ns() - td0;
+                    ctx->prof.dma_sync_ns += in_sync_ns;
+                  }
                 }
                 if (bst == OB_OK) {
                   active_in_slot = chosen;
@@ -2588,7 +2592,10 @@ ob_status_t ob_gemm_matmul_int8(ob_context_t* ctx,
                   &exec_h,
                   w_tile ? w_tile->ext2_buf : nullptr);
             }
-            if (prof_on) ctx->prof.submit_ns += (ob::monotonic_now_ns() - ts0);
+            if (prof_on) {
+              const uint64_t submit_total = ob::monotonic_now_ns() - ts0;
+              ctx->prof.submit_ns += (submit_total > in_sync_ns) ? (submit_total - in_sync_ns) : 0u;
+            }
             if (bst != OB_OK) {
               ob::release_tile_entry(ctx, entry);
               pinned_w.reset();
@@ -3305,6 +3312,7 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
           ob_buffer* out_buf = nullptr;
           ob_status_t bst = ob::ensure_pipeline_buf_tiered(
               ctx, &ctx->gemm_out_bufs_4k[slot], &ctx->gemm_out_bufs[slot], out_alloc, &out_buf);
+          uint64_t in_sync_ns = 0u;
           if (bst == OB_OK) {
             // Share ONE synced input DMA-BUF across all sibling tiles sharing (k0, tk, hw_k)!
             if (active_in_slot == OB_MAX_CREDITS ||
@@ -3320,7 +3328,10 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
               if (bst == OB_OK) {
                 const uint64_t td0 = prof_on ? ob::monotonic_now_ns() : 0u;
                 bst = ob_buffer_write(in_buf, a_q_tile.data(), a_q_tile.size(), 0u);
-                if (prof_on) ctx->prof.dma_sync_ns += (ob::monotonic_now_ns() - td0);
+                if (prof_on) {
+                  in_sync_ns = ob::monotonic_now_ns() - td0;
+                  ctx->prof.dma_sync_ns += in_sync_ns;
+                }
               }
               if (bst == OB_OK) {
                 active_in_slot = chosen;
@@ -3338,7 +3349,10 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
                 &exec_h,
                 w_tile ? w_tile->ext2_buf : nullptr);
           }
-          if (prof_on) ctx->prof.submit_ns += (ob::monotonic_now_ns() - ts0);
+          if (prof_on) {
+            const uint64_t submit_total = ob::monotonic_now_ns() - ts0;
+            ctx->prof.submit_ns += (submit_total > in_sync_ns) ? (submit_total - in_sync_ns) : 0u;
+          }
           if (bst != OB_OK) {
             ob::release_tile_entry(ctx, entry);
             pinned_w.reset();

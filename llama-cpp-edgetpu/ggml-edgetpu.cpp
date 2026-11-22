@@ -1197,6 +1197,13 @@ static ggml_status ggml_edgetpu_compute_forward_rope(ggml_backend_edgetpu_contex
 
     GGML_TENSOR_UNARY_OP_LOCALS
 
+    const int64_t n_offs_64 = static_cast<int64_t>(n_offs);
+    const int64_t n_dims_64 = static_cast<int64_t>(n_dims);
+    if (n_dims_64 <= 0 || (n_dims_64 % 2) != 0 || n_offs_64 < 0 || (n_offs_64 % 2) != 0 ||
+        n_offs_64 + n_dims_64 > ne0 || n_offs_64 + n_dims_64 > ne00) {
+        return;
+    }
+
     const float * freq_factors = src2 ? reinterpret_cast<const float *>(src2->data) : nullptr;
     const int32_t * pos        = reinterpret_cast<const int32_t *>(src1->data);
 
@@ -1255,7 +1262,7 @@ static ggml_status ggml_edgetpu_compute_forward_rope(ggml_backend_edgetpu_contex
                     if (n_offs > 0) {
                         std::memcpy(drow, srow, static_cast<size_t>(n_offs) * sizeof(float));
                     }
-                    const int64_t tail_start = n_offs + n_dims;
+                    const int64_t tail_start = n_offs_64 + n_dims_64;
                     if (tail_start < ne0) {
                         std::memcpy(drow + tail_start, srow + tail_start,
                                     static_cast<size_t>(ne0 - tail_start) * sizeof(float));
@@ -2657,13 +2664,14 @@ static bool ggml_backend_edgetpu_device_supports_op(ggml_backend_dev_t dev, cons
             if (op->nb[0] != sizeof(float) || src0->nb[0] != sizeof(float)) {
                 return false;
             }
-            const int n_dims = static_cast<const int32_t *>(op->op_params)[1];
-            const int mode   = static_cast<const int32_t *>(op->op_params)[2];
-            const int n_offs = static_cast<const int32_t *>(op->op_params)[15];
+            const int64_t n_dims = static_cast<int64_t>(static_cast<const int32_t *>(op->op_params)[1]);
+            const int     mode   = static_cast<const int32_t *>(op->op_params)[2];
+            const int64_t n_offs = static_cast<int64_t>(static_cast<const int32_t *>(op->op_params)[15]);
             if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
                 return false;
             }
-            if (n_dims <= 0 || (n_dims % 2) != 0 || n_offs < 0 || (n_offs % 2) != 0 || n_offs + n_dims > op->ne[0]) {
+            if (n_dims <= 0 || (n_dims % 2) != 0 || n_offs < 0 || (n_offs % 2) != 0 ||
+                n_offs + n_dims > op->ne[0] || n_offs + n_dims > src0->ne[0]) {
                 return false;
             }
             if (src2 != nullptr && (src2->type != GGML_TYPE_F32 || src2->ne[0] < n_dims / 2)) {
