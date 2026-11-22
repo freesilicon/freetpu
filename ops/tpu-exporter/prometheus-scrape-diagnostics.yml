@@ -9,10 +9,13 @@
 # manifests (`ops/tpu-cdi/manifests/k8s-tpu-workload-telemetry-sidecar.yaml`
 # and `ops/tpu-cdi/manifests/k8s-tpu-pod-cdi*.yaml`). Adjust `namespaces.names`
 # (or shard one job per approved namespace) to match your cluster layout,
-# enforce Kubernetes Pod Security Admission (`baseline` or `restricted`) on
-# `ml-workloads` so `hostNetwork: true` Pods are rejected at admission, and
-# pair with a cluster NetworkPolicy restricting Prometheus egress to approved
-# TPU workload namespaces and TCP port 9400. Requires Prometheus >= 2.41 for
+# enforce a targeted admission policy (e.g. Kubernetes `ValidatingAdmissionPolicy`
+# or policy engine) forbidding `spec.hostNetwork: true` in `ml-workloads` while
+# still permitting the sample sidecar's read-only `/sys/bus/pci` + `/sys/devices`
+# `hostPath` volumes and the TPU workload's `IPC_LOCK` capability (generic Pod
+# Security Standards `baseline`/`restricted` reject those fields), and pair with
+# a cluster NetworkPolicy restricting Prometheus egress to approved TPU workload
+# namespaces and TCP port 9400. Requires Prometheus >= 2.41 for
 # `action: dropequal` (Prometheus >= 3.0 recommended).
 
 global:

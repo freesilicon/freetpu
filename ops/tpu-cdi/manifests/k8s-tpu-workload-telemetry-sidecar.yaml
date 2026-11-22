@@ -14,8 +14,10 @@
 #   1. Build and push the `tpu-info`-enabled exporter image:
 #        docker build --build-arg INSTALL_TPU_INFO=1 \
 #          -t <registry>/freetpu-tpu-exporter:tpu-info ops/tpu-exporter
-#   2. Patched containerd (`>= 2.1.9`, `>= 2.2.5`, or `>= 2.3.2`, or a distro/GKE
-#      build patched for CVE-2026-53492 / GHSA-33vj-92qq-66hc / GCP-2026-037;
+#   2. Patched containerd (`2.1.x` >= 2.1.9, `2.2.x` >= 2.2.5, `2.3.x` >= 2.3.2,
+#      or >= 2.4.0 — excluding vulnerable `2.0.x`, `2.1.0-2.1.8`, `2.2.0-2.2.4`,
+#      and `2.3.0-2.3.1` — or a distro/GKE build patched for CVE-2026-53492 /
+#      GHSA-33vj-92qq-66hc / GCP-2026-037;
 #      otherwise disable/block untrusted checkpoint restores before publishing
 #      CDI specs so tenants cannot bypass DRA to claim `freetpu.dev/tpu=all`),
 #      Kubernetes >= 1.34 with `resource.k8s.io/v1` DRA, a cluster DRA driver

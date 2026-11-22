@@ -1,7 +1,9 @@
 # Sample Kubernetes DRA workload requesting a FreeTPU CDI device (stable resource.k8s.io/v1).
 # Prerequisites:
-#   1. Patched containerd (`>= 2.1.9`, `>= 2.2.5`, or `>= 2.3.2`, or a distro/GKE
-#      build patched for CVE-2026-53492 / GHSA-33vj-92qq-66hc / GCP-2026-037) —
+#   1. Patched containerd (`2.1.x` >= 2.1.9, `2.2.x` >= 2.2.5, `2.3.x` >= 2.3.2,
+#      or >= 2.4.0 — excluding vulnerable `2.0.x`, `2.1.0-2.1.8`, `2.2.0-2.2.4`,
+#      and `2.3.0-2.3.1` — or a distro/GKE build patched for CVE-2026-53492 /
+#      GHSA-33vj-92qq-66hc / GCP-2026-037) —
 #      or disable/block untrusted container checkpoint restores on TPU nodes
 #      before publishing `/var/run/cdi/freetpu.json` (unpatched containerd 2.x
 #      releases allow Pod checkpoint restores to smuggle CDI annotations and

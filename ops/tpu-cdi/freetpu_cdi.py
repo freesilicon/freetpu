@@ -366,9 +366,9 @@ def _shared_group_selector(pci_bdfs: Sequence[str]) -> str:
 
 
 def _stat_char_devnum(path: Path) -> Optional[str]:
-    """Return '<major>:<minor>' if path is a character device, else None."""
+    """Return '<major>:<minor>' if path itself (not a symlink) is a character device, else None."""
     try:
-        st = path.stat()
+        st = path.lstat()
     except OSError:
         return None
     if stat.S_ISCHR(st.st_mode):
@@ -1202,6 +1202,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Run a single reconciliation pass and exit (0 if valid, 1 if invalidated).",
     )
     sync.add_argument(
+        "--unlink-on-exit",
+        action="store_true",
+        help="Remove the published CDI spec file on graceful shutdown (SIGTERM/SIGINT).",
+    )
+    sync.add_argument(
         "--kind",
         default=CDI_KIND,
         help=f"CDI vendor/class kind (default: {CDI_KIND}).",
@@ -1380,6 +1385,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             deadline = time.monotonic() + interval
             while not stop_requested and time.monotonic() < deadline:
                 time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+        if args.unlink_on_exit:
+            removed, cleanup_err = _invalidate_spec(args.output)
+            if removed:
+                sys.stderr.write(f"freetpu-cdi sync: withdrew CDI spec at {args.output} on exit\n")
+            elif cleanup_err:
+                sys.stderr.write(
+                    f"freetpu-cdi sync: failed to withdraw CDI spec at {args.output} on exit: {cleanup_err}\n"
+                )
         return 0
 
     if args.command == "docker-args":

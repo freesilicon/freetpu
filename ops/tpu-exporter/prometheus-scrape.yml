@@ -23,6 +23,12 @@ scrape_configs:
           cluster: "cloud-tpu-v5e-v6e"
           node: "tpu-vm-0"
           collector_role: "node"
+    metric_relabel_configs:
+      # Drop per-PID series so tenant process churn never drives billing TSDB
+      # cardinality; chargeback queries use aggregated `freetpu_tpu_active_pids`.
+      - source_labels: [__name__]
+        action: drop
+        regex: "freetpu_tpu_process_active"
 
   # Trusted operator-managed DaemonSet discovery (billing inventory, VFIO
   # health, and hostPID reservation metrics).
@@ -59,3 +65,9 @@ scrape_configs:
         target_label: node
       - target_label: collector_role
         replacement: "node"
+    metric_relabel_configs:
+      # Drop per-PID series so tenant process churn never drives billing TSDB
+      # cardinality; chargeback queries use aggregated `freetpu_tpu_active_pids`.
+      - source_labels: [__name__]
+        action: drop
+        regex: "freetpu_tpu_process_active"

@@ -5,8 +5,10 @@
 #   1. Kubernetes API server configured with the beta DRA API group explicitly enabled:
 #        --runtime-config=resource.k8s.io/v1beta1=true
 #      and feature gate `DynamicResourceAllocation=true`.
-#   2. Patched containerd (`>= 2.1.9`, `>= 2.2.5`, or `>= 2.3.2`, or a distro/GKE
-#      build patched for CVE-2026-53492 / GHSA-33vj-92qq-66hc / GCP-2026-037) —
+#   2. Patched containerd (`2.1.x` >= 2.1.9, `2.2.x` >= 2.2.5, `2.3.x` >= 2.3.2,
+#      or >= 2.4.0 — excluding vulnerable `2.0.x`, `2.1.0-2.1.8`, `2.2.0-2.2.4`,
+#      and `2.3.0-2.3.1` — or a distro/GKE build patched for CVE-2026-53492 /
+#      GHSA-33vj-92qq-66hc / GCP-2026-037) —
 #      or disable/block untrusted container checkpoint restores on TPU nodes
 #      before publishing `/var/run/cdi/freetpu.json` (unpatched containerd 2.x
 #      allows checkpoint restores to bypass DRA and grab published CDI devices

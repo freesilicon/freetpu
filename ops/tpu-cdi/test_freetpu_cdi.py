@@ -23,12 +23,12 @@ import freetpu_cdi  # noqa: E402
 
 @contextlib.contextmanager
 def _mock_vfio_char_devices():
-    """Patch Path.stat so synthetic `<dev_root>/vfio/*` files behave as real Linux char devices."""
+    """Patch Path.stat/lstat so synthetic non-symlink `<dev_root>/vfio/*` files behave as Linux char devices."""
     orig_stat = Path.stat
+    orig_lstat = Path.lstat
 
-    def _char_stat(p: Path, *args, **kwargs):
-        st = orig_stat(p, *args, **kwargs)
-        if p.parent.name == "vfio":
+    def _maybe_char(p: Path, st):
+        if p.parent.name == "vfio" and not stat.S_ISLNK(st.st_mode):
             fake = mock.MagicMock()
             fake.st_mode = stat.S_IFCHR | 0o600
             if p.name == "vfio":
@@ -40,7 +40,16 @@ def _mock_vfio_char_devices():
             return fake
         return st
 
-    with mock.patch.object(Path, "stat", autospec=True, side_effect=_char_stat):
+    def _char_stat(p: Path, *args, **kwargs):
+        return _maybe_char(p, orig_stat(p, *args, **kwargs))
+
+    def _char_lstat(p: Path, *args, **kwargs):
+        return _maybe_char(p, orig_lstat(p, *args, **kwargs))
+
+    with (
+        mock.patch.object(Path, "stat", autospec=True, side_effect=_char_stat),
+        mock.patch.object(Path, "lstat", autospec=True, side_effect=_char_lstat),
+    ):
         yield
 
 
@@ -1217,6 +1226,61 @@ class FreeTpuCdiTests(unittest.TestCase):
                 (sysfs_root / "kernel" / "iommu_groups" / "0" / "devices").rmdir()
                 with self.assertRaisesRegex(RuntimeError, "missing or unreadable"):
                     freetpu_cdi.discover_tpu_chips(sysfs_root=sysfs_root, dev_root=dev_root)
+
+    def test_rejects_symlinked_vfio_nodes_and_withdraws_spec_on_graceful_exit(self) -> None:
+        import signal
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sysfs_root, dev_root = _make_mock_pci_vfio(
+                root,
+                devices=[
+                    {
+                        "bdf": "0000:00:06.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                    },
+                ],
+                create_vfio_nodes=["0"],
+            )
+            spec_out = root / "cdi" / "freetpu.json"
+            with _mock_vfio_char_devices():
+                # 1. Symlinked /dev/vfio/0 MUST be rejected (matching CDI v0.8.0 lstat check).
+                target_char = dev_root / "vfio" / "real0"
+                (dev_root / "vfio" / "0").rename(target_char)
+                os.symlink(str(target_char), dev_root / "vfio" / "0")
+                with self.assertRaisesRegex(RuntimeError, "not a character device"):
+                    freetpu_cdi.discover_tpu_chips(sysfs_root=sysfs_root, dev_root=dev_root)
+
+                # Restore real node for sync --unlink-on-exit test.
+                (dev_root / "vfio" / "0").unlink()
+                target_char.rename(dev_root / "vfio" / "0")
+
+                # 2. `sync --unlink-on-exit` publishes spec then removes it on graceful SIGTERM.
+                def _stop_after_first_sleep(_secs: float) -> None:
+                    self.assertTrue(spec_out.exists())
+                    os.kill(os.getpid(), signal.SIGTERM)
+
+                with mock.patch.object(freetpu_cdi.time, "sleep", side_effect=_stop_after_first_sleep):
+                    rc, _, err = _run_cli_inproc(
+                        [
+                            "sync",
+                            "--output",
+                            str(spec_out),
+                            "--interval",
+                            "1",
+                            "--unlink-on-exit",
+                            "--sysfs-root",
+                            str(sysfs_root),
+                            "--dev-root",
+                            str(dev_root),
+                        ]
+                    )
+                self.assertEqual(rc, 0, err)
+                self.assertFalse(spec_out.exists())
+                self.assertIn("withdrew CDI spec", err)
 
 
 if __name__ == "__main__":
