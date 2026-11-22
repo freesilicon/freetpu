@@ -5581,7 +5581,8 @@ Pkt build_op640_silu(uint32_t mask, float s_silu) {
   uint32_t idx = 0u;
   for (int s = 0; s < 8; ++s) {
     for (int k = 0; k < 5; ++k, ++idx) {
-      const float c = kSwigluSiluUnitCoeffs[s][k] / s_silu;
+      const float c = static_cast<float>(
+          static_cast<double>(kSwigluSiluUnitCoeffs[s][k]) / static_cast<double>(s_silu));
       set_bits_le(raw.data(), raw.size(), 76u + 32u * idx, 32u, fp32_bits_f(c));
     }
   }
@@ -5920,10 +5921,8 @@ void synthesize_swiglu_1x_chunks(uint32_t K, uint32_t H, uint32_t N,
   const uint32_t sw_out = sw_h;
   const uint32_t sram_out = sw_out * 128u;
 
-  const float m_gate = (d.s_in * d.s_wg) / d.s_gate;
-  const float m_up = (d.s_in * d.s_wu) / d.s_up;
-  const float m_mul = (d.s_silu * d.s_up) / d.s_prod;
-  const float m_down = (d.s_prod * d.s_wd) / d.s_out;
+  float m_gate = 0.0f, m_up = 0.0f, m_mul = 0.0f, m_down = 0.0f;
+  (void)compute_swiglu_hw_multipliers(d, &m_gate, &m_up, &m_mul, &m_down);
   const bool fast_kh = (k_cores == h_cores);
   const bool fast_hn = (h_cores == n_cores);
   const bool is_big_1536 = (h_iters == 3u);
@@ -6627,10 +6626,8 @@ void synthesize_swiglu_64x_chunks(uint32_t K, uint32_t H, uint32_t N,
   const uint32_t buf_out = buf_in;
   const uint32_t buf_scatter = buf_gate;
 
-  const float m_gate = (d.s_in * d.s_wg) / d.s_gate;
-  const float m_up = (d.s_in * d.s_wu) / d.s_up;
-  const float m_mul = (d.s_silu * d.s_up) / d.s_prod;
-  const float m_down = (d.s_prod * d.s_wd) / d.s_out;
+  float m_gate = 0.0f, m_up = 0.0f, m_mul = 0.0f, m_down = 0.0f;
+  (void)compute_swiglu_hw_multipliers(d, &m_gate, &m_up, &m_mul, &m_down);
 
   (*out_chunks)[0] = build_chunk0();
   (*out_chunks)[1] = build_chunk1_m64(64u, K);
@@ -7193,16 +7190,9 @@ ob_status_t synthesize_swiglu_parts(const ob_swiglu_int8_desc_t& desc,
     if (err) *err = "Unsupported chained SwiGLU shape";
     return OB_ERR_UNSUPPORTED;
   }
-  const float scales[9] = {
-      desc.s_in, desc.s_wg, desc.s_gate,
-      desc.s_wu, desc.s_up, desc.s_silu,
-      desc.s_prod, desc.s_wd, desc.s_out
-  };
-  for (float s : scales) {
-    if (!(std::isfinite(s) && s > 0.0f)) {
-      if (err) *err = "All SwiGLU quantization scales must be finite and strictly positive";
-      return OB_ERR_INVALID_ARG;
-    }
+  if (!compute_swiglu_hw_multipliers(desc, nullptr, nullptr, nullptr, nullptr)) {
+    if (err) *err = "All SwiGLU quantization scales, derived multipliers, and spline coefficients must be finite and strictly positive";
+    return OB_ERR_INVALID_ARG;
   }
 
   const uint32_t M = desc.m_dim;
@@ -7312,20 +7302,63 @@ ob_status_t build_swiglu_dgc0(const ob_swiglu_int8_desc_t& desc,
   return OB_OK;
 }
 
+bool compute_swiglu_hw_multipliers(const ob_swiglu_int8_desc_t& d,
+                                   float* out_m_gate,
+                                   float* out_m_up,
+                                   float* out_m_mul,
+                                   float* out_m_down) {
+  const float scales[9] = {
+      d.s_in, d.s_wg, d.s_gate,
+      d.s_wu, d.s_up, d.s_silu,
+      d.s_prod, d.s_wd, d.s_out
+  };
+  for (float s : scales) {
+    if (!(std::isfinite(s) && s > 0.0f)) return false;
+  }
+  auto ratio_f32 = [](float a, float b, float c) -> float {
+    const double r = (static_cast<double>(a) * static_cast<double>(b)) / static_cast<double>(c);
+    return static_cast<float>(r);
+  };
+  const float mg = ratio_f32(d.s_in, d.s_wg, d.s_gate);
+  const float mu = ratio_f32(d.s_in, d.s_wu, d.s_up);
+  const float mm = ratio_f32(d.s_silu, d.s_up, d.s_prod);
+  const float md = ratio_f32(d.s_prod, d.s_wd, d.s_out);
+  if (!(std::isfinite(mg) && mg > 0.0f &&
+        std::isfinite(mu) && mu > 0.0f &&
+        std::isfinite(mm) && mm > 0.0f &&
+        std::isfinite(md) && md > 0.0f)) {
+    return false;
+  }
+  for (int s = 0; s < 8; ++s) {
+    for (int k = 0; k < 5; ++k) {
+      const float c = static_cast<float>(
+          static_cast<double>(kSwigluSiluUnitCoeffs[s][k]) / static_cast<double>(d.s_silu));
+      if (!std::isfinite(c)) return false;
+    }
+  }
+  if (out_m_gate) *out_m_gate = mg;
+  if (out_m_up) *out_m_up = mu;
+  if (out_m_mul) *out_m_mul = mm;
+  if (out_m_down) *out_m_down = md;
+  return true;
+}
+
 void simulate_swiglu_hw_exact(const int8_t* x_mk,
                               const ob_swiglu_int8_desc_t& d,
                               int8_t* y_mn) {
   const uint32_t M = d.m_dim, K = d.k_dim, H = d.h_dim, N = d.n_dim;
-  const float m_g = (d.s_in * d.s_wg) / d.s_gate;
-  const float m_u = (d.s_in * d.s_wu) / d.s_up;
-  const float m_mul = (d.s_silu * d.s_up) / d.s_prod;
-  const float m_d = (d.s_prod * d.s_wd) / d.s_out;
+  float m_g = 0.0f, m_u = 0.0f, m_mul = 0.0f, m_d = 0.0f;
+  if (!compute_swiglu_hw_multipliers(d, &m_g, &m_u, &m_mul, &m_d)) {
+    std::memset(y_mn, 0, static_cast<size_t>(M) * N);
+    return;
+  }
   constexpr float kInf = __builtin_huge_valf();
 
   float silu_coeffs[8][5]{};
   for (int s = 0; s < 8; ++s) {
     for (int k = 0; k < 5; ++k) {
-      silu_coeffs[s][k] = kSwigluSiluUnitCoeffs[s][k] / d.s_silu;
+      silu_coeffs[s][k] = static_cast<float>(
+          static_cast<double>(kSwigluSiluUnitCoeffs[s][k]) / static_cast<double>(d.s_silu));
     }
   }
 

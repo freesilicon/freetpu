@@ -1201,7 +1201,7 @@ static ggml_status ggml_edgetpu_compute_forward_rope(ggml_backend_edgetpu_contex
     const int64_t n_dims_64 = static_cast<int64_t>(n_dims);
     if (n_dims_64 <= 0 || (n_dims_64 % 2) != 0 || n_offs_64 < 0 || (n_offs_64 % 2) != 0 ||
         n_offs_64 + n_dims_64 > ne0 || n_offs_64 + n_dims_64 > ne00) {
-        return;
+        return GGML_STATUS_FAILED;
     }
 
     const float * freq_factors = src2 ? reinterpret_cast<const float *>(src2->data) : nullptr;

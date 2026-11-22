@@ -513,8 +513,13 @@ CachedWeightTile* weight_cache_find_locked(ob_context* ctx, const WeightTileKey&
   return t;
 }
 
-void weight_cache_insert_locked(ob_context* ctx, CachedWeightTile* tile) {
+bool weight_cache_insert_locked(ob_context* ctx, CachedWeightTile* tile) {
   weight_cache_evict_locked(ctx, tile->ext2_bytes);
+  if (ctx->weight_cache_bytes + tile->ext2_bytes > ctx->weight_cache_max_bytes ||
+      ctx->weight_cache_map.size() >= ctx->weight_cache_max_entries) {
+    tile->in_cache = false;
+    return false;
+  }
   ctx->weight_cache_lru.push_front(tile);
   tile->lru_it = ctx->weight_cache_lru.begin();
   tile->in_cache = true;
@@ -523,6 +528,7 @@ void weight_cache_insert_locked(ob_context* ctx, CachedWeightTile* tile) {
   if (ctx->weight_cache_bytes > ctx->weight_cache_peak_bytes) {
     ctx->weight_cache_peak_bytes = ctx->weight_cache_bytes;
   }
+  return true;
 }
 
 template <typename DrainOneFn>
@@ -3167,7 +3173,9 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
                   sentinel->ext2_buf = nullptr;
                   sentinel->ext2_bytes = 0u;
                   sentinel->rejected_fusion = true;
-                  ob::weight_cache_insert_locked(ctx, sentinel);
+                  if (!ob::weight_cache_insert_locked(ctx, sentinel)) {
+                    delete sentinel;
+                  }
                 }
               }
               if (prof_on) ctx->prof.weight_pack_ns += (ob::monotonic_now_ns() - tp0);
@@ -3613,16 +3621,9 @@ ob_status_t ob_gemm_swiglu_int8(ob_context_t* ctx,
       !desc->wg_hk || !desc->wu_hk || !desc->wd_nh) {
     return OB_ERR_INVALID_ARG;
   }
-  const float scales_check[9] = {
-      desc->s_in, desc->s_wg, desc->s_gate,
-      desc->s_wu, desc->s_up, desc->s_silu,
-      desc->s_prod, desc->s_wd, desc->s_out
-  };
-  for (float sc : scales_check) {
-    if (!(std::isfinite(sc) && sc > 0.0f)) {
-      ob::set_last_error(ctx, "All SwiGLU quantization scales must be finite and strictly positive");
-      return OB_ERR_INVALID_ARG;
-    }
+  if (!ob::compute_swiglu_hw_multipliers(*desc, nullptr, nullptr, nullptr, nullptr)) {
+    ob::set_last_error(ctx, "All SwiGLU quantization scales, derived multipliers, and spline coefficients must be finite and strictly positive");
+    return OB_ERR_INVALID_ARG;
   }
   if (!ob::is_swiglu_shape(desc->m_dim, desc->k_dim, desc->h_dim, desc->n_dim)) {
     ob::set_last_error(ctx, "Unsupported exact INT8 SwiGLU shape");
@@ -4739,7 +4740,9 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
                 sentinel->key = wh;
                 sentinel->ext2_bytes = 0u;
                 sentinel->rejected_swiglu = true;
-                ob::weight_cache_insert_locked(ctx, sentinel);
+                if (!ob::weight_cache_insert_locked(ctx, sentinel)) {
+                  delete sentinel;
+                }
               }
             }
             if (prof_on) ctx->prof.weight_pack_ns += (ob::monotonic_now_ns() - tp0);
@@ -4779,7 +4782,9 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
                 sentinel->key = wh;
                 sentinel->ext2_bytes = 0u;
                 sentinel->rejected_swiglu = true;
-                ob::weight_cache_insert_locked(ctx, sentinel);
+                if (!ob::weight_cache_insert_locked(ctx, sentinel)) {
+                  delete sentinel;
+                }
               }
             }
             if (prof_on) ctx->prof.weight_pack_ns += (ob::monotonic_now_ns() - tp0);
@@ -4818,7 +4823,9 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
                 norms_tile->swiglu_linf_gate_max = linf_g_max;
                 norms_tile->swiglu_l1_up_max = l1_u_max;
                 norms_tile->swiglu_linf_up_max = linf_u_max;
-                ob::weight_cache_insert_locked(ctx, norms_tile);
+                if (!ob::weight_cache_insert_locked(ctx, norms_tile)) {
+                  delete norms_tile;
+                }
               }
             }
             if (prof_on) ctx->prof.weight_pack_ns += (ob::monotonic_now_ns() - tp0);

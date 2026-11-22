@@ -405,6 +405,15 @@ ob_status_t build_swiglu_dgc0(const ob_swiglu_int8_desc_t& desc,
                               SwigluSynthResult* out_parts,
                               std::string* err);
 
+// Validate SwiGLU quantization scales and compute FP32 hardware multipliers using double
+// intermediates to avoid intermediate overflow. Returns false if any scale, multiplier,
+// or scaled SiLU spline coefficient is non-finite or non-positive.
+bool compute_swiglu_hw_multipliers(const ob_swiglu_int8_desc_t& desc,
+                                   float* out_m_gate,
+                                   float* out_m_up,
+                                   float* out_m_mul,
+                                   float* out_m_down);
+
 // Exact FP32-RNE Horner SwiGLU hardware simulator (matches rango silicon max_abs_err=0).
 void simulate_swiglu_hw_exact(const int8_t* x_mk,
                               const ob_swiglu_int8_desc_t& desc,

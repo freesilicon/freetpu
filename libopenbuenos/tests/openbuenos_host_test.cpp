@@ -4523,6 +4523,23 @@ void test_phase7_cycle3_regressions() {
     CHECK(ob_gemm_matmul_f32_quant_batch(ctx, a64.data(), M64, K, jobs2, 2u, &s64_tail) == OB_OK);
     CHECK(s64_tail.tiles_dispatched == 3u);
     CHECK((s64_tail.flags & OB_STAT_FLAG_EMITTER_USED) != 0u);
+
+    // 9d. Exact INT8 SwiGLU scale ratios must not overflow float intermediates (2^64 * 2^64 / 2^64)
+    //     and must reject non-finite derived hardware multipliers.
+    {
+      constexpr float k2p64 = 18446744073709551616.0f;
+      std::vector<int8_t> xz(K, 0), wgz(H * K, 0), wuz(H * K, 0), wdz(N * H, 0), yz(N, 7);
+      ob_swiglu_int8_desc_t big_d{};
+      big_d.m_dim = 1u; big_d.k_dim = K; big_d.h_dim = H; big_d.n_dim = N;
+      big_d.s_in = 1.0f; big_d.s_wg = 1.0f; big_d.s_gate = 1.0f;
+      big_d.s_wu = 1.0f; big_d.s_up = 1.0f; big_d.s_silu = 1.0f;
+      big_d.s_prod = k2p64; big_d.s_wd = k2p64; big_d.s_out = k2p64;
+      big_d.wg_hk = wgz.data(); big_d.wu_hk = wuz.data(); big_d.wd_nh = wdz.data();
+      CHECK(ob_gemm_swiglu_int8(ctx, xz.data(), &big_d, yz.data(), &is) == OB_OK);
+      CHECK(yz[0] == 0);
+      big_d.s_out = 1.0f; // m_down = 2^128 -> non-finite float -> must be rejected!
+      CHECK(ob_gemm_swiglu_int8(ctx, xz.data(), &big_d, yz.data(), &is) == OB_ERR_INVALID_ARG);
+    }
     ob_context_destroy(ctx);
   }
 
