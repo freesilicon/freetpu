@@ -28,6 +28,7 @@ target_include_directories(opentpu
 
 if (UNIX AND NOT APPLE)
   target_link_libraries(opentpu PUBLIC m pthread dl)
+  target_link_options(opentpu PRIVATE -static-libstdc++ -static-libgcc -Wl,--as-needed -Wl,--exclude-libs,ALL)
 else()
   target_link_libraries(opentpu PUBLIC m)
 endif()
@@ -45,8 +46,36 @@ if (OPENTPU_BUILD_TESTS)
   add_test(NAME opentpu_host_test COMMAND opentpu_host_test)
 endif()
 
-if (OPENTPU_BUILD_TOOLS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  add_executable(vfio_m1_probe tools/vfio_m1_probe.cpp)
-  target_compile_features(vfio_m1_probe PRIVATE cxx_std_17)
-  target_compile_options(vfio_m1_probe PRIVATE -Wall -Wextra)
+if (OPENTPU_BUILD_TOOLS)
+  add_executable(opentpu_vfio_smoke tools/opentpu_vfio_smoke.cpp)
+  target_link_libraries(opentpu_vfio_smoke PRIVATE opentpu)
+  target_compile_features(opentpu_vfio_smoke PRIVATE cxx_std_17)
+  target_compile_options(opentpu_vfio_smoke PRIVATE -Wall -Wextra -Werror -fno-exceptions -fno-rtti)
+
+  add_executable(opentpu_matmul_proof tools/opentpu_matmul_proof.cpp)
+  add_dependencies(opentpu_matmul_proof opentpu)
+  target_include_directories(opentpu_matmul_proof PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/openxla
+  )
+  target_compile_features(opentpu_matmul_proof PRIVATE cxx_std_17)
+  target_compile_options(opentpu_matmul_proof PRIVATE -Wall -Wextra -Werror -fno-exceptions -fno-rtti)
+  if (UNIX AND NOT APPLE)
+    target_link_libraries(opentpu_matmul_proof PRIVATE dl m)
+    target_link_options(opentpu_matmul_proof PRIVATE -static-libstdc++ -static-libgcc -Wl,--as-needed)
+  else()
+    target_link_libraries(opentpu_matmul_proof PRIVATE m)
+  endif()
+
+  if (OPENTPU_BUILD_TESTS)
+    add_test(NAME opentpu_vfio_smoke_mock COMMAND opentpu_vfio_smoke --mock)
+    add_test(NAME opentpu_matmul_proof_mock
+             COMMAND opentpu_matmul_proof --mock --lib $<TARGET_FILE:opentpu>)
+  endif()
+
+  if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(vfio_m1_probe tools/vfio_m1_probe.cpp)
+    target_compile_features(vfio_m1_probe PRIVATE cxx_std_17)
+    target_compile_options(vfio_m1_probe PRIVATE -Wall -Wextra)
+  endif()
 endif()

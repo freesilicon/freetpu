@@ -11,12 +11,13 @@ make -C libopentpu verify-header-host host test
 Outputs in `libopentpu/build/host/`:
 - `libopentpu.so` (or `.dylib` on macOS) — shared library exporting `ot_*` C API and `GetPjrtApi()`
 - `libopentpu.a` — static library
-- `opentpu_host_test` — offline unit tests (IOVA allocator, BAR4 protobuf descriptor parser, mock H2D/D2H + `128x128` BF16 matmul, VLIW/tiling emitter, and `GetPjrtApi()` mock execution)
-- `opentpu_vfio_smoke` — standalone VFIO / `MAPS_LIBTPU=0` smoke binary (`--mock` for offline host verification)
+- `opentpu_host_test` — offline unit tests (IOVA allocator, BAR4 protobuf descriptor parser, mock H2D/D2H + `128x128` BF16 matmul, `{1,0:T(2,128)}` tiling/aliasing/chaining parity, IMEM stub structure, and `GetPjrtApi()` mock execution/validation)
+- `opentpu_vfio_smoke` — standalone VFIO / `MAPS_LIBTPU=0` DMA smoke binary (`--mock` for offline host verification)
+- `opentpu_matmul_proof` — standalone `dlopen` live proof binary exercising both C API `ot_matmul_bf16` and `GetPjrtApi()` across consecutive random `128x128` BF16 runs (`--mock` for offline host verification)
 
 ## Milestones (Track 2 / Issue #16)
 
 - **M1 (`/dev/vfio/0` Bare-Metal Access & Protocol Survey)**: Verified on `v5e-1` (`0x1ae0:0x0063`, `BAR0=4 GiB`, `BAR4=16 MiB`, `128` MSI-X vectors, `VFIO_TYPE1v2_IOMMU` + `MAP_DMA`, pre-booted BAR0 CSRs & BAR4 device descriptor proto, `VFIO_DEVICE_RESET` + `BAR0 + 0x10000` 256-slot SQ/CQ controller pointer reset). See [m1_hardware_survey.md](../docs/cloud-tpu-vfio/m1_hardware_survey.md).
 - **M2 (Host <-> HBM DMA Round-Trip over `/dev/vfio/0`)**: Verified byte-exact (`match=1`, `MAPS_LIBTPU=0`, `MAPS_LIBPYTHON=0`) across `4 KiB`, `64 KiB`, and `1 MiB` transfers via `op=0x04` SQ/CQ DMA descriptors in `ot_vfio.cpp` + `ot_device.cpp`.
-- **M3 (Bare-Metal `128x128` BF16 MXU Matmul over `/dev/vfio/0`)**: Cracked the `512 B` HBM launch descriptor (`OtV5eLaunchDesc`), `{1,0:T(2,128)}` BF16 HBM layout (`tile_pack_128x128_bf16` / `tile_unpack_128x128_bf16`), and 58-bundle `512`-bit VLIW MXU kernel (`ot::emit_v5e_matmul_128x128_body()` in `src/ot_vliw.h`). Clean-room emitter verified `0/16384` mismatches (`max_diff=0.000000`, `MAPS_LIBTPU=0`) on live `v5e-1` silicon; `ot_matmul_bf16` returns `OT_ERR_UNSUPPORTED` on live hardware until a standalone clean-room IMEM boot stub replaces resident command-listener init (`s8`) without vendor blobs.
-- **M4 (`GetPjrtApi()` `0.116`)**: Verified via `dlopen("./build/host/libopentpu.so")` -> `GetPjrtApi()` over live `/dev/vfio/0` (`platform=tpu`, `devices=1`, `hbm_limit=16909336064`, `PJRT_Client_BufferFromHostBuffer` -> `PJRT_Buffer_ToHostBuffer` 64 KiB `match=1`, `MAPS_LIBTPU=0`, `MAPS_LIBPYTHON=0`).
+- **M3 (Self-Contained Bare-Metal `128x128` BF16 MXU Matmul over `/dev/vfio/0`)**: Complete clean-room 120-bundle (`7,680 B`) direct-in-IMEM resident boot/poller + 58-bundle `512`-bit VLIW MXU matmul loop (`ot::emit_v5e_resident_matmul_imem()` in `src/ot_vliw.h`), direct Host -> IMEM DMA (`op=0x04`), core start (`op=0x03 d[8]=0x121`), slot-0 `OtV5eLaunchDesc` doorbell (`0x3fff00000`), and transparent `{1,0:T(2,128)}` HBM layout handling in `ot_device.cpp` + `ot_pjrt.cpp`. See [imem_boot_stub_spec.md](../docs/cloud-tpu-vfio/imem_boot_stub_spec.md).
+- **M4 (`GetPjrtApi()` `0.116`)**: Verified via `dlopen("./libopentpu.so")` -> `GetPjrtApi()` over `/dev/vfio/0` (`platform=tpu`, `devices=1`, `PJRT_Client_BufferFromHostBuffer` -> `PJRT_Client_Compile` -> `PJRT_LoadedExecutable_Execute` -> `PJRT_Buffer_ToHostBuffer`, `MAPS_LIBTPU=0`, `MAPS_LIBPYTHON=0`).

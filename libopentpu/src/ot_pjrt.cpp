@@ -3,12 +3,16 @@
 // Zero Google libtpu.so dependencies.
 
 #include "opentpu.h"
+#include "ot_internal.h"
 #include "pjrt_c_api.h"
 
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <new>
 #include <string>
+#include <utility>
 #include <vector>
 
 struct PJRT_Event {
@@ -51,6 +55,7 @@ struct PJRT_Buffer {
   PJRT_Device* device = nullptr;
   ot_buffer_t* ot_buf = nullptr;
   PJRT_Buffer_Type dtype = PJRT_Buffer_Type_INVALID;
+  size_t logical_bytes = 0;
   std::vector<int64_t> dims;
   std::vector<int64_t> minor_to_major;
   bool deleted = false;
@@ -143,6 +148,86 @@ size_t dtype_bytes(PJRT_Buffer_Type t) {
   }
 }
 
+PJRT_Error_Code ot_status_to_pjrt_code(ot_status_t st) {
+  switch (st) {
+    case OT_OK: return PJRT_Error_Code_OK;
+    case OT_ERR_INVALID_ARG: return PJRT_Error_Code_INVALID_ARGUMENT;
+    case OT_ERR_NO_MEMORY: return PJRT_Error_Code_RESOURCE_EXHAUSTED;
+    case OT_ERR_TIMEOUT: return PJRT_Error_Code_DEADLINE_EXCEEDED;
+    case OT_ERR_UNSUPPORTED: return PJRT_Error_Code_UNIMPLEMENTED;
+    case OT_ERR_NOT_FOUND: return PJRT_Error_Code_NOT_FOUND;
+    case OT_ERR_BUSY: return PJRT_Error_Code_UNAVAILABLE;
+    case OT_ERR_DEVICE:
+    case OT_ERR_IOCTL:
+    case OT_ERR_IO:
+    default:
+      return PJRT_Error_Code_INTERNAL;
+  }
+}
+
+PJRT_Error* make_ot_err(ot_context_t* ctx, ot_status_t st) {
+  std::string msg = ot_status_string(st);
+  const char* detail = ctx ? ot_context_last_error(ctx) : "";
+  if (detail && detail[0] != '\0') {
+    msg += ": ";
+    msg += detail;
+  }
+  return make_err(ot_status_to_pjrt_code(st), msg);
+}
+
+bool is_dense_row_major_strides(const int64_t* dims, size_t num_dims, size_t elem_sz,
+                                const int64_t* byte_strides, size_t num_byte_strides) {
+  if (num_byte_strides == 0) return true;
+  if (!byte_strides || num_byte_strides != num_dims) return false;
+  int64_t expected = static_cast<int64_t>(elem_sz);
+  for (size_t i = num_dims; i > 0; --i) {
+    size_t idx = i - 1;
+    if (dims[idx] > 1 && byte_strides[idx] != expected) return false;
+    if (dims[idx] == 0) return true;
+    if (expected > std::numeric_limits<int64_t>::max() / dims[idx]) return false;
+    expected *= dims[idx];
+  }
+  return true;
+}
+
+bool is_dense_row_major_layout(const PJRT_Buffer_MemoryLayout* layout,
+                               const int64_t* dims, size_t num_dims, size_t elem_sz) {
+  if (!layout) return true;
+  if (layout->type == PJRT_Buffer_MemoryLayout_Type_Tiled) {
+    if (layout->tiled.num_tiles != 0) return false;
+    if (layout->tiled.minor_to_major_size != num_dims) return false;
+    if (num_dims > 0 && !layout->tiled.minor_to_major) return false;
+    for (size_t i = 0; i < num_dims; ++i) {
+      if (layout->tiled.minor_to_major[i] != static_cast<int64_t>(num_dims - 1 - i)) {
+        return false;
+      }
+    }
+    return true;
+  }
+  if (layout->type == PJRT_Buffer_MemoryLayout_Type_Strides) {
+    return is_dense_row_major_strides(dims, num_dims, elem_sz,
+                                      layout->strides.byte_strides,
+                                      layout->strides.num_byte_strides);
+  }
+  return false;
+}
+
+bool parse_strict_u32(const std::string& tok, uint32_t* out) {
+  if (tok.empty()) return false;
+  for (char ch : tok) {
+    if (ch < '0' || ch > '9') return false;
+  }
+  char* end = nullptr;
+  errno = 0;
+  unsigned long v = std::strtoul(tok.c_str(), &end, 10);
+  if (errno != 0 || end != tok.c_str() + tok.size() || v == 0 ||
+      v > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+  *out = static_cast<uint32_t>(v);
+  return true;
+}
+
 // Parse simple textual StableHLO dot_general:
 //   %arg0: tensor<MxKxbf16>, %arg1: tensor<KxNxbf16> ... dot_general ...
 bool parse_stablehlo_matmul(const char* code, size_t len, uint32_t* m_out,
@@ -152,28 +237,45 @@ bool parse_stablehlo_matmul(const char* code, size_t len, uint32_t* m_out,
   if (s.find("dot_general") == std::string::npos && s.find("dot") == std::string::npos) {
     return false;
   }
-  // Extract first two tensor<AxBxbf16> shapes
+  // If explicit contracting dimensions are present, require standard matmul [1] x [0].
+  if (s.find("contracting_dims") != std::string::npos &&
+      s.find("[1] x [0]") == std::string::npos) {
+    return false;
+  }
+  if (s.find("lhs_contracting_dimensions") != std::string::npos &&
+      (s.find("lhs_contracting_dimensions = [1]") == std::string::npos ||
+       s.find("rhs_contracting_dimensions = [0]") == std::string::npos)) {
+    return false;
+  }
+
+  // Extract first up to three strict 2D tensor<AxBxbf16> shapes (lhs, rhs, optional out).
   std::vector<std::pair<uint32_t, uint32_t>> shapes;
   size_t pos = 0;
-  while (shapes.size() < 2) {
+  while (shapes.size() < 3) {
     size_t t = s.find("tensor<", pos);
     if (t == std::string::npos) break;
     size_t gt = s.find('>', t + 7);
-    if (gt == std::string::npos) break;
+    if (gt == std::string::npos) return false;
     std::string inner = s.substr(t + 7, gt - (t + 7));
     pos = gt + 1;
-    if (inner.find("bf16") == std::string::npos) continue;
     size_t x1 = inner.find('x');
-    if (x1 == std::string::npos) continue;
+    if (x1 == std::string::npos) return false;
     size_t x2 = inner.find('x', x1 + 1);
-    if (x2 == std::string::npos) continue;
-    uint32_t d0 = static_cast<uint32_t>(std::strtoul(inner.substr(0, x1).c_str(), nullptr, 10));
-    uint32_t d1 = static_cast<uint32_t>(
-        std::strtoul(inner.substr(x1 + 1, x2 - x1 - 1).c_str(), nullptr, 10));
-    if (d0 > 0 && d1 > 0) shapes.push_back({d0, d1});
+    if (x2 == std::string::npos) return false;
+    if (inner.substr(x2 + 1) != "bf16") return false;
+    uint32_t d0 = 0, d1 = 0;
+    if (!parse_strict_u32(inner.substr(0, x1), &d0) ||
+        !parse_strict_u32(inner.substr(x1 + 1, x2 - x1 - 1), &d1)) {
+      return false;
+    }
+    shapes.push_back({d0, d1});
   }
   if (shapes.size() < 2) return false;
   if (shapes[0].second != shapes[1].first) return false;
+  if (shapes.size() >= 3 &&
+      (shapes[2].first != shapes[0].first || shapes[2].second != shapes[1].second)) {
+    return false;
+  }
   *m_out = shapes[0].first;
   *k_out = shapes[0].second;
   *n_out = shapes[1].second;
@@ -341,7 +443,11 @@ PJRT_Error* ot_pjrt_client_compile(PJRT_Client_Compile_Args* args) {
   uint32_t m = 0, k = 0, n = 0;
   if (!parse_stablehlo_matmul(args->program->code, args->program->code_size, &m, &k, &n)) {
     return make_err(PJRT_Error_Code_UNIMPLEMENTED,
-                    "OpenTPU currently lowers textual StableHLO bf16 dot_general");
+                    "OpenTPU currently lowers 2D textual StableHLO bf16 dot_general");
+  }
+  if (!ot_context_is_mock(args->client->ctx) && (m != 128u || k != 128u || n != 128u)) {
+    return make_err(PJRT_Error_Code_UNIMPLEMENTED,
+                    "Live hardware BF16 matmul currently supports 128x128x128 only");
   }
   auto* le = new (std::nothrow) PJRT_LoadedExecutable();
   if (!le) return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, "out of memory");
@@ -356,25 +462,58 @@ PJRT_Error* ot_pjrt_client_compile(PJRT_Client_Compile_Args* args) {
 
 PJRT_Error* ot_pjrt_buffer_from_host_buffer(PJRT_Client_BufferFromHostBuffer_Args* args) {
   if (!args || !args->client) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null args");
+  if (args->num_dims > 0 && !args->dims) {
+    return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null dims with nonzero num_dims");
+  }
+  if (args->device && args->device != &args->client->device) {
+    return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "unknown device");
+  }
+  if (args->memory && args->memory != &args->client->device.mem.base) {
+    return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "unknown memory");
+  }
   size_t elem_sz = dtype_bytes(args->type);
   if (elem_sz == 0) return make_err(PJRT_Error_Code_UNIMPLEMENTED, "unsupported buffer dtype");
   size_t elems = 1;
   for (size_t i = 0; i < args->num_dims; ++i) {
     if (args->dims[i] < 0) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "negative dim");
-    elems *= static_cast<size_t>(args->dims[i]);
+    size_t d = static_cast<size_t>(args->dims[i]);
+    if (d > 0 && elems > std::numeric_limits<size_t>::max() / d) {
+      return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "element count overflow");
+    }
+    elems *= d;
   }
-  size_t nbytes = elems * elem_sz;
-  if (nbytes == 0) nbytes = 1;
+  if (elems > std::numeric_limits<size_t>::max() / elem_sz) {
+    return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "buffer byte size overflow");
+  }
+  if (!is_dense_row_major_strides(args->dims, args->num_dims, elem_sz,
+                                  args->byte_strides, args->num_byte_strides)) {
+    return make_err(PJRT_Error_Code_UNIMPLEMENTED,
+                    "only dense row-major host byte_strides are supported");
+  }
+  if (!is_dense_row_major_layout(args->device_layout, args->dims, args->num_dims, elem_sz)) {
+    return make_err(PJRT_Error_Code_UNIMPLEMENTED,
+                    "only dense row-major device_layout is supported");
+  }
+
+  const size_t logical_bytes = elems * elem_sz;
+  const size_t alloc_bytes = logical_bytes ? logical_bytes : 1u;
 
   ot_buffer_t* ot_buf = nullptr;
-  ot_status_t st = ot_buffer_alloc(args->client->ctx, nbytes, &ot_buf);
-  if (st != OT_OK) return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, ot_status_string(st));
+  ot_status_t st = ot_buffer_alloc(args->client->ctx, alloc_bytes, &ot_buf);
+  if (st != OT_OK) return make_ot_err(args->client->ctx, st);
 
-  if (args->data && elems > 0) {
-    st = ot_buffer_h2d(args->client->ctx, ot_buf, args->data, elems * elem_sz);
+  if (args->data && logical_bytes > 0) {
+    const bool is_128x128_bf16 =
+        (args->type == PJRT_Buffer_Type_BF16 && args->num_dims == 2u &&
+         args->dims[0] == 128 && args->dims[1] == 128);
+    if (is_128x128_bf16) {
+      st = ot::buffer_h2d_tiled_128x128_bf16(args->client->ctx, ot_buf, args->data);
+    } else {
+      st = ot_buffer_h2d(args->client->ctx, ot_buf, args->data, logical_bytes);
+    }
     if (st != OT_OK) {
       ot_buffer_free(ot_buf);
-      return make_err(PJRT_Error_Code_INTERNAL, ot_status_string(st));
+      return make_ot_err(args->client->ctx, st);
     }
   }
 
@@ -383,17 +522,26 @@ PJRT_Error* ot_pjrt_buffer_from_host_buffer(PJRT_Client_BufferFromHostBuffer_Arg
     ot_buffer_free(ot_buf);
     return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, "out of memory");
   }
+  auto* done_ev = new (std::nothrow) PJRT_Event{true};
+  if (!done_ev) {
+    delete buf;
+    ot_buffer_free(ot_buf);
+    return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, "out of memory");
+  }
   buf->ctx = args->client->ctx;
   buf->device = args->device ? args->device : &args->client->device;
   buf->ot_buf = ot_buf;
   buf->dtype = args->type;
-  buf->dims.assign(args->dims, args->dims + args->num_dims);
+  buf->logical_bytes = logical_bytes;
+  if (args->num_dims > 0) {
+    buf->dims.assign(args->dims, args->dims + args->num_dims);
+  }
   for (size_t i = args->num_dims; i > 0; --i) {
     buf->minor_to_major.push_back(static_cast<int64_t>(i - 1));
   }
 
   args->buffer = buf;
-  args->done_with_host_buffer = new (std::nothrow) PJRT_Event{true};
+  args->done_with_host_buffer = done_ev;
   return nullptr;
 }
 
@@ -472,7 +620,7 @@ PJRT_Error* ot_pjrt_device_memory_stats(PJRT_Device_MemoryStats_Args* args) {
   if (!args || !args->device) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null");
   ot_device_info_t info = {};
   ot_device_get_info(args->device->ctx, &info);
-  args->bytes_in_use = 0;
+  args->bytes_in_use = static_cast<int64_t>(ot::context_hbm_used_bytes(args->device->ctx));
   args->bytes_limit = static_cast<int64_t>(info.hbm_bytes_total);
   args->bytes_limit_is_set = true;
   return nullptr;
@@ -619,20 +767,45 @@ PJRT_Error* ot_pjrt_lexec_execute(PJRT_LoadedExecutable_Execute_Args* args) {
     return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "expected 1 device and 2 matmul args");
   }
   PJRT_LoadedExecutable* le = args->executable;
+  if (le->deleted) {
+    return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "executable has been deleted");
+  }
+  if (!args->argument_lists || !args->argument_lists[0] ||
+      !args->output_lists || !args->output_lists[0]) {
+    return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null argument or output list");
+  }
   PJRT_Buffer* lhs = args->argument_lists[0][0];
   PJRT_Buffer* rhs = args->argument_lists[0][1];
   if (!lhs || !rhs) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null input buffer");
+  if (lhs->deleted || rhs->deleted) {
+    return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "input buffer has been deleted");
+  }
+  if (lhs->ctx != le->client->ctx || rhs->ctx != le->client->ctx) {
+    return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "input buffer belongs to a different client");
+  }
+  if (lhs->dtype != PJRT_Buffer_Type_BF16 || rhs->dtype != PJRT_Buffer_Type_BF16) {
+    return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "expected BF16 input buffers");
+  }
+  if (lhs->dims.size() != 2u || rhs->dims.size() != 2u ||
+      lhs->dims[0] != static_cast<int64_t>(le->exec.m_dim) ||
+      lhs->dims[1] != static_cast<int64_t>(le->exec.k_dim) ||
+      rhs->dims[0] != static_cast<int64_t>(le->exec.k_dim) ||
+      rhs->dims[1] != static_cast<int64_t>(le->exec.n_dim)) {
+    return make_err(PJRT_Error_Code_INVALID_ARGUMENT,
+                    "input buffer dimensions do not match compiled matmul shape");
+  }
 
-  size_t out_bytes = static_cast<size_t>(le->exec.m_dim) * le->exec.n_dim * sizeof(uint16_t);
+  const size_t out_bytes =
+      static_cast<size_t>(le->exec.m_dim) * le->exec.n_dim * sizeof(uint16_t);
   ot_buffer_t* ot_out = nullptr;
   ot_status_t st = ot_buffer_alloc(le->client->ctx, out_bytes, &ot_out);
-  if (st != OT_OK) return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, ot_status_string(st));
+  if (st != OT_OK) return make_ot_err(le->client->ctx, st);
 
   st = ot_matmul_bf16(le->client->ctx, lhs->ot_buf, rhs->ot_buf, ot_out,
                       le->exec.m_dim, le->exec.k_dim, le->exec.n_dim);
   if (st != OT_OK) {
     ot_buffer_free(ot_out);
-    return make_err(PJRT_Error_Code_INTERNAL, ot_status_string(st));
+    return make_ot_err(le->client->ctx, st);
   }
 
   auto* out_buf = new (std::nothrow) PJRT_Buffer();
@@ -640,16 +813,26 @@ PJRT_Error* ot_pjrt_lexec_execute(PJRT_LoadedExecutable_Execute_Args* args) {
     ot_buffer_free(ot_out);
     return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, "out of memory");
   }
+  PJRT_Event* done_ev = nullptr;
+  if (args->device_complete_events) {
+    done_ev = new (std::nothrow) PJRT_Event{true};
+    if (!done_ev) {
+      delete out_buf;
+      ot_buffer_free(ot_out);
+      return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, "out of memory");
+    }
+  }
   out_buf->ctx = le->client->ctx;
   out_buf->device = &le->client->device;
   out_buf->ot_buf = ot_out;
   out_buf->dtype = PJRT_Buffer_Type_BF16;
+  out_buf->logical_bytes = out_bytes;
   out_buf->dims = le->exec.out_dims;
   out_buf->minor_to_major = {1, 0};
 
   args->output_lists[0][0] = out_buf;
   if (args->device_complete_events) {
-    args->device_complete_events[0] = new (std::nothrow) PJRT_Event{true};
+    args->device_complete_events[0] = done_ev;
   }
   return nullptr;
 }
@@ -736,7 +919,16 @@ PJRT_Error* ot_pjrt_buf_copy_to_device(PJRT_Buffer_CopyToDevice_Args*) {
 
 PJRT_Error* ot_pjrt_buf_to_host(PJRT_Buffer_ToHostBuffer_Args* args) {
   if (!args || !args->src) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null buffer");
-  size_t need = ot_buffer_size(args->src->ot_buf);
+  if (args->src->deleted) {
+    return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "buffer has been deleted");
+  }
+  const size_t elem_sz = dtype_bytes(args->src->dtype);
+  if (!is_dense_row_major_layout(args->host_layout, args->src->dims.data(),
+                                 args->src->dims.size(), elem_sz)) {
+    return make_err(PJRT_Error_Code_UNIMPLEMENTED,
+                    "only dense row-major host_layout is supported");
+  }
+  const size_t need = args->src->logical_bytes;
   if (!args->dst) {
     args->dst_size = need;
     args->event = nullptr;
@@ -745,9 +937,13 @@ PJRT_Error* ot_pjrt_buf_to_host(PJRT_Buffer_ToHostBuffer_Args* args) {
   if (args->dst_size < need) {
     return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "dst_size smaller than buffer size");
   }
-  ot_status_t st = ot_buffer_d2h(args->src->ctx, args->src->ot_buf, args->dst, need);
-  if (st != OT_OK) return make_err(PJRT_Error_Code_INTERNAL, ot_status_string(st));
-  args->event = new (std::nothrow) PJRT_Event{true};
+  if (need > 0) {
+    ot_status_t st = ot_buffer_d2h(args->src->ctx, args->src->ot_buf, args->dst, need);
+    if (st != OT_OK) return make_ot_err(args->src->ctx, st);
+  }
+  auto* ev = new (std::nothrow) PJRT_Event{true};
+  if (!ev) return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, "out of memory");
+  args->event = ev;
   return nullptr;
 }
 

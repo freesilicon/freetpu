@@ -25,8 +25,25 @@ static constexpr uint32_t kSqOpcodeCoreCtrl = 0x03u;
 static constexpr uint32_t kSqOpcodeDma      = 0x04u;
 static constexpr uint32_t kSqOpcodeExec     = 0x06u;
 
-// Default HBM IMEM/SMEM launch descriptor base (top of 16 GiB TPU aperture).
+// Default HBM launch descriptor slot-0 base (top of 16 GiB TPU aperture).
 static constexpr uint64_t kDefaultLaunchDescHbmAddr = 0x3fff00000ULL;
+
+// Verified v5e direct-in-IMEM resident loop & sync/doorbell constants.
+static constexpr size_t   kImemDmaAlignBytes   = 512u;
+static constexpr size_t   kResidentImemBundles = 120u;
+static constexpr size_t   kResidentImemBytes   = kResidentImemBundles * 64u;  // 7,680 B (15 x 512 B)
+static constexpr uint32_t kCoreCtrlStart       = 0x121u;
+static constexpr uint32_t kExecOpW8            = 0x41u;
+static constexpr uint32_t kExecOpW10           = 0x010101f9u;
+static constexpr uint32_t kSyncFlagLhsDma      = 0x33u;
+static constexpr uint32_t kSyncFlagExecDone    = 0x1f9u;
+static constexpr uint32_t kSyncFlagDoorbell    = 0x1fbu;
+static constexpr uint32_t kSyncFlagLdescDma    = 0x1ffu;
+static constexpr uint32_t kLdescDmaW28Doorbell = 0x0001fb10u;  // flag 0x1fb, +16 units (512 B / 32 B)
+static constexpr uint32_t kLdescDmaW29         = 0x01000000u;
+static constexpr uint32_t kImemDmaDstFlagsHi   = 0x10000000u;
+static constexpr uint32_t kImemDmaW28          = 0x130u;
+static constexpr uint32_t kImemDmaW29          = 0x04000000u;
 
 // TPU v5e 512-bit (64-byte) VLIW instruction bundle (little-endian 16 x uint32_t).
 struct VliwBundle {
@@ -71,6 +88,59 @@ struct VliwBundle {
   void set_mxu_push_act(uint32_t slot, uint32_t vreg_enc) {
     w[0] = 0xaf003c00u;
     w[1] = ((slot & 0xfu) << 24) | 0x0008e008u | ((vreg_enc & 0xfu) << 4);
+  }
+
+  // Sync flag immediate primitives (9-bit flag_id 0..511, units32 = bytes / 32).
+  static VliwBundle make_sync_wait_imm(uint32_t flag_id, uint32_t bytes) {
+    VliwBundle b = nop();
+    const uint32_t units32 = bytes / 32u;
+    b.set_dma_sync(0x3a8ca30fu);
+    b.w[12] = (flag_id & 0x3fu) << 26;
+    b.w[13] = (units32 << 14) | ((flag_id >> 6) & 0x7u);
+    return b;
+  }
+
+  static VliwBundle make_sync_sub_imm(uint32_t flag_id, uint32_t bytes) {
+    VliwBundle b = nop();
+    const uint32_t units32 = bytes / 32u;
+    const uint32_t neg_units = (0u - units32) & 0x3ffffu;
+    b.set_dma_sync(0x3a0ca10fu);
+    b.w[12] = (flag_id & 0x3fu) << 26;
+    b.w[13] = (neg_units << 14) | ((flag_id >> 6) & 0x7u);
+    b.w[14] = 0x0f000003u;
+    return b;
+  }
+
+  static VliwBundle make_sync_clear(uint32_t flag_id) {
+    VliwBundle b = nop();
+    b.set_dma_sync(0x3a0ca70fu);
+    b.w[12] = (flag_id & 0x3fu) << 26;
+    b.w[13] = 0x00004000u | ((flag_id >> 6) & 0x7u);
+    return b;
+  }
+
+  // Load 32-bit word from SMEM launch descriptor (indexed relative to end +0x200).
+  static VliwBundle make_smem_load_ldesc(uint32_t dst_sreg, uint32_t ldesc_byte_off) {
+    VliwBundle b = nop();
+    const int32_t neg_dwords = (static_cast<int32_t>(ldesc_byte_off) - 0x200) / 4;
+    b.w[13] = static_cast<uint32_t>(neg_dwords) << 14;
+    b.w[14] = 0x0e041000u | ((dst_sreg & 0x1fu) << 2);
+    return b;
+  }
+
+  // Scalar memory/DMA fence.
+  static VliwBundle make_fence() {
+    VliwBundle b = nop();
+    b.set_s0(0x0f000000u, 0x55700900u);
+    return b;
+  }
+
+  // Unconditional absolute IMEM branch (caller must follow with 4 delay-slot bundles).
+  static VliwBundle make_br_abs(uint32_t target_pc) {
+    VliwBundle b = nop();
+    b.w[13] = target_pc << 14;
+    b.set_s0(0x0f000000u, 0x55700400u);
+    return b;
   }
 };
 
@@ -201,6 +271,84 @@ inline std::vector<VliwBundle> emit_v5e_matmul_128x128_body() {
   { VliwBundle b = VliwBundle::nop(); b.set_dma_sync(0x3a00250fu); b.w[10]=0x000001e0u; push(b); }
   { VliwBundle b = VliwBundle::nop(); b.set_dma_sync(0x3a00030fu); push(b); }
   { VliwBundle b = VliwBundle::nop(); b.set_s0(0x0f000000u, 0x55700900u); push(b); }
+
+  return p;
+}
+
+// Emit the 120-bundle (7,680 B, 15 x 512 B) clean-room direct-in-IMEM resident loop
+// for Cloud TPU v5e-1. Uploaded once directly from host staging memory to IMEM PC=0
+// (zero prog_hbm bounce/reload) and started with op=0x03 (d[8]=0x121).
+//
+// Stages:
+//   PC   0.. 16: Signal SMEM[+0x1e8] (exec_seq) -> sync[0x1f9] (0 on cold boot).
+//   PC  17.. 20: Wait & consume host doorbell on sync[0x1fb] (>= 16, -= 16).
+//   PC  21.. 27: Fetch 512 B OtV5eLaunchDesc from HBM 0x3fff00000 -> SMEM + sync[0x1ff] + fence.
+//   PC  28.. 50: Load (out, lhs, rhs) >> 9 into (s2, s18, s1), issue unconditional 32 KiB LHS
+//                HBM->VMEM DMA, wait/sub/clear sync[0x33], zero s0.
+//   PC  51..108: Embedded 58-bundle 128x128 BF16 MXU matmul body.
+//   PC 109..119: NOP + absolute branch to PC=0 + 4 delay-slot NOPs + 5 pad NOPs.
+inline std::vector<VliwBundle> emit_v5e_resident_matmul_imem() {
+  std::vector<VliwBundle> p;
+  p.reserve(kResidentImemBundles);
+  auto push = [&](const VliwBundle& b) { p.push_back(b); };
+  auto push_nops = [&](size_t count) {
+    for (size_t i = 0; i < count; ++i) p.push_back(VliwBundle::nop());
+  };
+
+  // Stage 1 (PC 0..16): Read SMEM[+0x1e8] (exec_seq) and write to sync[0x1f9].
+  { VliwBundle b = VliwBundle::nop(); b.set_dma_sync(0x3b00060fu); b.set_s0(0x0f000000u, 0x55700dc4u); push(b); }  // PC 0
+  { VliwBundle b = VliwBundle::nop(); b.set_s0(0x2f000000u, 0x55701100u); push(b); }                              // PC 1
+  push_nops(1);                                                                                                    // PC 2
+  { VliwBundle b = VliwBundle::nop(); b.set_dma_sync(0x3a00000fu); b.set_s1_imm(0xfffe8007u, 0xec000000u); b.set_s0(0x8e04100cu, 0x55714184u); push(b); }  // PC 3
+  push_nops(1);                                                                                                    // PC 4
+  { VliwBundle b = VliwBundle::nop(); b.set_dma_sync(0x3b0e060fu); b.set_s1_imm(0x3fffc1ffu, 0xfc007dc0u); b.set_s0(0xcf000000u, 0x55700db0u); push(b); }  // PC 5
+  push_nops(1);                                                                                                    // PC 6
+  { VliwBundle b = VliwBundle::nop(); b.set_s0(0xef000000u, 0x5571c60cu); push(b); }                              // PC 7
+  push_nops(5);                                                                                                    // PC 8..12
+  { VliwBundle b = VliwBundle::nop(); b.set_s0(0x6f000000u, 0x5571ea1du); push(b); }                              // PC 13
+  { VliwBundle b = VliwBundle::nop(); b.set_dma_sync(0x3a0a200fu); b.w[10] = 0x00000160u; b.set_s1_imm(kSyncFlagExecDone << 14); push(b); }  // PC 14
+  push_nops(2);                                                                                                    // PC 15..16
+
+  // Stage 2 (PC 17..20): Block until host doorbell sync[0x1fb] >= 16, then subtract 16.
+  { VliwBundle b = VliwBundle::nop(); b.set_s0(0x8f000000u, 0x55701101u); push(b); }                              // PC 17
+  { VliwBundle b = VliwBundle::nop(); b.set_dma_sync(0x3a82a30fu); b.w[10] = 0x00000080u; b.set_s1_imm(0x00040000u); push(b); }  // PC 18
+  { VliwBundle b = VliwBundle::nop(); b.set_dma_sync(0x3a02a10fu); b.w[10] = 0x00000080u; b.set_s1_imm(0xfffc0000u); b.set_s0(0x0f000003u, 0x55780000u); push(b); }  // PC 19
+  push_nops(1);                                                                                                    // PC 20
+
+  // Stage 3 (PC 21..27): Fetch 512 B OtV5eLaunchDesc from HBM 0x3fff00000 -> SMEM + wait/sub sync[0x1ff] + fence.
+  { VliwBundle b = VliwBundle::nop(); b.set_s1_imm(0x3e000007u, 0xfcffe000u); b.set_s0(0xae01b13cu, 0x55700db1u); push(b); }  // PC 21
+  { VliwBundle b = VliwBundle::nop(); b.set_s0(0xcf000000u, 0x55714d31u); push(b); }                              // PC 22
+  { VliwBundle b = VliwBundle::nop(); b.set_s0(0x0f000000u, 0x5572eed2u); push(b); }                              // PC 23
+  { VliwBundle b = VliwBundle::nop(); b.set_s1_imm(kSyncFlagLdescDma << 14); b.set_s0(0x0211f000u, 0x5570d0e4u); push(b); }  // PC 24
+  push(VliwBundle::make_sync_wait_imm(kSyncFlagLdescDma, 512u));                                                  // PC 25
+  push(VliwBundle::make_sync_sub_imm(kSyncFlagLdescDma, 512u));                                                   // PC 26
+  push(VliwBundle::make_fence());                                                                                  // PC 27
+
+  // Stage 4 (PC 28..50): Load (out, lhs, rhs) >> 9, unconditional 32 KiB LHS HBM->VMEM DMA, sync[0x33], s0=0.
+  push(VliwBundle::make_smem_load_ldesc(2u,  0x190u));                                                            // PC 28 (s2  = out_hbm >> 9)
+  push(VliwBundle::make_smem_load_ldesc(18u, 0x174u));                                                            // PC 29 (s18 = lhs_hbm >> 9)
+  push(VliwBundle::make_smem_load_ldesc(1u,  0x170u));                                                            // PC 30 (s1  = rhs_hbm >> 9)
+  push_nops(6);                                                                                                    // PC 31..36
+  { VliwBundle b = VliwBundle::nop(); b.set_dma_sync(0x3a0a210fu); b.w[10] = 0x00000320u; b.set_s1_imm(kSyncFlagLhsDma << 14); b.set_s0(0x4e01bee8u, 0x55780000u); push(b); }  // PC 37
+  { VliwBundle b = VliwBundle::nop(); b.set_s0(0x6e01b874u, 0x5572f2d3u); push(b); }                              // PC 38
+  { VliwBundle b = VliwBundle::nop(); b.set_s0(0x8e5fba78u, 0x5572fad3u); push(b); }                              // PC 39
+  push_nops(5);                                                                                                    // PC 40..44
+  { VliwBundle b = VliwBundle::nop(); b.set_s1_imm(kSyncFlagLhsDma << 14); b.set_s0(0x0013d000u, 0x5570db72u); push(b); }  // PC 45
+  push(VliwBundle::make_sync_wait_imm(kSyncFlagLhsDma, 32768u));                                                  // PC 46
+  push(VliwBundle::make_sync_sub_imm(kSyncFlagLhsDma, 32768u));                                                   // PC 47
+  push(VliwBundle::make_sync_clear(kSyncFlagLhsDma));                                                             // PC 48
+  { VliwBundle b = VliwBundle::nop(); b.set_s0(0x0f000000u, 0x55700dc0u); push(b); }                              // PC 49 (s0 = 0)
+  push_nops(1);                                                                                                    // PC 50
+
+  // Stage 5 (PC 51..108): 58-bundle 128x128 BF16 MXU matmul kernel body.
+  const std::vector<VliwBundle> body = emit_v5e_matmul_128x128_body();
+  p.insert(p.end(), body.begin(), body.end());
+
+  // Stage 6 (PC 109..119): Loop back to PC=0 (+ 4 delay-slot NOPs + 5 pad NOPs -> 120 bundles = 7,680 B).
+  push_nops(1);                                                                                                    // PC 109
+  push(VliwBundle::make_br_abs(0u));                                                                              // PC 110
+  push_nops(4);                                                                                                    // PC 111..114 (delay slots)
+  push_nops(5);                                                                                                    // PC 115..119 (512B alignment pad)
 
   return p;
 }

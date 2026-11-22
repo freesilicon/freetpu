@@ -12,6 +12,13 @@
 
 namespace ot {
 
+static constexpr size_t kTile128x128Bf16Bytes = 128u * 128u * sizeof(uint16_t);
+
+enum class BufferLayout : uint8_t {
+  kRaw = 0,
+  kTiled2x128Bf16 = 1,
+};
+
 struct PciDiscoveryEntry {
   std::string bdf;
   uint16_t vendor_id = 0;
@@ -94,6 +101,12 @@ struct VfioTransport {
   uint32_t sq_seq = 0;
   bool ring_ready = false;
 
+  // IMEM boot/poller & kernel runtime state (initialized lazily on first live matmul).
+  bool imem_booted = false;
+  uint64_t scratch_lhs_hbm = 0;
+  uint64_t scratch_rhs_hbm = 0;
+  uint32_t exec_seq = 0;
+
   IovaAllocator iova_alloc;
   IovaAllocator hbm_alloc;
 
@@ -111,6 +124,19 @@ struct VfioTransport {
   bool dma_transfer_sync(uint64_t host_iova, uint64_t dev_addr, size_t len_bytes,
                          bool is_h2d, uint32_t dst_flags_hi, uint32_t w28,
                          uint32_t w29, uint32_t timeout_ms, std::string* err);
+  bool dma_h2d_sync(uint64_t host_iova, uint64_t dst_hbm, size_t len_bytes,
+                    uint32_t w28, uint32_t w29, uint32_t timeout_ms, std::string* err);
+  bool dma_d2h_sync(uint64_t host_iova, uint64_t src_hbm, size_t len_bytes,
+                    uint32_t w28, uint32_t w29, uint32_t timeout_ms, std::string* err);
+  bool dma_host_to_imem(uint64_t host_iova, uint64_t dst_imem, size_t len_bytes,
+                        uint32_t timeout_ms, std::string* err);
+  bool submit_core_ctrl(uint32_t ctrl_word, uint32_t timeout_ms,
+                        uint32_t cq_out[8], std::string* err);
+  bool submit_exec_sync(uint32_t expected_exec_seq, uint32_t timeout_ms,
+                        uint32_t cq_out[8], std::string* err);
+  bool ensure_imem_booted(uint32_t timeout_ms, std::string* err);
+  bool ensure_matmul_scratch(std::string* err);
+  void teardown_imem_state();
 
   bool read_pci_config(uint32_t offset, void* dst, size_t len);
   bool write_pci_config(uint32_t offset, const void* src, size_t len);
@@ -122,12 +148,18 @@ struct VfioTransport {
   void write32_bar0(uint64_t off, uint32_t val);
 };
 
+// Internal C++ helpers shared between ot_device.cpp and ot_pjrt.cpp.
+ot_status_t buffer_h2d_tiled_128x128_bf16(ot_context_t* ctx, ot_buffer_t* dst,
+                                          const void* host_src_row_major);
+uint64_t context_hbm_used_bytes(const ot_context_t* ctx);
+
 }  // namespace ot
 
 struct ot_buffer {
   ot_context_t* ctx = nullptr;
   size_t size_bytes = 0;
   uint64_t hbm_addr = 0;
+  ot::BufferLayout layout = ot::BufferLayout::kRaw;
   // Mock host mirror when running offline
   std::vector<uint8_t> mock_data;
 };
