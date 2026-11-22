@@ -234,48 +234,17 @@ def _stat_non_symlink_char_devnum(path: Path) -> Optional[str]:
 
 
 DEFAULT_PROC_SCAN_TIMEOUT_S = 2.0
+_PROC_SCAN_LOCK = threading.Lock()
+_IN_FLIGHT_PROC_SCANS: set[str] = set()
 
 
-def _scan_proc_vfio_pids(
+def _scan_proc_vfio_pids_sync(
     proc_root: Path,
-    vfio_paths: Sequence[str],
-    expected_devnums: Optional[Dict[str, Optional[str]]] = None,
-    scan_timeout_s: float = DEFAULT_PROC_SCAN_TIMEOUT_S,
-) -> Tuple[Dict[str, List[int]], bool, int, Dict[str, int]]:
-    """Find PIDs holding active non-`O_PATH` char-device FDs matching host `/dev/vfio/<group>` `st_rdev`.
-
-    Streams `/proc` and `/proc/<pid>/fd` with `os.scandir()` (avoiding O(open_fds)
-    `Path` list allocations on hosts with high `RLIMIT_NOFILE`) and enforces a hard
-    `scan_timeout_s` budget. If any `/proc/<pid>/fd` directory is unreadable or the
-    scan exceeds its time budget, marks `pid_telemetry_accessible=False` so PCI
-    inventory is still returned without publishing false zero PID counts.
-    """
-    unique_paths = list(dict.fromkeys(p for p in vfio_paths if p))
-    result: Dict[str, List[int]] = {}
-    verified_rdevs: Dict[str, int] = {}
-    if not unique_paths:
-        return result, True, 0, verified_rdevs
-    if not proc_root.is_dir():
-        return result, False, 1, verified_rdevs
-
-    rdev_to_paths: Dict[int, List[str]] = {}
-    for vp in unique_paths:
-        try:
-            host_st = os.lstat(vp)
-        except OSError:
-            continue
-        if not stat.S_ISCHR(host_st.st_mode):
-            continue
-        if expected_devnums is not None:
-            kernel_dn = expected_devnums.get(vp)
-            actual_dn = f"{os.major(host_st.st_rdev)}:{os.minor(host_st.st_rdev)}"
-            if not kernel_dn or actual_dn != kernel_dn:
-                continue
-        verified_rdevs[vp] = host_st.st_rdev
-        result[vp] = []
-        rdev_to_paths.setdefault(host_st.st_rdev, []).append(vp)
-
-    deadline = time.monotonic() + max(0.0, float(scan_timeout_s))
+    rdev_to_paths: Dict[int, List[str]],
+    result: Dict[str, List[int]],
+    deadline: float,
+) -> Tuple[bool, int]:
+    """Synchronously scan `/proc/<pid>/fd/*` via `os.scandir()` within `deadline`."""
     timed_out = False
     unreadable = 0
     fd_checks = 0
@@ -283,9 +252,9 @@ def _scan_proc_vfio_pids(
     try:
         proc_iter = os.scandir(proc_root)
     except PermissionError:
-        return result, False, 1, verified_rdevs
+        return False, 1
     except OSError:
-        return result, False, 1, verified_rdevs
+        return False, 1
 
     with proc_iter:
         for entry in proc_iter:
@@ -340,7 +309,81 @@ def _scan_proc_vfio_pids(
 
     for pids in result.values():
         pids.sort()
-    return result, (unreadable == 0 and not timed_out), unreadable + (1 if timed_out else 0), verified_rdevs
+    return (unreadable == 0 and not timed_out), unreadable + (1 if timed_out else 0)
+
+
+def _scan_proc_vfio_pids(
+    proc_root: Path,
+    vfio_paths: Sequence[str],
+    expected_devnums: Optional[Dict[str, Optional[str]]] = None,
+    scan_timeout_s: float = DEFAULT_PROC_SCAN_TIMEOUT_S,
+) -> Tuple[Dict[str, List[int]], bool, int, Dict[str, int]]:
+    """Find PIDs holding active non-`O_PATH` char-device FDs matching host `/dev/vfio/<group>` `st_rdev`.
+
+    Streams `/proc` and `/proc/<pid>/fd` with `os.scandir()` inside a single-flight
+    deadline-bounded daemon worker per `proc_root`. If a host process holds an open
+    descriptor on an unresponsive hard-mounted filesystem (e.g. NFS) and `os.stat()`
+    blocks past `scan_timeout_s`, this function returns promptly with
+    `pid_telemetry_accessible=False` without holding the scrape lock or spawning
+    unbounded extra threads, so PCI inventory and health metrics remain available.
+    """
+    unique_paths = list(dict.fromkeys(p for p in vfio_paths if p))
+    result: Dict[str, List[int]] = {}
+    verified_rdevs: Dict[str, int] = {}
+    if not unique_paths:
+        return result, True, 0, verified_rdevs
+    if not proc_root.is_dir():
+        return result, False, 1, verified_rdevs
+
+    rdev_to_paths: Dict[int, List[str]] = {}
+    for vp in unique_paths:
+        try:
+            host_st = os.lstat(vp)
+        except OSError:
+            continue
+        if not stat.S_ISCHR(host_st.st_mode):
+            continue
+        if expected_devnums is not None:
+            kernel_dn = expected_devnums.get(vp)
+            actual_dn = f"{os.major(host_st.st_rdev)}:{os.minor(host_st.st_rdev)}"
+            if not kernel_dn or actual_dn != kernel_dn:
+                continue
+        verified_rdevs[vp] = host_st.st_rdev
+        result[vp] = []
+        rdev_to_paths.setdefault(host_st.st_rdev, []).append(vp)
+
+    budget_s = float(scan_timeout_s)
+    if budget_s <= 0.0:
+        return {vp: [] for vp in verified_rdevs}, False, 1, verified_rdevs
+
+    proc_key = os.fspath(proc_root)
+    with _PROC_SCAN_LOCK:
+        if proc_key in _IN_FLIGHT_PROC_SCANS:
+            return {vp: [] for vp in verified_rdevs}, False, 1, verified_rdevs
+        _IN_FLIGHT_PROC_SCANS.add(proc_key)
+
+    worker_result: Dict[str, List[int]] = {vp: [] for vp in result}
+    outcome: Dict[str, Any] = {"ok": False, "unreadable": 1}
+    done_ev = threading.Event()
+    deadline = time.monotonic() + budget_s
+
+    def _worker() -> None:
+        try:
+            ok, unrd = _scan_proc_vfio_pids_sync(
+                proc_root, rdev_to_paths, worker_result, deadline
+            )
+            outcome["ok"] = ok
+            outcome["unreadable"] = unrd
+        finally:
+            with _PROC_SCAN_LOCK:
+                _IN_FLIGHT_PROC_SCANS.discard(proc_key)
+            done_ev.set()
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    if not done_ev.wait(timeout=budget_s):
+        return {vp: [] for vp in verified_rdevs}, False, 1, verified_rdevs
+    return worker_result, bool(outcome["ok"]), int(outcome["unreadable"]), verified_rdevs
 
 
 @dataclass
@@ -964,39 +1007,6 @@ def validate_chip_id_map(
         seen_runtime_targets[rt_id] = dev.pci_bdf
 
 
-def _pid_holds_vfio_rdev(
-    proc_root: Path,
-    pid: int,
-    target_rdev: int,
-    scan_timeout_s: float = DEFAULT_PROC_SCAN_TIMEOUT_S,
-) -> bool:
-    """Return True iff `/proc/<pid>/fd/*` contains an active non-`O_PATH` char device with `st_rdev == target_rdev`."""
-    pid_dir = proc_root / str(pid)
-    fd_dir = pid_dir / "fd"
-    deadline = time.monotonic() + max(0.0, float(scan_timeout_s))
-    try:
-        fd_iter = os.scandir(fd_dir)
-    except OSError:
-        return False
-    checks = 0
-    with fd_iter:
-        for fd_entry in fd_iter:
-            checks += 1
-            if (checks & 0xFF) == 0 and time.monotonic() > deadline:
-                return False
-            try:
-                fd_st = os.stat(fd_entry.path)
-            except OSError:
-                continue
-            if not (stat.S_ISCHR(fd_st.st_mode) and fd_st.st_rdev == target_rdev):
-                continue
-            flags, perm_denied = _read_fdinfo_flags(pid_dir / "fdinfo" / fd_entry.name)
-            if perm_denied or flags is None or (flags & _LINUX_O_PATH) != 0:
-                continue
-            return True
-    return False
-
-
 def collect_snapshot(
     sysfs_root: Path = Path("/sys"),
     dev_root: Path = Path("/dev"),
@@ -1156,13 +1166,6 @@ def collect_snapshot(
 
         if chips_row is not None and not skip_pid_scan:
             dev.telemetry_source = "tpu-info"
-            # Verify each CLI-reported PID actually holds an active non-O_PATH
-            # character device matching the host VFIO node's `st_rdev` (upstream
-            # `tpu-info` matches pathnames only and can pick up decoy files or O_PATH FDs).
-            if host_rdev is not None:
-                for p in chips_row.pids:
-                    if p not in pids and _pid_holds_vfio_rdev(proc_root, p, host_rdev):
-                        pids.append(p)
 
         rt_id = resolved_rt_ids.get(dev.pci_bdf)
         if rt_id in ambiguous_rt_ids:

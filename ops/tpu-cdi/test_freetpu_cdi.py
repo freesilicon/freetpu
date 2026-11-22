@@ -1083,7 +1083,8 @@ class FreeTpuCdiTests(unittest.TestCase):
                 )
                 base_spec = freetpu_cdi.build_cdi_spec(chips, vfio_container)
 
-                # Invalid CDI kinds rejected by containerd's CDI parser (digit-leading vendor/class, trailing punctuation).
+                # Invalid CDI kinds rejected by containerd's CDI parser (digit-leading vendor/class,
+                # trailing punctuation, and 1-char components that panic CDI v0.8.0 / containerd 2.0.0).
                 invalid_kinds = [
                     "1vendor/tpu",
                     "freetpu.dev/1tpu",
@@ -1092,6 +1093,9 @@ class FreeTpuCdiTests(unittest.TestCase):
                     "freetpu.dev/tpu_",
                     ".freetpu.dev/tpu",
                     "freetpu.dev/.tpu",
+                    "a/b",
+                    "a/tpu",
+                    "freetpu.dev/t",
                 ]
                 for bad_kind in invalid_kinds:
                     with self.assertRaisesRegex(ValueError, "Invalid CDI kind"):
@@ -1125,9 +1129,17 @@ class FreeTpuCdiTests(unittest.TestCase):
                     self.assertFalse(out_path.exists())
 
                 # Valid CDI kinds accepted by containerd's CDI parser.
-                for good_kind in ["freetpu.dev/tpu", "Example_Org.io/TPU-v6e", "a/b", "v1.org/tpu0"]:
+                for good_kind in ["freetpu.dev/tpu", "Example_Org.io/TPU-v6e", "ab/cd", "v1.org/tpu0"]:
                     spec = freetpu_cdi.build_cdi_spec(chips, vfio_container, kind=good_kind)
                     self.assertEqual(freetpu_cdi.validate_cdi_spec(spec), [])
+
+                # Device names ending in punctuation must be rejected per CDI v0.6.0.
+                bad_dev_spec = json.loads(json.dumps(base_spec))
+                bad_dev_spec["devices"][0]["name"] = "all-"
+                bad_dev_errs = freetpu_cdi.validate_cdi_spec(bad_dev_spec)
+                self.assertTrue(
+                    any("invalid CDI device name" in e for e in bad_dev_errs), bad_dev_errs
+                )
 
     def test_rejects_vfio_devnum_mismatch_against_kernel_sysfs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

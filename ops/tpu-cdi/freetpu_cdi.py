@@ -54,11 +54,13 @@ TPU_PCI_DEVICES: Dict[str, Tuple[str, str]] = {
 
 # CNCF CDI v0.6.0 / v0.8.0 parser grammar (ValidateVendorName / ValidateClassName):
 # vendor and class must each start with an ASCII letter, contain only
-# [A-Za-z0-9_.-], and end with an ASCII letter or digit.
+# [A-Za-z0-9_.-], end with an ASCII letter or digit, and have length >= 2
+# (CDI v0.8.0 shipped with containerd 2.0.0 panics on 1-character components).
 _CDI_KIND_RE = re.compile(
-    r"^[A-Za-z](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?/[A-Za-z](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?$"
+    r"^[A-Za-z][A-Za-z0-9_.-]*[A-Za-z0-9]/[A-Za-z][A-Za-z0-9_.-]*[A-Za-z0-9]\Z"
 )
-_CDI_DEVICE_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
+# CNCF CDI v0.6.0 device names must start and end with an ASCII alphanumeric char.
+_CDI_DEVICE_NAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?\Z")
 _ALLOWED_CONTAINER_EDITS_KEYS = frozenset(
     {"env", "deviceNodes", "hooks", "mounts"}
 )

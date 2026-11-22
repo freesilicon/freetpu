@@ -610,16 +610,34 @@ TPU Device Status
             self.assertIn("} 0", prom)
             self.assertNotIn("freetpu_tpu_active_pids{", prom)
 
-            # Bounded FD scan timeout marks PID telemetry unavailable without throwing.
-            with _mock_vfio_char_lstat():
-                _, ok_to, unrd_to, _ = tpu_exporter._scan_proc_vfio_pids(
-                    proc_root,
-                    [str(dev_root / "vfio" / "0")],
-                    expected_devnums={str(dev_root / "vfio" / "0"): "242:0"},
-                    scan_timeout_s=-1.0,
-                )
-            self.assertFalse(ok_to)
-            self.assertGreaterEqual(unrd_to, 1)
+            # Bounded FD scan timeout marks PID telemetry unavailable without throwing,
+            # even when a single `os.stat` blocks on an unresponsive filesystem (e.g. hung NFS).
+            release_blocked = threading.Event()
+            (proc_root / "2345" / "fd").mkdir(parents=True)
+            os.symlink(str(root / "hung-nfs-file"), proc_root / "2345" / "fd" / "3")
+
+            orig_stat_fn = os.stat
+
+            def _hung_nfs_stat(path_arg, *args, **kwargs):
+                if "2345" in os.fspath(path_arg):
+                    release_blocked.wait(timeout=5.0)
+                return orig_stat_fn(path_arg, *args, **kwargs)
+
+            try:
+                with (
+                    _mock_vfio_char_lstat(),
+                    mock.patch("tpu_exporter.os.stat", side_effect=_hung_nfs_stat),
+                ):
+                    _, ok_to, unrd_to, _ = tpu_exporter._scan_proc_vfio_pids(
+                        proc_root,
+                        [str(dev_root / "vfio" / "0")],
+                        expected_devnums={str(dev_root / "vfio" / "0"): "242:0"},
+                        scan_timeout_s=0.1,
+                    )
+                self.assertFalse(ok_to)
+                self.assertGreaterEqual(unrd_to, 1)
+            finally:
+                release_blocked.set()
 
             # Even when tpu-info returns a matching chip row with PID=None, an
             # unreadable /proc scan MUST keep PID telemetry unavailable (no false 0).
