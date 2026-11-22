@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -359,23 +360,229 @@ void test_rms_rope_softmax_swiglu_getrows_fused(cloudtpu::PjrtRuntime& rt) {
     std::printf("  [PASS] RMS_NORM, ROPE (normal+neox), SOFT_MAX, GET_ROWS, Fused Subgraph\n");
 }
 
+void test_silicon_regressions(cloudtpu::PjrtRuntime& rt) {
+    // 1) ROPE with non-multiple-of-8 dim (M=52, B2=2, D=128) -> verifies explicit row-major host_layout on TPU.
+    {
+        const int64_t B2 = 2, M = 52, D = 128;
+        std::vector<float> x(B2 * M * D);
+        for (size_t i = 0; i < x.size(); ++i) {
+            x[i] = std::sin(static_cast<float>(i) * 0.13f);
+        }
+        std::vector<int32_t> pos = {7, 19};
+        cloudtpu::GraphProgramSpec spec;
+        spec.inputs.push_back({1, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, B2, M, D}});
+        spec.inputs.push_back({2, cloudtpu::PjrtDType::S32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, B2}});
+        cloudtpu::OpNodeSpec op;
+        op.kind = cloudtpu::CloudOpKind::ROPE;
+        op.src_ids = {1, 2};
+        op.rope.n_dims = static_cast<int>(D);
+        op.rope.mode = 0;
+        op.rope.freq_base = 10000.0f;
+        op.dst = {3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, B2, M, D}};
+        spec.ops.push_back(op);
+        spec.output_ids = {3};
+        auto got = run_emitted(rt, cloudtpu::emit_stablehlo_program(spec),
+                               {rt.buffer_from_host(0, x.data(), cloudtpu::PjrtDType::F32, {1, B2, M, D}),
+                                rt.buffer_from_host(0, pos.data(), cloudtpu::PjrtDType::S32, {1, 1, 1, B2})});
+        for (int64_t b = 0; b < B2; ++b) {
+            for (int64_t m = 0; m < M; ++m) {
+                for (int64_t i = 0; i < D / 2; ++i) {
+                    const float theta = static_cast<float>(pos[static_cast<size_t>(b)]) *
+                                        std::pow(10000.0f, -2.0f * static_cast<float>(i) / static_cast<float>(D));
+                    const float c = std::cos(theta);
+                    const float s = std::sin(theta);
+                    const size_t base = static_cast<size_t>((b * M + m) * D + 2 * i);
+                    const float r0 = x[base] * c - x[base + 1] * s;
+                    const float r1 = x[base] * s + x[base + 1] * c;
+                    if (std::fabs(got[base] - r0) > 1e-4f || std::fabs(got[base + 1] - r1) > 1e-4f) {
+                        std::fprintf(stderr, "FAIL [ROPE M=52 b=%lld m=%lld i=%lld]: got=(%.5f,%.5f) ref=(%.5f,%.5f)\n",
+                                     (long long) b, (long long) m, (long long) i, got[base], got[base + 1], r0, r1);
+                        ++g_failures;
+                        goto done_rope52;
+                    }
+                }
+            }
+        }
+    done_rope52:;
+    }
+
+    // 2) Q4_0_SPLIT (N=16, NB=8, K=256): dequant-only CPY + MUL_MAT (M=4)
+    {
+        const int64_t N = 16, NB = 8, K = NB * 32, M = 4;
+        std::vector<uint8_t> qs(static_cast<size_t>(N * NB * 16));
+        std::vector<uint16_t> d(static_cast<size_t>(N * NB));
+        std::vector<float> w_ref(static_cast<size_t>(N * K));
+        for (int64_t n = 0; n < N; ++n) {
+            for (int64_t b = 0; b < NB; ++b) {
+                const float sc = 0.05f * static_cast<float>((n + b) % 7 + 1);
+                const uint16_t d16 = cloudtpu::f32_to_f16(sc);
+                d[static_cast<size_t>(n * NB + b)] = d16;
+                const float scale = cloudtpu::f16_to_f32(d16);
+                for (int64_t j = 0; j < 16; ++j) {
+                    const uint8_t lo = static_cast<uint8_t>((n * 3 + b * 5 + j) & 0x0F);
+                    const uint8_t hi = static_cast<uint8_t>((n * 7 + b * 11 + j * 3 + 2) & 0x0F);
+                    qs[static_cast<size_t>((n * NB + b) * 16 + j)] = static_cast<uint8_t>(lo | (hi << 4));
+                    w_ref[static_cast<size_t>(n * K + b * 32 + j)] = static_cast<float>(static_cast<int>(lo) - 8) * scale;
+                    w_ref[static_cast<size_t>(n * K + b * 32 + j + 16)] = static_cast<float>(static_cast<int>(hi) - 8) * scale;
+                }
+            }
+        }
+        auto bqs = rt.buffer_from_host(0, qs.data(), cloudtpu::PjrtDType::U8, {1, 1, N, NB, 16});
+        auto bd = rt.buffer_from_host(0, d.data(), cloudtpu::PjrtDType::F16, {1, 1, N, NB});
+
+        // Dequant-only check
+        {
+            cloudtpu::GraphProgramSpec cspec;
+            cspec.inputs.push_back({1, cloudtpu::PjrtDType::U8, cloudtpu::TensorStorageKind::Q4_0_SPLIT, {1, 1, N, K}});
+            cloudtpu::OpNodeSpec cpy;
+            cpy.kind = cloudtpu::CloudOpKind::CPY;
+            cpy.src_ids = {1};
+            cpy.dst = {2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, N, K}};
+            cspec.ops.push_back(cpy);
+            cspec.output_ids = {2};
+            auto wgot = run_emitted(rt, cloudtpu::emit_stablehlo_program(cspec), {bqs, bd});
+            int bad = 0;
+            for (size_t i = 0; i < w_ref.size(); ++i) {
+                if (std::fabs(wgot[i] - w_ref[i]) > 1e-4f) {
+                    if (bad < 4) {
+                        std::fprintf(stderr, "FAIL [Q4_0 dequant idx=%zu]: got=%.6f ref=%.6f\n", i, wgot[i], w_ref[i]);
+                    }
+                    ++bad;
+                }
+            }
+            if (bad > 0) {
+                std::fprintf(stderr, "FAIL [Q4_0 dequant total_bad=%d/%zu]\n", bad, w_ref.size());
+                ++g_failures;
+            }
+        }
+
+        // MUL_MAT Q4_0 K=256 check
+        std::vector<float> x(static_cast<size_t>(M * K));
+        for (size_t i = 0; i < x.size(); ++i) {
+            x[i] = std::cos(static_cast<float>(i) * 0.17f);
+        }
+        auto bx = rt.buffer_from_host(0, x.data(), cloudtpu::PjrtDType::F32, {1, 1, M, K});
+        {
+            cloudtpu::GraphProgramSpec mspec;
+            mspec.inputs.push_back({1, cloudtpu::PjrtDType::U8, cloudtpu::TensorStorageKind::Q4_0_SPLIT, {1, 1, N, K}});
+            mspec.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, K}});
+            cloudtpu::OpNodeSpec mm;
+            mm.kind = cloudtpu::CloudOpKind::MUL_MAT;
+            mm.src_ids = {1, 2};
+            mm.dst = {3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, N}};
+            mspec.ops.push_back(mm);
+            mspec.output_ids = {3};
+            auto ygot = run_emitted(rt, cloudtpu::emit_stablehlo_program(mspec), {bqs, bd, bx});
+            double se = 0.0, sref = 0.0;
+            for (int64_t m = 0; m < M; ++m) {
+                for (int64_t n = 0; n < N; ++n) {
+                    float ref = 0.0f;
+                    for (int64_t k = 0; k < K; ++k) {
+                        ref += x[static_cast<size_t>(m * K + k)] * w_ref[static_cast<size_t>(n * K + k)];
+                    }
+                    const double diff = static_cast<double>(ygot[static_cast<size_t>(m * N + n)] - ref);
+                    se += diff * diff;
+                    sref += static_cast<double>(ref) * static_cast<double>(ref);
+                }
+            }
+            const double nmse = se / std::max(1e-12, sref);
+            if (nmse > 5e-4) {
+                std::fprintf(stderr, "FAIL [Q4_0 MUL_MAT K=256]: nmse=%.6f got[0]=%.5f\n", nmse, ygot[0]);
+                ++g_failures;
+            }
+        }
+    }
+
+    // 3) Q8_0_SPLIT (N=16, NB=8, K=256, M=4)
+    {
+        const int64_t N = 16, NB = 8, K = NB * 32, M = 4;
+        std::vector<int8_t> qs(static_cast<size_t>(N * NB * 32));
+        std::vector<uint16_t> d(static_cast<size_t>(N * NB));
+        std::vector<float> w_ref(static_cast<size_t>(N * K));
+        for (int64_t n = 0; n < N; ++n) {
+            for (int64_t b = 0; b < NB; ++b) {
+                const uint16_t d16 = cloudtpu::f32_to_f16(0.01f * static_cast<float>((n + b) % 5 + 1));
+                d[static_cast<size_t>(n * NB + b)] = d16;
+                const float scale = cloudtpu::f16_to_f32(d16);
+                for (int64_t j = 0; j < 32; ++j) {
+                    const int8_t q = static_cast<int8_t>(((n * 13 + b * 29 + j * 7) % 251) - 125);
+                    qs[static_cast<size_t>((n * NB + b) * 32 + j)] = q;
+                    w_ref[static_cast<size_t>(n * K + b * 32 + j)] = static_cast<float>(q) * scale;
+                }
+            }
+        }
+        std::vector<float> x(static_cast<size_t>(M * K));
+        for (size_t i = 0; i < x.size(); ++i) x[i] = std::sin(static_cast<float>(i) * 0.23f);
+
+        auto bqs = rt.buffer_from_host(0, qs.data(), cloudtpu::PjrtDType::S8, {1, 1, N, NB, 32});
+        auto bd = rt.buffer_from_host(0, d.data(), cloudtpu::PjrtDType::F16, {1, 1, N, NB});
+        auto bx = rt.buffer_from_host(0, x.data(), cloudtpu::PjrtDType::F32, {1, 1, M, K});
+        cloudtpu::GraphProgramSpec mspec;
+        mspec.inputs.push_back({1, cloudtpu::PjrtDType::S8, cloudtpu::TensorStorageKind::Q8_0_SPLIT, {1, 1, N, K}});
+        mspec.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, K}});
+        cloudtpu::OpNodeSpec mm;
+        mm.kind = cloudtpu::CloudOpKind::MUL_MAT;
+        mm.src_ids = {1, 2};
+        mm.dst = {3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, N}};
+        mspec.ops.push_back(mm);
+        mspec.output_ids = {3};
+        auto ygot = run_emitted(rt, cloudtpu::emit_stablehlo_program(mspec), {bqs, bd, bx});
+        double se = 0.0, sref = 0.0;
+        for (int64_t m = 0; m < M; ++m) {
+            for (int64_t n = 0; n < N; ++n) {
+                float ref = 0.0f;
+                for (int64_t k = 0; k < K; ++k) {
+                    ref += x[static_cast<size_t>(m * K + k)] * w_ref[static_cast<size_t>(n * K + k)];
+                }
+                const double diff = static_cast<double>(ygot[static_cast<size_t>(m * N + n)] - ref);
+                se += diff * diff;
+                sref += static_cast<double>(ref) * static_cast<double>(ref);
+            }
+        }
+        const double nmse = se / std::max(1e-12, sref);
+        if (nmse > 5e-4) {
+            std::fprintf(stderr, "FAIL [Q8_0 MUL_MAT K=256]: nmse=%.6f got[0]=%.5f\n", nmse, ygot[0]);
+            ++g_failures;
+        }
+    }
+
+    std::printf("  [PASS] Silicon regressions (ROPE M=52, Q4_0/Q8_0 K=256)\n");
+}
+
 }  // namespace
 
 int main() {
-    std::printf("Running ggml-cloudtpu standalone host tests (Mock PJRT)...\n");
+    bool mock_mode = true;
+    if (const char* v = std::getenv("CLOUDTPU_MOCK")) {
+        mock_mode = (std::atoi(v) != 0);
+    }
+    std::printf("Running ggml-cloudtpu standalone tests (mock_mode=%d)...\n", mock_mode ? 1 : 0);
 
     test_compile_options_proto();
     test_half_bf16_conversions();
 
     cloudtpu::RuntimeConfig cfg;
-    cfg.mock_mode = true;
+    cfg.mock_mode = mock_mode;
     cfg.exec_cache_cap = 256;
     cloudtpu::PjrtRuntime rt;
     rt.init(cfg);
 
+    std::printf("  Platform: %s (%s), device[0]: %s\n",
+                rt.platform_name().c_str(),
+                rt.platform_version().c_str(),
+                rt.device_info(0).kind.c_str());
+
     test_lru_cache_and_hbm_roundtrip(rt);
     test_mul_mat_dense_and_quant(rt);
     test_rms_rope_softmax_swiglu_getrows_fused(rt);
+    test_silicon_regressions(rt);
+
+    const size_t py_maps = cloudtpu::count_libpython_mappings();
+    std::printf("  MAPS_LIBPYTHON=%zu\n", py_maps);
+    if (py_maps != 0) {
+        std::fprintf(stderr, "FAIL: expected MAPS_LIBPYTHON=0, got %zu\n", py_maps);
+        ++g_failures;
+    }
 
     rt.shutdown();
     std::printf("OVERALL: %s (%d failures)\n", (g_failures == 0) ? "ALL PASSED" : "FAILED", g_failures);

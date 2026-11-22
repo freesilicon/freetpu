@@ -16,6 +16,8 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -599,11 +601,12 @@ struct ggml_backend_cloudtpu_context {
             if (rt.is_initialized()) {
                 const cloudtpu::CacheStats st = rt.cache_stats();
                 GGML_LOG_INFO(
-                    "ggml-cloudtpu: summary device=%d mock=%d evals=%llu subgraphs=%llu ops=%llu "
+                    "ggml-cloudtpu: summary device=%d mock=%d maps_libpython=%zu evals=%llu subgraphs=%llu ops=%llu "
                     "cache_entries=%zu cache_hits=%llu cache_misses=%llu cache_evictions=%llu "
                     "compile_us=%llu execute_us=%llu\n",
                     device_index,
                     rt.is_mock() ? 1 : 0,
+                    cloudtpu::count_libpython_mappings(),
                     static_cast<unsigned long long>(total_graph_evals),
                     static_cast<unsigned long long>(total_subgraphs),
                     static_cast<unsigned long long>(total_ops_executed),

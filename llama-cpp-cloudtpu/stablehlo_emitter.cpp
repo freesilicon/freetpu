@@ -510,9 +510,10 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
 
         switch (op.kind) {
             case CloudOpKind::MUL_MAT: {
-                const PjrtDType deq_dt = op.high_precision ? PjrtDType::F32 : PjrtDType::BF16;
+                SsaValue x = resolve_dense(op.src_ids.at(1), PjrtDType::F32);
+                const PjrtDType deq_dt =
+                    (op.high_precision || x.dtype == PjrtDType::F32) ? PjrtDType::F32 : PjrtDType::BF16;
                 SsaValue w = resolve_dense(op.src_ids.at(0), deq_dt);
-                SsaValue x = resolve_dense(op.src_ids.at(1), deq_dt);
 
                 if (w.dtype != x.dtype) {
                     const PjrtDType common =

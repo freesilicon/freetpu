@@ -35,6 +35,9 @@ float bf16_to_f32(uint16_t b);
 uint16_t f32_to_f16(float f);
 float f16_to_f32(uint16_t h);
 
+// Counts "libpython" mappings in /proc/self/maps (0 on non-Linux or pure C++ processes).
+size_t count_libpython_mappings();
+
 struct PjrtCompileOptions {
     int32_t num_replicas = 1;
     int32_t num_partitions = 1;

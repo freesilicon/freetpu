@@ -112,6 +112,21 @@ float f16_to_f32(uint16_t h) {
     return f;
 }
 
+size_t count_libpython_mappings() {
+    std::ifstream ifs("/proc/self/maps");
+    if (!ifs.is_open()) {
+        return 0;
+    }
+    std::string line;
+    size_t count = 0;
+    while (std::getline(ifs, line)) {
+        if (line.find("libpython") != std::string::npos) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 PJRT_Buffer_Type to_pjrt_buffer_type(PjrtDType dt) {
     switch (dt) {
         case PjrtDType::F32: return PJRT_Buffer_Type_F32;
@@ -1259,6 +1274,12 @@ static PJRT_Error* mock_buffer_destroy(PJRT_Buffer_Destroy_Args* args) {
     delete mb;
     return nullptr;
 }
+static PJRT_Error* mock_buffer_dimensions(PJRT_Buffer_Dimensions_Args* args) {
+    auto* mb = reinterpret_cast<MockBuffer*>(args->buffer);
+    args->dims = mb->tensor.dims.empty() ? nullptr : mb->tensor.dims.data();
+    args->num_dims = mb->tensor.dims.size();
+    return nullptr;
+}
 static PJRT_Error* mock_buffer_to_host(PJRT_Buffer_ToHostBuffer_Args* args) {
     auto* mb = reinterpret_cast<MockBuffer*>(args->src);
     if (!args->dst) {
@@ -1383,6 +1404,7 @@ static const PJRT_Api* get_mock_pjrt_api() {
         a.PJRT_Executable_Destroy = mock_exec_destroy;
         a.PJRT_Executable_NumOutputs = mock_exec_num_outputs;
         a.PJRT_Buffer_Destroy = mock_buffer_destroy;
+        a.PJRT_Buffer_Dimensions = mock_buffer_dimensions;
         a.PJRT_Buffer_ToHostBuffer = mock_buffer_to_host;
         a.PJRT_Buffer_ReadyEvent = mock_buffer_ready_event;
         return a;
@@ -1718,10 +1740,38 @@ void PjrtRuntime::buffer_to_host(PJRT_Buffer* buf, void* dst, size_t dst_size) {
     if (!buf) {
         throw std::runtime_error("buffer_to_host: null PJRT_Buffer");
     }
+    // Always request explicit untiled C-order row-major host layout ({rank-1, ..., 0}).
+    // Leaving host_layout = nullptr causes libtpu.so to copy out in the TPU device buffer's
+    // chosen minor-to-major dimension order (transposed for non-multiple-of-8 or batched shapes).
+    std::vector<int64_t> minor_to_major;
+    PJRT_Buffer_MemoryLayout host_layout = {};
+    bool use_host_layout = false;
+    if (PJRT_API_HAS(api_, PJRT_Buffer_Dimensions)) {
+        PJRT_Buffer_Dimensions_Args dim_args = {};
+        dim_args.struct_size = PJRT_Buffer_Dimensions_Args_STRUCT_SIZE;
+        dim_args.buffer = buf;
+        check_error(api_->PJRT_Buffer_Dimensions(&dim_args), "PJRT_Buffer_Dimensions");
+        if (dim_args.num_dims > 1) {
+            minor_to_major.resize(dim_args.num_dims);
+            for (size_t i = 0; i < dim_args.num_dims; ++i) {
+                minor_to_major[i] = static_cast<int64_t>(dim_args.num_dims - 1 - i);
+            }
+            host_layout.struct_size = PJRT_Buffer_MemoryLayout_STRUCT_SIZE;
+            host_layout.type = PJRT_Buffer_MemoryLayout_Type_Tiled;
+            host_layout.tiled.struct_size = PJRT_Buffer_MemoryLayout_Tiled_STRUCT_SIZE;
+            host_layout.tiled.minor_to_major = minor_to_major.data();
+            host_layout.tiled.minor_to_major_size = minor_to_major.size();
+            host_layout.tiled.tile_dims = nullptr;
+            host_layout.tiled.tile_dim_sizes = nullptr;
+            host_layout.tiled.num_tiles = 0;
+            use_host_layout = true;
+        }
+    }
+
     PJRT_Buffer_ToHostBuffer_Args args = {};
     args.struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE;
     args.src = buf;
-    args.host_layout = nullptr;
+    args.host_layout = use_host_layout ? &host_layout : nullptr;
     args.dst = dst;
     args.dst_size = dst_size;
     check_error(api_->PJRT_Buffer_ToHostBuffer(&args), "PJRT_Buffer_ToHostBuffer");
@@ -1889,7 +1939,9 @@ void PjrtRuntime::execute(const CachedExecutable* exec,
     ex.num_args = num_inputs;
     ex.output_lists = out_lists;
     ex.device_complete_events = use_dev_event ? dev_ev : nullptr;
-    ex.execute_device = devices_[static_cast<size_t>(device_idx)];
+    // PJRT TPU plugins compile single-device executables with compile-time device assignment;
+    // passing nullptr avoids "execute_device not supported" errors on single-chip libtpu.so.
+    ex.execute_device = (devices_.size() > 1) ? devices_[static_cast<size_t>(device_idx)] : nullptr;
 
     check_error(api_->PJRT_LoadedExecutable_Execute(&ex), "PJRT_LoadedExecutable_Execute");
 
