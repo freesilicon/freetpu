@@ -3590,6 +3590,17 @@ ob_status_t ob_gemm_swiglu_int8(ob_context_t* ctx,
       !desc->wg_hk || !desc->wu_hk || !desc->wd_nh) {
     return OB_ERR_INVALID_ARG;
   }
+  const float scales_check[9] = {
+      desc->s_in, desc->s_wg, desc->s_gate,
+      desc->s_wu, desc->s_up, desc->s_silu,
+      desc->s_prod, desc->s_wd, desc->s_out
+  };
+  for (float sc : scales_check) {
+    if (!(std::isfinite(sc) && sc > 0.0f)) {
+      ob::set_last_error(ctx, "All SwiGLU quantization scales must be finite and strictly positive");
+      return OB_ERR_INVALID_ARG;
+    }
+  }
   if (!ob::is_swiglu_shape(desc->m_dim, desc->k_dim, desc->h_dim, desc->n_dim)) {
     ob::set_last_error(ctx, "Unsupported exact INT8 SwiGLU shape");
     return OB_ERR_UNSUPPORTED;
@@ -4456,6 +4467,81 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
         return (wst != OB_OK) ? wst : rst;
       };
 
+      const float slice_rms_aq = static_cast<float>(max_row_rms / static_cast<double>(s_a));
+      const double slice_mean_aq = max_row_abs_mean / static_cast<double>(s_a);
+      const double slice_l2_aq = static_cast<double>(slice_rms_aq) * std::sqrt(static_cast<double>(K));
+      auto eval_swiglu_eligibility = [&](float swg,
+                                         float lg_max, float lg_mean,
+                                         float lu_max, float lu_mean,
+                                         float ld_max,
+                                         float dcg_max, float dcu_max,
+                                         float l1g_max, float linfg_max,
+                                         float l1u_max, float linfu_max,
+                                         uint32_t* out_dg, uint32_t* out_du,
+                                         uint32_t* out_dm, uint32_t* out_dd,
+                                         float* out_sg) -> bool {
+        uint32_t dg = 0u, du = 0u, dm = 0u, dd = 0u;
+        ob::compute_swiglu_stage_dividers(
+            ms.tm, slice_rms_aq, lg_max, lg_mean, lu_max, lu_mean, ld_max,
+            &dg, &du, &dm, &dd);
+        const double dc_g_t = slice_mean_aq * static_cast<double>(dcg_max);
+        const double dc_u_t = slice_mean_aq * static_cast<double>(dcu_max);
+        const float sg_cand = s_a * swg * static_cast<float>(dg);
+        if (slice_rms_aq > 56.0f ||
+            dc_g_t > 64.0 * static_cast<double>(dg) ||
+            dc_u_t > 64.0 * static_cast<double>(du) ||
+            !(sg_cand >= 5.0e-4f)) {
+          return false;
+        }
+        const double ub_g = std::min({
+            slice_l2_aq * static_cast<double>(lg_max),
+            static_cast<double>(max_l1_aq) * static_cast<double>(linfg_max),
+            static_cast<double>(amax_aq) * static_cast<double>(l1g_max),
+        });
+        const double ub_u = std::min({
+            slice_l2_aq * static_cast<double>(lu_max),
+            static_cast<double>(max_l1_aq) * static_cast<double>(linfu_max),
+            static_cast<double>(amax_aq) * static_cast<double>(l1u_max),
+        });
+        bool holder_proven = false;
+        if (ub_g <= 127.0 * static_cast<double>(dg) &&
+            ub_u <= 127.0 * static_cast<double>(du)) {
+          const int64_t mqg = std::min<int64_t>(
+              127LL, static_cast<int64_t>(std::ceil(ub_g / static_cast<double>(dg))));
+          const int64_t mqu = std::min<int64_t>(
+              127LL, static_cast<int64_t>(std::ceil(ub_u / static_cast<double>(du))));
+          int64_t mqsilu = std::abs(ob::eval_swiglu_silu_q(static_cast<int32_t>(mqg), sg_cand));
+          mqsilu = std::max<int64_t>(
+              mqsilu, std::abs(ob::eval_swiglu_silu_q(static_cast<int32_t>(-mqg), sg_cand)));
+          if (sg_cand > 0.0f && mqg > 0LL) {
+            const int64_t qmc = std::max<int64_t>(
+                -mqg, std::min<int64_t>(0LL, -static_cast<int64_t>(
+                                                 std::llround(1.2784645f / sg_cand))));
+            mqsilu = std::max<int64_t>(
+                mqsilu, std::abs(ob::eval_swiglu_silu_q(static_cast<int32_t>(qmc), sg_cand)));
+          }
+          if (mqg > 0LL) {
+            mqsilu = std::min<int64_t>(127LL, std::max<int64_t>(mqsilu, mqg + 1LL));
+          }
+          const int64_t mprod = mqsilu * mqu;
+          uint32_t ndm = dm;
+          while (ndm < 64u && mprod > 127LL * static_cast<int64_t>(ndm)) ndm <<= 1u;
+          if (mprod <= 127LL * static_cast<int64_t>(ndm)) {
+            dm = ndm;
+            holder_proven = true;
+          }
+        }
+        if (!holder_proven && !fast_chain_on) {
+          return false;
+        }
+        *out_dg = dg;
+        *out_du = du;
+        *out_dm = dm;
+        *out_dd = dd;
+        *out_sg = sg_cand;
+        return true;
+      };
+
       for (const HChunk& hc : h_chunks) {
         const uint32_t h0 = hc.h0;
         const uint32_t th = hc.th;
@@ -4493,6 +4579,30 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
           drain_all_cleanup();
           slice_rejected = true;
           break;
+        }
+
+        uint32_t d_gate = 0u, d_up = 0u, d_mul = 0u, d_down = 0u;
+        float s_gate_cand = 0.0f;
+        bool eligibility_checked = false;
+        if (w_tile && w_tile->swiglu_norms_only) {
+          if (!eval_swiglu_eligibility(
+                  w_tile->swiglu_s_wg,
+                  w_tile->swiglu_l2_gate_max, w_tile->swiglu_l2_gate_mean,
+                  w_tile->swiglu_l2_up_max, w_tile->swiglu_l2_up_mean,
+                  w_tile->swiglu_l2_down_max,
+                  w_tile->swiglu_dc_gate_max, w_tile->swiglu_dc_up_max,
+                  w_tile->swiglu_l1_gate_max, w_tile->swiglu_linf_gate_max,
+                  w_tile->swiglu_l1_up_max, w_tile->swiglu_linf_up_max,
+                  &d_gate, &d_up, &d_mul, &d_down, &s_gate_cand)) {
+            drain_all_cleanup();
+            slice_rejected = true;
+            break;
+          }
+          // Activation passed using cached norms; drop the 0-byte norms-only entry and pack ext[2].
+          ctx->weight_cache_map.erase(w_tile->key);
+          ctx->weight_cache_lru.erase(w_tile->lru_it);
+          delete w_tile;
+          w_tile = nullptr;
         }
 
         if (!w_tile) {
@@ -4626,69 +4736,45 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
             break;
           }
 
-          // Check activation + weight-norm eligibility BEFORE packing/allocating the chained DMA-BUF
-          // so rejected cold calls never waste memory or cache an unused copy alongside M7A fallback.
-          {
-            const float pre_rms_aq = static_cast<float>(max_row_rms / static_cast<double>(s_a));
-            uint32_t pdg = 0u, pdu = 0u, pdm = 0u, pdd = 0u;
-            ob::compute_swiglu_stage_dividers(
-                ms.tm, pre_rms_aq,
-                l2_g_max, l2_g_mean, l2_u_max, l2_u_mean, l2_d_max,
-                &pdg, &pdu, &pdm, &pdd);
-            const double mean_aq = max_row_abs_mean / static_cast<double>(s_a);
-            const double dc_g_t = mean_aq * static_cast<double>(dc_g_max);
-            const double dc_u_t = mean_aq * static_cast<double>(dc_u_max);
-            const double l2_aq = static_cast<double>(pre_rms_aq) * std::sqrt(static_cast<double>(K));
-            const double ub_g = std::min({
-                l2_aq * static_cast<double>(l2_g_max),
-                static_cast<double>(max_l1_aq) * static_cast<double>(linf_g_max),
-                static_cast<double>(amax_aq) * static_cast<double>(l1_g_max),
-            });
-            const double ub_u = std::min({
-                l2_aq * static_cast<double>(l2_u_max),
-                static_cast<double>(max_l1_aq) * static_cast<double>(linf_u_max),
-                static_cast<double>(amax_aq) * static_cast<double>(l1_u_max),
-            });
-            bool pre_reject = (pre_rms_aq > 56.0f) ||
-                              (dc_g_t > 64.0 * static_cast<double>(pdg)) ||
-                              (dc_u_t > 64.0 * static_cast<double>(pdu)) ||
-                              !(s_a * s_wg * static_cast<float>(pdg) >= 5.0e-4f);
-            if (!pre_reject && !fast_chain_on) {
-              bool pre_holder = false;
-              if (ub_g <= 127.0 * static_cast<double>(pdg) &&
-                  ub_u <= 127.0 * static_cast<double>(pdu)) {
-                const int64_t mqg = std::min<int64_t>(
-                    127LL, static_cast<int64_t>(std::ceil(ub_g / static_cast<double>(pdg))));
-                const int64_t mqu = std::min<int64_t>(
-                    127LL, static_cast<int64_t>(std::ceil(ub_u / static_cast<double>(pdu))));
-                const float sg_init = s_a * s_wg * static_cast<float>(pdg);
-                int64_t mqsilu = std::abs(ob::eval_swiglu_silu_q(static_cast<int32_t>(mqg), sg_init));
-                mqsilu = std::max<int64_t>(
-                    mqsilu, std::abs(ob::eval_swiglu_silu_q(static_cast<int32_t>(-mqg), sg_init)));
-                if (sg_init > 0.0f && mqg > 0LL) {
-                  const int64_t qmc = std::max<int64_t>(
-                      -mqg, std::min<int64_t>(0LL, -static_cast<int64_t>(
-                                                       std::llround(1.2784645f / sg_init))));
-                  mqsilu = std::max<int64_t>(
-                      mqsilu, std::abs(ob::eval_swiglu_silu_q(static_cast<int32_t>(qmc), sg_init)));
-                }
-                if (mqg > 0LL) {
-                  mqsilu = std::min<int64_t>(127LL, std::max<int64_t>(mqsilu, mqg + 1LL));
-                }
-                const int64_t mprod = mqsilu * mqu;
-                uint32_t ndm = pdm;
-                while (ndm < 64u && mprod > 127LL * static_cast<int64_t>(ndm)) ndm <<= 1u;
-                if (mprod <= 127LL * static_cast<int64_t>(ndm)) pre_holder = true;
+          // Check activation + weight-norm eligibility BEFORE packing/allocating the chained DMA-BUF.
+          // If rejected, cache the 0-byte activation-independent norms so subsequent fallback tokens
+          // skip all weight conversions in O(1) without touching DMA memory.
+          if (!eval_swiglu_eligibility(
+                  s_wg,
+                  l2_g_max, l2_g_mean, l2_u_max, l2_u_mean, l2_d_max,
+                  dc_g_max, dc_u_max, l1_g_max, linf_g_max, l1_u_max, linf_u_max,
+                  &d_gate, &d_up, &d_mul, &d_down, &s_gate_cand)) {
+            bool norms_ok = false;
+            if (ob::weight_cache_prepare_space_locked(ctx, 0u, ring_count, drain_one, &norms_ok) == OB_OK &&
+                norms_ok) {
+              ob::CachedWeightTile* norms_tile = new (std::nothrow) ob::CachedWeightTile();
+              if (norms_tile) {
+                norms_tile->key = wh;
+                norms_tile->hw_k = K;
+                norms_tile->hw_n = N;
+                norms_tile->ext2_bytes = 0u;
+                norms_tile->swiglu_norms_only = true;
+                norms_tile->swiglu_s_wg = s_wg;
+                norms_tile->swiglu_l2_gate_max = l2_g_max;
+                norms_tile->swiglu_l2_gate_mean = l2_g_mean;
+                norms_tile->swiglu_l2_up_max = l2_u_max;
+                norms_tile->swiglu_l2_up_mean = l2_u_mean;
+                norms_tile->swiglu_l2_down_max = l2_d_max;
+                norms_tile->swiglu_dc_gate_max = dc_g_max;
+                norms_tile->swiglu_dc_up_max = dc_u_max;
+                norms_tile->swiglu_l1_gate_max = l1_g_max;
+                norms_tile->swiglu_linf_gate_max = linf_g_max;
+                norms_tile->swiglu_l1_up_max = l1_u_max;
+                norms_tile->swiglu_linf_up_max = linf_u_max;
+                ob::weight_cache_insert_locked(ctx, norms_tile);
               }
-              if (!pre_holder) pre_reject = true;
             }
-            if (pre_reject) {
-              if (prof_on) ctx->prof.weight_pack_ns += (ob::monotonic_now_ns() - tp0);
-              drain_all_cleanup();
-              slice_rejected = true;
-              break;
-            }
+            if (prof_on) ctx->prof.weight_pack_ns += (ob::monotonic_now_ns() - tp0);
+            drain_all_cleanup();
+            slice_rejected = true;
+            break;
           }
+          eligibility_checked = true;
 
           std::vector<uint8_t> ext2 = ob::pack_ext2_for_swiglu(
               ms.hw_m, K, hw_h, N,
@@ -4753,90 +4839,16 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
 
         ob::PinnedWeightTile pinned_w(w_tile);
 
-        const float rms_aq = static_cast<float>(max_row_rms / static_cast<double>(s_a));
-        uint32_t d_gate = 0u, d_up = 0u, d_mul = 0u, d_down = 0u;
-        ob::compute_swiglu_stage_dividers(
-            ms.tm, rms_aq,
-            w_tile->swiglu_l2_gate_max, w_tile->swiglu_l2_gate_mean,
-            w_tile->swiglu_l2_up_max, w_tile->swiglu_l2_up_mean,
-            w_tile->swiglu_l2_down_max,
-            &d_gate, &d_up, &d_mul, &d_down);
-
-        // Guard against silent intermediate INT8 clipping in gate/up/mul stages on correlated
-        // or low-crest dense activations before submitting any VII chunks.
-        {
-          const double mean_aq = max_row_abs_mean / static_cast<double>(s_a);
-          const double dc_gate_term = mean_aq * static_cast<double>(w_tile->swiglu_dc_gate_max);
-          const double dc_up_term = mean_aq * static_cast<double>(w_tile->swiglu_dc_up_max);
-          const double l2_aq = static_cast<double>(rms_aq) * std::sqrt(static_cast<double>(K));
-          const double ub_g = std::min({
-              l2_aq * static_cast<double>(w_tile->swiglu_l2_gate_max),
-              static_cast<double>(max_l1_aq) * static_cast<double>(w_tile->swiglu_linf_gate_max),
-              static_cast<double>(amax_aq) * static_cast<double>(w_tile->swiglu_l1_gate_max),
-          });
-          const double ub_u = std::min({
-              l2_aq * static_cast<double>(w_tile->swiglu_l2_up_max),
-              static_cast<double>(max_l1_aq) * static_cast<double>(w_tile->swiglu_linf_up_max),
-              static_cast<double>(amax_aq) * static_cast<double>(w_tile->swiglu_l1_up_max),
-          });
-          bool reject_clip = (rms_aq > 56.0f) ||
-                             (dc_gate_term > 64.0 * static_cast<double>(d_gate)) ||
-                             (dc_up_term > 64.0 * static_cast<double>(d_up));
-          if (!reject_clip) {
-            bool holder_proven = false;
-            if (ub_g <= 127.0 * static_cast<double>(d_gate) &&
-                ub_u <= 127.0 * static_cast<double>(d_up)) {
-              const int64_t max_qg = std::min<int64_t>(
-                  127LL, static_cast<int64_t>(std::ceil(ub_g / static_cast<double>(d_gate))));
-              const int64_t max_qu = std::min<int64_t>(
-                  127LL, static_cast<int64_t>(std::ceil(ub_u / static_cast<double>(d_up))));
-              const float s_gate_init = s_a * w_tile->swiglu_s_wg * static_cast<float>(d_gate);
-              int64_t max_qsilu = std::abs(
-                  ob::eval_swiglu_silu_q(static_cast<int32_t>(max_qg), s_gate_init));
-              max_qsilu = std::max<int64_t>(
-                  max_qsilu,
-                  std::abs(ob::eval_swiglu_silu_q(static_cast<int32_t>(-max_qg), s_gate_init)));
-              if (s_gate_init > 0.0f && max_qg > 0LL) {
-                const int64_t q_min_cand = std::max<int64_t>(
-                    -max_qg,
-                    std::min<int64_t>(0LL, -static_cast<int64_t>(
-                                               std::llround(1.2784645f / s_gate_init))));
-                max_qsilu = std::max<int64_t>(
-                    max_qsilu,
-                    std::abs(ob::eval_swiglu_silu_q(static_cast<int32_t>(q_min_cand), s_gate_init)));
-              }
-              if (max_qg > 0LL) {
-                max_qsilu = std::min<int64_t>(127LL, std::max<int64_t>(max_qsilu, max_qg + 1LL));
-              }
-              const int64_t max_prod = max_qsilu * max_qu;
-              uint32_t next_dm = d_mul;
-              while (next_dm < 64u && max_prod > 127LL * static_cast<int64_t>(next_dm)) {
-                next_dm <<= 1u;
-              }
-              if (max_prod <= 127LL * static_cast<int64_t>(next_dm)) {
-                d_mul = next_dm;
-                holder_proven = true;
-              }
-            }
-            if (!holder_proven && !fast_chain_on) {
-              // Avoid recomputing gate/up projections on the host CPU: when O(K) norm
-              // bounds cannot prove clip-free intermediates, route directly to the
-              // hardware-checked 2-stage TPU M7A fallback unless statistical fast
-              // chaining (OPENBUENOS_SWIGLU_FAST_CHAIN=1) was explicitly opted in.
-              reject_clip = true;
-            }
-          }
-          if (reject_clip) {
-            pinned_w.reset();
-            drain_all_cleanup();
-            slice_rejected = true;
-            break;
-          }
-        }
-        const float s_gate_cand = s_a * w_tile->swiglu_s_wg * static_cast<float>(d_gate);
-        // The 0x640 SiLU spline segment around 0 has constant term ~5.72e-5 / s_gate;
-        // route tiny/non-finite gate scales through M7A fallback so SiLU(0) stays accurate.
-        if (!(s_gate_cand >= 5.0e-4f)) {
+        if (!eligibility_checked &&
+            !eval_swiglu_eligibility(
+                w_tile->swiglu_s_wg,
+                w_tile->swiglu_l2_gate_max, w_tile->swiglu_l2_gate_mean,
+                w_tile->swiglu_l2_up_max, w_tile->swiglu_l2_up_mean,
+                w_tile->swiglu_l2_down_max,
+                w_tile->swiglu_dc_gate_max, w_tile->swiglu_dc_up_max,
+                w_tile->swiglu_l1_gate_max, w_tile->swiglu_linf_gate_max,
+                w_tile->swiglu_l1_up_max, w_tile->swiglu_linf_up_max,
+                &d_gate, &d_up, &d_mul, &d_down, &s_gate_cand)) {
           pinned_w.reset();
           drain_all_cleanup();
           slice_rejected = true;

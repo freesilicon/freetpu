@@ -269,6 +269,7 @@ struct CachedWeightTile {
   bool in_cache = false;
   bool rejected_fusion = false; // O(1) cached split decision when fused D spread > 1.5x
   bool rejected_swiglu = false; // O(1) cached fallback when W_gate row-scale spread is extreme
+  bool swiglu_norms_only = false; // O(1) cached weight norms (0 B DMA) when activation guard rejects before packing
 };
 
 // Built-in nanosecond stage profiler accumulators (zero clock_gettime when profile_enabled=false).

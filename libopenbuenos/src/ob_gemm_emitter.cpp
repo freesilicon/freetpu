@@ -7193,11 +7193,16 @@ ob_status_t synthesize_swiglu_parts(const ob_swiglu_int8_desc_t& desc,
     if (err) *err = "Unsupported chained SwiGLU shape";
     return OB_ERR_UNSUPPORTED;
   }
-  if (desc.s_in <= 0.0f || desc.s_wg <= 0.0f || desc.s_gate <= 0.0f ||
-      desc.s_wu <= 0.0f || desc.s_up <= 0.0f || desc.s_silu <= 0.0f ||
-      desc.s_prod <= 0.0f || desc.s_wd <= 0.0f || desc.s_out <= 0.0f) {
-    if (err) *err = "All SwiGLU quantization scales must be strictly positive";
-    return OB_ERR_INVALID_ARG;
+  const float scales[9] = {
+      desc.s_in, desc.s_wg, desc.s_gate,
+      desc.s_wu, desc.s_up, desc.s_silu,
+      desc.s_prod, desc.s_wd, desc.s_out
+  };
+  for (float s : scales) {
+    if (!(std::isfinite(s) && s > 0.0f)) {
+      if (err) *err = "All SwiGLU quantization scales must be finite and strictly positive";
+      return OB_ERR_INVALID_ARG;
+    }
   }
 
   const uint32_t M = desc.m_dim;

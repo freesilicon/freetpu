@@ -1949,21 +1949,51 @@ static int try_compute_fused_swiglu(ggml_backend_edgetpu_context * ctx,
             return 0;
         }
     }
-    for (int k = end_idx + 1; k < cgraph->n_nodes; ++k) {
-        const struct ggml_tensor * later = cgraph->nodes[k];
-        if (!later) {
+    auto tensor_aliases_inter = [&](const struct ggml_tensor * t) -> bool {
+        if (!t) {
+            return false;
+        }
+        const struct ggml_tensor * tv = t->view_src ? unwrap_view_src(t->view_src) : nullptr;
+        for (int p = 0; p < n_inter; ++p) {
+            if (tv == inter[p]) {
+                return true;
+            }
+        }
+        return false;
+    };
+    for (int k = 0; k < cgraph->n_nodes; ++k) {
+        if (k >= start_idx && k <= end_idx) {
             continue;
         }
-        const struct ggml_tensor * lv = later->view_src ? unwrap_view_src(later->view_src) : nullptr;
+        const struct ggml_tensor * other = cgraph->nodes[k];
+        if (!other) {
+            continue;
+        }
+        if (tensor_aliases_inter(other)) {
+            return 0;
+        }
         for (int p = 0; p < n_inter; ++p) {
-            if (lv == inter[p]) {
-                return 0;
-            }
             for (int s = 0; s < GGML_MAX_SRC; ++s) {
-                if (later->src[s] && unwrap_view_src(later->src[s]) == inter[p]) {
+                if (other->src[s] && unwrap_view_src(other->src[s]) == inter[p]) {
                     return 0;
                 }
             }
+        }
+    }
+    if (cgraph->leafs) {
+        for (int k = 0; k < cgraph->n_leafs; ++k) {
+            if (tensor_aliases_inter(cgraph->leafs[k])) {
+                return 0;
+            }
+        }
+    }
+    for (size_t h = 0; h < cgraph->visited_hash_set.size; ++h) {
+        if (!ggml_bitset_get(cgraph->visited_hash_set.used, h)) {
+            continue;
+        }
+        const struct ggml_tensor * ht = cgraph->visited_hash_set.keys[h];
+        if (tensor_aliases_inter(ht)) {
+            return 0;
         }
     }
 

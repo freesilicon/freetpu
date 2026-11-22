@@ -4328,17 +4328,32 @@ void test_phase7_cycle3_regressions() {
       CHECK(ob_gemm_swiglu_int8(ctx, ix.data(), &id, iy.data(), nullptr) == OB_ERR_INVALID_ARG);
       id.wg_hk = iw.data(); id.wu_hk = iw.data(); id.wd_nh = nullptr;
       CHECK(ob_gemm_swiglu_int8(ctx, ix.data(), &id, iy.data(), nullptr) == OB_ERR_INVALID_ARG);
+      // Non-finite scales (NaN / +Inf) must be rejected before synthesis.
+      id.wd_nh = iw.data();
+      id.s_gate = std::numeric_limits<float>::quiet_NaN();
+      CHECK(ob_gemm_swiglu_int8(ctx, ix.data(), &id, iy.data(), nullptr) == OB_ERR_INVALID_ARG);
+      id.s_gate = std::numeric_limits<float>::infinity();
+      CHECK(ob_gemm_swiglu_int8(ctx, ix.data(), &id, iy.data(), nullptr) == OB_ERR_INVALID_ARG);
     }
 
-    ob_invoke_stats_t s1{}, s2{};
+    // Cold rejected activation caches 0-byte weight norms so a repeat fallback skips weight conversion,
+    // and a later Holder-proven activation cleanly upgrades the entry to a packed chained tile.
+    ob_invoke_stats_t s0{}, s1{}, s2{};
+    CHECK(ob_gemm_swiglu_f32_quant(ctx, a_clip.data(), &sd, c.data(), &s0) == OB_OK);
+    const uint64_t hits_after_cold_rej = ctx->weight_cache_hits;
+    const uint64_t misses_after_cold_rej = ctx->weight_cache_misses;
+    CHECK(ob_gemm_swiglu_f32_quant(ctx, a_clip.data(), &sd, c.data(), &s0) == OB_OK);
+    CHECK(ctx->weight_cache_hits > hits_after_cold_rej);
+    CHECK(ctx->weight_cache_misses == misses_after_cold_rej);
+
     CHECK(ob_gemm_swiglu_f32_quant(ctx, a_holder.data(), &sd, c.data(), &s1) == OB_OK);
     ob_profile_stats_t p1{}, p2{};
     CHECK(ob_context_get_profile(ctx, &p1) == OB_OK);
-    CHECK(p1.swiglu_chunks_chained == 1u && p1.swiglu_fallbacks == 0u);
+    CHECK(p1.swiglu_chunks_chained == 1u && p1.swiglu_fallbacks == 2u);
 
     CHECK(ob_gemm_swiglu_f32_quant(ctx, a_clip.data(), &sd, c.data(), &s2) == OB_OK);
     CHECK(ob_context_get_profile(ctx, &p2) == OB_OK);
-    CHECK(p2.swiglu_chunks_chained == 1u && p2.swiglu_fallbacks == 1u);
+    CHECK(p2.swiglu_chunks_chained == 1u && p2.swiglu_fallbacks == 3u);
     const double expected_dot = 128.0 * (127.0 / 128.0);
     const double expected_y0 = (expected_dot / (1.0 + std::exp(-expected_dot))) * expected_dot;
     CHECK(std::fabs(static_cast<double>(c[0]) - expected_y0) / expected_y0 < 5e-3);
