@@ -47,8 +47,20 @@ colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json run --tpu V6E1 --
     fi
     rm -f "$log_f"
   }
+  cleanup() {
+    local status=$?
+    trap - EXIT
+    set +e
+    if ! colab --auth=adc --config "$CFG" stop -s "$SESSION_ID"; then
+      echo "ERROR: failed to stop Colab session $SESSION_ID" >&2
+      if [ "$status" -eq 0 ]; then
+        status=1
+      fi
+    fi
+    exit "$status"
+  }
   colab --auth=adc --config "$CFG" new -s "$SESSION_ID" --tpu V5E1
-  trap 'colab --auth=adc --config "$CFG" stop -s "$SESSION_ID" || true' EXIT
+  trap cleanup EXIT
   run_stage "=== SURVEY_COMPLETE ===" exec -s "$SESSION_ID" --timeout 600 -f experimental/cloud-tpu/vfio_pci_survey.py
   run_stage "=== RAW_BENCH_COMPLETE ===" exec -s "$SESSION_ID" --timeout 600 -f experimental/cloud-tpu/raw_compute_bench.py
   run_stage "=== PALLAS_OPT_COMPLETE ===" exec -s "$SESSION_ID" --timeout 600 -f experimental/cloud-tpu/pallas_opt_bench.py

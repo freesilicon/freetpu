@@ -1368,6 +1368,32 @@ def _w8_scale_for_kernel(s_1d):
     return s_1d[None, :]
 
 
+_PARITY_FAILURES = []
+
+
+def _check_decode_step_parity(stage_name, batch_sz, p_enabled, p_x0, p_x_last, x_x0):
+    x_f32 = x_x0.astype(jnp.float32)
+    p_f32 = p_x0.astype(jnp.float32)
+    p_last_f32 = p_x_last.astype(jnp.float32)
+    x_finite = bool(jnp.all(jnp.isfinite(x_f32)))
+    p_finite = bool(jnp.all(jnp.isfinite(p_f32))) and bool(jnp.all(jnp.isfinite(p_last_f32)))
+    finite_ok = x_finite and p_finite
+    step0_err = float(jnp.max(jnp.abs(p_f32 - x_f32)))
+    x_max_abs = float(jnp.max(jnp.abs(x_f32)))
+    rel_err = (
+        step0_err / max(x_max_abs, 1e-6)
+        if math.isfinite(step0_err) and math.isfinite(x_max_abs)
+        else float("inf")
+    )
+    tol = max(0.25, 0.05 * x_max_abs) if math.isfinite(x_max_abs) else 0.25
+    parity_ok = finite_ok and math.isfinite(step0_err) and (step0_err <= tol)
+    if (p_enabled and not parity_ok) or not x_finite:
+        _PARITY_FAILURES.append(
+            f"{stage_name}(B={batch_sz}): finite={finite_ok}, step0_err={step0_err}, x_max_abs={x_max_abs}, tol={tol}"
+        )
+    return finite_ok, x_finite, step0_err, x_max_abs, rel_err, parity_ok
+
+
 def make_w8_32l_step(use_pallas):
     @functools.partial(jax.jit, donate_argnums=(2, 3))
     def step(weights, x, k_cache, v_cache, pos):
@@ -1472,8 +1498,12 @@ for batch in (1, 32):
     )
 
     p_ok = W8A16_MODE is not None
-    p_gbs = (total_bytes / (p_med_s * 1e9)) if p_ok else None
-    x_gbs = total_bytes / (x_med_s * 1e9)
+    finite_ok, x_finite, step0_err, x_max_abs, step0_rel_err, parity_ok = (
+        _check_decode_step_parity("W8A16", batch, p_ok, p_x0, p_x_last, x_x0)
+    )
+    p_valid = p_ok and parity_ok
+    p_gbs = (total_bytes / (p_med_s * 1e9)) if p_valid else None
+    x_gbs = (total_bytes / (x_med_s * 1e9)) if x_finite else None
     print(
         "LLAMA8B_32L_W8A16:",
         json.dumps(
@@ -1486,20 +1516,24 @@ for batch in (1, 32):
                 "weight_gb": round(w8_weight_bytes / 1e9, 4),
                 "kv_mb": round(kv_bytes / 1e6, 2),
                 "scan_tpu_custom_call_count": p_cc_count if p_ok else 0,
-                "step0_max_abs_err": step0_err,
-                "pallas_compile_s": round(p_compile_s, 2) if p_ok else None,
-                "pallas_first_run_s": round(p_first_run_s, 2) if p_ok else None,
-                "pallas_ms_per_step": round(p_med_s * 1e3, 3) if p_ok else None,
-                "pallas_tok_per_s": round(batch / p_med_s, 2) if p_ok else None,
+                "finite_ok": finite_ok,
+                "parity_ok": parity_ok,
+                "step0_max_abs_err": step0_err if math.isfinite(step0_err) else str(step0_err),
+                "step0_ref_max_abs": round(x_max_abs, 4) if math.isfinite(x_max_abs) else str(x_max_abs),
+                "step0_rel_err": round(step0_rel_err, 6) if math.isfinite(step0_rel_err) else str(step0_rel_err),
+                "pallas_compile_s": round(p_compile_s, 2) if p_valid else None,
+                "pallas_first_run_s": round(p_first_run_s, 2) if p_valid else None,
+                "pallas_ms_per_step": round(p_med_s * 1e3, 3) if p_valid else None,
+                "pallas_steps_per_s": round(batch / p_med_s, 2) if p_valid else None,
                 "pallas_gb_s": round(p_gbs, 2) if p_gbs is not None else None,
                 "pallas_pct_819": round(100.0 * p_gbs / PEAK_HBM_GBS, 2) if p_gbs is not None else None,
                 "xla_compile_s": round(x_compile_s, 2),
                 "xla_first_run_s": round(x_first_run_s, 2),
-                "xla_ms_per_step": round(x_med_s * 1e3, 3),
-                "xla_tok_per_s": round(batch / x_med_s, 2),
-                "xla_gb_s": round(x_gbs, 2),
-                "xla_pct_819": round(100.0 * x_gbs / PEAK_HBM_GBS, 2),
-                "speedup": round(x_med_s / p_med_s, 2) if p_ok else None,
+                "xla_ms_per_step": round(x_med_s * 1e3, 3) if x_finite else None,
+                "xla_steps_per_s": round(batch / x_med_s, 2) if x_finite else None,
+                "xla_gb_s": round(x_gbs, 2) if x_gbs is not None else None,
+                "xla_pct_819": round(100.0 * x_gbs / PEAK_HBM_GBS, 2) if x_gbs is not None else None,
+                "speedup": round(x_med_s / p_med_s, 2) if (p_valid and x_finite) else None,
                 "hbm": get_hbm_stats(),
             }
         ),
@@ -1657,8 +1691,12 @@ for batch in (1, 32):
     )
 
     p4_ok = W4A16_MODE is not None
-    p_gbs = (total_bytes / (p_med_s * 1e9)) if p4_ok else None
-    x_gbs = total_bytes / (x_med_s * 1e9)
+    finite_ok, x_finite, step0_err, x_max_abs, step0_rel_err, parity_ok = (
+        _check_decode_step_parity("W4A16", batch, p4_ok, p_x0, p_x_last, x_x0)
+    )
+    p4_valid = p4_ok and parity_ok
+    p_gbs = (total_bytes / (p_med_s * 1e9)) if p4_valid else None
+    x_gbs = (total_bytes / (x_med_s * 1e9)) if x_finite else None
     print(
         "LLAMA8B_32L_W4A16:",
         json.dumps(
@@ -1671,20 +1709,24 @@ for batch in (1, 32):
                 "weight_gb": round(w4_weight_bytes / 1e9, 4),
                 "kv_mb": round(kv_bytes / 1e6, 2),
                 "scan_tpu_custom_call_count": p_cc_count if p4_ok else 0,
-                "step0_max_abs_err": step0_err,
-                "pallas_compile_s": round(p_compile_s, 2) if p4_ok else None,
-                "pallas_first_run_s": round(p_first_run_s, 2) if p4_ok else None,
-                "pallas_ms_per_step": round(p_med_s * 1e3, 3) if p4_ok else None,
-                "pallas_tok_per_s": round(batch / p_med_s, 2) if p4_ok else None,
+                "finite_ok": finite_ok,
+                "parity_ok": parity_ok,
+                "step0_max_abs_err": step0_err if math.isfinite(step0_err) else str(step0_err),
+                "step0_ref_max_abs": round(x_max_abs, 4) if math.isfinite(x_max_abs) else str(x_max_abs),
+                "step0_rel_err": round(step0_rel_err, 6) if math.isfinite(step0_rel_err) else str(step0_rel_err),
+                "pallas_compile_s": round(p_compile_s, 2) if p4_valid else None,
+                "pallas_first_run_s": round(p_first_run_s, 2) if p4_valid else None,
+                "pallas_ms_per_step": round(p_med_s * 1e3, 3) if p4_valid else None,
+                "pallas_steps_per_s": round(batch / p_med_s, 2) if p4_valid else None,
                 "pallas_gb_s": round(p_gbs, 2) if p_gbs is not None else None,
                 "pallas_pct_819": round(100.0 * p_gbs / PEAK_HBM_GBS, 2) if p_gbs is not None else None,
                 "xla_compile_s": round(x_compile_s, 2),
                 "xla_first_run_s": round(x_first_run_s, 2),
-                "xla_ms_per_step": round(x_med_s * 1e3, 3),
-                "xla_tok_per_s": round(batch / x_med_s, 2),
-                "xla_gb_s": round(x_gbs, 2),
-                "xla_pct_819": round(100.0 * x_gbs / PEAK_HBM_GBS, 2),
-                "speedup": round(x_med_s / p_med_s, 2) if p4_ok else None,
+                "xla_ms_per_step": round(x_med_s * 1e3, 3) if x_finite else None,
+                "xla_steps_per_s": round(batch / x_med_s, 2) if x_finite else None,
+                "xla_gb_s": round(x_gbs, 2) if x_gbs is not None else None,
+                "xla_pct_819": round(100.0 * x_gbs / PEAK_HBM_GBS, 2) if x_gbs is not None else None,
+                "speedup": round(x_med_s / p_med_s, 2) if (p4_valid and x_finite) else None,
                 "hbm": get_hbm_stats(),
             }
         ),
@@ -1698,12 +1740,18 @@ _KERNEL_CACHE.clear()
 gc.collect()
 jax.clear_caches()
 print("HBM_END:", json.dumps(get_hbm_stats()))
-if W8A16_MODE is None or W4A16_MODE is None:
+if W8A16_MODE is None or W4A16_MODE is None or _PARITY_FAILURES:
     print(
-        "LLAMA8B_PARTIAL:",
-        json.dumps({"w8a16_mode": W8A16_MODE, "w4a16_mode": W4A16_MODE}),
+        "LLAMA8B_FAILED:",
+        json.dumps(
+            {
+                "w8a16_mode": W8A16_MODE,
+                "w4a16_mode": W4A16_MODE,
+                "parity_failures": _PARITY_FAILURES,
+            }
+        ),
     )
     raise RuntimeError(
-        f"Llama8B decoder benchmark incomplete: W8A16_MODE={W8A16_MODE}, W4A16_MODE={W4A16_MODE}"
+        f"Llama8B decoder benchmark failed: W8A16_MODE={W8A16_MODE}, W4A16_MODE={W4A16_MODE}, parity_failures={_PARITY_FAILURES}"
     )
 print("=== LLAMA8B_COMPLETE ===")

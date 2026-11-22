@@ -32,7 +32,10 @@ def _is_safe_existing_ancestor(ancestor: str) -> bool:
   if stat.S_ISLNK(st.st_mode):
     if st.st_uid != 0 and st.st_uid != euid:
       return False
-    st = os.stat(ancestor)
+    try:
+      st = os.stat(ancestor)
+    except OSError:
+      return False
   if not stat.S_ISDIR(st.st_mode):
     return False
   if st.st_uid != euid and st.st_uid != 0:
@@ -42,35 +45,59 @@ def _is_safe_existing_ancestor(ancestor: str) -> bool:
   return True
 
 
-def _validate_existing_ancestor_chain(start_dir: str) -> None:
-  """Validate every existing ancestor directory up to `/` (and symlink targets)."""
-  visited: set[str] = set()
-  queue: list[str] = [start_dir]
-  while queue:
-    cur = queue.pop()
-    while cur and cur not in visited:
-      visited.add(cur)
-      if os.path.lexists(cur):
-        if not _is_safe_existing_ancestor(cur):
-          raise RuntimeError(
-              f"Refusing directory under untrusted ancestor: {cur}"
-          )
-        if os.path.islink(cur):
-          resolved = os.path.realpath(cur)
-          if resolved not in visited:
-            queue.append(resolved)
-      parent = os.path.dirname(cur)
-      if parent == cur:
-        break
-      cur = parent
+def _resolve_and_validate_dir_path(raw_path: str) -> str:
+  """Resolve symlinks hop-by-hop from `/` and validate every existing ancestor."""
+  expanded = os.path.expanduser(raw_path)
+  full = expanded if os.path.isabs(expanded) else os.path.join(os.getcwd(), expanded)
+  if not _is_safe_existing_ancestor("/"):
+    raise RuntimeError("Refusing directory under untrusted ancestor: /")
+  resolved = "/"
+  parts = [p for p in full.split("/") if p]
+  hops = 0
+  idx = 0
+  while idx < len(parts):
+    part = parts[idx]
+    idx += 1
+    if part == ".":
+      continue
+    if part == "..":
+      if resolved != "/":
+        resolved = os.path.dirname(resolved)
+      continue
+    candidate = "/" + part if resolved == "/" else resolved + "/" + part
+    if os.path.lexists(candidate):
+      if not _is_safe_existing_ancestor(candidate):
+        raise RuntimeError(f"Refusing directory under untrusted ancestor: {candidate}")
+      if os.path.islink(candidate):
+        hops += 1
+        if hops > 40:
+          raise RuntimeError(f"Too many symlink hops while validating path: {raw_path}")
+        target = os.readlink(candidate)
+        t_parts = [p for p in target.split("/") if p]
+        if target.startswith("/"):
+          resolved = "/"
+        parts = t_parts + parts[idx:]
+        idx = 0
+        continue
+      resolved = candidate
+    else:
+      if any(p == ".." for p in parts[idx:]):
+        raise RuntimeError(f"Refusing '..' after missing path component in: {raw_path}")
+      resolved = candidate
+      for rem in parts[idx:]:
+        if rem == ".":
+          continue
+        resolved = "/" + rem if resolved == "/" else resolved + "/" + rem
+      break
+  return resolved
 
 
 def ensure_private_dir(raw_dir: str) -> str:
-  """Ensure `raw_dir` exists as a non-symlink directory owned by the user with mode 0700."""
+  """Ensure `raw_dir` resolves to a safe non-symlink directory owned by the user with mode 0700."""
   expanded = os.path.expanduser(raw_dir)
   if os.path.islink(expanded):
     raise RuntimeError(f"Refusing symlinked directory path: {raw_dir}")
-  abs_dir = os.path.abspath(expanded)
+  abs_dir = _resolve_and_validate_dir_path(expanded)
   if not os.path.lexists(abs_dir):
     missing = []
     cur = abs_dir
@@ -80,13 +107,11 @@ def ensure_private_dir(raw_dir: str) -> str:
       if parent == cur:
         break
       cur = parent
-    _validate_existing_ancestor_chain(cur)
     for d in reversed(missing):
       try:
         os.mkdir(d, 0o700)
       except FileExistsError:
         pass
-  _validate_existing_ancestor_chain(os.path.dirname(abs_dir))
   st = os.lstat(abs_dir)
   if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
     raise RuntimeError(f"Expected non-symlink directory, got: {abs_dir}")
@@ -304,10 +329,16 @@ def main() -> None:
     raise RuntimeError(f"Invalid C++ source path: {CPP_SRC}")
 
   ir_dir = ensure_private_dir(IR_DIR)
-  bin_abs = os.path.abspath(os.path.expanduser(BIN_PATH))
+  bin_expanded = os.path.expanduser(BIN_PATH)
+  if os.path.islink(bin_expanded):
+    raise RuntimeError(f"Refusing symlinked output binary path: {bin_expanded}")
+  bin_name = os.path.basename(bin_expanded)
+  if bin_name in ("", ".", ".."):
+    raise RuntimeError(f"Invalid output binary path: {BIN_PATH}")
+  safe_bin_dir = ensure_private_dir(os.path.dirname(bin_expanded) or ".")
+  bin_abs = os.path.join(safe_bin_dir, bin_name)
   if os.path.islink(bin_abs):
     raise RuntimeError(f"Refusing symlinked output binary path: {bin_abs}")
-  ensure_private_dir(os.path.dirname(bin_abs))
 
   hdr_path = os.path.join(ir_dir, "pjrt_c_api.h")
   if os.path.islink(hdr_path):
