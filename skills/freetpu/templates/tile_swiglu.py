@@ -146,10 +146,12 @@ def run_tpu_benchmark(m: int, n: int, block_m: int, block_n: int, iters: int) ->
         np.asarray(up[:sl_m, :sl_n], dtype=np.float32),
     )
     max_abs_err_cpu = float(np.max(np.abs(out_f32[:sl_m, :sl_n] - cpu_slice)))
-    cpu_tol = max(0.05, 0.03 * float(np.max(np.abs(cpu_slice))))
-    if max_abs_err_cpu > cpu_tol:
+    rms_cpu = float(np.sqrt(np.mean(np.square(cpu_slice))))
+    nrmse_cpu = float(np.sqrt(np.mean(np.square(out_f32[:sl_m, :sl_n] - cpu_slice)))) / max(rms_cpu, 1e-12)
+    cpu_tol = max(5e-4, 0.03 * float(np.max(np.abs(cpu_slice))))
+    if nrmse_cpu > 0.05 or max_abs_err_cpu > cpu_tol:
         raise RuntimeError(
-            f"Pallas SwiGLU parity vs NumPy cpu_ref failed: max_abs_err={max_abs_err_cpu} > tol={cpu_tol}"
+            f"Pallas SwiGLU parity vs NumPy cpu_ref failed: max_abs_err={max_abs_err_cpu} (tol={cpu_tol}), nrmse={nrmse_cpu}"
         )
 
     def _bench(fn) -> Tuple[float, float]:

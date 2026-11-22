@@ -28,6 +28,8 @@ Load [references/silicon-cheatsheet.md](references/silicon-cheatsheet.md) when c
 
 Use this workflow for zero-Google-`.so` C/C++ kernels, closed-form `(M, K, N)` VLIW GEMMs, and `0x640` minimax spline fusion.
 
+> **Globally installed skill note**: If you loaded this skill via a global symlink (`~/.claude/skills/freetpu`, `~/.codex/skills/freetpu`, or `~/.gemini/config/skills/freetpu`) while working in another directory, resolve the skill's `SKILL.md` back to the FreeTPU repository root (`cd "$(dirname "$(dirname "$(dirname "$(readlink -f ~/.claude/skills/freetpu/SKILL.md)")")")"`) before running repository-relative commands below.
+
 1. **Verify host mock runtime & C11/C++17 headers offline** (macOS/Linux, no phone required):
    ```bash
    cmake -S libopenbuenos -B libopenbuenos/build/cmake-host -DCMAKE_BUILD_TYPE=Release
@@ -44,11 +46,12 @@ Use this workflow for zero-Google-`.so` C/C++ kernels, closed-form `(M, K, N)` V
    ```
    - `tools/emit_custom_gemm.py` synthesizes `chunk[0..6]` and packed `ext[2]` (`int32` bias + `[K/4, N_blk, 4]` `uint8` `w + 128`) using IEEE-754 **FP32 Round-Half-to-Even (RNE)** (`np.rint`), matching `buenos_a0` hardware rather than fixed-point RHU.
    - `tools/spline_0x640.py` synthesizes 208-byte `0x640` (`LoadCoefficientTables`) 8-segment degree-4 Remez minimax splines (`SiLU`, `GELU`, `exp`) with zero-overhead Mode-A fusion.
-   - To emit a runnable `.dgc0` + `.in.bin` + `.ref.bin` bundle locally, supply both a user-extracted shell (`--shell` or `FREETPU_SHELL_DGC0`) and `--out-prefix`:
+   - To emit a runnable `.dgc0` + `.in.bin` + `.ref.bin` bundle locally, supply both a user-extracted shell (`--shell` or `FREETPU_SHELL_DGC0`) and `--out-prefix` inside a fresh private directory:
      ```bash
+     PROBE_DIR="$(umask 077 && mktemp -d)"
      python3 skills/freetpu/templates/buenos_gemm_probe.py \
        --shell /path/to/local_shell.dgc0 \
-       --out-prefix /tmp/freetpu_probe
+       --out-prefix "$PROBE_DIR/freetpu_probe"
      ```
 
 3. **Cross-build and prove on physical Tensor G5 silicon** (unlocked Android ARM64 device):
@@ -56,12 +59,12 @@ Use this workflow for zero-Google-`.so` C/C++ kernels, closed-form `(M, K, N)` V
    make -C libopenbuenos verify-header android verify-android
    make -C runtime verify-baremetal
    ```
-   Push `tpu_baremetal_runner` and test artifacts via `adb push` to `/data/local/tmp/`, run with `--ref`, and verify both bit-exact parity (`max_abs_err == 0`) and clean-room ELF mapping (`maps_has_google_tpu_libs == false`):
+   Push `tpu_baremetal_runner` and the emitted artifacts (`$PROBE_DIR/freetpu_probe.*`) via `adb push` to `/data/local/tmp/`, run with `--ref`, and verify both bit-exact parity (`max_abs_err == 0`) and clean-room ELF mapping (`maps_has_google_tpu_libs == false`):
    ```bash
    adb shell "/data/local/tmp/tpu_baremetal_runner \
-     --dgc0 /data/local/tmp/probe.dgc0 \
-     --in /data/local/tmp/probe.in.bin \
-     --ref /data/local/tmp/probe.ref.bin \
+     --dgc0 /data/local/tmp/freetpu_probe.dgc0 \
+     --in /data/local/tmp/freetpu_probe.in.bin \
+     --ref /data/local/tmp/freetpu_probe.ref.bin \
      --iters 10 --json"
    ```
    - **Errata guard**: Never pack 4-bit weights as nibbles for `0x980` (`LiteRT#12178`); unpack `Q4_0` at load time to `uint8` (`w + 8`) or use `W8A16 (BF16)` with per-channel `FP32` scales. See [references/silicon-cheatsheet.md](references/silicon-cheatsheet.md).
@@ -72,12 +75,14 @@ Use this workflow for zero-Google-`.so` C/C++ kernels, closed-form `(M, K, N)` V
 
 Use this workflow to run Pallas/Mosaic or JAX/PJRT benchmarks on Colab TPUs with zero idle Compute Unit (CU) waste.
 
-1. **Check CU balance & isolate session state** (always pass global flags before the subcommand):
+1. **Check CU balance & isolate session state** in a fresh private temp directory (always pass global flags before the subcommand):
    ```bash
-   colab --auth=adc --config /tmp/freetpu-colab.json usage
+   WORK_DIR="$(umask 077 && mktemp -d)"
+   COLAB_STATE="$WORK_DIR/colab-sessions.json"
+   colab --auth=adc --config "$COLAB_STATE" usage
    ```
    - Abort if `Current balance` is below your run budget (e.g., `< 5.0` CUs).
-   - Always pass `--config <unique-path>` so parallel workers never clobber `~/.config/colab-cli/sessions.json`.
+   - Always keep `--config "$COLAB_STATE"` inside your private `WORK_DIR` (`0700`) so parallel workers never clobber `~/.config/colab-cli/sessions.json` and shared `/tmp` state files cannot pre-exist under another owner.
    - Pass `--no-public-api` when targeting `/tun/m/*` tunnel auth on unallowlisted GCP quota projects.
 
 2. **Run ephemeral probe with auto-stop and `v6e1 -> v5e1` fallback**:
@@ -85,24 +90,23 @@ Use this workflow to run Pallas/Mosaic or JAX/PJRT benchmarks on Colab TPUs with
      ```bash
      # Offline check & command preview
      python3 tools/colab_tpu_bench.py --self-test
-     python3 tools/colab_tpu_bench.py --dry-run --out-dir /tmp/freetpu-colab-dry
+     python3 tools/colab_tpu_bench.py --dry-run --out-dir "$WORK_DIR/dry"
 
      # Live single-shot run (v6e1 with automatic v5e1 fallback on 412/400)
      python3 tools/colab_tpu_bench.py \
        --auth adc \
        --min-cu-balance 10 \
-       --out-dir /tmp/freetpu-colab-proof \
+       --out-dir "$WORK_DIR/proof" \
        --script skills/freetpu/templates/tile_fused_gemm_silu.py
      ```
-   - Direct CLI pattern (`colab run` provisions, runs, propagates exit code, and auto-stops the VM even on error; use a fresh session name per run and create the export directory first):
+   - Direct CLI pattern (`colab run` provisions, runs, propagates exit code, and auto-stops the VM even on error; reuse `"$COLAB_STATE"` inside `"$WORK_DIR"` for both `run` and `log` with a unique session name):
      ```bash
-     SESSION_ID="freetpu-probe-$(date +%Y%m%d-%H%M%S)"
-     mkdir -p -m 700 /tmp/freetpu-colab-proof
-     colab --auth=adc --config /tmp/freetpu-colab.json run \
+     SESSION_ID="freetpu-probe-$(date +%Y%m%d-%H%M%S)-$$"
+     colab --auth=adc --config "$COLAB_STATE" run \
        -s "$SESSION_ID" --tpu V6E1 --timeout 300 \
-       skills/freetpu/templates/tile_swiglu.py
-     colab --auth=adc --config /tmp/freetpu-colab.json log \
-       -s "$SESSION_ID" -o /tmp/freetpu-colab-proof/proof.ipynb
+       -- skills/freetpu/templates/tile_swiglu.py
+     colab --auth=adc --config "$COLAB_STATE" log \
+       -s "$SESSION_ID" -o "$WORK_DIR/$SESSION_ID.ipynb"
      ```
    - For multi-step interactive sessions, prefer `colab exec` (keeps XLA/PJRT caches warm) over `colab ssh` (capped at 5 sessions / HTTP 429). Use `colab download` instead of `drive.mount`.
 
@@ -122,7 +126,7 @@ Start from the templates in `templates/`—each supports `--self-test` offline o
 
 - **Cloud TPU (Pallas / Mosaic)**:
   1. Tile `M, N, K` in multiples of MXU/vector lanes (`(8, 128)` minimum; `(512, 512, 256)` to `(1024, 1024, 256)` for large `4096^3` GEMMs).
-  2. Keep per-kernel scratch inside the **`16 MiB` VMEM** budget (`vmem_limit_bytes=16 * 1024 * 1024` via `pltpu.CompilerParams` or `pltpu.TPUCompilerParams`).
+  2. Keep per-kernel scratch inside the **`16 MiB` VMEM** budget (leave `vmem_limit_bytes` unset in `CompilerParams` unless `LIBTPU_INIT_ARGS` sets a strictly larger `--xla_tpu_scoped_vmem_limit_kib`).
   3. Accumulate in `jnp.float32` (`preferred_element_type=jnp.float32`) and cast to `jnp.bfloat16` only on final VMEM -> HBM store.
   4. Overlap HBM DMA with MXU compute via `pltpu.emit_pipeline` or explicit 2-slot `pltpu.make_async_copy(..., pltpu.SemaphoreType.DMA((2,)))`.
   5. Confirm native Mosaic lowering (`"tpu_custom_call" in fn.lower(...).as_text()`) before benchmarking.
