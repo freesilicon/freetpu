@@ -105,6 +105,12 @@ spec:
         - key: google.com/tpu
           operator: Exists
           effect: NoSchedule
+        - key: cloud.google.com/gke-spot
+          operator: Exists
+          effect: NoSchedule
+        - key: cloud.google.com/gke-queued
+          operator: Exists
+          effect: NoSchedule
       containers:
         - name: tpu-exporter
           image: python:3.12-slim
@@ -240,6 +246,12 @@ spec:
                       - "true"
       tolerations:
         - key: google.com/tpu
+          operator: Exists
+          effect: NoSchedule
+        - key: cloud.google.com/gke-spot
+          operator: Exists
+          effect: NoSchedule
+        - key: cloud.google.com/gke-queued
           operator: Exists
           effect: NoSchedule
       containers:
