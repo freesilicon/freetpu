@@ -140,7 +140,7 @@ def _make_device_node(
     # (5) regenerate or resume `freetpu_cdi.py sync`.
     return {
         "path": container_path,
-        "hostPath": str(host_path),
+        "hostPath": os.path.abspath(host_path),
         "type": "c",
         "permissions": permissions,
     }
@@ -218,6 +218,8 @@ def discover_tpu_chips(
     allow_missing_vfio: bool = False,
 ) -> Tuple[List[DiscoveredChip], Path]:
     """Scan sysfs for VFIO-backed Google 0x1ae0 TPU PCI devices and /dev/vfio/* nodes."""
+    sysfs_root = Path(os.path.abspath(sysfs_root))
+    dev_root = Path(os.path.abspath(dev_root))
     pci_dir = sysfs_root / "bus" / "pci" / "devices"
     if not pci_dir.is_dir():
         raise FileNotFoundError(f"PCI sysfs directory not found: {pci_dir}")
@@ -893,6 +895,8 @@ def verify_spec_against_host(
     still maps to the exact TPU PCI BDF(s) with zero non-TPU members, and flags changed
     char device numbers.
     """
+    sysfs_root = Path(os.path.abspath(sysfs_root))
+    dev_root = Path(os.path.abspath(dev_root))
     errors: List[str] = []
     if not isinstance(spec, dict):
         return ["CDI spec root must be a JSON object"]

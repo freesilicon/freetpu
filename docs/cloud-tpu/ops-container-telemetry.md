@@ -85,7 +85,7 @@ See [`ops/tpu-exporter/prometheus-scrape.yml`](../../ops/tpu-exporter/prometheus
 
 ### Generating, Validating & Reconciling Boot-Scoped `/var/run/cdi/freetpu.json`
 
-`freetpu-cdi` defaults to the boot-scoped CNCF CDI dynamic directory (`/var/run/cdi/freetpu.json`, tmpfs on Linux) so stale IOMMU group assignments never persist across reboots. Avoid persisting static specs in `/etc/cdi` across reboots or PCI/VFIO topology changes.
+`freetpu-cdi` defaults to the boot-scoped CNCF CDI dynamic directory (`/var/run/cdi/freetpu.json`, tmpfs on Linux) so stale IOMMU group assignments never persist across reboots. Avoid persisting static specs in `/etc/cdi` across reboots or PCI/VFIO topology changes. On Podman releases that search only `/etc/cdi` by default (e.g. Podman `5.4.x`), add `cdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]` under `[engine]` in `/etc/containers/containers.conf` (or `~/.config/containers/containers.conf`) so Podman discovers `/var/run/cdi/freetpu.json` while keeping specs boot-scoped.
 
 ```bash
 # Recommended on mutable hosts: continuously reconcile /var/run/cdi/freetpu.json

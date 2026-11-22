@@ -1435,6 +1435,21 @@ class FreeTpuCdiTests(unittest.TestCase):
                     empty_errs,
                 )
 
+                # 9. Relative `--dev-root` emits absolute `hostPath` entries that pass `validate_cdi_spec`.
+                rel_dev = Path(os.path.relpath(dev_root, Path.cwd()))
+                rel_sys = Path(os.path.relpath(sysfs_root, Path.cwd()))
+                rel_chips, rel_vfio_c = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=rel_sys, dev_root=rel_dev
+                )
+                rel_spec = freetpu_cdi.build_cdi_spec(rel_chips, rel_vfio_c)
+                self.assertEqual(freetpu_cdi.validate_cdi_spec(rel_spec), [])
+                self.assertTrue(
+                    rel_spec["containerEdits"]["deviceNodes"][0]["hostPath"].startswith("/")
+                )
+                for dev_entry in rel_spec["devices"]:
+                    for dn in dev_entry["containerEdits"]["deviceNodes"]:
+                        self.assertTrue(dn["hostPath"].startswith("/"))
+
 
 if __name__ == "__main__":
     unittest.main()

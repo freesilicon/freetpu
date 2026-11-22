@@ -27,6 +27,8 @@ sudo python3 ops/tpu-cdi/freetpu_cdi.py validate /var/run/cdi/freetpu.json --che
 
 With boot-scoped `/var/run/cdi/freetpu.json` generated (and CDI enabled in Docker, Podman, or unaffected/patched containerd `2.0.x` / `2.1.x >= 2.1.9` / `2.2.x >= 2.2.5` / `2.3.x >= 2.3.2` / `>= 2.4.0`):
 
+> **Podman CDI search path:** Affected Podman releases (including Podman `5.4.x`) default `cdi_spec_dirs` to `["/etc/cdi"]` only, so they will not discover `/var/run/cdi/freetpu.json` until `/var/run/cdi` is added. Add `cdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]` under `[engine]` in `/etc/containers/containers.conf` (or `~/.config/containers/containers.conf`) to keep the TPU spec boot-scoped on tmpfs instead of persisting stale specs under `/etc/cdi`.
+
 ```bash
 # Attach all TPU chips on the host with a sufficient VFIO memlock limit
 docker run --rm \
