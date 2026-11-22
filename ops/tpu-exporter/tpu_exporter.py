@@ -1826,11 +1826,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--no-pid-scan",
+        dest="no_pid_scan",
         action="store_true",
+        default=False,
         help=(
             "Disable `/proc/*/fd` PID scanning and query `tpu_info.metrics` directly "
-            "over loopback gRPC (recommended for unprivileged workload sidecars without "
-            "`shareProcessNamespace` or `SYS_PTRACE`)."
+            "over loopback gRPC (recommended for containers without host PID visibility)."
+        ),
+    )
+    parser.add_argument(
+        "--pid-scan",
+        dest="no_pid_scan",
+        action="store_false",
+        help=(
+            "Explicitly enable `/proc/*/fd` host PID scanning (overrides `--no-pid-scan`, "
+            "e.g. when running the Docker image with `--pid=host --cap-add=SYS_PTRACE`)."
         ),
     )
     parser.add_argument(

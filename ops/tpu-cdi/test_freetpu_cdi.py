@@ -1355,7 +1355,7 @@ class FreeTpuCdiTests(unittest.TestCase):
                     errs_sym,
                 )
 
-                # 6. Non-string/unhashable JSON fields in type/hookName produce validation errors (no TypeError).
+                # 6. Non-string/unhashable JSON fields in type/hookName/mounts/hooks produce validation errors (no TypeError).
                 malformed_spec = {
                     "cdiVersion": "0.6.0",
                     "kind": "freetpu.dev/tpu",
@@ -1367,7 +1367,24 @@ class FreeTpuCdiTests(unittest.TestCase):
                                 "deviceNodes": [
                                     {"path": "/dev/vfio/0", "type": ["c"], "uid": -1, "gid": 2**32, "fileMode": -1}
                                 ],
-                                "hooks": [{"hookName": {"bad": 1}, "path": "/bin/true"}],
+                                "mounts": [
+                                    {
+                                        "hostPath": "/tmp/a",
+                                        "containerPath": "/tmp/b",
+                                        "options": "ro",
+                                        "type": 123,
+                                        "extraField": True,
+                                    }
+                                ],
+                                "hooks": [
+                                    {
+                                        "hookName": {"bad": 1},
+                                        "path": "/bin/true",
+                                        "args": "not-a-list",
+                                        "timeout": 0,
+                                        "unknownKey": 1,
+                                    }
+                                ],
                             },
                         }
                     ],
@@ -1378,7 +1395,19 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertTrue(any(".uid:" in e for e in mal_errs), mal_errs)
                 self.assertTrue(any(".gid:" in e for e in mal_errs), mal_errs)
                 self.assertTrue(any(".fileMode:" in e for e in mal_errs), mal_errs)
+                self.assertTrue(any(".options: must be a list of strings" in e for e in mal_errs), mal_errs)
+                self.assertTrue(any(".type: must be a string" in e for e in mal_errs), mal_errs)
+                self.assertTrue(any("unsupported CDI v0.6.0 mount keys" in e for e in mal_errs), mal_errs)
                 self.assertTrue(any("invalid OCI hookName" in e for e in mal_errs), mal_errs)
+                self.assertTrue(any(".args: must be a list of strings" in e for e in mal_errs), mal_errs)
+                self.assertTrue(any(".timeout: must be a positive integer" in e for e in mal_errs), mal_errs)
+                self.assertTrue(any("unsupported CDI v0.6.0 hook keys" in e for e in mal_errs), mal_errs)
+
+                # 7. Per-device containerEdits must not emit colliding env vars when multiple selectors are requested.
+                clean_spec = freetpu_cdi.build_cdi_spec(chips_live, vfio_c)
+                for dev_entry in clean_spec["devices"]:
+                    self.assertNotIn("env", dev_entry["containerEdits"])
+                    self.assertIn("annotations", dev_entry)
 
 
 if __name__ == "__main__":

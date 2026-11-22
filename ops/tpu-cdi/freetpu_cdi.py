@@ -466,12 +466,6 @@ def build_cdi_spec(
                     "annotations": ann,
                     "containerEdits": {
                         "deviceNodes": [node],
-                        "env": [
-                            f"FREETPU_CDI_DEVICE={selector}",
-                            f"FREETPU_PCI_BDFS={rep.pci_bdf}",
-                            f"FREETPU_TPU_GENERATION={rep.generation}",
-                            f"FREETPU_VFIO_DEVICES={rep.vfio_container_path}",
-                        ],
                     },
                 }
             )
@@ -499,13 +493,6 @@ def build_cdi_spec(
                     "annotations": ann,
                     "containerEdits": {
                         "deviceNodes": [node],
-                        "env": [
-                            f"FREETPU_CDI_DEVICE={selector}",
-                            f"FREETPU_CHIP_COUNT={len(group_chips)}",
-                            f"FREETPU_PCI_BDFS={','.join(group_bdfs)}",
-                            f"FREETPU_TPU_GENERATION={','.join(group_gens)}",
-                            f"FREETPU_VFIO_DEVICES={rep.vfio_container_path}",
-                        ],
                     },
                 }
             )
@@ -528,13 +515,6 @@ def build_cdi_spec(
             "annotations": all_ann,
             "containerEdits": {
                 "deviceNodes": list(seen_group_nodes.values()),
-                "env": [
-                    "FREETPU_CDI_DEVICE=all",
-                    f"FREETPU_CHIP_COUNT={len(chips)}",
-                    f"FREETPU_PCI_BDFS={','.join(sorted(all_bdfs))}",
-                    f"FREETPU_TPU_GENERATION={','.join(all_generations)}",
-                    f"FREETPU_VFIO_DEVICES={','.join(seen_group_nodes.keys())}",
-                ],
             },
         }
     )
@@ -569,6 +549,8 @@ _ALLOWED_DEVICE_ENTRY_KEYS = frozenset({"name", "annotations", "containerEdits"}
 _ALLOWED_DEVICE_NODE_KEYS = frozenset(
     {"path", "hostPath", "type", "major", "minor", "fileMode", "permissions", "uid", "gid"}
 )
+_ALLOWED_MOUNT_KEYS = frozenset({"hostPath", "containerPath", "type", "options"})
+_ALLOWED_HOOK_KEYS = frozenset({"hookName", "path", "args", "env", "timeout"})
 _HOST_VALIDATED_CONTAINER_EDITS_KEYS = frozenset({"env", "deviceNodes"})
 _HOST_VALIDATED_DEVICE_NODE_KEYS = frozenset({"path", "hostPath", "type", "permissions"})
 
@@ -679,6 +661,11 @@ def _validate_container_edits(edits: Any, context: str, errors: List[str]) -> No
                 if not isinstance(m, dict):
                     errors.append(f"{mc}: must be an object")
                     continue
+                unknown_mount_keys = set(m.keys()) - _ALLOWED_MOUNT_KEYS
+                if unknown_mount_keys:
+                    errors.append(
+                        f"{mc}: unsupported CDI v0.6.0 mount keys: {sorted(unknown_mount_keys)}"
+                    )
                 if not isinstance(m.get("hostPath"), str) or not m["hostPath"].startswith("/"):
                     errors.append(f"{mc}.hostPath: must be an absolute path")
                 if (
@@ -686,6 +673,16 @@ def _validate_container_edits(edits: Any, context: str, errors: List[str]) -> No
                     or not m["containerPath"].startswith("/")
                 ):
                     errors.append(f"{mc}.containerPath: must be an absolute path")
+                if "type" in m:
+                    m_type = m["type"]
+                    if not isinstance(m_type, str):
+                        errors.append(f"{mc}.type: must be a string")
+                if "options" in m:
+                    m_opts = m["options"]
+                    if not isinstance(m_opts, list) or not all(
+                        isinstance(opt, str) for opt in m_opts
+                    ):
+                        errors.append(f"{mc}.options: must be a list of strings")
 
     if "hooks" in edits:
         hooks = edits["hooks"]
@@ -697,11 +694,36 @@ def _validate_container_edits(edits: Any, context: str, errors: List[str]) -> No
                 if not isinstance(h, dict):
                     errors.append(f"{hc}: must be an object")
                     continue
+                unknown_hook_keys = set(h.keys()) - _ALLOWED_HOOK_KEYS
+                if unknown_hook_keys:
+                    errors.append(
+                        f"{hc}: unsupported CDI v0.6.0 hook keys: {sorted(unknown_hook_keys)}"
+                    )
                 hook_name = h.get("hookName")
                 if not isinstance(hook_name, str) or hook_name not in _ALLOWED_HOOK_NAMES:
                     errors.append(f"{hc}.hookName: invalid OCI hookName {hook_name!r}")
                 if not isinstance(h.get("path"), str) or not h["path"].startswith("/"):
                     errors.append(f"{hc}.path: must be an absolute executable path")
+                if "args" in h:
+                    h_args = h["args"]
+                    if not isinstance(h_args, list) or not all(
+                        isinstance(a, str) for a in h_args
+                    ):
+                        errors.append(f"{hc}.args: must be a list of strings")
+                if "env" in h:
+                    h_env = h["env"]
+                    if not isinstance(h_env, list) or not all(
+                        isinstance(x, str) and "=" in x and bool(x.split("=", 1)[0]) for x in h_env
+                    ):
+                        errors.append(f"{hc}.env: must be a list of non-empty KEY=VALUE strings")
+                if "timeout" in h:
+                    h_timeout = h["timeout"]
+                    if (
+                        not isinstance(h_timeout, int)
+                        or isinstance(h_timeout, bool)
+                        or h_timeout <= 0
+                    ):
+                        errors.append(f"{hc}.timeout: must be a positive integer")
 
 
 def validate_cdi_spec(spec: Any) -> List[str]:

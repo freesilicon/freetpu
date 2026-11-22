@@ -1711,6 +1711,11 @@ TPU Runtime Utilization
             self.assertEqual(neg_rows["2"].hbm_total_bytes, 32 * 1024**3)
             self.assertEqual(neg_rows["2"].duty_cycle_percent, 42.5)
 
+            # `--pid-scan` cleanly overrides an earlier `--no-pid-scan` (e.g. Docker ENTRYPOINT).
+            parser = tpu_exporter.build_arg_parser()
+            self.assertTrue(parser.parse_args(["--no-pid-scan"]).no_pid_scan)
+            self.assertFalse(parser.parse_args(["--no-pid-scan", "--pid-scan"]).no_pid_scan)
+
             # Oversized HTTP headers (> MAX_HTTP_HEADER_BYTES) are rejected with 431 before scrape.
             import socket as _socket
 
