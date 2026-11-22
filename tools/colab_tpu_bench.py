@@ -206,22 +206,38 @@ def _ensure_private_dir(raw_path: Path) -> Path:
 
 
 def _write_text_nofollow(path: Path, text: str) -> None:
-    """Write UTF-8 text atomically/safely without following symlinks (mode 0600)."""
+    """Write UTF-8 text via a private temp file and atomically replace `path` (mode 0600)."""
     if path.is_symlink():
         raise UntrustedPathError(f"Refusing to write through symlink: {path}")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    if os.path.lexists(path):
+        st = os.lstat(path)
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+            raise UntrustedPathError(f"Refusing unsafe existing target file {path}")
+    _ensure_dir_not_shared_writable(path.parent)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    tmp_path = Path(tmp_name)
     try:
-        fd = os.open(path, flags, 0o600)
-    except OSError as exc:
-        raise UntrustedPathError(f"Refusing unsafe target file {path}: {exc}") from exc
-
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        st = os.fstat(fh.fileno())
-        if not stat.S_ISREG(st.st_mode):
-            raise UntrustedPathError(f"Target is not a regular file: {path}")
-        if hasattr(os, "geteuid") and st.st_uid != os.geteuid():
-            raise UntrustedPathError(f"Target file {path} has unexpected owner uid={st.st_uid}")
-        fh.write(text)
+        os.chmod(tmp_path, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            st = os.fstat(fh.fileno())
+            if not stat.S_ISREG(st.st_mode):
+                raise UntrustedPathError(f"Target is not a regular file: {tmp_path}")
+            if hasattr(os, "geteuid") and st.st_uid != os.geteuid():
+                raise UntrustedPathError(f"Target file {tmp_path} has unexpected owner uid={st.st_uid}")
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def _ensure_dir_not_shared_writable(dir_path: Path) -> Path:
@@ -248,39 +264,76 @@ def _ensure_dir_not_shared_writable(dir_path: Path) -> Path:
 
 
 def _normalize_config_path(config_path: Optional[Path], out_dir: Path) -> Path:
-    """Normalize `--config` to an absolute non-symlink path and ensure a safe parent dir."""
+    """Normalize explicit or default `--config` to an absolute non-symlink path with safe lock/parent."""
     if config_path is None:
-        return out_dir / "colab-sessions.json"
-    expanded = Path(os.path.expanduser(str(config_path)))
-    if expanded.is_symlink():
-        raise UntrustedPathError(f"Refusing symlinked --config path: {config_path}")
-    normalized = Path(os.path.abspath(str(expanded)))
+        normalized = Path(os.path.abspath(str(out_dir / "colab-sessions.json")))
+    else:
+        expanded = Path(os.path.expanduser(str(config_path)))
+        if expanded.is_symlink():
+            raise UntrustedPathError(f"Refusing symlinked --config path: {config_path}")
+        normalized = Path(os.path.abspath(str(expanded)))
     _ensure_dir_not_shared_writable(normalized.parent)
     if normalized.is_symlink() or Path(f"{normalized}.lock").is_symlink():
         raise UntrustedPathError(f"Refusing symlinked --config or lock path: {normalized}")
     return normalized
 
 
-def make_subprocess_runner(request_timeout_s: float = 60.0) -> CommandRunner:
-    """Create a non-interactive subprocess runner that bounds `colab` HTTP assign waits."""
+def _coerce_subprocess_text(data: Any) -> str:
+    if data is None:
+        return ""
+    if isinstance(data, bytes):
+        return data.decode("utf-8", errors="replace")
+    return str(data)
+
+
+def make_subprocess_runner(
+    request_timeout_s: float = 60.0,
+    run_wall_timeout_s: Optional[float] = None,
+) -> CommandRunner:
+    """Create a non-interactive subprocess runner that bounds `colab` HTTP and kernel setup waits."""
 
     def _run(cmd: Sequence[str]) -> CommandResult:
+        cmd_list = list(cmd)
         env = os.environ.copy()
         env.setdefault("COLAB_CLI_REQUEST_TIMEOUT", str(request_timeout_s))
         env.setdefault("COLAB_CLI_ASSIGN_RETRIES", "1")
-        proc = subprocess.run(
-            list(cmd),
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            env=env,
-            check=False,
-        )
-        return CommandResult(
-            returncode=proc.returncode,
-            stdout=proc.stdout,
-            stderr=proc.stderr,
-        )
+        is_run_cmd = "run" in cmd_list
+        if is_run_cmd:
+            wall_timeout = (
+                run_wall_timeout_s
+                if run_wall_timeout_s is not None
+                else max(request_timeout_s * 3.0, 180.0) + 300.0
+            )
+        else:
+            wall_timeout = max(request_timeout_s * 2.0, 120.0)
+        try:
+            proc = subprocess.run(
+                cmd_list,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=wall_timeout,
+                check=False,
+            )
+            return CommandResult(
+                returncode=proc.returncode,
+                stdout=proc.stdout,
+                stderr=proc.stderr,
+            )
+        except subprocess.TimeoutExpired as exc:
+            out_txt = _coerce_subprocess_text(exc.stdout)
+            err_txt = _coerce_subprocess_text(exc.stderr)
+            note = (
+                f"[colab_tpu_bench] `colab` subprocess exceeded wall timeout "
+                f"({wall_timeout:.1f}s); reconciling active sessions."
+            )
+            combined_err = f"{err_txt}\n{note}".strip() if err_txt else note
+            return CommandResult(
+                returncode=124,
+                stdout=out_txt,
+                stderr=combined_err + "\n",
+            )
 
     return _run
 
@@ -452,10 +505,12 @@ def is_capacity_or_quota_error(
 
 
 def is_allocation_timeout_error(returncode: int, stderr: str) -> bool:
-    """Return True if allocation timed out with an unknown server-side outcome."""
+    """Return True if allocation or setup timed out with an unknown server-side outcome."""
     if returncode == 0:
         return False
     err_lower = stderr.lower()
+    if returncode == 124 or "exceeded wall timeout" in err_lower:
+        return "[colab] session ready" not in err_lower
     if "[colab] session ready" in err_lower:
         return False
     return "readtimeout" in err_lower or "read timed out" in err_lower
@@ -655,7 +710,9 @@ def run_benchmark(
     """Execute pre-flight checks, TPU run (with conservative fallback), and release verification."""
     using_default_runner = runner is None
     if runner is None:
-        runner = make_subprocess_runner(cfg.request_timeout_s)
+        setup_budget_s = max(cfg.request_timeout_s * 3.0, 180.0)
+        run_wall_timeout_s = setup_budget_s + (cfg.timeout_s if cfg.timeout_s > 0 else 3600.0)
+        runner = make_subprocess_runner(cfg.request_timeout_s, run_wall_timeout_s=run_wall_timeout_s)
 
     for arg in cfg.script_args:
         if arg == "--env" or arg.startswith("--env="):
@@ -677,7 +734,15 @@ def run_benchmark(
 
     try:
         if cfg.out_dir is None:
-            out_dir = Path(tempfile.mkdtemp(prefix="freetpu-colab-"))
+            env_tmp = os.environ.get("TMPDIR")
+            tmp_root = Path(os.path.abspath(env_tmp if env_tmp else tempfile.gettempdir()))
+            _validate_existing_ancestor_chain(tmp_root)
+            created_tmp = Path(tempfile.mkdtemp(prefix="freetpu-colab-", dir=str(tmp_root)))
+            try:
+                out_dir = _ensure_private_dir(created_tmp)
+            except Exception:
+                shutil.rmtree(created_tmp, ignore_errors=True)
+                raise
         else:
             out_dir = _ensure_private_dir(cfg.out_dir)
     except UntrustedPathError as exc:
@@ -903,14 +968,20 @@ def run_benchmark(
             artifact_write_error = f"Failed writing local run logs: {exc}"
 
         if res.returncode == 0:
-            final_rc = 0
             chosen_tpu = tpu
             chosen_session = sess
             if generated_script:
                 probe_error = validate_builtin_probe(probe_payload)
-                if probe_error is not None:
-                    final_rc = 1
+                final_rc = 1 if probe_error is not None else 0
+            else:
+                final_rc = 0
+        else:
+            final_rc = res.returncode
 
+        if res.returncode == 0 or ready_seen or res.returncode == 124:
+            if chosen_tpu is None:
+                chosen_tpu = tpu
+                chosen_session = sess
             nb_path = out_dir / f"{sess}.ipynb"
             if nb_path.is_symlink() or (os.path.lexists(nb_path) and not nb_path.is_file()):
                 untrusted_target_error = f"Refusing unsafe notebook target path: {nb_path}"
@@ -931,16 +1002,16 @@ def run_benchmark(
                     export_error = f"`colab log` failed (rc={log_res.returncode}): {diag}"
                 else:
                     export_error = f"`colab log` exited 0 without creating notebook at {nb_path}"
+
+        if res.returncode == 0:
             break
 
         if timeout_seen:
             allocation_timed_out = True
-            final_rc = res.returncode
             break
 
         has_more = idx + 1 < len(cfg.tpus)
         if not (has_more and is_capacity_or_quota_error(res.returncode, res.stdout, res.stderr)):
-            final_rc = res.returncode
             break
 
     # 3. Verify server-side TPU assignment release whenever an allocation may have occurred.
@@ -998,7 +1069,8 @@ def run_benchmark(
 
     if allocation_timed_out and not teardown_verified:
         status = "allocation_timeout_unreconciled"
-        final_rc = 1
+        if final_rc == 0:
+            final_rc = 1
     elif allocation_timed_out:
         status = "allocation_timeout"
         if final_rc == 0:
@@ -1008,16 +1080,19 @@ def run_benchmark(
             status = "teardown_ambiguous"
         else:
             status = "teardown_verification_failed"
-        final_rc = 1
+        if final_rc == 0:
+            final_rc = 1
     elif probe_error is not None:
         status = "probe_validation_failed"
-        final_rc = 1
-    elif export_attempted and not export_ok:
+        if final_rc == 0:
+            final_rc = 1
+    elif final_rc == 0 and export_attempted and not export_ok:
         status = "proof_export_failed"
         final_rc = 1
     elif artifact_write_error is not None:
         status = "artifact_write_failed"
-        final_rc = 1
+        if final_rc == 0:
+            final_rc = 1
     elif final_rc == 0:
         status = "ok"
     else:
@@ -1552,7 +1627,79 @@ def run_self_test() -> int:
         probe_src = default_tpu_probe_script()
         assert "if exit_rc != 0:\n    sys.exit(exit_rc)" in probe_src
 
-    print("colab_tpu_bench.py self-test PASSED (16/16 suites).")
+        # 17. Auto-created out_dir validates parent/ancestors (rejects group-writable non-sticky TMPDIR).
+        bad_tmpdir = tmp_path / "gw_tmp"
+        bad_tmpdir.mkdir(mode=0o775)
+        os.chmod(bad_tmpdir, 0o775)
+        old_tmpdir = os.environ.get("TMPDIR")
+        os.environ["TMPDIR"] = str(bad_tmpdir)
+        try:
+            rc_atmp, sum_atmp = run_benchmark(
+                BenchConfig(dry_run=True, out_dir=None),
+                runner=low_or_bad_cu_runner("unused"),
+            )
+            assert rc_atmp == 2
+            assert sum_atmp["status"] == "untrusted_out_dir"
+        finally:
+            if old_tmpdir is None:
+                os.environ.pop("TMPDIR", None)
+            else:
+                os.environ["TMPDIR"] = old_tmpdir
+
+        # 18. Default derived config / lock symlinks inside reused out_dir are rejected.
+        reused_dir = tmp_path / "reused-default-cfg"
+        reused_dir.mkdir(mode=0o700)
+        os.chmod(reused_dir, 0o700)
+        (reused_dir / "colab-sessions.json.lock").symlink_to(tmp_path / "outside.lock")
+        rc_dlock, sum_dlock = run_benchmark(
+            BenchConfig(dry_run=True, out_dir=reused_dir, config_path=None),
+            runner=low_or_bad_cu_runner("unused"),
+        )
+        assert rc_dlock == 2
+        assert sum_dlock["status"] == "untrusted_config_path"
+
+        # 19. Atomic temp-file write+replace never mutates a hard-linked target.
+        hl_dir = tmp_path / "hardlink-box"
+        hl_dir.mkdir(mode=0o700)
+        os.chmod(hl_dir, 0o700)
+        hl_orig = hl_dir / "orig.txt"
+        hl_orig.write_text("do-not-overwrite", encoding="utf-8")
+        hl_copy = hl_dir / "summary.json"
+        os.link(hl_orig, hl_copy)
+        _write_text_nofollow(hl_copy, '{"ok": true}\n')
+        assert hl_orig.read_text(encoding="utf-8") == "do-not-overwrite"
+        assert hl_copy.read_text(encoding="utf-8") == '{"ok": true}\n'
+
+        # 20. Real subprocess runner bounds stalled setup/run waits and surfaces rc=124 timeout.
+        bounded = make_subprocess_runner(request_timeout_s=1.0, run_wall_timeout_s=0.2)
+        res_to = bounded([sys.executable, "-c", "import time; time.sleep(2)", "run"])
+        assert res_to.returncode == 124
+        assert is_allocation_timeout_error(res_to.returncode, res_to.stderr)
+
+        # 21. Nonzero workload exit after `Session READY` still exports proof & preserves exit code.
+        def ready_nonzero_runner(cmd: Sequence[str]) -> CommandResult:
+            cmd_list = list(cmd)
+            if "run" in cmd_list:
+                return CommandResult(
+                    3,
+                    "partial output\n",
+                    "[colab] Session READY (m-s-nz99).\nTraceback: workload exited 3\n",
+                )
+            return fallback_runner(cmd_list)
+
+        rc_nz, sum_nz = run_benchmark(
+            BenchConfig(tpus=("v5e1",), out_dir=tmp_path / "nonzero-ready"),
+            runner=ready_nonzero_runner,
+        )
+        assert rc_nz == 3
+        assert sum_nz["status"] == "failed"
+        assert sum_nz["proof_export"]["attempted"] is True
+        assert sum_nz["proof_export"]["ok"] is True
+        assert sum_nz["created_endpoint"] == "tpu-v5e1-ep1"
+        assert sum_nz["proof_notebook"] is not None
+        assert Path(sum_nz["proof_notebook"]).is_file()
+
+    print("colab_tpu_bench.py self-test PASSED (21/21 suites).")
     return 0
 
 
