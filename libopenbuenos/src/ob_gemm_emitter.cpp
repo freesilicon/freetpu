@@ -7380,6 +7380,26 @@ int32_t eval_swiglu_silu_q(int32_t q_g, float s_gate) {
   return quant_clip_i8_f32(y_silu);
 }
 
+void build_swiglu_silu_lut(float s_gate, int8_t out_lut[256]) {
+  if (!out_lut) return;
+  if (!(s_gate > 0.0f)) {
+    std::memset(out_lut, 0, 256u);
+    return;
+  }
+  constexpr float kInf = __builtin_huge_valf();
+  float silu_coeffs[8][5]{};
+  for (int s = 0; s < 8; ++s) {
+    for (int k = 0; k < 5; ++k) {
+      silu_coeffs[s][k] = kSwigluSiluUnitCoeffs[s][k] / s_gate;
+    }
+  }
+  for (int32_t q_g = -128; q_g <= 127; ++q_g) {
+    const float x_g = static_cast<float>(q_g) * s_gate;
+    const float y_silu = eval_0x640_horner_scalar(x_g, silu_coeffs, kSwigluSiluBps, -11.6f, kInf);
+    out_lut[q_g + 128] = static_cast<int8_t>(quant_clip_i8_f32(y_silu));
+  }
+}
+
 }  // namespace ob
 
 extern "C" {

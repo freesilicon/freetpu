@@ -4210,8 +4210,31 @@ void test_phase7_cycle3_regressions() {
     // Caller releases its ref; buffer stays alive inside inflight slot (refcnt=1).
     ob_buffer_free(b);
     CHECK(b->refcnt.load(std::memory_order_acquire) == 1u);
-    // Context destroy drains/frees retired_bufs cleanly.
+    CHECK(ctx->credits[0].abandoned == true);
+    // Simulate late firmware completion of abandoned command with credit_size=1:
+    // next device_submit_execute_async must reap it, free its credit, and release retired_bufs!
+    {
+      std::lock_guard<std::mutex> lk(ctx->vii_mu);
+      ctx->credits[0].state = ob::CreditSlot::COMPLETED;
+      ctx->inflight_count = 1u;
+    }
+    ctx->credit_size = 1u;
+    CHECK(ob::device_attach_inflight_buffers(ctx, fake_h, {}) == true);
+    CHECK(ctx->credits[0].state == ob::CreditSlot::FREE);
+    CHECK(ctx->inflight_count == 0u);
+    // Context destroy cleans up cleanly.
     ob_context_destroy(ctx);
+  }
+
+  // 3b. build_swiglu_silu_lut matches eval_swiglu_silu_q bit-for-bit across all 256 INT8 codes
+  {
+    int8_t lut[256]{};
+    for (float sg : {0.02f, 0.0442f, 0.11f, 0.25f}) {
+      ob::build_swiglu_silu_lut(sg, lut);
+      for (int32_t q = -128; q <= 127; ++q) {
+        CHECK(static_cast<int32_t>(lut[q + 128]) == ob::eval_swiglu_silu_q(q, sg));
+      }
+    }
   }
 
   // 4. Warm SwiGLU always enforces clipping check whenever Holder bounds fail (reusing cached ext[2])

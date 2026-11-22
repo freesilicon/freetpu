@@ -674,7 +674,7 @@ static void ensure_immutable_weight_buffer(ggml_backend_edgetpu_context * ctx,
     if (!bctx || !bctx->data || bctx->size == 0u) {
         return;
     }
-    if (buffer->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+    if (!bctx->owns_memory || buffer->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
         auto it = ctx->immutable_weight_versions.find(bctx->data);
         if (it != ctx->immutable_weight_versions.end()) {
             ob_gemm_unregister_immutable_weights(ctx->ob_ctx, bctx->data, it->second.first);

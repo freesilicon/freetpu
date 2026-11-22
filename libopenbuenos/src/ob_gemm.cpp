@@ -2729,14 +2729,52 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
           const int8_t* raw_out =
               static_cast<const int8_t*>(ob_buffer_data(p.out_buf));
           bool read_active = true;
+          std::array<bool, ob::kMaxFusedSubs> sub_done{};
+          const float* sa_ptr =
+              (p.tm <= p.s_a_inline.size()) ? p.s_a_inline.data() : p.s_a_overflow.data();
+          const float* sb_base = p.w_tile ? p.w_tile->row_s_b.data() : p.s_b.data();
+          auto dequant_sub = [&](uint32_t si, uint32_t scale_d_cur) {
+            const uint64_t tq0 = prof_on ? ob::monotonic_now_ns() : 0u;
+            const float eff_scale_d = static_cast<float>(scale_d_cur);
+            const ob::FusedSubSlice& sub = p.subs[si];
+            const ob_gemm_f32_quant_job_t& job = jobs[sub.job_idx];
+            const float* sb_ptr = sb_base + sub.out_off;
+            for (uint32_t mi = 0; mi < p.tm; ++mi) {
+              const float sa_d = sa_ptr[mi] * eff_scale_d;
+              float* c_row = job.c_mn + static_cast<size_t>(p.m0 + mi) * job.n_dim + sub.n0;
+              const int8_t* o_row = raw_out + static_cast<size_t>(mi) * p.hw_n + sub.out_off;
+              ob::dequant_accum_row_f32_impl(c_row, o_row, sb_ptr, sub.tn, sa_d);
+            }
+            sub_done[si] = true;
+            if (prof_on) ctx->prof.dequant_ns += (ob::monotonic_now_ns() - tq0);
+          };
 
           // Saturation-proof on-TPU retry: direct NEON check on mapped DMA-BUF (zero memcpy!).
+          // For fused tiles, preserve unsaturated sibling projections at their original scale
+          // before raising eff_d for any saturated sibling.
           if (builtin_active && p.w_tile != nullptr) {
             static constexpr double kRetryMults[5] = {1.25, 1.5, 2.0, 4.0, 4.0};
             for (uint32_t retry = 0u; retry < 5u && eff_d < (1u << 24); ++retry) {
-              const uint64_t tsat0 = prof_on ? ob::monotonic_now_ns() : 0u;
-              const bool sat = ob::tile_output_is_saturated_impl(raw_out, p.tm, p.tn_total, p.hw_n);
-              if (prof_on) ctx->prof.dequant_ns += (ob::monotonic_now_ns() - tsat0);
+              bool sat = false;
+              if (p.num_subs == 1u) {
+                const uint64_t tsat0 = prof_on ? ob::monotonic_now_ns() : 0u;
+                sat = ob::tile_output_is_saturated_impl(raw_out, p.tm, p.tn_total, p.hw_n);
+                if (prof_on) ctx->prof.dequant_ns += (ob::monotonic_now_ns() - tsat0);
+              } else {
+                for (uint32_t si = 0u; si < p.num_subs; ++si) {
+                  if (sub_done[si]) continue;
+                  const ob::FusedSubSlice& sub = p.subs[si];
+                  const uint64_t tsat0 = prof_on ? ob::monotonic_now_ns() : 0u;
+                  const bool sub_sat = ob::tile_output_is_saturated_impl(
+                      raw_out + sub.out_off, p.tm, sub.tn, p.hw_n);
+                  if (prof_on) ctx->prof.dequant_ns += (ob::monotonic_now_ns() - tsat0);
+                  if (!sub_sat) {
+                    dequant_sub(si, eff_d);
+                  } else {
+                    sat = true;
+                  }
+                }
+              }
               if (!sat) break;
 
               const uint64_t tde0 = prof_on ? ob::monotonic_now_ns() : 0u;
@@ -2797,25 +2835,11 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
           }
 
           if (rst == OB_OK && read_active) {
-            const uint64_t tq0 = prof_on ? ob::monotonic_now_ns() : 0u;
-            const float eff_scale_d = static_cast<float>(eff_d);
-            const float* sa_ptr =
-                (p.tm <= p.s_a_inline.size()) ? p.s_a_inline.data() : p.s_a_overflow.data();
-            const float* sb_base = p.w_tile ? p.w_tile->row_s_b.data() : p.s_b.data();
-
-            // Zero-copy NEON dequant-accum straight from mapped DMA-BUF into each sub-slice output!
             for (uint32_t si = 0u; si < p.num_subs; ++si) {
-              const ob::FusedSubSlice& sub = p.subs[si];
-              const ob_gemm_f32_quant_job_t& job = jobs[sub.job_idx];
-              const float* sb_ptr = sb_base + sub.out_off;
-              for (uint32_t mi = 0; mi < p.tm; ++mi) {
-                const float sa_d = sa_ptr[mi] * eff_scale_d;
-                float* c_row = job.c_mn + static_cast<size_t>(p.m0 + mi) * job.n_dim + sub.n0;
-                const int8_t* o_row = raw_out + static_cast<size_t>(mi) * p.hw_n + sub.out_off;
-                ob::dequant_accum_row_f32_impl(c_row, o_row, sb_ptr, sub.tn, sa_d);
+              if (!sub_done[si]) {
+                dequant_sub(si, eff_d);
               }
             }
-            if (prof_on) ctx->prof.dequant_ns += (ob::monotonic_now_ns() - tq0);
           }
           if (read_active) {
             const uint64_t td1 = prof_on ? ob::monotonic_now_ns() : 0u;
@@ -3919,6 +3943,8 @@ bool swiglu_chunk_clips_or_tunes(ob_context* ctx,
     const uint32_t du = *io_d_up;
     const uint32_t dm = *io_d_mul;
     const float s_gate = s_a * s_wg * static_cast<float>(dg);
+    int8_t silu_lut[256];
+    ob::build_swiglu_silu_lut(s_gate, silu_lut);
 
     int64_t worst_g = 0;
     int64_t worst_u = 0;
@@ -3974,7 +4000,7 @@ bool swiglu_chunk_clips_or_tunes(ob_context* ctx,
         const float ur = std::nearbyint(static_cast<float>(acc_u) / static_cast<float>(du));
         const int32_t q_g = (gr < -128.0f) ? -128 : ((gr > 127.0f) ? 127 : static_cast<int32_t>(gr));
         const int32_t q_u = (ur < -128.0f) ? -128 : ((ur > 127.0f) ? 127 : static_cast<int32_t>(ur));
-        const int32_t q_silu = ob::eval_swiglu_silu_q(q_g, s_gate);
+        const int32_t q_silu = static_cast<int32_t>(silu_lut[q_g + 128]);
         const int64_t prod = static_cast<int64_t>(q_silu) * static_cast<int64_t>(q_u);
         const int64_t ap = prod < 0 ? -prod : prod;
         if (ap > worst_prod) worst_prod = ap;

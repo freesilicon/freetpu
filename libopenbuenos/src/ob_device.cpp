@@ -517,6 +517,54 @@ ob_status_t device_submit_execute_async(ob_context* ctx,
     return OB_ERR_OVERFLOW;
   }
 
+  std::vector<CachedGraph*> reaped_entries;
+  std::vector<ob_buffer*> reaped_bufs;
+  {
+    std::lock_guard<std::mutex> lk(ctx->vii_mu);
+#if defined(__linux__)
+    if (!ctx->mock_mode) {
+      bool has_abandoned = false;
+      for (uint32_t i = 0; i < ctx->credit_size; ++i) {
+        if (ctx->credits[i].state == CreditSlot::IN_FLIGHT && ctx->credits[i].abandoned) {
+          has_abandoned = true;
+          break;
+        }
+      }
+      while (has_abandoned) {
+        std::string rerr;
+        if (pop_and_demux_one_locked(ctx, false, 0u, nullptr, nullptr, &rerr) != 0) break;
+      }
+    }
+#endif
+    for (uint32_t i = 0; i < ctx->credit_size; ++i) {
+      CreditSlot& s = ctx->credits[i];
+      if (s.abandoned &&
+          (s.state == CreditSlot::COMPLETED || s.state == CreditSlot::FAILED)) {
+        if (s.graph_entry) reaped_entries.push_back(s.graph_entry);
+        for (ob_buffer* rb : s.retired_bufs) {
+          if (rb) reaped_bufs.push_back(rb);
+        }
+        s.retired_bufs.clear();
+        s.state = CreditSlot::FREE;
+        s.abandoned = false;
+        s.handle = 0;
+        s.seq = 0;
+        s.graph_entry = nullptr;
+        s.error_msg.clear();
+        if (ctx->inflight_count > 0u) ctx->inflight_count -= 1u;
+      }
+    }
+  }
+  if (!reaped_entries.empty()) {
+    std::lock_guard<std::mutex> clk(ctx->cache_mu);
+    for (CachedGraph* ge : reaped_entries) {
+      graph_entry_unref_locked(ctx, ge);
+    }
+  }
+  for (ob_buffer* rb : reaped_bufs) {
+    ob_buffer_free(rb);
+  }
+
   std::lock_guard<std::mutex> lk(ctx->vii_mu);
   if (ctx->inflight_count >= ctx->credit_size) {
     set_last_error(ctx, "All VII execution credits occupied (max_inflight=" +
@@ -584,6 +632,7 @@ ob_status_t device_submit_execute_async(ob_context* ctx,
 
   const ob_exec_handle_t handle = ctx->next_exec_handle++;
   slot->state = CreditSlot::IN_FLIGHT;
+  slot->abandoned = false;
   slot->handle = handle;
   slot->seq = seq;
   slot->graph_entry = entry;
@@ -606,6 +655,7 @@ ob_status_t device_wait_handle(ob_context* ctx,
   if (!ctx || handle == 0u) return OB_ERR_INVALID_ARG;
 
   CachedGraph* completed_entry = nullptr;
+  std::vector<CachedGraph*> reaped_entries;
   std::vector<ob_buffer*> retired_to_free;
   ob_status_t result = OB_OK;
   ob_invoke_stats_t stats {};
@@ -723,6 +773,7 @@ ob_status_t device_wait_handle(ob_context* ctx,
     }
 
     slot->state = CreditSlot::FREE;
+    slot->abandoned = false;
     slot->handle = 0;
     slot->seq = 0;
     slot->graph_entry = nullptr;
@@ -730,12 +781,34 @@ ob_status_t device_wait_handle(ob_context* ctx,
     retired_to_free = std::move(slot->retired_bufs);
     slot->retired_bufs.clear();
     if (ctx->inflight_count > 0u) ctx->inflight_count -= 1u;
+
+    for (uint32_t i = 0; i < ctx->credit_size; ++i) {
+      CreditSlot& s = ctx->credits[i];
+      if (s.abandoned &&
+          (s.state == CreditSlot::COMPLETED || s.state == CreditSlot::FAILED)) {
+        if (s.graph_entry) reaped_entries.push_back(s.graph_entry);
+        for (ob_buffer* rb : s.retired_bufs) {
+          if (rb) retired_to_free.push_back(rb);
+        }
+        s.retired_bufs.clear();
+        s.state = CreditSlot::FREE;
+        s.abandoned = false;
+        s.handle = 0;
+        s.seq = 0;
+        s.graph_entry = nullptr;
+        s.error_msg.clear();
+        if (ctx->inflight_count > 0u) ctx->inflight_count -= 1u;
+      }
+    }
   }
 
-  // Release graph ref outside vii_mu to respect cache_mu -> vii_mu lock order
-  if (completed_entry) {
+  // Release graph refs outside vii_mu to respect cache_mu -> vii_mu lock order
+  if (completed_entry || !reaped_entries.empty()) {
     std::lock_guard<std::mutex> clk(ctx->cache_mu);
-    graph_entry_unref_locked(ctx, completed_entry);
+    if (completed_entry) graph_entry_unref_locked(ctx, completed_entry);
+    for (CachedGraph* ge : reaped_entries) {
+      graph_entry_unref_locked(ctx, ge);
+    }
   }
   for (ob_buffer* rb : retired_to_free) {
     if (rb) ob_buffer_free(rb);
@@ -770,23 +843,47 @@ bool device_attach_inflight_buffers(ob_context* ctx,
                                     ob_exec_handle_t handle,
                                     std::initializer_list<ob_buffer*> bufs) {
   if (!ctx || handle == 0u) return false;
-  std::lock_guard<std::mutex> lk(ctx->vii_mu);
-  CreditSlot* slot = nullptr;
-  for (uint32_t i = 0; i < ctx->credit_size; ++i) {
-    if (ctx->credits[i].state != CreditSlot::FREE &&
-        ctx->credits[i].handle == handle) {
-      slot = &ctx->credits[i];
-      break;
+  CachedGraph* reaped_entry = nullptr;
+  std::vector<ob_buffer*> reaped_bufs;
+  {
+    std::lock_guard<std::mutex> lk(ctx->vii_mu);
+    CreditSlot* slot = nullptr;
+    for (uint32_t i = 0; i < ctx->credit_size; ++i) {
+      if (ctx->credits[i].state != CreditSlot::FREE &&
+          ctx->credits[i].handle == handle) {
+        slot = &ctx->credits[i];
+        break;
+      }
+    }
+    if (!slot) return false;
+    slot->abandoned = true;
+    for (ob_buffer* b : bufs) {
+      if (!b) continue;
+      if (std::find(slot->retired_bufs.begin(), slot->retired_bufs.end(), b) ==
+          slot->retired_bufs.end()) {
+        buffer_retain(b);
+        slot->retired_bufs.push_back(b);
+      }
+    }
+    if (slot->state == CreditSlot::COMPLETED || slot->state == CreditSlot::FAILED) {
+      reaped_entry = slot->graph_entry;
+      reaped_bufs = std::move(slot->retired_bufs);
+      slot->retired_bufs.clear();
+      slot->state = CreditSlot::FREE;
+      slot->abandoned = false;
+      slot->handle = 0;
+      slot->seq = 0;
+      slot->graph_entry = nullptr;
+      slot->error_msg.clear();
+      if (ctx->inflight_count > 0u) ctx->inflight_count -= 1u;
     }
   }
-  if (!slot) return false;
-  for (ob_buffer* b : bufs) {
-    if (!b) continue;
-    if (std::find(slot->retired_bufs.begin(), slot->retired_bufs.end(), b) ==
-        slot->retired_bufs.end()) {
-      buffer_retain(b);
-      slot->retired_bufs.push_back(b);
-    }
+  if (reaped_entry) {
+    std::lock_guard<std::mutex> clk(ctx->cache_mu);
+    graph_entry_unref_locked(ctx, reaped_entry);
+  }
+  for (ob_buffer* rb : reaped_bufs) {
+    if (rb) ob_buffer_free(rb);
   }
   return true;
 }

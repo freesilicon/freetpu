@@ -127,6 +127,7 @@ struct CreditSlot {
     FAILED = 3
   };
   State state = FREE;
+  bool abandoned = false;
   ob_exec_handle_t handle = 0;
   uint32_t seq = 0;
   CachedGraph* graph_entry = nullptr;
@@ -411,6 +412,7 @@ void simulate_swiglu_hw_exact(const int8_t* x_mk,
 // Evaluate exact TPU piecewise-Horner SiLU on quantized gate code q_g in [-128, 127],
 // returning quantized INT8 code q_silu in [-128, 127] matching simulate_swiglu_hw_exact.
 int32_t eval_swiglu_silu_q(int32_t q_g, float s_gate);
+void build_swiglu_silu_lut(float s_gate, int8_t out_lut[256]);
 
 // RMS-calibrated 3-stage divider selection for chained SwiGLU (ob_gemm.cpp).
 void compute_swiglu_stage_dividers(uint32_t m_dim,
