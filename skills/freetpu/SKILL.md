@@ -86,7 +86,7 @@ Use this workflow for zero-Google-`.so` C/C++ kernels, closed-form `(M, K, N)` V
 
 ## Workflow 2: Headless Cloud TPU (`v5e-1` / `v6e-1`) via `google-colab-cli`
 
-Use this workflow to run Pallas/Mosaic or JAX/PJRT benchmarks on Colab TPUs with zero idle Compute Unit (CU) waste.
+Use this workflow with `google-colab-cli >= 0.7.6` (redacted logs) to run Pallas/Mosaic or JAX/PJRT benchmarks on Colab TPUs without leaking Compute Units (CUs).
 
 1. **Check CU balance & isolate session state** in a fresh private temp directory (always pass global flags before the subcommand):
    ```bash
@@ -98,7 +98,7 @@ Use this workflow to run Pallas/Mosaic or JAX/PJRT benchmarks on Colab TPUs with
    - Always keep `--config "$COLAB_STATE"` inside your private `WORK_DIR` (`0700`) so parallel workers never clobber `~/.config/colab-cli/sessions.json` and shared `/tmp` state files cannot pre-exist under another owner.
    - Pass `--no-public-api` when targeting `/tun/m/*` tunnel auth on unallowlisted GCP quota projects.
 
-2. **Run ephemeral probe with auto-stop and `v6e1 -> v5e1` fallback**:
+2. **Run ephemeral probe with verified teardown and `v6e1 -> v5e1` fallback**:
    - Preferred wrapper (`tools/colab_tpu_bench.py`):
      ```bash
      # Offline check & command preview
@@ -112,15 +112,21 @@ Use this workflow to run Pallas/Mosaic or JAX/PJRT benchmarks on Colab TPUs with
        --out-dir "$WORK_DIR/proof" \
        --script skills/freetpu/templates/tile_fused_gemm_silu.py
      ```
-   - Direct CLI pattern (`colab run` provisions, runs, propagates exit code, and auto-stops the VM even on error; reuse `"$COLAB_STATE"` inside `"$WORK_DIR"` for both `run` and `log` with a unique session name):
+   - Direct CLI pattern (do **not** assume default `colab run` teardown succeeded: if unassign fails, `colab run` suppresses the error, removes the local session record, and still prints `Session terminated.` while leaving the TPU billing CUs. Pass `--keep` so `$COLAB_STATE` retains the session record, stop explicitly, and verify server-side with `colab sessions`):
      ```bash
      SESSION_ID="freetpu-probe-$(date +%Y%m%d-%H%M%S)-$$"
+     RUN_RC=0
      colab --auth=adc --config "$COLAB_STATE" run \
-       -s "$SESSION_ID" --tpu V6E1 --timeout 300 \
-       -- skills/freetpu/templates/tile_swiglu.py
+       -s "$SESSION_ID" --tpu V6E1 --timeout 300 --keep \
+       -- skills/freetpu/templates/tile_swiglu.py || RUN_RC=$?
      colab --auth=adc --config "$COLAB_STATE" log \
-       -s "$SESSION_ID" -o "$WORK_DIR/$SESSION_ID.ipynb"
+       -s "$SESSION_ID" -o "$WORK_DIR/$SESSION_ID.ipynb" || true
+     colab --auth=adc --config "$COLAB_STATE" stop -s "$SESSION_ID"
+     # Verify server-side that no billable TPU runtime remains active:
+     colab --auth=adc --config "$COLAB_STATE" sessions
+     (exit "$RUN_RC")
      ```
+   - **Teardown verification**: After every run (wrapper or direct CLI), check `colab --auth=adc --config "$COLAB_STATE" sessions` to confirm no TPU runtime remains active on the server. If a runtime is still listed, stop it with `colab --auth=adc --config "$COLAB_STATE" stop -s "$SESSION_ID"` (when `--keep` preserved `$COLAB_STATE`); if local session state was already dropped by a non-`--keep` `colab run`, terminate the orphaned runtime immediately in the Colab UI (`Runtime -> Manage sessions`).
    - For multi-step interactive sessions, prefer `colab exec` (keeps XLA/PJRT caches warm) over `colab ssh` (capped at 5 sessions / HTTP 429). Use `colab download` instead of `drive.mount`.
 
 ---

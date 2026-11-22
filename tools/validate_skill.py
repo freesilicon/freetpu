@@ -208,6 +208,8 @@ def _parse_frontmatter_stdlib(fm_text: str) -> Dict[str, Any]:
         if not m:
             raise ValueError(f"Unsupported YAML frontmatter line: {line!r}")
         key = m.group(1)
+        if key in data:
+            raise ValueError(f"Invalid YAML frontmatter: duplicate key {key!r}")
         rest = (m.group(2) or "").strip()
 
         block_m = re.match(r"^([>|])([0-9]*[-+]?)(?:\s+#.*)?$", rest)
@@ -236,6 +238,14 @@ def _parse_frontmatter_stdlib(fm_text: str) -> Dict[str, Any]:
             elif indented[0] == "-" or indented[0].startswith("- "):
                 data[key] = indented
             elif re.match(r"^[A-Za-z0-9_-]+\s*:", indented[0]):
+                seen_nested = set()
+                for sub_line in indented:
+                    sub_m = re.match(r"^([A-Za-z0-9_-]+)\s*:", sub_line)
+                    if sub_m:
+                        sub_key = sub_m.group(1)
+                        if sub_key in seen_nested:
+                            raise ValueError(f"Invalid YAML frontmatter: duplicate key {sub_key!r} under {key!r}")
+                        seen_nested.add(sub_key)
                 data[key] = {"_lines": indented}
             else:
                 raise ValueError(f"Unsupported indented block under {key!r}: {indented[0]!r}")
@@ -270,12 +280,50 @@ def _parse_frontmatter_stdlib(fm_text: str) -> Dict[str, Any]:
     return data
 
 
+def _load_yaml_unique_keys(fm_text: str) -> Any:
+    """Parse YAML via PyYAML SafeLoader while rejecting duplicate mapping keys."""
+
+    class _UniqueKeySafeLoader(yaml.SafeLoader):
+        def construct_mapping(self, node: Any, deep: bool = False) -> Dict[Any, Any]:
+            if not isinstance(node, yaml.MappingNode):
+                raise yaml.constructor.ConstructorError(
+                    None,
+                    None,
+                    f"expected a mapping node, but found {node.id}",
+                    node.start_mark,
+                )
+            self.flatten_mapping(node)
+            mapping: Dict[Any, Any] = {}
+            for key_node, value_node in node.value:
+                key = self.construct_object(key_node, deep=deep)
+                try:
+                    is_dup = key in mapping
+                except TypeError as exc:
+                    raise yaml.constructor.ConstructorError(
+                        "while constructing a mapping",
+                        node.start_mark,
+                        "found unhashable key",
+                        key_node.start_mark,
+                    ) from exc
+                if is_dup:
+                    raise yaml.constructor.ConstructorError(
+                        "while constructing a mapping",
+                        node.start_mark,
+                        f"found duplicate key {key!r}",
+                        key_node.start_mark,
+                    )
+                mapping[key] = self.construct_object(value_node, deep=deep)
+            return mapping
+
+    return yaml.load(fm_text, Loader=_UniqueKeySafeLoader)
+
+
 def parse_frontmatter(text: str, *, require_yaml: bool = False) -> Tuple[Dict[str, Any], str]:
     """Parse YAML frontmatter with PyYAML when available (or strict typed stdlib fallback)."""
     fm_text, body = _extract_frontmatter_block(text)
     if yaml is not None:
         try:
-            parsed = yaml.safe_load(fm_text)
+            parsed = _load_yaml_unique_keys(fm_text)
         except yaml.YAMLError as exc:
             raise ValueError(f"Invalid YAML frontmatter: {exc}") from exc
         if parsed is None:
@@ -534,6 +582,14 @@ def run_validator_self_test(*, require_yaml: bool = False) -> None:
             '---\nname: freetpu\ndescription: "Valid length description closed with YAML document-end dots instead of ---."\n...\nBody\n',
             "missing closing YAML frontmatter delimiter",
         ),
+        (
+            '---\nname: freetpu\ndescription: "First valid description that is definitely longer than forty characters."\ndescription: "Second valid description that is definitely longer than forty characters."\n---\n',
+            "duplicate key",
+        ),
+        (
+            '---\nname: freetpu\nname: freetpu\ndescription: "Valid description that is definitely longer than forty characters."\n---\n',
+            "duplicate key",
+        ),
     ]
     for md_text, expected in invalid_cases:
         _check_skill_md(md_text, should_pass=False, expected_substr=expected)
@@ -543,6 +599,16 @@ def run_validator_self_test(*, require_yaml: bool = False) -> None:
     assert isinstance(fm_list["description"], list), f"stdlib parser returned {type(fm_list['description'])}"
     fm_block = _parse_frontmatter_stdlib("name: freetpu\ndescription:\n  - item one\n  - item two\n")
     assert isinstance(fm_block["description"], list), f"stdlib parser returned {type(fm_block['description'])}"
+    try:
+        _parse_frontmatter_stdlib(
+            'name: freetpu\n'
+            'description: "First valid description that is definitely longer than forty characters."\n'
+            'description: "Second valid description that is definitely longer than forty characters."\n'
+        )
+    except ValueError as exc:
+        assert "duplicate key" in str(exc), f"Unexpected duplicate-key error: {exc}"
+    else:
+        raise AssertionError("stdlib parser failed to reject duplicate description key")
 
 
 def main() -> int:
@@ -559,7 +625,8 @@ def main() -> int:
         run_validator_self_test(require_yaml=args.require_yaml)
         parser_name = "pyyaml" if yaml is not None else "stdlib"
         print(f"Skill validator self-test PASSED (parser={parser_name}).")
-        return 0
+        if not args.run_self_tests:
+            return 0
 
     repo_root = args.repo_root.resolve()
     skill_dir = (args.skill_dir or (repo_root / "skills" / "freetpu")).resolve()
