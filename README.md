@@ -90,6 +90,7 @@ All hardware metrics below were measured on Google Pixel 10 Pro Fold (`rango`, T
 | **Native `W8A16 (BF16)` FP32-I/O GEMM** | `1x64x32` (`2,048 B` `u8` + `128 B` per-channel `FP32` scales) | **`32/32` bit-exact `FP32`** (`max_abs_err = 0.0`, `411–426 us` HW, zero Google `.so`s) |
 | **`ggml-edgetpu` Backend Ops** | Live `rango` `test-backend-ops -b EDGETPU -o MUL_MAT` (`Q8_0` & `Q4_0`) | **`104/104` `q8_0`** & **`104/104` `q4_0`** PASS (`327/327` host mock), `cpu_fallback_slices = 0`, `DT_NEEDED = [libdl.so, libm.so, libc.so]` |
 | **Live LLM Throughput & Energy (`llama-bench`)** | `SmolLM2-135M-Q8_0` & `Qwen2.5-1.5B-{Q8_0,Q4_0}` (`PM=5` @ `1,286.4 MHz`, `MAPS_GOOGLE=0`) | **`SmolLM2`**: `pp512 = 563.82 t/s`, `tg64 = 17.36 t/s`; **`Qwen2.5-1.5B-Q8_0`**: `pp512 = 105.87 t/s` (**`-21.5%` system `mJ/tok` vs CPU**), `tg64 = 5.85 t/s`, **`22/22` verbatim CPU token match** |
+| **Dual-Pixel Wired TPU Cluster (`2× buenos_a0`)** | `Qwen2.5-32B-Instruct-Q4_0` (`17.43 GiB` > 16 GB) over direct 5 Gbps USB-C NCM (`rango` + `mustang`) | **`18.94 GiB` combined peak RSS** (`9.83 GiB` + `9.11 GiB`, `0 kB` swap on Node 2), `34/65` layers offloaded, `hw_us = 8.17 s` (`99.62%` hit, `cpu_fallback_slices = 0`), **`MAPS_GOOGLE = 0`** on both phones |
 
 See [docs/PHASE6_PERF_REPORT.md](docs/PHASE6_PERF_REPORT.md) for the full 18-case ODPM `mJ/tok` energy matrix and silicon scaling tables.
 
@@ -134,6 +135,7 @@ export OPENBUENOS_DIVE_INTERP_PATH=/data/local/tmp/tpu_open_stack/dive_interp_rv
 
 ## Documentation
 
+- [Track A Dual-Pixel Wired Cluster Playbook & Proof](docs/TRACK_A_DUAL_PIXEL_CLUSTER.md) — `GGML_RPC=ON` + `EDGETPU` hybrid RPC server, direct 5 Gbps USB-C CDC-NCM setup, and `17.43 GiB` `Qwen2.5-32B-Q4_0` pooled-RAM proof across `2× Tensor G5`
 - [Phase 6 Performance & Energy Report](docs/PHASE6_PERF_REPORT.md) — `1,286.4 MHz` DVFS + WakeLock unlock, `983.6 GOPS` (`5.55 TOPS/W`), batched `M=64` prefill, `SmolLM2`/`Qwen2.5` benchmarks & 18-case ODPM `mJ/tok` sweep
 - [Phase 5B Live LLM Spec](docs/PHASE5_LLAMA_TPU_SPEC.md) — `Probe A` dynamic `param_slice`, `O(1)` weight cache, outlier peeling & baseline bring-up
 - [DVFS, Power States & WakeLock Spec](docs/baremetal-vii/dvfs_power_states.md) — Corrected `+0x1c..+0x20` Litebuf wire fields, `TpuCorePowerState` (`0x03..0x19`), `MemoryPowerState` (`0x01..0x15`) & FW WakeLock (`union_type=4/5`)
