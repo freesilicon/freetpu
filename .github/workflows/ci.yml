@@ -29,6 +29,11 @@ jobs:
           make -C libopenbuenos verify-header-host host test
           make -C libopenbuenos clean
 
+      - name: Build & test libopentpu (Make)
+        run: |
+          make -C libopentpu verify-header-host host test
+          make -C libopentpu clean
+
       - name: Build bare-metal runtime (Linux UAPI headers)
         run: |
           cmake -S runtime -B build-runtime -G Ninja -DCMAKE_BUILD_TYPE=Release

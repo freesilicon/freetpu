@@ -1,0 +1,289 @@
+// SPDX-License-Identifier: Apache-2.0
+#include "ot_internal.h"
+#include "ot_vliw.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <new>
+#include <vector>
+
+namespace {
+
+inline float bf16_to_f32(uint16_t b) {
+  uint32_t u = static_cast<uint32_t>(b) << 16;
+  float f = 0.0f;
+  std::memcpy(&f, &u, sizeof(f));
+  return f;
+}
+
+inline uint16_t f32_to_bf16(float f) {
+  uint32_t u = 0;
+  std::memcpy(&u, &f, sizeof(u));
+  if ((u & 0x7fffffffU) > 0x7f800000U) {
+    return static_cast<uint16_t>((u >> 16) | 0x0040U);
+  }
+  uint32_t lsb = (u >> 16) & 1U;
+  u += 0x7fffU + lsb;
+  return static_cast<uint16_t>(u >> 16);
+}
+
+}  // namespace
+
+extern "C" {
+
+ot_config_t ot_config_default(void) {
+  ot_config_t cfg = {};
+  cfg.struct_size = sizeof(ot_config_t);
+  cfg.mock_mode = 0;
+  cfg.bdf = nullptr;
+  cfg.hbm_budget_bytes = 0;
+  cfg.timeout_ms = 5000u;
+  return cfg;
+}
+
+const char* ot_status_string(ot_status_t status) {
+  switch (status) {
+    case OT_OK: return "OT_OK";
+    case OT_ERR_INVALID_ARG: return "OT_ERR_INVALID_ARG";
+    case OT_ERR_NO_MEMORY: return "OT_ERR_NO_MEMORY";
+    case OT_ERR_DEVICE: return "OT_ERR_DEVICE";
+    case OT_ERR_IOCTL: return "OT_ERR_IOCTL";
+    case OT_ERR_TIMEOUT: return "OT_ERR_TIMEOUT";
+    case OT_ERR_UNSUPPORTED: return "OT_ERR_UNSUPPORTED";
+    case OT_ERR_NOT_FOUND: return "OT_ERR_NOT_FOUND";
+    case OT_ERR_IO: return "OT_ERR_IO";
+    case OT_ERR_BUSY: return "OT_ERR_BUSY";
+  }
+  return "OT_ERR_UNKNOWN";
+}
+
+ot_status_t ot_context_create(const ot_config_t* config, ot_context_t** out_ctx) {
+  if (!out_ctx) return OT_ERR_INVALID_ARG;
+  *out_ctx = nullptr;
+
+  ot_config_t cfg = ot_config_default();
+  if (config) {
+    if (config->struct_size != 0 && config->struct_size != sizeof(ot_config_t)) {
+      return OT_ERR_INVALID_ARG;
+    }
+    cfg = *config;
+  }
+
+  auto* ctx = new (std::nothrow) ot_context();
+  if (!ctx) return OT_ERR_NO_MEMORY;
+  ctx->cfg = cfg;
+
+  std::string err;
+  if (!ctx->transport.open_device(cfg, &ctx->info, &err)) {
+    delete ctx;
+    return OT_ERR_DEVICE;
+  }
+
+  if (!cfg.mock_mode && ctx->transport.bar4_mmio && ctx->transport.bar4_mapped_len >= 0x1000) {
+    std::vector<uint8_t> page(4096, 0);
+    for (size_t i = 0; i < page.size(); i += 4) {
+      uint32_t w = ctx->transport.read32_bar4(i);
+      std::memcpy(page.data() + i, &w, 4);
+    }
+    ot::parse_bar4_descriptor(page.data(), page.size(), &ctx->bar4_desc);
+  }
+
+  *out_ctx = ctx;
+  return OT_OK;
+}
+
+void ot_context_destroy(ot_context_t* ctx) {
+  if (!ctx) return;
+  ctx->transport.close_device();
+  delete ctx;
+}
+
+const char* ot_context_last_error(const ot_context_t* ctx) {
+  if (!ctx) return "";
+  return ctx->last_error.c_str();
+}
+
+int ot_context_is_mock(const ot_context_t* ctx) {
+  if (!ctx) return 0;
+  return ctx->info.is_mock ? 1 : 0;
+}
+
+ot_status_t ot_device_get_info(const ot_context_t* ctx, ot_device_info_t* out_info) {
+  if (!ctx || !out_info) return OT_ERR_INVALID_ARG;
+  *out_info = ctx->info;
+  return OT_OK;
+}
+
+ot_status_t ot_buffer_alloc(ot_context_t* ctx, size_t size_bytes, ot_buffer_t** out_buf) {
+  if (!ctx || !out_buf || size_bytes == 0) return OT_ERR_INVALID_ARG;
+  *out_buf = nullptr;
+
+  std::lock_guard<std::mutex> lk(ctx->mu);
+  uint64_t hbm_addr = 0;
+  uint64_t aligned_sz = (size_bytes + 4095ULL) & ~4095ULL;
+  if (!ctx->transport.hbm_alloc.alloc(aligned_sz, 4096ULL, &hbm_addr)) {
+    ctx->last_error = "HBM allocator out of space";
+    return OT_ERR_NO_MEMORY;
+  }
+
+  auto* buf = new (std::nothrow) ot_buffer();
+  if (!buf) {
+    ctx->transport.hbm_alloc.free(hbm_addr);
+    return OT_ERR_NO_MEMORY;
+  }
+  buf->ctx = ctx;
+  buf->size_bytes = size_bytes;
+  buf->hbm_addr = hbm_addr;
+  if (ctx->info.is_mock) {
+    buf->mock_data.assign(size_bytes, 0);
+  }
+  *out_buf = buf;
+  return OT_OK;
+}
+
+void ot_buffer_free(ot_buffer_t* buf) {
+  if (!buf) return;
+  if (buf->ctx) {
+    std::lock_guard<std::mutex> lk(buf->ctx->mu);
+    buf->ctx->transport.hbm_alloc.free(buf->hbm_addr);
+  }
+  delete buf;
+}
+
+size_t ot_buffer_size(const ot_buffer_t* buf) {
+  return buf ? buf->size_bytes : 0;
+}
+
+uint64_t ot_buffer_hbm_addr(const ot_buffer_t* buf) {
+  return buf ? buf->hbm_addr : 0;
+}
+
+ot_status_t ot_buffer_h2d(ot_context_t* ctx, ot_buffer_t* dst,
+                          const void* host_src, size_t size_bytes) {
+  if (!ctx || !dst || !host_src || size_bytes > dst->size_bytes) return OT_ERR_INVALID_ARG;
+  if (size_bytes == 0) return OT_OK;
+  std::lock_guard<std::mutex> lk(ctx->mu);
+  if (ctx->info.is_mock) {
+    std::memcpy(dst->mock_data.data(), host_src, size_bytes);
+    if (dst->hbm_addr + size_bytes <= ctx->transport.mock_hbm.size()) {
+      std::memcpy(ctx->transport.mock_hbm.data() + dst->hbm_addr, host_src, size_bytes);
+    }
+    return OT_OK;
+  }
+
+  if (!ctx->transport.host_stage_mem || ctx->transport.host_stage_size == 0) {
+    ctx->last_error = "DMA staging buffer not initialized";
+    return OT_ERR_DEVICE;
+  }
+
+  const auto* src_bytes = static_cast<const uint8_t*>(host_src);
+  size_t done = 0;
+  std::string err;
+  while (done < size_bytes) {
+    size_t chunk = std::min(size_bytes - done, ctx->transport.host_stage_size);
+    size_t dma_len = (chunk + 7u) & ~static_cast<size_t>(7u);
+    if (dma_len > ctx->transport.host_stage_size) {
+      chunk = ctx->transport.host_stage_size;
+      dma_len = chunk & ~static_cast<size_t>(7u);
+    }
+    if (dma_len > chunk) {
+      std::memset(ctx->transport.host_stage_mem + chunk, 0, dma_len - chunk);
+    }
+    std::memcpy(ctx->transport.host_stage_mem, src_bytes + done, chunk);
+    if (!ctx->transport.dma_transfer_sync(
+            ctx->transport.host_stage_iova, dst->hbm_addr + done, dma_len,
+            /*is_h2d=*/true, 0x40000000u, 0x10u, 0u, ctx->cfg.timeout_ms, &err)) {
+      ctx->last_error = err.empty() ? "Hardware H2D DMA failed" : err;
+      return OT_ERR_IOCTL;
+    }
+    done += chunk;
+  }
+  return OT_OK;
+}
+
+ot_status_t ot_buffer_d2h(ot_context_t* ctx, const ot_buffer_t* src,
+                          void* host_dst, size_t size_bytes) {
+  if (!ctx || !src || !host_dst || size_bytes > src->size_bytes) return OT_ERR_INVALID_ARG;
+  if (size_bytes == 0) return OT_OK;
+  std::lock_guard<std::mutex> lk(ctx->mu);
+  if (ctx->info.is_mock) {
+    if (src->hbm_addr + size_bytes <= ctx->transport.mock_hbm.size()) {
+      std::memcpy(host_dst, ctx->transport.mock_hbm.data() + src->hbm_addr, size_bytes);
+    } else {
+      std::memcpy(host_dst, src->mock_data.data(), size_bytes);
+    }
+    return OT_OK;
+  }
+
+  if (!ctx->transport.host_stage_mem || ctx->transport.host_stage_size == 0) {
+    ctx->last_error = "DMA staging buffer not initialized";
+    return OT_ERR_DEVICE;
+  }
+
+  auto* dst_bytes = static_cast<uint8_t*>(host_dst);
+  size_t done = 0;
+  std::string err;
+  while (done < size_bytes) {
+    size_t chunk = std::min(size_bytes - done, ctx->transport.host_stage_size);
+    size_t dma_len = (chunk + 7u) & ~static_cast<size_t>(7u);
+    if (dma_len > ctx->transport.host_stage_size) {
+      chunk = ctx->transport.host_stage_size;
+      dma_len = chunk & ~static_cast<size_t>(7u);
+    }
+    if (!ctx->transport.dma_transfer_sync(
+            ctx->transport.host_stage_iova, src->hbm_addr + done, dma_len,
+            /*is_h2d=*/false, 0x40000000u, 0x60u, 0u, ctx->cfg.timeout_ms, &err)) {
+      ctx->last_error = err.empty() ? "Hardware D2H DMA failed" : err;
+      return OT_ERR_IOCTL;
+    }
+    std::memcpy(dst_bytes + done, ctx->transport.host_stage_mem, chunk);
+    done += chunk;
+  }
+  return OT_OK;
+}
+
+ot_status_t ot_matmul_bf16(ot_context_t* ctx,
+                           const ot_buffer_t* lhs_mk,
+                           const ot_buffer_t* rhs_kn,
+                           ot_buffer_t* out_mn,
+                           uint32_t m_dim,
+                           uint32_t k_dim,
+                           uint32_t n_dim) {
+  if (!ctx || !lhs_mk || !rhs_kn || !out_mn || m_dim == 0 || k_dim == 0 || n_dim == 0) {
+    return OT_ERR_INVALID_ARG;
+  }
+  size_t need_a = static_cast<size_t>(m_dim) * k_dim * sizeof(uint16_t);
+  size_t need_b = static_cast<size_t>(k_dim) * n_dim * sizeof(uint16_t);
+  size_t need_c = static_cast<size_t>(m_dim) * n_dim * sizeof(uint16_t);
+  if (lhs_mk->size_bytes < need_a || rhs_kn->size_bytes < need_b || out_mn->size_bytes < need_c) {
+    return OT_ERR_INVALID_ARG;
+  }
+
+  std::lock_guard<std::mutex> lk(ctx->mu);
+  if (ctx->info.is_mock) {
+    const auto* a = reinterpret_cast<const uint16_t*>(ctx->transport.mock_hbm.data() + lhs_mk->hbm_addr);
+    const auto* b = reinterpret_cast<const uint16_t*>(ctx->transport.mock_hbm.data() + rhs_kn->hbm_addr);
+    auto* c = reinterpret_cast<uint16_t*>(ctx->transport.mock_hbm.data() + out_mn->hbm_addr);
+    for (uint32_t m = 0; m < m_dim; ++m) {
+      for (uint32_t n = 0; n < n_dim; ++n) {
+        float acc = 0.0f;
+        for (uint32_t k = 0; k < k_dim; ++k) {
+          acc += bf16_to_f32(a[static_cast<size_t>(m) * k_dim + k]) *
+                 bf16_to_f32(b[static_cast<size_t>(k) * n_dim + n]);
+        }
+        c[static_cast<size_t>(m) * n_dim + n] = f32_to_bf16(acc);
+      }
+    }
+    return OT_OK;
+  }
+
+  // Clean-room 58-bundle 128x128 BF16 MXU kernel body + 512B launch ABI live in ot_vliw.h;
+  // full self-contained IMEM boot replacement (without vendor blobs) remains tracked for M3 completion.
+  auto body = ot::emit_v5e_matmul_128x128_body();
+  (void)body;
+  ctx->last_error = "Hardware MXU launch requires standalone clean-room IMEM boot stub (M3 partial: DMA+kernel body ready)";
+  return OT_ERR_UNSUPPORTED;
+}
+
+}  // extern "C"
