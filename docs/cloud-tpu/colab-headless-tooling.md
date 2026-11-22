@@ -11,7 +11,7 @@ Google provides two official, supported headless automation surfaces for Colab r
 | Control Plane | Endpoint / Binary | Auth & Scopes | Best Use Case |
 | --- | --- | --- | --- |
 | **`google-colab-cli` (`colab`)** | `colab` CLI `>= 0.7.6` (`uv tool install google-colab-cli`) | `--auth=adc` or `--auth=oauth2` (`openid`, `cloud-platform`, `userinfo.email`, `colaboratory`) | Zero-waste `colab run` ephemeral TPU probes, persistent kernel `colab exec`, `/api/contents/` file sync, `colab log -o proof.ipynb`, `colab usage` |
-| **Official Colab MCP & Public REST `v1beta`** | `https://colaboratory.googleapis.com/mcp` & `https://colaboratory.googleapis.com/v1beta` | OAuth2 / ADC with `colaboratory` (or `colaboratory.readonly` for read-only REST discovery/inspection) + allowlisted `X-Goog-User-Project` | IDE/agent MCP orchestration (`list_runtime_specs`, `create_runtime`, `execute_code`, `delete_runtime`) with UUID `requestId` & `executionId` reattachment; Public REST `v1beta` covers subscription, runtime-spec discovery, and runtime lifecycle |
+| **Official Colab MCP & Public REST `v1beta`** | `https://colaboratory.googleapis.com/mcp` & `https://colaboratory.googleapis.com/v1beta` | OAuth2 / ADC with `colaboratory` (or `colaboratory.readonly` for non-mutating REST endpoints; note `runtimes.get` returns live runtime proxy tokens) + allowlisted `X-Goog-User-Project` | IDE/agent MCP orchestration (`list_runtime_specs`, `create_runtime`, `execute_code`, `delete_runtime`) with UUID `requestId` & `executionId` reattachment; Public REST `v1beta` covers subscription, runtime-spec discovery, and runtime lifecycle |
 
 ### `google-colab-cli` Dual-Path & `--no-public-api` Behavior
 
@@ -38,9 +38,17 @@ The remote Streamable HTTP MCP server at `https://colaboratory.googleapis.com/mc
 **Allowlist & Scope Behavior:**
 
 - Unauthenticated `initialize` and `tools/list` probes on `https://colaboratory.googleapis.com/mcp` return HTTP `200` and advertise all 10 tool schemas.
-- Read-only REST discovery/inspection endpoints (`GET /v1beta/subscription`, `GET /v1beta/runtimespecs`, `GET /v1beta/runtimes`, `GET /v1beta/runtimes/*`) accept the narrower `https://www.googleapis.com/auth/colaboratory.readonly` OAuth scope (as well as the full `https://www.googleapis.com/auth/colaboratory` scope) plus an allowlisted GCP quota project (`X-Goog-User-Project`). Prefer `colaboratory.readonly` for discovery-only credentials so they cannot create or delete runtimes unnecessarily.
+- **Discovery vs. Runtime Credential Retrieval (`colaboratory.readonly`)**:
+  - `GET /v1beta/subscription` and `GET /v1beta/runtimespecs` perform account and accelerator discovery only.
+  - `GET /v1beta/runtimes` and `GET /v1beta/runtimes/*` (`runtimes.get`) also accept the `https://www.googleapis.com/auth/colaboratory.readonly` OAuth scope, **but `runtimes.get` returns `ConnectionInfo` including the runtime proxy token** that authenticates directly to the runtime's Jupyter server (enabling code execution and file modifications on existing runtimes). Do **not** treat `colaboratory.readonly` tokens as harmless read-only monitoring credentials—protect them as runtime-access credentials even though they cannot call `POST /v1beta/runtimes` or `DELETE /v1beta/runtimes/*`.
 - Mutating REST calls (`POST /v1beta/runtimes`, `DELETE /v1beta/runtimes/*`) and full MCP `tools/call` orchestration require the read/write `https://www.googleapis.com/auth/colaboratory` OAuth scope and an allowlisted GCP quota project (`X-Goog-User-Project`).
-- Unallowlisted or missing-scope ADC tokens receive HTTP `403` (`ACCESS_TOKEN_SCOPE_INSUFFICIENT` or `PERMISSION_DENIED`). Re-mint ADC with the least-privilege scope required (substitute `colaboratory.readonly` for discovery-only REST callers):
+- Unallowlisted, disabled-API, or missing-scope ADC tokens receive HTTP `403` (`ACCESS_TOKEN_SCOPE_INSUFFICIENT` or `PERMISSION_DENIED`). First enable the Colaboratory API on your GCP quota project (resolves API-disabled `403 Forbidden` errors):
+
+```bash
+gcloud services enable colaboratory.googleapis.com --project=<your-gcp-project-id>
+```
+
+Then re-mint ADC with the least-privilege scope required:
 
 ```bash
 gcloud auth application-default login \
@@ -49,7 +57,7 @@ gcloud auth application-default login \
 
 If your GCP project still receives `403` on `colaboratory.googleapis.com/v1beta`, use `google-colab-cli` (`--no-public-api` / `/tun/m/*` tunnel) instead.
 
-#### Antigravity MCP Configuration (`~/.gemini/config/mcp_config.json`)
+#### Antigravity MCP Configuration (`~/.gemini/antigravity/mcp_config.json`)
 
 ```json
 {

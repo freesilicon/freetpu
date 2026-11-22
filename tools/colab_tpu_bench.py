@@ -396,8 +396,13 @@ def _ensure_dir_not_shared_writable(dir_path: Path) -> Path:
     return canonical_dir
 
 
-def _verify_file_writable_if_exists(path: Path, label: str) -> None:
-    """Verify an existing file is a user-owned, non-shared-writable regular non-symlink file."""
+def _verify_file_writable_if_exists(path: Path, label: str, *, require_private: bool = False) -> None:
+    """Verify an existing file is a user-owned, non-shared-writable regular non-symlink file.
+
+    When `require_private` is True, also reject any group/other access bits (`0o077`) so a
+    pre-existing readable session store cannot leak newly written runtime tokens via an
+    already-open file descriptor held by another local user.
+    """
     if not os.path.lexists(path):
         return
     try:
@@ -412,7 +417,13 @@ def _verify_file_writable_if_exists(path: Path, label: str) -> None:
         raise UntrustedPathError(
             f"{label} {path} is not owned by current user (uid={st.st_uid})"
         )
-    if (st.st_mode & 0o022) != 0:
+    forbidden_mask = 0o077 if require_private else 0o022
+    if (st.st_mode & forbidden_mask) != 0:
+        if require_private:
+            raise UntrustedPathError(
+                f"{label} {path} must not be group/world-accessible (mode={oct(stat.S_IMODE(st.st_mode))}); "
+                "use a fresh private path under a 0700 directory"
+            )
         raise UntrustedPathError(
             f"{label} {path} must not be group/world-writable (mode={oct(stat.S_IMODE(st.st_mode))})"
         )
@@ -433,7 +444,12 @@ def _verify_file_writable_if_exists(path: Path, label: str) -> None:
             raise UntrustedPathError(
                 f"{label} {path} is not owned by current user (uid={fst.st_uid})"
             )
-        if (fst.st_mode & 0o022) != 0:
+        if (fst.st_mode & forbidden_mask) != 0:
+            if require_private:
+                raise UntrustedPathError(
+                    f"{label} {path} must not be group/world-accessible (mode={oct(stat.S_IMODE(fst.st_mode))}); "
+                    "use a fresh private path under a 0700 directory"
+                )
             raise UntrustedPathError(
                 f"{label} {path} must not be group/world-writable (mode={oct(stat.S_IMODE(fst.st_mode))})"
             )
@@ -715,7 +731,7 @@ def _normalize_config_path(
     lock_path = Path(f"{canonical_cfg}.lock")
     if canonical_cfg.is_symlink() or lock_path.is_symlink():
         raise UntrustedPathError(f"Refusing symlinked --config or lock path: {canonical_cfg}")
-    _verify_file_writable_if_exists(canonical_cfg, "session config file")
+    _verify_file_writable_if_exists(canonical_cfg, "session config file", require_private=True)
     _verify_file_writable_if_exists(lock_path, "session config lock file")
     _verify_config_volume_writable(canonical_parent, canonical_cfg.name)
     _verify_config_lock_acquirable(lock_path)
@@ -4890,6 +4906,7 @@ def run_self_test() -> int:
         # 43. `--config` aliasing `--script` OR pointing to unrelated/non-session files is
         #     rejected BEFORE calling Colab (without truncating or leaking file contents).
         orig_future_src = future_script.read_text(encoding="utf-8")
+        os.chmod(future_script, 0o600)
         rc_alias, sum_alias = run_benchmark(
             BenchConfig(
                 tpus=("v5e1",),
@@ -4906,6 +4923,7 @@ def run_self_test() -> int:
         non_session_py = custom_dir / "notes.txt"
         secret_sentinel = "DO_NOT_LEAK_THIS_CONTENT_999"
         non_session_py.write_text(f"plain text {secret_sentinel}\n", encoding="utf-8")
+        os.chmod(non_session_py, 0o600)
         rc_unrel_txt, sum_unrel_txt = run_benchmark(
             BenchConfig(
                 tpus=("v5e1",),
@@ -4918,8 +4936,29 @@ def run_self_test() -> int:
         assert sum_unrel_txt["status"] == "untrusted_config_path"
         assert secret_sentinel not in json.dumps(sum_unrel_txt)
 
+        # 43b. Pre-existing readable empty `--config` (0644) in a traversable directory is rejected
+        #      so another local user holding an open fd cannot read runtime tokens written later.
+        readable_dir = tmp_path / "readable-cfg-dir"
+        readable_dir.mkdir(mode=0o755)
+        os.chmod(readable_dir, 0o755)
+        readable_cfg = readable_dir / "empty-sessions.json"
+        readable_cfg.write_text("", encoding="utf-8")
+        os.chmod(readable_cfg, 0o644)
+        rc_rd, sum_rd = run_benchmark(
+            BenchConfig(
+                tpus=("v5e1",),
+                config_path=readable_cfg,
+                out_dir=tmp_path / "readable-cfg-out",
+            ),
+            runner=forbid_calls_runner,
+        )
+        assert rc_rd == 2
+        assert sum_rd["status"] == "untrusted_config_path"
+        assert "group/world-accessible" in (sum_rd["error"] or "")
+
         non_session_json = custom_dir / "not-a-store.json"
         non_session_json.write_text('{"status": "ok", "chosen_tpu": "v6e1"}\n', encoding="utf-8")
+        os.chmod(non_session_json, 0o600)
         rc_unrel_js, sum_unrel_js = run_benchmark(
             BenchConfig(
                 tpus=("v5e1",),
@@ -4930,6 +4969,7 @@ def run_self_test() -> int:
         )
         assert rc_unrel_js == 2
         assert sum_unrel_js["status"] == "untrusted_config_path"
+        assert "group/world-accessible" not in (sum_unrel_js["error"] or "")
 
         # 44. Pre-READY HTTP 504 Gateway Timeout on allocation POST does NOT fall back to v5e1
         #     and keeps `teardown_verified=False` (`allocation_timeout_unreconciled`).
