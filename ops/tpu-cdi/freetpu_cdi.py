@@ -1328,7 +1328,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     dargs.add_argument(
         "--device",
         default="all",
-        help="CDI device selector suffix (default: all -> freetpu.dev/tpu=all).",
+        help="CDI device selector suffix (default: all -> <kind>=all).",
+    )
+    dargs.add_argument(
+        "--kind",
+        default=CDI_KIND,
+        help=f"CDI vendor/class kind (default: {CDI_KIND}).",
     )
     dargs.add_argument(
         "--cap-ipc-lock",
@@ -1498,7 +1503,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
 
     if args.command == "docker-args":
-        flags = [f"--device={CDI_KIND}={args.device}"]
+        if not isinstance(args.kind, str) or not _CDI_KIND_RE.match(args.kind):
+            sys.stderr.write(f"freetpu-cdi docker-args failed: invalid CDI kind {args.kind!r}\n")
+            return 1
+        flags = [f"--device={args.kind}={args.device}"]
         if args.cap_ipc_lock:
             flags.append("--cap-add=IPC_LOCK")
         else:

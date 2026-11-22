@@ -25,10 +25,10 @@ VFIO-backed Cloud TPU VMs (`v5e`, `v5p`, `v6e` Trillium) expose each TPU chip as
 | `0x005e` | `v4` | TPU v4 | 32 GiB | `/dev/accel*` (PCI inventory only; VFIO CDI & health N/A) |
 | `0x0062` | `v5p` | TPU v5p | 95 GiB | `vfio-pci` (`/dev/vfio/*`, full exporter + CDI) |
 | `0x0063` | `v5e` | TPU v5e | 16 GiB | `vfio-pci` (`/dev/vfio/*`, full exporter + CDI) |
-| `0x006e` | `v6e-pf` | TPU v6e (PF) | 32 GiB | `vfio-pci` (`/dev/vfio/*`, sysfs/VFIO inventory + CDI; upstream `tpu-info` omits `0x006e`, so live HBM/duty cycle requires VF `0x006f`) |
+| `0x006e` | `v6e-pf` | TPU v6e (PF) | 32 GiB | `vfio-pci` (`/dev/vfio/*`, sysfs/VFIO inventory + CDI; upstream `tpu-info` CLI discovery omits `0x006e`, while `tpu_exporter.py` maps `0x006e` to `TpuChip.V6E` and queries a reachable `libtpu` endpoint via its Python `tpu_info.metrics` gRPC fallback) |
 | `0x006f` | `v6e` | TPU v6e (Trillium) | 32 GiB | `vfio-pci` (`/dev/vfio/*`, full exporter + CDI) |
 
-> **TPU v6e PF (`0x006e`) note:** Upstream `tpu-info` recognizes the v6e virtual function (`0x006f`) and omits the physical function (`0x006e`), exiting before querying `libtpu` if only `0x006e` is present. On PF-only `0x006e` hosts, `tpu-exporter` still reports PCI/VFIO inventory, readiness, and active PIDs (and `freetpu-cdi` generates CDI specs), while live HBM and duty-cycle telemetry via `tpu-info` requires a `0x006f` VF or a collector that recognizes `0x006e`.
+> **TPU v6e PF (`0x006e`) note:** Upstream `tpu-info` CLI discovery recognizes the v6e virtual function (`0x006f`) and omits the physical function (`0x006e`), exiting before querying `libtpu` if only `0x006e` is present. On PF-only `0x006e` hosts, `tpu_exporter.py` maps `0x006e` directly to `TpuChip.V6E` and falls back to the Python `tpu_info.metrics` gRPC client against `--runtime-metrics-addr` (default `127.0.0.1:8431`) when the `tpu-info` Python package is installed, so live HBM and duty-cycle telemetry works on PF-only hosts without reconfiguring PCI devices (while PCI/VFIO inventory, readiness, active PIDs, and `freetpu-cdi` work without `tpu-info`).
 
 ---
 

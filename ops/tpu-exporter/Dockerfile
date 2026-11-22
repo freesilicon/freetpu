@@ -22,8 +22,12 @@ EXPOSE 9400
 # containers in Docker's default private PID namespace never report misleading
 # `freetpu_tpu_pid_telemetry_available=1` with zero active PIDs, while extra
 # runtime flags (e.g. `--runtime-metrics-addr 127.0.0.1:8431`) preserve
-# `--host 0.0.0.0` and `--health-port 9401`. To opt into host PID scanning, run
-# with `--pid=host --cap-add=SYS_PTRACE` (and an AppArmor profile permitting
-# cross-profile `/proc/<pid>/fd` reads) and pass `--pid-scan`.
+# `--host 0.0.0.0` and `--health-port 9401`. For host VFIO readiness (and opt-in
+# host PID scanning), bind-mount host sysfs subpaths and `/dev/vfio` read-only
+# (`-v /sys/bus/pci:/sys/bus/pci:ro -v /sys/devices:/sys/devices:ro
+# -v /sys/kernel/iommu_groups:/sys/kernel/iommu_groups:ro -v /dev/vfio:/dev/vfio:ro`);
+# to opt into host PID scanning, also run with `--pid=host --cap-add=SYS_PTRACE`
+# (and an AppArmor profile permitting cross-profile `/proc/<pid>/fd` reads) and
+# pass `--pid-scan`.
 ENTRYPOINT ["python3", "/opt/freetpu/tpu_exporter.py", "--host", "0.0.0.0", "--port", "9400", "--health-host", "127.0.0.1", "--health-port", "9401", "--no-pid-scan"]
 CMD []
