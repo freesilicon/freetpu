@@ -49,6 +49,8 @@ SUPPORTED_TPUS = frozenset({"v6e1", "v5e1"})
 DEFAULT_REQUEST_TIMEOUT_S: float = 60.0
 DEFAULT_STARTUP_OVERHEAD_S: float = 180.0
 DEFAULT_UNBOUNDED_INACTIVITY_WALL_TIMEOUT_S: float = 480.0
+DEFAULT_MAX_CAPTURE_BYTES: int = 256 * 1024
+DEFAULT_MAX_PROBE_CAPTURE_BYTES: int = 256 * 1024
 MIN_COLAB_CLI_VERSION: Tuple[int, int, int] = (0, 7, 6)
 _VERSION_RE = re.compile(
     r"\b(\d+)\.(\d+)\.(\d+)(?:(?:\.?post\d+)|([.-]?(?:a|b|rc|alpha|beta|dev|pre)\w*))?",
@@ -123,12 +125,20 @@ class CommandCancelledError(BaseException):
         returncode: int,
         stdout: str = "",
         stderr: str = "",
+        stdout_log_written: bool = False,
+        stderr_log_written: bool = False,
+        log_write_error: Optional[str] = None,
+        untrusted_log_error: Optional[str] = None,
     ) -> None:
         super().__init__(f"Command cancelled by {signal_name}")
         self.signal_name = signal_name
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
+        self.stdout_log_written = stdout_log_written
+        self.stderr_log_written = stderr_log_written
+        self.log_write_error = log_write_error
+        self.untrusted_log_error = untrusted_log_error
 
 
 @dataclass(frozen=True)
@@ -137,6 +147,10 @@ class CommandResult:
     stdout: str
     stderr: str
     timed_out: bool = False
+    stdout_log_written: bool = False
+    stderr_log_written: bool = False
+    log_write_error: Optional[str] = None
+    untrusted_log_error: Optional[str] = None
 
 
 CommandRunner = Callable[[Sequence[str]], CommandResult]
@@ -637,21 +651,30 @@ def _prepare_custom_script(
         ) from exc
 
     # Always wrap custom scripts in a thin `__main__` bootstrapper so `colab run`'s injected prelude
-    # never breaks `from __future__` / coding cookies and `__file__` is always set consistently.
+    # never breaks `from __future__` / coding cookies and the real source is materialized on disk
+    # so `__file__`, `open(__file__)`, and `inspect.getsource()` all work seamlessly at runtime.
     encoded = base64.b64encode(raw_bytes).decode("ascii")
-    orig_name = script_path.name
+    orig_name = os.path.basename(script_path.name) or "custom_script.py"
     wrapper_src = (
-        "import base64 as _ft_b64, sys as _ft_sys\n"
+        "import atexit as _ft_atexit, base64 as _ft_b64, os as _ft_os, "
+        "shutil as _ft_shutil, sys as _ft_sys, tempfile as _ft_tempfile\n"
         f"_ft_src = _ft_b64.b64decode({encoded!r})\n"
         f"_ft_name = {orig_name!r}\n"
+        "_ft_dir = _ft_tempfile.mkdtemp(prefix='freetpu_script_')\n"
+        "_ft_os.chmod(_ft_dir, 0o700)\n"
+        "_ft_atexit.register(_ft_shutil.rmtree, _ft_dir, True)\n"
+        "_ft_path = _ft_os.path.join(_ft_dir, _ft_name)\n"
+        "_ft_fd = _ft_os.open(_ft_path, _ft_os.O_WRONLY | _ft_os.O_CREAT | _ft_os.O_EXCL, 0o600)\n"
+        "with _ft_os.fdopen(_ft_fd, 'wb') as _ft_fh:\n"
+        "    _ft_fh.write(_ft_src)\n"
         "if _ft_sys.argv:\n"
-        "    _ft_sys.argv[0] = _ft_name\n"
+        "    _ft_sys.argv[0] = _ft_path\n"
         "_ft_main = _ft_sys.modules.get('__main__')\n"
         "_ft_ns = _ft_main.__dict__ if _ft_main is not None else globals()\n"
         "_ft_ns['__name__'] = '__main__'\n"
-        "_ft_ns['__file__'] = _ft_name\n"
+        "_ft_ns['__file__'] = _ft_path\n"
         "_ft_ns['__package__'] = None\n"
-        "exec(compile(_ft_src, _ft_name, 'exec'), _ft_ns)\n"
+        "exec(compile(_ft_src, _ft_path, 'exec'), _ft_ns)\n"
     )
     wrapper_path = out_dir / f"colab_custom_script.{session_base}.py"
     _write_text_nofollow(wrapper_path, wrapper_src)
@@ -794,11 +817,270 @@ def resolve_effective_request_timeout(
     return DEFAULT_REQUEST_TIMEOUT_S, False
 
 
+class _BoundedStreamCapture:
+    """Stream subprocess output to an optional private file while bounding RAM to O(1)."""
+
+    _BEGIN_BYTES = PROBE_JSON_BEGIN.encode("utf-8")
+    _END_BYTES = PROBE_JSON_END.encode("utf-8")
+    _READY_BYTES = b"[colab] session ready"
+
+    def __init__(
+        self,
+        *,
+        log_path: Optional[Path] = None,
+        max_capture_bytes: int = DEFAULT_MAX_CAPTURE_BYTES,
+        capture_probe: bool = False,
+        track_session_ready: bool = False,
+    ) -> None:
+        cap = max(int(max_capture_bytes), 512)
+        self.max_head_bytes = cap // 2
+        self.max_tail_bytes = cap - self.max_head_bytes
+        self.log_path = log_path
+        self.capture_probe = capture_probe
+        self.track_session_ready = track_session_ready
+
+        self.total_bytes = 0
+        self._head = bytearray()
+        self._tail_chunks: deque[bytes] = deque()
+        self._tail_len = 0
+
+        self._probe_active = False
+        self._probe_done = False
+        self._probe_overlap = bytearray()
+        self._probe_buf = bytearray()
+        self._captured_probe: Optional[bytes] = None
+
+        self._ready_overlap = bytearray()
+        self.saw_session_ready = False
+
+        self._fh: Optional[Any] = None
+        self._tmp_path: Optional[Path] = None
+        self.log_written = False
+        self.write_error: Optional[str] = None
+        self.untrusted_error: Optional[str] = None
+
+    def _open_spool_if_needed(self) -> None:
+        if self._fh is not None or self.log_path is None or self.write_error or self.untrusted_error:
+            return
+        try:
+            if self.log_path.is_symlink() or (
+                os.path.lexists(self.log_path) and not self.log_path.is_file()
+            ):
+                self.untrusted_error = f"Refusing unsafe log target path: {self.log_path}"
+                return
+            canonical_parent = _ensure_dir_not_shared_writable(self.log_path.parent)
+            target = canonical_parent / self.log_path.name
+            if target.is_symlink() or (os.path.lexists(target) and not target.is_file()):
+                self.untrusted_error = f"Refusing unsafe log target path: {target}"
+                return
+            self.log_path = target
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=f".{target.name}.",
+                suffix=".tmp",
+                dir=str(canonical_parent),
+            )
+            tmp_path = Path(tmp_name)
+            try:
+                os.chmod(tmp_path, 0o600)
+                fh = os.fdopen(fd, "wb")
+            except Exception:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+            self._tmp_path = tmp_path
+            self._fh = fh
+        except UntrustedPathError as exc:
+            self.untrusted_error = str(exc)
+        except OSError as exc:
+            self.write_error = f"Failed opening local run log {self.log_path}: {exc}"
+
+    def _close_and_unlink_tmp(self) -> None:
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            except OSError:
+                pass
+            self._fh = None
+        if self._tmp_path is not None:
+            try:
+                self._tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._tmp_path = None
+
+    def _scan_probe(self, chunk: bytes) -> None:
+        if not self.capture_probe or self._probe_done:
+            return
+        if not self._probe_active:
+            combined = bytes(self._probe_overlap) + chunk
+            idx = combined.find(self._BEGIN_BYTES)
+            if idx != -1:
+                self._probe_active = True
+                self._probe_overlap.clear()
+                tail_after_begin = combined[idx:]
+                self._append_probe_bytes(tail_after_begin)
+            else:
+                keep = len(self._BEGIN_BYTES) - 1
+                self._probe_overlap = bytearray(combined[-keep:]) if keep > 0 else bytearray()
+        else:
+            self._append_probe_bytes(chunk)
+
+    def _append_probe_bytes(self, data: bytes) -> None:
+        self._probe_buf.extend(data)
+        end_idx = self._probe_buf.find(self._END_BYTES)
+        if end_idx != -1:
+            self._captured_probe = bytes(self._probe_buf[: end_idx + len(self._END_BYTES)])
+            self._probe_buf.clear()
+            self._probe_active = False
+            self._probe_done = True
+        elif len(self._probe_buf) > DEFAULT_MAX_PROBE_CAPTURE_BYTES:
+            # Guard against unbounded memory if a script prints BEGIN without END.
+            self._probe_buf.clear()
+            self._probe_active = False
+            self._probe_done = True
+
+    def _scan_ready(self, chunk: bytes) -> None:
+        if not self.track_session_ready or self.saw_session_ready:
+            return
+        combined = bytes(self._ready_overlap) + chunk.lower()
+        if self._READY_BYTES in combined:
+            self.saw_session_ready = True
+            self._ready_overlap.clear()
+        else:
+            keep = len(self._READY_BYTES) - 1
+            self._ready_overlap = bytearray(combined[-keep:]) if keep > 0 else bytearray()
+
+    def feed(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+        self.total_bytes += len(chunk)
+
+        if self.log_path is not None and self.write_error is None and self.untrusted_error is None:
+            self._open_spool_if_needed()
+            if self._fh is not None:
+                try:
+                    self._fh.write(chunk)
+                except OSError as exc:
+                    self.write_error = f"Failed writing local run log {self.log_path}: {exc}"
+                    self._close_and_unlink_tmp()
+
+        if len(self._head) < self.max_head_bytes:
+            need = self.max_head_bytes - len(self._head)
+            self._head.extend(chunk[:need])
+
+        if self.max_tail_bytes > 0:
+            if len(chunk) >= self.max_tail_bytes:
+                self._tail_chunks.clear()
+                self._tail_chunks.append(chunk[-self.max_tail_bytes :])
+                self._tail_len = self.max_tail_bytes
+            else:
+                self._tail_chunks.append(chunk)
+                self._tail_len += len(chunk)
+                while self._tail_len > self.max_tail_bytes and self._tail_chunks:
+                    overflow = self._tail_len - self.max_tail_bytes
+                    first = self._tail_chunks[0]
+                    if len(first) <= overflow:
+                        self._tail_chunks.popleft()
+                        self._tail_len -= len(first)
+                    else:
+                        self._tail_chunks[0] = first[overflow:]
+                        self._tail_len -= overflow
+
+        self._scan_probe(chunk)
+        self._scan_ready(chunk)
+
+    def finalize(self, *, keep_log: bool, extra_suffix: bytes = b"") -> None:
+        if not keep_log or self.log_path is None or self.write_error or self.untrusted_error:
+            self._close_and_unlink_tmp()
+            return
+        if extra_suffix:
+            self._open_spool_if_needed()
+            if self._fh is not None:
+                try:
+                    self._fh.write(extra_suffix)
+                except OSError as exc:
+                    self.write_error = f"Failed writing local run log {self.log_path}: {exc}"
+                    self._close_and_unlink_tmp()
+                    return
+        if self._fh is None or self._tmp_path is None:
+            return
+        try:
+            self._fh.flush()
+            os.fsync(self._fh.fileno())
+            self._fh.close()
+            self._fh = None
+            if self.log_path.is_symlink() or (
+                os.path.lexists(self.log_path) and not self.log_path.is_file()
+            ):
+                self.untrusted_error = f"Refusing unsafe log target path: {self.log_path}"
+                self._close_and_unlink_tmp()
+                return
+            os.replace(self._tmp_path, self.log_path)
+            self._tmp_path = None
+            self.log_written = True
+        except OSError as exc:
+            self.write_error = f"Failed finalizing local run log {self.log_path}: {exc}"
+            self._close_and_unlink_tmp()
+
+    def render_text(self) -> str:
+        if self.total_bytes == 0:
+            return ""
+        tail_bytes = b"".join(self._tail_chunks)
+        if self.total_bytes <= len(self._head):
+            return bytes(self._head).decode("utf-8", errors="replace")
+        if self.total_bytes <= len(self._head) + len(tail_bytes):
+            overlap = (len(self._head) + len(tail_bytes)) - self.total_bytes
+            combined = bytes(self._head) + tail_bytes[overlap:]
+            return combined.decode("utf-8", errors="replace")
+
+        omitted = self.total_bytes - len(self._head) - len(tail_bytes)
+        parts: List[str] = [bytes(self._head).decode("utf-8", errors="replace")]
+        parts.append(
+            f"\n[colab_tpu_bench] ... {omitted} bytes omitted from bounded in-memory capture ...\n"
+        )
+        if self.saw_session_ready and self._READY_BYTES not in self._head.lower():
+            parts.append("[colab] Session READY (observed in streamed stderr)\n")
+        if self._captured_probe is not None:
+            parts.append(self._captured_probe.decode("utf-8", errors="replace") + "\n")
+        parts.append(tail_bytes.decode("utf-8", errors="replace"))
+        return "".join(parts)
+
+
+def _extract_run_session_from_cmd(cmd_list: Sequence[str]) -> Optional[str]:
+    """Return the validated `-s <sess>` name from a `colab run` invocation, if present."""
+    try:
+        run_idx = cmd_list.index("run")
+    except ValueError:
+        return None
+    for idx in range(run_idx + 1, len(cmd_list)):
+        tok = cmd_list[idx]
+        if tok == "--":
+            break
+        if tok in ("-s", "--session") and idx + 1 < len(cmd_list):
+            candidate = cmd_list[idx + 1]
+            if (
+                candidate
+                and ".." not in candidate
+                and _SAFE_STORED_SESSION_RE.fullmatch(candidate)
+            ):
+                return candidate
+            return None
+    return None
+
+
 def make_subprocess_runner(
     request_timeout_s: Optional[float] = None,
     run_wall_timeout_s: Optional[float] = None,
+    log_dir: Optional[Path] = None,
+    max_capture_bytes: int = DEFAULT_MAX_CAPTURE_BYTES,
 ) -> CommandRunner:
-    """Create a non-interactive subprocess runner that captures stdout/stderr incrementally."""
+    """Create a non-interactive subprocess runner with bounded memory and optional log streaming."""
 
     def _run(cmd: Sequence[str]) -> CommandResult:
         cmd_list = list(cmd)
@@ -809,7 +1091,8 @@ def make_subprocess_runner(
         # Disable Colab CLI's internal allocation POST retry so an ambiguous timeout/disconnect
         # cannot be masked by a subsequent 412 refusal that would falsely trigger v5e1 fallback.
         env["COLAB_CLI_ASSIGN_RETRIES"] = "0"
-        is_run_cmd = "run" in cmd_list
+        run_session = _extract_run_session_from_cmd(cmd_list)
+        is_run_cmd = run_session is not None or "run" in cmd_list
         if is_run_cmd:
             wall_timeout: Optional[float] = (
                 run_wall_timeout_s
@@ -819,6 +1102,29 @@ def make_subprocess_runner(
         else:
             wall_timeout = max(effective_req_timeout * 2.0, 120.0)
 
+        out_log_path = (
+            log_dir / f"{run_session}.stdout.txt"
+            if (log_dir is not None and run_session is not None)
+            else None
+        )
+        err_log_path = (
+            log_dir / f"{run_session}.stderr.txt"
+            if (log_dir is not None and run_session is not None)
+            else None
+        )
+        out_cap = _BoundedStreamCapture(
+            log_path=out_log_path,
+            max_capture_bytes=max_capture_bytes,
+            capture_probe=True,
+            track_session_ready=False,
+        )
+        err_cap = _BoundedStreamCapture(
+            log_path=err_log_path,
+            max_capture_bytes=max_capture_bytes,
+            capture_probe=False,
+            track_session_ready=True,
+        )
+
         proc = subprocess.Popen(
             cmd_list,
             stdin=subprocess.DEVNULL,
@@ -826,10 +1132,8 @@ def make_subprocess_runner(
             stderr=subprocess.PIPE,
             env=env,
         )
-        out_chunks: List[bytes] = []
-        err_chunks: List[bytes] = []
 
-        def _drain_pipe(stream: Any, sink: List[bytes]) -> None:
+        def _drain_pipe(stream: Any, cap: _BoundedStreamCapture) -> None:
             if stream is None:
                 return
             read_fn = getattr(stream, "read1", stream.read)
@@ -838,7 +1142,7 @@ def make_subprocess_runner(
                     chunk = read_fn(4096)
                     if not chunk:
                         break
-                    sink.append(chunk)
+                    cap.feed(chunk)
             except OSError:
                 pass
             finally:
@@ -848,21 +1152,31 @@ def make_subprocess_runner(
                     pass
 
         t_out = threading.Thread(
-            target=_drain_pipe, args=(proc.stdout, out_chunks), daemon=True
+            target=_drain_pipe, args=(proc.stdout, out_cap), daemon=True
         )
         t_err = threading.Thread(
-            target=_drain_pipe, args=(proc.stderr, err_chunks), daemon=True
+            target=_drain_pipe, args=(proc.stderr, err_cap), daemon=True
         )
         t_out.start()
         t_err.start()
 
-        def _collect_output(join_timeout: float = 2.0) -> Tuple[str, str]:
+        def _collect_output(
+            join_timeout: float = 2.0,
+            *,
+            keep_out_log: bool = False,
+            keep_err_log: bool = False,
+            err_suffix: bytes = b"",
+        ) -> Tuple[str, str]:
             t_out.join(timeout=join_timeout)
             t_err.join(timeout=join_timeout)
-            return (
-                b"".join(out_chunks).decode("utf-8", errors="replace"),
-                b"".join(err_chunks).decode("utf-8", errors="replace"),
-            )
+            out_cap.finalize(keep_log=keep_out_log)
+            err_cap.finalize(keep_log=keep_err_log, extra_suffix=err_suffix)
+            return out_cap.render_text(), err_cap.render_text()
+
+        def _combined_log_errors() -> Tuple[Optional[str], Optional[str]]:
+            untrusted = out_cap.untrusted_error or err_cap.untrusted_error
+            write_err = out_cap.write_error or err_cap.write_error
+            return write_err, untrusted
 
         def _terminate_and_reap() -> None:
             if proc.poll() is None:
@@ -881,37 +1195,78 @@ def make_subprocess_runner(
 
         try:
             proc.wait(timeout=wall_timeout)
-            out_txt, err_txt = _collect_output(join_timeout=5.0)
+            rc = proc.returncode if proc.returncode is not None else 1
+            out_txt, err_txt = _collect_output(
+                join_timeout=5.0,
+                keep_out_log=(out_cap.total_bytes > 0),
+                keep_err_log=(rc != 0 and err_cap.total_bytes > 0),
+            )
+            write_err, untrusted_err = _combined_log_errors()
             return CommandResult(
-                returncode=proc.returncode if proc.returncode is not None else 1,
+                returncode=rc,
                 stdout=out_txt,
                 stderr=err_txt,
                 timed_out=False,
+                stdout_log_written=out_cap.log_written,
+                stderr_log_written=err_cap.log_written,
+                log_write_error=write_err,
+                untrusted_log_error=untrusted_err,
             )
         except subprocess.TimeoutExpired:
             _terminate_and_reap()
-            out_txt, err_txt = _collect_output(join_timeout=2.0)
             timeout_label = f"{wall_timeout:.1f}s" if wall_timeout is not None else "configured"
             note = (
                 f"[colab_tpu_bench] `colab` subprocess exceeded wall timeout "
                 f"({timeout_label}); stopping session and reconciling active sessions."
             )
+            suffix_bytes = ("\n" + note + "\n").encode("utf-8") if err_cap.total_bytes > 0 else (note + "\n").encode("utf-8")
+            out_txt, err_txt = _collect_output(
+                join_timeout=2.0,
+                keep_out_log=(out_cap.total_bytes > 0),
+                keep_err_log=True,
+                err_suffix=suffix_bytes,
+            )
             combined_err = f"{err_txt}\n{note}".strip() if err_txt else note
+            write_err, untrusted_err = _combined_log_errors()
             return CommandResult(
                 returncode=124,
                 stdout=out_txt,
                 stderr=combined_err + "\n",
                 timed_out=True,
+                stdout_log_written=out_cap.log_written,
+                stderr_log_written=err_cap.log_written,
+                log_write_error=write_err,
+                untrusted_log_error=untrusted_err,
             )
         except (KeyboardInterrupt, TerminationSignal) as exc:
             _terminate_and_reap()
-            out_txt, err_txt = _collect_output(join_timeout=2.0)
             is_sigterm = isinstance(exc, TerminationSignal)
+            cancel_note = (
+                "[colab_tpu_bench] Terminated by supervisor (SIGTERM)."
+                if is_sigterm
+                else "[colab_tpu_bench] Interrupted by operator (KeyboardInterrupt)."
+            )
+            suffix_bytes = (
+                ("\n" + cancel_note + "\n").encode("utf-8")
+                if err_cap.total_bytes > 0
+                else (cancel_note + "\n").encode("utf-8")
+            )
+            out_txt, err_txt = _collect_output(
+                join_timeout=2.0,
+                keep_out_log=(out_cap.total_bytes > 0),
+                keep_err_log=True,
+                err_suffix=suffix_bytes,
+            )
+            write_err, untrusted_err = _combined_log_errors()
             raise CommandCancelledError(
                 signal_name="SIGTERM" if is_sigterm else "SIGINT",
                 returncode=143 if is_sigterm else 130,
                 stdout=out_txt,
                 stderr=err_txt,
+                stdout_log_written=out_cap.log_written,
+                stderr_log_written=err_cap.log_written,
+                log_write_error=write_err,
+                untrusted_log_error=untrusted_err,
             ) from exc
 
     return _run
@@ -999,6 +1354,131 @@ def extract_endpoint_from_notebook(nb_path: Path) -> Optional[str]:
     """Extract server endpoint ID recorded in a `colab log -o *.ipynb` session header."""
     endpoint, _ = inspect_exported_notebook(nb_path)
     return endpoint
+
+
+def read_endpoint_from_history(
+    session_name: str,
+    history_dir: Optional[Path] = None,
+) -> Optional[str]:
+    """Read the last `session_created` endpoint for `session_name` from Colab CLI history JSONL.
+
+    Colab CLI 0.8.0 records `session_created` (including `endpoint`) in
+    `~/.config/colab-cli/history/<session_name>.jsonl` immediately on allocation, even if
+    `colab run` later removes the local session mapping or `colab log -o *.ipynb` fails
+    (e.g., when the artifact volume is full). Never returns or logs non-endpoint fields.
+    """
+    if (
+        not isinstance(session_name, str)
+        or not session_name
+        or ".." in session_name
+        or not _SAFE_STORED_SESSION_RE.fullmatch(session_name)
+    ):
+        return None
+    raw_dir = (
+        Path(os.path.expanduser(str(history_dir)))
+        if history_dir is not None
+        else Path(os.path.expanduser("~/.config/colab-cli/history"))
+    )
+    if not os.path.lexists(raw_dir) or os.path.islink(raw_dir):
+        return None
+    try:
+        dir_st = os.lstat(raw_dir)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(dir_st.st_mode):
+        return None
+    euid = os.geteuid() if hasattr(os, "geteuid") else None
+    if euid is not None and dir_st.st_uid != euid:
+        return None
+    if (dir_st.st_mode & 0o022) != 0:
+        return None
+
+    log_path = raw_dir / f"{session_name}.jsonl"
+    if not os.path.lexists(log_path) or os.path.islink(log_path):
+        return None
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(log_path, flags)
+    except OSError:
+        return None
+    endpoint: Optional[str] = None
+    try:
+        fst = os.fstat(fd)
+        if not stat.S_ISREG(fst.st_mode):
+            return None
+        if euid is not None and fst.st_uid != euid:
+            return None
+        if (fst.st_mode & 0o022) != 0:
+            return None
+        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as fh:
+            fd = -1
+            for raw_line in fh:
+                if len(raw_line) > 256 * 1024:
+                    continue
+                line = raw_line.strip()
+                if not line or '"session_created"' not in line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (
+                    isinstance(obj, dict)
+                    and obj.get("event_type") == "session_created"
+                    and isinstance(obj.get("endpoint"), str)
+                    and obj["endpoint"].strip()
+                ):
+                    endpoint = obj["endpoint"].strip()
+    except OSError:
+        return endpoint
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    return endpoint
+
+
+def read_endpoint_from_session_store(
+    config_path: Path,
+    session_name: str,
+) -> Optional[str]:
+    """Read only the non-secret `endpoint` for `session_name` from an isolated session store."""
+    if not os.path.lexists(config_path) or os.path.islink(config_path):
+        return None
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(config_path, flags)
+    except OSError:
+        return None
+    try:
+        fst = os.fstat(fd)
+        euid = os.geteuid() if hasattr(os, "geteuid") else None
+        if (
+            not stat.S_ISREG(fst.st_mode)
+            or (euid is not None and fst.st_uid != euid)
+            or (fst.st_mode & 0o022) != 0
+            or fst.st_size > 2 * 1024 * 1024
+        ):
+            return None
+        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as fh:
+            fd = -1
+            data = json.loads(fh.read())
+    except (OSError, json.JSONDecodeError):
+        return None
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    if not isinstance(data, dict):
+        return None
+    entry = data.get(session_name)
+    if isinstance(entry, dict) and isinstance(entry.get("endpoint"), str) and entry["endpoint"].strip():
+        return entry["endpoint"].strip()
+    return None
 
 
 def detect_cli_capabilities(
@@ -1102,10 +1582,10 @@ def is_wall_timeout_error(res: CommandResult) -> bool:
 
 
 _UNCERTAIN_ALLOC_HTTP_RE = re.compile(
-    r"(?:\bhttp(?:\s+error)?\s*(?:502|503|504)\b|"
-    r"\b(?:502|503|504)\s+(?:server error|bad gateway|service unavailable|gateway time-?out)\b|"
-    r"\bstatus(?:\s+code)?\s*[=:]\s*(?:502|503|504)\b|"
-    r"\b(?:bad gateway|service unavailable|gateway time-?out)\b)",
+    r"(?:\bhttp(?:\s+error)?\s*5\d\d\b|"
+    r"\b5\d\d\s+(?:server error|internal server error|bad gateway|service unavailable|gateway time-?out)\b|"
+    r"\bstatus(?:[\s_]+code)?\s*[=:]\s*5\d\d\b|"
+    r"\b(?:internal server error|bad gateway|service unavailable|gateway time-?out)\b)",
     re.IGNORECASE,
 )
 
@@ -1373,11 +1853,6 @@ def run_benchmark(
 
     effective_wall_timeout = resolve_effective_wall_timeout(cfg.timeout_s, cfg.wall_timeout_s)
     using_default_runner = runner is None
-    if runner is None:
-        runner = make_subprocess_runner(
-            cfg.request_timeout_s,
-            run_wall_timeout_s=effective_wall_timeout,
-        )
 
     for arg in cfg.script_args:
         if arg == "--env" or arg.startswith("--env="):
@@ -1417,6 +1892,13 @@ def run_benchmark(
             out_dir = _ensure_private_dir(cfg.out_dir)
     except UntrustedPathError as exc:
         return 2, {"status": "untrusted_out_dir", "error": str(exc)}
+
+    if runner is None:
+        runner = make_subprocess_runner(
+            cfg.request_timeout_s,
+            run_wall_timeout_s=effective_wall_timeout,
+            log_dir=out_dir,
+        )
 
     session_prefix = cfg.session_name or "freetpu"
     session_base = f"{session_prefix}-{uuid.uuid4().hex[:8]}"
@@ -1679,6 +2161,15 @@ def run_benchmark(
             err_msg = f"`colab stop -s {sess_name}` exited 0 with authentication error: {diag}"
         return stop_res, err_msg
 
+    def _recover_session_endpoint(sess_name: str) -> Optional[str]:
+        nonlocal created_endpoint
+        ep = read_endpoint_from_history(sess_name)
+        if not ep:
+            ep = read_endpoint_from_session_store(isolated_config, sess_name)
+        if ep:
+            created_endpoint = ep
+        return ep
+
     def _export_session_log(sess_name: str) -> None:
         nonlocal export_attempted, export_ok, export_metadata_only
         nonlocal export_returncode, export_error, export_stderr_tail
@@ -1701,7 +2192,9 @@ def run_benchmark(
         if log_res.stderr.strip():
             export_stderr_tail = log_res.stderr.strip()[-1000:]
         if log_res.returncode == 0 and not nb_path.is_symlink() and nb_path.is_file():
-            created_endpoint, has_code_cell = inspect_exported_notebook(nb_path)
+            nb_endpoint, has_code_cell = inspect_exported_notebook(nb_path)
+            if nb_endpoint:
+                created_endpoint = nb_endpoint
             if has_code_cell:
                 proof_notebook = nb_path
                 metadata_notebook = None
@@ -1770,11 +2263,19 @@ def run_benchmark(
                     cancel_rc = cancel_exc.returncode
                     partial_stdout = cancel_exc.stdout
                     partial_stderr = cancel_exc.stderr
+                    cancel_stdout_written = cancel_exc.stdout_log_written
+                    cancel_stderr_written = cancel_exc.stderr_log_written
+                    if cancel_exc.untrusted_log_error:
+                        untrusted_target_error = cancel_exc.untrusted_log_error
+                    if cancel_exc.log_write_error and artifact_write_error is None:
+                        artifact_write_error = cancel_exc.log_write_error
                 else:
                     is_sigterm = isinstance(cancel_exc, TerminationSignal)
                     cancel_rc = 143 if is_sigterm else 130
                     partial_stdout = ""
                     partial_stderr = ""
+                    cancel_stdout_written = False
+                    cancel_stderr_written = False
 
                 if is_sigterm:
                     terminated = True
@@ -1785,6 +2286,9 @@ def run_benchmark(
                 if chosen_tpu is None:
                     chosen_tpu = tpu
                     chosen_session = sess
+
+                # Recover the allocated endpoint independently of notebook export before stop/reconcile.
+                _recover_session_endpoint(sess)
 
                 cancel_note = (
                     "[colab_tpu_bench] Terminated by supervisor (SIGTERM)."
@@ -1820,23 +2324,34 @@ def run_benchmark(
                     forced_stop["stderr_tail"] = stop_res.stderr.strip()[-1000:]
                 forced_stop["error"] = stop_err
 
-                try:
-                    if partial_stdout:
-                        _write_text_nofollow(out_dir / f"{sess}.stdout.txt", partial_stdout)
-                    if combined_cancel_stderr:
-                        _write_text_nofollow(
-                            out_dir / f"{sess}.stderr.txt", combined_cancel_stderr
-                        )
-                except UntrustedPathError as exc:
-                    untrusted_target_error = str(exc)
-                except OSError as exc:
-                    artifact_write_error = f"Failed writing local run logs: {exc}"
+                if untrusted_target_error is None:
+                    try:
+                        if partial_stdout and not cancel_stdout_written:
+                            _write_text_nofollow(out_dir / f"{sess}.stdout.txt", partial_stdout)
+                        if combined_cancel_stderr and not cancel_stderr_written:
+                            _write_text_nofollow(
+                                out_dir / f"{sess}.stderr.txt", combined_cancel_stderr
+                            )
+                    except UntrustedPathError as exc:
+                        untrusted_target_error = str(exc)
+                    except OSError as exc:
+                        if artifact_write_error is None:
+                            artifact_write_error = f"Failed writing local run logs: {exc}"
 
                 if untrusted_target_error is None:
                     _export_session_log(sess)
                 break
             finally:
                 in_cleanup = True
+
+            if res.untrusted_log_error:
+                untrusted_target_error = res.untrusted_log_error
+            if res.log_write_error and artifact_write_error is None:
+                artifact_write_error = res.log_write_error
+
+            # Recover the allocated endpoint from Colab CLI's session_created history event
+            # independently of notebook export so an export or disk-full failure cannot hide a TPU.
+            _recover_session_endpoint(sess)
 
             attempt_rec = {
                 "tpu": tpu,
@@ -1889,16 +2404,20 @@ def run_benchmark(
                     forced_stop["stderr_tail"] = stop_res.stderr.strip()[-1000:]
                 forced_stop["error"] = stop_err
 
+            if untrusted_target_error is not None:
+                break
+
             try:
-                if res.stdout:
+                if res.stdout and not res.stdout_log_written:
                     _write_text_nofollow(out_dir / f"{sess}.stdout.txt", res.stdout)
-                if res.returncode != 0 and res.stderr:
+                if res.returncode != 0 and res.stderr and not res.stderr_log_written:
                     _write_text_nofollow(out_dir / f"{sess}.stderr.txt", res.stderr)
             except UntrustedPathError as exc:
                 untrusted_target_error = str(exc)
                 break
             except OSError as exc:
-                artifact_write_error = f"Failed writing local run logs: {exc}"
+                if artifact_write_error is None:
+                    artifact_write_error = f"Failed writing local run logs: {exc}"
 
             if res.returncode == 0:
                 chosen_tpu = tpu
@@ -2011,10 +2530,33 @@ def run_benchmark(
                 _write_recovery_session_store(rec_path, rec_session, endpoint)
                 recovery_config_path = rec_path
                 return rec_path, rec_cmd, None
-            except (UntrustedPathError, OSError) as exc:
+            except OSError as exc:
+                # If the artifact volume is full or read-only, fall back to a private tempdir
+                # recovery store so `colab stop` can still release a billable TPU runtime.
+                try:
+                    env_tmp = os.environ.get("TMPDIR")
+                    tmp_root = Path(env_tmp if env_tmp else tempfile.gettempdir())
+                    canonical_tmp = _resolve_and_validate_existing_dir(tmp_root)
+                    fb_dir = Path(
+                        tempfile.mkdtemp(
+                            prefix="freetpu-colab-recovery-", dir=str(canonical_tmp)
+                        )
+                    )
+                    os.chmod(fb_dir, 0o700)
+                    fb_path = fb_dir / f"colab-recovery.{rec_session}.json"
+                    _write_recovery_session_store(fb_path, rec_session, endpoint)
+                    recovery_config_path = fb_path
+                    return fb_path, build_base_cmd(cfg, caps, fb_path), None
+                except (UntrustedPathError, OSError):
+                    return rec_path, rec_cmd, str(exc)
+            except UntrustedPathError as exc:
                 return rec_path, rec_cmd, str(exc)
 
         if maybe_allocated:
+            if created_endpoint is None:
+                for sname in reversed(attempted_sessions):
+                    if _recover_session_endpoint(sname):
+                        break
             (
                 query_err,
                 query_is_auth_err,
@@ -3820,8 +4362,10 @@ def run_self_test() -> int:
                         self.v = v
 
                 assert __name__ == "__main__"
-                assert __file__ == "future_bench.py"
-                assert sys.argv == ["future_bench.py", "--iters", "3"]
+                import os as _os
+                assert _os.path.basename(__file__) == "future_bench.py"
+                assert _os.path.isfile(__file__)
+                assert sys.argv == [__file__, "--iters", "3"]
                 b = make_box(7)
                 assert b.v == 7
                 assert pickle.loads(pickle.dumps(b)).v == 7
@@ -4096,8 +4640,9 @@ def run_self_test() -> int:
                 from pathlib import Path
                 import sys
                 assert Path(__file__).name == "plain_file_user.py"
+                assert Path(__file__).is_file()
                 assert __name__ == "__main__"
-                assert sys.argv == ["plain_file_user.py", "--ok"]
+                assert sys.argv == [__file__, "--ok"]
                 """
             ),
             encoding="utf-8",
@@ -4298,7 +4843,288 @@ def run_self_test() -> int:
         assert rc_hr == 2, f"Expected hour-only timestamp rejected: {sum_hr}"
         assert sum_hr["status"] == "untrusted_config_path"
 
-    print("colab_tpu_bench.py self-test PASSED (53/53 suites).")
+        # 54. Recover TPU endpoint independently from Colab CLI history JSONL even when
+        #     notebook export fails (e.g., disk full) and local session mapping was removed,
+        #     so `[?]` in `colab sessions` triggers stop retries instead of ambiguity.
+        sample_probe: Dict[str, Any] = {
+            "jax": {
+                "version": "0.5.0",
+                "default_backend": "tpu",
+                "device_count": 1,
+                "devices": [{"id": 0, "platform": "tpu"}],
+            },
+            "benchmark": {
+                "hardware": "colab-tpu",
+                "hw_us": 120.0,
+                "gflops": 1000.0,
+            },
+        }
+        fake_home = tmp_path / "hist-home"
+        hist_dir = fake_home / ".config" / "colab-cli" / "history"
+        hist_dir.mkdir(parents=True, mode=0o700)
+        os.chmod(fake_home, 0o700)
+        os.chmod(fake_home / ".config", 0o700)
+        os.chmod(fake_home / ".config" / "colab-cli", 0o700)
+        os.chmod(hist_dir, 0o700)
+        old_home = os.environ.get("HOME")
+        os.environ["HOME"] = str(fake_home)
+        try:
+            hist_state = {"stopped": False, "stop_configs": [], "sessions_calls": 0}
+
+            def history_recovery_runner(cmd: Sequence[str]) -> CommandResult:
+                if "--help" in cmd:
+                    return CommandResult(0, "Usage: colab --auth --config --no-public-api\n", "")
+                if "version" in cmd:
+                    return CommandResult(0, "Version: 0.8.0\n", "")
+                if "usage" in cmd:
+                    return CommandResult(
+                        0,
+                        "Current balance: 100.00 compute units\nUsage rate: 0.00 / hr\nActive assignments: 0\n",
+                        "",
+                    )
+                if "run" in cmd:
+                    s_idx = cmd.index("-s")
+                    sess_name = cmd[s_idx + 1]
+                    # Simulate Colab CLI 0.8.0 writing `session_created` to history JSONL and then
+                    # removing the session mapping from `--config` even though unassign failed.
+                    hfile = hist_dir / f"{sess_name}.jsonl"
+                    hfile.write_text(
+                        json.dumps(
+                            {
+                                "timestamp": "2026-11-22T15:30:00+00:00",
+                                "event_type": "session_created",
+                                "endpoint": "m-s-hist-recovered-99",
+                                "accelerator": "V6E1",
+                            }
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                    os.chmod(hfile, 0o600)
+                    return CommandResult(
+                        0,
+                        f"{PROBE_JSON_BEGIN}\n{json.dumps(sample_probe)}\n{PROBE_JSON_END}\n",
+                        f"[colab] Session READY ({sess_name}). Executing...\n",
+                    )
+                if "log" in cmd:
+                    return CommandResult(1, "", "OSError: [Errno 28] No space left on device\n")
+                if "sessions" in cmd:
+                    hist_state["sessions_calls"] += 1
+                    if hist_state["sessions_calls"] == 1 or hist_state["stopped"]:
+                        return CommandResult(0, "[colab] No active sessions found on server.\n", "")
+                    # Active TPU appears as `[?]` because Colab CLI removed the local mapping!
+                    return CommandResult(
+                        0,
+                        "[?] m-s-hist-recovered-99 | Hardware: V6E1 | Shape: STANDARD | Variant: TPU\n",
+                        "",
+                    )
+                if "stop" in cmd:
+                    c_idx = cmd.index("--config")
+                    rec_cfg_path = Path(cmd[c_idx + 1])
+                    rec_data = json.loads(rec_cfg_path.read_text(encoding="utf-8"))
+                    s_idx = cmd.index("-s")
+                    sess_name = cmd[s_idx + 1]
+                    assert rec_data[sess_name]["endpoint"] == "m-s-hist-recovered-99"
+                    hist_state["stop_configs"].append(str(rec_cfg_path))
+                    hist_state["stopped"] = True
+                    return CommandResult(0, "[colab] Stopped session.\n", "")
+                raise AssertionError(f"Unexpected cmd: {cmd}")
+
+            rc_hrec, sum_hrec = run_benchmark(
+                BenchConfig(
+                    tpus=("v6e1",),
+                    out_dir=tmp_path / "hist-recovery-out",
+                    teardown_retries=2,
+                    teardown_retry_delay_s=0.0,
+                ),
+                runner=history_recovery_runner,
+            )
+            assert sum_hrec["created_endpoint"] == "m-s-hist-recovered-99", sum_hrec
+            assert sum_hrec["teardown_verified"] is True, sum_hrec
+            assert sum_hrec["ambiguous_endpoints"] == [], sum_hrec
+            assert sum_hrec["leaked_endpoints"] == [], sum_hrec
+            assert len(sum_hrec["release_retries"]) == 1, sum_hrec
+            assert sum_hrec["release_retries"][0]["endpoint"] == "m-s-hist-recovered-99"
+            assert sum_hrec["proof_export"]["ok"] is False
+            assert sum_hrec["status"] == "proof_export_failed", sum_hrec
+            assert rc_hrec == 1
+        finally:
+            if old_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = old_home
+
+        # 55. Bound in-memory capture for verbose workloads while streaming full logs to private
+        #     files, preserving probe JSON in the middle, and surviving disk write OSErrors.
+        stream_dir = tmp_path / "stream-logs"
+        stream_dir.mkdir(mode=0o700)
+        os.chmod(stream_dir, 0o700)
+        verbose_script = tmp_path / "emit_verbose.py"
+        verbose_script.write_text(
+            textwrap.dedent(
+                f"""\
+                import json, sys
+                chunk = "A" * 65536 + "\\n"
+                for _ in range(16):
+                    sys.stdout.write(chunk)
+                sys.stdout.write({PROBE_JSON_BEGIN!r} + "\\n")
+                sys.stdout.write(json.dumps({sample_probe!r}) + "\\n")
+                sys.stdout.write({PROBE_JSON_END!r} + "\\n")
+                for _ in range(16):
+                    sys.stdout.write("B" * 65536 + "\\n")
+                sys.stderr.write("[colab] Session READY (verbose-sess). Executing...\\n")
+                """
+            ),
+            encoding="utf-8",
+        )
+        bounded_runner = make_subprocess_runner(
+            request_timeout_s=30.0,
+            run_wall_timeout_s=30.0,
+            log_dir=stream_dir,
+            max_capture_bytes=8192,
+        )
+        # Simulate a `colab run -s verbose-sess` invocation using sys.executable so `-s` log
+        # routing activates in `make_subprocess_runner`.
+        res_verb = bounded_runner(
+            [
+                sys.executable,
+                "-c",
+                "import runpy, sys; runpy.run_path(sys.argv[-1], run_name='__main__')",
+                "run",
+                "-s",
+                "verbose-sess",
+                "--",
+                str(verbose_script),
+            ]
+        )
+        assert res_verb.returncode == 0, res_verb.stderr
+        assert res_verb.stdout_log_written is True
+        assert res_verb.log_write_error is None
+        assert len(res_verb.stdout) < 64 * 1024, f"Expected bounded RAM, got {len(res_verb.stdout)}"
+        parsed_verb = extract_probe_json(res_verb.stdout)
+        assert parsed_verb == sample_probe, f"Probe lost in bounded stream: {parsed_verb}"
+        streamed_log = stream_dir / "verbose-sess.stdout.txt"
+        assert streamed_log.is_file()
+        assert streamed_log.stat().st_size > 2 * 1024 * 1024
+        assert (stat.S_IMODE(streamed_log.stat().st_mode) & 0o077) == 0
+
+        # Verify disk-full OSError during log write degrades cleanly without crashing capture.
+        cap_disk_full = _BoundedStreamCapture(
+            log_path=stream_dir / "disk-full.stdout.txt",
+            max_capture_bytes=2048,
+            capture_probe=True,
+        )
+        class _FailWriter:
+            def write(self, _data: bytes) -> int:
+                raise OSError(28, "No space left on device")
+            def close(self) -> None:
+                pass
+        cap_disk_full._fh = _FailWriter()
+        cap_disk_full.feed(b"head-" * 300)
+        cap_disk_full.feed(
+            f"\n{PROBE_JSON_BEGIN}\n{json.dumps(sample_probe)}\n{PROBE_JSON_END}\n".encode("utf-8")
+        )
+        cap_disk_full.feed(b"tail-" * 300)
+        cap_disk_full.finalize(keep_log=True)
+        assert cap_disk_full.write_error is not None
+        assert cap_disk_full.log_written is False
+        assert extract_probe_json(cap_disk_full.render_text()) == sample_probe
+
+        # 56. Pre-READY HTTP 500 Internal Server Error keeps allocation outcome unresolved
+        #     (blocks v5e1 fallback, keeps teardown_verified=False, surfaces recheck guidance).
+        assert is_allocation_timeout_error(
+            1,
+            "requests.exceptions.HTTPError: 500 Server Error: Internal Server Error for url: https://colab.research.google.com/tun/m/assign",
+        )
+        assert is_allocation_timeout_error(1, "HTTP Error 500: Internal Server Error")
+        assert is_allocation_timeout_error(1, "status_code=500")
+        assert not is_capacity_or_quota_error(
+            1, "", "requests.exceptions.HTTPError: 500 Server Error: Internal Server Error"
+        )
+
+        http500_runs: List[str] = []
+
+        def http500_alloc_runner(cmd: Sequence[str]) -> CommandResult:
+            if "--help" in cmd:
+                return CommandResult(0, "Usage: colab --auth --config --no-public-api\n", "")
+            if "version" in cmd:
+                return CommandResult(0, "Version: 0.8.0\n", "")
+            if "usage" in cmd:
+                return CommandResult(
+                    0,
+                    "Current balance: 100.00 compute units\nUsage rate: 0.00 / hr\nActive assignments: 0\n",
+                    "",
+                )
+            if "sessions" in cmd:
+                return CommandResult(0, "[colab] No active sessions found on server.\n", "")
+            if "run" in cmd:
+                tpu_arg = cmd[cmd.index("--tpu") + 1]
+                http500_runs.append(tpu_arg)
+                return CommandResult(
+                    1,
+                    "",
+                    "requests.exceptions.HTTPError: 500 Server Error: Internal Server Error for url: https://colab.research.google.com/tun/m/assign\n",
+                )
+            raise AssertionError(f"Unexpected cmd: {cmd}")
+
+        rc_500, sum_500 = run_benchmark(
+            BenchConfig(tpus=("v6e1", "v5e1"), out_dir=tmp_path / "http500-out"),
+            runner=http500_alloc_runner,
+        )
+        assert http500_runs == ["V6E1"], f"HTTP 500 must not fall back to V5E1: {http500_runs}"
+        assert rc_500 != 0
+        assert sum_500["teardown_verified"] is False, sum_500
+        assert sum_500["status"] == "allocation_timeout_unreconciled", sum_500
+        assert "sessions" in (sum_500["teardown_error"] or ""), sum_500
+
+        # 57. Wrapped custom script materializes its source file at runtime so both
+        #     `open(__file__)` and `inspect.getsource(fn)` succeed.
+        inspect_script = custom_dir / "inspect_self_bench.py"
+        inspect_script.write_text(
+            textwrap.dedent(
+                """\
+                from __future__ import annotations
+                import inspect
+                from pathlib import Path
+
+                def sample_kernel_fn(x: int) -> int:
+                    return x * 2 + 1
+
+                src_disk = Path(__file__).read_text(encoding="utf-8")
+                assert "def sample_kernel_fn(x: int) -> int:" in src_disk
+                fn_src = inspect.getsource(sample_kernel_fn)
+                assert "return x * 2 + 1" in fn_src
+                assert Path(__file__).name == "inspect_self_bench.py"
+                """
+            ),
+            encoding="utf-8",
+        )
+        rc_insp, sum_insp = run_benchmark(
+            BenchConfig(
+                dry_run=True,
+                script_path=inspect_script,
+                out_dir=tmp_path / "inspect-self-out",
+            ),
+            runner=low_or_bad_cu_runner("unused"),
+        )
+        assert rc_insp == 0
+        assert sum_insp["wrapped_custom_script"] is True
+        insp_wrapper = Path(sum_insp["script"])
+        insp_prelude = (
+            "import sys, warnings\n"
+            f"sys.argv = [{insp_wrapper.name!r}]\n"
+            "__name__ = '__main__'\n"
+            "warnings.filterwarnings('ignore', message='To exit: use')\n"
+        )
+        proc_insp = subprocess.run(
+            [sys.executable, "-c", insp_prelude + insp_wrapper.read_text(encoding="utf-8")],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc_insp.returncode == 0, f"inspect/open(__file__) script failed: {proc_insp.stderr}"
+
+    print("colab_tpu_bench.py self-test PASSED (57/57 suites).")
     return 0
 
 
