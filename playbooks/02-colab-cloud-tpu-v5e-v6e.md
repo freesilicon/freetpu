@@ -1,6 +1,6 @@
 # Playbook 02: Cloud TPU `v6e-1` / `v5e-1` Headless Colab 60-Second Benchmark
 
-Run `nvbench`-style compute and `nvbandwidth`-style HBM2e streaming benchmarks headlessly on Google Colab Cloud TPU (`v6e-1` Trillium 32 GB HBM with automatic `v5e-1` 16 GB HBM fallback) and auto-stop cleanly with zero idle Compute Unit burn.
+Run `nvbench`-style compute and `nvbandwidth`-style HBM2e streaming benchmarks headlessly on Google Colab Cloud TPU (`v6e-1` Trillium 32 GB HBM with automatic `v5e-1` 16 GB HBM fallback) and verify session teardown via `colab sessions` / `colab stop -s` to prevent idle Compute Unit burn.
 
 ---
 
@@ -16,6 +16,9 @@ Run `nvbench`-style compute and `nvbandwidth`-style HBM2e streaming benchmarks h
 ### 1. Pre-Flight Compute Unit Check + 1-Command Headless Run (`v6e-1` -> `v5e-1`)
 
 ```bash
+# Isolate Colab session metadata in a private 0700 directory (never /tmp)
+mkdir -p -m 700 ~/.cache/freetpu-colab
+
 # Check available Compute Units before provisioning
 colab --auth=adc usage
 
@@ -25,7 +28,7 @@ python3 bench/freetpu_bench.py \
   --backend colab_tpu \
   --colab-auth adc \
   --colab-tpu auto \
-  --colab-config /tmp/freetpu-colab-sessions.json \
+  --colab-config ~/.cache/freetpu-colab/sessions.json \
   --json runs/colab-tpu.json \
   --markdown runs/colab-tpu.md
 
@@ -43,19 +46,22 @@ python3 bench/freetpu_bench.py \
   --suite compute,bandwidth \
   --backend colab_tpu \
   --colab-tpu v5e1 \
-  --colab-config /tmp/freetpu-colab-v5e1.json \
+  --colab-config ~/.cache/freetpu-colab/v5e1.json \
   --markdown runs/colab-v5e1.md
 ```
 
 ### 3. Direct `colab run` Invocation (Zero Wrapper)
 
 ```bash
-colab --auth=adc --config /tmp/freetpu-colab-direct.json run \
-  --tpu V5E1 --timeout 300 \
+mkdir -p -m 700 ~/.cache/freetpu-colab
+colab --auth=adc --config ~/.cache/freetpu-colab/direct.json run \
+  -s freetpu-bench-direct --tpu V5E1 --timeout 300 \
   bench/freetpu_bench.py --suite compute,bandwidth --backend jax_tpu --emit-markers
+# Verify the ephemeral session was released (stop explicitly if still listed)
+colab --auth=adc --config ~/.cache/freetpu-colab/direct.json sessions
 ```
 
-`colab run` provisions an ephemeral TPU VM, executes `bench/freetpu_bench.py`, streams stdout back, and immediately releases the VM on exit.
+`colab run` attempts to release the ephemeral TPU VM on exit, though network drops, timeouts, or CLI errors can leave a session active; always verify via `colab sessions` (and run `colab --auth=adc --config ... stop -s <session_id>` if any session remains).
 
 ---
 
@@ -73,6 +79,6 @@ colab --auth=adc --config /tmp/freetpu-colab-direct.json run \
 
 ## Operational Guardrails
 
-- **Always isolate `--colab-config`**: Passing `--colab-config /tmp/...` keeps parallel benchmark runs from overwriting your default `~/.config/colab-cli/sessions.json`.
-- **Automatic `v6e1 -> v5e1` Fallback**: If Colab returns `HTTP 412 / 400 / 503` or `REASON_NO_BACKENDS` during VM allocation, `freetpu_bench.py` falls back to `v5e1` automatically (never retrying after `[colab] Session READY` to avoid duplicate CU spend).
+- **Always isolate `--colab-config` in a private `0700` dir**: Passing `--colab-config ~/.cache/freetpu-colab/...` keeps parallel benchmark runs separate from `~/.config/colab-cli/sessions.json` and avoids shared `/tmp` directories.
+- **Automatic `v6e1 -> v5e1` Fallback & Session Verification**: If Colab refuses allocation before `[colab] Session READY`, `freetpu_bench.py` falls back to `v5e1` automatically (never retrying after `[colab] Session READY` to avoid duplicate CU spend) and checks `colab sessions` / calls `colab stop -s <session>` after execution to verify teardown.
 - **Scope Boundary**: Colab is strictly for single-chip R&D and reproducible benchmarking—never deploy public inference APIs or multi-tenant proxies on Colab runtimes.

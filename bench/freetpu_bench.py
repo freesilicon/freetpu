@@ -15,10 +15,10 @@ Suites:
               (GB/s) across 16 KB..4 MB PP/MoE payloads over TCP/USB-Ethernet.
 
 Backends:
-  - cpu         : Local NumPy reference execution.
-  - buenos_mock : Local Tensor G5 (buenos_a0) mock modeling 4x4 serpentine tiling,
-                  FP32-RNE INT8 requantization, 1:2 u8->BF16 W8A16 dequant, and
-                  0x640 Mode-A SiLU spline parity.
+  - cpu         : Local NumPy FP32/INT8 reference execution.
+  - buenos_mock : Local Tensor G5 (buenos_a0) mock running FP32 reference GEMM/SiLU
+                  with 4x4 serpentine tile count metadata, host INT8 FP32-RNE
+                  requantization, and FP32 W8A16 dequant.
   - jax_tpu     : Direct JAX/XLA execution on Cloud TPU (or JAX device).
   - colab_tpu   : Headless Google Colab TPU runner via `colab` CLI with isolated
                   `--config` state and automatic v6e1 -> v5e1 capacity fallback.
@@ -176,8 +176,8 @@ PUBLISHED_BASELINES: Tuple[ReferenceBaseline, ...] = (
         display_name="NVIDIA RTX 5090",
         status="published-reference",
         memory_spec="32 GB GDDR7",
-        peak_bf16_tflops=419.0,
-        peak_int8_tops=838.0,
+        peak_bf16_tflops=209.5,
+        peak_int8_tops=419.0,
         measured_bf16_tflops=None,
         measured_int8_tops=None,
         bandwidth_gbps=1792.0,
@@ -185,7 +185,7 @@ PUBLISHED_BASELINES: Tuple[ReferenceBaseline, ...] = (
         dispatch_floor_us="~5-15 us CUDA/Graph",
         hourly_cost_usd=0.50,
         pricing_basis="Specialized community GPU cloud ($0.50/GPU-hr midpoint of $0.32-$0.80/hr; $1,999 FE MSRP ~$0.20/hr self-hosted)",
-        source_citation="NVIDIA Blackwell RTX 5090 spec (dense Tensor Core) & public community cloud pricing",
+        source_citation="NVIDIA Blackwell RTX 5090 spec (dense non-sparse Tensor Core) & public community cloud pricing",
         verified_decode_tok_s=None,
         verified_decode_label=None,
     ),
@@ -267,7 +267,7 @@ def run_compute_local(backend: str, quick: bool = False) -> Dict[str, Any]:
     for m, k, n in gemm_shapes:
         flops = 2.0 * m * k * n
 
-        # 1. FP32/BF16-emulated GEMM
+        # 1. FP32 reference GEMM
         a_f = rng.standard_normal((m, k), dtype=np.float32)
         b_f = rng.standard_normal((k, n), dtype=np.float32)
         for _ in range(warmup):
@@ -281,9 +281,9 @@ def run_compute_local(backend: str, quick: bool = False) -> Dict[str, Any]:
         med_s = max(st["median_us"] * 1e-6, 1e-9)
         min_s = max(st["min_us"] * 1e-6, 1e-9)
         cases.append({
-            "name": "gemm_bf16_ref" if backend == "cpu" else "gemm_bf16_mock",
+            "name": "gemm_fp32_ref" if backend == "cpu" else "gemm_fp32_mock",
             "shape": [m, k, n],
-            "dtype": "bf16_emulated_f32",
+            "dtype": "fp32",
             "unit": "TFLOP/s",
             "median_perf": round((flops / med_s) / 1e12, 6),
             "peak_perf": round((flops / min_s) / 1e12, 6),
@@ -320,7 +320,7 @@ def run_compute_local(backend: str, quick: bool = False) -> Dict[str, Any]:
             **st,
         })
 
-    # 3. W8A16 (u8 + zp=128 -> f32 + per-channel scale) + Fused BF16-ref GEMM+SiLU
+    # 3. W8A16 (u8 + zp=128 -> f32 + per-channel scale) + Fused FP32-ref GEMM+SiLU
     m, k, n = gemm_shapes[-1]
     flops = 2.0 * m * k * n
     a_w8 = rng.standard_normal((m, k), dtype=np.float32)
@@ -346,9 +346,9 @@ def run_compute_local(backend: str, quick: bool = False) -> Dict[str, Any]:
     st_w8 = _stats_summary(samples_w8)
     st_f = _stats_summary(samples_fused)
     cases.append({
-        "name": "gemm_w8a16_dequant",
+        "name": "gemm_w8a16_dequant_fp32_ref" if backend == "cpu" else "gemm_w8a16_dequant_fp32_mock",
         "shape": [m, k, n],
-        "dtype": "w8a16",
+        "dtype": "w8a16_fp32_ref",
         "unit": "TFLOP/s",
         "median_perf": round((flops / max(st_w8["median_us"] * 1e-6, 1e-9)) / 1e12, 6),
         "peak_perf": round((flops / max(st_w8["min_us"] * 1e-6, 1e-9)) / 1e12, 6),
@@ -356,9 +356,9 @@ def run_compute_local(backend: str, quick: bool = False) -> Dict[str, Any]:
         **st_w8,
     })
     cases.append({
-        "name": "fused_gemm_silu",
+        "name": "fused_gemm_silu_fp32_ref" if backend == "cpu" else "fused_gemm_silu_fp32_mock",
         "shape": [m, k, n],
-        "dtype": "bf16_emulated_f32+silu",
+        "dtype": "fp32+silu",
         "unit": "TFLOP/s",
         "median_perf": round((flops / max(st_f["median_us"] * 1e-6, 1e-9)) / 1e12, 6),
         "peak_perf": round((flops / max(st_f["min_us"] * 1e-6, 1e-9)) / 1e12, 6),
@@ -367,7 +367,7 @@ def run_compute_local(backend: str, quick: bool = False) -> Dict[str, Any]:
     })
 
     # Dispatch floor is the median latency of the smallest 1x64x32 op.
-    floor_cases = [c for c in cases if c["shape"] == [1, 64, 32] and c["name"].startswith("gemm_bf16")]
+    floor_cases = [c for c in cases if c["shape"] == [1, 64, 32] and c["name"].startswith("gemm_fp32")]
     peak_bf16 = max((c["peak_perf"] for c in cases if c["unit"] == "TFLOP/s"), default=0.0)
     peak_int8 = max((c["peak_perf"] for c in cases if c["unit"] == "TOPS"), default=0.0)
     return {
@@ -454,6 +454,11 @@ def run_bandwidth_local(backend: str, quick: bool = False) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+MAX_COMMS_PAYLOAD_BYTES = 4 * 1024 * 1024
+COMMS_READ_TIMEOUT_S = 15.0
+MAX_COMMS_CONCURRENT_CONNS = 8
+
+
 def _recv_exact(sock: socket.socket, nbytes: int) -> bytes:
     buf = bytearray(nbytes)
     view = memoryview(buf)
@@ -466,24 +471,36 @@ def _recv_exact(sock: socket.socket, nbytes: int) -> bytes:
     return bytes(buf)
 
 
-def _handle_comms_conn(conn: socket.socket) -> None:
+def _handle_comms_conn(
+    conn: socket.socket,
+    sem: Optional[threading.BoundedSemaphore] = None,
+    max_payload_bytes: int = MAX_COMMS_PAYLOAD_BYTES,
+    read_timeout_s: float = COMMS_READ_TIMEOUT_S,
+) -> None:
     try:
-        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        try:
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        conn.settimeout(read_timeout_s)
         while True:
-            hdr = conn.recv(8)
-            if not hdr:
+            first = conn.recv(1)
+            if not first:
                 break
-            if len(hdr) < 8:
-                hdr += _recv_exact(conn, 8 - len(hdr))
+            hdr = first + _recv_exact(conn, 7)
             (size,) = struct.unpack("!Q", hdr)
-            if size == 0:
+            if size == 0 or size > max_payload_bytes:
                 break
             payload = _recv_exact(conn, size)
             conn.sendall(hdr + payload)
-    except (OSError, EOFError):
+    except (OSError, EOFError, socket.timeout):
         pass
     finally:
-        conn.close()
+        try:
+            conn.close()
+        finally:
+            if sem is not None:
+                sem.release()
 
 
 def run_comms_server(bind_host: str, port: int) -> None:
@@ -493,12 +510,20 @@ def run_comms_server(bind_host: str, port: int) -> None:
     srv.bind((bind_host, port))
     srv.listen(8)
     actual_port = srv.getsockname()[1]
+    sem = threading.BoundedSemaphore(MAX_COMMS_CONCURRENT_CONNS)
     print(f"freetpu-bench comms server listening on {bind_host}:{actual_port}", flush=True)
     try:
         while True:
             conn, _addr = srv.accept()
-            t = threading.Thread(target=_handle_comms_conn, args=(conn,), daemon=True)
-            t.start()
+            if not sem.acquire(blocking=False):
+                conn.close()
+                continue
+            try:
+                t = threading.Thread(target=_handle_comms_conn, args=(conn, sem), daemon=True)
+                t.start()
+            except Exception:
+                conn.close()
+                sem.release()
     except KeyboardInterrupt:
         pass
     finally:
@@ -597,6 +622,17 @@ def run_comms_suite(
 # ---------------------------------------------------------------------------
 
 
+def _safe_hbm_bytes_limit(dev: Any) -> Optional[int]:
+    try:
+        raw_ms = dev.memory_stats()
+    except Exception:
+        return None
+    if isinstance(raw_ms, dict):
+        val = raw_ms.get("bytes_limit")
+        return val if isinstance(val, int) else None
+    return None
+
+
 def run_jax_tpu_suites(suites: Sequence[str], quick: bool = False, allow_jax_cpu: bool = False) -> Dict[str, Any]:
     import jax  # type: ignore
     import jax.numpy as jnp  # type: ignore
@@ -611,11 +647,6 @@ def run_jax_tpu_suites(suites: Sequence[str], quick: bool = False, allow_jax_cpu
 
     dev = devices[0]
     dev_kind = getattr(dev, "device_kind", backend_name)
-    mem_stats = {}
-    try:
-        mem_stats = dev.memory_stats()
-    except Exception:
-        mem_stats = {}
 
     results: Dict[str, Any] = {
         "device_info": {
@@ -623,7 +654,7 @@ def run_jax_tpu_suites(suites: Sequence[str], quick: bool = False, allow_jax_cpu
             "default_backend": backend_name,
             "device_kind": dev_kind,
             "device_count": len(devices),
-            "hbm_bytes_limit": mem_stats.get("bytes_limit"),
+            "hbm_bytes_limit": _safe_hbm_bytes_limit(dev),
         }
     }
 
@@ -938,6 +969,28 @@ def build_colab_run_commands(
     return cmds
 
 
+def _session_still_listed(sessions_stdout: str, session_name: str) -> bool:
+    pat = re.compile(rf"(?<![A-Za-z0-9_-]){re.escape(session_name)}(?![A-Za-z0-9_-])")
+    return any(pat.search(line) for line in sessions_stdout.splitlines())
+
+
+def _verify_and_stop_session(
+    runner: Callable[[Sequence[str]], subprocess.CompletedProcess[str]],
+    colab_bin: str,
+    auth: str,
+    iso_cfg: Path,
+    session_name: str,
+) -> bool:
+    sess_res = runner([colab_bin, "--auth", auth, "--config", str(iso_cfg), "sessions"])
+    if sess_res.returncode != 0:
+        return False
+    if not _session_still_listed(sess_res.stdout, session_name):
+        return True
+    runner([colab_bin, "--auth", auth, "--config", str(iso_cfg), "stop", "-s", session_name])
+    recheck = runner([colab_bin, "--auth", auth, "--config", str(iso_cfg), "sessions"])
+    return recheck.returncode == 0 and not _session_still_listed(recheck.stdout, session_name)
+
+
 def run_colab_tpu_suites(
     suites: Sequence[str],
     quick: bool,
@@ -998,10 +1051,12 @@ def run_colab_tpu_suites(
         attempts: List[Dict[str, Any]] = []
         for idx, (tpu, sess, cmd) in enumerate(planned):
             res = runner(cmd)
+            teardown_verified = _verify_and_stop_session(runner, colab_bin, auth, iso_cfg, sess)
             attempts.append({
                 "tpu": tpu,
                 "session": sess,
                 "returncode": res.returncode,
+                "teardown_verified": teardown_verified,
                 "stderr_tail": res.stderr.strip()[-600:],
             })
             if res.returncode == 0:
@@ -1014,6 +1069,7 @@ def run_colab_tpu_suites(
                     "status": "ok",
                     "tpu": tpu,
                     "session": sess,
+                    "teardown_verified": teardown_verified,
                     "usage_preflight": usage_res.stdout.strip(),
                     "attempts": attempts,
                 }
@@ -1021,7 +1077,7 @@ def run_colab_tpu_suites(
             if idx + 1 < len(planned) and is_colab_allocation_error(res.returncode, res.stderr):
                 continue
             raise RuntimeError(
-                f"Colab TPU run failed on {tpu} (rc={res.returncode}): {res.stderr.strip()[-600:]}"
+                f"Colab TPU run failed on {tpu} (rc={res.returncode}, teardown_verified={teardown_verified}): {res.stderr.strip()[-600:]}"
             )
         raise RuntimeError(f"All Colab TPU candidates exhausted: {attempts}")
     finally:
@@ -1099,7 +1155,15 @@ def build_scorecard_rows(
         if backend in ("jax_tpu", "colab_tpu"):
             kind = dev_info.get("device_kind") or (colab_tpu.upper() if colab_tpu else "Cloud TPU")
             label = f"LIVE RUN: {kind} ({backend})"
-            inferred_cost = 2.70 if (colab_tpu == "v6e1" or "v6" in str(kind).lower()) else 1.20 if ("v5" in str(kind).lower() or colab_tpu == "v5e1") else None
+            kind_low = str(kind).lower()
+            if colab_tpu == "v6e1" or "v6e" in kind_low:
+                inferred_cost: Optional[float] = 2.70
+            elif "v5p" in kind_low:
+                inferred_cost = 4.20
+            elif colab_tpu == "v5e1" or "v5e" in kind_low or "v5 lite" in kind_low:
+                inferred_cost = 1.20
+            else:
+                inferred_cost = None
             cost_basis = f"GCP public on-demand rate (${inferred_cost:.2f}/chip-hr)" if inferred_cost else "local/unspecified"
             mem_limit = dev_info.get("hbm_bytes_limit")
             mem_str = f"{mem_limit / (1024**3):.2f} GiB HBM" if mem_limit else "TPU HBM"
@@ -1134,6 +1198,7 @@ def build_scorecard_rows(
             "row_type": "measured",
             "memory": mem_str,
             "bf16_tflops": bf16_tf,
+            "bf16_is_fp32_ref": backend in ("cpu", "buenos_mock"),
             "int8_tops": int8_tops,
             "bw_gbps": bw_gbps,
             "dispatch_floor_us": f"{floor_us} us" if floor_us is not None else "—",
@@ -1207,7 +1272,10 @@ def render_markdown(report: Dict[str, Any]) -> str:
     ]
 
     for r in rows:
-        bf16_s = f"{r['bf16_tflops']:.2f}" if r.get("bf16_tflops") is not None else "—"
+        if r.get("bf16_tflops") is not None:
+            bf16_s = f"{r['bf16_tflops']:.2f} (fp32)" if r.get("bf16_is_fp32_ref") else f"{r['bf16_tflops']:.2f}"
+        else:
+            bf16_s = "—"
         int8_s = f"{r['int8_tops']:.2f}" if r.get("int8_tops") is not None else "—"
         bw_s = f"{r['bw_gbps']:.2f}" if r.get("bw_gbps") is not None else "—"
         cost_s = f"${r['hourly_cost_usd']:.2f}" if r.get("hourly_cost_usd") is not None else "—"
@@ -1306,12 +1374,71 @@ def run_self_test() -> int:
         assert comp["status"] == "measured"
         assert comp["peak_bf16_tflops"] > 0
         assert comp["peak_int8_tops"] > 0
-        assert any(c["name"] == "fused_gemm_silu" for c in comp["cases"])
-        assert any(c["name"] == "gemm_w8a16_dequant" for c in comp["cases"])
+        suffix = "ref" if backend == "cpu" else "mock"
+        assert any(c["name"] == f"gemm_fp32_{suffix}" and c["dtype"] == "fp32" for c in comp["cases"])
+        assert any(c["name"] == f"fused_gemm_silu_fp32_{suffix}" for c in comp["cases"])
+        assert any(c["name"] == f"gemm_w8a16_dequant_fp32_{suffix}" for c in comp["cases"])
 
         bw = run_bandwidth_local(backend, quick=True)
         assert bw["status"] == "measured"
         assert bw["peak_triad_gbps"] > 0
+
+    rtx5090 = next(b for b in PUBLISHED_BASELINES if b.target_id == "nvidia_rtx_5090")
+    assert rtx5090.peak_bf16_tflops == 209.5
+    assert rtx5090.peak_int8_tops == 419.0
+
+    # Comms size-cap & timeout hardening
+    c_sock, s_sock = socket.socketpair()
+    t_srv = threading.Thread(
+        target=_handle_comms_conn,
+        args=(s_sock, None, 1024, 0.2),
+        daemon=True,
+    )
+    t_srv.start()
+    c_sock.sendall(struct.pack("!Q", 2048))
+    assert c_sock.recv(16) == b""
+    t_srv.join(timeout=2.0)
+    assert not t_srv.is_alive()
+    c_sock.close()
+
+    c_to, s_to = socket.socketpair()
+    t_to = threading.Thread(
+        target=_handle_comms_conn,
+        args=(s_to, None, 1024, 0.05),
+        daemon=True,
+    )
+    t_to.start()
+    c_to.sendall(struct.pack("!Q", 64) + b"ab")
+    assert c_to.recv(16) == b""
+    t_to.join(timeout=2.0)
+    assert not t_to.is_alive()
+    c_to.close()
+
+    # _safe_hbm_bytes_limit + TPU kind pricing discrimination (v5p vs v5e vs v6e)
+    class _NoneMemDev:
+        def memory_stats(self) -> None:
+            return None
+
+    class _ErrMemDev:
+        def memory_stats(self) -> Dict[str, int]:
+            raise RuntimeError("no mem stats")
+
+    assert _safe_hbm_bytes_limit(_NoneMemDev()) is None
+    assert _safe_hbm_bytes_limit(_ErrMemDev()) is None
+
+    for dev_kind, colab_kind, exp_cost in (
+        ("TPU v5p", None, 4.20),
+        ("TPU v5 lite", "v5e1", 1.20),
+        ("TPU v6e", "v6e1", 2.70),
+        ("TPU v4", None, None),
+    ):
+        probe_rows = build_scorecard_rows({
+            "backend": "jax_tpu",
+            "device_info": {"device_kind": dev_kind, "hbm_bytes_limit": 16 * 1024**3},
+            "colab_meta": {"tpu": colab_kind} if colab_kind else {},
+            "compute": {"peak_bf16_tflops": 100.0},
+        })
+        assert probe_rows[0]["hourly_cost_usd"] == exp_cost, (dev_kind, probe_rows[0])
 
     comms = run_comms_suite(host="127.0.0.1", port=0, quick=True)
     assert comms["status"] == "measured"
@@ -1344,6 +1471,8 @@ def run_self_test() -> int:
         calls.append(list(cmd))
         if "usage" in cmd:
             return subprocess.CompletedProcess(cmd, 0, "Current balance: 100.0 compute units\n", "")
+        if "sessions" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "No active sessions.\n", "")
         if "V6E1" in cmd:
             return subprocess.CompletedProcess(cmd, 1, "", "HTTP 412 REASON_NO_BACKENDS: v6e1 unavailable")
         payload = {
@@ -1372,8 +1501,43 @@ def run_self_test() -> int:
         runner=_mock_colab_runner,
     )
     assert colab_res["colab_meta"]["tpu"] == "v5e1"
+    assert colab_res["colab_meta"]["teardown_verified"] is True
     assert colab_res["compute"]["peak_bf16_tflops"] == 179.36
-    assert len(calls) == 3  # usage + v6e1 fail + v5e1 ok
+    assert len(calls) == 5  # usage + v6e1 fail + sessions + v5e1 ok + sessions
+
+    # Leaked session triggers explicit stop -s
+    leaked_calls: List[List[str]] = []
+    session_stopped = {"done": False}
+
+    def _mock_leaked_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        leaked_calls.append(list(cmd))
+        if "usage" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "100.0\n", "")
+        if "stop" in cmd:
+            session_stopped["done"] = True
+            return subprocess.CompletedProcess(cmd, 0, "stopped\n", "")
+        if "sessions" in cmd:
+            if session_stopped["done"]:
+                return subprocess.CompletedProcess(cmd, 0, "No active sessions.\n", "")
+            # Find session base used in previous run call
+            run_calls = [c for c in leaked_calls if "run" in c]
+            sname = run_calls[-1][run_calls[-1].index("-s") + 1]
+            return subprocess.CompletedProcess(cmd, 0, f"{sname} active\n", "")
+        payload = {"schema": SCHEMA_VERSION, "compute": {"peak_bf16_tflops": 1.0}}
+        return subprocess.CompletedProcess(cmd, 0, f"{BENCH_JSON_BEGIN}\n{json.dumps(payload)}\n{BENCH_JSON_END}\n", "")
+
+    leaked_res = run_colab_tpu_suites(
+        suites=["compute"],
+        quick=True,
+        colab_bin="colab",
+        auth="adc",
+        tpu_order=("v5e1",),
+        config_path=None,
+        timeout_s=120.0,
+        runner=_mock_leaked_runner,
+    )
+    assert session_stopped["done"] is True
+    assert leaked_res["colab_meta"]["teardown_verified"] is True
 
     print(
         json.dumps(

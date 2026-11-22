@@ -29,8 +29,9 @@ cat runs/comms-loopback.md
 On **Node 2 (Receiver / Echo Server)** — e.g., Pixel 10 Pro XL (`192.168.77.2`):
 
 ```bash
-python3 bench/freetpu_bench.py --comms-server --comms-host 0.0.0.0 --comms-port 50055
+python3 bench/freetpu_bench.py --comms-server --comms-host 192.168.77.2 --comms-port 50055
 ```
+*(Or bind `--comms-host 127.0.0.1` when tunneling over an `adb forward` USB bridge.)*
 
 On **Node 1 (Driver)** — e.g., Pixel 10 Pro Fold or Linux/macOS host:
 
@@ -51,14 +52,14 @@ python3 bench/freetpu_bench.py \
 # Cross-build llama-bench & ggml-rpc-server for Android ARM64
 ./llama-cpp-edgetpu/build.sh android
 
-# Node 2: start clean-room EDGETPU RPC server (zero Google .so)
+# Node 2: start clean-room EDGETPU RPC server on the dedicated USB-Ethernet link (zero Google .so)
 adb -s <node2_serial> shell "su -c 'OPENBUENOS_PERF_MODE=5 \
-  /data/local/tmp/tpu_open_stack/ggml-rpc-server -d EDGETPU -H 0.0.0.0 -p 50052 -t 4'"
+  /data/local/tmp/tpu_open_stack/ggml-rpc-server -d EDGETPU -H 192.168.77.2 -p 50052 -t 4'"
 
 # Node 1: split layers across Node 2 RPC + local EDGETPU
 adb -s <node1_serial> shell "su -c 'OPENBUENOS_PERF_MODE=5 \
   /data/local/tmp/tpu_open_stack/llama-bench \
-  -m /data/local/tmp/models/model.gguf -r 192.168.77.2:50052 -ngl 14 -p 128 -n 32 -t 4'"
+  -m /data/local/tmp/models/model.gguf --rpc 192.168.77.2:50052 -ngl 14 -p 128 -n 32 -t 4'"
 ```
 
 ---
@@ -76,5 +77,6 @@ adb -s <node1_serial> shell "su -c 'OPENBUENOS_PERF_MODE=5 \
 
 ## Clean-Room & Topology Checks
 
-- **Verify zero vendor `.so`s on RPC server**: `adb shell "su -c 'cat /proc/$(pidof ggml-rpc-server)/maps | grep -E \"edgetpu|darwinn|google\"'"` must return empty.
+- **Verify zero vendor `.so`s on RPC server**: read `/proc/$pid/maps` inside the device shell without host subshell expansion and verify the read succeeded before asserting zero vendor matches:
+  `adb -s <node2_serial> shell 'su -c "pid=\$(pidof -s ggml-rpc-server) && [ -n \"\$pid\" ] && cat /proc/\$pid/maps"' | tee /tmp/rpc-maps.txt >/dev/null && test -s /tmp/rpc-maps.txt && ! grep -E "edgetpu|darwinn|google" /tmp/rpc-maps.txt`
 - **Avoid USB 2.0 hubs**: Check link speed (`ioreg` on macOS or `lsusb -t` on Linux) — USB 2.0 (`480 Mbps`) turns weight streaming and PP activation hops into the primary bottleneck.

@@ -46,6 +46,7 @@ make -C runtime verify-baremetal
 
 # Push runner + locally extracted DIVE interpreter onto your own unlocked device
 adb push runtime/build/android-arm64/tpu_baremetal_runner /data/local/tmp/tpu_open_stack/
+adb push /path/to/local/dive_interp_rv64.bin /data/local/tmp/tpu_open_stack/dive_interp_rv64.bin
 adb shell "su -c 'OPENBUENOS_DIVE_INTERP_PATH=/data/local/tmp/tpu_open_stack/dive_interp_rv64.bin \
   OPENBUENOS_PERF_MODE=5 \
   /data/local/tmp/tpu_open_stack/tpu_baremetal_runner --self-test'"
@@ -67,7 +68,7 @@ adb shell "su -c 'readelf -d /data/local/tmp/tpu_open_stack/tpu_baremetal_runner
 | **LLM Inference (`Qwen2.5-1.5B-Q8_0`)** | **`118.06 t/s`** `pp128`, **`5.85 t/s`** `tg64` (`-21.5%` system `mJ/tok` vs CPU on `pp512`) | [`docs/PHASE6_PERF_REPORT.md`](../docs/PHASE6_PERF_REPORT.md) |
 | **ELF `DT_NEEDED` Audit** | Strictly `[libdl.so, libm.so, libc.so]` (`0` vendor `.so`s) | [`docs/PHASE6_PERF_REPORT.md`](../docs/PHASE6_PERF_REPORT.md) |
 
-> Note: `--backend buenos_mock` measures your **host CPU** executing FreeTPU's FP32-RNE and `1:2` `u8->BF16` math paths (`row_type: measured`) alongside the published Tensor G5 silicon baseline (`row_type: published-reference`).
+> Note: `--backend buenos_mock` measures your **host CPU** executing FreeTPU's FP32 reference GEMM/SiLU (`gemm_fp32_ref` / `fused_gemm_silu_fp32_ref`) and host INT8 FP32-RNE requantization (`row_type: measured`) alongside the published Tensor G5 silicon baseline (`row_type: published-reference`).
 
 ---
 
