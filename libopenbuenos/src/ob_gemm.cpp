@@ -523,6 +523,10 @@ ob_status_t weight_cache_prepare_space_locked(ob_context* ctx,
                                               bool* out_cacheable) {
   ensure_weight_cache_budget(ctx, true);
   if (incoming_bytes > ctx->weight_cache_max_bytes) {
+    while (ring_count > 0u) {
+      ob_status_t dst = drain_one();
+      if (dst != OB_OK) return dst;
+    }
     weight_cache_evict_locked(ctx, ctx->weight_cache_max_bytes);
     *out_cacheable = false;
     return OB_OK;
@@ -2920,13 +2924,30 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
   bool allow_lt_64x = (k_dim >= 256u && max_k >= 512u && max_n >= 128u);
   if (allow_lt_64x) {
     bool all_ge_128 = true;
-    uint64_t total_n = 0ULL;
     for (uint32_t j = 0u; j < num_jobs; ++j) {
-      if (jobs[j].n_dim < 128u) all_ge_128 = false;
-      total_n += jobs[j].n_dim;
+      if (jobs[j].n_dim < 128u) {
+        all_ge_128 = false;
+        break;
+      }
     }
-    if (!all_ge_128 && !(horiz_fusion && num_jobs >= 2u && total_n >= 128ULL)) {
-      allow_lt_64x = false;
+    if (!all_ge_128) {
+      if (!horiz_fusion || num_jobs < 2u || !builtin_active || !blt_enabled) {
+        allow_lt_64x = false;
+      } else {
+        ob::build_scheduled_groups(64u, k_dim, jobs, num_jobs, max_k, max_n,
+                                   builtin_active, lt_enabled, blt_enabled,
+                                   horiz_fusion, &groups);
+        if (groups.empty()) {
+          allow_lt_64x = false;
+        } else {
+          for (const ob::ScheduledGroup& g : groups) {
+            if (!ob::is_lt_64x_shape(64u, g.hw_k, g.hw_n)) {
+              allow_lt_64x = false;
+              break;
+            }
+          }
+        }
+      }
     }
   }
 
@@ -4152,6 +4173,13 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
           batch_amax > 6.0f * min_row_amax) {
         need_fallback = true;
       }
+      if (!need_fallback && batch_amax > 0.0f) {
+        const float s_a_pre = ob::quantize_scale_pow2_2nd_up(batch_amax / 127.0f);
+        const float rms_aq_pre = static_cast<float>(max_row_rms / static_cast<double>(s_a_pre));
+        if (rms_aq_pre > 56.0f) {
+          need_fallback = true;
+        }
+      }
     }
 
     if (need_fallback) {
@@ -4596,6 +4624,70 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
             drain_all_cleanup();
             slice_rejected = true;
             break;
+          }
+
+          // Check activation + weight-norm eligibility BEFORE packing/allocating the chained DMA-BUF
+          // so rejected cold calls never waste memory or cache an unused copy alongside M7A fallback.
+          {
+            const float pre_rms_aq = static_cast<float>(max_row_rms / static_cast<double>(s_a));
+            uint32_t pdg = 0u, pdu = 0u, pdm = 0u, pdd = 0u;
+            ob::compute_swiglu_stage_dividers(
+                ms.tm, pre_rms_aq,
+                l2_g_max, l2_g_mean, l2_u_max, l2_u_mean, l2_d_max,
+                &pdg, &pdu, &pdm, &pdd);
+            const double mean_aq = max_row_abs_mean / static_cast<double>(s_a);
+            const double dc_g_t = mean_aq * static_cast<double>(dc_g_max);
+            const double dc_u_t = mean_aq * static_cast<double>(dc_u_max);
+            const double l2_aq = static_cast<double>(pre_rms_aq) * std::sqrt(static_cast<double>(K));
+            const double ub_g = std::min({
+                l2_aq * static_cast<double>(l2_g_max),
+                static_cast<double>(max_l1_aq) * static_cast<double>(linf_g_max),
+                static_cast<double>(amax_aq) * static_cast<double>(l1_g_max),
+            });
+            const double ub_u = std::min({
+                l2_aq * static_cast<double>(l2_u_max),
+                static_cast<double>(max_l1_aq) * static_cast<double>(linf_u_max),
+                static_cast<double>(amax_aq) * static_cast<double>(l1_u_max),
+            });
+            bool pre_reject = (pre_rms_aq > 56.0f) ||
+                              (dc_g_t > 64.0 * static_cast<double>(pdg)) ||
+                              (dc_u_t > 64.0 * static_cast<double>(pdu)) ||
+                              !(s_a * s_wg * static_cast<float>(pdg) >= 5.0e-4f);
+            if (!pre_reject && !fast_chain_on) {
+              bool pre_holder = false;
+              if (ub_g <= 127.0 * static_cast<double>(pdg) &&
+                  ub_u <= 127.0 * static_cast<double>(pdu)) {
+                const int64_t mqg = std::min<int64_t>(
+                    127LL, static_cast<int64_t>(std::ceil(ub_g / static_cast<double>(pdg))));
+                const int64_t mqu = std::min<int64_t>(
+                    127LL, static_cast<int64_t>(std::ceil(ub_u / static_cast<double>(pdu))));
+                const float sg_init = s_a * s_wg * static_cast<float>(pdg);
+                int64_t mqsilu = std::abs(ob::eval_swiglu_silu_q(static_cast<int32_t>(mqg), sg_init));
+                mqsilu = std::max<int64_t>(
+                    mqsilu, std::abs(ob::eval_swiglu_silu_q(static_cast<int32_t>(-mqg), sg_init)));
+                if (sg_init > 0.0f && mqg > 0LL) {
+                  const int64_t qmc = std::max<int64_t>(
+                      -mqg, std::min<int64_t>(0LL, -static_cast<int64_t>(
+                                                       std::llround(1.2784645f / sg_init))));
+                  mqsilu = std::max<int64_t>(
+                      mqsilu, std::abs(ob::eval_swiglu_silu_q(static_cast<int32_t>(qmc), sg_init)));
+                }
+                if (mqg > 0LL) {
+                  mqsilu = std::min<int64_t>(127LL, std::max<int64_t>(mqsilu, mqg + 1LL));
+                }
+                const int64_t mprod = mqsilu * mqu;
+                uint32_t ndm = pdm;
+                while (ndm < 64u && mprod > 127LL * static_cast<int64_t>(ndm)) ndm <<= 1u;
+                if (mprod <= 127LL * static_cast<int64_t>(ndm)) pre_holder = true;
+              }
+              if (!pre_holder) pre_reject = true;
+            }
+            if (pre_reject) {
+              if (prof_on) ctx->prof.weight_pack_ns += (ob::monotonic_now_ns() - tp0);
+              drain_all_cleanup();
+              slice_rejected = true;
+              break;
+            }
           }
 
           std::vector<uint8_t> ext2 = ob::pack_ext2_for_swiglu(

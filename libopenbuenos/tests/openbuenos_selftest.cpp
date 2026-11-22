@@ -1616,14 +1616,27 @@ int run_test_swiglu(int iters, int perf_mode, const char* dive_interp_path,
     ob_invoke_stats_t sc{}, sw{};
     st = ob_gemm_swiglu_f32_quant(ctx, a.data(), &sd, c_out.data(), &sc);
     if (profile) ob_context_reset_profile(ctx);
-    for (int it = 0; st == OB_OK && it < std::max(1, iters); ++it) {
+    ob_profile_stats_t p0{}, p1{};
+    (void)ob_context_get_profile(ctx, &p0);
+    const int warm_iters = std::max(1, iters);
+    for (int it = 0; st == OB_OK && it < warm_iters; ++it) {
       st = ob_gemm_swiglu_f32_quant(ctx, a.data(), &sd, c_out.data(), &sw);
     }
+    (void)ob_context_get_profile(ctx, &p1);
+    const uint64_t d_chained = p1.swiglu_chunks_chained - p0.swiglu_chunks_chained;
+    const uint64_t d_fb = p1.swiglu_fallbacks - p0.swiglu_fallbacks;
     double nmse = swiglu_ref_nmse(a, gd, ud, dd, c_out, fc.M, fc.K, fc.H, fc.N);
     const bool expect_chained = !(fc.is_q4 != 0u && fc.M > 8u);
     bool ok = (st == OB_OK) &&
-              (expect_chained ? (sw.tiles_dispatched == fc.exp_chunks && sw.cache_hits == fc.exp_chunks)
-                              : (sw.tiles_dispatched > 0u && sw.cache_hits == sw.tiles_dispatched)) &&
+              (expect_chained
+                   ? (sw.tiles_dispatched == fc.exp_chunks &&
+                      sw.cache_hits == fc.exp_chunks &&
+                      d_chained == static_cast<uint64_t>(warm_iters) * fc.exp_chunks &&
+                      d_fb == 0u)
+                   : (sw.tiles_dispatched > 0u &&
+                      sw.cache_hits == sw.tiles_dispatched &&
+                      d_chained == 0u &&
+                      d_fb == static_cast<uint64_t>(warm_iters))) &&
               (nmse < 3.5e-3);
     if (!ok) all_ok = false;
     std::printf("swiglu[%s]: ok=%d pm=%u wl=%d chunks=%u hits=%u cold_us=%llu warm_hw_us=%llu warm_wall_us=%llu nmse=%.2e\n",
