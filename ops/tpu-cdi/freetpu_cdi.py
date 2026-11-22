@@ -651,8 +651,23 @@ def _validate_container_edits(edits: Any, context: str, errors: List[str]) -> No
                 for field_name in ("major", "minor"):
                     if field_name in node:
                         val = node[field_name]
-                        if not isinstance(val, int) or isinstance(val, bool) or val < 0:
-                            errors.append(f"{nc}.{field_name}: must be a non-negative integer")
+                        if (
+                            not isinstance(val, int)
+                            or isinstance(val, bool)
+                            or val < 0
+                            or val > 0x7FFFFFFFFFFFFFFF
+                        ):
+                            errors.append(f"{nc}.{field_name}: must be a non-negative 64-bit integer")
+                for field_name in ("uid", "gid", "fileMode"):
+                    if field_name in node:
+                        val = node[field_name]
+                        if (
+                            not isinstance(val, int)
+                            or isinstance(val, bool)
+                            or val < 0
+                            or val > 0xFFFFFFFF
+                        ):
+                            errors.append(f"{nc}.{field_name}: must be an unsigned 32-bit integer")
 
     if "mounts" in edits:
         mounts = edits["mounts"]

@@ -1597,8 +1597,8 @@ TPU Device Status
             self.assertGreater(py_called[0], 0.05)
             self.assertTrue(snap2.tpu_info_available)
 
-            # When CLI exits 0 with ONLY inventory/N/A rows (no live utilization),
-            # preserve inventory rows and query configured runtime_metrics_addr within remaining budget.
+            # When CLI exits 0 with ONLY inventory/N/A rows (no live utilization) on the default
+            # runtime endpoint, preserve inventory rows and query runtime_metrics_addr within budget.
             py_called.clear()
 
             def _cli_inventory_only(*args, **kwargs):
@@ -1641,13 +1641,59 @@ TPU Device Status
                     proc_root=proc_root,
                     tpu_info_bin="tpu-info",
                     tpu_info_timeout_s=0.5,
-                    runtime_metrics_addr="127.0.0.1:9999",
+                    runtime_metrics_addr="127.0.0.1:8431",
                 )
-            self.assertEqual(py_called, ["127.0.0.1:9999"])
+            self.assertEqual(py_called, ["127.0.0.1:8431"])
             self.assertTrue(snap3.tpu_info_available)
             self.assertEqual(len(snap3.runtime_utilization), 1)
             self.assertEqual(snap3.runtime_utilization[0].hbm_used_bytes, 4 * 1024**3)
             self.assertAlmostEqual(snap3.runtime_utilization[0].duty_cycle_percent or 0.0, 55.0)
+
+            # When an explicit non-default `--runtime-metrics-addr` is supplied (with PID scanning
+            # enabled), query it directly without invoking `tpu-info` CLI against default port 8431.
+            py_called.clear()
+            with (
+                mock.patch.object(
+                    tpu_exporter,
+                    "_run_tpu_info",
+                    side_effect=AssertionError("must not call CLI against default 8431 when explicit addr set"),
+                ),
+                mock.patch.object(tpu_exporter, "_query_tpu_info_python_metrics", side_effect=_py_live_util),
+            ):
+                snap4 = tpu_exporter.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin="tpu-info",
+                    tpu_info_timeout_s=0.5,
+                    runtime_metrics_addr="127.0.0.1:9999",
+                )
+            self.assertEqual(py_called, ["127.0.0.1:9999"])
+            self.assertTrue(snap4.tpu_info_available)
+
+            # Oversized HTTP headers (> MAX_HTTP_HEADER_BYTES) are rejected with 431 before scrape.
+            import socket as _socket
+
+            srv = tpu_exporter._ExporterServer(
+                ("127.0.0.1", 0),
+                tpu_exporter._ExporterHandler,
+                sysfs_root=sysfs_root,
+                dev_root=dev_root,
+                proc_root=proc_root,
+                tpu_info_bin=None,
+            )
+            t = threading.Thread(target=srv.serve_forever, daemon=True)
+            t.start()
+            try:
+                port = srv.server_address[1]
+                with _socket.create_connection(("127.0.0.1", port), timeout=3.0) as s:
+                    big = b"GET /metrics HTTP/1.1\r\nHost: x\r\nX-Pad: " + (b"A" * (tpu_exporter.MAX_HTTP_HEADER_BYTES + 128)) + b"\r\n\r\n"
+                    s.sendall(big)
+                    resp = s.recv(1024)
+                self.assertIn(b"431", resp)
+            finally:
+                srv.shutdown()
+                srv.server_close()
 
     def _assert_valid_prometheus_text(self, text: str) -> None:
         lines = [ln for ln in text.splitlines() if ln.strip()]

@@ -24,6 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib
 import importlib.util
 import inspect
+import io
 import json
 import os
 from pathlib import Path
@@ -1007,6 +1008,11 @@ def validate_chip_id_map(
         seen_runtime_targets[rt_id] = dev.pci_bdf
 
 
+DEFAULT_RUNTIME_METRICS_ADDR = "127.0.0.1:8431"
+MAX_HTTP_HEADER_BYTES = 16384
+HTTP_HEADER_READ_TIMEOUT_S = 2.0
+
+
 def collect_snapshot(
     sysfs_root: Path = Path("/sys"),
     dev_root: Path = Path("/dev"),
@@ -1016,7 +1022,7 @@ def collect_snapshot(
     chip_id_map: Optional[Dict[str, str]] = None,
     *,
     skip_pid_scan: bool = False,
-    runtime_metrics_addr: Optional[str] = "127.0.0.1:8431",
+    runtime_metrics_addr: Optional[str] = DEFAULT_RUNTIME_METRICS_ADDR,
 ) -> ExporterSnapshot:
     """Collect PCI/VFIO discovery, optional procfs PID handles, and `tpu-info` runtime metrics."""
     t0 = time.monotonic()
@@ -1047,11 +1053,15 @@ def collect_snapshot(
 
     runtime_budget_s = max(0.05, float(tpu_info_timeout_s))
     runtime_deadline = time.monotonic() + runtime_budget_s
-    if skip_pid_scan:
-        # Sidecar / no-PID mode: query `tpu_info.metrics` directly over loopback
-        # gRPC with a hard deadline ONLY. Never fall back to the `tpu-info` CLI
-        # subprocess because it enumerates `/proc/*/fd/*` and can trigger
-        # cross-profile AppArmor permission errors.
+    explicit_non_default_runtime_addr = bool(
+        runtime_metrics_addr and runtime_metrics_addr != DEFAULT_RUNTIME_METRICS_ADDR
+    )
+    if skip_pid_scan or explicit_non_default_runtime_addr:
+        # Sidecar / no-PID mode OR explicit non-default `--runtime-metrics-addr`:
+        # query `tpu_info.metrics` directly at `runtime_metrics_addr` with a hard
+        # deadline. Never run the `tpu-info` CLI subprocess against its hardcoded
+        # default port 8431 when an explicit non-default runtime endpoint was
+        # configured (or when PID scanning is disabled).
         tpu_info_ok, tpu_info_err, parsed_rows = _query_tpu_info_python_metrics(
             devices,
             addr=runtime_metrics_addr,
@@ -1608,6 +1618,55 @@ class _ExporterServer(ThreadingHTTPServer):
 class _ExporterHandler(BaseHTTPRequestHandler):
     server: _ExporterServer
     timeout = DEFAULT_HTTP_SOCKET_TIMEOUT_S
+
+    def handle_one_request(self) -> None:
+        """Enforce aggregate header size and total wall-clock header read deadline."""
+        self.close_connection = True
+        deadline = time.monotonic() + HTTP_HEADER_READ_TIMEOUT_S
+        buf = bytearray()
+        header_complete = False
+        try:
+            while len(buf) <= MAX_HTTP_HEADER_BYTES:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._send_raw_error(408, "Request Timeout", "header read timeout\n")
+                    return
+                self.connection.settimeout(remaining)
+                chunk = self.connection.recv(min(4096, MAX_HTTP_HEADER_BYTES + 1 - len(buf)))
+                if not chunk:
+                    return
+                buf.extend(chunk)
+                if b"\r\n\r\n" in buf or b"\n\n" in buf:
+                    header_complete = True
+                    break
+            if not header_complete:
+                self._send_raw_error(
+                    431, "Request Header Fields Too Large", "request headers too large\n"
+                )
+                return
+            self.connection.settimeout(self.timeout)
+            self.rfile = io.BytesIO(bytes(buf))
+            super().handle_one_request()
+        except socket.timeout:
+            self._send_raw_error(408, "Request Timeout", "header read timeout\n")
+        except OSError:
+            return
+        finally:
+            self.close_connection = True
+
+    def _send_raw_error(self, code: int, reason: str, body: str) -> None:
+        payload = body.encode("utf-8")
+        resp = (
+            f"HTTP/1.1 {code} {reason}\r\n"
+            "Content-Type: text/plain; charset=utf-8\r\n"
+            f"Content-Length: {len(payload)}\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode("ascii") + payload
+        try:
+            self.connection.settimeout(1.0)
+            self.connection.sendall(resp)
+        except OSError:
+            pass
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         # Keep stdout clean when serving; log errors to stderr.

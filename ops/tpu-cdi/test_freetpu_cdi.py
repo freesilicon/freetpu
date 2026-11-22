@@ -1355,7 +1355,9 @@ class FreeTpuCdiTests(unittest.TestCase):
                             "name": "all",
                             "containerEdits": {
                                 "env": ["=empty-key"],
-                                "deviceNodes": [{"path": "/dev/vfio/0", "type": ["c"]}],
+                                "deviceNodes": [
+                                    {"path": "/dev/vfio/0", "type": ["c"], "uid": -1, "gid": 2**32, "fileMode": -1}
+                                ],
                                 "hooks": [{"hookName": {"bad": 1}, "path": "/bin/true"}],
                             },
                         }
@@ -1364,6 +1366,9 @@ class FreeTpuCdiTests(unittest.TestCase):
                 mal_errs = freetpu_cdi.validate_cdi_spec(malformed_spec)
                 self.assertTrue(any("non-empty KEY=VALUE" in e for e in mal_errs), mal_errs)
                 self.assertTrue(any("invalid device type" in e for e in mal_errs), mal_errs)
+                self.assertTrue(any(".uid:" in e for e in mal_errs), mal_errs)
+                self.assertTrue(any(".gid:" in e for e in mal_errs), mal_errs)
+                self.assertTrue(any(".fileMode:" in e for e in mal_errs), mal_errs)
                 self.assertTrue(any("invalid OCI hookName" in e for e in mal_errs), mal_errs)
 
 
