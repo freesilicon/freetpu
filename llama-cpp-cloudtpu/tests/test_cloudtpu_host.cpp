@@ -51,7 +51,27 @@ void test_compile_options_proto() {
     o8.num_partitions = 8;
     const std::string p8 = cloudtpu::encode_compile_options_proto(o8);
     CHECK_TRUE(p8.size() == sizeof(exp1) && static_cast<uint8_t>(p8[5]) == 0x08, "8-partition proto mismatch");
-    std::printf("  [PASS] compile_options_proto\n");
+
+    // Multi-chip replica-SPMD DeviceAssignmentProto (field 9 of ExecutableBuildOptionsProto)
+    cloudtpu::PjrtCompileOptions da_opts;
+    da_opts.num_replicas = 8;
+    da_opts.num_partitions = 1;
+    da_opts.use_spmd_partitioning = false;
+    da_opts.use_shardy_partitioner = false;
+    da_opts.device_assignment_ids = {0, 1, 2, 3, 4, 5, 6, 7};
+    const std::string p_da = cloudtpu::encode_compile_options_proto(da_opts);
+    // Expected EBO: 20 08 (replicas=8) 28 01 (parts=1) 4a 10 (field 9 len=16: 08 08 10 01 1a 0a 0a 08 00..07)
+    const uint8_t exp_da[] = {
+        0x1a, 0x16,
+        0x20, 0x08,
+        0x28, 0x01,
+        0x4a, 0x10,
+        0x08, 0x08, 0x10, 0x01,
+        0x1a, 0x0a, 0x0a, 0x08, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07
+    };
+    CHECK_TRUE(p_da.size() == sizeof(exp_da), "device_assignment proto length mismatch");
+    CHECK_TRUE(std::memcmp(p_da.data(), exp_da, sizeof(exp_da)) == 0, "device_assignment proto bytes mismatch");
+    std::printf("  [PASS] compile_options_proto (incl. DeviceAssignmentProto 8-chip)\n");
 }
 
 void test_half_bf16_conversions() {
@@ -549,6 +569,269 @@ void test_silicon_regressions(cloudtpu::PjrtRuntime& rt) {
     std::printf("  [PASS] Silicon regressions (ROPE M=52, Q4_0/Q8_0 K=256)\n");
 }
 
+void test_collectives_p1_live_compatible(cloudtpu::PjrtRuntime& rt) {
+    // Runs on BOTH live v5e-1 (P=1) and Host Mock to verify StableHLO v1.0 collective MLIR syntax
+    // (all_reduce, all_gather, reduce_scatter) compiles and executes cleanly on libtpu.so.
+    std::vector<float> x = {1.5f, -2.0f, 3.25f, 4.75f};
+    auto bx = rt.buffer_from_host(0, x.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, 4});
+
+    for (cloudtpu::CloudOpKind kind :
+         {cloudtpu::CloudOpKind::ALL_REDUCE_SUM,
+          cloudtpu::CloudOpKind::ALL_GATHER,
+          cloudtpu::CloudOpKind::REDUCE_SCATTER_SUM}) {
+        cloudtpu::GraphProgramSpec spec;
+        spec.spmd_chips = 1;
+        spec.inputs.push_back({1, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 4}});
+        cloudtpu::OpNodeSpec op;
+        op.kind = kind;
+        op.collective_dim = 3;
+        op.src_ids = {1};
+        op.dst = {2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 4}};
+        spec.ops.push_back(op);
+        spec.output_ids = {2};
+        auto got = run_emitted(rt, cloudtpu::emit_stablehlo_program(spec), {bx});
+        for (size_t i = 0; i < 4; ++i) {
+            CHECK_NEAR(got[i], x[i], 1e-5f, "P=1 collective identity");
+        }
+    }
+    std::printf("  [PASS] StableHLO collectives P=1 syntax & execution (all_reduce/all_gather/reduce_scatter)\n");
+}
+
+void test_spmd_multichip_mesh(int num_chips) {
+    cloudtpu::RuntimeConfig cfg;
+    cfg.mock_mode = true;
+    cfg.mock_devices = num_chips;
+    cfg.exec_cache_cap = 128;
+    cloudtpu::PjrtRuntime rt;
+    rt.init(cfg);
+
+    CHECK_TRUE(rt.device_count() == num_chips, "SPMD mock device_count");
+    size_t free0 = 0, total0 = 0;
+    CHECK_TRUE(rt.query_memory_stats(0, &free0, &total0), "SPMD device 0 memory stats");
+    if (num_chips == 8) {
+        CHECK_TRUE(total0 == (32ULL << 30), "v6e-8 32 GiB/chip HBM");
+    } else if (num_chips == 4) {
+        CHECK_TRUE(total0 == (192ULL << 30), "tpu7x-4t 192 GiB/chip HBM3e");
+    }
+
+    const auto copts = rt.make_spmd_compile_options(num_chips);
+    CHECK_TRUE(copts.num_replicas == num_chips && copts.num_partitions == 1, "SPMD compile options");
+    CHECK_TRUE(static_cast<int>(copts.device_assignment_ids.size()) == num_chips, "SPMD DeviceAssignment ids");
+
+    auto run_spmd = [&](const cloudtpu::EmittedProgram& prog,
+                        const std::vector<std::vector<cloudtpu::PjrtBufferPtr>>& per_dev_in) {
+        const auto* exec = rt.compile_or_get(prog.cache_key, prog.mlir_text, copts);
+        std::vector<std::vector<PJRT_Buffer*>> raw_in(static_cast<size_t>(num_chips));
+        std::vector<PJRT_Buffer* const*> in_ptrs(static_cast<size_t>(num_chips));
+        for (int d = 0; d < num_chips; ++d) {
+            for (const auto& b : per_dev_in[static_cast<size_t>(d)]) raw_in[static_cast<size_t>(d)].push_back(b->handle.get());
+            in_ptrs[static_cast<size_t>(d)] = raw_in[static_cast<size_t>(d)].data();
+        }
+        std::vector<cloudtpu::PjrtDType> out_dts;
+        std::vector<std::vector<int64_t>> out_dims;
+        for (const auto& ob : prog.output_bindings) {
+            out_dts.push_back(ob.dtype);
+            out_dims.push_back(ob.dims);
+        }
+        std::vector<std::vector<cloudtpu::PjrtBufferPtr>> outs;
+        rt.execute_spmd(exec, num_chips, in_ptrs.data(), prog.input_bindings.size(), outs, out_dts, out_dims, true);
+        return outs;
+    };
+
+    // 1) Direct ALL_REDUCE_SUM, ALL_GATHER, REDUCE_SCATTER_SUM across P chips
+    {
+        const int64_t D = static_cast<int64_t>(num_chips) * 2;
+        std::vector<std::vector<cloudtpu::PjrtBufferPtr>> in_ar(static_cast<size_t>(num_chips));
+        std::vector<std::vector<cloudtpu::PjrtBufferPtr>> in_ag(static_cast<size_t>(num_chips));
+        for (int d = 0; d < num_chips; ++d) {
+            std::vector<float> v_ar(static_cast<size_t>(D), static_cast<float>(d + 1));
+            std::vector<float> v_ag = {static_cast<float>(d * 10 + 1), static_cast<float>(d * 10 + 2)};
+            in_ar[static_cast<size_t>(d)] = {rt.buffer_from_host(d, v_ar.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, D})};
+            in_ag[static_cast<size_t>(d)] = {rt.buffer_from_host(d, v_ag.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, 2})};
+        }
+        // ALL_REDUCE_SUM: sum(1..P) = P*(P+1)/2
+        {
+            cloudtpu::GraphProgramSpec spec;
+            spec.spmd_chips = num_chips;
+            spec.inputs.push_back({1, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, D}});
+            cloudtpu::OpNodeSpec op;
+            op.kind = cloudtpu::CloudOpKind::ALL_REDUCE_SUM;
+            op.src_ids = {1};
+            op.dst = {2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, D}};
+            spec.ops.push_back(op);
+            spec.output_ids = {2};
+            auto outs = run_spmd(cloudtpu::emit_stablehlo_program(spec), in_ar);
+            const float exp_sum = static_cast<float>(num_chips * (num_chips + 1)) * 0.5f;
+            for (int d = 0; d < num_chips; ++d) {
+                std::vector<float> host(static_cast<size_t>(D));
+                rt.buffer_to_host(outs[static_cast<size_t>(d)][0]->handle.get(), host.data(), host.size() * 4);
+                CHECK_NEAR(host[0], exp_sum, 1e-4f, "SPMD ALL_REDUCE_SUM");
+            }
+        }
+        // ALL_GATHER
+        {
+            cloudtpu::GraphProgramSpec spec;
+            spec.spmd_chips = num_chips;
+            spec.inputs.push_back({1, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 2}});
+            cloudtpu::OpNodeSpec op;
+            op.kind = cloudtpu::CloudOpKind::ALL_GATHER;
+            op.collective_dim = 3;
+            op.src_ids = {1};
+            op.dst = {2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, D}};
+            spec.ops.push_back(op);
+            spec.output_ids = {2};
+            auto outs = run_spmd(cloudtpu::emit_stablehlo_program(spec), in_ag);
+            std::vector<float> host(static_cast<size_t>(D));
+            rt.buffer_to_host(outs[0][0]->handle.get(), host.data(), host.size() * 4);
+            for (int d = 0; d < num_chips; ++d) {
+                CHECK_NEAR(host[static_cast<size_t>(d * 2 + 0)], static_cast<float>(d * 10 + 1), 1e-4f, "SPMD ALL_GATHER[0]");
+                CHECK_NEAR(host[static_cast<size_t>(d * 2 + 1)], static_cast<float>(d * 10 + 2), 1e-4f, "SPMD ALL_GATHER[1]");
+            }
+        }
+        // REDUCE_SCATTER_SUM
+        {
+            cloudtpu::GraphProgramSpec spec;
+            spec.spmd_chips = num_chips;
+            spec.inputs.push_back({1, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, D}});
+            cloudtpu::OpNodeSpec op;
+            op.kind = cloudtpu::CloudOpKind::REDUCE_SCATTER_SUM;
+            op.collective_dim = 3;
+            op.src_ids = {1};
+            op.dst = {2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 2}};
+            spec.ops.push_back(op);
+            spec.output_ids = {2};
+            auto outs = run_spmd(cloudtpu::emit_stablehlo_program(spec), in_ar);
+            const float exp_sum = static_cast<float>(num_chips * (num_chips + 1)) * 0.5f;
+            for (int d = 0; d < num_chips; ++d) {
+                std::vector<float> host(2);
+                rt.buffer_to_host(outs[static_cast<size_t>(d)][0]->handle.get(), host.data(), host.size() * 4);
+                CHECK_NEAR(host[0], exp_sum, 1e-4f, "SPMD REDUCE_SCATTER_SUM[0]");
+                CHECK_NEAR(host[1], exp_sum, 1e-4f, "SPMD REDUCE_SCATTER_SUM[1]");
+            }
+        }
+    }
+
+    // 2) Fused Megatron-LM FFN across P chips:
+    //    Gate (SHARD_N, keep_sharded_out=true) + Up (SHARD_N, keep_sharded_out=true) -> local SWIGLU
+    //    -> Down (SHARD_K) -> SINGLE all_reduce(sum), ZERO all_gather!
+    {
+        const int64_t M = 2, K_embd = 16, H_ff = static_cast<int64_t>(num_chips) * 4;
+        const int64_t H_local = H_ff / num_chips;
+        std::vector<float> x(static_cast<size_t>(M * K_embd));
+        std::vector<float> w_gate(static_cast<size_t>(H_ff * K_embd));
+        std::vector<float> w_up(static_cast<size_t>(H_ff * K_embd));
+        std::vector<float> w_down(static_cast<size_t>(K_embd * H_ff));
+        for (size_t i = 0; i < x.size(); ++i) x[i] = std::sin(static_cast<float>(i) * 0.19f);
+        for (size_t i = 0; i < w_gate.size(); ++i) w_gate[i] = std::cos(static_cast<float>(i) * 0.11f) * 0.25f;
+        for (size_t i = 0; i < w_up.size(); ++i) w_up[i] = std::sin(static_cast<float>(i) * 0.07f) * 0.25f;
+        for (size_t i = 0; i < w_down.size(); ++i) w_down[i] = std::cos(static_cast<float>(i) * 0.13f) * 0.25f;
+
+        // Reference scalar FFN
+        std::vector<float> ref(static_cast<size_t>(M * K_embd), 0.0f);
+        for (int64_t m = 0; m < M; ++m) {
+            std::vector<float> h(static_cast<size_t>(H_ff), 0.0f);
+            for (int64_t j = 0; j < H_ff; ++j) {
+                float g = 0.0f, u = 0.0f;
+                for (int64_t k = 0; k < K_embd; ++k) {
+                    g += x[static_cast<size_t>(m * K_embd + k)] * w_gate[static_cast<size_t>(j * K_embd + k)];
+                    u += x[static_cast<size_t>(m * K_embd + k)] * w_up[static_cast<size_t>(j * K_embd + k)];
+                }
+                h[static_cast<size_t>(j)] = (g / (1.0f + std::exp(-g))) * u;
+            }
+            for (int64_t n = 0; n < K_embd; ++n) {
+                float acc = 0.0f;
+                for (int64_t j = 0; j < H_ff; ++j) {
+                    acc += h[static_cast<size_t>(j)] * w_down[static_cast<size_t>(n * H_ff + j)];
+                }
+                ref[static_cast<size_t>(m * K_embd + n)] = acc;
+            }
+        }
+
+        cloudtpu::GraphProgramSpec spec;
+        spec.spmd_chips = num_chips;
+        spec.inputs.push_back({1, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, K_embd}, cloudtpu::TensorShardingKind::REPLICATED});
+        spec.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, H_ff, K_embd}, cloudtpu::TensorShardingKind::SHARD_N});
+        spec.inputs.push_back({3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, H_ff, K_embd}, cloudtpu::TensorShardingKind::SHARD_N});
+        spec.inputs.push_back({4, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, K_embd, H_ff}, cloudtpu::TensorShardingKind::SHARD_K});
+
+        cloudtpu::OpNodeSpec op_g;
+        op_g.kind = cloudtpu::CloudOpKind::MUL_MAT;
+        op_g.src_ids = {2, 1};
+        op_g.dst = {10, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, H_ff}};
+        op_g.high_precision = true;
+        op_g.keep_sharded_out = true;
+
+        cloudtpu::OpNodeSpec op_u;
+        op_u.kind = cloudtpu::CloudOpKind::MUL_MAT;
+        op_u.src_ids = {3, 1};
+        op_u.dst = {11, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, H_ff}};
+        op_u.high_precision = true;
+        op_u.keep_sharded_out = true;
+
+        cloudtpu::OpNodeSpec op_glu;
+        op_glu.kind = cloudtpu::CloudOpKind::SWIGLU;
+        op_glu.src_ids = {10, 11};
+        op_glu.dst = {12, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, H_ff}};
+
+        cloudtpu::OpNodeSpec op_d;
+        op_d.kind = cloudtpu::CloudOpKind::MUL_MAT;
+        op_d.src_ids = {4, 12};
+        op_d.dst = {13, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, K_embd}};
+        op_d.high_precision = true;
+
+        spec.ops = {op_g, op_u, op_glu, op_d};
+        spec.output_ids = {13};
+
+        const auto prog = cloudtpu::emit_stablehlo_program(spec);
+        CHECK_TRUE(prog.mlir_text.find("stablehlo.all_gather") == std::string::npos,
+                   "Megatron FFN must emit zero all_gather");
+        const size_t ar_pos = prog.mlir_text.find("stablehlo.all_reduce");
+        CHECK_TRUE(ar_pos != std::string::npos &&
+                       prog.mlir_text.find("stablehlo.all_reduce", ar_pos + 1) == std::string::npos,
+                   "Megatron FFN must emit exactly one all_reduce");
+
+        // Prepare per-chip sharded buffers
+        std::vector<std::vector<cloudtpu::PjrtBufferPtr>> per_dev(static_cast<size_t>(num_chips));
+        for (int p = 0; p < num_chips; ++p) {
+            auto bx = rt.buffer_from_host(p, x.data(), cloudtpu::PjrtDType::F32, {1, 1, M, K_embd});
+            auto bg = rt.buffer_from_host(
+                p, w_gate.data() + static_cast<size_t>(p * H_local * K_embd),
+                cloudtpu::PjrtDType::F32, {1, 1, H_local, K_embd});
+            auto bu = rt.buffer_from_host(
+                p, w_up.data() + static_cast<size_t>(p * H_local * K_embd),
+                cloudtpu::PjrtDType::F32, {1, 1, H_local, K_embd});
+            std::vector<float> wd_local(static_cast<size_t>(K_embd * H_local));
+            for (int64_t r = 0; r < K_embd; ++r) {
+                std::memcpy(wd_local.data() + static_cast<size_t>(r * H_local),
+                            w_down.data() + static_cast<size_t>(r * H_ff + p * H_local),
+                            static_cast<size_t>(H_local) * sizeof(float));
+            }
+            auto bd = rt.buffer_from_host(p, wd_local.data(), cloudtpu::PjrtDType::F32, {1, 1, K_embd, H_local});
+            per_dev[static_cast<size_t>(p)] = {bx, bg, bu, bd};
+        }
+
+        // Verify per-chip HBM weight memory scales down by 1/P!
+        size_t f_used = 0, t_lim = 0;
+        CHECK_TRUE(rt.query_memory_stats(0, &f_used, &t_lim), "SPMD mem stats after shard upload");
+        const size_t used_chip0 = t_lim - f_used;
+        const size_t full_weights_bytes = (w_gate.size() + w_up.size() + w_down.size()) * sizeof(float);
+        const size_t expected_chip0 = (x.size() * sizeof(float)) + full_weights_bytes / static_cast<size_t>(num_chips);
+        CHECK_TRUE(used_chip0 == expected_chip0, "SPMD per-chip HBM scales by 1/P");
+
+        auto outs = run_spmd(prog, per_dev);
+        for (int p = 0; p < num_chips; ++p) {
+            std::vector<float> got(ref.size());
+            rt.buffer_to_host(outs[static_cast<size_t>(p)][0]->handle.get(), got.data(), got.size() * sizeof(float));
+            for (size_t i = 0; i < ref.size(); ++i) {
+                CHECK_NEAR(got[i], ref[i], 1e-4f, "SPMD Megatron FFN parity");
+            }
+        }
+    }
+
+    rt.shutdown();
+    std::printf("  [PASS] Multi-chip SPMD mesh (%d chips: collectives + 1/P HBM + Megatron FFN)\n", num_chips);
+}
+
 }  // namespace
 
 int main() {
@@ -576,6 +859,9 @@ int main() {
     test_mul_mat_dense_and_quant(rt);
     test_rms_rope_softmax_swiglu_getrows_fused(rt);
     test_silicon_regressions(rt);
+    test_collectives_p1_live_compatible(rt);
+    test_spmd_multichip_mesh(4);  // tpu7x-4t (4x 192 GiB HBM3e)
+    test_spmd_multichip_mesh(8);  // v6e-8 (8x 32 GiB HBM)
 
     const size_t py_maps = cloudtpu::count_libpython_mappings();
     std::printf("  MAPS_LIBPYTHON=%zu\n", py_maps);

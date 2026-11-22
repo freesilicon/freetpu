@@ -2,6 +2,7 @@
 
 #include <pjrt_c_api.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <list>
@@ -22,6 +23,7 @@ enum class PjrtDType {
     U8,
     S16,
     S32,
+    U32,
     S64,
 };
 
@@ -44,6 +46,9 @@ struct PjrtCompileOptions {
     int32_t num_partitions = 1;
     bool use_spmd_partitioning = true;
     bool use_shardy_partitioner = true;
+    // Optional explicit DeviceAssignmentProto mapping [partition][replica] -> device_id.
+    // Length must equal num_replicas * num_partitions when non-empty.
+    std::vector<int64_t> device_assignment_ids;
 };
 
 // Encodes xla::CompileOptionsProto in pure C++ protobuf wire format (zero libprotobuf dep).
@@ -60,6 +65,7 @@ struct PjrtDeviceInfo {
 
 struct RuntimeConfig {
     bool mock_mode = false;
+    int mock_devices = 1;  // Number of virtual TPU chips in Host Mock PJRT (e.g. 4=tpu7x, 8=v6e-8)
     int verbose = 0;
     uint32_t exec_cache_cap = 4096;
     std::string libtpu_path;
@@ -128,9 +134,17 @@ public:
                                    PjrtDType dtype,
                                    const std::vector<int64_t>& dims);
 
+    std::vector<PjrtBufferPtr> buffer_from_host_replicated(int num_devices,
+                                                           const void* data,
+                                                           PjrtDType dtype,
+                                                           const std::vector<int64_t>& dims);
+
     void buffer_to_host(PJRT_Buffer* buf, void* dst, size_t dst_size);
     void await_buffer_ready(PJRT_Buffer* buf);
     void await_event(PJRT_Event* ev);
+
+    // Builds compile options (including DeviceAssignmentProto when num_chips > 1) for a 1D chip mesh.
+    PjrtCompileOptions make_spmd_compile_options(int num_chips) const;
 
     // Compile StableHLO MLIR ("mlir" format) or return cached PJRT_LoadedExecutable*.
     // Thread-safe LRU cache keyed by canonical structural program key.
@@ -147,8 +161,18 @@ public:
                  const std::vector<std::vector<int64_t>>& out_dims,
                  bool sync);
 
+    void execute_spmd(const CachedExecutable* exec,
+                      int num_devices,
+                      PJRT_Buffer* const* const* per_device_inputs,
+                      size_t num_inputs,
+                      std::vector<std::vector<PjrtBufferPtr>>& per_device_outputs,
+                      const std::vector<PjrtDType>& out_dtypes,
+                      const std::vector<std::vector<int64_t>>& out_dims,
+                      bool sync);
+
     void clear_exec_cache();
     CacheStats cache_stats() const;
+    uint64_t eviction_epoch() const { return eviction_epoch_.load(std::memory_order_acquire); }
 
     // Exposes raw PJRT API pointers for diagnostics/tests.
     const PJRT_Api* pjrt_api() const { return api_; }
@@ -181,7 +205,8 @@ private:
     uint64_t cache_misses_ = 0;
     uint64_t cache_evictions_ = 0;
     uint64_t total_compile_us_ = 0;
-    uint64_t total_execute_us_ = 0;
+    std::atomic<uint64_t> total_execute_us_{0};
+    std::atomic<uint64_t> eviction_epoch_{0};
 };
 
 // Shared process-wide PJRT runtime singleton (libtpu.so owns exclusive /dev/vfio/0 per process).
