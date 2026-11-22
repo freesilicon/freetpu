@@ -11,12 +11,17 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+
+#if defined(__linux__) || defined(__ANDROID__)
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -1006,8 +1011,33 @@ static const char * ggml_backend_edgetpu_device_get_description(ggml_backend_dev
 
 static void ggml_backend_edgetpu_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
     GGML_UNUSED(dev);
+#if defined(__linux__) || defined(__ANDROID__)
+    const long pages     = sysconf(_SC_PHYS_PAGES);
+    const long page_size = sysconf(_SC_PAGE_SIZE);
+    size_t total_bytes = (pages > 0 && page_size > 0)
+        ? static_cast<size_t>(pages) * static_cast<size_t>(page_size)
+        : 0;
+    size_t avail_bytes = 0;
+
+    if (FILE * f = std::fopen("/proc/meminfo", "r")) {
+        char line[256];
+        unsigned long long kb = 0;
+        while (std::fgets(line, sizeof(line), f)) {
+            if (total_bytes == 0 && std::sscanf(line, "MemTotal: %llu kB", &kb) == 1) {
+                total_bytes = static_cast<size_t>(kb) * 1024u;
+            } else if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+                avail_bytes = static_cast<size_t>(kb) * 1024u;
+                break;
+            }
+        }
+        std::fclose(f);
+    }
+    *total = total_bytes;
+    *free  = avail_bytes > 0 ? avail_bytes : total_bytes;
+#else
     *free  = 0;
     *total = 0;
+#endif
 }
 
 static enum ggml_backend_dev_type ggml_backend_edgetpu_device_get_type(ggml_backend_dev_t dev) {

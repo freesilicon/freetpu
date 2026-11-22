@@ -1,0 +1,148 @@
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -1427,10 +1427,27 @@
+ 
+ class rpc_server {
+ public:
+-    rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir)
+-        : backends(std::move(all_backends)), cache_dir(cache_dir) {
++    rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir, size_t n_threads = 0)
++        : backends(std::move(all_backends)), cache_dir(cache_dir), n_threads(n_threads) {
+         stored_graphs.resize(backends.size());
+         comm_states.resize(backends.size());
++        for (ggml_backend_t backend : backends) {
++            ggml_backend_dev_t dev = ggml_backend_get_device(backend);
++            if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL &&
++                ggml_backend_buft_is_host(ggml_backend_get_default_buffer_type(backend))) {
++                cpu_fallback = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
++                if (cpu_fallback && n_threads > 0) {
++                    ggml_backend_reg_t cpu_reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(cpu_fallback));
++                    if (cpu_reg) {
++                        auto set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_set_n_threads");
++                        if (set_n_threads_fn) {
++                            set_n_threads_fn(cpu_fallback, (int) n_threads);
++                        }
++                    }
++                }
++                break;
++            }
++        }
+     }
+     ~rpc_server();
+ 
+@@ -1464,6 +1481,7 @@
+ 
+ private:
+     void sync_all_backends();
++    ggml_status compute_graph_with_accel_fallback(uint32_t device, ggml_cgraph * graph);
+     void comm_free_device(uint32_t dev_id);
+     static bool comm_allreduce_pairwise(void * comm_ctx_v, ggml_tensor ** tensors);
+     static bool comm_bootstrap_exchange(void * user_data, const void * send_buf, void * recv_buf, size_t size);
+@@ -1499,6 +1517,8 @@
+ 
+     std::vector<ggml_backend_t> backends;
+     const char * cache_dir;
++    size_t n_threads = 0;
++    ggml_backend_t cpu_fallback = nullptr;
+     std::unordered_set<ggml_backend_buffer_t> buffers;
+     // computed graphs cached per backend, keyed by uid
+     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
+@@ -2179,6 +2199,53 @@
+     }
+     result->view_offs = tensor->view_offs;
+     return result;
++}
++
++ggml_status rpc_server::compute_graph_with_accel_fallback(uint32_t device, ggml_cgraph * graph) {
++    ggml_backend_t backend = backends[device];
++    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
++    if (!cpu_fallback || !dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_ACCEL ||
++        !ggml_backend_buft_is_host(ggml_backend_get_default_buffer_type(backend))) {
++        return ggml_backend_graph_compute_async(backend, graph);
++    }
++
++    int i = 0;
++    while (i < graph->n_nodes) {
++        while (i < graph->n_nodes && graph->nodes[i] == nullptr) {
++            ++i;
++        }
++        if (i >= graph->n_nodes) {
++            break;
++        }
++        const bool use_accel = ggml_backend_dev_supports_op(dev, graph->nodes[i]);
++        int j = i + 1;
++        while (j < graph->n_nodes) {
++            ggml_tensor * node = graph->nodes[j];
++            if (node == nullptr) {
++                break;
++            }
++            if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 &&
++                ggml_backend_dev_supports_op(dev, node) != use_accel) {
++                break;
++            }
++            ++j;
++        }
++        struct ggml_cgraph sub = ggml_graph_view(graph, i, j);
++        ggml_status status = GGML_STATUS_SUCCESS;
++        if (use_accel) {
++            status = ggml_backend_graph_compute_async(backend, &sub);
++            if (status == GGML_STATUS_SUCCESS) {
++                ggml_backend_synchronize(backend);
++            }
++        } else {
++            status = ggml_backend_graph_compute(cpu_fallback, &sub);
++        }
++        if (status != GGML_STATUS_SUCCESS) {
++            return status;
++        }
++        i = j;
++    }
++    return GGML_STATUS_SUCCESS;
+ }
+ 
+ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+@@ -2266,7 +2333,7 @@
+     }
+     const std::chrono::duration<double, std::milli> deserialize_ms = std::chrono::steady_clock::now() - t_deserialize;
+ 
+-    ggml_status status = ggml_backend_graph_compute_async(backends[device], graph);
++    ggml_status status = compute_graph_with_accel_fallback(device, graph);
+     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+     sg.graph = graph;
+     LOG_DBG3("[%s] device: %u, graph build: %.3f ms\n", __func__, device, deserialize_ms.count());
+@@ -2285,7 +2352,7 @@
+     }
+     ggml_cgraph * graph = it->second.graph;
+     LOG_DBG("[%s] device: %u, uid: %" PRIu64 "\n", __func__, device, request.uid);
+-    ggml_status status = ggml_backend_graph_compute_async(backends[device], graph);
++    ggml_status status = compute_graph_with_accel_fallback(device, graph);
+     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+     return true;
+ }
+@@ -2655,11 +2722,15 @@
+     for (auto buffer : buffers) {
+         ggml_backend_buffer_free(buffer);
+     }
++    if (cpu_fallback != nullptr) {
++        ggml_backend_free(cpu_fallback);
++        cpu_fallback = nullptr;
++    }
+ }
+ 
+ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
+-                             socket_ptr sock) {
+-    rpc_server server(backends, cache_dir);
++                             size_t n_threads, socket_ptr sock) {
++    rpc_server server(backends, cache_dir, n_threads);
+     uint8_t cmd;
+     if (!sock->recv_data(&cmd, 1)) {
+         return;
+@@ -3047,7 +3118,7 @@
+             return;
+         }
+         LOG_INFO("Accepted client connection\n");
+-        rpc_serve_client(backends, cache_dir, client_socket);
++        rpc_serve_client(backends, cache_dir, n_threads, client_socket);
+         LOG_INFO("Client connection closed\n");
+     }
+     rpc_transport_shutdown();
