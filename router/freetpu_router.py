@@ -28,6 +28,7 @@ if __package__ in (None, ""):
 from router.config import (  # noqa: E402
     BackendConfig,
     RouterConfig,
+    VALID_AUTH_TYPES,
     VALID_POLICIES,
     load_config,
     sanitize_url,
@@ -116,19 +117,86 @@ def _estimate_prompt_tokens(payload: Mapping[str, Any]) -> int:
     return max(1, (total_chars + 3) // 4)
 
 
-def _extract_sse_delta_text(obj: Mapping[str, Any]) -> str:
+def _extract_choice_output_text(obj: Mapping[str, Any]) -> str:
+    """Extract all generated text and tool-call output across every choice."""
     choices = obj.get("choices")
     if not isinstance(choices, list) or not choices:
         return ""
-    first = choices[0]
-    if not isinstance(first, Mapping):
-        return ""
-    delta = first.get("delta")
-    if isinstance(delta, Mapping) and isinstance(delta.get("content"), str):
-        return delta["content"]
-    if isinstance(first.get("text"), str):
-        return first["text"]
-    return ""
+    parts: List[str] = []
+    for choice in choices:
+        if not isinstance(choice, Mapping):
+            continue
+        text_val = choice.get("text")
+        if isinstance(text_val, str) and text_val:
+            parts.append(text_val)
+        for container_key in ("delta", "message"):
+            container = choice.get(container_key)
+            if not isinstance(container, Mapping):
+                continue
+            for text_key in ("content", "refusal", "reasoning_content", "reasoning"):
+                val = container.get(text_key)
+                if isinstance(val, str) and val:
+                    parts.append(val)
+            func_call = container.get("function_call")
+            if isinstance(func_call, Mapping):
+                for fk in ("name", "arguments"):
+                    fval = func_call.get(fk)
+                    if isinstance(fval, str) and fval:
+                        parts.append(fval)
+            tool_calls = container.get("tool_calls")
+            if isinstance(tool_calls, list):
+                for tc in tool_calls:
+                    if not isinstance(tc, Mapping):
+                        continue
+                    fn = tc.get("function")
+                    if isinstance(fn, Mapping):
+                        for fk in ("name", "arguments"):
+                            fval = fn.get(fk)
+                            if isinstance(fval, str) and fval:
+                                parts.append(fval)
+    return "".join(parts)
+
+
+def _extract_non_stream_usage(
+    raw_resp: bytes,
+    est_prompt_tokens: int,
+) -> Tuple[int, int]:
+    """Extract `(prompt_tokens, completion_tokens)` preferring upstream counts."""
+    prompt_tokens = est_prompt_tokens
+    completion_tokens = 0
+    saw_prompt = False
+    saw_completion = False
+    try:
+        parsed_resp = json.loads(raw_resp.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return prompt_tokens, completion_tokens
+    if not isinstance(parsed_resp, Mapping):
+        return prompt_tokens, completion_tokens
+
+    usage = parsed_resp.get("usage")
+    if isinstance(usage, Mapping):
+        if usage.get("prompt_tokens") is not None:
+            prompt_tokens = int(usage["prompt_tokens"])
+            saw_prompt = True
+        if usage.get("completion_tokens") is not None:
+            completion_tokens = int(usage["completion_tokens"])
+            saw_completion = True
+
+    timings = parsed_resp.get("timings")
+    if isinstance(timings, Mapping):
+        if not saw_prompt and timings.get("prompt_n") is not None:
+            prompt_tokens = int(timings["prompt_n"])
+            saw_prompt = True
+        if not saw_completion and timings.get("predicted_n") is not None:
+            completion_tokens = int(timings["predicted_n"])
+            saw_completion = True
+
+    if not saw_completion:
+        output_txt = _extract_choice_output_text(parsed_resp)
+        if output_txt:
+            completion_tokens = max(1, (len(output_txt) + 3) // 4)
+
+    return prompt_tokens, completion_tokens
 
 
 @dataclass
@@ -154,6 +222,9 @@ class BackendState:
     def __post_init__(self) -> None:
         if self.ewma_latency_ms is None and self.config.latency_hint_ms is not None:
             self.ewma_latency_ms = self.config.latency_hint_ms
+        if not self.config.enabled:
+            self.healthy = False
+            self.unhealthy_reason = "disabled"
 
     def effective_models(self) -> List[str]:
         if self.config.discover_models and self.discovery_succeeded:
@@ -211,7 +282,7 @@ class BackendState:
             "spot": self.config.spot,
             "enabled": self.config.enabled,
             "base_url": sanitize_url(self.config.base_url),
-            "healthy": self.healthy and not in_cooldown,
+            "healthy": self.config.enabled and self.healthy and not in_cooldown,
             "unhealthy_reason": self.unhealthy_reason,
             "in_cooldown": in_cooldown,
             "inflight": self.inflight,
@@ -245,9 +316,19 @@ def build_hooks_from_config(
     if resolved_auth is None:
         auth_cfg = config.auth
         spec = auth_cfg.get("hook")
-        if spec:
-            resolved_auth = load_hook_from_spec(str(spec), auth_cfg.get("kwargs"))
-        elif auth_cfg.get("type") == "bearer":
+        auth_type = auth_cfg.get("type")
+        if spec is not None:
+            if not isinstance(spec, str) or not spec.strip():
+                raise ValueError(
+                    f"Invalid auth.hook spec {spec!r}; expected 'module:ClassName'"
+                )
+            if auth_type is not None and auth_type != "custom":
+                raise ValueError(
+                    f"Invalid auth.type {auth_type!r} when auth.hook is configured; "
+                    "omit 'type' or set 'custom'"
+                )
+            resolved_auth = load_hook_from_spec(spec.strip(), auth_cfg.get("kwargs"))
+        elif auth_type == "bearer":
             tokens: List[str] = [str(t) for t in auth_cfg.get("tokens") or [] if t]
             for env_name in auth_cfg.get("tokens_env") or []:
                 import os
@@ -257,8 +338,12 @@ def build_hooks_from_config(
                     tokens.append(val)
             exempt = auth_cfg.get("exempt_paths") or ("/health",)
             resolved_auth = BearerTokenAuthHook(tokens, exempt_paths=exempt)
-        else:
+        elif auth_type in (None, "allow_all"):
             resolved_auth = AllowAllAuthHook()
+        else:
+            raise ValueError(
+                f"Invalid auth.type {auth_type!r}; expected one of {VALID_AUTH_TYPES}"
+            )
 
     resolved_usage = usage_hook
     if resolved_usage is None:
@@ -493,6 +578,33 @@ class RouterEngine:
             else:
                 state.healthy = False
 
+    def try_reserve_backend(
+        self,
+        state: BackendState,
+        *,
+        now_monotonic: Optional[float] = None,
+    ) -> Optional[int]:
+        """Atomically recheck backend eligibility and reserve one in-flight slot."""
+        now_m = now_monotonic if now_monotonic is not None else time.monotonic()
+        with self._lock:
+            if not state.is_eligible(now_m):
+                return None
+            state.inflight += 1
+            state.total_requests += 1
+            state.last_used_monotonic = now_m
+            state.idle_notified = False
+        return self.metrics.inc_inflight(state.config.id)
+
+    def release_backend(self, state: BackendState) -> None:
+        """Release one in-flight slot; start idle timing when in-flight drops to zero."""
+        now_m = time.monotonic()
+        with self._lock:
+            state.inflight = max(0, state.inflight - 1)
+            if state.inflight == 0:
+                state.last_used_monotonic = now_m
+                state.idle_notified = False
+        self.metrics.dec_inflight(state.config.id)
+
     def select_candidates(
         self,
         model: str,
@@ -591,7 +703,8 @@ class RouterEngine:
         now_m = time.monotonic()
         with self._lock:
             snaps = [b.snapshot(now_m) for b in self._backends]
-        healthy_count = sum(1 for s in snaps if s["healthy"])
+        healthy_count = sum(1 for s in snaps if s["enabled"] and s["healthy"])
+        enabled_count = sum(1 for s in snaps if s["enabled"])
         status_str = "ok" if healthy_count > 0 else "degraded"
         http_code = 200 if healthy_count > 0 else 503
         payload = {
@@ -599,6 +712,7 @@ class RouterEngine:
             "version": __version__,
             "policy": self.config.policy,
             "healthy_backends": healthy_count,
+            "enabled_backends": enabled_count,
             "total_backends": len(snaps),
             "active_inflight": self.metrics.total_inflight(),
             "backends": snaps,
@@ -716,9 +830,39 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
     server: FreeTPURouterServer
     protocol_version = "HTTP/1.1"
 
+    def setup(self) -> None:
+        self.timeout = self.server.engine.config.client_read_timeout_s
+        super().setup()
+
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         if self.server.verbose:
             sys.stderr.write(f"{self.address_string()} - {format % args}\n")
+
+    def _resolve_cors_header(self) -> Tuple[bool, Optional[str]]:
+        """Check request Origin against explicit `cors_allowed_origins`.
+
+        Returns `(allowed, acao_header_value)`. Non-browser requests without an
+        `Origin` header are allowed with `acao_header_value=None`.
+        """
+        raw_origin = self.headers.get("Origin")
+        if raw_origin is None:
+            return True, None
+        origin = raw_origin.strip()
+        allowed = self.server.engine.config.cors_allowed_origins
+        if not allowed:
+            return False, None
+        if "*" in allowed:
+            return True, "*"
+        if origin.rstrip("/") in allowed:
+            return True, origin
+        return False, None
+
+    def _send_cors_headers(self, acao: Optional[str]) -> None:
+        if acao is None:
+            return
+        self.send_header("Access-Control-Allow-Origin", acao)
+        if acao != "*":
+            self.send_header("Vary", "Origin")
 
     def _send_bytes(
         self,
@@ -727,10 +871,12 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         body: bytes,
         extra_headers: Optional[Mapping[str, str]] = None,
     ) -> None:
+        self.close_connection = True
+        _, acao = self._resolve_cors_header()
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self._send_cors_headers(acao)
         self.send_header("Connection", "close")
         if extra_headers:
             for k, v in extra_headers.items():
@@ -740,6 +886,18 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         self.wfile.flush()
 
+    def _safe_send_bytes(
+        self,
+        status: int,
+        content_type: str,
+        body: bytes,
+        extra_headers: Optional[Mapping[str, str]] = None,
+    ) -> None:
+        try:
+            self._send_bytes(status, content_type, body, extra_headers=extra_headers)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            self.close_connection = True
+
     def _send_json(
         self,
         status: int,
@@ -748,6 +906,30 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
     ) -> None:
         body = (json.dumps(payload) + "\n").encode("utf-8")
         self._send_bytes(status, "application/json", body, extra_headers=extra_headers)
+
+    def _read_request_body(self, content_len: int) -> Tuple[Optional[bytes], Optional[Tuple[int, str, str]]]:
+        """Read exactly `content_len` bytes within the configured wall-clock deadline."""
+        timeout_s = self.server.engine.config.client_read_timeout_s
+        deadline = time.monotonic() + timeout_s
+        chunks: List[bytes] = []
+        remaining = content_len
+        read_fn = getattr(self.rfile, "read1", self.rfile.read)
+        try:
+            while remaining > 0:
+                time_left = deadline - time.monotonic()
+                if time_left <= 0:
+                    return None, (408, "request_timeout", "Request body read timed out")
+                self.connection.settimeout(time_left)
+                chunk = read_fn(min(65536, remaining))
+                if not chunk:
+                    return None, (400, "incomplete_body", "Incomplete request body")
+                chunks.append(chunk)
+                remaining -= len(chunk)
+        except TimeoutError:
+            return None, (408, "request_timeout", "Request body read timed out")
+        except OSError:
+            return None, (400, "incomplete_body", "Client disconnected while uploading body")
+        return b"".join(chunks), None
 
     def _authorize(self, path: str, method: str) -> Optional[AuthContext]:
         hdrs = {k: v for k, v in self.headers.items()}
@@ -766,8 +948,21 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         return ctx
 
     def do_OPTIONS(self) -> None:  # noqa: N802
+        self.close_connection = True
+        allowed, acao = self._resolve_cors_header()
+        if not allowed or acao is None:
+            self._send_bytes(
+                403,
+                "application/json",
+                _openai_error_body(
+                    "Cross-origin requests are not allowed by router CORS policy",
+                    error_type="permission_error",
+                    code="origin_not_allowed",
+                ),
+            )
+            return
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self._send_cors_headers(acao)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header(
             "Access-Control-Allow-Headers",
@@ -804,6 +999,19 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         )
 
     def do_POST(self) -> None:  # noqa: N802
+        origin_allowed, _ = self._resolve_cors_header()
+        if not origin_allowed:
+            self._send_bytes(
+                403,
+                "application/json",
+                _openai_error_body(
+                    "Origin is not allowed by router CORS policy",
+                    error_type="permission_error",
+                    code="origin_not_allowed",
+                ),
+            )
+            return
+
         path = urlsplit(self.path).path
         ctx = self._authorize(path, "POST")
         if ctx is None:
@@ -835,7 +1043,42 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
-        raw_req = self.rfile.read(content_len)
+        max_body = self.server.engine.config.max_request_body_bytes
+        if content_len > max_body:
+            self._send_bytes(
+                413,
+                "application/json",
+                _openai_error_body(
+                    f"Request body exceeds maximum size of {max_body} bytes",
+                    code="payload_too_large",
+                ),
+            )
+            return
+
+        raw_req, read_err = self._read_request_body(content_len)
+        if read_err is not None or raw_req is None:
+            err_status, err_code, err_msg = read_err or (
+                400,
+                "incomplete_body",
+                "Failed to read request body",
+            )
+            self._safe_send_bytes(
+                err_status,
+                "application/json",
+                _openai_error_body(err_msg, code=err_code),
+            )
+            return
+
+        # Allow legitimate long-running inference/streaming responses to write cleanly.
+        try:
+            write_timeout = max(
+                self.server.engine.config.client_read_timeout_s,
+                self.server.engine.config.request_timeout_s,
+            )
+            self.connection.settimeout(write_timeout)
+        except OSError:
+            pass
+
         try:
             req_payload = json.loads(raw_req.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -882,49 +1125,49 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             policy_override = policy_override.strip()
 
         candidates = engine.select_candidates(model, policy=policy_override)
-        if not candidates:
-            engine._emit_queue_pressure(
-                model=model,
-                active_inflight=engine.metrics.total_inflight(),
-                healthy_backends=0,
-                reason="no_healthy_backend",
-            )
-            self._send_bytes(
-                503,
-                "application/json",
-                _openai_error_body(
-                    f"No healthy backend available for model {model!r}",
-                    error_type="service_unavailable",
-                    code="no_healthy_backend",
-                ),
-                extra_headers={"X-FreeTPU-Request-Id": req_id},
-            )
-            return
-
-        total_inflight_now = engine.metrics.total_inflight() + 1
-        if total_inflight_now >= engine.config.queue_pressure_threshold:
-            engine._emit_queue_pressure(
-                model=model,
-                active_inflight=total_inflight_now,
-                healthy_backends=len(candidates),
-                reason="inflight_threshold_exceeded",
-            )
-
         est_prompt_tokens = _estimate_prompt_tokens(req_payload)
         failovers = 0
         last_error_status = 503
-        last_error_msg = "All candidate backends failed"
+        last_error_msg = f"No healthy backend available for model {model!r}"
+        last_error_type = "service_unavailable"
+        last_error_code = "no_healthy_backend"
+        last_error_body: Optional[bytes] = None
+        last_error_content_type = "application/json"
+        last_attempted_backend: Optional[BackendState] = None
+        prev_failure: Optional[Tuple[str, str]] = None
+        pressure_checked = False
 
-        for idx, backend in enumerate(candidates):
+        for backend in candidates:
             attempt_start = time.monotonic()
-            engine.metrics.inc_inflight(backend.config.id)
-            with engine._lock:
-                backend.inflight += 1
-                backend.total_requests += 1
-                backend.last_used_monotonic = attempt_start
-                backend.idle_notified = False
+            total_inflight_now = engine.try_reserve_backend(
+                backend, now_monotonic=attempt_start
+            )
+            if total_inflight_now is None:
+                continue
 
+            if not pressure_checked:
+                pressure_checked = True
+                if total_inflight_now >= engine.config.queue_pressure_threshold:
+                    engine._emit_queue_pressure(
+                        model=model,
+                        active_inflight=total_inflight_now,
+                        healthy_backends=len(candidates),
+                        reason="inflight_threshold_exceeded",
+                    )
+
+            if prev_failure is not None:
+                failovers += 1
+                engine.metrics.record_failover(
+                    model=model,
+                    from_backend=prev_failure[0],
+                    to_backend=backend.config.id,
+                    reason=prev_failure[1],
+                )
+                prev_failure = None
+
+            last_attempted_backend = backend
             conn: Optional[http.client.HTTPConnection] = None
+            non_stream_result: Optional[Tuple[int, str, bytes, float, float]] = None
             try:
                 scheme, host, port, upstream_path = _join_backend_url(
                     backend.config.base_url, endpoint
@@ -945,35 +1188,19 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
 
                 if resp.status in RETRYABLE_STATUS_CODES:
                     reason = f"http_{resp.status}"
-                    last_error_status = resp.status
-                    last_error_msg = f"Backend {backend.config.id!r} returned {resp.status}"
-                    engine.mark_backend_failed(backend, reason)
-                    if idx + 1 < len(candidates):
-                        failovers += 1
-                        engine.metrics.record_failover(
-                            model=model,
-                            from_backend=backend.config.id,
-                            to_backend=candidates[idx + 1].config.id,
-                            reason=reason,
-                        )
-                        continue
                     err_body = resp.read()
-                    self._send_bytes(
-                        resp.status,
-                        resp.getheader("Content-Type") or "application/json",
-                        err_body
-                        or _openai_error_body(
-                            last_error_msg,
-                            error_type="service_unavailable",
-                            code="backend_unavailable",
-                        ),
-                        extra_headers={
-                            "X-FreeTPU-Backend": backend.config.id,
-                            "X-FreeTPU-Failovers": str(failovers),
-                            "X-FreeTPU-Request-Id": req_id,
-                        },
+                    err_ct = resp.getheader("Content-Type") or "application/json"
+                    last_error_status = resp.status
+                    last_error_msg = (
+                        f"Backend {backend.config.id!r} returned {resp.status}"
                     )
-                    return
+                    last_error_type = "service_unavailable"
+                    last_error_code = "backend_unavailable"
+                    last_error_body = err_body or None
+                    last_error_content_type = err_ct
+                    engine.mark_backend_failed(backend, reason)
+                    prev_failure = (backend.config.id, reason)
+                    continue
 
                 if stream and 200 <= resp.status < 300:
                     completed = self._proxy_sse_stream(
@@ -986,65 +1213,67 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         failovers=failovers,
                         est_prompt_tokens=est_prompt_tokens,
                         principal=auth_ctx.principal,
-                        has_next_candidate=(idx + 1 < len(candidates)),
                     )
                     if completed:
                         return
                     # Pre-first-token stream failure: fail over to next candidate.
+                    reason = "stream_aborted_before_first_token"
                     last_error_status = 502
                     last_error_msg = (
                         f"Backend {backend.config.id!r} aborted stream before first token"
                     )
-                    engine.mark_backend_failed(backend, "stream_aborted_before_first_token")
-                    if idx + 1 < len(candidates):
-                        failovers += 1
-                        engine.metrics.record_failover(
-                            model=model,
-                            from_backend=backend.config.id,
-                            to_backend=candidates[idx + 1].config.id,
-                            reason="stream_aborted_before_first_token",
-                        )
-                        continue
-                    self._send_bytes(
-                        502,
-                        "application/json",
-                        _openai_error_body(
-                            last_error_msg,
-                            error_type="bad_gateway",
-                            code="upstream_stream_error",
-                        ),
-                        extra_headers={
-                            "X-FreeTPU-Backend": backend.config.id,
-                            "X-FreeTPU-Failovers": str(failovers),
-                            "X-FreeTPU-Request-Id": req_id,
-                        },
-                    )
-                    return
+                    last_error_type = "bad_gateway"
+                    last_error_code = "upstream_stream_error"
+                    last_error_body = None
+                    last_error_content_type = "application/json"
+                    engine.mark_backend_failed(backend, reason)
+                    prev_failure = (backend.config.id, reason)
+                    continue
 
                 # Non-streaming response (or non-retryable error status such as 4xx)
                 raw_resp = resp.read()
                 latency_ms = (time.monotonic() - req_start) * 1000.0
                 attempt_ms = (time.monotonic() - attempt_start) * 1000.0
                 content_type = resp.getheader("Content-Type") or "application/json"
+                non_stream_result = (
+                    resp.status,
+                    content_type,
+                    raw_resp,
+                    latency_ms,
+                    attempt_ms,
+                )
+            except (OSError, TimeoutError, http.client.HTTPException) as exc:
+                reason = "timeout" if isinstance(exc, TimeoutError) else "connection_error"
+                last_error_status = 504 if isinstance(exc, TimeoutError) else 502
+                last_error_msg = f"Backend {backend.config.id!r} failed: {exc}"
+                last_error_type = "service_unavailable"
+                last_error_code = reason
+                last_error_body = None
+                last_error_content_type = "application/json"
+                engine.mark_backend_failed(backend, reason)
+                prev_failure = (backend.config.id, reason)
+                continue
+            finally:
+                engine.release_backend(backend)
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
 
-                prompt_tokens = est_prompt_tokens
-                completion_tokens = 0
-                if 200 <= resp.status < 300:
+            if non_stream_result is not None:
+                resp_status, content_type, raw_resp, latency_ms, attempt_ms = (
+                    non_stream_result
+                )
+                if 200 <= resp_status < 300:
                     with engine._lock:
                         backend.record_latency(attempt_ms)
-                    try:
-                        parsed_resp = json.loads(raw_resp.decode("utf-8", errors="replace"))
-                        if isinstance(parsed_resp, Mapping):
-                            usage = parsed_resp.get("usage")
-                            if isinstance(usage, Mapping):
-                                if usage.get("prompt_tokens") is not None:
-                                    prompt_tokens = int(usage["prompt_tokens"])
-                                if usage.get("completion_tokens") is not None:
-                                    completion_tokens = int(usage["completion_tokens"])
-                    except json.JSONDecodeError:
-                        pass
+                    prompt_tokens, completion_tokens = _extract_non_stream_usage(
+                        raw_resp, est_prompt_tokens
+                    )
                 else:
                     prompt_tokens = 0
+                    completion_tokens = 0
 
                 engine._record_usage(
                     request_id=req_id,
@@ -1053,14 +1282,15 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     latency_ms=latency_ms,
-                    ttft_ms=latency_ms if 200 <= resp.status < 300 else None,
+                    ttft_ms=latency_ms if 200 <= resp_status < 300 else None,
                     stream=False,
                     failovers=failovers,
                     principal=auth_ctx.principal,
-                    status_code=resp.status,
+                    status_code=resp_status,
                 )
-                self._send_bytes(
-                    resp.status,
+                # Keep downstream client write failures isolated from backend failover.
+                self._safe_send_bytes(
+                    resp_status,
                     content_type,
                     raw_resp,
                     extra_headers={
@@ -1071,54 +1301,60 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
 
-            except (OSError, TimeoutError, http.client.HTTPException) as exc:
-                reason = "timeout" if isinstance(exc, TimeoutError) else "connection_error"
-                last_error_status = 504 if isinstance(exc, TimeoutError) else 502
-                last_error_msg = f"Backend {backend.config.id!r} failed: {exc}"
-                engine.mark_backend_failed(backend, reason)
-                if idx + 1 < len(candidates):
-                    failovers += 1
-                    engine.metrics.record_failover(
-                        model=model,
-                        from_backend=backend.config.id,
-                        to_backend=candidates[idx + 1].config.id,
-                        reason=reason,
-                    )
-                    continue
-                self._send_bytes(
-                    last_error_status,
-                    "application/json",
-                    _openai_error_body(
-                        last_error_msg,
-                        error_type="service_unavailable",
-                        code=reason,
-                    ),
-                    extra_headers={
-                        "X-FreeTPU-Backend": backend.config.id,
-                        "X-FreeTPU-Failovers": str(failovers),
-                        "X-FreeTPU-Request-Id": req_id,
-                    },
-                )
-                return
-            finally:
-                with engine._lock:
-                    backend.inflight = max(0, backend.inflight - 1)
-                engine.metrics.dec_inflight(backend.config.id)
-                if conn is not None:
-                    try:
-                        conn.close()
-                    except OSError:
-                        pass
+        total_latency_ms = (time.monotonic() - req_start) * 1000.0
+        if last_attempted_backend is None:
+            engine._emit_queue_pressure(
+                model=model,
+                active_inflight=engine.metrics.total_inflight(),
+                healthy_backends=0,
+                reason="no_healthy_backend",
+            )
+            engine.metrics.record_request(
+                model=model,
+                backend_id="none",
+                status=503,
+                prompt_tokens=0,
+                completion_tokens=0,
+                latency_ms=total_latency_ms,
+                ttft_ms=None,
+                estimated_cost_usd=0.0,
+            )
+            self._safe_send_bytes(
+                503,
+                "application/json",
+                _openai_error_body(
+                    f"No healthy backend available for model {model!r}",
+                    error_type="service_unavailable",
+                    code="no_healthy_backend",
+                ),
+                extra_headers={"X-FreeTPU-Request-Id": req_id},
+            )
+            return
 
-        self._send_bytes(
+        engine.metrics.record_request(
+            model=model,
+            backend_id=last_attempted_backend.config.id,
+            status=last_error_status,
+            prompt_tokens=0,
+            completion_tokens=0,
+            latency_ms=total_latency_ms,
+            ttft_ms=None,
+            estimated_cost_usd=0.0,
+        )
+        self._safe_send_bytes(
             last_error_status,
-            "application/json",
-            _openai_error_body(
+            last_error_content_type,
+            last_error_body
+            or _openai_error_body(
                 last_error_msg,
-                error_type="service_unavailable",
-                code="all_backends_failed",
+                error_type=last_error_type,
+                code=last_error_code,
             ),
-            extra_headers={"X-FreeTPU-Request-Id": req_id},
+            extra_headers={
+                "X-FreeTPU-Backend": last_attempted_backend.config.id,
+                "X-FreeTPU-Failovers": str(failovers),
+                "X-FreeTPU-Request-Id": req_id,
+            },
         )
 
     def _proxy_sse_stream(
@@ -1133,49 +1369,62 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         failovers: int,
         est_prompt_tokens: int,
         principal: str,
-        has_next_candidate: bool,
     ) -> bool:
-        """Buffer until first SSE chunk before committing 200 OK; then stream live.
+        """Buffer until first complete SSE data event before committing 200 OK.
 
         Returns True if headers/stream were committed to the downstream client,
-        or False if upstream failed before delivering the first token/chunk.
+        or False if upstream closed or sent no complete data event before commit.
         """
         engine = self.server.engine
         pre_commit_lines: List[bytes] = []
+        pre_commit_bytes = 0
+        max_pre_commit_bytes = 1024 * 1024
         first_chunk_time: Optional[float] = None
+        event_has_data = False
 
-        try:
-            while True:
-                line = resp.fp.readline()
-                if not line:
-                    if not pre_commit_lines:
-                        return False
-                    break
-                pre_commit_lines.append(line)
-                stripped = line.strip()
-                if stripped.startswith(b"data:") or stripped:
+        # Phase 1: upstream-only read through HTTPResponse.readline() (decodes chunked framing).
+        while True:
+            line = resp.readline()
+            if not line:
+                # EOF before a complete SSE data event -> retryable failure.
+                return False
+            pre_commit_bytes += len(line)
+            if pre_commit_bytes > max_pre_commit_bytes:
+                return False
+            pre_commit_lines.append(line)
+            if line in (b"\n", b"\r\n", b"\r"):
+                if event_has_data:
                     first_chunk_time = time.monotonic()
                     break
-        except (OSError, TimeoutError, http.client.HTTPException):
-            if has_next_candidate:
-                return False
-            raise
+                event_has_data = False
+                continue
+            content_line = line.rstrip(b"\r\n")
+            if content_line.startswith(b":"):
+                continue
+            if content_line.startswith(b"data:") and content_line[5:].strip():
+                event_has_data = True
 
-        # Upstream delivered first SSE line cleanly: commit downstream response headers.
+        # Phase 2: upstream delivered a complete SSE data event -> commit response.
+        # Downstream write errors from here on must never trigger backend failover.
         ttft_ms: Optional[float] = (
             (first_chunk_time - req_start) * 1000.0 if first_chunk_time else None
         )
         first_content_ttft_ms: Optional[float] = None
         prompt_tokens = est_prompt_tokens
         completion_tokens = 0
-        saw_explicit_usage = False
+        est_completion_chars = 0
+        saw_explicit_prompt_usage = False
+        saw_explicit_completion_usage = False
+        event_data_lines: List[bytes] = []
 
-        def inspect_sse_line(raw_line: bytes) -> None:
-            nonlocal first_content_ttft_ms, prompt_tokens, completion_tokens, saw_explicit_usage
-            stripped = raw_line.strip()
-            if not stripped.startswith(b"data:"):
+        def process_sse_event() -> None:
+            nonlocal first_content_ttft_ms, prompt_tokens, completion_tokens
+            nonlocal est_completion_chars, saw_explicit_prompt_usage
+            nonlocal saw_explicit_completion_usage
+            if not event_data_lines:
                 return
-            payload_bytes = stripped[5:].strip()
+            payload_bytes = b"\n".join(event_data_lines).strip()
+            event_data_lines.clear()
             if not payload_bytes or payload_bytes == b"[DONE]":
                 return
             try:
@@ -1184,56 +1433,91 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 return
             if not isinstance(obj, Mapping):
                 return
-            delta_txt = _extract_sse_delta_text(obj)
-            if delta_txt:
+            output_txt = _extract_choice_output_text(obj)
+            if output_txt:
                 if first_content_ttft_ms is None:
                     first_content_ttft_ms = (time.monotonic() - req_start) * 1000.0
-                if not saw_explicit_usage:
-                    completion_tokens += 1
+                est_completion_chars += len(output_txt)
             usage = obj.get("usage")
             if isinstance(usage, Mapping):
-                saw_explicit_usage = True
                 if usage.get("prompt_tokens") is not None:
                     prompt_tokens = int(usage["prompt_tokens"])
+                    saw_explicit_prompt_usage = True
                 if usage.get("completion_tokens") is not None:
                     completion_tokens = int(usage["completion_tokens"])
+                    saw_explicit_completion_usage = True
+            timings = obj.get("timings")
+            if isinstance(timings, Mapping):
+                if not saw_explicit_prompt_usage and timings.get("prompt_n") is not None:
+                    prompt_tokens = int(timings["prompt_n"])
+                    saw_explicit_prompt_usage = True
+                if (
+                    not saw_explicit_completion_usage
+                    and timings.get("predicted_n") is not None
+                ):
+                    completion_tokens = int(timings["predicted_n"])
+                    saw_explicit_completion_usage = True
 
-        self.send_response(resp.status)
-        self.send_header(
-            "Content-Type",
-            resp.getheader("Content-Type") or "text/event-stream; charset=utf-8",
-        )
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("X-Accel-Buffering", "no")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Connection", "close")
-        self.send_header("X-FreeTPU-Backend", backend.config.id)
-        self.send_header("X-FreeTPU-Failovers", str(failovers))
-        self.send_header("X-FreeTPU-Request-Id", req_id)
-        self.end_headers()
+        def inspect_sse_line(raw_line: bytes) -> None:
+            if raw_line in (b"\n", b"\r\n", b"\r"):
+                process_sse_event()
+                return
+            content_line = raw_line.rstrip(b"\r\n")
+            if content_line.startswith(b"data:"):
+                data_val = content_line[5:]
+                if data_val.startswith(b" "):
+                    data_val = data_val[1:]
+                event_data_lines.append(data_val)
 
+        self.close_connection = True
+        _, acao = self._resolve_cors_header()
         try:
+            self.send_response(resp.status)
+            self.send_header(
+                "Content-Type",
+                resp.getheader("Content-Type") or "text/event-stream; charset=utf-8",
+            )
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")
+            self._send_cors_headers(acao)
+            self.send_header("Connection", "close")
+            self.send_header("X-FreeTPU-Backend", backend.config.id)
+            self.send_header("X-FreeTPU-Failovers", str(failovers))
+            self.send_header("X-FreeTPU-Request-Id", req_id)
+            self.end_headers()
+
             for buffered in pre_commit_lines:
                 inspect_sse_line(buffered)
                 self.wfile.write(buffered)
             self.wfile.flush()
 
             while True:
-                line = resp.fp.readline()
+                line = resp.readline()
                 if not line:
                     break
                 inspect_sse_line(line)
                 self.wfile.write(line)
-                if line in (b"\n", b"\r\n"):
+                if line in (b"\n", b"\r\n", b"\r"):
                     self.wfile.flush()
             self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            # Client disconnected or upstream closed mid-stream after first token.
+        except (
+            BrokenPipeError,
+            ConnectionResetError,
+            OSError,
+            TimeoutError,
+            http.client.HTTPException,
+        ):
+            # Client disconnected or upstream closed mid-stream after first complete event.
             pass
         finally:
+            process_sse_event()
+            if not saw_explicit_completion_usage and est_completion_chars > 0:
+                completion_tokens = max(1, (est_completion_chars + 3) // 4)
             total_ms = (time.monotonic() - req_start) * 1000.0
             attempt_ms = (time.monotonic() - attempt_start) * 1000.0
-            effective_ttft = first_content_ttft_ms if first_content_ttft_ms is not None else ttft_ms
+            effective_ttft = (
+                first_content_ttft_ms if first_content_ttft_ms is not None else ttft_ms
+            )
             with engine._lock:
                 backend.record_latency(attempt_ms)
             engine._record_usage(
@@ -1298,6 +1582,15 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         help="Optional bearer token required on API requests (configures BearerTokenAuthHook).",
     )
     parser.add_argument(
+        "--cors-origin",
+        action="append",
+        dest="cors_origins",
+        help=(
+            "Explicitly allow a browser Origin for CORS (repeatable; cross-origin "
+            "access is disabled by default)."
+        ),
+    )
+    parser.add_argument(
         "--usage-jsonl",
         type=Path,
         help="Optional JSONL path to record per-request UsageMeterHook events.",
@@ -1334,17 +1627,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not args.config:
         parser.error("--config is required unless --self-test is passed")
 
-    cfg = load_config(args.config)
-    if args.host is not None:
-        cfg.host = args.host
-    if args.port is not None:
-        cfg.port = args.port
-    if args.policy is not None:
-        cfg.policy = args.policy
-    if args.bearer_token:
-        cfg.auth = {"type": "bearer", "tokens": [args.bearer_token]}
-    if args.usage_jsonl:
-        cfg.usage_meter = {"type": "jsonl", "jsonl_path": str(args.usage_jsonl)}
+    try:
+        cfg = load_config(args.config)
+        if args.host is not None:
+            cfg.host = args.host
+        if args.port is not None:
+            cfg.port = args.port
+        if args.policy is not None:
+            cfg.policy = args.policy
+        if args.bearer_token:
+            cfg.auth = {"type": "bearer", "tokens": [args.bearer_token]}
+        if args.cors_origins:
+            cfg.cors_allowed_origins = list(args.cors_origins)
+        if args.usage_jsonl:
+            cfg.usage_meter = {"type": "jsonl", "jsonl_path": str(args.usage_jsonl)}
+        cfg.validate()
+        if args.check_config:
+            build_hooks_from_config(cfg)
+    except (OSError, ValueError, json.JSONDecodeError, ImportError, AttributeError) as exc:
+        sys.stderr.write(f"Config error: {exc}\n")
+        return 1
 
     if args.check_config:
         print(

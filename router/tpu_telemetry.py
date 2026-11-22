@@ -95,7 +95,8 @@ def summarize_tpu_samples(
     scraped_at: Optional[float] = None,
 ) -> TpuExporterTelemetry:
     """Aggregate parsed `tpu-exporter` samples into node-level readiness stats."""
-    exporter_up = True
+    saw_exporter_up = False
+    exporter_up = False
     devices_discovered = 0
     health_by_chip: Dict[str, float] = {}
     hbm_used_by_chip: Dict[str, int] = {}
@@ -112,6 +113,7 @@ def summarize_tpu_samples(
             generations_seen.add(gen)
 
         if sample.name == "freetpu_exporter_up":
+            saw_exporter_up = True
             exporter_up = sample.value >= 1.0
         elif sample.name == "freetpu_tpu_devices_discovered":
             devices_discovered = int(round(sample.value))
@@ -141,6 +143,11 @@ def summarize_tpu_samples(
     ratios = list(hbm_ratio_by_chip.values())
     duties = list(duty_by_chip.values())
 
+    error_msg: Optional[str] = None
+    if not saw_exporter_up:
+        exporter_up = False
+        error_msg = "missing freetpu_exporter_up metric"
+
     return TpuExporterTelemetry(
         reachable=True,
         exporter_up=exporter_up,
@@ -156,6 +163,7 @@ def summarize_tpu_samples(
         active_pids=sum(pids_by_chip.values()),
         generations=sorted(generations_seen),
         scraped_at_unix=scraped_at if scraped_at is not None else time.time(),
+        error=error_msg,
     )
 
 
@@ -169,6 +177,8 @@ def evaluate_tpu_readiness(
     if not telemetry.reachable:
         return False, "tpu_exporter_unreachable"
     if not telemetry.exporter_up:
+        if telemetry.error == "missing freetpu_exporter_up metric":
+            return False, "tpu_exporter_invalid_metrics"
         return False, "tpu_exporter_down"
     if telemetry.total_chips > 0 and telemetry.healthy_chips == 0:
         return False, "tpu_unhealthy"

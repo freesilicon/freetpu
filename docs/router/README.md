@@ -134,7 +134,9 @@ A TPU backend is automatically marked unhealthy (`healthy: false`) and excluded 
 For both non-streaming JSON and SSE (`stream: true`) requests:
 
 - If a selected backend returns HTTP `502`, `503`, or `504`, raises a connection/timeout error, or drops an SSE stream **before delivering the first chunk/token**, the router places that backend into a bounded cooldown (`failure_cooldown_s`), increments `freetpu_router_failovers_total`, and seamlessly retries the next healthy backend holding the requested model.
-- For SSE streams, downstream `200 OK` headers are held until the first upstream SSE line arrives, preventing partial-stream corruption on pre-first-token preemption.
+- For SSE streams, downstream `200 OK` headers are held until the first complete upstream SSE data event arrives, preventing partial-stream corruption on pre-first-token preemption or keepalive-only aborts.
+- Browser cross-origin access is disabled by default (`cors_allowed_origins: []`); untrusted `Origin` headers on inference `POST`s are rejected with `403`. Opt in explicitly via `"cors_allowed_origins"` in config or `--cors-origin`.
+- Inbound request bodies are bounded by `max_request_body_bytes` (default 10 MiB) and `client_read_timeout_s` (default 30s).
 
 ---
 

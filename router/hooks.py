@@ -180,7 +180,7 @@ class JsonlUsageMeterHook(UsageMeterHook):
         self.path = Path(path)
         self._callback = callback
         self._lock = threading.Lock()
-        self.events: list[UsageEvent] = []
+        self.events_written: int = 0
 
     def record_usage(self, event: UsageEvent) -> None:
         line = json.dumps(event.to_dict(), sort_keys=True) + "\n"
@@ -188,7 +188,7 @@ class JsonlUsageMeterHook(UsageMeterHook):
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.path.open("a", encoding="utf-8") as fh:
                 fh.write(line)
-            self.events.append(event)
+            self.events_written += 1
         if self._callback is not None:
             self._callback(event)
 

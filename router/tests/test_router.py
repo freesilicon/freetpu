@@ -5,13 +5,16 @@ from __future__ import annotations
 
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
 import json
 from pathlib import Path
+import socket
 import sys
 import tempfile
 import threading
 import time
 import unittest
+from contextlib import redirect_stderr
 from typing import Any, Dict, List, Optional, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -21,7 +24,9 @@ if str(REPO_ROOT) not in sys.path:
 from router.config import BackendConfig, RouterConfig, load_config  # noqa: E402
 from router.freetpu_router import (  # noqa: E402
     FreeTPURouterServer,
+    build_hooks_from_config,
     create_router_server,
+    main as router_main,
 )
 from router.hooks import (  # noqa: E402
     BackendIdleEvent,
@@ -30,6 +35,11 @@ from router.hooks import (  # noqa: E402
     QueuePressureEvent,
     ScalerHook,
     UsageEvent,
+)
+from router.tpu_telemetry import (  # noqa: E402
+    evaluate_tpu_readiness,
+    parse_prometheus_text,
+    summarize_tpu_samples,
 )
 
 
@@ -47,6 +57,10 @@ class _MockOpenAIBackend(ThreadingHTTPServer):
         status_code: int = 200,
         latency_s: float = 0.0,
         abort_stream_before_first_token: bool = False,
+        raw_sse_bytes: Optional[bytes] = None,
+        custom_sse_chunks: Optional[List[Dict[str, Any]]] = None,
+        chunked_keepalive_sse: bool = False,
+        keepalive_hold_event: Optional[threading.Event] = None,
         prompt_tokens: int = 12,
         completion_tokens: int = 8,
     ) -> None:
@@ -55,9 +69,15 @@ class _MockOpenAIBackend(ThreadingHTTPServer):
         self.status_code = status_code
         self.latency_s = latency_s
         self.abort_stream_before_first_token = abort_stream_before_first_token
+        self.raw_sse_bytes = raw_sse_bytes
+        self.custom_sse_chunks = custom_sse_chunks
+        self.chunked_keepalive_sse = chunked_keepalive_sse
+        self.keepalive_hold_event = keepalive_hold_event
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
         self.requests_seen: List[Dict[str, Any]] = []
+        self.current_inflight = 0
+        self.peak_inflight = 0
         self._lock = threading.Lock()
         super().__init__(("127.0.0.1", 0), _MockOpenAIHandler)
 
@@ -113,7 +133,22 @@ class _MockOpenAIHandler(BaseHTTPRequestHandler):
             self.server.requests_seen.append(
                 {"path": self.path, "payload": payload}
             )
+            self.server.current_inflight += 1
+            if self.server.current_inflight > self.server.peak_inflight:
+                self.server.peak_inflight = self.server.current_inflight
 
+        try:
+            self._handle_post(payload)
+        finally:
+            with self.server._lock:
+                self.server.current_inflight = max(0, self.server.current_inflight - 1)
+
+    def _write_chunk(self, data: bytes) -> None:
+        header = f"{len(data):x}\r\n".encode("ascii")
+        self.wfile.write(header + data + b"\r\n")
+        self.wfile.flush()
+
+    def _handle_post(self, payload: Dict[str, Any]) -> None:
         if self.server.latency_s > 0:
             time.sleep(self.server.latency_s)
 
@@ -128,39 +163,89 @@ class _MockOpenAIHandler(BaseHTTPRequestHandler):
         stream = bool(payload.get("stream", False))
 
         if stream:
+            if self.server.chunked_keepalive_sse:
+                self.close_connection = False
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.send_header("Connection", "keep-alive")
+                self.end_headers()
+                chunk1 = json.dumps(
+                    {
+                        "id": "chatcmpl-chunked",
+                        "object": "chat.completion.chunk",
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {"content": "split-"}, "finish_reason": None}],
+                    }
+                )
+                chunk2 = json.dumps(
+                    {
+                        "id": "chatcmpl-chunked",
+                        "object": "chat.completion.chunk",
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {"content": "ok"}, "finish_reason": "stop"}],
+                        "usage": {
+                            "prompt_tokens": self.server.prompt_tokens,
+                            "completion_tokens": self.server.completion_tokens,
+                        },
+                    }
+                )
+                ev1 = f"data: {chunk1}\n\n".encode("utf-8")
+                # Intentionally split the first SSE event across two HTTP chunks.
+                mid = len(ev1) // 2
+                self._write_chunk(ev1[:mid])
+                self._write_chunk(ev1[mid:])
+                self._write_chunk(f"data: {chunk2}\n\ndata: [DONE]\n\n".encode("utf-8"))
+                # Terminating zero-length chunk while keeping the TCP socket open.
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+                if self.server.keepalive_hold_event is not None:
+                    self.server.keepalive_hold_event.wait(timeout=3.0)
+                return
+
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "close")
             self.end_headers()
+            if self.server.raw_sse_bytes is not None:
+                if self.server.raw_sse_bytes:
+                    self.wfile.write(self.server.raw_sse_bytes)
+                self.wfile.flush()
+                return
             if self.server.abort_stream_before_first_token:
                 self.wfile.flush()
                 return
-            chunks = [
-                {
-                    "id": "chatcmpl-mock",
-                    "object": "chat.completion.chunk",
-                    "model": model,
-                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-                },
-                {
-                    "id": "chatcmpl-mock",
-                    "object": "chat.completion.chunk",
-                    "model": model,
-                    "choices": [{"index": 0, "delta": {"content": "Hello "}, "finish_reason": None}],
-                },
-                {
-                    "id": "chatcmpl-mock",
-                    "object": "chat.completion.chunk",
-                    "model": model,
-                    "choices": [{"index": 0, "delta": {"content": self.server.backend_name}, "finish_reason": "stop"}],
-                    "usage": {
-                        "prompt_tokens": self.server.prompt_tokens,
-                        "completion_tokens": self.server.completion_tokens,
-                        "total_tokens": self.server.prompt_tokens + self.server.completion_tokens,
+            chunks = (
+                self.server.custom_sse_chunks
+                if self.server.custom_sse_chunks is not None
+                else [
+                    {
+                        "id": "chatcmpl-mock",
+                        "object": "chat.completion.chunk",
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
                     },
-                },
-            ]
+                    {
+                        "id": "chatcmpl-mock",
+                        "object": "chat.completion.chunk",
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {"content": "Hello "}, "finish_reason": None}],
+                    },
+                    {
+                        "id": "chatcmpl-mock",
+                        "object": "chat.completion.chunk",
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {"content": self.server.backend_name}, "finish_reason": "stop"}],
+                        "usage": {
+                            "prompt_tokens": self.server.prompt_tokens,
+                            "completion_tokens": self.server.completion_tokens,
+                            "total_tokens": self.server.prompt_tokens + self.server.completion_tokens,
+                        },
+                    },
+                ]
+            )
             for chunk in chunks:
                 line = f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
                 self.wfile.write(line)
@@ -844,6 +929,783 @@ class TestFreeTPURouter(unittest.TestCase):
         router.engine.check_idle_backends()
         self.assertEqual(len(scaler.idle_events), 1)
         self.assertEqual(scaler.idle_events[0].backend_id, "pixel-1")
+
+    def test_chunked_sse_stream_with_keepalive_upstream_and_split_event(self) -> None:
+        hold_open = threading.Event()
+        backend = self._track(
+            _MockOpenAIBackend(
+                "llama-chunked",
+                ["qwen-chunked"],
+                chunked_keepalive_sse=True,
+                keepalive_hold_event=hold_open,
+                prompt_tokens=15,
+                completion_tokens=7,
+            )
+        )
+        captured: List[UsageEvent] = []
+        usage_hook = JsonlUsageMeterHook(
+            Path(self._tmpdir.name) / "chunked.jsonl", callback=captured.append
+        )
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            backends=[
+                BackendConfig(
+                    id="llama-chunked",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=backend.base_url,
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg, usage_hook=usage_hook))
+        rport = router.server_address[1]
+
+        t0 = time.monotonic()
+        try:
+            status, hdrs, body = _http_request(
+                rport,
+                "POST",
+                "/v1/chat/completions",
+                body={
+                    "model": "qwen-chunked",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "chunked test"}],
+                },
+            )
+        finally:
+            hold_open.set()
+        elapsed = time.monotonic() - t0
+
+        self.assertEqual(status, 200)
+        self.assertIn("text/event-stream", hdrs["content-type"])
+        # Must finish right after terminating 0-chunk instead of waiting for keep-alive hold (3s).
+        self.assertLess(elapsed, 1.5)
+        sse_text = body.decode("utf-8")
+        self.assertNotIn("\r\n0\r\n", sse_text)
+        # Every non-empty line in the proxied body must be a valid SSE data line (no hex chunk sizes).
+        data_payloads: List[str] = []
+        for raw_line in sse_text.splitlines():
+            if not raw_line:
+                continue
+            self.assertTrue(
+                raw_line.startswith("data: "),
+                f"Unexpected non-SSE line (leaked chunk framing?): {raw_line!r}",
+            )
+            data_payloads.append(raw_line[6:])
+        self.assertEqual(data_payloads[-1], "[DONE]")
+        parsed = [json.loads(p) for p in data_payloads[:-1]]
+        combined = "".join(p["choices"][0]["delta"].get("content", "") for p in parsed)
+        self.assertEqual(combined, "split-ok")
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0].prompt_tokens, 15)
+        self.assertEqual(captured[0].completion_tokens, 7)
+
+    def test_unknown_auth_mode_rejected_by_config_and_check_config(self) -> None:
+        base_backend = BackendConfig(
+            id="b1",
+            type="pixel-tpu",
+            base_url="http://127.0.0.1:8081/v1",
+        )
+        with self.assertRaises(ValueError):
+            RouterConfig(backends=[base_backend], auth={"type": "beaer"})
+
+        bad_cfg_path = Path(self._tmpdir.name) / "bad_auth.json"
+        bad_cfg_path.write_text(
+            json.dumps(
+                {
+                    "auth": {"type": "bearer_typo", "tokens": ["secret"]},
+                    "backends": [
+                        {
+                            "id": "b1",
+                            "base_url": "http://127.0.0.1:8081/v1",
+                            "models": ["m1"],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaises(ValueError):
+            load_config(bad_cfg_path)
+
+        stderr_buf = io.StringIO()
+        with redirect_stderr(stderr_buf):
+            rc = router_main(["--check-config", "--config", str(bad_cfg_path)])
+        self.assertNotEqual(rc, 0)
+        self.assertIn("Invalid auth.type", stderr_buf.getvalue())
+
+        # Direct mutation before hook construction must also fail closed.
+        valid_cfg = RouterConfig(backends=[base_backend], auth={"type": "allow_all"})
+        valid_cfg.auth = {"type": "unknown_mode"}
+        with self.assertRaises(ValueError):
+            build_hooks_from_config(valid_cfg)
+
+    def test_cors_origin_restriction_and_explicit_opt_in(self) -> None:
+        backend = self._track(_MockOpenAIBackend("pixel-cors", ["m-cors"]))
+        default_cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            backends=[
+                BackendConfig(
+                    id="pixel-cors",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=backend.base_url,
+                )
+            ],
+        )
+        router_default = self._track(create_router_server(default_cfg))
+        rport = router_default.server_address[1]
+
+        # Default: OPTIONS from untrusted browser origin is rejected without ACAO.
+        status, hdrs, _ = _http_request(
+            rport,
+            "OPTIONS",
+            "/v1/chat/completions",
+            headers={"Origin": "https://evil.example"},
+        )
+        self.assertEqual(status, 403)
+        self.assertNotIn("access-control-allow-origin", hdrs)
+
+        # Default: untrusted Origin on POST (both JSON and text/plain simple request) -> 403.
+        for ctype in ("application/json", "text/plain"):
+            status, hdrs, _ = _http_request(
+                rport,
+                "POST",
+                "/v1/chat/completions",
+                headers={"Origin": "https://evil.example", "Content-Type": ctype},
+                body={"model": "m-cors", "messages": [{"role": "user", "content": "hi"}]},
+            )
+            self.assertEqual(status, 403)
+            self.assertNotIn("access-control-allow-origin", hdrs)
+
+        # Null origin (sandboxed iframe / local page) also rejected.
+        status, hdrs, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            headers={"Origin": "null"},
+            body={"model": "m-cors", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(len(backend.requests_seen), 0)
+
+        # Non-browser client without Origin succeeds and receives no wildcard ACAO.
+        status, hdrs, _ = _http_request(rport, "GET", "/v1/models")
+        self.assertEqual(status, 200)
+        self.assertNotIn("access-control-allow-origin", hdrs)
+
+        # Explicit opt-in allows only configured origin.
+        optin_cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            cors_allowed_origins=["https://trusted.example"],
+            backends=[
+                BackendConfig(
+                    id="pixel-cors",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=backend.base_url,
+                )
+            ],
+        )
+        router_optin = self._track(create_router_server(optin_cfg))
+        oport = router_optin.server_address[1]
+
+        status, hdrs, _ = _http_request(
+            oport,
+            "OPTIONS",
+            "/v1/chat/completions",
+            headers={"Origin": "https://trusted.example"},
+        )
+        self.assertEqual(status, 204)
+        self.assertEqual(hdrs.get("access-control-allow-origin"), "https://trusted.example")
+        self.assertEqual(hdrs.get("vary"), "Origin")
+
+        status, hdrs, _ = _http_request(
+            oport,
+            "POST",
+            "/v1/chat/completions",
+            headers={"Origin": "https://trusted.example"},
+            body={
+                "model": "m-cors",
+                "stream": True,
+                "messages": [{"role": "user", "content": "ok"}],
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(hdrs.get("access-control-allow-origin"), "https://trusted.example")
+        self.assertEqual(hdrs.get("vary"), "Origin")
+
+        status, hdrs, _ = _http_request(
+            oport,
+            "POST",
+            "/v1/chat/completions",
+            headers={"Origin": "https://evil.example"},
+            body={"model": "m-cors", "messages": [{"role": "user", "content": "no"}]},
+        )
+        self.assertEqual(status, 403)
+        self.assertNotIn("access-control-allow-origin", hdrs)
+
+    def test_inbound_request_size_limit_and_read_deadline(self) -> None:
+        backend = self._track(_MockOpenAIBackend("pixel-bound", ["m-bound"]))
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            max_request_body_bytes=128,
+            client_read_timeout_s=0.25,
+            backends=[
+                BackendConfig(
+                    id="pixel-bound",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=backend.base_url,
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        # 1. Oversized Content-Length -> 413 Payload Too Large without touching backend.
+        status, _, body = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-bound",
+                "messages": [{"role": "user", "content": "x" * 256}],
+            },
+        )
+        self.assertEqual(status, 413)
+        self.assertEqual(json.loads(body)["error"]["code"], "payload_too_large")
+        self.assertEqual(len(backend.requests_seen), 0)
+
+        # 2. Stalled unfinished upload hits client_read_timeout_s and returns 408 promptly.
+        t0 = time.monotonic()
+        with socket.create_connection(("127.0.0.1", rport), timeout=2.0) as sock:
+            sock.sendall(
+                b"POST /v1/chat/completions HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: 100\r\n"
+                b"\r\n"
+                b'{"mod'
+            )
+            sock.settimeout(2.0)
+            resp_raw = sock.recv(4096)
+        elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, 1.5)
+        self.assertIn(b"408", resp_raw.splitlines()[0])
+        self.assertEqual(len(backend.requests_seen), 0)
+
+    def test_client_disconnect_does_not_failover_or_cooldown_backend(self) -> None:
+        primary = self._track(
+            _MockOpenAIBackend("slow-primary", ["m-disc"], latency_s=0.25)
+        )
+        fallback = self._track(
+            _MockOpenAIBackend("paid-fallback", ["m-disc"], latency_s=0.0)
+        )
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            failure_cooldown_s=30.0,
+            backends=[
+                BackendConfig(
+                    id="slow-primary",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=primary.base_url,
+                ),
+                BackendConfig(
+                    id="paid-fallback",
+                    type="cloud-tpu-v6e",
+                    local=False,
+                    base_url=fallback.base_url,
+                    cost_per_1m_prompt_usd=1.0,
+                    cost_per_1m_completion_usd=2.0,
+                ),
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        payload = json.dumps(
+            {"model": "m-disc", "messages": [{"role": "user", "content": "cancel me"}]}
+        ).encode("utf-8")
+        req_bytes = (
+            b"POST /v1/chat/completions HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Type: application/json\r\n"
+            + f"Content-Length: {len(payload)}\r\n\r\n".encode("ascii")
+            + payload
+        )
+        sock = socket.create_connection(("127.0.0.1", rport), timeout=2.0)
+        sock.sendall(req_bytes)
+        # Wait briefly so primary begins processing, then close client socket abruptly.
+        time.sleep(0.06)
+        sock.close()
+
+        # Wait for primary to finish replying and handler to complete.
+        time.sleep(0.35)
+        primary_state = router.engine._backends[0]
+        self.assertEqual(len(primary.requests_seen), 1)
+        self.assertEqual(len(fallback.requests_seen), 0)
+        self.assertEqual(primary_state.total_failures, 0)
+        self.assertEqual(primary_state.cooldown_until_monotonic, 0.0)
+        self.assertTrue(primary_state.healthy)
+
+    def test_slot_recheck_prevents_overloading_fallback_and_respects_max_inflight(self) -> None:
+        primary = self._track(
+            _MockOpenAIBackend("slow-fail-primary", ["m-cap"], status_code=200, latency_s=0.0)
+        )
+        fallback = self._track(
+            _MockOpenAIBackend("cap-fallback", ["m-cap"], status_code=200, latency_s=0.30)
+        )
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            backends=[
+                BackendConfig(
+                    id="slow-fail-primary",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=primary.base_url,
+                ),
+                BackendConfig(
+                    id="cap-fallback",
+                    type="cloud-tpu-v5e",
+                    local=False,
+                    base_url=fallback.base_url,
+                    max_inflight=1,
+                ),
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        # Primary will now fail with 503 after 0.15s.
+        primary.status_code = 503
+        primary.latency_s = 0.15
+
+        results: List[Tuple[int, Dict[str, str]]] = []
+
+        def run_req() -> None:
+            st, hd, _ = _http_request(
+                rport,
+                "POST",
+                "/v1/chat/completions",
+                body={"model": "m-cap", "messages": [{"role": "user", "content": "race"}]},
+            )
+            results.append((st, hd))
+
+        # Request 1 starts, hits primary (takes 0.15s to fail).
+        t1 = threading.Thread(target=run_req)
+        t1.start()
+        time.sleep(0.05)
+
+        # While Request 1 is waiting on primary, occupy fallback's single slot.
+        fallback_state = router.engine._backends[1]
+        reserved = router.engine.try_reserve_backend(fallback_state)
+        self.assertIsNotNone(reserved)
+        try:
+            t1.join(timeout=3.0)
+        finally:
+            router.engine.release_backend(fallback_state)
+
+        # Fallback was full when Request 1 tried to fail over -> must NOT overload fallback.
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0][0], 503)
+        self.assertEqual(len(fallback.requests_seen), 0)
+        self.assertEqual(fallback.peak_inflight, 0)
+
+    def test_sse_keepalive_before_eof_fails_over_to_healthy_fallback(self) -> None:
+        spot = self._track(
+            _MockOpenAIBackend("spot-keepalive", ["m-sse"], status_code=200)
+        )
+        healthy = self._track(
+            _MockOpenAIBackend("healthy-backup", ["m-sse"], status_code=200)
+        )
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="cheapest",
+            failure_cooldown_s=30.0,
+            backends=[
+                BackendConfig(
+                    id="spot-keepalive",
+                    type="cloud-tpu-v5e",
+                    spot=True,
+                    base_url=spot.base_url,
+                    cost_per_1m_prompt_usd=0.10,
+                    cost_per_1m_completion_usd=0.10,
+                ),
+                BackendConfig(
+                    id="healthy-backup",
+                    type="cloud-tpu-v6e",
+                    spot=False,
+                    base_url=healthy.base_url,
+                    cost_per_1m_prompt_usd=0.50,
+                    cost_per_1m_completion_usd=0.50,
+                ),
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        # Case 1: Spot sends SSE keepalive comment + blank line, then EOF (preempted).
+        spot.raw_sse_bytes = b": keep-alive\n\n"
+        status, hdrs, body = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-sse",
+                "stream": True,
+                "messages": [{"role": "user", "content": "survive keepalive eof"}],
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(hdrs["x-freetpu-backend"], "healthy-backup")
+        self.assertEqual(hdrs["x-freetpu-failovers"], "1")
+        self.assertIn("healthy-backup", body.decode("utf-8"))
+
+        # Case 2: Spot sends incomplete data line without terminating blank line before EOF.
+        router.engine._backends[0].cooldown_until_monotonic = 0.0
+        spot.raw_sse_bytes = b'data: {"id":"partial","choices":[]}\n'
+        status, hdrs, body = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-sse",
+                "stream": True,
+                "messages": [{"role": "user", "content": "survive truncated event"}],
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(hdrs["x-freetpu-backend"], "healthy-backup")
+        self.assertEqual(hdrs["x-freetpu-failovers"], "1")
+        self.assertIn("healthy-backup", body.decode("utf-8"))
+
+    def test_streamed_tool_calls_and_multi_choice_usage_accounting(self) -> None:
+        tool_chunks = [
+            {
+                "id": "chatcmpl-tool",
+                "object": "chat.completion.chunk",
+                "model": "m-tool",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "get_tpu_status",
+                                        "arguments": '{"zone": "us-central1-a", ',
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            {
+                "id": "chatcmpl-tool",
+                "object": "chat.completion.chunk",
+                "model": "m-tool",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "function": {
+                                        "arguments": '"chip_count": 8}',
+                                    },
+                                }
+                            ]
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+            },
+        ]
+        backend = self._track(
+            _MockOpenAIBackend(
+                "tool-worker",
+                ["m-tool"],
+                custom_sse_chunks=tool_chunks,
+            )
+        )
+        captured: List[UsageEvent] = []
+        usage_hook = JsonlUsageMeterHook(
+            Path(self._tmpdir.name) / "tool_usage.jsonl", callback=captured.append
+        )
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            backends=[
+                BackendConfig(
+                    id="tool-worker",
+                    type="cloud-tpu-v5e",
+                    local=False,
+                    base_url=backend.base_url,
+                    cost_per_1m_prompt_usd=0.50,
+                    cost_per_1m_completion_usd=1.00,
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg, usage_hook=usage_hook))
+        rport = router.server_address[1]
+
+        status, _, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-tool",
+                "stream": True,
+                "messages": [{"role": "user", "content": "check tpu"}],
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(len(captured), 1)
+        self.assertGreater(captured[0].completion_tokens, 0)
+        self.assertGreater(captured[0].estimated_cost_usd, 0.0)
+        self.assertIsNotNone(captured[0].ttft_ms)
+
+        # Multi-choice stream where only choice[1] emits text and upstream omits usage.
+        backend.custom_sse_chunks = [
+            {
+                "id": "chatcmpl-multi",
+                "object": "chat.completion.chunk",
+                "model": "m-tool",
+                "choices": [
+                    {"index": 0, "delta": {"content": ""}, "finish_reason": None},
+                    {"index": 1, "delta": {"content": "second choice output text"}, "finish_reason": "stop"},
+                ],
+            }
+        ]
+        status, _, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-tool",
+                "stream": True,
+                "n": 2,
+                "messages": [{"role": "user", "content": "multi"}],
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(len(captured), 2)
+        self.assertGreater(captured[1].completion_tokens, 0)
+
+    def test_tpu_exporter_rejects_html_and_unrelated_metrics(self) -> None:
+        html_tele = summarize_tpu_samples(
+            parse_prometheus_text("<html><body><h1>Hello</h1></body></html>")
+        )
+        self.assertFalse(html_tele.exporter_up)
+        ready, reason = evaluate_tpu_readiness(html_tele)
+        self.assertFalse(ready)
+        self.assertEqual(reason, "tpu_exporter_invalid_metrics")
+
+        unrelated_tele = summarize_tpu_samples(
+            parse_prometheus_text(
+                "# TYPE node_cpu_seconds_total counter\nnode_cpu_seconds_total 42.0\n"
+            )
+        )
+        self.assertFalse(unrelated_tele.exporter_up)
+        ready, reason = evaluate_tpu_readiness(unrelated_tele)
+        self.assertFalse(ready)
+        self.assertEqual(reason, "tpu_exporter_invalid_metrics")
+
+    def test_disabled_backend_excluded_from_health_readiness(self) -> None:
+        down_enabled = self._track(
+            _MockOpenAIBackend("enabled-down", ["m-h"], status_code=503)
+        )
+        spare = self._track(
+            _MockOpenAIBackend("disabled-spare", ["m-h"], status_code=200)
+        )
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            backends=[
+                BackendConfig(
+                    id="enabled-down",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=down_enabled.base_url,
+                    enabled=True,
+                ),
+                BackendConfig(
+                    id="disabled-spare",
+                    type="cloud-tpu-v5e",
+                    local=False,
+                    base_url=spare.base_url,
+                    enabled=False,
+                ),
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        status, _, body = _http_request(rport, "GET", "/health")
+        self.assertEqual(status, 503)
+        hjson = json.loads(body)
+        self.assertEqual(hjson["status"], "degraded")
+        self.assertEqual(hjson["healthy_backends"], 0)
+        self.assertEqual(hjson["enabled_backends"], 1)
+        spare_snap = next(b for b in hjson["backends"] if b["id"] == "disabled-spare")
+        self.assertFalse(spare_snap["healthy"])
+        self.assertFalse(spare_snap["enabled"])
+
+    def test_idle_timer_starts_when_inflight_drops_to_zero(self) -> None:
+        # Request lasts 0.14s, longer than backend_idle_timeout_s=0.06s.
+        slow_worker = self._track(
+            _MockOpenAIBackend("long-worker", ["m-idle"], latency_s=0.14)
+        )
+        scaler = _RecordingScalerHook()
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            backend_idle_timeout_s=0.06,
+            backends=[
+                BackendConfig(
+                    id="long-worker",
+                    type="cloud-tpu-v5e",
+                    spot=True,
+                    base_url=slow_worker.base_url,
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg, scaler_hook=scaler))
+        rport = router.server_address[1]
+
+        status, _, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={"model": "m-idle", "messages": [{"role": "user", "content": "slow"}]},
+        )
+        self.assertEqual(status, 200)
+        # Right after request completion, idle time should be ~0s < 0.06s -> no idle event.
+        router.engine.check_idle_backends()
+        self.assertEqual(len(scaler.idle_events), 0)
+
+        # After waiting > 0.06s post-completion, idle event fires.
+        time.sleep(0.08)
+        router.engine.check_idle_backends()
+        self.assertEqual(len(scaler.idle_events), 1)
+        self.assertEqual(scaler.idle_events[0].backend_id, "long-worker")
+
+    def test_jsonl_usage_hook_does_not_retain_events_in_memory(self) -> None:
+        jsonl_path = Path(self._tmpdir.name) / "bounded.jsonl"
+        hook = JsonlUsageMeterHook(jsonl_path)
+        for idx in range(25):
+            hook.record_usage(
+                UsageEvent(
+                    request_id=f"req-{idx}",
+                    model="m1",
+                    backend_id="b1",
+                    prompt_tokens=10,
+                    completion_tokens=5,
+                    latency_ms=12.5,
+                    estimated_cost_usd=0.0,
+                )
+            )
+        self.assertEqual(hook.events_written, 25)
+        self.assertFalse(hasattr(hook, "events"))
+        lines = jsonl_path.read_text(encoding="utf-8").strip().splitlines()
+        self.assertEqual(len(lines), 25)
+
+    def test_terminal_routing_failures_counted_in_request_metrics(self) -> None:
+        failing_503 = self._track(
+            _MockOpenAIBackend("worker-503", ["m-503"], status_code=200)
+        )
+        dying_conn = self._track(
+            _MockOpenAIBackend("worker-dead", ["m-dead"], status_code=200)
+        )
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            backends=[
+                BackendConfig(
+                    id="worker-503",
+                    type="cloud-tpu-v5e",
+                    base_url=failing_503.base_url,
+                ),
+                BackendConfig(
+                    id="worker-dead",
+                    type="cloud-tpu-v5e",
+                    base_url=dying_conn.base_url,
+                ),
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        # 1. No eligible backend for unknown model -> 503 counted under backend_id="none".
+        status, _, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={"model": "unknown-model", "messages": [{"role": "user", "content": "x"}]},
+        )
+        self.assertEqual(status, 503)
+
+        # 2. Terminal retryable 503 on sole candidate -> counted under worker-503, status="503".
+        failing_503.status_code = 503
+        status, _, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={"model": "m-503", "messages": [{"role": "user", "content": "y"}]},
+        )
+        self.assertEqual(status, 503)
+
+        # 3. Terminal connection error on sole candidate -> counted under worker-dead, status="502".
+        dying_conn.shutdown()
+        dying_conn.server_close()
+        status, _, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={"model": "m-dead", "messages": [{"role": "user", "content": "z"}]},
+        )
+        self.assertEqual(status, 502)
+
+        _, _, metrics_raw = _http_request(rport, "GET", "/metrics")
+        metrics_txt = metrics_raw.decode("utf-8")
+        self.assertIn(
+            'freetpu_router_requests_total{model="unknown-model",backend_id="none",status="503"} 1',
+            metrics_txt,
+        )
+        self.assertIn(
+            'freetpu_router_requests_total{model="m-503",backend_id="worker-503",status="503"} 1',
+            metrics_txt,
+        )
+        self.assertIn(
+            'freetpu_router_requests_total{model="m-dead",backend_id="worker-dead",status="502"} 1',
+            metrics_txt,
+        )
 
 
 def run_self_tests(verbosity: int = 1) -> int:

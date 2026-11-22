@@ -11,6 +11,9 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 from urllib.parse import urlsplit
 
 VALID_POLICIES = ("cheapest", "local_first", "lowest_latency", "round_robin")
+VALID_AUTH_TYPES = ("allow_all", "bearer")
+DEFAULT_MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024
+DEFAULT_CLIENT_READ_TIMEOUT_S = 30.0
 
 
 def sanitize_url(url: str) -> str:
@@ -171,11 +174,17 @@ class RouterConfig:
     probe_timeout_s: float = 3.0
     queue_pressure_threshold: int = 16
     backend_idle_timeout_s: float = 300.0
+    max_request_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES
+    client_read_timeout_s: float = DEFAULT_CLIENT_READ_TIMEOUT_S
+    cors_allowed_origins: List[str] = field(default_factory=list)
     auth: Dict[str, Any] = field(default_factory=dict)
     usage_meter: Dict[str, Any] = field(default_factory=dict)
     scaler: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
         if self.policy not in VALID_POLICIES:
             raise ValueError(
                 f"Invalid routing policy {self.policy!r}; expected one of {VALID_POLICIES}"
@@ -193,6 +202,43 @@ class RouterConfig:
             raise ValueError("failure_cooldown_s must be >= 0")
         if self.request_timeout_s <= 0:
             raise ValueError("request_timeout_s must be > 0")
+        if self.max_request_body_bytes <= 0:
+            raise ValueError("max_request_body_bytes must be > 0")
+        if self.client_read_timeout_s <= 0:
+            raise ValueError("client_read_timeout_s must be > 0")
+        if isinstance(self.cors_allowed_origins, (str, bytes)):
+            raise ValueError("cors_allowed_origins must be a list of origin strings")
+        normalized_origins: List[str] = []
+        for raw_origin in self.cors_allowed_origins:
+            if not isinstance(raw_origin, str) or not raw_origin.strip():
+                raise ValueError("cors_allowed_origins entries must be non-empty strings")
+            origin = raw_origin.strip()
+            normalized_origins.append("*" if origin == "*" else origin.rstrip("/"))
+        self.cors_allowed_origins = normalized_origins
+
+        if not isinstance(self.auth, Mapping):
+            raise ValueError("'auth' must be a JSON object")
+        auth_spec = self.auth.get("hook")
+        auth_type = self.auth.get("type")
+        if auth_spec is not None:
+            if not isinstance(auth_spec, str) or ":" not in auth_spec.strip():
+                raise ValueError(
+                    f"Invalid auth.hook spec {auth_spec!r}; expected 'module:ClassName'"
+                )
+            spec_str = auth_spec.strip()
+            if not all(part.strip() for part in spec_str.split(":", 1)):
+                raise ValueError(
+                    f"Invalid auth.hook spec {auth_spec!r}; expected 'module:ClassName'"
+                )
+            if auth_type is not None and auth_type != "custom":
+                raise ValueError(
+                    f"Invalid auth.type {auth_type!r} when auth.hook is configured; omit 'type' or set 'custom'"
+                )
+        elif auth_type is not None:
+            if not isinstance(auth_type, str) or auth_type not in VALID_AUTH_TYPES:
+                raise ValueError(
+                    f"Invalid auth.type {auth_type!r}; expected one of {VALID_AUTH_TYPES}"
+                )
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "RouterConfig":
@@ -200,6 +246,16 @@ class RouterConfig:
         backends = [BackendConfig.from_dict(item) for item in raw_backends]
         if not backends:
             raise ValueError("Config must define at least one backend in 'backends'")
+        raw_origins = raw.get("cors_allowed_origins")
+        if raw_origins is None:
+            cors_origins: List[str] = []
+        elif isinstance(raw_origins, (list, tuple)):
+            cors_origins = list(raw_origins)
+        else:
+            raise ValueError("'cors_allowed_origins' must be a list of origin strings")
+        raw_auth = raw.get("auth")
+        if raw_auth is not None and not isinstance(raw_auth, Mapping):
+            raise ValueError("'auth' must be a JSON object")
         return cls(
             backends=backends,
             host=str(raw.get("host", "127.0.0.1")),
@@ -211,7 +267,14 @@ class RouterConfig:
             probe_timeout_s=float(raw.get("probe_timeout_s", 3.0)),
             queue_pressure_threshold=int(raw.get("queue_pressure_threshold", 16)),
             backend_idle_timeout_s=float(raw.get("backend_idle_timeout_s", 300.0)),
-            auth=dict(raw.get("auth") or {}),
+            max_request_body_bytes=int(
+                raw.get("max_request_body_bytes", DEFAULT_MAX_REQUEST_BODY_BYTES)
+            ),
+            client_read_timeout_s=float(
+                raw.get("client_read_timeout_s", DEFAULT_CLIENT_READ_TIMEOUT_S)
+            ),
+            cors_allowed_origins=cors_origins,
+            auth=dict(raw_auth or {}),
             usage_meter=dict(raw.get("usage_meter") or {}),
             scaler=dict(raw.get("scaler") or {}),
         )
