@@ -634,10 +634,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional local Python script to execute instead of the built-in TPU probe.",
     )
     parser.add_argument(
-        "--no-public-api",
+        "--public-api",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Pass `--no-public-api` when supported by the installed `colab` CLI (default: True).",
+        default=False,
+        help="Use Colab Public API instead of `--no-public-api` tunnel fallback (default: False).",
     )
     parser.add_argument(
         "--dry-run",
@@ -690,7 +690,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         min_cu_balance=args.min_cu_balance,
         max_active_assignments=args.max_active_assignments,
         timeout_s=args.timeout,
-        use_no_public_api=args.no_public_api,
+        use_no_public_api=not args.public_api,
         config_path=args.config,
         out_dir=args.out_dir,
         script_path=args.script,
