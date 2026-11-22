@@ -54,8 +54,12 @@ for pci_dev in sorted(glob.glob("/sys/bus/pci/devices/*")):
         print("    msi_irqs count:", len(msix))
 
 print("\n=== LIBTPU / PJRT C API SURFACE ===")
-import libtpu
-so_path = libtpu.get_library_path()
+override_libtpu = os.environ.get("TPU_LIBRARY_PATH")
+if override_libtpu and os.path.isfile(override_libtpu):
+    so_path = override_libtpu
+else:
+    import libtpu
+    so_path = libtpu.get_library_path()
 print("libtpu.so:", so_path)
 r2 = subprocess.run(f"nm -D '{so_path}' 2>&1 | grep -iE 'pjrt|tpu' | head -n 40", shell=True, text=True, capture_output=True)
 print("--- exported symbols (pjrt/tpu) ---")

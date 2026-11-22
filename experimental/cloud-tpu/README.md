@@ -34,6 +34,7 @@ colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json run --tpu V6E1 --
 (
   set -euo pipefail
   CFG=~/.cache/freetpu-colab/sessions.json
+  SESSION_ID="freetpu-tpu-$(date +%s)-$$"
   run_stage() {
     local marker="$1"; shift
     local out
@@ -41,26 +42,26 @@ colab --auth=adc --config ~/.cache/freetpu-colab/sessions.json run --tpu V6E1 --
     printf '%s\n' "$out"
     grep -Fq "$marker" <<<"$out"
   }
-  colab --auth=adc --config "$CFG" new -s freetpu-tpu --tpu V5E1
-  trap 'colab --auth=adc --config "$CFG" stop -s freetpu-tpu || true' EXIT
-  run_stage "=== SURVEY_COMPLETE ===" exec -s freetpu-tpu -f experimental/cloud-tpu/vfio_pci_survey.py
-  run_stage "=== RAW_BENCH_COMPLETE ===" exec -s freetpu-tpu -f experimental/cloud-tpu/raw_compute_bench.py
-  run_stage "=== PALLAS_OPT_COMPLETE ===" exec -s freetpu-tpu -f experimental/cloud-tpu/pallas_opt_bench.py
-  run_stage "=== LLAMA8B_COMPLETE ===" exec -s freetpu-tpu -f experimental/cloud-tpu/llama8b_decode_bench.py
-  colab --auth=adc --config "$CFG" upload -s freetpu-tpu experimental/cloud-tpu/tpu_pjrt_bench.cpp /content/tpu_pjrt_bench.cpp
-  colab --auth=adc --config "$CFG" upload -s freetpu-tpu experimental/cloud-tpu/export_stablehlo.py /content/export_stablehlo.py
-  run_stage "=== EXPORT_AND_BUILD_COMPLETE ===" exec -s freetpu-tpu <<'PY'
+  colab --auth=adc --config "$CFG" new -s "$SESSION_ID" --tpu V5E1
+  trap 'colab --auth=adc --config "$CFG" stop -s "$SESSION_ID" || true' EXIT
+  run_stage "=== SURVEY_COMPLETE ===" exec -s "$SESSION_ID" -f experimental/cloud-tpu/vfio_pci_survey.py
+  run_stage "=== RAW_BENCH_COMPLETE ===" exec -s "$SESSION_ID" -f experimental/cloud-tpu/raw_compute_bench.py
+  run_stage "=== PALLAS_OPT_COMPLETE ===" exec -s "$SESSION_ID" -f experimental/cloud-tpu/pallas_opt_bench.py
+  run_stage "=== LLAMA8B_COMPLETE ===" exec -s "$SESSION_ID" -f experimental/cloud-tpu/llama8b_decode_bench.py
+  colab --auth=adc --config "$CFG" upload -s "$SESSION_ID" experimental/cloud-tpu/tpu_pjrt_bench.cpp /content/tpu_pjrt_bench.cpp
+  colab --auth=adc --config "$CFG" upload -s "$SESSION_ID" experimental/cloud-tpu/export_stablehlo.py /content/export_stablehlo.py
+  run_stage "=== EXPORT_AND_BUILD_COMPLETE ===" exec -s "$SESSION_ID" <<'PY'
 import runpy
 runpy.run_path('/content/export_stablehlo.py', run_name='__main__')
 PY
-  colab --auth=adc --config "$CFG" restart-kernel -s freetpu-tpu
-  run_stage "=== CPP_PJRT_COMPLETE ===" exec -s freetpu-tpu <<'PY'
+  colab --auth=adc --config "$CFG" restart-kernel -s "$SESSION_ID"
+  run_stage "=== CPP_PJRT_COMPLETE ===" exec -s "$SESSION_ID" <<'PY'
 import os, subprocess
 bin_p = os.path.expanduser('~/.cache/freetpu-pjrt/tpu_pjrt_bench')
 print(subprocess.check_output(['ldd', bin_p], text=True))
 print(subprocess.check_output([bin_p], text=True))
 PY
-  colab --auth=adc --config "$CFG" log -s freetpu-tpu -o ~/.cache/freetpu-colab/freetpu-tpu-proof.ipynb
+  colab --auth=adc --config "$CFG" log -s "$SESSION_ID" -o ~/.cache/freetpu-colab/"$SESSION_ID"-proof.ipynb
 )
 ```
 

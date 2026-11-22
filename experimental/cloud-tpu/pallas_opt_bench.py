@@ -123,6 +123,8 @@ def xla_matmul_silu_rhs_t(a, b_t):
 
 xla_ref = xla_matmul_silu(a_mat, b_mat)
 xla_ref.block_until_ready()
+if not bool(jnp.all(jnp.isfinite(xla_ref)).item()):
+    raise RuntimeError("Part A XLA baseline produced nonfinite outputs")
 xla_med_s, xla_min_s = bench_fn(xla_matmul_silu, a_mat, b_mat, warmup=5, iters=30)
 xla_t_med_s, xla_t_min_s = bench_fn(
     xla_matmul_silu_rhs_t, a_mat, b_mat_t, warmup=5, iters=30
@@ -408,21 +410,33 @@ def make_async_copy_db_gemm_silu(
     return run
 
 
+PART_A_MAX_ABS_ERR_TOL = 0.05
+PART_B_MAX_ABS_ERR_TOL = 0.1
+
+
 def run_gemm_silu_cfg(label, fn, lhs, rhs):
     try:
         lowered_txt = fn.lower(lhs, rhs).as_text()
         has_tpu_custom_call = "tpu_custom_call" in lowered_txt
         out = fn(lhs, rhs)
         out.block_until_ready()
+        all_finite = bool(jnp.all(jnp.isfinite(out)).item())
         max_abs_err = float(
             jnp.max(jnp.abs(out.astype(jnp.float32) - xla_ref.astype(jnp.float32)))
+        )
+        parity_ok = (
+            all_finite
+            and math.isfinite(max_abs_err)
+            and max_abs_err <= PART_A_MAX_ABS_ERR_TOL
         )
         med_s, min_s = bench_fn(fn, lhs, rhs, warmup=4, iters=25)
         med_tflops = FLOPS_GEMM / (med_s * 1e12)
         peak_tflops = FLOPS_GEMM / (min_s * 1e12)
         rec = {
             "config": label,
-            "status": "ok",
+            "status": "ok" if parity_ok else "parity_fail",
+            "finite": all_finite,
+            "parity_ok": parity_ok,
             "tpu_custom_call": has_tpu_custom_call,
             "max_abs_err": max_abs_err,
             "median_us": round(med_s * 1e6, 2),
@@ -549,7 +563,10 @@ for bm, bn, bk in [(1024, 512, 512), (1024, 1024, 256), (512, 1024, 512)]:
         )
     )
 
-ok_part_a = [r for r in part_a_results if r.get("status") == "ok"]
+ok_part_a = [
+    r for r in part_a_results
+    if r.get("status") == "ok" and r.get("parity_ok") and r.get("finite")
+]
 if ok_part_a:
     best_a = min(ok_part_a, key=lambda r: r["median_us"])
     print(
@@ -564,6 +581,8 @@ if ok_part_a:
             }
         ),
     )
+else:
+    print("PALLAS_OPT_PART_A_FAIL:", json.dumps({"reason": "no finite parity-passing Pallas GEMM+SiLU config"}))
 
 # Free Part A tensors before Part B FlashAttention
 del a_mat, b_mat, b_mat_t, xla_ref
@@ -630,6 +649,7 @@ block_size_candidates = [
     ("bs_128_256_128", (128, 256, 128, 1)),
 ]
 
+part_b_case_valid = []
 for B, H, Q, K, D in attn_cases:
     print(f"\n--- FlashAttention Case: B={B}, H={H}, Q={Q}, K={K}, D={D}, causal=True ---")
     sm_scale = 1.0 / math.sqrt(D)
@@ -646,8 +666,11 @@ for B, H, Q, K, D in attn_cases:
     xla_out = None
     xa_med_s = None
     try:
-        xla_out = xla_attn_fn(q_arr, k_arr, v_arr)
-        xla_out.block_until_ready()
+        cand_xla_out = xla_attn_fn(q_arr, k_arr, v_arr)
+        cand_xla_out.block_until_ready()
+        if not bool(jnp.all(jnp.isfinite(cand_xla_out)).item()):
+            raise RuntimeError("dense XLA causal attention produced nonfinite values")
+        xla_out = cand_xla_out
         xa_med_s, xa_min_s = bench_fn(xla_attn_fn, q_arr, k_arr, v_arr, warmup=3, iters=15)
         xa_rec = {
             "shape": f"B={B},H={H},Q={Q},K={K},D={D}",
@@ -687,6 +710,7 @@ for B, H, Q, K, D in attn_cases:
 
             fa_out = run_fa(q_arr, k_arr, v_arr)
             fa_out.block_until_ready()
+            fa_finite = bool(jnp.all(jnp.isfinite(fa_out)).item())
             err = (
                 float(
                     jnp.max(
@@ -696,14 +720,28 @@ for B, H, Q, K, D in attn_cases:
                 if xla_out is not None
                 else None
             )
+            parity_ok = (
+                xla_out is not None
+                and fa_finite
+                and err is not None
+                and math.isfinite(err)
+                and err <= PART_B_MAX_ABS_ERR_TOL
+            )
             fa_med_s, fa_min_s = bench_fn(
                 run_fa, q_arr, k_arr, v_arr, warmup=3, iters=20
+            )
+            status = (
+                "ok"
+                if parity_ok
+                else ("baseline_missing" if xla_out is None else "parity_fail")
             )
             rec = {
                 "shape": f"B={B},H={H},Q={Q},K={K},D={D}",
                 "causal": True,
                 "block_sizes": bs_name,
-                "status": "ok",
+                "status": status,
+                "finite": fa_finite,
+                "parity_ok": parity_ok,
                 "tpu_custom_call": has_tpu_cc,
                 "max_abs_err": err,
                 "median_us": round(fa_med_s * 1e6, 2),
@@ -723,13 +761,33 @@ for B, H, Q, K, D in attn_cases:
             }
             print("FLASH_ATTN_ERR:", json.dumps(err_rec))
 
-    if fa_results:
-        best_fa = min(fa_results, key=lambda r: r["median_us"])
+    valid_fa = [
+        r for r in fa_results
+        if r.get("status") == "ok" and r.get("parity_ok") and r.get("finite")
+    ]
+    if valid_fa and xa_med_s is not None:
+        best_fa = min(valid_fa, key=lambda r: r["median_us"])
         print("FLASH_ATTN_BEST:", json.dumps(best_fa))
+        part_b_case_valid.append(True)
+    else:
+        print(
+            "FLASH_ATTN_FAIL:",
+            json.dumps({
+                "shape": f"B={B},H={H},Q={Q},K={K},D={D}",
+                "xla_ok": xa_med_s is not None,
+                "valid_candidates": len(valid_fa),
+            }),
+        )
+        part_b_case_valid.append(False)
 
     del q_arr, k_arr, v_arr, xla_out, xla_attn_fn
     gc.collect()
     jax.clear_caches()
 
 print("HBM_END:", json.dumps(get_hbm_stats()))
+if not ok_part_a or not all(part_b_case_valid):
+    raise RuntimeError(
+        f"Pallas suite incomplete: part_a_valid={len(ok_part_a)}, "
+        f"part_b_cases={part_b_case_valid}"
+    )
 print("=== PALLAS_OPT_COMPLETE ===")
