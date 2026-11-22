@@ -46,7 +46,7 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
      std::unordered_set<ggml_backend_buffer_t> buffers;
      // computed graphs cached per backend, keyed by uid
      std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
-@@ -2179,8 +2198,741 @@
+@@ -2179,6 +2198,787 @@
      }
      result->view_offs = tensor->view_offs;
      return result;
@@ -245,24 +245,34 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 +    }
 +}
 +
-+static bool rpc_cpu_fallback_validate_node(
-+        ggml_backend_dev_t cpu_dev,
-+        const ggml_tensor * node,
-+        const std::unordered_set<ggml_backend_buffer_t> & buffers) {
-+    if (node == nullptr || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
-+        return true;
++static bool rpc_accel_fallback_supports_op(const ggml_tensor * node) {
++    if (node == nullptr) {
++        return false;
 +    }
 +    if (rpc_op_is_noop(node->op)) {
 +        return true;
 +    }
-+    if (cpu_dev == nullptr || !ggml_backend_dev_supports_op(cpu_dev, node)) {
-+        return false;
-+    }
-+    if (!rpc_tensor_span_in_buffer(node, buffers, false)) {
++
++    auto dims_positive = [](const ggml_tensor * t) -> bool {
++        if ((uint32_t) t->type >= GGML_TYPE_COUNT) {
++            return false;
++        }
++        const int64_t blck = ggml_blck_size(t->type);
++        if (blck <= 0 || ggml_type_size(t->type) == 0) {
++            return false;
++        }
++        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
++            if (t->ne[d] <= 0) {
++                return false;
++            }
++        }
++        return (t->ne[0] % blck) == 0;
++    };
++    if (!dims_positive(node)) {
 +        return false;
 +    }
 +    for (int s = 0; s < GGML_MAX_SRC; ++s) {
-+        if (node->src[s] != nullptr && !rpc_tensor_span_in_buffer(node->src[s], buffers, false)) {
++        if (node->src[s] != nullptr && !dims_positive(node->src[s])) {
 +            return false;
 +        }
 +    }
@@ -294,17 +304,7 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 +                src1->ne[3] != 1) {
 +                return false;
 +            }
-+            uint64_t dst_start = 0, dst_end = 0;
-+            uint64_t src1_start = 0, src1_end = 0;
-+            if (!rpc_tensor_span_in_buffer(node, buffers, true, &dst_start, &dst_end) ||
-+                !rpc_tensor_span_in_buffer(src0, buffers, true) ||
-+                !rpc_tensor_span_in_buffer(src1, buffers, false, &src1_start, &src1_end)) {
-+                return false;
-+            }
-+            if (rpc_ranges_overlap(dst_start, dst_end, src1_start, src1_end)) {
-+                return false;
-+            }
-+            return true;
++            return ggml_is_contiguous_rows(node) && ggml_is_contiguous_rows(src0);
 +        }
 +        case GGML_OP_GET_ROWS: {
 +            if (src0 == nullptr || src1 == nullptr) {
@@ -330,43 +330,30 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 +                ggml_nelements(src1) > INT32_MAX / 2) {
 +                return false;
 +            }
-+            uint64_t dst_start = 0, dst_end = 0;
-+            uint64_t src1_start = 0, src1_end = 0;
-+            if (!rpc_tensor_span_in_buffer(node, buffers, true, &dst_start, &dst_end) ||
-+                !rpc_tensor_span_in_buffer(src0, buffers, true) ||
-+                !rpc_tensor_span_in_buffer(src1, buffers, false, &src1_start, &src1_end)) {
-+                return false;
-+            }
-+            if (rpc_ranges_overlap(dst_start, dst_end, src1_start, src1_end)) {
-+                return false;
-+            }
-+            return true;
++            return ggml_is_contiguous_rows(node) && ggml_is_contiguous_rows(src0);
 +        }
 +        case GGML_OP_SOFT_MAX: {
 +            if (src0 == nullptr || src0->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32) {
 +                return false;
 +            }
-+            if (!ggml_is_contiguous(node) || !ggml_are_same_shape(src0, node)) {
-+                return false;
-+            }
-+            if (!rpc_tensor_span_in_buffer(node, buffers, true) ||
-+                !rpc_tensor_span_in_buffer(src0, buffers, true)) {
++            if (!ggml_is_contiguous(node) || !ggml_is_contiguous_rows(src0) ||
++                !ggml_are_same_shape(src0, node)) {
 +                return false;
 +            }
 +            if (src1 != nullptr) {
 +                if ((src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16) ||
++                    !ggml_is_contiguous_rows(src1) ||
 +                    src1->ne[0] != src0->ne[0] ||
 +                    src1->ne[1] < src0->ne[1] ||
 +                    (src0->ne[2] % src1->ne[2]) != 0 ||
-+                    (src0->ne[3] % src1->ne[3]) != 0 ||
-+                    !rpc_tensor_span_in_buffer(src1, buffers, true)) {
++                    (src0->ne[3] % src1->ne[3]) != 0) {
 +                    return false;
 +                }
 +            }
 +            if (src2 != nullptr) {
 +                if (src2->type != GGML_TYPE_F32 ||
-+                    src2->ne[0] < src0->ne[2] ||
-+                    !rpc_tensor_span_in_buffer(src2, buffers, true)) {
++                    !ggml_is_contiguous_rows(src2) ||
++                    src2->ne[0] < src0->ne[2]) {
 +                    return false;
 +                }
 +            }
@@ -397,8 +384,7 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 +            if (!types_ok) {
 +                return false;
 +            }
-+            return rpc_tensor_span_in_buffer(node, buffers, true) &&
-+                   rpc_tensor_span_in_buffer(src0, buffers, true);
++            return ggml_is_contiguous_rows(node) && ggml_is_contiguous_rows(src0);
 +        }
 +        case GGML_OP_RMS_NORM: {
 +            if (src0 == nullptr || src0->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32) {
@@ -406,16 +392,14 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 +            }
 +            if (!ggml_are_same_shape(src0, node) ||
 +                src0->nb[0] != sizeof(float) ||
-+                node->nb[0] != sizeof(float)) {
++                node->nb[0] != sizeof(float) ||
++                !ggml_is_contiguous_rows(src0) ||
++                !ggml_is_contiguous_rows(node)) {
 +                return false;
 +            }
 +            float eps = -1.0f;
 +            memcpy(&eps, node->op_params, sizeof(float));
-+            if (!(eps >= 0.0f) || (eps - eps) != 0.0f) {
-+                return false;
-+            }
-+            return rpc_tensor_span_in_buffer(src0, buffers, true) &&
-+                   rpc_tensor_span_in_buffer(node, buffers, true);
++            return (eps >= 0.0f) && (eps - eps) == 0.0f;
 +        }
 +        case GGML_OP_ADD:
 +        case GGML_OP_SUB:
@@ -433,15 +417,14 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 +            if (!types_ok) {
 +                return false;
 +            }
-+            if (!ggml_can_repeat(src1, src0) || !ggml_are_same_shape(src0, node) ||
-+                src0->nb[0] != ggml_type_size(src0->type) ||
-+                src1->nb[0] != ggml_type_size(src1->type) ||
-+                node->nb[0] != ggml_type_size(node->type)) {
-+                return false;
-+            }
-+            return rpc_tensor_span_in_buffer(src0, buffers, true) &&
-+                   rpc_tensor_span_in_buffer(src1, buffers, true) &&
-+                   rpc_tensor_span_in_buffer(node, buffers, true);
++            return ggml_can_repeat(src1, src0) &&
++                   ggml_are_same_shape(src0, node) &&
++                   src0->nb[0] == ggml_type_size(src0->type) &&
++                   src1->nb[0] == ggml_type_size(src1->type) &&
++                   node->nb[0] == ggml_type_size(node->type) &&
++                   ggml_is_contiguous_rows(src0) &&
++                   ggml_is_contiguous_rows(src1) &&
++                   ggml_is_contiguous_rows(node);
 +        }
 +        case GGML_OP_SCALE: {
 +            if (src0 == nullptr || node->type != src0->type) {
@@ -450,12 +433,11 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 +            if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_BF16) {
 +                return false;
 +            }
-+            if (!ggml_are_same_shape(src0, node) ||
-+                src0->ne[0] > INT32_MAX / 2 || ggml_nrows(src0) > INT32_MAX / 2) {
-+                return false;
-+            }
-+            return rpc_tensor_span_in_buffer(src0, buffers, true) &&
-+                   rpc_tensor_span_in_buffer(node, buffers, true);
++            return ggml_are_same_shape(src0, node) &&
++                   src0->ne[0] <= INT32_MAX / 2 &&
++                   ggml_nrows(src0) <= INT32_MAX / 2 &&
++                   ggml_is_contiguous_rows(src0) &&
++                   ggml_is_contiguous_rows(node);
 +        }
 +        case GGML_OP_ROPE: {
 +            if (src0 == nullptr || src1 == nullptr) {
@@ -467,8 +449,11 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 +                return false;
 +            }
 +            if (!ggml_are_same_shape(src0, node) ||
++                node->ne[0] <= 0 || (node->ne[0] % 2) != 0 ||
 +                src0->nb[0] != ggml_type_size(src0->type) ||
 +                node->nb[0] != ggml_type_size(node->type) ||
++                !ggml_is_contiguous_rows(src0) ||
++                !ggml_is_contiguous_rows(node) ||
 +                ggml_nrows(node) > INT32_MAX / 2) {
 +                return false;
 +            }
@@ -482,19 +467,16 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 +            if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
 +                return false;
 +            }
-+            if (!ggml_is_contiguous(src1) || src1->ne[0] < node->ne[2] ||
-+                !rpc_tensor_span_in_buffer(src1, buffers, true)) {
++            if (!ggml_is_contiguous(src1) || src1->ne[0] < node->ne[2]) {
 +                return false;
 +            }
 +            if (src2 != nullptr) {
 +                if (src2->type != GGML_TYPE_F32 || !ggml_is_contiguous(src2) ||
-+                    src2->ne[0] < n_dims / 2 ||
-+                    !rpc_tensor_span_in_buffer(src2, buffers, true)) {
++                    src2->ne[0] < node->ne[0] / 2) {
 +                    return false;
 +                }
 +            }
-+            return rpc_tensor_span_in_buffer(src0, buffers, true) &&
-+                   rpc_tensor_span_in_buffer(node, buffers, true);
++            return true;
 +        }
 +        case GGML_OP_GLU: {
 +            if (src0 == nullptr || src0->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32) {
@@ -505,26 +487,22 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 +                return false;
 +            }
 +            if (!ggml_is_contiguous_1(src0) || !ggml_is_contiguous_1(node) ||
++                !ggml_is_contiguous_rows(src0) || !ggml_is_contiguous_rows(node) ||
 +                ggml_nrows(src0) > INT32_MAX / 2 || ggml_nrows(node) != ggml_nrows(src0)) {
 +                return false;
 +            }
 +            if (src1 != nullptr) {
-+                if (src1->type != GGML_TYPE_F32 || !ggml_is_contiguous_1(src1) ||
-+                    !ggml_are_same_shape(src0, src1) || !ggml_are_same_shape(src0, node) ||
-+                    !rpc_tensor_span_in_buffer(src1, buffers, true)) {
-+                    return false;
-+                }
-+            } else {
-+                if ((src0->ne[0] % 2) != 0 ||
-+                    node->ne[0] != src0->ne[0] / 2 ||
-+                    node->ne[1] != src0->ne[1] ||
-+                    node->ne[2] != src0->ne[2] ||
-+                    node->ne[3] != src0->ne[3]) {
-+                    return false;
-+                }
++                return src1->type == GGML_TYPE_F32 &&
++                       ggml_is_contiguous_1(src1) &&
++                       ggml_is_contiguous_rows(src1) &&
++                       ggml_are_same_shape(src0, src1) &&
++                       ggml_are_same_shape(src0, node);
 +            }
-+            return rpc_tensor_span_in_buffer(src0, buffers, true) &&
-+                   rpc_tensor_span_in_buffer(node, buffers, true);
++            return (src0->ne[0] % 2) == 0 &&
++                   node->ne[0] == src0->ne[0] / 2 &&
++                   node->ne[1] == src0->ne[1] &&
++                   node->ne[2] == src0->ne[2] &&
++                   node->ne[3] == src0->ne[3];
 +        }
 +        case GGML_OP_DUP:
 +        case GGML_OP_CPY:
@@ -534,29 +512,25 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 +                return false;
 +            }
 +            if (src0->type == node->type) {
-+                const bool is_q = ggml_blck_size(src0->type) > 1;
-+                if (is_q && (!ggml_is_contiguous_rows(src0) || !ggml_is_contiguous_rows(node))) {
-+                    return false;
++                if (ggml_blck_size(src0->type) > 1) {
++                    return ggml_are_same_shape(src0, node) &&
++                           ggml_is_contiguous_rows(src0) &&
++                           ggml_is_contiguous_rows(node) &&
++                           src0->nb[0] == ggml_type_size(src0->type) &&
++                           node->nb[0] == ggml_type_size(node->type);
 +                }
-+                return rpc_tensor_span_in_buffer(src0, buffers, is_q) &&
-+                       rpc_tensor_span_in_buffer(node, buffers, is_q);
++                return ggml_is_contiguous(node) || ggml_are_same_shape(src0, node);
 +            }
 +            const bool src_flt = src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16;
 +            const bool dst_flt = node->type == GGML_TYPE_F32 || node->type == GGML_TYPE_F16 || node->type == GGML_TYPE_BF16;
 +            if (src_flt && dst_flt) {
-+                if (!ggml_is_contiguous(node) &&
-+                    !(ggml_are_same_shape(src0, node) && ggml_is_contiguous_rows(src0) && ggml_is_contiguous_rows(node))) {
-+                    return false;
-+                }
-+                return rpc_tensor_span_in_buffer(src0, buffers, false) &&
-+                       rpc_tensor_span_in_buffer(node, buffers, false);
++                return ggml_is_contiguous(node) ||
++                       (ggml_are_same_shape(src0, node) &&
++                        ggml_is_contiguous_rows(src0) &&
++                        ggml_is_contiguous_rows(node));
 +            }
 +            if (src_flt && rpc_cpu_type_has_from_float(node->type)) {
-+                if (!ggml_is_contiguous(node) || !ggml_is_contiguous_rows(src0)) {
-+                    return false;
-+                }
-+                return rpc_tensor_span_in_buffer(src0, buffers, true) &&
-+                       rpc_tensor_span_in_buffer(node, buffers, true);
++                return ggml_is_contiguous(node) && ggml_is_contiguous_rows(src0);
 +            }
 +            return false;
 +        }
@@ -574,9 +548,9 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 +                (src1->ne[3] % src0->ne[3]) != 0) {
 +                return false;
 +            }
-+            return rpc_tensor_span_in_buffer(src0, buffers, true) &&
-+                   rpc_tensor_span_in_buffer(src1, buffers, true) &&
-+                   rpc_tensor_span_in_buffer(node, buffers, true);
++            return ggml_is_contiguous_rows(src0) &&
++                   ggml_is_contiguous_rows(src1) &&
++                   ggml_is_contiguous_rows(node);
 +        }
 +        case GGML_OP_MUL_MAT_ID: {
 +            if (src0 == nullptr || src1 == nullptr || src2 == nullptr) {
@@ -596,6 +570,57 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 +                node->ne[3] != 1) {
 +                return false;
 +            }
++            return ggml_is_contiguous_rows(src0) &&
++                   ggml_is_contiguous_rows(src1) &&
++                   ggml_is_contiguous_rows(node);
++        }
++        default:
++            return false;
++    }
++}
++
++static bool rpc_cpu_fallback_validate_node(
++        ggml_backend_dev_t cpu_dev,
++        const ggml_tensor * node,
++        const std::unordered_set<ggml_backend_buffer_t> & buffers) {
++    if (node == nullptr || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
++        return true;
++    }
++    if (rpc_op_is_noop(node->op)) {
++        return true;
++    }
++    if (cpu_dev == nullptr || !rpc_accel_fallback_supports_op(node)) {
++        return false;
++    }
++    if (!rpc_tensor_span_in_buffer(node, buffers, false)) {
++        return false;
++    }
++    for (int s = 0; s < GGML_MAX_SRC; ++s) {
++        if (node->src[s] != nullptr && !rpc_tensor_span_in_buffer(node->src[s], buffers, false)) {
++            return false;
++        }
++    }
++
++    const ggml_tensor * src0 = node->src[0];
++    const ggml_tensor * src1 = node->src[1];
++    const ggml_tensor * src2 = node->src[2];
++
++    switch (node->op) {
++        case GGML_OP_SET_ROWS:
++        case GGML_OP_GET_ROWS: {
++            uint64_t dst_start = 0, dst_end = 0;
++            uint64_t src1_start = 0, src1_end = 0;
++            if (!rpc_tensor_span_in_buffer(node, buffers, true, &dst_start, &dst_end) ||
++                !rpc_tensor_span_in_buffer(src0, buffers, true) ||
++                !rpc_tensor_span_in_buffer(src1, buffers, false, &src1_start, &src1_end)) {
++                return false;
++            }
++            if (rpc_ranges_overlap(dst_start, dst_end, src1_start, src1_end)) {
++                return false;
++            }
++            break;
++        }
++        case GGML_OP_MUL_MAT_ID: {
 +            uint64_t dst_start = 0, dst_end = 0;
 +            uint64_t src2_start = 0, src2_end = 0;
 +            if (!rpc_tensor_span_in_buffer(src0, buffers, true) ||
@@ -607,11 +632,35 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 +            if (rpc_ranges_overlap(dst_start, dst_end, src2_start, src2_end)) {
 +                return false;
 +            }
-+            return true;
++            break;
 +        }
-+        default:
-+            return false;
++        case GGML_OP_DUP:
++        case GGML_OP_CPY:
++        case GGML_OP_CONT: {
++            const bool req_contig = (src0->type == node->type)
++                ? (ggml_blck_size(src0->type) > 1)
++                : (rpc_cpu_type_has_from_float(node->type) &&
++                   node->type != GGML_TYPE_F32 && node->type != GGML_TYPE_F16 && node->type != GGML_TYPE_BF16);
++            if (!rpc_tensor_span_in_buffer(src0, buffers, req_contig) ||
++                !rpc_tensor_span_in_buffer(node, buffers, req_contig)) {
++                return false;
++            }
++            break;
++        }
++        default: {
++            if (!rpc_tensor_span_in_buffer(node, buffers, true)) {
++                return false;
++            }
++            for (int s = 0; s < GGML_MAX_SRC; ++s) {
++                if (node->src[s] != nullptr && !rpc_tensor_span_in_buffer(node->src[s], buffers, true)) {
++                    return false;
++                }
++            }
++            break;
++        }
 +    }
++
++    return ggml_backend_dev_supports_op(cpu_dev, node);
 +}
 +
 +static const ggml_tensor * rpc_cpu_fallback_index_tensor(const ggml_tensor * node) {
@@ -627,8 +676,8 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 +        default:
 +            return nullptr;
 +    }
- }
- 
++}
++
 +static bool rpc_cpu_fallback_validate_runtime_indices(const ggml_tensor * node) {
 +    if (node == nullptr) {
 +        return true;
@@ -719,11 +768,10 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 +        int j = i + 1;
 +        while (j < graph->n_nodes) {
 +            ggml_tensor * node = graph->nodes[j];
-+            if (node == nullptr) {
++            if (node == nullptr || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
 +                break;
 +            }
-+            if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 &&
-+                ggml_backend_dev_supports_op(dev, node) != use_accel) {
++            if (ggml_backend_dev_supports_op(dev, node) != use_accel) {
 +                break;
 +            }
 +            ++j;
@@ -783,12 +831,10 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 +        i = j;
 +    }
 +    return GGML_STATUS_SUCCESS;
-+}
-+
+ }
+ 
  bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
-     // serialization format:
-     // | device (4 bytes) | uid (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
-@@ -2266,8 +3018,11 @@
+@@ -2266,8 +3066,11 @@
      }
      const std::chrono::duration<double, std::milli> deserialize_ms = std::chrono::steady_clock::now() - t_deserialize;
  
@@ -802,7 +848,7 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
      sg.graph = graph;
      LOG_DBG3("[%s] device: %u, graph build: %.3f ms\n", __func__, device, deserialize_ms.count());
      return true;
-@@ -2285,8 +3040,11 @@
+@@ -2285,8 +3088,11 @@
      }
      ggml_cgraph * graph = it->second.graph;
      LOG_DBG("[%s] device: %u, uid: %" PRIu64 "\n", __func__, device, request.uid);
@@ -816,14 +862,15 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
      return true;
  }
  
-@@ -2655,11 +3413,15 @@
+@@ -2654,12 +3460,16 @@
+     }
      for (auto buffer : buffers) {
          ggml_backend_buffer_free(buffer);
-     }
++    }
 +    if (cpu_fallback != nullptr) {
 +        ggml_backend_free(cpu_fallback);
 +        cpu_fallback = nullptr;
-+    }
+     }
  }
  
  static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
@@ -834,7 +881,7 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
      uint8_t cmd;
      if (!sock->recv_data(&cmd, 1)) {
          return;
-@@ -3047,7 +3809,7 @@
+@@ -3047,7 +3857,7 @@
              return;
          }
          LOG_INFO("Accepted client connection\n");
@@ -843,3 +890,14 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
          LOG_INFO("Client connection closed\n");
      }
      rpc_transport_shutdown();
+@@ -3113,9 +3923,7 @@
+ 
+ static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+     GGML_UNUSED(dev);
+-    GGML_UNUSED(op);
+-    //TODO: call the remote backend and cache the results
+-    return true;
++    return rpc_accel_fallback_supports_op(op);
+ }
+ 
+ static bool ggml_backend_rpc_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
