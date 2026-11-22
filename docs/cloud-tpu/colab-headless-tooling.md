@@ -109,10 +109,13 @@ Outputs in `--out-dir`:
 ## 4. Colab ToS & Track C Graduation Boundaries
 
 - **Allowed on Colab (Track B)**: Personal interactive and automated R&D, single-chip `v6e-1` / `v5e-1` Pallas/Mosaic/PJRT/`llama.cpp` benchmarks, and artifact download within paid Compute Unit balance (e.g., Google AI Ultra `2,000 CUs/month` with 24-hour continuous background execution while CUs > 0).
+- **Plan-Dependent Web UI Rules (Colab FAQ)**:
+  - Running web UIs (e.g., Gradio/Streamlit) or bypassing the notebook UI is disallowed on **free managed runtimes without a positive Compute Unit balance**.
+  - On a **paid plan with a positive Compute Unit balance**, Google's Colab FAQ removes that web-UI restriction for personal/R&D use; persistent, public, or multi-tenant production serving still belongs on GCP (Cloud Run, GKE, or Compute Engine / Cloud TPU VMs).
 - **Strictly Prohibited (Hard Stop)**:
-  - Hosting public inference APIs, Gradio/web UIs bypassing notebooks, or multi-tenant serving.
   - Reselling compute, cryptocurrency mining, or sharing account credentials.
   - Bypassing BotGuard, reCAPTCHA, or rate limits (`412`/`429`), or extracting browser cookies.
+  - Hosting public or multi-tenant production inference APIs on ephemeral Colab runtimes.
 - **When to Graduate to Track C (GCP Cloud TPU VMs / TRC)**:
   - Multi-chip TPU pod slices and `400+ GB/s` ICI collective networking.
   - Uncontainerized kernel / `/dev/vfio/*` bare-metal driver work (`libopenbuenos` datacenter backend).
