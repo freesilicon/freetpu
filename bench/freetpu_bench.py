@@ -79,6 +79,25 @@ _DEFINITIVE_ALLOCATION_REFUSAL_MARKERS = (
     "no backends",
 )
 
+_AMBIGUOUS_ALLOCATION_MARKERS = (
+    "timed out",
+    "timeout",
+    "readtimeout",
+    "connecttimeout",
+    "retrying",
+    "retry ",
+    "retries",
+    "http 502",
+    "http 503",
+    "http 504",
+    "502 bad gateway",
+    "503 service unavailable",
+    "504 gateway timeout",
+    "connection reset",
+    "connection aborted",
+    "remote disconnected",
+)
+
 
 @dataclass(frozen=True)
 class ReferenceBaseline:
@@ -984,13 +1003,16 @@ def extract_bench_json(stdout: str) -> Optional[Dict[str, Any]]:
 def is_colab_allocation_error(returncode: int, stderr: str) -> bool:
     """Return True only for definitive allocation refusals where no runtime was assigned.
 
-    Ambiguous failures (timeouts, HTTP 502/503/504, connection resets) return False
-    because the server may have created a billable runtime before the error.
+    Ambiguous failures (timeouts, HTTP 502/503/504, connection resets, or any retried
+    allocation attempt) return False because the server may have created a billable
+    runtime before the error or subsequent refusal.
     """
     if returncode == 0:
         return False
     low = stderr.lower()
     if "[colab] session ready" in low:
+        return False
+    if any(marker in low for marker in _AMBIGUOUS_ALLOCATION_MARKERS):
         return False
     return any(marker in low for marker in _DEFINITIVE_ALLOCATION_REFUSAL_MARKERS)
 
@@ -1194,7 +1216,10 @@ def _default_colab_runner(
     """Run a Colab CLI command non-interactively with an optional host-side deadline."""
     env = os.environ.copy()
     env.setdefault("COLAB_CLI_REQUEST_TIMEOUT", "60")
-    env.setdefault("COLAB_CLI_ASSIGN_RETRIES", "1")
+    # Unconditionally disable internal Colab CLI allocation retries so a timed-out
+    # POST cannot be retried and masked by a subsequent HTTP 412 refusal while the
+    # first runtime is still provisioning server-side.
+    env["COLAB_CLI_ASSIGN_RETRIES"] = "0"
     popen_kwargs: Dict[str, Any] = {
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.PIPE,
@@ -3234,6 +3259,53 @@ def run_self_test() -> int:
     assert to_state["sessions_calls"] == 3
     assert to_res["colab_meta"]["teardown_verified"] is True
 
+    # 4p. `_default_colab_runner` MUST force COLAB_CLI_ASSIGN_RETRIES=0 (overriding ambient env)
+    # and a retried timeout + HTTP 412 refusal MUST NOT be treated as a definitive refusal
+    prev_retries = os.environ.get("COLAB_CLI_ASSIGN_RETRIES")
+    os.environ["COLAB_CLI_ASSIGN_RETRIES"] = "3"
+    try:
+        env_probe = _default_colab_runner(
+            [sys.executable, "-c", "import os; print(os.environ.get('COLAB_CLI_ASSIGN_RETRIES', ''))"],
+            timeout_s=10.0,
+        )
+        assert env_probe.returncode == 0
+        assert env_probe.stdout.strip() == "0", repr(env_probe.stdout)
+    finally:
+        if prev_retries is None:
+            os.environ.pop("COLAB_CLI_ASSIGN_RETRIES", None)
+        else:
+            os.environ["COLAB_CLI_ASSIGN_RETRIES"] = prev_retries
+    assert is_colab_allocation_error(1, "HTTP 412 Allocation refused: REASON_NO_BACKENDS") is True
+    assert (
+        is_colab_allocation_error(
+            1,
+            "ReadTimeout: timed out waiting for assign; retrying...\nHTTP 412 Allocation refused",
+        )
+        is False
+    )
+
+    # 4q. `--suite comms --backend jax_tpu` MUST skip JAX/TPU initialization completely
+    had_jax = "jax" in sys.modules
+    prev_jax = sys.modules.get("jax")
+    sys.modules["jax"] = None  # type: ignore[assignment]
+    try:
+        jax_comms_out = StringIO()
+        with redirect_stdout(jax_comms_out):
+            rc_jax_comms = main(["--suite", "comms", "--backend", "jax_tpu", "--quick", "--json", "-"])
+        assert rc_jax_comms == 0, rc_jax_comms
+        jax_comms_rep = json.loads(jax_comms_out.getvalue())
+        assert jax_comms_rep["backend"] == "jax_tpu"
+        assert "comms" in jax_comms_rep and jax_comms_rep["comms"]["status"] == "measured"
+        assert "device_info" not in jax_comms_rep
+        assert "compute" not in jax_comms_rep and "bandwidth" not in jax_comms_rep
+        measured_jax_comms = [r for r in jax_comms_rep["scorecard"] if r["row_type"] == "measured"]
+        assert len(measured_jax_comms) == 1 and "Local Host Comms" in measured_jax_comms[0]["target"]
+    finally:
+        if had_jax:
+            sys.modules["jax"] = prev_jax  # type: ignore[assignment]
+        else:
+            sys.modules.pop("jax", None)
+
     # 5. Verify this script compiles and loads under a `colab run` executable prelude
     src_text = Path(__file__).read_text(encoding="utf-8")
     compile("import os\nos.environ['X'] = '1'\n" + src_text, "colab_cell", "exec")
@@ -3333,8 +3405,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if "comms" in suites:
             report["comms"] = run_comms_suite(args.comms_host, args.comms_port, quick=args.quick)
     elif args.backend == "jax_tpu":
-        jax_res = run_jax_tpu_suites(suites, quick=args.quick, allow_jax_cpu=args.allow_jax_cpu)
-        report.update(jax_res)
+        if "compute" in suites or "bandwidth" in suites:
+            jax_res = run_jax_tpu_suites(suites, quick=args.quick, allow_jax_cpu=args.allow_jax_cpu)
+            report.update(jax_res)
         if "comms" in suites:
             report["comms"] = run_comms_suite(args.comms_host, args.comms_port, quick=args.quick)
     elif args.backend == "colab_tpu":
