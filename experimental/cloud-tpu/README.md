@@ -98,9 +98,10 @@ mkdir -p -m 700 ~/.cache/freetpu-pjrt
 mkdir -p -m 700 ~/.cache/freetpu-pjrt/ir
 curl -fsSL https://raw.githubusercontent.com/openxla/xla/main/xla/pjrt/c/pjrt_c_api.h \
   -o ~/.cache/freetpu-pjrt/ir/pjrt_c_api.h
+LIBTPU_PATH="${TPU_LIBRARY_PATH:-$(python3 -c 'import libtpu; print(libtpu.get_library_path())')}"
 g++ -O3 -std=c++17 -Wall -Wextra -I"$HOME/.cache/freetpu-pjrt/ir" \
   experimental/cloud-tpu/tpu_pjrt_bench.cpp -ldl -pthread -o ~/.cache/freetpu-pjrt/tpu_pjrt_bench
-~/.cache/freetpu-pjrt/tpu_pjrt_bench
+LIBTPU_PATH="$LIBTPU_PATH" ~/.cache/freetpu-pjrt/tpu_pjrt_bench
 ```
 
 ---

@@ -1440,31 +1440,35 @@ for batch in (1, 32):
     total_bytes = float(w8_weight_bytes + w8_scale_bytes + kv_bytes)
 
     w8_pallas_fn = make_w8_32l_step(use_pallas=True)
-    p_cc_count = (
-        w8_pallas_fn.lower(w8_weights, x_tok, kc, vc, jnp.int32(0))
-        .as_text()
-        .count("tpu_custom_call")
-    )
     t_c0 = time.perf_counter()
-    p_x0, kc, vc = w8_pallas_fn(w8_weights, x_tok, kc, vc, jnp.int32(0))
-    jax.block_until_ready((p_x0, kc, vc))
+    p_lowered = w8_pallas_fn.lower(w8_weights, x_tok, kc, vc, jnp.int32(0))
+    p_compiled = p_lowered.compile()
     p_compile_s = time.perf_counter() - t_c0
+    p_cc_count = p_lowered.as_text().count("tpu_custom_call")
+    t_r0 = time.perf_counter()
+    p_x0, kc, vc = p_compiled(w8_weights, x_tok, kc, vc, jnp.int32(0))
+    jax.block_until_ready((p_x0, kc, vc))
+    p_first_run_s = time.perf_counter() - t_r0
     p_med_s, p_min_s, p_x_last, kc, vc = bench_donated_decode(
-        w8_pallas_fn, w8_weights, x_tok, kc, vc
+        p_compiled, w8_weights, x_tok, kc, vc
     )
 
-    del kc, vc, w8_pallas_fn
+    del kc, vc, p_compiled, p_lowered, w8_pallas_fn
     gc.collect()
     kc, vc = alloc_kv_cache(batch, seed=900)
 
     w8_xla_fn = make_w8_32l_step(use_pallas=False)
     t_c1 = time.perf_counter()
-    x_x0, kc, vc = w8_xla_fn(w8_weights, x_tok, kc, vc, jnp.int32(0))
-    jax.block_until_ready((x_x0, kc, vc))
+    x_lowered = w8_xla_fn.lower(w8_weights, x_tok, kc, vc, jnp.int32(0))
+    x_compiled = x_lowered.compile()
     x_compile_s = time.perf_counter() - t_c1
+    t_r1 = time.perf_counter()
+    x_x0, kc, vc = x_compiled(w8_weights, x_tok, kc, vc, jnp.int32(0))
+    jax.block_until_ready((x_x0, kc, vc))
+    x_first_run_s = time.perf_counter() - t_r1
     step0_err = float(jnp.max(jnp.abs(p_x0.astype(jnp.float32) - x_x0.astype(jnp.float32))))
     x_med_s, x_min_s, _, kc, vc = bench_donated_decode(
-        w8_xla_fn, w8_weights, x_tok, kc, vc
+        x_compiled, w8_weights, x_tok, kc, vc
     )
 
     p_ok = W8A16_MODE is not None
@@ -1484,11 +1488,13 @@ for batch in (1, 32):
                 "scan_tpu_custom_call_count": p_cc_count if p_ok else 0,
                 "step0_max_abs_err": step0_err,
                 "pallas_compile_s": round(p_compile_s, 2) if p_ok else None,
+                "pallas_first_run_s": round(p_first_run_s, 2) if p_ok else None,
                 "pallas_ms_per_step": round(p_med_s * 1e3, 3) if p_ok else None,
                 "pallas_tok_per_s": round(batch / p_med_s, 2) if p_ok else None,
                 "pallas_gb_s": round(p_gbs, 2) if p_gbs is not None else None,
                 "pallas_pct_819": round(100.0 * p_gbs / PEAK_HBM_GBS, 2) if p_gbs is not None else None,
                 "xla_compile_s": round(x_compile_s, 2),
+                "xla_first_run_s": round(x_first_run_s, 2),
                 "xla_ms_per_step": round(x_med_s * 1e3, 3),
                 "xla_tok_per_s": round(batch / x_med_s, 2),
                 "xla_gb_s": round(x_gbs, 2),
@@ -1498,7 +1504,7 @@ for batch in (1, 32):
             }
         ),
     )
-    del x_tok, kc, vc, p_x0, p_x_last, x_x0, w8_xla_fn
+    del x_tok, kc, vc, p_x0, p_x_last, x_x0, x_compiled, x_lowered, w8_xla_fn
     gc.collect()
     jax.clear_caches()
 
@@ -1619,31 +1625,35 @@ for batch in (1, 32):
     total_bytes = float(w4_weight_bytes + w4_scale_bytes + kv_bytes)
 
     w4_pallas_fn = make_w4_32l_step(use_pallas=True)
-    p_cc_count = (
-        w4_pallas_fn.lower(w4_weights, x_tok, kc, vc, jnp.int32(0))
-        .as_text()
-        .count("tpu_custom_call")
-    )
     t_c0 = time.perf_counter()
-    p_x0, kc, vc = w4_pallas_fn(w4_weights, x_tok, kc, vc, jnp.int32(0))
-    jax.block_until_ready((p_x0, kc, vc))
+    p_lowered = w4_pallas_fn.lower(w4_weights, x_tok, kc, vc, jnp.int32(0))
+    p_compiled = p_lowered.compile()
     p_compile_s = time.perf_counter() - t_c0
+    p_cc_count = p_lowered.as_text().count("tpu_custom_call")
+    t_r0 = time.perf_counter()
+    p_x0, kc, vc = p_compiled(w4_weights, x_tok, kc, vc, jnp.int32(0))
+    jax.block_until_ready((p_x0, kc, vc))
+    p_first_run_s = time.perf_counter() - t_r0
     p_med_s, p_min_s, p_x_last, kc, vc = bench_donated_decode(
-        w4_pallas_fn, w4_weights, x_tok, kc, vc
+        p_compiled, w4_weights, x_tok, kc, vc
     )
 
-    del kc, vc, w4_pallas_fn
+    del kc, vc, p_compiled, p_lowered, w4_pallas_fn
     gc.collect()
     kc, vc = alloc_kv_cache(batch, seed=1900)
 
     w4_xla_fn = make_w4_32l_step(use_pallas=False)
     t_c1 = time.perf_counter()
-    x_x0, kc, vc = w4_xla_fn(w4_weights, x_tok, kc, vc, jnp.int32(0))
-    jax.block_until_ready((x_x0, kc, vc))
+    x_lowered = w4_xla_fn.lower(w4_weights, x_tok, kc, vc, jnp.int32(0))
+    x_compiled = x_lowered.compile()
     x_compile_s = time.perf_counter() - t_c1
+    t_r1 = time.perf_counter()
+    x_x0, kc, vc = x_compiled(w4_weights, x_tok, kc, vc, jnp.int32(0))
+    jax.block_until_ready((x_x0, kc, vc))
+    x_first_run_s = time.perf_counter() - t_r1
     step0_err = float(jnp.max(jnp.abs(p_x0.astype(jnp.float32) - x_x0.astype(jnp.float32))))
     x_med_s, x_min_s, _, kc, vc = bench_donated_decode(
-        w4_xla_fn, w4_weights, x_tok, kc, vc
+        x_compiled, w4_weights, x_tok, kc, vc
     )
 
     p4_ok = W4A16_MODE is not None
@@ -1663,11 +1673,13 @@ for batch in (1, 32):
                 "scan_tpu_custom_call_count": p_cc_count if p4_ok else 0,
                 "step0_max_abs_err": step0_err,
                 "pallas_compile_s": round(p_compile_s, 2) if p4_ok else None,
+                "pallas_first_run_s": round(p_first_run_s, 2) if p4_ok else None,
                 "pallas_ms_per_step": round(p_med_s * 1e3, 3) if p4_ok else None,
                 "pallas_tok_per_s": round(batch / p_med_s, 2) if p4_ok else None,
                 "pallas_gb_s": round(p_gbs, 2) if p_gbs is not None else None,
                 "pallas_pct_819": round(100.0 * p_gbs / PEAK_HBM_GBS, 2) if p_gbs is not None else None,
                 "xla_compile_s": round(x_compile_s, 2),
+                "xla_first_run_s": round(x_first_run_s, 2),
                 "xla_ms_per_step": round(x_med_s * 1e3, 3),
                 "xla_tok_per_s": round(batch / x_med_s, 2),
                 "xla_gb_s": round(x_gbs, 2),
@@ -1677,7 +1689,7 @@ for batch in (1, 32):
             }
         ),
     )
-    del x_tok, kc, vc, p_x0, p_x_last, x_x0, w4_xla_fn
+    del x_tok, kc, vc, p_x0, p_x_last, x_x0, x_compiled, x_lowered, w4_xla_fn
     gc.collect()
     jax.clear_caches()
 

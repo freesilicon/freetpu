@@ -6,6 +6,7 @@ import json
 import math
 import sys
 import time
+from typing import Optional, Tuple
 
 try:
     sys.stdout.reconfigure(line_buffering=True)

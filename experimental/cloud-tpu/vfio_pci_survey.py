@@ -61,9 +61,10 @@ else:
     import libtpu
     so_path = libtpu.get_library_path()
 print("libtpu.so:", so_path)
-r2 = subprocess.run(f"nm -D '{so_path}' 2>&1 | grep -iE 'pjrt|tpu' | head -n 40", shell=True, text=True, capture_output=True)
+r2 = subprocess.run(["nm", "-D", so_path], text=True, capture_output=True)
+sym_lines = [ln for ln in r2.stdout.splitlines() if "pjrt" in ln.lower() or "tpu" in ln.lower()]
 print("--- exported symbols (pjrt/tpu) ---")
-print(r2.stdout.strip())
+print("\n".join(sym_lines[:40]))
 
 lib = ctypes.CDLL(so_path)
 lib.GetPjrtApi.restype = ctypes.c_void_p
