@@ -64,6 +64,8 @@ max by (generation, node, chip) (freetpu_tpu_hbm_used_bytes) / (1024 * 1024 * 10
 ## Billing & Chargeback (Operator-Controlled `collector_role="node"` Only)
 
 > **Trust boundary:** Every financial, reservation-hour, and estimated-spend query in this section reads **exclusively** from operator-controlled `collector_role="node"` series (`freetpu_tpu_info` and `freetpu_tpu_active_pids` from the trusted `freetpu-node-exporter` DaemonSet or standalone host VM scrape). Tenant-supplied workload sidecar metrics (`collector_role="workload-sidecar"`) are **excluded** because a pod on a TPU node controls its HTTP scrape payload and can report arbitrary `generation`, `pci_bdf`, or utilization values for chips on that node. These queries do not require `--chip-id-map`.
+>
+> **Prometheus version prerequisite (`Prometheus >= 3.0`):** The 24-hour `[24h:15s]` and `[15s]` range/subquery coverage and chargeback queries below require **Prometheus `>= 3.0`** (left-open `(t-24h, t]` range/subquery windows, which evaluate exactly `5760 = 24h / 15s` intervals on any 15s boundary). Prometheus 2.x uses closed `[t-24h, t]` bounds, which produce `5761` points on a 15s boundary (causing the `== 1` complete-coverage gate to reject full windows and accept windows missing one interval). Do not run these exact-5760 queries unmodified on Prometheus 2.x.
 
 ```promql
 # 24h PID telemetry coverage ratio per physical chip (0.0 - 1.0) at the 15s billing

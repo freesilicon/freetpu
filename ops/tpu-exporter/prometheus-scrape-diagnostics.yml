@@ -8,9 +8,12 @@
 # Matches the `ml-workloads` namespace used by the sample DRA and sidecar
 # manifests (`ops/tpu-cdi/manifests/k8s-tpu-workload-telemetry-sidecar.yaml`
 # and `ops/tpu-cdi/manifests/k8s-tpu-pod-cdi*.yaml`). Adjust `namespaces.names`
-# (or shard one job per approved namespace) to match your cluster layout, and
+# (or shard one job per approved namespace) to match your cluster layout,
+# enforce Kubernetes Pod Security Admission (`baseline` or `restricted`) on
+# `ml-workloads` so `hostNetwork: true` Pods are rejected at admission, and
 # pair with a cluster NetworkPolicy restricting Prometheus egress to approved
-# TPU workload namespaces and port 9400.
+# TPU workload namespaces and TCP port 9400. Requires Prometheus >= 2.41 for
+# `action: dropequal` (Prometheus >= 3.0 recommended).
 
 global:
   scrape_interval: 15s
@@ -65,6 +68,17 @@ scrape_configs:
       - source_labels: [__meta_kubernetes_pod_container_port_name]
         action: keep
         regex: "metrics"
+      - source_labels: [__meta_kubernetes_pod_container_port_number]
+        action: keep
+        regex: "9400"
+      - source_labels: [__meta_kubernetes_pod_container_port_protocol]
+        action: keep
+        regex: "TCP"
+      # Drop hostNetwork Pods (whose pod IP equals the node host IP) so a tenant
+      # Pod cannot direct diagnostic scrapes to a node-level service on :9400.
+      - source_labels: [__meta_kubernetes_pod_ip]
+        target_label: __meta_kubernetes_pod_host_ip
+        action: dropequal
       - source_labels: [__meta_kubernetes_pod_node_name]
         target_label: node
       - source_labels: [__meta_kubernetes_namespace]

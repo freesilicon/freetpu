@@ -1,11 +1,24 @@
-# FreeTPU Node DaemonSet (VFIO-backed GKE Cloud TPU nodes: v5e, v5p, v6e Trillium):
-# Scope: Node-level boot-scoped CDI spec sync + PCI/VFIO inventory & hostPID
-# active-PID telemetry ONLY. This DaemonSet uses stock `python:3.12-slim` without
-# `tpu-info` and runs outside workload Pod network namespaces, so it does NOT emit
-# live HBM usage or MXU duty cycle. For live HBM + duty-cycle telemetry in
-# Kubernetes, run a `tpu-info`-enabled exporter sidecar inside each TPU workload
-# Pod so it shares `localhost:8431` with `libtpu` (see
-# `k8s-tpu-workload-telemetry-sidecar.yaml`).
+# FreeTPU Node DaemonSets (VFIO-backed GKE Cloud TPU nodes: v5e, v5p, v6e Trillium):
+# Scope:
+#   1. `DaemonSet/freetpu-node-agent` (default on VFIO-backed TPU nodes):
+#      PCI/VFIO inventory & hostPID active-PID Prometheus telemetry ONLY (does NOT
+#      mount `/var/run/cdi` or publish CDI specs). Uses stock `python:3.12-slim`
+#      without `tpu-info` and runs outside workload Pod network namespaces, so it
+#      does NOT emit live HBM usage or MXU duty cycle. For live HBM + duty-cycle
+#      telemetry in Kubernetes, run a `tpu-info`-enabled exporter sidecar inside
+#      each TPU workload Pod (`k8s-tpu-workload-telemetry-sidecar.yaml`).
+#   2. `DaemonSet/freetpu-cdi-sync` (OPT-IN CDI publisher):
+#      Publishes boot-scoped `/var/run/cdi/freetpu.json` ONLY on TPU nodes
+#      explicitly labeled `freetpu.dev/cdi-enabled=true`.
+#      SECURITY PREREQUISITE (CVE-2026-53492 / GHSA-33vj-92qq-66hc / GCP-2026-037):
+#      Unpatched containerd 2.x releases allow a tenant with Pod creation rights
+#      to smuggle CDI annotations via untrusted container checkpoint restores and
+#      bypass DRA to access every published CDI device (including
+#      `freetpu.dev/tpu=all`). Before labeling any node `freetpu.dev/cdi-enabled=true`,
+#      verify the node runs patched containerd (`>= 2.1.9`, `>= 2.2.5`, or
+#      `>= 2.3.2`, or a distro/GKE build patched for CVE-2026-53492) OR that
+#      untrusted container checkpoint restores are disabled/blocked on the node.
+#      Telemetry-only installations should leave `freetpu.dev/cdi-enabled` unset.
 #
 # Prerequisite (create the required ConfigMap in kube-system first):
 #   kubectl -n kube-system create configmap freetpu-ops-scripts \
@@ -17,21 +30,6 @@
 # `tpu-v5-lite-podslice`, `tpu-v5p-slice`, `tpu-v6e-slice`); excludes legacy
 # `/dev/accel*` v4 node pools (`tpu-v4-podslice`). Adjust `nodeAffinity` if your
 # cluster uses custom TPU node labels.
-#
-# 1. `freetpu-cdi-sync` handles initial boot-scoped `/var/run/cdi/freetpu.json`
-#    publication and continuous revalidation/retries independently of
-#    `tpu-exporter`. It regenerates `/var/run/cdi/freetpu.json` atomically on
-#    valid topology changes and unlinks it immediately if a VFIO group is
-#    reassigned, missing, or exposes a non-TPU device—without blocking node
-#    telemetry when a chip is unhealthy or unbound.
-# 2. `tpu-exporter` always starts immediately and serves PCI/VFIO inventory
-#    (including unhealthy/unbound chips) and hostPID active-PID Prometheus
-#    `/metrics` on :9400 (with SYS_PTRACE + AppArmor Unconfined, required on GKE
-#    because GKE's default container AppArmor profile blocks ptrace-mediated
-#    `/proc/<pid>/fd` reads across peers with different AppArmor profiles;
-#    `appArmorProfile` is GA in Kubernetes >= 1.30) and an isolated
-#    liveness/readiness endpoint on :9401 (`/healthz`) independent of scrape
-#    traffic saturation.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -74,44 +72,6 @@ spec:
           operator: Exists
           effect: NoSchedule
       containers:
-        - name: freetpu-cdi-sync
-          image: python:3.12-slim
-          command:
-            - python3
-            - /opt/freetpu/freetpu_cdi.py
-            - sync
-            - --output
-            - /var/run/cdi/freetpu.json
-            - --interval
-            - "15"
-          resources:
-            requests:
-              cpu: 20m
-              memory: 32Mi
-            limits:
-              cpu: 100m
-              memory: 64Mi
-          volumeMounts:
-            # Mount only the narrow sysfs subpaths needed for PCI and IOMMU
-            # discovery (never whole-host /sys) so containerd's read-only
-            # /sys/fs/cgroup mount is never shadowed by a writable host cgroup.
-            - name: sysfs-bus-pci
-              mountPath: /sys/bus/pci
-              readOnly: true
-            - name: sysfs-devices
-              mountPath: /sys/devices
-              readOnly: true
-            - name: sysfs-iommu-groups
-              mountPath: /sys/kernel/iommu_groups
-              readOnly: true
-            - name: dev-vfio
-              mountPath: /dev/vfio
-              readOnly: true
-            - name: cdi-dir
-              mountPath: /var/run/cdi
-            - name: freetpu-ops
-              mountPath: /opt/freetpu
-              readOnly: true
         - name: tpu-exporter
           image: python:3.12-slim
           command:
@@ -166,6 +126,9 @@ spec:
               cpu: 200m
               memory: 128Mi
           volumeMounts:
+            # Mount only the narrow sysfs subpaths needed for PCI and IOMMU
+            # discovery (never whole-host /sys) so containerd's read-only
+            # /sys/fs/cgroup mount is never shadowed by a writable host cgroup.
             - name: sysfs-bus-pci
               mountPath: /sys/bus/pci
               readOnly: true
@@ -197,8 +160,112 @@ spec:
         - name: dev-vfio
           hostPath:
             # DirectoryOrCreate lets the DaemonSet start even if vfio-pci failed
-            # to initialize so tpu-exporter can still report unhealthy chips and
-            # freetpu-cdi-sync can invalidate any stale CDI spec.
+            # to initialize so tpu-exporter can still report unhealthy chips.
+            path: /dev/vfio
+            type: DirectoryOrCreate
+        - name: freetpu-ops
+          configMap:
+            name: freetpu-ops-scripts
+---
+# Opt-in CDI spec publisher DaemonSet.
+# Schedules ONLY on VFIO-backed TPU nodes explicitly labeled:
+#   kubectl label node <tpu-node> freetpu.dev/cdi-enabled=true
+# ONLY label nodes verified to run patched containerd (`>= 2.1.9`, `>= 2.2.5`,
+# or `>= 2.3.2` for CVE-2026-53492 / GHSA-33vj-92qq-66hc / GCP-2026-037) OR
+# with untrusted container checkpoint restores disabled/blocked.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: freetpu-cdi-sync
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: freetpu-cdi-sync
+    app.kubernetes.io/component: tpu-ops
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: freetpu-cdi-sync
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: freetpu-cdi-sync
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: cloud.google.com/gke-tpu-accelerator
+                    operator: In
+                    values:
+                      - tpu-v5-lite-device
+                      - tpu-v5-lite-podslice
+                      - tpu-v5p-slice
+                      - tpu-v6e-slice
+                  - key: freetpu.dev/cdi-enabled
+                    operator: In
+                    values:
+                      - "true"
+      tolerations:
+        - key: google.com/tpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: freetpu-cdi-sync
+          image: python:3.12-slim
+          command:
+            - python3
+            - /opt/freetpu/freetpu_cdi.py
+            - sync
+            - --output
+            - /var/run/cdi/freetpu.json
+            - --interval
+            - "15"
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          volumeMounts:
+            # Mount only the narrow sysfs subpaths needed for PCI and IOMMU
+            # discovery (never whole-host /sys) so containerd's read-only
+            # /sys/fs/cgroup mount is never shadowed by a writable host cgroup.
+            - name: sysfs-bus-pci
+              mountPath: /sys/bus/pci
+              readOnly: true
+            - name: sysfs-devices
+              mountPath: /sys/devices
+              readOnly: true
+            - name: sysfs-iommu-groups
+              mountPath: /sys/kernel/iommu_groups
+              readOnly: true
+            - name: dev-vfio
+              mountPath: /dev/vfio
+              readOnly: true
+            - name: cdi-dir
+              mountPath: /var/run/cdi
+            - name: freetpu-ops
+              mountPath: /opt/freetpu
+              readOnly: true
+      volumes:
+        - name: sysfs-bus-pci
+          hostPath:
+            path: /sys/bus/pci
+            type: Directory
+        - name: sysfs-devices
+          hostPath:
+            path: /sys/devices
+            type: Directory
+        - name: sysfs-iommu-groups
+          hostPath:
+            path: /sys/kernel/iommu_groups
+            type: Directory
+        - name: dev-vfio
+          hostPath:
+            # DirectoryOrCreate lets freetpu-cdi-sync start even if vfio-pci
+            # failed to initialize so it can invalidate any stale CDI spec.
             path: /dev/vfio
             type: DirectoryOrCreate
         - name: cdi-dir
