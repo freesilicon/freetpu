@@ -2138,6 +2138,15 @@ void quantize_activation_row_split_fast(const float* a_row,
     if (av > amax) amax = av;
     sq_sum += static_cast<double>(v) * static_cast<double>(v);
   }
+  if (!std::isfinite(sq_sum) && std::isfinite(amax)) {
+    // Recompute activation energy in FP64 when large finite inputs (e.g., >= 1e20f)
+    // overflow FP32 squaring in the NEON fast path.
+    sq_sum = 0.0;
+    for (uint32_t i = 0u; i < tk; ++i) {
+      const double dv = static_cast<double>(a_row[i]);
+      sq_sum += dv * dv;
+    }
+  }
   if (amax == 0.0f) {
     std::memset(aq_row, 0, tk);
     *out_s_a = 0.0f;
@@ -2230,9 +2239,16 @@ void quantize_activation_row_split_fast(const float* a_row,
   }
   if (out_aq_sq) {
     // Analytical sum(aq^2) directly from remaining FP32 energy rem_sq (eliminates Pass 4 read!)
+    const uint64_t max_aq_sq = static_cast<uint64_t>(tk) * 16129ULL;
     const double d_inv = static_cast<double>(inv_sa);
     const double est_sq = rem_sq * d_inv * d_inv;
-    *out_aq_sq = (est_sq > 0.0) ? static_cast<uint64_t>(est_sq + 0.5) : 0ULL;
+    if (!std::isfinite(est_sq) || est_sq >= static_cast<double>(max_aq_sq)) {
+      *out_aq_sq = max_aq_sq;
+    } else if (est_sq > 0.0) {
+      *out_aq_sq = static_cast<uint64_t>(est_sq + 0.5);
+    } else {
+      *out_aq_sq = 0ULL;
+    }
   }
 }
 

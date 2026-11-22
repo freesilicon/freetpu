@@ -5322,6 +5322,16 @@ void test_phase8b_spsc_async_dequant_and_w8a16_pt() {
       CHECK(ob_gemm_matmul_f32_w8a16_tile(
                 ctx, a_r.data(), w_r.data(), sb_r.data(), K_r, N_r, out_r.data(), &rstats) == OB_OK);
       CHECK(std::isfinite(out_r[0]) && std::fabs(out_r[0] - 12.0f) < 1e-2f);
+
+      // Large finite activation energy (>= 1e20f) must preserve FP64 sum-of-squares and outlier peeling.
+      std::vector<float> a_big(256u, 1e18f);
+      a_big[7u] = 2e20f;
+      std::vector<int8_t> aq_big(256u, 0);
+      float sa_big = 0.0f;
+      std::vector<std::pair<uint32_t, float>> outliers_big;
+      ob::quantize_activation_row_split(a_big.data(), 256u, aq_big.data(), &sa_big, &outliers_big);
+      CHECK(outliers_big.size() == 1u && outliers_big[0].first == 7u && outliers_big[0].second == 2e20f);
+      CHECK(aq_big[7u] == 0 && aq_big[0u] == 127);
     }
 
     ob_context_destroy(ctx);
