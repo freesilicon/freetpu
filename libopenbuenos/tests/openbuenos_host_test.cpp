@@ -3988,17 +3988,47 @@ void test_phase7_cycle2_regressions() {
 
     // Cold 9-chunk Qwen2.5 SwiGLU under strict 16 MiB cap must NEVER exceed weight_cache_max_bytes!
     ctx->simulated_mem_available_bytes = 48ULL * 1024u * 1024u;
+    ctx->swiglu_fast_chain_enabled = true;
     constexpr uint32_t K = 1536u, H = 8960u, N = 1536u;
     const uint32_t nb_k = K / OB_QK8_0, nb_h = H / OB_QK8_0;
     std::vector<ob_block_q4_0_t> wg(static_cast<size_t>(H) * nb_k),
         wu(static_cast<size_t>(H) * nb_k), wd(static_cast<size_t>(N) * nb_h);
-    std::memset(wg.data(), 0, wg.size() * sizeof(ob_block_q4_0_t));
-    std::memset(wu.data(), 0, wu.size() * sizeof(ob_block_q4_0_t));
-    std::memset(wd.data(), 0, wd.size() * sizeof(ob_block_q4_0_t));
-    std::vector<float> a(K, 0.1f), c(N, 0.0f);
-    ob_gemm_swiglu_quant_desc_t sd{wg.data(), wu.data(), wd.data(), 1u, K, H, N, 1u, 1u, 1u, 1u};
+    const uint16_t d_q4 = fp32_to_fp16(0.025f);
+    uint32_t lcg = 0x13579BDFu;
+    auto next_nib = [&]() -> uint8_t {
+      // Zero-mean bell-shaped Q4_0 nibble in [2, 14] (signed [-6, +6], crest ~3.2 like real LLM weights).
+      lcg = lcg * 1664525u + 1013904223u;
+      const uint32_t a0 = (lcg >> 24) % 5u;
+      lcg = lcg * 1664525u + 1013904223u;
+      const uint32_t a1 = (lcg >> 24) % 5u;
+      lcg = lcg * 1664525u + 1013904223u;
+      const uint32_t a2 = (lcg >> 24) % 5u;
+      return static_cast<uint8_t>(2u + a0 + a1 + a2);
+    };
+    auto fill_q4 = [&](std::vector<ob_block_q4_0_t>& v) {
+      for (auto& b : v) {
+        b.d = d_q4;
+        for (uint32_t j = 0u; j < sizeof(b.qs); ++j) {
+          b.qs[j] = static_cast<uint8_t>(next_nib() | (next_nib() << 4));
+        }
+      }
+    };
+    fill_q4(wg);
+    fill_q4(wu);
+    fill_q4(wd);
+    // Zero-mean bell-shaped activation row (rms_aq < 40, crest ~3.2) so all 9 chunks take the chained path.
+    std::vector<float> a(K, 0.0f), c(N, 0.0f);
+    for (uint32_t i = 0u; i < K; ++i) {
+      a[i] = (static_cast<float>(next_nib()) - 8.0f) * 0.2f;
+    }
+    ob_gemm_swiglu_quant_desc_t sd{wg.data(), wu.data(), wd.data(), 1u, K, H, N, 1u, 1u, 1u, 0u};
     ob_invoke_stats_t ss{};
     CHECK(ob_gemm_swiglu_f32_quant(ctx, a.data(), &sd, c.data(), &ss) == OB_OK);
+    ob_profile_stats_t pcap{};
+    CHECK(ob_context_get_profile(ctx, &pcap) == OB_OK);
+    CHECK(pcap.swiglu_chunks_chained == 9u);
+    CHECK(pcap.swiglu_fallbacks == 0u);
+    CHECK(ctx->weight_cache_evictions > 0u);
     CHECK(ctx->weight_cache_bytes <= ctx->weight_cache_max_bytes);
     CHECK(ctx->weight_cache_peak_bytes <= ctx->weight_cache_max_bytes);
 
@@ -4038,22 +4068,32 @@ void test_phase7_cycle2_regressions() {
     CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
     CHECK(ob_gemm_register_builtin_emitter(ctx, interp_file.path()) == OB_OK);
     ctx->swiglu_prefill_enabled = true;
+    ctx->swiglu_fast_chain_enabled = true;
 
-    constexpr uint32_t M = 66u, K = 576u, H = 512u, N = 576u; // 64 chained + 2 fallback tail!
+    constexpr uint32_t M = 74u, K = 576u, H = 512u, N = 576u; // 64 chained + 10 M7A fallback tail!
     std::vector<ob_block_q8_0_t> wg(static_cast<size_t>(H) * (K / OB_QK8_0));
     std::vector<ob_block_q8_0_t> wu(static_cast<size_t>(H) * (K / OB_QK8_0));
     std::vector<ob_block_q8_0_t> wd(static_cast<size_t>(N) * (H / OB_QK8_0));
-    for (auto& b : wg) { b.d = fp32_to_fp16(0.01f); std::memset(b.qs, 1, OB_QK8_0); }
-    for (auto& b : wu) { b.d = fp32_to_fp16(0.01f); std::memset(b.qs, 1, OB_QK8_0); }
-    for (auto& b : wd) { b.d = fp32_to_fp16(0.01f); std::memset(b.qs, 1, OB_QK8_0); }
-    std::vector<float> a(static_cast<size_t>(M) * K, 0.05f), c(static_cast<size_t>(M) * N, 0.0f);
+    const uint16_t d_q8 = fp32_to_fp16(0.01f);
+    for (auto& b : wg) { b.d = d_q8; for (uint32_t j = 0u; j < OB_QK8_0; ++j) b.qs[j] = (j & 1u) ? 2 : -2; }
+    for (auto& b : wu) { b.d = d_q8; for (uint32_t j = 0u; j < OB_QK8_0; ++j) b.qs[j] = (j & 1u) ? -2 : 2; }
+    for (auto& b : wd) { b.d = d_q8; for (uint32_t j = 0u; j < OB_QK8_0; ++j) b.qs[j] = (j & 1u) ? 2 : -2; }
+    std::vector<float> a(static_cast<size_t>(M) * K, 0.0f), c(static_cast<size_t>(M) * N, 0.0f);
+    for (uint32_t r = 0u; r < M; ++r) {
+      for (uint32_t ki = 0u; ki < K; ++ki) {
+        a[static_cast<size_t>(r) * K + ki] =
+            ((ki & 15u) == 0u) ? ((ki & 16u) ? 0.5f : -0.5f) : ((ki & 1u) ? 0.05f : -0.05f);
+      }
+    }
     ob_gemm_swiglu_quant_desc_t sd{wg.data(), wu.data(), wd.data(), M, K, H, N, 0u, 0u, 0u, 0u};
     ob_invoke_stats_t st{};
     CHECK(ob_gemm_swiglu_f32_quant(ctx, a.data(), &sd, c.data(), &st) == OB_OK);
     ob_profile_stats_t ps{};
     CHECK(ob_context_get_profile(ctx, &ps) == OB_OK);
-    // Notice mock_mode HW_US is 0 or fallback hw; crucially ps.hw_us == st.hw_execution_us (not 2x fallback!)
-    CHECK(ps.swiglu_fallbacks >= 1u);
+    // Verify BOTH paths executed: 64-row chained slice AND 10-row M7A batched fallback tail,
+    // and that ps.hw_us == st.hw_execution_us (no double-counting fallback HW time).
+    CHECK(ps.swiglu_chunks_chained >= 1u);
+    CHECK(ps.swiglu_fallbacks == 1u);
     CHECK(ps.hw_us == st.hw_execution_us);
     CHECK(ps.total_wall_us < 1000000000ULL);
     ob_context_destroy(ctx);

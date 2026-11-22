@@ -435,11 +435,33 @@ static void ggml_backend_edgetpu_buffer_get_tensor(ggml_backend_buffer_t      bu
 static bool ggml_backend_edgetpu_buffer_cpy_tensor(ggml_backend_buffer_t      buffer,
                                                    const struct ggml_tensor * src,
                                                    struct ggml_tensor *       dst) {
+    if (!buffer || !src || !dst || !src->buffer || !dst->data) {
+        return false;
+    }
+    const size_t nbytes = ggml_nbytes(src);
+    if (nbytes != ggml_nbytes(dst)) {
+        return false;
+    }
     if (ggml_backend_buffer_is_host(src->buffer)) {
-        ggml_backend_edgetpu_buffer_set_tensor(buffer, dst, src->data, 0, ggml_nbytes(src));
+        ggml_backend_edgetpu_buffer_set_tensor(buffer, dst, src->data, 0, nbytes);
         return true;
     }
-    return false;
+    auto * ctx = static_cast<ggml_backend_edgetpu_buffer_context *>(buffer->context);
+    if (!ctx) {
+        return false;
+    }
+    // Intercept device-to-EdgeTPU copies here so ggml_backend_tensor_copy() does not
+    // bypass our version bump and packed-weight cache invalidation via raw host writes.
+    ggml_backend_tensor_get(src, dst->data, 0, nbytes);
+    ctx->weight_version.store(next_edgetpu_weight_version(), std::memory_order_release);
+    if (ctx->has_packed_entries.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(ctx->cache_mu);
+        ctx->packed_q8_cache.erase(dst->data);
+        if (ctx->packed_q8_cache.empty()) {
+            ctx->has_packed_entries.store(false, std::memory_order_release);
+        }
+    }
+    return true;
 }
 
 static void ggml_backend_edgetpu_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
@@ -671,10 +693,10 @@ struct ggml_backend_edgetpu_context {
 
 static void ensure_immutable_weight_buffer(ggml_backend_edgetpu_context * ctx,
                                            ggml_backend_buffer_t          buffer) {
-    // EDGETPU buffers are host-accessible (is_host() == true), so ggml_backend_tensor_copy()
-    // from device-only buffers can write directly into dst->data without invoking our buffer
-    // callbacks. Only register immutable O(1) regions when the caller explicitly opts in via
-    // OPENBUENOS_IMMUTABLE_WEIGHTS=1 and the buffer is EdgeTPU-owned weight storage.
+    // EDGETPU buffers are host-accessible (is_host() == true), so raw writes directly to
+    // tensor->data outside ggml buffer callbacks cannot be observed. Only register immutable
+    // O(1) regions when the caller explicitly opts in via OPENBUENOS_IMMUTABLE_WEIGHTS=1 and
+    // the buffer is EdgeTPU-owned weight storage.
     if (!ctx || !ctx->ob_ctx || !ctx->env.immutable_weights || !is_edgetpu_buffer(buffer)) {
         return;
     }
