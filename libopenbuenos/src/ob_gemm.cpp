@@ -504,34 +504,44 @@ inline uint32_t round_pow2_clamped(double val, uint32_t lo, uint32_t hi, double 
 }
 
 void compute_matrix_row_l2_stats(const int8_t* mat, uint32_t rows, uint32_t cols, uint32_t stride,
-                                 float* out_max_l2, float* out_mean_l2) {
+                                 float* out_max_l2, float* out_mean_l2,
+                                 float* out_max_abs_sum = nullptr) {
   double max_l2 = 0.0;
   double sum_l2 = 0.0;
+  double max_abs_sum = 0.0;
   for (uint32_t r = 0u; r < rows; ++r) {
     const int8_t* row = mat + static_cast<size_t>(r) * stride;
     uint64_t sq = 0ULL;
+    int64_t row_sum = 0LL;
     uint32_t c = 0u;
 #if defined(__ARM_NEON) && defined(__aarch64__)
     uint32x4_t v_sq = vdupq_n_u32(0u);
+    int32x4_t v_sum = vdupq_n_s32(0);
     for (; c + 16u <= cols; c += 16u) {
       int8x16_t v = vld1q_s8(row + c);
       int16x8_t lo = vmull_s8(vget_low_s8(v), vget_low_s8(v));
       int16x8_t hi = vmull_high_s8(v, v);
       v_sq = vpadalq_u16(v_sq, vreinterpretq_u16_s16(lo));
       v_sq = vpadalq_u16(v_sq, vreinterpretq_u16_s16(hi));
+      v_sum = vaddq_s32(v_sum, vpaddlq_s16(vpaddlq_s8(v)));
     }
     sq = static_cast<uint64_t>(vaddvq_u32(v_sq));
+    row_sum = static_cast<int64_t>(vaddvq_s32(v_sum));
 #endif
     for (; c < cols; ++c) {
       const int32_t v = static_cast<int32_t>(row[c]);
       sq += static_cast<uint64_t>(v * v);
+      row_sum += static_cast<int64_t>(v);
     }
     const double l2 = std::sqrt(static_cast<double>(sq));
+    const double abs_sum = std::fabs(static_cast<double>(row_sum));
     if (l2 > max_l2) max_l2 = l2;
+    if (abs_sum > max_abs_sum) max_abs_sum = abs_sum;
     sum_l2 += l2;
   }
   *out_max_l2 = static_cast<float>(max_l2);
   *out_mean_l2 = (rows > 0u) ? static_cast<float>(sum_l2 / static_cast<double>(rows)) : 0.0f;
+  if (out_max_abs_sum) *out_max_abs_sum = static_cast<float>(max_abs_sum);
 }
 
 void compute_swiglu_stage_dividers_impl(uint32_t m_dim,
@@ -555,8 +565,10 @@ void compute_swiglu_stage_dividers_impl(uint32_t m_dim,
     ra = 11.0;
   } else if (rms_a < 30.0f) {
     ra = 24.0;
-  } else {
+  } else if (rms_a <= 42.0f) {
     ra = 36.0;
+  } else {
+    ra = static_cast<double>(rms_a);
   }
   const double sig_gu = is_batched ? 4.0 : 3.65;
   const uint32_t d_gate = round_pow2_clamped((sig_gu * ra * static_cast<double>(l2_g_max)) / 127.0, 64u, 65536u, 1.42);
@@ -3634,6 +3646,7 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
     bool transient_m1_outlier = false;
     float batch_amax = 0.0f;
     double max_row_rms = 0.0;
+    double max_row_abs_mean = 0.0;
     if (!need_fallback) {
       float min_row_amax = 1e30f;
       float max_row_crest = 0.0f;
@@ -3641,10 +3654,12 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
         const float* a_row = a_slice + static_cast<size_t>(mi) * K;
         float r_amax = 0.0f;
         double r_sq = 0.0;
+        double r_sum = 0.0;
         uint32_t ki = 0u;
 #if defined(__ARM_NEON) && defined(__aarch64__)
         float32x4_t v_am = vdupq_n_f32(0.0f);
         float64x2_t v_sq = vdupq_n_f64(0.0);
+        float64x2_t v_sm = vdupq_n_f64(0.0);
         for (; ki + 4u <= K; ki += 4u) {
           float32x4_t v = vld1q_f32(a_row + ki);
           v_am = vmaxq_f32(v_am, vabsq_f32(v));
@@ -3652,21 +3667,26 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
           float64x2_t hi = vcvt_high_f64_f32(v);
           v_sq = vfmaq_f64(v_sq, lo, lo);
           v_sq = vfmaq_f64(v_sq, hi, hi);
+          v_sm = vaddq_f64(v_sm, vaddq_f64(lo, hi));
         }
         r_amax = vmaxvq_f32(v_am);
         r_sq = vaddvq_f64(v_sq);
+        r_sum = vaddvq_f64(v_sm);
 #endif
         for (; ki < K; ++ki) {
           float v = a_row[ki];
           float av = std::fabs(v);
           if (av > r_amax) r_amax = av;
           r_sq += static_cast<double>(v) * static_cast<double>(v);
+          r_sum += static_cast<double>(v);
         }
         if (r_amax > batch_amax) batch_amax = r_amax;
         if (r_amax > 0.0f && r_amax < min_row_amax) min_row_amax = r_amax;
         if (r_amax > 0.0f) {
           double rms = std::sqrt(r_sq / static_cast<double>(K));
           if (rms > max_row_rms) max_row_rms = rms;
+          double abs_mean = std::fabs(r_sum) / static_cast<double>(K);
+          if (abs_mean > max_row_abs_mean) max_row_abs_mean = abs_mean;
           float crest = static_cast<float>(static_cast<double>(r_amax) / std::max(rms, 1e-12));
           if (crest > max_row_crest) max_row_crest = crest;
         }
@@ -4038,13 +4058,30 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
             }
           }
 
-          //   d) Record per-stage L2 weight norms once for runtime RMS-calibrated PoT dividers!
-          float l2_g_max = 0.0f, l2_g_mean = 0.0f;
-          float l2_u_max = 0.0f, l2_u_mean = 0.0f;
+          //   d) Record per-stage L2 & DC-sum weight norms once for runtime RMS-calibrated PoT dividers!
+          float l2_g_max = 0.0f, l2_g_mean = 0.0f, dc_g_max = 0.0f;
+          float l2_u_max = 0.0f, l2_u_mean = 0.0f, dc_u_max = 0.0f;
           float l2_d_max = 0.0f, l2_d_mean = 0.0f;
-          ob::compute_matrix_row_l2_stats(wg_q.data(), th, K, K, &l2_g_max, &l2_g_mean);
-          ob::compute_matrix_row_l2_stats(wu_q.data(), th, K, K, &l2_u_max, &l2_u_mean);
+          ob::compute_matrix_row_l2_stats(wg_q.data(), th, K, K, &l2_g_max, &l2_g_mean, &dc_g_max);
+          ob::compute_matrix_row_l2_stats(wu_q.data(), th, K, K, &l2_u_max, &l2_u_mean, &dc_u_max);
           ob::compute_matrix_row_l2_stats(wd_q.data(), N, th, hw_h, &l2_d_max, &l2_d_mean);
+
+          // Reject statistically non-zero-mean gate/up weight tiles where correlated inputs
+          // could saturate intermediate INT8 stages silently despite unsaturated down output.
+          if ((l2_g_max > 0.0f && dc_g_max > 5.5f * l2_g_max) ||
+              (l2_u_max > 0.0f && dc_u_max > 5.5f * l2_u_max)) {
+            ob::CachedWeightTile* sentinel = new (std::nothrow) ob::CachedWeightTile();
+            if (sentinel) {
+              sentinel->key = wh;
+              sentinel->ext2_bytes = 0u;
+              sentinel->rejected_swiglu = true;
+              ob::weight_cache_insert_locked(ctx, sentinel);
+            }
+            if (prof_on) ctx->prof.weight_pack_ns += (ob::monotonic_now_ns() - tp0);
+            drain_all_cleanup();
+            slice_rejected = true;
+            break;
+          }
 
           std::vector<uint8_t> ext2 = ob::pack_ext2_for_swiglu(
               ms.hw_m, K, hw_h, N,
@@ -4081,7 +4118,42 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
           w_tile->swiglu_l2_up_max = l2_u_max;
           w_tile->swiglu_l2_up_mean = l2_u_mean;
           w_tile->swiglu_l2_down_max = l2_d_max;
+          w_tile->swiglu_dc_gate_max = dc_g_max;
+          w_tile->swiglu_dc_up_max = dc_u_max;
           ob::weight_cache_insert_locked(ctx, w_tile);
+        }
+
+        const float rms_aq = static_cast<float>(max_row_rms / static_cast<double>(s_a));
+        uint32_t d_gate = 0u, d_up = 0u, d_mul = 0u, d_down = 0u;
+        ob::compute_swiglu_stage_dividers(
+            ms.tm, rms_aq,
+            w_tile->swiglu_l2_gate_max, w_tile->swiglu_l2_gate_mean,
+            w_tile->swiglu_l2_up_max, w_tile->swiglu_l2_up_mean,
+            w_tile->swiglu_l2_down_max,
+            &d_gate, &d_up, &d_mul, &d_down);
+
+        // Guard against silent intermediate INT8 clipping in gate/up projections on correlated
+        // or low-crest dense activations before submitting any VII chunks.
+        {
+          const double mean_aq = max_row_abs_mean / static_cast<double>(s_a);
+          const double std_aq = std::sqrt(std::max(
+              0.0, static_cast<double>(rms_aq) * static_cast<double>(rms_aq) - mean_aq * mean_aq));
+          const double sig_gu = (ms.tm > 1u) ? 4.0 : 3.65;
+          const double dc_gate_term = mean_aq * static_cast<double>(w_tile->swiglu_dc_gate_max);
+          const double dc_up_term = mean_aq * static_cast<double>(w_tile->swiglu_dc_up_max);
+          const double est_gate =
+              dc_gate_term + sig_gu * std_aq * static_cast<double>(w_tile->swiglu_l2_gate_max);
+          const double est_up =
+              dc_up_term + sig_gu * std_aq * static_cast<double>(w_tile->swiglu_l2_up_max);
+          if (rms_aq > 56.0f ||
+              dc_gate_term > 64.0 * static_cast<double>(d_gate) ||
+              dc_up_term > 64.0 * static_cast<double>(d_up) ||
+              est_gate > 250.0 * static_cast<double>(d_gate) ||
+              est_up > 250.0 * static_cast<double>(d_up)) {
+            drain_all_cleanup();
+            slice_rejected = true;
+            break;
+          }
         }
 
         if (ring_count >= ring_depth) {
@@ -4092,15 +4164,6 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
           }
         }
         const uint32_t slot = (ring_head + ring_count) % ring_depth;
-
-        const float rms_aq = static_cast<float>(max_row_rms / static_cast<double>(s_a));
-        uint32_t d_gate = 0u, d_up = 0u, d_mul = 0u, d_down = 0u;
-        ob::compute_swiglu_stage_dividers(
-            ms.tm, rms_aq,
-            w_tile->swiglu_l2_gate_max, w_tile->swiglu_l2_gate_mean,
-            w_tile->swiglu_l2_up_max, w_tile->swiglu_l2_up_mean,
-            w_tile->swiglu_l2_down_max,
-            &d_gate, &d_up, &d_mul, &d_down);
         const float s_gate = s_a * w_tile->swiglu_s_wg * static_cast<float>(d_gate);
         const uint64_t gkey = ob::hash_swiglu_graph_key(
             ms.hw_m, K, hw_h, N, d_gate, d_up, d_mul, d_down,

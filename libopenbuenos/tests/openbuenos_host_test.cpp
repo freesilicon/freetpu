@@ -3791,6 +3791,80 @@ void test_phase7b_swiglu_chaining_2tier_and_outlier_cache() {
     ::unsetenv("OPENBUENOS_DISABLE_SWIGLU_CHAIN");
   }
 
+  // Verify correlated gate/up intermediate-clipping regression (A=1, d=1/8192, qs=64)
+  // AND alternating +/-1 dense activation route cleanly through M7A fallback without silent clipping.
+  {
+    ob_config_t gcfg = ob_config_default();
+    gcfg.mock_mode = 1;
+    ob_context_t* gctx = nullptr;
+    CHECK(ob_context_create(&gcfg, &gctx) == OB_OK);
+    CHECK(ob_gemm_register_builtin_emitter(gctx, interp_file.path()) == OB_OK);
+
+    constexpr uint32_t K = 576u, H = 1536u, N = 576u;
+    const uint32_t nb_k = K / OB_QK8_0;
+    const uint32_t nb_h = H / OB_QK8_0;
+    std::vector<ob_block_q8_0_t> wg_c(static_cast<size_t>(H) * nb_k);
+    std::vector<ob_block_q8_0_t> wu_c(static_cast<size_t>(H) * nb_k);
+    std::vector<ob_block_q8_0_t> wd_c(static_cast<size_t>(N) * nb_h);
+    const uint16_t d_1_8192 = fp32_to_fp16(1.0f / 8192.0f);
+    for (auto& b : wg_c) {
+      b.d = d_1_8192;
+      std::memset(b.qs, 64, OB_QK8_0);
+    }
+    for (auto& b : wu_c) {
+      b.d = d_1_8192;
+      std::memset(b.qs, 64, OB_QK8_0);
+    }
+    const uint16_t d_one = fp32_to_fp16(1.0f);
+    for (auto& b : wd_c) {
+      b.d = 0u;
+      std::memset(b.qs, 0, OB_QK8_0);
+    }
+    // W_down row 0 selects hidden channel 0 with weight 1.0 (unsaturated output).
+    wd_c[0].d = d_one;
+    wd_c[0].qs[0] = 1;
+
+    std::vector<float> a_ones(K, 1.0f);
+    std::vector<float> c_corr(N, 0.0f);
+    ob_gemm_swiglu_quant_desc_t sd_c{
+        wg_c.data(), wu_c.data(), wd_c.data(), 1u, K, H, N, 0u, 0u, 0u, 0u};
+    ob_invoke_stats_t st_c{};
+    CHECK(ob_gemm_swiglu_f32_quant(gctx, a_ones.data(), &sd_c, c_corr.data(), &st_c) == OB_OK);
+    ob_profile_stats_t gp{};
+    CHECK(ob_context_get_profile(gctx, &gp) == OB_OK);
+    CHECK(gp.swiglu_fallbacks == 1u);
+    CHECK(gp.swiglu_chunks_chained == 0u);
+    const float gate_exact = 4.5f;
+    const float expected_y0 = (gate_exact / (1.0f + std::exp(-gate_exact))) * gate_exact;
+    CHECK(std::fabs(c_corr[0] - expected_y0) < 1e-2f);
+
+    // Alternating +/-1 dense activation with balanced weight rows (crest=1, rms_aq=127):
+    // must also bypass chaining via the rms_aq > 56 guard rather than under-scaling.
+    for (uint32_t h = 0u; h < H; ++h) {
+      for (uint32_t bk = 0u; bk < nb_k; ++bk) {
+        wg_c[static_cast<size_t>(h) * nb_k + bk].d = d_1_8192;
+        wu_c[static_cast<size_t>(h) * nb_k + bk].d = d_1_8192;
+        for (uint32_t j = 0u; j < OB_QK8_0; ++j) {
+          int8_t v = (j & 1u) ? -64 : 64;
+          wg_c[static_cast<size_t>(h) * nb_k + bk].qs[j] = v;
+          wu_c[static_cast<size_t>(h) * nb_k + bk].qs[j] = v;
+        }
+      }
+    }
+    std::vector<float> a_alt(K, 1.0f);
+    for (uint32_t k = 0u; k < K; ++k) {
+      a_alt[k] = (k & 1u) ? -1.0f : 1.0f;
+    }
+    std::vector<float> c_alt(N, 0.0f);
+    CHECK(ob_gemm_swiglu_f32_quant(gctx, a_alt.data(), &sd_c, c_alt.data(), &st_c) == OB_OK);
+    CHECK(ob_context_get_profile(gctx, &gp) == OB_OK);
+    CHECK(gp.swiglu_fallbacks == 2u);
+    CHECK(gp.swiglu_chunks_chained == 0u);
+    CHECK(std::fabs(c_alt[0] - expected_y0) < 1e-2f);
+
+    ob_context_destroy(gctx);
+  }
+
   std::printf("[PASS] test_phase7b_swiglu_chaining_2tier_and_outlier_cache (6/6 offline SwiGLU synth + SmolLM2 1-VII & Qwen 9-VII + HW-sim NMSE<2.5e-3 + 2-tier 4KiB + fallbacks OK%s)\n",
               ran_corpus_parity ? " + 5/5 BIT-EXACT external corpus parity" : "; external 5-probe parity skipped without OPENBUENOS_CORPUS_DIR");
 }

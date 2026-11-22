@@ -225,6 +225,8 @@ struct CachedWeightTile {
   float swiglu_l2_up_max = 0.0f;
   float swiglu_l2_up_mean = 0.0f;
   float swiglu_l2_down_max = 0.0f;
+  float swiglu_dc_gate_max = 0.0f;
+  float swiglu_dc_up_max = 0.0f;
   uint32_t swiglu_d_gate = 0;
   uint32_t swiglu_d_up = 0;
   uint32_t swiglu_d_mul = 0;

@@ -1790,9 +1790,35 @@ static int try_compute_fused_swiglu(ggml_backend_edgetpu_context * ctx,
         return 0;
     }
 
-    // Ensure no intermediate tensor is a graph output or consumed by any later node in this split.
-    for (int k = 0; k < n_inter; ++k) {
-        if ((inter[k]->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
+    // Ensure no intermediate tensor is a graph output or consumed outside [start_idx, end_idx].
+    // Checking cgraph->use_counts catches consumers in later backend splits that are absent
+    // from this split's cgraph->nodes.
+    if (!cgraph->use_counts || cgraph->visited_hash_set.size == 0 ||
+        !cgraph->visited_hash_set.used || !cgraph->visited_hash_set.keys) {
+        return 0;
+    }
+    for (int k = start_idx; k < end_idx; ++k) {
+        const struct ggml_tensor * t = cgraph->nodes[k];
+        if (!t || (t->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
+            return 0;
+        }
+        const size_t hpos = ggml_hash_find(&cgraph->visited_hash_set, t);
+        if (hpos == GGML_HASHSET_FULL || !ggml_bitset_get(cgraph->visited_hash_set.used, hpos)) {
+            return 0;
+        }
+        int32_t internal_uses = 0;
+        for (int j = start_idx; j <= end_idx; ++j) {
+            const struct ggml_tensor * consumer = cgraph->nodes[j];
+            if (!consumer) {
+                continue;
+            }
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                if (consumer->src[s] == t) {
+                    internal_uses++;
+                }
+            }
+        }
+        if (internal_uses <= 0 || cgraph->use_counts[hpos] != internal_uses) {
             return 0;
         }
     }
