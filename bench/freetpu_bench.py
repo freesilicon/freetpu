@@ -1,0 +1,1519 @@
+#!/usr/bin/env python3
+"""
+freetpu-bench: Unified cross-TPU microbenchmark suite and scorecard generator.
+
+Inspired by NVIDIA's nvbench, nvbandwidth, nccl-tests, and dgx-spark-playbooks,
+adapted for Pixel Tensor G5 (buenos_a0), Cloud TPU (v5e-1 / v6e-1), and GPU
+comparison scorecards.
+
+Suites:
+  - compute   (nvbench-style): BF16 / INT8 / W8A16 GEMM, fused GEMM+SiLU,
+              and small-op dispatch floor sweep.
+  - bandwidth (nvbandwidth-style): HBM2e / LPDDR triad streaming bandwidth (GB/s)
+              and host<->device transfer latency (us).
+  - comms     (nccl-tests-style): Activation-hop latency (us) and throughput
+              (GB/s) across 16 KB..4 MB PP/MoE payloads over TCP/USB-Ethernet.
+
+Backends:
+  - cpu         : Local NumPy reference execution.
+  - buenos_mock : Local Tensor G5 (buenos_a0) mock modeling 4x4 serpentine tiling,
+                  FP32-RNE INT8 requantization, 1:2 u8->BF16 W8A16 dequant, and
+                  0x640 Mode-A SiLU spline parity.
+  - jax_tpu     : Direct JAX/XLA execution on Cloud TPU (or JAX device).
+  - colab_tpu   : Headless Google Colab TPU runner via `colab` CLI with isolated
+                  `--config` state and automatic v6e1 -> v5e1 capacity fallback.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import platform
+import re
+import shutil
+import socket
+import statistics
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover
+    np = None  # type: ignore[assignment]
+
+SCHEMA_VERSION = "freetpu.bench.v1"
+BENCH_JSON_BEGIN = "=== FREETPU_BENCH_JSON_BEGIN ==="
+BENCH_JSON_END = "=== FREETPU_BENCH_JSON_END ==="
+
+VALID_SUITES = ("compute", "bandwidth", "comms")
+VALID_BACKENDS = ("cpu", "buenos_mock", "jax_tpu", "colab_tpu")
+
+_ALLOCATION_ERROR_MARKERS = (
+    "allocation refused",
+    "backend rejected accelerator",
+    "toomanyassignmentserror",
+    "failed_precondition",
+    "precondition failed",
+    "reason_no_backends",
+    "reason_too_many_active_assignments",
+    "reason_quota_exceeded_usage_time",
+    "reason_runtime_version_unavailable",
+    "quota or entitlement",
+    "too many active sessions",
+    "no backends",
+    "read timed out",
+    "readtimeout",
+    "503",
+)
+
+
+@dataclass(frozen=True)
+class ReferenceBaseline:
+    target_id: str
+    display_name: str
+    status: str  # Always "published-reference" for reference table rows
+    memory_spec: str
+    peak_bf16_tflops: Optional[float]
+    peak_int8_tops: Optional[float]
+    measured_bf16_tflops: Optional[float]
+    measured_int8_tops: Optional[float]
+    bandwidth_gbps: float
+    bandwidth_basis: str
+    dispatch_floor_us: str
+    hourly_cost_usd: float
+    pricing_basis: str
+    source_citation: str
+    verified_decode_tok_s: Optional[float] = None
+    verified_decode_label: Optional[str] = None
+
+
+PUBLISHED_BASELINES: Tuple[ReferenceBaseline, ...] = (
+    ReferenceBaseline(
+        target_id="pixel_tensor_g5",
+        display_name="Pixel Tensor G5 (buenos_a0)",
+        status="published-reference",
+        memory_spec="15.6 GiB LPDDR (unified)",
+        peak_bf16_tflops=None,
+        peak_int8_tops=None,
+        measured_bf16_tflops=None,
+        measured_int8_tops=0.993,
+        bandwidth_gbps=27.96,
+        bandwidth_basis="measured weight DMA (1x2048x2048 @ 150 us)",
+        dispatch_floor_us="60.8-150 us hw (395 us wall)",
+        hourly_cost_usd=0.05,
+        pricing_basis="$1,299 Pixel 10 Pro amortized 3yr 24/7 ($0.049/hr) + $0.001/hr power (~5W); $0 cloud bill",
+        source_citation="FreeTPU Phase 6 Report & buenos_a0 silicon probes (W8A16 BF16 1x64x32 = 411-426 us hw)",
+        verified_decode_tok_s=5.85,
+        verified_decode_label="Qwen2.5-1.5B-Q8_0 (tg64)",
+    ),
+    ReferenceBaseline(
+        target_id="cloud_tpu_v5e_1",
+        display_name="Cloud TPU v5e-1",
+        status="published-reference",
+        memory_spec="16 GB HBM2e",
+        peak_bf16_tflops=197.0,
+        peak_int8_tops=394.0,
+        measured_bf16_tflops=179.36,
+        measured_int8_tops=350.69,
+        bandwidth_gbps=655.55,
+        bandwidth_basis="measured triad BW (80.0% of 819 GB/s peak)",
+        dispatch_floor_us="117.6-135.0 us sync (32 us pipelined)",
+        hourly_cost_usd=1.20,
+        pricing_basis="Google Cloud TPU v5e public on-demand (us-central1/us-east5/us-west1: $1.20/chip-hr)",
+        source_citation="Google Cloud TPU v5e spec + FreeTPU Track B live v5e-1 silicon run",
+        verified_decode_tok_s=97.53,
+        verified_decode_label="Llama-3-8B W8A16 (B=1)",
+    ),
+    ReferenceBaseline(
+        target_id="cloud_tpu_v6e_1",
+        display_name="Cloud TPU v6e-1 (Trillium)",
+        status="published-reference",
+        memory_spec="32 GB HBM2e",
+        peak_bf16_tflops=918.0,
+        peak_int8_tops=1836.0,
+        measured_bf16_tflops=None,
+        measured_int8_tops=None,
+        bandwidth_gbps=1638.0,
+        bandwidth_basis="published peak HBM bandwidth (1,638 GB/s)",
+        dispatch_floor_us="~100 us PJRT est.",
+        hourly_cost_usd=2.70,
+        pricing_basis="Google Cloud TPU v6e public on-demand (us-east1/us-east5: $2.70/chip-hr)",
+        source_citation="Google Cloud TPU v6e (Trillium) public architecture & pricing docs",
+        verified_decode_tok_s=None,
+        verified_decode_label=None,
+    ),
+    ReferenceBaseline(
+        target_id="nvidia_h100_sxm",
+        display_name="NVIDIA H100 SXM",
+        status="published-reference",
+        memory_spec="80 GB HBM3",
+        peak_bf16_tflops=989.0,
+        peak_int8_tops=1979.0,
+        measured_bf16_tflops=None,
+        measured_int8_tops=None,
+        bandwidth_gbps=3350.0,
+        bandwidth_basis="published peak HBM3 bandwidth (3,350 GB/s)",
+        dispatch_floor_us="~5-15 us CUDA/Graph",
+        hourly_cost_usd=3.49,
+        pricing_basis="Specialized GPU cloud on-demand ($3.49/GPU-hr reference; hyperscaler 8-GPU VMs ~$7-11/GPU-hr)",
+        source_citation="NVIDIA H100 SXM datasheet (dense Tensor Core, non-sparse) & public cloud rates",
+        verified_decode_tok_s=None,
+        verified_decode_label=None,
+    ),
+    ReferenceBaseline(
+        target_id="nvidia_rtx_5090",
+        display_name="NVIDIA RTX 5090",
+        status="published-reference",
+        memory_spec="32 GB GDDR7",
+        peak_bf16_tflops=419.0,
+        peak_int8_tops=838.0,
+        measured_bf16_tflops=None,
+        measured_int8_tops=None,
+        bandwidth_gbps=1792.0,
+        bandwidth_basis="published peak GDDR7 bandwidth (1,792 GB/s)",
+        dispatch_floor_us="~5-15 us CUDA/Graph",
+        hourly_cost_usd=0.50,
+        pricing_basis="Specialized community GPU cloud ($0.50/GPU-hr midpoint of $0.32-$0.80/hr; $1,999 FE MSRP ~$0.20/hr self-hosted)",
+        source_citation="NVIDIA Blackwell RTX 5090 spec (dense Tensor Core) & public community cloud pricing",
+        verified_decode_tok_s=None,
+        verified_decode_label=None,
+    ),
+)
+
+
+def parse_suites(raw: str) -> List[str]:
+    parts = [p.strip().lower() for p in raw.split(",") if p.strip()]
+    if not parts:
+        raise ValueError("Empty --suite specification")
+    if "all" in parts:
+        return list(VALID_SUITES)
+    out: List[str] = []
+    for p in parts:
+        if p not in VALID_SUITES:
+            raise ValueError(f"Unknown suite {p!r}; expected one of {VALID_SUITES} or 'all'")
+        if p not in out:
+            out.append(p)
+    return out
+
+
+def _require_numpy() -> Any:
+    if np is None:
+        raise RuntimeError("NumPy is required for freetpu_bench.py (`pip install numpy` or `apt install python3-numpy`).")
+    return np
+
+
+def _stats_summary(samples_us: Sequence[float]) -> Dict[str, float]:
+    ordered = sorted(float(x) for x in samples_us)
+    if not ordered:
+        return {"min_us": 0.0, "median_us": 0.0, "p95_us": 0.0, "max_us": 0.0}
+    p95_idx = min(len(ordered) - 1, max(0, int(math.ceil(0.95 * len(ordered))) - 1))
+    return {
+        "min_us": round(ordered[0], 3),
+        "median_us": round(statistics.median(ordered), 3),
+        "p95_us": round(ordered[p95_idx], 3),
+        "max_us": round(ordered[-1], 3),
+    }
+
+
+def _silu_np(x: Any) -> Any:
+    # Numerically stable SiLU: x * sigmoid(x)
+    x_f32 = x.astype(np.float32, copy=False)
+    pos = x_f32 >= 0
+    z = np.empty_like(x_f32)
+    z[pos] = 1.0 / (1.0 + np.exp(-x_f32[pos]))
+    exp_x = np.exp(x_f32[~pos])
+    z[~pos] = exp_x / (1.0 + exp_x)
+    return x_f32 * z
+
+
+def _buenos_tile_count(m: int, k: int, n: int) -> int:
+    """Compute Tensor G5 4x4 serpentine tile dispatches for an (M, K, N) GEMM."""
+    # Tensor G5 buenos_a0 uses 4x4 PE grid (16 PEs); host runtime pads M to 1 or 64, N to 32.
+    m_tiles = max(1, math.ceil(m / 64))
+    k_tiles = max(1, math.ceil(k / 512))
+    n_tiles = max(1, math.ceil(n / 128))
+    return m_tiles * k_tiles * n_tiles
+
+
+# ---------------------------------------------------------------------------
+# Local CPU / buenos_mock suites
+# ---------------------------------------------------------------------------
+
+
+def run_compute_local(backend: str, quick: bool = False) -> Dict[str, Any]:
+    _require_numpy()
+    rng = np.random.default_rng(42)
+
+    gemm_shapes = (
+        [(1, 64, 32), (16, 128, 128), (64, 512, 512)]
+        if quick
+        else [(1, 64, 32), (16, 128, 128), (1, 576, 1536), (64, 512, 512), (256, 1024, 1024), (512, 1024, 1024)]
+    )
+    warmup = 2 if quick else 3
+    iters = 4 if quick else 8
+
+    cases: List[Dict[str, Any]] = []
+    for m, k, n in gemm_shapes:
+        flops = 2.0 * m * k * n
+
+        # 1. FP32/BF16-emulated GEMM
+        a_f = rng.standard_normal((m, k), dtype=np.float32)
+        b_f = rng.standard_normal((k, n), dtype=np.float32)
+        for _ in range(warmup):
+            _ = a_f @ b_f
+        samples_us = []
+        for _ in range(iters):
+            t0 = time.perf_counter_ns()
+            _ = a_f @ b_f
+            samples_us.append((time.perf_counter_ns() - t0) / 1e3)
+        st = _stats_summary(samples_us)
+        med_s = max(st["median_us"] * 1e-6, 1e-9)
+        min_s = max(st["min_us"] * 1e-6, 1e-9)
+        cases.append({
+            "name": "gemm_bf16_ref" if backend == "cpu" else "gemm_bf16_mock",
+            "shape": [m, k, n],
+            "dtype": "bf16_emulated_f32",
+            "unit": "TFLOP/s",
+            "median_perf": round((flops / med_s) / 1e12, 6),
+            "peak_perf": round((flops / min_s) / 1e12, 6),
+            "tiles": _buenos_tile_count(m, k, n) if backend == "buenos_mock" else None,
+            **st,
+        })
+
+        # 2. INT8 GEMM (FP32-RNE requantization on buenos_mock)
+        a_i8 = rng.integers(-64, 64, size=(m, k), dtype=np.int8)
+        b_i8 = rng.integers(-64, 64, size=(k, n), dtype=np.int8)
+        scale = np.float32(1.0 / max(1, k))
+        for _ in range(warmup):
+            acc = a_i8.astype(np.int32) @ b_i8.astype(np.int32)
+            if backend == "buenos_mock":
+                _ = np.clip(np.rint(acc.astype(np.float32) * scale), -128, 127).astype(np.int8)
+        samples_us = []
+        for _ in range(iters):
+            t0 = time.perf_counter_ns()
+            acc = a_i8.astype(np.int32) @ b_i8.astype(np.int32)
+            if backend == "buenos_mock":
+                _ = np.clip(np.rint(acc.astype(np.float32) * scale), -128, 127).astype(np.int8)
+            samples_us.append((time.perf_counter_ns() - t0) / 1e3)
+        st = _stats_summary(samples_us)
+        med_s = max(st["median_us"] * 1e-6, 1e-9)
+        min_s = max(st["min_us"] * 1e-6, 1e-9)
+        cases.append({
+            "name": "gemm_int8",
+            "shape": [m, k, n],
+            "dtype": "int8",
+            "unit": "TOPS",
+            "median_perf": round((flops / med_s) / 1e12, 6),
+            "peak_perf": round((flops / min_s) / 1e12, 6),
+            "tiles": _buenos_tile_count(m, k, n) if backend == "buenos_mock" else None,
+            **st,
+        })
+
+    # 3. W8A16 (u8 + zp=128 -> f32 + per-channel scale) + Fused BF16-ref GEMM+SiLU
+    m, k, n = gemm_shapes[-1]
+    flops = 2.0 * m * k * n
+    a_w8 = rng.standard_normal((m, k), dtype=np.float32)
+    b_f_last = rng.standard_normal((k, n), dtype=np.float32)
+    w_u8 = rng.integers(0, 255, size=(k, n), dtype=np.uint8)
+    w_scale = rng.uniform(0.005, 0.02, size=(1, n)).astype(np.float32)
+    for _ in range(warmup):
+        w_deq = (w_u8.astype(np.float32) - np.float32(128.0)) * w_scale
+        _ = a_w8 @ w_deq
+        _ = _silu_np(a_w8 @ b_f_last)
+    samples_w8 = []
+    samples_fused = []
+    for _ in range(iters):
+        t0 = time.perf_counter_ns()
+        w_deq = (w_u8.astype(np.float32) - np.float32(128.0)) * w_scale
+        _ = a_w8 @ w_deq
+        samples_w8.append((time.perf_counter_ns() - t0) / 1e3)
+
+        t1 = time.perf_counter_ns()
+        _ = _silu_np(a_w8 @ b_f_last)
+        samples_fused.append((time.perf_counter_ns() - t1) / 1e3)
+
+    st_w8 = _stats_summary(samples_w8)
+    st_f = _stats_summary(samples_fused)
+    cases.append({
+        "name": "gemm_w8a16_dequant",
+        "shape": [m, k, n],
+        "dtype": "w8a16",
+        "unit": "TFLOP/s",
+        "median_perf": round((flops / max(st_w8["median_us"] * 1e-6, 1e-9)) / 1e12, 6),
+        "peak_perf": round((flops / max(st_w8["min_us"] * 1e-6, 1e-9)) / 1e12, 6),
+        "tiles": _buenos_tile_count(m, k, n) if backend == "buenos_mock" else None,
+        **st_w8,
+    })
+    cases.append({
+        "name": "fused_gemm_silu",
+        "shape": [m, k, n],
+        "dtype": "bf16_emulated_f32+silu",
+        "unit": "TFLOP/s",
+        "median_perf": round((flops / max(st_f["median_us"] * 1e-6, 1e-9)) / 1e12, 6),
+        "peak_perf": round((flops / max(st_f["min_us"] * 1e-6, 1e-9)) / 1e12, 6),
+        "tiles": _buenos_tile_count(m, k, n) if backend == "buenos_mock" else None,
+        **st_f,
+    })
+
+    # Dispatch floor is the median latency of the smallest 1x64x32 op.
+    floor_cases = [c for c in cases if c["shape"] == [1, 64, 32] and c["name"].startswith("gemm_bf16")]
+    peak_bf16 = max((c["peak_perf"] for c in cases if c["unit"] == "TFLOP/s"), default=0.0)
+    peak_int8 = max((c["peak_perf"] for c in cases if c["unit"] == "TOPS"), default=0.0)
+    return {
+        "status": "measured",
+        "backend": backend,
+        "peak_bf16_tflops": round(peak_bf16, 4),
+        "peak_int8_tops": round(peak_int8, 4),
+        "dispatch_floor_us": floor_cases[0]["median_us"] if floor_cases else None,
+        "cases": cases,
+    }
+
+
+def run_bandwidth_local(backend: str, quick: bool = False) -> Dict[str, Any]:
+    _require_numpy()
+    sizes_mb = [2, 8] if quick else [4, 16, 64]
+    iters = 3 if quick else 6
+
+    triad_cases: List[Dict[str, Any]] = []
+    scalar = np.float32(1.618034)
+    for mb in sizes_mb:
+        count = (mb * 1024 * 1024) // 4
+        a = np.ones(count, dtype=np.float32)
+        b = np.full(count, 2.0, dtype=np.float32)
+        c = np.empty(count, dtype=np.float32)
+        # Warmup
+        np.multiply(b, scalar, out=c)
+        np.add(a, c, out=c)
+
+        samples_us = []
+        for _ in range(iters):
+            t0 = time.perf_counter_ns()
+            np.multiply(b, scalar, out=c)
+            np.add(a, c, out=c)
+            samples_us.append((time.perf_counter_ns() - t0) / 1e3)
+
+        total_bytes = count * 4 * 3  # 2 reads + 1 write
+        st = _stats_summary(samples_us)
+        med_gbps = (total_bytes / max(st["median_us"] * 1e-6, 1e-9)) / 1e9
+        peak_gbps = (total_bytes / max(st["min_us"] * 1e-6, 1e-9)) / 1e9
+        triad_cases.append({
+            "name": "triad_fp32",
+            "tensor_bytes": count * 4,
+            "total_traffic_bytes": total_bytes,
+            "median_gbps": round(med_gbps, 3),
+            "peak_gbps": round(peak_gbps, 3),
+            **st,
+        })
+
+    # Host<->Device transfer simulation (aligned copy / staging overhead)
+    transfer_sizes = [4096, 65536] if quick else [4096, 65536, 4 * 1024 * 1024]
+    xfer_cases: List[Dict[str, Any]] = []
+    for nbytes in transfer_sizes:
+        src = np.arange(nbytes // 4, dtype=np.float32)
+        dst = np.empty_like(src)
+        np.copyto(dst, src)
+        samples_us = []
+        for _ in range(iters * 2):
+            t0 = time.perf_counter_ns()
+            np.copyto(dst, src)
+            samples_us.append((time.perf_counter_ns() - t0) / 1e3)
+        st = _stats_summary(samples_us)
+        med_gbps = (nbytes / max(st["median_us"] * 1e-6, 1e-9)) / 1e9
+        xfer_cases.append({
+            "name": "host_stage_copy",
+            "bytes": nbytes,
+            "median_gbps": round(med_gbps, 3),
+            **st,
+        })
+
+    peak_bw = max((c["peak_gbps"] for c in triad_cases), default=0.0)
+    h2d_floor = xfer_cases[0]["median_us"] if xfer_cases else None
+    return {
+        "status": "measured",
+        "backend": backend,
+        "peak_triad_gbps": round(peak_bw, 3),
+        "host_device_floor_us": h2d_floor,
+        "triad_cases": triad_cases,
+        "transfer_cases": xfer_cases,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Comms suite (nccl-tests style activation-hop benchmark)
+# ---------------------------------------------------------------------------
+
+
+def _recv_exact(sock: socket.socket, nbytes: int) -> bytes:
+    buf = bytearray(nbytes)
+    view = memoryview(buf)
+    got = 0
+    while got < nbytes:
+        n = sock.recv_into(view[got:])
+        if n == 0:
+            raise EOFError("Socket closed while reading activation payload")
+        got += n
+    return bytes(buf)
+
+
+def _handle_comms_conn(conn: socket.socket) -> None:
+    try:
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        while True:
+            hdr = conn.recv(8)
+            if not hdr:
+                break
+            if len(hdr) < 8:
+                hdr += _recv_exact(conn, 8 - len(hdr))
+            (size,) = struct.unpack("!Q", hdr)
+            if size == 0:
+                break
+            payload = _recv_exact(conn, size)
+            conn.sendall(hdr + payload)
+    except (OSError, EOFError):
+        pass
+    finally:
+        conn.close()
+
+
+def run_comms_server(bind_host: str, port: int) -> None:
+    """Run a persistent TCP activation-hop echo server for two-node benchmarks."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((bind_host, port))
+    srv.listen(8)
+    actual_port = srv.getsockname()[1]
+    print(f"freetpu-bench comms server listening on {bind_host}:{actual_port}", flush=True)
+    try:
+        while True:
+            conn, _addr = srv.accept()
+            t = threading.Thread(target=_handle_comms_conn, args=(conn,), daemon=True)
+            t.start()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.close()
+
+
+def run_comms_suite(
+    host: str = "127.0.0.1",
+    port: int = 0,
+    quick: bool = False,
+) -> Dict[str, Any]:
+    """Measure PP/MoE activation-hop RTT, 1-way hop latency, and throughput."""
+    payload_sizes = (
+        [16 * 1024, 64 * 1024]
+        if quick
+        else [16 * 1024, 64 * 1024, 256 * 1024, 1024 * 1024, 4 * 1024 * 1024]
+    )
+    iters = 8 if quick else 20
+
+    srv: Optional[socket.socket] = None
+    srv_thread: Optional[threading.Thread] = None
+    transport = "tcp_remote"
+
+    if port == 0:
+        transport = "tcp_loopback"
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind((host, 0))
+        srv.listen(4)
+        port = srv.getsockname()[1]
+
+        def _accept_one() -> None:
+            assert srv is not None
+            conn, _ = srv.accept()
+            _handle_comms_conn(conn)
+
+        srv_thread = threading.Thread(target=_accept_one, daemon=True)
+        srv_thread.start()
+
+    cases: List[Dict[str, Any]] = []
+    try:
+        with socket.create_connection((host, port), timeout=15.0) as cli:
+            cli.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            for size in payload_sizes:
+                msg = struct.pack("!Q", size) + (b"\x5a" * size)
+                expected_len = len(msg)
+                # Warmup
+                for _ in range(2):
+                    cli.sendall(msg)
+                    _ = _recv_exact(cli, expected_len)
+
+                rtt_us: List[float] = []
+                for _ in range(iters):
+                    t0 = time.perf_counter_ns()
+                    cli.sendall(msg)
+                    _ = _recv_exact(cli, expected_len)
+                    rtt_us.append((time.perf_counter_ns() - t0) / 1e3)
+
+                st_rtt = _stats_summary(rtt_us)
+                one_way_med_us = st_rtt["median_us"] / 2.0
+                # Ping-pong transfers `2 * size` bytes per RTT.
+                bidir_gbps = ((2.0 * size) / max(st_rtt["median_us"] * 1e-6, 1e-9)) / 1e9
+                peak_bidir_gbps = ((2.0 * size) / max(st_rtt["min_us"] * 1e-6, 1e-9)) / 1e9
+                cases.append({
+                    "payload_bytes": size,
+                    "payload_label": f"{size // 1024} KB" if size < 1024 * 1024 else f"{size // (1024 * 1024)} MB",
+                    "one_way_median_us": round(one_way_med_us, 3),
+                    "rtt_min_us": st_rtt["min_us"],
+                    "rtt_median_us": st_rtt["median_us"],
+                    "rtt_p95_us": st_rtt["p95_us"],
+                    "median_gbps": round(bidir_gbps, 3),
+                    "peak_gbps": round(peak_bidir_gbps, 3),
+                })
+            # Clean shutdown signal
+            cli.sendall(struct.pack("!Q", 0))
+    finally:
+        if srv_thread is not None:
+            srv_thread.join(timeout=2.0)
+        if srv is not None:
+            srv.close()
+
+    small_hop = cases[0]["one_way_median_us"] if cases else None
+    peak_gbps = max((c["peak_gbps"] for c in cases), default=0.0)
+    return {
+        "status": "measured",
+        "transport": transport,
+        "target": f"{host}:{port}",
+        "hop_floor_us": small_hop,
+        "peak_gbps": round(peak_gbps, 3),
+        "cases": cases,
+    }
+
+
+# ---------------------------------------------------------------------------
+# JAX / Cloud TPU suite (runs inside Colab or Cloud TPU VM)
+# ---------------------------------------------------------------------------
+
+
+def run_jax_tpu_suites(suites: Sequence[str], quick: bool = False, allow_jax_cpu: bool = False) -> Dict[str, Any]:
+    import jax  # type: ignore
+    import jax.numpy as jnp  # type: ignore
+
+    devices = jax.devices()
+    backend_name = jax.default_backend()
+    if backend_name != "tpu" and not allow_jax_cpu:
+        raise RuntimeError(
+            f"JAX default backend is {backend_name!r}, not 'tpu'. "
+            "Use `--backend colab_tpu` for remote Colab TPU or pass `--allow-jax-cpu`."
+        )
+
+    dev = devices[0]
+    dev_kind = getattr(dev, "device_kind", backend_name)
+    mem_stats = {}
+    try:
+        mem_stats = dev.memory_stats()
+    except Exception:
+        mem_stats = {}
+
+    results: Dict[str, Any] = {
+        "device_info": {
+            "jax_version": getattr(jax, "__version__", "unknown"),
+            "default_backend": backend_name,
+            "device_kind": dev_kind,
+            "device_count": len(devices),
+            "hbm_bytes_limit": mem_stats.get("bytes_limit"),
+        }
+    }
+
+    if "compute" in suites:
+        gemm_shapes = (
+            [(1, 64, 32), (1024, 1024, 1024), (4096, 4096, 4096)]
+            if quick
+            else [
+                (1, 64, 32),
+                (16, 128, 128),
+                (1, 576, 1536),
+                (1024, 1024, 1024),
+                (2048, 2048, 2048),
+                (4096, 4096, 4096),
+                (8192, 8192, 8192),
+            ]
+        )
+        warmup = 3 if quick else 5
+        iters = 10 if quick else 25
+        key = jax.random.PRNGKey(0)
+        cases: List[Dict[str, Any]] = []
+
+        @jax.jit
+        def bf16_mm(x: Any, y: Any) -> Any:
+            return jax.lax.dot_general(
+                x, y, (((1,), (0,)), ((), ())), preferred_element_type=jnp.bfloat16
+            )
+
+        @jax.jit
+        def fused_mm_silu(x: Any, y: Any) -> Any:
+            z = jax.lax.dot_general(
+                x, y, (((1,), (0,)), ((), ())), preferred_element_type=jnp.bfloat16
+            )
+            return z * jax.nn.sigmoid(z)
+
+        @jax.jit
+        def int8_mm(x: Any, y: Any) -> Any:
+            return jax.lax.dot_general(
+                x, y, (((1,), (0,)), ((), ())), preferred_element_type=jnp.int32
+            )
+
+        @jax.jit
+        def w8a16_mm(x: Any, w_i8: Any, scale: Any) -> Any:
+            w = w_i8.astype(jnp.bfloat16) * scale
+            return jax.lax.dot_general(
+                x, w, (((1,), (0,)), ((), ())), preferred_element_type=jnp.bfloat16
+            )
+
+        for m, k, n in gemm_shapes:
+            flops = 2.0 * m * k * n
+            a = jax.random.normal(key, (m, k), dtype=jnp.bfloat16)
+            b = jax.random.normal(key, (k, n), dtype=jnp.bfloat16)
+            a.block_until_ready()
+            b.block_until_ready()
+            for _ in range(warmup):
+                bf16_mm(a, b).block_until_ready()
+            samples_us = []
+            for _ in range(iters):
+                t0 = time.perf_counter_ns()
+                bf16_mm(a, b).block_until_ready()
+                samples_us.append((time.perf_counter_ns() - t0) / 1e3)
+            st = _stats_summary(samples_us)
+            cases.append({
+                "name": "gemm_bf16",
+                "shape": [m, k, n],
+                "dtype": "bf16",
+                "unit": "TFLOP/s",
+                "median_perf": round((flops / max(st["median_us"] * 1e-6, 1e-9)) / 1e12, 3),
+                "peak_perf": round((flops / max(st["min_us"] * 1e-6, 1e-9)) / 1e12, 3),
+                **st,
+            })
+            del a, b
+
+        # INT8 + W8A16 + Fused GEMM+SiLU on major shapes
+        major_shapes = [(4096, 4096, 4096)] if quick else [(4096, 4096, 4096), (8192, 8192, 8192)]
+        for m, k, n in major_shapes:
+            flops = 2.0 * m * k * n
+            a_i8 = jax.random.randint(key, (m, k), -127, 127).astype(jnp.int8)
+            b_i8 = jax.random.randint(key, (k, n), -127, 127).astype(jnp.int8)
+            a_i8.block_until_ready()
+            b_i8.block_until_ready()
+            for _ in range(warmup):
+                int8_mm(a_i8, b_i8).block_until_ready()
+            samples_us = []
+            for _ in range(iters):
+                t0 = time.perf_counter_ns()
+                int8_mm(a_i8, b_i8).block_until_ready()
+                samples_us.append((time.perf_counter_ns() - t0) / 1e3)
+            st = _stats_summary(samples_us)
+            cases.append({
+                "name": "gemm_int8",
+                "shape": [m, k, n],
+                "dtype": "int8",
+                "unit": "TOPS",
+                "median_perf": round((flops / max(st["median_us"] * 1e-6, 1e-9)) / 1e12, 3),
+                "peak_perf": round((flops / max(st["min_us"] * 1e-6, 1e-9)) / 1e12, 3),
+                **st,
+            })
+            del a_i8, b_i8
+
+        # Fused GEMM + SiLU & W8A16 on 4096^3
+        m, k, n = 4096, 4096, 4096
+        flops = 2.0 * m * k * n
+        a_bf = jax.random.normal(key, (m, k), dtype=jnp.bfloat16)
+        b_bf = jax.random.normal(key, (k, n), dtype=jnp.bfloat16)
+        w_i8 = jax.random.randint(key, (k, n), -127, 127).astype(jnp.int8)
+        scale = jnp.ones((1, n), dtype=jnp.bfloat16) * jnp.bfloat16(0.01)
+        a_bf.block_until_ready()
+        b_bf.block_until_ready()
+        w_i8.block_until_ready()
+        scale.block_until_ready()
+        for _ in range(warmup):
+            fused_mm_silu(a_bf, b_bf).block_until_ready()
+            w8a16_mm(a_bf, w_i8, scale).block_until_ready()
+        samples_fused, samples_w8 = [], []
+        for _ in range(iters):
+            t0 = time.perf_counter_ns()
+            fused_mm_silu(a_bf, b_bf).block_until_ready()
+            samples_fused.append((time.perf_counter_ns() - t0) / 1e3)
+            t1 = time.perf_counter_ns()
+            w8a16_mm(a_bf, w_i8, scale).block_until_ready()
+            samples_w8.append((time.perf_counter_ns() - t1) / 1e3)
+        st_f = _stats_summary(samples_fused)
+        st_w = _stats_summary(samples_w8)
+        cases.append({
+            "name": "fused_gemm_silu",
+            "shape": [m, k, n],
+            "dtype": "bf16+silu",
+            "unit": "TFLOP/s",
+            "median_perf": round((flops / max(st_f["median_us"] * 1e-6, 1e-9)) / 1e12, 3),
+            "peak_perf": round((flops / max(st_f["min_us"] * 1e-6, 1e-9)) / 1e12, 3),
+            **st_f,
+        })
+        cases.append({
+            "name": "gemm_w8a16",
+            "shape": [m, k, n],
+            "dtype": "w8a16_bf16",
+            "unit": "TFLOP/s",
+            "median_perf": round((flops / max(st_w["median_us"] * 1e-6, 1e-9)) / 1e12, 3),
+            "peak_perf": round((flops / max(st_w["min_us"] * 1e-6, 1e-9)) / 1e12, 3),
+            **st_w,
+        })
+
+        floor_cases = [c for c in cases if c["shape"] == [1, 64, 32]]
+        results["compute"] = {
+            "status": "measured",
+            "backend": "jax_tpu",
+            "peak_bf16_tflops": round(max((c["peak_perf"] for c in cases if c["unit"] == "TFLOP/s"), default=0.0), 3),
+            "peak_int8_tops": round(max((c["peak_perf"] for c in cases if c["unit"] == "TOPS"), default=0.0), 3),
+            "dispatch_floor_us": floor_cases[0]["median_us"] if floor_cases else None,
+            "cases": cases,
+        }
+
+    if "bandwidth" in suites:
+        _require_numpy()
+        key = jax.random.PRNGKey(1)
+        # 64 MB, 256 MB, 1024 MB BF16 tensors (in elements of 2 bytes)
+        sizes_mb = [64, 256] if quick else [64, 256, 1024]
+        warmup = 3 if quick else 5
+        iters = 10 if quick else 20
+
+        @jax.jit
+        def triad(x: Any, y: Any, s: Any) -> Any:
+            return x + s * y
+
+        s_val = jnp.bfloat16(1.618)
+        triad_cases: List[Dict[str, Any]] = []
+        for mb in sizes_mb:
+            elems = (mb * 1024 * 1024) // 2
+            a = jax.random.normal(key, (elems,), dtype=jnp.bfloat16)
+            b = jax.random.normal(key, (elems,), dtype=jnp.bfloat16)
+            a.block_until_ready()
+            b.block_until_ready()
+            for _ in range(warmup):
+                triad(a, b, s_val).block_until_ready()
+            samples_us = []
+            for _ in range(iters):
+                t0 = time.perf_counter_ns()
+                triad(a, b, s_val).block_until_ready()
+                samples_us.append((time.perf_counter_ns() - t0) / 1e3)
+            st = _stats_summary(samples_us)
+            total_bytes = elems * 2 * 3  # 2 reads + 1 write
+            triad_cases.append({
+                "name": "triad_bf16",
+                "tensor_bytes": elems * 2,
+                "total_traffic_bytes": total_bytes,
+                "median_gbps": round((total_bytes / max(st["median_us"] * 1e-6, 1e-9)) / 1e9, 3),
+                "peak_gbps": round((total_bytes / max(st["min_us"] * 1e-6, 1e-9)) / 1e9, 3),
+                **st,
+            })
+            del a, b
+
+        # Host <-> Device transfer overhead
+        xfer_cases: List[Dict[str, Any]] = []
+        for nbytes in ([4096, 4 * 1024 * 1024] if quick else [4096, 65536, 4 * 1024 * 1024]):
+            host_arr = np.ones(nbytes // 2, dtype=np.float16)
+            h2d_samples, d2h_samples = [], []
+            for _ in range(iters):
+                t0 = time.perf_counter_ns()
+                d_arr = jax.device_put(host_arr, dev)
+                d_arr.block_until_ready()
+                h2d_samples.append((time.perf_counter_ns() - t0) / 1e3)
+                t1 = time.perf_counter_ns()
+                _ = np.asarray(d_arr)
+                d2h_samples.append((time.perf_counter_ns() - t1) / 1e3)
+            st_h2d = _stats_summary(h2d_samples)
+            st_d2h = _stats_summary(d2h_samples)
+            xfer_cases.append({
+                "name": "h2d_device_put",
+                "bytes": nbytes,
+                "median_gbps": round((nbytes / max(st_h2d["median_us"] * 1e-6, 1e-9)) / 1e9, 3),
+                **st_h2d,
+            })
+            xfer_cases.append({
+                "name": "d2h_to_host",
+                "bytes": nbytes,
+                "median_gbps": round((nbytes / max(st_d2h["median_us"] * 1e-6, 1e-9)) / 1e9, 3),
+                **st_d2h,
+            })
+
+        results["bandwidth"] = {
+            "status": "measured",
+            "backend": "jax_tpu",
+            "peak_triad_gbps": round(max((c["peak_gbps"] for c in triad_cases), default=0.0), 3),
+            "host_device_floor_us": xfer_cases[0]["median_us"] if xfer_cases else None,
+            "triad_cases": triad_cases,
+            "transfer_cases": xfer_cases,
+        }
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Headless Colab TPU runner (--backend colab_tpu)
+# ---------------------------------------------------------------------------
+
+
+def resolve_colab_bin(explicit: Optional[str]) -> str:
+    if explicit:
+        return explicit
+    found = shutil.which("colab")
+    if found:
+        return found
+    home_bin = Path.home() / ".local" / "bin" / "colab"
+    if home_bin.is_file():
+        return str(home_bin)
+    return "colab"
+
+
+def extract_bench_json(stdout: str) -> Optional[Dict[str, Any]]:
+    pattern = re.compile(
+        re.escape(BENCH_JSON_BEGIN) + r"\s*(.*?)\s*" + re.escape(BENCH_JSON_END),
+        re.DOTALL,
+    )
+    match = pattern.search(stdout)
+    if not match:
+        return None
+    try:
+        parsed = json.loads(match.group(1))
+        return parsed if isinstance(parsed, dict) else {"value": parsed}
+    except json.JSONDecodeError:
+        return None
+
+
+def is_colab_allocation_error(returncode: int, stderr: str) -> bool:
+    if returncode == 0:
+        return False
+    low = stderr.lower()
+    if "[colab] session ready" in low:
+        return False
+    return any(marker in low for marker in _ALLOCATION_ERROR_MARKERS)
+
+
+def build_colab_run_commands(
+    colab_bin: str,
+    auth: str,
+    config_path: Path,
+    tpu_order: Sequence[str],
+    timeout_s: float,
+    remote_suites: Sequence[str],
+    quick: bool,
+    session_base: str,
+    script_path: Path,
+) -> List[Tuple[str, str, List[str]]]:
+    cmds: List[Tuple[str, str, List[str]]] = []
+    suite_arg = ",".join(remote_suites)
+    for idx, tpu in enumerate(tpu_order):
+        sess = f"{session_base}-{tpu}" if idx > 0 else session_base
+        cmd = [
+            colab_bin,
+            "--auth",
+            auth,
+            "--config",
+            str(config_path),
+            "run",
+            "-s",
+            sess,
+            "--tpu",
+            tpu.upper(),
+            "--timeout",
+            str(timeout_s),
+            str(script_path),
+            "--suite",
+            suite_arg,
+            "--backend",
+            "jax_tpu",
+            "--emit-markers",
+        ]
+        if quick:
+            cmd.append("--quick")
+        cmds.append((tpu, sess, cmd))
+    return cmds
+
+
+def run_colab_tpu_suites(
+    suites: Sequence[str],
+    quick: bool,
+    colab_bin: str,
+    auth: str,
+    tpu_order: Sequence[str],
+    config_path: Optional[Path],
+    timeout_s: float,
+    dry_run: bool = False,
+    runner: Optional[Callable[[Sequence[str]], subprocess.CompletedProcess[str]]] = None,
+) -> Dict[str, Any]:
+    remote_suites = [s for s in suites if s in ("compute", "bandwidth")]
+    if not remote_suites:
+        return {}
+
+    if runner is None:
+        def _default_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess[str]:
+            env = os.environ.copy()
+            env.setdefault("COLAB_CLI_REQUEST_TIMEOUT", "60")
+            env.setdefault("COLAB_CLI_ASSIGN_RETRIES", "1")
+            return subprocess.run(list(cmd), capture_output=True, text=True, env=env, check=False)
+        runner = _default_runner
+
+    tmp_ctx = tempfile.TemporaryDirectory(prefix="freetpu-bench-colab-")
+    tmp_dir = Path(tmp_ctx.name)
+    iso_cfg = config_path or (tmp_dir / "colab-sessions.json")
+    iso_cfg.parent.mkdir(parents=True, exist_ok=True)
+    session_base = f"freetpu-bench-{uuid.uuid4().hex[:8]}"
+    script_path = Path(__file__).resolve()
+
+    planned = build_colab_run_commands(
+        colab_bin=colab_bin,
+        auth=auth,
+        config_path=iso_cfg,
+        tpu_order=tpu_order,
+        timeout_s=timeout_s,
+        remote_suites=remote_suites,
+        quick=quick,
+        session_base=session_base,
+        script_path=script_path,
+    )
+
+    if dry_run:
+        tmp_ctx.cleanup()
+        return {
+            "colab_meta": {
+                "status": "dry_run",
+                "tpu_order": list(tpu_order),
+                "planned_commands": [cmd for _, _, cmd in planned],
+            }
+        }
+
+    try:
+        usage_res = runner([colab_bin, "--auth", auth, "--config", str(iso_cfg), "usage"])
+        if usage_res.returncode != 0:
+            raise RuntimeError(f"colab usage preflight failed: {usage_res.stderr.strip()}")
+
+        attempts: List[Dict[str, Any]] = []
+        for idx, (tpu, sess, cmd) in enumerate(planned):
+            res = runner(cmd)
+            attempts.append({
+                "tpu": tpu,
+                "session": sess,
+                "returncode": res.returncode,
+                "stderr_tail": res.stderr.strip()[-600:],
+            })
+            if res.returncode == 0:
+                payload = extract_bench_json(res.stdout)
+                if payload is None:
+                    raise RuntimeError(
+                        f"Colab session {sess} exited 0 without {BENCH_JSON_BEGIN} payload."
+                    )
+                payload["colab_meta"] = {
+                    "status": "ok",
+                    "tpu": tpu,
+                    "session": sess,
+                    "usage_preflight": usage_res.stdout.strip(),
+                    "attempts": attempts,
+                }
+                return payload
+            if idx + 1 < len(planned) and is_colab_allocation_error(res.returncode, res.stderr):
+                continue
+            raise RuntimeError(
+                f"Colab TPU run failed on {tpu} (rc={res.returncode}): {res.stderr.strip()[-600:]}"
+            )
+        raise RuntimeError(f"All Colab TPU candidates exhausted: {attempts}")
+    finally:
+        tmp_ctx.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# Economics & Scorecard Builder
+# ---------------------------------------------------------------------------
+
+
+def _compute_economics(
+    bf16_tflops: Optional[float],
+    int8_tops: Optional[float],
+    bw_gbps: Optional[float],
+    hourly_cost_usd: Optional[float],
+    model_gb: float,
+    bw_efficiency: float,
+    batch_size: int,
+    verified_tok_s: Optional[float] = None,
+) -> Dict[str, Optional[float]]:
+    if hourly_cost_usd is None or hourly_cost_usd <= 0.0:
+        return {
+            "tflops_per_dollar_hr": None,
+            "int8_tops_per_dollar_hr": None,
+            "gbps_per_dollar_hr": None,
+            "est_decode_tok_s": None,
+            "usd_per_1m_tokens_model": None,
+            "usd_per_1m_tokens_verified": None,
+        }
+    tf_per_dollar = round(bf16_tflops / hourly_cost_usd, 2) if bf16_tflops is not None else None
+    int8_per_dollar = round(int8_tops / hourly_cost_usd, 2) if int8_tops is not None else None
+    gbps_per_dollar = round(bw_gbps / hourly_cost_usd, 2) if bw_gbps is not None else None
+
+    # Weight-bandwidth-limited decode model:
+    # Effective batch_size increases tokens emitted per weight pass until compute bound.
+    est_tok_s: Optional[float] = None
+    usd_per_1m_model: Optional[float] = None
+    if bw_gbps is not None and bw_gbps > 0.0:
+        est_tok_s = round(((bw_gbps * bw_efficiency) / model_gb) * max(1, batch_size), 2)
+        if est_tok_s > 0.0:
+            usd_per_1m_model = round((hourly_cost_usd / (est_tok_s * 3600.0)) * 1e6, 3)
+
+    usd_per_1m_verified: Optional[float] = None
+    if verified_tok_s is not None and verified_tok_s > 0.0:
+        usd_per_1m_verified = round((hourly_cost_usd / (verified_tok_s * 3600.0)) * 1e6, 3)
+
+    return {
+        "tflops_per_dollar_hr": tf_per_dollar,
+        "int8_tops_per_dollar_hr": int8_per_dollar,
+        "gbps_per_dollar_hr": gbps_per_dollar,
+        "est_decode_tok_s": est_tok_s,
+        "usd_per_1m_tokens_model": usd_per_1m_model,
+        "usd_per_1m_tokens_verified": usd_per_1m_verified,
+    }
+
+
+def build_scorecard_rows(
+    report: Dict[str, Any],
+    model_gb: float = 8.0,
+    bw_efficiency: float = 0.70,
+    batch_size: int = 1,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+
+    comp = report.get("compute") or {}
+    bw = report.get("bandwidth") or {}
+    comms = report.get("comms") or {}
+    dev_info = report.get("device_info") or {}
+    backend = report.get("backend", "cpu")
+    colab_tpu = (report.get("colab_meta") or {}).get("tpu")
+
+    # 1. Live measured row
+    if comp or bw or comms:
+        if backend in ("jax_tpu", "colab_tpu"):
+            kind = dev_info.get("device_kind") or (colab_tpu.upper() if colab_tpu else "Cloud TPU")
+            label = f"LIVE RUN: {kind} ({backend})"
+            inferred_cost = 2.70 if (colab_tpu == "v6e1" or "v6" in str(kind).lower()) else 1.20 if ("v5" in str(kind).lower() or colab_tpu == "v5e1") else None
+            cost_basis = f"GCP public on-demand rate (${inferred_cost:.2f}/chip-hr)" if inferred_cost else "local/unspecified"
+            mem_limit = dev_info.get("hbm_bytes_limit")
+            mem_str = f"{mem_limit / (1024**3):.2f} GiB HBM" if mem_limit else "TPU HBM"
+        elif backend == "buenos_mock":
+            label = f"LIVE RUN: Host CPU via buenos_mock ({platform.machine()})"
+            inferred_cost = None
+            cost_basis = "host mock (zero TPU silicon)"
+            mem_str = "host RAM (mock)"
+        else:
+            label = f"LIVE RUN: Host CPU ({platform.machine()})"
+            inferred_cost = None
+            cost_basis = "local host CPU"
+            mem_str = "host RAM"
+
+        bf16_tf = comp.get("peak_bf16_tflops")
+        int8_tops = comp.get("peak_int8_tops")
+        bw_gbps = bw.get("peak_triad_gbps")
+        floor_us = comp.get("dispatch_floor_us")
+        hop_us = comms.get("hop_floor_us")
+
+        econ = _compute_economics(
+            bf16_tflops=bf16_tf,
+            int8_tops=int8_tops,
+            bw_gbps=bw_gbps,
+            hourly_cost_usd=inferred_cost,
+            model_gb=model_gb,
+            bw_efficiency=bw_efficiency,
+            batch_size=batch_size,
+        )
+        rows.append({
+            "target": label,
+            "row_type": "measured",
+            "memory": mem_str,
+            "bf16_tflops": bf16_tf,
+            "int8_tops": int8_tops,
+            "bw_gbps": bw_gbps,
+            "dispatch_floor_us": f"{floor_us} us" if floor_us is not None else "—",
+            "hop_latency_us": f"{hop_us} us" if hop_us is not None else "—",
+            "hourly_cost_usd": inferred_cost,
+            "pricing_basis": cost_basis,
+            **econ,
+        })
+
+    # 2. Published reference rows
+    for base in PUBLISHED_BASELINES:
+        bf16_ref = base.measured_bf16_tflops if base.measured_bf16_tflops is not None else base.peak_bf16_tflops
+        int8_ref = base.measured_int8_tops if base.measured_int8_tops is not None else base.peak_int8_tops
+        econ = _compute_economics(
+            bf16_tflops=bf16_ref,
+            int8_tops=int8_ref,
+            bw_gbps=base.bandwidth_gbps,
+            hourly_cost_usd=base.hourly_cost_usd,
+            model_gb=model_gb,
+            bw_efficiency=bw_efficiency,
+            batch_size=batch_size,
+            verified_tok_s=base.verified_decode_tok_s,
+        )
+        rows.append({
+            "target": base.display_name,
+            "row_type": base.status,
+            "memory": base.memory_spec,
+            "bf16_tflops": bf16_ref,
+            "bf16_is_measured": base.measured_bf16_tflops is not None,
+            "int8_tops": int8_ref,
+            "int8_is_measured": base.measured_int8_tops is not None,
+            "bw_gbps": base.bandwidth_gbps,
+            "bw_basis": base.bandwidth_basis,
+            "dispatch_floor_us": base.dispatch_floor_us,
+            "hop_latency_us": "60-512 us (local/USB-C)" if base.target_id == "pixel_tensor_g5" else "ICI / NVLink / PCIe",
+            "hourly_cost_usd": base.hourly_cost_usd,
+            "pricing_basis": base.pricing_basis,
+            "source_citation": base.source_citation,
+            "verified_decode_label": base.verified_decode_label,
+            "verified_decode_tok_s": base.verified_decode_tok_s,
+            **econ,
+        })
+
+    return rows
+
+
+def render_markdown(report: Dict[str, Any]) -> str:
+    econ_cfg = report.get("economics_assumptions") or {}
+    model_gb = econ_cfg.get("model_gb", 8.0)
+    bw_eff = econ_cfg.get("bw_efficiency", 0.70)
+    batch_size = econ_cfg.get("batch_size", 1)
+    rows = report.get("scorecard") or []
+
+    remote_host = (report.get("colab_meta") or {}).get("remote_host_platform")
+    host_str = (
+        f"{report.get('host_platform')} (remote: {remote_host})"
+        if remote_host
+        else str(report.get("host_platform"))
+    )
+
+    lines: List[str] = [
+        "# `freetpu-bench` Cross-Silicon Scorecard",
+        "",
+        f"- **Timestamp (UTC)**: `{report.get('timestamp_utc')}`",
+        f"- **Backend**: `{report.get('backend')}` | **Host**: `{host_str}` | **Suites**: `{', '.join(report.get('suites', []))}`",
+        "",
+        "## 1. Cross-Hardware Scorecard (`measured` vs `published-reference`)",
+        "",
+        "| Target | Row Type | Memory | BF16 (TF/s) | INT8 (TOPS) | Mem BW (GB/s) | Dispatch Floor | $/hr | TF/s per $ | Est. $/1M tok |",
+        "| --- | --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: |",
+    ]
+
+    for r in rows:
+        bf16_s = f"{r['bf16_tflops']:.2f}" if r.get("bf16_tflops") is not None else "—"
+        int8_s = f"{r['int8_tops']:.2f}" if r.get("int8_tops") is not None else "—"
+        bw_s = f"{r['bw_gbps']:.2f}" if r.get("bw_gbps") is not None else "—"
+        cost_s = f"${r['hourly_cost_usd']:.2f}" if r.get("hourly_cost_usd") is not None else "—"
+        tf_d_s = f"{r['tflops_per_dollar_hr']:.1f}" if r.get("tflops_per_dollar_hr") is not None else (
+            f"{r['int8_tops_per_dollar_hr']:.1f} (I8)" if r.get("int8_tops_per_dollar_hr") is not None else "—"
+        )
+        tok_cost = r.get("usd_per_1m_tokens_model")
+        tok_s = f"${tok_cost:.2f}" if tok_cost is not None else "—"
+        lines.append(
+            f"| {r['target']} | `{r['row_type']}` | {r['memory']} | {bf16_s} | {int8_s} | {bw_s} | {r['dispatch_floor_us']} | {cost_s} | {tf_d_s} | {tok_s} |"
+        )
+
+    lines.extend([
+        "",
+        f"> **Normalized `$/1M tok` Assumptions**: `{model_gb:.1f} GB` active weight read per token (e.g. Llama-3-8B W8A16), `{bw_eff * 100:.0f}%` memory-bandwidth decode efficiency, `batch_size={batch_size}` (`tok/s = BW * eff * B / model_gb`). Published references distinguish peak spec vs verified silicon runs.",
+        "",
+    ])
+
+    comp = report.get("compute")
+    if comp:
+        lines.extend([
+            "## 2. Live `compute` Suite (`nvbench`-style)",
+            "",
+            "| Kernel | Shape `(M,K,N)` | Dtype | Median Lat (us) | Min Lat (us) | Median Perf | Peak Perf |",
+            "| --- | --- | --- | ---: | ---: | ---: | ---: |",
+        ])
+        for c in comp.get("cases", []):
+            shape_s = "x".join(str(x) for x in c["shape"])
+            lines.append(
+                f"| `{c['name']}` | `{shape_s}` | `{c['dtype']}` | {c['median_us']:.2f} | {c['min_us']:.2f} | {c['median_perf']} {c['unit']} | {c['peak_perf']} {c['unit']} |"
+            )
+        lines.append("")
+
+    bw = report.get("bandwidth")
+    if bw:
+        lines.extend([
+            "## 3. Live `bandwidth` Suite (`nvbandwidth`-style)",
+            "",
+            "| Probe | Payload / Traffic | Median Lat (us) | Median BW (GB/s) | Peak BW (GB/s) |",
+            "| --- | --- | ---: | ---: | ---: |",
+        ])
+        for c in bw.get("triad_cases", []):
+            mb = c["tensor_bytes"] / (1024 * 1024)
+            lines.append(
+                f"| `{c['name']}` | {mb:.1f} MiB tensor ({c['total_traffic_bytes'] / (1024*1024):.1f} MiB 3x) | {c['median_us']:.2f} | {c['median_gbps']:.3f} | {c['peak_gbps']:.3f} |"
+            )
+        for c in bw.get("transfer_cases", []):
+            lines.append(
+                f"| `{c['name']}` | {c['bytes']} B | {c['median_us']:.2f} | {c['median_gbps']:.3f} | — |"
+            )
+        lines.append("")
+
+    comms = report.get("comms")
+    if comms:
+        lines.extend([
+            f"## 4. Live `comms` Suite (`nccl-tests`-style, `{comms.get('transport')}`)",
+            "",
+            "| Payload | 1-Way Hop Median (us) | RTT Median (us) | RTT p95 (us) | Median Bidir (GB/s) | Peak Bidir (GB/s) |",
+            "| --- | ---: | ---: | ---: | ---: | ---: |",
+        ])
+        for c in comms.get("cases", []):
+            lines.append(
+                f"| `{c['payload_label']}` | {c['one_way_median_us']:.2f} | {c['rtt_median_us']:.2f} | {c['rtt_p95_us']:.2f} | {c['median_gbps']:.3f} | {c['peak_gbps']:.3f} |"
+            )
+        lines.append("")
+
+    lines.extend([
+        "## 5. Published Pricing & Hardware Citations",
+        "",
+    ])
+    for b in PUBLISHED_BASELINES:
+        lines.append(f"- **{b.display_name}**: {b.pricing_basis} — *{b.source_citation}*.")
+    lines.append("")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Offline Self-Test
+# ---------------------------------------------------------------------------
+
+
+def run_self_test() -> int:
+    _require_numpy()
+    # 1. Verify suite parsing & baseline metadata integrity
+    assert parse_suites("all") == ["compute", "bandwidth", "comms"]
+    assert parse_suites("compute,comms") == ["compute", "comms"]
+    assert len(PUBLISHED_BASELINES) == 5
+    for b in PUBLISHED_BASELINES:
+        assert b.status == "published-reference"
+        assert b.hourly_cost_usd > 0
+        assert b.pricing_basis and b.source_citation
+
+    # 2. Verify cpu + buenos_mock quick execution + comms loopback
+    for backend in ("cpu", "buenos_mock"):
+        comp = run_compute_local(backend, quick=True)
+        assert comp["status"] == "measured"
+        assert comp["peak_bf16_tflops"] > 0
+        assert comp["peak_int8_tops"] > 0
+        assert any(c["name"] == "fused_gemm_silu" for c in comp["cases"])
+        assert any(c["name"] == "gemm_w8a16_dequant" for c in comp["cases"])
+
+        bw = run_bandwidth_local(backend, quick=True)
+        assert bw["status"] == "measured"
+        assert bw["peak_triad_gbps"] > 0
+
+    comms = run_comms_suite(host="127.0.0.1", port=0, quick=True)
+    assert comms["status"] == "measured"
+    assert comms["hop_floor_us"] is not None and comms["hop_floor_us"] > 0
+    assert len(comms["cases"]) == 2
+
+    # 3. Verify scorecard + Markdown/JSON rendering + clean-room output
+    report = {
+        "schema": SCHEMA_VERSION,
+        "timestamp_utc": "2026-01-01T00:00:00Z",
+        "backend": "buenos_mock",
+        "host_platform": f"{platform.system()}-{platform.machine()}",
+        "suites": ["compute", "bandwidth", "comms"],
+        "economics_assumptions": {"model_gb": 8.0, "bw_efficiency": 0.70, "batch_size": 1},
+        "compute": comp,
+        "bandwidth": bw,
+        "comms": comms,
+    }
+    report["scorecard"] = build_scorecard_rows(report)
+    assert any(r["row_type"] == "measured" for r in report["scorecard"])
+    assert sum(1 for r in report["scorecard"] if r["row_type"] == "published-reference") == 5
+    md = render_markdown(report)
+    assert "`measured`" in md and "`published-reference`" in md
+    assert "Pixel Tensor G5" in md and "Cloud TPU v6e-1" in md and "NVIDIA H100 SXM" in md
+
+    # 4. Verify colab_tpu fallback + marker parsing using an in-memory mock runner
+    calls: List[List[str]] = []
+
+    def _mock_colab_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(cmd))
+        if "usage" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "Current balance: 100.0 compute units\n", "")
+        if "V6E1" in cmd:
+            return subprocess.CompletedProcess(cmd, 1, "", "HTTP 412 REASON_NO_BACKENDS: v6e1 unavailable")
+        payload = {
+            "schema": SCHEMA_VERSION,
+            "device_info": {"device_kind": "TPU v5 lite", "hbm_bytes_limit": 16 * 1024**3},
+            "compute": {
+                "status": "measured",
+                "backend": "jax_tpu",
+                "peak_bf16_tflops": 179.36,
+                "peak_int8_tops": 350.69,
+                "dispatch_floor_us": 125.0,
+                "cases": [],
+            },
+        }
+        out = f"{BENCH_JSON_BEGIN}\n{json.dumps(payload)}\n{BENCH_JSON_END}\n"
+        return subprocess.CompletedProcess(cmd, 0, out, "")
+
+    colab_res = run_colab_tpu_suites(
+        suites=["compute"],
+        quick=True,
+        colab_bin="colab",
+        auth="adc",
+        tpu_order=("v6e1", "v5e1"),
+        config_path=None,
+        timeout_s=120.0,
+        runner=_mock_colab_runner,
+    )
+    assert colab_res["colab_meta"]["tpu"] == "v5e1"
+    assert colab_res["compute"]["peak_bf16_tflops"] == 179.36
+    assert len(calls) == 3  # usage + v6e1 fail + v5e1 ok
+
+    print(
+        json.dumps(
+            {
+                "status": "ok",
+                "self_test": "passed",
+                "suites_checked": list(VALID_SUITES),
+                "baselines_checked": len(PUBLISHED_BASELINES),
+                "colab_fallback_verified": True,
+            }
+        )
+    )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI Entrypoint
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="freetpu-bench",
+        description="Unified cross-TPU benchmark suite (compute, bandwidth, comms) + scorecard.",
+    )
+    p.add_argument("--suite", default="all", help="Comma-separated suites: compute,bandwidth,comms,all")
+    p.add_argument("--backend", choices=VALID_BACKENDS, default="cpu", help="Execution backend")
+    p.add_argument("--json", dest="json_out", default=None, help="Output JSON path (or '-' for stdout)")
+    p.add_argument("--markdown", dest="md_out", default=None, help="Output Markdown scorecard path (or '-' for stdout)")
+    p.add_argument("--emit-markers", action="store_true", help="Print JSON payload wrapped in FREETPU_BENCH markers")
+    p.add_argument("--quick", action="store_true", help="Run smaller shapes/iterations for fast smoke validation")
+    p.add_argument("--self-test", action="store_true", help="Run offline deterministic self-tests and exit")
+    p.add_argument("--model-gb", type=float, default=8.0, help="Weight footprint (GB) for $/1M-token decode model")
+    p.add_argument("--bw-efficiency", type=float, default=0.70, help="Memory BW efficiency factor (0..1]")
+    p.add_argument("--batch-size", type=int, default=1, help="Decode batch size for $/1M-token projection")
+    p.add_argument("--comms-host", default="127.0.0.1", help="Target host for comms suite")
+    p.add_argument("--comms-port", type=int, default=0, help="Target port for comms suite (0 = local loopback)")
+    p.add_argument("--comms-server", action="store_true", help="Start TCP activation-hop server and block")
+    p.add_argument("--colab-bin", default=None, help="Path to google-colab-cli (`colab`) binary")
+    p.add_argument("--colab-auth", default="adc", choices=("adc", "oauth2"), help="Colab CLI auth strategy")
+    p.add_argument("--colab-tpu", default="auto", choices=("auto", "v6e1", "v5e1"), help="Colab TPU target")
+    p.add_argument("--colab-config", default=None, help="Isolated `--config` path for Colab session state")
+    p.add_argument("--colab-timeout", type=float, default=300.0, help="Colab execution timeout (seconds)")
+    p.add_argument("--allow-jax-cpu", action="store_true", help="Allow jax_tpu backend to run on JAX CPU for testing")
+    p.add_argument("--dry-run", action="store_true", help="With --backend colab_tpu, print planned commands only")
+    return p
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.self_test:
+        return run_self_test()
+
+    if args.comms_server:
+        run_comms_server(args.comms_host, args.comms_port)
+        return 0
+
+    suites = parse_suites(args.suite)
+    report: Dict[str, Any] = {
+        "schema": SCHEMA_VERSION,
+        "timestamp_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "backend": args.backend,
+        "host_platform": f"{platform.system()}-{platform.machine()}",
+        "suites": suites,
+        "economics_assumptions": {
+            "model_gb": args.model_gb,
+            "bw_efficiency": args.bw_efficiency,
+            "batch_size": args.batch_size,
+        },
+    }
+
+    if args.backend in ("cpu", "buenos_mock"):
+        if "compute" in suites:
+            report["compute"] = run_compute_local(args.backend, quick=args.quick)
+        if "bandwidth" in suites:
+            report["bandwidth"] = run_bandwidth_local(args.backend, quick=args.quick)
+        if "comms" in suites:
+            report["comms"] = run_comms_suite(args.comms_host, args.comms_port, quick=args.quick)
+    elif args.backend == "jax_tpu":
+        jax_res = run_jax_tpu_suites(suites, quick=args.quick, allow_jax_cpu=args.allow_jax_cpu)
+        report.update(jax_res)
+        if "comms" in suites:
+            report["comms"] = run_comms_suite(args.comms_host, args.comms_port, quick=args.quick)
+    elif args.backend == "colab_tpu":
+        tpu_order = ("v6e1", "v5e1") if args.colab_tpu == "auto" else (args.colab_tpu,)
+        cfg_path = Path(args.colab_config) if args.colab_config else None
+        colab_res = run_colab_tpu_suites(
+            suites=suites,
+            quick=args.quick,
+            colab_bin=resolve_colab_bin(args.colab_bin),
+            auth=args.colab_auth,
+            tpu_order=tpu_order,
+            config_path=cfg_path,
+            timeout_s=args.colab_timeout,
+            dry_run=args.dry_run,
+        )
+        for key in ("device_info", "compute", "bandwidth", "colab_meta"):
+            if key in colab_res:
+                report[key] = colab_res[key]
+        if "host_platform" in colab_res and "colab_meta" in report:
+            report["colab_meta"]["remote_host_platform"] = colab_res["host_platform"]
+        if "comms" in suites and not args.dry_run:
+            report["comms"] = run_comms_suite(args.comms_host, args.comms_port, quick=args.quick)
+
+    report["scorecard"] = build_scorecard_rows(
+        report,
+        model_gb=args.model_gb,
+        bw_efficiency=args.bw_efficiency,
+        batch_size=args.batch_size,
+    )
+
+    json_text = json.dumps(report, indent=2, sort_keys=True) + "\n"
+    md_text = render_markdown(report)
+
+    if args.emit_markers:
+        print(BENCH_JSON_BEGIN)
+        print(json_text, end="")
+        print(BENCH_JSON_END)
+
+    if args.json_out == "-":
+        sys.stdout.write(json_text)
+    elif args.json_out:
+        out_p = Path(args.json_out)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        out_p.write_text(json_text, encoding="utf-8")
+
+    if args.md_out == "-":
+        sys.stdout.write(md_text)
+    elif args.md_out:
+        out_p = Path(args.md_out)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        out_p.write_text(md_text, encoding="utf-8")
+
+    if not args.emit_markers and not args.json_out and not args.md_out:
+        sys.stdout.write(md_text)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

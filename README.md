@@ -78,6 +78,27 @@ See [llama-cpp-edgetpu/README.md](llama-cpp-edgetpu/README.md) for patching upst
 
 ---
 
+## Benchmarks & Playbooks (`freetpu-bench`)
+
+Run [`bench/freetpu_bench.py`](bench/freetpu_bench.py) (`nvbench` + `nvbandwidth` + `nccl-tests` for TPUs) in one command to generate a JSON + Markdown scorecard comparing live measurements against Pixel Tensor G5 (`buenos_a0`), Cloud TPU `v5e-1` / `v6e-1`, NVIDIA H100 SXM, and RTX 5090:
+
+```bash
+# Offline host mock + local activation-hop suite
+python3 bench/freetpu_bench.py --suite all --backend buenos_mock --markdown runs/scorecard.md
+
+# Headless Cloud TPU (v6e-1 with automatic v5e-1 fallback) + local comms
+python3 bench/freetpu_bench.py --suite all --backend colab_tpu --markdown runs/colab-scorecard.md
+```
+
+Copy-paste 60-second playbooks (`dgx-spark-playbooks` style):
+
+- [01 — Pixel Tensor G5 (`buenos_a0`) Bare-Metal](playbooks/01-pixel-tensor-g5-baremetal.md)
+- [02 — Cloud TPU `v6e-1` / `v5e-1` Headless Colab](playbooks/02-colab-cloud-tpu-v5e-v6e.md)
+- [03 — Dual-Pixel Wired Cluster (`comms` Hop & Split-Layer RPC)](playbooks/03-dual-pixel-wired-cluster.md)
+- [04 — `$/1M Tokens` & `TFLOP/s-per-$` Economics vs H100 & RTX 5090](playbooks/04-cost-per-token-vs-gpu.md)
+
+---
+
 ## Verified Silicon & Host Results
 
 All hardware metrics below were measured on Google Pixel 10 Pro Fold (`rango`, Tensor G5 `buenos_a0`, `buenos.ko` ABI `1.4`) with `/proc/self/maps` confirming zero loaded Google/vendor `.so` libraries:

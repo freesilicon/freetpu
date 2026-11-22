@@ -57,6 +57,8 @@ jobs:
           python3 tools/verify_fusion_lut.py
           python3 tools/verify_chained_fusion.py
           python3 tools/verify_patch_proof.py
+          python3 bench/freetpu_bench.py --help >/dev/null
+          python3 bench/freetpu_bench.py --self-test
 
   clean-room-audit:
     name: Clean-Room & OSS Boundary Audit
