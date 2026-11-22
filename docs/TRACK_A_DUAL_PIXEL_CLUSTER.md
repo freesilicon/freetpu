@@ -75,8 +75,14 @@ Measured direct link: **`1.49 ms` min / `2.35 ms` avg** ping RTT (`0%` loss), **
 Bound the per-node `ext[2]` DMA-BUF LRU weight cache (`OPENBUENOS_WEIGHT_CACHE_MB=128`, `OPENBUENOS_POOL_MB=64`) to stay comfortably below Android LMKD limits while holding `~9 GiB` of model weights per phone:
 
 ```bash
-# Node 2 (mustang — bind RPC server exclusively to the direct USB-C NCM IP):
+# Node 2 (mustang — enforce USB-only ncm0 ingress for TCP 50052, then bind RPC server to 10.99.0.2):
+# Note: `-H 10.99.0.2` alone is a weak-host address bind; Linux can still accept traffic to a local IP
+# arriving on Wi-Fi unless an ingress firewall rule restricts port 50052 to `ncm0` + coordinator `10.99.0.1`.
 su -c '
+  iptables -D INPUT -p tcp --dport 50052 -i ncm0 -s 10.99.0.1/32 -d 10.99.0.2/32 -j ACCEPT 2>/dev/null || true
+  iptables -D INPUT -p tcp --dport 50052 -j DROP 2>/dev/null || true
+  iptables -I INPUT 1 -p tcp --dport 50052 -j DROP
+  iptables -I INPUT 1 -p tcp --dport 50052 -i ncm0 -s 10.99.0.1/32 -d 10.99.0.2/32 -j ACCEPT
   OPENBUENOS_VERBOSE=1 OPENBUENOS_WEIGHT_CACHE_MB=128 OPENBUENOS_WEIGHT_CACHE_ENTRIES=256 OPENBUENOS_POOL_MB=64 \
   /data/local/tmp/llama-edgetpu-rpc/ggml-rpc-server -d EDGETPU -H 10.99.0.2 -p 50052 -t 4
 '

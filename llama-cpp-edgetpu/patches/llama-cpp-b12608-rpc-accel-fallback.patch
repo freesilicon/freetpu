@@ -1,15 +1,13 @@
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
-index e4a84cb..a2b1d08 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
-@@ -1427,10 +1427,27 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device,
+@@ -1427,10 +1427,27 @@
  
  class rpc_server {
  public:
 -    rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir)
--        : backends(std::move(all_backends)), cache_dir(cache_dir) {
 +    rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir, size_t n_threads = 0)
-+        : backends(std::move(all_backends)), cache_dir(cache_dir), n_threads(n_threads) {
+         : backends(std::move(all_backends)), cache_dir(cache_dir) {
          stored_graphs.resize(backends.size());
          comm_states.resize(backends.size());
 +        for (ggml_backend_t backend : backends) {
@@ -32,7 +30,7 @@ index e4a84cb..a2b1d08 100644
      }
      ~rpc_server();
  
-@@ -1464,6 +1481,7 @@ public:
+@@ -1464,6 +1481,7 @@
  
  private:
      void sync_all_backends();
@@ -40,19 +38,20 @@ index e4a84cb..a2b1d08 100644
      void comm_free_device(uint32_t dev_id);
      static bool comm_allreduce_pairwise(void * comm_ctx_v, ggml_tensor ** tensors);
      static bool comm_bootstrap_exchange(void * user_data, const void * send_buf, void * recv_buf, size_t size);
-@@ -1499,6 +1517,8 @@ private:
+@@ -1499,6 +1517,7 @@
  
      std::vector<ggml_backend_t> backends;
      const char * cache_dir;
-+    size_t n_threads = 0;
 +    ggml_backend_t cpu_fallback = nullptr;
      std::unordered_set<ggml_backend_buffer_t> buffers;
      // computed graphs cached per backend, keyed by uid
      std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
-@@ -2181,6 +2201,831 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
+@@ -2179,8 +2198,741 @@
+     }
+     result->view_offs = tensor->view_offs;
      return result;
- }
- 
++}
++
 +static bool rpc_u64_mul_checked(uint64_t a, uint64_t b, uint64_t * out) {
 +    if (a != 0 && b > UINT64_MAX / a) {
 +        return false;
@@ -246,114 +245,12 @@ index e4a84cb..a2b1d08 100644
 +    }
 +}
 +
-+static bool rpc_cpu_fallback_op_allowed(const ggml_tensor * node) {
-+    if (node == nullptr) {
-+        return true;
-+    }
-+    switch (node->op) {
-+        case GGML_OP_NONE:
-+        case GGML_OP_DUP:
-+        case GGML_OP_ADD:
-+        case GGML_OP_ADD_ID:
-+        case GGML_OP_ACC:
-+        case GGML_OP_SUB:
-+        case GGML_OP_MUL:
-+        case GGML_OP_DIV:
-+        case GGML_OP_SQR:
-+        case GGML_OP_SQRT:
-+        case GGML_OP_LOG:
-+        case GGML_OP_SIN:
-+        case GGML_OP_COS:
-+        case GGML_OP_SUM:
-+        case GGML_OP_SUM_ROWS:
-+        case GGML_OP_CUMSUM:
-+        case GGML_OP_MEAN:
-+        case GGML_OP_ARGMAX:
-+        case GGML_OP_COUNT_EQUAL:
-+        case GGML_OP_REPEAT:
-+        case GGML_OP_CONCAT:
-+        case GGML_OP_NORM:
-+        case GGML_OP_RMS_NORM:
-+        case GGML_OP_GROUP_NORM:
-+        case GGML_OP_L2_NORM:
-+        case GGML_OP_MUL_MAT:
-+        case GGML_OP_MUL_MAT_ID:
-+        case GGML_OP_OUT_PROD:
-+        case GGML_OP_SCALE:
-+        case GGML_OP_SET:
-+        case GGML_OP_CPY:
-+        case GGML_OP_CONT:
-+        case GGML_OP_RESHAPE:
-+        case GGML_OP_VIEW:
-+        case GGML_OP_PERMUTE:
-+        case GGML_OP_TRANSPOSE:
-+        case GGML_OP_GET_ROWS:
-+        case GGML_OP_SET_ROWS:
-+        case GGML_OP_DIAG:
-+        case GGML_OP_SOFT_MAX:
-+        case GGML_OP_ROPE:
-+        case GGML_OP_CLAMP:
-+        case GGML_OP_CONV_TRANSPOSE_1D:
-+        case GGML_OP_IM2COL:
-+        case GGML_OP_IM2COL_3D:
-+        case GGML_OP_COL2IM_1D:
-+        case GGML_OP_CONV_2D:
-+        case GGML_OP_CONV_3D:
-+        case GGML_OP_CONV_2D_DW:
-+        case GGML_OP_CONV_TRANSPOSE_2D:
-+        case GGML_OP_POOL_1D:
-+        case GGML_OP_POOL_2D:
-+        case GGML_OP_UPSCALE:
-+        case GGML_OP_PAD:
-+        case GGML_OP_PAD_REFLECT_1D:
-+        case GGML_OP_ROLL:
-+        case GGML_OP_ARANGE:
-+        case GGML_OP_TIMESTEP_EMBEDDING:
-+        case GGML_OP_ARGSORT:
-+        case GGML_OP_TOP_K:
-+        case GGML_OP_LEAKY_RELU:
-+        case GGML_OP_TRI:
-+        case GGML_OP_FILL:
-+        case GGML_OP_FLASH_ATTN_EXT:
-+        case GGML_OP_SSM_CONV:
-+        case GGML_OP_SSM_SCAN:
-+        case GGML_OP_WIN_PART:
-+        case GGML_OP_WIN_UNPART:
-+        case GGML_OP_GET_REL_POS:
-+        case GGML_OP_ADD_REL_POS:
-+        case GGML_OP_RWKV_WKV6:
-+        case GGML_OP_GATED_LINEAR_ATTN:
-+        case GGML_OP_RWKV_WKV7:
-+        case GGML_OP_SOLVE_TRI:
-+        case GGML_OP_GATED_DELTA_NET:
-+        case GGML_OP_LIGHTNING_INDEXER:
-+        case GGML_OP_DSV4_HC_COMB:
-+        case GGML_OP_DSV4_HC_PRE:
-+        case GGML_OP_DSV4_HC_POST:
-+        case GGML_OP_TOP_K_MASK:
-+            return true;
-+        case GGML_OP_UNARY: {
-+            const int32_t uop = ggml_get_op_params_i32(node, 0);
-+            return uop >= 0 && uop < GGML_UNARY_OP_COUNT;
-+        }
-+        case GGML_OP_GLU: {
-+            const int32_t gop = ggml_get_op_params_i32(node, 0);
-+            return gop >= 0 && gop < GGML_GLU_OP_COUNT;
-+        }
-+        default:
-+            return false;
-+    }
-+}
-+
 +static bool rpc_cpu_fallback_validate_node(
 +        ggml_backend_dev_t cpu_dev,
 +        const ggml_tensor * node,
 +        const std::unordered_set<ggml_backend_buffer_t> & buffers) {
-+    if (node == nullptr) {
++    if (node == nullptr || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
 +        return true;
-+    }
-+    if (!rpc_cpu_fallback_op_allowed(node)) {
-+        return false;
 +    }
 +    if (rpc_op_is_noop(node->op)) {
 +        return true;
@@ -483,6 +380,9 @@ index e4a84cb..a2b1d08 100644
 +                return false;
 +            }
 +            const int32_t uop = ggml_get_op_params_i32(node, 0);
++            if (uop < 0 || uop >= GGML_UNARY_OP_COUNT) {
++                return false;
++            }
 +            const bool same_type_only =
 +                uop == GGML_UNARY_OP_GELU ||
 +                uop == GGML_UNARY_OP_GELU_ERF ||
@@ -500,80 +400,169 @@ index e4a84cb..a2b1d08 100644
 +            return rpc_tensor_span_in_buffer(node, buffers, true) &&
 +                   rpc_tensor_span_in_buffer(src0, buffers, true);
 +        }
-+        case GGML_OP_LEAKY_RELU: {
-+            if (src0 == nullptr || !ggml_are_same_shape(src0, node) || node->type != src0->type) {
-+                return false;
-+            }
-+            if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_BF16) {
-+                return false;
-+            }
-+            if (!ggml_is_contiguous_1(src0) || !ggml_is_contiguous_1(node) ||
-+                src0->nb[0] != ggml_type_size(src0->type) ||
-+                node->nb[0] != ggml_type_size(node->type)) {
-+                return false;
-+            }
-+            return rpc_tensor_span_in_buffer(node, buffers, true) &&
-+                   rpc_tensor_span_in_buffer(src0, buffers, true);
-+        }
-+        case GGML_OP_SUM: {
-+            if (src0 == nullptr || !ggml_is_scalar(node) || node->type != src0->type) {
-+                return false;
-+            }
-+            if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_BF16) {
-+                return false;
-+            }
-+            if (src0->type != GGML_TYPE_F32 &&
-+                (src0->nb[0] != ggml_type_size(src0->type) || !rpc_tensor_span_in_buffer(src0, buffers, true))) {
-+                return false;
-+            }
-+            return true;
-+        }
-+        case GGML_OP_MEAN: {
++        case GGML_OP_RMS_NORM: {
 +            if (src0 == nullptr || src0->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32) {
 +                return false;
 +            }
-+            if (src0->nb[0] != sizeof(float) ||
-+                node->ne[0] != 1 ||
-+                node->ne[1] != src0->ne[1] ||
-+                node->ne[2] != src0->ne[2] ||
-+                node->ne[3] != src0->ne[3]) {
++            if (!ggml_are_same_shape(src0, node) ||
++                src0->nb[0] != sizeof(float) ||
++                node->nb[0] != sizeof(float)) {
 +                return false;
 +            }
-+            return rpc_tensor_span_in_buffer(src0, buffers, true);
-+        }
-+        case GGML_OP_ARGMAX: {
-+            if (src0 == nullptr || src0->type != GGML_TYPE_F32 || node->type != GGML_TYPE_I32) {
-+                return false;
-+            }
-+            if (src0->nb[0] != sizeof(float) ||
-+                node->nb[0] != sizeof(int32_t) ||
-+                node->ne[0] != src0->ne[1]) {
++            float eps = -1.0f;
++            memcpy(&eps, node->op_params, sizeof(float));
++            if (!(eps >= 0.0f) || (eps - eps) != 0.0f) {
 +                return false;
 +            }
 +            return rpc_tensor_span_in_buffer(src0, buffers, true) &&
 +                   rpc_tensor_span_in_buffer(node, buffers, true);
 +        }
-+        case GGML_OP_PAD: {
++        case GGML_OP_ADD:
++        case GGML_OP_SUB:
++        case GGML_OP_MUL:
++        case GGML_OP_DIV: {
++            if (src0 == nullptr || src1 == nullptr) {
++                return false;
++            }
++            const bool types_ok =
++                (src0->type == GGML_TYPE_F32  && src1->type == GGML_TYPE_F32  && node->type == GGML_TYPE_F32)  ||
++                (src0->type == GGML_TYPE_F16  && src1->type == GGML_TYPE_F16  && node->type == GGML_TYPE_F16)  ||
++                (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_BF16 && node->type == GGML_TYPE_BF16) ||
++                (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F32  && (node->type == GGML_TYPE_BF16 || node->type == GGML_TYPE_F32)) ||
++                (src0->type == GGML_TYPE_F16  && src1->type == GGML_TYPE_F32  && (node->type == GGML_TYPE_F16  || node->type == GGML_TYPE_F32));
++            if (!types_ok) {
++                return false;
++            }
++            if (!ggml_can_repeat(src1, src0) || !ggml_are_same_shape(src0, node) ||
++                src0->nb[0] != ggml_type_size(src0->type) ||
++                src1->nb[0] != ggml_type_size(src1->type) ||
++                node->nb[0] != ggml_type_size(node->type)) {
++                return false;
++            }
++            return rpc_tensor_span_in_buffer(src0, buffers, true) &&
++                   rpc_tensor_span_in_buffer(src1, buffers, true) &&
++                   rpc_tensor_span_in_buffer(node, buffers, true);
++        }
++        case GGML_OP_SCALE: {
++            if (src0 == nullptr || node->type != src0->type) {
++                return false;
++            }
++            if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_BF16) {
++                return false;
++            }
++            if (!ggml_are_same_shape(src0, node) ||
++                src0->ne[0] > INT32_MAX / 2 || ggml_nrows(src0) > INT32_MAX / 2) {
++                return false;
++            }
++            return rpc_tensor_span_in_buffer(src0, buffers, true) &&
++                   rpc_tensor_span_in_buffer(node, buffers, true);
++        }
++        case GGML_OP_ROPE: {
++            if (src0 == nullptr || src1 == nullptr) {
++                return false;
++            }
++            if (node->type != src0->type ||
++                (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_BF16) ||
++                src1->type != GGML_TYPE_I32) {
++                return false;
++            }
++            if (!ggml_are_same_shape(src0, node) ||
++                src0->nb[0] != ggml_type_size(src0->type) ||
++                node->nb[0] != ggml_type_size(node->type) ||
++                ggml_nrows(node) > INT32_MAX / 2) {
++                return false;
++            }
++            const int32_t n_dims = ggml_get_op_params_i32(node, 1);
++            const int32_t mode   = ggml_get_op_params_i32(node, 2);
++            const int32_t n_offs = ggml_get_op_params_i32(node, 15);
++            if (n_dims <= 0 || n_dims > node->ne[0] || (n_dims % 2) != 0 ||
++                n_offs < 0 || (n_offs % 2) != 0 || n_offs + n_dims > node->ne[0]) {
++                return false;
++            }
++            if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
++                return false;
++            }
++            if (!ggml_is_contiguous(src1) || src1->ne[0] < node->ne[2] ||
++                !rpc_tensor_span_in_buffer(src1, buffers, true)) {
++                return false;
++            }
++            if (src2 != nullptr) {
++                if (src2->type != GGML_TYPE_F32 || !ggml_is_contiguous(src2) ||
++                    src2->ne[0] < n_dims / 2 ||
++                    !rpc_tensor_span_in_buffer(src2, buffers, true)) {
++                    return false;
++                }
++            }
++            return rpc_tensor_span_in_buffer(src0, buffers, true) &&
++                   rpc_tensor_span_in_buffer(node, buffers, true);
++        }
++        case GGML_OP_GLU: {
 +            if (src0 == nullptr || src0->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32) {
 +                return false;
 +            }
-+            if (!ggml_is_contiguous(node)) {
++            const int32_t gop = ggml_get_op_params_i32(node, 0);
++            if (gop < 0 || gop >= GGML_GLU_OP_COUNT) {
 +                return false;
 +            }
-+            const bool circular = (bool) ggml_get_op_params_i32(node, 8);
-+            if (!circular) {
-+                for (int d = 0; d < GGML_MAX_DIMS; ++d) {
-+                    const int64_t lp = ggml_get_op_params_i32(node, 2 * d);
-+                    const int64_t rp = ggml_get_op_params_i32(node, 2 * d + 1);
-+                    if (src0->ne[d] + lp + rp != node->ne[d]) {
-+                        return false;
-+                    }
++            if (!ggml_is_contiguous_1(src0) || !ggml_is_contiguous_1(node) ||
++                ggml_nrows(src0) > INT32_MAX / 2 || ggml_nrows(node) != ggml_nrows(src0)) {
++                return false;
++            }
++            if (src1 != nullptr) {
++                if (src1->type != GGML_TYPE_F32 || !ggml_is_contiguous_1(src1) ||
++                    !ggml_are_same_shape(src0, src1) || !ggml_are_same_shape(src0, node) ||
++                    !rpc_tensor_span_in_buffer(src1, buffers, true)) {
++                    return false;
++                }
++            } else {
++                if ((src0->ne[0] % 2) != 0 ||
++                    node->ne[0] != src0->ne[0] / 2 ||
++                    node->ne[1] != src0->ne[1] ||
++                    node->ne[2] != src0->ne[2] ||
++                    node->ne[3] != src0->ne[3]) {
++                    return false;
 +                }
 +            }
-+            return rpc_tensor_span_in_buffer(node, buffers, true);
++            return rpc_tensor_span_in_buffer(src0, buffers, true) &&
++                   rpc_tensor_span_in_buffer(node, buffers, true);
++        }
++        case GGML_OP_DUP:
++        case GGML_OP_CPY:
++        case GGML_OP_CONT: {
++            if (src0 == nullptr || ggml_nelements(src0) != ggml_nelements(node) ||
++                src0->ne[1] > INT32_MAX / 2) {
++                return false;
++            }
++            if (src0->type == node->type) {
++                const bool is_q = ggml_blck_size(src0->type) > 1;
++                if (is_q && (!ggml_is_contiguous_rows(src0) || !ggml_is_contiguous_rows(node))) {
++                    return false;
++                }
++                return rpc_tensor_span_in_buffer(src0, buffers, is_q) &&
++                       rpc_tensor_span_in_buffer(node, buffers, is_q);
++            }
++            const bool src_flt = src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16;
++            const bool dst_flt = node->type == GGML_TYPE_F32 || node->type == GGML_TYPE_F16 || node->type == GGML_TYPE_BF16;
++            if (src_flt && dst_flt) {
++                if (!ggml_is_contiguous(node) &&
++                    !(ggml_are_same_shape(src0, node) && ggml_is_contiguous_rows(src0) && ggml_is_contiguous_rows(node))) {
++                    return false;
++                }
++                return rpc_tensor_span_in_buffer(src0, buffers, false) &&
++                       rpc_tensor_span_in_buffer(node, buffers, false);
++            }
++            if (src_flt && rpc_cpu_type_has_from_float(node->type)) {
++                if (!ggml_is_contiguous(node) || !ggml_is_contiguous_rows(src0)) {
++                    return false;
++                }
++                return rpc_tensor_span_in_buffer(src0, buffers, true) &&
++                       rpc_tensor_span_in_buffer(node, buffers, true);
++            }
++            return false;
 +        }
 +        case GGML_OP_MUL_MAT: {
-+            if (src0 == nullptr || src1 == nullptr || node->type != GGML_TYPE_F32) {
++            if (src0 == nullptr || src1 == nullptr || node->type != GGML_TYPE_F32 ||
++                (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16 && src1->type != GGML_TYPE_BF16)) {
 +                return false;
 +            }
 +            if (src0->ne[0] != src1->ne[0] ||
@@ -593,7 +582,8 @@ index e4a84cb..a2b1d08 100644
 +            if (src0 == nullptr || src1 == nullptr || src2 == nullptr) {
 +                return false;
 +            }
-+            if (src2->type != GGML_TYPE_I32 || node->type != GGML_TYPE_F32) {
++            if (src2->type != GGML_TYPE_I32 || node->type != GGML_TYPE_F32 ||
++                (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16 && src1->type != GGML_TYPE_BF16)) {
 +                return false;
 +            }
 +            if (src0->ne[3] != 1 || src1->ne[3] != 1 || src2->ne[2] != 1 || src2->ne[3] != 1 ||
@@ -619,96 +609,8 @@ index e4a84cb..a2b1d08 100644
 +            }
 +            return true;
 +        }
-+        case GGML_OP_POOL_1D: {
-+            if (src0 == nullptr || node->type != GGML_TYPE_F32 ||
-+                (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16)) {
-+                return false;
-+            }
-+            const int32_t op = ggml_get_op_params_i32(node, 0);
-+            const int32_t k0 = ggml_get_op_params_i32(node, 1);
-+            const int32_t s0 = ggml_get_op_params_i32(node, 2);
-+            if ((op != GGML_OP_POOL_MAX && op != GGML_OP_POOL_AVG) || k0 <= 0 || s0 <= 0) {
-+                return false;
-+            }
-+            if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(node) ||
-+                node->ne[1] != src0->ne[1] ||
-+                node->ne[2] != src0->ne[2] ||
-+                node->ne[3] != src0->ne[3]) {
-+                return false;
-+            }
-+            return rpc_tensor_span_in_buffer(src0, buffers, true) &&
-+                   rpc_tensor_span_in_buffer(node, buffers, true);
-+        }
-+        case GGML_OP_POOL_2D: {
-+            if (src0 == nullptr || node->type != GGML_TYPE_F32 ||
-+                (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16)) {
-+                return false;
-+            }
-+            const int32_t op = ggml_get_op_params_i32(node, 0);
-+            const int32_t k0 = ggml_get_op_params_i32(node, 1);
-+            const int32_t k1 = ggml_get_op_params_i32(node, 2);
-+            const int32_t s0 = ggml_get_op_params_i32(node, 3);
-+            const int32_t s1 = ggml_get_op_params_i32(node, 4);
-+            if ((op != GGML_OP_POOL_MAX && op != GGML_OP_POOL_AVG) ||
-+                k0 <= 0 || k1 <= 0 || s0 <= 0 || s1 <= 0) {
-+                return false;
-+            }
-+            if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(node) ||
-+                node->ne[2] != src0->ne[2] ||
-+                node->ne[3] != src0->ne[3]) {
-+                return false;
-+            }
-+            return rpc_tensor_span_in_buffer(src0, buffers, true) &&
-+                   rpc_tensor_span_in_buffer(node, buffers, true);
-+        }
-+        case GGML_OP_WIN_PART: {
-+            if (src0 == nullptr || src0->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32) {
-+                return false;
-+            }
-+            const int32_t nep0 = ggml_get_op_params_i32(node, 0);
-+            const int32_t nep1 = ggml_get_op_params_i32(node, 1);
-+            const int32_t w    = ggml_get_op_params_i32(node, 2);
-+            if (nep0 <= 0 || nep1 <= 0 || w <= 0) {
-+                return false;
-+            }
-+            if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(node) ||
-+                src0->ne[3] != 1 ||
-+                node->ne[0] != src0->ne[0] ||
-+                node->ne[1] != w ||
-+                node->ne[2] != w ||
-+                node->ne[3] != (int64_t) nep0 * (int64_t) nep1) {
-+                return false;
-+            }
-+            return rpc_tensor_span_in_buffer(src0, buffers, true) &&
-+                   rpc_tensor_span_in_buffer(node, buffers, true);
-+        }
-+        case GGML_OP_WIN_UNPART: {
-+            if (src0 == nullptr || src0->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32) {
-+                return false;
-+            }
-+            const int32_t w = ggml_get_op_params_i32(node, 0);
-+            if (w <= 0) {
-+                return false;
-+            }
-+            if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(node) ||
-+                node->ne[3] != 1 ||
-+                node->ne[0] != src0->ne[0] ||
-+                src0->ne[1] != w ||
-+                src0->ne[2] != w) {
-+                return false;
-+            }
-+            const int64_t px  = (w - node->ne[1] % w) % w;
-+            const int64_t py  = (w - node->ne[2] % w) % w;
-+            const int64_t npx = (px + node->ne[1]) / w;
-+            const int64_t npy = (py + node->ne[2]) / w;
-+            if (src0->ne[3] != npx * npy) {
-+                return false;
-+            }
-+            return rpc_tensor_span_in_buffer(src0, buffers, true) &&
-+                   rpc_tensor_span_in_buffer(node, buffers, true);
-+        }
 +        default:
-+            return true;
++            return false;
 +    }
 +}
 +
@@ -725,8 +627,8 @@ index e4a84cb..a2b1d08 100644
 +        default:
 +            return nullptr;
 +    }
-+}
-+
+ }
+ 
 +static bool rpc_cpu_fallback_validate_runtime_indices(const ggml_tensor * node) {
 +    if (node == nullptr) {
 +        return true;
@@ -805,7 +707,9 @@ index e4a84cb..a2b1d08 100644
 +    ggml_backend_dev_t cpu_dev = ggml_backend_get_device(cpu_fallback);
 +    int i = 0;
 +    while (i < graph->n_nodes) {
-+        while (i < graph->n_nodes && graph->nodes[i] == nullptr) {
++        while (i < graph->n_nodes &&
++               (graph->nodes[i] == nullptr ||
++                (graph->nodes[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0)) {
 +            ++i;
 +        }
 +        if (i >= graph->n_nodes) {
@@ -834,7 +738,7 @@ index e4a84cb..a2b1d08 100644
 +        } else {
 +            for (int k = i; k < j; ++k) {
 +                ggml_tensor * node = graph->nodes[k];
-+                if (node == nullptr) {
++                if (node == nullptr || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
 +                    continue;
 +                }
 +                if (!rpc_cpu_fallback_validate_node(cpu_dev, node, buffers)) {
@@ -849,7 +753,10 @@ index e4a84cb..a2b1d08 100644
 +                    bool idx_written_earlier = false;
 +                    for (int m = i; m < k; ++m) {
 +                        const ggml_tensor * prev = graph->nodes[m];
-+                        if (prev != nullptr && !rpc_op_is_noop(prev->op) && prev->buffer == idx_tensor->buffer) {
++                        if (prev != nullptr &&
++                            (prev->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 &&
++                            !rpc_op_is_noop(prev->op) &&
++                            prev->buffer == idx_tensor->buffer) {
 +                            idx_written_earlier = true;
 +                            break;
 +                        }
@@ -881,7 +788,7 @@ index e4a84cb..a2b1d08 100644
  bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
      // serialization format:
      // | device (4 bytes) | uid (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
-@@ -2266,8 +3111,11 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+@@ -2266,8 +3018,11 @@
      }
      const std::chrono::duration<double, std::milli> deserialize_ms = std::chrono::steady_clock::now() - t_deserialize;
  
@@ -895,7 +802,7 @@ index e4a84cb..a2b1d08 100644
      sg.graph = graph;
      LOG_DBG3("[%s] device: %u, graph build: %.3f ms\n", __func__, device, deserialize_ms.count());
      return true;
-@@ -2285,8 +3133,11 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
+@@ -2285,8 +3040,11 @@
      }
      ggml_cgraph * graph = it->second.graph;
      LOG_DBG("[%s] device: %u, uid: %" PRIu64 "\n", __func__, device, request.uid);
@@ -909,7 +816,7 @@ index e4a84cb..a2b1d08 100644
      return true;
  }
  
-@@ -2655,11 +3506,15 @@ rpc_server::~rpc_server() {
+@@ -2655,11 +3413,15 @@
      for (auto buffer : buffers) {
          ggml_backend_buffer_free(buffer);
      }
@@ -927,7 +834,7 @@ index e4a84cb..a2b1d08 100644
      uint8_t cmd;
      if (!sock->recv_data(&cmd, 1)) {
          return;
-@@ -3047,7 +3902,7 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
+@@ -3047,7 +3809,7 @@
              return;
          }
          LOG_INFO("Accepted client connection\n");
