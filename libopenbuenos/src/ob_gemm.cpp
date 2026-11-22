@@ -4091,30 +4091,11 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
 
       bool tile_handled_by_hw = false;
       if (emitter != nullptr) {
-        // Decide whether this tile uses native 7-chunk PT W8A16(FP16) (full FP32 accum,
-        // zero activation quantization, zero outlier peel).
-        bool tile_use_w8a16 = false;
-        if (builtin_active && !ctx->mock_mode && w8a16_mode > 0u &&
-            hw_m == 1u && ob::is_w8a16_pt_1x_shape(1u, hw_k, hw_n)) {
-          if (w8a16_mode == 1u) {
-            tile_use_w8a16 = true;
-          } else {
-            // Selective auto mode: engage W8A16 on M=1 rows with severe outlier crest
-            const float* a_row = a_mk + static_cast<size_t>(m0) * k_dim + k0;
-            float am = 0.0f;
-            double sq = 0.0;
-            for (uint32_t ki = 0u; ki < tk; ++ki) {
-              const float v = a_row[ki];
-              const float av = std::fabs(v);
-              if (av > am) am = av;
-              sq += static_cast<double>(v) * static_cast<double>(v);
-            }
-            const double rms = std::sqrt(sq / static_cast<double>(std::max<uint32_t>(1u, tk)));
-            if (am > 16.0f || static_cast<double>(am) > 12.0 * std::max(rms, 1e-12)) {
-              tile_use_w8a16 = true;
-            }
-          }
-        }
+        // Decide whether this tile uses opt-in native 7-chunk PT W8A16(FP16)
+        // (full FP32 accumulator, zero activation quantization).
+        const bool tile_use_w8a16 =
+            builtin_active && !ctx->mock_mode && w8a16_mode == 1u &&
+            hw_m == 1u && ob::is_w8a16_pt_1x_shape(1u, hw_k, hw_n);
 
         // 1. Quantize/prepare shared A ONCE per (k0, tk, hw_k, tile_use_w8a16) across sibling tiles
         if (cached_a_k0 != k0 || cached_a_tk != tk || cached_aq_hw_k != hw_k ||

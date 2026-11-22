@@ -37,7 +37,7 @@ Investigating the three bandwidth/precision levers beyond Phase 7's `27.96 GB/s`
    - Kept calling BIG-core inline NEON (`kDefaultWorkerThreads=1`) for `quant`, `pack`, `submit`, `wait`, and `M<=8` decode, while offloading `M>8` prefill `dequant + outlier FMA` via a **16-slot cache-line-padded SPSC ring** to **1 persistent helper thread pinned to Tensor G5 performance cores (`cpuinfo_max_freq > min_freq`, `cpu2..7`)** with `~1` wakeup per prefill call (`0%` CPU during `tg64`).
    - Result: `OPENBUENOS_ASYNC_DEQUANT=1` outperformed synchronous `=0` on all 3 warm benchmarks (`SmolLM2 pp512`: `1,250.0 vs 1,204.7`; `Qwen2.5 Q8 pp512`: `179.4 vs 174.0`; `Qwen2.5 Q4 pp512`: `180.4 vs 164.1 t/s`).
 3. **Clean-Room 7-Chunk PT `W8A16(FP16)` Integrated (`ob_gemm_emitter.cpp`, `ob_gemm.cpp`)**:
-   - Implemented NEON `[N/32, K/2, 32, 2]` `w_i8^0x80` packer, generalized `16`-core `M=1` emitter (`512..2048`) with Probe-A dynamic `override_params`, NEON per-channel scale epilogue, `|x|>32768` prescale guard, and `OPENBUENOS_W8A16={0,1,auto}` (`opt-in`).
+   - Implemented NEON `[N/32, K/2, 32, 2]` `w_i8^0x80` packer, generalized `16`-core `M=1` emitter (`512..2048`) with Probe-A dynamic `override_params`, NEON per-channel scale epilogue, `|x|>32768` prescale guard, and `OPENBUENOS_W8A16={0,1}` (`opt-in`).
    - Host verification (`make -C libopenbuenos verify`): **20/20 suites PASS** (incl. Suite 20 `12,880/12,880 B` bit-exact PT W8A16 oracle); host `test-backend-ops`: `MUL_MAT 327/327`, `MUL_MAT_ID 227/227`.
 
 ---
@@ -50,7 +50,7 @@ All runs at `max_freq_mhz = 1286.4` (`PM=5` + FW WakeLock), `MAPS_GOOGLE=0`, `cp
 - `openbuenos_selftest --test-swiglu`: **`8/8 PASS`** (`sat_retries=0`, `qwen25_q4_64x1536x8960` fixed from `4.00e-03` -> **`2.14e-03`** at `5970 us` HW).
 - `openbuenos_selftest --test-w8a16`: **`8/8 PASS`** on live silicon (`pt_1x1536x1536` `144 us / 16.38 GB/s / relL2=2.181e-4`; `pt_1x2048x2048` `229 us / 18.32 GB/s / relL2=2.133e-4`; `spike75` `138 us / relL2=5.347e-5`; `prescale50k` `140 us / relL2=2.264e-4`).
 - `test-backend-ops`: **`435/435 PASS`** (`MUL_MAT q8_0` `104/104` in `10.56 s`; `q4_0` `104/104` in `21.44 s`; **`MUL_MAT_ID` MoE `q8_0` `115/115`** in `30.48 s` `99.99%` hit; **`MUL_MAT_ID` MoE `q4_0` `112/112`** in `28.99 s` `99.76%` hit).
-- Coherent greedy completions on `SmolLM2-135M-Q8_0`, `Qwen2.5-1.5B-Q8_0`, `Qwen2.5-1.5B-Q4_0`, plus opt-in `W8A16=1` (`sat_retries 50->14`) & `W8A16=auto` (`sat_retries 50->21`), all `w_evict=0`.
+- Coherent greedy completions on `SmolLM2-135M-Q8_0`, `Qwen2.5-1.5B-Q8_0`, `Qwen2.5-1.5B-Q4_0`, plus opt-in `W8A16=1` (`sat_retries 50->14`), all `w_evict=0`.
 
 ### 3.2 Phase 7 -> Phase 8 Warm `llama-bench` (`-p 128,512 -n 64 -t 4 -r 3`, `w_evict = 0`)
 
@@ -66,7 +66,7 @@ All runs at `max_freq_mhz = 1286.4` (`PM=5` + FW WakeLock), `MAPS_GOOGLE=0`, `cp
 | `Qwen2.5-1.5B Q4` | `pp512` | `144.99` | **`180.37 ± 3.27`** `[176.98, 183.50, 180.62]` (**beats CPU `160.2–176.3`**) | `164.09` | **`+24.4%`** | `1,368 MB` / `1,460 MB` |
 | `Qwen2.5-1.5B Q4` | `tg64` | `8.98` | **`9.38 ± 1.76`** `[7.36, 10.45, 10.35]` (warm **`10.45`**) | `5.99` | **`+4.5%`** | `1,368 MB` / `1,294 MB` |
 
-*(Opt-in `W8A16=1` / `auto` `Qwen2.5 Q8 tg64`: `4.96 ± 1.32` / `4.56 ± 1.10 t/s`, `w_evict=0`.)*
+*(Opt-in `W8A16=1` `Qwen2.5 Q8 tg64`: `4.96 ± 1.32 t/s`, `w_evict=0`.)*
 
 ### 3.3 18-Case Standalone ODPM `mJ/tok` Sweep (live device telemetry) — **5/6 Prefills Lower Steady-State Energy per Token vs 4T CPU**
 

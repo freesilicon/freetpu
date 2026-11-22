@@ -1168,17 +1168,7 @@ ob_status_t ob_context_create(const ob_config_t* config, ob_context_t** out_ctx)
   ctx->num_threads = env_threads;
   ctx->worker_pool.init(ctx->num_threads);
   ctx->async_dequant_enabled = read_env_flag("OPENBUENOS_ASYNC_DEQUANT", true);
-  ctx->w8a16_mode = 0u;
-  if (const char* ws = std::getenv("OPENBUENOS_W8A16"); ws && ws[0]) {
-    if (std::strcmp(ws, "auto") == 0 || std::strcmp(ws, "AUTO") == 0) {
-      ctx->w8a16_mode = 2u;
-    } else {
-      uint32_t wm = 0u;
-      if (read_env_u32("OPENBUENOS_W8A16", &wm)) {
-        ctx->w8a16_mode = (wm > 2u) ? 2u : wm;
-      }
-    }
-  }
+  ctx->w8a16_mode = read_env_flag("OPENBUENOS_W8A16", false) ? 1u : 0u;
   uint32_t env_max_out = ob::kDefaultMaxCachedOutlierCols;
   if (read_env_u32("OPENBUENOS_MAX_OUTLIER_COLS", &env_max_out)) {
     if (env_max_out > 1024u) env_max_out = 1024u;

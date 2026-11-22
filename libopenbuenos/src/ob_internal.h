@@ -650,7 +650,7 @@ struct ob_context {
   uint32_t spin_us = 450u; // Adaptive spin window (us) before poll(resp_efd) when ema_hw_us < 600
   uint32_t num_threads = ob::kDefaultWorkerThreads; // OPENBUENOS_THREADS (default 1, opt-in >1)
   bool async_dequant_enabled = true; // OPENBUENOS_ASYNC_DEQUANT (default 1, opt-out 0)
-  uint32_t w8a16_mode = 0u; // OPENBUENOS_W8A16: 0=off, 1=force supported M=1, 2=auto/outlier M=1
+  uint32_t w8a16_mode = 0u; // OPENBUENOS_W8A16: 0=off, 1=opt-in supported M=1
   uint32_t max_cached_outlier_cols = ob::kDefaultMaxCachedOutlierCols; // OPENBUENOS_MAX_OUTLIER_COLS (default 160)
   uint64_t ema_hw_us = 0u; // Exponential moving average of firmware hw_execution_us
   uint32_t credit_size = OB_MAX_CREDITS;
