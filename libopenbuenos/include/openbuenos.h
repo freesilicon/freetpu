@@ -487,6 +487,14 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t*                  ctx,
  * Automatically handles arbitrary M (chunking M > 64 internally), exact CPU FP32
  * reference in mock_mode=1, and clean M7A batched fallback for unsupported shapes,
  * extreme outlier rows, or OPENBUENOS_DISABLE_SWIGLU_CHAIN=1.
+ *
+ * Intermediate clipping safety: by default, chained execution runs only when
+ * O(K) Holder/L2/L1 norm bounds prove zero intermediate gate/up/mul INT8
+ * clipping; unproven slices route directly to the hardware-checked M7A TPU
+ * fallback with zero host projection recomputation. Set
+ * OPENBUENOS_SWIGLU_FAST_CHAIN=1 to enable statistical 3.65-sigma chained LLM
+ * decode (guarded by O(K) crest/RMS/DC screening and down-output saturation
+ * retries) without host-side gate/up projection recomputation.
  */
 typedef struct ob_gemm_swiglu_quant_desc {
   const void* w_gate_hk;    /* [h_dim, k_dim] contiguous ob_block_q8_0_t or ob_block_q4_0_t */

@@ -3350,6 +3350,7 @@ void test_phase7b_swiglu_chaining_2tier_and_outlier_cache() {
   //    HARDWARE-EXACT FP32 NMSE PROOF + Fallback Gates
   // -------------------------------------------------------------------------
   ::unsetenv("OPENBUENOS_DISABLE_SWIGLU_CHAIN");
+  ::unsetenv("OPENBUENOS_SWIGLU_FAST_CHAIN");
   ::unsetenv("OPENBUENOS_SWIGLU_MAX_CREST");
   ::unsetenv("OPENBUENOS_WEIGHT_CACHE_MB");
 
@@ -3359,6 +3360,7 @@ void test_phase7b_swiglu_chaining_2tier_and_outlier_cache() {
   cfg.graph_cache_capacity = 256u;
   ob_context_t* ctx = nullptr;
   CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+  ctx->swiglu_fast_chain_enabled = true;
   ob_context_set_profile(ctx, 1);
   CHECK(ob_gemm_register_builtin_emitter(ctx, interp_file.path()) == OB_OK);
 
@@ -4252,7 +4254,8 @@ void test_phase7_cycle3_regressions() {
     }
   }
 
-  // 4. Warm SwiGLU always enforces clipping check whenever Holder bounds fail (reusing cached ext[2])
+  // 4. Default SwiGLU chains only when O(K) Holder bounds prove zero clipping (zero CPU MACs!),
+  //    routes unproven/correlated warm activations straight to M7A TPU fallback, and rejects null weights in INT8 API.
   {
     constexpr uint32_t K = 576u, H = 1536u, N = 576u;
     const uint32_t nb_k = K / OB_QK8_0;
@@ -4284,15 +4287,15 @@ void test_phase7_cycle3_regressions() {
     wd[0].d = d_one;
     wd[0].qs[0] = 1;
 
-    // Cold benign input: orthogonal to row 0 -> chains cleanly and warms weight cache.
-    std::vector<float> a_benign(K, 0.0f);
-    for (uint32_t k = 128u; k < K; ++k) {
-      a_benign[k] = ((k % 4u) < 2u) ? 0.1f : -0.1f;
+    // Cold sparse input: 3 nonzero entries -> crest=13.86 <= 16, l1_aq <= 381, ub <= 48,387 <= 127*512,
+    // and max_prod <= 8128 = 127*64, so O(K) Holder bound proves zero clipping in default mode (zero CPU MACs!).
+    std::vector<float> a_holder(K, 0.0f);
+    for (uint32_t k = 128u; k < 131u; ++k) {
+      a_holder[k] = (k & 1u) ? -0.5f : 0.5f;
     }
-    a_benign[575] = 0.5f;
 
     // Warm clipping input: aligned with row 0 on [0..128) (+/-1.0) + spike 3.0 ->
-    // fails Holder bound; exact check from cached ext[2] MUST catch intermediate clip and fall back!
+    // fails Holder bound; default mode routes directly to M7A TPU fallback with zero CPU recomputation!
     std::vector<float> a_clip(K, 0.0f);
     for (uint32_t k = 0u; k < 128u; ++k) {
       a_clip[k] = (k & 1u) ? -1.0f : 1.0f;
@@ -4302,15 +4305,33 @@ void test_phase7_cycle3_regressions() {
     ob_gemm_swiglu_quant_desc_t sd{wg.data(), wu.data(), wd.data(), 1u, K, H, N, 0u, 0u, 0u, 0u};
     std::vector<float> c(N, 0.0f);
 
+    ::unsetenv("OPENBUENOS_SWIGLU_FAST_CHAIN");
     ob_config_t cfg = ob_config_default();
     cfg.mock_mode = 1;
     cfg.max_inflight = 1u; // Also exercises 1-credit pinned weight tile path!
     ob_context_t* ctx = nullptr;
     CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+    CHECK(ctx->swiglu_fast_chain_enabled == false);
     CHECK(ob_gemm_register_builtin_emitter(ctx, interp_file.path()) == OB_OK);
 
+    // Public ob_gemm_swiglu_int8 must reject any missing weight matrix consistently.
+    {
+      std::vector<int8_t> ix(64u, 1), iy(64u, 0), iw(64u * 64u, 1);
+      ob_swiglu_int8_desc_t id{};
+      id.m_dim = 1u; id.k_dim = 64u; id.h_dim = 64u; id.n_dim = 64u;
+      id.s_in = 1.0f; id.s_wg = 1.0f; id.s_gate = 1.0f;
+      id.s_wu = 1.0f; id.s_up = 1.0f; id.s_silu = 1.0f;
+      id.s_prod = 1.0f; id.s_wd = 1.0f; id.s_out = 1.0f;
+      id.wg_hk = nullptr; id.wu_hk = iw.data(); id.wd_nh = iw.data();
+      CHECK(ob_gemm_swiglu_int8(ctx, ix.data(), &id, iy.data(), nullptr) == OB_ERR_INVALID_ARG);
+      id.wg_hk = iw.data(); id.wu_hk = nullptr; id.wd_nh = iw.data();
+      CHECK(ob_gemm_swiglu_int8(ctx, ix.data(), &id, iy.data(), nullptr) == OB_ERR_INVALID_ARG);
+      id.wg_hk = iw.data(); id.wu_hk = iw.data(); id.wd_nh = nullptr;
+      CHECK(ob_gemm_swiglu_int8(ctx, ix.data(), &id, iy.data(), nullptr) == OB_ERR_INVALID_ARG);
+    }
+
     ob_invoke_stats_t s1{}, s2{};
-    CHECK(ob_gemm_swiglu_f32_quant(ctx, a_benign.data(), &sd, c.data(), &s1) == OB_OK);
+    CHECK(ob_gemm_swiglu_f32_quant(ctx, a_holder.data(), &sd, c.data(), &s1) == OB_OK);
     ob_profile_stats_t p1{}, p2{};
     CHECK(ob_context_get_profile(ctx, &p1) == OB_OK);
     CHECK(p1.swiglu_chunks_chained == 1u && p1.swiglu_fallbacks == 0u);

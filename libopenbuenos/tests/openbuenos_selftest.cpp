@@ -1402,7 +1402,8 @@ int run_test_swiglu(int iters, int perf_mode, const char* dive_interp_path,
     return 1;
   }
   if (profile) ob_context_set_profile(ctx, 1);
-  // Enable opt-in M=64 SwiGLU chaining inside --test-swiglu so both M=1 and M=64 shapes are verified
+  // Enable opt-in fast SwiGLU chaining + M=64 prefill inside --test-swiglu so M=1 and M=64 shapes are verified
+  ctx->swiglu_fast_chain_enabled = true;
   ctx->swiglu_prefill_enabled = true;
   st = ob_gemm_register_builtin_emitter(ctx, dive_interp_path);
   if (st != OB_OK) {

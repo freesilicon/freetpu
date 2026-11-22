@@ -1037,6 +1037,7 @@ ob_status_t ob_context_create(const ob_config_t* config, ob_context_t** out_ctx)
       ctx->large_tiles_enabled && !read_env_flag("OPENBUENOS_DISABLE_BATCHED_LARGE_TILES", false);
   ctx->horiz_fusion_enabled = !read_env_flag("OPENBUENOS_DISABLE_HORIZ_FUSION", false);
   ctx->swiglu_chain_enabled = !read_env_flag("OPENBUENOS_DISABLE_SWIGLU_CHAIN", false);
+  ctx->swiglu_fast_chain_enabled = read_env_flag("OPENBUENOS_SWIGLU_FAST_CHAIN", false);
   ctx->swiglu_prefill_enabled = read_env_flag("OPENBUENOS_SWIGLU_PREFILL", false);
   if (const char* s = std::getenv("OPENBUENOS_SWIGLU_MAX_CREST"); s && s[0]) {
     char* end = nullptr;

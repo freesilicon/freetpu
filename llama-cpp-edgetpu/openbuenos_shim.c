@@ -10,6 +10,7 @@
 #include "openbuenos.h"
 
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -400,9 +401,14 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t *                      ctx,
         return OB_ERR_INVALID_ARG;
     }
     const uint64_t t0 = ob_shim_now_us();
-    const size_t mh = (size_t)desc->m_dim * desc->h_dim;
-    float * gate_buf = (float *)malloc(mh * sizeof(float));
-    float * up_buf   = (float *)malloc(mh * sizeof(float));
+    if ((size_t)desc->m_dim > SIZE_MAX / sizeof(float) ||
+        (size_t)desc->h_dim > (SIZE_MAX / sizeof(float)) / (size_t)desc->m_dim) {
+        return OB_ERR_INVALID_ARG;
+    }
+    const size_t mh = (size_t)desc->m_dim * (size_t)desc->h_dim;
+    const size_t scratch_bytes = mh * sizeof(float);
+    float * gate_buf = (float *)malloc(scratch_bytes);
+    float * up_buf   = (float *)malloc(scratch_bytes);
     if (!gate_buf || !up_buf) {
         free(gate_buf);
         free(up_buf);

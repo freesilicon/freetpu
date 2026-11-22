@@ -3564,7 +3564,10 @@ ob_status_t ob_gemm_swiglu_int8(ob_context_t* ctx,
                                 const ob_swiglu_int8_desc_t* desc,
                                 int8_t* y_mn,
                                 ob_invoke_stats_t* out_stats) {
-  if (!ctx || !x_mk || !desc || !y_mn) return OB_ERR_INVALID_ARG;
+  if (!ctx || !x_mk || !desc || !y_mn ||
+      !desc->wg_hk || !desc->wu_hk || !desc->wd_nh) {
+    return OB_ERR_INVALID_ARG;
+  }
   if (!ob::is_swiglu_shape(desc->m_dim, desc->k_dim, desc->h_dim, desc->n_dim)) {
     ob::set_last_error(ctx, "Unsupported exact INT8 SwiGLU shape");
     return OB_ERR_UNSUPPORTED;
@@ -3868,188 +3871,6 @@ float neon_dot_f32_q4_row(const float* a, const ob_block_q4_0_t* row, uint32_t n
 #endif
 }
 
-inline int64_t dot_i8_row_exact(const int8_t* a, const int8_t* b, uint32_t K) {
-#if defined(__ARM_NEON) && defined(__aarch64__)
-  int32x4_t acc0 = vdupq_n_s32(0);
-  int32x4_t acc1 = vdupq_n_s32(0);
-  uint32_t k = 0u;
-  for (; k + 16u <= K; k += 16u) {
-    int8x16_t va = vld1q_s8(a + k);
-    int8x16_t vb = vld1q_s8(b + k);
-    acc0 = vaddq_s32(acc0, vpaddlq_s16(vmull_s8(vget_low_s8(va), vget_low_s8(vb))));
-    acc1 = vaddq_s32(acc1, vpaddlq_s16(vmull_high_s8(va, vb)));
-  }
-  int64_t s = static_cast<int64_t>(vaddvq_s32(vaddq_s32(acc0, acc1)));
-  for (; k < K; ++k) s += static_cast<int64_t>(a[k]) * static_cast<int64_t>(b[k]);
-  return s;
-#else
-  int64_t s = 0LL;
-  for (uint32_t k = 0u; k < K; ++k) s += static_cast<int64_t>(a[k]) * static_cast<int64_t>(b[k]);
-  return s;
-#endif
-}
-
-// Verify intermediate gate, up, and product ranges across all rows of a SwiGLU chunk.
-// Allows at most a 2x power-of-2 divider adjustment when borderline Gaussian tail channels
-// exceed 127 (up to 254), and rejects to M7A fallback whenever any intermediate stage
-// would still clip (eliminating silent correlated saturation).
-bool swiglu_chunk_clips_or_tunes(ob_context* ctx,
-                                 const ob::CachedWeightTile* w_tile,
-                                 const int8_t* cold_wg_q,
-                                 const int8_t* cold_wu_q,
-                                 const int8_t* a_q,
-                                 uint32_t tm,
-                                 uint32_t hw_m,
-                                 uint32_t K,
-                                 uint32_t hw_h,
-                                 uint32_t th,
-                                 float s_a,
-                                 float s_wg,
-                                 uint32_t* io_d_gate,
-                                 uint32_t* io_d_up,
-                                 uint32_t* io_d_mul) {
-  const bool have_cold = (cold_wg_q != nullptr && cold_wu_q != nullptr);
-  const size_t p_gate = (hw_m == 64u)
-      ? (static_cast<size_t>(hw_h) * (K + 16u))
-      : (static_cast<size_t>(hw_h) * (K + 4u));
-
-  struct Ext2ReadGuard {
-    ob_buffer* buf = nullptr;
-    bool active = false;
-    ~Ext2ReadGuard() {
-      if (active && buf) ob::buffer_sync_end_read(buf);
-    }
-  } ext2_guard;
-
-  const uint8_t* e2_g = nullptr;
-  const uint8_t* e2_u = nullptr;
-  std::vector<int8_t> wg_row_buf;
-  std::vector<int8_t> wu_row_buf;
-
-  if (!have_cold) {
-    if (!w_tile || !w_tile->ext2_buf || w_tile->ext2_bytes < 2u * p_gate) {
-      return true;
-    }
-    if (ctx && !ctx->mock_mode) {
-      if (ob::buffer_sync_begin_read(w_tile->ext2_buf) != OB_OK) {
-        return true;
-      }
-      ext2_guard.buf = w_tile->ext2_buf;
-      ext2_guard.active = true;
-    }
-    const uint8_t* e2_base = static_cast<const uint8_t*>(ob_buffer_data(w_tile->ext2_buf));
-    if (!e2_base) return true;
-    e2_g = e2_base;
-    e2_u = e2_base + p_gate;
-    wg_row_buf.resize(K);
-    wu_row_buf.resize(K);
-  }
-
-  for (int attempt = 0; attempt < 2; ++attempt) {
-    const uint32_t dg = *io_d_gate;
-    const uint32_t du = *io_d_up;
-    const uint32_t dm = *io_d_mul;
-    const float s_gate = s_a * s_wg * static_cast<float>(dg);
-    int8_t silu_lut[256];
-    ob::build_swiglu_silu_lut(s_gate, silu_lut);
-
-    int64_t worst_g = 0;
-    int64_t worst_u = 0;
-    int64_t worst_prod = 0;
-    for (uint32_t hi = 0u; hi < th; ++hi) {
-      const int8_t* wg_row = nullptr;
-      const int8_t* wu_row = nullptr;
-      if (have_cold) {
-        wg_row = cold_wg_q + static_cast<size_t>(hi) * K;
-        wu_row = cold_wu_q + static_cast<size_t>(hi) * K;
-      } else {
-        if (hw_m == 64u) {
-          const uint32_t ng = hi >> 3u;
-          const uint32_t c = hi & 7u;
-          const size_t grp_off = static_cast<size_t>(ng) * (128u + 8u * K) + 128u;
-          for (uint32_t kb = 0u; kb < K / 16u; ++kb) {
-            const size_t blk_off = grp_off + (static_cast<size_t>(kb) * 8u + c) * 16u;
-            for (uint32_t l = 0u; l < 16u; ++l) {
-              wg_row_buf[kb * 16u + l] = static_cast<int8_t>(e2_g[blk_off + l] ^ 0x80u);
-              wu_row_buf[kb * 16u + l] = static_cast<int8_t>(e2_u[blk_off + l] ^ 0x80u);
-            }
-          }
-        } else {
-          const uint32_t g = hi >> 5u;
-          const uint32_t r = hi & 31u;
-          const size_t grp_off = static_cast<size_t>(g) * (128u + 32u * K) + 128u;
-          for (uint32_t kb = 0u; kb < K / 16u; ++kb) {
-            const size_t blk_off = grp_off + static_cast<size_t>(kb) * 512u;
-            for (uint32_t q = 0u; q < 4u; ++q) {
-              const size_t q_off = blk_off + static_cast<size_t>(q) * 128u + static_cast<size_t>(r) * 4u;
-              for (uint32_t l = 0u; l < 4u; ++l) {
-                wg_row_buf[kb * 16u + q * 4u + l] = static_cast<int8_t>(e2_g[q_off + l] ^ 0x80u);
-                wu_row_buf[kb * 16u + q * 4u + l] = static_cast<int8_t>(e2_u[q_off + l] ^ 0x80u);
-              }
-            }
-          }
-        }
-        wg_row = wg_row_buf.data();
-        wu_row = wu_row_buf.data();
-      }
-      for (uint32_t mi = 0u; mi < tm; ++mi) {
-        const int8_t* aq = a_q + static_cast<size_t>(mi) * K;
-        const int64_t acc_g = dot_i8_row_exact(aq, wg_row, K);
-        const int64_t acc_u = dot_i8_row_exact(aq, wu_row, K);
-        const int64_t ag = acc_g < 0 ? -acc_g : acc_g;
-        const int64_t au = acc_u < 0 ? -acc_u : acc_u;
-        if (ag > worst_g) worst_g = ag;
-        if (au > worst_u) worst_u = au;
-        if (ag > 254LL * static_cast<int64_t>(dg) || au > 254LL * static_cast<int64_t>(du)) {
-          return true;
-        }
-        const float gr = std::nearbyint(static_cast<float>(acc_g) / static_cast<float>(dg));
-        const float ur = std::nearbyint(static_cast<float>(acc_u) / static_cast<float>(du));
-        const int32_t q_g = (gr < -128.0f) ? -128 : ((gr > 127.0f) ? 127 : static_cast<int32_t>(gr));
-        const int32_t q_u = (ur < -128.0f) ? -128 : ((ur > 127.0f) ? 127 : static_cast<int32_t>(ur));
-        const int32_t q_silu = static_cast<int32_t>(silu_lut[q_g + 128]);
-        const int64_t prod = static_cast<int64_t>(q_silu) * static_cast<int64_t>(q_u);
-        const int64_t ap = prod < 0 ? -prod : prod;
-        if (ap > worst_prod) worst_prod = ap;
-        if (ap > 254LL * 64LL) {
-          return true;
-        }
-      }
-    }
-
-    const bool g_ok = (worst_g <= 127LL * static_cast<int64_t>(dg));
-    const bool u_ok = (worst_u <= 127LL * static_cast<int64_t>(du));
-    const bool m_ok = (worst_prod <= 127LL * static_cast<int64_t>(dm));
-    if (g_ok && u_ok && m_ok) return false;
-    if (attempt > 0) return true;
-
-    bool changed = false;
-    if (!g_ok) {
-      if (dg >= 65536u || worst_g > 127LL * static_cast<int64_t>(dg << 1u)) return true;
-      *io_d_gate = dg << 1u;
-      changed = true;
-    }
-    if (!u_ok) {
-      if (du >= 65536u || worst_u > 127LL * static_cast<int64_t>(du << 1u)) return true;
-      *io_d_up = du << 1u;
-      changed = true;
-    }
-    if (!m_ok) {
-      uint32_t next_dm = dm;
-      while (next_dm < 64u && worst_prod > 127LL * static_cast<int64_t>(next_dm)) {
-        next_dm <<= 1u;
-      }
-      if (worst_prod > 127LL * static_cast<int64_t>(next_dm) && !changed) return true;
-      if (next_dm != dm) {
-        *io_d_mul = next_dm;
-        changed = true;
-      }
-    }
-    if (!changed) return true;
-  }
-  return true;
-}
-
 void cpu_swiglu_f32_quant_slice(const float* a_slice,
                                 const ob_gemm_swiglu_quant_desc_t* d,
                                 uint32_t tm,
@@ -4163,6 +3984,7 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
   const uint32_t N = desc->n_dim;
 
   bool can_chain_shape = false;
+  bool fast_chain_on = false;
   bool prefill_chain_on = false;
   bool builtin_active = false;
   bool prof_on = false;
@@ -4176,6 +3998,7 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
     prof_on = ctx->profile_enabled;
     strict_hash = ctx->strict_weight_hash;
     max_crest = ctx->swiglu_max_crest;
+    fast_chain_on = ctx->swiglu_fast_chain_enabled;
     prefill_chain_on = ctx->swiglu_prefill_enabled && ctx->batched_large_tiles_enabled;
     param_swap_slots = ctx->param_swap_slots;
     ring_depth = std::max<uint32_t>(1u, std::min<uint32_t>(ctx->credit_size, OB_MAX_CREDITS));
@@ -4643,8 +4466,6 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
           break;
         }
 
-        std::vector<int8_t> cold_wg_q;
-        std::vector<int8_t> cold_wu_q;
         if (!w_tile) {
           const uint64_t tp0 = prof_on ? ob::monotonic_now_ns() : 0u;
           // Cold pack:
@@ -4831,8 +4652,6 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
           } else {
             w_tile->in_cache = false;
           }
-          cold_wg_q = std::move(wg_q);
-          cold_wu_q = std::move(wu_q);
         }
 
         ob::PinnedWeightTile pinned_w(w_tile);
@@ -4902,13 +4721,12 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
                 holder_proven = true;
               }
             }
-            if (!holder_proven) {
-              const int8_t* cold_wg_ptr = cold_wg_q.empty() ? nullptr : cold_wg_q.data();
-              const int8_t* cold_wu_ptr = cold_wu_q.empty() ? nullptr : cold_wu_q.data();
-              reject_clip = swiglu_chunk_clips_or_tunes(
-                  ctx, w_tile, cold_wg_ptr, cold_wu_ptr, a_q.data(),
-                  ms.tm, ms.hw_m, K, hw_h, th, s_a, w_tile->swiglu_s_wg,
-                  &d_gate, &d_up, &d_mul);
+            if (!holder_proven && !fast_chain_on) {
+              // Avoid recomputing gate/up projections on the host CPU: when O(K) norm
+              // bounds cannot prove clip-free intermediates, route directly to the
+              // hardware-checked 2-stage TPU M7A fallback unless statistical fast
+              // chaining (OPENBUENOS_SWIGLU_FAST_CHAIN=1) was explicitly opted in.
+              reject_clip = true;
             }
           }
           if (reject_clip) {

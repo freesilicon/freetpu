@@ -481,6 +481,7 @@ struct ob_context {
   bool batched_large_tiles_enabled = true;
   bool horiz_fusion_enabled = true;
   bool swiglu_chain_enabled = true;
+  bool swiglu_fast_chain_enabled = false;
   bool swiglu_prefill_enabled = false;
   float swiglu_max_crest = 16.0f;
   uint32_t param_swap_slots = 1u;
