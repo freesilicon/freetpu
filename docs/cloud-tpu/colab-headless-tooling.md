@@ -10,7 +10,7 @@ Google provides two official, supported headless automation surfaces for Colab r
 
 | Control Plane | Endpoint / Binary | Auth & Scopes | Best Use Case |
 | --- | --- | --- | --- |
-| **`google-colab-cli` (`colab`)** | `colab` CLI (`uv tool install google-colab-cli`) | `--auth=adc` or `--auth=oauth2` (`openid`, `cloud-platform`, `userinfo.email`, `colaboratory`) | Zero-waste `colab run` ephemeral TPU probes, persistent kernel `colab exec`, `/api/contents/` file sync, `colab log -o proof.ipynb`, `colab usage` |
+| **`google-colab-cli` (`colab`)** | `colab` CLI `>= 0.7.6` (`uv tool install google-colab-cli`) | `--auth=adc` or `--auth=oauth2` (`openid`, `cloud-platform`, `userinfo.email`, `colaboratory`) | Zero-waste `colab run` ephemeral TPU probes, persistent kernel `colab exec`, `/api/contents/` file sync, `colab log -o proof.ipynb`, `colab usage` |
 | **Official Colab MCP & Public REST `v1beta`** | `https://colaboratory.googleapis.com/mcp` & `https://colaboratory.googleapis.com/v1beta` | OAuth2 / ADC with `colaboratory` (or `colaboratory.readonly` for read-only REST discovery/inspection) + allowlisted `X-Goog-User-Project` | IDE/agent MCP orchestration (`list_runtime_specs`, `create_runtime`, `execute_code`, `delete_runtime`) with UUID `requestId` & `executionId` reattachment; Public REST `v1beta` covers subscription, runtime-spec discovery, and runtime lifecycle |
 
 ### `google-colab-cli` Dual-Path & `--no-public-api` Behavior
@@ -80,7 +80,7 @@ If your GCP project still receives `403` on `colaboratory.googleapis.com/v1beta`
 
 ## 3. Using `tools/colab_tpu_bench.py`
 
-[`tools/colab_tpu_bench.py`](../../tools/colab_tpu_bench.py) wraps `google-colab-cli` with private `0700` output/config checks, signed CU guards, isolated `--config` normalization, conservative `v6e1 -> v5e1` fallback, independent inactivity (`--timeout`) and optional local wall-clock (`--wall-timeout`) caps, bounded `colab stop` reconciliation on Ctrl+C/wall-timeout or active-endpoint leak retries, TPU-validated probe JSON capture, and `.ipynb` proof export:
+[`tools/colab_tpu_bench.py`](../../tools/colab_tpu_bench.py) enforces `google-colab-cli >= 0.7.6` (redacted/private credential logging) before any authenticated command and wraps `google-colab-cli` with private `0700` output/config checks, signed CU guards, per-run isolated `--config` & dedicated recovery stores, conservative `v6e1 -> v5e1` fallback, independent inactivity (`--timeout`) and optional local wall-clock (`--wall-timeout`) caps, bounded `colab stop` reconciliation on Ctrl+C/SIGTERM/wall-timeout or active-endpoint/listing retries, TPU-validated probe JSON capture, and `.ipynb` proof export:
 
 ```bash
 # Offline CI self-test (no Colab credentials or hardware required)

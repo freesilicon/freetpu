@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shlex
@@ -43,6 +44,11 @@ PROBE_JSON_END = "=== FREETPU_COLAB_PROBE_JSON_END ==="
 
 DEFAULT_TPU_ORDER: Tuple[str, ...] = ("v6e1", "v5e1")
 SUPPORTED_TPUS = frozenset({"v6e1", "v5e1"})
+MIN_COLAB_CLI_VERSION: Tuple[int, int, int] = (0, 7, 6)
+_VERSION_RE = re.compile(
+    r"\b(\d+)\.(\d+)\.(\d+)(?:(?:\.?post\d+)|([.-]?(?:a|b|rc|alpha|beta|dev|pre)\w*))?",
+    re.IGNORECASE,
+)
 
 _ALLOCATION_DIAGNOSTIC_PATTERNS = (
     re.compile(r"^\[colab\]\s+allocation refused\b"),
@@ -356,10 +362,14 @@ def _ensure_dir_not_shared_writable(dir_path: Path) -> Path:
     return canonical_dir
 
 
-def _normalize_config_path(config_path: Optional[Path], out_dir: Path) -> Path:
-    """Normalize explicit or default `--config` to a canonical non-symlink path with safe lock/parent."""
+def _normalize_config_path(
+    config_path: Optional[Path],
+    out_dir: Path,
+    session_base: str = "run",
+) -> Path:
+    """Normalize explicit or default per-run `--config` to a canonical non-symlink path."""
     if config_path is None:
-        raw_cfg = out_dir / "colab-sessions.json"
+        raw_cfg = out_dir / f"colab-sessions.{session_base}.json"
     else:
         expanded = Path(os.path.expanduser(str(config_path)))
         if expanded.is_symlink():
@@ -382,43 +392,88 @@ def _coerce_subprocess_text(data: Any) -> str:
     return str(data)
 
 
-def _ensure_recovery_session_entry(
-    config_path: Path,
+def _write_recovery_session_store(
+    recovery_config: Path,
     session_name: str,
     endpoint: str,
-) -> bool:
-    """Ensure `config_path` contains a `colab stop`-usable mapping for `session_name -> endpoint`.
+) -> None:
+    """Write a dedicated per-run `colab stop` recovery store without touching shared session state.
 
     `google-colab-cli` v0.8.0's `colab run` teardown swallows `unassign()` failures and still
-    removes the session from local state. Re-seeding a minimal `SessionState`-compatible entry
-    with `token_expires_at: null` lets `colab stop -s <session_name>` refresh proxy metadata from
-    `list_assignments()` and unassign the stranded endpoint without clobbering other sessions.
+    removes the session from local state. Writing a minimal `SessionState`-compatible entry
+    with `token_expires_at: null` into a dedicated per-run file lets `colab stop -s <session_name>`
+    refresh proxy metadata from `list_assignments()` and unassign the stranded endpoint without
+    racing against concurrent workers sharing an explicit `--config` file.
     """
-    if config_path.is_symlink() or Path(f"{config_path}.lock").is_symlink():
-        raise UntrustedPathError(f"Refusing symlinked recovery config/lock path: {config_path}")
-    data: Dict[str, Any] = {}
-    if os.path.lexists(config_path):
-        st = os.lstat(config_path)
-        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
-            raise UntrustedPathError(f"Refusing non-regular recovery config path: {config_path}")
-        try:
-            loaded = json.loads(config_path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                data = loaded
-        except (OSError, json.JSONDecodeError):
-            data = {}
-    existing = data.get(session_name)
-    if isinstance(existing, dict) and existing.get("endpoint") == endpoint:
-        return False
-    data[session_name] = {
-        "name": session_name,
-        "token": "",
-        "url": "",
-        "endpoint": endpoint,
-        "token_expires_at": None,
+    if recovery_config.is_symlink() or Path(f"{recovery_config}.lock").is_symlink():
+        raise UntrustedPathError(
+            f"Refusing symlinked recovery config/lock path: {recovery_config}"
+        )
+    data = {
+        session_name: {
+            "name": session_name,
+            "token": "",
+            "url": "",
+            "endpoint": endpoint,
+            "token_expires_at": None,
+        }
     }
-    _write_text_nofollow(config_path, json.dumps(data, indent=2) + "\n")
-    return True
+    _write_text_nofollow(recovery_config, json.dumps(data, indent=2) + "\n")
+
+
+def is_supported_colab_cli_version(version_text: str) -> Tuple[bool, Optional[str]]:
+    """Return `(supported, parsed_version)` requiring `google-colab-cli >= 0.7.6` (final).
+
+    Releases prior to `0.7.6` logged unredacted authorization headers/tokens to
+    `~/.config/colab-cli/colab.log` under the default umask.
+    """
+    m = _VERSION_RE.search(version_text)
+    if not m:
+        return False, None
+    major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    prerelease = m.group(4)
+    parsed_str = m.group(0)
+    ver_tuple = (major, minor, patch)
+    if ver_tuple < MIN_COLAB_CLI_VERSION:
+        return False, parsed_str
+    if ver_tuple == MIN_COLAB_CLI_VERSION and prerelease:
+        return False, parsed_str
+    return True, parsed_str
+
+
+def check_colab_cli_version(
+    colab_bin: str,
+    runner: CommandRunner,
+) -> Tuple[bool, Optional[str], Optional[str], int]:
+    """Run non-authenticated `colab version` and enforce `>= 0.7.6` before any auth command."""
+    try:
+        res = runner([colab_bin, "version"])
+    except FileNotFoundError:
+        return False, None, f"Executable {colab_bin!r} not found in PATH.", 127
+    combined = f"{res.stdout}\n{res.stderr}".strip()
+    if res.returncode != 0:
+        return (
+            False,
+            None,
+            (
+                f"`{colab_bin} version` failed (rc={res.returncode}): "
+                f"{combined or 'no diagnostic output'}. Upgrade to google-colab-cli >= 0.7.6."
+            ),
+            res.returncode,
+        )
+    supported, parsed = is_supported_colab_cli_version(combined)
+    if not supported:
+        min_str = ".".join(str(x) for x in MIN_COLAB_CLI_VERSION)
+        return (
+            False,
+            parsed,
+            (
+                f"Unsupported google-colab-cli version {parsed or combined!r}; "
+                f"version >= {min_str} is required for redacted/private credential logging."
+            ),
+            res.returncode,
+        )
+    return True, parsed, None, res.returncode
 
 
 def make_subprocess_runner(
@@ -926,10 +981,35 @@ def run_benchmark(
     runner: Optional[CommandRunner] = None,
 ) -> Tuple[int, Dict[str, Any]]:
     """Execute pre-flight checks, TPU run (with conservative fallback), and release verification."""
-    if cfg.wall_timeout_s is not None and cfg.wall_timeout_s < 0:
+    if not math.isfinite(cfg.min_cu_balance):
+        return 2, {
+            "status": "invalid_cu_balance",
+            "error": f"`--min-cu-balance` must be a finite number (got {cfg.min_cu_balance!r}).",
+        }
+    if not math.isfinite(cfg.timeout_s) or cfg.timeout_s < 0:
         return 2, {
             "status": "invalid_timeout",
-            "error": f"`--wall-timeout` must be >= 0 (got {cfg.wall_timeout_s!r}).",
+            "error": f"`--timeout` must be finite and >= 0 (got {cfg.timeout_s!r}).",
+        }
+    if cfg.wall_timeout_s is not None and (
+        not math.isfinite(cfg.wall_timeout_s) or cfg.wall_timeout_s < 0
+    ):
+        return 2, {
+            "status": "invalid_timeout",
+            "error": f"`--wall-timeout` must be finite and >= 0 (got {cfg.wall_timeout_s!r}).",
+        }
+    if not math.isfinite(cfg.request_timeout_s) or cfg.request_timeout_s <= 0:
+        return 2, {
+            "status": "invalid_timeout",
+            "error": f"`--request-timeout` must be finite and > 0 (got {cfg.request_timeout_s!r}).",
+        }
+    if not math.isfinite(cfg.teardown_retry_delay_s) or cfg.teardown_retry_delay_s < 0:
+        return 2, {
+            "status": "invalid_timeout",
+            "error": (
+                f"`teardown_retry_delay_s` must be finite and >= 0 "
+                f"(got {cfg.teardown_retry_delay_s!r})."
+            ),
         }
 
     using_default_runner = runner is None
@@ -980,13 +1060,13 @@ def run_benchmark(
     except UntrustedPathError as exc:
         return 2, {"status": "untrusted_out_dir", "error": str(exc)}
 
-    try:
-        isolated_config = _normalize_config_path(cfg.config_path, out_dir)
-    except UntrustedPathError as exc:
-        return 2, {"status": "untrusted_config_path", "error": str(exc)}
-
     session_prefix = cfg.session_name or "freetpu"
     session_base = f"{session_prefix}-{uuid.uuid4().hex[:8]}"
+
+    try:
+        isolated_config = _normalize_config_path(cfg.config_path, out_dir, session_base)
+    except UntrustedPathError as exc:
+        return 2, {"status": "untrusted_config_path", "error": str(exc)}
 
     script_file = cfg.script_path
     generated_script = False
@@ -1039,10 +1119,12 @@ def run_benchmark(
     planned_commands.append([*base_cmd, "sessions"])
 
     if cfg.dry_run:
+        plan_path = out_dir / "dry-run-plan.json"
         summary = {
             "status": "dry_run",
             "colab_cli_found": bool(caps.get("cli_found", True)),
             "out_dir": str(out_dir),
+            "plan_path": str(plan_path),
             "isolated_config": str(isolated_config),
             "script": str(script_file),
             "generated_script": generated_script,
@@ -1054,12 +1136,22 @@ def run_benchmark(
         }
         try:
             _write_text_nofollow(
-                out_dir / "summary.json",
+                plan_path,
                 json.dumps(summary, indent=2) + "\n",
             )
         except UntrustedPathError as exc:
             return 2, {"status": "untrusted_out_dir", "error": str(exc)}
         return 0, summary
+
+    ver_ok, cli_version, ver_err, ver_rc = check_colab_cli_version(cfg.colab_bin, runner)
+    if not ver_ok:
+        return 2, {
+            "status": "unsupported_colab_cli_version",
+            "detected_version": cli_version,
+            "min_version": ".".join(str(x) for x in MIN_COLAB_CLI_VERSION),
+            "returncode": ver_rc,
+            "error": ver_err,
+        }
 
     if cfg.auth == "oauth2" and using_default_runner:
         if sys.stdin.isatty():
@@ -1159,9 +1251,15 @@ def run_benchmark(
     }
     release_retries: List[Dict[str, Any]] = []
     recovery_command: Optional[str] = None
+    recovery_config_path: Optional[Path] = None
 
-    def _run_stop_cmd(sess_name: str) -> Tuple[CommandResult, Optional[str]]:
-        stop_res = runner([*base_cmd, "stop", "-s", sess_name])
+    def _run_stop_cmd(
+        sess_name: str,
+        *,
+        cmd_prefix: Optional[Sequence[str]] = None,
+    ) -> Tuple[CommandResult, Optional[str]]:
+        prefix = list(cmd_prefix) if cmd_prefix is not None else base_cmd
+        stop_res = runner([*prefix, "stop", "-s", sess_name])
         err_msg: Optional[str] = None
         if stop_res.returncode != 0:
             diag = (
@@ -1397,7 +1495,8 @@ def run_benchmark(
             break
 
     # 3. Verify server-side TPU assignment release whenever an allocation may have occurred,
-    #    re-seeding local recovery state and retrying release if this run's assignment is still active.
+    #    applying bounded retries to both active-assignment leaks and transient listing failures
+    #    using a dedicated per-run recovery store (never mutating another worker's `--config`).
     teardown_verified = not maybe_allocated
     leaked_endpoints: List[str] = []
     leaked_sessions: List[str] = []
@@ -1406,14 +1505,16 @@ def run_benchmark(
     teardown_error: Optional[str] = None
 
     def _inspect_active_sessions() -> Tuple[
-        Optional[str], List[str], List[str], List[str], List[str]
+        Optional[str], bool, List[str], List[str], List[str], List[str]
     ]:
         sess_res = runner([*base_cmd, "sessions"])
-        if sess_res.returncode != 0 or _has_colab_auth_failure(sess_res):
+        is_auth_err = _has_colab_auth_failure(sess_res)
+        if sess_res.returncode != 0 or is_auth_err:
             diag = sess_res.stderr.strip() or sess_res.stdout.strip()
             if sess_res.returncode != 0:
                 return (
                     f"Post-run `colab sessions` failed (rc={sess_res.returncode}): {diag}",
+                    is_auth_err,
                     [],
                     [],
                     [],
@@ -1421,6 +1522,7 @@ def run_benchmark(
                 )
             return (
                 f"Post-run `colab sessions` exited 0 with authentication error: {diag}",
+                True,
                 [],
                 [],
                 [],
@@ -1442,54 +1544,154 @@ def run_benchmark(
             for sname in attempted_sessions
             if sname in names_after and sname not in names_before
         ]
-        return None, cur_leaked_eps, cur_leaked_sess, cur_ambig_eps, cur_other_eps
+        return None, False, cur_leaked_eps, cur_leaked_sess, cur_ambig_eps, cur_other_eps
+
+    def _prepare_recovery_store(
+        rec_session: str, endpoint: str
+    ) -> Tuple[Path, List[str], Optional[str]]:
+        nonlocal recovery_config_path
+        rec_path = out_dir / f"colab-recovery.{rec_session}.json"
+        rec_cmd = build_base_cmd(cfg, caps, rec_path)
+        try:
+            _write_recovery_session_store(rec_path, rec_session, endpoint)
+            recovery_config_path = rec_path
+            return rec_path, rec_cmd, None
+        except (UntrustedPathError, OSError) as exc:
+            return rec_path, rec_cmd, str(exc)
 
     if maybe_allocated:
         (
             query_err,
+            query_is_auth_err,
             leaked_endpoints,
             leaked_sessions,
             ambiguous_endpoints,
             other_new_endpoints,
         ) = _inspect_active_sessions()
-        if query_err is not None:
-            teardown_verified = False
-            teardown_error = query_err
-        elif leaked_endpoints or leaked_sessions:
-            recovery_session = (
-                chosen_session
-                or (leaked_sessions[0] if leaked_sessions else None)
-                or (attempted_sessions[-1] if attempted_sessions else session_base)
-            )
-            max_retries = max(int(cfg.teardown_retries), 0)
-            for retry_idx in range(1, max_retries + 1):
-                seeded = False
-                seed_err: Optional[str] = None
-                if created_endpoint is not None and created_endpoint in leaked_endpoints:
-                    try:
-                        seeded = _ensure_recovery_session_entry(
-                            isolated_config, recovery_session, created_endpoint
-                        )
-                    except (UntrustedPathError, OSError) as exc:
-                        seed_err = str(exc)
+        recovery_session = (
+            chosen_session
+            or (leaked_sessions[0] if leaked_sessions else None)
+            or (attempted_sessions[-1] if attempted_sessions else session_base)
+        )
+        max_retries = max(int(cfg.teardown_retries), 0)
+        retry_idx = 0
 
-                stop_targets = list(
-                    dict.fromkeys(
-                        [
-                            *leaked_sessions,
-                            *([recovery_session] if leaked_endpoints else []),
-                        ]
+        while True:
+            if query_err is None and not leaked_endpoints and not leaked_sessions:
+                if ambiguous_endpoints:
+                    teardown_verified = False
+                    teardown_error = (
+                        "Run endpoint is unknown and new Colab assignment(s) appeared after run: "
+                        f"ambiguous_endpoints={ambiguous_endpoints}"
                     )
+                elif created_endpoint is None and (
+                    allocation_timed_out or ((interrupted or terminated) and not ready_seen_any)
+                ):
+                    recheck_cmd = shlex.join([*base_cmd, "sessions"])
+                    teardown_verified = False
+                    teardown_error = (
+                        "Run ended before an allocation endpoint was confirmed; an in-flight server "
+                        "allocation may still materialize after this snapshot. Re-check active runtimes "
+                        f"(run: `{recheck_cmd}`) and stop any newly assigned TPU; isolated config "
+                        f"preserved at {isolated_config}."
+                    )
+                else:
+                    teardown_verified = True
+                    teardown_error = None
+                break
+
+            if query_is_auth_err or retry_idx >= max_retries:
+                teardown_verified = False
+                if created_endpoint is not None and (query_err is not None or leaked_endpoints):
+                    rec_path, rec_base, _ = _prepare_recovery_store(
+                        recovery_session, created_endpoint
+                    )
+                    recovery_command = shlex.join([*rec_base, "stop", "-s", recovery_session])
+                    preserved_path = rec_path
+                elif leaked_sessions:
+                    recovery_command = shlex.join([*base_cmd, "stop", "-s", recovery_session])
+                    preserved_path = isolated_config
+                else:
+                    preserved_path = isolated_config
+
+                if query_err is not None:
+                    teardown_error = query_err
+                    if recovery_command:
+                        teardown_error = (
+                            f"{query_err}; per-run recovery config preserved at {preserved_path} "
+                            f"(run: `{recovery_command}`)"
+                        )
+                else:
+                    teardown_error = (
+                        "Active Colab assignment/session remained after release retries: "
+                        f"endpoints={leaked_endpoints}, sessions={leaked_sessions}; "
+                        f"per-run recovery config preserved at {preserved_path} "
+                        f"(run: `{recovery_command}`)"
+                    )
+                break
+
+            retry_idx += 1
+            if (retry_idx > 1 or query_err is not None) and cfg.teardown_retry_delay_s > 0:
+                try:
+                    time.sleep(cfg.teardown_retry_delay_s)
+                except TerminationSignal:
+                    terminated = True
+                    final_rc = 143
+                    retry_idx = max_retries
+                    continue
+                except KeyboardInterrupt:
+                    interrupted = True
+                    final_rc = 130
+                    retry_idx = max_retries
+                    continue
+
+            if created_endpoint is not None and (leaked_endpoints or query_err is not None):
+                rec_path, rec_base, seed_err = _prepare_recovery_store(
+                    recovery_session, created_endpoint
                 )
-                for target_sess in stop_targets:
+                retry_res, retry_err = _run_stop_cmd(recovery_session, cmd_prefix=rec_base)
+                release_retries.append(
+                    {
+                        "attempt": retry_idx,
+                        "session": recovery_session,
+                        "endpoint": created_endpoint,
+                        "recovery_config": str(rec_path),
+                        "seed_error": seed_err,
+                        "returncode": retry_res.returncode,
+                        "error": retry_err,
+                        "stderr_tail": retry_res.stderr.strip()[-1000:]
+                        if retry_res.stderr.strip()
+                        else None,
+                    }
+                )
+                for extra_sess in list(dict.fromkeys(leaked_sessions)):
+                    if extra_sess == recovery_session:
+                        continue
+                    extra_res, extra_err = _run_stop_cmd(extra_sess)
+                    release_retries.append(
+                        {
+                            "attempt": retry_idx,
+                            "session": extra_sess,
+                            "endpoint": created_endpoint,
+                            "recovery_config": str(isolated_config),
+                            "seed_error": None,
+                            "returncode": extra_res.returncode,
+                            "error": extra_err,
+                            "stderr_tail": extra_res.stderr.strip()[-1000:]
+                            if extra_res.stderr.strip()
+                            else None,
+                        }
+                    )
+            elif leaked_sessions:
+                for target_sess in list(dict.fromkeys(leaked_sessions)):
                     retry_res, retry_err = _run_stop_cmd(target_sess)
                     release_retries.append(
                         {
                             "attempt": retry_idx,
                             "session": target_sess,
                             "endpoint": created_endpoint,
-                            "reseeded_config": seeded,
-                            "seed_error": seed_err,
+                            "recovery_config": str(isolated_config),
+                            "seed_error": None,
                             "returncode": retry_res.returncode,
                             "error": retry_err,
                             "stderr_tail": retry_res.stderr.strip()[-1000:]
@@ -1497,76 +1699,28 @@ def run_benchmark(
                             else None,
                         }
                     )
-
-                (
-                    query_err,
-                    leaked_endpoints,
-                    leaked_sessions,
-                    ambiguous_endpoints,
-                    other_new_endpoints,
-                ) = _inspect_active_sessions()
-                if query_err is not None:
-                    teardown_verified = False
-                    teardown_error = query_err
-                    break
-                if not leaked_endpoints and not leaked_sessions:
-                    if ambiguous_endpoints:
-                        teardown_verified = False
-                        teardown_error = (
-                            "Run endpoint is unknown and new Colab assignment(s) appeared after run: "
-                            f"ambiguous_endpoints={ambiguous_endpoints}"
-                        )
-                    else:
-                        teardown_verified = True
-                        teardown_error = None
-                    break
-                if retry_idx < max_retries and cfg.teardown_retry_delay_s > 0:
-                    try:
-                        time.sleep(cfg.teardown_retry_delay_s)
-                    except TerminationSignal:
-                        terminated = True
-                        final_rc = 143
-                        break
-                    except KeyboardInterrupt:
-                        interrupted = True
-                        final_rc = 130
-                        break
-
-            if query_err is None and (leaked_endpoints or leaked_sessions):
-                if created_endpoint is not None and created_endpoint in leaked_endpoints:
-                    try:
-                        _ensure_recovery_session_entry(
-                            isolated_config, recovery_session, created_endpoint
-                        )
-                    except (UntrustedPathError, OSError):
-                        pass
-                recovery_command = shlex.join([*base_cmd, "stop", "-s", recovery_session])
-                teardown_verified = False
-                teardown_error = (
-                    "Active Colab assignment/session remained after release retries: "
-                    f"endpoints={leaked_endpoints}, sessions={leaked_sessions}; "
-                    f"recovery config preserved at {isolated_config} "
-                    f"(run: `{recovery_command}`)"
+            else:
+                release_retries.append(
+                    {
+                        "attempt": retry_idx,
+                        "session": recovery_session,
+                        "endpoint": None,
+                        "recovery_config": None,
+                        "seed_error": None,
+                        "returncode": None,
+                        "error": query_err,
+                        "stderr_tail": None,
+                    }
                 )
-        elif ambiguous_endpoints:
-            teardown_verified = False
-            teardown_error = (
-                "Run endpoint is unknown and new Colab assignment(s) appeared after run: "
-                f"ambiguous_endpoints={ambiguous_endpoints}"
-            )
-        elif created_endpoint is None and (
-            allocation_timed_out or ((interrupted or terminated) and not ready_seen_any)
-        ):
-            recheck_cmd = shlex.join([*base_cmd, "sessions"])
-            teardown_verified = False
-            teardown_error = (
-                "Run ended before an allocation endpoint was confirmed; an in-flight server "
-                "allocation may still materialize after this snapshot. Re-check active runtimes "
-                f"(run: `{recheck_cmd}`) and stop any newly assigned TPU; isolated config "
-                f"preserved at {isolated_config}."
-            )
-        else:
-            teardown_verified = True
+
+            (
+                query_err,
+                query_is_auth_err,
+                leaked_endpoints,
+                leaked_sessions,
+                ambiguous_endpoints,
+                other_new_endpoints,
+            ) = _inspect_active_sessions()
 
     if untrusted_target_error is not None:
         return 2, {
@@ -1574,6 +1728,7 @@ def run_benchmark(
             "error": untrusted_target_error,
             "forced_stop": forced_stop,
             "release_retries": release_retries,
+            "recovery_config": str(recovery_config_path) if recovery_config_path else None,
             "recovery_command": recovery_command,
             "teardown_verified": teardown_verified,
             "leaked_endpoints": leaked_endpoints,
@@ -1626,7 +1781,9 @@ def run_benchmark(
     summary = {
         "status": status,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "colab_cli_version": cli_version,
         "isolated_config": str(isolated_config),
+        "recovery_config": str(recovery_config_path) if recovery_config_path else None,
         "usage_before": asdict(usage),
         "chosen_tpu": chosen_tpu,
         "chosen_session": chosen_session,
@@ -1683,6 +1840,8 @@ def run_self_test() -> int:
         ) -> Optional[CommandResult]:
             if "--help" in cmd_list:
                 return CommandResult(0, "Usage: colab --auth --config --no-public-api\n", "")
+            if "version" in cmd_list:
+                return CommandResult(0, "Version: 0.8.0\n", "")
             if "usage" in cmd_list:
                 return CommandResult(
                     0,
@@ -1721,6 +1880,8 @@ def run_self_test() -> int:
                 seen_cmds.append(list(cmd))
                 if "--help" in cmd:
                     return CommandResult(0, "Usage: [OPTIONS] --config --auth\n", "")
+                if "version" in cmd:
+                    return CommandResult(0, "Version: 0.8.0\n", "")
                 if "usage" in cmd:
                     return CommandResult(0, balance_line, "")
                 raise AssertionError(f"Unexpected command after preflight abort: {cmd}")
@@ -1833,7 +1994,7 @@ def run_self_test() -> int:
             assert sum_fb["proof_notebook"] is not None
             assert Path(sum_fb["proof_notebook"]).is_file()
             for c in fallback_cmds:
-                if "--help" not in c:
+                if "--help" not in c and "version" not in c:
                     assert "--config" in c and sum_fb["isolated_config"] in c
                     assert "--no-public-api" in c
 
@@ -1888,7 +2049,8 @@ def run_self_test() -> int:
         assert leak_stop_calls["n"] == 2
         assert len(sum_leak["release_retries"]) == 2
         assert sum_leak["recovery_command"] is not None
-        preserved_cfg = json.loads(Path(sum_leak["isolated_config"]).read_text(encoding="utf-8"))
+        assert sum_leak["recovery_config"] is not None
+        preserved_cfg = json.loads(Path(sum_leak["recovery_config"]).read_text(encoding="utf-8"))
         assert preserved_cfg[sum_leak["chosen_session"]]["endpoint"] == "tpu-v5e1-ep1"
 
         # 5. Built-in CPU-fallback probe payload (default_backend="cpu") fails validation.
@@ -1998,6 +2160,8 @@ def run_self_test() -> int:
         def oauth_eof_runner(cmd: Sequence[str]) -> CommandResult:
             if "--help" in cmd:
                 return CommandResult(0, "Usage: --auth --config\n", "")
+            if "version" in cmd:
+                return CommandResult(0, "Version: 0.8.0\n", "")
             return CommandResult(
                 1,
                 "",
@@ -2191,13 +2355,18 @@ def run_self_test() -> int:
             else:
                 os.environ["TMPDIR"] = old_tmpdir
 
-        # 18. Default derived config / lock symlinks inside reused out_dir are rejected.
+        # 18. Symlinked lock files for explicit `--config` inside reused out_dir are rejected,
+        #     and default `--config` paths are unique per run.
         reused_dir = tmp_path / "reused-default-cfg"
         reused_dir.mkdir(mode=0o700)
         os.chmod(reused_dir, 0o700)
-        (reused_dir / "colab-sessions.json.lock").symlink_to(tmp_path / "outside.lock")
+        (reused_dir / "custom-sessions.json.lock").symlink_to(tmp_path / "outside.lock")
         rc_dlock, sum_dlock = run_benchmark(
-            BenchConfig(dry_run=True, out_dir=reused_dir, config_path=None),
+            BenchConfig(
+                dry_run=True,
+                out_dir=reused_dir,
+                config_path=reused_dir / "custom-sessions.json",
+            ),
             runner=low_or_bad_cu_runner("unused"),
         )
         assert rc_dlock == 2
@@ -2256,7 +2425,7 @@ def run_self_test() -> int:
         def post_ready_wall_timeout_runner(cmd: Sequence[str]) -> CommandResult:
             cmd_list = list(cmd)
             wall_cmds.append(cmd_list)
-            if "--help" in cmd_list or "usage" in cmd_list:
+            if "--help" in cmd_list or "version" in cmd_list or "usage" in cmd_list:
                 res = base_help_usage_sessions(cmd_list)
                 assert res is not None
                 return res
@@ -2444,7 +2613,7 @@ def run_self_test() -> int:
         def cancel_clean_runner(cmd: Sequence[str]) -> CommandResult:
             cmd_list = list(cmd)
             cancel_cmds.append(cmd_list)
-            if "--help" in cmd_list or "usage" in cmd_list:
+            if "--help" in cmd_list or "version" in cmd_list or "usage" in cmd_list:
                 res = base_help_usage_sessions(cmd_list)
                 assert res is not None
                 return res
@@ -2527,7 +2696,8 @@ def run_self_test() -> int:
         assert sum_intu["teardown_verified"] is False
         assert "tpu-v6e1-int1" in sum_intu["leaked_endpoints"]
         assert sum_intu["recovery_command"] is not None
-        unrec_cfg = json.loads(Path(sum_intu["isolated_config"]).read_text(encoding="utf-8"))
+        assert sum_intu["recovery_config"] is not None
+        unrec_cfg = json.loads(Path(sum_intu["recovery_config"]).read_text(encoding="utf-8"))
         assert unrec_cfg[sum_intu["chosen_session"]]["endpoint"] == "tpu-v6e1-int1"
 
         # 27. Transient `colab run` unassign failure that cleared local state is recovered by
@@ -2573,7 +2743,8 @@ def run_self_test() -> int:
         assert sum_tr["leaked_endpoints"] == []
         assert retry_saw_seeded_endpoint == ["tpu-v5e1-ep1"]
         assert len(sum_tr["release_retries"]) == 1
-        assert sum_tr["release_retries"][0]["reseeded_config"] is True
+        assert sum_tr["release_retries"][0]["recovery_config"] is not None
+        assert sum_tr["release_retries"][0]["recovery_config"] != sum_tr["isolated_config"]
         assert sum_tr["release_retries"][0]["returncode"] == 0
 
         # 28. `--wall-timeout` is independent of `--timeout` (unset disables local wall cap).
@@ -2659,6 +2830,9 @@ def run_self_test() -> int:
                 flag = pathlib.Path({str(stub_marker)!r})
                 if "--help" in args:
                     print("Usage: colab --auth --config --no-public-api")
+                    sys.exit(0)
+                if "version" in args:
+                    print("Version: 0.8.0")
                     sys.exit(0)
                 if "usage" in args:
                     print("Current balance: 500.00 compute units")
@@ -2812,7 +2986,187 @@ def run_self_test() -> int:
         assert "CTRLC_PROGRESS_OUTPUT" in (ctrlc_out / f"{cp_sess}.stdout.txt").read_text(encoding="utf-8")
         assert "[colab] Session READY" in (ctrlc_out / f"{cp_sess}.stderr.txt").read_text(encoding="utf-8")
 
-    print("colab_tpu_bench.py self-test PASSED (33/33 suites).")
+        # 34. Colab CLI version gate requires >= 0.7.6 (final) before any authenticated command.
+        assert is_supported_colab_cli_version("Version: 0.7.5") == (False, "0.7.5")
+        assert is_supported_colab_cli_version("Version: 0.7.6rc1") == (False, "0.7.6rc1")
+        assert is_supported_colab_cli_version("Version: 0.7.6.dev0") == (False, "0.7.6.dev0")
+        assert is_supported_colab_cli_version("Version: 0.7.6") == (True, "0.7.6")
+        assert is_supported_colab_cli_version("Version: 0.7.6.post1") == (True, "0.7.6.post1")
+        assert is_supported_colab_cli_version("Version: 0.8.0") == (True, "0.8.0")
+        assert is_supported_colab_cli_version("unknown") == (False, None)
+
+        old_cli_cmds: List[List[str]] = []
+
+        def old_cli_runner(cmd: Sequence[str]) -> CommandResult:
+            cmd_list = list(cmd)
+            old_cli_cmds.append(cmd_list)
+            if "--help" in cmd_list:
+                return CommandResult(0, "Usage: colab --auth --config\n", "")
+            if "version" in cmd_list:
+                return CommandResult(0, "Version: 0.7.5\n", "")
+            raise AssertionError(f"Authenticated command must not run on v0.7.5: {cmd_list}")
+
+        rc_old, sum_old = run_benchmark(
+            BenchConfig(tpus=("v5e1",), out_dir=tmp_path / "old-cli-075"),
+            runner=old_cli_runner,
+        )
+        assert rc_old == 2
+        assert sum_old["status"] == "unsupported_colab_cli_version"
+        assert sum_old["detected_version"] == "0.7.5"
+        assert not any(sub in c for c in old_cli_cmds for sub in ("usage", "whoami", "sessions", "run"))
+
+        # 35. Transient post-run `colab sessions` listing outage enters bounded retry loop,
+        #     attempts `colab stop` using dedicated recovery config, and recovers (or preserves config).
+        outage_sess_calls = {"n": 0}
+        outage_stop_calls = {"n": 0}
+
+        def transient_sessions_outage_runner(cmd: Sequence[str]) -> CommandResult:
+            cmd_list = list(cmd)
+            if "sessions" in cmd_list:
+                outage_sess_calls["n"] += 1
+                if outage_sess_calls["n"] == 1:
+                    return CommandResult(0, "[colab] No active sessions found on server.\n", "")
+                if outage_sess_calls["n"] == 2:
+                    return CommandResult(1, "", "HTTP 503 Service Unavailable")
+                return CommandResult(0, "[colab] No active sessions found on server.\n", "")
+            if "stop" in cmd_list:
+                outage_stop_calls["n"] += 1
+                return CommandResult(0, "[colab] Session terminated.\n", "")
+            return fallback_runner(cmd_list)
+
+        rc_outage_ok, sum_outage_ok = run_benchmark(
+            BenchConfig(
+                tpus=("v5e1",),
+                out_dir=tmp_path / "outage-recover",
+                teardown_retries=2,
+                teardown_retry_delay_s=0.0,
+            ),
+            runner=transient_sessions_outage_runner,
+        )
+        assert rc_outage_ok == 0
+        assert sum_outage_ok["status"] == "ok"
+        assert sum_outage_ok["teardown_verified"] is True
+        assert outage_sess_calls["n"] == 3
+        assert outage_stop_calls["n"] == 1
+        assert len(sum_outage_ok["release_retries"]) == 1
+
+        # Persistent listing outage preserves per-run recovery config & recovery_command.
+        perm_outage_calls = {"sess": 0, "stop": 0}
+
+        def persistent_sessions_outage_runner(cmd: Sequence[str]) -> CommandResult:
+            cmd_list = list(cmd)
+            if "sessions" in cmd_list:
+                perm_outage_calls["sess"] += 1
+                if perm_outage_calls["sess"] == 1:
+                    return CommandResult(0, "[colab] No active sessions found on server.\n", "")
+                return CommandResult(1, "", "HTTP 503 Service Unavailable")
+            if "stop" in cmd_list:
+                perm_outage_calls["stop"] += 1
+                return CommandResult(1, "", "HTTP 503 Service Unavailable")
+            return fallback_runner(cmd_list)
+
+        rc_pout, sum_pout = run_benchmark(
+            BenchConfig(
+                tpus=("v5e1",),
+                out_dir=tmp_path / "outage-persist",
+                teardown_retries=2,
+                teardown_retry_delay_s=0.0,
+            ),
+            runner=persistent_sessions_outage_runner,
+        )
+        assert rc_pout == 1
+        assert sum_pout["status"] == "teardown_verification_failed"
+        assert sum_pout["teardown_verified"] is False
+        assert perm_outage_calls["sess"] == 4
+        assert perm_outage_calls["stop"] == 2
+        assert sum_pout["recovery_config"] is not None
+        assert sum_pout["recovery_command"] is not None
+        assert Path(sum_pout["recovery_config"]).is_file()
+
+        # 36. Recovery writes NEVER mutate an explicit shared `--config` file, and default
+        #     per-run configs in a shared `--out-dir` are distinct.
+        shared_cfg_dir = tmp_path / "shared-cfg-dir"
+        shared_cfg_dir.mkdir(mode=0o700)
+        os.chmod(shared_cfg_dir, 0o700)
+        shared_cfg_file = shared_cfg_dir / "shared-sessions.json"
+        other_worker_json = json.dumps(
+            {
+                "other-worker": {
+                    "name": "other-worker",
+                    "token": "tok",
+                    "url": "https://example.invalid",
+                    "endpoint": "m-s-other-worker",
+                }
+            },
+            indent=2,
+        )
+        shared_cfg_file.write_text(other_worker_json, encoding="utf-8")
+        os.chmod(shared_cfg_file, 0o600)
+
+        rc_conc, sum_conc = run_benchmark(
+            BenchConfig(
+                tpus=("v5e1",),
+                out_dir=shared_cfg_dir,
+                config_path=shared_cfg_file,
+                teardown_retries=1,
+                teardown_retry_delay_s=0.0,
+            ),
+            runner=leaked_runner,
+        )
+        assert rc_conc == 1
+        assert shared_cfg_file.read_text(encoding="utf-8") == other_worker_json
+        assert sum_conc["recovery_config"] != str(shared_cfg_file)
+        assert Path(sum_conc["recovery_config"]).is_file()
+
+        rc_d1, sum_d1 = run_benchmark(
+            BenchConfig(dry_run=True, out_dir=shared_cfg_dir),
+            runner=low_or_bad_cu_runner("unused"),
+        )
+        rc_d2, sum_d2 = run_benchmark(
+            BenchConfig(dry_run=True, out_dir=shared_cfg_dir),
+            runner=low_or_bad_cu_runner("unused"),
+        )
+        assert rc_d1 == 0 and rc_d2 == 0
+        assert sum_d1["isolated_config"] != sum_d2["isolated_config"]
+
+        # 37. Non-finite numeric values (nan / inf / -inf) are rejected before contacting Colab.
+        nonfinite_cmds: List[List[str]] = []
+
+        def forbid_calls_runner(cmd: Sequence[str]) -> CommandResult:
+            nonfinite_cmds.append(list(cmd))
+            raise AssertionError(f"Should not invoke CLI for non-finite config: {cmd}")
+
+        for bad_cfg, expected_status in (
+            (BenchConfig(min_cu_balance=float("nan"), out_dir=tmp_path / "nf1"), "invalid_cu_balance"),
+            (BenchConfig(min_cu_balance=float("inf"), out_dir=tmp_path / "nf2"), "invalid_cu_balance"),
+            (BenchConfig(timeout_s=float("nan"), out_dir=tmp_path / "nf3"), "invalid_timeout"),
+            (BenchConfig(timeout_s=float("inf"), out_dir=tmp_path / "nf4"), "invalid_timeout"),
+            (BenchConfig(wall_timeout_s=float("nan"), out_dir=tmp_path / "nf5"), "invalid_timeout"),
+            (BenchConfig(wall_timeout_s=float("inf"), out_dir=tmp_path / "nf6"), "invalid_timeout"),
+            (BenchConfig(request_timeout_s=float("nan"), out_dir=tmp_path / "nf7"), "invalid_timeout"),
+            (BenchConfig(teardown_retry_delay_s=float("nan"), out_dir=tmp_path / "nf8"), "invalid_timeout"),
+        ):
+            rc_nf, sum_nf = run_benchmark(bad_cfg, runner=forbid_calls_runner)
+            assert rc_nf == 2
+            assert sum_nf["status"] == expected_status
+        assert nonfinite_cmds == []
+
+        # 38. `--dry-run` writes `dry-run-plan.json` and NEVER overwrites an existing `summary.json`.
+        live_out = tmp_path / "live-preserved"
+        live_out.mkdir(mode=0o700)
+        os.chmod(live_out, 0o700)
+        live_summary_content = '{"status": "ok", "chosen_tpu": "v6e1"}\n'
+        (live_out / "summary.json").write_text(live_summary_content, encoding="utf-8")
+        rc_drp, sum_drp = run_benchmark(
+            BenchConfig(dry_run=True, out_dir=live_out),
+            runner=low_or_bad_cu_runner("unused"),
+        )
+        assert rc_drp == 0
+        assert (live_out / "summary.json").read_text(encoding="utf-8") == live_summary_content
+        assert Path(sum_drp["plan_path"]).name == "dry-run-plan.json"
+        assert Path(sum_drp["plan_path"]).is_file()
+
+    print("colab_tpu_bench.py self-test PASSED (38/38 suites).")
     return 0
 
 
