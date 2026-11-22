@@ -3577,7 +3577,9 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
     if (out_stats) {
       std::memset(out_stats, 0, sizeof(*out_stats));
       out_stats->wall_time_us = wall_ns / 1000ULL;
-      out_stats->flags = OB_STAT_FLAG_CPU_FALLBACK | (ctx->mock_mode ? OB_STAT_FLAG_MOCK : 0u);
+      out_stats->flags = static_cast<uint16_t>(
+          OB_STAT_FLAG_CPU_FALLBACK |
+          (ctx->mock_mode ? static_cast<uint32_t>(OB_STAT_FLAG_MOCK) : 0u));
     }
     return OB_OK;
   }
