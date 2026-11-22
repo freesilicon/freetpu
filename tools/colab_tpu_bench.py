@@ -23,13 +23,16 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -88,6 +91,28 @@ class UntrustedPathError(ValueError):
     """Raised when an output or config path is symlinked or not private to the current user."""
 
 
+class TerminationSignal(BaseException):
+    """Raised when SIGTERM is delivered so active TPU sessions are reconciled before exit."""
+
+
+class CommandCancelledError(BaseException):
+    """Raised when a running subprocess is interrupted, preserving stdout/stderr emitted so far."""
+
+    def __init__(
+        self,
+        *,
+        signal_name: str,
+        returncode: int,
+        stdout: str = "",
+        stderr: str = "",
+    ) -> None:
+        super().__init__(f"Command cancelled by {signal_name}")
+        self.signal_name = signal_name
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
 @dataclass(frozen=True)
 class CommandResult:
     returncode: int
@@ -128,113 +153,158 @@ class BenchConfig:
     dry_run: bool = False
 
 
-def _is_safe_existing_ancestor(ancestor: Path) -> bool:
-    """Verify an already-existing ancestor dir is not a shared writable/unowned trap."""
-    if not os.path.lexists(ancestor):
-        return True
-    st = os.lstat(ancestor)
-    if stat.S_ISLNK(st.st_mode):
-        # Allow system-owned OS symlinks such as macOS /tmp -> private/tmp or /var -> private/var,
-        # but resolve through them before checking ownership/sticky bit.
-        if hasattr(os, "geteuid") and st.st_uid != 0 and st.st_uid != os.geteuid():
-            return False
-        st = os.stat(ancestor)
+_MAX_SYMLINK_HOPS = 40
+
+
+def _validate_dir_stat(path: Path, st: os.stat_result) -> None:
+    """Validate that `st` describes a safe traversed ancestor directory."""
     if not stat.S_ISDIR(st.st_mode):
-        return False
+        raise UntrustedPathError(f"Refusing non-directory ancestor {path}")
     euid = os.geteuid() if hasattr(os, "geteuid") else st.st_uid
     if st.st_uid != euid and st.st_uid != 0:
-        return False
+        raise UntrustedPathError(
+            f"Refusing path under unowned ancestor {path} (uid={st.st_uid})"
+        )
     # If world/group-writable, require sticky bit (e.g., /tmp, /var/tmp) so other users cannot
     # replace or unlink subdirectories created inside it.
     if (st.st_mode & 0o022) != 0 and not (st.st_mode & stat.S_ISVTX):
-        return False
-    return True
+        raise UntrustedPathError(
+            f"Refusing path under untrusted writable ancestor {path} (mode={oct(stat.S_IMODE(st.st_mode))})"
+        )
 
 
-def _validate_existing_ancestor_chain(start_dir: Path) -> None:
-    """Validate every existing ancestor directory up to `/` (and symlink targets)."""
-    visited: Set[str] = set()
-    queue: List[Path] = [start_dir]
-    while queue:
-        cur = queue.pop()
-        while True:
-            key = str(cur)
-            if key in visited:
-                break
-            visited.add(key)
-            if os.path.lexists(cur):
-                if not _is_safe_existing_ancestor(cur):
-                    raise UntrustedPathError(
-                        f"Refusing path under untrusted ancestor {cur}"
-                    )
-                if os.path.islink(cur):
-                    resolved = Path(os.path.realpath(cur))
-                    if str(resolved) not in visited:
-                        queue.append(resolved)
-            parent = cur.parent
-            if parent == cur:
-                break
-            cur = parent
+def _resolve_and_validate_existing_dir(start_dir: Path) -> Path:
+    """Walk `start_dir` component-by-component, validating every intermediate directory and symlink.
+
+    Unlike `os.path.realpath`, this expands each symlink one hop at a time via `os.readlink`
+    so intermediate directories (e.g. a collaborator-writable scratch directory reached via an
+    intermediate symlink) are never skipped. Returns the validated canonical directory path.
+    """
+    raw = start_dir if start_dir.is_absolute() else Path(os.getcwd()) / start_dir
+    anchor = Path(raw.anchor or "/")
+    try:
+        root_st = os.lstat(anchor)
+    except OSError as exc:
+        raise UntrustedPathError(f"Cannot stat filesystem root {anchor}: {exc}") from exc
+    _validate_dir_stat(anchor, root_st)
+
+    resolved = anchor
+    pending: deque[str] = deque(raw.parts[1:])
+    euid = os.geteuid() if hasattr(os, "geteuid") else None
+    hops = 0
+
+    while pending:
+        part = pending.popleft()
+        if not part or part == ".":
+            continue
+        if part == "..":
+            resolved = resolved.parent
+            continue
+        candidate = resolved / part
+        try:
+            st = os.lstat(candidate)
+        except OSError as exc:
+            raise UntrustedPathError(f"Cannot stat path component {candidate}: {exc}") from exc
+
+        if stat.S_ISLNK(st.st_mode):
+            hops += 1
+            if hops > _MAX_SYMLINK_HOPS:
+                raise UntrustedPathError(f"Too many symbolic links while resolving {start_dir}")
+            if euid is not None and st.st_uid != euid and st.st_uid != 0:
+                raise UntrustedPathError(
+                    f"Refusing path through unowned symlink {candidate} (uid={st.st_uid})"
+                )
+            try:
+                target = os.readlink(candidate)
+            except OSError as exc:
+                raise UntrustedPathError(f"Cannot read symlink {candidate}: {exc}") from exc
+            target_path = Path(target)
+            if target_path.is_absolute():
+                resolved = Path(target_path.anchor or "/")
+                for p in reversed(target_path.parts[1:]):
+                    pending.appendleft(p)
+            else:
+                for p in reversed(target_path.parts):
+                    pending.appendleft(p)
+            continue
+
+        _validate_dir_stat(candidate, st)
+        resolved = candidate
+
+    return resolved
 
 
 def _ensure_private_dir(raw_path: Path) -> Path:
-    """Ensure `raw_path` exists as a non-symlink directory owned by the user with mode 0700."""
+    """Ensure `raw_path` exists as a canonical non-symlink directory owned by the user (mode 0700)."""
     expanded = Path(os.path.expanduser(str(raw_path)))
     if expanded.is_symlink():
         raise UntrustedPathError(f"Refusing symlinked directory path: {raw_path}")
 
-    abs_path = Path(os.path.abspath(str(expanded)))
-    if not os.path.lexists(abs_path):
-        # Find deepest existing ancestor and validate the full chain before creating missing 0700 dirs.
-        missing: List[Path] = []
-        cur = abs_path
+    raw_abs = expanded if expanded.is_absolute() else Path(os.getcwd()) / expanded
+    if os.path.lexists(raw_abs):
+        if os.path.islink(raw_abs):
+            raise UntrustedPathError(f"Refusing symlinked directory: {raw_abs}")
+        if raw_abs.name in ("", ".", ".."):
+            canonical_target = _resolve_and_validate_existing_dir(raw_abs)
+        else:
+            canonical_parent = _resolve_and_validate_existing_dir(raw_abs.parent)
+            canonical_target = canonical_parent / raw_abs.name
+    else:
+        missing_names: List[str] = []
+        cur = raw_abs
         while not os.path.lexists(cur):
-            missing.append(cur)
+            if cur.name in ("", ".", ".."):
+                raise UntrustedPathError(f"Refusing invalid missing path component in {raw_path}")
+            missing_names.append(cur.name)
             parent = cur.parent
             if parent == cur:
                 break
             cur = parent
-        _validate_existing_ancestor_chain(cur)
-        for to_create in reversed(missing):
+        canonical_cur = _resolve_and_validate_existing_dir(cur)
+        for name in reversed(missing_names):
+            canonical_cur = canonical_cur / name
             try:
-                os.mkdir(to_create, 0o700)
+                os.mkdir(canonical_cur, 0o700)
             except FileExistsError:
                 pass
-    _validate_existing_ancestor_chain(abs_path.parent)
+        canonical_target = canonical_cur
 
     try:
-        st = os.lstat(abs_path)
+        st = os.lstat(canonical_target)
     except OSError as exc:
-        raise UntrustedPathError(f"Cannot stat directory {abs_path}: {exc}") from exc
+        raise UntrustedPathError(f"Cannot stat directory {canonical_target}: {exc}") from exc
 
     if stat.S_ISLNK(st.st_mode):
-        raise UntrustedPathError(f"Refusing symlinked directory: {abs_path}")
+        raise UntrustedPathError(f"Refusing symlinked directory: {canonical_target}")
     if not stat.S_ISDIR(st.st_mode):
-        raise UntrustedPathError(f"Expected directory, found non-directory: {abs_path}")
+        raise UntrustedPathError(f"Expected directory, found non-directory: {canonical_target}")
     if hasattr(os, "geteuid") and st.st_uid != os.geteuid():
         raise UntrustedPathError(
-            f"Directory {abs_path} is not owned by current user (uid={st.st_uid})"
+            f"Directory {canonical_target} is not owned by current user (uid={st.st_uid})"
         )
     if (st.st_mode & 0o077) != 0:
         raise UntrustedPathError(
-            f"Directory {abs_path} must be private (mode 0700); got {oct(stat.S_IMODE(st.st_mode))}"
+            f"Directory {canonical_target} must be private (mode 0700); got {oct(stat.S_IMODE(st.st_mode))}"
         )
-    return abs_path
+    return canonical_target
 
 
 def _write_text_nofollow(path: Path, text: str) -> None:
     """Write UTF-8 text via a private temp file and atomically replace `path` (mode 0600)."""
     if path.is_symlink():
         raise UntrustedPathError(f"Refusing to write through symlink: {path}")
-    if os.path.lexists(path):
-        st = os.lstat(path)
+    canonical_parent = _ensure_dir_not_shared_writable(path.parent)
+    target = canonical_parent / path.name
+    if target.is_symlink():
+        raise UntrustedPathError(f"Refusing to write through symlink: {target}")
+    if os.path.lexists(target):
+        st = os.lstat(target)
         if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
-            raise UntrustedPathError(f"Refusing unsafe existing target file {path}")
-    _ensure_dir_not_shared_writable(path.parent)
+            raise UntrustedPathError(f"Refusing unsafe existing target file {target}")
     fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{path.name}.",
+        prefix=f".{target.name}.",
         suffix=".tmp",
-        dir=str(path.parent),
+        dir=str(canonical_parent),
     )
     tmp_path = Path(tmp_name)
     try:
@@ -248,7 +318,7 @@ def _write_text_nofollow(path: Path, text: str) -> None:
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp_path, path)
+        os.replace(tmp_path, target)
     except Exception:
         try:
             tmp_path.unlink(missing_ok=True)
@@ -258,41 +328,50 @@ def _write_text_nofollow(path: Path, text: str) -> None:
 
 
 def _ensure_dir_not_shared_writable(dir_path: Path) -> Path:
-    """Ensure `dir_path` exists as an operator-owned non-symlink dir not writable by others."""
+    """Ensure `dir_path` exists as a canonical operator-owned non-symlink dir not writable by others."""
     expanded = Path(os.path.expanduser(str(dir_path)))
     if expanded.is_symlink():
         raise UntrustedPathError(f"Refusing symlinked directory path: {dir_path}")
-    abs_dir = Path(os.path.abspath(str(expanded)))
-    if not os.path.lexists(abs_dir):
-        return _ensure_private_dir(abs_dir)
-    _validate_existing_ancestor_chain(abs_dir.parent)
-    st = os.lstat(abs_dir)
+    raw_abs = expanded if expanded.is_absolute() else Path(os.getcwd()) / expanded
+    if not os.path.lexists(raw_abs):
+        return _ensure_private_dir(raw_abs)
+    if os.path.islink(raw_abs):
+        raise UntrustedPathError(f"Refusing symlinked directory path: {raw_abs}")
+    if raw_abs.name in ("", ".", ".."):
+        canonical_dir = _resolve_and_validate_existing_dir(raw_abs)
+    else:
+        canonical_parent = _resolve_and_validate_existing_dir(raw_abs.parent)
+        canonical_dir = canonical_parent / raw_abs.name
+    st = os.lstat(canonical_dir)
     if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
-        raise UntrustedPathError(f"Refusing non-directory/symlink config parent: {abs_dir}")
+        raise UntrustedPathError(f"Refusing non-directory/symlink config parent: {canonical_dir}")
     if hasattr(os, "geteuid") and st.st_uid != os.geteuid():
         raise UntrustedPathError(
-            f"Config parent directory {abs_dir} is not owned by current user (uid={st.st_uid})"
+            f"Config parent directory {canonical_dir} is not owned by current user (uid={st.st_uid})"
         )
     if (st.st_mode & 0o022) != 0:
         raise UntrustedPathError(
-            f"Config parent directory {abs_dir} must not be group/world-writable (mode={oct(stat.S_IMODE(st.st_mode))})"
+            f"Config parent directory {canonical_dir} must not be group/world-writable (mode={oct(stat.S_IMODE(st.st_mode))})"
         )
-    return abs_dir
+    return canonical_dir
 
 
 def _normalize_config_path(config_path: Optional[Path], out_dir: Path) -> Path:
-    """Normalize explicit or default `--config` to an absolute non-symlink path with safe lock/parent."""
+    """Normalize explicit or default `--config` to a canonical non-symlink path with safe lock/parent."""
     if config_path is None:
-        normalized = Path(os.path.abspath(str(out_dir / "colab-sessions.json")))
+        raw_cfg = out_dir / "colab-sessions.json"
     else:
         expanded = Path(os.path.expanduser(str(config_path)))
         if expanded.is_symlink():
             raise UntrustedPathError(f"Refusing symlinked --config path: {config_path}")
-        normalized = Path(os.path.abspath(str(expanded)))
-    _ensure_dir_not_shared_writable(normalized.parent)
-    if normalized.is_symlink() or Path(f"{normalized}.lock").is_symlink():
-        raise UntrustedPathError(f"Refusing symlinked --config or lock path: {normalized}")
-    return normalized
+        raw_cfg = expanded if expanded.is_absolute() else Path(os.getcwd()) / expanded
+    if raw_cfg.name in ("", ".", ".."):
+        raise UntrustedPathError(f"Refusing invalid --config filename: {config_path}")
+    canonical_parent = _ensure_dir_not_shared_writable(raw_cfg.parent)
+    canonical_cfg = canonical_parent / raw_cfg.name
+    if canonical_cfg.is_symlink() or Path(f"{canonical_cfg}.lock").is_symlink():
+        raise UntrustedPathError(f"Refusing symlinked --config or lock path: {canonical_cfg}")
+    return canonical_cfg
 
 
 def _coerce_subprocess_text(data: Any) -> str:
@@ -346,7 +425,7 @@ def make_subprocess_runner(
     request_timeout_s: float = 60.0,
     run_wall_timeout_s: Optional[float] = None,
 ) -> CommandRunner:
-    """Create a non-interactive subprocess runner with bounded metadata calls and optional run cap."""
+    """Create a non-interactive subprocess runner that captures stdout/stderr incrementally."""
 
     def _run(cmd: Sequence[str]) -> CommandResult:
         cmd_list = list(cmd)
@@ -362,25 +441,79 @@ def make_subprocess_runner(
             )
         else:
             wall_timeout = max(request_timeout_s * 2.0, 120.0)
-        try:
-            proc = subprocess.run(
-                cmd_list,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                env=env,
-                timeout=wall_timeout,
-                check=False,
+
+        proc = subprocess.Popen(
+            cmd_list,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+        out_chunks: List[bytes] = []
+        err_chunks: List[bytes] = []
+
+        def _drain_pipe(stream: Any, sink: List[bytes]) -> None:
+            if stream is None:
+                return
+            read_fn = getattr(stream, "read1", stream.read)
+            try:
+                while True:
+                    chunk = read_fn(4096)
+                    if not chunk:
+                        break
+                    sink.append(chunk)
+            except OSError:
+                pass
+            finally:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
+        t_out = threading.Thread(
+            target=_drain_pipe, args=(proc.stdout, out_chunks), daemon=True
+        )
+        t_err = threading.Thread(
+            target=_drain_pipe, args=(proc.stderr, err_chunks), daemon=True
+        )
+        t_out.start()
+        t_err.start()
+
+        def _collect_output(join_timeout: float = 2.0) -> Tuple[str, str]:
+            t_out.join(timeout=join_timeout)
+            t_err.join(timeout=join_timeout)
+            return (
+                b"".join(out_chunks).decode("utf-8", errors="replace"),
+                b"".join(err_chunks).decode("utf-8", errors="replace"),
             )
+
+        def _terminate_and_reap() -> None:
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=0.5)
+                except (subprocess.TimeoutExpired, OSError):
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+                    try:
+                        proc.wait(timeout=2.0)
+                    except (subprocess.TimeoutExpired, OSError):
+                        pass
+
+        try:
+            proc.wait(timeout=wall_timeout)
+            out_txt, err_txt = _collect_output(join_timeout=5.0)
             return CommandResult(
-                returncode=proc.returncode,
-                stdout=proc.stdout,
-                stderr=proc.stderr,
+                returncode=proc.returncode if proc.returncode is not None else 1,
+                stdout=out_txt,
+                stderr=err_txt,
                 timed_out=False,
             )
-        except subprocess.TimeoutExpired as exc:
-            out_txt = _coerce_subprocess_text(exc.stdout)
-            err_txt = _coerce_subprocess_text(exc.stderr)
+        except subprocess.TimeoutExpired:
+            _terminate_and_reap()
+            out_txt, err_txt = _collect_output(join_timeout=2.0)
             timeout_label = f"{wall_timeout:.1f}s" if wall_timeout is not None else "configured"
             note = (
                 f"[colab_tpu_bench] `colab` subprocess exceeded wall timeout "
@@ -393,6 +526,16 @@ def make_subprocess_runner(
                 stderr=combined_err + "\n",
                 timed_out=True,
             )
+        except (KeyboardInterrupt, TerminationSignal) as exc:
+            _terminate_and_reap()
+            out_txt, err_txt = _collect_output(join_timeout=2.0)
+            is_sigterm = isinstance(exc, TerminationSignal)
+            raise CommandCancelledError(
+                signal_name="SIGTERM" if is_sigterm else "SIGINT",
+                returncode=143 if is_sigterm else 130,
+                stdout=out_txt,
+                stderr=err_txt,
+            ) from exc
 
     return _run
 
@@ -822,9 +965,11 @@ def run_benchmark(
     try:
         if cfg.out_dir is None:
             env_tmp = os.environ.get("TMPDIR")
-            tmp_root = Path(os.path.abspath(env_tmp if env_tmp else tempfile.gettempdir()))
-            _validate_existing_ancestor_chain(tmp_root)
-            created_tmp = Path(tempfile.mkdtemp(prefix="freetpu-colab-", dir=str(tmp_root)))
+            tmp_root = Path(env_tmp if env_tmp else tempfile.gettempdir())
+            canonical_tmp_root = _resolve_and_validate_existing_dir(tmp_root)
+            created_tmp = Path(
+                tempfile.mkdtemp(prefix="freetpu-colab-", dir=str(canonical_tmp_root))
+            )
             try:
                 out_dir = _ensure_private_dir(created_tmp)
             except Exception:
@@ -994,6 +1139,8 @@ def run_benchmark(
     allocation_timed_out = False
     wall_timed_out = False
     interrupted = False
+    terminated = False
+    ready_seen_any = False
     maybe_allocated = False
     probe_error: Optional[str] = None
     untrusted_target_error: Optional[str] = None
@@ -1068,25 +1215,67 @@ def run_benchmark(
             str(script_file),
             *cfg.script_args,
         ]
+        prev_sigterm_handler = None
+        sigterm_installed = False
+        if hasattr(signal, "SIGTERM") and threading.current_thread() is threading.main_thread():
+            def _handle_sigterm(signum: int, frame: Any) -> None:
+                del signum, frame
+                raise TerminationSignal("Received SIGTERM")
+
+            prev_sigterm_handler = signal.getsignal(signal.SIGTERM)
+            signal.signal(signal.SIGTERM, _handle_sigterm)
+            sigterm_installed = True
+
         try:
             res = runner(run_cmd)
-        except KeyboardInterrupt:
-            interrupted = True
+        except (KeyboardInterrupt, TerminationSignal, CommandCancelledError) as cancel_exc:
+            if isinstance(cancel_exc, CommandCancelledError):
+                is_sigterm = cancel_exc.signal_name == "SIGTERM"
+                cancel_rc = cancel_exc.returncode
+                partial_stdout = cancel_exc.stdout
+                partial_stderr = cancel_exc.stderr
+            else:
+                is_sigterm = isinstance(cancel_exc, TerminationSignal)
+                cancel_rc = 143 if is_sigterm else 130
+                partial_stdout = ""
+                partial_stderr = ""
+
+            if is_sigterm:
+                terminated = True
+            else:
+                interrupted = True
             maybe_allocated = True
-            final_rc = 130
+            final_rc = cancel_rc
             if chosen_tpu is None:
                 chosen_tpu = tpu
                 chosen_session = sess
+
+            cancel_note = (
+                "[colab_tpu_bench] Terminated by supervisor (SIGTERM)."
+                if is_sigterm
+                else "[colab_tpu_bench] Interrupted by operator (KeyboardInterrupt)."
+            )
+            combined_cancel_stderr = (
+                f"{partial_stderr.rstrip()}\n{cancel_note}\n"
+                if partial_stderr.strip()
+                else f"{cancel_note}\n"
+            )
+            if "[colab] session ready" in partial_stderr.lower():
+                ready_seen_any = True
+            parsed_partial = extract_probe_json(partial_stdout)
+            if parsed_partial is not None:
+                probe_payload = parsed_partial
+
             attempts.append(
                 {
                     "tpu": tpu,
                     "session": sess,
-                    "returncode": 130,
-                    "stderr_tail": "[colab_tpu_bench] Interrupted by operator (KeyboardInterrupt).",
+                    "returncode": cancel_rc,
+                    "stderr_tail": combined_cancel_stderr.strip()[-1000:],
                 }
             )
-            # CPython's subprocess.run kills `colab run` on Ctrl+C before its teardown can finish;
-            # run bounded cleanup using the attempted session name and isolated config.
+            # Reconcile the active TPU session first using the attempted session name and
+            # isolated config, then preserve any already-emitted workload output and log proof.
             forced_stop["attempted"] = True
             forced_stop["session"] = sess
             stop_res, stop_err = _run_stop_cmd(sess)
@@ -1094,8 +1283,23 @@ def run_benchmark(
             if stop_res.stderr.strip():
                 forced_stop["stderr_tail"] = stop_res.stderr.strip()[-1000:]
             forced_stop["error"] = stop_err
-            _export_session_log(sess)
+
+            try:
+                if partial_stdout:
+                    _write_text_nofollow(out_dir / f"{sess}.stdout.txt", partial_stdout)
+                if combined_cancel_stderr:
+                    _write_text_nofollow(out_dir / f"{sess}.stderr.txt", combined_cancel_stderr)
+            except UntrustedPathError as exc:
+                untrusted_target_error = str(exc)
+            except OSError as exc:
+                artifact_write_error = f"Failed writing local run logs: {exc}"
+
+            if untrusted_target_error is None:
+                _export_session_log(sess)
             break
+        finally:
+            if sigterm_installed:
+                signal.signal(signal.SIGTERM, prev_sigterm_handler)
 
         attempt_rec = {
             "tpu": tpu,
@@ -1110,6 +1314,8 @@ def run_benchmark(
             probe_payload = parsed_probe
 
         ready_seen = "[colab] session ready" in res.stderr.lower()
+        if ready_seen:
+            ready_seen_any = True
         wall_timeout_seen = is_wall_timeout_error(res)
         timeout_seen = is_allocation_timeout_error(
             res.returncode, res.stderr, timed_out=res.timed_out
@@ -1317,6 +1523,10 @@ def run_benchmark(
                 if retry_idx < max_retries and cfg.teardown_retry_delay_s > 0:
                     try:
                         time.sleep(cfg.teardown_retry_delay_s)
+                    except TerminationSignal:
+                        terminated = True
+                        final_rc = 143
+                        break
                     except KeyboardInterrupt:
                         interrupted = True
                         final_rc = 130
@@ -1344,6 +1554,17 @@ def run_benchmark(
                 "Run endpoint is unknown and new Colab assignment(s) appeared after run: "
                 f"ambiguous_endpoints={ambiguous_endpoints}"
             )
+        elif created_endpoint is None and (
+            allocation_timed_out or ((interrupted or terminated) and not ready_seen_any)
+        ):
+            recheck_cmd = shlex.join([*base_cmd, "sessions"])
+            teardown_verified = False
+            teardown_error = (
+                "Run ended before an allocation endpoint was confirmed; an in-flight server "
+                "allocation may still materialize after this snapshot. Re-check active runtimes "
+                f"(run: `{recheck_cmd}`) and stop any newly assigned TPU; isolated config "
+                f"preserved at {isolated_config}."
+            )
         else:
             teardown_verified = True
 
@@ -1361,7 +1582,10 @@ def run_benchmark(
             "teardown_error": teardown_error,
         }
 
-    if interrupted:
+    if terminated:
+        status = "terminated" if teardown_verified else "terminated_unreconciled"
+        final_rc = 143
+    elif interrupted:
         status = "interrupted" if teardown_verified else "interrupted_unreconciled"
         final_rc = 130
     elif allocation_timed_out and not teardown_verified:
@@ -1723,7 +1947,9 @@ def run_self_test() -> int:
         assert rc_to == 1
         assert len(sum_to["attempts"]) == 1
         assert sum_to["attempts"][0]["tpu"] == "v6e1"
-        assert sum_to["status"] == "allocation_timeout"
+        assert sum_to["status"] == "allocation_timeout_unreconciled"
+        assert sum_to["teardown_verified"] is False
+        assert "re-check" in (sum_to["teardown_error"] or "").lower()
 
         assert not is_capacity_or_quota_error(
             1,
@@ -2091,8 +2317,8 @@ def run_self_test() -> int:
         assert "--config" in stop_cmd and sum_wt["isolated_config"] in stop_cmd
         assert "-s" in stop_cmd and sum_wt["chosen_session"] in stop_cmd
 
-        # 23. Pre-READY wall-clock timeout (rc=124) also attempts `colab stop -s <sess>` before
-        #     verifying release, and reports `allocation_timeout` without falling back.
+        # 23. Pre-READY wall-clock timeout (rc=124) with no confirmed endpoint attempts
+        #     `colab stop -s <sess>` without falling back, and keeps teardown_verified=False.
         pre_wall_cmds: List[List[str]] = []
 
         def pre_ready_wall_timeout_runner(cmd: Sequence[str]) -> CommandResult:
@@ -2121,8 +2347,9 @@ def run_self_test() -> int:
             runner=pre_ready_wall_timeout_runner,
         )
         assert rc_pwt == 124
-        assert sum_pwt["status"] == "allocation_timeout"
-        assert sum_pwt["teardown_verified"] is True
+        assert sum_pwt["status"] == "allocation_timeout_unreconciled"
+        assert sum_pwt["teardown_verified"] is False
+        assert "in-flight" in (sum_pwt["teardown_error"] or "").lower()
         assert sum_pwt["forced_stop"]["attempted"] is True
         assert len(sum_pwt["attempts"]) == 1
         assert any("stop" in c for c in pre_wall_cmds)
@@ -2392,7 +2619,200 @@ def run_self_test() -> int:
         assert sum_124["forced_stop"]["attempted"] is False
         assert not any("stop" in c for c in exit124_cmds)
 
-    print("colab_tpu_bench.py self-test PASSED (29/29 suites).")
+        # 30. Pre-READY cancellation with no confirmed endpoint keeps teardown_verified=False
+        #     even when the first `colab sessions` snapshot returns empty.
+        def pre_ready_cancel_runner(cmd: Sequence[str]) -> CommandResult:
+            cmd_list = list(cmd)
+            base_res = base_help_usage_sessions(cmd_list)
+            if base_res is not None:
+                return base_res
+            if "run" in cmd_list:
+                raise KeyboardInterrupt()
+            if "stop" in cmd_list:
+                return CommandResult(0, "[colab] Session not found.\n", "")
+            if "log" in cmd_list:
+                return CommandResult(1, "", "no log")
+            raise AssertionError(f"Unexpected command: {cmd_list}")
+
+        rc_prc, sum_prc = run_benchmark(
+            BenchConfig(tpus=("v6e1", "v5e1"), out_dir=tmp_path / "pre-ready-cancel"),
+            runner=pre_ready_cancel_runner,
+        )
+        assert rc_prc == 130
+        assert sum_prc["status"] == "interrupted_unreconciled"
+        assert sum_prc["teardown_verified"] is False
+        assert "in-flight" in (sum_prc["teardown_error"] or "").lower()
+
+        # 31. SIGTERM reconciliation via real signal handler & subprocess runner preserves
+        #     partial stdout/stderr already emitted before SIGTERM, stops the TPU, and exits 143.
+        stub_dir = tmp_path / "stub-bin"
+        stub_dir.mkdir(mode=0o700)
+        os.chmod(stub_dir, 0o700)
+        stub_marker = tmp_path / "stub-stopped.flag"
+        stub_colab = stub_dir / "fake_colab.py"
+        stub_colab.write_text(
+            textwrap.dedent(
+                f"""\
+                #!/usr/bin/env python3
+                import json, os, pathlib, sys, time
+                args = sys.argv[1:]
+                flag = pathlib.Path({str(stub_marker)!r})
+                if "--help" in args:
+                    print("Usage: colab --auth --config --no-public-api")
+                    sys.exit(0)
+                if "usage" in args:
+                    print("Current balance: 500.00 compute units")
+                    print("Usage rate: 0.00/hr")
+                    print("Active assignments: 0")
+                    sys.exit(0)
+                if "sessions" in args:
+                    if flag.exists() or not (flag.parent / "stub-started.flag").exists():
+                        print("[colab] No active sessions found on server.")
+                    else:
+                        print("[s] tpu-v6e1-sigterm | Hardware: V6E1 | Shape: STANDARD | Variant: TPU")
+                    sys.exit(0)
+                if "run" in args:
+                    (flag.parent / "stub-started.flag").write_text("1", encoding="utf-8")
+                    sys.stderr.write("[colab] Session READY (sigterm-sess).\\n")
+                    sys.stderr.flush()
+                    sys.stdout.write("PARTIAL_BENCH_STEP_1\\n")
+                    sys.stdout.flush()
+                    time.sleep(30)
+                    sys.exit(0)
+                if "stop" in args:
+                    flag.write_text("stopped", encoding="utf-8")
+                    print("[colab] Session terminated.")
+                    sys.exit(0)
+                if "log" in args:
+                    out_p = pathlib.Path(args[args.index("-o") + 1])
+                    nb = {{
+                        "nbformat": 4,
+                        "cells": [{{
+                            "cell_type": "markdown",
+                            "source": "**Session Created**: now\\n- Endpoint: `tpu-v6e1-sigterm`\\n",
+                        }}],
+                    }}
+                    out_p.write_text(json.dumps(nb), encoding="utf-8")
+                    print("Exported notebook.")
+                    sys.exit(0)
+                sys.exit(1)
+                """
+            ),
+            encoding="utf-8",
+        )
+        os.chmod(stub_colab, 0o700)
+
+        if hasattr(signal, "SIGTERM") and threading.current_thread() is threading.main_thread():
+            prev_sigterm = signal.getsignal(signal.SIGTERM)
+            started_flag = tmp_path / "stub-started.flag"
+
+            def _send_sigterm_when_ready() -> None:
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline:
+                    if started_flag.exists():
+                        time.sleep(0.15)
+                        os.kill(os.getpid(), signal.SIGTERM)
+                        return
+                    time.sleep(0.02)
+
+            killer = threading.Thread(target=_send_sigterm_when_ready, daemon=True)
+            killer.start()
+            sigterm_out = tmp_path / "sigterm-real"
+            rc_term, sum_term = run_benchmark(
+                BenchConfig(
+                    colab_bin=str(stub_colab),
+                    tpus=("v6e1", "v5e1"),
+                    out_dir=sigterm_out,
+                    teardown_retry_delay_s=0.0,
+                )
+            )
+            killer.join(timeout=2.0)
+            assert signal.getsignal(signal.SIGTERM) == prev_sigterm
+            assert rc_term == 143
+            assert sum_term["status"] == "terminated"
+            assert sum_term["teardown_verified"] is True
+            assert sum_term["forced_stop"]["attempted"] is True
+            assert sum_term["forced_stop"]["returncode"] == 0
+            assert stub_marker.exists()
+            assert len(sum_term["attempts"]) == 1
+            term_sess = sum_term["chosen_session"]
+            assert term_sess is not None
+            saved_stdout = (sigterm_out / f"{term_sess}.stdout.txt").read_text(encoding="utf-8")
+            saved_stderr = (sigterm_out / f"{term_sess}.stderr.txt").read_text(encoding="utf-8")
+            assert "PARTIAL_BENCH_STEP_1" in saved_stdout
+            assert "[colab] Session READY" in saved_stderr
+            assert "SIGTERM" in saved_stderr
+
+        # 32. Intermediate symlink hopping through a world-writable scratch directory to a
+        #     private 0700 directory MUST be rejected; trusted symlink chains canonicalize.
+        priv_target = tmp_path / "priv-target"
+        priv_target.mkdir(mode=0o700)
+        os.chmod(priv_target, 0o700)
+        scratch_dir = tmp_path / "scratch-ww"
+        scratch_dir.mkdir(mode=0o777)
+        os.chmod(scratch_dir, 0o777)
+        scratch_hop = scratch_dir / "hop"
+        scratch_hop.symlink_to(priv_target)
+        trusted_parent = tmp_path / "trusted-parent"
+        trusted_parent.mkdir(mode=0o700)
+        os.chmod(trusted_parent, 0o700)
+        outer_trap = trusted_parent / "entry"
+        outer_trap.symlink_to(scratch_hop)
+
+        rc_trap_out, sum_trap_out = run_benchmark(
+            BenchConfig(dry_run=True, out_dir=outer_trap / "run-out"),
+            runner=low_or_bad_cu_runner("unused"),
+        )
+        assert rc_trap_out == 2
+        assert sum_trap_out["status"] == "untrusted_out_dir"
+
+        rc_trap_cfg, sum_trap_cfg = run_benchmark(
+            BenchConfig(
+                dry_run=True,
+                out_dir=priv_target / "safe-out",
+                config_path=outer_trap / "sessions.json",
+            ),
+            runner=low_or_bad_cu_runner("unused"),
+        )
+        assert rc_trap_cfg == 2
+        assert sum_trap_cfg["status"] == "untrusted_config_path"
+
+        safe_hop = trusted_parent / "safe-hop"
+        safe_hop.symlink_to(priv_target)
+        rc_safe_hop, sum_safe_hop = run_benchmark(
+            BenchConfig(dry_run=True, out_dir=safe_hop / "canon-out"),
+            runner=low_or_bad_cu_runner("unused"),
+        )
+        assert rc_safe_hop == 0
+        assert Path(sum_safe_hop["out_dir"]) == Path(os.path.realpath(priv_target / "canon-out"))
+        assert Path(sum_safe_hop["isolated_config"]).parent == Path(sum_safe_hop["out_dir"])
+
+        # 33. Mocked CommandCancelledError (SIGINT) preserves partial stdout/stderr into run logs.
+        def sigint_partial_runner(cmd: Sequence[str]) -> CommandResult:
+            cmd_list = list(cmd)
+            if "run" in cmd_list:
+                raise CommandCancelledError(
+                    signal_name="SIGINT",
+                    returncode=130,
+                    stdout="CTRLC_PROGRESS_OUTPUT\n",
+                    stderr="[colab] Session READY (ctrlc-sess).\n",
+                )
+            return cancel_clean_runner(cmd_list)
+
+        ctrlc_out = tmp_path / "ctrlc-partial"
+        rc_cp, sum_cp = run_benchmark(
+            BenchConfig(tpus=("v6e1",), out_dir=ctrlc_out, teardown_retry_delay_s=0.0),
+            runner=sigint_partial_runner,
+        )
+        assert rc_cp == 130
+        assert sum_cp["status"] == "interrupted"
+        assert sum_cp["teardown_verified"] is True
+        cp_sess = sum_cp["chosen_session"]
+        assert cp_sess is not None
+        assert "CTRLC_PROGRESS_OUTPUT" in (ctrlc_out / f"{cp_sess}.stdout.txt").read_text(encoding="utf-8")
+        assert "[colab] Session READY" in (ctrlc_out / f"{cp_sess}.stderr.txt").read_text(encoding="utf-8")
+
+    print("colab_tpu_bench.py self-test PASSED (33/33 suites).")
     return 0
 
 
