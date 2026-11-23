@@ -2408,6 +2408,716 @@ void test_one_graph_spmd_kv_donation(int num_chips) {
     std::printf("  [PASS] Multi-chip SPMD (%d chips) 1-graph 2-layer decode + repeated KV donation\n", num_chips);
 }
 
+struct CbQuantWeights {
+    cloudtpu::PjrtBufferPtr bqs;
+    cloudtpu::PjrtBufferPtr bd;
+    cloudtpu::PjrtBufferPtr bm;
+};
+
+CbQuantWeights make_cb_q4k_weights(cloudtpu::PjrtRuntime& rt, int64_t N, int64_t K, float phase) {
+    const int64_t NB = K / 32;
+    std::vector<int8_t> qs(static_cast<size_t>(NB * 32 * N));
+    std::vector<uint16_t> d_bf16(static_cast<size_t>(NB * N));
+    std::vector<uint16_t> m_bf16(static_cast<size_t>(NB * N));
+    for (int64_t b = 0; b < NB; ++b) {
+        for (int64_t n = 0; n < N; ++n) {
+            const float raw_d = 0.025f * (1.0f + 0.35f * std::sin(static_cast<float>(n * 3 + b) + phase));
+            const uint16_t db = cloudtpu::f32_to_bf16(raw_d);
+            const float d = cloudtpu::bf16_to_f32(db);
+            const float m_raw = 0.04f * std::cos(static_cast<float>(n + b * 5) + phase);
+            const uint16_t mb = cloudtpu::f32_to_bf16(m_raw + 8.0f * d);
+            d_bf16[static_cast<size_t>(b * N + n)] = db;
+            m_bf16[static_cast<size_t>(b * N + n)] = mb;
+            for (int64_t k = 0; k < 32; ++k) {
+                const int s4 = static_cast<int>((n * 7 + b * 3 + k * 5 + static_cast<int>(phase * 10.0f)) & 0x0F) - 8;
+                qs[static_cast<size_t>((b * 32 + k) * N + n)] = static_cast<int8_t>(s4);
+            }
+        }
+    }
+    CbQuantWeights w;
+    w.bqs = rt.buffer_from_host(0, qs.data(), cloudtpu::PjrtDType::S4, {1, 1, NB, 32, N});
+    w.bd = rt.buffer_from_host(0, d_bf16.data(), cloudtpu::PjrtDType::BF16, {1, 1, NB, N});
+    w.bm = rt.buffer_from_host(0, m_bf16.data(), cloudtpu::PjrtDType::BF16, {1, 1, NB, N});
+    return w;
+}
+
+CbQuantWeights make_cb_q6k_weights(cloudtpu::PjrtRuntime& rt, int64_t N, int64_t K, float phase) {
+    const int64_t NB = K / 16;
+    std::vector<int8_t> qs(static_cast<size_t>(NB * 16 * N));
+    std::vector<uint16_t> d_bf16(static_cast<size_t>(NB * N));
+    for (int64_t b = 0; b < NB; ++b) {
+        for (int64_t n = 0; n < N; ++n) {
+            const float raw_d = 0.02f * (1.0f + 0.4f * std::cos(static_cast<float>(n * 2 + b) + phase));
+            const uint16_t db = cloudtpu::f32_to_bf16(raw_d);
+            d_bf16[static_cast<size_t>(b * N + n)] = db;
+            for (int64_t k = 0; k < 16; ++k) {
+                const int q = (static_cast<int>(n * 5 + b * 3 + k * 7 + static_cast<int>(phase * 10.0f)) % 63) - 31;
+                qs[static_cast<size_t>((b * 16 + k) * N + n)] = static_cast<int8_t>(q);
+            }
+        }
+    }
+    CbQuantWeights w;
+    w.bqs = rt.buffer_from_host(0, qs.data(), cloudtpu::PjrtDType::S8, {1, 1, NB, 16, N});
+    w.bd = rt.buffer_from_host(0, d_bf16.data(), cloudtpu::PjrtDType::BF16, {1, 1, NB, N});
+    return w;
+}
+
+struct CbModelDims {
+    int64_t n_layers = 2;
+    int64_t E = 128;
+    int64_t H_Q = 4;
+    int64_t H_KV = 2;
+    int64_t D = 32;
+    int64_t H_ff = 128;
+    int64_t KV_CAP = 32;
+    int64_t N_KV = 24;
+    int64_t V_emb = 32;
+    int64_t V_out = 16;
+};
+
+cloudtpu::GraphProgramSpec build_cb_decode_spec(const CbModelDims& m,
+                                                int64_t T,
+                                                int64_t mask_rows,
+                                                bool use_s64_kv_idx) {
+    const int64_t D_Q = m.H_Q * m.D;
+    const int64_t D_KV = m.H_KV * m.D;
+    const auto DENSE = cloudtpu::TensorStorageKind::DENSE;
+    const auto Q4K = cloudtpu::TensorStorageKind::Q4_K_I4;
+    const auto Q6K = cloudtpu::TensorStorageKind::Q6_K_SPLIT;
+    const auto F32 = cloudtpu::PjrtDType::F32;
+    const auto F16 = cloudtpu::PjrtDType::F16;
+    const auto BF16 = cloudtpu::PjrtDType::BF16;
+    const auto S32 = cloudtpu::PjrtDType::S32;
+    const auto S64 = cloudtpu::PjrtDType::S64;
+    const auto S4 = cloudtpu::PjrtDType::S4;
+    const auto S8 = cloudtpu::PjrtDType::S8;
+    const auto REP = cloudtpu::TensorShardingKind::REPLICATED;
+
+    cloudtpu::GraphProgramSpec spec;
+    spec.bf16_matmul = true;
+    spec.mm_pad_m = 8;
+    uint64_t next_id = 1;
+
+    const uint64_t id_emb_tbl = next_id++;
+    const uint64_t id_tokens = next_id++;
+    const uint64_t id_pos = next_id++;
+    const uint64_t id_row_idx = next_id++;
+    const uint64_t id_mask = next_id++;
+    const uint64_t id_out_ids = next_id++;
+    spec.inputs.push_back({id_emb_tbl, F32, DENSE, {1, 1, m.V_emb, m.E}, REP});
+    spec.inputs.push_back({id_tokens, S32, DENSE, {1, 1, 1, T}, REP});
+    spec.inputs.push_back({id_pos, S32, DENSE, {1, 1, 1, T}, REP});
+    spec.inputs.push_back({id_row_idx, use_s64_kv_idx ? S64 : S32, DENSE, {1, 1, 1, T}, REP});
+    spec.inputs.push_back({id_mask, F16, DENSE, {1, 1, mask_rows, m.N_KV}, REP});
+    spec.inputs.push_back({id_out_ids, S32, DENSE, {1, 1, 1, T}, REP});
+
+    auto add_op = [&](cloudtpu::CloudOpKind kind,
+                      std::vector<uint64_t> srcs,
+                      cloudtpu::PjrtDType dt,
+                      int64_t d0,
+                      int64_t d1,
+                      int64_t d2,
+                      int64_t d3) -> cloudtpu::OpNodeSpec& {
+        const uint64_t oid = next_id++;
+        cloudtpu::OpNodeSpec op;
+        op.kind = kind;
+        op.src_ids = std::move(srcs);
+        op.dst = {oid, dt, DENSE, {d0, d1, d2, d3}};
+        spec.ops.push_back(std::move(op));
+        return spec.ops.back();
+    };
+
+    uint64_t cur_x = add_op(cloudtpu::CloudOpKind::GET_ROWS, {id_emb_tbl, id_tokens}, F32, 1, 1, T, m.E).dst.id;
+    std::vector<uint64_t> kv_out_ids;
+
+    for (int64_t l = 0; l < m.n_layers; ++l) {
+        auto add_dense = [&](cloudtpu::PjrtDType dt, int64_t d2, int64_t d3, int32_t alias_idx = -1) {
+            const uint64_t tid = next_id++;
+            spec.inputs.push_back({tid, dt, DENSE, {1, 1, d2, d3}, REP, alias_idx});
+            return tid;
+        };
+        auto add_q4k = [&](int64_t rows, int64_t cols) {
+            const uint64_t tid = next_id++;
+            cloudtpu::TensorSpec ts{tid, S4, Q4K, {1, 1, rows, cols}, REP};
+            ts.scale_dtype = BF16;
+            spec.inputs.push_back(ts);
+            return tid;
+        };
+
+        const uint64_t id_an = add_dense(F32, 1, m.E);
+        const uint64_t id_wq = add_q4k(D_Q, m.E);
+        const uint64_t id_wk = add_q4k(D_KV, m.E);
+        const uint64_t id_wv = add_q4k(D_KV, m.E);
+        const uint64_t id_kcache = add_dense(F16, m.KV_CAP, D_KV, static_cast<int32_t>(2 * l));
+        const uint64_t id_vcache = add_dense(F16, m.KV_CAP, D_KV, static_cast<int32_t>(2 * l + 1));
+        const uint64_t id_wo = add_q4k(m.E, D_Q);
+        const uint64_t id_fn = add_dense(F32, 1, m.E);
+        const uint64_t id_wg = add_q4k(m.H_ff, m.E);
+        const uint64_t id_wu = add_q4k(m.H_ff, m.E);
+        const uint64_t id_wd = add_q4k(m.E, m.H_ff);
+
+        uint64_t id_rn = 0;
+        {
+            auto& op = add_op(cloudtpu::CloudOpKind::RMS_NORM, {cur_x}, F32, 1, 1, T, m.E);
+            op.eps = 1e-5f;
+            id_rn = op.dst.id;
+        }
+        const uint64_t id_xin = add_op(cloudtpu::CloudOpKind::MUL, {id_rn, id_an}, F32, 1, 1, T, m.E).dst.id;
+
+        auto emit_mm = [&](uint64_t w, uint64_t act, int64_t out_dim) {
+            auto& op = add_op(cloudtpu::CloudOpKind::MUL_MAT, {w, act}, F32, 1, 1, T, out_dim);
+            op.high_precision = true;
+            return op.dst.id;
+        };
+        const uint64_t id_q2d = emit_mm(id_wq, id_xin, D_Q);
+        const uint64_t id_k2d = emit_mm(id_wk, id_xin, D_KV);
+        const uint64_t id_v2d = emit_mm(id_wv, id_xin, D_KV);
+
+        const uint64_t id_q3d = add_op(cloudtpu::CloudOpKind::RESHAPE, {id_q2d}, F32, 1, T, m.H_Q, m.D).dst.id;
+        const uint64_t id_k3d = add_op(cloudtpu::CloudOpKind::RESHAPE, {id_k2d}, F32, 1, T, m.H_KV, m.D).dst.id;
+
+        auto emit_rope = [&](uint64_t src, int64_t n_heads) {
+            auto& op = add_op(cloudtpu::CloudOpKind::ROPE, {src, id_pos}, F32, 1, T, n_heads, m.D);
+            op.rope.n_dims = static_cast<int32_t>(m.D);
+            op.rope.mode = 2;
+            op.rope.freq_base = 10000.0f;
+            op.rope.freq_scale = 1.0f;
+            op.rope.attn_factor = 1.0f;
+            return op.dst.id;
+        };
+        const uint64_t id_qr = emit_rope(id_q3d, m.H_Q);
+        const uint64_t id_kr = emit_rope(id_k3d, m.H_KV);
+        const uint64_t id_kflat = add_op(cloudtpu::CloudOpKind::RESHAPE, {id_kr}, F32, 1, 1, T, D_KV).dst.id;
+
+        const uint64_t id_kset =
+            add_op(cloudtpu::CloudOpKind::SET_ROWS, {id_kflat, id_row_idx, id_kcache}, F16, 1, 1, m.KV_CAP, D_KV).dst.id;
+        const uint64_t id_vset =
+            add_op(cloudtpu::CloudOpKind::SET_ROWS, {id_v2d, id_row_idx, id_vcache}, F16, 1, 1, m.KV_CAP, D_KV).dst.id;
+        kv_out_ids.push_back(id_kset);
+        kv_out_ids.push_back(id_vset);
+
+        auto emit_kv_view_perm = [&](uint64_t src_set) {
+            uint64_t sl_id = 0;
+            {
+                auto& op = add_op(cloudtpu::CloudOpKind::SLICE, {src_set}, F16, 1, m.N_KV, m.H_KV, m.D);
+                op.slice_starts = {0, 0, 0, 0};
+                op.slice_limits = {1, 1, m.N_KV, D_KV};
+                sl_id = op.dst.id;
+            }
+            auto& tp = add_op(cloudtpu::CloudOpKind::TRANSPOSE, {sl_id}, F16, 1, m.H_KV, m.N_KV, m.D);
+            tp.perm[0] = 0;
+            tp.perm[1] = 2;
+            tp.perm[2] = 1;
+            tp.perm[3] = 3;
+            return tp.dst.id;
+        };
+        const uint64_t id_kp = emit_kv_view_perm(id_kset);
+        const uint64_t id_vp = emit_kv_view_perm(id_vset);
+
+        uint64_t id_qp = 0;
+        {
+            auto& tp = add_op(cloudtpu::CloudOpKind::TRANSPOSE, {id_qr}, F32, 1, m.H_Q, T, m.D);
+            tp.perm[0] = 0;
+            tp.perm[1] = 2;
+            tp.perm[2] = 1;
+            tp.perm[3] = 3;
+            id_qp = tp.dst.id;
+        }
+        uint64_t id_attn = 0;
+        {
+            auto& fa = add_op(cloudtpu::CloudOpKind::FLASH_ATTN_EXT, {id_qp, id_kp, id_vp, id_mask}, F32, 1, T, m.H_Q, m.D);
+            fa.high_precision = true;
+            fa.flash_attn.scale = 1.0f / std::sqrt(static_cast<float>(m.D));
+            id_attn = fa.dst.id;
+        }
+
+        const uint64_t id_aflat = add_op(cloudtpu::CloudOpKind::RESHAPE, {id_attn}, F32, 1, 1, T, D_Q).dst.id;
+        const uint64_t id_oproj = emit_mm(id_wo, id_aflat, m.E);
+        const uint64_t id_hmid = add_op(cloudtpu::CloudOpKind::ADD, {cur_x, id_oproj}, F32, 1, 1, T, m.E).dst.id;
+
+        uint64_t id_fnorm = 0;
+        {
+            auto& op = add_op(cloudtpu::CloudOpKind::RMS_NORM, {id_hmid}, F32, 1, 1, T, m.E);
+            op.eps = 1e-5f;
+            id_fnorm = op.dst.id;
+        }
+        const uint64_t id_fin = add_op(cloudtpu::CloudOpKind::MUL, {id_fnorm, id_fn}, F32, 1, 1, T, m.E).dst.id;
+        const uint64_t id_gf = emit_mm(id_wg, id_fin, m.H_ff);
+        const uint64_t id_uf = emit_mm(id_wu, id_fin, m.H_ff);
+        const uint64_t id_sw = add_op(cloudtpu::CloudOpKind::SWIGLU, {id_gf, id_uf}, F32, 1, 1, T, m.H_ff).dst.id;
+        const uint64_t id_dn = emit_mm(id_wd, id_sw, m.E);
+        cur_x = add_op(cloudtpu::CloudOpKind::ADD, {id_hmid, id_dn}, F32, 1, 1, T, m.E).dst.id;
+    }
+
+    const uint64_t id_wout = next_id++;
+    {
+        cloudtpu::TensorSpec ts{id_wout, S8, Q6K, {1, 1, m.V_out, m.E}, REP};
+        ts.scale_dtype = BF16;
+        spec.inputs.push_back(ts);
+    }
+    const uint64_t id_hsel = add_op(cloudtpu::CloudOpKind::GET_ROWS, {cur_x, id_out_ids}, F32, 1, 1, T, m.E).dst.id;
+    uint64_t id_logits = 0;
+    {
+        auto& op = add_op(cloudtpu::CloudOpKind::MUL_MAT, {id_wout, id_hsel}, F32, 1, 1, T, m.V_out);
+        op.high_precision = true;
+        id_logits = op.dst.id;
+    }
+
+    spec.output_ids = kv_out_ids;
+    spec.output_ids.push_back(id_logits);
+    return spec;
+}
+
+void test_continuous_batching_padded_buckets() {
+    // 1) Env parsing and select_batch_bucket contract
+    {
+        const auto def_b = cloudtpu::parse_batch_buckets(nullptr);
+        const std::vector<int64_t> exp_def = {1, 2, 4, 8, 16};
+        CHECK_TRUE(def_b == exp_def, "default batch buckets must be {1,2,4,8,16}");
+        CHECK_TRUE(cloudtpu::parse_batch_buckets("0").empty(), "\"0\" must disable batch bucketing");
+        CHECK_TRUE(cloudtpu::parse_batch_buckets("").empty(), "\"\" must disable batch bucketing");
+        const auto custom_b = cloudtpu::parse_batch_buckets("16, 4, 8, 4, 1, 2");
+        CHECK_TRUE(custom_b == exp_def, "custom batch buckets must sort and deduplicate");
+
+        CHECK_TRUE(cloudtpu::select_batch_bucket(0, def_b) == 0, "n=0 selects 0");
+        CHECK_TRUE(cloudtpu::select_batch_bucket(1, def_b) == 1, "n=1 selects 1");
+        CHECK_TRUE(cloudtpu::select_batch_bucket(2, def_b) == 2, "n=2 selects 2");
+        CHECK_TRUE(cloudtpu::select_batch_bucket(3, def_b) == 4, "n=3 selects 4");
+        CHECK_TRUE(cloudtpu::select_batch_bucket(5, def_b) == 8, "n=5 selects 8");
+        CHECK_TRUE(cloudtpu::select_batch_bucket(8, def_b) == 8, "n=8 selects 8");
+        CHECK_TRUE(cloudtpu::select_batch_bucket(9, def_b) == 16, "n=9 selects 16");
+        CHECK_TRUE(cloudtpu::select_batch_bucket(16, def_b) == 16, "n=16 selects 16");
+        CHECK_TRUE(cloudtpu::select_batch_bucket(17, def_b) == 0, "n=17 > max returns 0");
+        CHECK_TRUE(cloudtpu::select_batch_bucket(5, {}) == 0, "empty buckets disables bucketing");
+    }
+
+    // 2) Reshape/view/pad/slice helpers + fail-closed dataflow invariants
+    {
+        const int64_t d_src1[4] = {1, 1, 5, 32};
+        const int64_t d_dst1[4] = {1, 5, 4, 8};
+        CHECK_TRUE(cloudtpu::map_token_axis_reshape(d_src1, 4, 2, d_dst1, 4) == 1, "reshape [1,1,5,32]->[1,5,4,8]");
+        CHECK_TRUE(cloudtpu::map_token_axis_reshape(d_dst1, 4, 1, d_src1, 4) == 2, "reshape [1,5,4,8]->[1,1,5,32]");
+        const int64_t d_amb_src[4] = {1, 1, 1, 8};
+        const int64_t d_amb_dst[4] = {1, 1, 1, 8};
+        CHECK_TRUE(cloudtpu::map_token_axis_reshape(d_amb_src, 4, 2, d_amb_dst, 4) == -1,
+                   "ambiguous T=1 reshape must fail closed");
+
+        std::vector<int64_t> rdims, starts = {0, 0, 0, 0}, limits = {1, 1, 5, 16};
+        CHECK_TRUE(cloudtpu::bucket_view_slice_dims(d_src1, 2, 5, 8, rdims, starts, limits), "bucket_view_slice_dims");
+        CHECK_TRUE(rdims.empty() && starts == std::vector<int64_t>({0, 0, 0, 0}) &&
+                       limits == std::vector<int64_t>({1, 1, 8, 16}),
+                   "bucket_view_slice_dims widens token limit [0..T)->[0..B)");
+
+        std::vector<int64_t> rdims2 = {1, 5, 4, 8}, starts2 = {0, 0, 0, 0}, limits2 = {1, 5, 2, 8};
+        CHECK_TRUE(cloudtpu::bucket_view_slice_dims(d_src1, 2, 5, 8, rdims2, starts2, limits2),
+                   "bucket_view_slice_dims reshaped head view");
+        CHECK_TRUE(rdims2 == std::vector<int64_t>({1, 8, 4, 8}) &&
+                       limits2 == std::vector<int64_t>({1, 8, 2, 8}),
+                   "bucket_view_slice_dims widens reshaped token axis");
+
+        // Strided pad & slice with outer=2 > 1
+        const int64_t od[4] = {1, 2, 5, 3};
+        const int64_t pd[4] = {1, 2, 8, 3};
+        std::vector<float> src(2 * 5 * 3);
+        for (size_t i = 0; i < src.size(); ++i) src[i] = static_cast<float>(i + 1) * 0.5f;
+        std::vector<float> padded(2 * 8 * 3, -99.0f);
+        cloudtpu::pad_dense_host_tensor(src.data(), padded.data(), cloudtpu::PjrtDType::F32,
+                                        od, pd, 2, cloudtpu::TokenInputPadKind::ZERO);
+        for (int b1 = 0; b1 < 2; ++b1) {
+            for (int t = 5; t < 8; ++t) {
+                for (int k = 0; k < 3; ++k) {
+                    CHECK_NEAR(padded[static_cast<size_t>((b1 * 8 + t) * 3 + k)], 0.0f, 1e-6f,
+                               "strided ZERO pad must clear dummy rows [T..B)");
+                }
+            }
+        }
+        std::vector<float> sliced(2 * 5 * 3, 0.0f);
+        cloudtpu::slice_dense_host_tensor(padded.data(), sliced.data(), sizeof(float), pd, od, 2);
+        for (size_t i = 0; i < src.size(); ++i) {
+            CHECK_NEAR(sliced[i], src[i], 1e-6f, "strided slice_dense_host_tensor roundtrip");
+        }
+
+        // Fail-closed: GET_ROWS(hidden, out_ids) where n_outputs != T
+        {
+            cloudtpu::GraphProgramSpec bad_gr;
+            bad_gr.inputs.push_back({1, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 5, 16}});
+            bad_gr.inputs.push_back({2, cloudtpu::PjrtDType::S32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 2}});
+            bad_gr.inputs.push_back({3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 8, 16}});
+            cloudtpu::OpNodeSpec mm;
+            mm.kind = cloudtpu::CloudOpKind::MUL_MAT;
+            mm.src_ids = {3, 1};
+            mm.dst = {4, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 5, 8}};
+            cloudtpu::OpNodeSpec gr;
+            gr.kind = cloudtpu::CloudOpKind::GET_ROWS;
+            gr.src_ids = {4, 2};
+            gr.dst = {5, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 2, 8}};
+            bad_gr.ops = {mm, gr};
+            bad_gr.output_ids = {5};
+            CHECK_TRUE(!cloudtpu::analyze_program_token_axes(bad_gr, 5, 8).success,
+                       "GET_ROWS(hidden, out_ids) with n_outputs != T must fail closed");
+        }
+
+        // Fail-closed: shared idx between SET_ROWS (NEG_ONE) and GET_ROWS (ZERO)
+        {
+            cloudtpu::GraphProgramSpec bad_idx;
+            bad_idx.inputs.push_back({1, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 16, 8}});
+            bad_idx.inputs.push_back({2, cloudtpu::PjrtDType::S32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 5}});
+            bad_idx.inputs.push_back({3, cloudtpu::PjrtDType::F16, cloudtpu::TensorStorageKind::DENSE, {1, 1, 16, 8}});
+            cloudtpu::OpNodeSpec gr;
+            gr.kind = cloudtpu::CloudOpKind::GET_ROWS;
+            gr.src_ids = {1, 2};
+            gr.dst = {4, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 5, 8}};
+            cloudtpu::OpNodeSpec sr;
+            sr.kind = cloudtpu::CloudOpKind::SET_ROWS;
+            sr.src_ids = {4, 2, 3};
+            sr.dst = {5, cloudtpu::PjrtDType::F16, cloudtpu::TensorStorageKind::DENSE, {1, 1, 16, 8}};
+            bad_idx.ops = {gr, sr};
+            bad_idx.output_ids = {5};
+            CHECK_TRUE(!cloudtpu::analyze_program_token_axes(bad_idx, 5, 8).success,
+                       "shared index tensor between GET_ROWS and SET_ROWS must fail closed");
+        }
+
+        // Fail-closed: SLICE along token_axis
+        {
+            cloudtpu::GraphProgramSpec bad_sl;
+            bad_sl.inputs.push_back({1, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 8, 8}});
+            bad_sl.inputs.push_back({2, cloudtpu::PjrtDType::S32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 5}});
+            cloudtpu::OpNodeSpec gr;
+            gr.kind = cloudtpu::CloudOpKind::GET_ROWS;
+            gr.src_ids = {1, 2};
+            gr.dst = {3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 5, 8}};
+            cloudtpu::OpNodeSpec sl;
+            sl.kind = cloudtpu::CloudOpKind::SLICE;
+            sl.src_ids = {3};
+            sl.slice_starts = {0, 0, 1, 0};
+            sl.slice_limits = {1, 1, 4, 8};
+            sl.dst = {4, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 3, 8}};
+            bad_sl.ops = {gr, sl};
+            bad_sl.output_ids = {4};
+            CHECK_TRUE(!cloudtpu::analyze_program_token_axes(bad_sl, 5, 8).success,
+                       "SLICE along token_axis must fail closed");
+        }
+
+        // FLASH_ATTN_EXT mask rules: T < mask[2] < B fails closed; mask[2] >= B (64) stays unpadded (-1)
+        const CbModelDims dims;
+        const auto bad_mask = build_cb_decode_spec(dims, 5, 6, true);
+        CHECK_TRUE(!cloudtpu::analyze_program_token_axes(bad_mask, 5, 8).success,
+                   "mask with T < mask[2] < B must fail closed");
+        const auto pad64_mask = build_cb_decode_spec(dims, 5, 64, true);
+        const auto plan64 = cloudtpu::analyze_program_token_axes(pad64_mask, 5, 8);
+        CHECK_TRUE(plan64.success && plan64.input_token_axis[4] == -1,
+                   "mask with dims[2] >= B (64) must remain unpadded (-1)");
+
+        // ROPE [1,1,T,D] with scalar pos [1,1,1,1] keeps pos unpadded (-1)
+        {
+            cloudtpu::GraphProgramSpec rspec;
+            rspec.inputs.push_back({1, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 5, 16}});
+            rspec.inputs.push_back({2, cloudtpu::PjrtDType::S32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 1}});
+            rspec.inputs.push_back({3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 8, 16}});
+            cloudtpu::OpNodeSpec mm;
+            mm.kind = cloudtpu::CloudOpKind::MUL_MAT;
+            mm.src_ids = {3, 1};
+            mm.dst = {4, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 5, 8}};
+            cloudtpu::OpNodeSpec rp;
+            rp.kind = cloudtpu::CloudOpKind::ROPE;
+            rp.src_ids = {4, 2};
+            rp.dst = {5, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 5, 8}};
+            rp.rope.n_dims = 8;
+            rspec.ops = {mm, rp};
+            rspec.output_ids = {5};
+            const auto rplan = cloudtpu::analyze_program_token_axes(rspec, 5, 8);
+            CHECK_TRUE(rplan.success && rplan.input_token_axis[0] == 2 &&
+                           rplan.input_token_axis[1] == -1 && rplan.output_token_axis[0] == 2,
+                       "ROPE on [1,1,T,D] with scalar pos must preserve pos=-1 and dst ax=2");
+        }
+    }
+
+    // 3) End-to-end T=5,6,7,8 continuous-batching decode graph (GET_ROWS + Q4_K_I4/BF16 + ROPE +
+    //    SET_ROWS(scatter -1) + FLASH_ATTN_EXT + FFN + GET_ROWS(out_ids) + lm_head(Q6_K/BF16))
+    const CbModelDims m;
+    const int64_t D_Q = m.H_Q * m.D;
+    const int64_t D_KV = m.H_KV * m.D;
+
+    cloudtpu::RuntimeConfig cfg;
+    cfg.mock_mode = true;
+    cfg.exec_cache_cap = 64;
+    cloudtpu::PjrtRuntime rt;
+    rt.init(cfg);
+
+    std::vector<float> emb_tbl(static_cast<size_t>(m.V_emb * m.E));
+    for (size_t i = 0; i < emb_tbl.size(); ++i) {
+        emb_tbl[i] = 0.25f * std::sin(static_cast<float>(i + 1) * 0.19f);
+    }
+    auto b_emb = rt.buffer_from_host(0, emb_tbl.data(), cloudtpu::PjrtDType::F32, {1, 1, m.V_emb, m.E});
+
+    struct LayerWeightBufs {
+        cloudtpu::PjrtBufferPtr an, fn;
+        CbQuantWeights wq, wk, wv, wo, wg, wu, wd;
+    };
+    std::vector<LayerWeightBufs> wbufs(static_cast<size_t>(m.n_layers));
+    for (int64_t l = 0; l < m.n_layers; ++l) {
+        const float lp = static_cast<float>(l) * 0.6f;
+        LayerWeightBufs& lb = wbufs[static_cast<size_t>(l)];
+        std::vector<float> an(static_cast<size_t>(m.E)), fn(static_cast<size_t>(m.E));
+        for (int64_t i = 0; i < m.E; ++i) {
+            an[static_cast<size_t>(i)] = 0.85f + 0.1f * std::cos(static_cast<float>(i) * 0.23f + lp);
+            fn[static_cast<size_t>(i)] = 0.9f + 0.1f * std::sin(static_cast<float>(i) * 0.29f + lp);
+        }
+        lb.an = rt.buffer_from_host(0, an.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, m.E});
+        lb.fn = rt.buffer_from_host(0, fn.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, m.E});
+        lb.wq = make_cb_q4k_weights(rt, D_Q, m.E, 0.1f + lp);
+        lb.wk = make_cb_q4k_weights(rt, D_KV, m.E, 0.2f + lp);
+        lb.wv = make_cb_q4k_weights(rt, D_KV, m.E, 0.3f + lp);
+        lb.wo = make_cb_q4k_weights(rt, m.E, D_Q, 0.4f + lp);
+        lb.wg = make_cb_q4k_weights(rt, m.H_ff, m.E, 0.5f + lp);
+        lb.wu = make_cb_q4k_weights(rt, m.H_ff, m.E, 0.6f + lp);
+        lb.wd = make_cb_q4k_weights(rt, m.E, m.H_ff, 0.7f + lp);
+    }
+    const CbQuantWeights lm_head = make_cb_q6k_weights(rt, m.V_out, m.E, 0.9f);
+
+    // Non-zero sentinel KV pattern to detect any corruption of untouched slots
+    std::vector<uint16_t> sentinel_kv(static_cast<size_t>(m.KV_CAP * D_KV));
+    for (size_t i = 0; i < sentinel_kv.size(); ++i) {
+        sentinel_kv[i] = cloudtpu::f32_to_f16(0.22f * std::sin(static_cast<float>(i + 3) * 0.37f));
+    }
+
+    auto make_step_buffers = [&](int64_t T,
+                                 int64_t bucket_B,
+                                 const cloudtpu::BucketAnalysisResult* plan,
+                                 bool use_s64,
+                                 std::vector<int64_t>& active_slots_out,
+                                 std::vector<cloudtpu::PjrtBufferPtr>& owned_bufs_out) {
+        owned_bufs_out.clear();
+        active_slots_out.resize(static_cast<size_t>(T));
+        std::vector<int32_t> tokens(static_cast<size_t>(T));
+        std::vector<int32_t> pos(static_cast<size_t>(T));
+        std::vector<int32_t> out_ids(static_cast<size_t>(T));
+        std::vector<int64_t> row_idx64(static_cast<size_t>(T));
+        std::vector<int32_t> row_idx32(static_cast<size_t>(T));
+        std::vector<uint16_t> mask(static_cast<size_t>(T * m.N_KV),
+                                   cloudtpu::f32_to_f16(-std::numeric_limits<float>::infinity()));
+
+        const int64_t fixed_slots[8] = {2, 5, 8, 11, 14, 17, 20, 22};
+        for (int64_t t = 0; t < T; ++t) {
+            tokens[static_cast<size_t>(t)] = static_cast<int32_t>((t * 5 + 3) % m.V_emb);
+            pos[static_cast<size_t>(t)] = static_cast<int32_t>(t + 1);
+            out_ids[static_cast<size_t>(t)] = static_cast<int32_t>(T - 1 - t);
+            row_idx64[static_cast<size_t>(t)] = fixed_slots[static_cast<size_t>(t)];
+            row_idx32[static_cast<size_t>(t)] = static_cast<int32_t>(fixed_slots[static_cast<size_t>(t)]);
+            active_slots_out[static_cast<size_t>(t)] = fixed_slots[static_cast<size_t>(t)];
+            mask[static_cast<size_t>(t * m.N_KV + 0)] = cloudtpu::f32_to_f16(0.0f);
+            mask[static_cast<size_t>(t * m.N_KV + fixed_slots[static_cast<size_t>(t)])] = cloudtpu::f32_to_f16(0.0f);
+        }
+
+        const int64_t eff_T = (plan && plan->success) ? bucket_B : T;
+        auto push_padded = [&](const void* src_ptr, cloudtpu::PjrtDType dt,
+                               const int64_t od[4], size_t input_idx) {
+            if (plan && plan->success && plan->input_token_axis[input_idx] >= 0) {
+                int64_t pd[4] = {od[0], od[1], od[2], od[3]};
+                pd[plan->input_token_axis[input_idx]] = bucket_B;
+                const size_t nbytes = cloudtpu::pjrt_dtype_nbytes(dt, pd[0] * pd[1] * pd[2] * pd[3]);
+                std::vector<uint8_t> tmp(nbytes);
+                cloudtpu::pad_dense_host_tensor(src_ptr, tmp.data(), dt, od, pd,
+                                                plan->input_token_axis[input_idx],
+                                                plan->input_pad_kind[input_idx]);
+                owned_bufs_out.push_back(rt.buffer_from_host(0, tmp.data(), dt, {pd[0], pd[1], pd[2], pd[3]}));
+            } else {
+                owned_bufs_out.push_back(rt.buffer_from_host(0, src_ptr, dt, {od[0], od[1], od[2], od[3]}));
+            }
+        };
+        const int64_t d_1d[4] = {1, 1, 1, T};
+        const int64_t d_mk[4] = {1, 1, T, m.N_KV};
+        push_padded(tokens.data(), cloudtpu::PjrtDType::S32, d_1d, 1);
+        push_padded(pos.data(), cloudtpu::PjrtDType::S32, d_1d, 2);
+        if (use_s64) {
+            push_padded(row_idx64.data(), cloudtpu::PjrtDType::S64, d_1d, 3);
+        } else {
+            push_padded(row_idx32.data(), cloudtpu::PjrtDType::S32, d_1d, 3);
+        }
+        push_padded(mask.data(), cloudtpu::PjrtDType::F16, d_mk, 4);
+        push_padded(out_ids.data(), cloudtpu::PjrtDType::S32, d_1d, 5);
+        (void) eff_T;
+    };
+
+    auto run_step = [&](const cloudtpu::GraphProgramSpec& run_spec,
+                        const cloudtpu::EmittedProgram& prog,
+                        int64_t T,
+                        int64_t bucket_B,
+                        const cloudtpu::BucketAnalysisResult* plan,
+                        bool use_s64,
+                        std::vector<std::vector<cloudtpu::PjrtBufferPtr>>& kv_bufs,
+                        std::vector<int64_t>& active_slots_out) {
+        std::vector<cloudtpu::PjrtBufferPtr> step_in;
+        make_step_buffers(T, bucket_B, plan, use_s64, active_slots_out, step_in);
+        std::vector<PJRT_Buffer*> raw_in;
+        raw_in.push_back(b_emb->handle.get());
+        for (const auto& p : step_in) raw_in.push_back(p->handle.get());
+        for (int64_t l = 0; l < m.n_layers; ++l) {
+            const LayerWeightBufs& lb = wbufs[static_cast<size_t>(l)];
+            auto push_q4k = [&](const CbQuantWeights& w) {
+                raw_in.push_back(w.bqs->handle.get());
+                raw_in.push_back(w.bd->handle.get());
+                raw_in.push_back(w.bm->handle.get());
+            };
+            raw_in.push_back(lb.an->handle.get());
+            push_q4k(lb.wq);
+            push_q4k(lb.wk);
+            push_q4k(lb.wv);
+            raw_in.push_back(kv_bufs[static_cast<size_t>(l)][0]->handle.get());
+            raw_in.push_back(kv_bufs[static_cast<size_t>(l)][1]->handle.get());
+            push_q4k(lb.wo);
+            raw_in.push_back(lb.fn->handle.get());
+            push_q4k(lb.wg);
+            push_q4k(lb.wu);
+            push_q4k(lb.wd);
+        }
+        raw_in.push_back(lm_head.bqs->handle.get());
+        raw_in.push_back(lm_head.bd->handle.get());
+
+        std::vector<cloudtpu::PjrtDType> out_dts;
+        std::vector<std::vector<int64_t>> out_dims;
+        for (const auto& ob : prog.output_bindings) {
+            out_dts.push_back(ob.dtype);
+            out_dims.push_back(ob.dims);
+        }
+        (void) run_spec;
+        const auto copts = rt.make_spmd_compile_options(1, 0, true, true);
+        const auto* exec = rt.compile_or_get(prog.cache_key, prog.mlir_text, copts);
+        std::vector<cloudtpu::PjrtBufferPtr> outs;
+        rt.execute(exec, 0, raw_in.data(), raw_in.size(), outs, out_dts, out_dims, true);
+        for (int64_t l = 0; l < m.n_layers; ++l) {
+            kv_bufs[static_cast<size_t>(l)][0] = outs[static_cast<size_t>(2 * l)];
+            kv_bufs[static_cast<size_t>(l)][1] = outs[static_cast<size_t>(2 * l + 1)];
+        }
+        const int64_t eff_T = (plan && plan->success) ? bucket_B : T;
+        std::vector<float> raw_logits(static_cast<size_t>(eff_T * m.V_out));
+        rt.buffer_to_host(outs.back()->handle.get(), raw_logits.data(), raw_logits.size() * sizeof(float));
+        if (plan && plan->success) {
+            const int64_t pd[4] = {1, 1, bucket_B, m.V_out};
+            const int64_t ld[4] = {1, 1, T, m.V_out};
+            std::vector<float> sliced(static_cast<size_t>(T * m.V_out));
+            cloudtpu::slice_dense_host_tensor(raw_logits.data(), sliced.data(), sizeof(float),
+                                              pd, ld, plan->output_token_axis.back());
+            return sliced;
+        }
+        return raw_logits;
+    };
+
+    // 3a) Sequential T=5,6,7,8 must share the exact cache_key and yield misses==1, hits==3
+    {
+        std::vector<std::vector<cloudtpu::PjrtBufferPtr>> kv_seq(static_cast<size_t>(m.n_layers));
+        for (int64_t l = 0; l < m.n_layers; ++l) {
+            kv_seq[static_cast<size_t>(l)].push_back(
+                rt.buffer_from_host(0, sentinel_kv.data(), cloudtpu::PjrtDType::F16, {1, 1, m.KV_CAP, D_KV}));
+            kv_seq[static_cast<size_t>(l)].push_back(
+                rt.buffer_from_host(0, sentinel_kv.data(), cloudtpu::PjrtDType::F16, {1, 1, m.KV_CAP, D_KV}));
+        }
+        const cloudtpu::CacheStats st_before = rt.cache_stats();
+        std::string key_ref;
+        for (int64_t T : {int64_t(5), int64_t(6), int64_t(7), int64_t(8)}) {
+            const int64_t B = cloudtpu::select_batch_bucket(T, {1, 2, 4, 8, 16});
+            CHECK_TRUE(B == 8, "T in 5..8 must select bucket 8");
+            cloudtpu::GraphProgramSpec spec = build_cb_decode_spec(m, T, T, true);
+            cloudtpu::BucketAnalysisResult plan;
+            if (B > T) {
+                plan = cloudtpu::analyze_program_token_axes(spec, T, B);
+                CHECK_TRUE(plan.success, "CB decode graph analysis must succeed");
+                CHECK_TRUE(cloudtpu::apply_program_batch_bucket(spec, plan), "apply_program_batch_bucket must succeed");
+            }
+            const cloudtpu::EmittedProgram prog = cloudtpu::emit_stablehlo_program(spec);
+            if (key_ref.empty()) {
+                key_ref = prog.cache_key;
+            } else {
+                CHECK_TRUE(prog.cache_key == key_ref, "T=5,6,7,8 bucketed specs must share identical cache_key");
+            }
+            std::vector<int64_t> active_slots;
+            run_step(spec, prog, T, B, (B > T) ? &plan : nullptr, true, kv_seq, active_slots);
+        }
+        const cloudtpu::CacheStats st_after = rt.cache_stats();
+        CHECK_TRUE(st_after.misses - st_before.misses == 1,
+                   "T=5,6,7,8 continuous batching must have misses == 1");
+        CHECK_TRUE(st_after.hits - st_before.hits == 3,
+                   "T=5,6,7,8 continuous batching must have hits == 3");
+    }
+
+    // 3b) Parity (< 1e-4) vs unbucketed and bit-exact KV slot non-corruption (both S64 and S32 indices)
+    for (bool use_s64 : {true, false}) {
+        for (int64_t T : {int64_t(5), int64_t(6), int64_t(7)}) {
+            auto init_kv = [&]() {
+                std::vector<std::vector<cloudtpu::PjrtBufferPtr>> kv(static_cast<size_t>(m.n_layers));
+                for (int64_t l = 0; l < m.n_layers; ++l) {
+                    kv[static_cast<size_t>(l)].push_back(
+                        rt.buffer_from_host(0, sentinel_kv.data(), cloudtpu::PjrtDType::F16, {1, 1, m.KV_CAP, D_KV}));
+                    kv[static_cast<size_t>(l)].push_back(
+                        rt.buffer_from_host(0, sentinel_kv.data(), cloudtpu::PjrtDType::F16, {1, 1, m.KV_CAP, D_KV}));
+                }
+                return kv;
+            };
+            auto kv_buck = init_kv();
+            auto kv_unb = init_kv();
+
+            const int64_t B = 8;
+            cloudtpu::GraphProgramSpec spec_u = build_cb_decode_spec(m, T, T, use_s64);
+            const cloudtpu::EmittedProgram prog_u = cloudtpu::emit_stablehlo_program(spec_u);
+            std::vector<int64_t> slots_u;
+            const std::vector<float> logits_u =
+                run_step(spec_u, prog_u, T, T, nullptr, use_s64, kv_unb, slots_u);
+
+            cloudtpu::GraphProgramSpec spec_b = spec_u;
+            const cloudtpu::BucketAnalysisResult plan = cloudtpu::analyze_program_token_axes(spec_b, T, B);
+            CHECK_TRUE(plan.success && plan.input_pad_kind[3] == cloudtpu::TokenInputPadKind::NEG_ONE,
+                       "SET_ROWS index input must require NEG_ONE padding");
+            CHECK_TRUE(cloudtpu::apply_program_batch_bucket(spec_b, plan), "apply bucket for parity");
+            const cloudtpu::EmittedProgram prog_b = cloudtpu::emit_stablehlo_program(spec_b);
+            std::vector<int64_t> slots_b;
+            const std::vector<float> logits_b =
+                run_step(spec_b, prog_b, T, B, &plan, use_s64, kv_buck, slots_b);
+
+            CHECK_TRUE(logits_b.size() == static_cast<size_t>(T * m.V_out) &&
+                           logits_u.size() == logits_b.size(),
+                       "logits output length must match logical [T, V_out]");
+            for (size_t i = 0; i < logits_b.size(); ++i) {
+                CHECK_NEAR(logits_b[i], logits_u[i], 1e-4f,
+                           "bucketed CB decode logits parity < 1e-4 vs unbucketed");
+            }
+
+            // Verify unused KV cache slots remain bit-exact to sentinel pattern across all layers
+            for (int64_t l = 0; l < m.n_layers; ++l) {
+                for (int kv_idx = 0; kv_idx < 2; ++kv_idx) {
+                    std::vector<uint16_t> got_b(static_cast<size_t>(m.KV_CAP * D_KV));
+                    std::vector<uint16_t> got_u(static_cast<size_t>(m.KV_CAP * D_KV));
+                    rt.buffer_to_host(kv_buck[static_cast<size_t>(l)][static_cast<size_t>(kv_idx)]->handle.get(),
+                                      got_b.data(), got_b.size() * sizeof(uint16_t));
+                    rt.buffer_to_host(kv_unb[static_cast<size_t>(l)][static_cast<size_t>(kv_idx)]->handle.get(),
+                                      got_u.data(), got_u.size() * sizeof(uint16_t));
+                    for (int64_t slot = 0; slot < m.KV_CAP; ++slot) {
+                        bool is_active = false;
+                        for (int64_t s : slots_b) {
+                            if (s == slot) {
+                                is_active = true;
+                                break;
+                            }
+                        }
+                        for (int64_t d = 0; d < D_KV; ++d) {
+                            const size_t off = static_cast<size_t>(slot * D_KV + d);
+                            if (!is_active) {
+                                CHECK_TRUE(got_b[off] == sentinel_kv[off],
+                                           "padded -1 SET_ROWS indices must never corrupt inactive KV slot");
+                            } else {
+                                CHECK_TRUE(got_b[off] == got_u[off],
+                                           "active KV slot values must match unbucketed bit-for-bit");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    rt.shutdown();
+    std::printf("  [PASS] Continuous batching padded buckets (T=5..8 -> B=8: misses=1, hits=3, parity < 1e-4, 0 KV corruption)\n");
+}
+
 #ifdef CLOUDTPU_HAS_GGML
 struct ScopedEnv {
     std::string key;
@@ -2787,6 +3497,355 @@ void test_ggml_cgraph_one_graph_decode() {
 
     std::printf("  [PASS] ggml_cgraph 2-layer 1-graph decode + KV donation + plan_hits=3 parity\n");
 }
+
+void test_ggml_cgraph_continuous_batching_buckets() {
+    ScopedEnv env_mock("CLOUDTPU_MOCK", "1");
+    ScopedEnv env_verb("CLOUDTPU_VERBOSE", "1");
+    ScopedEnv env_fuse_cap("CLOUDTPU_MAX_FUSE_OPS", nullptr);
+    ScopedEnv env_fuse_attn("CLOUDTPU_FUSE_ATTN", nullptr);
+    ScopedEnv env_fuse_graphs("CLOUDTPU_FUSE_GRAPHS", nullptr);
+
+    const int64_t n_layers = 2;
+    const int64_t E = 256;
+    const int64_t H_Q = 4;
+    const int64_t H_KV = 2;
+    const int64_t D = 64;
+    const int64_t D_Q = H_Q * D;
+    const int64_t D_KV = H_KV * D;
+    const int64_t H_ff = 256;
+    const int64_t KV_CAP = 32;
+    const int64_t N_KV = 24;
+    const int64_t V_emb = 32;
+    const int64_t V_out = 16;
+
+    std::vector<float> emb_data(static_cast<size_t>(V_emb * E));
+    for (size_t i = 0; i < emb_data.size(); ++i) {
+        emb_data[i] = 0.25f * std::sin(static_cast<float>(i + 1) * 0.17f);
+    }
+    std::vector<uint16_t> sentinel_kv(static_cast<size_t>(KV_CAP * D_KV));
+    for (size_t i = 0; i < sentinel_kv.size(); ++i) {
+        sentinel_kv[i] = cloudtpu::f32_to_f16(0.22f * std::sin(static_cast<float>(i + 5) * 0.31f));
+    }
+
+    auto fill_q4k = [](size_t nrows, size_t nbytes, float phase) {
+        std::vector<uint8_t> buf(nbytes, 0);
+        const size_t bs = 144;
+        const size_t nblocks = nbytes / bs;
+        for (size_t b = 0; b < nblocks; ++b) {
+            uint8_t* p = buf.data() + b * bs;
+            const uint16_t d = cloudtpu::f32_to_f16(0.02f);
+            const uint16_t dm = cloudtpu::f32_to_f16(0.005f);
+            std::memcpy(p, &d, 2);
+            std::memcpy(p + 2, &dm, 2);
+            for (size_t i = 0; i < 12; ++i) {
+                p[4 + i] = static_cast<uint8_t>((b * 5 + i * 3 + static_cast<size_t>(phase * 10.0f) + nrows) & 0x1F);
+            }
+            for (size_t i = 0; i < 128; ++i) {
+                p[16 + i] = static_cast<uint8_t>((b * 7 + i * 11 + static_cast<size_t>(phase * 13.0f)) & 0xFF);
+            }
+        }
+        return buf;
+    };
+    auto fill_q6k = [](size_t nrows, size_t nbytes) {
+        std::vector<uint8_t> buf(nbytes, 0);
+        const size_t bs = 210;
+        const size_t nblocks = nbytes / bs;
+        for (size_t b = 0; b < nblocks; ++b) {
+            uint8_t* p = buf.data() + b * bs;
+            for (size_t i = 0; i < 128; ++i) p[i] = static_cast<uint8_t>((b * 3 + i * 5) & 0xFF);
+            for (size_t i = 0; i < 64; ++i) p[128 + i] = static_cast<uint8_t>((b * 7 + i * 9) & 0xFF);
+            for (size_t i = 0; i < 16; ++i) p[192 + i] = static_cast<uint8_t>(static_cast<int8_t>(static_cast<int>((b + i) % 7) - 3));
+            const uint16_t d = cloudtpu::f32_to_f16(0.015f);
+            std::memcpy(p + 208, &d, 2);
+        }
+        return buf;
+    };
+
+    struct CbRunResult {
+        std::vector<std::vector<float>> logits_per_step;
+        std::vector<std::vector<uint16_t>> kc_after;
+        std::vector<std::vector<uint16_t>> vc_after;
+        std::string logs;
+        bool ok = false;
+    };
+
+    auto run_steps = [&](const std::vector<int64_t>& batch_sizes, const char* buckets_env) -> CbRunResult {
+        CbRunResult out;
+        ScopedEnv env_b("CLOUDTPU_BATCH_BUCKETS", buckets_env);
+        GgmlLogCapture cap;
+        ggml_backend_t backend = ggml_backend_cloudtpu_init();
+        if (!backend) return out;
+
+        const size_t w_mem = ggml_tensor_overhead() * 96 + 4096;
+        struct ggml_init_params wp = {w_mem, nullptr, true};
+        struct ggml_context* ctx_w = ggml_init(wp);
+        struct ggml_context* ctx_kv = ggml_init(wp);
+        if (!ctx_w || !ctx_kv) {
+            ggml_backend_free(backend);
+            return out;
+        }
+
+        ggml_tensor* tok_embd = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, E, V_emb);
+        ggml_tensor* w_out = ggml_new_tensor_2d(ctx_w, GGML_TYPE_Q6_K, E, V_out);
+        struct WLayer {
+            ggml_tensor *an, *wq, *wk, *wv, *wo, *fn, *wg, *wu, *wd;
+            ggml_tensor *kc, *vc;
+        };
+        std::vector<WLayer> wl(static_cast<size_t>(n_layers));
+        for (int64_t l = 0; l < n_layers; ++l) {
+            WLayer& w = wl[static_cast<size_t>(l)];
+            w.an = ggml_new_tensor_1d(ctx_w, GGML_TYPE_F32, E);
+            w.wq = ggml_new_tensor_2d(ctx_w, GGML_TYPE_Q4_K, E, D_Q);
+            w.wk = ggml_new_tensor_2d(ctx_w, GGML_TYPE_Q4_K, E, D_KV);
+            w.wv = ggml_new_tensor_2d(ctx_w, GGML_TYPE_Q4_K, E, D_KV);
+            w.wo = ggml_new_tensor_2d(ctx_w, GGML_TYPE_Q4_K, D_Q, E);
+            w.fn = ggml_new_tensor_1d(ctx_w, GGML_TYPE_F32, E);
+            w.wg = ggml_new_tensor_2d(ctx_w, GGML_TYPE_Q4_K, E, H_ff);
+            w.wu = ggml_new_tensor_2d(ctx_w, GGML_TYPE_Q4_K, E, H_ff);
+            w.wd = ggml_new_tensor_2d(ctx_w, GGML_TYPE_Q4_K, H_ff, E);
+            w.kc = ggml_new_tensor_2d(ctx_kv, GGML_TYPE_F16, D_KV, KV_CAP);
+            w.vc = ggml_new_tensor_2d(ctx_kv, GGML_TYPE_F16, D_KV, KV_CAP);
+        }
+
+        ggml_backend_buffer_t w_buf = ggml_backend_alloc_ctx_tensors(ctx_w, backend);
+        ggml_backend_buffer_t kv_buf = ggml_backend_alloc_ctx_tensors(ctx_kv, backend);
+        if (!w_buf || !kv_buf) {
+            if (kv_buf) ggml_backend_buffer_free(kv_buf);
+            if (w_buf) ggml_backend_buffer_free(w_buf);
+            ggml_free(ctx_kv);
+            ggml_free(ctx_w);
+            ggml_backend_free(backend);
+            return out;
+        }
+
+        ggml_backend_tensor_set(tok_embd, emb_data.data(), 0, emb_data.size() * sizeof(float));
+        const auto q6_bytes = fill_q6k(static_cast<size_t>(V_out), ggml_nbytes(w_out));
+        ggml_backend_tensor_set(w_out, q6_bytes.data(), 0, q6_bytes.size());
+        for (int64_t l = 0; l < n_layers; ++l) {
+            const float lp = static_cast<float>(l) * 0.5f;
+            const WLayer& w = wl[static_cast<size_t>(l)];
+            std::vector<float> an(static_cast<size_t>(E)), fn(static_cast<size_t>(E));
+            for (int64_t i = 0; i < E; ++i) {
+                an[static_cast<size_t>(i)] = 0.85f + 0.1f * std::cos(static_cast<float>(i) * 0.2f + lp);
+                fn[static_cast<size_t>(i)] = 0.9f + 0.1f * std::sin(static_cast<float>(i) * 0.25f + lp);
+            }
+            ggml_backend_tensor_set(w.an, an.data(), 0, an.size() * sizeof(float));
+            ggml_backend_tensor_set(w.fn, fn.data(), 0, fn.size() * sizeof(float));
+            auto set_q4k = [&](ggml_tensor* t, float ph) {
+                const auto b = fill_q4k(static_cast<size_t>(t->ne[1]), ggml_nbytes(t), ph + lp);
+                ggml_backend_tensor_set(t, b.data(), 0, b.size());
+            };
+            set_q4k(w.wq, 0.1f);
+            set_q4k(w.wk, 0.2f);
+            set_q4k(w.wv, 0.3f);
+            set_q4k(w.wo, 0.4f);
+            set_q4k(w.wg, 0.5f);
+            set_q4k(w.wu, 0.6f);
+            set_q4k(w.wd, 0.7f);
+            ggml_backend_tensor_set(w.kc, sentinel_kv.data(), 0, sentinel_kv.size() * sizeof(uint16_t));
+            ggml_backend_tensor_set(w.vc, sentinel_kv.data(), 0, sentinel_kv.size() * sizeof(uint16_t));
+        }
+
+        ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        const int64_t fixed_slots[8] = {2, 5, 8, 11, 14, 17, 20, 22};
+        for (int64_t T : batch_sizes) {
+            const size_t g_mem = ggml_tensor_overhead() * 256 + ggml_graph_overhead() + 4096;
+            struct ggml_init_params gp = {g_mem, nullptr, true};
+            struct ggml_context* ctx_g = ggml_init(gp);
+            struct ggml_cgraph* gf = ggml_new_graph(ctx_g);
+
+            ggml_tensor* inp_tokens = ggml_new_tensor_1d(ctx_g, GGML_TYPE_I32, T);
+            ggml_tensor* inp_pos = ggml_new_tensor_1d(ctx_g, GGML_TYPE_I32, T);
+            ggml_tensor* inp_row_idx = ggml_new_tensor_1d(ctx_g, GGML_TYPE_I64, T);
+            ggml_tensor* inp_mask = ggml_new_tensor_4d(ctx_g, GGML_TYPE_F16, N_KV, T, 1, 1);
+            ggml_tensor* inp_out_ids = ggml_new_tensor_1d(ctx_g, GGML_TYPE_I32, T);
+            ggml_set_input(inp_tokens);
+            ggml_set_input(inp_pos);
+            ggml_set_input(inp_row_idx);
+            ggml_set_input(inp_mask);
+            ggml_set_input(inp_out_ids);
+
+            ggml_tensor* cur = ggml_get_rows(ctx_g, tok_embd, inp_tokens);
+            for (int64_t l = 0; l < n_layers; ++l) {
+                const WLayer& w = wl[static_cast<size_t>(l)];
+                ggml_tensor* rn = ggml_rms_norm(ctx_g, cur, 1e-5f);
+                ggml_tensor* xin = ggml_mul(ctx_g, rn, w.an);
+                ggml_tensor* q = ggml_mul_mat(ctx_g, w.wq, xin);
+                ggml_tensor* k = ggml_mul_mat(ctx_g, w.wk, xin);
+                ggml_tensor* v = ggml_mul_mat(ctx_g, w.wv, xin);
+
+                ggml_tensor* q3 = ggml_reshape_3d(ctx_g, q, D, H_Q, T);
+                ggml_tensor* k3 = ggml_reshape_3d(ctx_g, k, D, H_KV, T);
+                ggml_tensor* qr = ggml_rope_ext(
+                    ctx_g, q3, inp_pos, nullptr, static_cast<int>(D), GGML_ROPE_TYPE_NEOX, 0,
+                    10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+                ggml_tensor* kr = ggml_rope_ext(
+                    ctx_g, k3, inp_pos, nullptr, static_cast<int>(D), GGML_ROPE_TYPE_NEOX, 0,
+                    10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+                ggml_tensor* kflat = ggml_reshape_2d(ctx_g, kr, D_KV, T);
+
+                ggml_tensor* kset = ggml_set_rows(ctx_g, w.kc, kflat, inp_row_idx);
+                ggml_tensor* vset = ggml_set_rows(ctx_g, w.vc, v, inp_row_idx);
+                ggml_build_forward_expand(gf, kset);
+                ggml_build_forward_expand(gf, vset);
+
+                ggml_tensor* kview = ggml_view_4d(
+                    ctx_g, w.kc, D, H_KV, N_KV, 1,
+                    static_cast<size_t>(D) * ggml_element_size(w.kc), w.kc->nb[1], w.kc->nb[2], 0);
+                ggml_tensor* vview = ggml_view_4d(
+                    ctx_g, w.vc, D, H_KV, N_KV, 1,
+                    static_cast<size_t>(D) * ggml_element_size(w.vc), w.vc->nb[1], w.vc->nb[2], 0);
+                ggml_tensor* qp = ggml_permute(ctx_g, qr, 0, 2, 1, 3);
+                ggml_tensor* kp = ggml_permute(ctx_g, kview, 0, 2, 1, 3);
+                ggml_tensor* vp = ggml_permute(ctx_g, vview, 0, 2, 1, 3);
+
+                ggml_tensor* attn = ggml_flash_attn_ext(
+                    ctx_g, qp, kp, vp, inp_mask, 1.0f / std::sqrt(static_cast<float>(D)), 0.0f, 0.0f);
+                ggml_prec_set_acc(attn, GGML_PREC_F32);
+                ggml_tensor* aflat = ggml_reshape_2d(ctx_g, attn, D_Q, T);
+                ggml_tensor* oproj = ggml_mul_mat(ctx_g, w.wo, aflat);
+                ggml_tensor* hmid = ggml_add(ctx_g, cur, oproj);
+
+                ggml_tensor* fn = ggml_rms_norm(ctx_g, hmid, 1e-5f);
+                ggml_tensor* fin = ggml_mul(ctx_g, fn, w.fn);
+                ggml_tensor* fg = ggml_mul_mat(ctx_g, w.wg, fin);
+                ggml_tensor* fu = ggml_mul_mat(ctx_g, w.wu, fin);
+                ggml_tensor* sw = ggml_swiglu_split(ctx_g, fg, fu);
+                ggml_tensor* dn = ggml_mul_mat(ctx_g, w.wd, sw);
+                cur = ggml_add(ctx_g, hmid, dn);
+            }
+            ggml_tensor* hsel = ggml_get_rows(ctx_g, cur, inp_out_ids);
+            ggml_tensor* logits = ggml_mul_mat(ctx_g, w_out, hsel);
+            ggml_set_output(logits);
+            ggml_build_forward_expand(gf, logits);
+
+            if (!ggml_gallocr_alloc_graph(galloc, gf)) {
+                ggml_free(ctx_g);
+                break;
+            }
+
+            std::vector<int32_t> tokens(static_cast<size_t>(T));
+            std::vector<int32_t> pos(static_cast<size_t>(T));
+            std::vector<int64_t> row_idx64(static_cast<size_t>(T));
+            std::vector<int32_t> out_ids(static_cast<size_t>(T));
+            std::vector<uint16_t> mask_f16(static_cast<size_t>(T * N_KV),
+                                           cloudtpu::f32_to_f16(-std::numeric_limits<float>::infinity()));
+            for (int64_t t = 0; t < T; ++t) {
+                tokens[static_cast<size_t>(t)] = static_cast<int32_t>((t * 5 + 3) % V_emb);
+                pos[static_cast<size_t>(t)] = static_cast<int32_t>(t + 1);
+                row_idx64[static_cast<size_t>(t)] = fixed_slots[static_cast<size_t>(t)];
+                out_ids[static_cast<size_t>(t)] = static_cast<int32_t>(T - 1 - t);
+                mask_f16[static_cast<size_t>(t * N_KV + 0)] = cloudtpu::f32_to_f16(0.0f);
+                mask_f16[static_cast<size_t>(t * N_KV + fixed_slots[static_cast<size_t>(t)])] = cloudtpu::f32_to_f16(0.0f);
+            }
+            ggml_backend_tensor_set(inp_tokens, tokens.data(), 0, tokens.size() * sizeof(int32_t));
+            ggml_backend_tensor_set(inp_pos, pos.data(), 0, pos.size() * sizeof(int32_t));
+            ggml_backend_tensor_set(inp_row_idx, row_idx64.data(), 0, row_idx64.size() * sizeof(int64_t));
+            ggml_backend_tensor_set(inp_mask, mask_f16.data(), 0, mask_f16.size() * sizeof(uint16_t));
+            ggml_backend_tensor_set(inp_out_ids, out_ids.data(), 0, out_ids.size() * sizeof(int32_t));
+
+            if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+                ggml_free(ctx_g);
+                break;
+            }
+            std::vector<float> y(static_cast<size_t>(T * V_out), 0.0f);
+            ggml_backend_tensor_get(logits, y.data(), 0, y.size() * sizeof(float));
+            // Also verify partial offset/size tensor_get on bucketed HBM slots
+            if (T >= 2) {
+                std::vector<float> y_row1(static_cast<size_t>(V_out), 0.0f);
+                ggml_backend_tensor_get(logits, y_row1.data(),
+                                        static_cast<size_t>(V_out) * sizeof(float),
+                                        y_row1.size() * sizeof(float));
+                for (int64_t v = 0; v < V_out; ++v) {
+                    if (std::fabs(y_row1[static_cast<size_t>(v)] - y[static_cast<size_t>(V_out + v)]) > 1e-6f) {
+                        ggml_free(ctx_g);
+                        ggml_gallocr_free(galloc);
+                        ggml_backend_buffer_free(kv_buf);
+                        ggml_backend_buffer_free(w_buf);
+                        ggml_free(ctx_kv);
+                        ggml_free(ctx_w);
+                        ggml_backend_free(backend);
+                        return out;
+                    }
+                }
+            }
+            out.logits_per_step.push_back(std::move(y));
+            ggml_free(ctx_g);
+        }
+
+        if (out.logits_per_step.size() == batch_sizes.size()) {
+            out.kc_after.resize(static_cast<size_t>(n_layers));
+            out.vc_after.resize(static_cast<size_t>(n_layers));
+            for (int64_t l = 0; l < n_layers; ++l) {
+                out.kc_after[static_cast<size_t>(l)].resize(static_cast<size_t>(KV_CAP * D_KV));
+                out.vc_after[static_cast<size_t>(l)].resize(static_cast<size_t>(KV_CAP * D_KV));
+                ggml_backend_tensor_get(wl[static_cast<size_t>(l)].kc,
+                                        out.kc_after[static_cast<size_t>(l)].data(), 0,
+                                        static_cast<size_t>(KV_CAP * D_KV) * sizeof(uint16_t));
+                ggml_backend_tensor_get(wl[static_cast<size_t>(l)].vc,
+                                        out.vc_after[static_cast<size_t>(l)].data(), 0,
+                                        static_cast<size_t>(KV_CAP * D_KV) * sizeof(uint16_t));
+            }
+            out.ok = true;
+        }
+        ggml_gallocr_free(galloc);
+        ggml_backend_buffer_free(kv_buf);
+        ggml_backend_buffer_free(w_buf);
+        ggml_free(ctx_kv);
+        ggml_free(ctx_w);
+        ggml_backend_free(backend);
+        out.logs = cap.buf;
+        return out;
+    };
+
+    // 1) T=5,6,7,8 sequence with CLOUDTPU_BATCH_BUCKETS=1,2,4,8,16 -> plan_misses=1, plan_hits=3
+    const CbRunResult seq_res = run_steps({5, 6, 7, 8}, "1,2,4,8,16");
+    CHECK_TRUE(seq_res.ok, "ggml CB bucket sequence T=5,6,7,8 succeeded");
+    const uint64_t misses = parse_log_u64(seq_res.logs, "plan_misses");
+    const uint64_t hits = parse_log_u64(seq_res.logs, "plan_hits");
+    const uint64_t bucketed = parse_log_u64(seq_res.logs, "bucketed_subgraphs");
+    CHECK_TRUE(misses == 1 && hits == 3, "ggml CB T=5,6,7,8 must yield plan_misses==1, plan_hits==3");
+    CHECK_TRUE(bucketed == 3, "ggml CB T=5,6,7 must increment bucketed_subgraphs==3");
+
+    // 2) Single-step parity (< 1e-4) vs unbucketed (CLOUDTPU_BATCH_BUCKETS=0) and zero KV corruption
+    const int64_t fixed_slots[8] = {2, 5, 8, 11, 14, 17, 20, 22};
+    for (int64_t T : {int64_t(5), int64_t(6), int64_t(7)}) {
+        const CbRunResult b_res = run_steps({T}, "1,2,4,8,16");
+        const CbRunResult u_res = run_steps({T}, "0");
+        CHECK_TRUE(b_res.ok && u_res.ok, "ggml CB bucketed vs unbucketed runs succeeded");
+        for (size_t i = 0; i < b_res.logits_per_step[0].size(); ++i) {
+            CHECK_NEAR(b_res.logits_per_step[0][i], u_res.logits_per_step[0][i], 1e-4f,
+                       "ggml CB bucketed logits parity < 1e-4 vs unbucketed");
+        }
+        for (int64_t l = 0; l < n_layers; ++l) {
+            for (int64_t slot = 0; slot < KV_CAP; ++slot) {
+                bool active = false;
+                for (int64_t t = 0; t < T; ++t) {
+                    if (fixed_slots[static_cast<size_t>(t)] == slot) {
+                        active = true;
+                        break;
+                    }
+                }
+                for (int64_t d = 0; d < D_KV; ++d) {
+                    const size_t off = static_cast<size_t>(slot * D_KV + d);
+                    if (!active) {
+                        CHECK_TRUE(b_res.kc_after[static_cast<size_t>(l)][off] == sentinel_kv[off] &&
+                                       b_res.vc_after[static_cast<size_t>(l)][off] == sentinel_kv[off],
+                                   "ggml CB unused KV slots must remain untouched");
+                    } else {
+                        CHECK_TRUE(b_res.kc_after[static_cast<size_t>(l)][off] ==
+                                       u_res.kc_after[static_cast<size_t>(l)][off] &&
+                                       b_res.vc_after[static_cast<size_t>(l)][off] ==
+                                           u_res.vc_after[static_cast<size_t>(l)][off],
+                                   "ggml CB active KV slots must match unbucketed");
+                    }
+                }
+            }
+        }
+    }
+
+    std::printf("  [PASS] ggml_cgraph CB buckets (T=5..8: plan_misses=1, plan_hits=3, parity < 1e-4, 0 KV corruption)\n");
+}
 #endif
 
 }  // namespace
@@ -2826,8 +3885,10 @@ int main() {
     test_bf16_scales_zero_f32_dequant_and_pad_m(rt);
     test_one_graph_multilayer_decode_and_donation();
     test_one_graph_spmd_kv_donation(4);
+    test_continuous_batching_padded_buckets();
 #ifdef CLOUDTPU_HAS_GGML
     test_ggml_cgraph_one_graph_decode();
+    test_ggml_cgraph_continuous_batching_buckets();
 #endif
 
     const size_t py_maps = cloudtpu::count_libpython_mappings();

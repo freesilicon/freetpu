@@ -1,8 +1,10 @@
 #include "stablehlo_emitter.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <sstream>
@@ -1743,6 +1745,885 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
     prog.mlir_text = builder.finish(return_vals);
     prog.cache_key = build_canonical_cache_key(prog.mlir_text, P, spec.mm_pad_m);
     return prog;
+}
+
+std::vector<int64_t> parse_batch_buckets(const char* env_val) {
+    if (env_val == nullptr) {
+        return {1, 2, 4, 8, 16};
+    }
+    std::string raw(env_val);
+    size_t start = 0;
+    while (start < raw.size() && std::isspace(static_cast<unsigned char>(raw[start]))) {
+        ++start;
+    }
+    size_t end = raw.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(raw[end - 1]))) {
+        --end;
+    }
+    const std::string trimmed = raw.substr(start, end - start);
+    if (trimmed.empty() || trimmed == "0" || trimmed == "off" || trimmed == "false") {
+        return {};
+    }
+
+    std::vector<int64_t> buckets;
+    size_t pos = 0;
+    while (pos < trimmed.size()) {
+        size_t sep = trimmed.find_first_of(", \t\r\n", pos);
+        if (sep == std::string::npos) {
+            sep = trimmed.size();
+        }
+        if (sep > pos) {
+            const std::string tok = trimmed.substr(pos, sep - pos);
+            char* endptr = nullptr;
+            const long long val = std::strtoll(tok.c_str(), &endptr, 10);
+            if (endptr != tok.c_str() && *endptr == '\0' && val > 0) {
+                buckets.push_back(static_cast<int64_t>(val));
+            }
+        }
+        pos = sep + 1;
+    }
+    std::sort(buckets.begin(), buckets.end());
+    buckets.erase(std::unique(buckets.begin(), buckets.end()), buckets.end());
+    return buckets;
+}
+
+int64_t select_batch_bucket(int64_t n_tokens, const std::vector<int64_t>& buckets) {
+    if (n_tokens < 1 || buckets.empty() || n_tokens > buckets.back()) {
+        return 0;
+    }
+    for (int64_t b : buckets) {
+        if (b >= n_tokens) {
+            return b;
+        }
+    }
+    return 0;
+}
+
+int map_token_axis_reshape(const int64_t* src_dims,
+                           size_t src_rank,
+                           int src_ax,
+                           const int64_t* dst_dims,
+                           size_t dst_rank) {
+    if (!src_dims || !dst_dims || src_ax < 0 || static_cast<size_t>(src_ax) >= src_rank || dst_rank == 0) {
+        return -1;
+    }
+    const int64_t target_dim = src_dims[src_ax];
+    if (target_dim <= 0) {
+        return -1;
+    }
+    int64_t outer = 1;
+    for (int k = 0; k < src_ax; ++k) {
+        outer *= src_dims[k];
+    }
+    int64_t inner = 1;
+    for (size_t k = static_cast<size_t>(src_ax) + 1; k < src_rank; ++k) {
+        inner *= src_dims[k];
+    }
+    int found = -1;
+    for (size_t d = 0; d < dst_rank; ++d) {
+        if (dst_dims[d] != target_dim) {
+            continue;
+        }
+        int64_t d_outer = 1;
+        for (size_t k = 0; k < d; ++k) {
+            d_outer *= dst_dims[k];
+        }
+        int64_t d_inner = 1;
+        for (size_t k = d + 1; k < dst_rank; ++k) {
+            d_inner *= dst_dims[k];
+        }
+        if (d_outer == outer && d_inner == inner) {
+            if (found >= 0) {
+                return -1;
+            }
+            found = static_cast<int>(d);
+        }
+    }
+    return found;
+}
+
+bool bucket_view_slice_dims(const int64_t parent_dims[4],
+                            int parent_token_axis,
+                            int64_t orig_tokens,
+                            int64_t bucket_tokens,
+                            std::vector<int64_t>& reshape_dims,
+                            std::vector<int64_t>& starts,
+                            std::vector<int64_t>& limits) {
+    if (parent_token_axis < 0) {
+        return true;
+    }
+    if (parent_token_axis > 3 || parent_dims[parent_token_axis] != orig_tokens || bucket_tokens <= orig_tokens) {
+        return false;
+    }
+    const int64_t* cur_ptr = reshape_dims.empty() ? parent_dims : reshape_dims.data();
+    const size_t cur_rank = reshape_dims.empty() ? 4 : reshape_dims.size();
+    if (starts.size() != cur_rank || limits.size() != cur_rank) {
+        return false;
+    }
+    const int cur_ax = reshape_dims.empty()
+                           ? parent_token_axis
+                           : map_token_axis_reshape(parent_dims, 4, parent_token_axis, cur_ptr, cur_rank);
+    if (cur_ax < 0) {
+        return false;
+    }
+    const size_t uax = static_cast<size_t>(cur_ax);
+    if (starts[uax] != 0 || limits[uax] != orig_tokens || cur_ptr[uax] != orig_tokens) {
+        return false;
+    }
+    if (!reshape_dims.empty()) {
+        reshape_dims[uax] = bucket_tokens;
+    }
+    limits[uax] = bucket_tokens;
+    return true;
+}
+
+BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
+                                                int64_t orig_tokens,
+                                                int64_t bucket_tokens) {
+    BucketAnalysisResult out;
+    if (orig_tokens < 1 || bucket_tokens <= orig_tokens) {
+        return out;
+    }
+
+    struct ValInfo {
+        uint64_t id = 0;
+        int64_t dims[4] = {1, 1, 1, 1};
+        bool is_external = false;
+        bool is_dense = true;
+        bool is_donated = false;
+        TensorShardingKind sharding = TensorShardingKind::REPLICATED;
+        int ax = -2;  // -2 = unknown, -1 = batch-invariant, 0..3 = token axis
+        TokenInputPadKind pad = TokenInputPadKind::NONE;
+    };
+
+    std::vector<ValInfo> vals;
+    vals.reserve(spec.inputs.size() + spec.ops.size());
+    std::unordered_map<uint64_t, size_t> id_to_idx;
+    id_to_idx.reserve((spec.inputs.size() + spec.ops.size()) * 2 + 1);
+    uint64_t max_id = 0;
+
+    for (const TensorSpec& in : spec.inputs) {
+        if (in.id == 0 || id_to_idx.count(in.id)) {
+            return out;
+        }
+        ValInfo vi;
+        vi.id = in.id;
+        for (int d = 0; d < 4; ++d) {
+            vi.dims[d] = in.dims[d];
+        }
+        vi.is_external = true;
+        vi.is_dense = (in.storage == TensorStorageKind::DENSE);
+        vi.is_donated = (in.alias_output_idx >= 0);
+        vi.sharding = in.sharding;
+        if (!vi.is_dense || vi.is_donated) {
+            vi.ax = -1;
+        }
+        id_to_idx[in.id] = vals.size();
+        vals.push_back(vi);
+        if (in.id > max_id) max_id = in.id;
+    }
+
+    for (const OpNodeSpec& op : spec.ops) {
+        if (op.dst.id == 0 || id_to_idx.count(op.dst.id)) {
+            return out;
+        }
+        ValInfo vi;
+        vi.id = op.dst.id;
+        for (int d = 0; d < 4; ++d) {
+            vi.dims[d] = op.dst.dims[d];
+        }
+        vi.is_external = false;
+        vi.is_dense = (op.dst.storage == TensorStorageKind::DENSE);
+        vi.sharding = op.keep_sharded_out ? TensorShardingKind::SHARD_K : TensorShardingKind::REPLICATED;
+        id_to_idx[op.dst.id] = vals.size();
+        vals.push_back(vi);
+        if (op.dst.id > max_id) max_id = op.dst.id;
+    }
+
+    for (uint64_t oid : spec.output_ids) {
+        if (!id_to_idx.count(oid)) {
+            return out;
+        }
+    }
+
+    auto lookup_idx = [&](uint64_t id, size_t* idx_out) -> bool {
+        auto it = id_to_idx.find(id);
+        if (it == id_to_idx.end()) {
+            return false;
+        }
+        *idx_out = it->second;
+        return true;
+    };
+
+    bool changed = false;
+    auto set_ax = [&](size_t idx, int new_ax) -> bool {
+        ValInfo& vi = vals[idx];
+        if (new_ax >= 0) {
+            if (new_ax > 3 || vi.dims[new_ax] != orig_tokens) {
+                return false;
+            }
+            if (!vi.is_dense || vi.is_donated) {
+                return false;
+            }
+            if (vi.sharding == TensorShardingKind::SHARD_N && new_ax == 2) {
+                return false;
+            }
+            if (vi.sharding == TensorShardingKind::SHARD_K && new_ax == 3) {
+                return false;
+            }
+        }
+        if (vi.ax == -2) {
+            vi.ax = new_ax;
+            changed = true;
+            return true;
+        }
+        return vi.ax == new_ax;
+    };
+
+    auto set_pad = [&](size_t idx, TokenInputPadKind kind) -> bool {
+        ValInfo& vi = vals[idx];
+        if (!vi.is_external || kind == TokenInputPadKind::NONE) {
+            return true;
+        }
+        if (vi.pad == TokenInputPadKind::NONE) {
+            vi.pad = kind;
+            return true;
+        }
+        return vi.pad == kind;
+    };
+
+    auto is_1d_tokens = [&](size_t idx) -> bool {
+        const auto& d = vals[idx].dims;
+        return d[0] == 1 && d[1] == 1 && d[2] == 1 && d[3] == orig_tokens;
+    };
+
+    auto is_1d_scalar = [&](size_t idx) -> bool {
+        const auto& d = vals[idx].dims;
+        return d[0] == 1 && d[1] == 1 && d[2] == 1 && d[3] == 1;
+    };
+
+    auto propagate_op = [&](const OpNodeSpec& op, bool allow_mm_seed) -> bool {
+        size_t dst_i = 0;
+        if (!lookup_idx(op.dst.id, &dst_i)) return false;
+
+        switch (op.kind) {
+            case CloudOpKind::GET_ROWS: {
+                if (op.src_ids.size() < 2) return false;
+                size_t tbl_i = 0, idx_i = 0;
+                if (!lookup_idx(op.src_ids[0], &tbl_i) || !lookup_idx(op.src_ids[1], &idx_i)) return false;
+                // Require 1D token indices [1, 1, 1, N_idx]
+                if (vals[idx_i].dims[0] != 1 || vals[idx_i].dims[1] != 1 || vals[idx_i].dims[2] != 1) {
+                    return false;
+                }
+                if (vals[tbl_i].ax == -2 && vals[tbl_i].is_external) {
+                    if (!set_ax(tbl_i, -1)) return false;
+                }
+                if (vals[tbl_i].ax == -1) {
+                    if (vals[idx_i].dims[3] == orig_tokens) {
+                        if (!set_ax(idx_i, 3) || !set_pad(idx_i, TokenInputPadKind::ZERO) || !set_ax(dst_i, 2)) {
+                            return false;
+                        }
+                    } else {
+                        if (!set_ax(idx_i, -1) || !set_ax(dst_i, -1)) return false;
+                    }
+                } else if (vals[tbl_i].ax == 2) {
+                    if (vals[idx_i].dims[3] != orig_tokens) {
+                        return false;
+                    }
+                    if (!set_ax(idx_i, 3) || !set_pad(idx_i, TokenInputPadKind::ZERO) || !set_ax(dst_i, 2)) {
+                        return false;
+                    }
+                } else if (vals[tbl_i].ax >= 0) {
+                    return false;
+                }
+                if (vals[dst_i].ax >= 0 && vals[dst_i].ax != 2) return false;
+                if (vals[idx_i].ax >= 0 && vals[idx_i].ax != 3) return false;
+                return true;
+            }
+            case CloudOpKind::SET_ROWS: {
+                if (op.src_ids.size() < 3) return false;
+                size_t upd_i = 0, idx_i = 0, kv_i = 0;
+                if (!lookup_idx(op.src_ids[0], &upd_i) ||
+                    !lookup_idx(op.src_ids[1], &idx_i) ||
+                    !lookup_idx(op.src_ids[2], &kv_i)) {
+                    return false;
+                }
+                if (!set_ax(kv_i, -1) || !set_ax(dst_i, -1)) return false;
+                if (vals[idx_i].dims[0] != 1 || vals[idx_i].dims[1] != 1 || vals[idx_i].dims[2] != 1) {
+                    return false;
+                }
+                if (vals[idx_i].dims[3] == orig_tokens) {
+                    if (!set_ax(idx_i, 3) || !set_pad(idx_i, TokenInputPadKind::NEG_ONE) || !set_ax(upd_i, 2)) {
+                        return false;
+                    }
+                } else {
+                    if (!set_ax(idx_i, -1) || !set_ax(upd_i, -1)) return false;
+                }
+                return true;
+            }
+            case CloudOpKind::ROPE: {
+                if (op.src_ids.size() < 2) return false;
+                size_t x_i = 0, pos_i = 0;
+                if (!lookup_idx(op.src_ids[0], &x_i) || !lookup_idx(op.src_ids[1], &pos_i)) return false;
+                if (op.src_ids.size() > 2 && op.src_ids[2] != 0) {
+                    size_t ff_i = 0;
+                    if (!lookup_idx(op.src_ids[2], &ff_i) || !set_ax(ff_i, -1)) return false;
+                }
+                if (is_1d_tokens(pos_i)) {
+                    if (vals[x_i].dims[1] != orig_tokens) return false;
+                    if (!set_ax(x_i, 1) || !set_ax(pos_i, 3) || !set_pad(pos_i, TokenInputPadKind::ZERO) ||
+                        !set_ax(dst_i, 1)) {
+                        return false;
+                    }
+                } else if (is_1d_scalar(pos_i)) {
+                    if (!set_ax(pos_i, -1)) return false;
+                    if (vals[x_i].ax != -2) {
+                        if (vals[x_i].ax == 1 || vals[x_i].ax == 3) return false;
+                        if (!set_ax(dst_i, vals[x_i].ax)) return false;
+                    }
+                    if (vals[dst_i].ax != -2) {
+                        if (vals[dst_i].ax == 1 || vals[dst_i].ax == 3) return false;
+                        if (!set_ax(x_i, vals[dst_i].ax)) return false;
+                    }
+                } else {
+                    return false;
+                }
+                return true;
+            }
+            case CloudOpKind::FLASH_ATTN_EXT: {
+                if (op.src_ids.size() < 3) return false;
+                size_t q_i = 0, k_i = 0, v_i = 0;
+                if (!lookup_idx(op.src_ids[0], &q_i) ||
+                    !lookup_idx(op.src_ids[1], &k_i) ||
+                    !lookup_idx(op.src_ids[2], &v_i)) {
+                    return false;
+                }
+                if (!set_ax(k_i, -1) || !set_ax(v_i, -1)) return false;
+                if (vals[q_i].dims[2] != orig_tokens) return false;
+                if (!set_ax(q_i, 2) || !set_ax(dst_i, 1)) return false;
+                if (op.src_ids.size() > 3 && op.src_ids[3] != 0) {
+                    size_t m_i = 0;
+                    if (!lookup_idx(op.src_ids[3], &m_i)) return false;
+                    if (vals[m_i].dims[2] == orig_tokens) {
+                        if (!set_ax(m_i, 2) || !set_pad(m_i, TokenInputPadKind::ZERO)) return false;
+                    } else if (vals[m_i].dims[2] >= bucket_tokens) {
+                        if (!set_ax(m_i, -1)) return false;
+                    } else {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            case CloudOpKind::MUL_MAT: {
+                if (op.src_ids.size() < 2) return false;
+                size_t w_i = 0, x_i = 0;
+                if (!lookup_idx(op.src_ids[0], &w_i) || !lookup_idx(op.src_ids[1], &x_i)) return false;
+                if (!set_ax(w_i, -1)) return false;
+                if (vals[x_i].ax == 3 || vals[dst_i].ax == 3) return false;
+                if (vals[x_i].ax != -2) {
+                    const int tx = vals[x_i].ax;
+                    if ((tx == 0 || tx == 1) && vals[w_i].dims[tx] != 1) return false;
+                    if (!set_ax(dst_i, tx)) return false;
+                }
+                if (vals[dst_i].ax != -2) {
+                    const int td = vals[dst_i].ax;
+                    if ((td == 0 || td == 1) && vals[w_i].dims[td] != 1) return false;
+                    if (!set_ax(x_i, td)) return false;
+                }
+                if (allow_mm_seed && vals[x_i].ax == -2 && vals[dst_i].ax == -2 &&
+                    vals[x_i].dims[2] == orig_tokens) {
+                    if (!set_ax(x_i, 2) || !set_ax(dst_i, 2)) return false;
+                }
+                return true;
+            }
+            case CloudOpKind::RMS_NORM: {
+                if (op.src_ids.empty()) return false;
+                size_t x_i = 0;
+                if (!lookup_idx(op.src_ids[0], &x_i)) return false;
+                if (vals[x_i].ax == 3 || vals[dst_i].ax == 3) return false;
+                if (vals[x_i].ax != -2 && !set_ax(dst_i, vals[x_i].ax)) return false;
+                if (vals[dst_i].ax != -2 && !set_ax(x_i, vals[dst_i].ax)) return false;
+                return true;
+            }
+            case CloudOpKind::SILU:
+            case CloudOpKind::SCALE: {
+                if (op.src_ids.empty()) return false;
+                size_t x_i = 0;
+                if (!lookup_idx(op.src_ids[0], &x_i)) return false;
+                if (vals[x_i].ax != -2 && !set_ax(dst_i, vals[x_i].ax)) return false;
+                if (vals[dst_i].ax != -2 && !set_ax(x_i, vals[dst_i].ax)) return false;
+                return true;
+            }
+            case CloudOpKind::SWIGLU: {
+                if (op.src_ids.empty()) return false;
+                size_t a_i = 0;
+                if (!lookup_idx(op.src_ids[0], &a_i)) return false;
+                if (op.src_ids.size() < 2 || op.src_ids[1] == 0) {
+                    if (vals[a_i].ax == 3 || vals[dst_i].ax == 3) return false;
+                    if (vals[a_i].ax != -2 && !set_ax(dst_i, vals[a_i].ax)) return false;
+                    if (vals[dst_i].ax != -2 && !set_ax(a_i, vals[dst_i].ax)) return false;
+                } else {
+                    size_t b_i = 0;
+                    if (!lookup_idx(op.src_ids[1], &b_i)) return false;
+                    if (vals[a_i].ax != -2 && (!set_ax(b_i, vals[a_i].ax) || !set_ax(dst_i, vals[a_i].ax))) return false;
+                    if (vals[b_i].ax != -2 && (!set_ax(a_i, vals[b_i].ax) || !set_ax(dst_i, vals[b_i].ax))) return false;
+                    if (vals[dst_i].ax != -2 && (!set_ax(a_i, vals[dst_i].ax) || !set_ax(b_i, vals[dst_i].ax))) return false;
+                }
+                return true;
+            }
+            case CloudOpKind::ADD:
+            case CloudOpKind::MUL: {
+                if (op.src_ids.size() < 2) return false;
+                size_t a_i = 0, b_i = 0;
+                if (!lookup_idx(op.src_ids[0], &a_i) || !lookup_idx(op.src_ids[1], &b_i)) return false;
+                if (vals[a_i].ax >= 0) {
+                    const int ta = vals[a_i].ax;
+                    if (!set_ax(dst_i, ta)) return false;
+                    if (vals[b_i].dims[ta] == 1 && (orig_tokens > 1 || !vals[b_i].is_external || !vals[a_i].is_external)) {
+                        if (vals[b_i].ax == -2 && !set_ax(b_i, -1)) return false;
+                    } else if (vals[b_i].dims[ta] == orig_tokens && orig_tokens > 1) {
+                        if (!set_ax(b_i, ta)) return false;
+                    } else if (vals[b_i].dims[ta] != 1) {
+                        return false;
+                    }
+                }
+                if (vals[b_i].ax >= 0) {
+                    const int tb = vals[b_i].ax;
+                    if (vals[a_i].dims[tb] != orig_tokens) return false;
+                    if (!set_ax(a_i, tb) || !set_ax(dst_i, tb)) return false;
+                }
+                if (vals[a_i].ax == -1 && vals[b_i].ax == -1) {
+                    if (!set_ax(dst_i, -1)) return false;
+                }
+                if (vals[dst_i].ax >= 0) {
+                    const int td = vals[dst_i].ax;
+                    if (!set_ax(a_i, td)) return false;
+                    if (vals[b_i].dims[td] == 1 && (orig_tokens > 1 || !vals[b_i].is_external || !vals[a_i].is_external)) {
+                        if (vals[b_i].ax == -2 && !set_ax(b_i, -1)) return false;
+                    } else if (vals[b_i].dims[td] == orig_tokens && orig_tokens > 1) {
+                        if (!set_ax(b_i, td)) return false;
+                    } else if (vals[b_i].dims[td] != 1) {
+                        return false;
+                    }
+                } else if (vals[dst_i].ax == -1) {
+                    if (!set_ax(a_i, -1) || !set_ax(b_i, -1)) return false;
+                }
+                return true;
+            }
+            case CloudOpKind::SOFT_MAX: {
+                if (op.src_ids.empty()) return false;
+                size_t x_i = 0;
+                if (!lookup_idx(op.src_ids[0], &x_i)) return false;
+                if (vals[x_i].ax == 3 || vals[dst_i].ax == 3) return false;
+                if (vals[x_i].ax != -2 && !set_ax(dst_i, vals[x_i].ax)) return false;
+                if (vals[dst_i].ax != -2 && !set_ax(x_i, vals[dst_i].ax)) return false;
+                if (op.src_ids.size() > 1 && op.src_ids[1] != 0) {
+                    size_t m_i = 0;
+                    if (!lookup_idx(op.src_ids[1], &m_i)) return false;
+                    if (vals[x_i].ax >= 0) {
+                        const int tx = vals[x_i].ax;
+                        if (tx == 2 && vals[m_i].dims[2] >= bucket_tokens) {
+                            if (!set_ax(m_i, -1)) return false;
+                        } else if (vals[m_i].dims[tx] == 1 && orig_tokens > 1) {
+                            if (vals[m_i].ax == -2 && !set_ax(m_i, -1)) return false;
+                        } else if (vals[m_i].dims[tx] == orig_tokens) {
+                            if (!set_ax(m_i, tx) || !set_pad(m_i, TokenInputPadKind::ZERO)) return false;
+                        } else {
+                            return false;
+                        }
+                    } else if (vals[x_i].ax == -1) {
+                        if (!set_ax(m_i, -1)) return false;
+                    }
+                }
+                return true;
+            }
+            case CloudOpKind::CPY:
+            case CloudOpKind::RESHAPE: {
+                if (op.src_ids.empty()) return false;
+                size_t x_i = 0;
+                if (!lookup_idx(op.src_ids[0], &x_i)) return false;
+                const bool same_shape =
+                    (vals[x_i].dims[0] == vals[dst_i].dims[0] && vals[x_i].dims[1] == vals[dst_i].dims[1] &&
+                     vals[x_i].dims[2] == vals[dst_i].dims[2] && vals[x_i].dims[3] == vals[dst_i].dims[3]);
+                if (same_shape) {
+                    if (vals[x_i].ax != -2 && !set_ax(dst_i, vals[x_i].ax)) return false;
+                    if (vals[dst_i].ax != -2 && !set_ax(x_i, vals[dst_i].ax)) return false;
+                    return true;
+                }
+                if (vals[x_i].ax >= 0) {
+                    const int d_ax = map_token_axis_reshape(vals[x_i].dims, 4, vals[x_i].ax, vals[dst_i].dims, 4);
+                    if (d_ax < 0 || !set_ax(dst_i, d_ax)) return false;
+                } else if (vals[x_i].ax == -1) {
+                    if (!set_ax(dst_i, -1)) return false;
+                }
+                if (vals[dst_i].ax >= 0) {
+                    const int s_ax = map_token_axis_reshape(vals[dst_i].dims, 4, vals[dst_i].ax, vals[x_i].dims, 4);
+                    if (s_ax < 0 || !set_ax(x_i, s_ax)) return false;
+                } else if (vals[dst_i].ax == -1) {
+                    if (!set_ax(x_i, -1)) return false;
+                }
+                return true;
+            }
+            case CloudOpKind::TRANSPOSE: {
+                if (op.src_ids.empty()) return false;
+                size_t x_i = 0;
+                if (!lookup_idx(op.src_ids[0], &x_i)) return false;
+                if (vals[x_i].ax >= 0) {
+                    int d_ax = -1;
+                    for (int j = 0; j < 4; ++j) {
+                        if (op.perm[j] == vals[x_i].ax) {
+                            d_ax = j;
+                            break;
+                        }
+                    }
+                    if (d_ax < 0 || !set_ax(dst_i, d_ax)) return false;
+                } else if (vals[x_i].ax == -1) {
+                    if (!set_ax(dst_i, -1)) return false;
+                }
+                if (vals[dst_i].ax >= 0) {
+                    const int64_t p = op.perm[vals[dst_i].ax];
+                    if (p < 0 || p > 3 || !set_ax(x_i, static_cast<int>(p))) return false;
+                } else if (vals[dst_i].ax == -1) {
+                    if (!set_ax(x_i, -1)) return false;
+                }
+                return true;
+            }
+            case CloudOpKind::SLICE: {
+                if (op.src_ids.empty()) return false;
+                size_t x_i = 0;
+                if (!lookup_idx(op.src_ids[0], &x_i)) return false;
+                const int64_t* cur_dims = op.slice_reshape.empty() ? vals[x_i].dims : op.slice_reshape.data();
+                const size_t cur_rank = op.slice_reshape.empty() ? 4 : op.slice_reshape.size();
+                if (cur_rank == 0 || op.slice_starts.size() != cur_rank || op.slice_limits.size() != cur_rank) {
+                    return false;
+                }
+                std::vector<int64_t> sl_dims(cur_rank);
+                for (size_t r = 0; r < cur_rank; ++r) {
+                    sl_dims[r] = op.slice_limits[r] - op.slice_starts[r];
+                }
+                if (vals[x_i].ax >= 0) {
+                    const int cur_ax = op.slice_reshape.empty()
+                                           ? vals[x_i].ax
+                                           : map_token_axis_reshape(vals[x_i].dims, 4, vals[x_i].ax, cur_dims, cur_rank);
+                    if (cur_ax < 0) return false;
+                    const size_t uax = static_cast<size_t>(cur_ax);
+                    if (op.slice_starts[uax] != 0 || op.slice_limits[uax] != cur_dims[uax] ||
+                        cur_dims[uax] != orig_tokens) {
+                        return false;
+                    }
+                    const int d_ax = map_token_axis_reshape(sl_dims.data(), cur_rank, cur_ax, vals[dst_i].dims, 4);
+                    if (d_ax < 0 || !set_ax(dst_i, d_ax)) return false;
+                } else if (vals[x_i].ax == -1) {
+                    if (!set_ax(dst_i, -1)) return false;
+                }
+                if (vals[dst_i].ax >= 0) {
+                    const int cur_ax = map_token_axis_reshape(vals[dst_i].dims, 4, vals[dst_i].ax, sl_dims.data(), cur_rank);
+                    if (cur_ax < 0) return false;
+                    const size_t uax = static_cast<size_t>(cur_ax);
+                    if (op.slice_starts[uax] != 0 || op.slice_limits[uax] != cur_dims[uax] ||
+                        cur_dims[uax] != orig_tokens) {
+                        return false;
+                    }
+                    const int s_ax = op.slice_reshape.empty()
+                                         ? cur_ax
+                                         : map_token_axis_reshape(cur_dims, cur_rank, cur_ax, vals[x_i].dims, 4);
+                    if (s_ax < 0 || !set_ax(x_i, s_ax)) return false;
+                } else if (vals[dst_i].ax == -1) {
+                    if (!set_ax(x_i, -1)) return false;
+                }
+                return true;
+            }
+            case CloudOpKind::ALL_REDUCE_SUM: {
+                if (op.src_ids.empty()) return false;
+                size_t x_i = 0;
+                if (!lookup_idx(op.src_ids[0], &x_i)) return false;
+                if (vals[x_i].ax != -2 && !set_ax(dst_i, vals[x_i].ax)) return false;
+                if (vals[dst_i].ax != -2 && !set_ax(x_i, vals[dst_i].ax)) return false;
+                return true;
+            }
+            case CloudOpKind::ALL_GATHER:
+            case CloudOpKind::REDUCE_SCATTER_SUM: {
+                if (op.src_ids.empty()) return false;
+                size_t x_i = 0;
+                if (!lookup_idx(op.src_ids[0], &x_i)) return false;
+                if (vals[x_i].ax == op.collective_dim || vals[dst_i].ax == op.collective_dim) return false;
+                if (vals[x_i].ax != -2 && !set_ax(dst_i, vals[x_i].ax)) return false;
+                if (vals[dst_i].ax != -2 && !set_ax(x_i, vals[dst_i].ax)) return false;
+                return true;
+            }
+        }
+        return false;
+    };
+
+    auto run_fixed_point = [&](bool seed_mm) -> bool {
+        const size_t max_iters = std::max<size_t>(4, spec.ops.size() * 2 + 4);
+        for (size_t iter = 0; iter < max_iters; ++iter) {
+            changed = false;
+            for (size_t oi = 0; oi < spec.ops.size(); ++oi) {
+                if (!propagate_op(spec.ops[oi], false)) return false;
+            }
+            for (size_t ri = spec.ops.size(); ri-- > 0;) {
+                if (!propagate_op(spec.ops[ri], false)) return false;
+            }
+            if (!changed) {
+                if (seed_mm) {
+                    bool seeded = false;
+                    for (const OpNodeSpec& op : spec.ops) {
+                        if (op.kind != CloudOpKind::MUL_MAT || op.src_ids.size() < 2) continue;
+                        size_t x_i = 0, dst_i = 0;
+                        if (!lookup_idx(op.src_ids[1], &x_i) || !lookup_idx(op.dst.id, &dst_i)) return false;
+                        if (vals[x_i].ax == -2 && vals[dst_i].ax == -2 && vals[x_i].dims[2] == orig_tokens) {
+                            if (!propagate_op(op, true)) return false;
+                            seeded = true;
+                            break;
+                        }
+                    }
+                    if (seeded) {
+                        continue;
+                    }
+                }
+                break;
+            }
+        }
+        return true;
+    };
+
+    if (!run_fixed_point(false)) {
+        return out;
+    }
+    if (!run_fixed_point(true)) {
+        return out;
+    }
+
+    // Finalize any remaining unassigned external inputs as batch-invariant, propagate once more,
+    // and then verify all op constraints cleanly.
+    for (ValInfo& vi : vals) {
+        if (vi.is_external && vi.ax == -2) {
+            vi.ax = -1;
+        }
+    }
+    if (!run_fixed_point(false)) {
+        return out;
+    }
+    for (ValInfo& vi : vals) {
+        if (vi.ax == -2) {
+            vi.ax = -1;
+        }
+    }
+    for (const OpNodeSpec& op : spec.ops) {
+        if (!propagate_op(op, false)) {
+            return out;
+        }
+    }
+
+    bool any_token_varying = false;
+    for (const ValInfo& vi : vals) {
+        if (vi.ax >= 0) {
+            any_token_varying = true;
+            break;
+        }
+    }
+    if (!any_token_varying) {
+        return out;
+    }
+
+    out.input_token_axis.resize(spec.inputs.size(), -1);
+    out.input_pad_kind.resize(spec.inputs.size(), TokenInputPadKind::NONE);
+    for (size_t i = 0; i < spec.inputs.size(); ++i) {
+        const ValInfo& vi = vals[i];
+        if (vi.ax >= 0) {
+            if (!vi.is_dense || vi.is_donated || vi.sharding != TensorShardingKind::REPLICATED ||
+                vi.dims[vi.ax] != orig_tokens) {
+                return BucketAnalysisResult{};
+            }
+            out.input_token_axis[i] = vi.ax;
+            out.input_pad_kind[i] = (vi.pad == TokenInputPadKind::NONE) ? TokenInputPadKind::ZERO : vi.pad;
+        }
+    }
+
+    const size_t n_in = spec.inputs.size();
+    out.op_dst_token_axis.resize(spec.ops.size(), -1);
+    for (size_t i = 0; i < spec.ops.size(); ++i) {
+        out.op_dst_token_axis[i] = vals[n_in + i].ax;
+    }
+
+    out.output_token_axis.resize(spec.output_ids.size(), -1);
+    for (size_t i = 0; i < spec.output_ids.size(); ++i) {
+        size_t idx = 0;
+        if (!lookup_idx(spec.output_ids[i], &idx)) {
+            return BucketAnalysisResult{};
+        }
+        out.output_token_axis[i] = vals[idx].ax;
+    }
+
+    if (max_id <= 1048576ULL) {
+        out.id_token_axis.assign(static_cast<size_t>(max_id) + 1, -1);
+        for (const ValInfo& vi : vals) {
+            out.id_token_axis[static_cast<size_t>(vi.id)] = vi.ax;
+        }
+    }
+
+    out.orig_tokens = orig_tokens;
+    out.bucket_tokens = bucket_tokens;
+    out.success = true;
+    return out;
+}
+
+bool apply_program_batch_bucket(GraphProgramSpec& spec, const BucketAnalysisResult& plan) {
+    if (!plan.success || plan.bucket_tokens <= plan.orig_tokens ||
+        plan.input_token_axis.size() != spec.inputs.size() ||
+        plan.op_dst_token_axis.size() != spec.ops.size()) {
+        return false;
+    }
+    struct OrigShape {
+        int64_t dims[4];
+        int ax;
+    };
+    std::unordered_map<uint64_t, OrigShape> orig_map;
+    orig_map.reserve((spec.inputs.size() + spec.ops.size()) * 2 + 1);
+    for (size_t i = 0; i < spec.inputs.size(); ++i) {
+        OrigShape os;
+        for (int d = 0; d < 4; ++d) os.dims[d] = spec.inputs[i].dims[d];
+        os.ax = plan.input_token_axis[i];
+        orig_map[spec.inputs[i].id] = os;
+        if (os.ax >= 0) {
+            if (spec.inputs[i].dims[os.ax] != plan.orig_tokens) return false;
+            spec.inputs[i].dims[os.ax] = plan.bucket_tokens;
+        }
+    }
+    for (size_t i = 0; i < spec.ops.size(); ++i) {
+        OpNodeSpec& op = spec.ops[i];
+        OrigShape os;
+        for (int d = 0; d < 4; ++d) os.dims[d] = op.dst.dims[d];
+        os.ax = plan.op_dst_token_axis[i];
+        orig_map[op.dst.id] = os;
+        if (op.kind == CloudOpKind::SLICE && !op.src_ids.empty()) {
+            auto it = orig_map.find(op.src_ids[0]);
+            if (it == orig_map.end()) return false;
+            if (it->second.ax >= 0) {
+                if (!bucket_view_slice_dims(it->second.dims,
+                                            it->second.ax,
+                                            plan.orig_tokens,
+                                            plan.bucket_tokens,
+                                            op.slice_reshape,
+                                            op.slice_starts,
+                                            op.slice_limits)) {
+                    return false;
+                }
+            }
+        }
+        if (os.ax >= 0) {
+            if (op.dst.dims[os.ax] != plan.orig_tokens) return false;
+            op.dst.dims[os.ax] = plan.bucket_tokens;
+        }
+    }
+    return true;
+}
+
+void pad_dense_host_tensor(const void* src,
+                           void* dst,
+                           PjrtDType dtype,
+                           const int64_t orig_dims[4],
+                           const int64_t padded_dims[4],
+                           int token_axis,
+                           TokenInputPadKind pad_kind) {
+    const size_t elem_bytes = pjrt_dtype_size(dtype);
+    if (elem_bytes == 0 || token_axis < 0 || token_axis >= 4) {
+        throw std::invalid_argument("pad_dense_host_tensor: invalid dtype or token_axis");
+    }
+    const int64_t T = orig_dims[token_axis];
+    const int64_t B = padded_dims[token_axis];
+    if (T < 0 || B < T) {
+        throw std::invalid_argument("pad_dense_host_tensor: invalid token dims");
+    }
+    for (int d = 0; d < 4; ++d) {
+        if (d != token_axis && orig_dims[d] != padded_dims[d]) {
+            throw std::invalid_argument("pad_dense_host_tensor: non-token dim mismatch");
+        }
+    }
+    size_t outer = 1;
+    for (int d = 0; d < token_axis; ++d) {
+        outer *= static_cast<size_t>(orig_dims[d]);
+    }
+    size_t inner = 1;
+    for (int d = token_axis + 1; d < 4; ++d) {
+        inner *= static_cast<size_t>(orig_dims[d]);
+    }
+    const size_t src_chunk_bytes = static_cast<size_t>(T) * inner * elem_bytes;
+    const size_t dst_chunk_bytes = static_cast<size_t>(B) * inner * elem_bytes;
+    const size_t pad_elems = static_cast<size_t>(B - T) * inner;
+    const size_t pad_bytes = pad_elems * elem_bytes;
+
+    const uint8_t* src_u8 = static_cast<const uint8_t*>(src);
+    uint8_t* dst_u8 = static_cast<uint8_t*>(dst);
+    for (size_t o = 0; o < outer; ++o) {
+        if (src_chunk_bytes > 0) {
+            if (src_u8 != nullptr) {
+                std::memcpy(dst_u8 + o * dst_chunk_bytes, src_u8 + o * src_chunk_bytes, src_chunk_bytes);
+            } else {
+                std::memset(dst_u8 + o * dst_chunk_bytes, 0, src_chunk_bytes);
+            }
+        }
+        uint8_t* pad_ptr = dst_u8 + o * dst_chunk_bytes + src_chunk_bytes;
+        if (pad_bytes == 0) {
+            continue;
+        }
+        if (pad_kind == TokenInputPadKind::NEG_ONE) {
+            if (dtype == PjrtDType::S32) {
+                const int32_t v = -1;
+                for (size_t i = 0; i < pad_elems; ++i) {
+                    std::memcpy(pad_ptr + i * sizeof(int32_t), &v, sizeof(int32_t));
+                }
+            } else if (dtype == PjrtDType::S64) {
+                const int64_t v = -1;
+                for (size_t i = 0; i < pad_elems; ++i) {
+                    std::memcpy(pad_ptr + i * sizeof(int64_t), &v, sizeof(int64_t));
+                }
+            } else {
+                throw std::invalid_argument("pad_dense_host_tensor: NEG_ONE requires S32 or S64");
+            }
+        } else {
+            std::memset(pad_ptr, 0, pad_bytes);
+        }
+    }
+}
+
+void slice_dense_host_tensor(const void* src,
+                             void* dst,
+                             size_t elem_bytes,
+                             const int64_t padded_dims[4],
+                             const int64_t logical_dims[4],
+                             int token_axis) {
+    if (elem_bytes == 0 || token_axis < 0 || token_axis >= 4) {
+        throw std::invalid_argument("slice_dense_host_tensor: invalid elem_bytes or token_axis");
+    }
+    const int64_t T = logical_dims[token_axis];
+    const int64_t B = padded_dims[token_axis];
+    if (T < 0 || B < T) {
+        throw std::invalid_argument("slice_dense_host_tensor: invalid token dims");
+    }
+    for (int d = 0; d < 4; ++d) {
+        if (d != token_axis && padded_dims[d] != logical_dims[d]) {
+            throw std::invalid_argument("slice_dense_host_tensor: non-token dim mismatch");
+        }
+    }
+    size_t outer = 1;
+    for (int d = 0; d < token_axis; ++d) {
+        outer *= static_cast<size_t>(logical_dims[d]);
+    }
+    size_t inner = 1;
+    for (int d = token_axis + 1; d < 4; ++d) {
+        inner *= static_cast<size_t>(logical_dims[d]);
+    }
+    const size_t src_chunk_bytes = static_cast<size_t>(B) * inner * elem_bytes;
+    const size_t dst_chunk_bytes = static_cast<size_t>(T) * inner * elem_bytes;
+    const uint8_t* src_u8 = static_cast<const uint8_t*>(src);
+    uint8_t* dst_u8 = static_cast<uint8_t*>(dst);
+    for (size_t o = 0; o < outer; ++o) {
+        if (dst_chunk_bytes > 0) {
+            std::memcpy(dst_u8 + o * dst_chunk_bytes, src_u8 + o * src_chunk_bytes, dst_chunk_bytes);
+        }
+    }
 }
 
 }  // namespace cloudtpu

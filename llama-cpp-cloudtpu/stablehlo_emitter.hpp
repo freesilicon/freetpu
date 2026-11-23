@@ -148,4 +148,76 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec);
 // Convenience helpers for unit tests / single-op lowering.
 std::string format_mlir_tensor_type(PjrtDType dtype, const std::vector<int64_t>& dims);
 
+// =========================================================================
+// Continuous Batching Padded Buckets & Safe Dataflow Token-Axis Propagation
+// =========================================================================
+
+// Parses CLOUDTPU_BATCH_BUCKETS (default "1,2,4,8,16", sorted unique positive ints;
+// "0" or "" disables bucketing and returns an empty vector).
+std::vector<int64_t> parse_batch_buckets(const char* env_val);
+
+// Returns smallest bucket B >= n_tokens if 1 <= n_tokens <= buckets.back(), else 0.
+int64_t select_batch_bucket(int64_t n_tokens, const std::vector<int64_t>& buckets);
+
+enum class TokenInputPadKind {
+    NONE = 0,
+    ZERO = 1,
+    NEG_ONE = 2,
+};
+
+struct BucketAnalysisResult {
+    bool success = false;
+    int64_t orig_tokens = 0;
+    int64_t bucket_tokens = 0;
+    std::vector<int> id_token_axis;       // Dense-ID fast lookup when max TensorSpec::id is bounded
+    std::vector<int> input_token_axis;    // Parallel to GraphProgramSpec::inputs (-1 or 0..3)
+    std::vector<TokenInputPadKind> input_pad_kind;
+    std::vector<int> op_dst_token_axis;   // Parallel to GraphProgramSpec::ops (-1 or 0..3)
+    std::vector<int> output_token_axis;   // Parallel to GraphProgramSpec::output_ids (-1 or 0..3)
+};
+
+// Maps src_ax through a contiguous reshape from src_dims to dst_dims via unique outer/inner product
+// matching where dst_dims[dst_ax] == src_dims[src_ax]. Returns -1 if missing or ambiguous.
+int map_token_axis_reshape(const int64_t* src_dims,
+                           size_t src_rank,
+                           int src_ax,
+                           const int64_t* dst_dims,
+                           size_t dst_rank);
+
+// Adjusts a SLICE descriptor along parent_token_axis (orig_tokens -> bucket_tokens).
+bool bucket_view_slice_dims(const int64_t parent_dims[4],
+                            int parent_token_axis,
+                            int64_t orig_tokens,
+                            int64_t bucket_tokens,
+                            std::vector<int64_t>& reshape_dims,
+                            std::vector<int64_t>& starts,
+                            std::vector<int64_t>& limits);
+
+// Propagates token_axis safely across all inputs, ops, and outputs of `spec`.
+// Fails closed (success=false) on any axis conflict, ambiguity, or unsafe slice.
+BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
+                                                int64_t orig_tokens,
+                                                int64_t bucket_tokens);
+
+// Rewrites `spec` dimensions in-place from orig_tokens -> bucket_tokens per `plan`.
+bool apply_program_batch_bucket(GraphProgramSpec& spec, const BucketAnalysisResult& plan);
+
+// Pads a contiguous C-order host buffer along `token_axis` from orig_dims to padded_dims.
+// When `src == nullptr`, fills [0..T) with 0 and [T..B) according to `pad_kind`.
+void pad_dense_host_tensor(const void* src,
+                           void* dst,
+                           PjrtDType dtype,
+                           const int64_t orig_dims[4],
+                           const int64_t padded_dims[4],
+                           int token_axis,
+                           TokenInputPadKind pad_kind);
+
+// Slices logical [0..T) along `token_axis` from a padded C-order host buffer into `dst`.
+void slice_dense_host_tensor(const void* src,
+                             void* dst,
+                             size_t elem_bytes,
+                             const int64_t padded_dims[4],
+                             const int64_t logical_dims[4],
+                             int token_axis);
+
 }  // namespace cloudtpu
