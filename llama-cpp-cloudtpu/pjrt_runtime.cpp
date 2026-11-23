@@ -227,19 +227,10 @@ void append_tag_bytes(std::string& out, uint32_t field_number, const std::string
 
 std::string encode_compile_options_proto(const PjrtCompileOptions& opts) {
     // xla::ExecutableBuildOptionsProto (openxla/xla/xla/pjrt/proto/compile_options.proto)
+    // Intentionally omit field 3 (debug_options) so OpenXLA preserves compiler defaults
+    // and XLA_FLAGS (e.g. --xla_dump_to); pass flag overrides via CompileOptionsProto
+    // field 7 (env_option_overrides) instead.
     std::string ebo;
-    if (!opts.backend_extra_options.empty()) {
-        // xla::DebugOptions (field 3 of ExecutableBuildOptionsProto):
-        //   map<string, string> xla_backend_extra_options = 500;
-        std::string dbg;
-        for (const auto& kv : opts.backend_extra_options) {
-            std::string entry;
-            append_tag_bytes(entry, 1, kv.first);
-            append_tag_bytes(entry, 2, kv.second);
-            append_tag_bytes(dbg, 500, entry);
-        }
-        append_tag_bytes(ebo, 3, dbg);
-    }
     if (opts.num_replicas > 0) {
         append_tag_varint(ebo, 4, static_cast<uint64_t>(opts.num_replicas));
     }
@@ -283,9 +274,22 @@ std::string encode_compile_options_proto(const PjrtCompileOptions& opts) {
         append_tag_varint(ebo, 19, 1);
     }
 
-    // xla::CompileOptionsProto { executable_build_options (field 3, length-delimited) }
+    // xla::CompileOptionsProto {
+    //   ExecutableBuildOptionsProto executable_build_options = 3;
+    //   map<string, OptionOverrideProto> env_option_overrides = 7;
+    // }
     std::string out;
     append_tag_bytes(out, 3, ebo);
+    for (const auto& kv : opts.env_option_overrides) {
+        // OptionOverrideProto { string string_field = 1; }
+        std::string override_val;
+        append_tag_bytes(override_val, 1, kv.second);
+        // map<string, OptionOverrideProto> entry { string key = 1; OptionOverrideProto value = 2; }
+        std::string entry;
+        append_tag_bytes(entry, 1, kv.first);
+        append_tag_bytes(entry, 2, override_val);
+        append_tag_bytes(out, 7, entry);
+    }
     return out;
 }
 
@@ -2681,7 +2685,7 @@ PjrtCompileOptions PjrtRuntime::make_spmd_compile_options(int num_chips,
             opts.device_assignment_ids[static_cast<size_t>(i)] = device_infos_[static_cast<size_t>(i)].id;
         }
         if (async_collectives) {
-            opts.backend_extra_options = {
+            opts.env_option_overrides = {
                 {"xla_tpu_enable_async_collective_fusion", "true"},
                 {"xla_tpu_overlap_compute_collective_tc", "true"},
                 {"xla_tpu_enable_async_collective_fusion_multiple_steps", "true"},

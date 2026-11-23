@@ -68,8 +68,9 @@ struct PjrtCompileOptions {
     // Optional explicit DeviceAssignmentProto mapping [partition][replica] -> device_id.
     // Length must equal num_replicas * num_partitions when non-empty.
     std::vector<int64_t> device_assignment_ids;
-    // Optional xla::DebugOptions.xla_backend_extra_options (field 500 map<string,string>).
-    std::vector<std::pair<std::string, std::string>> backend_extra_options;
+    // Optional CompileOptionsProto.env_option_overrides (field 7 map<string, OptionOverrideProto>),
+    // merged on top of compiler defaults and XLA_FLAGS without replacing DebugOptions.
+    std::vector<std::pair<std::string, std::string>> env_option_overrides;
 };
 
 // Encodes xla::CompileOptionsProto in pure C++ protobuf wire format (zero libprotobuf dep).
@@ -226,7 +227,7 @@ public:
 
     // Builds compile options (including DeviceAssignmentProto for multi-chip SPMD or
     // explicit single-device targeting on multi-chip hosts, alias_passthrough_params,
-    // and async collective overlap DebugOptions flags) for a 1D chip mesh.
+    // and async collective overlap env_option_overrides) for a 1D chip mesh.
     PjrtCompileOptions make_spmd_compile_options(int num_chips,
                                                  int device_idx = 0,
                                                  bool alias_passthrough = false,

@@ -84,28 +84,39 @@ void test_compile_options_proto() {
     CHECK_TRUE(p_da.size() == sizeof(exp_da), "device_assignment proto length mismatch");
     CHECK_TRUE(std::memcmp(p_da.data(), exp_da, sizeof(exp_da)) == 0, "device_assignment proto bytes mismatch");
 
-    // Alias passthrough + DebugOptions.xla_backend_extra_options (field 3 -> repeated field 500)
-    cloudtpu::PjrtCompileOptions opt_extra;
-    opt_extra.alias_passthrough_params = true;
-    opt_extra.backend_extra_options = {
+    // Alias passthrough + CompileOptionsProto.env_option_overrides (field 7 map<string, OptionOverrideProto>).
+    // Must leave ExecutableBuildOptionsProto.debug_options unset so XLA_FLAGS & defaults stay intact.
+    cloudtpu::PjrtCompileOptions opt_alias_only;
+    opt_alias_only.alias_passthrough_params = true;
+    const std::string p_alias_only = cloudtpu::encode_compile_options_proto(opt_alias_only);
+
+    cloudtpu::PjrtCompileOptions opt_extra = opt_alias_only;
+    opt_extra.env_option_overrides = {
         {"xla_tpu_enable_async_collective_fusion", "true"},
         {"xla_enable_async_all_reduce", "true"},
     };
     const std::string p_extra = cloudtpu::encode_compile_options_proto(opt_extra);
+    // Prefix must match p_alias_only byte-for-byte (proves ExecutableBuildOptionsProto is untouched / no debug_options).
+    CHECK_TRUE(p_extra.size() > p_alias_only.size() &&
+                   std::memcmp(p_extra.data(), p_alias_only.data(), p_alias_only.size()) == 0,
+               "env_option_overrides must not modify ExecutableBuildOptionsProto or emit debug_options");
+    // Field 7 wire tag = (7<<3)|2 = 0x3a immediately follows ExecutableBuildOptionsProto.
+    CHECK_TRUE(static_cast<uint8_t>(p_extra[p_alias_only.size()]) == 0x3a,
+               "env_option_overrides must serialize as CompileOptionsProto field 7 (0x3a)");
     CHECK_TRUE(p_extra.find("xla_tpu_enable_async_collective_fusion") != std::string::npos,
-               "backend_extra_options fusion key missing");
+               "env_option_overrides fusion key missing");
     CHECK_TRUE(p_extra.find("xla_enable_async_all_reduce") != std::string::npos,
-               "backend_extra_options all_reduce key missing");
-    // Field 10 tag = (10<<3)|0 = 0x50 followed by 0x01
+               "env_option_overrides all_reduce key missing");
+    // Field 10 tag = (10<<3)|0 = 0x50 followed by 0x01 inside ExecutableBuildOptionsProto
     bool found_alias_tag = false;
-    for (size_t i = 0; i + 1 < p_extra.size(); ++i) {
-        if (static_cast<uint8_t>(p_extra[i]) == 0x50 && static_cast<uint8_t>(p_extra[i + 1]) == 0x01) {
+    for (size_t i = 0; i + 1 < p_alias_only.size(); ++i) {
+        if (static_cast<uint8_t>(p_alias_only[i]) == 0x50 && static_cast<uint8_t>(p_alias_only[i + 1]) == 0x01) {
             found_alias_tag = true;
             break;
         }
     }
     CHECK_TRUE(found_alias_tag, "alias_passthrough_params (field 10) missing");
-    std::printf("  [PASS] compile_options_proto (incl. DeviceAssignmentProto, alias_passthrough, DebugOptions)\n");
+    std::printf("  [PASS] compile_options_proto (incl. DeviceAssignmentProto, alias_passthrough, env_option_overrides)\n");
 }
 
 void test_half_bf16_conversions() {
@@ -709,9 +720,11 @@ void test_silicon_regressions(cloudtpu::PjrtRuntime& rt) {
         }
 
         // Out-of-range indices (-1 and R) must leave every KV row bit-for-bit untouched (matching scatter).
+        // Upload a fresh KV buffer for each case because the preceding execution allows PJRT buffer donation.
         for (int32_t bad_idx : {int32_t{-1}, static_cast<int32_t>(R)}) {
             auto bbad = rt.buffer_from_host(0, &bad_idx, cloudtpu::PjrtDType::S32, {1, 1, 1, 1});
-            std::vector<PJRT_Buffer*> bad_in = {bupd->handle.get(), bbad->handle.get(), btbl->handle.get()};
+            auto btbl_case = rt.buffer_from_host(0, tbl.data(), cloudtpu::PjrtDType::F32, {1, 1, R, D});
+            std::vector<PJRT_Buffer*> bad_in = {bupd->handle.get(), bbad->handle.get(), btbl_case->handle.get()};
             std::vector<cloudtpu::PjrtBufferPtr> bad_outs;
             rt.execute(exec, 0, bad_in.data(), bad_in.size(), bad_outs,
                        {cloudtpu::PjrtDType::F32}, {{1, 1, R, D}}, true, &non_don);
@@ -1176,7 +1189,7 @@ void test_spmd_multichip_mesh(int num_chips) {
     const auto copts = rt.make_spmd_compile_options(num_chips);
     CHECK_TRUE(copts.num_replicas == num_chips && copts.num_partitions == 1, "SPMD compile options");
     CHECK_TRUE(static_cast<int>(copts.device_assignment_ids.size()) == num_chips, "SPMD DeviceAssignment ids");
-    CHECK_TRUE(copts.backend_extra_options.size() == 7, "SPMD async collective overlap flags (7)");
+    CHECK_TRUE(copts.env_option_overrides.size() == 7, "SPMD async collective overlap flags (7)");
 
     auto run_spmd = [&](const cloudtpu::EmittedProgram& prog,
                         const std::vector<std::vector<cloudtpu::PjrtBufferPtr>>& per_dev_in) {
