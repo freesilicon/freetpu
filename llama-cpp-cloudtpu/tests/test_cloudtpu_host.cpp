@@ -2165,6 +2165,22 @@ void test_subbyte_s4_u4_packing_and_hbm(cloudtpu::PjrtRuntime& rt) {
         rt.buffer_to_host(bs4->handle.get(), s4_roundtrip.data(), s4_roundtrip.size());
         CHECK_TRUE(s4_roundtrip == s4_host, "S4 H2D/D2H 1-B/elem roundtrip");
 
+        // Reading an S4 tensor (17 elements incl. -8, -1) into an oversized 32-byte host buffer
+        // must sign-extend exactly nelems=17 bytes and leave spare trailing bytes untouched.
+        auto bs4_odd = rt.buffer_from_host(0, s4_src.data(), cloudtpu::PjrtDType::S4, {1, 1, 1, 17});
+        CHECK_TRUE(bs4_odd->num_bytes() == 9, "odd S4 num_bytes == 9");
+        const int8_t sentinel = static_cast<int8_t>(0x5A);
+        std::vector<int8_t> s4_oversized(32, sentinel);
+        rt.buffer_to_host(bs4_odd->handle.get(), s4_oversized.data(), s4_oversized.size());
+        for (size_t i = 0; i < s4_src.size(); ++i) {
+            CHECK_TRUE(s4_oversized[i] == s4_src[i],
+                       "S4 H2D/D2H into oversized buffer must sign-extend all nelems");
+        }
+        for (size_t i = s4_src.size(); i < s4_oversized.size(); ++i) {
+            CHECK_TRUE(s4_oversized[i] == sentinel,
+                       "S4 H2D/D2H into oversized buffer must leave spare trailing bytes untouched");
+        }
+
         auto bu4 = rt.buffer_from_host(0, u4_src.data(), cloudtpu::PjrtDType::U4, {1, 1, 1, 17});
         CHECK_TRUE(bu4->num_bytes() == 9, "odd U4 num_bytes == 9");
         std::vector<uint8_t> u4_roundtrip(17, 0);

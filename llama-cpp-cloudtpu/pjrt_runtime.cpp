@@ -2287,9 +2287,9 @@ static PJRT_Error* mock_buffer_to_host(PJRT_Buffer_ToHostBuffer_Args* args) {
         return mock_error("MockPJRT: ToHostBuffer dst_size too small");
     }
     if (nelems > 0) {
-        if (mb->tensor.dtype == PjrtDType::S4) {
-            unpack_s4_to_i8(mb->tensor.bytes.data(), nelems, static_cast<int8_t*>(args->dst));
-        } else if (mb->tensor.dtype == PjrtDType::U4) {
+        if (mb->tensor.dtype == PjrtDType::S4 || mb->tensor.dtype == PjrtDType::U4) {
+            // Mirror legacy libtpu.so behavior where S4 ToHostBuffer returns zero-extended
+            // low nibbles (0x00..0x0F), exercising buffer_to_host's sign-extension path.
             unpack_u4_to_u8(mb->tensor.bytes.data(), nelems, static_cast<uint8_t*>(args->dst));
         } else {
             std::memcpy(args->dst, mb->tensor.bytes.data(), mb->tensor.bytes.size());
@@ -2957,6 +2957,7 @@ void PjrtRuntime::buffer_to_host(PJRT_Buffer* buf, void* dst, size_t dst_size) {
     // Handle sub-byte S4/U4 gracefully whether PJRT ToHostBuffer writes 1 B/elem or packed 0.5 B/elem,
     // and normalize S4 1-B/elem outputs where PJRT leaves nibbles zero-extended (0x08..0x0F).
     bool is_s4_buffer = false;
+    size_t s4_needed = 0;
     if (PJRT_API_HAS(api_, PJRT_Buffer_ElementType)) {
         PJRT_Buffer_ElementType_Args et_args = {};
         et_args.struct_size = PJRT_Buffer_ElementType_Args_STRUCT_SIZE;
@@ -2977,7 +2978,8 @@ void PjrtRuntime::buffer_to_host(PJRT_Buffer* buf, void* dst, size_t dst_size) {
                 await_event(q_args.event);
             }
             const size_t needed = q_args.dst_size;
-            if (needed == packed_bytes && dst_size == nelems && nelems > packed_bytes) {
+            s4_needed = needed;
+            if (needed == packed_bytes && dst_size >= nelems && nelems > packed_bytes) {
                 std::vector<uint8_t> tmp(needed);
                 PJRT_Buffer_ToHostBuffer_Args d_args = {};
                 d_args.struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE;
@@ -2996,7 +2998,7 @@ void PjrtRuntime::buffer_to_host(PJRT_Buffer* buf, void* dst, size_t dst_size) {
                 }
                 return;
             }
-            if (needed == nelems && dst_size == packed_bytes && nelems > packed_bytes) {
+            if (needed == nelems && dst_size >= packed_bytes && dst_size < nelems && nelems > packed_bytes) {
                 std::vector<uint8_t> tmp(needed);
                 PJRT_Buffer_ToHostBuffer_Args d_args = {};
                 d_args.struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE;
@@ -3028,7 +3030,7 @@ void PjrtRuntime::buffer_to_host(PJRT_Buffer* buf, void* dst, size_t dst_size) {
     if (args.event) {
         await_event(args.event);
     }
-    if (is_s4_buffer && dst_size == nelems && nelems > 0) {
+    if (is_s4_buffer && s4_needed == nelems && dst_size >= nelems && nelems > 0) {
         int8_t* out = static_cast<int8_t*>(dst);
         for (size_t i = 0; i < nelems; ++i) {
             out[i] = sign_extend_nibble(static_cast<uint8_t>(out[i]));
