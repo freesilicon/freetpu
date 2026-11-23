@@ -169,6 +169,39 @@ ot_status_t read_buffer_row_major_locked(ot_context_t* ctx, const ot_buffer_t* s
   return OT_OK;
 }
 
+ot_status_t write_buffer_raw_locked(ot_context_t* ctx, ot_buffer_t* dst, size_t dst_offset,
+                                    const uint8_t* src_bytes, size_t size_bytes) {
+  // If overwriting a tiled buffer without replacing its entire 32 KiB tiled prefix,
+  // materialize the tiled prefix to row-major first so untouched logical bytes survive.
+  if (dst->layout == ot::BufferLayout::kTiled2x128Bf16 &&
+      !(dst_offset == 0 && size_bytes >= ot::kTile128x128Bf16Bytes)) {
+    std::vector<uint8_t> rm(ot::kTile128x128Bf16Bytes, 0);
+    ot_status_t st = read_buffer_row_major_locked(ctx, dst, rm.data(), rm.size());
+    if (st != OT_OK) return st;
+    if (dst_offset < ot::kTile128x128Bf16Bytes) {
+      size_t overlap = std::min(size_bytes, ot::kTile128x128Bf16Bytes - dst_offset);
+      std::memcpy(rm.data() + dst_offset, src_bytes, overlap);
+    }
+    st = raw_h2d_locked(ctx, dst->hbm_addr, dst->size_bytes, 0u, rm.data(), rm.size());
+    if (st != OT_OK) return st;
+    dst->layout = ot::BufferLayout::kRaw;
+    if (dst_offset + size_bytes > ot::kTile128x128Bf16Bytes) {
+      size_t tail_start = std::max(dst_offset, ot::kTile128x128Bf16Bytes);
+      size_t src_skip = tail_start - dst_offset;
+      size_t tail_len = size_bytes - src_skip;
+      return raw_h2d_locked(ctx, dst->hbm_addr, dst->size_bytes, tail_start,
+                            src_bytes + src_skip, tail_len);
+    }
+    return OT_OK;
+  }
+
+  ot_status_t st = raw_h2d_locked(ctx, dst->hbm_addr, dst->size_bytes, dst_offset,
+                                  src_bytes, size_bytes);
+  if (st != OT_OK) return st;
+  dst->layout = ot::BufferLayout::kRaw;
+  return OT_OK;
+}
+
 }  // namespace
 
 namespace ot {
@@ -421,37 +454,8 @@ ot_status_t buffer_h2d_offset(ot_context_t* ctx, ot_buffer_t* dst, size_t dst_of
     return OT_ERR_DEVICE;
   }
   std::lock_guard<std::mutex> lk(ctx->mu);
-  const auto* src_bytes = static_cast<const uint8_t*>(host_src);
-
-  // If overwriting a tiled buffer without replacing its entire 32 KiB tiled prefix,
-  // materialize the tiled prefix to row-major first so untouched logical bytes survive.
-  if (dst->layout == ot::BufferLayout::kTiled2x128Bf16 &&
-      !(dst_offset == 0 && size_bytes >= ot::kTile128x128Bf16Bytes)) {
-    std::vector<uint8_t> rm(ot::kTile128x128Bf16Bytes, 0);
-    ot_status_t st = read_buffer_row_major_locked(ctx, dst, rm.data(), rm.size());
-    if (st != OT_OK) return st;
-    if (dst_offset < ot::kTile128x128Bf16Bytes) {
-      size_t overlap = std::min(size_bytes, ot::kTile128x128Bf16Bytes - dst_offset);
-      std::memcpy(rm.data() + dst_offset, src_bytes, overlap);
-    }
-    st = raw_h2d_locked(ctx, dst->hbm_addr, dst->size_bytes, 0u, rm.data(), rm.size());
-    if (st != OT_OK) return st;
-    dst->layout = ot::BufferLayout::kRaw;
-    if (dst_offset + size_bytes > ot::kTile128x128Bf16Bytes) {
-      size_t tail_start = std::max(dst_offset, ot::kTile128x128Bf16Bytes);
-      size_t src_skip = tail_start - dst_offset;
-      size_t tail_len = size_bytes - src_skip;
-      return raw_h2d_locked(ctx, dst->hbm_addr, dst->size_bytes, tail_start,
-                            src_bytes + src_skip, tail_len);
-    }
-    return OT_OK;
-  }
-
-  ot_status_t st = raw_h2d_locked(ctx, dst->hbm_addr, dst->size_bytes, dst_offset,
-                                  src_bytes, size_bytes);
-  if (st != OT_OK) return st;
-  dst->layout = ot::BufferLayout::kRaw;
-  return OT_OK;
+  return write_buffer_raw_locked(ctx, dst, dst_offset,
+                                 static_cast<const uint8_t*>(host_src), size_bytes);
 }
 
 }  // namespace ot
@@ -554,11 +558,9 @@ ot_status_t ot_matmul_bf16(ot_context_t* ctx,
       if (st != OT_OK) return st;
       out_mn->layout = ot::BufferLayout::kTiled2x128Bf16;
     } else {
-      st = raw_h2d_locked(ctx, out_mn->hbm_addr, out_mn->size_bytes, 0u,
-                          reinterpret_cast<const uint8_t*>(c_rm.data()),
-                          static_cast<size_t>(need_c));
-      if (st != OT_OK) return st;
-      out_mn->layout = ot::BufferLayout::kRaw;
+      return write_buffer_raw_locked(ctx, out_mn, 0u,
+                                     reinterpret_cast<const uint8_t*>(c_rm.data()),
+                                     static_cast<size_t>(need_c));
     }
     return OT_OK;
   }
@@ -579,8 +581,11 @@ ot_status_t ot_matmul_bf16(ot_context_t* ctx,
   }
 
   auto transport_status = [&](const std::string& e) -> ot_status_t {
-    if (ctx->transport.dma_faulted || e.find("timeout") != std::string::npos) {
+    if (e.find("timeout") != std::string::npos) {
       return OT_ERR_TIMEOUT;
+    }
+    if (ctx->transport.dma_faulted) {
+      return OT_ERR_DEVICE;
     }
     return OT_ERR_IOCTL;
   };

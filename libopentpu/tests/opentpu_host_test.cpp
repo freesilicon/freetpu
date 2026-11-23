@@ -1308,6 +1308,11 @@ static void test_layout_tiling_and_aliasing() {
   OT_CHECK(ot_buffer_d2h(ctx, ba, got.data(), nbytes) == OT_OK);
   OT_CHECK(got == ref_aa);
 
+  // Smaller mock matmul reusing a tiled 128x128 output buffer must preserve the unwritten suffix.
+  OT_CHECK(ot_buffer_h2d(ctx, ba, a.data(), nbytes) == OT_OK);
+  OT_CHECK(ot_buffer_h2d(ctx, bb, b.data(), nbytes) == OT_OK);
+  OT_CHECK(ot_matmul_bf16(ctx, ba, bb, bc, M, K, N) == OT_OK);
+  OT_CHECK(bc->layout == ot::BufferLayout::kTiled2x128Bf16);
   std::vector<uint16_t> sm_a(16u * 32u), sm_b(32u * 24u), sm_got(16u * 24u);
   fill_random_bf16(&sm_a, 0x4444ULL, 8, 0.25f);
   fill_random_bf16(&sm_b, 0x5555ULL, 8, 0.25f);
@@ -1318,6 +1323,10 @@ static void test_layout_tiling_and_aliasing() {
   OT_CHECK(bc->layout == ot::BufferLayout::kRaw);
   OT_CHECK(ot_buffer_d2h(ctx, bc, sm_got.data(), sm_got.size() * 2) == OT_OK);
   OT_CHECK(sm_got == sm_ref);
+  OT_CHECK(ot_buffer_d2h(ctx, bc, got.data(), nbytes) == OT_OK);
+  OT_CHECK(std::memcmp(got.data(), sm_ref.data(), sm_ref.size() * 2) == 0);
+  OT_CHECK(std::memcmp(got.data() + sm_ref.size(), ref_ab.data() + sm_ref.size(),
+                       (M * N - sm_ref.size()) * 2) == 0);
 
   ot_buffer_free(foreign);
   ot_buffer_free(be);

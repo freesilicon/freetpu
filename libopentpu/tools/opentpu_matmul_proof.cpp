@@ -22,6 +22,12 @@
 #include <string>
 #include <vector>
 
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#else
+#include <unistd.h>
+#endif
+
 namespace {
 
 inline float bf16_to_f32(uint16_t b) {
@@ -119,35 +125,61 @@ bool load_sym(void* handle, const char* name, Fn* out_fn) {
   return true;
 }
 
+std::string executable_dir(const char* argv0) {
+#ifdef __APPLE__
+  uint32_t sz = 0;
+  _NSGetExecutablePath(nullptr, &sz);
+  if (sz > 0) {
+    std::string exe(sz, '\0');
+    if (_NSGetExecutablePath(&exe[0], &sz) == 0) {
+      size_t nul = exe.find('\0');
+      if (nul != std::string::npos) exe.resize(nul);
+      auto slash = exe.rfind('/');
+      if (slash != std::string::npos) return exe.substr(0, slash + 1);
+    }
+  }
+#else
+  char buf[4096];
+  ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+  if (n > 0) {
+    std::string exe(buf, static_cast<size_t>(n));
+    auto slash = exe.rfind('/');
+    if (slash != std::string::npos) return exe.substr(0, slash + 1);
+  }
+#endif
+  if (argv0) {
+    std::string exe(argv0);
+    auto slash = exe.rfind('/');
+    if (slash != std::string::npos) return exe.substr(0, slash + 1);
+  }
+  return "";
+}
+
 void* open_opentpu_library(const std::string& explicit_path, const char* argv0,
                            std::string* resolved_out) {
-  std::vector<std::string> candidates;
+  std::string path;
   if (!explicit_path.empty()) {
-    candidates.push_back(explicit_path);
+    path = explicit_path;
   } else {
 #ifdef __APPLE__
     const char* lib_name = "libopentpu.dylib";
 #else
     const char* lib_name = "libopentpu.so";
 #endif
-    candidates.push_back(std::string("./") + lib_name);
-    if (argv0) {
-      std::string exe(argv0);
-      auto slash = exe.rfind('/');
-      if (slash != std::string::npos) {
-        candidates.push_back(exe.substr(0, slash + 1) + lib_name);
-      }
+    std::string dir = executable_dir(argv0);
+    if (dir.empty()) {
+      fprintf(stderr, "Unable to determine executable directory; pass --lib <path>\n");
+      return nullptr;
     }
+    path = dir + lib_name;
   }
 
-  for (const std::string& path : candidates) {
-    void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
-    if (h != nullptr) {
-      if (resolved_out) *resolved_out = path;
-      return h;
-    }
+  void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+  if (h != nullptr) {
+    if (resolved_out) *resolved_out = path;
+    return h;
   }
-  fprintf(stderr, "dlopen failed for all candidates (last error: %s)\n", dlerror());
+  fprintf(stderr, "dlopen(%s) failed: %s\n", path.c_str(), dlerror());
   return nullptr;
 }
 
