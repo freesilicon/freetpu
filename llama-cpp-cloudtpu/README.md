@@ -64,7 +64,7 @@ git clone --depth 1 --branch b12608 https://github.com/ggml-org/llama.cpp llama-
 
 # Host Mock verification against ggml-cpu:
 CLOUDTPU_MOCK=1 ./llama-cpp-cloudtpu/build-host/bin/test-backend-ops -b CLOUDTPU \
-  -o "MUL_MAT,RMS_NORM,ROPE,SOFT_MAX,GET_ROWS,ADD,MUL,CPY,UNARY,GLU"
+  -o "MUL_MAT,RMS_NORM,ROPE,SOFT_MAX,GET_ROWS,ADD,MUL,CPY,SILU,SWIGLU"
 ```
 
 ---

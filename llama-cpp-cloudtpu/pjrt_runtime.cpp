@@ -1383,7 +1383,7 @@ struct MockDevice {
 struct MockClient {
     std::vector<std::unique_ptr<MockDevice>> devices;
     std::vector<PJRT_Device*> device_ptrs;
-    std::atomic<int64_t> allocated_bytes{0};
+    std::shared_ptr<std::atomic<int64_t>> allocated_bytes = std::make_shared<std::atomic<int64_t>>(0);
 
     explicit MockClient(int num_devices) {
         const int count = std::max(1, num_devices);
@@ -1402,7 +1402,7 @@ struct MockClient {
 };
 struct MockBuffer {
     MockTensor tensor;
-    MockClient* client = nullptr;
+    std::shared_ptr<std::atomic<int64_t>> allocated_bytes;
     int device_id = 0;
 };
 struct MockExecutable {
@@ -1410,6 +1410,7 @@ struct MockExecutable {
 };
 struct MockLoadedExecutable {
     MockExecutable exec;
+    std::shared_ptr<std::atomic<int64_t>> allocated_bytes;
     int assigned_device_id = 0;
 };
 
@@ -1620,7 +1621,9 @@ static PJRT_Error* mock_dev_desc_to_string(PJRT_DeviceDescription_ToString_Args*
 static PJRT_Error* mock_device_memory_stats(PJRT_Device_MemoryStats_Args* args) {
     auto* d = reinterpret_cast<MockDevice*>(args->device);
     auto* c = d->client;
-    args->bytes_in_use = c->allocated_bytes.load(std::memory_order_relaxed);
+    args->bytes_in_use = c && c->allocated_bytes
+                             ? c->allocated_bytes->load(std::memory_order_relaxed)
+                             : 0;
     args->bytes_limit_is_set = true;
     args->bytes_limit = 16909336064LL;  // 15.748 GiB (v5e-1 HBM2e nominal)
     return nullptr;
@@ -1635,21 +1638,23 @@ static PJRT_Error* mock_buffer_from_host(PJRT_Client_BufferFromHostBuffer_Args* 
     }
     std::vector<int64_t> shape(args->dims, args->dims + args->num_dims);
     auto* mb = new MockBuffer();
-    mb->client = c;
+    mb->allocated_bytes = c ? c->allocated_bytes : nullptr;
     mb->device_id = dev ? dev->id : 0;
     mb->tensor.allocate(dt, std::move(shape));
     if (!mb->tensor.bytes.empty() && args->data) {
         std::memcpy(mb->tensor.bytes.data(), args->data, mb->tensor.bytes.size());
     }
-    c->allocated_bytes.fetch_add(static_cast<int64_t>(mb->tensor.bytes.size()), std::memory_order_relaxed);
+    if (mb->allocated_bytes) {
+        mb->allocated_bytes->fetch_add(static_cast<int64_t>(mb->tensor.bytes.size()), std::memory_order_relaxed);
+    }
     args->done_with_host_buffer = reinterpret_cast<PJRT_Event*>(new MockEvent());
     args->buffer = reinterpret_cast<PJRT_Buffer*>(mb);
     return nullptr;
 }
 static PJRT_Error* mock_buffer_destroy(PJRT_Buffer_Destroy_Args* args) {
     auto* mb = reinterpret_cast<MockBuffer*>(args->buffer);
-    if (mb && mb->client) {
-        mb->client->allocated_bytes.fetch_sub(static_cast<int64_t>(mb->tensor.bytes.size()), std::memory_order_relaxed);
+    if (mb && mb->allocated_bytes) {
+        mb->allocated_bytes->fetch_sub(static_cast<int64_t>(mb->tensor.bytes.size()), std::memory_order_relaxed);
     }
     delete mb;
     return nullptr;
@@ -1690,9 +1695,11 @@ static PJRT_Error* mock_client_compile(PJRT_Client_Compile_Args* args) {
         if (fmt != "mlir") {
             return mock_error("MockPJRT: expected program format 'mlir', got '" + fmt + "'");
         }
+        auto* c = reinterpret_cast<MockClient*>(args->client);
         const std::string code(args->program->code, args->program->code_size);
         auto* le = new MockLoadedExecutable();
         le->exec.program = parse_stablehlo_mlir(code);
+        le->allocated_bytes = c ? c->allocated_bytes : nullptr;
         le->assigned_device_id =
             parse_assigned_device_id_from_compile_options(args->compile_options, args->compile_options_size);
         args->executable = reinterpret_cast<PJRT_LoadedExecutable*>(le);
@@ -1736,7 +1743,7 @@ static PJRT_Error* mock_loaded_exec_execute(PJRT_LoadedExecutable_Execute_Args* 
             return mock_error("MockPJRT: argument count mismatch");
         }
         std::unordered_map<std::string, MockTensor> env;
-        MockClient* client = nullptr;
+        std::shared_ptr<std::atomic<int64_t>> allocated_bytes = le->allocated_bytes;
         for (size_t i = 0; i < args->num_args; ++i) {
             auto* mb = reinterpret_cast<MockBuffer*>(args->argument_lists[0][i]);
             if (mb->device_id != le->assigned_device_id) {
@@ -1744,7 +1751,7 @@ static PJRT_Error* mock_loaded_exec_execute(PJRT_LoadedExecutable_Execute_Args* 
                                   " does not match executable device " +
                                   std::to_string(le->assigned_device_id));
             }
-            if (!client) client = mb->client;
+            if (!allocated_bytes) allocated_bytes = mb->allocated_bytes;
             env[prog.args[i].first] = mb->tensor;
         }
         std::unordered_map<std::string, size_t> last_use;
@@ -1769,12 +1776,12 @@ static PJRT_Error* mock_loaded_exec_execute(PJRT_LoadedExecutable_Execute_Args* 
         }
         for (size_t oi = 0; oi < prog.return_names.size(); ++oi) {
             auto* out_mb = new MockBuffer();
-            out_mb->client = client;
+            out_mb->allocated_bytes = allocated_bytes;
             out_mb->device_id = le->assigned_device_id;
             // Copy rather than move so repeated SSA values in return_names stay valid.
             out_mb->tensor = env.at(prog.return_names[oi]);
-            if (client) {
-                client->allocated_bytes.fetch_add(static_cast<int64_t>(out_mb->tensor.bytes.size()), std::memory_order_relaxed);
+            if (allocated_bytes) {
+                allocated_bytes->fetch_add(static_cast<int64_t>(out_mb->tensor.bytes.size()), std::memory_order_relaxed);
             }
             args->output_lists[0][oi] = reinterpret_cast<PJRT_Buffer*>(out_mb);
         }

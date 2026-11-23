@@ -2822,13 +2822,16 @@ static cloudtpu_reg_state& get_reg_state(ggml_backend_reg_t reg) {
                 };
                 state.buft_ctxs.push_back(std::move(btc));
             }
+            state.initialized = true;
         } catch (const std::exception& e) {
             GGML_LOG_ERROR("ggml-cloudtpu: failed to initialize PJRT runtime (%s); 0 devices exposed\n",
                            e.what());
             state.devices.clear();
             state.bufts.clear();
+            state.dev_ctxs.clear();
+            state.buft_ctxs.clear();
+            state.initialized = false;
         }
-        state.initialized = true;
     }
     return state;
 }
@@ -2891,6 +2894,13 @@ ggml_backend_t ggml_backend_cloudtpu_init_device(int device_index) {
         return nullptr;
     }
 
+    ggml_backend_reg_t reg = ggml_backend_cloudtpu_reg();
+    if (static_cast<size_t>(device_index) >= ggml_backend_reg_dev_count(reg)) {
+        GGML_LOG_ERROR("ggml-cloudtpu: device_index=%d unavailable in registry (reg_count=%zu)\n",
+                       device_index, ggml_backend_reg_dev_count(reg));
+        return nullptr;
+    }
+
     auto* ctx = new ggml_backend_cloudtpu_context();
     ctx->device_index = device_index;
     ctx->env = env;
@@ -2911,7 +2921,7 @@ ggml_backend_t ggml_backend_cloudtpu_init_device(int device_index) {
     ggml_backend_t backend = new ggml_backend{
         /* .guid    = */ ggml_backend_cloudtpu_guid(),
         /* .iface   = */ ggml_backend_cloudtpu_i,
-        /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cloudtpu_reg(), static_cast<size_t>(device_index)),
+        /* .device  = */ ggml_backend_reg_dev_get(reg, static_cast<size_t>(device_index)),
         /* .context = */ ctx,
     };
     return backend;

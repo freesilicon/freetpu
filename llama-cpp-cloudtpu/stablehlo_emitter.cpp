@@ -6,14 +6,23 @@
 #include <cstring>
 #include <iomanip>
 #include <limits>
+#include <locale>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
 
 namespace cloudtpu {
 
-std::string format_mlir_tensor_type(PjrtDType dtype, const std::vector<int64_t>& dims) {
+namespace {
+std::ostringstream make_classic_stream() {
     std::ostringstream oss;
+    oss.imbue(std::locale::classic());
+    return oss;
+}
+}  // namespace
+
+std::string format_mlir_tensor_type(PjrtDType dtype, const std::vector<int64_t>& dims) {
+    std::ostringstream oss = make_classic_stream();
     oss << "tensor<";
     for (int64_t d : dims) {
         oss << d << "x";
@@ -36,17 +45,17 @@ std::string format_f32_literal(float v) {
     if (!std::isfinite(v)) {
         uint32_t bits = 0;
         std::memcpy(&bits, &v, sizeof(bits));
-        std::ostringstream oss;
+        std::ostringstream oss = make_classic_stream();
         oss << "0x" << std::uppercase << std::hex << std::setw(8) << std::setfill('0') << bits;
         return oss.str();
     }
-    std::ostringstream oss;
+    std::ostringstream oss = make_classic_stream();
     oss << std::scientific << std::setprecision(8) << v;
     return oss.str();
 }
 
 std::string format_dims_bracket(const std::vector<int64_t>& dims) {
-    std::ostringstream oss;
+    std::ostringstream oss = make_classic_stream();
     oss << "[";
     for (size_t i = 0; i < dims.size(); ++i) {
         if (i > 0) oss << ", ";
@@ -58,6 +67,7 @@ std::string format_dims_bracket(const std::vector<int64_t>& dims) {
 
 class StableHloBuilder {
 public:
+    StableHloBuilder() { body_.imbue(std::locale::classic()); }
     void add_arg(const std::string& arg_name, PjrtDType dtype, const std::vector<int64_t>& dims) {
         args_.push_back({arg_name, dtype, dims});
     }
@@ -316,7 +326,7 @@ public:
     }
 
     std::string finish(const std::vector<SsaValue>& outputs) const {
-        std::ostringstream mod;
+        std::ostringstream mod = make_classic_stream();
         mod << "module @ggml_cloudtpu {\n";
         mod << "  func.func public @main(";
         for (size_t i = 0; i < args_.size(); ++i) {
@@ -352,13 +362,13 @@ public:
 
 private:
     SsaValue next_val(PjrtDType dt, std::vector<int64_t> dims) {
-        std::ostringstream oss;
+        std::ostringstream oss = make_classic_stream();
         oss << "%v" << next_id_++;
         return {oss.str(), dt, std::move(dims)};
     }
 
     std::string next_tmp_name(const char* prefix) {
-        std::ostringstream oss;
+        std::ostringstream oss = make_classic_stream();
         oss << "%" << prefix << "_" << next_id_++;
         return oss.str();
     }
@@ -520,7 +530,7 @@ std::string build_canonical_cache_key(const std::string& mlir_text) {
     // and exact length to prevent collisions without external SHA libraries.
     const uint64_t h1 = fnv1a_64(mlir_text);
     const uint64_t h2 = fnv1a_64(std::string("cloudtpu_v1:") + mlir_text);
-    std::ostringstream oss;
+    std::ostringstream oss = make_classic_stream();
     oss << std::hex << std::setfill('0') << std::setw(16) << h1
         << std::setw(16) << h2 << "_" << std::dec << mlir_text.size();
     return oss.str();

@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <locale>
 #include <vector>
 
 namespace {
@@ -861,6 +862,50 @@ void test_q4_k_split_mul_mat(cloudtpu::PjrtRuntime& rt) {
     CHECK_TRUE(sc_out.size() == 4 && std::isinf(sc_out[0]) && sc_out[0] < 0.0f,
                "SCALE with -inf bias must produce -inf output");
     std::printf("  [PASS] SCALE preserves non-finite -inf constant\n");
+
+    // 7) Mock buffer surviving runtime shutdown must destroy safely without UAF.
+    {
+        cloudtpu::PjrtBufferPtr orphan_buf;
+        {
+            cloudtpu::PjrtRuntime tmp_rt;
+            cloudtpu::RuntimeConfig tmp_cfg;
+            tmp_cfg.mock_mode = true;
+            tmp_rt.init(tmp_cfg);
+            const std::vector<float> payload = {1.0f, 2.0f, 3.0f, 4.0f};
+            orphan_buf = tmp_rt.buffer_from_host(0, payload.data(), cloudtpu::PjrtDType::F32, {4});
+            tmp_rt.shutdown();
+        }
+        orphan_buf.reset();
+        std::printf("  [PASS] Mock PjrtBufferPtr outliving runtime shutdown destroys cleanly\n");
+    }
+
+    // 8) StableHLO emission must be independent of global C++ decimal-comma locales.
+    {
+        struct CommaPunct : std::numpunct<char> {
+            char do_decimal_point() const override { return ','; }
+            char do_thousands_sep() const override { return '.'; }
+            std::string do_grouping() const override { return "\3"; }
+        };
+        const std::locale prev_loc = std::locale::global(std::locale(std::locale::classic(), new CommaPunct()));
+        cloudtpu::GraphProgramSpec loc_spec;
+        loc_spec.inputs = {{1, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 1024}}};
+        cloudtpu::OpNodeSpec rms;
+        rms.kind = cloudtpu::CloudOpKind::RMS_NORM;
+        rms.src_ids = {1};
+        rms.dst = {2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 1024}};
+        rms.eps = 0.125f;
+        loc_spec.ops.push_back(rms);
+        loc_spec.output_ids = {2};
+        const auto loc_prog = cloudtpu::emit_stablehlo_program(loc_spec);
+        std::locale::global(prev_loc);
+        CHECK_TRUE(loc_prog.mlir_text.find("1024xf32") != std::string::npos,
+                   "dimension formatting must not insert locale thousands separators");
+        CHECK_TRUE(loc_prog.mlir_text.find("1.25000000e-01") != std::string::npos,
+                   "float formatting must use classic decimal point under comma locale");
+        CHECK_TRUE(loc_prog.mlir_text.find("1,25") == std::string::npos,
+                   "float formatting must not emit comma decimal separator");
+        std::printf("  [PASS] StableHLO emission ignores global C++ locale\n");
+    }
 }
 
 }  // namespace
