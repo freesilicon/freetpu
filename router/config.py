@@ -126,33 +126,35 @@ def is_loopback_host(host: str) -> bool:
 
 
 def sanitize_url(url: str) -> str:
-    """Strip userinfo credentials, query strings, and fragments before logging or displaying."""
+    """Strip userinfo credentials, query strings, and fragments before logging or displaying.
+
+    Fails closed (`"<redacted invalid URL>"`) for any malformed or ambiguously
+    parsed URL so credentials containing unescaped delimiters (`/`, `?`, `#`,
+    `@`, whitespace, or missing `://`) can never leak into diagnostics.
+    """
     cleaned = url.strip()
-    if "://" not in cleaned:
+    if "://" not in cleaned or any(ch.isspace() for ch in cleaned):
         return "<redacted invalid URL>"
     try:
         parts = urlsplit(cleaned)
     except ValueError:
-        stripped = cleaned.split("#", 1)[0].split("?", 1)[0]
-        scheme, rest = stripped.split("://", 1)
-        if (
-            not scheme
-            or not rest
-            or not scheme[0].isalpha()
-            or not all(c.isalnum() or c in "+-." for c in scheme)
-        ):
-            return "<redacted invalid URL>"
-        if "/" in rest:
-            authority, tail = rest.split("/", 1)
-            if "@" in authority:
-                authority = authority.rsplit("@", 1)[1]
-            return f"{scheme}://{authority}/{tail}"
-        if "@" in rest:
-            rest = rest.rsplit("@", 1)[1]
-        return f"{scheme}://{rest}"
-    if not parts.scheme or not parts.netloc:
+        return "<redacted invalid URL>"
+    scheme = parts.scheme.lower()
+    if scheme not in VALID_URL_SCHEMES or not parts.netloc:
+        return "<redacted invalid URL>"
+    if "@" in parts.path or "@" in parts.query or "@" in parts.fragment:
+        return "<redacted invalid URL>"
+    if not parts.hostname:
+        return "<redacted invalid URL>"
+    try:
+        port = parts.port
+    except ValueError:
+        return "<redacted invalid URL>"
+    if port is not None and not (1 <= port <= 65535):
         return "<redacted invalid URL>"
     netloc = parts.netloc.rsplit("@", 1)[1] if "@" in parts.netloc else parts.netloc
+    if not netloc:
+        return "<redacted invalid URL>"
     if (
         netloc == parts.netloc
         and not parts.query
@@ -234,7 +236,7 @@ def validate_http_url(
     if port is not None and not (1 <= port <= 65535):
         raise ValueError(
             f"Invalid {field_name} {sanitize_url(cleaned)!r}: "
-            f"port {port} out of range 1..65535"
+            "port out of range 1..65535"
         )
     return cleaned
 

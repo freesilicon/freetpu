@@ -15200,6 +15200,62 @@ asyncio.run(main())
         )
         self.assertIsNone(opt_out_backend.max_hbm_utilization)
 
+    def test_malformed_urls_with_unescaped_password_delimiters_redact_all_credentials(
+        self,
+    ) -> None:
+        invalid_secret_cases = (
+            ("https://alice:p4/ss@host:8000", ("alice", "p4", "ss")),
+            ("https://alice:p4?ss@host:8000", ("alice", "p4", "ss")),
+            ("https://alice:p4#ss@host:8000", ("alice", "p4", "ss")),
+            ("https://alice:99999/ss@host:8000", ("alice", "99999", "ss")),
+        )
+        for bad_url, forbidden_tokens in invalid_secret_cases:
+            with self.subTest(bad_url=bad_url):
+                sanitized = sanitize_url(bad_url)
+                self.assertEqual(sanitized, "<redacted invalid URL>")
+                for tok in forbidden_tokens:
+                    self.assertNotIn(tok, sanitized)
+                with self.assertRaises(ValueError) as ctx:
+                    validate_http_url(bad_url, field_name="backend base_url", allow_query=False)
+                err_msg = str(ctx.exception)
+                for tok in forbidden_tokens:
+                    self.assertNotIn(tok, err_msg)
+
+        # Even if numeric password looks like a valid port before '/' + '@', sanitize_url redacts it.
+        ambig = sanitize_url("https://alice:1234/w0rd@host:8000")
+        self.assertEqual(ambig, "<redacted invalid URL>")
+        for tok in ("alice", "1234", "w0rd"):
+            self.assertNotIn(tok, ambig)
+
+        # Backslash in password parsed as userinfo still strips all credentials cleanly.
+        bs_sanitized = sanitize_url("https://alice:p4\\w0rd@host:8000")
+        for tok in ("alice", "p4", "w0rd"):
+            self.assertNotIn(tok, bs_sanitized)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_path = Path(tmpdir) / "bad_pw_slash.json"
+            cfg_path.write_text(
+                json.dumps(
+                    {
+                        "backends": [
+                            {
+                                "id": "pw-slash-b",
+                                "base_url": "https://alice:p4/w0rd@host:8000",
+                                "models": ["m1"],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            err_buf = io.StringIO()
+            with redirect_stderr(err_buf):
+                rc = router_main(["--config", str(cfg_path), "--check-config"])
+            self.assertNotEqual(rc, 0)
+            stderr_out = err_buf.getvalue()
+            for tok in ("alice", "p4/w0rd", "p4", "w0rd"):
+                self.assertNotIn(tok, stderr_out)
+
 
 def run_self_tests(verbosity: int = 1) -> int:
     """Run all router tests cleanly via unittest."""
