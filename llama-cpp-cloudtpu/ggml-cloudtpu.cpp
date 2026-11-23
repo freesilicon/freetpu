@@ -1343,13 +1343,6 @@ static void ggml_backend_cloudtpu_buffer_clear(ggml_backend_buffer_t buffer, uin
     bctx->slots.clear();
 }
 
-static void ggml_backend_cloudtpu_buffer_reset(ggml_backend_buffer_t buffer) {
-    auto* bctx = static_cast<ggml_backend_cloudtpu_buffer_context*>(buffer->context);
-    std::lock_guard<std::mutex> lock(bctx->mu);
-    bctx->clear_value = 0;
-    bctx->slots.clear();
-}
-
 static const struct ggml_backend_buffer_i ggml_backend_cloudtpu_buffer_i = {
     /* .free_buffer   = */ ggml_backend_cloudtpu_buffer_free_buffer,
     /* .get_base      = */ ggml_backend_cloudtpu_buffer_get_base,
@@ -1361,7 +1354,7 @@ static const struct ggml_backend_buffer_i ggml_backend_cloudtpu_buffer_i = {
     /* .get_tensor_2d = */ NULL,
     /* .cpy_tensor    = */ ggml_backend_cloudtpu_buffer_cpy_tensor,
     /* .clear         = */ ggml_backend_cloudtpu_buffer_clear,
-    /* .reset         = */ ggml_backend_cloudtpu_buffer_reset,
+    /* .reset         = */ NULL,
     /* .set_tensor_n  = */ NULL,
     /* .get_tensor_n  = */ NULL,
     /* .cpy_tensor_n  = */ NULL,
@@ -1981,14 +1974,17 @@ static void resolve_tensor_hbm(cloudtpu::PjrtRuntime& rt,
         // Uninitialized fill-byte HBM buffer for newly allocated leaf/KV-cache buffers before first write.
         // Never silently materialize a computed graph activation node (t->op != GGML_OP_NONE).
         const cloudtpu::PjrtDType pdt = ggml_type_to_pjrt(t->type);
-        if (t->op == GGML_OP_NONE && pdt != cloudtpu::PjrtDType::INVALID && ggml_is_contiguous(t)) {
+        const bool quant_ok = is_quant_split_type(t->type) &&
+                              (t->ne[0] % quant_split_k_alignment(t->type)) == 0;
+        if (t->op == GGML_OP_NONE && (pdt != cloudtpu::PjrtDType::INVALID || quant_ok) && ggml_is_contiguous(t)) {
             const size_t t_bytes = ggml_nbytes(t);
             std::vector<uint8_t> init_bytes(t_bytes, bctx->clear_value);
+            CloudTpuTensorSlot next;
+            next.offset = t_off;
+            next.nbytes = t_bytes;
+            upload_raw_tensor_to_slot(rt, bctx->device_index, next, t, init_bytes.data());
             bctx->evict_overlapping_locked(t_off, t_bytes, t_off);
-            CloudTpuTensorSlot& slot = bctx->slots[t_off];
-            slot.offset = t_off;
-            slot.nbytes = t_bytes;
-            upload_raw_tensor_to_slot(rt, bctx->device_index, slot, t, init_bytes.data());
+            CloudTpuTensorSlot& slot = (bctx->slots[t_off] = std::move(next));
             out_primary = slot.hbm_primary;
             out_scales = slot.hbm_scales;
             out_mins = slot.hbm_mins;

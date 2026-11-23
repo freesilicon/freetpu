@@ -617,7 +617,10 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                     (op.high_precision || x.dtype == PjrtDType::F32) ? PjrtDType::F32 : PjrtDType::BF16;
                 SsaValue w = resolve_dense(op.src_ids.at(0), deq_dt);
 
-                if (w.dtype != x.dtype) {
+                if (op.high_precision) {
+                    w = builder.emit_convert(w, PjrtDType::F32);
+                    x = builder.emit_convert(x, PjrtDType::F32);
+                } else if (w.dtype != x.dtype) {
                     const PjrtDType common =
                         (w.dtype == PjrtDType::F32 || x.dtype == PjrtDType::F32) ? PjrtDType::F32 : PjrtDType::BF16;
                     w = builder.emit_convert(w, common);

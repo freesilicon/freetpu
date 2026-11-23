@@ -1,6 +1,7 @@
 #include "pjrt_runtime.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -1382,7 +1383,7 @@ struct MockDevice {
 struct MockClient {
     std::vector<std::unique_ptr<MockDevice>> devices;
     std::vector<PJRT_Device*> device_ptrs;
-    int64_t allocated_bytes = 0;
+    std::atomic<int64_t> allocated_bytes{0};
 
     explicit MockClient(int num_devices) {
         const int count = std::max(1, num_devices);
@@ -1619,7 +1620,7 @@ static PJRT_Error* mock_dev_desc_to_string(PJRT_DeviceDescription_ToString_Args*
 static PJRT_Error* mock_device_memory_stats(PJRT_Device_MemoryStats_Args* args) {
     auto* d = reinterpret_cast<MockDevice*>(args->device);
     auto* c = d->client;
-    args->bytes_in_use = c->allocated_bytes;
+    args->bytes_in_use = c->allocated_bytes.load(std::memory_order_relaxed);
     args->bytes_limit_is_set = true;
     args->bytes_limit = 16909336064LL;  // 15.748 GiB (v5e-1 HBM2e nominal)
     return nullptr;
@@ -1640,7 +1641,7 @@ static PJRT_Error* mock_buffer_from_host(PJRT_Client_BufferFromHostBuffer_Args* 
     if (!mb->tensor.bytes.empty() && args->data) {
         std::memcpy(mb->tensor.bytes.data(), args->data, mb->tensor.bytes.size());
     }
-    c->allocated_bytes += static_cast<int64_t>(mb->tensor.bytes.size());
+    c->allocated_bytes.fetch_add(static_cast<int64_t>(mb->tensor.bytes.size()), std::memory_order_relaxed);
     args->done_with_host_buffer = reinterpret_cast<PJRT_Event*>(new MockEvent());
     args->buffer = reinterpret_cast<PJRT_Buffer*>(mb);
     return nullptr;
@@ -1648,7 +1649,7 @@ static PJRT_Error* mock_buffer_from_host(PJRT_Client_BufferFromHostBuffer_Args* 
 static PJRT_Error* mock_buffer_destroy(PJRT_Buffer_Destroy_Args* args) {
     auto* mb = reinterpret_cast<MockBuffer*>(args->buffer);
     if (mb && mb->client) {
-        mb->client->allocated_bytes -= static_cast<int64_t>(mb->tensor.bytes.size());
+        mb->client->allocated_bytes.fetch_sub(static_cast<int64_t>(mb->tensor.bytes.size()), std::memory_order_relaxed);
     }
     delete mb;
     return nullptr;
@@ -1773,7 +1774,7 @@ static PJRT_Error* mock_loaded_exec_execute(PJRT_LoadedExecutable_Execute_Args* 
             // Copy rather than move so repeated SSA values in return_names stay valid.
             out_mb->tensor = env.at(prog.return_names[oi]);
             if (client) {
-                client->allocated_bytes += static_cast<int64_t>(out_mb->tensor.bytes.size());
+                client->allocated_bytes.fetch_add(static_cast<int64_t>(out_mb->tensor.bytes.size()), std::memory_order_relaxed);
             }
             args->output_lists[0][oi] = reinterpret_cast<PJRT_Buffer*>(out_mb);
         }
