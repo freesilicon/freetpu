@@ -1,6 +1,6 @@
 # Cloud TPU `v6e-8` High-Batch (`c=64–128`) & Dynamic W8A8 INT8 Serving Playbook
 
-Ready-to-run `vllm/vllm-tpu:latest` launch presets and FreeTPU Router configuration for scaling dense `Qwen3-32B` and `Llama-3.3-70B` models on Cloud TPU `v6e-8` (Trillium, `256 GiB` HBM, `12.8–13.1 TB/s` HBM BW, `7,344 TFLOP/s` BF16 / `14,688 TOPS` INT8).
+Ready-to-run `vllm/vllm-tpu:v0.33.0` launch presets and FreeTPU Router configuration for scaling dense `Qwen3-32B` and `Llama-3.3-70B` models on Cloud TPU `v6e-8` (Trillium, `256 GiB` HBM, `12.8–13.1 TB/s` HBM BW, `7,344 TFLOP/s` BF16 / `14,688 TOPS` INT8).
 
 ---
 
@@ -60,9 +60,9 @@ CONTAINER_FLAGS=(
 
 ---
 
-## 4. `vllm/vllm-tpu:latest` Launch Presets (`v6e-8`, `TP=8`)
+## 4. `vllm/vllm-tpu:v0.33.0` Launch Presets (`v6e-8`, `TP=8`)
 
-> **Flag check note:** Before launching on a fresh `vllm/vllm-tpu:latest` image, verify scheduler flags (`--async-scheduling` / `--num-scheduler-steps`) against `python3 -m vllm.entrypoints.openai.api_server --help` inside the container.
+> **Flag check note:** These presets pin `vllm/vllm-tpu:v0.33.0` and pass `--additional-config '{"enable_continue_decode": true}'` alongside `--async-scheduling` to opt into TPU multi-step decoding. When upgrading to a newer image tag, verify scheduler and `--additional-config` flags against `python3 -m vllm.entrypoints.openai.api_server --help` inside the container.
 
 ### Preset A: `Qwen/Qwen3-32B` BF16 High-Batch (`c=64..128`)
 
@@ -70,7 +70,7 @@ Targets `c=64..128` decode scaling (`~4,500–6,500 tok/s` projected vs `953 tok
 
 ```bash
 docker run -d --name vllm-qwen3-32b-highbatch "${CONTAINER_FLAGS[@]}" \
-  vllm/vllm-tpu:latest \
+  vllm/vllm-tpu:v0.33.0 \
   python3 -m vllm.entrypoints.openai.api_server \
     --host 127.0.0.1 --port 8000 \
     --model Qwen/Qwen3-32B \
@@ -81,7 +81,8 @@ docker run -d --name vllm-qwen3-32b-highbatch "${CONTAINER_FLAGS[@]}" \
     --max-num-batched-tokens 2048 \
     --enable-chunked-prefill \
     --gpu-memory-utilization 0.90 \
-    --async-scheduling
+    --async-scheduling \
+    --additional-config '{"enable_continue_decode": true}'
 ```
 
 ### Preset B: `unsloth/Llama-3.3-70B-Instruct` BF16 High-Batch (`c=64..128`)
@@ -90,7 +91,7 @@ Targets `c=64..128` decode scaling (`~2,500–3,800 tok/s` projected vs `633 tok
 
 ```bash
 docker run -d --name vllm-llama70b-highbatch "${CONTAINER_FLAGS[@]}" \
-  vllm/vllm-tpu:latest \
+  vllm/vllm-tpu:v0.33.0 \
   python3 -m vllm.entrypoints.openai.api_server \
     --host 127.0.0.1 --port 8000 \
     --model unsloth/Llama-3.3-70B-Instruct \
@@ -101,7 +102,8 @@ docker run -d --name vllm-llama70b-highbatch "${CONTAINER_FLAGS[@]}" \
     --max-num-batched-tokens 2048 \
     --enable-chunked-prefill \
     --gpu-memory-utilization 0.90 \
-    --async-scheduling
+    --async-scheduling \
+    --additional-config '{"enable_continue_decode": true}'
 ```
 
 ### Preset C: Dense Native TPU Dynamic `W8A8` INT8 (`compressed-tensors`)
@@ -113,7 +115,7 @@ Trillium `v6e` delivers `1,836 TOPS/chip` (`14,688 TOPS` across 8 chips) on nati
 # (for a local host directory, add -v /path/to/checkpoint:/models/dense-w8a8:ro
 # and pass --model /models/dense-w8a8).
 docker run -d --name vllm-int8-highbatch "${CONTAINER_FLAGS[@]}" \
-  vllm/vllm-tpu:latest \
+  vllm/vllm-tpu:v0.33.0 \
   python3 -m vllm.entrypoints.openai.api_server \
     --host 127.0.0.1 --port 8000 \
     --model "${MODEL_W8A8}" \
@@ -125,7 +127,8 @@ docker run -d --name vllm-int8-highbatch "${CONTAINER_FLAGS[@]}" \
     --max-num-batched-tokens 2048 \
     --enable-chunked-prefill \
     --gpu-memory-utilization 0.90 \
-    --async-scheduling
+    --async-scheduling \
+    --additional-config '{"enable_continue_decode": true}'
 ```
 
 ---

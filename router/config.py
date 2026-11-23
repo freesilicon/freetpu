@@ -23,6 +23,7 @@ DEFAULT_MAX_RESPONSE_BODY_BYTES = 16 * 1024 * 1024
 DEFAULT_MAX_HEADER_BYTES = 64 * 1024
 DEFAULT_MAX_JSON_DEPTH = 64
 DEFAULT_MAX_JSON_NODES = 32768
+DEFAULT_MAX_RESPONSE_JSON_NODES = 524288
 DEFAULT_CLIENT_READ_TIMEOUT_S = 30.0
 DEFAULT_CLIENT_HEADER_TIMEOUT_S = 10.0
 DEFAULT_MAX_CONCURRENT_CONNECTIONS = 512
@@ -547,6 +548,7 @@ class RouterConfig:
     max_header_bytes: int = DEFAULT_MAX_HEADER_BYTES
     max_json_depth: int = DEFAULT_MAX_JSON_DEPTH
     max_json_nodes: int = DEFAULT_MAX_JSON_NODES
+    max_response_json_nodes: int = DEFAULT_MAX_RESPONSE_JSON_NODES
     client_read_timeout_s: float = DEFAULT_CLIENT_READ_TIMEOUT_S
     client_header_timeout_s: float = DEFAULT_CLIENT_HEADER_TIMEOUT_S
     max_concurrent_connections: int = DEFAULT_MAX_CONCURRENT_CONNECTIONS
@@ -640,6 +642,11 @@ class RouterConfig:
         _validate_int_range(
             self.max_json_nodes,
             name="max_json_nodes",
+            min_value=1,
+        )
+        _validate_int_range(
+            self.max_response_json_nodes,
+            name="max_response_json_nodes",
             min_value=1,
         )
         if not isinstance(self.trust_proxy_headers, bool):
@@ -835,6 +842,11 @@ class RouterConfig:
             max_json_nodes=_validate_int_range(
                 raw.get("max_json_nodes", DEFAULT_MAX_JSON_NODES),
                 name="max_json_nodes",
+                min_value=1,
+            ),
+            max_response_json_nodes=_validate_int_range(
+                raw.get("max_response_json_nodes", DEFAULT_MAX_RESPONSE_JSON_NODES),
+                name="max_response_json_nodes",
                 min_value=1,
             ),
             client_read_timeout_s=_validate_finite_number(

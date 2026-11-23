@@ -6678,7 +6678,23 @@ asyncio.run(main())
             asyncio.run(run_batch(up_port, 1))
             asyncio.run(run_batch(rport, 1))
 
+            soft_nofile: Optional[int] = None
+            if hasattr(resource, "RLIMIT_NOFILE"):
+                try:
+                    soft_nofile, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+                except (OSError, ValueError):
+                    soft_nofile = None
+
+            tested_levels = 0
             for concurrency in (1, 8, 16, 64, 128):
+                # Each live stream uses ~3 FDs in the test process (client, accepted, upstream).
+                if (
+                    soft_nofile is not None
+                    and soft_nofile > 0
+                    and (3 * concurrency + 80) > soft_nofile
+                ):
+                    continue
+                tested_levels += 1
                 direct_ms = asyncio.run(run_batch(up_port, concurrency))
                 router_ms = asyncio.run(run_batch(rport, concurrency))
                 total_chunks = float(concurrency * num_tokens)
@@ -6693,6 +6709,7 @@ asyncio.run(main())
                 self.assertEqual(health["active_inflight"], 0)
                 self.assertEqual(health["backends"][0]["inflight"], 0)
                 self.assertEqual(router.engine._resp_mem_used_bytes, 0)
+            self.assertGreater(tested_levels, 0)
         finally:
             if up_proc.stdout is not None:
                 up_proc.stdout.close()
@@ -7229,6 +7246,12 @@ asyncio.run(main())
             playbook.index("python3 router/freetpu_router.py"),
         )
         self.assertIn("single attention request bucket", playbook.lower())
+        self.assertNotIn("vllm/vllm-tpu:latest", playbook)
+        self.assertIn("vllm/vllm-tpu:v0.33.0", playbook)
+        self.assertIn(
+            """--additional-config '{"enable_continue_decode": true}'""",
+            playbook,
+        )
 
     def test_deadline_socket_waits_support_high_fds_without_select_select(self) -> None:
         def _forbid_select(*args: Any, **kwargs: Any) -> Any:
@@ -8180,6 +8203,116 @@ asyncio.run(main())
         ready_ok, reason_ok = evaluate_tpu_readiness(telem_ok)
         self.assertTrue(ready_ok)
         self.assertIsNone(reason_ok)
+
+    def test_upstream_logprobs_response_exceeding_request_json_node_limit_succeeds(
+        self,
+    ) -> None:
+        # 1,024 generated tokens with 5 top_logprobs each produces >40,000 structural JSON nodes,
+        # exceeding default inbound max_json_nodes (32,768) while fitting cleanly within
+        # max_response_json_nodes and the shared response memory budget.
+        token_entry = {
+            "token": "ok",
+            "logprob": -0.05,
+            "top_logprobs": [
+                {"token": f"t{k}", "logprob": -0.1 * (k + 1)} for k in range(5)
+            ],
+        }
+        logprobs_payload = {
+            "id": "chatcmpl-logprobs-big",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "m-logprobs",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok " * 1024},
+                    "logprobs": {"content": [token_entry for _ in range(1024)]},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 1024, "total_tokens": 1036},
+        }
+        raw_nodes = _validate_json_structure(
+            json.dumps(logprobs_payload).encode("utf-8"),
+            max_depth=64,
+            max_nodes=524288,
+        )
+        self.assertGreater(raw_nodes, 32768)
+
+        backend = self._track(
+            _MockOpenAIBackend(
+                "logprobs-b",
+                ["m-logprobs"],
+                custom_non_stream_payload=logprobs_payload,
+            )
+        )
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            backends=[
+                BackendConfig(
+                    id="logprobs-b",
+                    base_url=backend.base_url,
+                    models=["m-logprobs"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        # 1. Valid 1,024-token top_logprobs=5 upstream response succeeds with HTTP 200.
+        st, _, bd = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-logprobs",
+                "messages": [{"role": "user", "content": "give logprobs"}],
+            },
+        )
+        self.assertEqual(st, 200)
+        parsed = json.loads(bd.decode("utf-8"))
+        self.assertEqual(len(parsed["choices"][0]["logprobs"]["content"]), 1024)
+        self.assertEqual(router.engine._resp_mem_used_bytes, 0)
+
+        # 2. Inbound request exceeding max_json_nodes is still rejected with HTTP 400.
+        cfg_strict = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            max_json_nodes=500,
+            max_response_json_nodes=1000,
+            backends=[
+                BackendConfig(
+                    id="logprobs-b",
+                    base_url=backend.base_url,
+                    models=["m-logprobs"],
+                )
+            ],
+        )
+        router2 = self._track(create_router_server(cfg_strict))
+        rport2 = router2.server_address[1]
+        st_req_bad, _, bd_req_bad = _http_request(
+            rport2,
+            "POST",
+            "/v1/chat/completions",
+            body={"model": "m-logprobs", "messages": [[] for _ in range(600)]},
+        )
+        self.assertEqual(st_req_bad, 400)
+        self.assertIn(b"json_complexity_limit_exceeded", bd_req_bad)
+
+        # 3. Upstream response exceeding explicit max_response_json_nodes (1000) returns HTTP 502.
+        st_resp_bad, _, bd_resp_bad = _http_request(
+            rport2,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-logprobs",
+                "messages": [{"role": "user", "content": "hit resp cap"}],
+            },
+        )
+        self.assertEqual(st_resp_bad, 502)
+        self.assertIn(b"response_too_large", bd_resp_bad)
+        self.assertEqual(router2.engine._resp_mem_used_bytes, 0)
 
 
 def run_self_tests(verbosity: int = 1) -> int:

@@ -3532,7 +3532,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                 resp_nodes = _validate_json_structure(
                                     raw_resp,
                                     max_depth=engine.config.max_json_depth,
-                                    max_nodes=engine.config.max_json_nodes,
+                                    max_nodes=engine.config.max_response_json_nodes,
                                 )
                             except _JsonStructureLimitError:
                                 if resp_mem_reserved[0] > 0:
