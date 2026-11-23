@@ -154,6 +154,20 @@ static void test_mock_dma_and_matmul() {
   ot_buffer_free(foreign);
   ot_context_destroy(ctx2);
 
+  // Verify CQ completion validation rejects mismatched sequence and non-zero status.
+  {
+    std::string cq_err;
+    uint32_t ok_cq[8] = {7u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
+    OT_CHECK(ot::validate_cq_completion(7u, ok_cq, &cq_err));
+    uint32_t bad_seq_cq[8] = {6u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
+    OT_CHECK(!ot::validate_cq_completion(7u, bad_seq_cq, &cq_err));
+    OT_CHECK(!cq_err.empty());
+    uint32_t bad_stat_cq[8] = {7u, 0x1u, 0u, 0u, 0u, 0u, 0u, 0u};
+    cq_err.clear();
+    OT_CHECK(!ot::validate_cq_completion(7u, bad_stat_cq, &cq_err));
+    OT_CHECK(!cq_err.empty());
+  }
+
   ot_buffer_free(bc);
   ot_buffer_free(bb);
   ot_buffer_free(ba);
@@ -771,24 +785,6 @@ static void test_pjrt_api_mock() {
     OT_CHECK(dm2.memory->vtable->get_user_data(dm2.memory, &key_a) == &val_a);
     // Re-attach destructor and verify PJRT_Client_Destroy invokes it.
     dm2.memory->vtable->set_user_data(dm2.memory, &key_a, &g_mem_dtor_calls, inc_dtor);
-
-    // Executing client 1's executable with execute_device from client 2 must fail.
-    PJRT_Buffer* dummy_in[2] = {fdev.buffer, fdev.buffer};
-    PJRT_Buffer** dummy_in_lists[1] = {dummy_in};
-    PJRT_Buffer* dummy_out[1] = {nullptr};
-    PJRT_Buffer** dummy_out_lists[1] = {dummy_out};
-    PJRT_LoadedExecutable_Execute_Args bad_ex = {};
-    bad_ex.struct_size = PJRT_LoadedExecutable_Execute_Args_STRUCT_SIZE;
-    bad_ex.executable = ca.executable;
-    bad_ex.num_devices = 1;
-    bad_ex.num_args = 2;
-    bad_ex.argument_lists = dummy_in_lists;
-    bad_ex.output_lists = dummy_out_lists;
-    bad_ex.execute_device = ad2.addressable_devices[0];
-    PJRT_Error* ex_dev_err = api->PJRT_LoadedExecutable_Execute(&bad_ex);
-    OT_CHECK(ex_dev_err != nullptr);
-    destroy_pjrt_error(api, ex_dev_err);
-
     OT_CHECK(api->PJRT_Client_Destroy(&cd2) == nullptr);
     OT_CHECK(g_mem_dtor_calls == 2);
   }
@@ -828,6 +824,41 @@ static void test_pjrt_api_mock() {
   PJRT_Buffer* outs[1] = {nullptr};
   PJRT_Buffer* const* arg_lists[1] = {ins};
   PJRT_Buffer** const out_lists[1] = {outs};
+
+  // Executing client 1's executable with live valid 128x128 inputs but client 2's execute_device must fail.
+  {
+    PJRT_Client_Create_Args cc3 = {};
+    cc3.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
+    OT_CHECK(api->PJRT_Client_Create(&cc3) == nullptr);
+    PJRT_Client_AddressableDevices_Args ad3 = {};
+    ad3.struct_size = PJRT_Client_AddressableDevices_Args_STRUCT_SIZE;
+    ad3.client = cc3.client;
+    OT_CHECK(api->PJRT_Client_AddressableDevices(&ad3) == nullptr);
+
+    PJRT_LoadedExecutable_Execute_Args bad_ex = {};
+    bad_ex.struct_size = PJRT_LoadedExecutable_Execute_Args_STRUCT_SIZE;
+    bad_ex.executable = ca.executable;
+    bad_ex.num_devices = 1;
+    bad_ex.num_args = 2;
+    bad_ex.argument_lists = arg_lists;
+    bad_ex.output_lists = out_lists;
+    bad_ex.execute_device = ad3.addressable_devices[0];
+    PJRT_Error* ex_dev_err = api->PJRT_LoadedExecutable_Execute(&bad_ex);
+    OT_CHECK(ex_dev_err != nullptr);
+    PJRT_Error_Message_Args em = {};
+    em.struct_size = PJRT_Error_Message_Args_STRUCT_SIZE;
+    em.error = ex_dev_err;
+    api->PJRT_Error_Message(&em);
+    OT_CHECK(em.message != nullptr &&
+             std::string(em.message, em.message_size).find("execute_device") != std::string::npos);
+    destroy_pjrt_error(api, ex_dev_err);
+    OT_CHECK(outs[0] == nullptr);
+
+    PJRT_Client_Destroy_Args cd3 = {};
+    cd3.struct_size = PJRT_Client_Destroy_Args_STRUCT_SIZE;
+    cd3.client = cc3.client;
+    OT_CHECK(api->PJRT_Client_Destroy(&cd3) == nullptr);
+  }
   PJRT_ExecuteOptions opts = {};
   opts.struct_size = PJRT_ExecuteOptions_STRUCT_SIZE;
   PJRT_Event* dev_ev[1] = {nullptr};

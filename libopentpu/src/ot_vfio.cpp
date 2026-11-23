@@ -833,6 +833,34 @@ void VfioTransport::teardown_ring_queues() {
   dma_faulted = false;
 }
 
+bool validate_cq_completion(uint32_t sent_seq, const uint32_t cq[8], std::string* err) {
+  if (!cq) {
+    if (err) *err = "Null CQ completion buffer";
+    return false;
+  }
+  if (cq[0] != sent_seq) {
+    if (err) {
+      char msg[128];
+      std::snprintf(msg, sizeof(msg),
+                    "CQ completion sequence mismatch: got=%u expected=%u",
+                    cq[0], sent_seq);
+      *err = msg;
+    }
+    return false;
+  }
+  if (cq[1] != 0u) {
+    if (err) {
+      char msg[160];
+      std::snprintf(msg, sizeof(msg),
+                    "VFIO CQ completion error: seq=%u status=0x%08x w2=0x%08x w3=0x%08x",
+                    cq[0], cq[1], cq[2], cq[3]);
+      *err = msg;
+    }
+    return false;
+  }
+  return true;
+}
+
 bool VfioTransport::submit_sq_wait(const uint32_t desc[32], uint32_t timeout_ms,
                                    uint32_t cq_out[8], std::string* err) {
   if (dma_faulted) {
@@ -840,7 +868,11 @@ bool VfioTransport::submit_sq_wait(const uint32_t desc[32], uint32_t timeout_ms,
     return false;
   }
   if (is_mock) {
-    if (cq_out) std::memset(cq_out, 0, 32);
+    if (cq_out) {
+      std::memset(cq_out, 0, 32);
+      cq_out[0] = sq_seq;
+    }
+    ++sq_seq;
     return true;
   }
 #ifndef __linux__
@@ -852,14 +884,20 @@ bool VfioTransport::submit_sq_wait(const uint32_t desc[32], uint32_t timeout_ms,
     return false;
   }
 
-  uint32_t idx = sq_seq % 256u;
+  const uint32_t sent_seq = sq_seq;
+  uint32_t idx = sent_seq % 256u;
   uint32_t* sq_slot = reinterpret_cast<uint32_t*>(sq_ring_mem + idx * 128u);
+  uint32_t* cq_slot = reinterpret_cast<uint32_t*>(cq_ring_mem + idx * 32u);
+  // Poison the CQ slot before ringing the doorbell so stale entries cannot match sent_seq.
+  std::memset(cq_slot, 0, 32u);
+  cq_slot[0] = ~sent_seq;
+
   std::memcpy(sq_slot, desc, 128u);
-  sq_slot[0] = sq_seq;
-  // Order DMA payload and SQ descriptor writes in outer-shareable domain before MMIO doorbell.
+  sq_slot[0] = sent_seq;
+  // Order DMA payload, CQ poison, and SQ descriptor writes in outer-shareable domain before MMIO doorbell.
   dma_wmb();
 
-  uint32_t target_seq = sq_seq + 1u;
+  uint32_t target_seq = sent_seq + 1u;
   sq_seq = target_seq;
   write32_bar0(0x10018u, target_seq);
   write32_bar0(0x10044u, 0u);
@@ -871,13 +909,14 @@ bool VfioTransport::submit_sq_wait(const uint32_t desc[32], uint32_t timeout_ms,
     if (static_cast<int32_t>(cq_tail - target_seq) >= 0) {
       // Order completion entry and DMA payload reads after observing cq_tail from PCIe device.
       dma_rmb();
-      if (cq_out) {
-        const uint32_t* cq_slot = reinterpret_cast<const uint32_t*>(cq_ring_mem + idx * 32u);
-        std::memcpy(cq_out, cq_slot, 32u);
-      }
+      uint32_t local_cq[8] = {};
+      std::memcpy(local_cq, cq_slot, 32u);
       dma_wmb();
       write32_bar0(0x1002cu, target_seq);
-      return true;
+      if (cq_out) {
+        std::memcpy(cq_out, local_cq, 32u);
+      }
+      return validate_cq_completion(sent_seq, local_cq, err);
     }
     if (std::chrono::steady_clock::now() >= deadline) {
       break;

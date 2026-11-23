@@ -129,6 +129,7 @@ struct VfioTransport {
 
 ot_status_t buffer_h2d_offset(ot_context_t* ctx, ot_buffer_t* dst, size_t dst_offset,
                               const void* host_src, size_t size_bytes);
+bool validate_cq_completion(uint32_t sent_seq, const uint32_t cq[8], std::string* err);
 
 }  // namespace ot
 

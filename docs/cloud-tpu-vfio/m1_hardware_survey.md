@@ -66,6 +66,7 @@ Observed at the `/dev/vfio/*` kernel boundary during a full `PJRT_Client_Create`
 - **`op=0x04` PCIe <-> HBM DMA Descriptor (128 B SQ Entry)**:
   - `qwords = len / 8`: `w[8] = ((qwords & 0xffff) << 16) | 0x1001`, `w[9] = 0x00400000 | (qwords >> 16)`.
   - Host IOVA high bits `[63:32]` in `w[10]`, and low bits `[31:0]` in `w[24]` for `H2D` (`w[25] = 0x00604000`, `w[26] = dev_addr[31:0]`, `w[27] = dst_flags_hi | dev_addr[35:32]`) or in `w[26]` for `D2H` (`w[24] = dev_addr[31:0]`, `w[25] = 0x00104000 | dev_addr[35:32]`, `w[27] = 0x40000000`), supporting both `<4 GiB` and `>=4 GiB` host IOVAs.
+  - **32 B CQ Completion Entry (`cq[0..7]`)**: `cq[0]` echoes the submitted `sq_seq` tag and `cq[1]` holds the completion status word (`0` = success; non-zero = hardware/DMA error). The driver poisons `cq[0] = ~sent_seq` before ringing the doorbell and validates `cq[0] == sent_seq && cq[1] == 0` after `cq_tail` advances.
   - Verified usable HBM aperture from `0x0_00100000` through `0x3_ef000000`, with **`match=1`** byte-exact round-trips across `4 KiB`, `64 KiB`, and `1 MiB` (`opentpu_vfio_smoke`, `MAPS_LIBTPU=0`, `MAPS_LIBPYTHON=0`) and over `GetPjrtApi()` (`PJRT_Client_BufferFromHostBuffer` / `PJRT_Buffer_ToHostBuffer`, `64 KiB` `match=1`).
 
 ## 5. `v5e-1` `512 B` Launch Descriptor, `{1,0:T(2,128)}` Tiling & 512-bit VLIW Matmul
