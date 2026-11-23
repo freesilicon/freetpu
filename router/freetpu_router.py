@@ -1036,22 +1036,6 @@ def _has_choice_audio_output(obj: Mapping[str, Any]) -> bool:
     return False
 
 
-def _has_prompt_token_ids(obj: Mapping[str, Any]) -> bool:
-    """Return True when response root or any choice carries non-empty `prompt_token_ids`."""
-    root_ids = obj.get("prompt_token_ids")
-    if isinstance(root_ids, (list, tuple)) and len(root_ids) > 0:
-        return True
-    choices = obj.get("choices")
-    if isinstance(choices, list):
-        for choice in choices:
-            if not (isinstance(choice, dict) or isinstance(choice, Mapping)):
-                continue
-            c_ids = choice.get("prompt_token_ids")
-            if isinstance(c_ids, (list, tuple)) and len(c_ids) > 0:
-                return True
-    return False
-
-
 def _extract_choice_token_id_count(obj: Mapping[str, Any]) -> int:
     """Count integer generated `token_ids` reported across choices in `obj`."""
     choices = obj.get("choices")
@@ -1171,10 +1155,9 @@ def _extract_non_stream_usage(
 
     if not saw_completion:
         resp_token_id_count = _extract_choice_token_id_count(parsed_resp)
-        has_prompt_token_ids = _has_prompt_token_ids(parsed_resp)
         if resp_token_id_count > 0:
             completion_tokens = resp_token_id_count
-        elif echo_prompt_chars and not has_prompt_token_ids:
+        elif echo_prompt_chars:
             adjusted_chars = _subtract_echoed_prompt_chars(
                 _extract_choice_output_char_counts(parsed_resp),
                 echo_prompt_chars,
@@ -4873,7 +4856,6 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             est_completion_chars = 0
             est_completion_chars_by_choice: Dict[int, int] = {}
             streamed_choice_token_ids_count = 0
-            saw_prompt_token_ids = False
             saw_explicit_prompt_usage = False
             saw_explicit_completion_usage = False
             saw_interim_usage = False
@@ -4950,7 +4932,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 """
                 nonlocal first_content_ttft_ms, prompt_tokens, completion_tokens
                 nonlocal est_completion_chars, streamed_choice_token_ids_count
-                nonlocal saw_prompt_token_ids, saw_explicit_prompt_usage
+                nonlocal saw_explicit_prompt_usage
                 nonlocal saw_explicit_completion_usage, saw_interim_usage
                 nonlocal saw_request_wide_usage, saw_final_usage, saw_timings_completion
                 nonlocal saw_done_sentinel, saw_upstream_error_event
@@ -5033,8 +5015,6 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         output_txt = _extract_choice_output_text(obj)
                         has_audio_out = _has_choice_audio_output(obj)
                         has_token_meta_out = _has_choice_token_metadata_output(obj)
-                        if _has_prompt_token_ids(obj):
-                            saw_prompt_token_ids = True
                         ev_token_ids_count = _extract_choice_token_id_count(obj)
                         if ev_token_ids_count > 0:
                             streamed_choice_token_ids_count += ev_token_ids_count
@@ -5663,7 +5643,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 if streamed_choice_token_ids_count > 0:
                     completion_tokens = streamed_choice_token_ids_count
                 else:
-                    if echo_prompt_chars and not saw_prompt_token_ids:
+                    if echo_prompt_chars:
                         adjusted_completion_chars = _subtract_echoed_prompt_chars(
                             est_completion_chars_by_choice,
                             echo_prompt_chars,

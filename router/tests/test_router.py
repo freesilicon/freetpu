@@ -12514,9 +12514,8 @@ asyncio.run(main())
                             ],
                         }
                     ).encode("utf-8")
-                else:
-                    # Without choice.token_ids, choice-level prompt_token_ids still suppresses
-                    # echoed-prompt subtraction so short completion text is NOT zeroed out.
+                elif mode[0] == "stream_text_only_with_return_token_ids":
+                    # return_token_ids=true without choice.token_ids still skips echo subtraction.
                     ev = json.dumps(
                         {
                             "id": "cmpl-tids-2",
@@ -12525,6 +12524,23 @@ asyncio.run(main())
                                 {
                                     "index": 0,
                                     "text": "Short answer",
+                                    "prompt_token_ids": [1, 2, 3, 4],
+                                    "finish_reason": "stop",
+                                }
+                            ],
+                        }
+                    ).encode("utf-8")
+                else:
+                    # echo=true with return_token_ids=false: vLLM echoes the prompt in text AND
+                    # may still emit prompt_token_ids; echoed prompt MUST still be subtracted.
+                    ev = json.dumps(
+                        {
+                            "id": "cmpl-tids-3",
+                            "object": "text_completion",
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "text": long_prompt + "Short answer",
                                     "prompt_token_ids": [1, 2, 3, 4],
                                     "finish_reason": "stop",
                                 }
@@ -12571,7 +12587,7 @@ asyncio.run(main())
             )
         )
 
-        # 1. With choice.token_ids + choice.prompt_token_ids: exact generated token count (3) recorded.
+        # 1. With return_token_ids=true + choice.token_ids: exact generated token count (3) recorded.
         st1, _, _ = _http_request(
             rport,
             "POST",
@@ -12587,9 +12603,9 @@ asyncio.run(main())
         self.assertEqual(st1, 200)
         self.assertEqual(recorded_usage[0].completion_tokens, 3)
 
-        # 2. Without return_token_ids or choice.token_ids, choice.prompt_token_ids still prevents
-        # subtracting the 400-char prompt from short completion text (12 chars -> 3 tokens).
-        mode[0] = "stream_text_only_with_choice_prompt_token_ids"
+        # 2. With return_token_ids=true and no choice.token_ids: short non-echoed text (12 chars -> 3 tokens)
+        # is NOT subtracted to 0.
+        mode[0] = "stream_text_only_with_return_token_ids"
         st2, _, _ = _http_request(
             rport,
             "POST",
@@ -12598,11 +12614,30 @@ asyncio.run(main())
                 "model": "m-echo-tids",
                 "prompt": long_prompt,
                 "echo": True,
+                "return_token_ids": True,
                 "stream": True,
             },
         )
         self.assertEqual(st2, 200)
         self.assertEqual(recorded_usage[1].completion_tokens, 3)
+
+        # 3. With echo=true and return_token_ids=false: even when prompt_token_ids is present,
+        # echoed 400-char prompt IS subtracted so only the 12-char completion (3 tokens) is billed.
+        mode[0] = "stream_echoed_text_with_prompt_token_ids"
+        st3, _, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/completions",
+            body={
+                "model": "m-echo-tids",
+                "prompt": long_prompt,
+                "echo": True,
+                "return_token_ids": False,
+                "stream": True,
+            },
+        )
+        self.assertEqual(st3, 200)
+        self.assertEqual(recorded_usage[2].completion_tokens, 3)
 
     def test_sse_excess_empty_choice_usage_frames_rejected_without_progress_renewal(
         self,
