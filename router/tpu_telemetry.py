@@ -212,10 +212,14 @@ def parse_prometheus_text(
     Scans line-by-line without materializing an intermediate list of all lines,
     and optionally filters to `metric_names` and caps retained samples.
     """
+    if max_samples is not None and max_samples <= 0:
+        return []
     samples: List[PromSample] = []
     pos = 0
     n = len(text)
     while pos <= n:
+        if max_samples is not None and len(samples) >= max_samples:
+            break
         nl = text.find("\n", pos)
         if nl == -1:
             raw_line = text[pos:]
@@ -230,8 +234,6 @@ def parse_prometheus_text(
         sample = _parse_prometheus_sample_line(line, allowed_names=metric_names)
         if sample is not None:
             samples.append(sample)
-            if max_samples is not None and len(samples) >= max_samples:
-                break
     return samples
 
 
@@ -321,7 +323,11 @@ class _TpuTelemetryAggregator:
                     if math.isfinite(ratio):
                         self.hbm_ratio_by_chip[chip_key] = ratio
 
-        total_chips = max(len(self.health_by_chip), self.devices_discovered)
+        total_chips = max(
+            len(self.tracked_chips),
+            len(self.health_by_chip),
+            self.devices_discovered,
+        )
         healthy_chips = sum(1 for v in self.health_by_chip.values() if v >= 1.0)
         ratios = list(self.hbm_ratio_by_chip.values())
         duties = list(self.duty_by_chip.values())

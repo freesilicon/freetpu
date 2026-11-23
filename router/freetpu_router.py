@@ -646,6 +646,69 @@ class _BoundedSSEReader:
             self._buf.extend(chunk)
 
 
+def _parse_inference_request_fields(
+    raw_req: bytes,
+    path: str,
+) -> Tuple[
+    Optional[Tuple[str, bool, int, int, bool]],
+    Optional[Tuple[int, Optional[str], str]],
+]:
+    """Decode and validate an inbound inference JSON body in an isolated scope.
+
+    Returns `((model, stream, est_prompt_tokens, expected_choices, expect_final_usage), None)`
+    on success or `(None, (status_code, error_code, message))` on validation failure.
+    Running inside a dedicated function guarantees that the decoded `str`, JSON
+    `dict`, and any nested user fields (such as `stream_options`) go out of scope
+    immediately before the router releases its JSON parse memory reservation.
+    """
+    try:
+        req_text = raw_req.decode("utf-8")
+        req_payload = json.loads(req_text)
+        del req_text
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return None, (400, None, f"Malformed JSON request: {exc}")
+
+    if not isinstance(req_payload, dict):
+        return None, (400, None, "Request JSON body must be an object")
+
+    raw_model = req_payload.get("model")
+    if not isinstance(raw_model, str):
+        return None, (400, "invalid_model_id", "Field 'model' must be a non-empty string")
+    model = raw_model.strip()
+    if not model:
+        return None, (400, "invalid_model_id", "Field 'model' is required")
+    if len(model) > MAX_MODEL_ID_LEN or any(
+        ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F for ch in model
+    ):
+        return None, (
+            400,
+            "invalid_model_id",
+            f"Field 'model' must be at most {MAX_MODEL_ID_LEN} printable characters",
+        )
+
+    raw_stream = req_payload.get("stream", False)
+    if raw_stream is None:
+        stream = False
+    elif isinstance(raw_stream, bool):
+        stream = raw_stream
+    else:
+        return None, (
+            400,
+            "invalid_stream_flag",
+            "Field 'stream' must be a JSON boolean (true or false)",
+        )
+
+    est_prompt_tokens = _estimate_prompt_tokens(req_payload)
+    expected_choices = _expected_stream_choices(path, req_payload)
+    raw_stream_opts = req_payload.get("stream_options")
+    expect_final_usage = bool(
+        stream
+        and isinstance(raw_stream_opts, Mapping)
+        and raw_stream_opts.get("include_usage") is True
+    )
+    return (model, stream, est_prompt_tokens, expected_choices, expect_final_usage), None
+
+
 def _estimate_prompt_tokens(payload: Mapping[str, Any]) -> int:
     total_chars = 0
     explicit_tokens = 0
@@ -3371,86 +3434,28 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                     return
                 req_mem_reserved[0] += extra_parse_mem
 
-            try:
-                req_text = raw_req.decode("utf-8")
-                req_payload = json.loads(req_text)
-                del req_text
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                self._send_bytes(
+            parsed_fields, parse_err = _parse_inference_request_fields(raw_req, path)
+            if parse_err is not None or parsed_fields is None:
+                err_status, err_code, err_msg = parse_err or (
                     400,
+                    None,
+                    "Malformed JSON request",
+                )
+                self._send_bytes(
+                    err_status,
                     "application/json",
-                    _openai_error_body(f"Malformed JSON request: {exc}"),
+                    _openai_error_body(err_msg, code=err_code),
                 )
                 return
-
-            if not isinstance(req_payload, dict):
-                self._send_bytes(
-                    400,
-                    "application/json",
-                    _openai_error_body("Request JSON body must be an object"),
-                )
-                return
-
-            raw_model = req_payload.get("model")
-            if not isinstance(raw_model, str):
-                self._send_bytes(
-                    400,
-                    "application/json",
-                    _openai_error_body(
-                        "Field 'model' must be a non-empty string",
-                        code="invalid_model_id",
-                    ),
-                )
-                return
-            model = raw_model.strip()
-            if not model:
-                self._send_bytes(
-                    400,
-                    "application/json",
-                    _openai_error_body(
-                        "Field 'model' is required",
-                        code="invalid_model_id",
-                    ),
-                )
-                return
-            if len(model) > MAX_MODEL_ID_LEN or any(
-                ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F for ch in model
-            ):
-                self._send_bytes(
-                    400,
-                    "application/json",
-                    _openai_error_body(
-                        f"Field 'model' must be at most {MAX_MODEL_ID_LEN} printable characters",
-                        code="invalid_model_id",
-                    ),
-                )
-                return
-
-            raw_stream = req_payload.get("stream", False)
-            if raw_stream is None:
-                stream = False
-            elif isinstance(raw_stream, bool):
-                stream = raw_stream
-            else:
-                self._send_bytes(
-                    400,
-                    "application/json",
-                    _openai_error_body(
-                        "Field 'stream' must be a JSON boolean (true or false)",
-                        code="invalid_stream_flag",
-                    ),
-                )
-                return
-            est_prompt_tokens = _estimate_prompt_tokens(req_payload)
-            expected_choices = _expected_stream_choices(path, req_payload)
-            raw_stream_opts = req_payload.get("stream_options")
-            expect_final_usage = bool(
-                stream
-                and isinstance(raw_stream_opts, Mapping)
-                and raw_stream_opts.get("include_usage") is True
-            )
-            # Release the decoded JSON tree before waiting on upstream inference.
-            del req_payload
+            (
+                model,
+                stream,
+                est_prompt_tokens,
+                expected_choices,
+                expect_final_usage,
+            ) = parsed_fields
+            # All decoded JSON containers went out of scope inside
+            # `_parse_inference_request_fields`; release the parse reservation now.
             parse_overhead = req_mem_reserved[0] - content_len
             if parse_overhead > 0:
                 engine.release_request_memory(parse_overhead)

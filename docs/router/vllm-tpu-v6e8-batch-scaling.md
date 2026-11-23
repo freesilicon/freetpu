@@ -20,19 +20,21 @@ With the preset flags (`--max-num-seqs 128`, `--max-num-batched-tokens 2048`, `-
 - **Power-of-two token-count (`num_tokens`) padding buckets** starting at `16` (`16, 32, 64, 128, 256, 512, 1024, 2048`) up to `--max-num-batched-tokens 2048` (so decode steps at `c=64` and `c=128` use distinct shapes below `256`).
 - **A single attention request bucket** sized to `--max-num-seqs 128` by default (unless attention request bucketing is explicitly enabled in the container configuration).
 
-### Persistent XLA Compilation Cache
+### Persistent Model Weights & XLA Compilation Cache
 
-Prevent 15+ minute Spot cold-start recompilation across VM preemptions by persisting XLA artifacts to preemption-safe storage (Compute Engine Local SSD is ephemeral and discarded on Spot preemption, and Cloud TPU `v6e` supports attached **Hyperdisk** rather than Persistent Disk — use a retained **Hyperdisk Balanced** (`hyperdisk-balanced`) disk reattached across replacements or a **GCS bucket**):
+The default Cloud TPU VM boot disk (`100 GiB`) cannot hold `Llama-3.3-70B-Instruct` BF16 weights (`~141 GB`) plus XLA compilation artifacts, and Compute Engine Local SSD is ephemeral and discarded on Spot preemption. Cloud TPU `v6e` supports attached **Hyperdisk** rather than Persistent Disk — attach a retained **Hyperdisk Balanced** (`hyperdisk-balanced`, `>= 250 GiB` for 70B BF16 weights + caches, `auto-delete=no`, read-write mode) mounted at `/mnt/disks/tpu-cache` for Hugging Face weights (and optionally XLA cache), or use a **GCS bucket** for shared XLA caching across Spot replacements:
 
 ```bash
-# Option A: Retained Hyperdisk Balanced (`--type=hyperdisk-balanced`) attached
-# in read-write mode (with `auto-delete=no` so the disk survives Spot preemption
-# and can be reattached/remounted on replacement v6e-8 VMs) at /var/cache/freetpu-xla-cache:
+# Option A: Retained Hyperdisk Balanced (`--type=hyperdisk-balanced`, >=250 GiB)
+# attached in read-write mode (with `auto-delete=no` so weights and caches survive
+# Spot preemption and can be reattached/remounted on replacement v6e-8 VMs):
+export HF_HUB_CACHE=/mnt/disks/tpu-cache/hf
 export JAX_COMPILATION_CACHE_DIR=/var/cache/freetpu-xla-cache
 export VLLM_XLA_CACHE_PATH=/var/cache/freetpu-xla-cache
-mkdir -p "$JAX_COMPILATION_CACHE_DIR"
+mkdir -p "$HF_HUB_CACHE" "$JAX_COMPILATION_CACHE_DIR"
 
-# Option B: Shared GCS bucket cache for ephemeral Spot fleets (recommended):
+# Option B: Shared GCS bucket for XLA cache across ephemeral Spot fleets (recommended;
+# still keep HF_HUB_CACHE on a >=250 GiB Hyperdisk Balanced volume for 70B BF16 weights):
 # export JAX_COMPILATION_CACHE_DIR="gs://${XLA_CACHE_BUCKET}/freetpu-xla-cache"
 # export VLLM_XLA_CACHE_PATH="${JAX_COMPILATION_CACHE_DIR}"
 # export LIBTPU_INIT_ARGS="--xla_tpu_enable_persistent_cache=true"
@@ -42,7 +44,7 @@ mkdir -p "$JAX_COMPILATION_CACHE_DIR"
 
 ## 3. Non-Privileged CDI Container Base Flags
 
-Per the verified Cloud TPU `v6e-8` CDI contract (no `--privileged` required; `--net=host` is required for 8-chip `libtpu` coordinator initialization):
+Per the verified Cloud TPU `v6e-8` CDI contract (no `--privileged` required; `--net=host` is required for 8-chip `libtpu` coordinator initialization). Both BF16 presets below share `CONTAINER_FLAGS`, mounting `HF_HUB_CACHE` off the boot disk so downloaded weights never fill the container writable layer:
 
 ```bash
 CONTAINER_FLAGS=(
@@ -52,6 +54,8 @@ CONTAINER_FLAGS=(
   --ulimit memlock=-1:-1
   --net=host
   --shm-size=64G
+  -v "${HF_HUB_CACHE:-/mnt/disks/tpu-cache/hf}:/hf-cache"
+  -e HF_HUB_CACHE=/hf-cache
   -v /var/cache/freetpu-xla-cache:/var/cache/freetpu-xla-cache
   -e JAX_COMPILATION_CACHE_DIR="${JAX_COMPILATION_CACHE_DIR:-/var/cache/freetpu-xla-cache}"
   -e VLLM_XLA_CACHE_PATH="${VLLM_XLA_CACHE_PATH:-/var/cache/freetpu-xla-cache}"

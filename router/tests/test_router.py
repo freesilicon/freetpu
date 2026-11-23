@@ -7295,6 +7295,8 @@ asyncio.run(main())
         self.assertIn("-e JAX_COMPILATION_CACHE_DIR=", playbook)
         self.assertIn("-e VLLM_XLA_CACHE_PATH=", playbook)
         self.assertIn("-e LIBTPU_INIT_ARGS=", playbook)
+        self.assertIn("-e HF_HUB_CACHE=/hf-cache", playbook)
+        self.assertIn("/mnt/disks/tpu-cache/hf", playbook)
         self.assertIn("Qwen/Qwen3-32B", playbook)
         self.assertIn("unsloth/Llama-3.3-70B-Instruct", playbook)
         self.assertNotIn("Preset C", playbook)
@@ -9789,6 +9791,107 @@ asyncio.run(main())
         self.assertTrue(telem_many.reachable)
         self.assertFalse(telem_many.exporter_up)
         self.assertEqual(telem_many.error, "exporter_chip_limit_exceeded")
+
+    def test_decoded_stream_options_released_before_inference(self) -> None:
+        slow_b = self._track(
+            _MockOpenAIBackend("rel-opts-b", ["m-relopts"], latency_s=0.35)
+        )
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            backends=[
+                BackendConfig(
+                    id="rel-opts-b",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=slow_b.base_url,
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+        marker = "unique-stream-opts-sentinel-987654"
+        req_body = {
+            "model": "m-relopts",
+            "stream": False,
+            "stream_options": {"include_usage": True, "blob": [marker] * 50},
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        res: Dict[str, Any] = {}
+
+        def _run() -> None:
+            st, _, _ = _http_request(
+                rport, "POST", "/v1/chat/completions", body=req_body
+            )
+            res["status"] = st
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        deadline = time.monotonic() + 2.0
+        while slow_b.current_inflight < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertGreaterEqual(slow_b.current_inflight, 1)
+
+        # Inspect active do_POST frame while request is blocked in _handle_inference:
+        # no decoded dict / stream_options container may remain in do_POST locals.
+        saw_do_post = False
+        for frame in sys._current_frames().values():
+            cur: Any = frame
+            while cur is not None:
+                if cur.f_code.co_name == "do_POST":
+                    saw_do_post = True
+                    for var_name, val in cur.f_locals.items():
+                        self.assertNotIn(
+                            var_name,
+                            ("req_payload", "raw_stream_opts", "req_text"),
+                        )
+                        self.assertFalse(
+                            isinstance(val, dict) and "include_usage" in val,
+                            f"do_POST retained decoded stream_options in local {var_name!r}",
+                        )
+                cur = cur.f_back
+        self.assertTrue(saw_do_post)
+
+        t.join(timeout=3.0)
+        self.assertEqual(res.get("status"), 200)
+        self.assertEqual(router.engine._req_mem_used_bytes, 0)
+
+    def test_tpu_readiness_counts_all_observed_chips_when_discovery_missing_or_undercounts(
+        self,
+    ) -> None:
+        # 1. Missing devices_discovered: chip 0 healthy, chip 1 reports HBM/duty only -> NOT ready.
+        missing_disc = "\n".join(
+            [
+                "freetpu_exporter_up 1",
+                'freetpu_tpu_health_status{chip="0"} 1',
+                'freetpu_tpu_hbm_utilization_ratio{chip="0"} 0.25',
+                'freetpu_tpu_hbm_utilization_ratio{chip="1"} 0.40',
+                'freetpu_tpu_duty_cycle_percent{chip="1"} 20.0',
+            ]
+        )
+        telem_missing = summarize_tpu_samples(parse_prometheus_text(missing_disc))
+        self.assertEqual(telem_missing.total_chips, 2)
+        self.assertEqual(telem_missing.healthy_chips, 1)
+        ready, reason = evaluate_tpu_readiness(telem_missing)
+        self.assertFalse(ready)
+        self.assertEqual(reason, "tpu_unhealthy")
+
+        # 2. Undercounted devices_discovered=1 with 2 observed chips -> still NOT ready.
+        undercount_disc = "freetpu_tpu_devices_discovered 1\n" + missing_disc
+        telem_under = summarize_tpu_samples(parse_prometheus_text(undercount_disc))
+        self.assertEqual(telem_under.total_chips, 2)
+        self.assertEqual(telem_under.healthy_chips, 1)
+        ready2, reason2 = evaluate_tpu_readiness(telem_under)
+        self.assertFalse(ready2)
+        self.assertEqual(reason2, "tpu_unhealthy")
+
+    def test_prometheus_parser_honors_zero_and_negative_max_samples(self) -> None:
+        text = "freetpu_exporter_up 1\nfreetpu_tpu_devices_discovered 4\n"
+        self.assertEqual(parse_prometheus_text(text, max_samples=0), [])
+        self.assertEqual(parse_prometheus_text(text, max_samples=-3), [])
+        one = parse_prometheus_text(text, max_samples=1)
+        self.assertEqual(len(one), 1)
+        self.assertEqual(one[0].name, "freetpu_exporter_up")
 
 
 def run_self_tests(verbosity: int = 1) -> int:
