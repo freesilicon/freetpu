@@ -9,6 +9,7 @@ add_library(openbuenos STATIC
   src/ob_sha256.cpp
   src/ob_dgc0.cpp
   src/ob_buffer_pool.cpp
+  src/ob_worker_pool.cpp
   src/ob_device.cpp
   src/ob_graph.cpp
   src/ob_gemm_emitter.cpp
@@ -33,7 +34,11 @@ target_include_directories(openbuenos
 )
 
 if (UNIX AND NOT APPLE)
-  target_link_libraries(openbuenos PUBLIC m)
+  if (ANDROID)
+    target_link_libraries(openbuenos PUBLIC m)
+  else()
+    target_link_libraries(openbuenos PUBLIC m pthread)
+  endif()
 elseif (APPLE)
   target_link_libraries(openbuenos PUBLIC m)
 endif()

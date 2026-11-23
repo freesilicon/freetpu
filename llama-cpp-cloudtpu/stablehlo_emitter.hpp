@@ -10,12 +10,12 @@ namespace cloudtpu {
 
 enum class TensorStorageKind {
     DENSE = 0,
-    Q8_0_SPLIT,  // Split into (qs: [B3, B2, NB, 32, N] S8, d: [B3, B2, NB, N] F16)
-    Q4_0_SPLIT,  // Split into (qs: [B3, B2, NB, 16, N] U8, d: [B3, B2, NB, N] F16)
-    Q4_K_SPLIT,  // Split into (qs: [B3, B2, NB, 16, N] U8, d_eff: [B3, B2, NB, N] F32/F16, m_eff: [B3, B2, NB, N] F32/F16)
-    Q6_K_SPLIT,  // Split into (qs: [B3, B2, NB, 16, N] S8, d_eff: [B3, B2, NB, N] F32/F16)
-    Q4_0_I4,     // Single-read K-major (qs: [B3, B2, NB, 32, N] S4/U4 or [..., N/2] U8 bitcast, d: [B3, B2, NB, N] F16)
-    Q4_K_I4,     // Single-read K-major (qs: [B3, B2, NB, 32, N] S4/U4 or [..., N/2] U8 bitcast, d_eff/m_eff: [B3, B2, NB, N] F32/F16)
+    Q8_0_SPLIT,  // K-major N-minor: (qs: [B3, B2, K/32, 32, N] S8, d: [B3, B2, K/32, N] F16)
+    Q4_0_SPLIT,  // K-major N-minor: (qs: [B3, B2, K/32, 16, N] U8, d: [B3, B2, K/32, N] F16)
+    Q4_K_SPLIT,  // K-major N-minor: (qs: [B3, B2, K/32, 16, N] U8, d_eff/m_eff: [B3, B2, K/32, N] F32/BF16)
+    Q6_K_SPLIT,  // K-major N-minor: (qs: [B3, B2, K/16, 16, N] S8, d_eff: [B3, B2, K/16, N] F32/BF16)
+    Q4_0_I4,     // Single-read K-major: (qs: [B3, B2, K/32, 32, N] S4/U4 or [..., N/2] U8 bitcast, d: [B3, B2, K/32, N] F16)
+    Q4_K_I4,     // Single-read K-major: (qs: [B3, B2, K/32, 32, N] S4/U4 or [..., N/2] U8 bitcast, d_eff/m_eff: [B3, B2, K/32, N] F32/BF16)
 };
 
 enum class TensorShardingKind {
@@ -115,7 +115,8 @@ struct GraphProgramSpec {
     std::vector<OpNodeSpec> ops;      // Topologically ordered ops
     std::vector<uint64_t> output_ids; // Live-out TensorSpec::ids
     int32_t spmd_chips = 1;           // Number of replica-SPMD chips (1 = single chip, 4 = tpu7x, 8 = v6e-8)
-    bool bf16_matmul = true;          // Dequantize quantized/low-bit weights & activations to BF16 for MXU
+    bool bf16_matmul = true;          // Cast split-quantized weights & activations to BF16 for MXU (dense F16/F32 stay F32)
+    bool bf16_flash_attn = false;     // Opt-in BF16 Q/K/probs/V matmuls in FLASH_ATTN_EXT (default false: F32 parity)
     bool q4_split_dot = true;         // Q4_0/Q4_K: true = two split-X dots (zero concat); false = single concat dot
     int32_t mm_pad_m = 8;             // Pad small BF16 Q4_*_I4/Q6_K_SPLIT M < mm_pad_m up to mm_pad_m for MXU (<=1 disables)
 };

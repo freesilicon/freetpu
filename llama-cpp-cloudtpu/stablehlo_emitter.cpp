@@ -7,14 +7,24 @@
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
+#include <limits>
+#include <locale>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
 
 namespace cloudtpu {
 
-std::string format_mlir_tensor_type(PjrtDType dtype, const std::vector<int64_t>& dims) {
+namespace {
+std::ostringstream make_classic_stream() {
     std::ostringstream oss;
+    oss.imbue(std::locale::classic());
+    return oss;
+}
+}  // namespace
+
+std::string format_mlir_tensor_type(PjrtDType dtype, const std::vector<int64_t>& dims) {
+    std::ostringstream oss = make_classic_stream();
     oss << "tensor<";
     for (int64_t d : dims) {
         oss << d << "x";
@@ -35,15 +45,19 @@ struct SsaValue {
 
 std::string format_f32_literal(float v) {
     if (!std::isfinite(v)) {
-        v = (v < 0.0f) ? -3.40282347e+38f : 3.40282347e+38f;
+        uint32_t bits = 0;
+        std::memcpy(&bits, &v, sizeof(bits));
+        std::ostringstream oss = make_classic_stream();
+        oss << "0x" << std::uppercase << std::hex << std::setw(8) << std::setfill('0') << bits;
+        return oss.str();
     }
-    std::ostringstream oss;
+    std::ostringstream oss = make_classic_stream();
     oss << std::scientific << std::setprecision(8) << v;
     return oss.str();
 }
 
 std::string format_dims_bracket(const std::vector<int64_t>& dims) {
-    std::ostringstream oss;
+    std::ostringstream oss = make_classic_stream();
     oss << "[";
     for (size_t i = 0; i < dims.size(); ++i) {
         if (i > 0) oss << ", ";
@@ -55,6 +69,7 @@ std::string format_dims_bracket(const std::vector<int64_t>& dims) {
 
 class StableHloBuilder {
 public:
+    StableHloBuilder() { body_.imbue(std::locale::classic()); }
     void add_arg(const std::string& arg_name,
                  PjrtDType dtype,
                  const std::vector<int64_t>& dims,
@@ -66,6 +81,11 @@ public:
     SsaValue arg_val(size_t idx) const { return args_.at(idx); }
 
     SsaValue emit_const_splat_f32(float val, const std::vector<int64_t>& dims, PjrtDType dt = PjrtDType::F32) {
+        if (!std::isfinite(val) && dt != PjrtDType::F32) {
+            // MLIR 32-bit IEEE hex float literals require f32; convert cleanly to target float type.
+            SsaValue f32_val = emit_const_splat_f32(val, dims, PjrtDType::F32);
+            return emit_convert(f32_val, dt);
+        }
         SsaValue out = next_val(dt, dims);
         body_ << "    " << out.name << " = stablehlo.constant dense<" << format_f32_literal(val)
               << "> : " << out.mlir_type() << "\n";
@@ -122,6 +142,30 @@ public:
         SsaValue out = next_val(a.dtype, a.dims);
         body_ << "    " << out.name << " = " << op_name << " " << a.name << ", " << b.name
               << " : " << out.mlir_type() << "\n";
+        return out;
+    }
+
+    SsaValue emit_compare(const char* dir, const SsaValue& a, const SsaValue& b) {
+        SsaValue out = next_val(PjrtDType::PRED, a.dims);
+        const char* cmp_type = "FLOAT";
+        if (a.dtype == PjrtDType::S4 || a.dtype == PjrtDType::S8 || a.dtype == PjrtDType::S16 ||
+            a.dtype == PjrtDType::S32 || a.dtype == PjrtDType::S64) {
+            cmp_type = "SIGNED";
+        } else if (a.dtype == PjrtDType::U4 || a.dtype == PjrtDType::U8 || a.dtype == PjrtDType::U32 ||
+                   a.dtype == PjrtDType::PRED) {
+            cmp_type = "UNSIGNED";
+        }
+        body_ << "    " << out.name << " = stablehlo.compare " << dir << ", " << a.name << ", " << b.name
+              << ", " << cmp_type << " : (" << a.mlir_type() << ", " << b.mlir_type() << ") -> "
+              << out.mlir_type() << "\n";
+        return out;
+    }
+
+    SsaValue emit_select(const SsaValue& pred, const SsaValue& on_true, const SsaValue& on_false) {
+        SsaValue out = next_val(on_true.dtype, on_true.dims);
+        body_ << "    " << out.name << " = \"stablehlo.select\"(" << pred.name << ", " << on_true.name
+              << ", " << on_false.name << ") : (" << pred.mlir_type() << ", " << on_true.mlir_type()
+              << ", " << on_false.mlir_type() << ") -> " << out.mlir_type() << "\n";
         return out;
     }
 
@@ -382,7 +426,7 @@ public:
     }
 
     static std::string format_replica_groups_1d(int32_t num_chips) {
-        std::ostringstream oss;
+        std::ostringstream oss = make_classic_stream();
         oss << "dense<[[";
         for (int32_t i = 0; i < num_chips; ++i) {
             if (i > 0) oss << ", ";
@@ -411,6 +455,12 @@ public:
     }
 
     SsaValue emit_all_gather(const SsaValue& x, int64_t gather_dim, int32_t num_chips) {
+        if (num_chips <= 0) {
+            throw std::invalid_argument("emit_all_gather: num_chips must be positive");
+        }
+        if (gather_dim < 0 || static_cast<size_t>(gather_dim) >= x.dims.size()) {
+            throw std::invalid_argument("emit_all_gather: gather_dim out of bounds");
+        }
         std::vector<int64_t> out_dims = x.dims;
         out_dims[static_cast<size_t>(gather_dim)] *= static_cast<int64_t>(num_chips);
         SsaValue out = next_val(x.dtype, out_dims);
@@ -423,9 +473,15 @@ public:
     }
 
     SsaValue emit_reduce_scatter(const SsaValue& x, int64_t scatter_dim, int32_t num_chips, const char* reducer_op) {
+        if (num_chips <= 0) {
+            throw std::invalid_argument("emit_reduce_scatter: num_chips must be positive");
+        }
+        if (scatter_dim < 0 || static_cast<size_t>(scatter_dim) >= x.dims.size()) {
+            throw std::invalid_argument("emit_reduce_scatter: scatter_dim out of bounds");
+        }
         std::vector<int64_t> out_dims = x.dims;
         if (out_dims[static_cast<size_t>(scatter_dim)] % num_chips != 0) {
-            throw std::runtime_error("emit_reduce_scatter: scatter_dim not divisible by num_chips");
+            throw std::invalid_argument("emit_reduce_scatter: scatter_dim not divisible by num_chips");
         }
         out_dims[static_cast<size_t>(scatter_dim)] /= static_cast<int64_t>(num_chips);
         SsaValue out = next_val(x.dtype, out_dims);
@@ -447,7 +503,7 @@ public:
     }
 
     std::string finish(const std::vector<SsaValue>& outputs) const {
-        std::ostringstream mod;
+        std::ostringstream mod = make_classic_stream();
         mod << "module @ggml_cloudtpu {\n";
         mod << "  func.func public @main(";
         for (size_t i = 0; i < args_.size(); ++i) {
@@ -486,13 +542,13 @@ public:
 
 private:
     SsaValue next_val(PjrtDType dt, std::vector<int64_t> dims) {
-        std::ostringstream oss;
+        std::ostringstream oss = make_classic_stream();
         oss << "%v" << next_id_++;
         return {oss.str(), dt, std::move(dims)};
     }
 
     std::string next_tmp_name(const char* prefix) {
-        std::ostringstream oss;
+        std::ostringstream oss = make_classic_stream();
         oss << "%" << prefix << "_" << next_id_++;
         return oss.str();
     }
@@ -591,10 +647,10 @@ SsaValue materialize_q4_i4_nibbles(StableHloBuilder& b,
 
 // TPU-native K-major N-minor dequantization (zero minor-dim tile padding, zero weight reshape,
 // zero broadcast reshape):
-//   Q8_0_SPLIT: qs [B3, B2, NB, 32, N] S8,      d [B3, B2, NB, N] F16     -> [B3, B2, NB, 32, N]
-//   Q6_K_SPLIT: qs [B3, B2, NB, 16, N] S8,      d [B3, B2, NB, N] F32/F16 -> [B3, B2, NB, 16, N]
-//   Q4_0_I4:    qs [B3, B2, NB, 32, N] S4/U4,   d [B3, B2, NB, N] F16     -> [B3, B2, NB, 32, N]
-//   Q4_K_I4:    qs [B3, B2, NB, 32, N] S4/U4, d/m [B3, B2, NB, N] F32/F16 -> [B3, B2, NB, 32, N]
+//   Q8_0_SPLIT: qs [B3, B2, NB, 32, N] S8,      d [B3, B2, NB, N] F16      -> [B3, B2, NB, 32, N]
+//   Q6_K_SPLIT: qs [B3, B2, NB, 16, N] S8,      d [B3, B2, NB, N] F32/BF16 -> [B3, B2, NB, 16, N]
+//   Q4_0_I4:    qs [B3, B2, NB, 32, N] S4/U4,   d [B3, B2, NB, N] F16      -> [B3, B2, NB, 32, N]
+//   Q4_K_I4:    qs [B3, B2, NB, 32, N] S4/U4, d/m [B3, B2, NB, N] F32/BF16 -> [B3, B2, NB, 32, N]
 SsaValue dequantize_k_major_blocks(StableHloBuilder& b,
                                    TensorStorageKind storage,
                                    const SsaValue& qs,
@@ -822,7 +878,7 @@ std::string build_canonical_cache_key(const std::string& mlir_text, int32_t spmd
     // exact length, SPMD chip count, and non-default mm_pad_m to prevent collisions without external SHA libraries.
     const uint64_t h1 = fnv1a_64(mlir_text);
     const uint64_t h2 = fnv1a_64(std::string("cloudtpu_v1:") + mlir_text);
-    std::ostringstream oss;
+    std::ostringstream oss = make_classic_stream();
     oss << std::hex << std::setfill('0') << std::setw(16) << h1
         << std::setw(16) << h2 << "_" << std::dec << mlir_text.size() << "_p" << spmd_chips;
     if (mm_pad_m != 8) {
@@ -842,6 +898,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
         TensorStorageKind storage = TensorStorageKind::DENSE;
         TensorShardingKind sharding = TensorShardingKind::REPLICATED;
         PjrtDType bitcast_target = PjrtDType::S4;
+        int64_t logical_k = 0;
         SsaValue dense;
         SsaValue q_qs;
         SsaValue q_d;
@@ -857,6 +914,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
         th.storage = in.storage;
         th.sharding = (P > 1) ? in.sharding : TensorShardingKind::REPLICATED;
         th.bitcast_target = (in.bitcast_target != PjrtDType::INVALID) ? in.bitcast_target : PjrtDType::S4;
+        th.logical_k = in.dims[3];
         const int64_t B3 = in.dims[0];
         const int64_t B2 = in.dims[1];
         int64_t M_or_N = in.dims[2];
@@ -926,7 +984,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
             th.q_qs = builder.arg_val(arg_idx - 1);
             prog.input_bindings.push_back({in.id, 0, q_dt, std::move(qs_dims), false});
 
-            std::vector<int64_t> d_dims = {B3, B2, NB, M_or_N};
+            const std::vector<int64_t> d_dims = {B3, B2, NB, M_or_N};
             const std::string d_name = "%arg" + std::to_string(arg_idx++);
             builder.add_arg(d_name, d_dt, d_dims);
             th.q_d = builder.arg_val(arg_idx - 1);
@@ -937,7 +995,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                 builder.add_arg(m_name, d_dt, d_dims);
                 th.q_m = builder.arg_val(arg_idx - 1);
                 th.has_q_m = true;
-                prog.input_bindings.push_back({in.id, 2, d_dt, std::move(d_dims), false});
+                prog.input_bindings.push_back({in.id, 2, d_dt, d_dims, false});
             }
         }
         env[in.id] = std::move(th);
@@ -977,9 +1035,8 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                 SsaValue x = (x_sh == TensorShardingKind::SHARD_K && w_sh == TensorShardingKind::SHARD_K)
                                  ? resolve_dense(op.src_ids.at(1), PjrtDType::F32)
                                  : resolve_replicated(op.src_ids.at(1), PjrtDType::F32);
-                const bool w_is_f32_dense =
-                    (w_th.storage == TensorStorageKind::DENSE && w_th.dense.dtype == PjrtDType::F32);
-                const bool use_bf16_mxu = spec.bf16_matmul && !op.high_precision && !w_is_f32_dense;
+                const bool w_is_quant_split = (w_th.storage != TensorStorageKind::DENSE);
+                const bool use_bf16_mxu = spec.bf16_matmul && !op.high_precision && w_is_quant_split;
                 const PjrtDType deq_dt =
                     use_bf16_mxu ? PjrtDType::BF16
                                  : ((op.high_precision || x.dtype == PjrtDType::F32) ? PjrtDType::F32 : PjrtDType::BF16);
@@ -1002,10 +1059,11 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                             x, {zero_i32, zero_i32, zero_i32, k_off}, {x.dims[0], x.dims[1], x.dims[2], K_local});
                     }
 
-                    const PjrtDType mm_dt = use_bf16_mxu ? PjrtDType::BF16
-                                                         : ((deq_dt == PjrtDType::F32 || x.dtype == PjrtDType::F32)
-                                                                ? PjrtDType::F32
-                                                                : PjrtDType::BF16);
+                    const PjrtDType mm_dt =
+                        use_bf16_mxu ? PjrtDType::BF16
+                                     : ((op.high_precision || deq_dt == PjrtDType::F32 || x.dtype == PjrtDType::F32)
+                                            ? PjrtDType::F32
+                                            : PjrtDType::BF16);
                     x = builder.emit_convert(x, mm_dt);
 
                     auto bcast_w5_batch = [&](SsaValue& wt) {
@@ -1063,7 +1121,8 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                             builder, w_th.storage, w_th.q_qs, w_th.q_d,
                             nullptr, w_th.bitcast_target, mm_dt);
                         bcast_w5_batch(w_km);
-                        SsaValue x_blk = builder.emit_reshape(x_mm, {x_mm.dims[0], x_mm.dims[1], x_mm.dims[2], NB_local, blk_elems});
+                        SsaValue x_blk = builder.emit_reshape(
+                            x_mm, {x_mm.dims[0], x_mm.dims[1], x_mm.dims[2], NB_local, blk_elems});
                         local_out = builder.emit_dot_general(
                             x_blk, w_km, {0, 1}, {0, 1}, {3, 4}, {2, 3}, dot_out_dims, op.dst.dtype,
                             op.high_precision);
@@ -1182,9 +1241,9 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
 
                 SsaValue w = resolve_dense(op.src_ids.at(0), deq_dt);
 
-                if (use_bf16_mxu) {
-                    w = builder.emit_convert(w, PjrtDType::BF16);
-                    x = builder.emit_convert(x, PjrtDType::BF16);
+                if (op.high_precision) {
+                    w = builder.emit_convert(w, PjrtDType::F32);
+                    x = builder.emit_convert(x, PjrtDType::F32);
                 } else if (w.dtype != x.dtype) {
                     const PjrtDType common =
                         (w.dtype == PjrtDType::F32 || x.dtype == PjrtDType::F32) ? PjrtDType::F32 : PjrtDType::BF16;
@@ -1421,7 +1480,9 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                 SsaValue zero = builder.emit_const_splat_f32(0.0f, {}, PjrtDType::F32);
                 SsaValue rsum = builder.emit_reduce_axis(exps, zero, 3, "stablehlo.add");
                 SsaValue rsum_b = builder.emit_broadcast_in_dim(rsum, {0, 1, 2}, s.dims);
-                SsaValue probs = builder.emit_binary("stablehlo.divide", exps, rsum_b);
+                SsaValue one_f = builder.emit_const_splat_f32(1.0f, s.dims, PjrtDType::F32);
+                SsaValue safe_rsum = builder.emit_binary("stablehlo.maximum", rsum_b, one_f);
+                SsaValue probs = builder.emit_binary("stablehlo.divide", exps, safe_rsum);
                 result = builder.emit_convert(probs, op.dst.dtype);
                 break;
             }
@@ -1436,20 +1497,43 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                 SsaValue idx3 = builder.emit_iota(0, idx_col_dims, PjrtDType::S32);
                 SsaValue idx2 = builder.emit_iota(1, idx_col_dims, PjrtDType::S32);
                 SsaValue idx1 = builder.emit_reshape(idx_raw, idx_col_dims);
-                SsaValue start_indices = builder.emit_concatenate({idx3, idx2, idx1}, 3);
 
-                if (P > 1 && tbl.sharding == TensorShardingKind::SHARD_N) {
-                    // Fallback for row-sharded tables: all-gather along row dim then gather.
-                    SsaValue full_tbl = resolve_replicated(op.src_ids.at(0), op.dst.dtype);
-                    SsaValue gathered = builder.emit_gather_3d_rows(full_tbl, start_indices, dst_dims);
-                    result = builder.emit_convert(gathered, op.dst.dtype);
-                } else if (tbl.storage == TensorStorageKind::DENSE) {
+                const bool is_shard_n = (P > 1 && tbl.sharding == TensorShardingKind::SHARD_N);
+                SsaValue start_indices;
+                SsaValue eff_idx1 = idx1;
+                SsaValue in_range;
+                if (is_shard_n) {
+                    // Row-sharded lookup: gather only the N_idx requested rows on each replica's
+                    // local shard, mask out non-local rows to 0, and all_reduce(add) the small
+                    // [B3, B2, N_idx, K] result instead of all-gathering the entire table.
+                    // K-major quantized tables store N along dim 3 ([B3, B2, NB, N_local]).
+                    const int64_t local_rows =
+                        (tbl.storage == TensorStorageKind::DENSE) ? tbl.dense.dims[2] : tbl.q_d.dims[3];
+                    SsaValue rid_s32 = builder.emit_convert(builder.emit_replica_id(), PjrtDType::S32);
+                    SsaValue rid_b = builder.emit_broadcast_in_dim(rid_s32, {}, idx_col_dims);
+                    SsaValue local_rows_c = builder.emit_const_splat_int(local_rows, idx_col_dims, PjrtDType::S32);
+                    SsaValue row_start = builder.emit_binary("stablehlo.multiply", rid_b, local_rows_c);
+                    SsaValue row_end = builder.emit_binary("stablehlo.add", row_start, local_rows_c);
+                    SsaValue ge_start = builder.emit_compare("GE", idx1, row_start);
+                    SsaValue lt_end = builder.emit_compare("LT", idx1, row_end);
+                    in_range = builder.emit_binary("stablehlo.and", ge_start, lt_end);
+
+                    SsaValue rel_idx = builder.emit_binary("stablehlo.subtract", idx1, row_start);
+                    SsaValue zero_idx = builder.emit_const_splat_int(0, idx_col_dims, PjrtDType::S32);
+                    SsaValue max_idx = builder.emit_const_splat_int(
+                        std::max<int64_t>(0, local_rows - 1), idx_col_dims, PjrtDType::S32);
+                    SsaValue clamped_lo = builder.emit_binary("stablehlo.maximum", rel_idx, zero_idx);
+                    eff_idx1 = builder.emit_binary("stablehlo.minimum", clamped_lo, max_idx);
+                    start_indices = builder.emit_concatenate({idx3, idx2, eff_idx1}, 3);
+                } else {
+                    start_indices = builder.emit_concatenate({idx3, idx2, idx1}, 3);
+                }
+
+                SsaValue local_rows_val;
+                if (tbl.storage == TensorStorageKind::DENSE) {
                     const std::vector<int64_t> local_dst = {B3, B2, N_idx, tbl.dense.dims[3]};
                     SsaValue gathered = builder.emit_gather_3d_rows(tbl.dense, start_indices, local_dst);
-                    SsaValue conv = builder.emit_convert(gathered, op.dst.dtype);
-                    result = (P > 1 && tbl.sharding == TensorShardingKind::SHARD_K)
-                                 ? builder.emit_all_gather(conv, 3, P)
-                                 : conv;
+                    local_rows_val = builder.emit_convert(gathered, op.dst.dtype);
                 } else {
                     // Gather only the selected N_idx rows along the last axis (N) from K-major tables,
                     // producing row-major [B3, B2, N_idx, NB, qs_blk] + [B3, B2, N_idx, NB], then dequantize!
@@ -1460,10 +1544,10 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                     if ((tbl.storage == TensorStorageKind::Q4_0_I4 ||
                          tbl.storage == TensorStorageKind::Q4_K_I4) &&
                         tbl.q_qs.dtype == PjrtDType::U8) {
-                        // Packed bitcast U8 [..., 32, N/2]: gather byte idx >> 1 in ui8, extract nibble (idx & 1).
+                        // Packed bitcast U8 [..., 32, N_local/2]: gather byte (eff_idx1 >> 1), extract nibble (eff_idx1 & 1).
                         SsaValue one = builder.emit_const_splat_int(1, idx_col_dims, PjrtDType::S32);
-                        SsaValue byte_idx1 = builder.emit_binary("stablehlo.shift_right_logical", idx1, one);
-                        SsaValue nib_sel = builder.emit_binary("stablehlo.and", idx1, one);
+                        SsaValue byte_idx1 = builder.emit_binary("stablehlo.shift_right_logical", eff_idx1, one);
+                        SsaValue nib_sel = builder.emit_binary("stablehlo.and", eff_idx1, one);
                         SsaValue byte_start_indices = builder.emit_concatenate({idx3, idx2, byte_idx1}, 3);
                         SsaValue g_u8 = builder.emit_gather_3d_last_axis(
                             tbl.q_qs, byte_start_indices, {B3, B2, N_idx, NB, qs_blk});
@@ -1497,11 +1581,26 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                             tbl.q_m, start_indices, {B3, B2, N_idx, NB});
                         g_m_ptr = &g_m;
                     }
-                    SsaValue local_deq = dequantize_row_major_blocks(
+                    local_rows_val = dequantize_row_major_blocks(
                         builder, tbl.storage, g_qs, g_d, g_m_ptr, eff_q_dt, op.dst.dtype);
-                    result = (P > 1 && tbl.sharding == TensorShardingKind::SHARD_K)
-                                 ? builder.emit_all_gather(local_deq, 3, P)
-                                 : local_deq;
+                }
+
+                if (is_shard_n) {
+                    SsaValue mask_b = builder.emit_broadcast_in_dim(in_range, {0, 1, 2, 3}, dst_dims);
+                    const bool dst_is_int = (op.dst.dtype == PjrtDType::PRED || op.dst.dtype == PjrtDType::S4 ||
+                                             op.dst.dtype == PjrtDType::U4 || op.dst.dtype == PjrtDType::S8 ||
+                                             op.dst.dtype == PjrtDType::U8 || op.dst.dtype == PjrtDType::S16 ||
+                                             op.dst.dtype == PjrtDType::S32 || op.dst.dtype == PjrtDType::U32 ||
+                                             op.dst.dtype == PjrtDType::S64);
+                    SsaValue zeros_dst = dst_is_int
+                                             ? builder.emit_const_splat_int(0, dst_dims, op.dst.dtype)
+                                             : builder.emit_const_splat_f32(0.0f, dst_dims, op.dst.dtype);
+                    SsaValue masked = builder.emit_select(mask_b, local_rows_val, zeros_dst);
+                    result = builder.emit_all_reduce(masked, P, "stablehlo.add");
+                } else if (P > 1 && tbl.sharding == TensorShardingKind::SHARD_K) {
+                    result = builder.emit_all_gather(local_rows_val, 3, P);
+                } else {
+                    result = local_rows_val;
                 }
                 break;
             }
@@ -1514,26 +1613,40 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                 const int64_t B3 = upd.dims[0];
                 const int64_t B2 = upd.dims[1];
                 const int64_t N_upd = upd.dims[2];
+                // Preserve S64 indices to avoid truncating valid >INT32_MAX row indices.
+                const PjrtDType idx_dt =
+                    (idx_raw.dtype == PjrtDType::S64) ? PjrtDType::S64 : PjrtDType::S32;
                 // Single-token decode fast path: emit O(1) in-place dynamic_update_slice instead of
                 // scatter when updating a single contiguous row slice across all batches/heads.
+                // Guard out-of-range indices (< 0 or >= n_rows) by selecting the existing row at
+                // the clamped destination before the update, matching scatter's discard semantics
+                // while keeping dynamic_update_slice as the sole final user of tbl for in-place donation.
                 if (N_upd == 1 && idx_raw.dims[0] == 1 && idx_raw.dims[1] == 1 &&
                     idx_raw.dims[2] == 1 && idx_raw.dims[3] == 1 &&
                     upd.dims[0] == tbl.dims[0] && upd.dims[1] == tbl.dims[1] && upd.dims[3] == tbl.dims[3]) {
-                    SsaValue idx_s32 = builder.emit_convert(idx_raw, PjrtDType::S32);
-                    SsaValue row_scalar = builder.emit_reshape(idx_s32, {});
-                    SsaValue zero_i32 = builder.emit_const_splat_int(0, {}, PjrtDType::S32);
+                    SsaValue idx_typed = builder.emit_convert(idx_raw, idx_dt);
+                    SsaValue row_scalar = builder.emit_reshape(idx_typed, {});
+                    SsaValue zero_idx = builder.emit_const_splat_int(0, {}, idx_dt);
+                    SsaValue n_rows_c = builder.emit_const_splat_int(tbl.dims[2], {}, idx_dt);
+                    SsaValue ge_zero = builder.emit_compare("GE", row_scalar, zero_idx);
+                    SsaValue lt_rows = builder.emit_compare("LT", row_scalar, n_rows_c);
+                    SsaValue in_bounds = builder.emit_binary("stablehlo.and", ge_zero, lt_rows);
+                    SsaValue in_bounds_b = builder.emit_broadcast_in_dim(in_bounds, {}, upd.dims);
+                    SsaValue cur_row = builder.emit_dynamic_slice(
+                        tbl, {zero_idx, zero_idx, row_scalar, zero_idx}, upd.dims);
+                    SsaValue safe_upd = builder.emit_select(in_bounds_b, upd, cur_row);
                     SsaValue updated = builder.emit_dynamic_update_slice(
-                        tbl, upd, {zero_i32, zero_i32, row_scalar, zero_i32});
+                        tbl, safe_upd, {zero_idx, zero_idx, row_scalar, zero_idx});
                     result = builder.emit_convert(updated, op.dst.dtype);
                     break;
                 }
                 // idx_raw GGML [N_upd, B2_i, B3_i, 1] -> HLO [1, B3_i, B2_i, N_upd] -> reshape [B3_i, B2_i, N_upd, 1]
-                SsaValue idx_s32 = builder.emit_convert(idx_raw, PjrtDType::S32);
-                SsaValue idx_4d = builder.emit_reshape(idx_s32, {idx_raw.dims[1], idx_raw.dims[2], idx_raw.dims[3], 1});
+                SsaValue idx_typed = builder.emit_convert(idx_raw, idx_dt);
+                SsaValue idx_4d = builder.emit_reshape(idx_typed, {idx_raw.dims[1], idx_raw.dims[2], idx_raw.dims[3], 1});
                 const std::vector<int64_t> idx_col_dims = {B3, B2, N_upd, 1};
                 SsaValue idx_b = broadcast_4d(builder, idx_4d, idx_col_dims);
-                SsaValue idx3 = builder.emit_iota(0, idx_col_dims, PjrtDType::S32);
-                SsaValue idx2 = builder.emit_iota(1, idx_col_dims, PjrtDType::S32);
+                SsaValue idx3 = builder.emit_iota(0, idx_col_dims, idx_dt);
+                SsaValue idx2 = builder.emit_iota(1, idx_col_dims, idx_dt);
                 SsaValue scatter_indices = builder.emit_concatenate({idx3, idx2, idx_b}, 3);
                 SsaValue scattered = builder.emit_scatter_3d_rows(tbl, scatter_indices, upd);
                 result = builder.emit_convert(scattered, op.dst.dtype);
@@ -1541,11 +1654,18 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
             }
             case CloudOpKind::ADD:
             case CloudOpKind::MUL: {
-                const TensorShardingKind a_sh = env.at(op.src_ids.at(0)).sharding;
-                const TensorShardingKind b_sh = env.at(op.src_ids.at(1)).sharding;
+                const TensorHandle& a_th = env.at(op.src_ids.at(0));
+                const TensorHandle& b_th = env.at(op.src_ids.at(1));
                 SsaValue a, b;
                 std::vector<int64_t> calc_dims = dst_dims;
-                if (P > 1 && a_sh == TensorShardingKind::SHARD_K && b_sh == TensorShardingKind::SHARD_K) {
+                // Only run the local SHARD_K fast path when both operands have equal logical K
+                // widths matching the output; unequal K widths require periodic repeat-broadcast
+                // over the full logical K axis, so gather via resolve_replicated first.
+                if (P > 1 &&
+                    a_th.sharding == TensorShardingKind::SHARD_K &&
+                    b_th.sharding == TensorShardingKind::SHARD_K &&
+                    a_th.logical_k == b_th.logical_k &&
+                    a_th.logical_k == dst_dims[3]) {
                     a = resolve_dense(op.src_ids.at(0), op.dst.dtype);
                     b = resolve_dense(op.src_ids.at(1), op.dst.dtype);
                     calc_dims[3] /= P;
@@ -1618,7 +1738,9 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                 SsaValue a = resolve_dense(op.src_ids.at(0), op.dst.dtype);
                 SsaValue c = builder.emit_convert(a, op.dst.dtype);
                 result = builder.emit_reduce_scatter(c, op.collective_dim, P, "stablehlo.add");
-                out_sharding = (op.collective_dim == 2) ? TensorShardingKind::SHARD_N : TensorShardingKind::SHARD_K;
+                // Keep explicit reduce_scatter outputs replica-local so downstream CPY/RESHAPE
+                // operates on the scattered shape rather than all-gathering into a mismatched shape.
+                out_sharding = TensorShardingKind::REPLICATED;
                 break;
             }
             case CloudOpKind::FLASH_ATTN_EXT: {
@@ -1649,7 +1771,39 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
 
                 // scores = q @ k^T : [B, H_Q, N_Q, N_KV]
                 const std::vector<int64_t> sc_dims = {B, H_Q, N_Q, N_KV};
-                const bool use_bf16_attn = spec.bf16_matmul && !op.high_precision;
+                const bool has_mask = (op.src_ids.size() > 3 && op.src_ids[3] != 0);
+                SsaValue m_b;
+                SsaValue visible;
+                SsaValue zeros_sc;
+                SsaValue neg_inf_sc;
+                SsaValue zero_scalar = builder.emit_const_splat_f32(0.0f, {}, PjrtDType::F32);
+
+                if (has_mask) {
+                    SsaValue m = builder.emit_convert(resolve_replicated(op.src_ids[3], PjrtDType::F32), PjrtDType::F32);
+                    if (m.dims[2] > N_Q) {
+                        m = builder.emit_slice(m, {0, 0, 0, 0}, {m.dims[0], m.dims[1], N_Q, m.dims[3]});
+                    }
+                    m_b = broadcast_4d(builder, m, sc_dims);
+                    neg_inf_sc = builder.emit_const_splat_f32(
+                        -std::numeric_limits<float>::infinity(), sc_dims, PjrtDType::F32);
+                    visible = builder.emit_compare("GT", m_b, neg_inf_sc);
+                    zeros_sc = builder.emit_const_splat_f32(0.0f, sc_dims, PjrtDType::F32);
+                    SsaValue ones_sc = builder.emit_const_splat_f32(1.0f, sc_dims, PjrtDType::F32);
+                    SsaValue vis_f32 = builder.emit_select(visible, ones_sc, zeros_sc);
+                    SsaValue any_vis_f32 = builder.emit_reduce_axis(vis_f32, zero_scalar, 2, "stablehlo.maximum");
+                    SsaValue any_vis = builder.emit_compare(
+                        "GT", any_vis_f32, builder.emit_const_splat_f32(0.0f, {B, H_Q, N_KV}, PjrtDType::F32));
+                    // Zero out K and V rows that are masked for every query before matmuls so
+                    // uninitialized/other-sequence non-finite KV entries cannot contaminate results.
+                    SsaValue any_vis_k = builder.emit_broadcast_in_dim(any_vis, {0, 1, 2}, {B, H_Q, N_KV, DK});
+                    k = builder.emit_select(
+                        any_vis_k, k, builder.emit_const_splat_f32(0.0f, {B, H_Q, N_KV, DK}, PjrtDType::F32));
+                    SsaValue any_vis_v = builder.emit_broadcast_in_dim(any_vis, {0, 1, 2}, {B, H_Q, N_KV, DV});
+                    v = builder.emit_select(
+                        any_vis_v, v, builder.emit_const_splat_f32(0.0f, {B, H_Q, N_KV, DV}, PjrtDType::F32));
+                }
+
+                const bool use_bf16_attn = spec.bf16_flash_attn && !op.high_precision;
                 SsaValue q_mm = use_bf16_attn ? builder.emit_convert(q, PjrtDType::BF16) : q;
                 SsaValue k_mm = use_bf16_attn ? builder.emit_convert(k, PjrtDType::BF16) : k;
                 SsaValue scores = builder.emit_dot_general(
@@ -1658,7 +1812,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                     SsaValue sc = builder.emit_const_splat_f32(op.flash_attn.scale, sc_dims, PjrtDType::F32);
                     scores = builder.emit_binary("stablehlo.multiply", scores, sc);
                 }
-                if (op.flash_attn.logit_softcap > 0.0f) {
+                if (op.flash_attn.logit_softcap != 0.0f) {
                     const float cap = op.flash_attn.logit_softcap;
                     SsaValue inv_cap = builder.emit_const_splat_f32(1.0f / cap, sc_dims, PjrtDType::F32);
                     SsaValue cap_c = builder.emit_const_splat_f32(cap, sc_dims, PjrtDType::F32);
@@ -1666,12 +1820,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                     scores = builder.emit_unary("stablehlo.tanh", scores);
                     scores = builder.emit_binary("stablehlo.multiply", scores, cap_c);
                 }
-                if (op.src_ids.size() > 3 && op.src_ids[3] != 0) {
-                    SsaValue m = builder.emit_convert(resolve_replicated(op.src_ids[3], PjrtDType::F32), PjrtDType::F32);
-                    if (m.dims[2] > N_Q) {
-                        m = builder.emit_slice(m, {0, 0, 0, 0}, {m.dims[0], m.dims[1], N_Q, m.dims[3]});
-                    }
-                    m = broadcast_4d(builder, m, sc_dims);
+                if (has_mask) {
                     if (op.flash_attn.max_bias > 0.0f) {
                         const uint32_t n_head = static_cast<uint32_t>(H_Q);
                         const uint32_t n_head_log2 = 1U << static_cast<uint32_t>(std::floor(std::log2(n_head)));
@@ -1685,27 +1834,56 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                         }
                         SsaValue sl_c = builder.emit_const_1d_f32(slopes, {1, H_Q, 1, 1});
                         SsaValue sl_b = builder.emit_broadcast_in_dim(sl_c, {0, 1, 2, 3}, sc_dims);
-                        m = builder.emit_binary("stablehlo.multiply", m, sl_b);
+                        m_b = builder.emit_binary("stablehlo.multiply", m_b, sl_b);
                     }
-                    scores = builder.emit_binary("stablehlo.add", scores, m);
+                    SsaValue scores_added = builder.emit_binary("stablehlo.add", scores, m_b);
+                    scores = builder.emit_select(visible, scores_added, neg_inf_sc);
                 }
 
                 // Softmax along N_KV (dim 3)
-                SsaValue neg_inf = builder.emit_const_splat_f32(-3.40282347e+38f, {}, PjrtDType::F32);
-                SsaValue rmax = builder.emit_reduce_axis(scores, neg_inf, 3, "stablehlo.maximum");
+                SsaValue neg_flt = builder.emit_const_splat_f32(-3.40282347e+38f, {}, PjrtDType::F32);
+                SsaValue rmax = builder.emit_reduce_axis(scores, neg_flt, 3, "stablehlo.maximum");
                 SsaValue rmax_b = builder.emit_broadcast_in_dim(rmax, {0, 1, 2}, sc_dims);
                 SsaValue shifted = builder.emit_binary("stablehlo.subtract", scores, rmax_b);
                 SsaValue exps = builder.emit_unary("stablehlo.exponential", shifted);
-                SsaValue zero = builder.emit_const_splat_f32(0.0f, {}, PjrtDType::F32);
-                SsaValue rsum = builder.emit_reduce_axis(exps, zero, 3, "stablehlo.add");
+                if (has_mask) {
+                    exps = builder.emit_select(visible, exps, zeros_sc);
+                }
+                SsaValue rsum = builder.emit_reduce_axis(exps, zero_scalar, 3, "stablehlo.add");
                 SsaValue rsum_b = builder.emit_broadcast_in_dim(rsum, {0, 1, 2}, sc_dims);
-                SsaValue probs = builder.emit_binary("stablehlo.divide", exps, rsum_b);
+                SsaValue one_f = builder.emit_const_splat_f32(1.0f, sc_dims, PjrtDType::F32);
+                SsaValue safe_rsum = builder.emit_binary("stablehlo.maximum", rsum_b, one_f);
+                SsaValue probs = builder.emit_binary("stablehlo.divide", exps, safe_rsum);
 
                 // out_bhqd = probs @ v : [B, H_Q, N_Q, N_KV] x [B, H_Q, N_KV, DV] -> [B, H_Q, N_Q, DV]
                 SsaValue probs_mm = use_bf16_attn ? builder.emit_convert(probs, PjrtDType::BF16) : probs;
-                SsaValue v_mm = use_bf16_attn ? builder.emit_convert(v, PjrtDType::BF16) : v;
-                SsaValue out_bhqd = builder.emit_dot_general(
-                    probs_mm, v_mm, {0, 1}, {0, 1}, {3}, {2}, {B, H_Q, N_Q, DV}, PjrtDType::F32, op.high_precision);
+                SsaValue out_bhqd;
+                if (has_mask) {
+                    // Prevent 0.0 * (NaN/Inf) contamination when one query masks a KV row that
+                    // another query in the same batch attends to, while still propagating NaN to
+                    // any query whose visible attended value is non-finite.
+                    const std::vector<int64_t> v_dims = {B, H_Q, N_KV, DV};
+                    SsaValue v_zeros = builder.emit_const_splat_f32(0.0f, v_dims, PjrtDType::F32);
+                    SsaValue v_ones = builder.emit_const_splat_f32(1.0f, v_dims, PjrtDType::F32);
+                    SsaValue v_diff = builder.emit_binary("stablehlo.subtract", v, v);
+                    SsaValue v_is_fin = builder.emit_compare("EQ", v_diff, v_zeros);
+                    SsaValue v_fin = builder.emit_select(v_is_fin, v, v_zeros);
+                    SsaValue v_fin_mm = use_bf16_attn ? builder.emit_convert(v_fin, PjrtDType::BF16) : v_fin;
+                    out_bhqd = builder.emit_dot_general(
+                        probs_mm, v_fin_mm, {0, 1}, {0, 1}, {3}, {2}, {B, H_Q, N_Q, DV}, PjrtDType::F32, op.high_precision);
+                    SsaValue v_bad = builder.emit_select(v_is_fin, v_zeros, v_ones);
+                    SsaValue q_bad = builder.emit_dot_general(
+                        probs, v_bad, {0, 1}, {0, 1}, {3}, {2}, {B, H_Q, N_Q, DV}, PjrtDType::F32, false);
+                    SsaValue q_has_bad = builder.emit_compare(
+                        "GT", q_bad, builder.emit_const_splat_f32(0.0f, {B, H_Q, N_Q, DV}, PjrtDType::F32));
+                    SsaValue nan_out = builder.emit_const_splat_f32(
+                        std::numeric_limits<float>::quiet_NaN(), {B, H_Q, N_Q, DV}, PjrtDType::F32);
+                    out_bhqd = builder.emit_select(q_has_bad, nan_out, out_bhqd);
+                } else {
+                    SsaValue v_mm = use_bf16_attn ? builder.emit_convert(v, PjrtDType::BF16) : v;
+                    out_bhqd = builder.emit_dot_general(
+                        probs_mm, v_mm, {0, 1}, {0, 1}, {3}, {2}, {B, H_Q, N_Q, DV}, PjrtDType::F32, op.high_precision);
+                }
                 // Permute [B, H_Q, N_Q, DV] -> [B, N_Q, H_Q, DV]
                 SsaValue out_permuted = builder.emit_transpose(out_bhqd, {0, 2, 1, 3});
                 result = builder.emit_convert(out_permuted, op.dst.dtype);
@@ -1716,13 +1894,9 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
         TensorHandle out_th;
         out_th.storage = TensorStorageKind::DENSE;
         out_th.sharding = out_sharding;
+        out_th.logical_k = op.dst.dims[3];
         out_th.dense = std::move(result);
         env[op.dst.id] = std::move(out_th);
-    }
-
-    std::unordered_map<uint64_t, CloudOpKind> producer_kind;
-    for (const OpNodeSpec& op : spec.ops) {
-        producer_kind[op.dst.id] = op.kind;
     }
 
     std::vector<SsaValue> return_vals;
@@ -1730,8 +1904,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
     for (uint64_t oid : spec.output_ids) {
         const TensorHandle& th = env.at(oid);
         SsaValue ov = th.dense;
-        const bool is_rs = (producer_kind.count(oid) && producer_kind[oid] == CloudOpKind::REDUCE_SCATTER_SUM);
-        if (P > 1 && !is_rs) {
+        if (P > 1) {
             if (th.sharding == TensorShardingKind::SHARD_N) {
                 ov = builder.emit_all_gather(ov, 2, P);
             } else if (th.sharding == TensorShardingKind::SHARD_K) {
@@ -1917,6 +2090,7 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
 
     struct ValInfo {
         uint64_t id = 0;
+        PjrtDType dtype = PjrtDType::F32;
         int64_t dims[4] = {1, 1, 1, 1};
         bool is_external = false;
         bool is_dense = true;
@@ -1939,6 +2113,7 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
         }
         ValInfo vi;
         vi.id = in.id;
+        vi.dtype = in.dtype;
         for (int d = 0; d < 4; ++d) {
             vi.dims[d] = in.dims[d];
         }
@@ -1960,6 +2135,7 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
         }
         ValInfo vi;
         vi.id = op.dst.id;
+        vi.dtype = op.dst.dtype;
         for (int d = 0; d < 4; ++d) {
             vi.dims[d] = op.dst.dims[d];
         }
@@ -2037,6 +2213,11 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
         ValInfo& vi = vals[idx];
         if (!vi.is_external || kind == TokenInputPadKind::NONE) {
             return true;
+        }
+        if (kind == TokenInputPadKind::NEG_ONE &&
+            vi.dtype != PjrtDType::S32 && vi.dtype != PjrtDType::S64) {
+            note_reason("neg_one_invalid_dtype");
+            return false;
         }
         if (vi.pad == TokenInputPadKind::NONE) {
             vi.pad = kind;

@@ -1,0 +1,372 @@
+# FreeTPU Node DaemonSets (VFIO-backed GKE Standard / self-managed Cloud TPU nodes: v5e, v5p, v6e Trillium):
+# Cluster prerequisite: requires **GKE Standard** (or self-managed Kubernetes);
+# **GKE Autopilot** blocks `hostPath` mounts at admission. On GKE Autopilot, run
+# `tpu_exporter.py --no-pid-scan` in the workload's network namespace instead of
+# deploying host DaemonSets.
+# Scope:
+#   1. `DaemonSet/freetpu-node-agent` (default on VFIO-backed TPU nodes):
+#      PCI/VFIO hardware inventory & readiness Prometheus telemetry ONLY (does
+#      NOT mount `/var/run/cdi`, publish CDI specs, or enable `hostPID` /
+#      `CAP_SYS_PTRACE` / `/proc` PID scanning by default). Because GKE Standard
+#      accepts `NetworkPolicy` objects even when policy enforcement is disabled,
+#      two safeguards apply:
+#      (a) SHARED-CLUSTER PREREQUISITE (applies to inventory-only mode as well):
+#          enforced NetworkPolicy (e.g. GKE Dataplane V2, Cilium, or Calico)
+#          paired with admission controls forbidding tenant `hostNetwork: true`
+#          pods—OR binding `--host 127.0.0.1` behind an authenticating proxy
+#          such as `kube-rbac-proxy`—is required on shared/multi-tenant clusters
+#          so tenant workloads cannot starve the exporter's bounded `:9400`
+#          scrape worker pool while loopback `/healthz`/`/readyz` stays green.
+#      (b) Host PID telemetry is disabled by default (`--no-pid-scan
+#          --tpu-info-bin ""`) so `:9400` never exposes host PIDs unless an
+#          operator explicitly opts in after verifying the ingress isolation
+#          above (add `hostPID: true`, `CAP_SYS_PTRACE`,
+#          `securityContext.appArmorProfile.type: Unconfined` on GKE, and remove
+#          `--no-pid-scan`). Uses stock `python:3.12-slim` without `tpu-info`
+#          and runs outside workload Pod network namespaces, so it does NOT emit
+#          live HBM usage or MXU duty cycle. For live HBM + duty-cycle telemetry,
+#          run `tpu_exporter.py` with `tpu-info` inside the same network
+#          namespace as `libtpu` (`127.0.0.1:8431`, e.g. on standalone TPU VMs
+#          or with `--no-pid-scan` in an operator-managed Pod sidecar).
+#   2. `DaemonSet/freetpu-cdi-sync` (OPT-IN CDI publisher):
+#      Publishes boot-scoped `/var/run/cdi/freetpu.json` ONLY on TPU nodes
+#      explicitly labeled `freetpu.dev/cdi-enabled=true`.
+#      SECURITY PREREQUISITE (CVE-2026-53492 / GHSA-33vj-92qq-66hc / GCP-2026-037):
+#      Affected containerd releases (`2.1.0-2.1.8`, `2.2.0-2.2.4`, `2.3.0-2.3.1`,
+#      or vendor/GKE builds carrying checkpoint-restore backports) allow a tenant
+#      with Pod creation rights to smuggle CDI annotations via untrusted container
+#      checkpoint restores and bypass DRA to access every published CDI device
+#      (including `freetpu.dev/tpu=all`). Before labeling any node
+#      `freetpu.dev/cdi-enabled=true`, verify the node runs an unaffected or
+#      patched containerd release (upstream `2.0.x`, `2.1.x` >= 2.1.9,
+#      `2.2.x` >= 2.2.5, `2.3.x` >= 2.3.2, or >= 2.4.0; also verify vendor/GKE
+#      builds for backports) OR that untrusted container checkpoint restores are
+#      disabled/blocked on the node. Telemetry-only installations should leave
+#      `freetpu.dev/cdi-enabled` unset. On graceful opt-out or DaemonSet deletion
+#      (`SIGTERM`), `freetpu-cdi-sync` passes `--unlink-on-exit` to remove
+#      `/var/run/cdi/freetpu.json`; after forced termination (`SIGKILL`), delete
+#      `/var/run/cdi/freetpu.json` on the host manually.
+#      VFIO MEMLOCK PREREQUISITE: CDI device injection does not configure
+#      `RLIMIT_MEMLOCK` or Linux capabilities, and Kubernetes Pods have no
+#      `--ulimit` field. On self-managed nodes inheriting a restrictive systemd
+#      memlock limit, verify the workload's effective memlock limit and raise
+#      the container runtime's memlock limit (e.g. `LimitMEMLOCK=infinity` in
+#      `containerd.service`) or grant an approved `IPC_LOCK` capability to TPU
+#      workload containers.
+#
+# Prerequisite (create the required ConfigMap in kube-system first):
+#   kubectl -n kube-system create configmap freetpu-ops-scripts \
+#     --from-file=ops/tpu-cdi/freetpu_cdi.py \
+#     --from-file=ops/tpu-exporter/tpu_exporter.py \
+#     --dry-run=client -o yaml | kubectl apply -f -
+#
+# Targets VFIO-backed GKE TPU node pools (`tpu-v5-lite-device`,
+# `tpu-v5-lite-podslice`, `tpu-v5p-slice`, `tpu-v6e-slice`); excludes legacy
+# `/dev/accel*` v4 node pools (`tpu-v4-podslice`). Adjust `nodeAffinity` if your
+# cluster uses custom TPU node labels.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: freetpu-node-agent
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: freetpu-tpu-exporter
+    app.kubernetes.io/component: tpu-ops
+    freetpu.dev/collector-role: node
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: freetpu-tpu-exporter
+      freetpu.dev/collector-role: node
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: freetpu-tpu-exporter
+        freetpu.dev/collector-role: node
+      # Intentionally omit `prometheus.io/scrape` annotations so generic
+      # annotation-based scrape jobs cannot double-scrape the exporter or
+      # bypass `prometheus-scrape.yml`'s per-PID series drop rule; the trusted
+      # `freetpu-node-exporter` job discovers this DaemonSet strictly by
+      # namespace, DaemonSet controller, container, and port name.
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: cloud.google.com/gke-tpu-accelerator
+                    operator: In
+                    values:
+                      - tpu-v5-lite-device
+                      - tpu-v5-lite-podslice
+                      - tpu-v5p-slice
+                      - tpu-v6e-slice
+      tolerations:
+        - key: google.com/tpu
+          operator: Exists
+          effect: NoSchedule
+        - key: cloud.google.com/gke-spot
+          operator: Exists
+          effect: NoSchedule
+        - key: cloud.google.com/gke-queued
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: tpu-exporter
+          image: python:3.12-slim
+          command:
+            - python3
+            - /opt/freetpu/tpu_exporter.py
+            - --host
+            - 0.0.0.0
+            - --port
+            - "9400"
+            - --health-host
+            - 127.0.0.1
+            - --health-port
+            - "9401"
+            - --no-pid-scan
+            - --tpu-info-bin
+            - ""
+          ports:
+            - name: metrics
+              containerPort: 9400
+              protocol: TCP
+          # Health listener binds strictly to 127.0.0.1:9401 (never exposed on
+          # the pod network) and is checked via local exec probes so remote pods
+          # cannot exhaust health slots or trigger spurious liveness restarts.
+          readinessProbe:
+            exec:
+              command:
+                - python3
+                - -c
+                - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9401/readyz', timeout=2).read()"
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command:
+                - python3
+                - -c
+                - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9401/healthz', timeout=2).read()"
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          volumeMounts:
+            # Mount only the narrow sysfs subpaths needed for PCI and IOMMU
+            # discovery (never whole-host /sys) so containerd's read-only
+            # /sys/fs/cgroup mount is never shadowed by a writable host cgroup.
+            - name: sysfs-bus-pci
+              mountPath: /sys/bus/pci
+              readOnly: true
+            - name: sysfs-devices
+              mountPath: /sys/devices
+              readOnly: true
+            - name: sysfs-iommu-groups
+              mountPath: /sys/kernel/iommu_groups
+              readOnly: true
+            - name: dev-vfio
+              mountPath: /dev/vfio
+              readOnly: true
+            - name: freetpu-ops
+              mountPath: /opt/freetpu
+              readOnly: true
+      volumes:
+        - name: sysfs-bus-pci
+          hostPath:
+            path: /sys/bus/pci
+            type: Directory
+        - name: sysfs-devices
+          hostPath:
+            path: /sys/devices
+            type: Directory
+        - name: sysfs-iommu-groups
+          hostPath:
+            path: /sys/kernel/iommu_groups
+            type: Directory
+        - name: dev-vfio
+          hostPath:
+            # DirectoryOrCreate lets the DaemonSet start even if vfio-pci failed
+            # to initialize so tpu-exporter can still report unhealthy chips.
+            path: /dev/vfio
+            type: DirectoryOrCreate
+        - name: freetpu-ops
+          configMap:
+            name: freetpu-ops-scripts
+---
+# Opt-in CDI spec publisher DaemonSet.
+# Schedules ONLY on VFIO-backed TPU nodes explicitly labeled:
+#   kubectl label node <tpu-node> freetpu.dev/cdi-enabled=true
+# ONLY label nodes verified to run an unaffected or patched containerd release
+# for CVE-2026-53492 (upstream `2.0.x`, `2.1.x` >= 2.1.9, `2.2.x` >= 2.2.5,
+# `2.3.x` >= 2.3.2, or >= 2.4.0 — excluding affected `2.1.0-2.1.8`,
+# `2.2.0-2.2.4`, `2.3.0-2.3.1`, and checking vendor/GKE builds for backports
+# per GHSA-33vj-92qq-66hc / GCP-2026-037) OR with untrusted container checkpoint
+# restores disabled/blocked. Removing the label or deleting this DaemonSet
+# triggers `--unlink-on-exit` on graceful shutdown (`SIGTERM`); after forced
+# termination (`SIGKILL`), delete `/var/run/cdi/freetpu.json` on the host directly.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: freetpu-cdi-sync
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: freetpu-cdi-sync
+    app.kubernetes.io/component: tpu-ops
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: freetpu-cdi-sync
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: freetpu-cdi-sync
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: cloud.google.com/gke-tpu-accelerator
+                    operator: In
+                    values:
+                      - tpu-v5-lite-device
+                      - tpu-v5-lite-podslice
+                      - tpu-v5p-slice
+                      - tpu-v6e-slice
+                  - key: freetpu.dev/cdi-enabled
+                    operator: In
+                    values:
+                      - "true"
+      tolerations:
+        - key: google.com/tpu
+          operator: Exists
+          effect: NoSchedule
+        - key: cloud.google.com/gke-spot
+          operator: Exists
+          effect: NoSchedule
+        - key: cloud.google.com/gke-queued
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: freetpu-cdi-sync
+          image: python:3.12-slim
+          command:
+            - python3
+            - /opt/freetpu/freetpu_cdi.py
+            - sync
+            - --output
+            - /var/run/cdi/freetpu.json
+            - --interval
+            - "15"
+            - --unlink-on-exit
+          # Report Ready only while `/var/run/cdi/freetpu.json` exists and passes
+          # live host VFIO verification (read-only; the sync loop owns writes/cleanup).
+          readinessProbe:
+            exec:
+              command:
+                - python3
+                - /opt/freetpu/freetpu_cdi.py
+                - validate
+                - /var/run/cdi/freetpu.json
+                - --check-host
+            initialDelaySeconds: 2
+            periodSeconds: 15
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          volumeMounts:
+            # Mount only the narrow sysfs subpaths needed for PCI and IOMMU
+            # discovery (never whole-host /sys) so containerd's read-only
+            # /sys/fs/cgroup mount is never shadowed by a writable host cgroup.
+            - name: sysfs-bus-pci
+              mountPath: /sys/bus/pci
+              readOnly: true
+            - name: sysfs-devices
+              mountPath: /sys/devices
+              readOnly: true
+            - name: sysfs-iommu-groups
+              mountPath: /sys/kernel/iommu_groups
+              readOnly: true
+            - name: dev-vfio
+              mountPath: /dev/vfio
+              readOnly: true
+            - name: cdi-dir
+              mountPath: /var/run/cdi
+            - name: freetpu-ops
+              mountPath: /opt/freetpu
+              readOnly: true
+      volumes:
+        - name: sysfs-bus-pci
+          hostPath:
+            path: /sys/bus/pci
+            type: Directory
+        - name: sysfs-devices
+          hostPath:
+            path: /sys/devices
+            type: Directory
+        - name: sysfs-iommu-groups
+          hostPath:
+            path: /sys/kernel/iommu_groups
+            type: Directory
+        - name: dev-vfio
+          hostPath:
+            # DirectoryOrCreate lets freetpu-cdi-sync start even if vfio-pci
+            # failed to initialize so it can invalidate any stale CDI spec.
+            path: /dev/vfio
+            type: DirectoryOrCreate
+        - name: cdi-dir
+          hostPath:
+            path: /var/run/cdi
+            type: DirectoryOrCreate
+        - name: freetpu-ops
+          configMap:
+            name: freetpu-ops-scripts
+---
+# Restrict ingress to the node exporter's :9400/metrics port strictly to the
+# trusted monitoring Prometheus scraper so tenant workloads cannot starve the
+# exporter's bounded scrape worker pool (even in default inventory-only mode) or
+# read host PID metrics if an operator explicitly opts into hostPID scanning.
+# SHARED-CLUSTER PREREQUISITE: requires a CNI enforcing Kubernetes NetworkPolicy
+# (e.g. GKE Dataplane V2, Cilium, or Calico) PLUS admission controls forbidding
+# tenant `hostNetwork: true` pods (since Kubernetes NetworkPolicy permits traffic
+# originating from the exporter's own node)—OR binding `--host 127.0.0.1` behind
+# an authenticating proxy such as kube-rbac-proxy (mTLS/RBAC). On GKE Standard
+# clusters without NetworkPolicy enforcement, always bind `--host 127.0.0.1`
+# behind an authenticating proxy on shared clusters (including inventory-only
+# mode). Adjust the namespaceSelector and podSelector below to match your
+# Prometheus pod.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: freetpu-node-agent-metrics
+  namespace: kube-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: freetpu-tpu-exporter
+      freetpu.dev/collector-role: node
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - protocol: TCP
+          port: 9400

@@ -1,15 +1,20 @@
 #include "pjrt_runtime.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#if !defined(_WIN32)
 #include <dlfcn.h>
+#endif
 #include <fstream>
+#include <locale>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_set>
 #include <utility>
 
 namespace cloudtpu {
@@ -58,7 +63,10 @@ uint16_t f32_to_f16(float f) {
         if (exp < -10) {
             return static_cast<uint16_t>(sign);
         }
-        mant = (mant | 0x00800000U) >> (1 - exp);
+        const uint32_t shift = static_cast<uint32_t>(1 - exp);
+        const uint32_t full = mant | 0x00800000U;
+        const uint32_t sticky = ((full & ((1U << shift) - 1U)) != 0U) ? 1U : 0U;
+        mant = (full >> shift) | sticky;
         const uint32_t round_bits = mant & 0x00001fffU;
         const uint32_t lsb = (mant >> 13) & 1U;
         if (round_bits > 0x00001000U || (round_bits == 0x00001000U && lsb != 0)) {
@@ -129,6 +137,7 @@ size_t count_libpython_mappings() {
 
 PJRT_Buffer_Type to_pjrt_buffer_type(PjrtDType dt) {
     switch (dt) {
+        case PjrtDType::PRED: return PJRT_Buffer_Type_PRED;
         case PjrtDType::F32: return PJRT_Buffer_Type_F32;
         case PjrtDType::F16: return PJRT_Buffer_Type_F16;
         case PjrtDType::BF16: return PJRT_Buffer_Type_BF16;
@@ -146,6 +155,7 @@ PJRT_Buffer_Type to_pjrt_buffer_type(PjrtDType dt) {
 
 PjrtDType from_pjrt_buffer_type(PJRT_Buffer_Type dt) {
     switch (dt) {
+        case PJRT_Buffer_Type_PRED: return PjrtDType::PRED;
         case PJRT_Buffer_Type_F32: return PjrtDType::F32;
         case PJRT_Buffer_Type_F16: return PjrtDType::F16;
         case PJRT_Buffer_Type_BF16: return PjrtDType::BF16;
@@ -163,6 +173,7 @@ PjrtDType from_pjrt_buffer_type(PJRT_Buffer_Type dt) {
 
 const char* pjrt_dtype_mlir_name(PjrtDType dt) {
     switch (dt) {
+        case PjrtDType::PRED: return "i1";
         case PjrtDType::F32: return "f32";
         case PjrtDType::F16: return "f16";
         case PjrtDType::BF16: return "bf16";
@@ -187,6 +198,7 @@ size_t pjrt_dtype_bits(PjrtDType dt) {
         case PjrtDType::F16:
         case PjrtDType::BF16:
         case PjrtDType::S16: return 16;
+        case PjrtDType::PRED:
         case PjrtDType::S8:
         case PjrtDType::U8: return 8;
         case PjrtDType::S4:
@@ -287,23 +299,21 @@ void append_tag_bytes(std::string& out, uint32_t field_number, const std::string
     out.append(payload);
 }
 
+void append_tag_fixed64(std::string& out, uint32_t field_number, uint64_t val) {
+    append_varint(out, (static_cast<uint64_t>(field_number) << 3) | 1ULL);
+    for (int i = 0; i < 8; ++i) {
+        out.push_back(static_cast<char>((val >> (i * 8)) & 0xFFU));
+    }
+}
+
 }  // namespace
 
 std::string encode_compile_options_proto(const PjrtCompileOptions& opts) {
     // xla::ExecutableBuildOptionsProto (openxla/xla/xla/pjrt/proto/compile_options.proto)
+    // Intentionally omit field 3 (debug_options) so OpenXLA preserves compiler defaults
+    // and XLA_FLAGS (e.g. --xla_dump_to); pass flag overrides via CompileOptionsProto
+    // field 7 (env_option_overrides) instead.
     std::string ebo;
-    if (!opts.backend_extra_options.empty()) {
-        // xla::DebugOptions (field 3 of ExecutableBuildOptionsProto):
-        //   map<string, string> xla_backend_extra_options = 500;
-        std::string dbg;
-        for (const auto& kv : opts.backend_extra_options) {
-            std::string entry;
-            append_tag_bytes(entry, 1, kv.first);
-            append_tag_bytes(entry, 2, kv.second);
-            append_tag_bytes(dbg, 500, entry);
-        }
-        append_tag_bytes(ebo, 3, dbg);
-    }
     if (opts.num_replicas > 0) {
         append_tag_varint(ebo, 4, static_cast<uint64_t>(opts.num_replicas));
     }
@@ -321,7 +331,8 @@ std::string encode_compile_options_proto(const PjrtCompileOptions& opts) {
         //     message ComputationDevice { repeated int64 replica_device_ids = 1; }
         const int32_t replicas = std::max<int32_t>(1, opts.num_replicas);
         const int32_t computations = std::max<int32_t>(1, opts.num_partitions);
-        if (opts.device_assignment_ids.size() != static_cast<size_t>(replicas) * static_cast<size_t>(computations)) {
+        if (opts.device_assignment_ids.size() !=
+            static_cast<size_t>(replicas) * static_cast<size_t>(computations)) {
             throw std::runtime_error("encode_compile_options_proto: device_assignment_ids size mismatch");
         }
         std::string da;
@@ -346,15 +357,116 @@ std::string encode_compile_options_proto(const PjrtCompileOptions& opts) {
         append_tag_varint(ebo, 19, 1);
     }
 
-    // xla::CompileOptionsProto { executable_build_options (field 3, length-delimited) }
+    // xla::CompileOptionsProto {
+    //   ExecutableBuildOptionsProto executable_build_options = 3;
+    //   map<string, OptionOverrideProto> env_option_overrides = 7;
+    // }
     std::string out;
     append_tag_bytes(out, 3, ebo);
+    for (const auto& ov : opts.env_option_overrides) {
+        // OptionOverrideProto {
+        //   oneof value { string string_field = 1; bool bool_field = 2; int64 int_field = 3; double double_field = 4; }
+        // }
+        std::string override_val;
+        switch (ov.kind) {
+            case PjrtOptionOverride::Kind::STRING:
+                append_tag_bytes(override_val, 1, ov.string_val);
+                break;
+            case PjrtOptionOverride::Kind::BOOL:
+                append_tag_varint(override_val, 2, ov.bool_val ? 1ULL : 0ULL);
+                break;
+            case PjrtOptionOverride::Kind::INT64:
+                append_tag_varint(override_val, 3, static_cast<uint64_t>(ov.int_val));
+                break;
+            case PjrtOptionOverride::Kind::DOUBLE: {
+                uint64_t bits = 0;
+                std::memcpy(&bits, &ov.double_val, sizeof(bits));
+                append_tag_fixed64(override_val, 4, bits);
+                break;
+            }
+        }
+        // map<string, OptionOverrideProto> entry { string key = 1; OptionOverrideProto value = 2; }
+        std::string entry;
+        append_tag_bytes(entry, 1, ov.key);
+        append_tag_bytes(entry, 2, override_val);
+        append_tag_bytes(out, 7, entry);
+    }
     return out;
 }
 
+std::string append_async_collective_libtpu_init_args(const std::string& existing_args) {
+    // Documented TPU async collective overlap flags for LIBTPU_INIT_ARGS (TorchTPU / MaxText
+    // v5e/v6e reference). These are libtpu initialization flags, NOT xla::DebugOptions fields,
+    // so they must be supplied via LIBTPU_INIT_ARGS before libtpu.so loads rather than via
+    // CompileOptionsProto.env_option_overrides.
+    static const std::pair<const char*, const char*> kFlags[] = {
+        {"xla_tpu_enable_async_collective_fusion", "true"},
+        {"xla_tpu_enable_async_collective_fusion_fuse_all_gather", "true"},
+        {"xla_tpu_enable_async_collective_fusion_multiple_steps", "true"},
+        {"xla_tpu_overlap_compute_collective_tc", "true"},
+        {"xla_enable_async_all_gather", "true"},
+    };
+
+    std::unordered_set<std::string> present;
+    {
+        std::istringstream iss(existing_args);
+        std::string tok;
+        while (iss >> tok) {
+            size_t start = 0;
+            while (start < tok.size() && tok[start] == '-') {
+                ++start;
+            }
+            if (start == 0 || start >= tok.size()) {
+                continue;
+            }
+            const size_t eq = tok.find('=', start);
+            std::string name = (eq == std::string::npos) ? tok.substr(start) : tok.substr(start, eq - start);
+            present.insert(name);
+            if (name.size() > 2 && name.compare(0, 2, "no") == 0) {
+                present.insert(name.substr(2));
+            }
+        }
+    }
+
+    std::string merged = existing_args;
+    while (!merged.empty() && std::isspace(static_cast<unsigned char>(merged.back()))) {
+        merged.pop_back();
+    }
+    for (const auto& kv : kFlags) {
+        if (present.count(kv.first) != 0) {
+            continue;
+        }
+        if (!merged.empty()) {
+            merged.push_back(' ');
+        }
+        merged.append("--");
+        merged.append(kv.first);
+        merged.push_back('=');
+        merged.append(kv.second);
+        present.insert(kv.first);
+    }
+    return merged;
+}
+
 // =========================================================================
-// PjrtBuffer Helpers
+// PjrtBuffer & PjrtLoadedExecutable Helpers
 // =========================================================================
+
+void PjrtLoadedExecutableDeleter::operator()(PJRT_LoadedExecutable* exec) const noexcept {
+    if (!exec || !api || !PJRT_API_HAS(api, PJRT_LoadedExecutable_Destroy)) {
+        return;
+    }
+    PJRT_LoadedExecutable_Destroy_Args args = {};
+    args.struct_size = PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
+    args.executable = exec;
+    PJRT_Error* err = api->PJRT_LoadedExecutable_Destroy(&args);
+    if (err && PJRT_API_HAS(api, PJRT_Error_Destroy)) {
+        PJRT_Error_Destroy_Args d_args = {};
+        d_args.struct_size = PJRT_Error_Destroy_Args_STRUCT_SIZE;
+        d_args.error = err;
+        api->PJRT_Error_Destroy(&d_args);
+    }
+}
 
 void PjrtBufferDeleter::operator()(PJRT_Buffer* buf) const noexcept {
     if (!buf || !api || !PJRT_API_HAS(api, PJRT_Buffer_Destroy)) {
@@ -364,6 +476,22 @@ void PjrtBufferDeleter::operator()(PJRT_Buffer* buf) const noexcept {
     args.struct_size = PJRT_Buffer_Destroy_Args_STRUCT_SIZE;
     args.buffer = buf;
     PJRT_Error* err = api->PJRT_Buffer_Destroy(&args);
+    if (err && PJRT_API_HAS(api, PJRT_Error_Destroy)) {
+        PJRT_Error_Destroy_Args d_args = {};
+        d_args.struct_size = PJRT_Error_Destroy_Args_STRUCT_SIZE;
+        d_args.error = err;
+        api->PJRT_Error_Destroy(&d_args);
+    }
+}
+
+void PjrtEventDeleter::operator()(PJRT_Event* ev) const noexcept {
+    if (!ev || !api || !PJRT_API_HAS(api, PJRT_Event_Destroy)) {
+        return;
+    }
+    PJRT_Event_Destroy_Args args = {};
+    args.struct_size = PJRT_Event_Destroy_Args_STRUCT_SIZE;
+    args.event = ev;
+    PJRT_Error* err = api->PJRT_Event_Destroy(&args);
     if (err && PJRT_API_HAS(api, PJRT_Error_Destroy)) {
         PJRT_Error_Destroy_Args d_args = {};
         d_args.struct_size = PJRT_Error_Destroy_Args_STRUCT_SIZE;
@@ -536,6 +664,7 @@ struct MockTensor {
             }
             case PjrtDType::S8:
                 return reinterpret_cast<const int8_t*>(bytes.data())[idx];
+            case PjrtDType::PRED:
             case PjrtDType::U8:
                 return static_cast<int64_t>(bytes[idx]);
             case PjrtDType::S4: {
@@ -577,6 +706,9 @@ struct MockTensor {
                 std::memcpy(bytes.data() + idx, &iv, 1);
                 break;
             }
+            case PjrtDType::PRED:
+                bytes[idx] = (v != 0) ? 1U : 0U;
+                break;
             case PjrtDType::U8:
                 bytes[idx] = static_cast<uint8_t>(v);
                 break;
@@ -610,6 +742,12 @@ static inline void copy_mock_elem(MockTensor& dst, size_t dst_idx, const MockTen
     }
 }
 
+static bool is_mock_integer_dtype(PjrtDType dt) {
+    return dt == PjrtDType::PRED || dt == PjrtDType::S4 || dt == PjrtDType::U4 ||
+           dt == PjrtDType::S8 || dt == PjrtDType::U8 || dt == PjrtDType::S16 ||
+           dt == PjrtDType::S32 || dt == PjrtDType::U32 || dt == PjrtDType::S64;
+}
+
 struct MockTypeSpec {
     PjrtDType dtype = PjrtDType::INVALID;
     std::vector<int64_t> dims;
@@ -624,6 +762,7 @@ static std::string trim_copy(const std::string& s) {
 }
 
 static PjrtDType parse_mlir_dtype(const std::string& tok) {
+    if (tok == "i1") return PjrtDType::PRED;
     if (tok == "f32") return PjrtDType::F32;
     if (tok == "f16") return PjrtDType::F16;
     if (tok == "bf16") return PjrtDType::BF16;
@@ -711,13 +850,6 @@ static std::vector<size_t> compute_row_major_strides(const std::vector<int64_t>&
     return strides;
 }
 
-static bool is_mock_int_dtype(PjrtDType dt) {
-    return dt == PjrtDType::S4 || dt == PjrtDType::U4 ||
-           dt == PjrtDType::S8 || dt == PjrtDType::U8 ||
-           dt == PjrtDType::S16 || dt == PjrtDType::S32 ||
-           dt == PjrtDType::U32 || dt == PjrtDType::S64;
-}
-
 struct MockOp {
     enum class Kind {
         CONSTANT,
@@ -729,6 +861,7 @@ struct MockOp {
         MULTIPLY,
         DIVIDE,
         MAXIMUM,
+        MINIMUM,
         BIT_AND,
         SHR_LOGICAL,
         RSQRT,
@@ -747,6 +880,8 @@ struct MockOp {
         REDUCE_MAX,
         GATHER,
         SCATTER_3D_ROWS,
+        COMPARE,
+        SELECT,
         REPLICA_ID,
         DYNAMIC_SLICE,
         DYNAMIC_UPDATE_SLICE,
@@ -760,6 +895,7 @@ struct MockOp {
     std::string out_name;
     MockTypeSpec out_type;
     std::vector<std::string> inputs;
+    std::string cmp_dir;
 
     // Constant values
     bool is_splat = true;
@@ -872,9 +1008,43 @@ static MockProgram parse_stablehlo_mlir(const std::string& mlir) {
         if (rhs.rfind("stablehlo.constant ", 0) == 0) {
             op.kind = MockOp::Kind::CONSTANT;
             const size_t d0 = rhs.find("dense<");
-            const size_t d1 = rhs.rfind('>');
+            if (d0 == std::string::npos) {
+                throw std::runtime_error("MockPJRT: missing dense< literal in stablehlo.constant");
+            }
+            const size_t d1 = rhs.find('>', d0 + 6);
+            if (d1 == std::string::npos) {
+                throw std::runtime_error("MockPJRT: unterminated dense< literal in stablehlo.constant");
+            }
             const std::string lit = trim_copy(rhs.substr(d0 + 6, d1 - (d0 + 6)));
-            const bool is_int = is_mock_int_dtype(op.out_type.dtype);
+            const bool is_int = is_mock_integer_dtype(op.out_type.dtype);
+            auto parse_mlir_float = [](const std::string& s) -> double {
+                if (s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+                    size_t idx = 0;
+                    const uint32_t bits = static_cast<uint32_t>(std::stoul(s, &idx, 16));
+                    if (idx != s.size()) {
+                        throw std::runtime_error("MockPJRT: invalid hex float literal: " + s);
+                    }
+                    float f = 0.0f;
+                    std::memcpy(&f, &bits, sizeof(f));
+                    return static_cast<double>(f);
+                }
+                std::istringstream iss(s);
+                iss.imbue(std::locale::classic());
+                double val = 0.0;
+                if (!(iss >> val) || !(iss >> std::ws).eof()) {
+                    throw std::runtime_error("MockPJRT: invalid float literal: " + s);
+                }
+                return val;
+            };
+            auto parse_mlir_int = [](const std::string& s) -> int64_t {
+                std::istringstream iss(s);
+                iss.imbue(std::locale::classic());
+                int64_t val = 0;
+                if (!(iss >> val) || !(iss >> std::ws).eof()) {
+                    throw std::runtime_error("MockPJRT: invalid int literal: " + s);
+                }
+                return val;
+            };
             if (!lit.empty() && lit.front() == '[') {
                 op.is_splat = false;
                 std::string inner = lit.substr(1, lit.size() - 2);
@@ -883,13 +1053,13 @@ static MockProgram parse_stablehlo_mlir(const std::string& mlir) {
                 while (std::getline(vs, tok, ',')) {
                     tok = trim_copy(tok);
                     if (tok.empty()) continue;
-                    if (is_int) op.array_i.push_back(std::stoll(tok));
-                    else op.array_f.push_back(std::stod(tok));
+                    if (is_int) op.array_i.push_back(parse_mlir_int(tok));
+                    else op.array_f.push_back(parse_mlir_float(tok));
                 }
             } else {
                 op.is_splat = true;
-                if (is_int) op.scalar_i = std::stoll(lit);
-                else op.scalar_f = std::stod(lit);
+                if (is_int) op.scalar_i = parse_mlir_int(lit);
+                else op.scalar_f = parse_mlir_float(lit);
             }
         } else if (rhs.rfind("stablehlo.iota ", 0) == 0) {
             op.kind = MockOp::Kind::IOTA;
@@ -915,6 +1085,9 @@ static MockProgram parse_stablehlo_mlir(const std::string& mlir) {
             op.inputs = extract_ssa_refs(rhs.substr(0, colon));
         } else if (rhs.rfind("stablehlo.maximum ", 0) == 0) {
             op.kind = MockOp::Kind::MAXIMUM;
+            op.inputs = extract_ssa_refs(rhs.substr(0, colon));
+        } else if (rhs.rfind("stablehlo.minimum ", 0) == 0) {
+            op.kind = MockOp::Kind::MINIMUM;
             op.inputs = extract_ssa_refs(rhs.substr(0, colon));
         } else if (rhs.rfind("stablehlo.and ", 0) == 0) {
             op.kind = MockOp::Kind::BIT_AND;
@@ -1019,6 +1192,17 @@ static MockProgram parse_stablehlo_mlir(const std::string& mlir) {
             op.gather_start_index_map = parse_named_arr("start_index_map");
             const size_t iv = rhs.find("index_vector_dim =");
             op.gather_index_vector_dim = std::stoll(rhs.substr(iv + 18));
+        } else if (rhs.rfind("stablehlo.compare ", 0) == 0) {
+            op.kind = MockOp::Kind::COMPARE;
+            const size_t dir_start = 18;
+            const size_t comma = rhs.find(',', dir_start);
+            op.cmp_dir = trim_copy(rhs.substr(dir_start, comma - dir_start));
+            op.inputs = extract_ssa_refs(rhs.substr(0, colon));
+        } else if (rhs.rfind("\"stablehlo.select\"", 0) == 0) {
+            op.kind = MockOp::Kind::SELECT;
+            const size_t lp = rhs.find('(');
+            const size_t rp = rhs.find(')', lp);
+            op.inputs = extract_ssa_refs(rhs.substr(lp + 1, rp - lp - 1));
         } else if (rhs.rfind("\"stablehlo.scatter\"", 0) == 0) {
             op.kind = MockOp::Kind::SCATTER_3D_ROWS;
             const size_t lp = rhs.find('(');
@@ -1097,7 +1281,7 @@ static MockTensor eval_mock_op(const MockOp& op,
     out.allocate(op.out_type.dtype, op.out_type.dims);
     const size_t n_out = out.num_elements();
 
-    const bool is_int = is_mock_int_dtype(out.dtype);
+    const bool is_int = is_mock_integer_dtype(out.dtype);
 
     switch (op.kind) {
         case MockOp::Kind::CONSTANT: {
@@ -1127,7 +1311,7 @@ static MockTensor eval_mock_op(const MockOp& op,
         }
         case MockOp::Kind::CONVERT: {
             const MockTensor& a = env.at(op.inputs[0]);
-            const bool src_int = is_mock_int_dtype(a.dtype);
+            const bool src_int = is_mock_integer_dtype(a.dtype);
             for (size_t i = 0; i < n_out; ++i) {
                 if (is_int && src_int) out.write_i64(i, a.read_i64(i));
                 else if (is_int) out.write_i64(i, static_cast<int64_t>(a.read_f32(i)));
@@ -1140,7 +1324,9 @@ static MockTensor eval_mock_op(const MockOp& op,
             const MockTensor& a = env.at(op.inputs[0]);
             const size_t bits_in = pjrt_dtype_bits(a.dtype);
             const size_t bits_out = pjrt_dtype_bits(out.dtype);
-            if (a.num_elements() * bits_in != n_out * bits_out || a.bytes.size() != out.bytes.size()) {
+            if (bits_in == 0 || bits_out == 0 ||
+                a.num_elements() * bits_in != n_out * bits_out ||
+                a.bytes.size() != out.bytes.size()) {
                 throw std::runtime_error("MockPJRT: bitcast_convert total bitwidth mismatch");
             }
             out.bytes = a.bytes;
@@ -1151,6 +1337,7 @@ static MockTensor eval_mock_op(const MockOp& op,
         case MockOp::Kind::MULTIPLY:
         case MockOp::Kind::DIVIDE:
         case MockOp::Kind::MAXIMUM:
+        case MockOp::Kind::MINIMUM:
         case MockOp::Kind::BIT_AND:
         case MockOp::Kind::SHR_LOGICAL: {
             const MockTensor& a = env.at(op.inputs[0]);
@@ -1162,15 +1349,18 @@ static MockTensor eval_mock_op(const MockOp& op,
                     const int64_t va = a.read_i64(i);
                     const int64_t vb = b.read_i64(i);
                     int64_t vr = 0;
-                    if (op.kind == MockOp::Kind::ADD) vr = va + vb;
-                    else if (op.kind == MockOp::Kind::SUBTRACT) vr = va - vb;
-                    else if (op.kind == MockOp::Kind::MULTIPLY) vr = va * vb;
+                    if (op.kind == MockOp::Kind::ADD) vr = static_cast<int64_t>(static_cast<uint64_t>(va) + static_cast<uint64_t>(vb));
+                    else if (op.kind == MockOp::Kind::SUBTRACT) vr = static_cast<int64_t>(static_cast<uint64_t>(va) - static_cast<uint64_t>(vb));
+                    else if (op.kind == MockOp::Kind::MULTIPLY) vr = static_cast<int64_t>(static_cast<uint64_t>(va) * static_cast<uint64_t>(vb));
                     else if (op.kind == MockOp::Kind::DIVIDE) vr = (vb != 0) ? (va / vb) : 0;
                     else if (op.kind == MockOp::Kind::MAXIMUM) vr = std::max(va, vb);
+                    else if (op.kind == MockOp::Kind::MINIMUM) vr = std::min(va, vb);
                     else if (op.kind == MockOp::Kind::BIT_AND) vr = (va & vb);
                     else if (op.kind == MockOp::Kind::SHR_LOGICAL) {
                         const uint64_t ua = static_cast<uint64_t>(va) & bit_mask;
-                        vr = static_cast<int64_t>(ua >> static_cast<unsigned>(vb));
+                        vr = (vb < 0 || static_cast<uint64_t>(vb) >= out_bits)
+                                 ? 0
+                                 : static_cast<int64_t>(ua >> static_cast<unsigned>(vb));
                     }
                     out.write_i64(i, vr);
                 } else {
@@ -1182,6 +1372,7 @@ static MockTensor eval_mock_op(const MockOp& op,
                     else if (op.kind == MockOp::Kind::MULTIPLY) vr = va * vb;
                     else if (op.kind == MockOp::Kind::DIVIDE) vr = va / vb;
                     else if (op.kind == MockOp::Kind::MAXIMUM) vr = std::max(va, vb);
+                    else if (op.kind == MockOp::Kind::MINIMUM) vr = std::min(va, vb);
                     out.write_f32(i, vr);
                 }
             }
@@ -1495,6 +1686,46 @@ static MockTensor eval_mock_op(const MockOp& op,
             }
             break;
         }
+        case MockOp::Kind::COMPARE: {
+            const MockTensor& a = env.at(op.inputs[0]);
+            const MockTensor& b = env.at(op.inputs[1]);
+            const bool a_int = is_mock_integer_dtype(a.dtype);
+            for (size_t i = 0; i < n_out; ++i) {
+                bool r = false;
+                if (a_int) {
+                    const int64_t va = a.read_i64(i);
+                    const int64_t vb = b.read_i64(i);
+                    if (op.cmp_dir == "EQ") r = (va == vb);
+                    else if (op.cmp_dir == "NE") r = (va != vb);
+                    else if (op.cmp_dir == "GT") r = (va > vb);
+                    else if (op.cmp_dir == "GE") r = (va >= vb);
+                    else if (op.cmp_dir == "LT") r = (va < vb);
+                    else if (op.cmp_dir == "LE") r = (va <= vb);
+                } else {
+                    const float va = a.read_f32(i);
+                    const float vb = b.read_f32(i);
+                    if (op.cmp_dir == "EQ") r = (va == vb);
+                    else if (op.cmp_dir == "NE") r = (va != vb);
+                    else if (op.cmp_dir == "GT") r = (va > vb);
+                    else if (op.cmp_dir == "GE") r = (va >= vb);
+                    else if (op.cmp_dir == "LT") r = (va < vb);
+                    else if (op.cmp_dir == "LE") r = (va <= vb);
+                }
+                out.write_i64(i, r ? 1 : 0);
+            }
+            break;
+        }
+        case MockOp::Kind::SELECT: {
+            const MockTensor& p = env.at(op.inputs[0]);
+            const MockTensor& t = env.at(op.inputs[1]);
+            const MockTensor& f = env.at(op.inputs[2]);
+            const bool scalar_pred = (p.num_elements() == 1);
+            for (size_t i = 0; i < n_out; ++i) {
+                const bool take_t = (p.read_i64(scalar_pred ? 0 : i) != 0);
+                copy_mock_elem(out, i, take_t ? t : f, i);
+            }
+            break;
+        }
         case MockOp::Kind::REPLICA_ID: {
             out.write_i64(0, replica_id);
             break;
@@ -1523,10 +1754,22 @@ static MockTensor eval_mock_op(const MockOp& op,
             break;
         }
         case MockOp::Kind::DYNAMIC_UPDATE_SLICE: {
+            if (op.inputs.size() < 2) {
+                throw std::runtime_error("MockPJRT: dynamic_update_slice requires operand and update");
+            }
             const MockTensor& operand = env.at(op.inputs[0]);
             const MockTensor& update = env.at(op.inputs[1]);
-            out.bytes = operand.bytes;
             const size_t rank = operand.dims.size();
+            if (operand.dtype != out.dtype || update.dtype != operand.dtype ||
+                operand.dims != out.dims || update.dims.size() != rank) {
+                throw std::runtime_error("MockPJRT: dynamic_update_slice operand/update type or rank mismatch");
+            }
+            for (size_t d = 0; d < rank; ++d) {
+                if (update.dims[d] > operand.dims[d]) {
+                    throw std::runtime_error("MockPJRT: dynamic_update_slice update dim exceeds operand dim");
+                }
+            }
+            out.bytes = operand.bytes;
             std::vector<int64_t> starts(rank, 0);
             for (size_t d = 0; d < rank && (d + 2) < op.inputs.size(); ++d) {
                 const int64_t st = env.at(op.inputs[d + 2]).read_i64(0);
@@ -1578,17 +1821,31 @@ static void eval_mock_collective(const MockOp& op,
             MockTensor acc;
             acc.allocate(op.out_type.dtype, op.out_type.dims);
             const size_t n = acc.num_elements();
+            const bool int_dt = is_mock_integer_dtype(acc.dtype);
             for (size_t gi = 0; gi < grp.size(); ++gi) {
                 const size_t r = static_cast<size_t>(grp[gi]);
                 const MockTensor& src = envs.at(r).at(op.inputs[0]);
                 for (size_t i = 0; i < n; ++i) {
-                    const float v = src.read_f32(i);
-                    if (gi == 0) {
-                        acc.write_f32(i, v);
-                    } else if (op.kind == MockOp::Kind::ALL_REDUCE_ADD) {
-                        acc.write_f32(i, acc.read_f32(i) + v);
+                    if (int_dt) {
+                        const int64_t v = src.read_i64(i);
+                        if (gi == 0) {
+                            acc.write_i64(i, v);
+                        } else if (op.kind == MockOp::Kind::ALL_REDUCE_ADD) {
+                            acc.write_i64(
+                                i, static_cast<int64_t>(static_cast<uint64_t>(acc.read_i64(i)) +
+                                                        static_cast<uint64_t>(v)));
+                        } else {
+                            acc.write_i64(i, std::max(acc.read_i64(i), v));
+                        }
                     } else {
-                        acc.write_f32(i, std::max(acc.read_f32(i), v));
+                        const float v = src.read_f32(i);
+                        if (gi == 0) {
+                            acc.write_f32(i, v);
+                        } else if (op.kind == MockOp::Kind::ALL_REDUCE_ADD) {
+                            acc.write_f32(i, acc.read_f32(i) + v);
+                        } else {
+                            acc.write_f32(i, std::max(acc.read_f32(i), v));
+                        }
                     }
                 }
             }
@@ -1626,11 +1883,20 @@ static void eval_mock_collective(const MockOp& op,
             MockTensor full;
             full.allocate(first.dtype, first.dims);
             const size_t n_full = full.num_elements();
+            const bool int_dt = is_mock_integer_dtype(full.dtype);
             for (size_t gi = 0; gi < grp.size(); ++gi) {
                 const MockTensor& src = envs.at(static_cast<size_t>(grp[gi])).at(op.inputs[0]);
                 for (size_t i = 0; i < n_full; ++i) {
-                    const float v = src.read_f32(i);
-                    full.write_f32(i, (gi == 0) ? v : (full.read_f32(i) + v));
+                    if (int_dt) {
+                        const int64_t v = src.read_i64(i);
+                        full.write_i64(
+                            i, (gi == 0) ? v
+                                         : static_cast<int64_t>(static_cast<uint64_t>(full.read_i64(i)) +
+                                                                static_cast<uint64_t>(v)));
+                    } else {
+                        const float v = src.read_f32(i);
+                        full.write_f32(i, (gi == 0) ? v : (full.read_f32(i) + v));
+                    }
                 }
             }
             const size_t sdim = static_cast<size_t>(op.collective_dim);
@@ -1660,8 +1926,6 @@ static void eval_mock_collective(const MockOp& op,
 }
 
 // Mock PJRT C API opaque structs
-static std::atomic<int> g_mock_requested_devices{1};
-
 struct MockError {
     std::string message;
 };
@@ -1676,7 +1940,8 @@ struct MockDevice {
     MockClient* client = nullptr;
     int id = 0;
     MockDeviceDescription desc;
-    std::atomic<int64_t> allocated_bytes{0};
+    // Shared ownership so orphan MockBuffers outliving MockClient::destroy never UAF.
+    std::shared_ptr<std::atomic<int64_t>> allocated_bytes = std::make_shared<std::atomic<int64_t>>(0);
     int64_t hbm_limit = 16909336064LL;  // 15.748 GiB (v5e-1 default)
 };
 struct MockClient {
@@ -1714,14 +1979,137 @@ struct MockClient {
 };
 struct MockBuffer {
     MockTensor tensor;
-    MockDevice* device = nullptr;
+    std::shared_ptr<std::atomic<int64_t>> allocated_bytes;
+    int device_id = 0;
 };
 struct MockExecutable {
     MockProgram program;
 };
 struct MockLoadedExecutable {
     MockExecutable exec;
+    std::vector<std::shared_ptr<std::atomic<int64_t>>> device_allocated_bytes;
+    std::vector<int> assigned_device_ids;
 };
+
+static bool pb_read_varint(const uint8_t* data, size_t size, size_t& pos, uint64_t& out) {
+    out = 0;
+    unsigned shift = 0;
+    while (pos < size && shift < 64) {
+        const uint8_t b = data[pos++];
+        out |= static_cast<uint64_t>(b & 0x7fU) << shift;
+        if ((b & 0x80U) == 0) {
+            return true;
+        }
+        shift += 7;
+    }
+    return false;
+}
+
+static bool pb_skip_field(const uint8_t* data, size_t size, size_t& pos, uint64_t wire_type) {
+    uint64_t v = 0;
+    switch (wire_type) {
+        case 0:
+            return pb_read_varint(data, size, pos, v);
+        case 1:
+            if (size - pos < 8) return false;
+            pos += 8;
+            return true;
+        case 2:
+            if (!pb_read_varint(data, size, pos, v) || v > size - pos) return false;
+            pos += static_cast<size_t>(v);
+            return true;
+        case 5:
+            if (size - pos < 4) return false;
+            pos += 4;
+            return true;
+        default:
+            return false;
+    }
+}
+
+static std::vector<int> parse_assigned_device_ids_from_compile_options(const char* buf, size_t len) {
+    std::vector<int> ids;
+    const auto* data = reinterpret_cast<const uint8_t*>(buf);
+    size_t pos = 0;
+    while (pos < len) {
+        uint64_t tag = 0;
+        if (!pb_read_varint(data, len, pos, tag)) break;
+        const uint64_t field = tag >> 3;
+        const uint64_t wt = tag & 7U;
+        if (field == 3 && wt == 2) {  // executable_build_options
+            uint64_t ebo_len = 0;
+            if (!pb_read_varint(data, len, pos, ebo_len) || ebo_len > len - pos) break;
+            const uint8_t* ebo = data + pos;
+            size_t epos = 0;
+            while (epos < ebo_len) {
+                uint64_t etag = 0;
+                if (!pb_read_varint(ebo, static_cast<size_t>(ebo_len), epos, etag)) break;
+                const uint64_t efield = etag >> 3;
+                const uint64_t ewt = etag & 7U;
+                if (efield == 9 && ewt == 2) {  // device_assignment
+                    uint64_t da_len = 0;
+                    if (!pb_read_varint(ebo, static_cast<size_t>(ebo_len), epos, da_len) ||
+                        da_len > ebo_len - epos) break;
+                    const uint8_t* da = ebo + epos;
+                    size_t dpos = 0;
+                    while (dpos < da_len) {
+                        uint64_t dtag = 0;
+                        if (!pb_read_varint(da, static_cast<size_t>(da_len), dpos, dtag)) break;
+                        const uint64_t dfield = dtag >> 3;
+                        const uint64_t dwt = dtag & 7U;
+                        if (dfield == 3 && dwt == 2) {  // computation_devices
+                            uint64_t cd_len = 0;
+                            if (!pb_read_varint(da, static_cast<size_t>(da_len), dpos, cd_len) ||
+                                cd_len > da_len - dpos) break;
+                            const uint8_t* cd = da + dpos;
+                            size_t cpos = 0;
+                            while (cpos < cd_len) {
+                                uint64_t ctag = 0;
+                                if (!pb_read_varint(cd, static_cast<size_t>(cd_len), cpos, ctag)) break;
+                                const uint64_t cfield = ctag >> 3;
+                                const uint64_t cwt = ctag & 7U;
+                                if (cfield == 1 && cwt == 2) {  // packed replica_device_ids
+                                    uint64_t ids_len = 0;
+                                    if (!pb_read_varint(cd, static_cast<size_t>(cd_len), cpos, ids_len) ||
+                                        ids_len > cd_len - cpos) break;
+                                    size_t ipos = 0;
+                                    while (ipos < ids_len) {
+                                        uint64_t dev_id = 0;
+                                        if (!pb_read_varint(cd + cpos, static_cast<size_t>(ids_len), ipos, dev_id)) {
+                                            break;
+                                        }
+                                        ids.push_back(static_cast<int>(dev_id));
+                                    }
+                                    cpos += static_cast<size_t>(ids_len);
+                                } else if (cfield == 1 && cwt == 0) {
+                                    uint64_t dev_id = 0;
+                                    if (pb_read_varint(cd, static_cast<size_t>(cd_len), cpos, dev_id)) {
+                                        ids.push_back(static_cast<int>(dev_id));
+                                    }
+                                } else if (!pb_skip_field(cd, static_cast<size_t>(cd_len), cpos, cwt)) {
+                                    break;
+                                }
+                            }
+                            dpos += static_cast<size_t>(cd_len);
+                        } else if (!pb_skip_field(da, static_cast<size_t>(da_len), dpos, dwt)) {
+                            break;
+                        }
+                    }
+                    epos += static_cast<size_t>(da_len);
+                } else if (!pb_skip_field(ebo, static_cast<size_t>(ebo_len), epos, ewt)) {
+                    break;
+                }
+            }
+            pos += static_cast<size_t>(ebo_len);
+        } else if (!pb_skip_field(data, len, pos, wt)) {
+            break;
+        }
+    }
+    if (ids.empty()) {
+        ids.push_back(0);
+    }
+    return ids;
+}
 
 static PJRT_Error* mock_error(const std::string& msg) {
     return reinterpret_cast<PJRT_Error*>(new MockError{msg});
@@ -1737,6 +2125,11 @@ static void mock_error_message(PJRT_Error_Message_Args* args) {
     args->message_size = e->message.size();
 }
 
+static PJRT_Error* mock_error_get_code(PJRT_Error_GetCode_Args* args) {
+    args->code = PJRT_Error_Code_INTERNAL;
+    return nullptr;
+}
+
 static PJRT_Error* mock_plugin_initialize(PJRT_Plugin_Initialize_Args*) { return nullptr; }
 static PJRT_Error* mock_event_destroy(PJRT_Event_Destroy_Args* args) {
     delete reinterpret_cast<MockEvent*>(args->event);
@@ -1745,7 +2138,17 @@ static PJRT_Error* mock_event_destroy(PJRT_Event_Destroy_Args* args) {
 static PJRT_Error* mock_event_await(PJRT_Event_Await_Args*) { return nullptr; }
 
 static PJRT_Error* mock_client_create(PJRT_Client_Create_Args* args) {
-    int n_devs = g_mock_requested_devices.load(std::memory_order_acquire);
+    int n_devs = 1;
+    if (args->create_options && args->num_options > 0) {
+        for (size_t i = 0; i < args->num_options; ++i) {
+            const PJRT_NamedValue& opt = args->create_options[i];
+            if (opt.name && opt.name_size == 17 &&
+                std::memcmp(opt.name, "mock_device_count", 17) == 0 &&
+                opt.type == PJRT_NamedValue_kInt64) {
+                n_devs = std::max(1, std::min(16, static_cast<int>(opt.int64_value)));
+            }
+        }
+    }
     if (n_devs <= 1) {
         if (const char* v = std::getenv("CLOUDTPU_MOCK_DEVICES")) {
             const int parsed = std::atoi(v);
@@ -1791,34 +2194,49 @@ static PJRT_Error* mock_dev_desc_id(PJRT_DeviceDescription_Id_Args* args) {
 }
 static PJRT_Error* mock_dev_desc_kind(PJRT_DeviceDescription_Kind_Args* args) {
     const auto* desc = reinterpret_cast<const MockDeviceDescription*>(args->device_description);
-    args->device_kind = desc->kind.data();
-    args->device_kind_size = desc->kind.size();
+    if (desc) {
+        args->device_kind = desc->kind.data();
+        args->device_kind_size = desc->kind.size();
+    } else {
+        static const char kKind[] = "Cloud TPU Host Mock";
+        args->device_kind = kKind;
+        args->device_kind_size = sizeof(kKind) - 1;
+    }
     return nullptr;
 }
 static PJRT_Error* mock_dev_desc_to_string(PJRT_DeviceDescription_ToString_Args* args) {
     const auto* desc = reinterpret_cast<const MockDeviceDescription*>(args->device_description);
-    args->to_string = desc->to_string.data();
-    args->to_string_size = desc->to_string.size();
+    if (desc) {
+        args->to_string = desc->to_string.data();
+        args->to_string_size = desc->to_string.size();
+    } else {
+        static const char kStr[] = "CLOUDTPU_MOCK(id=0)";
+        args->to_string = kStr;
+        args->to_string_size = sizeof(kStr) - 1;
+    }
     return nullptr;
 }
 static PJRT_Error* mock_device_memory_stats(PJRT_Device_MemoryStats_Args* args) {
     auto* d = reinterpret_cast<MockDevice*>(args->device);
-    args->bytes_in_use = d->allocated_bytes.load(std::memory_order_relaxed);
+    args->bytes_in_use =
+        (d && d->allocated_bytes) ? d->allocated_bytes->load(std::memory_order_relaxed) : 0;
     args->bytes_limit_is_set = true;
-    args->bytes_limit = d->hbm_limit;
+    args->bytes_limit = d ? d->hbm_limit : 16909336064LL;
     return nullptr;
 }
 
 static PJRT_Error* mock_buffer_from_host(PJRT_Client_BufferFromHostBuffer_Args* args) {
     auto* c = reinterpret_cast<MockClient*>(args->client);
-    auto* d = args->device ? reinterpret_cast<MockDevice*>(args->device) : c->devices[0].get();
+    auto* d = args->device ? reinterpret_cast<MockDevice*>(args->device)
+                           : (c && !c->devices.empty() ? c->devices[0].get() : nullptr);
     const PjrtDType dt = from_pjrt_buffer_type(args->type);
     if (dt == PjrtDType::INVALID) {
         return mock_error("MockPJRT: unsupported PJRT_Buffer_Type");
     }
     std::vector<int64_t> shape(args->dims, args->dims + args->num_dims);
     auto* mb = new MockBuffer();
-    mb->device = d;
+    mb->allocated_bytes = d ? d->allocated_bytes : nullptr;
+    mb->device_id = d ? d->id : 0;
     mb->tensor.allocate(dt, std::move(shape));
     if (!mb->tensor.bytes.empty() && args->data) {
         const size_t nelems = mb->tensor.num_elements();
@@ -1830,8 +2248,8 @@ static PJRT_Error* mock_buffer_from_host(PJRT_Client_BufferFromHostBuffer_Args* 
             std::memcpy(mb->tensor.bytes.data(), args->data, mb->tensor.bytes.size());
         }
     }
-    if (d) {
-        d->allocated_bytes.fetch_add(static_cast<int64_t>(mb->tensor.bytes.size()), std::memory_order_relaxed);
+    if (mb->allocated_bytes) {
+        mb->allocated_bytes->fetch_add(static_cast<int64_t>(mb->tensor.bytes.size()), std::memory_order_relaxed);
     }
     args->done_with_host_buffer = reinterpret_cast<PJRT_Event*>(new MockEvent());
     args->buffer = reinterpret_cast<PJRT_Buffer*>(mb);
@@ -1839,8 +2257,8 @@ static PJRT_Error* mock_buffer_from_host(PJRT_Client_BufferFromHostBuffer_Args* 
 }
 static PJRT_Error* mock_buffer_destroy(PJRT_Buffer_Destroy_Args* args) {
     auto* mb = reinterpret_cast<MockBuffer*>(args->buffer);
-    if (mb && mb->device) {
-        mb->device->allocated_bytes.fetch_sub(static_cast<int64_t>(mb->tensor.bytes.size()), std::memory_order_relaxed);
+    if (mb && mb->allocated_bytes) {
+        mb->allocated_bytes->fetch_sub(static_cast<int64_t>(mb->tensor.bytes.size()), std::memory_order_relaxed);
     }
     delete mb;
     return nullptr;
@@ -1894,9 +2312,18 @@ static PJRT_Error* mock_client_compile(PJRT_Client_Compile_Args* args) {
         if (fmt != "mlir") {
             return mock_error("MockPJRT: expected program format 'mlir', got '" + fmt + "'");
         }
+        auto* c = reinterpret_cast<MockClient*>(args->client);
         const std::string code(args->program->code, args->program->code_size);
         auto* le = new MockLoadedExecutable();
         le->exec.program = parse_stablehlo_mlir(code);
+        if (c) {
+            le->device_allocated_bytes.reserve(c->devices.size());
+            for (const auto& d : c->devices) {
+                le->device_allocated_bytes.push_back(d->allocated_bytes);
+            }
+        }
+        le->assigned_device_ids =
+            parse_assigned_device_ids_from_compile_options(args->compile_options, args->compile_options_size);
         args->executable = reinterpret_cast<PJRT_LoadedExecutable*>(le);
         return nullptr;
     } catch (const std::exception& e) {
@@ -1925,21 +2352,64 @@ static PJRT_Error* mock_exec_num_outputs(PJRT_Executable_NumOutputs_Args* args) 
 static PJRT_Error* mock_loaded_exec_execute(PJRT_LoadedExecutable_Execute_Args* args) {
     try {
         auto* le = reinterpret_cast<MockLoadedExecutable*>(args->executable);
+        const size_t n_devs = std::max<size_t>(1, args->num_devices);
+        const int primary_assigned_id = le->assigned_device_ids.empty() ? 0 : le->assigned_device_ids[0];
+        if (args->execute_device != nullptr) {
+            auto* req_dev = reinterpret_cast<MockDevice*>(args->execute_device);
+            if (req_dev->id != primary_assigned_id) {
+                return mock_error("MockPJRT: execute_device id " + std::to_string(req_dev->id) +
+                                  " does not match compiled device assignment " +
+                                  std::to_string(primary_assigned_id));
+            }
+        }
+        if (n_devs != le->assigned_device_ids.size()) {
+            return mock_error("MockPJRT: num_devices " + std::to_string(n_devs) +
+                              " does not match compiled replica assignment count " +
+                              std::to_string(le->assigned_device_ids.size()));
+        }
         const MockProgram& prog = le->exec.program;
         if (args->num_args != prog.args.size()) {
             return mock_error("MockPJRT: argument count mismatch");
         }
-        const size_t n_devs = std::max<size_t>(1, args->num_devices);
         std::vector<std::unordered_map<std::string, MockTensor>> envs(n_devs);
-        std::vector<MockDevice*> dev_ptrs(n_devs, nullptr);
+        std::vector<std::shared_ptr<std::atomic<int64_t>>> alloc_bytes(n_devs);
         for (size_t d = 0; d < n_devs; ++d) {
+            const int expected_dev_id = le->assigned_device_ids[d];
+            if (expected_dev_id >= 0 &&
+                static_cast<size_t>(expected_dev_id) < le->device_allocated_bytes.size()) {
+                alloc_bytes[d] = le->device_allocated_bytes[static_cast<size_t>(expected_dev_id)];
+            }
             for (size_t i = 0; i < args->num_args; ++i) {
                 auto* mb = reinterpret_cast<MockBuffer*>(args->argument_lists[d][i]);
-                if (!dev_ptrs[d] && mb) dev_ptrs[d] = mb->device;
+                if (!mb) {
+                    return mock_error("MockPJRT: null input buffer at arg " + std::to_string(i));
+                }
+                if (mb->device_id != expected_dev_id) {
+                    return mock_error("MockPJRT: input buffer on device " + std::to_string(mb->device_id) +
+                                      " does not match executable device " +
+                                      std::to_string(expected_dev_id));
+                }
+                const MockTypeSpec& expected_ts = prog.args[i].second;
+                if (mb->tensor.dtype != expected_ts.dtype || mb->tensor.dims != expected_ts.dims) {
+                    return mock_error("MockPJRT: input arg " + std::to_string(i) + " on device " +
+                                      std::to_string(expected_dev_id) +
+                                      " dtype/shape does not match compiled parameter signature");
+                }
+                if (!alloc_bytes[d]) alloc_bytes[d] = mb->allocated_bytes;
                 envs[d][prog.args[i].first] = mb->tensor;
             }
         }
-        for (const MockOp& op : prog.ops) {
+        std::unordered_map<std::string, size_t> last_use;
+        for (size_t idx = 0; idx < prog.ops.size(); ++idx) {
+            for (const std::string& inp : prog.ops[idx].inputs) {
+                last_use[inp] = idx;
+            }
+        }
+        for (const std::string& rname : prog.return_names) {
+            last_use[rname] = prog.ops.size();
+        }
+        for (size_t idx = 0; idx < prog.ops.size(); ++idx) {
+            const MockOp& op = prog.ops[idx];
             if (is_mock_collective_op(op.kind)) {
                 eval_mock_collective(op, envs);
             } else {
@@ -1947,14 +2417,25 @@ static PJRT_Error* mock_loaded_exec_execute(PJRT_LoadedExecutable_Execute_Args* 
                     envs[d][op.out_name] = eval_mock_op(op, envs[d], static_cast<int64_t>(d));
                 }
             }
+            for (const std::string& inp : op.inputs) {
+                auto it = last_use.find(inp);
+                if (it != last_use.end() && it->second == idx) {
+                    for (size_t d = 0; d < n_devs; ++d) {
+                        envs[d].erase(inp);
+                    }
+                }
+            }
         }
         for (size_t d = 0; d < n_devs; ++d) {
+            const int dev_id = le->assigned_device_ids[d];
             for (size_t oi = 0; oi < prog.return_names.size(); ++oi) {
                 auto* out_mb = new MockBuffer();
-                out_mb->device = dev_ptrs[d];
-                out_mb->tensor = std::move(envs[d].at(prog.return_names[oi]));
-                if (dev_ptrs[d]) {
-                    dev_ptrs[d]->allocated_bytes.fetch_add(
+                out_mb->allocated_bytes = alloc_bytes[d];
+                out_mb->device_id = dev_id;
+                // Copy rather than move so repeated SSA values in return_names stay valid.
+                out_mb->tensor = envs[d].at(prog.return_names[oi]);
+                if (out_mb->allocated_bytes) {
+                    out_mb->allocated_bytes->fetch_add(
                         static_cast<int64_t>(out_mb->tensor.bytes.size()), std::memory_order_relaxed);
                 }
                 args->output_lists[d][oi] = reinterpret_cast<PJRT_Buffer*>(out_mb);
@@ -1979,6 +2460,7 @@ static const PJRT_Api* get_mock_pjrt_api() {
 
         a.PJRT_Error_Destroy = mock_error_destroy;
         a.PJRT_Error_Message = mock_error_message;
+        a.PJRT_Error_GetCode = mock_error_get_code;
         a.PJRT_Plugin_Initialize = mock_plugin_initialize;
         a.PJRT_Event_Destroy = mock_event_destroy;
         a.PJRT_Event_Await = mock_event_await;
@@ -2043,8 +2525,20 @@ void PjrtRuntime::check_error(PJRT_Error* err, const char* where) const {
             msg.assign(m_args.message, m_args.message_size);
         }
     }
+    PJRT_Error_Code code = PJRT_Error_Code_UNKNOWN;
+    if (api_ && PJRT_API_HAS(api_, PJRT_Error_GetCode)) {
+        PJRT_Error_GetCode_Args c_args = {};
+        c_args.struct_size = PJRT_Error_GetCode_Args_STRUCT_SIZE;
+        c_args.error = err;
+        PJRT_Error* code_err = api_->PJRT_Error_GetCode(&c_args);
+        if (code_err) {
+            destroy_error(code_err);
+        } else {
+            code = c_args.code;
+        }
+    }
     destroy_error(err);
-    throw std::runtime_error(std::string(where) + ": " + msg);
+    throw PjrtError(code, std::string(where) + ": " + msg);
 }
 
 std::string PjrtRuntime::resolve_libtpu_path(const std::string& override_path) const {
@@ -2071,17 +2565,26 @@ std::string PjrtRuntime::resolve_libtpu_path(const std::string& override_path) c
 }
 
 void PjrtRuntime::init(const RuntimeConfig& cfg) {
-    if (is_initialized()) {
+    if (initialized_) {
         return;
     }
+    try {
     cfg_ = cfg;
     is_mock_ = cfg.mock_mode;
 
     if (is_mock_) {
-        g_mock_requested_devices.store(std::max(1, cfg.mock_devices), std::memory_order_release);
         api_ = get_mock_pjrt_api();
     } else {
+#if defined(_WIN32)
+        throw std::runtime_error(
+            "Live libtpu.so loading is only supported on Linux/POSIX; use mock mode on Windows");
+#else
         setenv("GRPC_VERBOSITY", "ERROR", 0);
+        if (cfg.async_collectives) {
+            const char* cur = std::getenv("LIBTPU_INIT_ARGS");
+            const std::string merged = append_async_collective_libtpu_init_args(cur ? cur : "");
+            setenv("LIBTPU_INIT_ARGS", merged.c_str(), 1);
+        }
         const std::string so_path = resolve_libtpu_path(cfg.libtpu_path);
         dl_handle_ = dlopen(so_path.c_str(), RTLD_NOW | RTLD_GLOBAL);
         if (!dl_handle_) {
@@ -2100,6 +2603,7 @@ void PjrtRuntime::init(const RuntimeConfig& cfg) {
         if (!api_) {
             throw std::runtime_error("GetPjrtApi() returned nullptr");
         }
+#endif
     }
 
     if (!PJRT_API_HAS(api_, PJRT_Error_Destroy) ||
@@ -2131,8 +2635,19 @@ void PjrtRuntime::init(const RuntimeConfig& cfg) {
         check_error(api_->PJRT_Plugin_Initialize(&init_args), "PJRT_Plugin_Initialize");
     }
 
+    PJRT_NamedValue mock_dev_opt = {};
+    mock_dev_opt.struct_size = PJRT_NamedValue_STRUCT_SIZE;
+    mock_dev_opt.name = "mock_device_count";
+    mock_dev_opt.name_size = 17;
+    mock_dev_opt.type = PJRT_NamedValue_kInt64;
+    mock_dev_opt.int64_value = std::max(1, cfg.mock_devices);
+
     PJRT_Client_Create_Args c_args = {};
     c_args.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
+    if (is_mock_ && cfg.mock_devices > 1) {
+        c_args.create_options = &mock_dev_opt;
+        c_args.num_options = 1;
+    }
     check_error(api_->PJRT_Client_Create(&c_args), "PJRT_Client_Create");
     client_ = c_args.client;
 
@@ -2213,9 +2728,15 @@ void PjrtRuntime::init(const RuntimeConfig& cfg) {
         }
         device_infos_.push_back(std::move(info));
     }
+    initialized_ = true;
+    } catch (...) {
+        shutdown();
+        throw;
+    }
 }
 
 void PjrtRuntime::shutdown() {
+    initialized_ = false;
     clear_exec_cache();
     if (client_ && api_ && PJRT_API_HAS(api_, PJRT_Client_Destroy)) {
         PJRT_Client_Destroy_Args args = {};
@@ -2229,6 +2750,9 @@ void PjrtRuntime::shutdown() {
     }
     devices_.clear();
     device_infos_.clear();
+    platform_name_.clear();
+    platform_version_.clear();
+    has_ready_event_ = false;
     api_ = nullptr;
     // Intentionally skip dlclose(dl_handle_) for libtpu singleton thread-safety.
 }
@@ -2288,16 +2812,28 @@ void PjrtRuntime::await_event(PJRT_Event* ev) {
     check_error(derr, "PJRT_Event_Destroy");
 }
 
-void PjrtRuntime::await_buffer_ready(PJRT_Buffer* buf) {
-    if (!buf || !has_ready_event_) {
+void PjrtRuntime::await_event(PjrtEventHandle ev) {
+    if (!ev) {
         return;
+    }
+    await_event(ev.release());
+}
+
+PjrtEventHandle PjrtRuntime::create_buffer_ready_event(PJRT_Buffer* buf) {
+    if (!buf || !has_ready_event_) {
+        return PjrtEventHandle(nullptr, PjrtEventDeleter{api_});
     }
     PJRT_Buffer_ReadyEvent_Args r_args = {};
     r_args.struct_size = PJRT_Buffer_ReadyEvent_Args_STRUCT_SIZE;
     r_args.buffer = buf;
     check_error(api_->PJRT_Buffer_ReadyEvent(&r_args), "PJRT_Buffer_ReadyEvent");
-    if (r_args.event) {
-        await_event(r_args.event);
+    return PjrtEventHandle(r_args.event, PjrtEventDeleter{api_});
+}
+
+void PjrtRuntime::await_buffer_ready(PJRT_Buffer* buf) {
+    PjrtEventHandle ev = create_buffer_ready_event(buf);
+    if (ev) {
+        await_event(std::move(ev));
     }
 }
 
@@ -2323,12 +2859,13 @@ PjrtBufferPtr PjrtRuntime::buffer_from_host(int device_idx,
     args.device_layout = nullptr;
 
     check_error(api_->PJRT_Client_BufferFromHostBuffer(&args), "PJRT_Client_BufferFromHostBuffer");
+    PjrtBufferHandle buf_handle(args.buffer, PjrtBufferDeleter{api_});
     if (args.done_with_host_buffer) {
         await_event(args.done_with_host_buffer);
     }
 
     auto out = std::make_shared<PjrtBuffer>();
-    out->handle = PjrtBufferHandle(args.buffer, PjrtBufferDeleter{api_});
+    out->handle = std::move(buf_handle);
     out->dtype = dtype;
     out->dims = dims;
     return out;
@@ -2351,8 +2888,7 @@ std::vector<PjrtBufferPtr> PjrtRuntime::buffer_from_host_replicated(int num_devi
 
 PjrtCompileOptions PjrtRuntime::make_spmd_compile_options(int num_chips,
                                                           int device_idx,
-                                                          bool alias_passthrough,
-                                                          bool async_collectives) const {
+                                                          bool alias_passthrough) const {
     PjrtCompileOptions opts;
     opts.alias_passthrough_params = alias_passthrough;
     const int n = std::max(1, std::min(num_chips, static_cast<int>(device_infos_.size())));
@@ -2367,6 +2903,9 @@ PjrtCompileOptions PjrtRuntime::make_spmd_compile_options(int num_chips,
     } else {
         // Explicit collective replica-SPMD across n TPU chips:
         // num_replicas = n, num_partitions = 1, explicit DeviceAssignmentProto mapping [0][0..n-1].
+        // Leave env_option_overrides empty: OpenXLA's CompileOptions::ApplyOption only accepts
+        // xla::DebugOptions fields and rejects TPU-specific xla_tpu_* flags; opt-in async
+        // collective flags are passed via LIBTPU_INIT_ARGS before libtpu.so loads.
         opts.num_replicas = n;
         opts.num_partitions = 1;
         opts.use_spmd_partitioning = false;
@@ -2374,17 +2913,6 @@ PjrtCompileOptions PjrtRuntime::make_spmd_compile_options(int num_chips,
         opts.device_assignment_ids.resize(static_cast<size_t>(n));
         for (int i = 0; i < n; ++i) {
             opts.device_assignment_ids[static_cast<size_t>(i)] = device_infos_[static_cast<size_t>(i)].id;
-        }
-        if (async_collectives) {
-            opts.backend_extra_options = {
-                {"xla_tpu_enable_async_collective_fusion", "true"},
-                {"xla_tpu_overlap_compute_collective_tc", "true"},
-                {"xla_tpu_enable_async_collective_fusion_multiple_steps", "true"},
-                {"xla_enable_async_all_gather", "true"},
-                {"xla_enable_async_all_reduce", "true"},
-                {"xla_tpu_enable_async_collective_fusion_fuse_all_gather", "true"},
-                {"xla_tpu_enable_async_collective_fusion_fuse_all_reduce", "true"},
-            };
         }
     }
     return opts;
@@ -2508,21 +3036,47 @@ void PjrtRuntime::buffer_to_host(PJRT_Buffer* buf, void* dst, size_t dst_size) {
     }
 }
 
-const CachedExecutable* PjrtRuntime::compile_or_get(const std::string& cache_key,
-                                                    const std::string& mlir_text,
-                                                    const PjrtCompileOptions& opts) {
+CachedExecutablePtr PjrtRuntime::compile_or_get(const std::string& cache_key,
+                                                const std::string& mlir_text,
+                                                int device_idx,
+                                                const PjrtCompileOptions& opts) {
+    if (device_idx < 0 || device_idx >= static_cast<int>(devices_.size())) {
+        throw std::out_of_range("compile_or_get: device_idx out of range");
+    }
+
+    PjrtCompileOptions eff_opts = opts;
+    const int target_dev_id = device_infos_[static_cast<size_t>(device_idx)].id;
+    if (eff_opts.device_assignment_ids.empty() && eff_opts.num_replicas == 1 &&
+        eff_opts.num_partitions == 1 && devices_.size() > 1) {
+        eff_opts.device_assignment_ids.push_back(static_cast<int64_t>(target_dev_id));
+    }
+
+    const std::string opts_pb = encode_compile_options_proto(eff_opts);
+
+    static const char kHex[] = "0123456789abcdef";
+    std::string full_key = cache_key;
+    full_key.append("|dev=");
+    full_key.append(std::to_string(device_idx));
+    full_key.push_back(':');
+    full_key.append(std::to_string(target_dev_id));
+    full_key.append("|opts=");
+    full_key.reserve(full_key.size() + opts_pb.size() * 2);
+    for (unsigned char b : opts_pb) {
+        full_key.push_back(kHex[b >> 4]);
+        full_key.push_back(kHex[b & 0x0f]);
+    }
+
     {
         std::lock_guard<std::mutex> lock(cache_mu_);
-        auto it = exec_cache_.find(cache_key);
+        auto it = exec_cache_.find(full_key);
         if (it != exec_cache_.end()) {
             cache_hits_ += 1;
             lru_order_.splice(lru_order_.begin(), lru_order_, it->second.lru_it);
-            return &it->second.exec;
+            return it->second.exec;
         }
     }
 
     const auto t0 = std::chrono::steady_clock::now();
-    const std::string opts_pb = encode_compile_options_proto(opts);
 
     PJRT_Program prog = {};
     prog.struct_size = PJRT_Program_STRUCT_SIZE;
@@ -2539,17 +3093,13 @@ const CachedExecutable* PjrtRuntime::compile_or_get(const std::string& cache_key
     c_args.compile_options_size = opts_pb.size();
 
     check_error(api_->PJRT_Client_Compile(&c_args), "PJRT_Client_Compile");
+    PjrtLoadedExecutableHandle loaded_handle(c_args.executable, PjrtLoadedExecutableDeleter{api_});
 
     PJRT_LoadedExecutable_GetExecutable_Args ge = {};
     ge.struct_size = PJRT_LoadedExecutable_GetExecutable_Args_STRUCT_SIZE;
-    ge.loaded_executable = c_args.executable;
+    ge.loaded_executable = loaded_handle.get();
     PJRT_Error* ge_err = api_->PJRT_LoadedExecutable_GetExecutable(&ge);
     if (ge_err || !ge.executable) {
-        PJRT_LoadedExecutable_Destroy_Args ld = {};
-        ld.struct_size = PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
-        ld.executable = c_args.executable;
-        PJRT_Error* derr = api_->PJRT_LoadedExecutable_Destroy(&ld);
-        if (derr) destroy_error(derr);
         if (ge_err) check_error(ge_err, "PJRT_LoadedExecutable_GetExecutable");
         throw std::runtime_error("PJRT_LoadedExecutable_GetExecutable returned null");
     }
@@ -2565,11 +3115,6 @@ const CachedExecutable* PjrtRuntime::compile_or_get(const std::string& cache_key
     PJRT_Error* ed_err = api_->PJRT_Executable_Destroy(&ed);
 
     if (no_err || ed_err) {
-        PJRT_LoadedExecutable_Destroy_Args ld = {};
-        ld.struct_size = PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
-        ld.executable = c_args.executable;
-        PJRT_Error* derr = api_->PJRT_LoadedExecutable_Destroy(&ld);
-        if (derr) destroy_error(derr);
         if (no_err) {
             if (ed_err) destroy_error(ed_err);
             check_error(no_err, "PJRT_Executable_NumOutputs");
@@ -2581,23 +3126,20 @@ const CachedExecutable* PjrtRuntime::compile_or_get(const std::string& cache_key
     const uint64_t compile_us = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
 
-    CachedExecutable exec;
-    exec.key = cache_key;
-    exec.handle = c_args.executable;
-    exec.num_outputs = no.num_outputs;
+    auto exec = std::make_shared<CachedExecutable>();
+    exec->key = full_key;
+    exec->handle = std::move(loaded_handle);
+    exec->device_idx = device_idx;
+    exec->num_replicas = std::max<int>(1, eff_opts.num_replicas);
+    exec->num_outputs = no.num_outputs;
 
     std::lock_guard<std::mutex> lock(cache_mu_);
     // Re-check in case another thread compiled the same key concurrently.
-    auto existing = exec_cache_.find(cache_key);
+    auto existing = exec_cache_.find(full_key);
     if (existing != exec_cache_.end()) {
-        PJRT_LoadedExecutable_Destroy_Args ld = {};
-        ld.struct_size = PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
-        ld.executable = exec.handle;
-        PJRT_Error* derr = api_->PJRT_LoadedExecutable_Destroy(&ld);
-        if (derr) destroy_error(derr);
         cache_hits_ += 1;
         lru_order_.splice(lru_order_.begin(), lru_order_, existing->second.lru_it);
-        return &existing->second.exec;
+        return existing->second.exec;
     }
 
     cache_misses_ += 1;
@@ -2608,11 +3150,6 @@ const CachedExecutable* PjrtRuntime::compile_or_get(const std::string& cache_key
         const std::string& victim_key = lru_order_.back();
         auto vit = exec_cache_.find(victim_key);
         if (vit != exec_cache_.end()) {
-            PJRT_LoadedExecutable_Destroy_Args ld = {};
-            ld.struct_size = PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
-            ld.executable = vit->second.exec.handle;
-            PJRT_Error* derr = api_->PJRT_LoadedExecutable_Destroy(&ld);
-            if (derr) destroy_error(derr);
             exec_cache_.erase(vit);
             cache_evictions_ += 1;
             eviction_epoch_.fetch_add(1, std::memory_order_release);
@@ -2620,16 +3157,15 @@ const CachedExecutable* PjrtRuntime::compile_or_get(const std::string& cache_key
         lru_order_.pop_back();
     }
 
-    lru_order_.push_front(cache_key);
+    lru_order_.push_front(full_key);
     CacheEntry entry;
-    entry.exec = std::move(exec);
+    entry.exec = exec;
     entry.lru_it = lru_order_.begin();
-    auto [inserted_it, ok] = exec_cache_.emplace(cache_key, std::move(entry));
-    (void) ok;
-    return &inserted_it->second.exec;
+    exec_cache_.emplace(full_key, std::move(entry));
+    return exec;
 }
 
-void PjrtRuntime::execute(const CachedExecutable* exec,
+void PjrtRuntime::execute(const CachedExecutablePtr& exec,
                           int device_idx,
                           PJRT_Buffer* const* inputs,
                           size_t num_inputs,
@@ -2643,6 +3179,12 @@ void PjrtRuntime::execute(const CachedExecutable* exec,
     }
     if (device_idx < 0 || device_idx >= static_cast<int>(devices_.size())) {
         throw std::out_of_range("execute: device_idx out of range");
+    }
+    if (exec->num_replicas != 1 || exec->device_idx != device_idx) {
+        throw std::runtime_error("execute: executable compiled for device " +
+                                 std::to_string(exec->device_idx) + " (replicas=" +
+                                 std::to_string(exec->num_replicas) + "), cannot run on device " +
+                                 std::to_string(device_idx));
     }
     if (exec->num_outputs != out_dtypes.size() || exec->num_outputs != out_dims.size()) {
         throw std::runtime_error("execute: output count mismatch vs executable");
@@ -2676,7 +3218,7 @@ void PjrtRuntime::execute(const CachedExecutable* exec,
 
     PJRT_LoadedExecutable_Execute_Args ex = {};
     ex.struct_size = PJRT_LoadedExecutable_Execute_Args_STRUCT_SIZE;
-    ex.executable = exec->handle;
+    ex.executable = exec->handle.get();
     ex.options = &opts;
     ex.argument_lists = arg_lists;
     ex.num_devices = 1;
@@ -2688,20 +3230,27 @@ void PjrtRuntime::execute(const CachedExecutable* exec,
     // (passing a non-null execute_device is only valid for portable executables).
     ex.execute_device = nullptr;
 
+    std::vector<PjrtBufferHandle> out_handles;
+    out_handles.reserve(exec->num_outputs);
+
     check_error(api_->PJRT_LoadedExecutable_Execute(&ex), "PJRT_LoadedExecutable_Execute");
+    PjrtEventHandle dev_ev_handle(dev_ev[0], PjrtEventDeleter{api_});
+    for (size_t i = 0; i < exec->num_outputs; ++i) {
+        out_handles.emplace_back(raw_out_ptr[i], PjrtBufferDeleter{api_});
+    }
 
     outputs.resize(exec->num_outputs);
     for (size_t i = 0; i < exec->num_outputs; ++i) {
         auto buf = std::make_shared<PjrtBuffer>();
-        buf->handle = PjrtBufferHandle(raw_out_ptr[i], PjrtBufferDeleter{api_});
+        buf->handle = std::move(out_handles[i]);
         buf->dtype = out_dtypes[i];
         buf->dims = out_dims[i];
         outputs[i] = std::move(buf);
     }
 
     if (sync) {
-        if (use_dev_event && dev_ev[0]) {
-            await_event(dev_ev[0]);
+        if (use_dev_event && dev_ev_handle) {
+            await_event(std::move(dev_ev_handle));
         } else if (has_ready_event_) {
             for (const auto& out_buf : outputs) {
                 await_buffer_ready(out_buf->handle.get());
@@ -2717,7 +3266,7 @@ void PjrtRuntime::execute(const CachedExecutable* exec,
     }
 }
 
-void PjrtRuntime::execute_spmd(const CachedExecutable* exec,
+void PjrtRuntime::execute_spmd(const CachedExecutablePtr& exec,
                                int num_devices,
                                PJRT_Buffer* const* const* per_device_inputs,
                                size_t num_inputs,
@@ -2731,6 +3280,11 @@ void PjrtRuntime::execute_spmd(const CachedExecutable* exec,
     }
     if (num_devices <= 0 || num_devices > static_cast<int>(devices_.size())) {
         throw std::out_of_range("execute_spmd: num_devices out of range");
+    }
+    if (exec->num_replicas != num_devices) {
+        throw std::runtime_error("execute_spmd: executable compiled for " +
+                                 std::to_string(exec->num_replicas) + " replicas, cannot run on " +
+                                 std::to_string(num_devices) + " devices");
     }
     if (exec->num_outputs != out_dtypes.size() || exec->num_outputs != out_dims.size()) {
         throw std::runtime_error("execute_spmd: output count mismatch vs executable");
@@ -2748,8 +3302,9 @@ void PjrtRuntime::execute_spmd(const CachedExecutable* exec,
 
     PJRT_ExecuteOptions opts = {};
     opts.struct_size = PJRT_ExecuteOptions_STRUCT_SIZE;
-    const int lid = next_launch_id_.fetch_add(1, std::memory_order_relaxed);
-    opts.launch_id = (lid > 0) ? lid : 1;
+    const uint32_t raw_lid = next_launch_id_.fetch_add(1, std::memory_order_relaxed);
+    const int32_t safe_lid = static_cast<int32_t>(raw_lid & 0x7FFFFFFFU);
+    opts.launch_id = (safe_lid > 0) ? safe_lid : 1;
     if (non_donatable_input_indices && !non_donatable_input_indices->empty()) {
         opts.non_donatable_input_indices = non_donatable_input_indices->data();
         opts.num_non_donatable_input_indices = non_donatable_input_indices->size();
@@ -2760,7 +3315,7 @@ void PjrtRuntime::execute_spmd(const CachedExecutable* exec,
 
     PJRT_LoadedExecutable_Execute_Args ex = {};
     ex.struct_size = PJRT_LoadedExecutable_Execute_Args_STRUCT_SIZE;
-    ex.executable = exec->handle;
+    ex.executable = exec->handle.get();
     ex.options = &opts;
     ex.argument_lists = per_device_inputs;
     ex.num_devices = n_devs;
@@ -2769,14 +3324,29 @@ void PjrtRuntime::execute_spmd(const CachedExecutable* exec,
     ex.device_complete_events = use_dev_event ? dev_events.data() : nullptr;
     ex.execute_device = nullptr;
 
+    std::vector<PjrtEventHandle> dev_ev_handles;
+    dev_ev_handles.reserve(dev_events.size());
+    std::vector<std::vector<PjrtBufferHandle>> out_handles(n_devs);
+    for (size_t d = 0; d < n_devs; ++d) {
+        out_handles[d].reserve(exec->num_outputs);
+    }
+
     check_error(api_->PJRT_LoadedExecutable_Execute(&ex), "PJRT_LoadedExecutable_Execute(SPMD)");
+    for (PJRT_Event* ev : dev_events) {
+        dev_ev_handles.emplace_back(ev, PjrtEventDeleter{api_});
+    }
+    for (size_t d = 0; d < n_devs; ++d) {
+        for (size_t i = 0; i < exec->num_outputs; ++i) {
+            out_handles[d].emplace_back(raw_outs[d][i], PjrtBufferDeleter{api_});
+        }
+    }
 
     per_device_outputs.resize(n_devs);
     for (size_t d = 0; d < n_devs; ++d) {
         per_device_outputs[d].resize(exec->num_outputs);
         for (size_t i = 0; i < exec->num_outputs; ++i) {
             auto buf = std::make_shared<PjrtBuffer>();
-            buf->handle = PjrtBufferHandle(raw_outs[d][i], PjrtBufferDeleter{api_});
+            buf->handle = std::move(out_handles[d][i]);
             buf->dtype = out_dtypes[i];
             buf->dims = out_dims[i];
             per_device_outputs[d][i] = std::move(buf);
@@ -2785,8 +3355,8 @@ void PjrtRuntime::execute_spmd(const CachedExecutable* exec,
 
     if (sync) {
         if (use_dev_event) {
-            for (PJRT_Event* ev : dev_events) {
-                if (ev) await_event(ev);
+            for (auto& ev : dev_ev_handles) {
+                if (ev) await_event(std::move(ev));
             }
         } else if (has_ready_event_) {
             for (size_t d = 0; d < n_devs; ++d) {
@@ -2807,18 +3377,25 @@ void PjrtRuntime::execute_spmd(const CachedExecutable* exec,
 
 void PjrtRuntime::clear_exec_cache() {
     std::lock_guard<std::mutex> lock(cache_mu_);
-    for (auto& kv : exec_cache_) {
-        if (kv.second.exec.handle && api_ && PJRT_API_HAS(api_, PJRT_LoadedExecutable_Destroy)) {
-            PJRT_LoadedExecutable_Destroy_Args ld = {};
-            ld.struct_size = PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
-            ld.executable = kv.second.exec.handle;
-            PJRT_Error* derr = api_->PJRT_LoadedExecutable_Destroy(&ld);
-            if (derr) destroy_error(derr);
-        }
-    }
     exec_cache_.clear();
     lru_order_.clear();
     eviction_epoch_.fetch_add(1, std::memory_order_release);
+}
+
+CachedExecutablePtr PjrtRuntime::get_cached_exec(const std::string& full_key) {
+    std::lock_guard<std::mutex> lock(cache_mu_);
+    auto it = exec_cache_.find(full_key);
+    if (it == exec_cache_.end()) {
+        return nullptr;
+    }
+    cache_hits_ += 1;
+    lru_order_.splice(lru_order_.begin(), lru_order_, it->second.lru_it);
+    return it->second.exec;
+}
+
+bool PjrtRuntime::has_cached_exec(const std::string& full_key) const {
+    std::lock_guard<std::mutex> lock(cache_mu_);
+    return exec_cache_.find(full_key) != exec_cache_.end();
 }
 
 CacheStats PjrtRuntime::cache_stats() const {
