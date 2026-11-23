@@ -2266,6 +2266,24 @@ static void test_mock_multitile_and_quant_matmul() {
     std::vector<uint16_t> ref_256(BM * BN, 0u);
     OT_CHECK(ot_buffer_d2h(ctx, bmc, ref_256.data(), ref_256.size() * 2u) == OT_OK);
 
+    // 6-prefix) Partial ot_buffer_d2h reads across tile boundaries (odd, 2B, mid-row,
+    //           cross-N-tile, cross-M-tile) must match full readback byte-for-byte.
+    {
+      const size_t prefix_sizes[] = {
+          1u, 2u, 3u, 127u, 256u, 257u, 300u, 512u, 513u,
+          127u * 512u + 300u, 128u * 512u, 128u * 512u + 1u,
+          128u * 512u + 256u, 128u * 512u + 300u, BM * BN * 2u - 1u};
+      const uint8_t* ref_bytes = reinterpret_cast<const uint8_t*>(ref_256.data());
+      for (size_t psz : prefix_sizes) {
+        std::vector<uint8_t> got_buf(psz + 4u, 0x5au);
+        // Test unaligned dst pointer (+1) as well as aligned pointer.
+        OT_CHECK(ot_buffer_d2h(ctx, bmc, got_buf.data() + 1u, psz) == OT_OK);
+        OT_CHECK(got_buf[0] == 0x5au);
+        OT_CHECK(std::memcmp(got_buf.data() + 1u, ref_bytes, psz) == 0);
+        OT_CHECK(got_buf[psz + 1u] == 0x5au);
+      }
+    }
+
     // 6a) Reuse 256x256 tiled `bmc` as output for 128x128x128 GEMM (with `bmc` also aliased as LHS!).
     std::vector<uint16_t> ref_128(128u * 128u, 0u);
     for (uint32_t m = 0; m < 128u; ++m) {

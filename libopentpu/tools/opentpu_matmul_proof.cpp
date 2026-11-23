@@ -816,23 +816,30 @@ bool run_freetile_proof(void* lib, bool mock_mode, bool do_multitile, bool do_qu
   if (ok && do_quant) {
     struct QCase { const char* label; uint32_t rhs_dtype; uint32_t qmode; uint32_t m, k, n; };
     const QCase qcases[] = {
-        {"Q8_0_BLK32", OT_DTYPE_Q8_0, OT_QUANT_BLOCK_32, 128u, 512u, 512u},
-        {"Q4_0_BLK32", OT_DTYPE_Q4_0, OT_QUANT_BLOCK_32, 128u, 512u, 512u},
-        {"Q8_0_LLM",   OT_DTYPE_Q8_0, OT_QUANT_BLOCK_32, 128u, 4096u, 4096u},
-        {"Q4_0_LLM",   OT_DTYPE_Q4_0, OT_QUANT_BLOCK_32, 128u, 4096u, 4096u},
+        {"Q8_0_BLK32",  OT_DTYPE_Q8_0, OT_QUANT_BLOCK_32,    128u, 512u, 512u},
+        {"Q4_0_BLK32",  OT_DTYPE_Q4_0, OT_QUANT_BLOCK_32,    128u, 512u, 512u},
+        {"INT8_PERCH",  OT_DTYPE_INT8, OT_QUANT_PER_CHANNEL, 128u, 512u, 512u},
+        {"INT4_PERCH",  OT_DTYPE_Q4_0, OT_QUANT_PER_CHANNEL, 128u, 512u, 512u},
+        {"Q8_0_LLM",    OT_DTYPE_Q8_0, OT_QUANT_BLOCK_32,    128u, 4096u, 4096u},
+        {"Q4_0_LLM",    OT_DTYPE_Q4_0, OT_QUANT_BLOCK_32,    128u, 4096u, 4096u},
     };
     for (const QCase& qc : qcases) {
       if (mock_mode && qc.k >= 4096u) continue;
       const bool is_q4 = (qc.rhs_dtype == OT_DTYPE_Q4_0);
+      const bool is_per_channel = (qc.qmode == OT_QUANT_PER_CHANNEL);
       std::vector<uint16_t> qa(static_cast<size_t>(qc.m) * qc.k);
       for (size_t i = 0; i < qa.size(); ++i) {
         qa[i] = f32_to_bf16(static_cast<float>(static_cast<int>(i % 9) - 4) * 0.125f);
       }
       std::vector<int8_t> w_i8(static_cast<size_t>(qc.k) * qc.n);
       std::vector<uint8_t> w_q4(static_cast<size_t>(qc.k) * qc.n / 2u, 0u);
-      std::vector<float> sc((static_cast<size_t>(qc.k) / 32u) * qc.n);
+      const size_t sc_count = is_per_channel
+          ? static_cast<size_t>(qc.n)
+          : ((static_cast<size_t>(qc.k) / 32u) * qc.n);
+      std::vector<float> sc(sc_count);
       for (size_t i = 0; i < sc.size(); ++i) {
-        sc[i] = 0.0625f * static_cast<float>((i % 7u) + 1u);
+        const size_t mod = is_per_channel ? 11u : 7u;
+        sc[i] = 0.0625f * static_cast<float>((i % mod) + 1u);
       }
       for (uint32_t k = 0; k < qc.k; ++k) {
         for (uint32_t n = 0; n < qc.n; ++n) {
@@ -865,7 +872,7 @@ bool run_freetile_proof(void* lib, bool mock_mode, bool do_multitile, bool do_qu
       ot_freetile_gemm_desc_t desc = p_desc_default(qc.m, qc.k, qc.n);
       desc.rhs_dtype = qc.rhs_dtype;
       desc.quant_mode = qc.qmode;
-      desc.quant_group_size = OT_QK8_0;
+      desc.quant_group_size = is_per_channel ? 0u : OT_QK8_0;
       desc.scale_dtype = OT_DTYPE_F32;
       ot_exec_stats_t stats{};
       std::vector<uint16_t> out_c(static_cast<size_t>(qc.m) * qc.n, 0u);
@@ -895,7 +902,8 @@ bool run_freetile_proof(void* lib, bool mock_mode, bool do_multitile, bool do_qu
         for (uint32_t n = 0; n < qc.n; ++n) {
           float acc = 0.0f;
           for (uint32_t k = 0; k < qc.k; ++k) {
-            const float s = bf16_to_f32(f32_to_bf16(sc[(k / 32u) * qc.n + n]));
+            const float raw_s = is_per_channel ? sc[n] : sc[(k / 32u) * qc.n + n];
+            const float s = bf16_to_f32(f32_to_bf16(raw_s));
             const float w = bf16_to_f32(f32_to_bf16(static_cast<float>(w_i8[static_cast<size_t>(k) * qc.n + n]) * s));
             acc += bf16_to_f32(qa[static_cast<size_t>(m) * qc.k + k]) * w;
           }

@@ -171,49 +171,45 @@ ot_status_t read_buffer_row_major_locked(ot_context_t* ctx, const ot_buffer_t* s
     ctx->last_error = "Invalid tiled buffer size";
     return OT_ERR_INVALID_ARG;
   }
-  ScopedBuf tiled(tiled_bytes);
-  if (!tiled.ptr) {
+  ScopedBuf tile_tiled(ot::kTile128x128Bf16Bytes);
+  if (!tile_tiled.ptr) {
     ctx->last_error = "Failed to allocate host tile readback workspace";
     return OT_ERR_NO_MEMORY;
   }
-  ot_status_t st = raw_d2h_locked(ctx, src->hbm_addr, tiled.ptr, tiled_bytes);
-  if (st != OT_OK) return st;
-
-  if (rows == 128u && cols == 128u) {
-    if (size_bytes >= ot::kTile128x128Bf16Bytes &&
-        (reinterpret_cast<uintptr_t>(dst_bytes) % alignof(uint16_t)) == 0) {
-      ot::tile_unpack_128x128_bf16(tiled.u16(), reinterpret_cast<uint16_t*>(dst_bytes));
-    } else {
-      ScopedBuf rm(ot::kTile128x128Bf16Bytes);
-      if (!rm.ptr) {
-        ctx->last_error = "Failed to allocate host tile unpack workspace";
-        return OT_ERR_NO_MEMORY;
-      }
-      ot::tile_unpack_128x128_bf16(tiled.u16(), rm.u16());
-      std::memcpy(dst_bytes, rm.ptr, std::min(size_bytes, ot::kTile128x128Bf16Bytes));
-    }
-  } else {
-    ScopedBuf rm(tiled_bytes);
-    ScopedBuf tile_rm(ot::kTile128x128Bf16Bytes);
-    if (!rm.ptr || !tile_rm.ptr) {
-      ctx->last_error = "Failed to allocate multi-tile unpack workspace";
-      return OT_ERR_NO_MEMORY;
-    }
-    const uint32_t m_tiles = rows / 128u;
-    const uint32_t n_tiles = cols / 128u;
-    uint16_t* dst_u16 = rm.u16();
-    for (uint32_t mt = 0; mt < m_tiles; ++mt) {
-      for (uint32_t nt = 0; nt < n_tiles; ++nt) {
-        const size_t tile_idx = static_cast<size_t>(mt) * n_tiles + nt;
-        ot::tile_unpack_128x128_bf16(tiled.u16() + tile_idx * (128u * 128u), tile_rm.u16());
-        for (uint32_t r = 0; r < 128u; ++r) {
-          const size_t dst_off =
-              (static_cast<size_t>(mt * 128u + r) * cols + nt * 128u);
-          std::memcpy(dst_u16 + dst_off, tile_rm.u16() + r * 128u, 128u * sizeof(uint16_t));
+  const uint32_t m_tiles = rows / 128u;
+  const uint32_t n_tiles = cols / 128u;
+  const size_t prefix_bytes = std::min(size_bytes, tiled_bytes);
+  const size_t row_stride_bytes = static_cast<size_t>(cols) * sizeof(uint16_t);
+  uint16_t row_buf[128];
+  for (uint32_t mt = 0; mt < m_tiles; ++mt) {
+    const size_t mt_base_byte = static_cast<size_t>(mt) * 128u * row_stride_bytes;
+    if (mt_base_byte >= prefix_bytes) break;
+    for (uint32_t nt = 0; nt < n_tiles; ++nt) {
+      const size_t tile_min_byte =
+          mt_base_byte + static_cast<size_t>(nt) * 128u * sizeof(uint16_t);
+      if (tile_min_byte >= prefix_bytes) break;
+      const size_t tile_idx = static_cast<size_t>(mt) * n_tiles + nt;
+      ot_status_t st = raw_d2h_locked(
+          ctx,
+          src->hbm_addr + tile_idx * ot::kTile128x128Bf16Bytes,
+          tile_tiled.ptr,
+          ot::kTile128x128Bf16Bytes);
+      if (st != OT_OK) return st;
+      const uint16_t* tiled_u16 = tile_tiled.u16();
+      for (uint32_t r = 0; r < 128u; ++r) {
+        const size_t dst_byte_off =
+            (static_cast<size_t>(mt) * 128u + r) * row_stride_bytes +
+            static_cast<size_t>(nt) * 128u * sizeof(uint16_t);
+        if (dst_byte_off >= prefix_bytes) break;
+        const size_t copy_bytes =
+            std::min<size_t>(128u * sizeof(uint16_t), prefix_bytes - dst_byte_off);
+        const size_t tile_row_base = (static_cast<size_t>(r) >> 1) * 256u + (r & 1u);
+        for (uint32_t c = 0; c < 128u; ++c) {
+          row_buf[c] = tiled_u16[tile_row_base + c * 2u];
         }
+        std::memcpy(dst_bytes + dst_byte_off, row_buf, copy_bytes);
       }
     }
-    std::memcpy(dst_bytes, rm.ptr, std::min(size_bytes, tiled_bytes));
   }
   if (size_bytes > tiled_bytes) {
     return raw_d2h_locked(ctx, src->hbm_addr + tiled_bytes,
