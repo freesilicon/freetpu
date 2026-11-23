@@ -9,23 +9,29 @@ OUT_DIR=""
 BACKEND_URL="${BACKEND_URL:-http://127.0.0.1:8000/v1}"
 MODEL_NAME="${MODEL_NAME:-}"
 CONCURRENCIES="${CONCURRENCIES:-16,32,64,128}"
+TIER_TIMEOUT_S="${TIER_TIMEOUT_S:-30}"
 CDI_VERSION="${CDI_VERSION:-1.1.0}"
 RUNTIME_METRICS_ADDR="${RUNTIME_METRICS_ADDR:-127.0.0.1:8431}"
 
 usage() {
   cat <<'EOF'
 Usage: 03_ops_and_router_smoke.sh [--out-dir DIR] [--backend-url URL] [--model NAME]
-                                  [--concurrencies 16,32,64,128] [--cdi-version 1.1.0]
-                                  [--runtime-metrics-addr HOST:PORT] [--dry-run] [--mock]
+                                  [--concurrencies 16,32,64,128] [--tier-timeout-s SEC]
+                                  [--cdi-version 1.1.0] [--runtime-metrics-addr HOST:PORT]
+                                  [--dry-run] [--mock]
 
 Runs bounded Ironwood Day-1 checks for the FreeTPU ops & serving control plane:
   1. CNCF CDI v1.1 spec generation & host validation (ops/tpu-cdi/freetpu_cdi.py generate + validate)
-  2. Prometheus telemetry one-shot capture (ops/tpu-exporter/tpu_exporter.py --once: direct gRPC / SeqLock SHM / PCIe AER)
+  2. Prometheus telemetry one-shot capture (ops/tpu-exporter/tpu_exporter.py --once) validating
+     actual non-comment Prometheus samples (freetpu_tpu_devices_discovered >= 1 and per-collector
+     counts for direct gRPC/runtime, SeqLock SHM, and PCIe AER)
   3. FreeTPU router config check (--check-config) + bounded SSE concurrency sweep (c=16,32,64,128)
-     verifying 100% stream completion and active_inflight == 0 after every concurrency level.
+     with an explicit per-tier wall-clock deadline (--tier-timeout-s), verifying peak_inflight >= c
+     (barrier-synchronized in --mock mode), 100% SSE [DONE] completion, and active_inflight == 0
+     after every tier.
 
 In --mock mode (or on non-Linux hosts), creates a synthetic tpu7x-standard-4t sysfs/devfs tree for
-CDI/exporter and runs the router sweep against a local loopback mock OpenAI SSE backend.
+CDI/exporter and runs the router sweep against a local loopback barrier-synchronized OpenAI SSE backend.
 EOF
 }
 
@@ -57,6 +63,11 @@ while [[ $# -gt 0 ]]; do
     --concurrencies)
       require_arg "$#" "$1"
       CONCURRENCIES="$2"
+      shift 2
+      ;;
+    --tier-timeout-s)
+      require_arg "$#" "$1"
+      TIER_TIMEOUT_S="$2"
       shift 2
       ;;
     --cdi-version)
@@ -104,10 +115,10 @@ log() {
 
 : > "${LOG}"
 log "=== FreeTPU Ironwood (tpu7x) Day-1 Ops & Router Smoke ==="
-log "timestamp_utc=${TIMESTAMP} mock_mode=${MOCK_MODE} cdi_version=${CDI_VERSION} concurrencies=${CONCURRENCIES} backend_url=${BACKEND_URL}"
+log "timestamp_utc=${TIMESTAMP} mock_mode=${MOCK_MODE} cdi_version=${CDI_VERSION} concurrencies=${CONCURRENCIES} tier_timeout_s=${TIER_TIMEOUT_S} backend_url=${BACKEND_URL}"
 
 if [[ "${DRY_RUN}" -eq 1 ]]; then
-  log "[DRY-RUN] Would run freetpu_cdi.py generate/validate (--cdi-version ${CDI_VERSION}), tpu_exporter.py --once, and freetpu_router.py --check-config + SSE concurrency sweep (${CONCURRENCIES}) asserting active_inflight==0."
+  log "[DRY-RUN] Would run freetpu_cdi.py generate/validate (--cdi-version ${CDI_VERSION}), tpu_exporter.py --once (validating non-comment Prometheus samples), and freetpu_router.py --check-config + SSE concurrency sweep (${CONCURRENCIES}, tier_timeout_s=${TIER_TIMEOUT_S}) asserting peak_inflight>=c and active_inflight==0."
   exit 0
 fi
 
@@ -122,9 +133,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-CDI_SCRIPT="${REPO_ROOT}/ops/tpu-cdi/freetpu_cdi.py"
-EXPORTER_SCRIPT="${REPO_ROOT}/ops/tpu-exporter/tpu_exporter.py"
-ROUTER_SCRIPT="${REPO_ROOT}/router/freetpu_router.py"
+CDI_SCRIPT="${CDI_SCRIPT:-${REPO_ROOT}/ops/tpu-cdi/freetpu_cdi.py}"
+EXPORTER_SCRIPT="${EXPORTER_SCRIPT:-${REPO_ROOT}/ops/tpu-exporter/tpu_exporter.py}"
+ROUTER_SCRIPT="${ROUTER_SCRIPT:-${REPO_ROOT}/router/freetpu_router.py}"
 CDI_SPEC="${OUT_DIR}/freetpu-cdi-${CDI_VERSION}.json"
 
 EFFECTIVE_MOCK="${MOCK_MODE}"
@@ -272,30 +283,99 @@ python3 "${EXPORTER_SCRIPT}" --once "${EXPORTER_EXTRA_ARGS[@]}" > "${EXPORTER_OU
 head -n 40 "${EXPORTER_OUT}" | tee -a "${LOG}"
 
 python3 - "${EXPORTER_OUT}" "${EFFECTIVE_MOCK}" <<'PYEOF' 2>&1 | tee -a "${LOG}"
+import math
+import re
 import sys
 
 prom_path, is_mock = sys.argv[1], sys.argv[2] == "1"
-text = open(prom_path, encoding="utf-8").read()
-required = ["freetpu_tpu_devices_discovered"]
+sample_re = re.compile(
+    r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?|NaN|[+-]?Inf)(?:\s+\d+)?$"
+)
+
+samples = []
+with open(prom_path, encoding="utf-8") as f:
+    for raw in f:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = sample_re.match(line)
+        if not m:
+            continue
+        name, labels, val_s = m.group(1), (m.group(2) or ""), m.group(3)
+        try:
+            val = float(val_s)
+        except ValueError:
+            continue
+        samples.append((name, labels, val))
+
+if not samples:
+    raise SystemExit(f"tpu-exporter emitted 0 valid non-comment Prometheus samples ({prom_path})")
+
+discovered_vals = [val for name, _lbl, val in samples if name == "freetpu_tpu_devices_discovered" and math.isfinite(val)]
+if not discovered_vals:
+    raise SystemExit("tpu-exporter missing non-comment freetpu_tpu_devices_discovered sample")
+devices_discovered = int(discovered_vals[-1])
+if devices_discovered < 1:
+    raise SystemExit(f"tpu-exporter discovered {devices_discovered} TPU devices (expected >= 1)")
+
+tpu7x_info_samples = sum(
+    1 for name, lbl, _v in samples
+    if name == "freetpu_tpu_info" and 'generation="tpu7x"' in lbl
+)
+grpc_runtime_samples = sum(
+    1 for name, lbl, _v in samples
+    if (
+        name in (
+            "freetpu_tpu_duty_cycle_percent",
+            "freetpu_tpu_runtime_duty_cycle_percent",
+            "freetpu_tpu_runtime_unjoined_duty_cycle_percent",
+        )
+        or (
+            name == "freetpu_tpu_info"
+            and ('telemetry_source="tpu-info-grpc"' in lbl or 'telemetry_source="tpu-info-cli"' in lbl)
+        )
+    )
+)
+shm_mxu_samples = sum(1 for name, _lbl, _v in samples if name == "freetpu_tpu_mxu_active_cycles_total")
+shm_dma_samples = sum(1 for name, _lbl, _v in samples if name == "freetpu_tpu_dma_bytes_transferred_total")
+shm_info_samples = sum(
+    1 for name, lbl, _v in samples
+    if name == "freetpu_tpu_info" and 'telemetry_source="libopentpu-shm"' in lbl
+)
+shm_samples = shm_mxu_samples + shm_dma_samples + shm_info_samples
+aer_corr_samples = sum(1 for name, _lbl, _v in samples if name == "freetpu_pcie_aer_correctable_total")
+aer_fatal_samples = sum(1 for name, _lbl, _v in samples if name == "freetpu_pcie_aer_fatal_total")
+aer_samples = aer_corr_samples + aer_fatal_samples
+
 if is_mock:
-    required.extend([
-        'generation="tpu7x"',
-        'telemetry_source="libopentpu-shm"',
-        "freetpu_tpu_mxu_active_cycles_total",
-        "freetpu_tpu_dma_bytes_transferred_total",
-        "freetpu_pcie_aer_correctable_total",
-        "freetpu_pcie_aer_fatal_total",
-    ])
-missing = [tok for tok in required if tok not in text]
-if missing:
-    raise SystemExit(f"tpu-exporter output missing expected markers: {missing}")
-metric_lines = [ln for ln in text.splitlines() if ln and not ln.startswith("#")]
-print(f"EXPORTER_SMOKE_STATUS=PASS metric_samples={len(metric_lines)} prom_file={prom_path}")
+    errors = []
+    if devices_discovered != 4:
+        errors.append(f"devices_discovered={devices_discovered} (expected 4)")
+    if tpu7x_info_samples < 4:
+        errors.append(f"tpu7x_info_samples={tpu7x_info_samples} (expected >= 4)")
+    if shm_mxu_samples < 1 or shm_dma_samples < 1 or shm_info_samples < 1:
+        errors.append(
+            f"shm_samples incomplete (mxu={shm_mxu_samples} dma={shm_dma_samples} info={shm_info_samples})"
+        )
+    if aer_corr_samples < 4 or aer_fatal_samples < 4:
+        errors.append(f"aer_samples incomplete (correctable={aer_corr_samples} fatal={aer_fatal_samples})")
+    if errors:
+        raise SystemExit("tpu-exporter mock sample verification failed: " + "; ".join(errors))
+
+grpc_status = str(grpc_runtime_samples) if grpc_runtime_samples > 0 else "unavailable"
+shm_status = str(shm_samples) if shm_samples > 0 else "unavailable"
+aer_status = str(aer_samples) if aer_samples > 0 else "unavailable"
+print(
+    f"EXPORTER_SMOKE_STATUS=PASS devices_discovered={devices_discovered} "
+    f"tpu7x_info_samples={tpu7x_info_samples} grpc_runtime_samples={grpc_status} "
+    f"shm_samples={shm_status} aer_samples={aer_status} "
+    f"total_samples={len(samples)} prom_file={prom_path}"
+)
 PYEOF
 
 # --- Step 3/3: FreeTPU Router --check-config + c=16..128 SSE concurrency sweep ---
-log "--- Step 3/3: router/freetpu_router.py --check-config + c=${CONCURRENCIES} SSE concurrency sweep ---"
-python3 - "${ROUTER_SCRIPT}" "${TMP_ROOT}" "${EFFECTIVE_MOCK}" "${BACKEND_URL}" "${MODEL_NAME}" "${CONCURRENCIES}" <<'PYEOF' 2>&1 | tee -a "${LOG}"
+log "--- Step 3/3: router/freetpu_router.py --check-config + c=${CONCURRENCIES} SSE concurrency sweep (tier_timeout_s=${TIER_TIMEOUT_S}) ---"
+python3 - "${ROUTER_SCRIPT}" "${TMP_ROOT}" "${EFFECTIVE_MOCK}" "${BACKEND_URL}" "${MODEL_NAME}" "${CONCURRENCIES}" "${TIER_TIMEOUT_S}" <<'PYEOF' 2>&1 | tee -a "${LOG}"
 import concurrent.futures
 import http.client
 import json
@@ -305,7 +385,6 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -315,8 +394,11 @@ is_mock = sys.argv[3] == "1"
 backend_url = sys.argv[4].rstrip("/")
 model_name = sys.argv[5].strip()
 concurrencies = [int(x.strip()) for x in sys.argv[6].split(",") if x.strip()]
+tier_timeout_s = float(sys.argv[7])
 if not concurrencies or any(c <= 0 for c in concurrencies):
     raise SystemExit(f"Invalid concurrencies list: {sys.argv[6]!r}")
+if tier_timeout_s <= 0:
+    raise SystemExit(f"Invalid tier_timeout_s: {tier_timeout_s!r}")
 
 
 def pick_free_port() -> int:
@@ -328,7 +410,29 @@ def pick_free_port() -> int:
 class _MockBackendServer(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
-    request_queue_size = 256
+    request_queue_size = 512
+
+    def __init__(self, server_address, handler_cls):
+        super().__init__(server_address, handler_cls)
+        self.tier_lock = threading.Lock()
+        self.target_conc = 0
+        self.arrived = 0
+        self.in_flight = 0
+        self.peak_backend_inflight = 0
+        self.all_arrived = threading.Event()
+        self.release_tier = threading.Event()
+        self.release_tier.set()
+        self.barrier_timeout_s = 15.0
+
+    def arm_tier(self, target_conc: int, barrier_timeout_s: float) -> None:
+        with self.tier_lock:
+            self.target_conc = target_conc
+            self.arrived = 0
+            self.in_flight = 0
+            self.peak_backend_inflight = 0
+            self.barrier_timeout_s = barrier_timeout_s
+            self.all_arrived.clear()
+            self.release_tier.clear()
 
 
 class _MockOpenAIHandler(BaseHTTPRequestHandler):
@@ -364,32 +468,57 @@ class _MockOpenAIHandler(BaseHTTPRequestHandler):
         stream = bool(req.get("stream", False))
 
         if stream:
-            chunks = [
-                json.dumps({
+            chunk1 = (
+                "data: "
+                + json.dumps({
                     "id": "chatcmpl-mock",
                     "object": "chat.completion.chunk",
                     "created": 1700000000,
                     "model": req_model,
                     "choices": [{"index": 0, "delta": {"role": "assistant", "content": "ok"}, "finish_reason": None}],
-                }),
-                json.dumps({
+                })
+                + "\n\n"
+            ).encode("utf-8")
+            chunk2 = (
+                "data: "
+                + json.dumps({
                     "id": "chatcmpl-mock",
                     "object": "chat.completion.chunk",
                     "created": 1700000000,
                     "model": req_model,
                     "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                     "usage": {"prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10},
-                }),
-            ]
-            payload = "".join(f"data: {c}\n\n" for c in chunks) + "data: [DONE]\n\n"
-            body = payload.encode("utf-8")
+                })
+                + "\n\ndata: [DONE]\n\n"
+            ).encode("utf-8")
+
+            srv = self.server
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
-            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Length", str(len(chunk1) + len(chunk2)))
             self.end_headers()
-            self.wfile.write(body)
+            self.wfile.write(chunk1)
             self.wfile.flush()
+
+            with srv.tier_lock:
+                srv.in_flight += 1
+                srv.arrived += 1
+                if srv.in_flight > srv.peak_backend_inflight:
+                    srv.peak_backend_inflight = srv.in_flight
+                target = srv.target_conc
+                if target > 0 and srv.arrived >= target:
+                    srv.all_arrived.set()
+                barrier_timeout = srv.barrier_timeout_s
+
+            try:
+                if target > 0:
+                    srv.release_tier.wait(timeout=barrier_timeout)
+                self.wfile.write(chunk2)
+                self.wfile.flush()
+            finally:
+                with srv.tier_lock:
+                    srv.in_flight = max(0, srv.in_flight - 1)
         else:
             body = json.dumps({
                 "id": "chatcmpl-mock",
@@ -420,7 +549,7 @@ try:
         backend_url = f"http://127.0.0.1:{mock_port}/v1"
         if not model_name:
             model_name = "ironwood-mock-model"
-        print(f"[MOCK] Started local OpenAI SSE mock backend at {backend_url} model={model_name}")
+        print(f"[MOCK] Started barrier-synchronized OpenAI SSE mock backend at {backend_url} model={model_name}")
     else:
         try:
             with urllib.request.urlopen(f"{backend_url}/models", timeout=5.0) as resp:
@@ -445,7 +574,7 @@ try:
         "policy": "round_robin",
         "health_poll_interval_s": 30.0,
         "failure_cooldown_s": 5.0,
-        "request_timeout_s": 60.0,
+        "request_timeout_s": max(60.0, tier_timeout_s * 2.0),
         "probe_timeout_s": 2.5,
         "auth": {"type": "allow_all"},
         "usage_meter": {"type": "noop"},
@@ -461,7 +590,7 @@ try:
                 "models": [model_name],
                 "discover_models": True,
                 "max_inflight": max(256, max(concurrencies) * 2),
-                "timeout_s": 60.0,
+                "timeout_s": max(60.0, tier_timeout_s * 2.0),
                 "priority": 10,
             }
         ],
@@ -511,9 +640,12 @@ try:
         "stream": True,
     }).encode("utf-8")
 
-    def fire_sse_request(_idx: int) -> float:
+    def fire_sse_request(_idx: int, tier_deadline: float) -> float:
         t0 = time.monotonic()
-        conn = http.client.HTTPConnection("127.0.0.1", router_port, timeout=30.0)
+        rem = tier_deadline - time.monotonic()
+        if rem <= 0:
+            raise TimeoutError(f"Tier wall-clock deadline ({tier_timeout_s}s) exceeded before connect")
+        conn = http.client.HTTPConnection("127.0.0.1", router_port, timeout=rem)
         try:
             conn.request(
                 "POST",
@@ -521,8 +653,29 @@ try:
                 body=req_body,
                 headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
             )
+            rem = tier_deadline - time.monotonic()
+            if rem <= 0:
+                raise TimeoutError(f"Tier wall-clock deadline ({tier_timeout_s}s) exceeded awaiting headers")
+            if conn.sock is not None:
+                conn.sock.settimeout(rem)
             resp = conn.getresponse()
-            data = resp.read().decode("utf-8", errors="replace")
+            buf = bytearray()
+            while True:
+                rem = tier_deadline - time.monotonic()
+                if rem <= 0:
+                    raise TimeoutError(f"Tier wall-clock deadline ({tier_timeout_s}s) exceeded mid-stream")
+                if conn.sock is not None:
+                    conn.sock.settimeout(rem)
+                try:
+                    chunk = resp.read1(4096)
+                except (socket.timeout, TimeoutError) as exc:
+                    raise TimeoutError(
+                        f"Tier wall-clock deadline ({tier_timeout_s}s) exceeded reading SSE chunk"
+                    ) from exc
+                if not chunk:
+                    break
+                buf.extend(chunk)
+            data = buf.decode("utf-8", errors="replace")
             if resp.status != 200:
                 raise RuntimeError(f"HTTP {resp.status}: {data[:200]}")
             if "data: [DONE]" not in data:
@@ -552,21 +705,89 @@ try:
 
     for conc in concurrencies:
         t_level = time.monotonic()
+        tier_deadline = t_level + tier_timeout_s
         latencies_ms = []
         errors = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=conc) as pool:
-            futs = [pool.submit(fire_sse_request, i) for i in range(conc)]
-            for fut in concurrent.futures.as_completed(futs):
+        peak_state = {"router": 0, "prom": 0}
+        backend_peak = 0
+
+        if is_mock and mock_server is not None:
+            mock_server.arm_tier(conc, barrier_timeout_s=tier_timeout_s)
+
+        stop_sampler = threading.Event()
+        sampler_thread = None
+
+        def _live_sampler(state=peak_state, stop_ev=stop_sampler) -> None:
+            while not stop_ev.is_set():
+                try:
+                    hi, pi = read_active_inflight()
+                    if hi > state["router"]:
+                        state["router"] = hi
+                    if pi > state["prom"]:
+                        state["prom"] = pi
+                except Exception:
+                    pass
+                stop_ev.wait(0.025)
+
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=conc)
+        try:
+            futs = [pool.submit(fire_sse_request, i, tier_deadline) for i in range(conc)]
+            if is_mock and mock_server is not None:
+                try:
+                    rem = max(0.1, tier_deadline - time.monotonic())
+                    reached = mock_server.all_arrived.wait(timeout=rem)
+                    hi, pi = read_active_inflight()
+                    peak_state["router"] = max(peak_state["router"], hi)
+                    peak_state["prom"] = max(peak_state["prom"], pi)
+                    with mock_server.tier_lock:
+                        backend_peak = mock_server.peak_backend_inflight
+                    if not reached:
+                        errors.append(
+                            f"Concurrency barrier timed out: arrived={mock_server.arrived}/{conc} "
+                            f"backend_peak={backend_peak} router_peak={peak_state['router']}"
+                        )
+                finally:
+                    mock_server.release_tier.set()
+            else:
+                sampler_thread = threading.Thread(target=_live_sampler, daemon=True)
+                sampler_thread.start()
+
+            wait_rem = max(0.0, tier_deadline - time.monotonic())
+            done, not_done = concurrent.futures.wait(futs, timeout=wait_rem)
+            for fut in done:
                 try:
                     latencies_ms.append(fut.result())
                 except Exception as exc:
                     errors.append(str(exc))
+            if not_done:
+                for fut in not_done:
+                    fut.cancel()
+                errors.append(
+                    f"Tier wall-clock deadline ({tier_timeout_s}s) exceeded: {len(not_done)}/{conc} streams still open"
+                )
+        finally:
+            if is_mock and mock_server is not None:
+                mock_server.release_tier.set()
+            stop_sampler.set()
+            if sampler_thread is not None:
+                sampler_thread.join(timeout=1.0)
+            pool.shutdown(wait=False, cancel_futures=True)
 
         wall_ms = (time.monotonic() - t_level) * 1000.0
         if errors:
             raise SystemExit(
-                f"ROUTER_SWEEP c={conc} FAILED: {len(errors)}/{conc} errors (first: {errors[0]})"
+                f"ROUTER_SWEEP c={conc} FAILED: {len(errors)} error(s) (first: {errors[0]})"
             )
+
+        peak_router_inflight = peak_state["router"]
+        peak_prom_inflight = peak_state["prom"]
+        if is_mock:
+            if backend_peak < conc or peak_router_inflight < conc or peak_prom_inflight < conc:
+                raise SystemExit(
+                    f"ROUTER_SWEEP c={conc} UNDER-CONCURRENT: "
+                    f"backend_peak={backend_peak} router_peak={peak_router_inflight} "
+                    f"prom_peak={peak_prom_inflight} (expected >= {conc})"
+                )
 
         # Poll briefly for final SSE teardown accounting on the server thread
         settle_deadline = time.monotonic() + 2.0
@@ -584,14 +805,21 @@ try:
         latencies_ms.sort()
         p50 = latencies_ms[len(latencies_ms) // 2]
         p95 = latencies_ms[min(len(latencies_ms) - 1, int(len(latencies_ms) * 0.95))]
+        peak_info = (
+            f"peak_inflight={peak_router_inflight} prom_peak={peak_prom_inflight} backend_peak={backend_peak}"
+            if is_mock
+            else f"observed_peak_inflight={peak_router_inflight} prom_peak={peak_prom_inflight}"
+        )
         print(
-            f"ROUTER_SWEEP c={conc} ok={len(latencies_ms)}/{conc} "
+            f"ROUTER_SWEEP c={conc} ok={len(latencies_ms)}/{conc} {peak_info} "
             f"wall_ms={wall_ms:.1f} p50_ms={p50:.1f} p95_ms={p95:.1f} "
             f"active_inflight={health_inf} prom_inflight={prom_inf} status=PASS"
         )
 
     print("ROUTER_SMOKE_STATUS=PASS")
 finally:
+    if mock_server is not None:
+        mock_server.release_tier.set()
     if router_proc is not None and router_proc.poll() is None:
         router_proc.terminate()
         try:

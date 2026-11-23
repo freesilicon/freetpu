@@ -57,9 +57,11 @@ Record from `runs/ironwood-day1/00_pci_vfio_survey.txt`:
 
 ## Step 01 (Minute 15–120): `ggml-cloudtpu` Verification, `f8E4M3FN`, FreeTile Mosaic `Q4_K`/`Q6_K`, & Model Matrix
 
-Run the turnkey ops & benchmark script with same-region GCS model staging (`--gcs-model-bucket`, skipped cleanly if unset) and persistent GCS `XLA_COMPILATION_CACHE_DIR`:
+If Step 00 staged a standalone `libtpu.so` via `--stage-libtpu`, export `LIBTPU_PATH` before running Step 01 (Step 01 also auto-discovers the newest staged `libtpu*.so` under `--out-dir` or `runs/ironwood-day1*` when `LIBTPU_PATH` is unset):
 
 ```bash
+export LIBTPU_PATH="$(ls -t runs/ironwood-day1/libtpu-*.so | head -n 1)"
+
 ./tools/ironwood-day1/01_ggml_cloudtpu_ops_bench.sh \
   --gcs-model-bucket gs://YOUR_BUCKET/models \
   --tpu-zone YOUR_TPU_ZONE \
@@ -70,11 +72,11 @@ Run the turnkey ops & benchmark script with same-region GCS model staging (`--gc
 ```
 
 What this captures:
-- Optional same-region GCS sync into `--models-dir` (`find -L` follows symlinks for both `/opt/models` and staged `.gguf` shards) and persistent `XLA_COMPILATION_CACHE_DIR` (`gs://...` or local fallback).
+- Automatic `LIBTPU_PATH` discovery from Step 00's staged wheel output when unset, optional same-region GCS sync into `--models-dir` (`find -L` follows symlinks for both `/opt/models` and staged `.gguf` shards), and persistent `XLA_COMPILATION_CACHE_DIR` (`gs://...` or local fallback).
 - `test_cloudtpu_host` standalone checks + `MAPS_LIBPYTHON=0`.
 - Live `test-backend-ops -b CLOUDTPU` under pinned `BF16` pure StableHLO baseline (`CLOUDTPU_MATMUL_FP8=0 CLOUDTPU_MATMUL_BF16=1 CLOUDTPU_FREETILE_MOSAIC=0`), plus the dedicated live `f8E4M3FN` accuracy gate (`test_cloudtpu_host --fp8-parity-only`, `NMSE < 1e-2` for `Q8_0` and factored `Q4_K_I4` + exact zero cancellation, avoiding upstream `test-backend-ops`'s hardcoded `5e-4` `Q8_0` BF16 limit).
-- Dedicated **FreeTile Mosaic `Q4_K`/`Q6_K` pass** (`CLOUDTPU_FREETILE_MOSAIC=1`) comparing Mosaic `tpu_custom_call` kernels against the pure StableHLO baseline (both in `test-backend-ops` / `--mock` and per-tier `llama-bench`; pass `--no-mosaic` to skip).
-- Side-by-side `llama-bench` throughput (`pp512` and `tg64`) across the `1t` bracket tiers (`8B`, `Qwen3-32B`, `Llama-3.3-70B`, `gpt-oss-120b`, `Qwen3-235B` `Q4_K_M`) and the hero **`tpu7x-standard-4t` (`768 GiB`) `DeepSeek-V3` / `DeepSeek-R1` 671B (`FP8`/`Q4`)** tier in pure StableHLO BF16, FreeTile Mosaic `Q4_K`/`Q6_K`, and `f8E4M3FN` modes.
+- Dedicated **FreeTile Mosaic `Q4_K`/`Q6_K` pass** (`CLOUDTPU_FREETILE_MOSAIC=1 CLOUDTPU_VERBOSE=1`) inspecting `ggml-cloudtpu: summary` `mosaic_compiles` / `mosaic_fallbacks` to verify Mosaic `tpu_custom_call` kernels actually dispatched (reporting `MOSAIC_COMPARISON_STATUS=FALLBACK_ONLY` rather than `PASS` if Mosaic silently fell back to pure StableHLO; pass `--no-mosaic` to skip).
+- Side-by-side `llama-bench` throughput (`pp512` and `tg64`) across named `1t` bracket tiers (`8B`, `Qwen3-32B`, `Llama-3.3-70B`, `gpt-oss-120b`, `Qwen3-235B` `Q4_K_M`, matched by both model family and size) and the hero **`tpu7x-standard-4t` (`768 GiB`) `DeepSeek-V3` / `DeepSeek-R1` 671B (`FP8`/`Q4`)** tier (gated on `>=8` effective Ironwood chiplets or explicit `--include-671b`) in pure StableHLO BF16, FreeTile Mosaic `Q4_K`/`Q6_K`, and `f8E4M3FN` modes.
 
 ### Runtime Knobs on Ironwood (`tpu7x`)
 
