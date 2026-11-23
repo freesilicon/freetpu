@@ -6,12 +6,13 @@
  *
  * Writers (e.g. libopentpu.so) publish per-chip counters with mode 0600/0644
  * (never group/world-writable) owned by a trusted publisher UID inside a
- * publisher-controlled, non-group/world-writable directory (mode 0700/0750/0755,
- * owned by a trusted publisher UID — NOT world-writable `/dev/shm` where
- * unrelated local users can pre-create predictable filenames under the sticky
- * bit):
- *   /dev/shm/freetpu/freetpu_metrics_<pci_bdf>
- *   (e.g. /dev/shm/freetpu/freetpu_metrics_0000:00:06.0)
+ * publisher-controlled, non-group/world-writable directory under root-owned
+ * `/run` (e.g. provisioned via systemd `RuntimeDirectory=freetpu-metrics` or
+ * `tmpfiles.d` `d /run/freetpu-metrics 0750 <publisher-uid> <exporter-gid> -`
+ * before untrusted workloads start — NOT under world-writable `/dev/shm` where
+ * unrelated local users could squat on the directory name or pre-create files):
+ *   /run/freetpu-metrics/freetpu_metrics_<pci_bdf>
+ *   (e.g. /run/freetpu-metrics/freetpu_metrics_0000:00:06.0)
  *
  * Concurrency & freshness protocol (lockless SeqLock, single writer / multi-reader):
  *   1. Before mutating payload fields, increment `seq` to an odd value with
@@ -44,7 +45,7 @@
 extern "C" {
 #endif
 
-#define FREETPU_METRICS_SHM_DEFAULT_DIR             "/dev/shm/freetpu"
+#define FREETPU_METRICS_SHM_DEFAULT_DIR             "/run/freetpu-metrics"
 #define FREETPU_METRICS_SHM_FILE_PREFIX             "freetpu_metrics_"
 #define FREETPU_METRICS_SHM_MAGIC                   0x46545055u /* "FTPU" little-endian */
 #define FREETPU_METRICS_SHM_VERSION                 1u

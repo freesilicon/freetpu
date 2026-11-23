@@ -2570,7 +2570,7 @@ TPU Runtime Utilization
                 iw_root,
                 devices=[
                     {
-                        "bdf": f"0000:00:{4 + i:02x}.0",
+                        "bdf": f"0000:00:{4 + (i // 2):02x}.{i % 2}",
                         "vendor": "0x1ae0",
                         "device": "0x0075" if i == 7 else "0x0076",
                         "driver": "vfio-pci",
@@ -3229,6 +3229,64 @@ TPU Runtime Utilization
                 {"4": 22.5, "5": 77.5},
             )
 
+            # Incomplete 6-function Ironwood PCI inventory (2 intact pairs + 2 orphaned
+            # functions spanning 4 physical chips!): MUST NOT divide `6 // 2 = 3` and
+            # conclude 4 per-chip duty IDs `{0..3}` exceed chip count! Keep unjoined!
+            iw6_root = root / "ironwood_incomplete_6fn"
+            iw6_bdfs = [
+                "0000:00:04.0",
+                "0000:00:04.1",
+                "0000:00:05.0",
+                "0000:00:05.1",
+                "0000:00:06.0",  # orphan from chip 2
+                "0000:00:07.0",  # orphan from chip 3
+            ]
+            iw6_sysfs, iw6_dev, iw6_proc = _make_mock_pci_tree(
+                iw6_root,
+                devices=[
+                    {
+                        "bdf": bdf,
+                        "vendor": "0x1ae0",
+                        "device": "0x0076",
+                        "driver": "vfio-pci",
+                        "iommu_group": str(i),
+                        "chip_id": str(i),
+                    }
+                    for i, bdf in enumerate(iw6_bdfs)
+                ],
+                create_vfio_nodes=[str(i) for i in range(6)],
+            )
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.dict(_te._GRPC_CHANNELS, {}, clear=True),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "grpc": _FakeGrpc,
+                        "tpu_info": SimpleNamespace(),
+                        "tpu_info.proto": SimpleNamespace(),
+                        "tpu_info.proto.tpu_metric_service_pb2": fake_pb2,
+                        "tpu_info.proto.tpu_metric_service_pb2_grpc": SimpleNamespace(
+                            RuntimeMetricServiceStub=_IronwoodPartialHbmDutyStub
+                        ),
+                    },
+                ),
+            ):
+                iw6_snap = _te.collect_snapshot(
+                    sysfs_root=iw6_sysfs,
+                    dev_root=iw6_dev,
+                    proc_root=iw6_proc,
+                    tpu_info_bin="tpu-info",
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=iw6_root / "no-shm",
+                )
+            self.assertIsNone(_te._verified_dual_function_chip_count(iw6_snap.devices, 2))
+            self.assertEqual([d.duty_cycle_percent for d in iw6_snap.devices], [None] * 6)
+            self.assertEqual(
+                iw6_snap.runtime_unjoined_duty_cycle,
+                {"0": 20.0, "1": 40.0, "2": 60.0, "3": 80.0},
+            )
+
             # Partial fallback after ambiguous gRPC duty-cycle: if CLI supplies joined
             # duty for ONLY 1 device ("0"), MUST retain the raw unjoined series so the
             # remaining 3 readings do not disappear; full joined coverage clears it.
@@ -3631,7 +3689,7 @@ TPU Runtime Utilization
             shm_root = root / "shm"
             shm_root.mkdir(parents=True, exist_ok=True)
             os.chmod(shm_root, 0o750)
-            self.assertEqual(tpu_exporter.DEFAULT_SHM_ROOT, Path("/dev/shm/freetpu"))
+            self.assertEqual(tpu_exporter.DEFAULT_SHM_ROOT, Path("/run/freetpu-metrics"))
             sysfs_root, dev_root, proc_root = _make_mock_pci_tree(
                 root,
                 devices=[
@@ -3911,7 +3969,7 @@ TPU Runtime Utilization
             self.assertIn("__atomic_fetch_add(&s->seq", shm_hdr_text)
             self.assertIn("freetpu_shm_metrics_v1_publish", shm_hdr_text)
             self.assertIn('FREETPU_METRICS_SHM_DEFAULT_DIR', shm_hdr_text)
-            self.assertIn('"/dev/shm/freetpu"', shm_hdr_text)
+            self.assertIn('"/run/freetpu-metrics"', shm_hdr_text)
 
             # Missing heartbeat (timestamp_ns=0) and far-future timestamps fail closed.
             for bad_ts in (0, now_ns + 3600 * 1_000_000_000):
@@ -4157,13 +4215,23 @@ TPU Runtime Utilization
                 'freetpu_tpu_runtime_duty_cycle_percent{pci_bdf="unmapped",expected_tpu_activity="sustained"}',
                 alerts_text,
             )
-            # Duty cycle collapse must be gated on sustained activity + current instant duty sample + HBM allocation.
+            # Duty cycle collapse must be gated on sustained activity + current instant duty sample + HBM allocation
+            # across per-PCI, runtime-unmapped, AND direct-gRPC unjoined sidecar series.
             self.assertIn('expected_tpu_activity="sustained"', alerts_text)
             self.assertIn('freetpu_tpu_duty_cycle_percent{expected_tpu_activity="sustained"} >= 0', alerts_text)
             self.assertIn(
                 'freetpu_tpu_runtime_duty_cycle_percent{pci_bdf="unmapped",expected_tpu_activity="sustained"} >= 0',
                 alerts_text,
             )
+            self.assertIn(
+                'avg_over_time(freetpu_tpu_runtime_unjoined_duty_cycle_percent{expected_tpu_activity="sustained"}[5m]) < 10',
+                alerts_text,
+            )
+            self.assertIn(
+                'freetpu_tpu_runtime_unjoined_duty_cycle_percent{expected_tpu_activity="sustained"} >= 0',
+                alerts_text,
+            )
+            self.assertIn("and on(job, instance)", alerts_text)
             self.assertIn('freetpu_tpu_hbm_used_bytes{expected_tpu_activity="sustained"} > 0', alerts_text)
             self.assertIn("inference replicas", alerts_text)
             # PCIe AER alert must use a multi-scrape window ([5m], not [1m]).

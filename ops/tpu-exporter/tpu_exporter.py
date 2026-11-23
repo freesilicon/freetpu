@@ -7,7 +7,7 @@ v5p, v6e Trillium, and tpu7x pending live HW confirmation), scrapes:
   - Direct `libtpu` gRPC / `RuntimeMetricService` (`localhost:8431`) when
     `grpcio` and protobuf stubs are available (with graceful fallback and zero
     unconditional `tpu-info` subprocess churn)
-  - Lockless SeqLock `/dev/shm/freetpu/freetpu_metrics_<bdf>` `pread` telemetry
+  - Lockless SeqLock `/run/freetpu-metrics/freetpu_metrics_<bdf>` `pread` telemetry
     for bare-metal `libopentpu.so` (`ops/tpu-exporter/freetpu_metrics_shm.h`),
     authenticated via publisher-controlled directory + opened-fd owner UID and
     non-group/world-writable permissions
@@ -108,7 +108,7 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
 FREETPU_SHM_MAGIC = 0x46545055
 FREETPU_SHM_VERSION = 1
-DEFAULT_SHM_ROOT = Path("/dev/shm/freetpu")
+DEFAULT_SHM_ROOT = Path("/run/freetpu-metrics")
 DEFAULT_SHM_MAX_AGE_S = 30.0
 _SHM_HEADER_STRUCT = struct.Struct("<IIQ")
 _SHM_PAYLOAD_STRUCT = struct.Struct("<QQQQQ")
@@ -1262,6 +1262,51 @@ def _infer_devices_per_chip(devices: Sequence[TpuTelemetry]) -> Optional[int]:
     return None
 
 
+def _verified_dual_function_chip_count(
+    devices: Sequence[TpuTelemetry],
+    devices_per_chip: int,
+) -> Optional[int]:
+    """Return verified physical chip count ONLY when every visible PCI function
+    belongs to a verified sibling group of size `devices_per_chip` (multifunction
+    PCI slot siblings `DDDD:BB:DD.*` OR shared sysfs `chip_id` siblings) AND the
+    host exposes at least 4 physical chips.
+
+    Returns `None` on incomplete PCI inventory (e.g. 6 functions = 2 pairs + 2
+    orphans, or only 2 of 4 chips visible) so `len(devices) // devices_per_chip`
+    never understates the physical chip upper bound.
+    """
+    if devices_per_chip <= 1 or not devices:
+        return None
+    slot_counts: Dict[Tuple[str, str], int] = {}
+    rid_counts: Dict[Tuple[str, str], int] = {}
+    for d in devices:
+        base_slot = d.pci_bdf.rsplit(".", 1)[0]
+        slot_counts[(d.generation, base_slot)] = slot_counts.get((d.generation, base_slot), 0) + 1
+        if d.runtime_chip_id:
+            rid_counts[(d.generation, d.runtime_chip_id)] = (
+                rid_counts.get((d.generation, d.runtime_chip_id), 0) + 1
+            )
+
+    verified_groups: set[Tuple[str, str, str]] = set()
+    for d in devices:
+        base_slot = d.pci_bdf.rsplit(".", 1)[0]
+        if slot_counts.get((d.generation, base_slot), 0) == devices_per_chip:
+            verified_groups.add(("slot", d.generation, base_slot))
+        elif (
+            d.runtime_chip_id
+            and rid_counts.get((d.generation, d.runtime_chip_id), 0) == devices_per_chip
+        ):
+            verified_groups.add(("rid", d.generation, d.runtime_chip_id))
+        else:
+            # Unpaired or degraded function: cannot verify a tight upper bound.
+            return None
+
+    chip_count = len(verified_groups)
+    # Require a full 4-chip host floor so partial container/degraded PCI views
+    # exposing only 2 chips never mistake 4 per-chip IDs for per-core IDs.
+    return chip_count if chip_count >= 4 else None
+
+
 def _query_grpc_runtime_metrics(
     devices: Sequence[TpuTelemetry],
     addr: Optional[str] = "127.0.0.1:8431",
@@ -1270,11 +1315,11 @@ def _query_grpc_runtime_metrics(
     """Query `libtpu` RuntimeMetricService directly in-process over gRPC (`localhost:8431`).
 
     Eliminates `tpu-info` CLI/Python subprocess churn and works cleanly when
-    `grpcio` and `tpu_metric_service` proto stubs are installed. Maps per-chip
-    `tpu.runtime.tensorcore.dutycycle.percent` readings across each chip's
-    logical runtime devices using `_GEN_DEVICES_PER_CHIP` (matching upstream
-    `tpu_info/metrics.py` & `device.py`, e.g. 2 logical cores per physical chip
-    on Ironwood `tpu7x` and v2/v3) before joining with per-core HBM series.
+    `grpcio` and `tpu_metric_service` proto stubs are installed. Joins per-core
+    duty cycle directly on single-device-per-chip generations (`v5e`, `v6e`,
+    `v5p`, `v4`) and on verified complete dual-function hosts when duty IDs
+    exceed the physical chip count; preserves ambiguous readings in the
+    separate unjoined series without duplicating across unreported cores.
     Falls back gracefully when `grpcio` or proto stubs are unavailable.
     """
     if not addr:
@@ -1305,7 +1350,6 @@ def _query_grpc_runtime_metrics(
     rows: Dict[str, _TpuInfoRow] = {}
     duty_by_chip: Dict[str, float] = {}
     raw_duty_ids: set[str] = set()
-    raw_hbm_ids: set[str] = set()
     last_err: Optional[str] = None
     any_rpc_ok = False
     total_rpcs = len(_GRPC_METRIC_NAMES)
@@ -1333,8 +1377,6 @@ def _query_grpc_runtime_metrics(
                 continue
             if metric_name == "tpu.runtime.tensorcore.dutycycle.percent":
                 raw_duty_ids.add(chip_id)
-            else:
-                raw_hbm_ids.add(chip_id)
             val = _extract_grpc_gauge_value(item)
             if val is None or val < 0.0:
                 continue
@@ -1359,14 +1401,13 @@ def _query_grpc_runtime_metrics(
     # - On `devices_per_chip > 1` generations (Ironwood tpu7x, v2/v3):
     #   Without an explicit endpoint layout discriminator, a partial per-core
     #   reply with IDs `{0..3}` is indistinguishable from a 4-chip per-chip reply,
-    #   so NEVER guess `per_chip` or duplicate readings across unreported cores.
-    #   Classify as `per_core` ONLY when:
-    #   - `len(raw_duty_int_ids) > expected_chip_count` (pigeonhole proof: more
-    #     distinct IDs than physical chips exist on the host), OR
-    #   - `all_hbm_core_ids` is non-empty, `raw_duty_int_ids == all_hbm_core_ids`,
-    #     AND `len(raw_duty_int_ids) == expected_core_count` (full per-core match).
-    #   Otherwise (including `{0..3}` alongside HBM `{0..7}`, or `{0..3}` / `{4, 5}`
-    #   without HBM IDs), treat as `ambiguous`: keep duty readings in
+    #   and incomplete PCI inventory (e.g. 6 functions across 4 degraded chips)
+    #   can understate physical chip count if divided by `devices_per_chip`.
+    #   Classify as `per_core` ONLY when `_verified_dual_function_chip_count`
+    #   establishes a complete verified sibling inventory (`>= 4` chips, zero
+    #   unpaired functions) AND `len(raw_duty_int_ids) > verified_chip_count`
+    #   (pigeonhole proof: more distinct IDs than physical chips exist).
+    #   Otherwise, treat as `ambiguous`: keep duty readings in
     #   `freetpu_tpu_runtime_unjoined_duty_cycle_percent` and allow fallback to run.
     if devices_per_chip is None:
         duty_layout = "ambiguous"
@@ -1378,29 +1419,12 @@ def _query_grpc_runtime_metrics(
             parsed_duty = [_parse_runtime_device_id(k) for k in raw_duty_ids]
             if all(cid is not None for cid in parsed_duty):
                 raw_duty_int_ids = {cid for cid in parsed_duty if cid is not None}
-                all_hbm_core_ids = {
-                    hid
-                    for k in raw_hbm_ids
-                    for hid in (_parse_runtime_device_id(k),)
-                    if hid is not None
-                }
-                expected_core_count = (
-                    len(devices)
-                    if len(devices) > 0 and len(devices) % devices_per_chip == 0
-                    else None
+                verified_chip_count = _verified_dual_function_chip_count(
+                    devices, devices_per_chip
                 )
-                expected_chip_count = (
-                    expected_core_count // devices_per_chip
-                    if expected_core_count is not None
-                    else None
-                )
-                if expected_chip_count is not None and (
-                    len(raw_duty_int_ids) > expected_chip_count
-                    or (
-                        bool(all_hbm_core_ids)
-                        and raw_duty_int_ids == all_hbm_core_ids
-                        and len(raw_duty_int_ids) == expected_core_count
-                    )
+                if (
+                    verified_chip_count is not None
+                    and len(raw_duty_int_ids) > verified_chip_count
                 ):
                     duty_layout = "per_core"
 
@@ -1441,7 +1465,9 @@ def read_shm_seqlock_metrics(
 
     Authenticates the publisher directory, metric file, and sample freshness on
     opened file descriptors:
-    - requires `shm_root` (default `/dev/shm/freetpu`) to be a non-symlink
+    - requires `shm_root` (default `/run/freetpu-metrics`, under root-owned `/run`
+      and provisioned via systemd `RuntimeDirectory=freetpu-metrics` / `tmpfiles.d`
+      to prevent name squatting under world-writable `/dev/shm`) to be a non-symlink
       publisher-controlled directory opened with `O_DIRECTORY | O_NOFOLLOW`,
       owned by an allowed UID (default: current `euid`) with neither group-write
       (`0o020`) nor world-write (`0o002`) permissions (rejecting shared `/dev/shm`
@@ -2270,7 +2296,7 @@ def collect_snapshot(
             if matched_util.hbm_bw_util_percent is not None:
                 dev.hbm_bandwidth_utilization_percent = matched_util.hbm_bw_util_percent
 
-        # Bare-metal libopentpu.so SeqLock /dev/shm/freetpu_metrics_<bdf> telemetry.
+        # Bare-metal libopentpu.so SeqLock /run/freetpu-metrics/freetpu_metrics_<bdf> telemetry.
         shm = read_shm_seqlock_metrics(
             dev.pci_bdf,
             shm_root=shm_root,
