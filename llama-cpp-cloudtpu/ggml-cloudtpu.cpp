@@ -746,6 +746,16 @@ static void pack_split_to_q6_K(const int8_t* qs,
     }
 }
 
+static bool is_replicated_cache_or_mask_name(const char* name) {
+    if (!name || name[0] == '\0') {
+        return false;
+    }
+    return std::strstr(name, "mask") != nullptr ||
+           std::strncmp(name, "cache_", 6) == 0 ||
+           std::strncmp(name, "moe_cache.", 10) == 0 ||
+           std::strstr(name, "_state_") != nullptr;
+}
+
 static cloudtpu::TensorShardingKind choose_upload_sharding(const struct ggml_tensor* tensor,
                                                            int spmd_chips,
                                                            int spmd_min_rows,
@@ -764,11 +774,12 @@ static cloudtpu::TensorShardingKind choose_upload_sharding(const struct ggml_ten
     }
     const int64_t K = tensor->ne[0];
     const int64_t N = tensor->ne[1];
-    // Never shard 1D vectors (e.g. norm weights, biases) or attention masks; only shard 2D weight matrices.
+    // Never shard 1D vectors (e.g. norm weights, biases), attention masks, or KV/state caches;
+    // only shard 2D weight matrices.
     if (N <= 1 || K <= 1) {
         return cloudtpu::TensorShardingKind::REPLICATED;
     }
-    if (tensor->name[0] != '\0' && std::strstr(tensor->name, "mask") != nullptr) {
+    if (is_replicated_cache_or_mask_name(tensor->name)) {
         return cloudtpu::TensorShardingKind::REPLICATED;
     }
     const int64_t q_align = quant_split_k_alignment(tensor->type);
@@ -1653,11 +1664,10 @@ static size_t ggml_backend_cloudtpu_buffer_type_get_alignment(ggml_backend_buffe
 
 static size_t ggml_backend_cloudtpu_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft,
                                                                const struct ggml_tensor* tensor) {
-    GGML_UNUSED(buft);
     if (!tensor) {
         return 0;
     }
-    const size_t packed = ggml_nbytes(tensor);
+    size_t base_size = ggml_nbytes(tensor);
     const int64_t K = tensor->ne[0];
     if (K > 0 && (K % QK_K) == 0 && (tensor->type == GGML_TYPE_Q4_K || tensor->type == GGML_TYPE_Q6_K)) {
         const size_t n_blocks = static_cast<size_t>(K / QK_K) *
@@ -1668,10 +1678,25 @@ static size_t ggml_backend_cloudtpu_buffer_type_get_alloc_size(ggml_backend_buff
         // and Q6_K (256B s8 + 64B f32 d = 320B/block) relative to packed GGML blocks.
         const size_t bytes_per_block = (tensor->type == GGML_TYPE_Q4_K) ? 192U : 320U;
         if (n_blocks <= SIZE_MAX / bytes_per_block) {
-            return std::max(packed, n_blocks * bytes_per_block);
+            base_size = std::max(base_size, n_blocks * bytes_per_block);
         }
     }
-    return packed;
+    // Under SPMD (P > 1), the unified device reports P * min_chip_hbm. Sharded 2D weights occupy
+    // base_size / P per chip (base_size total across P chips), whereas replicated leaf tensors
+    // (KV/state caches, norms, biases, masks, small or 3D tensors) retain a full copy on every chip
+    // (P * base_size total across P chips). Restrict expansion to true leaf tensors
+    // (op == GGML_OP_NONE && view_src == nullptr) so ggml-backend's TAG_ALLOC_SIZE_EXPAND invariant
+    // is preserved for compute-graph intermediates.
+    auto* btc = buft ? static_cast<cloudtpu_buft_context*>(buft->context) : nullptr;
+    if (btc && btc->spmd_chips > 1 && tensor->op == GGML_OP_NONE && tensor->view_src == nullptr) {
+        const cloudtpu::TensorShardingKind sh = choose_upload_sharding(
+            tensor, btc->spmd_chips, btc->spmd_min_rows, /*allow_sharding=*/true);
+        if (sh == cloudtpu::TensorShardingKind::REPLICATED) {
+            const size_t p = static_cast<size_t>(btc->spmd_chips);
+            return (base_size <= SIZE_MAX / p) ? (base_size * p) : SIZE_MAX;
+        }
+    }
+    return base_size;
 }
 
 static bool ggml_backend_cloudtpu_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
@@ -3629,17 +3654,24 @@ static void ggml_backend_cloudtpu_device_get_memory(ggml_backend_dev_t dev, size
     try {
         cloudtpu::PjrtRuntime& rt = ensure_runtime_initialized();
         if (dc->spmd_chips > 1) {
-            size_t sum_free = 0;
-            size_t sum_total = 0;
+            size_t min_free = SIZE_MAX;
+            size_t min_total = SIZE_MAX;
             for (int i = 0; i < dc->spmd_chips; ++i) {
                 size_t f = 0, t = 0;
-                if (rt.query_memory_stats(i, &f, &t)) {
-                    sum_free += f;
-                    sum_total += t;
+                if (!rt.query_memory_stats(i, &f, &t)) {
+                    *free = 0;
+                    *total = 0;
+                    return;
                 }
+                min_free = std::min(min_free, f);
+                min_total = std::min(min_total, t);
             }
-            *free = sum_free;
-            *total = sum_total;
+            // Symmetric SPMD allocations are bounded by the most constrained chip (min_free).
+            // Reporting P * min_free pairs with get_alloc_size charging 1x for sharded weights
+            // (base_size / P per chip) and P * base_size for replicated leaf buffers (KV cache).
+            const size_t p = static_cast<size_t>(dc->spmd_chips);
+            *free = (min_free <= SIZE_MAX / p) ? (min_free * p) : SIZE_MAX;
+            *total = (min_total <= SIZE_MAX / p) ? (min_total * p) : SIZE_MAX;
             return;
         }
         if (!rt.query_memory_stats(dc->device_index, free, total)) {
