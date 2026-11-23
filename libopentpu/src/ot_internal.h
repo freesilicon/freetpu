@@ -105,6 +105,12 @@ struct VfioTransport {
   int64_t owner_pid = 0;
 
   bool is_owner_process() const;
+  bool register_fork_cleanup(std::string* err);
+
+  VfioTransport() = default;
+  ~VfioTransport();
+  VfioTransport(const VfioTransport&) = delete;
+  VfioTransport& operator=(const VfioTransport&) = delete;
 
   IovaAllocator iova_alloc;
   IovaAllocator hbm_alloc;
@@ -137,6 +143,8 @@ struct VfioTransport {
 ot_status_t buffer_h2d_offset(ot_context_t* ctx, ot_buffer_t* dst, size_t dst_offset,
                               const void* host_src, size_t size_bytes);
 bool validate_cq_completion(uint32_t sent_seq, const uint32_t cq[8], std::string* err);
+// Static allocation-free PJRT_Error fallback used when error allocation fails.
+void* pjrt_static_fallback_error_raw(uint32_t error_code);
 
 }  // namespace ot
 

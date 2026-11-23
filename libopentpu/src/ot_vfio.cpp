@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -254,6 +255,105 @@ void* alloc_aligned_anon_pages(size_t len, size_t align, std::string* err) {
   return reinterpret_cast<void*>(aligned_addr);
 }
 
+namespace {
+
+pthread_mutex_t g_vfio_fork_mu = PTHREAD_MUTEX_INITIALIZER;
+pthread_once_t g_vfio_atfork_once = PTHREAD_ONCE_INIT;
+constexpr size_t kMaxTrackedVfioTransports = 64;
+VfioTransport* g_tracked_transports[kMaxTrackedVfioTransports] = {};
+bool g_vfio_atfork_registered = false;
+
+void vfio_atfork_prepare() {
+  pthread_mutex_lock(&g_vfio_fork_mu);
+}
+
+void vfio_atfork_parent() {
+  pthread_mutex_unlock(&g_vfio_fork_mu);
+}
+
+void vfio_atfork_child() {
+  for (size_t i = 0; i < kMaxTrackedVfioTransports; ++i) {
+    VfioTransport* t = g_tracked_transports[i];
+    if (!t) continue;
+    if (t->device_fd >= 0) {
+      ::close(t->device_fd);
+      t->device_fd = -1;
+    }
+    if (t->group_fd >= 0) {
+      ::close(t->group_fd);
+      t->group_fd = -1;
+    }
+    if (t->container_fd >= 0) {
+      ::close(t->container_fd);
+      t->container_fd = -1;
+    }
+    // BAR0/BAR4 and DMA arenas are marked MADV_DONTFORK so they are not mapped
+    // in the child; clear pointers so child cleanup touches no hardware or VMAs.
+    t->bar0_mmio = nullptr;
+    t->bar0_mapped_len = 0;
+    t->bar4_mmio = nullptr;
+    t->bar4_mapped_len = 0;
+    t->ring_arena_mem = nullptr;
+    t->ring_arena_bytes = 0;
+    t->host_stage_mem = nullptr;
+    t->host_stage_size = 0;
+    t->sq_ring_mem = nullptr;
+    t->cq_ring_mem = nullptr;
+    t->status_page_mem = nullptr;
+    t->pci_cmd_saved = false;
+    t->ring_ready = false;
+    t->dma_faulted = true;
+    g_tracked_transports[i] = nullptr;
+  }
+  pthread_mutex_unlock(&g_vfio_fork_mu);
+}
+
+void init_vfio_atfork_once() {
+  g_vfio_atfork_registered =
+      (pthread_atfork(vfio_atfork_prepare, vfio_atfork_parent, vfio_atfork_child) == 0);
+}
+
+void unregister_transport_locked(VfioTransport* t) {
+  for (size_t i = 0; i < kMaxTrackedVfioTransports; ++i) {
+    if (g_tracked_transports[i] == t) {
+      g_tracked_transports[i] = nullptr;
+    }
+  }
+}
+
+}  // namespace
+
+VfioTransport::~VfioTransport() {
+  close_device();
+}
+
+bool VfioTransport::register_fork_cleanup(std::string* err) {
+  pthread_once(&g_vfio_atfork_once, init_vfio_atfork_once);
+  if (!g_vfio_atfork_registered) {
+    if (err) *err = "pthread_atfork registration failed for VFIO transport";
+    return false;
+  }
+  pthread_mutex_lock(&g_vfio_fork_mu);
+  size_t free_slot = kMaxTrackedVfioTransports;
+  for (size_t i = 0; i < kMaxTrackedVfioTransports; ++i) {
+    if (g_tracked_transports[i] == this) {
+      pthread_mutex_unlock(&g_vfio_fork_mu);
+      return true;
+    }
+    if (g_tracked_transports[i] == nullptr && free_slot == kMaxTrackedVfioTransports) {
+      free_slot = i;
+    }
+  }
+  if (free_slot == kMaxTrackedVfioTransports) {
+    pthread_mutex_unlock(&g_vfio_fork_mu);
+    if (err) *err = "Too many concurrent live VFIO transports";
+    return false;
+  }
+  g_tracked_transports[free_slot] = this;
+  pthread_mutex_unlock(&g_vfio_fork_mu);
+  return true;
+}
+
 #ifdef __linux__
 static inline void dma_wmb() {
 #if defined(__aarch64__)
@@ -421,9 +521,19 @@ bool VfioTransport::open_device(const ot_config_t& cfg, ot_device_info_t* info, 
     return false;
   }
 
+  if (!register_fork_cleanup(err)) {
+    return false;
+  }
+
+  // Acquire VFIO descriptors under g_vfio_fork_mu so a concurrent fork() cannot
+  // observe an untracked descriptor in the child process.
+  pthread_mutex_lock(&g_vfio_fork_mu);
   container_fd = ::open("/dev/vfio/vfio", O_RDWR | O_CLOEXEC);
+  int open_err = errno;
+  pthread_mutex_unlock(&g_vfio_fork_mu);
   if (container_fd < 0) {
-    if (err) *err = std::string("open(/dev/vfio/vfio) failed: ") + std::strerror(errno);
+    if (err) *err = std::string("open(/dev/vfio/vfio) failed: ") + std::strerror(open_err);
+    close_device();
     return false;
   }
   if (::ioctl(container_fd, VFIO_GET_API_VERSION) != VFIO_API_VERSION) {
@@ -433,9 +543,12 @@ bool VfioTransport::open_device(const ot_config_t& cfg, ot_device_info_t* info, 
   }
 
   std::string grp_path = "/dev/vfio/" + std::to_string(pci.iommu_group);
+  pthread_mutex_lock(&g_vfio_fork_mu);
   group_fd = ::open(grp_path.c_str(), O_RDWR | O_CLOEXEC);
+  open_err = errno;
+  pthread_mutex_unlock(&g_vfio_fork_mu);
   if (group_fd < 0) {
-    if (err) *err = "open(" + grp_path + ") failed: " + std::strerror(errno);
+    if (err) *err = "open(" + grp_path + ") failed: " + std::strerror(open_err);
     close_device();
     return false;
   }
@@ -463,9 +576,12 @@ bool VfioTransport::open_device(const ot_config_t& cfg, ot_device_info_t* info, 
     }
   }
 
+  pthread_mutex_lock(&g_vfio_fork_mu);
   device_fd = ::ioctl(group_fd, VFIO_GROUP_GET_DEVICE_FD, pci.bdf.c_str());
+  open_err = errno;
+  pthread_mutex_unlock(&g_vfio_fork_mu);
   if (device_fd < 0) {
-    if (err) *err = std::string("VFIO_GROUP_GET_DEVICE_FD failed: ") + std::strerror(errno);
+    if (err) *err = std::string("VFIO_GROUP_GET_DEVICE_FD failed: ") + std::strerror(open_err);
     close_device();
     return false;
   }
@@ -513,29 +629,57 @@ bool VfioTransport::open_device(const ot_config_t& cfg, ot_device_info_t* info, 
   (void)::ioctl(device_fd, VFIO_DEVICE_RESET);
 
   if (bar4_size > 0 && (r4.flags & VFIO_REGION_INFO_FLAG_MMAP)) {
+    pthread_mutex_lock(&g_vfio_fork_mu);
     void* p4 = ::mmap(nullptr, static_cast<size_t>(bar4_size), PROT_READ | PROT_WRITE,
                       MAP_SHARED, device_fd, static_cast<off_t>(bar4_offset));
+    int map_err = errno;
+    if (p4 != MAP_FAILED) {
+      if (::madvise(p4, static_cast<size_t>(bar4_size), MADV_DONTFORK) != 0) {
+        map_err = errno;
+        ::munmap(p4, static_cast<size_t>(bar4_size));
+        p4 = MAP_FAILED;
+        pthread_mutex_unlock(&g_vfio_fork_mu);
+        if (err) *err = std::string("madvise(BAR4, MADV_DONTFORK) failed: ") + std::strerror(map_err);
+        close_device();
+        return false;
+      }
+      bar4_mmio = reinterpret_cast<volatile uint8_t*>(p4);
+      bar4_mapped_len = static_cast<size_t>(bar4_size);
+    }
+    pthread_mutex_unlock(&g_vfio_fork_mu);
     if (p4 == MAP_FAILED) {
-      if (err) *err = std::string("mmap(BAR4) failed: ") + std::strerror(errno);
+      if (err) *err = std::string("mmap(BAR4) failed: ") + std::strerror(map_err);
       close_device();
       return false;
     }
-    bar4_mmio = reinterpret_cast<volatile uint8_t*>(p4);
-    bar4_mapped_len = static_cast<size_t>(bar4_size);
   }
 
   // Map first 1 MiB of BAR0 covering the 0x10000..0x12000 ring controller aperture.
   if (bar0_size >= 0x20000ULL && (r0.flags & VFIO_REGION_INFO_FLAG_MMAP)) {
     size_t map_len = static_cast<size_t>(bar0_size < 0x100000ULL ? bar0_size : 0x100000ULL);
+    pthread_mutex_lock(&g_vfio_fork_mu);
     void* p0 = ::mmap(nullptr, map_len, PROT_READ | PROT_WRITE, MAP_SHARED,
                       device_fd, static_cast<off_t>(bar0_offset));
+    int map_err = errno;
+    if (p0 != MAP_FAILED) {
+      if (::madvise(p0, map_len, MADV_DONTFORK) != 0) {
+        map_err = errno;
+        ::munmap(p0, map_len);
+        p0 = MAP_FAILED;
+        pthread_mutex_unlock(&g_vfio_fork_mu);
+        if (err) *err = std::string("madvise(BAR0, MADV_DONTFORK) failed: ") + std::strerror(map_err);
+        close_device();
+        return false;
+      }
+      bar0_mmio = reinterpret_cast<volatile uint8_t*>(p0);
+      bar0_mapped_len = map_len;
+    }
+    pthread_mutex_unlock(&g_vfio_fork_mu);
     if (p0 == MAP_FAILED) {
-      if (err) *err = std::string("mmap(BAR0) failed: ") + std::strerror(errno);
+      if (err) *err = std::string("mmap(BAR0) failed: ") + std::strerror(map_err);
       close_device();
       return false;
     }
-    bar0_mmio = reinterpret_cast<volatile uint8_t*>(p0);
-    bar0_mapped_len = map_len;
   }
 
   uint16_t svid = 0, sdid = 0;
@@ -614,24 +758,35 @@ void VfioTransport::close_device() {
     write_pci_config(0x04, &saved_pci_cmd, sizeof(saved_pci_cmd));
     pci_cmd_saved = false;
   }
-  if (bar0_mmio && bar0_mapped_len > 0) {
-    ::munmap(const_cast<uint8_t*>(bar0_mmio), bar0_mapped_len);
+  if (is_owner_process()) {
+    if (bar0_mmio && bar0_mapped_len > 0) {
+      ::munmap(const_cast<uint8_t*>(bar0_mmio), bar0_mapped_len);
+    }
+    if (bar4_mmio && bar4_mapped_len > 0) {
+      ::munmap(const_cast<uint8_t*>(bar4_mmio), bar4_mapped_len);
+    }
   }
-  if (bar4_mmio && bar4_mapped_len > 0) {
-    ::munmap(const_cast<uint8_t*>(bar4_mmio), bar4_mapped_len);
-  }
-  if (device_fd >= 0) ::close(device_fd);
-  if (group_fd >= 0) ::close(group_fd);
-  if (container_fd >= 0) ::close(container_fd);
 #endif
+  pthread_mutex_lock(&g_vfio_fork_mu);
+  unregister_transport_locked(this);
+  if (device_fd >= 0) {
+    ::close(device_fd);
+    device_fd = -1;
+  }
+  if (group_fd >= 0) {
+    ::close(group_fd);
+    group_fd = -1;
+  }
+  if (container_fd >= 0) {
+    ::close(container_fd);
+    container_fd = -1;
+  }
   bar0_mmio = nullptr;
   bar0_mapped_len = 0;
   bar4_mmio = nullptr;
   bar4_mapped_len = 0;
-  device_fd = -1;
-  group_fd = -1;
-  container_fd = -1;
   owner_pid = 0;
+  pthread_mutex_unlock(&g_vfio_fork_mu);
 }
 
 bool VfioTransport::map_dma_at(void* vaddr, uint64_t iova, uint64_t size, std::string* err) {
@@ -782,14 +937,21 @@ bool VfioTransport::init_ring_queues(std::string* err) {
   }
 
   auto map_anon_dma = [&](uint64_t iova, size_t len) -> uint8_t* {
+    pthread_mutex_lock(&g_vfio_fork_mu);
     void* p = alloc_aligned_anon_pages(len, static_cast<size_t>(map_granule), err);
-    if (!p) return nullptr;
-    // Prevent copy-on-write page replacement across fork() while pages are pinned by VFIO.
-    if (::madvise(p, len, MADV_DONTFORK) != 0) {
-      if (err) *err = std::string("madvise(MADV_DONTFORK) failed: ") + std::strerror(errno);
-      ::munmap(p, len);
+    if (!p) {
+      pthread_mutex_unlock(&g_vfio_fork_mu);
       return nullptr;
     }
+    // Prevent copy-on-write page replacement across fork() while pages are pinned by VFIO.
+    if (::madvise(p, len, MADV_DONTFORK) != 0) {
+      int madv_err = errno;
+      ::munmap(p, len);
+      pthread_mutex_unlock(&g_vfio_fork_mu);
+      if (err) *err = std::string("madvise(MADV_DONTFORK) failed: ") + std::strerror(madv_err);
+      return nullptr;
+    }
+    pthread_mutex_unlock(&g_vfio_fork_mu);
     std::memset(p, 0, len);
     if (!map_dma_at(p, iova, len, err)) {
       ::munmap(p, len);

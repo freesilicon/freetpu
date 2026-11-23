@@ -4,10 +4,14 @@
 #include "ot_vliw.h"
 #include "pjrt_c_api.h"
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <vector>
 
 extern "C" const PJRT_Api* GetPjrtApi(void);
@@ -101,6 +105,74 @@ static void test_aligned_dma_arena_alloc() {
   OT_CHECK(ot::alloc_aligned_anon_pages(kTwoMiB, 3u * 4096u, &err) == nullptr);
   OT_CHECK(ot::alloc_aligned_anon_pages(0, kTwoMiB, &err) == nullptr);
   printf("[PASS] test_aligned_dma_arena_alloc\n");
+}
+
+static void test_fork_closes_vfio_fds_and_static_pjrt_err() {
+  // Verify pthread_atfork releases inherited VFIO descriptors in a forked child
+  // without closing the parent's descriptors.
+  int p0[2] = {-1, -1};
+  int p1[2] = {-1, -1};
+  int p2[2] = {-1, -1};
+  OT_CHECK(::pipe(p0) == 0 && ::pipe(p1) == 0 && ::pipe(p2) == 0);
+  {
+    ot::VfioTransport tr;
+    std::string err;
+    OT_CHECK(tr.register_fork_cleanup(&err));
+    tr.is_mock = false;
+    tr.owner_pid = static_cast<int64_t>(::getpid());
+    tr.container_fd = p0[0];
+    tr.group_fd = p1[0];
+    tr.device_fd = p2[0];
+    int tracked_fds[3] = {p0[0], p1[0], p2[0]};
+
+    pid_t pid = ::fork();
+    OT_CHECK(pid >= 0);
+    if (pid == 0) {
+      bool ok = true;
+      for (int fd : tracked_fds) {
+        errno = 0;
+        if (::fcntl(fd, F_GETFD) != -1 || errno != EBADF) ok = false;
+      }
+      if (tr.container_fd != -1 || tr.group_fd != -1 || tr.device_fd != -1) ok = false;
+      if (!tr.dma_faulted || tr.is_owner_process()) ok = false;
+      ::_exit(ok ? 0 : 1);
+    }
+    int status = 0;
+    OT_CHECK(::waitpid(pid, &status, 0) == pid);
+    OT_CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    // Parent descriptors remain open until parent closes the transport.
+    for (int fd : tracked_fds) {
+      OT_CHECK(::fcntl(fd, F_GETFD) != -1);
+    }
+    tr.close_device();
+    for (int fd : tracked_fds) {
+      errno = 0;
+      OT_CHECK(::fcntl(fd, F_GETFD) == -1 && errno == EBADF);
+    }
+  }
+  ::close(p0[1]);
+  ::close(p1[1]);
+  ::close(p2[1]);
+
+  // Verify allocation-free static fallback PJRT_Error behaves cleanly across code/msg/destroy.
+  const PJRT_Api* api = GetPjrtApi();
+  auto* fallback = reinterpret_cast<PJRT_Error*>(
+      ot::pjrt_static_fallback_error_raw(PJRT_Error_Code_RESOURCE_EXHAUSTED));
+  OT_CHECK(fallback != nullptr);
+  PJRT_Error_GetCode_Args gc = {};
+  gc.struct_size = PJRT_Error_GetCode_Args_STRUCT_SIZE;
+  gc.error = fallback;
+  OT_CHECK(api->PJRT_Error_GetCode(&gc) == nullptr);
+  OT_CHECK(gc.code == PJRT_Error_Code_RESOURCE_EXHAUSTED);
+  PJRT_Error_Message_Args gm = {};
+  gm.struct_size = PJRT_Error_Message_Args_STRUCT_SIZE;
+  gm.error = fallback;
+  api->PJRT_Error_Message(&gm);
+  OT_CHECK(gm.message != nullptr && gm.message_size > 0);
+  // Destroying the static fallback error repeatedly must be a safe no-op.
+  destroy_pjrt_error(api, fallback);
+  destroy_pjrt_error(api, fallback);
+  printf("[PASS] test_fork_closes_vfio_fds_and_static_pjrt_err\n");
 }
 
 static void test_mock_dma_and_matmul() {
@@ -1058,6 +1130,7 @@ int main() {
   test_iova_allocator();
   test_bar4_descriptor_parser();
   test_aligned_dma_arena_alloc();
+  test_fork_closes_vfio_fds_and_static_pjrt_err();
   test_mock_dma_and_matmul();
   test_pjrt_api_mock();
   test_vliw_and_tiling();

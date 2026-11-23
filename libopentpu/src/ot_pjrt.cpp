@@ -125,17 +125,26 @@ namespace {
 struct OtPjrtError {
   PJRT_Error base{};
   PJRT_Error_Code code = PJRT_Error_Code_INTERNAL;
-  std::string msg;
+  char* msg = nullptr;
+  size_t msg_len = 0;
+};
+
+struct OtStaticPjrtError {
+  PJRT_Error base;
+  PJRT_Error_Code code;
 };
 
 void err_vtable_destroy(PJRT_Error* e) {
-  delete reinterpret_cast<OtPjrtError*>(e);
+  auto* oe = reinterpret_cast<OtPjrtError*>(e);
+  if (!oe) return;
+  std::free(oe->msg);
+  delete oe;
 }
 
 void err_vtable_message(const PJRT_Error* e, const char** msg, size_t* len) {
   const auto* oe = reinterpret_cast<const OtPjrtError*>(e);
-  *msg = oe->msg.c_str();
-  *len = oe->msg.size();
+  *msg = oe->msg ? oe->msg : "";
+  *len = oe->msg_len;
 }
 
 PJRT_Error_Code err_vtable_code(const PJRT_Error* e) {
@@ -153,6 +162,53 @@ const PJRT_Error_FunctionTable kErrVtable = {
     err_vtable_code,
     err_vtable_payload,
 };
+
+void static_err_vtable_destroy(PJRT_Error*) {}
+
+void static_err_vtable_message(const PJRT_Error*, const char** msg, size_t* len) {
+  static constexpr char kOomMsg[] = "libopentpu: error (failed to allocate PJRT_Error)";
+  *msg = kOomMsg;
+  *len = sizeof(kOomMsg) - 1;
+}
+
+PJRT_Error_Code static_err_vtable_code(const PJRT_Error* e) {
+  return reinterpret_cast<const OtStaticPjrtError*>(e)->code;
+}
+
+const PJRT_Error_FunctionTable kStaticErrVtable = {
+    PJRT_Error_FunctionTable_STRUCT_SIZE,
+    sizeof(OtStaticPjrtError),
+    nullptr,
+    static_err_vtable_destroy,
+    static_err_vtable_message,
+    static_err_vtable_code,
+    err_vtable_payload,
+};
+
+PJRT_Error* static_fallback_err(PJRT_Error_Code code) {
+  static OtStaticPjrtError kFallbacks[17] = {
+      {{&kStaticErrVtable}, PJRT_Error_Code_INTERNAL},
+      {{&kStaticErrVtable}, PJRT_Error_Code_CANCELLED},
+      {{&kStaticErrVtable}, PJRT_Error_Code_UNKNOWN},
+      {{&kStaticErrVtable}, PJRT_Error_Code_INVALID_ARGUMENT},
+      {{&kStaticErrVtable}, PJRT_Error_Code_DEADLINE_EXCEEDED},
+      {{&kStaticErrVtable}, PJRT_Error_Code_NOT_FOUND},
+      {{&kStaticErrVtable}, PJRT_Error_Code_ALREADY_EXISTS},
+      {{&kStaticErrVtable}, PJRT_Error_Code_PERMISSION_DENIED},
+      {{&kStaticErrVtable}, PJRT_Error_Code_RESOURCE_EXHAUSTED},
+      {{&kStaticErrVtable}, PJRT_Error_Code_FAILED_PRECONDITION},
+      {{&kStaticErrVtable}, PJRT_Error_Code_ABORTED},
+      {{&kStaticErrVtable}, PJRT_Error_Code_OUT_OF_RANGE},
+      {{&kStaticErrVtable}, PJRT_Error_Code_UNIMPLEMENTED},
+      {{&kStaticErrVtable}, PJRT_Error_Code_INTERNAL},
+      {{&kStaticErrVtable}, PJRT_Error_Code_UNAVAILABLE},
+      {{&kStaticErrVtable}, PJRT_Error_Code_DATA_LOSS},
+      {{&kStaticErrVtable}, PJRT_Error_Code_UNAUTHENTICATED},
+  };
+  int idx = static_cast<int>(code);
+  if (idx <= 0 || idx >= 17) idx = static_cast<int>(PJRT_Error_Code_INTERNAL);
+  return &kFallbacks[idx].base;
+}
 
 void* mem_vtable_get_user_data(PJRT_Memory* memory, const void* key) {
   if (!memory) return nullptr;
@@ -204,10 +260,18 @@ const PJRT_Memory_FunctionTable kMemoryVtable = {
 
 PJRT_Error* make_err(PJRT_Error_Code code, const std::string& msg) {
   auto* e = new (std::nothrow) OtPjrtError();
-  if (!e) return nullptr;
+  if (!e) return static_fallback_err(code);
+  char* buf = static_cast<char*>(std::malloc(msg.size() + 1u));
+  if (!buf) {
+    delete e;
+    return static_fallback_err(code);
+  }
+  if (!msg.empty()) std::memcpy(buf, msg.data(), msg.size());
+  buf[msg.size()] = '\0';
   e->base.vtable = &kErrVtable;
   e->code = code;
-  e->msg = msg;
+  e->msg = buf;
+  e->msg_len = msg.size();
   return &e->base;
 }
 
@@ -2362,6 +2426,14 @@ PJRT_Api build_pjrt_api() {
 const PJRT_Api kPjrtApi = build_pjrt_api();
 
 }  // namespace
+
+namespace ot {
+
+void* pjrt_static_fallback_error_raw(uint32_t error_code) {
+  return static_fallback_err(static_cast<PJRT_Error_Code>(error_code));
+}
+
+}  // namespace ot
 
 extern "C" {
 
