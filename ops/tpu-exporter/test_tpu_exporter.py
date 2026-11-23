@@ -4338,6 +4338,8 @@ TPU Runtime Utilization
             self.assertEqual(struct.pack("<I", tpu_exporter.FREETPU_SHM_MAGIC), b"FTPU")
             shm_header = (EXPORTER_DIR / "freetpu_metrics_shm.h").read_text(encoding="utf-8")
             self.assertIn("0x55505446u", shm_header)
+            self.assertIn("mode 0600", shm_header)
+            self.assertIn("mode 0640", shm_header)
             shm_file = shm_root / "freetpu_metrics_0000:00:0b.0"
             payload = struct.pack(
                 "<IIQQQQQQ",
@@ -5410,6 +5412,164 @@ TPU Runtime Utilization
             sc_unset_by_bdf = {d.pci_bdf: d for d in sidecar_unset.devices}
             self.assertEqual(sc_unset_by_bdf["0000:00:04.0"].duty_cycle_percent, 40.0)
             self.assertIsNone(sc_unset_by_bdf["0000:00:05.0"].duty_cycle_percent)
+
+            # 3. Partial `get_chip_usage()` reply (HBM cores `{0, 1}` positionally zipped
+            #    against physical chip `1`'s duty `88.0`) MUST NOT publish chip 1's duty on
+            #    cores `0, 1` — both without `get_metric_data` AND when `get_metric_data`
+            #    exposes raw duty chip `{1}`! Verified raw duty chip `{0}` IS accepted.
+            partial_bad_usage = [
+                SimpleNamespace(
+                    device_id=c,
+                    memory_usage=10 * 1024**3,
+                    total_memory=96 * 1024**3,
+                    duty_cycle_pct=88.0,
+                )
+                for c in (0, 1)
+            ]
+            partial_no_raw_mod = SimpleNamespace(
+                get_chip_usage=lambda chip_type, addr=None: partial_bad_usage,
+            )
+            partial_mismatch_raw_mod = SimpleNamespace(
+                get_chip_usage=lambda chip_type, addr=None: partial_bad_usage,
+                get_metric_data=lambda addr, name: SimpleNamespace(
+                    metric=SimpleNamespace(metrics=[_make_item(1, as_double=88.0)])
+                ),
+            )
+            partial_verified_raw_mod = SimpleNamespace(
+                get_chip_usage=lambda chip_type, addr=None: [
+                    SimpleNamespace(
+                        device_id=c,
+                        memory_usage=10 * 1024**3,
+                        total_memory=96 * 1024**3,
+                        duty_cycle_pct=42.0,
+                    )
+                    for c in (0, 1)
+                ],
+                get_metric_data=lambda addr, name: SimpleNamespace(
+                    metric=SimpleNamespace(metrics=[_make_item(0, as_double=42.0)])
+                ),
+            )
+            for mod_bad in (partial_no_raw_mod, partial_mismatch_raw_mod):
+                with (
+                    mock.patch.object(
+                        tpu_exporter,
+                        "_query_grpc_runtime_metrics",
+                        return_value=(False, "grpc unavailable", {}),
+                    ),
+                    mock.patch.dict(
+                        sys.modules,
+                        {"tpu_info.metrics": mod_bad, "tpu_info.device": fake_device_mod},
+                    ),
+                ):
+                    bad_sc = tpu_exporter.collect_snapshot(
+                        sysfs_root=filt_sys,
+                        dev_root=filt_dev,
+                        proc_root=filt_proc,
+                        tpu_info_bin="tpu-info",
+                        chip_id_map=filt_map,
+                        skip_pid_scan=True,
+                        runtime_metrics_addr="127.0.0.1:8431",
+                        grpc_duty_layout="per-chip",
+                        shm_root=root / "no-shm",
+                    )
+                self.assertEqual(bad_sc.devices[0].hbm_used_bytes, 10 * 1024**3)
+                self.assertIsNone(bad_sc.devices[0].duty_cycle_percent)
+                self.assertTrue(all(rt.duty_cycle_percent is None for rt in bad_sc.runtime_utilization))
+
+            with (
+                mock.patch.object(
+                    tpu_exporter,
+                    "_query_grpc_runtime_metrics",
+                    return_value=(False, "grpc unavailable", {}),
+                ),
+                mock.patch.dict(
+                    sys.modules,
+                    {"tpu_info.metrics": partial_verified_raw_mod, "tpu_info.device": fake_device_mod},
+                ),
+            ):
+                ok_sc = tpu_exporter.collect_snapshot(
+                    sysfs_root=filt_sys,
+                    dev_root=filt_dev,
+                    proc_root=filt_proc,
+                    tpu_info_bin="tpu-info",
+                    chip_id_map=filt_map,
+                    skip_pid_scan=True,
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    grpc_duty_layout="per-chip",
+                    shm_root=root / "no-shm",
+                )
+            self.assertEqual(ok_sc.devices[0].duty_cycle_percent, 42.0)
+
+            # 4. Filtered 4-visible-chip slice of an 8-chip TPU v3 host receiving 8 physical-chip
+            #    duty IDs `{0..7}` and 16 HBM cores `{0..15}` MUST NOT infer `per-core` and
+            #    misattribute physical chip 1 to runtime core 1!
+            v3_4_sys, v3_4_dev, v3_4_proc = _make_mock_pci_tree(
+                root / "v3_filtered_4_of_8",
+                devices=[
+                    {
+                        "bdf": f"0000:00:{4 + i:02x}.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0027",
+                        "subsystem_device": "0x004e",
+                        "driver": "vfio-pci",
+                        "iommu_group": str(i),
+                    }
+                    for i in range(4)
+                ],
+                create_vfio_nodes=[str(i) for i in range(4)],
+            )
+
+            class _V3EightChipStub:
+                def __init__(self, channel):
+                    del channel
+
+                def GetRuntimeMetric(self, req, timeout=None):
+                    del timeout
+                    if req.metric_name == "tpu.runtime.hbm.memory.usage.bytes":
+                        items = [_make_item(c, as_int=(c + 1) * 1024**3) for c in range(16)]
+                    elif req.metric_name == "tpu.runtime.hbm.memory.total.bytes":
+                        items = [_make_item(c, as_int=16 * 1024**3) for c in range(16)]
+                    elif req.metric_name == "tpu.runtime.tensorcore.dutycycle.percent":
+                        items = [_make_item(c, as_double=10.0 * (c + 1)) for c in range(8)]
+                    else:
+                        items = []
+                    return SimpleNamespace(metric=SimpleNamespace(metrics=items))
+
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.dict(tpu_exporter._GRPC_CHANNELS, {}, clear=True),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "grpc": _FakeGrpc,
+                        "tpu_info": SimpleNamespace(),
+                        "tpu_info.proto": SimpleNamespace(),
+                        "tpu_info.proto.tpu_metric_service_pb2": SimpleNamespace(
+                            MetricRequest=_FakeReq
+                        ),
+                        "tpu_info.proto.tpu_metric_service_pb2_grpc": SimpleNamespace(
+                            RuntimeMetricServiceStub=_V3EightChipStub
+                        ),
+                    },
+                ),
+            ):
+                v3_filt_snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=v3_4_sys,
+                    dev_root=v3_4_dev,
+                    proc_root=v3_4_proc,
+                    tpu_info_bin="tpu-info",
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=root / "no-shm",
+                )
+            self.assertEqual(len(v3_filt_snap.runtime_utilization), 16)
+            self.assertTrue(
+                all(rt.duty_cycle_percent is None for rt in v3_filt_snap.runtime_utilization),
+                "Must NOT treat 8 v3 physical-chip duty IDs as per-core on a 4-visible-chip slice",
+            )
+            self.assertEqual(
+                v3_filt_snap.runtime_unjoined_duty_cycle,
+                {str(c): 10.0 * (c + 1) for c in range(8)},
+            )
 
     def _assert_valid_prometheus_text(self, text: str) -> None:
         lines = [ln for ln in text.splitlines() if ln.strip()]

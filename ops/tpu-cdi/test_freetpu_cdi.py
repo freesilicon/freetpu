@@ -633,6 +633,29 @@ class FreeTpuCdiTests(unittest.TestCase):
             any("conflicts with global containerEdits.netDevices" in e for e in override_collide_errs),
             override_collide_errs,
         )
+        # OCI/CDI v1.1.0 `%d` network interface name templates dynamically allocate
+        # unique names across scopes and MUST NOT be rejected as literal collisions.
+        cross_net_template_ok = {
+            "cdiVersion": "1.1.0",
+            "kind": "freetpu.dev/tpu",
+            "containerEdits": {
+                "deviceNodes": [{"path": "/dev/vfio/vfio"}],
+                "netDevices": [{"hostInterfaceName": "eth1", "name": "tpu%d"}],
+            },
+            "devices": [
+                {
+                    "name": "0",
+                    "containerEdits": {
+                        "deviceNodes": [{"path": "/dev/vfio/0"}],
+                        "netDevices": [
+                            {"hostInterfaceName": "eth2", "name": "tpu%d"},
+                            {"hostInterfaceName": "eth3", "name": "tpu%d"},
+                        ],
+                    },
+                }
+            ],
+        }
+        self.assertEqual(freetpu_cdi.validate_cdi_spec(cross_net_template_ok), [])
 
         # CNCF CDI v1.1.0 IntelRdt.closID validation: "/" (root CLOS), "" (unset), and
         # valid Linux filenames pass; paths containing "/", ".", "..", "\n", "\x00", or
@@ -4824,6 +4847,11 @@ class FreeTpuCdiTests(unittest.TestCase):
             self.assertIn("freetpu.dev/tpu=numa0-pcie-0000-00-4", readme_text)
             self.assertIn("--chip-id-map", dra_text)
             self.assertIn("TPU_ACCELERATOR_TYPE", dra_text)
+            # Basic smoke-test Pod must NOT unconditionally add IPC_LOCK (keeps Baseline/Restricted PSS compatibility).
+            self.assertFalse(
+                any(ln.strip() == "- IPC_LOCK" for ln in dra_text.splitlines()),
+                "DRA smoke-test Pod must keep IPC_LOCK commented/opt-in",
+            )
 
     def test_missing_vfio_group_node_retains_healthy_numa_slice_and_withdraws_broken_group(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4888,6 +4916,7 @@ class FreeTpuCdiTests(unittest.TestCase):
                 deg_names = {d["name"] for d in deg_spec["devices"]}
                 self.assertIn("numa0-pcie-0000-00-4", deg_names)
                 self.assertIn("0-3", deg_names)
+                self.assertNotIn("all", deg_names)
                 self.assertNotIn("numa1-pcie-0000-80-4", deg_names)
                 self.assertNotIn("4-7", deg_names)
                 self.assertNotIn("pci-0000-80-07-0", deg_names)
@@ -4899,8 +4928,43 @@ class FreeTpuCdiTests(unittest.TestCase):
                     [],
                 )
 
+                # Even if an ENTIRE NUMA half (groups 4..7) loses its VFIO nodes, `all` MUST
+                # remain withheld (never republishing `all` as `v6e-4`), while surviving NUMA 0
+                # stays published and host validation rejects any spec still advertising `all`.
+                for i in (4, 5, 6):
+                    (dev_root / "vfio" / str(i)).unlink()
+                ok_half, msg_half = freetpu_cdi.reconcile_cdi_spec(
+                    spec_path,
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    single_host_env=True,
+                )
+                self.assertTrue(ok_half, msg_half)
+                half_spec = json.loads(spec_path.read_text(encoding="utf-8"))
+                half_names = {d["name"] for d in half_spec["devices"]}
+                self.assertIn("numa0-pcie-0000-00-4", half_names)
+                self.assertIn("0-3", half_names)
+                self.assertNotIn("all", half_names)
+                self.assertEqual(
+                    freetpu_cdi.verify_spec_against_host(
+                        half_spec, sysfs_root=sysfs_root, dev_root=dev_root
+                    ),
+                    [],
+                )
+                bogus_all_spec = json.loads(json.dumps(half_spec))
+                n0_dev = next(
+                    d for d in bogus_all_spec["devices"] if d["name"] == "numa0-pcie-0000-00-4"
+                )
+                fake_all = json.loads(json.dumps(n0_dev))
+                fake_all["name"] = "all"
+                bogus_all_spec["devices"].append(fake_all)
+                bogus_all_errs = freetpu_cdi.verify_spec_against_host(
+                    bogus_all_spec, sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                self.assertTrue(any("device 'all'" in e for e in bogus_all_errs), bogus_all_errs)
+
                 # When ALL remaining `/dev/vfio/<group>` nodes vanish, fail closed and remove stale spec.
-                for i in range(7):
+                for i in range(4):
                     (dev_root / "vfio" / str(i)).unlink()
                 ok_all_gone, msg_all_gone = freetpu_cdi.reconcile_cdi_spec(
                     spec_path, sysfs_root=sysfs_root, dev_root=dev_root

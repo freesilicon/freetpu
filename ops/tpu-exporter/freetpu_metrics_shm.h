@@ -4,8 +4,10 @@
  * Copyright 2026 FreeTPU Authors
  * SPDX-License-Identifier: Apache-2.0
  *
- * Writers (e.g. libopentpu.so) publish per-chip counters with mode 0600/0644
- * (never group/world-writable) owned by a trusted publisher UID inside a
+ * Writers (e.g. libopentpu.so) publish per-chip counters with mode 0600 (when
+ * publisher and exporter share the same UID) or mode 0640 (group-readable by
+ * the exporter group when publisher and exporter run under separate UIDs;
+ * never group/world-writable) owned by a trusted publisher UID inside a
  * publisher-controlled, non-group/world-writable directory under root-owned
  * `/run` (e.g. provisioned via systemd `RuntimeDirectory=freetpu-metrics` or
  * `tmpfiles.d` `d /run/freetpu-metrics 0750 <publisher-uid> <exporter-gid> -`

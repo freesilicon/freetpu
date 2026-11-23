@@ -167,8 +167,11 @@ spec:
         capabilities:
           drop:
             - ALL
-          add:
-            - IPC_LOCK
+          # Optional: uncomment ONLY for real libtpu/VFIO workloads needing
+          # pinned DMA memory in namespaces whose Pod Security admission allows
+          # IPC_LOCK (Baseline and Restricted Pod Security Standards reject it):
+          # add:
+          #   - IPC_LOCK
       resources:
         # Guaranteed QoS requests/limits prevent CPU/memory overcommit, but
         # Kubernetes 1.34's kubelet does not register DRA as a Topology Manager

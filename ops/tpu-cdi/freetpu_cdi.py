@@ -1914,67 +1914,72 @@ def build_cdi_spec(
                 }
             )
 
-    all_complete_chips, all_incomplete_fns = _count_complete_chips(chips, bdf_to_phys)
-    all_supported_topology = _is_supported_all_topology(chips, bdf_to_phys, all_generations)
-    all_visibility = _resolve_verified_visibility_ordinals(
-        chips,
-        chips,
-        bdf_to_phys,
-        chip_id_map=chip_id_map,
-        host_pci_inventory=host_pci_inventory,
+    has_unavailable_pci_groups = bool(
+        host_pci_inventory is not None
+        and any(c.pci_bdf not in all_bdfs for c in host_pci_inventory)
     )
-    all_visibility_nomap = (
-        _resolve_verified_visibility_ordinals(
+    if not has_unavailable_pci_groups:
+        all_complete_chips, all_incomplete_fns = _count_complete_chips(chips, bdf_to_phys)
+        all_supported_topology = _is_supported_all_topology(chips, bdf_to_phys, all_generations)
+        all_visibility = _resolve_verified_visibility_ordinals(
             chips,
             chips,
-            bdf_to_phys_nomap,
-            chip_id_map=None,
+            bdf_to_phys,
+            chip_id_map=chip_id_map,
             host_pci_inventory=host_pci_inventory,
         )
-        if chip_id_map
-        else all_visibility
-    )
-    all_ann: Dict[str, str] = {
-        "freetpu.dev/allocation-unit": "all-devices",
-        "freetpu.dev/chip-count": str(all_complete_chips),
-        "freetpu.dev/pci-bdfs": ",".join(sorted(all_bdfs)),
-        "freetpu.dev/generations": ",".join(all_generations),
-        "freetpu.dev/optional-cap-add": "IPC_LOCK",
-        "freetpu.dev/required-ulimit-memlock": "-1",
-    }
-    if len(chips) != all_complete_chips or all_incomplete_fns > 0:
-        all_ann["freetpu.dev/pci-function-count"] = str(len(chips))
-    if all_incomplete_fns > 0:
-        all_ann["freetpu.dev/incomplete-pci-functions"] = str(all_incomplete_fns)
-        all_ann["freetpu.dev/capacity-complete"] = "false"
-    all_devnums = _format_vfio_devnums(list(seen_group_devnums.items()))
-    if all_devnums:
-        all_ann["freetpu.dev/vfio-devnums"] = all_devnums
-    if chip_id_map and (
-        any(c.pci_bdf in chip_id_map for c in chips)
-        or all_visibility != all_visibility_nomap
-    ):
-        all_ann["freetpu.dev/chip-id-source"] = "chip-id-map"
-
-    all_env = _build_device_env(
-        all_complete_chips,
-        all_generations,
-        single_host_env=inject_single_host_env,
-        include_bounds_env=all_supported_topology,
-        verified_visibility=all_visibility,
-        omit_visible_env=omit_visible_env,
-    )
-    all_edits: Dict[str, Any] = {"deviceNodes": list(seen_group_nodes.values())}
-    if all_env:
-        all_edits["env"] = all_env
-
-    devices.append(
-        {
-            "name": "all",
-            "annotations": all_ann,
-            "containerEdits": all_edits,
+        all_visibility_nomap = (
+            _resolve_verified_visibility_ordinals(
+                chips,
+                chips,
+                bdf_to_phys_nomap,
+                chip_id_map=None,
+                host_pci_inventory=host_pci_inventory,
+            )
+            if chip_id_map
+            else all_visibility
+        )
+        all_ann: Dict[str, str] = {
+            "freetpu.dev/allocation-unit": "all-devices",
+            "freetpu.dev/chip-count": str(all_complete_chips),
+            "freetpu.dev/pci-bdfs": ",".join(sorted(all_bdfs)),
+            "freetpu.dev/generations": ",".join(all_generations),
+            "freetpu.dev/optional-cap-add": "IPC_LOCK",
+            "freetpu.dev/required-ulimit-memlock": "-1",
         }
-    )
+        if len(chips) != all_complete_chips or all_incomplete_fns > 0:
+            all_ann["freetpu.dev/pci-function-count"] = str(len(chips))
+        if all_incomplete_fns > 0:
+            all_ann["freetpu.dev/incomplete-pci-functions"] = str(all_incomplete_fns)
+            all_ann["freetpu.dev/capacity-complete"] = "false"
+        all_devnums = _format_vfio_devnums(list(seen_group_devnums.items()))
+        if all_devnums:
+            all_ann["freetpu.dev/vfio-devnums"] = all_devnums
+        if chip_id_map and (
+            any(c.pci_bdf in chip_id_map for c in chips)
+            or all_visibility != all_visibility_nomap
+        ):
+            all_ann["freetpu.dev/chip-id-source"] = "chip-id-map"
+
+        all_env = _build_device_env(
+            all_complete_chips,
+            all_generations,
+            single_host_env=inject_single_host_env,
+            include_bounds_env=all_supported_topology,
+            verified_visibility=all_visibility,
+            omit_visible_env=omit_visible_env,
+        )
+        all_edits: Dict[str, Any] = {"deviceNodes": list(seen_group_nodes.values())}
+        if all_env:
+            all_edits["env"] = all_env
+
+        devices.append(
+            {
+                "name": "all",
+                "annotations": all_ann,
+                "containerEdits": all_edits,
+            }
+        )
 
     root_ann: Dict[str, str] = {
         "freetpu.dev/generated-by": "freetpu-cdi",
@@ -2162,9 +2167,9 @@ def _validate_container_edits(
                 iface_name = nd.get("name")
                 if not isinstance(iface_name, str) or not iface_name:
                     errors.append(f"{ndc}.name: must be a non-empty string")
-                elif iface_name in seen_net_names:
+                elif "%d" not in iface_name and iface_name in seen_net_names:
                     errors.append(f"{ndc}.name: duplicate netDevice name {iface_name!r}")
-                else:
+                elif "%d" not in iface_name:
                     seen_net_names.add(iface_name)
                 if isinstance(host_iface, str) and host_iface and isinstance(iface_name, str) and iface_name:
                     valid_net_entries.append((ndc, host_iface, iface_name))
@@ -2173,12 +2178,15 @@ def _validate_container_edits(
             # `hostInterfaceName`: a device entry for the same host interface
             # overrides the global mapping rather than conflicting with it.
             # Reject collisions only when two distinct host interfaces end up
-            # mapped to the same container-side destination `name`.
+            # mapped to the same fixed (non-template) container-side `name`;
+            # `%d` templates (e.g. `tpu%d`) allocate unique names dynamically.
             if global_net_by_host and valid_net_entries:
                 effective_by_host: Dict[str, str] = dict(global_net_by_host)
                 for _ndc, h_if, c_nm in valid_net_entries:
                     effective_by_host[h_if] = c_nm
                 for ndc, h_if, c_nm in valid_net_entries:
+                    if "%d" in c_nm:
+                        continue
                     conflicting_hosts = sorted(
                         other_h
                         for other_h, other_nm in effective_by_host.items()
@@ -2968,11 +2976,11 @@ def _verify_spec_against_host_detailed(
                             f"{ann.get('freetpu.dev/numa-node')!r} (host has {str(expected_dom_numa)!r})"
                         )
             elif name == "all":
-                all_live_bdfs = sorted(c.pci_bdf for c in live_chips)
-                if expected_live_bdfs != all_live_bdfs:
+                all_pci_bdfs = sorted(c.pci_bdf for c in live_pci_inventory)
+                if expected_live_bdfs != all_pci_bdfs:
                     errors.append(
                         f"device 'all': exposed VFIO groups {expected_live_bdfs} do not match "
-                        f"all live host TPU chips {all_live_bdfs}"
+                        f"all live host TPU PCI devices {all_pci_bdfs}"
                     )
 
         # Revalidate any injected `TPU_VISIBLE_CHIPS` / `TPU_VISIBLE_DEVICES` env

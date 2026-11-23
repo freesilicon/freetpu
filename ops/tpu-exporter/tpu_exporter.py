@@ -551,6 +551,7 @@ class _TpuInfoRow:
     in_chips_table: bool = False
     in_util_table: bool = False
     duty_unset_in_grpc: bool = False
+    duty_ids_verified: bool = False
     sources: List[str] = field(default_factory=list)
 
 
@@ -845,7 +846,7 @@ def _run_tpu_info(
 
 
 _PY_METRICS_SUBPROCESS_HELPER = (
-    "import inspect, json, sys, tpu_info.device as d, tpu_info.metrics as m\n"
+    "import inspect, json, math, sys, tpu_info.device as d, tpu_info.metrics as m\n"
     "chip_attr, addr, timeout_s = sys.argv[1], sys.argv[2], float(sys.argv[3])\n"
     "layout = sys.argv[4] if len(sys.argv) > 4 else 'auto'\n"
     "chip = getattr(d.TpuChip, chip_attr)\n"
@@ -857,10 +858,57 @@ _PY_METRICS_SUBPROCESS_HELPER = (
     "    if 'timeout' in sig.parameters:\n"
     "        kw['timeout'] = timeout_s\n"
     "    return fn(chip, **kw)\n"
+    "def _verify_raw_per_chip_duty(usage_rows, dpc):\n"
+    "    raw_fn = getattr(m, 'get_metric_data', None)\n"
+    "    if not callable(raw_fn):\n"
+    "        return None\n"
+    "    try:\n"
+    "        resp = raw_fn(addr, 'tpu.runtime.tensorcore.dutycycle.percent')\n"
+    "    except Exception:\n"
+    "        return None\n"
+    "    metric_obj = getattr(resp, 'metric', None)\n"
+    "    entries = getattr(metric_obj, 'metrics', None) if metric_obj is not None else None\n"
+    "    if not entries:\n"
+    "        return False\n"
+    "    raw_ids = set()\n"
+    "    for item in entries:\n"
+    "        attr = getattr(item, 'attribute', None)\n"
+    "        aval = getattr(attr, 'value', None) if attr is not None else None\n"
+    "        if aval is None:\n"
+    "            return False\n"
+    "        aw = aval.WhichOneof('attr') if hasattr(aval, 'WhichOneof') else None\n"
+    "        cid = getattr(aval, 'int_attr', None) if aw == 'int_attr' else getattr(aval, 'string_attr', None)\n"
+    "        try:\n"
+    "            cid_int = int(str(cid).strip(), 10)\n"
+    "        except Exception:\n"
+    "            return False\n"
+    "        g = getattr(item, 'gauge', None)\n"
+    "        gw = g.WhichOneof('value') if (g is not None and hasattr(g, 'WhichOneof')) else None\n"
+    "        if gw not in ('as_double', 'as_int'):\n"
+    "            return False\n"
+    "        gv = float(getattr(g, gw))\n"
+    "        if not math.isfinite(gv) or gv < 0.0:\n"
+    "            return False\n"
+    "        raw_ids.add(cid_int)\n"
+    "    hbm_ids = set()\n"
+    "    for r in (usage_rows or []):\n"
+    "        did = getattr(r, 'device_id', None)\n"
+    "        try:\n"
+    "            hbm_ids.add(int(str(did).strip(), 10))\n"
+    "        except Exception:\n"
+    "            return False\n"
+    "    expected_hbm = {cid * dpc + off for cid in raw_ids for off in range(dpc)}\n"
+    "    return bool(raw_ids) and expected_hbm == hbm_ids\n"
     "per_chip_fallback = False\n"
+    "duty_ids_verified = False\n"
     "new_fn = getattr(m, 'get_chip_usage_new', None) if chip_attr == 'V7X' else None\n"
     "if chip_attr == 'V7X' and layout == 'per-chip':\n"
     "    rows = _invoke(m.get_chip_usage)\n"
+    "    v_ok = _verify_raw_per_chip_duty(rows, 2)\n"
+    "    if v_ok is True:\n"
+    "        duty_ids_verified = True\n"
+    "    elif v_ok is False:\n"
+    "        per_chip_fallback = True\n"
     "elif callable(new_fn):\n"
     "    try:\n"
     "        rows = _invoke(new_fn)\n"
@@ -876,6 +924,7 @@ _PY_METRICS_SUBPROCESS_HELPER = (
     "        'total_memory': getattr(r, 'total_memory', None),\n"
     "        'duty_cycle_pct': getattr(r, 'duty_cycle_pct', None),\n"
     "        '_per_chip_fallback': per_chip_fallback,\n"
+    "        '_duty_ids_verified': duty_ids_verified,\n"
     "    }\n"
     "    for r in (rows or [])\n"
     "]\n"
@@ -910,11 +959,63 @@ def _parse_runtime_device_id(raw: Any) -> Optional[int]:
     return None
 
 
+def _verify_raw_python_per_chip_duty(
+    metrics_mod: Any,
+    addr: str,
+    usage_rows: Sequence[Any],
+    devices_per_chip: int,
+) -> Optional[bool]:
+    """Verify raw `tensorcore.dutycycle` chip IDs against HBM core IDs when `get_metric_data` is available.
+
+    Returns:
+      - `True` when raw duty chip IDs exist, every gauge is populated/valid, and
+        expanding `chip_id * devices_per_chip + offset` matches the HBM core IDs 1:1.
+      - `False` when raw duty data is present/queried and either mismatches HBM core
+        IDs (e.g. HBM cores `{0, 1}` paired with physical chip `1`) or has unset gauges.
+      - `None` when `get_metric_data` is unavailable or raises.
+    """
+    raw_fn = getattr(metrics_mod, "get_metric_data", None)
+    if not callable(raw_fn):
+        return None
+    try:
+        resp = raw_fn(addr, "tpu.runtime.tensorcore.dutycycle.percent")
+    except Exception:  # noqa: BLE001
+        return None
+    metric_obj = getattr(resp, "metric", None)
+    entries = getattr(metric_obj, "metrics", None) if metric_obj is not None else None
+    if not entries:
+        return False
+    raw_ids: set[int] = set()
+    for item in entries:
+        cid_str = _extract_grpc_chip_id(item)
+        cid_int = _parse_runtime_device_id(cid_str)
+        if cid_int is None:
+            return False
+        val = _extract_grpc_gauge_value(item)
+        if val is None or val < 0.0:
+            return False
+        raw_ids.add(cid_int)
+    hbm_ids: set[int] = set()
+    for row in usage_rows:
+        did = row.get("device_id") if isinstance(row, dict) else getattr(row, "device_id", None)
+        did_int = _parse_runtime_device_id(did)
+        if did_int is None:
+            return False
+        hbm_ids.add(did_int)
+    expected_hbm = {
+        cid * devices_per_chip + off
+        for cid in raw_ids
+        for off in range(devices_per_chip)
+    }
+    return bool(raw_ids) and expected_hbm == hbm_ids
+
+
 def _parse_python_usage_entries(
     entries: Iterable[Any],
     addr: str,
     *,
     per_chip_fallback: bool = False,
+    duty_ids_verified: bool = False,
     devices_per_chip: int = 2,
 ) -> Tuple[bool, Optional[str], Dict[str, _TpuInfoRow]]:
     rows: Dict[str, _TpuInfoRow] = {}
@@ -925,12 +1026,14 @@ def _parse_python_usage_entries(
             mem_total = item.get("total_memory")
             duty = item.get("duty_cycle_pct")
             item_per_chip_fb = bool(item.get("_per_chip_fallback", per_chip_fallback))
+            item_duty_verified = bool(item.get("_duty_ids_verified", duty_ids_verified))
         else:
             dev_id = getattr(item, "device_id", None)
             mem_used = getattr(item, "memory_usage", None)
             mem_total = getattr(item, "total_memory", None)
             duty = getattr(item, "duty_cycle_pct", None)
             item_per_chip_fb = per_chip_fallback
+            item_duty_verified = duty_ids_verified
         parsed_id = _parse_runtime_device_id(dev_id)
         if parsed_id is None:
             continue
@@ -959,10 +1062,10 @@ def _parse_python_usage_entries(
         ):
             if not item_per_chip_fb:
                 row.duty_cycle_percent = float(duty)
+                row.duty_ids_verified = item_duty_verified
             # When `get_chip_usage` ran only as a fallback after `get_chip_usage_new`
-            # failed in `auto` mode, preserve its HBM usage/total rows and do NOT
-            # infer raw duty IDs from HBM `device_id` (`get_chip_usage` labels rows
-            # with HBM IDs, not raw duty IDs).
+            # failed in `auto` mode (or raw duty chip IDs mismatched HBM core IDs),
+            # preserve HBM usage/total rows and omit unverified duty readings.
 
     if not rows:
         return False, f"tpu_info.metrics returned no parseable chip entries from {addr}", {}
@@ -1035,6 +1138,13 @@ def _query_tpu_info_python_metrics(
             try:
                 if chip_attr == "V7X" and grpc_duty_layout == "per-chip" and callable(get_chip_usage_legacy):
                     box["rows"] = _invoke_mock(get_chip_usage_legacy)
+                    v_ok = _verify_raw_python_per_chip_duty(
+                        cached_metrics_mod, addr, box["rows"] or [], inferred_dpc
+                    )
+                    if v_ok is True:
+                        box["duty_ids_verified"] = True
+                    elif v_ok is False:
+                        box["per_chip_fallback"] = True
                 elif callable(get_chip_usage_new):
                     try:
                         box["rows"] = _invoke_mock(get_chip_usage_new)
@@ -1064,6 +1174,7 @@ def _query_tpu_info_python_metrics(
             usage_list,
             addr,
             per_chip_fallback=bool(box.get("per_chip_fallback", False)),
+            duty_ids_verified=bool(box.get("duty_ids_verified", False)),
             devices_per_chip=inferred_dpc,
         )
 
@@ -1536,18 +1647,20 @@ def _query_grpc_runtime_metrics(
                 verified_chip_count = _verified_dual_function_chip_count(
                     devices, devices_per_chip
                 )
-                if verified_chip_count is not None:
-                    if len(raw_duty_int_ids) > verified_chip_count:
-                        duty_layout = "per_core"
-                elif known_gens == {"tpu7x"}:
-                    # Google Cloud Ironwood (`tpu7x`) VMs have at most 4 physical
-                    # chips per host (8 logical cores), so >4 distinct duty IDs
-                    # prove a per-core duty reply independently of PCI sibling
-                    # grouping (e.g. separate-slot Ironwood PCI functions without
-                    # sysfs `chip_id`s).
-                    if len(raw_duty_int_ids) > 4:
+                if known_gens == {"tpu7x"}:
+                    # Google Cloud Ironwood (`tpu7x`) VMs have an architectural
+                    # ceiling of 4 physical chips per host (8 logical cores), so
+                    # >max(4, verified_chip_count) distinct duty IDs prove a
+                    # per-core duty reply independently of PCI sibling grouping.
+                    if len(raw_duty_int_ids) > max(4, verified_chip_count or 4):
                         duty_layout = "per_core"
                 elif known_gens and known_gens <= {"v2", "v3", "v2-v3"} and len(devices) >= 4:
+                    # Cloud TPU v2/v3 VMs can host up to 8 physical chips (16
+                    # logical cores); a filtered container may see only 4 chips
+                    # while libtpu reports all 8 physical chips. Never compare
+                    # `len(raw_duty_int_ids)` against a possibly-filtered visible
+                    # chip count to infer `per_core` — require exceeding the
+                    # architectural 8-chip VM ceiling (or explicit `--grpc-duty-layout=per-core`).
                     legacy_chip_count = len(devices)
                     legacy_core_count = legacy_chip_count * devices_per_chip
                     expanded_raw = {
@@ -1555,7 +1668,7 @@ def _query_grpc_runtime_metrics(
                         for cid in raw_duty_int_ids
                         for off in range(devices_per_chip)
                     }
-                    if len(raw_duty_int_ids) > legacy_chip_count:
+                    if len(raw_duty_int_ids) > max(8, legacy_chip_count):
                         duty_layout = "per_core"
                     elif (
                         len(raw_duty_int_ids) == legacy_chip_count
@@ -1563,6 +1676,9 @@ def _query_grpc_runtime_metrics(
                         and expanded_raw == all_hbm_core_ids
                     ):
                         duty_layout = "per_chip"
+                elif verified_chip_count is not None:
+                    if len(raw_duty_int_ids) > max(8, verified_chip_count):
+                        duty_layout = "per_core"
 
     if duty_layout == "per_chip" and devices_per_chip is not None:
         for chip_key, duty_val in duty_by_chip.items():
@@ -2317,19 +2433,43 @@ def _sanitize_fallback_duty_rows(
                 copied.duty_cycle_percent = None
             stripped[k] = copied
         working = stripped
-    # Explicit `per-chip` Python fallback uses `get_chip_usage()` rather than
-    # `get_chip_usage_new()`, so preserve its expanded per-core duty readings
-    # even on filtered PCI sidecars (while still honoring `unset_duty_ids` above).
-    if grpc_duty_layout == "per-chip":
-        return working
-    # Restrict the `get_chip_usage_new` positional-zip guard strictly to
-    # Ironwood (`tpu7x`); sidecars without PCI inventory and legacy
+    # Restrict the Ironwood positional-zip guard strictly to hosts with
+    # Ironwood (`tpu7x`) devices; sidecars without PCI inventory and legacy
     # `v2`/`v3`/`v4`/`v5e`/`v5p`/`v6e` hosts preserve fallback duty readings.
     if not any(d.generation == "tpu7x" for d in devices):
         return working
     inferred_dpc = _infer_devices_per_chip(devices)
     if inferred_dpc is None or inferred_dpc <= 1:
         return working
+
+    # In explicit `per-chip` Python fallback (`get_chip_usage()`), upstream
+    # sorts HBM and duty replies separately and zips by position after checking
+    # only `2 * len(duty) == len(hbm)`. Accept partial subsets ONLY when raw
+    # duty chip IDs were independently verified 1:1 against HBM core IDs;
+    # otherwise require full contiguous 8-core host coverage (`0..7`) so a
+    # partial reply (e.g. HBM cores `{0,1}` + chip `1` duty) is never misjoined.
+    if grpc_duty_layout == "per-chip":
+        duty_rows = [
+            r for r in working.values() if r.in_util_table and r.duty_cycle_percent is not None
+        ]
+        if duty_rows and all(r.duty_ids_verified for r in duty_rows):
+            return working
+        raw_duty_ids = {
+            pid
+            for k, r in rows.items()
+            if r.in_util_table and r.duty_cycle_percent is not None
+            for pid in (_parse_runtime_device_id(k),)
+            if pid is not None
+        }
+        if raw_duty_ids == set(range(8)):
+            return working
+        sanitized_pc: Dict[str, _TpuInfoRow] = {}
+        for k, r in working.items():
+            copied = _copy_tpu_info_row(r)
+            if copied.duty_cycle_percent is not None:
+                copied.duty_cycle_percent = None
+            sanitized_pc[k] = copied
+        return sanitized_pc
 
     expected_core_count: Optional[int] = None
     verified_chips = _verified_dual_function_chip_count(devices, inferred_dpc)
@@ -2388,6 +2528,7 @@ def _copy_tpu_info_row(row: _TpuInfoRow) -> _TpuInfoRow:
         in_chips_table=row.in_chips_table,
         in_util_table=row.in_util_table,
         duty_unset_in_grpc=row.duty_unset_in_grpc,
+        duty_ids_verified=row.duty_ids_verified,
         sources=list(row.sources),
     )
 
