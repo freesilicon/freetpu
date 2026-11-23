@@ -303,7 +303,8 @@ bool plan_quant_matmul_kernel(ChipTarget target,
                               DType out_dt,
                               bool unsigned_q4,
                               TileKernel* out_kernel,
-                              std::string* reason) {
+                              std::string* reason,
+                              const TilePlannerConfig* planner_cfg) {
     if (out_kernel == nullptr) {
         return fail(reason, "out_kernel is null");
     }
@@ -334,8 +335,24 @@ bool plan_quant_matmul_kernel(ChipTarget target,
         return fail(reason, "K must be divisible by quant_block_size * 8");
     }
 
-    const std::vector<int64_t> bn_cands = {2048, 1024, 512, 256, 128};
-    const std::vector<int64_t> bk_cands = {2048, 1024, 512, 256, 128};
+    std::vector<int64_t> bn_cands = {2048, 1024, 512, 256, 128};
+    std::vector<int64_t> bk_cands = {2048, 1024, 512, 256, 128};
+    int64_t override_bm = m_pad;
+    if (planner_cfg != nullptr && planner_cfg->schedule_hook != nullptr) {
+        const TileShapeOverride ov = planner_cfg->schedule_hook(
+            target, m, k, n, fmt, scale_dt, out_dt, unsigned_q4, planner_cfg->hook_user_data);
+        if (ov.active) {
+            if (ov.bm >= m && (ov.bm % prof.sublane_align) == 0) {
+                override_bm = ov.bm;
+            }
+            if (ov.bn > 0) {
+                bn_cands.insert(bn_cands.begin(), ov.bn);
+            }
+            if (ov.bk > 0) {
+                bk_cands.insert(bk_cands.begin(), ov.bk);
+            }
+        }
+    }
 
     DType w_dt = DType::BF16;
     if (fmt == QuantFormat::Q4_K || fmt == QuantFormat::Q4_0) {
@@ -344,9 +361,13 @@ bool plan_quant_matmul_kernel(ChipTarget target,
         w_dt = DType::S8;
     }
 
-    // Reserve ~15% VMEM headroom for Mosaic compiler temporaries and DMA descriptors.
-    // This admits 2048x2048 S4 (~13.2 MiB / 16 MiB) while keeping S8 at 1024x2048 (~8.5 MiB).
-    const size_t safe_vmem_budget = (prof.vmem_bytes * 85) / 100;
+    // Reserve VMEM headroom for Mosaic compiler temporaries and DMA descriptors.
+    // Default 85% admits 2048x2048 S4 (~13.2 MiB / 16 MiB) while keeping S8 at 1024x2048 (~8.5 MiB).
+    const int64_t vmem_pct =
+        (planner_cfg != nullptr && planner_cfg->max_vmem_pct > 0 && planner_cfg->max_vmem_pct <= 100)
+            ? planner_cfg->max_vmem_pct
+            : 85;
+    const size_t safe_vmem_budget = (prof.vmem_bytes * static_cast<size_t>(vmem_pct)) / 100;
 
     bool found = false;
     TileKernel best;
@@ -364,7 +385,7 @@ bool plan_quant_matmul_kernel(ChipTarget target,
 
             TileKernel cand;
             std::ostringstream kname;
-            kname << "ft_" << quant_format_name(fmt) << "_m" << m_pad << "_k" << k << "_n" << n
+            kname << "ft_" << quant_format_name(fmt) << "_m" << override_bm << "_k" << k << "_n" << n
                   << "_bk" << bk << "_bn" << bn;
             cand.name = kname.str();
             cand.target = target;
@@ -374,7 +395,7 @@ bool plan_quant_matmul_kernel(ChipTarget target,
 
             const int64_t grid_n = n / bn;
             const int64_t grid_k = k / bk;
-            cand.grid.bm = m_pad;
+            cand.grid.bm = override_bm;
             cand.grid.bn = bn;
             cand.grid.bk = bk;
             if (grid_k == 1) {
@@ -386,7 +407,7 @@ bool plan_quant_matmul_kernel(ChipTarget target,
             }
 
             cand.matmul.m = m;
-            cand.matmul.m_padded = m_pad;
+            cand.matmul.m_padded = override_bm;
             cand.matmul.n = n;
             cand.matmul.k = k;
             cand.matmul.quant = fmt;
@@ -403,7 +424,7 @@ bool plan_quant_matmul_kernel(ChipTarget target,
             const MemorySpace sram_space =
                 (target == ChipTarget::BUENOS_A0) ? MemorySpace::SRAM : MemorySpace::VMEM;
 
-            cand.operands.push_back({"x", sram_space, DType::BF16, {m_pad, k}, {m_pad, bk}, false, false});
+            cand.operands.push_back({"x", sram_space, DType::BF16, {override_bm, k}, {override_bm, bk}, false, false});
             cand.operands.push_back({"w", sram_space, w_dt, {k, n}, {bk, bn}, false, false});
             if (fmt != QuantFormat::NONE) {
                 const int64_t nb = k / blk;
@@ -413,14 +434,14 @@ bool plan_quant_matmul_kernel(ChipTarget target,
                     cand.operands.push_back({"m", sram_space, DType::BF16, {nb, n}, {nb_tile, bn}, false, false});
                 }
             }
-            cand.operands.push_back({"out", sram_space, out_dt, {m_pad, n}, {m_pad, bn}, true, false});
+            cand.operands.push_back({"out", sram_space, out_dt, {override_bm, n}, {override_bm, bn}, true, false});
 
             if (grid_k > 1) {
-                cand.scratch.push_back({"acc", sram_space, DType::F32, {m_pad, n}, {m_pad, bn}, false, true});
+                cand.scratch.push_back({"acc", sram_space, DType::F32, {override_bm, n}, {override_bm, bn}, false, true});
             }
 
             const bool db = (grid_k > 1);
-            cand.prefetches.push_back({"x", MemorySpace::HBM, sram_space, {m_pad, bk}, db, db ? 2 : 1,
+            cand.prefetches.push_back({"x", MemorySpace::HBM, sram_space, {override_bm, bk}, db, db ? 2 : 1,
                                        db ? SyncMode::ASYNC_PIPELINE : SyncMode::SYNCHRONOUS});
             cand.prefetches.push_back({"w", MemorySpace::HBM, sram_space, {bk, bn}, db, db ? 2 : 1,
                                        db ? SyncMode::ASYNC_PIPELINE : SyncMode::SYNCHRONOUS});

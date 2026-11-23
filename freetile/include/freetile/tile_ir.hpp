@@ -146,6 +146,31 @@ struct TileKernel {
     bool validate(std::string* err = nullptr) const;
 };
 
+// Optional extension hook/config seam so external runtime or tuning layers
+// can override tile selection without forking FreeTile core IR.
+struct TileShapeOverride {
+    bool active = false;
+    int64_t bm = 0;
+    int64_t bn = 0;
+    int64_t bk = 0;
+};
+
+using TileScheduleHookFn = TileShapeOverride (*)(ChipTarget target,
+                                                 int64_t m,
+                                                 int64_t k,
+                                                 int64_t n,
+                                                 QuantFormat fmt,
+                                                 DType scale_dt,
+                                                 DType out_dt,
+                                                 bool unsigned_q4,
+                                                 void* user_data);
+
+struct TilePlannerConfig {
+    TileScheduleHookFn schedule_hook = nullptr;
+    void* hook_user_data = nullptr;
+    int64_t max_vmem_pct = 85;  // Max fraction of target VMEM budget to consume
+};
+
 // Plans an aligned, VMEM-feasible quantized or dense TileKernel for the given target.
 // Returns false with a diagnostic reason if the shape/dtype/target is ineligible.
 bool plan_quant_matmul_kernel(ChipTarget target,
@@ -157,6 +182,7 @@ bool plan_quant_matmul_kernel(ChipTarget target,
                               DType out_dt,
                               bool unsigned_q4,
                               TileKernel* out_kernel,
-                              std::string* reason = nullptr);
+                              std::string* reason = nullptr,
+                              const TilePlannerConfig* planner_cfg = nullptr);
 
 }  // namespace freetile

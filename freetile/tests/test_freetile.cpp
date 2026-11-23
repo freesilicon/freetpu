@@ -117,6 +117,28 @@ int main() {
         CHECK_TRUE(freetile::base64_encode("M") == "TQ==", "b64 M");
     }
 
+    // 6. TilePlannerConfig extension hook seam (allows external tuning overrides with zero fork)
+    {
+        auto custom_hook = [](freetile::ChipTarget, int64_t, int64_t, int64_t, freetile::QuantFormat,
+                              freetile::DType, freetile::DType, bool, void* user_data) -> freetile::TileShapeOverride {
+            int* called = static_cast<int*>(user_data);
+            *called += 1;
+            return {true, 16, 512, 512};
+        };
+        int hook_calls = 0;
+        freetile::TilePlannerConfig cfg;
+        cfg.schedule_hook = custom_hook;
+        cfg.hook_user_data = &hook_calls;
+        freetile::TileKernel k_ov;
+        CHECK_TRUE(freetile::plan_quant_matmul_kernel(
+            freetile::ChipTarget::V5E, 1, 4096, 14336, freetile::QuantFormat::Q4_K,
+            freetile::DType::BF16, freetile::DType::F32, false, &k_ov, nullptr, &cfg),
+            "Hook override plans Q4_K kernel");
+        CHECK_TRUE(hook_calls == 1, "Schedule hook invoked once");
+        CHECK_TRUE(k_ov.grid.bm == 16 && k_ov.grid.bn == 512 && k_ov.grid.bk == 512,
+                   "Schedule hook overrides (bm, bn, bk)");
+    }
+
     std::printf("PASS: all freetile unit tests succeeded!\n");
     return 0;
 }
