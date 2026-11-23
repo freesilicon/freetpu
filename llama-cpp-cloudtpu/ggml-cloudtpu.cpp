@@ -1475,6 +1475,16 @@ struct ggml_backend_cloudtpu_context {
     }
 };
 
+static constexpr uint64_t kMaxMockAttentionScoreElems = 8ULL * 1024ULL * 1024ULL;
+
+static bool is_host_mock_active() {
+    cloudtpu::PjrtRuntime& rt = cloudtpu::shared_pjrt_runtime(nullptr);
+    if (rt.is_initialized()) {
+        return rt.is_mock();
+    }
+    return load_env_config().mock_mode;
+}
+
 static bool is_view_noop_op(enum ggml_op op) {
     return op == GGML_OP_NONE || op == GGML_OP_RESHAPE || op == GGML_OP_VIEW ||
            op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
@@ -1648,6 +1658,10 @@ static bool ggml_backend_cloudtpu_device_supports_op_impl(const struct ggml_tens
                     return false;
                 }
             }
+            if (is_host_mock_active() &&
+                static_cast<uint64_t>(ggml_nelements(op)) > kMaxMockAttentionScoreElems) {
+                return false;
+            }
             return true;
         }
 
@@ -1684,6 +1698,19 @@ static bool ggml_backend_cloudtpu_device_supports_op_impl(const struct ggml_tens
                 }
                 if (mask->ne[0] != k->ne[1] || mask->ne[1] < q->ne[1] ||
                     (q->ne[2] % mask->ne[2]) != 0 || (q->ne[3] % mask->ne[3]) != 0) {
+                    return false;
+                }
+            }
+            if (is_host_mock_active()) {
+                const uint64_t b = static_cast<uint64_t>(q->ne[3]);
+                const uint64_t hq = static_cast<uint64_t>(q->ne[2]);
+                const uint64_t nq = static_cast<uint64_t>(q->ne[1]);
+                const uint64_t nkv = static_cast<uint64_t>(k->ne[1]);
+                if (b == 0 || hq == 0 || nq == 0 || nkv == 0 ||
+                    b > kMaxMockAttentionScoreElems ||
+                    hq > kMaxMockAttentionScoreElems / b ||
+                    nq > kMaxMockAttentionScoreElems / (b * hq) ||
+                    nkv > kMaxMockAttentionScoreElems / (b * hq * nq)) {
                     return false;
                 }
             }

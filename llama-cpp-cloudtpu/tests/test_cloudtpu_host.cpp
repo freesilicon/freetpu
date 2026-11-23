@@ -405,7 +405,8 @@ void test_silicon_regressions(cloudtpu::PjrtRuntime& rt) {
                     const size_t base = static_cast<size_t>((b * M + m) * D + 2 * i);
                     const float r0 = x[base] * c - x[base + 1] * s;
                     const float r1 = x[base] * s + x[base + 1] * c;
-                    if (std::fabs(got[base] - r0) > 1e-4f || std::fabs(got[base + 1] - r1) > 1e-4f) {
+                    if (!std::isfinite(got[base]) || !std::isfinite(got[base + 1]) ||
+                        std::fabs(got[base] - r0) > 1e-4f || std::fabs(got[base + 1] - r1) > 1e-4f) {
                         std::fprintf(stderr, "FAIL [ROPE M=52 b=%lld m=%lld i=%lld]: got=(%.5f,%.5f) ref=(%.5f,%.5f)\n",
                                      (long long) b, (long long) m, (long long) i, got[base], got[base + 1], r0, r1);
                         ++g_failures;
@@ -454,7 +455,7 @@ void test_silicon_regressions(cloudtpu::PjrtRuntime& rt) {
             auto wgot = run_emitted(rt, cloudtpu::emit_stablehlo_program(cspec), {bqs, bd});
             int bad = 0;
             for (size_t i = 0; i < w_ref.size(); ++i) {
-                if (std::fabs(wgot[i] - w_ref[i]) > 1e-4f) {
+                if (!std::isfinite(wgot[i]) || std::fabs(wgot[i] - w_ref[i]) > 1e-4f) {
                     if (bad < 4) {
                         std::fprintf(stderr, "FAIL [Q4_0 dequant idx=%zu]: got=%.6f ref=%.6f\n", i, wgot[i], w_ref[i]);
                     }
@@ -497,7 +498,7 @@ void test_silicon_regressions(cloudtpu::PjrtRuntime& rt) {
                 }
             }
             const double nmse = se / std::max(1e-12, sref);
-            if (nmse > 5e-4) {
+            if (!std::isfinite(nmse) || nmse > 5e-4) {
                 std::fprintf(stderr, "FAIL [Q4_0 MUL_MAT K=256]: nmse=%.6f got[0]=%.5f\n", nmse, ygot[0]);
                 ++g_failures;
             }
@@ -551,7 +552,7 @@ void test_silicon_regressions(cloudtpu::PjrtRuntime& rt) {
             }
         }
         const double nmse = se / std::max(1e-12, sref);
-        if (nmse > 5e-4) {
+        if (!std::isfinite(nmse) || nmse > 5e-4) {
             std::fprintf(stderr, "FAIL [Q8_0 MUL_MAT K=256]: nmse=%.6f got[0]=%.5f\n", nmse, ygot[0]);
             ++g_failures;
         }
@@ -714,6 +715,37 @@ void test_flash_attn_fully_masked_row(cloudtpu::PjrtRuntime& rt) {
     }
     check_vec_close(out, expected, 1e-5f, "FLASH_ATTN_EXT fully masked row");
     std::printf("  [PASS] FLASH_ATTN_EXT fully -INF masked row returns zero\n");
+
+    // Verify masked NaN/Inf K and V rows cannot contaminate another query that masks them,
+    // even when another query in the same batch attends to the poisoned row.
+    const float nan_f = std::numeric_limits<float>::quiet_NaN();
+    const float pos_inf = std::numeric_limits<float>::infinity();
+    std::vector<float> k_poison = k;
+    std::vector<float> v_poison = v;
+    for (int d = 0; d < D; ++d) {
+        k_poison[static_cast<size_t>(2 * D + d)] = nan_f;    // masked for all queries
+        v_poison[static_cast<size_t>(2 * D + d)] = pos_inf;  // masked for all queries
+        v_poison[static_cast<size_t>(3 * D + d)] = nan_f;    // masked for q0, visible to q1
+    }
+    const std::vector<float> mask_iso = {
+        0.0f,    0.0f,    neg_inf, neg_inf,  // q0 sees rows 0, 1 only
+        neg_inf, neg_inf, neg_inf, 0.0f,     // q1 sees poisoned row 3 only
+    };
+    auto bkp = rt.buffer_from_host(0, k_poison.data(), cloudtpu::PjrtDType::F32, {B, H, NKV, D});
+    auto bvp = rt.buffer_from_host(0, v_poison.data(), cloudtpu::PjrtDType::F32, {B, H, NKV, D});
+    auto bmi = rt.buffer_from_host(0, mask_iso.data(), cloudtpu::PjrtDType::F32, {B, H, NQ, NKV});
+    const auto out_iso = run_emitted(rt, cloudtpu::emit_stablehlo_program(spec), {bq, bkp, bvp, bmi});
+    const float p0 = e1 / (e1 + 1.0f);
+    const float p1 = 1.0f / (e1 + 1.0f);
+    std::vector<float> q0_got(out_iso.begin(), out_iso.begin() + D);
+    std::vector<float> q0_exp(static_cast<size_t>(D));
+    for (int d = 0; d < D; ++d) {
+        q0_exp[static_cast<size_t>(d)] = p0 * v[static_cast<size_t>(d)] + p1 * v[static_cast<size_t>(D + d)];
+        CHECK_TRUE(std::isnan(out_iso[static_cast<size_t>(D + d)]),
+                   "query attending to NaN V row should still surface NaN");
+    }
+    check_vec_close(q0_got, q0_exp, 1e-5f, "FLASH_ATTN_EXT masked NaN/Inf KV isolation");
+    std::printf("  [PASS] FLASH_ATTN_EXT isolates masked NaN/Inf K/V rows\n");
 }
 
 void test_q4_k_split_mul_mat(cloudtpu::PjrtRuntime& rt) {

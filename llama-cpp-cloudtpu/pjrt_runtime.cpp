@@ -134,6 +134,7 @@ size_t count_libpython_mappings() {
 
 PJRT_Buffer_Type to_pjrt_buffer_type(PjrtDType dt) {
     switch (dt) {
+        case PjrtDType::PRED: return PJRT_Buffer_Type_PRED;
         case PjrtDType::F32: return PJRT_Buffer_Type_F32;
         case PjrtDType::F16: return PJRT_Buffer_Type_F16;
         case PjrtDType::BF16: return PJRT_Buffer_Type_BF16;
@@ -148,6 +149,7 @@ PJRT_Buffer_Type to_pjrt_buffer_type(PjrtDType dt) {
 
 PjrtDType from_pjrt_buffer_type(PJRT_Buffer_Type dt) {
     switch (dt) {
+        case PJRT_Buffer_Type_PRED: return PjrtDType::PRED;
         case PJRT_Buffer_Type_F32: return PjrtDType::F32;
         case PJRT_Buffer_Type_F16: return PjrtDType::F16;
         case PJRT_Buffer_Type_BF16: return PjrtDType::BF16;
@@ -162,6 +164,7 @@ PjrtDType from_pjrt_buffer_type(PJRT_Buffer_Type dt) {
 
 const char* pjrt_dtype_mlir_name(PjrtDType dt) {
     switch (dt) {
+        case PjrtDType::PRED: return "i1";
         case PjrtDType::F32: return "f32";
         case PjrtDType::F16: return "f16";
         case PjrtDType::BF16: return "bf16";
@@ -182,6 +185,7 @@ size_t pjrt_dtype_size(PjrtDType dt) {
         case PjrtDType::F16:
         case PjrtDType::BF16:
         case PjrtDType::S16: return 2;
+        case PjrtDType::PRED:
         case PjrtDType::S8:
         case PjrtDType::U8: return 1;
         default: return 0;
@@ -458,6 +462,7 @@ struct MockTensor {
             }
             case PjrtDType::S8:
                 return reinterpret_cast<const int8_t*>(bytes.data())[idx];
+            case PjrtDType::PRED:
             case PjrtDType::U8:
                 return static_cast<int64_t>(bytes[idx]);
             default:
@@ -485,6 +490,9 @@ struct MockTensor {
                 std::memcpy(bytes.data() + idx, &iv, 1);
                 break;
             }
+            case PjrtDType::PRED:
+                bytes[idx] = (v != 0) ? 1U : 0U;
+                break;
             case PjrtDType::U8:
                 bytes[idx] = static_cast<uint8_t>(v);
                 break;
@@ -509,6 +517,7 @@ static std::string trim_copy(const std::string& s) {
 }
 
 static PjrtDType parse_mlir_dtype(const std::string& tok) {
+    if (tok == "i1") return PjrtDType::PRED;
     if (tok == "f32") return PjrtDType::F32;
     if (tok == "f16") return PjrtDType::F16;
     if (tok == "bf16") return PjrtDType::BF16;
@@ -621,12 +630,15 @@ struct MockOp {
         REDUCE_MAX,
         GATHER,
         SCATTER_3D_ROWS,
+        COMPARE,
+        SELECT,
     };
 
     Kind kind;
     std::string out_name;
     MockTypeSpec out_type;
     std::vector<std::string> inputs;
+    std::string cmp_dir;
 
     // Constant values
     bool is_splat = true;
@@ -886,6 +898,17 @@ static MockProgram parse_stablehlo_mlir(const std::string& mlir) {
             op.gather_start_index_map = parse_named_arr("start_index_map");
             const size_t iv = rhs.find("index_vector_dim =");
             op.gather_index_vector_dim = std::stoll(rhs.substr(iv + 18));
+        } else if (rhs.rfind("stablehlo.compare ", 0) == 0) {
+            op.kind = MockOp::Kind::COMPARE;
+            const size_t dir_start = 18;
+            const size_t comma = rhs.find(',', dir_start);
+            op.cmp_dir = trim_copy(rhs.substr(dir_start, comma - dir_start));
+            op.inputs = extract_ssa_refs(rhs.substr(0, colon));
+        } else if (rhs.rfind("\"stablehlo.select\"", 0) == 0) {
+            op.kind = MockOp::Kind::SELECT;
+            const size_t lp = rhs.find('(');
+            const size_t rp = rhs.find(')', lp);
+            op.inputs = extract_ssa_refs(rhs.substr(lp + 1, rp - lp - 1));
         } else if (rhs.rfind("\"stablehlo.scatter\"", 0) == 0) {
             op.kind = MockOp::Kind::SCATTER_3D_ROWS;
             const size_t lp = rhs.find('(');
@@ -1293,6 +1316,50 @@ static MockTensor eval_mock_op(const MockOp& op, const std::unordered_map<std::s
             }
             break;
         }
+        case MockOp::Kind::COMPARE: {
+            const MockTensor& a = env.at(op.inputs[0]);
+            const MockTensor& b = env.at(op.inputs[1]);
+            const bool a_int = (a.dtype == PjrtDType::PRED || a.dtype == PjrtDType::S8 ||
+                                a.dtype == PjrtDType::U8 || a.dtype == PjrtDType::S16 ||
+                                a.dtype == PjrtDType::S32 || a.dtype == PjrtDType::S64);
+            for (size_t i = 0; i < n_out; ++i) {
+                bool r = false;
+                if (a_int) {
+                    const int64_t va = a.read_i64(i);
+                    const int64_t vb = b.read_i64(i);
+                    if (op.cmp_dir == "EQ") r = (va == vb);
+                    else if (op.cmp_dir == "NE") r = (va != vb);
+                    else if (op.cmp_dir == "GT") r = (va > vb);
+                    else if (op.cmp_dir == "GE") r = (va >= vb);
+                    else if (op.cmp_dir == "LT") r = (va < vb);
+                    else if (op.cmp_dir == "LE") r = (va <= vb);
+                } else {
+                    const float va = a.read_f32(i);
+                    const float vb = b.read_f32(i);
+                    if (op.cmp_dir == "EQ") r = (va == vb);
+                    else if (op.cmp_dir == "NE") r = (va != vb);
+                    else if (op.cmp_dir == "GT") r = (va > vb);
+                    else if (op.cmp_dir == "GE") r = (va >= vb);
+                    else if (op.cmp_dir == "LT") r = (va < vb);
+                    else if (op.cmp_dir == "LE") r = (va <= vb);
+                }
+                out.write_i64(i, r ? 1 : 0);
+            }
+            break;
+        }
+        case MockOp::Kind::SELECT: {
+            const MockTensor& p = env.at(op.inputs[0]);
+            const MockTensor& t = env.at(op.inputs[1]);
+            const MockTensor& f = env.at(op.inputs[2]);
+            const size_t elem_sz = pjrt_dtype_size(out.dtype);
+            const bool scalar_pred = (p.num_elements() == 1);
+            for (size_t i = 0; i < n_out; ++i) {
+                const bool take_t = (p.read_i64(scalar_pred ? 0 : i) != 0);
+                const uint8_t* src_ptr = (take_t ? t.bytes.data() : f.bytes.data()) + i * elem_sz;
+                std::memcpy(out.bytes.data() + i * elem_sz, src_ptr, elem_sz);
+            }
+            break;
+        }
     }
     return out;
 }
@@ -1674,8 +1741,25 @@ static PJRT_Error* mock_loaded_exec_execute(PJRT_LoadedExecutable_Execute_Args* 
             if (!client) client = mb->client;
             env[prog.args[i].first] = mb->tensor;
         }
-        for (const MockOp& op : prog.ops) {
-            env[op.out_name] = eval_mock_op(op, env);
+        std::unordered_map<std::string, size_t> last_use;
+        for (size_t idx = 0; idx < prog.ops.size(); ++idx) {
+            for (const std::string& inp : prog.ops[idx].inputs) {
+                last_use[inp] = idx;
+            }
+        }
+        for (const std::string& rname : prog.return_names) {
+            last_use[rname] = prog.ops.size();
+        }
+        for (size_t idx = 0; idx < prog.ops.size(); ++idx) {
+            const MockOp& op = prog.ops[idx];
+            MockTensor res = eval_mock_op(op, env);
+            for (const std::string& inp : op.inputs) {
+                auto it = last_use.find(inp);
+                if (it != last_use.end() && it->second == idx) {
+                    env.erase(inp);
+                }
+            }
+            env[op.out_name] = std::move(res);
         }
         for (size_t oi = 0; oi < prog.return_names.size(); ++oi) {
             auto* out_mb = new MockBuffer();

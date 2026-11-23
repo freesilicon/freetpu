@@ -15,6 +15,7 @@ namespace cloudtpu {
 
 enum class PjrtDType {
     INVALID = 0,
+    PRED,
     F32,
     F16,
     BF16,
