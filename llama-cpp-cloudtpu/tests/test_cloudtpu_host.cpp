@@ -83,7 +83,79 @@ void test_compile_options_proto() {
     };
     CHECK_TRUE(p_da.size() == sizeof(exp_da), "device_assignment proto length mismatch");
     CHECK_TRUE(std::memcmp(p_da.data(), exp_da, sizeof(exp_da)) == 0, "device_assignment proto bytes mismatch");
-    std::printf("  [PASS] compile_options_proto (incl. DeviceAssignmentProto 8-chip)\n");
+
+    // Alias passthrough + CompileOptionsProto.env_option_overrides (field 7 map<string, OptionOverrideProto>).
+    // Must leave ExecutableBuildOptionsProto.debug_options unset so XLA_FLAGS & defaults stay intact,
+    // and serialize each OptionOverrideProto with its exact typed field (bool_field=2, string_field=1, int_field=3).
+    cloudtpu::PjrtCompileOptions opt_alias_only;
+    opt_alias_only.alias_passthrough_params = true;
+    const std::string p_alias_only = cloudtpu::encode_compile_options_proto(opt_alias_only);
+
+    cloudtpu::PjrtCompileOptions opt_extra = opt_alias_only;
+    opt_extra.env_option_overrides = {
+        cloudtpu::PjrtOptionOverride::make_bool("xla_tpu_detect_nan", true),
+        cloudtpu::PjrtOptionOverride::make_string("xla_dump_to", "/tmp/xla_dump"),
+        cloudtpu::PjrtOptionOverride::make_int("xla_cpu_parallel_codegen_split_count", 16384),
+    };
+    const std::string p_extra = cloudtpu::encode_compile_options_proto(opt_extra);
+    // Prefix must match p_alias_only byte-for-byte (proves ExecutableBuildOptionsProto is untouched / no debug_options).
+    CHECK_TRUE(p_extra.size() > p_alias_only.size() &&
+                   std::memcmp(p_extra.data(), p_alias_only.data(), p_alias_only.size()) == 0,
+               "env_option_overrides must not modify ExecutableBuildOptionsProto or emit debug_options");
+    // Field 7 wire tag = (7<<3)|2 = 0x3a immediately follows ExecutableBuildOptionsProto.
+    CHECK_TRUE(static_cast<uint8_t>(p_extra[p_alias_only.size()]) == 0x3a,
+               "env_option_overrides must serialize as CompileOptionsProto field 7 (0x3a)");
+    CHECK_TRUE(p_extra.find("xla_tpu_detect_nan") != std::string::npos,
+               "env_option_overrides bool DebugOptions key missing");
+    CHECK_TRUE(p_extra.find("xla_dump_to") != std::string::npos &&
+                   p_extra.find("/tmp/xla_dump") != std::string::npos,
+               "env_option_overrides string DebugOptions value missing");
+    // Verify typed OptionOverrideProto payload bytes:
+    //   bool_field=true -> value field (0x12 len=2) + bool_field tag (0x10 0x01)
+    const std::string bool_true_wire = {0x12, 0x02, 0x10, 0x01};
+    CHECK_TRUE(p_extra.find(bool_true_wire) != std::string::npos,
+               "bool override must encode OptionOverrideProto.bool_field (tag 0x10, val 0x01)");
+    //   int_field=16384 (0x4000 -> varint 80 80 01) -> value field (0x12 len=4) + int_field tag (0x18 80 80 01)
+    const std::string int_16384_wire = {
+        0x12, 0x04, 0x18, static_cast<char>(0x80), static_cast<char>(0x80), 0x01};
+    CHECK_TRUE(p_extra.find(int_16384_wire) != std::string::npos,
+               "int override must encode OptionOverrideProto.int_field (tag 0x18)");
+    // Field 10 tag = (10<<3)|0 = 0x50 followed by 0x01 inside ExecutableBuildOptionsProto
+    bool found_alias_tag = false;
+    for (size_t i = 0; i + 1 < p_alias_only.size(); ++i) {
+        if (static_cast<uint8_t>(p_alias_only[i]) == 0x50 && static_cast<uint8_t>(p_alias_only[i + 1]) == 0x01) {
+            found_alias_tag = true;
+            break;
+        }
+    }
+    CHECK_TRUE(found_alias_tag, "alias_passthrough_params (field 10) missing");
+
+    // Verify LIBTPU_INIT_ARGS helper appends documented async collective flags without clobbering
+    // or duplicating user-supplied flags.
+    const std::string init_all = cloudtpu::append_async_collective_libtpu_init_args("");
+    CHECK_TRUE(init_all.find("--xla_tpu_enable_async_collective_fusion=true") != std::string::npos &&
+                   init_all.find("--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true") != std::string::npos &&
+                   init_all.find("--xla_tpu_enable_async_collective_fusion_multiple_steps=true") != std::string::npos &&
+                   init_all.find("--xla_tpu_overlap_compute_collective_tc=true") != std::string::npos &&
+                   init_all.find("--xla_enable_async_all_gather=true") != std::string::npos,
+               "append_async_collective_libtpu_init_args must include all 5 documented LIBTPU_INIT_ARGS flags");
+    CHECK_TRUE(cloudtpu::append_async_collective_libtpu_init_args(init_all) == init_all,
+               "append_async_collective_libtpu_init_args must be idempotent");
+    const std::string user_args =
+        "--xla_tpu_enable_async_collective_fusion=false --noxla_tpu_overlap_compute_collective_tc "
+        "--xla_enable_async_all_gather=kAuto --custom_flag=42";
+    const std::string merged = cloudtpu::append_async_collective_libtpu_init_args(user_args);
+    CHECK_TRUE(merged.rfind(user_args, 0) == 0, "user LIBTPU_INIT_ARGS prefix must be preserved verbatim");
+    CHECK_TRUE(merged.find("--xla_tpu_enable_async_collective_fusion=true") == std::string::npos,
+               "must not override user --xla_tpu_enable_async_collective_fusion=false");
+    CHECK_TRUE(merged.find("--xla_tpu_overlap_compute_collective_tc=true") == std::string::npos,
+               "must not override user --noxla_tpu_overlap_compute_collective_tc");
+    CHECK_TRUE(merged.find("--xla_enable_async_all_gather=true") == std::string::npos,
+               "must not override user --xla_enable_async_all_gather=kAuto");
+    CHECK_TRUE(merged.find("--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true") != std::string::npos &&
+                   merged.find("--xla_tpu_enable_async_collective_fusion_multiple_steps=true") != std::string::npos,
+               "missing async collective flags must still be appended");
+    std::printf("  [PASS] compile_options_proto (incl. DeviceAssignmentProto, alias_passthrough, typed env_option_overrides, LIBTPU_INIT_ARGS)\n");
 }
 
 void test_half_bf16_conversions() {
@@ -256,15 +328,18 @@ void test_mul_mat_dense_and_quant(cloudtpu::PjrtRuntime& rt) {
         }
     }
 
-    // 2) Q4_0_SPLIT x F32
+    // 2) Q4_0_SPLIT x F32 (K-major N-minor: qs [1, 1, NB=1, 16, N], d [1, 1, NB=1, N])
     std::vector<uint8_t> qs(N * 16);
     std::vector<uint16_t> d(N);
+    std::vector<uint8_t> qs_km(16 * N);
     for (int64_t n = 0; n < N; ++n) {
         d[n] = cloudtpu::f32_to_f16(0.5f * static_cast<float>(n + 1));
         for (int64_t j = 0; j < 16; ++j) {
             const uint8_t lo = static_cast<uint8_t>((j + n + 5) & 0x0F);
             const uint8_t hi = static_cast<uint8_t>((j * 3 + 9) & 0x0F);
-            qs[n * 16 + j] = static_cast<uint8_t>(lo | (hi << 4));
+            const uint8_t packed = static_cast<uint8_t>(lo | (hi << 4));
+            qs[n * 16 + j] = packed;
+            qs_km[j * N + n] = packed;
         }
     }
     std::vector<float> x1(K);
@@ -281,8 +356,8 @@ void test_mul_mat_dense_and_quant(cloudtpu::PjrtRuntime& rt) {
     qspec.output_ids = {3};
 
     const auto qprog = cloudtpu::emit_stablehlo_program(qspec);
-    auto bqs = rt.buffer_from_host(0, qs.data(), cloudtpu::PjrtDType::U8, {1, 1, N, 1, 16});
-    auto bd = rt.buffer_from_host(0, d.data(), cloudtpu::PjrtDType::F16, {1, 1, N, 1});
+    auto bqs = rt.buffer_from_host(0, qs_km.data(), cloudtpu::PjrtDType::U8, {1, 1, 1, 16, N});
+    auto bd = rt.buffer_from_host(0, d.data(), cloudtpu::PjrtDType::F16, {1, 1, 1, N});
     auto bx1 = rt.buffer_from_host(0, x1.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, K});
     auto qgot = run_emitted(rt, qprog, {bqs, bd, bx1});
 
@@ -296,7 +371,36 @@ void test_mul_mat_dense_and_quant(cloudtpu::PjrtRuntime& rt) {
         }
         CHECK_NEAR(qgot[n], ref, 0.25f, "MUL_MAT Q4_0_SPLIT");
     }
-    std::printf("  [PASS] MUL_MAT (F32 GQA + Q4_0_SPLIT)\n");
+
+    // 3) Dense F16 weight + F32 activation stays out of the default BF16 quantized fast path:
+    //    [1 + 2^-9, 1] . [1, -1] must yield exact 2^-9 (BF16 rounding would collapse both to 1 -> 0).
+    {
+        const float eps = std::ldexp(1.0f, -9);
+        const std::vector<uint16_t> w_f16 = {cloudtpu::f32_to_f16(1.0f + eps), cloudtpu::f32_to_f16(1.0f)};
+        const std::vector<float> x_f32 = {1.0f, -1.0f};
+        auto bw_f16 = rt.buffer_from_host(0, w_f16.data(), cloudtpu::PjrtDType::F16, {1, 1, 1, 2});
+        auto bx_f32 = rt.buffer_from_host(0, x_f32.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, 2});
+
+        cloudtpu::GraphProgramSpec f16_spec;
+        f16_spec.bf16_matmul = true;  // Default quantized BF16 fast path ON
+        f16_spec.inputs.push_back({1, cloudtpu::PjrtDType::F16, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 2}});
+        f16_spec.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 2}});
+        cloudtpu::OpNodeSpec f16_mm;
+        f16_mm.kind = cloudtpu::CloudOpKind::MUL_MAT;
+        f16_mm.src_ids = {1, 2};
+        f16_mm.dst = {3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 1}};
+        f16_mm.high_precision = false;
+        f16_spec.ops.push_back(f16_mm);
+        f16_spec.output_ids = {3};
+
+        const auto f16_prog = cloudtpu::emit_stablehlo_program(f16_spec);
+        CHECK_TRUE(f16_prog.mlir_text.find("bf16") == std::string::npos,
+                   "Dense F16 MUL_MAT must not cast to bf16 under default bf16_matmul=true");
+        const auto f16_got = run_emitted(rt, f16_prog, {bw_f16, bx_f32});
+        CHECK_TRUE(std::fabs(f16_got[0] - eps) < 1e-7f,
+                   "Dense F16 MUL_MAT [1+2^-9, 1] . [1, -1] must equal exact 2^-9");
+    }
+    std::printf("  [PASS] MUL_MAT (F32 GQA + Q4_0_SPLIT + dense F16 precision)\n");
 }
 
 void test_rms_rope_softmax_swiglu_getrows_fused(cloudtpu::PjrtRuntime& rt) {
@@ -491,29 +595,29 @@ void test_silicon_regressions(cloudtpu::PjrtRuntime& rt) {
     done_rope52:;
     }
 
-    // 2) Q4_0_SPLIT (N=16, NB=8, K=256): dequant-only CPY + MUL_MAT (M=4)
+    // 2) Q4_0_SPLIT (N=16, NB=8, K=256): dequant-only CPY + MUL_MAT (M=4, both split-dot and single-dot)
     {
         const int64_t N = 16, NB = 8, K = NB * 32, M = 4;
-        std::vector<uint8_t> qs(static_cast<size_t>(N * NB * 16));
-        std::vector<uint16_t> d(static_cast<size_t>(N * NB));
+        std::vector<uint8_t> qs_km(static_cast<size_t>(NB * 16 * N));
+        std::vector<uint16_t> d_km(static_cast<size_t>(NB * N));
         std::vector<float> w_ref(static_cast<size_t>(N * K));
         for (int64_t n = 0; n < N; ++n) {
             for (int64_t b = 0; b < NB; ++b) {
                 const float sc = 0.05f * static_cast<float>((n + b) % 7 + 1);
                 const uint16_t d16 = cloudtpu::f32_to_f16(sc);
-                d[static_cast<size_t>(n * NB + b)] = d16;
+                d_km[static_cast<size_t>(b * N + n)] = d16;
                 const float scale = cloudtpu::f16_to_f32(d16);
                 for (int64_t j = 0; j < 16; ++j) {
                     const uint8_t lo = static_cast<uint8_t>((n * 3 + b * 5 + j) & 0x0F);
                     const uint8_t hi = static_cast<uint8_t>((n * 7 + b * 11 + j * 3 + 2) & 0x0F);
-                    qs[static_cast<size_t>((n * NB + b) * 16 + j)] = static_cast<uint8_t>(lo | (hi << 4));
+                    qs_km[static_cast<size_t>((b * 16 + j) * N + n)] = static_cast<uint8_t>(lo | (hi << 4));
                     w_ref[static_cast<size_t>(n * K + b * 32 + j)] = static_cast<float>(static_cast<int>(lo) - 8) * scale;
                     w_ref[static_cast<size_t>(n * K + b * 32 + j + 16)] = static_cast<float>(static_cast<int>(hi) - 8) * scale;
                 }
             }
         }
-        auto bqs = rt.buffer_from_host(0, qs.data(), cloudtpu::PjrtDType::U8, {1, 1, N, NB, 16});
-        auto bd = rt.buffer_from_host(0, d.data(), cloudtpu::PjrtDType::F16, {1, 1, N, NB});
+        auto bqs = rt.buffer_from_host(0, qs_km.data(), cloudtpu::PjrtDType::U8, {1, 1, NB, 16, N});
+        auto bd = rt.buffer_from_host(0, d_km.data(), cloudtpu::PjrtDType::F16, {1, 1, NB, N});
 
         // Dequant-only check
         {
@@ -541,14 +645,15 @@ void test_silicon_regressions(cloudtpu::PjrtRuntime& rt) {
             }
         }
 
-        // MUL_MAT Q4_0 K=256 check
+        // MUL_MAT Q4_0 K=256 check (both split-dot and single-dot)
         std::vector<float> x(static_cast<size_t>(M * K));
         for (size_t i = 0; i < x.size(); ++i) {
             x[i] = std::cos(static_cast<float>(i) * 0.17f);
         }
         auto bx = rt.buffer_from_host(0, x.data(), cloudtpu::PjrtDType::F32, {1, 1, M, K});
-        {
+        for (bool split_dot : {true, false}) {
             cloudtpu::GraphProgramSpec mspec;
+            mspec.q4_split_dot = split_dot;
             mspec.inputs.push_back({1, cloudtpu::PjrtDType::U8, cloudtpu::TensorStorageKind::Q4_0_SPLIT, {1, 1, N, K}});
             mspec.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, K}});
             cloudtpu::OpNodeSpec mm;
@@ -572,7 +677,8 @@ void test_silicon_regressions(cloudtpu::PjrtRuntime& rt) {
             }
             const double nmse = se / std::max(1e-12, sref);
             if (!std::isfinite(nmse) || nmse > 5e-4) {
-                std::fprintf(stderr, "FAIL [Q4_0 MUL_MAT K=256]: nmse=%.6f got[0]=%.5f\n", nmse, ygot[0]);
+                std::fprintf(stderr, "FAIL [Q4_0 MUL_MAT K=256 split=%d]: nmse=%.6f got[0]=%.5f\n",
+                             split_dot ? 1 : 0, nmse, ygot[0]);
                 ++g_failures;
             }
         }
@@ -581,17 +687,17 @@ void test_silicon_regressions(cloudtpu::PjrtRuntime& rt) {
     // 3) Q8_0_SPLIT (N=16, NB=8, K=256, M=4)
     {
         const int64_t N = 16, NB = 8, K = NB * 32, M = 4;
-        std::vector<int8_t> qs(static_cast<size_t>(N * NB * 32));
-        std::vector<uint16_t> d(static_cast<size_t>(N * NB));
+        std::vector<int8_t> qs_km(static_cast<size_t>(NB * 32 * N));
+        std::vector<uint16_t> d_km(static_cast<size_t>(NB * N));
         std::vector<float> w_ref(static_cast<size_t>(N * K));
         for (int64_t n = 0; n < N; ++n) {
             for (int64_t b = 0; b < NB; ++b) {
                 const uint16_t d16 = cloudtpu::f32_to_f16(0.01f * static_cast<float>((n + b) % 5 + 1));
-                d[static_cast<size_t>(n * NB + b)] = d16;
+                d_km[static_cast<size_t>(b * N + n)] = d16;
                 const float scale = cloudtpu::f16_to_f32(d16);
                 for (int64_t j = 0; j < 32; ++j) {
                     const int8_t q = static_cast<int8_t>(((n * 13 + b * 29 + j * 7) % 251) - 125);
-                    qs[static_cast<size_t>((n * NB + b) * 32 + j)] = q;
+                    qs_km[static_cast<size_t>((b * 32 + j) * N + n)] = q;
                     w_ref[static_cast<size_t>(n * K + b * 32 + j)] = static_cast<float>(q) * scale;
                 }
             }
@@ -599,8 +705,8 @@ void test_silicon_regressions(cloudtpu::PjrtRuntime& rt) {
         std::vector<float> x(static_cast<size_t>(M * K));
         for (size_t i = 0; i < x.size(); ++i) x[i] = std::sin(static_cast<float>(i) * 0.23f);
 
-        auto bqs = rt.buffer_from_host(0, qs.data(), cloudtpu::PjrtDType::S8, {1, 1, N, NB, 32});
-        auto bd = rt.buffer_from_host(0, d.data(), cloudtpu::PjrtDType::F16, {1, 1, N, NB});
+        auto bqs = rt.buffer_from_host(0, qs_km.data(), cloudtpu::PjrtDType::S8, {1, 1, NB, 32, N});
+        auto bd = rt.buffer_from_host(0, d_km.data(), cloudtpu::PjrtDType::F16, {1, 1, NB, N});
         auto bx = rt.buffer_from_host(0, x.data(), cloudtpu::PjrtDType::F32, {1, 1, M, K});
         cloudtpu::GraphProgramSpec mspec;
         mspec.inputs.push_back({1, cloudtpu::PjrtDType::S8, cloudtpu::TensorStorageKind::Q8_0_SPLIT, {1, 1, N, K}});
@@ -631,7 +737,72 @@ void test_silicon_regressions(cloudtpu::PjrtRuntime& rt) {
         }
     }
 
-    std::printf("  [PASS] Silicon regressions (ROPE M=52, Q4_0/Q8_0 K=256)\n");
+    // 4) Single-token SET_ROWS -> dynamic_update_slice + {tf.aliasing_output = 0 : i32}
+    {
+        const int64_t R = 8, D = 4;
+        std::vector<float> tbl(static_cast<size_t>(R * D), 0.0f);
+        for (size_t i = 0; i < tbl.size(); ++i) tbl[i] = static_cast<float>(i);
+        std::vector<float> upd = {101.0f, 102.0f, 103.0f, 104.0f};
+        int32_t row_idx = 5;
+
+        cloudtpu::GraphProgramSpec spec;
+        spec.inputs.push_back({1, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, D}});
+        spec.inputs.push_back({2, cloudtpu::PjrtDType::S32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 1}});
+        cloudtpu::TensorSpec kv_in{3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, R, D}};
+        kv_in.alias_output_idx = 0;
+        spec.inputs.push_back(kv_in);
+        cloudtpu::OpNodeSpec sr;
+        sr.kind = cloudtpu::CloudOpKind::SET_ROWS;
+        sr.src_ids = {1, 2, 3};
+        sr.dst = {4, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, R, D}};
+        spec.ops.push_back(sr);
+        spec.output_ids = {4};
+
+        const auto prog = cloudtpu::emit_stablehlo_program(spec);
+        CHECK_TRUE(prog.mlir_text.find("stablehlo.dynamic_update_slice") != std::string::npos,
+                   "single-row SET_ROWS must emit dynamic_update_slice");
+        CHECK_TRUE(prog.mlir_text.find("stablehlo.scatter") == std::string::npos,
+                   "single-row SET_ROWS must not emit scatter");
+        CHECK_TRUE(prog.mlir_text.find("{tf.aliasing_output = 0 : i32}") != std::string::npos,
+                   "donated KV arg must emit tf.aliasing_output = 0");
+        CHECK_TRUE(prog.input_bindings.size() == 3 && prog.input_bindings[2].donatable,
+                   "donated KV binding flag must be set");
+
+        auto bupd = rt.buffer_from_host(0, upd.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, D});
+        auto bidx = rt.buffer_from_host(0, &row_idx, cloudtpu::PjrtDType::S32, {1, 1, 1, 1});
+        auto btbl = rt.buffer_from_host(0, tbl.data(), cloudtpu::PjrtDType::F32, {1, 1, R, D});
+        const auto copts = rt.make_spmd_compile_options(1, 0, /*alias_passthrough=*/false);
+        const auto exec = rt.compile_or_get(prog.cache_key + "|alias_test", prog.mlir_text, 0, copts);
+        const std::vector<int64_t> non_don = {0, 1};
+        std::vector<PJRT_Buffer*> raw_in = {bupd->handle.get(), bidx->handle.get(), btbl->handle.get()};
+        std::vector<cloudtpu::PjrtBufferPtr> outs;
+        rt.execute(exec, 0, raw_in.data(), raw_in.size(), outs,
+                   {cloudtpu::PjrtDType::F32}, {{1, 1, R, D}}, true, &non_don);
+        std::vector<float> got(static_cast<size_t>(R * D));
+        rt.buffer_to_host(outs[0]->handle.get(), got.data(), got.size() * sizeof(float));
+        for (int64_t r = 0; r < R; ++r) {
+            for (int64_t d = 0; d < D; ++d) {
+                const float exp_v = (r == row_idx) ? upd[static_cast<size_t>(d)] : tbl[static_cast<size_t>(r * D + d)];
+                CHECK_NEAR(got[static_cast<size_t>(r * D + d)], exp_v, 1e-5f, "SET_ROWS DUS KV update");
+            }
+        }
+
+        // Out-of-range indices (-1 and R) must leave every KV row bit-for-bit untouched (matching scatter).
+        // Upload a fresh KV buffer for each case because the preceding execution allows PJRT buffer donation.
+        for (int32_t bad_idx : {int32_t{-1}, static_cast<int32_t>(R)}) {
+            auto bbad = rt.buffer_from_host(0, &bad_idx, cloudtpu::PjrtDType::S32, {1, 1, 1, 1});
+            auto btbl_case = rt.buffer_from_host(0, tbl.data(), cloudtpu::PjrtDType::F32, {1, 1, R, D});
+            std::vector<PJRT_Buffer*> bad_in = {bupd->handle.get(), bbad->handle.get(), btbl_case->handle.get()};
+            std::vector<cloudtpu::PjrtBufferPtr> bad_outs;
+            rt.execute(exec, 0, bad_in.data(), bad_in.size(), bad_outs,
+                       {cloudtpu::PjrtDType::F32}, {{1, 1, R, D}}, true, &non_don);
+            std::vector<float> bad_got(static_cast<size_t>(R * D));
+            rt.buffer_to_host(bad_outs[0]->handle.get(), bad_got.data(), bad_got.size() * sizeof(float));
+            check_vec_close(bad_got, tbl, 0.0f, "SET_ROWS DUS out-of-range preserves KV table");
+        }
+    }
+
+    std::printf("  [PASS] Silicon regressions (ROPE M=52, Q4_0/Q8_0 K=256, bounds-guarded DUS+KV donation)\n");
 }
 
 void test_multichip_device_assignment_and_eviction_lifetime() {
@@ -822,36 +993,93 @@ void test_flash_attn_fully_masked_row(cloudtpu::PjrtRuntime& rt) {
                    "unaffected finite V channels must remain preserved");
     }
     check_vec_close(q0_got, q0_exp, 1e-5f, "FLASH_ATTN_EXT masked NaN/Inf KV isolation");
-    std::printf("  [PASS] FLASH_ATTN_EXT isolates masked NaN/Inf K/V rows\n");
+
+    // Verify BF16 flash attention is gated independently of bf16_matmul so default
+    // CLOUDTPU_MATMUL_BF16=1 preserves F32 GGML attention parity (<0.0005 NMSE).
+    {
+        constexpr int64_t D256 = 256;
+        std::vector<float> q256(static_cast<size_t>(D256));
+        std::vector<float> k256(static_cast<size_t>(2 * D256));
+        std::vector<float> v256(static_cast<size_t>(2 * D256), 0.0f);
+        for (int64_t i = 0; i < 128; ++i) {
+            q256[static_cast<size_t>(i)] = 1.00390625f;  // 1 + 2^-8 (distinct from 1 in F32, rounds to 1 in BF16)
+            q256[static_cast<size_t>(128 + i)] = 1.0f;
+            k256[static_cast<size_t>(i)] = 2.0f;
+            k256[static_cast<size_t>(128 + i)] = -2.0f;
+            k256[static_cast<size_t>(D256 + i)] = -2.0f;
+            k256[static_cast<size_t>(D256 + 128 + i)] = 2.0f;
+        }
+        v256[0] = 1.0f;
+        v256[static_cast<size_t>(D256)] = 0.0f;
+        auto bq256 = rt.buffer_from_host(0, q256.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, D256});
+        auto bk256 = rt.buffer_from_host(0, k256.data(), cloudtpu::PjrtDType::F32, {1, 1, 2, D256});
+        auto bv256 = rt.buffer_from_host(0, v256.data(), cloudtpu::PjrtDType::F32, {1, 1, 2, D256});
+
+        cloudtpu::GraphProgramSpec fa_spec;
+        fa_spec.bf16_matmul = true;       // Default matmul BF16 ON
+        fa_spec.bf16_flash_attn = false;  // Default flash attention BF16 OFF
+        fa_spec.inputs.push_back({1, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, D256}});
+        fa_spec.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 2, D256}});
+        fa_spec.inputs.push_back({3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 2, D256}});
+        cloudtpu::OpNodeSpec fa_op;
+        fa_op.kind = cloudtpu::CloudOpKind::FLASH_ATTN_EXT;
+        fa_op.src_ids = {1, 2, 3};
+        fa_op.dst = {4, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, D256}};
+        fa_op.flash_attn.scale = 1.0f / 16.0f;
+        fa_op.high_precision = false;
+        fa_spec.ops.push_back(fa_op);
+        fa_spec.output_ids = {4};
+
+        const auto fa_f32_prog = cloudtpu::emit_stablehlo_program(fa_spec);
+        CHECK_TRUE(fa_f32_prog.mlir_text.find("bf16") == std::string::npos,
+                   "Default bf16_flash_attn=false must keep FLASH_ATTN_EXT in F32 even when bf16_matmul=true");
+        const auto fa_f32_out = run_emitted(rt, fa_f32_prog, {bq256, bk256, bv256});
+        const float exp_f32 = std::exp(0.0625f) / (std::exp(0.0625f) + std::exp(-0.0625f));
+        CHECK_TRUE(std::fabs(fa_f32_out[0] - exp_f32) < 1e-5f,
+                   "Default FLASH_ATTN_EXT must match F32 reference within GGML parity tolerance");
+
+        fa_spec.bf16_flash_attn = true;
+        const auto fa_bf16_prog = cloudtpu::emit_stablehlo_program(fa_spec);
+        CHECK_TRUE(fa_bf16_prog.mlir_text.find("bf16") != std::string::npos,
+                   "Opt-in bf16_flash_attn=true must cast FLASH_ATTN_EXT operands to bf16");
+        CHECK_TRUE(fa_bf16_prog.cache_key != fa_f32_prog.cache_key,
+                   "bf16_flash_attn toggle must produce distinct executable cache keys");
+        const auto fa_bf16_out = run_emitted(rt, fa_bf16_prog, {bq256, bk256, bv256});
+        CHECK_TRUE(std::fabs(fa_bf16_out[0] - 0.5f) < 1e-5f,
+                   "Opt-in BF16 FLASH_ATTN_EXT should reflect BF16 rounding (0.5f)");
+    }
+    std::printf("  [PASS] FLASH_ATTN_EXT isolates masked NaN/Inf K/V rows & gates BF16 independently\n");
 }
 
 void test_q4_k_split_mul_mat(cloudtpu::PjrtRuntime& rt) {
-    // Verify Q4_K_SPLIT emission & execution preserves rank-4 dims for both scales (d) and mins (m).
+    // Verify Q4_K_SPLIT emission & execution preserves rank-4 K-major dims for both scales (d) and mins (m).
     constexpr int64_t M = 2, K = 32, N = 3, NB = K / 32;
-    std::vector<uint8_t> qs(static_cast<size_t>(N * NB * 16), 0);
-    std::vector<float> d(static_cast<size_t>(N * NB), 0.5f);
-    std::vector<float> m(static_cast<size_t>(N * NB), -1.0f);
+    std::vector<uint8_t> qs_km(static_cast<size_t>(NB * 16 * N), 0);
+    std::vector<float> d_km(static_cast<size_t>(NB * N), 0.5f);
+    std::vector<float> m_km(static_cast<size_t>(NB * N), -1.0f);
     std::vector<float> w_ref(static_cast<size_t>(N * K), 0.0f);
     for (int64_t n = 0; n < N; ++n) {
-        d[static_cast<size_t>(n)] = 0.25f * static_cast<float>(n + 1);
-        m[static_cast<size_t>(n)] = -0.5f * static_cast<float>(n + 1);
+        d_km[static_cast<size_t>(n)] = 0.25f * static_cast<float>(n + 1);
+        m_km[static_cast<size_t>(n)] = -0.5f * static_cast<float>(n + 1);
         for (int64_t i = 0; i < 16; ++i) {
             const uint8_t lo = static_cast<uint8_t>((n + i) & 0x0F);
             const uint8_t hi = static_cast<uint8_t>((n + i + 3) & 0x0F);
-            qs[static_cast<size_t>(n * 16 + i)] = static_cast<uint8_t>(lo | (hi << 4));
-            w_ref[static_cast<size_t>(n * K + i)] = static_cast<float>(lo) * d[static_cast<size_t>(n)] + m[static_cast<size_t>(n)];
-            w_ref[static_cast<size_t>(n * K + 16 + i)] = static_cast<float>(hi) * d[static_cast<size_t>(n)] + m[static_cast<size_t>(n)];
+            qs_km[static_cast<size_t>(i * N + n)] = static_cast<uint8_t>(lo | (hi << 4));
+            w_ref[static_cast<size_t>(n * K + i)] = static_cast<float>(lo) * d_km[static_cast<size_t>(n)] + m_km[static_cast<size_t>(n)];
+            w_ref[static_cast<size_t>(n * K + 16 + i)] = static_cast<float>(hi) * d_km[static_cast<size_t>(n)] + m_km[static_cast<size_t>(n)];
         }
     }
     std::vector<float> x(static_cast<size_t>(M * K));
     for (size_t i = 0; i < x.size(); ++i) x[i] = 0.1f * static_cast<float>(static_cast<int>(i % 7) - 3);
 
-    auto bqs = rt.buffer_from_host(0, qs.data(), cloudtpu::PjrtDType::U8, {1, 1, N, NB, 16});
-    auto bd = rt.buffer_from_host(0, d.data(), cloudtpu::PjrtDType::F32, {1, 1, N, NB});
-    auto bm = rt.buffer_from_host(0, m.data(), cloudtpu::PjrtDType::F32, {1, 1, N, NB});
+    auto bqs = rt.buffer_from_host(0, qs_km.data(), cloudtpu::PjrtDType::U8, {1, 1, NB, 16, N});
+    auto bd = rt.buffer_from_host(0, d_km.data(), cloudtpu::PjrtDType::F32, {1, 1, NB, N});
+    auto bm = rt.buffer_from_host(0, m_km.data(), cloudtpu::PjrtDType::F32, {1, 1, NB, N});
     auto bx = rt.buffer_from_host(0, x.data(), cloudtpu::PjrtDType::F32, {1, 1, M, K});
 
+    // 1) Strict F32 parity path (bf16_matmul=false, high_precision=true)
     cloudtpu::GraphProgramSpec spec;
+    spec.bf16_matmul = false;
     spec.inputs.push_back({1, cloudtpu::PjrtDType::U8, cloudtpu::TensorStorageKind::Q4_K_SPLIT, {1, 1, N, K}});
     spec.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, K}});
     cloudtpu::OpNodeSpec mm;
@@ -864,7 +1092,8 @@ void test_q4_k_split_mul_mat(cloudtpu::PjrtRuntime& rt) {
 
     const auto prog = cloudtpu::emit_stablehlo_program(spec);
     CHECK_TRUE(prog.input_bindings.size() == 4, "Q4_K_SPLIT MUL_MAT has 4 input bindings (qs, d, m, x)");
-    CHECK_TRUE(prog.input_bindings[2].dims == std::vector<int64_t>({1, 1, N, NB}), "Q4_K mins binding rank-4");
+    CHECK_TRUE(prog.input_bindings[2].dims == std::vector<int64_t>({1, 1, NB, N}), "Q4_K mins binding rank-4 K-major");
+    CHECK_TRUE(prog.mlir_text.find("bf16") == std::string::npos, "Strict F32 Q4_K MUL_MAT must not cast to bf16");
 
     const auto got = run_emitted(rt, prog, {bqs, bd, bm, bx});
     std::vector<float> expected(static_cast<size_t>(M * N), 0.0f);
@@ -877,10 +1106,81 @@ void test_q4_k_split_mul_mat(cloudtpu::PjrtRuntime& rt) {
             expected[static_cast<size_t>(r * N + n)] = acc;
         }
     }
-    check_vec_close(got, expected, 1e-4f, "Q4_K_SPLIT MUL_MAT");
-    std::printf("  [PASS] Q4_K_SPLIT MUL_MAT (rank-4 scales & mins)\n");
+    check_vec_close(got, expected, 1e-4f, "Q4_K_SPLIT MUL_MAT F32");
 
-    // Verify SET_ROWS preserves 64-bit scatter indices (i64, not narrowed to i32).
+    // 2) BF16 MXU contraction path (bf16_matmul=true, high_precision=false) verified against
+    //    BF16-rounded operands (matching real MXU BF16 input precision).
+    cloudtpu::GraphProgramSpec bf16_spec = spec;
+    bf16_spec.bf16_matmul = true;
+    bf16_spec.ops[0].high_precision = false;
+    const auto bf16_prog = cloudtpu::emit_stablehlo_program(bf16_spec);
+    CHECK_TRUE(bf16_prog.mlir_text.find("bf16") != std::string::npos,
+               "BF16 Q4_K MUL_MAT must cast dequantized weights and activations to bf16");
+    const auto got_bf16 = run_emitted(rt, bf16_prog, {bqs, bd, bm, bx});
+    std::vector<float> expected_bf16(static_cast<size_t>(M * N), 0.0f);
+    for (int64_t r = 0; r < M; ++r) {
+        for (int64_t n = 0; n < N; ++n) {
+            float acc = 0.0f;
+            for (int64_t k = 0; k < K; ++k) {
+                const float x_q = cloudtpu::bf16_to_f32(cloudtpu::f32_to_bf16(x[static_cast<size_t>(r * K + k)]));
+                const float w_q = cloudtpu::bf16_to_f32(cloudtpu::f32_to_bf16(w_ref[static_cast<size_t>(n * K + k)]));
+                acc += x_q * w_q;
+            }
+            expected_bf16[static_cast<size_t>(r * N + n)] = acc;
+        }
+    }
+    check_vec_close(got_bf16, expected_bf16, 1e-4f, "Q4_K_SPLIT MUL_MAT BF16");
+
+    // 3) Compact BF16 scale storage (CLOUDTPU_Q4K_BF16_SCALES=1) preserves finite effective scales
+    //    above F16's 65504 limit (e.g. Q6_K d=1024 * sc=64 = 65536) without overflowing to Inf/NaN.
+    {
+        const float big_scale = 1024.0f * 64.0f;  // 65536.0f (overflows F16 to +Inf, exact in BF16)
+        const uint16_t big_f16 = cloudtpu::f32_to_f16(big_scale);
+        const uint16_t big_bf16 = cloudtpu::f32_to_bf16(big_scale);
+        CHECK_TRUE(std::isinf(cloudtpu::f16_to_f32(big_f16)), "sanity: 65536 overflows F16 to Inf");
+        CHECK_TRUE(std::isfinite(cloudtpu::bf16_to_f32(big_bf16)) &&
+                       cloudtpu::bf16_to_f32(big_bf16) == big_scale,
+                   "BF16 compact scale must preserve 65536.0f exactly");
+
+        constexpr int64_t K6 = 16, N6 = 2, NB6 = K6 / 16;
+        std::vector<int8_t> qs6(static_cast<size_t>(NB6 * 16 * N6), 0);
+        // Row 0 has all-zero coefficients (0 * Inf would become NaN under F16); row 1 has q[0]=1.
+        qs6[static_cast<size_t>(0 * N6 + 1)] = 1;
+        std::vector<uint16_t> d6_bf16(static_cast<size_t>(NB6 * N6), big_bf16);
+        std::vector<float> x6(static_cast<size_t>(K6), 0.0f);
+        x6[0] = 0.5f;
+
+        auto bqs6 = rt.buffer_from_host(0, qs6.data(), cloudtpu::PjrtDType::S8, {1, 1, NB6, 16, N6});
+        auto bd6 = rt.buffer_from_host(0, d6_bf16.data(), cloudtpu::PjrtDType::BF16, {1, 1, NB6, N6});
+        auto bx6 = rt.buffer_from_host(0, x6.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, K6});
+
+        cloudtpu::GraphProgramSpec q6_spec;
+        q6_spec.bf16_matmul = false;
+        cloudtpu::TensorSpec w6_ts = {
+            1, cloudtpu::PjrtDType::S8, cloudtpu::TensorStorageKind::Q6_K_SPLIT, {1, 1, N6, K6}};
+        w6_ts.scale_dtype = cloudtpu::PjrtDType::BF16;
+        q6_spec.inputs.push_back(w6_ts);
+        q6_spec.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, K6}});
+        cloudtpu::OpNodeSpec q6_mm;
+        q6_mm.kind = cloudtpu::CloudOpKind::MUL_MAT;
+        q6_mm.src_ids = {1, 2};
+        q6_mm.dst = {3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, N6}};
+        q6_mm.high_precision = true;
+        q6_spec.ops.push_back(q6_mm);
+        q6_spec.output_ids = {3};
+
+        const auto q6_prog = cloudtpu::emit_stablehlo_program(q6_spec);
+        CHECK_TRUE(q6_prog.input_bindings[1].dtype == cloudtpu::PjrtDType::BF16,
+                   "Q6_K_SPLIT compact scale binding must use BF16");
+        const auto q6_out = run_emitted(rt, q6_prog, {bqs6, bd6, bx6});
+        CHECK_TRUE(std::isfinite(q6_out[0]) && q6_out[0] == 0.0f,
+                   "Q6_K_SPLIT BF16 scale=65536 with q=0 must stay finite 0.0 (no NaN)");
+        CHECK_TRUE(std::isfinite(q6_out[1]) && std::fabs(q6_out[1] - 32768.0f) < 1e-3f,
+                   "Q6_K_SPLIT BF16 scale=65536 with q=1, x=0.5 must equal 32768.0");
+    }
+    std::printf("  [PASS] Q4_K_SPLIT & Q6_K_SPLIT MUL_MAT (F32 + BF16 MXU + BF16 compact scales)\n");
+
+    // Verify SET_ROWS preserves 64-bit indices on both single-row DUS and multi-row scatter paths.
     const std::vector<float> tbl_init = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
     const std::vector<float> upd_vals = {9.0f, 8.0f};
     const std::vector<int64_t> row_idx64 = {1};
@@ -898,11 +1198,36 @@ void test_q4_k_split_mul_mat(cloudtpu::PjrtRuntime& rt) {
     sr_spec.ops.push_back(sr_op);
     sr_spec.output_ids = {4};
     const auto sr_prog = cloudtpu::emit_stablehlo_program(sr_spec);
-    CHECK_TRUE(sr_prog.mlir_text.find("tensor<1x1x1x3xi64>") != std::string::npos,
-               "SET_ROWS with S64 indices must preserve i64 scatter coordinates");
+    CHECK_TRUE(sr_prog.mlir_text.find("stablehlo.dynamic_update_slice") != std::string::npos &&
+                   sr_prog.mlir_text.find("tensor<i64>") != std::string::npos,
+               "Single-row SET_ROWS with S64 indices must preserve i64 dynamic_update_slice coordinates");
     const auto sr_out = run_emitted(rt, sr_prog, {b_upd, b_idx, b_tbl});
-    check_vec_close(sr_out, {1.0f, 2.0f, 9.0f, 8.0f, 5.0f, 6.0f}, 1e-6f, "SET_ROWS S64");
-    std::printf("  [PASS] SET_ROWS preserves 64-bit scatter indices\n");
+    check_vec_close(sr_out, {1.0f, 2.0f, 9.0f, 8.0f, 5.0f, 6.0f}, 1e-6f, "SET_ROWS S64 DUS");
+    // Out-of-range S64 indices (-1, 3, and 2^33 which would wrap to 0 if narrowed to i32) must
+    // preserve tbl_init unchanged.
+    for (int64_t bad64 : {int64_t{-1}, int64_t{3}, int64_t{1LL << 33}}) {
+        auto b_bad64 = rt.buffer_from_host(0, &bad64, cloudtpu::PjrtDType::S64, {1, 1, 1, 1});
+        const auto bad_out = run_emitted(rt, sr_prog, {b_upd, b_bad64, b_tbl});
+        check_vec_close(bad_out, tbl_init, 0.0f, "SET_ROWS S64 DUS out-of-range preserves table");
+    }
+
+    // Multi-row SET_ROWS with S64 indices uses scatter and preserves i64 coordinates.
+    const std::vector<float> upd_vals2 = {9.0f, 8.0f, 7.0f, 6.5f};
+    const std::vector<int64_t> row_idx64_2 = {2, 0};
+    auto b_upd2 = rt.buffer_from_host(0, upd_vals2.data(), cloudtpu::PjrtDType::F32, {1, 1, 2, 2});
+    auto b_idx2 = rt.buffer_from_host(0, row_idx64_2.data(), cloudtpu::PjrtDType::S64, {1, 1, 1, 2});
+    cloudtpu::GraphProgramSpec sr2_spec;
+    sr2_spec.inputs.push_back({1, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 2, 2}});
+    sr2_spec.inputs.push_back({2, cloudtpu::PjrtDType::S64, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 2}});
+    sr2_spec.inputs.push_back({3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 3, 2}});
+    sr2_spec.ops.push_back(sr_op);
+    sr2_spec.output_ids = {4};
+    const auto sr2_prog = cloudtpu::emit_stablehlo_program(sr2_spec);
+    CHECK_TRUE(sr2_prog.mlir_text.find("tensor<1x1x2x3xi64>") != std::string::npos,
+               "Multi-row SET_ROWS with S64 indices must preserve i64 scatter coordinates");
+    const auto sr2_out = run_emitted(rt, sr2_prog, {b_upd2, b_idx2, b_tbl});
+    check_vec_close(sr2_out, {7.0f, 6.5f, 3.0f, 4.0f, 9.0f, 8.0f}, 1e-6f, "SET_ROWS S64 scatter");
+    std::printf("  [PASS] SET_ROWS preserves 64-bit indices (DUS + scatter)\n");
 
     // 7. FP16 subnormal rounding preserves sticky bits above 2^-25
     const float half_sub = std::ldexp(1.0f, -25);
@@ -1035,6 +1360,8 @@ void test_spmd_multichip_mesh(int num_chips) {
     const auto copts = rt.make_spmd_compile_options(num_chips);
     CHECK_TRUE(copts.num_replicas == num_chips && copts.num_partitions == 1, "SPMD compile options");
     CHECK_TRUE(static_cast<int>(copts.device_assignment_ids.size()) == num_chips, "SPMD DeviceAssignment ids");
+    CHECK_TRUE(copts.env_option_overrides.empty(),
+               "SPMD compile options must not emit non-DebugOptions xla_tpu_* env_option_overrides");
 
     auto run_spmd = [&](const cloudtpu::EmittedProgram& prog,
                         const std::vector<std::vector<cloudtpu::PjrtBufferPtr>>& per_dev_in) {
@@ -1427,7 +1754,7 @@ void test_spmd_shard_n_get_rows_and_collectives() {
             }
         }
 
-        // Quantized Q8_0_SPLIT SHARD_N table (K=32, 1 block per row)
+        // Quantized Q8_0_SPLIT SHARD_N table (K=32, 1 block per row, K-major N-minor per chip: [1, 1, 1, 32, N_LOCAL])
         std::vector<int8_t> qs(static_cast<size_t>(N * K));
         std::vector<uint16_t> ds(static_cast<size_t>(N));
         for (int64_t r = 0; r < N; ++r) {
@@ -1451,10 +1778,17 @@ void test_spmd_shard_n_get_rows_and_collectives() {
         std::vector<std::vector<PJRT_Buffer*>> q_raw_in(P);
         std::vector<PJRT_Buffer* const*> q_in_ptrs(P);
         for (int p = 0; p < P; ++p) {
+            std::vector<int8_t> qs_local_km(static_cast<size_t>(K * N_LOCAL));
+            for (int64_t r = 0; r < N_LOCAL; ++r) {
+                for (int64_t c = 0; c < K; ++c) {
+                    qs_local_km[static_cast<size_t>(c * N_LOCAL + r)] =
+                        qs[static_cast<size_t>((p * N_LOCAL + r) * K + c)];
+                }
+            }
             auto bq = rt.buffer_from_host(
-                p, qs.data() + static_cast<size_t>(p * N_LOCAL * K), cloudtpu::PjrtDType::S8, {1, 1, N_LOCAL, 1, K});
+                p, qs_local_km.data(), cloudtpu::PjrtDType::S8, {1, 1, 1, K, N_LOCAL});
             auto bd = rt.buffer_from_host(
-                p, ds.data() + static_cast<size_t>(p * N_LOCAL), cloudtpu::PjrtDType::F16, {1, 1, N_LOCAL, 1});
+                p, ds.data() + static_cast<size_t>(p * N_LOCAL), cloudtpu::PjrtDType::F16, {1, 1, 1, N_LOCAL});
             auto bi = rt.buffer_from_host(p, indices.data(), cloudtpu::PjrtDType::S32, {1, 1, 1, N_IDX});
             q_per_dev[static_cast<size_t>(p)] = {bq, bd, bi};
             q_raw_in[static_cast<size_t>(p)] = {bq->handle.get(), bd->handle.get(), bi->handle.get()};

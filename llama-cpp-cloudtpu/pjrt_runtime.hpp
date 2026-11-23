@@ -59,18 +59,74 @@ float f16_to_f32(uint16_t h);
 // Counts "libpython" mappings in /proc/self/maps (0 on non-Linux or pure C++ processes).
 size_t count_libpython_mappings();
 
+struct PjrtOptionOverride {
+    enum class Kind {
+        STRING = 1,  // OptionOverrideProto.string_field = 1
+        BOOL = 2,    // OptionOverrideProto.bool_field = 2
+        INT64 = 3,   // OptionOverrideProto.int_field = 3
+        DOUBLE = 4,  // OptionOverrideProto.double_field = 4
+    };
+
+    std::string key;
+    Kind kind = Kind::STRING;
+    std::string string_val;
+    bool bool_val = false;
+    int64_t int_val = 0;
+    double double_val = 0.0;
+
+    static PjrtOptionOverride make_string(std::string k, std::string v) {
+        PjrtOptionOverride o;
+        o.key = std::move(k);
+        o.kind = Kind::STRING;
+        o.string_val = std::move(v);
+        return o;
+    }
+
+    static PjrtOptionOverride make_bool(std::string k, bool v) {
+        PjrtOptionOverride o;
+        o.key = std::move(k);
+        o.kind = Kind::BOOL;
+        o.bool_val = v;
+        return o;
+    }
+
+    static PjrtOptionOverride make_int(std::string k, int64_t v) {
+        PjrtOptionOverride o;
+        o.key = std::move(k);
+        o.kind = Kind::INT64;
+        o.int_val = v;
+        return o;
+    }
+
+    static PjrtOptionOverride make_double(std::string k, double v) {
+        PjrtOptionOverride o;
+        o.key = std::move(k);
+        o.kind = Kind::DOUBLE;
+        o.double_val = v;
+        return o;
+    }
+};
+
 struct PjrtCompileOptions {
     int32_t num_replicas = 1;
     int32_t num_partitions = 1;
     bool use_spmd_partitioning = true;
     bool use_shardy_partitioner = true;
+    bool alias_passthrough_params = false;
     // Optional explicit DeviceAssignmentProto mapping [partition][replica] -> device_id.
     // Length must equal num_replicas * num_partitions when non-empty.
     std::vector<int64_t> device_assignment_ids;
+    // Optional CompileOptionsProto.env_option_overrides (field 7 map<string, OptionOverrideProto>),
+    // merged on top of compiler defaults and XLA_FLAGS without replacing DebugOptions.
+    std::vector<PjrtOptionOverride> env_option_overrides;
 };
 
 // Encodes xla::CompileOptionsProto in pure C++ protobuf wire format (zero libprotobuf dep).
 std::string encode_compile_options_proto(const PjrtCompileOptions& opts);
+
+// Appends documented libtpu async collective overlap flags to a LIBTPU_INIT_ARGS string
+// without clobbering or duplicating flags already set by the caller.
+std::string append_async_collective_libtpu_init_args(const std::string& existing_args);
 
 struct PjrtDeviceInfo {
     int index = 0;
@@ -86,6 +142,7 @@ struct RuntimeConfig {
     int mock_devices = 1;  // Number of virtual TPU chips in Host Mock PJRT (e.g. 4=tpu7x, 8=v6e-8)
     int verbose = 0;
     uint32_t exec_cache_cap = 4096;
+    bool async_collectives = false;  // Opt-in LIBTPU_INIT_ARGS async collective overlap flags before libtpu init
     std::string libtpu_path;
 };
 
@@ -222,8 +279,12 @@ public:
     void await_event(PjrtEventHandle ev);
 
     // Builds compile options (including DeviceAssignmentProto for multi-chip SPMD or
-    // explicit single-device targeting on multi-chip hosts) for a 1D chip mesh.
-    PjrtCompileOptions make_spmd_compile_options(int num_chips, int device_idx = 0) const;
+    // explicit single-device targeting on multi-chip hosts and alias_passthrough_params)
+    // for a 1D chip mesh. TPU-specific async collective flags belong in LIBTPU_INIT_ARGS
+    // (configured before libtpu.so initialization), not CompileOptionsProto.env_option_overrides.
+    PjrtCompileOptions make_spmd_compile_options(int num_chips,
+                                                 int device_idx = 0,
+                                                 bool alias_passthrough = false) const;
 
     // Compile StableHLO MLIR ("mlir" format) or return an owning reference to a cached executable.
     // Thread-safe LRU cache keyed by canonical structural program key and target device assignment.
@@ -239,7 +300,8 @@ public:
                  std::vector<PjrtBufferPtr>& outputs,
                  const std::vector<PjrtDType>& out_dtypes,
                  const std::vector<std::vector<int64_t>>& out_dims,
-                 bool sync);
+                 bool sync,
+                 const std::vector<int64_t>* non_donatable_input_indices = nullptr);
 
     void execute_spmd(const CachedExecutablePtr& exec,
                       int num_devices,
@@ -248,7 +310,8 @@ public:
                       std::vector<std::vector<PjrtBufferPtr>>& per_device_outputs,
                       const std::vector<PjrtDType>& out_dtypes,
                       const std::vector<std::vector<int64_t>>& out_dims,
-                      bool sync);
+                      bool sync,
+                      const std::vector<int64_t>* non_donatable_input_indices = nullptr);
 
     void clear_exec_cache();
     CachedExecutablePtr get_cached_exec(const std::string& full_key);
@@ -290,6 +353,7 @@ private:
     uint64_t total_compile_us_ = 0;
     std::atomic<uint64_t> total_execute_us_{0};
     std::atomic<uint64_t> eviction_epoch_{0};
+    std::atomic<uint32_t> next_launch_id_{1};
 };
 
 // Shared process-wide PJRT runtime singleton (libtpu.so owns exclusive /dev/vfio/0 per process).
