@@ -933,9 +933,8 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                 SsaValue x = (x_sh == TensorShardingKind::SHARD_K && w_sh == TensorShardingKind::SHARD_K)
                                  ? resolve_dense(op.src_ids.at(1), PjrtDType::F32)
                                  : resolve_replicated(op.src_ids.at(1), PjrtDType::F32);
-                const bool w_is_f32_dense =
-                    (w_th.storage == TensorStorageKind::DENSE && w_th.dense.dtype == PjrtDType::F32);
-                const bool use_bf16_mxu = spec.bf16_matmul && !op.high_precision && !w_is_f32_dense;
+                const bool w_is_quant_split = (w_th.storage != TensorStorageKind::DENSE);
+                const bool use_bf16_mxu = spec.bf16_matmul && !op.high_precision && w_is_quant_split;
                 const PjrtDType deq_dt =
                     use_bf16_mxu ? PjrtDType::BF16
                                  : ((op.high_precision || x.dtype == PjrtDType::F32) ? PjrtDType::F32 : PjrtDType::BF16);
@@ -1048,9 +1047,6 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                 if (op.high_precision) {
                     w = builder.emit_convert(w, PjrtDType::F32);
                     x = builder.emit_convert(x, PjrtDType::F32);
-                } else if (use_bf16_mxu) {
-                    w = builder.emit_convert(w, PjrtDType::BF16);
-                    x = builder.emit_convert(x, PjrtDType::BF16);
                 } else if (w.dtype != x.dtype) {
                     const PjrtDType common =
                         (w.dtype == PjrtDType::F32 || x.dtype == PjrtDType::F32) ? PjrtDType::F32 : PjrtDType::BF16;

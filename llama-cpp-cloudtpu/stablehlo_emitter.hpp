@@ -112,7 +112,7 @@ struct GraphProgramSpec {
     std::vector<OpNodeSpec> ops;      // Topologically ordered ops
     std::vector<uint64_t> output_ids; // Live-out TensorSpec::ids
     int32_t spmd_chips = 1;           // Number of replica-SPMD chips (1 = single chip, 4 = tpu7x, 8 = v6e-8)
-    bool bf16_matmul = true;          // Dequantize quantized/low-bit weights & activations to BF16 for MXU
+    bool bf16_matmul = true;          // Cast split-quantized weights & activations to BF16 for MXU (dense F16/F32 stay F32)
     bool bf16_flash_attn = false;     // Opt-in BF16 Q/K/probs/V matmuls in FLASH_ATTN_EXT (default false: F32 parity)
     bool q4_split_dot = true;         // Q4_0/Q4_K: true = two split-X dots (zero concat); false = single concat dot
 };

@@ -37,7 +37,7 @@ struct cloudtpu_env_config {
     bool fuse_graphs = true;
     bool fuse_attn = false;         // Fuse FLASH_ATTN_EXT with following O_proj/FFN ops
     bool donate_kv = true;          // Donate KV cache HBM buffers in-place on SET_ROWS
-    bool bf16_matmul = true;        // Dequantize quantized/low-bit weights & activations to BF16 for MXU
+    bool bf16_matmul = true;        // Cast split-quantized weights & activations to BF16 for MXU (dense F16/F32 stay F32)
     bool bf16_flash_attn = false;   // Opt-in BF16 Q/K/probs/V matmuls in FLASH_ATTN_EXT (default false: F32 parity)
     bool q4_split_dot = true;       // Q4_0/Q4_K: true = split-X two-dot (zero concat); false = single concat dot
     bool q4k_bf16_scales = false;   // Optional BF16 Q4_K/Q6_K scales (default off: F32 scales +9% faster on v5e-1)

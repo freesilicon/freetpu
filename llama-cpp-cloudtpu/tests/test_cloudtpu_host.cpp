@@ -371,7 +371,36 @@ void test_mul_mat_dense_and_quant(cloudtpu::PjrtRuntime& rt) {
         }
         CHECK_NEAR(qgot[n], ref, 0.25f, "MUL_MAT Q4_0_SPLIT");
     }
-    std::printf("  [PASS] MUL_MAT (F32 GQA + Q4_0_SPLIT)\n");
+
+    // 3) Dense F16 weight + F32 activation stays out of the default BF16 quantized fast path:
+    //    [1 + 2^-9, 1] . [1, -1] must yield exact 2^-9 (BF16 rounding would collapse both to 1 -> 0).
+    {
+        const float eps = std::ldexp(1.0f, -9);
+        const std::vector<uint16_t> w_f16 = {cloudtpu::f32_to_f16(1.0f + eps), cloudtpu::f32_to_f16(1.0f)};
+        const std::vector<float> x_f32 = {1.0f, -1.0f};
+        auto bw_f16 = rt.buffer_from_host(0, w_f16.data(), cloudtpu::PjrtDType::F16, {1, 1, 1, 2});
+        auto bx_f32 = rt.buffer_from_host(0, x_f32.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, 2});
+
+        cloudtpu::GraphProgramSpec f16_spec;
+        f16_spec.bf16_matmul = true;  // Default quantized BF16 fast path ON
+        f16_spec.inputs.push_back({1, cloudtpu::PjrtDType::F16, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 2}});
+        f16_spec.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 2}});
+        cloudtpu::OpNodeSpec f16_mm;
+        f16_mm.kind = cloudtpu::CloudOpKind::MUL_MAT;
+        f16_mm.src_ids = {1, 2};
+        f16_mm.dst = {3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 1}};
+        f16_mm.high_precision = false;
+        f16_spec.ops.push_back(f16_mm);
+        f16_spec.output_ids = {3};
+
+        const auto f16_prog = cloudtpu::emit_stablehlo_program(f16_spec);
+        CHECK_TRUE(f16_prog.mlir_text.find("bf16") == std::string::npos,
+                   "Dense F16 MUL_MAT must not cast to bf16 under default bf16_matmul=true");
+        const auto f16_got = run_emitted(rt, f16_prog, {bw_f16, bx_f32});
+        CHECK_TRUE(std::fabs(f16_got[0] - eps) < 1e-7f,
+                   "Dense F16 MUL_MAT [1+2^-9, 1] . [1, -1] must equal exact 2^-9");
+    }
+    std::printf("  [PASS] MUL_MAT (F32 GQA + Q4_0_SPLIT + dense F16 precision)\n");
 }
 
 void test_rms_rope_softmax_swiglu_getrows_fused(cloudtpu::PjrtRuntime& rt) {
