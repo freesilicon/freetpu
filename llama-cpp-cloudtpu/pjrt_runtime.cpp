@@ -1310,8 +1310,39 @@ static MockProgram parse_stablehlo_mlir(const std::string& mlir) {
             if (!closed_quote) {
                 throw std::runtime_error("MockPJRT: unterminated tpu_custom_call backend_config");
             }
-            if (cfg_json.find("\"serialization_format\": 1") == std::string::npos) {
-                throw std::runtime_error("MockPJRT: unsupported tpu_custom_call serialization_format");
+            const size_t sfp = cfg_json.find("\"serialization_format\"");
+            if (sfp == std::string::npos) {
+                throw std::runtime_error("MockPJRT: missing tpu_custom_call serialization_format");
+            }
+            size_t sf_cur = sfp + 22;
+            while (sf_cur < cfg_json.size() && std::isspace(static_cast<unsigned char>(cfg_json[sf_cur]))) {
+                ++sf_cur;
+            }
+            if (sf_cur >= cfg_json.size() || cfg_json[sf_cur] != ':') {
+                throw std::runtime_error("MockPJRT: malformed tpu_custom_call serialization_format");
+            }
+            ++sf_cur;
+            while (sf_cur < cfg_json.size() && std::isspace(static_cast<unsigned char>(cfg_json[sf_cur]))) {
+                ++sf_cur;
+            }
+            const size_t sf_num_start = sf_cur;
+            if (sf_cur < cfg_json.size() && (cfg_json[sf_cur] == '-' || cfg_json[sf_cur] == '+')) {
+                ++sf_cur;
+            }
+            const size_t sf_digits_start = sf_cur;
+            while (sf_cur < cfg_json.size() && std::isdigit(static_cast<unsigned char>(cfg_json[sf_cur]))) {
+                ++sf_cur;
+            }
+            const bool sf_valid_delim =
+                (sf_cur == cfg_json.size()) || cfg_json[sf_cur] == ',' || cfg_json[sf_cur] == '}' ||
+                std::isspace(static_cast<unsigned char>(cfg_json[sf_cur]));
+            if (sf_cur == sf_digits_start || !sf_valid_delim) {
+                throw std::runtime_error("MockPJRT: invalid tpu_custom_call serialization_format value");
+            }
+            const int64_t ser_fmt = std::stoll(cfg_json.substr(sf_num_start, sf_cur - sf_num_start));
+            if (ser_fmt != 1) {
+                throw std::runtime_error("MockPJRT: unsupported tpu_custom_call serialization_format: " +
+                                         std::to_string(ser_fmt));
             }
             const size_t bp = cfg_json.find("\"body\": \"");
             if (bp == std::string::npos) {

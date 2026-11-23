@@ -425,6 +425,19 @@ int main() {
                    "Colliding transform_0 disambiguated to @_transform_0");
     }
 
+    // 15. escape_mlir_string_literal escapes all ASCII control bytes (incl. \f, \v, \r, \0, 0x7F)
+    {
+        std::string raw("a\"b\\c\nd\te\vf\fg\rh");
+        raw.push_back('\0');
+        raw.push_back(static_cast<char>(0x7F));
+        const std::string esc = freetile::escape_mlir_string_literal(raw);
+        CHECK_TRUE(esc == "a\\\"b\\\\c\\nd\\te\\0Bf\\0Cg\\0Dh\\00\\7F",
+                   "escape_mlir_string_literal matches MLIR lexer escape grammar");
+        for (unsigned char c : esc) {
+            CHECK_TRUE(c >= 0x20U && c < 0x7FU, "Escaped MLIR string contains only printable ASCII");
+        }
+    }
+
     std::printf("PASS: all freetile unit tests succeeded!\n");
     return 0;
 }

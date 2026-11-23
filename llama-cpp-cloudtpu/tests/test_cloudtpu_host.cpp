@@ -6631,6 +6631,19 @@ void test_freetile_mosaic_lowering(cloudtpu::PjrtRuntime& rt) {
                 threw = true;
             }
             CHECK_TRUE(threw, "MockPJRT rejects unsigned xui4 inside Mosaic MLIR body");
+
+            // Verify MockPJRT rejects serialization_format: 10 (complete integer parse, not prefix match)
+            std::string bad_ser_mlir = prog.mlir_text;
+            const size_t ser_pos = bad_ser_mlir.find("\\\"serialization_format\\\": 1");
+            CHECK_TRUE(ser_pos != std::string::npos, "Found serialization_format: 1 in emitted Mosaic MLIR");
+            bad_ser_mlir.replace(ser_pos, 27, "\\\"serialization_format\\\": 10");
+            bool threw_ser = false;
+            try {
+                (void)rt.compile_or_get("bad_ser_fmt_10_test", bad_ser_mlir, 0, rt.make_spmd_compile_options(1));
+            } catch (const std::exception&) {
+                threw_ser = true;
+            }
+            CHECK_TRUE(threw_ser, "MockPJRT rejects serialization_format: 10 (must be exact 1)");
         }
     }
 

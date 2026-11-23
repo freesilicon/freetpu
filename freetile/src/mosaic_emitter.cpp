@@ -132,6 +132,7 @@ std::string base64_encode(const std::string& input) {
 }
 
 std::string escape_mlir_string_literal(const std::string& raw) {
+    static constexpr char kHex[] = "0123456789ABCDEF";
     std::string out;
     out.reserve(raw.size() + 16);
     for (unsigned char c : raw) {
@@ -141,6 +142,12 @@ std::string escape_mlir_string_literal(const std::string& raw) {
             out += "\\\"";
         } else if (c == '\n') {
             out += "\\n";
+        } else if (c == '\t') {
+            out += "\\t";
+        } else if (c < 0x20U || c == 0x7FU) {
+            out.push_back('\\');
+            out.push_back(kHex[(c >> 4) & 0x0FU]);
+            out.push_back(kHex[c & 0x0FU]);
         } else {
             out.push_back(static_cast<char>(c));
         }
