@@ -667,6 +667,7 @@ struct HbmScratchGuard {
 
 ot_status_t transport_err_status(ot_context_t* ctx, const std::string& e) {
   (void)e;
+  if (ctx->transport.last_op_oom) return OT_ERR_NO_MEMORY;
   return ot::classify_transport_error(ctx->transport.last_op_timed_out,
                                       ctx->transport.dma_faulted);
 }
@@ -1076,6 +1077,7 @@ ot_status_t ot_matmul_bf16_ex(ot_context_t* ctx,
         out_stats->tiles_m = plan.tiles_m;
         out_stats->tiles_k = plan.tiles_k;
         out_stats->tiles_n = plan.tiles_n;
+        out_stats->imem_bundles = plan.imem_bundles;
         out_stats->vmem_bytes_used = plan.vmem.total_vmem_bytes;
         out_stats->hbm_bytes_moved = plan.hbm_bytes_moved;
       }
@@ -1168,7 +1170,7 @@ ot_status_t ot_matmul_bf16_ex(ot_context_t* ctx,
     out_stats->tiles_m = plan.tiles_m;
     out_stats->tiles_k = plan.tiles_k;
     out_stats->tiles_n = plan.tiles_n;
-    out_stats->imem_bundles = static_cast<uint32_t>(ot::emit_v5e_imem_for_freetile(plan).size());
+    out_stats->imem_bundles = ctx->transport.loaded_imem_bundles;
     out_stats->vmem_bytes_used = plan.vmem.total_vmem_bytes;
   }
   return OT_OK;
@@ -1443,6 +1445,7 @@ ot_status_t ot_matmul_quant(ot_context_t* ctx,
       out_stats->tiles_m = plan.tiles_m;
       out_stats->tiles_k = plan.tiles_k;
       out_stats->tiles_n = plan.tiles_n;
+      out_stats->imem_bundles = plan.imem_bundles;
       out_stats->vmem_bytes_used = plan.vmem.total_vmem_bytes;
     }
     return OT_OK;
@@ -1552,7 +1555,7 @@ ot_status_t ot_matmul_quant(ot_context_t* ctx,
     out_stats->tiles_m = plan.tiles_m;
     out_stats->tiles_k = plan.tiles_k;
     out_stats->tiles_n = plan.tiles_n;
-    out_stats->imem_bundles = static_cast<uint32_t>(ot::emit_v5e_imem_for_freetile(plan).size());
+    out_stats->imem_bundles = ctx->transport.loaded_imem_bundles;
     out_stats->vmem_bytes_used = plan.vmem.total_vmem_bytes;
   }
   return OT_OK;

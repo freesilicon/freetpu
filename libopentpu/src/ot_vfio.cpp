@@ -1118,6 +1118,7 @@ bool validate_cq_completion(uint32_t sent_seq, const uint32_t cq[8], std::string
 bool VfioTransport::submit_sq_wait(const uint32_t desc[32], uint32_t timeout_ms,
                                    uint32_t cq_out[8], std::string* err) {
   last_op_timed_out = false;
+  last_op_oom = false;
   if (!is_mock && !is_owner_process()) {
     if (err) *err = "VFIO context cannot be used in a forked child process";
     return false;
@@ -1311,6 +1312,7 @@ bool VfioTransport::submit_core_ctrl(uint32_t ctrl_word, uint32_t timeout_ms,
 bool VfioTransport::submit_exec_sync(uint32_t expected_exec_seq, uint32_t timeout_ms,
                                      uint32_t cq_out[8], std::string* err) {
   last_op_timed_out = false;
+  last_op_oom = false;
   uint32_t local_cq[8] = {};
   bool poll_failed = false;
   bool timed_out = false;
@@ -1375,6 +1377,7 @@ bool VfioTransport::submit_exec_sync(uint32_t expected_exec_seq, uint32_t timeou
   ring_ready = false;
   imem_booted = false;
   loaded_prog_kind = 0u;
+  loaded_imem_bundles = 0u;
 #ifdef __linux__
   if (!is_mock && !already_faulted) {
     if (bar0_mmio && bar0_mapped_len >= 0x12000u) {
@@ -1439,6 +1442,7 @@ bool VfioTransport::ensure_imem_booted(uint32_t timeout_ms, std::string* err) {
 
 bool VfioTransport::ensure_imem_program(uint32_t prog_kind, uint32_t timeout_ms,
                                         std::string* err) {
+  last_op_oom = false;
   if (!is_mock && !is_owner_process()) {
     if (err) *err = "VFIO context cannot be used in a forked child process";
     return false;
@@ -1453,12 +1457,17 @@ bool VfioTransport::ensure_imem_program(uint32_t prog_kind, uint32_t timeout_ms,
     // never leaves stale resident metadata behind. Keep exec_seq monotonic.
     imem_booted = false;
     loaded_prog_kind = 0u;
+    loaded_imem_bundles = 0u;
     uint32_t cq_out[8] = {};
     if (!submit_core_ctrl(kCoreCtrlStart, timeout_ms, cq_out, err)) {
       return false;
     }
     imem_booted = true;
     loaded_prog_kind = prog_kind;
+    loaded_imem_bundles = (prog_kind == 2u)
+        ? freetile::kV5eImemBundlesQuantQ8
+        : ((prog_kind == 3u) ? freetile::kV5eImemBundlesQuantQ4
+                             : freetile::kV5eImemBundlesBf16);
     return true;
   }
   if (!ring_ready || !host_stage_mem || host_stage_size < kResidentImemBytes) {
@@ -1485,6 +1494,7 @@ bool VfioTransport::ensure_imem_program(uint32_t prog_kind, uint32_t timeout_ms,
   // upload or core-start never leaves stale resident metadata behind.
   imem_booted = false;
   loaded_prog_kind = 0u;
+  loaded_imem_bundles = 0u;
 
   std::memcpy(host_stage_mem, imem_prog.data(), prog_bytes);
   if (!dma_host_to_imem(host_stage_iova, /*dst_imem=*/0ULL, prog_bytes, timeout_ms, err)) {
@@ -1498,12 +1508,15 @@ bool VfioTransport::ensure_imem_program(uint32_t prog_kind, uint32_t timeout_ms,
   // from a prior program's completion can never false-match the next launch.
   imem_booted = true;
   loaded_prog_kind = prog_kind;
+  loaded_imem_bundles = static_cast<uint32_t>(imem_prog.size());
   return true;
 }
 
 bool VfioTransport::ensure_quant_constants(uint32_t timeout_ms, std::string* err) {
+  last_op_oom = false;
   if (quant_const_hbm != 0) return true;
   if (!hbm_alloc.alloc(40960u, 4096u, &quant_const_hbm)) {
+    last_op_oom = true;
     if (err) *err = "Out of device HBM for quantized dequant constants (40 KiB)";
     return false;
   }
@@ -1540,6 +1553,7 @@ void VfioTransport::teardown_imem_state() {
   quant_const_hbm = 0;
   imem_booted = false;
   loaded_prog_kind = 0;
+  loaded_imem_bundles = 0;
   exec_seq = 0;
 }
 

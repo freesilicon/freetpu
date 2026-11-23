@@ -1483,19 +1483,23 @@ static void test_vfio_imem_lifecycle_mock() {
   OT_CHECK(ctx->transport.scratch_lhs_hbm != 0 && ctx->transport.scratch_rhs_hbm != 0);
   OT_CHECK(ctx->transport.hbm_alloc.used_bytes() == 2u * ot::kTile128x128Bf16Bytes);
 
-  // 1) Monotonic exec_seq across BF16 -> Q8 -> Q4 -> BF16 resident program switches.
+  // 1) Monotonic exec_seq & cached loaded_imem_bundles across BF16 -> Q8 -> Q4 -> BF16 switches.
   OT_CHECK(ctx->transport.loaded_prog_kind == 1u);
+  OT_CHECK(ctx->transport.loaded_imem_bundles == ot::freetile::kV5eImemBundlesBf16);
   ctx->transport.exec_seq = ctx->transport.next_exec_seq();
   OT_CHECK(ctx->transport.exec_seq == 1u);
   OT_CHECK(ctx->transport.ensure_imem_program(2u, 1000u, &err));
   OT_CHECK(ctx->transport.imem_booted && ctx->transport.loaded_prog_kind == 2u);
+  OT_CHECK(ctx->transport.loaded_imem_bundles == ot::freetile::kV5eImemBundlesQuantQ8);
   OT_CHECK(ctx->transport.exec_seq == 1u && ctx->transport.next_exec_seq() == 2u);
   ctx->transport.exec_seq = ctx->transport.next_exec_seq();
   OT_CHECK(ctx->transport.ensure_imem_program(3u, 1000u, &err));
   OT_CHECK(ctx->transport.imem_booted && ctx->transport.loaded_prog_kind == 3u);
+  OT_CHECK(ctx->transport.loaded_imem_bundles == ot::freetile::kV5eImemBundlesQuantQ4);
   OT_CHECK(ctx->transport.exec_seq == 2u && ctx->transport.next_exec_seq() == 3u);
   OT_CHECK(ctx->transport.ensure_imem_program(1u, 1000u, &err));
   OT_CHECK(ctx->transport.imem_booted && ctx->transport.loaded_prog_kind == 1u);
+  OT_CHECK(ctx->transport.loaded_imem_bundles == ot::freetile::kV5eImemBundlesBf16);
   OT_CHECK(ctx->transport.exec_seq == 2u);
   ctx->transport.exec_seq = 0xffffffffu;
   OT_CHECK(ctx->transport.next_exec_seq() == 1u);
@@ -1505,10 +1509,27 @@ static void test_vfio_imem_lifecycle_mock() {
   ctx->transport.mock_core_ctrl_fail = true;
   err.clear();
   OT_CHECK(!ctx->transport.ensure_imem_program(2u, 1000u, &err));
-  OT_CHECK(!ctx->transport.imem_booted && ctx->transport.loaded_prog_kind == 0u);
+  OT_CHECK(!ctx->transport.imem_booted && ctx->transport.loaded_prog_kind == 0u &&
+           ctx->transport.loaded_imem_bundles == 0u);
   ctx->transport.mock_core_ctrl_fail = false;
   OT_CHECK(ctx->transport.ensure_imem_program(2u, 1000u, &err));
   OT_CHECK(ctx->transport.imem_booted && ctx->transport.loaded_prog_kind == 2u);
+
+  // 2b) ensure_quant_constants HBM OOM must set last_op_oom so transport maps to OT_ERR_NO_MEMORY.
+  {
+    const uint64_t avail =
+        ctx->transport.hbm_alloc.capacity_bytes() - ctx->transport.hbm_alloc.used_bytes();
+    uint64_t filler_addr = 0;
+    const uint64_t fill_sz = (avail > 16384ULL) ? ((avail - 16384ULL) & ~4095ULL) : 0ULL;
+    OT_CHECK(fill_sz > 0ULL && ctx->transport.hbm_alloc.alloc(fill_sz, 4096ULL, &filler_addr));
+    err.clear();
+    OT_CHECK(!ctx->transport.ensure_quant_constants(1000u, &err));
+    OT_CHECK(ctx->transport.last_op_oom);
+    OT_CHECK(ctx->transport.quant_const_hbm == 0ULL);
+    ctx->transport.hbm_alloc.free(filler_addr);
+    OT_CHECK(ctx->transport.ensure_quant_constants(1000u, &err));
+    OT_CHECK(!ctx->transport.last_op_oom && ctx->transport.quant_const_hbm != 0ULL);
+  }
 
   uint32_t cq[8] = {};
   OT_CHECK(ctx->transport.submit_exec_sync(7u, 1000u, cq, &err));
@@ -1797,10 +1818,20 @@ static void test_freetile_descriptor_and_planner() {
                   .valid);
     ot_freetile_gemm_desc_t trunc_qm = q8_2c;
     trunc_qm.quant_mode = 259u;  // (uint8_t)259 == OT_QUANT_BLOCK_32
-    OT_CHECK(!ot::freetile::plan_v5e_tile_gemm(
-                  ot::freetile::TileKernelDescriptor::from_c_desc(trunc_qm))
-                  .valid);
+    const auto trunc_qm_desc = ot::freetile::TileKernelDescriptor::from_c_desc(trunc_qm);
+    OT_CHECK(trunc_qm_desc.quant.mode == OT_QUANT_NONE && trunc_qm_desc.has_invalid_c_field);
+    OT_CHECK(!ot::freetile::plan_v5e_tile_gemm(trunc_qm_desc).valid);
   }
+
+  // Valid lowering plans must populate imem_bundles matching the exact emitted IMEM kernel size.
+  OT_CHECK(bf16_plan.imem_bundles > 0u &&
+           bf16_plan.imem_bundles == ot::emit_v5e_imem_for_freetile(bf16_plan).size());
+  OT_CHECK(bf16_k1_plan.imem_bundles > 0u &&
+           bf16_k1_plan.imem_bundles == ot::emit_v5e_imem_for_freetile(bf16_k1_plan).size());
+  OT_CHECK(q8_2c_plan.imem_bundles > 0u &&
+           q8_2c_plan.imem_bundles == ot::emit_v5e_imem_for_freetile(q8_2c_plan).size());
+  OT_CHECK(q4_plan.imem_bundles > 0u &&
+           q4_plan.imem_bundles == ot::emit_v5e_imem_for_freetile(q4_plan).size());
 
   // Quantized planner must also normalize k_loop_accum_f32 to true (matching emitted FP32 accum).
   {

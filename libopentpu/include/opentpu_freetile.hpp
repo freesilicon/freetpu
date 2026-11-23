@@ -18,6 +18,9 @@ namespace freetile {
 static constexpr uint32_t kV5eMaxItersPerLaunch = 1024u;
 static constexpr uint64_t kV5eQuantScaleTileDmaBytes = 1024ULL;
 static constexpr uint64_t kV5eQuantConstChunkDmaBytes = 36864ULL;
+static constexpr uint32_t kV5eImemBundlesBf16 = 456u;
+static constexpr uint32_t kV5eImemBundlesQuantQ8 = 664u;
+static constexpr uint32_t kV5eImemBundlesQuantQ4 = 512u;
 
 inline uint64_t count_v5e_launch_chunks(uint32_t m_tiles, uint32_t k_tiles, uint32_t n_tiles,
                                         uint32_t max_iters_per_launch = kV5eMaxItersPerLaunch) {
@@ -117,8 +120,7 @@ struct TileKernelDescriptor {
     d.out_dtype = dtype_from_c(c.out_dtype);
     d.op_kind = (d.rhs_dtype == DType::kBf16) ? OpKind::kMatmul : OpKind::kMatmulDequant;
     const bool qm_ok = is_valid_c_quant_mode(c.quant_mode);
-    d.quant.mode = qm_ok ? static_cast<ot_quant_mode_t>(c.quant_mode)
-                         : static_cast<ot_quant_mode_t>(-1);
+    d.quant.mode = qm_ok ? static_cast<ot_quant_mode_t>(c.quant_mode) : OT_QUANT_NONE;
     d.quant.group_size = c.quant_group_size;
     d.quant.per_tensor_scale = c.quant_scale;
     d.quant.scale_dtype = dtype_from_c(c.scale_dtype);
@@ -301,6 +303,13 @@ inline LoweringPlan plan_v5e_tile_gemm(const TileKernelDescriptor& desc) {
                  chunks * kV5eQuantConstChunkDmaBytes;
   }
   plan.hbm_bytes_moved = hbm_total;
+  if (desc.rhs_dtype == DType::kBf16) {
+    plan.imem_bundles = kV5eImemBundlesBf16;
+  } else if (desc.rhs_dtype == DType::kQ4_0) {
+    plan.imem_bundles = kV5eImemBundlesQuantQ4;
+  } else {
+    plan.imem_bundles = kV5eImemBundlesQuantQ8;
+  }
   plan.valid = true;
   return plan;
 }

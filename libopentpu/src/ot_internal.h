@@ -110,6 +110,7 @@ struct VfioTransport {
   bool ring_ready = false;
   bool dma_faulted = false;
   bool last_op_timed_out = false;
+  bool last_op_oom = false;
   bool mock_exec_timeout = false;
   bool mock_exec_poll_error = false;
   bool mock_core_ctrl_fail = false;
@@ -126,6 +127,7 @@ struct VfioTransport {
   // IMEM boot/poller & kernel runtime state (initialized lazily on first live matmul).
   bool imem_booted = false;
   uint32_t loaded_prog_kind = 0;  // 0=none, 1=bf16, 2=q8, 3=q4
+  uint32_t loaded_imem_bundles = 0;
   uint64_t scratch_lhs_hbm = 0;
   uint64_t scratch_rhs_hbm = 0;
   uint64_t quant_const_hbm = 0;   // 40 KiB Sel + -2304.0f + -136.0f constants
