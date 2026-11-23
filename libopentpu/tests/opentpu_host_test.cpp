@@ -1486,6 +1486,24 @@ static void test_vfio_imem_lifecycle_mock() {
   uint32_t cq[8] = {};
   OT_CHECK(ctx->transport.submit_exec_sync(7u, 1000u, cq, &err));
   OT_CHECK(cq[4] == 1u && cq[5] == 7u);
+  OT_CHECK(!ctx->transport.last_op_timed_out);
+
+  // EXEC polling deadline expiration must report timeout (OT_ERR_TIMEOUT),
+  // distinct from non-timeout device faults (OT_ERR_DEVICE) and CQ errors (OT_ERR_IOCTL).
+  OT_CHECK(ot::classify_transport_error(true, true) == OT_ERR_TIMEOUT);
+  OT_CHECK(ot::classify_transport_error(false, true) == OT_ERR_DEVICE);
+  OT_CHECK(ot::classify_transport_error(false, false) == OT_ERR_IOCTL);
+  ctx->transport.mock_exec_timeout = true;
+  err.clear();
+  OT_CHECK(!ctx->transport.submit_exec_sync(8u, 10u, cq, &err));
+  OT_CHECK(ctx->transport.dma_faulted);
+  OT_CHECK(ctx->transport.last_op_timed_out);
+  OT_CHECK(err.find("EXEC completion timeout") != std::string::npos);
+  OT_CHECK(ot::classify_transport_error(ctx->transport.last_op_timed_out,
+                                        ctx->transport.dma_faulted) == OT_ERR_TIMEOUT);
+  ctx->transport.dma_faulted = false;
+  ctx->transport.last_op_timed_out = false;
+  ctx->transport.mock_exec_timeout = false;
 
   ctx->transport.teardown_imem_state();
   OT_CHECK(!ctx->transport.imem_booted);
@@ -1600,7 +1618,40 @@ static void test_freetile_descriptor_and_planner() {
       ot::freetile::plan_v5e_tile_gemm(ot::freetile::TileKernelDescriptor::from_c_desc(q4));
   OT_CHECK(q4_plan.valid);
   OT_CHECK(q4_plan.vmem.rhs_vmem_bytes == 8192u);
+  const uint64_t expected_q4_512_hbm =
+      4ULL * (128ULL * 512ULL * 2ULL) +       // tiles_n * A
+      1ULL * (512ULL * 512ULL / 2ULL) +       // tiles_m * B_q4
+      (128ULL * 512ULL * 2ULL) +              // C
+      (1ULL * 4ULL * 4ULL) * 1024ULL +        // 1 KiB scale tile per (m,n,k) iter
+      1ULL * 36864ULL;                        // 36 KiB constants per launch chunk
+  OT_CHECK(q4_plan.hbm_bytes_moved == expected_q4_512_hbm);
   OT_CHECK(q4_plan.hbm_bytes_moved < bf16_plan.hbm_bytes_moved);
+
+  // Multi-chunk quantized shape (2*32*32 = 2048 iters -> 2 launch chunks of 36 KiB constants).
+  ot_freetile_gemm_desc_t q8_2c = ot_freetile_gemm_desc_default(256u, 4096u, 4096u);
+  q8_2c.rhs_dtype = OT_DTYPE_Q8_0;
+  q8_2c.quant_mode = OT_QUANT_BLOCK_32;
+  q8_2c.quant_group_size = OT_QK8_0;
+  const ot::freetile::LoweringPlan q8_2c_plan =
+      ot::freetile::plan_v5e_tile_gemm(ot::freetile::TileKernelDescriptor::from_c_desc(q8_2c));
+  OT_CHECK(q8_2c_plan.valid);
+  OT_CHECK(ot::freetile::count_v5e_launch_chunks(2u, 32u, 32u) == 2u);
+  const uint64_t expected_q8_2c_hbm =
+      32ULL * (256ULL * 4096ULL * 2ULL) +
+      2ULL * (4096ULL * 4096ULL) +
+      (256ULL * 4096ULL * 2ULL) +
+      (2ULL * 32ULL * 32ULL) * 1024ULL +
+      2ULL * 36864ULL;
+  OT_CHECK(q8_2c_plan.hbm_bytes_moved == expected_q8_2c_hbm);
+
+  // Reserved Q4_K / BLOCK_256 must be rejected cleanly by the planner.
+  ot_freetile_gemm_desc_t q4k = ot_freetile_gemm_desc_default(128u, 256u, 256u);
+  q4k.rhs_dtype = OT_DTYPE_Q4_K;
+  q4k.quant_mode = OT_QUANT_BLOCK_256;
+  q4k.quant_group_size = 256u;
+  OT_CHECK(!ot::freetile::plan_v5e_tile_gemm(
+                ot::freetile::TileKernelDescriptor::from_c_desc(q4k))
+                .valid);
 
   ot_freetile_gemm_desc_t bad = ot_freetile_gemm_desc_default(128u, 130u, 128u);
   const ot::freetile::LoweringPlan bad_plan =
@@ -1757,7 +1808,15 @@ static void test_mock_multitile_and_quant_matmul() {
   q8d.rhs_dtype = OT_DTYPE_Q8_0;
   q8d.quant_mode = OT_QUANT_BLOCK_32;
   q8d.quant_group_size = OT_QK8_0;
+  q8d.scale_dtype = OT_DTYPE_F32;
   OT_CHECK(ot_matmul_quant(ctx, bqa, bqi8, bqsc, bqout, &q8d, &stats) == OT_OK);
+  const uint64_t expected_q8_hbm =
+      2ULL * (static_cast<uint64_t>(QM) * QK * 2ULL) +
+      1ULL * (static_cast<uint64_t>(QK) * QN) +
+      (static_cast<uint64_t>(QM) * QN * 2ULL) +
+      (1ULL * 2ULL * 2ULL) * 1024ULL +
+      36864ULL;
+  OT_CHECK(stats.hbm_bytes_moved == expected_q8_hbm);
   std::vector<uint16_t> out_q8(QM * QN, 0u);
   OT_CHECK(ot_buffer_d2h(ctx, bqout, out_q8.data(), out_q8.size() * 2u) == OT_OK);
 
@@ -1765,11 +1824,20 @@ static void test_mock_multitile_and_quant_matmul() {
   q4d.rhs_dtype = OT_DTYPE_Q4_0;
   q4d.quant_mode = OT_QUANT_BLOCK_32;
   q4d.quant_group_size = OT_QK8_0;
+  q4d.scale_dtype = OT_DTYPE_F32;
   OT_CHECK(ot_matmul_quant(ctx, bqa, bqq4, bqsc, bqout, &q4d, &stats) == OT_OK);
+  const uint64_t expected_q4_hbm =
+      2ULL * (static_cast<uint64_t>(QM) * QK * 2ULL) +
+      1ULL * (static_cast<uint64_t>(QK) * QN / 2ULL) +
+      (static_cast<uint64_t>(QM) * QN * 2ULL) +
+      (1ULL * 2ULL * 2ULL) * 1024ULL +
+      36864ULL;
+  OT_CHECK(stats.hbm_bytes_moved == expected_q4_hbm);
   std::vector<uint16_t> out_q4(QM * QN, 0u);
   OT_CHECK(ot_buffer_d2h(ctx, bqout, out_q4.data(), out_q4.size() * 2u) == OT_OK);
 
   // Q4 values stay within [-7, 7], matching w_i8 above cleanly!
+  std::vector<uint16_t> ref_q(QM * QN, 0u);
   for (uint32_t m = 0; m < QM; ++m) {
     for (uint32_t n = 0; n < QN; ++n) {
       float acc = 0.0f;
@@ -1778,10 +1846,230 @@ static void test_mock_multitile_and_quant_matmul() {
         const float wf = host_bf16_to_f32(host_f32_to_bf16(static_cast<float>(w_i8[k * QN + n]) * sc));
         acc += host_bf16_to_f32(qa[m * QK + k]) * wf;
       }
-      const uint16_t ref = host_f32_to_bf16(acc);
-      OT_CHECK(out_q8[m * QN + n] == ref);
-      OT_CHECK(out_q4[m * QN + n] == ref);
+      ref_q[m * QN + n] = host_f32_to_bf16(acc);
+      OT_CHECK(out_q8[m * QN + n] == ref_q[m * QN + n]);
+      OT_CHECK(out_q4[m * QN + n] == ref_q[m * QN + n]);
     }
+  }
+
+  // 3) Scale dtype must depend strictly on desc->scale_dtype, never buffer capacity:
+  //    store BF16 scales inside a 2x-oversized (float-sized) buffer.
+  {
+    std::vector<uint16_t> sc_bf16(sc_blk.size());
+    for (size_t i = 0; i < sc_blk.size(); ++i) sc_bf16[i] = host_f32_to_bf16(sc_blk[i]);
+    ot_buffer_t* bqsc_big = nullptr;
+    OT_CHECK(ot_buffer_alloc(ctx, sc_blk.size() * sizeof(float), &bqsc_big) == OT_OK);
+    // Fill upper half with poison so accidental FP32 decoding would corrupt scales.
+    std::vector<uint8_t> sc_bytes(sc_blk.size() * sizeof(float), 0x7fu);
+    std::memcpy(sc_bytes.data(), sc_bf16.data(), sc_bf16.size() * sizeof(uint16_t));
+    OT_CHECK(ot_buffer_h2d(ctx, bqsc_big, sc_bytes.data(), sc_bytes.size()) == OT_OK);
+
+    ot_freetile_gemm_desc_t q8_bf16sc = q8d;
+    q8_bf16sc.scale_dtype = OT_DTYPE_BF16;
+    std::vector<uint16_t> out_bf16sc(QM * QN, 0u);
+    OT_CHECK(ot_matmul_quant(ctx, bqa, bqi8, bqsc_big, bqout, &q8_bf16sc, nullptr) == OT_OK);
+    OT_CHECK(ot_buffer_d2h(ctx, bqout, out_bf16sc.data(), out_bf16sc.size() * 2u) == OT_OK);
+    OT_CHECK(out_bf16sc == ref_q);
+
+    ot_freetile_gemm_desc_t bad_sd = q8d;
+    bad_sd.scale_dtype = OT_DTYPE_INT8;
+    OT_CHECK(ot_matmul_quant(ctx, bqa, bqi8, bqsc_big, bqout, &bad_sd, nullptr) ==
+             OT_ERR_INVALID_ARG);
+    ot_buffer_free(bqsc_big);
+  }
+
+  // 4) Inline interleaved ot_block_q8_0_t and ot_block_q4_0_t (rhs_scales == NULL),
+  //    both non-transposed [K/32, N] and transposed [N, K/32].
+  for (uint8_t trans = 0u; trans <= 1u; ++trans) {
+    const size_t k_blks = QK / OT_QK8_0;
+    std::vector<ot_block_q8_0_t> blk_q8(k_blks * QN);
+    std::vector<ot_block_q4_0_t> blk_q4(k_blks * QN);
+    std::memset(blk_q8.data(), 0, blk_q8.size() * sizeof(ot_block_q8_0_t));
+    std::memset(blk_q4.data(), 0, blk_q4.size() * sizeof(ot_block_q4_0_t));
+    for (size_t sg = 0; sg < k_blks; ++sg) {
+      for (size_t n = 0; n < QN; ++n) {
+        const size_t bidx = trans ? (n * k_blks + sg) : (sg * QN + n);
+        const uint16_t d = host_f32_to_bf16(sc_blk[sg * QN + n]);
+        blk_q8[bidx].d = d;
+        blk_q4[bidx].d = d;
+        for (size_t ki = 0; ki < OT_QK8_0; ++ki) {
+          const int8_t v = w_i8[(sg * OT_QK8_0 + ki) * QN + n];
+          blk_q8[bidx].qs[ki] = v;
+          const uint32_t nib = static_cast<uint32_t>(v + 8) & 0xfu;
+          blk_q4[bidx].qs[ki >> 1] |= static_cast<uint8_t>((ki & 1u) ? (nib << 4) : nib);
+        }
+      }
+    }
+    ot_buffer_t *bbq8 = nullptr, *bbq4 = nullptr;
+    OT_CHECK(ot_buffer_alloc(ctx, blk_q8.size() * sizeof(ot_block_q8_0_t), &bbq8) == OT_OK);
+    OT_CHECK(ot_buffer_alloc(ctx, blk_q4.size() * sizeof(ot_block_q4_0_t), &bbq4) == OT_OK);
+    OT_CHECK(ot_buffer_h2d(ctx, bbq8, blk_q8.data(), blk_q8.size() * sizeof(ot_block_q8_0_t)) ==
+             OT_OK);
+    OT_CHECK(ot_buffer_h2d(ctx, bbq4, blk_q4.data(), blk_q4.size() * sizeof(ot_block_q4_0_t)) ==
+             OT_OK);
+
+    ot_freetile_gemm_desc_t d_q8 = q8d;
+    d_q8.tile.rhs_transposed = trans;
+    std::vector<uint16_t> got_blk(QM * QN, 0u);
+    OT_CHECK(ot_matmul_quant(ctx, bqa, bbq8, nullptr, bqout, &d_q8, nullptr) == OT_OK);
+    OT_CHECK(ot_buffer_d2h(ctx, bqout, got_blk.data(), got_blk.size() * 2u) == OT_OK);
+    OT_CHECK(got_blk == ref_q);
+
+    ot_freetile_gemm_desc_t d_q4 = q4d;
+    d_q4.tile.rhs_transposed = trans;
+    std::fill(got_blk.begin(), got_blk.end(), 0u);
+    OT_CHECK(ot_matmul_quant(ctx, bqa, bbq4, nullptr, bqout, &d_q4, nullptr) == OT_OK);
+    OT_CHECK(ot_buffer_d2h(ctx, bqout, got_blk.data(), got_blk.size() * 2u) == OT_OK);
+    OT_CHECK(got_blk == ref_q);
+
+    ot_buffer_free(bbq4);
+    ot_buffer_free(bbq8);
+  }
+
+  // Reserved Q4_K / BLOCK_256 must return OT_ERR_UNSUPPORTED; INT8 BLOCK_32 without scales invalid.
+  {
+    ot_freetile_gemm_desc_t q4kd = q4d;
+    q4kd.rhs_dtype = OT_DTYPE_Q4_K;
+    q4kd.quant_mode = OT_QUANT_BLOCK_256;
+    q4kd.quant_group_size = 256u;
+    OT_CHECK(ot_matmul_quant(ctx, bqa, bqq4, bqsc, bqout, &q4kd, nullptr) == OT_ERR_UNSUPPORTED);
+
+    ot_freetile_gemm_desc_t i8_nosc = q8d;
+    i8_nosc.rhs_dtype = OT_DTYPE_INT8;
+    OT_CHECK(ot_matmul_quant(ctx, bqa, bqi8, nullptr, bqout, &i8_nosc, nullptr) ==
+             OT_ERR_INVALID_ARG);
+  }
+
+  // 5) Transposed RHS in BF16 GEMM (rhs_transposed = 1, [N, K] storage) + validation.
+  {
+    const uint32_t TM = 128u, TK = 256u, TN = 128u;
+    std::vector<uint16_t> ta(TM * TK), tb_nk(TN * TK), tc_got(TM * TN, 0u), tc_ref(TM * TN, 0u);
+    for (uint32_t m = 0; m < TM; ++m) {
+      for (uint32_t k = 0; k < TK; ++k) {
+        ta[m * TK + k] =
+            host_f32_to_bf16(static_cast<float>(static_cast<int>((m * 7u + k * 3u) % 13u) - 6) * 0.125f);
+      }
+    }
+    for (uint32_t n = 0; n < TN; ++n) {
+      for (uint32_t k = 0; k < TK; ++k) {
+        tb_nk[n * TK + k] =
+            host_f32_to_bf16(static_cast<float>(static_cast<int>((n * 11u + k * 5u) % 11u) - 5) * 0.25f);
+      }
+    }
+    for (uint32_t m = 0; m < TM; ++m) {
+      for (uint32_t n = 0; n < TN; ++n) {
+        float acc = 0.0f;
+        for (uint32_t k = 0; k < TK; ++k) {
+          acc += host_bf16_to_f32(ta[m * TK + k]) * host_bf16_to_f32(tb_nk[n * TK + k]);
+        }
+        tc_ref[m * TN + n] = host_f32_to_bf16(acc);
+      }
+    }
+    ot_buffer_t *bta = nullptr, *btb = nullptr, *btc = nullptr;
+    OT_CHECK(ot_buffer_alloc(ctx, ta.size() * 2u, &bta) == OT_OK);
+    OT_CHECK(ot_buffer_alloc(ctx, tb_nk.size() * 2u, &btb) == OT_OK);
+    OT_CHECK(ot_buffer_alloc(ctx, tc_got.size() * 2u, &btc) == OT_OK);
+    OT_CHECK(ot_buffer_h2d(ctx, bta, ta.data(), ta.size() * 2u) == OT_OK);
+    OT_CHECK(ot_buffer_h2d(ctx, btb, tb_nk.data(), tb_nk.size() * 2u) == OT_OK);
+
+    ot_freetile_gemm_desc_t tdesc = ot_freetile_gemm_desc_default(TM, TK, TN);
+    tdesc.tile.rhs_transposed = 1u;
+    OT_CHECK(ot_matmul_bf16_ex(ctx, bta, btb, btc, &tdesc, nullptr) == OT_OK);
+    OT_CHECK(ot_buffer_d2h(ctx, btc, tc_got.data(), tc_got.size() * 2u) == OT_OK);
+    OT_CHECK(tc_got == tc_ref);
+
+    // Invalid rhs_transposed > 1 must fail.
+    tdesc.tile.rhs_transposed = 2u;
+    OT_CHECK(ot_matmul_bf16_ex(ctx, bta, btb, btc, &tdesc, nullptr) == OT_ERR_INVALID_ARG);
+    ot_freetile_gemm_desc_t bad_qt = q8d;
+    bad_qt.tile.rhs_transposed = 2u;
+    OT_CHECK(ot_matmul_quant(ctx, bqa, bqi8, bqsc, bqout, &bad_qt, nullptr) == OT_ERR_INVALID_ARG);
+
+    ot_buffer_free(btc);
+    ot_buffer_free(btb);
+    ot_buffer_free(bta);
+  }
+
+  // 6) Reusing a 256x256 tiled output buffer for smaller tiled (128x128) and
+  //    non-tile-aligned (64x64) GEMMs must preserve the entire logical suffix,
+  //    and feeding a tiled output back as an aliased / mismatched-shape input
+  //    must read logical row-major elements without double-tiling.
+  {
+    const uint32_t BM = 256u, BK = 256u, BN = 256u;
+    std::vector<uint16_t> ma(BM * BK), mb(BK * BN);
+    for (size_t i = 0; i < ma.size(); ++i) {
+      ma[i] = host_f32_to_bf16(static_cast<float>(static_cast<int>(i % 13u) - 6) * 0.125f);
+    }
+    for (size_t i = 0; i < mb.size(); ++i) {
+      mb[i] = host_f32_to_bf16(static_cast<float>(static_cast<int>(i % 11u) - 5) * 0.125f);
+    }
+    ot_buffer_t *bma = nullptr, *bmb = nullptr, *bmc = nullptr;
+    OT_CHECK(ot_buffer_alloc(ctx, ma.size() * 2u, &bma) == OT_OK);
+    OT_CHECK(ot_buffer_alloc(ctx, mb.size() * 2u, &bmb) == OT_OK);
+    OT_CHECK(ot_buffer_alloc(ctx, BM * BN * 2u, &bmc) == OT_OK);
+    OT_CHECK(ot_buffer_h2d(ctx, bma, ma.data(), ma.size() * 2u) == OT_OK);
+    OT_CHECK(ot_buffer_h2d(ctx, bmb, mb.data(), mb.size() * 2u) == OT_OK);
+
+    const ot_freetile_gemm_desc_t d256 = ot_freetile_gemm_desc_default(BM, BK, BN);
+    OT_CHECK(ot_matmul_bf16_ex(ctx, bma, bmb, bmc, &d256, nullptr) == OT_OK);
+    std::vector<uint16_t> ref_256(BM * BN, 0u);
+    OT_CHECK(ot_buffer_d2h(ctx, bmc, ref_256.data(), ref_256.size() * 2u) == OT_OK);
+
+    // 6a) Reuse 256x256 tiled `bmc` as output for 128x128x128 GEMM (with `bmc` also aliased as LHS!).
+    std::vector<uint16_t> ref_128(128u * 128u, 0u);
+    for (uint32_t m = 0; m < 128u; ++m) {
+      for (uint32_t n = 0; n < 128u; ++n) {
+        float acc = 0.0f;
+        for (uint32_t k = 0; k < 128u; ++k) {
+          acc += host_bf16_to_f32(ref_256[m * 128u + k]) * host_bf16_to_f32(mb[k * 128u + n]);
+        }
+        ref_128[m * 128u + n] = host_f32_to_bf16(acc);
+      }
+    }
+    const ot_freetile_gemm_desc_t d128 = ot_freetile_gemm_desc_default(128u, 128u, 128u);
+    OT_CHECK(ot_matmul_bf16_ex(ctx, bmc, bmb, bmc, &d128, nullptr) == OT_OK);
+    std::vector<uint16_t> after_128(BM * BN, 0u);
+    OT_CHECK(ot_buffer_d2h(ctx, bmc, after_128.data(), after_128.size() * 2u) == OT_OK);
+    OT_CHECK(std::memcmp(after_128.data(), ref_128.data(), ref_128.size() * 2u) == 0);
+    OT_CHECK(std::memcmp(after_128.data() + ref_128.size(),
+                         ref_256.data() + ref_128.size(),
+                         (BM * BN - ref_128.size()) * 2u) == 0);
+
+    // 6b) Re-populate 256x256 tiled `bmc`, then overwrite prefix with non-tile-aligned 64x64x64 GEMM.
+    OT_CHECK(ot_matmul_bf16_ex(ctx, bma, bmb, bmc, &d256, nullptr) == OT_OK);
+    const ot_freetile_gemm_desc_t d64 = ot_freetile_gemm_desc_default(64u, 64u, 64u);
+    OT_CHECK(ot_matmul_bf16_ex(ctx, bma, bmb, bmc, &d64, nullptr) == OT_OK);
+    std::vector<uint16_t> after_64(BM * BN, 0u);
+    OT_CHECK(ot_buffer_d2h(ctx, bmc, after_64.data(), after_64.size() * 2u) == OT_OK);
+    OT_CHECK(std::memcmp(after_64.data() + (64u * 64u),
+                         ref_256.data() + (64u * 64u),
+                         (BM * BN - 64u * 64u) * 2u) == 0);
+
+    // 6c) Feed a tiled 256x128 buffer as mismatched-shape 128x256 LHS (and aliased output) to ot_matmul_quant.
+    const ot_freetile_gemm_desc_t d256x128 = ot_freetile_gemm_desc_default(256u, 128u, 128u);
+    OT_CHECK(ot_matmul_bf16_ex(ctx, bma, bmb, bmc, &d256x128, nullptr) == OT_OK);
+    std::vector<uint16_t> lhs_logical(128u * 256u, 0u);
+    OT_CHECK(ot_buffer_d2h(ctx, bmc, lhs_logical.data(), lhs_logical.size() * 2u) == OT_OK);
+    std::vector<uint16_t> ref_q_alias(QM * QN, 0u);
+    for (uint32_t m = 0; m < QM; ++m) {
+      for (uint32_t n = 0; n < QN; ++n) {
+        float acc = 0.0f;
+        for (uint32_t k = 0; k < QK; ++k) {
+          const float sc = host_bf16_to_f32(host_f32_to_bf16(sc_blk[(k / 32u) * QN + n]));
+          const float wf = host_bf16_to_f32(host_f32_to_bf16(static_cast<float>(w_i8[k * QN + n]) * sc));
+          acc += host_bf16_to_f32(lhs_logical[m * QK + k]) * wf;
+        }
+        ref_q_alias[m * QN + n] = host_f32_to_bf16(acc);
+      }
+    }
+    OT_CHECK(ot_matmul_quant(ctx, bmc, bqi8, bqsc, bmc, &q8d, nullptr) == OT_OK);
+    std::vector<uint16_t> got_q_alias(QM * QN, 0u);
+    OT_CHECK(ot_buffer_d2h(ctx, bmc, got_q_alias.data(), got_q_alias.size() * 2u) == OT_OK);
+    OT_CHECK(got_q_alias == ref_q_alias);
+
+    ot_buffer_free(bmc);
+    ot_buffer_free(bmb);
+    ot_buffer_free(bma);
   }
 
   ot_buffer_free(bqout);

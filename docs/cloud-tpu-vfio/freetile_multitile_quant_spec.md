@@ -10,8 +10,9 @@ Clean-room specification and live silicon proof for extending `libopentpu` (`0x1
 ## 1. FreeTile Descriptor & Lowering Seam
 
 The C11 ABI in [`opentpu.h`](../../libopentpu/include/opentpu.h) exposes `ot_freetile_gemm_desc_t` and `ot_exec_stats_t`, mirrored in pure C++17 by [`opentpu_freetile.hpp`](../../libopentpu/include/opentpu_freetile.hpp):
-- `ot::freetile::TileKernelDescriptor::from_c_desc(...)` captures `(m_dim, k_dim, n_dim)`, `(block_m=128, block_k=128, block_n=128)`, `vmem_double_buffer`, `k_loop_accum_f32`, `rhs_transposed`, `quant_mode`, `quant_group_size`, and scale parameters.
-- `ot::freetile::plan_v5e_tile_gemm(desc)` produces a deterministic `LoweringPlan` with exact VMEM buffer map (`0x000..0x1f0`), K-loop double-buffer footprint, HBM DMA traffic estimate, and dispatch entry point (`ot::emit_v5e_imem_for_freetile(plan)`).
+- `ot::freetile::TileKernelDescriptor::from_c_desc(...)` captures `(m_dim, k_dim, n_dim)`, `(block_m=128, block_k=128, block_n=128)`, `vmem_double_buffer`, `k_loop_accum_f32`, `rhs_transposed`, `quant_mode`, `quant_group_size`, `scale_dtype`, and scale parameters.
+- `ot::freetile::plan_v5e_tile_gemm(desc)` produces a deterministic `LoweringPlan` with exact VMEM buffer map (`0x000..0x1f0`), K-loop double-buffer footprint, HBM DMA traffic estimate (including 1 KiB scale tile loads per `(m_tile, n_tile, k_tile)` iteration and 36 KiB constant loads per launch chunk when quantized), and dispatch entry point (`ot::emit_v5e_imem_for_freetile(plan)`).
+- `ot_matmul_quant` accepts either split weights + separate `rhs_scales` (element type explicitly controlled by `desc->scale_dtype`: `OT_DTYPE_BF16` or `OT_DTYPE_F32`) or inline interleaved `ot_block_q8_0_t` / `ot_block_q4_0_t` records (`rhs_scales == NULL` for `Q8_0`/`Q4_0` `BLOCK_32`). `OT_DTYPE_Q4_K` and `OT_QUANT_BLOCK_256` are reserved and return `OT_ERR_UNSUPPORTED`.
 
 ### Launch Descriptor (`OtV5eLaunchDesc` at HBM `0x3fff00000`)
 

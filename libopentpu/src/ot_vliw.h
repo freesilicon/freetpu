@@ -1302,7 +1302,6 @@ inline std::vector<VliwBundle> emit_v5e_imem_for_freetile(
     case ot::freetile::DType::kQ8_0:
       return emit_v5e_resident_freetile_quant_imem(/*is_q4=*/false);
     case ot::freetile::DType::kQ4_0:
-    case ot::freetile::DType::kQ4_K:
       return emit_v5e_resident_freetile_quant_imem(/*is_q4=*/true);
     case ot::freetile::DType::kBf16:
     default:

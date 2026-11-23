@@ -6,6 +6,7 @@
 
 #include "opentpu.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -13,6 +14,33 @@
 
 namespace ot {
 namespace freetile {
+
+static constexpr uint32_t kV5eMaxItersPerLaunch = 1024u;
+static constexpr uint64_t kV5eQuantScaleTileDmaBytes = 1024ULL;
+static constexpr uint64_t kV5eQuantConstChunkDmaBytes = 36864ULL;
+
+inline uint32_t count_v5e_launch_chunks(uint32_t m_tiles, uint32_t k_tiles, uint32_t n_tiles,
+                                        uint32_t max_iters_per_launch = kV5eMaxItersPerLaunch) {
+  if (m_tiles == 0u || k_tiles == 0u || n_tiles == 0u || max_iters_per_launch == 0u) return 0u;
+  const uint32_t m_step =
+      (k_tiles >= max_iters_per_launch)
+          ? 1u
+          : std::min(m_tiles, std::max(1u, max_iters_per_launch / k_tiles));
+  const uint32_t n_step_base =
+      (k_tiles >= max_iters_per_launch) ? 1u : std::max(1u, max_iters_per_launch / k_tiles);
+  uint32_t chunks = 0u;
+  for (uint32_t ms = 0u; ms < m_tiles;) {
+    const uint32_t m_chunk = std::min(m_step, m_tiles - ms);
+    const uint32_t n_max_for_m = std::max(1u, n_step_base / m_chunk);
+    for (uint32_t ns = 0u; ns < n_tiles;) {
+      const uint32_t n_chunk = std::min(n_max_for_m, n_tiles - ns);
+      ++chunks;
+      ns += n_chunk;
+    }
+    ms += m_chunk;
+  }
+  return chunks;
+}
 
 enum class OpKind : uint8_t {
   kMatmul = 0,
@@ -40,6 +68,7 @@ struct QuantSpec {
   ot_quant_mode_t mode = OT_QUANT_NONE;
   uint32_t group_size = 0u;
   float per_tensor_scale = 1.0f;
+  DType scale_dtype = DType::kF32;
 };
 
 struct TileKernelDescriptor {
@@ -73,6 +102,7 @@ struct TileKernelDescriptor {
     d.quant.mode = static_cast<ot_quant_mode_t>(c.quant_mode);
     d.quant.group_size = c.quant_group_size;
     d.quant.per_tensor_scale = c.quant_scale;
+    d.quant.scale_dtype = static_cast<DType>(c.scale_dtype);
     return d;
   }
 };
@@ -122,6 +152,15 @@ inline LoweringPlan plan_v5e_tile_gemm(const TileKernelDescriptor& desc) {
     plan.error = "v5e tile GEMM requires BF16 activations and outputs";
     return plan;
   }
+  if (desc.rhs_dtype == DType::kQ4_K || desc.quant.mode == OT_QUANT_BLOCK_256) {
+    plan.error = "Q4_K / BLOCK_256 is reserved and not yet supported";
+    return plan;
+  }
+  if (desc.rhs_dtype != DType::kBf16 && desc.rhs_dtype != DType::kInt8 &&
+      desc.rhs_dtype != DType::kQ8_0 && desc.rhs_dtype != DType::kQ4_0) {
+    plan.error = "Unsupported RHS dtype for v5e tile GEMM";
+    return plan;
+  }
 
   plan.tiles_m = desc.m_dim / bm;
   plan.tiles_k = desc.k_dim / bk;
@@ -133,7 +172,7 @@ inline LoweringPlan plan_v5e_tile_gemm(const TileKernelDescriptor& desc) {
   size_t rhs_elem_den = 1u;
   if (desc.rhs_dtype == DType::kInt8 || desc.rhs_dtype == DType::kQ8_0) {
     rhs_elem_num = 1u;
-  } else if (desc.rhs_dtype == DType::kQ4_0 || desc.rhs_dtype == DType::kQ4_K) {
+  } else if (desc.rhs_dtype == DType::kQ4_0) {
     rhs_elem_num = 1u;
     rhs_elem_den = 2u;
   }
@@ -155,11 +194,22 @@ inline LoweringPlan plan_v5e_tile_gemm(const TileKernelDescriptor& desc) {
   const uint64_t b_bytes = (static_cast<uint64_t>(desc.k_dim) * desc.n_dim * rhs_elem_num) / rhs_elem_den;
   const uint64_t c_bytes = static_cast<uint64_t>(desc.m_dim) * desc.n_dim * 2ULL;
   // Total HBM traffic across (tiles_m x tiles_n) output tiles streaming K:
-  // each output tile streams K of A and K of B, then writes 128x128 C.
-  plan.hbm_bytes_moved =
+  // each output tile streams K of A and K of B (plus 1 KiB scale tile per
+  // M/N/K iteration and 36 KiB constants per launch chunk when quantized),
+  // then writes 128x128 C.
+  uint64_t hbm_total =
       static_cast<uint64_t>(plan.tiles_n) * a_bytes +
       static_cast<uint64_t>(plan.tiles_m) * b_bytes +
       c_bytes;
+  if (desc.rhs_dtype != DType::kBf16) {
+    const uint64_t tile_iters =
+        static_cast<uint64_t>(plan.tiles_m) * plan.tiles_n * plan.tiles_k;
+    const uint32_t chunks =
+        count_v5e_launch_chunks(plan.tiles_m, plan.tiles_k, plan.tiles_n, kV5eMaxItersPerLaunch);
+    hbm_total += tile_iters * kV5eQuantScaleTileDmaBytes +
+                 static_cast<uint64_t>(chunks) * kV5eQuantConstChunkDmaBytes;
+  }
+  plan.hbm_bytes_moved = hbm_total;
   plan.valid = true;
   return plan;
 }

@@ -656,7 +656,7 @@ bool run_pjrt_api_proof(void* lib, bool mock_mode, int num_runs) {
   return ok && maps_ok;
 }
 
-bool run_freetile_proof(void* lib, bool mock_mode, bool do_multitile, bool do_quant) {
+bool run_freetile_proof(void* lib, bool mock_mode, bool do_multitile, bool do_quant, int num_runs) {
   using fn_config_default_t = ot_config_t (*)(void);
   using fn_context_create_t = ot_status_t (*)(const ot_config_t*, ot_context_t**);
   using fn_context_destroy_t = void (*)(ot_context_t*);
@@ -701,10 +701,30 @@ bool run_freetile_proof(void* lib, bool mock_mode, bool do_multitile, bool do_qu
     return false;
   }
 
+  const int measured_runs = (num_runs > 0) ? num_runs : 1;
   bool ok = true;
-  auto calc_gbps = [](uint64_t bytes, uint64_t us) -> double {
-    if (us == 0) return 0.0;
-    return static_cast<double>(bytes) / (static_cast<double>(us) * 1e3);
+  auto calc_gbps = [](uint64_t bytes, double us) -> double {
+    if (us <= 0.0) return 0.0;
+    return static_cast<double>(bytes) / (us * 1e3);
+  };
+  struct TimingSummary {
+    uint64_t min_us = 0;
+    double med_us = 0.0;
+    double mean_us = 0.0;
+  };
+  auto summarize_us = [](std::vector<uint64_t> vals) -> TimingSummary {
+    TimingSummary s{};
+    if (vals.empty()) return s;
+    std::sort(vals.begin(), vals.end());
+    s.min_us = vals.front();
+    const size_t n = vals.size();
+    s.med_us = (n & 1u)
+        ? static_cast<double>(vals[n / 2u])
+        : (0.5 * static_cast<double>(vals[n / 2u - 1u] + vals[n / 2u]));
+    double sum = 0.0;
+    for (uint64_t v : vals) sum += static_cast<double>(v);
+    s.mean_us = sum / static_cast<double>(n);
+    return s;
   };
 
   if (do_multitile) {
@@ -734,16 +754,27 @@ bool run_freetile_proof(void* lib, bool mock_mode, bool do_multitile, bool do_qu
           p_buffer_h2d(ctx, bb, b.data(), b.size() * 2u) != OT_OK) {
         fprintf(stderr, "[FREETILE_BF16] HBM setup failed for %ux%ux%u: %s\n",
                 s.m, s.k, s.n, p_last_error ? p_last_error(ctx) : "");
+        p_buffer_free(bc); p_buffer_free(bb); p_buffer_free(ba);
         ok = false;
         break;
       }
 
       const ot_freetile_gemm_desc_t desc = p_desc_default(s.m, s.k, s.n);
       ot_exec_stats_t stats{};
-      // Warm + measure.
-      if (p_matmul_bf16_ex(ctx, ba, bb, bc, &desc, &stats) != OT_OK ||
-          p_matmul_bf16_ex(ctx, ba, bb, bc, &desc, &stats) != OT_OK ||
-          p_buffer_d2h(ctx, bc, c.data(), c.size() * 2u) != OT_OK) {
+      // 1 warmup + `measured_runs` timed executions.
+      bool exec_ok = (p_matmul_bf16_ex(ctx, ba, bb, bc, &desc, &stats) == OT_OK);
+      std::vector<uint64_t> hw_runs;
+      std::vector<uint64_t> wall_runs;
+      hw_runs.reserve(static_cast<size_t>(measured_runs));
+      wall_runs.reserve(static_cast<size_t>(measured_runs));
+      for (int r = 0; exec_ok && r < measured_runs; ++r) {
+        exec_ok = (p_matmul_bf16_ex(ctx, ba, bb, bc, &desc, &stats) == OT_OK);
+        if (exec_ok) {
+          hw_runs.push_back(stats.hw_us);
+          wall_runs.push_back(stats.wall_us);
+        }
+      }
+      if (!exec_ok || p_buffer_d2h(ctx, bc, c.data(), c.size() * 2u) != OT_OK) {
         fprintf(stderr, "[FREETILE_BF16] exec failed for %ux%ux%u: %s\n",
                 s.m, s.k, s.n, p_last_error ? p_last_error(ctx) : "");
         p_buffer_free(bc); p_buffer_free(bb); p_buffer_free(ba);
@@ -764,13 +795,15 @@ bool run_freetile_proof(void* lib, bool mock_mode, bool do_multitile, bool do_qu
         }
       }
       CompareResult cmp = compare_bf16(c, ref);
-      printf("[FREETILE_BF16] %ux%ux%u tiles=(%u,%u,%u) mismatches=%zu/%zu max_diff=%.6f "
-             "hw_us=%llu wall_us=%llu hbm_gbps=%.2f\n",
-             s.m, s.k, s.n, stats.tiles_m, stats.tiles_k, stats.tiles_n,
+      const TimingSummary hw_sum = summarize_us(hw_runs);
+      const TimingSummary wall_sum = summarize_us(wall_runs);
+      printf("[FREETILE_BF16] %ux%ux%u runs=%d tiles=(%u,%u,%u) mismatches=%zu/%zu max_diff=%.6f "
+             "hw_us(min/med/mean)=%llu/%.1f/%.1f wall_us(min/med/mean)=%llu/%.1f/%.1f hbm_gbps=%.2f\n",
+             s.m, s.k, s.n, measured_runs, stats.tiles_m, stats.tiles_k, stats.tiles_n,
              cmp.mismatches, ref.size(), cmp.max_diff,
-             static_cast<unsigned long long>(stats.hw_us),
-             static_cast<unsigned long long>(stats.wall_us),
-             calc_gbps(stats.hbm_bytes_moved, stats.hw_us));
+             static_cast<unsigned long long>(hw_sum.min_us), hw_sum.med_us, hw_sum.mean_us,
+             static_cast<unsigned long long>(wall_sum.min_us), wall_sum.med_us, wall_sum.mean_us,
+             calc_gbps(stats.hbm_bytes_moved, hw_sum.med_us));
       if (cmp.mismatches != 0) {
         fprintf(stderr, "BF16 mismatch first idx=%zu got=0x%04x ref=0x%04x\n",
                 cmp.first_bad_idx, cmp.first_got, cmp.first_ref);
@@ -824,6 +857,7 @@ bool run_freetile_proof(void* lib, bool mock_mode, bool do_multitile, bool do_qu
           p_buffer_h2d(ctx, bqsc, sc.data(), sc.size() * sizeof(float)) != OT_OK) {
         fprintf(stderr, "[FREETILE_QUANT:%s] HBM setup failed: %s\n",
                 qc.label, p_last_error ? p_last_error(ctx) : "");
+        p_buffer_free(bqout); p_buffer_free(bqsc); p_buffer_free(bqq); p_buffer_free(bqa);
         ok = false;
         break;
       }
@@ -832,11 +866,23 @@ bool run_freetile_proof(void* lib, bool mock_mode, bool do_multitile, bool do_qu
       desc.rhs_dtype = qc.rhs_dtype;
       desc.quant_mode = qc.qmode;
       desc.quant_group_size = OT_QK8_0;
+      desc.scale_dtype = OT_DTYPE_F32;
       ot_exec_stats_t stats{};
       std::vector<uint16_t> out_c(static_cast<size_t>(qc.m) * qc.n, 0u);
-      if (p_matmul_quant(ctx, bqa, bqq, bqsc, bqout, &desc, &stats) != OT_OK ||
-          p_matmul_quant(ctx, bqa, bqq, bqsc, bqout, &desc, &stats) != OT_OK ||
-          p_buffer_d2h(ctx, bqout, out_c.data(), out_c.size() * 2u) != OT_OK) {
+      // 1 warmup + `measured_runs` timed executions.
+      bool exec_ok = (p_matmul_quant(ctx, bqa, bqq, bqsc, bqout, &desc, &stats) == OT_OK);
+      std::vector<uint64_t> hw_runs;
+      std::vector<uint64_t> wall_runs;
+      hw_runs.reserve(static_cast<size_t>(measured_runs));
+      wall_runs.reserve(static_cast<size_t>(measured_runs));
+      for (int r = 0; exec_ok && r < measured_runs; ++r) {
+        exec_ok = (p_matmul_quant(ctx, bqa, bqq, bqsc, bqout, &desc, &stats) == OT_OK);
+        if (exec_ok) {
+          hw_runs.push_back(stats.hw_us);
+          wall_runs.push_back(stats.wall_us);
+        }
+      }
+      if (!exec_ok || p_buffer_d2h(ctx, bqout, out_c.data(), out_c.size() * 2u) != OT_OK) {
         fprintf(stderr, "[FREETILE_QUANT:%s] exec failed: %s\n",
                 qc.label, p_last_error ? p_last_error(ctx) : "");
         p_buffer_free(bqout); p_buffer_free(bqsc); p_buffer_free(bqq); p_buffer_free(bqa);
@@ -857,12 +903,14 @@ bool run_freetile_proof(void* lib, bool mock_mode, bool do_multitile, bool do_qu
         }
       }
       CompareResult cmp = compare_bf16(out_c, ref);
-      printf("[FREETILE_QUANT:%s] %ux%ux%u mismatches=%zu/%zu max_diff=%.6f "
-             "hw_us=%llu wall_us=%llu hbm_gbps=%.2f\n",
-             qc.label, qc.m, qc.k, qc.n, cmp.mismatches, ref.size(), cmp.max_diff,
-             static_cast<unsigned long long>(stats.hw_us),
-             static_cast<unsigned long long>(stats.wall_us),
-             calc_gbps(stats.hbm_bytes_moved, stats.hw_us));
+      const TimingSummary hw_sum = summarize_us(hw_runs);
+      const TimingSummary wall_sum = summarize_us(wall_runs);
+      printf("[FREETILE_QUANT:%s] %ux%ux%u runs=%d mismatches=%zu/%zu max_diff=%.6f "
+             "hw_us(min/med/mean)=%llu/%.1f/%.1f wall_us(min/med/mean)=%llu/%.1f/%.1f hbm_gbps=%.2f\n",
+             qc.label, qc.m, qc.k, qc.n, measured_runs, cmp.mismatches, ref.size(), cmp.max_diff,
+             static_cast<unsigned long long>(hw_sum.min_us), hw_sum.med_us, hw_sum.mean_us,
+             static_cast<unsigned long long>(wall_sum.min_us), wall_sum.med_us, wall_sum.mean_us,
+             calc_gbps(stats.hbm_bytes_moved, hw_sum.med_us));
       if (cmp.mismatches != 0) ok = false;
       p_buffer_free(bqout); p_buffer_free(bqsc); p_buffer_free(bqq); p_buffer_free(bqa);
     }
@@ -909,7 +957,9 @@ int main(int argc, char** argv) {
   printf("Loaded libopentpu via dlopen: %s\n", resolved.c_str());
 
   bool c_ok = run_c_api_proof(lib_a, mock_mode, num_runs);
-  bool ft_ok = (!do_multitile && !do_quant) ? true : run_freetile_proof(lib_a, mock_mode, do_multitile, do_quant);
+  bool ft_ok = (!do_multitile && !do_quant)
+      ? true
+      : run_freetile_proof(lib_a, mock_mode, do_multitile, do_quant, num_runs);
   bool maps_a_ok = check_maps_clean("C_API_DONE", mock_mode);
   dlclose(lib_a);
   if (!c_ok || !ft_ok || !maps_a_ok) return 3;

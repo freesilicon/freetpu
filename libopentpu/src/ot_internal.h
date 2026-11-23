@@ -109,6 +109,8 @@ struct VfioTransport {
   uint32_t sq_seq = 0;
   bool ring_ready = false;
   bool dma_faulted = false;
+  bool last_op_timed_out = false;
+  bool mock_exec_timeout = false;
   int64_t owner_pid = 0;
 
   bool is_owner_process() const;
@@ -182,6 +184,7 @@ ot_status_t buffer_d2h_tiled_128x128_bf16(ot_context_t* ctx, const ot_buffer_t* 
                                           void* host_dst_tiled);
 uint64_t context_hbm_used_bytes(const ot_context_t* ctx);
 bool validate_cq_completion(uint32_t sent_seq, const uint32_t cq[8], std::string* err);
+ot_status_t classify_transport_error(bool last_op_timed_out, bool dma_faulted);
 // Static allocation-free PJRT_Error fallback used when error allocation fails.
 void* pjrt_static_fallback_error_raw(uint32_t error_code);
 

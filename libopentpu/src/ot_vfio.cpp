@@ -1117,6 +1117,7 @@ bool validate_cq_completion(uint32_t sent_seq, const uint32_t cq[8], std::string
 
 bool VfioTransport::submit_sq_wait(const uint32_t desc[32], uint32_t timeout_ms,
                                    uint32_t cq_out[8], std::string* err) {
+  last_op_timed_out = false;
   if (!is_mock && !is_owner_process()) {
     if (err) *err = "VFIO context cannot be used in a forked child process";
     return false;
@@ -1208,6 +1209,7 @@ bool VfioTransport::submit_sq_wait(const uint32_t desc[32], uint32_t timeout_ms,
   }
 
   quiesce_on_unverified_dma();
+  last_op_timed_out = true;
   if (err) {
     *err = "SQ doorbell timeout waiting for completion seq=" + std::to_string(sent_seq) +
            " (device quiesced; recreate context)";
@@ -1304,7 +1306,9 @@ bool VfioTransport::submit_core_ctrl(uint32_t ctrl_word, uint32_t timeout_ms,
 
 bool VfioTransport::submit_exec_sync(uint32_t expected_exec_seq, uint32_t timeout_ms,
                                      uint32_t cq_out[8], std::string* err) {
-  if (is_mock) {
+  last_op_timed_out = false;
+  uint32_t local_cq[8] = {};
+  if (is_mock && !mock_exec_timeout) {
     if (cq_out) {
       std::memset(cq_out, 0, 32);
       cq_out[4] = 1u;
@@ -1312,48 +1316,56 @@ bool VfioTransport::submit_exec_sync(uint32_t expected_exec_seq, uint32_t timeou
     }
     return true;
   }
-  uint32_t d[32] = {};
-  d[1] = kSqOpcodeExec;
-  d[8] = kExecOpW8;
-  d[10] = kExecOpW10;
-  uint32_t local_cq[8] = {};
-  const auto timeout = std::chrono::milliseconds(timeout_ms ? timeout_ms : 5000u);
-  const auto deadline = std::chrono::steady_clock::now() + timeout;
-  for (;;) {
-    std::memset(local_cq, 0, sizeof(local_cq));
-    if (!submit_sq_wait(d, timeout_ms, local_cq, err)) {
-      return false;
-    }
-    if (local_cq[4] == 1u && local_cq[5] == expected_exec_seq) {
-      if (cq_out) {
-        std::memcpy(cq_out, local_cq, sizeof(local_cq));
+  if (!is_mock) {
+    uint32_t d[32] = {};
+    d[1] = kSqOpcodeExec;
+    d[8] = kExecOpW8;
+    d[10] = kExecOpW10;
+    const auto timeout = std::chrono::milliseconds(timeout_ms ? timeout_ms : 5000u);
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    for (;;) {
+      std::memset(local_cq, 0, sizeof(local_cq));
+      const auto now = std::chrono::steady_clock::now();
+      const auto rem_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+      const uint32_t sq_timeout_ms = (rem_ms > 0) ? static_cast<uint32_t>(rem_ms) : 1u;
+      if (!submit_sq_wait(d, sq_timeout_ms, local_cq, err)) {
+        return false;
       }
-      return true;
-    }
-    if (std::chrono::steady_clock::now() >= deadline) {
-      break;
-    }
+      if (local_cq[4] == 1u && local_cq[5] == expected_exec_seq) {
+        if (cq_out) {
+          std::memcpy(cq_out, local_cq, sizeof(local_cq));
+        }
+        return true;
+      }
+      if (std::chrono::steady_clock::now() >= deadline) {
+        break;
+      }
 #ifdef __linux__
-    ::usleep(25);
+      ::usleep(25);
 #endif
+    }
   }
   if (cq_out) {
     std::memcpy(cq_out, local_cq, sizeof(local_cq));
   }
   dma_faulted = true;
+  last_op_timed_out = true;
   ring_ready = false;
   imem_booted = false;
 #ifdef __linux__
-  if (bar0_mmio && bar0_mapped_len >= 0x12000u) {
-    write32_bar0(0x10000u, 0u);
-    write32_bar0(0x10040u, 0u);
-  }
-  if (device_fd >= 0) {
-    (void)::ioctl(device_fd, VFIO_DEVICE_RESET);
+  if (!is_mock) {
+    if (bar0_mmio && bar0_mapped_len >= 0x12000u) {
+      write32_bar0(0x10000u, 0u);
+      write32_bar0(0x10040u, 0u);
+    }
+    if (device_fd >= 0) {
+      (void)::ioctl(device_fd, VFIO_DEVICE_RESET);
+    }
   }
 #endif
   if (err) {
-    *err = "EXEC completion mismatch: cq[4]=" + std::to_string(local_cq[4]) +
+    *err = "EXEC completion timeout: cq[4]=" + std::to_string(local_cq[4]) +
            " cq[5]=" + std::to_string(local_cq[5]) +
            " expected=" + std::to_string(expected_exec_seq) +
            " (device quiesced; recreate context)";
