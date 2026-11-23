@@ -24,12 +24,12 @@ Executed lazily on the first live `ot_matmul_bf16` call (idempotent across calls
 
 ### 1.2 Per-Call Matmul Dispatch (`ot_matmul_bf16` & `GetPjrtApi`)
 
-1. **HBM `{1,0:T(2,128)}` Tensor Layout Management**:
-   - The v5e MXU kernel operates on `{1,0:T(2,128)}` pair-major BF16 tiles (`tiled_u16_idx(r, c) = (r >> 1) * 256 + c * 2 + (r & 1)`).
+1. **HBM `{1,0:T(2,128)(2,1)}` Tensor Layout Management**:
+   - The v5e MXU kernel operates on `{1,0:T(2,128)(2,1)}` pair-major BF16 tiles (`tiled_u16_idx(r, c) = (r >> 1) * 256 + c * 2 + (r & 1)`).
    - Every `ot_buffer_t` tracks its current on-device layout (`BufferLayout::kRaw` vs `BufferLayout::kTiled2x128Bf16`).
-   - `ot_pjrt.cpp` (`PJRT_Client_BufferFromHostBuffer`) uploads `128x128` BF16 tensors directly in `{1,0:T(2,128)}` layout (`ot::buffer_h2d_tiled_128x128_bf16`), avoiding any repack DMA during `PJRT_LoadedExecutable_Execute`.
-   - Raw C API buffers uploaded via `ot_buffer_h2d` (`kRaw`) are repacked into persistent 32 KiB HBM scratch slots (`scratch_lhs_hbm` / `scratch_rhs_hbm`) without mutating `const` inputs. In-place aliasing (`out == lhs` or `out == rhs`) also isolates inputs into scratch, while self-multiply (`lhs == rhs`) shares a single tiled HBM address.
-   - Outputs are written directly in `{1,0:T(2,128)}` layout and marked `kTiled2x128Bf16`, allowing chained device-resident matmuls `(A @ B) @ D` with zero intermediate repack and transparent row-major unpacking in `ot_buffer_d2h` / `PJRT_Buffer_ToHostBuffer`.
+   - `ot_pjrt.cpp` (`PJRT_Client_BufferFromHostBuffer`) keeps default uploads (`device_layout == nullptr`) dense major-to-minor (`kRaw`, per PJRT contract) and uploads `128x128` BF16 tensors directly in native `{1,0:T(2,128)(2,1)}` layout (`ot::buffer_h2d_tiled_128x128_bf16`) when callers explicitly request `{1,0:T(2,128)(2,1)}` in `device_layout` (for contiguous host inputs), avoiding any repack DMA during `PJRT_LoadedExecutable_Execute`. `PJRT_Buffer_GetMemoryLayout` reports the exact matching repeated-tiling descriptor `{1,0:T(2,128)(2,1)}` for tiled buffers and untiled `{1,0}` for raw buffers.
+   - Raw C API buffers uploaded via `ot_buffer_h2d` (`kRaw`) and dense PJRT buffers are repacked into lazily allocated 32 KiB HBM scratch slots (`scratch_lhs_hbm` / `scratch_rhs_hbm`) without mutating `const` inputs. In-place aliasing (`out == lhs` or `out == rhs`) also isolates inputs into scratch, while self-multiply (`lhs == rhs`) shares a single tiled HBM address.
+   - Outputs are written directly in `{1,0:T(2,128)(2,1)}` layout and marked `kTiled2x128Bf16`, allowing chained device-resident matmuls `(A @ B) @ D` with zero intermediate repack and transparent row-major unpacking in `ot_buffer_d2h` / `PJRT_Buffer_ToHostBuffer`.
 2. **Launch Descriptor (`OtV5eLaunchDesc`, `512 B` at `0x3fff00000`)**:
    - Monotonically increment `exec_seq` (`1, 2, 3, ...`, wrapping `0xffffffff -> 1`).
    - Four `uint32_t` words are causally consumed by the resident loop (`prog_hbm = 0`):

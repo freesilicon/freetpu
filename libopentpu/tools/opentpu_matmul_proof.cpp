@@ -393,8 +393,9 @@ bool run_c_api_proof(void* lib, bool mock_mode, int num_runs) {
     }
   }
 
+  bool maps_ok = check_maps_clean("C_API_ACTIVE", mock_mode);
   cleanup();
-  return ok;
+  return ok && maps_ok;
 }
 
 bool run_pjrt_api_proof(void* lib, bool mock_mode, int num_runs) {
