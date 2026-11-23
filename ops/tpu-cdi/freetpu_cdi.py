@@ -2199,7 +2199,7 @@ def validate_cdi_spec(spec: Any) -> List[str]:
                 edits_dict = dev["containerEdits"]
                 has_any_edit = any(
                     (isinstance(edits_dict.get(k), list) and len(edits_dict[k]) > 0)
-                    or (k == "intelRdt" and isinstance(edits_dict.get(k), dict) and len(edits_dict[k]) > 0)
+                    or (k == "intelRdt" and isinstance(edits_dict.get(k), dict))
                     for k in allowed_edits_keys
                 )
                 if not has_any_edit:
@@ -2760,6 +2760,63 @@ def _verify_spec_against_host_detailed(
                         f"device 'all': exposed VFIO groups {expected_live_bdfs} do not match "
                         f"all live host TPU chips {all_live_bdfs}"
                     )
+
+        # Revalidate any injected `TPU_VISIBLE_CHIPS` / `TPU_VISIBLE_DEVICES` env
+        # masks against live verified runtime ordinals for this selector's PCI BDFs
+        # so non-range slices whose chip IDs changed (e.g. `0,1,4,5` -> `2,3,6,7`)
+        # are detected as stale instead of remaining published.
+        injected_vis: Dict[str, str] = {}
+        for env_src in (
+            global_edits.get("env") if isinstance(global_edits, dict) else None,
+            edits.get("env") if isinstance(edits, dict) else None,
+        ):
+            if isinstance(env_src, list):
+                for entry in env_src:
+                    if isinstance(entry, str) and "=" in entry:
+                        ek, ev = entry.split("=", 1)
+                        if ek in ("TPU_VISIBLE_CHIPS", "TPU_VISIBLE_DEVICES"):
+                            injected_vis[ek] = ev.strip()
+
+        if injected_vis and expected_live_bdfs and all(
+            b in live_chips_by_bdf for b in expected_live_bdfs
+        ):
+            dev_live_chips = [live_chips_by_bdf[b] for b in expected_live_bdfs]
+            live_vis = _resolve_verified_visibility_ordinals(
+                dev_live_chips,
+                live_chips,
+                live_bdf_to_phys,
+                chip_id_map=chip_id_map,
+            )
+            uses_explicit_chip_map_env = ann.get("freetpu.dev/chip-id-source") == "chip-id-map"
+            if live_vis is not None:
+                exp_chips, exp_devs = live_vis
+                expected_env_map = {
+                    "TPU_VISIBLE_CHIPS": ",".join(str(x) for x in exp_chips),
+                    "TPU_VISIBLE_DEVICES": ",".join(str(x) for x in exp_devs),
+                }
+                for ek, injected_val in injected_vis.items():
+                    exp_val = expected_env_map[ek]
+                    if injected_val != exp_val:
+                        if chip_id_map is None and uses_explicit_chip_map_env:
+                            unverifiable.append(
+                                f"device {name!r}: injected {ek}={injected_val!r} was generated "
+                                "with --chip-id-map and cannot be verified without that map"
+                            )
+                        else:
+                            errors.append(
+                                f"device {name!r}: stale injected {ek}={injected_val!r} "
+                                f"(live host expects {exp_val!r})"
+                            )
+            elif chip_id_map is None:
+                unverifiable.append(
+                    f"device {name!r}: injected {', '.join(sorted(injected_vis))} cannot be "
+                    "verified without --chip-id-map (live host does not expose verifiable chip_id ordinals)"
+                )
+            else:
+                errors.append(
+                    f"device {name!r}: injected {', '.join(sorted(injected_vis))} cannot be "
+                    "verified against supplied --chip-id-map and live host topology"
+                )
 
         recorded_dev_dn = _parse_vfio_devnums_annotation(ann.get("freetpu.dev/vfio-devnums"))
         for cp in matched_group_paths:

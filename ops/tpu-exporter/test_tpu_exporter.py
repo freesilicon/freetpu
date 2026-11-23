@@ -3502,11 +3502,60 @@ TPU Runtime Utilization
                     runtime_metrics_addr="127.0.0.1:8431",
                     shm_root=iw_root / "no-shm",
                 )
-            # Logical cores 0..3 cover raw IDs 0 (cores 0,1) and 1 (cores 2,3),
-            # but NOT raw IDs 2 (cores 4,5) or 3 (cores 6,7) — MUST retain 2 & 3!
+            # Partial 4-row fallback on an 8-core Ironwood host cannot prove that
+            # upstream `tpu_info` positional zipping matched duty IDs to HBM core IDs;
+            # strip unverified fallback duty so no PCI device receives misattributed
+            # duty and all 4 raw gRPC readings remain preserved as unjoined.
+            self.assertTrue(all(d.duty_cycle_percent is None for d in iw_partial4_fb_snap.devices))
             self.assertEqual(
                 iw_partial4_fb_snap.runtime_unjoined_duty_cycle,
-                {"2": 62.5, "3": 87.5},
+                {"0": 12.5, "1": 37.5, "2": 62.5, "3": 87.5},
+            )
+
+            # Partial 2-row Ironwood fallback where upstream `get_chip_usage_new`
+            # positionally zipped HBM cores `{2, 3}` with chip duty `{0, 1}` MUST NOT
+            # publish chip 0/1 duty onto cores 2/3, while still preserving HBM `{2, 3}`!
+            def _partial_2row_cores23_cli(*args, **kwargs):
+                rows = _te.parse_tpu_info_output(
+                    "TPU Runtime Utilization\n"
+                    "| Chip | HBM Usage (GiB)       | Duty cycle |\n"
+                    "|------|-----------------------|------------|\n"
+                    "| 2    | 30.00 GiB / 96.00 GiB | 12.50%     |\n"
+                    "| 3    | 40.00 GiB / 96.00 GiB | 37.50%     |\n"
+                )
+                return True, None, rows
+
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.dict(_te._GRPC_CHANNELS, {}, clear=True),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "grpc": _FakeGrpc,
+                        "tpu_info": SimpleNamespace(),
+                        "tpu_info.proto": SimpleNamespace(),
+                        "tpu_info.proto.tpu_metric_service_pb2": fake_pb2,
+                        "tpu_info.proto.tpu_metric_service_pb2_grpc": SimpleNamespace(
+                            RuntimeMetricServiceStub=_IronwoodDutyOnlyNoHbmStub
+                        ),
+                    },
+                ),
+                mock.patch.object(_te, "_run_tpu_info", side_effect=_partial_2row_cores23_cli),
+            ):
+                iw_partial2_fb_snap = _te.collect_snapshot(
+                    sysfs_root=iw_sysfs,
+                    dev_root=iw_dev,
+                    proc_root=iw_proc,
+                    tpu_info_bin="tpu-info",
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=iw_root / "no-shm",
+                )
+            self.assertEqual(iw_partial2_fb_snap.devices[2].hbm_used_bytes, 30 * 1024**3)
+            self.assertEqual(iw_partial2_fb_snap.devices[3].hbm_used_bytes, 40 * 1024**3)
+            self.assertTrue(all(d.duty_cycle_percent is None for d in iw_partial2_fb_snap.devices))
+            self.assertEqual(
+                iw_partial2_fb_snap.runtime_unjoined_duty_cycle,
+                {"0": 12.5, "1": 37.5, "2": 62.5, "3": 87.5},
             )
             with (
                 _mock_vfio_char_lstat(),
@@ -3906,8 +3955,21 @@ TPU Runtime Utilization
             prom = tpu_exporter.format_prometheus_metrics(snap)
             self._assert_valid_prometheus_text(prom)
             self.assertIn("freetpu_tpu_shm_hbm_allocated_bytes{", prom)
-            self.assertIn("freetpu_tpu_mxu_active_cycles_total{", prom)
-            self.assertIn("freetpu_tpu_dma_bytes_transferred_total{", prom)
+            # Monotonic SHM counters MUST use stable PCI labels (no scan-order `chip`
+            # label) so losing a lower-index TPU never resets surviving counter series.
+            self.assertIn(
+                'freetpu_tpu_mxu_active_cycles_total{pci_bdf="0000:00:0b.0",device_id="0x006f",generation="v6e"} 987654321',
+                prom,
+            )
+            self.assertIn(
+                'freetpu_tpu_dma_bytes_transferred_total{pci_bdf="0000:00:0b.0",device_id="0x006f",generation="v6e"} 104857600',
+                prom,
+            )
+            for ln in prom.splitlines():
+                if ln.startswith(
+                    ("freetpu_tpu_mxu_active_cycles_total", "freetpu_tpu_dma_bytes_transferred_total")
+                ):
+                    self.assertNotIn('chip="', ln)
 
             # When an inventory-only `tpu-info` row or duty-cycle-only runtime sample omits
             # HBM usage on a device with known HBM capacity (32 GiB nominal v6e), SHM supplies

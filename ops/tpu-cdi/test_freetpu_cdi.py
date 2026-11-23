@@ -653,6 +653,27 @@ class FreeTpuCdiTests(unittest.TestCase):
             }
             self.assertEqual(freetpu_cdi.validate_cdi_spec(valid_pre11), [])
 
+        # Per CNCF CDI v1.1.0, a non-null empty `intelRdt: {}` object on a device
+        # counts as a valid edit (resetting global intelRdt settings).
+        empty_irdt_reset_spec = {
+            "cdiVersion": "1.1.0",
+            "kind": "freetpu.dev/tpu",
+            "containerEdits": {
+                "deviceNodes": [
+                    {"path": "/dev/vfio/vfio"},
+                    {"path": "/dev/vfio/0"},
+                ],
+                "intelRdt": {"closID": "tpu-global"},
+            },
+            "devices": [
+                {
+                    "name": "0",
+                    "containerEdits": {"intelRdt": {}},
+                }
+            ],
+        }
+        self.assertEqual(freetpu_cdi.validate_cdi_spec(empty_irdt_reset_spec), [])
+
     def test_rejects_vfio_group_with_non_tpu_devices_and_non_vfio_driver(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2783,6 +2804,95 @@ class FreeTpuCdiTests(unittest.TestCase):
                 )
                 self.assertEqual(rc_sw_withmap, 0, err_swwm)
                 self.assertTrue(swapped_spec_path.exists())
+
+                # Non-contiguous `--chip-id-map` (`0,1,4,5` on NUMA 0; `2,3,6,7` on NUMA 1)
+                # emits NO numeric range aliases, only `numa0-pcie-...` / `numa1-pcie-...`
+                # with injected `TPU_VISIBLE_CHIPS` / `TPU_VISIBLE_DEVICES`. When the map
+                # later changes (`0,1,4,5` -> `2,3,6,7`), `validate --check-host --remove-if-stale`
+                # with the updated map MUST detect stale injected visibility masks and unlink!
+                noncontig_map_a = {
+                    "0000:00:04.0": 0,
+                    "0000:00:05.0": 1,
+                    "0000:00:06.0": 4,
+                    "0000:00:07.0": 5,
+                    "0000:80:04.0": 2,
+                    "0000:80:05.0": 3,
+                    "0000:80:06.0": 6,
+                    "0000:80:07.0": 7,
+                }
+                noncontig_map_b = {
+                    "0000:00:04.0": 2,
+                    "0000:00:05.0": 3,
+                    "0000:00:06.0": 6,
+                    "0000:00:07.0": 7,
+                    "0000:80:04.0": 0,
+                    "0000:80:05.0": 1,
+                    "0000:80:06.0": 4,
+                    "0000:80:07.0": 5,
+                }
+                nc_map_a_file = swap_root / "nc-map-a.json"
+                nc_map_b_file = swap_root / "nc-map-b.json"
+                nc_map_a_file.write_text(json.dumps(noncontig_map_a), encoding="utf-8")
+                nc_map_b_file.write_text(json.dumps(noncontig_map_b), encoding="utf-8")
+                nc_spec_path = swap_root / "freetpu-noncontig.json"
+                rc_nc_gen, _o_nc, err_nc = _run_cli_inproc(
+                    [
+                        "generate",
+                        "--sysfs-root",
+                        str(swap_sysfs),
+                        "--dev-root",
+                        str(swap_dev),
+                        "--single-host-env",
+                        "--chip-id-map",
+                        str(nc_map_a_file),
+                        "--output",
+                        str(nc_spec_path),
+                        "--validate",
+                    ]
+                )
+                self.assertEqual(rc_nc_gen, 0, err_nc)
+                nc_loaded = json.loads(nc_spec_path.read_text(encoding="utf-8"))
+                nc_names = {d["name"] for d in nc_loaded["devices"]}
+                self.assertNotIn("0-3", nc_names)
+                self.assertNotIn("4-7", nc_names)
+                # Without --chip-id-map, preserve the live map-generated spec.
+                rc_nc_nomap, _o_ncnm, err_ncnm = _run_cli_inproc(
+                    [
+                        "validate",
+                        str(nc_spec_path),
+                        "--check-host",
+                        "--remove-if-stale",
+                        "--sysfs-root",
+                        str(swap_sysfs),
+                        "--dev-root",
+                        str(swap_dev),
+                    ]
+                )
+                self.assertNotEqual(rc_nc_nomap, 0)
+                self.assertIn("Preserved live CDI spec", err_ncnm)
+                self.assertTrue(nc_spec_path.exists())
+                # With the UPDATED map (2,3,6,7 on NUMA 0), stale injected masks MUST
+                # fail validation AND unlink the stale spec!
+                rc_nc_stale, _o_ncs, err_ncs = _run_cli_inproc(
+                    [
+                        "validate",
+                        str(nc_spec_path),
+                        "--check-host",
+                        "--remove-if-stale",
+                        "--chip-id-map",
+                        str(nc_map_b_file),
+                        "--sysfs-root",
+                        str(swap_sysfs),
+                        "--dev-root",
+                        str(swap_dev),
+                    ]
+                )
+                self.assertNotEqual(rc_nc_stale, 0)
+                self.assertIn("stale injected TPU_VISIBLE_CHIPS", err_ncs)
+                self.assertFalse(
+                    nc_spec_path.exists(),
+                    "must unlink stale CDI spec when injected TPU_VISIBLE_CHIPS/DEVICES no longer match --chip-id-map",
+                )
 
                 # If publication-time host verification fails, BOTH `generate --validate`
                 # and `reconcile_cdi_spec` MUST fail closed and remove any stale spec file!

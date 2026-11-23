@@ -2041,6 +2041,63 @@ def _has_complete_utilization(rows: Dict[str, _TpuInfoRow]) -> bool:
     return all(_row_has_complete_utilization(r) for r in util_rows)
 
 
+def _sanitize_fallback_duty_rows(
+    rows: Dict[str, _TpuInfoRow],
+    devices: Sequence[TpuTelemetry],
+) -> Dict[str, _TpuInfoRow]:
+    """Strip unverified fallback `duty_cycle_percent` joins on multi-core-per-chip hosts.
+
+    Upstream `tpu_info.metrics.get_chip_usage_new` (used on Ironwood `V7X` by
+    both the `tpu-info` CLI and Python API) sorts HBM and duty-cycle replies
+    separately and zips them by position without checking that IDs match. On
+    `devices_per_chip > 1` (or unknown-generation) hosts, accept fallback
+    `duty_cycle_percent` ONLY when fallback covers the full contiguous verified
+    host core set (`0..verified_chips * devices_per_chip - 1`), where equal-
+    length positional zipping is provably 1:1. For partial/subset replies (e.g.
+    HBM cores `{2,3}` zipped against chip duty `{0,1}`), preserve HBM fields
+    and leave `duty_cycle_percent` unset so raw gRPC duty stays unjoined
+    instead of being misattributed to the wrong PCI device.
+    """
+    if not rows:
+        return rows
+    inferred_dpc = _infer_devices_per_chip(devices)
+    if inferred_dpc == 1:
+        return rows
+
+    expected_core_count: Optional[int] = None
+    if inferred_dpc is not None and inferred_dpc > 1:
+        verified_chips = _verified_dual_function_chip_count(devices, inferred_dpc)
+        if verified_chips is not None:
+            expected_core_count = verified_chips * inferred_dpc
+        else:
+            known_gens = {
+                d.generation
+                for d in devices
+                if d.generation in _GEN_DEVICES_PER_CHIP
+            }
+            if known_gens and known_gens <= {"v2", "v3", "v2-v3"} and len(devices) >= 4:
+                expected_core_count = len(devices) * inferred_dpc
+
+    if expected_core_count is not None:
+        duty_ids = {
+            pid
+            for k, r in rows.items()
+            if r.in_util_table and r.duty_cycle_percent is not None
+            for pid in (_parse_runtime_device_id(k),)
+            if pid is not None
+        }
+        if duty_ids == set(range(expected_core_count)):
+            return rows
+
+    sanitized: Dict[str, _TpuInfoRow] = {}
+    for k, r in rows.items():
+        copied = _copy_tpu_info_row(r)
+        if copied.duty_cycle_percent is not None:
+            copied.duty_cycle_percent = None
+        sanitized[k] = copied
+    return sanitized
+
+
 def _tag_row_sources(rows: Dict[str, _TpuInfoRow], source_label: str) -> Dict[str, _TpuInfoRow]:
     """Attach `source_label` provenance to rows returned by a telemetry backend."""
     tagged: Dict[str, _TpuInfoRow] = {}
@@ -2280,6 +2337,7 @@ def collect_snapshot(
                     timeout_s=remaining_s,
                 )
                 if py_ok:
+                    py_rows = _sanitize_fallback_duty_rows(py_rows, devices)
                     py_rows = _tag_row_sources(py_rows, "tpu-info-python")
                     parsed_rows = (
                         _merge_runtime_rows(parsed_rows, py_rows, prefer_base=True)
@@ -2329,6 +2387,7 @@ def collect_snapshot(
                 timeout_s=remaining_s,
             )
             if cli_ok:
+                cli_rows = _sanitize_fallback_duty_rows(cli_rows, devices)
                 cli_rows = _tag_row_sources(cli_rows, "tpu-info")
                 tpu_info_ok = True
                 tpu_info_err = None
@@ -2352,6 +2411,7 @@ def collect_snapshot(
                     timeout_s=remaining_s,
                 )
                 if py_ok:
+                    py_rows = _sanitize_fallback_duty_rows(py_rows, devices)
                     py_rows = _tag_row_sources(py_rows, "tpu-info-python")
                     parsed_rows = (
                         _merge_runtime_rows(parsed_rows, py_rows, prefer_base=True)
@@ -2638,24 +2698,24 @@ def format_prometheus_metrics(snapshot: ExporterSnapshot) -> str:
             hbm_bw_samples.append((base_labels, _fmt_float(d.hbm_bandwidth_utilization_percent)))
         if d.duty_cycle_percent is not None:
             duty_samples.append((base_labels, _fmt_float(d.duty_cycle_percent)))
-        # Monotonic PCIe AER hardware error counters MUST NOT include scan-order
-        # `chip` (or dynamic VFIO labels) so losing a lower-index TPU never resets
-        # surviving series identity and breaks `increase(freetpu_pcie_aer_fatal_total[5m])`.
-        aer_labels = {
+        # Monotonic hardware and SHM counters MUST NOT include scan-order `chip`
+        # (or dynamic VFIO labels) so losing a lower-index TPU never resets
+        # surviving series identity and breaks `rate()` / `increase()`.
+        stable_counter_labels = {
             "pci_bdf": d.pci_bdf,
             "device_id": d.device_id,
             "generation": d.generation,
         }
         if d.aer_correctable_total is not None:
-            aer_corr_samples.append((aer_labels, str(d.aer_correctable_total)))
+            aer_corr_samples.append((stable_counter_labels, str(d.aer_correctable_total)))
         if d.aer_fatal_total is not None:
-            aer_fatal_samples.append((aer_labels, str(d.aer_fatal_total)))
+            aer_fatal_samples.append((stable_counter_labels, str(d.aer_fatal_total)))
         if d.shm_hbm_allocated_bytes is not None:
             shm_hbm_alloc_samples.append((base_labels, str(d.shm_hbm_allocated_bytes)))
         if d.mxu_active_cycles is not None:
-            mxu_cycles_samples.append((base_labels, str(d.mxu_active_cycles)))
+            mxu_cycles_samples.append((stable_counter_labels, str(d.mxu_active_cycles)))
         if d.dma_bytes_transferred is not None:
-            dma_bytes_samples.append((base_labels, str(d.dma_bytes_transferred)))
+            dma_bytes_samples.append((stable_counter_labels, str(d.dma_bytes_transferred)))
 
         if d.pid_telemetry_available:
             pid_count_samples.append((base_labels, str(len(d.active_pids))))
