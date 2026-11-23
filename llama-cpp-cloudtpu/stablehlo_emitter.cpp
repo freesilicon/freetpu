@@ -1391,14 +1391,25 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                     (idx_raw.dtype == PjrtDType::S64) ? PjrtDType::S64 : PjrtDType::S32;
                 // Single-token decode fast path: emit O(1) in-place dynamic_update_slice instead of
                 // scatter when updating a single contiguous row slice across all batches/heads.
+                // Guard out-of-range indices (< 0 or >= n_rows) by selecting the existing row at
+                // the clamped destination before the update, matching scatter's discard semantics
+                // while keeping dynamic_update_slice as the sole final user of tbl for in-place donation.
                 if (N_upd == 1 && idx_raw.dims[0] == 1 && idx_raw.dims[1] == 1 &&
                     idx_raw.dims[2] == 1 && idx_raw.dims[3] == 1 &&
                     upd.dims[0] == tbl.dims[0] && upd.dims[1] == tbl.dims[1] && upd.dims[3] == tbl.dims[3]) {
                     SsaValue idx_typed = builder.emit_convert(idx_raw, idx_dt);
                     SsaValue row_scalar = builder.emit_reshape(idx_typed, {});
                     SsaValue zero_idx = builder.emit_const_splat_int(0, {}, idx_dt);
+                    SsaValue n_rows_c = builder.emit_const_splat_int(tbl.dims[2], {}, idx_dt);
+                    SsaValue ge_zero = builder.emit_compare("GE", row_scalar, zero_idx);
+                    SsaValue lt_rows = builder.emit_compare("LT", row_scalar, n_rows_c);
+                    SsaValue in_bounds = builder.emit_binary("stablehlo.and", ge_zero, lt_rows);
+                    SsaValue in_bounds_b = builder.emit_broadcast_in_dim(in_bounds, {}, upd.dims);
+                    SsaValue cur_row = builder.emit_dynamic_slice(
+                        tbl, {zero_idx, zero_idx, row_scalar, zero_idx}, upd.dims);
+                    SsaValue safe_upd = builder.emit_select(in_bounds_b, upd, cur_row);
                     SsaValue updated = builder.emit_dynamic_update_slice(
-                        tbl, upd, {zero_idx, zero_idx, row_scalar, zero_idx});
+                        tbl, safe_upd, {zero_idx, zero_idx, row_scalar, zero_idx});
                     result = builder.emit_convert(updated, op.dst.dtype);
                     break;
                 }

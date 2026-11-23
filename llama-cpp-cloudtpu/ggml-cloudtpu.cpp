@@ -3684,8 +3684,10 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
                           emitted.input_bindings.size(), prog_spec.ops.size(), emitted.output_bindings.size(),
                           emitted.mlir_text.c_str());
         }
+        // Use explicit {tf.aliasing_output} attributes alone (alias_passthrough_params=false) so XLA
+        // never implicitly donates an unchecked passthrough copy's source buffer.
         const cloudtpu::PjrtCompileOptions copts =
-            rt.make_spmd_compile_options(P, ctx->device_index, has_alias, ctx->env.async_collectives);
+            rt.make_spmd_compile_options(P, ctx->device_index, /*alias_passthrough=*/false, ctx->env.async_collectives);
         exec = rt.compile_or_get(
             emitted.cache_key, emitted.mlir_text, (P > 1) ? 0 : ctx->device_index, copts);
 
@@ -3764,7 +3766,10 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
         if (plan.has_donation) {
             for (size_t bi = 0; bi < plan.input_bindings.size(); ++bi) {
                 const auto& ib = plan.input_bindings[bi];
-                if (!ib.donatable) continue;
+                if (!ib.donatable) {
+                    ctx->scratch_non_donatable.push_back(static_cast<int64_t>(bi));
+                    continue;
+                }
                 const auto& rp = ctx->scratch_resolved[ib.input_idx];
                 // Exclusive ownership check: 1 ref in bctx->slots + 1 ref in scratch_resolved == 2,
                 // and raw PJRT_Buffer* must not appear twice in argument list.
@@ -3832,7 +3837,10 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
         if (plan.has_donation) {
             for (size_t bi = 0; bi < plan.input_bindings.size(); ++bi) {
                 const auto& ib = plan.input_bindings[bi];
-                if (!ib.donatable) continue;
+                if (!ib.donatable) {
+                    ctx->scratch_non_donatable.push_back(static_cast<int64_t>(bi));
+                    continue;
+                }
                 const auto& rp = ctx->scratch_resolved[ib.input_idx];
                 bool safe = (rp.primary.size() == n_devs);
                 for (size_t d = 0; safe && d < n_devs; ++d) {

@@ -692,12 +692,13 @@ void test_silicon_regressions(cloudtpu::PjrtRuntime& rt) {
         auto bupd = rt.buffer_from_host(0, upd.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, D});
         auto bidx = rt.buffer_from_host(0, &row_idx, cloudtpu::PjrtDType::S32, {1, 1, 1, 1});
         auto btbl = rt.buffer_from_host(0, tbl.data(), cloudtpu::PjrtDType::F32, {1, 1, R, D});
-        const auto copts = rt.make_spmd_compile_options(1, 0, true, true);
+        const auto copts = rt.make_spmd_compile_options(1, 0, /*alias_passthrough=*/false, true);
         const auto exec = rt.compile_or_get(prog.cache_key + "|alias_test", prog.mlir_text, 0, copts);
+        const std::vector<int64_t> non_don = {0, 1};
         std::vector<PJRT_Buffer*> raw_in = {bupd->handle.get(), bidx->handle.get(), btbl->handle.get()};
         std::vector<cloudtpu::PjrtBufferPtr> outs;
         rt.execute(exec, 0, raw_in.data(), raw_in.size(), outs,
-                   {cloudtpu::PjrtDType::F32}, {{1, 1, R, D}}, true);
+                   {cloudtpu::PjrtDType::F32}, {{1, 1, R, D}}, true, &non_don);
         std::vector<float> got(static_cast<size_t>(R * D));
         rt.buffer_to_host(outs[0]->handle.get(), got.data(), got.size() * sizeof(float));
         for (int64_t r = 0; r < R; ++r) {
@@ -706,9 +707,21 @@ void test_silicon_regressions(cloudtpu::PjrtRuntime& rt) {
                 CHECK_NEAR(got[static_cast<size_t>(r * D + d)], exp_v, 1e-5f, "SET_ROWS DUS KV update");
             }
         }
+
+        // Out-of-range indices (-1 and R) must leave every KV row bit-for-bit untouched (matching scatter).
+        for (int32_t bad_idx : {int32_t{-1}, static_cast<int32_t>(R)}) {
+            auto bbad = rt.buffer_from_host(0, &bad_idx, cloudtpu::PjrtDType::S32, {1, 1, 1, 1});
+            std::vector<PJRT_Buffer*> bad_in = {bupd->handle.get(), bbad->handle.get(), btbl->handle.get()};
+            std::vector<cloudtpu::PjrtBufferPtr> bad_outs;
+            rt.execute(exec, 0, bad_in.data(), bad_in.size(), bad_outs,
+                       {cloudtpu::PjrtDType::F32}, {{1, 1, R, D}}, true, &non_don);
+            std::vector<float> bad_got(static_cast<size_t>(R * D));
+            rt.buffer_to_host(bad_outs[0]->handle.get(), bad_got.data(), bad_got.size() * sizeof(float));
+            check_vec_close(bad_got, tbl, 0.0f, "SET_ROWS DUS out-of-range preserves KV table");
+        }
     }
 
-    std::printf("  [PASS] Silicon regressions (ROPE M=52, Q4_0/Q8_0 K=256, DUS+KV donation)\n");
+    std::printf("  [PASS] Silicon regressions (ROPE M=52, Q4_0/Q8_0 K=256, bounds-guarded DUS+KV donation)\n");
 }
 
 void test_multichip_device_assignment_and_eviction_lifetime() {
@@ -928,7 +941,9 @@ void test_q4_k_split_mul_mat(cloudtpu::PjrtRuntime& rt) {
     auto bm = rt.buffer_from_host(0, m_km.data(), cloudtpu::PjrtDType::F32, {1, 1, NB, N});
     auto bx = rt.buffer_from_host(0, x.data(), cloudtpu::PjrtDType::F32, {1, 1, M, K});
 
+    // 1) Strict F32 parity path (bf16_matmul=false, high_precision=true)
     cloudtpu::GraphProgramSpec spec;
+    spec.bf16_matmul = false;
     spec.inputs.push_back({1, cloudtpu::PjrtDType::U8, cloudtpu::TensorStorageKind::Q4_K_SPLIT, {1, 1, N, K}});
     spec.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, K}});
     cloudtpu::OpNodeSpec mm;
@@ -942,6 +957,7 @@ void test_q4_k_split_mul_mat(cloudtpu::PjrtRuntime& rt) {
     const auto prog = cloudtpu::emit_stablehlo_program(spec);
     CHECK_TRUE(prog.input_bindings.size() == 4, "Q4_K_SPLIT MUL_MAT has 4 input bindings (qs, d, m, x)");
     CHECK_TRUE(prog.input_bindings[2].dims == std::vector<int64_t>({1, 1, NB, N}), "Q4_K mins binding rank-4 K-major");
+    CHECK_TRUE(prog.mlir_text.find("bf16") == std::string::npos, "Strict F32 Q4_K MUL_MAT must not cast to bf16");
 
     const auto got = run_emitted(rt, prog, {bqs, bd, bm, bx});
     std::vector<float> expected(static_cast<size_t>(M * N), 0.0f);
@@ -954,8 +970,31 @@ void test_q4_k_split_mul_mat(cloudtpu::PjrtRuntime& rt) {
             expected[static_cast<size_t>(r * N + n)] = acc;
         }
     }
-    check_vec_close(got, expected, 1e-4f, "Q4_K_SPLIT MUL_MAT");
-    std::printf("  [PASS] Q4_K_SPLIT MUL_MAT (rank-4 K-major scales & mins)\n");
+    check_vec_close(got, expected, 1e-4f, "Q4_K_SPLIT MUL_MAT F32");
+
+    // 2) BF16 MXU contraction path (bf16_matmul=true, high_precision=false) verified against
+    //    BF16-rounded operands (matching real MXU BF16 input precision).
+    cloudtpu::GraphProgramSpec bf16_spec = spec;
+    bf16_spec.bf16_matmul = true;
+    bf16_spec.ops[0].high_precision = false;
+    const auto bf16_prog = cloudtpu::emit_stablehlo_program(bf16_spec);
+    CHECK_TRUE(bf16_prog.mlir_text.find("bf16") != std::string::npos,
+               "BF16 Q4_K MUL_MAT must cast dequantized weights and activations to bf16");
+    const auto got_bf16 = run_emitted(rt, bf16_prog, {bqs, bd, bm, bx});
+    std::vector<float> expected_bf16(static_cast<size_t>(M * N), 0.0f);
+    for (int64_t r = 0; r < M; ++r) {
+        for (int64_t n = 0; n < N; ++n) {
+            float acc = 0.0f;
+            for (int64_t k = 0; k < K; ++k) {
+                const float x_q = cloudtpu::bf16_to_f32(cloudtpu::f32_to_bf16(x[static_cast<size_t>(r * K + k)]));
+                const float w_q = cloudtpu::bf16_to_f32(cloudtpu::f32_to_bf16(w_ref[static_cast<size_t>(n * K + k)]));
+                acc += x_q * w_q;
+            }
+            expected_bf16[static_cast<size_t>(r * N + n)] = acc;
+        }
+    }
+    check_vec_close(got_bf16, expected_bf16, 1e-4f, "Q4_K_SPLIT MUL_MAT BF16");
+    std::printf("  [PASS] Q4_K_SPLIT MUL_MAT (rank-4 K-major scales & mins, F32 + BF16)\n");
 
     // Verify SET_ROWS preserves 64-bit indices on both single-row DUS and multi-row scatter paths.
     const std::vector<float> tbl_init = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
@@ -980,6 +1019,13 @@ void test_q4_k_split_mul_mat(cloudtpu::PjrtRuntime& rt) {
                "Single-row SET_ROWS with S64 indices must preserve i64 dynamic_update_slice coordinates");
     const auto sr_out = run_emitted(rt, sr_prog, {b_upd, b_idx, b_tbl});
     check_vec_close(sr_out, {1.0f, 2.0f, 9.0f, 8.0f, 5.0f, 6.0f}, 1e-6f, "SET_ROWS S64 DUS");
+    // Out-of-range S64 indices (-1, 3, and 2^33 which would wrap to 0 if narrowed to i32) must
+    // preserve tbl_init unchanged.
+    for (int64_t bad64 : {int64_t{-1}, int64_t{3}, int64_t{1LL << 33}}) {
+        auto b_bad64 = rt.buffer_from_host(0, &bad64, cloudtpu::PjrtDType::S64, {1, 1, 1, 1});
+        const auto bad_out = run_emitted(rt, sr_prog, {b_upd, b_bad64, b_tbl});
+        check_vec_close(bad_out, tbl_init, 0.0f, "SET_ROWS S64 DUS out-of-range preserves table");
+    }
 
     // Multi-row SET_ROWS with S64 indices uses scatter and preserves i64 coordinates.
     const std::vector<float> upd_vals2 = {9.0f, 8.0f, 7.0f, 6.5f};
