@@ -1683,15 +1683,20 @@ static size_t ggml_backend_cloudtpu_buffer_type_get_alloc_size(ggml_backend_buff
     }
     // Under SPMD (P > 1), the unified device reports P * min_chip_hbm. Sharded 2D weights occupy
     // base_size / P per chip (base_size total across P chips), whereas replicated leaf tensors
-    // (KV/state caches, norms, biases, masks, small or 3D tensors) retain a full copy on every chip
-    // (P * base_size total across P chips). Restrict expansion to true leaf tensors
-    // (op == GGML_OP_NONE && view_src == nullptr) so ggml-backend's TAG_ALLOC_SIZE_EXPAND invariant
-    // is preserved for compute-graph intermediates.
+    // (KV/state caches, norms, biases, masks, small or 3D tensors) and replicated compute outputs
+    // permitted by GGML's TAG_ALLOC_SIZE_EXPAND contract (MUL_MAT, MUL_MAT_ID, FLASH_ATTN_EXT,
+    // etc.) retain a full copy on every chip (P * base_size total across P chips).
     auto* btc = buft ? static_cast<cloudtpu_buft_context*>(buft->context) : nullptr;
-    if (btc && btc->spmd_chips > 1 && tensor->op == GGML_OP_NONE && tensor->view_src == nullptr) {
-        const cloudtpu::TensorShardingKind sh = choose_upload_sharding(
-            tensor, btc->spmd_chips, btc->spmd_min_rows, /*allow_sharding=*/true);
-        if (sh == cloudtpu::TensorShardingKind::REPLICATED) {
+    if (btc && btc->spmd_chips > 1 && tensor->view_src == nullptr) {
+        bool replicate_charge = false;
+        if (tensor->op == GGML_OP_NONE) {
+            const cloudtpu::TensorShardingKind sh = choose_upload_sharding(
+                tensor, btc->spmd_chips, btc->spmd_min_rows, /*allow_sharding=*/true);
+            replicate_charge = (sh == cloudtpu::TensorShardingKind::REPLICATED);
+        } else if (ggml_op_alloc_size_may_expand(tensor->op)) {
+            replicate_charge = true;
+        }
+        if (replicate_charge) {
             const size_t p = static_cast<size_t>(btc->spmd_chips);
             return (base_size <= SIZE_MAX / p) ? (base_size * p) : SIZE_MAX;
         }
@@ -2531,26 +2536,49 @@ static void store_tensor_hbm_spmd(cloudtpu::PjrtRuntime& rt,
     }
 }
 
+static bool same_backing_address_space(const struct ggml_tensor* a, const struct ggml_tensor* b) {
+    if (!a || !b || !a->data || !b->data) {
+        return false;
+    }
+    const bool a_tpu = (a->buffer != nullptr && is_cloudtpu_buffer(a->buffer));
+    const bool b_tpu = (b->buffer != nullptr && is_cloudtpu_buffer(b->buffer));
+    if (a_tpu || b_tpu) {
+        return a_tpu && b_tpu && a->buffer == b->buffer;
+    }
+    // Both tensors live in host virtual memory (raw host pointers or non-CloudTPU host buffers),
+    // so byte-range checks detect host-backed in-place write/read aliasing too.
+    return true;
+}
+
 static bool tensor_ranges_overlap(const struct ggml_tensor* a, const struct ggml_tensor* b) {
-    if (!a || !b || !a->buffer || a->buffer != b->buffer || !is_cloudtpu_buffer(a->buffer)) {
+    if (!same_backing_address_space(a, b)) {
+        return false;
+    }
+    const size_t a_bytes = ggml_nbytes(a);
+    const size_t b_bytes = ggml_nbytes(b);
+    if (a_bytes == 0 || b_bytes == 0) {
         return false;
     }
     const uintptr_t a0 = reinterpret_cast<uintptr_t>(a->data);
-    const uintptr_t a1 = a0 + ggml_nbytes(a);
+    const uintptr_t a1 = a0 + a_bytes;
     const uintptr_t b0 = reinterpret_cast<uintptr_t>(b->data);
-    const uintptr_t b1 = b0 + ggml_nbytes(b);
+    const uintptr_t b1 = b0 + b_bytes;
     return a0 < b1 && b0 < a1;
 }
 
 static bool tensor_range_covers(const struct ggml_tensor* outer, const struct ggml_tensor* inner) {
-    if (!outer || !inner || !outer->buffer || outer->buffer != inner->buffer ||
-        !is_cloudtpu_buffer(outer->buffer)) {
+    if (!same_backing_address_space(outer, inner)) {
+        return false;
+    }
+    const size_t o_bytes = ggml_nbytes(outer);
+    const size_t i_bytes = ggml_nbytes(inner);
+    if (o_bytes == 0 || i_bytes == 0) {
         return false;
     }
     const uintptr_t o0 = reinterpret_cast<uintptr_t>(outer->data);
-    const uintptr_t o1 = o0 + ggml_nbytes(outer);
+    const uintptr_t o1 = o0 + o_bytes;
     const uintptr_t i0 = reinterpret_cast<uintptr_t>(inner->data);
-    const uintptr_t i1 = i0 + ggml_nbytes(inner);
+    const uintptr_t i1 = i0 + i_bytes;
     return o0 <= i0 && o1 >= i1;
 }
 
@@ -3489,8 +3517,12 @@ static enum ggml_status ggml_backend_cloudtpu_graph_compute(ggml_backend_t backe
                 if (!start_is_attn) {
                     std::vector<const struct ggml_tensor*> inplace_writes;
                     std::vector<const struct ggml_tensor*> slice_writes;
+                    auto tracks_alias_write = [](const struct ggml_tensor* t) -> bool {
+                        return t->op == GGML_OP_SET_ROWS || t->view_src != nullptr ||
+                               !t->buffer || !is_cloudtpu_buffer(t->buffer);
+                    };
                     slice_writes.push_back(cgraph->nodes[i]);
-                    if (cgraph->nodes[i]->op == GGML_OP_SET_ROWS || cgraph->nodes[i]->view_src != nullptr) {
+                    if (tracks_alias_write(cgraph->nodes[i])) {
                         inplace_writes.push_back(cgraph->nodes[i]);
                     }
                     int fused_ops = 1;
@@ -3506,10 +3538,11 @@ static enum ggml_status ggml_backend_cloudtpu_graph_compute(ggml_backend_t backe
                         if (nj->op == GGML_OP_FLASH_ATTN_EXT) {
                             break;
                         }
-                        // Guard against aliasing a previous in-place write in this slice via a
-                        // different ggml_tensor* (e.g. a fresh view of a KV cache updated by SET_ROWS),
-                        // and split before any write that partially overlaps an earlier write in this
-                        // slice so both writes materialize in exact graph order.
+                        // Guard against aliasing a previous in-place or host-backed write in this
+                        // slice via a different ggml_tensor* (e.g. a fresh view of a KV cache or
+                        // host table updated by SET_ROWS/CPY), and split before any write that
+                        // partially overlaps an earlier write in this slice so both writes
+                        // materialize in exact graph order.
                         bool alias_conflict = false;
                         for (const struct ggml_tensor* pw : slice_writes) {
                             if (tensor_ranges_overlap(nj, pw) && !tensor_range_covers(nj, pw)) {
@@ -3521,11 +3554,20 @@ static enum ggml_status ggml_backend_cloudtpu_graph_compute(ggml_backend_t backe
                             const int max_src =
                                 (nj->op == GGML_OP_CPY || nj->op == GGML_OP_CONT) ? 1 : GGML_MAX_SRC;
                             for (int s = 0; s < max_src && nj->src[s] != nullptr && !alias_conflict; ++s) {
-                                for (const struct ggml_tensor* cur = nj->src[s]; cur != nullptr; cur = view_parent(cur)) {
-                                    for (const struct ggml_tensor* iw : inplace_writes) {
+                                for (const struct ggml_tensor* iw : inplace_writes) {
+                                    bool direct_ssa = false;
+                                    for (const struct ggml_tensor* cur = nj->src[s]; cur != nullptr;
+                                         cur = view_parent(cur)) {
                                         if (cur == iw) {
-                                            break;  // Direct SSA dependency on iw is safe
+                                            direct_ssa = true;
+                                            break;
                                         }
+                                    }
+                                    if (direct_ssa) {
+                                        continue;  // Direct SSA dependency on iw (incl. views of iw) is safe
+                                    }
+                                    for (const struct ggml_tensor* cur = nj->src[s]; cur != nullptr;
+                                         cur = view_parent(cur)) {
                                         if (tensor_ranges_overlap(cur, iw)) {
                                             alias_conflict = true;
                                             break;
@@ -3539,7 +3581,7 @@ static enum ggml_status ggml_backend_cloudtpu_graph_compute(ggml_backend_t backe
                             break;
                         }
                         slice_writes.push_back(nj);
-                        if (nj->op == GGML_OP_SET_ROWS || nj->view_src != nullptr) {
+                        if (tracks_alias_write(nj)) {
                             inplace_writes.push_back(nj);
                         }
                         ++j;
