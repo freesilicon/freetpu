@@ -11,7 +11,7 @@ usage() {
   cat <<'EOF'
 Usage: 00_pci_vfio_survey.sh [--out-dir DIR] [--dry-run] [--mock]
 
-Non-destructive Day-1 hardware survey for Cloud TPU hosts (tpu7x-1t / tpu7x-4t):
+Non-destructive Day-1 hardware survey for Cloud TPU v7x hosts (tpu7x-standard-4t):
   - Enumerates PCI Vendor 0x1ae0 functions, Device IDs, BAR0/BAR2/BAR4 sizes, Resizable BAR caps
   - Captures MSI-X capability counts, iommufd (/dev/iommu) and /dev/vfio/* viability
   - Compares physical PCI function count vs PJRT logical chiplet count
@@ -98,7 +98,27 @@ for dev_path in /sys/bus/pci/devices/*; do
     nl -ba "${dev_path}/resource" | head -n 7 | tee -a "${REPORT}"
   fi
   if command -v lspci >/dev/null 2>&1; then
-    lspci -s "${bdf}" -nnvvv 2>/dev/null | grep -E "Google|Region |Resizable BAR|MSI-X|LnkSta:" | tee -a "${REPORT}" || true
+    lspci -s "${bdf}" -nnvvv 2>/dev/null | awk '
+      function indent_len(s) {
+        match(s, /^[ \t]*/)
+        return RLENGTH
+      }
+      /Resizable BAR/ {
+        print
+        in_rebar = 1
+        rebar_indent = indent_len($0)
+        next
+      }
+      in_rebar {
+        if ($0 ~ /^[ \t]*$/ || indent_len($0) <= rebar_indent) {
+          in_rebar = 0
+        } else {
+          print
+          next
+        }
+      }
+      /Google|Region |MSI-X|LnkSta:/ { print }
+    ' | tee -a "${REPORT}" || true
   fi
   tpu_count=$((tpu_count + 1))
 done

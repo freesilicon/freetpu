@@ -121,10 +121,30 @@ run_bench_tier() {
   local pattern="$2"
   local model_path=""
   if [[ -d "${MODELS_DIR}" ]]; then
-    model_path="$(find "${MODELS_DIR}" -maxdepth 3 -type f -iname "${pattern}" | head -n 1 || true)"
+    local matches=()
+    local line=""
+    while IFS= read -r line; do
+      [[ -n "${line}" ]] && matches+=("${line}")
+    done < <(find "${MODELS_DIR}" -maxdepth 3 -type f -iname "${pattern}" 2>/dev/null | LC_ALL=C sort)
+
+    local f=""
+    for f in "${matches[@]+"${matches[@]}"}"; do
+      if [[ ! "${f}" =~ -[0-9]+-of-[0-9]+\.[gG][gG][uU][fF]$ ]]; then
+        model_path="${f}"
+        break
+      fi
+    done
+    if [[ -z "${model_path}" ]]; then
+      for f in "${matches[@]+"${matches[@]}"}"; do
+        if [[ "${f}" =~ -00001-of-[0-9]+\.[gG][gG][uU][fF]$ ]]; then
+          model_path="${f}"
+          break
+        fi
+      done
+    fi
   fi
   if [[ -z "${model_path}" ]]; then
-    log "[SKIP] ${tier}: no GGUF matching '${pattern}' in ${MODELS_DIR}"
+    log "[SKIP] ${tier}: no single-file or shard-00001 GGUF matching '${pattern}' in ${MODELS_DIR}"
     return 0
   fi
   for fp8_mode in 0 auto; do

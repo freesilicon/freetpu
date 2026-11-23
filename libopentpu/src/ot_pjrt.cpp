@@ -108,10 +108,17 @@ struct PJRT_Device {
   OtPjrtMemory mem{};
   ot_context_t* ctx = nullptr;
   PJRT_Memory* mem_ptrs[1] = {&mem.base};
+
+  ~PJRT_Device() {
+    if (ctx) {
+      ot_context_destroy(ctx);
+      ctx = nullptr;
+    }
+  }
 };
 
 struct PJRT_Client {
-  ot_context_t* ctx = nullptr;
+  bool is_mock = false;
   std::vector<std::unique_ptr<PJRT_Device>> devices;
   std::vector<PJRT_Device*> dev_ptrs;
   std::vector<PJRT_Memory*> mem_ptrs;
@@ -134,6 +141,7 @@ struct PJRT_Buffer {
 struct PJRT_Executable {
   std::string name = "opentpu_matmul";
   std::string fingerprint;
+  size_t num_replicas = 1;
   uint32_t m_dim = 0;
   uint32_t k_dim = 0;
   uint32_t n_dim = 0;
@@ -147,7 +155,9 @@ struct PJRT_Executable {
 struct PJRT_LoadedExecutable {
   PJRT_Client* client = nullptr;
   PJRT_Executable exec{};
-  std::vector<int> assigned_device_ids = {0};
+  std::vector<int> assigned_device_ids;
+  std::vector<PJRT_Device*> assigned_devices;
+  std::vector<PJRT_LogicalDeviceIds> assigned_logical_ids;
   bool deleted = false;
 };
 
@@ -1104,8 +1114,8 @@ PJRT_Error* ot_pjrt_client_create(PJRT_Client_Create_Args* args) {
   const char* mock_env = std::getenv("OPENTPU_MOCK");
   if (mock_env && std::strcmp(mock_env, "1") == 0) cfg.mock_mode = 1;
 
-  ot_context_t* ctx = nullptr;
-  ot_status_t st = ot_context_create(&cfg, &ctx);
+  ot_context_t* first_ctx = nullptr;
+  ot_status_t st = ot_context_create(&cfg, &first_ctx);
   if (st != OT_OK) {
     const char* detail = ot_context_last_error(nullptr);
     std::string msg = std::string("ot_context_create failed: ") + ot_status_string(st);
@@ -1118,19 +1128,20 @@ PJRT_Error* ot_pjrt_client_create(PJRT_Client_Create_Args* args) {
   }
 
   ot_device_info_t info = {};
-  (void)ot_device_get_info(ctx, &info);
+  (void)ot_device_get_info(first_ctx, &info);
   ot_device_geometry_t geom = {};
-  (void)ot_device_get_geometry(ctx, &geom);
+  (void)ot_device_get_geometry(first_ctx, &geom);
 
   std::string kind_str = "TPU v5 lite";
   if (info.chip_gen == OT_CHIP_TPU7X) kind_str = "TPU v7x";
   else if (info.chip_gen == OT_CHIP_V6E) kind_str = "TPU v6 lite";
 
   size_t pci_funcs = 1;
-  size_t chiplets_per_func =
-      geom.logical_chiplets_per_pci_func > 0 ? geom.logical_chiplets_per_pci_func : 1u;
+  size_t chiplets_per_func = 1;
 
   if (cfg.mock_mode) {
+    chiplets_per_func =
+        geom.logical_chiplets_per_pci_func > 0 ? geom.logical_chiplets_per_pci_func : 1u;
     if (const char* topo_env = std::getenv("OPENTPU_MOCK_TOPOLOGY")) {
       if (std::strcmp(topo_env, "tpu7x-1t") == 0 || std::strcmp(topo_env, "tpu7x_1t") == 0) {
         kind_str = "TPU v7x";
@@ -1151,76 +1162,106 @@ PJRT_Error* ot_pjrt_client_create(PJRT_Client_Create_Args* args) {
       }
     }
   } else {
-    std::vector<ot::PciDiscoveryEntry> tpus;
-    if (ot::enumerate_linux_tpus(&tpus, nullptr) && !tpus.empty()) {
-      size_t same_gen = 0;
-      for (const auto& entry : tpus) {
-        if (entry.device_id == info.device_id) {
-          ++same_gen;
-        }
-      }
-      if (same_gen > 0) {
-        pci_funcs = same_gen;
-      }
+    // Keep live sysfs topology discovery separate from addressable PJRT devices:
+    // only expose live compute devices that have their own opened and execution-validated
+    // VFIO transport context (currently single-function TPU v5e 0x1ae0:0x0063).
+    if (info.chip_gen != OT_CHIP_V5E) {
+      ot_context_destroy(first_ctx);
+      return make_err(PJRT_Error_Code_UNIMPLEMENTED,
+                      "Live PJRT compute execution is validated on TPU v5e (0x1ae0:0x0063) only; "
+                      "unvalidated live devices/chiplets are not exposed as addressable PJRT devices");
     }
+    kind_str = "TPU v5 lite";
+    pci_funcs = 1;
+    chiplets_per_func = 1;
   }
 
   const size_t total_logical = pci_funcs * chiplets_per_func;
+  std::vector<int> selected_ids;
   if (has_visible_devs) {
-    for (int64_t vid : visible_devs) {
+    selected_ids.reserve(visible_devs.size());
+    for (size_t i = 0; i < visible_devs.size(); ++i) {
+      const int64_t vid = visible_devs[i];
       if (vid < 0 || static_cast<size_t>(vid) >= total_logical) {
-        ot_context_destroy(ctx);
-        return make_err(PJRT_Error_Code_UNIMPLEMENTED,
-                        total_logical <= 1 ? "single-device OpenTPU supports device 0 only"
-                                           : "visible_devices index out of addressable range");
+        ot_context_destroy(first_ctx);
+        return make_err(PJRT_Error_Code_INVALID_ARGUMENT,
+                        "visible_devices index out of range");
       }
+      const int id = static_cast<int>(vid);
+      if (std::find(selected_ids.begin(), selected_ids.end(), id) != selected_ids.end()) {
+        ot_context_destroy(first_ctx);
+        return make_err(PJRT_Error_Code_INVALID_ARGUMENT,
+                        "duplicate device index in visible_devices");
+      }
+      selected_ids.push_back(id);
+    }
+  } else {
+    selected_ids.reserve(total_logical);
+    for (size_t i = 0; i < total_logical; ++i) {
+      selected_ids.push_back(static_cast<int>(i));
     }
   }
 
   auto* c = new (std::nothrow) PJRT_Client();
   if (!c) {
-    ot_context_destroy(ctx);
+    ot_context_destroy(first_ctx);
     return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, "out of memory");
   }
-  c->ctx = ctx;
+  c->is_mock = (cfg.mock_mode != 0);
 
   // Serpentine 2x2 package walk when 4 physical packages are present (e.g. tpu7x-4t)
   // so intra-package D2D chiplets remain consecutive pairs (0,1), (2,3), (4,5), (6,7).
   const int64_t grid_x = (pci_funcs == 4) ? 2 : static_cast<int64_t>(pci_funcs);
-  c->devices.reserve(total_logical);
-  c->dev_ptrs.reserve(total_logical);
-  c->mem_ptrs.reserve(total_logical);
-  c->topology.desc_ptrs.reserve(total_logical);
+  c->devices.reserve(selected_ids.size());
+  c->dev_ptrs.reserve(selected_ids.size());
+  c->mem_ptrs.reserve(selected_ids.size());
+  c->topology.desc_ptrs.reserve(selected_ids.size());
 
-  for (size_t pkg = 0; pkg < pci_funcs; ++pkg) {
+  for (size_t idx = 0; idx < selected_ids.size(); ++idx) {
+    const int logical_id = selected_ids[idx];
+    const size_t pkg = static_cast<size_t>(logical_id) / chiplets_per_func;
+    const size_t core = static_cast<size_t>(logical_id) % chiplets_per_func;
     const int64_t y = static_cast<int64_t>(pkg) / grid_x;
     int64_t x = static_cast<int64_t>(pkg) % grid_x;
     if (pci_funcs == 4 && (y & 1) != 0) {
       x = grid_x - 1 - x;
     }
-    for (size_t core = 0; core < chiplets_per_func; ++core) {
-      const int logical_id = static_cast<int>(pkg * chiplets_per_func + core);
-      auto dev = std::make_unique<PJRT_Device>();
-      dev->ctx = ctx;
-      dev->desc.id = logical_id;
-      dev->desc.local_hardware_id = logical_id;
-      dev->desc.kind = kind_str;
-      dev->desc.debug_str = "OpenTPU:" + std::to_string(logical_id);
-      dev->desc.coords = {x, y, 0};
-      dev->desc.core_on_chip =
-          (chiplets_per_func > 1) ? static_cast<int64_t>(core) : -1;
-      dev->desc.finalize_attrs();
-      dev->mem.base.vtable = &kMemoryVtable;
-      dev->mem.id = logical_id;
-      dev->mem.debug_str = "TPU_HBM:" + std::to_string(logical_id);
-      dev->mem.device = dev.get();
-      dev->mem_ptrs[0] = &dev->mem.base;
 
-      c->dev_ptrs.push_back(dev.get());
-      c->mem_ptrs.push_back(&dev->mem.base);
-      c->topology.desc_ptrs.push_back(&dev->desc);
-      c->devices.push_back(std::move(dev));
+    ot_context_t* dev_ctx = nullptr;
+    if (idx == 0) {
+      dev_ctx = first_ctx;
+      first_ctx = nullptr;
+    } else {
+      // Each addressable mock device owns an isolated ot_context_t & HBM arena.
+      ot_status_t dst = ot_context_create(&cfg, &dev_ctx);
+      if (dst != OT_OK) {
+        delete c;
+        return make_err(PJRT_Error_Code_INTERNAL,
+                        std::string("ot_context_create failed for device ") +
+                            std::to_string(logical_id) + ": " + ot_status_string(dst));
+      }
     }
+
+    auto dev = std::make_unique<PJRT_Device>();
+    dev->ctx = dev_ctx;
+    dev->desc.id = logical_id;
+    dev->desc.local_hardware_id = logical_id;
+    dev->desc.kind = kind_str;
+    dev->desc.debug_str = "OpenTPU:" + std::to_string(logical_id);
+    dev->desc.coords = {x, y, 0};
+    dev->desc.core_on_chip =
+        (chiplets_per_func > 1) ? static_cast<int64_t>(core) : -1;
+    dev->desc.finalize_attrs();
+    dev->mem.base.vtable = &kMemoryVtable;
+    dev->mem.id = logical_id;
+    dev->mem.debug_str = "TPU_HBM:" + std::to_string(logical_id);
+    dev->mem.device = dev.get();
+    dev->mem_ptrs[0] = &dev->mem.base;
+
+    c->dev_ptrs.push_back(dev.get());
+    c->mem_ptrs.push_back(&dev->mem.base);
+    c->topology.desc_ptrs.push_back(&dev->desc);
+    c->devices.push_back(std::move(dev));
   }
 
   c->topology.platform_name = c->platform_name;
@@ -1276,15 +1317,35 @@ void ot_pjrt_serialized_topo_deleter(PJRT_SerializedTopology* s) {
   delete s;
 }
 
+static std::string serialize_topology_description(const PJRT_TopologyDescription& topo) {
+  std::string out = "v2|" + topo.platform_name + "|" + topo.platform_version +
+                    "|n=" + std::to_string(topo.desc_ptrs.size());
+  for (const PJRT_DeviceDescription* d : topo.desc_ptrs) {
+    out += "|dev(";
+    if (!d) {
+      out += "null)";
+      continue;
+    }
+    out += "id=" + std::to_string(d->id);
+    out += ",proc=" + std::to_string(d->process_index);
+    out += ",hw=" + std::to_string(d->local_hardware_id);
+    out += ",kind=" + d->kind;
+    out += ",coords=";
+    for (size_t ci = 0; ci < d->coords.size(); ++ci) {
+      if (ci > 0) out += ",";
+      out += std::to_string(d->coords[ci]);
+    }
+    out += ",core=" + std::to_string(d->core_on_chip);
+    out += ")";
+  }
+  return out;
+}
+
 PJRT_Error* ot_pjrt_topo_serialize(PJRT_TopologyDescription_Serialize_Args* args) {
   if (!args || !args->topology) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null topology");
   auto* st = new (std::nothrow) PJRT_SerializedTopology();
   if (!st) return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, "out of memory");
-  const char* kind =
-      !args->topology->desc_ptrs.empty() && args->topology->desc_ptrs[0]
-          ? args->topology->desc_ptrs[0]->kind.c_str()
-          : "unknown";
-  st->data = args->topology->platform_name + "|" + args->topology->platform_version + "|" + kind;
+  st->data = serialize_topology_description(*args->topology);
   args->serialized_bytes = st->data.c_str();
   args->serialized_bytes_size = st->data.size();
   args->serialized_topology = st;
@@ -1294,12 +1355,7 @@ PJRT_Error* ot_pjrt_topo_serialize(PJRT_TopologyDescription_Serialize_Args* args
 
 PJRT_Error* ot_pjrt_topo_fingerprint(PJRT_TopologyDescription_Fingerprint_Args* args) {
   if (!args || !args->topology) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null topology");
-  const char* kind =
-      !args->topology->desc_ptrs.empty() && args->topology->desc_ptrs[0]
-          ? args->topology->desc_ptrs[0]->kind.c_str()
-          : "unknown";
-  std::string key =
-      args->topology->platform_name + "|" + args->topology->platform_version + "|" + kind;
+  const std::string key = serialize_topology_description(*args->topology);
   uint64_t h = 14695981039346656037ULL;
   for (unsigned char c : key) {
     h ^= static_cast<uint64_t>(c);
@@ -1311,7 +1367,6 @@ PJRT_Error* ot_pjrt_topo_fingerprint(PJRT_TopologyDescription_Fingerprint_Args* 
 
 PJRT_Error* ot_pjrt_client_destroy(PJRT_Client_Destroy_Args* args) {
   if (!args || !args->client) return nullptr;
-  ot_context_destroy(args->client->ctx);
   delete args->client;
   return nullptr;
 }
@@ -1436,13 +1491,22 @@ static bool pb_skip_field(const uint8_t* p, size_t len, size_t* pos, uint32_t wi
   return false;
 }
 
+static PJRT_Device* find_client_device_by_id(const std::vector<PJRT_Device*>& client_devs, int id) {
+  for (PJRT_Device* d : client_devs) {
+    if (d && d->desc.id == id) return d;
+  }
+  return nullptr;
+}
+
 static PJRT_Error* validate_device_assignment_proto(const uint8_t* p,
                                                     size_t len,
-                                                    size_t num_devices,
+                                                    const std::vector<PJRT_Device*>& client_devs,
                                                     std::vector<int>* out_assigned_ids) {
+  const size_t num_devices = client_devs.size();
   size_t pos = 0;
   size_t comp_dev_count = 0;
   uint64_t replica_count = 1;
+  bool has_replica_count = false;
   uint64_t comp_count = 1;
   std::vector<int> assigned;
   while (pos < len) {
@@ -1456,6 +1520,7 @@ static PJRT_Error* validate_device_assignment_proto(const uint8_t* p,
       if (!pb_read_varint(p, len, &pos, &replica_count)) {
         return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed replica_count");
       }
+      has_replica_count = true;
       if (replica_count == 0 || replica_count > num_devices) {
         return make_err(PJRT_Error_Code_UNIMPLEMENTED,
                         num_devices <= 1 ? "single-device OpenTPU requires 1 replica and 1 computation"
@@ -1488,17 +1553,27 @@ static PJRT_Error* validate_device_assignment_proto(const uint8_t* p,
         }
         uint32_t sfield = static_cast<uint32_t>(stag >> 3);
         uint32_t swire = static_cast<uint32_t>(stag & 0x7u);
+        auto append_did = [&](uint64_t did) -> PJRT_Error* {
+          if (did > static_cast<uint64_t>(std::numeric_limits<int>::max()) ||
+              !find_client_device_by_id(client_devs, static_cast<int>(did))) {
+            return make_err(PJRT_Error_Code_UNIMPLEMENTED,
+                            num_devices <= 1 ? "single-device OpenTPU supports single device id 0 only"
+                                             : "replica_device_id out of addressable range");
+          }
+          const int id = static_cast<int>(did);
+          if (std::find(assigned.begin(), assigned.end(), id) != assigned.end()) {
+            return make_err(PJRT_Error_Code_INVALID_ARGUMENT,
+                            "duplicate replica_device_id in device_assignment");
+          }
+          assigned.push_back(id);
+          return nullptr;
+        };
         if (sfield == 1 && swire == 0) {
           uint64_t did = 0;
           if (!pb_read_varint(sub, sub_len, &spos, &did)) {
             return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed replica_device_id");
           }
-          if (did >= num_devices) {
-            return make_err(PJRT_Error_Code_UNIMPLEMENTED,
-                            num_devices <= 1 ? "single-device OpenTPU supports single device id 0 only"
-                                             : "replica_device_id out of addressable range");
-          }
-          assigned.push_back(static_cast<int>(did));
+          if (PJRT_Error* derr = append_did(did)) return derr;
         } else if (sfield == 1 && swire == 2) {
           uint64_t plen = 0;
           if (!pb_read_varint(sub, sub_len, &spos, &plen) || plen > sub_len - spos) {
@@ -1510,12 +1585,7 @@ static PJRT_Error* validate_device_assignment_proto(const uint8_t* p,
             if (!pb_read_varint(sub, pend, &spos, &did)) {
               return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed packed replica_device_id");
             }
-            if (did >= num_devices) {
-              return make_err(PJRT_Error_Code_UNIMPLEMENTED,
-                              num_devices <= 1 ? "single-device OpenTPU supports single device id 0 only"
-                                               : "replica_device_id out of addressable range");
-            }
-            assigned.push_back(static_cast<int>(did));
+            if (PJRT_Error* derr = append_did(did)) return derr;
           }
         } else if (!pb_skip_field(sub, sub_len, &spos, swire)) {
           return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed computation_device field");
@@ -1532,6 +1602,10 @@ static PJRT_Error* validate_device_assignment_proto(const uint8_t* p,
                       num_devices <= 1 ? "single-device OpenTPU supports single device id 0 only"
                                        : "device_assignment size exceeds addressable devices");
     }
+    if (has_replica_count && assigned.size() != replica_count) {
+      return make_err(PJRT_Error_Code_INVALID_ARGUMENT,
+                      "device_assignment replica_device_ids length does not match replica_count");
+    }
     if (out_assigned_ids) *out_assigned_ids = std::move(assigned);
   }
   return nullptr;
@@ -1539,11 +1613,13 @@ static PJRT_Error* validate_device_assignment_proto(const uint8_t* p,
 
 static PJRT_Error* validate_exec_build_options_proto(const uint8_t* p,
                                                      size_t len,
-                                                     size_t num_devices,
+                                                     const std::vector<PJRT_Device*>& client_devs,
                                                      std::vector<int>* out_assigned_ids) {
+  const size_t num_devices = client_devs.size();
   size_t pos = 0;
   uint64_t num_replicas = 1;
   bool has_explicit_da = false;
+  int explicit_ordinal_dev_id = -1;
   while (pos < len) {
     uint64_t tag = 0;
     if (!pb_read_varint(p, len, &pos, &tag)) {
@@ -1557,10 +1633,20 @@ static PJRT_Error* validate_exec_build_options_proto(const uint8_t* p,
         return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed device_ordinal");
       }
       int64_t ord = static_cast<int64_t>(raw);
-      if (ord != -1 && (ord < 0 || static_cast<size_t>(ord) >= num_devices)) {
-        return make_err(PJRT_Error_Code_INVALID_ARGUMENT,
-                        num_devices <= 1 ? "single-device OpenTPU supports device_ordinal -1 or 0 only"
-                                         : "device_ordinal out of addressable device range");
+      if (ord != -1) {
+        if (ord < 0 || ord > std::numeric_limits<int>::max()) {
+          return make_err(PJRT_Error_Code_INVALID_ARGUMENT,
+                          "device_ordinal out of addressable device range");
+        }
+        if (PJRT_Device* by_id = find_client_device_by_id(client_devs, static_cast<int>(ord))) {
+          explicit_ordinal_dev_id = by_id->desc.id;
+        } else if (static_cast<size_t>(ord) < num_devices) {
+          explicit_ordinal_dev_id = client_devs[static_cast<size_t>(ord)]->desc.id;
+        } else {
+          return make_err(PJRT_Error_Code_INVALID_ARGUMENT,
+                          num_devices <= 1 ? "single-device OpenTPU supports device_ordinal -1 or 0 only"
+                                           : "device_ordinal out of addressable device range");
+        }
       }
     } else if (field == 2 && wire == 2) {
       uint64_t slen = 0;
@@ -1605,7 +1691,7 @@ static PJRT_Error* validate_exec_build_options_proto(const uint8_t* p,
       }
       has_explicit_da = true;
       PJRT_Error* err = validate_device_assignment_proto(
-          p + pos, static_cast<size_t>(slen), num_devices, out_assigned_ids);
+          p + pos, static_cast<size_t>(slen), client_devs, out_assigned_ids);
       if (err) return err;
       pos += static_cast<size_t>(slen);
     } else if (field == 10 && wire == 0) {
@@ -1623,8 +1709,12 @@ static PJRT_Error* validate_exec_build_options_proto(const uint8_t* p,
   }
   if (!has_explicit_da && out_assigned_ids) {
     out_assigned_ids->clear();
-    for (uint64_t i = 0; i < num_replicas; ++i) {
-      out_assigned_ids->push_back(static_cast<int>(i));
+    if (num_replicas == 1 && explicit_ordinal_dev_id >= 0) {
+      out_assigned_ids->push_back(explicit_ordinal_dev_id);
+    } else {
+      for (uint64_t i = 0; i < num_replicas; ++i) {
+        out_assigned_ids->push_back(client_devs[static_cast<size_t>(i)]->desc.id);
+      }
     }
   }
   return nullptr;
@@ -1632,9 +1722,14 @@ static PJRT_Error* validate_exec_build_options_proto(const uint8_t* p,
 
 static PJRT_Error* validate_compile_options(const char* data,
                                             size_t len,
-                                            size_t num_devices,
+                                            const std::vector<PJRT_Device*>& client_devs,
                                             std::vector<int>* out_assigned_ids) {
-  if (out_assigned_ids) *out_assigned_ids = {0};
+  if (out_assigned_ids) {
+    out_assigned_ids->clear();
+    if (!client_devs.empty()) {
+      out_assigned_ids->push_back(client_devs[0]->desc.id);
+    }
+  }
   if (len == 0) return nullptr;
   if (!data) {
     return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null compile_options with nonzero size");
@@ -1670,7 +1765,7 @@ static PJRT_Error* validate_compile_options(const char* data,
         return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed executable_build_options length");
       }
       PJRT_Error* err = validate_exec_build_options_proto(
-          p + pos, static_cast<size_t>(slen), num_devices, out_assigned_ids);
+          p + pos, static_cast<size_t>(slen), client_devs, out_assigned_ids);
       if (err) return err;
       pos += static_cast<size_t>(slen);
     } else if (field == 4 && wire == 0) {
@@ -1712,10 +1807,13 @@ PJRT_Error* ot_pjrt_client_compile(PJRT_Client_Compile_Args* args) {
   if (!args || !args->client || !args->program) {
     return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null compile args");
   }
+  if (args->client->dev_ptrs.empty()) {
+    return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "client has no addressable devices");
+  }
   std::vector<int> assigned_ids;
   if (PJRT_Error* opt_err = validate_compile_options(args->compile_options,
                                                      args->compile_options_size,
-                                                     args->client->devices.size(),
+                                                     args->client->dev_ptrs,
                                                      &assigned_ids)) {
     return opt_err;
   }
@@ -1739,17 +1837,35 @@ PJRT_Error* ot_pjrt_client_compile(PJRT_Client_Compile_Args* args) {
     return make_err(PJRT_Error_Code_UNIMPLEMENTED,
                     "OpenTPU M4 lowers single-op textual StableHLO bf16 dot_general only");
   }
-  if (!ot_context_is_mock(args->client->ctx) && (m != 128u || k != 128u || n != 128u)) {
+  if (!args->client->is_mock && (m != 128u || k != 128u || n != 128u)) {
     return make_err(PJRT_Error_Code_UNIMPLEMENTED,
                     "Live hardware BF16 matmul currently supports 128x128x128 only");
   }
+
+  if (assigned_ids.empty()) {
+    assigned_ids.push_back(args->client->dev_ptrs[0]->desc.id);
+  }
+  std::vector<PJRT_Device*> assigned_devs;
+  std::vector<PJRT_LogicalDeviceIds> assigned_logical_ids;
+  assigned_devs.reserve(assigned_ids.size());
+  assigned_logical_ids.reserve(assigned_ids.size());
+  for (size_t r = 0; r < assigned_ids.size(); ++r) {
+    PJRT_Device* dev = find_client_device_by_id(args->client->dev_ptrs, assigned_ids[r]);
+    if (!dev) {
+      return make_err(PJRT_Error_Code_INVALID_ARGUMENT,
+                      "assigned device id not found in client's addressable devices");
+    }
+    assigned_devs.push_back(dev);
+    assigned_logical_ids.push_back({static_cast<int>(r), 0});
+  }
+
   auto* le = new (std::nothrow) PJRT_LoadedExecutable();
   if (!le) return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, "out of memory");
   le->client = args->client;
   le->assigned_device_ids = std::move(assigned_ids);
-  if (le->assigned_device_ids.empty()) {
-    le->assigned_device_ids = {args->client->devices.empty() ? 0 : args->client->devices[0]->desc.id};
-  }
+  le->assigned_devices = std::move(assigned_devs);
+  le->assigned_logical_ids = std::move(assigned_logical_ids);
+  le->exec.num_replicas = le->assigned_devices.size();
   le->exec.m_dim = m;
   le->exec.k_dim = k;
   le->exec.n_dim = n;
@@ -1839,17 +1955,21 @@ PJRT_Error* ot_pjrt_buffer_from_host_buffer(PJRT_Client_BufferFromHostBuffer_Arg
     return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null host data for non-empty buffer");
   }
 
-  // Reserve device HBM before allocating or packing any strided host copy so oversized
-  // uploads fail immediately with RESOURCE_EXHAUSTED instead of spiking host RAM.
+  // Reserve device HBM on the target device's own isolated context before allocating or
+  // packing any strided host copy so oversized uploads fail immediately with RESOURCE_EXHAUSTED.
   size_t alloc_bytes = logical_bytes == 0 ? 1 : logical_bytes;
+  ot_context_t* dev_ctx = target_device->ctx;
+  if (!dev_ctx) {
+    return make_err(PJRT_Error_Code_FAILED_PRECONDITION, "target device has no transport context");
+  }
   ot_buffer_t* ot_buf = nullptr;
-  ot_status_t st = ot_buffer_alloc(args->client->ctx, alloc_bytes, &ot_buf);
-  if (st != OT_OK) return make_ot_err(args->client->ctx, st);
+  ot_status_t st = ot_buffer_alloc(dev_ctx, alloc_bytes, &ot_buf);
+  if (st != OT_OK) return make_ot_err(dev_ctx, st);
 
   if (elems > 0) {
     if (is_noncontiguous_host) {
       PJRT_Error* up_err = upload_strided_host_buffer(
-          args->client->ctx, ot_buf, args->data, args->dims, args->num_dims, args->byte_strides,
+          dev_ctx, ot_buf, args->data, args->dims, args->num_dims, args->byte_strides,
           elem_sz, elems);
       if (up_err) {
         ot_buffer_free(ot_buf);
@@ -1859,13 +1979,13 @@ PJRT_Error* ot_pjrt_buffer_from_host_buffer(PJRT_Client_BufferFromHostBuffer_Arg
       // Per PJRT contract, device_layout == nullptr requests dense major-to-minor storage.
       // Callers requesting native TPU {1,0:T(2,128)(2,1)} storage avoid dispatch-time repacking.
       if (explicit_tiled_2x128) {
-        st = ot::buffer_h2d_tiled_128x128_bf16(args->client->ctx, ot_buf, args->data);
+        st = ot::buffer_h2d_tiled_128x128_bf16(dev_ctx, ot_buf, args->data);
       } else {
-        st = ot_buffer_h2d(args->client->ctx, ot_buf, args->data, logical_bytes);
+        st = ot_buffer_h2d(dev_ctx, ot_buf, args->data, logical_bytes);
       }
       if (st != OT_OK) {
         ot_buffer_free(ot_buf);
-        return make_ot_err(args->client->ctx, st);
+        return make_ot_err(dev_ctx, st);
       }
     }
   }
@@ -1875,7 +1995,7 @@ PJRT_Error* ot_pjrt_buffer_from_host_buffer(PJRT_Client_BufferFromHostBuffer_Arg
     ot_buffer_free(ot_buf);
     return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, "out of memory");
   }
-  buf->ctx = args->client->ctx;
+  buf->ctx = dev_ctx;
   buf->device = target_device;
   buf->ot_buf = ot_buf;
   buf->logical_bytes = logical_bytes;
@@ -2082,8 +2202,8 @@ PJRT_Error* ot_pjrt_exec_name(PJRT_Executable_Name_Args* args) {
 }
 
 PJRT_Error* ot_pjrt_exec_num_replicas(PJRT_Executable_NumReplicas_Args* args) {
-  if (!args) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null");
-  args->num_replicas = 1;
+  if (!args || !args->executable) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null");
+  args->num_replicas = args->executable->num_replicas;
   return nullptr;
 }
 
@@ -2202,8 +2322,8 @@ PJRT_Error* ot_pjrt_lexec_fingerprint(PJRT_LoadedExecutable_Fingerprint_Args* ar
 
 PJRT_Error* ot_pjrt_lexec_addr_devices(PJRT_LoadedExecutable_AddressableDevices_Args* args) {
   if (!args || !args->executable) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null");
-  args->addressable_devices = args->executable->client->dev_ptrs.data();
-  args->num_addressable_devices = args->executable->client->dev_ptrs.size();
+  args->addressable_devices = args->executable->assigned_devices.data();
+  args->num_addressable_devices = args->executable->assigned_devices.size();
   return nullptr;
 }
 
@@ -2226,21 +2346,27 @@ PJRT_Error* ot_pjrt_lexec_execute(PJRT_LoadedExecutable_Execute_Args* args) {
   if (le->deleted) {
     return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "executable has been deleted");
   }
-  const size_t expected_devs = le->assigned_device_ids.empty() ? 1 : le->assigned_device_ids.size();
-  if (args->num_devices != expected_devs && args->num_devices != 1) {
+  const size_t expected_devs = le->assigned_devices.size();
+  if (expected_devs == 0) {
+    return make_err(PJRT_Error_Code_FAILED_PRECONDITION, "executable has no assigned devices");
+  }
+  if (args->execute_device) {
+    if (args->num_devices != 1) {
+      return make_err(PJRT_Error_Code_INVALID_ARGUMENT,
+                      "unexpected num_devices in Execute with execute_device");
+    }
+  } else if (args->num_devices != expected_devs) {
     return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "unexpected num_devices in Execute");
   }
-  PJRT_Device* exec_dev = le->client->devices.empty() ? nullptr : le->client->devices[0].get();
+  PJRT_Device* override_dev = nullptr;
   if (args->execute_device) {
-    bool found = false;
     for (const auto& d : le->client->devices) {
       if (d && args->execute_device == d.get()) {
-        found = true;
-        exec_dev = d.get();
+        override_dev = d.get();
         break;
       }
     }
-    if (!found) {
+    if (!override_dev) {
       return make_err(PJRT_Error_Code_INVALID_ARGUMENT,
                       "execute_device does not belong to this executable's client");
     }
@@ -2248,17 +2374,62 @@ PJRT_Error* ot_pjrt_lexec_execute(PJRT_LoadedExecutable_Execute_Args* args) {
   if (!args->argument_lists || !args->output_lists) {
     return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null argument_lists or output_lists");
   }
+
+  auto device_belongs_to_client = [&](const PJRT_Device* dev) -> bool {
+    for (const auto& d : le->client->devices) {
+      if (d && d.get() == dev) return true;
+    }
+    return false;
+  };
+
+  struct StagedReplicaOut {
+    PJRT_Buffer* buf = nullptr;
+    PJRT_Event* ev = nullptr;
+  };
+  std::vector<StagedReplicaOut> staged;
+  staged.reserve(args->num_devices);
+  auto cleanup_staged = [&]() {
+    for (auto& s : staged) {
+      if (s.buf) {
+        if (s.buf->ot_buf) {
+          ot_buffer_free(s.buf->ot_buf);
+          s.buf->ot_buf = nullptr;
+        }
+        delete s.buf;
+      }
+      delete s.ev;
+    }
+    staged.clear();
+  };
+
   for (size_t di = 0; di < args->num_devices; ++di) {
     if (!args->argument_lists[di] || !args->output_lists[di]) {
+      cleanup_staged();
       return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null argument_lists or output_lists");
     }
+    PJRT_Device* target_dev = override_dev ? override_dev : le->assigned_devices[di];
+    if (!target_dev || !target_dev->ctx) {
+      cleanup_staged();
+      return make_err(PJRT_Error_Code_FAILED_PRECONDITION,
+                      "replica target device has no transport context");
+    }
+    ot_context_t* dev_ctx = target_dev->ctx;
+
     PJRT_Buffer* lhs = args->argument_lists[di][0];
     PJRT_Buffer* rhs = args->argument_lists[di][1];
     if (!lhs || !rhs || lhs->deleted || rhs->deleted || !lhs->ot_buf || !rhs->ot_buf) {
+      cleanup_staged();
       return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null or deleted input buffer");
     }
-    if (lhs->ctx != le->client->ctx || rhs->ctx != le->client->ctx) {
+    if (!device_belongs_to_client(lhs->device) || !device_belongs_to_client(rhs->device)) {
+      cleanup_staged();
       return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "input buffer belongs to another client");
+    }
+    if (lhs->device != target_dev || rhs->device != target_dev ||
+        lhs->ctx != dev_ctx || rhs->ctx != dev_ctx) {
+      cleanup_staged();
+      return make_err(PJRT_Error_Code_INVALID_ARGUMENT,
+                      "input buffer is not placed on the target replica device");
     }
     if (lhs->dtype != PJRT_Buffer_Type_BF16 || rhs->dtype != PJRT_Buffer_Type_BF16 ||
         lhs->dims.size() != 2 || rhs->dims.size() != 2 ||
@@ -2266,39 +2437,34 @@ PJRT_Error* ot_pjrt_lexec_execute(PJRT_LoadedExecutable_Execute_Args* args) {
         lhs->dims[1] != static_cast<int64_t>(le->exec.k_dim) ||
         rhs->dims[0] != static_cast<int64_t>(le->exec.k_dim) ||
         rhs->dims[1] != static_cast<int64_t>(le->exec.n_dim)) {
+      cleanup_staged();
       return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "input buffer dtype or shape mismatch");
     }
 
     size_t out_bytes = static_cast<size_t>(le->exec.m_dim) * le->exec.n_dim * sizeof(uint16_t);
     ot_buffer_t* ot_out = nullptr;
-    ot_status_t st = ot_buffer_alloc(le->client->ctx, out_bytes, &ot_out);
-    if (st != OT_OK) return make_ot_err(le->client->ctx, st);
+    ot_status_t st = ot_buffer_alloc(dev_ctx, out_bytes, &ot_out);
+    if (st != OT_OK) {
+      cleanup_staged();
+      return make_ot_err(dev_ctx, st);
+    }
 
-    st = ot_matmul_bf16(le->client->ctx, lhs->ot_buf, rhs->ot_buf, ot_out,
+    st = ot_matmul_bf16(dev_ctx, lhs->ot_buf, rhs->ot_buf, ot_out,
                         le->exec.m_dim, le->exec.k_dim, le->exec.n_dim);
     if (st != OT_OK) {
       ot_buffer_free(ot_out);
-      return make_ot_err(le->client->ctx, st);
-    }
-
-    PJRT_Device* out_dev = exec_dev;
-    if (!args->execute_device && di < le->assigned_device_ids.size()) {
-      const int target_id = le->assigned_device_ids[di];
-      for (const auto& d : le->client->devices) {
-        if (d && d->desc.id == target_id) {
-          out_dev = d.get();
-          break;
-        }
-      }
+      cleanup_staged();
+      return make_ot_err(dev_ctx, st);
     }
 
     auto* out_buf = new (std::nothrow) PJRT_Buffer();
     if (!out_buf) {
       ot_buffer_free(ot_out);
+      cleanup_staged();
       return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, "out of memory");
     }
-    out_buf->ctx = le->client->ctx;
-    out_buf->device = out_dev;
+    out_buf->ctx = dev_ctx;
+    out_buf->device = target_dev;
     out_buf->ot_buf = ot_out;
     out_buf->logical_bytes = out_bytes;
     out_buf->dtype = PJRT_Buffer_Type_BF16;
@@ -2311,12 +2477,17 @@ PJRT_Error* ot_pjrt_lexec_execute(PJRT_LoadedExecutable_Execute_Args* args) {
       if (!done_ev) {
         ot_buffer_free(out_buf->ot_buf);
         delete out_buf;
+        cleanup_staged();
         return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, "out of memory");
       }
     }
-    args->output_lists[di][0] = out_buf;
+    staged.push_back({out_buf, done_ev});
+  }
+
+  for (size_t di = 0; di < args->num_devices; ++di) {
+    args->output_lists[di][0] = staged[di].buf;
     if (args->device_complete_events) {
-      args->device_complete_events[di] = done_ev;
+      args->device_complete_events[di] = staged[di].ev;
     }
   }
   return nullptr;
@@ -2643,9 +2814,8 @@ PJRT_Error* ot_pjrt_exec_ctx_destroy(PJRT_ExecuteContext_Destroy_Args* args) {
 PJRT_Error* ot_pjrt_lexec_addr_device_logical_ids(
     PJRT_LoadedExecutable_AddressableDeviceLogicalIds_Args* args) {
   if (!args || !args->executable) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null");
-  static PJRT_LogicalDeviceIds kSingleLogicalId = {0, 0};
-  args->addressable_device_logical_ids = &kSingleLogicalId;
-  args->num_addressable_device_logical_ids = 1;
+  args->addressable_device_logical_ids = args->executable->assigned_logical_ids.data();
+  args->num_addressable_device_logical_ids = args->executable->assigned_logical_ids.size();
   return nullptr;
 }
 

@@ -78,7 +78,39 @@ if [[ "${MOCK_MODE}" -eq 1 || "${LIVE_VFIO}" -eq 0 || "$(uname -s)" != "Linux" ]
   exit 0
 fi
 
-log "--- Probing live /dev/vfio/* with opentpu_vfio_smoke (expect safe reject on unvalidated PCI DID or PASS on 0x0063) ---"
-"${SMOKE_BIN}" 2>&1 | tee -a "${LOG}" || true
+if [[ ! -x "${SMOKE_BIN}" ]]; then
+  log "ERROR: smoke binary not found or not executable: ${SMOKE_BIN}"
+  exit 1
+fi
+
+first_vfio_tpu_bdf=""
+for dev_path in /sys/bus/pci/devices/*; do
+  [[ -r "${dev_path}/vendor" && -L "${dev_path}/driver" ]] || continue
+  vid="$(cat "${dev_path}/vendor" 2>/dev/null || true)"
+  drv="$(basename "$(readlink -f "${dev_path}/driver" 2>/dev/null || true)" 2>/dev/null || true)"
+  if [[ "${vid}" == "0x1ae0" && "${drv}" == "vfio-pci" ]]; then
+    first_vfio_tpu_bdf="$(basename "${dev_path}")"
+    break
+  fi
+done
+
+probe_cmd=("${SMOKE_BIN}")
+if [[ -n "${first_vfio_tpu_bdf}" ]]; then
+  probe_cmd+=(--bdf "${first_vfio_tpu_bdf}")
+fi
+
+log "--- Probing live /dev/vfio/* with ${probe_cmd[*]} (expect PASS on validated 0x0063 or safe refusal on unvalidated TPU PCI DID) ---"
+probe_rc=0
+probe_out="$("${probe_cmd[@]}" 2>&1)" || probe_rc=$?
+printf '%s\n' "${probe_out}" | tee -a "${LOG}"
+
+if [[ "${probe_rc}" -eq 0 ]]; then
+  log "LIVE_VFIO_PROBE_STATUS=PASS"
+elif [[ "${probe_rc}" -eq 1 ]] && printf '%s\n' "${probe_out}" | grep -Eq "OT_ERR_UNSUPPORTED|Unsupported TPU PCI device|Refusing to reset/program unsupported VFIO PCI device"; then
+  log "LIVE_VFIO_PROBE_STATUS=EXPECTED_UNVALIDATED_DEVICE_REFUSAL (exit=${probe_rc})"
+else
+  log "LIVE_VFIO_PROBE_STATUS=UNEXPECTED_FAILURE (exit=${probe_rc})"
+  exit "${probe_rc}"
+fi
 
 echo "Probe complete: ${LOG}"

@@ -1377,6 +1377,8 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                                 x_mm.dims[0], x_mm.dims[1], NB_local, x_mm.dims[2], N_local};
                             SsaValue dot_b;
                             SsaValue x_for_sum = x_blk;
+                            bool xsum_has_fp8_scale = false;
+                            SsaValue xsum_fp8_scale;
                             if (use_fp8_mxu) {
                                 // Integer nibbles in [-8..15] are exact in f8E4M3FN (no weight scaling needed).
                                 SsaValue qs_fp8 = builder.emit_convert(qs_eff, PjrtDType::F8E4M3FN);
@@ -1392,6 +1394,12 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                                     qx.fp8, qs_fp8, {0, 1, 3}, {0, 1, 2}, {4}, {3},
                                     dot_b_dims, PjrtDType::F32, false);
                                 dot_b = apply_fp8_scales(builder, dot_fp8, qx.scale_f32, nullptr);
+                                // Reduce the same FP8-rounded activations (scaling the block sum by
+                                // qx.scale_f32) so +8*xsum and xsum*m match dot_b's quantized inputs
+                                // and preserve exact cancellation for zero unsigned nibbles.
+                                x_for_sum = qx.fp8;
+                                xsum_has_fp8_scale = true;
+                                xsum_fp8_scale = qx.scale_f32;
                             } else {
                                 SsaValue qs_mm = builder.emit_convert(qs_eff, mm_dt);
                                 if (w_th.storage == TensorStorageKind::Q4_0_I4 && qs_eff.dtype == PjrtDType::U4) {
@@ -1418,6 +1426,9 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                             if (q4k_needs_xsum) {
                                 SsaValue x_f32 = builder.emit_convert(x_for_sum, PjrtDType::F32);
                                 xsum = builder.emit_reduce_axis(x_f32, zero_f32, 4, "stablehlo.add");
+                                if (xsum_has_fp8_scale) {
+                                    xsum = apply_fp8_scales(builder, xsum, xsum_fp8_scale, nullptr);
+                                }
                             }
                             if (w_th.storage == TensorStorageKind::Q4_K_I4 && qs_eff.dtype == PjrtDType::S4) {
                                 // Restore unsigned nibble contribution dot(x, u4) = dot(x, s4) + 8*sum(x)

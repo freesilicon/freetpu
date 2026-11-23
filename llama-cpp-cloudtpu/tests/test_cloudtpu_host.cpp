@@ -6826,6 +6826,34 @@ void test_fp8_e4m3fn_scalar_and_matmul_parity() {
             den4 += static_cast<double>(ref4[static_cast<size_t>(i)]) * static_cast<double>(ref4[static_cast<size_t>(i)]);
         }
         CHECK_TRUE((err4 / std::max(den4, 1e-30)) < 1e-2, "FP8 E4M3FN factored Q4_K_I4 NMSE < 1e-2");
+
+        // 5. Exact zero cancellation under FP8 E4M3FN: when all unsigned nibbles are 0 (s4 == -8)
+        //    and bias m == 0, dequantized weights are identically 0. Because xsum must reduce the
+        //    same FP8-rounded activations as dot_b, output must be identically 0.0f even with
+        //    non-FP8-exact activations and large scale d.
+        std::vector<int8_t> s4_zero_u4(static_cast<size_t>(NB4 * 32 * N4), static_cast<int8_t>(-8));
+        std::vector<float> d4_large(static_cast<size_t>(NB4 * N4), 1024.0f);
+        std::vector<float> m4_zero(static_cast<size_t>(NB4 * N4), 0.0f);
+        std::vector<float> x4_inexact(static_cast<size_t>(K4));
+        for (int64_t k = 0; k < K4; ++k) {
+            x4_inexact[static_cast<size_t>(k)] =
+                1.3712345f * std::sin(0.73f * static_cast<float>(k + 1)) + 0.1111111f;
+        }
+        auto bz_qs = rt.buffer_from_host(0, s4_zero_u4.data(), cloudtpu::PjrtDType::S4, {1, 1, NB4, 32, N4});
+        auto bz_d = rt.buffer_from_host(0, d4_large.data(), cloudtpu::PjrtDType::F32, {1, 1, NB4, N4});
+        auto bz_m = rt.buffer_from_host(0, m4_zero.data(), cloudtpu::PjrtDType::F32, {1, 1, NB4, N4});
+        auto bz_x = rt.buffer_from_host(0, x4_inexact.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, K4});
+        std::array<PJRT_Buffer*, 4> inz = {
+            bz_qs->handle.get(), bz_d->handle.get(), bz_m->handle.get(), bz_x->handle.get()};
+        std::vector<cloudtpu::PjrtBufferPtr> outz;
+        rt.execute(ex4, 0, inz.data(), inz.size(), outz,
+                   {cloudtpu::PjrtDType::F32}, {{1, 1, 1, N4}}, true);
+        std::vector<float> gotz(static_cast<size_t>(N4), -1.0f);
+        rt.buffer_to_host(outz[0]->handle.get(), gotz.data(), gotz.size() * sizeof(float));
+        for (int64_t i = 0; i < N4; ++i) {
+            CHECK_TRUE(gotz[static_cast<size_t>(i)] == 0.0f,
+                       "FP8 E4M3FN Q4_K_I4 zero unsigned nibbles + zero m must cancel to exact 0.0f");
+        }
     }
 
     rt.shutdown();

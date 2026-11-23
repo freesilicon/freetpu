@@ -1730,6 +1730,446 @@ static void test_pjrt_dual_chiplet_tpu7x_enumeration() {
   printf("[PASS] test_pjrt_dual_chiplet_tpu7x_enumeration\n");
 }
 
+static void test_pjrt_multidevice_isolation_and_topology() {
+  const PJRT_Api* api = GetPjrtApi();
+  OT_CHECK(api != nullptr);
+
+  const char* mlir_4x4 =
+      "module {\n"
+      "  func.func public @main(%a: tensor<4x4xbf16>, %b: tensor<4x4xbf16>) -> tensor<4x4xbf16> {\n"
+      "    %0 = stablehlo.dot_general %a, %b, contracting_dims = [1] x [0] : "
+      "(tensor<4x4xbf16>, tensor<4x4xbf16>) -> tensor<4x4xbf16>\n"
+      "    return %0 : tensor<4x4xbf16>\n"
+      "  }\n"
+      "}\n";
+  PJRT_Program prog = {};
+  prog.struct_size = PJRT_Program_STRUCT_SIZE;
+  prog.code = const_cast<char*>(mlir_4x4);
+  prog.code_size = std::strlen(mlir_4x4);
+  prog.format = "mlir";
+  prog.format_size = 4;
+
+  auto get_mem_used = [&](PJRT_Device* dev) -> int64_t {
+    PJRT_Device_MemoryStats_Args ms = {};
+    ms.struct_size = PJRT_Device_MemoryStats_Args_STRUCT_SIZE;
+    ms.device = dev;
+    OT_CHECK(api->PJRT_Device_MemoryStats(&ms) == nullptr);
+    return ms.bytes_in_use;
+  };
+
+  auto upload_bf16 = [&](PJRT_Client* client, PJRT_Device* dev,
+                         const std::vector<uint16_t>& data,
+                         int64_t rows, int64_t cols) -> PJRT_Buffer* {
+    int64_t dims[2] = {rows, cols};
+    PJRT_Client_BufferFromHostBuffer_Args up = {};
+    up.struct_size = PJRT_Client_BufferFromHostBuffer_Args_STRUCT_SIZE;
+    up.client = client;
+    up.data = data.data();
+    up.type = PJRT_Buffer_Type_BF16;
+    up.dims = dims;
+    up.num_dims = 2;
+    up.host_buffer_semantics = PJRT_HostBufferSemantics_kImmutableUntilTransferCompletes;
+    up.device = dev;
+    OT_CHECK(api->PJRT_Client_BufferFromHostBuffer(&up) == nullptr);
+    if (up.done_with_host_buffer) {
+      PJRT_Event_Destroy_Args ed = {};
+      ed.struct_size = PJRT_Event_Destroy_Args_STRUCT_SIZE;
+      ed.event = up.done_with_host_buffer;
+      OT_CHECK(api->PJRT_Event_Destroy(&ed) == nullptr);
+    }
+    return up.buffer;
+  };
+
+  auto destroy_buf = [&](PJRT_Buffer* b) {
+    if (!b) return;
+    PJRT_Buffer_Destroy_Args bd = {};
+    bd.struct_size = PJRT_Buffer_Destroy_Args_STRUCT_SIZE;
+    bd.buffer = b;
+    OT_CHECK(api->PJRT_Buffer_Destroy(&bd) == nullptr);
+  };
+
+  auto get_err_code = [&](PJRT_Error* err) -> PJRT_Error_Code {
+    PJRT_Error_GetCode_Args gc = {};
+    gc.struct_size = PJRT_Error_GetCode_Args_STRUCT_SIZE;
+    gc.error = err;
+    OT_CHECK(api->PJRT_Error_GetCode(&gc) == nullptr);
+    return gc.code;
+  };
+
+  // 1. Topology serialization & fingerprint must distinguish 2-chiplet vs 8-chiplet layouts.
+  {
+    auto capture_topo = [&](const char* topo_name, std::string* out_ser, uint64_t* out_fp) {
+      setenv("OPENTPU_MOCK", "1", 1);
+      setenv("OPENTPU_MOCK_CHIP", "tpu7x", 1);
+      setenv("OPENTPU_MOCK_TOPOLOGY", topo_name, 1);
+
+      PJRT_Client_Create_Args cc = {};
+      cc.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
+      OT_CHECK(api->PJRT_Client_Create(&cc) == nullptr && cc.client != nullptr);
+
+      PJRT_Client_TopologyDescription_Args td = {};
+      td.struct_size = PJRT_Client_TopologyDescription_Args_STRUCT_SIZE;
+      td.client = cc.client;
+      OT_CHECK(api->PJRT_Client_TopologyDescription(&td) == nullptr && td.topology != nullptr);
+
+      PJRT_TopologyDescription_Serialize_Args ser = {};
+      ser.struct_size = PJRT_TopologyDescription_Serialize_Args_STRUCT_SIZE;
+      ser.topology = td.topology;
+      OT_CHECK(api->PJRT_TopologyDescription_Serialize(&ser) == nullptr);
+      OT_CHECK(ser.serialized_bytes != nullptr && ser.serialized_bytes_size > 0);
+      out_ser->assign(ser.serialized_bytes, ser.serialized_bytes_size);
+      ser.serialized_topology_deleter(ser.serialized_topology);
+
+      PJRT_TopologyDescription_Fingerprint_Args fp = {};
+      fp.struct_size = PJRT_TopologyDescription_Fingerprint_Args_STRUCT_SIZE;
+      fp.topology = td.topology;
+      OT_CHECK(api->PJRT_TopologyDescription_Fingerprint(&fp) == nullptr);
+      *out_fp = fp.fingerprint;
+
+      PJRT_Client_Destroy_Args cd = {};
+      cd.struct_size = PJRT_Client_Destroy_Args_STRUCT_SIZE;
+      cd.client = cc.client;
+      OT_CHECK(api->PJRT_Client_Destroy(&cd) == nullptr);
+    };
+
+    std::string ser_2a, ser_2b, ser_8;
+    uint64_t fp_2a = 0, fp_2b = 0, fp_8 = 0;
+    capture_topo("tpu7x-1t", &ser_2a, &fp_2a);
+    capture_topo("tpu7x-1t", &ser_2b, &fp_2b);
+    capture_topo("tpu7x-4t", &ser_8, &fp_8);
+
+    OT_CHECK(ser_2a == ser_2b && fp_2a == fp_2b);
+    OT_CHECK(ser_2a != ser_8);
+    OT_CHECK(fp_2a != fp_8);
+    OT_CHECK(ser_2a.find("n=2") != std::string::npos);
+    OT_CHECK(ser_8.find("n=8") != std::string::npos);
+  }
+
+  // 2. visible_devices=[1] on 2-chiplet mock must restrict devices, memories, lookup, and default assignment.
+  {
+    setenv("OPENTPU_MOCK", "1", 1);
+    setenv("OPENTPU_MOCK_CHIP", "tpu7x", 1);
+    setenv("OPENTPU_MOCK_TOPOLOGY", "tpu7x-1t", 1);
+
+    // Reject empty, duplicate, negative, and out-of-range visible_devices with INVALID_ARGUMENT.
+    auto check_bad_visible = [&](const int64_t* vals, size_t cnt) {
+      PJRT_NamedValue opt = {};
+      opt.struct_size = PJRT_NamedValue_STRUCT_SIZE;
+      opt.name = "visible_devices";
+      opt.name_size = 15;
+      opt.type = PJRT_NamedValue_kInt64List;
+      opt.int64_array_value = vals;
+      opt.value_size = cnt;
+      PJRT_Client_Create_Args cc = {};
+      cc.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
+      cc.create_options = &opt;
+      cc.num_options = 1;
+      PJRT_Error* e = api->PJRT_Client_Create(&cc);
+      OT_CHECK(e != nullptr);
+      OT_CHECK(get_err_code(e) == PJRT_Error_Code_INVALID_ARGUMENT);
+      destroy_pjrt_error(api, e);
+    };
+    const int64_t dup_vals[2] = {1, 1};
+    const int64_t oor_vals[1] = {2};
+    const int64_t neg_vals[1] = {-1};
+    check_bad_visible(nullptr, 0);
+    check_bad_visible(dup_vals, 2);
+    check_bad_visible(oor_vals, 1);
+    check_bad_visible(neg_vals, 1);
+
+    // Valid visible_devices=[1] -> exposes ONLY device 1 and memory 1, assigns device 1 by default.
+    const int64_t vis1[1] = {1};
+    PJRT_NamedValue opt = {};
+    opt.struct_size = PJRT_NamedValue_STRUCT_SIZE;
+    opt.name = "visible_devices";
+    opt.name_size = 15;
+    opt.type = PJRT_NamedValue_kInt64List;
+    opt.int64_array_value = vis1;
+    opt.value_size = 1;
+    PJRT_Client_Create_Args cc = {};
+    cc.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
+    cc.create_options = &opt;
+    cc.num_options = 1;
+    OT_CHECK(api->PJRT_Client_Create(&cc) == nullptr && cc.client != nullptr);
+
+    PJRT_Client_Devices_Args da = {};
+    da.struct_size = PJRT_Client_Devices_Args_STRUCT_SIZE;
+    da.client = cc.client;
+    OT_CHECK(api->PJRT_Client_Devices(&da) == nullptr);
+    OT_CHECK(da.num_devices == 1u);
+
+    PJRT_Client_AddressableDevices_Args ad = {};
+    ad.struct_size = PJRT_Client_AddressableDevices_Args_STRUCT_SIZE;
+    ad.client = cc.client;
+    OT_CHECK(api->PJRT_Client_AddressableDevices(&ad) == nullptr);
+    OT_CHECK(ad.num_addressable_devices == 1u && ad.addressable_devices[0] == da.devices[0]);
+
+    PJRT_Device_GetDescription_Args gd = {};
+    gd.struct_size = PJRT_Device_GetDescription_Args_STRUCT_SIZE;
+    gd.device = ad.addressable_devices[0];
+    OT_CHECK(api->PJRT_Device_GetDescription(&gd) == nullptr);
+    PJRT_DeviceDescription_Id_Args did = {};
+    did.struct_size = PJRT_DeviceDescription_Id_Args_STRUCT_SIZE;
+    did.device_description = gd.device_description;
+    OT_CHECK(api->PJRT_DeviceDescription_Id(&did) == nullptr);
+    OT_CHECK(did.id == 1);
+
+    PJRT_Client_AddressableMemories_Args am = {};
+    am.struct_size = PJRT_Client_AddressableMemories_Args_STRUCT_SIZE;
+    am.client = cc.client;
+    OT_CHECK(api->PJRT_Client_AddressableMemories(&am) == nullptr);
+    OT_CHECK(am.num_addressable_memories == 1u);
+    PJRT_Memory_Id_Args mid = {};
+    mid.struct_size = PJRT_Memory_Id_Args_STRUCT_SIZE;
+    mid.memory = am.addressable_memories[0];
+    OT_CHECK(api->PJRT_Memory_Id(&mid) == nullptr);
+    OT_CHECK(mid.id == 1);
+
+    PJRT_Client_LookupDevice_Args ld0 = {};
+    ld0.struct_size = PJRT_Client_LookupDevice_Args_STRUCT_SIZE;
+    ld0.client = cc.client;
+    ld0.id = 0;
+    PJRT_Error* ld0_err = api->PJRT_Client_LookupDevice(&ld0);
+    OT_CHECK(ld0_err != nullptr && get_err_code(ld0_err) == PJRT_Error_Code_NOT_FOUND);
+    destroy_pjrt_error(api, ld0_err);
+
+    PJRT_Client_LookupDevice_Args ld1 = {};
+    ld1.struct_size = PJRT_Client_LookupDevice_Args_STRUCT_SIZE;
+    ld1.client = cc.client;
+    ld1.id = 1;
+    OT_CHECK(api->PJRT_Client_LookupDevice(&ld1) == nullptr &&
+             ld1.device == ad.addressable_devices[0]);
+
+    int def_assign[1] = {-1};
+    PJRT_Client_DefaultDeviceAssignment_Args dda = {};
+    dda.struct_size = PJRT_Client_DefaultDeviceAssignment_Args_STRUCT_SIZE;
+    dda.client = cc.client;
+    dda.num_replicas = 1;
+    dda.num_partitions = 1;
+    dda.default_assignment = def_assign;
+    dda.default_assignment_size = 1;
+    OT_CHECK(api->PJRT_Client_DefaultDeviceAssignment(&dda) == nullptr);
+    OT_CHECK(def_assign[0] == 1);
+
+    // Default compile on visible_devices=[1] assigns device 1 and executes cleanly.
+    PJRT_Client_Compile_Args ca = {};
+    ca.struct_size = PJRT_Client_Compile_Args_STRUCT_SIZE;
+    ca.client = cc.client;
+    ca.program = &prog;
+    OT_CHECK(api->PJRT_Client_Compile(&ca) == nullptr && ca.executable != nullptr);
+    PJRT_LoadedExecutable_AddressableDevices_Args lead = {};
+    lead.struct_size = PJRT_LoadedExecutable_AddressableDevices_Args_STRUCT_SIZE;
+    lead.executable = ca.executable;
+    OT_CHECK(api->PJRT_LoadedExecutable_AddressableDevices(&lead) == nullptr);
+    OT_CHECK(lead.num_addressable_devices == 1u &&
+             lead.addressable_devices[0] == ad.addressable_devices[0]);
+
+    std::vector<uint16_t> ones(16, 0x3f80u);
+    PJRT_Buffer* b0 = upload_bf16(cc.client, ad.addressable_devices[0], ones, 4, 4);
+    PJRT_Buffer* b1 = upload_bf16(cc.client, ad.addressable_devices[0], ones, 4, 4);
+    PJRT_Buffer* ins[2] = {b0, b1};
+    PJRT_Buffer* outs[1] = {nullptr};
+    PJRT_Buffer* const* arg_lists[1] = {ins};
+    PJRT_Buffer** const out_lists[1] = {outs};
+    PJRT_ExecuteOptions eopts = {};
+    eopts.struct_size = PJRT_ExecuteOptions_STRUCT_SIZE;
+    PJRT_LoadedExecutable_Execute_Args ex = {};
+    ex.struct_size = PJRT_LoadedExecutable_Execute_Args_STRUCT_SIZE;
+    ex.executable = ca.executable;
+    ex.options = &eopts;
+    ex.argument_lists = arg_lists;
+    ex.num_devices = 1;
+    ex.num_args = 2;
+    ex.output_lists = out_lists;
+    OT_CHECK(api->PJRT_LoadedExecutable_Execute(&ex) == nullptr && outs[0] != nullptr);
+    PJRT_Buffer_Device_Args obd = {};
+    obd.struct_size = PJRT_Buffer_Device_Args_STRUCT_SIZE;
+    obd.buffer = outs[0];
+    OT_CHECK(api->PJRT_Buffer_Device(&obd) == nullptr && obd.device == ad.addressable_devices[0]);
+
+    destroy_buf(b0);
+    destroy_buf(b1);
+    destroy_buf(outs[0]);
+    PJRT_LoadedExecutable_Destroy_Args led = {};
+    led.struct_size = PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
+    led.executable = ca.executable;
+    OT_CHECK(api->PJRT_LoadedExecutable_Destroy(&led) == nullptr);
+    PJRT_Client_Destroy_Args cd = {};
+    cd.struct_size = PJRT_Client_Destroy_Args_STRUCT_SIZE;
+    cd.client = cc.client;
+    OT_CHECK(api->PJRT_Client_Destroy(&cd) == nullptr);
+  }
+
+  // 3. 2-chiplet mock: per-device isolated HBM, 1-replica executable returns 1 device,
+  //    and 2-replica Execute failure on replica 1 leaks zero buffers/events from replica 0.
+  {
+    setenv("OPENTPU_MOCK", "1", 1);
+    setenv("OPENTPU_MOCK_CHIP", "tpu7x", 1);
+    setenv("OPENTPU_MOCK_TOPOLOGY", "tpu7x-1t", 1);
+
+    PJRT_Client_Create_Args cc = {};
+    cc.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
+    OT_CHECK(api->PJRT_Client_Create(&cc) == nullptr && cc.client != nullptr);
+
+    PJRT_Client_AddressableDevices_Args ad = {};
+    ad.struct_size = PJRT_Client_AddressableDevices_Args_STRUCT_SIZE;
+    ad.client = cc.client;
+    OT_CHECK(api->PJRT_Client_AddressableDevices(&ad) == nullptr);
+    OT_CHECK(ad.num_addressable_devices == 2u);
+    PJRT_Device* dev0 = ad.addressable_devices[0];
+    PJRT_Device* dev1 = ad.addressable_devices[1];
+
+    // Isolated mock contexts: uploading to dev0 changes dev0 HBM only, leaving dev1 at 0.
+    std::vector<uint16_t> ones(16, 0x3f80u);
+    std::vector<uint16_t> twos(16, 0x4000u);
+    PJRT_Buffer* d0_a = upload_bf16(cc.client, dev0, ones, 4, 4);
+    PJRT_Buffer* d0_b = upload_bf16(cc.client, dev0, ones, 4, 4);
+    OT_CHECK(get_mem_used(dev0) > 0);
+    OT_CHECK(get_mem_used(dev1) == 0);
+
+    // 1-replica executable on 2-chiplet client must advertise ONLY 1 assigned device and execute with num_devices=1.
+    PJRT_Client_Compile_Args ca1 = {};
+    ca1.struct_size = PJRT_Client_Compile_Args_STRUCT_SIZE;
+    ca1.client = cc.client;
+    ca1.program = &prog;
+    OT_CHECK(api->PJRT_Client_Compile(&ca1) == nullptr && ca1.executable != nullptr);
+
+    PJRT_LoadedExecutable_AddressableDevices_Args lead1 = {};
+    lead1.struct_size = PJRT_LoadedExecutable_AddressableDevices_Args_STRUCT_SIZE;
+    lead1.executable = ca1.executable;
+    OT_CHECK(api->PJRT_LoadedExecutable_AddressableDevices(&lead1) == nullptr);
+    OT_CHECK(lead1.num_addressable_devices == 1u && lead1.addressable_devices[0] == dev0);
+
+    PJRT_Buffer* ins1[2] = {d0_a, d0_b};
+    PJRT_Buffer* outs1[1] = {nullptr};
+    PJRT_Buffer* const* arg_lists1[1] = {ins1};
+    PJRT_Buffer** const out_lists1[1] = {outs1};
+    PJRT_ExecuteOptions eopts = {};
+    eopts.struct_size = PJRT_ExecuteOptions_STRUCT_SIZE;
+    PJRT_LoadedExecutable_Execute_Args ex1 = {};
+    ex1.struct_size = PJRT_LoadedExecutable_Execute_Args_STRUCT_SIZE;
+    ex1.executable = ca1.executable;
+    ex1.options = &eopts;
+    ex1.argument_lists = arg_lists1;
+    ex1.num_devices = 1;
+    ex1.num_args = 2;
+    ex1.output_lists = out_lists1;
+    OT_CHECK(api->PJRT_LoadedExecutable_Execute(&ex1) == nullptr && outs1[0] != nullptr);
+    destroy_buf(outs1[0]);
+
+    PJRT_LoadedExecutable_Destroy_Args led1 = {};
+    led1.struct_size = PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
+    led1.executable = ca1.executable;
+    OT_CHECK(api->PJRT_LoadedExecutable_Destroy(&led1) == nullptr);
+
+    // 2-replica executable: replica 0 valid, replica 1 has shape mismatch -> must fail with zero leaks.
+    const char opt_rep2[] = {0x1a, 0x02, 0x20, 0x02};
+    PJRT_Client_Compile_Args ca2 = {};
+    ca2.struct_size = PJRT_Client_Compile_Args_STRUCT_SIZE;
+    ca2.client = cc.client;
+    ca2.program = &prog;
+    ca2.compile_options = opt_rep2;
+    ca2.compile_options_size = sizeof(opt_rep2);
+    OT_CHECK(api->PJRT_Client_Compile(&ca2) == nullptr && ca2.executable != nullptr);
+
+    PJRT_LoadedExecutable_AddressableDevices_Args lead2 = {};
+    lead2.struct_size = PJRT_LoadedExecutable_AddressableDevices_Args_STRUCT_SIZE;
+    lead2.executable = ca2.executable;
+    OT_CHECK(api->PJRT_LoadedExecutable_AddressableDevices(&lead2) == nullptr);
+    OT_CHECK(lead2.num_addressable_devices == 2u &&
+             lead2.addressable_devices[0] == dev0 &&
+             lead2.addressable_devices[1] == dev1);
+
+    PJRT_Buffer* d1_a = upload_bf16(cc.client, dev1, twos, 4, 4);
+    std::vector<uint16_t> bad_rhs_data(8, 0x4000u);
+    PJRT_Buffer* d1_bad = upload_bf16(cc.client, dev1, bad_rhs_data, 2, 4);
+
+    const int64_t dev0_used_before = get_mem_used(dev0);
+    const int64_t dev1_used_before = get_mem_used(dev1);
+
+    PJRT_Buffer* r0_in[2] = {d0_a, d0_b};
+    PJRT_Buffer* r1_bad_in[2] = {d1_a, d1_bad};
+    PJRT_Buffer* const* bad_arg_lists[2] = {r0_in, r1_bad_in};
+    PJRT_Buffer* r0_out[1] = {nullptr};
+    PJRT_Buffer* r1_out[1] = {nullptr};
+    PJRT_Buffer** const rep_out_lists[2] = {r0_out, r1_out};
+    PJRT_Event* rep_evs[2] = {nullptr, nullptr};
+
+    PJRT_LoadedExecutable_Execute_Args ex_fail = {};
+    ex_fail.struct_size = PJRT_LoadedExecutable_Execute_Args_STRUCT_SIZE;
+    ex_fail.executable = ca2.executable;
+    ex_fail.options = &eopts;
+    ex_fail.argument_lists = bad_arg_lists;
+    ex_fail.num_devices = 2;
+    ex_fail.num_args = 2;
+    ex_fail.output_lists = rep_out_lists;
+    ex_fail.device_complete_events = rep_evs;
+    PJRT_Error* fail_err = api->PJRT_LoadedExecutable_Execute(&ex_fail);
+    OT_CHECK(fail_err != nullptr);
+    OT_CHECK(get_err_code(fail_err) == PJRT_Error_Code_INVALID_ARGUMENT);
+    destroy_pjrt_error(api, fail_err);
+
+    // Caller outputs/events untouched and dev0 HBM released completely (zero leaked buffers/events).
+    OT_CHECK(r0_out[0] == nullptr && r1_out[0] == nullptr);
+    OT_CHECK(rep_evs[0] == nullptr && rep_evs[1] == nullptr);
+    OT_CHECK(get_mem_used(dev0) == dev0_used_before);
+    OT_CHECK(get_mem_used(dev1) == dev1_used_before);
+
+    // Valid 2-replica Execute succeeds on both devices independently.
+    PJRT_Buffer* d1_b = upload_bf16(cc.client, dev1, twos, 4, 4);
+    PJRT_Buffer* r1_ok_in[2] = {d1_a, d1_b};
+    PJRT_Buffer* const* ok_arg_lists[2] = {r0_in, r1_ok_in};
+    PJRT_LoadedExecutable_Execute_Args ex_ok = ex_fail;
+    ex_ok.argument_lists = ok_arg_lists;
+    OT_CHECK(api->PJRT_LoadedExecutable_Execute(&ex_ok) == nullptr);
+    OT_CHECK(r0_out[0] != nullptr && r1_out[0] != nullptr);
+    OT_CHECK(rep_evs[0] != nullptr && rep_evs[1] != nullptr);
+
+    std::vector<uint16_t> out0_h(16, 0), out1_h(16, 0);
+    auto read_back = [&](PJRT_Buffer* b, std::vector<uint16_t>& dst) {
+      PJRT_Buffer_ToHostBuffer_Args th = {};
+      th.struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE;
+      th.src = b;
+      th.dst = dst.data();
+      th.dst_size = dst.size() * sizeof(uint16_t);
+      OT_CHECK(api->PJRT_Buffer_ToHostBuffer(&th) == nullptr);
+      if (th.event) {
+        PJRT_Event_Destroy_Args ed = {};
+        ed.struct_size = PJRT_Event_Destroy_Args_STRUCT_SIZE;
+        ed.event = th.event;
+        OT_CHECK(api->PJRT_Event_Destroy(&ed) == nullptr);
+      }
+    };
+    read_back(r0_out[0], out0_h);
+    read_back(r1_out[0], out1_h);
+    for (uint16_t v : out0_h) OT_CHECK(v == 0x4080u);  // 4 * (1 * 1) = 4.0
+    for (uint16_t v : out1_h) OT_CHECK(v == 0x4180u);  // 4 * (2 * 2) = 16.0
+
+    for (PJRT_Event* ev : rep_evs) {
+      PJRT_Event_Destroy_Args ed = {};
+      ed.struct_size = PJRT_Event_Destroy_Args_STRUCT_SIZE;
+      ed.event = ev;
+      OT_CHECK(api->PJRT_Event_Destroy(&ed) == nullptr);
+    }
+    for (PJRT_Buffer* b : {d0_a, d0_b, d1_a, d1_b, d1_bad, r0_out[0], r1_out[0]}) {
+      destroy_buf(b);
+    }
+    PJRT_LoadedExecutable_Destroy_Args led2 = {};
+    led2.struct_size = PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
+    led2.executable = ca2.executable;
+    OT_CHECK(api->PJRT_LoadedExecutable_Destroy(&led2) == nullptr);
+    PJRT_Client_Destroy_Args cd = {};
+    cd.struct_size = PJRT_Client_Destroy_Args_STRUCT_SIZE;
+    cd.client = cc.client;
+    OT_CHECK(api->PJRT_Client_Destroy(&cd) == nullptr);
+  }
+
+  unsetenv("OPENTPU_MOCK_TOPOLOGY");
+  unsetenv("OPENTPU_MOCK_CHIP");
+  unsetenv("OPENTPU_MOCK");
+  printf("[PASS] test_pjrt_multidevice_isolation_and_topology\n");
+}
+
 int main() {
   test_iova_allocator();
   test_bar4_descriptor_parser();
@@ -1743,6 +2183,7 @@ int main() {
   test_resident_imem_stub_structure();
   test_multigen_hal_geometry_and_rebar();
   test_pjrt_dual_chiplet_tpu7x_enumeration();
+  test_pjrt_multidevice_isolation_and_topology();
   printf("ALL_HOST_TESTS_PASSED\n");
   return 0;
 }
