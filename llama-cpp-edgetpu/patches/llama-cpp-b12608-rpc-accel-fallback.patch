@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
-index e4a84cb..c55d41c 100644
+index e4a84cb..ca5a0b2 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
 @@ -127,7 +127,9 @@ struct rpc_msg_hello_req {
@@ -87,7 +87,7 @@ index e4a84cb..c55d41c 100644
      LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
  }
  
-@@ -2181,6 +2215,248 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
+@@ -2181,6 +2215,253 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
      return result;
  }
  
@@ -97,6 +97,11 @@ index e4a84cb..c55d41c 100644
 +    }
 +    return node->op != GGML_OP_MAP_CUSTOM1 && node->op != GGML_OP_MAP_CUSTOM2 &&
 +           node->op != GGML_OP_MAP_CUSTOM3 && node->op != GGML_OP_CUSTOM;
++}
++
++static bool rpc_op_is_noop(enum ggml_op op) {
++    return op == GGML_OP_NONE || op == GGML_OP_RESHAPE || op == GGML_OP_VIEW ||
++           op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
 +}
 +
 +static bool rpc_tensor_storage_in_bounds(
@@ -215,6 +220,9 @@ index e4a84cb..c55d41c 100644
 +    if (node == nullptr) {
 +        return false;
 +    }
++    if (rpc_op_is_noop(node->op)) {
++        return true;
++    }
 +    auto f32_contig = [](const ggml_tensor * t) {
 +        return t != nullptr && !ggml_is_empty(t) && t->type == GGML_TYPE_F32 &&
 +               t->nb[0] == sizeof(float) && ggml_is_contiguous(t) &&
@@ -226,12 +234,6 @@ index e4a84cb..c55d41c 100644
 +               t->nb[0] == ggml_type_size(t->type) && ggml_is_contiguous_rows(t);
 +    };
 +    switch (node->op) {
-+        case GGML_OP_NONE:
-+        case GGML_OP_RESHAPE:
-+        case GGML_OP_VIEW:
-+        case GGML_OP_PERMUTE:
-+        case GGML_OP_TRANSPOSE:
-+            return true;
 +        case GGML_OP_SCALE:
 +        case GGML_OP_RMS_NORM: {
 +            const ggml_tensor * src0 = node->src[0];
@@ -294,7 +296,9 @@ index e4a84cb..c55d41c 100644
 +    int i = 0;
 +    while (i < graph->n_nodes) {
 +        while (i < graph->n_nodes &&
-+               (graph->nodes[i] == nullptr || (graph->nodes[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0)) { ++i; }
++               (graph->nodes[i] == nullptr ||
++                (graph->nodes[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
++                rpc_op_is_noop(graph->nodes[i]->op))) { ++i; }
 +        if (i >= graph->n_nodes) { break; }
 +        if (!rpc_node_storage_valid(graph->nodes[i], buffers)) {
 +            LOG_ERROR("[%s] rejecting invalid storage at node %d (op=%d)\n", __func__, i, (int) graph->nodes[i]->op);
@@ -304,7 +308,8 @@ index e4a84cb..c55d41c 100644
 +        int j = i + 1;
 +        while (j < graph->n_nodes) {
 +            ggml_tensor * node = graph->nodes[j];
-+            if (node == nullptr || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) { break; }
++            if (node == nullptr || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
++                rpc_op_is_noop(node->op)) { break; }
 +            if (!rpc_node_storage_valid(node, buffers)) {
 +                LOG_ERROR("[%s] rejecting invalid storage at node %d (op=%d)\n", __func__, j, (int) node->op);
 +                return GGML_STATUS_FAILED;
@@ -336,7 +341,7 @@ index e4a84cb..c55d41c 100644
  bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
      // serialization format:
      // | device (4 bytes) | uid (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
-@@ -2266,8 +2542,12 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+@@ -2266,8 +2547,12 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
      }
      const std::chrono::duration<double, std::milli> deserialize_ms = std::chrono::steady_clock::now() - t_deserialize;
  
@@ -351,7 +356,7 @@ index e4a84cb..c55d41c 100644
      sg.graph = graph;
      LOG_DBG3("[%s] device: %u, graph build: %.3f ms\n", __func__, device, deserialize_ms.count());
      return true;
-@@ -2285,8 +2565,11 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
+@@ -2285,8 +2570,11 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
      }
      ggml_cgraph * graph = it->second.graph;
      LOG_DBG("[%s] device: %u, uid: %" PRIu64 "\n", __func__, device, request.uid);
@@ -365,7 +370,7 @@ index e4a84cb..c55d41c 100644
      return true;
  }
  
-@@ -2655,11 +2938,15 @@ rpc_server::~rpc_server() {
+@@ -2655,11 +2943,15 @@ rpc_server::~rpc_server() {
      for (auto buffer : buffers) {
          ggml_backend_buffer_free(buffer);
      }
@@ -383,7 +388,7 @@ index e4a84cb..c55d41c 100644
      uint8_t cmd;
      if (!sock->recv_data(&cmd, 1)) {
          return;
-@@ -3047,7 +3334,7 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
+@@ -3047,7 +3339,7 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
              return;
          }
          LOG_INFO("Accepted client connection\n");
@@ -392,7 +397,7 @@ index e4a84cb..c55d41c 100644
          LOG_INFO("Client connection closed\n");
      }
      rpc_transport_shutdown();
-@@ -3112,8 +3399,15 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
+@@ -3112,8 +3404,15 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
  }
  
  static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {

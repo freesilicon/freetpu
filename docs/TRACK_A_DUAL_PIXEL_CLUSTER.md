@@ -75,10 +75,14 @@ Measured direct link: **`1.49 ms` min / `2.35 ms` avg** ping RTT (`0%` loss), **
 Bound the per-node `ext[2]` DMA-BUF LRU weight cache (`OPENBUENOS_WEIGHT_CACHE_MB=128`, `OPENBUENOS_POOL_MB=64`) to stay comfortably below Android LMKD limits while holding `~9 GiB` of model weights per phone:
 
 ```bash
-# Node 2 (mustang — bind RPC server to the direct USB-C NCM address):
-# Note: per upstream llama.cpp, ggml-rpc-server is unauthenticated and intended only for a
-# trusted, isolated point-to-point link (keep Wi-Fi off or restrict TCP 50052 to ncm0).
+# Node 2 (mustang — isolate TCP 50052 strictly to `ncm0` BEFORE starting the root RPC server):
+# Per upstream llama.cpp, ggml-rpc-server is unauthenticated. Either disable Wi-Fi (`svc wifi disable`)
+# before launch, or enforce an ingress rule allowing TCP 50052 only from `10.99.0.1` over `ncm0`:
 su -c '
+  iptables -D INPUT -p tcp --dport 50052 -i ncm0 -s 10.99.0.1/32 -d 10.99.0.2/32 -j ACCEPT 2>/dev/null || true
+  iptables -D INPUT -p tcp --dport 50052 -j DROP 2>/dev/null || true
+  iptables -I INPUT 1 -p tcp --dport 50052 -j DROP
+  iptables -I INPUT 1 -p tcp --dport 50052 -i ncm0 -s 10.99.0.1/32 -d 10.99.0.2/32 -j ACCEPT
   OPENBUENOS_VERBOSE=1 OPENBUENOS_WEIGHT_CACHE_MB=128 OPENBUENOS_WEIGHT_CACHE_ENTRIES=256 OPENBUENOS_POOL_MB=64 \
   /data/local/tmp/llama-edgetpu-rpc/ggml-rpc-server -d EDGETPU -H 10.99.0.2 -p 50052 -t 4
 '
@@ -117,7 +121,7 @@ su -c '
   - **End-to-End Timing**: `load = 223.45 s` (`9.03 GiB` streamed over 5 Gbps USB-C NCM), `prompt eval = 0.06 t/s` (`5 tok`), `eval = 0.01 t/s` (`7 runs`).
   - **Bottleneck Diagnosis**: With `OPENBUENOS_WEIGHT_CACHE_MB=128` protecting 16 GB LMKD, every token evicted and re-packed `Q4_0 → ext[2]` weights on CPU (`wall_us / hw_us = 58.7×`). Pure Tensor G5 silicon ran ~50× faster (`~0.68 s/tok` per node), directly motivating **single-copy pre-packed `ext[2]` residency** for fast 32B decode.
 
-### 3.2 `Qwen2.5-1.5B-Q8_0` (`1.76 GiB`) Benchmark Matrix (`llama-bench -p 128 -n 32 -r 2 -t 4`)
+### 3.2 `Qwen2.5-1.5B-Q8_0` (`1.76 GiB`) Benchmark Matrix (`llama-bench -p 128 -n 32 -r 2 -t 4`, plus `--no-kv-offload 1` for `RPC → EDGETPU` rows)
 
 | Topology | Interconnect | `ngl` | Model Load (`853 MiB`) | Sync Wire RTT | `pp128` (`t/s`) | `tg32` (`t/s`) |
 | --- | --- | ---: | ---: | --- | ---: | ---: |
