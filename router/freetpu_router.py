@@ -794,7 +794,7 @@ def _parse_inference_request_fields(
         req_text = raw_req.decode("utf-8")
         req_payload = json.loads(req_text)
         del req_text
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         return None, (400, None, f"Malformed JSON request: {exc}")
 
     if not isinstance(req_payload, dict):
@@ -1130,7 +1130,7 @@ def _extract_non_stream_usage(
     if parsed_resp is None:
         try:
             loaded = json.loads(raw_resp.decode("utf-8", errors="replace"))
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, ValueError):
             return prompt_tokens, completion_tokens
         if not isinstance(loaded, Mapping):
             return prompt_tokens, completion_tokens
@@ -1278,7 +1278,7 @@ def _classify_sse_error_event(
             else:
                 try:
                     parsed = json.loads(payload_bytes.decode("utf-8", errors="replace"))
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, ValueError):
                     parsed = None
 
     has_err_obj = isinstance(parsed, Mapping) and (
@@ -1368,7 +1368,7 @@ def _sse_event_should_commit(
         )
         try:
             obj = json.loads(payload_bytes.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             raise _MalformedSSEPayloadError("Malformed JSON in upstream SSE event") from exc
     if not isinstance(obj, Mapping):
         raise _MalformedSSEPayloadError("Upstream SSE event JSON must be an object")
@@ -1910,7 +1910,7 @@ class RouterEngine:
                     loaded = json.loads(raw.decode("utf-8", errors="replace"))
                     if isinstance(loaded, (dict, list)):
                         parsed_json = loaded
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, ValueError):
                     parsed_json = None
             return resp.status, parsed_json, rtt_ms, None
         except (OSError, TimeoutError, ValueError, OverflowError, http.client.HTTPException) as exc:
@@ -4333,7 +4333,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                         resp_text = raw_resp.decode("utf-8")
                                         loaded_resp = json.loads(resp_text)
                                         del resp_text
-                                    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                                    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
                                         raise http.client.IncompleteRead(raw_resp) from exc
                                     else:
                                         if not isinstance(loaded_resp, Mapping):
@@ -4783,7 +4783,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                     pre_text = payload_bytes.decode("utf-8", errors="replace")
                                 try:
                                     parsed_pre = json.loads(pre_text)
-                                except json.JSONDecodeError:
+                                except (json.JSONDecodeError, ValueError):
                                     pre_parse_invalid_json = True
                                     parsed_pre = None
                                 finally:
@@ -5218,7 +5218,9 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                         completion_tokens = sum(t_c_vals)
                                         saw_timings_completion = True
                         return made_progress, False
-                except (UnicodeDecodeError, json.JSONDecodeError):
+                except _JsonStructureLimitError:
+                    raise
+                except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
                     saw_upstream_error_event = True
                     return False, False
 

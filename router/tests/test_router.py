@@ -13262,6 +13262,45 @@ asyncio.run(main())
             self.assertFalse(ready)
             self.assertEqual(reason, "tpu_exporter_invalid_metrics")
 
+    def test_oversized_integer_in_json_request_returns_400_json(self) -> None:
+        backend = self._track(_MockOpenAIBackend("bigint-b", ["m-bigint"]))
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            backends=[
+                BackendConfig(
+                    id="bigint-b",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=backend.base_url,
+                    models=["m-bigint"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        raw_payload = (
+            '{"model":"m-bigint","messages":[],"max_tokens":' + ("9" * 5000) + "}"
+        ).encode("utf-8")
+        conn = http.client.HTTPConnection("127.0.0.1", rport, timeout=3.0)
+        try:
+            conn.request(
+                "POST",
+                "/v1/chat/completions",
+                body=raw_payload,
+                headers={"Content-Type": "application/json"},
+            )
+            resp = conn.getresponse()
+            body = resp.read()
+        finally:
+            conn.close()
+        self.assertEqual(resp.status, 400)
+        parsed = json.loads(body.decode("utf-8"))
+        self.assertIn("error", parsed)
+        self.assertEqual(parsed["error"].get("type"), "invalid_request_error")
+        self.assertEqual(len(backend.requests_seen), 0)
+
 
 def run_self_tests(verbosity: int = 1) -> int:
     """Run all router tests cleanly via unittest."""
