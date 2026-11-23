@@ -1946,14 +1946,30 @@ TPU Runtime Utilization
                 create_vfio_nodes=["3", "2", "4"],
             )
 
-            created_channels: list[str] = []
+            created_channels: list[tuple[str, object, object]] = []
             rpc_calls: list[tuple[str, float]] = []
 
+            class _FakeLocalConnType:
+                LOCAL_TCP = "LOCAL_TCP"
+                UDS = "UDS"
+
             class _FakeGrpc:
+                LocalConnectionType = _FakeLocalConnType
+
                 @staticmethod
-                def insecure_channel(addr: str):
-                    created_channels.append(addr)
-                    return SimpleNamespace(addr=addr)
+                def local_channel_credentials(conn_type):
+                    return ("local_creds", conn_type)
+
+                @staticmethod
+                def secure_channel(addr: str, creds, options=None):
+                    created_channels.append((addr, creds, list(options or [])))
+                    return SimpleNamespace(addr=addr, creds=creds, options=options)
+
+                @staticmethod
+                def insecure_channel(addr: str, options=None):
+                    raise AssertionError(
+                        f"must use local_channel_credentials + secure_channel, not insecure_channel({addr!r})"
+                    )
 
             class _FakeMetricRequest:
                 def __init__(self, metric_name: str):
@@ -2098,8 +2114,37 @@ TPU Runtime Utilization
 
             self.assertTrue(snap1.tpu_info_available)
             self.assertTrue(snap2.tpu_info_available)
-            # Persistent channel reused across scrapes.
-            self.assertEqual(created_channels, ["127.0.0.1:8431"])
+            # Persistent local-transport channel reused across scrapes with proxy disabled.
+            self.assertEqual(
+                created_channels,
+                [
+                    (
+                        "127.0.0.1:8431",
+                        ("local_creds", "LOCAL_TCP"),
+                        [("grpc.enable_http_proxy", 0)],
+                    )
+                ],
+            )
+            # Non-local gRPC targets MUST be rejected before opening a channel.
+            with (
+                mock.patch.dict(_te._GRPC_CHANNELS, {}, clear=True),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "grpc": _FakeGrpc,
+                        "tpu_info": SimpleNamespace(),
+                        "tpu_info.proto": SimpleNamespace(),
+                        "tpu_info.proto.tpu_metric_service_pb2": fake_pb2,
+                        "tpu_info.proto.tpu_metric_service_pb2_grpc": fake_pb2_grpc,
+                    },
+                ),
+            ):
+                ok_remote, err_remote, rows_remote = _te._query_grpc_runtime_metrics(
+                    snap1.devices, addr="10.0.0.5:8431"
+                )
+            self.assertFalse(ok_remote)
+            self.assertIn("non-local", err_remote or "")
+            self.assertEqual(rows_remote, {})
             self.assertEqual(snap1.devices[0].telemetry_source, "libtpu-grpc")
             self.assertEqual(snap1.devices[0].hbm_used_bytes, 16 * 1024**3)
             self.assertAlmostEqual(snap1.devices[0].duty_cycle_percent or 0.0, 72.5)
@@ -2702,6 +2747,37 @@ TPU Runtime Utilization
             self.assertEqual(d_inv.hbm_total_bytes, 30 * 1024**3)
             ratio = d_inv.hbm_used_bytes / d_inv.hbm_total_bytes
             self.assertGreater(ratio, 0.95)
+
+            # Even when runtime supplies a 32 GiB HBM total WITHOUT HBM usage,
+            # SHM usage (29 GiB of a 30 GiB SHM pool) MUST pair with SHM pool
+            # capacity (30 GiB -> 96.7%), not the runtime's 32 GiB total (90.6%).
+            total_only_row = tpu_exporter._TpuInfoRow(
+                chip_key="0",
+                hbm_used_bytes=None,
+                hbm_total_bytes=32 * 1024**3,
+                duty_cycle_percent=50.0,
+                in_util_table=True,
+            )
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_query_grpc_runtime_metrics",
+                    return_value=(True, None, {"0": total_only_row}),
+                ),
+            ):
+                total_only_snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin="tpu-info",
+                    chip_id_map={"0000:00:0b.0": "0"},
+                    shm_root=shm_root,
+                )
+            d_tot = total_only_snap.devices[0]
+            self.assertEqual(d_tot.hbm_used_bytes, 29 * 1024**3)
+            self.assertEqual(d_tot.hbm_total_bytes, 30 * 1024**3)
+            self.assertGreater(d_tot.hbm_used_bytes / d_tot.hbm_total_bytes, 0.95)
 
             # Restore original payload for subsequent SHM security/torn-read tests.
             shm_file.write_bytes(payload)

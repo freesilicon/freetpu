@@ -986,8 +986,16 @@ def _compute_topology_slices(
     bdf_to_phys: Dict[str, int],
     *,
     reserved_names: Optional[set[str]] = None,
+    chip_id_map: Optional[Dict[str, int]] = None,
 ) -> List[_TopologySlice]:
-    """Compute valid single-domain NUMA / PCIe sub-host slices and their canonical aliases."""
+    """Compute valid single-domain NUMA / PCIe sub-host slices and their canonical aliases.
+
+    Numeric range aliases (e.g. `0-3`, `4-7`) are emitted ONLY from verified
+    stable runtime chip IDs (sysfs `chip_id` or explicit `--chip-id-map`) so
+    losing a chip in one NUMA domain never renumbers a healthy sibling slice
+    (e.g. turning `4-7` into `3-6`). When verified chip IDs are unavailable,
+    only the topology selector (`numa*` or `pcie*`) is emitted.
+    """
     domains: Dict[Tuple[str, Optional[int], str], List[DiscoveredChip]] = {}
     for chip in chips:
         domains.setdefault(_topology_domain_key(chip), []).append(chip)
@@ -1040,10 +1048,17 @@ def _compute_topology_slices(
             if use_explicit_numa and discovered_numa is not None
             else [f"pcie{dom_ordinal}"]
         )
-        if list(slice_phys_indices) == list(
-            range(slice_phys_indices[0], slice_phys_indices[0] + len(slice_phys_indices))
-        ):
-            candidate_names.append(f"{slice_phys_indices[0]}-{slice_phys_indices[-1]}")
+        verified_vis = _resolve_verified_visibility_ordinals(
+            d_chips,
+            chips,
+            bdf_to_phys,
+            chip_id_map=chip_id_map,
+            is_full_host_all=False,
+        )
+        if verified_vis is not None:
+            vis_chips, _vis_devs = verified_vis
+            if vis_chips and vis_chips == list(range(vis_chips[0], vis_chips[0] + len(vis_chips))):
+                candidate_names.append(f"{vis_chips[0]}-{vis_chips[-1]}")
 
         aliases: List[str] = []
         for s_name in candidate_names:
@@ -1256,7 +1271,9 @@ def build_cdi_spec(
     # `numa1`, `pcie0`, `0-3`, `4-7` on `v6e-8`) strictly within matching NUMA /
     # PCIe root complex boundaries.
     used_names = {d["name"] for d in devices}
-    for topo_slice in _compute_topology_slices(chips, bdf_to_phys, reserved_names=used_names):
+    for topo_slice in _compute_topology_slices(
+        chips, bdf_to_phys, reserved_names=used_names, chip_id_map=chip_id_map
+    ):
         slice_nodes, slice_devnums = _dedup_device_nodes(topo_slice.chips)
         slice_visibility = _resolve_verified_visibility_ordinals(
             topo_slice.chips,
@@ -1874,6 +1891,7 @@ def verify_spec_against_host(
     dev_root: Path = Path("/dev"),
     iommu_dev_path: Optional[Path] = None,
     vfio_mode: str = "auto",
+    chip_id_map: Optional[Dict[str, int]] = None,
 ) -> List[str]:
     """Revalidate all effective global and per-device CDI nodes against live host VFIO/iommufd state.
 
@@ -1936,6 +1954,7 @@ def verify_spec_against_host(
         live_chips,
         _map_physical_chip_indices(live_chips),
         reserved_names=live_reserved_names,
+        chip_id_map=chip_id_map,
     ):
         for alias in topo_slice.aliases:
             expected_slices_by_name[alias] = topo_slice
@@ -2449,6 +2468,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional override path for /dev/iommu probing in --check-host mode.",
     )
+    val.add_argument(
+        "--chip-id-map",
+        default=None,
+        help=(
+            "Optional JSON object or file path mapping PCI BDF -> verified runtime "
+            "chip/device ordinal (used with --check-host to verify numeric range aliases)."
+        ),
+    )
 
     sync = sub.add_parser(
         "sync",
@@ -2666,6 +2693,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 1
         errors = validate_cdi_spec(parsed)
         if not errors and args.check_host:
+            try:
+                val_chip_map = _load_chip_id_map(args.chip_id_map)
+            except Exception as exc:  # noqa: BLE001
+                sys.stderr.write(f"freetpu-cdi validate failed: invalid --chip-id-map: {exc}\n")
+                return 1
             errors.extend(
                 verify_spec_against_host(
                     parsed,
@@ -2673,6 +2705,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     dev_root=args.dev_root,
                     iommu_dev_path=args.iommu_dev,
                     vfio_mode=args.vfio_mode,
+                    chip_id_map=val_chip_map,
                 )
             )
         if errors:

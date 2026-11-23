@@ -36,6 +36,7 @@ import importlib
 import importlib.util
 import inspect
 import io
+import ipaddress
 import json
 import math
 import os
@@ -1021,11 +1022,75 @@ def _load_grpc_runtime_modules() -> Optional[Tuple[Any, Any, Any]]:
     return None
 
 
+def _parse_local_grpc_target(addr: str) -> str:
+    """Validate that `addr` targets a local transport and return `'uds'` or `'tcp'`.
+
+    Matches upstream `tpu_info/metrics.py` local-only transport guarantees so
+    process proxy settings or non-loopback targets cannot divert local `libtpu`
+    telemetry to a remote endpoint.
+    """
+    target = addr.strip()
+    if not target:
+        raise ValueError("Empty gRPC runtime metrics address")
+    if target.startswith("unix:") or target.startswith("unix-abstract:"):
+        return "uds"
+
+    raw = target
+    for scheme in ("ipv4:", "ipv6:", "dns:///"):
+        if raw.startswith(scheme):
+            raw = raw[len(scheme):]
+            break
+
+    host = ""
+    if raw.startswith("["):
+        end_bracket = raw.find("]")
+        if end_bracket <= 1:
+            raise ValueError(f"Malformed IPv6 gRPC runtime metrics address: {addr!r}")
+        host = raw[1:end_bracket]
+    elif ":" in raw:
+        host, _port = raw.rsplit(":", 1)
+    else:
+        host = raw
+
+    host_lower = host.strip().lower()
+    if host_lower == "localhost":
+        return "tcp"
+    try:
+        if ipaddress.ip_address(host_lower).is_loopback:
+            return "tcp"
+    except ValueError:
+        pass
+    raise ValueError(
+        f"Refusing non-local runtime metrics gRPC target {addr!r}: "
+        "only loopback TCP (127.0.0.1, ::1, localhost) and local UDS endpoints are permitted"
+    )
+
+
 def _get_grpc_channel(grpc_mod: Any, addr: str) -> Any:
+    transport = _parse_local_grpc_target(addr)
     with _GRPC_CHANNEL_LOCK:
         channel = _GRPC_CHANNELS.get(addr)
         if channel is None:
-            channel = grpc_mod.insecure_channel(addr)
+            local_creds_fn = getattr(grpc_mod, "local_channel_credentials", None)
+            local_conn_type = getattr(grpc_mod, "LocalConnectionType", None)
+            secure_channel_fn = getattr(grpc_mod, "secure_channel", None)
+            if not (
+                callable(local_creds_fn)
+                and local_conn_type is not None
+                and callable(secure_channel_fn)
+            ):
+                raise RuntimeError(
+                    "grpc module lacks local_channel_credentials / secure_channel required for local-only libtpu telemetry"
+                )
+            conn_type = (
+                local_conn_type.UDS if transport == "uds" else local_conn_type.LOCAL_TCP
+            )
+            creds = local_creds_fn(conn_type)
+            channel = secure_channel_fn(
+                addr,
+                creds,
+                options=[("grpc.enable_http_proxy", 0)],
+            )
             _GRPC_CHANNELS[addr] = channel
         return channel
 
@@ -2009,7 +2074,6 @@ def collect_snapshot(
             matched_util = util_rows[matched_key]
             mapped_util_keys[matched_key] = dev.pci_bdf
 
-        has_measured_hbm_total = False
         if matched_util is not None:
             if (
                 matched_util.hbm_used_bytes is not None
@@ -2022,7 +2086,6 @@ def collect_snapshot(
                 dev.hbm_used_bytes = matched_util.hbm_used_bytes
             if matched_util.hbm_total_bytes is not None:
                 dev.hbm_total_bytes = matched_util.hbm_total_bytes
-                has_measured_hbm_total = True
             if matched_util.duty_cycle_percent is not None:
                 dev.duty_cycle_percent = matched_util.duty_cycle_percent
             if matched_util.hbm_bw_util_percent is not None:
@@ -2044,7 +2107,7 @@ def collect_snapshot(
                 dev.hbm_used_bytes = shm.hbm_used_bytes
                 used_from_shm = True
             if shm.hbm_allocated_bytes > 0 and (
-                dev.hbm_total_bytes is None or (used_from_shm and not has_measured_hbm_total)
+                dev.hbm_total_bytes is None or used_from_shm
             ):
                 dev.hbm_total_bytes = shm.hbm_allocated_bytes
             if dev.telemetry_source == "sysfs-fallback":

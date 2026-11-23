@@ -2198,8 +2198,14 @@ class FreeTpuCdiTests(unittest.TestCase):
                 )
 
                 by_name = {d["name"]: d for d in spec["devices"]}
-                for slice_name in ("numa0", "0-3", "numa1", "4-7", "all"):
+                # Without verified sysfs `chip_id` or `--chip-id-map`, only topology
+                # selectors (`numa0`, `numa1`, `all`) are emitted — volatile discovery-order
+                # numeric range aliases (`0-3`, `4-7`) are omitted so losing a chip in one
+                # NUMA domain never renumbers a healthy sibling slice.
+                for slice_name in ("numa0", "numa1", "all"):
                     self.assertIn(slice_name, by_name)
+                self.assertNotIn("0-3", by_name)
+                self.assertNotIn("4-7", by_name)
 
                 # NUMA 0 slice strictly binds 0000:00:* chips 0..3 with 2,2,1 bounds.
                 numa0 = by_name["numa0"]
@@ -2257,6 +2263,17 @@ class FreeTpuCdiTests(unittest.TestCase):
                 )
                 self.assertEqual(m_n1_env["TPU_VISIBLE_CHIPS"], "0,1,2,3")
                 self.assertEqual(m_n1_env["TPU_VISIBLE_DEVICES"], "0,1,2,3")
+                self.assertIn("4-7", mapped_by_name)
+                self.assertIn("0-3", mapped_by_name)
+                self.assertEqual(
+                    freetpu_cdi.verify_spec_against_host(
+                        mapped_spec,
+                        sysfs_root=sysfs_root,
+                        dev_root=dev_root,
+                        chip_id_map=reordered_map,
+                    ),
+                    [],
+                )
 
                 # Full 8-chip v6e-8 `all` uses 2,4,1 bounds and full-host 0..7 visibility.
                 all_env = dict(kv.split("=", 1) for kv in by_name["all"]["containerEdits"]["env"])
@@ -2281,22 +2298,18 @@ class FreeTpuCdiTests(unittest.TestCase):
                     errs_cross,
                 )
 
-                # Swapping/renaming `numa1` -> `numa0` (and `4-7` -> `0-3`) while keeping
-                # valid single-domain nodes and annotations MUST fail --check-host!
+                # Swapping/renaming `numa1` -> `numa0` while keeping valid single-domain
+                # nodes and annotations MUST fail --check-host!
                 swapped = json.loads(json.dumps(spec))
                 for dev in swapped["devices"]:
                     if dev["name"] == "numa0":
                         dev["name"] = "numa1"
                     elif dev["name"] == "numa1":
                         dev["name"] = "numa0"
-                    elif dev["name"] == "0-3":
-                        dev["name"] = "4-7"
-                    elif dev["name"] == "4-7":
-                        dev["name"] = "0-3"
                 errs_swap = freetpu_cdi.verify_spec_against_host(
                     swapped, sysfs_root=sysfs_root, dev_root=dev_root
                 )
-                for bad_alias in ("numa0", "numa1", "0-3", "4-7"):
+                for bad_alias in ("numa0", "numa1"):
                     self.assertTrue(
                         any(
                             f"device '{bad_alias}'" in e
@@ -2304,6 +2317,29 @@ class FreeTpuCdiTests(unittest.TestCase):
                             for e in errs_swap
                         ),
                         f"Expected swapped alias error for {bad_alias}, got {errs_swap}",
+                    )
+                # Also verify swapping numeric range aliases (`0-3` <-> `4-7`) on a spec
+                # with verified chip IDs fails --check-host!
+                swapped_mapped = json.loads(json.dumps(mapped_spec))
+                for dev in swapped_mapped["devices"]:
+                    if dev["name"] == "0-3":
+                        dev["name"] = "4-7"
+                    elif dev["name"] == "4-7":
+                        dev["name"] = "0-3"
+                errs_swap_mapped = freetpu_cdi.verify_spec_against_host(
+                    swapped_mapped,
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    chip_id_map=reordered_map,
+                )
+                for bad_alias in ("0-3", "4-7"):
+                    self.assertTrue(
+                        any(
+                            f"device '{bad_alias}'" in e
+                            and "does not match live host topology" in e
+                            for e in errs_swap_mapped
+                        ),
+                        f"Expected swapped range alias error for {bad_alias}, got {errs_swap_mapped}",
                     )
 
                 # Unknown slice alias (e.g. `numa2` on a 2-NUMA host) must also fail --check-host!
@@ -2360,6 +2396,37 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertTrue(
                     any("device 'numa0'" in e for e in errs_deg_old),
                     errs_deg_old,
+                )
+
+                # With verified sysfs `chip_id` (0..3 on NUMA 0, 4..7 on NUMA 1), losing
+                # chip 0 on NUMA 0 MUST keep healthy NUMA 1 stable as `numa1` + `4-7`
+                # and NEVER renumber it to `3-6`!
+                deg_vid_root = root / "v6e8_degraded_verified_ids"
+                v6e8_verified = [
+                    {**d, "chip_id": str(idx)} for idx, d in enumerate(v6e8_devices)
+                ]
+                deg_vid_sys, deg_vid_dev = _make_mock_pci_vfio(
+                    deg_vid_root,
+                    devices=v6e8_verified[1:],  # chip 0 gone; NUMA 0 has 1,2,3; NUMA 1 has 4,5,6,7
+                    create_vfio_nodes=[str(i) for i in range(1, 8)],
+                )
+                deg_vid_chips, deg_vid_ctrl = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=deg_vid_sys, dev_root=deg_vid_dev
+                )
+                deg_vid_spec = freetpu_cdi.build_cdi_spec(
+                    deg_vid_chips, deg_vid_ctrl, single_host_env=True
+                )
+                deg_vid_by_name = {d["name"]: d for d in deg_vid_spec["devices"]}
+                self.assertNotIn("numa0", deg_vid_by_name)
+                self.assertNotIn("0-2", deg_vid_by_name)
+                self.assertNotIn("3-6", deg_vid_by_name)
+                self.assertIn("numa1", deg_vid_by_name)
+                self.assertIn("4-7", deg_vid_by_name)
+                self.assertEqual(
+                    freetpu_cdi.verify_spec_against_host(
+                        deg_vid_spec, sysfs_root=deg_vid_sys, dev_root=deg_vid_dev
+                    ),
+                    [],
                 )
 
             # Verify tpu7x Ironwood 4-chip VM (8 PCI functions across 0x0076 / 0x0075):
@@ -2515,7 +2582,9 @@ class FreeTpuCdiTests(unittest.TestCase):
                     [],
                 )
                 sw_by_name = {d["name"]: d for d in sw_spec["devices"]}
-                self.assertTrue({"pcie0", "0-3", "pcie1", "4-7", "all"} <= set(sw_by_name), sw_by_name.keys())
+                self.assertTrue({"pcie0", "pcie1", "all"} <= set(sw_by_name), sw_by_name.keys())
+                self.assertNotIn("0-3", sw_by_name)
+                self.assertNotIn("4-7", sw_by_name)
                 self.assertNotIn("numa0", sw_by_name)
                 self.assertNotIn("numa1", sw_by_name)
                 self.assertNotIn("freetpu.dev/numa-node", sw_by_name["pcie0"]["annotations"])
@@ -2585,12 +2654,17 @@ class FreeTpuCdiTests(unittest.TestCase):
             self.assertIn("TPU_SKIP_MDS_QUERY=true", dra_text)
 
             # Verify README keeps containerd GHSA-33vj-92qq-66hc security prerequisite
-            # before the general Quickstart section (not only under DaemonSet instructions).
+            # before the general Quickstart section and documents --chip-id-map /
+            # explicit TPU_VISIBLE_CHIPS + TPU_VISIBLE_DEVICES for isolated slices.
             readme_text = (CDI_DIR / "README.md").read_text(encoding="utf-8")
             qs_idx = readme_text.index("## Quickstart")
             sec_idx = readme_text.index("GHSA-33vj-92qq-66hc")
             self.assertLess(sec_idx, qs_idx)
             self.assertNotIn("2.1.x+", readme_text)
+            self.assertIn("--chip-id-map", readme_text)
+            self.assertIn("-e TPU_VISIBLE_CHIPS=", readme_text)
+            self.assertIn("-e TPU_VISIBLE_DEVICES=", readme_text)
+            self.assertIn("--chip-id-map", dra_text)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 # `freetpu-cdi` — Open CNCF CDI Toolkit for Cloud TPUs
 
-`freetpu_cdi.py` is an open, zero-dependency CNCF Container Device Interface (CDI) spec generator for VFIO-backed Google Cloud TPUs (`v5e`, `v5p`, `v6e` Trillium, and `tpu7x` Ironwood). By default it emits **CDI `v0.6.0`** (the minimum version needed by all generated fields and compatible with unaffected/patched containerd releases `2.0.x`, `2.1.x >= 2.1.9`, `2.2.x >= 2.2.5`, `2.3.x >= 2.3.2`, or `>= 2.4.0`), with `--cdi-version 1.1.0` available as an explicit opt-in. It scans `/sys/bus/pci/devices/*` (`vendor=0x1ae0`), preserves legacy VFIO (`/dev/vfio/vfio` + `/dev/vfio/<iommu_group>`) as the default whenever usable (with explicit `--vfio-mode iommufd` / `cdev` opt-in and pure-`iommufd` fallback using verified `<pci>/vfio-dev/vfioN` sysfs associations), verifies full IOMMU group isolation and groups sibling chips sharing an IOMMU group into a single allocation unit in both modes, omits static `major`/`minor` numbers from `deviceNodes` while tracking live char device numbers in `freetpu.dev/vfio-devnums` annotations, groups multi-root hosts (e.g. `v6e-8` `0000:00` vs `0000:80`, resolved via sysfs PCI host-bridge ancestry) into NUMA/PCIe-aware sub-host slices (`numa0`/`numa1` or `pcie0`/`pcie1`, plus range aliases `0-3`/`4-7`), preserves workload-provided `libtpu` environment variables by default (`--network-mode host`, safe for multi-host slices) with opt-in `--single-host-env` / `--network-mode isolated` overrides (`MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353`, `TPU_HOST_BOUNDS=1,1,1`, `TPU_WORKER_HOSTNAMES=localhost`, `TPU_WORKER_ID=0`, `TPU_SKIP_MDS_QUERY=true` — plus physical `TPU_VISIBLE_CHIPS`, logical `TPU_VISIBLE_DEVICES`, and physical-chip-derived `TPU_CHIPS_PER_HOST_BOUNDS` on full-allocation slice/`all` selectors only, omitting them on composable `pci-*`/`group-pci-*` selectors), and emits a boot-scoped spec at `/var/run/cdi/freetpu.json` (tmpfs, cleared across reboots).
+`freetpu_cdi.py` is an open, zero-dependency CNCF Container Device Interface (CDI) spec generator for VFIO-backed Google Cloud TPUs (`v5e`, `v5p`, `v6e` Trillium, and `tpu7x` Ironwood). By default it emits **CDI `v0.6.0`** (the minimum version needed by all generated fields and compatible with unaffected/patched containerd releases `2.0.x`, `2.1.x >= 2.1.9`, `2.2.x >= 2.2.5`, `2.3.x >= 2.3.2`, or `>= 2.4.0`), with `--cdi-version 1.1.0` available as an explicit opt-in. It scans `/sys/bus/pci/devices/*` (`vendor=0x1ae0`), preserves legacy VFIO (`/dev/vfio/vfio` + `/dev/vfio/<iommu_group>`) as the default whenever usable (with explicit `--vfio-mode iommufd` / `cdev` opt-in and pure-`iommufd` fallback using verified `<pci>/vfio-dev/vfioN` sysfs associations), verifies full IOMMU group isolation and groups sibling chips sharing an IOMMU group into a single allocation unit in both modes, omits static `major`/`minor` numbers from `deviceNodes` while tracking live char device numbers in `freetpu.dev/vfio-devnums` annotations, groups multi-root hosts (e.g. `v6e-8` `0000:00` vs `0000:80`, resolved via sysfs PCI host-bridge ancestry) into NUMA/PCIe-aware sub-host slices (`numa0`/`numa1` or `pcie0`/`pcie1`, plus range aliases `0-3`/`4-7`), preserves workload-provided `libtpu` environment variables by default (`--network-mode host`, safe for multi-host slices) with opt-in `--single-host-env` / `--network-mode isolated` overrides (`MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353`, `TPU_HOST_BOUNDS=1,1,1`, `TPU_WORKER_HOSTNAMES=localhost`, `TPU_WORKER_ID=0`, `TPU_SKIP_MDS_QUERY=true`, and physical-chip-derived `TPU_CHIPS_PER_HOST_BOUNDS` on full-allocation slice/`all` selectors — plus verified `TPU_VISIBLE_CHIPS` and `TPU_VISIBLE_DEVICES` on complete full-host `all` and on sub-host slices when runtime ordinals are verified via sysfs `chip_id` or `--chip-id-map`, omitting visibility/bounds on composable `pci-*`/`group-pci-*` selectors), and emits a boot-scoped spec at `/var/run/cdi/freetpu.json` (tmpfs, cleared across reboots).
 
 > **Containerd security prerequisite (CVE-2026-53492 / GHSA-33vj-92qq-66hc):** Before publishing `/var/run/cdi/freetpu.json` on **any** host (whether manually via `generate`/`sync` or via Kubernetes DaemonSet), verify containerd is **not** an affected release (`2.1.0–2.1.8`, `2.2.0–2.2.4`, `2.3.0–2.3.1`, or vendor/GKE builds carrying checkpoint-restore backports — fixed in `2.1.9`, `2.2.5`, `2.3.2`, `>= 2.4.0`; upstream `2.0.x` lacks the affected checkpoint-restore path) **or** confirm untrusted container checkpoint restores are disabled/blocked. On affected releases with checkpoint restore allowed, any published CDI spec can expose TPU devices (including `all`) outside Kubernetes resource allocation.
 
@@ -42,13 +42,27 @@ docker run --rm \
 # Opt in to single-host isolated env overrides so a NUMA-aligned 4-chip slice on a v6e-8
 # runs WITHOUT --net=host (injects MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353,
 # TPU_HOST_BOUNDS=1,1,1, TPU_WORKER_HOSTNAMES=localhost, TPU_WORKER_ID=0,
-# TPU_SKIP_MDS_QUERY=true, plus TPU_CHIPS_PER_HOST_BOUNDS=2,2,1, TPU_VISIBLE_CHIPS,
-# and TPU_VISIBLE_DEVICES on slice/all selectors):
-sudo python3 ops/tpu-cdi/freetpu_cdi.py generate --single-host-env --output /var/run/cdi/freetpu.json --validate
+# TPU_SKIP_MDS_QUERY=true, and TPU_CHIPS_PER_HOST_BOUNDS=2,2,1).
+# On hosts without sysfs `chip_id` files, pass `--chip-id-map` (JSON object or file
+# mapping PCI BDF -> verified runtime chip ID) so CDI also injects verified
+# TPU_VISIBLE_CHIPS and TPU_VISIBLE_DEVICES (and stable `0-3`/`4-7` range aliases):
+sudo python3 ops/tpu-cdi/freetpu_cdi.py generate \
+  --single-host-env \
+  --chip-id-map /etc/freetpu/chip-id-map.json \
+  --output /var/run/cdi/freetpu.json --validate
 
 docker run --rm \
   --device=freetpu.dev/tpu=numa0 \
   --ulimit memlock=-1:-1 \
+  my-jax-tpu-image:latest
+
+# Or, if generating without sysfs `chip_id` and without `--chip-id-map`, set the
+# verified visibility masks explicitly on the workload container:
+docker run --rm \
+  --device=freetpu.dev/tpu=numa0 \
+  --ulimit memlock=-1:-1 \
+  -e TPU_VISIBLE_CHIPS=0,1,2,3 \
+  -e TPU_VISIBLE_DEVICES=0,1,2,3 \
   my-jax-tpu-image:latest
 
 # Default generation preserves workload-provided libtpu env vars for multi-host slices;
