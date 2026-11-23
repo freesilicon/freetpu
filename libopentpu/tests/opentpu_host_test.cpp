@@ -186,6 +186,10 @@ static void test_fork_closes_vfio_fds_and_static_pjrt_err() {
   ctx->info.is_mock = 0u;
   ctx->transport.is_mock = false;
   ctx->transport.owner_pid = static_cast<int64_t>(::getpid());
+  for (ot_buffer_t* b : {ba, bb, bc}) {
+    b->is_mock = false;
+    b->owner_pid = ctx->transport.owner_pid;
+  }
   ctx->mu.lock();
   pid_t cpid = ::fork();
   OT_CHECK(cpid >= 0);
@@ -201,6 +205,9 @@ static void test_fork_closes_vfio_fds_and_static_pjrt_err() {
     if (!em || std::strstr(em, "forked") == nullptr) ok = false;
     ot_buffer_free(ba);
     ot_context_destroy(ctx);
+    // Free remaining buffers AFTER destroying ctx in the forked child (must not touch ctx).
+    ot_buffer_free(bb);
+    ot_buffer_free(bc);
     ::_exit(ok ? 0 : 1);
   }
   ctx->mu.unlock();
@@ -209,6 +216,9 @@ static void test_fork_closes_vfio_fds_and_static_pjrt_err() {
   OT_CHECK(WIFEXITED(cstatus) && WEXITSTATUS(cstatus) == 0);
   ctx->info.is_mock = 1u;
   ctx->transport.is_mock = true;
+  for (ot_buffer_t* b : {ba, bb, bc}) {
+    b->is_mock = true;
+  }
   ot_buffer_free(ba);
   ot_buffer_free(bb);
   ot_buffer_free(bc);

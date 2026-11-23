@@ -1600,8 +1600,14 @@ PJRT_Error* ot_pjrt_buffer_from_host_buffer(PJRT_Client_BufferFromHostBuffer_Arg
     buf->minor_to_major.push_back(static_cast<int64_t>(i - 1));
   }
 
+  auto* done_ev = new (std::nothrow) PJRT_Event();
+  if (!done_ev) {
+    ot_buffer_free(buf->ot_buf);
+    delete buf;
+    return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, "out of memory");
+  }
   args->buffer = buf;
-  args->done_with_host_buffer = new (std::nothrow) PJRT_Event();
+  args->done_with_host_buffer = done_ev;
   return nullptr;
 }
 
@@ -1955,9 +1961,18 @@ PJRT_Error* ot_pjrt_lexec_execute(PJRT_LoadedExecutable_Execute_Args* args) {
   out_buf->dims = le->exec.out_dims;
   out_buf->minor_to_major = {1, 0};
 
+  PJRT_Event* done_ev = nullptr;
+  if (args->device_complete_events) {
+    done_ev = new (std::nothrow) PJRT_Event();
+    if (!done_ev) {
+      ot_buffer_free(out_buf->ot_buf);
+      delete out_buf;
+      return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, "out of memory");
+    }
+  }
   args->output_lists[0][0] = out_buf;
   if (args->device_complete_events) {
-    args->device_complete_events[0] = new (std::nothrow) PJRT_Event();
+    args->device_complete_events[0] = done_ev;
   }
   return nullptr;
 }
@@ -2075,11 +2090,16 @@ PJRT_Error* ot_pjrt_buf_to_host(PJRT_Buffer_ToHostBuffer_Args* args) {
   if (args->dst_size < need) {
     return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "dst_size smaller than buffer size");
   }
+  auto* ev = new (std::nothrow) PJRT_Event();
+  if (!ev) return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, "out of memory");
   if (need > 0) {
     ot_status_t st = ot_buffer_d2h(args->src->ctx, args->src->ot_buf, args->dst, need);
-    if (st != OT_OK) return make_err(PJRT_Error_Code_INTERNAL, ot_status_string(st));
+    if (st != OT_OK) {
+      delete ev;
+      return make_err(PJRT_Error_Code_INTERNAL, ot_status_string(st));
+    }
   }
-  args->event = new (std::nothrow) PJRT_Event();
+  args->event = ev;
   return nullptr;
 }
 

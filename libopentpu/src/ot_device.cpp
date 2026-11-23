@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstring>
 #include <new>
+#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -179,6 +180,8 @@ ot_status_t ot_buffer_alloc(ot_context_t* ctx, size_t size_bytes, ot_buffer_t** 
   buf->ctx = ctx;
   buf->size_bytes = size_bytes;
   buf->hbm_addr = hbm_addr;
+  buf->is_mock = (ctx->info.is_mock != 0u);
+  buf->owner_pid = ctx->transport.owner_pid;
   if (ctx->info.is_mock) {
     buf->mock_data.assign(size_bytes, 0);
   }
@@ -189,6 +192,11 @@ ot_status_t ot_buffer_alloc(ot_context_t* ctx, size_t size_bytes, ot_buffer_t** 
 
 void ot_buffer_free(ot_buffer_t* buf) {
   if (!buf) return;
+  if (!buf->is_mock && buf->owner_pid != 0 &&
+      buf->owner_pid != static_cast<int64_t>(::getpid())) {
+    delete buf;
+    return;
+  }
   if (buf->ctx && (buf->ctx->info.is_mock || buf->ctx->transport.is_owner_process())) {
     std::lock_guard<std::mutex> lk(buf->ctx->mu);
     auto& live = buf->ctx->live_buffers;
