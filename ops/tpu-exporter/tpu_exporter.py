@@ -2115,6 +2115,7 @@ def _resolve_raw_device_runtime_ids(
     """
     raw_sysfs_counts: Dict[str, int] = {}
     raw_sysfs_gen_counts: Dict[Tuple[str, str], int] = {}
+    tpu7x_slot_rids: Dict[str, List[str]] = {}
     for dev in devices:
         if dev.runtime_chip_id:
             raw_sysfs_counts[dev.runtime_chip_id] = (
@@ -2123,12 +2124,29 @@ def _resolve_raw_device_runtime_ids(
             raw_sysfs_gen_counts[(dev.generation, dev.runtime_chip_id)] = (
                 raw_sysfs_gen_counts.get((dev.generation, dev.runtime_chip_id), 0) + 1
             )
+            if dev.generation == "tpu7x":
+                base_slot = dev.pci_bdf.rsplit(".", 1)[0]
+                tpu7x_slot_rids.setdefault(base_slot, []).append(dev.runtime_chip_id)
     shared_raw_sysfs_ids = {rid for rid, cnt in raw_sysfs_counts.items() if cnt > 1}
     physical_sysfs_gens = {
         gen
         for (gen, _rid), cnt in raw_sysfs_gen_counts.items()
         if cnt > 1 and _GEN_DEVICES_PER_CHIP.get(gen, 1) > 1
     }
+    # On Ironwood (`tpu7x`, 2 logical cores/PCI functions per physical chip), a
+    # filtered PCI view exposing only one function per chip makes physical sysfs
+    # `chip_id`s appear unique even though they are NOT logical core IDs.
+    # Require positive host-level evidence that `tpu7x` sysfs `chip_id` is
+    # per-core (at least one multifunction sibling pair on the same PCI slot
+    # reporting distinct non-empty `chip_id`s, with zero shared `tpu7x` raw
+    # `chip_id`s) before trusting raw sysfs `chip_id` without `--chip-id-map`.
+    tpu7x_sysfs_proved_per_core = (
+        "tpu7x" not in physical_sysfs_gens
+        and any(
+            len(rids) == _GEN_DEVICES_PER_CHIP["tpu7x"] and len(set(rids)) == len(rids)
+            for rids in tpu7x_slot_rids.values()
+        )
+    )
 
     resolved_by_bdf: Dict[str, Optional[str]] = {}
     claimants: Dict[str, List[str]] = {}
@@ -2145,6 +2163,7 @@ def _resolve_raw_device_runtime_ids(
             if (
                 dev.runtime_chip_id not in shared_raw_sysfs_ids
                 and dev.generation not in physical_sysfs_gens
+                and (dev.generation != "tpu7x" or tpu7x_sysfs_proved_per_core)
             ):
                 rt_id = dev.runtime_chip_id
         resolved_by_bdf[dev.pci_bdf] = rt_id
@@ -2152,6 +2171,31 @@ def _resolve_raw_device_runtime_ids(
             claimants.setdefault(rt_id, []).append(dev.pci_bdf)
     ambiguous = {rt for rt, bdfs in claimants.items() if len(bdfs) > 1}
     return resolved_by_bdf, ambiguous
+
+
+def _verified_row_alias_map(
+    devices: Sequence[TpuTelemetry],
+    shared_vfio: set[str],
+    chip_id_map: Optional[Dict[str, str]],
+) -> Dict[str, str]:
+    """Map every verified non-ambiguous alias for a TPU (`pci_bdf`, unique
+    `/dev/vfio/<group>`, verified `runtime_id`) to one canonical row key so
+    multi-backend fallback merges combine fields onto the same device row."""
+    resolved_by_bdf, ambiguous = _resolve_raw_device_runtime_ids(
+        devices, shared_vfio, chip_id_map
+    )
+    aliases: Dict[str, str] = {}
+    for dev in devices:
+        rt_id = resolved_by_bdf.get(dev.pci_bdf)
+        if rt_id in ambiguous:
+            rt_id = None
+        canonical = rt_id if rt_id else dev.pci_bdf
+        aliases[dev.pci_bdf] = canonical
+        if dev.vfio_device and dev.vfio_device not in shared_vfio:
+            aliases[dev.vfio_device] = canonical
+        if rt_id:
+            aliases[rt_id] = canonical
+    return aliases
 
 
 def _expected_runtime_ids_for_devices(
@@ -2196,42 +2240,36 @@ def _sanitize_fallback_duty_rows(
     rows: Dict[str, _TpuInfoRow],
     devices: Sequence[TpuTelemetry],
 ) -> Dict[str, _TpuInfoRow]:
-    """Strip unverified fallback `duty_cycle_percent` joins on multi-core-per-chip hosts.
+    """Strip unverified fallback `duty_cycle_percent` joins on Ironwood (`tpu7x`) hosts.
 
-    Upstream `tpu_info.metrics.get_chip_usage_new` (used on Ironwood `V7X` by
-    both the `tpu-info` CLI and Python API) sorts HBM and duty-cycle replies
-    separately and zips them by position without checking that IDs match. On
-    `devices_per_chip > 1` (or unknown-generation) hosts, accept fallback
+    Upstream `tpu_info.metrics.get_chip_usage_new` (used strictly on Ironwood
+    `V7X` by both the `tpu-info` CLI and Python API) sorts HBM and duty-cycle
+    replies separately and zips them by position without checking that IDs
+    match. Legacy `v2`/`v3`/`v4`/`v5e`/`v5p`/`v6e` use `get_chip_usage`, which
+    already expands per-chip duty readings cleanly into per-core rows even when
+    PCI visibility is partial. On Ironwood (`tpu7x`), accept fallback
     `duty_cycle_percent` ONLY when fallback covers the full contiguous verified
     host core set (`0..verified_chips * devices_per_chip - 1`), where equal-
-    length positional zipping is provably 1:1. For partial/subset replies (e.g.
-    HBM cores `{2,3}` zipped against chip duty `{0,1}`), preserve HBM fields
-    and leave `duty_cycle_percent` unset so raw gRPC duty stays unjoined
-    instead of being misattributed to the wrong PCI device.
+    length positional zipping is provably 1:1. For partial/subset Ironwood
+    replies (e.g. HBM cores `{2,3}` zipped against chip duty `{0,1}`), preserve
+    HBM fields and leave `duty_cycle_percent` unset so raw gRPC duty stays
+    unjoined instead of being misattributed to the wrong PCI device.
     """
     if not rows:
         return rows
+    # Restrict the `get_chip_usage_new` positional-zip guard strictly to
+    # Ironwood (`tpu7x`); sidecars without PCI inventory and legacy
+    # `v2`/`v3`/`v4`/`v5e`/`v5p`/`v6e` hosts preserve fallback duty readings.
+    if not any(d.generation == "tpu7x" for d in devices):
+        return rows
     inferred_dpc = _infer_devices_per_chip(devices)
-    # Apply the multi-core positional-zip guard ONLY when PCI inventory confirms
-    # a multi-core-per-chip host (`devices_per_chip > 1`); sidecars without PCI
-    # inventory (`inferred_dpc is None`) and single-core-per-chip generations
-    # (`v4`, `v5e`, `v5p`, `v6e`) preserve Python/CLI fallback duty readings.
     if inferred_dpc is None or inferred_dpc <= 1:
         return rows
 
     expected_core_count: Optional[int] = None
-    if inferred_dpc is not None and inferred_dpc > 1:
-        verified_chips = _verified_dual_function_chip_count(devices, inferred_dpc)
-        if verified_chips is not None:
-            expected_core_count = verified_chips * inferred_dpc
-        else:
-            known_gens = {
-                d.generation
-                for d in devices
-                if d.generation in _GEN_DEVICES_PER_CHIP
-            }
-            if known_gens and known_gens <= {"v2", "v3", "v2-v3"} and len(devices) >= 4:
-                expected_core_count = len(devices) * inferred_dpc
+    verified_chips = _verified_dual_function_chip_count(devices, inferred_dpc)
+    if verified_chips is not None:
+        expected_core_count = verified_chips * inferred_dpc
 
     if expected_core_count is not None:
         duty_ids = {
@@ -2291,30 +2329,37 @@ def _merge_runtime_rows(
     extra_rows: Dict[str, _TpuInfoRow],
     *,
     prefer_base: bool = False,
+    alias_to_canonical: Optional[Dict[str, str]] = None,
 ) -> Dict[str, _TpuInfoRow]:
-    merged: Dict[str, _TpuInfoRow] = {k: _copy_tpu_info_row(r) for k, r in base_rows.items()}
-    for k, r in extra_rows.items():
-        existing = merged.get(k)
+    def _merge_one(
+        target: Dict[str, _TpuInfoRow],
+        raw_key: str,
+        r: _TpuInfoRow,
+        *,
+        keep_existing: bool,
+    ) -> None:
+        k = alias_to_canonical.get(raw_key, raw_key) if alias_to_canonical else raw_key
+        existing = target.get(k)
         if existing is not None:
             used_extra = False
-            if r.hbm_used_bytes is not None and (not prefer_base or existing.hbm_used_bytes is None):
+            if r.hbm_used_bytes is not None and (not keep_existing or existing.hbm_used_bytes is None):
                 existing.hbm_used_bytes = r.hbm_used_bytes
                 used_extra = True
-            if r.hbm_total_bytes is not None and (not prefer_base or existing.hbm_total_bytes is None):
+            if r.hbm_total_bytes is not None and (not keep_existing or existing.hbm_total_bytes is None):
                 existing.hbm_total_bytes = r.hbm_total_bytes
                 used_extra = True
             if r.duty_cycle_percent is not None and (
-                not prefer_base or existing.duty_cycle_percent is None
+                not keep_existing or existing.duty_cycle_percent is None
             ):
                 existing.duty_cycle_percent = r.duty_cycle_percent
                 used_extra = True
             if r.unjoined_duty_cycle_percent is not None and (
-                not prefer_base or existing.unjoined_duty_cycle_percent is None
+                not keep_existing or existing.unjoined_duty_cycle_percent is None
             ):
                 existing.unjoined_duty_cycle_percent = r.unjoined_duty_cycle_percent
                 used_extra = True
             if r.hbm_bw_util_percent is not None and (
-                not prefer_base or existing.hbm_bw_util_percent is None
+                not keep_existing or existing.hbm_bw_util_percent is None
             ):
                 existing.hbm_bw_util_percent = r.hbm_bw_util_percent
                 used_extra = True
@@ -2332,7 +2377,15 @@ def _merge_runtime_rows(
                     if src and src not in existing.sources:
                         existing.sources.append(src)
         else:
-            merged[k] = _copy_tpu_info_row(r)
+            copied = _copy_tpu_info_row(r)
+            copied.chip_key = k
+            target[k] = copied
+
+    merged: Dict[str, _TpuInfoRow] = {}
+    for k, r in base_rows.items():
+        _merge_one(merged, k, r, keep_existing=True)
+    for k, r in extra_rows.items():
+        _merge_one(merged, k, r, keep_existing=prefer_base)
     return merged
 
 
@@ -2444,6 +2497,7 @@ def collect_snapshot(
     expected_runtime_ids = _expected_runtime_ids_for_devices(
         devices, shared_vfio, chip_id_map
     )
+    verified_row_aliases = _verified_row_alias_map(devices, shared_vfio, chip_id_map)
     runtime_budget_s = max(0.05, float(tpu_info_timeout_s))
     runtime_deadline = time.monotonic() + runtime_budget_s
     explicit_non_default_runtime_addr = bool(
@@ -2467,7 +2521,12 @@ def collect_snapshot(
             grpc_duty_layout=grpc_duty_layout,
         )
         if parsed_rows:
-            parsed_rows = _tag_row_sources(parsed_rows, "libtpu-grpc")
+            parsed_rows = _merge_runtime_rows(
+                {},
+                _tag_row_sources(parsed_rows, "libtpu-grpc"),
+                prefer_base=True,
+                alias_to_canonical=verified_row_aliases,
+            )
         if not tpu_info_ok or not _has_complete_utilization(
             parsed_rows, expected_runtime_ids=expected_runtime_ids
         ):
@@ -2482,10 +2541,11 @@ def collect_snapshot(
                 if py_ok:
                     py_rows = _sanitize_fallback_duty_rows(py_rows, devices)
                     py_rows = _tag_row_sources(py_rows, "tpu-info-python")
-                    parsed_rows = (
-                        _merge_runtime_rows(parsed_rows, py_rows, prefer_base=True)
-                        if parsed_rows
-                        else py_rows
+                    parsed_rows = _merge_runtime_rows(
+                        parsed_rows,
+                        py_rows,
+                        prefer_base=True,
+                        alias_to_canonical=verified_row_aliases,
                     )
                     tpu_info_ok, tpu_info_err = True, None
                 elif not tpu_info_ok:
@@ -2524,7 +2584,12 @@ def collect_snapshot(
                 grpc_duty_layout=grpc_duty_layout,
             )
             if parsed_rows:
-                parsed_rows = _tag_row_sources(parsed_rows, "libtpu-grpc")
+                parsed_rows = _merge_runtime_rows(
+                    {},
+                    _tag_row_sources(parsed_rows, "libtpu-grpc"),
+                    prefer_base=True,
+                    alias_to_canonical=verified_row_aliases,
+                )
 
         remaining_s = runtime_deadline - time.monotonic()
         # When the configured CLI is the primary/first backend (e.g. a custom
@@ -2550,10 +2615,11 @@ def collect_snapshot(
                 cli_rows = _tag_row_sources(cli_rows, "tpu-info")
                 tpu_info_ok = True
                 tpu_info_err = None
-                parsed_rows = (
-                    _merge_runtime_rows(parsed_rows, cli_rows, prefer_base=True)
-                    if parsed_rows
-                    else cli_rows
+                parsed_rows = _merge_runtime_rows(
+                    parsed_rows,
+                    cli_rows,
+                    prefer_base=True,
+                    alias_to_canonical=verified_row_aliases,
                 )
             elif not tpu_info_ok:
                 tpu_info_err = cli_err
@@ -2578,10 +2644,11 @@ def collect_snapshot(
                 if py_ok:
                     py_rows = _sanitize_fallback_duty_rows(py_rows, devices)
                     py_rows = _tag_row_sources(py_rows, "tpu-info-python")
-                    parsed_rows = (
-                        _merge_runtime_rows(parsed_rows, py_rows, prefer_base=True)
-                        if parsed_rows
-                        else py_rows
+                    parsed_rows = _merge_runtime_rows(
+                        parsed_rows,
+                        py_rows,
+                        prefer_base=True,
+                        alias_to_canonical=verified_row_aliases,
                     )
                     tpu_info_ok, tpu_info_err = True, None
     util_rows = {k: r for k, r in parsed_rows.items() if r.in_util_table}
@@ -2608,21 +2675,24 @@ def collect_snapshot(
                 all_rdevs_verified = False
         pids = sorted(pids_set)
 
-        # Attach `TPU Chips` rows strictly by verified /dev/vfio/<group> or PCI BDF.
+        rt_id = resolved_rt_ids.get(dev.pci_bdf)
+        if rt_id is None or rt_id in ambiguous_rt_ids:
+            dev.runtime_chip_id = None
+            verified_rt_id = None
+        else:
+            dev.runtime_chip_id = rt_id
+            verified_rt_id = rt_id
+
+        # Attach `TPU Chips` rows strictly by verified /dev/vfio/<group>, PCI BDF,
+        # or canonicalized verified runtime ID for this device.
         chips_row: Optional[_TpuInfoRow] = None
-        for key in (dev.vfio_device, dev.pci_bdf):
+        for key in (dev.vfio_device, dev.pci_bdf, verified_rt_id):
             if key and key in parsed_rows and parsed_rows[key].in_chips_table:
                 chips_row = parsed_rows[key]
                 break
 
         if chips_row is not None and not skip_pid_scan:
             dev.telemetry_source = _format_row_source(chips_row)
-
-        rt_id = resolved_rt_ids.get(dev.pci_bdf)
-        if rt_id is None or rt_id in ambiguous_rt_ids:
-            dev.runtime_chip_id = None
-        else:
-            dev.runtime_chip_id = rt_id
 
         matched_key = prospective_util_key.get(dev.pci_bdf)
         matched_util: Optional[_TpuInfoRow] = None
@@ -3376,10 +3446,29 @@ def _load_chip_id_map(raw: Optional[Path | str]) -> Optional[Dict[str, str]]:
         # (>255 bytes) never fail with ENAMETOOLONG in Path.is_file().
         if not text.startswith(("{", "[")):
             text = Path(text).read_text(encoding="utf-8")
-    parsed = json.loads(text)
+
+    def _no_duplicate_keys(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+        obj: Dict[str, Any] = {}
+        seen_norm: Dict[str, str] = {}
+        for k, v in pairs:
+            if not isinstance(k, str) or not k.strip():
+                raise ValueError(
+                    f"Invalid --chip-id-map key {k!r}: must be a non-empty string"
+                )
+            norm_k = k.strip()
+            norm_cmp = norm_k.lower()
+            if norm_cmp in seen_norm:
+                raise ValueError(
+                    f"Duplicate --chip-id-map key {k!r} (conflicts with {seen_norm[norm_cmp]!r})"
+                )
+            seen_norm[norm_cmp] = k
+            obj[norm_k] = v
+        return obj
+
+    parsed = json.loads(text, object_pairs_hook=_no_duplicate_keys)
     if not isinstance(parsed, dict):
         raise ValueError(f"--chip-id-map must be a JSON object: {raw}")
-    return {str(k): str(v) for k, v in parsed.items()}
+    return {str(k): str(v).strip() for k, v in parsed.items()}
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

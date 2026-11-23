@@ -418,13 +418,21 @@ def _load_chip_id_map(raw: Optional[str]) -> Optional[Dict[str, int]]:
             is_file = False
         if is_file:
             text = path.read_text(encoding="utf-8")
-    data = json.loads(text)
+    data = _load_json_strict_keys(text)
     if not isinstance(data, dict):
         raise ValueError("--chip-id-map must be a JSON object mapping PCI BDF strings to integer IDs")
     result: Dict[str, int] = {}
+    seen_norm: Dict[str, str] = {}
     for k, v in data.items():
         if not isinstance(k, str) or not k.strip():
             raise ValueError(f"Invalid --chip-id-map key {k!r}: must be a non-empty PCI BDF string")
+        norm_k = k.strip()
+        norm_cmp = norm_k.lower()
+        if norm_cmp in seen_norm:
+            raise ValueError(
+                f"Duplicate --chip-id-map key {k!r} (conflicts with {seen_norm[norm_cmp]!r})"
+            )
+        seen_norm[norm_cmp] = k
         if isinstance(v, bool):
             raise ValueError(f"Invalid --chip-id-map value for {k!r}: boolean is not a chip ID")
         if isinstance(v, str) and v.strip().isdigit():
@@ -435,7 +443,7 @@ def _load_chip_id_map(raw: Optional[str]) -> Optional[Dict[str, int]]:
             raise ValueError(
                 f"Invalid --chip-id-map value {v!r} for {k!r}: must be a non-negative integer"
             )
-        result[k.strip()] = iv
+        result[norm_k] = iv
     return result
 
 
@@ -654,13 +662,19 @@ def discover_tpu_chips(
                 legacy_is_iommu_compat=legacy_is_iommu_compat,
                 allow_missing_vfio=allow_missing_vfio,
             )
-            groups_usable = _legacy_vfio_groups_usable(
+            # Preserve legacy VFIO whenever its control node and AT LEAST ONE
+            # verified `/dev/vfio/<group>` node remain usable so losing a single
+            # group node on a dual-interface host never flips healthy legacy
+            # selectors over to iommufd cdev automatically. Switch to iommufd
+            # cdev in `auto` mode only when zero legacy group nodes are usable.
+            any_legacy_groups_usable = _legacy_vfio_groups_usable(
                 tpu_candidates,
                 sysfs_root,
                 dev_root,
                 allow_missing_vfio=allow_missing_vfio,
+                require_all=False,
             )
-            if legacy_ctrl_usable and groups_usable:
+            if legacy_ctrl_usable and any_legacy_groups_usable:
                 use_iommufd = False
             else:
                 iommu_ctrl_usable = _iommufd_control_usable(
@@ -668,30 +682,13 @@ def discover_tpu_chips(
                     sysfs_root,
                     allow_missing_vfio=allow_missing_vfio,
                 )
-                cdevs_usable = _iommufd_cdev_usable(
-                    tpu_candidates,
-                    sysfs_root,
-                    dev_root,
-                    allow_missing_vfio=allow_missing_vfio,
-                )
-                if iommu_ctrl_usable and cdevs_usable:
-                    use_iommufd = True
-                elif legacy_ctrl_usable and _legacy_vfio_groups_usable(
+                use_iommufd = iommu_ctrl_usable and _iommufd_cdev_usable(
                     tpu_candidates,
                     sysfs_root,
                     dev_root,
                     allow_missing_vfio=allow_missing_vfio,
                     require_all=False,
-                ):
-                    use_iommufd = False
-                else:
-                    use_iommufd = iommu_ctrl_usable and _iommufd_cdev_usable(
-                        tpu_candidates,
-                        sysfs_root,
-                        dev_root,
-                        allow_missing_vfio=allow_missing_vfio,
-                        require_all=False,
-                    )
+                )
         else:
             use_iommufd = False
 
@@ -1002,31 +999,32 @@ def _map_physical_chip_indices(
 
     # Identify functions explicitly sharing the SAME physical chip ID within one
     # topology domain (never pairing distinct unique IDs via integer division).
-    # Preserve raw sysfs `chip_id` for physical sibling pairing so passing a
-    # logical per-function `--chip-id-map` (e.g. `0..7` for visibility masks on
-    # Ironwood where siblings share physical sysfs `chip_id` `0..3`) never masks
-    # the sysfs sibling relationship. Fall back to `chip_id_map` only when sysfs
-    # `chip_id` is absent.
+    # Pass 1: preserve verified PCI-slot and shared sysfs `chip_id` pairs first
+    # so passing a logical per-function `--chip-id-map` (e.g. `0..7` on Ironwood
+    # where siblings share physical sysfs `chip_id` `0..3`) never masks the
+    # sysfs sibling relationship.
+    # Pass 2: for any remaining unresolved dual-function chiplets (including
+    # separate-slot chiplets whose sysfs `chip_id` is absent OR distinct per
+    # function), allow explicit `--chip-id-map` shared physical IDs to establish
+    # sibling pairs within the same topology domain.
     shared_sysfs_counts: Dict[Tuple[str, int], int] = {}
     shared_sysfs_domains: Dict[Tuple[str, int], set[Tuple[str, Optional[int], str]]] = {}
-    shared_map_counts: Dict[Tuple[str, int], int] = {}
-    shared_map_domains: Dict[Tuple[str, int], set[Tuple[str, Optional[int], str]]] = {}
     for c in chips:
         per_chip = _PCI_FUNCTIONS_PER_PHYSICAL_CHIP.get(c.generation, 1)
         if per_chip <= 1:
+            continue
+        base_slot = c.pci_bdf.rsplit(".", 1)[0]
+        if slot_counts.get((c.generation, base_slot), 0) == per_chip:
             continue
         if c.runtime_chip_id is not None:
             rkey = (c.generation, int(c.runtime_chip_id))
             shared_sysfs_counts[rkey] = shared_sysfs_counts.get(rkey, 0) + 1
             shared_sysfs_domains.setdefault(rkey, set()).add(_topology_domain_key(c))
-        elif chip_id_map and c.pci_bdf in chip_id_map:
-            mkey = (c.generation, int(chip_id_map[c.pci_bdf]))
-            shared_map_counts[mkey] = shared_map_counts.get(mkey, 0) + 1
-            shared_map_domains.setdefault(mkey, set()).add(_topology_domain_key(c))
 
     slot_to_phys: Dict[Tuple[str, str], int] = {}
     shared_rid_to_phys: Dict[Tuple[str, str, Tuple[str, Optional[int], str], int], int] = {}
     next_phys = 0
+    unresolved_multi: List[DiscoveredChip] = []
 
     for c in chips:
         per_chip = _PCI_FUNCTIONS_PER_PHYSICAL_CHIP.get(c.generation, 1)
@@ -1056,23 +1054,38 @@ def _map_physical_chip_indices(
                     next_phys += 1
                 bdf_to_phys[c.pci_bdf] = shared_rid_to_phys[vkey]
                 continue
-        elif chip_id_map and c.pci_bdf in chip_id_map:
-            mkey = (c.generation, int(chip_id_map[c.pci_bdf]))
-            if (
-                shared_map_counts.get(mkey, 0) == per_chip
-                and len(shared_map_domains.get(mkey, set())) == 1
-            ):
-                vkey = ("map", c.generation, _topology_domain_key(c), int(chip_id_map[c.pci_bdf]))
-                if vkey not in shared_rid_to_phys:
-                    shared_rid_to_phys[vkey] = next_phys
-                    next_phys += 1
-                bdf_to_phys[c.pci_bdf] = shared_rid_to_phys[vkey]
-                continue
 
-        # Unmatched or single-function chiplet: assign its own singleton physical
-        # ID so `_has_complete_chip_functions` marks it incomplete.
-        bdf_to_phys[c.pci_bdf] = next_phys
-        next_phys += 1
+        unresolved_multi.append(c)
+
+    if unresolved_multi:
+        shared_map_counts: Dict[Tuple[str, int], int] = {}
+        shared_map_domains: Dict[Tuple[str, int], set[Tuple[str, Optional[int], str]]] = {}
+        if chip_id_map:
+            for c in unresolved_multi:
+                if c.pci_bdf in chip_id_map:
+                    mkey = (c.generation, int(chip_id_map[c.pci_bdf]))
+                    shared_map_counts[mkey] = shared_map_counts.get(mkey, 0) + 1
+                    shared_map_domains.setdefault(mkey, set()).add(_topology_domain_key(c))
+
+        for c in unresolved_multi:
+            per_chip = _PCI_FUNCTIONS_PER_PHYSICAL_CHIP.get(c.generation, 1)
+            if chip_id_map and c.pci_bdf in chip_id_map:
+                mkey = (c.generation, int(chip_id_map[c.pci_bdf]))
+                if (
+                    shared_map_counts.get(mkey, 0) == per_chip
+                    and len(shared_map_domains.get(mkey, set())) == 1
+                ):
+                    vkey = ("map", c.generation, _topology_domain_key(c), int(chip_id_map[c.pci_bdf]))
+                    if vkey not in shared_rid_to_phys:
+                        shared_rid_to_phys[vkey] = next_phys
+                        next_phys += 1
+                    bdf_to_phys[c.pci_bdf] = shared_rid_to_phys[vkey]
+                    continue
+
+            # Unmatched or single-function chiplet: assign its own singleton physical
+            # ID so `_has_complete_chip_functions` marks it incomplete.
+            bdf_to_phys[c.pci_bdf] = next_phys
+            next_phys += 1
 
     return bdf_to_phys
 

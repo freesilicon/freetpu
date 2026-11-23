@@ -4969,6 +4969,120 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertIn("removed stale", err3)
                 self.assertFalse(spec_path.exists())
 
+    def test_dual_interface_keeps_legacy_vfio_when_one_group_node_disappears(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sysfs_root, dev_root = _make_mock_pci_vfio(
+                root / "dual_partial_legacy",
+                devices=[
+                    {
+                        "bdf": "0000:00:0b.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                        "iommufd_cdev": "vfio0",
+                    },
+                    {
+                        "bdf": "0000:00:0c.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "1",
+                        "iommufd_cdev": "vfio1",
+                    },
+                ],
+                create_vfio_container=True,
+                create_vfio_nodes=["0"],  # group 1 disappeared while both cdevs still exist!
+                create_iommu=True,
+                create_iommufd_cdevs=["vfio0", "vfio1"],
+            )
+            with _mock_vfio_char_devices():
+                chips, ctrl = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=sysfs_root, dev_root=dev_root, vfio_mode="auto"
+                )
+                self.assertEqual(ctrl, dev_root / "vfio" / "vfio")
+                self.assertEqual([c.pci_bdf for c in chips], ["0000:00:0b.0"])
+                self.assertEqual([c.vfio_mode for c in chips], ["vfio-group"])
+                self.assertEqual([c.vfio_container_path for c in chips], ["/dev/vfio/0"])
+
+    def test_separate_slot_ironwood_pairs_via_explicit_chip_map_over_distinct_sysfs_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sep_devs = [
+                {
+                    "bdf": f"0000:00:{4 + i:02x}.0",
+                    "vendor": "0x1ae0",
+                    "device": "0x0076",
+                    "driver": "vfio-pci",
+                    "iommu_group": str(i),
+                    "numa_node": "0",
+                    "chip_id": str(i),  # distinct per-function sysfs IDs (0..3)
+                }
+                for i in range(4)
+            ] + [
+                {
+                    "bdf": f"0000:80:{4 + i:02x}.0",
+                    "vendor": "0x1ae0",
+                    "device": "0x0076",
+                    "driver": "vfio-pci",
+                    "iommu_group": str(4 + i),
+                    "numa_node": "1",
+                    "chip_id": str(4 + i),  # distinct per-function sysfs IDs (4..7)
+                }
+                for i in range(4)
+            ]
+            sysfs_root, dev_root = _make_mock_pci_vfio(
+                root / "ironwood_sep_slot_map_pair",
+                devices=sep_devs,
+                create_vfio_nodes=[str(i) for i in range(8)],
+            )
+            # Operator supplies verified shared physical chip IDs (0,0,1,1,2,2,3,3).
+            pair_map = {
+                "0000:00:04.0": 0,
+                "0000:00:05.0": 0,
+                "0000:00:06.0": 1,
+                "0000:00:07.0": 1,
+                "0000:80:04.0": 2,
+                "0000:80:05.0": 2,
+                "0000:80:06.0": 3,
+                "0000:80:07.0": 3,
+            }
+            with _mock_vfio_char_devices():
+                chips, ctrl = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                spec = freetpu_cdi.build_cdi_spec(
+                    chips, ctrl, single_host_env=True, chip_id_map=pair_map
+                )
+                by_name = {d["name"]: d for d in spec["devices"]}
+                self.assertEqual(by_name["all"]["annotations"]["freetpu.dev/chip-count"], "4")
+                all_env = dict(
+                    kv.split("=", 1) for kv in by_name["all"]["containerEdits"]["env"]
+                )
+                self.assertEqual(all_env.get("TPU_ACCELERATOR_TYPE"), "tpu7x-8")
+                self.assertEqual(all_env.get("TPU_VISIBLE_CHIPS"), "0,1,2,3")
+                self.assertEqual(all_env.get("TPU_VISIBLE_DEVICES"), "0,1,2,3,4,5,6,7")
+                self.assertEqual(all_env.get("TPU_SKIP_MDS_QUERY"), "true")
+                self.assertEqual(
+                    freetpu_cdi.verify_spec_against_host(
+                        spec,
+                        sysfs_root=sysfs_root,
+                        dev_root=dev_root,
+                        chip_id_map=pair_map,
+                    ),
+                    [],
+                )
+
+    def test_chip_id_map_rejects_duplicate_and_colliding_keys(self) -> None:
+        for bad_json in (
+            '{"0000:00:06.0": 0, "0000:00:06.0": 1}',
+            '{"0000:00:06.0": 0, " 0000:00:06.0 ": 1}',
+            '{"0000:00:0a.0": 0, "0000:00:0A.0": 1}',
+        ):
+            with self.assertRaisesRegex(ValueError, "[Dd]uplicate"):
+                freetpu_cdi._load_chip_id_map(bad_json)
+
 
 if __name__ == "__main__":
     unittest.main()

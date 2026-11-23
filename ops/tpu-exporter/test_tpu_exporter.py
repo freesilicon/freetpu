@@ -4905,6 +4905,207 @@ TPU Runtime Utilization
             self.assertEqual(len(loaded_inline or {}), 12)
             self.assertEqual((loaded_inline or {})["0000:00:0f.0"], "11")
 
+            # Duplicate raw, whitespace-padded, or case-colliding keys MUST fail closed.
+            for bad_map_json in (
+                '{"0000:00:06.0": "0", "0000:00:06.0": "1"}',
+                '{"0000:00:06.0": "0", " 0000:00:06.0 ": "1"}',
+                '{"0000:00:0a.0": "0", "0000:00:0A.0": "1"}',
+            ):
+                with self.assertRaisesRegex(ValueError, "Duplicate"):
+                    tpu_exporter._load_chip_id_map(bad_map_json)
+
+    def test_filtered_ironwood_pci_view_requires_per_core_evidence_or_chip_map(self) -> None:
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # Filtered PCI view exposing only ONE function per physical Ironwood chip:
+            # raw sysfs `chip_id`s 0..3 appear unique, but cannot prove logical core IDs.
+            sysfs_root, dev_root, proc_root = _make_mock_pci_tree(
+                root,
+                devices=[
+                    {
+                        "bdf": f"0000:00:{4 + i:02x}.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0076",
+                        "driver": "vfio-pci",
+                        "iommu_group": str(i),
+                        "chip_id": str(i),
+                    }
+                    for i in range(4)
+                ],
+                create_vfio_nodes=[str(i) for i in range(4)],
+            )
+            grpc_rows = {
+                str(c): tpu_exporter._TpuInfoRow(
+                    chip_key=str(c),
+                    hbm_used_bytes=(c + 1) * 10 * 1024**3,
+                    hbm_total_bytes=96 * 1024**3,
+                    duty_cycle_percent=10.0 * (c + 1),
+                    in_util_table=True,
+                )
+                for c in range(8)
+            }
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_query_grpc_runtime_metrics",
+                    return_value=(True, None, grpc_rows),
+                ),
+            ):
+                snap_nomap = tpu_exporter.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin="tpu-info",
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=root / "no-shm",
+                )
+                snap_mapped = tpu_exporter.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin="tpu-info",
+                    chip_id_map={"0000:00:05.0": "2"},
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=root / "no-shm",
+                )
+
+            # Without explicit chip_id_map, filtered Ironwood functions MUST stay unmapped.
+            self.assertEqual(len(snap_nomap.runtime_utilization), 8)
+            self.assertTrue(all(d.runtime_chip_id is None for d in snap_nomap.devices))
+            self.assertTrue(all(d.hbm_used_bytes is None for d in snap_nomap.devices))
+            self.assertTrue(all(rt.mapped_pci_bdf is None for rt in snap_nomap.runtime_utilization))
+
+            # Explicit chip_id_map attaches only the mapped BDF to its exact logical core.
+            mapped_by_bdf = {d.pci_bdf: d for d in snap_mapped.devices}
+            self.assertEqual(mapped_by_bdf["0000:00:05.0"].runtime_chip_id, "2")
+            self.assertEqual(mapped_by_bdf["0000:00:05.0"].hbm_used_bytes, 30 * 1024**3)
+            self.assertIsNone(mapped_by_bdf["0000:00:04.0"].hbm_used_bytes)
+            rt_by_id = {rt.runtime_chip: rt for rt in snap_mapped.runtime_utilization}
+            self.assertEqual(rt_by_id["2"].mapped_pci_bdf, "0000:00:05.0")
+            self.assertIsNone(rt_by_id["1"].mapped_pci_bdf)
+
+    def test_fallback_merges_verified_bdf_and_runtime_aliases_and_preserves_legacy_v3_duty(self) -> None:
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # 1. Custom CLI reports HBM under PCI BDF; Python fallback supplies missing
+            #    duty cycle under verified runtime ID "0" -> merged into ONE canonical row.
+            sysfs_root, dev_root, proc_root = _make_mock_pci_tree(
+                root / "alias_merge",
+                devices=[
+                    {
+                        "bdf": "0000:00:06.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                        "chip_id": "0",
+                    }
+                ],
+                create_vfio_nodes=["0"],
+            )
+            cli_rows = {
+                "0000:00:06.0": tpu_exporter._TpuInfoRow(
+                    chip_key="0000:00:06.0",
+                    hbm_used_bytes=10 * 1024**3,
+                    hbm_total_bytes=32 * 1024**3,
+                    duty_cycle_percent=None,
+                    in_util_table=True,
+                )
+            }
+            py_rows = {
+                "0": tpu_exporter._TpuInfoRow(
+                    chip_key="0",
+                    hbm_used_bytes=12 * 1024**3,
+                    hbm_total_bytes=32 * 1024**3,
+                    duty_cycle_percent=47.5,
+                    in_util_table=True,
+                )
+            }
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.object(tpu_exporter, "_run_tpu_info", return_value=(True, None, cli_rows)),
+                mock.patch.object(
+                    tpu_exporter, "_query_tpu_info_python_metrics", return_value=(True, None, py_rows)
+                ),
+            ):
+                snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin="custom-tpu-wrapper",
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=root / "no-shm",
+                )
+            self.assertEqual(snap.devices[0].hbm_used_bytes, 10 * 1024**3)
+            self.assertEqual(snap.devices[0].duty_cycle_percent, 47.5)
+            self.assertEqual(snap.devices[0].telemetry_source, "tpu-info+tpu-info-python")
+            self.assertEqual(len(snap.runtime_utilization), 1)
+            self.assertEqual(snap.runtime_utilization[0].runtime_chip, "0")
+            self.assertEqual(snap.runtime_utilization[0].mapped_pci_bdf, "0000:00:06.0")
+            self.assertEqual(snap.runtime_utilization[0].duty_cycle_percent, 47.5)
+
+            # 2. Legacy v3 (0x0027) with partial PCI visibility (only 2 chips visible)
+            #    and direct gRPC unavailable MUST preserve fallback duty-cycle readings.
+            v3_sys, v3_dev, v3_proc = _make_mock_pci_tree(
+                root / "v3_partial_pci",
+                devices=[
+                    {
+                        "bdf": f"0000:00:{4 + i:02x}.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0027",
+                        "subsystem_device": "0x004e",
+                        "driver": "vfio-pci",
+                        "iommu_group": str(i),
+                    }
+                    for i in range(2)
+                ],
+                create_vfio_nodes=["0", "1"],
+            )
+            v3_py_rows = {
+                str(c): tpu_exporter._TpuInfoRow(
+                    chip_key=str(c),
+                    hbm_used_bytes=(c + 1) * 1024**3,
+                    hbm_total_bytes=16 * 1024**3,
+                    duty_cycle_percent=25.0 + c,
+                    in_util_table=True,
+                )
+                for c in range(8)
+            }
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_query_grpc_runtime_metrics",
+                    return_value=(False, "grpc unavailable", {}),
+                ),
+                mock.patch.object(
+                    tpu_exporter, "_run_tpu_info", return_value=(False, "cli unavailable", {})
+                ),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_query_tpu_info_python_metrics",
+                    return_value=(True, None, v3_py_rows),
+                ),
+            ):
+                v3_snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=v3_sys,
+                    dev_root=v3_dev,
+                    proc_root=v3_proc,
+                    tpu_info_bin="tpu-info",
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=root / "no-shm",
+                )
+            self.assertEqual(len(v3_snap.runtime_utilization), 8)
+            self.assertEqual(
+                [rt.duty_cycle_percent for rt in v3_snap.runtime_utilization],
+                [25.0 + c for c in range(8)],
+            )
+
     def _assert_valid_prometheus_text(self, text: str) -> None:
         lines = [ln for ln in text.splitlines() if ln.strip()]
         self.assertGreater(len(lines), 0)
