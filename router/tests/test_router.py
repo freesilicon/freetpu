@@ -11653,6 +11653,213 @@ asyncio.run(main())
         self.assertEqual(recorded_usage[0].prompt_tokens, 10)
         self.assertEqual(recorded_usage[0].completion_tokens, 15)
 
+    def test_fd_headroom_admission_cap_and_emfile_returns_503_without_cooldown(
+        self,
+    ) -> None:
+        import errno
+        from router import config as config_mod
+        from router import freetpu_router as router_mod
+
+        self.assertEqual(config_mod.DEFAULT_MAX_CONCURRENT_CONNECTIONS, 256)
+        try:
+            import resource
+        except ImportError:
+            resource = None  # type: ignore[assignment]
+        if resource is not None:
+            with mock.patch.object(
+                resource, "getrlimit", return_value=(1024, 4096)
+            ):
+                self.assertEqual(
+                    router_mod._effective_max_concurrent_connections(512), 480
+                )
+                self.assertEqual(
+                    router_mod._effective_max_concurrent_connections(256), 256
+                )
+            with mock.patch.object(
+                resource, "getrlimit", return_value=(200, 4096)
+            ):
+                self.assertEqual(
+                    router_mod._effective_max_concurrent_connections(256), 68
+                )
+
+        primary = self._track(_MockOpenAIBackend("emfile-primary", ["m-emfile"]))
+        backup = self._track(_MockOpenAIBackend("emfile-backup", ["m-emfile"]))
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            failure_cooldown_s=30.0,
+            backends=[
+                BackendConfig(
+                    id="emfile-primary",
+                    local=True,
+                    base_url=primary.base_url,
+                    models=["m-emfile"],
+                ),
+                BackendConfig(
+                    id="emfile-backup",
+                    local=False,
+                    base_url=backup.base_url,
+                    models=["m-emfile"],
+                ),
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+        p_port = primary.server_address[1]
+        orig_connect = socket.socket.connect
+
+        def _raise_emfile_on_primary(sock_self: socket.socket, address: Any) -> Any:
+            if isinstance(address, tuple) and len(address) >= 2 and address[1] == p_port:
+                raise OSError(errno.EMFILE, "Too many open files")
+            return orig_connect(sock_self, address)
+
+        with mock.patch.object(socket.socket, "connect", new=_raise_emfile_on_primary):
+            st, hdrs, bd = _http_request(
+                rport,
+                "POST",
+                "/v1/chat/completions",
+                body={
+                    "model": "m-emfile",
+                    "messages": [{"role": "user", "content": "emfile"}],
+                },
+            )
+        self.assertEqual(st, 503)
+        self.assertIn(b"router_overloaded", bd)
+        self.assertEqual(hdrs.get("x-freetpu-failovers"), "0")
+        self.assertEqual(len(backup.requests_seen), 0)
+        for bstate in router.engine._backends:
+            self.assertEqual(bstate.total_failures, 0)
+            self.assertEqual(bstate.cooldown_until_monotonic, 0.0)
+            self.assertTrue(bstate.healthy)
+
+    def test_streamed_multi_choice_timings_sums_predicted_tokens_across_choices(
+        self,
+    ) -> None:
+        recorded_usage: List[UsageEvent] = []
+
+        class _RecordHook:
+            def record_usage(self, event: UsageEvent) -> None:
+                recorded_usage.append(event)
+
+        class _MultiChoiceTimingsSSEHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return None
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = json.dumps(
+                    {"object": "list", "data": [{"id": "m-n2-timings"}]}
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802
+                clen = int(self.headers.get("Content-Length", "0"))
+                if clen > 0:
+                    self.rfile.read(clen)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(
+                    b'data: {"id":"t-n2","object":"chat.completion.chunk",'
+                    b'"choices":[{"index":0,"delta":{"content":"a"},"finish_reason":null}],'
+                    b'"timings":{"prompt_n":12,"predicted_n":5}}\n\n'
+                    b'data: {"id":"t-n2","object":"chat.completion.chunk",'
+                    b'"choices":[{"index":0,"delta":{"content":"b"},"finish_reason":"stop"}],'
+                    b'"timings":{"prompt_n":12,"predicted_n":20}}\n\n'
+                    b'data: {"id":"t-n2","object":"chat.completion.chunk",'
+                    b'"choices":[{"index":1,"delta":{"content":"c"},"finish_reason":"stop"}],'
+                    b'"timings":{"prompt_n":12,"predicted_n":30}}\n\n'
+                    b"data: [DONE]\n\n"
+                )
+                self.wfile.flush()
+
+        srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _MultiChoiceTimingsSSEHandler))
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            backends=[
+                BackendConfig(
+                    id="n2-timings-b",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=f"http://127.0.0.1:{srv.server_address[1]}/v1",
+                    models=["m-n2-timings"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg, usage_hook=_RecordHook()))
+        st, _, bd = _http_request(
+            router.server_address[1],
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-n2-timings",
+                "n": 2,
+                "stream": True,
+                "messages": [{"role": "user", "content": "timings"}],
+            },
+        )
+        self.assertEqual(st, 200)
+        self.assertIn(b"data: [DONE]", bd)
+        self.assertEqual(len(recorded_usage), 1)
+        self.assertEqual(recorded_usage[0].status_code, 200)
+        self.assertEqual(recorded_usage[0].prompt_tokens, 12)
+        self.assertEqual(recorded_usage[0].completion_tokens, 50)
+
+    def test_poll_read_masks_exclude_pollpri_urgent_events(self) -> None:
+        import select
+        from router import tpu_telemetry as telemetry_mod
+
+        if not hasattr(select, "poll"):
+            return
+        pollpri = getattr(select, "POLLPRI", 0)
+        self.assertEqual(telemetry_mod._POLL_READ_EVENTS & pollpri, 0)
+        self.assertNotEqual(telemetry_mod._POLL_READ_EVENTS & select.POLLIN, 0)
+
+        seen_masks: List[int] = []
+        real_poll_factory = select.poll
+
+        class _RecordingPoller:
+            def __init__(self) -> None:
+                self._inner = real_poll_factory()
+
+            def register(self, fd: Any, eventmask: int = 0) -> None:
+                seen_masks.append(eventmask)
+                self._inner.register(fd, eventmask)
+
+            def modify(self, fd: Any, eventmask: int) -> None:
+                seen_masks.append(eventmask)
+                self._inner.modify(fd, eventmask)
+
+            def poll(self, timeout: Optional[int] = None) -> List[Tuple[int, int]]:
+                return self._inner.poll(timeout)
+
+        s1, s2 = socket.socketpair()
+        c1, c2 = socket.socketpair()
+        try:
+            with mock.patch.object(select, "poll", side_effect=_RecordingPoller):
+                telemetry_mod.wait_sockets_readable([s1], 0.0)
+                telemetry_mod._wait_io_or_client(s1, c1, wait_write=False, timeout_s=0.0)
+                telemetry_mod._wait_io_or_client(s1, c1, wait_write=True, timeout_s=0.0)
+            self.assertGreaterEqual(len(seen_masks), 4)
+            for mask in seen_masks:
+                self.assertEqual(mask & pollpri, 0)
+        finally:
+            s1.close()
+            s2.close()
+            c1.close()
+            c2.close()
+
 
 def run_self_tests(verbosity: int = 1) -> int:
     """Run all router tests cleanly via unittest."""

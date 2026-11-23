@@ -8,7 +8,7 @@
   "probe_timeout_s": 3.0,
   "queue_pressure_threshold": 128,
   "backend_idle_timeout_s": 300.0,
-  "max_concurrent_connections": 512,
+  "max_concurrent_connections": 256,
   "auth": {
     "type": "allow_all"
   },

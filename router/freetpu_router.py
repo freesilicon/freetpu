@@ -2981,6 +2981,30 @@ class _SSEReactor:
                 self._finish_task(task)
 
 
+_FD_HEADROOM_RESERVED = 64
+
+
+def _effective_max_concurrent_connections(configured: int) -> int:
+    """Clamp concurrent admission to leave FD headroom for upstream sockets and probes.
+
+    Each active inference holds up to 2 sockets (client + upstream), plus fixed
+    process descriptors (stdio, listener, reactor wakeup pipe, background probes).
+    """
+    limit = max(1, int(configured))
+    try:
+        import resource
+
+        soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (ImportError, OSError, ValueError, AttributeError):
+        return limit
+    if soft_limit is None or soft_limit <= 0:
+        return limit
+    if hasattr(resource, "RLIM_INFINITY") and soft_limit == resource.RLIM_INFINITY:
+        return limit
+    safe_cap = max(1, (int(soft_limit) - _FD_HEADROOM_RESERVED) // 2)
+    return min(limit, safe_cap)
+
+
 class FreeTPURouterServer(ThreadingHTTPServer):
     """Multi-threaded stdlib HTTP server hosting `RouterEngine`."""
 
@@ -3007,8 +3031,11 @@ class FreeTPURouterServer(ThreadingHTTPServer):
             self.address_family = socket.AF_INET6
         else:
             self.address_family = socket.AF_INET
-        self._conn_semaphore = threading.BoundedSemaphore(
+        self.effective_max_concurrent_connections = _effective_max_concurrent_connections(
             engine.config.max_concurrent_connections
+        )
+        self._conn_semaphore = threading.BoundedSemaphore(
+            self.effective_max_concurrent_connections
         )
         self.sse_reactor = _SSEReactor()
         super().__init__((clean_host, server_address[1]), _RouterRequestHandler)
@@ -4142,6 +4169,36 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                     # or write a second HTTP response into the open stream.
                     self.close_connection = True
                     return
+                if isinstance(exc, OSError) and exc.errno in (errno.EMFILE, errno.ENFILE):
+                    # Local file-descriptor exhaustion is router overload, not a backend fault:
+                    # return 503 immediately without cooling down or retrying backends.
+                    total_ms = (time.monotonic() - req_start) * 1000.0
+                    engine._record_terminal_failure(
+                        request_id=req_id,
+                        model=model,
+                        backend_id=backend.config.id,
+                        matched_backend=True,
+                        status_code=503,
+                        latency_ms=total_ms,
+                        stream=stream,
+                        failovers=failovers,
+                        principal=auth_ctx.principal,
+                    )
+                    self._safe_send_bytes(
+                        503,
+                        "application/json",
+                        _openai_error_body(
+                            "Router file descriptor capacity temporarily exhausted; retry later",
+                            error_type="service_unavailable",
+                            code="router_overloaded",
+                        ),
+                        extra_headers={
+                            "X-FreeTPU-Backend": backend.config.id,
+                            "X-FreeTPU-Failovers": str(failovers),
+                            "X-FreeTPU-Request-Id": req_id,
+                        },
+                    )
+                    return
                 if isinstance(exc, TimeoutError):
                     reason = "timeout"
                     last_error_status = 504
@@ -4574,6 +4631,9 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             per_choice_terminal_usage: Dict[
                 Tuple[int, ...], Tuple[Optional[int], Optional[int]]
             ] = {}
+            per_choice_timings: Dict[
+                Tuple[int, ...], Tuple[Optional[int], Optional[int]]
+            ] = {}
             empty_choice_usage_frames: List[Tuple[Optional[int], Optional[int]]] = []
             upstream_read_error = False
             size_limit_exceeded = False
@@ -4643,14 +4703,24 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         event_has_terminal_choice = False
                         event_has_non_terminal_choice = False
                         event_terminal_indices: List[int] = []
+                        event_choice_indices: List[int] = []
                         if isinstance(choices, list):
-                            for choice in choices:
+                            for pos, choice in enumerate(choices):
                                 if not isinstance(choice, dict):
                                     continue
+                                c_idx = choice.get("index")
+                                if (
+                                    isinstance(c_idx, int)
+                                    and not isinstance(c_idx, bool)
+                                    and c_idx >= 0
+                                ):
+                                    choice_idx = c_idx
+                                else:
+                                    choice_idx = pos
+                                event_choice_indices.append(choice_idx)
                                 if choice.get("finish_reason") is not None:
                                     made_progress = True
                                     event_has_terminal_choice = True
-                                    c_idx = choice.get("index")
                                     if (
                                         isinstance(c_idx, int)
                                         and not isinstance(c_idx, bool)
@@ -4756,15 +4826,41 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                         saw_final_usage = True
                         timings = obj.get("timings")
                         if isinstance(timings, dict):
-                            if not saw_explicit_prompt_usage:
-                                pt = _safe_nonneg_int(timings.get("prompt_n"))
-                                if pt is not None:
-                                    prompt_tokens = pt
-                            if not saw_explicit_completion_usage:
-                                ct = _safe_nonneg_int(timings.get("predicted_n"))
-                                if ct is not None:
-                                    completion_tokens = ct
-                                    saw_timings_completion = True
+                            t_pt = _safe_nonneg_int(timings.get("prompt_n"))
+                            t_ct = _safe_nonneg_int(timings.get("predicted_n"))
+                            if t_pt is not None or t_ct is not None:
+                                if event_choice_indices:
+                                    t_key = tuple(sorted(set(event_choice_indices)))
+                                    per_choice_timings.pop((-1,), None)
+                                    prev_p, prev_c = per_choice_timings.get(t_key, (None, None))
+                                    per_choice_timings[t_key] = (
+                                        t_pt if t_pt is not None else prev_p,
+                                        t_ct if t_ct is not None else prev_c,
+                                    )
+                                else:
+                                    prev_p, prev_c = per_choice_timings.get((-1,), (None, None))
+                                    per_choice_timings.clear()
+                                    per_choice_timings[(-1,)] = (
+                                        t_pt if t_pt is not None else prev_p,
+                                        t_ct if t_ct is not None else prev_c,
+                                    )
+                                if not saw_explicit_prompt_usage:
+                                    t_p_vals = [
+                                        p
+                                        for p, _ in per_choice_timings.values()
+                                        if p is not None
+                                    ]
+                                    if t_p_vals:
+                                        prompt_tokens = _aggregate_prompt_tokens(t_p_vals)
+                                if not saw_explicit_completion_usage:
+                                    t_c_vals = [
+                                        c
+                                        for _, c in per_choice_timings.values()
+                                        if c is not None
+                                    ]
+                                    if t_c_vals:
+                                        completion_tokens = sum(t_c_vals)
+                                        saw_timings_completion = True
                         return made_progress, False
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     saw_upstream_error_event = True

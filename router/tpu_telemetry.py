@@ -422,7 +422,7 @@ class ClientDisconnectedError(Exception):
 
 
 _MSG_DONTWAIT = getattr(socket, "MSG_DONTWAIT", 0)
-_POLL_READ_EVENTS = getattr(select, "POLLIN", 0) | getattr(select, "POLLPRI", 0)
+_POLL_READ_EVENTS = getattr(select, "POLLIN", 0)
 _POLL_HUP_EVENT = getattr(select, "POLLHUP", 0)
 _POLL_ERR_EVENTS = getattr(select, "POLLERR", 0) | getattr(select, "POLLNVAL", 0)
 
