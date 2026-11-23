@@ -5776,6 +5776,229 @@ TPU Runtime Utilization
             self.assertIn('freetpu_tpu_hbm_bandwidth_utilization_percent{chip="0",pci_bdf="0000:00:06.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/0"} 30', bw_prom)
             self.assertIn('freetpu_tpu_runtime_hbm_bandwidth_utilization_percent{runtime_chip="0",pci_bdf="0000:00:06.0"} 30', bw_prom)
 
+    def test_ironwood_filtered_sidecar_separate_slots_and_min_grpc_budget(self) -> None:
+        import types
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            # 1. Filtered 2-PCI-function Ironwood sidecar (`auto` layout) with explicit
+            #    `--chip-id-map` receiving a complete 8-row stock `get_chip_usage_new()`
+            #    fallback (without `get_metric_data`): non-zero duty MUST be preserved
+            #    while unverified `0.0` duty MUST still be suppressed.
+            f_sys, f_dev, f_proc = _make_mock_pci_tree(
+                root / "iw_filtered_2fn",
+                devices=[
+                    {
+                        "bdf": "0000:00:04.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0076",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                    },
+                    {
+                        "bdf": "0000:00:05.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0076",
+                        "driver": "vfio-pci",
+                        "iommu_group": "1",
+                    },
+                ],
+                create_vfio_nodes=["0", "1"],
+            )
+            fake_dev_mod = types.ModuleType("tpu_info.device")
+
+            class _FakeChipEnum:
+                V7X = "V7X"
+
+            fake_dev_mod.TpuChip = _FakeChipEnum  # type: ignore[attr-defined]
+            fake_metrics_mod = types.ModuleType("tpu_info.metrics")
+
+            class _FakeUsage:
+                def __init__(self, device_id: int, mem_used: int, mem_total: int, duty: float) -> None:
+                    self.device_id = device_id
+                    self.memory_usage = mem_used
+                    self.total_memory = mem_total
+                    self.duty_cycle_pct = duty
+
+            def _stock_get_chip_usage_new(_chip: object, addr: str = "") -> list[_FakeUsage]:
+                # Complete 8-row Ironwood reply (`0..7`); core 0 active (62.5%), core 7 is 0.0%.
+                return [
+                    _FakeUsage(
+                        i,
+                        16 * 1024**3,
+                        192 * 1024**3,
+                        0.0 if i == 7 else 62.5,
+                    )
+                    for i in range(8)
+                ]
+
+            fake_metrics_mod.get_chip_usage_new = _stock_get_chip_usage_new  # type: ignore[attr-defined]
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "tpu_info": types.ModuleType("tpu_info"),
+                        "tpu_info.device": fake_dev_mod,
+                        "tpu_info.metrics": fake_metrics_mod,
+                    },
+                ),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_query_grpc_runtime_metrics",
+                    return_value=(False, "grpc unavailable", {}),
+                ),
+            ):
+                f_snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=f_sys,
+                    dev_root=f_dev,
+                    proc_root=f_proc,
+                    skip_pid_scan=True,
+                    chip_id_map={"0000:00:04.0": "0", "0000:00:05.0": "7"},
+                    shm_root=root / "no-shm",
+                )
+            f_by_bdf = {d.pci_bdf: d for d in f_snap.devices}
+            self.assertAlmostEqual(f_by_bdf["0000:00:04.0"].duty_cycle_percent or 0.0, 62.5)
+            self.assertIsNone(f_by_bdf["0000:00:05.0"].duty_cycle_percent)
+
+            # 2. All 8 separate-slot Ironwood PCI functions exposing distinct sysfs
+            #    `chip_id` values `0..7` WITHOUT `--chip-id-map` MUST be accepted as
+            #    per-core IDs (8 distinct integer IDs > 4 physical-chip Ironwood ceiling).
+            sep8_sys, sep8_dev, sep8_proc = _make_mock_pci_tree(
+                root / "iw_sep8_sysfs",
+                devices=[
+                    {
+                        "bdf": f"0000:00:{4 + i:02x}.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0076",
+                        "driver": "vfio-pci",
+                        "iommu_group": str(i),
+                        "chip_id": str(i),
+                    }
+                    for i in range(8)
+                ],
+                create_vfio_nodes=[str(i) for i in range(8)],
+            )
+            grpc_rows_8 = {
+                str(i): tpu_exporter._TpuInfoRow(
+                    chip_key=str(i),
+                    hbm_used_bytes=(i + 1) * 1024**3,
+                    hbm_total_bytes=192 * 1024**3,
+                    duty_cycle_percent=10.0 + i,
+                    in_util_table=True,
+                    duty_ids_verified=True,
+                )
+                for i in range(8)
+            }
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_query_grpc_runtime_metrics",
+                    return_value=(True, None, grpc_rows_8),
+                ),
+            ):
+                sep8_snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=sep8_sys,
+                    dev_root=sep8_dev,
+                    proc_root=sep8_proc,
+                    skip_pid_scan=True,
+                    shm_root=root / "no-shm",
+                )
+            self.assertEqual(len(sep8_snap.devices), 8)
+            for i, dev in enumerate(sep8_snap.devices):
+                self.assertEqual(dev.hbm_used_bytes, (i + 1) * 1024**3)
+                self.assertAlmostEqual(dev.duty_cycle_percent or 0.0, 10.0 + i)
+
+            # 3. At the minimum 50 ms runtime budget (`tpu_info_timeout_s=0.05`), direct
+            #    gRPC MUST honor its 32.5 ms sub-budget (`<= 0.035s`, NOT clamped back up
+            #    to `0.05s`) so fallback still runs inside the remaining budget.
+            b_sys, b_dev, b_proc = _make_mock_pci_tree(
+                root / "min_budget_grpc",
+                devices=[
+                    {
+                        "bdf": "0000:00:04.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                        "chip_id": "0",
+                    }
+                ],
+                create_vfio_nodes=["0"],
+            )
+            observed_rpc_timeouts: list[float] = []
+            fallback_timeouts: list[float] = []
+
+            class _FakeMetricReq:
+                def __init__(self, metric_name: str) -> None:
+                    self.metric_name = metric_name
+
+            class _FakeStub:
+                def __init__(self, _chan: object) -> None:
+                    pass
+
+                def GetRuntimeMetric(self, _req: object, timeout: float = 0.0) -> object:
+                    observed_rpc_timeouts.append(timeout)
+                    raise RuntimeError("simulated fast rpc error")
+
+            fake_grpc = types.SimpleNamespace(
+                LocalConnectionType=types.SimpleNamespace(LOCAL_TCP="LOCAL_TCP"),
+                local_channel_credentials=lambda _kind: object(),
+                secure_channel=lambda _addr, _creds, options=None: object(),
+            )
+            fake_pb2 = types.SimpleNamespace(MetricRequest=_FakeMetricReq)
+            fake_pb2_grpc = types.SimpleNamespace(RuntimeMetricServiceStub=_FakeStub)
+
+            def _fake_py_fallback(_devs: object, *, addr: object, timeout_s: float, grpc_duty_layout: str = "auto") -> tuple[bool, None, dict[str, tpu_exporter._TpuInfoRow]]:
+                fallback_timeouts.append(timeout_s)
+                return (
+                    True,
+                    None,
+                    {
+                        "0": tpu_exporter._TpuInfoRow(
+                            chip_key="0",
+                            hbm_used_bytes=2 * 1024**3,
+                            hbm_total_bytes=32 * 1024**3,
+                            duty_cycle_percent=40.0,
+                            in_util_table=True,
+                            duty_ids_verified=True,
+                        )
+                    },
+                )
+
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_load_grpc_runtime_modules",
+                    return_value=(fake_grpc, fake_pb2, fake_pb2_grpc),
+                ),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_query_tpu_info_python_metrics",
+                    side_effect=_fake_py_fallback,
+                ),
+            ):
+                b_snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=b_sys,
+                    dev_root=b_dev,
+                    proc_root=b_proc,
+                    skip_pid_scan=True,
+                    runtime_metrics_addr="127.0.0.1:59431",
+                    tpu_info_timeout_s=0.05,
+                    shm_root=root / "no-shm",
+                )
+            self.assertTrue(observed_rpc_timeouts)
+            self.assertTrue(
+                all(0.0 < t <= 0.035 for t in observed_rpc_timeouts),
+                f"Expected direct gRPC per-RPC timeouts <= 0.035s at 50ms budget, got {observed_rpc_timeouts}",
+            )
+            self.assertEqual(len(fallback_timeouts), 1)
+            self.assertGreater(fallback_timeouts[0], 0.0)
+            self.assertAlmostEqual(b_snap.devices[0].duty_cycle_percent or 0.0, 40.0)
+
     def _assert_valid_prometheus_text(self, text: str) -> None:
         lines = [ln for ln in text.splitlines() if ln.strip()]
         self.assertGreater(len(lines), 0)

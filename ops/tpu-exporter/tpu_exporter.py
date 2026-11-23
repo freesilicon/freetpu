@@ -1123,7 +1123,7 @@ def _query_tpu_info_python_metrics(
     if not addr:
         return False, "runtime metrics gRPC address disabled", {}
 
-    deadline_s = max(0.05, float(timeout_s))
+    deadline_s = max(0.001, float(timeout_s))
     chip_attr = None
     for dev in devices:
         candidate = _GEN_TO_TPU_CHIP_ATTR.get(dev.generation)
@@ -1567,7 +1567,8 @@ def _query_grpc_runtime_metrics(
     if stub_cls is None or req_cls is None:
         return False, "RuntimeMetricServiceStub or MetricRequest missing from proto stubs", {}
 
-    deadline = time.monotonic() + max(0.05, float(timeout_s))
+    budget_s = max(0.001, float(timeout_s))
+    deadline = time.monotonic() + budget_s
     try:
         channel = _get_grpc_channel(grpc_mod, addr)
         stub = stub_cls(channel)
@@ -1589,11 +1590,11 @@ def _query_grpc_runtime_metrics(
     total_rpcs = len(_GRPC_METRIC_NAMES)
     for idx, metric_name in enumerate(_GRPC_METRIC_NAMES):
         remaining = deadline - time.monotonic()
-        if remaining <= 0.01:
+        if remaining <= 0.001:
             last_err = f"gRPC RuntimeMetricService timed out ({addr})"
             break
         remaining_rpcs = total_rpcs - idx
-        per_rpc_timeout = min(remaining, max(0.05, remaining / remaining_rpcs))
+        per_rpc_timeout = min(remaining, max(0.001, remaining / remaining_rpcs))
         try:
             resp = rpc_fn(req_cls(metric_name=metric_name), timeout=per_rpc_timeout)
             any_rpc_ok = True
@@ -2330,6 +2331,7 @@ def _resolve_raw_device_runtime_ids(
     raw_sysfs_counts: Dict[str, int] = {}
     raw_sysfs_gen_counts: Dict[Tuple[str, str], int] = {}
     tpu7x_slot_rids: Dict[str, List[str]] = {}
+    tpu7x_distinct_int_rids: set[int] = set()
     for dev in devices:
         if dev.runtime_chip_id:
             raw_sysfs_counts[dev.runtime_chip_id] = (
@@ -2341,24 +2343,33 @@ def _resolve_raw_device_runtime_ids(
             if dev.generation == "tpu7x":
                 base_slot = dev.pci_bdf.rsplit(".", 1)[0]
                 tpu7x_slot_rids.setdefault(base_slot, []).append(dev.runtime_chip_id)
+                parsed_rid = _parse_runtime_device_id(dev.runtime_chip_id)
+                if parsed_rid is not None:
+                    tpu7x_distinct_int_rids.add(parsed_rid)
     shared_raw_sysfs_ids = {rid for rid, cnt in raw_sysfs_counts.items() if cnt > 1}
     physical_sysfs_gens = {
         gen
         for (gen, _rid), cnt in raw_sysfs_gen_counts.items()
         if cnt > 1 and _GEN_DEVICES_PER_CHIP.get(gen, 1) > 1
     }
-    # On Ironwood (`tpu7x`, 2 logical cores/PCI functions per physical chip), a
-    # filtered PCI view exposing only one function per chip makes physical sysfs
-    # `chip_id`s appear unique even though they are NOT logical core IDs.
-    # Require positive host-level evidence that `tpu7x` sysfs `chip_id` is
-    # per-core (at least one multifunction sibling pair on the same PCI slot
-    # reporting distinct non-empty `chip_id`s, with zero shared `tpu7x` raw
-    # `chip_id`s) before trusting raw sysfs `chip_id` without `--chip-id-map`.
+    # On Ironwood (`tpu7x`, 2 logical cores/PCI functions per physical chip,
+    # max 4 physical chips per VM), a filtered PCI view exposing only one
+    # function per chip makes physical sysfs `chip_id`s appear unique even
+    # though they are NOT logical core IDs. Require positive host-level
+    # evidence that `tpu7x` sysfs `chip_id` is per-core — either (a) at least
+    # one multifunction sibling pair on the same PCI slot reporting distinct
+    # non-empty `chip_id`s, or (b) strictly more than 4 distinct non-negative
+    # integer `chip_id`s (e.g. `0..7` across 8 separate PCI slots, ruling out
+    # physical-chip numbering by pigeonhole), with zero shared `tpu7x` raw
+    # `chip_id`s — before trusting raw sysfs `chip_id` without `--chip-id-map`.
     tpu7x_sysfs_proved_per_core = (
         "tpu7x" not in physical_sysfs_gens
-        and any(
-            len(rids) == _GEN_DEVICES_PER_CHIP["tpu7x"] and len(set(rids)) == len(rids)
-            for rids in tpu7x_slot_rids.values()
+        and (
+            any(
+                len(rids) == _GEN_DEVICES_PER_CHIP["tpu7x"] and len(set(rids)) == len(rids)
+                for rids in tpu7x_slot_rids.values()
+            )
+            or len(tpu7x_distinct_int_rids) > 4
         )
     )
 
@@ -2509,6 +2520,13 @@ def _sanitize_fallback_duty_rows(
             cleaned[k] = copied
         return cleaned
 
+    raw_duty_rows = [
+        (k, _parse_runtime_device_id(k))
+        for k, r in rows.items()
+        if r.in_util_table and r.duty_cycle_percent is not None
+    ]
+    raw_duty_ids = {pid for _k, pid in raw_duty_rows if pid is not None}
+
     # In explicit `per-chip` Python fallback (`get_chip_usage()`), upstream
     # sorts HBM and duty replies separately and zips by position after checking
     # only `2 * len(duty) == len(hbm)`. Accept partial subsets ONLY when raw
@@ -2521,14 +2539,7 @@ def _sanitize_fallback_duty_rows(
         ]
         if duty_rows and all(r.duty_ids_verified for r in duty_rows):
             return working
-        raw_duty_ids = {
-            pid
-            for k, r in rows.items()
-            if r.in_util_table and r.duty_cycle_percent is not None
-            for pid in (_parse_runtime_device_id(k),)
-            if pid is not None
-        }
-        if raw_duty_ids == set(range(8)):
+        if len(raw_duty_rows) == 8 and raw_duty_ids == set(range(8)):
             return _strip_unverified_ironwood_zeros(working)
         sanitized_pc: Dict[str, _TpuInfoRow] = {}
         for k, r in working.items():
@@ -2544,12 +2555,22 @@ def _sanitize_fallback_duty_rows(
     if duty_rows_auto and all(r.duty_ids_verified for r in duty_rows_auto):
         return working
 
+    # On Ironwood (`tpu7x`, max 4 physical chips = 8 logical cores per VM), a
+    # complete 8-row contiguous reply `{0..7}` from `get_chip_usage_new()`
+    # proves full 1:1 positional coverage independently of how many PCI
+    # functions a filtered sidecar sees. Still strip unverified `0.0` readings
+    # so stock unset protobuf defaults cannot trigger `TpuMxuDutyCycleCollapse`.
+    if (
+        all(d.generation == "tpu7x" for d in devices)
+        and len(raw_duty_rows) == 8
+        and raw_duty_ids == set(range(8))
+    ):
+        return _strip_unverified_ironwood_zeros(working)
+
     expected_core_count: Optional[int] = None
     verified_chips = _verified_dual_function_chip_count(devices, inferred_dpc)
     if verified_chips is not None:
         expected_core_count = verified_chips * inferred_dpc
-    elif all(d.generation == "tpu7x" for d in devices) and len(devices) == 8:
-        expected_core_count = 8
 
     if expected_core_count is not None:
         duty_ids = {

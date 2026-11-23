@@ -4873,6 +4873,44 @@ class FreeTpuCdiTests(unittest.TestCase):
                 any(ln.strip() == "- IPC_LOCK" for ln in dra_text.splitlines()),
                 "DRA smoke-test Pod must keep IPC_LOCK commented/opt-in",
             )
+            # Restricted Pod Security Standard (PSS) requirements on the smoke-test Pod.
+            self.assertIn("runAsNonRoot: true", dra_text)
+            self.assertIn("runAsUser: 65532", dra_text)
+            self.assertIn("seccompProfile:", dra_text)
+            self.assertIn("type: RuntimeDefault", dra_text)
+            self.assertIn("allowPrivilegeEscalation: false", dra_text)
+            self.assertIn("- ALL", dra_text)
+            # Smoke-test command must check an always-injected CDI marker env var and VFIO nodes,
+            # and exit non-zero when CDI injection is absent.
+            self.assertIn("FREETPU_CDI_VERSION", dra_text)
+            self.assertIn("/dev/vfio/vfio", dra_text)
+            cmd_marker = "        - |\n"
+            self.assertIn(cmd_marker, dra_text)
+            cmd_block = dra_text.split(cmd_marker, 1)[1].split("      securityContext:", 1)[0]
+            cmd_script = "\n".join(
+                ln[10:] if ln.startswith("          ") else ln
+                for ln in cmd_block.splitlines()
+            )
+            compile(cmd_script, "<k8s-tpu-dra-example-cmd>", "exec")
+            probe_env = {
+                k: v
+                for k, v in os.environ.items()
+                if not k.startswith("FREETPU_") and not k.startswith("TPU_")
+            }
+            probe_proc = subprocess.run(
+                [sys.executable, "-c", cmd_script],
+                env=probe_env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertNotEqual(
+                probe_proc.returncode,
+                0,
+                f"DRA smoke-test command must exit non-zero without CDI injection: {probe_proc.stdout} {probe_proc.stderr}",
+            )
+            self.assertIn("CDI injection missing", probe_proc.stderr)
 
     def test_missing_vfio_group_node_retains_healthy_numa_slice_and_withdraws_broken_group(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -5423,6 +5461,124 @@ class FreeTpuCdiTests(unittest.TestCase):
                     for kv in by_name2["numa0-pcie-0000-00-4"]["containerEdits"]["env"]
                 )
                 self.assertEqual(n0_env2.get("TPU_VISIBLE_CHIPS"), "0,1,2,3")
+
+    def test_degraded_single_root_v6e_domain_withholds_4chip_slice_and_2x2_bounds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # Single-root 8-chip v6e host with no NUMA locality (`numa_node` absent):
+            # all 8 PCI functions share one PCIe root domain (`0000:00`).
+            devs = [
+                {
+                    "bdf": f"0000:00:{4 + i:02x}.0",
+                    "vendor": "0x1ae0",
+                    "device": "0x006f",
+                    "driver": "vfio-pci",
+                    "iommu_group": str(i),
+                    "chip_id": str(i),
+                }
+                for i in range(8)
+            ]
+            sysfs_root, dev_root = _make_mock_pci_vfio(
+                root / "single_root_v6e8",
+                devices=devs,
+                create_vfio_nodes=[str(i) for i in range(8)],
+            )
+            spec_path = root / "cdi" / "freetpu.json"
+
+            with _mock_vfio_char_devices():
+                ok_full, msg_full = freetpu_cdi.reconcile_cdi_spec(
+                    spec_path,
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    single_host_env=True,
+                )
+                self.assertTrue(ok_full, msg_full)
+                full_spec = json.loads(spec_path.read_text(encoding="utf-8"))
+                full_names = {d["name"] for d in full_spec["devices"]}
+                self.assertIn("pcie-0000-00-8", full_names)
+                self.assertIn("all", full_names)
+
+                # Four VFIO nodes disappear while all 8 PCI functions remain visible in sysfs.
+                # The 4 surviving functions may NOT form a valid 2x2 torus mesh, so neither
+                # `pcie-0000-00-4` nor `0-3` nor `TPU_CHIPS_PER_HOST_BOUNDS=2,2,1` may be published.
+                for idx in range(4, 8):
+                    (dev_root / "vfio" / str(idx)).unlink()
+
+                ok_deg, msg_deg = freetpu_cdi.reconcile_cdi_spec(
+                    spec_path,
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    single_host_env=True,
+                )
+                self.assertTrue(ok_deg, msg_deg)
+                deg_spec = json.loads(spec_path.read_text(encoding="utf-8"))
+                deg_names = {d["name"] for d in deg_spec["devices"]}
+                self.assertNotIn("pcie-0000-00-4", deg_names)
+                self.assertNotIn("0-3", deg_names)
+                self.assertNotIn("all", deg_names)
+                self.assertEqual(
+                    deg_names,
+                    {f"pci-0000-00-{4 + i:02x}-0" for i in range(4)},
+                )
+                for dev_entry in deg_spec["devices"]:
+                    env_list = dev_entry.get("containerEdits", {}).get("env", [])
+                    self.assertNotIn("TPU_CHIPS_PER_HOST_BOUNDS=2,2,1", env_list)
+                    self.assertNotIn("TPU_ACCELERATOR_TYPE=v6e-4", env_list)
+
+                # Public discover_tpu_chips() -> build_cdi_spec() must also withhold the degraded slice.
+                pub_chips, pub_ctrl = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                pub_spec = freetpu_cdi.build_cdi_spec(
+                    pub_chips, pub_ctrl, single_host_env=True
+                )
+                pub_names = {d["name"] for d in pub_spec["devices"]}
+                self.assertNotIn("pcie-0000-00-4", pub_names)
+                self.assertNotIn("0-3", pub_names)
+                self.assertNotIn("all", pub_names)
+
+                # Host validation accepts the reconciled spec and rejects a forged 4-chip slice.
+                self.assertEqual(
+                    freetpu_cdi.verify_spec_against_host(
+                        deg_spec, sysfs_root=sysfs_root, dev_root=dev_root
+                    ),
+                    [],
+                )
+                forged = json.loads(json.dumps(deg_spec))
+                forged["devices"].append(
+                    {
+                        "name": "pcie-0000-00-4",
+                        "annotations": {
+                            "freetpu.dev/pci-bdfs": ",".join(
+                                f"0000:00:{4 + i:02x}.0" for i in range(4)
+                            ),
+                            "freetpu.dev/pcie-root": "0000:00",
+                            "freetpu.dev/chip-count": "4",
+                        },
+                        "containerEdits": {
+                            "deviceNodes": [
+                                {
+                                    "path": f"/dev/vfio/{i}",
+                                    "hostPath": str(dev_root / "vfio" / str(i)),
+                                    "type": "c",
+                                    "permissions": "rw",
+                                }
+                                for i in range(4)
+                            ],
+                            "env": [
+                                "TPU_ACCELERATOR_TYPE=v6e-4",
+                                "TPU_CHIPS_PER_HOST_BOUNDS=2,2,1",
+                            ],
+                        },
+                    }
+                )
+                forged_errs = freetpu_cdi.verify_spec_against_host(
+                    forged, sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                self.assertTrue(
+                    any("pcie-0000-00-4" in e for e in forged_errs),
+                    forged_errs,
+                )
 
 
 if __name__ == "__main__":

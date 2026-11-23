@@ -1569,18 +1569,36 @@ def _compute_topology_slices(
     if not domains:
         return []
 
+    full_inventory = host_pci_inventory if host_pci_inventory is not None else chips
+    inventory_domain_bdfs: Dict[Tuple[str, Optional[int], str], set[str]] = {}
+    for inv_chip in full_inventory:
+        inventory_domain_bdfs.setdefault(_topology_domain_key(inv_chip), set()).add(
+            inv_chip.pci_bdf
+        )
+
     used_names = set(reserved_names or ())
 
-    # Map every IOMMU group to the set of domain keys that touch it so we
-    # never emit a sub-host slice that splits an IOMMU group across domains
-    # (enforced in BOTH legacy VFIO and iommufd/cdev modes).
+    # Map every IOMMU group across the full host PCI inventory to the set of
+    # domain keys that touch it so we never emit a sub-host slice that splits
+    # an IOMMU group across domains (enforced in BOTH legacy VFIO and
+    # iommufd/cdev modes).
     group_to_domains: Dict[str, set[Tuple[str, Optional[int], str]]] = {}
-    for d_key, d_chips in domains.items():
-        for c in d_chips:
-            group_to_domains.setdefault(c.iommu_group, set()).add(d_key)
+    for inv_chip in full_inventory:
+        group_to_domains.setdefault(inv_chip.iommu_group, set()).add(
+            _topology_domain_key(inv_chip)
+        )
 
     slices: List[_TopologySlice] = []
     for dom_ordinal, (d_key, d_chips) in enumerate(domains.items()):
+        # Withhold any NUMA/PCIe slice whose domain lost one or more VFIO-ready
+        # PCI functions compared to the full host PCI inventory (e.g. an 8-chip
+        # single-root v6e domain losing 4 VFIO nodes must NOT be republished as
+        # a 4-chip slice with `2,2,1` topology bounds). Other unaffected domains
+        # whose PCI functions are all VFIO-available remain publishable.
+        domain_inv_bdfs = inventory_domain_bdfs.get(d_key, set())
+        available_domain_bdfs = {c.pci_bdf for c in d_chips}
+        if domain_inv_bdfs and not domain_inv_bdfs.issubset(available_domain_bdfs):
+            continue
         if len(d_chips) < 2:
             continue
         if any(
@@ -2883,7 +2901,9 @@ def _verify_spec_against_host_detailed(
                         slice_live_chips = [live_chips_by_bdf[b] for b in expected_live_bdfs]
                         domain_key = next(iter(slice_domains))
                         domain_bdfs = sorted(
-                            c.pci_bdf for c in live_chips if _topology_domain_key(c) == domain_key
+                            c.pci_bdf
+                            for c in live_pci_inventory
+                            if _topology_domain_key(c) == domain_key
                         )
                         slice_per_chip_set = {
                             _PCI_FUNCTIONS_PER_PHYSICAL_CHIP.get(c.generation, 1)
