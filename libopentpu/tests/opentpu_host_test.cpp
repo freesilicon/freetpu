@@ -172,6 +172,47 @@ static void test_fork_closes_vfio_fds_and_static_pjrt_err() {
   // Destroying the static fallback error repeatedly must be a safe no-op.
   destroy_pjrt_error(api, fallback);
   destroy_pjrt_error(api, fallback);
+
+  // Verify forked-child VFIO API calls return OT_ERR_DEVICE without deadlocking
+  // even when another thread in the parent held ctx->mu across fork().
+  ot_config_t cfg = ot_config_default();
+  cfg.mock_mode = 1;
+  ot_context_t* ctx = nullptr;
+  OT_CHECK(ot_context_create(&cfg, &ctx) == OT_OK);
+  ot_buffer_t *ba = nullptr, *bb = nullptr, *bc = nullptr;
+  OT_CHECK(ot_buffer_alloc(ctx, 16, &ba) == OT_OK);
+  OT_CHECK(ot_buffer_alloc(ctx, 16, &bb) == OT_OK);
+  OT_CHECK(ot_buffer_alloc(ctx, 16, &bc) == OT_OK);
+  ctx->info.is_mock = 0u;
+  ctx->transport.is_mock = false;
+  ctx->transport.owner_pid = static_cast<int64_t>(::getpid());
+  ctx->mu.lock();
+  pid_t cpid = ::fork();
+  OT_CHECK(cpid >= 0);
+  if (cpid == 0) {
+    ot_buffer_t* out = nullptr;
+    uint8_t scratch[16] = {};
+    bool ok = true;
+    if (ot_buffer_alloc(ctx, 16, &out) != OT_ERR_DEVICE || out != nullptr) ok = false;
+    if (ot_buffer_h2d(ctx, ba, scratch, sizeof(scratch)) != OT_ERR_DEVICE) ok = false;
+    if (ot_buffer_d2h(ctx, ba, scratch, sizeof(scratch)) != OT_ERR_DEVICE) ok = false;
+    if (ot_matmul_bf16(ctx, ba, bb, bc, 2, 2, 2) != OT_ERR_DEVICE) ok = false;
+    const char* em = ot_context_last_error(ctx);
+    if (!em || std::strstr(em, "forked") == nullptr) ok = false;
+    ot_buffer_free(ba);
+    ot_context_destroy(ctx);
+    ::_exit(ok ? 0 : 1);
+  }
+  ctx->mu.unlock();
+  int cstatus = 0;
+  OT_CHECK(::waitpid(cpid, &cstatus, 0) == cpid);
+  OT_CHECK(WIFEXITED(cstatus) && WEXITSTATUS(cstatus) == 0);
+  ctx->info.is_mock = 1u;
+  ctx->transport.is_mock = true;
+  ot_buffer_free(ba);
+  ot_buffer_free(bb);
+  ot_buffer_free(bc);
+  ot_context_destroy(ctx);
   printf("[PASS] test_fork_closes_vfio_fds_and_static_pjrt_err\n");
 }
 

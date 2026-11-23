@@ -113,6 +113,11 @@ ot_status_t ot_context_create(const ot_config_t* config, ot_context_t** out_ctx)
 
 void ot_context_destroy(ot_context_t* ctx) {
   if (!ctx) return;
+  if (!ctx->info.is_mock && !ctx->transport.is_owner_process()) {
+    ctx->transport.close_device();
+    delete ctx;
+    return;
+  }
   {
     std::lock_guard<std::mutex> lk(ctx->mu);
     for (ot_buffer_t* b : ctx->live_buffers) {
@@ -129,6 +134,9 @@ void ot_context_destroy(ot_context_t* ctx) {
 
 const char* ot_context_last_error(const ot_context_t* ctx) {
   if (!ctx) return g_last_create_error.c_str();
+  if (!ctx->info.is_mock && !ctx->transport.is_owner_process()) {
+    return "VFIO context cannot be used in a forked child process";
+  }
   return ctx->last_error.c_str();
 }
 
@@ -147,12 +155,11 @@ ot_status_t ot_buffer_alloc(ot_context_t* ctx, size_t size_bytes, ot_buffer_t** 
   if (!ctx || !out_buf || size_bytes == 0) return OT_ERR_INVALID_ARG;
   if (size_bytes > UINT64_MAX - 4095ULL) return OT_ERR_INVALID_ARG;
   *out_buf = nullptr;
-
-  std::lock_guard<std::mutex> lk(ctx->mu);
   if (!ctx->info.is_mock && !ctx->transport.is_owner_process()) {
-    ctx->last_error = "VFIO context cannot be used in a forked child process";
     return OT_ERR_DEVICE;
   }
+
+  std::lock_guard<std::mutex> lk(ctx->mu);
   if (ctx->transport.dma_faulted) {
     ctx->last_error = "Context faulted after prior DMA timeout; recreate context";
     return OT_ERR_DEVICE;
@@ -182,7 +189,7 @@ ot_status_t ot_buffer_alloc(ot_context_t* ctx, size_t size_bytes, ot_buffer_t** 
 
 void ot_buffer_free(ot_buffer_t* buf) {
   if (!buf) return;
-  if (buf->ctx) {
+  if (buf->ctx && (buf->ctx->info.is_mock || buf->ctx->transport.is_owner_process())) {
     std::lock_guard<std::mutex> lk(buf->ctx->mu);
     auto& live = buf->ctx->live_buffers;
     auto it = std::find(live.begin(), live.end(), buf);
@@ -214,11 +221,10 @@ ot_status_t buffer_h2d_offset(ot_context_t* ctx, ot_buffer_t* dst, size_t dst_of
     return OT_ERR_INVALID_ARG;
   }
   if (size_bytes == 0) return OT_OK;
-  std::lock_guard<std::mutex> lk(ctx->mu);
   if (!ctx->info.is_mock && !ctx->transport.is_owner_process()) {
-    ctx->last_error = "VFIO context cannot be used in a forked child process";
     return OT_ERR_DEVICE;
   }
+  std::lock_guard<std::mutex> lk(ctx->mu);
   if (ctx->transport.dma_faulted) {
     ctx->last_error = "Context faulted after prior DMA timeout; recreate context";
     return OT_ERR_DEVICE;
@@ -293,11 +299,10 @@ ot_status_t ot_buffer_d2h(ot_context_t* ctx, const ot_buffer_t* src,
     return OT_ERR_INVALID_ARG;
   }
   if (size_bytes == 0) return OT_OK;
-  std::lock_guard<std::mutex> lk(ctx->mu);
   if (!ctx->info.is_mock && !ctx->transport.is_owner_process()) {
-    ctx->last_error = "VFIO context cannot be used in a forked child process";
     return OT_ERR_DEVICE;
   }
+  std::lock_guard<std::mutex> lk(ctx->mu);
   if (ctx->transport.dma_faulted) {
     ctx->last_error = "Context faulted after prior DMA timeout; recreate context";
     return OT_ERR_DEVICE;
@@ -366,12 +371,11 @@ ot_status_t ot_matmul_bf16(ot_context_t* ctx,
   if (ranges_overlap(out_mn, lhs_mk) || ranges_overlap(out_mn, rhs_kn)) {
     return OT_ERR_INVALID_ARG;
   }
-
-  std::lock_guard<std::mutex> lk(ctx->mu);
   if (!ctx->info.is_mock && !ctx->transport.is_owner_process()) {
-    ctx->last_error = "VFIO context cannot be used in a forked child process";
     return OT_ERR_DEVICE;
   }
+
+  std::lock_guard<std::mutex> lk(ctx->mu);
   if (ctx->transport.dma_faulted) {
     ctx->last_error = "Context faulted after prior DMA timeout; recreate context";
     return OT_ERR_DEVICE;
