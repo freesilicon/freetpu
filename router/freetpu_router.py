@@ -122,8 +122,17 @@ def _safe_probe_error(exc: BaseException) -> str:
     return f"probe_exception:{type(exc).__name__}"
 
 
+def _is_valid_model_id(model: str) -> bool:
+    """Return True if `model` is a non-empty printable model ID within `MAX_MODEL_ID_LEN`."""
+    return (
+        bool(model)
+        and len(model) <= MAX_MODEL_ID_LEN
+        and not any(ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F for ch in model)
+    )
+
+
 def _extract_models_list(parsed: Any) -> Optional[List[str]]:
-    """Validate an OpenAI `/v1/models` JSON response and return discovered model IDs and aliases."""
+    """Validate an OpenAI `/v1/models` JSON response and return usable discovered model IDs and aliases."""
     items: Optional[List[Any]] = None
     if isinstance(parsed, Mapping):
         raw_data = parsed.get("data")
@@ -141,7 +150,7 @@ def _extract_models_list(parsed: Any) -> Optional[List[str]]:
         raw_id = item.get("id")
         if isinstance(raw_id, str):
             mid = raw_id.strip()
-            if mid and mid not in seen:
+            if _is_valid_model_id(mid) and mid not in seen:
                 seen.add(mid)
                 discovered.append(mid)
         raw_aliases = item.get("aliases")
@@ -149,7 +158,7 @@ def _extract_models_list(parsed: Any) -> Optional[List[str]]:
             for raw_alias in raw_aliases:
                 if isinstance(raw_alias, str):
                     alias = raw_alias.strip()
-                    if alias and alias not in seen:
+                    if _is_valid_model_id(alias) and alias not in seen:
                         seen.add(alias)
                         discovered.append(alias)
     return discovered
@@ -797,9 +806,7 @@ def _parse_inference_request_fields(
     model = raw_model.strip()
     if not model:
         return None, (400, "invalid_model_id", "Field 'model' is required")
-    if len(model) > MAX_MODEL_ID_LEN or any(
-        ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F for ch in model
-    ):
+    if not _is_valid_model_id(model):
         return None, (
             400,
             "invalid_model_id",

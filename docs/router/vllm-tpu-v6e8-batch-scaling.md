@@ -48,6 +48,12 @@ mkdir -p "$HF_HUB_CACHE" "$XLA_CACHE_DIR"
 
 ## 3. Non-Privileged CDI Container Base Flags
 
+Before launching either preset with `--device=freetpu.dev/tpu=all`, enable CDI in Docker (for Docker versions where CDI is not enabled by default, add `"features": {"cdi": true}` to `/etc/docker/daemon.json` and restart Docker) and register the boot-scoped FreeTPU CDI specification on the TPU VM (see [ops/tpu-cdi/README.md](../../ops/tpu-cdi/README.md) for continuous `sync` reconciliation and VFIO rebind safety):
+
+```bash
+sudo python3 ops/tpu-cdi/freetpu_cdi.py generate --output /var/run/cdi/freetpu.json --validate
+```
+
 Per the verified Cloud TPU `v6e-8` CDI contract (no `--privileged` required; `--net=host` is required for 8-chip `libtpu` coordinator initialization). Both BF16 presets below share `CONTAINER_FLAGS`, mounting both `HF_HUB_CACHE` and the XLA compilation cache off the retained Hyperdisk so neither weights nor compiled artifacts live on the 100 GiB boot disk:
 
 ```bash

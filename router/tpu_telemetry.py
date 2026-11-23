@@ -267,7 +267,12 @@ class _TpuTelemetryAggregator:
         self.tracked_chips: set[str] = set()
         self.generations_seen: set[str] = set()
         self.non_finite_metrics: set[str] = set()
+        self.malformed_metrics: set[str] = set()
         self.limit_error: Optional[str] = None
+
+    def add_malformed_metric(self, metric_name: str) -> None:
+        if metric_name in _KNOWN_TPU_METRICS:
+            self.malformed_metrics.add(metric_name)
 
     def _register_chip(self, chip_key: str) -> bool:
         if chip_key in self.tracked_chips:
@@ -347,6 +352,10 @@ class _TpuTelemetryAggregator:
             exporter_up = False
             bad_names = ", ".join(sorted(self.non_finite_metrics))
             error_msg = f"non-finite telemetry values in {bad_names}"
+        elif self.malformed_metrics:
+            exporter_up = False
+            bad_names = ", ".join(sorted(self.malformed_metrics))
+            error_msg = f"malformed telemetry values in {bad_names}"
         elif not self.saw_exporter_up:
             exporter_up = False
             error_msg = "missing freetpu_exporter_up metric"
@@ -399,6 +408,7 @@ def evaluate_tpu_readiness(
         if telemetry.error and (
             telemetry.error == "missing freetpu_exporter_up metric"
             or telemetry.error.startswith("non-finite telemetry")
+            or telemetry.error.startswith("malformed telemetry")
         ):
             return False, "tpu_exporter_invalid_metrics"
         return False, "tpu_exporter_down"
@@ -1192,6 +1202,8 @@ def _stream_scrape_tpu_body(
         )
         if sample is not None:
             agg.add_sample(sample)
+        else:
+            agg.add_malformed_metric(name_bytes.decode("ascii", errors="replace"))
 
     while True:
         remaining = deadline - time.monotonic()

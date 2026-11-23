@@ -13130,6 +13130,138 @@ asyncio.run(main())
         self.assertFalse(ready)
         self.assertEqual(reason, "tpu_exporter_unreachable")
 
+    def test_discovered_model_ids_match_inference_id_validation_policy(self) -> None:
+        overlong_path = "/models/" + ("a" * 260) + ".gguf"
+        control_alias = "bad\x07alias"
+        valid_alias = "qwen3-32b-q4"
+
+        class _OverlongModelDiscoveryHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return None
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = json.dumps(
+                    {
+                        "object": "list",
+                        "data": [
+                            {
+                                "id": overlong_path,
+                                "object": "model",
+                                "aliases": [control_alias, valid_alias],
+                            }
+                        ],
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802
+                clen = int(self.headers.get("Content-Length", "0"))
+                if clen > 0:
+                    self.rfile.read(clen)
+                body = json.dumps(
+                    {
+                        "id": "chatcmpl-valid-alias",
+                        "object": "chat.completion",
+                        "model": valid_alias,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "ok"},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6},
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
+        srv = self._track(
+            ThreadingHTTPServer(("127.0.0.1", 0), _OverlongModelDiscoveryHandler)
+        )
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            backends=[
+                BackendConfig(
+                    id="gguf-b",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=f"http://127.0.0.1:{srv.server_address[1]}/v1",
+                    discover_models=True,
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        st_m, _, body_m = _http_request(rport, "GET", "/v1/models")
+        self.assertEqual(st_m, 200)
+        advertised = [entry["id"] for entry in json.loads(body_m.decode("utf-8"))["data"]]
+        self.assertEqual(advertised, [valid_alias])
+
+        st_ok, _, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": valid_alias,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        self.assertEqual(st_ok, 200)
+
+        st_bad, _, body_bad = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": overlong_path,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        self.assertEqual(st_bad, 400)
+        self.assertIn("invalid_model_id", body_bad.decode("utf-8"))
+
+    def test_tpu_exporter_marks_malformed_pressure_metrics_invalid(self) -> None:
+        for bad_line, metric_name in (
+            ('freetpu_tpu_duty_cycle_percent{chip="0"} N/A\n', "freetpu_tpu_duty_cycle_percent"),
+            (
+                'freetpu_tpu_hbm_utilization_ratio{chip="0"} garbage\n',
+                "freetpu_tpu_hbm_utilization_ratio",
+            ),
+        ):
+            raw = (
+                "freetpu_exporter_up 1\n"
+                "freetpu_tpu_devices_discovered 1\n"
+                'freetpu_tpu_health_status{chip="0"} 1\n'
+                + bad_line
+            )
+            exporter = self._track(_MockTpuExporter(raw_body=raw))
+            telem = scrape_tpu_exporter(exporter.metrics_url, timeout_s=2.0)
+            self.assertTrue(telem.reachable)
+            self.assertFalse(telem.exporter_up)
+            self.assertIsNotNone(telem.error)
+            self.assertIn(metric_name, telem.error or "")
+            ready, reason = evaluate_tpu_readiness(
+                telem,
+                max_hbm_utilization=0.95,
+                max_duty_cycle_percent=80.0,
+            )
+            self.assertFalse(ready)
+            self.assertEqual(reason, "tpu_exporter_invalid_metrics")
+
 
 def run_self_tests(verbosity: int = 1) -> int:
     """Run all router tests cleanly via unittest."""
