@@ -351,6 +351,48 @@ def _resolve_iommufd_cdev(
     return cdev_dir.name, devnum
 
 
+def _parse_pci_domain_bus(pci_bdf: str) -> Optional[Tuple[str, int]]:
+    parts = pci_bdf.strip().lower().split(":")
+    if len(parts) < 2:
+        return None
+    try:
+        return parts[0], int(parts[1], 16)
+    except ValueError:
+        return None
+
+
+def _scan_pcie_bridge_roots(sysfs_root: Path) -> Dict[Tuple[str, int], set[str]]:
+    """Map `(pci_domain_hex, bus_num)` -> set of PCIe root complexes via sysfs PCIe bridges."""
+    pci_devices_dir = sysfs_root / "bus" / "pci" / "devices"
+    bus_to_roots: Dict[Tuple[str, int], set[str]] = {}
+    if not pci_devices_dir.is_dir():
+        return bus_to_roots
+    try:
+        entries = list(pci_devices_dir.iterdir())
+    except OSError:
+        return bus_to_roots
+    for entry in entries:
+        sec_txt = _read_text(entry / "secondary_bus_number")
+        sub_txt = _read_text(entry / "subordinate_bus_number")
+        if not sec_txt or not sub_txt:
+            continue
+        parsed = _parse_pci_domain_bus(entry.name)
+        if parsed is None:
+            continue
+        dom_hex, _bridge_bus = parsed
+        try:
+            sec_bus = int(sec_txt, 0)
+            sub_bus = int(sub_txt, 0)
+        except ValueError:
+            continue
+        if not (0 <= sec_bus <= sub_bus <= 255):
+            continue
+        root = _resolve_pcie_root_complex(entry)
+        for bus_num in range(sec_bus, sub_bus + 1):
+            bus_to_roots.setdefault((dom_hex, bus_num), set()).add(root)
+    return bus_to_roots
+
+
 def _pcie_root_complex(pci_bdf: str) -> str:
     """Return `<domain>:<bus>` prefix from a PCI BDF (fallback when sysfs root bridge is absent)."""
     parts = pci_bdf.strip().split(":")
@@ -962,18 +1004,22 @@ def _discover_tpu_chips_with_inventory(
 
 
 class DiscoveredChipList(List[DiscoveredChip]):
-    """List of allocatable discovered TPU chips carrying the full host PCI inventory."""
+    """List of allocatable discovered TPU chips carrying full host PCI inventory and bridge roots."""
 
     def __init__(
         self,
         chips: Iterable[DiscoveredChip],
         *,
         full_pci_inventory: Optional[Sequence[DiscoveredChip]] = None,
+        bridge_bus_to_roots: Optional[Dict[Tuple[str, int], set[str]]] = None,
     ) -> None:
         super().__init__(chips)
         self.full_pci_inventory: Tuple[DiscoveredChip, ...] = tuple(
             full_pci_inventory if full_pci_inventory is not None else self
         )
+        self.bridge_bus_to_roots: Dict[Tuple[str, int], set[str]] = {
+            k: set(v) for k, v in (bridge_bus_to_roots or {}).items()
+        }
 
 
 def discover_tpu_chips(
@@ -1004,7 +1050,15 @@ def discover_tpu_chips(
         iommu_dev_path=iommu_dev_path,
         vfio_mode=vfio_mode,
     )
-    return DiscoveredChipList(chips, full_pci_inventory=full_pci_inventory), control_node
+    bridge_roots = _scan_pcie_bridge_roots(sysfs_root)
+    return (
+        DiscoveredChipList(
+            chips,
+            full_pci_inventory=full_pci_inventory,
+            bridge_bus_to_roots=bridge_roots,
+        ),
+        control_node,
+    )
 
 
 def _pci_bdf_token(pci_bdf: str) -> str:
@@ -1554,6 +1608,7 @@ def _compute_topology_slices(
     chip_id_map: Optional[Dict[str, int]] = None,
     host_pci_inventory: Optional[Sequence[DiscoveredChip]] = None,
     observed_domain_bdfs: Optional[Dict[Tuple[str, Optional[int], str], set[str]]] = None,
+    bridge_bus_to_roots: Optional[Dict[Tuple[str, int], set[str]]] = None,
 ) -> List[_TopologySlice]:
     """Compute valid single-domain NUMA / PCIe sub-host slices and their canonical aliases.
 
@@ -1594,6 +1649,14 @@ def _compute_topology_slices(
     for obs_dkey, obs_bdfs in (observed_domain_bdfs or {}).items():
         for obs_bdf in obs_bdfs:
             observed_bdf_to_domains.setdefault(obs_bdf, set()).add(obs_dkey)
+    live_root_set = {d_k[2] for d_k in domains}
+    live_bus_to_roots: Dict[Tuple[str, int], set[str]] = {}
+    for inv_c in full_inventory:
+        parsed_cb = _parse_pci_domain_bus(inv_c.pci_bdf)
+        if parsed_cb is not None:
+            live_bus_to_roots.setdefault(parsed_cb, set()).add(
+                inv_c.pcie_root or _pcie_root_complex(inv_c.pci_bdf)
+            )
 
     slices: List[_TopologySlice] = []
     for dom_ordinal, (d_key, d_chips) in enumerate(domains.items()):
@@ -1603,9 +1666,14 @@ def _compute_topology_slices(
         # missing `--chip-id-map` BDFs attributed to this domain) so a degraded
         # single-root 8-chip v6e domain losing 4 functions can never be
         # republished as a 4-chip slice with fabricated `2,2,1` topology bounds.
-        # When a PCIe root is shared by multiple NUMA domains, attribute any
-        # previously observed missing `--chip-id-map` BDF strictly to its
-        # recorded domain so losing a chip in NUMA 1 does not withdraw NUMA 0.
+        # Attribution priority for a missing mapped BDF:
+        # 1. Exact domain recorded in same-boot `observed_domain_bdfs`.
+        # 2. Unambiguous PCIe bridge hierarchy (`bridge_bus_to_roots`) or live
+        #    root / shared-bus ancestry.
+        # 3. Fail closed: if a missing mapped BDF cannot be unambiguously
+        #    assigned to any specific PCIe root/domain (e.g. a disappeared
+        #    bridged endpoint on a fresh scan), withhold affected slices rather
+        #    than ignoring it and publishing a `2,2,1` slice.
         domain_expected_bdfs = set(inventory_domain_bdfs.get(d_key, set()))
         if observed_domain_bdfs:
             domain_expected_bdfs.update(observed_domain_bdfs.get(d_key, set()))
@@ -1617,7 +1685,26 @@ def _compute_topology_slices(
                 if recorded_domains:
                     if d_key in recorded_domains:
                         domain_expected_bdfs.add(map_bdf)
-                elif _pcie_root_complex(map_bdf) == d_key[2]:
+                    continue
+                assigned_root: Optional[str] = None
+                parsed_mb = _parse_pci_domain_bus(map_bdf)
+                if parsed_mb is not None and bridge_bus_to_roots:
+                    b_roots = bridge_bus_to_roots.get(parsed_mb)
+                    if b_roots and len(b_roots) == 1:
+                        assigned_root = next(iter(b_roots))
+                if assigned_root is None:
+                    direct_root = _pcie_root_complex(map_bdf)
+                    if direct_root in live_root_set:
+                        assigned_root = direct_root
+                if assigned_root is None and parsed_mb is not None:
+                    sb_roots = live_bus_to_roots.get(parsed_mb)
+                    if sb_roots and len(sb_roots) == 1:
+                        assigned_root = next(iter(sb_roots))
+                if assigned_root is not None:
+                    if assigned_root == d_key[2]:
+                        domain_expected_bdfs.add(map_bdf)
+                else:
+                    # Unassignable missing mapped endpoint: fail closed on this domain.
                     domain_expected_bdfs.add(map_bdf)
         available_domain_bdfs = {c.pci_bdf for c in d_chips}
         if domain_expected_bdfs and not domain_expected_bdfs.issubset(available_domain_bdfs):
@@ -1885,6 +1972,7 @@ def build_cdi_spec(
     omit_visible_env: bool = False,
     host_pci_inventory: Optional[Sequence[DiscoveredChip]] = None,
     observed_domain_bdfs: Optional[Dict[Tuple[str, Optional[int], str], set[str]]] = None,
+    bridge_bus_to_roots: Optional[Dict[Tuple[str, int], set[str]]] = None,
 ) -> Dict[str, Any]:
     """Build a CNCF CDI JSON specification dictionary (default: CDI v0.6.0, host-safe env).
 
@@ -1913,6 +2001,10 @@ def build_cdi_spec(
         carried_inv = getattr(chips, "full_pci_inventory", None)
         if carried_inv is not None:
             host_pci_inventory = carried_inv
+    if bridge_bus_to_roots is None:
+        carried_bridges = getattr(chips, "bridge_bus_to_roots", None)
+        if carried_bridges is not None:
+            bridge_bus_to_roots = carried_bridges
 
     for chip in chips:
         if chip.non_tpu_group_members:
@@ -2015,9 +2107,13 @@ def build_cdi_spec(
             # Expose shared IOMMU groups strictly as a single hardware-backed
             # allocation unit so callers never assume device-level VFIO isolation
             # between sibling chips and selectors never shift onto different chips.
+            # Emit locality annotations (`pcie-root` / `numa-node`) ONLY when every
+            # member of the shared group agrees on that domain.
             unit_complete_chips, unit_incomplete_fns = _count_complete_chips(
                 unit_chips, bdf_to_phys
             )
+            unit_roots = {c.pcie_root or _pcie_root_complex(c.pci_bdf) for c in unit_chips}
+            unit_numas = {c.numa_node for c in unit_chips}
             selector = _shared_group_selector(unit_bdfs)
             ann = {
                 "freetpu.dev/allocation-unit": "shared-iommu-group",
@@ -2026,17 +2122,20 @@ def build_cdi_spec(
                 "freetpu.dev/pci-bdfs": ",".join(unit_bdfs),
                 "freetpu.dev/generations": ",".join(unit_gens),
                 "freetpu.dev/iommu-group": rep.iommu_group,
-                "freetpu.dev/pcie-root": pcie_root,
                 "freetpu.dev/optional-cap-add": "IPC_LOCK",
                 "freetpu.dev/required-ulimit-memlock": "-1",
             }
+            if len(unit_roots) == 1:
+                ann["freetpu.dev/pcie-root"] = next(iter(unit_roots))
             if len(unit_chips) != unit_complete_chips or unit_incomplete_fns > 0:
                 ann["freetpu.dev/pci-function-count"] = str(len(unit_chips))
             if unit_incomplete_fns > 0:
                 ann["freetpu.dev/incomplete-pci-functions"] = str(unit_incomplete_fns)
                 ann["freetpu.dev/capacity-complete"] = "false"
-            if rep.numa_node is not None:
-                ann["freetpu.dev/numa-node"] = str(rep.numa_node)
+            if len(unit_numas) == 1:
+                only_numa = next(iter(unit_numas))
+                if only_numa is not None:
+                    ann["freetpu.dev/numa-node"] = str(only_numa)
             if devnums_str:
                 ann["freetpu.dev/vfio-devnums"] = devnums_str
             devices.append(
@@ -2067,6 +2166,7 @@ def build_cdi_spec(
         chip_id_map=chip_id_map,
         host_pci_inventory=host_pci_inventory,
         observed_domain_bdfs=merged_observed_domains,
+        bridge_bus_to_roots=bridge_bus_to_roots,
     ):
         slice_nodes, slice_devnums = _dedup_device_nodes(topo_slice.chips)
         slice_visibility = _resolve_verified_visibility_ordinals(
@@ -2878,6 +2978,7 @@ def _verify_spec_against_host_detailed(
     merged_live_observed = _merge_observed_domain_bdfs(
         spec_observed_domains, live_pci_inventory
     )
+    live_bridge_roots = _scan_pcie_bridge_roots(sysfs_root)
     live_bdf_to_phys = _map_physical_chip_indices(live_chips, chip_id_map=chip_id_map)
     expected_slices_by_name: Dict[str, _TopologySlice] = {}
     expected_slices_by_bdfs: Dict[Tuple[str, ...], _TopologySlice] = {}
@@ -2888,6 +2989,7 @@ def _verify_spec_against_host_detailed(
         chip_id_map=chip_id_map,
         host_pci_inventory=live_pci_inventory,
         observed_domain_bdfs=merged_live_observed,
+        bridge_bus_to_roots=live_bridge_roots,
     ):
         expected_slices_by_bdfs[topo_slice.pci_bdfs] = topo_slice
         for alias in topo_slice.aliases:
@@ -3686,6 +3788,7 @@ def reconcile_cdi_spec(
             omit_visible_env=omit_visible_env,
             host_pci_inventory=full_pci_inventory,
             observed_domain_bdfs=merged_observed,
+            bridge_bus_to_roots=_scan_pcie_bridge_roots(sysfs_root),
         )
     except Exception as exc:  # noqa: BLE001
         removed, cleanup_err = _invalidate_spec(output_path)
@@ -4129,6 +4232,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 omit_visible_env=args.omit_visible_env,
                 host_pci_inventory=full_pci_inventory,
                 observed_domain_bdfs=merged_gen_observed,
+                bridge_bus_to_roots=_scan_pcie_bridge_roots(args.sysfs_root),
             )
         except Exception as exc:  # noqa: BLE001
             if not args.stdout and not args.allow_missing_vfio:

@@ -3805,8 +3805,9 @@ TPU Runtime Utilization
                 {"0": 12.5, "1": 37.5, "2": 62.5, "3": 87.5},
             )
 
-            # Custom telemetry wrapper (`--tpu-info-bin /path/to/custom-wrapper`) is NOT
-            # stock `tpu-info` and MUST retain its partial-core Ironwood duty-cycle rows!
+            # Custom telemetry wrapper (`--tpu-info-bin /path/to/custom-wrapper`) MUST
+            # retain partial-core Ironwood duty-cycle rows ONLY when `--trust-tpu-info-cli-duty`
+            # is explicitly set (without the flag, stock Ironwood sanitization still applies).
             custom_iw_wrapper = iw_root / "custom-wrapper.sh"
             custom_iw_wrapper.write_text(
                 "#!/bin/sh\n"
@@ -3826,6 +3827,7 @@ TPU Runtime Utilization
                     dev_root=iw_dev,
                     proc_root=iw_proc,
                     tpu_info_bin=str(custom_iw_wrapper),
+                    trust_tpu_info_cli_duty=True,
                     runtime_metrics_addr="127.0.0.1:8431",
                     shm_root=iw_root / "no-shm",
                 )
@@ -3859,6 +3861,7 @@ TPU Runtime Utilization
                     proc_root=iw_proc,
                     tpu_info_bin=str(custom_iw_wrapper),
                     tpu_info_timeout_s=0.05,
+                    trust_tpu_info_cli_duty=True,
                     runtime_metrics_addr="127.0.0.1:8431",
                     shm_root=iw_root / "no-shm",
                 )
@@ -6373,14 +6376,16 @@ TPU Runtime Utilization
                 {"0", "1", "2", "3"},
             )
 
-            # 8. An explicit custom operator wrapper path whose basename happens to be
-            #    `tpu-info` (e.g. `.../opt/telemetry/tpu-info`) MUST NOT be sanitized as
-            #    stock `tpu-info` and MUST preserve valid duty readings on a 2-core mapped
-            #    Ironwood host!
-            custom_dir = root / "opt" / "telemetry"
-            custom_dir.mkdir(parents=True)
-            custom_wrapper = custom_dir / "tpu-info"
-            custom_wrapper.write_text(
+            # 8. Separate executable path selection from trusting CLI duty readings:
+            #    (a) Stock `tpu-info` configured by absolute path (`/usr/local/bin/tpu-info`)
+            #        with default `trust_tpu_info_cli_duty=False` keeps direct gRPC first AND
+            #        applies Ironwood duty validation (stripping unverified 2-row duty).
+            #    (b) Explicit custom wrapper (`/opt/telemetry/tpu-info`) with
+            #        `trust_tpu_info_cli_duty=True` runs directly and preserves duty readings!
+            stock_abs_dir = root / "usr" / "local" / "bin"
+            stock_abs_dir.mkdir(parents=True)
+            stock_abs_bin = stock_abs_dir / "tpu-info"
+            stock_cli_body = (
                 "#!/bin/sh\n"
                 "cat <<'EOF'\n"
                 "TPU Device Status\n"
@@ -6390,22 +6395,184 @@ TPU Runtime Utilization
                 "| 0         | 16.00 GiB / 192.00 GiB    | [|.........] 8.3%  | [||||||||..] 75.0%    |\n"
                 "| 1         | 8.00 GiB / 192.00 GiB     | [..........] 4.2%  | [|||.......] 25.0%    |\n"
                 "+-----------+---------------------------+--------------------+-----------------------+\n"
-                "EOF\n",
-                encoding="utf-8",
+                "EOF\n"
             )
+            stock_abs_bin.write_text(stock_cli_body, encoding="utf-8")
+            stock_abs_bin.chmod(0o755)
+            grpc_probe_calls: list[str] = []
+
+            def _record_grpc_fail(*_args: object, **kwargs: object) -> tuple[bool, str, dict[str, object]]:
+                grpc_probe_calls.append(str(kwargs.get("addr", "")))
+                return False, "grpc down", {}
+
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_query_grpc_runtime_metrics",
+                    side_effect=_record_grpc_fail,
+                ),
+            ):
+                abs_snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=f_sys,
+                    dev_root=f_dev,
+                    proc_root=f_proc,
+                    tpu_info_bin=str(stock_abs_bin),
+                    chip_id_map={"0000:00:04.0": "0", "0000:00:05.0": "1"},
+                    shm_root=root / "no-shm",
+                )
+            self.assertEqual(len(grpc_probe_calls), 1)
+            abs_by_bdf = {d.pci_bdf: d for d in abs_snap.devices}
+            self.assertIsNone(abs_by_bdf["0000:00:04.0"].duty_cycle_percent)
+            self.assertIsNone(abs_by_bdf["0000:00:05.0"].duty_cycle_percent)
+
+            custom_dir = root / "opt" / "telemetry"
+            custom_dir.mkdir(parents=True)
+            custom_wrapper = custom_dir / "tpu-info"
+            custom_wrapper.write_text(stock_cli_body, encoding="utf-8")
             custom_wrapper.chmod(0o755)
-            with _mock_vfio_char_lstat():
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_query_grpc_runtime_metrics",
+                    side_effect=AssertionError("must not call direct gRPC when --trust-tpu-info-cli-duty is set"),
+                ),
+            ):
                 cw_snap = tpu_exporter.collect_snapshot(
                     sysfs_root=f_sys,
                     dev_root=f_dev,
                     proc_root=f_proc,
                     tpu_info_bin=str(custom_wrapper),
+                    trust_tpu_info_cli_duty=True,
                     chip_id_map={"0000:00:04.0": "0", "0000:00:05.0": "1"},
                     shm_root=root / "no-shm",
                 )
             cw_by_bdf = {d.pci_bdf: d for d in cw_snap.devices}
             self.assertAlmostEqual(cw_by_bdf["0000:00:04.0"].duty_cycle_percent or 0.0, 75.0)
             self.assertAlmostEqual(cw_by_bdf["0000:00:05.0"].duty_cycle_percent or 0.0, 25.0)
+
+            # 9. `auto`-mode Ironwood where `get_chip_usage_new()` raises AssertionError
+            #    on 4 physical-chip duty gauges vs 8 HBM rows: fallback recovers HBM via
+            #    `get_chip_usage()` AND still exports all 4 raw duty readings in
+            #    `freetpu_tpu_runtime_unjoined_duty_cycle_percent`!
+            fake_metrics_raise = types.ModuleType("tpu_info.metrics")
+
+            def _raise_usage_new(_chip: object, addr: str = "") -> list[_FakeUsage]:
+                raise AssertionError("len(duty)=4 != len(hbm)=8")
+
+            def _recover_usage_8(_chip: object, addr: str = "") -> list[_FakeUsage]:
+                return [
+                    _FakeUsage(i, (i + 1) * 1024**3, 192 * 1024**3, 0.0)
+                    for i in range(8)
+                ]
+
+            fake_metrics_raise.get_chip_usage_new = _raise_usage_new  # type: ignore[attr-defined]
+            fake_metrics_raise.get_chip_usage = _recover_usage_8  # type: ignore[attr-defined]
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "grpc": fake_grpc_mod,
+                        "tpu_info": types.ModuleType("tpu_info"),
+                        "tpu_info.device": fake_dev_mod,
+                        "tpu_info.metrics": fake_metrics_raise,
+                        "tpu_info.proto": types.ModuleType("tpu_info.proto"),
+                        "tpu_info.proto.tpu_metric_service_pb2": fake_proto_pb2,
+                        "tpu_info.proto.tpu_metric_service_pb2_grpc": fake_proto_grpc_4,
+                    },
+                ),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_query_grpc_runtime_metrics",
+                    return_value=(False, "direct grpc down", {}),
+                ),
+            ):
+                rec_snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=rpc_sys,
+                    dev_root=rpc_dev,
+                    proc_root=rpc_proc,
+                    skip_pid_scan=True,
+                    runtime_metrics_addr="127.0.0.1:59434",
+                    grpc_duty_layout="auto",
+                    shm_root=root / "no-shm",
+                )
+            self.assertEqual(len(rec_snap.devices), 8)
+            for i, dev in enumerate(rec_snap.devices):
+                self.assertEqual(dev.hbm_used_bytes, (i + 1) * 1024**3)
+                self.assertIsNone(dev.duty_cycle_percent)
+            self.assertEqual(
+                rec_snap.runtime_unjoined_duty_cycle,
+                {"0": 42.0, "1": 43.0, "2": 44.0, "3": 45.0},
+            )
+
+            # 10. Raw protobuf duty gauge populated via `as_int = 55` while stock
+            #     `get_chip_usage_new()` reports `0.0` (reading only `as_double`):
+            #     exporter MUST publish the decoded raw value `55.0`!
+            class _IntGauge:
+                def __init__(self, as_int_val: int) -> None:
+                    self.as_int = as_int_val
+                    self.as_double = 0.0
+
+                def WhichOneof(self, _name: str) -> str:
+                    return "as_int"
+
+                def HasField(self, field_name: str) -> bool:
+                    return field_name == "as_int"
+
+            class _IntDutyStub:
+                def __init__(self, _chan: object) -> None:
+                    pass
+
+                def GetRuntimeMetric(self, _req: object, timeout: float = 0.0) -> object:
+                    pts = [
+                        types.SimpleNamespace(
+                            attribute=_Attr(i),
+                            gauge=_IntGauge(55) if i == 0 else _Gauge(60.0),
+                        )
+                        for i in range(8)
+                    ]
+                    return types.SimpleNamespace(metric=types.SimpleNamespace(metrics=pts))
+
+            fake_proto_grpc_int = types.ModuleType("tpu_info.proto.tpu_metric_service_pb2_grpc")
+            fake_proto_grpc_int.RuntimeMetricServiceStub = _IntDutyStub  # type: ignore[attr-defined]
+            fake_metrics_int = types.ModuleType("tpu_info.metrics")
+            fake_metrics_int.get_chip_usage_new = lambda _chip, addr="": [  # type: ignore[attr-defined]
+                _FakeUsage(i, 16 * 1024**3, 192 * 1024**3, 0.0 if i == 0 else 60.0)
+                for i in range(8)
+            ]
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "grpc": fake_grpc_mod,
+                        "tpu_info": types.ModuleType("tpu_info"),
+                        "tpu_info.device": fake_dev_mod,
+                        "tpu_info.metrics": fake_metrics_int,
+                        "tpu_info.proto": types.ModuleType("tpu_info.proto"),
+                        "tpu_info.proto.tpu_metric_service_pb2": fake_proto_pb2,
+                        "tpu_info.proto.tpu_metric_service_pb2_grpc": fake_proto_grpc_int,
+                    },
+                ),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_query_grpc_runtime_metrics",
+                    return_value=(False, "direct grpc down", {}),
+                ),
+            ):
+                int_snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=rpc_sys,
+                    dev_root=rpc_dev,
+                    proc_root=rpc_proc,
+                    skip_pid_scan=True,
+                    runtime_metrics_addr="127.0.0.1:59435",
+                    shm_root=root / "no-shm",
+                )
+            int_by_bdf = {d.pci_bdf: d for d in int_snap.devices}
+            self.assertAlmostEqual(int_by_bdf["0000:00:04.0"].duty_cycle_percent or 0.0, 55.0)
+            self.assertAlmostEqual(int_by_bdf["0000:00:05.0"].duty_cycle_percent or 0.0, 60.0)
 
     def _assert_valid_prometheus_text(self, text: str) -> None:
         lines = [ln for ln in text.splitlines() if ln.strip()]

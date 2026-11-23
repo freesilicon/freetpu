@@ -5847,6 +5847,126 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertIn("numa0-pcie-0000-00-4", sr2_names)
                 self.assertNotIn("numa1-pcie-0000-00-4", sr2_names)
 
+                # Bridged single-root v6e-8 (root `0000:00`, bridged endpoints on buses
+                # `0000:04..0b`): on a FRESH scan where 4 endpoints disappeared while a
+                # complete 8-entry `--chip-id-map` is supplied, MUST withhold `pcie-0000-00-4`
+                # and `2,2,1` bounds — both when sysfs exposes PCIe bridge bus ranges AND
+                # when bridge files are absent (fail-closed unassignable missing BDF)!
+                for with_bridge_files in (True, False):
+                    br_root = root / f"bridged_v6e8_{'with' if with_bridge_files else 'no'}_bridge"
+                    br_sys = br_root / "sys"
+                    br_dev = br_root / "dev"
+                    (br_dev / "vfio").mkdir(parents=True)
+                    (br_dev / "vfio" / "vfio").write_text("", encoding="utf-8")
+                    vfio_misc_dev = br_sys / "class" / "misc" / "vfio" / "dev"
+                    vfio_misc_dev.parent.mkdir(parents=True, exist_ok=True)
+                    vfio_misc_dev.write_text("10:196\n", encoding="utf-8")
+                    pci_bus_dir = br_sys / "bus" / "pci" / "devices"
+                    pci_bus_dir.mkdir(parents=True)
+                    bridge_dir = br_sys / "devices" / "pci0000:00" / "0000:00:01.0"
+                    bridge_dir.mkdir(parents=True)
+                    if with_bridge_files:
+                        (bridge_dir / "secondary_bus_number").write_text("0x04\n", encoding="utf-8")
+                        (bridge_dir / "subordinate_bus_number").write_text("0x0b\n", encoding="utf-8")
+                    os.symlink(str(bridge_dir), pci_bus_dir / "0000:00:01.0")
+                    for i in range(4):
+                        bdf = f"0000:{4 + i:02x}:00.0"
+                        ep_dir = bridge_dir / bdf
+                        ep_dir.mkdir(parents=True)
+                        (ep_dir / "vendor").write_text("0x1ae0\n", encoding="utf-8")
+                        (ep_dir / "device").write_text("0x006f\n", encoding="utf-8")
+                        (ep_dir / "enable").write_text("1\n", encoding="utf-8")
+                        drv_target = br_sys / "bus" / "pci" / "drivers" / "vfio-pci"
+                        drv_target.mkdir(parents=True, exist_ok=True)
+                        os.symlink(str(drv_target), ep_dir / "driver")
+                        grp_dir = br_sys / "kernel" / "iommu_groups" / str(i) / "devices"
+                        grp_dir.mkdir(parents=True, exist_ok=True)
+                        os.symlink(str(ep_dir), pci_bus_dir / bdf)
+                        os.symlink(str(ep_dir), grp_dir / bdf)
+                        os.symlink(str(br_sys / "kernel" / "iommu_groups" / str(i)), ep_dir / "iommu_group")
+                        (br_dev / "vfio" / str(i)).write_text("", encoding="utf-8")
+                        grp_dev = br_sys / "class" / "vfio" / str(i) / "dev"
+                        grp_dev.parent.mkdir(parents=True, exist_ok=True)
+                        grp_dev.write_text(f"242:{i}\n", encoding="utf-8")
+
+                    full_bridged_map = {f"0000:{4 + i:02x}:00.0": i for i in range(8)}
+                    br_chips, br_ctrl = freetpu_cdi.discover_tpu_chips(
+                        sysfs_root=br_sys, dev_root=br_dev
+                    )
+                    self.assertTrue(all(c.pcie_root == "0000:00" for c in br_chips))
+                    br_spec = freetpu_cdi.build_cdi_spec(
+                        br_chips, br_ctrl, single_host_env=True, chip_id_map=full_bridged_map
+                    )
+                    br_names = {d["name"] for d in br_spec["devices"]}
+                    self.assertNotIn("pcie-0000-00-4", br_names)
+                    self.assertNotIn("0-3", br_names)
+                    for dev_entry in br_spec["devices"]:
+                        env_list = dev_entry.get("containerEdits", {}).get("env", [])
+                        self.assertNotIn("TPU_CHIPS_PER_HOST_BOUNDS=2,2,1", env_list)
+                        self.assertNotIn("TPU_ACCELERATOR_TYPE=v6e-4", env_list)
+                    self.assertEqual(
+                        freetpu_cdi.verify_spec_against_host(
+                            br_spec,
+                            sysfs_root=br_sys,
+                            dev_root=br_dev,
+                            chip_id_map=full_bridged_map,
+                        ),
+                        [],
+                    )
+
+                # Shared IOMMU group spanning multiple NUMA nodes / PCIe roots MUST omit
+                # disagreeing `freetpu.dev/pcie-root` and `freetpu.dev/numa-node` annotations,
+                # while a single-domain shared group still emits both!
+                cross_sys, cross_dev = _make_mock_pci_vfio(
+                    root / "cross_domain_shared_group",
+                    devices=[
+                        {
+                            "bdf": "0000:00:04.0",
+                            "vendor": "0x1ae0",
+                            "device": "0x006f",
+                            "driver": "vfio-pci",
+                            "iommu_group": "7",
+                            "numa_node": "0",
+                        },
+                        {
+                            "bdf": "0000:80:04.0",
+                            "vendor": "0x1ae0",
+                            "device": "0x006f",
+                            "driver": "vfio-pci",
+                            "iommu_group": "7",
+                            "numa_node": "1",
+                        },
+                        {
+                            "bdf": "0000:00:05.0",
+                            "vendor": "0x1ae0",
+                            "device": "0x006f",
+                            "driver": "vfio-pci",
+                            "iommu_group": "8",
+                            "numa_node": "0",
+                        },
+                        {
+                            "bdf": "0000:00:06.0",
+                            "vendor": "0x1ae0",
+                            "device": "0x006f",
+                            "driver": "vfio-pci",
+                            "iommu_group": "8",
+                            "numa_node": "0",
+                        },
+                    ],
+                    create_vfio_nodes=["7", "8"],
+                )
+                cross_chips, cross_ctrl = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=cross_sys, dev_root=cross_dev
+                )
+                cross_spec = freetpu_cdi.build_cdi_spec(cross_chips, cross_ctrl)
+                cross_by_name = {d["name"]: d for d in cross_spec["devices"]}
+                span_ann = cross_by_name["group-pci-0000-00-04-0_0000-80-04-0"]["annotations"]
+                self.assertNotIn("freetpu.dev/pcie-root", span_ann)
+                self.assertNotIn("freetpu.dev/numa-node", span_ann)
+                same_ann = cross_by_name["group-pci-0000-00-05-0_0000-00-06-0"]["annotations"]
+                self.assertEqual(same_ann.get("freetpu.dev/pcie-root"), "0000:00")
+                self.assertEqual(same_ann.get("freetpu.dev/numa-node"), "0")
+
     def test_all_selector_revalidates_map_dependent_topology_with_omit_visible_env(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
