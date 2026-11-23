@@ -30,10 +30,36 @@ jobs:
           cmake --build build-cloudtpu -j"$(nproc)"
           ctest --test-dir build-cloudtpu --output-on-failure
 
+      - name: Build & test llama-cpp-cloudtpu GGML overlay (b12608 + CLOUDTPU_MOCK=1)
+        run: |
+          LLAMA_SRC="${RUNNER_TEMP}/llama.cpp-b12608"
+          LLAMA_BUILD="${RUNNER_TEMP}/build-cloudtpu-b12608"
+          git clone --depth 1 --branch b12608 https://github.com/ggml-org/llama.cpp "$LLAMA_SRC"
+          LLAMA_CPP_DIR="$LLAMA_SRC" ./llama-cpp-cloudtpu/build.sh overlay
+          cmake -S "$LLAMA_SRC" -B "$LLAMA_BUILD" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_CLOUDTPU=ON \
+            -DGGML_METAL=OFF \
+            -DGGML_BLAS=OFF \
+            -DGGML_OPENMP=OFF \
+            -DLLAMA_BUILD_TESTS=ON \
+            -DLLAMA_BUILD_TOOLS=OFF \
+            -DLLAMA_OPENSSL=OFF
+          cmake --build "$LLAMA_BUILD" --target test-backend-ops -j"$(nproc)"
+          CLOUDTPU_MOCK=1 "$LLAMA_BUILD/bin/test-backend-ops" test -b CLOUDTPU -o ADD
+          CLOUDTPU_MOCK=1 "$LLAMA_BUILD/bin/test-backend-ops" test -b CLOUDTPU -o RMS_NORM
+          CLOUDTPU_MOCK=1 "$LLAMA_BUILD/bin/test-backend-ops" test -b CLOUDTPU -o SCALE
+
       - name: Build & test libopenbuenos (Make)
         run: |
           make -C libopenbuenos verify-header-host host test
           make -C libopenbuenos clean
+
+      - name: Build & test libopentpu (Make)
+        run: |
+          make -C libopentpu verify-header-host host test
+          make -C libopentpu clean
 
       - name: Build bare-metal runtime (Linux UAPI headers)
         run: |
@@ -63,6 +89,14 @@ jobs:
           python3 tools/verify_fusion_lut.py
           python3 tools/verify_chained_fusion.py
           python3 tools/verify_patch_proof.py
+          python3 tools/colab_tpu_bench.py --self-test
+
+      - name: Run Cloud TPU ops exporter & CDI self-tests
+        run: |
+          python3 ops/tpu-exporter/tpu_exporter.py --help >/dev/null
+          python3 ops/tpu-cdi/freetpu_cdi.py --help >/dev/null
+          python3 ops/tpu-exporter/test_tpu_exporter.py -v
+          python3 ops/tpu-cdi/test_freetpu_cdi.py -v
 
   clean-room-audit:
     name: Clean-Room & OSS Boundary Audit

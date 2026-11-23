@@ -53,3 +53,106 @@
  #endif
  #ifdef GGML_USE_CPU
          register_backend(ggml_backend_cpu_reg());
+@@ -590,6 +601,9 @@
+     ggml_backend_load_best("hexagon",  silent, dir_path);
+     ggml_backend_load_best("musa",     silent, dir_path);
+     ggml_backend_load_best("openvino", silent, dir_path);
++    if (getenv("GGML_DISABLE_CLOUDTPU") == nullptr) {
++        ggml_backend_load_best("cloudtpu", silent, dir_path);
++    }
+     ggml_backend_load_best("cpu",      silent, dir_path);
+     // check the environment variable GGML_BACKEND_PATH to load an out-of-tree backend
+     const char * backend_path = std::getenv("GGML_BACKEND_PATH");
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -215,9 +215,25 @@
+ 
+         if (offload) {
+             auto * dev = model.dev_layer(il);
+-            buft = ggml_backend_dev_buffer_type(dev);
+-
+-            dev_name = ggml_backend_dev_name(dev);
++            const char * cand_name = ggml_backend_dev_name(dev);
++            const bool k_ok = (type_k == GGML_TYPE_F32 || type_k == GGML_TYPE_F16 || type_k == GGML_TYPE_BF16);
++            const bool v_ok = is_mla || (!v_trans && (type_v == GGML_TYPE_F32 || type_v == GGML_TYPE_F16 || type_v == GGML_TYPE_BF16));
++            const bool rope_type_ok =
++                hparams.rope_type == LLAMA_ROPE_TYPE_NORM ||
++                hparams.rope_type == LLAMA_ROPE_TYPE_NEOX ||
++                hparams.rope_type == LLAMA_ROPE_TYPE_MROPE ||
++                hparams.rope_type == LLAMA_ROPE_TYPE_IMROPE;
++            const bool rope_shift_ok =
++                !hparams.has_rope(il) ||
++                (rope_type_ok && hparams.n_lora_kv == 0 && hparams.n_rot(il) == hparams.n_embd_head_k(il));
++            if (cand_name && std::strncmp(cand_name, "CLOUDTPU", 8) == 0 && (!k_ok || !v_ok || !rope_shift_ok)) {
++                LLAMA_LOG_WARN("%s: layer %3d: %s does not support KV cache config (k=%s v=%s v_trans=%d n_rot=%u head_k=%u); placing KV cache on CPU\n",
++                        __func__, il, cand_name, ggml_type_name(type_k), ggml_type_name(type_v), (int) v_trans, hparams.n_rot(il), hparams.n_embd_head_k(il));
++            } else {
++                buft = ggml_backend_dev_buffer_type(dev);
++
++                dev_name = cand_name;
++            }
+         }
+ 
+         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -86,9 +86,15 @@
+         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+ 
+         if (offload) {
+             auto * dev = model.dev_layer(i);
+-            buft = ggml_backend_dev_buffer_type(dev);
+-
+-            dev_name = ggml_backend_dev_name(dev);
++            const char * cand_name = ggml_backend_dev_name(dev);
++            if (cand_name && std::strncmp(cand_name, "CLOUDTPU", 8) == 0) {
++                LLAMA_LOG_WARN("%s: layer %3d: %s does not support in-place recurrent state updates; placing RS cache on CPU\n",
++                        __func__, i, cand_name);
++            } else {
++                buft = ggml_backend_dev_buffer_type(dev);
++
++                dev_name = cand_name;
++            }
+         }
+ 
+--- a/src/llama-kv-cache-dsv4.cpp
++++ b/src/llama-kv-cache-dsv4.cpp
+@@ -972,10 +972,16 @@
+         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+ 
+         if (offload) {
+             auto * dev = model.dev_layer(il);
+-            buft = ggml_backend_dev_buffer_type(dev);
+-
+-            dev_name = ggml_backend_dev_name(dev);
++            const char * cand_name = ggml_backend_dev_name(dev);
++            if (cand_name && std::strncmp(cand_name, "CLOUDTPU", 8) == 0) {
++                LLAMA_LOG_WARN("%s: layer %3d: %s does not support in-place DSV4 state updates; placing compressor state on CPU\n",
++                        __func__, il, cand_name);
++            } else {
++                buft = ggml_backend_dev_buffer_type(dev);
++
++                dev_name = cand_name;
++            }
+         }
+ 
+         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1515,7 +1515,16 @@
+     layer_inp_dev = ggml_new_tensor_2d(ctx_layer_inp_dev.get(), GGML_TYPE_F32, n_layer_inp*model.hparams.n_embd, cparams.n_batch);
+     ggml_set_name(layer_inp_dev, "layer_inp_dev");
+ 
+     layer_inp_dev_dev = model.dev_output();
++    if (layer_inp_dev_dev && std::strncmp(ggml_backend_dev_name(layer_inp_dev_dev), "CLOUDTPU", 8) == 0) {
++        LLAMA_LOG_WARN("%s: %s does not support strided layer_inp_dev writes; using host copies\n",
++                __func__, ggml_backend_dev_name(layer_inp_dev_dev));
++        cparams.embeddings_layer_inp_dev = false;
++        layer_inp_dev     = nullptr;
++        layer_inp_dev_dev = nullptr;
++        ctx_layer_inp_dev.reset();
++        return;
++    }
+     auto * buft = layer_inp_dev_dev ? ggml_backend_dev_buffer_type(layer_inp_dev_dev) : ggml_backend_cpu_buffer_type();
+ 
+     buf_layer_inp_dev.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_layer_inp_dev.get(), buft));

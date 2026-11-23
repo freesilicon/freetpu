@@ -13,7 +13,7 @@ Clean-room Apache-2.0 GGML `GPU` backend (`CLOUDTPU`) targeting Google Cloud TPU
 | **PJRT Runtime & Cache** | `pjrt_runtime.hpp`, `pjrt_runtime.cpp` | `dlopen(libtpu.so)` -> `GetPjrtApi()`, pure C++ `CompileOptionsProto` + `DeviceAssignmentProto` wire encoder, thread-safe LRU executable cache (`PJRT_LoadedExecutable*`) with eviction epoch, single-chip & multi-chip replica-SPMD execution (`execute_spmd`), HBM buffer H2D/D2H with explicit untiled C-order `host_layout`, `/proc/self/maps` `libpython` audit, and multi-device **Host Mock PJRT** (`CLOUDTPU_MOCK=1`, `CLOUDTPU_MOCK_DEVICES=1..16`) executing StableHLO IR + cross-chip collectives (`all_reduce`, `all_gather`, `reduce_scatter`, `replica_id`, `dynamic_slice`) |
 | **StableHLO Emitter** | `stablehlo_emitter.hpp`, `stablehlo_emitter.cpp` | Zero-dependency C++17 textual StableHLO MLIR emitter (`format="mlir"`) + deterministic structural cache key for `MUL_MAT` (`F32`/`F16`/`BF16`/`Q8_0`/`Q4_0`/`Q4_K`/`Q6_K`, replicated, `SHARD_N`, and `SHARD_K`), `FLASH_ATTN_EXT` (GQA + mask + ALiBi + softcap), `RMS_NORM`, `ROPE` (Normal & NeoX + YaRN + `rope_freqs`), `SILU`, `SWIGLU`, `SOFT_MAX`, `GET_ROWS`, `SET_ROWS` (`stablehlo.scatter`), `ADD`, `MUL`, `SCALE`, `CPY`, `RESHAPE`, `TRANSPOSE`, `SLICE`, and StableHLO v1.0 collectives (`ALL_REDUCE_SUM`, `ALL_GATHER`, `REDUCE_SCATTER_SUM`) |
 | **GGML Backend** | `ggml-cloudtpu.h`, `ggml-cloudtpu.cpp` | HBM-resident multi-chip `ggml_backend_buffer` slot manager (lossless split & sharded HBM upload for `Q8_0`/`Q4_0`/`Q4_K`/`Q6_K`/`F16`/`BF16`/`F32`, O(1) slot reuse fast-path, sub-slice view patching), O(N) `ggml_gallocr` liveness precomputation, zero-MLIR-re-emission `SubgraphPlanCache`, extended fusion (`CLOUDTPU_MAX_FUSE_OPS=64`) with automatic Megatron-LM 1-collective FFN detection (`Gate`/`Up` `SHARD_N` -> local `SwiGLU` -> `Down` `SHARD_K` + single `all_reduce`), async pipelining (`ggml_backend_cloudtpu_synchronize`), and recursive `VIEW`/`PERMUTE`/`TRANSPOSE`/`RESHAPE` lowering |
-| **PJRT Header** | `third_party/openxla/pjrt_c_api.h` | Pinned Apache-2.0 OpenXLA `pjrt_c_api.h` (`0bfeeb476952fc0ae13dd38e27a9053cb1baa3ce`, ABI `0.116`, `struct_size=1144`) |
+| **PJRT Header** | `../libopentpu/third_party/openxla/pjrt_c_api.h` | Pinned Apache-2.0 OpenXLA `pjrt_c_api.h` (`0bfeeb476952fc0ae13dd38e27a9053cb1baa3ce`, ABI `0.116`, `struct_size=1144`) |
 
 ---
 
@@ -92,7 +92,7 @@ git clone --depth 1 --branch b12608 https://github.com/ggml-org/llama.cpp llama-
 
 # 1-chip Host Mock verification against ggml-cpu:
 CLOUDTPU_MOCK=1 ./llama-cpp-cloudtpu/build-host/bin/test-backend-ops -b CLOUDTPU \
-  -o "MUL_MAT,RMS_NORM,ROPE,SOFT_MAX,GET_ROWS,ADD,MUL,CPY,UNARY,GLU"
+  -o "MUL_MAT,RMS_NORM,ROPE,SOFT_MAX,GET_ROWS,ADD,MUL,CPY,SILU,SWIGLU"
 
 # 8-chip v6e-8 SPMD Host Mock verification:
 CLOUDTPU_MOCK=1 CLOUDTPU_MOCK_DEVICES=8 CLOUDTPU_SPMD_CHIPS=8 CLOUDTPU_SPMD_MIN_ROWS=8 \
