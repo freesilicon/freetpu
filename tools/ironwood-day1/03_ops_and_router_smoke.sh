@@ -23,12 +23,14 @@ Usage: 03_ops_and_router_smoke.sh [--out-dir DIR] [--backend-url URL] [--model N
 Runs bounded Ironwood Day-1 checks for the FreeTPU ops & serving control plane:
   1. CNCF CDI v1.1 spec generation & host validation (ops/tpu-cdi/freetpu_cdi.py generate + validate)
   2. Prometheus telemetry one-shot capture (ops/tpu-exporter/tpu_exporter.py --once) validating
-     actual non-comment Prometheus samples (freetpu_tpu_devices_discovered >= 1 and per-collector
-     counts for direct gRPC/runtime, SeqLock SHM, and PCIe AER)
+     actual non-comment Prometheus samples (freetpu_tpu_devices_discovered >= 1 and explicit
+     per-collector verification for direct_grpc, shm, and aer; live runs with missing collectors
+     report EXPORTER_SMOKE_STATUS=PARTIAL_UNVERIFIED)
   3. FreeTPU router config check (--check-config) + bounded SSE concurrency sweep (c=16,32,64,128)
-     with an explicit per-tier wall-clock deadline (--tier-timeout-s), verifying peak_inflight >= c
-     (barrier-synchronized in --mock mode), 100% SSE [DONE] completion, and active_inflight == 0
-     after every tier.
+     with an explicit per-tier wall-clock deadline (--tier-timeout-s), rejecting SSE error events
+     and asserting active_inflight == 0 after every tier. In --mock mode, a barrier-synchronized
+     backend enforces hard peak_inflight >= c; in live mode, observed peak_inflight is sampled
+     and tiers that complete without observing peak_inflight >= c report COMPLETED_UNVERIFIED_PEAK.
 
 In --mock mode (or on non-Linux hosts), creates a synthetic tpu7x-standard-4t sysfs/devfs tree for
 CDI/exporter and runs the router sweep against a local loopback barrier-synchronized OpenAI SSE backend.
@@ -118,7 +120,7 @@ log "=== FreeTPU Ironwood (tpu7x) Day-1 Ops & Router Smoke ==="
 log "timestamp_utc=${TIMESTAMP} mock_mode=${MOCK_MODE} cdi_version=${CDI_VERSION} concurrencies=${CONCURRENCIES} tier_timeout_s=${TIER_TIMEOUT_S} backend_url=${BACKEND_URL}"
 
 if [[ "${DRY_RUN}" -eq 1 ]]; then
-  log "[DRY-RUN] Would run freetpu_cdi.py generate/validate (--cdi-version ${CDI_VERSION}), tpu_exporter.py --once (validating non-comment Prometheus samples), and freetpu_router.py --check-config + SSE concurrency sweep (${CONCURRENCIES}, tier_timeout_s=${TIER_TIMEOUT_S}) asserting peak_inflight>=c and active_inflight==0."
+  log "[DRY-RUN] Would run freetpu_cdi.py generate/validate (--cdi-version ${CDI_VERSION}), tpu_exporter.py --once (validating non-comment Prometheus samples and direct_grpc/shm/aer collectors), and freetpu_router.py --check-config + SSE concurrency sweep (${CONCURRENCIES}, tier_timeout_s=${TIER_TIMEOUT_S}, barrier peak_inflight>=c in --mock / observed peak_inflight in live mode, rejecting SSE error events, asserting active_inflight==0)."
   exit 0
 fi
 
@@ -318,34 +320,37 @@ devices_discovered = int(discovered_vals[-1])
 if devices_discovered < 1:
     raise SystemExit(f"tpu-exporter discovered {devices_discovered} TPU devices (expected >= 1)")
 
-tpu7x_info_samples = sum(
-    1 for name, lbl, _v in samples
-    if name == "freetpu_tpu_info" and 'generation="tpu7x"' in lbl
-)
-grpc_runtime_samples = sum(
-    1 for name, lbl, _v in samples
-    if (
-        name in (
-            "freetpu_tpu_duty_cycle_percent",
-            "freetpu_tpu_runtime_duty_cycle_percent",
-            "freetpu_tpu_runtime_unjoined_duty_cycle_percent",
-        )
-        or (
-            name == "freetpu_tpu_info"
-            and ('telemetry_source="tpu-info-grpc"' in lbl or 'telemetry_source="tpu-info-cli"' in lbl)
-        )
-    )
-)
+telemetry_source_re = re.compile(r'telemetry_source="([^"]*)"')
+tpu7x_info_samples = 0
+direct_grpc_samples = 0
+tpu_info_cli_samples = 0
+shm_info_samples = 0
+
+for name, lbl, _v in samples:
+    if name != "freetpu_tpu_info":
+        continue
+    if 'generation="tpu7x"' in lbl:
+        tpu7x_info_samples += 1
+    m_src = telemetry_source_re.search(lbl)
+    src_tokens = {tok.strip() for tok in m_src.group(1).split("+") if tok.strip()} if m_src else set()
+    if "libtpu-grpc" in src_tokens or "grpc" in src_tokens:
+        direct_grpc_samples += 1
+    elif "tpu-info" in src_tokens or "tpu-info-cli" in src_tokens:
+        tpu_info_cli_samples += 1
+    if "libopentpu-shm" in src_tokens:
+        shm_info_samples += 1
+
 shm_mxu_samples = sum(1 for name, _lbl, _v in samples if name == "freetpu_tpu_mxu_active_cycles_total")
 shm_dma_samples = sum(1 for name, _lbl, _v in samples if name == "freetpu_tpu_dma_bytes_transferred_total")
-shm_info_samples = sum(
-    1 for name, lbl, _v in samples
-    if name == "freetpu_tpu_info" and 'telemetry_source="libopentpu-shm"' in lbl
-)
 shm_samples = shm_mxu_samples + shm_dma_samples + shm_info_samples
 aer_corr_samples = sum(1 for name, _lbl, _v in samples if name == "freetpu_pcie_aer_correctable_total")
 aer_fatal_samples = sum(1 for name, _lbl, _v in samples if name == "freetpu_pcie_aer_fatal_total")
 aer_samples = aer_corr_samples + aer_fatal_samples
+
+direct_grpc_status = "PASS" if direct_grpc_samples > 0 else "UNVERIFIED"
+tpu_info_cli_status = "FALLBACK" if tpu_info_cli_samples > 0 else "NONE"
+shm_status = "PASS" if (shm_mxu_samples > 0 and shm_dma_samples > 0) else "UNVERIFIED"
+aer_status = "PASS" if (aer_corr_samples > 0 and aer_fatal_samples > 0) else "UNVERIFIED"
 
 if is_mock:
     errors = []
@@ -361,14 +366,19 @@ if is_mock:
         errors.append(f"aer_samples incomplete (correctable={aer_corr_samples} fatal={aer_fatal_samples})")
     if errors:
         raise SystemExit("tpu-exporter mock sample verification failed: " + "; ".join(errors))
+    exporter_status = "PASS"
+else:
+    if (direct_grpc_status == "PASS" or shm_status == "PASS") and aer_status == "PASS":
+        exporter_status = "PASS"
+    else:
+        exporter_status = "PARTIAL_UNVERIFIED"
 
-grpc_status = str(grpc_runtime_samples) if grpc_runtime_samples > 0 else "unavailable"
-shm_status = str(shm_samples) if shm_samples > 0 else "unavailable"
-aer_status = str(aer_samples) if aer_samples > 0 else "unavailable"
 print(
-    f"EXPORTER_SMOKE_STATUS=PASS devices_discovered={devices_discovered} "
-    f"tpu7x_info_samples={tpu7x_info_samples} grpc_runtime_samples={grpc_status} "
-    f"shm_samples={shm_status} aer_samples={aer_status} "
+    f"EXPORTER_SMOKE_STATUS={exporter_status} devices_discovered={devices_discovered} "
+    f"tpu7x_info_samples={tpu7x_info_samples} "
+    f"direct_grpc={direct_grpc_status}({direct_grpc_samples}) "
+    f"tpu_info_cli={tpu_info_cli_status}({tpu_info_cli_samples}) "
+    f"shm={shm_status}({shm_samples}) aer={aer_status}({aer_samples}) "
     f"total_samples={len(samples)} prom_file={prom_path}"
 )
 PYEOF
@@ -678,11 +688,42 @@ try:
             data = buf.decode("utf-8", errors="replace")
             if resp.status != 200:
                 raise RuntimeError(f"HTTP {resp.status}: {data[:200]}")
-            if "data: [DONE]" not in data:
-                raise RuntimeError(f"Missing SSE [DONE] sentinel: {data[:200]}")
+            validate_sse_response(data)
             return (time.monotonic() - t0) * 1000.0
         finally:
             conn.close()
+
+    def validate_sse_response(data: str) -> None:
+        saw_done = False
+        valid_chunks = 0
+        for raw_line in data.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith(":"):
+                continue
+            if line.startswith("event:"):
+                ev_name = line[6:].strip().lower()
+                if ev_name == "error":
+                    raise RuntimeError(f"SSE stream emitted event: error ({data[:200]})")
+                continue
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if not payload:
+                continue
+            if payload == "[DONE]":
+                saw_done = True
+                continue
+            try:
+                obj = json.loads(payload)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"SSE stream emitted invalid JSON payload: {payload[:200]}") from exc
+            if isinstance(obj, dict) and ("error" in obj or obj.get("object") == "error"):
+                raise RuntimeError(f"SSE stream emitted error payload: {payload[:200]}")
+            valid_chunks += 1
+        if not saw_done:
+            raise RuntimeError(f"Missing SSE [DONE] sentinel: {data[:200]}")
+        if valid_chunks < 1:
+            raise RuntimeError(f"SSE stream completed with [DONE] but 0 valid data chunks: {data[:200]}")
 
     def read_active_inflight() -> tuple[int, int]:
         with urllib.request.urlopen(f"http://127.0.0.1:{router_port}/health", timeout=5.0) as resp:
@@ -703,6 +744,7 @@ try:
             raise RuntimeError("freetpu_router_active_inflight metric missing from /metrics")
         return health_inf, prom_sum
 
+    all_tiers_verified_peak = True
     for conc in concurrencies:
         t_level = time.monotonic()
         tier_deadline = t_level + tier_timeout_s
@@ -805,18 +847,25 @@ try:
         latencies_ms.sort()
         p50 = latencies_ms[len(latencies_ms) // 2]
         p95 = latencies_ms[min(len(latencies_ms) - 1, int(len(latencies_ms) * 0.95))]
-        peak_info = (
-            f"peak_inflight={peak_router_inflight} prom_peak={peak_prom_inflight} backend_peak={backend_peak}"
-            if is_mock
-            else f"observed_peak_inflight={peak_router_inflight} prom_peak={peak_prom_inflight}"
-        )
+        if is_mock:
+            tier_status = "PASS"
+            peak_info = f"peak_inflight={peak_router_inflight} prom_peak={peak_prom_inflight} backend_peak={backend_peak}"
+        else:
+            observed_peak = max(peak_router_inflight, peak_prom_inflight)
+            if observed_peak >= conc:
+                tier_status = "PASS"
+            else:
+                tier_status = "COMPLETED_UNVERIFIED_PEAK"
+                all_tiers_verified_peak = False
+            peak_info = f"observed_peak_inflight={peak_router_inflight} prom_peak={peak_prom_inflight}"
         print(
             f"ROUTER_SWEEP c={conc} ok={len(latencies_ms)}/{conc} {peak_info} "
             f"wall_ms={wall_ms:.1f} p50_ms={p50:.1f} p95_ms={p95:.1f} "
-            f"active_inflight={health_inf} prom_inflight={prom_inf} status=PASS"
+            f"active_inflight={health_inf} prom_inflight={prom_inf} status={tier_status}"
         )
 
-    print("ROUTER_SMOKE_STATUS=PASS")
+    router_overall = "PASS" if all_tiers_verified_peak else "COMPLETED_UNVERIFIED_PEAK"
+    print(f"ROUTER_SMOKE_STATUS={router_overall}")
 finally:
     if mock_server is not None:
         mock_server.release_tier.set()
@@ -834,5 +883,11 @@ finally:
         mock_server.server_close()
 PYEOF
 
-log "OPS_AND_ROUTER_SMOKE_STATUS=PASS"
+EXPORTER_FINAL="$(sed -n 's/^EXPORTER_SMOKE_STATUS=\([^[:space:]]*\).*/\1/p' "${LOG}" | tail -n 1)"
+ROUTER_FINAL="$(sed -n 's/^ROUTER_SMOKE_STATUS=\([^[:space:]]*\).*/\1/p' "${LOG}" | tail -n 1)"
+if [[ "${EXPORTER_FINAL}" == "PASS" && "${ROUTER_FINAL}" == "PASS" ]]; then
+  log "OPS_AND_ROUTER_SMOKE_STATUS=PASS"
+else
+  log "OPS_AND_ROUTER_SMOKE_STATUS=PARTIAL_UNVERIFIED (exporter=${EXPORTER_FINAL:-UNKNOWN} router=${ROUTER_FINAL:-UNKNOWN})"
+fi
 echo "Smoke log written to: ${LOG}"

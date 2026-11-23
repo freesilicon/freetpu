@@ -313,8 +313,13 @@ if [[ "${MOCK_MODE}" -eq 1 ]]; then
       exit 1
     fi
     log "[MOCK] Pass 2/2: FreeTile Mosaic Q4_K/Q6_K Host Mock comparison (CLOUDTPU_FREETILE_MOSAIC=1 vs pure StableHLO baseline)"
-    mosaic_mock_out="$(CLOUDTPU_MOCK=1 CLOUDTPU_MOCK_PROFILE=tpu7x-4t CLOUDTPU_MOCK_DEVICES=8 CLOUDTPU_MATMUL_FP8=0 CLOUDTPU_FREETILE_MOSAIC=1 CLOUDTPU_VERBOSE=1 "${HOST_TEST_BIN}" 2>&1)"
+    mosaic_mock_rc=0
+    mosaic_mock_out="$(CLOUDTPU_MOCK=1 CLOUDTPU_MOCK_PROFILE=tpu7x-4t CLOUDTPU_MOCK_DEVICES=8 CLOUDTPU_MATMUL_FP8=0 CLOUDTPU_FREETILE_MOSAIC=1 CLOUDTPU_VERBOSE=1 "${HOST_TEST_BIN}" 2>&1)" || mosaic_mock_rc=$?
     printf '%s\n' "${mosaic_mock_out}" | tee -a "${LOG}"
+    if [[ "${mosaic_mock_rc}" -ne 0 ]]; then
+      log "ERROR: Mock FreeTile Mosaic test_cloudtpu_host failed (exit=${mosaic_mock_rc})"
+      exit "${mosaic_mock_rc}"
+    fi
     if ! printf '%s\n' "${mosaic_mock_out}" | grep -Fq "[PASS] FreeTile Mosaic lowering (Q4_K_I4 S4/U4/F32-scales, Q4_0_I4 U4, Q6_K_SPLIT, fallback & dialect guard)"; then
       log "ERROR: Mock FreeTile Mosaic run did not report expected FreeTile Mosaic Q4_K/Q6_K dispatch proof marker."
       log "MOSAIC_COMPARISON_STATUS=FALLBACK_ONLY (mock: missing FreeTile Mosaic dispatch marker)"
@@ -352,9 +357,14 @@ CLOUDTPU_MOCK=0 CLOUDTPU_SPMD_CHIPS=1 CLOUDTPU_MATMUL_FP8=auto CLOUDTPU_MATMUL_B
 
 if [[ "${RUN_MOSAIC}" -eq 1 ]]; then
   log "--- Live FreeTile Mosaic Q4_K/Q6_K pass (CLOUDTPU_FREETILE_MOSAIC=1 CLOUDTPU_VERBOSE=1 vs pure StableHLO) ---"
+  mosaic_ops_rc=0
   mosaic_ops_out="$(CLOUDTPU_MOCK=0 CLOUDTPU_SPMD_CHIPS=1 CLOUDTPU_MATMUL_FP8=0 CLOUDTPU_MATMUL_BF16=1 CLOUDTPU_FREETILE_MOSAIC=1 CLOUDTPU_VERBOSE=1 \
-    "${BIN_DIR}/test-backend-ops" -b CLOUDTPU -o "MUL_MAT" 2>&1)"
+    "${BIN_DIR}/test-backend-ops" -b CLOUDTPU -o "MUL_MAT" 2>&1)" || mosaic_ops_rc=$?
   printf '%s\n' "${mosaic_ops_out}" | tee -a "${LOG}"
+  if [[ "${mosaic_ops_rc}" -ne 0 ]]; then
+    log "ERROR: Live FreeTile Mosaic test-backend-ops failed (exit=${mosaic_ops_rc})"
+    exit "${mosaic_ops_rc}"
+  fi
   evaluate_live_mosaic_dispatch "test-backend-ops:MUL_MAT" "${mosaic_ops_out}"
 fi
 
@@ -425,10 +435,15 @@ run_bench_tier() {
 
   if [[ "${RUN_MOSAIC}" -eq 1 ]]; then
     log "--- llama-bench ${tier} checkpoint=${ckpt_name} spmd=${SPMD_CHIPS} fp8=0 mosaic=1 (FreeTile Mosaic Q4_K/Q6_K) ---"
+    local mosaic_bench_rc=0
     local mosaic_bench_out=""
     mosaic_bench_out="$(CLOUDTPU_MOCK=0 CLOUDTPU_SPMD_CHIPS="${SPMD_CHIPS}" CLOUDTPU_MATMUL_BF16=1 CLOUDTPU_MATMUL_FP8=0 CLOUDTPU_FREETILE_MOSAIC=1 CLOUDTPU_VERBOSE=1 \
-      "${BIN_DIR}/llama-bench" -m "${model_path}" -ngl 99 -fa 1 -sm none -mg 0 -p 512 -n 64 2>&1)"
+      "${BIN_DIR}/llama-bench" -m "${model_path}" -ngl 99 -fa 1 -sm none -mg 0 -p 512 -n 64 2>&1)" || mosaic_bench_rc=$?
     printf '%s\n' "${mosaic_bench_out}" | tee -a "${LOG}"
+    if [[ "${mosaic_bench_rc}" -ne 0 ]]; then
+      log "ERROR: FreeTile Mosaic llama-bench failed for ${tier} checkpoint=${ckpt_name} (exit=${mosaic_bench_rc})"
+      exit "${mosaic_bench_rc}"
+    fi
     evaluate_live_mosaic_dispatch "llama-bench:${tier}:${ckpt_name}" "${mosaic_bench_out}"
   fi
 
@@ -449,7 +464,7 @@ should_run_671b_tier() {
 # 1t bracket tiers (fit within 192 GiB single-package bracket, also sharded across 8 chiplets on 4t)
 run_bench_tier "8B (1t bracket)" "" "8b" "q4_k_m" "distill"
 run_bench_tier "Qwen3-32B (1t bracket)" "qwen[-_.]?3" "32b" "q4_k_m" "distill"
-run_bench_tier "Llama-3.3-70B (1t bracket)" "llama" "70b" "q4_k_m" "distill"
+run_bench_tier "Llama-3.3-70B (1t bracket)" "llama[-_.]?3[._-]?3" "70b" "q4_k_m" "distill"
 run_bench_tier "gpt-oss-120b (1t bracket)" "gpt[-_.]?oss" "120b" "q4_k_m"
 run_bench_tier "Qwen3-235B (1t bracket)" "qwen[-_.]?3" "235b" "q4_k_m" "distill"
 
