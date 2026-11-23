@@ -641,6 +641,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
     struct TensorHandle {
         TensorStorageKind storage = TensorStorageKind::DENSE;
         TensorShardingKind sharding = TensorShardingKind::REPLICATED;
+        int64_t logical_k = 0;
         SsaValue dense;
         SsaValue q_qs;
         SsaValue q_d;
@@ -655,6 +656,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
         TensorHandle th;
         th.storage = in.storage;
         th.sharding = (P > 1) ? in.sharding : TensorShardingKind::REPLICATED;
+        th.logical_k = in.dims[3];
         const int64_t B3 = in.dims[0];
         const int64_t B2 = in.dims[1];
         int64_t M_or_N = in.dims[2];
@@ -1071,11 +1073,18 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
             }
             case CloudOpKind::ADD:
             case CloudOpKind::MUL: {
-                const TensorShardingKind a_sh = env.at(op.src_ids.at(0)).sharding;
-                const TensorShardingKind b_sh = env.at(op.src_ids.at(1)).sharding;
+                const TensorHandle& a_th = env.at(op.src_ids.at(0));
+                const TensorHandle& b_th = env.at(op.src_ids.at(1));
                 SsaValue a, b;
                 std::vector<int64_t> calc_dims = dst_dims;
-                if (P > 1 && a_sh == TensorShardingKind::SHARD_K && b_sh == TensorShardingKind::SHARD_K) {
+                // Only run the local SHARD_K fast path when both operands have equal logical K
+                // widths matching the output; unequal K widths require periodic repeat-broadcast
+                // over the full logical K axis, so gather via resolve_replicated first.
+                if (P > 1 &&
+                    a_th.sharding == TensorShardingKind::SHARD_K &&
+                    b_th.sharding == TensorShardingKind::SHARD_K &&
+                    a_th.logical_k == b_th.logical_k &&
+                    a_th.logical_k == dst_dims[3]) {
                     a = resolve_dense(op.src_ids.at(0), op.dst.dtype);
                     b = resolve_dense(op.src_ids.at(1), op.dst.dtype);
                     calc_dims[3] /= P;
@@ -1296,6 +1305,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
         TensorHandle out_th;
         out_th.storage = TensorStorageKind::DENSE;
         out_th.sharding = out_sharding;
+        out_th.logical_k = op.dst.dims[3];
         out_th.dense = std::move(result);
         env[op.dst.id] = std::move(out_th);
     }

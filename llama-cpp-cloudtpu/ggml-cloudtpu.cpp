@@ -2500,6 +2500,18 @@ static bool tensor_ranges_overlap(const struct ggml_tensor* a, const struct ggml
     return a0 < b1 && b0 < a1;
 }
 
+static bool tensor_range_covers(const struct ggml_tensor* outer, const struct ggml_tensor* inner) {
+    if (!outer || !inner || !outer->buffer || outer->buffer != inner->buffer ||
+        !is_cloudtpu_buffer(outer->buffer)) {
+        return false;
+    }
+    const uintptr_t o0 = reinterpret_cast<uintptr_t>(outer->data);
+    const uintptr_t o1 = o0 + ggml_nbytes(outer);
+    const uintptr_t i0 = reinterpret_cast<uintptr_t>(inner->data);
+    const uintptr_t i1 = i0 + ggml_nbytes(inner);
+    return o0 <= i0 && o1 >= i1;
+}
+
 static void compute_cgraph_liveness(ggml_backend_cloudtpu_context* ctx, const struct ggml_cgraph* cgraph) {
     const int n = cgraph->n_nodes;
     ctx->liveness.first_consumer.assign(static_cast<size_t>(n), n);
@@ -2558,7 +2570,9 @@ static void compute_cgraph_liveness(ggml_backend_cloudtpu_context* ctx, const st
         const uintptr_t b1 = b0 + ggml_nbytes(nk);
         auto& active = active_by_buf[nk->buffer];
         for (size_t a = 0; a < active.size();) {
-            if (active[a].start < b1 && b0 < active[a].end) {
+            // Only treat a later write as killing an earlier write when it completely covers
+            // the earlier byte range; partial subview overwrites must preserve untouched bytes.
+            if (b0 <= active[a].start && b1 >= active[a].end) {
                 ctx->liveness.first_overwrite[static_cast<size_t>(active[a].node_idx)] = k;
                 active[a] = active.back();
                 active.pop_back();
@@ -3234,6 +3248,29 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
 
     const CachedSubgraphPlan& plan = *plan_ptr;
 
+    // Release owning PJRT buffer references from reusable scratch containers on exit (normal
+    // or exception) so freeing/resetting GGML buffers immediately reclaims HBM while preserving
+    // container capacities across decode steps.
+    struct ScratchBufferGuard {
+        ggml_backend_cloudtpu_context* c;
+        ~ScratchBufferGuard() {
+            for (auto& rb : c->scratch_resolved) {
+                rb.primary.clear();
+                rb.scales.clear();
+                rb.mins.clear();
+            }
+            c->scratch_outputs_1d.clear();
+            for (auto& row : c->scratch_spmd_outputs) {
+                row.clear();
+            }
+            c->scratch_raw_inputs.clear();
+            for (auto& row : c->scratch_spmd_inputs) {
+                row.clear();
+            }
+            c->scratch_spmd_input_ptrs.clear();
+        }
+    } scratch_guard{ctx};
+
     // 5. Resolve each unique leaf input ONCE into flat scratch_resolved[].
     const size_t n_in = ctx->scratch_inputs.size();
     ctx->scratch_resolved.resize(n_in);
@@ -3392,6 +3429,8 @@ static enum ggml_status ggml_backend_cloudtpu_graph_compute(ggml_backend_t backe
                 const bool start_is_attn = (cgraph->nodes[i]->op == GGML_OP_FLASH_ATTN_EXT);
                 if (!start_is_attn) {
                     std::vector<const struct ggml_tensor*> inplace_writes;
+                    std::vector<const struct ggml_tensor*> slice_writes;
+                    slice_writes.push_back(cgraph->nodes[i]);
                     if (cgraph->nodes[i]->op == GGML_OP_SET_ROWS || cgraph->nodes[i]->view_src != nullptr) {
                         inplace_writes.push_back(cgraph->nodes[i]);
                     }
@@ -3409,9 +3448,17 @@ static enum ggml_status ggml_backend_cloudtpu_graph_compute(ggml_backend_t backe
                             break;
                         }
                         // Guard against aliasing a previous in-place write in this slice via a
-                        // different ggml_tensor* (e.g. a fresh view of a KV cache updated by SET_ROWS).
+                        // different ggml_tensor* (e.g. a fresh view of a KV cache updated by SET_ROWS),
+                        // and split before any write that partially overlaps an earlier write in this
+                        // slice so both writes materialize in exact graph order.
                         bool alias_conflict = false;
-                        if (!inplace_writes.empty()) {
+                        for (const struct ggml_tensor* pw : slice_writes) {
+                            if (tensor_ranges_overlap(nj, pw) && !tensor_range_covers(nj, pw)) {
+                                alias_conflict = true;
+                                break;
+                            }
+                        }
+                        if (!alias_conflict && !inplace_writes.empty()) {
                             const int max_src =
                                 (nj->op == GGML_OP_CPY || nj->op == GGML_OP_CONT) ? 1 : GGML_MAX_SRC;
                             for (int s = 0; s < max_src && nj->src[s] != nullptr && !alias_conflict; ++s) {
@@ -3432,6 +3479,7 @@ static enum ggml_status ggml_backend_cloudtpu_graph_compute(ggml_backend_t backe
                         if (alias_conflict) {
                             break;
                         }
+                        slice_writes.push_back(nj);
                         if (nj->op == GGML_OP_SET_ROWS || nj->view_src != nullptr) {
                             inplace_writes.push_back(nj);
                         }

@@ -1198,6 +1198,109 @@ void test_spmd_multichip_mesh(int num_chips) {
     std::printf("  [PASS] Multi-chip SPMD mesh (%d chips: collectives + 1/P HBM + Megatron FFN)\n", num_chips);
 }
 
+void test_spmd_unequal_k_shard_broadcast() {
+    // Regression test: with P=2 and SHARD_K inputs shaped [1024, 32] and [512, 32] in GGML order
+    // (HLO [1, 1, 32, 1024] and [1, 1, 32, 512]), ADD and MUL must gather before repeat-broadcasting
+    // along K so columns 256..511 match b[256..511] rather than repeating b[0..255].
+    constexpr int P = 2;
+    constexpr int64_t N = 32;
+    constexpr int64_t KA = 1024;
+    constexpr int64_t KB = 512;
+    constexpr int64_t KA_LOCAL = KA / P;
+    constexpr int64_t KB_LOCAL = KB / P;
+
+    cloudtpu::RuntimeConfig cfg;
+    cfg.mock_mode = true;
+    cfg.mock_devices = P;
+    cfg.exec_cache_cap = 64;
+    cloudtpu::PjrtRuntime rt;
+    rt.init(cfg);
+
+    std::vector<float> a_full(static_cast<size_t>(N * KA));
+    std::vector<float> b_full(static_cast<size_t>(N * KB));
+    for (int64_t r = 0; r < N; ++r) {
+        for (int64_t k = 0; k < KA; ++k) {
+            a_full[static_cast<size_t>(r * KA + k)] = static_cast<float>(r * 1000 + k) * 0.01f;
+        }
+        for (int64_t k = 0; k < KB; ++k) {
+            // Distinct values across first half (0..255) vs second half (256..511)
+            b_full[static_cast<size_t>(r * KB + k)] = static_cast<float>(k + 1) + static_cast<float>(r) * 0.25f;
+        }
+    }
+
+    std::vector<std::vector<cloudtpu::PjrtBufferPtr>> per_dev(P);
+    for (int p = 0; p < P; ++p) {
+        std::vector<float> a_sh(static_cast<size_t>(N * KA_LOCAL));
+        std::vector<float> b_sh(static_cast<size_t>(N * KB_LOCAL));
+        for (int64_t r = 0; r < N; ++r) {
+            std::memcpy(a_sh.data() + static_cast<size_t>(r * KA_LOCAL),
+                        a_full.data() + static_cast<size_t>(r * KA + p * KA_LOCAL),
+                        static_cast<size_t>(KA_LOCAL) * sizeof(float));
+            std::memcpy(b_sh.data() + static_cast<size_t>(r * KB_LOCAL),
+                        b_full.data() + static_cast<size_t>(r * KB + p * KB_LOCAL),
+                        static_cast<size_t>(KB_LOCAL) * sizeof(float));
+        }
+        per_dev[static_cast<size_t>(p)] = {
+            rt.buffer_from_host(p, a_sh.data(), cloudtpu::PjrtDType::F32, {1, 1, N, KA_LOCAL}),
+            rt.buffer_from_host(p, b_sh.data(), cloudtpu::PjrtDType::F32, {1, 1, N, KB_LOCAL}),
+        };
+    }
+
+    const auto copts = rt.make_spmd_compile_options(P);
+    for (cloudtpu::CloudOpKind kind : {cloudtpu::CloudOpKind::ADD, cloudtpu::CloudOpKind::MUL}) {
+        cloudtpu::GraphProgramSpec spec;
+        spec.spmd_chips = P;
+        spec.inputs.push_back(
+            {1, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, N, KA}, cloudtpu::TensorShardingKind::SHARD_K});
+        spec.inputs.push_back(
+            {2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, N, KB}, cloudtpu::TensorShardingKind::SHARD_K});
+        cloudtpu::OpNodeSpec op;
+        op.kind = kind;
+        op.src_ids = {1, 2};
+        op.dst = {3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, N, KA}};
+        spec.ops.push_back(op);
+        spec.output_ids = {3};
+
+        const auto prog = cloudtpu::emit_stablehlo_program(spec);
+        CHECK_TRUE(prog.mlir_text.find("stablehlo.all_gather") != std::string::npos,
+                   "unequal-width SHARD_K ADD/MUL must all_gather before broadcast");
+        const auto exec = rt.compile_or_get(prog.cache_key, prog.mlir_text, 0, copts);
+        std::vector<std::vector<PJRT_Buffer*>> raw_in(P);
+        std::vector<PJRT_Buffer* const*> in_ptrs(P);
+        for (int p = 0; p < P; ++p) {
+            for (const auto& b : per_dev[static_cast<size_t>(p)]) raw_in[static_cast<size_t>(p)].push_back(b->handle.get());
+            in_ptrs[static_cast<size_t>(p)] = raw_in[static_cast<size_t>(p)].data();
+        }
+        std::vector<std::vector<cloudtpu::PjrtBufferPtr>> outs;
+        rt.execute_spmd(exec, P, in_ptrs.data(), prog.input_bindings.size(), outs,
+                        {cloudtpu::PjrtDType::F32}, {{1, 1, N, KA}}, true);
+
+        for (int p = 0; p < P; ++p) {
+            std::vector<float> got(static_cast<size_t>(N * KA));
+            rt.buffer_to_host(outs[static_cast<size_t>(p)][0]->handle.get(), got.data(), got.size() * sizeof(float));
+            for (int64_t r = 0; r < N; ++r) {
+                for (int64_t k = 0; k < KA; ++k) {
+                    const float av = a_full[static_cast<size_t>(r * KA + k)];
+                    const float bv = b_full[static_cast<size_t>(r * KB + (k % KB))];
+                    const float exp_v = (kind == cloudtpu::CloudOpKind::ADD) ? (av + bv) : (av * bv);
+                    const float diff = std::fabs(got[static_cast<size_t>(r * KA + k)] - exp_v);
+                    if (!std::isfinite(diff) || diff > 1e-3f) {
+                        std::fprintf(stderr, "FAIL [SPMD unequal SHARD_K %s p=%d r=%lld k=%lld]: got=%.4f exp=%.4f\n",
+                                     (kind == cloudtpu::CloudOpKind::ADD) ? "ADD" : "MUL",
+                                     p, static_cast<long long>(r), static_cast<long long>(k),
+                                     got[static_cast<size_t>(r * KA + k)], exp_v);
+                        ++g_failures;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    rt.shutdown();
+    std::printf("  [PASS] SPMD P=2 unequal-width SHARD_K broadcast ([1024, 32] + [512, 32] ADD/MUL)\n");
+}
+
 }  // namespace
 
 int main() {
@@ -1229,6 +1332,7 @@ int main() {
     test_q4_k_split_mul_mat(rt);
     test_silicon_regressions(rt);
     test_collectives_p1_live_compatible(rt);
+    test_spmd_unequal_k_shard_broadcast();
     test_spmd_multichip_mesh(4);  // tpu7x-4t (4x 192 GiB HBM3e)
     test_spmd_multichip_mesh(8);  // v6e-8 (8x 32 GiB HBM)
 
