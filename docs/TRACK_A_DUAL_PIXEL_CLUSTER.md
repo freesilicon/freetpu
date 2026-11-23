@@ -40,32 +40,28 @@ Host mock verification (`OPENBUENOS_MOCK=1`): `test-backend-ops -b EDGETPU -o MU
 
 ### 2.2 Bring Up Direct 5 Gbps USB-C CDC-NCM Link (Zero Wi-Fi Data)
 
-Connect both rooted Pixel 10s directly with a USB-C 3.2 / Thunderbolt 5 cable (if using Wireless Debugging during initial link setup, disable Wi-Fi on Node 2 before starting the unauthenticated RPC server so only the point-to-point USB-C NCM link is active). On the USB `device` side (`mustang`), enable CDC-NCM and assign a point-to-point `/30` subnet with high-priority policy routing (`table 200`):
+Connect both Pixel 10 developer units directly with a USB-C 3.2 / Thunderbolt 5 cable. From a developer shell on the USB `device` side (`mustang`), enable CDC-NCM and assign a point-to-point `/30` subnet with policy routing (`table 200`):
 
 ```bash
-# Node 2 (mustang — USB device side, super-speed):
-su -c '
-  svc usb setFunctions ncm
-  sleep 2
-  ip addr flush dev ncm0 2>/dev/null || true
-  ip link set ncm0 up
-  ip addr add 10.99.0.2/30 dev ncm0
-  ip route replace 10.99.0.0/30 dev ncm0 table 200
-  ip rule del to 10.99.0.0/30 lookup 200 2>/dev/null || true
-  ip rule add pref 100 to 10.99.0.0/30 lookup 200
-'
+# Node 2 (mustang — USB device side, SuperSpeed):
+svc usb setFunctions ncm
+sleep 2
+ip addr flush dev ncm0 2>/dev/null || true
+ip link set ncm0 up
+ip addr add 10.99.0.2/30 dev ncm0
+ip route replace 10.99.0.0/30 dev ncm0 table 200
+ip rule del to 10.99.0.0/30 lookup 200 2>/dev/null || true
+ip rule add pref 100 to 10.99.0.0/30 lookup 200
 
 # Node 1 (rango — USB host side, 5000M SuperSpeed):
-su -c '
-  ip link set usb0 up
-  ip addr add 10.99.0.1/30 dev usb0 2>/dev/null || true
-  ip route replace 10.99.0.0/30 dev usb0 src 10.99.0.1 table 200
-  ip rule del to 10.99.0.0/30 lookup 200 2>/dev/null || true
-  ip rule add pref 100 to 10.99.0.0/30 lookup 200
-  echo on > /sys/bus/usb/devices/2-1/power/control 2>/dev/null || true
-  echo 50 > /sys/class/net/usb0/cdc_ncm/tx_timer_usecs
-  ping -c 10 -i 0.02 10.99.0.2
-'
+ip link set usb0 up
+ip addr add 10.99.0.1/30 dev usb0 2>/dev/null || true
+ip route replace 10.99.0.0/30 dev usb0 src 10.99.0.1 table 200
+ip rule del to 10.99.0.0/30 lookup 200 2>/dev/null || true
+ip rule add pref 100 to 10.99.0.0/30 lookup 200
+echo on > /sys/bus/usb/devices/2-1/power/control 2>/dev/null || true
+echo 50 > /sys/class/net/usb0/cdc_ncm/tx_timer_usecs
+ping -c 10 -i 0.02 10.99.0.2
 ```
 
 Measured direct link: **`1.49 ms` min / `2.35 ms` avg** ping RTT (`0%` loss), **`1.01–3.77 ms`** sync RPC RTT (`GET_DEVICE_MEMORY` / `ALLOC_BUFFER`), and **`469–810 µs`** async `GRAPH_COMPUTE` push.
@@ -74,25 +70,21 @@ Measured direct link: **`1.49 ms` min / `2.35 ms` avg** ping RTT (`0%` loss), **
 
 Bound the per-node `ext[2]` DMA-BUF LRU weight cache (`OPENBUENOS_WEIGHT_CACHE_MB=128`, `OPENBUENOS_POOL_MB=64`) to stay comfortably below Android LMKD limits while holding `~9 GiB` of model weights per phone.
 
-> **Pre-launch isolation**: Before starting the RPC server on Node 2, turn off Wi-Fi (and Wireless Debugging) in Android Settings so only the direct point-to-point USB-C `ncm0` link (`10.99.0.0/30`) is active.
+Before starting `ggml-rpc-server` on Node 2, turn off Wi-Fi (and Wireless Debugging) in Android Settings so only the direct point-to-point USB-C `ncm0` link (`10.99.0.0/30`) is active.
 
 ```bash
-# Node 2 (mustang — bind RPC server to the isolated USB-C NCM address):
-su -c '
-  OPENBUENOS_VERBOSE=1 OPENBUENOS_WEIGHT_CACHE_MB=128 OPENBUENOS_WEIGHT_CACHE_ENTRIES=256 OPENBUENOS_POOL_MB=64 \
-  /data/local/tmp/llama-edgetpu-rpc/ggml-rpc-server -d EDGETPU -H 10.99.0.2 -p 50052 -t 4
-'
+# Node 2 (mustang — bind RPC server to the dedicated USB-C NCM address):
+OPENBUENOS_VERBOSE=1 OPENBUENOS_WEIGHT_CACHE_MB=128 OPENBUENOS_WEIGHT_CACHE_ENTRIES=256 OPENBUENOS_POOL_MB=64 \
+/data/local/tmp/llama-edgetpu-rpc/ggml-rpc-server -d EDGETPU -H 10.99.0.2 -p 50052 -t 4
 
 # Node 1 (rango — split 34/65 layers onto mustang EDGETPU, keep 31/65 layers on rango EDGETPU):
-# Note: `--no-kv-offload` keeps KV-cache `SET_ROWS` writes on the coordinator while offloading
+# `--no-kv-offload` keeps KV-cache `SET_ROWS` writes on the coordinator while offloading
 # model weights and `MUL_MAT` projections to Node 2's EDGETPU RPC server.
-su -c '
-  OPENBUENOS_VERBOSE=1 OPENBUENOS_WEIGHT_CACHE_MB=128 OPENBUENOS_WEIGHT_CACHE_ENTRIES=256 OPENBUENOS_POOL_MB=64 \
-  /data/local/tmp/llama-edgetpu-rpc/llama-completion \
-    -m /data/local/tmp/llama-edgetpu/models/Qwen2.5-32B-Instruct-Q4_0.gguf \
-    --rpc 10.99.0.2:50052 -ngl 34 --no-kv-offload -c 256 -b 64 -ub 64 -t 4 -no-cnv \
-    -p "The capital of France is" -n 8 --temp 0 --no-display-prompt
-'
+OPENBUENOS_VERBOSE=1 OPENBUENOS_WEIGHT_CACHE_MB=128 OPENBUENOS_WEIGHT_CACHE_ENTRIES=256 OPENBUENOS_POOL_MB=64 \
+/data/local/tmp/llama-edgetpu-rpc/llama-completion \
+  -m /data/local/tmp/llama-edgetpu/models/Qwen2.5-32B-Instruct-Q4_0.gguf \
+  --rpc 10.99.0.2:50052 -ngl 34 --no-kv-offload -c 256 -b 64 -ub 64 -t 4 -no-cnv \
+  -p "The capital of France is" -n 8 --temp 0 --no-display-prompt
 ```
 
 ---
@@ -123,7 +115,7 @@ su -c '
 | --- | --- | ---: | ---: | --- | ---: | ---: |
 | `rango` Local `EDGETPU` | Single phone | `0` | local | — | `109.79 ± 0.79` | `5.52 ± 0.82` |
 | `rango` Loopback `RPC → EDGETPU` | `127.0.0.1:50052` | `99` | local TCP | `0.51–1.77 ms` | `45.50 ± 0.21` | `1.24 ± 0.19` |
-| `rango` `EDGETPU` + `mustang` `CPU` (unrooted) | USB 2.0 ADB tunnel | `14` | `30.95 s` | `5.16–10.87 ms` | `63.49 ± 0.28` | `2.26 ± 0.19` |
+| `rango` `EDGETPU` + `mustang` `CPU` (CPU-only peer) | USB 2.0 ADB tunnel | `14` | `30.95 s` | `5.16–10.87 ms` | `63.49 ± 0.28` | `2.26 ± 0.19` |
 | **`rango` `EDGETPU` + `mustang` `EDGETPU` (`2× buenos_a0`)** | **Direct 5 Gbps USB-C NCM (`10.99.0.2`)** | **`14`** | **`8.54 s` (`4.15×` faster)** | **`1.01–3.77 ms`** (`469–810 µs` async push) | **`45.05 ± 0.67`** | **`1.03 ± 0.11`** |
 
 ### 3.3 Live `/proc/<pid>/maps` Zero-Vendor-`.so` Audit (Both Nodes)
