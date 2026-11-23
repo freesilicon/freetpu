@@ -219,7 +219,7 @@ def evaluate_tpu_readiness(
         return False, "tpu_exporter_down"
     if telemetry.total_chips <= 0:
         return False, "tpu_no_devices_discovered"
-    if telemetry.healthy_chips == 0:
+    if telemetry.healthy_chips < telemetry.total_chips:
         return False, "tpu_unhealthy"
     if (
         telemetry.max_hbm_utilization_ratio is not None

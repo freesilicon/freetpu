@@ -7219,11 +7219,16 @@ asyncio.run(main())
         self.assertIn("-e JAX_COMPILATION_CACHE_DIR=", playbook)
         self.assertIn("-e VLLM_XLA_CACHE_PATH=", playbook)
         self.assertIn("-e LIBTPU_INIT_ARGS=", playbook)
-        self.assertIn("offline conversion", playbook.lower())
         self.assertNotIn("W8A8/W8A16", playbook)
         self.assertNotIn("W8A16/W8A8", playbook)
-        self.assertIn(":/models/gpt-oss-120b-int8:ro", playbook)
-        self.assertIn("--model /models/gpt-oss-120b-int8", playbook)
+        self.assertNotIn("gpt-oss-120b", playbook)
+        self.assertIn("ops/tpu-exporter/tpu_exporter.py", playbook)
+        self.assertIn("127.0.0.1:9400/metrics", playbook)
+        self.assertLess(
+            playbook.index("ops/tpu-exporter/tpu_exporter.py"),
+            playbook.index("python3 router/freetpu_router.py"),
+        )
+        self.assertIn("single attention request bucket", playbook.lower())
 
     def test_deadline_socket_waits_support_high_fds_without_select_select(self) -> None:
         def _forbid_select(*args: Any, **kwargs: Any) -> Any:
@@ -8093,6 +8098,88 @@ asyncio.run(main())
             ready_bad, reason_bad = evaluate_tpu_readiness(telem_bad)
             self.assertFalse(ready_bad)
             self.assertEqual(reason_bad, "tpu_exporter_invalid_metrics")
+
+    def test_scalar_and_non_string_backend_models_rejected(self) -> None:
+        for bad_models in ("my-model", 123, ["ok-model", 42], {"a": "b"}):
+            with self.subTest(bad_models=bad_models):
+                with self.assertRaises(ValueError):
+                    BackendConfig.from_dict(
+                        {
+                            "id": "bad-models-b",
+                            "base_url": "http://127.0.0.1:8000/v1",
+                            "models": bad_models,
+                        }
+                    )
+        with self.assertRaises(ValueError):
+            BackendConfig(
+                id="bad-models-direct",
+                base_url="http://127.0.0.1:8000/v1",
+                models="my-model",  # type: ignore[arg-type]
+            )
+
+        bad_cfg = Path(self._tmpdir.name) / "scalar_models.json"
+        bad_cfg.write_text(
+            json.dumps(
+                {
+                    "backends": [
+                        {
+                            "id": "scalar-m",
+                            "base_url": "http://127.0.0.1:8000/v1",
+                            "models": "my-model",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        err_buf = io.StringIO()
+        with redirect_stderr(err_buf):
+            rc = router_main(["--check-config", "--config", str(bad_cfg)])
+        self.assertNotEqual(rc, 0)
+
+    def test_partial_unhealthy_tpu_slice_marks_backend_unready(self) -> None:
+        # 1. 7 of 8 chips healthy, 1 chip unhealthy -> unready ("tpu_unhealthy").
+        partial_lines = [
+            "freetpu_exporter_up 1",
+            "freetpu_tpu_devices_discovered 8",
+        ] + [
+            f'freetpu_tpu_health_status{{chip="{i}"}} {0 if i == 3 else 1}'
+            for i in range(8)
+        ]
+        telem_partial = summarize_tpu_samples(
+            parse_prometheus_text("\n".join(partial_lines))
+        )
+        self.assertEqual(telem_partial.total_chips, 8)
+        self.assertEqual(telem_partial.healthy_chips, 7)
+        ready_p, reason_p = evaluate_tpu_readiness(telem_partial)
+        self.assertFalse(ready_p)
+        self.assertEqual(reason_p, "tpu_unhealthy")
+
+        # 2. 8 discovered chips, only 7 health metrics emitted -> unready ("tpu_unhealthy").
+        missing_lines = [
+            "freetpu_exporter_up 1",
+            "freetpu_tpu_devices_discovered 8",
+        ] + [f'freetpu_tpu_health_status{{chip="{i}"}} 1' for i in range(7)]
+        telem_missing = summarize_tpu_samples(
+            parse_prometheus_text("\n".join(missing_lines))
+        )
+        self.assertEqual(telem_missing.total_chips, 8)
+        self.assertEqual(telem_missing.healthy_chips, 7)
+        ready_m, reason_m = evaluate_tpu_readiness(telem_missing)
+        self.assertFalse(ready_m)
+        self.assertEqual(reason_m, "tpu_unhealthy")
+
+        # 3. All 8 of 8 chips healthy -> ready.
+        healthy_lines = [
+            "freetpu_exporter_up 1",
+            "freetpu_tpu_devices_discovered 8",
+        ] + [f'freetpu_tpu_health_status{{chip="{i}"}} 1' for i in range(8)]
+        telem_ok = summarize_tpu_samples(
+            parse_prometheus_text("\n".join(healthy_lines))
+        )
+        ready_ok, reason_ok = evaluate_tpu_readiness(telem_ok)
+        self.assertTrue(ready_ok)
+        self.assertIsNone(reason_ok)
 
 
 def run_self_tests(verbosity: int = 1) -> int:

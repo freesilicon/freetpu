@@ -1,6 +1,6 @@
 # Cloud TPU `v6e-8` High-Batch (`c=64–128`) & Dynamic W8A8 INT8 Serving Playbook
 
-Ready-to-run `vllm/vllm-tpu:latest` launch presets and FreeTPU Router configuration for scaling `Qwen3-32B`, `Llama-3.3-70B`, and `gpt-oss-120b` on Cloud TPU `v6e-8` (Trillium, `256 GiB` HBM, `12.8–13.1 TB/s` HBM BW, `7,344 TFLOP/s` BF16 / `14,688 TOPS` INT8).
+Ready-to-run `vllm/vllm-tpu:latest` launch presets and FreeTPU Router configuration for scaling dense `Qwen3-32B` and `Llama-3.3-70B` models on Cloud TPU `v6e-8` (Trillium, `256 GiB` HBM, `12.8–13.1 TB/s` HBM BW, `7,344 TFLOP/s` BF16 / `14,688 TOPS` INT8).
 
 ---
 
@@ -10,20 +10,15 @@ Live Phase 1 `v6e-8` serving measurements showed:
 - **Extreme decode bandwidth bound:** The Trillium BF16 roofline ridge point is `7,344 / 12.8 ≈ 574` tokens/step (`560` at `13.1 TB/s`), so `c=1..16` operates at **0.1%–1.2% MFU**.
 - **`c=8 -> c=16` proxy cliff (now fixed):** The initial `ThreadingHTTPServer` router hit a model-independent `+7.2 ms/step` stall from `listen(5)` SYN backlog saturation, Nagle/Delayed-ACK without `TCP_NODELAY`, per-chunk thread/GIL/JSON contention, and upstream HTTP/1.1 keep-alive waits (`active_inflight` ghost counts and `5.6–6.0 s` EWMA `latency_ms`).
 - **Router fix in this branch:** `_SSEReactor` (`selectors.DefaultSelector` event-loop pump), `request_queue_size = 1024`, `TCP_NODELAY` on client/upstream sockets, `"Connection": "close"` upstream headers, single-pass SSE parsing, and `_BackendSlotLease` RAII guarantees keep router overhead `<0.5 ms/chunk` at `c=128` with `active_inflight == 0` after every request.
-- **Next hardware unlock (`c=64..128` + dynamic W8A8 INT8):** Scaling batch concurrency from `c=16` to `c=64..128` with async multi-step scheduling and 256-aligned static buckets projects **4×–7×** aggregate `tok/s`, and switching BF16 weights to native TPU dynamic `W8A8` INT8 halves per-step HBM weight streaming (`65.5 -> ~33 GB` on 32B, `141 -> ~71 GB` on 70B).
+- **Next hardware unlock (`c=64..128` + dynamic W8A8 INT8):** Scaling batch concurrency from `c=16` to `c=64..128` with async multi-step scheduling and 256-aligned token budgets projects **4×–7×** aggregate `tok/s`, and switching BF16 weights to native TPU dynamic `W8A8` INT8 halves per-step HBM weight streaming (`65.5 -> ~33 GB` on 32B, `141 -> ~71 GB` on 70B).
 
 ---
 
-## 2. 2D MXU-Aligned Static Compilation Bucket Matrix
+## 2. TPU Shape Compilation & Persistent XLA Cache
 
-Trillium (`v6e`) uses `256×256` systolic MXUs; reduction/output dimensions align to `256` (and intermediate dimensions to `128`). Configure chunked prefill and static buckets to cover `c=64..128` without triggering mid-benchmark XLA recompilation:
-
-| Execution Phase | `batch_size` Buckets | `num_tokens` Buckets | Notes |
-| --- | --- | --- | --- |
-| **Decode (Low Concurrency)** | `1, 2, 4, 8` | `1` | Interactive / single-stream TTFT & TPOT baseline |
-| **Decode (High Concurrency)** | `16, 32, 64, 128` | `1` | High-throughput batch scaling (`4×–7×` aggregate tok/s) |
-| **Chunked Prefill** | `1, 2, 4` | `256, 512, 1024, 2048` | Caps per-step prefill tokens at `2048` (`256`-aligned) |
-| **Mixed (Extend + Decode)** | `8, 16, 32` | `128, 256` | Multi-turn KV extension overlapping active decodes |
+Trillium (`v6e`) uses `256×256` systolic MXUs; reduction/output dimensions align to `256` (and intermediate dimensions to `128`). With the preset flags (`--max-num-seqs 128`, `--max-num-batched-tokens 2048`, `--enable-chunked-prefill`), upstream `tpu-inference` compiles:
+- **Token-count (`num_tokens`) padding buckets** up to `--max-num-batched-tokens 2048` (`256`-aligned for Trillium MXUs, covering single-token decode steps through chunked prefills).
+- **A single attention request bucket** sized to `--max-num-seqs 128` by default (unless attention request bucketing is explicitly enabled in the container configuration).
 
 ### Persistent XLA Compilation Cache
 
@@ -109,14 +104,12 @@ docker run -d --name vllm-llama70b-highbatch "${CONTAINER_FLAGS[@]}" \
     --async-scheduling
 ```
 
-### Preset C: Native TPU Dynamic `W8A8` INT8 Serving Presets
+### Preset C: Dense Native TPU Dynamic `W8A8` INT8 (`compressed-tensors`)
 
-Trillium `v6e` delivers `1,836 TOPS/chip` (`14,688 TOPS` across 8 chips) on native `int8` MXUs while halving weight HBM reads vs BF16 (`33 GB` on 32B, `71 GB` on 70B). The TPU `compressed-tensors` INT8 linear loader requires **dynamic 8-bit activations (`W8A8`)** — weight-only `W8A16` checkpoints are not supported by that loader.
-
-1. **Dense Dynamic `W8A8` INT8 (`compressed-tensors` checkpoint):**
+Trillium `v6e` delivers `1,836 TOPS/chip` (`14,688 TOPS` across 8 chips) on native `int8` MXUs while halving weight HBM reads vs BF16 (`33 GB` on 32B, `71 GB` on 70B). The TPU `compressed-tensors` INT8 linear loader supports dense models quantized with **dynamic 8-bit activations (`W8A8`)** — weight-only `W8A16` checkpoints and fused-expert MoE INT8 W8A8 checkpoints are not supported by that loader.
 
 ```bash
-# Set MODEL_W8A8 to a Hugging Face compressed-tensors dynamic W8A8 INT8 repo ID
+# Set MODEL_W8A8 to a Hugging Face compressed-tensors dense dynamic W8A8 INT8 repo ID
 # (for a local host directory, add -v /path/to/checkpoint:/models/dense-w8a8:ro
 # and pass --model /models/dense-w8a8).
 docker run -d --name vllm-int8-highbatch "${CONTAINER_FLAGS[@]}" \
@@ -135,48 +128,29 @@ docker run -d --name vllm-int8-highbatch "${CONTAINER_FLAGS[@]}" \
     --async-scheduling
 ```
 
-2. **Preconverted `openai/gpt-oss-120b` Dynamic `W8A8` INT8 (`compressed-tensors`) Preset (`v6e-8`):**
-
-`v6e` lacks native `f4E2M1FN` (`MXFP4`) MXU/Mosaic instructions, and the published `openai/gpt-oss-120b` checkpoint declares `quantization_config.quant_method = "mxfp4"` in `config.json`. Because `--quantization compressed-tensors` requires a checkpoint whose `config.json` already declares `"quant_method": "compressed-tensors"` with dynamic `W8A8` INT8 quantization, vLLM rejects raw `openai/gpt-oss-120b` under that flag. Perform an offline conversion first (dequantizing MXFP4 weights to BF16 and exporting a `compressed-tensors` dynamic `W8A8` INT8 checkpoint to a host directory, e.g. with `llm-compressor`), bind-mount that directory read-only into the container, and pass the container path `/models/gpt-oss-120b-int8` to `--model` (`~117 GB` total = `~14.6 GB/chip`, leaving `~108 GiB` free KV HBM, `~5.1 GB` active weights per token):
-
-```bash
-# Offline prerequisite (run once before serving; raw openai/gpt-oss-120b is mxfp4):
-# Dequantize openai/gpt-oss-120b -> BF16 and export a compressed-tensors dynamic W8A8 INT8
-# checkpoint to "${GPT_OSS_120B_INT8_HOST_DIR}" (with
-# config.json quantization_config.quant_method == "compressed-tensors").
-export GPT_OSS_120B_INT8_HOST_DIR=/srv/models/gpt-oss-120b-w8a8-int8
-
-docker run -d --name vllm-gptoss120b-int8 "${CONTAINER_FLAGS[@]}" \
-  -v "${GPT_OSS_120B_INT8_HOST_DIR}:/models/gpt-oss-120b-int8:ro" \
-  -e MOE_TC_PERMUTE=1 \
-  vllm/vllm-tpu:latest \
-  python3 -m vllm.entrypoints.openai.api_server \
-    --host 127.0.0.1 --port 8000 \
-    --model /models/gpt-oss-120b-int8 \
-    --quantization compressed-tensors \
-    --enable-expert-parallel \
-    --tensor-parallel-size 8 \
-    --dtype bfloat16 \
-    --max-model-len 4096 \
-    --max-num-seqs 128 \
-    --max-num-batched-tokens 2048 \
-    --enable-chunked-prefill \
-    --gpu-memory-utilization 0.90 \
-    --async-scheduling
-```
-
 ---
 
-## 5. FreeTPU Router Launch & Post-Sweep Verification
+## 5. TPU Exporter, FreeTPU Router Launch & Post-Sweep Verification
 
-Start the router with the high-batch config preset:
+`router/examples/cloud-tpu-v6e8-high-batch.json` enables `cloud-tpu-v6e-8-spot` with `tpu_exporter_url: "http://127.0.0.1:9400/metrics"`, so start the FreeTPU TPU exporter and verify it reports healthy chips **before** launching the router:
+
+```bash
+python3 ops/tpu-exporter/tpu_exporter.py \
+  --host 127.0.0.1 \
+  --port 9400 &
+
+# Verify the exporter is up and all 8 chips report healthy (1) before starting the router:
+curl -sf http://127.0.0.1:9400/metrics | grep -E 'freetpu_(exporter_up|tpu_devices_discovered|tpu_health_status)'
+```
+
+Then start the router with the high-batch config preset:
 
 ```bash
 python3 router/freetpu_router.py \
   --config router/examples/cloud-tpu-v6e8-high-batch.json
 ```
 
-Warm up static buckets (`c=1, 8, 16, 32, 64, 128`) before timing, and verify zero leaked in-flight slots immediately after every concurrency sweep:
+Run a short warmup sweep (`c=1..128`) to populate the XLA compilation cache before timing, and verify zero leaked in-flight slots immediately after every concurrency sweep:
 
 ```bash
 curl -s http://127.0.0.1:8080/health | python3 -m json.tool

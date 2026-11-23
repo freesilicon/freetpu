@@ -279,6 +279,12 @@ class BackendConfig:
                 allow_query=True,
             )
         ctx = f"Backend {self.id!r}"
+        if not isinstance(self.models, list) or not all(
+            isinstance(m, str) for m in self.models
+        ):
+            raise ValueError(
+                f"{ctx} field 'models' must be a list of strings, got {self.models!r}"
+            )
         _validate_finite_number(
             self.cost_per_1m_prompt_usd,
             name=f"{ctx} cost_per_1m_prompt_usd",
@@ -387,8 +393,17 @@ class BackendConfig:
             lowered = btype.lower()
             is_local = lowered.startswith(("pixel", "local", "mac", "edge"))
 
-        models_raw = raw.get("models") or []
-        models = [str(m).strip() for m in models_raw if str(m).strip()]
+        if "models" not in raw or raw["models"] is None:
+            models: List[str] = []
+        else:
+            models_raw = raw["models"]
+            if not isinstance(models_raw, list) or not all(
+                isinstance(m, str) for m in models_raw
+            ):
+                raise ValueError(
+                    f"{ctx} field 'models' must be a JSON array of strings, got {models_raw!r}"
+                )
+            models = [m.strip() for m in models_raw if m.strip()]
 
         cost_shared = raw.get("cost_per_1m_tokens_usd")
         prompt_cost = _validate_finite_number(
