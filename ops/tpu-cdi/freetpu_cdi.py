@@ -3464,7 +3464,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         last_msg = ""
         interval = max(1.0, float(args.interval))
+        chip_map_is_file = bool(
+            args.chip_id_map and not str(args.chip_id_map).strip().startswith(("{", "["))
+        )
         while not stop_requested:
+            tick_chip_map = parsed_chip_map
+            if chip_map_is_file:
+                try:
+                    tick_chip_map = _load_chip_id_map(args.chip_id_map)
+                except Exception as exc:  # noqa: BLE001
+                    ok = False
+                    msg = f"failed to reload --chip-id-map {args.chip_id_map!r}: {exc} (skipping tick)"
+                    if msg != last_msg or not ok:
+                        sys.stderr.write(f"freetpu-cdi sync: {msg}\n")
+                        sys.stderr.flush()
+                        last_msg = msg
+                    deadline = time.monotonic() + interval
+                    while not stop_requested and time.monotonic() < deadline:
+                        time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+                    continue
             try:
                 ok, msg = reconcile_cdi_spec(
                     args.output,
@@ -3476,7 +3494,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     iommu_dev_path=args.iommu_dev,
                     cdi_version=args.cdi_version,
                     vfio_mode=args.vfio_mode,
-                    chip_id_map=parsed_chip_map,
+                    chip_id_map=tick_chip_map,
                     omit_visible_env=args.omit_visible_env,
                 )
             except Exception as exc:  # noqa: BLE001

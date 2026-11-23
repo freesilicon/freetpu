@@ -2894,6 +2894,72 @@ class FreeTpuCdiTests(unittest.TestCase):
                     "must unlink stale CDI spec when injected TPU_VISIBLE_CHIPS/DEVICES no longer match --chip-id-map",
                 )
 
+                # Continuous `sync --chip-id-map <file>` MUST reload the file before
+                # each reconciliation tick (skipping transient bad JSON without crashing)
+                # so operator map corrections republish updated masks immediately!
+                live_map_file = swap_root / "live-sync-map.json"
+                live_map_file.write_text(json.dumps(noncontig_map_a), encoding="utf-8")
+                sync_out_path = swap_root / "freetpu-sync-reload.json"
+                sync_sig_handlers: Dict[int, Any] = {}
+                sync_ticks = {"n": 0}
+                fake_clock = {"t": 0.0}
+
+                def _fake_signal(sig_num, handler):
+                    sync_sig_handlers[sig_num] = handler
+                    return None
+
+                def _fake_monotonic():
+                    return fake_clock["t"]
+
+                def _fake_sleep(_dt):
+                    fake_clock["t"] += 2.0
+                    sync_ticks["n"] += 1
+                    if sync_ticks["n"] == 1:
+                        # Tick 1 published map A; corrupt file transiently for Tick 2.
+                        snap_a = json.loads(sync_out_path.read_text(encoding="utf-8"))
+                        numa0_a = {d["name"]: d for d in snap_a["devices"]}["numa0-pcie-0000-00-4"]
+                        env_a = dict(kv.split("=", 1) for kv in numa0_a["containerEdits"]["env"])
+                        self.assertEqual(env_a["TPU_VISIBLE_CHIPS"], "0,1,4,5")
+                        live_map_file.write_text("{broken-json", encoding="utf-8")
+                    elif sync_ticks["n"] == 2:
+                        # Tick 2 skipped bad JSON; now write corrected map B for Tick 3.
+                        live_map_file.write_text(json.dumps(noncontig_map_b), encoding="utf-8")
+                    else:
+                        # Stop cleanly after Tick 3 published map B.
+                        sync_sig_handlers[freetpu_cdi.signal.SIGTERM](
+                            freetpu_cdi.signal.SIGTERM, None
+                        )
+
+                with (
+                    mock.patch.object(freetpu_cdi.signal, "signal", side_effect=_fake_signal),
+                    mock.patch.object(freetpu_cdi.time, "monotonic", side_effect=_fake_monotonic),
+                    mock.patch.object(freetpu_cdi.time, "sleep", side_effect=_fake_sleep),
+                ):
+                    rc_sync_loop, _o_sl, err_sl = _run_cli_inproc(
+                        [
+                            "sync",
+                            "--sysfs-root",
+                            str(swap_sysfs),
+                            "--dev-root",
+                            str(swap_dev),
+                            "--single-host-env",
+                            "--chip-id-map",
+                            str(live_map_file),
+                            "--output",
+                            str(sync_out_path),
+                            "--interval",
+                            "1",
+                        ]
+                    )
+                self.assertEqual(rc_sync_loop, 0, err_sl)
+                self.assertIn("failed to reload --chip-id-map", err_sl)
+                self.assertTrue(sync_out_path.exists())
+                snap_b = json.loads(sync_out_path.read_text(encoding="utf-8"))
+                numa0_b = {d["name"]: d for d in snap_b["devices"]}["numa0-pcie-0000-00-4"]
+                env_b = dict(kv.split("=", 1) for kv in numa0_b["containerEdits"]["env"])
+                self.assertEqual(env_b["TPU_VISIBLE_CHIPS"], "2,3,6,7")
+                self.assertEqual(env_b["TPU_VISIBLE_DEVICES"], "2,3,6,7")
+
                 # If publication-time host verification fails, BOTH `generate --validate`
                 # and `reconcile_cdi_spec` MUST fail closed and remove any stale spec file!
                 with mock.patch.object(

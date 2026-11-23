@@ -2033,12 +2033,56 @@ def _row_has_complete_utilization(row: _TpuInfoRow) -> bool:
     )
 
 
-def _has_complete_utilization(rows: Dict[str, _TpuInfoRow]) -> bool:
-    """Return True when every observed runtime device row has both HBM usage/total and duty-cycle."""
-    util_rows = [r for r in rows.values() if r.in_util_table]
+def _expected_runtime_ids_for_devices(
+    devices: Sequence[TpuTelemetry],
+    shared_vfio: set[str],
+    chip_id_map: Optional[Dict[str, str]],
+) -> set[str]:
+    """Return the set of non-ambiguous expected runtime IDs established by
+    verified sysfs `chip_id` and/or explicit `--chip-id-map`."""
+    resolved_by_bdf: Dict[str, Optional[str]] = {}
+    claimants: Dict[str, List[str]] = {}
+    for dev in devices:
+        is_shared_vfio = bool(dev.vfio_device and dev.vfio_device in shared_vfio)
+        rt_id: Optional[str] = None
+        if chip_id_map:
+            mapped = chip_id_map.get(dev.pci_bdf)
+            if mapped is None and not is_shared_vfio and dev.vfio_device:
+                mapped = chip_id_map.get(dev.vfio_device)
+            if mapped is not None:
+                rt_id = str(mapped).strip() or None
+        if not rt_id:
+            rt_id = dev.runtime_chip_id
+        resolved_by_bdf[dev.pci_bdf] = rt_id
+        if rt_id:
+            claimants.setdefault(rt_id, []).append(dev.pci_bdf)
+    ambiguous = {rt for rt, bdfs in claimants.items() if len(bdfs) > 1}
+    return {
+        rt
+        for rt in resolved_by_bdf.values()
+        if rt is not None and rt not in ambiguous
+    }
+
+
+def _has_complete_utilization(
+    rows: Dict[str, _TpuInfoRow],
+    expected_runtime_ids: Optional[set[str]] = None,
+) -> bool:
+    """Return True when every observed runtime device row (and every expected
+    runtime ID established by PCI inventory / `--chip-id-map`) has both HBM
+    usage/total and duty-cycle."""
+    util_rows = {k: r for k, r in rows.items() if r.in_util_table}
     if not util_rows:
         return False
-    return all(_row_has_complete_utilization(r) for r in util_rows)
+    if not all(_row_has_complete_utilization(r) for r in util_rows.values()):
+        return False
+    if expected_runtime_ids:
+        complete_ids = {
+            k for k, r in util_rows.items() if _row_has_complete_utilization(r)
+        }
+        if not expected_runtime_ids.issubset(complete_ids):
+            return False
+    return True
 
 
 def _sanitize_fallback_duty_rows(
@@ -2304,6 +2348,9 @@ def collect_snapshot(
             proc_root, real_vfio_paths, expected_devnums=expected_vfio_devnums
         )
 
+    expected_runtime_ids = _expected_runtime_ids_for_devices(
+        devices, shared_vfio, chip_id_map
+    )
     runtime_budget_s = max(0.05, float(tpu_info_timeout_s))
     runtime_deadline = time.monotonic() + runtime_budget_s
     explicit_non_default_runtime_addr = bool(
@@ -2328,7 +2375,9 @@ def collect_snapshot(
         )
         if parsed_rows:
             parsed_rows = _tag_row_sources(parsed_rows, "libtpu-grpc")
-        if not tpu_info_ok or not _has_complete_utilization(parsed_rows):
+        if not tpu_info_ok or not _has_complete_utilization(
+            parsed_rows, expected_runtime_ids=expected_runtime_ids
+        ):
             remaining_s = runtime_deadline - time.monotonic()
             if remaining_s >= 0.05:
                 py_ok, py_err, py_rows = _query_tpu_info_python_metrics(
@@ -2356,10 +2405,11 @@ def collect_snapshot(
         # and cannot establish authoritative PCI identity, so we do NOT spawn the
         # CLI solely to guess mappings when direct gRPC already returned complete
         # HBM + duty-cycle readings. If direct gRPC returned only partial
-        # utilization (e.g. HBM succeeded while duty-cycle timed out), run
-        # fallback within the remaining scrape budget and merge only the missing
-        # fields (`prefer_base=True`) so successful gRPC readings are preserved
-        # while per-row source provenance records which chips used fallback.
+        # utilization (e.g. HBM succeeded while duty-cycle timed out, or entire
+        # expected devices were omitted), run fallback within the remaining
+        # scrape budget and merge only the missing fields (`prefer_base=True`) so
+        # successful gRPC readings are preserved while per-row source provenance
+        # records which chips used fallback.
         use_default_grpc_first = tpu_info_bin == "tpu-info"
         tpu_info_ok = False
         tpu_info_err = None
@@ -2381,13 +2431,22 @@ def collect_snapshot(
                 parsed_rows = _tag_row_sources(parsed_rows, "libtpu-grpc")
 
         remaining_s = runtime_deadline - time.monotonic()
-        if (not tpu_info_ok or not _has_complete_utilization(parsed_rows)) and remaining_s >= 0.05:
+        if (
+            not tpu_info_ok
+            or not _has_complete_utilization(
+                parsed_rows, expected_runtime_ids=expected_runtime_ids
+            )
+        ) and remaining_s >= 0.05:
             cli_ok, cli_err, cli_rows = _run_tpu_info(
                 tpu_info_bin=tpu_info_bin,
                 timeout_s=remaining_s,
             )
             if cli_ok:
-                cli_rows = _sanitize_fallback_duty_rows(cli_rows, devices)
+                # Only apply the upstream `tpu-info` V7X positional-zip duty guard
+                # to stock `tpu-info` executables; preserve duty-cycle readings
+                # produced by custom operator wrappers passed via `--tpu-info-bin`.
+                if Path(tpu_info_bin).name in ("tpu-info", "tpu_info"):
+                    cli_rows = _sanitize_fallback_duty_rows(cli_rows, devices)
                 cli_rows = _tag_row_sources(cli_rows, "tpu-info")
                 tpu_info_ok = True
                 tpu_info_err = None
@@ -2401,7 +2460,12 @@ def collect_snapshot(
 
             remaining_s = runtime_deadline - time.monotonic()
             if (
-                (not tpu_info_ok or not _has_complete_utilization(parsed_rows))
+                (
+                    not tpu_info_ok
+                    or not _has_complete_utilization(
+                        parsed_rows, expected_runtime_ids=expected_runtime_ids
+                    )
+                )
                 and runtime_metrics_addr
                 and remaining_s >= 0.05
             ):

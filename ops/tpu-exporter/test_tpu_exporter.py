@@ -3557,6 +3557,117 @@ TPU Runtime Utilization
                 iw_partial2_fb_snap.runtime_unjoined_duty_cycle,
                 {"0": 12.5, "1": 37.5, "2": 62.5, "3": 87.5},
             )
+
+            # Custom telemetry wrapper (`--tpu-info-bin /path/to/custom-wrapper`) is NOT
+            # stock `tpu-info` and MUST retain its partial-core Ironwood duty-cycle rows!
+            custom_iw_wrapper = iw_root / "custom-wrapper.sh"
+            custom_iw_wrapper.write_text(
+                "#!/bin/sh\n"
+                "cat <<'EOF'\n"
+                "TPU Runtime Utilization\n"
+                "| Chip | HBM Usage (GiB)       | Duty cycle |\n"
+                "|------|-----------------------|------------|\n"
+                "| 2    | 30.00 GiB / 96.00 GiB | 12.50%     |\n"
+                "| 3    | 40.00 GiB / 96.00 GiB | 37.50%     |\n"
+                "EOF\n",
+                encoding="utf-8",
+            )
+            custom_iw_wrapper.chmod(0o755)
+            with _mock_vfio_char_lstat():
+                iw_custom_snap = _te.collect_snapshot(
+                    sysfs_root=iw_sysfs,
+                    dev_root=iw_dev,
+                    proc_root=iw_proc,
+                    tpu_info_bin=str(custom_iw_wrapper),
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=iw_root / "no-shm",
+                )
+            self.assertAlmostEqual(iw_custom_snap.devices[2].duty_cycle_percent or 0.0, 12.5)
+            self.assertAlmostEqual(iw_custom_snap.devices[3].duty_cycle_percent or 0.0, 37.5)
+            self.assertEqual(iw_custom_snap.devices[2].hbm_used_bytes, 30 * 1024**3)
+            self.assertEqual(iw_custom_snap.devices[3].hbm_used_bytes, 40 * 1024**3)
+
+            # 4-device v6e host where direct gRPC returns complete HBM + duty rows for
+            # ONLY 2 devices (`0, 1`) and omits devices `2, 3`: `_has_complete_utilization`
+            # MUST see missing expected runtime IDs `{2, 3}` and invoke fallback to fill them!
+            v6e4_root = root / "v6e4_partial_grpc_rows"
+            v6e4_sysfs, v6e4_dev, v6e4_proc = _make_mock_pci_tree(
+                v6e4_root,
+                devices=[
+                    {
+                        "bdf": f"0000:00:{4 + i:02x}.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": str(i),
+                        "chip_id": str(i),
+                    }
+                    for i in range(4)
+                ],
+                create_vfio_nodes=[str(i) for i in range(4)],
+            )
+
+            class _V6eTwoOfFourStub:
+                def __init__(self, channel):
+                    self.channel = channel
+
+                def GetRuntimeMetric(self, req, timeout=None):
+                    del timeout
+                    if req.metric_name == "tpu.runtime.hbm.memory.usage.bytes":
+                        items = [_make_item(c, as_int=(c + 1) * 4 * 1024**3) for c in (0, 1)]
+                    elif req.metric_name == "tpu.runtime.hbm.memory.total.bytes":
+                        items = [_make_item(c, as_int=32 * 1024**3) for c in (0, 1)]
+                    elif req.metric_name == "tpu.runtime.tensorcore.dutycycle.percent":
+                        items = [_make_item(c, as_double=20.0 + c * 10.0) for c in (0, 1)]
+                    else:
+                        items = []
+                    return SimpleNamespace(metric=SimpleNamespace(metrics=items))
+
+            def _v6e4_fallback_cli(*args, **kwargs):
+                rows = _te.parse_tpu_info_output(
+                    "TPU Runtime Utilization\n"
+                    "| Chip | HBM Usage (GiB)       | Duty cycle |\n"
+                    "|------|-----------------------|------------|\n"
+                    "| 0    | 4.00 GiB / 32.00 GiB  | 20.00%     |\n"
+                    "| 1    | 8.00 GiB / 32.00 GiB  | 30.00%     |\n"
+                    "| 2    | 12.00 GiB / 32.00 GiB | 40.00%     |\n"
+                    "| 3    | 16.00 GiB / 32.00 GiB | 50.00%     |\n"
+                )
+                return True, None, rows
+
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.dict(_te._GRPC_CHANNELS, {}, clear=True),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "grpc": _FakeGrpc,
+                        "tpu_info": SimpleNamespace(),
+                        "tpu_info.proto": SimpleNamespace(),
+                        "tpu_info.proto.tpu_metric_service_pb2": fake_pb2,
+                        "tpu_info.proto.tpu_metric_service_pb2_grpc": SimpleNamespace(
+                            RuntimeMetricServiceStub=_V6eTwoOfFourStub
+                        ),
+                    },
+                ),
+                mock.patch.object(_te, "_run_tpu_info", side_effect=_v6e4_fallback_cli),
+            ):
+                v6e4_snap = _te.collect_snapshot(
+                    sysfs_root=v6e4_sysfs,
+                    dev_root=v6e4_dev,
+                    proc_root=v6e4_proc,
+                    tpu_info_bin="tpu-info",
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=v6e4_root / "no-shm",
+                )
+            self.assertEqual(
+                [d.duty_cycle_percent for d in v6e4_snap.devices],
+                [20.0, 30.0, 40.0, 50.0],
+            )
+            self.assertEqual(
+                [d.telemetry_source for d in v6e4_snap.devices],
+                ["libtpu-grpc", "libtpu-grpc", "tpu-info", "tpu-info"],
+            )
             with (
                 _mock_vfio_char_lstat(),
                 mock.patch.dict(_te._GRPC_CHANNELS, {}, clear=True),
