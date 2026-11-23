@@ -1347,24 +1347,25 @@ bool VfioTransport::submit_exec_sync(uint32_t expected_exec_seq, uint32_t timeou
   return true;
 }
 
-bool VfioTransport::ensure_matmul_scratch(std::string* err) {
-  bool alloced_lhs = false;
-  if (scratch_lhs_hbm == 0) {
-    if (!hbm_alloc.alloc(kTile128x128Bf16Bytes, 4096ULL, &scratch_lhs_hbm)) {
-      if (err) *err = "Failed to allocate HBM LHS scratch buffer";
-      return false;
-    }
-    alloced_lhs = true;
+bool VfioTransport::ensure_matmul_scratch_slot(uint64_t* slot, std::string* err) {
+  if (!slot) return false;
+  if (*slot != 0) return true;
+  if (!hbm_alloc.alloc(kTile128x128Bf16Bytes, 4096ULL, slot)) {
+    if (err) *err = "Failed to allocate HBM matmul scratch buffer";
+    return false;
   }
-  if (scratch_rhs_hbm == 0) {
-    if (!hbm_alloc.alloc(kTile128x128Bf16Bytes, 4096ULL, &scratch_rhs_hbm)) {
-      if (alloced_lhs) {
-        hbm_alloc.free(scratch_lhs_hbm);
-        scratch_lhs_hbm = 0;
-      }
-      if (err) *err = "Failed to allocate HBM RHS scratch buffer";
-      return false;
+  return true;
+}
+
+bool VfioTransport::ensure_matmul_scratch(std::string* err) {
+  const bool had_lhs = (scratch_lhs_hbm != 0);
+  if (!ensure_matmul_scratch_slot(&scratch_lhs_hbm, err)) return false;
+  if (!ensure_matmul_scratch_slot(&scratch_rhs_hbm, err)) {
+    if (!had_lhs && scratch_lhs_hbm != 0) {
+      hbm_alloc.free(scratch_lhs_hbm);
+      scratch_lhs_hbm = 0;
     }
+    return false;
   }
   return true;
 }

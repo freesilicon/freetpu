@@ -1351,6 +1351,9 @@ static void test_vfio_imem_lifecycle_mock() {
   OT_CHECK(ctx->transport.imem_booted);
   OT_CHECK(ctx->transport.ensure_imem_booted(1000u, &err));
 
+  OT_CHECK(ctx->transport.ensure_matmul_scratch_slot(&ctx->transport.scratch_lhs_hbm, &err));
+  OT_CHECK(ctx->transport.scratch_lhs_hbm != 0 && ctx->transport.scratch_rhs_hbm == 0);
+  OT_CHECK(ctx->transport.hbm_alloc.used_bytes() == ot::kTile128x128Bf16Bytes);
   OT_CHECK(ctx->transport.ensure_matmul_scratch(&err));
   OT_CHECK(ctx->transport.scratch_lhs_hbm != 0 && ctx->transport.scratch_rhs_hbm != 0);
   OT_CHECK(ctx->transport.hbm_alloc.used_bytes() == 2u * ot::kTile128x128Bf16Bytes);

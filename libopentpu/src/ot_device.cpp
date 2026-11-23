@@ -677,7 +677,7 @@ ot_status_t ot_matmul_bf16(ot_context_t* ctx,
       *out_hbm = src->hbm_addr;
       return OT_OK;
     }
-    if (!ctx->transport.ensure_matmul_scratch(&err)) {
+    if (!ctx->transport.ensure_matmul_scratch_slot(scratch_slot, &err)) {
       ctx->last_error = err.empty() ? "Failed to allocate matmul scratch HBM" : err;
       return OT_ERR_NO_MEMORY;
     }

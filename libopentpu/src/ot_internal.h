@@ -153,6 +153,7 @@ struct VfioTransport {
   bool submit_exec_sync(uint32_t expected_exec_seq, uint32_t timeout_ms,
                         uint32_t cq_out[8], std::string* err);
   bool ensure_imem_booted(uint32_t timeout_ms, std::string* err);
+  bool ensure_matmul_scratch_slot(uint64_t* slot, std::string* err);
   bool ensure_matmul_scratch(std::string* err);
   void teardown_imem_state();
 
