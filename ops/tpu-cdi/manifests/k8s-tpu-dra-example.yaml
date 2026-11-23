@@ -52,12 +52,12 @@ spec:
 ---
 # Example ResourceSlice published by a node-local `freetpu-dra-driver` DaemonSet
 # for a single Cloud TPU v6e-8 host (`0000:00` on NUMA 0, `0000:80` on NUMA 1).
-# Note: `freetpu_cdi.py` emits capacity-pinned, root-bound sub-host slice
-# selectors (`numa<node>-<chips>`, e.g. `numa0-4`, `numa1-4`,
-# `numa<node>-pcie-<root>-<chips>`, or `pcie-<root>-<chips>`) only for
-# supported generation topologies (`{4, 8}` physical chips for `v6e` and `v5e`,
-# `{4}` for 4-chip-per-VM `v5p` and `tpu7x`). If a 4-chip v6e
-# NUMA half drops to 3 or 2 chips, `numa0-4` is withdrawn completely (no
+# Note: `freetpu_cdi.py` emits capacity-pinned, permanently domain-bound sub-host
+# slice selectors (`numa<node>-pcie-<root>-<chips>`, e.g. `numa0-pcie-0000-00-4`,
+# `numa1-pcie-0000-80-4`, or `pcie-<root>-<chips>` when NUMA locality is absent)
+# only for supported generation topologies (`{4, 8}` physical chips for `v6e` and
+# `v5e`, `{4}` for 4-chip-per-VM `v5p` and `tpu7x`). If a 4-chip v6e NUMA half
+# drops to 3 or 2 chips, `numa0-pcie-0000-00-4` is withdrawn completely (no
 # degraded 2-chip v6e slice is emitted) so 4-chip claims fail closed instead
 # of silently shrinking or attaching an unverified torus diagonal. A DRA driver
 # publishing `ResourceSlice` objects must still reconcile against live CDI
@@ -83,7 +83,7 @@ spec:
         pcie_root:
           string: "0000:00"
         cdi_selector:
-          string: "freetpu.dev/tpu=numa0-4"
+          string: "freetpu.dev/tpu=numa0-pcie-0000-00-4"
         chips:
           int: 4
         memoryGiB:
@@ -100,7 +100,7 @@ spec:
         pcie_root:
           string: "0000:80"
         cdi_selector:
-          string: "freetpu.dev/tpu=numa1-4"
+          string: "freetpu.dev/tpu=numa1-pcie-0000-80-4"
         chips:
           int: 4
         memoryGiB:

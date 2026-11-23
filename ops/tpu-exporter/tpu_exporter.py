@@ -1353,35 +1353,28 @@ def _query_grpc_runtime_metrics(
     # Join duty-cycle readings with per-core HBM rows using ALL raw response IDs
     # collected BEFORE filtering unset/NaN/negative gauges:
     # - When `devices_per_chip is None` (e.g. sidecar without `/sys/bus/pci`
-    #   inventory or mixed/unrecognized generations), NEVER assume 1:1 joins:
-    #   physical-chip duty IDs (e.g. `{0..3}` on Ironwood) would otherwise land
-    #   on logical cores `0..3` (attaching chip 1's duty to core 1 of chip 0).
-    #   Treat layout as `ambiguous` and keep HBM rows separate until PCI
-    #   inventory establishes the generation.
-    # - On `devices_per_chip == 1` generations (v5e, v6e), always join 1:1.
-    # - On `devices_per_chip > 1` generations (Ironwood tpu7x, v2/v3, v4/v5p):
-    #   Determine per-chip vs per-core layout without letting partial HBM replies
-    #   discard conclusive per-core duty readings OR misclassify physical-chip IDs:
-    #   - If `all_hbm_core_ids` is present and `expanded(raw_duty_ids) == raw_hbm_ids`
-    #     (exact 1:N bijection, handling full hosts `{0..3} -> {0..7}`, sliced
-    #     partitions `{2,3} -> {4..7}`, and non-zero offsets `{4,5} -> {8..11}`),
-    #     treat as `per_chip` and expand only valid readings.
-    #   - Else if `expected_chip_count` is known and `raw_duty_ids` conclusively
-    #     proves per-core layout — either by pigeonhole count (`len(raw_duty_ids)
-    #     > expected_chip_count`, e.g. 8 distinct duty IDs on a 4-chip host even
-    #     when HBM only returned 6 cores!) or by containing zero-based logical
-    #     core IDs `>= expected_chip_count` within `[0, expected_core_count)` —
-    #     treat as 1:1 `per_core` independently of partial HBM coverage.
-    #   - Otherwise (including when HBM IDs are completely absent and duty IDs
-    #     are `{0..3}` on an 8-function / 4-chip host — which could equally be
-    #     4 logical cores on a sliced runtime OR 4 physical chips — or partial
-    #     HBM `{0..3}` + duty `{0..3}`), treat as `ambiguous` and publish the raw
-    #     readings in the unjoined series rather than expanding across cores.
+    #   inventory or mixed/unrecognized generations), NEVER assume 1:1 joins;
+    #   treat as `ambiguous` and publish raw readings in the separate unjoined series.
+    # - On `devices_per_chip == 1` generations (v5e, v6e, v5p, v4), always join 1:1.
+    # - On `devices_per_chip > 1` generations (Ironwood tpu7x, v2/v3):
+    #   Without an explicit endpoint layout discriminator, a partial per-core
+    #   reply with IDs `{0..3}` is indistinguishable from a 4-chip per-chip reply,
+    #   so NEVER guess `per_chip` or duplicate readings across unreported cores.
+    #   Classify as `per_core` ONLY when:
+    #   - `len(raw_duty_int_ids) > expected_chip_count` (pigeonhole proof: more
+    #     distinct IDs than physical chips exist on the host), OR
+    #   - `all_hbm_core_ids` is non-empty, `raw_duty_int_ids == all_hbm_core_ids`,
+    #     AND `len(raw_duty_int_ids) == expected_core_count` (full per-core match).
+    #   Otherwise (including `{0..3}` alongside HBM `{0..7}`, or `{0..3}` / `{4, 5}`
+    #   without HBM IDs), treat as `ambiguous`: keep duty readings in
+    #   `freetpu_tpu_runtime_unjoined_duty_cycle_percent` and allow fallback to run.
     if devices_per_chip is None:
         duty_layout = "ambiguous"
-    else:
+    elif devices_per_chip == 1:
         duty_layout = "per_core"
-        if devices_per_chip > 1 and duty_by_chip:
+    else:
+        duty_layout = "ambiguous"
+        if duty_by_chip:
             parsed_duty = [_parse_runtime_device_id(k) for k in raw_duty_ids]
             if all(cid is not None for cid in parsed_duty):
                 raw_duty_int_ids = {cid for cid in parsed_duty if cid is not None}
@@ -1401,53 +1394,28 @@ def _query_grpc_runtime_metrics(
                     if expected_core_count is not None
                     else None
                 )
-                has_unambiguous_per_core_ids = expected_chip_count is not None and (
+                if expected_chip_count is not None and (
                     len(raw_duty_int_ids) > expected_chip_count
                     or (
                         bool(all_hbm_core_ids)
-                        and 0 in all_hbm_core_ids
-                        and expected_core_count is not None
-                        and all(0 <= cid < expected_core_count for cid in raw_duty_int_ids)
-                        and all(0 <= hid < expected_core_count for hid in all_hbm_core_ids)
-                        and any(cid >= expected_chip_count for cid in raw_duty_int_ids)
+                        and raw_duty_int_ids == all_hbm_core_ids
+                        and len(raw_duty_int_ids) == expected_core_count
                     )
-                )
-                expanded_raw = {
-                    cid * devices_per_chip + off
-                    for cid in raw_duty_int_ids
-                    for off in range(devices_per_chip)
-                }
-                if (
-                    all_hbm_core_ids
-                    and expanded_raw == all_hbm_core_ids
-                    and len(raw_duty_int_ids) * devices_per_chip == len(all_hbm_core_ids)
                 ):
-                    duty_layout = "per_chip"
-                elif has_unambiguous_per_core_ids:
                     duty_layout = "per_core"
-                else:
-                    duty_layout = "ambiguous"
-            else:
-                duty_layout = "ambiguous"
 
-    if duty_layout != "ambiguous":
+    if duty_layout == "per_core":
         for chip_key, duty_val in duty_by_chip.items():
-            chip_idx = _parse_runtime_device_id(chip_key)
-            if duty_layout == "per_chip" and devices_per_chip is not None and chip_idx is not None:
-                for offset in range(devices_per_chip):
-                    core_key = str(chip_idx * devices_per_chip + offset)
-                    row = rows.setdefault(core_key, _TpuInfoRow(chip_key=core_key))
-                    row.in_util_table = True
-                    row.duty_cycle_percent = duty_val
-            else:
-                row = rows.setdefault(chip_key, _TpuInfoRow(chip_key=chip_key))
-                row.in_util_table = True
-                row.duty_cycle_percent = duty_val
+            row = rows.setdefault(chip_key, _TpuInfoRow(chip_key=chip_key))
+            row.in_util_table = True
+            row.duty_cycle_percent = duty_val
     elif duty_by_chip:
-        # Layout is ambiguous (e.g. sidecar without PCI inventory where physical-chip
-        # vs logical-core IDs cannot be verified): keep `duty_cycle_percent` unset so
-        # we never misjoin chip IDs onto logical core HBM rows, and preserve the raw
-        # readings in `unjoined_duty_cycle_percent` for separate export.
+        # Layout is ambiguous (e.g. sidecar without PCI inventory or dual-core
+        # Ironwood where per-chip vs partial per-core IDs cannot be verified):
+        # keep `duty_cycle_percent` unset so we never duplicate or misjoin chip
+        # IDs onto logical core HBM rows, preserve the raw readings in
+        # `unjoined_duty_cycle_percent` for separate export, and allow fallback
+        # to run within the remaining scrape budget.
         for raw_key, duty_val in duty_by_chip.items():
             row = rows.setdefault(raw_key, _TpuInfoRow(chip_key=raw_key))
             row.in_util_table = True

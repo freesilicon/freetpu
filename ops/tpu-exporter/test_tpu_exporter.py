@@ -2630,12 +2630,71 @@ TPU Runtime Utilization
                     shm_root=iw_root / "no-shm",
                 )
             self.assertEqual(len(iw_snap.devices), 8)
-            expected_duty = [12.5, 12.5, 37.5, 37.5, 62.5, 62.5, 87.5, 87.5]
-            self.assertEqual([d.duty_cycle_percent for d in iw_snap.devices], expected_duty)
+            # Without an explicit endpoint layout flag, 4 duty-cycle IDs `{0..3}`
+            # alongside 8 HBM IDs `{0..7}` could be a partial per-core reply rather
+            # than a 4-chip per-chip reply: MUST NOT duplicate `{0..3}` onto cores
+            # `4..7`, keep them in `runtime_unjoined_duty_cycle`, and allow fallback
+            # to resolve per-core duty cycle when available!
+            self.assertEqual([d.duty_cycle_percent for d in iw_snap.devices], [None] * 8)
+            self.assertEqual(
+                iw_snap.runtime_unjoined_duty_cycle,
+                {"0": 12.5, "1": 37.5, "2": 62.5, "3": 87.5},
+            )
             self.assertEqual(
                 [d.hbm_used_bytes for d in iw_snap.devices],
                 [(c + 1) * 10 * 1024**3 for c in range(8)],
             )
+
+            # Verify fallback IS invoked when Ironwood direct gRPC returns ambiguous
+            # `{0..3}` duty alongside `{0..7}` HBM, preserving direct-gRPC HBM while
+            # filling all 8 cores' duty cycle and clearing the unjoined series!
+            iw_fb_calls: list[float] = []
+
+            def _iw_8core_fallback(*args, **kwargs):
+                iw_fb_calls.append(float(kwargs.get("timeout_s", 0.0)))
+                lines = [
+                    "TPU Runtime Utilization",
+                    "| Chip | HBM Usage (GiB)       | Duty cycle |",
+                    "|------|-----------------------|------------|",
+                ] + [
+                    f"| {c}    | 1.00 GiB / 96.00 GiB | {12.5 + (c // 2) * 25.0:.2f}%     |"
+                    for c in range(8)
+                ]
+                return True, None, _te.parse_tpu_info_output("\n".join(lines) + "\n")
+
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.dict(_te._GRPC_CHANNELS, {}, clear=True),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "grpc": _FakeGrpc,
+                        "tpu_info": SimpleNamespace(),
+                        "tpu_info.proto": SimpleNamespace(),
+                        "tpu_info.proto.tpu_metric_service_pb2": fake_pb2,
+                        "tpu_info.proto.tpu_metric_service_pb2_grpc": iw_pb2_grpc,
+                    },
+                ),
+                mock.patch.object(_te, "_run_tpu_info", side_effect=_iw_8core_fallback),
+            ):
+                iw_resolved_snap = _te.collect_snapshot(
+                    sysfs_root=iw_sysfs,
+                    dev_root=iw_dev,
+                    proc_root=iw_proc,
+                    tpu_info_bin="tpu-info",
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=iw_root / "no-shm",
+                )
+            self.assertEqual(len(iw_fb_calls), 1)
+            self.assertEqual(
+                [d.duty_cycle_percent for d in iw_resolved_snap.devices],
+                [12.5, 12.5, 37.5, 37.5, 62.5, 62.5, 87.5, 87.5],
+            )
+            self.assertEqual(
+                [d.hbm_used_bytes for d in iw_resolved_snap.devices],
+                [(c + 1) * 10 * 1024**3 for c in range(8)],
+            )
+            self.assertEqual(iw_resolved_snap.runtime_unjoined_duty_cycle, {})
 
             # Ironwood per-core duty-cycle response (8 entries 0..7 matching 8 HBM cores)
             # MUST preserve 1:1 per-core readings and NEVER double/fabricate rows 8..15!
@@ -2789,10 +2848,10 @@ TPU Runtime Utilization
                 [(c + 1) * 4 * 1024**3 for c in range(8)],
             )
 
-            # Ironwood sliced partition exposing physical chips 2 & 3: runtime reports
-            # duty-cycle IDs `{2, 3}` and HBM core IDs `{4, 5, 6, 7}`. Exact set expansion
-            # (`{2, 3}` -> `{4, 5, 6, 7} == HBM`) MUST classify as per-chip BEFORE any
-            # chip-count comparison so cores 4..7 receive their duty-cycle readings!
+            # Ironwood sliced partition exposing duty-cycle IDs `{2, 3}` and HBM core
+            # IDs `{4, 5, 6, 7}`: without an explicit layout flag, never guess per-chip
+            # expansion across cores; keep `{2, 3}` in `runtime_unjoined_duty_cycle`
+            # while preserving HBM cores `4..7` cleanly!
             class _IronwoodSlicedChips23Stub:
                 def __init__(self, channel):
                     self.channel = channel
@@ -2833,9 +2892,10 @@ TPU Runtime Utilization
                     runtime_metrics_addr="127.0.0.1:8431",
                     shm_root=iw_root / "no-shm",
                 )
+            self.assertEqual([d.duty_cycle_percent for d in iw_slice_snap.devices], [None] * 8)
             self.assertEqual(
-                [d.duty_cycle_percent for d in iw_slice_snap.devices],
-                [None, None, None, None, 42.5, 42.5, 84.0, 84.0],
+                iw_slice_snap.runtime_unjoined_duty_cycle,
+                {"2": 42.5, "3": 84.0},
             )
             self.assertEqual(
                 sorted(rt.runtime_chip for rt in iw_slice_snap.runtime_utilization),
@@ -3350,7 +3410,7 @@ TPU Runtime Utilization
                         "tpu_info": SimpleNamespace(),
                         "tpu_info.proto": SimpleNamespace(),
                         "tpu_info.proto.tpu_metric_service_pb2": fake_pb2,
-                        "tpu_info.proto.tpu_metric_service_pb2_grpc": iw_pb2_grpc,
+                        "tpu_info.proto.tpu_metric_service_pb2_grpc": iw_percore_pb2_grpc,
                     },
                 ),
             ):
@@ -3380,11 +3440,11 @@ TPU Runtime Utilization
             )
             self.assertEqual(
                 [d.hbm_used_bytes for d in iw_shared_mapped.devices],
-                [(i + 1) * 10 * 1024**3 for i in range(8)],
+                [(i + 1) * 8 * 1024**3 for i in range(8)],
             )
             self.assertEqual(
                 [d.duty_cycle_percent for d in iw_shared_mapped.devices],
-                [12.5, 12.5, 37.5, 37.5, 62.5, 62.5, 87.5, 87.5],
+                [11.0 * (i + 1) for i in range(8)],
             )
 
             # Custom `--tpu-info-bin` specified by bare name (without `/`) MUST invoke

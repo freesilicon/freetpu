@@ -7,8 +7,9 @@ to generate a boot-scoped CNCF Container Device Interface (CDI) specification
 (default: CDI v0.6.0 for broad containerd 2.0/2.1+ compatibility, with opt-in
 `--cdi-version 1.1.0`, output default: /var/run/cdi/freetpu.json) exposing:
   - `freetpu.dev/tpu=pci-<bdf>` (and `group-pci-...` for shared IOMMU groups)
-  - NUMA / PCIe-root-complex-aware capacity-pinned sub-host presets (`numa0-4`,
-    `numa1-4`, `pcie-0000-00-4`, `0-3`, `4-7`) on multi-root hosts (e.g. Cloud
+  - NUMA / PCIe-root-complex-aware capacity-pinned sub-host presets
+    (`numa0-pcie-0000-00-4`, `numa1-pcie-0000-80-4`, `pcie-0000-00-4` when NUMA
+    is unavailable, plus verified range aliases `0-3`, `4-7`) on multi-root hosts (e.g. Cloud
     TPU v6e-8 `0000:00` vs `0000:80`)
   - `freetpu.dev/tpu=all`
 
@@ -1377,20 +1378,6 @@ def _compute_topology_slices(
         return []
 
     used_names = set(reserved_names or ())
-    explicit_numa_ids = [
-        key[1] for key in domains if key[0] == "numa" and key[1] is not None
-    ]
-    use_explicit_numa = (
-        len(explicit_numa_ids) == len(domains)
-        and len(set(explicit_numa_ids)) == len(domains)
-    )
-    # Map every PCIe root to the set of topology domains it spans so we never
-    # publish an ambiguous root-only `pcie-<root>-<chips>` alias when one root
-    # spans multiple NUMA domains (which could shift to another NUMA domain if
-    # the first loses a chip).
-    root_to_domains: Dict[str, set[Tuple[str, Optional[int], str]]] = {}
-    for d_key in domains:
-        root_to_domains.setdefault(d_key[2], set()).add(d_key)
 
     # Map every IOMMU group to the set of domain keys that touch it so we
     # never emit a sub-host slice that splits an IOMMU group across domains
@@ -1427,22 +1414,21 @@ def _compute_topology_slices(
         discovered_numa = d_key[1]
         pcie_root = d_key[2]
         slice_chip_count = len(slice_phys_indices)
-        # Always emit the full NUMA-and-root-qualified selector
-        # (`numa<node>-pcie-<root>-<chips>`) whenever NUMA locality is known so
-        # workloads pinned to it keep working even if a sibling NUMA domain on
-        # the same PCIe root disappears. Also emit `numa<node>-<chips>` when the
-        # NUMA node is unique and root-only `pcie-<root>-<chips>` when the root
-        # spans a single NUMA domain (suppressing ambiguous root-only aliases).
+        # Keep every slice selector permanently bound to its exact hardware
+        # domain regardless of what other roots or NUMA nodes disappear or
+        # return across refreshes:
+        # - When sysfs NUMA locality is known, publish ONLY the domain-qualified
+        #   `numa<node>-pcie-<root>-<chips>` selector (never scan-dependent
+        #   `numa<node>-<chips>` or `pcie-<root>-<chips>` shortcuts that could
+        #   rebind to a different NUMA node or PCIe root after an outage).
+        # - When NUMA locality is absent (`None`), publish `pcie-<root>-<chips>`.
         pcie_root_token = _pci_bdf_token(pcie_root)
-        root_spans_multiple_domains = len(root_to_domains.get(pcie_root, set())) > 1
         candidate_names: List[str] = []
-        if use_explicit_numa and discovered_numa is not None:
-            candidate_names.append(f"numa{discovered_numa}-{slice_chip_count}")
         if discovered_numa is not None:
             candidate_names.append(
                 f"numa{discovered_numa}-pcie-{pcie_root_token}-{slice_chip_count}"
             )
-        if not root_spans_multiple_domains:
+        else:
             candidate_names.append(f"pcie-{pcie_root_token}-{slice_chip_count}")
         verified_vis = _resolve_verified_visibility_ordinals(
             d_chips,
@@ -1473,7 +1459,7 @@ def _compute_topology_slices(
                     numa_node=discovered_numa,
                     pcie_root=pcie_root,
                     pcie_domain=dom_ordinal,
-                    allocation_unit="numa-slice" if use_explicit_numa else "pcie-slice",
+                    allocation_unit="numa-slice" if discovered_numa is not None else "pcie-slice",
                     aliases=tuple(aliases),
                 )
             )
@@ -1670,7 +1656,7 @@ def build_cdi_spec(
             )
 
     # Emit NUMA / PCIe-root-complex-aware capacity-pinned sub-host slice presets
-    # (e.g. `numa0-4`, `numa1-4`, `pcie-0000-00-4`, `0-3`, `4-7` on `v6e-8`)
+    # (e.g. `numa0-pcie-0000-00-4`, `numa1-pcie-0000-80-4`, `0-3`, `4-7` on `v6e-8`)
     # strictly within matching NUMA / PCIe root complex boundaries.
     used_names = {d["name"] for d in devices}
     for topo_slice in _compute_topology_slices(
