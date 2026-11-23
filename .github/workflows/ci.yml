@@ -29,6 +29,11 @@ jobs:
           make -C libopenbuenos verify-header-host host test
           make -C libopenbuenos clean
 
+      - name: Build & test libopentpu (Make)
+        run: |
+          make -C libopentpu verify-header-host host test
+          make -C libopentpu clean
+
       - name: Build bare-metal runtime (Linux UAPI headers)
         run: |
           cmake -S runtime -B build-runtime -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -57,6 +62,14 @@ jobs:
           python3 tools/verify_fusion_lut.py
           python3 tools/verify_chained_fusion.py
           python3 tools/verify_patch_proof.py
+          python3 tools/colab_tpu_bench.py --self-test
+
+      - name: Run Cloud TPU ops exporter & CDI self-tests
+        run: |
+          python3 ops/tpu-exporter/tpu_exporter.py --help >/dev/null
+          python3 ops/tpu-cdi/freetpu_cdi.py --help >/dev/null
+          python3 ops/tpu-exporter/test_tpu_exporter.py -v
+          python3 ops/tpu-cdi/test_freetpu_cdi.py -v
 
       - name: Run FreeTPU Router self-tests
         run: |

@@ -99,11 +99,16 @@ ob_status_t alloc_raw_slab(ob_context* ctx, size_t slab_size, uint32_t map_flags
   }
 
 #if defined(__linux__)
-  int heap_fd = ::open(ctx->dma_heap_path.c_str(), O_RDONLY | O_CLOEXEC);
+  int heap_fd = ctx->dma_heap_fd;
+  bool close_heap_fd = false;
   if (heap_fd < 0) {
-    set_last_error(ctx, "open(" + ctx->dma_heap_path + ") failed errno=" +
-                            std::to_string(errno));
-    return OB_ERR_DEVICE;
+    heap_fd = ::open(ctx->dma_heap_path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (heap_fd < 0) {
+      set_last_error(ctx, "open(" + ctx->dma_heap_path + ") failed errno=" +
+                              std::to_string(errno));
+      return OB_ERR_DEVICE;
+    }
+    close_heap_fd = true;
   }
 
   LocalDmaHeapAllocationData req{};
@@ -113,12 +118,12 @@ ob_status_t alloc_raw_slab(ob_context* ctx, size_t slab_size, uint32_t map_flags
   req.heap_flags = 0;
   if (::ioctl(heap_fd, OB_DMA_HEAP_IOCTL_ALLOC, &req) != 0) {
     int e = errno;
-    ::close(heap_fd);
+    if (close_heap_fd) ::close(heap_fd);
     set_last_error(ctx, "DMA_HEAP_IOCTL_ALLOC(" + std::to_string(slab_size) +
                             ") failed errno=" + std::to_string(e));
     return OB_ERR_IOCTL;
   }
-  ::close(heap_fd);
+  if (close_heap_fd) ::close(heap_fd);
   out->dmabuf_fd = static_cast<int>(req.fd);
 
   void* ptr = ::mmap(nullptr, slab_size, PROT_READ | PROT_WRITE, MAP_SHARED,
@@ -204,6 +209,75 @@ void buffer_pool_clear(ob_context* ctx) {
   ctx->pool_current_count = 0;
 }
 
+ob_status_t buffer_sync_begin_read(ob_buffer* buf) {
+  if (!buf || !buf->ctx) return OB_ERR_INVALID_ARG;
+  if (buf->ctx->mock_mode) return OB_OK;
+#if defined(__linux__)
+  if (sync_dmabuf_fd(buf->slab.dmabuf_fd,
+                     OB_DMA_BUF_SYNC_START | OB_DMA_BUF_SYNC_READ) != 0) {
+    set_last_error(buf->ctx, "DMA_BUF_IOCTL_SYNC(START|READ) failed");
+    return OB_ERR_IOCTL;
+  }
+  return OB_OK;
+#else
+  return OB_ERR_UNSUPPORTED;
+#endif
+}
+
+ob_status_t buffer_sync_end_read(ob_buffer* buf) {
+  if (!buf || !buf->ctx) return OB_ERR_INVALID_ARG;
+  if (buf->ctx->mock_mode) return OB_OK;
+#if defined(__linux__)
+  if (sync_dmabuf_fd(buf->slab.dmabuf_fd,
+                     OB_DMA_BUF_SYNC_END | OB_DMA_BUF_SYNC_READ) != 0) {
+    set_last_error(buf->ctx, "DMA_BUF_IOCTL_SYNC(END|READ) failed");
+    return OB_ERR_IOCTL;
+  }
+  return OB_OK;
+#else
+  return OB_ERR_UNSUPPORTED;
+#endif
+}
+
+ob_status_t buffer_sync_begin_write(ob_buffer* buf) {
+  if (!buf || !buf->ctx) return OB_ERR_INVALID_ARG;
+  if (buf->ctx->mock_mode) return OB_OK;
+#if defined(__linux__)
+  if (sync_dmabuf_fd(buf->slab.dmabuf_fd,
+                     OB_DMA_BUF_SYNC_START | OB_DMA_BUF_SYNC_WRITE) != 0) {
+    set_last_error(buf->ctx, "DMA_BUF_IOCTL_SYNC(START|WRITE) failed");
+    return OB_ERR_IOCTL;
+  }
+  return OB_OK;
+#else
+  return OB_ERR_UNSUPPORTED;
+#endif
+}
+
+ob_status_t buffer_sync_end_write(ob_buffer* buf) {
+  if (!buf || !buf->ctx) return OB_ERR_INVALID_ARG;
+  if (buf->ctx->mock_mode) return OB_OK;
+#if defined(__linux__)
+  if (sync_dmabuf_fd(buf->slab.dmabuf_fd,
+                     OB_DMA_BUF_SYNC_END | OB_DMA_BUF_SYNC_WRITE) != 0) {
+    set_last_error(buf->ctx, "DMA_BUF_IOCTL_SYNC(END|WRITE) failed");
+    return OB_ERR_IOCTL;
+  }
+  return OB_OK;
+#else
+  return OB_ERR_UNSUPPORTED;
+#endif
+}
+
+size_t buffer_slab_size(size_t requested) {
+  return compute_slab_size(requested);
+}
+
+void buffer_retain(ob_buffer* buf) {
+  if (!buf) return;
+  buf->refcnt.fetch_add(1u, std::memory_order_relaxed);
+}
+
 }  // namespace ob
 
 extern "C" {
@@ -228,6 +302,21 @@ ob_status_t ob_buffer_alloc(ob_context_t* ctx,
   if (!(flags & OB_BUF_NO_POOL)) {
     std::lock_guard<std::mutex> lk(ctx->pool_mu);
     auto it = ctx->pool_buckets.find(slab_size);
+    if (it == ctx->pool_buckets.end() || it->second.empty()) {
+      // Best-fit fallback: reuse a slightly larger pooled slab (<= 2x) to avoid DMA-BUF churn.
+      size_t best_sz = 0u;
+      auto best_it = ctx->pool_buckets.end();
+      const size_t max_reuse = slab_size * 2u;
+      for (auto bit = ctx->pool_buckets.begin(); bit != ctx->pool_buckets.end(); ++bit) {
+        if (!bit->second.empty() && bit->first >= slab_size && bit->first <= max_reuse) {
+          if (best_sz == 0u || bit->first < best_sz) {
+            best_sz = bit->first;
+            best_it = bit;
+          }
+        }
+      }
+      it = best_it;
+    }
     if (it != ctx->pool_buckets.end() && !it->second.empty()) {
       auto lru_it = it->second.back();
       it->second.pop_back();
@@ -280,6 +369,9 @@ ob_status_t ob_buffer_alloc(ob_context_t* ctx,
 
 void ob_buffer_free(ob_buffer_t* buf) {
   if (!buf) return;
+  if (buf->refcnt.fetch_sub(1u, std::memory_order_acq_rel) > 1u) {
+    return;
+  }
   ob_context* ctx = buf->ctx;
   ob::PooledSlab slab = buf->slab;
   uint32_t flags = buf->flags;
