@@ -533,7 +533,6 @@ class _TpuInfoRow:
     chip_key: str
     chip_type: str = ""
     pids: List[int] = field(default_factory=list)
-    runtime_device_ids: List[str] = field(default_factory=list)
     hbm_used_bytes: Optional[int] = None
     hbm_total_bytes: Optional[int] = None
     duty_cycle_percent: Optional[float] = None
@@ -733,14 +732,6 @@ def parse_tpu_info_output(output: str) -> Dict[str, _TpuInfoRow]:
                 dev_path = os.path.normpath(dev_path)
             row = rows.setdefault(dev_path, _TpuInfoRow(chip_key=dev_path))
             row.in_chips_table = True
-            if (
-                chip_key
-                and chip_key != dev_path
-                and not chip_key.startswith("/")
-                and chip_key.lower() not in ("n/a", "none")
-                and chip_key not in row.runtime_device_ids
-            ):
-                row.runtime_device_ids.append(chip_key)
             if pid_idx < len(cells):
                 pid_cell = cells[pid_idx]
                 for tok in re.findall(r"\b[0-9]+\b", pid_cell):
@@ -1700,7 +1691,6 @@ def _copy_tpu_info_row(row: _TpuInfoRow) -> _TpuInfoRow:
         chip_key=row.chip_key,
         chip_type=row.chip_type,
         pids=list(row.pids),
-        runtime_device_ids=list(row.runtime_device_ids),
         hbm_used_bytes=row.hbm_used_bytes,
         hbm_total_bytes=row.hbm_total_bytes,
         duty_cycle_percent=row.duty_cycle_percent,
@@ -1737,9 +1727,6 @@ def _merge_runtime_rows(
             for pid in r.pids:
                 if pid not in existing.pids:
                     existing.pids.append(pid)
-            for rt_id in r.runtime_device_ids:
-                if rt_id not in existing.runtime_device_ids:
-                    existing.runtime_device_ids.append(rt_id)
             existing.in_chips_table = existing.in_chips_table or r.in_chips_table
             existing.in_util_table = existing.in_util_table or r.in_util_table
         else:
@@ -1758,14 +1745,14 @@ def _resolve_device_runtime_mapping(
     Dict[str, Optional[str]],
     set[str],
 ]:
-    """Resolve unambiguous runtime chip IDs and utilization row keys for discovered PCI devices.
+    """Resolve authoritative runtime chip IDs and utilization row keys for discovered PCI devices.
 
-    Sources consulted in priority order:
+    Only authoritative sources are accepted for runtime-ordinal-to-PCI mapping:
     1. Verified sysfs `chip_id` (`dev.runtime_chip_id`)
     2. Explicit `--chip-id-map` (`pci_bdf` or non-shared `/dev/vfio/<group>`)
-    3. Verified non-shared `tpu-info` CLI `TPU Process Monitor` VFIO-to-device-ID mapping
-       (only when a single runtime ordinal maps cleanly to `dev.vfio_device`)
 
+    `tpu-info` CLI Process Monitor guesses `/dev/vfio/<runtime_id>` when runtime IDs
+    differ from IOMMU groups, so it is NEVER treated as authoritative PCI identity.
     Any runtime ID or utilization row claimed by >1 physical PCI device is flagged
     ambiguous so it remains keyed strictly by runtime ID (`pci_bdf="unmapped"`).
     """
@@ -1784,14 +1771,6 @@ def _resolve_device_runtime_mapping(
                 mapped = chip_id_map.get(dev.vfio_device)
             if mapped is not None:
                 verified_runtime_id = str(mapped)
-        if not verified_runtime_id and not is_shared_vfio and dev.vfio_device:
-            vfio_row = parsed_rows.get(dev.vfio_device)
-            if (
-                vfio_row is not None
-                and vfio_row.in_chips_table
-                and len(vfio_row.runtime_device_ids) == 1
-            ):
-                verified_runtime_id = vfio_row.runtime_device_ids[0]
         resolved_rt_ids[dev.pci_bdf] = verified_runtime_id
         if verified_runtime_id:
             rt_id_claimants.setdefault(verified_runtime_id, []).append(dev.pci_bdf)
@@ -1820,29 +1799,6 @@ def _resolve_device_runtime_mapping(
 
     ambiguous_util_keys = {k for k, bdfs in util_key_claimants.items() if len(bdfs) > 1}
     return resolved_rt_ids, ambiguous_rt_ids, prospective_util_key, ambiguous_util_keys
-
-
-def _all_live_runtime_rows_mapped(
-    devices: Sequence[TpuTelemetry],
-    parsed_rows: Dict[str, _TpuInfoRow],
-    shared_vfio: set[str],
-    chip_id_map: Optional[Dict[str, str]],
-) -> bool:
-    """Return True when every live utilization row maps unambiguously to a discovered PCI device."""
-    live_util_keys = {k for k, r in parsed_rows.items() if _row_has_live_utilization(r)}
-    if not live_util_keys:
-        return False
-    if not devices:
-        return True
-    _, _, prospective_util_key, ambiguous_util_keys = _resolve_device_runtime_mapping(
-        devices, parsed_rows, shared_vfio, chip_id_map
-    )
-    mapped_keys = {
-        k
-        for k in prospective_util_key.values()
-        if k is not None and k not in ambiguous_util_keys
-    }
-    return live_util_keys <= mapped_keys
 
 
 def collect_snapshot(
@@ -1920,32 +1876,27 @@ def collect_snapshot(
                 )
     else:
         # Prefer direct in-process `RuntimeMetricService` gRPC over spawning
-        # `tpu-info` subprocesses when default `"tpu-info"` is configured AND all
-        # live gRPC rows can be mapped unambiguously to discovered PCI devices.
-        # If a caller supplied an explicit CLI script/path, gRPC stubs/endpoint are
-        # unavailable, or gRPC runtime ordinals cannot be mapped to PCI devices
-        # without the CLI's VFIO process table, fall back to `tpu-info` within the
-        # single shared scrape deadline.
+        # `tpu-info` subprocesses when default `"tpu-info"` is configured; if a
+        # caller supplied an explicit CLI script/path or gRPC stubs/endpoint are
+        # unavailable, fall back cleanly within the single shared scrape deadline.
+        # Note: `tpu-info` CLI Process Monitor guesses `/dev/vfio/<runtime_id>`
+        # and cannot establish authoritative PCI identity, so we do NOT spawn the
+        # CLI solely to guess mappings when direct gRPC already returned live rows.
         custom_cli_path = os.path.sep in tpu_info_bin
         tpu_info_ok = False
         tpu_info_err = None
         parsed_rows = {}
-        grpc_has_live = False
         if not custom_cli_path and runtime_metrics_addr:
             tpu_info_ok, tpu_info_err, parsed_rows = _query_grpc_runtime_metrics(
                 devices,
                 addr=runtime_metrics_addr,
                 timeout_s=runtime_budget_s,
             )
-            grpc_has_live = tpu_info_ok and _has_live_utilization(parsed_rows)
-            if grpc_has_live:
+            if tpu_info_ok and _has_live_utilization(parsed_rows):
                 runtime_source_label = "libtpu-grpc"
 
-        need_cli_for_mapping = grpc_has_live and not _all_live_runtime_rows_mapped(
-            devices, parsed_rows, shared_vfio, chip_id_map
-        )
         remaining_s = runtime_deadline - time.monotonic()
-        if (not tpu_info_ok or not _has_live_utilization(parsed_rows) or need_cli_for_mapping) and remaining_s >= 0.05:
+        if (not tpu_info_ok or not _has_live_utilization(parsed_rows)) and remaining_s >= 0.05:
             cli_ok, cli_err, cli_rows = _run_tpu_info(
                 tpu_info_bin=tpu_info_bin,
                 timeout_s=remaining_s,
@@ -1953,25 +1904,7 @@ def collect_snapshot(
             if cli_ok:
                 tpu_info_ok = True
                 tpu_info_err = None
-                if parsed_rows:
-                    merged_rows = _merge_runtime_rows(
-                        parsed_rows, cli_rows, prefer_base=grpc_has_live
-                    )
-                    # If CLI directly maps PCI devices via VFIO/BDF utilization keys while
-                    # merging would leave superseded unmapped gRPC ordinals behind, prefer CLI.
-                    if (
-                        need_cli_for_mapping
-                        and _all_live_runtime_rows_mapped(devices, cli_rows, shared_vfio, chip_id_map)
-                        and not _all_live_runtime_rows_mapped(
-                            devices, merged_rows, shared_vfio, chip_id_map
-                        )
-                    ):
-                        parsed_rows = cli_rows
-                        runtime_source_label = "tpu-info"
-                    else:
-                        parsed_rows = merged_rows
-                else:
-                    parsed_rows = cli_rows
+                parsed_rows = _merge_runtime_rows(parsed_rows, cli_rows) if parsed_rows else cli_rows
             elif not tpu_info_ok:
                 tpu_info_err = cli_err
 
@@ -2027,6 +1960,7 @@ def collect_snapshot(
             matched_util = util_rows[matched_key]
             mapped_util_keys[matched_key] = dev.pci_bdf
 
+        has_measured_hbm_total = False
         if matched_util is not None:
             if (
                 matched_util.hbm_used_bytes is not None
@@ -2039,6 +1973,7 @@ def collect_snapshot(
                 dev.hbm_used_bytes = matched_util.hbm_used_bytes
             if matched_util.hbm_total_bytes is not None:
                 dev.hbm_total_bytes = matched_util.hbm_total_bytes
+                has_measured_hbm_total = True
             if matched_util.duty_cycle_percent is not None:
                 dev.duty_cycle_percent = matched_util.duty_cycle_percent
             if matched_util.hbm_bw_util_percent is not None:
@@ -2055,10 +1990,12 @@ def collect_snapshot(
             dev.shm_hbm_allocated_bytes = shm.hbm_allocated_bytes
             dev.mxu_active_cycles = shm.mxu_active_cycles
             dev.dma_bytes_transferred = shm.dma_bytes_transferred
+            used_from_shm = False
             if dev.hbm_used_bytes is None:
                 dev.hbm_used_bytes = shm.hbm_used_bytes
+                used_from_shm = True
             if shm.hbm_allocated_bytes > 0 and (
-                dev.hbm_total_bytes is None or dev.telemetry_source == "sysfs-fallback"
+                dev.hbm_total_bytes is None or (used_from_shm and not has_measured_hbm_total)
             ):
                 dev.hbm_total_bytes = shm.hbm_allocated_bytes
             if dev.telemetry_source == "sysfs-fallback":

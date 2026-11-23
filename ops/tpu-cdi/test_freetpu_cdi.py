@@ -2470,16 +2470,16 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertEqual(sn_by_name["pcie1"]["annotations"]["freetpu.dev/pcie-domain"], "1")
 
             # Verify Kubernetes DRA example manifest uses stable resource.k8s.io/v1 API
-            # and documents Topology Manager + Guaranteed QoS CPU/memory prerequisites.
+            # and accurately qualifies Kubernetes 1.34 DRA Topology Manager limitation.
             dra_path = CDI_DIR / "manifests" / "k8s-tpu-dra-example.yaml"
             dra_text = dra_path.read_text(encoding="utf-8")
             self.assertNotIn("resource.k8s.io/v1beta1", dra_text)
             self.assertEqual(dra_text.count("apiVersion: resource.k8s.io/v1"), 3)
             self.assertNotIn("basic:", dra_text)
             self.assertIn("exactly:", dra_text)
-            self.assertIn("single-numa-node", dra_text)
-            self.assertIn("cpuManagerPolicy", dra_text)
-            self.assertIn("memoryManagerPolicy", dra_text)
+            self.assertIn("hint provider", dra_text)
+            self.assertIn("separate placement mechanism", dra_text)
+            self.assertIn("numactl", dra_text)
             self.assertIn("Guaranteed", dra_text)
             self.assertIn('cpu: "4"', dra_text)
             self.assertIn('memory: "32Gi"', dra_text)

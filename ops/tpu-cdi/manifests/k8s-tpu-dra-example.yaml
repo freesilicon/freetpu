@@ -14,15 +14,18 @@
 #   privilege escalation. (Without `--single-host-env`, CDI preserves workload
 #   env for multi-host jobs.)
 # - Partitions v6e-8 TPU endpoints along physical NUMA / PCIe root-complex
-#   boundaries (`0000:00` NUMA 0 chips 0..3 vs `0000:80` NUMA 1 chips 4..7).
-#   DMA LOCALITY PREREQUISITE: Selecting single-NUMA TPU endpoints alone does
-#   NOT pin Pod CPU cores or host DMA buffers to that socket. To guarantee
-#   single-socket host-to-device DMA without crossing CPU UPI/QPI interconnects,
-#   the node kubelet MUST run Topology Manager with `single-numa-node` policy
-#   plus static CPU Manager (`cpuManagerPolicy: static`) and Memory Manager
-#   (`memoryManagerPolicy: Static`), the DRA driver must report matching NUMA
-#   topology hints, and the Pod must run in Guaranteed QoS with equal integer
-#   CPU and memory `requests` and `limits` (as configured in the Pod below).
+#   boundaries (`0000:00` NUMA 0 chips 0..3 vs `0000:80` NUMA 1 chips 4..7)
+#   so the DRA ResourceClaimTemplate selects TPU locality within one NUMA
+#   domain.
+#   CPU/MEMORY NUMA CO-LOCATION NOTE: Kubernetes 1.34's kubelet does NOT
+#   register its DRA manager as a Topology Manager hint provider, so a DRA
+#   claim alone (even with kubelet Topology Manager `single-numa-node`,
+#   static CPU/Memory Manager, and Guaranteed QoS) only selects TPU device
+#   locality—kubelet may still place the Pod's CPUs and memory on another
+#   socket. Co-locating Pod CPU cores and host DMA buffers on the same NUMA
+#   node as the claimed TPU slice requires a separate placement mechanism
+#   (e.g., `numactl`/workload entrypoint affinity, node-level NUMA-aware
+#   scheduling, or an OCI/runtime hook binding cpuset/mems to that NUMA node).
 # - Legacy `/dev/vfio/<group>` (default when usable) and Linux 6.8+ `iommufd`
 #   (`--vfio-mode iommufd` / pure-iommufd fallback) are handled by `freetpu_cdi.py`.
 ---
@@ -84,10 +87,11 @@ spec:
         memory:
           value: 128Gi
 ---
-# Topology-aware 4-chip ResourceClaimTemplate selecting endpoints in a single
-# NUMA domain (pair with kubelet Topology Manager `single-numa-node`, static
-# CPU/Memory Manager, and Guaranteed QoS integer CPU/memory requests/limits on
-# the Pod to keep host DMA buffers on the same socket; eliminates hostNetwork).
+# Topology-aware 4-chip ResourceClaimTemplate selecting TPU endpoints within
+# a single NUMA domain (eliminates hostNetwork; note that Kubernetes 1.34
+# kubelet does not register DRA as a Topology Manager hint provider, so
+# co-locating Pod CPU and memory on NUMA 0 requires a separate placement
+# mechanism).
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaimTemplate
 metadata:
@@ -133,10 +137,11 @@ spec:
           add:
             - IPC_LOCK
       resources:
-        # Guaranteed QoS (equal integer CPU and memory requests/limits) is
-        # required by Kubernetes Topology Manager (`single-numa-node`) with
-        # static CPU/Memory Manager so Pod CPUs and DMA buffers stay on the
-        # same NUMA socket as the claimed TPU slice.
+        # Guaranteed QoS requests/limits prevent CPU/memory overcommit, but
+        # Kubernetes 1.34's kubelet does not register DRA as a Topology Manager
+        # hint provider; use a separate placement mechanism (such as `numactl` /
+        # entrypoint affinity or a NUMA-aware scheduler/runtime hook) to pin
+        # Pod CPU cores and host DMA buffers to the claimed TPU's NUMA node.
         requests:
           cpu: "4"
           memory: "32Gi"
