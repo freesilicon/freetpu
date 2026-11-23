@@ -6667,7 +6667,8 @@ asyncio.run(main())
             for concurrency in (1, 8, 16, 64, 128):
                 direct_ms = asyncio.run(run_batch(up_port, concurrency))
                 router_ms = asyncio.run(run_batch(rport, concurrency))
-                per_chunk_overhead_ms = (router_ms - direct_ms) / float(num_tokens)
+                total_chunks = float(concurrency * num_tokens)
+                per_chunk_overhead_ms = (router_ms - direct_ms) / total_chunks
                 self.assertLess(
                     per_chunk_overhead_ms,
                     0.5,
