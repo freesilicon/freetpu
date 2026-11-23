@@ -53,3 +53,26 @@
  #endif
  #ifdef GGML_USE_CPU
          register_backend(ggml_backend_cpu_reg());
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -215,9 +215,17 @@
+ 
+         if (offload) {
+             auto * dev = model.dev_layer(il);
+-            buft = ggml_backend_dev_buffer_type(dev);
+-
+-            dev_name = ggml_backend_dev_name(dev);
++            const char * cand_name = ggml_backend_dev_name(dev);
++            const bool k_ok = (type_k == GGML_TYPE_F32 || type_k == GGML_TYPE_F16 || type_k == GGML_TYPE_BF16);
++            const bool v_ok = is_mla || (type_v == GGML_TYPE_F32 || type_v == GGML_TYPE_F16 || type_v == GGML_TYPE_BF16);
++            if (cand_name && std::strncmp(cand_name, "CLOUDTPU", 8) == 0 && (!k_ok || !v_ok)) {
++                LLAMA_LOG_WARN("%s: layer %3d: %s does not support KV cache types (%s/%s); placing KV cache on CPU\n",
++                        __func__, il, cand_name, ggml_type_name(type_k), ggml_type_name(type_v));
++            } else {
++                buft = ggml_backend_dev_buffer_type(dev);
++
++                dev_name = cand_name;
++            }
+         }
+ 
+         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);

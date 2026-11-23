@@ -1653,7 +1653,8 @@ static PJRT_Error* mock_loaded_exec_execute(PJRT_LoadedExecutable_Execute_Args* 
             auto* out_mb = new MockBuffer();
             out_mb->client = client;
             out_mb->device_id = le->assigned_device_id;
-            out_mb->tensor = std::move(env.at(prog.return_names[oi]));
+            // Copy rather than move so repeated SSA values in return_names stay valid.
+            out_mb->tensor = env.at(prog.return_names[oi]);
             if (client) {
                 client->allocated_bytes += static_cast<int64_t>(out_mb->tensor.bytes.size());
             }

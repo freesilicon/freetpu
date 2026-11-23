@@ -580,45 +580,62 @@ void test_multichip_device_assignment_and_eviction_lifetime() {
     spec.output_ids = {3};
     const auto prog = cloudtpu::emit_stablehlo_program(spec);
 
-    // Compile for chip 0, then compile same program for chip 1 (evicting chip 0 because cap=1).
-    const auto exec0 = rt.compile_or_get(prog.cache_key, prog.mlir_text, 0);
-    const auto exec1 = rt.compile_or_get(prog.cache_key, prog.mlir_text, 1);
-    CHECK_TRUE(exec0 != exec1, "distinct executables compiled per device");
-    CHECK_TRUE(rt.cache_stats().evictions == 1, "cap=1 evicted exec0 when exec1 inserted");
+    {
+        // Compile for chip 0, then compile same program for chip 1 (evicting chip 0 because cap=1).
+        const auto exec0 = rt.compile_or_get(prog.cache_key, prog.mlir_text, 0);
+        const auto exec1 = rt.compile_or_get(prog.cache_key, prog.mlir_text, 1);
+        CHECK_TRUE(exec0 != exec1, "distinct executables compiled per device");
+        CHECK_TRUE(rt.cache_stats().evictions == 1, "cap=1 evicted exec0 when exec1 inserted");
 
-    // Held shared_ptr keeps evicted exec0 alive through dispatch on chip 0.
-    const std::vector<float> a0 = {1.0f, 2.0f, 3.0f, 4.0f};
-    const std::vector<float> b0 = {10.0f, 20.0f, 30.0f, 40.0f};
-    auto ba0 = rt.buffer_from_host(0, a0.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, 4});
-    auto bb0 = rt.buffer_from_host(0, b0.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, 4});
-    PJRT_Buffer* in0[2] = {ba0->handle.get(), bb0->handle.get()};
-    std::vector<cloudtpu::PjrtBufferPtr> out0;
-    rt.execute(exec0, 0, in0, 2, out0, {cloudtpu::PjrtDType::F32}, {{1, 1, 1, 4}}, true);
-    std::vector<float> h0(4, 0.0f);
-    rt.buffer_to_host(out0[0]->handle.get(), h0.data(), h0.size() * sizeof(float));
-    check_vec_close(h0, {11.0f, 22.0f, 33.0f, 44.0f}, 1e-6f, "evicted exec0 dispatch");
+        // Held shared_ptr keeps evicted exec0 alive through dispatch on chip 0.
+        const std::vector<float> a0 = {1.0f, 2.0f, 3.0f, 4.0f};
+        const std::vector<float> b0 = {10.0f, 20.0f, 30.0f, 40.0f};
+        auto ba0 = rt.buffer_from_host(0, a0.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, 4});
+        auto bb0 = rt.buffer_from_host(0, b0.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, 4});
+        PJRT_Buffer* in0[2] = {ba0->handle.get(), bb0->handle.get()};
+        std::vector<cloudtpu::PjrtBufferPtr> out0;
+        rt.execute(exec0, 0, in0, 2, out0, {cloudtpu::PjrtDType::F32}, {{1, 1, 1, 4}}, true);
+        std::vector<float> h0(4, 0.0f);
+        rt.buffer_to_host(out0[0]->handle.get(), h0.data(), h0.size() * sizeof(float));
+        check_vec_close(h0, {11.0f, 22.0f, 33.0f, 44.0f}, 1e-6f, "evicted exec0 dispatch");
 
-    // Execute exec1 on chip 1.
-    const std::vector<float> a1 = {2.0f, 4.0f, 6.0f, 8.0f};
-    const std::vector<float> b1 = {1.0f, 1.0f, 1.0f, 1.0f};
-    auto ba1 = rt.buffer_from_host(1, a1.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, 4});
-    auto bb1 = rt.buffer_from_host(1, b1.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, 4});
-    PJRT_Buffer* in1[2] = {ba1->handle.get(), bb1->handle.get()};
-    std::vector<cloudtpu::PjrtBufferPtr> out1;
-    rt.execute(exec1, 1, in1, 2, out1, {cloudtpu::PjrtDType::F32}, {{1, 1, 1, 4}}, true);
-    std::vector<float> h1(4, 0.0f);
-    rt.buffer_to_host(out1[0]->handle.get(), h1.data(), h1.size() * sizeof(float));
-    check_vec_close(h1, {3.0f, 5.0f, 7.0f, 9.0f}, 1e-6f, "chip 1 dispatch");
+        // Execute exec1 on chip 1.
+        const std::vector<float> a1 = {2.0f, 4.0f, 6.0f, 8.0f};
+        const std::vector<float> b1 = {1.0f, 1.0f, 1.0f, 1.0f};
+        auto ba1 = rt.buffer_from_host(1, a1.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, 4});
+        auto bb1 = rt.buffer_from_host(1, b1.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, 4});
+        PJRT_Buffer* in1[2] = {ba1->handle.get(), bb1->handle.get()};
+        std::vector<cloudtpu::PjrtBufferPtr> out1;
+        rt.execute(exec1, 1, in1, 2, out1, {cloudtpu::PjrtDType::F32}, {{1, 1, 1, 4}}, true);
+        std::vector<float> h1(4, 0.0f);
+        rt.buffer_to_host(out1[0]->handle.get(), h1.data(), h1.size() * sizeof(float));
+        check_vec_close(h1, {3.0f, 5.0f, 7.0f, 9.0f}, 1e-6f, "chip 1 dispatch");
 
-    // Mismatched device execution must fail cleanly.
-    bool threw = false;
-    try {
-        std::vector<cloudtpu::PjrtBufferPtr> bad_out;
-        rt.execute(exec0, 1, in1, 2, bad_out, {cloudtpu::PjrtDType::F32}, {{1, 1, 1, 4}}, true);
-    } catch (const std::exception&) {
-        threw = true;
+        // Mismatched device execution must fail cleanly.
+        bool threw = false;
+        try {
+            std::vector<cloudtpu::PjrtBufferPtr> bad_out;
+            rt.execute(exec0, 1, in1, 2, bad_out, {cloudtpu::PjrtDType::F32}, {{1, 1, 1, 4}}, true);
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        CHECK_TRUE(threw, "mismatched device execution rejected");
+
+        // Repeated SSA value in return list must remain valid in every output buffer.
+        cloudtpu::GraphProgramSpec dup_spec = spec;
+        dup_spec.output_ids = {3, 3};
+        const auto dup_prog = cloudtpu::emit_stablehlo_program(dup_spec);
+        const auto dup_exec = rt.compile_or_get(dup_prog.cache_key, dup_prog.mlir_text, 0);
+        std::vector<cloudtpu::PjrtBufferPtr> dup_outs;
+        rt.execute(dup_exec, 0, in0, 2, dup_outs,
+                   {cloudtpu::PjrtDType::F32, cloudtpu::PjrtDType::F32},
+                   {{1, 1, 1, 4}, {1, 1, 1, 4}}, true);
+        std::vector<float> d0(4, 0.0f), d1(4, 0.0f);
+        rt.buffer_to_host(dup_outs[0]->handle.get(), d0.data(), d0.size() * sizeof(float));
+        rt.buffer_to_host(dup_outs[1]->handle.get(), d1.data(), d1.size() * sizeof(float));
+        check_vec_close(d0, {11.0f, 22.0f, 33.0f, 44.0f}, 1e-6f, "repeated return output[0]");
+        check_vec_close(d1, {11.0f, 22.0f, 33.0f, 44.0f}, 1e-6f, "repeated return output[1]");
     }
-    CHECK_TRUE(threw, "mismatched device execution rejected");
 
     rt.shutdown();
     std::printf("  [PASS] Multi-chip device assignment & cache eviction lifetime\n");
