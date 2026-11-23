@@ -100,10 +100,11 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
 FREETPU_SHM_MAGIC = 0x46545055
 FREETPU_SHM_VERSION = 1
+DEFAULT_SHM_MAX_AGE_S = 30.0
 _SHM_HEADER_STRUCT = struct.Struct("<IIQ")
-_SHM_PAYLOAD_STRUCT = struct.Struct("<QQQQ")
+_SHM_PAYLOAD_STRUCT = struct.Struct("<QQQQQ")
 _SHM_SEQ_STRUCT = struct.Struct("<Q")
-_SHM_FULL_STRUCT = struct.Struct("<IIQQQQQ")  # 48 bytes; matches freetpu_shm_metrics_v1
+_SHM_FULL_STRUCT = struct.Struct("<IIQQQQQQ")  # 56 bytes; matches freetpu_shm_metrics_v1
 
 DEFAULT_GCP_METADATA_PREEMPTED_URL = (
     "http://metadata.google.internal/computeMetadata/v1/instance/preempted"
@@ -117,6 +118,7 @@ class ShmMetrics:
     mxu_active_cycles: int
     dma_bytes_transferred: int
     seq: int
+    timestamp_ns: int = 0
 
 
 @dataclass
@@ -1171,10 +1173,35 @@ def _query_grpc_runtime_metrics(
             elif metric_name == "tpu.runtime.hbm.utilization.percent":
                 row.hbm_bw_util_percent = float(val)
 
-    # Join per-chip duty cycle onto logical runtime cores using devices_per_chip:
-    # chip `c` covers logical cores `c * devices_per_chip + offset` (core_id // devices_per_chip == c).
+    # Join duty-cycle readings with per-core HBM rows:
+    # - Preserve 1:1 per-core keys when duty_by_chip already reports per-core IDs
+    #   (as on Ironwood's dedicated 1:1 reader in upstream `tpu_info/metrics.py`).
+    # - Expand per-chip IDs (`c -> c * devices_per_chip + offset`) ONLY when
+    #   `devices_per_chip > 1` AND the response reports physical-chip readings
+    #   (fewer numeric IDs than HBM cores whose expanded IDs stay within the
+    #   known core set, or matching discovered physical chips when HBM is absent).
+    should_expand_duty = False
+    if devices_per_chip > 1 and duty_by_chip and all(k.isdigit() for k in duty_by_chip):
+        duty_ids = {int(k) for k in duty_by_chip}
+        hbm_core_ids = {int(k) for k in rows if k.isdigit()}
+        if hbm_core_ids:
+            expanded_ids = {
+                cid * devices_per_chip + off
+                for cid in duty_ids
+                for off in range(devices_per_chip)
+            }
+            if (
+                duty_ids != hbm_core_ids
+                and len(duty_ids) < len(hbm_core_ids)
+                and expanded_ids <= hbm_core_ids
+            ):
+                should_expand_duty = True
+        elif len(devices) > 0 and len(duty_ids) * devices_per_chip == len(devices):
+            if max(duty_ids) < len(duty_ids):
+                should_expand_duty = True
+
     for chip_key, duty_val in duty_by_chip.items():
-        if devices_per_chip > 1 and chip_key.isdigit():
+        if should_expand_duty and chip_key.isdigit():
             chip_idx = int(chip_key)
             for offset in range(devices_per_chip):
                 core_key = str(chip_idx * devices_per_chip + offset)
@@ -1199,16 +1226,21 @@ def read_shm_seqlock_metrics(
     *,
     max_retries: int = 64,
     trusted_uids: Optional[Sequence[int]] = None,
+    max_age_s: float = DEFAULT_SHM_MAX_AGE_S,
+    now_ns: Optional[int] = None,
 ) -> Optional[ShmMetrics]:
     """Read bare-metal `libopentpu.so` telemetry from `<shm_root>/freetpu_metrics_<bdf>` via SeqLock `pread`.
 
-    Authenticates the publisher on the opened file descriptor before reading:
+    Authenticates the publisher and sample freshness on the opened file descriptor:
     - rejects world-writable directories that lack the sticky bit (`S_ISVTX`);
     - opens with `O_NOFOLLOW | O_NONBLOCK` to avoid symlink/FIFO TOCTOU races;
     - requires a regular file owned by an allowed UID (default: current `euid`)
       with neither group-write (`0o020`) nor world-write (`0o002`) permissions;
     - reads via `os.pread` (never `mmap`) so concurrent truncation cannot raise
-      `SIGBUS` and instead fails closed with `None`.
+      `SIGBUS` and instead fails closed with `None`;
+    - requires a fresh publisher heartbeat `timestamp_ns` within `max_age_s`
+      (default 30s) so exited/crashed publishers expire cleanly instead of
+      pinning stale HBM/OOM readings indefinitely.
     """
     if shm_root is None or not pci_bdf:
         return None
@@ -1252,6 +1284,10 @@ def read_shm_seqlock_metrics(
         if fd_st.st_size < _SHM_FULL_STRUCT.size:
             return None
 
+        effective_now_ns = time.time_ns() if now_ns is None else int(now_ns)
+        max_age_ns = int(max(0.0, float(max_age_s)) * 1_000_000_000)
+        max_future_skew_ns = max(5_000_000_000, max_age_ns)
+
         for _ in range(max(1, max_retries)):
             hdr = os.pread(fd, _SHM_HEADER_STRUCT.size, 0)
             if len(hdr) < _SHM_HEADER_STRUCT.size:
@@ -1270,15 +1306,22 @@ def read_shm_seqlock_metrics(
                 return None
             (seq2,) = _SHM_SEQ_STRUCT.unpack_from(seq2_raw, 0)
             if seq1 == seq2:
-                hbm_alloc, hbm_used, mxu_cycles, dma_bytes = _SHM_PAYLOAD_STRUCT.unpack_from(
+                hbm_alloc, hbm_used, mxu_cycles, dma_bytes, ts_ns = _SHM_PAYLOAD_STRUCT.unpack_from(
                     payload, 0
                 )
+                if ts_ns <= 0:
+                    return None
+                if effective_now_ns - ts_ns > max_age_ns:
+                    return None
+                if ts_ns - effective_now_ns > max_future_skew_ns:
+                    return None
                 return ShmMetrics(
                     hbm_allocated_bytes=hbm_alloc,
                     hbm_used_bytes=hbm_used,
                     mxu_active_cycles=mxu_cycles,
                     dma_bytes_transferred=dma_bytes,
                     seq=seq1,
+                    timestamp_ns=ts_ns,
                 )
         return None
     except (OSError, ValueError, struct.error):
@@ -1672,6 +1715,7 @@ def collect_snapshot(
     runtime_metrics_addr: Optional[str] = DEFAULT_RUNTIME_METRICS_ADDR,
     shm_root: Optional[Path] = Path("/dev/shm"),
     shm_trusted_uids: Optional[Sequence[int]] = None,
+    shm_max_age_s: float = DEFAULT_SHM_MAX_AGE_S,
     gcp_metadata_preemption: bool = False,
     gcp_metadata_url: str = DEFAULT_GCP_METADATA_PREEMPTED_URL,
     gcp_metadata_timeout_s: float = 0.5,
@@ -1876,6 +1920,7 @@ def collect_snapshot(
             dev.pci_bdf,
             shm_root=shm_root,
             trusted_uids=shm_trusted_uids,
+            max_age_s=shm_max_age_s,
         )
         if shm is not None:
             dev.shm_hbm_allocated_bytes = shm.hbm_allocated_bytes
@@ -2317,6 +2362,7 @@ class _ExporterServer(ThreadingHTTPServer):
         runtime_metrics_addr: Optional[str] = "127.0.0.1:8431",
         shm_root: Optional[Path] = Path("/dev/shm"),
         shm_trusted_uids: Optional[Sequence[int]] = None,
+        shm_max_age_s: float = DEFAULT_SHM_MAX_AGE_S,
         gcp_metadata_preemption: bool = False,
         gcp_metadata_url: str = DEFAULT_GCP_METADATA_PREEMPTED_URL,
         gcp_metadata_timeout_s: float = 0.5,
@@ -2333,6 +2379,7 @@ class _ExporterServer(ThreadingHTTPServer):
         self.runtime_metrics_addr = runtime_metrics_addr
         self.shm_root = shm_root
         self.shm_trusted_uids = tuple(shm_trusted_uids) if shm_trusted_uids is not None else None
+        self.shm_max_age_s = shm_max_age_s
         self.gcp_metadata_preemption = gcp_metadata_preemption
         self.gcp_metadata_url = gcp_metadata_url
         self.gcp_metadata_timeout_s = gcp_metadata_timeout_s
@@ -2389,6 +2436,7 @@ class _ExporterServer(ThreadingHTTPServer):
                 runtime_metrics_addr=self.runtime_metrics_addr,
                 shm_root=self.shm_root,
                 shm_trusted_uids=self.shm_trusted_uids,
+                shm_max_age_s=self.shm_max_age_s,
                 gcp_metadata_preemption=self.gcp_metadata_preemption,
                 gcp_metadata_url=self.gcp_metadata_url,
                 gcp_metadata_timeout_s=self.gcp_metadata_timeout_s,
@@ -2636,6 +2684,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--shm-max-age-s",
+        type=float,
+        default=DEFAULT_SHM_MAX_AGE_S,
+        help=(
+            f"Maximum age in seconds for SeqLock SHM publisher heartbeat timestamp_ns "
+            f"(default: {DEFAULT_SHM_MAX_AGE_S}; expired samples are omitted)."
+        ),
+    )
+    parser.add_argument(
         "--gcp-metadata-preemption",
         action="store_true",
         default=False,
@@ -2691,6 +2748,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 runtime_metrics_addr=runtime_metrics_addr,
                 shm_root=args.shm_root,
                 shm_trusted_uids=args.shm_trusted_uids,
+                shm_max_age_s=args.shm_max_age_s,
                 gcp_metadata_preemption=args.gcp_metadata_preemption,
                 gcp_metadata_url=args.gcp_metadata_url,
                 gcp_metadata_timeout_s=args.gcp_metadata_timeout,
@@ -2717,6 +2775,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         runtime_metrics_addr=runtime_metrics_addr,
         shm_root=args.shm_root,
         shm_trusted_uids=args.shm_trusted_uids,
+        shm_max_age_s=args.shm_max_age_s,
         gcp_metadata_preemption=args.gcp_metadata_preemption,
         gcp_metadata_url=args.gcp_metadata_url,
         gcp_metadata_timeout_s=args.gcp_metadata_timeout,

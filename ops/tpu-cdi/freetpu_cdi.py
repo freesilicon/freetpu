@@ -49,8 +49,9 @@ import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # Default to CDI v0.6.0 — the minimum spec version needed for all generated
-# fields (annotations, deviceNodes.hostPath, env) and universally accepted by
-# supported containerd releases (2.0.x, 2.1.x, 2.2.x+). Operators may opt into
+# fields (annotations, deviceNodes.hostPath, env) and compatible with supported
+# containerd releases (unaffected 2.0.x, patched 2.1.x >= 2.1.9, 2.2.x >= 2.2.5,
+# 2.3.x >= 2.3.2, >= 2.4.0; see GHSA-33vj-92qq-66hc). Operators may opt into
 # newer CDI versions (e.g. "1.1.0") via --cdi-version.
 DEFAULT_CDI_VERSION = "0.6.0"
 CDI_VERSION = DEFAULT_CDI_VERSION
@@ -726,8 +727,34 @@ def _chips_per_host_bounds(chip_count: int, generations: Sequence[str]) -> str:
     return f"1,{chip_count},1"
 
 
+def _logical_device_indices(
+    subset: Sequence[DiscoveredChip],
+    physical_chip_indices: Sequence[int],
+) -> List[int]:
+    """Return logical runtime device ordinals corresponding to `subset` / `physical_chip_indices`.
+
+    On 1-device-per-chip generations (`v5e`, `v5p`, `v6e`), logical device IDs
+    equal physical chip ordinals. On 2-device-per-chip generations (`tpu7x`
+    Ironwood, `v2-v3`), physical chip `c` exposes logical devices `2*c` and
+    `2*c + 1` (e.g. physical chips `2,3` -> logical devices `4,5,6,7`).
+    """
+    per_chip_set = {
+        _PCI_FUNCTIONS_PER_PHYSICAL_CHIP.get(c.generation, 1) for c in subset
+    }
+    if len(per_chip_set) == 1:
+        per_chip = next(iter(per_chip_set))
+        if per_chip > 1:
+            return [
+                phys_idx * per_chip + offset
+                for phys_idx in physical_chip_indices
+                for offset in range(per_chip)
+            ]
+    return [c.index for c in subset]
+
+
 def _build_device_env(
     physical_chip_indices: Sequence[int],
+    logical_device_indices: Sequence[int],
     generations: Sequence[str],
     *,
     single_host_env: bool = False,
@@ -739,23 +766,25 @@ def _build_device_env(
     overwrites workload-configured multi-host peer discovery, visibility, or
     host bounds. When `single_host_env=True` is explicitly opted in:
     - All selectors receive isolated loopback Megascale / single-host overrides.
-    - Full-allocation / slice selectors (`numa*`, `0-3`/`4-7`, `all`) also
-      receive `TPU_VISIBLE_DEVICES` and physical-chip-derived
-      `TPU_CHIPS_PER_HOST_BOUNDS`.
+    - Full-allocation / slice selectors (`numa*`, `pcie*`, `0-3`/`4-7`, `all`)
+      also receive physical chip mask `TPU_VISIBLE_CHIPS`, logical device mask
+      `TPU_VISIBLE_DEVICES`, and physical-chip-derived `TPU_CHIPS_PER_HOST_BOUNDS`.
     - Independently composable unit selectors (`pci-*`, `group-pci-*`) omit
-      `TPU_VISIBLE_DEVICES` and `TPU_CHIPS_PER_HOST_BOUNDS` so combining
-      multiple selectors never overwrites visibility in OCI env merging.
+      `TPU_VISIBLE_CHIPS`, `TPU_VISIBLE_DEVICES`, and `TPU_CHIPS_PER_HOST_BOUNDS`
+      so combining multiple selectors never overwrites visibility in OCI env merging.
     """
     if not single_host_env:
         return []
 
     env: List[str] = []
     if include_visibility_env:
-        visible = ",".join(str(idx) for idx in physical_chip_indices)
+        visible_chips = ",".join(str(idx) for idx in physical_chip_indices)
+        visible_devices = ",".join(str(idx) for idx in logical_device_indices)
         bounds = _chips_per_host_bounds(len(physical_chip_indices), generations)
         env.extend(
             [
-                f"TPU_VISIBLE_DEVICES={visible}",
+                f"TPU_VISIBLE_CHIPS={visible_chips}",
+                f"TPU_VISIBLE_DEVICES={visible_devices}",
                 f"TPU_CHIPS_PER_HOST_BOUNDS={bounds}",
             ]
         )
@@ -881,8 +910,10 @@ def build_cdi_spec(
             if c.generation not in unit_gens:
                 unit_gens.append(c.generation)
         unit_phys_indices = _distinct_physical_indices(unit_chips, bdf_to_phys)
+        unit_logical_indices = _logical_device_indices(unit_chips, unit_phys_indices)
         unit_env = _build_device_env(
             unit_phys_indices,
+            unit_logical_indices,
             unit_gens,
             single_host_env=inject_single_host_env,
             include_visibility_env=False,
@@ -984,35 +1015,45 @@ def build_cdi_spec(
             slice_nodes, slice_devnums = _dedup_device_nodes(d_chips)
             slice_bdfs = sorted(c.pci_bdf for c in d_chips)
             slice_phys_indices = _distinct_physical_indices(d_chips, bdf_to_phys)
+            slice_logical_indices = _logical_device_indices(d_chips, slice_phys_indices)
             slice_gens: List[str] = []
             for c in d_chips:
                 if c.generation not in slice_gens:
                     slice_gens.append(c.generation)
             slice_env = _build_device_env(
                 slice_phys_indices,
+                slice_logical_indices,
                 slice_gens,
                 single_host_env=inject_single_host_env,
                 include_visibility_env=True,
             )
-            numa_label = str(d_key[1]) if use_explicit_numa and d_key[1] is not None else str(dom_ordinal)
+            discovered_numa = d_key[1]
             pcie_root = d_key[2]
             slice_ann_base: Dict[str, str] = {
-                "freetpu.dev/allocation-unit": "numa-slice",
+                "freetpu.dev/allocation-unit": "numa-slice" if use_explicit_numa else "pcie-slice",
                 "freetpu.dev/chip-count": str(len(slice_phys_indices)),
                 "freetpu.dev/pci-bdfs": ",".join(slice_bdfs),
                 "freetpu.dev/generations": ",".join(slice_gens),
-                "freetpu.dev/numa-node": numa_label,
                 "freetpu.dev/pcie-root": pcie_root,
+                "freetpu.dev/pcie-domain": str(dom_ordinal),
                 "freetpu.dev/optional-cap-add": "IPC_LOCK",
                 "freetpu.dev/required-ulimit-memlock": "-1",
             }
+            # Record freetpu.dev/numa-node ONLY with the actual sysfs NUMA node;
+            # never substitute a PCIe domain ordinal or invent a node when sysfs has none.
+            if discovered_numa is not None:
+                slice_ann_base["freetpu.dev/numa-node"] = str(discovered_numa)
             if len(d_chips) != len(slice_phys_indices):
                 slice_ann_base["freetpu.dev/pci-function-count"] = str(len(d_chips))
             slice_devnums_str = _format_vfio_devnums(list(slice_devnums.items()))
             if slice_devnums_str:
                 slice_ann_base["freetpu.dev/vfio-devnums"] = slice_devnums_str
 
-            candidate_names = [f"numa{numa_label}"]
+            candidate_names = (
+                [f"numa{discovered_numa}"]
+                if use_explicit_numa and discovered_numa is not None
+                else [f"pcie{dom_ordinal}"]
+            )
             if slice_phys_indices == list(
                 range(slice_phys_indices[0], slice_phys_indices[0] + len(slice_phys_indices))
             ):
@@ -1036,6 +1077,7 @@ def build_cdi_spec(
                 )
 
     all_phys_indices = _distinct_physical_indices(chips, bdf_to_phys)
+    all_logical_indices = _logical_device_indices(chips, all_phys_indices)
     all_ann: Dict[str, str] = {
         "freetpu.dev/allocation-unit": "all-devices",
         "freetpu.dev/chip-count": str(len(all_phys_indices)),
@@ -1052,6 +1094,7 @@ def build_cdi_spec(
 
     all_env = _build_device_env(
         all_phys_indices,
+        all_logical_indices,
         all_generations,
         single_host_env=inject_single_host_env,
         include_visibility_env=True,
@@ -1809,7 +1852,7 @@ def verify_spec_against_host(
                         f"device {name!r}: shared-group PCI selector name does not match verified "
                         f"VFIO group membership {expected_live_bdfs} (expected selector {expected_sel!r})"
                     )
-            elif name.startswith("numa") or _RANGE_SLICE_RE.match(name):
+            elif name.startswith("numa") or name.startswith("pcie") or _RANGE_SLICE_RE.match(name):
                 slice_domains = {
                     _topology_domain_key(live_chips_by_bdf[b])
                     for b in expected_live_bdfs
@@ -1987,7 +2030,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             f"CNCF CDI spec version to emit (default: {DEFAULT_CDI_VERSION}, "
             "the minimum version needed by generated fields and compatible with "
-            "supported containerd 2.0/2.1+ releases)."
+            "unaffected/patched containerd releases: 2.0.x, >=2.1.9, >=2.2.5, "
+            ">=2.3.2, >=2.4.0)."
         ),
     )
     gen.add_argument(

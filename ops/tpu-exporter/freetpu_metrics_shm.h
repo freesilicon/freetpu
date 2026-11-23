@@ -8,17 +8,21 @@
  * (never group/world-writable) owned by a trusted publisher UID to:
  *   /dev/shm/freetpu_metrics_<pci_bdf>   (e.g. /dev/shm/freetpu_metrics_0000:00:06.0)
  *
- * Concurrency protocol (lockless SeqLock, single writer / multi-reader):
+ * Concurrency & freshness protocol (lockless SeqLock, single writer / multi-reader):
  *   1. Before mutating payload fields, increment `seq` to an odd value with
  *      release/acq_rel memory ordering (or atomic_fetch_add(&s->seq, 1) + fence).
  *   2. Write `hbm_allocated_bytes`, `hbm_used_bytes`, `mxu_active_cycles`,
- *      and `dma_bytes_transferred`.
+ *      `dma_bytes_transferred`, and `timestamp_ns` (CLOCK_REALTIME Unix epoch
+ *      nanoseconds heartbeat; writers MUST refresh `timestamp_ns` periodically
+ *      while alive and unlink or stop refreshing on exit).
  *   3. Increment `seq` to the next even value with release ordering.
  *
  * Readers (`ops/tpu-exporter/tpu_exporter.py`) open with `O_NOFOLLOW`, verify
  * regular-file type, trusted owner UID, and non-group/world-writable mode via
  * `fstat`, then read via `pread` (avoiding `mmap` SIGBUS on truncation),
- * checking `magic`, `version`, and even/unchanged `seq` across the payload read.
+ * checking `magic`, `version`, even/unchanged `seq`, and `timestamp_ns`
+ * freshness (`now_ns - timestamp_ns <= max_age_ns`, default 30s). Expired
+ * samples from stopped/crashed publishers are omitted.
  */
 
 #ifndef FREETPU_METRICS_SHM_H
@@ -30,9 +34,10 @@
 extern "C" {
 #endif
 
-#define FREETPU_METRICS_SHM_MAGIC   0x46545055u /* "FTPU" little-endian */
-#define FREETPU_METRICS_SHM_VERSION 1u
-#define FREETPU_METRICS_SHM_SIZE    48u
+#define FREETPU_METRICS_SHM_MAGIC                   0x46545055u /* "FTPU" little-endian */
+#define FREETPU_METRICS_SHM_VERSION                 1u
+#define FREETPU_METRICS_SHM_SIZE                    56u
+#define FREETPU_METRICS_SHM_DEFAULT_MAX_AGE_SECONDS 30u
 
 struct freetpu_shm_metrics_v1 {
     uint32_t magic;                 /* offset 0:  FREETPU_METRICS_SHM_MAGIC */
@@ -42,14 +47,15 @@ struct freetpu_shm_metrics_v1 {
     uint64_t hbm_used_bytes;        /* offset 24: HBM live bytes in use */
     uint64_t mxu_active_cycles;     /* offset 32: cumulative MXU active cycles */
     uint64_t dma_bytes_transferred; /* offset 40: cumulative DMA bytes */
+    uint64_t timestamp_ns;          /* offset 48: publisher heartbeat CLOCK_REALTIME ns */
 };
 
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
 _Static_assert(sizeof(struct freetpu_shm_metrics_v1) == FREETPU_METRICS_SHM_SIZE,
-               "freetpu_shm_metrics_v1 must be 48 bytes");
+               "freetpu_shm_metrics_v1 must be 56 bytes");
 #elif defined(__cplusplus) && __cplusplus >= 201103L
 static_assert(sizeof(struct freetpu_shm_metrics_v1) == FREETPU_METRICS_SHM_SIZE,
-              "freetpu_shm_metrics_v1 must be 48 bytes");
+              "freetpu_shm_metrics_v1 must be 56 bytes");
 #endif
 
 #ifdef __cplusplus

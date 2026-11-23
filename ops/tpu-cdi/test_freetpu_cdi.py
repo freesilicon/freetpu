@@ -226,6 +226,7 @@ class FreeTpuCdiTests(unittest.TestCase):
             self.assertEqual(
                 iso_spec["devices"][-1]["containerEdits"]["env"],
                 [
+                    "TPU_VISIBLE_CHIPS=0",
                     "TPU_VISIBLE_DEVICES=0",
                     "TPU_CHIPS_PER_HOST_BOUNDS=1,1,1",
                     "MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353",
@@ -1765,12 +1766,14 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertEqual(all_env["TPU_HOST_BOUNDS"], "1,1,1")
                 self.assertEqual(all_env["TPU_SKIP_MDS_QUERY"], "1")
 
-                # Composable PCI selectors omit TPU_VISIBLE_DEVICES / TPU_CHIPS_PER_HOST_BOUNDS
-                # so combining multiple PCI selectors never overwrites visibility in OCI env.
+                # Composable PCI selectors omit TPU_VISIBLE_CHIPS / TPU_VISIBLE_DEVICES /
+                # TPU_CHIPS_PER_HOST_BOUNDS so combining multiple PCI selectors never
+                # overwrites visibility in OCI env.
                 pci0_iso_env = {
                     kv.split("=", 1)[0]: kv.split("=", 1)[1]
                     for kv in iso_spec["devices"][0]["containerEdits"]["env"]
                 }
+                self.assertNotIn("TPU_VISIBLE_CHIPS", pci0_iso_env)
                 self.assertNotIn("TPU_VISIBLE_DEVICES", pci0_iso_env)
                 self.assertNotIn("TPU_CHIPS_PER_HOST_BOUNDS", pci0_iso_env)
                 self.assertEqual(pci0_iso_env["MEGASCALE_COORDINATOR_ADDRESS"], "127.0.0.1:8353")
@@ -2242,17 +2245,29 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertEqual(all_7x["annotations"]["freetpu.dev/pci-function-count"], "8")
                 all_7x_env = dict(kv.split("=", 1) for kv in all_7x["containerEdits"]["env"])
                 self.assertEqual(all_7x_env["TPU_CHIPS_PER_HOST_BOUNDS"], "2,2,1")
-                self.assertEqual(all_7x_env["TPU_VISIBLE_DEVICES"], "0,1,2,3")
-                # Each NUMA half holds 2 physical chips (4 PCI functions) -> 1,2,1.
+                self.assertEqual(all_7x_env["TPU_VISIBLE_CHIPS"], "0,1,2,3")
+                self.assertEqual(all_7x_env["TPU_VISIBLE_DEVICES"], "0,1,2,3,4,5,6,7")
+                # Each NUMA half holds 2 physical chips (4 logical devices):
+                # numa0 -> chips 0,1 / logical devices 0,1,2,3; numa1 -> chips 2,3 / devices 4,5,6,7.
                 numa0_7x_env = dict(
                     kv.split("=", 1) for kv in by_name_7x["numa0"]["containerEdits"]["env"]
                 )
                 self.assertEqual(len(by_name_7x["numa0"]["containerEdits"]["deviceNodes"]), 4)
                 self.assertEqual(numa0_7x_env["TPU_CHIPS_PER_HOST_BOUNDS"], "1,2,1")
-                self.assertEqual(numa0_7x_env["TPU_VISIBLE_DEVICES"], "0,1")
+                self.assertEqual(numa0_7x_env["TPU_VISIBLE_CHIPS"], "0,1")
+                self.assertEqual(numa0_7x_env["TPU_VISIBLE_DEVICES"], "0,1,2,3")
+
+                numa1_7x_env = dict(
+                    kv.split("=", 1) for kv in by_name_7x["numa1"]["containerEdits"]["env"]
+                )
+                self.assertEqual(numa1_7x_env["TPU_CHIPS_PER_HOST_BOUNDS"], "1,2,1")
+                self.assertEqual(numa1_7x_env["TPU_VISIBLE_CHIPS"], "2,3")
+                self.assertEqual(numa1_7x_env["TPU_VISIBLE_DEVICES"], "4,5,6,7")
 
             # Verify PCIe root resolution from sysfs ancestry when endpoints sit behind
             # PCIe switches on distinct downstream bus numbers (without numa_node files).
+            # When sysfs supplies NO numa_node, `freetpu.dev/numa-node` MUST be omitted
+            # and slices use `pcie0`/`pcie1` + `freetpu.dev/pcie-domain` (never inventing NUMA IDs).
             sw_root = root / "pcie_switch"
             sw_sys = sw_root / "sys"
             sw_dev = sw_root / "dev"
@@ -2298,8 +2313,63 @@ class FreeTpuCdiTests(unittest.TestCase):
                     ["0000:00"] * 4 + ["0000:80"] * 4,
                 )
                 sw_spec = freetpu_cdi.build_cdi_spec(sw_chips, sw_ctrl)
-                sw_names = {d["name"] for d in sw_spec["devices"]}
-                self.assertTrue({"numa0", "0-3", "numa1", "4-7", "all"} <= sw_names, sw_names)
+                self.assertEqual(
+                    freetpu_cdi.verify_spec_against_host(
+                        sw_spec, sysfs_root=sw_sys, dev_root=sw_dev
+                    ),
+                    [],
+                )
+                sw_by_name = {d["name"]: d for d in sw_spec["devices"]}
+                self.assertTrue({"pcie0", "0-3", "pcie1", "4-7", "all"} <= set(sw_by_name), sw_by_name.keys())
+                self.assertNotIn("numa0", sw_by_name)
+                self.assertNotIn("numa1", sw_by_name)
+                self.assertNotIn("freetpu.dev/numa-node", sw_by_name["pcie0"]["annotations"])
+                self.assertNotIn("freetpu.dev/numa-node", sw_by_name["pcie1"]["annotations"])
+                self.assertEqual(sw_by_name["pcie0"]["annotations"]["freetpu.dev/pcie-domain"], "0")
+                self.assertEqual(sw_by_name["pcie1"]["annotations"]["freetpu.dev/pcie-domain"], "1")
+
+            # When two PCIe roots SHARE Linux NUMA node 0, BOTH slices must keep
+            # `freetpu.dev/numa-node == "0"` (never writing domain ordinal "1" as NUMA node 1).
+            shared_numa_root = root / "shared_numa0"
+            shared_numa_devs = [
+                {
+                    "bdf": f"0000:00:0{i:x}.0",
+                    "vendor": "0x1ae0",
+                    "device": "0x006f",
+                    "driver": "vfio-pci",
+                    "iommu_group": str(i),
+                    "numa_node": "0",
+                }
+                for i in range(2)
+            ] + [
+                {
+                    "bdf": f"0000:80:0{i:x}.0",
+                    "vendor": "0x1ae0",
+                    "device": "0x006f",
+                    "driver": "vfio-pci",
+                    "iommu_group": str(2 + i),
+                    "numa_node": "0",
+                }
+                for i in range(2)
+            ]
+            sn_sys, sn_dev = _make_mock_pci_vfio(
+                shared_numa_root,
+                devices=shared_numa_devs,
+                create_vfio_nodes=["0", "1", "2", "3"],
+            )
+            with _mock_vfio_char_devices():
+                sn_chips, sn_ctrl = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=sn_sys, dev_root=sn_dev
+                )
+                sn_spec = freetpu_cdi.build_cdi_spec(sn_chips, sn_ctrl)
+                sn_by_name = {d["name"]: d for d in sn_spec["devices"]}
+                self.assertIn("pcie0", sn_by_name)
+                self.assertIn("pcie1", sn_by_name)
+                self.assertNotIn("numa1", sn_by_name)
+                self.assertEqual(sn_by_name["pcie0"]["annotations"]["freetpu.dev/numa-node"], "0")
+                self.assertEqual(sn_by_name["pcie1"]["annotations"]["freetpu.dev/numa-node"], "0")
+                self.assertEqual(sn_by_name["pcie0"]["annotations"]["freetpu.dev/pcie-domain"], "0")
+                self.assertEqual(sn_by_name["pcie1"]["annotations"]["freetpu.dev/pcie-domain"], "1")
 
             # Verify Kubernetes DRA example manifest uses stable resource.k8s.io/v1 API.
             dra_path = CDI_DIR / "manifests" / "k8s-tpu-dra-example.yaml"
@@ -2308,6 +2378,14 @@ class FreeTpuCdiTests(unittest.TestCase):
             self.assertEqual(dra_text.count("apiVersion: resource.k8s.io/v1"), 3)
             self.assertNotIn("basic:", dra_text)
             self.assertIn("exactly:", dra_text)
+
+            # Verify README keeps containerd GHSA-33vj-92qq-66hc security prerequisite
+            # before the general Quickstart section (not only under DaemonSet instructions).
+            readme_text = (CDI_DIR / "README.md").read_text(encoding="utf-8")
+            qs_idx = readme_text.index("## Quickstart")
+            sec_idx = readme_text.index("GHSA-33vj-92qq-66hc")
+            self.assertLess(sec_idx, qs_idx)
+            self.assertNotIn("2.1.x+", readme_text)
 
 
 if __name__ == "__main__":

@@ -2213,8 +2213,58 @@ TPU Runtime Utilization
                 [(c + 1) * 10 * 1024**3 for c in range(8)],
             )
 
+            # Ironwood per-core duty-cycle response (8 entries 0..7 matching 8 HBM cores)
+            # MUST preserve 1:1 per-core readings and NEVER double/fabricate rows 8..15!
+            class _IronwoodPerCoreStub:
+                def __init__(self, channel):
+                    self.channel = channel
+
+                def GetRuntimeMetric(self, req, timeout=None):
+                    del timeout
+                    if req.metric_name == "tpu.runtime.hbm.memory.usage.bytes":
+                        items = [_make_item(c, as_int=(c + 1) * 8 * 1024**3) for c in range(8)]
+                    elif req.metric_name == "tpu.runtime.hbm.memory.total.bytes":
+                        items = [_make_item(c, as_int=96 * 1024**3) for c in range(8)]
+                    elif req.metric_name == "tpu.runtime.tensorcore.dutycycle.percent":
+                        items = [_make_item(c, as_double=11.0 * (c + 1)) for c in range(8)]
+                    elif req.metric_name == "tpu.runtime.hbm.utilization.percent":
+                        items = [_make_item(c, as_double=40.0 + c) for c in range(8)]
+                    else:
+                        items = []
+                    return SimpleNamespace(metric=SimpleNamespace(metrics=items))
+
+            iw_percore_pb2_grpc = SimpleNamespace(RuntimeMetricServiceStub=_IronwoodPerCoreStub)
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.dict(_te._GRPC_CHANNELS, {}, clear=True),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "grpc": _FakeGrpc,
+                        "tpu_info": SimpleNamespace(),
+                        "tpu_info.proto": SimpleNamespace(),
+                        "tpu_info.proto.tpu_metric_service_pb2": fake_pb2,
+                        "tpu_info.proto.tpu_metric_service_pb2_grpc": iw_percore_pb2_grpc,
+                    },
+                ),
+            ):
+                iw_pc_snap = _te.collect_snapshot(
+                    sysfs_root=iw_sysfs,
+                    dev_root=iw_dev,
+                    proc_root=iw_proc,
+                    tpu_info_bin="tpu-info",
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=iw_root / "no-shm",
+                )
+            self.assertEqual(len(iw_pc_snap.runtime_utilization), 8)
+            self.assertEqual(
+                [d.duty_cycle_percent for d in iw_pc_snap.devices],
+                [11.0 * (c + 1) for c in range(8)],
+            )
+
     def test_shm_seqlock_mmap_reader_including_torn_read_retry(self) -> None:
         import struct
+        import time
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2234,9 +2284,10 @@ TPU Runtime Utilization
                 create_vfio_nodes=["3"],
             )
 
+            now_ns = time.time_ns()
             shm_file = shm_root / "freetpu_metrics_0000:00:0b.0"
             payload = struct.pack(
-                "<IIQQQQQ",
+                "<IIQQQQQQ",
                 tpu_exporter.FREETPU_SHM_MAGIC,
                 tpu_exporter.FREETPU_SHM_VERSION,
                 4,  # even seq
@@ -2244,6 +2295,7 @@ TPU Runtime Utilization
                 18 * 1024**3,  # hbm_used_bytes
                 987654321,  # mxu_active_cycles
                 104857600,  # dma_bytes_transferred
+                now_ns,  # fresh publisher heartbeat timestamp_ns
             )
             shm_file.write_bytes(payload)
             os.chmod(shm_file, 0o600)
@@ -2340,10 +2392,78 @@ TPU Runtime Utilization
             assert res_torn is not None
             self.assertEqual(res_torn.hbm_used_bytes, 18 * 1024**3)
 
+            # Freshness/expiry checks: stale sample after publisher exit MUST be omitted
+            # so crashed workloads cannot pin HBM OOM alerts indefinitely.
+            stale_ts = now_ns - 60 * 1_000_000_000
+            shm_file.write_bytes(
+                struct.pack(
+                    "<IIQQQQQQ",
+                    tpu_exporter.FREETPU_SHM_MAGIC,
+                    tpu_exporter.FREETPU_SHM_VERSION,
+                    8,
+                    32 * 1024**3,
+                    31 * 1024**3,  # high HBM that would trigger OOM if not expired
+                    987654321,
+                    104857600,
+                    stale_ts,
+                )
+            )
+            self.assertIsNone(
+                tpu_exporter.read_shm_seqlock_metrics(
+                    "0000:00:0b.0", shm_root=shm_root, max_age_s=30.0, now_ns=now_ns
+                )
+            )
+            with _mock_vfio_char_lstat():
+                stale_snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin=None,
+                    shm_root=shm_root,
+                    shm_max_age_s=30.0,
+                )
+            self.assertIsNone(stale_snap.devices[0].hbm_used_bytes)
+            self.assertEqual(stale_snap.devices[0].telemetry_source, "sysfs-fallback")
+
+            # Custom max_age_s=120 accepts 60s-old sample while rejecting 180s-old sample.
+            res_ttl = tpu_exporter.read_shm_seqlock_metrics(
+                "0000:00:0b.0", shm_root=shm_root, max_age_s=120.0, now_ns=now_ns
+            )
+            self.assertIsNotNone(res_ttl)
+            self.assertIsNone(
+                tpu_exporter.read_shm_seqlock_metrics(
+                    "0000:00:0b.0",
+                    shm_root=shm_root,
+                    max_age_s=120.0,
+                    now_ns=now_ns + 121 * 1_000_000_000,
+                )
+            )
+
+            # Missing heartbeat (timestamp_ns=0) and far-future timestamps fail closed.
+            for bad_ts in (0, now_ns + 3600 * 1_000_000_000):
+                shm_file.write_bytes(
+                    struct.pack(
+                        "<IIQQQQQQ",
+                        tpu_exporter.FREETPU_SHM_MAGIC,
+                        tpu_exporter.FREETPU_SHM_VERSION,
+                        10,
+                        32 * 1024**3,
+                        18 * 1024**3,
+                        1,
+                        2,
+                        bad_ts,
+                    )
+                )
+                self.assertIsNone(
+                    tpu_exporter.read_shm_seqlock_metrics(
+                        "0000:00:0b.0", shm_root=shm_root, now_ns=now_ns
+                    )
+                )
+
             # Persistent odd seq (crashed writer) must fail closed within max_retries.
             shm_file.write_bytes(
                 struct.pack(
-                    "<IIQQQQQ",
+                    "<IIQQQQQQ",
                     tpu_exporter.FREETPU_SHM_MAGIC,
                     tpu_exporter.FREETPU_SHM_VERSION,
                     5,  # odd = write in progress
@@ -2351,6 +2471,7 @@ TPU Runtime Utilization
                     18 * 1024**3,
                     1,
                     2,
+                    now_ns,
                 )
             )
             self.assertIsNone(
@@ -2361,7 +2482,7 @@ TPU Runtime Utilization
 
             # Bad magic must fail closed.
             shm_file.write_bytes(
-                struct.pack("<IIQQQQQ", 0xDEADBEEF, 1, 2, 0, 0, 0, 0)
+                struct.pack("<IIQQQQQQ", 0xDEADBEEF, 1, 2, 0, 0, 0, 0, now_ns)
             )
             self.assertIsNone(
                 tpu_exporter.read_shm_seqlock_metrics("0000:00:0b.0", shm_root=shm_root)
