@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <sys/mman.h>
 #include <vector>
 
 extern "C" const PJRT_Api* GetPjrtApi(void);
@@ -71,7 +72,35 @@ static void test_bar4_descriptor_parser() {
   OT_CHECK(desc.header_word == hdr);
   OT_CHECK(desc.core_count_observed == 1);
   OT_CHECK(desc.instance_token == "TPUv5");
+
+  // Unmapped/error BAR4 reads (all 0xff) and blank/zero-field pages must be rejected.
+  std::vector<uint8_t> ff_page(4096, 0xff);
+  OT_CHECK(!ot::parse_bar4_descriptor(ff_page.data(), ff_page.size(), &desc));
+  OT_CHECK(!desc.valid);
+  std::vector<uint8_t> zero_page(4096, 0x00);
+  OT_CHECK(!ot::parse_bar4_descriptor(zero_page.data(), zero_page.size(), &desc));
+  uint32_t bad_len = 4;
+  std::memcpy(zero_page.data() + 0x08, &bad_len, 4);
+  OT_CHECK(!ot::parse_bar4_descriptor(zero_page.data(), zero_page.size(), &desc));
   printf("[PASS] test_bar4_descriptor_parser\n");
+}
+
+static void test_aligned_dma_arena_alloc() {
+  std::string err;
+  constexpr size_t kTwoMiB = 2u * 1024u * 1024u;
+  void* p = ot::alloc_aligned_anon_pages(kTwoMiB, kTwoMiB, &err);
+  OT_CHECK(p != nullptr);
+  OT_CHECK((reinterpret_cast<uintptr_t>(p) & (kTwoMiB - 1u)) == 0);
+  auto* bytes = static_cast<uint8_t*>(p);
+  bytes[0] = 0x5au;
+  bytes[kTwoMiB - 1u] = 0xa5u;
+  OT_CHECK(bytes[0] == 0x5au && bytes[kTwoMiB - 1u] == 0xa5u);
+  OT_CHECK(::munmap(p, kTwoMiB) == 0);
+
+  // Non-power-of-two alignment and zero length must fail.
+  OT_CHECK(ot::alloc_aligned_anon_pages(kTwoMiB, 3u * 4096u, &err) == nullptr);
+  OT_CHECK(ot::alloc_aligned_anon_pages(0, kTwoMiB, &err) == nullptr);
+  printf("[PASS] test_aligned_dma_arena_alloc\n");
 }
 
 static void test_mock_dma_and_matmul() {
@@ -1028,6 +1057,7 @@ static void test_vliw_and_tiling() {
 int main() {
   test_iova_allocator();
   test_bar4_descriptor_parser();
+  test_aligned_dma_arena_alloc();
   test_mock_dma_and_matmul();
   test_pjrt_api_mock();
   test_vliw_and_tiling();

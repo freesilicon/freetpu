@@ -59,6 +59,10 @@ struct Bar4Descriptor {
 
 bool parse_bar4_descriptor(const uint8_t* bar4_page, size_t page_len, Bar4Descriptor* out);
 
+// Allocate an anonymous page mapping of length `len` whose host virtual address
+// is aligned to `align` (power of 2, >= host page size). Caller releases with munmap(p, len).
+void* alloc_aligned_anon_pages(size_t len, size_t align, std::string* err);
+
 // VFIO + PCI device transport handle.
 struct VfioTransport {
   int container_fd = -1;

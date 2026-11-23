@@ -7,6 +7,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #ifdef __linux__
@@ -14,7 +16,6 @@
 #include <fcntl.h>
 #include <linux/vfio.h>
 #include <sys/ioctl.h>
-#include <sys/mman.h>
 #endif
 
 namespace ot {
@@ -156,6 +157,7 @@ bool parse_bar4_descriptor(const uint8_t* bar4_page, size_t page_len, Bar4Descri
     if (!read_varint(p, proto_len, &pos, &tag)) return false;
     uint32_t field_num = static_cast<uint32_t>(tag >> 3);
     uint32_t wire = static_cast<uint32_t>(tag & 7u);
+    if (field_num == 0) return false;
     if (wire == 0) {
       uint64_t v = 0;
       if (!read_varint(p, proto_len, &pos, &v)) return false;
@@ -182,6 +184,74 @@ bool parse_bar4_descriptor(const uint8_t* bar4_page, size_t page_len, Bar4Descri
   }
   out->valid = true;
   return true;
+}
+
+void* alloc_aligned_anon_pages(size_t len, size_t align, std::string* err) {
+  if (len == 0) {
+    if (err) *err = "DMA arena length must be non-zero";
+    return nullptr;
+  }
+  long host_ps_raw = ::sysconf(_SC_PAGESIZE);
+  const size_t host_ps = (host_ps_raw > 0) ? static_cast<size_t>(host_ps_raw) : 4096u;
+  if ((host_ps & (host_ps - 1u)) != 0) {
+    if (err) *err = "Host page size is not a power of two";
+    return nullptr;
+  }
+  if (align == 0) align = host_ps;
+  if ((align & (align - 1u)) != 0) {
+    if (err) *err = "DMA alignment must be a power of two";
+    return nullptr;
+  }
+  if (align < host_ps) align = host_ps;
+  if ((len % host_ps) != 0) {
+    if (err) *err = "DMA arena length must be a multiple of host page size";
+    return nullptr;
+  }
+
+  if (align <= host_ps) {
+    void* p = ::mmap(nullptr, len, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) {
+      if (err) *err = std::string("mmap failed: ") + std::strerror(errno);
+      return nullptr;
+    }
+    if ((reinterpret_cast<uintptr_t>(p) & static_cast<uintptr_t>(align - 1u)) != 0) {
+      ::munmap(p, len);
+      if (err) *err = "mmap returned misaligned backing page";
+      return nullptr;
+    }
+    return p;
+  }
+
+  if (len > std::numeric_limits<size_t>::max() - align) {
+    if (err) *err = "DMA arena aligned allocation overflow";
+    return nullptr;
+  }
+  const size_t over_len = len + align;
+  void* raw = ::mmap(nullptr, over_len, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (raw == MAP_FAILED) {
+    if (err) *err = std::string("mmap failed: ") + std::strerror(errno);
+    return nullptr;
+  }
+  const uintptr_t raw_addr = reinterpret_cast<uintptr_t>(raw);
+  const uintptr_t mask = static_cast<uintptr_t>(align - 1u);
+  const uintptr_t aligned_addr = (raw_addr + mask) & ~mask;
+  if (aligned_addr < raw_addr) {
+    ::munmap(raw, over_len);
+    if (err) *err = "DMA arena aligned address wraparound";
+    return nullptr;
+  }
+  const size_t lead = static_cast<size_t>(aligned_addr - raw_addr);
+  if (lead > over_len || over_len - lead < len) {
+    ::munmap(raw, over_len);
+    if (err) *err = "DMA arena aligned subrange out of bounds";
+    return nullptr;
+  }
+  const size_t trail = over_len - lead - len;
+  if (lead > 0) (void)::munmap(raw, lead);
+  if (trail > 0) (void)::munmap(reinterpret_cast<void*>(aligned_addr + len), trail);
+  return reinterpret_cast<void*>(aligned_addr);
 }
 
 #ifdef __linux__
@@ -514,7 +584,8 @@ bool VfioTransport::open_device(const ot_config_t& cfg, ot_device_info_t* info, 
   info->smem_bytes = 1024ULL * 1024ULL;
   info->num_mxus = 4u;
   info->is_mock = 0u;
-  info->is_prebooted = (read32_bar4(0x08) != 0) ? 1u : 0u;
+  // Derived in ot_context_create() only after parsing a valid BAR4 descriptor.
+  info->is_prebooted = 0u;
 
   // Reserve 0x0000..0x00100000 for ring queues + 0x00100000..0x00500000 for staging.
   iova_alloc.init(0x00800000ULL, 0xf0000000ULL);
@@ -705,10 +776,14 @@ bool VfioTransport::init_ring_queues(std::string* err) {
     return false;
   }
 
+  if (map_granule > std::numeric_limits<size_t>::max()) {
+    if (err) *err = "IOMMU page size exceeds host address width";
+    return false;
+  }
+
   auto map_anon_dma = [&](uint64_t iova, size_t len) -> uint8_t* {
-    void* p = ::mmap(nullptr, len, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (p == MAP_FAILED) return nullptr;
+    void* p = alloc_aligned_anon_pages(len, static_cast<size_t>(map_granule), err);
+    if (!p) return nullptr;
     // Prevent copy-on-write page replacement across fork() while pages are pinned by VFIO.
     if (::madvise(p, len, MADV_DONTFORK) != 0) {
       if (err) *err = std::string("madvise(MADV_DONTFORK) failed: ") + std::strerror(errno);

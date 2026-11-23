@@ -91,13 +91,20 @@ ot_status_t ot_context_create(const ot_config_t* config, ot_context_t** out_ctx)
     return OT_ERR_DEVICE;
   }
 
-  if (!cfg.mock_mode && ctx->transport.bar4_mmio && ctx->transport.bar4_mapped_len >= 0x1000) {
-    std::vector<uint8_t> page(4096, 0);
-    for (size_t i = 0; i < page.size(); i += 4) {
-      uint32_t w = ctx->transport.read32_bar4(i);
-      std::memcpy(page.data() + i, &w, 4);
+  if (!cfg.mock_mode) {
+    ctx->info.is_prebooted = 0u;
+    if (ctx->transport.bar4_mmio && ctx->transport.bar4_mapped_len >= 0x20) {
+      size_t read_len = ctx->transport.bar4_mapped_len < 4096u ? ctx->transport.bar4_mapped_len : 4096u;
+      read_len &= ~size_t{3u};
+      std::vector<uint8_t> page(read_len, 0);
+      for (size_t i = 0; i < page.size(); i += 4) {
+        uint32_t w = ctx->transport.read32_bar4(i);
+        std::memcpy(page.data() + i, &w, 4);
+      }
+      if (ot::parse_bar4_descriptor(page.data(), page.size(), &ctx->bar4_desc)) {
+        ctx->info.is_prebooted = 1u;
+      }
     }
-    ot::parse_bar4_descriptor(page.data(), page.size(), &ctx->bar4_desc);
   }
 
   *out_ctx = ctx;
