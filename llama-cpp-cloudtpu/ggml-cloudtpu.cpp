@@ -30,7 +30,7 @@ constexpr size_t CLOUDTPU_BUFFER_ALIGNMENT = 64;
 struct cloudtpu_env_config {
     bool mock_mode = false;
     int mock_devices = 1;
-    int spmd_chips = 0;       // 0 = auto (use all rt.device_count()), 1 = single chip, >1 = explicit SPMD chip count
+    int spmd_chips = 1;       // 1 = default per-chip devices, 0 = opt-in auto (all rt.device_count()), >1 = explicit SPMD chip count
     int spmd_min_rows = 256;  // Minimum weight rows/cols to shard across SPMD chips
     int max_fuse_ops = 64;    // Max ops per fused StableHLO subgraph
     int verbose = 0;
@@ -1286,7 +1286,7 @@ static void ggml_backend_cloudtpu_buffer_memset_tensor(ggml_backend_buffer_t buf
             next.nbytes = t_bytes;
             upload_raw_tensor_to_slot(
                 rt, bctx->device_index, bctx->spmd_chips, bctx->spmd_min_rows,
-                next, tensor, tmp.data(), /*allow_sharding=*/false);
+                next, tensor, tmp.data(), /*allow_sharding=*/true);
             bctx->evict_overlapping_locked(t_off, t_bytes, t_off);
             bctx->slots[t_off] = std::move(next);
         } else {
@@ -1312,7 +1312,8 @@ static void ggml_backend_cloudtpu_buffer_memset_tensor(ggml_backend_buffer_t buf
                 CloudTpuTensorSlot& slot = bctx->slots[t_off];
                 slot.offset = t_off;
                 slot.nbytes = t_bytes;
-                slot.sharding = cloudtpu::TensorShardingKind::REPLICATED;
+                slot.sharding = choose_upload_sharding(
+                    tensor, bctx->spmd_chips, bctx->spmd_min_rows, /*allow_sharding=*/true);
                 slot.hbm_primary.clear();
                 slot.hbm_scales.clear();
                 slot.hbm_mins.clear();

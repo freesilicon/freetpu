@@ -54,7 +54,7 @@ Eliminating host MLIR re-emission (`SubgraphPlanCache`), replacing per-subgraph 
 
 ### M4A Multi-Chip SPMD Live Silicon Proof (`v6e-8` Trillium, `MAPS_LIBPYTHON=0`)
 
-When `CLOUDTPU_SPMD_CHIPS=auto` (default) detects `P > 1` TPU chips, `ggml-cloudtpu` exposes a single unified `CLOUDTPU` device reporting aggregated mesh HBM (`P * per_chip_hbm`), compiles explicit replica-SPMD StableHLO v1.0 collectives (`all_reduce`, `all_gather`, `reduce_scatter`, `replica_id` + `dynamic_slice`) with `DeviceAssignmentProto` (`num_replicas=P, num_partitions=1`), and automatically shards 2D weights by `1/P` across chips (`SHARD_K` for `ffn_down`/`token_embd`, `SHARD_N` for `Q`/`K`/`V`/`O`/`ffn_gate`/`ffn_up`/`output`, fusing Megatron-LM FFN blocks down to a single `all_reduce`).
+When opted in via `CLOUDTPU_SPMD_CHIPS=auto` (or an explicit count such as `CLOUDTPU_SPMD_CHIPS=8`) with `P > 1` TPU chips, `ggml-cloudtpu` exposes a single unified `CLOUDTPU` device reporting aggregated mesh HBM (`P * min_chip_hbm`), compiles explicit replica-SPMD StableHLO v1.0 collectives (`all_reduce`, `all_gather`, `reduce_scatter`, `replica_id` + `dynamic_slice`) with `DeviceAssignmentProto` (`num_replicas=P, num_partitions=1`), and automatically shards 2D weights by `1/P` across chips (`SHARD_K` for `ffn_down`/`token_embd`, `SHARD_N` for `Q`/`K`/`V`/`O`/`ffn_gate`/`ffn_up`/`output`, fusing Megatron-LM FFN blocks down to a single `all_reduce`). Leaving `CLOUDTPU_SPMD_CHIPS` unset (default `1`) preserves per-chip devices (`CLOUDTPU`, `CLOUDTPU1`, ...).
 
 #### Live 8-Chip `v6e-8` Silicon Verification (`SPMD 8x TPU v6 lite`, `255,967 MB` HBM, `ldd libpython = 0`)
 - **`test_cloudtpu_host` (`CLOUDTPU_MOCK=0`):** `ALL PASSED (0 failures)` — single-chip & P=1 StableHLO collective syntax/execution (`all_reduce`/`all_gather`/`reduce_scatter`) verified live on `libtpu.so` (`MAPS_LIBPYTHON=0`), plus 4-chip & 8-chip SPMD collective and Megatron FFN unit tests on the in-process Host Mock (live 8-chip SPMD execution is verified below via `test-backend-ops` and `llama-bench`/`llama-cli`).
@@ -107,7 +107,7 @@ CLOUDTPU_MOCK=1 CLOUDTPU_MOCK_DEVICES=8 CLOUDTPU_SPMD_CHIPS=8 CLOUDTPU_SPMD_MIN_
 | --- | --- | --- |
 | `CLOUDTPU_MOCK` | `0` on Linux, `1` on macOS/Windows | `1` runs in-process Host Mock PJRT executing emitted StableHLO IR |
 | `CLOUDTPU_MOCK_DEVICES` | `1` | Virtual TPU chip count in Host Mock (`4` simulates `tpu7x-4t`, `8` simulates `v6e-8`) |
-| `CLOUDTPU_SPMD_CHIPS` | `auto` (`rt.device_count()`) | Explicit chip count (`1..16`) for replica-SPMD Tensor Parallelism (`1` exposes per-chip devices) |
+| `CLOUDTPU_SPMD_CHIPS` | `1` (per-chip devices) | Opt-in replica-SPMD Tensor Parallelism: `1` exposes per-chip devices (`CLOUDTPU`, `CLOUDTPU1`, ...); `auto` uses all discovered chips; `2..16` sets an explicit mesh size |
 | `CLOUDTPU_SPMD_MIN_ROWS` | `256` | Minimum 2D weight matrix rows/cols required to shard across SPMD chips |
 | `CLOUDTPU_MAX_FUSE_OPS` | `64` | Maximum GGML ops fused into a single StableHLO subgraph executable |
 | `LIBTPU_PATH` / `TPU_LIBRARY_PATH` | Auto-resolved `libtpu.so` | Explicit path to `libtpu.so` (or future clean-room `libopentpu.so`) |
