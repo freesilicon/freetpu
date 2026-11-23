@@ -297,7 +297,8 @@ public:
             body_ << operands[i].name;
         }
         body_ << ") {backend_config = \"" << freetile::escape_mlir_string_literal(backend_config_json)
-              << "\", kernel_name = \"" << kernel_name << "\", operand_layouts = [";
+              << "\", kernel_name = \"" << freetile::escape_mlir_string_literal(kernel_name)
+              << "\", operand_layouts = [";
         for (size_t i = 0; i < operands.size(); ++i) {
             if (i > 0) body_ << ", ";
             body_ << "dense<[1, 0]> : tensor<2xindex>";

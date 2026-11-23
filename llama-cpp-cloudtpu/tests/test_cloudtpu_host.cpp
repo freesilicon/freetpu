@@ -6245,6 +6245,138 @@ void test_ggml_cgraph_reshaped_host_cpy_and_q4_bitcast_view() {
     std::printf("  [PASS] ggml_cgraph reshaped host CPY bucket writeback & 3-row BITCAST Q4_K slot-shape fallback\n");
 #endif
 }
+
+void test_ggml_cgraph_freetile_mosaic_fallback() {
+#if !defined(_WIN32)
+    // End-to-end GGML backend test exercising execute_subgraph's automatic Mosaic -> StableHLO
+    // compile retry (CLOUDTPU_FREETILE_MOSAIC=1 + CLOUDTPU_FREETILE_MOSAIC_VERSION=999) as well
+    // as normal Mosaic execution (default version 17) on an eligible Q4_K matmul (M=1, K=256, N=128).
+    const int64_t K = 256, N = 128, M = 1;
+    std::vector<uint8_t> w_raw(static_cast<size_t>(N) * 144U, 0);
+    for (int64_t r = 0; r < N; ++r) {
+        uint8_t* blk = w_raw.data() + static_cast<size_t>(r) * 144U;
+        const uint16_t d_f16 = cloudtpu::f32_to_f16(0.03f * static_cast<float>((r % 5) + 1));
+        const uint16_t dmin_f16 = cloudtpu::f32_to_f16(0.01f * static_cast<float>((r % 3) + 1));
+        std::memcpy(blk + 0, &d_f16, 2);
+        std::memcpy(blk + 2, &dmin_f16, 2);
+        for (int i = 0; i < 12; ++i) {
+            blk[4 + i] = static_cast<uint8_t>(((r * 7 + i * 5) % 15) + 1);
+        }
+        for (int i = 0; i < 128; ++i) {
+            const uint8_t lo = static_cast<uint8_t>((r * 3 + i * 5) & 0x0F);
+            const uint8_t hi = static_cast<uint8_t>((r * 5 + i * 3 + 1) & 0x0F);
+            blk[16 + i] = static_cast<uint8_t>(lo | (hi << 4));
+        }
+    }
+    std::vector<float> x_host(static_cast<size_t>(M * K));
+    for (size_t i = 0; i < x_host.size(); ++i) {
+        x_host[i] = std::sin(static_cast<float>(i) * 0.09f);
+    }
+
+    std::vector<float> ref_y(static_cast<size_t>(M * N), 0.0f);
+    {
+        ggml_backend_t cpu_be = ggml_backend_cpu_init();
+        CHECK_TRUE(cpu_be != nullptr, "cpu backend init for FreeTile Mosaic fallback ref");
+        const size_t mem = ggml_tensor_overhead() * 24 + ggml_graph_overhead() + 4096;
+        struct ggml_init_params p = {mem, nullptr, true};
+        struct ggml_context* ctx_w = ggml_init(p);
+        ggml_tensor* tw = ggml_new_tensor_2d(ctx_w, GGML_TYPE_Q4_K, K, N);
+        ggml_backend_buffer_t w_buf = ggml_backend_alloc_ctx_tensors(ctx_w, cpu_be);
+        ggml_backend_tensor_set(tw, w_raw.data(), 0, w_raw.size());
+
+        struct ggml_context* ctx_g = ggml_init(p);
+        struct ggml_cgraph* gf = ggml_new_graph(ctx_g);
+        ggml_tensor* tx = ggml_new_tensor_2d(ctx_g, GGML_TYPE_F32, K, M);
+        ggml_set_input(tx);
+        ggml_tensor* ty = ggml_mul_mat(ctx_g, tw, tx);
+        ggml_set_output(ty);
+        ggml_build_forward_expand(gf, ty);
+
+        ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu_be));
+        CHECK_TRUE(ggml_gallocr_alloc_graph(galloc, gf), "cpu alloc for FreeTile Mosaic ref");
+        ggml_backend_tensor_set(tx, x_host.data(), 0, x_host.size() * sizeof(float));
+        CHECK_TRUE(ggml_backend_graph_compute(cpu_be, gf) == GGML_STATUS_SUCCESS, "cpu compute FreeTile Mosaic ref");
+        ggml_backend_tensor_get(ty, ref_y.data(), 0, ref_y.size() * sizeof(float));
+
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx_g);
+        ggml_backend_buffer_free(w_buf);
+        ggml_free(ctx_w);
+        ggml_backend_free(cpu_be);
+    }
+    double ref_energy = 0.0;
+    for (float v : ref_y) ref_energy += static_cast<double>(v) * static_cast<double>(v);
+    CHECK_TRUE(ref_energy > 1e-2, "FreeTile Mosaic fallback CPU reference must be non-zero");
+
+    auto run_child = [&](const char* mosaic_ver, const char* label) {
+        std::fflush(stdout);
+        std::fflush(stderr);
+        const pid_t pid = fork();
+        CHECK_TRUE(pid >= 0, label);
+        if (pid == 0) {
+            setenv("CLOUDTPU_MOCK", "1", 1);
+            setenv("CLOUDTPU_MOCK_DEVICES", "1", 1);
+            setenv("CLOUDTPU_SPMD_CHIPS", "1", 1);
+            setenv("CLOUDTPU_Q4_MODE", "i4", 1);
+            setenv("CLOUDTPU_Q4K_BF16_SCALES", "0", 1);
+            setenv("CLOUDTPU_FREETILE_MOSAIC", "1", 1);
+            if (mosaic_ver != nullptr) {
+                setenv("CLOUDTPU_FREETILE_MOSAIC_VERSION", mosaic_ver, 1);
+            } else {
+                unsetenv("CLOUDTPU_FREETILE_MOSAIC_VERSION");
+            }
+            ggml_backend_t be = ggml_backend_cloudtpu_init();
+            bool ok = false;
+            if (be != nullptr) {
+                const size_t mem = ggml_tensor_overhead() * 24 + ggml_graph_overhead() + 4096;
+                struct ggml_init_params p = {mem, nullptr, true};
+                struct ggml_context* ctx_w = ggml_init(p);
+                ggml_tensor* tw = ggml_new_tensor_2d(ctx_w, GGML_TYPE_Q4_K, K, N);
+                ggml_backend_buffer_t w_buf = ggml_backend_alloc_ctx_tensors(ctx_w, be);
+                ggml_backend_tensor_set(tw, w_raw.data(), 0, w_raw.size());
+
+                struct ggml_context* ctx_g = ggml_init(p);
+                struct ggml_cgraph* gf = ggml_new_graph(ctx_g);
+                ggml_tensor* tx = ggml_new_tensor_2d(ctx_g, GGML_TYPE_F32, K, M);
+                ggml_set_input(tx);
+                ggml_tensor* ty = ggml_mul_mat(ctx_g, tw, tx);
+                ggml_set_output(ty);
+                ggml_build_forward_expand(gf, ty);
+
+                ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
+                if (ggml_gallocr_alloc_graph(galloc, gf)) {
+                    ggml_backend_tensor_set(tx, x_host.data(), 0, x_host.size() * sizeof(float));
+                    // Execute twice: 1st compiles (or triggers Mosaic compile-fail retry & installs fallback),
+                    // 2nd verifies cached plan reuse succeeds with identical accurate output.
+                    bool run1 = (ggml_backend_graph_compute(be, gf) == GGML_STATUS_SUCCESS);
+                    std::vector<float> got1(static_cast<size_t>(M * N), 0.0f);
+                    if (run1) {
+                        ggml_backend_tensor_get(ty, got1.data(), 0, got1.size() * sizeof(float));
+                    }
+                    bool run2 = run1 && (ggml_backend_graph_compute(be, gf) == GGML_STATUS_SUCCESS);
+                    std::vector<float> got2(static_cast<size_t>(M * N), 0.0f);
+                    if (run2) {
+                        ggml_backend_tensor_get(ty, got2.data(), 0, got2.size() * sizeof(float));
+                    }
+                    ok = run2 && (compute_nmse(got1, ref_y) < 5e-4) && (compute_nmse(got2, ref_y) < 5e-4);
+                }
+                ggml_gallocr_free(galloc);
+                ggml_free(ctx_g);
+                ggml_backend_buffer_free(w_buf);
+                ggml_free(ctx_w);
+                ggml_backend_free(be);
+            }
+            _exit(ok ? 0 : 1);
+        }
+        int status = 0;
+        CHECK_TRUE(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0, label);
+    };
+
+    run_child(nullptr, "ggml_cgraph FreeTile Mosaic Q4_K (v17) must succeed and match CPU reference");
+    run_child("999", "ggml_cgraph FreeTile Mosaic invalid version (999) must automatically fall back to StableHLO");
+    std::printf("  [PASS] ggml_cgraph FreeTile Mosaic Q4_K (v17 + automatic v999 fallback retry & cache hit)\n");
+#endif
+}
 #endif
 
 void test_freetile_mosaic_lowering(cloudtpu::PjrtRuntime& rt) {
@@ -6671,6 +6803,7 @@ int main() {
     test_ggml_cgraph_reshaped_host_cpy_and_q4_bitcast_view();
     test_ggml_cgraph_one_graph_decode();
     test_ggml_cgraph_continuous_batching_buckets();
+    test_ggml_cgraph_freetile_mosaic_fallback();
 #endif
 
     const size_t py_maps = cloudtpu::count_libpython_mappings();

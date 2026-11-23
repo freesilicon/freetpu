@@ -2,6 +2,7 @@
 #include "freetile/tile_ir.hpp"
 
 #include <cstdio>
+#include <locale>
 #include <stdexcept>
 #include <string>
 
@@ -326,6 +327,51 @@ int main() {
             freetile::DType::BF16, freetile::DType::F32, false, &bad_smem), "Plan small dense kernel");
         bad_smem.operands[1].space = freetile::MemorySpace::SMEM;
         CHECK_TRUE(!bad_smem.validate(&verr), "SMEM-tagged weight window rejected on Mosaic target");
+    }
+
+    // 13. Classic locale invariant (digit-grouping global locale must never emit "2,048")
+    {
+        struct CommaNumpunct : std::numpunct<char> {
+            char do_thousands_sep() const override { return ','; }
+            std::string do_grouping() const override { return "\3"; }
+        };
+        const std::locale prev_loc = std::locale::global(std::locale(std::locale::classic(), new CommaNumpunct()));
+        struct LocaleGuard {
+            std::locale prev;
+            ~LocaleGuard() { std::locale::global(prev); }
+        } guard{prev_loc};
+
+        freetile::TileKernel k_loc;
+        std::string reason;
+        CHECK_TRUE(freetile::plan_quant_matmul_kernel(
+            freetile::ChipTarget::V5E, 1, 4096, 14336, freetile::QuantFormat::Q4_K,
+            freetile::DType::BF16, freetile::DType::F32, false, &k_loc, &reason), "Plan under grouping locale");
+        CHECK_TRUE(k_loc.name.find(',') == std::string::npos, "Kernel name contains no locale commas");
+        const auto em_loc = freetile::emit_mosaic_kernel(k_loc);
+        CHECK_TRUE(em_loc.mosaic_mlir.find("2,048") == std::string::npos, "Mosaic MLIR contains no grouped 2,048");
+        CHECK_TRUE(em_loc.mosaic_mlir.find("memref<8x2048xf32, #tpu.memory_space<vmem>>") != std::string::npos,
+                   "Mosaic MLIR preserves clean 2048 dimension under grouping locale");
+        CHECK_TRUE(em_loc.cache_key.find(',') == std::string::npos, "Mosaic cache_key contains no locale commas");
+    }
+
+    // 14. Unsafe kernel names (quotes, backslashes, whitespace, leading digits) rejected
+    {
+        freetile::TileKernel k_name;
+        CHECK_TRUE(freetile::plan_quant_matmul_kernel(
+            freetile::ChipTarget::V5E, 8, 64, 128, freetile::QuantFormat::NONE,
+            freetile::DType::BF16, freetile::DType::F32, false, &k_name), "Plan dense kernel for name test");
+        std::string verr;
+        for (const char* bad : {"bad\"name\\x", "bad name", "123leading_digit", "bad\nname"}) {
+            k_name.name = bad;
+            CHECK_TRUE(!k_name.validate(&verr), "Unsafe kernel.name rejected by validate()");
+            bool threw = false;
+            try {
+                (void)freetile::emit_mosaic_kernel(k_name);
+            } catch (const std::runtime_error&) {
+                threw = true;
+            }
+            CHECK_TRUE(threw, "Unsafe kernel.name throws in emit_mosaic_kernel()");
+        }
     }
 
     std::printf("PASS: all freetile unit tests succeeded!\n");

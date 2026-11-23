@@ -3,11 +3,35 @@
 #include <algorithm>
 #include <cctype>
 #include <limits>
+#include <locale>
 #include <sstream>
 
 namespace freetile {
 
 namespace {
+
+std::ostringstream make_classic_stream() {
+    std::ostringstream oss;
+    oss.imbue(std::locale::classic());
+    return oss;
+}
+
+bool is_safe_mlir_symbol(const std::string& s) {
+    if (s.empty()) {
+        return false;
+    }
+    const unsigned char c0 = static_cast<unsigned char>(s[0]);
+    if (!(std::isalpha(c0) || c0 == '_')) {
+        return false;
+    }
+    for (size_t i = 1; i < s.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        if (!(std::isalnum(c) || c == '_' || c == '.' || c == '-' || c == '$')) {
+            return false;
+        }
+    }
+    return true;
+}
 
 std::string to_lower_ascii(std::string s) {
     for (char& c : s) {
@@ -245,8 +269,8 @@ size_t TileKernel::vmem_footprint_bytes() const {
 }
 
 bool TileKernel::validate(std::string* err) const {
-    if (name.empty()) {
-        return fail(err, "TileKernel name must not be empty");
+    if (!is_safe_mlir_symbol(name)) {
+        return fail(err, "TileKernel name must be a valid bare MLIR symbol ([A-Za-z_][A-Za-z0-9_$.-]*)");
     }
     const TargetProfile prof = target_profile(target);
     if (matmul.m <= 0 || matmul.m_padded <= 0 || matmul.n <= 0 || matmul.k <= 0) {
@@ -412,7 +436,7 @@ bool TileKernel::validate(std::string* err) const {
         }
     }
     if (vmem_footprint_bytes() > prof.vmem_bytes) {
-        std::ostringstream oss;
+        std::ostringstream oss = make_classic_stream();
         oss << "VMEM footprint (" << vmem_footprint_bytes() << " B) exceeds target budget ("
             << prof.vmem_bytes << " B)";
         return fail(err, oss.str());
@@ -524,7 +548,7 @@ bool plan_quant_matmul_kernel(ChipTarget target,
             }
 
             TileKernel cand;
-            std::ostringstream kname;
+            std::ostringstream kname = make_classic_stream();
             kname << "ft_" << quant_format_name(fmt) << "_m" << override_bm << "_k" << k << "_n" << n
                   << "_bk" << bk << "_bn" << bn;
             cand.name = kname.str();

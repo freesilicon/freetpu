@@ -1,6 +1,7 @@
 #include "freetile/mosaic_emitter.hpp"
 
 #include <iomanip>
+#include <locale>
 #include <sstream>
 #include <stdexcept>
 
@@ -8,8 +9,14 @@ namespace freetile {
 
 namespace {
 
-std::string format_memref_vmem(const std::vector<int64_t>& shape, DType dt) {
+std::ostringstream make_classic_stream() {
     std::ostringstream oss;
+    oss.imbue(std::locale::classic());
+    return oss;
+}
+
+std::string format_memref_vmem(const std::vector<int64_t>& shape, DType dt) {
+    std::ostringstream oss = make_classic_stream();
     oss << "memref<";
     for (int64_t d : shape) {
         oss << d << "x";
@@ -19,7 +26,7 @@ std::string format_memref_vmem(const std::vector<int64_t>& shape, DType dt) {
 }
 
 std::string format_vector_type(const std::vector<int64_t>& shape, DType dt) {
-    std::ostringstream oss;
+    std::ostringstream oss = make_classic_stream();
     oss << "vector<";
     for (int64_t d : shape) {
         oss << d << "x";
@@ -39,6 +46,8 @@ uint64_t fnv1a_64(const std::string& s) {
 
 class MosaicBuilder {
 public:
+    MosaicBuilder() : body_(make_classic_stream()) {}
+
     std::string next_val() { return "%" + std::to_string(next_id_++); }
 
     std::ostringstream& body() { return body_; }
@@ -446,7 +455,7 @@ MosaicEmitResult emit_mosaic_kernel(const TileKernel& kernel, int64_t mosaic_ver
 
     b.body() << "    \"stable_mosaic.func.return\"() : () -> ()\n";
 
-    std::ostringstream mod;
+    std::ostringstream mod = make_classic_stream();
     mod << "module attributes {stable_mosaic.version = " << version << " : i64} {\n";
     mod << "  \"stable_mosaic.func.func\"() ({\n";
     mod << "  ^bb0(";
@@ -474,7 +483,8 @@ MosaicEmitResult emit_mosaic_kernel(const TileKernel& kernel, int64_t mosaic_ver
         mod << kernel.grid.dims[i];
     }
     mod << ">, scalar_prefetch = 0 : i64, scratch_operands = " << kernel.scratch.size()
-        << " : i64, sym_name = \"" << kernel.name << "\", tpu.core_type = #tpu.core_type<tc>, window_params = [";
+        << " : i64, sym_name = \"" << escape_mlir_string_literal(kernel.name)
+        << "\", tpu.core_type = #tpu.core_type<tc>, window_params = [";
     for (size_t i = 0; i < kernel.operands.size(); ++i) {
         if (i > 0) mod << ", ";
         const auto& wb = kernel.operands[i].window_bounds;
@@ -521,7 +531,7 @@ MosaicEmitResult emit_mosaic_kernel(const TileKernel& kernel, int64_t mosaic_ver
         "\", \"serialization_format\": 1, \"needs_layout_passes\": true}}";
     res.kernel_name = kernel.name;
 
-    std::ostringstream key;
+    std::ostringstream key = make_classic_stream();
     key << std::hex << std::setfill('0') << std::setw(16) << fnv1a_64(res.mosaic_mlir)
         << "_" << std::dec << res.mosaic_mlir.size() << "_v" << version;
     res.cache_key = key.str();
