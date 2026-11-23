@@ -8,6 +8,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import sys
@@ -231,6 +232,7 @@ class FreeTpuCdiTests(unittest.TestCase):
                 iso_spec["devices"][-1]["containerEdits"]["env"],
                 [
                     "TPU_CHIPS_PER_HOST_BOUNDS=1,1,1",
+                    "TPU_ACCELERATOR_TYPE=v5litepod-1",
                     "MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353",
                     "TPU_HOST_BOUNDS=1,1,1",
                     "TPU_WORKER_HOSTNAMES=localhost",
@@ -251,6 +253,7 @@ class FreeTpuCdiTests(unittest.TestCase):
                     "TPU_VISIBLE_CHIPS=0",
                     "TPU_VISIBLE_DEVICES=0",
                     "TPU_CHIPS_PER_HOST_BOUNDS=1,1,1",
+                    "TPU_ACCELERATOR_TYPE=v5litepod-1",
                     "MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353",
                     "TPU_HOST_BOUNDS=1,1,1",
                     "TPU_WORKER_HOSTNAMES=localhost",
@@ -1837,6 +1840,7 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertNotIn("TPU_VISIBLE_CHIPS", all_env)
                 self.assertNotIn("TPU_VISIBLE_DEVICES", all_env)
                 self.assertEqual(all_env["TPU_CHIPS_PER_HOST_BOUNDS"], "2,2,1")
+                self.assertEqual(all_env["TPU_ACCELERATOR_TYPE"], "v6e-4")
                 self.assertEqual(all_env["MEGASCALE_COORDINATOR_ADDRESS"], "127.0.0.1:8353")
                 self.assertEqual(all_env["TPU_HOST_BOUNDS"], "1,1,1")
                 self.assertEqual(all_env["TPU_WORKER_HOSTNAMES"], "localhost")
@@ -1888,6 +1892,7 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertNotIn("TPU_VISIBLE_CHIPS", pci0_iso_env)
                 self.assertNotIn("TPU_VISIBLE_DEVICES", pci0_iso_env)
                 self.assertNotIn("TPU_CHIPS_PER_HOST_BOUNDS", pci0_iso_env)
+                self.assertNotIn("TPU_ACCELERATOR_TYPE", pci0_iso_env)
                 self.assertEqual(pci0_iso_env["MEGASCALE_COORDINATOR_ADDRESS"], "127.0.0.1:8353")
                 self.assertEqual(pci0_iso_env["TPU_WORKER_HOSTNAMES"], "localhost")
                 self.assertEqual(pci0_iso_env["TPU_WORKER_ID"], "0")
@@ -2019,6 +2024,32 @@ class FreeTpuCdiTests(unittest.TestCase):
                     "/dev/vfio/devices/vfio1",
                 )
                 self.assertIn("FREETPU_IOMMU_MODE=iommufd", spec["containerEdits"]["env"])
+
+                # 1b. Linux iommufd compatibility symlink (`/dev/vfio/vfio -> ../iommu`
+                #     without native `misc/vfio/dev`): default `vfio_mode="auto"` MUST
+                #     recognize the compatibility symlink and publish the verified iommufd spec!
+                compat_link = dev_root / "vfio" / "vfio"
+                os.symlink("../iommu", compat_link)
+                try:
+                    compat_chips, compat_ctrl = freetpu_cdi.discover_tpu_chips(
+                        sysfs_root=sysfs_root,
+                        dev_root=dev_root,
+                        vfio_mode="auto",
+                    )
+                    self.assertEqual(compat_ctrl, dev_root / "iommu")
+                    self.assertTrue(all(c.vfio_mode == "iommufd" for c in compat_chips))
+                    compat_spec = freetpu_cdi.build_cdi_spec(compat_chips, compat_ctrl)
+                    self.assertEqual(freetpu_cdi.validate_cdi_spec(compat_spec), [])
+                    self.assertEqual(
+                        freetpu_cdi.verify_spec_against_host(
+                            compat_spec,
+                            sysfs_root=sysfs_root,
+                            dev_root=dev_root,
+                        ),
+                        [],
+                    )
+                finally:
+                    compat_link.unlink(missing_ok=True)
 
                 # Incomplete iommufd spec lacking /dev/vfio/devices/vfioN must fail validation.
                 bad_iommufd = {
@@ -2285,6 +2316,7 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertNotIn("TPU_VISIBLE_CHIPS", n0_env)
                 self.assertNotIn("TPU_VISIBLE_DEVICES", n0_env)
                 self.assertEqual(n0_env["TPU_CHIPS_PER_HOST_BOUNDS"], "2,2,1")
+                self.assertEqual(n0_env["TPU_ACCELERATOR_TYPE"], "v6e-4")
                 self.assertEqual(n0_env["MEGASCALE_COORDINATOR_ADDRESS"], "127.0.0.1:8353")
 
                 # NUMA 1 slice strictly binds 0000:80:* with 2,2,1 bounds (visibility omitted).
@@ -2341,6 +2373,7 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertNotIn("TPU_VISIBLE_CHIPS", all_env)
                 self.assertNotIn("TPU_VISIBLE_DEVICES", all_env)
                 self.assertEqual(all_env["TPU_CHIPS_PER_HOST_BOUNDS"], "2,4,1")
+                self.assertEqual(all_env["TPU_ACCELERATOR_TYPE"], "v6e-8")
                 mapped_all_env = dict(
                     kv.split("=", 1) for kv in mapped_by_name["all"]["containerEdits"]["env"]
                 )
@@ -2548,8 +2581,13 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertEqual(all_7x["annotations"]["freetpu.dev/pci-function-count"], "8")
                 all_7x_env = dict(kv.split("=", 1) for kv in all_7x["containerEdits"]["env"])
                 self.assertEqual(all_7x_env["TPU_CHIPS_PER_HOST_BOUNDS"], "2,2,1")
+                self.assertEqual(all_7x_env["TPU_ACCELERATOR_TYPE"], "tpu7x-8")
                 self.assertEqual(all_7x_env["TPU_VISIBLE_CHIPS"], "0,1,2,3")
                 self.assertEqual(all_7x_env["TPU_VISIBLE_DEVICES"], "0,1,2,3,4,5,6,7")
+                # PyTorch/XLA `torch_xla/_internal/tpu.py` version regex must match every emitted type.
+                pytorch_xla_re = re.compile(r"^(?:v|tpu)(\d)([A-Za-z]?){7}-(\d+)$")
+                for atype in ("v5litepod-1", "v6e-4", "v6e-8", "tpu7x-4", "tpu7x-8"):
+                    self.assertRegex(atype, pytorch_xla_re)
                 # Each NUMA half holds 2 physical chips (4 logical devices):
                 # numa0 -> chips 0,1 / logical devices 0,1,2,3; numa1 -> chips 2,3 / devices 4,5,6,7.
                 numa0_7x_env = dict(
@@ -2557,6 +2595,7 @@ class FreeTpuCdiTests(unittest.TestCase):
                 )
                 self.assertEqual(len(by_name_7x["numa0"]["containerEdits"]["deviceNodes"]), 4)
                 self.assertEqual(numa0_7x_env["TPU_CHIPS_PER_HOST_BOUNDS"], "1,2,1")
+                self.assertEqual(numa0_7x_env["TPU_ACCELERATOR_TYPE"], "tpu7x-4")
                 self.assertEqual(numa0_7x_env["TPU_VISIBLE_CHIPS"], "0,1")
                 self.assertEqual(numa0_7x_env["TPU_VISIBLE_DEVICES"], "0,1,2,3")
 
@@ -2564,16 +2603,17 @@ class FreeTpuCdiTests(unittest.TestCase):
                     kv.split("=", 1) for kv in by_name_7x["numa1"]["containerEdits"]["env"]
                 )
                 self.assertEqual(numa1_7x_env["TPU_CHIPS_PER_HOST_BOUNDS"], "1,2,1")
+                self.assertEqual(numa1_7x_env["TPU_ACCELERATOR_TYPE"], "tpu7x-4")
                 self.assertEqual(numa1_7x_env["TPU_VISIBLE_CHIPS"], "2,3")
                 self.assertEqual(numa1_7x_env["TPU_VISIBLE_DEVICES"], "4,5,6,7")
 
-                # Ironwood 4-chip host missing 1 PCI function/chiplet (only 7 VFIO nodes):
-                # `all` MUST omit TPU_VISIBLE_CHIPS, TPU_VISIBLE_DEVICES, and
-                # TPU_CHIPS_PER_HOST_BOUNDS (never advertising 0..7 or 2,2,1!).
+                # Ironwood 4-chip host missing 1 PCI function/chiplet in NUMA 1 (only 7 VFIO nodes):
+                # `all` MUST omit TPU_VISIBLE_CHIPS, TPU_VISIBLE_DEVICES, TPU_CHIPS_PER_HOST_BOUNDS,
+                # and TPU_ACCELERATOR_TYPE (never advertising 0..7 or 2,2,1!).
                 root_7x_deg = root / "tpu7x_missing_chiplet"
                 sysfs_7x_deg, dev_7x_deg = _make_mock_pci_vfio(
                     root_7x_deg,
-                    devices=ironwood_devices[:7],  # drop 1 chiplet -> 7 functions
+                    devices=ironwood_devices[:7],  # drop 1 chiplet from NUMA 1 -> 7 functions
                     create_vfio_nodes=[str(i) for i in range(7)],
                 )
                 chips_7x_deg, ctrl_7x_deg = freetpu_cdi.discover_tpu_chips(
@@ -2590,8 +2630,44 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertNotIn("TPU_VISIBLE_CHIPS", all_7x_deg_env)
                 self.assertNotIn("TPU_VISIBLE_DEVICES", all_7x_deg_env)
                 self.assertNotIn("TPU_CHIPS_PER_HOST_BOUNDS", all_7x_deg_env)
+                self.assertNotIn("TPU_ACCELERATOR_TYPE", all_7x_deg_env)
                 self.assertNotIn("numa1", by_name_7x_deg)
                 self.assertIn("numa0", by_name_7x_deg)
+
+                # Ironwood 4-chip host missing 1 PCI function in the FIRST root (NUMA 0 has 3
+                # functions, NUMA 1 still has all 4 functions): unmatched NUMA 0 function MUST
+                # NOT pair across topology domains with NUMA 1 — `numa0` is withdrawn while
+                # healthy 4-function `numa1` remains published!
+                root_7x_deg0 = root / "tpu7x_missing_first_root_chiplet"
+                sysfs_7x_deg0, dev_7x_deg0 = _make_mock_pci_vfio(
+                    root_7x_deg0,
+                    devices=ironwood_devices[1:],  # drop 1 chiplet from FIRST root (NUMA 0)
+                    create_vfio_nodes=[str(i) for i in range(1, 8)],
+                )
+                chips_7x_deg0, ctrl_7x_deg0 = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=sysfs_7x_deg0, dev_root=dev_7x_deg0
+                )
+                spec_7x_deg0 = freetpu_cdi.build_cdi_spec(
+                    chips_7x_deg0, ctrl_7x_deg0, single_host_env=True
+                )
+                by_name_7x_deg0 = {d["name"]: d for d in spec_7x_deg0["devices"]}
+                self.assertNotIn("numa0", by_name_7x_deg0)
+                self.assertIn("numa1", by_name_7x_deg0)
+                self.assertIn("2-3", by_name_7x_deg0)
+                self.assertEqual(len(by_name_7x_deg0["numa1"]["containerEdits"]["deviceNodes"]), 4)
+                n1_deg0_env = dict(
+                    kv.split("=", 1) for kv in by_name_7x_deg0["numa1"]["containerEdits"]["env"]
+                )
+                self.assertEqual(n1_deg0_env["TPU_CHIPS_PER_HOST_BOUNDS"], "1,2,1")
+                self.assertEqual(n1_deg0_env["TPU_ACCELERATOR_TYPE"], "tpu7x-4")
+                self.assertEqual(n1_deg0_env["TPU_VISIBLE_CHIPS"], "2,3")
+                self.assertEqual(n1_deg0_env["TPU_VISIBLE_DEVICES"], "4,5,6,7")
+                all_7x_deg0_env = dict(
+                    kv.split("=", 1) for kv in by_name_7x_deg0["all"]["containerEdits"]["env"]
+                )
+                self.assertNotIn("TPU_VISIBLE_CHIPS", all_7x_deg0_env)
+                self.assertNotIn("TPU_CHIPS_PER_HOST_BOUNDS", all_7x_deg0_env)
+                self.assertNotIn("TPU_ACCELERATOR_TYPE", all_7x_deg0_env)
 
             # Verify PCIe root resolution from sysfs ancestry when endpoints sit behind
             # PCIe switches on distinct downstream bus numbers (without numa_node files).
@@ -2731,7 +2807,9 @@ class FreeTpuCdiTests(unittest.TestCase):
             self.assertIn("--chip-id-map", readme_text)
             self.assertIn("-e TPU_VISIBLE_CHIPS=", readme_text)
             self.assertIn("-e TPU_VISIBLE_DEVICES=", readme_text)
+            self.assertIn("TPU_ACCELERATOR_TYPE", readme_text)
             self.assertIn("--chip-id-map", dra_text)
+            self.assertIn("TPU_ACCELERATOR_TYPE", dra_text)
 
 
 if __name__ == "__main__":

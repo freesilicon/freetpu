@@ -453,14 +453,32 @@ def discover_tpu_chips(
     has_legacy_control = legacy_control.exists() or legacy_control.is_symlink()
     has_iommu_control = effective_iommu.exists() or effective_iommu.is_symlink()
 
+    legacy_is_iommu_compat = False
+    if has_legacy_control and has_iommu_control:
+        if legacy_control.is_symlink():
+            try:
+                legacy_is_iommu_compat = os.path.realpath(legacy_control) == os.path.realpath(
+                    effective_iommu
+                )
+            except OSError:
+                legacy_is_iommu_compat = False
+        elif _read_kernel_vfio_devnum(sysfs_root) is None:
+            kernel_iommu_dn = _read_kernel_iommu_devnum(sysfs_root)
+            if (
+                kernel_iommu_dn is not None
+                and _stat_char_devnum(legacy_control) == kernel_iommu_dn
+            ):
+                legacy_is_iommu_compat = True
+
     if norm_mode == "iommufd":
         use_iommufd = True
     elif norm_mode == "legacy":
         use_iommufd = False
     else:
-        # auto: preserve legacy VFIO whenever its control node exists (or dry-run);
-        # use iommufd only when legacy /dev/vfio/vfio is absent and /dev/iommu exists.
-        use_iommufd = (not has_legacy_control) and has_iommu_control
+        # auto: preserve native legacy VFIO whenever its control node exists;
+        # use iommufd when legacy /dev/vfio/vfio is absent OR is a compatibility
+        # symlink/node to /dev/iommu and /dev/iommu exists.
+        use_iommufd = ((not has_legacy_control) or legacy_is_iommu_compat) and has_iommu_control
 
     if use_iommufd:
         control_node = effective_iommu
@@ -706,7 +724,12 @@ def _map_physical_chip_indices(chips: Sequence[DiscoveredChip]) -> Dict[str, int
         slot_counts[key] = slot_counts.get(key, 0) + 1
 
     slot_to_phys: Dict[Tuple[str, str], int] = {}
-    gen_pending_phys: Dict[str, Tuple[int, int]] = {}  # gen -> (phys_id, remaining_slots)
+    # Key unmatched separate-slot functions by `(generation, topology_domain)` so
+    # losing a function in one NUMA/PCIe root NEVER pairs with or invalidates a
+    # healthy sibling slice in another topology domain.
+    domain_pending_phys: Dict[
+        Tuple[str, Tuple[str, Optional[int], str]], Tuple[int, int]
+    ] = {}
     next_phys = 0
 
     for c in chips:
@@ -725,19 +748,20 @@ def _map_physical_chip_indices(chips: Sequence[DiscoveredChip]) -> Dict[str, int
             bdf_to_phys[c.pci_bdf] = slot_to_phys[slot_key]
             continue
 
-        pending = gen_pending_phys.get(c.generation)
+        pending_key = (c.generation, _topology_domain_key(c))
+        pending = domain_pending_phys.get(pending_key)
         if pending is not None and pending[1] > 0:
             phys_id, rem = pending
             bdf_to_phys[c.pci_bdf] = phys_id
             if rem - 1 > 0:
-                gen_pending_phys[c.generation] = (phys_id, rem - 1)
+                domain_pending_phys[pending_key] = (phys_id, rem - 1)
             else:
-                gen_pending_phys.pop(c.generation, None)
+                domain_pending_phys.pop(pending_key, None)
         else:
             phys_id = next_phys
             next_phys += 1
             bdf_to_phys[c.pci_bdf] = phys_id
-            gen_pending_phys[c.generation] = (phys_id, per_chip - 1)
+            domain_pending_phys[pending_key] = (phys_id, per_chip - 1)
 
     return bdf_to_phys
 
@@ -910,6 +934,38 @@ def _logical_device_indices(
     return [c.index for c in subset]
 
 
+def _tpu_accelerator_type(
+    physical_chip_count: int,
+    generations: Sequence[str],
+) -> Optional[str]:
+    """Return Google Cloud / PyTorch-XLA `TPU_ACCELERATOR_TYPE` for a supported single-host slice.
+
+    Matches PyTorch/XLA `torch_xla/_internal/tpu.py` (`^(?:v|tpu)(\\d)([A-Za-z]?){7}-(\\d+)$`):
+    - `v6e` / `v6e-pf` -> `v6e-<chips>` (e.g. `v6e-4`, `v6e-8`)
+    - `v5e` -> `v5litepod-<chips>` (e.g. `v5litepod-1`, `v5litepod-4`, `v5litepod-8`)
+    - `v5p` -> `v5p-<cores>` (`chips * 2`, e.g. `v5p-8`)
+    - `v4` -> `v4-<cores>` (`chips * 2`, e.g. `v4-8`)
+    - `tpu7x` (Ironwood) -> `tpu7x-<cores>` (`chips * 2`, e.g. `tpu7x-4`, `tpu7x-8`)
+    """
+    if physical_chip_count not in _SUPPORTED_SINGLE_HOST_CHIP_COUNTS:
+        return None
+    norm_gens = {"v6e" if g == "v6e-pf" else g for g in generations if g}
+    if len(norm_gens) != 1:
+        return None
+    gen = next(iter(norm_gens))
+    if gen == "v6e":
+        return f"v6e-{physical_chip_count}"
+    if gen == "v5e":
+        return f"v5litepod-{physical_chip_count}"
+    if gen == "v5p":
+        return f"v5p-{physical_chip_count * 2}"
+    if gen == "v4":
+        return f"v4-{physical_chip_count * 2}"
+    if gen == "tpu7x":
+        return f"tpu7x-{physical_chip_count * 2}"
+    return None
+
+
 def _build_device_env(
     physical_chip_count: int,
     generations: Sequence[str],
@@ -925,15 +981,16 @@ def _build_device_env(
     host bounds. When `single_host_env=True` is explicitly opted in:
     - All selectors receive isolated loopback Megascale / single-host overrides.
     - Full-allocation / slice selectors (`numa*`, `pcie*`, `0-3`/`4-7`, `all`)
-      with supported complete chip counts receive `TPU_CHIPS_PER_HOST_BOUNDS`.
+      with supported complete chip counts receive `TPU_CHIPS_PER_HOST_BOUNDS`
+      and `TPU_ACCELERATOR_TYPE` (required by PyTorch/XLA when metadata
+      discovery is disabled via `TPU_SKIP_MDS_QUERY=true`).
     - `TPU_VISIBLE_CHIPS` and `TPU_VISIBLE_DEVICES` are emitted ONLY when
       `verified_visibility` supplies verified runtime ordinals (from sysfs
-      `chip_id`, explicit `--chip-id-map`, or a complete full-host `all`
-      allocation), preserving workload-provided visibility when ordinals are
-      unverified on sub-host slices.
+      `chip_id` or explicit `--chip-id-map`), preserving workload-provided
+      visibility when ordinals are unverified.
     - Independently composable unit selectors (`pci-*`, `group-pci-*`) omit
-      visibility and host bounds so combining multiple selectors never
-      overwrites visibility in OCI env merging.
+      visibility, host bounds, and accelerator type so combining multiple
+      selectors never overwrites OCI env settings.
     """
     if not single_host_env:
         return []
@@ -949,6 +1006,9 @@ def _build_device_env(
             env.append("TPU_VISIBLE_DEVICES=" + ",".join(str(idx) for idx in vis_devices))
         bounds = _chips_per_host_bounds(physical_chip_count, generations)
         env.append(f"TPU_CHIPS_PER_HOST_BOUNDS={bounds}")
+        accel_type = _tpu_accelerator_type(physical_chip_count, generations)
+        if accel_type is not None:
+            env.append(f"TPU_ACCELERATOR_TYPE={accel_type}")
     env.extend(
         [
             "MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353",

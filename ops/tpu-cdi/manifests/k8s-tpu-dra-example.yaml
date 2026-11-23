@@ -8,9 +8,9 @@
 #   `--network-mode isolated`), CDI (default v0.6.0, opt-in --cdi-version 1.1.0)
 #   injects MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353, TPU_HOST_BOUNDS=1,1,1,
 #   TPU_WORKER_HOSTNAMES=localhost, TPU_WORKER_ID=0, TPU_SKIP_MDS_QUERY=true,
-#   and slice-scoped TPU_CHIPS_PER_HOST_BOUNDS=2,2,1 on slice selectors so two
-#   independent 4-chip workloads can share one v6e-8 host without port 8353
-#   collisions or hostNetwork privilege escalation. When sysfs `chip_id` files
+#   TPU_CHIPS_PER_HOST_BOUNDS=2,2,1, and TPU_ACCELERATOR_TYPE=v6e-4 on slice
+#   selectors so two independent 4-chip workloads can share one v6e-8 host
+#   without port 8353 collisions or hostNetwork privilege escalation. When sysfs `chip_id` files
 #   are present (or `--chip-id-map <json>` is passed to `freetpu_cdi.py`), CDI
 #   also injects verified TPU_VISIBLE_CHIPS and TPU_VISIBLE_DEVICES; on hosts
 #   without sysfs `chip_id` and without `--chip-id-map`, set TPU_VISIBLE_CHIPS
