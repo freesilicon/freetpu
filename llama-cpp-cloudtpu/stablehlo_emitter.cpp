@@ -836,13 +836,16 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                 const int64_t B3 = upd.dims[0];
                 const int64_t B2 = upd.dims[1];
                 const int64_t N_upd = upd.dims[2];
+                // Preserve S64 indices to avoid truncating valid >INT32_MAX row indices.
+                const PjrtDType idx_dt =
+                    (idx_raw.dtype == PjrtDType::S64) ? PjrtDType::S64 : PjrtDType::S32;
                 // idx_raw GGML [N_upd, B2_i, B3_i, 1] -> HLO [1, B3_i, B2_i, N_upd] -> reshape [B3_i, B2_i, N_upd, 1]
-                SsaValue idx_s32 = builder.emit_convert(idx_raw, PjrtDType::S32);
-                SsaValue idx_4d = builder.emit_reshape(idx_s32, {idx_raw.dims[1], idx_raw.dims[2], idx_raw.dims[3], 1});
+                SsaValue idx_typed = builder.emit_convert(idx_raw, idx_dt);
+                SsaValue idx_4d = builder.emit_reshape(idx_typed, {idx_raw.dims[1], idx_raw.dims[2], idx_raw.dims[3], 1});
                 const std::vector<int64_t> idx_col_dims = {B3, B2, N_upd, 1};
                 SsaValue idx_b = broadcast_4d(builder, idx_4d, idx_col_dims);
-                SsaValue idx3 = builder.emit_iota(0, idx_col_dims, PjrtDType::S32);
-                SsaValue idx2 = builder.emit_iota(1, idx_col_dims, PjrtDType::S32);
+                SsaValue idx3 = builder.emit_iota(0, idx_col_dims, idx_dt);
+                SsaValue idx2 = builder.emit_iota(1, idx_col_dims, idx_dt);
                 SsaValue scatter_indices = builder.emit_concatenate({idx3, idx2, idx_b}, 3);
                 SsaValue scattered = builder.emit_scatter_3d_rows(tbl, scatter_indices, upd);
                 result = builder.emit_convert(scattered, op.dst.dtype);

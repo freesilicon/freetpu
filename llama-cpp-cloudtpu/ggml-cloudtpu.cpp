@@ -161,9 +161,21 @@ static const struct ggml_tensor* view_parent(const struct ggml_tensor* t) {
     return t->view_src;
 }
 
-static bool try_build_view_slice(const struct ggml_tensor* t, ViewSlicePlan* plan) {
+static bool try_build_view_slice(const struct ggml_tensor* t,
+                                 ViewSlicePlan* plan,
+                                 const struct ggml_tensor** out_base = nullptr) {
     const struct ggml_tensor* base = view_parent(t);
-    if (!t || !base || t->type != base->type || !is_dense_supported_type(t->type)) {
+    if (!t || !base) {
+        return false;
+    }
+    // Nested views (e.g. packed QKV -> strided K/V view -> 2D KV update view) can have a
+    // strided immediate parent; fall back to the contiguous root tensor t->view_src where
+    // GGML already accumulated the byte offset t->view_offs.
+    if (!ggml_is_contiguous(base) && t->view_src != nullptr && t->view_src != base &&
+        ggml_is_contiguous(t->view_src)) {
+        base = t->view_src;
+    }
+    if (t->type != base->type || !is_dense_supported_type(t->type)) {
         return false;
     }
     if (!ggml_is_contiguous(base)) {
@@ -185,6 +197,9 @@ static bool try_build_view_slice(const struct ggml_tensor* t, ViewSlicePlan* pla
             plan->reshape_dims = {base_nels};
             plan->starts = {elem_off};
             plan->limits = {elem_off + view_nels};
+        }
+        if (out_base) {
+            *out_base = base;
         }
         return true;
     }
@@ -240,6 +255,9 @@ static bool try_build_view_slice(const struct ggml_tensor* t, ViewSlicePlan* pla
                     plan->starts = {o2, o1, o0};
                     plan->limits = {o2 + t->ne[2], o1 + t->ne[1], o0 + t->ne[0]};
                 }
+                if (out_base) {
+                    *out_base = base;
+                }
                 return true;
             }
         }
@@ -263,6 +281,9 @@ static bool try_build_view_slice(const struct ggml_tensor* t, ViewSlicePlan* pla
         plan->reshape_dims = {D3, D2, D1, D0};
         plan->starts = {o3, o2, o1, o0};
         plan->limits = {o3 + t->ne[3], o2 + t->ne[2], o1 + t->ne[1], o0 + t->ne[0]};
+    }
+    if (out_base) {
+        *out_base = base;
     }
     return true;
 }
@@ -388,10 +409,11 @@ static bool is_supported_input_layout(const struct ggml_tensor* t, int depth = 0
         return is_supported_input_layout(parent, depth + 1);
     }
     if (t->op == GGML_OP_VIEW || t->op == GGML_OP_NONE) {
-        if (!try_build_view_slice(t, nullptr)) {
+        const struct ggml_tensor* slice_base = nullptr;
+        if (!try_build_view_slice(t, nullptr, &slice_base)) {
             return false;
         }
-        return is_supported_input_layout(parent, depth + 1);
+        return is_supported_input_layout(slice_base, depth + 1);
     }
     return is_supported_output_layout(t);
 }
@@ -818,7 +840,8 @@ static bool patch_view_into_root_slot_locked(cloudtpu::PjrtRuntime& rt,
                                              size_t offset,
                                              size_t size,
                                              const void* src_data,
-                                             uint8_t fill_value) {
+                                             uint8_t fill_value,
+                                             bool flush_now) {
     if (!view_tensor || view_tensor->view_src == nullptr) {
         return false;
     }
@@ -868,7 +891,11 @@ static bool patch_view_into_root_slot_locked(cloudtpu::PjrtRuntime& rt,
     } else {
         std::memset(parent.staging.data() + rel, fill_value, size);
     }
-    upload_raw_tensor_to_slot(rt, bctx->device_index, parent, root, parent.staging.data());
+    // Keep partial host writes batched in staging until device execution needs the tensor
+    // (avoids repeated full-tensor D2H+H2D roundtrips during session KV restore).
+    if (flush_now) {
+        upload_raw_tensor_to_slot(rt, bctx->device_index, parent, root, parent.staging.data());
+    }
     return true;
 }
 
@@ -886,7 +913,8 @@ static void ggml_backend_cloudtpu_buffer_memset_tensor(ggml_backend_buffer_t buf
     const size_t t_bytes = ggml_nbytes(tensor);
 
     std::lock_guard<std::mutex> lock(bctx->mu);
-    if (patch_view_into_root_slot_locked(rt, bctx, buffer, tensor, t_off, offset, size, nullptr, value)) {
+    if (patch_view_into_root_slot_locked(
+            rt, bctx, buffer, tensor, t_off, offset, size, nullptr, value, /*flush_now=*/false)) {
         return;
     }
     bctx->evict_overlapping_locked(t_off, t_bytes, t_off);
@@ -923,7 +951,8 @@ static void ggml_backend_cloudtpu_buffer_set_tensor(ggml_backend_buffer_t buffer
     const size_t t_bytes = ggml_nbytes(tensor);
 
     std::lock_guard<std::mutex> lock(bctx->mu);
-    if (patch_view_into_root_slot_locked(rt, bctx, buffer, tensor, t_off, offset, size, data, 0)) {
+    if (patch_view_into_root_slot_locked(
+            rt, bctx, buffer, tensor, t_off, offset, size, data, 0, /*flush_now=*/false)) {
         return;
     }
     bctx->evict_overlapping_locked(t_off, t_bytes, t_off);
@@ -1704,7 +1733,8 @@ static void store_tensor_hbm(cloudtpu::PjrtRuntime& rt,
                 rt.buffer_to_host(buf->handle.get(), slice_bytes.data(), t_bytes);
                 std::lock_guard<std::mutex> lock(bctx->mu);
                 if (patch_view_into_root_slot_locked(
-                        rt, bctx, t->buffer, t, t_off, 0, t_bytes, slice_bytes.data(), 0)) {
+                        rt, bctx, t->buffer, t, t_off, 0, t_bytes, slice_bytes.data(), 0,
+                        /*flush_now=*/true)) {
                     return;
                 }
             }
@@ -1990,8 +2020,9 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
                 return rid;
             }
             ViewSlicePlan vplan;
-            if (try_build_view_slice(t, &vplan)) {
-                const uint64_t base_id = self(self, parent);
+            const struct ggml_tensor* slice_base = nullptr;
+            if (try_build_view_slice(t, &vplan, &slice_base)) {
+                const uint64_t base_id = self(self, slice_base);
                 const uint64_t sid = next_id++;
                 cloudtpu::OpNodeSpec s_op;
                 s_op.kind = cloudtpu::CloudOpKind::SLICE;

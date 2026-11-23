@@ -770,6 +770,30 @@ void test_q4_k_split_mul_mat(cloudtpu::PjrtRuntime& rt) {
     }
     check_vec_close(got, expected, 1e-4f, "Q4_K_SPLIT MUL_MAT");
     std::printf("  [PASS] Q4_K_SPLIT MUL_MAT (rank-4 scales & mins)\n");
+
+    // Verify SET_ROWS preserves 64-bit scatter indices (i64, not narrowed to i32).
+    const std::vector<float> tbl_init = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+    const std::vector<float> upd_vals = {9.0f, 8.0f};
+    const std::vector<int64_t> row_idx64 = {1};
+    auto b_upd = rt.buffer_from_host(0, upd_vals.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, 2});
+    auto b_idx = rt.buffer_from_host(0, row_idx64.data(), cloudtpu::PjrtDType::S64, {1, 1, 1, 1});
+    auto b_tbl = rt.buffer_from_host(0, tbl_init.data(), cloudtpu::PjrtDType::F32, {1, 1, 3, 2});
+    cloudtpu::GraphProgramSpec sr_spec;
+    sr_spec.inputs.push_back({1, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 2}});
+    sr_spec.inputs.push_back({2, cloudtpu::PjrtDType::S64, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 1}});
+    sr_spec.inputs.push_back({3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 3, 2}});
+    cloudtpu::OpNodeSpec sr_op;
+    sr_op.kind = cloudtpu::CloudOpKind::SET_ROWS;
+    sr_op.src_ids = {1, 2, 3};
+    sr_op.dst = {4, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 3, 2}};
+    sr_spec.ops.push_back(sr_op);
+    sr_spec.output_ids = {4};
+    const auto sr_prog = cloudtpu::emit_stablehlo_program(sr_spec);
+    CHECK_TRUE(sr_prog.mlir_text.find("tensor<1x1x1x3xi64>") != std::string::npos,
+               "SET_ROWS with S64 indices must preserve i64 scatter coordinates");
+    const auto sr_out = run_emitted(rt, sr_prog, {b_upd, b_idx, b_tbl});
+    check_vec_close(sr_out, {1.0f, 2.0f, 9.0f, 8.0f, 5.0f, 6.0f}, 1e-6f, "SET_ROWS S64");
+    std::printf("  [PASS] SET_ROWS preserves 64-bit scatter indices\n");
 }
 
 }  // namespace
