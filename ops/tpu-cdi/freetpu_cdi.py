@@ -3830,6 +3830,12 @@ def reconcile_cdi_spec(
     }
     for d_k, bdfs_s in _load_same_boot_observed_domains(output_path).items():
         prior_observed.setdefault(d_k, set()).update(bdfs_s)
+    # Persist recovered same-boot PCI inventory into caller-managed sync state
+    # BEFORE discovery can fail and unlink `output_path`, so a failed tick 1
+    # (e.g. 0 VFIO nodes) never erases previously observed endpoints before tick 2.
+    if observed_domain_bdfs is not None:
+        for d_k, bdfs_s in prior_observed.items():
+            observed_domain_bdfs.setdefault(d_k, set()).update(bdfs_s)
 
     try:
         chips, vfio_container, full_pci_inventory = _discover_tpu_chips_with_inventory(
@@ -3841,8 +3847,9 @@ def reconcile_cdi_spec(
         )
         merged_observed = _merge_observed_domain_bdfs(prior_observed, full_pci_inventory)
         if observed_domain_bdfs is not None:
+            observed_domain_bdfs.clear()
             for d_k, bdfs_s in merged_observed.items():
-                observed_domain_bdfs.setdefault(d_k, set()).update(bdfs_s)
+                observed_domain_bdfs[d_k] = set(bdfs_s)
         spec = build_cdi_spec(
             chips,
             vfio_container,
@@ -4481,7 +4488,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         last_msg = ""
         interval = max(1.0, float(args.interval))
-        sync_observed_domains: Dict[Tuple[str, Optional[int], str], set[str]] = {}
+        sync_observed_domains: Dict[Tuple[str, Optional[int], str], set[str]] = (
+            _load_same_boot_observed_domains(args.output)
+        )
         while not stop_requested:
             tick_chip_map = parsed_chip_map
             if chip_map_is_file:

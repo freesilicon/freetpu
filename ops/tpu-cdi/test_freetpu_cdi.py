@@ -6462,6 +6462,124 @@ class FreeTpuCdiTests(unittest.TestCase):
                 dev_names2 = {d["name"] for d in upgraded2["devices"]}
                 self.assertIn("numa0-pcie-0000-00-4", dev_names2)
 
+    def test_sync_restart_retains_observed_inventory_when_first_tick_fails_and_deletes_spec(self) -> None:
+        import shutil
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # Single-root 8-chip v6e host (no NUMA locality).
+            all_devs = [
+                {
+                    "bdf": f"0000:00:{4 + i:02x}.0",
+                    "vendor": "0x1ae0",
+                    "device": "0x006f",
+                    "driver": "vfio-pci",
+                    "iommu_group": str(i),
+                }
+                for i in range(8)
+            ]
+            sysfs_root, dev_root = _make_mock_pci_vfio(
+                root / "sync_restart_v6e8",
+                devices=all_devs,
+                create_vfio_nodes=[str(i) for i in range(8)],
+            )
+            spec_path = root / "cdi" / "v6e8_sync.json"
+
+            with _mock_vfio_char_devices():
+                # Publish healthy initial v6e-8 spec recording all 8 BDFs.
+                rc_init, _oi, err_init = _run_cli_inproc(
+                    [
+                        "generate",
+                        "--output",
+                        str(spec_path),
+                        "--single-host-env",
+                        "--validate",
+                        "--sysfs-root",
+                        str(sysfs_root),
+                        "--dev-root",
+                        str(dev_root),
+                    ]
+                )
+                self.assertEqual(rc_init, 0, err_init)
+                self.assertTrue(spec_path.exists())
+
+                # Before `sync` restarts, lose ALL 8 VFIO nodes so tick 1 fails
+                # discovery and deletes `spec_path`.
+                for i in range(8):
+                    (dev_root / "vfio" / str(i)).unlink()
+
+                sig_handlers: dict[int, object] = {}
+                sleep_count = [0]
+                mono_now = [0.0]
+
+                def _fake_signal(signum: int, handler: object) -> None:
+                    sig_handlers[signum] = handler
+
+                def _fake_sleep(_secs: float) -> None:
+                    sleep_count[0] += 1
+                    mono_now[0] += 2.0
+                    if sleep_count[0] == 1:
+                        # Tick 1 must have deleted the stale spec on 0-VFIO discovery failure.
+                        self.assertFalse(spec_path.exists())
+                        # Now drop 4 PCI functions (4..7) and restore VFIO ONLY for survivors (0..3).
+                        for i in range(4, 8):
+                            bdf = all_devs[i]["bdf"]
+                            pci_ep = sysfs_root / "bus" / "pci" / "devices" / bdf
+                            if pci_ep.is_symlink() or pci_ep.is_file():
+                                pci_ep.unlink()
+                            elif pci_ep.is_dir():
+                                shutil.rmtree(pci_ep)
+                            grp_dir = sysfs_root / "kernel" / "iommu_groups" / str(i)
+                            if grp_dir.exists():
+                                shutil.rmtree(grp_dir)
+                        for i in range(4):
+                            (dev_root / "vfio" / str(i)).write_text("", encoding="utf-8")
+                    elif sleep_count[0] >= 2:
+                        handler = sig_handlers.get(freetpu_cdi.signal.SIGTERM)
+                        if callable(handler):
+                            handler(freetpu_cdi.signal.SIGTERM, None)
+
+                def _fake_mono() -> float:
+                    return mono_now[0]
+
+                with (
+                    mock.patch.object(freetpu_cdi.signal, "signal", side_effect=_fake_signal),
+                    mock.patch.object(freetpu_cdi.time, "sleep", side_effect=_fake_sleep),
+                    mock.patch.object(freetpu_cdi.time, "monotonic", side_effect=_fake_mono),
+                ):
+                    rc_sync, _os, err_sync = _run_cli_inproc(
+                        [
+                            "sync",
+                            "--interval",
+                            "1",
+                            "--output",
+                            str(spec_path),
+                            "--single-host-env",
+                            "--sysfs-root",
+                            str(sysfs_root),
+                            "--dev-root",
+                            str(dev_root),
+                        ]
+                    )
+                self.assertEqual(rc_sync, 0, err_sync)
+                self.assertGreaterEqual(sleep_count[0], 2)
+                self.assertTrue(spec_path.exists())
+                rep_spec = json.loads(spec_path.read_text(encoding="utf-8"))
+                dev_names = {d["name"] for d in rep_spec["devices"]}
+                self.assertFalse(
+                    any(n.startswith(("pcie-", "numa")) for n in dev_names),
+                    f"Sync must remember 8-BDF inventory after failed tick 1 and withhold 4-chip slice: {dev_names}",
+                )
+                all_dev = next(d for d in rep_spec["devices"] if d["name"] == "all")
+                all_env = dict(
+                    kv.split("=", 1) for kv in all_dev["containerEdits"].get("env", [])
+                )
+                self.assertNotIn("TPU_CHIPS_PER_HOST_BOUNDS", all_env)
+                self.assertNotIn("TPU_ACCELERATOR_TYPE", all_env)
+                obs_ann = rep_spec["annotations"].get("freetpu.dev/observed-domain-bdfs", "")
+                for d_rec in all_devs:
+                    self.assertIn(d_rec["bdf"], obs_ann)
+
 
 if __name__ == "__main__":
     unittest.main()

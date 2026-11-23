@@ -6958,6 +6958,285 @@ TPU Runtime Utilization
                 f"Optional duty RPC must leave serialization reserve (< {helper_timeout_s}s), got {seen_rpc_timeout}",
             )
 
+    def test_prometheus_rule_files_v6e_mismatched_duty_ids_v2_rep_group_pid_and_parent_deadline(self) -> None:
+        from types import SimpleNamespace
+        import types
+        from unittest import mock
+
+        # 1. Companion Prometheus scrape config MUST load `prometheus-alerts.yml` via `rule_files`.
+        exporter_dir = Path(__file__).resolve().parent
+        scrape_yml = (exporter_dir / "prometheus-scrape.yml").read_text(encoding="utf-8")
+        self.assertRegex(scrape_yml, r"(?m)^rule_files:\s*$")
+        self.assertIn('"prometheus-alerts.yml"', scrape_yml)
+        self.assertTrue((exporter_dir / "prometheus-alerts.yml").exists())
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            # 2. v6e sidecar where `get_chip_usage()` returns HBM rows `{0, 1}` zipped
+            #    with misassigned nonzero duties `(35.0, 88.0)` while raw protobuf duty
+            #    carries IDs `{1: 35.0, 2: 88.0}`:
+            #    - device 0 MUST have `duty_cycle_percent is None` (NOT 35.0!)
+            #    - device 1 MUST have `duty_cycle_percent == 35.0` (ID 1, NOT ID 2's 88.0!)
+            #    - ID 2's 88.0 MUST NOT attach to any joined device and appears only in unjoined duty.
+            v6e_sys, v6e_dev, v6e_proc = _make_mock_pci_tree(
+                root / "v6e_mismatched_duty",
+                devices=[
+                    {
+                        "bdf": "0000:00:04.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                        "chip_id": "0",
+                    },
+                    {
+                        "bdf": "0000:00:05.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "1",
+                        "chip_id": "1",
+                    },
+                ],
+                create_vfio_nodes=["0", "1"],
+            )
+
+            class _AttrInt:
+                def __init__(self, cid: int) -> None:
+                    self.int_attr = cid
+
+                def WhichOneof(self, name: str) -> Optional[str]:
+                    return "int_attr" if name == "attr" else None
+
+            class _GaugeDbl:
+                def __init__(self, val: float) -> None:
+                    self.as_double = float(val)
+
+                def WhichOneof(self, name: str) -> Optional[str]:
+                    return "as_double" if name == "value" else None
+
+                def HasField(self, field: str) -> bool:
+                    return field == "as_double"
+
+            fake_dev_mod = types.ModuleType("tpu_info.device")
+            fake_dev_mod.TpuChip = SimpleNamespace(V6E="V6E")
+            fake_metrics_mod = types.ModuleType("tpu_info.metrics")
+            fake_metrics_mod.get_chip_usage = lambda chip, addr=None: [
+                SimpleNamespace(
+                    device_id=0,
+                    memory_usage=4 * 1024**3,
+                    total_memory=32 * 1024**3,
+                    duty_cycle_pct=35.0,  # misassigned from raw ID 1!
+                ),
+                SimpleNamespace(
+                    device_id=1,
+                    memory_usage=8 * 1024**3,
+                    total_memory=32 * 1024**3,
+                    duty_cycle_pct=88.0,  # misassigned from raw ID 2!
+                ),
+            ]
+            fake_grpc = types.ModuleType("grpc")
+            fake_grpc.insecure_channel = lambda addr, options=None: SimpleNamespace(close=lambda: None)
+            fake_pb2 = types.ModuleType("tpu_info.proto.tpu_metric_service_pb2")
+            fake_pb2.MetricRequest = lambda metric_name="": SimpleNamespace(metric_name=metric_name)
+
+            class _MismatchStub:
+                def __init__(self, _ch: Any) -> None:
+                    pass
+
+                def GetRuntimeMetric(self, _req: Any, timeout: float = 1.0) -> Any:
+                    return SimpleNamespace(
+                        metric=SimpleNamespace(
+                            metrics=[
+                                SimpleNamespace(
+                                    attribute=SimpleNamespace(value=_AttrInt(1)),
+                                    gauge=_GaugeDbl(35.0),
+                                ),
+                                SimpleNamespace(
+                                    attribute=SimpleNamespace(value=_AttrInt(2)),
+                                    gauge=_GaugeDbl(88.0),
+                                ),
+                            ]
+                        )
+                    )
+
+            fake_pb2_grpc = types.ModuleType("tpu_info.proto.tpu_metric_service_pb2_grpc")
+            fake_pb2_grpc.RuntimeMetricServiceStub = _MismatchStub
+            with (
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "tpu_info": types.ModuleType("tpu_info"),
+                        "tpu_info.device": fake_dev_mod,
+                        "tpu_info.metrics": fake_metrics_mod,
+                    },
+                ),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_query_grpc_runtime_metrics",
+                    return_value=(False, "direct grpc down", {}),
+                ),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_load_grpc_runtime_modules",
+                    return_value=(fake_grpc, fake_pb2, fake_pb2_grpc),
+                ),
+            ):
+                mm_snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=v6e_sys,
+                    dev_root=v6e_dev,
+                    proc_root=v6e_proc,
+                    skip_pid_scan=True,
+                    runtime_metrics_addr="127.0.0.1:59451",
+                    shm_root=root / "no-shm",
+                )
+            mm_by_bdf = {d.pci_bdf: d for d in mm_snap.devices}
+            self.assertEqual(mm_by_bdf["0000:00:04.0"].hbm_used_bytes, 4 * 1024**3)
+            self.assertIsNone(mm_by_bdf["0000:00:04.0"].duty_cycle_percent)
+            self.assertEqual(mm_by_bdf["0000:00:05.0"].hbm_used_bytes, 8 * 1024**3)
+            self.assertAlmostEqual(mm_by_bdf["0000:00:05.0"].duty_cycle_percent or 0.0, 35.0)
+            mm_prom = tpu_exporter.format_prometheus_metrics(mm_snap)
+            self.assertNotIn('pci_bdf="0000:00:04.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/0"} 35', mm_prom)
+            self.assertNotIn("88", mm_prom.split("freetpu_tpu_runtime_unjoined_duty_cycle_percent")[0])
+            self.assertIn('runtime_device_id="2"} 88', mm_prom)
+
+            # 3. Collapsed v2/v3 chip spanning 2 IOMMU groups where the REPRESENTATIVE
+            #    function's VFIO group shares an unrelated non-TPU PCI device while the
+            #    sibling function has an exclusive group -> PID telemetry MUST be withheld!
+            rep_sys, rep_dev, rep_proc = _make_mock_pci_tree(
+                root / "v2_rep_shared_sib_excl",
+                devices=[
+                    {
+                        "bdf": "0000:00:04.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0027",
+                        "subsystem_device": "0x004e",
+                        "driver": "vfio-pci",
+                        "iommu_group": "5",
+                    },
+                    {
+                        "bdf": "0000:00:09.0",
+                        "vendor": "0x1af4",
+                        "device": "0x1041",
+                        "driver": "vfio-pci",
+                        "iommu_group": "5",  # non-TPU sharing representative group 5!
+                    },
+                    {
+                        "bdf": "0000:00:04.1",
+                        "vendor": "0x1ae0",
+                        "device": "0x0027",
+                        "subsystem_device": "0x004e",
+                        "driver": "vfio-pci",
+                        "iommu_group": "6",  # exclusive sibling group!
+                    },
+                ],
+                create_vfio_nodes=["5", "6"],
+            )
+            fd_dir = rep_proc / "9003" / "fd"
+            fd_dir.mkdir(parents=True)
+            os.symlink(str(rep_dev / "vfio" / "5"), fd_dir / "3")
+            os.symlink(str(rep_dev / "vfio" / "6"), fd_dir / "4")
+            fdinfo_dir = rep_proc / "9003" / "fdinfo"
+            fdinfo_dir.mkdir(parents=True)
+            (fdinfo_dir / "3").write_text("pos:\t0\nflags:\t02\n", encoding="utf-8")
+            (fdinfo_dir / "4").write_text("pos:\t0\nflags:\t02\n", encoding="utf-8")
+            with _mock_vfio_char_lstat():
+                rep_snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=rep_sys,
+                    dev_root=rep_dev,
+                    proc_root=rep_proc,
+                    tpu_info_bin=None,
+                    shm_root=root / "no-shm",
+                )
+            self.assertEqual(len(rep_snap.devices), 1)
+            self.assertFalse(rep_snap.devices[0].vfio_group_exclusive)
+            self.assertFalse(rep_snap.devices[0].pid_telemetry_available)
+            self.assertFalse(rep_snap.pid_telemetry_available)
+            self.assertEqual(rep_snap.devices[0].active_pids, [])
+            self.assertNotIn(
+                "freetpu_tpu_active_pids{",
+                tpu_exporter.format_prometheus_metrics(rep_snap),
+            )
+
+            # 4. Parent shared monotonic deadline accounts for slow Python startup /
+            #    `tpu_info` import so optional duty verification skips/aborts in time
+            #    and returns collected HBM rows BEFORE the parent kills the subprocess!
+            slow_pkg = root / "slow_site"
+            (slow_pkg / "tpu_info" / "proto").mkdir(parents=True)
+            (slow_pkg / "tpu_info" / "__init__.py").write_text("", encoding="utf-8")
+            (slow_pkg / "tpu_info" / "device.py").write_text(
+                "class TpuChip:\n    V6E = 'V6E'\n", encoding="utf-8"
+            )
+            # Slow import consumes 0.25s of a 0.45s parent subprocess budget!
+            (slow_pkg / "tpu_info" / "metrics.py").write_text(
+                "import time\n"
+                "from types import SimpleNamespace\n"
+                "time.sleep(0.25)\n"
+                "def get_chip_usage(chip, addr=None, timeout=None):\n"
+                "    return [SimpleNamespace(device_id=0, memory_usage=6*1024**3, total_memory=32*1024**3, duty_cycle_pct=55.0)]\n",
+                encoding="utf-8",
+            )
+            (slow_pkg / "tpu_info" / "proto" / "__init__.py").write_text("", encoding="utf-8")
+            (slow_pkg / "tpu_info" / "proto" / "tpu_metric_service_pb2.py").write_text(
+                "class MetricRequest:\n    def __init__(self, metric_name=''):\n        self.metric_name = metric_name\n",
+                encoding="utf-8",
+            )
+            rpc_timeout_log = root / "slow_rpc_timeout.txt"
+            (slow_pkg / "tpu_info" / "proto" / "tpu_metric_service_pb2_grpc.py").write_text(
+                "import time\n"
+                "class RuntimeMetricServiceStub:\n"
+                "    def __init__(self, chan):\n        pass\n"
+                "    def GetRuntimeMetric(self, req, timeout=None):\n"
+                f"        open({str(rpc_timeout_log)!r}, 'w', encoding='utf-8').write(str(timeout))\n"
+                "        time.sleep(timeout if timeout is not None else 1.0)\n"
+                "        raise TimeoutError('stalled duty rpc')\n",
+                encoding="utf-8",
+            )
+            (slow_pkg / "grpc.py").write_text(
+                "class _Ch:\n    def close(self):\n        pass\n"
+                "def insecure_channel(addr, options=None):\n    return _Ch()\n",
+                encoding="utf-8",
+            )
+            orig_pypath = os.environ.get("PYTHONPATH")
+            new_pypath = str(slow_pkg) + (os.pathsep + orig_pypath if orig_pypath else "")
+            parent_timeout_s = 0.55
+            orig_run_sub = tpu_exporter._run_subprocess_bounded
+
+            def _run_with_pypath(cmd: list[str], *, timeout_s: float) -> subprocess.CompletedProcess[str]:
+                env_copy = dict(os.environ)
+                env_copy["PYTHONPATH"] = new_pypath
+                return subprocess.run(
+                    cmd,
+                    env=env_copy,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_s,
+                    check=False,
+                )
+
+            with (
+                mock.patch.object(tpu_exporter.importlib.util, "find_spec", return_value=object()),
+                mock.patch.object(tpu_exporter, "_run_subprocess_bounded", side_effect=_run_with_pypath),
+            ):
+                py_ok, py_err, py_rows = tpu_exporter._query_tpu_info_python_metrics(
+                    tpu_exporter.discover_tpu_devices(sysfs_root=v6e_sys, dev_root=v6e_dev),
+                    addr="127.0.0.1:59452",
+                    timeout_s=parent_timeout_s,
+                )
+            self.assertTrue(py_ok, f"Slow import + stalled duty RPC must still return HBM rows: {py_err}")
+            self.assertIn("0", py_rows)
+            self.assertEqual(py_rows["0"].hbm_used_bytes, 6 * 1024**3)
+            self.assertEqual(py_rows["0"].hbm_total_bytes, 32 * 1024**3)
+            if rpc_timeout_log.exists():
+                seen_t = float(rpc_timeout_log.read_text(encoding="utf-8").strip())
+                # Parent budget minus >= 0.25s import minus >= 0.11s reserve -> strictly < 0.25s!
+                self.assertLess(
+                    seen_t,
+                    parent_timeout_s - 0.25,
+                    f"Duty RPC timeout must subtract startup+import time from parent deadline: {seen_t}",
+                )
+
     def _assert_valid_prometheus_text(self, text: str) -> None:
         lines = [ln for ln in text.splitlines() if ln.strip()]
         self.assertGreater(len(lines), 0)

@@ -871,7 +871,8 @@ _PY_METRICS_SUBPROCESS_HELPER = (
     "chip_attr, addr, timeout_s = sys.argv[1], sys.argv[2], float(sys.argv[3])\n"
     "layout = sys.argv[4] if len(sys.argv) > 4 else 'auto'\n"
     "dpc = int(sys.argv[5], 10) if len(sys.argv) > 5 else (2 if chip_attr == 'V7X' else 1)\n"
-    "deadline = time.monotonic() + max(0.001, timeout_s)\n"
+    "local_deadline = time.monotonic() + max(0.001, timeout_s)\n"
+    "deadline = min(float(sys.argv[6]), local_deadline) if len(sys.argv) > 6 else local_deadline\n"
     "serialize_reserve_s = min(0.15, max(0.005, timeout_s * 0.2))\n"
     "chip = getattr(d.TpuChip, chip_attr)\n"
     "def _invoke(fn):\n"
@@ -1003,12 +1004,22 @@ _PY_METRICS_SUBPROCESS_HELPER = (
     "            )\n"
     "        if allow_direct_id_fallback and all_raw_ids and all_raw_ids == hbm_ids:\n"
     "            return ('verified', dict(populated_vals), unset_ids)\n"
-    "        return ('unjoined', populated_vals) if populated_vals else False\n"
-    "    if not all_raw_ids or all_raw_ids != hbm_ids:\n"
+    "        matched_v = {did: populated_vals[did // dev_per_chip] for did in hbm_ids if (did // dev_per_chip) in populated_vals}\n"
+    "        matched_u = {did for did in hbm_ids if (did // dev_per_chip) not in populated_vals}\n"
+    "        unmatched_j = {cid: gv for cid, gv in populated_vals.items() if not any((cid * dev_per_chip + off) in hbm_ids for off in range(dev_per_chip))}\n"
+    "        if matched_v:\n"
+    "            return ('partial', matched_v, matched_u, unmatched_j)\n"
     "        return ('unjoined', populated_vals) if populated_vals else False\n"
     "    if require_pigeonhole and len(all_raw_ids) <= 4:\n"
     "        return ('unjoined', populated_vals) if populated_vals else False\n"
-    "    return ('verified', dict(populated_vals), unset_ids)\n"
+    "    if all_raw_ids and all_raw_ids == hbm_ids:\n"
+    "        return ('verified', dict(populated_vals), unset_ids)\n"
+    "    matched_v = {did: populated_vals[did] for did in hbm_ids if did in populated_vals}\n"
+    "    matched_u = {did for did in hbm_ids if did not in populated_vals}\n"
+    "    unmatched_j = {cid: gv for cid, gv in populated_vals.items() if cid not in hbm_ids}\n"
+    "    if matched_v:\n"
+    "        return ('partial', matched_v, matched_u, unmatched_j)\n"
+    "    return ('unjoined', populated_vals) if populated_vals else False\n"
     "per_chip_fallback = False\n"
     "verified_hbm_vals = {}\n"
     "unset_hbm_ids = set()\n"
@@ -1019,6 +1030,8 @@ _PY_METRICS_SUBPROCESS_HELPER = (
     "    v_res = _verify_raw_duty(rows, 2, per_chip_mode=True)\n"
     "    if isinstance(v_res, tuple) and v_res[0] == 'verified':\n"
     "        verified_hbm_vals, unset_hbm_ids = v_res[1], v_res[2]\n"
+    "    elif isinstance(v_res, tuple) and v_res[0] == 'partial':\n"
+    "        verified_hbm_vals, unset_hbm_ids, unjoined_duty_vals = v_res[1], v_res[2], v_res[3]\n"
     "    elif isinstance(v_res, tuple) and v_res[0] == 'unjoined':\n"
     "        per_chip_fallback = True\n"
     "        unjoined_duty_vals = v_res[1]\n"
@@ -1032,6 +1045,8 @@ _PY_METRICS_SUBPROCESS_HELPER = (
     "        )\n"
     "        if isinstance(v_res, tuple) and v_res[0] == 'verified':\n"
     "            verified_hbm_vals, unset_hbm_ids = v_res[1], v_res[2]\n"
+    "        elif isinstance(v_res, tuple) and v_res[0] == 'partial':\n"
+    "            verified_hbm_vals, unset_hbm_ids, unjoined_duty_vals = v_res[1], v_res[2], v_res[3]\n"
     "        elif isinstance(v_res, tuple) and v_res[0] == 'unjoined':\n"
     "            per_chip_fallback = True\n"
     "            unjoined_duty_vals = v_res[1]\n"
@@ -1052,6 +1067,13 @@ _PY_METRICS_SUBPROCESS_HELPER = (
     "    )\n"
     "    if isinstance(v_res, tuple) and v_res[0] == 'verified':\n"
     "        verified_hbm_vals, unset_hbm_ids = v_res[1], v_res[2]\n"
+    "    elif isinstance(v_res, tuple) and v_res[0] == 'partial':\n"
+    "        verified_hbm_vals, unset_hbm_ids, unjoined_duty_vals = v_res[1], v_res[2], v_res[3]\n"
+    "    elif isinstance(v_res, tuple) and v_res[0] == 'unjoined':\n"
+    "        per_chip_fallback = True\n"
+    "        unjoined_duty_vals = v_res[1]\n"
+    "    elif v_res is False:\n"
+    "        per_chip_fallback = True\n"
     "out = []\n"
     "seen_out_ids = set()\n"
     "for r in (rows or []):\n"
@@ -1249,8 +1271,21 @@ def _verify_raw_python_per_chip_duty(
             )
         if allow_direct_id_fallback and all_raw_ids and all_raw_ids == hbm_ids:
             return ("verified", dict(populated_vals), unset_ids)
-        return ("unjoined", populated_vals) if populated_vals else False
-    if not all_raw_ids or all_raw_ids != hbm_ids:
+        matched_v = {
+            did: populated_vals[did // devices_per_chip]
+            for did in hbm_ids
+            if (did // devices_per_chip) in populated_vals
+        }
+        matched_u = {
+            did for did in hbm_ids if (did // devices_per_chip) not in populated_vals
+        }
+        unmatched_j = {
+            cid: gv
+            for cid, gv in populated_vals.items()
+            if not any((cid * devices_per_chip + off) in hbm_ids for off in range(devices_per_chip))
+        }
+        if matched_v:
+            return ("partial", matched_v, matched_u, unmatched_j)
         return ("unjoined", populated_vals) if populated_vals else False
     # On Ironwood (`V7X`, max 4 physical chips per VM) in `auto` layout,
     # matching ID sets with `<= 4` entries (e.g. `{0,1,2,3}` vs `{0,1,2,3}`)
@@ -1259,7 +1294,14 @@ def _verify_raw_python_per_chip_duty(
     # while preserving decoded raw gauges in the unjoined duty-cycle series.
     if require_pigeonhole and len(all_raw_ids) <= 4:
         return ("unjoined", populated_vals) if populated_vals else False
-    return ("verified", dict(populated_vals), unset_ids)
+    if all_raw_ids and all_raw_ids == hbm_ids:
+        return ("verified", dict(populated_vals), unset_ids)
+    matched_v = {did: populated_vals[did] for did in hbm_ids if did in populated_vals}
+    matched_u = {did for did in hbm_ids if did not in populated_vals}
+    unmatched_j = {cid: gv for cid, gv in populated_vals.items() if cid not in hbm_ids}
+    if matched_v:
+        return ("partial", matched_v, matched_u, unmatched_j)
+    return ("unjoined", populated_vals) if populated_vals else False
 
 
 def _parse_python_usage_entries(
@@ -1447,6 +1489,12 @@ def _query_tpu_info_python_metrics(
                     )
                     if isinstance(v_res, tuple) and v_res[0] == "verified":
                         box["verified_hbm_vals"], box["unset_hbm_ids"] = v_res[1], v_res[2]
+                    elif isinstance(v_res, tuple) and v_res[0] == "partial":
+                        box["verified_hbm_vals"], box["unset_hbm_ids"], box["unjoined_duty_by_id"] = (
+                            v_res[1],
+                            v_res[2],
+                            v_res[3],
+                        )
                     elif isinstance(v_res, tuple) and v_res[0] == "unjoined":
                         box["per_chip_fallback"] = True
                         box["unjoined_duty_by_id"] = v_res[1]
@@ -1471,6 +1519,12 @@ def _query_tpu_info_python_metrics(
                         )
                         if isinstance(v_res, tuple) and v_res[0] == "verified":
                             box["verified_hbm_vals"], box["unset_hbm_ids"] = v_res[1], v_res[2]
+                        elif isinstance(v_res, tuple) and v_res[0] == "partial":
+                            box["verified_hbm_vals"], box["unset_hbm_ids"], box["unjoined_duty_by_id"] = (
+                                v_res[1],
+                                v_res[2],
+                                v_res[3],
+                            )
                         elif isinstance(v_res, tuple) and v_res[0] == "unjoined":
                             box["per_chip_fallback"] = True
                             box["unjoined_duty_by_id"] = v_res[1]
@@ -1516,6 +1570,17 @@ def _query_tpu_info_python_metrics(
                     )
                     if isinstance(v_res, tuple) and v_res[0] == "verified":
                         box["verified_hbm_vals"], box["unset_hbm_ids"] = v_res[1], v_res[2]
+                    elif isinstance(v_res, tuple) and v_res[0] == "partial":
+                        box["verified_hbm_vals"], box["unset_hbm_ids"], box["unjoined_duty_by_id"] = (
+                            v_res[1],
+                            v_res[2],
+                            v_res[3],
+                        )
+                    elif isinstance(v_res, tuple) and v_res[0] == "unjoined":
+                        box["per_chip_fallback"] = True
+                        box["unjoined_duty_by_id"] = v_res[1]
+                    elif v_res is False:
+                        box["per_chip_fallback"] = True
             except Exception as exc:  # noqa: BLE001
                 box["error"] = exc
             finally:
@@ -1547,6 +1612,7 @@ def _query_tpu_info_python_metrics(
     except Exception as exc:  # noqa: BLE001
         return False, f"tpu_info python API unavailable: {exc}", {}
 
+    sub_deadline_mono = time.monotonic() + deadline_s
     try:
         proc = _run_subprocess_bounded(
             [
@@ -1558,6 +1624,7 @@ def _query_tpu_info_python_metrics(
                 str(deadline_s),
                 grpc_duty_layout,
                 str(inferred_dpc),
+                f"{sub_deadline_mono:.6f}",
             ],
             timeout_s=deadline_s,
         )
@@ -2527,7 +2594,7 @@ def discover_tpu_devices(
                     )
                     if vfio_group_exclusive and iommu_group not in existing.sibling_iommu_groups:
                         existing.sibling_iommu_groups.append(iommu_group)
-                    elif not vfio_group_exclusive:
+                    if not existing.vfio_group_exclusive or not vfio_group_exclusive:
                         existing.unverified_sibling_vfio = True
                 elif not iommu_group:
                     existing.vfio_group_exclusive = False
@@ -3353,7 +3420,11 @@ def collect_snapshot(
         ]
         dev_vfio_paths = [str(dev_root / "vfio" / grp) for grp in dev_groups]
         pids_set: set[int] = set()
-        all_rdevs_verified = bool(dev_vfio_paths) and not dev.unverified_sibling_vfio
+        all_rdevs_verified = (
+            bool(dev_vfio_paths)
+            and dev.vfio_group_exclusive
+            and not dev.unverified_sibling_vfio
+        )
         for vp in dev_vfio_paths:
             pids_set.update(proc_pids.get(vp, []))
             if vfio_rdevs.get(vp) is None:
