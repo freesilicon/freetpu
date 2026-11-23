@@ -3220,7 +3220,11 @@ void PjrtRuntime::buffer_to_host(PJRT_Buffer* buf, void* dst, size_t dst_size) {
 CachedExecutablePtr PjrtRuntime::compile_or_get(const std::string& cache_key,
                                                 const std::string& mlir_text,
                                                 int device_idx,
-                                                const PjrtCompileOptions& opts) {
+                                                const PjrtCompileOptions& opts,
+                                                bool* out_compiled) {
+    if (out_compiled != nullptr) {
+        *out_compiled = false;
+    }
     if (device_idx < 0 || device_idx >= static_cast<int>(devices_.size())) {
         throw std::out_of_range("compile_or_get: device_idx out of range");
     }
@@ -3285,6 +3289,9 @@ CachedExecutablePtr PjrtRuntime::compile_or_get(const std::string& cache_key,
     }
     if (is_mosaic) {
         mosaic_compile_successes_.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (out_compiled != nullptr) {
+        *out_compiled = true;
     }
     PjrtLoadedExecutableHandle loaded_handle(c_args.executable, PjrtLoadedExecutableDeleter{api_});
 

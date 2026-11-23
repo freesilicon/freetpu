@@ -308,7 +308,8 @@ public:
     CachedExecutablePtr compile_or_get(const std::string& cache_key,
                                        const std::string& mlir_text,
                                        int device_idx = 0,
-                                       const PjrtCompileOptions& opts = {});
+                                       const PjrtCompileOptions& opts = {},
+                                       bool* out_compiled = nullptr);
 
     void execute(const CachedExecutablePtr& exec,
                  int device_idx,

@@ -410,6 +410,18 @@ int main() {
             }
             CHECK_TRUE(threw, "Unsafe kernel.name throws in emit_mosaic_kernel()");
         }
+
+        // Valid kernel.name colliding with default "transform_0" must disambiguate transform symbol
+        k_name.name = "transform_0";
+        CHECK_TRUE(k_name.validate(&verr), "kernel.name='transform_0' validates cleanly");
+        const auto em_col = freetile::emit_mosaic_kernel(k_name);
+        const size_t first_sym = em_col.mosaic_mlir.find("sym_name = \"transform_0\"");
+        CHECK_TRUE(first_sym != std::string::npos, "Entry point keeps sym_name = \"transform_0\"");
+        CHECK_TRUE(em_col.mosaic_mlir.find("sym_name = \"transform_0\"", first_sym + 1) == std::string::npos,
+                   "No duplicate sym_name = \"transform_0\" in emitted module");
+        CHECK_TRUE(em_col.mosaic_mlir.find("transform_indices = @_transform_0") != std::string::npos &&
+                   em_col.mosaic_mlir.find("sym_name = \"_transform_0\"") != std::string::npos,
+                   "Colliding transform_0 disambiguated to @_transform_0");
     }
 
     std::printf("PASS: all freetile unit tests succeeded!\n");

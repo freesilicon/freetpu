@@ -4988,8 +4988,11 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
             prog_spec.freetile_mosaic && emitted.mlir_text.find("@tpu_custom_call") != std::string::npos;
         if (used_mosaic) {
             try {
-                exec = rt.compile_or_get(emitted.cache_key, emitted.mlir_text, compile_dev, copts);
-                ctx->mosaic_compiles += 1;
+                bool compiled_now = false;
+                exec = rt.compile_or_get(emitted.cache_key, emitted.mlir_text, compile_dev, copts, &compiled_now);
+                if (compiled_now) {
+                    ctx->mosaic_compiles += 1;
+                }
             } catch (const std::exception& e) {
                 ctx->mosaic_fallbacks += 1;
                 GGML_LOG_WARN("ggml-cloudtpu: FreeTile Mosaic compile failed (%s); falling back to pure StableHLO\n",

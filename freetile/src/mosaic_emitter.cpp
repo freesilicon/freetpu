@@ -1,5 +1,6 @@
 #include "freetile/mosaic_emitter.hpp"
 
+#include <algorithm>
 #include <iomanip>
 #include <locale>
 #include <sstream>
@@ -482,18 +483,30 @@ MosaicEmitResult emit_mosaic_kernel(const TileKernel& kernel, int64_t mosaic_ver
         if (i > 0) mod << ", ";
         mod << kernel.grid.dims[i];
     }
+    // Choose window-transform symbol names guaranteed never to collide with kernel.name
+    std::vector<std::string> transform_names;
+    transform_names.reserve(kernel.operands.size());
+    for (size_t i = 0; i < kernel.operands.size(); ++i) {
+        std::string tname = "transform_" + std::to_string(i);
+        while (tname == kernel.name ||
+               std::find(transform_names.begin(), transform_names.end(), tname) != transform_names.end()) {
+            tname.insert(tname.begin(), '_');
+        }
+        transform_names.push_back(std::move(tname));
+    }
+
     mod << ">, scalar_prefetch = 0 : i64, scratch_operands = " << kernel.scratch.size()
         << " : i64, sym_name = \"" << escape_mlir_string_literal(kernel.name)
         << "\", tpu.core_type = #tpu.core_type<tc>, window_params = [";
     for (size_t i = 0; i < kernel.operands.size(); ++i) {
         if (i > 0) mod << ", ";
         const auto& wb = kernel.operands[i].window_bounds;
-        mod << "{transform_indices = @transform_" << i << ", window_bounds = array<i64: " << wb[0] << ", " << wb[1]
-            << ">}";
+        mod << "{transform_indices = @" << transform_names[i] << ", window_bounds = array<i64: " << wb[0] << ", "
+            << wb[1] << ">}";
     }
     mod << "]} : () -> ()\n";
 
-    // Emit @transform_0 .. @transform_{N-1} by validated operand position (0 = activation, last = output)
+    // Emit window-transform funcs by validated operand position (0 = activation, last = output)
     for (size_t i = 0; i < kernel.operands.size(); ++i) {
         const bool is_act = (i == 0);
         const bool is_out = (i + 1 == kernel.operands.size());
@@ -506,7 +519,8 @@ MosaicEmitResult emit_mosaic_kernel(const TileKernel& kernel, int64_t mosaic_ver
             } else {
                 mod << "    \"stable_mosaic.func.return\"(%0, %arg0) : (i32, i32) -> ()\n";
             }
-            mod << "  }) {function_type = (i32) -> (i32, i32), sym_name = \"transform_" << i << "\"} : () -> ()\n";
+            mod << "  }) {function_type = (i32) -> (i32, i32), sym_name = \"" << transform_names[i]
+                << "\"} : () -> ()\n";
         } else {
             mod << "  ^bb0(%arg0: i32, %arg1: i32):\n";
             mod << "    %0 = \"stable_mosaic.arith.constant\"() {value = 0 : i32} : () -> i32\n";
@@ -517,7 +531,8 @@ MosaicEmitResult emit_mosaic_kernel(const TileKernel& kernel, int64_t mosaic_ver
             } else {
                 mod << "    \"stable_mosaic.func.return\"(%arg1, %arg0) : (i32, i32) -> ()\n";
             }
-            mod << "  }) {function_type = (i32, i32) -> (i32, i32), sym_name = \"transform_" << i << "\"} : () -> ()\n";
+            mod << "  }) {function_type = (i32, i32) -> (i32, i32), sym_name = \"" << transform_names[i]
+                << "\"} : () -> ()\n";
         }
     }
 

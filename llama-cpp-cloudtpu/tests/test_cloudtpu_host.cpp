@@ -6376,6 +6376,49 @@ void test_ggml_cgraph_freetile_mosaic_fallback() {
                         // 2nd run hits cache (no second compile) & executes again.
                         stats_ok = (ca1 == 1 && cf1 == 0 && ma1 == 1 && ms1 == 1 && ex1 == 1 &&
                                     ca2 == 1 && ex2 == 2);
+                        // Second fresh backend context (empty plan_cache) hitting shared PJRT cache
+                        // must reuse the compiled Mosaic executable without recompiling.
+                        if (stats_ok) {
+                            ggml_backend_t be2 = ggml_backend_cloudtpu_init();
+                            if (be2 != nullptr) {
+                                struct ggml_context* ctx_w2 = ggml_init(p);
+                                ggml_tensor* tw2 = ggml_new_tensor_2d(ctx_w2, GGML_TYPE_Q4_K, K, N);
+                                ggml_backend_buffer_t w_buf2 = ggml_backend_alloc_ctx_tensors(ctx_w2, be2);
+                                ggml_backend_tensor_set(tw2, w_raw.data(), 0, w_raw.size());
+
+                                struct ggml_context* ctx_g2 = ggml_init(p);
+                                struct ggml_cgraph* gf2 = ggml_new_graph(ctx_g2);
+                                ggml_tensor* tx2 = ggml_new_tensor_2d(ctx_g2, GGML_TYPE_F32, K, M);
+                                ggml_set_input(tx2);
+                                ggml_tensor* ty2 = ggml_mul_mat(ctx_g2, tw2, tx2);
+                                ggml_set_output(ty2);
+                                ggml_build_forward_expand(gf2, ty2);
+
+                                ggml_gallocr_t galloc2 = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be2));
+                                bool run3 = ggml_gallocr_alloc_graph(galloc2, gf2);
+                                std::vector<float> got3(static_cast<size_t>(M * N), 0.0f);
+                                if (run3) {
+                                    ggml_backend_tensor_set(tx2, x_host.data(), 0, x_host.size() * sizeof(float));
+                                    run3 = (ggml_backend_graph_compute(be2, gf2) == GGML_STATUS_SUCCESS);
+                                    if (run3) {
+                                        ggml_backend_tensor_get(ty2, got3.data(), 0, got3.size() * sizeof(float));
+                                    }
+                                }
+                                const cloudtpu::CacheStats st3 = rt_child.cache_stats();
+                                const uint64_t ca3 = st3.compile_attempts - st0.compile_attempts;
+                                const uint64_t hits3 = st3.hits - st2.hits;
+                                const uint64_t ex3 = st3.execute_calls - st0.execute_calls;
+                                stats_ok = run3 && (ca3 == 1 && hits3 >= 1 && ex3 == 3) &&
+                                           (compute_nmse(got3, ref_y) < 5e-4);
+                                ggml_gallocr_free(galloc2);
+                                ggml_free(ctx_g2);
+                                ggml_backend_buffer_free(w_buf2);
+                                ggml_free(ctx_w2);
+                                ggml_backend_free(be2);
+                            } else {
+                                stats_ok = false;
+                            }
+                        }
                     } else {
                         // Invalid v999 Mosaic: 1st run attempts 1 Mosaic compile (fails), retries with
                         // 1 pure StableHLO compile (succeeds, no @tpu_custom_call), executes once;
@@ -6462,6 +6505,12 @@ void test_freetile_mosaic_lowering(cloudtpu::PjrtRuntime& rt) {
                    "Q4_K_I4 S4 FreeTile Mosaic emits @tpu_custom_call");
         CHECK_TRUE(prog.mlir_text.find("stablehlo.dot_general") == std::string::npos,
                    "Q4_K_I4 S4 FreeTile Mosaic replaces dot_general");
+        bool compiled_first = false;
+        bool compiled_second = true;
+        (void)rt.compile_or_get(prog.cache_key, prog.mlir_text, 0, rt.make_spmd_compile_options(1), &compiled_first);
+        (void)rt.compile_or_get(prog.cache_key, prog.mlir_text, 0, rt.make_spmd_compile_options(1), &compiled_second);
+        CHECK_TRUE(compiled_first && !compiled_second,
+                   "compile_or_get reports out_compiled=true on miss and false on shared cache hit");
         auto got = run_emitted(rt, prog, {bqs, bd, bm, bx});
         CHECK_TRUE(compute_nmse(got, ref) < 5e-4, "Q4_K_I4 S4 FreeTile Mosaic NMSE < 5e-4");
 
