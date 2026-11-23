@@ -1204,9 +1204,11 @@ void test_spmd_multichip_mesh(int num_chips) {
     CHECK_TRUE(static_cast<int>(copts.device_assignment_ids.size()) == num_chips, "SPMD DeviceAssignment ids");
     CHECK_TRUE(copts.env_option_overrides.empty(), "SPMD default leaves TPU env_option_overrides opt-in");
     const auto copts_async = rt.make_spmd_compile_options(num_chips, 0, false, /*async_collectives=*/true);
-    CHECK_TRUE(copts_async.env_option_overrides.size() == 6, "Opt-in SPMD async collective overlap overrides (6)");
+    CHECK_TRUE(copts_async.env_option_overrides.size() == 5, "Opt-in SPMD async collective overlap overrides (5)");
     bool saw_ag_enum = false;
     for (const auto& ov : copts_async.env_option_overrides) {
+        CHECK_TRUE(ov.key != "xla_tpu_enable_async_collective_fusion_fuse_all_gather",
+                   "Tristate/Boolean-ambiguous fuse_all_gather must not be sent as a bool override");
         if (ov.key == "xla_enable_async_all_gather") {
             CHECK_TRUE(ov.kind == cloudtpu::PjrtOptionOverride::Kind::STRING && ov.string_val == "kEnabled",
                        "xla_enable_async_all_gather must use enum string kEnabled");

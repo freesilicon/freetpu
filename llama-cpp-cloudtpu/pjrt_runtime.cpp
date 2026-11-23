@@ -2711,15 +2711,17 @@ PjrtCompileOptions PjrtRuntime::make_spmd_compile_options(int num_chips,
         }
         if (async_collectives) {
             // Opt-in TPU async collective overlap overrides matching OpenXLA TPU flag guidance
-            // (https://openxla.org/xla/flags_guidance#performance_flags):
-            //   - xla_enable_async_all_gather is an enum (kDisabled/kEnabled/kAuto)
-            //   - xla_tpu_* flags are boolean OptionOverrideProto.bool_field values
+            // (https://openxla.org/xla/flags_guidance#performance_flags) and MaxText's flag table:
+            //   - xla_enable_async_all_gather is a TristateFlag enum (kDisabled/kEnabled/kAuto)
+            //   - the remaining 4 xla_tpu_* flags are unambiguous booleans (OptionOverrideProto.bool_field)
+            // Note: xla_tpu_enable_async_collective_fusion_fuse_all_gather is omitted because it is
+            // already enabled by default on v5e/v6e and varies between Boolean and TristateFlag across
+            // libtpu builds; pass plugin-version-specific flags via LIBTPU_INIT_ARGS when needed.
             opts.env_option_overrides = {
                 PjrtOptionOverride::make_bool("xla_tpu_enable_async_collective_fusion", true),
                 PjrtOptionOverride::make_bool("xla_tpu_overlap_compute_collective_tc", true),
                 PjrtOptionOverride::make_bool("xla_tpu_enable_async_collective_fusion_multiple_steps", true),
                 PjrtOptionOverride::make_string("xla_enable_async_all_gather", "kEnabled"),
-                PjrtOptionOverride::make_bool("xla_tpu_enable_async_collective_fusion_fuse_all_gather", true),
                 PjrtOptionOverride::make_bool("xla_tpu_enable_async_collective_fusion_fuse_all_reduce", true),
             };
         }

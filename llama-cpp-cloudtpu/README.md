@@ -47,7 +47,7 @@ All binaries (`test_cloudtpu_host`, `test-backend-ops`, `llama-cli`, `llama-benc
 3. **Single-token `SET_ROWS` bounds-guarded `dynamic_update_slice` + in-place KV buffer donation (`CLOUDTPU_DONATE_KV=1`):** emits explicit `{tf.aliasing_output = idx : i32}` (with `alias_passthrough_params` disabled) and runtime exclusive-ownership donation checks (`non_donatable_input_indices` marks all non-aliased or shared inputs), while guarding out-of-range row indices to preserve scatter discard semantics.
 4. **Llama-3 `ROPE` `n_dims == 0` probe fix:** keeps `rope_freqs.weight` resident in TPU HBM during `llama-model-loader` buffer placement, eliminating the 65 CPU/TPU graph splits per token on Llama-3.1-8B.
 5. **BF16 MXU contraction (`CLOUDTPU_MATMUL_BF16=1`):** computes quantized affine `q * d + m` in F32 VPU precision and casts once to `BF16` for native MXU contraction (`114/114` `Q4_K`, `102/102` `Q8_0`, `63/63` `Q6_K`, `102/102` `Q4_0`, `287/287` `ROPE`, `65/65` `SET_ROWS`, `56/56` `GET_ROWS` passed on live `v5e-1`).
-6. **Multi-chip async collective overlap (`CLOUDTPU_ASYNC_COLLECTIVES=1`, opt-in):** encodes 6 typed XLA TPU async collective overlap overrides (`5 bool_field` + `xla_enable_async_all_gather=kEnabled`) into `CompileOptionsProto.env_option_overrides` (preserving compiler defaults and `XLA_FLAGS`) plus monotonic `launch_id` when `P > 1`.
+6. **Multi-chip async collective overlap (`CLOUDTPU_ASYNC_COLLECTIVES=1`, opt-in):** encodes 5 typed XLA TPU async collective overlap overrides (`4 bool_field` + `xla_enable_async_all_gather=kEnabled`) into `CompileOptionsProto.env_option_overrides` (preserving compiler defaults and `XLA_FLAGS`; pass plugin-version-specific flags via `LIBTPU_INIT_ARGS`) plus monotonic `launch_id` when `P > 1`.
 
 | Model (GGUF) | Quant | Size | M3 `pp512` | M4B `pp512` | **M4C `pp512`** | M3 `tg64` | M4B `tg64` | **M4C `tg64`** (`FUSE_ATTN=0` / `1`) | M4C vs M4B `tg64` |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -121,7 +121,7 @@ CLOUDTPU_MOCK=1 CLOUDTPU_MOCK_DEVICES=8 CLOUDTPU_SPMD_CHIPS=8 CLOUDTPU_SPMD_MIN_
 | `CLOUDTPU_MATMUL_BF16` | `1` | `1` casts dequantized weights & activations to `BF16` for TPU MXU contraction (dense F32 weights stay F32) |
 | `CLOUDTPU_Q4_SPLIT_DOT` | `1` | `1` uses zero-concatenate split-X Q4 `dot_general` (`+78%` on 8B `Q4_K_M`); `0` uses single concatenated `dot_general` |
 | `CLOUDTPU_Q4K_BF16_SCALES` | `0` | Set `1` to store `Q4_K`/`Q6_K` scales in F16 (`0` = F32 scales, faster on `v5e-1`) |
-| `CLOUDTPU_ASYNC_COLLECTIVES` | `0` | Opt-in (`1`) enables 6 typed XLA TPU async collective overlap overrides in `CompileOptionsProto.env_option_overrides` when `P > 1` |
+| `CLOUDTPU_ASYNC_COLLECTIVES` | `0` | Opt-in (`1`) enables 5 typed XLA TPU async collective overlap overrides in `CompileOptionsProto.env_option_overrides` when `P > 1` |
 | `LIBTPU_PATH` / `TPU_LIBRARY_PATH` | Auto-resolved `libtpu.so` | Explicit path to `libtpu.so` (or future clean-room `libopentpu.so`) |
 | `CLOUDTPU_FUSE_GRAPHS` | `1` | `1` fuses contiguous supported GGML nodes + enables async pipelining |
 | `CLOUDTPU_CACHE_CAP` | `4096` | LRU capacity of compiled `PJRT_LoadedExecutable*` and `SubgraphPlanCache` |
