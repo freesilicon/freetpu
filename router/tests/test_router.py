@@ -13633,6 +13633,175 @@ asyncio.run(main())
         self.assertEqual(recorded_usage[1].prompt_tokens, 150)
         self.assertEqual(recorded_usage[1].completion_tokens, 5)
 
+    def test_upstream_http_500_fails_over_and_cools_down_failing_backend(self) -> None:
+        failing = self._track(
+            _MockOpenAIBackend("vllm-500-primary", ["m-500"], status_code=200)
+        )
+        backup = self._track(
+            _MockOpenAIBackend("vllm-500-backup", ["m-500"], status_code=200)
+        )
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            failure_cooldown_s=30.0,
+            backends=[
+                BackendConfig(
+                    id="vllm-500-primary",
+                    local=True,
+                    base_url=failing.base_url,
+                    models=["m-500"],
+                ),
+                BackendConfig(
+                    id="vllm-500-backup",
+                    local=False,
+                    base_url=backup.base_url,
+                    models=["m-500"],
+                ),
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        failing.status_code = 500
+        st, hdrs, _ = _http_request(
+            router.server_address[1],
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-500",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        self.assertEqual(st, 200)
+        self.assertEqual(hdrs.get("x-freetpu-backend"), "vllm-500-backup")
+        self.assertEqual(hdrs.get("x-freetpu-failovers"), "1")
+        primary_state = router.engine._backends[0]
+        self.assertEqual(primary_state.total_failures, 1)
+        self.assertGreater(primary_state.cooldown_until_monotonic, time.monotonic())
+
+    def test_high_batch_v6e8_preset_probes_vllm_health_and_ipv6_banner_brackets_host(
+        self,
+    ) -> None:
+        from router.freetpu_router import _format_listen_authority, main as router_main
+
+        preset = load_config(
+            REPO_ROOT / "router" / "examples" / "cloud-tpu-v6e8-high-batch.json"
+        )
+        self.assertEqual(len(preset.backends), 2)
+        for b in preset.backends:
+            self.assertEqual(b.health_path, "/health")
+            self.assertTrue(b.discover_models)
+
+        self.assertEqual(_format_listen_authority("::1", 8080), "[::1]:8080")
+        self.assertEqual(_format_listen_authority("::", 8080), "[::]:8080")
+        self.assertEqual(_format_listen_authority("127.0.0.1", 8080), "127.0.0.1:8080")
+
+        fake_srv = mock.MagicMock()
+        fake_srv.server_address = ("::1", 8080, 0, 0)
+        fake_srv.serve_forever.side_effect = KeyboardInterrupt()
+        out_buf = io.StringIO()
+        with (
+            mock.patch("router.freetpu_router.create_router_server", return_value=fake_srv),
+            mock.patch("sys.stdout", out_buf),
+        ):
+            rc = router_main(
+                [
+                    "--config",
+                    str(REPO_ROOT / "router" / "examples" / "local-pixel-cluster.json"),
+                    "--host",
+                    "::1",
+                    "--no-initial-probe",
+                ]
+            )
+        self.assertEqual(rc, 0)
+        self.assertIn("http://[::1]:8080/v1", out_buf.getvalue())
+
+    def test_tpu_exporter_normalizes_chunked_transfer_encoding_with_trailing_ows(
+        self,
+    ) -> None:
+        metrics_payload = (
+            b"freetpu_exporter_up 1\n"
+            b"freetpu_tpu_devices_discovered 1\n"
+            b'freetpu_tpu_health_status{chip="0"} 1\n'
+            b'freetpu_tpu_hbm_utilization_ratio{chip="0"} 0.25\n'
+        )
+        chunked_wire = (
+            f"{len(metrics_payload):x}\r\n".encode("ascii")
+            + metrics_payload
+            + b"\r\n0\r\n\r\n"
+        )
+        mode = ["chunked_ows"]
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(4)
+        port = listener.getsockname()[1]
+        stop_evt = threading.Event()
+
+        def _serve() -> None:
+            listener.settimeout(0.2)
+            while not stop_evt.is_set():
+                try:
+                    conn, _ = listener.accept()
+                except TimeoutError:
+                    continue
+                except OSError:
+                    break
+                try:
+                    conn.settimeout(1.0)
+                    conn.recv(4096)
+                    if mode[0] == "chunked_ows":
+                        # Trailing OWS in Transfer-Encoding + persistent connection (no Connection: close).
+                        conn.sendall(
+                            b"HTTP/1.1 200 OK\r\n"
+                            b"Content-Type: text/plain; version=0.0.4\r\n"
+                            b"Transfer-Encoding: chunked  \t\r\n"
+                            b"\r\n"
+                            + chunked_wire
+                        )
+                        # Keep socket open briefly to verify chunked terminator ends read without timeout.
+                        time.sleep(0.3)
+                    else:
+                        conn.sendall(
+                            b"HTTP/1.1 200 OK\r\n"
+                            b"Content-Type: text/plain; version=0.0.4\r\n"
+                            b"Transfer-Encoding: gzip\r\n"
+                            b"Connection: close\r\n"
+                            b"\r\n"
+                            + metrics_payload
+                        )
+                except OSError:
+                    pass
+                finally:
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+
+        thread = threading.Thread(target=_serve, daemon=True)
+        thread.start()
+        try:
+            telem = scrape_tpu_exporter(
+                f"http://127.0.0.1:{port}/metrics",
+                timeout_s=1.0,
+            )
+            self.assertTrue(telem.reachable, msg=f"unexpected error: {telem.error}")
+            self.assertTrue(telem.exporter_up)
+            self.assertEqual(telem.healthy_chips, 1)
+            self.assertAlmostEqual(telem.max_hbm_utilization_ratio or 0.0, 0.25)
+            self.assertTrue(evaluate_tpu_readiness(telem)[0])
+
+            mode[0] = "unsupported_te"
+            telem_bad = scrape_tpu_exporter(
+                f"http://127.0.0.1:{port}/metrics",
+                timeout_s=1.0,
+            )
+            self.assertFalse(telem_bad.reachable)
+            self.assertFalse(evaluate_tpu_readiness(telem_bad)[0])
+        finally:
+            stop_evt.set()
+            listener.close()
+            thread.join(timeout=2.0)
+
 
 def run_self_tests(verbosity: int = 1) -> int:
     """Run all router tests cleanly via unittest."""

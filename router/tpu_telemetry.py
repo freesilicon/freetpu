@@ -1072,6 +1072,36 @@ class DeadlineSocket:
         return getattr(self._sock, name)
 
 
+def _normalize_transfer_encoding(resp: http.client.HTTPResponse) -> None:
+    """Normalize `Transfer-Encoding` headers with RFC 9112 OWS so chunked decoding is reliable."""
+    headers = getattr(resp, "headers", None)
+    raw_values: Optional[List[str]] = None
+    if headers is not None and hasattr(headers, "get_all"):
+        raw_values = headers.get_all("Transfer-Encoding")
+    else:
+        single = resp.getheader("Transfer-Encoding")
+        if single is not None:
+            raw_values = [single]
+    if not raw_values:
+        return
+    codings: List[str] = []
+    for raw_hdr in raw_values:
+        for part in str(raw_hdr).split(","):
+            token = part.strip(" \t").lower()
+            if token:
+                codings.append(token)
+    if not codings:
+        raise ValueError("Malformed empty Transfer-Encoding header")
+    if codings != ["chunked"]:
+        raise ValueError(
+            f"Unsupported Transfer-Encoding {codings!r}; only single 'chunked' coding is supported"
+        )
+    if not resp.chunked:
+        resp.chunked = True
+        resp.chunk_left = None
+        resp.length = None
+
+
 def _parse_validated_content_length(
     resp: http.client.HTTPResponse,
 ) -> Optional[int]:
@@ -1113,6 +1143,7 @@ def _read_bounded_http_body(
     max_bytes: int = MAX_EXPORTER_RESPONSE_BYTES,
 ) -> bytes:
     """Read an HTTP response body incrementally under an elapsed wall-clock deadline."""
+    _normalize_transfer_encoding(resp)
     declared_len = _parse_validated_content_length(resp)
     if declared_len is not None and declared_len > max_bytes:
         raise ValueError(f"Exporter response exceeded {max_bytes} byte limit")
@@ -1189,6 +1220,7 @@ def _stream_scrape_tpu_body(
     max_line_bytes: int = MAX_EXPORTER_LINE_BYTES,
 ) -> TpuExporterTelemetry:
     """Stream-read and aggregate only known TPU metrics in O(1) bounded memory."""
+    _normalize_transfer_encoding(resp)
     declared_len = _parse_validated_content_length(resp)
     if declared_len is not None and declared_len > max_bytes:
         raise ValueError(f"Exporter response exceeded {max_bytes} byte limit")

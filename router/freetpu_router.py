@@ -72,6 +72,7 @@ from router.tpu_telemetry import (  # noqa: E402
     ClientDisconnectedError,
     DeadlineSocket,
     TpuExporterTelemetry,
+    _normalize_transfer_encoding,
     evaluate_tpu_readiness,
     scrape_tpu_exporter,
     wait_sockets_readable,
@@ -79,7 +80,7 @@ from router.tpu_telemetry import (  # noqa: E402
 
 __version__ = "0.1.0"
 
-RETRYABLE_STATUS_CODES = (502, 503, 504)
+RETRYABLE_STATUS_CODES = (500, 502, 503, 504)
 UNKNOWN_MODEL_LABEL = "_unknown"
 OTHER_MODEL_LABEL = "_other"
 MAX_METRIC_MODEL_LABELS = 256
@@ -1953,6 +1954,7 @@ class RouterEngine:
                 deadline_sock = DeadlineSocket(raw_sock, deadline, label="Probe response")
                 conn.sock = deadline_sock
             resp = conn.getresponse()
+            _normalize_transfer_encoding(resp)
             upstream_sock = deadline_sock if deadline_sock is not None else raw_sock
             raw = _read_bounded_http_response(
                 resp,
@@ -4149,6 +4151,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                     )
                     conn.sock = deadline_sock
                 resp = conn.getresponse()
+                _normalize_transfer_encoding(resp)
                 upstream_sock = deadline_sock if deadline_sock is not None else raw_sock
 
                 if resp.status in RETRYABLE_STATUS_CODES:
@@ -5926,6 +5929,14 @@ def _apply_cli_overrides(cfg: RouterConfig, args: argparse.Namespace) -> None:
         cfg.usage_meter = {"type": "jsonl", "jsonl_path": str(args.usage_jsonl)}
 
 
+def _format_listen_authority(host: str, port: int) -> str:
+    """Format `host:port` bracketing IPv6 literals for valid URL authorities."""
+    host_str = str(host)
+    if ":" in host_str and not host_str.startswith("["):
+        return f"[{host_str}]:{port}"
+    return f"{host_str}:{port}"
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = _build_cli_parser()
     args = parser.parse_args(argv)
@@ -5959,7 +5970,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.check_config:
         print(
             f"Config OK: policy={cfg.policy}, backends={len(cfg.backends)}, "
-            f"listen={cfg.host}:{cfg.port}"
+            f"listen={_format_listen_authority(cfg.host, cfg.port)}"
         )
         return 0
 
@@ -5970,7 +5981,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     bound_host, bound_port = server.server_address[:2]
     print(
-        f"FreeTPU Router v{__version__} listening on http://{bound_host}:{bound_port}/v1 "
+        f"FreeTPU Router v{__version__} listening on http://{_format_listen_authority(bound_host, bound_port)}/v1 "
         f"(policy={cfg.policy}, backends={len(cfg.backends)})",
         flush=True,
     )
