@@ -1650,7 +1650,8 @@ static void test_freetile_descriptor_and_planner() {
   OT_CHECK(bf16_plan.tiles_m == 1u && bf16_plan.tiles_k == 32u && bf16_plan.tiles_n == 32u);
   OT_CHECK(bf16_plan.vmem.stages == 2u);
   OT_CHECK(bf16_plan.desc.block_spec.vmem_double_buffer);
-  OT_CHECK(bf16_plan.vmem.total_vmem_bytes == 2u * (32768u + 32768u) + 65536u + 32768u);
+  OT_CHECK(bf16_plan.vmem.acc_vmem_bytes == 0u);  // Accumulators live in v48..v63 registers
+  OT_CHECK(bf16_plan.vmem.total_vmem_bytes == 2u * (32768u + 32768u) + 32768u);
   OT_CHECK(bf16_plan.vmem.total_vmem_bytes <= 16u * 1024u * 1024u);
 
   // Multi-K BF16 always emits 2-stage ping-pong VMEM even if vmem_double_buffer hint is 0;
@@ -1670,7 +1671,8 @@ static void test_freetile_descriptor_and_planner() {
   OT_CHECK(bf16_k1_plan.valid);
   OT_CHECK(bf16_k1_plan.vmem.stages == 1u);
   OT_CHECK(!bf16_k1_plan.desc.block_spec.vmem_double_buffer);
-  OT_CHECK(bf16_k1_plan.vmem.total_vmem_bytes == 1u * (32768u + 32768u) + 65536u + 32768u);
+  OT_CHECK(bf16_k1_plan.vmem.acc_vmem_bytes == 0u);
+  OT_CHECK(bf16_k1_plan.vmem.total_vmem_bytes == 1u * (32768u + 32768u) + 32768u);
 
   ot_freetile_gemm_desc_t q4 = ot_freetile_gemm_desc_default(128u, 512u, 512u);
   q4.rhs_dtype = OT_DTYPE_Q4_0;
@@ -1679,15 +1681,17 @@ static void test_freetile_descriptor_and_planner() {
   const ot::freetile::LoweringPlan q4_plan =
       ot::freetile::plan_v5e_tile_gemm(ot::freetile::TileKernelDescriptor::from_c_desc(q4));
   OT_CHECK(q4_plan.valid);
-  // Quantized IMEM kernel is single-stage (1 stage) with dequant staging + 36 KiB constants.
+  // Quantized IMEM kernel is single-stage: 32 KiB LHS + 8 KiB Q4 + 32 KiB cleared scale window
+  // + 32 KiB dequant BF16 staging + 36 KiB constants + 32 KiB OUT (0 VMEM for register acc).
   OT_CHECK(q4_plan.vmem.stages == 1u);
   OT_CHECK(!q4_plan.desc.block_spec.vmem_double_buffer);
   OT_CHECK(q4_plan.vmem.rhs_vmem_bytes == 8192u);
-  OT_CHECK(q4_plan.vmem.scale_vmem_bytes == 1024u);
+  OT_CHECK(q4_plan.vmem.scale_vmem_bytes == 32768u);
   OT_CHECK(q4_plan.vmem.dequant_vmem_bytes == 32768u);
   OT_CHECK(q4_plan.vmem.const_vmem_bytes == 36864u);
+  OT_CHECK(q4_plan.vmem.acc_vmem_bytes == 0u);
   OT_CHECK(q4_plan.vmem.total_vmem_bytes ==
-           32768u + 8192u + 1024u + 32768u + 36864u + 65536u + 32768u);
+           32768u + 8192u + 32768u + 32768u + 36864u + 32768u);
   const uint64_t expected_q4_512_hbm =
       4ULL * (128ULL * 512ULL * 2ULL) +       // tiles_n * A
       1ULL * (512ULL * 512ULL / 2ULL) +       // tiles_m * B_q4
@@ -1744,7 +1748,7 @@ static void test_freetile_descriptor_and_planner() {
       2ULL * 36864ULL;
   OT_CHECK(q8_2c_plan.hbm_bytes_moved == expected_q8_2c_hbm);
 
-  // Reserved Q4_K / BLOCK_256 must be rejected cleanly by the planner.
+  // Reserved Q4_K / BLOCK_256 and unsupported quantization descriptors must be rejected by planner.
   ot_freetile_gemm_desc_t q4k = ot_freetile_gemm_desc_default(128u, 256u, 256u);
   q4k.rhs_dtype = OT_DTYPE_Q4_K;
   q4k.quant_mode = OT_QUANT_BLOCK_256;
@@ -1752,6 +1756,28 @@ static void test_freetile_descriptor_and_planner() {
   OT_CHECK(!ot::freetile::plan_v5e_tile_gemm(
                 ot::freetile::TileKernelDescriptor::from_c_desc(q4k))
                 .valid);
+
+  ot_freetile_gemm_desc_t i8_none = ot_freetile_gemm_desc_default(128u, 256u, 256u);
+  i8_none.rhs_dtype = OT_DTYPE_INT8;
+  i8_none.quant_mode = OT_QUANT_NONE;
+  OT_CHECK(!ot::freetile::plan_v5e_tile_gemm(
+                ot::freetile::TileKernelDescriptor::from_c_desc(i8_none))
+                .valid);
+
+  ot_freetile_gemm_desc_t bf16_badq = ot_freetile_gemm_desc_default(128u, 256u, 256u);
+  bf16_badq.quant_mode = OT_QUANT_BLOCK_32;
+  OT_CHECK(!ot::freetile::plan_v5e_tile_gemm(
+                ot::freetile::TileKernelDescriptor::from_c_desc(bf16_badq))
+                .valid);
+
+  ot_freetile_gemm_desc_t q8_bad_sd = q8_2c;
+  q8_bad_sd.scale_dtype = OT_DTYPE_INT8;
+  OT_CHECK(!ot::freetile::plan_v5e_tile_gemm(
+                ot::freetile::TileKernelDescriptor::from_c_desc(q8_bad_sd))
+                .valid);
+
+  OT_CHECK(q8_2c_plan.vmem.total_vmem_bytes ==
+           32768u + 16384u + 32768u + 32768u + 36864u + 32768u);
 
   ot_freetile_gemm_desc_t bad = ot_freetile_gemm_desc_default(128u, 130u, 128u);
   const ot::freetile::LoweringPlan bad_plan =
@@ -2039,6 +2065,17 @@ static void test_mock_multitile_and_quant_matmul() {
     OT_CHECK(ot_matmul_quant(ctx, bqa, bqi8, nullptr, bqout, &i8_nosc, nullptr) ==
              OT_ERR_INVALID_ARG);
 
+    // INT8 with OT_QUANT_NONE must be rejected by both planner and ot_matmul_quant.
+    ot_freetile_gemm_desc_t i8_none = q8d;
+    i8_none.rhs_dtype = OT_DTYPE_INT8;
+    i8_none.quant_mode = OT_QUANT_NONE;
+    i8_none.quant_group_size = 0u;
+    OT_CHECK(!ot::freetile::plan_v5e_tile_gemm(
+                  ot::freetile::TileKernelDescriptor::from_c_desc(i8_none))
+                  .valid);
+    OT_CHECK(ot_matmul_quant(ctx, bqa, bqi8, bqsc, bqout, &i8_none, nullptr) ==
+             OT_ERR_INVALID_ARG);
+
     // Huge dimensions with small buffers must fail fast on buffer-size validation
     // (O(1), never spinning in launch planning).
     ot_freetile_gemm_desc_t huge_q = ot_freetile_gemm_desc_default(1048576u, 131072u, 1048576u);
@@ -2144,10 +2181,14 @@ static void test_mock_multitile_and_quant_matmul() {
                          ref_256.data() + ref_128.size(),
                          (BM * BN - ref_128.size()) * 2u) == 0);
 
-    // 6b) Re-populate 256x256 tiled `bmc`, then overwrite prefix with non-tile-aligned 64x64x64 GEMM.
+    // 6b) Re-populate 256x256 tiled `bmc`, then overwrite prefix with non-tile-aligned 64x64x64 GEMM,
+    //     and verify wall_us and hbm_bytes_moved are populated on non-tile-aligned mock stats.
     OT_CHECK(ot_matmul_bf16_ex(ctx, bma, bmb, bmc, &d256, nullptr) == OT_OK);
     const ot_freetile_gemm_desc_t d64 = ot_freetile_gemm_desc_default(64u, 64u, 64u);
-    OT_CHECK(ot_matmul_bf16_ex(ctx, bma, bmb, bmc, &d64, nullptr) == OT_OK);
+    ot_exec_stats_t stats_64{};
+    OT_CHECK(ot_matmul_bf16_ex(ctx, bma, bmb, bmc, &d64, &stats_64) == OT_OK);
+    OT_CHECK(stats_64.wall_us > 0u);
+    OT_CHECK(stats_64.hbm_bytes_moved == 3ULL * 64ULL * 64ULL * sizeof(uint16_t));
     std::vector<uint16_t> after_64(BM * BN, 0u);
     OT_CHECK(ot_buffer_d2h(ctx, bmc, after_64.data(), after_64.size() * 2u) == OT_OK);
     OT_CHECK(std::memcmp(after_64.data() + (64u * 64u),

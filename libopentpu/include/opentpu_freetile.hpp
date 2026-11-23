@@ -106,11 +106,11 @@ struct TileKernelDescriptor {
 struct VmemBufferPlan {
   uint32_t lhs_vmem_bytes = 0;     // Per stage (x2 when double buffered)
   uint32_t rhs_vmem_bytes = 0;     // Per stage (x2 when double buffered)
-  uint32_t scale_vmem_bytes = 0;   // Per stage if quantized (1 KiB DMA window)
-  uint32_t dequant_vmem_bytes = 0; // BF16 dequantized RHS tile staging if quantized
-  uint32_t const_vmem_bytes = 0;   // Dequant Sel + IEEE-754 bias constants if quantized
-  uint32_t acc_vmem_bytes = 0;     // FP32 accumulator / staging
-  uint32_t out_vmem_bytes = 0;     // Output BF16 tile
+  uint32_t scale_vmem_bytes = 0;   // Scale VMEM scratch region if quantized (32 KiB cleared window)
+  uint32_t dequant_vmem_bytes = 0; // BF16 dequantized RHS tile staging if quantized (32 KiB)
+  uint32_t const_vmem_bytes = 0;   // Dequant Sel + IEEE-754 bias constants if quantized (36 KiB)
+  uint32_t acc_vmem_bytes = 0;     // 0 on v5e (FP32 accumulators live in vector registers v48..v63)
+  uint32_t out_vmem_bytes = 0;     // Output BF16 tile (32 KiB)
   uint32_t total_vmem_bytes = 0;
   uint32_t stages = 1;
 };
@@ -127,48 +127,98 @@ struct LoweringPlan {
   uint64_t hbm_bytes_moved = 0;
 };
 
-// Validate and plan a FreeTile GEMM/Dequant-GEMM kernel for TPU v5e-1 (16 MiB VMEM).
-inline LoweringPlan plan_v5e_tile_gemm(const TileKernelDescriptor& desc) {
-  LoweringPlan plan;
-  plan.desc = desc;
+// Shared descriptor contract validator used by both plan_v5e_tile_gemm() and
+// ot_matmul_bf16_ex() / ot_matmul_quant() so planner and runtime strictly agree.
+inline bool validate_v5e_tile_gemm_desc(const TileKernelDescriptor& desc, std::string* error) {
   const uint32_t bm = desc.block_spec.block_m;
   const uint32_t bk = desc.block_spec.block_k;
   const uint32_t bn = desc.block_spec.block_n;
   if (desc.m_dim == 0u || desc.k_dim == 0u || desc.n_dim == 0u) {
-    plan.error = "GEMM dimensions must be non-zero";
-    return plan;
+    if (error) *error = "GEMM dimensions must be non-zero";
+    return false;
   }
   if (bm != 128u || bk != 128u || bn != 128u) {
-    plan.error = "v5e MXU native tile block must be 128x128x128";
-    return plan;
+    if (error) *error = "v5e MXU native tile block must be 128x128x128";
+    return false;
   }
   if ((desc.m_dim % bm) != 0u || (desc.k_dim % bk) != 0u || (desc.n_dim % bn) != 0u) {
-    plan.error = "GEMM dimensions must be multiples of tile block (128, 128, 128)";
-    return plan;
+    if (error) *error = "GEMM dimensions must be multiples of tile block (128, 128, 128)";
+    return false;
   }
   if (desc.lhs_dtype != DType::kBf16 || desc.out_dtype != DType::kBf16) {
-    plan.error = "v5e tile GEMM requires BF16 activations and outputs";
-    return plan;
+    if (error) *error = "v5e tile GEMM requires BF16 activations and outputs";
+    return false;
   }
   if (desc.rhs_dtype == DType::kQ4_K || desc.quant.mode == OT_QUANT_BLOCK_256) {
-    plan.error = "Q4_K / BLOCK_256 is reserved and not yet supported";
+    if (error) *error = "Q4_K / BLOCK_256 is reserved and not yet supported";
+    return false;
+  }
+  if (desc.rhs_dtype == DType::kBf16) {
+    if (desc.quant.mode != OT_QUANT_NONE || desc.quant.group_size != 0u) {
+      if (error) *error = "BF16 tile GEMM requires OT_QUANT_NONE and quant_group_size == 0";
+      return false;
+    }
+    return true;
+  }
+  if (desc.rhs_dtype != DType::kInt8 && desc.rhs_dtype != DType::kQ8_0 &&
+      desc.rhs_dtype != DType::kQ4_0) {
+    if (error) *error = "Unsupported RHS dtype for v5e tile GEMM";
+    return false;
+  }
+  if (desc.quant.mode == OT_QUANT_BLOCK_32) {
+    if (desc.quant.group_size != 0u && desc.quant.group_size != OT_QK8_0) {
+      if (error) *error = "OT_QUANT_BLOCK_32 requires quant_group_size of 0 or 32";
+      return false;
+    }
+  } else if (desc.quant.mode == OT_QUANT_PER_CHANNEL || desc.quant.mode == OT_QUANT_PER_TENSOR) {
+    if (desc.quant.group_size != 0u) {
+      if (error) *error = "Per-channel / per-tensor quant requires quant_group_size == 0";
+      return false;
+    }
+  } else if (desc.quant.mode == OT_QUANT_NONE &&
+             (desc.rhs_dtype == DType::kQ8_0 || desc.rhs_dtype == DType::kQ4_0)) {
+    if (desc.quant.group_size != 0u && desc.quant.group_size != OT_QK8_0) {
+      if (error) *error = "Q8_0 / Q4_0 requires quant_group_size of 0 or 32";
+      return false;
+    }
+  } else {
+    if (error) *error = "Unsupported quantization mode for RHS dtype";
+    return false;
+  }
+  if (desc.quant.scale_dtype != DType::kBf16 && desc.quant.scale_dtype != DType::kF32) {
+    if (error) *error = "Quantized GEMM scale_dtype must be OT_DTYPE_BF16 or OT_DTYPE_F32";
+    return false;
+  }
+  return true;
+}
+
+// Validate and plan a FreeTile GEMM/Dequant-GEMM kernel for TPU v5e-1 (16 MiB VMEM).
+inline LoweringPlan plan_v5e_tile_gemm(const TileKernelDescriptor& desc) {
+  LoweringPlan plan;
+  plan.desc = desc;
+  if (!validate_v5e_tile_gemm_desc(desc, &plan.error)) {
     return plan;
   }
-  if (desc.rhs_dtype != DType::kBf16 && desc.rhs_dtype != DType::kInt8 &&
-      desc.rhs_dtype != DType::kQ8_0 && desc.rhs_dtype != DType::kQ4_0) {
-    plan.error = "Unsupported RHS dtype for v5e tile GEMM";
-    return plan;
-  }
+  const uint32_t bm = desc.block_spec.block_m;
+  const uint32_t bk = desc.block_spec.block_k;
+  const uint32_t bn = desc.block_spec.block_n;
 
   plan.tiles_m = desc.m_dim / bm;
   plan.tiles_k = desc.k_dim / bk;
   plan.tiles_n = desc.n_dim / bn;
   const bool is_quant = (desc.rhs_dtype != DType::kBf16);
-  // Match the exact DMA schedule emitted by ot_vliw.h:
-  // - BF16 multi-K (tiles_k > 1) always uses 2-stage ping-pong VMEM (0x000/0x040 + 0x080/0x0c0).
-  // - BF16 single-K (tiles_k == 1) uses only stage 0 (0x000/0x040).
-  // - Quantized IMEM kernels are single-stage (0x000 LHS, 0x0c0 Q, 0x140 scales,
-  //   0x040 dequant BF16 staging, 0x180 constants).
+  if (is_quant && plan.desc.quant.mode == OT_QUANT_NONE) {
+    plan.desc.quant.mode = OT_QUANT_BLOCK_32;
+    if (plan.desc.quant.group_size == 0u) plan.desc.quant.group_size = OT_QK8_0;
+  }
+  // Match the exact VMEM layout & DMA schedule emitted by ot_vliw.h:
+  // - BF16 multi-K (tiles_k > 1): 2-stage ping-pong LHS+RHS (0x000/0x040 + 0x080/0x0c0) + OUT (0x100).
+  // - BF16 single-K (tiles_k == 1): 1-stage LHS+RHS (0x000/0x040) + OUT (0x100).
+  // - Quantized kernels: 1-stage LHS (0x000, 32 KiB) + packed Q (0x0c0, 8/16 KiB) +
+  //   dequant BF16 RHS staging (0x040, 32 KiB) + OUT (0x100, 32 KiB) +
+  //   cleared 8-VREG scale scratch window (0x140..0x178, 32 KiB) +
+  //   constants (0x180 Sel 32 KiB + 0x1c0/0x1d0 bias 4 KiB = 36 KiB).
+  // - FP32 accumulators (v48..v63) live in vector registers, not VMEM (acc_vmem_bytes = 0).
   const uint32_t stages = (!is_quant && plan.tiles_k > 1u) ? 2u : 1u;
   plan.desc.block_spec.vmem_double_buffer = (stages == 2u);
   plan.vmem.stages = stages;
@@ -182,15 +232,16 @@ inline LoweringPlan plan_v5e_tile_gemm(const TileKernelDescriptor& desc) {
     rhs_elem_den = 2u;
   }
   plan.vmem.rhs_vmem_bytes = static_cast<uint32_t>((static_cast<uint64_t>(bk) * bn * rhs_elem_num) / rhs_elem_den);
-  plan.vmem.scale_vmem_bytes = is_quant ? static_cast<uint32_t>(kV5eQuantScaleTileDmaBytes) : 0u;
+  // Quantized emitter zeroes 8 VREGs (8 * 4 KiB = 32 KiB) at VMEM[0x140..0x178] for scale staging.
+  plan.vmem.scale_vmem_bytes = is_quant ? (8u * 4096u) : 0u;
   plan.vmem.dequant_vmem_bytes = is_quant ? (bk * bn * 2u) : 0u;
   plan.vmem.const_vmem_bytes = is_quant ? static_cast<uint32_t>(kV5eQuantConstChunkDmaBytes) : 0u;
-  plan.vmem.acc_vmem_bytes = bm * bn * 4u;
+  plan.vmem.acc_vmem_bytes = 0u;
   plan.vmem.out_vmem_bytes = bm * bn * 2u;
   plan.vmem.total_vmem_bytes =
-      stages * (plan.vmem.lhs_vmem_bytes + plan.vmem.rhs_vmem_bytes + plan.vmem.scale_vmem_bytes) +
-      plan.vmem.dequant_vmem_bytes + plan.vmem.const_vmem_bytes +
-      plan.vmem.acc_vmem_bytes + plan.vmem.out_vmem_bytes;
+      stages * (plan.vmem.lhs_vmem_bytes + plan.vmem.rhs_vmem_bytes) +
+      plan.vmem.scale_vmem_bytes + plan.vmem.dequant_vmem_bytes +
+      plan.vmem.const_vmem_bytes + plan.vmem.acc_vmem_bytes + plan.vmem.out_vmem_bytes;
 
   // v5e TensorCore VMEM budget is 16 MiB (16,777,216 B) per core.
   if (plan.vmem.total_vmem_bytes > 16u * 1024u * 1024u) {
