@@ -12065,6 +12065,206 @@ asyncio.run(main())
         self.assertEqual(st4, 200)
         self.assertEqual(recorded_usage[3].completion_tokens, 0)
 
+    def test_loopback_credential_guard_rejects_trailing_dot_ip_and_non_loopback_peer(
+        self,
+    ) -> None:
+        from router.config import is_loopback_host
+        from router.freetpu_router import _verify_connected_peer_for_credentials
+
+        self.assertFalse(is_loopback_host("127.0.0.1."))
+        self.assertFalse(is_loopback_host("::1."))
+        self.assertTrue(is_loopback_host("127.0.0.1"))
+        self.assertTrue(is_loopback_host("::1"))
+        self.assertTrue(is_loopback_host("localhost"))
+        self.assertTrue(is_loopback_host("localhost."))
+
+        with self.assertRaisesRegex(ValueError, "plaintext HTTP"):
+            BackendConfig(
+                id="dot-ip",
+                base_url="http://127.0.0.1.:8000/v1",
+                api_key="secret-token",
+            ).validate()
+
+        closed = [False]
+
+        class _FakeRemoteSock:
+            def getpeername(self) -> Tuple[str, int]:
+                return ("203.0.113.10", 8000)
+
+        class _FakeConn:
+            def __init__(self) -> None:
+                self.sock: Any = _FakeRemoteSock()
+
+            def connect(self) -> None:
+                pass
+
+            def close(self) -> None:
+                closed[0] = True
+                self.sock = None
+
+        bcfg = BackendConfig(
+            id="spoofed-localhost",
+            base_url="http://localhost:8000/v1",
+            api_key="secret-token",
+        )
+        bcfg.validate()
+        with self.assertRaisesRegex(ValueError, "non-loopback peer"):
+            _verify_connected_peer_for_credentials(
+                _FakeConn(),  # type: ignore[arg-type]
+                bcfg,
+                "http",
+                "secret-token",
+            )
+        self.assertTrue(closed[0])
+
+    def test_interrupted_multi_choice_continuous_usage_preserves_per_choice_totals(
+        self,
+    ) -> None:
+        recorded_usage: List[UsageEvent] = []
+
+        class _RecordHook:
+            def record_usage(self, event: UsageEvent) -> None:
+                recorded_usage.append(event)
+
+        complete_with_final_frame = [False]
+
+        class _ContinuousMultiChoiceHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return None
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = json.dumps(
+                    {"object": "list", "data": [{"id": "m-cont-n2"}]}
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802
+                clen = int(self.headers.get("Content-Length", "0"))
+                if clen > 0:
+                    self.rfile.read(clen)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(
+                    b'data: {"id":"v-n2","object":"chat.completion.chunk",'
+                    b'"choices":[{"index":0,"delta":{"content":"a"},"finish_reason":null}],'
+                    b'"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}\n\n'
+                    b'data: {"id":"v-n2","object":"chat.completion.chunk",'
+                    b'"choices":[{"index":0,"delta":{"content":"b"},"finish_reason":null}],'
+                    b'"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}}\n\n'
+                    b'data: {"id":"v-n2","object":"chat.completion.chunk",'
+                    b'"choices":[{"index":1,"delta":{"content":"c"},"finish_reason":null}],'
+                    b'"usage":{"prompt_tokens":10,"completion_tokens":15,"total_tokens":25}}\n\n'
+                )
+                if complete_with_final_frame[0]:
+                    self.wfile.write(
+                        b'data: {"id":"v-n2","object":"chat.completion.chunk",'
+                        b'"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+                        b'data: {"id":"v-n2","object":"chat.completion.chunk",'
+                        b'"choices":[{"index":1,"delta":{},"finish_reason":"stop"}]}\n\n'
+                        b'data: {"id":"v-n2","object":"chat.completion.chunk","choices":[],'
+                        b'"usage":{"prompt_tokens":10,"completion_tokens":40,"total_tokens":50}}\n\n'
+                        b"data: [DONE]\n\n"
+                    )
+                self.wfile.flush()
+
+        srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _ContinuousMultiChoiceHandler))
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            failure_cooldown_s=30.0,
+            backends=[
+                BackendConfig(
+                    id="cont-n2-b",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=f"http://127.0.0.1:{srv.server_address[1]}/v1",
+                    models=["m-cont-n2"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg, usage_hook=_RecordHook()))
+        rport = router.server_address[1]
+
+        # 1. Interrupted multi-choice continuous-usage stream sums latest count per choice (20+15=35).
+        conn = http.client.HTTPConnection("127.0.0.1", rport, timeout=3.0)
+        try:
+            body = json.dumps(
+                {
+                    "model": "m-cont-n2",
+                    "n": 2,
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                    "messages": [{"role": "user", "content": "interrupted"}],
+                }
+            ).encode("utf-8")
+            conn.request(
+                "POST",
+                "/v1/chat/completions",
+                body=body,
+                headers={"Content-Type": "application/json"},
+            )
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)
+            with self.assertRaises(http.client.IncompleteRead):
+                resp.read()
+        finally:
+            conn.close()
+        self.assertEqual(len(recorded_usage), 1)
+        self.assertEqual(recorded_usage[0].status_code, 502)
+        self.assertEqual(recorded_usage[0].prompt_tokens, 10)
+        self.assertEqual(recorded_usage[0].completion_tokens, 35)
+
+        # 2. Final request-wide choices:[] usage frame supersedes per-choice sum when it arrives.
+        router.engine._backends[0].healthy = True
+        router.engine._backends[0].cooldown_until_monotonic = 0.0
+        complete_with_final_frame[0] = True
+        st2, _, bd2 = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-cont-n2",
+                "n": 2,
+                "stream": True,
+                "stream_options": {"include_usage": True},
+                "messages": [{"role": "user", "content": "complete"}],
+            },
+        )
+        self.assertEqual(st2, 200)
+        self.assertIn(b"data: [DONE]", bd2)
+        self.assertEqual(recorded_usage[1].status_code, 200)
+        self.assertEqual(recorded_usage[1].prompt_tokens, 10)
+        self.assertEqual(recorded_usage[1].completion_tokens, 40)
+
+    def test_tpu_exporter_handles_dns_worker_thread_start_failure_cleanly(self) -> None:
+        from router import tpu_telemetry as telemetry_mod
+
+        sem_before = telemetry_mod._DNS_RESOLVER_SEMAPHORE._value
+        with mock.patch.object(
+            threading.Thread,
+            "start",
+            side_effect=RuntimeError("can't start new thread"),
+        ):
+            telem = scrape_tpu_exporter(
+                "http://tpu-node.local:9400/metrics",
+                timeout_s=0.5,
+            )
+        self.assertFalse(telem.reachable)
+        self.assertFalse(telem.exporter_up)
+        self.assertEqual(telem.error, "exporter_network_error:OSError")
+        self.assertEqual(telemetry_mod._DNS_RESOLVER_SEMAPHORE._value, sem_before)
+
 
 def run_self_tests(verbosity: int = 1) -> int:
     """Run all router tests cleanly via unittest."""

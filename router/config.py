@@ -105,12 +105,14 @@ def _validate_int_range(
 
 
 def is_loopback_host(host: str) -> bool:
-    """Return True if `host` is a loopback hostname (`localhost`) or IP (`127.0.0.0/8`, `::1`)."""
-    cleaned = host.strip().lower().rstrip(".")
+    """Return True if `host` is a loopback hostname (`localhost`) or canonical loopback IP (`127.0.0.0/8`, `::1`)."""
+    cleaned = host.strip().lower()
     if cleaned.startswith("[") and cleaned.endswith("]"):
         cleaned = cleaned[1:-1]
-    if cleaned == "localhost":
+    if cleaned.rstrip(".") == "localhost":
         return True
+    # Do not strip trailing dots before IP parsing: glibc getaddrinfo sends
+    # trailing-dot numeric spellings such as `127.0.0.1.` to DNS resolution.
     addr_str = cleaned.split("%", 1)[0]
     try:
         return ipaddress.ip_address(addr_str).is_loopback

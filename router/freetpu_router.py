@@ -524,6 +524,42 @@ def _ensure_safe_credential_transport(
         )
 
 
+def _verify_connected_peer_for_credentials(
+    conn: http.client.HTTPConnection,
+    backend: BackendConfig,
+    scheme: str,
+    api_key: Optional[str],
+) -> None:
+    """Connect and verify the TCP peer IP is loopback before transmitting plaintext credentials."""
+    if (
+        not api_key
+        or scheme.lower() != "http"
+        or backend.allow_insecure_http is True
+    ):
+        return
+    if conn.sock is None:
+        conn.connect()
+    peer_sock = conn.sock
+    if peer_sock is None:
+        raise ValueError(
+            f"Refusing to send bearer credentials for backend {backend.id!r} without a connected loopback peer"
+        )
+    try:
+        peer_ip = str(peer_sock.getpeername()[0]).split("%", 1)[0]
+        is_peer_loopback = ipaddress.ip_address(peer_ip).is_loopback
+    except (OSError, ValueError, IndexError):
+        is_peer_loopback = False
+    if not is_peer_loopback:
+        try:
+            conn.close()
+        except OSError:
+            pass
+        raise ValueError(
+            f"Refusing to send bearer credentials for backend {backend.id!r} over "
+            f"plaintext HTTP to non-loopback peer; use 'https://' or set 'allow_insecure_http': true"
+        )
+
+
 def _expected_stream_prompt_batch_size(
     endpoint: str,
     req_payload: Mapping[str, Any],
@@ -1742,6 +1778,7 @@ class RouterEngine:
             if rem <= 0:
                 raise TimeoutError("Probe exceeded elapsed deadline")
             conn = _open_http_connection(scheme, host, port, rem)
+            _verify_connected_peer_for_credentials(conn, backend, scheme, api_key)
             conn.request("GET", path, headers=headers)
             raw_sock = conn.sock
             rem = deadline - time.monotonic()
@@ -3918,6 +3955,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 }
                 api_key = backend.config.resolved_api_key()
                 _ensure_safe_credential_transport(backend.config, scheme, host, api_key)
+                _verify_connected_peer_for_credentials(conn, backend.config, scheme, api_key)
                 if api_key:
                     headers["Authorization"] = f"Bearer {api_key}"
 
@@ -4724,7 +4762,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             saw_done_sentinel = False
             saw_upstream_error_event = False
             finished_choice_indices: set[int] = set()
-            per_choice_terminal_usage: Dict[
+            per_choice_usage: Dict[
                 Tuple[int, ...], Tuple[Optional[int], Optional[int]]
             ] = {}
             per_choice_timings: Dict[
@@ -4889,23 +4927,31 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                     )
                                     if not is_terminal_only_usage:
                                         saw_interim_usage = True
-                                    if (
-                                        is_terminal_only_usage
-                                        and not saw_interim_usage
-                                        and not saw_request_wide_usage
-                                    ):
-                                        # llama-server attaches per-choice usage to each terminal
-                                        # choice chunk in batched streaming completions.
-                                        usage_key = tuple(sorted(set(event_terminal_indices)))
-                                        per_choice_terminal_usage[usage_key] = (pt, ct)
+                                    if not saw_request_wide_usage:
+                                        # Track the latest cumulative counts per choice across
+                                        # both llama-server terminal choice chunks and vLLM
+                                        # continuous_usage_stats interim choice chunks so an
+                                        # interrupted multi-choice stream preserves all choices.
+                                        usage_key = (
+                                            tuple(sorted(set(event_choice_indices)))
+                                            if event_choice_indices
+                                            else (-1,)
+                                        )
+                                        prev_p, prev_c = per_choice_usage.get(
+                                            usage_key, (None, None)
+                                        )
+                                        per_choice_usage[usage_key] = (
+                                            pt if pt is not None else prev_p,
+                                            ct if ct is not None else prev_c,
+                                        )
                                         p_vals = [
                                             p
-                                            for p, _ in per_choice_terminal_usage.values()
+                                            for p, _ in per_choice_usage.values()
                                             if p is not None
                                         ]
                                         c_vals = [
                                             c
-                                            for _, c in per_choice_terminal_usage.values()
+                                            for _, c in per_choice_usage.values()
                                             if c is not None
                                         ]
                                         if p_vals:
@@ -4913,13 +4959,6 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                             saw_explicit_prompt_usage = True
                                         if c_vals:
                                             completion_tokens = sum(c_vals)
-                                            saw_explicit_completion_usage = True
-                                    elif not saw_request_wide_usage:
-                                        if pt is not None:
-                                            prompt_tokens = pt
-                                            saw_explicit_prompt_usage = True
-                                        if ct is not None:
-                                            completion_tokens = ct
                                             saw_explicit_completion_usage = True
                                     if (
                                         is_terminal_only_usage

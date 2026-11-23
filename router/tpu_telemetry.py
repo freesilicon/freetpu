@@ -647,6 +647,9 @@ def _resolve_host_with_deadline(
             daemon=True,
         )
         thread.start()
+    except RuntimeError as exc:
+        _DNS_RESOLVER_SEMAPHORE.release()
+        raise OSError("DNS resolver worker thread failed to start") from exc
     except BaseException:
         _DNS_RESOLVER_SEMAPHORE.release()
         raise
