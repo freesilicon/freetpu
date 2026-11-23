@@ -18,6 +18,10 @@ namespace freetile {
 static constexpr uint32_t kV5eMaxItersPerLaunch = 1024u;
 static constexpr uint64_t kV5eQuantScaleTileDmaBytes = 1024ULL;
 static constexpr uint64_t kV5eQuantConstChunkDmaBytes = 36864ULL;
+// Exact 512 B-aligned (8-bundle) VLIW bundle counts emitted by ot_vliw.h:
+//   BF16  = 456 (28 boot + 49 dispatch + 265 multi-tile + 72 single-tile + 42 epilogue; 0 pad)
+//   Q8/I8 = 664 (verified in opentpu_host_test against emit_v5e_resident_freetile_quant_imem(false))
+//   Q4    = 512 (verified in opentpu_host_test against emit_v5e_resident_freetile_quant_imem(true))
 static constexpr uint32_t kV5eImemBundlesBf16 = 456u;
 static constexpr uint32_t kV5eImemBundlesQuantQ8 = 664u;
 static constexpr uint32_t kV5eImemBundlesQuantQ4 = 512u;

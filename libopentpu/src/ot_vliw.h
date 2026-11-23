@@ -586,17 +586,18 @@ inline void tile_pack_scales_4x128_bf16(const uint16_t* scales_4x128_bf16,
   }
 }
 
-// Build constant 40 KiB HBM buffer required by quantized dequant IMEM kernels:
+// Build constant 40 KiB HBM buffer required by quantized dequant IMEM kernels
+// directly into `out_40kib` with zero heap allocations:
 //   [0x0000..0x8000): Sel[128,128] BF16 tiled (1.0 in cols 0..3 for rows 0..31/32..63/64..95/96..127)
 //   [0x8000..0x9000): C_NEG2304 (1,024 copies of -2304.0f = 0xc5100000u)
 //   [0x9000..0xa000): C_NEG136  (1,024 copies of -136.0f  = 0xc3080000u)
 inline void init_quant_const_vregs_40kib(uint8_t* out_40kib) {
   std::memset(out_40kib, 0, 40960u);
-  std::vector<uint16_t> sel_rm(128u * 128u, 0u);
+  uint16_t* sel_tiled = reinterpret_cast<uint16_t*>(out_40kib);
   for (uint32_t r = 0; r < 128u; ++r) {
-    sel_rm[r * 128u + (r >> 5)] = 0x3f80u;  // 1.0f in BF16
+    const uint32_t c = r >> 5;
+    sel_tiled[((r >> 1) * 256u) + (c * 2u) + (r & 1u)] = 0x3f80u;  // 1.0f in BF16
   }
-  tile_pack_128x128_bf16(sel_rm.data(), reinterpret_cast<uint16_t*>(out_40kib));
 
   uint32_t* neg2304 = reinterpret_cast<uint32_t*>(out_40kib + 32768u);
   uint32_t* neg136 = reinterpret_cast<uint32_t*>(out_40kib + 36864u);

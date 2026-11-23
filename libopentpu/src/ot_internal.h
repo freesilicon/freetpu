@@ -114,6 +114,7 @@ struct VfioTransport {
   bool mock_exec_timeout = false;
   bool mock_exec_poll_error = false;
   bool mock_core_ctrl_fail = false;
+  bool mock_quant_const_upload_fail = false;
   int64_t owner_pid = 0;
 
   bool is_owner_process() const;

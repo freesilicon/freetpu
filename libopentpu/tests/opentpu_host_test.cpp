@@ -1515,8 +1515,18 @@ static void test_vfio_imem_lifecycle_mock() {
   OT_CHECK(ctx->transport.ensure_imem_program(2u, 1000u, &err));
   OT_CHECK(ctx->transport.imem_booted && ctx->transport.loaded_prog_kind == 2u);
 
-  // 2b) ensure_quant_constants HBM OOM must set last_op_oom so transport maps to OT_ERR_NO_MEMORY.
+  // 2b) ensure_quant_constants HBM OOM must set last_op_oom, and upload failure must
+  //     leave quant_const_hbm == 0 without leaking the HBM allocation.
   {
+    const uint64_t used_before = ctx->transport.hbm_alloc.used_bytes();
+    ctx->transport.mock_quant_const_upload_fail = true;
+    err.clear();
+    OT_CHECK(!ctx->transport.ensure_quant_constants(1000u, &err));
+    OT_CHECK(!ctx->transport.last_op_oom);
+    OT_CHECK(ctx->transport.quant_const_hbm == 0ULL);
+    OT_CHECK(ctx->transport.hbm_alloc.used_bytes() == used_before);
+    ctx->transport.mock_quant_const_upload_fail = false;
+
     const uint64_t avail =
         ctx->transport.hbm_alloc.capacity_bytes() - ctx->transport.hbm_alloc.used_bytes();
     uint64_t filler_addr = 0;
@@ -1857,6 +1867,27 @@ static void test_freetile_vliw_emitters_and_packing() {
   const auto bf16_prog = ot::emit_v5e_resident_freetile_bf16_imem();
   const auto q8_prog = ot::emit_v5e_resident_freetile_quant_imem(/*is_q4=*/false);
   const auto q4_prog = ot::emit_v5e_resident_freetile_quant_imem(/*is_q4=*/true);
+
+  OT_CHECK(bf16_prog.size() == ot::freetile::kV5eImemBundlesBf16);
+  OT_CHECK(q8_prog.size() == ot::freetile::kV5eImemBundlesQuantQ8);
+  OT_CHECK(q4_prog.size() == ot::freetile::kV5eImemBundlesQuantQ4);
+
+  // Verify zero-alloc init_quant_const_vregs_40kib matches tile_pack_128x128_bf16 + FP32 constants.
+  {
+    std::vector<uint8_t> got_40k(40960u, 0xaau);
+    ot::init_quant_const_vregs_40kib(got_40k.data());
+    std::vector<uint16_t> sel_rm(128u * 128u, 0u);
+    for (uint32_t r = 0; r < 128u; ++r) sel_rm[r * 128u + (r >> 5)] = 0x3f80u;
+    std::vector<uint16_t> sel_ref(128u * 128u, 0u);
+    ot::tile_pack_128x128_bf16(sel_rm.data(), sel_ref.data());
+    OT_CHECK(std::memcmp(got_40k.data(), sel_ref.data(), 32768u) == 0);
+    for (uint32_t i = 0; i < 1024u; ++i) {
+      uint32_t v0 = 0, v1 = 0;
+      std::memcpy(&v0, got_40k.data() + 32768u + i * 4u, 4u);
+      std::memcpy(&v1, got_40k.data() + 36864u + i * 4u, 4u);
+      OT_CHECK(v0 == 0xc5100000u && v1 == 0xc3080000u);
+    }
+  }
 
   for (const auto* prog : {&bf16_prog, &q8_prog, &q4_prog}) {
     OT_CHECK(!prog->empty());

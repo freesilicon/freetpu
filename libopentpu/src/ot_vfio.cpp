@@ -1515,24 +1515,34 @@ bool VfioTransport::ensure_imem_program(uint32_t prog_kind, uint32_t timeout_ms,
 bool VfioTransport::ensure_quant_constants(uint32_t timeout_ms, std::string* err) {
   last_op_oom = false;
   if (quant_const_hbm != 0) return true;
-  if (!hbm_alloc.alloc(40960u, 4096u, &quant_const_hbm)) {
+  uint64_t hbm_addr = 0;
+  if (!hbm_alloc.alloc(40960u, 4096u, &hbm_addr)) {
     last_op_oom = true;
     if (err) *err = "Out of device HBM for quantized dequant constants (40 KiB)";
     return false;
   }
-  if (is_mock) return true;
+  if (is_mock) {
+    if (mock_quant_const_upload_fail) {
+      hbm_alloc.free(hbm_addr);
+      if (err) *err = "Injected mock failure uploading quantized dequant constants";
+      return false;
+    }
+    quant_const_hbm = hbm_addr;
+    return true;
+  }
   if (!host_stage_mem || host_stage_size < 40960u) {
-    hbm_alloc.free(quant_const_hbm);
-    quant_const_hbm = 0;
+    hbm_alloc.free(hbm_addr);
     if (err) *err = "Host DMA staging too small for quantized dequant constants";
     return false;
   }
   init_quant_const_vregs_40kib(host_stage_mem);
-  if (!dma_h2d_sync(host_stage_iova, quant_const_hbm, 40960u, 0x10u, 0u, timeout_ms, err)) {
-    hbm_alloc.free(quant_const_hbm);
-    quant_const_hbm = 0;
+  if (!dma_h2d_sync(host_stage_iova, hbm_addr, 40960u, 0x10u, 0u, timeout_ms, err)) {
+    if (!dma_faulted) {
+      hbm_alloc.free(hbm_addr);
+    }
     return false;
   }
+  quant_const_hbm = hbm_addr;
   return true;
 }
 
