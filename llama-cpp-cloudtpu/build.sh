@@ -27,9 +27,15 @@ overlay_backend() {
        "$SRC/ggml/src/ggml-cloudtpu/"
     cp "$ROOT/../libopentpu/third_party/openxla/pjrt_c_api.h" "$SRC/ggml/src/ggml-cloudtpu/third_party/openxla/"
 
-    if ! grep -q "GGML_CLOUDTPU" "$SRC/ggml/CMakeLists.txt"; then
-        git -C "$SRC" apply "$ROOT/patches/llama-cpp-b12608-cloudtpu.patch" || \
-            patch -d "$SRC" -p1 < "$ROOT/patches/llama-cpp-b12608-cloudtpu.patch"
+    local patch_file="$ROOT/patches/llama-cpp-b12608-cloudtpu.patch"
+    if git -C "$SRC" apply --reverse --check "$patch_file" 2>/dev/null; then
+        : # Complete overlay patch is already applied.
+    elif git -C "$SRC" apply --check "$patch_file" 2>/dev/null; then
+        git -C "$SRC" apply "$patch_file"
+    else
+        echo "ERROR: llama.cpp tree at '$SRC' has a partially applied or conflicting CLOUDTPU overlay." >&2
+        echo "Reset '$SRC' to clean tag b12608 before re-running $0." >&2
+        exit 1
     fi
 }
 

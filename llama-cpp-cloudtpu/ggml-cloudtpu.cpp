@@ -690,7 +690,8 @@ static void upload_raw_tensor_to_slot(cloudtpu::PjrtRuntime& rt,
     const int64_t N = tensor->ne[1];
     const int64_t K = tensor->ne[0];
 
-    if (tensor->type == GGML_TYPE_Q8_0 && (K % QK8_0) == 0) {
+    const bool is_contig = ggml_is_contiguous(tensor);
+    if (is_contig && tensor->type == GGML_TYPE_Q8_0 && (K % QK8_0) == 0) {
         const size_t nb = static_cast<size_t>(K / QK8_0);
         const size_t nrows = static_cast<size_t>(B3 * B2 * N);
         std::vector<int8_t> qs;
@@ -703,7 +704,7 @@ static void upload_raw_tensor_to_slot(cloudtpu::PjrtRuntime& rt,
         slot.hbm_scales = rt.buffer_from_host(
             device_index, d.data(), cloudtpu::PjrtDType::F16, {B3, B2, N, static_cast<int64_t>(nb)});
         slot.hbm_mins.reset();
-    } else if (tensor->type == GGML_TYPE_Q4_0 && (K % QK4_0) == 0) {
+    } else if (is_contig && tensor->type == GGML_TYPE_Q4_0 && (K % QK4_0) == 0) {
         const size_t nb = static_cast<size_t>(K / QK4_0);
         const size_t nrows = static_cast<size_t>(B3 * B2 * N);
         std::vector<uint8_t> qs;
@@ -716,7 +717,7 @@ static void upload_raw_tensor_to_slot(cloudtpu::PjrtRuntime& rt,
         slot.hbm_scales = rt.buffer_from_host(
             device_index, d.data(), cloudtpu::PjrtDType::F16, {B3, B2, N, static_cast<int64_t>(nb)});
         slot.hbm_mins.reset();
-    } else if (tensor->type == GGML_TYPE_Q4_K && (K % QK_K) == 0) {
+    } else if (is_contig && tensor->type == GGML_TYPE_Q4_K && (K % QK_K) == 0) {
         const size_t nb_k = static_cast<size_t>(K / QK_K);
         const int64_t nb32 = K / 32;
         const size_t nrows = static_cast<size_t>(B3 * B2 * N);
@@ -738,7 +739,7 @@ static void upload_raw_tensor_to_slot(cloudtpu::PjrtRuntime& rt,
             device_index, d_eff.data(), cloudtpu::PjrtDType::F32, {B3, B2, N, nb32});
         slot.hbm_mins = rt.buffer_from_host(
             device_index, m_eff.data(), cloudtpu::PjrtDType::F32, {B3, B2, N, nb32});
-    } else if (tensor->type == GGML_TYPE_Q6_K && (K % QK_K) == 0) {
+    } else if (is_contig && tensor->type == GGML_TYPE_Q6_K && (K % QK_K) == 0) {
         const size_t nb_k = static_cast<size_t>(K / QK_K);
         const int64_t nb16 = K / 16;
         const size_t nrows = static_cast<size_t>(B3 * B2 * N);
