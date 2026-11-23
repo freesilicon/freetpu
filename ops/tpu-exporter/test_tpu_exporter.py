@@ -6376,12 +6376,14 @@ TPU Runtime Utilization
                 {"0", "1", "2", "3"},
             )
 
-            # 8. Separate executable path selection from trusting CLI duty readings:
-            #    (a) Stock `tpu-info` configured by absolute path (`/usr/local/bin/tpu-info`)
-            #        with default `trust_tpu_info_cli_duty=False` keeps direct gRPC first AND
-            #        applies Ironwood duty validation (stripping unverified 2-row duty).
-            #    (b) Explicit custom wrapper (`/opt/telemetry/tpu-info`) with
-            #        `trust_tpu_info_cli_duty=True` runs directly and preserves duty readings!
+            # 8. Execution order and duty-cycle trust are cleanly orthogonal:
+            #    (a) Explicit `/usr/local/bin/tpu-info` (without `--trust-tpu-info-cli-duty`)
+            #        invokes the configured CLI FIRST and applies stock Ironwood duty sanitization.
+            #    (b) Explicit `/opt/telemetry/tpu-info` (without `--trust-tpu-info-cli-duty`)
+            #        invokes `/opt/telemetry/tpu-info` FIRST (even when direct gRPC is healthy!),
+            #        keeps HBM from the wrapper, and applies stock Ironwood duty sanitization.
+            #    (c) Explicit `/opt/telemetry/tpu-info` WITH `--trust-tpu-info-cli-duty`
+            #        invokes the wrapper FIRST and trusts its duty readings!
             stock_abs_dir = root / "usr" / "local" / "bin"
             stock_abs_dir.mkdir(parents=True)
             stock_abs_bin = stock_abs_dir / "tpu-info"
@@ -6399,18 +6401,17 @@ TPU Runtime Utilization
             )
             stock_abs_bin.write_text(stock_cli_body, encoding="utf-8")
             stock_abs_bin.chmod(0o755)
-            grpc_probe_calls: list[str] = []
-
-            def _record_grpc_fail(*_args: object, **kwargs: object) -> tuple[bool, str, dict[str, object]]:
-                grpc_probe_calls.append(str(kwargs.get("addr", "")))
-                return False, "grpc down", {}
-
             with (
                 _mock_vfio_char_lstat(),
                 mock.patch.object(
                     tpu_exporter,
                     "_query_grpc_runtime_metrics",
-                    side_effect=_record_grpc_fail,
+                    side_effect=AssertionError("explicit CLI path must run CLI first, not direct gRPC"),
+                ),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_query_tpu_info_python_metrics",
+                    return_value=(False, "py fallback unavailable", {}),
                 ),
             ):
                 abs_snap = tpu_exporter.collect_snapshot(
@@ -6421,8 +6422,8 @@ TPU Runtime Utilization
                     chip_id_map={"0000:00:04.0": "0", "0000:00:05.0": "1"},
                     shm_root=root / "no-shm",
                 )
-            self.assertEqual(len(grpc_probe_calls), 1)
             abs_by_bdf = {d.pci_bdf: d for d in abs_snap.devices}
+            self.assertEqual(abs_by_bdf["0000:00:04.0"].hbm_used_bytes, 16 * 1024**3)
             self.assertIsNone(abs_by_bdf["0000:00:04.0"].duty_cycle_percent)
             self.assertIsNone(abs_by_bdf["0000:00:05.0"].duty_cycle_percent)
 
@@ -6431,12 +6432,39 @@ TPU Runtime Utilization
             custom_wrapper = custom_dir / "tpu-info"
             custom_wrapper.write_text(stock_cli_body, encoding="utf-8")
             custom_wrapper.chmod(0o755)
+            # Without --trust-tpu-info-cli-duty: runs /opt/telemetry/tpu-info FIRST, sanitizes duty.
             with (
                 _mock_vfio_char_lstat(),
                 mock.patch.object(
                     tpu_exporter,
                     "_query_grpc_runtime_metrics",
-                    side_effect=AssertionError("must not call direct gRPC when --trust-tpu-info-cli-duty is set"),
+                    side_effect=AssertionError("explicit wrapper named tpu-info must run first"),
+                ),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_query_tpu_info_python_metrics",
+                    return_value=(False, "py fallback unavailable", {}),
+                ),
+            ):
+                cw_untrusted = tpu_exporter.collect_snapshot(
+                    sysfs_root=f_sys,
+                    dev_root=f_dev,
+                    proc_root=f_proc,
+                    tpu_info_bin=str(custom_wrapper),
+                    chip_id_map={"0000:00:04.0": "0", "0000:00:05.0": "1"},
+                    shm_root=root / "no-shm",
+                )
+            cwu_by_bdf = {d.pci_bdf: d for d in cw_untrusted.devices}
+            self.assertEqual(cwu_by_bdf["0000:00:04.0"].hbm_used_bytes, 16 * 1024**3)
+            self.assertIsNone(cwu_by_bdf["0000:00:04.0"].duty_cycle_percent)
+
+            # With --trust-tpu-info-cli-duty: runs /opt/telemetry/tpu-info FIRST and preserves duty!
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_query_grpc_runtime_metrics",
+                    side_effect=AssertionError("must not call direct gRPC for explicit wrapper"),
                 ),
             ):
                 cw_snap = tpu_exporter.collect_snapshot(
@@ -6444,13 +6472,55 @@ TPU Runtime Utilization
                     dev_root=f_dev,
                     proc_root=f_proc,
                     tpu_info_bin=str(custom_wrapper),
-                    trust_tpu_info_cli_duty=True,
                     chip_id_map={"0000:00:04.0": "0", "0000:00:05.0": "1"},
+                    trust_tpu_info_cli_duty=True,
                     shm_root=root / "no-shm",
                 )
             cw_by_bdf = {d.pci_bdf: d for d in cw_snap.devices}
             self.assertAlmostEqual(cw_by_bdf["0000:00:04.0"].duty_cycle_percent or 0.0, 75.0)
             self.assertAlmostEqual(cw_by_bdf["0000:00:05.0"].duty_cycle_percent or 0.0, 25.0)
+
+            # 8b. Non-loopback `--runtime-metrics-addr` MUST be rejected up front BEFORE
+            #     calling either direct gRPC OR the Python fallback!
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_query_grpc_runtime_metrics",
+                    side_effect=AssertionError("must not call direct gRPC on non-loopback addr"),
+                ),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_query_tpu_info_python_metrics",
+                    side_effect=AssertionError("must not call Python fallback on non-loopback addr"),
+                ),
+            ):
+                nl_snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=f_sys,
+                    dev_root=f_dev,
+                    proc_root=f_proc,
+                    skip_pid_scan=True,
+                    runtime_metrics_addr="10.0.0.5:8431",
+                    shm_root=root / "no-shm",
+                )
+            self.assertFalse(nl_snap.tpu_info_available)
+            self.assertIn("non-local", nl_snap.tpu_info_error or "")
+
+            # 8c. Positional `chip_id_map` (6th positional arg) MUST remain compatible, and
+            #     malformed PCI BDF keys in `_load_chip_id_map` MUST raise ValueError.
+            with _mock_vfio_char_lstat():
+                pos_snap = tpu_exporter.collect_snapshot(
+                    f_sys,
+                    f_dev,
+                    f_proc,
+                    None,
+                    1.0,
+                    {"0000:00:04.0": "0", "0000:00:05.0": "1"},
+                    shm_root=root / "no-shm",
+                )
+            self.assertEqual(len(pos_snap.devices), 2)
+            with self.assertRaisesRegex(ValueError, "PCI BDF"):
+                tpu_exporter._load_chip_id_map('{"0000:00:08": "0"}')
 
             # 9. `auto`-mode Ironwood where `get_chip_usage_new()` raises AssertionError
             #    on 4 physical-chip duty gauges vs 8 HBM rows: fallback recovers HBM via

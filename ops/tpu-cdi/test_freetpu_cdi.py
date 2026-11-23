@@ -5967,6 +5967,214 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertEqual(same_ann.get("freetpu.dev/pcie-root"), "0000:00")
                 self.assertEqual(same_ann.get("freetpu.dev/numa-node"), "0")
 
+    def test_continuous_sync_startup_map_recovery_dual_mode_preservation_and_bdf_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # 1. Malformed PCI BDF key (e.g. `0000:00:08`) MUST be rejected by `_load_chip_id_map`
+            #    and preserve an existing healthy CDI spec during `generate`/`sync`.
+            with self.assertRaisesRegex(ValueError, "PCI BDF"):
+                freetpu_cdi._load_chip_id_map('{"0000:00:08": 0}')
+            self.assertEqual(
+                freetpu_cdi._load_chip_id_map('{"00:08.0": 2}'),
+                {"0000:00:08.0": 2},
+            )
+
+            # Dual-interface host (legacy `/dev/vfio/0` + iommufd `/dev/vfio/devices/vfio0`).
+            dual_sys, dual_dev = _make_mock_pci_vfio(
+                root / "dual_mode_recovery",
+                devices=[
+                    {
+                        "bdf": "0000:00:04.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                        "iommufd_cdev": "vfio0",
+                    }
+                ],
+                create_vfio_nodes=["0"],
+                create_iommu=True,
+                create_iommufd_cdevs=["vfio0"],
+            )
+            spec_path = root / "cdi" / "dual_legacy.json"
+            map_path = root / "chip_map.json"
+            map_path.write_text('{"0000:00:04.0": 0}\n', encoding="utf-8")
+
+            with _mock_vfio_char_devices():
+                # Publish a healthy legacy spec first.
+                rc_leg, _ol, err_leg = _run_cli_inproc(
+                    [
+                        "generate",
+                        "--output",
+                        str(spec_path),
+                        "--validate",
+                        "--vfio-mode",
+                        "legacy",
+                        "--single-host-env",
+                        "--chip-id-map",
+                        str(map_path),
+                        "--sysfs-root",
+                        str(dual_sys),
+                        "--dev-root",
+                        str(dual_dev),
+                    ]
+                )
+                self.assertEqual(rc_leg, 0, err_leg)
+                orig_text = spec_path.read_text(encoding="utf-8")
+
+                # 2. Malformed BDF key in `generate` fails cleanly & preserves existing spec.
+                rc_bad_bdf, _ob, err_bad_bdf = _run_cli_inproc(
+                    [
+                        "generate",
+                        "--output",
+                        str(spec_path),
+                        "--chip-id-map",
+                        '{"0000:00:08": 0}',
+                        "--sysfs-root",
+                        str(dual_sys),
+                        "--dev-root",
+                        str(dual_dev),
+                    ]
+                )
+                self.assertNotEqual(rc_bad_bdf, 0)
+                self.assertIn("PCI BDF", err_bad_bdf)
+                self.assertTrue(spec_path.exists())
+                self.assertEqual(spec_path.read_text(encoding="utf-8"), orig_text)
+
+                # 3. Running `generate --vfio-mode iommufd` with an unreadable map MUST
+                #    revalidate the existing LEGACY spec in its own `legacy` mode and
+                #    PRESERVE it instead of deleting it!
+                missing_map = root / "does_not_exist.json"
+                rc_mode_sw, _om, err_mode_sw = _run_cli_inproc(
+                    [
+                        "generate",
+                        "--output",
+                        str(spec_path),
+                        "--vfio-mode",
+                        "iommufd",
+                        "--chip-id-map",
+                        str(missing_map),
+                        "--sysfs-root",
+                        str(dual_sys),
+                        "--dev-root",
+                        str(dual_dev),
+                    ]
+                )
+                self.assertNotEqual(rc_mode_sw, 0)
+                self.assertTrue(
+                    spec_path.exists(),
+                    f"Healthy legacy spec must be preserved on map error under --vfio-mode iommufd: {err_mode_sw}",
+                )
+                self.assertEqual(spec_path.read_text(encoding="utf-8"), orig_text)
+
+                # 4a. Continuous `sync` with corrupt map at tick 1 stays in loop and
+                #     recovers when map becomes valid at tick 2!
+                corrupt_map = root / "sync_startup_map.json"
+                corrupt_map.write_text("{broken json\n", encoding="utf-8")
+                sig_handlers: dict[int, object] = {}
+                sleep_count = [0]
+
+                def _fake_signal(signum: int, handler: object) -> None:
+                    sig_handlers[signum] = handler
+
+                mono_now = [0.0]
+
+                def _fake_sleep_recover(_secs: float) -> None:
+                    sleep_count[0] += 1
+                    mono_now[0] += 2.0
+                    if sleep_count[0] == 1:
+                        # Repair map before tick 2!
+                        corrupt_map.write_text('{"0000:00:04.0": 7}\n', encoding="utf-8")
+                    elif sleep_count[0] >= 2:
+                        handler = sig_handlers.get(freetpu_cdi.signal.SIGTERM)
+                        if callable(handler):
+                            handler(freetpu_cdi.signal.SIGTERM, None)
+
+                def _fake_mono_recover() -> float:
+                    return mono_now[0]
+
+                with (
+                    mock.patch.object(freetpu_cdi.signal, "signal", side_effect=_fake_signal),
+                    mock.patch.object(freetpu_cdi.time, "sleep", side_effect=_fake_sleep_recover),
+                    mock.patch.object(freetpu_cdi.time, "monotonic", side_effect=_fake_mono_recover),
+                ):
+                    rc_rec, _or, err_rec = _run_cli_inproc(
+                        [
+                            "sync",
+                            "--interval",
+                            "1",
+                            "--output",
+                            str(spec_path),
+                            "--vfio-mode",
+                            "legacy",
+                            "--single-host-env",
+                            "--chip-id-map",
+                            str(corrupt_map),
+                            "--sysfs-root",
+                            str(dual_sys),
+                            "--dev-root",
+                            str(dual_dev),
+                        ]
+                    )
+                self.assertEqual(rc_rec, 0, err_rec)
+                self.assertGreaterEqual(sleep_count[0], 2)
+                self.assertIn("failed to reload --chip-id-map", err_rec)
+                rec_spec = json.loads(spec_path.read_text(encoding="utf-8"))
+                all_env = dict(
+                    kv.split("=", 1)
+                    for kv in next(d for d in rec_spec["devices"] if d["name"] == "all")["containerEdits"]["env"]
+                )
+                self.assertEqual(all_env.get("TPU_VISIBLE_CHIPS"), "7")
+
+                # 4b. Continuous `sync` with corrupt map at tick 1 (preserving spec), then
+                #     VFIO node disappears before tick 2 while map is still broken ->
+                #     tick 2 detects confirmed drift and withdraws the stale spec!
+                corrupt_map.write_text("{still broken\n", encoding="utf-8")
+                sleep_count2 = [0]
+                mono_now2 = [0.0]
+
+                def _fake_sleep_drift(_secs: float) -> None:
+                    sleep_count2[0] += 1
+                    mono_now2[0] += 2.0
+                    if sleep_count2[0] == 1:
+                        # Spec was preserved after tick 1; now break VFIO before tick 2!
+                        self.assertTrue(spec_path.exists())
+                        (dual_dev / "vfio" / "0").unlink()
+                    elif sleep_count2[0] >= 2:
+                        handler = sig_handlers.get(freetpu_cdi.signal.SIGTERM)
+                        if callable(handler):
+                            handler(freetpu_cdi.signal.SIGTERM, None)
+
+                def _fake_mono_drift() -> float:
+                    return mono_now2[0]
+
+                with (
+                    mock.patch.object(freetpu_cdi.signal, "signal", side_effect=_fake_signal),
+                    mock.patch.object(freetpu_cdi.time, "sleep", side_effect=_fake_sleep_drift),
+                    mock.patch.object(freetpu_cdi.time, "monotonic", side_effect=_fake_mono_drift),
+                ):
+                    rc_dr, _odr, err_dr = _run_cli_inproc(
+                        [
+                            "sync",
+                            "--interval",
+                            "1",
+                            "--output",
+                            str(spec_path),
+                            "--vfio-mode",
+                            "legacy",
+                            "--single-host-env",
+                            "--chip-id-map",
+                            str(corrupt_map),
+                            "--sysfs-root",
+                            str(dual_sys),
+                            "--dev-root",
+                            str(dual_dev),
+                        ]
+                    )
+                self.assertEqual(rc_dr, 0, err_dr)
+                self.assertIn("confirmed hardware drift", err_dr)
+                self.assertFalse(spec_path.exists())
+
     def test_all_selector_revalidates_map_dependent_topology_with_omit_visible_env(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -1335,6 +1335,10 @@ def _query_tpu_info_python_metrics(
     """
     if not addr:
         return False, "runtime metrics gRPC address disabled", {}
+    try:
+        _parse_local_grpc_target(addr)
+    except ValueError as exc:
+        return False, str(exc), {}
 
     deadline_s = max(0.001, float(timeout_s))
     chip_attr = None
@@ -3009,7 +3013,6 @@ def collect_snapshot(
     proc_root: Path = Path("/proc"),
     tpu_info_bin: Optional[str] = "tpu-info",
     tpu_info_timeout_s: float = 5.0,
-    trust_tpu_info_cli_duty: bool = False,
     chip_id_map: Optional[Dict[str, str]] = None,
     *,
     skip_pid_scan: bool = False,
@@ -3021,6 +3024,7 @@ def collect_snapshot(
     gcp_metadata_preemption: bool = False,
     gcp_metadata_url: str = DEFAULT_GCP_METADATA_PREEMPTED_URL,
     gcp_metadata_timeout_s: float = 0.5,
+    trust_tpu_info_cli_duty: bool = False,
 ) -> ExporterSnapshot:
     """Collect PCI/VFIO discovery, SeqLock SHM, AER counters, optional procfs PIDs, and gRPC/`tpu-info` metrics."""
     if grpc_duty_layout not in VALID_GRPC_DUTY_LAYOUTS:
@@ -3062,6 +3066,14 @@ def collect_snapshot(
     verified_row_aliases = _verified_row_alias_map(devices, shared_vfio, chip_id_map)
     runtime_budget_s = max(0.05, float(tpu_info_timeout_s))
     runtime_deadline = time.monotonic() + runtime_budget_s
+    runtime_addr_err: Optional[str] = None
+    valid_runtime_metrics_addr: Optional[str] = runtime_metrics_addr
+    if runtime_metrics_addr:
+        try:
+            _parse_local_grpc_target(runtime_metrics_addr)
+        except ValueError as exc:
+            runtime_addr_err = str(exc)
+            valid_runtime_metrics_addr = None
     explicit_non_default_runtime_addr = bool(
         runtime_metrics_addr and runtime_metrics_addr != DEFAULT_RUNTIME_METRICS_ADDR
     )
@@ -3071,80 +3083,78 @@ def collect_snapshot(
         tpu_info_ok, tpu_info_err, parsed_rows = False, "tpu-info disabled", {}
     elif skip_pid_scan or explicit_non_default_runtime_addr:
         # Sidecar / no-PID mode OR explicit non-default `--runtime-metrics-addr`:
-        # try direct in-process gRPC first (capped at 65% of the shared runtime
-        # budget so 35% remains reserved for the Python `tpu_info.metrics`
-        # fallback if gRPC RPCs fail, stall, or return only partial families
-        # such as HBM without duty-cycle). Never spawn the `tpu-info` CLI subprocess.
-        grpc_budget_s = runtime_budget_s * 0.65
-        tpu_info_ok, tpu_info_err, parsed_rows = _query_grpc_runtime_metrics(
-            devices,
-            addr=runtime_metrics_addr,
-            timeout_s=grpc_budget_s,
-            grpc_duty_layout=grpc_duty_layout,
-        )
-        if parsed_rows:
-            parsed_rows = _merge_runtime_rows(
-                {},
-                _tag_row_sources(parsed_rows, "libtpu-grpc"),
-                prefer_base=True,
-                alias_to_canonical=verified_row_aliases,
+        # validate loopback/UDS endpoint ONCE up front before dispatching to
+        # either direct gRPC or Python fallback. Never spawn `tpu-info` CLI.
+        if runtime_addr_err is not None:
+            tpu_info_ok, tpu_info_err, parsed_rows = False, runtime_addr_err, {}
+        else:
+            grpc_budget_s = runtime_budget_s * 0.65
+            tpu_info_ok, tpu_info_err, parsed_rows = _query_grpc_runtime_metrics(
+                devices,
+                addr=valid_runtime_metrics_addr,
+                timeout_s=grpc_budget_s,
+                grpc_duty_layout=grpc_duty_layout,
             )
-        if not tpu_info_ok or not _has_complete_utilization(
-            parsed_rows,
-            expected_runtime_ids=expected_runtime_ids,
-            min_expected_rows=len(devices),
-        ):
-            remaining_s = runtime_deadline - time.monotonic()
-            if remaining_s >= 0.01:
-                py_ok, py_err, py_rows = _query_tpu_info_python_metrics(
-                    devices,
-                    addr=runtime_metrics_addr,
-                    timeout_s=remaining_s,
-                    grpc_duty_layout=grpc_duty_layout,
+            if parsed_rows:
+                parsed_rows = _merge_runtime_rows(
+                    {},
+                    _tag_row_sources(parsed_rows, "libtpu-grpc"),
+                    prefer_base=True,
+                    alias_to_canonical=verified_row_aliases,
                 )
-                if py_ok:
-                    grpc_unset_duty_ids = {
-                        k for k, r in parsed_rows.items() if r.duty_unset_in_grpc
-                    }
-                    py_rows = _sanitize_fallback_duty_rows(
-                        py_rows,
+            if (
+                valid_runtime_metrics_addr
+                and (
+                    not tpu_info_ok
+                    or not _has_complete_utilization(
+                        parsed_rows,
+                        expected_runtime_ids=expected_runtime_ids,
+                        min_expected_rows=len(devices),
+                    )
+                )
+            ):
+                remaining_s = runtime_deadline - time.monotonic()
+                if remaining_s >= 0.01:
+                    py_ok, py_err, py_rows = _query_tpu_info_python_metrics(
                         devices,
-                        unset_duty_ids=grpc_unset_duty_ids,
+                        addr=valid_runtime_metrics_addr,
+                        timeout_s=remaining_s,
                         grpc_duty_layout=grpc_duty_layout,
                     )
-                    py_rows = _tag_row_sources(py_rows, "tpu-info-python")
-                    parsed_rows = _merge_runtime_rows(
-                        parsed_rows,
-                        py_rows,
-                        prefer_base=True,
-                        alias_to_canonical=verified_row_aliases,
-                    )
-                    tpu_info_ok, tpu_info_err = True, None
-                elif not tpu_info_ok:
-                    tpu_info_err = py_err
+                    if py_ok:
+                        grpc_unset_duty_ids = {
+                            k for k, r in parsed_rows.items() if r.duty_unset_in_grpc
+                        }
+                        py_rows = _sanitize_fallback_duty_rows(
+                            py_rows,
+                            devices,
+                            unset_duty_ids=grpc_unset_duty_ids,
+                            grpc_duty_layout=grpc_duty_layout,
+                        )
+                        py_rows = _tag_row_sources(py_rows, "tpu-info-python")
+                        parsed_rows = _merge_runtime_rows(
+                            parsed_rows,
+                            py_rows,
+                            prefer_base=True,
+                            alias_to_canonical=verified_row_aliases,
+                        )
+                        tpu_info_ok, tpu_info_err = True, None
+                    elif not tpu_info_ok:
+                        tpu_info_err = py_err
     else:
-        # Prefer direct in-process `RuntimeMetricService` gRPC over spawning
-        # `tpu-info` subprocesses ONLY for the exact default `"tpu-info"` value;
-        # any custom executable name or path (e.g. `my-wrapper` on PATH or
-        # `/path/to/wrapper`) invokes that configured CLI directly.
-        # Note: `tpu-info` CLI Process Monitor guesses `/dev/vfio/<runtime_id>`
-        # and cannot establish authoritative PCI identity, so we do NOT spawn the
-        # CLI solely to guess mappings when direct gRPC already returned complete
-        # HBM + duty-cycle readings. If direct gRPC returned only partial
-        # utilization (e.g. HBM succeeded while duty-cycle timed out, or entire
-        # expected devices were omitted), run fallback within the remaining
-        # scrape budget and merge only the missing fields (`prefer_base=True`) so
-        # successful gRPC readings are preserved while per-row source provenance
-        # records which chips used fallback.
-        use_default_grpc_first = (
-            not trust_tpu_info_cli_duty
-            and Path(tpu_info_bin).name in ("tpu-info", "tpu_info")
-        )
+        # Execution order and duty-cycle trust are strictly orthogonal:
+        # - Exact default `"tpu-info"` tries direct gRPC first with CLI fallback.
+        # - Any explicitly configured executable path or name (`tpu_info_bin !=
+        #   "tpu-info"`, even `/opt/telemetry/tpu-info` or `/usr/local/bin/tpu-info`)
+        #   runs that configured CLI FIRST.
+        # - Stock Ironwood duty sanitization applies to ALL CLI output unless
+        #   `--trust-tpu-info-cli-duty` is explicitly enabled.
+        use_default_grpc_first = tpu_info_bin == "tpu-info"
         tpu_info_ok = False
-        tpu_info_err = None
+        tpu_info_err = runtime_addr_err
         parsed_rows = {}
         attempted_grpc = False
-        if use_default_grpc_first and runtime_metrics_addr:
+        if use_default_grpc_first and valid_runtime_metrics_addr:
             attempted_grpc = True
             # Reserve 35% of the shared runtime scrape budget for the fallback
             # path when fallback is enabled so a stalled gRPC RPC cannot starve
@@ -3154,7 +3164,7 @@ def collect_snapshot(
             )
             tpu_info_ok, tpu_info_err, parsed_rows = _query_grpc_runtime_metrics(
                 devices,
-                addr=runtime_metrics_addr,
+                addr=valid_runtime_metrics_addr,
                 timeout_s=grpc_budget_s,
                 grpc_duty_layout=grpc_duty_layout,
             )
@@ -3218,12 +3228,12 @@ def collect_snapshot(
                         min_expected_rows=len(devices),
                     )
                 )
-                and runtime_metrics_addr
+                and valid_runtime_metrics_addr
                 and remaining_s >= 0.01
             ):
                 py_ok, _py_err, py_rows = _query_tpu_info_python_metrics(
                     devices,
-                    addr=runtime_metrics_addr,
+                    addr=valid_runtime_metrics_addr,
                     timeout_s=remaining_s,
                     grpc_duty_layout=grpc_duty_layout,
                 )
@@ -4044,6 +4054,9 @@ def _load_chip_id_map(raw: Optional[Path | str]) -> Optional[Dict[str, str]]:
         if not text.startswith(("{", "[")):
             text = Path(text).read_text(encoding="utf-8")
 
+    _pci_bdf_canon_re = re.compile(r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$")
+    _pci_bdf_short_re = re.compile(r"^[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$")
+
     def _no_duplicate_keys(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
         obj: Dict[str, Any] = {}
         seen_norm: Dict[str, str] = {}
@@ -4053,13 +4066,24 @@ def _load_chip_id_map(raw: Optional[Path | str]) -> Optional[Dict[str, str]]:
                     f"Invalid --chip-id-map key {k!r}: must be a non-empty string"
                 )
             norm_k = k.strip()
-            norm_cmp = norm_k.lower()
+            if norm_k.startswith("/"):
+                store_k = norm_k
+                norm_cmp = norm_k.lower()
+            else:
+                norm_cmp = norm_k.lower()
+                if _pci_bdf_short_re.match(norm_cmp):
+                    norm_cmp = f"0000:{norm_cmp}"
+                if not _pci_bdf_canon_re.match(norm_cmp):
+                    raise ValueError(
+                        f"Invalid --chip-id-map PCI BDF key {k!r}: expected canonical "
+                        "DDDD:BB:DD.F (e.g. '0000:00:08.0') or /dev/vfio/<group> path"
+                    )
+                store_k = norm_cmp
             if norm_cmp in seen_norm:
                 raise ValueError(
                     f"Duplicate --chip-id-map key {k!r} (conflicts with {seen_norm[norm_cmp]!r})"
                 )
             seen_norm[norm_cmp] = k
-            store_k = norm_k if norm_k.startswith("/") else norm_cmp
             obj[store_k] = v
         return obj
 

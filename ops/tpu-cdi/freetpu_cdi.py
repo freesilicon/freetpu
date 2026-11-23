@@ -445,6 +445,23 @@ def _parse_runtime_chip_id(pci_entry: Path) -> Optional[int]:
     return val if val >= 0 else None
 
 
+_PCI_BDF_CANON_RE = re.compile(r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$")
+_PCI_BDF_SHORT_RE = re.compile(r"^[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$")
+
+
+def _normalize_pci_bdf_key(raw_key: str) -> str:
+    """Validate and canonicalize a PCI BDF string (`DDDD:BB:DD.F`, accepting short `BB:DD.F`)."""
+    norm = raw_key.strip().lower()
+    if _PCI_BDF_SHORT_RE.match(norm):
+        norm = f"0000:{norm}"
+    if not _PCI_BDF_CANON_RE.match(norm):
+        raise ValueError(
+            f"Invalid --chip-id-map PCI BDF key {raw_key!r}: expected canonical DDDD:BB:DD.F "
+            "(e.g. '0000:00:08.0')"
+        )
+    return norm
+
+
 def _load_chip_id_map(raw: Optional[str]) -> Optional[Dict[str, int]]:
     """Parse `--chip-id-map` JSON object or file path mapping PCI BDF -> non-negative runtime int ID."""
     if raw is None or not str(raw).strip():
@@ -468,8 +485,7 @@ def _load_chip_id_map(raw: Optional[str]) -> Optional[Dict[str, int]]:
     for k, v in data.items():
         if not isinstance(k, str) or not k.strip():
             raise ValueError(f"Invalid --chip-id-map key {k!r}: must be a non-empty PCI BDF string")
-        norm_k = k.strip()
-        norm_cmp = norm_k.lower()
+        norm_cmp = _normalize_pci_bdf_key(k)
         if norm_cmp in seen_norm:
             raise ValueError(
                 f"Duplicate --chip-id-map key {k!r} (conflicts with {seen_norm[norm_cmp]!r})"
@@ -2900,6 +2916,17 @@ def _detect_spec_vfio_mode(spec: Dict[str, Any]) -> str:
         return "iommufd"
     if "/dev/vfio/vfio" in paths:
         return "legacy"
+    if any(p.startswith("/dev/vfio/devices/vfio") for p in paths):
+        return "iommufd"
+    if any(p.startswith("/dev/vfio/") and p.removeprefix("/dev/vfio/").isdigit() for p in paths):
+        return "legacy"
+    root_ann = spec.get("annotations")
+    if isinstance(root_ann, dict):
+        mode_ann = root_ann.get("freetpu.dev/iommu-mode") or root_ann.get("freetpu.dev/vfio-mode")
+        if mode_ann in ("iommufd", "cdev"):
+            return "iommufd"
+        if mode_ann in ("vfio-group", "legacy"):
+            return "legacy"
     return "auto"
 
 
@@ -4155,12 +4182,17 @@ def _revalidate_existing_spec_on_map_failure(
         existing_spec = _load_json_strict_keys(output_path.read_text(encoding="utf-8"))
         confirmed_drift.extend(validate_cdi_spec(existing_spec))
         if not confirmed_drift:
+            # Always revalidate the already-published spec in ITS OWN VFIO mode
+            # (not a newly requested CLI `--vfio-mode`) so a failed map load while
+            # switching modes never deletes a healthy spec without a replacement.
+            existing_mode = _detect_spec_vfio_mode(existing_spec)
+            reval_vfio_mode = existing_mode if existing_mode != "auto" else vfio_mode
             host_confirmed, _unverifiable = _verify_spec_against_host_detailed(
                 existing_spec,
                 sysfs_root=sysfs_root,
                 dev_root=dev_root,
                 iommu_dev_path=iommu_dev_path,
-                vfio_mode=vfio_mode,
+                vfio_mode=reval_vfio_mode,
                 chip_id_map=None,
             )
             confirmed_drift.extend(host_confirmed)
@@ -4363,20 +4395,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not isinstance(args.kind, str) or not _CDI_KIND_RE.match(args.kind):
             sys.stderr.write(f"freetpu-cdi sync failed: Invalid CDI kind {args.kind!r}\n")
             return 1
-        try:
-            parsed_chip_map = _load_chip_id_map(args.chip_id_map)
-        except Exception as exc:  # noqa: BLE001
-            drift_suffix = _revalidate_existing_spec_on_map_failure(
-                args.output,
-                sysfs_root=args.sysfs_root,
-                dev_root=args.dev_root,
-                iommu_dev_path=args.iommu_dev,
-                vfio_mode=args.vfio_mode,
-            )
-            sys.stderr.write(
-                f"freetpu-cdi sync failed: invalid --chip-id-map: {exc}{drift_suffix}\n"
-            )
-            return 1
+        chip_map_is_file = bool(
+            args.chip_id_map and not str(args.chip_id_map).strip().startswith(("{", "["))
+        )
+        parsed_chip_map: Optional[Dict[str, int]] = None
+        if args.once or not chip_map_is_file:
+            try:
+                parsed_chip_map = _load_chip_id_map(args.chip_id_map)
+            except Exception as exc:  # noqa: BLE001
+                drift_suffix = _revalidate_existing_spec_on_map_failure(
+                    args.output,
+                    sysfs_root=args.sysfs_root,
+                    dev_root=args.dev_root,
+                    iommu_dev_path=args.iommu_dev,
+                    vfio_mode=args.vfio_mode,
+                )
+                sys.stderr.write(
+                    f"freetpu-cdi sync failed: invalid --chip-id-map: {exc}{drift_suffix}\n"
+                )
+                return 1
         if args.once:
             ok, msg = reconcile_cdi_spec(
                 args.output,
@@ -4406,9 +4443,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         last_msg = ""
         interval = max(1.0, float(args.interval))
         sync_observed_domains: Dict[Tuple[str, Optional[int], str], set[str]] = {}
-        chip_map_is_file = bool(
-            args.chip_id_map and not str(args.chip_id_map).strip().startswith(("{", "["))
-        )
         while not stop_requested:
             tick_chip_map = parsed_chip_map
             if chip_map_is_file:
