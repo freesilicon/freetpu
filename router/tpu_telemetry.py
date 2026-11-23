@@ -19,12 +19,14 @@ from dataclasses import asdict, dataclass, field
 import errno
 import http.client
 import io
+import ipaddress
 import math
 import re
 import select
 import selectors
 import socket
 import ssl
+import threading
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
@@ -351,6 +353,131 @@ def _tls_handshake_with_deadline(
             pass
 
 
+def _wait_io_or_client(
+    upstream: Any,
+    client: Any,
+    *,
+    wait_write: bool,
+    timeout_s: Optional[float],
+) -> Tuple[bool, bool, bool]:
+    """Wait for `upstream` readability/writability while optionally watching `client` readability.
+
+    Returns `(upstream_ready, client_readable, client_errored)` using an API that
+    supports file descriptors >= 1024.
+    """
+    if hasattr(select, "poll"):
+        poller = select.poll()
+        up_fd = upstream.fileno()
+        if up_fd < 0:
+            raise ValueError("Invalid upstream socket file descriptor")
+        up_mask = select.POLLOUT if wait_write else _POLL_READ_EVENTS
+        poller.register(up_fd, up_mask)
+        cli_fd: Optional[int] = None
+        if client is not None:
+            cli_fd = client.fileno()
+            if cli_fd < 0:
+                raise ClientDisconnectedError("Downstream client disconnected")
+            if cli_fd == up_fd:
+                poller.modify(up_fd, up_mask | _POLL_READ_EVENTS)
+            else:
+                poller.register(cli_fd, _POLL_READ_EVENTS)
+        if timeout_s is None:
+            timeout_ms: Optional[int] = None
+        elif timeout_s <= 0:
+            timeout_ms = 0
+        else:
+            timeout_ms = min(2147483647, max(1, math.ceil(timeout_s * 1000.0)))
+        ready = poller.poll(timeout_ms)
+        up_ready = False
+        cli_read = False
+        cli_err = False
+        for fd, revents in ready:
+            if fd == up_fd and (revents & (up_mask | _POLL_HUP_EVENT | _POLL_ERR_EVENTS)):
+                up_ready = True
+            if cli_fd is not None and fd == cli_fd:
+                if revents & _POLL_ERR_EVENTS:
+                    cli_err = True
+                if revents & (_POLL_READ_EVENTS | _POLL_HUP_EVENT):
+                    cli_read = True
+        return up_ready, cli_read, cli_err
+
+    with selectors.DefaultSelector() as selector:
+        up_ev = selectors.EVENT_WRITE if wait_write else selectors.EVENT_READ
+        selector.register(upstream, up_ev, data="up")
+        if client is not None:
+            selector.register(client, selectors.EVENT_READ, data="cli")
+        events = selector.select(timeout=timeout_s)
+        up_ready = False
+        cli_read = False
+        for key, _ in events:
+            if key.data == "up":
+                up_ready = True
+            elif key.data == "cli":
+                cli_read = True
+        return up_ready, cli_read, False
+
+
+_DNS_RESOLVER_SEMAPHORE = threading.BoundedSemaphore(32)
+
+
+def _resolve_host_with_deadline(
+    host: str,
+    port: int,
+    *,
+    deadline: float,
+    label: str = "Exporter scrape",
+) -> List[Any]:
+    """Resolve `host` via `socket.getaddrinfo` bounded by `deadline`."""
+    rem = deadline - time.monotonic()
+    if rem <= 0:
+        raise TimeoutError(f"{label} exceeded elapsed deadline")
+    try:
+        ipaddress.ip_address(host.split("%", 1)[0])
+        is_ip_literal = True
+    except ValueError:
+        is_ip_literal = False
+    if is_ip_literal:
+        infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"{label} exceeded elapsed deadline")
+        return infos
+
+    if not _DNS_RESOLVER_SEMAPHORE.acquire(timeout=rem):
+        raise TimeoutError(f"{label} exceeded elapsed deadline")
+
+    done = threading.Event()
+    result_box: List[Any] = []
+    err_box: List[BaseException] = []
+    getaddrinfo_fn = socket.getaddrinfo
+
+    def _worker() -> None:
+        try:
+            result_box.append(getaddrinfo_fn(host, port, 0, socket.SOCK_STREAM))
+        except BaseException as exc:  # noqa: BLE001
+            err_box.append(exc)
+        finally:
+            done.set()
+            _DNS_RESOLVER_SEMAPHORE.release()
+
+    try:
+        thread = threading.Thread(
+            target=_worker,
+            name="freetpu-dns-resolve",
+            daemon=True,
+        )
+        thread.start()
+    except BaseException:
+        _DNS_RESOLVER_SEMAPHORE.release()
+        raise
+
+    rem = deadline - time.monotonic()
+    if rem <= 0 or not done.wait(timeout=rem):
+        raise TimeoutError(f"{label} exceeded elapsed deadline")
+    if err_box:
+        raise err_box[0]
+    return result_box[0] if result_box else []
+
+
 def _create_deadline_connection(
     host: str,
     port: int,
@@ -361,10 +488,7 @@ def _create_deadline_connection(
     server_hostname: Optional[str] = None,
 ) -> socket.socket:
     """Resolve `host`, connect across candidate addresses, and run TLS under one deadline."""
-    rem = deadline - time.monotonic()
-    if rem <= 0:
-        raise TimeoutError(f"{label} exceeded elapsed deadline")
-    infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    infos = _resolve_host_with_deadline(host, port, deadline=deadline, label=label)
     if not infos:
         raise OSError("getaddrinfo returns an empty list")
 
@@ -506,13 +630,18 @@ class _DeadlineSocketIO(io.RawIOBase):
     def readable(self) -> bool:
         return True
 
-    def _wait_readable_or_cancel(self) -> None:
+    def _wait_upstream_or_cancel(
+        self,
+        *,
+        wait_write: bool = False,
+        check_pending: bool = True,
+    ) -> None:
         upstream = self._wrapper._sock
         deadline = self._wrapper.deadline
-        # If TLS already decrypted buffered bytes, read immediately without blocking in poll.
-        pending_fn = getattr(upstream, "pending", None)
-        if callable(pending_fn) and pending_fn() > 0:
-            return
+        if check_pending and not wait_write:
+            pending_fn = getattr(upstream, "pending", None)
+            if callable(pending_fn) and pending_fn() > 0:
+                return
         while True:
             rem: Optional[float] = None
             if deadline is not None:
@@ -522,7 +651,14 @@ class _DeadlineSocketIO(io.RawIOBase):
             if self._wrapper._watch_client and self._wrapper._client_sock is not None:
                 client = self._wrapper._client_sock
                 try:
-                    readable, errored = wait_sockets_readable([upstream, client], rem)
+                    up_ready, cli_read, cli_err = _wait_io_or_client(
+                        upstream,
+                        client,
+                        wait_write=wait_write,
+                        timeout_s=rem,
+                    )
+                except ClientDisconnectedError:
+                    raise
                 except (OSError, ValueError):
                     try:
                         if client.fileno() < 0:
@@ -536,9 +672,9 @@ class _DeadlineSocketIO(io.RawIOBase):
                         raise
                     self._wrapper._watch_client = False
                     continue
-                if client in errored:
+                if cli_err:
                     raise ClientDisconnectedError("Downstream client disconnected")
-                if client in readable:
+                if cli_read:
                     peek: Optional[bytes] = None
                     try:
                         peek = client.recv(
@@ -556,65 +692,78 @@ class _DeadlineSocketIO(io.RawIOBase):
                     if peek is not None:
                         # Extra pipelined bytes on client socket; stop EOF-watching to avoid busy spin.
                         self._wrapper._watch_client = False
-                if upstream in readable or upstream in errored:
+                if up_ready:
                     return
-                if not readable and not errored and deadline is not None:
+                if not up_ready and not cli_read and not cli_err and deadline is not None:
                     if time.monotonic() >= deadline:
                         raise TimeoutError(f"{self._wrapper.label} exceeded elapsed deadline")
             else:
-                readable, errored = wait_sockets_readable([upstream], rem)
-                if upstream in readable or upstream in errored:
+                up_ready, _, _ = _wait_io_or_client(
+                    upstream,
+                    None,
+                    wait_write=wait_write,
+                    timeout_s=rem,
+                )
+                if up_ready:
                     return
                 if deadline is not None and time.monotonic() >= deadline:
                     raise TimeoutError(f"{self._wrapper.label} exceeded elapsed deadline")
 
-    def readinto(self, b: Any) -> int:
+    def _wait_readable_or_cancel(self) -> None:
+        self._wait_upstream_or_cancel(wait_write=False, check_pending=True)
+
+    def readinto(self, b: Any) -> Optional[int]:
         if self.closed:
             raise ValueError("I/O operation on closed file.")
         wrapper = self._wrapper
+        if wrapper._buffered_peek_only:
+            return None
         upstream = wrapper._sock
         deadline = wrapper.deadline
         if deadline is not None and time.monotonic() >= deadline:
             raise TimeoutError(f"{wrapper.label} exceeded elapsed deadline")
 
-        if not wrapper._is_ssl:
-            if not self._nonblocking_configured:
+        if not self._nonblocking_configured:
+            try:
+                upstream.settimeout(0.0)
+                self._nonblocking_configured = True
+            except OSError:
+                pass
+        if self._nonblocking_configured:
+            while True:
                 try:
-                    upstream.settimeout(0.0)
-                    self._nonblocking_configured = True
-                except OSError:
-                    pass
-            if self._nonblocking_configured:
-                while True:
-                    try:
-                        n = upstream.recv_into(b)
-                        if (
-                            n > 0
-                            and wrapper._watch_client
-                            and wrapper._check_client_on_fast_read
-                            and wrapper._client_sock is not None
-                        ):
-                            client = wrapper._client_sock
-                            try:
-                                r_cli, e_cli = wait_sockets_readable([client], 0.0)
-                                if client in e_cli:
+                    n = upstream.recv_into(b)
+                    if (
+                        n > 0
+                        and wrapper._watch_client
+                        and wrapper._check_client_on_fast_read
+                        and wrapper._client_sock is not None
+                    ):
+                        client = wrapper._client_sock
+                        try:
+                            r_cli, e_cli = wait_sockets_readable([client], 0.0)
+                            if client in e_cli:
+                                raise ClientDisconnectedError("Downstream client disconnected")
+                            if client in r_cli:
+                                peek = client.recv(1, socket.MSG_PEEK | _MSG_DONTWAIT)
+                                if peek == b"":
                                     raise ClientDisconnectedError("Downstream client disconnected")
-                                if client in r_cli:
-                                    peek = client.recv(1, socket.MSG_PEEK | _MSG_DONTWAIT)
-                                    if peek == b"":
-                                        raise ClientDisconnectedError("Downstream client disconnected")
-                                    wrapper._watch_client = False
-                            except ClientDisconnectedError:
-                                raise
-                            except (OSError, ValueError):
-                                pass
-                        return n
-                    except BlockingIOError:
-                        pass
-                    except OSError as exc:
-                        if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                                wrapper._watch_client = False
+                        except ClientDisconnectedError:
                             raise
-                    self._wait_readable_or_cancel()
+                        except (OSError, ValueError):
+                            pass
+                    return n
+                except ssl.SSLWantReadError:
+                    self._wait_upstream_or_cancel(wait_write=False, check_pending=False)
+                except ssl.SSLWantWriteError:
+                    self._wait_upstream_or_cancel(wait_write=True, check_pending=False)
+                except BlockingIOError:
+                    self._wait_upstream_or_cancel(wait_write=False, check_pending=False)
+                except OSError as exc:
+                    if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                        raise
+                    self._wait_upstream_or_cancel(wait_write=False, check_pending=False)
 
         self._wait_readable_or_cancel()
         if deadline is not None:
@@ -647,6 +796,7 @@ class DeadlineSocket:
         self._client_sock = client_sock
         self._watch_client = client_sock is not None
         self._check_client_on_fast_read = client_sock is not None
+        self._buffered_peek_only = False
         self._is_ssl = isinstance(sock, ssl.SSLSocket)
         self._io_refs = 0
         self._closed = False
@@ -674,12 +824,12 @@ class DeadlineSocket:
             rem = self.deadline - time.monotonic()
             if rem <= 0:
                 raise TimeoutError(f"{self.label} exceeded elapsed deadline")
-            if not self._is_ssl and self._io_refs > 0:
+            if self._io_refs > 0:
                 return
             effective = min(timeout, rem) if timeout is not None else rem
             self._sock.settimeout(effective)
         else:
-            if not self._is_ssl and self._io_refs > 0:
+            if self._io_refs > 0:
                 return
             self._sock.settimeout(timeout)
 

@@ -81,6 +81,7 @@ MAX_PROBE_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_ERROR_RESPONSE_BYTES = 1024 * 1024
 MAX_MODEL_ID_LEN = 256
 REQUEST_MEMORY_PARSE_MULTIPLIER = 4
+_UTF8_4BYTE_RE = re.compile(rb"[\xf0-\xff]")
 _API_VERSION_SUFFIX_RE = re.compile(r"/v\d+(?:alpha|beta\d*)?$")
 _LOG_CONTROL_CHAR_TABLE = str.maketrans(
     {c: f"\\x{c:02x}" for c in (*range(0x00, 0x20), *range(0x7F, 0xA0))}
@@ -152,26 +153,74 @@ class _JsonStructureLimitError(ValueError):
 
 
 def _validate_json_structure(
-    text: str,
+    text: str | bytes | bytearray,
     *,
     max_depth: int,
     max_nodes: int,
-) -> None:
-    """Validate JSON nesting depth and container/element count in O(1) working memory."""
+) -> int:
+    """Validate JSON nesting depth and structural count in O(1) working memory.
+
+    Accepts UTF-8 `bytes`/`bytearray` (avoiding decoded string allocation before
+    validation) or `str`, and returns the number of structural JSON tokens seen.
+    """
     n = len(text)
     i = 0
     depth = 0
     nodes = 0
+    if isinstance(text, (bytes, bytearray)):
+        # UTF-8 is ASCII-compatible: structural ASCII bytes never appear inside
+        # multi-byte UTF-8 sequences (all continuation/lead bytes are >= 0x80).
+        while i < n:
+            ch = text[i]
+            if ch == 34:  # '"'
+                i += 1
+                while True:
+                    q = text.find(b'"', i)
+                    if q == -1:
+                        return nodes
+                    bs = 0
+                    j = q - 1
+                    while j >= i and text[j] == 92:  # '\\'
+                        bs += 1
+                        j -= 1
+                    if (bs & 1) == 0:
+                        i = q + 1
+                        break
+                    i = q + 1
+                continue
+            if ch == 123 or ch == 91:  # '{' or '['
+                depth += 1
+                if depth > max_depth:
+                    raise _JsonStructureLimitError(
+                        f"JSON nesting depth exceeds maximum limit of {max_depth}"
+                    )
+                nodes += 1
+                if nodes > max_nodes:
+                    raise _JsonStructureLimitError(
+                        f"JSON structure exceeds maximum limit of {max_nodes} elements"
+                    )
+            elif ch == 125 or ch == 93:  # '}' or ']'
+                if depth > 0:
+                    depth -= 1
+            elif ch == 44 or ch == 58:  # ',' or ':'
+                nodes += 1
+                if nodes > max_nodes:
+                    raise _JsonStructureLimitError(
+                        f"JSON structure exceeds maximum limit of {max_nodes} elements"
+                    )
+            i += 1
+        return nodes
+
     while i < n:
-        ch = text[i]
-        if ch == '"':
+        ch_s = text[i]
+        if ch_s == '"':
             # Skip quoted strings via C-level str.find with zero regex backtracking state.
             i += 1
             while True:
                 q = text.find('"', i)
                 if q == -1:
                     # Unclosed string literal; let json.loads report exact JSONDecodeError.
-                    return
+                    return nodes
                 bs = 0
                 j = q - 1
                 while j >= i and text[j] == "\\":
@@ -182,7 +231,7 @@ def _validate_json_structure(
                     break
                 i = q + 1
             continue
-        if ch == "{" or ch == "[":
+        if ch_s == "{" or ch_s == "[":
             depth += 1
             if depth > max_depth:
                 raise _JsonStructureLimitError(
@@ -193,16 +242,40 @@ def _validate_json_structure(
                 raise _JsonStructureLimitError(
                     f"JSON structure exceeds maximum limit of {max_nodes} elements"
                 )
-        elif ch == "}" or ch == "]":
+        elif ch_s == "}" or ch_s == "]":
             if depth > 0:
                 depth -= 1
-        elif ch == "," or ch == ":":
+        elif ch_s == "," or ch_s == ":":
             nodes += 1
             if nodes > max_nodes:
                 raise _JsonStructureLimitError(
                     f"JSON structure exceeds maximum limit of {max_nodes} elements"
                 )
         i += 1
+    return nodes
+
+
+def _estimate_json_parse_memory(raw: bytes, *, nodes: int = 0) -> int:
+    """Estimate peak CPython working-set bytes while decoding and parsing UTF-8 JSON.
+
+    Accounts for PEP-393 flexible string widening (UCS-1 / UCS-2 / UCS-4),
+    JSON `\\uXXXX` surrogate escapes, and dense parsed container/value overhead
+    while `raw`, decoded text, and parsed objects coexist in memory.
+    """
+    n = len(raw)
+    if n <= 0:
+        return 1
+    has_u_escape = (b"\\u" in raw) or (b"\\U" in raw)
+    if raw.isascii():
+        base_mult = 9 if has_u_escape else REQUEST_MEMORY_PARSE_MULTIPLIER
+    elif _UTF8_4BYTE_RE.search(raw) is not None:
+        base_mult = 10
+    elif has_u_escape:
+        base_mult = 10
+    else:
+        base_mult = 6
+    dense_node_overhead = max(0, nodes - 64) * 32
+    return max(n * base_mult, n * (base_mult - 1) + dense_node_overhead)
 
 
 def _read_bounded_http_response(
@@ -312,7 +385,9 @@ def _join_backend_url(
     *,
     strip_api_version: bool = False,
 ) -> Tuple[str, str, int, str]:
-    validated = validate_http_url(base_url, field_name="backend base_url")
+    validated = validate_http_url(
+        base_url, field_name="backend base_url", allow_query=False
+    )
     parsed = urlsplit(validated)
     scheme = parsed.scheme.lower()
     host = parsed.hostname or ""
@@ -3002,14 +3077,11 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 pass
 
             try:
-                req_text = raw_req.decode("utf-8")
-                _validate_json_structure(
-                    req_text,
+                req_nodes = _validate_json_structure(
+                    raw_req,
                     max_depth=engine.config.max_json_depth,
                     max_nodes=engine.config.max_json_nodes,
                 )
-                req_payload = json.loads(req_text)
-                del req_text
             except _JsonStructureLimitError as exc:
                 self._send_bytes(
                     400,
@@ -3020,6 +3092,27 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                     ),
                 )
                 return
+
+            needed_parse_mem = _estimate_json_parse_memory(raw_req, nodes=req_nodes)
+            if needed_parse_mem > reserved_mem:
+                extra_parse_mem = needed_parse_mem - reserved_mem
+                if not engine.try_reserve_request_memory(extra_parse_mem):
+                    self._send_bytes(
+                        503,
+                        "application/json",
+                        _openai_error_body(
+                            "Router request memory budget exhausted; retry later",
+                            error_type="service_unavailable",
+                            code="server_memory_limit_reached",
+                        ),
+                    )
+                    return
+                reserved_mem += extra_parse_mem
+
+            try:
+                req_text = raw_req.decode("utf-8")
+                req_payload = json.loads(req_text)
+                del req_text
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                 self._send_bytes(
                     400,
@@ -3422,92 +3515,100 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         prompt_tokens_val = 0
                         completion_tokens_val = 0
                         if 200 <= resp.status < 300:
-                            # Reserve parse overhead, validate JSON structure, extract usage, and drop parsed tree.
-                            parse_extra = len(raw_resp) * (REQUEST_MEMORY_PARSE_MULTIPLIER - 1)
-                            if parse_extra > 0:
-                                if not engine.try_reserve_response_memory(parse_extra):
-                                    if resp_mem_reserved[0] > 0:
-                                        engine.release_response_memory(resp_mem_reserved[0])
-                                        resp_mem_reserved[0] = 0
-                                    latency_ms = (time.monotonic() - req_start) * 1000.0
-                                    attempt_ms = (time.monotonic() - attempt_start) * 1000.0
-                                    non_stream_result = (
-                                        503,
-                                        "application/json",
-                                        _openai_error_body(
-                                            "Router response memory budget exhausted; retry later",
-                                            error_type="service_unavailable",
-                                            code="server_memory_limit_reached",
-                                        ),
-                                        latency_ms,
-                                        attempt_ms,
-                                        0,
-                                        0,
-                                    )
-                                    parse_extra = -1
-                                else:
-                                    resp_mem_reserved[0] += parse_extra
-                            if parse_extra >= 0:
-                                try:
-                                    resp_text = raw_resp.decode("utf-8")
-                                    _validate_json_structure(
-                                        resp_text,
-                                        max_depth=engine.config.max_json_depth,
-                                        max_nodes=engine.config.max_json_nodes,
-                                    )
-                                    loaded_resp = json.loads(resp_text)
-                                    del resp_text
-                                except _JsonStructureLimitError:
-                                    if resp_mem_reserved[0] > 0:
-                                        engine.release_response_memory(resp_mem_reserved[0])
-                                        resp_mem_reserved[0] = 0
-                                    latency_ms = (time.monotonic() - req_start) * 1000.0
-                                    attempt_ms = (time.monotonic() - attempt_start) * 1000.0
-                                    non_stream_result = (
-                                        502,
-                                        "application/json",
-                                        _openai_error_body(
-                                            "Upstream response JSON exceeded structural complexity limits",
-                                            error_type="bad_gateway",
-                                            code="response_too_large",
-                                        ),
-                                        latency_ms,
-                                        attempt_ms,
-                                        0,
-                                        0,
-                                    )
-                                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                                    raise http.client.IncompleteRead(raw_resp) from exc
-                                else:
-                                    if not isinstance(loaded_resp, Mapping):
-                                        raise http.client.IncompleteRead(raw_resp)
-                                    prompt_tokens_val, completion_tokens_val = (
-                                        _extract_non_stream_usage(
+                            # Validate JSON structure on raw bytes first, reserve exact
+                            # PEP-393 peak parse memory before decoding, extract usage,
+                            # and drop the parsed tree immediately.
+                            resp_nodes: Optional[int] = None
+                            try:
+                                resp_nodes = _validate_json_structure(
+                                    raw_resp,
+                                    max_depth=engine.config.max_json_depth,
+                                    max_nodes=engine.config.max_json_nodes,
+                                )
+                            except _JsonStructureLimitError:
+                                if resp_mem_reserved[0] > 0:
+                                    engine.release_response_memory(resp_mem_reserved[0])
+                                    resp_mem_reserved[0] = 0
+                                latency_ms = (time.monotonic() - req_start) * 1000.0
+                                attempt_ms = (time.monotonic() - attempt_start) * 1000.0
+                                non_stream_result = (
+                                    502,
+                                    "application/json",
+                                    _openai_error_body(
+                                        "Upstream response JSON exceeded structural complexity limits",
+                                        error_type="bad_gateway",
+                                        code="response_too_large",
+                                    ),
+                                    latency_ms,
+                                    attempt_ms,
+                                    0,
+                                    0,
+                                )
+                            if resp_nodes is not None:
+                                needed_resp_mem = _estimate_json_parse_memory(
+                                    raw_resp, nodes=resp_nodes
+                                )
+                                parse_extra = max(0, needed_resp_mem - resp_mem_reserved[0])
+                                if parse_extra > 0:
+                                    if not engine.try_reserve_response_memory(parse_extra):
+                                        if resp_mem_reserved[0] > 0:
+                                            engine.release_response_memory(resp_mem_reserved[0])
+                                            resp_mem_reserved[0] = 0
+                                        latency_ms = (time.monotonic() - req_start) * 1000.0
+                                        attempt_ms = (time.monotonic() - attempt_start) * 1000.0
+                                        non_stream_result = (
+                                            503,
+                                            "application/json",
+                                            _openai_error_body(
+                                                "Router response memory budget exhausted; retry later",
+                                                error_type="service_unavailable",
+                                                code="server_memory_limit_reached",
+                                            ),
+                                            latency_ms,
+                                            attempt_ms,
+                                            0,
+                                            0,
+                                        )
+                                        parse_extra = -1
+                                    else:
+                                        resp_mem_reserved[0] += parse_extra
+                                if parse_extra >= 0:
+                                    try:
+                                        resp_text = raw_resp.decode("utf-8")
+                                        loaded_resp = json.loads(resp_text)
+                                        del resp_text
+                                    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                                        raise http.client.IncompleteRead(raw_resp) from exc
+                                    else:
+                                        if not isinstance(loaded_resp, Mapping):
+                                            raise http.client.IncompleteRead(raw_resp)
+                                        prompt_tokens_val, completion_tokens_val = (
+                                            _extract_non_stream_usage(
+                                                raw_resp,
+                                                est_prompt_tokens,
+                                                parsed_resp=loaded_resp,
+                                            )
+                                        )
+                                        del loaded_resp
+                                        if parse_extra > 0:
+                                            engine.release_response_memory(parse_extra)
+                                            resp_mem_reserved[0] = max(
+                                                0, resp_mem_reserved[0] - parse_extra
+                                            )
+                                        latency_ms = (time.monotonic() - req_start) * 1000.0
+                                        attempt_ms = (time.monotonic() - attempt_start) * 1000.0
+                                        content_type = (
+                                            resp.getheader("Content-Type") or "application/json"
+                                        )
+                                        non_stream_result = (
+                                            resp.status,
+                                            content_type,
                                             raw_resp,
-                                            est_prompt_tokens,
-                                            parsed_resp=loaded_resp,
+                                            latency_ms,
+                                            attempt_ms,
+                                            prompt_tokens_val,
+                                            completion_tokens_val,
                                         )
-                                    )
-                                    del loaded_resp
-                                    if parse_extra > 0:
-                                        engine.release_response_memory(parse_extra)
-                                        resp_mem_reserved[0] = max(
-                                            0, resp_mem_reserved[0] - parse_extra
-                                        )
-                                    latency_ms = (time.monotonic() - req_start) * 1000.0
-                                    attempt_ms = (time.monotonic() - attempt_start) * 1000.0
-                                    content_type = (
-                                        resp.getheader("Content-Type") or "application/json"
-                                    )
-                                    non_stream_result = (
-                                        resp.status,
-                                        content_type,
-                                        raw_resp,
-                                        latency_ms,
-                                        attempt_ms,
-                                        prompt_tokens_val,
-                                        completion_tokens_val,
-                                    )
                         else:
                             latency_ms = (time.monotonic() - req_start) * 1000.0
                             attempt_ms = (time.monotonic() - attempt_start) * 1000.0
@@ -4020,13 +4121,21 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                     fp_extra = b""
                     fp = getattr(resp, "fp", None)
                     if fp is not None and hasattr(fp, "peek"):
+                        if isinstance(upstream_sock, DeadlineSocket):
+                            upstream_sock._buffered_peek_only = True
                         try:
                             peeked = fp.peek()
                             if peeked:
                                 fp_extra = fp.read1(len(peeked))
+                        except ClientDisconnectedError:
+                            downstream_write_error = True
+                            use_reactor = False
                         except OSError:
                             fp_extra = b""
-                    if fp_extra:
+                        finally:
+                            if isinstance(upstream_sock, DeadlineSocket):
+                                upstream_sock._buffered_peek_only = False
+                    if use_reactor and fp_extra:
                         if not engine.try_reserve_response_memory(len(fp_extra)):
                             memory_limit_exceeded = True
                             use_reactor = False
@@ -4076,7 +4185,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         downstream_write_error = task.downstream_write_error
                         size_limit_exceeded = task.size_limit_exceeded
                         memory_limit_exceeded = task.memory_limit_exceeded
-                if not use_reactor and not memory_limit_exceeded:
+                if not use_reactor and not memory_limit_exceeded and not downstream_write_error:
                     phase2_buf = bytearray(rem_bytes)
                     scan_pos = 0
                     event_start = 0
@@ -4212,7 +4321,13 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             effective_ttft = (
                 first_content_ttft_ms if first_content_ttft_ms is not None else ttft_ms
             )
-            if stream_memory_exceeded:
+            if downstream_write_error:
+                # Downstream client disconnected or stalled on writes: record a distinct
+                # client-closed status (499) in Prometheus and UsageMeterHook while
+                # retaining partial token counts, without updating backend success latency
+                # or penalizing backend health.
+                recorded_status = 499
+            elif stream_memory_exceeded:
                 # Shared memory exhaustion is request-scoped: do not penalize backend health.
                 recorded_status = 503
             elif stream_size_exceeded:

@@ -118,12 +118,32 @@ def is_loopback_host(host: str) -> bool:
 
 
 def sanitize_url(url: str) -> str:
-    """Strip any userinfo credentials from a URL before logging or displaying."""
-    parts = urlsplit(url)
-    if "@" not in parts.netloc:
+    """Strip userinfo credentials, query strings, and fragments before logging or displaying."""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        cleaned = url.split("#", 1)[0].split("?", 1)[0]
+        if "://" in cleaned:
+            scheme, rest = cleaned.split("://", 1)
+            if "/" in rest:
+                authority, tail = rest.split("/", 1)
+                if "@" in authority:
+                    authority = authority.rsplit("@", 1)[1]
+                return f"{scheme}://{authority}/{tail}"
+            if "@" in rest:
+                rest = rest.rsplit("@", 1)[1]
+            return f"{scheme}://{rest}"
+        return cleaned
+    netloc = parts.netloc.rsplit("@", 1)[1] if "@" in parts.netloc else parts.netloc
+    if (
+        netloc == parts.netloc
+        and not parts.query
+        and not parts.fragment
+        and "?" not in url
+        and "#" not in url
+    ):
         return url
-    _, hostport = parts.netloc.rsplit("@", 1)
-    return parts._replace(netloc=hostport).geturl()
+    return parts._replace(netloc=netloc, query="", fragment="").geturl()
 
 
 def normalize_origin(origin: str) -> Optional[tuple[str, str, int]]:
@@ -131,7 +151,10 @@ def normalize_origin(origin: str) -> Optional[tuple[str, str, int]]:
     cleaned = origin.strip()
     if not cleaned or any(ch.isspace() for ch in cleaned):
         return None
-    parts = urlsplit(cleaned)
+    try:
+        parts = urlsplit(cleaned)
+    except ValueError:
+        return None
     scheme = parts.scheme.lower()
     if scheme not in VALID_URL_SCHEMES:
         return None
@@ -152,10 +175,20 @@ def normalize_origin(origin: str) -> Optional[tuple[str, str, int]]:
     return scheme, host, resolved_port
 
 
-def validate_http_url(url: str, *, field_name: str = "url") -> str:
+def validate_http_url(
+    url: str,
+    *,
+    field_name: str = "url",
+    allow_query: bool = True,
+) -> str:
     """Validate that a backend or exporter URL uses an explicit http/https scheme, host, and port."""
     cleaned = url.strip()
-    parts = urlsplit(cleaned)
+    try:
+        parts = urlsplit(cleaned)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid {field_name} {sanitize_url(cleaned)!r}: {exc}"
+        ) from exc
     scheme = parts.scheme.lower()
     if scheme not in VALID_URL_SCHEMES:
         raise ValueError(
@@ -165,6 +198,14 @@ def validate_http_url(url: str, *, field_name: str = "url") -> str:
     if not parts.hostname:
         raise ValueError(
             f"Invalid {field_name} {sanitize_url(cleaned)!r}: missing hostname"
+        )
+    if parts.fragment or "#" in cleaned:
+        raise ValueError(
+            f"Invalid {field_name} {sanitize_url(cleaned)!r}: fragments are not supported"
+        )
+    if not allow_query and (parts.query or "?" in cleaned):
+        raise ValueError(
+            f"Invalid {field_name} {sanitize_url(cleaned)!r}: query parameters are not supported"
         )
     try:
         port = parts.port
@@ -227,12 +268,15 @@ class BackendConfig:
                     f"Backend {self.id!r} field {field_name!r} must be a boolean, got {val!r}"
                 )
         self.base_url = validate_http_url(
-            self.base_url, field_name=f"backend {self.id!r} base_url"
+            self.base_url,
+            field_name=f"backend {self.id!r} base_url",
+            allow_query=False,
         ).rstrip("/")
         if self.tpu_exporter_url:
             self.tpu_exporter_url = validate_http_url(
                 self.tpu_exporter_url,
                 field_name=f"backend {self.id!r} tpu_exporter_url",
+                allow_query=True,
             )
         ctx = f"Backend {self.id!r}"
         _validate_finite_number(

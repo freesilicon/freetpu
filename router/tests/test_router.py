@@ -14,6 +14,7 @@ from pathlib import Path
 import resource
 import select
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -29,7 +30,13 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from router.config import BackendConfig, RouterConfig, load_config  # noqa: E402
+from router.config import (  # noqa: E402
+    BackendConfig,
+    RouterConfig,
+    load_config,
+    sanitize_url,
+    validate_http_url,
+)
 from router.freetpu_router import (  # noqa: E402
     FreeTPURouterServer,
     MAX_RR_CURSORS,
@@ -6694,6 +6701,14 @@ asyncio.run(main())
 
     def test_slow_sse_client_does_not_block_other_streams_and_evicts_cleanly(self) -> None:
         stop_srv = threading.Event()
+        upstream_closed_event = threading.Event()
+        upstream_closed_at: List[float] = []
+        recorded_usage: List[UsageEvent] = []
+
+        class _CaptureHook:
+            def record_usage(self, event: UsageEvent) -> None:
+                recorded_usage.append(event)
+
         srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv_sock.bind(("127.0.0.1", 0))
@@ -6725,7 +6740,7 @@ asyncio.run(main())
                     "choices": [
                         {
                             "index": 0,
-                            "delta": {"content": "S" * 4096},
+                            "delta": {"content": "S" * 32768},
                             "finish_reason": None,
                         }
                     ],
@@ -6756,6 +6771,7 @@ asyncio.run(main())
         ] + [b"data: [DONE]\n\n"]
 
         def handle_conn(conn: socket.socket) -> None:
+            is_slow = False
             try:
                 conn.settimeout(3.0)
                 buf = b""
@@ -6797,18 +6813,29 @@ asyncio.run(main())
                     b"Cache-Control: no-cache\r\nConnection: close\r\n\r\n"
                 )
                 if req_obj.get("model") == "m-slow":
+                    is_slow = True
                     conn.sendall(first_slow)
-                    for _ in range(512):
-                        if stop_srv.is_set():
-                            return
-                        conn.sendall(big_slow_chunk)
-                        time.sleep(0.002)
-                    conn.sendall(b"data: [DONE]\n\n")
+                    # Keep streaming indefinitely without [DONE] until the router evicts
+                    # the stalled client and closes this upstream connection.
+                    conn.settimeout(0.25)
+                    while not stop_srv.is_set():
+                        view = memoryview(big_slow_chunk)
+                        offset = 0
+                        while offset < len(view) and not stop_srv.is_set():
+                            try:
+                                sent = conn.send(view[offset:])
+                            except TimeoutError:
+                                continue
+                            if sent <= 0:
+                                raise BrokenPipeError("upstream peer closed")
+                            offset += sent
                 else:
                     for ch in fast_chunks:
                         conn.sendall(ch)
             except OSError:
-                pass
+                if is_slow and not stop_srv.is_set():
+                    upstream_closed_at.append(time.monotonic())
+                    upstream_closed_event.set()
             finally:
                 try:
                     conn.close()
@@ -6843,11 +6870,11 @@ asyncio.run(main())
                     )
                 ],
             )
-            router = self._track(create_router_server(cfg))
+            router = self._track(create_router_server(cfg, usage_hook=_CaptureHook()))
             rport = router.server_address[1]
 
-            # Open slow client with a small receive buffer, read only the response headers,
-            # then stop consuming so its TCP send buffer fills inside _SSEReactor.
+            # Set a small SO_RCVBUF BEFORE connect() so both Linux and macOS advertise
+            # a small TCP receive window and backpressure fills quickly inside _SSEReactor.
             slow_body = json.dumps(
                 {
                     "model": "m-slow",
@@ -6855,11 +6882,14 @@ asyncio.run(main())
                     "messages": [{"role": "user", "content": "stall me"}],
                 }
             ).encode("utf-8")
-            slow_sock = socket.create_connection(("127.0.0.1", rport), timeout=3.0)
+            slow_start = time.monotonic()
+            slow_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            slow_sock.settimeout(3.0)
             try:
                 slow_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
             except OSError:
                 pass
+            slow_sock.connect(("127.0.0.1", rport))
             slow_sock.sendall(
                 (
                     f"POST /v1/chat/completions HTTP/1.1\r\n"
@@ -6878,7 +6908,7 @@ asyncio.run(main())
                 slow_hdr += part
             self.assertIn(b"200 OK", slow_hdr)
 
-            # Give the reactor time to fill the stalled client's socket buffer.
+            # Give the reactor time to saturate the stalled client's socket send buffer.
             time.sleep(0.15)
 
             # Fast SSE streams on the SAME shared reactor must complete promptly without stalling.
@@ -6897,11 +6927,18 @@ asyncio.run(main())
                 self.assertEqual(st, 200)
                 self.assertIn(b"data: [DONE]", bd)
             fast_elapsed = time.monotonic() - t0
-            self.assertLess(fast_elapsed, 0.5)
+            self.assertLess(fast_elapsed, 1.0)
 
-            # Wait for the stalled slow client to be evicted on its write_deadline
-            # (still connected!) without penalizing the healthy backend or leaking slots/memory.
-            deadline = time.monotonic() + 2.5
+            # The slow upstream MUST observe socket close due to write-timeout eviction
+            # well BEFORE the overall 5.0s request_timeout_s (and without ever sending [DONE]).
+            self.assertTrue(
+                upstream_closed_event.wait(timeout=2.5),
+                "Slow upstream was not closed by router write-timeout eviction",
+            )
+            self.assertTrue(upstream_closed_at)
+            self.assertLess(upstream_closed_at[0] - slow_start, 2.5)
+
+            deadline = time.monotonic() + 2.0
             while time.monotonic() < deadline:
                 _, health = router.engine.health_payload()
                 if health["active_inflight"] == 0 and router.engine._resp_mem_used_bytes == 0:
@@ -6912,6 +6949,10 @@ asyncio.run(main())
             self.assertEqual(router.engine._resp_mem_used_bytes, 0)
             self.assertTrue(router.engine._backends[0].healthy)
             self.assertEqual(router.engine._backends[0].cooldown_until_monotonic, 0.0)
+            slow_events = [e for e in recorded_usage if e.model == "m-slow"]
+            self.assertEqual(len(slow_events), 1)
+            self.assertEqual(slow_events[0].status_code, 499)
+            self.assertGreater(slow_events[0].completion_tokens, 0)
         finally:
             stop_srv.set()
             if slow_sock is not None:
@@ -7163,6 +7204,10 @@ asyncio.run(main())
             REPO_ROOT / "docs/router/vllm-tpu-v6e8-batch-scaling.md"
         ).read_text(encoding="utf-8")
         self.assertNotIn("XLA_COMPILATION_CACHE_DIR", playbook)
+        self.assertNotIn("local NVMe", playbook)
+        self.assertNotIn("Load-Time MXFP4", playbook)
+        self.assertIn("Persistent Disk", playbook)
+        self.assertIn("gs://", playbook)
         self.assertIn(
             "export JAX_COMPILATION_CACHE_DIR=/var/cache/freetpu-xla-cache",
             playbook,
@@ -7171,14 +7216,10 @@ asyncio.run(main())
             "export VLLM_XLA_CACHE_PATH=/var/cache/freetpu-xla-cache",
             playbook,
         )
-        self.assertIn(
-            "-e JAX_COMPILATION_CACHE_DIR=/var/cache/freetpu-xla-cache",
-            playbook,
-        )
-        self.assertIn(
-            "-e VLLM_XLA_CACHE_PATH=/var/cache/freetpu-xla-cache",
-            playbook,
-        )
+        self.assertIn("-e JAX_COMPILATION_CACHE_DIR=", playbook)
+        self.assertIn("-e VLLM_XLA_CACHE_PATH=", playbook)
+        self.assertIn("-e LIBTPU_INIT_ARGS=", playbook)
+        self.assertIn("offline conversion", playbook.lower())
 
     def test_deadline_socket_waits_support_high_fds_without_select_select(self) -> None:
         def _forbid_select(*args: Any, **kwargs: Any) -> Any:
@@ -7440,6 +7481,385 @@ asyncio.run(main())
             self.assertFalse(telem.reachable)
             self.assertFalse(telem.exporter_up)
             self.assertIn("Invalid tpu_exporter_url", telem.error or "")
+
+    def test_sanitize_url_strips_query_and_fragment_and_base_url_rejects_them(
+        self,
+    ) -> None:
+        self.assertEqual(
+            sanitize_url(
+                "https://user:topsecret@api.example.com:8443/v1?subscription-key=supersecret#frag"
+            ),
+            "https://api.example.com:8443/v1",
+        )
+        self.assertEqual(
+            sanitize_url("http://127.0.0.1:8000/v1?api_key=leakme"),
+            "http://127.0.0.1:8000/v1",
+        )
+        self.assertEqual(
+            sanitize_url("http://127.0.0.1:8000/v1#secret-fragment"),
+            "http://127.0.0.1:8000/v1",
+        )
+        for bad_base in (
+            "https://api.example.com/v1?subscription-key=supersecret",
+            "https://api.example.com/v1#supersecret",
+            "http://127.0.0.1:8000/v1?",
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                BackendConfig(id="bad-q-b", base_url=bad_base)
+            self.assertNotIn("supersecret", str(ctx.exception))
+
+        # Exporter URLs may carry query parameters but must reject fragments.
+        ok_exp = validate_http_url(
+            "http://127.0.0.1:9400/metrics?target=tpu0",
+            field_name="tpu_exporter_url",
+            allow_query=True,
+        )
+        self.assertEqual(ok_exp, "http://127.0.0.1:9400/metrics?target=tpu0")
+        with self.assertRaises(ValueError) as ctx_frag:
+            BackendConfig(
+                id="bad-exp-frag",
+                base_url="http://127.0.0.1:8000/v1",
+                tpu_exporter_url="http://127.0.0.1:9400/metrics#secretfrag",
+            )
+        self.assertNotIn("secretfrag", str(ctx_frag.exception))
+
+    def test_shared_request_memory_budget_accounts_for_supplementary_unicode_ucs4(
+        self,
+    ) -> None:
+        backend = self._track(_MockOpenAIBackend("ucs4-mem-b", ["m-ucs4"]))
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            max_total_request_memory_bytes=2000,
+            backends=[
+                BackendConfig(
+                    id="ucs4-mem-b",
+                    base_url=backend.base_url,
+                    models=["m-ucs4"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        # 1. Pure ASCII ~300-byte body needs 4x (~1200 bytes) <= 2000 -> succeeds.
+        st_ascii, _, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-ucs4",
+                "messages": [{"role": "user", "content": "a" * 240}],
+            },
+        )
+        self.assertEqual(st_ascii, 200)
+        self.assertEqual(router.engine._req_mem_used_bytes, 0)
+
+        # 2. Same-sized body with one raw UTF-8 supplementary char (UCS-4 4x str widening)
+        # requires 10x (~3000 bytes) > 2000 -> rejected before decoding with 503.
+        ucs4_raw = json.dumps(
+            {
+                "model": "m-ucs4",
+                "messages": [{"role": "user", "content": ("a" * 236) + "\U0001f600"}],
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        conn = http.client.HTTPConnection("127.0.0.1", rport, timeout=3.0)
+        try:
+            conn.request(
+                "POST",
+                "/v1/chat/completions",
+                body=ucs4_raw,
+                headers={"Content-Type": "application/json"},
+            )
+            resp = conn.getresponse()
+            bd_ucs4 = resp.read()
+            self.assertEqual(resp.status, 503)
+            self.assertIn(b"server_memory_limit_reached", bd_ucs4)
+        finally:
+            conn.close()
+        self.assertEqual(router.engine._req_mem_used_bytes, 0)
+
+        # 3. Same-sized pure-ASCII body with a \uD83D\uDE00 surrogate escape also widens
+        # parsed string memory -> rejected before decoding with 503.
+        esc_raw = (
+            '{"model":"m-ucs4","messages":[{"role":"user","content":"'
+            + ("a" * 228)
+            + '\\uD83D\\uDE00"}]}'
+        ).encode("ascii")
+        conn2 = http.client.HTTPConnection("127.0.0.1", rport, timeout=3.0)
+        try:
+            conn2.request(
+                "POST",
+                "/v1/chat/completions",
+                body=esc_raw,
+                headers={"Content-Type": "application/json"},
+            )
+            resp2 = conn2.getresponse()
+            bd_esc = resp2.read()
+            self.assertEqual(resp2.status, 503)
+            self.assertIn(b"server_memory_limit_reached", bd_esc)
+        finally:
+            conn2.close()
+        self.assertEqual(router.engine._req_mem_used_bytes, 0)
+
+    def test_downstream_sse_disconnect_records_499_retains_tokens_and_skips_latency(
+        self,
+    ) -> None:
+        recorded: List[UsageEvent] = []
+
+        class _CaptureHook:
+            def record_usage(self, event: UsageEvent) -> None:
+                recorded.append(event)
+
+        # Use a raw TCP upstream that sends 1 SSE token then waits for client disconnect
+        # so the disconnect happens mid-stream (before [DONE]).
+        stop_up = threading.Event()
+        up_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        up_srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        up_srv.bind(("127.0.0.1", 0))
+        up_srv.listen(8)
+        up_srv.settimeout(0.2)
+        up_port = up_srv.getsockname()[1]
+
+        def _handle_up(conn: socket.socket) -> None:
+            try:
+                conn.settimeout(2.0)
+                buf = b""
+                while b"\r\n\r\n" not in buf:
+                    p = conn.recv(4096)
+                    if not p:
+                        return
+                    buf += p
+                hdr = buf.split(b"\r\n\r\n", 1)[0].decode("latin1")
+                if hdr.startswith("GET /v1/models"):
+                    body = b'{"object":"list","data":[{"id":"m-disc499","object":"model"}]}'
+                    conn.sendall(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                        + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode("ascii")
+                        + body
+                    )
+                    return
+                conn.sendall(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                    b"Cache-Control: no-cache\r\nConnection: close\r\n\r\n"
+                )
+                tok = (
+                    "data: "
+                    + json.dumps(
+                        {
+                            "id": "chatcmpl-499",
+                            "object": "chat.completion.chunk",
+                            "model": "m-disc499",
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": "Hello partial stream"},
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                    )
+                    + "\n\n"
+                ).encode("utf-8")
+                conn.sendall(tok)
+                stop_up.wait(timeout=3.0)
+            except OSError:
+                pass
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+        def _accept_up() -> None:
+            while not stop_up.is_set():
+                try:
+                    c, _ = up_srv.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                threading.Thread(target=_handle_up, args=(c,), daemon=True).start()
+
+        up_thread = threading.Thread(target=_accept_up, daemon=True)
+        up_thread.start()
+        try:
+            cfg = RouterConfig(
+                host="127.0.0.1",
+                port=0,
+                backends=[
+                    BackendConfig(
+                        id="disc-499-raw",
+                        base_url=f"http://127.0.0.1:{up_port}/v1",
+                        models=["m-disc499"],
+                    )
+                ],
+            )
+            router = self._track(create_router_server(cfg, usage_hook=_CaptureHook()))
+            rport = router.server_address[1]
+            # Reset EWMA latency after probe so we can assert cancelled stream does not record latency.
+            router.engine._backends[0].ewma_latency_ms = None
+
+            req_body = json.dumps(
+                {
+                    "model": "m-disc499",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "partial"}],
+                }
+            ).encode("utf-8")
+            cli = socket.create_connection(("127.0.0.1", rport), timeout=3.0)
+            try:
+                cli.sendall(
+                    (
+                        f"POST /v1/chat/completions HTTP/1.1\r\n"
+                        f"Host: 127.0.0.1:{rport}\r\n"
+                        f"Content-Type: application/json\r\n"
+                        f"Content-Length: {len(req_body)}\r\n"
+                        f"Connection: close\r\n\r\n"
+                    ).encode("ascii")
+                    + req_body
+                )
+                seen = b""
+                while b"Hello partial stream" not in seen:
+                    p = cli.recv(4096)
+                    if not p:
+                        break
+                    seen += p
+                self.assertIn(b"Hello partial stream", seen)
+            finally:
+                # Client disconnects mid-stream after receiving the first token.
+                cli.close()
+
+            deadline = time.monotonic() + 2.0
+            while not recorded and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertEqual(len(recorded), 1)
+            self.assertEqual(recorded[0].status_code, 499)
+            self.assertGreater(recorded[0].completion_tokens, 0)
+            self.assertIsNone(router.engine._backends[0].ewma_latency_ms)
+            self.assertTrue(router.engine._backends[0].healthy)
+            self.assertEqual(router.engine._backends[0].cooldown_until_monotonic, 0.0)
+
+            st_m, _, bd_m = _http_request(rport, "GET", "/metrics")
+            self.assertEqual(st_m, 200)
+            metrics_txt = bd_m.decode("utf-8")
+            self.assertIn('status="499"', metrics_txt)
+            self.assertNotIn('model="m-disc499",backend_id="disc-499-raw",status="200"', metrics_txt)
+        finally:
+            stop_up.set()
+            try:
+                up_srv.close()
+            except OSError:
+                pass
+            up_thread.join(timeout=2.0)
+
+    def test_scrape_tpu_exporter_enforces_deadline_during_slow_dns_resolution(
+        self,
+    ) -> None:
+        release_dns = threading.Event()
+
+        def _slow_getaddrinfo(*args: Any, **kwargs: Any) -> List[Any]:
+            release_dns.wait(timeout=1.5)
+            return [
+                (
+                    socket.AF_INET,
+                    socket.SOCK_STREAM,
+                    socket.IPPROTO_TCP,
+                    "",
+                    ("127.0.0.1", 9400),
+                )
+            ]
+
+        t0 = time.monotonic()
+        try:
+            with mock.patch.object(socket, "getaddrinfo", side_effect=_slow_getaddrinfo):
+                telem = scrape_tpu_exporter(
+                    "http://slow-dns.tpu.test:9400/metrics", timeout_s=0.25
+                )
+            elapsed = time.monotonic() - t0
+            self.assertFalse(telem.reachable)
+            self.assertEqual(telem.error, "exporter_scrape_timeout")
+            self.assertLess(elapsed, 0.65)
+        finally:
+            release_dns.set()
+
+    def test_deadline_socket_cancels_stalled_tls_read_on_client_disconnect(
+        self,
+    ) -> None:
+        for want_exc in (ssl.SSLWantReadError(), ssl.SSLWantWriteError()):
+            with self.subTest(want_exc=type(want_exc).__name__):
+                up_r, up_w = socket.socketpair()
+                cli_r, cli_w = socket.socketpair()
+                try:
+                    class _FakeTLSSocket:
+                        """Simulates a nonblocking SSLSocket receiving a partial TLS record."""
+
+                        def __init__(self, inner: socket.socket) -> None:
+                            self._inner = inner
+                            self._consumed_record = False
+
+                        def fileno(self) -> int:
+                            return self._inner.fileno()
+
+                        def settimeout(self, t: Optional[float]) -> None:
+                            self._inner.settimeout(t)
+
+                        def pending(self) -> int:
+                            return 0
+
+                        def recv_into(self, b: Any) -> int:
+                            # Drain the partial TLS record byte so TCP readability clears,
+                            # then tell caller OpenSSL needs more read/write I/O.
+                            if not self._consumed_record:
+                                try:
+                                    self._inner.recv(1)
+                                except BlockingIOError:
+                                    pass
+                                self._consumed_record = True
+                            raise want_exc
+
+                        def close(self) -> None:
+                            self._inner.close()
+
+                    fake_tls = _FakeTLSSocket(up_r)
+                    ds = DeadlineSocket(
+                        fake_tls,
+                        time.monotonic() + 5.0,
+                        label="tls-cancel-test",
+                        client_sock=cli_r,
+                    )
+                    ds._is_ssl = True
+
+                    # Make upstream TCP readable (partial TLS record). For SSLWantWriteError,
+                    # also saturate up_r's send buffer so POLLOUT blocks until client disconnect.
+                    up_w.sendall(b"\x17")
+                    if isinstance(want_exc, ssl.SSLWantWriteError):
+                        up_r.setblocking(False)
+                        try:
+                            while True:
+                                up_r.send(b"z" * 65536)
+                        except BlockingIOError:
+                            pass
+
+                    def _disconnect_client() -> None:
+                        time.sleep(0.06)
+                        cli_w.close()
+
+                    threading.Thread(target=_disconnect_client, daemon=True).start()
+                    t0 = time.monotonic()
+                    fp = ds.makefile("rb")
+                    try:
+                        with self.assertRaises(ClientDisconnectedError):
+                            fp.read(16)
+                    finally:
+                        fp.close()
+                    self.assertLess(time.monotonic() - t0, 1.0)
+                finally:
+                    up_r.close()
+                    up_w.close()
+                    cli_r.close()
+                    cli_w.close()
 
 
 def run_self_tests(verbosity: int = 1) -> int:

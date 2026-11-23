@@ -27,13 +27,18 @@ Trillium (`v6e`) uses `256×256` systolic MXUs; reduction/output dimensions alig
 
 ### Persistent XLA Compilation Cache
 
-Prevent 15+ minute Spot cold-start recompilation across VM preemptions by persisting XLA artifacts to local NVMe/host disk or GCS:
+Prevent 15+ minute Spot cold-start recompilation across VM preemptions by persisting XLA artifacts to preemption-safe storage (Compute Engine Local SSD is ephemeral and discarded on Spot preemption — use a **retained Persistent Disk** reattached across replacements or a **GCS bucket**):
 
 ```bash
+# Option A: Retained Persistent Disk mounted at /var/cache/freetpu-xla-cache
+# (attach with --auto-delete=no and remount on replacement Spot VMs):
 export JAX_COMPILATION_CACHE_DIR=/var/cache/freetpu-xla-cache
 export VLLM_XLA_CACHE_PATH=/var/cache/freetpu-xla-cache
 mkdir -p "$JAX_COMPILATION_CACHE_DIR"
-# Optional GCS-backed persistent cache for Spot fleets:
+
+# Option B: Shared GCS bucket cache for ephemeral Spot fleets (recommended):
+# export JAX_COMPILATION_CACHE_DIR="gs://${XLA_CACHE_BUCKET}/freetpu-xla-cache"
+# export VLLM_XLA_CACHE_PATH="${JAX_COMPILATION_CACHE_DIR}"
 # export LIBTPU_INIT_ARGS="--xla_tpu_enable_persistent_cache=true"
 ```
 
@@ -52,8 +57,9 @@ CONTAINER_FLAGS=(
   --net=host
   --shm-size=64G
   -v /var/cache/freetpu-xla-cache:/var/cache/freetpu-xla-cache
-  -e JAX_COMPILATION_CACHE_DIR=/var/cache/freetpu-xla-cache
-  -e VLLM_XLA_CACHE_PATH=/var/cache/freetpu-xla-cache
+  -e JAX_COMPILATION_CACHE_DIR="${JAX_COMPILATION_CACHE_DIR:-/var/cache/freetpu-xla-cache}"
+  -e VLLM_XLA_CACHE_PATH="${VLLM_XLA_CACHE_PATH:-/var/cache/freetpu-xla-cache}"
+  -e LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:-}"
 )
 ```
 
@@ -128,17 +134,21 @@ docker run -d --name vllm-int8-highbatch "${CONTAINER_FLAGS[@]}" \
     --async-scheduling
 ```
 
-2. **`openai/gpt-oss-120b` Load-Time MXFP4 -> W8A16/W8A8 INT8 Bypass (`v6e-8`):**
+2. **Preconverted `openai/gpt-oss-120b` W8A16/W8A8 INT8 (`compressed-tensors`) Preset (`v6e-8`):**
 
-`v6e` lacks native `f4E2M1FN` (`MXFP4`) MXU/Mosaic instructions. Converting MXFP4 -> W8A16/W8A8 INT8 (`~117 GB` total = `~14.6 GB/chip`, leaving `~108 GiB` free KV HBM) with `MOE_TC_PERMUTE=1` and Expert Parallelism avoids the `gmm_v2` / `fused_ep_moe` `f4E2M1FN` compile error while keeping `~5.1 GB` active weights per token:
+`v6e` lacks native `f4E2M1FN` (`MXFP4`) MXU/Mosaic instructions, and the published `openai/gpt-oss-120b` checkpoint declares `quantization_config.quant_method = "mxfp4"` in `config.json`. Because `--quantization compressed-tensors` requires a checkpoint whose `config.json` already declares `"quant_method": "compressed-tensors"`, vLLM rejects raw `openai/gpt-oss-120b` under that flag. Perform an offline conversion first (dequantizing MXFP4 weights to BF16 and exporting a `compressed-tensors` W8A16/W8A8 INT8 checkpoint, e.g. with `llm-compressor`), or point `GPT_OSS_120B_COMPRESSED_TENSORS_INT8` at an already-preconverted `compressed-tensors` INT8 checkpoint (`~117 GB` total = `~14.6 GB/chip`, leaving `~108 GiB` free KV HBM, `~5.1 GB` active weights per token):
 
 ```bash
+# Offline prerequisite (run once before serving; raw openai/gpt-oss-120b is mxfp4):
+# Dequantize openai/gpt-oss-120b -> BF16 and export a compressed-tensors W8A16/W8A8 INT8
+# checkpoint to "${GPT_OSS_120B_COMPRESSED_TENSORS_INT8}" (with
+# config.json quantization_config.quant_method == "compressed-tensors").
 docker run -d --name vllm-gptoss120b-int8 "${CONTAINER_FLAGS[@]}" \
   -e MOE_TC_PERMUTE=1 \
   vllm/vllm-tpu:latest \
   python3 -m vllm.entrypoints.openai.api_server \
     --host 127.0.0.1 --port 8000 \
-    --model "${GPT_OSS_120B_INT8_OR_CONVERTED}" \
+    --model "${GPT_OSS_120B_COMPRESSED_TENSORS_INT8}" \
     --quantization compressed-tensors \
     --enable-expert-parallel \
     --tensor-parallel-size 8 \
