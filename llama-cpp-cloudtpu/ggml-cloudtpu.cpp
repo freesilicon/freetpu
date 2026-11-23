@@ -1891,7 +1891,8 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
         if (is_skipped_graph_node(n)) {
             continue;
         }
-        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+        const int max_src = (n->op == GGML_OP_CPY || n->op == GGML_OP_CONT) ? 1 : GGML_MAX_SRC;
+        for (int s = 0; s < max_src; ++s) {
             for (const struct ggml_tensor* cur = n->src[s]; cur != nullptr; cur = view_parent(cur)) {
                 if (produced_in_slice.count(cur)) {
                     consumed_inside.insert(cur);
@@ -1904,7 +1905,8 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
         if (!n || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
         }
-        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+        const int max_src = (n->op == GGML_OP_CPY || n->op == GGML_OP_CONT) ? 1 : GGML_MAX_SRC;
+        for (int s = 0; s < max_src; ++s) {
             for (const struct ggml_tensor* cur = n->src[s]; cur != nullptr; cur = view_parent(cur)) {
                 if (produced_in_slice.count(cur)) {
                     needed_outside.insert(cur);
@@ -2068,6 +2070,10 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
             if (node->src[1]) {
                 src_ids.push_back(get_or_register_input(get_or_register_input, node->src[1]));
             }
+        } else if (node->op == GGML_OP_CPY || node->op == GGML_OP_CONT) {
+            // GGML_OP_CPY (including ggml_cast) places the uncomputed destination in src[1];
+            // only src[0] is read as a PJRT input.
+            src_ids.push_back(get_or_register_input(get_or_register_input, node->src[0]));
         } else {
             for (int s = 0; s < GGML_MAX_SRC && node->src[s] != nullptr; ++s) {
                 src_ids.push_back(get_or_register_input(get_or_register_input, node->src[s]));
