@@ -5180,6 +5180,237 @@ TPU Runtime Utilization
                 [25.0 + c for c in range(8)],
             )
 
+    def test_separate_slot_ironwood_per_core_duty_and_filtered_per_chip_fallback(self) -> None:
+        from types import SimpleNamespace
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # 1. Full 8-function Ironwood VM with separate PCI slots and NO sysfs chip_id:
+            #    `_verified_dual_function_chip_count()` is None, yet 8 distinct duty IDs
+            #    (> 4 physical Ironwood chips per VM) MUST join as per-core in `auto` mode.
+            sep_bdfs = [f"0000:00:{4 + i:02x}.0" for i in range(4)] + [
+                f"0000:80:{4 + i:02x}.0" for i in range(4)
+            ]
+            sep_sys, sep_dev, sep_proc = _make_mock_pci_tree(
+                root / "iw_sep_slots",
+                devices=[
+                    {
+                        "bdf": bdf,
+                        "vendor": "0x1ae0",
+                        "device": "0x0076",
+                        "driver": "vfio-pci",
+                        "iommu_group": str(i),
+                    }
+                    for i, bdf in enumerate(sep_bdfs)
+                ],
+                create_vfio_nodes=[str(i) for i in range(8)],
+            )
+
+            class _FakeReq:
+                def __init__(self, metric_name: str) -> None:
+                    self.metric_name = metric_name
+
+            class _FakeGrpc:
+                class LocalConnectionType:
+                    LOCAL_TCP = "LOCAL_TCP"
+
+                @staticmethod
+                def local_channel_credentials(conn_type):
+                    return ("local_creds", conn_type)
+
+                @staticmethod
+                def secure_channel(addr, creds, options=None):
+                    del addr, creds, options
+                    return SimpleNamespace(close=lambda: None)
+
+            def _make_item(dev_id: int, *, as_int=None, as_double=None):
+                gauge = SimpleNamespace(
+                    as_int=int(as_int or 0),
+                    as_double=float(as_double or 0.0),
+                    WhichOneof=lambda _f: "as_int"
+                    if as_int is not None
+                    else ("as_double" if as_double is not None else None),
+                )
+                attr_val = SimpleNamespace(
+                    int_attr=dev_id,
+                    WhichOneof=lambda _f: "int_attr",
+                )
+                return SimpleNamespace(
+                    attribute=SimpleNamespace(key="device_id", value=attr_val),
+                    gauge=gauge,
+                )
+
+            class _SepSlotPerCoreStub:
+                def __init__(self, channel):
+                    del channel
+
+                def GetRuntimeMetric(self, req, timeout=None):
+                    del timeout
+                    if req.metric_name == "tpu.runtime.hbm.memory.usage.bytes":
+                        items = [_make_item(c, as_int=(c + 1) * 6 * 1024**3) for c in range(8)]
+                    elif req.metric_name == "tpu.runtime.hbm.memory.total.bytes":
+                        items = [_make_item(c, as_int=96 * 1024**3) for c in range(8)]
+                    elif req.metric_name == "tpu.runtime.tensorcore.dutycycle.percent":
+                        items = [_make_item(c, as_double=12.0 + c) for c in range(8)]
+                    else:
+                        items = []
+                    return SimpleNamespace(metric=SimpleNamespace(metrics=items))
+
+            sep_map = {bdf: str(i) for i, bdf in enumerate(sep_bdfs)}
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.dict(tpu_exporter._GRPC_CHANNELS, {}, clear=True),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "grpc": _FakeGrpc,
+                        "tpu_info": SimpleNamespace(),
+                        "tpu_info.proto": SimpleNamespace(),
+                        "tpu_info.proto.tpu_metric_service_pb2": SimpleNamespace(
+                            MetricRequest=_FakeReq
+                        ),
+                        "tpu_info.proto.tpu_metric_service_pb2_grpc": SimpleNamespace(
+                            RuntimeMetricServiceStub=_SepSlotPerCoreStub
+                        ),
+                    },
+                ),
+            ):
+                sep_nomap = tpu_exporter.collect_snapshot(
+                    sysfs_root=sep_sys,
+                    dev_root=sep_dev,
+                    proc_root=sep_proc,
+                    tpu_info_bin="tpu-info",
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=root / "no-shm",
+                )
+                sep_mapped = tpu_exporter.collect_snapshot(
+                    sysfs_root=sep_sys,
+                    dev_root=sep_dev,
+                    proc_root=sep_proc,
+                    tpu_info_bin="tpu-info",
+                    chip_id_map=sep_map,
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=root / "no-shm",
+                )
+            self.assertIsNone(tpu_exporter._verified_dual_function_chip_count(sep_nomap.devices, 2))
+            self.assertEqual(sep_nomap.runtime_unjoined_duty_cycle, {})
+            self.assertEqual(
+                [rt.duty_cycle_percent for rt in sep_nomap.runtime_utilization],
+                [12.0 + c for c in range(8)],
+            )
+            self.assertEqual(
+                [d.duty_cycle_percent for d in sep_mapped.devices],
+                [12.0 + c for c in range(8)],
+            )
+
+            # 2. Filtered Ironwood sidecar (`--no-pid-scan`, only 2 visible PCI functions)
+            #    with `--grpc-duty-layout=per-chip` when direct gRPC fails MUST preserve
+            #    expanded per-core duty from `tpu_info.metrics.get_chip_usage()`, while
+            #    still blocking fallback from filling any core marked unset by gRPC.
+            filt_sys, filt_dev, filt_proc = _make_mock_pci_tree(
+                root / "iw_filtered_sidecar",
+                devices=[
+                    {
+                        "bdf": "0000:00:04.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0076",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                    },
+                    {
+                        "bdf": "0000:00:05.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0076",
+                        "driver": "vfio-pci",
+                        "iommu_group": "1",
+                    },
+                ],
+                create_vfio_nodes=[],
+            )
+            filt_map = {"0000:00:04.0": "0", "0000:00:05.0": "2"}
+            fake_usage_rows = [
+                SimpleNamespace(
+                    device_id=c,
+                    memory_usage=(c + 1) * 10 * 1024**3,
+                    total_memory=96 * 1024**3,
+                    duty_cycle_pct=40.0 + (c // 2) * 15.0,
+                )
+                for c in range(8)
+            ]
+            fake_metrics_mod = SimpleNamespace(
+                get_chip_usage=lambda chip_type, addr=None: fake_usage_rows,
+                get_chip_usage_new=lambda chip_type, addr=None: (_ for _ in ()).throw(
+                    AssertionError("per-chip must invoke get_chip_usage, not get_chip_usage_new")
+                ),
+            )
+            fake_device_mod = SimpleNamespace(TpuChip=SimpleNamespace(V7X="v7x"))
+            with (
+                mock.patch.object(
+                    tpu_exporter,
+                    "_query_grpc_runtime_metrics",
+                    return_value=(False, "grpc unavailable", {}),
+                ),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "tpu_info.metrics": fake_metrics_mod,
+                        "tpu_info.device": fake_device_mod,
+                    },
+                ),
+            ):
+                sidecar_snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=filt_sys,
+                    dev_root=filt_dev,
+                    proc_root=filt_proc,
+                    tpu_info_bin="tpu-info",
+                    chip_id_map=filt_map,
+                    skip_pid_scan=True,
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    grpc_duty_layout="per-chip",
+                    shm_root=root / "no-shm",
+                )
+            sc_by_bdf = {d.pci_bdf: d for d in sidecar_snap.devices}
+            self.assertEqual(sc_by_bdf["0000:00:04.0"].hbm_used_bytes, 10 * 1024**3)
+            self.assertEqual(sc_by_bdf["0000:00:04.0"].duty_cycle_percent, 40.0)
+            self.assertEqual(sc_by_bdf["0000:00:05.0"].hbm_used_bytes, 30 * 1024**3)
+            self.assertEqual(sc_by_bdf["0000:00:05.0"].duty_cycle_percent, 55.0)
+
+            # Verify gRPC-marked unset duty on core "2" is still blocked in per-chip fallback.
+            unset_grpc_rows = {
+                "2": tpu_exporter._TpuInfoRow(
+                    chip_key="2", in_util_table=True, duty_unset_in_grpc=True
+                )
+            }
+            with (
+                mock.patch.object(
+                    tpu_exporter,
+                    "_query_grpc_runtime_metrics",
+                    return_value=(False, "no live metrics", unset_grpc_rows),
+                ),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "tpu_info.metrics": fake_metrics_mod,
+                        "tpu_info.device": fake_device_mod,
+                    },
+                ),
+            ):
+                sidecar_unset = tpu_exporter.collect_snapshot(
+                    sysfs_root=filt_sys,
+                    dev_root=filt_dev,
+                    proc_root=filt_proc,
+                    tpu_info_bin="tpu-info",
+                    chip_id_map=filt_map,
+                    skip_pid_scan=True,
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    grpc_duty_layout="per-chip",
+                    shm_root=root / "no-shm",
+                )
+            sc_unset_by_bdf = {d.pci_bdf: d for d in sidecar_unset.devices}
+            self.assertEqual(sc_unset_by_bdf["0000:00:04.0"].duty_cycle_percent, 40.0)
+            self.assertIsNone(sc_unset_by_bdf["0000:00:05.0"].duty_cycle_percent)
+
     def _assert_valid_prometheus_text(self, text: str) -> None:
         lines = [ln for ln in text.splitlines() if ln.strip()]
         self.assertGreater(len(lines), 0)

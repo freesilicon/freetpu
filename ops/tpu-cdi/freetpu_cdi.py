@@ -570,21 +570,21 @@ def _legacy_vfio_groups_usable(
     return True if require_all else any(group_ok.values())
 
 
-def discover_tpu_chips(
+def _discover_tpu_chips_with_inventory(
     sysfs_root: Path = Path("/sys"),
     dev_root: Path = Path("/dev"),
     *,
     allow_missing_vfio: bool = False,
     iommu_dev_path: Optional[Path] = None,
     vfio_mode: str = "auto",
-) -> Tuple[List[DiscoveredChip], Path]:
-    """Scan sysfs for VFIO/iommufd-backed Google 0x1ae0 TPU PCI devices and device nodes.
+) -> Tuple[List[DiscoveredChip], Path, List[DiscoveredChip]]:
+    """Scan sysfs for VFIO/iommufd-backed Google 0x1ae0 TPU PCI devices and return
+    `(allocatable_chips, control_node, full_pci_inventory)`.
 
-    In default `vfio_mode="auto"`, legacy VFIO (`/dev/vfio/vfio` + `/dev/vfio/<group>`)
-    is preserved whenever `/dev/vfio/vfio` is present so hosts with working legacy VFIO
-    never break or withdraw group nodes merely because `/dev/iommu` also exists.
-    `iommufd` cdev mode is selected either explicitly via `vfio_mode="iommufd"` (or `"cdev"`)
-    or in `"auto"` mode when legacy `/dev/vfio/vfio` is absent and `/dev/iommu` is present.
+    `full_pci_inventory` retains every TPU PCI function visible in sysfs —
+    including functions whose per-group VFIO/iommufd device node is currently
+    unavailable — so chip-ID uniqueness checks never hide a cross-slice sysfs
+    `chip_id` collision when another slice loses its VFIO node.
     """
     norm_mode = _normalize_vfio_mode(vfio_mode)
     sysfs_root = Path(os.path.abspath(sysfs_root))
@@ -751,6 +751,7 @@ def discover_tpu_chips(
                 )
 
     candidate_chips: List[DiscoveredChip] = []
+    full_pci_inventory: List[DiscoveredChip] = []
     failed_vfio_groups: set[str] = set()
     first_vfio_node_error: Optional[Exception] = None
     for entry, device_id, gen, model_name in tpu_candidates:
@@ -793,6 +794,30 @@ def discover_tpu_chips(
 
         numa_node = _parse_numa_node(entry)
         pcie_root = _resolve_pcie_root_complex(entry)
+        runtime_chip_id = _parse_runtime_chip_id(entry)
+
+        # Always retain this PCI function in `full_pci_inventory` for host-wide
+        # chip-ID uniqueness checks even if its VFIO/iommufd node is missing or
+        # unverified below.
+        inv_entry = DiscoveredChip(
+            index=len(full_pci_inventory),
+            pci_bdf=entry.name,
+            vendor_id=GOOGLE_PCI_VENDOR_ID,
+            device_id=device_id,
+            generation=gen,
+            model_name=model_name,
+            driver=driver,
+            iommu_group=iommu_group,
+            vfio_host_path=dev_root / "vfio" / iommu_group,
+            vfio_container_path=f"/dev/vfio/{iommu_group}",
+            non_tpu_group_members=non_tpu_members,
+            numa_node=numa_node,
+            pcie_root=pcie_root,
+            vfio_mode="iommufd" if use_iommufd else "vfio-group",
+            iommufd_cdev=None,
+            runtime_chip_id=runtime_chip_id,
+        )
+        full_pci_inventory.append(inv_entry)
 
         # If a single IOMMU group loses its `/dev/vfio/<group>` or iommufd cdev
         # node (or fails per-group char/devnum verification) while its PCI entry
@@ -895,7 +920,7 @@ def discover_tpu_chips(
                 pcie_root=pcie_root,
                 vfio_mode=chip_vfio_mode,
                 iommufd_cdev=iommufd_cdev,
-                runtime_chip_id=_parse_runtime_chip_id(entry),
+                runtime_chip_id=runtime_chip_id,
             )
         )
 
@@ -933,6 +958,32 @@ def discover_tpu_chips(
             f"No known Google TPU PCI devices (vendor={GOOGLE_PCI_VENDOR_ID}) found under {pci_dir}"
         )
 
+    return chips, control_node, full_pci_inventory
+
+
+def discover_tpu_chips(
+    sysfs_root: Path = Path("/sys"),
+    dev_root: Path = Path("/dev"),
+    *,
+    allow_missing_vfio: bool = False,
+    iommu_dev_path: Optional[Path] = None,
+    vfio_mode: str = "auto",
+) -> Tuple[List[DiscoveredChip], Path]:
+    """Scan sysfs for VFIO/iommufd-backed Google 0x1ae0 TPU PCI devices and device nodes.
+
+    In default `vfio_mode="auto"`, legacy VFIO (`/dev/vfio/vfio` + `/dev/vfio/<group>`)
+    is preserved whenever `/dev/vfio/vfio` is present so hosts with working legacy VFIO
+    never break or withdraw group nodes merely because `/dev/iommu` also exists.
+    `iommufd` cdev mode is selected either explicitly via `vfio_mode="iommufd"` (or `"cdev"`)
+    or in `"auto"` mode when legacy `/dev/vfio/vfio` is absent and `/dev/iommu` is present.
+    """
+    chips, control_node, _full_pci_inventory = _discover_tpu_chips_with_inventory(
+        sysfs_root=sysfs_root,
+        dev_root=dev_root,
+        allow_missing_vfio=allow_missing_vfio,
+        iommu_dev_path=iommu_dev_path,
+        vfio_mode=vfio_mode,
+    )
     return chips, control_node
 
 
@@ -1233,13 +1284,16 @@ def _resolve_verified_visibility_ordinals(
     bdf_to_phys: Dict[str, int],
     *,
     chip_id_map: Optional[Dict[str, int]] = None,
+    host_pci_inventory: Optional[Sequence[DiscoveredChip]] = None,
 ) -> Optional[Tuple[List[int], List[int]]]:
     """Return `(visible_chip_ordinals, visible_device_ordinals)` ONLY when verified.
 
     - Requires every physical chip in `subset` to have its complete PCI function set.
     - Requires authoritative runtime ordinals from sysfs `chip_id` or explicit
-      `chip_id_map` for EVERY chip in `subset` (checking uniqueness across all
-      host chips so conflicting or incomplete maps fail closed).
+      `chip_id_map` for EVERY chip in `subset`, checking uniqueness across ALL
+      TPU functions present in host PCI sysfs (`host_pci_inventory`, including
+      functions whose VFIO nodes are currently unavailable) so conflicting or
+      incomplete maps fail closed.
     - Never assumes runtime ordinals are `0..N-1` (even on `all`, since Cloud TPU
       hosts can expose non-contiguous runtime IDs such as `8,9,12,13`). When
       verified ordinals are unavailable, returns `None` so CDI omits
@@ -1254,6 +1308,10 @@ def _resolve_verified_visibility_ordinals(
             return chip_id_map[chip.pci_bdf]
         return chip.runtime_chip_id
 
+    inventory_chips: Sequence[DiscoveredChip] = (
+        host_pci_inventory if host_pci_inventory is not None else all_chips
+    )
+
     subset_raw: List[Optional[int]] = [_raw_id(c) for c in subset]
     if all(rid is not None for rid in subset_raw):
         per_chip_set = {
@@ -1262,13 +1320,13 @@ def _resolve_verified_visibility_ordinals(
         if len(per_chip_set) == 1:
             per_chip = next(iter(per_chip_set))
             all_raw_by_bdf: Dict[str, int] = {}
-            for c in all_chips:
+            for c in inventory_chips:
                 rid = _raw_id(c)
                 if rid is not None:
                     all_raw_by_bdf[c.pci_bdf] = rid
 
             if per_chip == 1:
-                # Every claimed runtime ID across the host must be unique.
+                # Every claimed runtime ID across the full host PCI inventory must be unique.
                 if len(set(all_raw_by_bdf.values())) == len(all_raw_by_bdf):
                     ords = sorted(int(rid) for rid in subset_raw if rid is not None)
                     return ords, list(ords)
@@ -1289,17 +1347,22 @@ def _resolve_verified_visibility_ordinals(
                 return None
 
             # Case B: physical chip ID shared by both PCI functions of each chip.
+            inv_bdf_to_phys = (
+                _map_physical_chip_indices(inventory_chips, chip_id_map=chip_id_map)
+                if host_pci_inventory is not None
+                else bdf_to_phys
+            )
             phys_to_rids: Dict[int, set[int]] = {}
-            for c in all_chips:
+            for c in inventory_chips:
                 rid = all_raw_by_bdf.get(c.pci_bdf)
                 if rid is not None:
-                    phys_to_rids.setdefault(bdf_to_phys[c.pci_bdf], set()).add(rid)
+                    phys_to_rids.setdefault(inv_bdf_to_phys[c.pci_bdf], set()).add(rid)
             if all(len(rids) == 1 for rids in phys_to_rids.values()):
                 claimed_phys_rids = [next(iter(rids)) for rids in phys_to_rids.values()]
                 if len(set(claimed_phys_rids)) == len(claimed_phys_rids):
                     sub_phys = sorted(
                         {
-                            next(iter(phys_to_rids[bdf_to_phys[c.pci_bdf]]))
+                            next(iter(phys_to_rids[inv_bdf_to_phys[c.pci_bdf]]))
                             for c in subset
                         }
                     )
@@ -1469,6 +1532,7 @@ def _compute_topology_slices(
     *,
     reserved_names: Optional[set[str]] = None,
     chip_id_map: Optional[Dict[str, int]] = None,
+    host_pci_inventory: Optional[Sequence[DiscoveredChip]] = None,
 ) -> List[_TopologySlice]:
     """Compute valid single-domain NUMA / PCIe sub-host slices and their canonical aliases.
 
@@ -1543,6 +1607,7 @@ def _compute_topology_slices(
             chips,
             bdf_to_phys,
             chip_id_map=chip_id_map,
+            host_pci_inventory=host_pci_inventory,
         )
         if verified_vis is not None:
             vis_chips, _vis_devs = verified_vis
@@ -1605,6 +1670,7 @@ def build_cdi_spec(
     cdi_version: str = DEFAULT_CDI_VERSION,
     chip_id_map: Optional[Dict[str, int]] = None,
     omit_visible_env: bool = False,
+    host_pci_inventory: Optional[Sequence[DiscoveredChip]] = None,
 ) -> Dict[str, Any]:
     """Build a CNCF CDI JSON specification dictionary (default: CDI v0.6.0, host-safe env).
 
@@ -1773,7 +1839,11 @@ def build_cdi_spec(
     )
     used_names = {d["name"] for d in devices}
     for topo_slice in _compute_topology_slices(
-        chips, bdf_to_phys, reserved_names=used_names, chip_id_map=chip_id_map
+        chips,
+        bdf_to_phys,
+        reserved_names=used_names,
+        chip_id_map=chip_id_map,
+        host_pci_inventory=host_pci_inventory,
     ):
         slice_nodes, slice_devnums = _dedup_device_nodes(topo_slice.chips)
         slice_visibility = _resolve_verified_visibility_ordinals(
@@ -1781,6 +1851,7 @@ def build_cdi_spec(
             chips,
             bdf_to_phys,
             chip_id_map=chip_id_map,
+            host_pci_inventory=host_pci_inventory,
         )
         slice_visibility_nomap = (
             _resolve_verified_visibility_ordinals(
@@ -1788,6 +1859,7 @@ def build_cdi_spec(
                 chips,
                 bdf_to_phys_nomap,
                 chip_id_map=None,
+                host_pci_inventory=host_pci_inventory,
             )
             if chip_id_map
             else slice_visibility
@@ -1849,6 +1921,7 @@ def build_cdi_spec(
         chips,
         bdf_to_phys,
         chip_id_map=chip_id_map,
+        host_pci_inventory=host_pci_inventory,
     )
     all_visibility_nomap = (
         _resolve_verified_visibility_ordinals(
@@ -1856,6 +1929,7 @@ def build_cdi_spec(
             chips,
             bdf_to_phys_nomap,
             chip_id_map=None,
+            host_pci_inventory=host_pci_inventory,
         )
         if chip_id_map
         else all_visibility
@@ -2506,7 +2580,7 @@ def _verify_spec_against_host_detailed(
     effective_mode = _detect_spec_vfio_mode(spec) if norm_mode == "auto" else norm_mode
 
     try:
-        live_chips, vfio_container = discover_tpu_chips(
+        live_chips, vfio_container, live_pci_inventory = _discover_tpu_chips_with_inventory(
             sysfs_root=sysfs_root,
             dev_root=dev_root,
             allow_missing_vfio=False,
@@ -2543,6 +2617,7 @@ def _verify_spec_against_host_detailed(
         live_bdf_to_phys,
         reserved_names=live_reserved_names,
         chip_id_map=chip_id_map,
+        host_pci_inventory=live_pci_inventory,
     ):
         expected_slices_by_bdfs[topo_slice.pci_bdfs] = topo_slice
         for alias in topo_slice.aliases:
@@ -2925,6 +3000,7 @@ def _verify_spec_against_host_detailed(
                 live_chips,
                 live_bdf_to_phys,
                 chip_id_map=chip_id_map,
+                host_pci_inventory=live_pci_inventory,
             )
             uses_explicit_chip_map_env = ann.get("freetpu.dev/chip-id-source") == "chip-id-map"
             if live_vis is not None:
@@ -3057,7 +3133,7 @@ def reconcile_cdi_spec(
     if vfio_mode not in VFIO_MODES:
         return False, f"Invalid vfio_mode {vfio_mode!r} (existing spec preserved)"
     try:
-        chips, vfio_container = discover_tpu_chips(
+        chips, vfio_container, full_pci_inventory = _discover_tpu_chips_with_inventory(
             sysfs_root=sysfs_root,
             dev_root=dev_root,
             allow_missing_vfio=False,
@@ -3073,6 +3149,7 @@ def reconcile_cdi_spec(
             cdi_version=cdi_version,
             chip_id_map=chip_id_map,
             omit_visible_env=omit_visible_env,
+            host_pci_inventory=full_pci_inventory,
         )
     except Exception as exc:  # noqa: BLE001
         removed, cleanup_err = _invalidate_spec(output_path)
@@ -3489,7 +3566,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 1
 
         try:
-            chips, vfio_container = discover_tpu_chips(
+            chips, vfio_container, full_pci_inventory = _discover_tpu_chips_with_inventory(
                 sysfs_root=args.sysfs_root,
                 dev_root=args.dev_root,
                 allow_missing_vfio=args.allow_missing_vfio,
@@ -3505,6 +3582,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 cdi_version=args.cdi_version,
                 chip_id_map=parsed_chip_map,
                 omit_visible_env=args.omit_visible_env,
+                host_pci_inventory=full_pci_inventory,
             )
         except Exception as exc:  # noqa: BLE001
             if not args.stdout and not args.allow_missing_vfio:

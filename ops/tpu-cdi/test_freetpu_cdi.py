@@ -5227,6 +5227,98 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertIn("Preserved live CDI spec", err2)
                 self.assertTrue(spec_path.exists())
 
+    def test_missing_vfio_function_chip_id_conflict_blocks_alias_and_visibility_mask(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # NUMA 0 reports chip_id 0..3; NUMA 1 function 0000:80:07.0 collides on chip_id=3
+            # and loses its `/dev/vfio/7` node while remaining present in PCI sysfs.
+            devs = [
+                {
+                    "bdf": f"0000:00:{4 + i:02x}.0",
+                    "vendor": "0x1ae0",
+                    "device": "0x006f",
+                    "driver": "vfio-pci",
+                    "iommu_group": str(i),
+                    "numa_node": "0",
+                    "chip_id": str(i),
+                }
+                for i in range(4)
+            ] + [
+                {
+                    "bdf": f"0000:80:{4 + i:02x}.0",
+                    "vendor": "0x1ae0",
+                    "device": "0x006f",
+                    "driver": "vfio-pci",
+                    "iommu_group": str(4 + i),
+                    "numa_node": "1",
+                    "chip_id": "3" if i == 3 else str(4 + i),  # 0000:80:07.0 collides with 3!
+                }
+                for i in range(4)
+            ]
+            sysfs_root, dev_root = _make_mock_pci_vfio(
+                root / "missing_vfio_chip_id_conflict",
+                devices=devs,
+                create_vfio_nodes=[str(i) for i in range(7)],  # /dev/vfio/7 missing!
+            )
+            spec_path = root / "cdi" / "freetpu.json"
+
+            with _mock_vfio_char_devices():
+                ok, msg = freetpu_cdi.reconcile_cdi_spec(
+                    spec_path,
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    single_host_env=True,
+                )
+                self.assertTrue(ok, msg)
+                spec = json.loads(spec_path.read_text(encoding="utf-8"))
+                by_name = {d["name"]: d for d in spec["devices"]}
+                self.assertIn("numa0-pcie-0000-00-4", by_name)
+                self.assertNotIn("0-3", by_name)
+                n0_env = dict(
+                    kv.split("=", 1)
+                    for kv in by_name["numa0-pcie-0000-00-4"]["containerEdits"]["env"]
+                )
+                self.assertNotIn("TPU_VISIBLE_CHIPS", n0_env)
+                self.assertNotIn("TPU_VISIBLE_DEVICES", n0_env)
+                self.assertEqual(
+                    freetpu_cdi.verify_spec_against_host(
+                        spec, sysfs_root=sysfs_root, dev_root=dev_root
+                    ),
+                    [],
+                )
+
+                # Host validation MUST reject a spec injecting `0-3` / `TPU_VISIBLE_CHIPS=0,1,2,3`
+                # while the unavailable PCI function still collides on chip_id=3 in sysfs.
+                bad_spec = json.loads(json.dumps(spec))
+                n0_copy = json.loads(json.dumps(by_name["numa0-pcie-0000-00-4"]))
+                n0_copy["name"] = "0-3"
+                n0_copy["containerEdits"]["env"].append("TPU_VISIBLE_CHIPS=0,1,2,3")
+                bad_spec["devices"].append(n0_copy)
+                bad_errs = freetpu_cdi.verify_spec_against_host(
+                    bad_spec, sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                self.assertTrue(any("0-3" in e for e in bad_errs), bad_errs)
+
+                # Once the sysfs conflict is cleared (chip_id=7), `0-3` and visibility masks return.
+                (sysfs_root / "bus" / "pci" / "devices" / "0000:80:07.0" / "chip_id").write_text(
+                    "7\n", encoding="utf-8"
+                )
+                ok2, msg2 = freetpu_cdi.reconcile_cdi_spec(
+                    spec_path,
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    single_host_env=True,
+                )
+                self.assertTrue(ok2, msg2)
+                spec2 = json.loads(spec_path.read_text(encoding="utf-8"))
+                by_name2 = {d["name"]: d for d in spec2["devices"]}
+                self.assertIn("0-3", by_name2)
+                n0_env2 = dict(
+                    kv.split("=", 1)
+                    for kv in by_name2["numa0-pcie-0000-00-4"]["containerEdits"]["env"]
+                )
+                self.assertEqual(n0_env2.get("TPU_VISIBLE_CHIPS"), "0,1,2,3")
+
 
 if __name__ == "__main__":
     unittest.main()

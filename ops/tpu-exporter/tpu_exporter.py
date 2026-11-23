@@ -1539,6 +1539,14 @@ def _query_grpc_runtime_metrics(
                 if verified_chip_count is not None:
                     if len(raw_duty_int_ids) > verified_chip_count:
                         duty_layout = "per_core"
+                elif known_gens == {"tpu7x"}:
+                    # Google Cloud Ironwood (`tpu7x`) VMs have at most 4 physical
+                    # chips per host (8 logical cores), so >4 distinct duty IDs
+                    # prove a per-core duty reply independently of PCI sibling
+                    # grouping (e.g. separate-slot Ironwood PCI functions without
+                    # sysfs `chip_id`s).
+                    if len(raw_duty_int_ids) > 4:
+                        duty_layout = "per_core"
                 elif known_gens and known_gens <= {"v2", "v3", "v2-v3"} and len(devices) >= 4:
                     legacy_chip_count = len(devices)
                     legacy_core_count = legacy_chip_count * devices_per_chip
@@ -2279,21 +2287,24 @@ def _sanitize_fallback_duty_rows(
     devices: Sequence[TpuTelemetry],
     *,
     unset_duty_ids: Optional[set[str]] = None,
+    grpc_duty_layout: str = "auto",
 ) -> Dict[str, _TpuInfoRow]:
     """Strip unverified fallback `duty_cycle_percent` joins on Ironwood (`tpu7x`) hosts
     and block stock fallbacks from turning gRPC-unset duty gauges into `0.0%`.
 
     Upstream `tpu_info.metrics.get_chip_usage_new` (used strictly on Ironwood
-    `V7X` by both the `tpu-info` CLI and Python API) sorts HBM and duty-cycle
-    replies separately and zips them by position without checking that IDs
-    match, and stock `tpu-info` / `tpu_info.metrics` read unset protobuf duty
-    gauges as `0.0` without checking field presence. Legacy `v2`/`v3`/`v4`/
-    `v5e`/`v5p`/`v6e` use `get_chip_usage`, which already expands per-chip duty
-    readings cleanly into per-core rows even when PCI visibility is partial.
-    On Ironwood (`tpu7x`), accept fallback `duty_cycle_percent` ONLY when
-    fallback covers the full contiguous verified host core set
-    (`0..verified_chips * devices_per_chip - 1`) with populated gauges, where
-    equal-length positional zipping is provably 1:1.
+    `V7X` by stock `tpu-info` CLI and `auto`/`per-core` Python fallback) sorts
+    HBM and duty-cycle replies separately and zips them by position without
+    checking that IDs match, and stock `tpu-info` / `tpu_info.metrics` read
+    unset protobuf duty gauges as `0.0` without checking field presence.
+    Explicit `--grpc-duty-layout=per-chip` in the Python fallback calls
+    `get_chip_usage()` instead (which expands chip readings into per-core rows
+    cleanly even on a filtered PCI sidecar), and legacy `v2`/`v3`/`v4`/`v5e`/
+    `v5p`/`v6e` always use `get_chip_usage()`.
+    On Ironwood (`tpu7x`) `get_chip_usage_new` paths, accept fallback
+    `duty_cycle_percent` ONLY when fallback covers the full contiguous verified
+    host core set (`0..verified_chips * devices_per_chip - 1`) with populated
+    gauges, where equal-length positional zipping is provably 1:1.
     """
     if not rows:
         return rows
@@ -2306,6 +2317,11 @@ def _sanitize_fallback_duty_rows(
                 copied.duty_cycle_percent = None
             stripped[k] = copied
         working = stripped
+    # Explicit `per-chip` Python fallback uses `get_chip_usage()` rather than
+    # `get_chip_usage_new()`, so preserve its expanded per-core duty readings
+    # even on filtered PCI sidecars (while still honoring `unset_duty_ids` above).
+    if grpc_duty_layout == "per-chip":
+        return working
     # Restrict the `get_chip_usage_new` positional-zip guard strictly to
     # Ironwood (`tpu7x`); sidecars without PCI inventory and legacy
     # `v2`/`v3`/`v4`/`v5e`/`v5p`/`v6e` hosts preserve fallback duty readings.
@@ -2319,6 +2335,8 @@ def _sanitize_fallback_duty_rows(
     verified_chips = _verified_dual_function_chip_count(devices, inferred_dpc)
     if verified_chips is not None:
         expected_core_count = verified_chips * inferred_dpc
+    elif all(d.generation == "tpu7x" for d in devices) and len(devices) == 8:
+        expected_core_count = 8
 
     if expected_core_count is not None:
         duty_ids = {
@@ -2595,7 +2613,10 @@ def collect_snapshot(
                         k for k, r in parsed_rows.items() if r.duty_unset_in_grpc
                     }
                     py_rows = _sanitize_fallback_duty_rows(
-                        py_rows, devices, unset_duty_ids=grpc_unset_duty_ids
+                        py_rows,
+                        devices,
+                        unset_duty_ids=grpc_unset_duty_ids,
+                        grpc_duty_layout=grpc_duty_layout,
                     )
                     py_rows = _tag_row_sources(py_rows, "tpu-info-python")
                     parsed_rows = _merge_runtime_rows(
@@ -2708,7 +2729,10 @@ def collect_snapshot(
                         k for k, r in parsed_rows.items() if r.duty_unset_in_grpc
                     }
                     py_rows = _sanitize_fallback_duty_rows(
-                        py_rows, devices, unset_duty_ids=grpc_unset_duty_ids
+                        py_rows,
+                        devices,
+                        unset_duty_ids=grpc_unset_duty_ids,
+                        grpc_duty_layout=grpc_duty_layout,
                     )
                     py_rows = _tag_row_sources(py_rows, "tpu-info-python")
                     parsed_rows = _merge_runtime_rows(
