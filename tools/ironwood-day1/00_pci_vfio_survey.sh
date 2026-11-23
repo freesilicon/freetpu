@@ -130,18 +130,78 @@ emit_topology_status() {
   fi
 }
 
+compute_file_sha256() {
+  local target="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "${target}" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "${target}" | awk '{print $1}'
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 - "${target}" <<'PYEOF'
+import hashlib, sys
+h = hashlib.sha256()
+with open(sys.argv[1], "rb") as f:
+    for chunk in iter(lambda: f.read(1024 * 1024), b""):
+        h.update(chunk)
+print(h.hexdigest())
+PYEOF
+  else
+    return 1
+  fi
+}
+
+check_staged_libtpu_stamp() {
+  local dest="$1"
+  local want_ver="$2"
+  local stamp="${dest}.version"
+  LIBTPU_STAMP_REASON=""
+  if [[ ! -s "${dest}" ]]; then
+    LIBTPU_STAMP_REASON="missing_binary"
+    return 1
+  fi
+  if [[ ! -r "${stamp}" ]]; then
+    LIBTPU_STAMP_REASON="missing_version_stamp"
+    return 1
+  fi
+  local got_ver="" got_sha="" actual_sha=""
+  got_ver="$(sed -n 's/^version=//p' "${stamp}" | head -n 1)"
+  got_sha="$(sed -n 's/^sha256=//p' "${stamp}" | head -n 1)"
+  if [[ "${got_ver}" != "${want_ver}" ]]; then
+    LIBTPU_STAMP_REASON="version_mismatch(have=${got_ver:-unknown},want=${want_ver})"
+    return 1
+  fi
+  if [[ -z "${got_sha}" ]]; then
+    LIBTPU_STAMP_REASON="missing_sha256_in_stamp"
+    return 1
+  fi
+  actual_sha="$(compute_file_sha256 "${dest}" 2>/dev/null || true)"
+  if [[ -z "${actual_sha}" || "${actual_sha}" != "${got_sha}" ]]; then
+    LIBTPU_STAMP_REASON="sha256_mismatch"
+    return 1
+  fi
+  LIBTPU_STAMP_REASON="verified(version=${got_ver},sha256=${actual_sha})"
+  return 0
+}
+
 stage_libtpu_wheel() {
   if [[ "${STAGE_LIBTPU}" -ne 1 ]]; then
     return 0
   fi
   if [[ "${DRY_RUN}" -eq 1 || "${MOCK_MODE}" -eq 1 ]]; then
-    log "[LIBTPU-STAGE] Would extract libtpu/libtpu.so from PyPI libtpu==${LIBTPU_VERSION} cp312 x86_64 wheel to ${LIBTPU_DEST} (zero JAX install required)"
+    if check_staged_libtpu_stamp "${LIBTPU_DEST}" "${LIBTPU_VERSION}"; then
+      log "[LIBTPU-STAGE] Would reuse verified staged libtpu.so (${LIBTPU_STAMP_REASON}): ${LIBTPU_DEST}"
+    else
+      log "[LIBTPU-STAGE] Would extract libtpu/libtpu.so from PyPI libtpu==${LIBTPU_VERSION} cp312 x86_64 wheel to ${LIBTPU_DEST} (reason=${LIBTPU_STAMP_REASON}, zero JAX install required)"
+    fi
     return 0
   fi
-  if [[ -s "${LIBTPU_DEST}" ]]; then
-    log "[LIBTPU-STAGE] Reusing existing staged libtpu.so: ${LIBTPU_DEST}"
+  if check_staged_libtpu_stamp "${LIBTPU_DEST}" "${LIBTPU_VERSION}"; then
+    log "[LIBTPU-STAGE] Reusing verified staged libtpu.so (${LIBTPU_STAMP_REASON}): ${LIBTPU_DEST}"
     export LIBTPU_PATH="${LIBTPU_DEST}"
     return 0
+  fi
+  if [[ -e "${LIBTPU_DEST}" ]]; then
+    log "[LIBTPU-STAGE] Existing ${LIBTPU_DEST} cannot be reused (${LIBTPU_STAMP_REASON}); re-staging libtpu==${LIBTPU_VERSION}"
   fi
   if ! command -v python3 >/dev/null 2>&1; then
     log "ERROR: --stage-libtpu requires python3 to download and extract the cp312 wheel."
@@ -185,12 +245,19 @@ with zipfile.ZipFile(io.BytesIO(whl_bytes)) as zf:
         raise SystemExit(f"libtpu.so not found inside {whl['filename']}")
     so_bytes = zf.read(so_members[0])
 
+so_sha = hashlib.sha256(so_bytes).hexdigest()
 tmp_dest = f"{dest}.tmp.{os.getpid()}"
 with open(tmp_dest, "wb") as f:
     f.write(so_bytes)
 os.chmod(tmp_dest, 0o755)
 os.replace(tmp_dest, dest)
-print(f"LIBTPU_STAGED path={dest} wheel={whl['filename']} bytes={len(so_bytes)} sha256={actual_sha}")
+
+stamp_path = f"{dest}.version"
+tmp_stamp = f"{stamp_path}.tmp.{os.getpid()}"
+with open(tmp_stamp, "w", encoding="utf-8") as f:
+    f.write(f"version={version}\nsha256={so_sha}\nwheel={whl['filename']}\nwheel_sha256={actual_sha}\n")
+os.replace(tmp_stamp, stamp_path)
+print(f"LIBTPU_STAGED path={dest} version={version} wheel={whl['filename']} bytes={len(so_bytes)} so_sha256={so_sha} wheel_sha256={actual_sha}")
 PYEOF
   export LIBTPU_PATH="${LIBTPU_DEST}"
 }

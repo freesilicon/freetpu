@@ -368,7 +368,7 @@ if is_mock:
         raise SystemExit("tpu-exporter mock sample verification failed: " + "; ".join(errors))
     exporter_status = "PASS"
 else:
-    if (direct_grpc_status == "PASS" or shm_status == "PASS") and aer_status == "PASS":
+    if direct_grpc_status == "PASS" and shm_status == "PASS" and aer_status == "PASS":
         exporter_status = "PASS"
     else:
         exporter_status = "PARTIAL_UNVERIFIED"

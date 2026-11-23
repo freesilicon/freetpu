@@ -219,6 +219,25 @@ resolve_effective_chips() {
   printf '%s' "${chips}"
 }
 
+should_run_671b_tier() {
+  local eff_chips="$1"
+  if [[ "${INCLUDE_671B}" -eq 1 || "${eff_chips}" -ge 8 ]]; then
+    return 0
+  fi
+  return 1
+}
+
+build_gcs_exclude_regex() {
+  local run_671b="$1"
+  if [[ "${run_671b}" -eq 1 ]]; then
+    printf '%s' '^xla-cache/.*'
+  else
+    printf '%s' '(^xla-cache/.*|(?i:(?:^|.*/)(?:.*671b.*|.*deepseek[-_.]?(?:v3|r1)(?!.*(?:distill|1\.5b|7b|8b|14b|32b|70b)).*\.gguf$)))'
+  fi
+}
+
+LAST_MOSAIC_STATUS="FALLBACK_ONLY"
+
 evaluate_live_mosaic_dispatch() {
   local label="$1"
   local run_output="$2"
@@ -238,12 +257,19 @@ evaluate_live_mosaic_dispatch() {
   ')"
   local saw=0 mc=0 mf=0
   read -r saw mc mf <<< "${summary_counts}"
-  if [[ "${saw}" -eq 1 && "${mc}" -gt 0 ]]; then
+  if [[ "${saw}" -eq 1 && "${mc}" -gt 0 && "${mf}" -eq 0 ]]; then
+    LAST_MOSAIC_STATUS="PASS"
     log "MOSAIC_COMPARISON_STATUS=PASS (label=${label} mosaic_compiles=${mc} mosaic_fallbacks=${mf})"
+  elif [[ "${saw}" -eq 1 && "${mc}" -gt 0 && "${mf}" -gt 0 ]]; then
+    LAST_MOSAIC_STATUS="PARTIAL_FALLBACK"
+    log "WARN: FreeTile Mosaic partially fell back to pure StableHLO (label=${label} mosaic_compiles=${mc} mosaic_fallbacks=${mf})"
+    log "MOSAIC_COMPARISON_STATUS=PARTIAL_FALLBACK (label=${label} mosaic_compiles=${mc} mosaic_fallbacks=${mf})"
   elif [[ "${mf}" -gt 0 ]] || printf '%s\n' "${run_output}" | grep -Fq "FreeTile Mosaic compile failed"; then
+    LAST_MOSAIC_STATUS="FALLBACK_ONLY"
     log "WARN: FreeTile Mosaic fell back to pure StableHLO without dispatching a Mosaic kernel (label=${label} mosaic_compiles=${mc} mosaic_fallbacks=${mf})"
     log "MOSAIC_COMPARISON_STATUS=FALLBACK_ONLY (label=${label} mosaic_compiles=${mc} mosaic_fallbacks=${mf})"
   else
+    LAST_MOSAIC_STATUS="FALLBACK_ONLY"
     log "WARN: No FreeTile Mosaic kernel dispatch observed in ggml-cloudtpu summary (label=${label} summary_seen=${saw} mosaic_compiles=${mc} mosaic_fallbacks=${mf})"
     log "MOSAIC_COMPARISON_STATUS=FALLBACK_ONLY (label=${label} mosaic_compiles=0 mosaic_fallbacks=${mf})"
   fi
@@ -258,16 +284,21 @@ sync_gcs_models() {
     log "[GCS] --skip-gcs-sync set — keeping GCS_MODEL_BUCKET=${GCS_MODEL_BUCKET} for cache defaults only"
     return 0
   fi
+  local exclude_re=""
+  exclude_re="$(build_gcs_exclude_regex "${RUN_671B_TIER}")"
+  if [[ "${RUN_671B_TIER}" -eq 0 ]]; then
+    log "[GCS] Excluding 671B/DeepSeek-V3/R1 checkpoints from sync (effective_chips=${EFFECTIVE_CHIPS}, spmd=${SPMD_CHIPS}, include_671b=${INCLUDE_671B})"
+  fi
   if [[ "${DRY_RUN}" -eq 1 || "${MOCK_MODE}" -eq 1 ]]; then
-    log "[GCS] Would sync same-region models (tpu_zone=${TPU_ZONE:-auto}): gcloud storage rsync --recursive --exclude='^xla-cache/.*' ${GCS_MODEL_BUCKET} ${MODELS_DIR}"
+    log "[GCS] Would sync same-region models (tpu_zone=${TPU_ZONE:-auto}): gcloud storage rsync --recursive --exclude='${exclude_re}' ${GCS_MODEL_BUCKET} ${MODELS_DIR}"
     return 0
   fi
   mkdir -p "${MODELS_DIR}"
   log "--- Staging models from same-region GCS (${GCS_MODEL_BUCKET}, tpu_zone=${TPU_ZONE:-auto}) -> ${MODELS_DIR} ---"
   if command -v gcloud >/dev/null 2>&1; then
-    gcloud storage rsync --recursive --exclude='^xla-cache/.*' "${GCS_MODEL_BUCKET}" "${MODELS_DIR}" 2>&1 | tee -a "${LOG}"
+    gcloud storage rsync --recursive --exclude="${exclude_re}" "${GCS_MODEL_BUCKET}" "${MODELS_DIR}" 2>&1 | tee -a "${LOG}"
   elif command -v gsutil >/dev/null 2>&1; then
-    gsutil -m rsync -r -x '^xla-cache/.*' "${GCS_MODEL_BUCKET}" "${MODELS_DIR}" 2>&1 | tee -a "${LOG}"
+    gsutil -m rsync -r -x "${exclude_re}" "${GCS_MODEL_BUCKET}" "${MODELS_DIR}" 2>&1 | tee -a "${LOG}"
   else
     log "ERROR: GCS_MODEL_BUCKET=${GCS_MODEL_BUCKET} is set, but neither gcloud nor gsutil is installed."
     return 1
@@ -276,7 +307,12 @@ sync_gcs_models() {
 
 : > "${LOG}"
 log "=== FreeTPU Ironwood (tpu7x) Day-1 ggml-cloudtpu Ops & Bench ==="
-log "timestamp_utc=${TIMESTAMP} spmd_chips=${SPMD_CHIPS} models_dir=${MODELS_DIR} tpu_zone=${TPU_ZONE:-unset} gcs_model_bucket=${GCS_MODEL_BUCKET:-unset} run_mosaic=${RUN_MOSAIC} include_671b=${INCLUDE_671B}"
+EFFECTIVE_CHIPS="$(resolve_effective_chips)"
+RUN_671B_TIER=0
+if should_run_671b_tier "${EFFECTIVE_CHIPS}"; then
+  RUN_671B_TIER=1
+fi
+log "timestamp_utc=${TIMESTAMP} spmd_chips=${SPMD_CHIPS} effective_chips=${EFFECTIVE_CHIPS} run_671b_tier=${RUN_671B_TIER} models_dir=${MODELS_DIR} tpu_zone=${TPU_ZONE:-unset} gcs_model_bucket=${GCS_MODEL_BUCKET:-unset} run_mosaic=${RUN_MOSAIC} include_671b=${INCLUDE_671B}"
 
 resolve_staged_libtpu
 
@@ -356,16 +392,33 @@ CLOUDTPU_MOCK=0 CLOUDTPU_SPMD_CHIPS=1 CLOUDTPU_MATMUL_FP8=auto CLOUDTPU_MATMUL_B
   "${HOST_TEST_BIN}" --fp8-parity-only 2>&1 | tee -a "${LOG}"
 
 if [[ "${RUN_MOSAIC}" -eq 1 ]]; then
-  log "--- Live FreeTile Mosaic Q4_K/Q6_K pass (CLOUDTPU_FREETILE_MOSAIC=1 CLOUDTPU_VERBOSE=1 vs pure StableHLO) ---"
-  mosaic_ops_rc=0
-  mosaic_ops_out="$(CLOUDTPU_MOCK=0 CLOUDTPU_SPMD_CHIPS=1 CLOUDTPU_MATMUL_FP8=0 CLOUDTPU_MATMUL_BF16=1 CLOUDTPU_FREETILE_MOSAIC=1 CLOUDTPU_VERBOSE=1 \
-    "${BIN_DIR}/test-backend-ops" -b CLOUDTPU -o "MUL_MAT" 2>&1)" || mosaic_ops_rc=$?
-  printf '%s\n' "${mosaic_ops_out}" | tee -a "${LOG}"
-  if [[ "${mosaic_ops_rc}" -ne 0 ]]; then
-    log "ERROR: Live FreeTile Mosaic test-backend-ops failed (exit=${mosaic_ops_rc})"
-    exit "${mosaic_ops_rc}"
+  log "--- Live FreeTile Mosaic Q4_K & Q6_K ops gate (CLOUDTPU_FREETILE_MOSAIC=1 CLOUDTPU_VERBOSE=1, verified independently per quant type) ---"
+  mosaic_q4k_status="FALLBACK_ONLY"
+  mosaic_q6k_status="FALLBACK_ONLY"
+  for qtype in q4_K q6_K; do
+    log "--- Live FreeTile Mosaic MUL_MAT (${qtype}) ---"
+    mosaic_ops_rc=0
+    mosaic_ops_out="$(CLOUDTPU_MOCK=0 CLOUDTPU_SPMD_CHIPS=1 CLOUDTPU_MATMUL_FP8=0 CLOUDTPU_MATMUL_BF16=1 CLOUDTPU_FREETILE_MOSAIC=1 CLOUDTPU_VERBOSE=1 \
+      "${BIN_DIR}/test-backend-ops" -b CLOUDTPU -o "MUL_MAT" -p "type_a=${qtype}" 2>&1)" || mosaic_ops_rc=$?
+    printf '%s\n' "${mosaic_ops_out}" | tee -a "${LOG}"
+    if [[ "${mosaic_ops_rc}" -ne 0 ]]; then
+      log "ERROR: Live FreeTile Mosaic test-backend-ops (${qtype}) failed (exit=${mosaic_ops_rc})"
+      exit "${mosaic_ops_rc}"
+    fi
+    evaluate_live_mosaic_dispatch "test-backend-ops:MUL_MAT:${qtype}" "${mosaic_ops_out}"
+    if [[ "${qtype}" == "q4_K" ]]; then
+      mosaic_q4k_status="${LAST_MOSAIC_STATUS}"
+    else
+      mosaic_q6k_status="${LAST_MOSAIC_STATUS}"
+    fi
+  done
+  if [[ "${mosaic_q4k_status}" == "PASS" && "${mosaic_q6k_status}" == "PASS" ]]; then
+    log "MOSAIC_OPS_GATE_STATUS=PASS (q4_K=${mosaic_q4k_status} q6_K=${mosaic_q6k_status})"
+  elif [[ "${mosaic_q4k_status}" == "PASS" || "${mosaic_q6k_status}" == "PASS" || "${mosaic_q4k_status}" == "PARTIAL_FALLBACK" || "${mosaic_q6k_status}" == "PARTIAL_FALLBACK" ]]; then
+    log "MOSAIC_OPS_GATE_STATUS=PARTIAL_FALLBACK (q4_K=${mosaic_q4k_status} q6_K=${mosaic_q6k_status})"
+  else
+    log "MOSAIC_OPS_GATE_STATUS=FALLBACK_ONLY (q4_K=${mosaic_q4k_status} q6_K=${mosaic_q6k_status})"
   fi
-  evaluate_live_mosaic_dispatch "test-backend-ops:MUL_MAT" "${mosaic_ops_out}"
 fi
 
 find_model_gguf() {
@@ -453,14 +506,6 @@ run_bench_tier() {
     2>&1 | tee -a "${LOG}"
 }
 
-should_run_671b_tier() {
-  local eff_chips="$1"
-  if [[ "${INCLUDE_671B}" -eq 1 || "${eff_chips}" -ge 8 ]]; then
-    return 0
-  fi
-  return 1
-}
-
 # 1t bracket tiers (fit within 192 GiB single-package bracket, also sharded across 8 chiplets on 4t)
 run_bench_tier "8B (1t bracket)" "" "8b" "q4_k_m" "distill"
 run_bench_tier "Qwen3-32B (1t bracket)" "qwen[-_.]?3" "32b" "q4_k_m" "distill"
@@ -469,8 +514,7 @@ run_bench_tier "gpt-oss-120b (1t bracket)" "gpt[-_.]?oss" "120b" "q4_k_m"
 run_bench_tier "Qwen3-235B (1t bracket)" "qwen[-_.]?3" "235b" "q4_k_m" "distill"
 
 # Hero 4t tier (tpu7x-standard-4t: 768 GiB across 8 logical chiplets)
-EFFECTIVE_CHIPS="$(resolve_effective_chips)"
-if should_run_671b_tier "${EFFECTIVE_CHIPS}"; then
+if [[ "${RUN_671B_TIER}" -eq 1 ]]; then
   run_bench_tier "DeepSeek-V3/R1-671B (4t hero 768GiB)" "deepseek[-_.]?(v3|r1)" "(671b|deepseek[-_.]?(v3|r1))" "(q4_k_m|q4_k|q4_0|iq4|fp8|f8e4m3)" "(distill|1\.5b|7b|8b|14b|32b|70b)"
 else
   log "SKIP: 671B tier requires >=8 Ironwood chiplets (768 GiB HBM) or --include-671b (effective_chips=${EFFECTIVE_CHIPS}, spmd=${SPMD_CHIPS})"
