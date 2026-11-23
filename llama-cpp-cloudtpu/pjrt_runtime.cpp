@@ -2107,22 +2107,19 @@ CachedExecutablePtr PjrtRuntime::compile_or_get(const std::string& cache_key,
         eff_opts.device_assignment_ids.push_back(static_cast<int64_t>(target_dev_id));
     }
 
+    const std::string opts_pb = encode_compile_options_proto(eff_opts);
+
+    static const char kHex[] = "0123456789abcdef";
     std::string full_key = cache_key;
     full_key.append("|dev=");
     full_key.append(std::to_string(device_idx));
     full_key.push_back(':');
     full_key.append(std::to_string(target_dev_id));
-    if (eff_opts.num_replicas != 1 || eff_opts.num_partitions != 1 ||
-        !eff_opts.device_assignment_ids.empty()) {
-        full_key.append("|r=");
-        full_key.append(std::to_string(eff_opts.num_replicas));
-        full_key.append(",p=");
-        full_key.append(std::to_string(eff_opts.num_partitions));
-        full_key.append(",da=");
-        for (size_t i = 0; i < eff_opts.device_assignment_ids.size(); ++i) {
-            if (i > 0) full_key.push_back(',');
-            full_key.append(std::to_string(eff_opts.device_assignment_ids[i]));
-        }
+    full_key.append("|opts=");
+    full_key.reserve(full_key.size() + opts_pb.size() * 2);
+    for (unsigned char b : opts_pb) {
+        full_key.push_back(kHex[b >> 4]);
+        full_key.push_back(kHex[b & 0x0f]);
     }
 
     {
@@ -2136,7 +2133,6 @@ CachedExecutablePtr PjrtRuntime::compile_or_get(const std::string& cache_key,
     }
 
     const auto t0 = std::chrono::steady_clock::now();
-    const std::string opts_pb = encode_compile_options_proto(eff_opts);
 
     PJRT_Program prog = {};
     prog.struct_size = PJRT_Program_STRUCT_SIZE;

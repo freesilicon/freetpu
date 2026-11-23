@@ -635,6 +635,15 @@ void test_multichip_device_assignment_and_eviction_lifetime() {
         rt.buffer_to_host(dup_outs[1]->handle.get(), d1.data(), d1.size() * sizeof(float));
         check_vec_close(d0, {11.0f, 22.0f, 33.0f, 44.0f}, 1e-6f, "repeated return output[0]");
         check_vec_close(d1, {11.0f, 22.0f, 33.0f, 44.0f}, 1e-6f, "repeated return output[1]");
+
+        // Distinct partitioner settings on the same program & device must not alias in cache.
+        cloudtpu::PjrtCompileOptions opt_shardy_on;
+        opt_shardy_on.use_shardy_partitioner = true;
+        cloudtpu::PjrtCompileOptions opt_shardy_off;
+        opt_shardy_off.use_shardy_partitioner = false;
+        const auto ex_on = rt.compile_or_get(prog.cache_key, prog.mlir_text, 0, opt_shardy_on);
+        const auto ex_off = rt.compile_or_get(prog.cache_key, prog.mlir_text, 0, opt_shardy_off);
+        CHECK_TRUE(ex_on != ex_off, "different partitioner options must use distinct cache entries");
     }
 
     rt.shutdown();

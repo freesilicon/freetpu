@@ -53,9 +53,19 @@
  #endif
  #ifdef GGML_USE_CPU
          register_backend(ggml_backend_cpu_reg());
+@@ -601,6 +612,9 @@
+     ggml_backend_load_best("hexagon",  silent, dir_path);
+     ggml_backend_load_best("musa",     silent, dir_path);
+     ggml_backend_load_best("openvino", silent, dir_path);
++    if (getenv("GGML_DISABLE_CLOUDTPU") == nullptr) {
++        ggml_backend_load_best("cloudtpu", silent, dir_path);
++    }
+     ggml_backend_load_best("cpu",      silent, dir_path);
+     // check the environment variable GGML_BACKEND_PATH to load an out-of-tree backend
+     const char * backend_path = std::getenv("GGML_BACKEND_PATH");
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
-@@ -215,9 +215,17 @@
+@@ -215,9 +215,25 @@
  
          if (offload) {
              auto * dev = model.dev_layer(il);
@@ -65,9 +75,17 @@
 +            const char * cand_name = ggml_backend_dev_name(dev);
 +            const bool k_ok = (type_k == GGML_TYPE_F32 || type_k == GGML_TYPE_F16 || type_k == GGML_TYPE_BF16);
 +            const bool v_ok = is_mla || (type_v == GGML_TYPE_F32 || type_v == GGML_TYPE_F16 || type_v == GGML_TYPE_BF16);
-+            if (cand_name && std::strncmp(cand_name, "CLOUDTPU", 8) == 0 && (!k_ok || !v_ok)) {
-+                LLAMA_LOG_WARN("%s: layer %3d: %s does not support KV cache types (%s/%s); placing KV cache on CPU\n",
-+                        __func__, il, cand_name, ggml_type_name(type_k), ggml_type_name(type_v));
++            const bool rope_type_ok =
++                hparams.rope_type == LLAMA_ROPE_TYPE_NORM ||
++                hparams.rope_type == LLAMA_ROPE_TYPE_NEOX ||
++                hparams.rope_type == LLAMA_ROPE_TYPE_MROPE ||
++                hparams.rope_type == LLAMA_ROPE_TYPE_IMROPE;
++            const bool rope_shift_ok =
++                !hparams.has_rope(il) ||
++                (rope_type_ok && hparams.n_lora_kv == 0 && hparams.n_rot(il) == hparams.n_embd_head_k(il));
++            if (cand_name && std::strncmp(cand_name, "CLOUDTPU", 8) == 0 && (!k_ok || !v_ok || !rope_shift_ok)) {
++                LLAMA_LOG_WARN("%s: layer %3d: %s does not support KV cache config (k=%s v=%s n_rot=%u head_k=%u); placing KV cache on CPU\n",
++                        __func__, il, cand_name, ggml_type_name(type_k), ggml_type_name(type_v), hparams.n_rot(il), hparams.n_embd_head_k(il));
 +            } else {
 +                buft = ggml_backend_dev_buffer_type(dev);
 +
