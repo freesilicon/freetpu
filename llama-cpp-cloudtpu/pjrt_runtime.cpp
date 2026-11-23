@@ -754,6 +754,7 @@ struct MockOp {
         ALL_REDUCE_MAX,
         ALL_GATHER,
         REDUCE_SCATTER_ADD,
+        TPU_CUSTOM_CALL,
     };
 
     Kind kind;
@@ -782,6 +783,12 @@ struct MockOp {
     std::vector<int64_t> slice_strides;
     std::vector<int64_t> dynamic_slice_sizes;
     std::vector<std::vector<int64_t>> replica_groups;
+    // FreeTile Mosaic custom_call attrs
+    std::string custom_call_kernel_name;
+    int64_t custom_call_mosaic_version = 17;
+    int64_t custom_call_blk = 32;
+    bool custom_call_has_min = false;
+    bool custom_call_unsigned_q4 = false;
     // Gather attrs
     std::vector<int64_t> gather_offset_dims;
     std::vector<int64_t> gather_collapsed_dims;
@@ -1079,6 +1086,91 @@ static MockProgram parse_stablehlo_mlir(const std::string& mlir) {
                     }
                     p = rb + 1;
                 }
+            }
+        } else if (rhs.rfind("stablehlo.custom_call @tpu_custom_call(", 0) == 0) {
+            op.kind = MockOp::Kind::TPU_CUSTOM_CALL;
+            const size_t lp = rhs.find('(');
+            const size_t rp = rhs.find(')', lp);
+            op.inputs = extract_ssa_refs(rhs.substr(lp + 1, rp - lp - 1));
+            const size_t knp = rhs.find("kernel_name = \"");
+            if (knp != std::string::npos) {
+                const size_t kne = rhs.find('"', knp + 15);
+                op.custom_call_kernel_name = rhs.substr(knp + 15, kne - (knp + 15));
+            }
+            const size_t bcp = rhs.find("backend_config = \"");
+            if (bcp == std::string::npos) {
+                throw std::runtime_error("MockPJRT: tpu_custom_call missing backend_config");
+            }
+            size_t cur = bcp + 18;
+            std::string cfg_json;
+            while (cur < rhs.size()) {
+                if (rhs[cur] == '\\' && cur + 1 < rhs.size()) {
+                    char nx = rhs[cur + 1];
+                    if (nx == 'n') cfg_json.push_back('\n');
+                    else cfg_json.push_back(nx);
+                    cur += 2;
+                } else if (rhs[cur] == '"') {
+                    break;
+                } else {
+                    cfg_json.push_back(rhs[cur++]);
+                }
+            }
+            if (cfg_json.find("\"serialization_format\": 1") == std::string::npos) {
+                throw std::runtime_error("MockPJRT: unsupported tpu_custom_call serialization_format");
+            }
+            const size_t bp = cfg_json.find("\"body\": \"");
+            if (bp == std::string::npos) {
+                throw std::runtime_error("MockPJRT: tpu_custom_call missing body");
+            }
+            const size_t be = cfg_json.find('"', bp + 9);
+            const std::string b64 = cfg_json.substr(bp + 9, be - (bp + 9));
+            auto b64_val = [](unsigned char c) -> int {
+                if (c >= 'A' && c <= 'Z') return c - 'A';
+                if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+                if (c >= '0' && c <= '9') return c - '0' + 52;
+                if (c == '+') return 62;
+                if (c == '/') return 63;
+                return -1;
+            };
+            std::string mosaic_txt;
+            uint32_t acc_bits = 0;
+            int acc_cnt = 0;
+            for (unsigned char c : b64) {
+                if (c == '=') break;
+                int v = b64_val(c);
+                if (v < 0) continue;
+                acc_bits = (acc_bits << 6) | static_cast<uint32_t>(v);
+                acc_cnt += 6;
+                if (acc_cnt >= 8) {
+                    acc_cnt -= 8;
+                    mosaic_txt.push_back(static_cast<char>((acc_bits >> acc_cnt) & 0xFF));
+                }
+            }
+            const size_t vp = mosaic_txt.find("stable_mosaic.version = ");
+            if (vp == std::string::npos) {
+                throw std::runtime_error("MockPJRT: Mosaic module missing stable_mosaic.version");
+            }
+            op.custom_call_mosaic_version = std::stoll(mosaic_txt.substr(vp + 24));
+            if (op.custom_call_mosaic_version != 17) {
+                throw std::runtime_error("MockPJRT: unsupported stable_mosaic.version: " +
+                                         std::to_string(op.custom_call_mosaic_version));
+            }
+            if (op.custom_call_kernel_name.rfind("ft_q6_k_", 0) == 0) {
+                op.custom_call_blk = 16;
+                op.custom_call_has_min = false;
+            } else if (op.custom_call_kernel_name.rfind("ft_q4_k_", 0) == 0) {
+                op.custom_call_blk = 32;
+                op.custom_call_has_min = true;
+            } else if (op.custom_call_kernel_name.rfind("ft_q4_0_", 0) == 0) {
+                op.custom_call_blk = 32;
+                op.custom_call_has_min = false;
+                op.custom_call_unsigned_q4 = (mosaic_txt.find("stable_mosaic.arith.uitofp") != std::string::npos);
+            } else if (op.custom_call_kernel_name.rfind("ft_q8_0_", 0) == 0) {
+                op.custom_call_blk = 32;
+                op.custom_call_has_min = false;
+            } else {
+                op.custom_call_blk = 1;
+                op.custom_call_has_min = false;
             }
         } else {
             throw std::runtime_error("MockPJRT: unsupported StableHLO op: " + rhs);
@@ -1545,6 +1637,43 @@ static MockTensor eval_mock_op(const MockOp& op,
                     dst_idx += (static_cast<size_t>(starts[d]) + c) * out_strides[d];
                 }
                 copy_mock_elem(out, dst_idx, update, i);
+            }
+            break;
+        }
+        case MockOp::Kind::TPU_CUSTOM_CALL: {
+            const MockTensor& x = env.at(op.inputs.at(0));
+            const MockTensor& w = env.at(op.inputs.at(1));
+            const int64_t M = x.dims.at(0);
+            const int64_t K = x.dims.at(1);
+            const int64_t N = w.dims.at(1);
+            const bool has_scales = (op.inputs.size() >= 3);
+            const MockTensor* d_ptr = has_scales ? &env.at(op.inputs.at(2)) : nullptr;
+            const MockTensor* m_ptr =
+                (op.custom_call_has_min && op.inputs.size() >= 4) ? &env.at(op.inputs.at(3)) : nullptr;
+            const int64_t blk = std::max<int64_t>(1, op.custom_call_blk);
+
+            for (int64_t mi = 0; mi < M; ++mi) {
+                for (int64_t ni = 0; ni < N; ++ni) {
+                    double acc = 0.0;
+                    for (int64_t ki = 0; ki < K; ++ki) {
+                        const double xv = static_cast<double>(x.read_f32(static_cast<size_t>(mi * K + ki)));
+                        double wv = static_cast<double>(w.read_f32(static_cast<size_t>(ki * N + ni)));
+                        if (op.custom_call_unsigned_q4) {
+                            wv -= 8.0;
+                        }
+                        if (d_ptr != nullptr) {
+                            const int64_t bi = ki / blk;
+                            const double dv = static_cast<double>(d_ptr->read_f32(static_cast<size_t>(bi * N + ni)));
+                            wv *= dv;
+                            if (m_ptr != nullptr) {
+                                const double mv = static_cast<double>(m_ptr->read_f32(static_cast<size_t>(bi * N + ni)));
+                                wv += mv;
+                            }
+                        }
+                        acc += xv * wv;
+                    }
+                    out.write_f32(static_cast<size_t>(mi * N + ni), static_cast<float>(acc));
+                }
             }
             break;
         }

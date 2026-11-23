@@ -24,6 +24,12 @@ jobs:
           cmake --build build-cmake -j"$(nproc)"
           ctest --test-dir build-cmake --output-on-failure
 
+      - name: Configure & test freetile (Zero-Dep C++17 Tile IR)
+        run: |
+          cmake -S freetile -B build-freetile -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-freetile -j"$(nproc)"
+          ctest --test-dir build-freetile --output-on-failure
+
       - name: Configure & test llama-cpp-cloudtpu (Host Mock PJRT)
         run: |
           cmake -S llama-cpp-cloudtpu -B build-cloudtpu -G Ninja -DCMAKE_BUILD_TYPE=Release

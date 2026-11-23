@@ -19,6 +19,7 @@ overlay_backend() {
     fi
 
     mkdir -p "$SRC/ggml/src/ggml-cloudtpu/third_party/openxla"
+    mkdir -p "$SRC/ggml/src/ggml-cloudtpu/freetile/include/freetile" "$SRC/ggml/src/ggml-cloudtpu/freetile/src"
     cp "$ROOT/ggml-cloudtpu.h" "$SRC/ggml/include/ggml-cloudtpu.h"
     cp "$ROOT/ggml-cloudtpu.cpp" \
        "$ROOT/pjrt_runtime.hpp" "$ROOT/pjrt_runtime.cpp" \
@@ -26,6 +27,8 @@ overlay_backend() {
        "$ROOT/CMakeLists.txt" \
        "$SRC/ggml/src/ggml-cloudtpu/"
     cp "$ROOT/third_party/openxla/pjrt_c_api.h" "$SRC/ggml/src/ggml-cloudtpu/third_party/openxla/"
+    cp "$ROOT/../freetile/include/freetile/"*.hpp "$SRC/ggml/src/ggml-cloudtpu/freetile/include/freetile/"
+    cp "$ROOT/../freetile/src/"*.cpp "$SRC/ggml/src/ggml-cloudtpu/freetile/src/"
 
     if ! grep -q "GGML_CLOUDTPU" "$SRC/ggml/CMakeLists.txt"; then
         git -C "$SRC" apply "$ROOT/patches/llama-cpp-b12608-cloudtpu.patch" || \
