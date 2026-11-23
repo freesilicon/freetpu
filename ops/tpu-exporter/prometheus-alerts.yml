@@ -1,9 +1,11 @@
 # Prometheus alerting rules for FreeTPU Cloud TPU fleets (ops/tpu-exporter/tpu_exporter.py).
 #
 # Scrape/evaluation timing notes:
-# - Pair with ops/tpu-exporter/prometheus-scrape.yml (`scrape_interval: 15s`,
-#   `evaluation_interval: 15s`). Range windows (`[5m]`) also retain >= 5 samples
-#   at Prometheus's default 1m scrape interval.
+# - Pair with ops/tpu-exporter/prometheus-scrape.yml (`scrape_interval: 10s`,
+#   `evaluation_interval: 10s`, i.e. `<= 10s` for `GcpSpotPreemption` to catch
+#   GCP Spot's best-effort <= 30s shutdown window). Range windows (`[5m]`) also
+#   retain >= 5 samples at Prometheus's default 1m scrape interval for non-Spot
+#   alerts.
 # - Runtime-only fallback clauses (`{pci_bdf="unmapped"}`) fire ONLY for chips
 #   that could not be mapped to a PCI BDF, preventing duplicate alerts when a
 #   runtime chip is already mapped to a PCI-labeled metric.
@@ -119,10 +121,15 @@ groups:
             increased on TPU device {{ $labels.pci_bdf }}. Cordon the node and
             run hardware diagnostics / reboot.
 
-      # Monitoring/observability alert only (requires short scrape/evaluation
-      # intervals such as 15s in prometheus-scrape.yml; Prometheus's default 1m
-      # interval can miss GCP Spot's best-effort <=30s shutdown window).
-      # `max_over_time(...[6m])` retains an observed `TRUE` notice past VM
+      # Monitoring/observability alert only: requires `scrape_interval <= 10s`
+      # (e.g. 5s-10s in prometheus-scrape.yml) because the exporter queries GCP
+      # metadata only during a scrape and Spot's best-effort shutdown window is
+      # at most 30s (Prometheus's default 60s interval misses notices between
+      # scrapes, and `max_over_time(...[6m])` cannot recover a notice that was
+      # never scraped before VM shutdown). When preemption tracking must survive
+      # VM shutdown regardless of scrape timing, ingest Compute Engine preemption
+      # events / Cloud Logging instead.
+      # `max_over_time(...[6m])` retains an already-scraped `TRUE` notice past VM
       # shutdown, staleness, Alertmanager's default 30s `group_wait`, AND
       # Alertmanager's default 5m `group_interval` when multiple instances
       # preempt in sequence on a grouped route (a dedicated route with a short
@@ -140,6 +147,8 @@ groups:
             Monitoring alert only: GCP instance metadata reported
             preempted=TRUE on {{ $labels.node }}. Because Spot VMs have zero
             guaranteed advance notice and a best-effort shutdown window of up to
-            30s, time-critical checkpointing (e.g. Orbax emergency checkpoint)
-            must be driven by a workload-local metadata watcher or SIGTERM
+            30s, pair this alert with scrape_interval <= 10s (e.g. 5s-10s) or
+            Compute Engine preemption events / Cloud Logging for post-shutdown
+            durability; drive time-critical checkpointing (e.g. Orbax emergency
+            checkpoint) via a workload-local metadata watcher or SIGTERM
             shutdown handler rather than Prometheus scrape/alert evaluation.

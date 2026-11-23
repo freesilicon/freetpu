@@ -940,6 +940,7 @@ _PY_METRICS_SUBPROCESS_HELPER = (
     "        return False\n"
     "    all_raw_ids = set()\n"
     "    populated_ids = set()\n"
+    "    populated_vals = {}\n"
     "    unset_ids = set()\n"
     "    for item in entries:\n"
     "        attr = getattr(item, 'attribute', None)\n"
@@ -966,6 +967,7 @@ _PY_METRICS_SUBPROCESS_HELPER = (
     "                    gv = float(getattr(g, 'as_int'))\n"
     "        if gv is not None and math.isfinite(gv) and gv >= 0.0:\n"
     "            populated_ids.add(cid_int)\n"
+    "            populated_vals[cid_int] = gv\n"
     "        else:\n"
     "            unset_ids.add(cid_int)\n"
     "    hbm_ids = set()\n"
@@ -978,25 +980,30 @@ _PY_METRICS_SUBPROCESS_HELPER = (
     "    if per_chip_mode:\n"
     "        expected_hbm = {cid * dpc + off for cid in all_raw_ids for off in range(dpc)}\n"
     "        if not all_raw_ids or expected_hbm != hbm_ids:\n"
-    "            return False\n"
+    "            return ('unjoined', populated_vals) if populated_vals else False\n"
     "        return (\n"
+    "            'verified',\n"
     "            {cid * dpc + off for cid in populated_ids for off in range(dpc)},\n"
     "            {cid * dpc + off for cid in unset_ids for off in range(dpc)},\n"
     "        )\n"
     "    if not all_raw_ids or all_raw_ids != hbm_ids:\n"
-    "        return False\n"
+    "        return ('unjoined', populated_vals) if populated_vals else False\n"
     "    if require_pigeonhole and len(all_raw_ids) <= 4:\n"
-    "        return False\n"
-    "    return (populated_ids, unset_ids)\n"
+    "        return ('unjoined', populated_vals) if populated_vals else False\n"
+    "    return ('verified', populated_ids, unset_ids)\n"
     "per_chip_fallback = False\n"
     "verified_hbm_ids = set()\n"
     "unset_hbm_ids = set()\n"
+    "unjoined_duty_vals = {}\n"
     "new_fn = getattr(m, 'get_chip_usage_new', None) if chip_attr == 'V7X' else None\n"
     "if chip_attr == 'V7X' and layout == 'per-chip':\n"
     "    rows = _invoke(m.get_chip_usage)\n"
     "    v_res = _verify_raw_ironwood_duty(rows, 2, per_chip_mode=True)\n"
-    "    if isinstance(v_res, tuple):\n"
-    "        verified_hbm_ids, unset_hbm_ids = v_res\n"
+    "    if isinstance(v_res, tuple) and v_res[0] == 'verified':\n"
+    "        verified_hbm_ids, unset_hbm_ids = v_res[1], v_res[2]\n"
+    "    elif isinstance(v_res, tuple) and v_res[0] == 'unjoined':\n"
+    "        per_chip_fallback = True\n"
+    "        unjoined_duty_vals = v_res[1]\n"
     "    elif v_res is False:\n"
     "        per_chip_fallback = True\n"
     "elif callable(new_fn):\n"
@@ -1005,8 +1012,11 @@ _PY_METRICS_SUBPROCESS_HELPER = (
     "        v_res = _verify_raw_ironwood_duty(\n"
     "            rows, 2, per_chip_mode=False, require_pigeonhole=(layout == 'auto')\n"
     "        )\n"
-    "        if isinstance(v_res, tuple):\n"
-    "            verified_hbm_ids, unset_hbm_ids = v_res\n"
+    "        if isinstance(v_res, tuple) and v_res[0] == 'verified':\n"
+    "            verified_hbm_ids, unset_hbm_ids = v_res[1], v_res[2]\n"
+    "        elif isinstance(v_res, tuple) and v_res[0] == 'unjoined':\n"
+    "            per_chip_fallback = True\n"
+    "            unjoined_duty_vals = v_res[1]\n"
     "        elif v_res is False:\n"
     "            per_chip_fallback = True\n"
     "    except (AssertionError, ValueError):\n"
@@ -1015,21 +1025,34 @@ _PY_METRICS_SUBPROCESS_HELPER = (
     "else:\n"
     "    rows = _invoke(m.get_chip_usage)\n"
     "out = []\n"
+    "seen_out_ids = set()\n"
     "for r in (rows or []):\n"
     "    did_raw = getattr(r, 'device_id', None)\n"
     "    try:\n"
     "        did_int = int(str(did_raw).strip(), 10)\n"
     "    except Exception:\n"
     "        did_int = None\n"
+    "    if did_int is not None:\n"
+    "        seen_out_ids.add(did_int)\n"
     "    duty_val = None if (did_int in unset_hbm_ids) else getattr(r, 'duty_cycle_pct', None)\n"
-    "    out.append({\n"
+    "    entry = {\n"
     "        'device_id': did_raw,\n"
     "        'memory_usage': getattr(r, 'memory_usage', None),\n"
     "        'total_memory': getattr(r, 'total_memory', None),\n"
     "        'duty_cycle_pct': duty_val,\n"
     "        '_per_chip_fallback': per_chip_fallback,\n"
     "        '_duty_ids_verified': bool(did_int is not None and did_int in verified_hbm_ids),\n"
-    "    })\n"
+    "    }\n"
+    "    if did_int is not None and did_int in unjoined_duty_vals:\n"
+    "        entry['_unjoined_duty_cycle_pct'] = unjoined_duty_vals[did_int]\n"
+    "    out.append(entry)\n"
+    "for cid_int, gv in sorted(unjoined_duty_vals.items()):\n"
+    "    if cid_int not in seen_out_ids:\n"
+    "        out.append({\n"
+    "            'device_id': cid_int,\n"
+    "            '_unjoined_only': True,\n"
+    "            '_unjoined_duty_cycle_pct': gv,\n"
+    "        })\n"
     "sys.stdout.write(json.dumps(out))\n"
 )
 
@@ -1070,7 +1093,7 @@ def _verify_raw_python_per_chip_duty(
     per_chip_mode: bool = True,
     require_pigeonhole: bool = False,
     timeout_s: float = 0.5,
-) -> Union[Tuple[set[int], set[int]], bool, None]:
+) -> Union[Tuple[str, set[int], set[int]], Tuple[str, Dict[int, float]], bool, None]:
     """Verify raw `tensorcore.dutycycle` IDs and populated protobuf gauges via upstream
     `RuntimeMetricServiceStub.GetRuntimeMetric` (with optional `get_metric_data` fallback).
 
@@ -1124,6 +1147,7 @@ def _verify_raw_python_per_chip_duty(
         return False
     all_raw_ids: set[int] = set()
     populated_ids: set[int] = set()
+    populated_vals: Dict[int, float] = {}
     unset_ids: set[int] = set()
     for item in entries:
         cid_str = _extract_grpc_chip_id(item)
@@ -1145,6 +1169,7 @@ def _verify_raw_python_per_chip_duty(
                         val = cand
         if val is not None and val >= 0.0:
             populated_ids.add(cid_int)
+            populated_vals[cid_int] = float(val)
         else:
             unset_ids.add(cid_int)
     hbm_ids: set[int] = set()
@@ -1161,20 +1186,22 @@ def _verify_raw_python_per_chip_duty(
             for off in range(devices_per_chip)
         }
         if not all_raw_ids or expected_hbm != hbm_ids:
-            return False
+            return ("unjoined", populated_vals) if populated_vals else False
         return (
+            "verified",
             {cid * devices_per_chip + off for cid in populated_ids for off in range(devices_per_chip)},
             {cid * devices_per_chip + off for cid in unset_ids for off in range(devices_per_chip)},
         )
     if not all_raw_ids or all_raw_ids != hbm_ids:
-        return False
+        return ("unjoined", populated_vals) if populated_vals else False
     # On Ironwood (`V7X`, max 4 physical chips per VM) in `auto` layout,
     # matching ID sets with `<= 4` entries (e.g. `{0,1,2,3}` vs `{0,1,2,3}`)
     # remain ambiguous between 4 logical cores and 4 physical chips; require
-    # pigeonhole proof (`len(all_raw_ids) > 4`) unless `--grpc-duty-layout=per-core`.
+    # pigeonhole proof (`len(all_raw_ids) > 4`) unless `--grpc-duty-layout=per-core`,
+    # while preserving decoded raw gauges in the unjoined duty-cycle series.
     if require_pigeonhole and len(all_raw_ids) <= 4:
-        return False
-    return populated_ids, unset_ids
+        return ("unjoined", populated_vals) if populated_vals else False
+    return ("verified", populated_ids, unset_ids)
 
 
 def _parse_python_usage_entries(
@@ -1185,10 +1212,13 @@ def _parse_python_usage_entries(
     duty_ids_verified: bool = False,
     verified_hbm_ids: Optional[set[int]] = None,
     unset_hbm_ids: Optional[set[int]] = None,
+    unjoined_duty_by_id: Optional[Dict[int, float]] = None,
     devices_per_chip: int = 2,
 ) -> Tuple[bool, Optional[str], Dict[str, _TpuInfoRow]]:
     rows: Dict[str, _TpuInfoRow] = {}
     for item in entries:
+        unjoined_only = False
+        unjoined_val: Any = None
         if isinstance(item, dict):
             dev_id = item.get("device_id")
             mem_used = item.get("memory_usage")
@@ -1196,6 +1226,8 @@ def _parse_python_usage_entries(
             duty = item.get("duty_cycle_pct")
             item_per_chip_fb = bool(item.get("_per_chip_fallback", per_chip_fallback))
             item_duty_verified = bool(item.get("_duty_ids_verified", duty_ids_verified))
+            unjoined_only = bool(item.get("_unjoined_only", False))
+            unjoined_val = item.get("_unjoined_duty_cycle_pct")
         else:
             dev_id = getattr(item, "device_id", None)
             mem_used = getattr(item, "memory_usage", None)
@@ -1211,9 +1243,21 @@ def _parse_python_usage_entries(
             item_duty_verified = False
         elif verified_hbm_ids and parsed_id in verified_hbm_ids:
             item_duty_verified = True
+        if unjoined_val is None and unjoined_duty_by_id and parsed_id in unjoined_duty_by_id:
+            unjoined_val = unjoined_duty_by_id[parsed_id]
         key = str(parsed_id)
         row = rows.setdefault(key, _TpuInfoRow(chip_key=key))
-        row.in_util_table = True
+        if not unjoined_only:
+            row.in_util_table = True
+        if (
+            isinstance(unjoined_val, (int, float))
+            and not isinstance(unjoined_val, bool)
+            and math.isfinite(float(unjoined_val))
+            and unjoined_val >= 0
+        ):
+            row.unjoined_duty_cycle_percent = float(unjoined_val)
+        if unjoined_only:
+            continue
         if (
             isinstance(mem_used, (int, float))
             and not isinstance(mem_used, bool)
@@ -1240,6 +1284,14 @@ def _parse_python_usage_entries(
             # When `get_chip_usage` ran only as a fallback after `get_chip_usage_new`
             # failed in `auto` mode (or raw duty chip IDs mismatched HBM core IDs),
             # preserve HBM usage/total rows and omit unverified duty readings.
+
+    if unjoined_duty_by_id:
+        for cid_int, gv in unjoined_duty_by_id.items():
+            if math.isfinite(gv) and gv >= 0.0:
+                key = str(cid_int)
+                row = rows.setdefault(key, _TpuInfoRow(chip_key=key))
+                if row.unjoined_duty_cycle_percent is None:
+                    row.unjoined_duty_cycle_percent = float(gv)
 
     if not rows:
         return False, f"tpu_info.metrics returned no parseable chip entries from {addr}", {}
@@ -1320,8 +1372,11 @@ def _query_tpu_info_python_metrics(
                         per_chip_mode=True,
                         timeout_s=deadline_s,
                     )
-                    if isinstance(v_res, tuple):
-                        box["verified_hbm_ids"], box["unset_hbm_ids"] = v_res
+                    if isinstance(v_res, tuple) and v_res[0] == "verified":
+                        box["verified_hbm_ids"], box["unset_hbm_ids"] = v_res[1], v_res[2]
+                    elif isinstance(v_res, tuple) and v_res[0] == "unjoined":
+                        box["per_chip_fallback"] = True
+                        box["unjoined_duty_by_id"] = v_res[1]
                     elif v_res is False:
                         box["per_chip_fallback"] = True
                 elif callable(get_chip_usage_new):
@@ -1336,8 +1391,11 @@ def _query_tpu_info_python_metrics(
                             require_pigeonhole=(grpc_duty_layout == "auto"),
                             timeout_s=deadline_s,
                         )
-                        if isinstance(v_res, tuple):
-                            box["verified_hbm_ids"], box["unset_hbm_ids"] = v_res
+                        if isinstance(v_res, tuple) and v_res[0] == "verified":
+                            box["verified_hbm_ids"], box["unset_hbm_ids"] = v_res[1], v_res[2]
+                        elif isinstance(v_res, tuple) and v_res[0] == "unjoined":
+                            box["per_chip_fallback"] = True
+                            box["unjoined_duty_by_id"] = v_res[1]
                         elif v_res is False:
                             box["per_chip_fallback"] = True
                     except (AssertionError, ValueError):
@@ -1369,6 +1427,7 @@ def _query_tpu_info_python_metrics(
             duty_ids_verified=bool(box.get("duty_ids_verified", False)),
             verified_hbm_ids=box.get("verified_hbm_ids"),
             unset_hbm_ids=box.get("unset_hbm_ids"),
+            unjoined_duty_by_id=box.get("unjoined_duty_by_id"),
             devices_per_chip=inferred_dpc,
         )
 
@@ -2125,6 +2184,10 @@ def query_gcp_preemption_status(
     Bypasses process HTTP proxies for Compute Engine's built-in metadata endpoints
     (`metadata.google.internal` and `169.254.169.254`) so VM proxy settings do not
     silently break Spot preemption polling when `NO_PROXY` omits the metadata host.
+    Because GCP Spot VMs have a best-effort shutdown window of at most 30s and
+    this exporter queries metadata only during a scrape, pair with a `<= 10s`
+    Prometheus scrape interval (e.g. `5s`-`10s`) or use Compute Engine
+    preemption events / Cloud Logging when tracking must survive VM shutdown.
     """
     try:
         req = urllib.request.Request(url, headers={"Metadata-Flavor": "Google"})
@@ -3087,9 +3150,10 @@ def collect_snapshot(
             )
             if cli_ok:
                 # Only apply the upstream `tpu-info` V7X positional-zip duty guard
-                # to stock `tpu-info` executables; preserve duty-cycle readings
-                # produced by custom operator wrappers passed via `--tpu-info-bin`.
-                if Path(tpu_info_bin).name in ("tpu-info", "tpu_info"):
+                # to the stock default `"tpu-info"` fallback; preserve duty-cycle
+                # readings produced by explicit custom operator wrappers (even if
+                # their basename is `tpu-info`, e.g. `/opt/telemetry/tpu-info`).
+                if use_default_grpc_first:
                     grpc_unset_duty_ids = {
                         k for k, r in parsed_rows.items() if r.duty_unset_in_grpc
                     }
@@ -3267,7 +3331,7 @@ def collect_snapshot(
 
     unjoined_duty_candidates: Dict[str, float] = {
         key: row.unjoined_duty_cycle_percent
-        for key, row in util_rows.items()
+        for key, row in parsed_rows.items()
         if row.unjoined_duty_cycle_percent is not None
     }
     joined_duty_keys: set[str] = {
@@ -4112,7 +4176,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--gcp-metadata-preemption",
         action="store_true",
         default=False,
-        help="Opt-in fast poll of GCP Spot/Preemptible instance metadata for gcp_metadata_preempted_status.",
+        help=(
+            "Opt-in fast poll of GCP Spot/Preemptible instance metadata for "
+            "gcp_metadata_preempted_status (pair with <= 10s Prometheus scrape_interval "
+            "to observe Spot's <= 30s shutdown window, or use Compute Engine preemption "
+            "events / Cloud Logging for post-shutdown durability)."
+        ),
     )
     parser.add_argument(
         "--gcp-metadata-url",

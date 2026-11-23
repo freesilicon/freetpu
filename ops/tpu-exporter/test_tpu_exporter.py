@@ -4969,6 +4969,11 @@ TPU Runtime Utilization
             self.assertIn("group_interval", alerts_text)
             self.assertIn("Monitoring alert only", alerts_text)
             self.assertIn("workload-local metadata watcher or SIGTERM", alerts_text)
+            self.assertIn("scrape_interval <= 10s", alerts_text)
+            self.assertIn("Cloud Logging", alerts_text)
+            scrape_text = (EXPORTER_DIR / "prometheus-scrape.yml").read_text(encoding="utf-8")
+            self.assertIn("scrape_interval: 10s", scrape_text)
+            self.assertIn("evaluation_interval: 10s", scrape_text)
 
             # Long (>260-byte) inline JSON `--chip-id-map` MUST parse cleanly without
             # probing the filesystem (no ENAMETOOLONG on 255-byte NAME_MAX filesystems).
@@ -6259,6 +6264,15 @@ TPU Runtime Utilization
                     dev.duty_cycle_percent,
                     f"Ambiguous 4-entry Ironwood auto fallback must not join duty onto {dev.pci_bdf}",
                 )
+            # Raw decoded Ironwood duty gauges MUST still populate the unjoined series
+            # so advisory `TpuUnjoinedDutyCycleLow` can evaluate them!
+            self.assertEqual(
+                amb_snap.runtime_unjoined_duty_cycle,
+                {"0": 42.0, "1": 43.0, "2": 44.0, "3": 45.0},
+            )
+            amb_prom = tpu_exporter.format_prometheus_metrics(amb_snap)
+            self.assertIn('freetpu_tpu_runtime_unjoined_duty_cycle_percent{runtime_device_id="0"} 42', amb_prom)
+            self.assertIn('freetpu_tpu_runtime_unjoined_duty_cycle_percent{runtime_device_id="3"} 45', amb_prom)
 
             # 7a. 4-device v6e host with ONLY device 0 mapped (`chip_id="0"`) + direct gRPC
             #     returning 1 row for device 0 MUST STILL trigger fallback because 1 < 4!
@@ -6358,6 +6372,40 @@ TPU Runtime Utilization
                 {r.runtime_chip for r in cli_partial_snap.runtime_utilization},
                 {"0", "1", "2", "3"},
             )
+
+            # 8. An explicit custom operator wrapper path whose basename happens to be
+            #    `tpu-info` (e.g. `.../opt/telemetry/tpu-info`) MUST NOT be sanitized as
+            #    stock `tpu-info` and MUST preserve valid duty readings on a 2-core mapped
+            #    Ironwood host!
+            custom_dir = root / "opt" / "telemetry"
+            custom_dir.mkdir(parents=True)
+            custom_wrapper = custom_dir / "tpu-info"
+            custom_wrapper.write_text(
+                "#!/bin/sh\n"
+                "cat <<'EOF'\n"
+                "TPU Device Status\n"
+                "+-----------+---------------------------+--------------------+-----------------------+\n"
+                "| Device ID | Memory Usage (Used/Total) | Memory Bar Gauge   | TensorCore Duty Cycle |\n"
+                "+-----------+---------------------------+--------------------+-----------------------+\n"
+                "| 0         | 16.00 GiB / 192.00 GiB    | [|.........] 8.3%  | [||||||||..] 75.0%    |\n"
+                "| 1         | 8.00 GiB / 192.00 GiB     | [..........] 4.2%  | [|||.......] 25.0%    |\n"
+                "+-----------+---------------------------+--------------------+-----------------------+\n"
+                "EOF\n",
+                encoding="utf-8",
+            )
+            custom_wrapper.chmod(0o755)
+            with _mock_vfio_char_lstat():
+                cw_snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=f_sys,
+                    dev_root=f_dev,
+                    proc_root=f_proc,
+                    tpu_info_bin=str(custom_wrapper),
+                    chip_id_map={"0000:00:04.0": "0", "0000:00:05.0": "1"},
+                    shm_root=root / "no-shm",
+                )
+            cw_by_bdf = {d.pci_bdf: d for d in cw_snap.devices}
+            self.assertAlmostEqual(cw_by_bdf["0000:00:04.0"].duty_cycle_percent or 0.0, 75.0)
+            self.assertAlmostEqual(cw_by_bdf["0000:00:05.0"].duty_cycle_percent or 0.0, 25.0)
 
     def _assert_valid_prometheus_text(self, text: str) -> None:
         lines = [ln for ln in text.splitlines() if ln.strip()]

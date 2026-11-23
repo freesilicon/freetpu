@@ -5784,6 +5784,69 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertEqual(drift_msg, "")
                 self.assertTrue(nc_spec_path.exists())
 
+                # Shared PCIe root (`0000:00`) with TWO NUMA domains (`numa0` and `numa1`)
+                # and `--chip-id-map` covering all 8 BDFs: when 1 TPU in `numa1` disappears
+                # from sysfs while remaining in `--chip-id-map`, `numa0`'s healthy 4-chip
+                # slice MUST remain published while `numa1` is withheld!
+                shared_root_2numa_devs = [
+                    {
+                        "bdf": f"0000:00:{4 + i:02x}.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": str(i),
+                        "numa_node": "0",
+                    }
+                    for i in range(4)
+                ] + [
+                    {
+                        "bdf": f"0000:00:{8 + i:02x}.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": str(4 + i),
+                        "numa_node": "1",
+                    }
+                    for i in range(4)
+                ]
+                sr2_sys, sr2_dev = _make_mock_pci_vfio(
+                    root / "shared_root_2numa_map_loss",
+                    devices=shared_root_2numa_devs,
+                    create_vfio_nodes=[str(i) for i in range(8)],
+                )
+                sr2_map = {shared_root_2numa_devs[i]["bdf"]: i for i in range(8)}
+                sr2_spec_path = root / "cdi" / "sr2_freetpu.json"
+                ok_sr1, msg_sr1 = freetpu_cdi.reconcile_cdi_spec(
+                    sr2_spec_path,
+                    sysfs_root=sr2_sys,
+                    dev_root=sr2_dev,
+                    single_host_env=True,
+                    chip_id_map=sr2_map,
+                )
+                self.assertTrue(ok_sr1, msg_sr1)
+                sr1_names = {
+                    d["name"] for d in json.loads(sr2_spec_path.read_text(encoding="utf-8"))["devices"]
+                }
+                self.assertIn("numa0-pcie-0000-00-4", sr1_names)
+                self.assertIn("numa1-pcie-0000-00-4", sr1_names)
+
+                # Remove 1 TPU from `numa1` (`0000:00:0b.0`) from sysfs while keeping it in `sr2_map`.
+                shutil.rmtree(sr2_sys / "bus" / "pci" / "devices" / "0000:00:0b.0")
+                (sr2_dev / "vfio" / "7").unlink()
+                ok_sr2, msg_sr2 = freetpu_cdi.reconcile_cdi_spec(
+                    sr2_spec_path,
+                    sysfs_root=sr2_sys,
+                    dev_root=sr2_dev,
+                    single_host_env=True,
+                    chip_id_map=sr2_map,
+                )
+                self.assertTrue(ok_sr2, msg_sr2)
+                sr2_names = {
+                    d["name"] for d in json.loads(sr2_spec_path.read_text(encoding="utf-8"))["devices"]
+                }
+                self.assertIn("numa0-pcie-0000-00-4", sr2_names)
+                self.assertNotIn("numa1-pcie-0000-00-4", sr2_names)
+
     def test_all_selector_revalidates_map_dependent_topology_with_omit_visible_env(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

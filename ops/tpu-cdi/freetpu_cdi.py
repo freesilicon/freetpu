@@ -1590,23 +1590,34 @@ def _compute_topology_slices(
             _topology_domain_key(inv_chip)
         )
 
+    observed_bdf_to_domains: Dict[str, set[Tuple[str, Optional[int], str]]] = {}
+    for obs_dkey, obs_bdfs in (observed_domain_bdfs or {}).items():
+        for obs_bdf in obs_bdfs:
+            observed_bdf_to_domains.setdefault(obs_bdf, set()).add(obs_dkey)
+
     slices: List[_TopologySlice] = []
     for dom_ordinal, (d_key, d_chips) in enumerate(domains.items()):
         # Withhold any NUMA/PCIe slice whose domain lost one or more PCI
         # functions (either unavailable VFIO nodes in live PCI sysfs, PCI
         # functions previously observed in this boot's domain inventory, or
-        # missing `--chip-id-map` BDFs on the same PCIe root) so a degraded
+        # missing `--chip-id-map` BDFs attributed to this domain) so a degraded
         # single-root 8-chip v6e domain losing 4 functions can never be
         # republished as a 4-chip slice with fabricated `2,2,1` topology bounds.
+        # When a PCIe root is shared by multiple NUMA domains, attribute any
+        # previously observed missing `--chip-id-map` BDF strictly to its
+        # recorded domain so losing a chip in NUMA 1 does not withdraw NUMA 0.
         domain_expected_bdfs = set(inventory_domain_bdfs.get(d_key, set()))
         if observed_domain_bdfs:
             domain_expected_bdfs.update(observed_domain_bdfs.get(d_key, set()))
         if chip_id_map:
             for map_bdf in chip_id_map:
-                if (
-                    map_bdf not in inventory_all_bdfs
-                    and _pcie_root_complex(map_bdf) == d_key[2]
-                ):
+                if map_bdf in inventory_all_bdfs:
+                    continue
+                recorded_domains = observed_bdf_to_domains.get(map_bdf)
+                if recorded_domains:
+                    if d_key in recorded_domains:
+                        domain_expected_bdfs.add(map_bdf)
+                elif _pcie_root_complex(map_bdf) == d_key[2]:
                     domain_expected_bdfs.add(map_bdf)
         available_domain_bdfs = {c.pci_bdf for c in d_chips}
         if domain_expected_bdfs and not domain_expected_bdfs.issubset(available_domain_bdfs):
