@@ -60,6 +60,10 @@ int main() {
             freetile::DType::BF16, freetile::DType::F32, true, &k_q4k_u4), "Q4_K U4 1024x1024");
         const auto em_q4k_u4 = freetile::emit_mosaic_kernel(k_q4k_u4);
         CHECK_TRUE(em_q4k_u4.mosaic_mlir.find("stable_mosaic.arith.uitofp") != std::string::npos, "Q4_K U4 uitofp");
+        CHECK_TRUE(em_q4k_u4.mosaic_mlir.find("vector<1024x1024xi4>") != std::string::npos, "Q4_K U4 signless vector i4");
+        CHECK_TRUE(em_q4k_u4.mosaic_mlir.find("memref<1024x1024xi4, #tpu.memory_space<vmem>>") != std::string::npos,
+                   "Q4_K U4 signless memref i4");
+        CHECK_TRUE(em_q4k_u4.mosaic_mlir.find("xui4") == std::string::npos, "Q4_K U4 emits zero ui4 inside Mosaic");
         CHECK_TRUE(em_q4k_u4.mosaic_mlir.find("value = 8.000000e+00 : bf16") == std::string::npos, "Q4_K U4 has no +8 shift");
     }
 
@@ -80,6 +84,8 @@ int main() {
             freetile::DType::BF16, freetile::DType::F32, true, &k_q40), "Q4_0 U4 1024x1024");
         const auto em40 = freetile::emit_mosaic_kernel(k_q40);
         CHECK_TRUE(em40.mosaic_mlir.find("stable_mosaic.arith.uitofp") != std::string::npos, "Q4_0 U4 uitofp");
+        CHECK_TRUE(em40.mosaic_mlir.find("vector<1024x1024xi4>") != std::string::npos, "Q4_0 U4 signless vector i4");
+        CHECK_TRUE(em40.mosaic_mlir.find("xui4") == std::string::npos, "Q4_0 U4 emits zero ui4 inside Mosaic");
         CHECK_TRUE(em40.mosaic_mlir.find("stable_mosaic.arith.subf") != std::string::npos, "Q4_0 U4 -8");
 
         freetile::TileKernel k_q80;
@@ -147,6 +153,65 @@ int main() {
         CHECK_TRUE(hook_calls == 1, "Schedule hook invoked once");
         CHECK_TRUE(k_ov.grid.bm == 16 && k_ov.grid.bn == 512 && k_ov.grid.bk == 512,
                    "Schedule hook overrides (bm, bn, bk)");
+    }
+
+    // 7. Validation rejects mismatched operand & scratch windows against grid tile dims
+    {
+        freetile::TileKernel k_val;
+        CHECK_TRUE(freetile::plan_quant_matmul_kernel(
+            freetile::ChipTarget::V5E, 1, 512, 256, freetile::QuantFormat::Q4_K,
+            freetile::DType::BF16, freetile::DType::F32, false, &k_val), "Plan Q4_K 512x256");
+        CHECK_TRUE(k_val.grid.bn == 256, "bn == 256");
+
+        // Mutate output window from 256 -> 128 on bn=256 grid: divides global N=256, must still fail
+        freetile::TileKernel bad_out = k_val;
+        bad_out.operands.back().window_bounds[1] = 128;
+        std::string verr;
+        CHECK_TRUE(!bad_out.validate(&verr), "Output window 128 != bn 256 rejected");
+        bool threw = false;
+        try {
+            (void)freetile::emit_mosaic_kernel(bad_out);
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        CHECK_TRUE(threw, "emit_mosaic_kernel throws on mismatched output window");
+
+        // Mutate scale window rows
+        freetile::TileKernel bad_d = k_val;
+        bad_d.operands[2].window_bounds[0] = 8;
+        CHECK_TRUE(!bad_d.validate(&verr), "Scale window mismatch rejected");
+
+        // Mutate scratch accumulator window on multi-K kernel
+        freetile::TileKernel k_mk;
+        CHECK_TRUE(freetile::plan_quant_matmul_kernel(
+            freetile::ChipTarget::V5E, 1, 4096, 1024, freetile::QuantFormat::Q8_0,
+            freetile::DType::BF16, freetile::DType::F32, false, &k_mk), "Plan multi-K Q8_0");
+        CHECK_TRUE(k_mk.scratch.size() == 1, "Multi-K has scratch");
+        k_mk.scratch[0].window_bounds[1] = 128;
+        CHECK_TRUE(!k_mk.validate(&verr), "Scratch window mismatch rejected");
+    }
+
+    // 8. Default dense planner handles aligned K < 128 (e.g. M=8, K=64, N=128 and K=96) without schedule hook
+    {
+        freetile::TileKernel k_d64;
+        std::string reason;
+        CHECK_TRUE(freetile::plan_quant_matmul_kernel(
+            freetile::ChipTarget::V5E, 8, 64, 128, freetile::QuantFormat::NONE,
+            freetile::DType::BF16, freetile::DType::F32, false, &k_d64, &reason),
+            ("Dense M=8 K=64 N=128 plan failed: " + reason).c_str());
+        CHECK_TRUE(k_d64.grid.bm == 8 && k_d64.grid.bk == 64 && k_d64.grid.bn == 128,
+                   "Dense K=64 selects 8x64x128 tile");
+        CHECK_TRUE(k_d64.grid.dims.size() == 1 && k_d64.grid.dims[0] == 1, "Dense K=64 single-K 1D grid");
+        CHECK_TRUE(k_d64.validate(&reason), "Dense K=64 validates cleanly");
+        const auto em_d64 = freetile::emit_mosaic_kernel(k_d64);
+        CHECK_TRUE(em_d64.mosaic_mlir.find("vector<8x64xbf16>") != std::string::npos, "Dense K=64 vector<8x64xbf16>");
+
+        freetile::TileKernel k_d96;
+        CHECK_TRUE(freetile::plan_quant_matmul_kernel(
+            freetile::ChipTarget::V5E, 8, 96, 128, freetile::QuantFormat::NONE,
+            freetile::DType::BF16, freetile::DType::BF16, false, &k_d96, &reason),
+            ("Dense M=8 K=96 N=128 plan failed: " + reason).c_str());
+        CHECK_TRUE(k_d96.grid.bk == 96 && k_d96.validate(&reason), "Dense K=96 selects bk=96 and validates");
     }
 
     std::printf("PASS: all freetile unit tests succeeded!\n");

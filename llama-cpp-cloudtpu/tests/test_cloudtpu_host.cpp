@@ -6389,6 +6389,43 @@ void test_freetile_mosaic_lowering(cloudtpu::PjrtRuntime& rt) {
                    "Q4_K_I4 U4 FreeTile Mosaic emits @tpu_custom_call");
         auto got = run_emitted(rt, prog, {bqs, bd, bm, bx});
         CHECK_TRUE(compute_nmse(got, ref) < 5e-4, "Q4_K_I4 U4 FreeTile Mosaic NMSE < 5e-4");
+
+        // Verify MockPJRT rejects unsigned ui4 inside Mosaic MLIR body (MLIR requires signless i4)
+        if (rt.is_mock()) {
+            const std::string bad_mosaic =
+                "module attributes {stable_mosaic.version = 17 : i64} { vector<256x128xui4> }";
+            // Base64 encode bad_mosaic and inject into a minimal custom_call
+            static constexpr char kB64[] =
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            std::string b64;
+            for (size_t i = 0; i < bad_mosaic.size(); i += 3) {
+                const uint32_t b0 = static_cast<unsigned char>(bad_mosaic[i]);
+                const uint32_t b1 = (i + 1 < bad_mosaic.size()) ? static_cast<unsigned char>(bad_mosaic[i + 1]) : 0U;
+                const uint32_t b2 = (i + 2 < bad_mosaic.size()) ? static_cast<unsigned char>(bad_mosaic[i + 2]) : 0U;
+                const uint32_t t = (b0 << 16) | (b1 << 8) | b2;
+                b64.push_back(kB64[(t >> 18) & 0x3F]);
+                b64.push_back(kB64[(t >> 12) & 0x3F]);
+                b64.push_back((i + 1 < bad_mosaic.size()) ? kB64[(t >> 6) & 0x3F] : '=');
+                b64.push_back((i + 2 < bad_mosaic.size()) ? kB64[t & 0x3F] : '=');
+            }
+            const std::string bad_mlir =
+                "module @bad_ui4 {\n"
+                "  func.func @main(%arg0: tensor<8x256xbf16>, %arg1: tensor<256x128xui4>) -> tensor<8x128xf32> {\n"
+                "    %0 = stablehlo.custom_call @tpu_custom_call(%arg0, %arg1) "
+                "{backend_config = \"{\\\"custom_call_config\\\": {\\\"body\\\": \\\"" + b64 +
+                "\\\", \\\"serialization_format\\\": 1}}\", kernel_name = \"ft_q4_k_bad\"} : "
+                "(tensor<8x256xbf16>, tensor<256x128xui4>) -> tensor<8x128xf32>\n"
+                "    return %0 : tensor<8x128xf32>\n"
+                "  }\n"
+                "}\n";
+            bool threw = false;
+            try {
+                (void)rt.compile_or_get("bad_ui4_mosaic_test", bad_mlir, 0, rt.make_spmd_compile_options(1));
+            } catch (const std::exception&) {
+                threw = true;
+            }
+            CHECK_TRUE(threw, "MockPJRT rejects unsigned xui4 inside Mosaic MLIR body");
+        }
     }
 
     // 3) Q4_0_I4 U4 (M=1 pad8, K=256, N=128) with w = (u4 - 8)*d

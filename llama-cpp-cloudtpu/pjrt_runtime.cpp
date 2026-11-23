@@ -1353,6 +1353,11 @@ static MockProgram parse_stablehlo_mlir(const std::string& mlir) {
                 throw std::runtime_error("MockPJRT: unsupported stable_mosaic.version: " +
                                          std::to_string(op.custom_call_mosaic_version));
             }
+            if (mosaic_txt.find("xui4") != std::string::npos ||
+                mosaic_txt.find("xui8") != std::string::npos) {
+                throw std::runtime_error(
+                    "MockPJRT: Mosaic module must use signless integer types (i4/i8), not ui4/ui8");
+            }
             const bool has_const_8 = (mosaic_txt.find("value = 8.000000e+00 : bf16") != std::string::npos);
             if (op.custom_call_kernel_name.rfind("ft_q6_k_", 0) == 0) {
                 op.custom_call_blk = 16;

@@ -135,14 +135,16 @@ const char* chip_target_name(ChipTarget target) {
 }
 
 const char* dtype_mlir_name(DType dt) {
+    // Mosaic MLIR (memref/vector/arith) requires signless integer types; signedness
+    // is carried by conversion ops (arith.sitofp vs arith.uitofp).
     switch (dt) {
         case DType::F32: return "f32";
         case DType::F16: return "f16";
         case DType::BF16: return "bf16";
-        case DType::S4: return "i4";
-        case DType::U4: return "ui4";
-        case DType::S8: return "i8";
-        case DType::U8: return "ui8";
+        case DType::S4:
+        case DType::U4: return "i4";
+        case DType::S8:
+        case DType::U8: return "i8";
         case DType::S32: return "i32";
         case DType::I1: return "i1";
         default: return "invalid";
@@ -302,6 +304,9 @@ bool TileKernel::validate(std::string* err) const {
         return fail(err, "TileGrid semantics size must match grid dims");
     }
 
+    if (matmul.has_min != quant_has_min(matmul.quant)) {
+        return fail(err, "TileMatmul has_min does not match QuantFormat");
+    }
     const size_t expected_ops = (matmul.quant == QuantFormat::NONE) ? 3
                                 : (matmul.has_min ? 5 : 4);
     if (operands.size() != expected_ops) {
@@ -313,24 +318,80 @@ bool TileKernel::validate(std::string* err) const {
     if (matmul.out_dtype != DType::BF16 && matmul.out_dtype != DType::F32) {
         return fail(err, "TileMatmul out_dtype must be BF16 or F32");
     }
-    if (matmul.quant != QuantFormat::NONE && matmul.scale_dtype != DType::BF16) {
-        return fail(err, "Quantized TileMatmul scale_dtype must be BF16");
-    }
-    for (const SramTile& op : operands) {
-        if (op.window_bounds.size() != 2 || op.global_shape.size() != 2) {
-            return fail(err, "SramTile operands must be 2D");
+    if (matmul.quant == QuantFormat::NONE) {
+        if (matmul.weight_dtype != DType::BF16) {
+            return fail(err, "Dense TileMatmul weight_dtype must be BF16");
         }
-        for (size_t d = 0; d < 2; ++d) {
-            if (op.window_bounds[d] <= 0 || op.global_shape[d] <= 0 ||
-                op.global_shape[d] < op.window_bounds[d] ||
-                (op.global_shape[d] % op.window_bounds[d]) != 0) {
-                return fail(err, "SramTile global_shape must be positive and evenly divisible by window_bounds");
+    } else {
+        if (matmul.scale_dtype != DType::BF16) {
+            return fail(err, "Quantized TileMatmul scale_dtype must be BF16");
+        }
+        const DType expected_w_dt =
+            (matmul.quant == QuantFormat::Q4_K || matmul.quant == QuantFormat::Q4_0)
+                ? (matmul.unsigned_q4 ? DType::U4 : DType::S4)
+                : DType::S8;
+        if (matmul.weight_dtype != expected_w_dt) {
+            return fail(err, "Quantized TileMatmul weight_dtype does not match QuantFormat/unsigned_q4");
+        }
+    }
+
+    auto check_operand = [&](size_t idx,
+                             const char* label,
+                             int64_t g0,
+                             int64_t g1,
+                             int64_t w0,
+                             int64_t w1,
+                             DType expected_dt,
+                             bool expected_output) -> bool {
+        const SramTile& op = operands[idx];
+        if (op.window_bounds.size() != 2 || op.global_shape.size() != 2) {
+            return fail(err, std::string("SramTile operand ") + label + " must be 2D");
+        }
+        if (op.global_shape[0] != g0 || op.global_shape[1] != g1) {
+            return fail(err, std::string("SramTile operand ") + label + " global_shape does not match matmul dims");
+        }
+        if (op.window_bounds[0] != w0 || op.window_bounds[1] != w1) {
+            return fail(err, std::string("SramTile operand ") + label + " window_bounds does not match grid tile dims");
+        }
+        if (op.dtype != expected_dt) {
+            return fail(err, std::string("SramTile operand ") + label + " dtype does not match TileMatmul");
+        }
+        if (op.is_output != expected_output) {
+            return fail(err, std::string("SramTile operand ") + label + " is_output flag mismatch");
+        }
+        return true;
+    };
+
+    size_t op_idx = 0;
+    if (!check_operand(op_idx++, "x", matmul.m_padded, matmul.k, grid.bm, grid.bk, matmul.act_dtype, false)) {
+        return false;
+    }
+    if (!check_operand(op_idx++, "w", matmul.k, matmul.n, grid.bk, grid.bn, matmul.weight_dtype, false)) {
+        return false;
+    }
+    if (matmul.quant != QuantFormat::NONE) {
+        const int64_t nb = matmul.k / blk;
+        const int64_t nb_tile = grid.bk / blk;
+        if (!check_operand(op_idx++, "d", nb, matmul.n, nb_tile, grid.bn, matmul.scale_dtype, false)) {
+            return false;
+        }
+        if (matmul.has_min) {
+            if (!check_operand(op_idx++, "m", nb, matmul.n, nb_tile, grid.bn, matmul.scale_dtype, false)) {
+                return false;
             }
         }
     }
+    if (!check_operand(op_idx++, "out", matmul.m_padded, matmul.n, grid.bm, grid.bn, matmul.out_dtype, true)) {
+        return false;
+    }
+
     for (const SramTile& sc : scratch) {
-        if (sc.window_bounds.size() != 2 || sc.window_bounds[0] <= 0 || sc.window_bounds[1] <= 0) {
-            return fail(err, "SramTile scratch must have positive 2D window_bounds");
+        if (sc.window_bounds.size() != 2 ||
+            sc.window_bounds[0] != grid.bm || sc.window_bounds[1] != grid.bn) {
+            return fail(err, "SramTile scratch window_bounds must match {bm, bn}");
+        }
+        if (sc.dtype != DType::F32) {
+            return fail(err, "SramTile scratch accumulator dtype must be F32");
         }
     }
     if (vmem_footprint_bytes() > prof.vmem_bytes) {
@@ -380,11 +441,22 @@ bool plan_quant_matmul_kernel(ChipTarget target,
     }
     const int64_t min_bk = (fmt == QuantFormat::NONE) ? prof.sublane_align : (blk * prof.sublane_align);
     if ((k % min_bk) != 0) {
-        return fail(reason, "K must be divisible by quant_block_size * 8");
+        return fail(reason, (fmt == QuantFormat::NONE)
+                                ? "Dense K must be divisible by sublane_align (8)"
+                                : "K must be divisible by quant_block_size * 8");
     }
 
     std::vector<int64_t> bn_cands = {2048, 1024, 512, 256, 128, 64};
     std::vector<int64_t> bk_cands = {2048, 1024, 512, 256, 128};
+    if (fmt == QuantFormat::NONE) {
+        if (k < 128 && k >= min_bk && (k % min_bk) == 0) {
+            bk_cands.push_back(k);
+        }
+        bk_cands.push_back(64);
+        bk_cands.push_back(32);
+        bk_cands.push_back(16);
+        bk_cands.push_back(8);
+    }
     int64_t override_bm = m_pad;
     if (planner_cfg != nullptr && planner_cfg->schedule_hook != nullptr) {
         const TileShapeOverride ov = planner_cfg->schedule_hook(
@@ -424,7 +496,7 @@ bool plan_quant_matmul_kernel(ChipTarget target,
             continue;
         }
         for (int64_t bk : bk_cands) {
-            if (bk < min_bk || (k % bk) != 0 || (bk % blk) != 0) {
+            if (bk < min_bk || (bk % min_bk) != 0 || (k % bk) != 0 || (bk % blk) != 0) {
                 continue;
             }
             if (fmt != QuantFormat::NONE && ((bk / blk) % prof.sublane_align) != 0) {
