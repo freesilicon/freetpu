@@ -85,15 +85,17 @@ void test_compile_options_proto() {
     CHECK_TRUE(std::memcmp(p_da.data(), exp_da, sizeof(exp_da)) == 0, "device_assignment proto bytes mismatch");
 
     // Alias passthrough + CompileOptionsProto.env_option_overrides (field 7 map<string, OptionOverrideProto>).
-    // Must leave ExecutableBuildOptionsProto.debug_options unset so XLA_FLAGS & defaults stay intact.
+    // Must leave ExecutableBuildOptionsProto.debug_options unset so XLA_FLAGS & defaults stay intact,
+    // and serialize each OptionOverrideProto with its exact typed field (bool_field=2, string_field=1, int_field=3).
     cloudtpu::PjrtCompileOptions opt_alias_only;
     opt_alias_only.alias_passthrough_params = true;
     const std::string p_alias_only = cloudtpu::encode_compile_options_proto(opt_alias_only);
 
     cloudtpu::PjrtCompileOptions opt_extra = opt_alias_only;
     opt_extra.env_option_overrides = {
-        {"xla_tpu_enable_async_collective_fusion", "true"},
-        {"xla_enable_async_all_reduce", "true"},
+        cloudtpu::PjrtOptionOverride::make_bool("xla_tpu_enable_async_collective_fusion", true),
+        cloudtpu::PjrtOptionOverride::make_string("xla_enable_async_all_gather", "kEnabled"),
+        cloudtpu::PjrtOptionOverride::make_int("xla_tpu_scoped_vmem_limit_kib", 16384),
     };
     const std::string p_extra = cloudtpu::encode_compile_options_proto(opt_extra);
     // Prefix must match p_alias_only byte-for-byte (proves ExecutableBuildOptionsProto is untouched / no debug_options).
@@ -105,8 +107,19 @@ void test_compile_options_proto() {
                "env_option_overrides must serialize as CompileOptionsProto field 7 (0x3a)");
     CHECK_TRUE(p_extra.find("xla_tpu_enable_async_collective_fusion") != std::string::npos,
                "env_option_overrides fusion key missing");
-    CHECK_TRUE(p_extra.find("xla_enable_async_all_reduce") != std::string::npos,
-               "env_option_overrides all_reduce key missing");
+    CHECK_TRUE(p_extra.find("xla_enable_async_all_gather") != std::string::npos &&
+                   p_extra.find("kEnabled") != std::string::npos,
+               "env_option_overrides enum string value kEnabled missing");
+    // Verify typed OptionOverrideProto payload bytes:
+    //   bool_field=true -> value field (0x12 len=2) + bool_field tag (0x10 0x01)
+    const std::string bool_true_wire = {0x12, 0x02, 0x10, 0x01};
+    CHECK_TRUE(p_extra.find(bool_true_wire) != std::string::npos,
+               "bool override must encode OptionOverrideProto.bool_field (tag 0x10, val 0x01)");
+    //   int_field=16384 (0x4000 -> varint 80 80 01) -> value field (0x12 len=4) + int_field tag (0x18 80 80 01)
+    const std::string int_16384_wire = {
+        0x12, 0x04, 0x18, static_cast<char>(0x80), static_cast<char>(0x80), 0x01};
+    CHECK_TRUE(p_extra.find(int_16384_wire) != std::string::npos,
+               "int override must encode OptionOverrideProto.int_field (tag 0x18)");
     // Field 10 tag = (10<<3)|0 = 0x50 followed by 0x01 inside ExecutableBuildOptionsProto
     bool found_alias_tag = false;
     for (size_t i = 0; i + 1 < p_alias_only.size(); ++i) {
@@ -116,7 +129,7 @@ void test_compile_options_proto() {
         }
     }
     CHECK_TRUE(found_alias_tag, "alias_passthrough_params (field 10) missing");
-    std::printf("  [PASS] compile_options_proto (incl. DeviceAssignmentProto, alias_passthrough, env_option_overrides)\n");
+    std::printf("  [PASS] compile_options_proto (incl. DeviceAssignmentProto, alias_passthrough, typed env_option_overrides)\n");
 }
 
 void test_half_bf16_conversions() {
@@ -1189,7 +1202,21 @@ void test_spmd_multichip_mesh(int num_chips) {
     const auto copts = rt.make_spmd_compile_options(num_chips);
     CHECK_TRUE(copts.num_replicas == num_chips && copts.num_partitions == 1, "SPMD compile options");
     CHECK_TRUE(static_cast<int>(copts.device_assignment_ids.size()) == num_chips, "SPMD DeviceAssignment ids");
-    CHECK_TRUE(copts.env_option_overrides.size() == 7, "SPMD async collective overlap flags (7)");
+    CHECK_TRUE(copts.env_option_overrides.empty(), "SPMD default leaves TPU env_option_overrides opt-in");
+    const auto copts_async = rt.make_spmd_compile_options(num_chips, 0, false, /*async_collectives=*/true);
+    CHECK_TRUE(copts_async.env_option_overrides.size() == 6, "Opt-in SPMD async collective overlap overrides (6)");
+    bool saw_ag_enum = false;
+    for (const auto& ov : copts_async.env_option_overrides) {
+        if (ov.key == "xla_enable_async_all_gather") {
+            CHECK_TRUE(ov.kind == cloudtpu::PjrtOptionOverride::Kind::STRING && ov.string_val == "kEnabled",
+                       "xla_enable_async_all_gather must use enum string kEnabled");
+            saw_ag_enum = true;
+        } else {
+            CHECK_TRUE(ov.kind == cloudtpu::PjrtOptionOverride::Kind::BOOL && ov.bool_val,
+                       "xla_tpu_* async collective override must use bool_field=true");
+        }
+    }
+    CHECK_TRUE(saw_ag_enum, "Opt-in SPMD overrides include xla_enable_async_all_gather=kEnabled");
 
     auto run_spmd = [&](const cloudtpu::EmittedProgram& prog,
                         const std::vector<std::vector<cloudtpu::PjrtBufferPtr>>& per_dev_in) {

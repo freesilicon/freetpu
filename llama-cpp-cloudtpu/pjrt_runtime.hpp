@@ -59,6 +59,54 @@ float f16_to_f32(uint16_t h);
 // Counts "libpython" mappings in /proc/self/maps (0 on non-Linux or pure C++ processes).
 size_t count_libpython_mappings();
 
+struct PjrtOptionOverride {
+    enum class Kind {
+        STRING = 1,  // OptionOverrideProto.string_field = 1
+        BOOL = 2,    // OptionOverrideProto.bool_field = 2
+        INT64 = 3,   // OptionOverrideProto.int_field = 3
+        DOUBLE = 4,  // OptionOverrideProto.double_field = 4
+    };
+
+    std::string key;
+    Kind kind = Kind::STRING;
+    std::string string_val;
+    bool bool_val = false;
+    int64_t int_val = 0;
+    double double_val = 0.0;
+
+    static PjrtOptionOverride make_string(std::string k, std::string v) {
+        PjrtOptionOverride o;
+        o.key = std::move(k);
+        o.kind = Kind::STRING;
+        o.string_val = std::move(v);
+        return o;
+    }
+
+    static PjrtOptionOverride make_bool(std::string k, bool v) {
+        PjrtOptionOverride o;
+        o.key = std::move(k);
+        o.kind = Kind::BOOL;
+        o.bool_val = v;
+        return o;
+    }
+
+    static PjrtOptionOverride make_int(std::string k, int64_t v) {
+        PjrtOptionOverride o;
+        o.key = std::move(k);
+        o.kind = Kind::INT64;
+        o.int_val = v;
+        return o;
+    }
+
+    static PjrtOptionOverride make_double(std::string k, double v) {
+        PjrtOptionOverride o;
+        o.key = std::move(k);
+        o.kind = Kind::DOUBLE;
+        o.double_val = v;
+        return o;
+    }
+};
+
 struct PjrtCompileOptions {
     int32_t num_replicas = 1;
     int32_t num_partitions = 1;
@@ -70,7 +118,7 @@ struct PjrtCompileOptions {
     std::vector<int64_t> device_assignment_ids;
     // Optional CompileOptionsProto.env_option_overrides (field 7 map<string, OptionOverrideProto>),
     // merged on top of compiler defaults and XLA_FLAGS without replacing DebugOptions.
-    std::vector<std::pair<std::string, std::string>> env_option_overrides;
+    std::vector<PjrtOptionOverride> env_option_overrides;
 };
 
 // Encodes xla::CompileOptionsProto in pure C++ protobuf wire format (zero libprotobuf dep).
@@ -231,7 +279,7 @@ public:
     PjrtCompileOptions make_spmd_compile_options(int num_chips,
                                                  int device_idx = 0,
                                                  bool alias_passthrough = false,
-                                                 bool async_collectives = true) const;
+                                                 bool async_collectives = false) const;
 
     // Compile StableHLO MLIR ("mlir" format) or return an owning reference to a cached executable.
     // Thread-safe LRU cache keyed by canonical structural program key and target device assignment.

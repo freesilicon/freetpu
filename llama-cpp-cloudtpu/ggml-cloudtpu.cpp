@@ -40,7 +40,7 @@ struct cloudtpu_env_config {
     bool bf16_matmul = true;        // Dequantize quantized/low-bit weights & activations to BF16 for MXU
     bool q4_split_dot = true;       // Q4_0/Q4_K: true = split-X two-dot (zero concat); false = single concat dot
     bool q4k_bf16_scales = false;   // Optional F16 Q4_K/Q6_K scales (default off: F32 scales +9% faster on v5e-1)
-    bool async_collectives = true;  // Enable XLA TPU async collective overlap flags on multi-chip SPMD
+    bool async_collectives = false; // Opt-in XLA TPU async collective overlap overrides on multi-chip SPMD
     uint32_t cache_cap = 4096;
     uint64_t min_elements = 0;
     std::string libtpu_path;

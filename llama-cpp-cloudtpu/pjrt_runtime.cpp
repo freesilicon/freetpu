@@ -223,6 +223,13 @@ void append_tag_bytes(std::string& out, uint32_t field_number, const std::string
     out.append(payload);
 }
 
+void append_tag_fixed64(std::string& out, uint32_t field_number, uint64_t val) {
+    append_varint(out, (static_cast<uint64_t>(field_number) << 3) | 1ULL);
+    for (int i = 0; i < 8; ++i) {
+        out.push_back(static_cast<char>((val >> (i * 8)) & 0xFFU));
+    }
+}
+
 }  // namespace
 
 std::string encode_compile_options_proto(const PjrtCompileOptions& opts) {
@@ -280,13 +287,31 @@ std::string encode_compile_options_proto(const PjrtCompileOptions& opts) {
     // }
     std::string out;
     append_tag_bytes(out, 3, ebo);
-    for (const auto& kv : opts.env_option_overrides) {
-        // OptionOverrideProto { string string_field = 1; }
+    for (const auto& ov : opts.env_option_overrides) {
+        // OptionOverrideProto {
+        //   oneof value { string string_field = 1; bool bool_field = 2; int64 int_field = 3; double double_field = 4; }
+        // }
         std::string override_val;
-        append_tag_bytes(override_val, 1, kv.second);
+        switch (ov.kind) {
+            case PjrtOptionOverride::Kind::STRING:
+                append_tag_bytes(override_val, 1, ov.string_val);
+                break;
+            case PjrtOptionOverride::Kind::BOOL:
+                append_tag_varint(override_val, 2, ov.bool_val ? 1ULL : 0ULL);
+                break;
+            case PjrtOptionOverride::Kind::INT64:
+                append_tag_varint(override_val, 3, static_cast<uint64_t>(ov.int_val));
+                break;
+            case PjrtOptionOverride::Kind::DOUBLE: {
+                uint64_t bits = 0;
+                std::memcpy(&bits, &ov.double_val, sizeof(bits));
+                append_tag_fixed64(override_val, 4, bits);
+                break;
+            }
+        }
         // map<string, OptionOverrideProto> entry { string key = 1; OptionOverrideProto value = 2; }
         std::string entry;
-        append_tag_bytes(entry, 1, kv.first);
+        append_tag_bytes(entry, 1, ov.key);
         append_tag_bytes(entry, 2, override_val);
         append_tag_bytes(out, 7, entry);
     }
@@ -2685,14 +2710,17 @@ PjrtCompileOptions PjrtRuntime::make_spmd_compile_options(int num_chips,
             opts.device_assignment_ids[static_cast<size_t>(i)] = device_infos_[static_cast<size_t>(i)].id;
         }
         if (async_collectives) {
+            // Opt-in TPU async collective overlap overrides matching OpenXLA TPU flag guidance
+            // (https://openxla.org/xla/flags_guidance#performance_flags):
+            //   - xla_enable_async_all_gather is an enum (kDisabled/kEnabled/kAuto)
+            //   - xla_tpu_* flags are boolean OptionOverrideProto.bool_field values
             opts.env_option_overrides = {
-                {"xla_tpu_enable_async_collective_fusion", "true"},
-                {"xla_tpu_overlap_compute_collective_tc", "true"},
-                {"xla_tpu_enable_async_collective_fusion_multiple_steps", "true"},
-                {"xla_enable_async_all_gather", "true"},
-                {"xla_enable_async_all_reduce", "true"},
-                {"xla_tpu_enable_async_collective_fusion_fuse_all_gather", "true"},
-                {"xla_tpu_enable_async_collective_fusion_fuse_all_reduce", "true"},
+                PjrtOptionOverride::make_bool("xla_tpu_enable_async_collective_fusion", true),
+                PjrtOptionOverride::make_bool("xla_tpu_overlap_compute_collective_tc", true),
+                PjrtOptionOverride::make_bool("xla_tpu_enable_async_collective_fusion_multiple_steps", true),
+                PjrtOptionOverride::make_string("xla_enable_async_all_gather", "kEnabled"),
+                PjrtOptionOverride::make_bool("xla_tpu_enable_async_collective_fusion_fuse_all_gather", true),
+                PjrtOptionOverride::make_bool("xla_tpu_enable_async_collective_fusion_fuse_all_reduce", true),
             };
         }
     }
