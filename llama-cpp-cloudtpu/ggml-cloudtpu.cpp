@@ -61,7 +61,7 @@ static cloudtpu_env_config load_env_config() {
             cfg.spmd_chips = 0;
         } else {
             const int parsed = std::atoi(v);
-            if (parsed >= 1 && parsed <= 16) {
+            if (parsed >= 1) {
                 cfg.spmd_chips = parsed;
             }
         }
@@ -105,11 +105,26 @@ static cloudtpu_env_config load_env_config() {
 }
 
 static int resolve_spmd_chips(const cloudtpu_env_config& env, const cloudtpu::PjrtRuntime& rt) {
-    const int avail = std::max(1, rt.device_count());
-    if (env.spmd_chips <= 0) {
-        return avail;
+    const int avail = rt.device_count();
+    if (avail <= 0) {
+        throw std::runtime_error("no PJRT devices available");
     }
-    return std::max(1, std::min(env.spmd_chips, avail));
+    if (env.spmd_chips <= 0) {
+        // Explicit CLOUDTPU_SPMD_CHIPS=auto uses all available chips (up to 16).
+        return std::min(avail, 16);
+    }
+    if (env.spmd_chips > 16) {
+        throw std::runtime_error(
+            "CLOUDTPU_SPMD_CHIPS=" + std::to_string(env.spmd_chips) +
+            " exceeds supported SPMD maximum (16); available PJRT devices=" +
+            std::to_string(avail));
+    }
+    if (env.spmd_chips > avail) {
+        throw std::runtime_error(
+            "CLOUDTPU_SPMD_CHIPS=" + std::to_string(env.spmd_chips) +
+            " exceeds available PJRT devices (" + std::to_string(avail) + ")");
+    }
+    return env.spmd_chips;
 }
 
 struct cloudtpu_hot_env_cache {
@@ -769,7 +784,7 @@ static cloudtpu::TensorShardingKind choose_upload_sharding(const struct ggml_ten
     const bool is_q = is_quant_split_type(tensor->type);
     const bool is_fp = (tensor->type == GGML_TYPE_F32 || tensor->type == GGML_TYPE_F16 ||
                         tensor->type == GGML_TYPE_BF16);
-    if (!is_q && (!is_fp || !ggml_is_contiguous(tensor))) {
+    if ((!is_q && !is_fp) || !ggml_is_contiguous(tensor)) {
         return cloudtpu::TensorShardingKind::REPLICATED;
     }
     const int64_t K = tensor->ne[0];
