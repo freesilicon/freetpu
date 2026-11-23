@@ -1072,6 +1072,39 @@ class DeadlineSocket:
         return getattr(self._sock, name)
 
 
+def _parse_validated_content_length(
+    resp: http.client.HTTPResponse,
+) -> Optional[int]:
+    """Validate and normalize HTTP `Content-Length` headers per RFC 9112 §6.3.
+
+    Returns `None` when `Transfer-Encoding` is used or no `Content-Length` header
+    is present. Raises `ValueError` on malformed or conflicting values so duplicate
+    matching values (e.g. `1200, 1200`) remain enforced and invalid headers fail closed.
+    """
+    if resp.chunked or resp.getheader("Transfer-Encoding") is not None:
+        return None
+    headers = getattr(resp, "headers", None)
+    raw_values: Optional[List[str]] = None
+    if headers is not None and hasattr(headers, "get_all"):
+        raw_values = headers.get_all("Content-Length")
+    else:
+        single = resp.getheader("Content-Length")
+        if single is not None:
+            raw_values = [single]
+    if not raw_values:
+        return None
+    parsed_values: set[int] = set()
+    for raw_hdr in raw_values:
+        for part in str(raw_hdr).split(","):
+            token = part.strip()
+            if not token or not token.isascii() or not token.isdigit():
+                raise ValueError("Invalid Content-Length header in exporter response")
+            parsed_values.add(int(token))
+    if len(parsed_values) != 1:
+        raise ValueError("Conflicting Content-Length headers in exporter response")
+    return next(iter(parsed_values))
+
+
 def _read_bounded_http_body(
     resp: http.client.HTTPResponse,
     upstream_sock: Any,
@@ -1080,23 +1113,14 @@ def _read_bounded_http_body(
     max_bytes: int = MAX_EXPORTER_RESPONSE_BYTES,
 ) -> bytes:
     """Read an HTTP response body incrementally under an elapsed wall-clock deadline."""
-    declared_len: Optional[int] = None
-    if not resp.chunked:
-        raw_len = resp.getheader("Content-Length")
-        if raw_len is not None:
-            try:
-                parsed_len = int(raw_len.strip())
-            except ValueError:
-                parsed_len = -1
-            if parsed_len >= 0:
-                declared_len = parsed_len
-                if declared_len > max_bytes:
-                    raise ValueError(
-                        f"Exporter response exceeded {max_bytes} byte limit"
-                    )
+    declared_len = _parse_validated_content_length(resp)
+    if declared_len is not None and declared_len > max_bytes:
+        raise ValueError(f"Exporter response exceeded {max_bytes} byte limit")
     buf = bytearray()
     total = 0
     while True:
+        if declared_len is not None and total >= declared_len:
+            break
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             buf.clear()
@@ -1112,7 +1136,10 @@ def _read_bounded_http_body(
         if budget_left <= 0:
             buf.clear()
             raise ValueError(f"Exporter response exceeded {max_bytes} byte limit")
-        chunk = resp.read1(min(8192, budget_left))
+        to_read = min(8192, budget_left)
+        if declared_len is not None:
+            to_read = min(to_read, declared_len - total)
+        chunk = resp.read1(to_read)
         if not chunk:
             break
         total += len(chunk)
@@ -1162,20 +1189,9 @@ def _stream_scrape_tpu_body(
     max_line_bytes: int = MAX_EXPORTER_LINE_BYTES,
 ) -> TpuExporterTelemetry:
     """Stream-read and aggregate only known TPU metrics in O(1) bounded memory."""
-    declared_len: Optional[int] = None
-    if not resp.chunked:
-        raw_len = resp.getheader("Content-Length")
-        if raw_len is not None:
-            try:
-                parsed_len = int(raw_len.strip())
-            except ValueError:
-                parsed_len = -1
-            if parsed_len >= 0:
-                declared_len = parsed_len
-                if declared_len > max_bytes:
-                    raise ValueError(
-                        f"Exporter response exceeded {max_bytes} byte limit"
-                    )
+    declared_len = _parse_validated_content_length(resp)
+    if declared_len is not None and declared_len > max_bytes:
+        raise ValueError(f"Exporter response exceeded {max_bytes} byte limit")
 
     agg = _TpuTelemetryAggregator()
     line_buf = bytearray()
@@ -1207,6 +1223,8 @@ def _stream_scrape_tpu_body(
             agg.add_malformed_metric(name_bytes.decode("ascii", errors="replace"))
 
     while True:
+        if declared_len is not None and total >= declared_len:
+            break
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             line_buf.clear()
@@ -1222,7 +1240,10 @@ def _stream_scrape_tpu_body(
         if budget_left <= 0:
             line_buf.clear()
             raise ValueError(f"Exporter response exceeded {max_bytes} byte limit")
-        chunk = resp.read1(min(8192, budget_left))
+        to_read = min(8192, budget_left)
+        if declared_len is not None:
+            to_read = min(to_read, declared_len - total)
+        chunk = resp.read1(to_read)
         if not chunk:
             break
         total += len(chunk)

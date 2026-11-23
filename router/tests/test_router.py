@@ -13447,6 +13447,70 @@ asyncio.run(main())
         self.assertFalse(ready)
         self.assertEqual(reason, "tpu_exporter_unreachable")
 
+    def test_tpu_exporter_validates_duplicate_conflicting_and_malformed_content_length(
+        self,
+    ) -> None:
+        valid_body = (
+            b"freetpu_exporter_up 1\n"
+            b"freetpu_tpu_devices_discovered 1\n"
+            b'freetpu_tpu_health_status{chip="0"} 1\n'
+        )
+        mode = ["dup_truncated"]
+
+        class _ContentLengthExporter(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return None
+
+            def do_GET(self) -> None:  # noqa: N802
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; version=0.0.4")
+                if mode[0] == "dup_truncated":
+                    self.send_header("Content-Length", "1200, 1200")
+                elif mode[0] == "dup_exact":
+                    exact = str(len(valid_body))
+                    self.send_header("Content-Length", exact)
+                    self.send_header("Content-Length", exact)
+                elif mode[0] == "conflicting":
+                    self.send_header("Content-Length", "100, 200")
+                else:
+                    self.send_header("Content-Length", "abc")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(valid_body)
+                self.wfile.flush()
+
+        srv = self._track(
+            ThreadingHTTPServer(("127.0.0.1", 0), _ContentLengthExporter)
+        )
+        url = f"http://127.0.0.1:{srv.server_address[1]}/metrics"
+
+        # 1. Duplicate matching Content-Length truncated early -> incomplete scrape.
+        telem_trunc = scrape_tpu_exporter(url, timeout_s=2.0)
+        self.assertFalse(telem_trunc.reachable)
+        self.assertEqual(telem_trunc.error, "exporter_incomplete_response")
+        self.assertFalse(evaluate_tpu_readiness(telem_trunc)[0])
+
+        # 2. Duplicate matching Content-Length with exact body -> succeeds cleanly.
+        mode[0] = "dup_exact"
+        telem_ok = scrape_tpu_exporter(url, timeout_s=2.0)
+        self.assertTrue(telem_ok.reachable)
+        self.assertTrue(telem_ok.exporter_up)
+        self.assertTrue(evaluate_tpu_readiness(telem_ok)[0])
+
+        # 3. Conflicting Content-Length -> rejected.
+        mode[0] = "conflicting"
+        telem_conflict = scrape_tpu_exporter(url, timeout_s=2.0)
+        self.assertFalse(telem_conflict.reachable)
+        self.assertFalse(evaluate_tpu_readiness(telem_conflict)[0])
+
+        # 4. Malformed Content-Length -> rejected.
+        mode[0] = "malformed"
+        telem_bad = scrape_tpu_exporter(url, timeout_s=2.0)
+        self.assertFalse(telem_bad.reachable)
+        self.assertFalse(evaluate_tpu_readiness(telem_bad)[0])
+
 
 def run_self_tests(verbosity: int = 1) -> int:
     """Run all router tests cleanly via unittest."""

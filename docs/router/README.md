@@ -8,6 +8,8 @@ Built exclusively on the Python 3 standard library (`http.server`, `http.client`
 
 ## 60-Second Quickstart
 
+> **Prerequisite for live routing (steps 3–4):** Steps 1–2 run completely offline with zero hardware. Before starting the router in step 3, ensure at least one OpenAI-compatible inference worker (for example, `llama-server --host 127.0.0.1 --port 8081 --alias qwen2.5-1.5b-q8_0 -m <model.gguf>` or `vLLM`) is already listening on one of the backend ports defined in `router/examples/hybrid-pixel-cloud.json` (`8081–8084`, or edit the config to point at your running worker URL). Without a healthy backend listening, `/v1/models` returns an empty list.
+
 ```bash
 # 1. Run the offline end-to-end self-test suite (zero TPU hardware required)
 python3 router/freetpu_router.py --self-test
@@ -15,7 +17,7 @@ python3 router/freetpu_router.py --self-test
 # 2. Validate an example multi-backend config
 python3 router/freetpu_router.py --check-config --config router/examples/hybrid-pixel-cloud.json
 
-# 3. Start the router on http://127.0.0.1:8080/v1
+# 3. Start the router on http://127.0.0.1:8080/v1 (requires >=1 running backend on ports 8081-8084)
 python3 router/freetpu_router.py --config router/examples/hybrid-pixel-cloud.json --policy local_first
 
 # 4. Point any OpenAI SDK, curl, or coding agent at the router

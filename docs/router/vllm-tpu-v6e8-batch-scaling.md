@@ -102,7 +102,9 @@ docker run -d --name vllm-qwen3-32b-highbatch "${CONTAINER_FLAGS[@]}" \
 
 ### Preset B: `unsloth/Llama-3.3-70B-Instruct` BF16 High-Batch (`c=64..128`)
 
-Targets `c=64..128` decode scaling (`~2,500–3,800 tok/s` projected vs `633 tok/s` baseline; `~$0.47–$0.72/1M` Spot):
+Targets `c=64..128` decode scaling (`~2,500–3,800 tok/s` projected vs `633 tok/s` baseline; `~$0.47–$0.72/1M` Spot) for short-to-medium sequence lengths (for example, `512`-token prompts + `256`-token outputs, or total sequence lengths up to `~2,048` tokens):
+
+> **KV-cache concurrency budget:** On `v6e-8` (`256 GiB` total HBM) with `--gpu-memory-utilization 0.90` (`~230 GiB` usable) and `~141 GB` (`~131 GiB`) of BF16 weights, roughly `~99 GiB` remains before runtime and activation overhead. For `Llama-3.3-70B-Instruct` (`80` layers, `8` GQA KV heads, `head_dim=128`, BF16), KV cache consumes `320 KiB/token` (`1.25 GiB` per `4,096`-token sequence), so `128` simultaneous full `4,096`-token sequences would require `160 GiB` of KV cache alone and saturate KV capacity around `~64–75` concurrent requests. Use `--max-model-len 4096` as a safety ceiling while sizing your `c=128` sweep to short/medium sequences (`<= 2,048` tokens total, e.g., `512` prompt + `256` output), and verify the worker's startup log for its reported available KV-cache capacity before choosing concurrency.
 
 ```bash
 docker run -d --name vllm-llama70b-highbatch "${CONTAINER_FLAGS[@]}" \
