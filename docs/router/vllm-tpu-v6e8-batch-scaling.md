@@ -1,4 +1,4 @@
-# Cloud TPU `v6e-8` High-Batch (`c=64–128`) & W8A8/W8A16 Serving Playbook
+# Cloud TPU `v6e-8` High-Batch (`c=64–128`) & Dynamic W8A8 INT8 Serving Playbook
 
 Ready-to-run `vllm/vllm-tpu:latest` launch presets and FreeTPU Router configuration for scaling `Qwen3-32B`, `Llama-3.3-70B`, and `gpt-oss-120b` on Cloud TPU `v6e-8` (Trillium, `256 GiB` HBM, `12.8–13.1 TB/s` HBM BW, `7,344 TFLOP/s` BF16 / `14,688 TOPS` INT8).
 
@@ -10,7 +10,7 @@ Live Phase 1 `v6e-8` serving measurements showed:
 - **Extreme decode bandwidth bound:** The Trillium BF16 roofline ridge point is `7,344 / 12.8 ≈ 574` tokens/step (`560` at `13.1 TB/s`), so `c=1..16` operates at **0.1%–1.2% MFU**.
 - **`c=8 -> c=16` proxy cliff (now fixed):** The initial `ThreadingHTTPServer` router hit a model-independent `+7.2 ms/step` stall from `listen(5)` SYN backlog saturation, Nagle/Delayed-ACK without `TCP_NODELAY`, per-chunk thread/GIL/JSON contention, and upstream HTTP/1.1 keep-alive waits (`active_inflight` ghost counts and `5.6–6.0 s` EWMA `latency_ms`).
 - **Router fix in this branch:** `_SSEReactor` (`selectors.DefaultSelector` event-loop pump), `request_queue_size = 1024`, `TCP_NODELAY` on client/upstream sockets, `"Connection": "close"` upstream headers, single-pass SSE parsing, and `_BackendSlotLease` RAII guarantees keep router overhead `<0.5 ms/chunk` at `c=128` with `active_inflight == 0` after every request.
-- **Next hardware unlock (`c=64..128` + W8A8/W8A16):** Scaling batch concurrency from `c=16` to `c=64..128` with async multi-step scheduling and 256-aligned static buckets projects **4×–7×** aggregate `tok/s`, and switching BF16 weights to native TPU INT8 (`W8A8` / `W8A16`) halves per-step HBM weight streaming (`65.5 -> ~33 GB` on 32B, `141 -> ~71 GB` on 70B).
+- **Next hardware unlock (`c=64..128` + dynamic W8A8 INT8):** Scaling batch concurrency from `c=16` to `c=64..128` with async multi-step scheduling and 256-aligned static buckets projects **4×–7×** aggregate `tok/s`, and switching BF16 weights to native TPU dynamic `W8A8` INT8 halves per-step HBM weight streaming (`65.5 -> ~33 GB` on 32B, `141 -> ~71 GB` on 70B).
 
 ---
 
@@ -109,20 +109,21 @@ docker run -d --name vllm-llama70b-highbatch "${CONTAINER_FLAGS[@]}" \
     --async-scheduling
 ```
 
-### Preset C: Native TPU INT8 (`W8A8` / `W8A16`) Serving Presets
+### Preset C: Native TPU Dynamic `W8A8` INT8 Serving Presets
 
-Trillium `v6e` delivers `1,836 TOPS/chip` (`14,688 TOPS` across 8 chips) on native `int8` MXUs while halving weight HBM reads vs BF16 (`33 GB` on 32B, `71 GB` on 70B).
+Trillium `v6e` delivers `1,836 TOPS/chip` (`14,688 TOPS` across 8 chips) on native `int8` MXUs while halving weight HBM reads vs BF16 (`33 GB` on 32B, `71 GB` on 70B). The TPU `compressed-tensors` INT8 linear loader requires **dynamic 8-bit activations (`W8A8`)** — weight-only `W8A16` checkpoints are not supported by that loader.
 
-1. **Dense `W8A8` / `W8A16` INT8 (`compressed-tensors` / `qwix` checkpoint):**
+1. **Dense Dynamic `W8A8` INT8 (`compressed-tensors` checkpoint):**
 
 ```bash
-# Replace MODEL_INT8 with a TPU-supported INT8 checkpoint
-# (compressed-tensors W8A8/W8A16 or qwix INT8 export)
+# Set MODEL_W8A8 to a Hugging Face compressed-tensors dynamic W8A8 INT8 repo ID
+# (for a local host directory, add -v /path/to/checkpoint:/models/dense-w8a8:ro
+# and pass --model /models/dense-w8a8).
 docker run -d --name vllm-int8-highbatch "${CONTAINER_FLAGS[@]}" \
   vllm/vllm-tpu:latest \
   python3 -m vllm.entrypoints.openai.api_server \
     --host 127.0.0.1 --port 8000 \
-    --model "${MODEL_INT8}" \
+    --model "${MODEL_W8A8}" \
     --quantization compressed-tensors \
     --tensor-parallel-size 8 \
     --dtype bfloat16 \
@@ -134,21 +135,24 @@ docker run -d --name vllm-int8-highbatch "${CONTAINER_FLAGS[@]}" \
     --async-scheduling
 ```
 
-2. **Preconverted `openai/gpt-oss-120b` W8A16/W8A8 INT8 (`compressed-tensors`) Preset (`v6e-8`):**
+2. **Preconverted `openai/gpt-oss-120b` Dynamic `W8A8` INT8 (`compressed-tensors`) Preset (`v6e-8`):**
 
-`v6e` lacks native `f4E2M1FN` (`MXFP4`) MXU/Mosaic instructions, and the published `openai/gpt-oss-120b` checkpoint declares `quantization_config.quant_method = "mxfp4"` in `config.json`. Because `--quantization compressed-tensors` requires a checkpoint whose `config.json` already declares `"quant_method": "compressed-tensors"`, vLLM rejects raw `openai/gpt-oss-120b` under that flag. Perform an offline conversion first (dequantizing MXFP4 weights to BF16 and exporting a `compressed-tensors` W8A16/W8A8 INT8 checkpoint, e.g. with `llm-compressor`), or point `GPT_OSS_120B_COMPRESSED_TENSORS_INT8` at an already-preconverted `compressed-tensors` INT8 checkpoint (`~117 GB` total = `~14.6 GB/chip`, leaving `~108 GiB` free KV HBM, `~5.1 GB` active weights per token):
+`v6e` lacks native `f4E2M1FN` (`MXFP4`) MXU/Mosaic instructions, and the published `openai/gpt-oss-120b` checkpoint declares `quantization_config.quant_method = "mxfp4"` in `config.json`. Because `--quantization compressed-tensors` requires a checkpoint whose `config.json` already declares `"quant_method": "compressed-tensors"` with dynamic `W8A8` INT8 quantization, vLLM rejects raw `openai/gpt-oss-120b` under that flag. Perform an offline conversion first (dequantizing MXFP4 weights to BF16 and exporting a `compressed-tensors` dynamic `W8A8` INT8 checkpoint to a host directory, e.g. with `llm-compressor`), bind-mount that directory read-only into the container, and pass the container path `/models/gpt-oss-120b-int8` to `--model` (`~117 GB` total = `~14.6 GB/chip`, leaving `~108 GiB` free KV HBM, `~5.1 GB` active weights per token):
 
 ```bash
 # Offline prerequisite (run once before serving; raw openai/gpt-oss-120b is mxfp4):
-# Dequantize openai/gpt-oss-120b -> BF16 and export a compressed-tensors W8A16/W8A8 INT8
-# checkpoint to "${GPT_OSS_120B_COMPRESSED_TENSORS_INT8}" (with
+# Dequantize openai/gpt-oss-120b -> BF16 and export a compressed-tensors dynamic W8A8 INT8
+# checkpoint to "${GPT_OSS_120B_INT8_HOST_DIR}" (with
 # config.json quantization_config.quant_method == "compressed-tensors").
+export GPT_OSS_120B_INT8_HOST_DIR=/srv/models/gpt-oss-120b-w8a8-int8
+
 docker run -d --name vllm-gptoss120b-int8 "${CONTAINER_FLAGS[@]}" \
+  -v "${GPT_OSS_120B_INT8_HOST_DIR}:/models/gpt-oss-120b-int8:ro" \
   -e MOE_TC_PERMUTE=1 \
   vllm/vllm-tpu:latest \
   python3 -m vllm.entrypoints.openai.api_server \
     --host 127.0.0.1 --port 8000 \
-    --model "${GPT_OSS_120B_COMPRESSED_TENSORS_INT8}" \
+    --model /models/gpt-oss-120b-int8 \
     --quantization compressed-tensors \
     --enable-expert-parallel \
     --tensor-parallel-size 8 \

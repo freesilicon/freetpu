@@ -7220,6 +7220,10 @@ asyncio.run(main())
         self.assertIn("-e VLLM_XLA_CACHE_PATH=", playbook)
         self.assertIn("-e LIBTPU_INIT_ARGS=", playbook)
         self.assertIn("offline conversion", playbook.lower())
+        self.assertNotIn("W8A8/W8A16", playbook)
+        self.assertNotIn("W8A16/W8A8", playbook)
+        self.assertIn(":/models/gpt-oss-120b-int8:ro", playbook)
+        self.assertIn("--model /models/gpt-oss-120b-int8", playbook)
 
     def test_deadline_socket_waits_support_high_fds_without_select_select(self) -> None:
         def _forbid_select(*args: Any, **kwargs: Any) -> Any:
@@ -7860,6 +7864,235 @@ asyncio.run(main())
                     up_w.close()
                     cli_r.close()
                     cli_w.close()
+
+    def test_fixed_length_sse_finishes_immediately_when_buffered_without_done_or_eof(
+        self,
+    ) -> None:
+        stop_up = threading.Event()
+        up_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        up_srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        up_srv.bind(("127.0.0.1", 0))
+        up_srv.listen(8)
+        up_srv.settimeout(0.2)
+        up_port = up_srv.getsockname()[1]
+
+        sse_body = (
+            "data: "
+            + json.dumps(
+                {
+                    "id": "chatcmpl-fixed",
+                    "object": "chat.completion.chunk",
+                    "model": "m-fixed",
+                    "choices": [
+                        {"index": 0, "delta": {"content": "hello"}, "finish_reason": None}
+                    ],
+                }
+            )
+            + "\n\n"
+            + "data: "
+            + json.dumps(
+                {
+                    "id": "chatcmpl-fixed",
+                    "object": "chat.completion.chunk",
+                    "model": "m-fixed",
+                    "choices": [
+                        {"index": 0, "delta": {"content": " world"}, "finish_reason": "stop"}
+                    ],
+                }
+            )
+            + "\n\n"
+        ).encode("utf-8")
+
+        def _handle(conn: socket.socket) -> None:
+            try:
+                conn.settimeout(2.0)
+                buf = b""
+                while b"\r\n\r\n" not in buf:
+                    p = conn.recv(4096)
+                    if not p:
+                        return
+                    buf += p
+                hdr = buf.split(b"\r\n\r\n", 1)[0].decode("latin1")
+                if hdr.startswith("GET /v1/models"):
+                    body = b'{"object":"list","data":[{"id":"m-fixed","object":"model"}]}'
+                    conn.sendall(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                        + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode("ascii")
+                        + body
+                    )
+                    return
+                # Send fixed-length SSE body with finish_reason="stop" and NO [DONE],
+                # then keep the TCP socket open well past request_timeout_s.
+                conn.sendall(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: text/event-stream\r\n"
+                    + f"Content-Length: {len(sse_body)}\r\n\r\n".encode("ascii")
+                    + sse_body
+                )
+                stop_up.wait(timeout=3.0)
+            except OSError:
+                pass
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+        def _accept() -> None:
+            while not stop_up.is_set():
+                try:
+                    c, _ = up_srv.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                threading.Thread(target=_handle, args=(c,), daemon=True).start()
+
+        up_thread = threading.Thread(target=_accept, daemon=True)
+        up_thread.start()
+        try:
+            cfg = RouterConfig(
+                host="127.0.0.1",
+                port=0,
+                request_timeout_s=1.5,
+                backends=[
+                    BackendConfig(
+                        id="fixed-sse-b",
+                        base_url=f"http://127.0.0.1:{up_port}/v1",
+                        models=["m-fixed"],
+                    )
+                ],
+            )
+            router = self._track(create_router_server(cfg))
+            rport = router.server_address[1]
+
+            t0 = time.monotonic()
+            st, _, bd = _http_request(
+                rport,
+                "POST",
+                "/v1/chat/completions",
+                body={
+                    "model": "m-fixed",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+            elapsed = time.monotonic() - t0
+            self.assertEqual(st, 200)
+            self.assertLess(elapsed, 0.6)
+            self.assertIn(b"hello", bd)
+            self.assertIn(b" world", bd)
+            self.assertNotIn(b"upstream_stream_interrupted", bd)
+            _, health = router.engine.health_payload()
+            self.assertEqual(health["active_inflight"], 0)
+            self.assertTrue(router.engine._backends[0].healthy)
+            self.assertEqual(router.engine._backends[0].cooldown_until_monotonic, 0.0)
+        finally:
+            stop_up.set()
+            try:
+                up_srv.close()
+            except OSError:
+                pass
+            up_thread.join(timeout=2.0)
+
+    def test_http_1_0_sse_request_uses_close_delimited_framing_not_chunked(
+        self,
+    ) -> None:
+        backend = self._track(_MockOpenAIBackend("http10-sse-b", ["m-http10"]))
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            backends=[
+                BackendConfig(
+                    id="http10-sse-b",
+                    base_url=backend.base_url,
+                    models=["m-http10"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        req_body = json.dumps(
+            {
+                "model": "m-http10",
+                "stream": True,
+                "messages": [{"role": "user", "content": "hello 1.0"}],
+            }
+        ).encode("utf-8")
+        sock = socket.create_connection(("127.0.0.1", rport), timeout=3.0)
+        try:
+            sock.sendall(
+                (
+                    f"POST /v1/chat/completions HTTP/1.0\r\n"
+                    f"Host: 127.0.0.1:{rport}\r\n"
+                    f"Content-Type: application/json\r\n"
+                    f"Content-Length: {len(req_body)}\r\n\r\n"
+                ).encode("ascii")
+                + req_body
+            )
+            chunks: List[bytes] = []
+            while True:
+                part = sock.recv(4096)
+                if not part:
+                    break
+                chunks.append(part)
+            raw_resp = b"".join(chunks)
+        finally:
+            sock.close()
+
+        hdr_raw, body_raw = raw_resp.split(b"\r\n\r\n", 1)
+        hdr_lower = hdr_raw.decode("latin1").lower()
+        self.assertIn("200 ok", hdr_lower)
+        self.assertNotIn("transfer-encoding", hdr_lower)
+        self.assertIn("connection: close", hdr_lower)
+        self.assertTrue(body_raw.startswith(b"data: "), f"Unexpected chunk framing: {body_raw[:64]!r}")
+        self.assertTrue(body_raw.endswith(b"data: [DONE]\n\n"))
+        self.assertNotIn(b"\r\n0\r\n\r\n", body_raw)
+
+    def test_prometheus_parser_handles_leading_trailing_dot_and_lowercase_nan(
+        self,
+    ) -> None:
+        # Leading dot (.97) triggers HBM OOM risk (>= 0.95).
+        hbm_text = (
+            "freetpu_exporter_up 1\n"
+            "freetpu_tpu_devices_discovered 1\n"
+            'freetpu_tpu_health_status{chip="0"} 1\n'
+            'freetpu_tpu_hbm_utilization_ratio{chip="0"} .97\n'
+        )
+        telem_hbm = summarize_tpu_samples(parse_prometheus_text(hbm_text))
+        self.assertAlmostEqual(telem_hbm.max_hbm_utilization_ratio or 0.0, 0.97, places=6)
+        ready_hbm, reason_hbm = evaluate_tpu_readiness(telem_hbm, max_hbm_utilization=0.95)
+        self.assertFalse(ready_hbm)
+        self.assertEqual(reason_hbm, "tpu_hbm_oom_risk")
+
+        # Trailing dot (97.) triggers duty-cycle overload (>= 95.0).
+        duty_text = (
+            "freetpu_exporter_up 1\n"
+            "freetpu_tpu_devices_discovered 1\n"
+            'freetpu_tpu_health_status{chip="0"} 1\n'
+            'freetpu_tpu_duty_cycle_percent{chip="0"} 97.\n'
+        )
+        telem_duty = summarize_tpu_samples(parse_prometheus_text(duty_text))
+        self.assertAlmostEqual(telem_duty.max_duty_cycle_percent or 0.0, 97.0, places=6)
+        ready_duty, reason_duty = evaluate_tpu_readiness(
+            telem_duty, max_duty_cycle_percent=95.0
+        )
+        self.assertFalse(ready_duty)
+        self.assertEqual(reason_duty, "tpu_duty_cycle_overloaded")
+
+        # Lowercase nan and -inf are preserved as non-finite -> invalid metrics.
+        for bad_val in ("nan", "-inf", "+Inf"):
+            bad_text = (
+                "freetpu_exporter_up 1\n"
+                "freetpu_tpu_devices_discovered 1\n"
+                'freetpu_tpu_health_status{chip="0"} 1\n'
+                f'freetpu_tpu_duty_cycle_percent{{chip="0"}} {bad_val}\n'
+            )
+            telem_bad = summarize_tpu_samples(parse_prometheus_text(bad_text))
+            ready_bad, reason_bad = evaluate_tpu_readiness(telem_bad)
+            self.assertFalse(ready_bad)
+            self.assertEqual(reason_bad, "tpu_exporter_invalid_metrics")
 
 
 def run_self_tests(verbosity: int = 1) -> int:

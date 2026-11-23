@@ -45,7 +45,7 @@ _KNOWN_TPU_METRICS = frozenset(
 )
 
 _METRIC_LINE_RE = re.compile(
-    r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?\s+([+-]?(?:[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|NaN|[+-]?Inf))(?:\s+[0-9]+)?$"
+    r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?\s+(\S+)(?:\s+[+-]?[0-9]+)?$"
 )
 _LABEL_RE = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"')
 
@@ -98,6 +98,8 @@ def parse_prometheus_text(text: str) -> List[PromSample]:
         if not match:
             continue
         name, label_str, val_str = match.group(1), match.group(2), match.group(3)
+        if "_" in val_str:
+            continue
         try:
             value = float(val_str)
         except ValueError:

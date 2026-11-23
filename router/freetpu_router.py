@@ -1880,6 +1880,7 @@ class _SSEReactorTask:
         "raw_buf",
         "write_buf",
         "chunked",
+        "chunked_downstream",
         "chunk_left",
         "remaining_content_length",
         "max_event_bytes",
@@ -1927,6 +1928,7 @@ class _SSEReactorTask:
         on_event_fn: Callable[[str, List[bytes]], Tuple[bool, bool]],
         event_data_lines: List[bytes],
         current_event_type: str,
+        chunked_downstream: bool = True,
         max_write_buf_bytes: Optional[int] = None,
         write_timeout_s: Optional[float] = None,
     ) -> None:
@@ -1937,6 +1939,7 @@ class _SSEReactorTask:
         self.raw_buf = raw_buf
         self.write_buf = bytearray()
         self.chunked = chunked
+        self.chunked_downstream = chunked_downstream
         self.chunk_left = chunk_left
         self.remaining_content_length = remaining_content_length
         self.max_event_bytes = max_event_bytes
@@ -2282,7 +2285,11 @@ class _SSEReactor:
             task.scan_pos -= flush_end
             task.event_start -= flush_end
             self._release_mem(task, flush_end)
-            framed = f"{flush_end:x}\r\n".encode("ascii") + payload + b"\r\n"
+            framed = (
+                f"{flush_end:x}\r\n".encode("ascii") + payload + b"\r\n"
+                if task.chunked_downstream
+                else payload
+            )
             if not self._enqueue_client_write(task, framed):
                 return
 
@@ -2464,6 +2471,8 @@ class _SSEReactor:
                 task.upstream_sock.setblocking(False)
                 if task.chunked and task.raw_buf:
                     self._decode_chunked(task)
+                elif not task.chunked and task.remaining_content_length == 0:
+                    task.eof = True
                 self._process_sse_buf(task)
                 if task.downstream_write_error or (
                     task.upstream_done and not task.write_buf
@@ -4058,10 +4067,30 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                     event_data_lines.append(data_val)
                 return False
 
+            def _supports_chunked_transfer(version: str) -> bool:
+                if not version.startswith("HTTP/"):
+                    return False
+                parts = version[5:].split(".", 1)
+                if len(parts) != 2:
+                    return False
+                try:
+                    return (int(parts[0]), int(parts[1])) >= (1, 1)
+                except ValueError:
+                    return False
+
+            use_chunked_downstream = _supports_chunked_transfer(
+                str(getattr(self, "request_version", "HTTP/1.1"))
+            )
+
             def write_chunk(data: bytes) -> None:
                 if not data:
                     return
-                self.connection.sendall(f"{len(data):x}\r\n".encode("ascii") + data + b"\r\n")
+                if use_chunked_downstream:
+                    self.connection.sendall(
+                        f"{len(data):x}\r\n".encode("ascii") + data + b"\r\n"
+                    )
+                else:
+                    self.connection.sendall(data)
 
             self.close_connection = True
             _, acao = self._resolve_cors_header()
@@ -4075,7 +4104,8 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 )
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("X-Accel-Buffering", "no")
-                self.send_header("Transfer-Encoding", "chunked")
+                if use_chunked_downstream:
+                    self.send_header("Transfer-Encoding", "chunked")
                 self._send_cors_headers(acao)
                 self.send_header("Connection", "close")
                 self.send_header("X-FreeTPU-Backend", backend.config.id)
@@ -4135,6 +4165,14 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         finally:
                             if isinstance(upstream_sock, DeadlineSocket):
                                 upstream_sock._buffered_peek_only = False
+                    if (
+                        use_reactor
+                        and not resp.chunked
+                        and resp.status not in (204, 304)
+                        and not (100 <= resp.status < 200)
+                        and resp.length is not None
+                    ):
+                        fp_extra = fp_extra[: max(0, resp.length)]
                     if use_reactor and fp_extra:
                         if not engine.try_reserve_response_memory(len(fp_extra)):
                             memory_limit_exceeded = True
@@ -4177,6 +4215,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                             on_event_fn=process_sse_event_from,
                             event_data_lines=event_data_lines,
                             current_event_type=current_event_type,
+                            chunked_downstream=use_chunked_downstream,
                         )
                         reactor.submit(task)
                         task.done_event.wait()
@@ -4186,6 +4225,14 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         size_limit_exceeded = task.size_limit_exceeded
                         memory_limit_exceeded = task.memory_limit_exceeded
                 if not use_reactor and not memory_limit_exceeded and not downstream_write_error:
+                    if (
+                        not resp.chunked
+                        and resp.status not in (204, 304)
+                        and not (100 <= resp.status < 200)
+                        and resp.length is not None
+                        and resp.length <= 0
+                    ):
+                        phase2_eof = True
                     phase2_buf = bytearray(rem_bytes)
                     scan_pos = 0
                     event_start = 0
@@ -4386,7 +4433,8 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         write_chunk(err_event)
                         self.wfile.flush()
                     else:
-                        self.wfile.write(b"0\r\n\r\n")
+                        if use_chunked_downstream:
+                            self.wfile.write(b"0\r\n\r\n")
                         self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     downstream_write_error = True
