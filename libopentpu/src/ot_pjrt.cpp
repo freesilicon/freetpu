@@ -837,6 +837,7 @@ bool is_supported_dense_layout(const PJRT_Buffer_MemoryLayout* layout,
   if (layout->type == PJRT_Buffer_MemoryLayout_Type_Tiled) {
     if (layout->tiled.num_tiles != 0) return false;
     if (layout->tiled.minor_to_major_size != num_dims) return false;
+    if (num_dims > 0 && !layout->tiled.minor_to_major) return false;
     for (size_t i = 0; i < num_dims; ++i) {
       int64_t expected_dim = static_cast<int64_t>(num_dims - 1 - i);
       if (layout->tiled.minor_to_major[i] != expected_dim) return false;

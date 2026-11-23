@@ -183,7 +183,14 @@ ot_status_t ot_buffer_alloc(ot_context_t* ctx, size_t size_bytes, ot_buffer_t** 
   buf->is_mock = (ctx->info.is_mock != 0u);
   buf->owner_pid = ctx->transport.owner_pid;
   if (ctx->info.is_mock) {
-    buf->mock_data.assign(size_bytes, 0);
+    if (hbm_addr > ctx->transport.mock_hbm.size() ||
+        size_bytes > ctx->transport.mock_hbm.size() - hbm_addr) {
+      ctx->transport.hbm_alloc.free(hbm_addr);
+      delete buf;
+      ctx->last_error = "Mock HBM backing store out of bounds";
+      return OT_ERR_NO_MEMORY;
+    }
+    std::memset(ctx->transport.mock_hbm.data() + hbm_addr, 0, size_bytes);
   }
   ctx->live_buffers.push_back(buf);
   *out_buf = buf;
@@ -238,10 +245,13 @@ ot_status_t buffer_h2d_offset(ot_context_t* ctx, ot_buffer_t* dst, size_t dst_of
     return OT_ERR_DEVICE;
   }
   if (ctx->info.is_mock) {
-    std::memcpy(dst->mock_data.data() + dst_offset, host_src, size_bytes);
-    if (dst->hbm_addr + dst_offset + size_bytes <= ctx->transport.mock_hbm.size()) {
-      std::memcpy(ctx->transport.mock_hbm.data() + dst->hbm_addr + dst_offset, host_src, size_bytes);
+    if (dst->hbm_addr > ctx->transport.mock_hbm.size() ||
+        dst_offset > ctx->transport.mock_hbm.size() - dst->hbm_addr ||
+        size_bytes > ctx->transport.mock_hbm.size() - dst->hbm_addr - dst_offset) {
+      ctx->last_error = "Mock HBM H2D range out of bounds";
+      return OT_ERR_DEVICE;
     }
+    std::memcpy(ctx->transport.mock_hbm.data() + dst->hbm_addr + dst_offset, host_src, size_bytes);
     return OT_OK;
   }
 
@@ -316,11 +326,12 @@ ot_status_t ot_buffer_d2h(ot_context_t* ctx, const ot_buffer_t* src,
     return OT_ERR_DEVICE;
   }
   if (ctx->info.is_mock) {
-    if (src->hbm_addr + size_bytes <= ctx->transport.mock_hbm.size()) {
-      std::memcpy(host_dst, ctx->transport.mock_hbm.data() + src->hbm_addr, size_bytes);
-    } else {
-      std::memcpy(host_dst, src->mock_data.data(), size_bytes);
+    if (src->hbm_addr > ctx->transport.mock_hbm.size() ||
+        size_bytes > ctx->transport.mock_hbm.size() - src->hbm_addr) {
+      ctx->last_error = "Mock HBM D2H range out of bounds";
+      return OT_ERR_DEVICE;
     }
+    std::memcpy(host_dst, ctx->transport.mock_hbm.data() + src->hbm_addr, size_bytes);
     return OT_OK;
   }
 

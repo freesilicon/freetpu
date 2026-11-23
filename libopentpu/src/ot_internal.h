@@ -154,8 +154,6 @@ struct ot_buffer {
   uint64_t hbm_addr = 0;
   bool is_mock = false;
   int64_t owner_pid = 0;
-  // Mock host mirror when running offline
-  std::vector<uint8_t> mock_data;
 };
 
 struct ot_context {
