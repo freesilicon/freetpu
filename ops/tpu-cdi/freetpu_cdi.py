@@ -973,6 +973,49 @@ def _is_supported_single_host_chip_count(
     return physical_chip_count in allowed
 
 
+def _is_supported_all_topology(
+    chips: Sequence[DiscoveredChip],
+    bdf_to_phys: Dict[str, int],
+    generations: Sequence[str],
+) -> bool:
+    """Return True iff the live `all` chip set forms a verified single-host topology.
+
+    Prevents injecting single-host bounds/accelerator-type overrides (such as
+    `TPU_CHIPS_PER_HOST_BOUNDS=2,2,1` / `TPU_ACCELERATOR_TYPE=v6e-4`) onto a
+    degraded cross-root set (e.g. a v6e-8 degraded to 3+1 or 2+2 chips across
+    its two NUMA roots, where a supported v6e-4 2x2 slice must sit within one
+    NUMA/PCIe root domain).
+    """
+    if not chips or not _has_complete_chip_functions(chips, bdf_to_phys):
+        return False
+    n_chips = len(_distinct_physical_indices(chips, bdf_to_phys))
+    if not _is_supported_single_host_chip_count(n_chips, generations):
+        return False
+
+    domains: Dict[Tuple[str, Optional[int], str], List[DiscoveredChip]] = {}
+    for c in chips:
+        domains.setdefault(_topology_domain_key(c), []).append(c)
+    domain_phys_counts = sorted(
+        len(_distinct_physical_indices(d_chips, bdf_to_phys))
+        for d_chips in domains.values()
+    )
+
+    norm_gens = {"v6e" if g == "v6e-pf" else g for g in generations if g}
+    gen = next(iter(norm_gens))
+
+    if n_chips == 1:
+        return domain_phys_counts == [1]
+    if n_chips == 2:
+        return domain_phys_counts == [2]
+    if n_chips == 4:
+        if gen == "tpu7x":
+            return domain_phys_counts in ([4], [2, 2])
+        return domain_phys_counts == [4]
+    if n_chips == 8:
+        return domain_phys_counts in ([8], [4, 4])
+    return False
+
+
 def _has_complete_chip_functions(
     subset: Sequence[DiscoveredChip],
     bdf_to_phys: Dict[str, int],
@@ -1237,7 +1280,7 @@ def _compute_topology_slices(
     for chip in chips:
         domains.setdefault(_topology_domain_key(chip), []).append(chip)
 
-    if len(domains) < 2:
+    if not domains:
         return []
 
     used_names = set(reserved_names or ())
@@ -1258,7 +1301,7 @@ def _compute_topology_slices(
 
     slices: List[_TopologySlice] = []
     for dom_ordinal, (d_key, d_chips) in enumerate(domains.items()):
-        if len(d_chips) < 2 or len(d_chips) >= len(chips):
+        if len(d_chips) < 2:
             continue
         if any(
             len(group_to_domains.get(c.iommu_group, set())) > 1 for c in d_chips
@@ -1565,7 +1608,7 @@ def build_cdi_spec(
             )
 
     all_phys_indices = _distinct_physical_indices(chips, bdf_to_phys)
-    all_complete = _has_complete_chip_functions(chips, bdf_to_phys)
+    all_supported_topology = _is_supported_all_topology(chips, bdf_to_phys, all_generations)
     all_visibility = _resolve_verified_visibility_ordinals(
         chips,
         chips,
@@ -1590,7 +1633,7 @@ def build_cdi_spec(
         len(all_phys_indices),
         all_generations,
         single_host_env=inject_single_host_env,
-        include_bounds_env=all_complete,
+        include_bounds_env=all_supported_topology,
         verified_visibility=all_visibility,
     )
     all_edits: Dict[str, Any] = {"deviceNodes": list(seen_group_nodes.values())}

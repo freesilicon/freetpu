@@ -2782,6 +2782,75 @@ class FreeTpuCdiTests(unittest.TestCase):
                     [],
                 )
 
+                # Losing EVERY PCI function on NUMA 0 (`0000:00`) leaves only NUMA 1's
+                # 4 healthy chips (`0000:80`). `sync` MUST preserve `numa1-4` and its
+                # verified `4-7` range alias so surviving DRA/Docker consumers keep
+                # running, while withdrawing `numa0-4` / `0-3`!
+                lost_root0_sys, lost_root0_dev = _make_mock_pci_vfio(
+                    root / "v6e8_lost_entire_numa0",
+                    devices=v6e8_verified[4:],  # NUMA 0 completely gone; NUMA 1 intact (4..7)
+                    create_vfio_nodes=[str(i) for i in range(4, 8)],
+                )
+                lost_root0_out = root / "v6e8_lost_entire_numa0.json"
+                ok_lr0, msg_lr0 = freetpu_cdi.reconcile_cdi_spec(
+                    lost_root0_out,
+                    sysfs_root=lost_root0_sys,
+                    dev_root=lost_root0_dev,
+                    single_host_env=True,
+                )
+                self.assertTrue(ok_lr0, msg_lr0)
+                lr0_spec = json.loads(lost_root0_out.read_text(encoding="utf-8"))
+                lr0_by_name = {d["name"]: d for d in lr0_spec["devices"]}
+                self.assertNotIn("numa0-4", lr0_by_name)
+                self.assertNotIn("0-3", lr0_by_name)
+                self.assertIn("numa1-4", lr0_by_name)
+                self.assertIn("4-7", lr0_by_name)
+                self.assertEqual(lr0_by_name["numa1-4"]["annotations"]["freetpu.dev/pcie-root"], "0000:80")
+                self.assertEqual(lr0_by_name["numa1-4"]["annotations"]["freetpu.dev/numa-node"], "1")
+                lr0_n1_env = dict(
+                    kv.split("=", 1) for kv in lr0_by_name["numa1-4"]["containerEdits"]["env"]
+                )
+                self.assertEqual(lr0_n1_env["TPU_CHIPS_PER_HOST_BOUNDS"], "2,2,1")
+                self.assertEqual(lr0_n1_env["TPU_ACCELERATOR_TYPE"], "v6e-4")
+                self.assertEqual(lr0_n1_env["TPU_VISIBLE_CHIPS"], "4,5,6,7")
+                self.assertEqual(lr0_n1_env["TPU_VISIBLE_DEVICES"], "4,5,6,7")
+
+                # Degraded v6e-8 with 4 surviving chips split cross-root (3 on NUMA 0 +
+                # 1 on NUMA 1, OR 2 on NUMA 0 + 2 on NUMA 1): `all` MUST NOT inject
+                # `TPU_CHIPS_PER_HOST_BOUNDS=2,2,1` or `TPU_ACCELERATOR_TYPE=v6e-4`
+                # because a valid v6e-4 2x2 slice must reside within one NUMA/PCIe root!
+                for label, subset_indices in (
+                    ("split_3_1", [0, 1, 2, 4]),
+                    ("split_2_2", [0, 1, 4, 5]),
+                ):
+                    split_sys, split_dev = _make_mock_pci_vfio(
+                        root / f"v6e8_degraded_{label}",
+                        devices=[v6e8_verified[i] for i in subset_indices],
+                        create_vfio_nodes=[str(i) for i in subset_indices],
+                    )
+                    split_chips, split_ctrl = freetpu_cdi.discover_tpu_chips(
+                        sysfs_root=split_sys, dev_root=split_dev
+                    )
+                    split_spec = freetpu_cdi.build_cdi_spec(
+                        split_chips, split_ctrl, single_host_env=True
+                    )
+                    split_by_name = {d["name"]: d for d in split_spec["devices"]}
+                    self.assertNotIn("numa0-4", split_by_name)
+                    self.assertNotIn("numa1-4", split_by_name)
+                    split_all_env = dict(
+                        kv.split("=", 1) for kv in split_by_name["all"]["containerEdits"]["env"]
+                    )
+                    self.assertNotIn("TPU_CHIPS_PER_HOST_BOUNDS", split_all_env)
+                    self.assertNotIn("TPU_ACCELERATOR_TYPE", split_all_env)
+                    self.assertNotIn("TPU_VISIBLE_CHIPS", split_all_env)
+                    self.assertNotIn("TPU_VISIBLE_DEVICES", split_all_env)
+                    self.assertEqual(
+                        freetpu_cdi.verify_spec_against_host(
+                            split_spec, sysfs_root=split_sys, dev_root=split_dev
+                        ),
+                        [],
+                    )
+
             # Verify tpu7x Ironwood 4-chip VM (8 PCI functions across 0x0076 / 0x0075):
             # all 8 PCI functions remain allocated in VFIO deviceNodes while host bounds
             # use the 4 physical chips (`2,2,1`, NOT `2,4,1`).
