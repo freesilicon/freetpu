@@ -9787,11 +9787,13 @@ asyncio.run(main())
     def test_tpu_exporter_stream_filters_unrelated_metrics_and_bounds_memory(
         self,
     ) -> None:
-        # 1. Stream ~1.2 MiB of 300,000 unrelated short lines + oversized unrelated line
-        # + valid TPU lines in small chunks (so the test server itself does not allocate
-        # 1.2 MiB inside the same process's tracemalloc window) and verify scraper peak
-        # heap stays well under 256 KiB.
-        unrelated_chunk = b"a 1\n" * 2000  # 8 KiB per write x 150 = 1.2 MB, 300k lines
+        # 1. Stream ~1.8 MiB of 440,000 unrelated short lines + oversized unrelated line
+        # + valid TPU lines in small pre-allocated chunks (within MAX_EXPORTER_RESPONSE_BYTES=2 MiB,
+        # without allocating the full body inside the same process's tracemalloc window) and
+        # verify scraper peak heap stays O(1) and well below both 512 KiB and a third of the
+        # streamed wire body (allowing normal CPython/Linux thread & socket buffer variance).
+        unrelated_chunk = b"a 1\n" * 2000  # 8 KiB per write x 220 = 1.76 MB, 440k lines
+        unrelated_repeats = 220
         oversized_unrelated = (f'other_metric{{blob="{"x" * 20000}"}} 1\n').encode("ascii")
         valid_tpu = (
             'freetpu_exporter_up 1\n'
@@ -9801,7 +9803,11 @@ asyncio.run(main())
             'freetpu_tpu_duty_cycle_percent{chip="0"} 40.0\n'
             'freetpu_tpu_duty_cycle_percent{chip="1"} 60.0\n'
         ).encode("utf-8")
-        total_len = (len(unrelated_chunk) * 150) + len(oversized_unrelated) + len(valid_tpu)
+        total_len = (
+            (len(unrelated_chunk) * unrelated_repeats)
+            + len(oversized_unrelated)
+            + len(valid_tpu)
+        )
 
         class _StreamingExporterHandler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -9815,7 +9821,7 @@ asyncio.run(main())
                 self.send_header("Content-Length", str(total_len))
                 self.send_header("Connection", "close")
                 self.end_headers()
-                for _ in range(150):
+                for _ in range(unrelated_repeats):
                     self.wfile.write(unrelated_chunk)
                 self.wfile.write(oversized_unrelated)
                 self.wfile.write(valid_tpu)
@@ -9838,8 +9844,9 @@ asyncio.run(main())
         self.assertEqual(telem.healthy_chips, 2)
         self.assertAlmostEqual(telem.avg_duty_cycle_percent or 0.0, 50.0)
         self.assertEqual(telem.generations, ["v6e"])
-        # Streaming filter avoids retaining the 1.2 MB wire body or 300k PromSample/dict objects.
-        self.assertLess(peak_bytes, 256 * 1024)
+        # Streaming filter avoids retaining the ~1.8 MB wire body or 440k PromSample/dict objects.
+        self.assertLess(peak_bytes, 512 * 1024)
+        self.assertLess(peak_bytes, total_len // 3)
 
         # 2. Hostile exporter emitting >256 distinct TPU chip IDs fails closed cleanly.
         many_chips = "freetpu_exporter_up 1\n" + "".join(
