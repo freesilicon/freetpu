@@ -6483,8 +6483,8 @@ void test_ironwood_d2d_pairing_and_sdy_mesh() {
         CHECK_TRUE(rt.query_memory_stats(0, &f0, &t0) && t0 == (96ULL << 30),
                    "tpu7x-1t 96 GiB/logical chiplet HBM3e");
         const auto sdy1 = cloudtpu::format_sdy_mesh_op(2, rt.d2d_group_size(), {0, 1});
-        CHECK_TRUE(sdy1.find("sdy.mesh @mesh = <[\"package\"=1, \"d2d\"=2]>") != std::string::npos,
-                   "tpu7x-1t sdy.mesh syntax");
+        CHECK_TRUE(sdy1 == "sdy.mesh @mesh = <[\"package\"=1, \"d2d\"=2]>",
+                   "tpu7x-1t identity sdy.mesh omits device_ids");
     }
 
     // 2. tpu7x-4t with scrambled device enumeration: PjrtRuntime must reconstruct
@@ -6559,8 +6559,10 @@ void test_ironwood_d2d_pairing_and_sdy_mesh() {
         spec.ops = {ar};
         spec.output_ids = {2};
         const auto prog = cloudtpu::emit_stablehlo_program(spec);
-        CHECK_TRUE(prog.mlir_text.find("sdy.mesh @mesh = <[\"ici\"=4, \"d2d\"=2]>") != std::string::npos,
-                   "tpu7x-4t sdy.mesh emission");
+        CHECK_TRUE(prog.mlir_text.find(
+                       "sdy.mesh @mesh = <[\"ici\"=4, \"d2d\"=2], device_ids=[0, 1, 2, 3, 6, 7, 4, 5]>") !=
+                       std::string::npos,
+                   "tpu7x-4t non-identity sdy.mesh encodes device_ids=[0, 1, 2, 3, 6, 7, 4, 5]");
 
         const auto exec = rt.compile_or_get(prog.cache_key, prog.mlir_text, 0, copts);
         std::vector<cloudtpu::PjrtBufferPtr> bufs(8);
@@ -6581,6 +6583,39 @@ void test_ironwood_d2d_pairing_and_sdy_mesh() {
             CHECK_NEAR(got[static_cast<size_t>(k)], 36.0f, 1e-4f, "tpu7x-4t D2D AllReduce sum 1..8=36");
         }
         rt.shutdown();
+    }
+
+    // 3. Named Host Mock profile dictates its documented device count even when CLOUDTPU_MOCK_DEVICES conflicts.
+    {
+        cloudtpu::RuntimeConfig cfg;
+        cfg.mock_mode = true;
+        cfg.mock_devices = 4;  // Conflicting count
+        cfg.mock_profile = cloudtpu::MockTopologyProfile::TPU7X_4T;
+        cloudtpu::PjrtRuntime rt;
+        rt.init(cfg);
+        CHECK_TRUE(rt.device_count() == 8,
+                   "Named profile tpu7x-4t overrides conflicting mock_devices=4 to 8 logical chiplets");
+        rt.shutdown();
+
+        const char* prev_devs_raw = std::getenv("CLOUDTPU_MOCK_DEVICES");
+        const char* prev_prof_raw = std::getenv("CLOUDTPU_MOCK_PROFILE");
+        const bool had_devs = (prev_devs_raw != nullptr);
+        const bool had_prof = (prev_prof_raw != nullptr);
+        const std::string prev_devs = had_devs ? prev_devs_raw : "";
+        const std::string prev_prof = had_prof ? prev_prof_raw : "";
+        setenv("CLOUDTPU_MOCK_DEVICES", "4", 1);
+        setenv("CLOUDTPU_MOCK_PROFILE", "tpu7x-4t", 1);
+        cloudtpu::RuntimeConfig env_cfg;
+        env_cfg.mock_mode = true;
+        cloudtpu::PjrtRuntime env_rt;
+        env_rt.init(env_cfg);
+        CHECK_TRUE(env_rt.device_count() == 8,
+                   "Env CLOUDTPU_MOCK_PROFILE=tpu7x-4t overrides CLOUDTPU_MOCK_DEVICES=4 to 8 logical chiplets");
+        env_rt.shutdown();
+        if (had_prof) setenv("CLOUDTPU_MOCK_PROFILE", prev_prof.c_str(), 1);
+        else unsetenv("CLOUDTPU_MOCK_PROFILE");
+        if (had_devs) setenv("CLOUDTPU_MOCK_DEVICES", prev_devs.c_str(), 1);
+        else unsetenv("CLOUDTPU_MOCK_DEVICES");
     }
     std::printf("  [PASS] Ironwood tpu7x dual-chiplet D2D Hamiltonian pairing & Shardy sdy.mesh\n");
 }

@@ -891,8 +891,10 @@ bool VfioTransport::open_device(const ot_config_t& cfg, ot_device_info_t* info, 
   info->iommu_group = pci.iommu_group;
   if (pci.device_id == 0x0063u) {
     info->chip_gen = OT_CHIP_V5E;
-  } else if (pci.device_id == 0x006fu) {
+  } else if (pci.device_id == 0x006fu || pci.device_id == 0x006eu) {
     info->chip_gen = OT_CHIP_V6E;
+  } else if (pci.device_id == 0x0075u || pci.device_id == 0x0076u) {
+    info->chip_gen = OT_CHIP_TPU7X;
   } else {
     info->chip_gen = OT_CHIP_UNKNOWN;
   }

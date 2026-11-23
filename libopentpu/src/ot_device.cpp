@@ -566,7 +566,7 @@ bool chip_geometry_for_device_id(uint16_t device_id, ot_device_geometry_t* out) 
       out->vmem_bytes_per_logical_chiplet = 128ULL << 20;
       out->smem_bytes_per_logical_chiplet = 1ULL << 20;
       return true;
-    case 0x006fu:  // Cloud TPU v6e Trillium (single chiplet, 256x256 MXU, 32 GiB HBM)
+    case 0x006fu:  // Cloud TPU v6e Trillium (single chiplet, 1 TensorCore, 2x 256x256 MXU, 32 GiB HBM)
     case 0x006eu:
       out->chip_gen = OT_CHIP_V6E;
       out->mxu_rows = 256u;
@@ -574,13 +574,14 @@ bool chip_geometry_for_device_id(uint16_t device_id, ot_device_geometry_t* out) 
       out->fp8_inner_rows = 0u;
       out->fp8_inner_cols = 0u;
       out->logical_chiplets_per_pci_func = 1u;
-      out->num_mxus_per_logical_chiplet = 4u;
+      out->num_mxus_per_logical_chiplet = 2u;
       out->supports_native_fp8 = 0u;
       out->hbm_bytes_per_logical_chiplet = 32ULL << 30;
       out->vmem_bytes_per_logical_chiplet = 128ULL << 20;
       out->smem_bytes_per_logical_chiplet = 1ULL << 20;
       return true;
-    case 0x0075u:  // Provisional Ironwood tpu7x (dual-chiplet, 256x256 MXU + (4,1) FP8 inner tile, 96 GiB/chiplet)
+    case 0x0075u:  // Ironwood tpu7x (dual-chiplet, 256x256 MXU + (4,1) FP8 inner tile, 96 GiB HBM, 64 MiB VMEM/chiplet)
+    case 0x0076u:  // Documented Cloud TPU v7x (Ironwood) guest VM VFIO PCI Device ID
       out->chip_gen = OT_CHIP_TPU7X;
       out->mxu_rows = 256u;
       out->mxu_cols = 256u;
@@ -590,7 +591,7 @@ bool chip_geometry_for_device_id(uint16_t device_id, ot_device_geometry_t* out) 
       out->num_mxus_per_logical_chiplet = 4u;
       out->supports_native_fp8 = 1u;
       out->hbm_bytes_per_logical_chiplet = 96ULL << 30;
-      out->vmem_bytes_per_logical_chiplet = 128ULL << 20;
+      out->vmem_bytes_per_logical_chiplet = 64ULL << 20;
       out->smem_bytes_per_logical_chiplet = 1ULL << 20;
       return true;
     default:

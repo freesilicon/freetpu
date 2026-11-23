@@ -99,10 +99,8 @@ if [[ "${MOCK_MODE}" -eq 1 ]]; then
 fi
 
 BIN_DIR="${REPO_ROOT}/llama-cpp-cloudtpu/build-host/bin"
-if [[ ! -x "${BIN_DIR}/test-backend-ops" || ! -x "${BIN_DIR}/llama-bench" ]]; then
-  log "--- Building llama-cpp-cloudtpu host overlay ---"
-  "${REPO_ROOT}/llama-cpp-cloudtpu/build.sh" host 2>&1 | tee -a "${LOG}"
-fi
+log "--- Building/refreshing llama-cpp-cloudtpu host overlay ---"
+"${REPO_ROOT}/llama-cpp-cloudtpu/build.sh" host 2>&1 | tee -a "${LOG}"
 
 log "--- Standalone Host Check & MAPS_LIBPYTHON=0 Proof ---"
 "${REPO_ROOT}/llama-cpp-cloudtpu/build.sh" standalone 2>&1 | tee -a "${LOG}"

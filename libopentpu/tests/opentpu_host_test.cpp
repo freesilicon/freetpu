@@ -1590,16 +1590,23 @@ static void test_multigen_hal_geometry_and_rebar() {
   OT_CHECK(ot_chip_geometry_for_device_id(0x006fu, &g6) == OT_OK);
   OT_CHECK(g6.chip_gen == OT_CHIP_V6E);
   OT_CHECK(g6.mxu_rows == 256u && g6.mxu_cols == 256u);
+  OT_CHECK(g6.num_mxus_per_logical_chiplet == 2u);
   OT_CHECK(g6.logical_chiplets_per_pci_func == 1u);
   OT_CHECK(g6.hbm_bytes_per_logical_chiplet == (32ULL << 30));
+  OT_CHECK(ot_chip_geometry_for_device_id(0x006eu, &g6) == OT_OK);
+  OT_CHECK(g6.chip_gen == OT_CHIP_V6E && g6.num_mxus_per_logical_chiplet == 2u);
 
-  OT_CHECK(ot_chip_geometry_for_device_id(0x0075u, &g7) == OT_OK);
-  OT_CHECK(g7.chip_gen == OT_CHIP_TPU7X);
-  OT_CHECK(g7.mxu_rows == 256u && g7.mxu_cols == 256u);
-  OT_CHECK(g7.fp8_inner_rows == 4u && g7.fp8_inner_cols == 1u);
-  OT_CHECK(g7.supports_native_fp8 == 1u);
-  OT_CHECK(g7.logical_chiplets_per_pci_func == 2u);
-  OT_CHECK(g7.hbm_bytes_per_logical_chiplet == (96ULL << 30));
+  for (uint16_t did7 : {static_cast<uint16_t>(0x0075u), static_cast<uint16_t>(0x0076u)}) {
+    OT_CHECK(ot_chip_geometry_for_device_id(did7, &g7) == OT_OK);
+    OT_CHECK(g7.chip_gen == OT_CHIP_TPU7X);
+    OT_CHECK(g7.pci_device_id == did7);
+    OT_CHECK(g7.mxu_rows == 256u && g7.mxu_cols == 256u);
+    OT_CHECK(g7.fp8_inner_rows == 4u && g7.fp8_inner_cols == 1u);
+    OT_CHECK(g7.supports_native_fp8 == 1u);
+    OT_CHECK(g7.logical_chiplets_per_pci_func == 2u);
+    OT_CHECK(g7.hbm_bytes_per_logical_chiplet == (96ULL << 30));
+    OT_CHECK(g7.vmem_bytes_per_logical_chiplet == (64ULL << 20));
+  }
 
   ot_device_geometry_t gbad = {};
   OT_CHECK(ot_chip_geometry_for_device_id(0x9999u, &gbad) == OT_ERR_UNSUPPORTED);
@@ -1637,9 +1644,20 @@ static void test_multigen_hal_geometry_and_rebar() {
   OT_CHECK(info.chip_gen == OT_CHIP_TPU7X && info.device_id == 0x0075u);
   ot_device_geometry_t ctx_geom = {};
   OT_CHECK(ot_device_get_geometry(ctx, &ctx_geom) == OT_OK);
-  OT_CHECK(ctx_geom.logical_chiplets_per_pci_func == 2u && ctx_geom.mxu_rows == 256u);
+  OT_CHECK(ctx_geom.logical_chiplets_per_pci_func == 2u && ctx_geom.mxu_rows == 256u &&
+           ctx_geom.vmem_bytes_per_logical_chiplet == (64ULL << 20));
   ot_context_destroy(ctx);
   unsetenv("OPENTPU_MOCK_CHIP");
+
+  // Guest VM VFIO Ironwood PCI Device ID (0x0076) via OPENTPU_MOCK_DEVICE_ID.
+  setenv("OPENTPU_MOCK_DEVICE_ID", "0x0076", 1);
+  ctx = nullptr;
+  OT_CHECK(ot_context_create(&cfg, &ctx) == OT_OK && ctx != nullptr);
+  OT_CHECK(ot_device_get_info(ctx, &info) == OT_OK);
+  OT_CHECK(info.chip_gen == OT_CHIP_TPU7X && info.device_id == 0x0076u &&
+           info.vmem_bytes == (64ULL << 20));
+  ot_context_destroy(ctx);
+  unsetenv("OPENTPU_MOCK_DEVICE_ID");
 
   printf("[PASS] test_multigen_hal_geometry_and_rebar\n");
 }

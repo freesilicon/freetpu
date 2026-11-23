@@ -41,8 +41,8 @@ struct RebarCapabilityInfo {
 // Parse a 0x1234 hex sysfs attribute safely (no exceptions).
 bool parse_hex_u64(const std::string& text, uint64_t* out);
 
-// HAL geometry lookup across Google Cloud TPU generations (0x0063 v5e, 0x006f v6e,
-// 0x0075 provisional Ironwood tpu7x dual-chiplet). Returns false on unknown device_id.
+// HAL geometry lookup across Google Cloud TPU generations (0x0063 v5e, 0x006e/0x006f v6e,
+// 0x0075/0x0076 Ironwood tpu7x dual-chiplet). Returns false on unknown device_id.
 bool chip_geometry_for_device_id(uint16_t device_id, ot_device_geometry_t* out);
 
 // Clamp a PCI BAR mmap length (e.g. 64-bit Resizable BAR) so large VRAM/HBM apertures

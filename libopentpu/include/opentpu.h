@@ -41,7 +41,7 @@ typedef enum ot_chip_gen {
   OT_CHIP_UNKNOWN = 0,
   OT_CHIP_V5E     = 1, /* PCI 0x1ae0:0x0063 (128x128 MXU, 1 chiplet/package) */
   OT_CHIP_V6E     = 2, /* PCI 0x1ae0:0x006f (256x256 MXU, 1 chiplet/package) */
-  OT_CHIP_TPU7X   = 3  /* PCI 0x1ae0:0x0075 provisional Ironwood (256x256 MXU, dual-chiplet D2D) */
+  OT_CHIP_TPU7X   = 3  /* PCI 0x1ae0:0x0076 / 0x0075 Ironwood (256x256 MXU, dual-chiplet D2D, 64 MiB VMEM/chiplet) */
 } ot_chip_gen_t;
 
 typedef struct ot_device_geometry {

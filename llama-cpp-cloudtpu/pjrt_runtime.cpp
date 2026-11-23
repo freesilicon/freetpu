@@ -2424,14 +2424,22 @@ struct MockClient {
     MockClient(int n_devs,
                MockTopologyProfile profile = MockTopologyProfile::AUTO,
                bool scramble_order = false) {
-        if (profile == MockTopologyProfile::TPU7X_1T && n_devs <= 1) {
-            n_devs = 2;
-        } else if ((profile == MockTopologyProfile::TPU7X_4T ||
-                    profile == MockTopologyProfile::V6E_8) &&
-                   n_devs <= 1) {
-            n_devs = 8;
-        } else if (profile == MockTopologyProfile::V5E_1) {
-            n_devs = 1;
+        int profile_devs = 0;
+        switch (profile) {
+            case MockTopologyProfile::V5E_1:    profile_devs = 1; break;
+            case MockTopologyProfile::TPU7X_1T: profile_devs = 2; break;
+            case MockTopologyProfile::V6E_8:    profile_devs = 8; break;
+            case MockTopologyProfile::TPU7X_4T: profile_devs = 8; break;
+            case MockTopologyProfile::AUTO:     profile_devs = 0; break;
+        }
+        if (profile_devs > 0) {
+            if (n_devs > 1 && n_devs != profile_devs) {
+                std::fprintf(stderr,
+                             "ggml-cloudtpu: CLOUDTPU_MOCK_DEVICES=%d conflicts with named "
+                             "CLOUDTPU_MOCK_PROFILE (expects %d logical devices); using %d\n",
+                             n_devs, profile_devs, profile_devs);
+            }
+            n_devs = profile_devs;
         }
         n_devs = std::max(1, std::min(16, n_devs));
 

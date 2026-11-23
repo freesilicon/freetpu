@@ -36,7 +36,7 @@
 ```
 
 Record from `runs/ironwood-day1/00_pci_vfio_survey.txt`:
-- PCI Vendor/Device ID (`0x1ae0:0x0075` or observed Silicon DID) and physical PCI function count (`4` on `tpu7x-standard-4t`).
+- PCI Vendor/Device ID (`0x1ae0:0x0076` guest VFIO ID / `0x0075` or observed Silicon DID) and physical PCI function count (`4` on `tpu7x-standard-4t`).
 - `BAR0`, `BAR2`, `BAR4` window sizes and PCIe **Resizable BAR** (`0x0015`) capability fields (`current size:` and `supported:` lines).
 - `MSI-X` vector count, `/dev/iommu` (`iommufd`) availability, and `/dev/vfio/*` group viability.
 - Confirm physical-to-logical mapping in PJRT:
@@ -82,7 +82,7 @@ What this captures:
 
 Wait for:
 - `ot_chip_geometry_for_device_id()` & Resizable BAR clamp verification passing (`ALL_HOST_TESTS_PASSED`).
-- Live `/dev/vfio/*` probe confirming zero `libtpu.so` / `libpython` links (`MAPS_LIBTPU=0`, `MAPS_LIBPYTHON=0`) and safe refusal on unvalidated non-`0x0063` ring DMA paths until `0x0075` (or observed DID) doorbell registers are documented cleanly.
+- Live `/dev/vfio/*` probe confirming zero `libtpu.so` / `libpython` links (`MAPS_LIBTPU=0`, `MAPS_LIBPYTHON=0`) and safe refusal on unvalidated non-`0x0063` ring DMA paths until `0x0076` / `0x0075` (or observed DID) doorbell registers are documented cleanly.
 
 ---
 

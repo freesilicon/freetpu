@@ -985,21 +985,33 @@ std::string format_sdy_mesh_op(int32_t num_chips,
     if (d2d_group_size == 2 && n >= 2 && (n % 2) == 0) {
         const int32_t pkgs = n / 2;
         if (pkgs == 1) {
-            oss << "sdy.mesh @mesh = <[\"package\"=1, \"d2d\"=2]>";
+            oss << "sdy.mesh @mesh = <[\"package\"=1, \"d2d\"=2]";
         } else {
-            oss << "sdy.mesh @mesh = <[\"ici\"=" << pkgs << ", \"d2d\"=2]>";
+            oss << "sdy.mesh @mesh = <[\"ici\"=" << pkgs << ", \"d2d\"=2]";
         }
     } else {
-        oss << "sdy.mesh @mesh = <[\"replica\"=" << n << "]>";
+        oss << "sdy.mesh @mesh = <[\"replica\"=" << n << "]";
     }
-    if (!device_ids.empty()) {
-        oss << "  // d2d_device_ids=[";
+    bool is_non_identity = false;
+    if (static_cast<int32_t>(device_ids.size()) == n) {
+        for (int32_t i = 0; i < n; ++i) {
+            if (device_ids[static_cast<size_t>(i)] != static_cast<int64_t>(i)) {
+                is_non_identity = true;
+                break;
+            }
+        }
+    } else if (!device_ids.empty()) {
+        is_non_identity = true;
+    }
+    if (is_non_identity) {
+        oss << ", device_ids=[";
         for (size_t i = 0; i < device_ids.size(); ++i) {
-            if (i > 0) oss << ",";
+            if (i > 0) oss << ", ";
             oss << device_ids[i];
         }
         oss << "]";
     }
+    oss << ">";
     return oss.str();
 }
 
