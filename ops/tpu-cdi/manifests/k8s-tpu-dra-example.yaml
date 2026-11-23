@@ -1,0 +1,224 @@
+# Starter Kubernetes Dynamic Resource Allocation (DRA) manifest (`resource.k8s.io/v1`,
+# stable in Kubernetes 1.34+) for FreeTPU Cloud TPU v6e-8 / v5e-8 sub-host
+# topology-aware partitioning.
+#
+# Key properties:
+# - Uses standard Kubernetes CNI networking (`hostNetwork` omitted / false):
+#   when `freetpu_cdi.py` is run with opt-in `--single-host-env` (or
+#   `--network-mode isolated`), CDI (default v0.6.0, opt-in --cdi-version 1.1.0)
+#   injects MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353, TPU_HOST_BOUNDS=1,1,1,
+#   TPU_WORKER_HOSTNAMES=localhost, TPU_WORKER_ID=0, TPU_SKIP_MDS_QUERY=true,
+#   TPU_CHIPS_PER_HOST_BOUNDS=2,2,1, and TPU_ACCELERATOR_TYPE=v6e-4 on slice
+#   selectors so two independent 4-chip workloads can share one v6e-8 host
+#   without port 8353 collisions or hostNetwork privilege escalation. When sysfs `chip_id` files
+#   are present (or `--chip-id-map <json>` is passed to `freetpu_cdi.py`), CDI
+#   also injects verified TPU_VISIBLE_CHIPS and TPU_VISIBLE_DEVICES (for
+#   multi-process PyTorch/XLA on a sub-host slice, pass `--omit-visible-env`
+#   and use a slice-aware launcher that sets both the process count, e.g.
+#   `PJRT_LOCAL_PROCESS_COUNT=4`, and each rank's actual assigned chip ID such
+#   as `4,5,6,7` rather than bare `xmp.spawn()` which scans all 8 host PCI
+#   devices and assigns zero-based local ranks); on hosts without sysfs
+#   `chip_id` and without `--chip-id-map`, set TPU_VISIBLE_CHIPS and
+#   TPU_VISIBLE_DEVICES explicitly on the Pod container (or pass
+#   `--chip-id-map`). (Without `--single-host-env`, CDI preserves workload env
+#   for multi-host jobs.)
+# - Partitions v6e-8 TPU endpoints along physical NUMA / PCIe root-complex
+#   boundaries (`0000:00` NUMA 0 chips 0..3 vs `0000:80` NUMA 1 chips 4..7)
+#   so the DRA ResourceClaimTemplate selects TPU locality within one NUMA
+#   domain.
+#   CPU/MEMORY NUMA CO-LOCATION NOTE: Kubernetes 1.34's kubelet does NOT
+#   register its DRA manager as a Topology Manager hint provider, so a DRA
+#   claim alone (even with kubelet Topology Manager `single-numa-node`,
+#   static CPU/Memory Manager, and Guaranteed QoS) only selects TPU device
+#   locality—kubelet may still place the Pod's CPUs and memory on another
+#   socket. Co-locating Pod CPU cores and host DMA buffers on the same NUMA
+#   node as the claimed TPU slice requires a separate placement mechanism
+#   (e.g., `numactl`/workload entrypoint affinity, node-level NUMA-aware
+#   scheduling, or an OCI/runtime hook binding cpuset/mems to that NUMA node).
+# - Legacy `/dev/vfio/<group>` (default when usable) and Linux 6.8+ `iommufd`
+#   (`--vfio-mode iommufd` / pure-iommufd fallback) are handled by `freetpu_cdi.py`.
+---
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: freetpu-tpu-v6e
+spec:
+  selectors:
+    - cel:
+        expression: >-
+          device.driver == "freetpu.dev" &&
+          "generation" in device.attributes["freetpu.dev"] &&
+          device.attributes["freetpu.dev"].generation == "v6e"
+---
+# Example ResourceSlice published by a node-local `freetpu-dra-driver` DaemonSet
+# for a single Cloud TPU v6e-8 host (`0000:00` on NUMA 0, `0000:80` on NUMA 1).
+# Note: `freetpu_cdi.py` emits capacity-pinned, permanently domain-bound sub-host
+# slice selectors (`numa<node>-pcie-<root>-<chips>`, e.g. `numa0-pcie-0000-00-4`,
+# `numa1-pcie-0000-80-4`, or `pcie-<root>-<chips>` when NUMA locality is absent)
+# only for supported generation topologies (`{4, 8}` physical chips for `v6e` and
+# `v5e`, `{4}` for 4-chip-per-VM `v5p` and `tpu7x`). If a 4-chip v6e NUMA half
+# drops to 3 or 2 chips, `numa0-pcie-0000-00-4` is withdrawn completely (no
+# degraded 2-chip v6e slice is emitted) so 4-chip claims fail closed instead
+# of silently shrinking or attaching an unverified torus diagonal. A DRA driver
+# publishing `ResourceSlice` objects must still reconcile against live CDI
+# selectors and withdraw degraded slices before scheduling new claims.
+apiVersion: resource.k8s.io/v1
+kind: ResourceSlice
+metadata:
+  name: v6e-8-node-0-freetpu
+spec:
+  nodeName: v6e-8-node-0
+  driver: freetpu.dev
+  pool:
+    name: v6e-8-node-0
+    generation: 1
+    resourceSliceCount: 1
+  devices:
+    - name: numa0-slice
+      attributes:
+        generation:
+          string: "v6e"
+        numa_node:
+          string: "0"
+        pcie_root:
+          string: "0000:00"
+        cdi_selector:
+          string: "freetpu.dev/tpu=numa0-pcie-0000-00-4"
+        chips:
+          int: 4
+        memoryGiB:
+          int: 128
+      capacity:
+        memory:
+          value: 128Gi
+    - name: numa1-slice
+      attributes:
+        generation:
+          string: "v6e"
+        numa_node:
+          string: "1"
+        pcie_root:
+          string: "0000:80"
+        cdi_selector:
+          string: "freetpu.dev/tpu=numa1-pcie-0000-80-4"
+        chips:
+          int: 4
+        memoryGiB:
+          int: 128
+      capacity:
+        memory:
+          value: 128Gi
+---
+# Topology-aware 4-chip ResourceClaimTemplate selecting TPU endpoints within
+# a single NUMA domain (eliminates hostNetwork; note that Kubernetes 1.34
+# kubelet does not register DRA as a Topology Manager hint provider, so
+# co-locating Pod CPU and memory on NUMA 0 requires a separate placement
+# mechanism).
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: tpu-v6e-4chip-numa0
+  namespace: default
+spec:
+  spec:
+    devices:
+      requests:
+        - name: tpu-slice
+          exactly:
+            deviceClassName: freetpu-tpu-v6e
+            selectors:
+              - cel:
+                  expression: >-
+                    "numa_node" in device.attributes["freetpu.dev"] &&
+                    device.attributes["freetpu.dev"].numa_node == "0" &&
+                    "chips" in device.attributes["freetpu.dev"] &&
+                    device.attributes["freetpu.dev"].chips == 4 &&
+                    "memoryGiB" in device.attributes["freetpu.dev"] &&
+                    device.attributes["freetpu.dev"].memoryGiB >= 120
+---
+# Network-isolated 4-chip Cloud TPU workload Pod (NO hostNetwork: true, NO privileged: true).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: tpu-4chip-isolated-worker
+  namespace: default
+spec:
+  restartPolicy: Never
+  # Restricted Pod Security Standard (PSS) pod-level securityContext.
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  # hostNetwork is intentionally omitted (false): when freetpu_cdi.py runs with
+  # --single-host-env, CDI containerEdits.env binds Megascale coordinator to
+  # 127.0.0.1:8353 inside this Pod's network namespace.
+  containers:
+    - name: jax-worker
+      image: python:3.12-slim
+      # If the node lacks sysfs `chip_id` files and `freetpu_cdi.py` runs
+      # without `--chip-id-map`, uncomment and supply the verified chip IDs for
+      # this slice explicitly:
+      # env:
+      #   - name: TPU_VISIBLE_CHIPS
+      #     value: "0,1,2,3"
+      #   - name: TPU_VISIBLE_DEVICES
+      #     value: "0,1,2,3"
+      command:
+        - python3
+        - -c
+        - |
+          import glob, os, sys
+          ver = os.environ.get("FREETPU_CDI_VERSION")
+          mode = os.environ.get("FREETPU_IOMMU_MODE")
+          if mode == "iommufd":
+              vfio_ok = os.path.exists("/dev/iommu") and bool(
+                  glob.glob("/dev/vfio/devices/vfio*")
+              )
+          else:
+              vfio_ok = os.path.exists("/dev/vfio/vfio") and any(
+                  os.path.basename(p).isdigit() for p in glob.glob("/dev/vfio/*")
+              )
+          if not ver or not vfio_ok:
+              sys.exit(
+                  f"CDI injection missing: FREETPU_CDI_VERSION={ver!r} "
+                  f"FREETPU_IOMMU_MODE={mode!r} vfio_ok={vfio_ok}"
+              )
+          print(
+              "CDI OK:",
+              ver,
+              mode,
+              os.environ.get("TPU_VISIBLE_DEVICES"),
+              os.environ.get("MEGASCALE_COORDINATOR_ADDRESS"),
+          )
+      securityContext:
+        allowPrivilegeEscalation: false
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+        capabilities:
+          drop:
+            - ALL
+          # Optional: uncomment ONLY for real libtpu/VFIO workloads needing
+          # pinned DMA memory in namespaces whose Pod Security admission allows
+          # IPC_LOCK (Baseline and Restricted Pod Security Standards reject it):
+          # add:
+          #   - IPC_LOCK
+      resources:
+        # Guaranteed QoS requests/limits prevent CPU/memory overcommit, but
+        # Kubernetes 1.34's kubelet does not register DRA as a Topology Manager
+        # hint provider; use a separate placement mechanism (such as `numactl` /
+        # entrypoint affinity or a NUMA-aware scheduler/runtime hook) to pin
+        # Pod CPU cores and host DMA buffers to the claimed TPU's NUMA node.
+        requests:
+          cpu: "4"
+          memory: "32Gi"
+        limits:
+          cpu: "4"
+          memory: "32Gi"
+        claims:
+          - name: tpu
+  resourceClaims:
+    - name: tpu
+      resourceClaimTemplateName: tpu-v6e-4chip-numa0
