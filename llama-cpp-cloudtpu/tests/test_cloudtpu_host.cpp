@@ -3036,15 +3036,75 @@ void test_bf16_scales_zero_f32_dequant_and_pad_m(cloudtpu::PjrtRuntime& rt) {
                 CHECK_TRUE(prog.mlir_text.find("tensor<1x1x8x8x16xf32>") != std::string::npos,
                            "Q4_K_I4 M<8 pad8 factored dot_b has M=8");
             } else {
-                // M=40 in-loop dequant with BF16 scales uses zero-F32-temp fast_bf16 path
-                CHECK_TRUE(prog.mlir_text.find("tensor<1x1x8x32x16xf32>") == std::string::npos,
-                           "Q4_K_I4 BF16 scales prefill must emit zero F32 dequant temp");
+                // M=40 in-loop Q4_K_I4 dequant applies m in F32 before rounding to BF16
                 CHECK_TRUE(prog.mlir_text.find("-> tensor<1x1x8x32x16xbf16>") != std::string::npos,
-                           "Q4_K_I4 BF16 scales prefill converts i4 directly to BF16");
+                           "Q4_K_I4 BF16 scales prefill rounds dequantized weight to BF16 after adding m");
             }
 
             auto got = run_emitted(rt, prog, {bqs, bd, bm, bx});
             CHECK_TRUE(compute_nmse(got, ref) < 5e-4, "Q4_K_I4 BF16 scales + pad8 NMSE < 5e-4");
+        }
+
+        // 2b) Exact BF16-scale cancellation & pre-rounding offset regressions:
+        //   (a) Small-batch factored dot: u4=8 (s4=0), d=1/32, m=-1/4, x=[1, 1/256] -> exact 0.0f
+        //   (b) Prefill (M=40) dequant:   u4=3 (s4=-5), d=1.0078125, m=-3.03125, x=[1, 0..] -> exact -0.0078125f
+        {
+            // (a) Small-batch M=1 with BF16 scales: xsum stays F32 in both scale and offset terms
+            const uint16_t d_bf = cloudtpu::f32_to_bf16(0.03125f);   // 1/32 (exact BF16)
+            const uint16_t m_bf = cloudtpu::f32_to_bf16(-0.25f);     // -1/4 (exact BF16)
+            std::vector<int8_t> qs_0(static_cast<size_t>(NB * 32 * N), 0);  // s4=0 -> u4=8
+            std::vector<uint16_t> d_b(static_cast<size_t>(NB * N), d_bf);
+            std::vector<uint16_t> m_b(static_cast<size_t>(NB * N), m_bf);
+            std::vector<float> x_two(static_cast<size_t>(K), 0.0f);
+            x_two[0] = 1.0f;
+            x_two[1] = 1.0f / 256.0f;  // exact BF16, but 1 + 1/256 rounds to 1 in BF16!
+
+            auto bqs0 = rt.buffer_from_host(0, qs_0.data(), cloudtpu::PjrtDType::S4, {1, 1, NB, 32, N});
+            auto bd0 = rt.buffer_from_host(0, d_b.data(), cloudtpu::PjrtDType::BF16, {1, 1, NB, N});
+            auto bm0 = rt.buffer_from_host(0, m_b.data(), cloudtpu::PjrtDType::BF16, {1, 1, NB, N});
+            auto bx0 = rt.buffer_from_host(0, x_two.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, K});
+
+            cloudtpu::GraphProgramSpec sp_a;
+            sp_a.bf16_matmul = true;
+            sp_a.mm_pad_m = 8;
+            cloudtpu::TensorSpec ws_a{1, cloudtpu::PjrtDType::S4, cloudtpu::TensorStorageKind::Q4_K_I4, {1, 1, N, K}};
+            ws_a.scale_dtype = cloudtpu::PjrtDType::BF16;
+            sp_a.inputs.push_back(ws_a);
+            sp_a.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, K}});
+            cloudtpu::OpNodeSpec mm_a;
+            mm_a.kind = cloudtpu::CloudOpKind::MUL_MAT;
+            mm_a.src_ids = {1, 2};
+            mm_a.dst = {3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, N}};
+            sp_a.ops.push_back(mm_a);
+            sp_a.output_ids = {3};
+            const auto got_a = run_emitted(rt, cloudtpu::emit_stablehlo_program(sp_a), {bqs0, bd0, bm0, bx0});
+            for (float v : got_a) {
+                CHECK_TRUE(v == 0.0f, "Q4_K_I4 BF16-scale small-batch u4=8,d=1/32,m=-1/4 must cancel to exact 0.0f");
+            }
+
+            // (b) Prefill M=40 with BF16 scales: u4=3 (s4=-5), d=1.0078125, m=-3.03125 -> -0.0078125f
+            const uint16_t dp_bf = cloudtpu::f32_to_bf16(1.0078125f);
+            const uint16_t mp_bf = cloudtpu::f32_to_bf16(-3.03125f);
+            std::vector<int8_t> qs_m5(static_cast<size_t>(NB * 32 * N), static_cast<int8_t>(-5));  // u4=3
+            std::vector<uint16_t> dp_b(static_cast<size_t>(NB * N), dp_bf);
+            std::vector<uint16_t> mp_b(static_cast<size_t>(NB * N), mp_bf);
+            const int64_t M_pre = 40;
+            std::vector<float> x_pre(static_cast<size_t>(M_pre * K), 0.0f);
+            x_pre[0] = 1.0f;
+
+            auto bqsp = rt.buffer_from_host(0, qs_m5.data(), cloudtpu::PjrtDType::S4, {1, 1, NB, 32, N});
+            auto bdp = rt.buffer_from_host(0, dp_b.data(), cloudtpu::PjrtDType::BF16, {1, 1, NB, N});
+            auto bmp = rt.buffer_from_host(0, mp_b.data(), cloudtpu::PjrtDType::BF16, {1, 1, NB, N});
+            auto bxp = rt.buffer_from_host(0, x_pre.data(), cloudtpu::PjrtDType::F32, {1, 1, M_pre, K});
+
+            cloudtpu::GraphProgramSpec sp_b = sp_a;
+            sp_b.inputs[1].dims[2] = M_pre;
+            sp_b.ops[0].dst.dims[2] = M_pre;
+            const auto got_b = run_emitted(rt, cloudtpu::emit_stablehlo_program(sp_b), {bqsp, bdp, bmp, bxp});
+            for (int64_t n = 0; n < N; ++n) {
+                CHECK_NEAR(got_b[static_cast<size_t>(n)], -0.0078125f, 1e-6f,
+                           "Q4_K_I4 BF16-scale prefill must apply m in F32 before rounding to BF16");
+            }
         }
     }
 
@@ -5897,6 +5957,43 @@ void test_ggml_cgraph_reshaped_host_cpy_and_q4_bitcast_view() {
         std::vector<float> x_host(static_cast<size_t>(M * K));
         for (size_t i = 0; i < x_host.size(); ++i) x_host[i] = std::sin(static_cast<float>(i + 1) * 0.11f);
 
+        // Compute real CPU reference matmul using the first 3 rows of w_raw
+        std::vector<float> ref_y;
+        {
+            ggml_backend_t cpu_be = ggml_backend_cpu_init();
+            CHECK_TRUE(cpu_be != nullptr, "cpu init for 3-row BITCAST Q4_K alias reference");
+            const size_t mem = ggml_tensor_overhead() * 24 + ggml_graph_overhead() + 4096;
+            struct ggml_init_params p = {mem, nullptr, true};
+            struct ggml_context* ctx_w = ggml_init(p);
+            ggml_tensor* tw3_cpu = ggml_new_tensor_2d(ctx_w, GGML_TYPE_Q4_K, K, N_VIEW);
+            ggml_backend_buffer_t w_buf = ggml_backend_alloc_ctx_tensors(ctx_w, cpu_be);
+            ggml_backend_tensor_set(tw3_cpu, w_raw.data(), 0, static_cast<size_t>(N_VIEW) * 144U);
+
+            struct ggml_context* ctx_g = ggml_init(p);
+            struct ggml_cgraph* gf = ggml_new_graph(ctx_g);
+            ggml_tensor* tx = ggml_new_tensor_2d(ctx_g, GGML_TYPE_F32, K, M);
+            ggml_set_input(tx);
+            ggml_tensor* ty = ggml_mul_mat(ctx_g, tw3_cpu, tx);
+            ggml_set_output(ty);
+            ggml_build_forward_expand(gf, ty);
+
+            ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu_be));
+            CHECK_TRUE(ggml_gallocr_alloc_graph(galloc, gf), "cpu alloc for 3-row Q4_K ref");
+            ggml_backend_tensor_set(tx, x_host.data(), 0, x_host.size() * sizeof(float));
+            CHECK_TRUE(ggml_backend_graph_compute(cpu_be, gf) == GGML_STATUS_SUCCESS, "cpu compute 3-row Q4_K ref");
+            ref_y.resize(static_cast<size_t>(M * N_VIEW), 0.0f);
+            ggml_backend_tensor_get(ty, ref_y.data(), 0, ref_y.size() * sizeof(float));
+
+            ggml_gallocr_free(galloc);
+            ggml_free(ctx_g);
+            ggml_backend_buffer_free(w_buf);
+            ggml_free(ctx_w);
+            ggml_backend_free(cpu_be);
+        }
+        double ref_energy = 0.0;
+        for (float v : ref_y) ref_energy += static_cast<double>(v) * static_cast<double>(v);
+        CHECK_TRUE(ref_energy > 1e-2, "3-row Q4_K CPU reference must be non-zero");
+
         std::fflush(stdout);
         std::fflush(stderr);
         const pid_t pid = fork();
@@ -5934,15 +6031,9 @@ void test_ggml_cgraph_reshaped_host_cpy_and_q4_bitcast_view() {
                 if (ggml_gallocr_alloc_graph(galloc, gf)) {
                     ggml_backend_tensor_set(tx, x_host.data(), 0, x_host.size() * sizeof(float));
                     if (ggml_backend_graph_compute(be, gf) == GGML_STATUS_SUCCESS) {
-                        std::vector<float> got(static_cast<size_t>(M * N_VIEW), -1.0f);
+                        std::vector<float> got(static_cast<size_t>(M * N_VIEW), 0.0f);
                         ggml_backend_tensor_get(ty, got.data(), 0, got.size() * sizeof(float));
-                        ok = true;
-                        for (float v : got) {
-                            if (std::fabs(v) > 1e-5f || !std::isfinite(v)) {
-                                ok = false;
-                                break;
-                            }
-                        }
+                        ok = (compute_nmse(got, ref_y) < 5e-4);
                     }
                 }
                 ggml_gallocr_free(galloc);
@@ -5955,7 +6046,7 @@ void test_ggml_cgraph_reshaped_host_cpy_and_q4_bitcast_view() {
         }
         int status = 0;
         CHECK_TRUE(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0,
-                   "3-row Q4_K tensor at 4-row BITCAST slot offset must fall back cleanly to Q4_K_SPLIT");
+                   "3-row Q4_K tensor aliasing 4-row BITCAST slot must slice weights and match CPU reference");
     }
     std::printf("  [PASS] ggml_cgraph reshaped host CPY bucket writeback & 3-row BITCAST Q4_K slot-shape fallback\n");
 #endif

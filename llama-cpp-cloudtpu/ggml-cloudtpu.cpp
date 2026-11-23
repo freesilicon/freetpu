@@ -3193,15 +3193,15 @@ static void resolve_tensor_hbm(cloudtpu::PjrtRuntime& rt,
                 throw CloudTpuAllocError("ggml-cloudtpu: prior HBM upload failed for tensor '" +
                                          std::string(t->name) + "': " + slot.upload_error);
             }
-            if (slot.staging_dirty && !slot.staging.empty()) {
+            const struct ggml_tensor* upload_t =
+                (t->view_src != nullptr && t->view_offs == 0 && ggml_is_contiguous(t))
+                    ? unwrap_view_src(t)
+                    : t;
+            if (slot.staging_dirty && !slot.staging.empty() && slot.nbytes == ggml_nbytes(upload_t)) {
                 CloudTpuTensorSlot next;
                 next.offset = slot.offset;
                 next.nbytes = slot.nbytes;
                 const cloudtpu::TensorShardingKind slot_sh = slot.sharding;
-                const struct ggml_tensor* upload_t =
-                    (t->view_src != nullptr && t->view_offs == 0 && ggml_is_contiguous(t))
-                        ? unwrap_view_src(t)
-                        : t;
                 upload_raw_tensor_to_slot(
                     rt, bctx->device_index, bctx->spmd_chips, bctx->spmd_min_rows,
                     next, upload_t, slot.staging.data(), /*allow_sharding=*/true, &slot_sh,
@@ -3255,13 +3255,46 @@ static void resolve_tensor_hbm(cloudtpu::PjrtRuntime& rt,
                 }
             }
         }
-        // Uninitialized fill-byte HBM buffer for newly allocated leaf/KV-cache buffers before first write.
-        // Never silently materialize a computed graph activation node (t->op != GGML_OP_NONE).
+        // Extract a contiguous sub-range from an existing live parent slot (e.g. a 3-row Q4_K
+        // alias over a 4-row BITCAST Q4_K slot) without evicting or zeroing the parent weights.
         const cloudtpu::PjrtDType pdt = ggml_type_to_pjrt(t->type);
         const bool quant_ok = is_quant_split_type(t->type) &&
                               (t->ne[0] % quant_split_k_alignment(t->type)) == 0;
         if (t->op == GGML_OP_NONE && (pdt != cloudtpu::PjrtDType::INVALID || quant_ok) && ggml_is_contiguous(t)) {
             const size_t t_bytes = ggml_nbytes(t);
+            for (const auto& kv : bctx->slots) {
+                const CloudTpuTensorSlot& parent = kv.second;
+                if (t_bytes <= parent.nbytes && t_off >= parent.offset &&
+                    (t_off - parent.offset) <= parent.nbytes - t_bytes) {
+                    std::vector<uint8_t> slice_bytes;
+                    const size_t rel = t_off - parent.offset;
+                    if (parent.staging_dirty && !parent.staging.empty() && parent.staging.size() >= rel + t_bytes) {
+                        slice_bytes.assign(parent.staging.begin() + static_cast<std::ptrdiff_t>(rel),
+                                           parent.staging.begin() + static_cast<std::ptrdiff_t>(rel + t_bytes));
+                    } else if (parent.has_hbm()) {
+                        std::vector<uint8_t> parent_host(parent.nbytes);
+                        download_slot_to_host(rt, parent, parent_host.data());
+                        slice_bytes.assign(parent_host.begin() + static_cast<std::ptrdiff_t>(rel),
+                                           parent_host.begin() + static_cast<std::ptrdiff_t>(rel + t_bytes));
+                    }
+                    if (slice_bytes.size() == t_bytes) {
+                        CloudTpuTensorSlot tmp;
+                        tmp.offset = t_off;
+                        tmp.nbytes = t_bytes;
+                        upload_raw_tensor_to_slot(
+                            rt, bctx->device_index, bctx->spmd_chips, bctx->spmd_min_rows,
+                            tmp, t, slice_bytes.data(), /*allow_sharding=*/false, nullptr,
+                            bctx->q4k_bf16_scales, bctx->q4_mode, bctx->q4k_u4);
+                        out.sharding = tmp.sharding;
+                        out.primary = std::move(tmp.hbm_primary);
+                        out.scales = std::move(tmp.hbm_scales);
+                        out.mins = std::move(tmp.hbm_mins);
+                        return;
+                    }
+                }
+            }
+            // Uninitialized fill-byte HBM buffer for newly allocated leaf/KV-cache buffers before first write.
+            // Never silently materialize a computed graph activation node (t->op != GGML_OP_NONE).
             std::vector<uint8_t> init_bytes(t_bytes, bctx->clear_value);
             CloudTpuTensorSlot next;
             next.offset = t_off;

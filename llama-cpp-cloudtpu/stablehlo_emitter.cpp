@@ -675,23 +675,17 @@ SsaValue dequantize_k_major_blocks(StableHloBuilder& b,
         qs_eff = materialize_q4_i4_nibbles(b, qs, target_4bit, N);
     }
 
+    // Only bypass F32 dequantization when there is no additive minimum offset (e.g. Q6_K_SPLIT
+    // lm_head): Q4_K_I4 must apply its minimum offset m in F32 before rounding to BF16 so
+    // small net weights after cancellation are never erased by intermediate BF16 rounding.
     const bool fast_bf16 =
         (out_dt == PjrtDType::BF16 && d.dtype == PjrtDType::BF16 &&
-         (m_opt == nullptr || m_opt->dtype == PjrtDType::BF16) &&
+         m_opt == nullptr &&
          !(storage == TensorStorageKind::Q4_0_I4 && qs_eff.dtype == PjrtDType::U4));
     if (fast_bf16) {
         SsaValue q_bf = b.emit_convert(qs_eff, PjrtDType::BF16);
-        if (storage == TensorStorageKind::Q4_K_I4 && qs_eff.dtype == PjrtDType::S4) {
-            SsaValue eight = b.emit_const_splat_f32(8.0f, km_dims, PjrtDType::BF16);
-            q_bf = b.emit_binary("stablehlo.add", q_bf, eight);
-        }
         SsaValue d_b = b.emit_broadcast_in_dim(d, {0, 1, 2, 4}, km_dims);
-        SsaValue scaled = b.emit_binary("stablehlo.multiply", q_bf, d_b);
-        if (storage == TensorStorageKind::Q4_K_I4 && m_opt != nullptr) {
-            SsaValue m_b = b.emit_broadcast_in_dim(*m_opt, {0, 1, 2, 4}, km_dims);
-            scaled = b.emit_binary("stablehlo.add", scaled, m_b);
-        }
-        return scaled;
+        return b.emit_binary("stablehlo.multiply", q_bf, d_b);
     }
 
     SsaValue q_f = b.emit_convert(qs_eff, PjrtDType::F32);
@@ -1188,18 +1182,12 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                             if (w_th.storage == TensorStorageKind::Q4_K_I4 && w_th.has_q_m) {
                                 SsaValue m_km = w_th.q_m;
                                 bcast_w4_batch(m_km);
-                                // Keep the minimum offset correction dot in F32 (HIGHEST precision) unless
-                                // scales are explicitly stored in BF16.
-                                const bool fast_bf16_m =
-                                    (mm_dt == PjrtDType::BF16) &&
-                                    (d_km.dtype == PjrtDType::BF16) &&
-                                    (m_km.dtype == PjrtDType::BF16);
-                                const PjrtDType m_dot_dt = fast_bf16_m ? PjrtDType::BF16 : PjrtDType::F32;
-                                SsaValue xsum_mm = builder.emit_convert(xsum, m_dot_dt);
-                                SsaValue m_mm = builder.emit_convert(m_km, m_dot_dt);
+                                // Always keep the minimum offset correction dot in F32 (HIGHEST precision) so
+                                // both (dot_b + 8*xsum) * d and xsum @ m share the exact same F32 activation sum.
+                                SsaValue m_f32 = builder.emit_convert(m_km, PjrtDType::F32);
                                 SsaValue m_dot = builder.emit_dot_general(
-                                    xsum_mm, m_mm, {0, 1}, {0, 1}, {3}, {2},
-                                    dot_out_dims, PjrtDType::F32, op.high_precision || !fast_bf16_m);
+                                    xsum, m_f32, {0, 1}, {0, 1}, {3}, {2},
+                                    dot_out_dims, PjrtDType::F32, /*high_precision=*/true);
                                 acc = builder.emit_binary("stablehlo.add", acc, m_dot);
                             }
                             local_out = builder.emit_convert(acc, op.dst.dtype);
