@@ -897,6 +897,10 @@ void test_q4_k_split_mul_mat(cloudtpu::PjrtRuntime& rt) {
         loc_spec.ops.push_back(rms);
         loc_spec.output_ids = {2};
         const auto loc_prog = cloudtpu::emit_stablehlo_program(loc_spec);
+        // Also compile and execute under the decimal-comma locale to prove mock parser independence.
+        std::vector<float> loc_in(1024, 1.0f);
+        auto b_loc = rt.buffer_from_host(0, loc_in.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, 1024});
+        const auto loc_out = run_emitted(rt, loc_prog, {b_loc});
         std::locale::global(prev_loc);
         CHECK_TRUE(loc_prog.mlir_text.find("1024xf32") != std::string::npos,
                    "dimension formatting must not insert locale thousands separators");
@@ -904,7 +908,10 @@ void test_q4_k_split_mul_mat(cloudtpu::PjrtRuntime& rt) {
                    "float formatting must use classic decimal point under comma locale");
         CHECK_TRUE(loc_prog.mlir_text.find("1,25") == std::string::npos,
                    "float formatting must not emit comma decimal separator");
-        std::printf("  [PASS] StableHLO emission ignores global C++ locale\n");
+        const float expected_rms = 1.0f / std::sqrt(1.0f + 0.125f);
+        CHECK_TRUE(loc_out.size() == 1024 && std::fabs(loc_out[0] - expected_rms) < 1e-5f,
+                   "mock StableHLO parser must parse float constants with eps=0.125 under comma locale");
+        std::printf("  [PASS] StableHLO emission & mock parsing ignore global C++ locale\n");
     }
 }
 

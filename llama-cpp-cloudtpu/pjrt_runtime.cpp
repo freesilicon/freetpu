@@ -11,6 +11,7 @@
 #include <dlfcn.h>
 #endif
 #include <fstream>
+#include <locale>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -744,19 +745,44 @@ static MockProgram parse_stablehlo_mlir(const std::string& mlir) {
         if (rhs.rfind("stablehlo.constant ", 0) == 0) {
             op.kind = MockOp::Kind::CONSTANT;
             const size_t d0 = rhs.find("dense<");
-            const size_t d1 = rhs.rfind('>');
+            if (d0 == std::string::npos) {
+                throw std::runtime_error("MockPJRT: missing dense< literal in stablehlo.constant");
+            }
+            const size_t d1 = rhs.find('>', d0 + 6);
+            if (d1 == std::string::npos) {
+                throw std::runtime_error("MockPJRT: unterminated dense< literal in stablehlo.constant");
+            }
             const std::string lit = trim_copy(rhs.substr(d0 + 6, d1 - (d0 + 6)));
             const bool is_int = (op.out_type.dtype == PjrtDType::S8 || op.out_type.dtype == PjrtDType::U8 ||
                                  op.out_type.dtype == PjrtDType::S16 || op.out_type.dtype == PjrtDType::S32 ||
                                  op.out_type.dtype == PjrtDType::S64);
             auto parse_mlir_float = [](const std::string& s) -> double {
                 if (s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
-                    const uint32_t bits = static_cast<uint32_t>(std::stoul(s, nullptr, 16));
+                    size_t idx = 0;
+                    const uint32_t bits = static_cast<uint32_t>(std::stoul(s, &idx, 16));
+                    if (idx != s.size()) {
+                        throw std::runtime_error("MockPJRT: invalid hex float literal: " + s);
+                    }
                     float f = 0.0f;
                     std::memcpy(&f, &bits, sizeof(f));
                     return static_cast<double>(f);
                 }
-                return std::stod(s);
+                std::istringstream iss(s);
+                iss.imbue(std::locale::classic());
+                double val = 0.0;
+                if (!(iss >> val) || !(iss >> std::ws).eof()) {
+                    throw std::runtime_error("MockPJRT: invalid float literal: " + s);
+                }
+                return val;
+            };
+            auto parse_mlir_int = [](const std::string& s) -> int64_t {
+                std::istringstream iss(s);
+                iss.imbue(std::locale::classic());
+                int64_t val = 0;
+                if (!(iss >> val) || !(iss >> std::ws).eof()) {
+                    throw std::runtime_error("MockPJRT: invalid int literal: " + s);
+                }
+                return val;
             };
             if (!lit.empty() && lit.front() == '[') {
                 op.is_splat = false;
@@ -766,12 +792,12 @@ static MockProgram parse_stablehlo_mlir(const std::string& mlir) {
                 while (std::getline(vs, tok, ',')) {
                     tok = trim_copy(tok);
                     if (tok.empty()) continue;
-                    if (is_int) op.array_i.push_back(std::stoll(tok));
+                    if (is_int) op.array_i.push_back(parse_mlir_int(tok));
                     else op.array_f.push_back(parse_mlir_float(tok));
                 }
             } else {
                 op.is_splat = true;
-                if (is_int) op.scalar_i = std::stoll(lit);
+                if (is_int) op.scalar_i = parse_mlir_int(lit);
                 else op.scalar_f = parse_mlir_float(lit);
             }
         } else if (rhs.rfind("stablehlo.iota ", 0) == 0) {
