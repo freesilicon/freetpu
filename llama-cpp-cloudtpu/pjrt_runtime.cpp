@@ -2065,12 +2065,13 @@ PjrtBufferPtr PjrtRuntime::buffer_from_host(int device_idx,
     args.device_layout = nullptr;
 
     check_error(api_->PJRT_Client_BufferFromHostBuffer(&args), "PJRT_Client_BufferFromHostBuffer");
+    PjrtBufferHandle buf_handle(args.buffer, PjrtBufferDeleter{api_});
     if (args.done_with_host_buffer) {
         await_event(args.done_with_host_buffer);
     }
 
     auto out = std::make_shared<PjrtBuffer>();
-    out->handle = PjrtBufferHandle(args.buffer, PjrtBufferDeleter{api_});
+    out->handle = std::move(buf_handle);
     out->dtype = dtype;
     out->dims = dims;
     return out;
@@ -2294,20 +2295,27 @@ void PjrtRuntime::execute(const CachedExecutablePtr& exec,
     // Executable is statically assigned to the target chip via DeviceAssignmentProto at compile time.
     ex.execute_device = nullptr;
 
+    std::vector<PjrtBufferHandle> out_handles;
+    out_handles.reserve(exec->num_outputs);
+
     check_error(api_->PJRT_LoadedExecutable_Execute(&ex), "PJRT_LoadedExecutable_Execute");
+    PjrtEventHandle dev_ev_handle(dev_ev[0], PjrtEventDeleter{api_});
+    for (size_t i = 0; i < exec->num_outputs; ++i) {
+        out_handles.emplace_back(raw_outputs[i], PjrtBufferDeleter{api_});
+    }
 
     outputs.resize(exec->num_outputs);
     for (size_t i = 0; i < exec->num_outputs; ++i) {
         auto buf = std::make_shared<PjrtBuffer>();
-        buf->handle = PjrtBufferHandle(raw_outputs[i], PjrtBufferDeleter{api_});
+        buf->handle = std::move(out_handles[i]);
         buf->dtype = out_dtypes[i];
         buf->dims = out_dims[i];
         outputs[i] = std::move(buf);
     }
 
     if (sync) {
-        if (use_dev_event && dev_ev[0]) {
-            await_event(dev_ev[0]);
+        if (use_dev_event && dev_ev_handle) {
+            await_event(std::move(dev_ev_handle));
         } else if (has_ready_event_) {
             for (const auto& out_buf : outputs) {
                 await_buffer_ready(out_buf->handle.get());

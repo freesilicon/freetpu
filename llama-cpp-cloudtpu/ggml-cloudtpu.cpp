@@ -877,6 +877,27 @@ static bool patch_view_into_root_slot_locked(cloudtpu::PjrtRuntime& rt,
     }
     auto pit = bctx->slots.find(root_off);
     if (pit == bctx->slots.end() || pit->second.nbytes != root_bytes) {
+        const size_t rel_new = (t_off - root_off) + offset;
+        if (rel_new == 0 && size == root_bytes) {
+            CloudTpuTensorSlot next;
+            next.offset = root_off;
+            next.nbytes = root_bytes;
+            if (src_data != nullptr) {
+                upload_raw_tensor_to_slot(rt, bctx->device_index, next, root, src_data);
+            } else {
+                std::vector<uint8_t> tmp(root_bytes, fill_value);
+                upload_raw_tensor_to_slot(rt, bctx->device_index, next, root, tmp.data());
+            }
+            bctx->evict_overlapping_locked(root_off, root_bytes, root_off);
+            bctx->slots[root_off] = std::move(next);
+            return true;
+        }
+        std::vector<uint8_t> init_staging(root_bytes, bctx->clear_value);
+        if (src_data != nullptr) {
+            std::memcpy(init_staging.data() + rel_new, src_data, size);
+        } else {
+            std::memset(init_staging.data() + rel_new, fill_value, size);
+        }
         bctx->evict_overlapping_locked(root_off, root_bytes, root_off);
         CloudTpuTensorSlot& parent = bctx->slots[root_off];
         parent.offset = root_off;
@@ -884,31 +905,39 @@ static bool patch_view_into_root_slot_locked(cloudtpu::PjrtRuntime& rt,
         parent.hbm_primary.reset();
         parent.hbm_scales.reset();
         parent.hbm_mins.reset();
-        parent.staging.assign(root_bytes, bctx->clear_value);
+        parent.staging = std::move(init_staging);
         parent.staging_dirty = true;
         parent.upload_failed = false;
         parent.upload_error.clear();
-        pit = bctx->slots.find(root_off);
+        if (flush_now) {
+            upload_raw_tensor_to_slot(rt, bctx->device_index, parent, root, parent.staging.data());
+        }
+        return true;
     }
     CloudTpuTensorSlot& parent = pit->second;
     const size_t rel = (t_off - parent.offset) + offset;
     if (rel == 0 && size == root_bytes) {
+        CloudTpuTensorSlot next;
+        next.offset = parent.offset;
+        next.nbytes = parent.nbytes;
         if (src_data != nullptr) {
-            upload_raw_tensor_to_slot(rt, bctx->device_index, parent, root, src_data);
+            upload_raw_tensor_to_slot(rt, bctx->device_index, next, root, src_data);
         } else {
             std::vector<uint8_t> tmp(root_bytes, fill_value);
-            upload_raw_tensor_to_slot(rt, bctx->device_index, parent, root, tmp.data());
+            upload_raw_tensor_to_slot(rt, bctx->device_index, next, root, tmp.data());
         }
+        parent = std::move(next);
         return true;
     }
     if (parent.upload_failed) {
         throw CloudTpuAllocError(parent.upload_error);
     }
     if (!parent.staging_dirty) {
-        parent.staging.assign(parent.nbytes, bctx->clear_value);
+        std::vector<uint8_t> tmp(parent.nbytes, bctx->clear_value);
         if (parent.hbm_primary) {
-            download_slot_to_host(rt, parent, parent.staging.data());
+            download_slot_to_host(rt, parent, tmp.data());
         }
+        parent.staging = std::move(tmp);
         parent.staging_dirty = true;
     }
     if (src_data != nullptr) {
@@ -922,6 +951,29 @@ static bool patch_view_into_root_slot_locked(cloudtpu::PjrtRuntime& rt,
         upload_raw_tensor_to_slot(rt, bctx->device_index, parent, root, parent.staging.data());
     }
     return true;
+}
+
+static bool is_partial_view_write(ggml_backend_cloudtpu_buffer_context* bctx,
+                                  ggml_backend_buffer_t buffer,
+                                  const struct ggml_tensor* tensor,
+                                  size_t offset,
+                                  size_t size) {
+    if (!bctx || !tensor || tensor->view_src == nullptr) {
+        return false;
+    }
+    const struct ggml_tensor* root = unwrap_view_src(tensor);
+    if (!root || root->buffer != buffer) {
+        return false;
+    }
+    const size_t t_off = tensor_offset_in_buffer(bctx, tensor);
+    const size_t root_off = tensor_offset_in_buffer(bctx, root);
+    const size_t root_bytes = ggml_nbytes(root);
+    if (t_off < root_off || offset > SIZE_MAX - t_off || size > SIZE_MAX - (t_off + offset) ||
+        t_off + offset + size > root_off + root_bytes) {
+        return false;
+    }
+    const size_t rel = (t_off - root_off) + offset;
+    return !(rel == 0 && size == root_bytes);
 }
 
 static void record_buffer_upload_failure(ggml_backend_cloudtpu_buffer_context* bctx,
@@ -962,38 +1014,64 @@ static void ggml_backend_cloudtpu_buffer_memset_tensor(ggml_backend_buffer_t buf
         return;
     }
     auto* bctx = static_cast<ggml_backend_cloudtpu_buffer_context*>(buffer->context);
+    const size_t t_bytes = ggml_nbytes(tensor);
+    const bool partial_view = is_partial_view_write(bctx, buffer, tensor, offset, size);
     try {
         cloudtpu::PjrtRuntime& rt = ensure_runtime_initialized();
         const size_t t_off = tensor_offset_in_buffer(bctx, tensor);
-        const size_t t_bytes = ggml_nbytes(tensor);
 
         std::lock_guard<std::mutex> lock(bctx->mu);
         if (patch_view_into_root_slot_locked(
                 rt, bctx, buffer, tensor, t_off, offset, size, nullptr, value, /*flush_now=*/false)) {
             return;
         }
-        bctx->evict_overlapping_locked(t_off, t_bytes, t_off);
-        CloudTpuTensorSlot& slot = bctx->slots[t_off];
-        slot.offset = t_off;
-        slot.nbytes = t_bytes;
-
         if (offset == 0 && size == t_bytes) {
+            bctx->evict_overlapping_locked(t_off, t_bytes, t_off);
+            CloudTpuTensorSlot& slot = bctx->slots[t_off];
+            slot.offset = t_off;
+            slot.nbytes = t_bytes;
             std::vector<uint8_t> tmp(t_bytes, value);
             upload_raw_tensor_to_slot(rt, bctx->device_index, slot, tensor, tmp.data());
         } else {
-            if (slot.upload_failed) {
-                throw CloudTpuAllocError(slot.upload_error);
-            }
-            if (!slot.staging_dirty) {
-                slot.staging.assign(t_bytes, bctx->clear_value);
-                if (slot.hbm_primary) {
-                    download_slot_to_host(rt, slot, slot.staging.data());
+            auto it = bctx->slots.find(t_off);
+            if (it != bctx->slots.end() && it->second.nbytes == t_bytes) {
+                CloudTpuTensorSlot& slot = it->second;
+                if (slot.upload_failed) {
+                    throw CloudTpuAllocError(slot.upload_error);
                 }
+                if (!slot.staging_dirty) {
+                    std::vector<uint8_t> tmp(t_bytes, bctx->clear_value);
+                    if (slot.hbm_primary) {
+                        download_slot_to_host(rt, slot, tmp.data());
+                    }
+                    slot.staging = std::move(tmp);
+                    slot.staging_dirty = true;
+                }
+                std::memset(slot.staging.data() + offset, value, size);
+            } else {
+                std::vector<uint8_t> tmp(t_bytes, bctx->clear_value);
+                std::memset(tmp.data() + offset, value, size);
+                bctx->evict_overlapping_locked(t_off, t_bytes, t_off);
+                CloudTpuTensorSlot& slot = bctx->slots[t_off];
+                slot.offset = t_off;
+                slot.nbytes = t_bytes;
+                slot.hbm_primary.reset();
+                slot.hbm_scales.reset();
+                slot.hbm_mins.reset();
+                slot.staging = std::move(tmp);
                 slot.staging_dirty = true;
+                slot.upload_failed = false;
+                slot.upload_error.clear();
             }
-            std::memset(slot.staging.data() + offset, value, size);
         }
     } catch (const std::exception& e) {
+        if (partial_view || offset != 0 || size != t_bytes) {
+            // Preserve any existing valid root/slot data intact when a partial write fails.
+            GGML_LOG_ERROR("ggml-cloudtpu: partial memset_tensor failed for '%s': %s\n",
+                           (tensor && tensor->name[0] != '\0') ? tensor->name : "?",
+                           e.what());
+            throw;
+        }
         record_buffer_upload_failure(bctx, buffer, tensor, "memset_tensor", e.what());
     }
 }
@@ -1007,41 +1085,82 @@ static void ggml_backend_cloudtpu_buffer_set_tensor(ggml_backend_buffer_t buffer
         return;
     }
     auto* bctx = static_cast<ggml_backend_cloudtpu_buffer_context*>(buffer->context);
+    const size_t t_bytes = ggml_nbytes(tensor);
+    const bool partial_view = is_partial_view_write(bctx, buffer, tensor, offset, size);
     try {
         cloudtpu::PjrtRuntime& rt = ensure_runtime_initialized();
         const size_t t_off = tensor_offset_in_buffer(bctx, tensor);
-        const size_t t_bytes = ggml_nbytes(tensor);
 
         std::lock_guard<std::mutex> lock(bctx->mu);
         if (patch_view_into_root_slot_locked(
                 rt, bctx, buffer, tensor, t_off, offset, size, data, 0, /*flush_now=*/false)) {
             return;
         }
-        bctx->evict_overlapping_locked(t_off, t_bytes, t_off);
-        CloudTpuTensorSlot& slot = bctx->slots[t_off];
-        slot.offset = t_off;
-        slot.nbytes = t_bytes;
-
         if (offset == 0 && size == t_bytes) {
+            bctx->evict_overlapping_locked(t_off, t_bytes, t_off);
+            CloudTpuTensorSlot& slot = bctx->slots[t_off];
+            slot.offset = t_off;
+            slot.nbytes = t_bytes;
             upload_raw_tensor_to_slot(rt, bctx->device_index, slot, tensor, data);
         } else {
-            if (slot.upload_failed) {
-                throw CloudTpuAllocError(slot.upload_error);
-            }
-            if (!slot.staging_dirty) {
-                slot.staging.assign(t_bytes, bctx->clear_value);
-                if (slot.hbm_primary) {
-                    download_slot_to_host(rt, slot, slot.staging.data());
+            auto it = bctx->slots.find(t_off);
+            CloudTpuTensorSlot* slot_ptr = nullptr;
+            if (it != bctx->slots.end() && it->second.nbytes == t_bytes) {
+                slot_ptr = &it->second;
+                if (slot_ptr->upload_failed) {
+                    throw CloudTpuAllocError(slot_ptr->upload_error);
                 }
+                if (!slot_ptr->staging_dirty) {
+                    std::vector<uint8_t> tmp(t_bytes, bctx->clear_value);
+                    if (slot_ptr->hbm_primary) {
+                        download_slot_to_host(rt, *slot_ptr, tmp.data());
+                    }
+                    slot_ptr->staging = std::move(tmp);
+                    slot_ptr->staging_dirty = true;
+                }
+                std::memcpy(slot_ptr->staging.data() + offset, data, size);
+            } else {
+                std::vector<uint8_t> tmp(t_bytes, bctx->clear_value);
+                std::memcpy(tmp.data() + offset, data, size);
+                bctx->evict_overlapping_locked(t_off, t_bytes, t_off);
+                CloudTpuTensorSlot& slot = bctx->slots[t_off];
+                slot.offset = t_off;
+                slot.nbytes = t_bytes;
+                slot.hbm_primary.reset();
+                slot.hbm_scales.reset();
+                slot.hbm_mins.reset();
+                slot.staging = std::move(tmp);
                 slot.staging_dirty = true;
+                slot.upload_failed = false;
+                slot.upload_error.clear();
+                slot_ptr = &slot;
             }
-            std::memcpy(slot.staging.data() + offset, data, size);
-            // If full buffer has been populated via tail write, flush to HBM immediately.
+            // If full buffer has been populated via tail write, flush to HBM immediately;
+            // on HBM OOM, keep staging intact so graph_compute can report GGML_STATUS_ALLOC_FAILED.
             if (offset + size == t_bytes) {
-                upload_raw_tensor_to_slot(rt, bctx->device_index, slot, tensor, slot.staging.data());
+                try {
+                    CloudTpuTensorSlot next;
+                    next.offset = slot_ptr->offset;
+                    next.nbytes = slot_ptr->nbytes;
+                    upload_raw_tensor_to_slot(
+                        rt, bctx->device_index, next, tensor, slot_ptr->staging.data());
+                    *slot_ptr = std::move(next);
+                } catch (const std::exception& e) {
+                    GGML_LOG_ERROR("ggml-cloudtpu: deferred tail flush failed for '%s' (keeping staging): %s\n",
+                                   (tensor && tensor->name[0] != '\0') ? tensor->name : "?",
+                                   e.what());
+                }
             }
         }
     } catch (const std::exception& e) {
+        if (partial_view || offset != 0 || size != t_bytes) {
+            // Preserve any existing valid root/slot data intact when a partial write fails
+            // (e.g., session sequence restore on a shared KV cache).
+            GGML_LOG_ERROR("ggml-cloudtpu: partial set_tensor failed for '%s': %s\n",
+                           (tensor && tensor->name[0] != '\0') ? tensor->name : "?",
+                           e.what());
+            throw;
+        }
         record_buffer_upload_failure(bctx, buffer, tensor, "set_tensor", e.what());
     }
 }
@@ -1055,58 +1174,47 @@ static void ggml_backend_cloudtpu_buffer_get_tensor(ggml_backend_buffer_t buffer
         return;
     }
     auto* bctx = static_cast<ggml_backend_cloudtpu_buffer_context*>(buffer->context);
-    try {
-        cloudtpu::PjrtRuntime& rt = ensure_runtime_initialized();
-        const size_t t_off = tensor_offset_in_buffer(bctx, tensor);
-        const size_t t_bytes = ggml_nbytes(tensor);
+    cloudtpu::PjrtRuntime& rt = ensure_runtime_initialized();
+    const size_t t_off = tensor_offset_in_buffer(bctx, tensor);
+    const size_t t_bytes = ggml_nbytes(tensor);
 
-        std::lock_guard<std::mutex> lock(bctx->mu);
-        auto it = bctx->slots.find(t_off);
-        if (it != bctx->slots.end() && it->second.nbytes >= offset + size) {
-            const CloudTpuTensorSlot& slot = it->second;
-            if (slot.upload_failed) {
-                GGML_LOG_ERROR("ggml-cloudtpu: get_tensor on failed slot '%s': %s\n",
-                               tensor->name, slot.upload_error.c_str());
-                std::memset(data, bctx->clear_value, size);
-                return;
-            }
-            if (offset == 0 && size == slot.nbytes && slot.storage == cloudtpu::TensorStorageKind::DENSE &&
-                !slot.staging_dirty && slot.hbm_primary) {
-                rt.buffer_to_host(slot.hbm_primary->handle.get(), data, size);
-                return;
-            }
-            std::vector<uint8_t> tmp(slot.nbytes);
-            download_slot_to_host(rt, slot, tmp.data());
-            std::memcpy(data, tmp.data() + offset, size);
+    std::lock_guard<std::mutex> lock(bctx->mu);
+    auto it = bctx->slots.find(t_off);
+    if (it != bctx->slots.end() && it->second.nbytes >= offset + size) {
+        const CloudTpuTensorSlot& slot = it->second;
+        if (slot.upload_failed) {
+            throw std::runtime_error("ggml-cloudtpu: get_tensor on failed slot '" +
+                                     std::string(tensor->name) + "': " + slot.upload_error);
+        }
+        if (offset == 0 && size == slot.nbytes && slot.storage == cloudtpu::TensorStorageKind::DENSE &&
+            !slot.staging_dirty && slot.hbm_primary) {
+            rt.buffer_to_host(slot.hbm_primary->handle.get(), data, size);
             return;
         }
-
-        // Check if tensor is a sub-slice view inside a parent slot.
-        for (const auto& kv : bctx->slots) {
-            const CloudTpuTensorSlot& parent = kv.second;
-            if (t_off >= parent.offset && t_off + t_bytes <= parent.offset + parent.nbytes) {
-                if (parent.upload_failed) {
-                    GGML_LOG_ERROR("ggml-cloudtpu: get_tensor on failed parent slot '%s': %s\n",
-                                   tensor->name, parent.upload_error.c_str());
-                    std::memset(data, bctx->clear_value, size);
-                    return;
-                }
-                std::vector<uint8_t> tmp(parent.nbytes);
-                download_slot_to_host(rt, parent, tmp.data());
-                const size_t rel = (t_off - parent.offset) + offset;
-                std::memcpy(data, tmp.data() + rel, size);
-                return;
-            }
-        }
-
-        // Fill-byte fallback if tensor was never explicitly written (honors buffer clear value).
-        std::memset(data, bctx->clear_value, size);
-    } catch (const std::exception& e) {
-        GGML_LOG_ERROR("ggml-cloudtpu: get_tensor failed for '%s': %s\n",
-                       (tensor && tensor->name[0] != '\0') ? tensor->name : "?",
-                       e.what());
-        std::memset(data, bctx->clear_value, size);
+        std::vector<uint8_t> tmp(slot.nbytes);
+        download_slot_to_host(rt, slot, tmp.data());
+        std::memcpy(data, tmp.data() + offset, size);
+        return;
     }
+
+    // Check if tensor is a sub-slice view inside a parent slot.
+    for (const auto& kv : bctx->slots) {
+        const CloudTpuTensorSlot& parent = kv.second;
+        if (t_off >= parent.offset && t_off + t_bytes <= parent.offset + parent.nbytes) {
+            if (parent.upload_failed) {
+                throw std::runtime_error("ggml-cloudtpu: get_tensor on failed parent slot '" +
+                                         std::string(tensor->name) + "': " + parent.upload_error);
+            }
+            std::vector<uint8_t> tmp(parent.nbytes);
+            download_slot_to_host(rt, parent, tmp.data());
+            const size_t rel = (t_off - parent.offset) + offset;
+            std::memcpy(data, tmp.data() + rel, size);
+            return;
+        }
+    }
+
+    // Fill-byte fallback is reserved for unwritten tensors (honors buffer clear value).
+    std::memset(data, bctx->clear_value, size);
 }
 
 static bool ggml_backend_cloudtpu_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
