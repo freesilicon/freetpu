@@ -129,6 +129,15 @@ _ALLOWED_PERMISSIONS_CHARS = frozenset({"r", "w", "m"})
 _VFIO_CDEV_NAME_RE = re.compile(r"^vfio[0-9]+\Z")
 
 
+def _is_valid_iommufd_cdev_path(path: str) -> bool:
+    """Return True iff `path` is a direct `/dev/vfio/devices/vfio<N>` cdev node path."""
+    prefix = "/dev/vfio/devices/"
+    if not path.startswith(prefix):
+        return False
+    basename = path[len(prefix):]
+    return "/" not in basename and bool(_VFIO_CDEV_NAME_RE.match(basename))
+
+
 @dataclass(frozen=True)
 class DiscoveredChip:
     index: int
@@ -859,16 +868,26 @@ def _format_vfio_devnums(entries: Sequence[Tuple[str, Optional[str]]]) -> Option
     return ",".join(f"{cp}={dn}" for cp, dn in pairs)
 
 
-def _map_physical_chip_indices(chips: Sequence[DiscoveredChip]) -> Dict[str, int]:
+def _map_physical_chip_indices(
+    chips: Sequence[DiscoveredChip],
+    *,
+    chip_id_map: Optional[Dict[str, int]] = None,
+) -> Dict[str, int]:
     """Map each discovered PCI BDF to its physical TPU chip ordinal (`0..N-1`).
 
     Generations with 1 PCI function per physical chip (`v5e`, `v5p`, `v6e`, etc.)
     map 1:1. Dual-function/chiplet generations (`tpu7x` Ironwood `0x0075`/`0x0076`
-    and legacy `v2-v3`) group two PCI functions per physical chip (pairing
-    functions on the same PCI slot `DDDD:BB:DD` when present, or consecutive
-    functions in deterministic enumeration order otherwise), so host bounds match
-    physical chip topology (e.g. 8 Ironwood PCI functions -> 4 physical chips ->
-    `2,2,1`) while every PCI function remains attached for VFIO allocation.
+    and legacy `v2-v3`) pair two PCI functions into one physical chip ONLY when a
+    verified hardware sibling relationship exists:
+    - multifunction siblings sharing the exact same PCI slot `DDDD:BB:DD`
+      (when `slot_count == per_chip`), OR
+    - authoritative runtime IDs from sysfs `chip_id` or explicit `chip_id_map`
+      within the same topology domain (either unique logical device IDs pairing
+      by `rid // per_chip`, or shared physical chip IDs pairing by exact `rid`).
+
+    Unmatched or unverified separate-slot functions are NEVER blindly paired in
+    enumeration order (preventing orphaned functions from two different degraded
+    chips from being counted as a complete chip).
     """
     bdf_to_phys: Dict[str, int] = {}
     slot_counts: Dict[Tuple[str, str], int] = {}
@@ -877,13 +896,52 @@ def _map_physical_chip_indices(chips: Sequence[DiscoveredChip]) -> Dict[str, int
         key = (c.generation, base_slot)
         slot_counts[key] = slot_counts.get(key, 0) + 1
 
+    # Pre-inspect authoritative runtime IDs per multi-function generation so we
+    # can distinguish unique logical IDs (Case A: `rid // per_chip`) from shared
+    # physical chip IDs (Case B: equal `rid`) without guessing across domains.
+    def _raw_id(chip: DiscoveredChip) -> Optional[int]:
+        if chip_id_map and chip.pci_bdf in chip_id_map:
+            return chip_id_map[chip.pci_bdf]
+        return chip.runtime_chip_id
+
+    gen_id_mode: Dict[str, str] = {}
+    gen_rids: Dict[str, List[Tuple[DiscoveredChip, int]]] = {}
+    for c in chips:
+        per_chip = _PCI_FUNCTIONS_PER_PHYSICAL_CHIP.get(c.generation, 1)
+        if per_chip <= 1:
+            continue
+        rid = _raw_id(c)
+        if rid is not None:
+            gen_rids.setdefault(c.generation, []).append((c, int(rid)))
+
+    for gen, pairs in gen_rids.items():
+        per_chip = _PCI_FUNCTIONS_PER_PHYSICAL_CHIP.get(gen, 1)
+        rid_counts: Dict[int, int] = {}
+        rid_domains: Dict[int, set[Tuple[str, Optional[int], str]]] = {}
+        for c, rid in pairs:
+            rid_counts[rid] = rid_counts.get(rid, 0) + 1
+            rid_domains.setdefault(rid, set()).add(_topology_domain_key(c))
+        if all(cnt == 1 for cnt in rid_counts.values()):
+            # Case A: unique logical device IDs (e.g. 0..7 -> chips 0..3 via rid // 2).
+            bucket_counts: Dict[Tuple[Tuple[str, Optional[int], str], int], int] = {}
+            bucket_domains: Dict[int, set[Tuple[str, Optional[int], str]]] = {}
+            for c, rid in pairs:
+                dom = _topology_domain_key(c)
+                b = rid // per_chip
+                bucket_counts[(dom, b)] = bucket_counts.get((dom, b), 0) + 1
+                bucket_domains.setdefault(b, set()).add(dom)
+            if all(cnt <= per_chip for cnt in bucket_counts.values()) and all(
+                len(doms) == 1 for doms in bucket_domains.values()
+            ):
+                gen_id_mode[gen] = "logical"
+        elif all(cnt <= per_chip for cnt in rid_counts.values()) and all(
+            len(doms) == 1 for doms in rid_domains.values()
+        ):
+            # Case B: shared physical chip ID on sibling functions of each chip.
+            gen_id_mode[gen] = "physical"
+
     slot_to_phys: Dict[Tuple[str, str], int] = {}
-    # Key unmatched separate-slot functions by `(generation, topology_domain)` so
-    # losing a function in one NUMA/PCIe root NEVER pairs with or invalidates a
-    # healthy sibling slice in another topology domain.
-    domain_pending_phys: Dict[
-        Tuple[str, Tuple[str, Optional[int], str]], Tuple[int, int]
-    ] = {}
+    verified_group_to_phys: Dict[Tuple[str, Tuple[str, Optional[int], str], int], int] = {}
     next_phys = 0
 
     for c in chips:
@@ -895,27 +953,29 @@ def _map_physical_chip_indices(chips: Sequence[DiscoveredChip]) -> Dict[str, int
 
         base_slot = c.pci_bdf.rsplit(".", 1)[0]
         slot_key = (c.generation, base_slot)
-        if slot_counts.get(slot_key, 0) > 1:
+        if slot_counts.get(slot_key, 0) == per_chip:
             if slot_key not in slot_to_phys:
                 slot_to_phys[slot_key] = next_phys
                 next_phys += 1
             bdf_to_phys[c.pci_bdf] = slot_to_phys[slot_key]
             continue
 
-        pending_key = (c.generation, _topology_domain_key(c))
-        pending = domain_pending_phys.get(pending_key)
-        if pending is not None and pending[1] > 0:
-            phys_id, rem = pending
-            bdf_to_phys[c.pci_bdf] = phys_id
-            if rem - 1 > 0:
-                domain_pending_phys[pending_key] = (phys_id, rem - 1)
-            else:
-                domain_pending_phys.pop(pending_key, None)
-        else:
-            phys_id = next_phys
-            next_phys += 1
-            bdf_to_phys[c.pci_bdf] = phys_id
-            domain_pending_phys[pending_key] = (phys_id, per_chip - 1)
+        rid = _raw_id(c)
+        id_mode = gen_id_mode.get(c.generation)
+        if rid is not None and id_mode is not None:
+            group_val = int(rid) // per_chip if id_mode == "logical" else int(rid)
+            vkey = (c.generation, _topology_domain_key(c), group_val)
+            if vkey not in verified_group_to_phys:
+                verified_group_to_phys[vkey] = next_phys
+                next_phys += 1
+            bdf_to_phys[c.pci_bdf] = verified_group_to_phys[vkey]
+            continue
+
+        # Unverified/orphaned separate-slot function: assign its own singleton
+        # physical ID so `_has_complete_chip_functions` marks it incomplete
+        # instead of falsely pairing orphans from distinct degraded chips.
+        bdf_to_phys[c.pci_bdf] = next_phys
+        next_phys += 1
 
     return bdf_to_phys
 
@@ -1294,6 +1354,14 @@ def _compute_topology_slices(
         len(explicit_numa_ids) == len(domains)
         and len(set(explicit_numa_ids)) == len(domains)
     )
+    # Map every PCIe root to the set of topology domains it spans so we never
+    # publish an ambiguous root-only `pcie-<root>-<chips>` alias when one root
+    # spans multiple NUMA domains (which could shift to another NUMA domain if
+    # the first loses a chip).
+    root_to_domains: Dict[str, set[Tuple[str, Optional[int], str]]] = {}
+    for d_key in domains:
+        root_to_domains.setdefault(d_key[2], set()).add(d_key)
+
     # Map every IOMMU group to the set of domain keys that touch it so we
     # never emit a sub-host slice that splits an IOMMU group across domains
     # (enforced in BOTH legacy VFIO and iommufd/cdev modes).
@@ -1329,14 +1397,23 @@ def _compute_topology_slices(
         discovered_numa = d_key[1]
         pcie_root = d_key[2]
         slice_chip_count = len(slice_phys_indices)
-        # Always emit the stable root-qualified selector (`pcie-<root>-<chips>`)
-        # alongside any unique `numa<node>-<chips>` alias so workloads pinned to
-        # `pcie-<root>-<chips>` (e.g. when two roots share a NUMA node) stay valid
-        # even if a sibling root disappears and makes `numa<node>-<chips>` unique.
+        # Emit stable root-qualified `pcie-<root>-<chips>` whenever the root maps
+        # to a single domain (including shared-NUMA dual-root hosts so losing a
+        # sibling root never breaks workloads pinned to `pcie-<root>-<chips>`).
+        # When one PCIe root spans multiple NUMA domains, suppress the ambiguous
+        # root-only alias and emit domain-qualified `numa<node>-pcie-<root>-<chips>`
+        # alongside any unique `numa<node>-<chips>` selector.
         pcie_root_token = _pci_bdf_token(pcie_root)
-        candidate_names: List[str] = [f"pcie-{pcie_root_token}-{slice_chip_count}"]
+        root_spans_multiple_domains = len(root_to_domains.get(pcie_root, set())) > 1
+        candidate_names: List[str] = []
         if use_explicit_numa and discovered_numa is not None:
-            candidate_names.insert(0, f"numa{discovered_numa}-{slice_chip_count}")
+            candidate_names.append(f"numa{discovered_numa}-{slice_chip_count}")
+        if not root_spans_multiple_domains:
+            candidate_names.append(f"pcie-{pcie_root_token}-{slice_chip_count}")
+        elif discovered_numa is not None:
+            candidate_names.append(
+                f"numa{discovered_numa}-pcie-{pcie_root_token}-{slice_chip_count}"
+            )
         verified_vis = _resolve_verified_visibility_ordinals(
             d_chips,
             chips,
@@ -1454,7 +1531,7 @@ def build_cdi_spec(
         ],
     }
 
-    bdf_to_phys = _map_physical_chip_indices(chips)
+    bdf_to_phys = _map_physical_chip_indices(chips, chip_id_map=chip_id_map)
 
     devices: List[Dict[str, Any]] = []
     seen_group_nodes: Dict[str, Dict[str, Any]] = {}
@@ -2076,7 +2153,7 @@ def validate_cdi_spec(spec: Any) -> List[str]:
                 f"{dc} ({label!r}): effective containerEdits must expose /dev/iommu or /dev/vfio/vfio container node"
             )
         elif has_iommufd:
-            if not any(p.startswith("/dev/vfio/devices/vfio") for p in effective_paths):
+            if not any(_is_valid_iommufd_cdev_path(p) for p in effective_paths):
                 errors.append(
                     f"{dc} ({label!r}): effective containerEdits with /dev/iommu must expose at least one /dev/vfio/devices/vfioN device node"
                 )
@@ -2239,7 +2316,7 @@ def verify_spec_against_host(
     expected_slices_by_name: Dict[str, _TopologySlice] = {}
     for topo_slice in _compute_topology_slices(
         live_chips,
-        _map_physical_chip_indices(live_chips),
+        _map_physical_chip_indices(live_chips, chip_id_map=chip_id_map),
         reserved_names=live_reserved_names,
         chip_id_map=chip_id_map,
     ):

@@ -45,7 +45,10 @@ metadata:
 spec:
   selectors:
     - cel:
-        expression: device.driver == "freetpu.dev" && device.attributes["freetpu.dev"].generation == "v6e"
+        expression: >-
+          device.driver == "freetpu.dev" &&
+          "generation" in device.attributes["freetpu.dev"] &&
+          device.attributes["freetpu.dev"].generation == "v6e"
 ---
 # Example ResourceSlice published by a node-local `freetpu-dra-driver` DaemonSet
 # for a single Cloud TPU v6e-8 host (`0000:00` on NUMA 0, `0000:80` on NUMA 1).
@@ -125,8 +128,11 @@ spec:
             selectors:
               - cel:
                   expression: >-
+                    "numa_node" in device.attributes["freetpu.dev"] &&
                     device.attributes["freetpu.dev"].numa_node == "0" &&
+                    "chips" in device.attributes["freetpu.dev"] &&
                     device.attributes["freetpu.dev"].chips == 4 &&
+                    "memoryGiB" in device.attributes["freetpu.dev"] &&
                     device.attributes["freetpu.dev"].memoryGiB >= 120
 ---
 # Network-isolated 4-chip Cloud TPU workload Pod (NO hostNetwork: true, NO privileged: true).

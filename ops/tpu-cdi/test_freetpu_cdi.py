@@ -2131,17 +2131,30 @@ class FreeTpuCdiTests(unittest.TestCase):
                         vfio_mode="auto",
                     )
 
-                # Incomplete iommufd spec lacking /dev/vfio/devices/vfioN must fail validation.
-                bad_iommufd = {
-                    "cdiVersion": "0.6.0",
-                    "kind": "freetpu.dev/tpu",
-                    "containerEdits": {"deviceNodes": [{"path": "/dev/iommu"}]},
-                    "devices": [{"name": "0", "containerEdits": {"env": ["FOO=bar"]}}],
-                }
-                bad_errs = freetpu_cdi.validate_cdi_spec(bad_iommufd)
-                self.assertTrue(
-                    any("/dev/vfio/devices/vfioN" in e for e in bad_errs), bad_errs
-                )
+                # Incomplete or malformed iommufd cdev paths (`/dev/vfio/devices/vfio`,
+                # non-numeric `/dev/vfio/devices/vfioabc`, or nested paths) must fail validation.
+                for bad_cdev_path in (
+                    None,
+                    "/dev/vfio/devices/vfio",
+                    "/dev/vfio/devices/vfioabc",
+                    "/dev/vfio/devices/vfio0/extra",
+                ):
+                    dev_edits = (
+                        {"env": ["FOO=bar"]}
+                        if bad_cdev_path is None
+                        else {"deviceNodes": [{"path": bad_cdev_path, "type": "c"}]}
+                    )
+                    bad_iommufd = {
+                        "cdiVersion": "0.6.0",
+                        "kind": "freetpu.dev/tpu",
+                        "containerEdits": {"deviceNodes": [{"path": "/dev/iommu"}]},
+                        "devices": [{"name": "0", "containerEdits": dev_edits}],
+                    }
+                    bad_errs = freetpu_cdi.validate_cdi_spec(bad_iommufd)
+                    self.assertTrue(
+                        any("/dev/vfio/devices/vfioN" in e for e in bad_errs),
+                        f"Expected cdev validation error for {bad_cdev_path!r}, got {bad_errs}",
+                    )
 
             # 1e. Linux 6.8+ `CONFIG_IOMMUFD_VFIO_CONTAINER` real char `/dev/vfio/vfio`
             #     with its OWN misc devnum (`10:196`) when legacy `/dev/vfio/<group>`
@@ -3046,6 +3059,141 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertNotIn("TPU_CHIPS_PER_HOST_BOUNDS", all_7x_deg0_env)
                 self.assertNotIn("TPU_ACCELERATOR_TYPE", all_7x_deg0_env)
 
+                # Orphaned Ironwood functions from TWO distinct degraded chips in the same
+                # domain (1 intact chip + 1 orphan from chip 1 + 1 orphan from chip 2 = 4
+                # functions total) MUST NOT be falsely paired into a 2nd complete chip!
+                # Test both multifunction slots (no chip_id) AND verified chip_id cases.
+                mf_orphan_devs = [
+                    {
+                        "bdf": "0000:00:04.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0076",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                        "numa_node": "0",
+                    },
+                    {
+                        "bdf": "0000:00:04.1",
+                        "vendor": "0x1ae0",
+                        "device": "0x0076",
+                        "driver": "vfio-pci",
+                        "iommu_group": "1",
+                        "numa_node": "0",
+                    },
+                    {
+                        "bdf": "0000:00:05.0",  # orphan from chip 1 (05.1 missing)
+                        "vendor": "0x1ae0",
+                        "device": "0x0076",
+                        "driver": "vfio-pci",
+                        "iommu_group": "2",
+                        "numa_node": "0",
+                    },
+                    {
+                        "bdf": "0000:00:06.0",  # orphan from chip 2 (06.1 missing)
+                        "vendor": "0x1ae0",
+                        "device": "0x0076",
+                        "driver": "vfio-pci",
+                        "iommu_group": "3",
+                        "numa_node": "0",
+                    },
+                ]
+                mfo_sys, mfo_dev = _make_mock_pci_vfio(
+                    root / "tpu7x_multifunc_orphans",
+                    devices=mf_orphan_devs,
+                    create_vfio_nodes=["0", "1", "2", "3"],
+                )
+                mfo_chips, mfo_ctrl = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=mfo_sys, dev_root=mfo_dev
+                )
+                mfo_spec = freetpu_cdi.build_cdi_spec(
+                    mfo_chips, mfo_ctrl, single_host_env=True
+                )
+                mfo_by_name = {d["name"]: d for d in mfo_spec["devices"]}
+                self.assertNotIn("numa0-2", mfo_by_name)
+                mfo_all_env = dict(
+                    kv.split("=", 1) for kv in mfo_by_name["all"]["containerEdits"]["env"]
+                )
+                self.assertNotIn("TPU_CHIPS_PER_HOST_BOUNDS", mfo_all_env)
+                self.assertNotIn("TPU_ACCELERATOR_TYPE", mfo_all_env)
+
+                # Separate-slot Ironwood with verified chip_ids {0, 1, 2, 4} (intact chip 0
+                # + orphan 2 from chip 1 + orphan 4 from chip 2): MUST NOT pair 2 & 4!
+                id_orphan_devs = [
+                    {
+                        "bdf": f"0000:00:0{4 + idx:x}.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0076",
+                        "driver": "vfio-pci",
+                        "iommu_group": str(idx),
+                        "numa_node": "0",
+                        "chip_id": str(cid),
+                    }
+                    for idx, cid in enumerate((0, 1, 2, 4))
+                ]
+                ido_sys, ido_dev = _make_mock_pci_vfio(
+                    root / "tpu7x_id_orphans",
+                    devices=id_orphan_devs,
+                    create_vfio_nodes=["0", "1", "2", "3"],
+                )
+                ido_chips, ido_ctrl = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=ido_sys, dev_root=ido_dev
+                )
+                ido_spec = freetpu_cdi.build_cdi_spec(
+                    ido_chips, ido_ctrl, single_host_env=True
+                )
+                ido_by_name = {d["name"]: d for d in ido_spec["devices"]}
+                self.assertNotIn("numa0-2", ido_by_name)
+                ido_all_env = dict(
+                    kv.split("=", 1) for kv in ido_by_name["all"]["containerEdits"]["env"]
+                )
+                self.assertNotIn("TPU_CHIPS_PER_HOST_BOUNDS", ido_all_env)
+                self.assertNotIn("TPU_ACCELERATOR_TYPE", ido_all_env)
+
+                # Healthy multifunction Ironwood (no chip_id required): 04.0/04.1 + 05.0/05.1
+                # on NUMA 0 and 80:00.0/00.1 + 80:01.0/01.1 on NUMA 1 pair cleanly!
+                mf_ok_devs = [
+                    {
+                        "bdf": f"0000:00:0{4 + slot:x}.{fn}",
+                        "vendor": "0x1ae0",
+                        "device": "0x0076",
+                        "driver": "vfio-pci",
+                        "iommu_group": str(slot * 2 + fn),
+                        "numa_node": "0",
+                    }
+                    for slot in range(2)
+                    for fn in range(2)
+                ] + [
+                    {
+                        "bdf": f"0000:80:0{slot:x}.{fn}",
+                        "vendor": "0x1ae0",
+                        "device": "0x0076",
+                        "driver": "vfio-pci",
+                        "iommu_group": str(4 + slot * 2 + fn),
+                        "numa_node": "1",
+                    }
+                    for slot in range(2)
+                    for fn in range(2)
+                ]
+                mfok_sys, mfok_dev = _make_mock_pci_vfio(
+                    root / "tpu7x_multifunc_healthy",
+                    devices=mf_ok_devs,
+                    create_vfio_nodes=[str(i) for i in range(8)],
+                )
+                mfok_chips, mfok_ctrl = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=mfok_sys, dev_root=mfok_dev
+                )
+                mfok_spec = freetpu_cdi.build_cdi_spec(
+                    mfok_chips, mfok_ctrl, single_host_env=True
+                )
+                mfok_by_name = {d["name"]: d for d in mfok_spec["devices"]}
+                self.assertIn("numa0-2", mfok_by_name)
+                self.assertIn("numa1-2", mfok_by_name)
+                mfok_all_env = dict(
+                    kv.split("=", 1) for kv in mfok_by_name["all"]["containerEdits"]["env"]
+                )
+                self.assertEqual(mfok_all_env["TPU_CHIPS_PER_HOST_BOUNDS"], "2,2,1")
+                self.assertEqual(mfok_all_env["TPU_ACCELERATOR_TYPE"], "tpu7x-8")
+
             # Verify PCIe root resolution from sysfs ancestry when endpoints sit behind
             # PCIe switches on distinct downstream bus numbers (without numa_node files).
             # When sysfs supplies NO numa_node, `freetpu.dev/numa-node` MUST be omitted
@@ -3361,6 +3509,70 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertNotIn("TPU_VISIBLE_DEVICES", ovs_env)
                 self.assertEqual(ovs_env["TPU_ACCELERATOR_TYPE"], "v6e-4")
 
+                # When ONE PCIe root (`0000:00`) spans TWO NUMA domains (NUMA 0 with 4 chips
+                # and NUMA 1 with 4 chips), ambiguous root-only `pcie-0000-00-4` MUST be
+                # suppressed so degrading NUMA 0 never retargets `pcie-0000-00-4` onto NUMA 1;
+                # domain-qualified `numa0-pcie-0000-00-4` / `numa1-pcie-0000-00-4` stay distinct.
+                one_root_two_numa_devs = [
+                    {
+                        "bdf": f"0000:00:0{i:x}.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": str(i),
+                        "numa_node": "0",
+                    }
+                    for i in range(4)
+                ] + [
+                    {
+                        "bdf": f"0000:00:0{4 + i:x}.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": str(4 + i),
+                        "numa_node": "1",
+                    }
+                    for i in range(4)
+                ]
+                ortn_sys, ortn_dev = _make_mock_pci_vfio(
+                    root / "one_root_two_numa",
+                    devices=one_root_two_numa_devs,
+                    create_vfio_nodes=[str(i) for i in range(8)],
+                )
+                ortn_chips, ortn_ctrl = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=ortn_sys, dev_root=ortn_dev
+                )
+                ortn_spec = freetpu_cdi.build_cdi_spec(ortn_chips, ortn_ctrl)
+                ortn_by_name = {d["name"]: d for d in ortn_spec["devices"]}
+                self.assertNotIn("pcie-0000-00-4", ortn_by_name)
+                self.assertIn("numa0-4", ortn_by_name)
+                self.assertIn("numa1-4", ortn_by_name)
+                self.assertIn("numa0-pcie-0000-00-4", ortn_by_name)
+                self.assertIn("numa1-pcie-0000-00-4", ortn_by_name)
+                self.assertEqual(
+                    freetpu_cdi.verify_spec_against_host(
+                        ortn_spec, sysfs_root=ortn_sys, dev_root=ortn_dev
+                    ),
+                    [],
+                )
+                # Drop 1 chip from NUMA 0: NUMA 0 selectors withdraw, NUMA 1 stays bound to
+                # `numa1-4` + `numa1-pcie-0000-00-4`, and `pcie-0000-00-4` is STILL not emitted!
+                ortn_deg_sys, ortn_deg_dev = _make_mock_pci_vfio(
+                    root / "one_root_two_numa_deg",
+                    devices=one_root_two_numa_devs[1:],
+                    create_vfio_nodes=[str(i) for i in range(1, 8)],
+                )
+                ortn_deg_chips, ortn_deg_ctrl = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=ortn_deg_sys, dev_root=ortn_deg_dev
+                )
+                ortn_deg_spec = freetpu_cdi.build_cdi_spec(ortn_deg_chips, ortn_deg_ctrl)
+                ortn_deg_by_name = {d["name"]: d for d in ortn_deg_spec["devices"]}
+                self.assertNotIn("pcie-0000-00-4", ortn_deg_by_name)
+                self.assertNotIn("numa0-4", ortn_deg_by_name)
+                self.assertNotIn("numa0-pcie-0000-00-4", ortn_deg_by_name)
+                self.assertIn("numa1-4", ortn_deg_by_name)
+                self.assertIn("numa1-pcie-0000-00-4", ortn_deg_by_name)
+
             # Verify Kubernetes DRA example manifest uses stable resource.k8s.io/v1 API
             # and accurately qualifies Kubernetes 1.34 DRA Topology Manager limitation.
             dra_path = CDI_DIR / "manifests" / "k8s-tpu-dra-example.yaml"
@@ -3369,6 +3581,10 @@ class FreeTpuCdiTests(unittest.TestCase):
             self.assertEqual(dra_text.count("apiVersion: resource.k8s.io/v1"), 3)
             self.assertNotIn("basic:", dra_text)
             self.assertIn("exactly:", dra_text)
+            self.assertIn('"generation" in device.attributes["freetpu.dev"]', dra_text)
+            self.assertIn('"numa_node" in device.attributes["freetpu.dev"]', dra_text)
+            self.assertIn('"chips" in device.attributes["freetpu.dev"]', dra_text)
+            self.assertIn('"memoryGiB" in device.attributes["freetpu.dev"]', dra_text)
             self.assertIn("hint provider", dra_text)
             self.assertIn("separate placement mechanism", dra_text)
             self.assertIn("numactl", dra_text)
