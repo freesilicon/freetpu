@@ -656,26 +656,305 @@ bool run_pjrt_api_proof(void* lib, bool mock_mode, int num_runs) {
   return ok && maps_ok;
 }
 
+bool run_freetile_proof(void* lib, bool mock_mode, bool do_multitile, bool do_quant, int num_runs) {
+  using fn_config_default_t = ot_config_t (*)(void);
+  using fn_context_create_t = ot_status_t (*)(const ot_config_t*, ot_context_t**);
+  using fn_context_destroy_t = void (*)(ot_context_t*);
+  using fn_last_error_t = const char* (*)(const ot_context_t*);
+  using fn_buffer_alloc_t = ot_status_t (*)(ot_context_t*, size_t, ot_buffer_t**);
+  using fn_buffer_free_t = void (*)(ot_buffer_t*);
+  using fn_buffer_h2d_t = ot_status_t (*)(ot_context_t*, ot_buffer_t*, const void*, size_t);
+  using fn_buffer_d2h_t = ot_status_t (*)(ot_context_t*, const ot_buffer_t*, void*, size_t);
+  using fn_desc_default_t = ot_freetile_gemm_desc_t (*)(uint32_t, uint32_t, uint32_t);
+  using fn_matmul_bf16_ex_t = ot_status_t (*)(ot_context_t*, const ot_buffer_t*,
+                                              const ot_buffer_t*, ot_buffer_t*,
+                                              const ot_freetile_gemm_desc_t*, ot_exec_stats_t*);
+  using fn_matmul_quant_t = ot_status_t (*)(ot_context_t*, const ot_buffer_t*,
+                                            const ot_buffer_t*, const ot_buffer_t*,
+                                            ot_buffer_t*, const ot_freetile_gemm_desc_t*,
+                                            ot_exec_stats_t*);
+
+  auto sym = [&](const char* name) -> void* { return dlsym(lib, name); };
+  auto p_config_default = reinterpret_cast<fn_config_default_t>(sym("ot_config_default"));
+  auto p_context_create = reinterpret_cast<fn_context_create_t>(sym("ot_context_create"));
+  auto p_context_destroy = reinterpret_cast<fn_context_destroy_t>(sym("ot_context_destroy"));
+  auto p_last_error = reinterpret_cast<fn_last_error_t>(sym("ot_context_last_error"));
+  auto p_buffer_alloc = reinterpret_cast<fn_buffer_alloc_t>(sym("ot_buffer_alloc"));
+  auto p_buffer_free = reinterpret_cast<fn_buffer_free_t>(sym("ot_buffer_free"));
+  auto p_buffer_h2d = reinterpret_cast<fn_buffer_h2d_t>(sym("ot_buffer_h2d"));
+  auto p_buffer_d2h = reinterpret_cast<fn_buffer_d2h_t>(sym("ot_buffer_d2h"));
+  auto p_desc_default = reinterpret_cast<fn_desc_default_t>(sym("ot_freetile_gemm_desc_default"));
+  auto p_matmul_bf16_ex = reinterpret_cast<fn_matmul_bf16_ex_t>(sym("ot_matmul_bf16_ex"));
+  auto p_matmul_quant = reinterpret_cast<fn_matmul_quant_t>(sym("ot_matmul_quant"));
+  if (!p_config_default || !p_context_create || !p_context_destroy || !p_buffer_alloc ||
+      !p_buffer_free || !p_buffer_h2d || !p_buffer_d2h || !p_desc_default ||
+      !p_matmul_bf16_ex || !p_matmul_quant) {
+    fprintf(stderr, "Missing FreeTile symbols in libopentpu\n");
+    return false;
+  }
+
+  ot_config_t cfg = p_config_default();
+  cfg.mock_mode = mock_mode ? 1u : 0u;
+  ot_context_t* ctx = nullptr;
+  if (p_context_create(&cfg, &ctx) != OT_OK || !ctx) {
+    fprintf(stderr, "ot_context_create failed\n");
+    return false;
+  }
+
+  const int measured_runs = (num_runs > 0) ? num_runs : 1;
+  bool ok = true;
+  auto calc_gbps = [](uint64_t bytes, double us) -> double {
+    if (us <= 0.0) return 0.0;
+    return static_cast<double>(bytes) / (us * 1e3);
+  };
+  struct TimingSummary {
+    uint64_t min_us = 0;
+    double med_us = 0.0;
+    double mean_us = 0.0;
+  };
+  auto summarize_us = [](std::vector<uint64_t> vals) -> TimingSummary {
+    TimingSummary s{};
+    if (vals.empty()) return s;
+    std::sort(vals.begin(), vals.end());
+    s.min_us = vals.front();
+    const size_t n = vals.size();
+    s.med_us = (n & 1u)
+        ? static_cast<double>(vals[n / 2u])
+        : (0.5 * static_cast<double>(vals[n / 2u - 1u] + vals[n / 2u]));
+    double sum = 0.0;
+    for (uint64_t v : vals) sum += static_cast<double>(v);
+    s.mean_us = sum / static_cast<double>(n);
+    return s;
+  };
+
+  if (do_multitile) {
+    struct Shape { uint32_t m, k, n; };
+    const Shape shapes[] = {
+        {128u, 512u, 512u},
+        {256u, 512u, 256u},
+        {128u, 4096u, 4096u},
+    };
+    for (const Shape& s : shapes) {
+      if (mock_mode && s.k >= 4096u) continue;  // Keep mock O(M*K*N) host test fast
+      std::vector<uint16_t> a(static_cast<size_t>(s.m) * s.k);
+      std::vector<uint16_t> b(static_cast<size_t>(s.k) * s.n);
+      std::vector<uint16_t> c(static_cast<size_t>(s.m) * s.n, 0u);
+      for (size_t i = 0; i < a.size(); ++i) {
+        a[i] = f32_to_bf16(static_cast<float>(static_cast<int>(i % 13) - 6) * 0.125f);
+      }
+      for (size_t i = 0; i < b.size(); ++i) {
+        b[i] = f32_to_bf16(static_cast<float>(static_cast<int>(i % 11) - 5) * 0.0625f);
+      }
+
+      ot_buffer_t *ba = nullptr, *bb = nullptr, *bc = nullptr;
+      if (p_buffer_alloc(ctx, a.size() * 2u, &ba) != OT_OK ||
+          p_buffer_alloc(ctx, b.size() * 2u, &bb) != OT_OK ||
+          p_buffer_alloc(ctx, c.size() * 2u, &bc) != OT_OK ||
+          p_buffer_h2d(ctx, ba, a.data(), a.size() * 2u) != OT_OK ||
+          p_buffer_h2d(ctx, bb, b.data(), b.size() * 2u) != OT_OK) {
+        fprintf(stderr, "[FREETILE_BF16] HBM setup failed for %ux%ux%u: %s\n",
+                s.m, s.k, s.n, p_last_error ? p_last_error(ctx) : "");
+        p_buffer_free(bc); p_buffer_free(bb); p_buffer_free(ba);
+        ok = false;
+        break;
+      }
+
+      const ot_freetile_gemm_desc_t desc = p_desc_default(s.m, s.k, s.n);
+      ot_exec_stats_t stats{};
+      // 1 warmup + `measured_runs` timed executions.
+      bool exec_ok = (p_matmul_bf16_ex(ctx, ba, bb, bc, &desc, &stats) == OT_OK);
+      std::vector<uint64_t> hw_runs;
+      std::vector<uint64_t> wall_runs;
+      hw_runs.reserve(static_cast<size_t>(measured_runs));
+      wall_runs.reserve(static_cast<size_t>(measured_runs));
+      for (int r = 0; exec_ok && r < measured_runs; ++r) {
+        exec_ok = (p_matmul_bf16_ex(ctx, ba, bb, bc, &desc, &stats) == OT_OK);
+        if (exec_ok) {
+          hw_runs.push_back(stats.hw_us);
+          wall_runs.push_back(stats.wall_us);
+        }
+      }
+      if (!exec_ok || p_buffer_d2h(ctx, bc, c.data(), c.size() * 2u) != OT_OK) {
+        fprintf(stderr, "[FREETILE_BF16] exec failed for %ux%ux%u: %s\n",
+                s.m, s.k, s.n, p_last_error ? p_last_error(ctx) : "");
+        p_buffer_free(bc); p_buffer_free(bb); p_buffer_free(ba);
+        ok = false;
+        break;
+      }
+
+      // Verify exact sample / full parity against FP32 reference.
+      std::vector<uint16_t> ref(c.size());
+      for (uint32_t m = 0; m < s.m; ++m) {
+        for (uint32_t n = 0; n < s.n; ++n) {
+          float acc = 0.0f;
+          for (uint32_t k = 0; k < s.k; ++k) {
+            acc += bf16_to_f32(a[static_cast<size_t>(m) * s.k + k]) *
+                   bf16_to_f32(b[static_cast<size_t>(k) * s.n + n]);
+          }
+          ref[static_cast<size_t>(m) * s.n + n] = f32_to_bf16(acc);
+        }
+      }
+      CompareResult cmp = compare_bf16(c, ref);
+      const TimingSummary hw_sum = summarize_us(hw_runs);
+      const TimingSummary wall_sum = summarize_us(wall_runs);
+      printf("[FREETILE_BF16] %ux%ux%u runs=%d tiles=(%u,%u,%u) mismatches=%zu/%zu max_diff=%.6f "
+             "hw_us(min/med/mean)=%llu/%.1f/%.1f wall_us(min/med/mean)=%llu/%.1f/%.1f hbm_gbps=%.2f\n",
+             s.m, s.k, s.n, measured_runs, stats.tiles_m, stats.tiles_k, stats.tiles_n,
+             cmp.mismatches, ref.size(), cmp.max_diff,
+             static_cast<unsigned long long>(hw_sum.min_us), hw_sum.med_us, hw_sum.mean_us,
+             static_cast<unsigned long long>(wall_sum.min_us), wall_sum.med_us, wall_sum.mean_us,
+             calc_gbps(stats.hbm_bytes_moved, hw_sum.med_us));
+      if (cmp.mismatches != 0) {
+        fprintf(stderr, "BF16 mismatch first idx=%zu got=0x%04x ref=0x%04x\n",
+                cmp.first_bad_idx, cmp.first_got, cmp.first_ref);
+        ok = false;
+      }
+      p_buffer_free(bc); p_buffer_free(bb); p_buffer_free(ba);
+    }
+  }
+
+  if (ok && do_quant) {
+    struct QCase { const char* label; uint32_t rhs_dtype; uint32_t qmode; uint32_t m, k, n; };
+    const QCase qcases[] = {
+        {"Q8_0_BLK32",  OT_DTYPE_Q8_0, OT_QUANT_BLOCK_32,    128u, 512u, 512u},
+        {"Q4_0_BLK32",  OT_DTYPE_Q4_0, OT_QUANT_BLOCK_32,    128u, 512u, 512u},
+        {"INT8_PERCH",  OT_DTYPE_INT8, OT_QUANT_PER_CHANNEL, 128u, 512u, 512u},
+        {"INT4_PERCH",  OT_DTYPE_Q4_0, OT_QUANT_PER_CHANNEL, 128u, 512u, 512u},
+        {"Q8_0_LLM",    OT_DTYPE_Q8_0, OT_QUANT_BLOCK_32,    128u, 4096u, 4096u},
+        {"Q4_0_LLM",    OT_DTYPE_Q4_0, OT_QUANT_BLOCK_32,    128u, 4096u, 4096u},
+    };
+    for (const QCase& qc : qcases) {
+      if (mock_mode && qc.k >= 4096u) continue;
+      const bool is_q4 = (qc.rhs_dtype == OT_DTYPE_Q4_0);
+      const bool is_per_channel = (qc.qmode == OT_QUANT_PER_CHANNEL);
+      std::vector<uint16_t> qa(static_cast<size_t>(qc.m) * qc.k);
+      for (size_t i = 0; i < qa.size(); ++i) {
+        qa[i] = f32_to_bf16(static_cast<float>(static_cast<int>(i % 9) - 4) * 0.125f);
+      }
+      std::vector<int8_t> w_i8(static_cast<size_t>(qc.k) * qc.n);
+      std::vector<uint8_t> w_q4(static_cast<size_t>(qc.k) * qc.n / 2u, 0u);
+      const size_t sc_count = is_per_channel
+          ? static_cast<size_t>(qc.n)
+          : ((static_cast<size_t>(qc.k) / 32u) * qc.n);
+      std::vector<float> sc(sc_count);
+      for (size_t i = 0; i < sc.size(); ++i) {
+        const size_t mod = is_per_channel ? 11u : 7u;
+        sc[i] = 0.0625f * static_cast<float>((i % mod) + 1u);
+      }
+      for (uint32_t k = 0; k < qc.k; ++k) {
+        for (uint32_t n = 0; n < qc.n; ++n) {
+          const int mod = is_q4 ? 15 : 31;
+          const int off = is_q4 ? -7 : -15;
+          const int8_t v = static_cast<int8_t>(static_cast<int>((k * 13u + n * 7u) % mod) + off);
+          w_i8[static_cast<size_t>(k) * qc.n + n] = v;
+          const size_t lin = static_cast<size_t>(k) * qc.n + n;
+          const uint32_t nib = static_cast<uint32_t>(v + 8) & 0xfu;
+          w_q4[lin >> 1] |= static_cast<uint8_t>((lin & 1u) ? (nib << 4) : nib);
+        }
+      }
+
+      ot_buffer_t *bqa = nullptr, *bqq = nullptr, *bqsc = nullptr, *bqout = nullptr;
+      const size_t qbytes = is_q4 ? w_q4.size() : w_i8.size();
+      if (p_buffer_alloc(ctx, qa.size() * 2u, &bqa) != OT_OK ||
+          p_buffer_alloc(ctx, qbytes, &bqq) != OT_OK ||
+          p_buffer_alloc(ctx, sc.size() * sizeof(float), &bqsc) != OT_OK ||
+          p_buffer_alloc(ctx, static_cast<size_t>(qc.m) * qc.n * 2u, &bqout) != OT_OK ||
+          p_buffer_h2d(ctx, bqa, qa.data(), qa.size() * 2u) != OT_OK ||
+          p_buffer_h2d(ctx, bqq, is_q4 ? static_cast<const void*>(w_q4.data()) : w_i8.data(), qbytes) != OT_OK ||
+          p_buffer_h2d(ctx, bqsc, sc.data(), sc.size() * sizeof(float)) != OT_OK) {
+        fprintf(stderr, "[FREETILE_QUANT:%s] HBM setup failed: %s\n",
+                qc.label, p_last_error ? p_last_error(ctx) : "");
+        p_buffer_free(bqout); p_buffer_free(bqsc); p_buffer_free(bqq); p_buffer_free(bqa);
+        ok = false;
+        break;
+      }
+
+      ot_freetile_gemm_desc_t desc = p_desc_default(qc.m, qc.k, qc.n);
+      desc.rhs_dtype = qc.rhs_dtype;
+      desc.quant_mode = qc.qmode;
+      desc.quant_group_size = is_per_channel ? 0u : OT_QK8_0;
+      desc.scale_dtype = OT_DTYPE_F32;
+      ot_exec_stats_t stats{};
+      std::vector<uint16_t> out_c(static_cast<size_t>(qc.m) * qc.n, 0u);
+      // 1 warmup + `measured_runs` timed executions.
+      bool exec_ok = (p_matmul_quant(ctx, bqa, bqq, bqsc, bqout, &desc, &stats) == OT_OK);
+      std::vector<uint64_t> hw_runs;
+      std::vector<uint64_t> wall_runs;
+      hw_runs.reserve(static_cast<size_t>(measured_runs));
+      wall_runs.reserve(static_cast<size_t>(measured_runs));
+      for (int r = 0; exec_ok && r < measured_runs; ++r) {
+        exec_ok = (p_matmul_quant(ctx, bqa, bqq, bqsc, bqout, &desc, &stats) == OT_OK);
+        if (exec_ok) {
+          hw_runs.push_back(stats.hw_us);
+          wall_runs.push_back(stats.wall_us);
+        }
+      }
+      if (!exec_ok || p_buffer_d2h(ctx, bqout, out_c.data(), out_c.size() * 2u) != OT_OK) {
+        fprintf(stderr, "[FREETILE_QUANT:%s] exec failed: %s\n",
+                qc.label, p_last_error ? p_last_error(ctx) : "");
+        p_buffer_free(bqout); p_buffer_free(bqsc); p_buffer_free(bqq); p_buffer_free(bqa);
+        ok = false;
+        break;
+      }
+
+      std::vector<uint16_t> ref(out_c.size());
+      for (uint32_t m = 0; m < qc.m; ++m) {
+        for (uint32_t n = 0; n < qc.n; ++n) {
+          float acc = 0.0f;
+          for (uint32_t k = 0; k < qc.k; ++k) {
+            const float raw_s = is_per_channel ? sc[n] : sc[(k / 32u) * qc.n + n];
+            const float s = bf16_to_f32(f32_to_bf16(raw_s));
+            const float w = bf16_to_f32(f32_to_bf16(static_cast<float>(w_i8[static_cast<size_t>(k) * qc.n + n]) * s));
+            acc += bf16_to_f32(qa[static_cast<size_t>(m) * qc.k + k]) * w;
+          }
+          ref[static_cast<size_t>(m) * qc.n + n] = f32_to_bf16(acc);
+        }
+      }
+      CompareResult cmp = compare_bf16(out_c, ref);
+      const TimingSummary hw_sum = summarize_us(hw_runs);
+      const TimingSummary wall_sum = summarize_us(wall_runs);
+      printf("[FREETILE_QUANT:%s] %ux%ux%u runs=%d mismatches=%zu/%zu max_diff=%.6f "
+             "hw_us(min/med/mean)=%llu/%.1f/%.1f wall_us(min/med/mean)=%llu/%.1f/%.1f hbm_gbps=%.2f\n",
+             qc.label, qc.m, qc.k, qc.n, measured_runs, cmp.mismatches, ref.size(), cmp.max_diff,
+             static_cast<unsigned long long>(hw_sum.min_us), hw_sum.med_us, hw_sum.mean_us,
+             static_cast<unsigned long long>(wall_sum.min_us), wall_sum.med_us, wall_sum.mean_us,
+             calc_gbps(stats.hbm_bytes_moved, hw_sum.med_us));
+      if (cmp.mismatches != 0) ok = false;
+      p_buffer_free(bqout); p_buffer_free(bqsc); p_buffer_free(bqq); p_buffer_free(bqa);
+    }
+  }
+
+  bool maps_ok = check_maps_clean("FREETILE_ACTIVE", mock_mode);
+  p_context_destroy(ctx);
+  return ok && maps_ok;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   bool mock_mode = false;
+  bool do_multitile = false;
+  bool do_quant = false;
   int num_runs = 3;
   std::string lib_path;
 
   for (int i = 1; i < argc; ++i) {
     if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
-      printf("Usage: %s [--mock] [--lib <path>] [--runs <N>=3] [--help]\n", argv[0]);
+      printf("Usage: %s [--mock] [--lib <path>] [--runs <N>=3] [--multitile] [--quant] [--help]\n", argv[0]);
       return 0;
     } else if (std::strcmp(argv[i], "--mock") == 0) {
       mock_mode = true;
+    } else if (std::strcmp(argv[i], "--multitile") == 0) {
+      do_multitile = true;
+    } else if (std::strcmp(argv[i], "--quant") == 0) {
+      do_quant = true;
     } else if (std::strcmp(argv[i], "--lib") == 0 && i + 1 < argc) {
       lib_path = argv[++i];
     } else if (std::strcmp(argv[i], "--runs") == 0 && i + 1 < argc) {
       num_runs = std::atoi(argv[++i]);
       if (num_runs < 3) num_runs = 3;
     } else {
-      fprintf(stderr, "Usage: %s [--mock] [--lib <path>] [--runs <N>=3] [--help]\n", argv[0]);
+      fprintf(stderr, "Usage: %s [--mock] [--lib <path>] [--runs <N>=3] [--multitile] [--quant] [--help]\n", argv[0]);
       return 1;
     }
   }
@@ -686,9 +965,12 @@ int main(int argc, char** argv) {
   printf("Loaded libopentpu via dlopen: %s\n", resolved.c_str());
 
   bool c_ok = run_c_api_proof(lib_a, mock_mode, num_runs);
+  bool ft_ok = (!do_multitile && !do_quant)
+      ? true
+      : run_freetile_proof(lib_a, mock_mode, do_multitile, do_quant, num_runs);
   bool maps_a_ok = check_maps_clean("C_API_DONE", mock_mode);
   dlclose(lib_a);
-  if (!c_ok || !maps_a_ok) return 3;
+  if (!c_ok || !ft_ok || !maps_a_ok) return 3;
 
   // Fresh dlopen for Part B: GetPjrtApi() end-to-end proof.
   void* lib_b = open_opentpu_library(resolved, argv[0], nullptr);
