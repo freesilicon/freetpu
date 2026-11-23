@@ -597,8 +597,8 @@ def parse_tpu_info_output(output: str) -> Dict[str, _TpuInfoRow]:
     """Parse `tpu-info` stdout tables (both Unicode box and ASCII pipe styles).
 
     Supports both:
-    - Modern `tpu-info` dashboard tables: `TPU Device Status` (Memory Usage +
-      TensorCore Duty Cycle, ignoring Memory Bar Gauge / HBM Bandwidth Util
+    - Modern `tpu-info` dashboard tables: `TPU Device Status` (Memory Usage,
+      HBM Bandwidth Util, and TensorCore Duty Cycle, ignoring Memory Bar Gauge
       percentages) and `TPU Process Monitor` (Device Path / VFIO Path + PID).
     - Classic `tpu-info` tables: `TPU Chips` and `TPU Runtime Utilization`,
       keeping standalone `TensorCore Utilization` tables isolated.
@@ -651,6 +651,8 @@ def parse_tpu_info_output(output: str) -> Dict[str, _TpuInfoRow]:
                     col_map["mem"] = idx
                 elif "duty cycle" in hdr:
                     col_map["duty"] = idx
+                elif "bandwidth" in hdr or ("hbm" in hdr and "util" in hdr):
+                    col_map["hbm_bw"] = idx
                 elif "path" in hdr or "vfio" in hdr:
                     col_map["path"] = idx
                 elif hdr == "pid":
@@ -669,6 +671,10 @@ def parse_tpu_info_output(output: str) -> Dict[str, _TpuInfoRow]:
                     col_map["mem"] = idx
                 elif "duty" not in col_map and "duty cycle" in hdr:
                     col_map["duty"] = idx
+                elif "hbm_bw" not in col_map and (
+                    "bandwidth" in hdr or ("hbm" in hdr and "util" in hdr)
+                ):
+                    col_map["hbm_bw"] = idx
                 elif "path" not in col_map and ("path" in hdr or "vfio" in hdr):
                     col_map["path"] = idx
                 elif "pid" not in col_map and hdr == "pid":
@@ -680,6 +686,7 @@ def parse_tpu_info_output(output: str) -> Dict[str, _TpuInfoRow]:
             row.in_util_table = True
             mem_idx = col_map.get("mem")
             duty_idx = col_map.get("duty")
+            bw_idx = col_map.get("hbm_bw")
             mem_text = (
                 cells[mem_idx]
                 if mem_idx is not None and mem_idx < len(cells)
@@ -702,10 +709,17 @@ def parse_tpu_info_output(output: str) -> Dict[str, _TpuInfoRow]:
                 pct_val = float(pct_match.group(1))
                 if math.isfinite(pct_val) and pct_val >= 0.0:
                     row.duty_cycle_percent = pct_val
+            if bw_idx is not None and bw_idx < len(cells):
+                bw_match = _PCT_RE.search(cells[bw_idx])
+                if bw_match:
+                    bw_val = float(bw_match.group(1))
+                    if math.isfinite(bw_val) and bw_val >= 0.0:
+                        row.hbm_bw_util_percent = bw_val
         elif section == "device_status":
             row = rows.setdefault(chip_key, _TpuInfoRow(chip_key=chip_key))
             row.in_util_table = True
             mem_idx = col_map.get("mem", 1)
+            bw_idx = col_map.get("hbm_bw", 3 if len(cells) >= 5 else -1)
             duty_idx = col_map.get("duty", 4)
             if mem_idx < len(cells):
                 mem_match = _MEM_PAIR_RE.search(cells[mem_idx])
@@ -715,6 +729,12 @@ def parse_tpu_info_output(output: str) -> Dict[str, _TpuInfoRow]:
                     if used_bytes >= 0 and total_bytes > 0:
                         row.hbm_used_bytes = used_bytes
                         row.hbm_total_bytes = total_bytes
+            if 0 <= bw_idx < len(cells):
+                bw_match = _PCT_RE.search(cells[bw_idx])
+                if bw_match:
+                    bw_val = float(bw_match.group(1))
+                    if math.isfinite(bw_val) and bw_val >= 0.0:
+                        row.hbm_bw_util_percent = bw_val
             if duty_idx < len(cells):
                 pct_match = _PCT_RE.search(cells[duty_idx])
                 if pct_match:
@@ -858,7 +878,7 @@ _PY_METRICS_SUBPROCESS_HELPER = (
     "    if 'timeout' in sig.parameters:\n"
     "        kw['timeout'] = timeout_s\n"
     "    return fn(chip, **kw)\n"
-    "def _verify_raw_per_chip_duty(usage_rows, dpc):\n"
+    "def _verify_raw_ironwood_duty(usage_rows, dpc, *, per_chip_mode):\n"
     "    raw_fn = getattr(m, 'get_metric_data', None)\n"
     "    if not callable(raw_fn):\n"
     "        return None\n"
@@ -897,14 +917,16 @@ _PY_METRICS_SUBPROCESS_HELPER = (
     "            hbm_ids.add(int(str(did).strip(), 10))\n"
     "        except Exception:\n"
     "            return False\n"
-    "    expected_hbm = {cid * dpc + off for cid in raw_ids for off in range(dpc)}\n"
-    "    return bool(raw_ids) and expected_hbm == hbm_ids\n"
+    "    if per_chip_mode:\n"
+    "        expected_hbm = {cid * dpc + off for cid in raw_ids for off in range(dpc)}\n"
+    "        return bool(raw_ids) and expected_hbm == hbm_ids\n"
+    "    return bool(raw_ids) and raw_ids == hbm_ids\n"
     "per_chip_fallback = False\n"
     "duty_ids_verified = False\n"
     "new_fn = getattr(m, 'get_chip_usage_new', None) if chip_attr == 'V7X' else None\n"
     "if chip_attr == 'V7X' and layout == 'per-chip':\n"
     "    rows = _invoke(m.get_chip_usage)\n"
-    "    v_ok = _verify_raw_per_chip_duty(rows, 2)\n"
+    "    v_ok = _verify_raw_ironwood_duty(rows, 2, per_chip_mode=True)\n"
     "    if v_ok is True:\n"
     "        duty_ids_verified = True\n"
     "    elif v_ok is False:\n"
@@ -912,6 +934,11 @@ _PY_METRICS_SUBPROCESS_HELPER = (
     "elif callable(new_fn):\n"
     "    try:\n"
     "        rows = _invoke(new_fn)\n"
+    "        v_ok = _verify_raw_ironwood_duty(rows, 2, per_chip_mode=False)\n"
+    "        if v_ok is True:\n"
+    "            duty_ids_verified = True\n"
+    "        elif v_ok is False:\n"
+    "            per_chip_fallback = True\n"
     "    except (AssertionError, ValueError):\n"
     "        rows = _invoke(m.get_chip_usage)\n"
     "        per_chip_fallback = True\n"
@@ -964,14 +991,18 @@ def _verify_raw_python_per_chip_duty(
     addr: str,
     usage_rows: Sequence[Any],
     devices_per_chip: int,
+    *,
+    per_chip_mode: bool = True,
 ) -> Optional[bool]:
-    """Verify raw `tensorcore.dutycycle` chip IDs against HBM core IDs when `get_metric_data` is available.
+    """Verify raw `tensorcore.dutycycle` IDs and populated protobuf gauges when `get_metric_data` is available.
 
     Returns:
-      - `True` when raw duty chip IDs exist, every gauge is populated/valid, and
-        expanding `chip_id * devices_per_chip + offset` matches the HBM core IDs 1:1.
-      - `False` when raw duty data is present/queried and either mismatches HBM core
-        IDs (e.g. HBM cores `{0, 1}` paired with physical chip `1`) or has unset gauges.
+      - `True` when raw duty IDs exist, every gauge is populated/valid (not unset
+        protobuf default `0.0`), and IDs match HBM core IDs 1:1 (expanding
+        `chip_id * devices_per_chip + offset` when `per_chip_mode=True`, or
+        direct `raw_ids == hbm_ids` when `per_chip_mode=False`).
+      - `False` when raw duty data is queried and either mismatches HBM core IDs
+        or contains an unset/invalid protobuf gauge.
       - `None` when `get_metric_data` is unavailable or raises.
     """
     raw_fn = getattr(metrics_mod, "get_metric_data", None)
@@ -1002,12 +1033,14 @@ def _verify_raw_python_per_chip_duty(
         if did_int is None:
             return False
         hbm_ids.add(did_int)
-    expected_hbm = {
-        cid * devices_per_chip + off
-        for cid in raw_ids
-        for off in range(devices_per_chip)
-    }
-    return bool(raw_ids) and expected_hbm == hbm_ids
+    if per_chip_mode:
+        expected_hbm = {
+            cid * devices_per_chip + off
+            for cid in raw_ids
+            for off in range(devices_per_chip)
+        }
+        return bool(raw_ids) and expected_hbm == hbm_ids
+    return bool(raw_ids) and raw_ids == hbm_ids
 
 
 def _parse_python_usage_entries(
@@ -1139,7 +1172,7 @@ def _query_tpu_info_python_metrics(
                 if chip_attr == "V7X" and grpc_duty_layout == "per-chip" and callable(get_chip_usage_legacy):
                     box["rows"] = _invoke_mock(get_chip_usage_legacy)
                     v_ok = _verify_raw_python_per_chip_duty(
-                        cached_metrics_mod, addr, box["rows"] or [], inferred_dpc
+                        cached_metrics_mod, addr, box["rows"] or [], inferred_dpc, per_chip_mode=True
                     )
                     if v_ok is True:
                         box["duty_ids_verified"] = True
@@ -1148,6 +1181,13 @@ def _query_tpu_info_python_metrics(
                 elif callable(get_chip_usage_new):
                     try:
                         box["rows"] = _invoke_mock(get_chip_usage_new)
+                        v_ok = _verify_raw_python_per_chip_duty(
+                            cached_metrics_mod, addr, box["rows"] or [], inferred_dpc, per_chip_mode=False
+                        )
+                        if v_ok is True:
+                            box["duty_ids_verified"] = True
+                        elif v_ok is False:
+                            box["per_chip_fallback"] = True
                     except (AssertionError, ValueError):
                         if callable(get_chip_usage_legacy):
                             box["rows"] = _invoke_mock(get_chip_usage_legacy)
@@ -2123,9 +2163,22 @@ def discover_tpu_devices(
 
         aer_correctable, aer_fatal = read_pcie_aer_counters(entry)
 
+        # A VFIO group is exclusive to this TPU ONLY when we verified the full
+        # kernel `/sys/kernel/iommu_groups/<group>/devices` membership and it
+        # contains strictly this single PCI BDF (no sibling TPUs or non-TPU devices).
+        full_members = group_members.get(iommu_group, set()) | ({entry.name} if iommu_group else set())
+        vfio_group_exclusive = (
+            driver == "vfio-pci"
+            and bool(iommu_group)
+            and group_dir_readable.get(iommu_group, False)
+            and full_members == {entry.name}
+        )
+
         # Group dual-core legacy TPU v2/v3 (0x0027) PCI functions sharing the same
         # base PCI address (`DDDD:BB:DD`) into one physical chip record while
         # retaining per-function PCIe AER counters keyed by each sibling's own BDF.
+        # Verify sibling IOMMU group membership exclusivity before attributing
+        # sibling VFIO group PIDs or keeping `vfio_group_exclusive=True`.
         if device_id in LEGACY_DUAL_FUNCTION_DEVICE_IDS:
             base_addr = entry.name.rsplit(".", 1)[0]
             existing = legacy_by_base_addr.get(base_addr)
@@ -2139,24 +2192,23 @@ def discover_tpu_devices(
                     existing.hbm_total_bytes = nominal_hbm if nominal_hbm > 0 else None
                 if aer_correctable is not None or aer_fatal is not None:
                     existing.sibling_aer_counters[entry.name] = (aer_correctable, aer_fatal)
-                if (
-                    iommu_group
-                    and iommu_group != existing.iommu_group
-                    and iommu_group not in existing.sibling_iommu_groups
-                ):
-                    existing.sibling_iommu_groups.append(iommu_group)
+                if iommu_group and iommu_group != existing.iommu_group:
+                    existing.vfio_group_exclusive = (
+                        existing.vfio_group_exclusive and vfio_group_exclusive
+                    )
+                    if vfio_group_exclusive and iommu_group not in existing.sibling_iommu_groups:
+                        existing.sibling_iommu_groups.append(iommu_group)
+                else:
+                    same_group_exclusive = (
+                        driver == "vfio-pci"
+                        and bool(iommu_group)
+                        and group_dir_readable.get(iommu_group, False)
+                        and full_members <= {existing.pci_bdf, entry.name}
+                    )
+                    existing.vfio_group_exclusive = (
+                        existing.vfio_group_exclusive and same_group_exclusive
+                    )
                 continue
-
-        # A VFIO group is exclusive to this TPU ONLY when we verified the full
-        # kernel `/sys/kernel/iommu_groups/<group>/devices` membership and it
-        # contains strictly this single PCI BDF (no sibling TPUs or non-TPU devices).
-        full_members = group_members.get(iommu_group, set()) | ({entry.name} if iommu_group else set())
-        vfio_group_exclusive = (
-            driver == "vfio-pci"
-            and bool(iommu_group)
-            and group_dir_readable.get(iommu_group, False)
-            and full_members == {entry.name}
-        )
 
         chip = TpuTelemetry(
             chip_index=len(discovered),
@@ -2442,12 +2494,27 @@ def _sanitize_fallback_duty_rows(
     if inferred_dpc is None or inferred_dpc <= 1:
         return working
 
+    def _strip_unverified_ironwood_zeros(src_rows: Dict[str, _TpuInfoRow]) -> Dict[str, _TpuInfoRow]:
+        """Clear `0.0` duty readings whose protobuf gauge presence was not verified
+        so stock `tpu-info` / `get_chip_usage_new()` / `get_chip_usage()` reading
+        unset protobuf defaults as `0.0` can never trigger `TpuMxuDutyCycleCollapse`."""
+        cleaned: Dict[str, _TpuInfoRow] = {}
+        for k, r in src_rows.items():
+            copied = _copy_tpu_info_row(r)
+            if (
+                copied.duty_cycle_percent == 0.0
+                and not copied.duty_ids_verified
+            ):
+                copied.duty_cycle_percent = None
+            cleaned[k] = copied
+        return cleaned
+
     # In explicit `per-chip` Python fallback (`get_chip_usage()`), upstream
     # sorts HBM and duty replies separately and zips by position after checking
     # only `2 * len(duty) == len(hbm)`. Accept partial subsets ONLY when raw
-    # duty chip IDs were independently verified 1:1 against HBM core IDs;
-    # otherwise require full contiguous 8-core host coverage (`0..7`) so a
-    # partial reply (e.g. HBM cores `{0,1}` + chip `1` duty) is never misjoined.
+    # duty chip IDs and gauge presence were independently verified 1:1 against
+    # HBM core IDs; otherwise require full contiguous 8-core host coverage
+    # (`0..7`) and strip any unverified `0.0` fallback duty values.
     if grpc_duty_layout == "per-chip":
         duty_rows = [
             r for r in working.values() if r.in_util_table and r.duty_cycle_percent is not None
@@ -2462,7 +2529,7 @@ def _sanitize_fallback_duty_rows(
             if pid is not None
         }
         if raw_duty_ids == set(range(8)):
-            return working
+            return _strip_unverified_ironwood_zeros(working)
         sanitized_pc: Dict[str, _TpuInfoRow] = {}
         for k, r in working.items():
             copied = _copy_tpu_info_row(r)
@@ -2470,6 +2537,12 @@ def _sanitize_fallback_duty_rows(
                 copied.duty_cycle_percent = None
             sanitized_pc[k] = copied
         return sanitized_pc
+
+    duty_rows_auto = [
+        r for r in working.values() if r.in_util_table and r.duty_cycle_percent is not None
+    ]
+    if duty_rows_auto and all(r.duty_ids_verified for r in duty_rows_auto):
+        return working
 
     expected_core_count: Optional[int] = None
     verified_chips = _verified_dual_function_chip_count(devices, inferred_dpc)
@@ -2487,7 +2560,7 @@ def _sanitize_fallback_duty_rows(
             if pid is not None
         }
         if duty_ids == set(range(expected_core_count)):
-            return working
+            return _strip_unverified_ironwood_zeros(working)
 
     sanitized: Dict[str, _TpuInfoRow] = {}
     for k, r in working.items():

@@ -634,7 +634,9 @@ class FreeTpuCdiTests(unittest.TestCase):
             override_collide_errs,
         )
         # OCI/CDI v1.1.0 `%d` network interface name templates dynamically allocate
-        # unique names across scopes and MUST NOT be rejected as literal collisions.
+        # unique names across global vs device scopes, while upstream CDI 1.1
+        # still rejects repeated literal destination names (including `%d`)
+        # within a single edit list.
         cross_net_template_ok = {
             "cdiVersion": "1.1.0",
             "kind": "freetpu.dev/tpu",
@@ -649,13 +651,32 @@ class FreeTpuCdiTests(unittest.TestCase):
                         "deviceNodes": [{"path": "/dev/vfio/0"}],
                         "netDevices": [
                             {"hostInterfaceName": "eth2", "name": "tpu%d"},
-                            {"hostInterfaceName": "eth3", "name": "tpu%d"},
                         ],
                     },
                 }
             ],
         }
         self.assertEqual(freetpu_cdi.validate_cdi_spec(cross_net_template_ok), [])
+        same_list_template_dup = {
+            **cross_net_template_ok,
+            "devices": [
+                {
+                    "name": "0",
+                    "containerEdits": {
+                        "deviceNodes": [{"path": "/dev/vfio/0"}],
+                        "netDevices": [
+                            {"hostInterfaceName": "eth2", "name": "tpu%d"},
+                            {"hostInterfaceName": "eth3", "name": "tpu%d"},
+                        ],
+                    },
+                }
+            ],
+        }
+        same_list_dup_errs = freetpu_cdi.validate_cdi_spec(same_list_template_dup)
+        self.assertTrue(
+            any("duplicate netDevice name 'tpu%d'" in e for e in same_list_dup_errs),
+            same_list_dup_errs,
+        )
 
         # CNCF CDI v1.1.0 IntelRdt.closID validation: "/" (root CLOS), "" (unset), and
         # valid Linux filenames pass; paths containing "/", ".", "..", "\n", "\x00", or
@@ -5327,6 +5348,26 @@ class FreeTpuCdiTests(unittest.TestCase):
             spec_path = root / "cdi" / "freetpu.json"
 
             with _mock_vfio_char_devices():
+                # Public `discover_tpu_chips()` -> `build_cdi_spec()` MUST preserve the full
+                # PCI inventory automatically so `all` is withheld and cross-slice chip_id
+                # conflicts with unavailable VFIO functions still block `0-3` / visibility env.
+                pub_chips, pub_ctrl = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                pub_spec = freetpu_cdi.build_cdi_spec(
+                    pub_chips, pub_ctrl, single_host_env=True
+                )
+                pub_by_name = {d["name"]: d for d in pub_spec["devices"]}
+                self.assertIn("numa0-pcie-0000-00-4", pub_by_name)
+                self.assertNotIn("all", pub_by_name)
+                self.assertNotIn("0-3", pub_by_name)
+                pub_n0_env = dict(
+                    kv.split("=", 1)
+                    for kv in pub_by_name["numa0-pcie-0000-00-4"]["containerEdits"]["env"]
+                )
+                self.assertNotIn("TPU_VISIBLE_CHIPS", pub_n0_env)
+                self.assertNotIn("TPU_VISIBLE_DEVICES", pub_n0_env)
+
                 ok, msg = freetpu_cdi.reconcile_cdi_spec(
                     spec_path,
                     sysfs_root=sysfs_root,

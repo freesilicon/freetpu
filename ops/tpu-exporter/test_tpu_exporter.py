@@ -5571,6 +5571,211 @@ TPU Runtime Utilization
                 {str(c): 10.0 * (c + 1) for c in range(8)},
             )
 
+            # 5. Ironwood 8-row stock fallback (`get_chip_usage_new()`) when direct gRPC is
+            #    unavailable MUST NOT publish unverified `0.0%` duty (e.g. unset protobuf
+            #    default `as_double == 0.0`), while accepting verified populated `0.0%`.
+            eight_rows_zero_core7 = [
+                SimpleNamespace(
+                    device_id=c,
+                    memory_usage=(c + 1) * 8 * 1024**3,
+                    total_memory=96 * 1024**3,
+                    duty_cycle_pct=(15.0 + c if c < 7 else 0.0),
+                )
+                for c in range(8)
+            ]
+            # (a) No raw `get_metric_data`: unverified `0.0` on core 7 cleared to None; 0..6 kept.
+            mod_no_raw_zero = SimpleNamespace(
+                get_chip_usage_new=lambda chip_type, addr=None: eight_rows_zero_core7,
+            )
+            # (b) Raw `get_metric_data` shows core 7 gauge is UNSET: core 7 stays None.
+            mod_unset_raw_zero = SimpleNamespace(
+                get_chip_usage_new=lambda chip_type, addr=None: eight_rows_zero_core7,
+                get_metric_data=lambda addr, name: SimpleNamespace(
+                    metric=SimpleNamespace(
+                        metrics=[_make_item(c, as_double=15.0 + c) for c in range(7)]
+                        + [_make_item(7)]  # unset gauge!
+                    )
+                ),
+            )
+            # (c) Raw `get_metric_data` proves core 7 gauge IS populated at 0.0: 0.0 published.
+            mod_populated_zero = SimpleNamespace(
+                get_chip_usage_new=lambda chip_type, addr=None: eight_rows_zero_core7,
+                get_metric_data=lambda addr, name: SimpleNamespace(
+                    metric=SimpleNamespace(
+                        metrics=[_make_item(c, as_double=(15.0 + c if c < 7 else 0.0)) for c in range(8)]
+                    )
+                ),
+            )
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_query_grpc_runtime_metrics",
+                    return_value=(False, "grpc unavailable", {}),
+                ),
+                mock.patch.dict(
+                    sys.modules,
+                    {"tpu_info.metrics": mod_no_raw_zero, "tpu_info.device": fake_device_mod},
+                ),
+            ):
+                snap_no_raw_z = tpu_exporter.collect_snapshot(
+                    sysfs_root=sep_sys,
+                    dev_root=sep_dev,
+                    proc_root=sep_proc,
+                    tpu_info_bin="tpu-info",
+                    chip_id_map=sep_map,
+                    skip_pid_scan=True,
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=root / "no-shm",
+                )
+            self.assertEqual(snap_no_raw_z.devices[7].hbm_used_bytes, 64 * 1024**3)
+            self.assertIsNone(snap_no_raw_z.devices[7].duty_cycle_percent)
+            self.assertEqual(snap_no_raw_z.devices[0].duty_cycle_percent, 15.0)
+
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_query_grpc_runtime_metrics",
+                    return_value=(False, "grpc unavailable", {}),
+                ),
+                mock.patch.dict(
+                    sys.modules,
+                    {"tpu_info.metrics": mod_unset_raw_zero, "tpu_info.device": fake_device_mod},
+                ),
+            ):
+                snap_unset_z = tpu_exporter.collect_snapshot(
+                    sysfs_root=sep_sys,
+                    dev_root=sep_dev,
+                    proc_root=sep_proc,
+                    tpu_info_bin="tpu-info",
+                    chip_id_map=sep_map,
+                    skip_pid_scan=True,
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=root / "no-shm",
+                )
+            self.assertEqual(snap_unset_z.devices[7].hbm_used_bytes, 64 * 1024**3)
+            self.assertIsNone(snap_unset_z.devices[7].duty_cycle_percent)
+
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_query_grpc_runtime_metrics",
+                    return_value=(False, "grpc unavailable", {}),
+                ),
+                mock.patch.dict(
+                    sys.modules,
+                    {"tpu_info.metrics": mod_populated_zero, "tpu_info.device": fake_device_mod},
+                ),
+            ):
+                snap_pop_z = tpu_exporter.collect_snapshot(
+                    sysfs_root=sep_sys,
+                    dev_root=sep_dev,
+                    proc_root=sep_proc,
+                    tpu_info_bin="tpu-info",
+                    chip_id_map=sep_map,
+                    skip_pid_scan=True,
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=root / "no-shm",
+                )
+            self.assertEqual(snap_pop_z.devices[7].duty_cycle_percent, 0.0)
+
+            # 6. Collapsed legacy 0x0027 chip whose representative group 0 is exclusive
+            #    but whose sibling group 1 ALSO contains a non-TPU PCI device MUST be marked
+            #    non-exclusive and MUST NOT attribute sibling group 1's PIDs to the TPU chip!
+            sib_sys, sib_dev, sib_proc = _make_mock_pci_tree(
+                root / "legacy_shared_sibling_group",
+                devices=[
+                    {
+                        "bdf": "0000:00:04.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0027",
+                        "subsystem_device": "0x004e",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                    },
+                    {
+                        "bdf": "0000:00:04.1",
+                        "vendor": "0x1ae0",
+                        "device": "0x0027",
+                        "subsystem_device": "0x004e",
+                        "driver": "vfio-pci",
+                        "iommu_group": "1",
+                    },
+                    {
+                        "bdf": "0000:00:09.0",
+                        "vendor": "0x1af4",
+                        "device": "0x1041",
+                        "driver": "vfio-pci",
+                        "iommu_group": "1",  # non-TPU sharing sibling group 1!
+                    },
+                ],
+                create_vfio_nodes=["0", "1"],
+            )
+            p_fd_dir = sib_proc / "9001" / "fd"
+            p_fd_dir.mkdir(parents=True)
+            os.symlink(str(sib_dev / "vfio" / "1"), p_fd_dir / "3")
+            p_fdinfo = sib_proc / "9001" / "fdinfo"
+            p_fdinfo.mkdir(parents=True)
+            (p_fdinfo / "3").write_text("pos:\t0\nflags:\t02\n", encoding="utf-8")
+            with _mock_vfio_char_lstat():
+                sib_snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=sib_sys,
+                    dev_root=sib_dev,
+                    proc_root=sib_proc,
+                    tpu_info_bin=None,
+                    shm_root=root / "no-shm",
+                )
+            self.assertEqual(len(sib_snap.devices), 1)
+            self.assertFalse(sib_snap.devices[0].vfio_group_exclusive)
+            self.assertEqual(sib_snap.devices[0].active_pids, [])
+
+            # 7. CLI `TPU Device Status` parser MUST preserve `HBM Bandwidth Util`
+            #    (ignoring `N/A` / `-`) and export it via Prometheus.
+            cli_bw_text = (
+                "TPU Device Status\n"
+                "+-----------+---------------------------+--------------------+--------------------+-----------------------+\n"
+                "| Device ID | Memory Usage (Used/Total) | Memory Bar Gauge   | HBM Bandwidth Util | TensorCore Duty Cycle |\n"
+                "+-----------+---------------------------+--------------------+--------------------+-----------------------+\n"
+                "| 0         | 10.00 GiB / 16.00 GiB     | [||||||....] 62.5% | [|||.......] 30.0% | [||||||||..] 75.0%    |\n"
+                "| 1         | 4.00 GiB / 16.00 GiB      | [||........] 25.0% | N/A                | [||........] 20.0%    |\n"
+                "+-----------+---------------------------+--------------------+--------------------+-----------------------+\n"
+            )
+            bw_rows = tpu_exporter.parse_tpu_info_output(cli_bw_text)
+            self.assertAlmostEqual(bw_rows["0"].hbm_bw_util_percent or 0.0, 30.0)
+            self.assertIsNone(bw_rows["1"].hbm_bw_util_percent)
+            bw_sys, bw_dev, bw_proc = _make_mock_pci_tree(
+                root / "cli_bw_export",
+                devices=[
+                    {
+                        "bdf": "0000:00:06.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                        "chip_id": "0",
+                    }
+                ],
+                create_vfio_nodes=["0"],
+            )
+            bw_cli = root / "mock-bw-cli.sh"
+            bw_cli.write_text(f"#!/bin/sh\ncat <<'EOF'\n{cli_bw_text}EOF\n", encoding="utf-8")
+            bw_cli.chmod(0o755)
+            with _mock_vfio_char_lstat():
+                bw_snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=bw_sys,
+                    dev_root=bw_dev,
+                    proc_root=bw_proc,
+                    tpu_info_bin=str(bw_cli),
+                    runtime_metrics_addr=None,
+                    shm_root=root / "no-shm",
+                )
+            self.assertAlmostEqual(bw_snap.devices[0].hbm_bandwidth_utilization_percent or 0.0, 30.0)
+            bw_prom = tpu_exporter.format_prometheus_metrics(bw_snap)
+            self.assertIn('freetpu_tpu_hbm_bandwidth_utilization_percent{chip="0",pci_bdf="0000:00:06.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/0"} 30', bw_prom)
+            self.assertIn('freetpu_tpu_runtime_hbm_bandwidth_utilization_percent{runtime_chip="0",pci_bdf="0000:00:06.0"} 30', bw_prom)
+
     def _assert_valid_prometheus_text(self, text: str) -> None:
         lines = [ln for ln in text.splitlines() if ln.strip()]
         self.assertGreater(len(lines), 0)

@@ -961,6 +961,21 @@ def _discover_tpu_chips_with_inventory(
     return chips, control_node, full_pci_inventory
 
 
+class DiscoveredChipList(List[DiscoveredChip]):
+    """List of allocatable discovered TPU chips carrying the full host PCI inventory."""
+
+    def __init__(
+        self,
+        chips: Iterable[DiscoveredChip],
+        *,
+        full_pci_inventory: Optional[Sequence[DiscoveredChip]] = None,
+    ) -> None:
+        super().__init__(chips)
+        self.full_pci_inventory: Tuple[DiscoveredChip, ...] = tuple(
+            full_pci_inventory if full_pci_inventory is not None else self
+        )
+
+
 def discover_tpu_chips(
     sysfs_root: Path = Path("/sys"),
     dev_root: Path = Path("/dev"),
@@ -976,15 +991,20 @@ def discover_tpu_chips(
     never break or withdraw group nodes merely because `/dev/iommu` also exists.
     `iommufd` cdev mode is selected either explicitly via `vfio_mode="iommufd"` (or `"cdev"`)
     or in `"auto"` mode when legacy `/dev/vfio/vfio` is absent and `/dev/iommu` is present.
+
+    Returns a `DiscoveredChipList` (a `list[DiscoveredChip]` subclass) whose
+    `.full_pci_inventory` attribute retains any TPU PCI functions whose VFIO
+    nodes were unavailable so downstream `build_cdi_spec(chips, ctrl)` callers
+    automatically withhold `all` and enforce host-wide chip-ID uniqueness.
     """
-    chips, control_node, _full_pci_inventory = _discover_tpu_chips_with_inventory(
+    chips, control_node, full_pci_inventory = _discover_tpu_chips_with_inventory(
         sysfs_root=sysfs_root,
         dev_root=dev_root,
         allow_missing_vfio=allow_missing_vfio,
         iommu_dev_path=iommu_dev_path,
         vfio_mode=vfio_mode,
     )
-    return chips, control_node
+    return DiscoveredChipList(chips, full_pci_inventory=full_pci_inventory), control_node
 
 
 def _pci_bdf_token(pci_bdf: str) -> str:
@@ -1695,6 +1715,10 @@ def build_cdi_spec(
         )
     if not chips:
         raise ValueError("Cannot build CDI spec with zero discovered TPU chips")
+    if host_pci_inventory is None:
+        carried_inv = getattr(chips, "full_pci_inventory", None)
+        if carried_inv is not None:
+            host_pci_inventory = carried_inv
 
     for chip in chips:
         if chip.non_tpu_group_members:
@@ -2167,9 +2191,9 @@ def _validate_container_edits(
                 iface_name = nd.get("name")
                 if not isinstance(iface_name, str) or not iface_name:
                     errors.append(f"{ndc}.name: must be a non-empty string")
-                elif "%d" not in iface_name and iface_name in seen_net_names:
+                elif iface_name in seen_net_names:
                     errors.append(f"{ndc}.name: duplicate netDevice name {iface_name!r}")
-                elif "%d" not in iface_name:
+                else:
                     seen_net_names.add(iface_name)
                 if isinstance(host_iface, str) and host_iface and isinstance(iface_name, str) and iface_name:
                     valid_net_entries.append((ndc, host_iface, iface_name))
