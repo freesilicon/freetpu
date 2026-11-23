@@ -72,6 +72,8 @@ from router.tpu_telemetry import (  # noqa: E402
     ClientDisconnectedError,
     DeadlineSocket,
     TpuExporterTelemetry,
+    _DeadlineHTTPConnection,
+    _DeadlineHTTPSConnection,
     _normalize_transfer_encoding,
     evaluate_tpu_readiness,
     scrape_tpu_exporter,
@@ -527,20 +529,93 @@ def _open_http_connection(
     host: str,
     port: int,
     timeout_s: float,
+    *,
+    deadline: Optional[float] = None,
+    label: str = "Upstream request",
 ) -> http.client.HTTPConnection:
     normalized = scheme.lower()
+    eff_deadline = (
+        deadline if deadline is not None else (time.monotonic() + max(0.01, timeout_s))
+    )
     if normalized == "https":
-        return http.client.HTTPSConnection(
+        return _DeadlineHTTPSConnection(
             host,
             port,
-            timeout=timeout_s,
+            deadline=eff_deadline,
             context=ssl.create_default_context(),
+            label=label,
         )
     if normalized == "http":
-        return http.client.HTTPConnection(host, port, timeout=timeout_s)
+        return _DeadlineHTTPConnection(
+            host,
+            port,
+            deadline=eff_deadline,
+            label=label,
+        )
     raise ValueError(
         f"Unsupported backend URL scheme {scheme!r}; expected one of {VALID_URL_SCHEMES}"
     )
+
+
+def _send_http_request_with_deadline(
+    conn: http.client.HTTPConnection,
+    method: str,
+    path: str,
+    *,
+    headers: Mapping[str, str],
+    body: Optional[bytes],
+    deadline: float,
+    label: str = "Upstream request",
+) -> None:
+    """Connect and send an HTTP request line, headers, and body under one wall-clock deadline."""
+    rem = deadline - time.monotonic()
+    if rem <= 0:
+        raise TimeoutError(f"{label} exceeded elapsed deadline")
+    if conn.sock is None:
+        conn.timeout = rem
+        conn.connect()
+    sock = conn.sock
+    if sock is None:
+        raise OSError(f"{label} failed to establish upstream socket")
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+    rem = deadline - time.monotonic()
+    if rem <= 0:
+        raise TimeoutError(f"{label} exceeded elapsed deadline")
+    sock.settimeout(rem)
+    conn.putrequest(method, path)
+    has_content_length = any(k.lower() == "content-length" for k in headers)
+    for k, v in headers.items():
+        conn.putheader(k, v)
+    if body is not None and not has_content_length:
+        conn.putheader("Content-Length", str(len(body)))
+    rem = deadline - time.monotonic()
+    if rem <= 0:
+        raise TimeoutError(f"{label} exceeded elapsed deadline")
+    sock.settimeout(rem)
+    conn.endheaders()
+    if body:
+        view = memoryview(body)
+        offset = 0
+        total = len(view)
+        try:
+            while offset < total:
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    raise TimeoutError(f"{label} upload exceeded elapsed deadline")
+                sock.settimeout(rem)
+                sent = sock.send(view[offset : offset + 65536])
+                if sent <= 0:
+                    raise BrokenPipeError(f"{label} closed connection during upload")
+                offset += sent
+        finally:
+            view.release()
+    rem = deadline - time.monotonic()
+    if rem <= 0:
+        raise TimeoutError(f"{label} exceeded elapsed deadline")
+    sock.settimeout(rem)
 
 
 def _ensure_safe_credential_transport(
@@ -2168,9 +2243,19 @@ class RouterEngine:
             rem = deadline - time.monotonic()
             if rem <= 0:
                 raise TimeoutError("Probe exceeded elapsed deadline")
-            conn = _open_http_connection(scheme, host, port, rem)
+            conn = _open_http_connection(
+                scheme, host, port, rem, deadline=deadline, label="Probe"
+            )
             _verify_connected_peer_for_credentials(conn, backend, scheme, api_key)
-            conn.request("GET", path, headers=headers)
+            _send_http_request_with_deadline(
+                conn,
+                "GET",
+                path,
+                headers=headers,
+                body=None,
+                deadline=deadline,
+                label="Probe",
+            )
             raw_sock = conn.sock
             rem = deadline - time.monotonic()
             if rem <= 0:
@@ -3676,6 +3761,10 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             super().handle_one_request()
         except _HeaderSizeLimitExceeded:
             self.close_connection = True
+            if not hasattr(self, "request_version"):
+                self.request_version = self.protocol_version
+            if not hasattr(self, "command"):
+                self.command = ""
             if not hasattr(self, "requestline"):
                 self.requestline = ""
             if not hasattr(self, "headers"):
@@ -4697,7 +4786,18 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 )
                 timeout_s = backend.config.timeout_s or engine.config.request_timeout_s
                 attempt_deadline = attempt_start + timeout_s
-                conn = _open_http_connection(scheme, host, port, timeout_s)
+                attempt_label = f"Backend {backend.config.id!r} request"
+                rem_open = attempt_deadline - time.monotonic()
+                if rem_open <= 0:
+                    raise TimeoutError(f"{attempt_label} exceeded elapsed deadline")
+                conn = _open_http_connection(
+                    scheme,
+                    host,
+                    port,
+                    rem_open,
+                    deadline=attempt_deadline,
+                    label=attempt_label,
+                )
                 headers = {
                     "Content-Type": "application/json",
                     "Accept": "text/event-stream" if stream else "application/json",
@@ -4710,17 +4810,21 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 if api_key:
                     headers["Authorization"] = f"Bearer {api_key}"
 
-                conn.request("POST", upstream_path, body=raw_req, headers=headers)
+                _send_http_request_with_deadline(
+                    conn,
+                    "POST",
+                    upstream_path,
+                    headers=headers,
+                    body=raw_req,
+                    deadline=attempt_deadline,
+                    label=attempt_label,
+                )
                 raw_sock = conn.sock
-                if raw_sock is not None:
-                    try:
-                        raw_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                    except OSError:
-                        pass
                 rem_hdr = attempt_deadline - time.monotonic()
                 if rem_hdr <= 0:
                     raise TimeoutError("Upstream response headers exceeded elapsed deadline")
                 if raw_sock is not None:
+                    raw_sock.settimeout(rem_hdr)
                     deadline_sock = DeadlineSocket(
                         raw_sock,
                         attempt_deadline,

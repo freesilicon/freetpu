@@ -15256,6 +15256,178 @@ asyncio.run(main())
             for tok in ("alice", "p4/w0rd", "p4", "w0rd"):
                 self.assertNotIn(tok, stderr_out)
 
+    def test_upstream_attempt_deadline_bounds_connect_plus_stalled_upload_and_fails_over(
+        self,
+    ) -> None:
+        from router import freetpu_router as router_mod
+
+        # 1. Unit check on _send_http_request_with_deadline: slow connect + slow trickle
+        #    upload must raise TimeoutError at the single shared deadline (never per-chunk).
+        class _TrickleSock:
+            def __init__(self) -> None:
+                self.timeouts: List[Optional[float]] = []
+
+            def setsockopt(self, *args: Any, **kwargs: Any) -> None:
+                pass
+
+            def settimeout(self, t: Optional[float]) -> None:
+                self.timeouts.append(t)
+
+            def sendall(self, data: bytes) -> None:
+                pass
+
+            def send(self, data: Any) -> int:
+                time.sleep(0.06)
+                return min(1024, len(data))
+
+        class _SlowConnectConn(http.client.HTTPConnection):
+            def __init__(self) -> None:
+                super().__init__("127.0.0.1", 80, timeout=1.0)
+                self._trickle = _TrickleSock()
+
+            def connect(self) -> None:
+                time.sleep(0.15)
+                self.sock = self._trickle  # type: ignore[assignment]
+
+        t0 = time.monotonic()
+        conn = _SlowConnectConn()
+        with self.assertRaises(TimeoutError):
+            router_mod._send_http_request_with_deadline(
+                conn,
+                "POST",
+                "/v1/chat/completions",
+                headers={"Content-Type": "application/json"},
+                body=b"x" * 65536,
+                deadline=t0 + 0.30,
+                label="test-upload",
+            )
+        elapsed_u = time.monotonic() - t0
+        self.assertLess(elapsed_u, 0.55)
+        self.assertGreaterEqual(len(conn._trickle.timeouts), 3)
+        # Subsequent send timeouts must strictly shrink as deadline approaches.
+        self.assertLess(conn._trickle.timeouts[-1] or 99.0, 0.20)
+
+        # 2. End-to-end router failover when primary stalls during upload/response.
+        hold_open = threading.Event()
+        accepted_conns: List[socket.socket] = []
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(4)
+        stalled_port = listener.getsockname()[1]
+
+        def _accept_and_stall() -> None:
+            listener.settimeout(0.2)
+            while not hold_open.is_set():
+                try:
+                    c, _ = listener.accept()
+                except TimeoutError:
+                    continue
+                except OSError:
+                    break
+                try:
+                    c.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+                except OSError:
+                    pass
+                accepted_conns.append(c)
+
+        accept_thread = threading.Thread(target=_accept_and_stall, daemon=True)
+        accept_thread.start()
+        backup = self._track(_MockOpenAIBackend("deadline-backup", ["m-deadline"]))
+        try:
+            cfg = RouterConfig(
+                host="127.0.0.1",
+                port=0,
+                policy="local_first",
+                request_timeout_s=0.30,
+                max_request_body_bytes=4 * 1024 * 1024,
+                max_total_request_memory_bytes=32 * 1024 * 1024,
+                backends=[
+                    BackendConfig(
+                        id="stalled-primary",
+                        local=True,
+                        base_url=f"http://127.0.0.1:{stalled_port}",
+                        models=["m-deadline"],
+                        timeout_s=0.30,
+                    ),
+                    BackendConfig(
+                        id="deadline-backup",
+                        local=False,
+                        base_url=backup.base_url,
+                        models=["m-deadline"],
+                    ),
+                ],
+            )
+            router = self._track(create_router_server(cfg, probe_on_start=False))
+            rport = router.server_address[1]
+            # Wait briefly for backup to be ready, keep primary healthy to force attempt on it first.
+            router.engine._backends[0].healthy = True
+            router.engine._backends[1].healthy = True
+
+            t_req = time.monotonic()
+            st, hdrs, _ = _http_request(
+                rport,
+                "POST",
+                "/v1/chat/completions",
+                body={
+                    "model": "m-deadline",
+                    "messages": [{"role": "user", "content": "A" * (512 * 1024)}],
+                },
+            )
+            elapsed_req = time.monotonic() - t_req
+            self.assertEqual(st, 200)
+            self.assertEqual(hdrs.get("x-freetpu-backend"), "deadline-backup")
+            self.assertEqual(hdrs.get("x-freetpu-failovers"), "1")
+            self.assertLess(elapsed_req, 1.5)
+        finally:
+            hold_open.set()
+            listener.close()
+            for c in accepted_conns:
+                try:
+                    c.close()
+                except OSError:
+                    pass
+            accept_thread.join(timeout=1.0)
+
+    def test_oversized_request_line_returns_http_431_instead_of_eof(self) -> None:
+        backend = self._track(_MockOpenAIBackend("reqline-431-b", ["m-431"]))
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            max_header_bytes=512,
+            backends=[
+                BackendConfig(
+                    id="reqline-431-b",
+                    base_url=backend.base_url,
+                    models=["m-431"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+        oversized_req = (
+            b"GET /" + (b"a" * 2048) + b" HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+        )
+        with socket.create_connection(("127.0.0.1", rport), timeout=5.0) as sock:
+            sock.sendall(oversized_req)
+            resp = bytearray()
+            while True:
+                try:
+                    chunk = sock.recv(4096)
+                except ConnectionResetError:
+                    break
+                if not chunk:
+                    break
+                resp.extend(chunk)
+        raw_resp = bytes(resp)
+        self.assertTrue(
+            raw_resp.startswith(b"HTTP/1.1 431 "),
+            f"Expected HTTP/1.1 431 response, got: {raw_resp[:120]!r}",
+        )
+        _, _, body = raw_resp.partition(b"\r\n\r\n")
+        parsed = json.loads(body.decode("utf-8"))
+        self.assertEqual(parsed["error"]["code"], "request_header_fields_too_large")
+
 
 def run_self_tests(verbosity: int = 1) -> int:
     """Run all router tests cleanly via unittest."""
