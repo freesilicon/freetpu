@@ -46,10 +46,12 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
      std::unordered_set<ggml_backend_buffer_t> buffers;
      // computed graphs cached per backend, keyed by uid
      std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
-@@ -2181,6 +2200,78 @@
+@@ -2179,8 +2198,173 @@
+     }
+     result->view_offs = tensor->view_offs;
      return result;
- }
- 
++}
++
 +static bool rpc_op_is_supported_on_rpc(const ggml_tensor * node) {
 +    if (node == nullptr || (uint32_t) node->op >= GGML_OP_COUNT) {
 +        return false;
@@ -64,6 +66,97 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 +        default:
 +            return true;
 +    }
++}
++
++static bool rpc_tensor_storage_in_bounds(
++        const ggml_tensor * t,
++        const std::unordered_set<ggml_backend_buffer_t> & buffers,
++        int depth = 0) {
++    if (t == nullptr || depth > 32 || (uint32_t) t->type >= GGML_TYPE_COUNT) {
++        return false;
++    }
++    const int64_t blck_size = ggml_blck_size(t->type);
++    const size_t  type_size = ggml_type_size(t->type);
++    if (blck_size <= 0 || type_size == 0) {
++        return false;
++    }
++    bool is_empty = false;
++    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
++        if (t->ne[d] < 0 || (uint64_t) t->nb[d] > (uint64_t) INT64_MAX) {
++            return false;
++        }
++        if (t->ne[d] == 0) {
++            is_empty = true;
++        }
++    }
++
++    ggml_backend_buffer_t buf = t->buffer;
++    if (buf == nullptr || buffers.find(buf) == buffers.end() ||
++        !ggml_backend_buffer_is_host(buf) || t->data == nullptr) {
++        return false;
++    }
++
++    uint64_t span = 0;
++    if (!is_empty) {
++        if ((t->ne[0] % blck_size) != 0 || t->nb[0] < type_size) {
++            return false;
++        }
++        int first_dim = 0;
++        if (blck_size > 1) {
++            const uint64_t n_blocks = (uint64_t) (t->ne[0] / blck_size);
++            if (n_blocks > UINT64_MAX / (uint64_t) t->nb[0]) {
++                return false;
++            }
++            span = n_blocks * (uint64_t) t->nb[0];
++            first_dim = 1;
++        } else {
++            span = (uint64_t) type_size;
++        }
++        for (int d = first_dim; d < GGML_MAX_DIMS; ++d) {
++            const uint64_t count  = (uint64_t) (t->ne[d] - 1);
++            const uint64_t stride = (uint64_t) t->nb[d];
++            if (count != 0) {
++                if (stride < type_size || stride > (UINT64_MAX - span) / count) {
++                    return false;
++                }
++                span += count * stride;
++            }
++        }
++    }
++
++    const uint64_t base     = (uint64_t) (uintptr_t) ggml_backend_buffer_get_base(buf);
++    const uint64_t buf_size = (uint64_t) ggml_backend_buffer_get_size(buf);
++    const uint64_t data     = (uint64_t) (uintptr_t) t->data;
++    if (base == 0 || data < base || (data - base) > buf_size || span > buf_size - (data - base)) {
++        return false;
++    }
++
++    if (t->view_src != nullptr) {
++        if (!rpc_tensor_storage_in_bounds(t->view_src, buffers, depth + 1)) {
++            return false;
++        }
++        const uint64_t src_data = (uint64_t) (uintptr_t) t->view_src->data;
++        if (t->view_src->buffer != buf ||
++            (uint64_t) t->view_offs > UINT64_MAX - src_data ||
++            src_data + (uint64_t) t->view_offs != data) {
++            return false;
++        }
++    }
++    return true;
+ }
+ 
++static bool rpc_node_storage_valid(
++        const ggml_tensor * node,
++        const std::unordered_set<ggml_backend_buffer_t> & buffers) {
++    if (!rpc_tensor_storage_in_bounds(node, buffers)) {
++        return false;
++    }
++    for (int s = 0; s < GGML_MAX_SRC; ++s) {
++        if (node->src[s] != nullptr && !rpc_tensor_storage_in_bounds(node->src[s], buffers)) {
++            return false;
++        }
++    }
++    return true;
 +}
 +
 +ggml_status rpc_server::compute_graph_with_accel_fallback(uint32_t device, ggml_cgraph * graph) {
@@ -84,8 +177,9 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 +        if (i >= graph->n_nodes) {
 +            break;
 +        }
-+        if (!rpc_op_is_supported_on_rpc(graph->nodes[i])) {
-+            LOG_ERROR("[%s] rejecting unsupported RPC op %d\n", __func__, (int) graph->nodes[i]->op);
++        if (!rpc_op_is_supported_on_rpc(graph->nodes[i]) ||
++            !rpc_node_storage_valid(graph->nodes[i], buffers)) {
++            LOG_ERROR("[%s] rejecting invalid RPC node %d (op=%d)\n", __func__, i, (int) graph->nodes[i]->op);
 +            return GGML_STATUS_FAILED;
 +        }
 +        const bool use_accel = ggml_backend_dev_supports_op(dev, graph->nodes[i]);
@@ -95,8 +189,9 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 +            if (node == nullptr || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
 +                break;
 +            }
-+            if (!rpc_op_is_supported_on_rpc(node)) {
-+                LOG_ERROR("[%s] rejecting unsupported RPC op %d\n", __func__, (int) node->op);
++            if (!rpc_op_is_supported_on_rpc(node) ||
++                !rpc_node_storage_valid(node, buffers)) {
++                LOG_ERROR("[%s] rejecting invalid RPC node %d (op=%d)\n", __func__, j, (int) node->op);
 +                return GGML_STATUS_FAILED;
 +            }
 +            if (ggml_backend_dev_supports_op(dev, node) != use_accel) {
@@ -125,7 +220,7 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
  bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
      // serialization format:
      // | device (4 bytes) | uid (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
-@@ -2266,8 +2357,12 @@
+@@ -2266,8 +2450,12 @@
      }
      const std::chrono::duration<double, std::milli> deserialize_ms = std::chrono::steady_clock::now() - t_deserialize;
  
@@ -140,7 +235,7 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
      sg.graph = graph;
      LOG_DBG3("[%s] device: %u, graph build: %.3f ms\n", __func__, device, deserialize_ms.count());
      return true;
-@@ -2285,8 +2380,11 @@
+@@ -2285,8 +2473,11 @@
      }
      ggml_cgraph * graph = it->second.graph;
      LOG_DBG("[%s] device: %u, uid: %" PRIu64 "\n", __func__, device, request.uid);
@@ -154,14 +249,15 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
      return true;
  }
  
-@@ -2655,11 +2753,15 @@
+@@ -2654,12 +2845,16 @@
+     }
      for (auto buffer : buffers) {
          ggml_backend_buffer_free(buffer);
-     }
++    }
 +    if (cpu_fallback != nullptr) {
 +        ggml_backend_free(cpu_fallback);
 +        cpu_fallback = nullptr;
-+    }
+     }
  }
  
  static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
@@ -172,7 +268,7 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
      uint8_t cmd;
      if (!sock->recv_data(&cmd, 1)) {
          return;
-@@ -3047,7 +3149,7 @@
+@@ -3047,7 +3242,7 @@
              return;
          }
          LOG_INFO("Accepted client connection\n");
@@ -181,7 +277,7 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
          LOG_INFO("Client connection closed\n");
      }
      rpc_transport_shutdown();
-@@ -3113,9 +3215,8 @@
+@@ -3113,9 +3308,8 @@
  
  static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
      GGML_UNUSED(dev);
