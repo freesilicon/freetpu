@@ -393,11 +393,25 @@ class BackendConfig:
         ) / 1_000_000.0
 
     @classmethod
-    def from_dict(cls, raw: Mapping[str, Any]) -> "BackendConfig":
-        backend_id = str(raw["id"]).strip()
+    def from_dict(
+        cls,
+        raw: Mapping[str, Any],
+        *,
+        index: Optional[int] = None,
+    ) -> "BackendConfig":
+        entry_label = f"Backend #{index}" if index is not None else "Backend"
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"{entry_label} entry must be a JSON object")
+        if "id" not in raw or not isinstance(raw["id"], str):
+            raise ValueError(f"{entry_label} missing required non-empty string field 'id'")
+        backend_id = raw["id"].strip()
         if not backend_id:
-            raise ValueError("Backend 'id' must be non-empty")
-        base_url = str(raw["base_url"]).strip().rstrip("/")
+            raise ValueError(f"{entry_label} field 'id' must be non-empty")
+        if "base_url" not in raw or not isinstance(raw["base_url"], str):
+            raise ValueError(
+                f"Backend {backend_id!r} missing required non-empty string field 'base_url'"
+            )
+        base_url = raw["base_url"].strip().rstrip("/")
         if not base_url:
             raise ValueError(f"Backend {backend_id!r} requires a non-empty 'base_url'")
         btype = str(raw.get("type", "generic")).strip() or "generic"
@@ -845,8 +859,17 @@ class RouterConfig:
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "RouterConfig":
-        raw_backends: Sequence[Mapping[str, Any]] = raw.get("backends") or []
-        backends = [BackendConfig.from_dict(item) for item in raw_backends]
+        raw_backends_val = raw.get("backends")
+        if raw_backends_val is None:
+            raw_backends: Sequence[Any] = []
+        elif isinstance(raw_backends_val, list):
+            raw_backends = raw_backends_val
+        else:
+            raise ValueError("'backends' must be a JSON array of backend objects")
+        backends = [
+            BackendConfig.from_dict(item, index=idx)
+            for idx, item in enumerate(raw_backends)
+        ]
         if not backends:
             raise ValueError("Config must define at least one backend in 'backends'")
         raw_origins = raw.get("cors_allowed_origins")

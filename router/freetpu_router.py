@@ -5872,7 +5872,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cfg.validate()
         if args.check_config:
             build_hooks_from_config(cfg)
-    except (OSError, ValueError, json.JSONDecodeError, ImportError, AttributeError) as exc:
+    except (
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+        json.JSONDecodeError,
+        ImportError,
+        AttributeError,
+    ) as exc:
         sys.stderr.write(f"Config error: {exc}\n")
         return 1
 

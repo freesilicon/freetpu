@@ -10869,6 +10869,7 @@ asyncio.run(main())
                 *,
                 server_hostname: Optional[str] = None,
                 do_handshake_on_connect: bool = True,
+                suppress_ragged_eofs: bool = True,
             ) -> Any:
                 peer_port = sock.getpeername()[1]
                 wrapped_calls.append((peer_port, server_hostname, do_handshake_on_connect))
@@ -10877,6 +10878,7 @@ asyncio.run(main())
                         sock,
                         server_hostname=server_hostname,
                         do_handshake_on_connect=do_handshake_on_connect,
+                        suppress_ragged_eofs=suppress_ragged_eofs,
                     )
                 fail_cert = (
                     mode[0] == "all_bad_cert"
@@ -13300,6 +13302,150 @@ asyncio.run(main())
         self.assertIn("error", parsed)
         self.assertEqual(parsed["error"].get("type"), "invalid_request_error")
         self.assertEqual(len(backend.requests_seen), 0)
+
+    def test_missing_backend_required_fields_reported_as_config_errors(self) -> None:
+        from router.freetpu_router import main as router_main
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for idx, bad_backends in enumerate(
+                (
+                    [{"base_url": "http://127.0.0.1:8081/v1"}],
+                    [{"id": "missing-url-b"}],
+                    ["not-an-object"],
+                )
+            ):
+                with self.assertRaises(ValueError):
+                    RouterConfig.from_dict({"backends": bad_backends})
+                cfg_path = Path(tmpdir) / f"missing-backend-field-{idx}.json"
+                cfg_path.write_text(
+                    json.dumps({"backends": bad_backends}),
+                    encoding="utf-8",
+                )
+                err_buf = io.StringIO()
+                with mock.patch("sys.stderr", err_buf):
+                    rc = router_main(["--check-config", "--config", str(cfg_path)])
+                self.assertEqual(rc, 1)
+                self.assertIn("Config error:", err_buf.getvalue())
+
+    def test_https_tpu_exporter_disables_ragged_eof_suppression_and_rejects_ssl_eof(
+        self,
+    ) -> None:
+        from router import tpu_telemetry as telemetry_mod
+
+        class _RaggedEOFTLSSock:
+            def __init__(self, sock: socket.socket) -> None:
+                self._sock = sock
+                self._chunks = [
+                    (
+                        b"HTTP/1.1 200 OK\r\n"
+                        b"Content-Type: text/plain; version=0.0.4\r\n"
+                        b"Connection: close\r\n"
+                        b"\r\n"
+                        b"freetpu_exporter_up 1\n"
+                        b"freetpu_tpu_devices_discovered 1\n"
+                        b'freetpu_tpu_health_status{chip="0"} 1\n'
+                    )
+                ]
+
+            def do_handshake(self) -> None:
+                return None
+
+            def settimeout(self, t: Optional[float]) -> None:
+                self._sock.settimeout(t)
+
+            def setblocking(self, flag: bool) -> None:
+                self._sock.setblocking(flag)
+
+            def gettimeout(self) -> Optional[float]:
+                return self._sock.gettimeout()
+
+            def fileno(self) -> int:
+                return self._sock.fileno()
+
+            def pending(self) -> int:
+                return len(self._chunks[0]) if self._chunks else 0
+
+            def sendall(self, data: bytes) -> None:
+                return None
+
+            def recv(self, n: int) -> bytes:
+                if self._chunks:
+                    chunk = self._chunks.pop(0)
+                    return chunk
+                raise ssl.SSLEOFError(8, "EOF occurred in violation of protocol")
+
+            def recv_into(self, buf: Any, nbytes: int = 0) -> int:
+                data = self.recv(nbytes or len(buf))
+                buf[: len(data)] = data
+                return len(data)
+
+            def close(self) -> None:
+                try:
+                    self._sock.close()
+                except OSError:
+                    pass
+
+        observed_kwargs: List[Dict[str, Any]] = []
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(4)
+        lport = listener.getsockname()[1]
+
+        def _accept_once() -> None:
+            try:
+                conn, _ = listener.accept()
+                time.sleep(0.05)
+                conn.close()
+            except OSError:
+                pass
+
+        t = threading.Thread(target=_accept_once, daemon=True)
+        t.start()
+
+        class _CaptureSSLContext:
+            verify_mode = ssl.CERT_REQUIRED
+            check_hostname = True
+
+            def wrap_socket(
+                self,
+                sock: socket.socket,
+                *,
+                server_hostname: Optional[str] = None,
+                do_handshake_on_connect: bool = True,
+                suppress_ragged_eofs: bool = True,
+            ) -> Any:
+                observed_kwargs.append(
+                    {
+                        "server_hostname": server_hostname,
+                        "do_handshake_on_connect": do_handshake_on_connect,
+                        "suppress_ragged_eofs": suppress_ragged_eofs,
+                    }
+                )
+                return _RaggedEOFTLSSock(sock)
+
+        try:
+            with mock.patch.object(
+                telemetry_mod.ssl,
+                "create_default_context",
+                return_value=_CaptureSSLContext(),
+            ):
+                telem = scrape_tpu_exporter(
+                    f"https://127.0.0.1:{lport}/metrics",
+                    timeout_s=2.0,
+                )
+        finally:
+            listener.close()
+            t.join(timeout=1.0)
+
+        self.assertEqual(len(observed_kwargs), 1)
+        self.assertIs(observed_kwargs[0]["suppress_ragged_eofs"], False)
+        self.assertFalse(telem.reachable)
+        self.assertFalse(telem.exporter_up)
+        self.assertEqual(telem.error, "exporter_tls_error")
+        ready, reason = evaluate_tpu_readiness(telem)
+        self.assertFalse(ready)
+        self.assertEqual(reason, "tpu_exporter_unreachable")
 
 
 def run_self_tests(verbosity: int = 1) -> int:

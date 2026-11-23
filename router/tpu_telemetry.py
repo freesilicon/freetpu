@@ -721,6 +721,7 @@ def _create_deadline_connection(
                     cand_sock,
                     server_hostname=server_hostname or host,
                     do_handshake_on_connect=False,
+                    suppress_ragged_eofs=False,
                 )
                 _tls_handshake_with_deadline(
                     tls_sock,
