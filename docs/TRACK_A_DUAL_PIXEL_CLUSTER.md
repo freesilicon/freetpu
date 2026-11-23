@@ -72,12 +72,13 @@ Measured direct link: **`1.49 ms` min / `2.35 ms` avg** ping RTT (`0%` loss), **
 
 ### 2.3 Run `>16 GB` Model Across `2× Tensor G5` (`Qwen2.5-32B-Instruct-Q4_0`, `17.43 GiB`)
 
-Bound the per-node `ext[2]` DMA-BUF LRU weight cache (`OPENBUENOS_WEIGHT_CACHE_MB=128`, `OPENBUENOS_POOL_MB=64`) to stay comfortably below Android LMKD limits while holding `~9 GiB` of model weights per phone:
+Bound the per-node `ext[2]` DMA-BUF LRU weight cache (`OPENBUENOS_WEIGHT_CACHE_MB=128`, `OPENBUENOS_POOL_MB=64`) to stay comfortably below Android LMKD limits while holding `~9 GiB` of model weights per phone.
+
+> **Pre-launch isolation**: Before starting the RPC server on Node 2, turn off Wi-Fi (and Wireless Debugging) in Android Settings so only the direct point-to-point USB-C `ncm0` link (`10.99.0.0/30`) is active.
 
 ```bash
-# Node 2 (mustang — disable Wi-Fi BEFORE launching the unauthenticated RPC server so only ncm0 is active):
+# Node 2 (mustang — bind RPC server to the isolated USB-C NCM address):
 su -c '
-  svc wifi disable
   OPENBUENOS_VERBOSE=1 OPENBUENOS_WEIGHT_CACHE_MB=128 OPENBUENOS_WEIGHT_CACHE_ENTRIES=256 OPENBUENOS_POOL_MB=64 \
   /data/local/tmp/llama-edgetpu-rpc/ggml-rpc-server -d EDGETPU -H 10.99.0.2 -p 50052 -t 4
 '
