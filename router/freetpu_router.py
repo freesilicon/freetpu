@@ -4883,9 +4883,15 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             saw_done_sentinel = False
             saw_upstream_error_event = False
             finished_choice_indices: set[int] = set()
+            finished_choices_seen_count = 0
             per_choice_usage: Dict[
                 Tuple[int, ...], Tuple[Optional[int], Optional[int]]
             ] = {}
+            settled_usage_count = 0
+            settled_usage_completion_sum = 0
+            settled_usage_prompt_count = 0
+            settled_usage_prompt_sum = 0
+            settled_usage_prompt_max = 0
             per_choice_timings: Dict[
                 Tuple[int, ...], Tuple[Optional[int], Optional[int]]
             ] = {}
@@ -4903,10 +4909,16 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             required_choices = max(1, expected_choices)
             effective_prompt_batch_size = max(1, prompt_batch_size)
             n_per_prompt = max(1, required_choices // effective_prompt_batch_size)
-            max_final_usage_frames = min(required_choices, _MAX_TRACKED_STREAM_CHOICES)
             max_tracked_choices = min(
                 max(64, required_choices), _MAX_TRACKED_STREAM_CHOICES
             )
+
+            def _all_choices_finished() -> bool:
+                if required_choices <= max_tracked_choices:
+                    return len(finished_choice_indices) >= required_choices and all(
+                        idx in finished_choice_indices for idx in range(required_choices)
+                    )
+                return finished_choices_seen_count >= required_choices
 
             def _aggregate_prompt_tokens_by_choice(
                 entries: Mapping[Tuple[int, ...], Tuple[Optional[int], Optional[int]]],
@@ -4942,6 +4954,10 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 nonlocal saw_explicit_completion_usage, saw_interim_usage
                 nonlocal saw_request_wide_usage, saw_final_usage, saw_timings_completion
                 nonlocal saw_done_sentinel, saw_upstream_error_event
+                nonlocal finished_choices_seen_count
+                nonlocal settled_usage_count, settled_usage_completion_sum
+                nonlocal settled_usage_prompt_count, settled_usage_prompt_sum
+                nonlocal settled_usage_prompt_max
                 nonlocal empty_choice_usage_count, empty_choice_prompt_count
                 nonlocal empty_choice_prompt_sum, empty_choice_prompt_max
                 nonlocal empty_choice_completion_sum
@@ -5006,12 +5022,11 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                     ):
                                         resolved_idx = c_idx
                                     else:
-                                        resolved_idx = len(finished_choice_indices)
-                                    if (
-                                        resolved_idx in finished_choice_indices
-                                        or len(finished_choice_indices) < max_tracked_choices
-                                    ):
-                                        finished_choice_indices.add(resolved_idx)
+                                        resolved_idx = finished_choices_seen_count
+                                    if resolved_idx not in finished_choice_indices:
+                                        finished_choices_seen_count += 1
+                                        if len(finished_choice_indices) < max_tracked_choices:
+                                            finished_choice_indices.add(resolved_idx)
                                     event_terminal_indices.append(resolved_idx)
                                 else:
                                     event_has_non_terminal_choice = True
@@ -5048,19 +5063,16 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                             got_usage_count = (pt is not None) or (ct is not None)
                             if got_usage_count:
                                 has_choices = isinstance(choices, list) and len(choices) > 0
-                                all_choices_finished_now = (
-                                    len(finished_choice_indices) >= required_choices
-                                    and all(
-                                        idx in finished_choice_indices
-                                        for idx in range(required_choices)
-                                    )
-                                )
+                                all_choices_finished_now = _all_choices_finished()
                                 if not has_choices:
                                     # Empty-choices usage frame: OpenAI/vLLM emit a single
                                     # request-wide total at the end, whereas llama-server on
                                     # multi-choice streams (n > 1 / batched prompts) can emit
                                     # one empty-choices usage frame per finished choice.
-                                    if empty_choice_usage_count >= max_final_usage_frames:
+                                    max_empty_usage_allowed = min(
+                                        required_choices, max(1, finished_choices_seen_count)
+                                    )
+                                    if empty_choice_usage_count >= max_empty_usage_allowed:
                                         saw_upstream_error_event = True
                                         return False, True
                                     made_progress = True
@@ -5117,8 +5129,22 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                             usage_key not in per_choice_usage
                                             and len(per_choice_usage) >= max_tracked_choices
                                         ):
-                                            saw_upstream_error_event = True
-                                            return False, True
+                                            if (
+                                                len(per_choice_usage) + settled_usage_count
+                                                >= max(max_tracked_choices, required_choices)
+                                            ):
+                                                saw_upstream_error_event = True
+                                                return False, True
+                                            ev_key = next(iter(per_choice_usage))
+                                            ev_p, ev_c = per_choice_usage.pop(ev_key)
+                                            settled_usage_count += 1
+                                            if ev_c is not None:
+                                                settled_usage_completion_sum += ev_c
+                                            if ev_p is not None:
+                                                settled_usage_prompt_count += 1
+                                                settled_usage_prompt_sum += ev_p
+                                                if ev_p > settled_usage_prompt_max:
+                                                    settled_usage_prompt_max = ev_p
                                         prev_p, prev_c = per_choice_usage.get(
                                             usage_key, (None, None)
                                         )
@@ -5134,11 +5160,28 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                             for _, c in per_choice_usage.values()
                                             if c is not None
                                         ]
-                                        if agg_p is not None:
-                                            prompt_tokens = agg_p
+                                        if agg_p is not None or settled_usage_prompt_count > 0:
+                                            if settled_usage_prompt_count == 0:
+                                                prompt_tokens = agg_p if agg_p is not None else 0
+                                            elif effective_prompt_batch_size <= 1:
+                                                prompt_tokens = max(
+                                                    settled_usage_prompt_max,
+                                                    agg_p if agg_p is not None else 0,
+                                                )
+                                            else:
+                                                settled_p = (
+                                                    settled_usage_prompt_sum // n_per_prompt
+                                                    if n_per_prompt > 1
+                                                    else settled_usage_prompt_sum
+                                                )
+                                                prompt_tokens = settled_p + (
+                                                    agg_p if agg_p is not None else 0
+                                                )
                                             saw_explicit_prompt_usage = True
-                                        if c_vals:
-                                            completion_tokens = sum(c_vals)
+                                        if c_vals or settled_usage_completion_sum > 0:
+                                            completion_tokens = (
+                                                settled_usage_completion_sum + sum(c_vals)
+                                            )
                                             saw_explicit_completion_usage = True
                                     if (
                                         is_terminal_only_usage
@@ -5594,12 +5637,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
 
             # Per WHATWG SSE spec, discard any incomplete (unterminated) event data at EOF
             # rather than letting it satisfy completion checks.
-            all_choices_finished = (
-                len(finished_choice_indices) >= required_choices
-                and all(
-                    idx in finished_choice_indices for idx in range(required_choices)
-                )
-            )
+            all_choices_finished = _all_choices_finished()
             usage_satisfied = (not expect_final_usage) or saw_final_usage
             stream_completed = (
                 not saw_upstream_error_event

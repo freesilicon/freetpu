@@ -714,6 +714,7 @@ class TestFreeTPURouter(unittest.TestCase):
         self._tmpdir.cleanup()
 
     def _track(self, srv: ThreadingHTTPServer) -> Any:
+        srv.daemon_threads = True
         self._servers.append(srv)
         _start_server(srv)
         return srv
@@ -8955,8 +8956,6 @@ asyncio.run(main())
                 self.wfile.flush()
 
         corrupt_srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _CorruptSSEHandler))
-        corrupt_srv.daemon_threads = True
-        threading.Thread(target=corrupt_srv.serve_forever, daemon=True).start()
         corrupt_port = corrupt_srv.server_address[1]
 
         healthy_fallback = self._track(
@@ -9316,8 +9315,6 @@ asyncio.run(main())
                 self.wfile.flush()
 
         srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _AudioSSEHandler))
-        srv.daemon_threads = True
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
         cfg = RouterConfig(
             host="127.0.0.1",
             port=0,
@@ -9418,8 +9415,6 @@ asyncio.run(main())
                     pass
 
         srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _KeepaliveSSEHandler))
-        srv.daemon_threads = True
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
         cfg = RouterConfig(
             host="127.0.0.1",
             port=0,
@@ -9520,8 +9515,6 @@ asyncio.run(main())
                 self.wfile.flush()
 
         srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _CloseDelimSSEHandler))
-        srv.daemon_threads = True
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
         cfg = RouterConfig(
             host="127.0.0.1",
             port=0,
@@ -9646,8 +9639,6 @@ asyncio.run(main())
                 self.wfile.flush()
 
         srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _CRSseHandler))
-        srv.daemon_threads = True
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
         cfg = RouterConfig(
             host="127.0.0.1",
             port=0,
@@ -9771,8 +9762,6 @@ asyncio.run(main())
                 self.wfile.flush()
 
         srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _StreamingExporterHandler))
-        srv.daemon_threads = True
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
         metrics_url = f"http://127.0.0.1:{srv.server_address[1]}/metrics"
 
         tracemalloc.start()
@@ -9953,8 +9942,6 @@ asyncio.run(main())
                 self.wfile.flush()
 
         srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _InterimUsageSSEHandler))
-        srv.daemon_threads = True
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
         cfg = RouterConfig(
             host="127.0.0.1",
             port=0,
@@ -10181,8 +10168,6 @@ asyncio.run(main())
                 self.wfile.flush()
 
         srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _DoneNoUsageHandler))
-        srv.daemon_threads = True
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
         cfg = RouterConfig(
             host="127.0.0.1",
             port=0,
@@ -10354,8 +10339,6 @@ asyncio.run(main())
                 self.wfile.flush()
 
         srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _TokenMetaSSEHandler))
-        srv.daemon_threads = True
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
         cfg = RouterConfig(
             host="127.0.0.1",
             port=0,
@@ -10456,8 +10439,6 @@ asyncio.run(main())
         srv = self._track(
             ThreadingHTTPServer(("127.0.0.1", 0), _MalformedPostCommitSSEHandler)
         )
-        srv.daemon_threads = True
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
         cfg = RouterConfig(
             host="127.0.0.1",
             port=0,
@@ -10709,8 +10690,6 @@ asyncio.run(main())
                 self.wfile.flush()
 
         srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _LegacyUsageSSEHandler))
-        srv.daemon_threads = True
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
         cfg = RouterConfig(
             host="127.0.0.1",
             port=0,
@@ -11061,8 +11040,6 @@ asyncio.run(main())
                 self.wfile.flush()
 
         srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _ComplexSSEHandler))
-        srv.daemon_threads = True
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
         cfg = RouterConfig(
             host="127.0.0.1",
             port=0,
@@ -11225,8 +11202,6 @@ asyncio.run(main())
                 self.wfile.flush()
 
         srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _TwoChunkSSEHandler))
-        srv.daemon_threads = True
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
         cfg = RouterConfig(
             host="127.0.0.1",
             port=0,
@@ -11381,8 +11356,6 @@ asyncio.run(main())
                 self.wfile.flush()
 
         srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _BatchCompletionsSSEHandler))
-        srv.daemon_threads = True
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
         cfg = RouterConfig(
             host="127.0.0.1",
             port=0,
@@ -11489,8 +11462,6 @@ asyncio.run(main())
                 self.wfile.write(body)
 
         srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _AliasModelsHandler))
-        srv.daemon_threads = True
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
         cfg = RouterConfig(
             host="127.0.0.1",
             port=0,
@@ -11625,8 +11596,6 @@ asyncio.run(main())
                 self.wfile.flush()
 
         srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _MultiChoiceUsageSSEHandler))
-        srv.daemon_threads = True
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
         cfg = RouterConfig(
             host="127.0.0.1",
             port=0,
@@ -11786,8 +11755,6 @@ asyncio.run(main())
                 self.wfile.flush()
 
         srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _MultiChoiceTimingsSSEHandler))
-        srv.daemon_threads = True
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
         cfg = RouterConfig(
             host="127.0.0.1",
             port=0,
@@ -11980,8 +11947,6 @@ asyncio.run(main())
                 self.wfile.flush()
 
         srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _EchoCompletionsHandler))
-        srv.daemon_threads = True
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
         cfg = RouterConfig(
             host="127.0.0.1",
             port=0,
@@ -12177,8 +12142,6 @@ asyncio.run(main())
                 self.wfile.flush()
 
         srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _ContinuousMultiChoiceHandler))
-        srv.daemon_threads = True
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
         cfg = RouterConfig(
             host="127.0.0.1",
             port=0,
@@ -12379,8 +12342,6 @@ asyncio.run(main())
                 self.wfile.flush()
 
         srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _BatchedN2InterruptedHandler))
-        srv.daemon_threads = True
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
         cfg = RouterConfig(
             host="127.0.0.1",
             port=0,
@@ -12574,8 +12535,6 @@ asyncio.run(main())
                 self.wfile.flush()
 
         srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _EchoReturnTokenIdsHandler))
-        srv.daemon_threads = True
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
         cfg = RouterConfig(
             host="127.0.0.1",
             port=0,
@@ -12698,8 +12657,6 @@ asyncio.run(main())
                     pass
 
         srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _RunawayUsageHandler))
-        srv.daemon_threads = True
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
         cfg = RouterConfig(
             host="127.0.0.1",
             port=0,
@@ -12839,7 +12796,6 @@ asyncio.run(main())
         mock_backend = self._track(
             _MockOpenAIBackend("cors-exp-b", ["m-cors-exp"])
         )
-        threading.Thread(target=mock_backend.serve_forever, daemon=True).start()
         cfg = RouterConfig(
             host="127.0.0.1",
             port=0,
@@ -12908,7 +12864,6 @@ asyncio.run(main())
         self.assertNotIn("freetpu_exporter_up1", by_name)
 
         exporter = self._track(_MockTpuExporter(raw_body=compact_metrics))
-        threading.Thread(target=exporter.serve_forever, daemon=True).start()
         telemetry = scrape_tpu_exporter(
             exporter.metrics_url,
             timeout_s=2.0,
@@ -12920,6 +12875,108 @@ asyncio.run(main())
         self.assertAlmostEqual(telemetry.max_hbm_utilization_ratio or 0.0, 0.42)
         ready, reason = evaluate_tpu_readiness(telemetry)
         self.assertTrue(ready, msg=f"unexpected unready reason: {reason}")
+
+    def test_large_batch_over_1024_choices_preserves_final_usage_and_done(self) -> None:
+        recorded_usage: List[UsageEvent] = []
+
+        class _RecordHook:
+            def record_usage(self, event: UsageEvent) -> None:
+                recorded_usage.append(event)
+
+        class _LargeBatchSSEHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return None
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = json.dumps(
+                    {"object": "list", "data": [{"id": "m-batch-1200"}]}
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802
+                clen = int(self.headers.get("Content-Length", "0"))
+                if clen > 0:
+                    self.rfile.read(clen)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                # Emit 1,200 terminal choices (600 prompts x n=2) followed by one aggregate usage frame + [DONE].
+                parts: List[bytes] = []
+                for start in range(0, 1200, 100):
+                    ev = json.dumps(
+                        {
+                            "id": "cmpl-1200",
+                            "object": "text_completion",
+                            "choices": [
+                                {"index": idx, "text": "x", "finish_reason": "stop"}
+                                for idx in range(start, start + 100)
+                            ],
+                        }
+                    ).encode("utf-8")
+                    parts.append(b"data: " + ev + b"\n\n")
+                usage_ev = json.dumps(
+                    {
+                        "id": "cmpl-1200",
+                        "object": "text_completion",
+                        "choices": [],
+                        "usage": {
+                            "prompt_tokens": 6000,
+                            "completion_tokens": 2400,
+                            "total_tokens": 8400,
+                        },
+                    }
+                ).encode("utf-8")
+                parts.append(b"data: " + usage_ev + b"\n\n")
+                parts.append(b"data: [DONE]\n\n")
+                self.wfile.write(b"".join(parts))
+                self.wfile.flush()
+
+        srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _LargeBatchSSEHandler))
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            failure_cooldown_s=30.0,
+            backends=[
+                BackendConfig(
+                    id="batch-1200-b",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=f"http://127.0.0.1:{srv.server_address[1]}/v1",
+                    models=["m-batch-1200"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg, usage_hook=_RecordHook()))
+        st, _, bd = _http_request(
+            router.server_address[1],
+            "POST",
+            "/v1/completions",
+            body={
+                "model": "m-batch-1200",
+                "prompt": [f"p{i}" for i in range(600)],
+                "n": 2,
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            },
+        )
+        self.assertEqual(st, 200)
+        self.assertIn(b"data: [DONE]", bd)
+        self.assertEqual(len(recorded_usage), 1)
+        self.assertEqual(recorded_usage[0].status_code, 200)
+        self.assertEqual(recorded_usage[0].prompt_tokens, 6000)
+        self.assertEqual(recorded_usage[0].completion_tokens, 2400)
+        bstate = router.engine._backends[0]
+        self.assertEqual(bstate.total_failures, 0)
+        self.assertTrue(bstate.healthy)
+        self.assertEqual(bstate.cooldown_until_monotonic, 0.0)
 
 
 def run_self_tests(verbosity: int = 1) -> int:
