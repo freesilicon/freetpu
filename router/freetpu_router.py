@@ -121,7 +121,7 @@ def _safe_probe_error(exc: BaseException) -> str:
 
 
 def _extract_models_list(parsed: Any) -> Optional[List[str]]:
-    """Validate an OpenAI `/v1/models` JSON response and return discovered model IDs."""
+    """Validate an OpenAI `/v1/models` JSON response and return discovered model IDs and aliases."""
     items: Optional[List[Any]] = None
     if isinstance(parsed, Mapping):
         raw_data = parsed.get("data")
@@ -132,12 +132,24 @@ def _extract_models_list(parsed: Any) -> Optional[List[str]]:
     if items is None:
         return None
     discovered: List[str] = []
+    seen: set[str] = set()
     for item in items:
         if not isinstance(item, Mapping):
             return None
         raw_id = item.get("id")
-        if isinstance(raw_id, str) and raw_id.strip():
-            discovered.append(raw_id.strip())
+        if isinstance(raw_id, str):
+            mid = raw_id.strip()
+            if mid and mid not in seen:
+                seen.add(mid)
+                discovered.append(mid)
+        raw_aliases = item.get("aliases")
+        if isinstance(raw_aliases, list):
+            for raw_alias in raw_aliases:
+                if isinstance(raw_alias, str):
+                    alias = raw_alias.strip()
+                    if alias and alias not in seen:
+                        seen.add(alias)
+                        discovered.append(alias)
     return discovered
 
 
@@ -1322,7 +1334,7 @@ def build_hooks_from_config(
                     isinstance(t, str) and t.strip() for t in raw_tokens
                 ):
                     raise ValueError("auth.tokens must be a list of non-empty strings")
-                tokens.extend(t for t in raw_tokens)
+                tokens.extend(t.strip() for t in raw_tokens)
             raw_tokens_env = auth_cfg.get("tokens_env")
             if raw_tokens_env is not None:
                 if not isinstance(raw_tokens_env, (list, tuple)) or not all(
@@ -1337,6 +1349,11 @@ def build_hooks_from_config(
                     val = os.environ.get(env_name.strip(), "").strip()
                     if val:
                         tokens.append(val)
+            if not tokens:
+                raise ValueError(
+                    "auth.type='bearer' resolved zero non-empty tokens; "
+                    "configure auth.tokens or set at least one non-blank env var in auth.tokens_env"
+                )
             if "exempt_paths" in auth_cfg and auth_cfg["exempt_paths"] is not None:
                 raw_exempt = auth_cfg["exempt_paths"]
                 if not isinstance(raw_exempt, (list, tuple)) or not all(
@@ -4528,11 +4545,15 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             saw_explicit_prompt_usage = False
             saw_explicit_completion_usage = False
             saw_interim_usage = False
+            saw_request_wide_usage = False
             saw_final_usage = False
             saw_timings_completion = False
             saw_done_sentinel = False
             saw_upstream_error_event = False
             finished_choice_indices: set[int] = set()
+            per_choice_terminal_usage: Dict[
+                Tuple[int, ...], Tuple[Optional[int], Optional[int]]
+            ] = {}
             upstream_read_error = False
             size_limit_exceeded = False
             memory_limit_exceeded = False
@@ -4552,7 +4573,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 nonlocal first_content_ttft_ms, prompt_tokens, completion_tokens
                 nonlocal est_completion_chars, saw_explicit_prompt_usage
                 nonlocal saw_explicit_completion_usage, saw_interim_usage
-                nonlocal saw_final_usage, saw_timings_completion
+                nonlocal saw_request_wide_usage, saw_final_usage, saw_timings_completion
                 nonlocal saw_done_sentinel, saw_upstream_error_event
                 if not data_lines:
                     return False, False
@@ -4589,6 +4610,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         choices = obj.get("choices")
                         event_has_terminal_choice = False
                         event_has_non_terminal_choice = False
+                        event_terminal_indices: List[int] = []
                         if isinstance(choices, list):
                             for choice in choices:
                                 if not isinstance(choice, dict):
@@ -4602,9 +4624,11 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                         and not isinstance(c_idx, bool)
                                         and c_idx >= 0
                                     ):
-                                        finished_choice_indices.add(c_idx)
+                                        resolved_idx = c_idx
                                     else:
-                                        finished_choice_indices.add(len(finished_choice_indices))
+                                        resolved_idx = len(finished_choice_indices)
+                                    finished_choice_indices.add(resolved_idx)
+                                    event_terminal_indices.append(resolved_idx)
                                 else:
                                     event_has_non_terminal_choice = True
                         output_txt = _extract_choice_output_text(obj)
@@ -4618,36 +4642,71 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                 est_completion_chars += len(output_txt)
                         usage = obj.get("usage")
                         if isinstance(usage, dict):
-                            got_usage_count = False
                             pt = _safe_nonneg_int(usage.get("prompt_tokens"))
-                            if pt is not None:
-                                prompt_tokens = pt
-                                saw_explicit_prompt_usage = True
-                                got_usage_count = True
-                                made_progress = True
                             ct = _safe_nonneg_int(usage.get("completion_tokens"))
-                            if ct is not None:
-                                completion_tokens = ct
-                                saw_explicit_completion_usage = True
-                                got_usage_count = True
+                            got_usage_count = (pt is not None) or (ct is not None)
+                            if got_usage_count:
                                 made_progress = True
-                            has_choices = isinstance(choices, list) and len(choices) > 0
-                            if got_usage_count and has_choices and (
-                                event_has_non_terminal_choice or not event_has_terminal_choice
-                            ):
-                                saw_interim_usage = True
-                            all_choices_finished_now = all(
-                                idx in finished_choice_indices for idx in range(required_choices)
-                            )
-                            if got_usage_count and (
-                                not has_choices
-                                or (
-                                    event_has_terminal_choice
-                                    and all_choices_finished_now
-                                    and not saw_interim_usage
-                                )
-                            ):
-                                saw_final_usage = True
+                                has_choices = isinstance(choices, list) and len(choices) > 0
+                                if not has_choices:
+                                    # Authoritative request-wide final usage frame (OpenAI / vLLM).
+                                    saw_request_wide_usage = True
+                                    if pt is not None:
+                                        prompt_tokens = pt
+                                        saw_explicit_prompt_usage = True
+                                    if ct is not None:
+                                        completion_tokens = ct
+                                        saw_explicit_completion_usage = True
+                                    saw_final_usage = True
+                                else:
+                                    is_terminal_only_usage = (
+                                        event_has_terminal_choice
+                                        and not event_has_non_terminal_choice
+                                    )
+                                    if not is_terminal_only_usage:
+                                        saw_interim_usage = True
+                                    if (
+                                        is_terminal_only_usage
+                                        and not saw_interim_usage
+                                        and not saw_request_wide_usage
+                                    ):
+                                        # llama-server attaches per-choice usage to each terminal
+                                        # choice chunk in batched streaming completions.
+                                        usage_key = tuple(sorted(set(event_terminal_indices)))
+                                        per_choice_terminal_usage[usage_key] = (pt, ct)
+                                        p_vals = [
+                                            p
+                                            for p, _ in per_choice_terminal_usage.values()
+                                            if p is not None
+                                        ]
+                                        c_vals = [
+                                            c
+                                            for _, c in per_choice_terminal_usage.values()
+                                            if c is not None
+                                        ]
+                                        if p_vals:
+                                            prompt_tokens = sum(p_vals)
+                                            saw_explicit_prompt_usage = True
+                                        if c_vals:
+                                            completion_tokens = sum(c_vals)
+                                            saw_explicit_completion_usage = True
+                                    elif not saw_request_wide_usage:
+                                        if pt is not None:
+                                            prompt_tokens = pt
+                                            saw_explicit_prompt_usage = True
+                                        if ct is not None:
+                                            completion_tokens = ct
+                                            saw_explicit_completion_usage = True
+                                    all_choices_finished_now = all(
+                                        idx in finished_choice_indices
+                                        for idx in range(required_choices)
+                                    )
+                                    if (
+                                        is_terminal_only_usage
+                                        and all_choices_finished_now
+                                        and not saw_interim_usage
+                                    ):
+                                        saw_final_usage = True
                         timings = obj.get("timings")
                         if isinstance(timings, dict):
                             if not saw_explicit_prompt_usage:

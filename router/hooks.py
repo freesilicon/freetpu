@@ -71,14 +71,20 @@ class BearerTokenAuthHook(AuthHook):
             raise ValueError("exempt_paths must be an iterable of path strings, not a scalar string")
         if isinstance(tokens, Mapping):
             self._token_principals: Dict[str, str] = {
-                str(tok): str(principal) for tok, principal in tokens.items() if tok
+                tok.strip(): str(principal)
+                for tok, principal in tokens.items()
+                if isinstance(tok, str) and tok.strip()
             }
         else:
             self._token_principals = {
-                str(tok): f"token-{idx + 1}"
+                tok.strip(): f"token-{idx + 1}"
                 for idx, tok in enumerate(tokens)
-                if tok
+                if isinstance(tok, str) and tok.strip()
             }
+        if not self._token_principals:
+            raise ValueError(
+                "BearerTokenAuthHook requires at least one non-empty bearer token"
+            )
         self._exempt_paths = set(exempt_paths)
 
     def authenticate(

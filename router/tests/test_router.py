@@ -11308,6 +11308,258 @@ asyncio.run(main())
         self.assertEqual(router.engine._backends[0].total_failures, 0)
         self.assertEqual(router.engine._backends[0].cooldown_until_monotonic, 0.0)
 
+    def test_streamed_batch_completions_accumulates_per_choice_usage_and_prefers_request_wide_total(
+        self,
+    ) -> None:
+        recorded_usage: List[UsageEvent] = []
+
+        class _RecordHook:
+            def record_usage(self, event: UsageEvent) -> None:
+                recorded_usage.append(event)
+
+        include_request_wide_frame = [False]
+
+        class _BatchCompletionsSSEHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return None
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = json.dumps(
+                    {"object": "list", "data": [{"id": "m-batch-usage"}]}
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802
+                clen = int(self.headers.get("Content-Length", "0"))
+                if clen > 0:
+                    self.rfile.read(clen)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(
+                    b'data: {"id":"b1","object":"text_completion",'
+                    b'"choices":[{"index":0,"text":"A1","finish_reason":null}]}\n\n'
+                    b'data: {"id":"b1","object":"text_completion",'
+                    b'"choices":[{"index":1,"text":"A2","finish_reason":null}]}\n\n'
+                    b'data: {"id":"b1","object":"text_completion",'
+                    b'"choices":[{"index":0,"text":"","finish_reason":"stop"}],'
+                    b'"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}\n\n'
+                    b'data: {"id":"b1","object":"text_completion",'
+                    b'"choices":[{"index":1,"text":"","finish_reason":"stop"}],'
+                    b'"usage":{"prompt_tokens":12,"completion_tokens":7,"total_tokens":19}}\n\n'
+                )
+                if include_request_wide_frame[0]:
+                    self.wfile.write(
+                        b'data: {"id":"b1","object":"text_completion","choices":[],'
+                        b'"usage":{"prompt_tokens":25,"completion_tokens":14,"total_tokens":39}}\n\n'
+                    )
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+
+        srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _BatchCompletionsSSEHandler))
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            backends=[
+                BackendConfig(
+                    id="batch-usage-b",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=f"http://127.0.0.1:{srv.server_address[1]}/v1",
+                    models=["m-batch-usage"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg, usage_hook=_RecordHook()))
+        rport = router.server_address[1]
+
+        # 1. Per-choice terminal usage chunks accumulate across batch choices.
+        st1, _, bd1 = _http_request(
+            rport,
+            "POST",
+            "/v1/completions",
+            body={
+                "model": "m-batch-usage",
+                "prompt": ["Q1", "Q2"],
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            },
+        )
+        self.assertEqual(st1, 200)
+        self.assertIn(b"data: [DONE]", bd1)
+        self.assertEqual(recorded_usage[0].status_code, 200)
+        self.assertEqual(recorded_usage[0].prompt_tokens, 22)
+        self.assertEqual(recorded_usage[0].completion_tokens, 12)
+
+        # 2. Request-wide empty-choices usage frame takes precedence when provided.
+        include_request_wide_frame[0] = True
+        st2, _, bd2 = _http_request(
+            rport,
+            "POST",
+            "/v1/completions",
+            body={
+                "model": "m-batch-usage",
+                "prompt": ["Q1", "Q2"],
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            },
+        )
+        self.assertEqual(st2, 200)
+        self.assertIn(b"data: [DONE]", bd2)
+        self.assertEqual(recorded_usage[1].status_code, 200)
+        self.assertEqual(recorded_usage[1].prompt_tokens, 25)
+        self.assertEqual(recorded_usage[1].completion_tokens, 14)
+
+    def test_model_discovery_preserves_llama_server_aliases_for_routing(self) -> None:
+        class _AliasModelsHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return None
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = json.dumps(
+                    {
+                        "object": "list",
+                        "data": [
+                            {
+                                "id": "qwen3-32b.gguf",
+                                "object": "model",
+                                "aliases": ["qwen3-32b", "default", "qwen3-32b.gguf"],
+                            }
+                        ],
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802
+                clen = int(self.headers.get("Content-Length", "0"))
+                req = json.loads(self.rfile.read(clen).decode("utf-8"))
+                body = json.dumps(
+                    {
+                        "id": "alias-1",
+                        "object": "chat.completion",
+                        "model": req.get("model"),
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "ok"},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
+        srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _AliasModelsHandler))
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            backends=[
+                BackendConfig(
+                    id="llama-alias-b",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=f"http://127.0.0.1:{srv.server_address[1]}/v1",
+                    models=["qwen3-32b"],
+                    discover_models=True,
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg, probe_on_start=True))
+        rport = router.server_address[1]
+        self.assertEqual(
+            router.engine._backends[0].effective_models(),
+            ["qwen3-32b.gguf", "qwen3-32b", "default"],
+        )
+
+        for requested_model in ("qwen3-32b.gguf", "qwen3-32b", "default"):
+            st, hdrs, _ = _http_request(
+                rport,
+                "POST",
+                "/v1/chat/completions",
+                body={
+                    "model": requested_model,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+            self.assertEqual(st, 200, f"expected alias {requested_model!r} to route")
+            self.assertEqual(hdrs.get("x-freetpu-backend"), "llama-alias-b")
+
+    def test_bearer_auth_rejects_zero_resolved_tokens_at_check_config_and_hook_init(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(ValueError, "non-empty bearer token"):
+            BearerTokenAuthHook([])
+        with self.assertRaisesRegex(ValueError, "non-empty bearer token"):
+            BearerTokenAuthHook(["   "])
+        with self.assertRaisesRegex(ValueError, "non-empty bearer token"):
+            BearerTokenAuthHook({})
+
+        env_key = "FREETPU_TEST_EMPTY_BEARER_TOKEN_ENV"
+        prev_val = os.environ.pop(env_key, None)
+        cfg_path = Path(self._tmpdir.name) / "empty_bearer_env.json"
+        cfg_path.write_text(
+            json.dumps(
+                {
+                    "auth": {"type": "bearer", "tokens_env": [env_key]},
+                    "backends": [
+                        {
+                            "id": "b1",
+                            "base_url": "http://127.0.0.1:8081/v1",
+                            "models": ["m1"],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        try:
+            # Unset env var fails build_hooks_from_config and --check-config.
+            with self.assertRaisesRegex(ValueError, "zero non-empty tokens"):
+                build_hooks_from_config(load_config(cfg_path))
+            self.assertEqual(
+                router_main(["--check-config", "--config", str(cfg_path)]),
+                1,
+            )
+
+            # Blank-whitespace env var also fails build_hooks_from_config and --check-config.
+            os.environ[env_key] = "   \t  "
+            with self.assertRaisesRegex(ValueError, "zero non-empty tokens"):
+                build_hooks_from_config(load_config(cfg_path))
+            self.assertEqual(
+                router_main(["--check-config", "--config", str(cfg_path)]),
+                1,
+            )
+        finally:
+            if prev_val is None:
+                os.environ.pop(env_key, None)
+            else:
+                os.environ[env_key] = prev_val
+
 
 def run_self_tests(verbosity: int = 1) -> int:
     """Run all router tests cleanly via unittest."""
