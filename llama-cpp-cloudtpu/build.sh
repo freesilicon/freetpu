@@ -72,7 +72,7 @@ build_standalone_tests() {
     fi
     "$CMAKE" -S "$ROOT" -B "$bdir" "${gen_args[@]}" -DCMAKE_BUILD_TYPE=Release
     "$CMAKE" --build "$bdir" -j"$JOBS"
-    "$CTEST" --test-dir "$bdir" --output-on-failure
+    (cd "$bdir" && "$CTEST" --output-on-failure)
 }
 
 case "$mode" in
