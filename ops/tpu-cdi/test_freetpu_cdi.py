@@ -220,7 +220,9 @@ class FreeTpuCdiTests(unittest.TestCase):
                 [
                     "MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353",
                     "TPU_HOST_BOUNDS=1,1,1",
-                    "TPU_SKIP_MDS_QUERY=1",
+                    "TPU_WORKER_HOSTNAMES=localhost",
+                    "TPU_WORKER_ID=0",
+                    "TPU_SKIP_MDS_QUERY=true",
                 ],
             )
             self.assertEqual(
@@ -231,7 +233,9 @@ class FreeTpuCdiTests(unittest.TestCase):
                     "TPU_CHIPS_PER_HOST_BOUNDS=1,1,1",
                     "MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353",
                     "TPU_HOST_BOUNDS=1,1,1",
-                    "TPU_SKIP_MDS_QUERY=1",
+                    "TPU_WORKER_HOSTNAMES=localhost",
+                    "TPU_WORKER_ID=0",
+                    "TPU_SKIP_MDS_QUERY=true",
                 ],
             )
             # Device numbers are omitted from deviceNodes (with live st_rdev tracked in annotations to invalidate CDI caches on rebind).
@@ -510,6 +514,51 @@ class FreeTpuCdiTests(unittest.TestCase):
         self.assertTrue(any("netDevices[0].name: must be a non-empty string" in e for e in errs4), errs4)
         self.assertTrue(any("netDevices[1].name: must be a non-empty string" in e for e in errs4), errs4)
         self.assertTrue(any("duplicate netDevice name" in e for e in errs4), errs4)
+
+        # CNCF CDI v1.1.0 IntelRdt.closID validation: "/" (root CLOS), "" (unset), and
+        # valid Linux filenames pass; paths containing "/", ".", "..", "\n", "\x00", or
+        # >= 4096 bytes must fail validation.
+        for valid_clos in ("", "/", "tpu-tenant-0"):
+            ok_clos_spec = {
+                "cdiVersion": "1.1.0",
+                "kind": "freetpu.dev/tpu",
+                "containerEdits": {
+                    "deviceNodes": [{"path": "/dev/vfio/vfio"}],
+                    "intelRdt": {"closID": valid_clos},
+                },
+                "devices": [
+                    {
+                        "name": "0",
+                        "containerEdits": {"deviceNodes": [{"path": "/dev/vfio/0"}]},
+                    }
+                ],
+            }
+            self.assertEqual(
+                freetpu_cdi.validate_cdi_spec(ok_clos_spec),
+                [],
+                f"Expected closID {valid_clos!r} to be valid",
+            )
+
+        for bad_clos in ("tenant/tpu", "/tenant", ".", "..", "a\nb", "a\x00b", "a" * 4096):
+            bad_clos_spec = {
+                "cdiVersion": "1.1.0",
+                "kind": "freetpu.dev/tpu",
+                "containerEdits": {
+                    "deviceNodes": [{"path": "/dev/vfio/vfio"}],
+                    "intelRdt": {"closID": bad_clos},
+                },
+                "devices": [
+                    {
+                        "name": "0",
+                        "containerEdits": {"deviceNodes": [{"path": "/dev/vfio/0"}]},
+                    }
+                ],
+            }
+            clos_errs = freetpu_cdi.validate_cdi_spec(bad_clos_spec)
+            self.assertTrue(
+                any("intelRdt.closID: invalid closID" in e for e in clos_errs),
+                f"Expected invalid closID error for {bad_clos!r}, got {clos_errs}",
+            )
 
     def test_rejects_vfio_group_with_non_tpu_devices_and_non_vfio_driver(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1650,7 +1699,9 @@ class FreeTpuCdiTests(unittest.TestCase):
                         dev_entry["containerEdits"]["env"],
                     )
                     self.assertIn("TPU_HOST_BOUNDS=1,1,1", dev_entry["containerEdits"]["env"])
-                    self.assertIn("TPU_SKIP_MDS_QUERY=1", dev_entry["containerEdits"]["env"])
+                    self.assertIn("TPU_WORKER_HOSTNAMES=localhost", dev_entry["containerEdits"]["env"])
+                    self.assertIn("TPU_WORKER_ID=0", dev_entry["containerEdits"]["env"])
+                    self.assertIn("TPU_SKIP_MDS_QUERY=true", dev_entry["containerEdits"]["env"])
 
                 # 8. Empty per-device containerEdits is rejected (CDI requires >= 1 edit per device).
                 empty_dev_spec = {
@@ -1764,7 +1815,9 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertEqual(all_env["TPU_CHIPS_PER_HOST_BOUNDS"], "2,2,1")
                 self.assertEqual(all_env["MEGASCALE_COORDINATOR_ADDRESS"], "127.0.0.1:8353")
                 self.assertEqual(all_env["TPU_HOST_BOUNDS"], "1,1,1")
-                self.assertEqual(all_env["TPU_SKIP_MDS_QUERY"], "1")
+                self.assertEqual(all_env["TPU_WORKER_HOSTNAMES"], "localhost")
+                self.assertEqual(all_env["TPU_WORKER_ID"], "0")
+                self.assertEqual(all_env["TPU_SKIP_MDS_QUERY"], "true")
 
                 # Composable PCI selectors omit TPU_VISIBLE_CHIPS / TPU_VISIBLE_DEVICES /
                 # TPU_CHIPS_PER_HOST_BOUNDS so combining multiple PCI selectors never
@@ -1777,6 +1830,9 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertNotIn("TPU_VISIBLE_DEVICES", pci0_iso_env)
                 self.assertNotIn("TPU_CHIPS_PER_HOST_BOUNDS", pci0_iso_env)
                 self.assertEqual(pci0_iso_env["MEGASCALE_COORDINATOR_ADDRESS"], "127.0.0.1:8353")
+                self.assertEqual(pci0_iso_env["TPU_WORKER_HOSTNAMES"], "localhost")
+                self.assertEqual(pci0_iso_env["TPU_WORKER_ID"], "0")
+                self.assertEqual(pci0_iso_env["TPU_SKIP_MDS_QUERY"], "true")
 
                 host_spec = freetpu_cdi.build_cdi_spec(
                     chips, control_node, network_mode="host"
@@ -2195,6 +2251,48 @@ class FreeTpuCdiTests(unittest.TestCase):
                     errs_cross,
                 )
 
+                # Swapping/renaming `numa1` -> `numa0` (and `4-7` -> `0-3`) while keeping
+                # valid single-domain nodes and annotations MUST fail --check-host!
+                swapped = json.loads(json.dumps(spec))
+                for dev in swapped["devices"]:
+                    if dev["name"] == "numa0":
+                        dev["name"] = "numa1"
+                    elif dev["name"] == "numa1":
+                        dev["name"] = "numa0"
+                    elif dev["name"] == "0-3":
+                        dev["name"] = "4-7"
+                    elif dev["name"] == "4-7":
+                        dev["name"] = "0-3"
+                errs_swap = freetpu_cdi.verify_spec_against_host(
+                    swapped, sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                for bad_alias in ("numa0", "numa1", "0-3", "4-7"):
+                    self.assertTrue(
+                        any(
+                            f"device '{bad_alias}'" in e
+                            and "does not match live host topology" in e
+                            for e in errs_swap
+                        ),
+                        f"Expected swapped alias error for {bad_alias}, got {errs_swap}",
+                    )
+
+                # Unknown slice alias (e.g. `numa2` on a 2-NUMA host) must also fail --check-host!
+                unknown_alias = json.loads(json.dumps(spec))
+                for dev in unknown_alias["devices"]:
+                    if dev["name"] == "numa1":
+                        dev["name"] = "numa2"
+                errs_unk = freetpu_cdi.verify_spec_against_host(
+                    unknown_alias, sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                self.assertTrue(
+                    any(
+                        "device 'numa2'" in e
+                        and "does not match any live host topology slice" in e
+                        for e in errs_unk
+                    ),
+                    errs_unk,
+                )
+
             # Verify tpu7x Ironwood 4-chip VM (8 PCI functions across 0x0076 / 0x0075):
             # all 8 PCI functions remain allocated in VFIO deviceNodes while host bounds
             # use the 4 physical chips (`2,2,1`, NOT `2,4,1`).
@@ -2371,13 +2469,23 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertEqual(sn_by_name["pcie0"]["annotations"]["freetpu.dev/pcie-domain"], "0")
                 self.assertEqual(sn_by_name["pcie1"]["annotations"]["freetpu.dev/pcie-domain"], "1")
 
-            # Verify Kubernetes DRA example manifest uses stable resource.k8s.io/v1 API.
+            # Verify Kubernetes DRA example manifest uses stable resource.k8s.io/v1 API
+            # and documents Topology Manager + Guaranteed QoS CPU/memory prerequisites.
             dra_path = CDI_DIR / "manifests" / "k8s-tpu-dra-example.yaml"
             dra_text = dra_path.read_text(encoding="utf-8")
             self.assertNotIn("resource.k8s.io/v1beta1", dra_text)
             self.assertEqual(dra_text.count("apiVersion: resource.k8s.io/v1"), 3)
             self.assertNotIn("basic:", dra_text)
             self.assertIn("exactly:", dra_text)
+            self.assertIn("single-numa-node", dra_text)
+            self.assertIn("cpuManagerPolicy", dra_text)
+            self.assertIn("memoryManagerPolicy", dra_text)
+            self.assertIn("Guaranteed", dra_text)
+            self.assertIn('cpu: "4"', dra_text)
+            self.assertIn('memory: "32Gi"', dra_text)
+            self.assertIn("TPU_WORKER_HOSTNAMES=localhost", dra_text)
+            self.assertIn("TPU_WORKER_ID=0", dra_text)
+            self.assertIn("TPU_SKIP_MDS_QUERY=true", dra_text)
 
             # Verify README keeps containerd GHSA-33vj-92qq-66hc security prerequisite
             # before the general Quickstart section (not only under DaemonSet instructions).

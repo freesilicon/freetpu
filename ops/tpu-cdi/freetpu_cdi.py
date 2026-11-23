@@ -17,12 +17,13 @@ Also supports:
     and pure-iommufd fallback (`/dev/iommu` + verified `<pci>/vfio-dev/vfioN`)
   - Opt-in single-host isolated container networking via `--single-host-env`
     (or `--network-mode isolated`), injecting `MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353`,
-    `TPU_HOST_BOUNDS=1,1,1`, `TPU_SKIP_MDS_QUERY=1` (plus physical-chip-derived
-    `TPU_CHIPS_PER_HOST_BOUNDS` and `TPU_VISIBLE_DEVICES` on full-allocation
-    selectors `numa*`/`0-3`/`all` only). By default (`--network-mode host`,
-    without `--single-host-env`), no `libtpu` environment overrides are injected
-    so existing multi-host workloads retain their configured peer discovery,
-    visibility, and bounds.
+    `TPU_HOST_BOUNDS=1,1,1`, `TPU_WORKER_HOSTNAMES=localhost`, `TPU_WORKER_ID=0`,
+    `TPU_SKIP_MDS_QUERY=true` (plus physical `TPU_VISIBLE_CHIPS`, logical
+    `TPU_VISIBLE_DEVICES`, and physical-chip-derived `TPU_CHIPS_PER_HOST_BOUNDS`
+    on full-allocation selectors `numa*`/`pcie*`/`0-3`/`all` only). By default
+    (`--network-mode host`, without `--single-host-env`), no `libtpu` environment
+    overrides are injected so existing multi-host workloads retain their
+    configured peer discovery, visibility, and bounds.
   - `validate`: strict CNCF CDI structural & live host VFIO/iommufd validator
   - `sync`: boot-scoped generator/reconciler that invalidates stale specs on drift
   - `docker-args`: prints Docker / Podman CLI flags (memlock default; optional IPC_LOCK)
@@ -792,10 +793,110 @@ def _build_device_env(
         [
             "MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353",
             "TPU_HOST_BOUNDS=1,1,1",
-            "TPU_SKIP_MDS_QUERY=1",
+            "TPU_WORKER_HOSTNAMES=localhost",
+            "TPU_WORKER_ID=0",
+            "TPU_SKIP_MDS_QUERY=true",
         ]
     )
     return env
+
+
+@dataclass(frozen=True)
+class _TopologySlice:
+    chips: Tuple[DiscoveredChip, ...]
+    pci_bdfs: Tuple[str, ...]
+    physical_indices: Tuple[int, ...]
+    logical_indices: Tuple[int, ...]
+    generations: Tuple[str, ...]
+    numa_node: Optional[int]
+    pcie_root: str
+    pcie_domain: int
+    allocation_unit: str
+    aliases: Tuple[str, ...]
+
+
+def _compute_topology_slices(
+    chips: Sequence[DiscoveredChip],
+    bdf_to_phys: Dict[str, int],
+    *,
+    reserved_names: Optional[set[str]] = None,
+) -> List[_TopologySlice]:
+    """Compute valid single-domain NUMA / PCIe sub-host slices and their canonical aliases."""
+    domains: Dict[Tuple[str, Optional[int], str], List[DiscoveredChip]] = {}
+    for chip in chips:
+        domains.setdefault(_topology_domain_key(chip), []).append(chip)
+
+    if len(domains) < 2:
+        return []
+
+    used_names = set(reserved_names or ())
+    explicit_numa_ids = [
+        key[1] for key in domains if key[0] == "numa" and key[1] is not None
+    ]
+    use_explicit_numa = (
+        len(explicit_numa_ids) == len(domains)
+        and len(set(explicit_numa_ids)) == len(domains)
+    )
+    # Map every IOMMU group to the set of domain keys that touch it so we
+    # never emit a sub-host slice that splits an IOMMU group across domains
+    # (enforced in BOTH legacy VFIO and iommufd/cdev modes).
+    group_to_domains: Dict[str, set[Tuple[str, Optional[int], str]]] = {}
+    for d_key, d_chips in domains.items():
+        for c in d_chips:
+            group_to_domains.setdefault(c.iommu_group, set()).add(d_key)
+
+    slices: List[_TopologySlice] = []
+    for dom_ordinal, (d_key, d_chips) in enumerate(domains.items()):
+        if len(d_chips) < 2 or len(d_chips) >= len(chips):
+            continue
+        if any(
+            len(group_to_domains.get(c.iommu_group, set())) > 1 for c in d_chips
+        ):
+            continue
+
+        slice_bdfs = tuple(sorted(c.pci_bdf for c in d_chips))
+        slice_phys_indices = tuple(_distinct_physical_indices(d_chips, bdf_to_phys))
+        slice_logical_indices = tuple(_logical_device_indices(d_chips, slice_phys_indices))
+        slice_gens: List[str] = []
+        for c in d_chips:
+            if c.generation not in slice_gens:
+                slice_gens.append(c.generation)
+
+        discovered_numa = d_key[1]
+        pcie_root = d_key[2]
+        candidate_names = (
+            [f"numa{discovered_numa}"]
+            if use_explicit_numa and discovered_numa is not None
+            else [f"pcie{dom_ordinal}"]
+        )
+        if list(slice_phys_indices) == list(
+            range(slice_phys_indices[0], slice_phys_indices[0] + len(slice_phys_indices))
+        ):
+            candidate_names.append(f"{slice_phys_indices[0]}-{slice_phys_indices[-1]}")
+
+        aliases: List[str] = []
+        for s_name in candidate_names:
+            if s_name in used_names or s_name == "all":
+                continue
+            used_names.add(s_name)
+            aliases.append(s_name)
+
+        if aliases:
+            slices.append(
+                _TopologySlice(
+                    chips=tuple(d_chips),
+                    pci_bdfs=slice_bdfs,
+                    physical_indices=slice_phys_indices,
+                    logical_indices=slice_logical_indices,
+                    generations=tuple(slice_gens),
+                    numa_node=discovered_numa,
+                    pcie_root=pcie_root,
+                    pcie_domain=dom_ordinal,
+                    allocation_unit="numa-slice" if use_explicit_numa else "pcie-slice",
+                    aliases=tuple(aliases),
+                )
+            )
+    return slices
 
 
 def _dedup_device_nodes(chips: Sequence[DiscoveredChip]) -> Tuple[List[Dict[str, Any]], Dict[str, Optional[str]]]:
@@ -981,100 +1082,51 @@ def build_cdi_spec(
             )
 
     # Emit NUMA / PCIe-root-complex-aware sub-host slice presets (e.g. `numa0`,
-    # `numa1`, `0-3`, `4-7` on `v6e-8`) strictly within matching NUMA / PCIe root
-    # complex boundaries so host-to-device DMA never crosses UPI/QPI.
-    domains: Dict[Tuple[str, Optional[int], str], List[DiscoveredChip]] = {}
-    for chip in chips:
-        domains.setdefault(_topology_domain_key(chip), []).append(chip)
-
-    if len(domains) >= 2:
-        used_names = {d["name"] for d in devices}
-        explicit_numa_ids = [
-            key[1] for key in domains if key[0] == "numa" and key[1] is not None
-        ]
-        use_explicit_numa = (
-            len(explicit_numa_ids) == len(domains)
-            and len(set(explicit_numa_ids)) == len(domains)
+    # `numa1`, `pcie0`, `0-3`, `4-7` on `v6e-8`) strictly within matching NUMA /
+    # PCIe root complex boundaries.
+    used_names = {d["name"] for d in devices}
+    for topo_slice in _compute_topology_slices(chips, bdf_to_phys, reserved_names=used_names):
+        slice_nodes, slice_devnums = _dedup_device_nodes(topo_slice.chips)
+        slice_env = _build_device_env(
+            topo_slice.physical_indices,
+            topo_slice.logical_indices,
+            topo_slice.generations,
+            single_host_env=inject_single_host_env,
+            include_visibility_env=True,
         )
-        # Map every IOMMU group to the set of domain keys that touch it so we
-        # never emit a sub-host slice that splits an IOMMU group across domains
-        # (enforced in BOTH legacy VFIO and iommufd/cdev modes).
-        group_to_domains: Dict[str, set[Tuple[str, Optional[int], str]]] = {}
-        for d_key, d_chips in domains.items():
-            for c in d_chips:
-                group_to_domains.setdefault(c.iommu_group, set()).add(d_key)
+        slice_ann_base: Dict[str, str] = {
+            "freetpu.dev/allocation-unit": topo_slice.allocation_unit,
+            "freetpu.dev/chip-count": str(len(topo_slice.physical_indices)),
+            "freetpu.dev/pci-bdfs": ",".join(topo_slice.pci_bdfs),
+            "freetpu.dev/generations": ",".join(topo_slice.generations),
+            "freetpu.dev/pcie-root": topo_slice.pcie_root,
+            "freetpu.dev/pcie-domain": str(topo_slice.pcie_domain),
+            "freetpu.dev/optional-cap-add": "IPC_LOCK",
+            "freetpu.dev/required-ulimit-memlock": "-1",
+        }
+        # Record freetpu.dev/numa-node ONLY with the actual sysfs NUMA node;
+        # never substitute a PCIe domain ordinal or invent a node when sysfs has none.
+        if topo_slice.numa_node is not None:
+            slice_ann_base["freetpu.dev/numa-node"] = str(topo_slice.numa_node)
+        if len(topo_slice.chips) != len(topo_slice.physical_indices):
+            slice_ann_base["freetpu.dev/pci-function-count"] = str(len(topo_slice.chips))
+        slice_devnums_str = _format_vfio_devnums(list(slice_devnums.items()))
+        if slice_devnums_str:
+            slice_ann_base["freetpu.dev/vfio-devnums"] = slice_devnums_str
 
-        for dom_ordinal, (d_key, d_chips) in enumerate(domains.items()):
-            if len(d_chips) < 2 or len(d_chips) >= len(chips):
-                continue
-            if any(
-                len(group_to_domains.get(c.iommu_group, set())) > 1 for c in d_chips
-            ):
-                continue
-
-            slice_nodes, slice_devnums = _dedup_device_nodes(d_chips)
-            slice_bdfs = sorted(c.pci_bdf for c in d_chips)
-            slice_phys_indices = _distinct_physical_indices(d_chips, bdf_to_phys)
-            slice_logical_indices = _logical_device_indices(d_chips, slice_phys_indices)
-            slice_gens: List[str] = []
-            for c in d_chips:
-                if c.generation not in slice_gens:
-                    slice_gens.append(c.generation)
-            slice_env = _build_device_env(
-                slice_phys_indices,
-                slice_logical_indices,
-                slice_gens,
-                single_host_env=inject_single_host_env,
-                include_visibility_env=True,
-            )
-            discovered_numa = d_key[1]
-            pcie_root = d_key[2]
-            slice_ann_base: Dict[str, str] = {
-                "freetpu.dev/allocation-unit": "numa-slice" if use_explicit_numa else "pcie-slice",
-                "freetpu.dev/chip-count": str(len(slice_phys_indices)),
-                "freetpu.dev/pci-bdfs": ",".join(slice_bdfs),
-                "freetpu.dev/generations": ",".join(slice_gens),
-                "freetpu.dev/pcie-root": pcie_root,
-                "freetpu.dev/pcie-domain": str(dom_ordinal),
-                "freetpu.dev/optional-cap-add": "IPC_LOCK",
-                "freetpu.dev/required-ulimit-memlock": "-1",
+        for s_name in topo_slice.aliases:
+            slice_edits: Dict[str, Any] = {
+                "deviceNodes": [dict(n) for n in slice_nodes],
             }
-            # Record freetpu.dev/numa-node ONLY with the actual sysfs NUMA node;
-            # never substitute a PCIe domain ordinal or invent a node when sysfs has none.
-            if discovered_numa is not None:
-                slice_ann_base["freetpu.dev/numa-node"] = str(discovered_numa)
-            if len(d_chips) != len(slice_phys_indices):
-                slice_ann_base["freetpu.dev/pci-function-count"] = str(len(d_chips))
-            slice_devnums_str = _format_vfio_devnums(list(slice_devnums.items()))
-            if slice_devnums_str:
-                slice_ann_base["freetpu.dev/vfio-devnums"] = slice_devnums_str
-
-            candidate_names = (
-                [f"numa{discovered_numa}"]
-                if use_explicit_numa and discovered_numa is not None
-                else [f"pcie{dom_ordinal}"]
-            )
-            if slice_phys_indices == list(
-                range(slice_phys_indices[0], slice_phys_indices[0] + len(slice_phys_indices))
-            ):
-                candidate_names.append(f"{slice_phys_indices[0]}-{slice_phys_indices[-1]}")
-
-            for s_name in candidate_names:
-                if s_name in used_names or s_name == "all":
-                    continue
-                used_names.add(s_name)
-                slice_edits: Dict[str, Any] = {
-                    "deviceNodes": [dict(n) for n in slice_nodes],
+            if slice_env:
+                slice_edits["env"] = list(slice_env)
+            devices.append(
+                {
+                    "name": s_name,
+                    "annotations": dict(slice_ann_base),
+                    "containerEdits": slice_edits,
                 }
-                if slice_env:
-                    slice_edits["env"] = list(slice_env)
-                devices.append(
-                    {
-                        "name": s_name,
-                        "annotations": dict(slice_ann_base),
-                        "containerEdits": slice_edits,
-                    }
-                )
+            )
 
     all_phys_indices = _distinct_physical_indices(chips, bdf_to_phys)
     all_logical_indices = _logical_device_indices(chips, all_phys_indices)
@@ -1233,6 +1285,21 @@ def _validate_container_edits(
             for str_field in ("closID", "l3CacheSchema", "memBwSchema"):
                 if str_field in irdt and not isinstance(irdt[str_field], str):
                     errors.append(f"{context}.intelRdt.{str_field}: must be a string")
+            if "closID" in irdt and isinstance(irdt["closID"], str):
+                clos_id = irdt["closID"]
+                # Matches CNCF CDI v1.1.0 `IntelRdt.Validate()` (`pkg/cdi/container-edits.go`):
+                # `""` (unset) and `"/"` (root CLOS) are permitted; otherwise must be a valid
+                # Linux filename (< 4096 bytes, not "." or "..", and no "/", "\n", or "\x00").
+                if clos_id not in ("", "/"):
+                    if (
+                        len(clos_id.encode("utf-8")) >= 4096
+                        or clos_id in (".", "..")
+                        or any(ch in clos_id for ch in ("/", "\n", "\x00"))
+                    ):
+                        errors.append(
+                            f"{context}.intelRdt.closID: invalid closID {clos_id!r} "
+                            "(must be '/' for root CLOS or a valid Linux filename without '/', newline, or NUL)"
+                        )
             for bool_field in ("enableCMT", "enableMBM", "enableMonitoring"):
                 if bool_field in irdt and bool_field in allowed_irdt_keys:
                     if not isinstance(irdt[bool_field], bool):
@@ -1670,6 +1737,23 @@ def verify_spec_against_host(
         live_devnums_by_container_path[expected_control_container_path] = container_dn
 
     live_chips_by_bdf = {c.pci_bdf: c for c in live_chips}
+    live_units: Dict[str, List[DiscoveredChip]] = {}
+    for chip in live_chips:
+        live_units.setdefault(chip.iommu_group, []).append(chip)
+    live_reserved_names: set[str] = {
+        _single_chip_selector(u[0].pci_bdf)
+        if len(u) == 1
+        else _shared_group_selector(sorted(c.pci_bdf for c in u))
+        for u in live_units.values()
+    }
+    expected_slices_by_name: Dict[str, _TopologySlice] = {}
+    for topo_slice in _compute_topology_slices(
+        live_chips,
+        _map_physical_chip_indices(live_chips),
+        reserved_names=live_reserved_names,
+    ):
+        for alias in topo_slice.aliases:
+            expected_slices_by_name[alias] = topo_slice
     groups_bdfs: Dict[str, List[str]] = {}
     groups_host: Dict[str, Path] = {}
     for chip in live_chips:
@@ -1862,6 +1946,40 @@ def verify_spec_against_host(
                     errors.append(
                         f"device {name!r}: sub-host slice crosses NUMA / PCIe root complex boundaries ({expected_live_bdfs})"
                     )
+                expected_slice = expected_slices_by_name.get(name)
+                if expected_slice is None:
+                    errors.append(
+                        f"device {name!r}: slice alias does not match any live host topology slice "
+                        f"(live aliases: {sorted(expected_slices_by_name)})"
+                    )
+                elif expected_live_bdfs != list(expected_slice.pci_bdfs):
+                    errors.append(
+                        f"device {name!r}: slice alias PCI membership {expected_live_bdfs} does not "
+                        f"match live host topology for {name!r} ({list(expected_slice.pci_bdfs)})"
+                    )
+                else:
+                    if (
+                        "freetpu.dev/pcie-root" in ann
+                        and ann.get("freetpu.dev/pcie-root") != expected_slice.pcie_root
+                    ):
+                        errors.append(
+                            f"device {name!r}: stale freetpu.dev/pcie-root "
+                            f"{ann.get('freetpu.dev/pcie-root')!r} (host has {expected_slice.pcie_root!r})"
+                        )
+                    if expected_slice.numa_node is None and "freetpu.dev/numa-node" in ann:
+                        errors.append(
+                            f"device {name!r}: unexpected freetpu.dev/numa-node "
+                            f"{ann.get('freetpu.dev/numa-node')!r} when host sysfs reports no NUMA node"
+                        )
+                    elif (
+                        expected_slice.numa_node is not None
+                        and "freetpu.dev/numa-node" in ann
+                        and ann.get("freetpu.dev/numa-node") != str(expected_slice.numa_node)
+                    ):
+                        errors.append(
+                            f"device {name!r}: stale freetpu.dev/numa-node "
+                            f"{ann.get('freetpu.dev/numa-node')!r} (host has {str(expected_slice.numa_node)!r})"
+                        )
             elif name == "all":
                 all_live_bdfs = sorted(c.pci_bdf for c in live_chips)
                 if expected_live_bdfs != all_live_bdfs:
@@ -2063,7 +2181,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Opt in to injecting single-host isolated libtpu env overrides "
             "(MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353, TPU_HOST_BOUNDS=1,1,1, "
-            "TPU_SKIP_MDS_QUERY=1, plus slice-scoped TPU_VISIBLE_DEVICES and "
+            "TPU_WORKER_HOSTNAMES=localhost, TPU_WORKER_ID=0, TPU_SKIP_MDS_QUERY=true, "
+            "plus slice-scoped TPU_VISIBLE_CHIPS, TPU_VISIBLE_DEVICES, and "
             "TPU_CHIPS_PER_HOST_BOUNDS on full-allocation selectors)."
         ),
     )

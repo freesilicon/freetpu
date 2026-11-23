@@ -7,14 +7,22 @@
 #   when `freetpu_cdi.py` is run with opt-in `--single-host-env` (or
 #   `--network-mode isolated`), CDI (default v0.6.0, opt-in --cdi-version 1.1.0)
 #   injects MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353, TPU_HOST_BOUNDS=1,1,1,
-#   slice-scoped TPU_CHIPS_PER_HOST_BOUNDS=2,2,1, TPU_VISIBLE_DEVICES, and
-#   TPU_SKIP_MDS_QUERY=1 on slice selectors so two independent 4-chip workloads
+#   TPU_WORKER_HOSTNAMES=localhost, TPU_WORKER_ID=0, TPU_SKIP_MDS_QUERY=true,
+#   and slice-scoped TPU_CHIPS_PER_HOST_BOUNDS=2,2,1, TPU_VISIBLE_CHIPS, and
+#   TPU_VISIBLE_DEVICES on slice selectors so two independent 4-chip workloads
 #   can share one v6e-8 host without port 8353 collisions or hostNetwork
 #   privilege escalation. (Without `--single-host-env`, CDI preserves workload
 #   env for multi-host jobs.)
-# - Partitions v6e-8 strictly along physical NUMA / PCIe root-complex
-#   boundaries (`0000:00` NUMA 0 chips 0..3 vs `0000:80` NUMA 1 chips 4..7)
-#   so host-to-device DMA never crosses CPU UPI/QPI interconnects.
+# - Partitions v6e-8 TPU endpoints along physical NUMA / PCIe root-complex
+#   boundaries (`0000:00` NUMA 0 chips 0..3 vs `0000:80` NUMA 1 chips 4..7).
+#   DMA LOCALITY PREREQUISITE: Selecting single-NUMA TPU endpoints alone does
+#   NOT pin Pod CPU cores or host DMA buffers to that socket. To guarantee
+#   single-socket host-to-device DMA without crossing CPU UPI/QPI interconnects,
+#   the node kubelet MUST run Topology Manager with `single-numa-node` policy
+#   plus static CPU Manager (`cpuManagerPolicy: static`) and Memory Manager
+#   (`memoryManagerPolicy: Static`), the DRA driver must report matching NUMA
+#   topology hints, and the Pod must run in Guaranteed QoS with equal integer
+#   CPU and memory `requests` and `limits` (as configured in the Pod below).
 # - Legacy `/dev/vfio/<group>` (default when usable) and Linux 6.8+ `iommufd`
 #   (`--vfio-mode iommufd` / pure-iommufd fallback) are handled by `freetpu_cdi.py`.
 ---
@@ -76,8 +84,10 @@ spec:
         memory:
           value: 128Gi
 ---
-# Topology-aware 4-chip ResourceClaimTemplate pinned to a single NUMA domain
-# (avoids cross-socket UPI/QPI DMA and eliminates hostNetwork: true).
+# Topology-aware 4-chip ResourceClaimTemplate selecting endpoints in a single
+# NUMA domain (pair with kubelet Topology Manager `single-numa-node`, static
+# CPU/Memory Manager, and Guaranteed QoS integer CPU/memory requests/limits on
+# the Pod to keep host DMA buffers on the same socket; eliminates hostNetwork).
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaimTemplate
 metadata:
@@ -123,6 +133,16 @@ spec:
           add:
             - IPC_LOCK
       resources:
+        # Guaranteed QoS (equal integer CPU and memory requests/limits) is
+        # required by Kubernetes Topology Manager (`single-numa-node`) with
+        # static CPU/Memory Manager so Pod CPUs and DMA buffers stay on the
+        # same NUMA socket as the claimed TPU slice.
+        requests:
+          cpu: "4"
+          memory: "32Gi"
+        limits:
+          cpu: "4"
+          memory: "32Gi"
         claims:
           - name: tpu
   resourceClaims:

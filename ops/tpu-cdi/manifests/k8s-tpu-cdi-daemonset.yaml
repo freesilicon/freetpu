@@ -57,7 +57,8 @@
 #      never lose peer discovery on spec refresh. Add `--single-host-env` (or
 #      `--network-mode isolated`) only on dedicated single-host / sub-host
 #      isolated node pools to inject `MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353`,
-#      `TPU_HOST_BOUNDS=1,1,1`, `TPU_SKIP_MDS_QUERY=1`, and slice-scoped
+#      `TPU_HOST_BOUNDS=1,1,1`, `TPU_WORKER_HOSTNAMES=localhost`,
+#      `TPU_WORKER_ID=0`, `TPU_SKIP_MDS_QUERY=true`, and slice-scoped
 #      `TPU_VISIBLE_CHIPS` + `TPU_VISIBLE_DEVICES` + `TPU_CHIPS_PER_HOST_BOUNDS`.
 #      VFIO MEMLOCK PREREQUISITE: CDI device injection does not configure
 #      `RLIMIT_MEMLOCK` or Linux capabilities, and Kubernetes Pods have no

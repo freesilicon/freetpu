@@ -185,8 +185,10 @@ TPU Process Monitor
         self.assertIn("/dev/vfio/0", rows)
         self.assertTrue(rows["/dev/vfio/0"].in_chips_table)
         self.assertEqual(rows["/dev/vfio/0"].pids, [4242])
+        self.assertEqual(rows["/dev/vfio/0"].runtime_device_ids, ["0"])
         self.assertIn("/dev/vfio/2", rows)
         self.assertEqual(rows["/dev/vfio/2"].pids, [])
+        self.assertEqual(rows["/dev/vfio/2"].runtime_device_ids, ["1"])
 
         # Also verify Unicode box-drawing borders with literal `|` gauges inside cells.
         unicode_dash = """
@@ -2041,7 +2043,7 @@ TPU Runtime Utilization
                     elif req.metric_name == "tpu.runtime.hbm.memory.total.bytes":
                         items = [
                             _make_item(0, as_int=32 * 1024**3),
-                            _make_item("1", as_int=192 * 1024**3),
+                            _make_item("1", as_int=96 * 1024**3),
                         ]
                     elif req.metric_name == "tpu.runtime.tensorcore.dutycycle.percent":
                         items = [
@@ -2109,12 +2111,14 @@ TPU Runtime Utilization
             self.assertEqual(snap1.devices[1].device_id, "0x0076")
             self.assertEqual(snap1.devices[1].generation, "tpu7x")
             self.assertEqual(snap1.devices[1].hbm_used_bytes, 64 * 1024**3)
-            self.assertEqual(snap1.devices[1].hbm_total_bytes, 192 * 1024**3)
+            self.assertEqual(snap1.devices[1].hbm_total_bytes, 96 * 1024**3)
             self.assertAlmostEqual(
                 snap1.devices[1].hbm_bandwidth_utilization_percent or 0.0, 41.0
             )
             self.assertEqual(snap1.devices[2].device_id, "0x0075")
             self.assertEqual(snap1.devices[2].generation, "tpu7x")
+            self.assertEqual(snap1.devices[2].hbm_nominal_bytes, 96 * 1024**3)
+            self.assertEqual(snap1.devices[2].hbm_total_bytes, 96 * 1024**3)
             # Unset AttrValue and unset Gauge entries must not appear in runtime_utilization.
             self.assertEqual(
                 sorted(rt.runtime_chip for rt in snap1.runtime_utilization),
@@ -2261,6 +2265,162 @@ TPU Runtime Utilization
                 [d.duty_cycle_percent for d in iw_pc_snap.devices],
                 [11.0 * (c + 1) for c in range(8)],
             )
+
+            # Ironwood 4-chip VM (8 exposed PCI functions across 0x0076/0x0075) without
+            # runtime totals MUST report 96 GiB per chiplet PCI row = 768 GiB aggregate
+            # (not 8 * 192 GiB = 1,536 GiB).
+            iw_inv_root = root / "ironwood_inventory"
+            iw_inv_sysfs, iw_inv_dev, iw_inv_proc = _make_mock_pci_tree(
+                iw_inv_root,
+                devices=[
+                    {
+                        "bdf": f"0000:00:{4 + i:02x}.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0076" if i < 6 else "0x0075",
+                        "driver": "vfio-pci",
+                        "iommu_group": str(i),
+                    }
+                    for i in range(8)
+                ],
+                create_vfio_nodes=[str(i) for i in range(8)],
+            )
+            with _mock_vfio_char_lstat():
+                iw_inv_snap = _te.collect_snapshot(
+                    sysfs_root=iw_inv_sysfs,
+                    dev_root=iw_inv_dev,
+                    proc_root=iw_inv_proc,
+                    tpu_info_bin=None,
+                    shm_root=iw_inv_root / "no-shm",
+                )
+            self.assertEqual(len(iw_inv_snap.devices), 8)
+            self.assertEqual(
+                [d.hbm_total_bytes for d in iw_inv_snap.devices],
+                [96 * 1024**3] * 8,
+            )
+            self.assertEqual(
+                sum(d.hbm_total_bytes or 0 for d in iw_inv_snap.devices),
+                768 * 1024**3,
+            )
+
+            # Multi-chip host WITHOUT sysfs `chip_id` or `--chip-id-map`: when direct
+            # gRPC returns unmapped runtime ordinals ("0", "1"), exporter MUST keep the
+            # `tpu-info` CLI fallback so CLI Process Monitor VFIO paths (or VFIO-keyed
+            # utilization rows) preserve PCI-labeled HBM and duty-cycle series!
+            nomap_root = root / "grpc_cli_mapping_fallback"
+            nomap_sysfs, nomap_dev, nomap_proc = _make_mock_pci_tree(
+                nomap_root,
+                devices=[
+                    {
+                        "bdf": "0000:00:04.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                    },
+                    {
+                        "bdf": "0000:00:05.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "2",
+                    },
+                ],
+                create_vfio_nodes=["0", "2"],
+            )
+            cli_pm_rows = _te.parse_tpu_info_output(
+                "TPU Device Status\n"
+                "+-----------+---------------------------+--------------------+--------------------+-----------------------+\n"
+                "| Device ID | Memory Usage (Used/Total) | Memory Bar Gauge   | HBM Bandwidth Util | TensorCore Duty Cycle |\n"
+                "+-----------+---------------------------+--------------------+--------------------+-----------------------+\n"
+                "| 0         | 15.00 GiB / 32.00 GiB     | [|||||.....] 46.9% | [||........] 20.0% | [|||||||...] 70.0%    |\n"
+                "| 1         | 20.00 GiB / 32.00 GiB     | [||||||....] 62.5% | [||||......] 40.0% | [||||||||..] 80.0%    |\n"
+                "+-----------+---------------------------+--------------------+--------------------+-----------------------+\n"
+                "\n"
+                "TPU Process Monitor\n"
+                "+-----------+-------------------------+------+--------------+-------------------+\n"
+                "| Device ID | Device Path / VFIO Path | PID  | Process Name | Memory Allocation |\n"
+                "+-----------+-------------------------+------+--------------+-------------------+\n"
+                "| 0         | /dev/vfio/0             | 4242 | python3      | 15.00 GiB         |\n"
+                "| 1         | /dev/vfio/2             | 4242 | python3      | 20.00 GiB         |\n"
+                "+-----------+-------------------------+------+--------------+-------------------+\n"
+            )
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.dict(_te._GRPC_CHANNELS, {}, clear=True),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "grpc": _FakeGrpc,
+                        "tpu_info": SimpleNamespace(),
+                        "tpu_info.proto": SimpleNamespace(),
+                        "tpu_info.proto.tpu_metric_service_pb2": fake_pb2,
+                        "tpu_info.proto.tpu_metric_service_pb2_grpc": fake_pb2_grpc,
+                    },
+                ),
+                mock.patch.object(
+                    _te, "_run_tpu_info", return_value=(True, None, cli_pm_rows)
+                ) as mock_cli_pm,
+            ):
+                pm_snap = _te.collect_snapshot(
+                    sysfs_root=nomap_sysfs,
+                    dev_root=nomap_dev,
+                    proc_root=nomap_proc,
+                    tpu_info_bin="tpu-info",
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=nomap_root / "no-shm",
+                )
+            self.assertEqual(mock_cli_pm.call_count, 1)
+            # Preserves exact gRPC metrics while recovering PCI BDF labels via CLI Process Monitor!
+            self.assertEqual(pm_snap.devices[0].telemetry_source, "libtpu-grpc")
+            self.assertEqual(pm_snap.devices[0].hbm_used_bytes, 16 * 1024**3)
+            self.assertAlmostEqual(pm_snap.devices[0].duty_cycle_percent or 0.0, 72.5)
+            self.assertAlmostEqual(pm_snap.devices[0].hbm_bandwidth_utilization_percent or 0.0, 63.2)
+            self.assertEqual(pm_snap.devices[1].hbm_used_bytes, 64 * 1024**3)
+            self.assertAlmostEqual(pm_snap.devices[1].duty_cycle_percent or 0.0, 88.0)
+            self.assertTrue(all(rt.mapped_pci_bdf is not None for rt in pm_snap.runtime_utilization))
+
+            # Subcase B: CLI supplies utilization keyed directly by `/dev/vfio/<group>`
+            # (no Process Monitor table); exporter maps PCI series via CLI without
+            # leaving duplicate unmapped gRPC runtime rows behind.
+            cli_vfio_rows = _te.parse_tpu_info_output(
+                "TPU Runtime Utilization\n"
+                "| Chip        | HBM Usage (GiB)       | Duty cycle |\n"
+                "|-------------|-----------------------|------------|\n"
+                "| /dev/vfio/0 | 12.00 GiB / 32.00 GiB | 55.00%     |\n"
+                "| /dev/vfio/2 | 24.00 GiB / 32.00 GiB | 75.00%     |\n"
+            )
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.dict(_te._GRPC_CHANNELS, {}, clear=True),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "grpc": _FakeGrpc,
+                        "tpu_info": SimpleNamespace(),
+                        "tpu_info.proto": SimpleNamespace(),
+                        "tpu_info.proto.tpu_metric_service_pb2": fake_pb2,
+                        "tpu_info.proto.tpu_metric_service_pb2_grpc": fake_pb2_grpc,
+                    },
+                ),
+                mock.patch.object(
+                    _te, "_run_tpu_info", return_value=(True, None, cli_vfio_rows)
+                ) as mock_cli_vfio,
+            ):
+                vfio_snap = _te.collect_snapshot(
+                    sysfs_root=nomap_sysfs,
+                    dev_root=nomap_dev,
+                    proc_root=nomap_proc,
+                    tpu_info_bin="tpu-info",
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=nomap_root / "no-shm",
+                )
+            self.assertEqual(mock_cli_vfio.call_count, 1)
+            self.assertEqual(vfio_snap.devices[0].hbm_used_bytes, 12 * 1024**3)
+            self.assertAlmostEqual(vfio_snap.devices[0].duty_cycle_percent or 0.0, 55.0)
+            self.assertEqual(vfio_snap.devices[1].hbm_used_bytes, 24 * 1024**3)
+            self.assertAlmostEqual(vfio_snap.devices[1].duty_cycle_percent or 0.0, 75.0)
+            self.assertEqual(len(vfio_snap.runtime_utilization), 2)
+            self.assertTrue(all(rt.mapped_pci_bdf is not None for rt in vfio_snap.runtime_utilization))
 
     def test_shm_seqlock_mmap_reader_including_torn_read_retry(self) -> None:
         import struct
@@ -2598,7 +2758,9 @@ TPU Runtime Utilization
             # PCIe AER alert must use a multi-scrape window ([5m], not [1m]).
             self.assertIn("increase(freetpu_pcie_aer_fatal_total[5m]) > 0", alerts_text)
             self.assertNotIn("freetpu_pcie_aer_fatal_total[1m]", alerts_text)
-            # Spot preemption alert must clarify monitoring-only scope and workload-local checkpointing.
+            # Spot preemption alert must clarify monitoring-only scope, workload-local checkpointing,
+            # and retain observed TRUE notices via max_over_time past VM shutdown / Alertmanager group_wait.
+            self.assertIn("max_over_time(gcp_metadata_preempted_status[2m]) == 1", alerts_text)
             self.assertIn("Monitoring alert only", alerts_text)
             self.assertIn("workload-local metadata watcher or SIGTERM", alerts_text)
 
