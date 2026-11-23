@@ -22,11 +22,12 @@ With the preset flags (`--max-num-seqs 128`, `--max-num-batched-tokens 2048`, `-
 
 ### Persistent XLA Compilation Cache
 
-Prevent 15+ minute Spot cold-start recompilation across VM preemptions by persisting XLA artifacts to preemption-safe storage (Compute Engine Local SSD is ephemeral and discarded on Spot preemption — use a **retained Persistent Disk** reattached across replacements or a **GCS bucket**):
+Prevent 15+ minute Spot cold-start recompilation across VM preemptions by persisting XLA artifacts to preemption-safe storage (Compute Engine Local SSD is ephemeral and discarded on Spot preemption, and Cloud TPU `v6e` supports attached **Hyperdisk** rather than Persistent Disk — use a retained **Hyperdisk Balanced** (`hyperdisk-balanced`) disk reattached across replacements or a **GCS bucket**):
 
 ```bash
-# Option A: Retained Persistent Disk mounted at /var/cache/freetpu-xla-cache
-# (attach with --auto-delete=no and remount on replacement Spot VMs):
+# Option A: Retained Hyperdisk Balanced (`--type=hyperdisk-balanced`) attached
+# in read-write mode (with `auto-delete=no` so the disk survives Spot preemption
+# and can be reattached/remounted on replacement v6e-8 VMs) at /var/cache/freetpu-xla-cache:
 export JAX_COMPILATION_CACHE_DIR=/var/cache/freetpu-xla-cache
 export VLLM_XLA_CACHE_PATH=/var/cache/freetpu-xla-cache
 mkdir -p "$JAX_COMPILATION_CACHE_DIR"

@@ -3004,12 +3004,24 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         body = (json.dumps(payload) + "\n").encode("utf-8")
         self._send_bytes(status, "application/json", body, extra_headers=extra_headers)
 
-    def _read_request_body(self, content_len: int) -> Tuple[Optional[bytes], Optional[Tuple[int, str, str]]]:
-        """Read exactly `content_len` bytes within the configured wall-clock deadline."""
-        timeout_s = self.server.engine.config.client_read_timeout_s
+    def _read_request_body(
+        self,
+        content_len: int,
+        *,
+        reserved_out: Optional[List[int]] = None,
+    ) -> Tuple[Optional[bytes], Optional[Tuple[int, str, str]]]:
+        """Read exactly `content_len` bytes within the configured wall-clock deadline.
+
+        Charges upload memory incrementally as bytes actually arrive (plus the
+        temporary `bytes(buf)` copy during finalization) so stalled uploads do
+        not pin the router's shared request memory budget.
+        """
+        engine = self.server.engine
+        timeout_s = engine.config.client_read_timeout_s
         deadline = time.monotonic() + timeout_s
         buf = bytearray()
         remaining = content_len
+        reserved_local = 0
         read_fn = getattr(self.rfile, "read1", self.rfile.read)
         try:
             while remaining > 0:
@@ -3022,18 +3034,45 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 if not chunk:
                     buf.clear()
                     return None, (400, "incomplete_body", "Incomplete request body")
+                chunk_len = len(chunk)
+                if not engine.try_reserve_request_memory(chunk_len):
+                    buf.clear()
+                    return None, (
+                        503,
+                        "server_memory_limit_reached",
+                        "Router request memory budget exhausted; retry later",
+                    )
+                reserved_local += chunk_len
+                if reserved_out is not None:
+                    reserved_out[0] += chunk_len
                 buf.extend(chunk)
-                remaining -= len(chunk)
+                remaining -= chunk_len
         except TimeoutError:
             buf.clear()
             return None, (408, "request_timeout", "Request body read timed out")
         except OSError:
             buf.clear()
             return None, (400, "incomplete_body", "Client disconnected while uploading body")
+        copy_extra = max(0, (2 * len(buf)) - reserved_local)
+        if copy_extra > 0:
+            if not engine.try_reserve_request_memory(copy_extra):
+                buf.clear()
+                return None, (
+                    503,
+                    "server_memory_limit_reached",
+                    "Router request memory budget exhausted; retry later",
+                )
+            reserved_local += copy_extra
+            if reserved_out is not None:
+                reserved_out[0] += copy_extra
         try:
             return bytes(buf), None
         finally:
             buf.clear()
+            if copy_extra > 0:
+                engine.release_request_memory(copy_extra)
+                if reserved_out is not None:
+                    reserved_out[0] = max(0, reserved_out[0] - copy_extra)
 
     def _authorize(self, path: str, method: str) -> Optional[AuthContext]:
         hdrs = {k: v for k, v in self.headers.items()}
@@ -3165,42 +3204,39 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
 
         engine = self.server.engine
         max_total_req_mem = engine.config.max_total_request_memory_bytes
-        parse_budget = max(1, content_len * REQUEST_MEMORY_PARSE_MULTIPLIER)
-        if parse_budget > max_total_req_mem:
+        min_parse_budget = max(1, content_len * REQUEST_MEMORY_PARSE_MULTIPLIER)
+        if min_parse_budget > max_total_req_mem:
             self._send_bytes(
                 413,
                 "application/json",
                 _openai_error_body(
-                    f"Request estimated parse memory ({parse_budget} bytes) exceeds router request memory budget ({max_total_req_mem} bytes)",
+                    f"Request estimated parse memory ({min_parse_budget} bytes) exceeds router request memory budget ({max_total_req_mem} bytes)",
                     code="payload_too_large",
                 ),
             )
             return
-        if not engine.try_reserve_request_memory(parse_budget):
-            self._send_bytes(
-                503,
-                "application/json",
-                _openai_error_body(
-                    "Router request memory budget exhausted; retry later",
-                    error_type="service_unavailable",
-                    code="server_memory_limit_reached",
-                ),
-            )
-            return
 
-        reserved_mem = parse_budget
+        req_mem_reserved = [0]
         try:
-            raw_req, read_err = self._read_request_body(content_len)
+            raw_req, read_err = self._read_request_body(
+                content_len,
+                reserved_out=req_mem_reserved,
+            )
             if read_err is not None or raw_req is None:
                 err_status, err_code, err_msg = read_err or (
                     400,
                     "incomplete_body",
                     "Failed to read request body",
                 )
+                err_type = (
+                    "service_unavailable"
+                    if err_status == 503
+                    else "invalid_request_error"
+                )
                 self._safe_send_bytes(
                     err_status,
                     "application/json",
-                    _openai_error_body(err_msg, code=err_code),
+                    _openai_error_body(err_msg, error_type=err_type, code=err_code),
                 )
                 return
 
@@ -3248,8 +3284,8 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                     ),
                 )
                 return
-            if needed_parse_mem > reserved_mem:
-                extra_parse_mem = needed_parse_mem - reserved_mem
+            if needed_parse_mem > req_mem_reserved[0]:
+                extra_parse_mem = needed_parse_mem - req_mem_reserved[0]
                 if not engine.try_reserve_request_memory(extra_parse_mem):
                     self._send_bytes(
                         503,
@@ -3261,7 +3297,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         ),
                     )
                     return
-                reserved_mem += extra_parse_mem
+                req_mem_reserved[0] += extra_parse_mem
 
             try:
                 req_text = raw_req.decode("utf-8")
@@ -3337,10 +3373,10 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             expected_choices = _expected_stream_choices(path, req_payload)
             # Release the decoded JSON tree before waiting on upstream inference.
             del req_payload
-            parse_overhead = reserved_mem - content_len
+            parse_overhead = req_mem_reserved[0] - content_len
             if parse_overhead > 0:
                 engine.release_request_memory(parse_overhead)
-                reserved_mem = content_len
+                req_mem_reserved[0] = content_len
 
             self._handle_inference(
                 path,
@@ -3352,8 +3388,9 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 ctx,
             )
         finally:
-            if reserved_mem > 0:
-                engine.release_request_memory(reserved_mem)
+            if req_mem_reserved[0] > 0:
+                engine.release_request_memory(req_mem_reserved[0])
+                req_mem_reserved[0] = 0
 
     def _handle_inference(
         self,

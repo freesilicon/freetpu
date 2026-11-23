@@ -6670,32 +6670,58 @@ asyncio.run(main())
 
             async def stream_one(port: int, raw_req: bytes) -> Tuple[int, bool]:
                 r, w = await asyncio.open_connection("127.0.0.1", port)
-                sock = w.get_extra_info("socket")
-                if sock is not None:
-                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                w.write(raw_req)
-                await w.drain()
-                await r.readuntil(b"\r\n\r\n")
-                chunks = 0
-                saw_done = False
-                while True:
-                    line = await r.readline()
-                    if not line:
-                        break
-                    if line.startswith(b"data: "):
-                        if line.strip() == b"data: [DONE]":
-                            saw_done = True
-                        else:
-                            chunks += 1
-                w.close()
-                return chunks, saw_done
+                try:
+                    sock = w.get_extra_info("socket")
+                    if sock is not None:
+                        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    w.write(raw_req)
+                    await w.drain()
+                    await r.readuntil(b"\r\n\r\n")
+                    chunks = 0
+                    saw_done = False
+                    while True:
+                        line = await r.readline()
+                        if not line:
+                            break
+                        if line.startswith(b"data: "):
+                            if line.strip() == b"data: [DONE]":
+                                saw_done = True
+                            else:
+                                chunks += 1
+                    return chunks, saw_done
+                finally:
+                    w.close()
+                    try:
+                        await w.wait_closed()
+                    except (OSError, asyncio.CancelledError):
+                        pass
 
-            async def run_batch(port: int, concurrency: int) -> float:
+            async def run_batch(
+                port: int,
+                concurrency: int,
+                *,
+                batch_timeout_s: float = 15.0,
+            ) -> float:
                 raw_req = make_raw_req(port)
                 t0 = time.perf_counter()
-                results = await asyncio.gather(
-                    *[stream_one(port, raw_req) for _ in range(concurrency)]
-                )
+                tasks = [
+                    asyncio.create_task(stream_one(port, raw_req))
+                    for _ in range(concurrency)
+                ]
+                try:
+                    results = await asyncio.wait_for(
+                        asyncio.gather(*tasks),
+                        timeout=batch_timeout_s,
+                    )
+                except asyncio.TimeoutError:
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    self.fail(
+                        f"SSE concurrency batch timed out after {batch_timeout_s:.1f}s "
+                        f"(port={port}, concurrency={concurrency})"
+                    )
                 wall_ms = (time.perf_counter() - t0) * 1000.0
                 for chunks, saw_done in results:
                     self.assertEqual(chunks, num_tokens)
@@ -7254,7 +7280,9 @@ asyncio.run(main())
         self.assertNotIn("XLA_COMPILATION_CACHE_DIR", playbook)
         self.assertNotIn("local NVMe", playbook)
         self.assertNotIn("Load-Time MXFP4", playbook)
-        self.assertIn("Persistent Disk", playbook)
+        self.assertIn("Hyperdisk Balanced", playbook)
+        self.assertIn("hyperdisk-balanced", playbook)
+        self.assertNotIn("Retained Persistent Disk", playbook)
         self.assertIn("gs://", playbook)
         self.assertIn(
             "export JAX_COMPILATION_CACHE_DIR=/var/cache/freetpu-xla-cache",
@@ -9105,6 +9133,73 @@ asyncio.run(main())
         self.assertEqual(telem.healthy_chips, 3)
         self.assertEqual(telem.total_chips, 3)
         self.assertAlmostEqual(telem.avg_duty_cycle_percent or 0.0, 60.0)
+
+    def test_stalled_upload_does_not_hold_parse_budget_or_block_concurrent_requests(
+        self,
+    ) -> None:
+        backend = self._track(_MockOpenAIBackend("stall-up-b", ["m-stallup"]))
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            max_request_body_bytes=10000,
+            max_total_request_memory_bytes=2000,
+            client_read_timeout_s=0.6,
+            backends=[
+                BackendConfig(
+                    id="stall-up-b",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=backend.base_url,
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        # Open two stalled uploads each declaring Content-Length: 480 (which would
+        # have reserved 1,920 bytes upfront under 4x pre-reservation) and sending only 1 byte.
+        stalled_socks: List[socket.socket] = []
+        try:
+            for _ in range(2):
+                s = socket.create_connection(("127.0.0.1", rport), timeout=2.0)
+                stalled_socks.append(s)
+                s.sendall(
+                    (
+                        f"POST /v1/chat/completions HTTP/1.1\r\n"
+                        f"Host: 127.0.0.1:{rport}\r\n"
+                        f"Content-Type: application/json\r\n"
+                        f"Content-Length: 480\r\n"
+                        f"Connection: close\r\n\r\n"
+                        "{"
+                    ).encode("ascii")
+                )
+            deadline = time.monotonic() + 1.5
+            while router.engine._req_mem_used_bytes < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            # Only the 2 actually received bytes are charged — NOT 2 * 1,920 = 3,840 bytes.
+            self.assertEqual(router.engine._req_mem_used_bytes, 2)
+
+            # Concurrent real inference request (~380 bytes -> ~1,520 parse peak) succeeds with 200!
+            st_ok, _, bd_ok = _http_request(
+                rport,
+                "POST",
+                "/v1/chat/completions",
+                body={
+                    "model": "m-stallup",
+                    "messages": [{"role": "user", "content": "a" * 310}],
+                },
+            )
+            self.assertEqual(st_ok, 200)
+            self.assertIn(b"stall-up-b", bd_ok)
+        finally:
+            for s in stalled_socks:
+                s.close()
+
+        # Once stalled sockets close, all incrementally reserved bytes are released cleanly.
+        deadline = time.monotonic() + 2.0
+        while router.engine._req_mem_used_bytes != 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(router.engine._req_mem_used_bytes, 0)
 
 
 def run_self_tests(verbosity: int = 1) -> int:
