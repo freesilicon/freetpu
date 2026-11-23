@@ -100,6 +100,92 @@ ot_status_t ot_buffer_h2d(ot_context_t* ctx, ot_buffer_t* dst,
 ot_status_t ot_buffer_d2h(ot_context_t* ctx, const ot_buffer_t* src,
                           void* host_dst, size_t size_bytes);
 
+/* =========================================================================
+ * FreeTile-Aligned Tile Descriptor & Quantized GEMM ABI
+ * ========================================================================= */
+
+#define OT_QK8_0 32u
+
+typedef enum ot_dtype {
+  OT_DTYPE_BF16 = 0,
+  OT_DTYPE_F32  = 1,
+  OT_DTYPE_INT8 = 2,
+  OT_DTYPE_Q8_0 = 3,
+  OT_DTYPE_Q4_0 = 4,
+  OT_DTYPE_Q4_K = 5
+} ot_dtype_t;
+
+typedef enum ot_quant_mode {
+  OT_QUANT_NONE        = 0,
+  OT_QUANT_PER_TENSOR  = 1,
+  OT_QUANT_PER_CHANNEL = 2,
+  OT_QUANT_BLOCK_32    = 3,
+  OT_QUANT_BLOCK_256   = 4
+} ot_quant_mode_t;
+
+#if defined(__GNUC__) || defined(__clang__)
+typedef struct __attribute__((packed)) ot_block_q8_0 {
+  uint16_t d;
+  int8_t   qs[OT_QK8_0];
+} ot_block_q8_0_t;
+typedef struct __attribute__((packed)) ot_block_q4_0 {
+  uint16_t d;
+  uint8_t  qs[OT_QK8_0 / 2u];
+} ot_block_q4_0_t;
+#else
+#pragma pack(push, 1)
+typedef struct ot_block_q8_0 {
+  uint16_t d;
+  int8_t   qs[OT_QK8_0];
+} ot_block_q8_0_t;
+typedef struct ot_block_q4_0 {
+  uint16_t d;
+  uint8_t  qs[OT_QK8_0 / 2u];
+} ot_block_q4_0_t;
+#pragma pack(pop)
+#endif
+
+typedef struct ot_tile_shape {
+  uint32_t block_m;            /* VMEM M tile height (default 128 on v5e) */
+  uint32_t block_k;            /* VMEM K tile width (default 128 on v5e) */
+  uint32_t block_n;            /* VMEM N tile width (default 128 on v5e) */
+  uint8_t  vmem_double_buffer; /* 1 = 2-stage HBM<->VMEM ping-pong DMA */
+  uint8_t  k_loop_accum_f32;   /* 1 = accumulate FP32 across K tiles */
+  uint8_t  rhs_transposed;     /* 0 = [K, N], 1 = [N, K] */
+  uint8_t  reserved;
+} ot_tile_shape_t;
+
+typedef struct ot_freetile_gemm_desc {
+  uint32_t        struct_size;      /* sizeof(ot_freetile_gemm_desc_t) or 0 */
+  uint32_t        m_dim;
+  uint32_t        k_dim;
+  uint32_t        n_dim;
+  ot_tile_shape_t tile;
+  uint32_t        lhs_dtype;        /* enum ot_dtype */
+  uint32_t        rhs_dtype;        /* enum ot_dtype */
+  uint32_t        out_dtype;        /* enum ot_dtype */
+  uint32_t        quant_mode;       /* enum ot_quant_mode */
+  uint32_t        quant_group_size; /* 32 for Q8_0/Q4_0, 256 for Q4_K, 0 otherwise */
+  float           quant_scale;      /* Per-tensor scale when rhs_scales is NULL */
+  uint32_t        flags;
+} ot_freetile_gemm_desc_t;
+
+typedef struct ot_exec_stats {
+  uint64_t hw_us;
+  uint64_t wall_us;
+  uint64_t hbm_bytes_moved;
+  uint32_t tiles_m;
+  uint32_t tiles_k;
+  uint32_t tiles_n;
+  uint32_t imem_bundles;
+  uint32_t vmem_bytes_used;
+  uint32_t reserved;
+} ot_exec_stats_t;
+
+ot_freetile_gemm_desc_t ot_freetile_gemm_desc_default(uint32_t m_dim,
+                                                      uint32_t k_dim,
+                                                      uint32_t n_dim);
+
 /* Clean-room BF16 GEMM dispatch (M x K) * (K x N) -> (M x N) */
 ot_status_t ot_matmul_bf16(ot_context_t* ctx,
                            const ot_buffer_t* lhs_mk,
@@ -108,6 +194,22 @@ ot_status_t ot_matmul_bf16(ot_context_t* ctx,
                            uint32_t m_dim,
                            uint32_t k_dim,
                            uint32_t n_dim);
+
+ot_status_t ot_matmul_bf16_ex(ot_context_t* ctx,
+                              const ot_buffer_t* lhs_mk,
+                              const ot_buffer_t* rhs_kn,
+                              ot_buffer_t* out_mn,
+                              const ot_freetile_gemm_desc_t* desc,
+                              ot_exec_stats_t* out_stats);
+
+/* Clean-room quantized INT8/Q8_0/Q4_0/Q4_K unpack + dequant + MXU GEMM */
+ot_status_t ot_matmul_quant(ot_context_t* ctx,
+                            const ot_buffer_t* lhs_mk,
+                            const ot_buffer_t* rhs_quant,
+                            const ot_buffer_t* rhs_scales,
+                            ot_buffer_t* out_mn,
+                            const ot_freetile_gemm_desc_t* desc,
+                            ot_exec_stats_t* out_stats);
 
 #ifdef __cplusplus
 }

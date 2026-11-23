@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -157,61 +158,95 @@ ot_status_t read_buffer_row_major_locked(ot_context_t* ctx, const ot_buffer_t* s
   if (src->layout != ot::BufferLayout::kTiled2x128Bf16) {
     return raw_d2h_locked(ctx, src->hbm_addr, dst_bytes, size_bytes);
   }
-  if (src->size_bytes < ot::kTile128x128Bf16Bytes) {
+  const uint32_t rows =
+      (src->tiled_rows >= 128u && (src->tiled_rows % 128u) == 0u) ? src->tiled_rows : 128u;
+  const uint32_t cols =
+      (src->tiled_cols >= 128u && (src->tiled_cols % 128u) == 0u) ? src->tiled_cols : 128u;
+  const size_t tiled_bytes = static_cast<size_t>(rows) * cols * sizeof(uint16_t);
+  if (src->size_bytes < tiled_bytes) {
     ctx->last_error = "Invalid tiled buffer size";
     return OT_ERR_INVALID_ARG;
   }
-  ScopedBuf tiled(ot::kTile128x128Bf16Bytes);
+  ScopedBuf tiled(tiled_bytes);
   if (!tiled.ptr) {
     ctx->last_error = "Failed to allocate host tile readback workspace";
     return OT_ERR_NO_MEMORY;
   }
-  ot_status_t st = raw_d2h_locked(ctx, src->hbm_addr, tiled.ptr, ot::kTile128x128Bf16Bytes);
+  ot_status_t st = raw_d2h_locked(ctx, src->hbm_addr, tiled.ptr, tiled_bytes);
   if (st != OT_OK) return st;
 
-  if (size_bytes >= ot::kTile128x128Bf16Bytes &&
-      (reinterpret_cast<uintptr_t>(dst_bytes) % alignof(uint16_t)) == 0) {
-    ot::tile_unpack_128x128_bf16(tiled.u16(), reinterpret_cast<uint16_t*>(dst_bytes));
+  if (rows == 128u && cols == 128u) {
+    if (size_bytes >= ot::kTile128x128Bf16Bytes &&
+        (reinterpret_cast<uintptr_t>(dst_bytes) % alignof(uint16_t)) == 0) {
+      ot::tile_unpack_128x128_bf16(tiled.u16(), reinterpret_cast<uint16_t*>(dst_bytes));
+    } else {
+      ScopedBuf rm(ot::kTile128x128Bf16Bytes);
+      if (!rm.ptr) {
+        ctx->last_error = "Failed to allocate host tile unpack workspace";
+        return OT_ERR_NO_MEMORY;
+      }
+      ot::tile_unpack_128x128_bf16(tiled.u16(), rm.u16());
+      std::memcpy(dst_bytes, rm.ptr, std::min(size_bytes, ot::kTile128x128Bf16Bytes));
+    }
   } else {
-    ScopedBuf rm(ot::kTile128x128Bf16Bytes);
-    if (!rm.ptr) {
-      ctx->last_error = "Failed to allocate host tile unpack workspace";
+    ScopedBuf rm(tiled_bytes);
+    ScopedBuf tile_rm(ot::kTile128x128Bf16Bytes);
+    if (!rm.ptr || !tile_rm.ptr) {
+      ctx->last_error = "Failed to allocate multi-tile unpack workspace";
       return OT_ERR_NO_MEMORY;
     }
-    ot::tile_unpack_128x128_bf16(tiled.u16(), rm.u16());
-    const size_t first = std::min(size_bytes, ot::kTile128x128Bf16Bytes);
-    std::memcpy(dst_bytes, rm.ptr, first);
+    const uint32_t m_tiles = rows / 128u;
+    const uint32_t n_tiles = cols / 128u;
+    uint16_t* dst_u16 = rm.u16();
+    for (uint32_t mt = 0; mt < m_tiles; ++mt) {
+      for (uint32_t nt = 0; nt < n_tiles; ++nt) {
+        const size_t tile_idx = static_cast<size_t>(mt) * n_tiles + nt;
+        ot::tile_unpack_128x128_bf16(tiled.u16() + tile_idx * (128u * 128u), tile_rm.u16());
+        for (uint32_t r = 0; r < 128u; ++r) {
+          const size_t dst_off =
+              (static_cast<size_t>(mt * 128u + r) * cols + nt * 128u);
+          std::memcpy(dst_u16 + dst_off, tile_rm.u16() + r * 128u, 128u * sizeof(uint16_t));
+        }
+      }
+    }
+    std::memcpy(dst_bytes, rm.ptr, std::min(size_bytes, tiled_bytes));
   }
-  if (size_bytes > ot::kTile128x128Bf16Bytes) {
-    return raw_d2h_locked(ctx, src->hbm_addr + ot::kTile128x128Bf16Bytes,
-                          dst_bytes + ot::kTile128x128Bf16Bytes,
-                          size_bytes - ot::kTile128x128Bf16Bytes);
+  if (size_bytes > tiled_bytes) {
+    return raw_d2h_locked(ctx, src->hbm_addr + tiled_bytes,
+                          dst_bytes + tiled_bytes,
+                          size_bytes - tiled_bytes);
   }
   return OT_OK;
 }
 
 ot_status_t write_buffer_raw_locked(ot_context_t* ctx, ot_buffer_t* dst, size_t dst_offset,
                                     const uint8_t* src_bytes, size_t size_bytes) {
-  // If overwriting a tiled buffer without replacing its entire 32 KiB tiled prefix,
+  // If overwriting a tiled buffer without replacing its entire tiled prefix,
   // materialize the tiled prefix to row-major first so untouched logical bytes survive.
+  const size_t tiled_bytes =
+      (dst->tiled_rows >= 128u && dst->tiled_cols >= 128u)
+          ? (static_cast<size_t>(dst->tiled_rows) * dst->tiled_cols * sizeof(uint16_t))
+          : ot::kTile128x128Bf16Bytes;
   if (dst->layout == ot::BufferLayout::kTiled2x128Bf16 &&
-      !(dst_offset == 0 && size_bytes >= ot::kTile128x128Bf16Bytes)) {
-    ScopedBuf rm(ot::kTile128x128Bf16Bytes);
+      !(dst_offset == 0 && size_bytes >= tiled_bytes)) {
+    ScopedBuf rm(tiled_bytes);
     if (!rm.ptr) {
       ctx->last_error = "Failed to allocate host tile materialize workspace";
       return OT_ERR_NO_MEMORY;
     }
-    ot_status_t st = read_buffer_row_major_locked(ctx, dst, rm.ptr, ot::kTile128x128Bf16Bytes);
+    ot_status_t st = read_buffer_row_major_locked(ctx, dst, rm.ptr, tiled_bytes);
     if (st != OT_OK) return st;
-    if (dst_offset < ot::kTile128x128Bf16Bytes) {
-      size_t overlap = std::min(size_bytes, ot::kTile128x128Bf16Bytes - dst_offset);
+    if (dst_offset < tiled_bytes) {
+      size_t overlap = std::min(size_bytes, tiled_bytes - dst_offset);
       std::memcpy(rm.ptr + dst_offset, src_bytes, overlap);
     }
-    st = raw_h2d_locked(ctx, dst->hbm_addr, dst->size_bytes, 0u, rm.ptr, ot::kTile128x128Bf16Bytes);
+    st = raw_h2d_locked(ctx, dst->hbm_addr, dst->size_bytes, 0u, rm.ptr, tiled_bytes);
     if (st != OT_OK) return st;
     dst->layout = ot::BufferLayout::kRaw;
-    if (dst_offset + size_bytes > ot::kTile128x128Bf16Bytes) {
-      size_t tail_start = std::max(dst_offset, ot::kTile128x128Bf16Bytes);
+    dst->tiled_rows = 0;
+    dst->tiled_cols = 0;
+    if (dst_offset + size_bytes > tiled_bytes) {
+      size_t tail_start = std::max(dst_offset, tiled_bytes);
       size_t src_skip = tail_start - dst_offset;
       size_t tail_len = size_bytes - src_skip;
       return raw_h2d_locked(ctx, dst->hbm_addr, dst->size_bytes, tail_start,
@@ -224,6 +259,8 @@ ot_status_t write_buffer_raw_locked(ot_context_t* ctx, ot_buffer_t* dst, size_t 
                                   src_bytes, size_bytes);
   if (st != OT_OK) return st;
   dst->layout = ot::BufferLayout::kRaw;
+  dst->tiled_rows = 0;
+  dst->tiled_cols = 0;
   return OT_OK;
 }
 
@@ -258,6 +295,8 @@ ot_status_t buffer_h2d_tiled_128x128_bf16(ot_context_t* ctx, ot_buffer_t* dst,
                                   tiled.ptr, kTile128x128Bf16Bytes);
   if (st != OT_OK) return st;
   dst->layout = BufferLayout::kTiled2x128Bf16;
+  dst->tiled_rows = 128u;
+  dst->tiled_cols = 128u;
   return OT_OK;
 }
 
@@ -566,6 +605,169 @@ ot_status_t ot_buffer_d2h(ot_context_t* ctx, const ot_buffer_t* src,
   return read_buffer_row_major_locked(ctx, src, static_cast<uint8_t*>(host_dst), size_bytes);
 }
 
+}  // extern "C"
+
+namespace {
+
+struct HbmScratchGuard {
+  ot_context_t* ctx = nullptr;
+  uint64_t addr = 0;
+  ~HbmScratchGuard() {
+    if (ctx && addr != 0 && !ctx->transport.dma_faulted) {
+      ctx->transport.hbm_alloc.free(addr);
+    }
+  }
+};
+
+ot_status_t transport_err_status(ot_context_t* ctx, const std::string& e) {
+  if (e.find("timeout") != std::string::npos) return OT_ERR_TIMEOUT;
+  if (ctx->transport.dma_faulted) return OT_ERR_DEVICE;
+  return OT_ERR_IOCTL;
+}
+
+void pack_bf16_matrix_tiles(const uint16_t* row_major, uint32_t rows, uint32_t cols,
+                            uint16_t* tiled_out) {
+  const uint32_t mt_cnt = rows / 128u;
+  const uint32_t nt_cnt = cols / 128u;
+  std::vector<uint16_t> tile_rm(128u * 128u);
+  for (uint32_t mt = 0; mt < mt_cnt; ++mt) {
+    for (uint32_t nt = 0; nt < nt_cnt; ++nt) {
+      for (uint32_t r = 0; r < 128u; ++r) {
+        const size_t src_off = static_cast<size_t>(mt * 128u + r) * cols + nt * 128u;
+        std::memcpy(tile_rm.data() + r * 128u, row_major + src_off, 128u * sizeof(uint16_t));
+      }
+      const size_t tile_idx = static_cast<size_t>(mt) * nt_cnt + nt;
+      ot::tile_pack_128x128_bf16(tile_rm.data(), tiled_out + tile_idx * (128u * 128u));
+    }
+  }
+}
+
+bool ranges_overlap_buf(const ot_buffer_t* x, const ot_buffer_t* y) {
+  if (x == y) return true;
+  if (x->size_bytes == 0 || y->size_bytes == 0) return false;
+  return x->hbm_addr < (y->hbm_addr + y->size_bytes) &&
+         y->hbm_addr < (x->hbm_addr + x->size_bytes);
+}
+
+ot_status_t validate_gemm_buffers(ot_context_t* ctx, const ot_buffer_t* a,
+                                  const ot_buffer_t* b, const ot_buffer_t* c) {
+  if (!ctx || !a || !b || !c) return OT_ERR_INVALID_ARG;
+  if (is_foreign_forked_buffer(a) || is_foreign_forked_buffer(b) ||
+      is_foreign_forked_buffer(c)) {
+    return OT_ERR_DEVICE;
+  }
+  if (a->ctx != ctx || a->ctx_instance_id != ctx->instance_id ||
+      b->ctx != ctx || b->ctx_instance_id != ctx->instance_id ||
+      c->ctx != ctx || c->ctx_instance_id != ctx->instance_id) {
+    return OT_ERR_INVALID_ARG;
+  }
+  if (!ctx->info.is_mock && !ctx->transport.is_owner_process()) {
+    return OT_ERR_DEVICE;
+  }
+  return OT_OK;
+}
+
+ot_status_t launch_v5e_chunked_exec(ot_context_t* ctx,
+                                  uint64_t lhs_hbm,
+                                  uint64_t rhs_hbm,
+                                  uint64_t out_hbm,
+                                  uint64_t scales_hbm,
+                                  uint64_t const_hbm,
+                                  uint32_t m_tiles,
+                                  uint32_t k_tiles,
+                                  uint32_t n_tiles,
+                                  uint32_t quant_mode,
+                                  uint64_t rhs_tile_bytes,
+                                  uint32_t max_iters_per_launch,
+                                  uint64_t* out_hw_us,
+                                  std::string* err) {
+  const uint32_t m_step =
+      (k_tiles >= max_iters_per_launch)
+          ? 1u
+          : std::min(m_tiles, std::max(1u, max_iters_per_launch / k_tiles));
+  const uint32_t n_step_base =
+      (k_tiles >= max_iters_per_launch) ? 1u : std::max(1u, max_iters_per_launch / k_tiles);
+
+  uint64_t total_hw_us = 0u;
+  for (uint32_t ms = 0u; ms < m_tiles;) {
+    const uint32_t m_chunk = std::min(m_step, m_tiles - ms);
+    const uint32_t n_max_for_m = std::max(1u, n_step_base / m_chunk);
+    for (uint32_t ns = 0u; ns < n_tiles;) {
+      const uint32_t n_chunk = std::min(n_max_for_m, n_tiles - ns);
+      const uint64_t sub_lhs = lhs_hbm + static_cast<uint64_t>(ms) * k_tiles * ot::kTile128x128Bf16Bytes;
+      const uint64_t sub_rhs = rhs_hbm + static_cast<uint64_t>(ns) * rhs_tile_bytes;
+      const uint64_t sub_out = out_hbm +
+          (static_cast<uint64_t>(ms) * n_tiles + ns) * ot::kTile128x128Bf16Bytes;
+      const uint64_t sub_sc = (scales_hbm != 0ULL)
+          ? (scales_hbm + static_cast<uint64_t>(ns) * 1024ULL)
+          : 0ULL;
+      const uint32_t n_stride =
+          (m_tiles == 1u && k_tiles == 1u && n_tiles == 1u) ? 0u : n_tiles;
+
+      const uint32_t next_seq =
+          (ctx->transport.exec_seq == 0xffffffffu) ? 1u : (ctx->transport.exec_seq + 1u);
+      const ot::OtV5eLaunchDesc ldesc = ot::OtV5eLaunchDesc::build_ex(
+          sub_lhs, sub_rhs, sub_out, /*prog_hbm=*/0ULL, next_seq,
+          m_chunk, k_tiles, n_chunk, quant_mode, sub_sc, const_hbm, n_stride);
+
+      std::memcpy(ctx->transport.host_stage_mem, ldesc.bytes, sizeof(ldesc.bytes));
+      const auto t0 = std::chrono::steady_clock::now();
+      if (!ctx->transport.dma_h2d_sync(ctx->transport.host_stage_iova,
+                                       ot::kDefaultLaunchDescHbmAddr,
+                                       sizeof(ldesc.bytes),
+                                       ot::kLdescDmaW28Doorbell,
+                                       ot::kLdescDmaW29,
+                                       ctx->cfg.timeout_ms, err)) {
+        ctx->last_error = err->empty() ? "Launch descriptor doorbell DMA failed" : *err;
+        return transport_err_status(ctx, *err);
+      }
+      ctx->transport.exec_seq = next_seq;
+
+      uint32_t cq_out[8] = {};
+      if (!ctx->transport.submit_exec_sync(next_seq, ctx->cfg.timeout_ms, cq_out, err)) {
+        ctx->last_error = err->empty() ? "Hardware MXU EXEC failed" : *err;
+        return transport_err_status(ctx, *err);
+      }
+      const auto t1 = std::chrono::steady_clock::now();
+      total_hw_us += static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+      ns += n_chunk;
+    }
+    ms += m_chunk;
+  }
+  if (out_hw_us) *out_hw_us = total_hw_us;
+  return OT_OK;
+}
+
+}  // namespace
+
+extern "C" {
+
+ot_freetile_gemm_desc_t ot_freetile_gemm_desc_default(uint32_t m_dim,
+                                                      uint32_t k_dim,
+                                                      uint32_t n_dim) {
+  ot_freetile_gemm_desc_t d{};
+  d.struct_size = sizeof(ot_freetile_gemm_desc_t);
+  d.m_dim = m_dim;
+  d.k_dim = k_dim;
+  d.n_dim = n_dim;
+  d.tile.block_m = 128u;
+  d.tile.block_k = 128u;
+  d.tile.block_n = 128u;
+  d.tile.vmem_double_buffer = 1u;
+  d.tile.k_loop_accum_f32 = 1u;
+  d.tile.rhs_transposed = 0u;
+  d.tile.reserved = 0u;
+  d.lhs_dtype = OT_DTYPE_BF16;
+  d.rhs_dtype = OT_DTYPE_BF16;
+  d.out_dtype = OT_DTYPE_BF16;
+  d.quant_mode = OT_QUANT_NONE;
+  d.quant_group_size = 0u;
+  d.quant_scale = 1.0f;
+  d.flags = 0u;
+  return d;
+}
+
 ot_status_t ot_matmul_bf16(ot_context_t* ctx,
                            const ot_buffer_t* lhs_mk,
                            const ot_buffer_t* rhs_kn,
@@ -573,19 +775,38 @@ ot_status_t ot_matmul_bf16(ot_context_t* ctx,
                            uint32_t m_dim,
                            uint32_t k_dim,
                            uint32_t n_dim) {
-  if (!ctx || !lhs_mk || !rhs_kn || !out_mn ||
-      m_dim == 0 || k_dim == 0 || n_dim == 0) {
+  const ot_freetile_gemm_desc_t desc = ot_freetile_gemm_desc_default(m_dim, k_dim, n_dim);
+  return ot_matmul_bf16_ex(ctx, lhs_mk, rhs_kn, out_mn, &desc, nullptr);
+}
+
+ot_status_t ot_matmul_bf16_ex(ot_context_t* ctx,
+                              const ot_buffer_t* lhs_mk,
+                              const ot_buffer_t* rhs_kn,
+                              ot_buffer_t* out_mn,
+                              const ot_freetile_gemm_desc_t* desc,
+                              ot_exec_stats_t* out_stats) {
+  const auto wall_t0 = std::chrono::steady_clock::now();
+  if (!desc || desc->m_dim == 0 || desc->k_dim == 0 || desc->n_dim == 0) {
     return OT_ERR_INVALID_ARG;
   }
-  if (is_foreign_forked_buffer(lhs_mk) || is_foreign_forked_buffer(rhs_kn) ||
-      is_foreign_forked_buffer(out_mn)) {
-    return OT_ERR_DEVICE;
-  }
-  if (lhs_mk->ctx != ctx || lhs_mk->ctx_instance_id != ctx->instance_id ||
-      rhs_kn->ctx != ctx || rhs_kn->ctx_instance_id != ctx->instance_id ||
-      out_mn->ctx != ctx || out_mn->ctx_instance_id != ctx->instance_id) {
+  if (desc->struct_size != 0u && desc->struct_size != sizeof(ot_freetile_gemm_desc_t)) {
     return OT_ERR_INVALID_ARG;
   }
+  if (desc->lhs_dtype != OT_DTYPE_BF16 || desc->rhs_dtype != OT_DTYPE_BF16 ||
+      desc->out_dtype != OT_DTYPE_BF16 || desc->quant_mode != OT_QUANT_NONE) {
+    return OT_ERR_INVALID_ARG;
+  }
+  if ((desc->tile.block_m != 0u && desc->tile.block_m != 128u) ||
+      (desc->tile.block_k != 0u && desc->tile.block_k != 128u) ||
+      (desc->tile.block_n != 0u && desc->tile.block_n != 128u)) {
+    return OT_ERR_INVALID_ARG;
+  }
+  ot_status_t st_val = validate_gemm_buffers(ctx, lhs_mk, rhs_kn, out_mn);
+  if (st_val != OT_OK) return st_val;
+
+  const uint32_t m_dim = desc->m_dim;
+  const uint32_t k_dim = desc->k_dim;
+  const uint32_t n_dim = desc->n_dim;
   auto mul_bf16_bytes = [](uint32_t a, uint32_t b, uint64_t* out) -> bool {
     const uint64_t prod = static_cast<uint64_t>(a) * static_cast<uint64_t>(b);
     if (prod > std::numeric_limits<uint64_t>::max() / sizeof(uint16_t)) return false;
@@ -601,22 +822,25 @@ ot_status_t ot_matmul_bf16(ot_context_t* ctx,
   if (lhs_mk->size_bytes < need_a || rhs_kn->size_bytes < need_b || out_mn->size_bytes < need_c) {
     return OT_ERR_INVALID_ARG;
   }
-  if (!ctx->info.is_mock && !ctx->transport.is_owner_process()) {
-    return OT_ERR_DEVICE;
-  }
 
   std::lock_guard<std::mutex> lk(ctx->mu);
   if (ctx->transport.dma_faulted) {
     ctx->last_error = "Context faulted after prior DMA timeout; recreate context";
     return OT_ERR_DEVICE;
   }
-  auto ranges_overlap = [](const ot_buffer_t* x, const ot_buffer_t* y) -> bool {
-    if (x == y) return true;
-    if (x->size_bytes == 0 || y->size_bytes == 0) return false;
-    uint64_t x_end = x->hbm_addr + x->size_bytes;
-    uint64_t y_end = y->hbm_addr + y->size_bytes;
-    return x->hbm_addr < y_end && y->hbm_addr < x_end;
-  };
+  if (out_stats) std::memset(out_stats, 0, sizeof(*out_stats));
+
+  const bool is_tile_aligned =
+      ((m_dim % 128u) == 0u) && ((k_dim % 128u) == 0u) && ((n_dim % 128u) == 0u);
+  ot::freetile::LoweringPlan plan{};
+  if (is_tile_aligned) {
+    auto fdesc = ot::freetile::TileKernelDescriptor::from_c_desc(*desc);
+    plan = ot::freetile::plan_v5e_tile_gemm(fdesc);
+    if (!plan.valid) {
+      ctx->last_error = plan.error;
+      return OT_ERR_INVALID_ARG;
+    }
+  }
 
   if (ctx->info.is_mock) {
     struct MallocGuard {
@@ -638,9 +862,9 @@ ot_status_t ot_matmul_bf16(ot_context_t* ctx,
     const uint16_t* a_ptr = nullptr;
     const uint16_t* b_ptr = nullptr;
     const bool lhs_needs_copy =
-        (lhs_mk->layout == ot::BufferLayout::kTiled2x128Bf16) || ranges_overlap(lhs_mk, out_mn);
+        (lhs_mk->layout == ot::BufferLayout::kTiled2x128Bf16) || ranges_overlap_buf(lhs_mk, out_mn);
     const bool rhs_needs_copy =
-        (rhs_kn->layout == ot::BufferLayout::kTiled2x128Bf16) || ranges_overlap(rhs_kn, out_mn);
+        (rhs_kn->layout == ot::BufferLayout::kTiled2x128Bf16) || ranges_overlap_buf(rhs_kn, out_mn);
 
     if (lhs_needs_copy) {
       a_tmp.p = static_cast<uint16_t*>(std::malloc(static_cast<size_t>(need_a)));
@@ -668,10 +892,10 @@ ot_status_t ot_matmul_bf16(ot_context_t* ctx,
       b_ptr = reinterpret_cast<const uint16_t*>(ctx->transport.mock_hbm.data() + rhs_kn->hbm_addr);
     }
 
-    if (m_dim == 128u && k_dim == 128u && n_dim == 128u) {
+    if (is_tile_aligned) {
       MallocGuard c_rm, c_tiled;
-      c_rm.p = static_cast<uint16_t*>(std::malloc(ot::kTile128x128Bf16Bytes));
-      c_tiled.p = static_cast<uint16_t*>(std::malloc(ot::kTile128x128Bf16Bytes));
+      c_rm.p = static_cast<uint16_t*>(std::malloc(static_cast<size_t>(need_c)));
+      c_tiled.p = static_cast<uint16_t*>(std::malloc(static_cast<size_t>(need_c)));
       if (!c_rm.p || !c_tiled.p) return OT_ERR_NO_MEMORY;
       for (uint32_t m = 0; m < m_dim; ++m) {
         for (uint32_t n = 0; n < n_dim; ++n) {
@@ -683,15 +907,26 @@ ot_status_t ot_matmul_bf16(ot_context_t* ctx,
           c_rm.p[static_cast<size_t>(m) * n_dim + n] = f32_to_bf16(acc);
         }
       }
-      ot::tile_pack_128x128_bf16(c_rm.p, c_tiled.p);
+      pack_bf16_matrix_tiles(c_rm.p, m_dim, n_dim, c_tiled.p);
       std::memcpy(ctx->transport.mock_hbm.data() + out_mn->hbm_addr,
-                  c_tiled.p, ot::kTile128x128Bf16Bytes);
+                  c_tiled.p, static_cast<size_t>(need_c));
       out_mn->layout = ot::BufferLayout::kTiled2x128Bf16;
+      out_mn->tiled_rows = m_dim;
+      out_mn->tiled_cols = n_dim;
+      if (out_stats) {
+        const auto wall_t1 = std::chrono::steady_clock::now();
+        out_stats->hw_us = 0u;
+        out_stats->wall_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(wall_t1 - wall_t0).count());
+        out_stats->tiles_m = plan.tiles_m;
+        out_stats->tiles_k = plan.tiles_k;
+        out_stats->tiles_n = plan.tiles_n;
+        out_stats->vmem_bytes_used = plan.vmem.total_vmem_bytes;
+        out_stats->hbm_bytes_moved = plan.hbm_bytes_moved;
+      }
       return OT_OK;
     }
 
-    // If reusing a tiled output buffer for a smaller raw matmul, unpack the 32 KiB
-    // tile in-place first so unwritten suffix bytes remain valid row-major data.
     if (out_mn->layout == ot::BufferLayout::kTiled2x128Bf16 &&
         need_c < ot::kTile128x128Bf16Bytes) {
       MallocGuard prev_rm;
@@ -705,6 +940,8 @@ ot_status_t ot_matmul_bf16(ot_context_t* ctx,
                           ot::kTile128x128Bf16Bytes);
       if (st != OT_OK) return st;
       out_mn->layout = ot::BufferLayout::kRaw;
+      out_mn->tiled_rows = 0;
+      out_mn->tiled_cols = 0;
     }
 
     auto* c_ptr = reinterpret_cast<uint16_t*>(ctx->transport.mock_hbm.data() + out_mn->hbm_addr);
@@ -719,11 +956,13 @@ ot_status_t ot_matmul_bf16(ot_context_t* ctx,
       }
     }
     out_mn->layout = ot::BufferLayout::kRaw;
+    out_mn->tiled_rows = 0;
+    out_mn->tiled_cols = 0;
     return OT_OK;
   }
 
-  if (m_dim != 128u || k_dim != 128u || n_dim != 128u) {
-    ctx->last_error = "Live hardware BF16 matmul currently supports 128x128x128 only";
+  if (!is_tile_aligned) {
+    ctx->last_error = "Live hardware BF16 matmul requires M, K, N to be positive multiples of 128";
     return OT_ERR_UNSUPPORTED;
   }
   if ((lhs_mk->hbm_addr & 0x1ffULL) != 0 || (rhs_kn->hbm_addr & 0x1ffULL) != 0 ||
@@ -737,60 +976,62 @@ ot_status_t ot_matmul_bf16(ot_context_t* ctx,
     return OT_ERR_DEVICE;
   }
 
-  auto transport_status = [&](const std::string& e) -> ot_status_t {
-    if (e.find("timeout") != std::string::npos) {
-      return OT_ERR_TIMEOUT;
-    }
-    if (ctx->transport.dma_faulted) {
-      return OT_ERR_DEVICE;
-    }
-    return OT_ERR_IOCTL;
-  };
-
   std::string err;
-  if (!ctx->transport.ensure_imem_booted(ctx->cfg.timeout_ms, &err)) {
-    ctx->last_error = err.empty() ? "IMEM boot stub initialization failed" : err;
-    return transport_status(err);
+  if (!ctx->transport.ensure_imem_program(/*bf16=*/1u, ctx->cfg.timeout_ms, &err)) {
+    ctx->last_error = err.empty() ? "IMEM boot initialization failed" : err;
+    return transport_err_status(ctx, err);
   }
 
-  auto prepare_tiled_input = [&](const ot_buffer_t* src, uint64_t* scratch_slot,
-                                 uint64_t* out_hbm) -> ot_status_t {
-    if (src->layout == ot::BufferLayout::kTiled2x128Bf16 && !ranges_overlap(src, out_mn)) {
+  HbmScratchGuard temp_lhs{ctx, 0}, temp_rhs{ctx, 0};
+  auto prepare_bf16_input = [&](const ot_buffer_t* src, uint32_t rows, uint32_t cols,
+                                uint64_t* single_tile_slot, HbmScratchGuard* dyn_guard,
+                                uint64_t* out_hbm) -> ot_status_t {
+    const size_t bytes = static_cast<size_t>(rows) * cols * sizeof(uint16_t);
+    const bool already_tiled =
+        (src->layout == ot::BufferLayout::kTiled2x128Bf16) &&
+        ((rows == 128u && cols == 128u && src->tiled_rows == 0u) ||
+         (src->tiled_rows == rows && src->tiled_cols == cols));
+    if (already_tiled && !ranges_overlap_buf(src, out_mn)) {
       *out_hbm = src->hbm_addr;
       return OT_OK;
     }
-    if (!ctx->transport.ensure_matmul_scratch_slot(scratch_slot, &err)) {
-      ctx->last_error = err.empty() ? "Failed to allocate matmul scratch HBM" : err;
-      return OT_ERR_NO_MEMORY;
-    }
-    const uint64_t dst_scratch = *scratch_slot;
-    if (src->layout == ot::BufferLayout::kTiled2x128Bf16) {
-      // In-place aliasing (src overlaps out_mn) with an already tiled buffer: copy raw 32 KiB to scratch.
-      if (!ctx->transport.dma_d2h_sync(ctx->transport.host_stage_iova, src->hbm_addr,
-                                       ot::kTile128x128Bf16Bytes, 0x60u, 0u,
-                                       ctx->cfg.timeout_ms, &err) ||
-          !ctx->transport.dma_h2d_sync(ctx->transport.host_stage_iova, dst_scratch,
-                                       ot::kTile128x128Bf16Bytes, 0x10u, 0u,
-                                       ctx->cfg.timeout_ms, &err)) {
-        ctx->last_error = err.empty() ? "Scratch copy DMA failed" : err;
-        return transport_status(err);
+
+    uint64_t dst_scratch = 0;
+    if (bytes == ot::kTile128x128Bf16Bytes) {
+      if (!ctx->transport.ensure_matmul_scratch_slot(single_tile_slot, &err)) {
+        ctx->last_error = err.empty() ? "Failed to allocate matmul scratch HBM" : err;
+        return OT_ERR_NO_MEMORY;
       }
+      dst_scratch = *single_tile_slot;
+    } else {
+      if (!ctx->transport.hbm_alloc.alloc(bytes, 4096u, &dyn_guard->addr)) {
+        ctx->last_error = "Out of device HBM for multi-tile BF16 packing workspace";
+        return OT_ERR_NO_MEMORY;
+      }
+      dst_scratch = dyn_guard->addr;
+    }
+
+    if (already_tiled) {
+      ScopedBuf copy_buf(bytes);
+      if (!copy_buf.ptr) return OT_ERR_NO_MEMORY;
+      ot_status_t st = raw_d2h_locked(ctx, src->hbm_addr, copy_buf.ptr, bytes);
+      if (st != OT_OK) return st;
+      st = raw_h2d_locked(ctx, dst_scratch, bytes, 0u, copy_buf.ptr, bytes);
+      if (st != OT_OK) return st;
       *out_hbm = dst_scratch;
       return OT_OK;
     }
 
-    // Raw row-major input in HBM: D2H -> pack {1,0:T(2,128)(2,1)} -> H2D into scratch.
-    ScopedBuf rm(ot::kTile128x128Bf16Bytes);
-    ScopedBuf tiled(ot::kTile128x128Bf16Bytes);
+    ScopedBuf rm(bytes);
+    ScopedBuf tiled(bytes);
     if (!rm.ptr || !tiled.ptr) {
-      ctx->last_error = "Failed to allocate host tile pack workspace";
+      ctx->last_error = "Failed to allocate host multi-tile pack workspace";
       return OT_ERR_NO_MEMORY;
     }
-    ot_status_t st = raw_d2h_locked(ctx, src->hbm_addr, rm.ptr, ot::kTile128x128Bf16Bytes);
+    ot_status_t st = raw_d2h_locked(ctx, src->hbm_addr, rm.ptr, bytes);
     if (st != OT_OK) return st;
-    ot::tile_pack_128x128_bf16(rm.u16(), tiled.u16());
-    st = raw_h2d_locked(ctx, dst_scratch, ot::kTile128x128Bf16Bytes, 0u,
-                        tiled.ptr, ot::kTile128x128Bf16Bytes);
+    pack_bf16_matrix_tiles(rm.u16(), rows, cols, tiled.u16());
+    st = raw_h2d_locked(ctx, dst_scratch, bytes, 0u, tiled.ptr, bytes);
     if (st != OT_OK) return st;
     *out_hbm = dst_scratch;
     return OT_OK;
@@ -798,39 +1039,358 @@ ot_status_t ot_matmul_bf16(ot_context_t* ctx,
 
   uint64_t lhs_hbm = 0;
   uint64_t rhs_hbm = 0;
-  ot_status_t st = prepare_tiled_input(lhs_mk, &ctx->transport.scratch_lhs_hbm, &lhs_hbm);
+  ot_status_t st = prepare_bf16_input(lhs_mk, m_dim, k_dim,
+                                      &ctx->transport.scratch_lhs_hbm, &temp_lhs, &lhs_hbm);
   if (st != OT_OK) return st;
-  if (rhs_kn == lhs_mk) {
+  if (rhs_kn == lhs_mk && k_dim == m_dim && n_dim == k_dim) {
     rhs_hbm = lhs_hbm;
   } else {
-    st = prepare_tiled_input(rhs_kn, &ctx->transport.scratch_rhs_hbm, &rhs_hbm);
+    st = prepare_bf16_input(rhs_kn, k_dim, n_dim,
+                            &ctx->transport.scratch_rhs_hbm, &temp_rhs, &rhs_hbm);
     if (st != OT_OK) return st;
   }
 
-  const uint32_t next_seq =
-      (ctx->transport.exec_seq == 0xffffffffu) ? 1u : (ctx->transport.exec_seq + 1u);
-  const ot::OtV5eLaunchDesc ldesc = ot::OtV5eLaunchDesc::build(
-      lhs_hbm, rhs_hbm, out_mn->hbm_addr, /*prog_hbm=*/0ULL, next_seq);
-
-  std::memcpy(ctx->transport.host_stage_mem, ldesc.bytes, sizeof(ldesc.bytes));
-  if (!ctx->transport.dma_h2d_sync(ctx->transport.host_stage_iova,
-                                   ot::kDefaultLaunchDescHbmAddr,
-                                   sizeof(ldesc.bytes),
-                                   ot::kLdescDmaW28Doorbell,
-                                   ot::kLdescDmaW29,
-                                   ctx->cfg.timeout_ms, &err)) {
-    ctx->last_error = err.empty() ? "Launch descriptor doorbell DMA failed" : err;
-    return transport_status(err);
-  }
-  ctx->transport.exec_seq = next_seq;
-
-  uint32_t cq_out[8] = {};
-  if (!ctx->transport.submit_exec_sync(next_seq, ctx->cfg.timeout_ms, cq_out, &err)) {
-    ctx->last_error = err.empty() ? "Hardware MXU EXEC failed" : err;
-    return transport_status(err);
-  }
+  uint64_t hw_us = 0u;
+  st = launch_v5e_chunked_exec(ctx, lhs_hbm, rhs_hbm, out_mn->hbm_addr, 0ULL, 0ULL,
+                               plan.tiles_m, plan.tiles_k, plan.tiles_n,
+                               /*quant_mode=*/0u, ot::kTile128x128Bf16Bytes,
+                               /*max_iters_per_launch=*/1024u, &hw_us, &err);
+  if (st != OT_OK) return st;
+  const auto t1 = std::chrono::steady_clock::now();
 
   out_mn->layout = ot::BufferLayout::kTiled2x128Bf16;
+  out_mn->tiled_rows = m_dim;
+  out_mn->tiled_cols = n_dim;
+  if (out_stats) {
+    out_stats->hw_us = hw_us;
+    out_stats->wall_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(t1 - wall_t0).count());
+    out_stats->hbm_bytes_moved = plan.hbm_bytes_moved;
+    out_stats->tiles_m = plan.tiles_m;
+    out_stats->tiles_k = plan.tiles_k;
+    out_stats->tiles_n = plan.tiles_n;
+    out_stats->imem_bundles = static_cast<uint32_t>(ot::emit_v5e_imem_for_freetile(plan).size());
+    out_stats->vmem_bytes_used = plan.vmem.total_vmem_bytes;
+  }
+  return OT_OK;
+}
+
+ot_status_t ot_matmul_quant(ot_context_t* ctx,
+                            const ot_buffer_t* lhs_mk,
+                            const ot_buffer_t* rhs_quant,
+                            const ot_buffer_t* rhs_scales,
+                            ot_buffer_t* out_mn,
+                            const ot_freetile_gemm_desc_t* desc,
+                            ot_exec_stats_t* out_stats) {
+  const auto wall_t0 = std::chrono::steady_clock::now();
+  if (!desc || desc->m_dim == 0 || desc->k_dim == 0 || desc->n_dim == 0) {
+    return OT_ERR_INVALID_ARG;
+  }
+  if (desc->struct_size != 0u && desc->struct_size != sizeof(ot_freetile_gemm_desc_t)) {
+    return OT_ERR_INVALID_ARG;
+  }
+  ot_status_t st_val = validate_gemm_buffers(ctx, lhs_mk, rhs_quant, out_mn);
+  if (st_val != OT_OK) return st_val;
+  if (rhs_scales && (rhs_scales->ctx != ctx ||
+                     rhs_scales->ctx_instance_id != ctx->instance_id ||
+                     is_foreign_forked_buffer(rhs_scales))) {
+    return OT_ERR_INVALID_ARG;
+  }
+
+  ot::freetile::TileKernelDescriptor fdesc = ot::freetile::TileKernelDescriptor::from_c_desc(*desc);
+  ot::freetile::LoweringPlan plan = ot::freetile::plan_v5e_tile_gemm(fdesc);
+  if (!plan.valid) {
+    ctx->last_error = plan.error;
+    return OT_ERR_INVALID_ARG;
+  }
+
+  const uint32_t m_dim = desc->m_dim;
+  const uint32_t k_dim = desc->k_dim;
+  const uint32_t n_dim = desc->n_dim;
+  const bool is_q4 = (desc->rhs_dtype == OT_DTYPE_Q4_0 || desc->rhs_dtype == OT_DTYPE_Q4_K);
+  const bool is_i8 = (desc->rhs_dtype == OT_DTYPE_INT8 || desc->rhs_dtype == OT_DTYPE_Q8_0);
+  if (!is_q4 && !is_i8) {
+    return OT_ERR_INVALID_ARG;
+  }
+
+  bool is_block32 = false;
+  bool is_per_channel = false;
+  bool is_per_tensor = false;
+  uint32_t qmode_word = 0u;
+  if (desc->quant_mode == OT_QUANT_BLOCK_32 || desc->rhs_dtype == OT_DTYPE_Q8_0 ||
+      desc->rhs_dtype == OT_DTYPE_Q4_0) {
+    if (desc->quant_mode == OT_QUANT_PER_CHANNEL || desc->quant_mode == OT_QUANT_PER_TENSOR) {
+      is_per_channel = (desc->quant_mode == OT_QUANT_PER_CHANNEL);
+      is_per_tensor = (desc->quant_mode == OT_QUANT_PER_TENSOR);
+    } else {
+      is_block32 = true;
+    }
+  } else if (desc->quant_mode == OT_QUANT_PER_CHANNEL) {
+    is_per_channel = true;
+  } else if (desc->quant_mode == OT_QUANT_PER_TENSOR) {
+    is_per_tensor = true;
+  } else {
+    return OT_ERR_INVALID_ARG;
+  }
+
+  if (is_q4) {
+    qmode_word = is_block32
+        ? static_cast<uint32_t>(ot::QuantKernelMode::kQ4_0)
+        : static_cast<uint32_t>(ot::QuantKernelMode::kInt4PerChannel);
+  } else {
+    qmode_word = is_block32
+        ? static_cast<uint32_t>(ot::QuantKernelMode::kQ8_0)
+        : static_cast<uint32_t>(ot::QuantKernelMode::kInt8PerChannel);
+  }
+  if (!is_per_tensor && !rhs_scales) {
+    return OT_ERR_INVALID_ARG;
+  }
+
+  const size_t need_lhs = static_cast<size_t>(m_dim) * k_dim * sizeof(uint16_t);
+  const size_t need_q = is_q4 ? (static_cast<size_t>(k_dim) * n_dim / 2u)
+                              : (static_cast<size_t>(k_dim) * n_dim);
+  const size_t scale_groups = is_block32 ? (static_cast<size_t>(k_dim) / 32u) : 1u;
+  const size_t scale_elems = is_per_tensor ? 1u : (scale_groups * n_dim);
+  const bool scales_are_f32 =
+      rhs_scales && (rhs_scales->size_bytes >= scale_elems * sizeof(float));
+  const size_t need_scales =
+      rhs_scales ? (scales_are_f32 ? (scale_elems * sizeof(float))
+                                   : (scale_elems * sizeof(uint16_t)))
+                 : 0u;
+  const size_t need_out = static_cast<size_t>(m_dim) * n_dim * sizeof(uint16_t);
+  if (lhs_mk->size_bytes < need_lhs || rhs_quant->size_bytes < need_q ||
+      (rhs_scales && rhs_scales->size_bytes < need_scales) ||
+      out_mn->size_bytes < need_out) {
+    return OT_ERR_INVALID_ARG;
+  }
+
+  std::lock_guard<std::mutex> lk(ctx->mu);
+  if (ctx->transport.dma_faulted) {
+    ctx->last_error = "Context faulted after prior DMA timeout; recreate context";
+    return OT_ERR_DEVICE;
+  }
+  if (out_stats) std::memset(out_stats, 0, sizeof(*out_stats));
+
+  auto decode_scale_bf16 = [&](const uint8_t* raw_sc, size_t sg, size_t col) -> uint16_t {
+    if (is_per_tensor) {
+      if (!rhs_scales) return f32_to_bf16(desc->quant_scale);
+      if (scales_are_f32) {
+        float f = 0.0f;
+        std::memcpy(&f, raw_sc, sizeof(float));
+        return f32_to_bf16(f);
+      }
+      uint16_t b = 0;
+      std::memcpy(&b, raw_sc, sizeof(uint16_t));
+      return b;
+    }
+    const size_t idx = (is_per_channel ? 0u : sg) * n_dim + col;
+    if (scales_are_f32) {
+      float f = 0.0f;
+      std::memcpy(&f, raw_sc + idx * sizeof(float), sizeof(float));
+      return f32_to_bf16(f);
+    }
+    uint16_t b = 0;
+    std::memcpy(&b, raw_sc + idx * sizeof(uint16_t), sizeof(uint16_t));
+    return b;
+  };
+
+  if (ctx->info.is_mock) {
+    const size_t hbm_sz = ctx->transport.mock_hbm.size();
+    auto in_bounds = [&](uint64_t a, size_t len) {
+      return a <= hbm_sz && len <= hbm_sz - a;
+    };
+    if (!in_bounds(lhs_mk->hbm_addr, need_lhs) ||
+        !in_bounds(rhs_quant->hbm_addr, need_q) ||
+        (rhs_scales && !in_bounds(rhs_scales->hbm_addr, need_scales)) ||
+        !in_bounds(out_mn->hbm_addr, need_out)) {
+      ctx->last_error = "Mock HBM quant matmul range out of bounds";
+      return OT_ERR_DEVICE;
+    }
+    std::vector<uint16_t> lhs_rm(static_cast<size_t>(m_dim) * k_dim);
+    ot_status_t st = read_buffer_row_major_locked(
+        ctx, lhs_mk, reinterpret_cast<uint8_t*>(lhs_rm.data()), need_lhs);
+    if (st != OT_OK) return st;
+
+    const uint8_t* q_ptr = ctx->transport.mock_hbm.data() + rhs_quant->hbm_addr;
+    const uint8_t* sc_ptr = rhs_scales ? (ctx->transport.mock_hbm.data() + rhs_scales->hbm_addr) : nullptr;
+    const bool rhs_transposed = (desc->tile.rhs_transposed != 0u);
+
+    std::vector<uint16_t> out_rm(static_cast<size_t>(m_dim) * n_dim);
+    std::vector<uint16_t> rhs_deq_bf16(static_cast<size_t>(k_dim) * n_dim);
+    for (uint32_t k = 0; k < k_dim; ++k) {
+      const size_t sg = k / 32u;
+      for (uint32_t n = 0; n < n_dim; ++n) {
+        int32_t qv = 0;
+        const size_t elem = rhs_transposed
+            ? (static_cast<size_t>(n) * k_dim + k)
+            : (static_cast<size_t>(k) * n_dim + n);
+        if (is_q4) {
+          const uint8_t packed = q_ptr[elem >> 1];
+          const uint32_t nib = (elem & 1u) ? (packed >> 4) : (packed & 0xfu);
+          qv = static_cast<int32_t>(nib) - 8;
+        } else {
+          qv = static_cast<int8_t>(q_ptr[elem]);
+        }
+        const float sc = bf16_to_f32(decode_scale_bf16(sc_ptr, sg, n));
+        rhs_deq_bf16[static_cast<size_t>(k) * n_dim + n] =
+            f32_to_bf16(static_cast<float>(qv) * sc);
+      }
+    }
+    for (uint32_t m = 0; m < m_dim; ++m) {
+      for (uint32_t n = 0; n < n_dim; ++n) {
+        float acc = 0.0f;
+        for (uint32_t k = 0; k < k_dim; ++k) {
+          acc += bf16_to_f32(lhs_rm[static_cast<size_t>(m) * k_dim + k]) *
+                 bf16_to_f32(rhs_deq_bf16[static_cast<size_t>(k) * n_dim + n]);
+        }
+        out_rm[static_cast<size_t>(m) * n_dim + n] = f32_to_bf16(acc);
+      }
+    }
+    std::vector<uint16_t> out_tiled(static_cast<size_t>(m_dim) * n_dim);
+    pack_bf16_matrix_tiles(out_rm.data(), m_dim, n_dim, out_tiled.data());
+    std::memcpy(ctx->transport.mock_hbm.data() + out_mn->hbm_addr,
+                out_tiled.data(), need_out);
+    out_mn->layout = ot::BufferLayout::kTiled2x128Bf16;
+    out_mn->tiled_rows = m_dim;
+    out_mn->tiled_cols = n_dim;
+    if (out_stats) {
+      const auto wall_t1 = std::chrono::steady_clock::now();
+      out_stats->hw_us = 0u;
+      out_stats->wall_us = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(wall_t1 - wall_t0).count());
+      out_stats->hbm_bytes_moved = plan.hbm_bytes_moved;
+      out_stats->tiles_m = plan.tiles_m;
+      out_stats->tiles_k = plan.tiles_k;
+      out_stats->tiles_n = plan.tiles_n;
+      out_stats->vmem_bytes_used = plan.vmem.total_vmem_bytes;
+    }
+    return OT_OK;
+  }
+
+  if ((lhs_mk->hbm_addr & 0x1ffULL) != 0 || (rhs_quant->hbm_addr & 0x1ffULL) != 0 ||
+      (rhs_scales && (rhs_scales->hbm_addr & 0x1ffULL) != 0) ||
+      (out_mn->hbm_addr & 0x1ffULL) != 0) {
+    ctx->last_error = "Hardware quantized matmul HBM buffers must be 512-byte aligned";
+    return OT_ERR_INVALID_ARG;
+  }
+  std::string err;
+  if (!ctx->transport.ensure_imem_program(is_q4 ? 3u : 2u, ctx->cfg.timeout_ms, &err) ||
+      !ctx->transport.ensure_quant_constants(ctx->cfg.timeout_ms, &err)) {
+    ctx->last_error = err.empty() ? "Quantized IMEM setup failed" : err;
+    return transport_err_status(ctx, err);
+  }
+
+  HbmScratchGuard g_lhs{ctx, 0}, g_q{ctx, 0}, g_sc{ctx, 0};
+  uint64_t lhs_hbm = 0;
+  const bool lhs_tiled_ok =
+      (lhs_mk->layout == ot::BufferLayout::kTiled2x128Bf16) &&
+      ((m_dim == 128u && k_dim == 128u && lhs_mk->tiled_rows == 0u) ||
+       (lhs_mk->tiled_rows == m_dim && lhs_mk->tiled_cols == k_dim)) &&
+      !ranges_overlap_buf(lhs_mk, out_mn);
+  if (lhs_tiled_ok) {
+    lhs_hbm = lhs_mk->hbm_addr;
+  } else {
+    if (!ctx->transport.hbm_alloc.alloc(need_lhs, 4096u, &g_lhs.addr)) {
+      return OT_ERR_NO_MEMORY;
+    }
+    ScopedBuf rm(need_lhs), tiled(need_lhs);
+    if (!rm.ptr || !tiled.ptr) return OT_ERR_NO_MEMORY;
+    ot_status_t st = raw_d2h_locked(ctx, lhs_mk->hbm_addr, rm.ptr, need_lhs);
+    if (st != OT_OK) return st;
+    pack_bf16_matrix_tiles(rm.u16(), m_dim, k_dim, tiled.u16());
+    st = raw_h2d_locked(ctx, g_lhs.addr, need_lhs, 0u, tiled.ptr, need_lhs);
+    if (st != OT_OK) return st;
+    lhs_hbm = g_lhs.addr;
+  }
+
+  const size_t q_tile_bytes = is_q4 ? 8192u : 16384u;
+  const size_t q_tiled_total = static_cast<size_t>(plan.tiles_k) * plan.tiles_n * q_tile_bytes;
+  const size_t sc_tile_groups = is_block32 ? plan.tiles_k : 1u;
+  const size_t sc_tiled_total = sc_tile_groups * plan.tiles_n * 1024u;
+  if (!ctx->transport.hbm_alloc.alloc(q_tiled_total, 4096u, &g_q.addr) ||
+      !ctx->transport.hbm_alloc.alloc(sc_tiled_total, 4096u, &g_sc.addr)) {
+    return OT_ERR_NO_MEMORY;
+  }
+
+  {
+    ScopedBuf q_rm(need_q), q_tiled(q_tiled_total);
+    ScopedBuf sc_rm(rhs_scales ? need_scales : 4u), sc_tiled(sc_tiled_total);
+    if (!q_rm.ptr || !q_tiled.ptr || !sc_rm.ptr || !sc_tiled.ptr) return OT_ERR_NO_MEMORY;
+    ot_status_t st = raw_d2h_locked(ctx, rhs_quant->hbm_addr, q_rm.ptr, need_q);
+    if (st != OT_OK) return st;
+    if (rhs_scales && need_scales > 0u) {
+      st = raw_d2h_locked(ctx, rhs_scales->hbm_addr, sc_rm.ptr, need_scales);
+      if (st != OT_OK) return st;
+    }
+
+    const bool rhs_transposed = (desc->tile.rhs_transposed != 0u);
+    std::vector<int8_t> tile_i8(128u * 128u);
+    std::vector<uint16_t> tile_sc(4u * 128u);
+    for (uint32_t kt = 0; kt < plan.tiles_k; ++kt) {
+      for (uint32_t nt = 0; nt < plan.tiles_n; ++nt) {
+        for (uint32_t r = 0; r < 128u; ++r) {
+          for (uint32_t c = 0; c < 128u; ++c) {
+            const size_t gr = kt * 128u + r;
+            const size_t gc = nt * 128u + c;
+            const size_t elem = rhs_transposed ? (gc * k_dim + gr) : (gr * n_dim + gc);
+            if (is_q4) {
+              const uint8_t packed = q_rm.ptr[elem >> 1];
+              const uint32_t nib = (elem & 1u) ? (packed >> 4) : (packed & 0xfu);
+              tile_i8[r * 128u + c] = static_cast<int8_t>(static_cast<int32_t>(nib) - 8);
+            } else {
+              tile_i8[r * 128u + c] = static_cast<int8_t>(q_rm.ptr[elem]);
+            }
+          }
+        }
+        const size_t q_off = (static_cast<size_t>(kt) * plan.tiles_n + nt) * q_tile_bytes;
+        auto* dst_u32 = reinterpret_cast<uint32_t*>(q_tiled.ptr + q_off);
+        if (is_q4) {
+          ot::tile_pack_128x128_q4(tile_i8.data(), dst_u32);
+        } else {
+          ot::tile_pack_128x128_i8(tile_i8.data(), dst_u32);
+        }
+        if (is_block32 || kt == 0u) {
+          for (uint32_t kb = 0; kb < 4u; ++kb) {
+            const size_t sg = kt * 4u + kb;
+            for (uint32_t c = 0; c < 128u; ++c) {
+              tile_sc[kb * 128u + c] = decode_scale_bf16(sc_rm.ptr, sg, nt * 128u + c);
+            }
+          }
+          const size_t sc_off =
+              (static_cast<size_t>(is_block32 ? kt : 0u) * plan.tiles_n + nt) * 1024u;
+          ot::tile_pack_scales_4x128_bf16(
+              tile_sc.data(), reinterpret_cast<uint16_t*>(sc_tiled.ptr + sc_off));
+        }
+      }
+    }
+    st = raw_h2d_locked(ctx, g_q.addr, q_tiled_total, 0u, q_tiled.ptr, q_tiled_total);
+    if (st != OT_OK) return st;
+    st = raw_h2d_locked(ctx, g_sc.addr, sc_tiled_total, 0u, sc_tiled.ptr, sc_tiled_total);
+    if (st != OT_OK) return st;
+  }
+
+  uint64_t hw_us = 0u;
+  ot_status_t st_exec = launch_v5e_chunked_exec(
+      ctx, lhs_hbm, g_q.addr, out_mn->hbm_addr, g_sc.addr, ctx->transport.quant_const_hbm,
+      plan.tiles_m, plan.tiles_k, plan.tiles_n, qmode_word, q_tile_bytes,
+      /*max_iters_per_launch=*/1024u, &hw_us, &err);
+  if (st_exec != OT_OK) return st_exec;
+  const auto t1 = std::chrono::steady_clock::now();
+
+  out_mn->layout = ot::BufferLayout::kTiled2x128Bf16;
+  out_mn->tiled_rows = m_dim;
+  out_mn->tiled_cols = n_dim;
+  if (out_stats) {
+    out_stats->hw_us = hw_us;
+    out_stats->wall_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(t1 - wall_t0).count());
+    out_stats->hbm_bytes_moved = plan.hbm_bytes_moved;
+    out_stats->tiles_m = plan.tiles_m;
+    out_stats->tiles_k = plan.tiles_k;
+    out_stats->tiles_n = plan.tiles_n;
+    out_stats->imem_bundles = static_cast<uint32_t>(ot::emit_v5e_imem_for_freetile(plan).size());
+    out_stats->vmem_bytes_used = plan.vmem.total_vmem_bytes;
+  }
   return OT_OK;
 }
 

@@ -1579,6 +1579,220 @@ static void test_resident_imem_stub_structure() {
   printf("[PASS] test_resident_imem_stub_structure\n");
 }
 
+static void test_freetile_descriptor_and_planner() {
+  const ot_freetile_gemm_desc_t cdesc = ot_freetile_gemm_desc_default(128u, 4096u, 4096u);
+  OT_CHECK(cdesc.struct_size == sizeof(ot_freetile_gemm_desc_t));
+  OT_CHECK(cdesc.tile.block_m == 128u && cdesc.tile.block_k == 128u && cdesc.tile.block_n == 128u);
+  OT_CHECK(cdesc.tile.vmem_double_buffer == 1u && cdesc.tile.k_loop_accum_f32 == 1u);
+
+  const auto fdesc = ot::freetile::TileKernelDescriptor::from_c_desc(cdesc);
+  const ot::freetile::LoweringPlan bf16_plan = ot::freetile::plan_v5e_tile_gemm(fdesc);
+  OT_CHECK(bf16_plan.valid);
+  OT_CHECK(bf16_plan.tiles_m == 1u && bf16_plan.tiles_k == 32u && bf16_plan.tiles_n == 32u);
+  OT_CHECK(bf16_plan.vmem.stages == 2u);
+  OT_CHECK(bf16_plan.vmem.total_vmem_bytes <= 16u * 1024u * 1024u);
+
+  ot_freetile_gemm_desc_t q4 = ot_freetile_gemm_desc_default(128u, 512u, 512u);
+  q4.rhs_dtype = OT_DTYPE_Q4_0;
+  q4.quant_mode = OT_QUANT_BLOCK_32;
+  q4.quant_group_size = OT_QK8_0;
+  const ot::freetile::LoweringPlan q4_plan =
+      ot::freetile::plan_v5e_tile_gemm(ot::freetile::TileKernelDescriptor::from_c_desc(q4));
+  OT_CHECK(q4_plan.valid);
+  OT_CHECK(q4_plan.vmem.rhs_vmem_bytes == 8192u);
+  OT_CHECK(q4_plan.hbm_bytes_moved < bf16_plan.hbm_bytes_moved);
+
+  ot_freetile_gemm_desc_t bad = ot_freetile_gemm_desc_default(128u, 130u, 128u);
+  const ot::freetile::LoweringPlan bad_plan =
+      ot::freetile::plan_v5e_tile_gemm(ot::freetile::TileKernelDescriptor::from_c_desc(bad));
+  OT_CHECK(!bad_plan.valid);
+  printf("[PASS] test_freetile_descriptor_and_planner\n");
+}
+
+static void test_freetile_vliw_emitters_and_packing() {
+  const auto bf16_prog = ot::emit_v5e_resident_freetile_bf16_imem();
+  const auto q8_prog = ot::emit_v5e_resident_freetile_quant_imem(/*is_q4=*/false);
+  const auto q4_prog = ot::emit_v5e_resident_freetile_quant_imem(/*is_q4=*/true);
+
+  for (const auto* prog : {&bf16_prog, &q8_prog, &q4_prog}) {
+    OT_CHECK(!prog->empty());
+    OT_CHECK((prog->size() * sizeof(ot::VliwBundle)) % ot::kImemDmaAlignBytes == 0u);
+    OT_CHECK(prog->size() <= 1024u);  // Strictly fits within 64 KiB resident IMEM window
+    OT_CHECK((*prog)[0].w[2] == 0x3b00060fu);
+    OT_CHECK((*prog)[25].w[2] == 0x3a8ca30fu);
+  }
+
+  ot_freetile_gemm_desc_t cq8 = ot_freetile_gemm_desc_default(128u, 256u, 256u);
+  cq8.rhs_dtype = OT_DTYPE_Q8_0;
+  cq8.quant_mode = OT_QUANT_BLOCK_32;
+  const ot::freetile::LoweringPlan p =
+      ot::freetile::plan_v5e_tile_gemm(ot::freetile::TileKernelDescriptor::from_c_desc(cq8));
+  OT_CHECK(ot::emit_v5e_imem_for_freetile(p).size() == q8_prog.size());
+
+  // Verify T(8,128)(4,1) int8 and q4 packing byte lanes.
+  std::vector<int8_t> i8_rm(128u * 128u, 0);
+  i8_rm[0u * 128u + 3u] = 17;     // r=0  -> chunk=0, sublane=0, byte 0
+  i8_rm[8u * 128u + 3u] = -5;     // r=8  -> chunk=0, sublane=0, byte 1
+  i8_rm[16u * 128u + 3u] = 42;    // r=16 -> chunk=0, sublane=0, byte 2
+  i8_rm[24u * 128u + 3u] = -128;  // r=24 -> chunk=0, sublane=0, byte 3
+  std::vector<uint32_t> i8_tiled(4096u, 0u);
+  ot::tile_pack_128x128_i8(i8_rm.data(), i8_tiled.data());
+  OT_CHECK((i8_tiled[3] & 0xffu) == 17u);
+  OT_CHECK(static_cast<int8_t>((i8_tiled[3] >> 8) & 0xffu) == -5);
+  OT_CHECK(((i8_tiled[3] >> 16) & 0xffu) == 42u);
+  OT_CHECK(static_cast<int8_t>((i8_tiled[3] >> 24) & 0xffu) == -128);
+
+  std::vector<int8_t> q4_rm(128u * 128u, 0);
+  q4_rm[0u * 128u + 5u] = -3;   // chunk4=0, lo_nib -> (-3 + 8) = 5
+  q4_rm[32u * 128u + 5u] = 6;   // chunk4=0, hi_nib -> (6 + 8) = 14
+  std::vector<uint32_t> q4_tiled(2048u, 0u);
+  ot::tile_pack_128x128_q4(q4_rm.data(), q4_tiled.data());
+  OT_CHECK((q4_tiled[5] & 0xfu) == 5u);
+  OT_CHECK(((q4_tiled[5] >> 4) & 0xfu) == 14u);
+
+  const auto ldesc = ot::OtV5eLaunchDesc::build_ex(
+      0x1000ULL, 0x2000ULL, 0x3000ULL, 0ULL, 7u, 2u, 4u, 3u, 1u, 0x4000ULL, 0x5000ULL, 32u);
+  auto read32 = [&](size_t off) {
+    uint32_t v = 0;
+    std::memcpy(&v, ldesc.bytes + off, 4);
+    return v;
+  };
+  OT_CHECK(read32(0x178u) == 2u && read32(0x180u) == 4u && read32(0x184u) == 3u);
+  OT_CHECK(read32(0x188u) == 1u && read32(0x18cu) == (0x4000u >> 9) &&
+           read32(0x194u) == (0x5000u >> 9) && read32(0x198u) == 32u);
+  printf("[PASS] test_freetile_vliw_emitters_and_packing\n");
+}
+
+static uint16_t host_f32_to_bf16(float f) {
+  uint32_t u = 0;
+  std::memcpy(&u, &f, 4);
+  u += 0x7fffu + ((u >> 16) & 1u);
+  return static_cast<uint16_t>(u >> 16);
+}
+
+static float host_bf16_to_f32(uint16_t b) {
+  uint32_t u = static_cast<uint32_t>(b) << 16;
+  float f = 0.0f;
+  std::memcpy(&f, &u, 4);
+  return f;
+}
+
+static void test_mock_multitile_and_quant_matmul() {
+  ot_config_t cfg = ot_config_default();
+  cfg.mock_mode = 1u;
+  ot_context_t* ctx = nullptr;
+  OT_CHECK(ot_context_create(&cfg, &ctx) == OT_OK && ctx != nullptr);
+
+  // 1) Multi-tile 256 x 256 x 256 BF16 GEMM via ot_matmul_bf16_ex
+  const uint32_t M = 256u, K = 256u, N = 256u;
+  std::vector<uint16_t> a_bf16(M * K), b_bf16(K * N), c_got(M * N, 0u);
+  for (size_t i = 0; i < a_bf16.size(); ++i) {
+    a_bf16[i] = host_f32_to_bf16(static_cast<float>(static_cast<int>(i % 13) - 6) * 0.125f);
+  }
+  for (size_t i = 0; i < b_bf16.size(); ++i) {
+    b_bf16[i] = host_f32_to_bf16(static_cast<float>(static_cast<int>(i % 11) - 5) * 0.25f);
+  }
+  ot_buffer_t* ba = nullptr;
+  ot_buffer_t* bb = nullptr;
+  ot_buffer_t* bc = nullptr;
+  OT_CHECK(ot_buffer_alloc(ctx, a_bf16.size() * 2u, &ba) == OT_OK);
+  OT_CHECK(ot_buffer_alloc(ctx, b_bf16.size() * 2u, &bb) == OT_OK);
+  OT_CHECK(ot_buffer_alloc(ctx, c_got.size() * 2u, &bc) == OT_OK);
+  OT_CHECK(ot_buffer_h2d(ctx, ba, a_bf16.data(), a_bf16.size() * 2u) == OT_OK);
+  OT_CHECK(ot_buffer_h2d(ctx, bb, b_bf16.data(), b_bf16.size() * 2u) == OT_OK);
+
+  const ot_freetile_gemm_desc_t bf_desc = ot_freetile_gemm_desc_default(M, K, N);
+  ot_exec_stats_t stats{};
+  OT_CHECK(ot_matmul_bf16_ex(ctx, ba, bb, bc, &bf_desc, &stats) == OT_OK);
+  OT_CHECK(stats.tiles_m == 2u && stats.tiles_k == 2u && stats.tiles_n == 2u);
+  OT_CHECK(ot_buffer_d2h(ctx, bc, c_got.data(), c_got.size() * 2u) == OT_OK);
+
+  for (uint32_t m = 0; m < M; ++m) {
+    for (uint32_t n = 0; n < N; ++n) {
+      float acc = 0.0f;
+      for (uint32_t k = 0; k < K; ++k) {
+        acc += host_bf16_to_f32(a_bf16[m * K + k]) * host_bf16_to_f32(b_bf16[k * N + n]);
+      }
+      OT_CHECK(c_got[m * N + n] == host_f32_to_bf16(acc));
+    }
+  }
+  ot_buffer_free(bc);
+  ot_buffer_free(bb);
+  ot_buffer_free(ba);
+
+  // 2) Quantized 128 x 256 x 256 Q8_0 (block-32) & Q4_0 (block-32) & INT8_PER_CHANNEL
+  const uint32_t QM = 128u, QK = 256u, QN = 256u;
+  std::vector<uint16_t> qa(QM * QK);
+  for (size_t i = 0; i < qa.size(); ++i) {
+    qa[i] = host_f32_to_bf16(static_cast<float>(static_cast<int>(i % 9) - 4) * 0.125f);
+  }
+  std::vector<int8_t> w_i8(QK * QN);
+  std::vector<uint8_t> w_q4(QK * QN / 2u, 0u);
+  std::vector<float> sc_blk((QK / 32u) * QN);
+  for (size_t i = 0; i < sc_blk.size(); ++i) {
+    sc_blk[i] = 0.0625f * static_cast<float>((i % 7u) + 1u);
+  }
+  for (uint32_t k = 0; k < QK; ++k) {
+    for (uint32_t n = 0; n < QN; ++n) {
+      const int8_t v = static_cast<int8_t>(static_cast<int>((k * 13u + n * 7u) % 15u) - 7);
+      w_i8[k * QN + n] = v;
+      const size_t lin = static_cast<size_t>(k) * QN + n;
+      const uint32_t nib = static_cast<uint32_t>(v + 8) & 0xfu;
+      w_q4[lin >> 1] |= static_cast<uint8_t>((lin & 1u) ? (nib << 4) : nib);
+    }
+  }
+
+  ot_buffer_t *bqa = nullptr, *bqi8 = nullptr, *bqq4 = nullptr, *bqsc = nullptr, *bqout = nullptr;
+  OT_CHECK(ot_buffer_alloc(ctx, qa.size() * 2u, &bqa) == OT_OK);
+  OT_CHECK(ot_buffer_alloc(ctx, w_i8.size(), &bqi8) == OT_OK);
+  OT_CHECK(ot_buffer_alloc(ctx, w_q4.size(), &bqq4) == OT_OK);
+  OT_CHECK(ot_buffer_alloc(ctx, sc_blk.size() * sizeof(float), &bqsc) == OT_OK);
+  OT_CHECK(ot_buffer_alloc(ctx, QM * QN * 2u, &bqout) == OT_OK);
+  OT_CHECK(ot_buffer_h2d(ctx, bqa, qa.data(), qa.size() * 2u) == OT_OK);
+  OT_CHECK(ot_buffer_h2d(ctx, bqi8, w_i8.data(), w_i8.size()) == OT_OK);
+  OT_CHECK(ot_buffer_h2d(ctx, bqq4, w_q4.data(), w_q4.size()) == OT_OK);
+  OT_CHECK(ot_buffer_h2d(ctx, bqsc, sc_blk.data(), sc_blk.size() * sizeof(float)) == OT_OK);
+
+  ot_freetile_gemm_desc_t q8d = ot_freetile_gemm_desc_default(QM, QK, QN);
+  q8d.rhs_dtype = OT_DTYPE_Q8_0;
+  q8d.quant_mode = OT_QUANT_BLOCK_32;
+  q8d.quant_group_size = OT_QK8_0;
+  OT_CHECK(ot_matmul_quant(ctx, bqa, bqi8, bqsc, bqout, &q8d, &stats) == OT_OK);
+  std::vector<uint16_t> out_q8(QM * QN, 0u);
+  OT_CHECK(ot_buffer_d2h(ctx, bqout, out_q8.data(), out_q8.size() * 2u) == OT_OK);
+
+  ot_freetile_gemm_desc_t q4d = ot_freetile_gemm_desc_default(QM, QK, QN);
+  q4d.rhs_dtype = OT_DTYPE_Q4_0;
+  q4d.quant_mode = OT_QUANT_BLOCK_32;
+  q4d.quant_group_size = OT_QK8_0;
+  OT_CHECK(ot_matmul_quant(ctx, bqa, bqq4, bqsc, bqout, &q4d, &stats) == OT_OK);
+  std::vector<uint16_t> out_q4(QM * QN, 0u);
+  OT_CHECK(ot_buffer_d2h(ctx, bqout, out_q4.data(), out_q4.size() * 2u) == OT_OK);
+
+  // Q4 values stay within [-7, 7], matching w_i8 above cleanly!
+  for (uint32_t m = 0; m < QM; ++m) {
+    for (uint32_t n = 0; n < QN; ++n) {
+      float acc = 0.0f;
+      for (uint32_t k = 0; k < QK; ++k) {
+        const float sc = host_bf16_to_f32(host_f32_to_bf16(sc_blk[(k / 32u) * QN + n]));
+        const float wf = host_bf16_to_f32(host_f32_to_bf16(static_cast<float>(w_i8[k * QN + n]) * sc));
+        acc += host_bf16_to_f32(qa[m * QK + k]) * wf;
+      }
+      const uint16_t ref = host_f32_to_bf16(acc);
+      OT_CHECK(out_q8[m * QN + n] == ref);
+      OT_CHECK(out_q4[m * QN + n] == ref);
+    }
+  }
+
+  ot_buffer_free(bqout);
+  ot_buffer_free(bqsc);
+  ot_buffer_free(bqq4);
+  ot_buffer_free(bqi8);
+  ot_buffer_free(bqa);
+  ot_context_destroy(ctx);
+  printf("[PASS] test_mock_multitile_and_quant_matmul\n");
+}
+
 int main() {
   test_iova_allocator();
   test_bar4_descriptor_parser();
@@ -1590,6 +1804,9 @@ int main() {
   test_pjrt_api_mock();
   test_vliw_and_tiling();
   test_resident_imem_stub_structure();
+  test_freetile_descriptor_and_planner();
+  test_freetile_vliw_emitters_and_packing();
+  test_mock_multitile_and_quant_matmul();
   printf("ALL_HOST_TESTS_PASSED\n");
   return 0;
 }

@@ -121,8 +121,10 @@ struct VfioTransport {
 
   // IMEM boot/poller & kernel runtime state (initialized lazily on first live matmul).
   bool imem_booted = false;
+  uint32_t loaded_prog_kind = 0;  // 0=none, 1=bf16, 2=q8, 3=q4
   uint64_t scratch_lhs_hbm = 0;
   uint64_t scratch_rhs_hbm = 0;
+  uint64_t quant_const_hbm = 0;   // 40 KiB Sel + -2304.0f + -136.0f constants
   uint32_t exec_seq = 0;
 
   IovaAllocator iova_alloc;
@@ -153,6 +155,8 @@ struct VfioTransport {
   bool submit_exec_sync(uint32_t expected_exec_seq, uint32_t timeout_ms,
                         uint32_t cq_out[8], std::string* err);
   bool ensure_imem_booted(uint32_t timeout_ms, std::string* err);
+  bool ensure_imem_program(uint32_t prog_kind, uint32_t timeout_ms, std::string* err);
+  bool ensure_quant_constants(uint32_t timeout_ms, std::string* err);
   bool ensure_matmul_scratch_slot(uint64_t* slot, std::string* err);
   bool ensure_matmul_scratch(std::string* err);
   void teardown_imem_state();
@@ -191,6 +195,8 @@ struct ot_buffer {
   bool is_mock = false;
   int64_t owner_pid = 0;
   ot::BufferLayout layout = ot::BufferLayout::kRaw;
+  uint32_t tiled_rows = 0;
+  uint32_t tiled_cols = 0;
 };
 
 struct ot_context {
