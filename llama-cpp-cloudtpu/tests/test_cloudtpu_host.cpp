@@ -12,6 +12,7 @@
 #endif
 #endif
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
