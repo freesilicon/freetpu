@@ -1522,14 +1522,20 @@ def _sse_event_should_commit(
     max_nodes: int = DEFAULT_MAX_RESPONSE_JSON_NODES,
     echo_chat_chars: int = 0,
     echo_chars_by_choice: Optional[Dict[int, int]] = None,
+    generated_out: Optional[List[bool]] = None,
 ) -> bool:
     """Return True when a complete non-error SSE data event carries output or a terminator.
 
     Role-only, empty-delta, prompt-progress, and echoed chat-prefix chunks are
     buffered so Spot preemption before the first generated token still fails over.
-    Raises `_MalformedSSEPayloadError` on invalid UTF-8, invalid JSON, or
-    non-object JSON so pre-commit protocol corruption remains eligible for failover.
+    When `generated_out` is provided, sets `generated_out[0] = True` iff this
+    event carries actual generated output (not echoed chat input or a
+    finish-only / usage-only / `[DONE]` terminator). Raises
+    `_MalformedSSEPayloadError` on invalid UTF-8, invalid JSON, or non-object
+    JSON so pre-commit protocol corruption remains eligible for failover.
     """
+    if generated_out is not None:
+        generated_out[0] = False
     if not payload_bytes:
         return False
     if payload_bytes == b"[DONE]":
@@ -1551,20 +1557,27 @@ def _sse_event_should_commit(
     if obj.get("error") is not None or obj.get("object") == "error":
         return False
     if _has_choice_audio_output(obj) or _has_choice_token_metadata_output(obj):
+        if generated_out is not None:
+            generated_out[0] = True
         return True
     if echo_chat_chars <= 0:
         if _extract_choice_output_text(obj):
+            if generated_out is not None:
+                generated_out[0] = True
             return True
     choices = obj.get("choices")
     if isinstance(choices, list):
+        saw_finish = False
         for pos, choice in enumerate(choices):
             if not isinstance(choice, Mapping):
                 continue
             if choice.get("finish_reason") is not None:
-                return True
+                saw_finish = True
             if echo_chat_chars > 0:
                 has_non_echo, content_chars = _choice_non_echo_chat_output(choice)
                 if has_non_echo:
+                    if generated_out is not None:
+                        generated_out[0] = True
                     return True
                 if content_chars > 0:
                     c_idx = choice.get("index")
@@ -1577,17 +1590,25 @@ def _sse_event_should_commit(
                     )
                     if echo_chars_by_choice is None:
                         if content_chars > echo_chat_chars:
+                            if generated_out is not None:
+                                generated_out[0] = True
                             return True
                     else:
                         if (
                             resolved_idx not in echo_chars_by_choice
                             and len(echo_chars_by_choice) >= _MAX_TRACKED_STREAM_CHOICES
                         ):
+                            if generated_out is not None:
+                                generated_out[0] = True
                             return True
                         new_total = echo_chars_by_choice.get(resolved_idx, 0) + content_chars
                         echo_chars_by_choice[resolved_idx] = new_total
                         if new_total > echo_chat_chars:
+                            if generated_out is not None:
+                                generated_out[0] = True
                             return True
+        if saw_finish:
+            return True
         if not choices and isinstance(obj.get("usage"), Mapping):
             return True
         return False
@@ -5178,7 +5199,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         pre_commit_buf = bytearray()
         pre_commit_bytes = 0
         max_pre_commit_bytes = engine.config.max_sse_pre_commit_bytes
-        first_chunk_time: Optional[float] = None
+        first_token_time: Optional[float] = None
         pending_event_start = 0
         pending_event_has_data = False
         pending_event_type = ""
@@ -5374,12 +5395,14 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                         code="upstream_stream_error",
                                     ),
                                 )
+                            pre_commit_generated = [False]
                             try:
                                 should_commit = _sse_event_should_commit(
                                     payload_bytes,
                                     parsed_obj=parsed_pre,
                                     echo_chat_chars=echo_chat_chars,
                                     echo_chars_by_choice=pre_commit_echo_chars_by_choice,
+                                    generated_out=pre_commit_generated,
                                 )
                             except _MalformedSSEPayloadError:
                                 return (
@@ -5396,7 +5419,8 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                             if pre_parse_extra > 0:
                                 engine.release_response_memory(pre_parse_extra)
                         if should_commit:
-                            first_chunk_time = time.monotonic()
+                            if pre_commit_generated[0] and first_token_time is None:
+                                first_token_time = time.monotonic()
                             break
                     else:
                         pending_event_type = ""
@@ -5412,10 +5436,12 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
 
             # Phase 2: upstream delivered output or valid terminator -> commit chunked response.
             # Downstream write errors from here on must never trigger backend failover.
-            ttft_ms: Optional[float] = (
-                (first_chunk_time - req_start) * 1000.0 if first_chunk_time else None
+            first_token_ttft_ms: Optional[float] = (
+                (first_token_time - req_start) * 1000.0
+                if first_token_time is not None
+                else None
             )
-            first_content_ttft_ms: Optional[float] = None
+            replaying_pre_commit = False
             prompt_tokens = est_prompt_tokens
             completion_tokens = 0
             est_completion_chars = 0
@@ -5496,7 +5522,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
 
                 Returns `(made_progress, saw_done)`.
                 """
-                nonlocal first_content_ttft_ms, prompt_tokens, completion_tokens
+                nonlocal first_token_ttft_ms, prompt_tokens, completion_tokens
                 nonlocal est_completion_chars, streamed_choice_token_ids_count
                 nonlocal saw_explicit_prompt_usage
                 nonlocal saw_explicit_completion_usage, saw_interim_usage
@@ -5586,8 +5612,6 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                             streamed_choice_token_ids_count += ev_token_ids_count
                         if output_txt or has_audio_out or has_token_meta_out:
                             made_progress = True
-                            if first_content_ttft_ms is None:
-                                first_content_ttft_ms = (time.monotonic() - req_start) * 1000.0
                             if output_txt:
                                 est_completion_chars += len(output_txt)
                                 if echo_prompt_chars or echo_prompt_tokens:
@@ -5615,6 +5639,42 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                                 est_chat_content_chars_by_choice.get(c_idx, 0)
                                                 + c_len
                                             )
+                            if first_token_ttft_ms is None and not replaying_pre_commit:
+                                has_generated_out = has_audio_out or has_token_meta_out
+                                if not has_generated_out and output_txt:
+                                    if echo_chat_chars <= 0:
+                                        has_generated_out = True
+                                    elif isinstance(choices, list):
+                                        for pos, choice in enumerate(choices):
+                                            if not isinstance(choice, dict):
+                                                continue
+                                            has_non_echo, content_chars = (
+                                                _choice_non_echo_chat_output(choice)
+                                            )
+                                            if has_non_echo:
+                                                has_generated_out = True
+                                                break
+                                            if content_chars > 0:
+                                                c_idx = choice.get("index")
+                                                resolved_idx = (
+                                                    c_idx
+                                                    if isinstance(c_idx, int)
+                                                    and not isinstance(c_idx, bool)
+                                                    and c_idx >= 0
+                                                    else pos
+                                                )
+                                                if (
+                                                    est_chat_content_chars_by_choice.get(
+                                                        resolved_idx, 0
+                                                    )
+                                                    > echo_chat_chars
+                                                ):
+                                                    has_generated_out = True
+                                                    break
+                                if has_generated_out:
+                                    first_token_ttft_ms = (
+                                        time.monotonic() - req_start
+                                    ) * 1000.0
                         usage = obj.get("usage")
                         if isinstance(usage, dict):
                             pt = _safe_nonneg_int(usage.get("prompt_tokens"))
@@ -5890,34 +5950,38 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 self.send_header("X-FreeTPU-Request-Id", req_id)
                 self.end_headers()
 
-                scan = 0
-                pre_len = len(pre_commit_buf)
-                while scan < pre_len:
-                    nl = pre_commit_buf.find(b"\n", scan, pre_len)
-                    cr = pre_commit_buf.find(b"\r", scan, pre_len)
-                    if nl == -1 and cr == -1:
-                        ln_end = pre_len
-                    elif cr != -1 and (nl == -1 or cr < nl):
-                        ln_end = (
-                            cr + 2
-                            if (cr + 1 < pre_len and pre_commit_buf[cr + 1] == 10)
-                            else cr + 1
-                        )
-                    else:
-                        ln_end = nl + 1
-                    try:
-                        inspect_sse_line(bytes(pre_commit_buf[scan:ln_end]))
-                    except _MemoryBudgetExceededError:
-                        event_data_lines.clear()
-                        memory_limit_exceeded = True
-                        break
-                    except _JsonStructureLimitError:
-                        event_data_lines.clear()
-                        size_limit_exceeded = True
-                        break
-                    if upstream_read_error:
-                        break
-                    scan = ln_end
+                replaying_pre_commit = True
+                try:
+                    scan = 0
+                    pre_len = len(pre_commit_buf)
+                    while scan < pre_len:
+                        nl = pre_commit_buf.find(b"\n", scan, pre_len)
+                        cr = pre_commit_buf.find(b"\r", scan, pre_len)
+                        if nl == -1 and cr == -1:
+                            ln_end = pre_len
+                        elif cr != -1 and (nl == -1 or cr < nl):
+                            ln_end = (
+                                cr + 2
+                                if (cr + 1 < pre_len and pre_commit_buf[cr + 1] == 10)
+                                else cr + 1
+                            )
+                        else:
+                            ln_end = nl + 1
+                        try:
+                            inspect_sse_line(bytes(pre_commit_buf[scan:ln_end]))
+                        except _MemoryBudgetExceededError:
+                            event_data_lines.clear()
+                            memory_limit_exceeded = True
+                            break
+                        except _JsonStructureLimitError:
+                            event_data_lines.clear()
+                            size_limit_exceeded = True
+                            break
+                        if upstream_read_error:
+                            break
+                        scan = ln_end
+                finally:
+                    replaying_pre_commit = False
                 if (
                     not memory_limit_exceeded
                     and not size_limit_exceeded
@@ -6257,9 +6321,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         completion_tokens = max(1, (est_completion_chars + 3) // 4)
             total_ms = (time.monotonic() - req_start) * 1000.0
             attempt_ms = (time.monotonic() - attempt_start) * 1000.0
-            effective_ttft = (
-                first_content_ttft_ms if first_content_ttft_ms is not None else ttft_ms
-            )
+            effective_ttft = first_token_ttft_ms
             if downstream_write_error:
                 # Downstream client disconnected or stalled on writes: record a distinct
                 # client-closed status (499) in Prometheus and UsageMeterHook while

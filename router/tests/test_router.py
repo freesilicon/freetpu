@@ -14501,6 +14501,194 @@ asyncio.run(main())
         self.assertTrue(ready_f)
         self.assertIsNone(reason_f)
 
+    def test_streaming_ttft_measures_first_generated_output_arrival_and_skips_echo_and_finish_only(
+        self,
+    ) -> None:
+        recorded_usage: List[UsageEvent] = []
+
+        class _RecordHook:
+            def record_usage(self, event: UsageEvent) -> None:
+                recorded_usage.append(event)
+
+        mode = ["finish_only"]
+
+        class _TTFTStreamHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                pass
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = b'{"object":"list","data":[{"id":"m-ttft"}]}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802
+                cl = int(self.headers.get("Content-Length", "0"))
+                if cl > 0:
+                    self.rfile.read(cl)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                if mode[0] == "finish_only":
+                    self.wfile.write(
+                        b'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}\n\n'
+                        b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+                        b"data: [DONE]\n\n"
+                    )
+                    self.wfile.flush()
+                elif mode[0] == "echo_only":
+                    self.wfile.write(
+                        b'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}\n\n'
+                        b'data: {"choices":[{"index":0,"delta":{"content":"Prefix"}}]}\n\n'
+                        b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}\n\n'
+                        b"data: [DONE]\n\n"
+                    )
+                    self.wfile.flush()
+                elif mode[0] == "echo_then_delayed_gen":
+                    self.wfile.write(
+                        b'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}\n\n'
+                        b'data: {"choices":[{"index":0,"delta":{"content":"Prefix"}}]}\n\n'
+                    )
+                    self.wfile.flush()
+                    time.sleep(0.15)
+                    self.wfile.write(
+                        b'data: {"choices":[{"index":0,"delta":{"content":" generated"},"finish_reason":"stop"}]}\n\n'
+                        b"data: [DONE]\n\n"
+                    )
+                    self.wfile.flush()
+                else:  # prompt_progress_then_gen
+                    for i in range(5):
+                        self.wfile.write(
+                            f'data: {{"prompt_progress":{{"processed":{i + 1},"total":5}}}}\n\n'.encode(
+                                "utf-8"
+                            )
+                        )
+                    self.wfile.write(
+                        b'data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}\n\n'
+                        b"data: [DONE]\n\n"
+                    )
+                    self.wfile.flush()
+                self.close_connection = True
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), _TTFTStreamHandler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            cfg = RouterConfig(
+                host="127.0.0.1",
+                port=0,
+                backends=[
+                    BackendConfig(
+                        id="ttft-backend",
+                        base_url=f"http://127.0.0.1:{srv.server_address[1]}",
+                        models=["m-ttft"],
+                    )
+                ],
+            )
+            router = self._track(create_router_server(cfg, usage_hook=_RecordHook()))
+            rport = router.server_address[1]
+
+            # 1. Finish-only stream produces no generated token -> ttft_ms must be None and
+            #    no TTFT histogram sample is recorded.
+            st1, _, _ = _http_request(
+                rport,
+                "POST",
+                "/v1/chat/completions",
+                body={
+                    "model": "m-ttft",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "empty"}],
+                },
+            )
+            self.assertEqual(st1, 200)
+            self.assertEqual(len(recorded_usage), 1)
+            self.assertIsNone(recorded_usage[0].ttft_ms)
+
+            # 2. Echo-only stream (echo=true, finish_reason=length without generated output)
+            #    must also leave ttft_ms as None.
+            mode[0] = "echo_only"
+            st2, _, _ = _http_request(
+                rport,
+                "POST",
+                "/v1/chat/completions",
+                body={
+                    "model": "m-ttft",
+                    "stream": True,
+                    "echo": True,
+                    "messages": [
+                        {"role": "user", "content": "continue"},
+                        {"role": "assistant", "content": "Prefix"},
+                    ],
+                },
+            )
+            self.assertEqual(st2, 200)
+            self.assertEqual(len(recorded_usage), 2)
+            self.assertIsNone(recorded_usage[1].ttft_ms)
+            self.assertNotIn("freetpu_router_ttft_ms_count", router.engine.metrics_text())
+
+            # 3. Echoed prefix followed 150ms later by generated token: TTFT waits for the
+            #    generated token (>= 120ms), NOT the immediate echoed prefix.
+            mode[0] = "echo_then_delayed_gen"
+            st3, _, _ = _http_request(
+                rport,
+                "POST",
+                "/v1/chat/completions",
+                body={
+                    "model": "m-ttft",
+                    "stream": True,
+                    "echo": True,
+                    "messages": [
+                        {"role": "user", "content": "continue"},
+                        {"role": "assistant", "content": "Prefix"},
+                    ],
+                },
+            )
+            self.assertEqual(st3, 200)
+            self.assertEqual(len(recorded_usage), 3)
+            self.assertIsNotNone(recorded_usage[2].ttft_ms)
+            assert recorded_usage[2].ttft_ms is not None
+            self.assertGreaterEqual(recorded_usage[2].ttft_ms, 120.0)
+
+            # 4. Phase 1 arrival timestamp is preserved even if header emission / replay is slow.
+            mode[0] = "prompt_progress_then_gen"
+            import router.freetpu_router as router_mod
+
+            orig_end_headers = router_mod._RouterRequestHandler.end_headers
+
+            def _slow_end_headers(handler_self: Any) -> None:
+                if getattr(handler_self, "path", "") == "/v1/chat/completions":
+                    time.sleep(0.15)
+                orig_end_headers(handler_self)
+
+            with mock.patch.object(
+                router_mod._RouterRequestHandler, "end_headers", _slow_end_headers
+            ):
+                st4, _, _ = _http_request(
+                    rport,
+                    "POST",
+                    "/v1/chat/completions",
+                    body={
+                        "model": "m-ttft",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "fast"}],
+                    },
+                )
+            self.assertEqual(st4, 200)
+            self.assertEqual(len(recorded_usage), 4)
+            ev4 = recorded_usage[3]
+            self.assertIsNotNone(ev4.ttft_ms)
+            assert ev4.ttft_ms is not None
+            self.assertGreaterEqual(ev4.latency_ms, 140.0)
+            # TTFT was captured at Phase 1 arrival BEFORE the 150ms header/replay stall.
+            self.assertLess(ev4.ttft_ms, ev4.latency_ms - 100.0)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
 
 def run_self_tests(verbosity: int = 1) -> int:
     """Run all router tests cleanly via unittest."""
