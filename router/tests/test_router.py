@@ -15,6 +15,7 @@ import resource
 import select
 import socket
 import ssl
+import struct
 import subprocess
 import sys
 import tempfile
@@ -68,6 +69,30 @@ from router.tpu_telemetry import (  # noqa: E402
     summarize_tpu_samples,
     wait_sockets_readable,
 )
+
+
+def _abort_tcp_socket(sock: socket.socket) -> None:
+    """Abort a TCP connection immediately with RST (distinguishing abort from SHUT_WR FIN)."""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    except OSError:
+        pass
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+def _tcp_socketpair() -> Tuple[socket.socket, socket.socket]:
+    """Return a connected loopback TCP `(server_side, client_side)` socket pair."""
+    srv = socket.create_server(("127.0.0.1", 0))
+    try:
+        port = srv.getsockname()[1]
+        cli = socket.create_connection(("127.0.0.1", port), timeout=2.0)
+        acc, _ = srv.accept()
+        return acc, cli
+    finally:
+        srv.close()
 
 
 class _MockOpenAIBackend(ThreadingHTTPServer):
@@ -5325,7 +5350,7 @@ class TestFreeTPURouter(unittest.TestCase):
                 time.sleep(0.01)
             self.assertEqual(len(primary.requests_seen), 1)
         finally:
-            sock.close()
+            _abort_tcp_socket(sock)
 
         # Wait past primary's 0.25s timeout so the retry check runs.
         time.sleep(0.45)
@@ -6122,7 +6147,7 @@ class TestFreeTPURouter(unittest.TestCase):
                 self.assertTrue(upstream_started.wait(timeout=2.0))
             finally:
                 t_close = time.monotonic()
-                sock.close()
+                _abort_tcp_socket(sock)
 
             # Active upstream connection must be closed promptly well before the 5.0s timeout.
             self.assertTrue(upstream_closed.wait(timeout=1.5))
@@ -7252,6 +7277,9 @@ asyncio.run(main())
             """--additional-config '{"enable_continue_decode": true}'""",
             playbook,
         )
+        self.assertIn("symmetric per-tensor or per-channel", playbook.lower())
+        self.assertIn("dynamic per-token", playbook.lower())
+        self.assertIn("per-group", playbook.lower())
 
     def test_deadline_socket_waits_support_high_fds_without_select_select(self) -> None:
         def _forbid_select(*args: Any, **kwargs: Any) -> Any:
@@ -7276,15 +7304,15 @@ asyncio.run(main())
             up_r.close()
             up_w.close()
 
-        # 2. Client-watch wait path works for both normal reads and client disconnect.
+        # 2. Client-watch wait path works for abrupt client disconnect (TCP RST).
         up_r2, up_w2 = socket.socketpair()
-        cli_r2, cli_w2 = socket.socketpair()
+        cli_r2, cli_w2 = _tcp_socketpair()
         try:
-            def _close_client() -> None:
+            def _abort_client() -> None:
                 time.sleep(0.05)
-                cli_w2.close()
+                _abort_tcp_socket(cli_w2)
 
-            threading.Thread(target=_close_client, daemon=True).start()
+            threading.Thread(target=_abort_client, daemon=True).start()
             with mock.patch.object(select, "select", side_effect=_forbid_select):
                 ds2 = DeadlineSocket(
                     up_r2,
@@ -7760,8 +7788,8 @@ asyncio.run(main())
                     seen += p
                 self.assertIn(b"Hello partial stream", seen)
             finally:
-                # Client disconnects mid-stream after receiving the first token.
-                cli.close()
+                # Client abruptly aborts mid-stream after receiving the first token.
+                _abort_tcp_socket(cli)
 
             deadline = time.monotonic() + 2.0
             while not recorded and time.monotonic() < deadline:
@@ -7822,7 +7850,7 @@ asyncio.run(main())
         for want_exc in (ssl.SSLWantReadError(), ssl.SSLWantWriteError()):
             with self.subTest(want_exc=type(want_exc).__name__):
                 up_r, up_w = socket.socketpair()
-                cli_r, cli_w = socket.socketpair()
+                cli_r, cli_w = _tcp_socketpair()
                 try:
                     class _FakeTLSSocket:
                         """Simulates a nonblocking SSLSocket receiving a partial TLS record."""
@@ -7876,7 +7904,7 @@ asyncio.run(main())
 
                     def _disconnect_client() -> None:
                         time.sleep(0.06)
-                        cli_w.close()
+                        _abort_tcp_socket(cli_w)
 
                     threading.Thread(target=_disconnect_client, daemon=True).start()
                     t0 = time.monotonic()
@@ -8313,6 +8341,163 @@ asyncio.run(main())
         self.assertEqual(st_resp_bad, 502)
         self.assertIn(b"response_too_large", bd_resp_bad)
         self.assertEqual(router2.engine._resp_mem_used_bytes, 0)
+
+    def test_url_parse_errors_redact_unicode_authority_credentials(self) -> None:
+        # Unicode NFKC-unsafe character in authority makes CPython urlsplit() raise ValueError
+        # whose own message quotes the raw authority; validate_http_url and scrape_tpu_exporter
+        # must suppress that raw message and exception chain so credentials never leak.
+        secret_urls = (
+            "http://user:topsecret@bad\u2100host/v1",
+            "http://user:topsecret@[::1:8000/v1",
+        )
+        for bad_url in secret_urls:
+            with self.subTest(bad_url=bad_url):
+                with self.assertRaises(ValueError) as ctx:
+                    validate_http_url(bad_url, field_name="backend base_url", allow_query=False)
+                self.assertNotIn("topsecret", str(ctx.exception))
+                self.assertIsNone(ctx.exception.__cause__)
+                self.assertTrue(ctx.exception.__suppress_context__)
+
+                telem = scrape_tpu_exporter(bad_url, timeout_s=0.5)
+                self.assertFalse(telem.reachable)
+                self.assertNotIn("topsecret", telem.error or "")
+
+    def test_ipv6_loopback_listener_binds_and_serves_requests(self) -> None:
+        if not socket.has_ipv6:
+            self.skipTest("IPv6 not supported in this Python build")
+        probe = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        try:
+            probe.bind(("::1", 0))
+        except OSError:
+            self.skipTest("IPv6 loopback ::1 unavailable on this host")
+        finally:
+            probe.close()
+
+        backend = self._track(_MockOpenAIBackend("ipv6-b", ["m-v6"]))
+        cfg = RouterConfig(
+            host="::1",
+            port=0,
+            backends=[
+                BackendConfig(
+                    id="ipv6-b",
+                    base_url=backend.base_url,
+                    models=["m-v6"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        self.assertEqual(router.address_family, socket.AF_INET6)
+        rport = router.server_address[1]
+        conn = http.client.HTTPConnection("::1", rport, timeout=3.0)
+        try:
+            conn.request("GET", "/health")
+            resp = conn.getresponse()
+            body = json.loads(resp.read().decode("utf-8"))
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(body["status"], "ok")
+        finally:
+            conn.close()
+
+    def test_backend_id_validates_safe_ascii_header_characters(self) -> None:
+        for bad_id in ("bad\u2603id", "bad id", "bad\r\nid", "bad\tid", " leading"):
+            with self.subTest(bad_id=bad_id):
+                with self.assertRaises(ValueError):
+                    BackendConfig(id=bad_id, base_url="http://127.0.0.1:8000/v1")
+
+    def test_half_closed_client_shutdown_wr_receives_full_non_stream_and_sse_responses(
+        self,
+    ) -> None:
+        primary = self._track(
+            _MockOpenAIBackend("halfclose-primary", ["m-hc"], status_code=200)
+        )
+        backup = self._track(
+            _MockOpenAIBackend("halfclose-backup", ["m-hc"], latency_s=0.08)
+        )
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            backends=[
+                BackendConfig(
+                    id="halfclose-primary",
+                    local=True,
+                    base_url=primary.base_url,
+                    models=["m-hc"],
+                ),
+                BackendConfig(
+                    id="halfclose-backup",
+                    local=False,
+                    base_url=backup.base_url,
+                    models=["m-hc"],
+                ),
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+        primary.status_code = 503
+
+        # 1. Non-streaming POST with immediate shutdown(SHUT_WR) must still fail over
+        # from 503 primary and receive the complete 200 JSON response from backup.
+        req_body = json.dumps(
+            {"model": "m-hc", "messages": [{"role": "user", "content": "half close"}]}
+        ).encode("utf-8")
+        sock = socket.create_connection(("127.0.0.1", rport), timeout=3.0)
+        try:
+            sock.sendall(
+                (
+                    f"POST /v1/chat/completions HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1:{rport}\r\n"
+                    f"Content-Type: application/json\r\n"
+                    f"Content-Length: {len(req_body)}\r\n"
+                    f"Connection: close\r\n\r\n"
+                ).encode("ascii")
+                + req_body
+            )
+            sock.shutdown(socket.SHUT_WR)
+            chunks: List[bytes] = []
+            while True:
+                part = sock.recv(4096)
+                if not part:
+                    break
+                chunks.append(part)
+            raw_resp = b"".join(chunks)
+        finally:
+            sock.close()
+        self.assertIn(b"200 OK", raw_resp)
+        self.assertIn(b"halfclose-backup", raw_resp)
+
+        # 2. Streaming SSE POST with immediate shutdown(SHUT_WR) must receive all chunks + [DONE].
+        sse_body = json.dumps(
+            {
+                "model": "m-hc",
+                "stream": True,
+                "messages": [{"role": "user", "content": "half close sse"}],
+            }
+        ).encode("utf-8")
+        sock2 = socket.create_connection(("127.0.0.1", rport), timeout=3.0)
+        try:
+            sock2.sendall(
+                (
+                    f"POST /v1/chat/completions HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1:{rport}\r\n"
+                    f"Content-Type: application/json\r\n"
+                    f"Content-Length: {len(sse_body)}\r\n"
+                    f"Connection: close\r\n\r\n"
+                ).encode("ascii")
+                + sse_body
+            )
+            sock2.shutdown(socket.SHUT_WR)
+            chunks2: List[bytes] = []
+            while True:
+                part = sock2.recv(4096)
+                if not part:
+                    break
+                chunks2.append(part)
+            raw_sse = b"".join(chunks2)
+        finally:
+            sock2.close()
+        self.assertIn(b"200 OK", raw_sse)
+        self.assertIn(b"data: [DONE]", raw_sse)
 
 
 def run_self_tests(verbosity: int = 1) -> int:

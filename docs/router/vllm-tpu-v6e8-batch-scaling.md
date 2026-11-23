@@ -108,11 +108,12 @@ docker run -d --name vllm-llama70b-highbatch "${CONTAINER_FLAGS[@]}" \
 
 ### Preset C: Dense Native TPU Dynamic `W8A8` INT8 (`compressed-tensors`)
 
-Trillium `v6e` delivers `1,836 TOPS/chip` (`14,688 TOPS` across 8 chips) on native `int8` MXUs while halving weight HBM reads vs BF16 (`33 GB` on 32B, `71 GB` on 70B). The TPU `compressed-tensors` INT8 linear loader supports dense models quantized with **dynamic 8-bit activations (`W8A8`)** — weight-only `W8A16` checkpoints and fused-expert MoE INT8 W8A8 checkpoints are not supported by that loader.
+Trillium `v6e` delivers `1,836 TOPS/chip` (`14,688 TOPS` across 8 chips) on native `int8` MXUs while halving weight HBM reads vs BF16 (`33 GB` on 32B, `71 GB` on 70B). The pinned `vllm/vllm-tpu:v0.33.0` TPU `compressed-tensors` linear loader supports dense models using **symmetric per-tensor or per-channel INT8 weights** with **dynamic per-token INT8 activations (`W8A8`)** — per-group weight quantization, weight-only `W8A16`, and fused-expert MoE INT8 `W8A8` checkpoints are not supported by that loader.
 
 ```bash
-# Set MODEL_W8A8 to a Hugging Face compressed-tensors dense dynamic W8A8 INT8 repo ID
-# (for a local host directory, add -v /path/to/checkpoint:/models/dense-w8a8:ro
+# Set MODEL_W8A8 to a Hugging Face compressed-tensors dense W8A8 INT8 repo ID
+# (symmetric per-tensor or per-channel INT8 weights + dynamic per-token INT8 activations;
+# for a local host directory, add -v /path/to/checkpoint:/models/dense-w8a8:ro
 # and pass --model /models/dense-w8a8).
 docker run -d --name vllm-int8-highbatch "${CONTAINER_FLAGS[@]}" \
   vllm/vllm-tpu:v0.33.0 \

@@ -186,10 +186,10 @@ def validate_http_url(
     cleaned = url.strip()
     try:
         parts = urlsplit(cleaned)
-    except ValueError as exc:
+    except ValueError:
         raise ValueError(
-            f"Invalid {field_name} {sanitize_url(cleaned)!r}: {exc}"
-        ) from exc
+            f"Invalid {field_name} {sanitize_url(cleaned)!r}: malformed URL"
+        ) from None
     scheme = parts.scheme.lower()
     if scheme not in VALID_URL_SCHEMES:
         raise ValueError(
@@ -210,10 +210,10 @@ def validate_http_url(
         )
     try:
         port = parts.port
-    except ValueError as exc:
+    except ValueError:
         raise ValueError(
-            f"Invalid {field_name} {sanitize_url(cleaned)!r}: invalid port ({exc})"
-        ) from exc
+            f"Invalid {field_name} {sanitize_url(cleaned)!r}: invalid port"
+        ) from None
     if port is not None and not (1 <= port <= 65535):
         raise ValueError(
             f"Invalid {field_name} {sanitize_url(cleaned)!r}: "
@@ -254,8 +254,15 @@ class BackendConfig:
         self.validate()
 
     def validate(self) -> None:
-        if not self.id or not self.id.strip():
-            raise ValueError("Backend 'id' must be non-empty")
+        if not isinstance(self.id, str) or not self.id.strip():
+            raise ValueError("Backend 'id' must be a non-empty string")
+        if self.id != self.id.strip() or any(
+            ord(ch) < 0x21 or ord(ch) > 0x7E for ch in self.id
+        ):
+            raise ValueError(
+                f"Backend 'id' {self.id!r} must contain only printable ASCII characters "
+                "without whitespace or control characters"
+            )
         for field_name in (
             "local",
             "spot",

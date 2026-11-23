@@ -15,6 +15,7 @@ import errno
 import hashlib
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import ipaddress
 import json
 import math
 from pathlib import Path
@@ -2435,7 +2436,7 @@ class _SSEReactor:
 
     def _on_client_readable(self, task: _SSEReactorTask) -> None:
         try:
-            peek = task.client_sock.recv(1, socket.MSG_PEEK | _MSG_DONTWAIT)
+            task.client_sock.recv(1, socket.MSG_PEEK | _MSG_DONTWAIT)
         except BlockingIOError:
             return
         except OSError as exc:
@@ -2444,12 +2445,9 @@ class _SSEReactor:
             task.downstream_write_error = True
             self._finish_task(task)
             return
-        if peek == b"":
-            task.downstream_write_error = True
-            self._finish_task(task)
-            return
-        # Client sent extra pipelined bytes; stop watching client readability
-        # while preserving EVENT_WRITE if buffered output is still draining.
+        # Orderly read-side EOF (client half-closed via SHUT_WR per RFC 9112 §9.6)
+        # or extra pipelined bytes: stop watching client readability while
+        # preserving EVENT_WRITE and keeping the response stream open.
         task.watch_client_read = False
         self._update_client_registration(task)
 
@@ -2569,12 +2567,21 @@ class FreeTPURouterServer(ThreadingHTTPServer):
     ) -> None:
         self.engine = engine
         self.verbose = verbose
-        self.configured_bind_host = str(server_address[0]).strip().lower().strip("[]")
+        clean_host = str(server_address[0]).strip().strip("[]")
+        self.configured_bind_host = clean_host.lower()
+        try:
+            ip_obj = ipaddress.ip_address(clean_host.split("%", 1)[0])
+        except ValueError:
+            ip_obj = None
+        if ip_obj is not None and ip_obj.version == 6:
+            self.address_family = socket.AF_INET6
+        else:
+            self.address_family = socket.AF_INET
         self._conn_semaphore = threading.BoundedSemaphore(
             engine.config.max_concurrent_connections
         )
         self.sse_reactor = _SSEReactor()
-        super().__init__(server_address, _RouterRequestHandler)
+        super().__init__((clean_host, server_address[1]), _RouterRequestHandler)
 
     def process_request(self, request: Any, client_address: Any) -> None:
         if not self._conn_semaphore.acquire(blocking=False):
@@ -2793,7 +2800,12 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         return host_port == bound_port
 
     def _is_client_disconnected(self) -> bool:
-        """Non-blocking probe detecting whether the downstream client closed its TCP socket."""
+        """Non-blocking probe detecting whether the downstream TCP connection aborted.
+
+        Per RFC 9112 §9.6, an orderly read-side EOF (`shutdown(SHUT_WR)`) is not a
+        disconnect once the request body has been read; only socket errors/resets
+        or invalid descriptors abort retry/failover.
+        """
         sock = getattr(self, "connection", None)
         if sock is None:
             return True
@@ -2811,14 +2823,14 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         if sock not in readable:
             return False
         try:
-            peek = sock.recv(1, socket.MSG_PEEK | getattr(socket, "MSG_DONTWAIT", 0))
+            sock.recv(1, socket.MSG_PEEK | getattr(socket, "MSG_DONTWAIT", 0))
         except BlockingIOError:
             return False
         except OSError as exc:
             if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
                 return False
             return True
-        return peek == b""
+        return False
 
     def _resolve_cors_header(self) -> Tuple[bool, Optional[str]]:
         """Check request Origin against explicit `cors_allowed_origins` and same-origin authority.

@@ -689,10 +689,10 @@ class _DeadlineSocketIO(io.RawIOBase):
                             peek = None
                         else:
                             raise ClientDisconnectedError("Downstream client disconnected") from exc
-                    if peek == b"":
-                        raise ClientDisconnectedError("Downstream client disconnected")
                     if peek is not None:
-                        # Extra pipelined bytes on client socket; stop EOF-watching to avoid busy spin.
+                        # Either orderly read-side EOF (client half-closed via SHUT_WR per
+                        # RFC 9112 §9.6) or extra pipelined bytes: stop read-watching to
+                        # avoid busy-spinning while keeping the response path open.
                         self._wrapper._watch_client = False
                 if up_ready:
                     return
@@ -747,10 +747,21 @@ class _DeadlineSocketIO(io.RawIOBase):
                             if client in e_cli:
                                 raise ClientDisconnectedError("Downstream client disconnected")
                             if client in r_cli:
-                                peek = client.recv(1, socket.MSG_PEEK | _MSG_DONTWAIT)
-                                if peek == b"":
-                                    raise ClientDisconnectedError("Downstream client disconnected")
-                                wrapper._watch_client = False
+                                try:
+                                    peek = client.recv(1, socket.MSG_PEEK | _MSG_DONTWAIT)
+                                except BlockingIOError:
+                                    peek = None
+                                except OSError as exc:
+                                    if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                                        peek = None
+                                    else:
+                                        raise ClientDisconnectedError(
+                                            "Downstream client disconnected"
+                                        ) from exc
+                                if peek is not None:
+                                    # Orderly read-side EOF (SHUT_WR) or pipelined bytes:
+                                    # keep response path open and stop read-watching.
+                                    wrapper._watch_client = False
                         except ClientDisconnectedError:
                             raise
                         except (OSError, ValueError):
@@ -914,14 +925,14 @@ def scrape_tpu_exporter(
         parsed = urlsplit(url)
         scheme = parsed.scheme.lower()
         host = parsed.hostname
-    except ValueError as exc:
+    except ValueError:
         return TpuExporterTelemetry(
             reachable=False,
             exporter_up=False,
             devices_discovered=0,
             healthy_chips=0,
             total_chips=0,
-            error=f"Invalid tpu_exporter_url: {exc}",
+            error="Invalid tpu_exporter_url: malformed URL",
         )
     if scheme not in ("http", "https") or not host:
         return TpuExporterTelemetry(
@@ -930,18 +941,18 @@ def scrape_tpu_exporter(
             devices_discovered=0,
             healthy_chips=0,
             total_chips=0,
-            error=f"Invalid tpu_exporter_url: {url!r}",
+            error="Invalid tpu_exporter_url: missing scheme or hostname",
         )
     try:
         parsed_port = parsed.port
-    except ValueError as exc:
+    except ValueError:
         return TpuExporterTelemetry(
             reachable=False,
             exporter_up=False,
             devices_discovered=0,
             healthy_chips=0,
             total_chips=0,
-            error=f"Invalid tpu_exporter_url port: {exc}",
+            error="Invalid tpu_exporter_url: invalid port",
         )
     if parsed_port is not None and not (1 <= parsed_port <= 65535):
         return TpuExporterTelemetry(
