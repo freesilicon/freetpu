@@ -111,6 +111,8 @@ struct VfioTransport {
   bool dma_faulted = false;
   bool last_op_timed_out = false;
   bool mock_exec_timeout = false;
+  bool mock_exec_poll_error = false;
+  bool mock_core_ctrl_fail = false;
   int64_t owner_pid = 0;
 
   bool is_owner_process() const;
@@ -128,6 +130,7 @@ struct VfioTransport {
   uint64_t scratch_rhs_hbm = 0;
   uint64_t quant_const_hbm = 0;   // 40 KiB Sel + -2304.0f + -136.0f constants
   uint32_t exec_seq = 0;
+  uint32_t next_exec_seq() const { return (exec_seq == 0xffffffffu) ? 1u : (exec_seq + 1u); }
 
   IovaAllocator iova_alloc;
   IovaAllocator hbm_alloc;

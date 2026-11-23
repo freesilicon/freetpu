@@ -1483,13 +1483,40 @@ static void test_vfio_imem_lifecycle_mock() {
   OT_CHECK(ctx->transport.scratch_lhs_hbm != 0 && ctx->transport.scratch_rhs_hbm != 0);
   OT_CHECK(ctx->transport.hbm_alloc.used_bytes() == 2u * ot::kTile128x128Bf16Bytes);
 
+  // 1) Monotonic exec_seq across BF16 -> Q8 -> Q4 -> BF16 resident program switches.
+  OT_CHECK(ctx->transport.loaded_prog_kind == 1u);
+  ctx->transport.exec_seq = ctx->transport.next_exec_seq();
+  OT_CHECK(ctx->transport.exec_seq == 1u);
+  OT_CHECK(ctx->transport.ensure_imem_program(2u, 1000u, &err));
+  OT_CHECK(ctx->transport.imem_booted && ctx->transport.loaded_prog_kind == 2u);
+  OT_CHECK(ctx->transport.exec_seq == 1u && ctx->transport.next_exec_seq() == 2u);
+  ctx->transport.exec_seq = ctx->transport.next_exec_seq();
+  OT_CHECK(ctx->transport.ensure_imem_program(3u, 1000u, &err));
+  OT_CHECK(ctx->transport.imem_booted && ctx->transport.loaded_prog_kind == 3u);
+  OT_CHECK(ctx->transport.exec_seq == 2u && ctx->transport.next_exec_seq() == 3u);
+  OT_CHECK(ctx->transport.ensure_imem_program(1u, 1000u, &err));
+  OT_CHECK(ctx->transport.imem_booted && ctx->transport.loaded_prog_kind == 1u);
+  OT_CHECK(ctx->transport.exec_seq == 2u);
+  ctx->transport.exec_seq = 0xffffffffu;
+  OT_CHECK(ctx->transport.next_exec_seq() == 1u);
+  ctx->transport.exec_seq = 2u;
+
+  // 2) Failed core-start during IMEM program switch must invalidate the old cache.
+  ctx->transport.mock_core_ctrl_fail = true;
+  err.clear();
+  OT_CHECK(!ctx->transport.ensure_imem_program(2u, 1000u, &err));
+  OT_CHECK(!ctx->transport.imem_booted && ctx->transport.loaded_prog_kind == 0u);
+  ctx->transport.mock_core_ctrl_fail = false;
+  OT_CHECK(ctx->transport.ensure_imem_program(2u, 1000u, &err));
+  OT_CHECK(ctx->transport.imem_booted && ctx->transport.loaded_prog_kind == 2u);
+
   uint32_t cq[8] = {};
   OT_CHECK(ctx->transport.submit_exec_sync(7u, 1000u, cq, &err));
   OT_CHECK(cq[4] == 1u && cq[5] == 7u);
   OT_CHECK(!ctx->transport.last_op_timed_out);
 
-  // EXEC polling deadline expiration must report timeout (OT_ERR_TIMEOUT),
-  // distinct from non-timeout device faults (OT_ERR_DEVICE) and CQ errors (OT_ERR_IOCTL).
+  // 3) EXEC polling deadline expiration must report timeout (OT_ERR_TIMEOUT) & quiesce,
+  //    while non-timeout EXEC poll failures must ALSO fault & quiesce (OT_ERR_DEVICE).
   OT_CHECK(ot::classify_transport_error(true, true) == OT_ERR_TIMEOUT);
   OT_CHECK(ot::classify_transport_error(false, true) == OT_ERR_DEVICE);
   OT_CHECK(ot::classify_transport_error(false, false) == OT_ERR_IOCTL);
@@ -1498,12 +1525,26 @@ static void test_vfio_imem_lifecycle_mock() {
   OT_CHECK(!ctx->transport.submit_exec_sync(8u, 10u, cq, &err));
   OT_CHECK(ctx->transport.dma_faulted);
   OT_CHECK(ctx->transport.last_op_timed_out);
+  OT_CHECK(!ctx->transport.imem_booted && ctx->transport.loaded_prog_kind == 0u);
   OT_CHECK(err.find("EXEC completion timeout") != std::string::npos);
   OT_CHECK(ot::classify_transport_error(ctx->transport.last_op_timed_out,
                                         ctx->transport.dma_faulted) == OT_ERR_TIMEOUT);
   ctx->transport.dma_faulted = false;
   ctx->transport.last_op_timed_out = false;
   ctx->transport.mock_exec_timeout = false;
+
+  OT_CHECK(ctx->transport.ensure_imem_program(1u, 1000u, &err));
+  ctx->transport.mock_exec_poll_error = true;
+  err.clear();
+  OT_CHECK(!ctx->transport.submit_exec_sync(9u, 10u, cq, &err));
+  OT_CHECK(ctx->transport.dma_faulted);
+  OT_CHECK(!ctx->transport.last_op_timed_out);
+  OT_CHECK(!ctx->transport.imem_booted && ctx->transport.loaded_prog_kind == 0u);
+  OT_CHECK(err.find("device quiesced") != std::string::npos);
+  OT_CHECK(ot::classify_transport_error(ctx->transport.last_op_timed_out,
+                                        ctx->transport.dma_faulted) == OT_ERR_DEVICE);
+  ctx->transport.dma_faulted = false;
+  ctx->transport.mock_exec_poll_error = false;
 
   ctx->transport.teardown_imem_state();
   OT_CHECK(!ctx->transport.imem_booted);
@@ -1608,7 +1649,28 @@ static void test_freetile_descriptor_and_planner() {
   OT_CHECK(bf16_plan.valid);
   OT_CHECK(bf16_plan.tiles_m == 1u && bf16_plan.tiles_k == 32u && bf16_plan.tiles_n == 32u);
   OT_CHECK(bf16_plan.vmem.stages == 2u);
+  OT_CHECK(bf16_plan.desc.block_spec.vmem_double_buffer);
+  OT_CHECK(bf16_plan.vmem.total_vmem_bytes == 2u * (32768u + 32768u) + 65536u + 32768u);
   OT_CHECK(bf16_plan.vmem.total_vmem_bytes <= 16u * 1024u * 1024u);
+
+  // Multi-K BF16 always emits 2-stage ping-pong VMEM even if vmem_double_buffer hint is 0;
+  // single-K BF16 uses only stage 0 (1 stage).
+  ot_freetile_gemm_desc_t bf16_hint0 = ot_freetile_gemm_desc_default(128u, 512u, 256u);
+  bf16_hint0.tile.vmem_double_buffer = 0u;
+  const ot::freetile::LoweringPlan bf16_hint0_plan =
+      ot::freetile::plan_v5e_tile_gemm(ot::freetile::TileKernelDescriptor::from_c_desc(bf16_hint0));
+  OT_CHECK(bf16_hint0_plan.valid);
+  OT_CHECK(bf16_hint0_plan.vmem.stages == 2u);
+  OT_CHECK(bf16_hint0_plan.desc.block_spec.vmem_double_buffer);
+  OT_CHECK(bf16_hint0_plan.vmem.total_vmem_bytes == bf16_plan.vmem.total_vmem_bytes);
+
+  const ot_freetile_gemm_desc_t bf16_k1 = ot_freetile_gemm_desc_default(256u, 128u, 256u);
+  const ot::freetile::LoweringPlan bf16_k1_plan =
+      ot::freetile::plan_v5e_tile_gemm(ot::freetile::TileKernelDescriptor::from_c_desc(bf16_k1));
+  OT_CHECK(bf16_k1_plan.valid);
+  OT_CHECK(bf16_k1_plan.vmem.stages == 1u);
+  OT_CHECK(!bf16_k1_plan.desc.block_spec.vmem_double_buffer);
+  OT_CHECK(bf16_k1_plan.vmem.total_vmem_bytes == 1u * (32768u + 32768u) + 65536u + 32768u);
 
   ot_freetile_gemm_desc_t q4 = ot_freetile_gemm_desc_default(128u, 512u, 512u);
   q4.rhs_dtype = OT_DTYPE_Q4_0;
@@ -1617,7 +1679,15 @@ static void test_freetile_descriptor_and_planner() {
   const ot::freetile::LoweringPlan q4_plan =
       ot::freetile::plan_v5e_tile_gemm(ot::freetile::TileKernelDescriptor::from_c_desc(q4));
   OT_CHECK(q4_plan.valid);
+  // Quantized IMEM kernel is single-stage (1 stage) with dequant staging + 36 KiB constants.
+  OT_CHECK(q4_plan.vmem.stages == 1u);
+  OT_CHECK(!q4_plan.desc.block_spec.vmem_double_buffer);
   OT_CHECK(q4_plan.vmem.rhs_vmem_bytes == 8192u);
+  OT_CHECK(q4_plan.vmem.scale_vmem_bytes == 1024u);
+  OT_CHECK(q4_plan.vmem.dequant_vmem_bytes == 32768u);
+  OT_CHECK(q4_plan.vmem.const_vmem_bytes == 36864u);
+  OT_CHECK(q4_plan.vmem.total_vmem_bytes ==
+           32768u + 8192u + 1024u + 32768u + 36864u + 65536u + 32768u);
   const uint64_t expected_q4_512_hbm =
       4ULL * (128ULL * 512ULL * 2ULL) +       // tiles_n * A
       1ULL * (512ULL * 512ULL / 2ULL) +       // tiles_m * B_q4
@@ -1626,6 +1696,36 @@ static void test_freetile_descriptor_and_planner() {
       1ULL * 36864ULL;                        // 36 KiB constants per launch chunk
   OT_CHECK(q4_plan.hbm_bytes_moved == expected_q4_512_hbm);
   OT_CHECK(q4_plan.hbm_bytes_moved < bf16_plan.hbm_bytes_moved);
+
+  // Verify O(1) closed-form count_v5e_launch_chunks matches the reference chunking loop
+  // across an exhaustive grid including remainder m_chunks and k_tiles >= max_iters.
+  auto ref_launch_chunks = [](uint32_t mt, uint32_t kt, uint32_t nt, uint32_t lim) -> uint64_t {
+    const uint32_t m_step = (kt >= lim) ? 1u : std::min(mt, std::max(1u, lim / kt));
+    const uint32_t n_base = (kt >= lim) ? 1u : std::max(1u, lim / kt);
+    uint64_t c = 0ULL;
+    for (uint32_t ms = 0u; ms < mt;) {
+      const uint32_t mc = std::min(m_step, mt - ms);
+      const uint32_t n_max = std::max(1u, n_base / mc);
+      for (uint32_t ns = 0u; ns < nt;) {
+        ns += std::min(n_max, nt - ns);
+        ++c;
+      }
+      ms += mc;
+    }
+    return c;
+  };
+  const uint32_t ms_grid[] = {1u, 2u, 3u, 5u, 7u, 13u, 32u};
+  const uint32_t ks_grid[] = {1u, 2u, 3u, 7u, 16u, 32u, 64u, 128u, 513u, 1023u, 1024u, 1025u, 2048u};
+  const uint32_t ns_grid[] = {1u, 2u, 3u, 5u, 9u, 32u, 65u};
+  for (uint32_t mt : ms_grid) {
+    for (uint32_t kt : ks_grid) {
+      for (uint32_t nt : ns_grid) {
+        OT_CHECK(ot::freetile::count_v5e_launch_chunks(mt, kt, nt) ==
+                 ref_launch_chunks(mt, kt, nt, ot::freetile::kV5eMaxItersPerLaunch));
+      }
+    }
+  }
+  OT_CHECK(ot::freetile::count_v5e_launch_chunks(8192u, 1024u, 8192u) == 67108864ULL);
 
   // Multi-chunk quantized shape (2*32*32 = 2048 iters -> 2 launch chunks of 36 KiB constants).
   ot_freetile_gemm_desc_t q8_2c = ot_freetile_gemm_desc_default(256u, 4096u, 4096u);
@@ -1937,6 +2037,15 @@ static void test_mock_multitile_and_quant_matmul() {
     ot_freetile_gemm_desc_t i8_nosc = q8d;
     i8_nosc.rhs_dtype = OT_DTYPE_INT8;
     OT_CHECK(ot_matmul_quant(ctx, bqa, bqi8, nullptr, bqout, &i8_nosc, nullptr) ==
+             OT_ERR_INVALID_ARG);
+
+    // Huge dimensions with small buffers must fail fast on buffer-size validation
+    // (O(1), never spinning in launch planning).
+    ot_freetile_gemm_desc_t huge_q = ot_freetile_gemm_desc_default(1048576u, 131072u, 1048576u);
+    huge_q.rhs_dtype = OT_DTYPE_Q8_0;
+    huge_q.quant_mode = OT_QUANT_BLOCK_32;
+    huge_q.quant_group_size = OT_QK8_0;
+    OT_CHECK(ot_matmul_quant(ctx, bqa, bqi8, bqsc, bqout, &huge_q, nullptr) ==
              OT_ERR_INVALID_ARG);
   }
 

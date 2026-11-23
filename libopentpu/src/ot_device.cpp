@@ -838,8 +838,7 @@ ot_status_t launch_v5e_chunked_exec(ot_context_t* ctx,
       const uint32_t n_stride =
           (m_tiles == 1u && k_tiles == 1u && n_tiles == 1u) ? 0u : n_tiles;
 
-      const uint32_t next_seq =
-          (ctx->transport.exec_seq == 0xffffffffu) ? 1u : (ctx->transport.exec_seq + 1u);
+      const uint32_t next_seq = ctx->transport.next_exec_seq();
       const ot::OtV5eLaunchDesc ldesc = ot::OtV5eLaunchDesc::build_ex(
           sub_lhs, sub_rhs, sub_out, /*prog_hbm=*/0ULL, next_seq,
           m_chunk, k_tiles, n_chunk, quant_mode, sub_sc, const_hbm, n_stride);
@@ -1186,12 +1185,13 @@ ot_status_t ot_matmul_quant(ot_context_t* ctx,
     ctx->last_error = "Q4_K / BLOCK_256 is reserved and not yet supported";
     return OT_ERR_UNSUPPORTED;
   }
-
-  ot::freetile::TileKernelDescriptor fdesc = ot::freetile::TileKernelDescriptor::from_c_desc(*desc);
-  ot::freetile::LoweringPlan plan = ot::freetile::plan_v5e_tile_gemm(fdesc);
-  if (!plan.valid) {
-    std::lock_guard<std::mutex> lk(ctx->mu);
-    ctx->last_error = plan.error;
+  if (desc->lhs_dtype != OT_DTYPE_BF16 || desc->out_dtype != OT_DTYPE_BF16) {
+    return OT_ERR_INVALID_ARG;
+  }
+  if ((desc->tile.block_m != 0u && desc->tile.block_m != 128u) ||
+      (desc->tile.block_k != 0u && desc->tile.block_k != 128u) ||
+      (desc->tile.block_n != 0u && desc->tile.block_n != 128u) ||
+      (desc->m_dim % 128u) != 0u || (desc->k_dim % 128u) != 0u || (desc->n_dim % 128u) != 0u) {
     return OT_ERR_INVALID_ARG;
   }
 
@@ -1294,6 +1294,14 @@ ot_status_t ot_matmul_quant(ot_context_t* ctx,
   if (lhs_mk->size_bytes < need_lhs_u64 || rhs_quant->size_bytes < need_q_u64 ||
       (rhs_scales && rhs_scales->size_bytes < need_scales_u64) ||
       out_mn->size_bytes < need_out_u64) {
+    return OT_ERR_INVALID_ARG;
+  }
+
+  ot::freetile::TileKernelDescriptor fdesc = ot::freetile::TileKernelDescriptor::from_c_desc(*desc);
+  ot::freetile::LoweringPlan plan = ot::freetile::plan_v5e_tile_gemm(fdesc);
+  if (!plan.valid) {
+    std::lock_guard<std::mutex> lk(ctx->mu);
+    ctx->last_error = plan.error;
     return OT_ERR_INVALID_ARG;
   }
 

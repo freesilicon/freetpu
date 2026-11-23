@@ -58,13 +58,14 @@ Every non-obvious ISA/VFIO constraint below was falsified directly on live `v5e-
 Measured on live Google Colab `v5e-1` (`0x1ae0:0x0063`, `/dev/vfio/0`):
 - `libopentpu` command: `./libopentpu/build/host/opentpu_matmul_proof --runs 3 --multitile --quant`
 - Runtime maps: **`MAPS_LIBTPU=0`**, **`MAPS_LIBPYTHON=0`** (`NEEDED`: `libstdc++.so.6`, `libc.so.6`, `ld-linux-x86-64.so.2` only)
-- XLA baseline: `jax` (`libtpu.so`) `jnp.matmul` steady-state median latency via `block_until_ready()` in an isolated child process.
+- XLA baseline: `jax` (`libtpu.so`) `jnp.matmul` steady-state median call-to-ready latency via `block_until_ready()` on device-resident arrays in an isolated child process (includes host/PJRT dispatch + XLA runtime scheduling; excludes initial H2D upload).
 
-> **Bandwidth definitions**:
-> - **Unique Footprint GB/s** = `(bytes(A) + bytes(B_packed) + bytes(scales) + bytes(C)) / time_us`, comparable directly across XLA and `libopentpu`.
-> - **DMA Traffic GB/s** = `plan.hbm_bytes_moved / hw_us` (accounts for HBM->VMEM re-reads in the triple-loop tile schedule).
+> **Timing scope & bandwidth definitions**:
+> - **`libopentpu` `hw_us`** measures **resident IMEM device execution only** (launch descriptor doorbell DMA through `OP_EXEC` completion on already-packed HBM tiles). It excludes host-side raw-buffer readback/packing/upload overhead included in end-to-end `wall_us`, so `hw_us` and XLA call-to-ready `median_us` are **not** identical end-to-end timing scopes and are reported side by side for device-kernel reference only.
+> - **Unique Footprint GB/s** = `(bytes(A) + bytes(B_packed) + bytes(scales) + bytes(C)) / time_us`.
+> - **DMA Traffic GB/s** = historical Colab run activation + packed-weight + output tile traffic divided by `hw_us` (`ot_exec_stats_t::hbm_bytes_moved` additionally includes the `1 KiB` scale loads per tile iteration and `36 KiB` constant loads per launch chunk).
 
-| Shape & Format | `libopentpu` Mismatches (vs FP32 Ref) | `libopentpu` `hw_us` | XLA `median_us` (`libtpu.so`) | `libopentpu` Footprint GB/s | `libopentpu` DMA GB/s | XLA Footprint GB/s |
+| Shape & Format | `libopentpu` Mismatches (vs FP32 Ref) | `libopentpu` Device `hw_us` (IMEM only) | XLA Call-to-Ready `median_us` (`libtpu.so`) | `libopentpu` Footprint GB/s (`hw_us`) | `libopentpu` DMA GB/s (`hw_us`) | XLA Footprint GB/s (`median_us`) |
 | --- | --- | --- | --- | --- | --- | --- |
 | `BF16` `128x512x512` | `0 / 65,536` (`max_diff=0.0`) | `136 us` | `124.8 us` | `5.78` | `8.67` | `6.30` |
 | `BF16` `256x512x256` | `0 / 65,536` (`max_diff=0.0`) | `134 us` | `132.8 us` | `4.89` | `8.80` | `4.93` |
@@ -74,4 +75,4 @@ Measured on live Google Colab `v5e-1` (`0x1ae0:0x0063`, `/dev/vfio/0`):
 | `Q8_0` blk-32 `128x4096x4096` | `0 / 524,288` (`max_diff=0.0`) | `1,153 us` | `250.1 us` | `17.28` | `44.56` | `79.67` |
 | `Q4_0` blk-32 `128x4096x4096` | `0 / 524,288` (`max_diff=0.0`) | `1,026 us` | `453.3 us` | `11.24` | `41.90` | `25.45` |
 
-On small/medium `512x512` quantized matmuls, `libopentpu`'s resident bare-metal IMEM path already beats `libtpu.so` XLA latency (`134 us` vs `227.7 us`, **`1.70x` faster** on `Q4_0`). At `4096x4096`, `libopentpu` reaches **`156.7–166.6 GB/s` DMA (`82–87 GB/s` footprint)** in BF16 and **`41.9–50.3 GB/s` DMA** in quantized modes with zero `libtpu.so`; adding ping-pong DMA overlap inside `emit_v5e_resident_freetile_quant_imem` is the natural next throughput step.
+On `512x512` quantized matmuls, `libopentpu`'s resident IMEM device-kernel `hw_us` is `134–135 us` (compared with `141.8–227.7 us` XLA steady-state call-to-ready latency); note that end-to-end raw-buffer `ot_matmul_quant` calls (`wall_us`) additionally incur host-side weight repacking and staging until device-resident pre-packed weight handles are added. At `4096x4096`, the resident IMEM kernels reach `156.7 GB/s` DMA (`82.0 GB/s` unique footprint) in BF16 and `41.9–44.6 GB/s` DMA in quantized modes with zero `libtpu.so`; pre-packed device weight handles (to eliminate host packing from `wall_us`) and ping-pong DMA overlap inside `emit_v5e_resident_freetile_quant_imem` are the natural next throughput steps.

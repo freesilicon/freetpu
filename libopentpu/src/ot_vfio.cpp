@@ -1295,6 +1295,10 @@ bool VfioTransport::dma_host_to_imem(uint64_t host_iova, uint64_t dst_imem, size
 bool VfioTransport::submit_core_ctrl(uint32_t ctrl_word, uint32_t timeout_ms,
                                      uint32_t cq_out[8], std::string* err) {
   if (is_mock) {
+    if (mock_core_ctrl_fail) {
+      if (err) *err = "Mock core_ctrl command failed";
+      return false;
+    }
     if (cq_out) std::memset(cq_out, 0, 32);
     return true;
   }
@@ -1308,7 +1312,10 @@ bool VfioTransport::submit_exec_sync(uint32_t expected_exec_seq, uint32_t timeou
                                      uint32_t cq_out[8], std::string* err) {
   last_op_timed_out = false;
   uint32_t local_cq[8] = {};
-  if (is_mock && !mock_exec_timeout) {
+  bool poll_failed = false;
+  bool timed_out = false;
+
+  if (is_mock && !mock_exec_timeout && !mock_exec_poll_error) {
     if (cq_out) {
       std::memset(cq_out, 0, 32);
       cq_out[4] = 1u;
@@ -1316,7 +1323,14 @@ bool VfioTransport::submit_exec_sync(uint32_t expected_exec_seq, uint32_t timeou
     }
     return true;
   }
-  if (!is_mock) {
+  if (is_mock) {
+    if (mock_exec_poll_error) {
+      poll_failed = true;
+      if (err) *err = "Mock EXEC poll CQ failure";
+    } else {
+      timed_out = true;
+    }
+  } else {
     uint32_t d[32] = {};
     d[1] = kSqOpcodeExec;
     d[8] = kExecOpW8;
@@ -1330,7 +1344,8 @@ bool VfioTransport::submit_exec_sync(uint32_t expected_exec_seq, uint32_t timeou
           std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
       const uint32_t sq_timeout_ms = (rem_ms > 0) ? static_cast<uint32_t>(rem_ms) : 1u;
       if (!submit_sq_wait(d, sq_timeout_ms, local_cq, err)) {
-        return false;
+        poll_failed = true;
+        break;
       }
       if (local_cq[4] == 1u && local_cq[5] == expected_exec_seq) {
         if (cq_out) {
@@ -1339,6 +1354,7 @@ bool VfioTransport::submit_exec_sync(uint32_t expected_exec_seq, uint32_t timeou
         return true;
       }
       if (std::chrono::steady_clock::now() >= deadline) {
+        timed_out = true;
         break;
       }
 #ifdef __linux__
@@ -1349,26 +1365,47 @@ bool VfioTransport::submit_exec_sync(uint32_t expected_exec_seq, uint32_t timeou
   if (cq_out) {
     std::memcpy(cq_out, local_cq, sizeof(local_cq));
   }
+  // Launch doorbell has already been rung; any unconfirmed exit (deadline timeout
+  // OR SQ/CQ poll error) must fault and quiesce the device so scratch HBM is
+  // never freed under an in-flight kernel.
+  const bool was_timeout = timed_out || last_op_timed_out;
+  const bool already_faulted = dma_faulted;
   dma_faulted = true;
-  last_op_timed_out = true;
+  last_op_timed_out = was_timeout;
   ring_ready = false;
   imem_booted = false;
+  loaded_prog_kind = 0u;
 #ifdef __linux__
-  if (!is_mock) {
+  if (!is_mock && !already_faulted) {
     if (bar0_mmio && bar0_mapped_len >= 0x12000u) {
       write32_bar0(0x10000u, 0u);
       write32_bar0(0x10040u, 0u);
+    }
+    uint16_t cmd = 0;
+    if (read_pci_config(0x04, &cmd, sizeof(cmd)) && (cmd & 0x0004u)) {
+      cmd &= static_cast<uint16_t>(~0x0004u);
+      (void)write_pci_config(0x04, &cmd, sizeof(cmd));
     }
     if (device_fd >= 0) {
       (void)::ioctl(device_fd, VFIO_DEVICE_RESET);
     }
   }
+#else
+  (void)already_faulted;
 #endif
   if (err) {
-    *err = "EXEC completion timeout: cq[4]=" + std::to_string(local_cq[4]) +
-           " cq[5]=" + std::to_string(local_cq[5]) +
-           " expected=" + std::to_string(expected_exec_seq) +
-           " (device quiesced; recreate context)";
+    if (poll_failed && !err->empty()) {
+      if (err->find("device quiesced") == std::string::npos) {
+        *err += " (EXEC unconfirmed; device quiesced; recreate context)";
+      }
+    } else if (was_timeout) {
+      *err = "EXEC completion timeout: cq[4]=" + std::to_string(local_cq[4]) +
+             " cq[5]=" + std::to_string(local_cq[5]) +
+             " expected=" + std::to_string(expected_exec_seq) +
+             " (device quiesced; recreate context)";
+    } else {
+      *err = "EXEC poll failed before completion (device quiesced; recreate context)";
+    }
   }
   return false;
 }
@@ -1412,6 +1449,14 @@ bool VfioTransport::ensure_imem_program(uint32_t prog_kind, uint32_t timeout_ms,
   }
   if (imem_booted && loaded_prog_kind == prog_kind) return true;
   if (is_mock) {
+    // Invalidate prior resident cache before reloading so failed core_ctrl start
+    // never leaves stale resident metadata behind. Keep exec_seq monotonic.
+    imem_booted = false;
+    loaded_prog_kind = 0u;
+    uint32_t cq_out[8] = {};
+    if (!submit_core_ctrl(kCoreCtrlStart, timeout_ms, cq_out, err)) {
+      return false;
+    }
     imem_booted = true;
     loaded_prog_kind = prog_kind;
     return true;
@@ -1436,6 +1481,11 @@ bool VfioTransport::ensure_imem_program(uint32_t prog_kind, uint32_t timeout_ms,
     return false;
   }
 
+  // Invalidate cached resident program before modifying IMEM so a failed DMA
+  // upload or core-start never leaves stale resident metadata behind.
+  imem_booted = false;
+  loaded_prog_kind = 0u;
+
   std::memcpy(host_stage_mem, imem_prog.data(), prog_bytes);
   if (!dma_host_to_imem(host_stage_iova, /*dst_imem=*/0ULL, prog_bytes, timeout_ms, err)) {
     return false;
@@ -1444,9 +1494,10 @@ bool VfioTransport::ensure_imem_program(uint32_t prog_kind, uint32_t timeout_ms,
   if (!submit_core_ctrl(kCoreCtrlStart, timeout_ms, cq_out, err)) {
     return false;
   }
+  // Keep exec_seq monotonic across resident program switches so sync[0x1f9]
+  // from a prior program's completion can never false-match the next launch.
   imem_booted = true;
   loaded_prog_kind = prog_kind;
-  exec_seq = 0;
   return true;
 }
 

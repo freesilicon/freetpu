@@ -156,7 +156,7 @@ typedef struct ot_tile_shape {
   uint32_t block_m;            /* VMEM M tile height (default 128 on v5e) */
   uint32_t block_k;            /* VMEM K tile width (default 128 on v5e) */
   uint32_t block_n;            /* VMEM N tile width (default 128 on v5e) */
-  uint8_t  vmem_double_buffer; /* 1 = 2-stage HBM<->VMEM ping-pong DMA */
+  uint8_t  vmem_double_buffer; /* Hint: multi-K BF16 uses 2-stage ping-pong; quant uses 1-stage */
   uint8_t  k_loop_accum_f32;   /* 1 = accumulate FP32 across K tiles */
   uint8_t  rhs_transposed;     /* 0 = [K, N], 1 = [N, K] */
   uint8_t  reserved;

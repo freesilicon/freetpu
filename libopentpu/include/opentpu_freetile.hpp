@@ -19,27 +19,23 @@ static constexpr uint32_t kV5eMaxItersPerLaunch = 1024u;
 static constexpr uint64_t kV5eQuantScaleTileDmaBytes = 1024ULL;
 static constexpr uint64_t kV5eQuantConstChunkDmaBytes = 36864ULL;
 
-inline uint32_t count_v5e_launch_chunks(uint32_t m_tiles, uint32_t k_tiles, uint32_t n_tiles,
+inline uint64_t count_v5e_launch_chunks(uint32_t m_tiles, uint32_t k_tiles, uint32_t n_tiles,
                                         uint32_t max_iters_per_launch = kV5eMaxItersPerLaunch) {
-  if (m_tiles == 0u || k_tiles == 0u || n_tiles == 0u || max_iters_per_launch == 0u) return 0u;
-  const uint32_t m_step =
-      (k_tiles >= max_iters_per_launch)
-          ? 1u
-          : std::min(m_tiles, std::max(1u, max_iters_per_launch / k_tiles));
+  if (m_tiles == 0u || k_tiles == 0u || n_tiles == 0u || max_iters_per_launch == 0u) return 0ULL;
   const uint32_t n_step_base =
       (k_tiles >= max_iters_per_launch) ? 1u : std::max(1u, max_iters_per_launch / k_tiles);
-  uint32_t chunks = 0u;
-  for (uint32_t ms = 0u; ms < m_tiles;) {
-    const uint32_t m_chunk = std::min(m_step, m_tiles - ms);
-    const uint32_t n_max_for_m = std::max(1u, n_step_base / m_chunk);
-    for (uint32_t ns = 0u; ns < n_tiles;) {
-      const uint32_t n_chunk = std::min(n_max_for_m, n_tiles - ns);
-      ++chunks;
-      ns += n_chunk;
-    }
-    ms += m_chunk;
+  const uint32_t m_step = std::min(m_tiles, n_step_base);
+  const uint64_t full_m_blocks = m_tiles / m_step;
+  const uint32_t rem_m = m_tiles % m_step;
+  const uint64_t n_max_full = std::max(1u, n_step_base / m_step);
+  const uint64_t chunks_per_full =
+      (static_cast<uint64_t>(n_tiles) + n_max_full - 1ULL) / n_max_full;
+  uint64_t total = full_m_blocks * chunks_per_full;
+  if (rem_m > 0u) {
+    const uint64_t n_max_rem = std::max(1u, n_step_base / rem_m);
+    total += (static_cast<uint64_t>(n_tiles) + n_max_rem - 1ULL) / n_max_rem;
   }
-  return chunks;
+  return total;
 }
 
 enum class OpKind : uint8_t {
@@ -108,11 +104,13 @@ struct TileKernelDescriptor {
 };
 
 struct VmemBufferPlan {
-  uint32_t lhs_vmem_bytes = 0;   // Per stage (x2 when double buffered)
-  uint32_t rhs_vmem_bytes = 0;   // Per stage (x2 when double buffered)
-  uint32_t scale_vmem_bytes = 0; // Per stage if quantized
-  uint32_t acc_vmem_bytes = 0;   // FP32 accumulator / staging
-  uint32_t out_vmem_bytes = 0;   // Output BF16 tile
+  uint32_t lhs_vmem_bytes = 0;     // Per stage (x2 when double buffered)
+  uint32_t rhs_vmem_bytes = 0;     // Per stage (x2 when double buffered)
+  uint32_t scale_vmem_bytes = 0;   // Per stage if quantized (1 KiB DMA window)
+  uint32_t dequant_vmem_bytes = 0; // BF16 dequantized RHS tile staging if quantized
+  uint32_t const_vmem_bytes = 0;   // Dequant Sel + IEEE-754 bias constants if quantized
+  uint32_t acc_vmem_bytes = 0;     // FP32 accumulator / staging
+  uint32_t out_vmem_bytes = 0;     // Output BF16 tile
   uint32_t total_vmem_bytes = 0;
   uint32_t stages = 1;
 };
@@ -165,7 +163,14 @@ inline LoweringPlan plan_v5e_tile_gemm(const TileKernelDescriptor& desc) {
   plan.tiles_m = desc.m_dim / bm;
   plan.tiles_k = desc.k_dim / bk;
   plan.tiles_n = desc.n_dim / bn;
-  const uint32_t stages = (desc.block_spec.vmem_double_buffer && plan.tiles_k > 1u) ? 2u : 1u;
+  const bool is_quant = (desc.rhs_dtype != DType::kBf16);
+  // Match the exact DMA schedule emitted by ot_vliw.h:
+  // - BF16 multi-K (tiles_k > 1) always uses 2-stage ping-pong VMEM (0x000/0x040 + 0x080/0x0c0).
+  // - BF16 single-K (tiles_k == 1) uses only stage 0 (0x000/0x040).
+  // - Quantized IMEM kernels are single-stage (0x000 LHS, 0x0c0 Q, 0x140 scales,
+  //   0x040 dequant BF16 staging, 0x180 constants).
+  const uint32_t stages = (!is_quant && plan.tiles_k > 1u) ? 2u : 1u;
+  plan.desc.block_spec.vmem_double_buffer = (stages == 2u);
   plan.vmem.stages = stages;
   plan.vmem.lhs_vmem_bytes = bm * bk * 2u;
   size_t rhs_elem_num = 2u;
@@ -177,11 +182,14 @@ inline LoweringPlan plan_v5e_tile_gemm(const TileKernelDescriptor& desc) {
     rhs_elem_den = 2u;
   }
   plan.vmem.rhs_vmem_bytes = static_cast<uint32_t>((static_cast<uint64_t>(bk) * bn * rhs_elem_num) / rhs_elem_den);
-  plan.vmem.scale_vmem_bytes = (desc.rhs_dtype == DType::kBf16) ? 0u : (bn * 4u);
+  plan.vmem.scale_vmem_bytes = is_quant ? static_cast<uint32_t>(kV5eQuantScaleTileDmaBytes) : 0u;
+  plan.vmem.dequant_vmem_bytes = is_quant ? (bk * bn * 2u) : 0u;
+  plan.vmem.const_vmem_bytes = is_quant ? static_cast<uint32_t>(kV5eQuantConstChunkDmaBytes) : 0u;
   plan.vmem.acc_vmem_bytes = bm * bn * 4u;
   plan.vmem.out_vmem_bytes = bm * bn * 2u;
   plan.vmem.total_vmem_bytes =
       stages * (plan.vmem.lhs_vmem_bytes + plan.vmem.rhs_vmem_bytes + plan.vmem.scale_vmem_bytes) +
+      plan.vmem.dequant_vmem_bytes + plan.vmem.const_vmem_bytes +
       plan.vmem.acc_vmem_bytes + plan.vmem.out_vmem_bytes;
 
   // v5e TensorCore VMEM budget is 16 MiB (16,777,216 B) per core.
@@ -201,13 +209,13 @@ inline LoweringPlan plan_v5e_tile_gemm(const TileKernelDescriptor& desc) {
       static_cast<uint64_t>(plan.tiles_n) * a_bytes +
       static_cast<uint64_t>(plan.tiles_m) * b_bytes +
       c_bytes;
-  if (desc.rhs_dtype != DType::kBf16) {
+  if (is_quant) {
     const uint64_t tile_iters =
         static_cast<uint64_t>(plan.tiles_m) * plan.tiles_n * plan.tiles_k;
-    const uint32_t chunks =
+    const uint64_t chunks =
         count_v5e_launch_chunks(plan.tiles_m, plan.tiles_k, plan.tiles_n, kV5eMaxItersPerLaunch);
     hbm_total += tile_iters * kV5eQuantScaleTileDmaBytes +
-                 static_cast<uint64_t>(chunks) * kV5eQuantConstChunkDmaBytes;
+                 chunks * kV5eQuantConstChunkDmaBytes;
   }
   plan.hbm_bytes_moved = hbm_total;
   plan.valid = true;
