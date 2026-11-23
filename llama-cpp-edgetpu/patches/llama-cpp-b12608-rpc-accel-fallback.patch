@@ -46,700 +46,21 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
      std::unordered_set<ggml_backend_buffer_t> buffers;
      // computed graphs cached per backend, keyed by uid
      std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
-@@ -2179,6 +2198,787 @@
-     }
-     result->view_offs = tensor->view_offs;
+@@ -2181,6 +2200,78 @@
      return result;
-+}
-+
-+static bool rpc_u64_mul_checked(uint64_t a, uint64_t b, uint64_t * out) {
-+    if (a != 0 && b > UINT64_MAX / a) {
+ }
+ 
++static bool rpc_op_is_supported_on_rpc(const ggml_tensor * node) {
++    if (node == nullptr || (uint32_t) node->op >= GGML_OP_COUNT) {
 +        return false;
-+    }
-+    *out = a * b;
-+    return true;
-+}
-+
-+static bool rpc_u64_add_checked(uint64_t a, uint64_t b, uint64_t * out) {
-+    if (b > UINT64_MAX - a) {
-+        return false;
-+    }
-+    *out = a + b;
-+    return true;
-+}
-+
-+static bool rpc_ranges_overlap(uint64_t a0, uint64_t a1, uint64_t b0, uint64_t b1) {
-+    return a0 < b1 && b0 < a1;
-+}
-+
-+static bool rpc_op_is_noop(enum ggml_op op) {
-+    switch (op) {
-+        case GGML_OP_NONE:
-+        case GGML_OP_RESHAPE:
-+        case GGML_OP_VIEW:
-+        case GGML_OP_PERMUTE:
-+        case GGML_OP_TRANSPOSE:
-+            return true;
-+        default:
-+            return false;
-+    }
-+}
-+
-+static bool rpc_tensor_span_in_buffer(
-+        const ggml_tensor * t,
-+        const std::unordered_set<ggml_backend_buffer_t> & buffers,
-+        bool require_contiguous_rows,
-+        uint64_t * out_start = nullptr,
-+        uint64_t * out_end   = nullptr) {
-+    if (t == nullptr || t->buffer == nullptr || t->data == nullptr) {
-+        return false;
-+    }
-+    if (buffers.find(t->buffer) == buffers.end()) {
-+        return false;
-+    }
-+    if ((uint32_t) t->type >= GGML_TYPE_COUNT) {
-+        return false;
-+    }
-+    const int64_t blck_size = ggml_blck_size(t->type);
-+    const size_t  type_size = ggml_type_size(t->type);
-+    if (blck_size <= 0 || type_size == 0) {
-+        return false;
-+    }
-+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
-+        if (t->ne[d] <= 0) {
-+            return false;
-+        }
-+    }
-+    if (t->ne[0] % blck_size != 0) {
-+        return false;
-+    }
-+    if (require_contiguous_rows && !ggml_is_contiguous_rows(t)) {
-+        return false;
-+    }
-+
-+    uint64_t span = 0;
-+    int first_stride_dim = 0;
-+    if (require_contiguous_rows) {
-+        if (!rpc_u64_mul_checked((uint64_t) (t->ne[0] / blck_size), (uint64_t) type_size, &span)) {
-+            return false;
-+        }
-+        first_stride_dim = 1;
-+    } else if (blck_size == 1) {
-+        span = (uint64_t) type_size;
-+        first_stride_dim = 0;
-+    } else {
-+        const uint64_t n_blocks = (uint64_t) (t->ne[0] / blck_size);
-+        if (n_blocks == 1) {
-+            span = (uint64_t) type_size;
-+        } else {
-+            if (t->nb[0] < type_size) {
-+                return false;
-+            }
-+            uint64_t blk_span = 0;
-+            if (!rpc_u64_mul_checked(n_blocks - 1, (uint64_t) t->nb[0], &blk_span) ||
-+                !rpc_u64_add_checked(blk_span, (uint64_t) type_size, &span)) {
-+                return false;
-+            }
-+        }
-+        first_stride_dim = 1;
-+    }
-+
-+    for (int d = first_stride_dim; d < GGML_MAX_DIMS; ++d) {
-+        uint64_t dim_span = 0;
-+        if (!rpc_u64_mul_checked((uint64_t) (t->ne[d] - 1), (uint64_t) t->nb[d], &dim_span)) {
-+            return false;
-+        }
-+        if (!rpc_u64_add_checked(span, dim_span, &span)) {
-+            return false;
-+        }
-+    }
-+
-+    const uint64_t base     = (uint64_t) (uintptr_t) ggml_backend_buffer_get_base(t->buffer);
-+    const uint64_t buf_size = (uint64_t) ggml_backend_buffer_get_size(t->buffer);
-+    const uint64_t data     = (uint64_t) (uintptr_t) t->data;
-+    if (data < base) {
-+        return false;
-+    }
-+    const uint64_t offset = data - base;
-+    if (offset > buf_size || span > buf_size - offset) {
-+        return false;
-+    }
-+    if (out_start != nullptr) {
-+        *out_start = data;
-+    }
-+    if (out_end != nullptr) {
-+        *out_end = data + span;
-+    }
-+    return true;
-+}
-+
-+static bool rpc_cpu_type_has_from_float(ggml_type type) {
-+    switch (type) {
-+        case GGML_TYPE_F32:
-+        case GGML_TYPE_F16:
-+        case GGML_TYPE_BF16:
-+        case GGML_TYPE_Q1_0:
-+        case GGML_TYPE_Q2_0:
-+        case GGML_TYPE_Q4_0:
-+        case GGML_TYPE_Q4_1:
-+        case GGML_TYPE_Q5_0:
-+        case GGML_TYPE_Q5_1:
-+        case GGML_TYPE_Q8_0:
-+        case GGML_TYPE_Q8_1:
-+        case GGML_TYPE_MXFP4:
-+        case GGML_TYPE_NVFP4:
-+        case GGML_TYPE_F8_E4M3:
-+        case GGML_TYPE_Q2_K:
-+        case GGML_TYPE_Q3_K:
-+        case GGML_TYPE_Q4_K:
-+        case GGML_TYPE_Q5_K:
-+        case GGML_TYPE_Q6_K:
-+        case GGML_TYPE_IQ4_NL:
-+        case GGML_TYPE_IQ4_XS:
-+        case GGML_TYPE_Q8_K:
-+        case GGML_TYPE_TQ1_0:
-+        case GGML_TYPE_TQ2_0:
-+        case GGML_TYPE_I32:
-+            return true;
-+        default:
-+            return false;
-+    }
-+}
-+
-+static bool rpc_cpu_get_rows_src0_type_supported(ggml_type type) {
-+    switch (type) {
-+        case GGML_TYPE_Q1_0:
-+        case GGML_TYPE_Q2_0:
-+        case GGML_TYPE_Q4_0:
-+        case GGML_TYPE_Q4_1:
-+        case GGML_TYPE_Q5_0:
-+        case GGML_TYPE_Q5_1:
-+        case GGML_TYPE_Q8_0:
-+        case GGML_TYPE_Q8_1:
-+        case GGML_TYPE_MXFP4:
-+        case GGML_TYPE_NVFP4:
-+        case GGML_TYPE_F8_E4M3:
-+        case GGML_TYPE_Q2_K:
-+        case GGML_TYPE_Q3_K:
-+        case GGML_TYPE_Q4_K:
-+        case GGML_TYPE_Q5_K:
-+        case GGML_TYPE_Q6_K:
-+        case GGML_TYPE_TQ1_0:
-+        case GGML_TYPE_TQ2_0:
-+        case GGML_TYPE_IQ2_XXS:
-+        case GGML_TYPE_IQ2_XS:
-+        case GGML_TYPE_IQ3_XXS:
-+        case GGML_TYPE_IQ1_S:
-+        case GGML_TYPE_IQ1_M:
-+        case GGML_TYPE_IQ4_NL:
-+        case GGML_TYPE_IQ4_XS:
-+        case GGML_TYPE_IQ3_S:
-+        case GGML_TYPE_IQ2_S:
-+        case GGML_TYPE_F16:
-+        case GGML_TYPE_BF16:
-+        case GGML_TYPE_F32:
-+        case GGML_TYPE_I32:
-+            return true;
-+        default:
-+            return false;
-+    }
-+}
-+
-+static bool rpc_accel_fallback_supports_op(const ggml_tensor * node) {
-+    if (node == nullptr) {
-+        return false;
-+    }
-+    if (rpc_op_is_noop(node->op)) {
-+        return true;
-+    }
-+
-+    auto dims_positive = [](const ggml_tensor * t) -> bool {
-+        if ((uint32_t) t->type >= GGML_TYPE_COUNT) {
-+            return false;
-+        }
-+        const int64_t blck = ggml_blck_size(t->type);
-+        if (blck <= 0 || ggml_type_size(t->type) == 0) {
-+            return false;
-+        }
-+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
-+            if (t->ne[d] <= 0) {
-+                return false;
-+            }
-+        }
-+        return (t->ne[0] % blck) == 0;
-+    };
-+    if (!dims_positive(node)) {
-+        return false;
-+    }
-+    for (int s = 0; s < GGML_MAX_SRC; ++s) {
-+        if (node->src[s] != nullptr && !dims_positive(node->src[s])) {
-+            return false;
-+        }
-+    }
-+
-+    const ggml_tensor * src0 = node->src[0];
-+    const ggml_tensor * src1 = node->src[1];
-+    const ggml_tensor * src2 = node->src[2];
-+
-+    switch (node->op) {
-+        case GGML_OP_SET_ROWS: {
-+            if (src0 == nullptr || src1 == nullptr) {
-+                return false;
-+            }
-+            if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_BF16) {
-+                return false;
-+            }
-+            if (src1->type != GGML_TYPE_I64 && src1->type != GGML_TYPE_I32) {
-+                return false;
-+            }
-+            if (!rpc_cpu_type_has_from_float(node->type)) {
-+                return false;
-+            }
-+            if (node->ne[0] != src0->ne[0] ||
-+                node->ne[2] != src0->ne[2] ||
-+                node->ne[3] != src0->ne[3] ||
-+                src0->ne[1] != src1->ne[0] ||
-+                (src0->ne[2] % src1->ne[1]) != 0 ||
-+                (src0->ne[3] % src1->ne[2]) != 0 ||
-+                src1->ne[3] != 1) {
-+                return false;
-+            }
-+            return ggml_is_contiguous_rows(node) && ggml_is_contiguous_rows(src0);
-+        }
-+        case GGML_OP_GET_ROWS: {
-+            if (src0 == nullptr || src1 == nullptr) {
-+                return false;
-+            }
-+            if (src1->type != GGML_TYPE_I32 || !rpc_cpu_get_rows_src0_type_supported(src0->type)) {
-+                return false;
-+            }
-+            const ggml_type expected_dst_type = (src0->type == GGML_TYPE_I32) ? GGML_TYPE_I32 : GGML_TYPE_F32;
-+            if (node->type != expected_dst_type) {
-+                return false;
-+            }
-+            if (node->ne[0] != src0->ne[0] ||
-+                node->ne[1] != src1->ne[0] ||
-+                node->ne[2] != src1->ne[1] ||
-+                node->ne[3] != src1->ne[2] ||
-+                src0->ne[2] != src1->ne[1] ||
-+                src0->ne[3] != src1->ne[2] ||
-+                src1->ne[3] != 1) {
-+                return false;
-+            }
-+            if (src0->nb[0] != ggml_type_size(src0->type) ||
-+                ggml_nelements(src1) > INT32_MAX / 2) {
-+                return false;
-+            }
-+            return ggml_is_contiguous_rows(node) && ggml_is_contiguous_rows(src0);
-+        }
-+        case GGML_OP_SOFT_MAX: {
-+            if (src0 == nullptr || src0->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32) {
-+                return false;
-+            }
-+            if (!ggml_is_contiguous(node) || !ggml_is_contiguous_rows(src0) ||
-+                !ggml_are_same_shape(src0, node)) {
-+                return false;
-+            }
-+            if (src1 != nullptr) {
-+                if ((src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16) ||
-+                    !ggml_is_contiguous_rows(src1) ||
-+                    src1->ne[0] != src0->ne[0] ||
-+                    src1->ne[1] < src0->ne[1] ||
-+                    (src0->ne[2] % src1->ne[2]) != 0 ||
-+                    (src0->ne[3] % src1->ne[3]) != 0) {
-+                    return false;
-+                }
-+            }
-+            if (src2 != nullptr) {
-+                if (src2->type != GGML_TYPE_F32 ||
-+                    !ggml_is_contiguous_rows(src2) ||
-+                    src2->ne[0] < src0->ne[2]) {
-+                    return false;
-+                }
-+            }
-+            return true;
-+        }
-+        case GGML_OP_UNARY: {
-+            if (src0 == nullptr || !ggml_are_same_shape(src0, node)) {
-+                return false;
-+            }
-+            if (src0->ne[0] > INT32_MAX / 2 || ggml_nrows(src0) > INT32_MAX / 2) {
-+                return false;
-+            }
-+            const int32_t uop = ggml_get_op_params_i32(node, 0);
-+            if (uop < 0 || uop >= GGML_UNARY_OP_COUNT) {
-+                return false;
-+            }
-+            const bool same_type_only =
-+                uop == GGML_UNARY_OP_GELU ||
-+                uop == GGML_UNARY_OP_GELU_ERF ||
-+                uop == GGML_UNARY_OP_GELU_QUICK ||
-+                uop == GGML_UNARY_OP_SILU;
-+            const bool types_ok = same_type_only
-+                ? (node->type == src0->type &&
-+                   (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16))
-+                : ((src0->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32) ||
-+                   (src0->type == GGML_TYPE_F16 && (node->type == GGML_TYPE_F16 || node->type == GGML_TYPE_F32)) ||
-+                   (src0->type == GGML_TYPE_BF16 && (node->type == GGML_TYPE_BF16 || node->type == GGML_TYPE_F32)));
-+            if (!types_ok) {
-+                return false;
-+            }
-+            return ggml_is_contiguous_rows(node) && ggml_is_contiguous_rows(src0);
-+        }
-+        case GGML_OP_RMS_NORM: {
-+            if (src0 == nullptr || src0->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32) {
-+                return false;
-+            }
-+            if (!ggml_are_same_shape(src0, node) ||
-+                src0->nb[0] != sizeof(float) ||
-+                node->nb[0] != sizeof(float) ||
-+                !ggml_is_contiguous_rows(src0) ||
-+                !ggml_is_contiguous_rows(node)) {
-+                return false;
-+            }
-+            float eps = -1.0f;
-+            memcpy(&eps, node->op_params, sizeof(float));
-+            return (eps >= 0.0f) && (eps - eps) == 0.0f;
-+        }
-+        case GGML_OP_ADD:
-+        case GGML_OP_SUB:
-+        case GGML_OP_MUL:
-+        case GGML_OP_DIV: {
-+            if (src0 == nullptr || src1 == nullptr) {
-+                return false;
-+            }
-+            const bool types_ok =
-+                (src0->type == GGML_TYPE_F32  && src1->type == GGML_TYPE_F32  && node->type == GGML_TYPE_F32)  ||
-+                (src0->type == GGML_TYPE_F16  && src1->type == GGML_TYPE_F16  && node->type == GGML_TYPE_F16)  ||
-+                (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_BF16 && node->type == GGML_TYPE_BF16) ||
-+                (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F32  && (node->type == GGML_TYPE_BF16 || node->type == GGML_TYPE_F32)) ||
-+                (src0->type == GGML_TYPE_F16  && src1->type == GGML_TYPE_F32  && (node->type == GGML_TYPE_F16  || node->type == GGML_TYPE_F32));
-+            if (!types_ok) {
-+                return false;
-+            }
-+            return ggml_can_repeat(src1, src0) &&
-+                   ggml_are_same_shape(src0, node) &&
-+                   src0->nb[0] == ggml_type_size(src0->type) &&
-+                   src1->nb[0] == ggml_type_size(src1->type) &&
-+                   node->nb[0] == ggml_type_size(node->type) &&
-+                   ggml_is_contiguous_rows(src0) &&
-+                   ggml_is_contiguous_rows(src1) &&
-+                   ggml_is_contiguous_rows(node);
-+        }
-+        case GGML_OP_SCALE: {
-+            if (src0 == nullptr || node->type != src0->type) {
-+                return false;
-+            }
-+            if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_BF16) {
-+                return false;
-+            }
-+            return ggml_are_same_shape(src0, node) &&
-+                   src0->ne[0] <= INT32_MAX / 2 &&
-+                   ggml_nrows(src0) <= INT32_MAX / 2 &&
-+                   ggml_is_contiguous_rows(src0) &&
-+                   ggml_is_contiguous_rows(node);
-+        }
-+        case GGML_OP_ROPE: {
-+            if (src0 == nullptr || src1 == nullptr) {
-+                return false;
-+            }
-+            if (node->type != src0->type ||
-+                (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_BF16) ||
-+                src1->type != GGML_TYPE_I32) {
-+                return false;
-+            }
-+            if (!ggml_are_same_shape(src0, node) ||
-+                node->ne[0] <= 0 || (node->ne[0] % 2) != 0 ||
-+                src0->nb[0] != ggml_type_size(src0->type) ||
-+                node->nb[0] != ggml_type_size(node->type) ||
-+                !ggml_is_contiguous_rows(src0) ||
-+                !ggml_is_contiguous_rows(node) ||
-+                ggml_nrows(node) > INT32_MAX / 2) {
-+                return false;
-+            }
-+            const int32_t n_dims = ggml_get_op_params_i32(node, 1);
-+            const int32_t mode   = ggml_get_op_params_i32(node, 2);
-+            const int32_t n_offs = ggml_get_op_params_i32(node, 15);
-+            if (n_dims <= 0 || n_dims > node->ne[0] || (n_dims % 2) != 0 ||
-+                n_offs < 0 || (n_offs % 2) != 0 || n_offs + n_dims > node->ne[0]) {
-+                return false;
-+            }
-+            if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
-+                return false;
-+            }
-+            if (!ggml_is_contiguous(src1) || src1->ne[0] < node->ne[2]) {
-+                return false;
-+            }
-+            if (src2 != nullptr) {
-+                if (src2->type != GGML_TYPE_F32 || !ggml_is_contiguous(src2) ||
-+                    src2->ne[0] < node->ne[0] / 2) {
-+                    return false;
-+                }
-+            }
-+            return true;
-+        }
-+        case GGML_OP_GLU: {
-+            if (src0 == nullptr || src0->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32) {
-+                return false;
-+            }
-+            const int32_t gop = ggml_get_op_params_i32(node, 0);
-+            if (gop < 0 || gop >= GGML_GLU_OP_COUNT) {
-+                return false;
-+            }
-+            if (!ggml_is_contiguous_1(src0) || !ggml_is_contiguous_1(node) ||
-+                !ggml_is_contiguous_rows(src0) || !ggml_is_contiguous_rows(node) ||
-+                ggml_nrows(src0) > INT32_MAX / 2 || ggml_nrows(node) != ggml_nrows(src0)) {
-+                return false;
-+            }
-+            if (src1 != nullptr) {
-+                return src1->type == GGML_TYPE_F32 &&
-+                       ggml_is_contiguous_1(src1) &&
-+                       ggml_is_contiguous_rows(src1) &&
-+                       ggml_are_same_shape(src0, src1) &&
-+                       ggml_are_same_shape(src0, node);
-+            }
-+            return (src0->ne[0] % 2) == 0 &&
-+                   node->ne[0] == src0->ne[0] / 2 &&
-+                   node->ne[1] == src0->ne[1] &&
-+                   node->ne[2] == src0->ne[2] &&
-+                   node->ne[3] == src0->ne[3];
-+        }
-+        case GGML_OP_DUP:
-+        case GGML_OP_CPY:
-+        case GGML_OP_CONT: {
-+            if (src0 == nullptr || ggml_nelements(src0) != ggml_nelements(node) ||
-+                src0->ne[1] > INT32_MAX / 2) {
-+                return false;
-+            }
-+            if (src0->type == node->type) {
-+                if (ggml_blck_size(src0->type) > 1) {
-+                    return ggml_are_same_shape(src0, node) &&
-+                           ggml_is_contiguous_rows(src0) &&
-+                           ggml_is_contiguous_rows(node) &&
-+                           src0->nb[0] == ggml_type_size(src0->type) &&
-+                           node->nb[0] == ggml_type_size(node->type);
-+                }
-+                return ggml_is_contiguous(node) || ggml_are_same_shape(src0, node);
-+            }
-+            const bool src_flt = src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16;
-+            const bool dst_flt = node->type == GGML_TYPE_F32 || node->type == GGML_TYPE_F16 || node->type == GGML_TYPE_BF16;
-+            if (src_flt && dst_flt) {
-+                return ggml_is_contiguous(node) ||
-+                       (ggml_are_same_shape(src0, node) &&
-+                        ggml_is_contiguous_rows(src0) &&
-+                        ggml_is_contiguous_rows(node));
-+            }
-+            if (src_flt && rpc_cpu_type_has_from_float(node->type)) {
-+                return ggml_is_contiguous(node) && ggml_is_contiguous_rows(src0);
-+            }
-+            return false;
-+        }
-+        case GGML_OP_MUL_MAT: {
-+            if (src0 == nullptr || src1 == nullptr || node->type != GGML_TYPE_F32 ||
-+                (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16 && src1->type != GGML_TYPE_BF16)) {
-+                return false;
-+            }
-+            if (src0->ne[0] != src1->ne[0] ||
-+                node->ne[0] != src0->ne[1] ||
-+                node->ne[1] != src1->ne[1] ||
-+                node->ne[2] != src1->ne[2] ||
-+                node->ne[3] != src1->ne[3] ||
-+                (src1->ne[2] % src0->ne[2]) != 0 ||
-+                (src1->ne[3] % src0->ne[3]) != 0) {
-+                return false;
-+            }
-+            return ggml_is_contiguous_rows(src0) &&
-+                   ggml_is_contiguous_rows(src1) &&
-+                   ggml_is_contiguous_rows(node);
-+        }
-+        case GGML_OP_MUL_MAT_ID: {
-+            if (src0 == nullptr || src1 == nullptr || src2 == nullptr) {
-+                return false;
-+            }
-+            if (src2->type != GGML_TYPE_I32 || node->type != GGML_TYPE_F32 ||
-+                (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16 && src1->type != GGML_TYPE_BF16)) {
-+                return false;
-+            }
-+            if (src0->ne[3] != 1 || src1->ne[3] != 1 || src2->ne[2] != 1 || src2->ne[3] != 1 ||
-+                src0->ne[0] != src1->ne[0] ||
-+                src2->ne[1] != src1->ne[2] ||
-+                (src2->ne[0] % src1->ne[1]) != 0 ||
-+                node->ne[0] != src0->ne[1] ||
-+                node->ne[1] != src2->ne[0] ||
-+                node->ne[2] != src1->ne[2] ||
-+                node->ne[3] != 1) {
-+                return false;
-+            }
-+            return ggml_is_contiguous_rows(src0) &&
-+                   ggml_is_contiguous_rows(src1) &&
-+                   ggml_is_contiguous_rows(node);
-+        }
-+        default:
-+            return false;
-+    }
-+}
-+
-+static bool rpc_cpu_fallback_validate_node(
-+        ggml_backend_dev_t cpu_dev,
-+        const ggml_tensor * node,
-+        const std::unordered_set<ggml_backend_buffer_t> & buffers) {
-+    if (node == nullptr || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
-+        return true;
-+    }
-+    if (rpc_op_is_noop(node->op)) {
-+        return true;
-+    }
-+    if (cpu_dev == nullptr || !rpc_accel_fallback_supports_op(node)) {
-+        return false;
-+    }
-+    if (!rpc_tensor_span_in_buffer(node, buffers, false)) {
-+        return false;
-+    }
-+    for (int s = 0; s < GGML_MAX_SRC; ++s) {
-+        if (node->src[s] != nullptr && !rpc_tensor_span_in_buffer(node->src[s], buffers, false)) {
-+            return false;
-+        }
-+    }
-+
-+    const ggml_tensor * src0 = node->src[0];
-+    const ggml_tensor * src1 = node->src[1];
-+    const ggml_tensor * src2 = node->src[2];
-+
-+    switch (node->op) {
-+        case GGML_OP_SET_ROWS:
-+        case GGML_OP_GET_ROWS: {
-+            uint64_t dst_start = 0, dst_end = 0;
-+            uint64_t src1_start = 0, src1_end = 0;
-+            if (!rpc_tensor_span_in_buffer(node, buffers, true, &dst_start, &dst_end) ||
-+                !rpc_tensor_span_in_buffer(src0, buffers, true) ||
-+                !rpc_tensor_span_in_buffer(src1, buffers, false, &src1_start, &src1_end)) {
-+                return false;
-+            }
-+            if (rpc_ranges_overlap(dst_start, dst_end, src1_start, src1_end)) {
-+                return false;
-+            }
-+            break;
-+        }
-+        case GGML_OP_MUL_MAT_ID: {
-+            uint64_t dst_start = 0, dst_end = 0;
-+            uint64_t src2_start = 0, src2_end = 0;
-+            if (!rpc_tensor_span_in_buffer(src0, buffers, true) ||
-+                !rpc_tensor_span_in_buffer(src1, buffers, true) ||
-+                !rpc_tensor_span_in_buffer(node, buffers, true, &dst_start, &dst_end) ||
-+                !rpc_tensor_span_in_buffer(src2, buffers, false, &src2_start, &src2_end)) {
-+                return false;
-+            }
-+            if (rpc_ranges_overlap(dst_start, dst_end, src2_start, src2_end)) {
-+                return false;
-+            }
-+            break;
-+        }
-+        case GGML_OP_DUP:
-+        case GGML_OP_CPY:
-+        case GGML_OP_CONT: {
-+            const bool req_contig = (src0->type == node->type)
-+                ? (ggml_blck_size(src0->type) > 1)
-+                : (rpc_cpu_type_has_from_float(node->type) &&
-+                   node->type != GGML_TYPE_F32 && node->type != GGML_TYPE_F16 && node->type != GGML_TYPE_BF16);
-+            if (!rpc_tensor_span_in_buffer(src0, buffers, req_contig) ||
-+                !rpc_tensor_span_in_buffer(node, buffers, req_contig)) {
-+                return false;
-+            }
-+            break;
-+        }
-+        default: {
-+            if (!rpc_tensor_span_in_buffer(node, buffers, true)) {
-+                return false;
-+            }
-+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
-+                if (node->src[s] != nullptr && !rpc_tensor_span_in_buffer(node->src[s], buffers, true)) {
-+                    return false;
-+                }
-+            }
-+            break;
-+        }
-+    }
-+
-+    return ggml_backend_dev_supports_op(cpu_dev, node);
-+}
-+
-+static const ggml_tensor * rpc_cpu_fallback_index_tensor(const ggml_tensor * node) {
-+    if (node == nullptr) {
-+        return nullptr;
 +    }
 +    switch (node->op) {
-+        case GGML_OP_SET_ROWS:
-+        case GGML_OP_GET_ROWS:
-+            return node->src[1];
-+        case GGML_OP_MUL_MAT_ID:
-+            return node->src[2];
-+        default:
-+            return nullptr;
-+    }
-+}
-+
-+static bool rpc_cpu_fallback_validate_runtime_indices(const ggml_tensor * node) {
-+    if (node == nullptr) {
-+        return true;
-+    }
-+    switch (node->op) {
-+        case GGML_OP_SET_ROWS: {
-+            const ggml_tensor * src1 = node->src[1];
-+            const char * base = (const char *) src1->data;
-+            for (int64_t i12 = 0; i12 < src1->ne[2]; ++i12) {
-+                for (int64_t i11 = 0; i11 < src1->ne[1]; ++i11) {
-+                    for (int64_t i10 = 0; i10 < src1->ne[0]; ++i10) {
-+                        const char * ptr = base + i10 * src1->nb[0] + i11 * src1->nb[1] + i12 * src1->nb[2];
-+                        int64_t idx = -1;
-+                        if (src1->type == GGML_TYPE_I64) {
-+                            memcpy(&idx, ptr, sizeof(idx));
-+                        } else {
-+                            int32_t idx32 = -1;
-+                            memcpy(&idx32, ptr, sizeof(idx32));
-+                            idx = (int64_t) idx32;
-+                        }
-+                        if (idx < 0 || idx >= node->ne[1]) {
-+                            return false;
-+                        }
-+                    }
-+                }
-+            }
-+            return true;
-+        }
-+        case GGML_OP_GET_ROWS: {
-+            const ggml_tensor * src0 = node->src[0];
-+            const ggml_tensor * src1 = node->src[1];
-+            const char * base = (const char *) src1->data;
-+            for (int64_t i12 = 0; i12 < src1->ne[2]; ++i12) {
-+                for (int64_t i11 = 0; i11 < src1->ne[1]; ++i11) {
-+                    for (int64_t i10 = 0; i10 < src1->ne[0]; ++i10) {
-+                        const char * ptr = base + i10 * src1->nb[0] + i11 * src1->nb[1] + i12 * src1->nb[2];
-+                        int32_t idx = -1;
-+                        memcpy(&idx, ptr, sizeof(idx));
-+                        if (idx < 0 || idx >= src0->ne[1]) {
-+                            return false;
-+                        }
-+                    }
-+                }
-+            }
-+            return true;
-+        }
-+        case GGML_OP_MUL_MAT_ID: {
-+            const ggml_tensor * src0 = node->src[0];
-+            const ggml_tensor * src2 = node->src[2];
-+            const char * base = (const char *) src2->data;
-+            for (int64_t i21 = 0; i21 < src2->ne[1]; ++i21) {
-+                for (int64_t i20 = 0; i20 < src2->ne[0]; ++i20) {
-+                    const char * ptr = base + i20 * src2->nb[0] + i21 * src2->nb[1];
-+                    int32_t idx = -2;
-+                    memcpy(&idx, ptr, sizeof(idx));
-+                    if (idx != -1 && (idx < 0 || idx >= src0->ne[2])) {
-+                        return false;
-+                    }
-+                }
-+            }
-+            return true;
-+        }
++        case GGML_OP_MAP_CUSTOM1:
++        case GGML_OP_MAP_CUSTOM2:
++        case GGML_OP_MAP_CUSTOM3:
++        case GGML_OP_CUSTOM:
++            // Custom ops carry process-local function pointers in op_params.
++            return false;
 +        default:
 +            return true;
 +    }
@@ -753,7 +74,6 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 +        return ggml_backend_graph_compute_async(backend, graph);
 +    }
 +
-+    ggml_backend_dev_t cpu_dev = ggml_backend_get_device(cpu_fallback);
 +    int i = 0;
 +    while (i < graph->n_nodes) {
 +        while (i < graph->n_nodes &&
@@ -764,6 +84,10 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 +        if (i >= graph->n_nodes) {
 +            break;
 +        }
++        if (!rpc_op_is_supported_on_rpc(graph->nodes[i])) {
++            LOG_ERROR("[%s] rejecting unsupported RPC op %d\n", __func__, (int) graph->nodes[i]->op);
++            return GGML_STATUS_FAILED;
++        }
 +        const bool use_accel = ggml_backend_dev_supports_op(dev, graph->nodes[i]);
 +        int j = i + 1;
 +        while (j < graph->n_nodes) {
@@ -771,58 +95,23 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 +            if (node == nullptr || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
 +                break;
 +            }
++            if (!rpc_op_is_supported_on_rpc(node)) {
++                LOG_ERROR("[%s] rejecting unsupported RPC op %d\n", __func__, (int) node->op);
++                return GGML_STATUS_FAILED;
++            }
 +            if (ggml_backend_dev_supports_op(dev, node) != use_accel) {
 +                break;
 +            }
 +            ++j;
 +        }
++        struct ggml_cgraph sub = ggml_graph_view(graph, i, j);
 +        ggml_status status = GGML_STATUS_SUCCESS;
 +        if (use_accel) {
-+            struct ggml_cgraph sub = ggml_graph_view(graph, i, j);
 +            status = ggml_backend_graph_compute_async(backend, &sub);
 +            if (status == GGML_STATUS_SUCCESS) {
 +                ggml_backend_synchronize(backend);
 +            }
 +        } else {
-+            for (int k = i; k < j; ++k) {
-+                ggml_tensor * node = graph->nodes[k];
-+                if (node == nullptr || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
-+                    continue;
-+                }
-+                if (!rpc_cpu_fallback_validate_node(cpu_dev, node, buffers)) {
-+                    const uint32_t op_u = (uint32_t) node->op;
-+                    const char * op_s = op_u < GGML_OP_COUNT ? ggml_op_name(node->op) : "INVALID";
-+                    LOG_ERROR("[%s] rejecting invalid/disallowed CPU fallback op %d (%s)\n",
-+                              __func__, (int) node->op, op_s);
-+                    return GGML_STATUS_FAILED;
-+                }
-+                const ggml_tensor * idx_tensor = rpc_cpu_fallback_index_tensor(node);
-+                if (idx_tensor != nullptr) {
-+                    bool idx_written_earlier = false;
-+                    for (int m = i; m < k; ++m) {
-+                        const ggml_tensor * prev = graph->nodes[m];
-+                        if (prev != nullptr &&
-+                            (prev->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 &&
-+                            !rpc_op_is_noop(prev->op) &&
-+                            prev->buffer == idx_tensor->buffer) {
-+                            idx_written_earlier = true;
-+                            break;
-+                        }
-+                    }
-+                    if (idx_written_earlier) {
-+                        j = k;
-+                        break;
-+                    }
-+                    if (!rpc_cpu_fallback_validate_runtime_indices(node)) {
-+                        const uint32_t op_u = (uint32_t) node->op;
-+                        const char * op_s = op_u < GGML_OP_COUNT ? ggml_op_name(node->op) : "INVALID";
-+                        LOG_ERROR("[%s] rejecting out-of-bounds runtime index for CPU fallback op %d (%s)\n",
-+                                  __func__, (int) node->op, op_s);
-+                        return GGML_STATUS_FAILED;
-+                    }
-+                }
-+            }
-+            struct ggml_cgraph sub = ggml_graph_view(graph, i, j);
 +            status = ggml_backend_graph_compute(cpu_fallback, &sub);
 +        }
 +        if (status != GGML_STATUS_SUCCESS) {
@@ -831,10 +120,12 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 +        i = j;
 +    }
 +    return GGML_STATUS_SUCCESS;
- }
- 
++}
++
  bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
-@@ -2266,8 +3066,11 @@
+     // serialization format:
+     // | device (4 bytes) | uid (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
+@@ -2266,8 +2357,12 @@
      }
      const std::chrono::duration<double, std::milli> deserialize_ms = std::chrono::steady_clock::now() - t_deserialize;
  
@@ -842,13 +133,14 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 -    GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
 +    ggml_status status = compute_graph_with_accel_fallback(device, graph);
 +    if (status != GGML_STATUS_SUCCESS) {
-+        LOG_ERROR("[%s] device: %u, graph compute failed/rejected (status=%d)\n", __func__, device, (int) status);
++        sg.graph = nullptr;
++        LOG_ERROR("[%s] device: %u, graph compute failed (status=%d)\n", __func__, device, (int) status);
 +        return false;
 +    }
      sg.graph = graph;
      LOG_DBG3("[%s] device: %u, graph build: %.3f ms\n", __func__, device, deserialize_ms.count());
      return true;
-@@ -2285,8 +3088,11 @@
+@@ -2285,8 +2380,11 @@
      }
      ggml_cgraph * graph = it->second.graph;
      LOG_DBG("[%s] device: %u, uid: %" PRIu64 "\n", __func__, device, request.uid);
@@ -856,21 +148,20 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 -    GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
 +    ggml_status status = compute_graph_with_accel_fallback(device, graph);
 +    if (status != GGML_STATUS_SUCCESS) {
-+        LOG_ERROR("[%s] device: %u, graph compute failed/rejected (status=%d)\n", __func__, device, (int) status);
++        LOG_ERROR("[%s] device: %u, graph compute failed (status=%d)\n", __func__, device, (int) status);
 +        return false;
 +    }
      return true;
  }
  
-@@ -2654,12 +3460,16 @@
-     }
+@@ -2655,11 +2753,15 @@
      for (auto buffer : buffers) {
          ggml_backend_buffer_free(buffer);
-+    }
+     }
 +    if (cpu_fallback != nullptr) {
 +        ggml_backend_free(cpu_fallback);
 +        cpu_fallback = nullptr;
-     }
++    }
  }
  
  static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
@@ -881,7 +172,7 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
      uint8_t cmd;
      if (!sock->recv_data(&cmd, 1)) {
          return;
-@@ -3047,7 +3857,7 @@
+@@ -3047,7 +3149,7 @@
              return;
          }
          LOG_INFO("Accepted client connection\n");
@@ -890,14 +181,14 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
          LOG_INFO("Client connection closed\n");
      }
      rpc_transport_shutdown();
-@@ -3113,9 +3923,7 @@
+@@ -3113,9 +3215,8 @@
  
  static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
      GGML_UNUSED(dev);
 -    GGML_UNUSED(op);
--    //TODO: call the remote backend and cache the results
+     //TODO: call the remote backend and cache the results
 -    return true;
-+    return rpc_accel_fallback_supports_op(op);
++    return rpc_op_is_supported_on_rpc(op);
  }
  
  static bool ggml_backend_rpc_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
