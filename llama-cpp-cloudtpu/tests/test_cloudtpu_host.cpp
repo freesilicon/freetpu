@@ -5646,8 +5646,16 @@ void test_ggml_cgraph_continuous_batching_buckets() {
         }
 
         ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-        const int64_t fixed_slots[8] = {2, 5, 8, 11, 14, 17, 20, 22};
-        for (int64_t T : batch_sizes) {
+        auto step_kv_slot = [](size_t step_idx, int64_t t) -> int64_t {
+            static const int64_t base_slots[8] = {2, 5, 8, 11, 14, 17, 20, 22};
+            // Shift existing lanes on cache-hit steps (step_idx > 0) across distinct slots in
+            // [1, N_KV-1] while keeping slot 0 and slots [N_KV, KV_CAP) untouched.
+            return (step_idx == 0)
+                       ? base_slots[static_cast<size_t>(t)]
+                       : (1 + ((base_slots[static_cast<size_t>(t)] + static_cast<int64_t>(step_idx)) % 23));
+        };
+        for (size_t step_idx = 0; step_idx < batch_sizes.size(); ++step_idx) {
+            const int64_t T = batch_sizes[step_idx];
             const size_t g_mem = ggml_tensor_overhead() * 256 + ggml_graph_overhead() + 4096;
             struct ggml_init_params gp = {g_mem, nullptr, true};
             struct ggml_context* ctx_g = ggml_init(gp);
@@ -5730,12 +5738,20 @@ void test_ggml_cgraph_continuous_batching_buckets() {
             std::vector<uint16_t> mask_f16(static_cast<size_t>(T * N_KV),
                                            cloudtpu::f32_to_f16(-std::numeric_limits<float>::infinity()));
             for (int64_t t = 0; t < T; ++t) {
-                tokens[static_cast<size_t>(t)] = static_cast<int32_t>((t * 5 + 3) % V_emb);
-                pos[static_cast<size_t>(t)] = static_cast<int32_t>(t + 1);
-                row_idx64[static_cast<size_t>(t)] = fixed_slots[static_cast<size_t>(t)];
-                out_ids[static_cast<size_t>(t)] = static_cast<int32_t>(T - 1 - t);
+                const int64_t kv_slot = step_kv_slot(step_idx, t);
+                tokens[static_cast<size_t>(t)] =
+                    static_cast<int32_t>((t * 5 + static_cast<int64_t>(step_idx) * 7 + 3) % V_emb);
+                pos[static_cast<size_t>(t)] =
+                    static_cast<int32_t>((t + 1) + static_cast<int64_t>(step_idx) * 4);
+                row_idx64[static_cast<size_t>(t)] = kv_slot;
+                out_ids[static_cast<size_t>(t)] =
+                    static_cast<int32_t>((T - 1 - t + static_cast<int64_t>(step_idx)) % T);
                 mask_f16[static_cast<size_t>(t * N_KV + 0)] = cloudtpu::f32_to_f16(0.0f);
-                mask_f16[static_cast<size_t>(t * N_KV + fixed_slots[static_cast<size_t>(t)])] = cloudtpu::f32_to_f16(0.0f);
+                mask_f16[static_cast<size_t>(t * N_KV + kv_slot)] = cloudtpu::f32_to_f16(0.0f);
+                if (step_idx > 0) {
+                    const int64_t prev_slot = step_kv_slot(step_idx - 1, t);
+                    mask_f16[static_cast<size_t>(t * N_KV + prev_slot)] = cloudtpu::f32_to_f16(0.0f);
+                }
             }
             ggml_backend_tensor_set(inp_tokens, tokens.data(), 0, tokens.size() * sizeof(int32_t));
             ggml_backend_tensor_set(inp_pos, pos.data(), 0, pos.size() * sizeof(int32_t));
@@ -5800,12 +5816,19 @@ void test_ggml_cgraph_continuous_batching_buckets() {
         return out;
     };
 
-    // 1) T=5,6,7,8 sequence with default CLOUDTPU_BATCH_BUCKETS -> plan_misses=1, plan_hits=3,
-    //    and verify every step's logits (including all cache-hit steps) and final KV state match
-    //    the identical T=5,6,7,8 sequence run with bucketing disabled.
+    // 1) T=5,6,7,8 sequence with default CLOUDTPU_BATCH_BUCKETS -> plan_misses=1, plan_hits=3.
+    //    Inputs (token, pos, attention mask, KV destination, out_ids) vary for existing lanes on
+    //    every cache-hit step; verify every step's logits and the final KV state match the
+    //    identical T=5,6,7,8 sequence run with bucketing disabled.
+    const std::vector<int64_t> seq_batches = {5, 6, 7, 8};
     const int64_t fixed_slots[8] = {2, 5, 8, 11, 14, 17, 20, 22};
-    const CbRunResult seq_res = run_steps({5, 6, 7, 8}, nullptr);
-    const CbRunResult seq_unbucketed = run_steps({5, 6, 7, 8}, "0");
+    auto seq_kv_slot = [&](size_t step_idx, int64_t t) -> int64_t {
+        return (step_idx == 0)
+                   ? fixed_slots[static_cast<size_t>(t)]
+                   : (1 + ((fixed_slots[static_cast<size_t>(t)] + static_cast<int64_t>(step_idx)) % 23));
+    };
+    const CbRunResult seq_res = run_steps(seq_batches, nullptr);
+    const CbRunResult seq_unbucketed = run_steps(seq_batches, "0");
     CHECK_TRUE(seq_res.ok && seq_unbucketed.ok, "ggml CB bucket sequence T=5,6,7,8 succeeded");
     const uint64_t misses = parse_log_u64(seq_res.logs, "plan_misses");
     const uint64_t hits = parse_log_u64(seq_res.logs, "plan_hits");
@@ -5816,6 +5839,15 @@ void test_ggml_cgraph_continuous_batching_buckets() {
                "ggml CB unbucketed reference T=5,6,7,8 must have bucketed==0");
     CHECK_TRUE(seq_res.logits_per_step.size() == 4 && seq_unbucketed.logits_per_step.size() == 4,
                "ggml CB T=5,6,7,8 must return 4 step logit buffers");
+    float max_step01_lane_delta = 0.0f;
+    for (int64_t i = 0; i < 5 * V_out; ++i) {
+        max_step01_lane_delta = std::max(
+            max_step01_lane_delta,
+            std::fabs(seq_res.logits_per_step[1][static_cast<size_t>(i)] -
+                      seq_res.logits_per_step[0][static_cast<size_t>(i)]));
+    }
+    CHECK_TRUE(max_step01_lane_delta > 1e-3f,
+               "ggml CB cache-hit step must produce updated logits for varied existing lanes");
     for (size_t s = 0; s < seq_res.logits_per_step.size(); ++s) {
         CHECK_TRUE(seq_res.logits_per_step[s].size() == seq_unbucketed.logits_per_step[s].size(),
                    "ggml CB sequence step logit size must match unbucketed");
@@ -5830,10 +5862,12 @@ void test_ggml_cgraph_continuous_batching_buckets() {
     for (int64_t l = 0; l < n_layers; ++l) {
         for (int64_t slot = 0; slot < KV_CAP; ++slot) {
             bool active = false;
-            for (int64_t t = 0; t < 8; ++t) {
-                if (fixed_slots[static_cast<size_t>(t)] == slot) {
-                    active = true;
-                    break;
+            for (size_t s = 0; s < seq_batches.size() && !active; ++s) {
+                for (int64_t t = 0; t < seq_batches[s]; ++t) {
+                    if (seq_kv_slot(s, t) == slot) {
+                        active = true;
+                        break;
+                    }
                 }
             }
             for (int64_t d = 0; d < D_KV; ++d) {
