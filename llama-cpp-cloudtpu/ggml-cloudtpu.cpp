@@ -1468,7 +1468,11 @@ struct ggml_backend_cloudtpu_context {
     }
 };
 
+// Cap materialized [B, H_Q, N_Q, N_KV] F32 score tensors on both host mock (32 MiB)
+// and live Cloud TPU (256 MiB) so oversized long-context prefills fall back cleanly
+// instead of exhausting host RAM or 16 GiB v5e HBM.
 static constexpr uint64_t kMaxMockAttentionScoreElems = 8ULL * 1024ULL * 1024ULL;
+static constexpr uint64_t kMaxLiveAttentionScoreElems = 64ULL * 1024ULL * 1024ULL;
 
 static bool is_host_mock_active() {
     cloudtpu::PjrtRuntime& rt = cloudtpu::shared_pjrt_runtime(nullptr);
@@ -1651,8 +1655,9 @@ static bool ggml_backend_cloudtpu_device_supports_op_impl(const struct ggml_tens
                     return false;
                 }
             }
-            if (is_host_mock_active() &&
-                static_cast<uint64_t>(ggml_nelements(op)) > kMaxMockAttentionScoreElems) {
+            const uint64_t max_score_elems =
+                is_host_mock_active() ? kMaxMockAttentionScoreElems : kMaxLiveAttentionScoreElems;
+            if (static_cast<uint64_t>(ggml_nelements(op)) > max_score_elems) {
                 return false;
             }
             return true;
@@ -1694,16 +1699,18 @@ static bool ggml_backend_cloudtpu_device_supports_op_impl(const struct ggml_tens
                     return false;
                 }
             }
-            if (is_host_mock_active()) {
+            {
+                const uint64_t max_score_elems =
+                    is_host_mock_active() ? kMaxMockAttentionScoreElems : kMaxLiveAttentionScoreElems;
                 const uint64_t b = static_cast<uint64_t>(q->ne[3]);
                 const uint64_t hq = static_cast<uint64_t>(q->ne[2]);
                 const uint64_t nq = static_cast<uint64_t>(q->ne[1]);
                 const uint64_t nkv = static_cast<uint64_t>(k->ne[1]);
                 if (b == 0 || hq == 0 || nq == 0 || nkv == 0 ||
-                    b > kMaxMockAttentionScoreElems ||
-                    hq > kMaxMockAttentionScoreElems / b ||
-                    nq > kMaxMockAttentionScoreElems / (b * hq) ||
-                    nkv > kMaxMockAttentionScoreElems / (b * hq * nq)) {
+                    b > max_score_elems ||
+                    hq > max_score_elems / b ||
+                    nq > max_score_elems / (b * hq) ||
+                    nkv > max_score_elems / (b * hq * nq)) {
                     return false;
                 }
             }
