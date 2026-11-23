@@ -126,8 +126,16 @@ for dev_path in "${PCI_SYSFS_DIR}"/*; do
     non_tpu_google_count=$((non_tpu_google_count + 1))
     continue
   fi
-  drv="$(basename "$(readlink -f "${dev_path}/driver" 2>/dev/null || echo unbound)" 2>/dev/null || echo unbound)"
-  grp="$(basename "$(readlink -f "${dev_path}/iommu_group" 2>/dev/null || echo none)" 2>/dev/null || echo none)"
+  if [[ -L "${dev_path}/driver" && -e "${dev_path}/driver" ]]; then
+    drv="$(basename "$(readlink -f "${dev_path}/driver" 2>/dev/null)" 2>/dev/null || echo unbound)"
+  else
+    drv="unbound"
+  fi
+  if [[ -L "${dev_path}/iommu_group" && -e "${dev_path}/iommu_group" ]]; then
+    grp="$(basename "$(readlink -f "${dev_path}/iommu_group" 2>/dev/null)" 2>/dev/null || echo none)"
+  else
+    grp="none"
+  fi
   numa="$(cat "${dev_path}/numa_node" 2>/dev/null || echo -1)"
   log "--- TPU BDF=${bdf} vid=${vid} did=${did} class=${cls} driver=${drv} iommu_group=${grp} numa=${numa} ---"
   if [[ -r "${dev_path}/resource" ]]; then

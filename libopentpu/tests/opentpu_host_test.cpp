@@ -2358,6 +2358,133 @@ static void test_pjrt_multidevice_isolation_and_topology() {
     OT_CHECK(api->PJRT_Client_Destroy(&cd) == nullptr);
   }
 
+  // 7. With visible_devices=[1, 3], compile device_ordinal=1 must resolve to the 2nd visible
+  //    device (global ID 3), NOT global device ID 1, and device_ordinal=2 must be rejected.
+  {
+    unsetenv("OPENTPU_MOCK_CHIP");
+    unsetenv("OPENTPU_MOCK_DEVICE_ID");
+    setenv("OPENTPU_MOCK", "1", 1);
+    setenv("OPENTPU_MOCK_TOPOLOGY", "tpu7x-4t", 1);
+
+    const int64_t vis13[2] = {1, 3};
+    PJRT_NamedValue nv = {};
+    nv.struct_size = PJRT_NamedValue_STRUCT_SIZE;
+    nv.name = "visible_devices";
+    nv.name_size = std::strlen("visible_devices");
+    nv.type = PJRT_NamedValue_kInt64List;
+    nv.int64_array_value = vis13;
+    nv.value_size = 2;
+
+    PJRT_Client_Create_Args cc = {};
+    cc.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
+    cc.create_options = &nv;
+    cc.num_options = 1;
+    OT_CHECK(api->PJRT_Client_Create(&cc) == nullptr && cc.client != nullptr);
+
+    PJRT_Client_AddressableDevices_Args ad = {};
+    ad.struct_size = PJRT_Client_AddressableDevices_Args_STRUCT_SIZE;
+    ad.client = cc.client;
+    OT_CHECK(api->PJRT_Client_AddressableDevices(&ad) == nullptr);
+    OT_CHECK(ad.num_addressable_devices == 2u);
+
+    auto get_dev_id = [&](PJRT_Device* d) -> int {
+      PJRT_Device_GetDescription_Args gd = {};
+      gd.struct_size = PJRT_Device_GetDescription_Args_STRUCT_SIZE;
+      gd.device = d;
+      OT_CHECK(api->PJRT_Device_GetDescription(&gd) == nullptr);
+      PJRT_DeviceDescription_Id_Args id = {};
+      id.struct_size = PJRT_DeviceDescription_Id_Args_STRUCT_SIZE;
+      id.device_description = gd.device_description;
+      OT_CHECK(api->PJRT_DeviceDescription_Id(&id) == nullptr);
+      return id.id;
+    };
+    OT_CHECK(get_dev_id(ad.addressable_devices[0]) == 1);
+    OT_CHECK(get_dev_id(ad.addressable_devices[1]) == 3);
+
+    // CompileOptions { executable_build_options (field 3) { device_ordinal (field 1) = 1 } }
+    const char opt_ord1[] = {0x1a, 0x02, 0x08, 0x01};
+    PJRT_Client_Compile_Args ca = {};
+    ca.struct_size = PJRT_Client_Compile_Args_STRUCT_SIZE;
+    ca.client = cc.client;
+    ca.program = &prog;
+    ca.compile_options = opt_ord1;
+    ca.compile_options_size = sizeof(opt_ord1);
+    OT_CHECK(api->PJRT_Client_Compile(&ca) == nullptr && ca.executable != nullptr);
+
+    PJRT_LoadedExecutable_AddressableDevices_Args ead = {};
+    ead.struct_size = PJRT_LoadedExecutable_AddressableDevices_Args_STRUCT_SIZE;
+    ead.executable = ca.executable;
+    OT_CHECK(api->PJRT_LoadedExecutable_AddressableDevices(&ead) == nullptr);
+    OT_CHECK(ead.num_addressable_devices == 1u);
+    OT_CHECK(ead.addressable_devices[0] == ad.addressable_devices[1]);
+    OT_CHECK(get_dev_id(ead.addressable_devices[0]) == 3);
+
+    // Out-of-range ordinal (device_ordinal=2 >= visible_count=2) must fail with INVALID_ARGUMENT.
+    const char opt_ord2[] = {0x1a, 0x02, 0x08, 0x02};
+    PJRT_Client_Compile_Args ca_bad = ca;
+    ca_bad.compile_options = opt_ord2;
+    ca_bad.compile_options_size = sizeof(opt_ord2);
+    ca_bad.executable = nullptr;
+    PJRT_Error* oob_err = api->PJRT_Client_Compile(&ca_bad);
+    OT_CHECK(oob_err != nullptr && get_err_code(oob_err) == PJRT_Error_Code_INVALID_ARGUMENT);
+    OT_CHECK(ca_bad.executable == nullptr);
+    destroy_pjrt_error(api, oob_err);
+
+    PJRT_LoadedExecutable_Destroy_Args led = {};
+    led.struct_size = PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
+    led.executable = ca.executable;
+    OT_CHECK(api->PJRT_LoadedExecutable_Destroy(&led) == nullptr);
+    PJRT_Client_Destroy_Args cd = {};
+    cd.struct_size = PJRT_Client_Destroy_Args_STRUCT_SIZE;
+    cd.client = cc.client;
+    OT_CHECK(api->PJRT_Client_Destroy(&cd) == nullptr);
+  }
+
+  // 8. Conflicting mock topology + device ID / chip selectors must fail with INVALID_ARGUMENT,
+  //    while matching guest Ironwood VFIO ID (0x0076) + tpu7x-4t succeeds consistently.
+  {
+    setenv("OPENTPU_MOCK", "1", 1);
+    unsetenv("OPENTPU_MOCK_CHIP");
+    setenv("OPENTPU_MOCK_TOPOLOGY", "tpu7x-4t", 1);
+    setenv("OPENTPU_MOCK_DEVICE_ID", "0x0063", 1);
+
+    PJRT_Client_Create_Args cc_bad_did = {};
+    cc_bad_did.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
+    PJRT_Error* err_did = api->PJRT_Client_Create(&cc_bad_did);
+    OT_CHECK(err_did != nullptr && get_err_code(err_did) == PJRT_Error_Code_INVALID_ARGUMENT);
+    OT_CHECK(cc_bad_did.client == nullptr);
+    destroy_pjrt_error(api, err_did);
+
+    unsetenv("OPENTPU_MOCK_DEVICE_ID");
+    setenv("OPENTPU_MOCK_CHIP", "v5e", 1);
+    PJRT_Client_Create_Args cc_bad_chip = {};
+    cc_bad_chip.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
+    PJRT_Error* err_chip = api->PJRT_Client_Create(&cc_bad_chip);
+    OT_CHECK(err_chip != nullptr && get_err_code(err_chip) == PJRT_Error_Code_INVALID_ARGUMENT);
+    OT_CHECK(cc_bad_chip.client == nullptr);
+    destroy_pjrt_error(api, err_chip);
+
+    unsetenv("OPENTPU_MOCK_CHIP");
+    setenv("OPENTPU_MOCK_DEVICE_ID", "0x0076", 1);
+    PJRT_Client_Create_Args cc_ok = {};
+    cc_ok.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
+    OT_CHECK(api->PJRT_Client_Create(&cc_ok) == nullptr && cc_ok.client != nullptr);
+    PJRT_Client_AddressableDevices_Args ad = {};
+    ad.struct_size = PJRT_Client_AddressableDevices_Args_STRUCT_SIZE;
+    ad.client = cc_ok.client;
+    OT_CHECK(api->PJRT_Client_AddressableDevices(&ad) == nullptr);
+    OT_CHECK(ad.num_addressable_devices == 8u);
+    ot_device_info_t dinfo = {};
+    OT_CHECK(ot_device_get_info(ot::pjrt_device_context_raw(ad.addressable_devices[0]), &dinfo) == OT_OK);
+    OT_CHECK(dinfo.chip_gen == OT_CHIP_TPU7X && dinfo.device_id == 0x0076u);
+
+    PJRT_Client_Destroy_Args cd = {};
+    cd.struct_size = PJRT_Client_Destroy_Args_STRUCT_SIZE;
+    cd.client = cc_ok.client;
+    OT_CHECK(api->PJRT_Client_Destroy(&cd) == nullptr);
+    unsetenv("OPENTPU_MOCK_DEVICE_ID");
+  }
+
   unsetenv("OPENTPU_MOCK_TOPOLOGY");
   unsetenv("OPENTPU_MOCK_CHIP");
   unsetenv("OPENTPU_MOCK");

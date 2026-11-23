@@ -1143,35 +1143,102 @@ PJRT_Error* ot_pjrt_client_create(PJRT_Client_Create_Args* args) {
   size_t chiplets_per_func = 1;
 
   if (cfg.mock_mode) {
-    uint16_t mock_did = 0x0063u;
-    if (const char* did_env = std::getenv("OPENTPU_MOCK_DEVICE_ID")) {
-      uint64_t parsed = 0;
-      if (ot::parse_hex_u64(did_env, &parsed) && parsed <= 0xffffULL) {
-        mock_did = static_cast<uint16_t>(parsed);
+    auto parse_mock_chip_env = [](const char* s) -> ot_chip_gen_t {
+      if (!s || !s[0]) return OT_CHIP_UNKNOWN;
+      if (std::strcmp(s, "tpu7x") == 0 || std::strcmp(s, "ironwood") == 0 ||
+          std::strcmp(s, "v7x") == 0) {
+        return OT_CHIP_TPU7X;
       }
-    } else if (const char* topo_env = std::getenv("OPENTPU_MOCK_TOPOLOGY")) {
-      if (std::strcmp(topo_env, "tpu7x-1t") == 0 || std::strcmp(topo_env, "tpu7x_1t") == 0 ||
-          std::strcmp(topo_env, "tpu7x-4t") == 0 || std::strcmp(topo_env, "tpu7x_4t") == 0) {
-        mock_did = 0x0075u;
+      if (std::strcmp(s, "v6e") == 0 || std::strcmp(s, "trillium") == 0) {
+        return OT_CHIP_V6E;
+      }
+      if (std::strcmp(s, "v5e") == 0 || std::strcmp(s, "v5lite") == 0) {
+        return OT_CHIP_V5E;
+      }
+      return OT_CHIP_UNKNOWN;
+    };
+
+    bool has_named_topo = false;
+    ot_chip_gen_t topo_gen = OT_CHIP_UNKNOWN;
+    uint16_t topo_did = 0x0063u;
+    if (const char* topo_env = std::getenv("OPENTPU_MOCK_TOPOLOGY")) {
+      if (std::strcmp(topo_env, "tpu7x-1t") == 0 || std::strcmp(topo_env, "tpu7x_1t") == 0) {
+        has_named_topo = true;
+        topo_gen = OT_CHIP_TPU7X;
+        topo_did = 0x0075u;
+        pci_funcs = 1;
+        chiplets_per_func = 2;
+      } else if (std::strcmp(topo_env, "tpu7x-4t") == 0 || std::strcmp(topo_env, "tpu7x_4t") == 0) {
+        has_named_topo = true;
+        topo_gen = OT_CHIP_TPU7X;
+        topo_did = 0x0075u;
+        pci_funcs = 4;
+        chiplets_per_func = 2;
       } else if (std::strcmp(topo_env, "v6e-8") == 0 || std::strcmp(topo_env, "v6e_8") == 0) {
-        mock_did = 0x006fu;
+        has_named_topo = true;
+        topo_gen = OT_CHIP_V6E;
+        topo_did = 0x006fu;
+        pci_funcs = 8;
+        chiplets_per_func = 1;
       } else if (std::strcmp(topo_env, "v5e-1") == 0 || std::strcmp(topo_env, "v5e_1") == 0) {
-        mock_did = 0x0063u;
-      } else if (const char* chip_env = std::getenv("OPENTPU_MOCK_CHIP")) {
-        if (std::strcmp(chip_env, "tpu7x") == 0 || std::strcmp(chip_env, "ironwood") == 0 ||
-            std::strcmp(chip_env, "v7x") == 0) {
-          mock_did = 0x0075u;
-        } else if (std::strcmp(chip_env, "v6e") == 0 || std::strcmp(chip_env, "trillium") == 0) {
-          mock_did = 0x006fu;
+        has_named_topo = true;
+        topo_gen = OT_CHIP_V5E;
+        topo_did = 0x0063u;
+        pci_funcs = 1;
+        chiplets_per_func = 1;
+      }
+    }
+
+    bool has_did_env = false;
+    bool did_parsed_ok = false;
+    uint16_t env_did = 0;
+    ot_chip_gen_t did_gen = OT_CHIP_UNKNOWN;
+    if (const char* did_env = std::getenv("OPENTPU_MOCK_DEVICE_ID")) {
+      if (did_env[0] != '\0') {
+        has_did_env = true;
+        uint64_t parsed = 0;
+        if (ot::parse_hex_u64(did_env, &parsed) && parsed <= 0xffffULL) {
+          did_parsed_ok = true;
+          env_did = static_cast<uint16_t>(parsed);
+          ot_device_geometry_t did_geom = {};
+          (void)ot::chip_geometry_for_device_id(env_did, &did_geom);
+          did_gen = static_cast<ot_chip_gen_t>(did_geom.chip_gen);
         }
       }
-    } else if (const char* chip_env = std::getenv("OPENTPU_MOCK_CHIP")) {
-      if (std::strcmp(chip_env, "tpu7x") == 0 || std::strcmp(chip_env, "ironwood") == 0 ||
-          std::strcmp(chip_env, "v7x") == 0) {
-        mock_did = 0x0075u;
-      } else if (std::strcmp(chip_env, "v6e") == 0 || std::strcmp(chip_env, "trillium") == 0) {
-        mock_did = 0x006fu;
+    }
+
+    bool has_chip_env = false;
+    ot_chip_gen_t chip_gen = OT_CHIP_UNKNOWN;
+    if (const char* chip_env = std::getenv("OPENTPU_MOCK_CHIP")) {
+      if (chip_env[0] != '\0') {
+        has_chip_env = true;
+        chip_gen = parse_mock_chip_env(chip_env);
       }
+    }
+
+    if (has_named_topo && has_did_env && did_gen != topo_gen) {
+      return make_err(PJRT_Error_Code_INVALID_ARGUMENT,
+                      "OPENTPU_MOCK_TOPOLOGY conflicts with OPENTPU_MOCK_DEVICE_ID chip generation");
+    }
+    if (has_named_topo && has_chip_env && chip_gen != topo_gen) {
+      return make_err(PJRT_Error_Code_INVALID_ARGUMENT,
+                      "OPENTPU_MOCK_TOPOLOGY conflicts with OPENTPU_MOCK_CHIP chip generation");
+    }
+    if (has_did_env && has_chip_env &&
+        (did_gen == OT_CHIP_UNKNOWN || chip_gen == OT_CHIP_UNKNOWN || did_gen != chip_gen)) {
+      return make_err(PJRT_Error_Code_INVALID_ARGUMENT,
+                      "OPENTPU_MOCK_DEVICE_ID conflicts with OPENTPU_MOCK_CHIP chip generation");
+    }
+
+    uint16_t mock_did = 0x0063u;
+    if (has_did_env && did_parsed_ok) {
+      mock_did = env_did;
+    } else if (has_named_topo) {
+      mock_did = topo_did;
+    } else if (has_chip_env) {
+      if (chip_gen == OT_CHIP_TPU7X) mock_did = 0x0075u;
+      else if (chip_gen == OT_CHIP_V6E) mock_did = 0x006fu;
+      else mock_did = 0x0063u;
     }
 
     ot_device_geometry_t mock_geom = {};
@@ -1179,27 +1246,9 @@ PJRT_Error* ot_pjrt_client_create(PJRT_Client_Create_Args* args) {
     if (mock_geom.chip_gen == OT_CHIP_TPU7X) kind_str = "TPU v7x";
     else if (mock_geom.chip_gen == OT_CHIP_V6E) kind_str = "TPU v6 lite";
     else kind_str = "TPU v5 lite";
-    chiplets_per_func =
-        mock_geom.logical_chiplets_per_pci_func > 0 ? mock_geom.logical_chiplets_per_pci_func : 1u;
-
-    if (const char* topo_env = std::getenv("OPENTPU_MOCK_TOPOLOGY")) {
-      if (std::strcmp(topo_env, "tpu7x-1t") == 0 || std::strcmp(topo_env, "tpu7x_1t") == 0) {
-        kind_str = "TPU v7x";
-        pci_funcs = 1;
-        chiplets_per_func = 2;
-      } else if (std::strcmp(topo_env, "tpu7x-4t") == 0 || std::strcmp(topo_env, "tpu7x_4t") == 0) {
-        kind_str = "TPU v7x";
-        pci_funcs = 4;
-        chiplets_per_func = 2;
-      } else if (std::strcmp(topo_env, "v6e-8") == 0 || std::strcmp(topo_env, "v6e_8") == 0) {
-        kind_str = "TPU v6 lite";
-        pci_funcs = 8;
-        chiplets_per_func = 1;
-      } else if (std::strcmp(topo_env, "v5e-1") == 0 || std::strcmp(topo_env, "v5e_1") == 0) {
-        kind_str = "TPU v5 lite";
-        pci_funcs = 1;
-        chiplets_per_func = 1;
-      }
+    if (!has_named_topo) {
+      chiplets_per_func =
+          mock_geom.logical_chiplets_per_pci_func > 0 ? mock_geom.logical_chiplets_per_pci_func : 1u;
     }
   }
 
@@ -1695,19 +1744,12 @@ static PJRT_Error* validate_exec_build_options_proto(const uint8_t* p,
       }
       int64_t ord = static_cast<int64_t>(raw);
       if (ord != -1) {
-        if (ord < 0 || ord > std::numeric_limits<int>::max()) {
-          return make_err(PJRT_Error_Code_INVALID_ARGUMENT,
-                          "device_ordinal out of addressable device range");
-        }
-        if (PJRT_Device* by_id = find_client_device_by_id(client_devs, static_cast<int>(ord))) {
-          explicit_ordinal_dev_id = by_id->desc.id;
-        } else if (static_cast<size_t>(ord) < num_devices) {
-          explicit_ordinal_dev_id = client_devs[static_cast<size_t>(ord)]->desc.id;
-        } else {
+        if (ord < 0 || static_cast<size_t>(ord) >= num_devices) {
           return make_err(PJRT_Error_Code_INVALID_ARGUMENT,
                           num_devices <= 1 ? "single-device OpenTPU supports device_ordinal -1 or 0 only"
                                            : "device_ordinal out of addressable device range");
         }
+        explicit_ordinal_dev_id = client_devs[static_cast<size_t>(ord)]->desc.id;
       }
     } else if (field == 2 && wire == 2) {
       uint64_t slen = 0;

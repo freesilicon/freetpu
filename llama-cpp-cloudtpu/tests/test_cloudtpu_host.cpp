@@ -6652,9 +6652,22 @@ void test_ironwood_d2d_pairing_and_sdy_mesh() {
     std::printf("  [PASS] Ironwood tpu7x dual-chiplet D2D Hamiltonian pairing & Shardy sdy.mesh\n");
 }
 
-void run_fp8_matmul_parity_on_runtime(cloudtpu::PjrtRuntime& rt) {
+void run_fp8_matmul_parity_on_runtime(cloudtpu::PjrtRuntime& rt,
+                                      cloudtpu::Fp8MatmulMode fp8_mode = cloudtpu::Fp8MatmulMode::AUTO) {
     const int64_t K = 64, N = 8, NB = K / 32;
     const bool rt_is_tpu7x = rt.is_tpu7x_topology();
+    if (fp8_mode == cloudtpu::Fp8MatmulMode::OFF) {
+        CHECK_TRUE(false, "FP8 parity gate cannot run with CLOUDTPU_MATMUL_FP8=0");
+        return;
+    }
+    if (fp8_mode == cloudtpu::Fp8MatmulMode::AUTO && !rt_is_tpu7x) {
+        std::fprintf(stderr,
+                     "FAIL: FP8 AUTO parity gate requires detected Ironwood (tpu7x/v7x) topology "
+                     "(device[0].kind='%s', platform='%s')\n",
+                     rt.device_info(0).kind.c_str(), rt.platform_version().c_str());
+        ++g_failures;
+        return;
+    }
     auto build_q8_spec = [&](cloudtpu::Fp8MatmulMode mode, bool is_tpu7x, bool high_prec) {
         cloudtpu::GraphProgramSpec spec;
         spec.fp8_matmul = mode;
@@ -6693,8 +6706,7 @@ void run_fp8_matmul_parity_on_runtime(cloudtpu::PjrtRuntime& rt) {
     };
 
     const auto p_fp8 = cloudtpu::emit_stablehlo_program(
-        build_q8_spec(rt_is_tpu7x ? cloudtpu::Fp8MatmulMode::AUTO : cloudtpu::Fp8MatmulMode::FORCE,
-                      rt_is_tpu7x, false));
+        build_q8_spec(fp8_mode, rt_is_tpu7x, false));
     const auto p_bf16 = cloudtpu::emit_stablehlo_program(
         build_q8_spec(cloudtpu::Fp8MatmulMode::OFF, rt_is_tpu7x, false));
     CHECK_TRUE(p_fp8.mlir_text.find("xf8E4M3FN>") != std::string::npos,
@@ -6796,7 +6808,7 @@ void run_fp8_matmul_parity_on_runtime(cloudtpu::PjrtRuntime& rt) {
             ref4[static_cast<size_t>(n)] = static_cast<float>(acc);
         }
         cloudtpu::GraphProgramSpec spec4;
-        spec4.fp8_matmul = rt_is_tpu7x ? cloudtpu::Fp8MatmulMode::AUTO : cloudtpu::Fp8MatmulMode::FORCE;
+        spec4.fp8_matmul = fp8_mode;
         spec4.target_is_tpu7x = rt_is_tpu7x;
         cloudtpu::TensorSpec w4;
         w4.id = 1;
@@ -7414,8 +7426,28 @@ int main(int argc, char** argv) {
                 rt.device_info(0).kind.c_str());
 
     if (fp8_parity_only) {
-        run_fp8_matmul_parity_on_runtime(rt);
-        std::printf("  [PASS] Live/runtime FP8 f8E4M3FN parity gate (Q8_0 & Q4_K_I4 NMSE < 1e-2 + exact zero cancellation)\n");
+        cloudtpu::Fp8MatmulMode fp8_mode = cloudtpu::Fp8MatmulMode::AUTO;
+        if (const char* v = std::getenv("CLOUDTPU_MATMUL_FP8")) {
+            if (v[0] == '\0' || std::strcmp(v, "auto") == 0 || std::strcmp(v, "AUTO") == 0) {
+                fp8_mode = cloudtpu::Fp8MatmulMode::AUTO;
+            } else if (std::strcmp(v, "force") == 0 || std::strcmp(v, "FORCE") == 0 ||
+                       std::strcmp(v, "1") == 0 || std::strcmp(v, "on") == 0 ||
+                       std::strcmp(v, "true") == 0 || std::atoi(v) != 0) {
+                fp8_mode = cloudtpu::Fp8MatmulMode::FORCE;
+            } else {
+                fp8_mode = cloudtpu::Fp8MatmulMode::OFF;
+            }
+        }
+        const char* mode_name = (fp8_mode == cloudtpu::Fp8MatmulMode::AUTO)
+                                    ? "auto"
+                                    : (fp8_mode == cloudtpu::Fp8MatmulMode::FORCE ? "force" : "off");
+        std::printf("  FP8 parity gate: mode=%s, detected_tpu7x=%d\n",
+                    mode_name, rt.is_tpu7x_topology() ? 1 : 0);
+        run_fp8_matmul_parity_on_runtime(rt, fp8_mode);
+        if (g_failures == 0) {
+            std::printf("  [PASS] Live/runtime FP8 f8E4M3FN parity gate (mode=%s, Q8_0 & Q4_K_I4 NMSE < 1e-2 + exact zero cancellation)\n",
+                        mode_name);
+        }
         const size_t py_maps = cloudtpu::count_libpython_mappings();
         std::printf("  MAPS_LIBPYTHON=%zu\n", py_maps);
         if (py_maps != 0) {
