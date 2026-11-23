@@ -589,6 +589,9 @@ SsaValue dequantize_row_major_blocks(StableHloBuilder& b,
         if (storage == TensorStorageKind::Q4_0_I4 && effective_q_dt == PjrtDType::U4) {
             SsaValue eight = b.emit_const_splat_f32(8.0f, blk_dims, calc_dt);
             q_f = b.emit_binary("stablehlo.subtract", q_f, eight);
+        } else if (storage == TensorStorageKind::Q4_K_I4 && effective_q_dt == PjrtDType::S4) {
+            SsaValue eight = b.emit_const_splat_f32(8.0f, blk_dims, calc_dt);
+            q_f = b.emit_binary("stablehlo.add", q_f, eight);
         }
         SsaValue d_c = b.emit_convert(d, calc_dt);
         SsaValue d_b = b.emit_broadcast_in_dim(d_c, {0, 1, 2, 3}, blk_dims);
@@ -677,6 +680,10 @@ SsaValue dequantize_k_major_blocks(StableHloBuilder& b,
          !(storage == TensorStorageKind::Q4_0_I4 && qs_eff.dtype == PjrtDType::U4));
     if (fast_bf16) {
         SsaValue q_bf = b.emit_convert(qs_eff, PjrtDType::BF16);
+        if (storage == TensorStorageKind::Q4_K_I4 && qs_eff.dtype == PjrtDType::S4) {
+            SsaValue eight = b.emit_const_splat_f32(8.0f, km_dims, PjrtDType::BF16);
+            q_bf = b.emit_binary("stablehlo.add", q_bf, eight);
+        }
         SsaValue d_b = b.emit_broadcast_in_dim(d, {0, 1, 2, 4}, km_dims);
         SsaValue scaled = b.emit_binary("stablehlo.multiply", q_bf, d_b);
         if (storage == TensorStorageKind::Q4_K_I4 && m_opt != nullptr) {
@@ -690,6 +697,9 @@ SsaValue dequantize_k_major_blocks(StableHloBuilder& b,
     if (storage == TensorStorageKind::Q4_0_I4 && qs_eff.dtype == PjrtDType::U4) {
         SsaValue eight = b.emit_const_splat_f32(8.0f, km_dims, PjrtDType::F32);
         q_f = b.emit_binary("stablehlo.subtract", q_f, eight);
+    } else if (storage == TensorStorageKind::Q4_K_I4 && qs_eff.dtype == PjrtDType::S4) {
+        SsaValue eight = b.emit_const_splat_f32(8.0f, km_dims, PjrtDType::F32);
+        q_f = b.emit_binary("stablehlo.add", q_f, eight);
     }
     SsaValue d_c = b.emit_convert(d, PjrtDType::F32);
     SsaValue d_b = b.emit_broadcast_in_dim(d_c, {0, 1, 2, 4}, km_dims);
@@ -1150,20 +1160,35 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                             SsaValue dot_b = builder.emit_dot_general(
                                 x_blk, qs_mm, {0, 1, 3}, {0, 1, 2}, {4}, {3},
                                 dot_b_dims, PjrtDType::F32, op.high_precision);
+                            SsaValue zero_f32 = builder.emit_const_splat_f32(0.0f, {}, PjrtDType::F32);
+                            const bool q4k_needs_xsum =
+                                (w_th.storage == TensorStorageKind::Q4_K_I4) &&
+                                (qs_eff.dtype == PjrtDType::S4 || w_th.has_q_m);
+                            SsaValue xsum;
+                            if (q4k_needs_xsum) {
+                                SsaValue x_f32 = builder.emit_convert(x_blk, PjrtDType::F32);
+                                xsum = builder.emit_reduce_axis(x_f32, zero_f32, 4, "stablehlo.add");
+                            }
+                            if (w_th.storage == TensorStorageKind::Q4_K_I4 && qs_eff.dtype == PjrtDType::S4) {
+                                // Restore unsigned nibble contribution dot(x, u4) = dot(x, s4) + 8*sum(x)
+                                // BEFORE scaling by d, preserving exact cancellation for zero nibbles even
+                                // when 8*d >> |m| without pre-shifting m into m + 8*d.
+                                SsaValue eight_f32 = builder.emit_const_splat_f32(8.0f, xsum.dims, PjrtDType::F32);
+                                SsaValue eight_xsum = builder.emit_binary("stablehlo.multiply", xsum, eight_f32);
+                                SsaValue eight_xsum_b =
+                                    builder.emit_broadcast_in_dim(eight_xsum, {0, 1, 3, 2}, dot_b_dims);
+                                dot_b = builder.emit_binary("stablehlo.add", dot_b, eight_xsum_b);
+                            }
                             SsaValue d_f32 = builder.emit_convert(d_km, PjrtDType::F32);
                             SsaValue d_b = builder.emit_broadcast_in_dim(d_f32, {0, 1, 2, 4}, dot_b_dims);
                             SsaValue scaled = builder.emit_binary("stablehlo.multiply", dot_b, d_b);
-                            SsaValue zero_f32 = builder.emit_const_splat_f32(0.0f, {}, PjrtDType::F32);
                             SsaValue acc = builder.emit_reduce_axis(scaled, zero_f32, 2, "stablehlo.add");
 
                             if (w_th.storage == TensorStorageKind::Q4_K_I4 && w_th.has_q_m) {
                                 SsaValue m_km = w_th.q_m;
                                 bcast_w4_batch(m_km);
-                                SsaValue x_f32 = builder.emit_convert(x_blk, PjrtDType::F32);
-                                SsaValue xsum = builder.emit_reduce_axis(x_f32, zero_f32, 4, "stablehlo.add");
-                                // Keep the shifted offset correction dot in F32 (HIGHEST precision) unless
-                                // scales are explicitly stored in BF16, so (q - 8) * d + (m + 8*d) cancels
-                                // exact-zero nibbles without asymmetric BF16 rounding residuals.
+                                // Keep the minimum offset correction dot in F32 (HIGHEST precision) unless
+                                // scales are explicitly stored in BF16.
                                 const bool fast_bf16_m =
                                     (mm_dt == PjrtDType::BF16) &&
                                     (d_km.dtype == PjrtDType::BF16) &&

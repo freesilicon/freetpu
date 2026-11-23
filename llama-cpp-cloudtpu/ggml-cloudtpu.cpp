@@ -48,7 +48,7 @@ struct cloudtpu_env_config {
     bool bf16_flash_attn = false;   // Opt-in BF16 Q/K/probs/V matmuls in FLASH_ATTN_EXT (default false: F32 parity)
     CloudTpuQ4Mode q4_mode = CloudTpuQ4Mode::I4;  // Single-read S4/U4 default (overridden by CLOUDTPU_Q4_MODE / CLOUDTPU_Q4_SPLIT_DOT)
     bool q4_split_dot = true;       // Q4_0/Q4_K SPLIT vs CONCAT selection when q4_mode is SPLIT/CONCAT
-    bool q4k_u4 = false;            // Q4_K I4/BITCAST: false = shifted S4 (m_eff += 8*d_eff), true = U4 (0..15)
+    bool q4k_u4 = false;            // Q4_K I4/BITCAST: false = signed S4 (q-8, unshifted m_eff), true = U4 (0..15)
     bool q4k_bf16_scales = false;   // Opt-in hardware BF16 Q4_K/Q6_K scales (default false: full F32 scale precision for GET_ROWS parity)
     int32_t mm_pad_m = 8;           // Pad small BF16 Q4_*_I4/Q6_K_SPLIT M < mm_pad_m up to mm_pad_m for MXU (<=1 disables)
     bool async_collectives = false; // Opt-in LIBTPU_INIT_ARGS TPU async collective overlap flags before libtpu init
@@ -1046,10 +1046,7 @@ static void unpack_q4_K_to_i4(const block_q4_K* src,
                     uint8_t sc = 0, m = 0;
                     get_scale_min_k4_local(is, row[bk].scales, &sc, &m);
                     const float de = d * static_cast<float>(sc);
-                    float me = -(dmin * static_cast<float>(m));
-                    if (use_s4) {
-                        me += 8.0f * de;
-                    }
+                    const float me = -(dmin * static_cast<float>(m));
                     const size_t sub = bk * 8 + static_cast<size_t>(is);
                     out_d_km[(b * nb32 + sub) * N + n] = de;
                     out_m_km[(b * nb32 + sub) * N + n] = me;
