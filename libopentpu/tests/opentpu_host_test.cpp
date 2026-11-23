@@ -471,6 +471,25 @@ static void test_pjrt_api_mock() {
     PJRT_Error* unt_err = api->PJRT_Client_Compile(&ca_unt);
     OT_CHECK(unt_err != nullptr);
     destroy_pjrt_error(api, unt_err);
+
+    // Module-level explicit result layout attribute must be rejected.
+    const char* mlir_mod_layout =
+        "module attributes {mhlo.xla_entry_computation_result_layout = [dense<[0, 1]> : tensor<2xindex>]} {\n"
+        "  func.func @main(%a: tensor<128x128xbf16>, %b: tensor<128x128xbf16>) -> tensor<128x128xbf16> {\n"
+        "    %0 = stablehlo.dot_general %a, %b, contracting_dims = [1] x [0] : (tensor<128x128xbf16>, tensor<128x128xbf16>) -> tensor<128x128xbf16>\n"
+        "    return %0 : tensor<128x128xbf16>\n"
+        "  }\n"
+        "}\n";
+    PJRT_Program p_ml = prog;
+    p_ml.code = const_cast<char*>(mlir_mod_layout);
+    p_ml.code_size = std::strlen(mlir_mod_layout);
+    PJRT_Client_Compile_Args ca_ml = {};
+    ca_ml.struct_size = PJRT_Client_Compile_Args_STRUCT_SIZE;
+    ca_ml.client = cc.client;
+    ca_ml.program = &p_ml;
+    PJRT_Error* ml_err = api->PJRT_Client_Compile(&ca_ml);
+    OT_CHECK(ml_err != nullptr);
+    destroy_pjrt_error(api, ml_err);
   }
 
   // Valid 1x1 compile_options (including field 9 device_assignment for device 0) must succeed.

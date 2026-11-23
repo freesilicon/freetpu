@@ -515,6 +515,25 @@ bool parse_stablehlo_matmul(const char* code, size_t len, uint32_t* m_out,
         prefix.back() != '{') {
       return false;
     }
+    // Reject module-level layout/sharding/aliasing/multi-device attributes that OpenTPU M4 cannot honor.
+    std::string mod_hdr = trim_ws(prefix.substr(6, prefix.size() - 7));
+    if (!mod_hdr.empty()) {
+      size_t attr_ob = mod_hdr.find('{');
+      if (attr_ob != std::string::npos) {
+        size_t attr_cb = find_matching_delim(mod_hdr, attr_ob, '{', '}');
+        if (attr_cb == std::string::npos || !trim_ws(mod_hdr.substr(attr_cb + 1)).empty()) {
+          return false;
+        }
+        std::string mod_dict = mod_hdr.substr(attr_ob, attr_cb - attr_ob + 1);
+        if (!is_benign_mlir_attr_dict(mod_dict) ||
+            mod_dict.find("layout") != std::string::npos ||
+            mod_dict.find("xla_entry_computation") != std::string::npos ||
+            mod_dict.find("tiles") != std::string::npos ||
+            mod_dict.find("cross_program_prefetches") != std::string::npos) {
+          return false;
+        }
+      }
+    }
     if (tail != "}") return false;
   }
 

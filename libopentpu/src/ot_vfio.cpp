@@ -902,6 +902,25 @@ bool VfioTransport::submit_sq_wait(const uint32_t desc[32], uint32_t timeout_ms,
   write32_bar0(0x10018u, target_seq);
   write32_bar0(0x10044u, 0u);
 
+  auto quiesce_on_unverified_dma = [&]() {
+    // Quiesce the device immediately so an in-flight descriptor cannot complete
+    // late into reused staging memory or reallocated HBM.
+    dma_faulted = true;
+    ring_ready = false;
+    if (bar0_mmio && bar0_mapped_len >= 0x12000u) {
+      write32_bar0(0x10000u, 0u);
+      write32_bar0(0x10040u, 0u);
+    }
+    uint16_t cmd = 0;
+    if (read_pci_config(0x04, &cmd, sizeof(cmd)) && (cmd & 0x0004u)) {
+      cmd &= static_cast<uint16_t>(~0x0004u);  // Clear PCI_COMMAND_MASTER
+      (void)write_pci_config(0x04, &cmd, sizeof(cmd));
+    }
+    if (device_fd >= 0) {
+      (void)::ioctl(device_fd, VFIO_DEVICE_RESET);
+    }
+  };
+
   const auto timeout = std::chrono::milliseconds(timeout_ms ? timeout_ms : 5000u);
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   for (;;) {
@@ -911,11 +930,18 @@ bool VfioTransport::submit_sq_wait(const uint32_t desc[32], uint32_t timeout_ms,
       dma_rmb();
       uint32_t local_cq[8] = {};
       std::memcpy(local_cq, cq_slot, 32u);
-      dma_wmb();
-      write32_bar0(0x1002cu, target_seq);
       if (cq_out) {
         std::memcpy(cq_out, local_cq, 32u);
       }
+      if (local_cq[0] != sent_seq) {
+        // Submitted DMA has no verified completion: quiesce and quarantine context.
+        quiesce_on_unverified_dma();
+        (void)validate_cq_completion(sent_seq, local_cq, err);
+        if (err) *err += " (device quiesced; recreate context)";
+        return false;
+      }
+      dma_wmb();
+      write32_bar0(0x1002cu, target_seq);
       return validate_cq_completion(sent_seq, local_cq, err);
     }
     if (std::chrono::steady_clock::now() >= deadline) {
@@ -924,22 +950,7 @@ bool VfioTransport::submit_sq_wait(const uint32_t desc[32], uint32_t timeout_ms,
     ::usleep(10);
   }
 
-  // Quiesce the device immediately so an in-flight descriptor cannot complete
-  // late into reused staging memory or reallocated HBM.
-  dma_faulted = true;
-  ring_ready = false;
-  if (bar0_mmio && bar0_mapped_len >= 0x12000u) {
-    write32_bar0(0x10000u, 0u);
-    write32_bar0(0x10040u, 0u);
-  }
-  uint16_t cmd = 0;
-  if (read_pci_config(0x04, &cmd, sizeof(cmd)) && (cmd & 0x0004u)) {
-    cmd &= static_cast<uint16_t>(~0x0004u);  // Clear PCI_COMMAND_MASTER
-    (void)write_pci_config(0x04, &cmd, sizeof(cmd));
-  }
-  if (device_fd >= 0) {
-    (void)::ioctl(device_fd, VFIO_DEVICE_RESET);
-  }
+  quiesce_on_unverified_dma();
   if (err) {
     *err = "SQ doorbell timeout waiting for completion seq=" + std::to_string(target_seq - 1u) +
            " (device quiesced; recreate context)";
