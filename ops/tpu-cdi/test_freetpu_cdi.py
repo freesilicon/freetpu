@@ -583,6 +583,37 @@ class FreeTpuCdiTests(unittest.TestCase):
                 f"Expected invalid closID error for {bad_clos!r}, got {clos_errs}",
             )
 
+        # Root CLOS `"/"` is valid ONLY on CDI 1.1.0; CDI 0.7.0, 0.8.0, and 1.0.0
+        # MUST reject `"/"` while still permitting `""` and normal Linux filenames.
+        for pre_11_ver in ("0.7.0", "0.8.0", "1.0.0"):
+            root_clos_pre11 = {
+                "cdiVersion": pre_11_ver,
+                "kind": "freetpu.dev/tpu",
+                "containerEdits": {
+                    "deviceNodes": [{"path": "/dev/vfio/vfio"}],
+                    "intelRdt": {"closID": "/"},
+                },
+                "devices": [
+                    {
+                        "name": "0",
+                        "containerEdits": {"deviceNodes": [{"path": "/dev/vfio/0"}]},
+                    }
+                ],
+            }
+            pre11_errs = freetpu_cdi.validate_cdi_spec(root_clos_pre11)
+            self.assertTrue(
+                any("intelRdt.closID: invalid closID" in e for e in pre11_errs),
+                f"Expected CDI {pre_11_ver} to reject root closID '/', got {pre11_errs}",
+            )
+            valid_pre11 = {
+                **root_clos_pre11,
+                "containerEdits": {
+                    "deviceNodes": [{"path": "/dev/vfio/vfio"}],
+                    "intelRdt": {"closID": "tpu-tenant"},
+                },
+            }
+            self.assertEqual(freetpu_cdi.validate_cdi_spec(valid_pre11), [])
+
     def test_rejects_vfio_group_with_non_tpu_devices_and_non_vfio_driver(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2611,6 +2642,108 @@ class FreeTpuCdiTests(unittest.TestCase):
                 )
                 self.assertEqual(rc_withmap, 0, err_wm)
                 self.assertTrue(gen_out.exists())
+
+                # Even when host sysfs DOES expose `chip_id`s (0..3 on NUMA 0, 4..7 on NUMA 1),
+                # a spec generated with a swapped `--chip-id-map` (NUMA 0 -> 4..7, NUMA 1 -> 0..3)
+                # records `freetpu.dev/chip-id-source=chip-id-map` on numeric range aliases so
+                # `validate --check-host --remove-if-stale` without `--chip-id-map` treats the
+                # alias mismatch as unverifiable and PRESERVES the healthy live spec!
+                swap_root = root / "v6e8_sysfs_swapped_map"
+                swap_sysfs, swap_dev = _make_mock_pci_vfio(
+                    swap_root,
+                    devices=[
+                        {
+                            "bdf": f"0000:00:{4 + i:02x}.0",
+                            "vendor": "0x1ae0",
+                            "device": "0x006f",
+                            "driver": "vfio-pci",
+                            "iommu_group": str(i),
+                            "numa_node": "0",
+                            "chip_id": str(i),
+                        }
+                        for i in range(4)
+                    ]
+                    + [
+                        {
+                            "bdf": f"0000:80:{4 + i:02x}.0",
+                            "vendor": "0x1ae0",
+                            "device": "0x006f",
+                            "driver": "vfio-pci",
+                            "iommu_group": str(4 + i),
+                            "numa_node": "1",
+                            "chip_id": str(4 + i),
+                        }
+                        for i in range(4)
+                    ],
+                    create_vfio_nodes=[str(i) for i in range(8)],
+                )
+                swapped_map = {
+                    **{f"0000:00:{4 + i:02x}.0": 4 + i for i in range(4)},
+                    **{f"0000:80:{4 + i:02x}.0": i for i in range(4)},
+                }
+                swapped_map_file = swap_root / "swapped-map.json"
+                swapped_map_file.write_text(json.dumps(swapped_map), encoding="utf-8")
+                swapped_spec_path = swap_root / "freetpu-tpu.json"
+                rc_sw_gen, _o_sw, err_sw = _run_cli_inproc(
+                    [
+                        "generate",
+                        "--sysfs-root",
+                        str(swap_sysfs),
+                        "--dev-root",
+                        str(swap_dev),
+                        "--chip-id-map",
+                        str(swapped_map_file),
+                        "--output",
+                        str(swapped_spec_path),
+                        "--validate",
+                    ]
+                )
+                self.assertEqual(rc_sw_gen, 0, err_sw)
+                sw_loaded = json.loads(swapped_spec_path.read_text(encoding="utf-8"))
+                sw_by_name = {d["name"]: d for d in sw_loaded["devices"]}
+                self.assertEqual(
+                    sw_by_name["0-3"]["annotations"].get("freetpu.dev/chip-id-source"),
+                    "chip-id-map",
+                )
+                self.assertEqual(
+                    sw_by_name["4-7"]["annotations"].get("freetpu.dev/chip-id-source"),
+                    "chip-id-map",
+                )
+                rc_sw_nomap, _o_swnm, err_swnm = _run_cli_inproc(
+                    [
+                        "validate",
+                        str(swapped_spec_path),
+                        "--check-host",
+                        "--remove-if-stale",
+                        "--sysfs-root",
+                        str(swap_sysfs),
+                        "--dev-root",
+                        str(swap_dev),
+                    ]
+                )
+                self.assertNotEqual(rc_sw_nomap, 0)
+                self.assertIn("Preserved live CDI spec", err_swnm)
+                self.assertIn("--chip-id-map", err_swnm)
+                self.assertTrue(
+                    swapped_spec_path.exists(),
+                    "must preserve healthy live spec generated with swapped --chip-id-map when map is omitted",
+                )
+                rc_sw_withmap, _o_swwm, err_swwm = _run_cli_inproc(
+                    [
+                        "validate",
+                        str(swapped_spec_path),
+                        "--check-host",
+                        "--remove-if-stale",
+                        "--chip-id-map",
+                        str(swapped_map_file),
+                        "--sysfs-root",
+                        str(swap_sysfs),
+                        "--dev-root",
+                        str(swap_dev),
+                    ]
+                )
+                self.assertEqual(rc_sw_withmap, 0, err_swwm)
+                self.assertTrue(swapped_spec_path.exists())
 
                 # If publication-time host verification fails, BOTH `generate --validate`
                 # and `reconcile_cdi_spec` MUST fail closed and remove any stale spec file!

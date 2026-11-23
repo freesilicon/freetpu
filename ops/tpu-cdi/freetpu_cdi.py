@@ -1703,10 +1703,13 @@ def build_cdi_spec(
             }
             if slice_env:
                 slice_edits["env"] = list(slice_env)
+            s_ann = dict(slice_ann_base)
+            if chip_id_map and _RANGE_SLICE_RE.match(s_name):
+                s_ann["freetpu.dev/chip-id-source"] = "chip-id-map"
             devices.append(
                 {
                     "name": s_name,
-                    "annotations": dict(slice_ann_base),
+                    "annotations": s_ann,
                     "containerEdits": slice_edits,
                 }
             )
@@ -1880,18 +1883,26 @@ def _validate_container_edits(
                     errors.append(f"{context}.intelRdt.{str_field}: must be a string")
             if "closID" in irdt and isinstance(irdt["closID"], str):
                 clos_id = irdt["closID"]
-                # Matches CNCF CDI v1.1.0 `IntelRdt.Validate()` (`pkg/cdi/container-edits.go`):
-                # `""` (unset) and `"/"` (root CLOS) are permitted; otherwise must be a valid
-                # Linux filename (< 4096 bytes, not "." or "..", and no "/", "\n", or "\x00").
-                if clos_id not in ("", "/"):
+                # Matches CNCF CDI `IntelRdt.Validate()` (`pkg/cdi/container-edits.go`):
+                # `""` (unset) is always permitted; `"/"` (root CLOS) is permitted ONLY
+                # in CDI >= 1.1.0 (rejected in 0.7.0, 0.8.0, and 1.0.0); otherwise must
+                # be a valid Linux filename (< 4096 bytes, not "." or "..", and no "/",
+                # "\n", or "\x00").
+                try:
+                    cdi_ver_tuple = tuple(int(p) for p in cdi_version.split("."))
+                except ValueError:
+                    cdi_ver_tuple = (0, 0, 0)
+                allow_root_clos = cdi_ver_tuple >= (1, 1, 0)
+                if clos_id != "" and not (allow_root_clos and clos_id == "/"):
                     if (
                         len(clos_id.encode("utf-8")) >= 4096
                         or clos_id in (".", "..")
                         or any(ch in clos_id for ch in ("/", "\n", "\x00"))
                     ):
+                        root_hint = "'/' for root CLOS or " if allow_root_clos else ""
                         errors.append(
                             f"{context}.intelRdt.closID: invalid closID {clos_id!r} "
-                            "(must be '/' for root CLOS or a valid Linux filename without '/', newline, or NUL)"
+                            f"(must be {root_hint}a valid Linux filename without '/', newline, or NUL)"
                         )
             for bool_field in ("enableCMT", "enableMBM", "enableMonitoring"):
                 if bool_field in irdt and bool_field in allowed_irdt_keys:
@@ -2548,37 +2559,41 @@ def _verify_spec_against_host_detailed(
                     )
                 expected_slice = expected_slices_by_name.get(name)
                 check_slice = expected_slice
-                if expected_slice is None:
-                    range_match = _RANGE_SLICE_RE.match(name)
-                    live_slice_for_bdfs = (
-                        expected_slices_by_bdfs.get(tuple(expected_live_bdfs))
-                        if range_match is not None
-                        else None
+                range_match = _RANGE_SLICE_RE.match(name)
+                live_slice_for_bdfs = (
+                    expected_slices_by_bdfs.get(tuple(expected_live_bdfs))
+                    if range_match is not None
+                    else None
+                )
+                range_width_matches = False
+                if range_match is not None and live_slice_for_bdfs is not None:
+                    start_idx, end_idx = (int(p) for p in name.split("-", 1))
+                    range_width_matches = (
+                        end_idx >= start_idx
+                        and (end_idx - start_idx + 1)
+                        == len(live_slice_for_bdfs.physical_indices)
                     )
-                    range_width_matches = False
-                    if range_match is not None and live_slice_for_bdfs is not None:
-                        start_idx, end_idx = (int(p) for p in name.split("-", 1))
-                        range_width_matches = (
-                            end_idx >= start_idx
-                            and (end_idx - start_idx + 1)
-                            == len(live_slice_for_bdfs.physical_indices)
-                        )
+                uses_explicit_chip_map = ann.get("freetpu.dev/chip-id-source") == "chip-id-map"
+                if expected_slice is None:
                     if (
                         range_width_matches
                         and chip_id_map is None
                         and live_slice_for_bdfs is not None
-                        and _resolve_verified_visibility_ordinals(
-                            live_slice_for_bdfs.chips,
-                            live_chips,
-                            live_bdf_to_phys,
-                            chip_id_map=None,
+                        and (
+                            uses_explicit_chip_map
+                            or _resolve_verified_visibility_ordinals(
+                                live_slice_for_bdfs.chips,
+                                live_chips,
+                                live_bdf_to_phys,
+                                chip_id_map=None,
+                            )
+                            is None
                         )
-                        is None
                     ):
                         unverifiable.append(
                             f"device {name!r}: numeric range alias cannot be verified without "
-                            "--chip-id-map (host sysfs exposes no chip_id; underlying VFIO/PCI "
-                            "topology still matches live host)"
+                            "--chip-id-map (spec depends on explicit --chip-id-map or host sysfs "
+                            "exposes no chip_id; underlying VFIO/PCI topology still matches live host)"
                         )
                         check_slice = live_slice_for_bdfs
                     else:
@@ -2587,11 +2602,24 @@ def _verify_spec_against_host_detailed(
                             f"(live aliases: {sorted(expected_slices_by_name)})"
                         )
                 elif expected_live_bdfs != list(expected_slice.pci_bdfs):
-                    errors.append(
-                        f"device {name!r}: slice alias PCI membership {expected_live_bdfs} does not "
-                        f"match live host topology for {name!r} ({list(expected_slice.pci_bdfs)})"
-                    )
-                    check_slice = None
+                    if (
+                        range_width_matches
+                        and chip_id_map is None
+                        and live_slice_for_bdfs is not None
+                        and uses_explicit_chip_map
+                    ):
+                        unverifiable.append(
+                            f"device {name!r}: numeric range alias was generated with --chip-id-map "
+                            "and cannot be verified without that map (underlying VFIO/PCI topology "
+                            "still matches live host)"
+                        )
+                        check_slice = live_slice_for_bdfs
+                    else:
+                        errors.append(
+                            f"device {name!r}: slice alias PCI membership {expected_live_bdfs} does not "
+                            f"match live host topology for {name!r} ({list(expected_slice.pci_bdfs)})"
+                        )
+                        check_slice = None
 
                 if check_slice is not None:
                     if (
