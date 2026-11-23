@@ -124,6 +124,10 @@ struct PjrtCompileOptions {
 // Encodes xla::CompileOptionsProto in pure C++ protobuf wire format (zero libprotobuf dep).
 std::string encode_compile_options_proto(const PjrtCompileOptions& opts);
 
+// Appends documented libtpu async collective overlap flags to a LIBTPU_INIT_ARGS string
+// without clobbering or duplicating flags already set by the caller.
+std::string append_async_collective_libtpu_init_args(const std::string& existing_args);
+
 struct PjrtDeviceInfo {
     int index = 0;
     int id = 0;
@@ -138,6 +142,7 @@ struct RuntimeConfig {
     int mock_devices = 1;  // Number of virtual TPU chips in Host Mock PJRT (e.g. 4=tpu7x, 8=v6e-8)
     int verbose = 0;
     uint32_t exec_cache_cap = 4096;
+    bool async_collectives = false;  // Opt-in LIBTPU_INIT_ARGS async collective overlap flags before libtpu init
     std::string libtpu_path;
 };
 
@@ -274,12 +279,12 @@ public:
     void await_event(PjrtEventHandle ev);
 
     // Builds compile options (including DeviceAssignmentProto for multi-chip SPMD or
-    // explicit single-device targeting on multi-chip hosts, alias_passthrough_params,
-    // and async collective overlap env_option_overrides) for a 1D chip mesh.
+    // explicit single-device targeting on multi-chip hosts and alias_passthrough_params)
+    // for a 1D chip mesh. TPU-specific async collective flags belong in LIBTPU_INIT_ARGS
+    // (configured before libtpu.so initialization), not CompileOptionsProto.env_option_overrides.
     PjrtCompileOptions make_spmd_compile_options(int num_chips,
                                                  int device_idx = 0,
-                                                 bool alias_passthrough = false,
-                                                 bool async_collectives = false) const;
+                                                 bool alias_passthrough = false) const;
 
     // Compile StableHLO MLIR ("mlir" format) or return an owning reference to a cached executable.
     // Thread-safe LRU cache keyed by canonical structural program key and target device assignment.

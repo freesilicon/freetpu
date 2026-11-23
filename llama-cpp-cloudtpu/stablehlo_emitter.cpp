@@ -600,8 +600,8 @@ SsaValue dequantize_row_major_blocks(StableHloBuilder& b,
 
 // TPU-native K-major N-minor dequantization (zero minor-dim tile padding, zero weight reshape,
 // zero broadcast reshape):
-//   Q8_0_SPLIT: qs [B3, B2, NB, 32, N] S8,  d [B3, B2, NB, N] F16     -> [B3, B2, NB, 32, N]
-//   Q6_K_SPLIT: qs [B3, B2, NB, 16, N] S8,  d [B3, B2, NB, N] F32/F16 -> [B3, B2, NB, 16, N]
+//   Q8_0_SPLIT: qs [B3, B2, NB, 32, N] S8,  d [B3, B2, NB, N] F16      -> [B3, B2, NB, 32, N]
+//   Q6_K_SPLIT: qs [B3, B2, NB, 16, N] S8,  d [B3, B2, NB, N] F32/BF16 -> [B3, B2, NB, 16, N]
 SsaValue dequantize_k_major_blocks(StableHloBuilder& b,
                                    TensorStorageKind storage,
                                    const SsaValue& qs,
@@ -1576,7 +1576,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                         any_vis_v, v, builder.emit_const_splat_f32(0.0f, {B, H_Q, N_KV, DV}, PjrtDType::F32));
                 }
 
-                const bool use_bf16_attn = spec.bf16_matmul && !op.high_precision;
+                const bool use_bf16_attn = spec.bf16_flash_attn && !op.high_precision;
                 SsaValue q_mm = use_bf16_attn ? builder.emit_convert(q, PjrtDType::BF16) : q;
                 SsaValue k_mm = use_bf16_attn ? builder.emit_convert(k, PjrtDType::BF16) : k;
                 SsaValue scores = builder.emit_dot_general(

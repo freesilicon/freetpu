@@ -38,9 +38,10 @@ struct cloudtpu_env_config {
     bool fuse_attn = false;         // Fuse FLASH_ATTN_EXT with following O_proj/FFN ops
     bool donate_kv = true;          // Donate KV cache HBM buffers in-place on SET_ROWS
     bool bf16_matmul = true;        // Dequantize quantized/low-bit weights & activations to BF16 for MXU
+    bool bf16_flash_attn = false;   // Opt-in BF16 Q/K/probs/V matmuls in FLASH_ATTN_EXT (default false: F32 parity)
     bool q4_split_dot = true;       // Q4_0/Q4_K: true = split-X two-dot (zero concat); false = single concat dot
-    bool q4k_bf16_scales = false;   // Optional F16 Q4_K/Q6_K scales (default off: F32 scales +9% faster on v5e-1)
-    bool async_collectives = false; // Opt-in XLA TPU async collective overlap overrides on multi-chip SPMD
+    bool q4k_bf16_scales = false;   // Optional BF16 Q4_K/Q6_K scales (default off: F32 scales +9% faster on v5e-1)
+    bool async_collectives = false; // Opt-in LIBTPU_INIT_ARGS TPU async collective overlap flags before libtpu init
     uint32_t cache_cap = 4096;
     uint64_t min_elements = 0;
     std::string libtpu_path;
@@ -98,6 +99,9 @@ static cloudtpu_env_config load_env_config() {
     }
     if (const char* v = std::getenv("CLOUDTPU_MATMUL_BF16")) {
         cfg.bf16_matmul = (std::atoi(v) != 0);
+    }
+    if (const char* v = std::getenv("CLOUDTPU_FLASH_ATTN_BF16")) {
+        cfg.bf16_flash_attn = (std::atoi(v) != 0);
     }
     if (const char* v = std::getenv("CLOUDTPU_Q4_SPLIT_DOT")) {
         cfg.q4_split_dot = (std::atoi(v) != 0);
@@ -183,6 +187,7 @@ static cloudtpu::PjrtRuntime& ensure_runtime_initialized() {
     rt_cfg.mock_devices = env.mock_devices;
     rt_cfg.verbose = env.verbose;
     rt_cfg.exec_cache_cap = env.cache_cap;
+    rt_cfg.async_collectives = env.async_collectives;
     rt_cfg.libtpu_path = env.libtpu_path;
     return cloudtpu::shared_pjrt_runtime(&rt_cfg);
 }
@@ -1067,20 +1072,22 @@ static void upload_raw_tensor_to_slot(cloudtpu::PjrtRuntime& rt,
             rt, device_index, spmd_chips, sh, qs_km.data(), cloudtpu::PjrtDType::U8,
             {B3, B2, nb32, 16, N}, q5_shard_ax);
         if (q4k_bf16_scales) {
-            std::vector<uint16_t> d_f16(d_eff.size());
-            std::vector<uint16_t> m_f16(m_eff.size());
+            // Store compact effective scales in BF16 (full F32 8-bit exponent range) rather than
+            // F16 so large finite products (e.g. d * sc > 65504) never overflow to Inf/NaN.
+            std::vector<uint16_t> d_bf16(d_eff.size());
+            std::vector<uint16_t> m_bf16(m_eff.size());
             for (size_t i = 0; i < d_eff.size(); ++i) {
-                d_f16[i] = cloudtpu::f32_to_f16(d_eff[i]);
-                m_f16[i] = cloudtpu::f32_to_f16(m_eff[i]);
+                d_bf16[i] = cloudtpu::f32_to_bf16(d_eff[i]);
+                m_bf16[i] = cloudtpu::f32_to_bf16(m_eff[i]);
             }
-            auto d_km = transpose_n_to_minor(d_f16.data(), B, static_cast<size_t>(N), static_cast<size_t>(nb32));
-            auto m_km = transpose_n_to_minor(m_f16.data(), B, static_cast<size_t>(N), static_cast<size_t>(nb32));
-            slot.scale_dtype = cloudtpu::PjrtDType::F16;
+            auto d_km = transpose_n_to_minor(d_bf16.data(), B, static_cast<size_t>(N), static_cast<size_t>(nb32));
+            auto m_km = transpose_n_to_minor(m_bf16.data(), B, static_cast<size_t>(N), static_cast<size_t>(nb32));
+            slot.scale_dtype = cloudtpu::PjrtDType::BF16;
             slot.hbm_scales = upload_sharded_part(
-                rt, device_index, spmd_chips, sh, d_km.data(), cloudtpu::PjrtDType::F16,
+                rt, device_index, spmd_chips, sh, d_km.data(), cloudtpu::PjrtDType::BF16,
                 {B3, B2, nb32, N}, q4_shard_ax);
             slot.hbm_mins = upload_sharded_part(
-                rt, device_index, spmd_chips, sh, m_km.data(), cloudtpu::PjrtDType::F16,
+                rt, device_index, spmd_chips, sh, m_km.data(), cloudtpu::PjrtDType::BF16,
                 {B3, B2, nb32, N}, q4_shard_ax);
         } else {
             auto d_km = transpose_n_to_minor(d_eff.data(), B, static_cast<size_t>(N), static_cast<size_t>(nb32));
@@ -1114,14 +1121,16 @@ static void upload_raw_tensor_to_slot(cloudtpu::PjrtRuntime& rt,
             rt, device_index, spmd_chips, sh, qs_km.data(), cloudtpu::PjrtDType::S8,
             {B3, B2, nb16, 16, N}, q5_shard_ax);
         if (q4k_bf16_scales) {
-            std::vector<uint16_t> d_f16(d_eff.size());
+            // Store compact effective scales in BF16 (full F32 8-bit exponent range) rather than
+            // F16 so valid Q6_K products like d=1024 * sc=64 = 65536 stay finite without NaN.
+            std::vector<uint16_t> d_bf16(d_eff.size());
             for (size_t i = 0; i < d_eff.size(); ++i) {
-                d_f16[i] = cloudtpu::f32_to_f16(d_eff[i]);
+                d_bf16[i] = cloudtpu::f32_to_bf16(d_eff[i]);
             }
-            auto d_km = transpose_n_to_minor(d_f16.data(), B, static_cast<size_t>(N), static_cast<size_t>(nb16));
-            slot.scale_dtype = cloudtpu::PjrtDType::F16;
+            auto d_km = transpose_n_to_minor(d_bf16.data(), B, static_cast<size_t>(N), static_cast<size_t>(nb16));
+            slot.scale_dtype = cloudtpu::PjrtDType::BF16;
             slot.hbm_scales = upload_sharded_part(
-                rt, device_index, spmd_chips, sh, d_km.data(), cloudtpu::PjrtDType::F16,
+                rt, device_index, spmd_chips, sh, d_km.data(), cloudtpu::PjrtDType::BF16,
                 {B3, B2, nb16, N}, q4_shard_ax);
         } else {
             auto d_km = transpose_n_to_minor(d_eff.data(), B, static_cast<size_t>(N), static_cast<size_t>(nb16));
@@ -1821,7 +1830,7 @@ static size_t ggml_backend_cloudtpu_buffer_type_get_alloc_size(ggml_backend_buff
         return 0;
     }
     auto* btc = buft ? static_cast<cloudtpu_buft_context*>(buft->context) : nullptr;
-    const bool f16_scales = (btc && btc->q4k_bf16_scales);
+    const bool bf16_scales = (btc && btc->q4k_bf16_scales);
     size_t base_size = ggml_nbytes(tensor);
     const int64_t K = tensor->ne[0];
     if (K > 0 && (K % QK_K) == 0 && (tensor->type == GGML_TYPE_Q4_K || tensor->type == GGML_TYPE_Q6_K)) {
@@ -1832,7 +1841,7 @@ static size_t ggml_backend_cloudtpu_buffer_type_get_alloc_size(ggml_backend_buff
         // Split HBM representation expands Q4_K (128B u8 + 32B/16B d + 32B/16B m = 192B/160B/block)
         // and Q6_K (256B s8 + 64B/32B d = 320B/288B/block) relative to packed GGML blocks.
         const size_t bytes_per_block =
-            (tensor->type == GGML_TYPE_Q4_K) ? (f16_scales ? 160U : 192U) : (f16_scales ? 288U : 320U);
+            (tensor->type == GGML_TYPE_Q4_K) ? (bf16_scales ? 160U : 192U) : (bf16_scales ? 288U : 320U);
         if (n_blocks <= SIZE_MAX / bytes_per_block) {
             base_size = std::max(base_size, n_blocks * bytes_per_block);
         }
@@ -2496,9 +2505,9 @@ static cloudtpu::PjrtDType lookup_tensor_scale_dtype(const struct ggml_tensor* t
         if (it != bctx->slots.end() && it->second.scale_dtype != cloudtpu::PjrtDType::INVALID) {
             return it->second.scale_dtype;
         }
-        return bctx->q4k_bf16_scales ? cloudtpu::PjrtDType::F16 : cloudtpu::PjrtDType::F32;
+        return bctx->q4k_bf16_scales ? cloudtpu::PjrtDType::BF16 : cloudtpu::PjrtDType::F32;
     }
-    return default_q4k_bf16 ? cloudtpu::PjrtDType::F16 : cloudtpu::PjrtDType::F32;
+    return default_q4k_bf16 ? cloudtpu::PjrtDType::BF16 : cloudtpu::PjrtDType::F32;
 }
 
 static const struct ggml_tensor* canonical_root(const struct ggml_tensor* t) {
@@ -3219,7 +3228,8 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
     sig_push(sig, (ctx->env.bf16_matmul ? 1ULL : 0ULL) |
                   (ctx->env.async_collectives ? 2ULL : 0ULL) |
                   (ctx->env.donate_kv ? 4ULL : 0ULL) |
-                  (ctx->env.q4_split_dot ? 8ULL : 0ULL));
+                  (ctx->env.q4_split_dot ? 8ULL : 0ULL) |
+                  (ctx->env.bf16_flash_attn ? 16ULL : 0ULL));
     uint32_t next_id = 1;
 
     auto register_input_sig = [&](auto& self, const struct ggml_tensor* t) -> uint32_t {
@@ -3535,6 +3545,7 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
         cloudtpu::GraphProgramSpec prog_spec;
         prog_spec.spmd_chips = P;
         prog_spec.bf16_matmul = ctx->env.bf16_matmul;
+        prog_spec.bf16_flash_attn = ctx->env.bf16_flash_attn;
         prog_spec.q4_split_dot = ctx->env.q4_split_dot;
         std::unordered_map<const struct ggml_tensor*, uint64_t> tensor_to_id;
         std::unordered_map<uint64_t, uint32_t> id_to_input_idx;
@@ -3687,7 +3698,7 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
         // Use explicit {tf.aliasing_output} attributes alone (alias_passthrough_params=false) so XLA
         // never implicitly donates an unchecked passthrough copy's source buffer.
         const cloudtpu::PjrtCompileOptions copts =
-            rt.make_spmd_compile_options(P, ctx->device_index, /*alias_passthrough=*/false, ctx->env.async_collectives);
+            rt.make_spmd_compile_options(P, ctx->device_index, /*alias_passthrough=*/false);
         exec = rt.compile_or_get(
             emitted.cache_key, emitted.mlir_text, (P > 1) ? 0 : ctx->device_index, copts);
 

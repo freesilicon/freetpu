@@ -93,9 +93,9 @@ void test_compile_options_proto() {
 
     cloudtpu::PjrtCompileOptions opt_extra = opt_alias_only;
     opt_extra.env_option_overrides = {
-        cloudtpu::PjrtOptionOverride::make_bool("xla_tpu_enable_async_collective_fusion", true),
-        cloudtpu::PjrtOptionOverride::make_string("xla_enable_async_all_gather", "kEnabled"),
-        cloudtpu::PjrtOptionOverride::make_int("xla_tpu_scoped_vmem_limit_kib", 16384),
+        cloudtpu::PjrtOptionOverride::make_bool("xla_tpu_detect_nan", true),
+        cloudtpu::PjrtOptionOverride::make_string("xla_dump_to", "/tmp/xla_dump"),
+        cloudtpu::PjrtOptionOverride::make_int("xla_cpu_parallel_codegen_split_count", 16384),
     };
     const std::string p_extra = cloudtpu::encode_compile_options_proto(opt_extra);
     // Prefix must match p_alias_only byte-for-byte (proves ExecutableBuildOptionsProto is untouched / no debug_options).
@@ -105,11 +105,11 @@ void test_compile_options_proto() {
     // Field 7 wire tag = (7<<3)|2 = 0x3a immediately follows ExecutableBuildOptionsProto.
     CHECK_TRUE(static_cast<uint8_t>(p_extra[p_alias_only.size()]) == 0x3a,
                "env_option_overrides must serialize as CompileOptionsProto field 7 (0x3a)");
-    CHECK_TRUE(p_extra.find("xla_tpu_enable_async_collective_fusion") != std::string::npos,
-               "env_option_overrides fusion key missing");
-    CHECK_TRUE(p_extra.find("xla_enable_async_all_gather") != std::string::npos &&
-                   p_extra.find("kEnabled") != std::string::npos,
-               "env_option_overrides enum string value kEnabled missing");
+    CHECK_TRUE(p_extra.find("xla_tpu_detect_nan") != std::string::npos,
+               "env_option_overrides bool DebugOptions key missing");
+    CHECK_TRUE(p_extra.find("xla_dump_to") != std::string::npos &&
+                   p_extra.find("/tmp/xla_dump") != std::string::npos,
+               "env_option_overrides string DebugOptions value missing");
     // Verify typed OptionOverrideProto payload bytes:
     //   bool_field=true -> value field (0x12 len=2) + bool_field tag (0x10 0x01)
     const std::string bool_true_wire = {0x12, 0x02, 0x10, 0x01};
@@ -129,7 +129,33 @@ void test_compile_options_proto() {
         }
     }
     CHECK_TRUE(found_alias_tag, "alias_passthrough_params (field 10) missing");
-    std::printf("  [PASS] compile_options_proto (incl. DeviceAssignmentProto, alias_passthrough, typed env_option_overrides)\n");
+
+    // Verify LIBTPU_INIT_ARGS helper appends documented async collective flags without clobbering
+    // or duplicating user-supplied flags.
+    const std::string init_all = cloudtpu::append_async_collective_libtpu_init_args("");
+    CHECK_TRUE(init_all.find("--xla_tpu_enable_async_collective_fusion=true") != std::string::npos &&
+                   init_all.find("--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true") != std::string::npos &&
+                   init_all.find("--xla_tpu_enable_async_collective_fusion_multiple_steps=true") != std::string::npos &&
+                   init_all.find("--xla_tpu_overlap_compute_collective_tc=true") != std::string::npos &&
+                   init_all.find("--xla_enable_async_all_gather=true") != std::string::npos,
+               "append_async_collective_libtpu_init_args must include all 5 documented LIBTPU_INIT_ARGS flags");
+    CHECK_TRUE(cloudtpu::append_async_collective_libtpu_init_args(init_all) == init_all,
+               "append_async_collective_libtpu_init_args must be idempotent");
+    const std::string user_args =
+        "--xla_tpu_enable_async_collective_fusion=false --noxla_tpu_overlap_compute_collective_tc "
+        "--xla_enable_async_all_gather=kAuto --custom_flag=42";
+    const std::string merged = cloudtpu::append_async_collective_libtpu_init_args(user_args);
+    CHECK_TRUE(merged.rfind(user_args, 0) == 0, "user LIBTPU_INIT_ARGS prefix must be preserved verbatim");
+    CHECK_TRUE(merged.find("--xla_tpu_enable_async_collective_fusion=true") == std::string::npos,
+               "must not override user --xla_tpu_enable_async_collective_fusion=false");
+    CHECK_TRUE(merged.find("--xla_tpu_overlap_compute_collective_tc=true") == std::string::npos,
+               "must not override user --noxla_tpu_overlap_compute_collective_tc");
+    CHECK_TRUE(merged.find("--xla_enable_async_all_gather=true") == std::string::npos,
+               "must not override user --xla_enable_async_all_gather=kAuto");
+    CHECK_TRUE(merged.find("--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true") != std::string::npos &&
+                   merged.find("--xla_tpu_enable_async_collective_fusion_multiple_steps=true") != std::string::npos,
+               "missing async collective flags must still be appended");
+    std::printf("  [PASS] compile_options_proto (incl. DeviceAssignmentProto, alias_passthrough, typed env_option_overrides, LIBTPU_INIT_ARGS)\n");
 }
 
 void test_half_bf16_conversions() {
@@ -716,7 +742,7 @@ void test_silicon_regressions(cloudtpu::PjrtRuntime& rt) {
         auto bupd = rt.buffer_from_host(0, upd.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, D});
         auto bidx = rt.buffer_from_host(0, &row_idx, cloudtpu::PjrtDType::S32, {1, 1, 1, 1});
         auto btbl = rt.buffer_from_host(0, tbl.data(), cloudtpu::PjrtDType::F32, {1, 1, R, D});
-        const auto copts = rt.make_spmd_compile_options(1, 0, /*alias_passthrough=*/false, true);
+        const auto copts = rt.make_spmd_compile_options(1, 0, /*alias_passthrough=*/false);
         const auto exec = rt.compile_or_get(prog.cache_key + "|alias_test", prog.mlir_text, 0, copts);
         const std::vector<int64_t> non_don = {0, 1};
         std::vector<PJRT_Buffer*> raw_in = {bupd->handle.get(), bidx->handle.get(), btbl->handle.get()};
@@ -938,7 +964,62 @@ void test_flash_attn_fully_masked_row(cloudtpu::PjrtRuntime& rt) {
                    "unaffected finite V channels must remain preserved");
     }
     check_vec_close(q0_got, q0_exp, 1e-5f, "FLASH_ATTN_EXT masked NaN/Inf KV isolation");
-    std::printf("  [PASS] FLASH_ATTN_EXT isolates masked NaN/Inf K/V rows\n");
+
+    // Verify BF16 flash attention is gated independently of bf16_matmul so default
+    // CLOUDTPU_MATMUL_BF16=1 preserves F32 GGML attention parity (<0.0005 NMSE).
+    {
+        constexpr int64_t D256 = 256;
+        std::vector<float> q256(static_cast<size_t>(D256));
+        std::vector<float> k256(static_cast<size_t>(2 * D256));
+        std::vector<float> v256(static_cast<size_t>(2 * D256), 0.0f);
+        for (int64_t i = 0; i < 128; ++i) {
+            q256[static_cast<size_t>(i)] = 1.00390625f;  // 1 + 2^-8 (distinct from 1 in F32, rounds to 1 in BF16)
+            q256[static_cast<size_t>(128 + i)] = 1.0f;
+            k256[static_cast<size_t>(i)] = 2.0f;
+            k256[static_cast<size_t>(128 + i)] = -2.0f;
+            k256[static_cast<size_t>(D256 + i)] = -2.0f;
+            k256[static_cast<size_t>(D256 + 128 + i)] = 2.0f;
+        }
+        v256[0] = 1.0f;
+        v256[static_cast<size_t>(D256)] = 0.0f;
+        auto bq256 = rt.buffer_from_host(0, q256.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, D256});
+        auto bk256 = rt.buffer_from_host(0, k256.data(), cloudtpu::PjrtDType::F32, {1, 1, 2, D256});
+        auto bv256 = rt.buffer_from_host(0, v256.data(), cloudtpu::PjrtDType::F32, {1, 1, 2, D256});
+
+        cloudtpu::GraphProgramSpec fa_spec;
+        fa_spec.bf16_matmul = true;       // Default matmul BF16 ON
+        fa_spec.bf16_flash_attn = false;  // Default flash attention BF16 OFF
+        fa_spec.inputs.push_back({1, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, D256}});
+        fa_spec.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 2, D256}});
+        fa_spec.inputs.push_back({3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 2, D256}});
+        cloudtpu::OpNodeSpec fa_op;
+        fa_op.kind = cloudtpu::CloudOpKind::FLASH_ATTN_EXT;
+        fa_op.src_ids = {1, 2, 3};
+        fa_op.dst = {4, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, D256}};
+        fa_op.flash_attn.scale = 1.0f / 16.0f;
+        fa_op.high_precision = false;
+        fa_spec.ops.push_back(fa_op);
+        fa_spec.output_ids = {4};
+
+        const auto fa_f32_prog = cloudtpu::emit_stablehlo_program(fa_spec);
+        CHECK_TRUE(fa_f32_prog.mlir_text.find("bf16") == std::string::npos,
+                   "Default bf16_flash_attn=false must keep FLASH_ATTN_EXT in F32 even when bf16_matmul=true");
+        const auto fa_f32_out = run_emitted(rt, fa_f32_prog, {bq256, bk256, bv256});
+        const float exp_f32 = std::exp(0.0625f) / (std::exp(0.0625f) + std::exp(-0.0625f));
+        CHECK_TRUE(std::fabs(fa_f32_out[0] - exp_f32) < 1e-5f,
+                   "Default FLASH_ATTN_EXT must match F32 reference within GGML parity tolerance");
+
+        fa_spec.bf16_flash_attn = true;
+        const auto fa_bf16_prog = cloudtpu::emit_stablehlo_program(fa_spec);
+        CHECK_TRUE(fa_bf16_prog.mlir_text.find("bf16") != std::string::npos,
+                   "Opt-in bf16_flash_attn=true must cast FLASH_ATTN_EXT operands to bf16");
+        CHECK_TRUE(fa_bf16_prog.cache_key != fa_f32_prog.cache_key,
+                   "bf16_flash_attn toggle must produce distinct executable cache keys");
+        const auto fa_bf16_out = run_emitted(rt, fa_bf16_prog, {bq256, bk256, bv256});
+        CHECK_TRUE(std::fabs(fa_bf16_out[0] - 0.5f) < 1e-5f,
+                   "Opt-in BF16 FLASH_ATTN_EXT should reflect BF16 rounding (0.5f)");
+    }
+    std::printf("  [PASS] FLASH_ATTN_EXT isolates masked NaN/Inf K/V rows & gates BF16 independently\n");
 }
 
 void test_q4_k_split_mul_mat(cloudtpu::PjrtRuntime& rt) {
@@ -1020,7 +1101,55 @@ void test_q4_k_split_mul_mat(cloudtpu::PjrtRuntime& rt) {
         }
     }
     check_vec_close(got_bf16, expected_bf16, 1e-4f, "Q4_K_SPLIT MUL_MAT BF16");
-    std::printf("  [PASS] Q4_K_SPLIT MUL_MAT (rank-4 K-major scales & mins, F32 + BF16)\n");
+
+    // 3) Compact BF16 scale storage (CLOUDTPU_Q4K_BF16_SCALES=1) preserves finite effective scales
+    //    above F16's 65504 limit (e.g. Q6_K d=1024 * sc=64 = 65536) without overflowing to Inf/NaN.
+    {
+        const float big_scale = 1024.0f * 64.0f;  // 65536.0f (overflows F16 to +Inf, exact in BF16)
+        const uint16_t big_f16 = cloudtpu::f32_to_f16(big_scale);
+        const uint16_t big_bf16 = cloudtpu::f32_to_bf16(big_scale);
+        CHECK_TRUE(std::isinf(cloudtpu::f16_to_f32(big_f16)), "sanity: 65536 overflows F16 to Inf");
+        CHECK_TRUE(std::isfinite(cloudtpu::bf16_to_f32(big_bf16)) &&
+                       cloudtpu::bf16_to_f32(big_bf16) == big_scale,
+                   "BF16 compact scale must preserve 65536.0f exactly");
+
+        constexpr int64_t K6 = 16, N6 = 2, NB6 = K6 / 16;
+        std::vector<int8_t> qs6(static_cast<size_t>(NB6 * 16 * N6), 0);
+        // Row 0 has all-zero coefficients (0 * Inf would become NaN under F16); row 1 has q[0]=1.
+        qs6[static_cast<size_t>(0 * N6 + 1)] = 1;
+        std::vector<uint16_t> d6_bf16(static_cast<size_t>(NB6 * N6), big_bf16);
+        std::vector<float> x6(static_cast<size_t>(K6), 0.0f);
+        x6[0] = 0.5f;
+
+        auto bqs6 = rt.buffer_from_host(0, qs6.data(), cloudtpu::PjrtDType::S8, {1, 1, NB6, 16, N6});
+        auto bd6 = rt.buffer_from_host(0, d6_bf16.data(), cloudtpu::PjrtDType::BF16, {1, 1, NB6, N6});
+        auto bx6 = rt.buffer_from_host(0, x6.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, K6});
+
+        cloudtpu::GraphProgramSpec q6_spec;
+        q6_spec.bf16_matmul = false;
+        cloudtpu::TensorSpec w6_ts = {
+            1, cloudtpu::PjrtDType::S8, cloudtpu::TensorStorageKind::Q6_K_SPLIT, {1, 1, N6, K6}};
+        w6_ts.scale_dtype = cloudtpu::PjrtDType::BF16;
+        q6_spec.inputs.push_back(w6_ts);
+        q6_spec.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, K6}});
+        cloudtpu::OpNodeSpec q6_mm;
+        q6_mm.kind = cloudtpu::CloudOpKind::MUL_MAT;
+        q6_mm.src_ids = {1, 2};
+        q6_mm.dst = {3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, N6}};
+        q6_mm.high_precision = true;
+        q6_spec.ops.push_back(q6_mm);
+        q6_spec.output_ids = {3};
+
+        const auto q6_prog = cloudtpu::emit_stablehlo_program(q6_spec);
+        CHECK_TRUE(q6_prog.input_bindings[1].dtype == cloudtpu::PjrtDType::BF16,
+                   "Q6_K_SPLIT compact scale binding must use BF16");
+        const auto q6_out = run_emitted(rt, q6_prog, {bqs6, bd6, bx6});
+        CHECK_TRUE(std::isfinite(q6_out[0]) && q6_out[0] == 0.0f,
+                   "Q6_K_SPLIT BF16 scale=65536 with q=0 must stay finite 0.0 (no NaN)");
+        CHECK_TRUE(std::isfinite(q6_out[1]) && std::fabs(q6_out[1] - 32768.0f) < 1e-3f,
+                   "Q6_K_SPLIT BF16 scale=65536 with q=1, x=0.5 must equal 32768.0");
+    }
+    std::printf("  [PASS] Q4_K_SPLIT & Q6_K_SPLIT MUL_MAT (F32 + BF16 MXU + BF16 compact scales)\n");
 
     // Verify SET_ROWS preserves 64-bit indices on both single-row DUS and multi-row scatter paths.
     const std::vector<float> tbl_init = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
@@ -1202,23 +1331,8 @@ void test_spmd_multichip_mesh(int num_chips) {
     const auto copts = rt.make_spmd_compile_options(num_chips);
     CHECK_TRUE(copts.num_replicas == num_chips && copts.num_partitions == 1, "SPMD compile options");
     CHECK_TRUE(static_cast<int>(copts.device_assignment_ids.size()) == num_chips, "SPMD DeviceAssignment ids");
-    CHECK_TRUE(copts.env_option_overrides.empty(), "SPMD default leaves TPU env_option_overrides opt-in");
-    const auto copts_async = rt.make_spmd_compile_options(num_chips, 0, false, /*async_collectives=*/true);
-    CHECK_TRUE(copts_async.env_option_overrides.size() == 5, "Opt-in SPMD async collective overlap overrides (5)");
-    bool saw_ag_enum = false;
-    for (const auto& ov : copts_async.env_option_overrides) {
-        CHECK_TRUE(ov.key != "xla_tpu_enable_async_collective_fusion_fuse_all_gather",
-                   "Tristate/Boolean-ambiguous fuse_all_gather must not be sent as a bool override");
-        if (ov.key == "xla_enable_async_all_gather") {
-            CHECK_TRUE(ov.kind == cloudtpu::PjrtOptionOverride::Kind::STRING && ov.string_val == "kEnabled",
-                       "xla_enable_async_all_gather must use enum string kEnabled");
-            saw_ag_enum = true;
-        } else {
-            CHECK_TRUE(ov.kind == cloudtpu::PjrtOptionOverride::Kind::BOOL && ov.bool_val,
-                       "xla_tpu_* async collective override must use bool_field=true");
-        }
-    }
-    CHECK_TRUE(saw_ag_enum, "Opt-in SPMD overrides include xla_enable_async_all_gather=kEnabled");
+    CHECK_TRUE(copts.env_option_overrides.empty(),
+               "SPMD compile options must not emit non-DebugOptions xla_tpu_* env_option_overrides");
 
     auto run_spmd = [&](const cloudtpu::EmittedProgram& prog,
                         const std::vector<std::vector<cloudtpu::PjrtBufferPtr>>& per_dev_in) {

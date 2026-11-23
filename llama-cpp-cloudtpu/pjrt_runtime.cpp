@@ -14,6 +14,7 @@
 #include <locale>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_set>
 #include <utility>
 
 namespace cloudtpu {
@@ -316,6 +317,60 @@ std::string encode_compile_options_proto(const PjrtCompileOptions& opts) {
         append_tag_bytes(out, 7, entry);
     }
     return out;
+}
+
+std::string append_async_collective_libtpu_init_args(const std::string& existing_args) {
+    // Documented TPU async collective overlap flags for LIBTPU_INIT_ARGS (TorchTPU / MaxText
+    // v5e/v6e reference). These are libtpu initialization flags, NOT xla::DebugOptions fields,
+    // so they must be supplied via LIBTPU_INIT_ARGS before libtpu.so loads rather than via
+    // CompileOptionsProto.env_option_overrides.
+    static const std::pair<const char*, const char*> kFlags[] = {
+        {"xla_tpu_enable_async_collective_fusion", "true"},
+        {"xla_tpu_enable_async_collective_fusion_fuse_all_gather", "true"},
+        {"xla_tpu_enable_async_collective_fusion_multiple_steps", "true"},
+        {"xla_tpu_overlap_compute_collective_tc", "true"},
+        {"xla_enable_async_all_gather", "true"},
+    };
+
+    std::unordered_set<std::string> present;
+    {
+        std::istringstream iss(existing_args);
+        std::string tok;
+        while (iss >> tok) {
+            size_t start = 0;
+            while (start < tok.size() && tok[start] == '-') {
+                ++start;
+            }
+            if (start == 0 || start >= tok.size()) {
+                continue;
+            }
+            const size_t eq = tok.find('=', start);
+            std::string name = (eq == std::string::npos) ? tok.substr(start) : tok.substr(start, eq - start);
+            present.insert(name);
+            if (name.size() > 2 && name.compare(0, 2, "no") == 0) {
+                present.insert(name.substr(2));
+            }
+        }
+    }
+
+    std::string merged = existing_args;
+    while (!merged.empty() && std::isspace(static_cast<unsigned char>(merged.back()))) {
+        merged.pop_back();
+    }
+    for (const auto& kv : kFlags) {
+        if (present.count(kv.first) != 0) {
+            continue;
+        }
+        if (!merged.empty()) {
+            merged.push_back(' ');
+        }
+        merged.append("--");
+        merged.append(kv.first);
+        merged.push_back('=');
+        merged.append(kv.second);
+        present.insert(kv.first);
+    }
+    return merged;
 }
 
 // =========================================================================
@@ -2382,6 +2437,11 @@ void PjrtRuntime::init(const RuntimeConfig& cfg) {
             "Live libtpu.so loading is only supported on Linux/POSIX; use mock mode on Windows");
 #else
         setenv("GRPC_VERBOSITY", "ERROR", 0);
+        if (cfg.async_collectives) {
+            const char* cur = std::getenv("LIBTPU_INIT_ARGS");
+            const std::string merged = append_async_collective_libtpu_init_args(cur ? cur : "");
+            setenv("LIBTPU_INIT_ARGS", merged.c_str(), 1);
+        }
         const std::string so_path = resolve_libtpu_path(cfg.libtpu_path);
         dl_handle_ = dlopen(so_path.c_str(), RTLD_NOW | RTLD_GLOBAL);
         if (!dl_handle_) {
@@ -2685,8 +2745,7 @@ std::vector<PjrtBufferPtr> PjrtRuntime::buffer_from_host_replicated(int num_devi
 
 PjrtCompileOptions PjrtRuntime::make_spmd_compile_options(int num_chips,
                                                           int device_idx,
-                                                          bool alias_passthrough,
-                                                          bool async_collectives) const {
+                                                          bool alias_passthrough) const {
     PjrtCompileOptions opts;
     opts.alias_passthrough_params = alias_passthrough;
     const int n = std::max(1, std::min(num_chips, static_cast<int>(device_infos_.size())));
@@ -2701,6 +2760,9 @@ PjrtCompileOptions PjrtRuntime::make_spmd_compile_options(int num_chips,
     } else {
         // Explicit collective replica-SPMD across n TPU chips:
         // num_replicas = n, num_partitions = 1, explicit DeviceAssignmentProto mapping [0][0..n-1].
+        // Leave env_option_overrides empty: OpenXLA's CompileOptions::ApplyOption only accepts
+        // xla::DebugOptions fields and rejects TPU-specific xla_tpu_* flags; opt-in async
+        // collective flags are passed via LIBTPU_INIT_ARGS before libtpu.so loads.
         opts.num_replicas = n;
         opts.num_partitions = 1;
         opts.use_spmd_partitioning = false;
@@ -2708,22 +2770,6 @@ PjrtCompileOptions PjrtRuntime::make_spmd_compile_options(int num_chips,
         opts.device_assignment_ids.resize(static_cast<size_t>(n));
         for (int i = 0; i < n; ++i) {
             opts.device_assignment_ids[static_cast<size_t>(i)] = device_infos_[static_cast<size_t>(i)].id;
-        }
-        if (async_collectives) {
-            // Opt-in TPU async collective overlap overrides matching OpenXLA TPU flag guidance
-            // (https://openxla.org/xla/flags_guidance#performance_flags) and MaxText's flag table:
-            //   - xla_enable_async_all_gather is a TristateFlag enum (kDisabled/kEnabled/kAuto)
-            //   - the remaining 4 xla_tpu_* flags are unambiguous booleans (OptionOverrideProto.bool_field)
-            // Note: xla_tpu_enable_async_collective_fusion_fuse_all_gather is omitted because it is
-            // already enabled by default on v5e/v6e and varies between Boolean and TristateFlag across
-            // libtpu builds; pass plugin-version-specific flags via LIBTPU_INIT_ARGS when needed.
-            opts.env_option_overrides = {
-                PjrtOptionOverride::make_bool("xla_tpu_enable_async_collective_fusion", true),
-                PjrtOptionOverride::make_bool("xla_tpu_overlap_compute_collective_tc", true),
-                PjrtOptionOverride::make_bool("xla_tpu_enable_async_collective_fusion_multiple_steps", true),
-                PjrtOptionOverride::make_string("xla_enable_async_all_gather", "kEnabled"),
-                PjrtOptionOverride::make_bool("xla_tpu_enable_async_collective_fusion_fuse_all_reduce", true),
-            };
         }
     }
     return opts;
