@@ -108,12 +108,14 @@ log "--- Standalone Host Check & MAPS_LIBPYTHON=0 Proof ---"
 "${REPO_ROOT}/llama-cpp-cloudtpu/build.sh" standalone 2>&1 | tee -a "${LOG}"
 
 log "--- Live test-backend-ops (BF16 MXU default) ---"
-CLOUDTPU_MOCK=0 CLOUDTPU_SPMD_CHIPS=1 "${BIN_DIR}/test-backend-ops" -b CLOUDTPU \
+CLOUDTPU_MOCK=0 CLOUDTPU_SPMD_CHIPS=1 CLOUDTPU_MATMUL_FP8=0 CLOUDTPU_MATMUL_BF16=1 \
+  "${BIN_DIR}/test-backend-ops" -b CLOUDTPU \
   -o "MUL_MAT,RMS_NORM,ROPE,SOFT_MAX,GET_ROWS,SET_ROWS,ADD,MUL,CPY,SILU,SWIGLU,FLASH_ATTN_EXT" \
   2>&1 | tee -a "${LOG}"
 
 log "--- Live test-backend-ops (FP8 f8E4M3FN tpu7x auto path) ---"
-CLOUDTPU_MOCK=0 CLOUDTPU_SPMD_CHIPS=1 CLOUDTPU_MATMUL_FP8=auto "${BIN_DIR}/test-backend-ops" -b CLOUDTPU \
+CLOUDTPU_MOCK=0 CLOUDTPU_SPMD_CHIPS=1 CLOUDTPU_MATMUL_FP8=auto CLOUDTPU_MATMUL_BF16=1 \
+  "${BIN_DIR}/test-backend-ops" -b CLOUDTPU \
   -o "MUL_MAT" 2>&1 | tee -a "${LOG}"
 
 run_bench_tier() {
@@ -149,7 +151,7 @@ run_bench_tier() {
   fi
   for fp8_mode in 0 auto; do
     log "--- llama-bench ${tier} model=$(basename "${model_path}") spmd=${SPMD_CHIPS} fp8=${fp8_mode} ---"
-    CLOUDTPU_MOCK=0 CLOUDTPU_SPMD_CHIPS="${SPMD_CHIPS}" CLOUDTPU_MATMUL_FP8="${fp8_mode}" \
+    CLOUDTPU_MOCK=0 CLOUDTPU_SPMD_CHIPS="${SPMD_CHIPS}" CLOUDTPU_MATMUL_BF16=1 CLOUDTPU_MATMUL_FP8="${fp8_mode}" \
       "${BIN_DIR}/llama-bench" -m "${model_path}" -ngl 99 -fa 1 -sm none -mg 0 -p 512 -n 64 \
       2>&1 | tee -a "${LOG}"
   done

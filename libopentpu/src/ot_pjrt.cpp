@@ -1114,6 +1114,28 @@ PJRT_Error* ot_pjrt_client_create(PJRT_Client_Create_Args* args) {
   const char* mock_env = std::getenv("OPENTPU_MOCK");
   if (mock_env && std::strcmp(mock_env, "1") == 0) cfg.mock_mode = 1;
 
+  // Validate visible_devices before opening any live VFIO context (which may issue VFIO_DEVICE_RESET).
+  // In live mode OpenTPU exposes only single device 0; reject negative, duplicate, or non-zero IDs early.
+  if (has_visible_devs) {
+    std::vector<int64_t> seen;
+    seen.reserve(visible_devs.size());
+    for (int64_t vid : visible_devs) {
+      if (vid < 0) {
+        return make_err(PJRT_Error_Code_INVALID_ARGUMENT,
+                        "visible_devices index out of range");
+      }
+      if (!cfg.mock_mode && vid != 0) {
+        return make_err(PJRT_Error_Code_INVALID_ARGUMENT,
+                        "visible_devices index out of range for live single-device OpenTPU");
+      }
+      if (std::find(seen.begin(), seen.end(), vid) != seen.end()) {
+        return make_err(PJRT_Error_Code_INVALID_ARGUMENT,
+                        "duplicate device index in visible_devices");
+      }
+      seen.push_back(vid);
+    }
+  }
+
   ot_context_t* first_ctx = nullptr;
   ot_status_t st = ot_context_create(&cfg, &first_ctx);
   if (st != OT_OK) {
@@ -1607,6 +1629,11 @@ static PJRT_Error* validate_device_assignment_proto(const uint8_t* p,
                       "device_assignment replica_device_ids length does not match replica_count");
     }
     if (out_assigned_ids) *out_assigned_ids = std::move(assigned);
+  } else if (has_replica_count && out_assigned_ids) {
+    out_assigned_ids->clear();
+    for (uint64_t i = 0; i < replica_count; ++i) {
+      out_assigned_ids->push_back(client_devs[static_cast<size_t>(i)]->desc.id);
+    }
   }
   return nullptr;
 }
@@ -1618,8 +1645,11 @@ static PJRT_Error* validate_exec_build_options_proto(const uint8_t* p,
   const size_t num_devices = client_devs.size();
   size_t pos = 0;
   uint64_t num_replicas = 1;
+  uint64_t num_partitions = 1;
+  bool has_num_replicas = false;
   bool has_explicit_da = false;
   int explicit_ordinal_dev_id = -1;
+  std::vector<int> da_assigned;
   while (pos < len) {
     uint64_t tag = 0;
     if (!pb_read_varint(p, len, &pos, &tag)) {
@@ -1665,7 +1695,10 @@ static PJRT_Error* validate_exec_build_options_proto(const uint8_t* p,
                         num_devices <= 1 ? "single-device OpenTPU supports num_replicas=1 and num_partitions=1 only"
                                          : "num_replicas exceeds addressable devices");
       }
-      if (v > 0) num_replicas = v;
+      if (v > 0) {
+        num_replicas = v;
+        has_num_replicas = true;
+      }
     } else if (field == 5 && wire == 0) {
       uint64_t v = 0;
       if (!pb_read_varint(p, len, &pos, &v)) {
@@ -1675,6 +1708,7 @@ static PJRT_Error* validate_exec_build_options_proto(const uint8_t* p,
         return make_err(PJRT_Error_Code_UNIMPLEMENTED,
                         "OpenTPU supports num_partitions=1 only");
       }
+      if (v > 0) num_partitions = v;
     } else if (field == 7 && wire == 0) {
       uint64_t auto_spmd = 0;
       if (!pb_read_varint(p, len, &pos, &auto_spmd)) {
@@ -1690,8 +1724,9 @@ static PJRT_Error* validate_exec_build_options_proto(const uint8_t* p,
         return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed device_assignment");
       }
       has_explicit_da = true;
+      da_assigned.clear();
       PJRT_Error* err = validate_device_assignment_proto(
-          p + pos, static_cast<size_t>(slen), client_devs, out_assigned_ids);
+          p + pos, static_cast<size_t>(slen), client_devs, &da_assigned);
       if (err) return err;
       pos += static_cast<size_t>(slen);
     } else if (field == 10 && wire == 0) {
@@ -1707,7 +1742,16 @@ static PJRT_Error* validate_exec_build_options_proto(const uint8_t* p,
       return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed executable_build_options field");
     }
   }
-  if (!has_explicit_da && out_assigned_ids) {
+  if (has_explicit_da) {
+    if (da_assigned.empty() && !client_devs.empty()) {
+      da_assigned.push_back(client_devs[0]->desc.id);
+    }
+    if (has_num_replicas && da_assigned.size() != num_replicas * num_partitions) {
+      return make_err(PJRT_Error_Code_INVALID_ARGUMENT,
+                      "explicit device_assignment size disagrees with num_replicas * num_partitions");
+    }
+    if (out_assigned_ids) *out_assigned_ids = std::move(da_assigned);
+  } else if (out_assigned_ids) {
     out_assigned_ids->clear();
     if (num_replicas == 1 && explicit_ordinal_dev_id >= 0) {
       out_assigned_ids->push_back(explicit_ordinal_dev_id);

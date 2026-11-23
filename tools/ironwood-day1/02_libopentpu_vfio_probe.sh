@@ -86,8 +86,14 @@ fi
 first_vfio_tpu_bdf=""
 for dev_path in /sys/bus/pci/devices/*; do
   [[ -r "${dev_path}/vendor" && -L "${dev_path}/driver" ]] || continue
-  vid="$(cat "${dev_path}/vendor" 2>/dev/null || true)"
+  vid="$(tr '[:upper:]' '[:lower:]' < "${dev_path}/vendor" 2>/dev/null || true)"
+  cls="$(tr '[:upper:]' '[:lower:]' < "${dev_path}/class" 2>/dev/null || true)"
   drv="$(basename "$(readlink -f "${dev_path}/driver" 2>/dev/null || true)" 2>/dev/null || true)"
+  case "${cls}" in
+    0x02*) continue ;;
+    0xff*|0x12*|0x0b*|0x08*) ;;
+    *) continue ;;
+  esac
   if [[ "${vid}" == "0x1ae0" && "${drv}" == "vfio-pci" ]]; then
     first_vfio_tpu_bdf="$(basename "${dev_path}")"
     break

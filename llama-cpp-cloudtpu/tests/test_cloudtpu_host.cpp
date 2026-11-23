@@ -6602,6 +6602,21 @@ void test_fp8_e4m3fn_scalar_and_matmul_parity() {
             CHECK_NEAR(cloudtpu::f8e4m3fn_to_f32(cloudtpu::f32_to_f8e4m3fn(f)), f, 0.0f,
                        "f8E4M3FN integer [-16..16] bit-exact");
         }
+        // Subnormal round-to-nearest-even exact ties (min positive subnormal = 2^-9, half = 2^-10).
+        const float half_min_sub = std::ldexp(1.0f, -10);  // 2^-10 (tie between 0x00 and 0x01)
+        const float just_above_half = std::nextafter(half_min_sub, 1.0f);
+        const float tie_3 = std::ldexp(3.0f, -10);         // 3*2^-10 (tie between 0x01 and 0x02)
+        const float tie_5 = std::ldexp(5.0f, -10);         // 5*2^-10 (tie between 0x02 and 0x03)
+        const float tie_15 = std::ldexp(15.0f, -10);       // 15*2^-10 (tie between 0x07 and 0x08)
+        CHECK_TRUE(cloudtpu::f32_to_f8e4m3fn(half_min_sub) == 0x00, "2^-10 tie rounds to even 0x00");
+        CHECK_TRUE(cloudtpu::f32_to_f8e4m3fn(just_above_half) == 0x01, "2^-10 + eps rounds up to 0x01");
+        CHECK_TRUE(cloudtpu::f32_to_f8e4m3fn(tie_3) == 0x02, "3*2^-10 tie rounds to even 0x02");
+        CHECK_TRUE(cloudtpu::f32_to_f8e4m3fn(tie_5) == 0x02, "5*2^-10 tie rounds to even 0x02");
+        CHECK_TRUE(cloudtpu::f32_to_f8e4m3fn(tie_15) == 0x08, "15*2^-10 tie promotes to even 0x08");
+        CHECK_TRUE(cloudtpu::f32_to_f8e4m3fn(-half_min_sub) == 0x80, "-2^-10 tie rounds to even 0x80");
+        CHECK_TRUE(cloudtpu::f32_to_f8e4m3fn(-just_above_half) == 0x81, "-(2^-10 + eps) rounds to 0x81");
+        CHECK_TRUE(cloudtpu::f32_to_f8e4m3fn(-tie_3) == 0x82, "-3*2^-10 tie rounds to even 0x82");
+        CHECK_TRUE(cloudtpu::f32_to_f8e4m3fn(-tie_5) == 0x82, "-5*2^-10 tie rounds to even 0x82");
     }
 
     // 2. Verify gating rules (AUTO + tpu7x -> FP8, AUTO + non-tpu7x -> BF16, OFF -> BF16,

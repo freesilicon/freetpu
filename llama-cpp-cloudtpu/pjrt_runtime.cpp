@@ -140,14 +140,13 @@ uint8_t f32_to_f8e4m3fn(float f) {
         if (exp < -3) {
             return sign;
         }
-        const uint32_t shift = static_cast<uint32_t>(1 - exp);
+        // value = full * 2^(exp - 30) = (full / 2^(21 - exp)) * 2^-9, with total_shift in [21, 24].
+        const uint32_t total_shift = static_cast<uint32_t>(21 - exp);
         const uint32_t full = mant | 0x00800000U;
-        const uint32_t sticky = ((full & ((1U << (20 + shift)) - 1U)) != 0U) ? 1U : 0U;
-        const uint32_t shifted = full >> shift;
-        const uint32_t round_bits = (shifted & 0x000fffffU) | sticky;
-        uint32_t q_mant = shifted >> 20;
-        const uint32_t lsb = q_mant & 1U;
-        if (round_bits > 0x00080000U || (round_bits == 0x00080000U && lsb != 0U)) {
+        uint32_t q_mant = full >> total_shift;
+        const uint32_t rem = full & ((1U << total_shift) - 1U);
+        const uint32_t half = 1U << (total_shift - 1U);
+        if (rem > half || (rem == half && (q_mant & 1U) != 0U)) {
             q_mant += 1U;
         }
         if (q_mant >= 8U) {

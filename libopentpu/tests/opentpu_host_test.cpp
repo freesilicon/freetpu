@@ -2062,6 +2062,36 @@ static void test_pjrt_multidevice_isolation_and_topology() {
     led1.executable = ca1.executable;
     OT_CHECK(api->PJRT_LoadedExecutable_Destroy(&led1) == nullptr);
 
+    // Reject mismatched num_replicas vs explicit device_assignment with INVALID_ARGUMENT.
+    {
+      // field 3 (exec_build_options): field 4 (num_replicas=2) + field 9 (1x1 device_assignment=[0])
+      const char opt_rep2_da1[] = {
+          0x1a, 0x0c,
+          0x20, 0x02,
+          0x4a, 0x08, 0x08, 0x01, 0x10, 0x01, 0x1a, 0x02, 0x08, 0x00};
+      PJRT_Client_Compile_Args bad_m = {};
+      bad_m.struct_size = PJRT_Client_Compile_Args_STRUCT_SIZE;
+      bad_m.client = cc.client;
+      bad_m.program = &prog;
+      bad_m.compile_options = opt_rep2_da1;
+      bad_m.compile_options_size = sizeof(opt_rep2_da1);
+      PJRT_Error* me = api->PJRT_Client_Compile(&bad_m);
+      OT_CHECK(me != nullptr && get_err_code(me) == PJRT_Error_Code_INVALID_ARGUMENT);
+      destroy_pjrt_error(api, me);
+
+      // field 3 (exec_build_options): field 4 (num_replicas=1) + field 9 (2x1 device_assignment=[0, 1])
+      const char opt_rep1_da2[] = {
+          0x1a, 0x0e,
+          0x20, 0x01,
+          0x4a, 0x0a, 0x08, 0x02, 0x10, 0x01, 0x1a, 0x04, 0x08, 0x00, 0x08, 0x01};
+      bad_m.compile_options = opt_rep1_da2;
+      bad_m.compile_options_size = sizeof(opt_rep1_da2);
+      bad_m.executable = nullptr;
+      me = api->PJRT_Client_Compile(&bad_m);
+      OT_CHECK(me != nullptr && get_err_code(me) == PJRT_Error_Code_INVALID_ARGUMENT);
+      destroy_pjrt_error(api, me);
+    }
+
     // 2-replica executable: replica 0 valid, replica 1 has shape mismatch -> must fail with zero leaks.
     const char opt_rep2[] = {0x1a, 0x02, 0x20, 0x02};
     PJRT_Client_Compile_Args ca2 = {};
@@ -2162,6 +2192,37 @@ static void test_pjrt_multidevice_isolation_and_topology() {
     cd.struct_size = PJRT_Client_Destroy_Args_STRUCT_SIZE;
     cd.client = cc.client;
     OT_CHECK(api->PJRT_Client_Destroy(&cd) == nullptr);
+  }
+
+  // 4. Live mode (OPENTPU_MOCK unset): invalid visible_devices must be rejected with INVALID_ARGUMENT
+  //    BEFORE attempting to open or reset any VFIO device (which would fail with INTERNAL on host).
+  {
+    unsetenv("OPENTPU_MOCK");
+    unsetenv("OPENTPU_MOCK_CHIP");
+    unsetenv("OPENTPU_MOCK_TOPOLOGY");
+    auto check_live_visible_rejected = [&](const int64_t* vals, size_t cnt) {
+      PJRT_NamedValue opt = {};
+      opt.struct_size = PJRT_NamedValue_STRUCT_SIZE;
+      opt.name = "visible_devices";
+      opt.name_size = 15;
+      opt.type = PJRT_NamedValue_kInt64List;
+      opt.int64_array_value = vals;
+      opt.value_size = cnt;
+      PJRT_Client_Create_Args cc = {};
+      cc.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
+      cc.create_options = &opt;
+      cc.num_options = 1;
+      PJRT_Error* e = api->PJRT_Client_Create(&cc);
+      OT_CHECK(e != nullptr);
+      OT_CHECK(get_err_code(e) == PJRT_Error_Code_INVALID_ARGUMENT);
+      destroy_pjrt_error(api, e);
+    };
+    const int64_t dev1[1] = {1};
+    const int64_t dup0[2] = {0, 0};
+    const int64_t neg1[1] = {-1};
+    check_live_visible_rejected(dev1, 1);
+    check_live_visible_rejected(dup0, 2);
+    check_live_visible_rejected(neg1, 1);
   }
 
   unsetenv("OPENTPU_MOCK_TOPOLOGY");
