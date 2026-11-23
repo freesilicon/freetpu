@@ -39,10 +39,26 @@ typedef enum ot_status {
 
 typedef enum ot_chip_gen {
   OT_CHIP_UNKNOWN = 0,
-  OT_CHIP_V5E     = 1, /* PCI 0x1ae0:0x0063 */
-  OT_CHIP_V6E     = 2, /* PCI 0x1ae0:0x006f (documented; transport not yet validated) */
-  OT_CHIP_TPU7X   = 3
+  OT_CHIP_V5E     = 1, /* PCI 0x1ae0:0x0063 (128x128 MXU, 1 chiplet/package) */
+  OT_CHIP_V6E     = 2, /* PCI 0x1ae0:0x006f (256x256 MXU, 1 chiplet/package) */
+  OT_CHIP_TPU7X   = 3  /* PCI 0x1ae0:0x0076 / 0x0075 Ironwood (256x256 MXU, dual-chiplet D2D, 64 MiB VMEM/chiplet) */
 } ot_chip_gen_t;
+
+typedef struct ot_device_geometry {
+  uint32_t chip_gen;
+  uint16_t pci_device_id;
+  uint16_t mxu_rows;
+  uint16_t mxu_cols;
+  uint16_t fp8_inner_rows;
+  uint16_t fp8_inner_cols;
+  uint32_t logical_chiplets_per_pci_func;
+  uint32_t num_mxus_per_logical_chiplet;
+  uint32_t supports_native_fp8;
+  uint32_t reserved;
+  uint64_t hbm_bytes_per_logical_chiplet;
+  uint64_t vmem_bytes_per_logical_chiplet;
+  uint64_t smem_bytes_per_logical_chiplet;
+} ot_device_geometry_t;
 
 typedef struct ot_config {
   uint32_t    struct_size;       /* sizeof(ot_config_t) or 0 */
@@ -85,6 +101,8 @@ const char* ot_context_last_error(const ot_context_t* ctx);
 int         ot_context_is_mock(const ot_context_t* ctx);
 
 ot_status_t ot_device_get_info(const ot_context_t* ctx, ot_device_info_t* out_info);
+ot_status_t ot_chip_geometry_for_device_id(uint16_t pci_device_id, ot_device_geometry_t* out_geom);
+ot_status_t ot_device_get_geometry(const ot_context_t* ctx, ot_device_geometry_t* out_geom);
 
 /* IOMMU-mapped host staging & HBM device buffer management.
  * Callers should free buffers before destroying their owning context; any

@@ -22,6 +22,7 @@ enum class PjrtDType {
     F32,
     F16,
     BF16,
+    F8E4M3FN,
     S8,
     U8,
     S4,
@@ -62,11 +63,13 @@ void unpack_s4_to_i8(const uint8_t* src_packed, size_t nelems, int8_t* dst);
 void pack_u4_from_u8(const uint8_t* src, size_t nelems, uint8_t* dst_packed);
 void unpack_u4_to_u8(const uint8_t* src_packed, size_t nelems, uint8_t* dst);
 
-// Pure C++17 half/bfloat16 conversion helpers (zero external dependencies).
+// Pure C++17 half/bfloat16/fp8 conversion helpers (zero external dependencies).
 uint16_t f32_to_bf16(float f);
 float bf16_to_f32(uint16_t b);
 uint16_t f32_to_f16(float f);
 float f16_to_f32(uint16_t h);
+uint8_t f32_to_f8e4m3fn(float f);
+float f8e4m3fn_to_f32(uint8_t b);
 
 // Counts "libpython" mappings in /proc/self/maps (0 on non-Linux or pure C++ processes).
 size_t count_libpython_mappings();
@@ -140,6 +143,16 @@ std::string encode_compile_options_proto(const PjrtCompileOptions& opts);
 // without clobbering or duplicating flags already set by the caller.
 std::string append_async_collective_libtpu_init_args(const std::string& existing_args);
 
+enum class MockTopologyProfile {
+    AUTO = 0,
+    V5E_1,
+    V6E_8,
+    TPU7X_1T,
+    TPU7X_4T,
+};
+
+MockTopologyProfile parse_mock_topology_profile(const char* val);
+
 struct PjrtDeviceInfo {
     int index = 0;
     int id = 0;
@@ -147,15 +160,34 @@ struct PjrtDeviceInfo {
     std::string description;
     int64_t hbm_bytes_in_use = 0;
     int64_t hbm_bytes_limit = 0;
+    std::vector<int64_t> coords;
+    int64_t core_on_chip = -1;
+    int32_t chip_id = 0;
+    int32_t chiplet_id = 0;
+    bool is_dual_chiplet = false;
 };
+
+// Computes Hamiltonian D2D-paired device indices (grouping chiplets of each physical
+// package consecutively so pairs (0,1), (2,3), ... stay on the intra-package D2D link
+// and packages follow a serpentine/Gray path across torus coordinates).
+std::vector<int> compute_d2d_hamiltonian_order(const std::vector<PjrtDeviceInfo>& infos);
+
+// Returns true if a PJRT device kind string identifies Ironwood / Cloud TPU v7x.
+bool is_tpu7x_device_kind(const std::string& kind);
 
 struct RuntimeConfig {
     bool mock_mode = false;
-    int mock_devices = 1;  // Number of virtual TPU chips in Host Mock PJRT (e.g. 4=tpu7x, 8=v6e-8)
+    int mock_devices = 1;  // Logical TPU devices in Host Mock PJRT (2=tpu7x-1t, 8=tpu7x-4t/v6e-8)
+    MockTopologyProfile mock_profile = MockTopologyProfile::AUTO;
+    bool mock_scramble_device_order = false;  // Interleaves chiplets in mock enumeration to test D2D pairing
     int verbose = 0;
     uint32_t exec_cache_cap = 4096;
     bool async_collectives = false;  // Opt-in LIBTPU_INIT_ARGS async collective overlap flags before libtpu init
     std::string libtpu_path;
+
+    // Populates RuntimeConfig from CLOUDTPU_MOCK* env vars; named CLOUDTPU_MOCK_PROFILE
+    // dictates its documented logical device count when set.
+    static RuntimeConfig from_env();
 };
 
 struct CacheStats {
@@ -276,6 +308,9 @@ public:
     const std::string& platform_version() const { return platform_version_; }
     int device_count() const { return static_cast<int>(devices_.size()); }
     const PjrtDeviceInfo& device_info(int device_idx) const;
+    bool is_dual_chiplet_topology() const;
+    bool is_tpu7x_topology() const;
+    int d2d_group_size() const { return is_dual_chiplet_topology() ? 2 : 1; }
 
     bool query_memory_stats(int device_idx, size_t* free_bytes, size_t* total_bytes) const;
 

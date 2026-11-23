@@ -38,6 +38,8 @@ enum class CloudTpuQ4Mode {
 struct cloudtpu_env_config {
     bool mock_mode = false;
     int mock_devices = 1;
+    cloudtpu::MockTopologyProfile mock_profile = cloudtpu::MockTopologyProfile::AUTO;
+    bool mock_scramble_device_order = false;
     int spmd_chips = 1;       // 1 = default per-chip devices, 0 = opt-in auto (all rt.device_count()), >1 = explicit SPMD chip count
     int spmd_min_rows = 256;  // Minimum weight rows/cols to shard across SPMD chips
     int max_fuse_ops = 4096;  // Max ops per fused StableHLO subgraph
@@ -46,6 +48,8 @@ struct cloudtpu_env_config {
     bool fuse_attn = true;          // Fuse FLASH_ATTN_EXT with following O_proj/FFN ops
     bool donate_kv = true;          // Donate KV cache HBM buffers in-place on SET_ROWS
     bool bf16_matmul = true;        // Cast split-quantized weights & activations to BF16 for MXU (dense F16/F32 stay F32)
+    cloudtpu::Fp8MatmulMode fp8_matmul = cloudtpu::Fp8MatmulMode::OFF;  // Opt-in/auto f8E4M3FN dot_general via CLOUDTPU_MATMUL_FP8
+    bool emit_sdy_mesh = false;     // Opt-in Shardy sdy.mesh module decl via CLOUDTPU_EMIT_SDY_MESH
     bool bf16_flash_attn = false;   // Opt-in BF16 Q/K/probs/V matmuls in FLASH_ATTN_EXT (default false: F32 parity)
     CloudTpuQ4Mode q4_mode = CloudTpuQ4Mode::I4;  // Single-read S4/U4 default (overridden by CLOUDTPU_Q4_MODE / CLOUDTPU_Q4_SPLIT_DOT)
     bool q4_split_dot = true;       // Q4_0/Q4_K SPLIT vs CONCAT selection when q4_mode is SPLIT/CONCAT
@@ -76,6 +80,12 @@ static cloudtpu_env_config load_env_config() {
         if (parsed >= 1 && parsed <= 16) {
             cfg.mock_devices = parsed;
         }
+    }
+    if (const char* v = std::getenv("CLOUDTPU_MOCK_PROFILE")) {
+        cfg.mock_profile = cloudtpu::parse_mock_topology_profile(v);
+    }
+    if (const char* v = std::getenv("CLOUDTPU_MOCK_SCRAMBLE_ORDER")) {
+        cfg.mock_scramble_device_order = (std::atoi(v) != 0);
     }
     if (const char* v = std::getenv("CLOUDTPU_SPMD_CHIPS")) {
         if (std::strcmp(v, "auto") == 0 || std::strcmp(v, "AUTO") == 0) {
@@ -113,6 +123,22 @@ static cloudtpu_env_config load_env_config() {
     }
     if (const char* v = std::getenv("CLOUDTPU_MATMUL_BF16")) {
         cfg.bf16_matmul = (std::atoi(v) != 0);
+    }
+    if (const char* v = std::getenv("CLOUDTPU_MATMUL_FP8")) {
+        if (std::strcmp(v, "auto") == 0 || std::strcmp(v, "AUTO") == 0) {
+            cfg.fp8_matmul = cloudtpu::Fp8MatmulMode::AUTO;
+        } else if (std::strcmp(v, "force") == 0 || std::strcmp(v, "FORCE") == 0 ||
+                   std::strcmp(v, "1") == 0 || std::strcmp(v, "on") == 0 ||
+                   std::strcmp(v, "true") == 0) {
+            cfg.fp8_matmul = cloudtpu::Fp8MatmulMode::FORCE;
+        } else if (std::atoi(v) != 0) {
+            cfg.fp8_matmul = cloudtpu::Fp8MatmulMode::FORCE;
+        } else {
+            cfg.fp8_matmul = cloudtpu::Fp8MatmulMode::OFF;
+        }
+    }
+    if (const char* v = std::getenv("CLOUDTPU_EMIT_SDY_MESH")) {
+        cfg.emit_sdy_mesh = (std::atoi(v) != 0);
     }
     if (const char* v = std::getenv("CLOUDTPU_FLASH_ATTN_BF16")) {
         cfg.bf16_flash_attn = (std::atoi(v) != 0);
@@ -236,6 +262,8 @@ static cloudtpu::PjrtRuntime& ensure_runtime_initialized() {
     cloudtpu::RuntimeConfig rt_cfg;
     rt_cfg.mock_mode = env.mock_mode;
     rt_cfg.mock_devices = env.mock_devices;
+    rt_cfg.mock_profile = env.mock_profile;
+    rt_cfg.mock_scramble_device_order = env.mock_scramble_device_order;
     rt_cfg.verbose = env.verbose;
     rt_cfg.exec_cache_cap = env.cache_cap;
     rt_cfg.async_collectives = env.async_collectives;
@@ -4089,6 +4117,20 @@ static BuiltSubgraphSpec build_subgraph_program_spec(const ggml_backend_cloudtpu
     cloudtpu::GraphProgramSpec& prog_spec = built.prog_spec;
     prog_spec.spmd_chips = P;
     prog_spec.bf16_matmul = ctx->env.bf16_matmul;
+    prog_spec.fp8_matmul = ctx->env.fp8_matmul;
+    prog_spec.emit_sdy_mesh = ctx->env.emit_sdy_mesh;
+    cloudtpu::PjrtRuntime& rt_shared = cloudtpu::shared_pjrt_runtime(nullptr);
+    if (rt_shared.is_initialized()) {
+        prog_spec.target_is_tpu7x = rt_shared.is_tpu7x_topology();
+        prog_spec.d2d_group_size = rt_shared.d2d_group_size();
+        if (prog_spec.emit_sdy_mesh && P > 1) {
+            // Physical PJRT device placement (e.g. Hamiltonian D2D-paired subset [0,1,2,3,6,7])
+            // is encoded by PJRT DeviceAssignmentProto (mapping logical replica r in 0..P-1 to
+            // physical device id). Shardy sdy.mesh operates over logical mesh device IDs 0..P-1,
+            // which are already ordered consecutively in Hamiltonian D2D pairs (identity 0..P-1).
+            prog_spec.sdy_mesh_device_ids.clear();
+        }
+    }
     prog_spec.bf16_flash_attn = ctx->env.bf16_flash_attn;
     prog_spec.q4_split_dot = ctx->env.q4_split_dot;
     prog_spec.mm_pad_m = ctx->env.mm_pad_m;
@@ -4529,7 +4571,11 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
                   (ctx->env.bf16_flash_attn ? 16ULL : 0ULL) |
                   (ctx->env.q4k_u4 ? 32ULL : 0ULL) |
                   (ctx->env.freetile_mosaic ? 64ULL : 0ULL) |
-                  (static_cast<uint64_t>(ctx->env.q4_mode) << 8));
+                  (ctx->env.emit_sdy_mesh ? 128ULL : 0ULL) |
+                  (rt.is_tpu7x_topology() ? 256ULL : 0ULL) |
+                  (static_cast<uint64_t>(ctx->env.q4_mode) << 9) |
+                  (static_cast<uint64_t>(ctx->env.fp8_matmul) << 13) |
+                  (static_cast<uint64_t>(rt.d2d_group_size()) << 17));
     sig_push(sig, static_cast<uint64_t>(ctx->env.mm_pad_m));
     if (ctx->env.freetile_mosaic) {
         sig_push(sig, static_cast<uint64_t>(ctx->env.freetile_mosaic_version));

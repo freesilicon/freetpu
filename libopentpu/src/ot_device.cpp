@@ -443,6 +443,30 @@ ot_status_t ot_device_get_info(const ot_context_t* ctx, ot_device_info_t* out_in
   return OT_OK;
 }
 
+ot_status_t ot_chip_geometry_for_device_id(uint16_t pci_device_id, ot_device_geometry_t* out_geom) {
+  if (!out_geom) return OT_ERR_INVALID_ARG;
+  if (!ot::chip_geometry_for_device_id(pci_device_id, out_geom)) {
+    return OT_ERR_UNSUPPORTED;
+  }
+  return OT_OK;
+}
+
+ot_status_t ot_device_get_geometry(const ot_context_t* ctx, ot_device_geometry_t* out_geom) {
+  if (!ctx || !out_geom) return OT_ERR_INVALID_ARG;
+  if (ot::chip_geometry_for_device_id(ctx->info.device_id, out_geom)) {
+    return OT_OK;
+  }
+  std::memset(out_geom, 0, sizeof(*out_geom));
+  out_geom->chip_gen = ctx->info.chip_gen;
+  out_geom->pci_device_id = ctx->info.device_id;
+  out_geom->hbm_bytes_per_logical_chiplet = ctx->info.hbm_bytes_total;
+  out_geom->vmem_bytes_per_logical_chiplet = ctx->info.vmem_bytes;
+  out_geom->smem_bytes_per_logical_chiplet = ctx->info.smem_bytes;
+  out_geom->num_mxus_per_logical_chiplet = ctx->info.num_mxus;
+  out_geom->logical_chiplets_per_pci_func = (ctx->info.chip_gen == OT_CHIP_TPU7X) ? 2u : 1u;
+  return OT_OK;
+}
+
 ot_status_t ot_buffer_alloc(ot_context_t* ctx, size_t size_bytes, ot_buffer_t** out_buf) {
   if (!ctx || !out_buf || size_bytes == 0 ||
       size_bytes > std::numeric_limits<uint64_t>::max() - 4095ULL) {
@@ -523,6 +547,58 @@ uint64_t ot_buffer_hbm_addr(const ot_buffer_t* buf) {
 }  // extern "C"
 
 namespace ot {
+
+bool chip_geometry_for_device_id(uint16_t device_id, ot_device_geometry_t* out) {
+  if (!out) return false;
+  std::memset(out, 0, sizeof(*out));
+  out->pci_device_id = device_id;
+  switch (device_id) {
+    case 0x0063u:  // Cloud TPU v5e (single chiplet, 128x128 MXU, 16 GiB HBM)
+      out->chip_gen = OT_CHIP_V5E;
+      out->mxu_rows = 128u;
+      out->mxu_cols = 128u;
+      out->fp8_inner_rows = 0u;
+      out->fp8_inner_cols = 0u;
+      out->logical_chiplets_per_pci_func = 1u;
+      out->num_mxus_per_logical_chiplet = 4u;
+      out->supports_native_fp8 = 0u;
+      out->hbm_bytes_per_logical_chiplet = 16ULL << 30;
+      out->vmem_bytes_per_logical_chiplet = 128ULL << 20;
+      out->smem_bytes_per_logical_chiplet = 1ULL << 20;
+      return true;
+    case 0x006fu:  // Cloud TPU v6e Trillium (single chiplet, 1 TensorCore, 2x 256x256 MXU, 32 GiB HBM)
+    case 0x006eu:
+      out->chip_gen = OT_CHIP_V6E;
+      out->mxu_rows = 256u;
+      out->mxu_cols = 256u;
+      out->fp8_inner_rows = 0u;
+      out->fp8_inner_cols = 0u;
+      out->logical_chiplets_per_pci_func = 1u;
+      out->num_mxus_per_logical_chiplet = 2u;
+      out->supports_native_fp8 = 0u;
+      out->hbm_bytes_per_logical_chiplet = 32ULL << 30;
+      out->vmem_bytes_per_logical_chiplet = 128ULL << 20;
+      out->smem_bytes_per_logical_chiplet = 1ULL << 20;
+      return true;
+    case 0x0075u:  // Ironwood tpu7x (dual-chiplet, 256x256 MXU + (4,1) FP8 inner tile, 96 GiB HBM, 64 MiB VMEM/chiplet)
+    case 0x0076u:  // Documented Cloud TPU v7x (Ironwood) guest VM VFIO PCI Device ID
+      out->chip_gen = OT_CHIP_TPU7X;
+      out->mxu_rows = 256u;
+      out->mxu_cols = 256u;
+      out->fp8_inner_rows = 4u;
+      out->fp8_inner_cols = 1u;
+      out->logical_chiplets_per_pci_func = 2u;
+      out->num_mxus_per_logical_chiplet = 2u;
+      out->supports_native_fp8 = 1u;
+      out->hbm_bytes_per_logical_chiplet = 96ULL << 30;
+      out->vmem_bytes_per_logical_chiplet = 64ULL << 20;
+      out->smem_bytes_per_logical_chiplet = 1ULL << 20;
+      return true;
+    default:
+      out->chip_gen = OT_CHIP_UNKNOWN;
+      return false;
+  }
+}
 
 ot_status_t buffer_h2d_offset(ot_context_t* ctx, ot_buffer_t* dst, size_t dst_offset,
                               const void* host_src, size_t size_bytes) {
@@ -722,6 +798,10 @@ ot_status_t ot_matmul_bf16(ot_context_t* ctx,
     return OT_OK;
   }
 
+  if (ctx->info.chip_gen != OT_CHIP_V5E) {
+    ctx->last_error = "Live hardware BF16 matmul currently validated on TPU v5e (0x0063) only";
+    return OT_ERR_UNSUPPORTED;
+  }
   if (m_dim != 128u || k_dim != 128u || n_dim != 128u) {
     ctx->last_error = "Live hardware BF16 matmul currently supports 128x128x128 only";
     return OT_ERR_UNSUPPORTED;

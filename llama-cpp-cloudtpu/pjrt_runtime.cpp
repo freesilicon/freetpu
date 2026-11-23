@@ -120,6 +120,84 @@ float f16_to_f32(uint16_t h) {
     return f;
 }
 
+uint8_t f32_to_f8e4m3fn(float f) {
+    uint32_t x = 0;
+    std::memcpy(&x, &f, sizeof(x));
+    const uint8_t sign = static_cast<uint8_t>((x >> 24) & 0x80U);
+    const uint32_t abs_x = x & 0x7fffffffU;
+    // NaN -> 0x7F (preserving sign)
+    if (abs_x > 0x7f800000U) {
+        return static_cast<uint8_t>(sign | 0x7fU);
+    }
+    // Inf or magnitude >= 448.0 saturates to finite max 0x7E (448.0) per OCP E4M3FN clamping.
+    if (abs_x >= 0x43e00000U) {
+        return static_cast<uint8_t>(sign | 0x7eU);
+    }
+    int32_t exp = static_cast<int32_t>((x >> 23) & 0xffU) - 127 + 7;
+    uint32_t mant = x & 0x007fffffU;
+    if (exp <= 0) {
+        // Subnormal or underflow to zero (min positive subnormal = 2^-9 = 0x3b000000).
+        if (exp < -3) {
+            return sign;
+        }
+        // value = full * 2^(exp - 30) = (full / 2^(21 - exp)) * 2^-9, with total_shift in [21, 24].
+        const uint32_t total_shift = static_cast<uint32_t>(21 - exp);
+        const uint32_t full = mant | 0x00800000U;
+        uint32_t q_mant = full >> total_shift;
+        const uint32_t rem = full & ((1U << total_shift) - 1U);
+        const uint32_t half = 1U << (total_shift - 1U);
+        if (rem > half || (rem == half && (q_mant & 1U) != 0U)) {
+            q_mant += 1U;
+        }
+        if (q_mant >= 8U) {
+            // Rounded up from largest subnormal into smallest normal (exp=1, mant=0).
+            return static_cast<uint8_t>(sign | 0x08U);
+        }
+        return static_cast<uint8_t>(sign | q_mant);
+    }
+    const uint32_t round_bits = mant & 0x000fffffU;
+    uint32_t q_mant = mant >> 20;
+    const uint32_t lsb = q_mant & 1U;
+    if (round_bits > 0x00080000U || (round_bits == 0x00080000U && lsb != 0U)) {
+        q_mant += 1U;
+        if (q_mant >= 8U) {
+            q_mant = 0U;
+            exp += 1;
+        }
+    }
+    if (exp > 15 || (exp == 15 && q_mant >= 7U)) {
+        return static_cast<uint8_t>(sign | 0x7eU);
+    }
+    return static_cast<uint8_t>(sign | (static_cast<uint32_t>(exp) << 3) | q_mant);
+}
+
+float f8e4m3fn_to_f32(uint8_t b) {
+    const uint32_t sign = static_cast<uint32_t>(b & 0x80U) << 24;
+    uint32_t exp = (b >> 3) & 0x0fU;
+    uint32_t mant = b & 0x07U;
+    uint32_t out = 0;
+    if (exp == 0x0fU && mant == 0x07U) {
+        out = sign | 0x7fc00000U;
+    } else if (exp == 0U) {
+        if (mant == 0U) {
+            out = sign;
+        } else {
+            exp = 1U;
+            while ((mant & 0x08U) == 0U) {
+                mant <<= 1;
+                exp -= 1U;
+            }
+            mant &= 0x07U;
+            out = sign | ((exp + 127U - 7U) << 23) | (mant << 20);
+        }
+    } else {
+        out = sign | ((exp + 127U - 7U) << 23) | (mant << 20);
+    }
+    float f = 0.0f;
+    std::memcpy(&f, &out, sizeof(f));
+    return f;
+}
+
 size_t count_libpython_mappings() {
     std::ifstream ifs("/proc/self/maps");
     if (!ifs.is_open()) {
@@ -141,6 +219,7 @@ PJRT_Buffer_Type to_pjrt_buffer_type(PjrtDType dt) {
         case PjrtDType::F32: return PJRT_Buffer_Type_F32;
         case PjrtDType::F16: return PJRT_Buffer_Type_F16;
         case PjrtDType::BF16: return PJRT_Buffer_Type_BF16;
+        case PjrtDType::F8E4M3FN: return PJRT_Buffer_Type_F8E4M3FN;
         case PjrtDType::S8: return PJRT_Buffer_Type_S8;
         case PjrtDType::U8: return PJRT_Buffer_Type_U8;
         case PjrtDType::S4: return PJRT_Buffer_Type_S4;
@@ -159,6 +238,7 @@ PjrtDType from_pjrt_buffer_type(PJRT_Buffer_Type dt) {
         case PJRT_Buffer_Type_F32: return PjrtDType::F32;
         case PJRT_Buffer_Type_F16: return PjrtDType::F16;
         case PJRT_Buffer_Type_BF16: return PjrtDType::BF16;
+        case PJRT_Buffer_Type_F8E4M3FN: return PjrtDType::F8E4M3FN;
         case PJRT_Buffer_Type_S8: return PjrtDType::S8;
         case PJRT_Buffer_Type_U8: return PjrtDType::U8;
         case PJRT_Buffer_Type_S4: return PjrtDType::S4;
@@ -177,6 +257,7 @@ const char* pjrt_dtype_mlir_name(PjrtDType dt) {
         case PjrtDType::F32: return "f32";
         case PjrtDType::F16: return "f16";
         case PjrtDType::BF16: return "bf16";
+        case PjrtDType::F8E4M3FN: return "f8E4M3FN";
         case PjrtDType::S8: return "i8";
         case PjrtDType::U8: return "ui8";
         case PjrtDType::S4: return "i4";
@@ -199,6 +280,7 @@ size_t pjrt_dtype_bits(PjrtDType dt) {
         case PjrtDType::BF16:
         case PjrtDType::S16: return 16;
         case PjrtDType::PRED:
+        case PjrtDType::F8E4M3FN:
         case PjrtDType::S8:
         case PjrtDType::U8: return 8;
         case PjrtDType::S4:
@@ -512,6 +594,221 @@ size_t PjrtBuffer::num_bytes() const {
     return pjrt_dtype_nbytes(dtype, num_elements());
 }
 
+int mock_profile_device_count(MockTopologyProfile profile) {
+    switch (profile) {
+        case MockTopologyProfile::V5E_1:    return 1;
+        case MockTopologyProfile::TPU7X_1T: return 2;
+        case MockTopologyProfile::V6E_8:    return 8;
+        case MockTopologyProfile::TPU7X_4T: return 8;
+        case MockTopologyProfile::AUTO:     return 0;
+    }
+    return 0;
+}
+
+RuntimeConfig RuntimeConfig::from_env() {
+    RuntimeConfig cfg;
+#if defined(__linux__)
+    cfg.mock_mode = false;
+#else
+    cfg.mock_mode = true;
+#endif
+    if (const char* v = std::getenv("CLOUDTPU_MOCK")) {
+        cfg.mock_mode = (std::atoi(v) != 0);
+    }
+    int env_devices = 0;
+    if (const char* v = std::getenv("CLOUDTPU_MOCK_DEVICES")) {
+        const int parsed = std::atoi(v);
+        if (parsed >= 1 && parsed <= 16) {
+            env_devices = parsed;
+            cfg.mock_devices = parsed;
+        }
+    }
+    if (const char* v = std::getenv("CLOUDTPU_MOCK_PROFILE")) {
+        cfg.mock_profile = parse_mock_topology_profile(v);
+    }
+    const int profile_devs = mock_profile_device_count(cfg.mock_profile);
+    if (profile_devs > 0) {
+        if (env_devices > 0 && env_devices != profile_devs) {
+            std::fprintf(stderr,
+                         "ggml-cloudtpu: CLOUDTPU_MOCK_DEVICES=%d conflicts with named "
+                         "CLOUDTPU_MOCK_PROFILE (expects %d logical devices); using %d\n",
+                         env_devices, profile_devs, profile_devs);
+        }
+        cfg.mock_devices = profile_devs;
+    }
+    if (const char* v = std::getenv("CLOUDTPU_MOCK_SCRAMBLE_ORDER")) {
+        cfg.mock_scramble_device_order = (std::atoi(v) != 0);
+    }
+    return cfg;
+}
+
+MockTopologyProfile parse_mock_topology_profile(const char* val) {
+    if (!val || val[0] == '\0') {
+        return MockTopologyProfile::AUTO;
+    }
+    std::string s;
+    for (const char* p = val; *p; ++p) {
+        s.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(*p))));
+    }
+    if (s == "auto") {
+        return MockTopologyProfile::AUTO;
+    }
+    if (s == "v5e" || s == "v5e-1" || s == "v5e_1" || s == "v5litepod-1") {
+        return MockTopologyProfile::V5E_1;
+    }
+    if (s == "v6e" || s == "v6e-8" || s == "v6e_8") {
+        return MockTopologyProfile::V6E_8;
+    }
+    if (s == "tpu7x-1t" || s == "tpu7x_1t" || s == "tpu7x-standard-1t" || s == "1t" ||
+        s == "ironwood-1t") {
+        return MockTopologyProfile::TPU7X_1T;
+    }
+    if (s == "tpu7x-4t" || s == "tpu7x_4t" || s == "tpu7x-standard-4t" || s == "4t" ||
+        s == "tpu7x" || s == "ironwood" || s == "ironwood-4t") {
+        return MockTopologyProfile::TPU7X_4T;
+    }
+    return MockTopologyProfile::AUTO;
+}
+
+bool is_tpu7x_device_kind(const std::string& kind) {
+    std::string lower;
+    lower.reserve(kind.size());
+    for (unsigned char c : kind) {
+        lower.push_back(static_cast<char>(std::tolower(c)));
+    }
+    return lower.find("tpu7x") != std::string::npos ||
+           lower.find("tpu v7") != std::string::npos ||
+           lower.find("tpu7") != std::string::npos ||
+           lower.find("ironwood") != std::string::npos;
+}
+
+std::vector<int> compute_d2d_hamiltonian_order(const std::vector<PjrtDeviceInfo>& infos) {
+    const int n = static_cast<int>(infos.size());
+    std::vector<int> identity;
+    identity.reserve(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        identity.push_back(i);
+    }
+    if (n <= 1) {
+        return identity;
+    }
+
+    bool any_coords = false;
+    bool any_core = false;
+    bool any_tpu7x = false;
+    for (const auto& info : infos) {
+        if (!info.coords.empty()) {
+            any_coords = true;
+        }
+        if (info.core_on_chip >= 0 || info.is_dual_chiplet) {
+            any_core = true;
+        }
+        if (is_tpu7x_device_kind(info.kind)) {
+            any_tpu7x = true;
+        }
+    }
+
+    struct PkgKey {
+        std::vector<int64_t> coords;
+        bool operator<(const PkgKey& o) const { return coords < o.coords; }
+        bool operator==(const PkgKey& o) const { return coords == o.coords; }
+    };
+
+    // Group logical devices into physical chip packages so intra-package chiplets
+    // remain consecutive D2D pairs (0,1), (2,3), (4,5), (6,7), avoiding the 6x
+    // cross-package ICI penalty when pairing ranks.
+    struct PkgGroup {
+        std::vector<int64_t> coords;
+        std::vector<int> member_indices;
+    };
+    std::vector<PkgGroup> groups;
+
+    auto find_or_add_group = [&](const std::vector<int64_t>& key) -> PkgGroup& {
+        for (auto& g : groups) {
+            if (g.coords == key) {
+                return g;
+            }
+        }
+        groups.push_back(PkgGroup{key, {}});
+        return groups.back();
+    };
+
+    for (int i = 0; i < n; ++i) {
+        const auto& info = infos[static_cast<size_t>(i)];
+        std::vector<int64_t> key;
+        if (any_coords && !info.coords.empty()) {
+            key = info.coords;
+        } else if (any_tpu7x || any_core) {
+            key = {info.id / 2};
+        } else {
+            key = {info.id};
+        }
+        find_or_add_group(key).member_indices.push_back(i);
+    }
+
+    bool multi_member_group = false;
+    for (const auto& g : groups) {
+        if (g.member_indices.size() >= 2) {
+            multi_member_group = true;
+            break;
+        }
+    }
+
+    // If hardware didn't populate coordinates/core_on_chip yet for tpu7x, pair by id/2.
+    if (!multi_member_group && (any_tpu7x || any_core) && (n % 2 == 0)) {
+        groups.clear();
+        for (int i = 0; i < n; ++i) {
+            const auto& info = infos[static_cast<size_t>(i)];
+            find_or_add_group({info.id / 2}).member_indices.push_back(i);
+        }
+    }
+
+    // Order physical packages along a serpentine Hamiltonian torus path:
+    // For (x, y, z): sort by z ascending; within z, flip y on odd z; within (y, z), flip x on odd (y ^ z).
+    std::sort(groups.begin(), groups.end(), [&](const PkgGroup& a, const PkgGroup& b) {
+        const size_t dims = std::min(a.coords.size(), b.coords.size());
+        if (dims >= 3) {
+            const int64_t az = a.coords[2];
+            const int64_t bz = b.coords[2];
+            if (az != bz) return az < bz;
+            const int64_t ay = a.coords[1];
+            const int64_t by = b.coords[1];
+            if (ay != by) return ((az & 1) == 0) ? (ay < by) : (ay > by);
+            const int64_t ax = a.coords[0];
+            const int64_t bx = b.coords[0];
+            if (ax != bx) return (((az ^ ay) & 1) == 0) ? (ax < bx) : (ax > bx);
+        } else if (dims == 2) {
+            const int64_t ay = a.coords[1];
+            const int64_t by = b.coords[1];
+            if (ay != by) return ay < by;
+            const int64_t ax = a.coords[0];
+            const int64_t bx = b.coords[0];
+            if (ax != bx) return ((ay & 1) == 0) ? (ax < bx) : (ax > bx);
+        }
+        return a.coords < b.coords;
+    });
+
+    std::vector<int> order;
+    order.reserve(static_cast<size_t>(n));
+    for (auto& g : groups) {
+        std::sort(g.member_indices.begin(), g.member_indices.end(), [&](int ia, int ib) {
+            const auto& a = infos[static_cast<size_t>(ia)];
+            const auto& b = infos[static_cast<size_t>(ib)];
+            if (a.core_on_chip != b.core_on_chip && a.core_on_chip >= 0 && b.core_on_chip >= 0) {
+                return a.core_on_chip < b.core_on_chip;
+            }
+            if (a.id != b.id) {
+                return a.id < b.id;
+            }
+            return ia < ib;
+        });
+        for (int idx : g.member_indices) {
+            order.push_back(idx);
+        }
+    }
+    return order;
+}
+
 // =========================================================================
 // In-Process Host Mock PJRT C API + StableHLO Textual Evaluator
 // =========================================================================
@@ -554,6 +851,8 @@ struct MockTensor {
                 std::memcpy(&b, bytes.data() + idx * 2, 2);
                 return bf16_to_f32(b);
             }
+            case PjrtDType::F8E4M3FN:
+                return f8e4m3fn_to_f32(bytes[idx]);
             case PjrtDType::S8:
                 return static_cast<float>(reinterpret_cast<const int8_t*>(bytes.data())[idx]);
             case PjrtDType::U8:
@@ -601,6 +900,9 @@ struct MockTensor {
                 std::memcpy(bytes.data() + idx * 2, &b, 2);
                 break;
             }
+            case PjrtDType::F8E4M3FN:
+                bytes[idx] = f32_to_f8e4m3fn(v);
+                break;
             case PjrtDType::S8: {
                 const int8_t iv = static_cast<int8_t>(std::lround(v));
                 std::memcpy(bytes.data() + idx, &iv, 1);
@@ -766,6 +1068,7 @@ static PjrtDType parse_mlir_dtype(const std::string& tok) {
     if (tok == "f32") return PjrtDType::F32;
     if (tok == "f16") return PjrtDType::F16;
     if (tok == "bf16") return PjrtDType::BF16;
+    if (tok == "f8E4M3FN" || tok == "f8e4m3fn") return PjrtDType::F8E4M3FN;
     if (tok == "i8" || tok == "si8") return PjrtDType::S8;
     if (tok == "ui8") return PjrtDType::U8;
     if (tok == "i4" || tok == "si4") return PjrtDType::S4;
@@ -936,6 +1239,7 @@ struct MockProgram {
     std::vector<std::pair<std::string, MockTypeSpec>> args;
     std::vector<MockOp> ops;
     std::vector<std::string> return_names;
+    std::string sdy_mesh_line;
 };
 
 static MockProgram parse_stablehlo_mlir(const std::string& mlir) {
@@ -979,6 +1283,10 @@ static MockProgram parse_stablehlo_mlir(const std::string& mlir) {
         }
 
         if (line == "}" || line.rfind("module ", 0) == 0) {
+            continue;
+        }
+        if (line.rfind("sdy.mesh ", 0) == 0) {
+            prog.sdy_mesh_line = line;
             continue;
         }
 
@@ -2145,6 +2453,9 @@ struct MockDeviceDescription {
     int id = 0;
     std::string kind;
     std::string to_string;
+    std::vector<int64_t> coords;
+    int64_t core_on_chip = -1;
+    std::vector<PJRT_NamedValue> attrs;
 };
 struct MockDevice {
     MockClient* client = nullptr;
@@ -2158,30 +2469,122 @@ struct MockClient {
     std::vector<std::unique_ptr<MockDevice>> devices;
     std::vector<PJRT_Device*> device_ptrs;
 
-    explicit MockClient(int n_devs) {
+    MockClient(int n_devs,
+               MockTopologyProfile profile = MockTopologyProfile::AUTO,
+               bool scramble_order = false) {
+        int profile_devs = 0;
+        switch (profile) {
+            case MockTopologyProfile::V5E_1:    profile_devs = 1; break;
+            case MockTopologyProfile::TPU7X_1T: profile_devs = 2; break;
+            case MockTopologyProfile::V6E_8:    profile_devs = 8; break;
+            case MockTopologyProfile::TPU7X_4T: profile_devs = 8; break;
+            case MockTopologyProfile::AUTO:     profile_devs = 0; break;
+        }
+        if (profile_devs > 0) {
+            if (n_devs > 1 && n_devs != profile_devs) {
+                std::fprintf(stderr,
+                             "ggml-cloudtpu: CLOUDTPU_MOCK_DEVICES=%d conflicts with named "
+                             "CLOUDTPU_MOCK_PROFILE (expects %d logical devices); using %d\n",
+                             n_devs, profile_devs, profile_devs);
+            }
+            n_devs = profile_devs;
+        }
         n_devs = std::max(1, std::min(16, n_devs));
+
         std::string kind_str = "Cloud TPU Host Mock (v5e-1)";
         int64_t per_chip_hbm = 16909336064LL;  // 15.748 GiB (v5e-1)
-        if (n_devs == 8) {
+        bool dual_chiplet = false;
+        if (profile == MockTopologyProfile::TPU7X_1T ||
+            (profile == MockTopologyProfile::AUTO && n_devs == 2)) {
+            kind_str = "Cloud TPU Host Mock (tpu7x-1t)";
+            per_chip_hbm = 103079215104LL;  // 96 GiB/logical chiplet (192 GiB/package)
+            dual_chiplet = true;
+        } else if (profile == MockTopologyProfile::TPU7X_4T) {
+            kind_str = "Cloud TPU Host Mock (tpu7x-4t)";
+            per_chip_hbm = 103079215104LL;  // 96 GiB/logical chiplet (768 GiB total across 8 logical)
+            dual_chiplet = true;
+        } else if (profile == MockTopologyProfile::V6E_8 ||
+                   (profile == MockTopologyProfile::AUTO && n_devs == 8)) {
             kind_str = "Cloud TPU Host Mock (v6e-8)";
             per_chip_hbm = 34359738368LL;  // 32 GiB/chip (256 GiB total)
         } else if (n_devs == 4) {
-            kind_str = "Cloud TPU Host Mock (tpu7x-4t)";
-            per_chip_hbm = 206158430208LL;  // 192 GiB/chip (768 GiB total)
+            kind_str = "Cloud TPU Host Mock (4-chip)";
+            per_chip_hbm = 34359738368LL;  // 32 GiB/chip
         } else if (n_devs > 1) {
             kind_str = "Cloud TPU Host Mock (" + std::to_string(n_devs) + "-chip)";
             per_chip_hbm = 34359738368LL;
         }
+
+        // Build logical device layout, optionally scrambled (all chiplet-0s then chiplet-1s +
+        // non-Hamiltonian 2x2 torus order) so tests can verify PjrtRuntime D2D Hamiltonian sorting.
+        struct DevEntry {
+            int hw_id;
+            std::vector<int64_t> coords;
+            int64_t core_on_chip;
+        };
+        std::vector<DevEntry> entries;
+        entries.reserve(static_cast<size_t>(n_devs));
+        if (dual_chiplet && (n_devs % 2) == 0) {
+            const int n_pkgs = n_devs / 2;
+            const int grid_x = (n_pkgs == 4) ? 2 : n_pkgs;
+            if (scramble_order) {
+                for (int core = 1; core >= 0; --core) {
+                    for (int pkg = n_pkgs - 1; pkg >= 0; --pkg) {
+                        const int x = pkg % grid_x;
+                        const int y = pkg / grid_x;
+                        const int hw_id = pkg * 2 + core;
+                        entries.push_back({hw_id, {x, y, 0}, core});
+                    }
+                }
+            } else {
+                for (int i = 0; i < n_devs; ++i) {
+                    const int pkg = i / 2;
+                    const int core = i % 2;
+                    const int x = pkg % grid_x;
+                    const int y = pkg / grid_x;
+                    entries.push_back({i, {x, y, 0}, core});
+                }
+            }
+        } else {
+            for (int i = 0; i < n_devs; ++i) {
+                entries.push_back({i, {i, 0, 0}, -1});
+            }
+        }
+
         devices.reserve(static_cast<size_t>(n_devs));
         device_ptrs.reserve(static_cast<size_t>(n_devs));
         for (int i = 0; i < n_devs; ++i) {
+            const auto& e = entries[static_cast<size_t>(i)];
             auto d = std::make_unique<MockDevice>();
             d->client = this;
-            d->id = i;
+            d->id = e.hw_id;
             d->hbm_limit = per_chip_hbm;
-            d->desc.id = i;
+            d->desc.id = e.hw_id;
             d->desc.kind = kind_str;
-            d->desc.to_string = "CLOUDTPU_MOCK(id=" + std::to_string(i) + ")";
+            d->desc.to_string = "CLOUDTPU_MOCK(id=" + std::to_string(e.hw_id) + ")";
+            d->desc.coords = e.coords;
+            d->desc.core_on_chip = e.core_on_chip;
+
+            PJRT_NamedValue coords_attr = {};
+            coords_attr.struct_size = PJRT_NamedValue_STRUCT_SIZE;
+            coords_attr.name = "coords";
+            coords_attr.name_size = 6;
+            coords_attr.type = PJRT_NamedValue_kInt64List;
+            coords_attr.int64_array_value = d->desc.coords.data();
+            coords_attr.value_size = d->desc.coords.size();
+            d->desc.attrs.push_back(coords_attr);
+
+            if (d->desc.core_on_chip >= 0) {
+                PJRT_NamedValue coc_attr = {};
+                coc_attr.struct_size = PJRT_NamedValue_STRUCT_SIZE;
+                coc_attr.name = "core_on_chip";
+                coc_attr.name_size = 12;
+                coc_attr.type = PJRT_NamedValue_kInt64;
+                coc_attr.int64_value = d->desc.core_on_chip;
+                coc_attr.value_size = 1;
+                d->desc.attrs.push_back(coc_attr);
+            }
+
             device_ptrs.push_back(reinterpret_cast<PJRT_Device*>(d.get()));
             devices.push_back(std::move(d));
         }
@@ -2349,25 +2752,24 @@ static PJRT_Error* mock_event_await(PJRT_Event_Await_Args*) { return nullptr; }
 
 static PJRT_Error* mock_client_create(PJRT_Client_Create_Args* args) {
     int n_devs = 1;
+    MockTopologyProfile profile = MockTopologyProfile::AUTO;
+    bool scramble_order = false;
     if (args->create_options && args->num_options > 0) {
         for (size_t i = 0; i < args->num_options; ++i) {
             const PJRT_NamedValue& opt = args->create_options[i];
-            if (opt.name && opt.name_size == 17 &&
-                std::memcmp(opt.name, "mock_device_count", 17) == 0 &&
-                opt.type == PJRT_NamedValue_kInt64) {
+            if (!opt.name) continue;
+            const std::string opt_name(opt.name, opt.name_size);
+            if (opt_name == "mock_device_count" && opt.type == PJRT_NamedValue_kInt64) {
                 n_devs = std::max(1, std::min(16, static_cast<int>(opt.int64_value)));
+            } else if (opt_name == "mock_profile" && opt.type == PJRT_NamedValue_kString && opt.string_value) {
+                const std::string pstr(opt.string_value, opt.value_size);
+                profile = parse_mock_topology_profile(pstr.c_str());
+            } else if (opt_name == "mock_scramble_order" && opt.type == PJRT_NamedValue_kBool) {
+                scramble_order = opt.bool_value;
             }
         }
     }
-    if (n_devs <= 1) {
-        if (const char* v = std::getenv("CLOUDTPU_MOCK_DEVICES")) {
-            const int parsed = std::atoi(v);
-            if (parsed > 1 && parsed <= 16) {
-                n_devs = parsed;
-            }
-        }
-    }
-    args->client = reinterpret_cast<PJRT_Client*>(new MockClient(n_devs));
+    args->client = reinterpret_cast<PJRT_Client*>(new MockClient(n_devs, profile, scramble_order));
     return nullptr;
 }
 static PJRT_Error* mock_client_destroy(PJRT_Client_Destroy_Args* args) {
@@ -2400,6 +2802,17 @@ static PJRT_Error* mock_device_get_description(PJRT_Device_GetDescription_Args* 
 static PJRT_Error* mock_dev_desc_id(PJRT_DeviceDescription_Id_Args* args) {
     const auto* desc = reinterpret_cast<const MockDeviceDescription*>(args->device_description);
     args->id = desc ? desc->id : 0;
+    return nullptr;
+}
+static PJRT_Error* mock_dev_desc_attributes(PJRT_DeviceDescription_Attributes_Args* args) {
+    const auto* desc = reinterpret_cast<const MockDeviceDescription*>(args->device_description);
+    if (desc && !desc->attrs.empty()) {
+        args->attributes = desc->attrs.data();
+        args->num_attributes = desc->attrs.size();
+    } else {
+        args->attributes = nullptr;
+        args->num_attributes = 0;
+    }
     return nullptr;
 }
 static PJRT_Error* mock_dev_desc_kind(PJRT_DeviceDescription_Kind_Args* args) {
@@ -2683,6 +3096,7 @@ static const PJRT_Api* get_mock_pjrt_api() {
         a.PJRT_Client_BufferFromHostBuffer = mock_buffer_from_host;
         a.PJRT_Device_GetDescription = mock_device_get_description;
         a.PJRT_DeviceDescription_Id = mock_dev_desc_id;
+        a.PJRT_DeviceDescription_Attributes = mock_dev_desc_attributes;
         a.PJRT_DeviceDescription_Kind = mock_dev_desc_kind;
         a.PJRT_DeviceDescription_ToString = mock_dev_desc_to_string;
         a.PJRT_Device_MemoryStats = mock_device_memory_stats;
@@ -2845,18 +3259,55 @@ void PjrtRuntime::init(const RuntimeConfig& cfg) {
         check_error(api_->PJRT_Plugin_Initialize(&init_args), "PJRT_Plugin_Initialize");
     }
 
-    PJRT_NamedValue mock_dev_opt = {};
-    mock_dev_opt.struct_size = PJRT_NamedValue_STRUCT_SIZE;
-    mock_dev_opt.name = "mock_device_count";
-    mock_dev_opt.name_size = 17;
-    mock_dev_opt.type = PJRT_NamedValue_kInt64;
-    mock_dev_opt.int64_value = std::max(1, cfg.mock_devices);
+    std::vector<PJRT_NamedValue> create_opts;
+    std::string mock_profile_str;
+    if (is_mock_) {
+        if (cfg.mock_devices > 1) {
+            PJRT_NamedValue opt = {};
+            opt.struct_size = PJRT_NamedValue_STRUCT_SIZE;
+            opt.name = "mock_device_count";
+            opt.name_size = 17;
+            opt.type = PJRT_NamedValue_kInt64;
+            opt.int64_value = cfg.mock_devices;
+            opt.value_size = 1;
+            create_opts.push_back(opt);
+        }
+        if (cfg.mock_profile != MockTopologyProfile::AUTO) {
+            switch (cfg.mock_profile) {
+                case MockTopologyProfile::V5E_1: mock_profile_str = "v5e-1"; break;
+                case MockTopologyProfile::V6E_8: mock_profile_str = "v6e-8"; break;
+                case MockTopologyProfile::TPU7X_1T: mock_profile_str = "tpu7x-1t"; break;
+                case MockTopologyProfile::TPU7X_4T: mock_profile_str = "tpu7x-4t"; break;
+                default: break;
+            }
+            if (!mock_profile_str.empty()) {
+                PJRT_NamedValue opt = {};
+                opt.struct_size = PJRT_NamedValue_STRUCT_SIZE;
+                opt.name = "mock_profile";
+                opt.name_size = 12;
+                opt.type = PJRT_NamedValue_kString;
+                opt.string_value = mock_profile_str.c_str();
+                opt.value_size = mock_profile_str.size();
+                create_opts.push_back(opt);
+            }
+        }
+        if (cfg.mock_scramble_device_order) {
+            PJRT_NamedValue opt = {};
+            opt.struct_size = PJRT_NamedValue_STRUCT_SIZE;
+            opt.name = "mock_scramble_order";
+            opt.name_size = 19;
+            opt.type = PJRT_NamedValue_kBool;
+            opt.bool_value = true;
+            opt.value_size = 1;
+            create_opts.push_back(opt);
+        }
+    }
 
     PJRT_Client_Create_Args c_args = {};
     c_args.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
-    if (is_mock_ && cfg.mock_devices > 1) {
-        c_args.create_options = &mock_dev_opt;
-        c_args.num_options = 1;
+    if (!create_opts.empty()) {
+        c_args.create_options = create_opts.data();
+        c_args.num_options = create_opts.size();
     }
     check_error(api_->PJRT_Client_Create(&c_args), "PJRT_Client_Create");
     client_ = c_args.client;
@@ -2913,6 +3364,31 @@ void PjrtRuntime::init(const RuntimeConfig& cfg) {
             check_error(api_->PJRT_DeviceDescription_Kind(&k_args), "PJRT_DeviceDescription_Kind");
             info.kind.assign(k_args.device_kind, k_args.device_kind_size);
         }
+        if (PJRT_API_HAS(api_, PJRT_DeviceDescription_Attributes)) {
+            PJRT_DeviceDescription_Attributes_Args attr_args = {};
+            attr_args.struct_size = PJRT_DeviceDescription_Attributes_Args_STRUCT_SIZE;
+            attr_args.device_description = desc;
+            PJRT_Error* attr_err = api_->PJRT_DeviceDescription_Attributes(&attr_args);
+            if (!attr_err) {
+                for (size_t ai = 0; ai < attr_args.num_attributes; ++ai) {
+                    const PJRT_NamedValue& a = attr_args.attributes[ai];
+                    if (!a.name) continue;
+                    const std::string aname(a.name, a.name_size);
+                    if (aname == "coords") {
+                        if (a.type == PJRT_NamedValue_kInt64List && a.int64_array_value) {
+                            info.coords.assign(a.int64_array_value,
+                                               a.int64_array_value + a.value_size);
+                        } else if (a.type == PJRT_NamedValue_kInt64) {
+                            info.coords.push_back(a.int64_value);
+                        }
+                    } else if (aname == "core_on_chip" && a.type == PJRT_NamedValue_kInt64) {
+                        info.core_on_chip = a.int64_value;
+                    }
+                }
+            } else {
+                destroy_error(attr_err);
+            }
+        }
         if (PJRT_API_HAS(api_, PJRT_DeviceDescription_ToString)) {
             PJRT_DeviceDescription_ToString_Args ts_args = {};
             ts_args.struct_size = PJRT_DeviceDescription_ToString_Args_STRUCT_SIZE;
@@ -2937,6 +3413,70 @@ void PjrtRuntime::init(const RuntimeConfig& cfg) {
             }
         }
         device_infos_.push_back(std::move(info));
+    }
+
+    // Detect dual-chiplet topologies (e.g. tpu7x-1t / tpu7x-4t):
+    // either two logical devices share identical chip coordinates, or core_on_chip > 0,
+    // or device_kind matches Ironwood/tpu7x on an even logical count >= 2.
+    bool shared_coords = false;
+    for (size_t i = 0; i < device_infos_.size() && !shared_coords; ++i) {
+        if (device_infos_[i].coords.empty()) continue;
+        for (size_t j = i + 1; j < device_infos_.size(); ++j) {
+            if (device_infos_[i].coords == device_infos_[j].coords) {
+                shared_coords = true;
+                break;
+            }
+        }
+    }
+    bool dual_chiplet = shared_coords;
+    if (!dual_chiplet) {
+        for (const auto& info : device_infos_) {
+            if (info.core_on_chip > 0 ||
+                (is_tpu7x_device_kind(info.kind) &&
+                 device_infos_.size() >= 2 &&
+                 (device_infos_.size() % 2) == 0)) {
+                dual_chiplet = true;
+                break;
+            }
+        }
+    }
+    for (auto& info : device_infos_) {
+        info.is_dual_chiplet = dual_chiplet;
+    }
+
+    if (devices_.size() > 1) {
+        const std::vector<int> order = compute_d2d_hamiltonian_order(device_infos_);
+        if (order.size() == devices_.size()) {
+            std::vector<PJRT_Device*> sorted_devs;
+            std::vector<PjrtDeviceInfo> sorted_infos;
+            sorted_devs.reserve(devices_.size());
+            sorted_infos.reserve(device_infos_.size());
+            for (int r = 0; r < static_cast<int>(order.size()); ++r) {
+                const int src = order[static_cast<size_t>(r)];
+                sorted_devs.push_back(devices_[static_cast<size_t>(src)]);
+                PjrtDeviceInfo info = device_infos_[static_cast<size_t>(src)];
+                info.index = r;
+                if (dual_chiplet) {
+                    info.chip_id = r / 2;
+                    info.chiplet_id = (info.core_on_chip >= 0)
+                                          ? static_cast<int32_t>(info.core_on_chip)
+                                          : (r % 2);
+                } else {
+                    info.chip_id = r;
+                    info.chiplet_id = 0;
+                }
+                sorted_infos.push_back(std::move(info));
+            }
+            devices_ = std::move(sorted_devs);
+            device_infos_ = std::move(sorted_infos);
+        }
+    } else if (!device_infos_.empty()) {
+        device_infos_[0].index = 0;
+        device_infos_[0].chip_id = 0;
+        device_infos_[0].chiplet_id =
+            (device_infos_[0].core_on_chip >= 0)
+                ? static_cast<int32_t>(device_infos_[0].core_on_chip)
+                : 0;
     }
     initialized_ = true;
     } catch (...) {
@@ -2972,6 +3512,24 @@ const PjrtDeviceInfo& PjrtRuntime::device_info(int device_idx) const {
         throw std::out_of_range("Cloud TPU device index out of range");
     }
     return device_infos_[static_cast<size_t>(device_idx)];
+}
+
+bool PjrtRuntime::is_dual_chiplet_topology() const {
+    for (const auto& info : device_infos_) {
+        if (info.is_dual_chiplet) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool PjrtRuntime::is_tpu7x_topology() const {
+    for (const auto& info : device_infos_) {
+        if (is_tpu7x_device_kind(info.kind)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool PjrtRuntime::query_memory_stats(int device_idx, size_t* free_bytes, size_t* total_bytes) const {

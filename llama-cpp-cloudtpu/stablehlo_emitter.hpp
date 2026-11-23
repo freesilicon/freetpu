@@ -110,12 +110,23 @@ struct OpNodeSpec {
     FlashAttnParams flash_attn;
 };
 
+enum class Fp8MatmulMode {
+    OFF = 0,
+    AUTO = 1,
+    FORCE = 2,
+};
+
 struct GraphProgramSpec {
     std::vector<TensorSpec> inputs;   // External live-in tensors
     std::vector<OpNodeSpec> ops;      // Topologically ordered ops
     std::vector<uint64_t> output_ids; // Live-out TensorSpec::ids
-    int32_t spmd_chips = 1;           // Number of replica-SPMD chips (1 = single chip, 4 = tpu7x, 8 = v6e-8)
+    int32_t spmd_chips = 1;           // Number of replica-SPMD chips (1 = single chip, 2 = tpu7x-1t, 8 = tpu7x-4t/v6e-8)
     bool bf16_matmul = true;          // Cast split-quantized weights & activations to BF16 for MXU (dense F16/F32 stay F32)
+    Fp8MatmulMode fp8_matmul = Fp8MatmulMode::AUTO;  // AUTO enables f8E4M3FN dot_general when target_is_tpu7x=true
+    bool target_is_tpu7x = false;     // Set when active runtime exposes Ironwood / Cloud TPU v7x hardware
+    int32_t d2d_group_size = 1;       // Logical chiplets per physical package (2 on tpu7x, 1 otherwise)
+    bool emit_sdy_mesh = false;       // Emit module-level Shardy `sdy.mesh` aligned to D2D pairs
+    std::vector<int64_t> sdy_mesh_device_ids;  // Optional ordered logical device IDs matching DeviceAssignmentProto
     bool bf16_flash_attn = false;     // Opt-in BF16 Q/K/probs/V matmuls in FLASH_ATTN_EXT (default false: F32 parity)
     bool q4_split_dot = true;         // Q4_0/Q4_K: true = two split-X dots (zero concat); false = single concat dot
     int32_t mm_pad_m = 8;             // Pad small BF16 Q4_*_I4/Q6_K_SPLIT M < mm_pad_m up to mm_pad_m for MXU (<=1 disables)
@@ -231,5 +242,10 @@ void slice_dense_host_tensor(const void* src,
                              const int64_t padded_dims[4],
                              const int64_t logical_dims[4],
                              int token_axis);
+
+// Formats a D2D-aware Shardy `sdy.mesh` module declaration (e.g. `sdy.mesh @mesh = <["ici"=4, "d2d"=2]>` on tpu7x-4t).
+std::string format_sdy_mesh_op(int32_t num_chips,
+                               int32_t d2d_group_size = 1,
+                               const std::vector<int64_t>& device_ids = {});
 
 }  // namespace cloudtpu

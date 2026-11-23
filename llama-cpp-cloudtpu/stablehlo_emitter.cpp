@@ -533,9 +533,16 @@ public:
         return out;
     }
 
+    void set_sdy_mesh(std::string line) {
+        sdy_mesh_line_ = std::move(line);
+    }
+
     std::string finish(const std::vector<SsaValue>& outputs) const {
         std::ostringstream mod = make_classic_stream();
         mod << "module @ggml_cloudtpu {\n";
+        if (!sdy_mesh_line_.empty()) {
+            mod << "  " << sdy_mesh_line_ << "\n";
+        }
         mod << "  func.func public @main(";
         for (size_t i = 0; i < args_.size(); ++i) {
             if (i > 0) mod << ", ";
@@ -587,8 +594,46 @@ private:
     std::vector<SsaValue> args_;
     std::vector<int32_t> arg_aliases_;
     std::ostringstream body_;
+    std::string sdy_mesh_line_;
     int next_id_ = 0;
 };
+
+struct Fp8QuantizedTensor {
+    SsaValue fp8;
+    SsaValue scale_f32;
+};
+
+// Dynamically scales an arbitrary tensor into OCP E4M3FN (max finite 448.0, clamped
+// to 416.0 target headroom so rounding never overflows to 0x7F NaN) using only
+// portable StableHLO ops supported identically by XLA and Host Mock PJRT.
+Fp8QuantizedTensor quantize_tensor_to_f8e4m3fn(StableHloBuilder& b, const SsaValue& x) {
+    SsaValue xf = (x.dtype == PjrtDType::F32) ? x : b.emit_convert(x, PjrtDType::F32);
+    SsaValue zero_like = b.emit_const_splat_f32(0.0f, xf.dims, PjrtDType::F32);
+    SsaValue neg_xf = b.emit_binary("stablehlo.subtract", zero_like, xf);
+    SsaValue abs_xf = b.emit_binary("stablehlo.maximum", xf, neg_xf);
+    SsaValue cur = abs_xf;
+    SsaValue zero_scalar = b.emit_const_splat_f32(0.0f, {}, PjrtDType::F32);
+    for (int64_t ax = static_cast<int64_t>(xf.dims.size()) - 1; ax >= 0; --ax) {
+        cur = b.emit_reduce_axis(cur, zero_scalar, ax, "stablehlo.maximum");
+    }
+    SsaValue eps = b.emit_const_splat_f32(1e-12f, {}, PjrtDType::F32);
+    SsaValue amax_safe = b.emit_binary("stablehlo.maximum", cur, eps);
+    SsaValue fp8_cap = b.emit_const_splat_f32(416.0f, {}, PjrtDType::F32);
+    SsaValue scale = b.emit_binary("stablehlo.divide", amax_safe, fp8_cap);
+    SsaValue scale_b = b.emit_broadcast_in_dim(scale, {}, xf.dims);
+    SsaValue scaled = b.emit_binary("stablehlo.divide", xf, scale_b);
+    SsaValue q = b.emit_convert(scaled, PjrtDType::F8E4M3FN);
+    return {std::move(q), std::move(scale)};
+}
+
+SsaValue apply_fp8_scales(StableHloBuilder& b,
+                          const SsaValue& dot_f32,
+                          const SsaValue& scale_x,
+                          const SsaValue* scale_w) {
+    SsaValue total_scale = scale_w ? b.emit_binary("stablehlo.multiply", scale_x, *scale_w) : scale_x;
+    SsaValue scale_b = b.emit_broadcast_in_dim(total_scale, {}, dot_f32.dims);
+    return b.emit_binary("stablehlo.multiply", dot_f32, scale_b);
+}
 
 // Dequantizes row-major [B3, B2, N_idx, NB, qs_blk] + [B3, B2, N_idx, NB] blocks (used by GET_ROWS
 // after gathering only the small selected subset of rows).
@@ -932,10 +977,57 @@ std::string build_canonical_cache_key(const std::string& mlir_text,
 
 }  // namespace
 
+std::string format_sdy_mesh_op(int32_t num_chips,
+                               int32_t d2d_group_size,
+                               const std::vector<int64_t>& device_ids) {
+    const int32_t n = std::max<int32_t>(1, num_chips);
+    std::ostringstream oss = make_classic_stream();
+    if (d2d_group_size == 2 && n >= 2 && (n % 2) == 0) {
+        const int32_t pkgs = n / 2;
+        if (pkgs == 1) {
+            oss << "sdy.mesh @mesh = <[\"package\"=1, \"d2d\"=2]";
+        } else {
+            oss << "sdy.mesh @mesh = <[\"ici\"=" << pkgs << ", \"d2d\"=2]";
+        }
+    } else {
+        oss << "sdy.mesh @mesh = <[\"replica\"=" << n << "]";
+    }
+    bool valid_perm = (static_cast<int32_t>(device_ids.size()) == n);
+    bool is_non_identity = false;
+    if (valid_perm) {
+        std::vector<uint8_t> seen(static_cast<size_t>(n), 0);
+        for (int32_t i = 0; i < n; ++i) {
+            const int64_t v = device_ids[static_cast<size_t>(i)];
+            if (v < 0 || v >= static_cast<int64_t>(n) || seen[static_cast<size_t>(v)] != 0) {
+                valid_perm = false;
+                break;
+            }
+            seen[static_cast<size_t>(v)] = 1;
+            if (v != static_cast<int64_t>(i)) {
+                is_non_identity = true;
+            }
+        }
+    }
+    if (valid_perm && is_non_identity) {
+        oss << ", device_ids=[";
+        for (size_t i = 0; i < device_ids.size(); ++i) {
+            if (i > 0) oss << ", ";
+            oss << device_ids[i];
+        }
+        oss << "]";
+    }
+    oss << ">";
+    return oss.str();
+}
+
 EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
     EmittedProgram prog;
     StableHloBuilder builder;
     const int32_t P = std::max<int32_t>(1, spec.spmd_chips);
+    if (spec.emit_sdy_mesh) {
+        builder.set_sdy_mesh(
+            format_sdy_mesh_op(P, spec.d2d_group_size, spec.sdy_mesh_device_ids));
+    }
 
     struct TensorHandle {
         TensorStorageKind storage = TensorStorageKind::DENSE;
@@ -1079,10 +1171,18 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                                  ? resolve_dense(op.src_ids.at(1), PjrtDType::F32)
                                  : resolve_replicated(op.src_ids.at(1), PjrtDType::F32);
                 const bool w_is_quant_split = (w_th.storage != TensorStorageKind::DENSE);
-                const bool use_bf16_mxu = spec.bf16_matmul && !op.high_precision && w_is_quant_split;
+                const bool use_fp8_mxu =
+                    !op.high_precision && w_is_quant_split &&
+                    (spec.fp8_matmul == Fp8MatmulMode::FORCE ||
+                     (spec.fp8_matmul == Fp8MatmulMode::AUTO && spec.target_is_tpu7x));
+                const bool use_bf16_mxu =
+                    !use_fp8_mxu && spec.bf16_matmul && !op.high_precision && w_is_quant_split;
                 const PjrtDType deq_dt =
-                    use_bf16_mxu ? PjrtDType::BF16
-                                 : ((op.high_precision || x.dtype == PjrtDType::F32) ? PjrtDType::F32 : PjrtDType::BF16);
+                    use_fp8_mxu ? PjrtDType::F32
+                                : (use_bf16_mxu ? PjrtDType::BF16
+                                                : ((op.high_precision || x.dtype == PjrtDType::F32)
+                                                       ? PjrtDType::F32
+                                                       : PjrtDType::BF16));
 
                 // Fast path for ALL K-major N-minor quantized weights (Q8_0, Q6_K, Q4_0, Q4_K):
                 // Zero weight reshape, zero transpose, zero broadcast reshape, and 0% (8,128) tile padding!
@@ -1103,10 +1203,13 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                     }
 
                     const PjrtDType mm_dt =
-                        use_bf16_mxu ? PjrtDType::BF16
-                                     : ((op.high_precision || deq_dt == PjrtDType::F32 || x.dtype == PjrtDType::F32)
-                                            ? PjrtDType::F32
-                                            : PjrtDType::BF16);
+                        use_fp8_mxu
+                            ? PjrtDType::F32
+                            : (use_bf16_mxu ? PjrtDType::BF16
+                                            : ((op.high_precision || deq_dt == PjrtDType::F32 ||
+                                                x.dtype == PjrtDType::F32)
+                                                   ? PjrtDType::F32
+                                                   : PjrtDType::BF16));
                     x = builder.emit_convert(x, mm_dt);
 
                     auto bcast_w5_batch = [&](SsaValue& wt) {
@@ -1235,7 +1338,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
 
                     const bool apply_pad_m =
                         !emitted_freetile_mosaic &&
-                        use_bf16_mxu && !op.high_precision && spec.mm_pad_m > 1 &&
+                        (use_bf16_mxu || use_fp8_mxu) && !op.high_precision && spec.mm_pad_m > 1 &&
                         x.dims[0] == 1 && x.dims[1] == 1 &&
                         m_orig >= 1 && m_orig < spec.mm_pad_m &&
                         (w_th.storage == TensorStorageKind::Q6_K_SPLIT ||
@@ -1259,9 +1362,20 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                         bcast_w5_batch(w_km);
                         SsaValue x_blk = builder.emit_reshape(
                             x_mm, {x_mm.dims[0], x_mm.dims[1], x_mm.dims[2], NB_local, blk_elems});
-                        local_out = builder.emit_dot_general(
-                            x_blk, w_km, {0, 1}, {0, 1}, {3, 4}, {2, 3}, dot_out_dims, op.dst.dtype,
-                            op.high_precision);
+                        if (use_fp8_mxu) {
+                            auto qx = quantize_tensor_to_f8e4m3fn(builder, x_blk);
+                            auto qw = quantize_tensor_to_f8e4m3fn(builder, w_km);
+                            SsaValue dot_f32 = builder.emit_dot_general(
+                                qx.fp8, qw.fp8, {0, 1}, {0, 1}, {3, 4}, {2, 3}, dot_out_dims,
+                                PjrtDType::F32, false);
+                            SsaValue scaled_out =
+                                apply_fp8_scales(builder, dot_f32, qx.scale_f32, &qw.scale_f32);
+                            local_out = builder.emit_convert(scaled_out, op.dst.dtype);
+                        } else {
+                            local_out = builder.emit_dot_general(
+                                x_blk, w_km, {0, 1}, {0, 1}, {3, 4}, {2, 3}, dot_out_dims, op.dst.dtype,
+                                op.high_precision);
+                        }
                     } else if (is_q4_i4) {
                         if (is_q4_factored) {
                             // Factored S4 decode/small-batch path (M <= 32):
@@ -1276,32 +1390,62 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
 
                             SsaValue x_blk = builder.emit_reshape(
                                 x_mm, {x_mm.dims[0], x_mm.dims[1], x_mm.dims[2], NB_local, blk_elems});
-                            SsaValue qs_mm = builder.emit_convert(qs_eff, mm_dt);
-                            if (w_th.storage == TensorStorageKind::Q4_0_I4 && qs_eff.dtype == PjrtDType::U4) {
-                                SsaValue eight = builder.emit_const_splat_f32(8.0f, qs_mm.dims, mm_dt);
-                                qs_mm = builder.emit_binary("stablehlo.subtract", qs_mm, eight);
-                            }
                             const std::vector<int64_t> dot_b_dims = {
                                 x_mm.dims[0], x_mm.dims[1], NB_local, x_mm.dims[2], N_local};
-                            // Match activation precision between dot_b and xsum:
-                            // - BF16 MXU path (mm_dt == BF16): x_blk is BF16, so xsum reduces
-                            //   convert(x_blk -> F32) of those exact BF16-rounded activations.
-                            // - F32 path (mm_dt == F32, e.g. CLOUDTPU_MATMUL_BF16=0): require
-                            //   precision = [HIGHEST, HIGHEST] on dot_b so TPU MXU does not round
-                            //   F32 dot inputs to BF16 while xsum uses full F32 precision.
-                            const bool dot_b_high_precision =
-                                op.high_precision || (mm_dt == PjrtDType::F32);
-                            SsaValue dot_b = builder.emit_dot_general(
-                                x_blk, qs_mm, {0, 1, 3}, {0, 1, 2}, {4}, {3},
-                                dot_b_dims, PjrtDType::F32, dot_b_high_precision);
+                            SsaValue dot_b;
+                            SsaValue x_for_sum = x_blk;
+                            bool xsum_has_fp8_scale = false;
+                            SsaValue xsum_fp8_scale;
+                            if (use_fp8_mxu) {
+                                // Integer nibbles in [-8..15] are exact in f8E4M3FN (no weight scaling needed).
+                                SsaValue qs_fp8 = builder.emit_convert(qs_eff, PjrtDType::F8E4M3FN);
+                                if (w_th.storage == TensorStorageKind::Q4_0_I4 && qs_eff.dtype == PjrtDType::U4) {
+                                    SsaValue qs_f32 = builder.emit_convert(qs_eff, PjrtDType::F32);
+                                    SsaValue eight = builder.emit_const_splat_f32(8.0f, qs_f32.dims, PjrtDType::F32);
+                                    qs_fp8 = builder.emit_convert(
+                                        builder.emit_binary("stablehlo.subtract", qs_f32, eight),
+                                        PjrtDType::F8E4M3FN);
+                                }
+                                auto qx = quantize_tensor_to_f8e4m3fn(builder, x_blk);
+                                SsaValue dot_fp8 = builder.emit_dot_general(
+                                    qx.fp8, qs_fp8, {0, 1, 3}, {0, 1, 2}, {4}, {3},
+                                    dot_b_dims, PjrtDType::F32, false);
+                                dot_b = apply_fp8_scales(builder, dot_fp8, qx.scale_f32, nullptr);
+                                // Reduce the same FP8-rounded activations (scaling the block sum by
+                                // qx.scale_f32) so +8*xsum and xsum*m match dot_b's quantized inputs
+                                // and preserve exact cancellation for zero unsigned nibbles.
+                                x_for_sum = qx.fp8;
+                                xsum_has_fp8_scale = true;
+                                xsum_fp8_scale = qx.scale_f32;
+                            } else {
+                                SsaValue qs_mm = builder.emit_convert(qs_eff, mm_dt);
+                                if (w_th.storage == TensorStorageKind::Q4_0_I4 && qs_eff.dtype == PjrtDType::U4) {
+                                    SsaValue eight = builder.emit_const_splat_f32(8.0f, qs_mm.dims, mm_dt);
+                                    qs_mm = builder.emit_binary("stablehlo.subtract", qs_mm, eight);
+                                }
+                                // Match activation precision between dot_b and xsum:
+                                // - BF16 MXU path (mm_dt == BF16): x_blk is BF16, so xsum reduces
+                                //   convert(x_blk -> F32) of those exact BF16-rounded activations.
+                                // - F32 path (mm_dt == F32, e.g. CLOUDTPU_MATMUL_BF16=0): require
+                                //   precision = [HIGHEST, HIGHEST] on dot_b so TPU MXU does not round
+                                //   F32 dot inputs to BF16 while xsum uses full F32 precision.
+                                const bool dot_b_high_precision =
+                                    op.high_precision || (mm_dt == PjrtDType::F32);
+                                dot_b = builder.emit_dot_general(
+                                    x_blk, qs_mm, {0, 1, 3}, {0, 1, 2}, {4}, {3},
+                                    dot_b_dims, PjrtDType::F32, dot_b_high_precision);
+                            }
                             SsaValue zero_f32 = builder.emit_const_splat_f32(0.0f, {}, PjrtDType::F32);
                             const bool q4k_needs_xsum =
                                 (w_th.storage == TensorStorageKind::Q4_K_I4) &&
                                 (qs_eff.dtype == PjrtDType::S4 || w_th.has_q_m);
                             SsaValue xsum;
                             if (q4k_needs_xsum) {
-                                SsaValue x_f32 = builder.emit_convert(x_blk, PjrtDType::F32);
+                                SsaValue x_f32 = builder.emit_convert(x_for_sum, PjrtDType::F32);
                                 xsum = builder.emit_reduce_axis(x_f32, zero_f32, 4, "stablehlo.add");
+                                if (xsum_has_fp8_scale) {
+                                    xsum = apply_fp8_scales(builder, xsum, xsum_fp8_scale, nullptr);
+                                }
                             }
                             if (w_th.storage == TensorStorageKind::Q4_K_I4 && qs_eff.dtype == PjrtDType::S4) {
                                 // Restore unsigned nibble contribution dot(x, u4) = dot(x, s4) + 8*sum(x)
@@ -1338,9 +1482,20 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                             bcast_w5_batch(w_km);
                             SsaValue w_2d = builder.emit_reshape(
                                 w_km, {x.dims[0], x.dims[1], K_local, N_local});
-                            local_out = builder.emit_dot_general(
-                                x, w_2d, {0, 1}, {0, 1}, {3}, {2}, local_out_dims, op.dst.dtype,
-                                op.high_precision);
+                            if (use_fp8_mxu) {
+                                auto qx = quantize_tensor_to_f8e4m3fn(builder, x);
+                                auto qw = quantize_tensor_to_f8e4m3fn(builder, w_2d);
+                                SsaValue dot_f32 = builder.emit_dot_general(
+                                    qx.fp8, qw.fp8, {0, 1}, {0, 1}, {3}, {2}, local_out_dims,
+                                    PjrtDType::F32, false);
+                                SsaValue scaled_out =
+                                    apply_fp8_scales(builder, dot_f32, qx.scale_f32, &qw.scale_f32);
+                                local_out = builder.emit_convert(scaled_out, op.dst.dtype);
+                            } else {
+                                local_out = builder.emit_dot_general(
+                                    x, w_2d, {0, 1}, {0, 1}, {3}, {2}, local_out_dims, op.dst.dtype,
+                                    op.high_precision);
+                            }
                         }
                     } else {
                         SsaValue w_lo, w_hi;
@@ -1350,7 +1505,21 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                         bcast_w5_batch(w_lo);
                         bcast_w5_batch(w_hi);
                         SsaValue x_blk = builder.emit_reshape(x, {x.dims[0], x.dims[1], x.dims[2], NB_local, 2, 16});
-                        if (spec.q4_split_dot) {
+                        if (use_fp8_mxu) {
+                            auto qx = quantize_tensor_to_f8e4m3fn(builder, x_blk);
+                            SsaValue w_lo6 = builder.emit_reshape(
+                                w_lo, {x.dims[0], x.dims[1], NB_local, 1, 16, N_local});
+                            SsaValue w_hi6 = builder.emit_reshape(
+                                w_hi, {x.dims[0], x.dims[1], NB_local, 1, 16, N_local});
+                            SsaValue w_cat = builder.emit_concatenate({w_lo6, w_hi6}, 3);
+                            auto qw = quantize_tensor_to_f8e4m3fn(builder, w_cat);
+                            SsaValue dot_f32 = builder.emit_dot_general(
+                                qx.fp8, qw.fp8, {0, 1}, {0, 1}, {3, 4, 5}, {2, 3, 4}, local_out_dims,
+                                PjrtDType::F32, false);
+                            SsaValue scaled_out =
+                                apply_fp8_scales(builder, dot_f32, qx.scale_f32, &qw.scale_f32);
+                            local_out = builder.emit_convert(scaled_out, op.dst.dtype);
+                        } else if (spec.q4_split_dot) {
                             SsaValue x_lo = builder.emit_reshape(
                                 builder.emit_slice(x_blk, {0, 0, 0, 0, 0, 0},
                                                    {x.dims[0], x.dims[1], x.dims[2], NB_local, 1, 16}),
