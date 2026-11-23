@@ -94,3 +94,47 @@
          }
  
          LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -86,10 +86,16 @@
+         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+ 
+         if (offload) {
+             auto * dev = model.dev_layer(i);
+-            buft = ggml_backend_dev_buffer_type(dev);
+-
+-            dev_name = ggml_backend_dev_name(dev);
++            const char * cand_name = ggml_backend_dev_name(dev);
++            if (cand_name && std::strncmp(cand_name, "CLOUDTPU", 8) == 0) {
++                LLAMA_LOG_WARN("%s: layer %3d: %s does not support in-place recurrent state updates; placing RS cache on CPU\n",
++                        __func__, i, cand_name);
++            } else {
++                buft = ggml_backend_dev_buffer_type(dev);
++
++                dev_name = cand_name;
++            }
+         }
+ 
+         LLAMA_LOG_DEBUG("%s, layer %3d: dev = %s\n", __func__, i, dev_name);
+--- a/src/llama-kv-cache-dsv4.cpp
++++ b/src/llama-kv-cache-dsv4.cpp
+@@ -972,10 +972,16 @@
+         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+ 
+         if (offload) {
+             auto * dev = model.dev_layer(il);
+-            buft = ggml_backend_dev_buffer_type(dev);
+-
+-            dev_name = ggml_backend_dev_name(dev);
++            const char * cand_name = ggml_backend_dev_name(dev);
++            if (cand_name && std::strncmp(cand_name, "CLOUDTPU", 8) == 0) {
++                LLAMA_LOG_WARN("%s: layer %3d: %s does not support in-place DSV4 state updates; placing compressor state on CPU\n",
++                        __func__, il, cand_name);
++            } else {
++                buft = ggml_backend_dev_buffer_type(dev);
++
++                dev_name = cand_name;
++            }
+         }
+ 
+         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);

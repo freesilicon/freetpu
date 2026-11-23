@@ -1202,7 +1202,8 @@ static bool is_skipped_graph_node(const struct ggml_tensor* node) {
     return !node || is_view_noop_op(node->op) || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0;
 }
 
-static bool ggml_backend_cloudtpu_device_supports_op_impl(const struct ggml_tensor* op) {
+static bool ggml_backend_cloudtpu_device_supports_op_impl(const struct ggml_tensor* op,
+                                                          bool allow_probe = false) {
     if (!op) {
         return false;
     }
@@ -1284,11 +1285,18 @@ static bool ggml_backend_cloudtpu_device_supports_op_impl(const struct ggml_tens
             if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
                 return false;
             }
-            if (n_dims <= 0 || (n_dims % 2) != 0 || n_offs < 0 || (n_offs % 2) != 0 ||
-                n_offs + n_dims > src0->ne[0]) {
+            if (src1->ne[0] != src0->ne[2]) {
                 return false;
             }
-            if (src1->ne[0] != src0->ne[2]) {
+            // llama-model-loader probes rope_freqs.weight placement with a synthetic RoPE
+            // op carrying n_dims == 0; accept that placement probe while requiring positive
+            // even n_dims for executable graph nodes.
+            if (allow_probe && n_dims == 0 && n_offs == 0 && mode == GGML_ROPE_TYPE_NORMAL &&
+                src2 != nullptr && src2->type == GGML_TYPE_F32 && is_supported_input_layout(src2)) {
+                return true;
+            }
+            if (n_dims <= 0 || (n_dims % 2) != 0 || n_offs < 0 || (n_offs % 2) != 0 ||
+                n_offs + n_dims > src0->ne[0]) {
                 return false;
             }
             if (src2 != nullptr &&
@@ -1916,7 +1924,8 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
         }
         const struct ggml_tensor* parent = view_parent(t);
         if (t->view_src != nullptr && parent != nullptr &&
-            is_dense_supported_type(t->type) && t->type == parent->type) {
+            (is_dense_supported_type(t->type) || t->type == GGML_TYPE_I64) &&
+            t->type == parent->type) {
             if (t->op == GGML_OP_PERMUTE && t->view_offs == parent->view_offs) {
                 const uint64_t base_id = self(self, parent);
                 const uint64_t tid = next_id++;
@@ -2108,7 +2117,7 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
     }
 
     std::vector<cloudtpu::PjrtBufferPtr> outputs;
-    const bool sync_exec = is_final_subgraph || !ctx->env.fuse_graphs;
+    const bool sync_exec = is_final_subgraph || !ctx->env.fuse_graphs || !rt.has_ready_event();
     rt.execute(exec,
                ctx->device_index,
                raw_inputs.data(),
@@ -2122,13 +2131,12 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
         struct ggml_tensor* out_t = id_to_output_tensor.at(emitted.output_bindings[oi].tensor_id);
         store_tensor_hbm(rt, out_t, outputs[oi]);
     }
-    {
+    if (sync_exec) {
+        ggml_backend_cloudtpu_synchronize_ctx(ctx);
+    } else {
         std::lock_guard<std::mutex> lock(ctx->sync_mu);
-        if (sync_exec) {
-            ctx->pending_sync_buffers.clear();
-        } else {
-            ctx->pending_sync_buffers = outputs;
-        }
+        ctx->pending_sync_buffers.insert(
+            ctx->pending_sync_buffers.end(), outputs.begin(), outputs.end());
     }
 
     ctx->total_subgraphs += 1;
@@ -2320,7 +2328,7 @@ static ggml_backend_buffer_type_t ggml_backend_cloudtpu_device_get_buffer_type(g
 static bool ggml_backend_cloudtpu_device_supports_op(ggml_backend_dev_t dev,
                                                      const struct ggml_tensor* op) {
     GGML_UNUSED(dev);
-    return ggml_backend_cloudtpu_device_supports_op_impl(op);
+    return ggml_backend_cloudtpu_device_supports_op_impl(op, /*allow_probe=*/true);
 }
 
 static bool ggml_backend_cloudtpu_device_supports_buft(ggml_backend_dev_t dev,
