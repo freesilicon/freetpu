@@ -168,6 +168,24 @@ static void test_mock_dma_and_matmul() {
     OT_CHECK(!cq_err.empty());
   }
 
+  // Verify owner_pid enforcement rejects live-VFIO context use from another PID.
+  {
+    ot_config_t cfg_pid = ot_config_default();
+    cfg_pid.mock_mode = 1;
+    ot_context_t* ctx_pid = nullptr;
+    OT_CHECK(ot_context_create(&cfg_pid, &ctx_pid) == OT_OK);
+    OT_CHECK(ctx_pid->transport.is_owner_process());
+    ctx_pid->info.is_mock = 0;
+    ctx_pid->transport.is_mock = false;
+    ctx_pid->transport.owner_pid = -1;
+    OT_CHECK(!ctx_pid->transport.is_owner_process());
+    ot_buffer_t* child_buf = nullptr;
+    OT_CHECK(ot_buffer_alloc(ctx_pid, 4096, &child_buf) == OT_ERR_DEVICE);
+    ctx_pid->info.is_mock = 1;
+    ctx_pid->transport.is_mock = true;
+    ot_context_destroy(ctx_pid);
+  }
+
   ot_buffer_free(bc);
   ot_buffer_free(bb);
   ot_buffer_free(ba);
@@ -490,6 +508,25 @@ static void test_pjrt_api_mock() {
     PJRT_Error* ml_err = api->PJRT_Client_Compile(&ca_ml);
     OT_CHECK(ml_err != nullptr);
     destroy_pjrt_error(api, ml_err);
+
+    // Unsupported result memory_kind ("pinned_host") must be rejected; "device" accepted.
+    const char* mlir_pinned =
+        "module {\n"
+        "  func.func @main(%a: tensor<128x128xbf16>, %b: tensor<128x128xbf16>) -> (tensor<128x128xbf16> {mhlo.memory_kind = \"pinned_host\"}) {\n"
+        "    %0 = stablehlo.dot_general %a, %b, contracting_dims = [1] x [0] : (tensor<128x128xbf16>, tensor<128x128xbf16>) -> tensor<128x128xbf16>\n"
+        "    return %0 : tensor<128x128xbf16>\n"
+        "  }\n"
+        "}\n";
+    PJRT_Program p_pin = prog;
+    p_pin.code = const_cast<char*>(mlir_pinned);
+    p_pin.code_size = std::strlen(mlir_pinned);
+    PJRT_Client_Compile_Args ca_pin = {};
+    ca_pin.struct_size = PJRT_Client_Compile_Args_STRUCT_SIZE;
+    ca_pin.client = cc.client;
+    ca_pin.program = &p_pin;
+    PJRT_Error* pin_err = api->PJRT_Client_Compile(&ca_pin);
+    OT_CHECK(pin_err != nullptr);
+    destroy_pjrt_error(api, pin_err);
   }
 
   // Valid 1x1 compile_options (including field 9 device_assignment for device 0) must succeed.

@@ -389,14 +389,68 @@ bool parse_stablehlo_matmul(const char* code, size_t len, uint32_t* m_out,
     return std::string::npos;
   };
   auto is_benign_mlir_attr_dict = [](const std::string& dict) -> bool {
-    // Reject attribute dicts carrying semantic sharding/aliasing/non-default layout constraints.
-    if (dict.find("sharding") != std::string::npos ||
-        dict.find("aliasing") != std::string::npos ||
-        dict.find("memory_space") != std::string::npos) {
-      return false;
+    // Strict allowlist of purely-informational / single-device default MLIR/JAX attributes.
+    // Any other attribute (memory_kind != "device", sharding, aliasing, custom layout, etc.) is rejected.
+    if (dict.size() < 2 || dict.front() != '{' || dict.back() != '}') return false;
+    std::string inner = trim_ws(dict.substr(1, dict.size() - 2));
+    if (inner.empty()) return true;
+    std::vector<std::string> entries;
+    std::string cur;
+    int depth = 0;
+    bool in_str = false;
+    for (size_t i = 0; i < inner.size(); ++i) {
+      char c = inner[i];
+      if (in_str) {
+        cur.push_back(c);
+        if (c == '\\' && i + 1 < inner.size()) {
+          cur.push_back(inner[++i]);
+        } else if (c == '"') {
+          in_str = false;
+        }
+        continue;
+      }
+      if (c == '"') {
+        in_str = true;
+        cur.push_back(c);
+      } else if (c == '{' || c == '(' || c == '[' || c == '<') {
+        ++depth;
+        cur.push_back(c);
+      } else if (c == '}' || c == ')' || c == ']' || c == '>') {
+        if (depth == 0) return false;
+        --depth;
+        cur.push_back(c);
+      } else if (c == ',' && depth == 0) {
+        entries.push_back(trim_ws(cur));
+        cur.clear();
+      } else {
+        cur.push_back(c);
+      }
     }
-    size_t lm = dict.find("layout_mode");
-    if (lm != std::string::npos && dict.find("\"default\"", lm) == std::string::npos) {
+    if (in_str || depth != 0) return false;
+    entries.push_back(trim_ws(cur));
+
+    for (const auto& e : entries) {
+      if (e.empty()) return false;
+      size_t eq = e.find('=');
+      if (eq == std::string::npos) return false;
+      std::string key = trim_ws(e.substr(0, eq));
+      std::string val = trim_ws(e.substr(eq + 1));
+      if (key == "jax.arg_info" || key == "jax.result_info" ||
+          key == "sym_name" || key == "sym_visibility") {
+        continue;
+      }
+      if (key == "mhlo.layout_mode") {
+        if (val != "\"default\"") return false;
+        continue;
+      }
+      if (key == "mhlo.memory_kind") {
+        if (val != "\"device\"") return false;
+        continue;
+      }
+      if (key == "mhlo.num_replicas" || key == "mhlo.num_partitions") {
+        if (val != "1" && val != "1 : i32" && val != "1 : i64") return false;
+        continue;
+      }
       return false;
     }
     return true;

@@ -98,6 +98,9 @@ struct VfioTransport {
   uint32_t sq_seq = 0;
   bool ring_ready = false;
   bool dma_faulted = false;
+  int64_t owner_pid = 0;
+
+  bool is_owner_process() const;
 
   IovaAllocator iova_alloc;
   IovaAllocator hbm_alloc;

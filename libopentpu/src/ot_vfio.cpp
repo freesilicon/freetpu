@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unistd.h>
 
 #ifdef __linux__
 #include <dirent.h>
@@ -14,7 +15,6 @@
 #include <linux/vfio.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <unistd.h>
 #endif
 
 namespace ot {
@@ -297,9 +297,14 @@ static bool discover_linux_tpu(const char* preferred_bdf, PciDiscoveryEntry* out
 }
 #endif
 
+bool VfioTransport::is_owner_process() const {
+  return owner_pid == 0 || owner_pid == static_cast<int64_t>(::getpid());
+}
+
 bool VfioTransport::open_device(const ot_config_t& cfg, ot_device_info_t* info, std::string* err) {
   if (!info) return false;
   std::memset(info, 0, sizeof(*info));
+  owner_pid = static_cast<int64_t>(::getpid());
 
   static constexpr uint64_t kHbmAllocBase = 0x00100000ULL;
 
@@ -534,7 +539,7 @@ bool VfioTransport::open_device(const ot_config_t& cfg, ot_device_info_t* info, 
 void VfioTransport::close_device() {
   teardown_ring_queues();
 #ifdef __linux__
-  if (!is_mock && device_fd >= 0 && pci_cmd_saved) {
+  if (!is_mock && is_owner_process() && device_fd >= 0 && pci_cmd_saved) {
     write_pci_config(0x04, &saved_pci_cmd, sizeof(saved_pci_cmd));
     pci_cmd_saved = false;
   }
@@ -555,6 +560,7 @@ void VfioTransport::close_device() {
   device_fd = -1;
   group_fd = -1;
   container_fd = -1;
+  owner_pid = 0;
 }
 
 bool VfioTransport::map_dma_at(void* vaddr, uint64_t iova, uint64_t size, std::string* err) {
@@ -790,35 +796,39 @@ bool VfioTransport::init_ring_queues(std::string* err) {
 
 void VfioTransport::teardown_ring_queues() {
 #ifdef __linux__
-  if (!is_mock && bar0_mmio && bar0_mapped_len >= 0x12000u && ring_ready) {
-    write32_bar0(0x10150u, 0u);
-    write32_bar0(0x10110u, 0u);
-    write32_bar0(0x10120u, 0u);
-    write32_bar0(0x10130u, 0u);
-    write32_bar0(0x11f00u, 0u);
-    write32_bar0(0x10100u, 0u);
-    write32_bar0(0x10000u, 0u);
-    write32_bar0(0x10010u, 0u);
-    write32_bar0(0x10014u, 0u);
-    write32_bar0(0x10020u, 0u);
-    write32_bar0(0x10024u, 0u);
-    write32_bar0(0x10030u, 0u);
-    write32_bar0(0x10034u, 0u);
-    write32_bar0(0x10040u, 0u);
-  }
-  auto unmap_anon_dma = [&](void* p, uint64_t iova, size_t len) {
-    if (!p) return;
-    if (container_fd >= 0) {
-      struct vfio_iommu_type1_dma_unmap dunmap = {};
-      dunmap.argsz = sizeof(dunmap);
-      dunmap.iova = iova;
-      dunmap.size = len;
-      (void)::ioctl(container_fd, VFIO_IOMMU_UNMAP_DMA, &dunmap);
+  // Only the process that opened the VFIO device owns hardware queues and MADV_DONTFORK arenas.
+  // A forked child must never stop the parent's queues, unmap parent DMA, or munmap DONTFORK VMAs.
+  if (is_owner_process()) {
+    if (!is_mock && bar0_mmio && bar0_mapped_len >= 0x12000u && ring_ready) {
+      write32_bar0(0x10150u, 0u);
+      write32_bar0(0x10110u, 0u);
+      write32_bar0(0x10120u, 0u);
+      write32_bar0(0x10130u, 0u);
+      write32_bar0(0x11f00u, 0u);
+      write32_bar0(0x10100u, 0u);
+      write32_bar0(0x10000u, 0u);
+      write32_bar0(0x10010u, 0u);
+      write32_bar0(0x10014u, 0u);
+      write32_bar0(0x10020u, 0u);
+      write32_bar0(0x10024u, 0u);
+      write32_bar0(0x10030u, 0u);
+      write32_bar0(0x10034u, 0u);
+      write32_bar0(0x10040u, 0u);
     }
-    ::munmap(p, len);
-  };
-  unmap_anon_dma(host_stage_mem, kStageBaseIova, host_stage_size);
-  unmap_anon_dma(ring_arena_mem, kSqRingIova, ring_arena_bytes);
+    auto unmap_anon_dma = [&](void* p, uint64_t iova, size_t len) {
+      if (!p) return;
+      if (container_fd >= 0) {
+        struct vfio_iommu_type1_dma_unmap dunmap = {};
+        dunmap.argsz = sizeof(dunmap);
+        dunmap.iova = iova;
+        dunmap.size = len;
+        (void)::ioctl(container_fd, VFIO_IOMMU_UNMAP_DMA, &dunmap);
+      }
+      ::munmap(p, len);
+    };
+    unmap_anon_dma(host_stage_mem, kStageBaseIova, host_stage_size);
+    unmap_anon_dma(ring_arena_mem, kSqRingIova, ring_arena_bytes);
+  }
 #endif
   ring_arena_mem = nullptr;
   ring_arena_bytes = 0;
@@ -863,6 +873,10 @@ bool validate_cq_completion(uint32_t sent_seq, const uint32_t cq[8], std::string
 
 bool VfioTransport::submit_sq_wait(const uint32_t desc[32], uint32_t timeout_ms,
                                    uint32_t cq_out[8], std::string* err) {
+  if (!is_mock && !is_owner_process()) {
+    if (err) *err = "VFIO context cannot be used in a forked child process";
+    return false;
+  }
   if (dma_faulted) {
     if (err) *err = "VFIO DMA faulted after prior timeout; recreate context to reset device";
     return false;
