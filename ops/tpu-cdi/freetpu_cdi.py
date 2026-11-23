@@ -713,6 +713,32 @@ def _distinct_physical_indices(
     return ordered
 
 
+# Supported single-host Cloud TPU physical chip topologies. Sub-host slice
+# selectors (`numa*`, `pcie*`, range aliases) are emitted ONLY when a domain's
+# live physical chip count is a supported multi-chip topology and every chip has
+# its full PCI function set, so degraded topologies (e.g. 3 chips on a 4-chip
+# NUMA half after one TPU disappears) withdraw the selector instead of exposing
+# unsupported shapes like `TPU_CHIPS_PER_HOST_BOUNDS=1,3,1`.
+_SUPPORTED_SINGLE_HOST_CHIP_COUNTS = frozenset({1, 2, 4, 8})
+_SUPPORTED_SUBHOST_SLICE_CHIP_COUNTS = frozenset({2, 4, 8})
+
+
+def _has_complete_chip_functions(
+    subset: Sequence[DiscoveredChip],
+    physical_chip_count: int,
+) -> bool:
+    """Return True when every physical chip in `subset` exposes its expected PCI function count."""
+    if physical_chip_count <= 0:
+        return False
+    per_chip_set = {
+        _PCI_FUNCTIONS_PER_PHYSICAL_CHIP.get(c.generation, 1) for c in subset
+    }
+    if len(per_chip_set) != 1:
+        return len(subset) == physical_chip_count
+    per_chip = next(iter(per_chip_set))
+    return len(subset) == physical_chip_count * per_chip
+
+
 def _chips_per_host_bounds(chip_count: int, generations: Sequence[str]) -> str:
     """Return `TPU_CHIPS_PER_HOST_BOUNDS` (`X,Y,Z`) matching physical chip count and generation."""
     if chip_count <= 1:
@@ -778,7 +804,10 @@ def _build_device_env(
         return []
 
     env: List[str] = []
-    if include_visibility_env:
+    if (
+        include_visibility_env
+        and len(physical_chip_indices) in _SUPPORTED_SINGLE_HOST_CHIP_COUNTS
+    ):
         visible_chips = ",".join(str(idx) for idx in physical_chip_indices)
         visible_devices = ",".join(str(idx) for idx in logical_device_indices)
         bounds = _chips_per_host_bounds(len(physical_chip_indices), generations)
@@ -856,6 +885,11 @@ def _compute_topology_slices(
 
         slice_bdfs = tuple(sorted(c.pci_bdf for c in d_chips))
         slice_phys_indices = tuple(_distinct_physical_indices(d_chips, bdf_to_phys))
+        if (
+            len(slice_phys_indices) not in _SUPPORTED_SUBHOST_SLICE_CHIP_COUNTS
+            or not _has_complete_chip_functions(d_chips, len(slice_phys_indices))
+        ):
+            continue
         slice_logical_indices = tuple(_logical_device_indices(d_chips, slice_phys_indices))
         slice_gens: List[str] = []
         for c in d_chips:

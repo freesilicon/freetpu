@@ -40,6 +40,10 @@ spec:
 ---
 # Example ResourceSlice published by a node-local `freetpu-dra-driver` DaemonSet
 # for a single Cloud TPU v6e-8 host (`0000:00` on NUMA 0, `0000:80` on NUMA 1).
+# Note: `freetpu_cdi.py` withdraws a sub-host slice selector (e.g. `numa0`) if
+# a chip disappears and leaves an unsupported topology (such as 3 chips); a DRA
+# driver publishing `ResourceSlice` objects must reconcile against live CDI
+# selectors and withdraw degraded slices before scheduling new 4-chip claims.
 apiVersion: resource.k8s.io/v1
 kind: ResourceSlice
 metadata:

@@ -2264,6 +2264,147 @@ TPU Runtime Utilization
                 [11.0 * (c + 1) for c in range(8)],
             )
 
+            # Ironwood per-core duty-cycle response with 8 raw IDs (0..7) where only
+            # cores 0..3 have valid readings and cores 4..7 have unset/NaN gauges MUST
+            # stay per-core 1:1 (never doubling 0..3 into 8 cores or fabricating 4..7!).
+            class _IronwoodPartialValidPerCoreStub:
+                def __init__(self, channel):
+                    self.channel = channel
+
+                def GetRuntimeMetric(self, req, timeout=None):
+                    del timeout
+                    if req.metric_name == "tpu.runtime.hbm.memory.usage.bytes":
+                        items = [_make_item(c, as_int=(c + 1) * 4 * 1024**3) for c in range(8)]
+                    elif req.metric_name == "tpu.runtime.hbm.memory.total.bytes":
+                        items = [_make_item(c, as_int=96 * 1024**3) for c in range(8)]
+                    elif req.metric_name == "tpu.runtime.tensorcore.dutycycle.percent":
+                        items = [
+                            _make_item(c, as_double=11.0 * (c + 1)) for c in range(4)
+                        ] + [
+                            _make_item(4),  # unset gauge
+                            _make_item(5, as_double=float("nan")),
+                            _make_item(6, as_double=-1.0),
+                            _make_item(7),  # unset gauge
+                        ]
+                    else:
+                        items = []
+                    return SimpleNamespace(metric=SimpleNamespace(metrics=items))
+
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.dict(_te._GRPC_CHANNELS, {}, clear=True),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "grpc": _FakeGrpc,
+                        "tpu_info": SimpleNamespace(),
+                        "tpu_info.proto": SimpleNamespace(),
+                        "tpu_info.proto.tpu_metric_service_pb2": fake_pb2,
+                        "tpu_info.proto.tpu_metric_service_pb2_grpc": SimpleNamespace(
+                            RuntimeMetricServiceStub=_IronwoodPartialValidPerCoreStub
+                        ),
+                    },
+                ),
+            ):
+                iw_partial_snap = _te.collect_snapshot(
+                    sysfs_root=iw_sysfs,
+                    dev_root=iw_dev,
+                    proc_root=iw_proc,
+                    tpu_info_bin="tpu-info",
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=iw_root / "no-shm",
+                )
+            self.assertEqual(
+                [d.duty_cycle_percent for d in iw_partial_snap.devices],
+                [11.0, 22.0, 33.0, 44.0, None, None, None, None],
+            )
+
+            # Ambiguous partial response (only raw IDs {0, 1} on an 8-core / 4-chip host)
+            # MUST omit ambiguous duty-cycle readings instead of guessing chip vs core.
+            class _IronwoodAmbiguousDutyStub:
+                def __init__(self, channel):
+                    self.channel = channel
+
+                def GetRuntimeMetric(self, req, timeout=None):
+                    del timeout
+                    if req.metric_name == "tpu.runtime.hbm.memory.usage.bytes":
+                        items = [_make_item(c, as_int=(c + 1) * 4 * 1024**3) for c in range(8)]
+                    elif req.metric_name == "tpu.runtime.hbm.memory.total.bytes":
+                        items = [_make_item(c, as_int=96 * 1024**3) for c in range(8)]
+                    elif req.metric_name == "tpu.runtime.tensorcore.dutycycle.percent":
+                        items = [_make_item(0, as_double=50.0), _make_item(1, as_double=60.0)]
+                    else:
+                        items = []
+                    return SimpleNamespace(metric=SimpleNamespace(metrics=items))
+
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.dict(_te._GRPC_CHANNELS, {}, clear=True),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "grpc": _FakeGrpc,
+                        "tpu_info": SimpleNamespace(),
+                        "tpu_info.proto": SimpleNamespace(),
+                        "tpu_info.proto.tpu_metric_service_pb2": fake_pb2,
+                        "tpu_info.proto.tpu_metric_service_pb2_grpc": SimpleNamespace(
+                            RuntimeMetricServiceStub=_IronwoodAmbiguousDutyStub
+                        ),
+                    },
+                ),
+            ):
+                iw_ambig_snap = _te.collect_snapshot(
+                    sysfs_root=iw_sysfs,
+                    dev_root=iw_dev,
+                    proc_root=iw_proc,
+                    tpu_info_bin="tpu-info",
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=iw_root / "no-shm",
+                )
+            self.assertEqual([d.duty_cycle_percent for d in iw_ambig_snap.devices], [None] * 8)
+            self.assertEqual(
+                [d.hbm_used_bytes for d in iw_ambig_snap.devices],
+                [(c + 1) * 4 * 1024**3 for c in range(8)],
+            )
+
+            # Custom `--tpu-info-bin` specified by bare name (without `/`) MUST invoke
+            # that configured executable via PATH instead of taking the default gRPC shortcut.
+            custom_rows = _te.parse_tpu_info_output(
+                "TPU Runtime Utilization\n"
+                "| Chip | HBM Usage (GiB)      | Duty cycle |\n"
+                "|------|----------------------|------------|\n"
+                "| 0    | 5.00 GiB / 32.00 GiB | 33.00%     |\n"
+            )
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.dict(_te._GRPC_CHANNELS, {}, clear=True),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "grpc": _FakeGrpc,
+                        "tpu_info": SimpleNamespace(),
+                        "tpu_info.proto": SimpleNamespace(),
+                        "tpu_info.proto.tpu_metric_service_pb2": fake_pb2,
+                        "tpu_info.proto.tpu_metric_service_pb2_grpc": fake_pb2_grpc,
+                    },
+                ),
+                mock.patch.object(
+                    _te, "_run_tpu_info", return_value=(True, None, custom_rows)
+                ) as mock_custom_cli,
+            ):
+                custom_snap = _te.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin="my-tpu-info-wrapper",
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=root / "no-shm",
+                )
+            self.assertEqual(mock_custom_cli.call_count, 1)
+            self.assertEqual(mock_custom_cli.call_args.kwargs["tpu_info_bin"], "my-tpu-info-wrapper")
+            self.assertEqual(custom_snap.devices[0].hbm_used_bytes, 5 * 1024**3)
+            self.assertAlmostEqual(custom_snap.devices[0].duty_cycle_percent or 0.0, 33.0)
+
             # Ironwood 4-chip VM (8 exposed PCI functions across 0x0076/0x0075) without
             # runtime totals MUST report 96 GiB per chiplet PCI row = 768 GiB aggregate
             # (not 8 * 192 GiB = 1,536 GiB).
@@ -2767,6 +2908,23 @@ TPU Runtime Utilization
                 meta_srv.shutdown()
                 meta_srv.server_close()
                 meta_t.join(timeout=2.0)
+
+            # Scheme-less / malformed --gcp-metadata-url must degrade gracefully to None
+            # without aborting snapshot collection or dropping PCI/VFIO metrics.
+            with _mock_vfio_char_lstat():
+                bad_url_snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin=None,
+                    shm_root=root / "no-shm",
+                    gcp_metadata_preemption=True,
+                    gcp_metadata_url="metadata.google.internal/computeMetadata/v1/instance/preempted",
+                    gcp_metadata_timeout_s=0.5,
+                )
+            self.assertIsNone(bad_url_snap.gcp_preempted_status)
+            self.assertEqual(len(bad_url_snap.devices), 2)
+            self.assertEqual(bad_url_snap.devices[0].aer_correctable_total, 3)
 
             alerts_path = EXPORTER_DIR / "prometheus-alerts.yml"
             self.assertTrue(alerts_path.is_file())

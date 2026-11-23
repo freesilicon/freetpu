@@ -1143,6 +1143,8 @@ def _query_grpc_runtime_metrics(
     devices_per_chip = _infer_devices_per_chip(devices)
     rows: Dict[str, _TpuInfoRow] = {}
     duty_by_chip: Dict[str, float] = {}
+    raw_duty_ids: set[str] = set()
+    raw_hbm_ids: set[str] = set()
     last_err: Optional[str] = None
     any_rpc_ok = False
     for metric_name in _GRPC_METRIC_NAMES:
@@ -1163,8 +1165,14 @@ def _query_grpc_runtime_metrics(
             continue
         for item in entries:
             chip_id = _extract_grpc_chip_id(item)
+            if chip_id is None:
+                continue
+            if metric_name == "tpu.runtime.tensorcore.dutycycle.percent":
+                raw_duty_ids.add(chip_id)
+            else:
+                raw_hbm_ids.add(chip_id)
             val = _extract_grpc_gauge_value(item)
-            if chip_id is None or val is None or val < 0.0:
+            if val is None or val < 0.0:
                 continue
             if metric_name == "tpu.runtime.tensorcore.dutycycle.percent":
                 duty_by_chip[chip_id] = float(val)
@@ -1178,45 +1186,69 @@ def _query_grpc_runtime_metrics(
             elif metric_name == "tpu.runtime.hbm.utilization.percent":
                 row.hbm_bw_util_percent = float(val)
 
-    # Join duty-cycle readings with per-core HBM rows:
-    # - Preserve 1:1 per-core keys when duty_by_chip already reports per-core IDs
-    #   (as on Ironwood's dedicated 1:1 reader in upstream `tpu_info/metrics.py`).
-    # - Expand per-chip IDs (`c -> c * devices_per_chip + offset`) ONLY when
-    #   `devices_per_chip > 1` AND the response reports physical-chip readings
-    #   (fewer numeric IDs than HBM cores whose expanded IDs stay within the
-    #   known core set, or matching discovered physical chips when HBM is absent).
-    should_expand_duty = False
-    if devices_per_chip > 1 and duty_by_chip and all(k.isdigit() for k in duty_by_chip):
-        duty_ids = {int(k) for k in duty_by_chip}
-        hbm_core_ids = {int(k) for k in rows if k.isdigit()}
-        if hbm_core_ids:
-            expanded_ids = {
+    # Join duty-cycle readings with per-core HBM rows using ALL raw response IDs
+    # collected BEFORE filtering unset/NaN/negative gauges:
+    # - On `devices_per_chip == 1` generations (v5e, v6e), always join 1:1.
+    # - On `devices_per_chip > 1` generations (Ironwood tpu7x, v2/v3, v4/v5p):
+    #   - If raw duty-cycle IDs match the core set or include any ID >= chip_count,
+    #     treat the response as per-core (1:1) and never duplicate usable readings
+    #     across cores with missing values.
+    #   - Expand per-chip (`c -> c * devices_per_chip + offset`) ONLY when raw
+    #     duty-cycle IDs match the full physical-chip ID set for the core/device
+    #     layout (and expand only entries with valid readings).
+    #   - If a partial numeric response is ambiguous (cannot distinguish per-chip
+    #     from per-core), omit those ambiguous duty-cycle readings rather than
+    #     misassigning them to the wrong core.
+    duty_layout = "per_core"
+    if devices_per_chip > 1 and duty_by_chip and all(k.isdigit() for k in raw_duty_ids):
+        raw_duty_int_ids = {int(k) for k in raw_duty_ids}
+        all_hbm_core_ids = {int(k) for k in raw_hbm_ids if k.isdigit()}
+        if all_hbm_core_ids:
+            expected_chip_ids = {cid // devices_per_chip for cid in all_hbm_core_ids}
+            expected_chip_count = len(expected_chip_ids)
+            expanded_raw = {
                 cid * devices_per_chip + off
-                for cid in duty_ids
+                for cid in raw_duty_int_ids
                 for off in range(devices_per_chip)
             }
-            if (
-                duty_ids != hbm_core_ids
-                and len(duty_ids) < len(hbm_core_ids)
-                and expanded_ids <= hbm_core_ids
+            if raw_duty_int_ids == all_hbm_core_ids or any(
+                cid >= expected_chip_count for cid in raw_duty_int_ids
             ):
-                should_expand_duty = True
-        elif len(devices) > 0 and len(duty_ids) * devices_per_chip == len(devices):
-            if max(duty_ids) < len(duty_ids):
-                should_expand_duty = True
+                duty_layout = "per_core"
+            elif (
+                raw_duty_int_ids == expected_chip_ids
+                and len(raw_duty_int_ids) * devices_per_chip == len(all_hbm_core_ids)
+                and expanded_raw == all_hbm_core_ids
+            ):
+                duty_layout = "per_chip"
+            else:
+                duty_layout = "ambiguous"
+        elif len(devices) > 0 and len(devices) % devices_per_chip == 0:
+            expected_chip_count = len(devices) // devices_per_chip
+            if raw_duty_int_ids == set(range(len(devices))) or any(
+                cid >= expected_chip_count for cid in raw_duty_int_ids
+            ):
+                duty_layout = "per_core"
+            elif raw_duty_int_ids == set(range(expected_chip_count)):
+                duty_layout = "per_chip"
+            else:
+                duty_layout = "ambiguous"
+        else:
+            duty_layout = "ambiguous"
 
-    for chip_key, duty_val in duty_by_chip.items():
-        if should_expand_duty and chip_key.isdigit():
-            chip_idx = int(chip_key)
-            for offset in range(devices_per_chip):
-                core_key = str(chip_idx * devices_per_chip + offset)
-                row = rows.setdefault(core_key, _TpuInfoRow(chip_key=core_key))
+    if duty_layout != "ambiguous":
+        for chip_key, duty_val in duty_by_chip.items():
+            if duty_layout == "per_chip" and chip_key.isdigit():
+                chip_idx = int(chip_key)
+                for offset in range(devices_per_chip):
+                    core_key = str(chip_idx * devices_per_chip + offset)
+                    row = rows.setdefault(core_key, _TpuInfoRow(chip_key=core_key))
+                    row.in_util_table = True
+                    row.duty_cycle_percent = duty_val
+            else:
+                row = rows.setdefault(chip_key, _TpuInfoRow(chip_key=chip_key))
                 row.in_util_table = True
                 row.duty_cycle_percent = duty_val
-        else:
-            row = rows.setdefault(chip_key, _TpuInfoRow(chip_key=chip_key))
-            row.in_util_table = True
-            row.duty_cycle_percent = duty_val
 
     if not rows:
         if not any_rpc_ok and last_err:
@@ -1382,8 +1414,8 @@ def query_gcp_preemption_status(
     timeout_s: float = 0.5,
 ) -> Optional[int]:
     """Query GCP instance preemption metadata (`1` if preempted, `0` if healthy, `None` if unavailable)."""
-    req = urllib.request.Request(url, headers={"Metadata-Flavor": "Google"})
     try:
+        req = urllib.request.Request(url, headers={"Metadata-Flavor": "Google"})
         with urllib.request.urlopen(req, timeout=max(0.05, float(timeout_s))) as resp:
             body = resp.read(256).decode("utf-8", errors="replace").strip().lower()
     except (OSError, urllib.error.URLError, ValueError):
@@ -1876,17 +1908,17 @@ def collect_snapshot(
                 )
     else:
         # Prefer direct in-process `RuntimeMetricService` gRPC over spawning
-        # `tpu-info` subprocesses when default `"tpu-info"` is configured; if a
-        # caller supplied an explicit CLI script/path or gRPC stubs/endpoint are
-        # unavailable, fall back cleanly within the single shared scrape deadline.
+        # `tpu-info` subprocesses ONLY for the exact default `"tpu-info"` value;
+        # any custom executable name or path (e.g. `my-wrapper` on PATH or
+        # `/path/to/wrapper`) invokes that configured CLI directly.
         # Note: `tpu-info` CLI Process Monitor guesses `/dev/vfio/<runtime_id>`
         # and cannot establish authoritative PCI identity, so we do NOT spawn the
         # CLI solely to guess mappings when direct gRPC already returned live rows.
-        custom_cli_path = os.path.sep in tpu_info_bin
+        use_default_grpc_first = tpu_info_bin == "tpu-info"
         tpu_info_ok = False
         tpu_info_err = None
         parsed_rows = {}
-        if not custom_cli_path and runtime_metrics_addr:
+        if use_default_grpc_first and runtime_metrics_addr:
             tpu_info_ok, tpu_info_err, parsed_rows = _query_grpc_runtime_metrics(
                 devices,
                 addr=runtime_metrics_addr,

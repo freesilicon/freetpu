@@ -2293,6 +2293,45 @@ class FreeTpuCdiTests(unittest.TestCase):
                     errs_unk,
                 )
 
+                # Degraded NUMA 0 (1 TPU disappears -> 3 chips on NUMA 0, 4 on NUMA 1):
+                # `numa0` and `0-2` MUST be withdrawn (never emitting unsupported 1,3,1 bounds),
+                # healthy 4-chip `numa1` remains published, and `all` on 7 chips omits bogus
+                # TPU_CHIPS_PER_HOST_BOUNDS. Previously published 4-chip `numa0` fails --check-host!
+                deg_root = root / "v6e8_degraded_numa0"
+                deg_sys, deg_dev = _make_mock_pci_vfio(
+                    deg_root,
+                    devices=v6e8_devices[1:],  # drop 1 chip from NUMA 0 (leaving 3 + 4 = 7)
+                    create_vfio_nodes=[str(i) for i in range(1, 8)],
+                )
+                deg_chips, deg_ctrl = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=deg_sys, dev_root=deg_dev
+                )
+                deg_spec = freetpu_cdi.build_cdi_spec(
+                    deg_chips, deg_ctrl, single_host_env=True
+                )
+                deg_by_name = {d["name"]: d for d in deg_spec["devices"]}
+                self.assertNotIn("numa0", deg_by_name)
+                self.assertNotIn("0-2", deg_by_name)
+                self.assertIn("numa1", deg_by_name)
+                self.assertEqual(deg_by_name["numa1"]["annotations"]["freetpu.dev/chip-count"], "4")
+                deg_all_env = dict(
+                    kv.split("=", 1) for kv in deg_by_name["all"]["containerEdits"]["env"]
+                )
+                self.assertNotIn("TPU_CHIPS_PER_HOST_BOUNDS", deg_all_env)
+                self.assertEqual(
+                    freetpu_cdi.verify_spec_against_host(
+                        deg_spec, sysfs_root=deg_sys, dev_root=deg_dev
+                    ),
+                    [],
+                )
+                errs_deg_old = freetpu_cdi.verify_spec_against_host(
+                    spec, sysfs_root=deg_sys, dev_root=deg_dev
+                )
+                self.assertTrue(
+                    any("device 'numa0'" in e for e in errs_deg_old),
+                    errs_deg_old,
+                )
+
             # Verify tpu7x Ironwood 4-chip VM (8 PCI functions across 0x0076 / 0x0075):
             # all 8 PCI functions remain allocated in VFIO deviceNodes while host bounds
             # use the 4 physical chips (`2,2,1`, NOT `2,4,1`).
