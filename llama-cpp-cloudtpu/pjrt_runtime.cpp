@@ -2094,10 +2094,19 @@ static PJRT_Error* mock_loaded_exec_execute(PJRT_LoadedExecutable_Execute_Args* 
             }
             for (size_t i = 0; i < args->num_args; ++i) {
                 auto* mb = reinterpret_cast<MockBuffer*>(args->argument_lists[d][i]);
+                if (!mb) {
+                    return mock_error("MockPJRT: null input buffer at arg " + std::to_string(i));
+                }
                 if (mb->device_id != expected_dev_id) {
                     return mock_error("MockPJRT: input buffer on device " + std::to_string(mb->device_id) +
                                       " does not match executable device " +
                                       std::to_string(expected_dev_id));
+                }
+                const MockTypeSpec& expected_ts = prog.args[i].second;
+                if (mb->tensor.dtype != expected_ts.dtype || mb->tensor.dims != expected_ts.dims) {
+                    return mock_error("MockPJRT: input arg " + std::to_string(i) + " on device " +
+                                      std::to_string(expected_dev_id) +
+                                      " dtype/shape does not match compiled parameter signature");
                 }
                 if (!alloc_bytes[d]) alloc_bytes[d] = mb->allocated_bytes;
                 envs[d][prog.args[i].first] = mb->tensor;

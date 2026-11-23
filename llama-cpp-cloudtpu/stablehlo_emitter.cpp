@@ -391,6 +391,12 @@ public:
     }
 
     SsaValue emit_all_gather(const SsaValue& x, int64_t gather_dim, int32_t num_chips) {
+        if (num_chips <= 0) {
+            throw std::invalid_argument("emit_all_gather: num_chips must be positive");
+        }
+        if (gather_dim < 0 || static_cast<size_t>(gather_dim) >= x.dims.size()) {
+            throw std::invalid_argument("emit_all_gather: gather_dim out of bounds");
+        }
         std::vector<int64_t> out_dims = x.dims;
         out_dims[static_cast<size_t>(gather_dim)] *= static_cast<int64_t>(num_chips);
         SsaValue out = next_val(x.dtype, out_dims);
@@ -403,9 +409,15 @@ public:
     }
 
     SsaValue emit_reduce_scatter(const SsaValue& x, int64_t scatter_dim, int32_t num_chips, const char* reducer_op) {
+        if (num_chips <= 0) {
+            throw std::invalid_argument("emit_reduce_scatter: num_chips must be positive");
+        }
+        if (scatter_dim < 0 || static_cast<size_t>(scatter_dim) >= x.dims.size()) {
+            throw std::invalid_argument("emit_reduce_scatter: scatter_dim out of bounds");
+        }
         std::vector<int64_t> out_dims = x.dims;
         if (out_dims[static_cast<size_t>(scatter_dim)] % num_chips != 0) {
-            throw std::runtime_error("emit_reduce_scatter: scatter_dim not divisible by num_chips");
+            throw std::invalid_argument("emit_reduce_scatter: scatter_dim not divisible by num_chips");
         }
         out_dims[static_cast<size_t>(scatter_dim)] /= static_cast<int64_t>(num_chips);
         SsaValue out = next_val(x.dtype, out_dims);

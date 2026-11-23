@@ -1600,8 +1600,94 @@ void test_spmd_shard_n_get_rows_and_collectives() {
                        "P=2 S32 REDUCE_SCATTER_SUM must preserve 16777217 exactly");
         }
 
+        // 4) Bounds checks: invalid collective_dim must throw std::invalid_argument, and
+        //    MockPJRT must reject input shape/dtype mismatches before evaluating collectives.
+        for (int64_t bad_dim : std::vector<int64_t>{-1, 4}) {
+            bool ag_threw = false;
+            try {
+                cloudtpu::GraphProgramSpec bad;
+                bad.spmd_chips = P;
+                bad.inputs.push_back({1, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 2, 4}});
+                cloudtpu::OpNodeSpec op;
+                op.kind = cloudtpu::CloudOpKind::ALL_GATHER;
+                op.collective_dim = bad_dim;
+                op.src_ids = {1};
+                op.dst = {2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 2, 8}};
+                bad.ops.push_back(op);
+                bad.output_ids = {2};
+                (void)cloudtpu::emit_stablehlo_program(bad);
+            } catch (const std::invalid_argument&) {
+                ag_threw = true;
+            }
+            CHECK_TRUE(ag_threw, "ALL_GATHER with out-of-bounds collective_dim must throw invalid_argument");
+
+            bool rs_threw = false;
+            try {
+                cloudtpu::GraphProgramSpec bad;
+                bad.spmd_chips = P;
+                bad.inputs.push_back({1, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 2, 4}});
+                cloudtpu::OpNodeSpec op;
+                op.kind = cloudtpu::CloudOpKind::REDUCE_SCATTER_SUM;
+                op.collective_dim = bad_dim;
+                op.src_ids = {1};
+                op.dst = {2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 2, 2}};
+                bad.ops.push_back(op);
+                bad.output_ids = {2};
+                (void)cloudtpu::emit_stablehlo_program(bad);
+            } catch (const std::invalid_argument&) {
+                rs_threw = true;
+            }
+            CHECK_TRUE(rs_threw, "REDUCE_SCATTER_SUM with out-of-bounds collective_dim must throw invalid_argument");
+        }
+        {
+            cloudtpu::GraphProgramSpec ag_spec;
+            ag_spec.spmd_chips = P;
+            ag_spec.inputs.push_back({1, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 2}});
+            cloudtpu::OpNodeSpec op;
+            op.kind = cloudtpu::CloudOpKind::ALL_GATHER;
+            op.collective_dim = 3;
+            op.src_ids = {1};
+            op.dst = {2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 4}};
+            ag_spec.ops.push_back(op);
+            ag_spec.output_ids = {2};
+            const auto ag_prog = cloudtpu::emit_stablehlo_program(ag_spec);
+            const auto ag_exec = rt.compile_or_get(ag_prog.cache_key, ag_prog.mlir_text, 0, copts);
+
+            // Shape mismatch: pass [1, 1, 1, 4] instead of expected [1, 1, 1, 2]
+            const std::vector<float> full_vals = {1.0f, 2.0f, 3.0f, 4.0f};
+            auto wrong_s0 = rt.buffer_from_host(0, full_vals.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, 4});
+            auto wrong_s1 = rt.buffer_from_host(1, full_vals.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, 4});
+            PJRT_Buffer* ws0[1] = {wrong_s0->handle.get()};
+            PJRT_Buffer* ws1[1] = {wrong_s1->handle.get()};
+            PJRT_Buffer* const* ws_ptrs[2] = {ws0, ws1};
+            bool shape_rejected = false;
+            try {
+                std::vector<std::vector<cloudtpu::PjrtBufferPtr>> outs;
+                rt.execute_spmd(ag_exec, P, ws_ptrs, 1, outs, {cloudtpu::PjrtDType::F32}, {{1, 1, 1, 4}}, true);
+            } catch (const std::exception&) {
+                shape_rejected = true;
+            }
+            CHECK_TRUE(shape_rejected, "MockPJRT must reject mismatched SPMD input shape");
+
+            // Dtype mismatch: pass S32 [1, 1, 1, 2] instead of expected F32 [1, 1, 1, 2]
+            const std::vector<int32_t> wrong_dt_vals = {1, 2};
+            auto wd0 = rt.buffer_from_host(0, wrong_dt_vals.data(), cloudtpu::PjrtDType::S32, {1, 1, 1, 2});
+            auto wd1 = rt.buffer_from_host(1, wrong_dt_vals.data(), cloudtpu::PjrtDType::S32, {1, 1, 1, 2});
+            PJRT_Buffer* d0[1] = {wd0->handle.get()};
+            PJRT_Buffer* d1[1] = {wd1->handle.get()};
+            PJRT_Buffer* const* wd_ptrs[2] = {d0, d1};
+            bool dtype_rejected = false;
+            try {
+                std::vector<std::vector<cloudtpu::PjrtBufferPtr>> outs;
+                rt.execute_spmd(ag_exec, P, wd_ptrs, 1, outs, {cloudtpu::PjrtDType::F32}, {{1, 1, 1, 4}}, true);
+            } catch (const std::exception&) {
+                dtype_rejected = true;
+            }
+            CHECK_TRUE(dtype_rejected, "MockPJRT must reject mismatched SPMD input dtype");
+        }
+
         rt.shutdown();
-        std::printf("  [PASS] SPMD REDUCE_SCATTER_SUM -> CPY & exact S32 collective precision (16777217)\n");
+        std::printf("  [PASS] SPMD REDUCE_SCATTER_SUM -> CPY, S32 precision, & collective/input bounds checks\n");
     }
 }
 
