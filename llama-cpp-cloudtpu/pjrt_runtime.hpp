@@ -7,6 +7,7 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -24,6 +25,21 @@ enum class PjrtDType {
     S16,
     S32,
     S64,
+};
+
+class PjrtError : public std::runtime_error {
+public:
+    PjrtError(PJRT_Error_Code code, const std::string& msg)
+        : std::runtime_error(msg), code_(code) {}
+
+    PJRT_Error_Code code() const noexcept { return code_; }
+
+    bool is_resource_exhausted() const noexcept {
+        return code_ == PJRT_Error_Code_RESOURCE_EXHAUSTED;
+    }
+
+private:
+    PJRT_Error_Code code_;
 };
 
 PJRT_Buffer_Type to_pjrt_buffer_type(PjrtDType dt);

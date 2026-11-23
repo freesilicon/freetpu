@@ -990,7 +990,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                     SsaValue sc = builder.emit_const_splat_f32(op.flash_attn.scale, sc_dims, PjrtDType::F32);
                     scores = builder.emit_binary("stablehlo.multiply", scores, sc);
                 }
-                if (op.flash_attn.logit_softcap > 0.0f) {
+                if (op.flash_attn.logit_softcap != 0.0f) {
                     const float cap = op.flash_attn.logit_softcap;
                     SsaValue inv_cap = builder.emit_const_splat_f32(1.0f / cap, sc_dims, PjrtDType::F32);
                     SsaValue cap_c = builder.emit_const_splat_f32(cap, sc_dims, PjrtDType::F32);

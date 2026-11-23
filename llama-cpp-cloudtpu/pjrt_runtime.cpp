@@ -1539,6 +1539,11 @@ static void mock_error_message(PJRT_Error_Message_Args* args) {
     args->message_size = e->message.size();
 }
 
+static PJRT_Error* mock_error_get_code(PJRT_Error_GetCode_Args* args) {
+    args->code = PJRT_Error_Code_INTERNAL;
+    return nullptr;
+}
+
 static PJRT_Error* mock_plugin_initialize(PJRT_Plugin_Initialize_Args*) { return nullptr; }
 static PJRT_Error* mock_event_destroy(PJRT_Event_Destroy_Args* args) {
     delete reinterpret_cast<MockEvent*>(args->event);
@@ -1791,6 +1796,7 @@ static const PJRT_Api* get_mock_pjrt_api() {
 
         a.PJRT_Error_Destroy = mock_error_destroy;
         a.PJRT_Error_Message = mock_error_message;
+        a.PJRT_Error_GetCode = mock_error_get_code;
         a.PJRT_Plugin_Initialize = mock_plugin_initialize;
         a.PJRT_Event_Destroy = mock_event_destroy;
         a.PJRT_Event_Await = mock_event_await;
@@ -1854,8 +1860,20 @@ void PjrtRuntime::check_error(PJRT_Error* err, const char* where) const {
             msg.assign(m_args.message, m_args.message_size);
         }
     }
+    PJRT_Error_Code code = PJRT_Error_Code_UNKNOWN;
+    if (api_ && PJRT_API_HAS(api_, PJRT_Error_GetCode)) {
+        PJRT_Error_GetCode_Args c_args = {};
+        c_args.struct_size = PJRT_Error_GetCode_Args_STRUCT_SIZE;
+        c_args.error = err;
+        PJRT_Error* code_err = api_->PJRT_Error_GetCode(&c_args);
+        if (code_err) {
+            destroy_error(code_err);
+        } else {
+            code = c_args.code;
+        }
+    }
     destroy_error(err);
-    throw std::runtime_error(std::string(where) + ": " + msg);
+    throw PjrtError(code, std::string(where) + ": " + msg);
 }
 
 std::string PjrtRuntime::resolve_libtpu_path(const std::string& override_path) const {

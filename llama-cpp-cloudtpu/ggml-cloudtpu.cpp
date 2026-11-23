@@ -2610,6 +2610,14 @@ static enum ggml_status ggml_backend_cloudtpu_graph_compute(ggml_backend_t backe
                        (i < cgraph->n_nodes && cgraph->nodes[i]) ? cgraph->nodes[i]->name : "?",
                        e.what());
         return GGML_STATUS_ALLOC_FAILED;
+    } catch (const cloudtpu::PjrtError& e) {
+        GGML_LOG_ERROR("ggml-cloudtpu: graph_compute PJRT error (code=%d) at node %d (%s '%s'): %s\n",
+                       static_cast<int>(e.code()),
+                       i,
+                       (i < cgraph->n_nodes && cgraph->nodes[i]) ? ggml_op_desc(cgraph->nodes[i]) : "?",
+                       (i < cgraph->n_nodes && cgraph->nodes[i]) ? cgraph->nodes[i]->name : "?",
+                       e.what());
+        return e.is_resource_exhausted() ? GGML_STATUS_ALLOC_FAILED : GGML_STATUS_FAILED;
     } catch (const std::bad_alloc& e) {
         GGML_LOG_ERROR("ggml-cloudtpu: graph_compute host OOM at node %d (%s '%s'): %s\n",
                        i,
@@ -2623,10 +2631,6 @@ static enum ggml_status ggml_backend_cloudtpu_graph_compute(ggml_backend_t backe
                        (i < cgraph->n_nodes && cgraph->nodes[i]) ? ggml_op_desc(cgraph->nodes[i]) : "?",
                        (i < cgraph->n_nodes && cgraph->nodes[i]) ? cgraph->nodes[i]->name : "?",
                        e.what());
-        const std::string msg(e.what());
-        if (msg.find("RESOURCE_EXHAUSTED") != std::string::npos) {
-            return GGML_STATUS_ALLOC_FAILED;
-        }
         return GGML_STATUS_FAILED;
     }
 }
