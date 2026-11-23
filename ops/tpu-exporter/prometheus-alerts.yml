@@ -1,0 +1,154 @@
+# Prometheus alerting rules for FreeTPU Cloud TPU fleets (ops/tpu-exporter/tpu_exporter.py).
+#
+# Scrape/evaluation timing notes:
+# - Pair with ops/tpu-exporter/prometheus-scrape.yml (`scrape_interval: 10s`,
+#   `evaluation_interval: 10s`, i.e. `<= 10s` for `GcpSpotPreemption` to catch
+#   GCP Spot's best-effort <= 30s shutdown window). Range windows (`[5m]`) also
+#   retain >= 5 samples at Prometheus's default 1m scrape interval for non-Spot
+#   alerts.
+# - Runtime-only fallback clauses (`{pci_bdf="unmapped"}`) fire ONLY for chips
+#   that could not be mapped to a PCI BDF, preventing duplicate alerts when a
+#   runtime chip is already mapped to a PCI-labeled metric.
+# - `GcpSpotPreemption` is for fleet observability/incident tracking only — do
+#   NOT rely on Prometheus scraping for time-critical Spot checkpointing.
+groups:
+  - name: freetpu-tpu-alerts
+    rules:
+      - alert: TpuHbmOOMWarning
+        expr: |
+          (
+            freetpu_tpu_hbm_utilization_ratio > 0.95
+          )
+          or
+          (
+            freetpu_tpu_runtime_hbm_used_bytes{pci_bdf="unmapped"}
+            / (freetpu_tpu_runtime_hbm_total_bytes{pci_bdf="unmapped"} > 0) > 0.95
+          )
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TPU HBM utilization above 95% on {{ $labels.node }} ({{ $labels.pci_bdf }})"
+          description: >-
+            TPU HBM usage exceeded 95% of capacity for 1 minute. Trigger dynamic
+            batch-size reduction, KV cache eviction, or re-sharding before OOM.
+
+      # Scoped explicitly to targets labeled `expected_tpu_activity="sustained"`
+      # (e.g. continuous training jobs via Prometheus scrape relabeling) AND
+      # gated on active HBM allocation. An initialized libtpu runtime reports 0%
+      # duty cycle while idle, so warmed-up inference replicas with zero traffic
+      # must NOT fire this critical alert; for inference pools, gate low duty
+      # cycle on a serving-layer demand signal (e.g. in-flight requests > 0).
+      - alert: TpuMxuDutyCycleCollapse
+        expr: |
+          (
+            avg_over_time(freetpu_tpu_duty_cycle_percent{expected_tpu_activity="sustained"}[5m]) < 10
+            and
+            freetpu_tpu_duty_cycle_percent{expected_tpu_activity="sustained"} >= 0
+            and
+            freetpu_tpu_hbm_used_bytes{expected_tpu_activity="sustained"} > 0
+          )
+          or
+          (
+            avg_over_time(freetpu_tpu_runtime_duty_cycle_percent{pci_bdf="unmapped",expected_tpu_activity="sustained"}[5m]) < 10
+            and
+            freetpu_tpu_runtime_duty_cycle_percent{pci_bdf="unmapped",expected_tpu_activity="sustained"} >= 0
+            and
+            freetpu_tpu_runtime_hbm_used_bytes{pci_bdf="unmapped",expected_tpu_activity="sustained"} > 0
+          )
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "TPU MXU duty cycle collapsed (<10%) on sustained workload {{ $labels.node }}"
+          description: >-
+            TensorCore / MXU duty cycle remained below 10% over 5 minutes on a
+            target labeled expected_tpu_activity="sustained" with active HBM
+            allocation. Investigate input-pipeline stalls or ICI collective
+            barriers. Idle/warmed-up inference replicas are excluded unless
+            explicitly gated on serving demand.
+
+      # Advisory warning for direct-gRPC unjoined duty-cycle telemetry (e.g.
+      # unprivileged sidecars without PCI inventory or ambiguous multi-core
+      # hosts in `--grpc-duty-layout=auto`). Raw unjoined IDs cannot prove
+      # per-device coverage across all active allocations, so this stays a
+      # target-level warning rather than a critical page; configure PCI
+      # inventory or explicit `--grpc-duty-layout` for deterministic per-device
+      # critical paging via `TpuMxuDutyCycleCollapse`.
+      - alert: TpuUnjoinedDutyCycleLow
+        expr: |
+          max by (job, instance, node) (
+            avg_over_time(freetpu_tpu_runtime_unjoined_duty_cycle_percent{expected_tpu_activity="sustained"}[5m])
+          ) < 10
+          and on(job, instance)
+          max by (job, instance) (
+            freetpu_tpu_runtime_unjoined_duty_cycle_percent{expected_tpu_activity="sustained"} >= 0
+          )
+          and on(job, instance) (
+            max by (job, instance) (freetpu_tpu_runtime_hbm_used_bytes{pci_bdf="unmapped",expected_tpu_activity="sustained"} > 0)
+            or
+            max by (job, instance) (freetpu_tpu_hbm_used_bytes{expected_tpu_activity="sustained"} > 0)
+          )
+          unless on(job, instance) (
+            max by (job, instance) (avg_over_time(freetpu_tpu_duty_cycle_percent{expected_tpu_activity="sustained"}[5m])) >= 10
+            or
+            max by (job, instance) (avg_over_time(freetpu_tpu_runtime_duty_cycle_percent{pci_bdf="unmapped",expected_tpu_activity="sustained"}[5m])) >= 10
+          )
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Unjoined TPU MXU duty cycle low (<10%) on {{ $labels.node }}"
+          description: >-
+            Observed raw unjoined MXU duty-cycle samples stayed below 10% over
+            5 minutes on a sustained-activity target with active HBM allocation.
+            Because unjoined raw IDs cannot verify per-device coverage on
+            ambiguous multi-core or no-PCI sidecar targets, inspect the workload
+            and configure PCI inventory or explicit --grpc-duty-layout for
+            deterministic per-device critical alerting.
+
+      - alert: TpuPcieAerFault
+        # 5m range window provides multiple scrapes even at Prometheus's default
+        # 1m scrape interval (and 20 samples at the recommended 15s interval).
+        expr: increase(freetpu_pcie_aer_fatal_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Fatal PCIe AER fault detected on {{ $labels.node }} ({{ $labels.pci_bdf }})"
+          description: >-
+            Unrecoverable PCIe Advanced Error Reporting (AER) fatal error count
+            increased on TPU device {{ $labels.pci_bdf }}. Cordon the node and
+            run hardware diagnostics / reboot.
+
+      # Monitoring/observability alert only: requires `scrape_interval <= 10s`
+      # (e.g. 5s-10s in prometheus-scrape.yml) because the exporter queries GCP
+      # metadata only during a scrape and Spot's best-effort shutdown window is
+      # at most 30s (Prometheus's default 60s interval misses notices between
+      # scrapes, and `max_over_time(...[6m])` cannot recover a notice that was
+      # never scraped before VM shutdown). When preemption tracking must survive
+      # VM shutdown regardless of scrape timing, ingest Compute Engine preemption
+      # events / Cloud Logging instead.
+      # `max_over_time(...[6m])` retains an already-scraped `TRUE` notice past VM
+      # shutdown, staleness, Alertmanager's default 30s `group_wait`, AND
+      # Alertmanager's default 5m `group_interval` when multiple instances
+      # preempt in sequence on a grouped route (a dedicated route with a short
+      # `group_interval`, e.g. 15s-30s, is still recommended).
+      # Time-critical checkpointing MUST use a workload-local metadata watcher
+      # (`wait_for_change=true`) or SIGTERM handler inside the training job.
+      - alert: GcpSpotPreemption
+        expr: max_over_time(gcp_metadata_preempted_status[6m]) == 1
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "GCP Spot preemption notice observed on {{ $labels.node }}"
+          description: >-
+            Monitoring alert only: GCP instance metadata reported
+            preempted=TRUE on {{ $labels.node }}. Because Spot VMs have zero
+            guaranteed advance notice and a best-effort shutdown window of up to
+            30s, pair this alert with scrape_interval <= 10s (e.g. 5s-10s) or
+            Compute Engine preemption events / Cloud Logging for post-shutdown
+            durability; drive time-critical checkpointing (e.g. Orbax emergency
+            checkpoint) via a workload-local metadata watcher or SIGTERM
+            shutdown handler rather than Prometheus scrape/alert evaluation.
