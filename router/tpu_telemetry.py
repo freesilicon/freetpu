@@ -22,10 +22,11 @@ import io
 import math
 import re
 import select
+import selectors
 import socket
 import ssl
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 
 _KNOWN_TPU_METRICS = frozenset(
@@ -238,6 +239,261 @@ class ClientDisconnectedError(Exception):
 
 
 _MSG_DONTWAIT = getattr(socket, "MSG_DONTWAIT", 0)
+_POLL_READ_EVENTS = getattr(select, "POLLIN", 0) | getattr(select, "POLLPRI", 0)
+_POLL_HUP_EVENT = getattr(select, "POLLHUP", 0)
+_POLL_ERR_EVENTS = getattr(select, "POLLERR", 0) | getattr(select, "POLLNVAL", 0)
+
+
+def wait_sockets_readable(
+    sockets: Sequence[Any],
+    timeout_s: Optional[float],
+) -> Tuple[set[Any], set[Any]]:
+    """Wait for socket readability or error using an API supporting FDs >= 1024.
+
+    Returns `(readable, errored)` subsets of `sockets`.
+    """
+    if hasattr(select, "poll"):
+        poller = select.poll()
+        fd_to_socks: Dict[int, List[Any]] = {}
+        for sock in sockets:
+            fd = sock.fileno()
+            if fd < 0:
+                raise ValueError("Invalid socket file descriptor")
+            if fd not in fd_to_socks:
+                fd_to_socks[fd] = [sock]
+                poller.register(fd, _POLL_READ_EVENTS)
+            else:
+                fd_to_socks[fd].append(sock)
+        if timeout_s is None:
+            timeout_ms: Optional[int] = None
+        elif timeout_s <= 0:
+            timeout_ms = 0
+        else:
+            timeout_ms = min(2147483647, max(1, math.ceil(timeout_s * 1000.0)))
+        ready = poller.poll(timeout_ms)
+        readable: set[Any] = set()
+        errored: set[Any] = set()
+        for fd, revents in ready:
+            matched = fd_to_socks.get(fd)
+            if not matched:
+                continue
+            if revents & (_POLL_READ_EVENTS | _POLL_HUP_EVENT):
+                readable.update(matched)
+            if revents & _POLL_ERR_EVENTS:
+                errored.update(matched)
+        return readable, errored
+
+    with selectors.DefaultSelector() as selector:
+        for sock in sockets:
+            selector.register(sock, selectors.EVENT_READ, data=sock)
+        events = selector.select(timeout=timeout_s)
+        return {key.data for key, _ in events}, set()
+
+
+def _wait_socket_writable(sock: Any, timeout_s: Optional[float]) -> bool:
+    """Wait until `sock` is writable or errored, supporting FDs >= 1024."""
+    if hasattr(select, "poll"):
+        poller = select.poll()
+        fd = sock.fileno()
+        if fd < 0:
+            raise ValueError("Invalid socket file descriptor")
+        poller.register(fd, select.POLLOUT)
+        if timeout_s is None:
+            timeout_ms: Optional[int] = None
+        elif timeout_s <= 0:
+            timeout_ms = 0
+        else:
+            timeout_ms = min(2147483647, max(1, math.ceil(timeout_s * 1000.0)))
+        return bool(poller.poll(timeout_ms))
+
+    with selectors.DefaultSelector() as selector:
+        selector.register(sock, selectors.EVENT_WRITE, data=sock)
+        return bool(selector.select(timeout=timeout_s))
+
+
+def _tls_handshake_with_deadline(
+    tls_sock: ssl.SSLSocket,
+    *,
+    deadline: float,
+    label: str,
+) -> None:
+    """Drive a nonblocking TLS handshake strictly within `deadline`."""
+    orig_timeout = tls_sock.gettimeout()
+    tls_sock.setblocking(False)
+    try:
+        while True:
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                raise TimeoutError(f"{label} exceeded elapsed deadline")
+            try:
+                tls_sock.do_handshake()
+                return
+            except ssl.SSLWantReadError:
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    raise TimeoutError(f"{label} exceeded elapsed deadline")
+                wait_sockets_readable([tls_sock], rem)
+            except ssl.SSLWantWriteError:
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    raise TimeoutError(f"{label} exceeded elapsed deadline")
+                _wait_socket_writable(tls_sock, rem)
+    finally:
+        try:
+            rem = deadline - time.monotonic()
+            if orig_timeout is None:
+                tls_sock.settimeout(None)
+            elif rem > 0:
+                tls_sock.settimeout(rem)
+            else:
+                tls_sock.settimeout(0.0)
+        except OSError:
+            pass
+
+
+def _create_deadline_connection(
+    host: str,
+    port: int,
+    *,
+    deadline: float,
+    label: str = "Exporter scrape",
+    ssl_context: Optional[ssl.SSLContext] = None,
+    server_hostname: Optional[str] = None,
+) -> socket.socket:
+    """Resolve `host`, connect across candidate addresses, and run TLS under one deadline."""
+    rem = deadline - time.monotonic()
+    if rem <= 0:
+        raise TimeoutError(f"{label} exceeded elapsed deadline")
+    infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    if not infos:
+        raise OSError("getaddrinfo returns an empty list")
+
+    last_err: Optional[OSError] = None
+    sock: Optional[socket.socket] = None
+    for af, socktype, proto, _canonname, sa in infos:
+        rem = deadline - time.monotonic()
+        if rem <= 0:
+            raise TimeoutError(f"{label} exceeded elapsed deadline")
+        cand_sock: Optional[socket.socket] = None
+        try:
+            cand_sock = socket.socket(af, socktype, proto)
+            cand_sock.settimeout(rem)
+            cand_sock.connect(sa)
+            sock = cand_sock
+            last_err = None
+            break
+        except OSError as exc:
+            last_err = exc
+            if cand_sock is not None:
+                try:
+                    cand_sock.close()
+                except OSError:
+                    pass
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"{label} exceeded elapsed deadline") from exc
+
+    if sock is None:
+        if last_err is not None:
+            raise last_err
+        raise OSError("getaddrinfo returns an empty list")
+
+    if ssl_context is not None:
+        rem = deadline - time.monotonic()
+        if rem <= 0:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            raise TimeoutError(f"{label} exceeded elapsed deadline")
+        tls_sock: Optional[ssl.SSLSocket] = None
+        try:
+            sock.settimeout(rem)
+            tls_sock = ssl_context.wrap_socket(
+                sock,
+                server_hostname=server_hostname or host,
+                do_handshake_on_connect=False,
+            )
+            _tls_handshake_with_deadline(tls_sock, deadline=deadline, label=label)
+            sock = tls_sock
+        except BaseException:
+            if tls_sock is not None:
+                try:
+                    tls_sock.close()
+                except OSError:
+                    pass
+            else:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            raise
+
+    rem = deadline - time.monotonic()
+    if rem <= 0:
+        try:
+            sock.close()
+        except OSError:
+            pass
+        raise TimeoutError(f"{label} exceeded elapsed deadline")
+    sock.settimeout(rem)
+    return sock
+
+
+class _DeadlineHTTPConnection(http.client.HTTPConnection):
+    """`HTTPConnection` enforcing a single wall-clock deadline across connect setup."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        *,
+        deadline: float,
+        label: str = "Exporter scrape",
+    ) -> None:
+        rem = deadline - time.monotonic()
+        if rem <= 0:
+            raise TimeoutError(f"{label} exceeded elapsed deadline")
+        super().__init__(host, port, timeout=rem)
+        self._deadline = deadline
+        self._label = label
+
+    def connect(self) -> None:
+        self.sock = _create_deadline_connection(
+            self.host,
+            self.port,
+            deadline=self._deadline,
+            label=self._label,
+        )
+
+
+class _DeadlineHTTPSConnection(http.client.HTTPSConnection):
+    """`HTTPSConnection` enforcing a single wall-clock deadline across TCP connect and TLS."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        *,
+        deadline: float,
+        context: ssl.SSLContext,
+        label: str = "Exporter scrape",
+    ) -> None:
+        rem = deadline - time.monotonic()
+        if rem <= 0:
+            raise TimeoutError(f"{label} exceeded elapsed deadline")
+        super().__init__(host, port, timeout=rem, context=context)
+        self._deadline = deadline
+        self._label = label
+
+    def connect(self) -> None:
+        self.sock = _create_deadline_connection(
+            self.host,
+            self.port,
+            deadline=self._deadline,
+            label=self._label,
+            ssl_context=self._context,
+            server_hostname=self.host,
+        )
 
 
 class _DeadlineSocketIO(io.RawIOBase):
@@ -253,7 +509,7 @@ class _DeadlineSocketIO(io.RawIOBase):
     def _wait_readable_or_cancel(self) -> None:
         upstream = self._wrapper._sock
         deadline = self._wrapper.deadline
-        # If TLS already decrypted buffered bytes, read immediately without blocking in select.
+        # If TLS already decrypted buffered bytes, read immediately without blocking in poll.
         pending_fn = getattr(upstream, "pending", None)
         if callable(pending_fn) and pending_fn() > 0:
             return
@@ -266,15 +522,18 @@ class _DeadlineSocketIO(io.RawIOBase):
             if self._wrapper._watch_client and self._wrapper._client_sock is not None:
                 client = self._wrapper._client_sock
                 try:
-                    readable, _, errored = select.select(
-                        [upstream, client], [], [client], rem
-                    )
+                    readable, errored = wait_sockets_readable([upstream, client], rem)
                 except (OSError, ValueError):
                     try:
-                        if client.fileno() == -1:
+                        if client.fileno() < 0:
                             raise ClientDisconnectedError("Downstream client disconnected")
                     except (OSError, AttributeError):
                         raise ClientDisconnectedError("Downstream client disconnected")
+                    try:
+                        if upstream.fileno() < 0:
+                            raise
+                    except (OSError, AttributeError):
+                        raise
                     self._wrapper._watch_client = False
                     continue
                 if client in errored:
@@ -297,14 +556,14 @@ class _DeadlineSocketIO(io.RawIOBase):
                     if peek is not None:
                         # Extra pipelined bytes on client socket; stop EOF-watching to avoid busy spin.
                         self._wrapper._watch_client = False
-                if upstream in readable:
+                if upstream in readable or upstream in errored:
                     return
                 if not readable and not errored and deadline is not None:
                     if time.monotonic() >= deadline:
                         raise TimeoutError(f"{self._wrapper.label} exceeded elapsed deadline")
             else:
-                readable, _, _ = select.select([upstream], [], [], rem)
-                if upstream in readable:
+                readable, errored = wait_sockets_readable([upstream], rem)
+                if upstream in readable or upstream in errored:
                     return
                 if deadline is not None and time.monotonic() >= deadline:
                     raise TimeoutError(f"{self._wrapper.label} exceeded elapsed deadline")
@@ -337,10 +596,10 @@ class _DeadlineSocketIO(io.RawIOBase):
                         ):
                             client = wrapper._client_sock
                             try:
-                                r_cli, _, e_cli = select.select([client], [], [client], 0.0)
-                                if e_cli:
+                                r_cli, e_cli = wait_sockets_readable([client], 0.0)
+                                if client in e_cli:
                                     raise ClientDisconnectedError("Downstream client disconnected")
-                                if r_cli:
+                                if client in r_cli:
                                     peek = client.recv(1, socket.MSG_PEEK | _MSG_DONTWAIT)
                                     if peek == b"":
                                         raise ClientDisconnectedError("Downstream client disconnected")
@@ -415,9 +674,13 @@ class DeadlineSocket:
             rem = self.deadline - time.monotonic()
             if rem <= 0:
                 raise TimeoutError(f"{self.label} exceeded elapsed deadline")
+            if not self._is_ssl and self._io_refs > 0:
+                return
             effective = min(timeout, rem) if timeout is not None else rem
             self._sock.settimeout(effective)
         else:
+            if not self._is_ssl and self._io_refs > 0:
+                return
             self._sock.settimeout(timeout)
 
     def _decref_io(self) -> None:
@@ -463,7 +726,9 @@ def _read_bounded_http_body(
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("Exporter scrape exceeded elapsed deadline")
-        if upstream_sock is not None:
+        if isinstance(upstream_sock, DeadlineSocket):
+            upstream_sock.deadline = deadline
+        elif upstream_sock is not None:
             try:
                 upstream_sock.settimeout(remaining)
             except OSError:
@@ -493,9 +758,19 @@ def scrape_tpu_exporter(
     timeout_s: float = 2.0,
 ) -> TpuExporterTelemetry:
     """Fetch and parse `/metrics` from a `tpu-exporter` HTTP(S) endpoint."""
-    parsed = urlsplit(url)
-    scheme = parsed.scheme.lower()
-    host = parsed.hostname
+    try:
+        parsed = urlsplit(url)
+        scheme = parsed.scheme.lower()
+        host = parsed.hostname
+    except ValueError as exc:
+        return TpuExporterTelemetry(
+            reachable=False,
+            exporter_up=False,
+            devices_discovered=0,
+            healthy_chips=0,
+            total_chips=0,
+            error=f"Invalid tpu_exporter_url: {exc}",
+        )
     if scheme not in ("http", "https") or not host:
         return TpuExporterTelemetry(
             reachable=False,
@@ -535,24 +810,38 @@ def scrape_tpu_exporter(
     resp: Optional[http.client.HTTPResponse] = None
     raw_sock: Any = None
     try:
-        rem = deadline - time.monotonic()
-        if rem <= 0:
-            raise TimeoutError("Exporter scrape exceeded elapsed deadline")
         if scheme == "https":
-            conn = http.client.HTTPSConnection(
-                host, port, timeout=rem, context=ssl.create_default_context()
+            conn = _DeadlineHTTPSConnection(
+                host,
+                port,
+                deadline=deadline,
+                context=ssl.create_default_context(),
+                label="Exporter scrape",
             )
         else:
-            conn = http.client.HTTPConnection(host, port, timeout=rem)
-        conn.request("GET", path, headers={"Accept": "text/plain"})
+            conn = _DeadlineHTTPConnection(
+                host,
+                port,
+                deadline=deadline,
+                label="Exporter scrape",
+            )
+        conn.connect()
         raw_sock = conn.sock
         rem = deadline - time.monotonic()
         if rem <= 0:
             raise TimeoutError("Exporter scrape exceeded elapsed deadline")
         if raw_sock is not None:
-            conn.sock = DeadlineSocket(raw_sock, deadline, label="Exporter scrape")
+            raw_sock.settimeout(rem)
+        conn.request("GET", path, headers={"Accept": "text/plain"})
+        rem = deadline - time.monotonic()
+        if rem <= 0:
+            raise TimeoutError("Exporter scrape exceeded elapsed deadline")
+        deadline_sock: Optional[DeadlineSocket] = None
+        if raw_sock is not None:
+            deadline_sock = DeadlineSocket(raw_sock, deadline, label="Exporter scrape")
+            conn.sock = deadline_sock
         resp = conn.getresponse()
-        upstream_sock = raw_sock
+        upstream_sock = deadline_sock if deadline_sock is not None else raw_sock
         if resp.status < 200 or resp.status >= 300:
             return TpuExporterTelemetry(
                 reachable=False,

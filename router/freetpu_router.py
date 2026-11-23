@@ -19,7 +19,6 @@ import json
 import math
 from pathlib import Path
 import re
-import select
 import selectors
 import socket
 import ssl
@@ -68,6 +67,7 @@ from router.tpu_telemetry import (  # noqa: E402
     TpuExporterTelemetry,
     evaluate_tpu_readiness,
     scrape_tpu_exporter,
+    wait_sockets_readable,
 )
 
 __version__ = "0.1.0"
@@ -244,7 +244,9 @@ def _read_bounded_http_response(
         rem = deadline - time.monotonic()
         if rem <= 0:
             raise TimeoutError(f"{label} exceeded elapsed deadline")
-        if upstream_sock is not None:
+        if isinstance(upstream_sock, DeadlineSocket):
+            upstream_sock.deadline = deadline
+        elif upstream_sock is not None:
             try:
                 upstream_sock.settimeout(rem)
             except OSError:
@@ -1220,10 +1222,12 @@ class RouterEngine:
             rem = deadline - time.monotonic()
             if rem <= 0:
                 raise TimeoutError("Probe exceeded elapsed deadline")
+            deadline_sock: Optional[DeadlineSocket] = None
             if raw_sock is not None:
-                conn.sock = DeadlineSocket(raw_sock, deadline, label="Probe response")
+                deadline_sock = DeadlineSocket(raw_sock, deadline, label="Probe response")
+                conn.sock = deadline_sock
             resp = conn.getresponse()
-            upstream_sock = raw_sock
+            upstream_sock = deadline_sock if deadline_sock is not None else raw_sock
             raw = _read_bounded_http_response(
                 resp,
                 upstream_sock,
@@ -1785,6 +1789,9 @@ _OVERLOAD_503_RAW = (
 
 
 _MSG_DONTWAIT = getattr(socket, "MSG_DONTWAIT", 0)
+_SSE_CLIENT_WRITE_BUFFER_MIN_BYTES = 256 * 1024
+_SSE_CLIENT_WRITE_BUFFER_MAX_BYTES = 2 * 1024 * 1024
+_SSE_REACTOR_MAX_READS_PER_TICK = 16
 
 
 class _SSEReactorTask:
@@ -1796,12 +1803,16 @@ class _SSEReactorTask:
         "engine",
         "sse_buf",
         "raw_buf",
+        "write_buf",
         "chunked",
         "chunk_left",
         "remaining_content_length",
         "max_event_bytes",
+        "max_write_buf_bytes",
         "timeout_s",
+        "write_timeout_s",
         "progress_deadline",
+        "write_deadline",
         "sse_mem_box",
         "on_event_fn",
         "event_data_lines",
@@ -1814,8 +1825,13 @@ class _SSEReactorTask:
         "size_limit_exceeded",
         "memory_limit_exceeded",
         "eof",
+        "upstream_done",
         "done_event",
-        "client_registered",
+        "upstream_registered",
+        "watch_client_read",
+        "client_events",
+        "client_orig_timeout",
+        "client_nonblocking_set",
     )
 
     def __init__(
@@ -1833,21 +1849,39 @@ class _SSEReactorTask:
         timeout_s: float,
         progress_deadline: float,
         sse_mem_box: List[int],
-        on_event_fn: Callable[[], bool],
+        on_event_fn: Callable[[str, List[bytes]], Tuple[bool, bool]],
         event_data_lines: List[bytes],
         current_event_type: str,
+        max_write_buf_bytes: Optional[int] = None,
+        write_timeout_s: Optional[float] = None,
     ) -> None:
         self.upstream_sock = upstream_sock
         self.client_sock = client_sock
         self.engine = engine
         self.sse_buf = sse_buf
         self.raw_buf = raw_buf
+        self.write_buf = bytearray()
         self.chunked = chunked
         self.chunk_left = chunk_left
         self.remaining_content_length = remaining_content_length
         self.max_event_bytes = max_event_bytes
+        if max_write_buf_bytes is not None:
+            self.max_write_buf_bytes = max(1, max_write_buf_bytes)
+        else:
+            self.max_write_buf_bytes = max(
+                _SSE_CLIENT_WRITE_BUFFER_MIN_BYTES,
+                min(_SSE_CLIENT_WRITE_BUFFER_MAX_BYTES, max_event_bytes + 64),
+            )
         self.timeout_s = timeout_s
+        if write_timeout_s is not None:
+            self.write_timeout_s = max(0.01, write_timeout_s)
+        else:
+            self.write_timeout_s = max(
+                0.01,
+                min(timeout_s, engine.config.client_read_timeout_s),
+            )
         self.progress_deadline = progress_deadline
+        self.write_deadline: Optional[float] = None
         self.sse_mem_box = sse_mem_box
         self.on_event_fn = on_event_fn
         self.event_data_lines = event_data_lines
@@ -1860,8 +1894,13 @@ class _SSEReactorTask:
         self.size_limit_exceeded = False
         self.memory_limit_exceeded = False
         self.eof = False
+        self.upstream_done = False
         self.done_event = threading.Event()
-        self.client_registered = False
+        self.upstream_registered = False
+        self.watch_client_read = True
+        self.client_events = 0
+        self.client_orig_timeout: Optional[float] = None
+        self.client_nonblocking_set = False
 
 
 class _SSEReactor:
@@ -1941,18 +1980,75 @@ class _SSEReactor:
             task.engine.release_response_memory(rel)
             task.sse_mem_box[0] -= rel
 
+    def _set_upstream_reading(self, task: _SSEReactorTask, enabled: bool) -> bool:
+        if enabled == task.upstream_registered:
+            return True
+        try:
+            if enabled:
+                self._selector.register(
+                    task.upstream_sock, selectors.EVENT_READ, data=("up", task)
+                )
+                task.upstream_registered = True
+            else:
+                self._selector.unregister(task.upstream_sock)
+                task.upstream_registered = False
+            return True
+        except (KeyError, OSError, ValueError):
+            task.upstream_registered = False
+            if enabled:
+                task.upstream_read_error = True
+                self._finish_task(task)
+                return False
+            return True
+
+    def _update_client_registration(self, task: _SSEReactorTask) -> bool:
+        desired = 0
+        if task.watch_client_read:
+            desired |= selectors.EVENT_READ
+        if task.write_buf:
+            desired |= selectors.EVENT_WRITE
+        if desired == task.client_events:
+            return True
+        try:
+            if desired == 0:
+                if task.client_events != 0:
+                    self._selector.unregister(task.client_sock)
+            elif task.client_events == 0:
+                self._selector.register(task.client_sock, desired, data=("cli", task))
+            else:
+                self._selector.modify(task.client_sock, desired, data=("cli", task))
+            task.client_events = desired
+            return True
+        except (KeyError, OSError, ValueError):
+            task.client_events = 0
+            task.downstream_write_error = True
+            self._finish_task(task)
+            return False
+
     def _finish_task(self, task: _SSEReactorTask) -> None:
         self._active.discard(task)
-        try:
-            self._selector.unregister(task.upstream_sock)
-        except (KeyError, ValueError):
-            pass
-        if task.client_registered:
+        if task.upstream_registered:
+            try:
+                self._selector.unregister(task.upstream_sock)
+            except (KeyError, ValueError):
+                pass
+            task.upstream_registered = False
+        if task.client_events != 0:
             try:
                 self._selector.unregister(task.client_sock)
             except (KeyError, ValueError):
                 pass
-            task.client_registered = False
+            task.client_events = 0
+        if task.client_nonblocking_set:
+            try:
+                task.client_sock.settimeout(task.client_orig_timeout)
+            except OSError:
+                pass
+            task.client_nonblocking_set = False
+        if task.write_buf:
+            rem = len(task.write_buf)
+            task.write_buf.clear()
+            self._release_mem(task, rem)
         if task.sse_buf:
             rem = len(task.sse_buf)
             task.sse_buf.clear()
@@ -1962,6 +2058,49 @@ class _SSEReactor:
             task.raw_buf.clear()
             self._release_mem(task, rem)
         task.done_event.set()
+
+    def _enqueue_client_write(self, task: _SSEReactorTask, framed: bytes) -> bool:
+        """Write `framed` nonblockingly to `task.client_sock`, buffering any remainder.
+
+        Returns False on downstream write error or buffer/memory cap overflow.
+        """
+        if not framed:
+            return True
+        remaining: bytes
+        if not task.write_buf:
+            try:
+                sent = task.client_sock.send(framed)
+            except BlockingIOError:
+                remaining = framed
+            except OSError as exc:
+                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    remaining = framed
+                else:
+                    task.downstream_write_error = True
+                    return False
+            else:
+                if sent <= 0:
+                    task.downstream_write_error = True
+                    return False
+                if sent >= len(framed):
+                    return True
+                remaining = framed[sent:]
+        else:
+            remaining = framed
+
+        rem_len = len(remaining)
+        if len(task.write_buf) + rem_len > task.max_write_buf_bytes:
+            task.downstream_write_error = True
+            return False
+        if not task.engine.try_reserve_response_memory(rem_len):
+            task.downstream_write_error = True
+            return False
+        task.sse_mem_box[0] += rem_len
+        was_empty = not task.write_buf
+        task.write_buf.extend(remaining)
+        if was_empty:
+            task.write_deadline = time.monotonic() + task.write_timeout_s
+        return True
 
     def _decode_chunked(self, task: _SSEReactorTask) -> None:
         raw = task.raw_buf
@@ -2016,11 +2155,8 @@ class _SSEReactor:
                     return
                 task.chunk_left = None
 
-    def _process_sse_buf(self, task: _SSEReactorTask) -> bool:
-        """Scan complete SSE events in `task.sse_buf` and flush as one HTTP chunk.
-
-        Returns True if the task has reached a terminal state.
-        """
+    def _process_sse_buf(self, task: _SSEReactorTask) -> None:
+        """Scan complete SSE events in `task.sse_buf` and write nonblockingly as one HTTP chunk."""
         buf = task.sse_buf
         flush_end = 0
         while True:
@@ -2071,38 +2207,38 @@ class _SSEReactor:
             task.scan_pos -= flush_end
             task.event_start -= flush_end
             self._release_mem(task, flush_end)
-            try:
-                task.client_sock.sendall(
-                    f"{flush_end:x}\r\n".encode("ascii") + payload + b"\r\n"
-                )
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                task.downstream_write_error = True
-                return True
+            framed = f"{flush_end:x}\r\n".encode("ascii") + payload + b"\r\n"
+            if not self._enqueue_client_write(task, framed):
+                return
 
-        return (
+        if (
             task.saw_done_sentinel
             or task.size_limit_exceeded
             or task.upstream_read_error
             or task.memory_limit_exceeded
-            or task.downstream_write_error
             or task.eof
-        )
+        ):
+            task.upstream_done = True
 
     def _on_upstream_ready(self, task: _SSEReactorTask) -> None:
-        while True:
+        reads = 0
+        while reads < _SSE_REACTOR_MAX_READS_PER_TICK:
+            if task.write_buf or task.upstream_done:
+                return
             avail = task.engine.available_response_memory()
-            if task.chunked:
-                rem_ev_cap = (task.max_event_bytes - (len(task.sse_buf) - task.event_start)) + 1
-                to_read = min(65536, max(1, avail), max(1, rem_ev_cap))
-            else:
-                rem_ev_cap = (task.max_event_bytes - (len(task.sse_buf) - task.event_start)) + 1
-                to_read = min(65536, max(1, avail), max(1, rem_ev_cap))
-                if task.remaining_content_length is not None:
-                    if task.remaining_content_length <= 0:
-                        task.eof = True
+            rem_ev_cap = (task.max_event_bytes - (len(task.sse_buf) - task.event_start)) + 1
+            to_read = min(65536, max(1, avail), max(1, rem_ev_cap))
+            if not task.chunked and task.remaining_content_length is not None:
+                if task.remaining_content_length <= 0:
+                    task.eof = True
+                    task.upstream_done = True
+                    self._set_upstream_reading(task, False)
+                    if not task.write_buf:
                         self._finish_task(task)
-                        return
-                    to_read = min(to_read, task.remaining_content_length)
+                    else:
+                        self._update_client_registration(task)
+                    return
+                to_read = min(to_read, task.remaining_content_length)
             try:
                 chunk = task.upstream_sock.recv(to_read)
             except BlockingIOError:
@@ -2111,9 +2247,15 @@ class _SSEReactor:
                 if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
                     return
                 task.upstream_read_error = True
-                self._finish_task(task)
+                task.upstream_done = True
+                self._set_upstream_reading(task, False)
+                if not task.write_buf:
+                    self._finish_task(task)
+                else:
+                    self._update_client_registration(task)
                 return
 
+            reads += 1
             if not chunk:
                 if task.chunked:
                     task.upstream_read_error = True
@@ -2123,13 +2265,23 @@ class _SSEReactor:
                 ):
                     task.upstream_read_error = True
                 task.eof = True
-                if self._process_sse_buf(task) or task.eof:
+                task.upstream_done = True
+                self._process_sse_buf(task)
+                self._set_upstream_reading(task, False)
+                if task.downstream_write_error or not task.write_buf:
                     self._finish_task(task)
+                else:
+                    self._update_client_registration(task)
                 return
 
             if not task.engine.try_reserve_response_memory(len(chunk)):
                 task.memory_limit_exceeded = True
-                self._finish_task(task)
+                task.upstream_done = True
+                self._set_upstream_reading(task, False)
+                if not task.write_buf:
+                    self._finish_task(task)
+                else:
+                    self._update_client_registration(task)
                 return
             task.sse_mem_box[0] += len(chunk)
 
@@ -2145,11 +2297,61 @@ class _SSEReactor:
                         task.eof = True
                 task.sse_buf.extend(chunk)
 
-            if self._process_sse_buf(task):
+            self._process_sse_buf(task)
+            if task.downstream_write_error:
                 self._finish_task(task)
                 return
+            if task.upstream_done:
+                self._set_upstream_reading(task, False)
+                if not task.write_buf:
+                    self._finish_task(task)
+                else:
+                    self._update_client_registration(task)
+                return
+            if task.write_buf:
+                # Apply backpressure: pause upstream reads until client drains write_buf.
+                self._set_upstream_reading(task, False)
+                self._update_client_registration(task)
+                return
 
-    def _on_client_event(self, task: _SSEReactorTask) -> None:
+    def _on_client_writable(self, task: _SSEReactorTask) -> None:
+        total_sent = 0
+        while task.write_buf:
+            view = memoryview(task.write_buf)[:65536]
+            try:
+                sent = task.client_sock.send(view)
+            except BlockingIOError:
+                view.release()
+                break
+            except OSError as exc:
+                view.release()
+                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    break
+                task.downstream_write_error = True
+                self._finish_task(task)
+                return
+            view.release()
+            if sent <= 0:
+                task.downstream_write_error = True
+                self._finish_task(task)
+                return
+            del task.write_buf[:sent]
+            self._release_mem(task, sent)
+            total_sent += sent
+
+        if not task.write_buf:
+            task.write_deadline = None
+            if task.upstream_done:
+                self._finish_task(task)
+                return
+            task.progress_deadline = time.monotonic() + task.timeout_s
+            if not self._update_client_registration(task):
+                return
+            self._set_upstream_reading(task, True)
+        elif total_sent > 0:
+            task.write_deadline = time.monotonic() + task.write_timeout_s
+
+    def _on_client_readable(self, task: _SSEReactorTask) -> None:
         try:
             peek = task.client_sock.recv(1, socket.MSG_PEEK | _MSG_DONTWAIT)
         except BlockingIOError:
@@ -2164,13 +2366,10 @@ class _SSEReactor:
             task.downstream_write_error = True
             self._finish_task(task)
             return
-        # Client sent extra pipelined bytes; stop watching client readability.
-        if task.client_registered:
-            try:
-                self._selector.unregister(task.client_sock)
-            except (KeyError, ValueError):
-                pass
-            task.client_registered = False
+        # Client sent extra pipelined bytes; stop watching client readability
+        # while preserving EVENT_WRITE if buffered output is still draining.
+        task.watch_client_read = False
+        self._update_client_registration(task)
 
     def _drain_pending(self) -> None:
         while True:
@@ -2179,28 +2378,37 @@ class _SSEReactor:
                     return
                 task = self._pending.popleft()
             try:
-                if task.chunked and task.raw_buf:
-                    self._decode_chunked(task)
-                if self._process_sse_buf(task):
-                    self._finish_task(task)
-                    continue
-                task.upstream_sock.setblocking(False)
-                self._selector.register(
-                    task.upstream_sock, selectors.EVENT_READ, data=("up", task)
-                )
                 try:
-                    self._selector.register(
-                        task.client_sock, selectors.EVENT_READ, data=("cli", task)
-                    )
-                    task.client_registered = True
-                except (OSError, ValueError):
+                    task.client_orig_timeout = task.client_sock.gettimeout()
+                    task.client_sock.setblocking(False)
+                    task.client_nonblocking_set = True
+                except OSError:
                     task.downstream_write_error = True
                     self._finish_task(task)
                     continue
+                task.upstream_sock.setblocking(False)
+                if task.chunked and task.raw_buf:
+                    self._decode_chunked(task)
+                self._process_sse_buf(task)
+                if task.downstream_write_error or (
+                    task.upstream_done and not task.write_buf
+                ):
+                    self._finish_task(task)
+                    continue
                 self._active.add(task)
+                if not self._update_client_registration(task):
+                    continue
+                if not task.upstream_done and not task.write_buf:
+                    self._set_upstream_reading(task, True)
             except Exception:
                 task.upstream_read_error = True
                 self._finish_task(task)
+
+    @staticmethod
+    def _task_deadline(task: _SSEReactorTask) -> float:
+        if task.write_buf and task.write_deadline is not None:
+            return task.write_deadline
+        return task.progress_deadline
 
     def _run(self) -> None:
         while not self._stop_event.is_set():
@@ -2208,14 +2416,14 @@ class _SSEReactor:
             now_m = time.monotonic()
             timeout: Optional[float] = None
             if self._active:
-                earliest = min(t.progress_deadline for t in self._active)
+                earliest = min(self._task_deadline(t) for t in self._active)
                 timeout = max(0.0, earliest - now_m)
             try:
                 events = self._selector.select(timeout=timeout)
             except OSError:
                 break
             now_m = time.monotonic()
-            for key, _ in events:
+            for key, mask in events:
                 tag = key.data
                 if tag is None:
                     try:
@@ -2233,14 +2441,22 @@ class _SSEReactor:
                     if kind == "up":
                         self._on_upstream_ready(task)
                     else:
-                        self._on_client_event(task)
+                        if mask & selectors.EVENT_WRITE:
+                            self._on_client_writable(task)
+                        if task in self._active and (mask & selectors.EVENT_READ):
+                            self._on_client_readable(task)
                 except Exception:
                     task.upstream_read_error = True
                     self._finish_task(task)
             if self._active:
-                expired = [t for t in self._active if now_m >= t.progress_deadline]
+                expired = [
+                    t for t in self._active if now_m >= self._task_deadline(t)
+                ]
                 for task in expired:
-                    task.upstream_read_error = True
+                    if task.write_buf and task.write_deadline is not None:
+                        task.downstream_write_error = True
+                    else:
+                        task.upstream_read_error = True
                     self._finish_task(task)
 
         for task in list(self._active):
@@ -2250,7 +2466,7 @@ class _SSEReactor:
             while self._pending:
                 task = self._pending.popleft()
                 task.downstream_write_error = True
-                task.done_event.set()
+                self._finish_task(task)
 
 
 class FreeTPURouterServer(ThreadingHTTPServer):
@@ -2498,12 +2714,17 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         if sock is None:
             return True
         try:
-            readable, _, errored = select.select([sock], [], [sock], 0.0)
-        except (OSError, ValueError):
+            readable, errored = wait_sockets_readable([sock], 0.0)
+        except ValueError:
+            try:
+                return sock.fileno() < 0
+            except (OSError, AttributeError):
+                return True
+        except OSError:
             return True
-        if errored:
+        if sock in errored:
             return True
-        if not readable:
+        if sock not in readable:
             return False
         try:
             peek = sock.recv(1, socket.MSG_PEEK | getattr(socket, "MSG_DONTWAIT", 0))
@@ -3025,7 +3246,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                     )
                     conn.sock = deadline_sock
                 resp = conn.getresponse()
-                upstream_sock = raw_sock
+                upstream_sock = deadline_sock if deadline_sock is not None else raw_sock
 
                 if resp.status in RETRYABLE_STATUS_CODES:
                     # Fail over immediately without waiting to drain a potentially stalled error body.
@@ -3643,30 +3864,6 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 if payload_bytes == b"[DONE]":
                     saw_done_sentinel = True
                     return True, True
-                # Fast passthrough path for ordinary streaming delta chunks once TTFT
-                # is already recorded: skip full JSON decode unless the payload may
-                # carry error, usage, timings, or a non-null finish_reason.
-                if (
-                    first_content_ttft_ms is not None
-                    and not ev_type
-                    and b'"error"' not in payload_bytes
-                    and b'"usage"' not in payload_bytes
-                    and b'"timings"' not in payload_bytes
-                    and b'"object":"error"' not in payload_bytes
-                    and b'"object": "error"' not in payload_bytes
-                    and (
-                        required_choices == 1
-                        and (
-                            b'"finish_reason":null' in payload_bytes
-                            or b'"finish_reason": null' in payload_bytes
-                        )
-                    )
-                ):
-                    est_completion_chars += max(4, len(payload_bytes) // 16)
-                    return (
-                        b'"delta":{}' not in payload_bytes
-                        and b'"delta": {}' not in payload_bytes
-                    ), False
                 try:
                     obj = json.loads(payload_bytes)
                 except UnicodeDecodeError:

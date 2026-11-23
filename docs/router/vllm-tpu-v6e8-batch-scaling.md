@@ -30,8 +30,9 @@ Trillium (`v6e`) uses `256×256` systolic MXUs; reduction/output dimensions alig
 Prevent 15+ minute Spot cold-start recompilation across VM preemptions by persisting XLA artifacts to local NVMe/host disk or GCS:
 
 ```bash
-export XLA_COMPILATION_CACHE_DIR=/var/cache/freetpu-xla-cache
-mkdir -p "$XLA_COMPILATION_CACHE_DIR"
+export JAX_COMPILATION_CACHE_DIR=/var/cache/freetpu-xla-cache
+export VLLM_XLA_CACHE_PATH=/var/cache/freetpu-xla-cache
+mkdir -p "$JAX_COMPILATION_CACHE_DIR"
 # Optional GCS-backed persistent cache for Spot fleets:
 # export LIBTPU_INIT_ARGS="--xla_tpu_enable_persistent_cache=true"
 ```
@@ -51,7 +52,8 @@ CONTAINER_FLAGS=(
   --net=host
   --shm-size=64G
   -v /var/cache/freetpu-xla-cache:/var/cache/freetpu-xla-cache
-  -e XLA_COMPILATION_CACHE_DIR=/var/cache/freetpu-xla-cache
+  -e JAX_COMPILATION_CACHE_DIR=/var/cache/freetpu-xla-cache
+  -e VLLM_XLA_CACHE_PATH=/var/cache/freetpu-xla-cache
 )
 ```
 

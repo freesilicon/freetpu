@@ -11,6 +11,8 @@ import io
 import json
 import os
 from pathlib import Path
+import resource
+import select
 import socket
 import subprocess
 import sys
@@ -19,6 +21,7 @@ import threading
 import time
 import tracemalloc
 import unittest
+from unittest import mock
 from contextlib import redirect_stderr
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -49,10 +52,14 @@ from router.hooks import (  # noqa: E402
     UsageEvent,
 )
 from router.tpu_telemetry import (  # noqa: E402
+    ClientDisconnectedError,
+    DeadlineSocket,
+    _read_bounded_http_body,
     evaluate_tpu_readiness,
     parse_prometheus_text,
     scrape_tpu_exporter,
     summarize_tpu_samples,
+    wait_sockets_readable,
 )
 
 
@@ -6684,6 +6691,755 @@ asyncio.run(main())
                 up_proc.stdout.close()
             up_proc.terminate()
             up_proc.wait(timeout=3)
+
+    def test_slow_sse_client_does_not_block_other_streams_and_evicts_cleanly(self) -> None:
+        stop_srv = threading.Event()
+        srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv_sock.bind(("127.0.0.1", 0))
+        srv_sock.listen(64)
+        srv_sock.settimeout(0.2)
+        up_port = srv_sock.getsockname()[1]
+
+        first_slow = (
+            "data: "
+            + json.dumps(
+                {
+                    "id": "chatcmpl-slow",
+                    "object": "chat.completion.chunk",
+                    "model": "m-slow",
+                    "choices": [
+                        {"index": 0, "delta": {"content": "init"}, "finish_reason": None}
+                    ],
+                }
+            )
+            + "\n\n"
+        ).encode("utf-8")
+        big_slow_chunk = (
+            "data: "
+            + json.dumps(
+                {
+                    "id": "chatcmpl-slow",
+                    "object": "chat.completion.chunk",
+                    "model": "m-slow",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": "S" * 4096},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+            )
+            + "\n\n"
+        ).encode("utf-8")
+        fast_chunks = [
+            (
+                "data: "
+                + json.dumps(
+                    {
+                        "id": "chatcmpl-fast",
+                        "object": "chat.completion.chunk",
+                        "model": "m-fast",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": f"ok{i}"},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                )
+                + "\n\n"
+            ).encode("utf-8")
+            for i in range(3)
+        ] + [b"data: [DONE]\n\n"]
+
+        def handle_conn(conn: socket.socket) -> None:
+            try:
+                conn.settimeout(3.0)
+                buf = b""
+                while b"\r\n\r\n" not in buf:
+                    part = conn.recv(4096)
+                    if not part:
+                        return
+                    buf += part
+                hdr_raw, rest = buf.split(b"\r\n\r\n", 1)
+                hdr_txt = hdr_raw.decode("latin1")
+                if hdr_txt.startswith("GET /v1/models"):
+                    body = json.dumps(
+                        {
+                            "object": "list",
+                            "data": [
+                                {"id": "m-slow", "object": "model"},
+                                {"id": "m-fast", "object": "model"},
+                            ],
+                        }
+                    ).encode("utf-8")
+                    conn.sendall(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                        + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode("ascii")
+                        + body
+                    )
+                    return
+                cl = 0
+                for line in hdr_txt.split("\r\n"):
+                    if line.lower().startswith("content-length:"):
+                        cl = int(line.split(":", 1)[1].strip())
+                while len(rest) < cl:
+                    part = conn.recv(cl - len(rest))
+                    if not part:
+                        break
+                    rest += part
+                req_obj = json.loads(rest[:cl].decode("utf-8"))
+                conn.sendall(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                    b"Cache-Control: no-cache\r\nConnection: close\r\n\r\n"
+                )
+                if req_obj.get("model") == "m-slow":
+                    conn.sendall(first_slow)
+                    for _ in range(512):
+                        if stop_srv.is_set():
+                            return
+                        conn.sendall(big_slow_chunk)
+                        time.sleep(0.002)
+                    conn.sendall(b"data: [DONE]\n\n")
+                else:
+                    for ch in fast_chunks:
+                        conn.sendall(ch)
+            except OSError:
+                pass
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+        def accept_loop() -> None:
+            while not stop_srv.is_set():
+                try:
+                    c, _ = srv_sock.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                threading.Thread(target=handle_conn, args=(c,), daemon=True).start()
+
+        accept_thread = threading.Thread(target=accept_loop, daemon=True)
+        accept_thread.start()
+        slow_sock: Optional[socket.socket] = None
+        try:
+            cfg = RouterConfig(
+                host="127.0.0.1",
+                port=0,
+                policy="lowest_latency",
+                request_timeout_s=5.0,
+                client_read_timeout_s=0.6,
+                backends=[
+                    BackendConfig(
+                        id="sse-backpressure-b",
+                        base_url=f"http://127.0.0.1:{up_port}/v1",
+                        models=["m-slow", "m-fast"],
+                    )
+                ],
+            )
+            router = self._track(create_router_server(cfg))
+            rport = router.server_address[1]
+
+            # Open slow client with a small receive buffer, read only the response headers,
+            # then stop consuming so its TCP send buffer fills inside _SSEReactor.
+            slow_body = json.dumps(
+                {
+                    "model": "m-slow",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "stall me"}],
+                }
+            ).encode("utf-8")
+            slow_sock = socket.create_connection(("127.0.0.1", rport), timeout=3.0)
+            try:
+                slow_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+            except OSError:
+                pass
+            slow_sock.sendall(
+                (
+                    f"POST /v1/chat/completions HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1:{rport}\r\n"
+                    f"Content-Type: application/json\r\n"
+                    f"Content-Length: {len(slow_body)}\r\n"
+                    f"Connection: close\r\n\r\n"
+                ).encode("ascii")
+                + slow_body
+            )
+            slow_hdr = b""
+            while b"\r\n\r\n" not in slow_hdr:
+                part = slow_sock.recv(1024)
+                if not part:
+                    break
+                slow_hdr += part
+            self.assertIn(b"200 OK", slow_hdr)
+
+            # Give the reactor time to fill the stalled client's socket buffer.
+            time.sleep(0.15)
+
+            # Fast SSE streams on the SAME shared reactor must complete promptly without stalling.
+            t0 = time.monotonic()
+            for _ in range(3):
+                st, _, bd = _http_request(
+                    rport,
+                    "POST",
+                    "/v1/chat/completions",
+                    body={
+                        "model": "m-fast",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "fast"}],
+                    },
+                )
+                self.assertEqual(st, 200)
+                self.assertIn(b"data: [DONE]", bd)
+            fast_elapsed = time.monotonic() - t0
+            self.assertLess(fast_elapsed, 0.5)
+
+            # Wait for the stalled slow client to be evicted on its write_deadline
+            # (still connected!) without penalizing the healthy backend or leaking slots/memory.
+            deadline = time.monotonic() + 2.5
+            while time.monotonic() < deadline:
+                _, health = router.engine.health_payload()
+                if health["active_inflight"] == 0 and router.engine._resp_mem_used_bytes == 0:
+                    break
+                time.sleep(0.05)
+            _, health = router.engine.health_payload()
+            self.assertEqual(health["active_inflight"], 0)
+            self.assertEqual(router.engine._resp_mem_used_bytes, 0)
+            self.assertTrue(router.engine._backends[0].healthy)
+            self.assertEqual(router.engine._backends[0].cooldown_until_monotonic, 0.0)
+        finally:
+            stop_srv.set()
+            if slow_sock is not None:
+                try:
+                    slow_sock.close()
+                except OSError:
+                    pass
+            try:
+                srv_sock.close()
+            except OSError:
+                pass
+            accept_thread.join(timeout=2.0)
+
+    def test_streaming_usage_fallback_uses_generated_content_not_raw_json_length(
+        self,
+    ) -> None:
+        recorded: List[UsageEvent] = []
+
+        class _CaptureUsageHook:
+            def record_usage(self, event: UsageEvent) -> None:
+                recorded.append(event)
+
+        huge_id = "chatcmpl-" + ("x" * 2048)
+        huge_fp = "fp_" + ("z" * 1024)
+        huge_logprobs = {
+            "content": [
+                {
+                    "token": "Hi",
+                    "logprob": -0.05,
+                    "bytes": [72, 105],
+                    "top_logprobs": [{"token": "Hello", "logprob": -1.5}] * 16,
+                }
+            ]
+        }
+        # Exact generated characters: "Hi" (2) + " there" (6) + "plan" (4) + "get" (3) + "{}" (2) = 17 chars -> 5 tokens.
+        sse_chunks = [
+            {
+                "id": huge_id,
+                "object": "chat.completion.chunk",
+                "created": 1700000001,
+                "model": "m-usage-est",
+                "system_fingerprint": huge_fp,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": "Hi"},
+                        "logprobs": huge_logprobs,
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            {
+                "id": huge_id,
+                "object": "chat.completion.chunk",
+                "created": 1700000002,
+                "model": "m-usage-est",
+                "system_fingerprint": huge_fp,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
+            },
+            {
+                "id": huge_id,
+                "object": "chat.completion.chunk",
+                "created": 1700000003,
+                "model": "m-usage-est",
+                "system_fingerprint": huge_fp,
+                "choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": None}],
+            },
+            {
+                "id": huge_id,
+                "object": "chat.completion.chunk",
+                "created": 1700000004,
+                "model": "m-usage-est",
+                "system_fingerprint": huge_fp,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": " there"},
+                        "logprobs": huge_logprobs,
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            {
+                "id": huge_id,
+                "object": "chat.completion.chunk",
+                "created": 1700000005,
+                "model": "m-usage-est",
+                "system_fingerprint": huge_fp,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"reasoning_content": "plan"},
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            {
+                "id": huge_id,
+                "object": "chat.completion.chunk",
+                "created": 1700000006,
+                "model": "m-usage-est",
+                "system_fingerprint": huge_fp,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"name": "get", "arguments": "{}"},
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            {
+                "id": huge_id,
+                "object": "chat.completion.chunk",
+                "created": 1700000007,
+                "model": "m-usage-est",
+                "system_fingerprint": huge_fp,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            },
+        ]
+        backend = self._track(
+            _MockOpenAIBackend(
+                "usage-est-b",
+                ["m-usage-est"],
+                custom_sse_chunks=sse_chunks,
+            )
+        )
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            backends=[
+                BackendConfig(
+                    id="usage-est-b",
+                    base_url=backend.base_url,
+                    models=["m-usage-est"],
+                    cost_per_1m_prompt_usd=1.0,
+                    cost_per_1m_completion_usd=2.0,
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg, usage_hook=_CaptureUsageHook()))
+        rport = router.server_address[1]
+
+        st, _, bd = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-usage-est",
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        self.assertEqual(st, 200)
+        self.assertIn(b"data: [DONE]", bd)
+        self.assertEqual(len(recorded), 1)
+        ev = recorded[0]
+        self.assertEqual(ev.completion_tokens, 5)
+        expected_cost = (ev.prompt_tokens * 1.0 + 5 * 2.0) / 1_000_000.0
+        self.assertAlmostEqual(ev.estimated_cost_usd, expected_cost, places=12)
+
+        # Also verify `/v1/completions` streaming with `choice.text` + huge metadata.
+        recorded.clear()
+        backend.custom_sse_chunks = [
+            {
+                "id": huge_id,
+                "object": "text_completion",
+                "created": 1700000010,
+                "model": "m-usage-est",
+                "choices": [{"index": 0, "text": "abcd", "finish_reason": None}],
+            },
+            {
+                "id": huge_id,
+                "object": "text_completion",
+                "created": 1700000011,
+                "model": "m-usage-est",
+                "choices": [{"index": 0, "text": "efgh", "finish_reason": "stop"}],
+            },
+        ]
+        st2, _, bd2 = _http_request(
+            rport,
+            "POST",
+            "/v1/completions",
+            body={"model": "m-usage-est", "stream": True, "prompt": "go"},
+        )
+        self.assertEqual(st2, 200)
+        self.assertIn(b"data: [DONE]", bd2)
+        self.assertEqual(len(recorded), 1)
+        self.assertEqual(recorded[0].completion_tokens, 2)
+
+    def test_high_fd_client_preserves_failover_without_select_select(self) -> None:
+        primary = self._track(
+            _MockOpenAIBackend("highfd-primary", ["m-highfd"], status_code=200)
+        )
+        backup = self._track(_MockOpenAIBackend("highfd-backup", ["m-highfd"]))
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            backends=[
+                BackendConfig(
+                    id="highfd-primary",
+                    local=True,
+                    base_url=primary.base_url,
+                    models=["m-highfd"],
+                ),
+                BackendConfig(
+                    id="highfd-backup",
+                    local=False,
+                    base_url=backup.base_url,
+                    models=["m-highfd"],
+                ),
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+        # Flip primary to 503 after initial health probe so the request hits primary first
+        # and exercises _is_client_disconnected() before failing over to backup.
+        primary.status_code = 503
+
+        def _forbid_select(*args: Any, **kwargs: Any) -> Any:
+            raise ValueError("filedescriptor out of range in select()")
+
+        with mock.patch.object(select, "select", side_effect=_forbid_select):
+            st, hdrs, bd = _http_request(
+                rport,
+                "POST",
+                "/v1/chat/completions",
+                body={
+                    "model": "m-highfd",
+                    "messages": [{"role": "user", "content": "failover"}],
+                },
+            )
+        self.assertEqual(st, 200)
+        self.assertEqual(hdrs["x-freetpu-backend"], "highfd-backup")
+        self.assertEqual(hdrs["x-freetpu-failovers"], "1")
+        self.assertIn(b"highfd-backup", bd)
+
+    def test_tpu_v6e8_playbook_uses_supported_jax_and_vllm_cache_vars(self) -> None:
+        playbook = (
+            REPO_ROOT / "docs/router/vllm-tpu-v6e8-batch-scaling.md"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("XLA_COMPILATION_CACHE_DIR", playbook)
+        self.assertIn(
+            "export JAX_COMPILATION_CACHE_DIR=/var/cache/freetpu-xla-cache",
+            playbook,
+        )
+        self.assertIn(
+            "export VLLM_XLA_CACHE_PATH=/var/cache/freetpu-xla-cache",
+            playbook,
+        )
+        self.assertIn(
+            "-e JAX_COMPILATION_CACHE_DIR=/var/cache/freetpu-xla-cache",
+            playbook,
+        )
+        self.assertIn(
+            "-e VLLM_XLA_CACHE_PATH=/var/cache/freetpu-xla-cache",
+            playbook,
+        )
+
+    def test_deadline_socket_waits_support_high_fds_without_select_select(self) -> None:
+        def _forbid_select(*args: Any, **kwargs: Any) -> Any:
+            raise ValueError("filedescriptor out of range in select()")
+
+        # 1. Upstream-only wait path (client_sock=None) works without select.select().
+        up_r, up_w = socket.socketpair()
+        try:
+            def _delayed_send() -> None:
+                time.sleep(0.05)
+                up_w.sendall(b"hello")
+
+            threading.Thread(target=_delayed_send, daemon=True).start()
+            with mock.patch.object(select, "select", side_effect=_forbid_select):
+                ds = DeadlineSocket(up_r, time.monotonic() + 1.0, label="test-up")
+                fp = ds.makefile("rb")
+                try:
+                    self.assertEqual(fp.read(5), b"hello")
+                finally:
+                    fp.close()
+        finally:
+            up_r.close()
+            up_w.close()
+
+        # 2. Client-watch wait path works for both normal reads and client disconnect.
+        up_r2, up_w2 = socket.socketpair()
+        cli_r2, cli_w2 = socket.socketpair()
+        try:
+            def _close_client() -> None:
+                time.sleep(0.05)
+                cli_w2.close()
+
+            threading.Thread(target=_close_client, daemon=True).start()
+            with mock.patch.object(select, "select", side_effect=_forbid_select):
+                ds2 = DeadlineSocket(
+                    up_r2,
+                    time.monotonic() + 1.0,
+                    label="test-watch",
+                    client_sock=cli_r2,
+                )
+                fp2 = ds2.makefile("rb")
+                try:
+                    with self.assertRaises(ClientDisconnectedError):
+                        fp2.read(5)
+                finally:
+                    fp2.close()
+        finally:
+            up_r2.close()
+            up_w2.close()
+            cli_r2.close()
+            cli_w2.close()
+
+        # 3. Real OS FD >= 1024 test when RLIMIT_NOFILE permits.
+        soft_lim, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft_lim > 1060 and hasattr(select, "poll"):
+            s_r, s_w = socket.socketpair()
+            high_fd: Optional[int] = None
+            high_sock: Optional[socket.socket] = None
+            try:
+                for cand_fd in range(1040, min(soft_lim - 4, 1080)):
+                    try:
+                        os.fstat(cand_fd)
+                        continue
+                    except OSError:
+                        os.dup2(s_r.fileno(), cand_fd)
+                        high_fd = cand_fd
+                        break
+                if high_fd is not None:
+                    high_sock = socket.socket(fileno=high_fd)
+                    high_fd = None
+                    self.assertGreaterEqual(high_sock.fileno(), 1024)
+                    s_w.sendall(b"ok")
+                    readable, errored = wait_sockets_readable([high_sock], 0.5)
+                    self.assertIn(high_sock, readable)
+                    self.assertFalse(errored)
+                    self.assertEqual(high_sock.recv(2), b"ok")
+            finally:
+                if high_sock is not None:
+                    high_sock.close()
+                if high_fd is not None:
+                    os.close(high_fd)
+                s_r.close()
+                s_w.close()
+
+    def test_scrape_tpu_exporter_enforces_deadline_across_multi_addr_and_tls(
+        self,
+    ) -> None:
+        # Part A: multi-address hostname where each candidate stalls must not multiply timeout.
+        recorded_timeouts: List[Optional[float]] = []
+
+        class _StallingConnectSocket:
+            def __init__(self, af: int, stype: int, proto: int) -> None:
+                self._timeout: Optional[float] = None
+
+            def settimeout(self, t: Optional[float]) -> None:
+                self._timeout = t
+                recorded_timeouts.append(t)
+
+            def connect(self, sa: Any) -> None:
+                sleep_s = min(0.18, self._timeout if self._timeout is not None else 0.18)
+                time.sleep(max(0.0, sleep_s))
+                raise TimeoutError("simulated connect stall")
+
+            def close(self) -> None:
+                pass
+
+        fake_infos = [
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("203.0.113.1", 9400)),
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("203.0.113.2", 9400)),
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("203.0.113.3", 9400)),
+        ]
+        t0 = time.monotonic()
+        with (
+            mock.patch.object(socket, "getaddrinfo", return_value=fake_infos),
+            mock.patch.object(socket, "socket", side_effect=_StallingConnectSocket),
+        ):
+            telem = scrape_tpu_exporter(
+                "http://multi.tpu.test:9400/metrics", timeout_s=0.30
+            )
+        elapsed = time.monotonic() - t0
+        self.assertFalse(telem.reachable)
+        self.assertEqual(telem.error, "exporter_scrape_timeout")
+        self.assertLess(elapsed, 0.55)
+        self.assertGreaterEqual(len(recorded_timeouts), 2)
+        self.assertLess(recorded_timeouts[1], recorded_timeouts[0])
+
+        # Part B: HTTPS server that accepts TCP and stalls during TLS handshake.
+        tls_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        tls_srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        tls_srv.bind(("127.0.0.1", 0))
+        tls_srv.listen(4)
+        tls_port = tls_srv.getsockname()[1]
+        accepted: List[socket.socket] = []
+
+        def _stall_tls() -> None:
+            try:
+                c, _ = tls_srv.accept()
+                accepted.append(c)
+                time.sleep(2.0)
+            except OSError:
+                pass
+
+        tls_thread = threading.Thread(target=_stall_tls, daemon=True)
+        tls_thread.start()
+        try:
+            t1 = time.monotonic()
+            telem_tls = scrape_tpu_exporter(
+                f"https://127.0.0.1:{tls_port}/metrics", timeout_s=0.25
+            )
+            elapsed_tls = time.monotonic() - t1
+            self.assertFalse(telem_tls.reachable)
+            self.assertEqual(telem_tls.error, "exporter_scrape_timeout")
+            self.assertLess(elapsed_tls, 0.65)
+        finally:
+            for c in accepted:
+                try:
+                    c.close()
+                except OSError:
+                    pass
+            tls_srv.close()
+            tls_thread.join(timeout=2.5)
+
+    def test_scrape_tpu_exporter_keeps_plain_http_body_socket_nonblocking(self) -> None:
+        # Chunked response that delivers its chunk header near the deadline, then stalls payload.
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        port = srv.getsockname()[1]
+        accepted: List[socket.socket] = []
+
+        def _serve_stalled_chunk() -> None:
+            try:
+                c, _ = srv.accept()
+                accepted.append(c)
+                c.settimeout(1.0)
+                buf = b""
+                while b"\r\n\r\n" not in buf:
+                    part = c.recv(1024)
+                    if not part:
+                        return
+                    buf += part
+                c.sendall(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: text/plain\r\n"
+                    b"Transfer-Encoding: chunked\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+                # Send chunk size header near the 0.30s deadline, then stall chunk payload.
+                time.sleep(0.20)
+                c.sendall(b"a\r\n")
+                time.sleep(1.5)
+            except OSError:
+                pass
+
+        t = threading.Thread(target=_serve_stalled_chunk, daemon=True)
+        t.start()
+        try:
+            t0 = time.monotonic()
+            telem = scrape_tpu_exporter(
+                f"http://127.0.0.1:{port}/metrics", timeout_s=0.30
+            )
+            elapsed = time.monotonic() - t0
+            self.assertFalse(telem.reachable)
+            self.assertEqual(telem.error, "exporter_scrape_timeout")
+            self.assertLess(elapsed, 0.50)
+        finally:
+            for c in accepted:
+                try:
+                    c.close()
+                except OSError:
+                    pass
+            srv.close()
+            t.join(timeout=2.0)
+
+        # Directly confirm _read_bounded_http_body never sets a positive timeout on the raw socket
+        # once DeadlineSocket/_DeadlineSocketIO has configured nonblocking mode.
+        r_sock, w_sock = socket.socketpair()
+        settimeout_calls: List[Optional[float]] = []
+
+        class _SpySocket:
+            def __init__(self, inner: socket.socket) -> None:
+                self._inner = inner
+
+            def settimeout(self, val: Optional[float]) -> None:
+                settimeout_calls.append(val)
+                self._inner.settimeout(val)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._inner, name)
+
+        try:
+            w_sock.sendall(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: text/plain\r\n"
+                b"Content-Length: 5\r\n"
+                b"Connection: close\r\n\r\nhello"
+            )
+            w_sock.close()
+            spy = _SpySocket(r_sock)
+            ds = DeadlineSocket(spy, time.monotonic() + 1.0, label="spy-body")
+            resp = http.client.HTTPResponse(ds)
+            resp.begin()
+            try:
+                body = _read_bounded_http_body(resp, ds, deadline=time.monotonic() + 1.0)
+            finally:
+                resp.close()
+            self.assertEqual(body, b"hello")
+            self.assertEqual(settimeout_calls, [0.0])
+        finally:
+            r_sock.close()
+
+    def test_scrape_tpu_exporter_invalid_url_syntax_returns_unreachable(self) -> None:
+        for bad_url in (
+            "http://[::1:9100/metrics",
+            "http://[bad]host/metrics",
+        ):
+            telem = scrape_tpu_exporter(bad_url, timeout_s=0.5)
+            self.assertFalse(telem.reachable)
+            self.assertFalse(telem.exporter_up)
+            self.assertIn("Invalid tpu_exporter_url", telem.error or "")
 
 
 def run_self_tests(verbosity: int = 1) -> int:
