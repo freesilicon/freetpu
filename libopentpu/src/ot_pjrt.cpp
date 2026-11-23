@@ -879,6 +879,26 @@ bool is_supported_dense_layout(const PJRT_Buffer_MemoryLayout* layout,
   return false;
 }
 
+bool is_supported_tiled_2x128_layout(const PJRT_Buffer_MemoryLayout* layout,
+                                     PJRT_Buffer_Type dtype,
+                                     const int64_t* dims, size_t num_dims) {
+  if (!layout || layout->type != PJRT_Buffer_MemoryLayout_Type_Tiled) return false;
+  if (dtype != PJRT_Buffer_Type_BF16 || num_dims != 2u || !dims ||
+      dims[0] != 128 || dims[1] != 128) {
+    return false;
+  }
+  if (layout->tiled.minor_to_major_size != 2u || !layout->tiled.minor_to_major ||
+      layout->tiled.minor_to_major[0] != 1 || layout->tiled.minor_to_major[1] != 0) {
+    return false;
+  }
+  if (layout->tiled.num_tiles != 1u || !layout->tiled.tile_dim_sizes || !layout->tiled.tile_dims) {
+    return false;
+  }
+  return layout->tiled.tile_dim_sizes[0] == 2u &&
+         layout->tiled.tile_dims[0] == 2 &&
+         layout->tiled.tile_dims[1] == 128;
+}
+
 PJRT_Error* upload_strided_host_buffer(ot_context_t* ctx, ot_buffer_t* dst_buf,
                                        const void* data, const int64_t* dims, size_t num_dims,
                                        const int64_t* byte_strides, size_t elem_sz,
@@ -1576,10 +1596,13 @@ PJRT_Error* ot_pjrt_buffer_from_host_buffer(PJRT_Client_BufferFromHostBuffer_Arg
       return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "invalid byte_strides");
     }
   }
-  if (args->device_layout &&
+  const bool explicit_tiled_2x128 =
+      args->device_layout &&
+      is_supported_tiled_2x128_layout(args->device_layout, args->type, args->dims, args->num_dims);
+  if (args->device_layout && !explicit_tiled_2x128 &&
       !is_supported_dense_layout(args->device_layout, args->dims, args->num_dims, elem_sz)) {
     return make_err(PJRT_Error_Code_UNIMPLEMENTED,
-                    "unsupported device_layout (dense row-major only)");
+                    "unsupported device_layout (dense row-major or 128x128 bf16 {1,0:T(2,128)} only)");
   }
 
   if (elems > 0 && !args->data) {
@@ -1604,7 +1627,19 @@ PJRT_Error* ot_pjrt_buffer_from_host_buffer(PJRT_Client_BufferFromHostBuffer_Arg
         return up_err;
       }
     } else {
-      st = ot_buffer_h2d(args->client->ctx, ot_buf, args->data, logical_bytes);
+      // Use native TPU {1,0:T(2,128)} tiled storage by default (device_layout == nullptr)
+      // or when explicitly requested, avoiding dispatch-time D2H/H2D repack overhead on live
+      // 128x128 BF16 matmul; honor explicit dense device_layout with raw row-major storage.
+      const bool is_128x128_bf16 =
+          (args->type == PJRT_Buffer_Type_BF16 && args->num_dims == 2u &&
+           args->dims[0] == 128 && args->dims[1] == 128);
+      const bool use_tiled_upload =
+          is_128x128_bf16 && (args->device_layout == nullptr || explicit_tiled_2x128);
+      if (use_tiled_upload) {
+        st = ot::buffer_h2d_tiled_128x128_bf16(args->client->ctx, ot_buf, args->data);
+      } else {
+        st = ot_buffer_h2d(args->client->ctx, ot_buf, args->data, logical_bytes);
+      }
       if (st != OT_OK) {
         ot_buffer_free(ot_buf);
         return make_ot_err(args->client->ctx, st);
@@ -2052,6 +2087,14 @@ PJRT_Error* ot_pjrt_buf_mem_layout(PJRT_Buffer_GetMemoryLayout_Args* args) {
   args->layout.tiled.struct_size = PJRT_Buffer_MemoryLayout_Tiled_STRUCT_SIZE;
   args->layout.tiled.minor_to_major = args->buffer->minor_to_major.data();
   args->layout.tiled.minor_to_major_size = args->buffer->minor_to_major.size();
+  if (!args->buffer->deleted && args->buffer->ot_buf &&
+      args->buffer->ot_buf->layout == ot::BufferLayout::kTiled2x128Bf16) {
+    static const int64_t kTileDims2x128[2] = {2, 128};
+    static const size_t kTileDimSizes2x128[1] = {2};
+    args->layout.tiled.tile_dims = kTileDims2x128;
+    args->layout.tiled.tile_dim_sizes = kTileDimSizes2x128;
+    args->layout.tiled.num_tiles = 1;
+  }
   return nullptr;
 }
 

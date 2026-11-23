@@ -201,9 +201,15 @@ std::string mapped_basename(const std::string& maps_line) {
   return (slash == std::string::npos) ? path : path.substr(slash + 1);
 }
 
-bool check_maps_clean(const char* tag) {
+bool check_maps_clean(const char* tag, bool mock_mode) {
   std::ifstream ifs("/proc/self/maps");
   if (!ifs.is_open()) {
+    if (!mock_mode) {
+      fprintf(stderr,
+              "[%s] ERROR: /proc/self/maps unreadable in live mode; cannot verify MAPS_LIBTPU=0 MAPS_LIBPYTHON=0\n",
+              tag);
+      return false;
+    }
     printf("[%s] MAPS_CHECK=SKIPPED (/proc/self/maps unavailable on this host)\n", tag);
     return true;
   }
@@ -621,7 +627,7 @@ bool run_pjrt_api_proof(void* lib, bool mock_mode, int num_runs) {
     }
   }
 
-  bool maps_ok = check_maps_clean("PJRT_ACTIVE");
+  bool maps_ok = check_maps_clean("PJRT_ACTIVE", mock_mode);
   cleanup_client();
   return ok && maps_ok;
 }
@@ -656,7 +662,7 @@ int main(int argc, char** argv) {
   printf("Loaded libopentpu via dlopen: %s\n", resolved.c_str());
 
   bool c_ok = run_c_api_proof(lib_a, mock_mode, num_runs);
-  bool maps_a_ok = check_maps_clean("C_API_DONE");
+  bool maps_a_ok = check_maps_clean("C_API_DONE", mock_mode);
   dlclose(lib_a);
   if (!c_ok || !maps_a_ok) return 3;
 
@@ -667,7 +673,7 @@ int main(int argc, char** argv) {
   dlclose(lib_b);
   if (!pjrt_ok) return 5;
 
-  if (!check_maps_clean("FINAL")) return 6;
+  if (!check_maps_clean("FINAL", mock_mode)) return 6;
   printf("OPENTPU_MATMUL_PROOF_PASSED (mock=%d runs=%d)\n", mock_mode ? 1 : 0, num_runs);
   return 0;
 }
