@@ -845,13 +845,16 @@ _PY_METRICS_SUBPROCESS_HELPER = (
     "import inspect, json, sys, tpu_info.device as d, tpu_info.metrics as m\n"
     "chip_attr, addr, timeout_s = sys.argv[1], sys.argv[2], float(sys.argv[3])\n"
     "chip = getattr(d.TpuChip, chip_attr)\n"
-    "sig = inspect.signature(m.get_chip_usage)\n"
+    "fn = getattr(m, 'get_chip_usage_new', None) if chip_attr == 'V7X' else None\n"
+    "if not callable(fn):\n"
+    "    fn = m.get_chip_usage\n"
+    "sig = inspect.signature(fn)\n"
     "kw = {}\n"
     "if 'addr' in sig.parameters:\n"
     "    kw['addr'] = addr\n"
     "if 'timeout' in sig.parameters:\n"
     "    kw['timeout'] = timeout_s\n"
-    "rows = m.get_chip_usage(chip, **kw)\n"
+    "rows = fn(chip, **kw)\n"
     "out = [\n"
     "    {\n"
     "        'device_id': getattr(r, 'device_id', None),\n"
@@ -974,7 +977,13 @@ def _query_tpu_info_python_metrics(
     cached_metrics_mod = sys.modules.get("tpu_info.metrics")
     if cached_metrics_mod is not None and not getattr(cached_metrics_mod, "__file__", None):
         tpu_device_mod = sys.modules.get("tpu_info.device")
-        get_chip_usage = getattr(cached_metrics_mod, "get_chip_usage", None)
+        get_chip_usage = (
+            getattr(cached_metrics_mod, "get_chip_usage_new", None)
+            if chip_attr == "V7X"
+            else None
+        )
+        if not callable(get_chip_usage):
+            get_chip_usage = getattr(cached_metrics_mod, "get_chip_usage", None)
         tpu_chip_enum = getattr(tpu_device_mod, "TpuChip", None) if tpu_device_mod is not None else None
         if not callable(get_chip_usage) or tpu_chip_enum is None or not hasattr(tpu_chip_enum, chip_attr):
             return False, "tpu_info.metrics.get_chip_usage unavailable", {}
@@ -1309,21 +1318,33 @@ def _verified_dual_function_chip_count(
     return chip_count if chip_count >= 4 else None
 
 
+VALID_GRPC_DUTY_LAYOUTS = ("auto", "per-chip", "per-core")
+
+
 def _query_grpc_runtime_metrics(
     devices: Sequence[TpuTelemetry],
     addr: Optional[str] = "127.0.0.1:8431",
     timeout_s: float = 5.0,
+    grpc_duty_layout: str = "auto",
 ) -> Tuple[bool, Optional[str], Dict[str, _TpuInfoRow]]:
     """Query `libtpu` RuntimeMetricService directly in-process over gRPC (`localhost:8431`).
 
     Eliminates `tpu-info` CLI/Python subprocess churn and works cleanly when
-    `grpcio` and `tpu_metric_service` proto stubs are installed. Joins per-core
-    duty cycle directly on single-device-per-chip generations (`v5e`, `v6e`,
-    `v5p`, `v4`) and on verified complete dual-function hosts when duty IDs
-    exceed the physical chip count; preserves ambiguous readings in the
-    separate unjoined series without duplicating across unreported cores.
+    `grpcio` and `tpu_metric_service` proto stubs are installed. In `auto` mode,
+    joins per-core duty cycle directly on single-device-per-chip generations
+    (`v5e`, `v6e`, `v5p`, `v4`) and on verified complete dual-function hosts
+    when duty IDs prove `per_core` via pigeonhole (`len(raw_duty_ids) >
+    verified_chip_count`); expands legacy `v2`/`v3` per-chip replies only when
+    verified full-host coverage matches; and retains ambiguous Ironwood (`tpu7x`)
+    or sidecar replies in the separate unjoined series unless an explicit
+    `--grpc-duty-layout` (`per-core` or `per-chip`) is configured.
     Falls back gracefully when `grpcio` or proto stubs are unavailable.
     """
+    if grpc_duty_layout not in VALID_GRPC_DUTY_LAYOUTS:
+        raise ValueError(
+            f"Invalid --grpc-duty-layout {grpc_duty_layout!r}; "
+            f"expected one of {', '.join(VALID_GRPC_DUTY_LAYOUTS)}"
+        )
     if not addr:
         return False, "runtime metrics gRPC address disabled", {}
 
@@ -1399,27 +1420,38 @@ def _query_grpc_runtime_metrics(
 
     # Join duty-cycle readings with per-core HBM rows using ALL raw response IDs
     # collected BEFORE filtering unset/NaN/negative gauges:
-    # - When `devices_per_chip is None` (e.g. sidecar without `/sys/bus/pci`
-    #   inventory or mixed/unrecognized generations), NEVER assume 1:1 joins;
-    #   treat as `ambiguous` and publish raw readings in the separate unjoined series.
-    # - On `devices_per_chip == 1` generations (v5e, v6e, v5p, v4), always join 1:1.
-    # - On `devices_per_chip > 1` generations (Ironwood tpu7x, v2/v3), require a
-    #   complete verified sibling PCI inventory (`verified_chip_count >= 4`, zero
-    #   unpaired functions):
-    #   1. If `len(raw_duty_int_ids) > verified_chip_count`, pigeonhole proves
-    #      1:1 `per_core` layout (e.g. 8 raw duty IDs on a 4-chip host, even if
-    #      some cores reported NaN/unset gauges or partial HBM).
-    #   2. Else if BOTH chip and core coverage are complete (`len(raw_duty_int_ids)
-    #      == verified_chip_count`, `len(all_hbm_core_ids) == verified_chip_count *
-    #      devices_per_chip`, AND `expanded(raw_duty_int_ids) == all_hbm_core_ids`),
-    #      apply upstream `libtpu` / `tpu_info` documented per-chip expansion
-    #      (`chip c -> cores c * devices_per_chip + offset`) directly over gRPC
-    #      without spawning fallback subprocesses.
-    #   3. Otherwise (incomplete PCI inventory, partial/missing HBM, partial/offset
-    #      duty IDs, or sidecar without PCI inventory), treat as `ambiguous`: keep
-    #      raw duty readings in `freetpu_tpu_runtime_unjoined_duty_cycle_percent`
-    #      and allow fallback to run within the remaining scrape budget.
-    if devices_per_chip is None:
+    # - Explicit `--grpc-duty-layout=per-core` joins 1:1 directly.
+    # - Explicit `--grpc-duty-layout=per-chip` expands `chip c -> c * dpc + off`
+    #   when `devices_per_chip` is known from PCI inventory (otherwise remains
+    #   `ambiguous` so we never guess a multiplier).
+    # - In default `auto` mode:
+    #   - When `devices_per_chip is None` (sidecar without `/sys/bus/pci` or
+    #     mixed/unrecognized generations), keep readings `ambiguous` (unjoined).
+    #   - On `devices_per_chip == 1` generations (`v5e`, `v6e`, `v5p`, `v4`),
+    #     always join 1:1.
+    #   - On Ironwood (`tpu7x`, `devices_per_chip == 2`), upstream `tpu-info`
+    #     uses the per-device path (`metrics.get_chip_usage_new`), so a 4-ID
+    #     duty reply `{0..3}` alongside 8 HBM IDs `{0..7}` is ambiguous with a
+    #     partial per-core reply. Join `per_core` ONLY when a verified complete
+    #     sibling PCI inventory (`verified_chip_count >= 4`, zero unpaired
+    #     functions) proves `len(raw_duty_int_ids) > verified_chip_count` via
+    #     pigeonhole; never auto-expand `tpu7x` per-chip without explicit
+    #     `--grpc-duty-layout=per-chip`.
+    #   - On legacy `v2`/`v3` (where `discover_tpu_devices` collapses dual-
+    #     function 0x0027 into one record per physical chip and upstream
+    #     `metrics.get_chip_usage` strictly expands per chip), allow full-host
+    #     per-chip expansion when `len(raw_duty_int_ids) == len(devices) >= 4`
+    #     and `expanded(raw_duty_int_ids) == all_hbm_core_ids`.
+    if grpc_duty_layout == "per-core":
+        duty_layout = "per_core"
+    elif grpc_duty_layout == "per-chip":
+        if devices_per_chip is None:
+            duty_layout = "ambiguous"
+        elif devices_per_chip == 1:
+            duty_layout = "per_core"
+        else:
+            duty_layout = "per_chip"
+    elif devices_per_chip is None:
         duty_layout = "ambiguous"
     elif devices_per_chip == 1:
         duty_layout = "per_core"
@@ -1435,21 +1467,30 @@ def _query_grpc_runtime_metrics(
                     for hid in (_parse_runtime_device_id(k),)
                     if hid is not None
                 }
+                known_gens = {
+                    d.generation
+                    for d in devices
+                    if d.generation in _GEN_DEVICES_PER_CHIP
+                }
                 verified_chip_count = _verified_dual_function_chip_count(
                     devices, devices_per_chip
                 )
                 if verified_chip_count is not None:
-                    verified_core_count = verified_chip_count * devices_per_chip
+                    if len(raw_duty_int_ids) > verified_chip_count:
+                        duty_layout = "per_core"
+                elif known_gens and known_gens <= {"v2", "v3", "v2-v3"} and len(devices) >= 4:
+                    legacy_chip_count = len(devices)
+                    legacy_core_count = legacy_chip_count * devices_per_chip
                     expanded_raw = {
                         cid * devices_per_chip + off
                         for cid in raw_duty_int_ids
                         for off in range(devices_per_chip)
                     }
-                    if len(raw_duty_int_ids) > verified_chip_count:
+                    if len(raw_duty_int_ids) > legacy_chip_count:
                         duty_layout = "per_core"
                     elif (
-                        len(raw_duty_int_ids) == verified_chip_count
-                        and len(all_hbm_core_ids) == verified_core_count
+                        len(raw_duty_int_ids) == legacy_chip_count
+                        and len(all_hbm_core_ids) == legacy_core_count
                         and expanded_raw == all_hbm_core_ids
                     ):
                         duty_layout = "per_chip"
@@ -2166,6 +2207,7 @@ def collect_snapshot(
     *,
     skip_pid_scan: bool = False,
     runtime_metrics_addr: Optional[str] = DEFAULT_RUNTIME_METRICS_ADDR,
+    grpc_duty_layout: str = "auto",
     shm_root: Optional[Path] = DEFAULT_SHM_ROOT,
     shm_trusted_uids: Optional[Sequence[int]] = None,
     shm_max_age_s: float = DEFAULT_SHM_MAX_AGE_S,
@@ -2174,6 +2216,11 @@ def collect_snapshot(
     gcp_metadata_timeout_s: float = 0.5,
 ) -> ExporterSnapshot:
     """Collect PCI/VFIO discovery, SeqLock SHM, AER counters, optional procfs PIDs, and gRPC/`tpu-info` metrics."""
+    if grpc_duty_layout not in VALID_GRPC_DUTY_LAYOUTS:
+        raise ValueError(
+            f"Invalid --grpc-duty-layout {grpc_duty_layout!r}; "
+            f"expected one of {', '.join(VALID_GRPC_DUTY_LAYOUTS)}"
+        )
     t0 = time.monotonic()
     devices = discover_tpu_devices(sysfs_root=sysfs_root, dev_root=dev_root)
     shared_vfio = _shared_vfio_paths(devices)
@@ -2220,6 +2267,7 @@ def collect_snapshot(
             devices,
             addr=runtime_metrics_addr,
             timeout_s=grpc_budget_s,
+            grpc_duty_layout=grpc_duty_layout,
         )
         if parsed_rows:
             parsed_rows = _tag_row_sources(parsed_rows, "libtpu-grpc")
@@ -2269,6 +2317,7 @@ def collect_snapshot(
                 devices,
                 addr=runtime_metrics_addr,
                 timeout_s=grpc_budget_s,
+                grpc_duty_layout=grpc_duty_layout,
             )
             if parsed_rows:
                 parsed_rows = _tag_row_sources(parsed_rows, "libtpu-grpc")
@@ -2424,15 +2473,33 @@ def collect_snapshot(
         for key, row in util_rows.items()
         if row.unjoined_duty_cycle_percent is not None
     }
-    joined_duty_count = sum(1 for r in util_rows.values() if r.duty_cycle_percent is not None)
-    all_util_rows_have_joined_duty = (
-        bool(util_rows)
-        and joined_duty_count == len(util_rows)
-        and joined_duty_count >= len(unjoined_duty_candidates)
-    )
-    runtime_unjoined_duty: Dict[str, float] = (
-        {} if all_util_rows_have_joined_duty else unjoined_duty_candidates
-    )
+    joined_duty_keys: set[str] = {
+        key for key, row in util_rows.items() if row.duty_cycle_percent is not None
+    }
+    inferred_dpc = _infer_devices_per_chip(devices)
+
+    def _is_unjoined_duty_covered(raw_key: str) -> bool:
+        """Return True ONLY when fallback joined rows provably cover `raw_key`
+        under BOTH per-core (`raw_id`) and per-chip (`raw_id * dpc + offset`)
+        interpretations using a verified PCI `devices_per_chip` multiplier.
+        """
+        if inferred_dpc is None or inferred_dpc < 1:
+            return False
+        raw_id = _parse_runtime_device_id(raw_key)
+        if raw_id is None:
+            return False
+        if str(raw_id) not in joined_duty_keys:
+            return False
+        return all(
+            str(raw_id * inferred_dpc + off) in joined_duty_keys
+            for off in range(inferred_dpc)
+        )
+
+    runtime_unjoined_duty: Dict[str, float] = {
+        key: val
+        for key, val in unjoined_duty_candidates.items()
+        if not _is_unjoined_duty_covered(key)
+    }
 
     gcp_preempted: Optional[int] = None
     if gcp_metadata_preemption:
@@ -2571,10 +2638,18 @@ def format_prometheus_metrics(snapshot: ExporterSnapshot) -> str:
             hbm_bw_samples.append((base_labels, _fmt_float(d.hbm_bandwidth_utilization_percent)))
         if d.duty_cycle_percent is not None:
             duty_samples.append((base_labels, _fmt_float(d.duty_cycle_percent)))
+        # Monotonic PCIe AER hardware error counters MUST NOT include scan-order
+        # `chip` (or dynamic VFIO labels) so losing a lower-index TPU never resets
+        # surviving series identity and breaks `increase(freetpu_pcie_aer_fatal_total[5m])`.
+        aer_labels = {
+            "pci_bdf": d.pci_bdf,
+            "device_id": d.device_id,
+            "generation": d.generation,
+        }
         if d.aer_correctable_total is not None:
-            aer_corr_samples.append((base_labels, str(d.aer_correctable_total)))
+            aer_corr_samples.append((aer_labels, str(d.aer_correctable_total)))
         if d.aer_fatal_total is not None:
-            aer_fatal_samples.append((base_labels, str(d.aer_fatal_total)))
+            aer_fatal_samples.append((aer_labels, str(d.aer_fatal_total)))
         if d.shm_hbm_allocated_bytes is not None:
             shm_hbm_alloc_samples.append((base_labels, str(d.shm_hbm_allocated_bytes)))
         if d.mxu_active_cycles is not None:
@@ -2847,6 +2922,7 @@ class _ExporterServer(ThreadingHTTPServer):
         chip_id_map: Optional[Dict[str, str]] = None,
         skip_pid_scan: bool = False,
         runtime_metrics_addr: Optional[str] = "127.0.0.1:8431",
+        grpc_duty_layout: str = "auto",
         shm_root: Optional[Path] = DEFAULT_SHM_ROOT,
         shm_trusted_uids: Optional[Sequence[int]] = None,
         shm_max_age_s: float = DEFAULT_SHM_MAX_AGE_S,
@@ -2864,6 +2940,7 @@ class _ExporterServer(ThreadingHTTPServer):
         self.chip_id_map = chip_id_map
         self.skip_pid_scan = skip_pid_scan
         self.runtime_metrics_addr = runtime_metrics_addr
+        self.grpc_duty_layout = grpc_duty_layout
         self.shm_root = shm_root
         self.shm_trusted_uids = tuple(shm_trusted_uids) if shm_trusted_uids is not None else None
         self.shm_max_age_s = shm_max_age_s
@@ -2921,6 +2998,7 @@ class _ExporterServer(ThreadingHTTPServer):
                 chip_id_map=self.chip_id_map,
                 skip_pid_scan=self.skip_pid_scan,
                 runtime_metrics_addr=self.runtime_metrics_addr,
+                grpc_duty_layout=self.grpc_duty_layout,
                 shm_root=self.shm_root,
                 shm_trusted_uids=self.shm_trusted_uids,
                 shm_max_age_s=self.shm_max_age_s,
@@ -3164,6 +3242,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--grpc-duty-layout",
+        choices=VALID_GRPC_DUTY_LAYOUTS,
+        default="auto",
+        help=(
+            "Direct gRPC duty-cycle ID layout: 'auto' (default: 1:1 on single-core-per-chip "
+            "generations and verified pigeonhole Ironwood per-core replies, keeping ambiguous "
+            "replies unjoined), 'per-core' (explicit 1:1 join), or 'per-chip' (expand across "
+            "devices_per_chip when PCI inventory is present)."
+        ),
+    )
+    parser.add_argument(
         "--shm-root",
         type=Path,
         default=DEFAULT_SHM_ROOT,
@@ -3246,6 +3335,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 chip_id_map=chip_id_map,
                 skip_pid_scan=args.no_pid_scan,
                 runtime_metrics_addr=runtime_metrics_addr,
+                grpc_duty_layout=args.grpc_duty_layout,
                 shm_root=args.shm_root,
                 shm_trusted_uids=args.shm_trusted_uids,
                 shm_max_age_s=args.shm_max_age_s,
@@ -3273,6 +3363,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         chip_id_map=chip_id_map,
         skip_pid_scan=args.no_pid_scan,
         runtime_metrics_addr=runtime_metrics_addr,
+        grpc_duty_layout=args.grpc_duty_layout,
         shm_root=args.shm_root,
         shm_trusted_uids=args.shm_trusted_uids,
         shm_max_age_s=args.shm_max_age_s,

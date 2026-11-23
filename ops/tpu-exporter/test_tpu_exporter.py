@@ -2680,6 +2680,67 @@ TPU Runtime Utilization
                     return SimpleNamespace(metric=SimpleNamespace(metrics=items))
 
             iw_pb2_grpc = SimpleNamespace(RuntimeMetricServiceStub=_IronwoodStub)
+            # In default `auto` mode on Ironwood (`tpu7x`), upstream `tpu-info` uses
+            # a per-device duty-cycle path (`metrics.get_chip_usage_new`), so 4 duty
+            # IDs `{0..3}` alongside 8 HBM IDs `{0..7}` is ambiguous with a partial
+            # per-core reply. `auto` MUST keep them unjoined (NOT copy 4 readings
+            # across 8 cores) and allow fallback to run!
+            iw_auto_fallback_calls: List[str] = []
+
+            def _failing_iw_fallback(*args, **kwargs):
+                iw_auto_fallback_calls.append("cli")
+                return False, "tpu-info unavailable", {}
+
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.dict(_te._GRPC_CHANNELS, {}, clear=True),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "grpc": _FakeGrpc,
+                        "tpu_info": SimpleNamespace(),
+                        "tpu_info.proto": SimpleNamespace(),
+                        "tpu_info.proto.tpu_metric_service_pb2": fake_pb2,
+                        "tpu_info.proto.tpu_metric_service_pb2_grpc": iw_pb2_grpc,
+                    },
+                ),
+                mock.patch.object(_te, "_run_tpu_info", side_effect=_failing_iw_fallback),
+            ):
+                iw_auto_snap = _te.collect_snapshot(
+                    sysfs_root=iw_sysfs,
+                    dev_root=iw_dev,
+                    proc_root=iw_proc,
+                    tpu_info_bin="tpu-info",
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=iw_root / "no-shm",
+                )
+            self.assertEqual(len(iw_auto_snap.devices), 8)
+            self.assertEqual(iw_auto_fallback_calls, ["cli"])
+            self.assertTrue(all(d.duty_cycle_percent is None for d in iw_auto_snap.devices))
+            self.assertEqual(
+                iw_auto_snap.runtime_unjoined_duty_cycle,
+                {"0": 12.5, "1": 37.5, "2": 62.5, "3": 87.5},
+            )
+            self.assertEqual(
+                [d.hbm_used_bytes for d in iw_auto_snap.devices],
+                [(c + 1) * 10 * 1024**3 for c in range(8)],
+            )
+
+            # With explicit `--grpc-duty-layout=per-chip`, the operator opts in to
+            # per-chip expansion (`chip c -> cores 2*c, 2*c+1`) directly over gRPC
+            # without spawning fallback subprocesses.
+            parsed_layout_args = _te.build_arg_parser().parse_args(
+                ["--grpc-duty-layout", "per-chip"]
+            )
+            self.assertEqual(parsed_layout_args.grpc_duty_layout, "per-chip")
+            with self.assertRaises(ValueError):
+                _te.collect_snapshot(
+                    sysfs_root=iw_sysfs,
+                    dev_root=iw_dev,
+                    proc_root=iw_proc,
+                    tpu_info_bin=None,
+                    grpc_duty_layout="bogus",
+                )
             with (
                 _mock_vfio_char_lstat(),
                 mock.patch.dict(_te._GRPC_CHANNELS, {}, clear=True),
@@ -2697,7 +2758,7 @@ TPU Runtime Utilization
                     _te,
                     "_run_tpu_info",
                     side_effect=AssertionError(
-                        "must not spawn fallback on complete verified Ironwood per-chip gRPC reply"
+                        "must not spawn fallback when explicit --grpc-duty-layout=per-chip completes over gRPC"
                     ),
                 ),
             ):
@@ -2707,12 +2768,10 @@ TPU Runtime Utilization
                     proc_root=iw_proc,
                     tpu_info_bin="tpu-info",
                     runtime_metrics_addr="127.0.0.1:8431",
+                    grpc_duty_layout="per-chip",
                     shm_root=iw_root / "no-shm",
                 )
             self.assertEqual(len(iw_snap.devices), 8)
-            # Complete verified 4-chip Ironwood host returning all 4 physical-chip duty
-            # readings `{0..3}` + all 8 logical-core HBM readings `{0..7}` joins cleanly
-            # via documented per-chip expansion directly over gRPC (zero fallback spawned!).
             self.assertEqual(
                 [d.duty_cycle_percent for d in iw_snap.devices],
                 [12.5, 12.5, 37.5, 37.5, 62.5, 62.5, 87.5, 87.5],
@@ -2723,6 +2782,44 @@ TPU Runtime Utilization
                 [(c + 1) * 10 * 1024**3 for c in range(8)],
             )
             self.assertTrue(all(d.telemetry_source == "libtpu-grpc" for d in iw_snap.devices))
+
+            # In `tpu_info.metrics` Python fallback on Ironwood (`V7X`), prefer
+            # upstream `get_chip_usage_new` over legacy `get_chip_usage` when available.
+            v7x_py_calls: List[str] = []
+
+            def _v7x_get_chip_usage_new(chip_type, addr="localhost:8431"):
+                v7x_py_calls.append(f"new:{chip_type}:{addr}")
+                return [
+                    SimpleNamespace(
+                        device_id=c,
+                        memory_usage=(c + 1) * 1024**3,
+                        total_memory=96 * 1024**3,
+                        duty_cycle_pct=10.0 + c,
+                    )
+                    for c in range(8)
+                ]
+
+            def _v7x_get_chip_usage_old(*args, **kwargs):
+                raise AssertionError("must prefer get_chip_usage_new for V7X when available")
+
+            with mock.patch.dict(
+                sys.modules,
+                {
+                    "tpu_info.device": SimpleNamespace(TpuChip=SimpleNamespace(V7X="V7X")),
+                    "tpu_info.metrics": SimpleNamespace(
+                        get_chip_usage=_v7x_get_chip_usage_old,
+                        get_chip_usage_new=_v7x_get_chip_usage_new,
+                    ),
+                },
+            ):
+                py_ok, py_err, py_rows = _te._query_tpu_info_python_metrics(
+                    iw_snap.devices,
+                    addr="127.0.0.1:8431",
+                    timeout_s=1.0,
+                )
+            self.assertTrue(py_ok, py_err)
+            self.assertEqual(v7x_py_calls, ["new:V7X:127.0.0.1:8431"])
+            self.assertEqual(len(py_rows), 8)
 
             # Ironwood per-core duty-cycle response (8 entries 0..7 matching 8 HBM cores)
             # MUST preserve 1:1 per-core readings and NEVER double/fabricate rows 8..15!
@@ -3327,6 +3424,19 @@ TPU Runtime Utilization
                 )
                 return True, None, rows
 
+            def _partial_4row_cli(*args, **kwargs):
+                # Logical cores 0..3 cover only physical chips 0 and 1 on a
+                # dual-function host (`devices_per_chip=2`), NOT chips 2 and 3!
+                lines = [
+                    "TPU Runtime Utilization",
+                    "| Chip | HBM Usage (GiB)       | Duty cycle |",
+                    "|------|-----------------------|------------|",
+                ] + [
+                    f"| {c}    | 10.00 GiB / 96.00 GiB | {12.5 + (c // 2) * 25.0:.2f}%     |"
+                    for c in range(4)
+                ]
+                return True, None, _te.parse_tpu_info_output("\n".join(lines) + "\n")
+
             def _full_8row_cli(*args, **kwargs):
                 lines = [
                     "TPU Runtime Utilization",
@@ -3366,6 +3476,37 @@ TPU Runtime Utilization
             self.assertEqual(
                 iw_partial_fb_snap.runtime_unjoined_duty_cycle,
                 {"0": 12.5, "1": 37.5, "2": 62.5, "3": 87.5},
+            )
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.dict(_te._GRPC_CHANNELS, {}, clear=True),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "grpc": _FakeGrpc,
+                        "tpu_info": SimpleNamespace(),
+                        "tpu_info.proto": SimpleNamespace(),
+                        "tpu_info.proto.tpu_metric_service_pb2": fake_pb2,
+                        "tpu_info.proto.tpu_metric_service_pb2_grpc": SimpleNamespace(
+                            RuntimeMetricServiceStub=_IronwoodDutyOnlyNoHbmStub
+                        ),
+                    },
+                ),
+                mock.patch.object(_te, "_run_tpu_info", side_effect=_partial_4row_cli),
+            ):
+                iw_partial4_fb_snap = _te.collect_snapshot(
+                    sysfs_root=iw_sysfs,
+                    dev_root=iw_dev,
+                    proc_root=iw_proc,
+                    tpu_info_bin="tpu-info",
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=iw_root / "no-shm",
+                )
+            # Logical cores 0..3 cover raw IDs 0 (cores 0,1) and 1 (cores 2,3),
+            # but NOT raw IDs 2 (cores 4,5) or 3 (cores 6,7) — MUST retain 2 & 3!
+            self.assertEqual(
+                iw_partial4_fb_snap.runtime_unjoined_duty_cycle,
+                {"2": 62.5, "3": 87.5},
             )
             with (
                 _mock_vfio_char_lstat(),
@@ -4127,9 +4268,60 @@ TPU Runtime Utilization
 
                 prom = tpu_exporter.format_prometheus_metrics(snap)
                 self._assert_valid_prometheus_text(prom)
-                self.assertIn('freetpu_pcie_aer_correctable_total{chip="0",pci_bdf="0000:00:0b.0"', prom)
-                self.assertIn('freetpu_pcie_aer_fatal_total{chip="0",pci_bdf="0000:00:0b.0"', prom)
+                # AER counters MUST use stable hardware PCI labels (no scan-order `chip`
+                # label) so losing a lower-index TPU never resets surviving series identity.
+                self.assertIn(
+                    'freetpu_pcie_aer_correctable_total{pci_bdf="0000:00:0b.0",device_id="0x006f",generation="v6e"} 3',
+                    prom,
+                )
+                self.assertIn(
+                    'freetpu_pcie_aer_fatal_total{pci_bdf="0000:00:0b.0",device_id="0x006f",generation="v6e"} 1',
+                    prom,
+                )
+                self.assertIn(
+                    'freetpu_pcie_aer_fatal_total{pci_bdf="0000:80:00.0",device_id="0x006f",generation="v6e"} 0',
+                    prom,
+                )
+                for ln in prom.splitlines():
+                    if ln.startswith("freetpu_pcie_aer_"):
+                        self.assertNotIn('chip="', ln)
                 self.assertIn("gcp_metadata_preempted_status 1", prom)
+
+                # Simulate lower-index TPU `0000:00:0b.0` disappearing and `0000:80:00.0`
+                # recording a fatal AER fault: `0000:80:00.0` shifts from chip_index 1->0,
+                # yet its `freetpu_pcie_aer_fatal_total` label set MUST remain identical!
+                shifted_root = root / "aer_shifted"
+                sh_sysfs, sh_dev, sh_proc = _make_mock_pci_tree(
+                    shifted_root,
+                    devices=[
+                        {
+                            "bdf": "0000:80:00.0",
+                            "vendor": "0x1ae0",
+                            "device": "0x006f",
+                            "driver": "vfio-pci",
+                            "iommu_group": "5",
+                        }
+                    ],
+                    create_vfio_nodes=["5"],
+                )
+                (sh_sysfs / "bus/pci/devices/0000:80:00.0/aer_dev_fatal").write_text(
+                    "DLP 1\nTOTAL_ERR_FATAL 1\n", encoding="utf-8"
+                )
+                with _mock_vfio_char_lstat():
+                    sh_snap = tpu_exporter.collect_snapshot(
+                        sysfs_root=sh_sysfs,
+                        dev_root=sh_dev,
+                        proc_root=sh_proc,
+                        tpu_info_bin=None,
+                        shm_root=root / "no-shm",
+                    )
+                self.assertEqual(sh_snap.devices[0].chip_index, 0)
+                sh_prom = tpu_exporter.format_prometheus_metrics(sh_snap)
+                self._assert_valid_prometheus_text(sh_prom)
+                self.assertIn(
+                    'freetpu_pcie_aer_fatal_total{pci_bdf="0000:80:00.0",device_id="0x006f",generation="v6e"} 1',
+                    sh_prom,
+                )
             finally:
                 meta_srv.shutdown()
                 meta_srv.server_close()
@@ -4251,8 +4443,12 @@ TPU Runtime Utilization
                 'freetpu_tpu_runtime_duty_cycle_percent{pci_bdf="unmapped",expected_tpu_activity="sustained"} >= 0',
                 alerts_text,
             )
+            # Unjoined branch MUST aggregate at the scrape-target level (`max by (job, instance, node)`)
+            # so idle unallocated devices on a partially-used host never trigger false critical pages,
+            # and suppress when any joined duty series on the target is healthy (`>= 10`).
+            self.assertIn("max by (job, instance, node) (", alerts_text)
             self.assertIn(
-                'avg_over_time(freetpu_tpu_runtime_unjoined_duty_cycle_percent{expected_tpu_activity="sustained"}[5m]) < 10',
+                'avg_over_time(freetpu_tpu_runtime_unjoined_duty_cycle_percent{expected_tpu_activity="sustained"}[5m])',
                 alerts_text,
             )
             self.assertIn(
@@ -4260,6 +4456,7 @@ TPU Runtime Utilization
                 alerts_text,
             )
             self.assertIn("and on(job, instance)", alerts_text)
+            self.assertIn("unless on(job, instance)", alerts_text)
             self.assertIn('freetpu_tpu_hbm_used_bytes{expected_tpu_activity="sustained"} > 0', alerts_text)
             self.assertIn("inference replicas", alerts_text)
             # PCIe AER alert must use a multi-scrape window ([5m], not [1m]).
