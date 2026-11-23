@@ -49,7 +49,9 @@ int main() {
         CHECK_TRUE(emitted.mosaic_mlir.find("value = 8.000000e+00 : bf16") != std::string::npos, "Q4_K S4 +8 unshift const");
         CHECK_TRUE(emitted.mosaic_mlir.find("stable_mosaic.arith.addf") != std::string::npos, "Q4_K S4 +8 addf");
         CHECK_TRUE(emitted.mosaic_mlir.find("stable_mosaic.tpu.matmul") != std::string::npos, "tpu.matmul");
-        CHECK_TRUE(emitted.mosaic_mlir.find("stable_mosaic.vector.multi_reduction") != std::string::npos, "Q4_K factored x_sum");
+        CHECK_TRUE(emitted.mosaic_mlir.find("stable_mosaic.vector.multi_reduction") != std::string::npos, "Q4_K F32 x_sum");
+        CHECK_TRUE(emitted.mosaic_mlir.find("stable_mosaic.arith.truncf") == std::string::npos,
+                   "F32-output Q4_K never truncates F32 x_sum to BF16");
         CHECK_TRUE(emitted.mosaic_mlir.find("@transform_4") != std::string::npos, "5 window transforms");
         CHECK_TRUE(emitted.mosaic_mlir.find("memref<8x2048xf32, #tpu.memory_space<vmem>>") != std::string::npos, "F32 output");
         CHECK_TRUE(emitted.backend_config_json.find("\"serialization_format\": 1") != std::string::npos, "serialization_format 1");
@@ -212,6 +214,56 @@ int main() {
             freetile::DType::BF16, freetile::DType::BF16, false, &k_d96, &reason),
             ("Dense M=8 K=96 N=128 plan failed: " + reason).c_str());
         CHECK_TRUE(k_d96.grid.bk == 96 && k_d96.validate(&reason), "Dense K=96 selects bk=96 and validates");
+    }
+
+    // 9. Positional activation window transforms (renaming operand 0 to "act" preserves transforms)
+    {
+        // Single-K multi-N kernel (N=4096, bn=2048 -> 2 N tiles)
+        freetile::TileKernel k_sk;
+        CHECK_TRUE(freetile::plan_quant_matmul_kernel(
+            freetile::ChipTarget::V5E, 1, 512, 4096, freetile::QuantFormat::Q4_K,
+            freetile::DType::BF16, freetile::DType::F32, false, &k_sk), "Plan single-K multi-N Q4_K");
+        CHECK_TRUE(k_sk.grid.dims.size() == 1 && k_sk.grid.dims[0] == 2, "Single-K 2 N tiles");
+        const auto em_sk_orig = freetile::emit_mosaic_kernel(k_sk);
+        k_sk.operands[0].name = "act";
+        const auto em_sk_renamed = freetile::emit_mosaic_kernel(k_sk);
+        CHECK_TRUE(em_sk_renamed.mosaic_mlir == em_sk_orig.mosaic_mlir,
+                   "Single-K multi-N window transforms ignore activation name");
+
+        // Multi-K kernel (K=4096, N=4096 -> 2D grid)
+        freetile::TileKernel k_mk;
+        CHECK_TRUE(freetile::plan_quant_matmul_kernel(
+            freetile::ChipTarget::V5E, 1, 4096, 4096, freetile::QuantFormat::Q4_K,
+            freetile::DType::BF16, freetile::DType::F32, false, &k_mk), "Plan multi-K Q4_K");
+        CHECK_TRUE(k_mk.grid.dims.size() == 2, "Multi-K 2D grid");
+        const auto em_mk_orig = freetile::emit_mosaic_kernel(k_mk);
+        k_mk.operands[0].name = "act";
+        const auto em_mk_renamed = freetile::emit_mosaic_kernel(k_mk);
+        CHECK_TRUE(em_mk_renamed.mosaic_mlir == em_mk_orig.mosaic_mlir,
+                   "Multi-K window transforms ignore activation name");
+
+        // Multi-K with PARALLEL K axis must fail validation & throw on emit
+        freetile::TileKernel bad_sem = k_mk;
+        bad_sem.grid.semantics[1] = freetile::DimensionSemantics::PARALLEL;
+        std::string verr;
+        CHECK_TRUE(!bad_sem.validate(&verr), "Multi-K PARALLEL K axis rejected by validate()");
+        bool threw = false;
+        try {
+            (void)freetile::emit_mosaic_kernel(bad_sem);
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        CHECK_TRUE(threw, "Multi-K PARALLEL K axis throws in emit_mosaic_kernel()");
+    }
+
+    // 10. Unknown QuantFormat rejected cleanly before modulo
+    {
+        freetile::TileKernel bad_fmt;
+        std::string reason;
+        const bool ok = freetile::plan_quant_matmul_kernel(
+            freetile::ChipTarget::V5E, 1, 512, 256, static_cast<freetile::QuantFormat>(99),
+            freetile::DType::BF16, freetile::DType::F32, false, &bad_fmt, &reason);
+        CHECK_TRUE(!ok && !reason.empty(), "Unknown QuantFormat cleanly rejected with diagnostic");
     }
 
     std::printf("PASS: all freetile unit tests succeeded!\n");

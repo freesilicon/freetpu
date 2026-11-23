@@ -303,6 +303,9 @@ bool TileKernel::validate(std::string* err) const {
     if (grid.semantics.size() != grid.dims.size()) {
         return fail(err, "TileGrid semantics size must match grid dims");
     }
+    if (k_tiles > 1 && grid.semantics[1] != DimensionSemantics::ARBITRARY) {
+        return fail(err, "Multi-K TileGrid reduction axis (dim 1) must use ARBITRARY semantics");
+    }
 
     if (matmul.has_min != quant_has_min(matmul.quant)) {
         return fail(err, "TileMatmul has_min does not match QuantFormat");
@@ -436,6 +439,9 @@ bool plan_quant_matmul_kernel(ChipTarget target,
 
     const int64_t m_pad = ((m + prof.sublane_align - 1) / prof.sublane_align) * prof.sublane_align;
     const int64_t blk = quant_block_size(fmt);
+    if (blk <= 0) {
+        return fail(reason, "Unsupported QuantFormat");
+    }
     if ((k % blk) != 0) {
         return fail(reason, "K must be divisible by quant block size");
     }
