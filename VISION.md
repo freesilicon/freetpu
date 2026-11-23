@@ -43,9 +43,9 @@ TPUs (`v5e`, `v6e`, `tpu7x`), and non-NVIDIA AI ASICs.
   Cloud).
 - Hosting commercial production APIs or reselling compute on ephemeral R&D
   sandboxes like Google Colab or non-commercial research grants like Google's
-  TPU Research Cloud (TRC) — TRC is strictly for open, non-commercial
-  Apache-2.0 R&D and public benchmarks, while production serving belongs on
-  paid Cloud TPU VMs or dedicated partner silicon.
+  TPU Research Cloud (TRC) — as FreeTPU policy, we use TRC strictly for open,
+  non-commercial Apache-2.0 R&D and public benchmarks, while production serving
+  belongs on paid Cloud TPU VMs or dedicated partner silicon.
 - Unverified claims or synthetic estimates presented as silicon proof.
 
 ## Guardrails
