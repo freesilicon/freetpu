@@ -1257,13 +1257,16 @@ def _query_grpc_runtime_metrics(
     raw_hbm_ids: set[str] = set()
     last_err: Optional[str] = None
     any_rpc_ok = False
-    for metric_name in _GRPC_METRIC_NAMES:
+    total_rpcs = len(_GRPC_METRIC_NAMES)
+    for idx, metric_name in enumerate(_GRPC_METRIC_NAMES):
         remaining = deadline - time.monotonic()
         if remaining <= 0.01:
             last_err = f"gRPC RuntimeMetricService timed out ({addr})"
             break
+        remaining_rpcs = total_rpcs - idx
+        per_rpc_timeout = min(remaining, max(0.05, remaining / remaining_rpcs))
         try:
-            resp = rpc_fn(req_cls(metric_name=metric_name), timeout=remaining)
+            resp = rpc_fn(req_cls(metric_name=metric_name), timeout=per_rpc_timeout)
             any_rpc_ok = True
         except Exception as exc:  # noqa: BLE001
             last_err = f"gRPC GetRuntimeMetric({metric_name}) failed ({addr}): {exc}"
@@ -2076,10 +2079,16 @@ def collect_snapshot(
         tpu_info_err = None
         parsed_rows = {}
         if use_default_grpc_first and runtime_metrics_addr:
+            # Reserve 35% of the shared runtime scrape budget for the fallback
+            # path when fallback is enabled so a stalled gRPC RPC cannot starve
+            # fallback telemetry.
+            grpc_budget_s = (
+                runtime_budget_s * 0.65 if tpu_info_bin else runtime_budget_s
+            )
             tpu_info_ok, tpu_info_err, parsed_rows = _query_grpc_runtime_metrics(
                 devices,
                 addr=runtime_metrics_addr,
-                timeout_s=runtime_budget_s,
+                timeout_s=grpc_budget_s,
             )
             if tpu_info_ok and _has_live_utilization(parsed_rows):
                 runtime_source_label = "libtpu-grpc"

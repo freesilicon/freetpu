@@ -212,8 +212,9 @@ class FreeTpuCdiTests(unittest.TestCase):
             self.assertIn("FREETPU_NETWORK_MODE=host", spec["containerEdits"]["env"])
 
             # Opt-in single_host_env injects isolated overrides; composable single-chip
-            # PCI selector still omits TPU_VISIBLE_DEVICES / TPU_CHIPS_PER_HOST_BOUNDS,
-            # while `all` injects full visibility and bounds.
+            # PCI selector omits TPU_VISIBLE_DEVICES / TPU_CHIPS_PER_HOST_BOUNDS /
+            # TPU_ACCELERATOR_TYPE / TPU_SKIP_MDS_QUERY (preserving metadata discovery
+            # when topology is not injected), while `all` injects complete topology + MDS skip.
             with _mock_vfio_char_devices():
                 iso_spec = freetpu_cdi.build_cdi_spec(
                     chips, vfio_container, single_host_env=True
@@ -225,7 +226,6 @@ class FreeTpuCdiTests(unittest.TestCase):
                     "TPU_HOST_BOUNDS=1,1,1",
                     "TPU_WORKER_HOSTNAMES=localhost",
                     "TPU_WORKER_ID=0",
-                    "TPU_SKIP_MDS_QUERY=true",
                 ],
             )
             self.assertEqual(
@@ -1724,7 +1724,10 @@ class FreeTpuCdiTests(unittest.TestCase):
                     self.assertIn("TPU_HOST_BOUNDS=1,1,1", dev_entry["containerEdits"]["env"])
                     self.assertIn("TPU_WORKER_HOSTNAMES=localhost", dev_entry["containerEdits"]["env"])
                     self.assertIn("TPU_WORKER_ID=0", dev_entry["containerEdits"]["env"])
-                    self.assertIn("TPU_SKIP_MDS_QUERY=true", dev_entry["containerEdits"]["env"])
+                    if dev_entry["name"] == "all":
+                        self.assertIn("TPU_SKIP_MDS_QUERY=true", dev_entry["containerEdits"]["env"])
+                    else:
+                        self.assertNotIn("TPU_SKIP_MDS_QUERY=true", dev_entry["containerEdits"]["env"])
 
                 # 8. Empty per-device containerEdits is rejected (CDI requires >= 1 edit per device).
                 empty_dev_spec = {
@@ -1893,10 +1896,10 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertNotIn("TPU_VISIBLE_DEVICES", pci0_iso_env)
                 self.assertNotIn("TPU_CHIPS_PER_HOST_BOUNDS", pci0_iso_env)
                 self.assertNotIn("TPU_ACCELERATOR_TYPE", pci0_iso_env)
+                self.assertNotIn("TPU_SKIP_MDS_QUERY", pci0_iso_env)
                 self.assertEqual(pci0_iso_env["MEGASCALE_COORDINATOR_ADDRESS"], "127.0.0.1:8353")
                 self.assertEqual(pci0_iso_env["TPU_WORKER_HOSTNAMES"], "localhost")
                 self.assertEqual(pci0_iso_env["TPU_WORKER_ID"], "0")
-                self.assertEqual(pci0_iso_env["TPU_SKIP_MDS_QUERY"], "true")
 
                 host_spec = freetpu_cdi.build_cdi_spec(
                     chips, control_node, network_mode="host"
@@ -2920,12 +2923,15 @@ class FreeTpuCdiTests(unittest.TestCase):
                 )
 
             # Verify tpu7x Ironwood 4-chip VM (8 PCI functions across 0x0076 / 0x0075):
-            # all 8 PCI functions remain allocated in VFIO deviceNodes while host bounds
-            # use the 4 physical chips (`2,2,1`, NOT `2,4,1`).
+            # sibling chiplets share PCI slots (`04.0/04.1`, `05.0/05.1` on NUMA 0;
+            # `80:00.0/00.1`, `80:01.0/01.1` on NUMA 1); all 8 PCI functions remain
+            # allocated in VFIO deviceNodes while host bounds use the 4 physical chips
+            # (`2,2,1`, NOT `2,4,1`), and individual single-function `pci-*` selectors
+            # are labeled `single-chiplet` rather than `single-chip`.
             root_7x = root / "tpu7x"
             ironwood_devices = [
                 {
-                    "bdf": f"0000:00:0{4 + i:x}.0",
+                    "bdf": f"0000:00:0{4 + (i // 2):x}.{i % 2}",
                     "vendor": "0x1ae0",
                     "device": "0x0076" if i < 3 else "0x0075",
                     "driver": "vfio-pci",
@@ -2936,7 +2942,7 @@ class FreeTpuCdiTests(unittest.TestCase):
                 for i in range(4)
             ] + [
                 {
-                    "bdf": f"0000:80:0{i:x}.0",
+                    "bdf": f"0000:80:0{i // 2:x}.{i % 2}",
                     "vendor": "0x1ae0",
                     "device": "0x0076",
                     "driver": "vfio-pci",
@@ -2964,6 +2970,11 @@ class FreeTpuCdiTests(unittest.TestCase):
                 )
                 self.assertEqual(freetpu_cdi.validate_cdi_spec(spec_7x), [])
                 by_name_7x = {d["name"]: d for d in spec_7x["devices"]}
+                # Individual Ironwood single-function `pci-*` selectors MUST be labeled
+                # `single-chiplet` (never `single-chip`), and omit `TPU_SKIP_MDS_QUERY`.
+                pci_7x = by_name_7x["pci-0000-00-04-0"]
+                self.assertEqual(pci_7x["annotations"]["freetpu.dev/allocation-unit"], "single-chiplet")
+                self.assertNotIn("TPU_SKIP_MDS_QUERY=true", pci_7x["containerEdits"]["env"])
                 all_7x = by_name_7x["all"]
                 # All 8 VFIO function nodes are attached.
                 self.assertEqual(len(all_7x["containerEdits"]["deviceNodes"]), 8)
@@ -3148,6 +3159,87 @@ class FreeTpuCdiTests(unittest.TestCase):
                 )
                 self.assertNotIn("TPU_CHIPS_PER_HOST_BOUNDS", ido_all_env)
                 self.assertNotIn("TPU_ACCELERATOR_TYPE", ido_all_env)
+
+                # Degraded separate-slot Ironwood with 1 surviving function per chip and
+                # unique physical chip IDs {0, 1, 2, 3}: MUST NOT pair by `rid // 2` into
+                # two bogus "complete" chips (and MUST omit bounds, accel type, and MDS skip)!
+                id_unique_4_devs = [
+                    {
+                        "bdf": f"0000:00:0{4 + idx:x}.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0076",
+                        "driver": "vfio-pci",
+                        "iommu_group": str(idx),
+                        "numa_node": "0",
+                        "chip_id": str(idx),
+                    }
+                    for idx in range(4)
+                ]
+                idu_sys, idu_dev = _make_mock_pci_vfio(
+                    root / "tpu7x_unique_physical_id_orphans",
+                    devices=id_unique_4_devs,
+                    create_vfio_nodes=["0", "1", "2", "3"],
+                )
+                idu_chips, idu_ctrl = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=idu_sys, dev_root=idu_dev
+                )
+                idu_spec = freetpu_cdi.build_cdi_spec(
+                    idu_chips, idu_ctrl, single_host_env=True
+                )
+                idu_by_name = {d["name"]: d for d in idu_spec["devices"]}
+                self.assertNotIn("numa0-2", idu_by_name)
+                idu_all_env = dict(
+                    kv.split("=", 1) for kv in idu_by_name["all"]["containerEdits"]["env"]
+                )
+                self.assertNotIn("TPU_CHIPS_PER_HOST_BOUNDS", idu_all_env)
+                self.assertNotIn("TPU_ACCELERATOR_TYPE", idu_all_env)
+                self.assertNotIn("TPU_SKIP_MDS_QUERY", idu_all_env)
+
+                # Separate-slot Ironwood with explicit SHARED physical chip IDs
+                # (0,0,1,1 on NUMA 0; 2,2,3,3 on NUMA 1): pairs verified siblings cleanly!
+                shared_id_7x_devs = [
+                    {
+                        "bdf": f"0000:00:0{4 + idx:x}.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0076",
+                        "driver": "vfio-pci",
+                        "iommu_group": str(idx),
+                        "numa_node": "0",
+                        "chip_id": str(idx // 2),
+                    }
+                    for idx in range(4)
+                ] + [
+                    {
+                        "bdf": f"0000:80:0{idx:x}.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0076",
+                        "driver": "vfio-pci",
+                        "iommu_group": str(4 + idx),
+                        "numa_node": "1",
+                        "chip_id": str(2 + (idx // 2)),
+                    }
+                    for idx in range(4)
+                ]
+                sid_sys, sid_dev = _make_mock_pci_vfio(
+                    root / "tpu7x_shared_physical_ids",
+                    devices=shared_id_7x_devs,
+                    create_vfio_nodes=[str(i) for i in range(8)],
+                )
+                sid_chips, sid_ctrl = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=sid_sys, dev_root=sid_dev
+                )
+                sid_spec = freetpu_cdi.build_cdi_spec(
+                    sid_chips, sid_ctrl, single_host_env=True
+                )
+                sid_by_name = {d["name"]: d for d in sid_spec["devices"]}
+                self.assertIn("numa0-2", sid_by_name)
+                self.assertIn("numa1-2", sid_by_name)
+                sid_all_env = dict(
+                    kv.split("=", 1) for kv in sid_by_name["all"]["containerEdits"]["env"]
+                )
+                self.assertEqual(sid_all_env["TPU_CHIPS_PER_HOST_BOUNDS"], "2,2,1")
+                self.assertEqual(sid_all_env["TPU_ACCELERATOR_TYPE"], "tpu7x-8")
+                self.assertEqual(sid_all_env["TPU_SKIP_MDS_QUERY"], "true")
 
                 # Healthy multifunction Ironwood (no chip_id required): 04.0/04.1 + 05.0/05.1
                 # on NUMA 0 and 80:00.0/00.1 + 80:01.0/01.1 on NUMA 1 pair cleanly!

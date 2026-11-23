@@ -877,17 +877,18 @@ def _map_physical_chip_indices(
 
     Generations with 1 PCI function per physical chip (`v5e`, `v5p`, `v6e`, etc.)
     map 1:1. Dual-function/chiplet generations (`tpu7x` Ironwood `0x0075`/`0x0076`
-    and legacy `v2-v3`) pair two PCI functions into one physical chip ONLY when a
-    verified hardware sibling relationship exists:
+    and legacy `v2-v3`) pair two PCI functions into one physical chip ONLY when an
+    explicit verified sibling relationship exists:
     - multifunction siblings sharing the exact same PCI slot `DDDD:BB:DD`
-      (when `slot_count == per_chip`), OR
-    - authoritative runtime IDs from sysfs `chip_id` or explicit `chip_id_map`
-      within the same topology domain (either unique logical device IDs pairing
-      by `rid // per_chip`, or shared physical chip IDs pairing by exact `rid`).
+      (`slot_count == per_chip`), OR
+    - multiple functions explicitly mapped to the SAME physical chip ID from
+      sysfs `chip_id` or `--chip-id-map` within the same topology domain
+      (`rid_count == per_chip`).
 
-    Unmatched or unverified separate-slot functions are NEVER blindly paired in
-    enumeration order (preventing orphaned functions from two different degraded
-    chips from being counted as a complete chip).
+    Distinct unique IDs are NEVER paired by integer division (since one surviving
+    function per chip across 4 chips can expose unique physical IDs `0,1,2,3`),
+    and unmatched functions are left as incomplete singletons so degraded chips
+    cannot form bogus multi-chip slices.
     """
     bdf_to_phys: Dict[str, int] = {}
     slot_counts: Dict[Tuple[str, str], int] = {}
@@ -896,52 +897,27 @@ def _map_physical_chip_indices(
         key = (c.generation, base_slot)
         slot_counts[key] = slot_counts.get(key, 0) + 1
 
-    # Pre-inspect authoritative runtime IDs per multi-function generation so we
-    # can distinguish unique logical IDs (Case A: `rid // per_chip`) from shared
-    # physical chip IDs (Case B: equal `rid`) without guessing across domains.
     def _raw_id(chip: DiscoveredChip) -> Optional[int]:
         if chip_id_map and chip.pci_bdf in chip_id_map:
             return chip_id_map[chip.pci_bdf]
         return chip.runtime_chip_id
 
-    gen_id_mode: Dict[str, str] = {}
-    gen_rids: Dict[str, List[Tuple[DiscoveredChip, int]]] = {}
+    # Identify functions explicitly sharing the SAME physical chip ID within one
+    # topology domain (never pairing distinct unique IDs via integer division).
+    shared_rid_counts: Dict[Tuple[str, int], int] = {}
+    shared_rid_domains: Dict[Tuple[str, int], set[Tuple[str, Optional[int], str]]] = {}
     for c in chips:
         per_chip = _PCI_FUNCTIONS_PER_PHYSICAL_CHIP.get(c.generation, 1)
         if per_chip <= 1:
             continue
         rid = _raw_id(c)
         if rid is not None:
-            gen_rids.setdefault(c.generation, []).append((c, int(rid)))
-
-    for gen, pairs in gen_rids.items():
-        per_chip = _PCI_FUNCTIONS_PER_PHYSICAL_CHIP.get(gen, 1)
-        rid_counts: Dict[int, int] = {}
-        rid_domains: Dict[int, set[Tuple[str, Optional[int], str]]] = {}
-        for c, rid in pairs:
-            rid_counts[rid] = rid_counts.get(rid, 0) + 1
-            rid_domains.setdefault(rid, set()).add(_topology_domain_key(c))
-        if all(cnt == 1 for cnt in rid_counts.values()):
-            # Case A: unique logical device IDs (e.g. 0..7 -> chips 0..3 via rid // 2).
-            bucket_counts: Dict[Tuple[Tuple[str, Optional[int], str], int], int] = {}
-            bucket_domains: Dict[int, set[Tuple[str, Optional[int], str]]] = {}
-            for c, rid in pairs:
-                dom = _topology_domain_key(c)
-                b = rid // per_chip
-                bucket_counts[(dom, b)] = bucket_counts.get((dom, b), 0) + 1
-                bucket_domains.setdefault(b, set()).add(dom)
-            if all(cnt <= per_chip for cnt in bucket_counts.values()) and all(
-                len(doms) == 1 for doms in bucket_domains.values()
-            ):
-                gen_id_mode[gen] = "logical"
-        elif all(cnt <= per_chip for cnt in rid_counts.values()) and all(
-            len(doms) == 1 for doms in rid_domains.values()
-        ):
-            # Case B: shared physical chip ID on sibling functions of each chip.
-            gen_id_mode[gen] = "physical"
+            rkey = (c.generation, int(rid))
+            shared_rid_counts[rkey] = shared_rid_counts.get(rkey, 0) + 1
+            shared_rid_domains.setdefault(rkey, set()).add(_topology_domain_key(c))
 
     slot_to_phys: Dict[Tuple[str, str], int] = {}
-    verified_group_to_phys: Dict[Tuple[str, Tuple[str, Optional[int], str], int], int] = {}
+    shared_rid_to_phys: Dict[Tuple[str, Tuple[str, Optional[int], str], int], int] = {}
     next_phys = 0
 
     for c in chips:
@@ -961,19 +937,21 @@ def _map_physical_chip_indices(
             continue
 
         rid = _raw_id(c)
-        id_mode = gen_id_mode.get(c.generation)
-        if rid is not None and id_mode is not None:
-            group_val = int(rid) // per_chip if id_mode == "logical" else int(rid)
-            vkey = (c.generation, _topology_domain_key(c), group_val)
-            if vkey not in verified_group_to_phys:
-                verified_group_to_phys[vkey] = next_phys
-                next_phys += 1
-            bdf_to_phys[c.pci_bdf] = verified_group_to_phys[vkey]
-            continue
+        if rid is not None:
+            rkey = (c.generation, int(rid))
+            if (
+                shared_rid_counts.get(rkey, 0) == per_chip
+                and len(shared_rid_domains.get(rkey, set())) == 1
+            ):
+                vkey = (c.generation, _topology_domain_key(c), int(rid))
+                if vkey not in shared_rid_to_phys:
+                    shared_rid_to_phys[vkey] = next_phys
+                    next_phys += 1
+                bdf_to_phys[c.pci_bdf] = shared_rid_to_phys[vkey]
+                continue
 
-        # Unverified/orphaned separate-slot function: assign its own singleton
-        # physical ID so `_has_complete_chip_functions` marks it incomplete
-        # instead of falsely pairing orphans from distinct degraded chips.
+        # Unmatched or single-function chiplet: assign its own singleton physical
+        # ID so `_has_complete_chip_functions` marks it incomplete.
         bdf_to_phys[c.pci_bdf] = next_phys
         next_phys += 1
 
@@ -1285,6 +1263,7 @@ def _build_device_env(
         return []
 
     env: List[str] = []
+    has_complete_topology = False
     if (
         include_bounds_env
         and _is_supported_single_host_chip_count(physical_chip_count, generations)
@@ -1298,15 +1277,21 @@ def _build_device_env(
         accel_type = _tpu_accelerator_type(physical_chip_count, generations)
         if accel_type is not None:
             env.append(f"TPU_ACCELERATOR_TYPE={accel_type}")
+            has_complete_topology = True
     env.extend(
         [
             "MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353",
             "TPU_HOST_BOUNDS=1,1,1",
             "TPU_WORKER_HOSTNAMES=localhost",
             "TPU_WORKER_ID=0",
-            "TPU_SKIP_MDS_QUERY=true",
         ]
     )
+    # Gate `TPU_SKIP_MDS_QUERY=true` strictly on complete topology injection so
+    # composable `pci-*`/`group-pci-*` selectors and degraded `all` selectors
+    # that omit `TPU_ACCELERATOR_TYPE`/`TPU_CHIPS_PER_HOST_BOUNDS` do not break
+    # PyTorch/XLA metadata discovery.
+    if has_complete_topology:
+        env.append("TPU_SKIP_MDS_QUERY=true")
     return env
 
 
@@ -1577,8 +1562,10 @@ def build_cdi_spec(
 
         if len(unit_chips) == 1:
             selector = _single_chip_selector(rep.pci_bdf)
+            per_chip = _PCI_FUNCTIONS_PER_PHYSICAL_CHIP.get(rep.generation, 1)
+            unit_label = "single-chiplet" if per_chip > 1 else "single-chip"
             ann: Dict[str, str] = {
-                "freetpu.dev/allocation-unit": "single-chip",
+                "freetpu.dev/allocation-unit": unit_label,
                 "freetpu.dev/pci-bdf": rep.pci_bdf,
                 "freetpu.dev/vendor-id": rep.vendor_id,
                 "freetpu.dev/device-id": rep.device_id,

@@ -1597,6 +1597,125 @@ TPU Device Status
             self.assertEqual(py_called, [])
             self.assertFalse(snap.tpu_info_available)
 
+            # 2. Direct gRPC MUST cap each individual RPC's timeout AND reserve scrape
+            #    budget for CLI fallback so a stalled first RPC (dutycycle) neither
+            #    starves independent HBM RPCs nor prevents CLI fallback when all RPCs fail.
+            from types import SimpleNamespace
+
+            seen_grpc_timeouts: list[tuple[str, float]] = []
+
+            def _make_simple_item(chip_id: int, as_int: int) -> SimpleNamespace:
+                val = SimpleNamespace(
+                    int_attr=chip_id,
+                    string_attr="",
+                    WhichOneof=lambda _g: "int_attr",
+                    HasField=lambda f: f == "int_attr",
+                )
+                gauge = SimpleNamespace(
+                    as_int=as_int,
+                    as_double=0.0,
+                    WhichOneof=lambda _g: "as_int",
+                    HasField=lambda f: f == "as_int",
+                )
+                return SimpleNamespace(
+                    attribute=SimpleNamespace(key="device_id", value=val),
+                    gauge=gauge,
+                )
+
+            class _SlowDutyFastHbmStub:
+                def __init__(self, _channel):
+                    pass
+
+                def GetRuntimeMetric(self, req, timeout=None):
+                    seen_grpc_timeouts.append((req.metric_name, float(timeout or 0.0)))
+                    if req.metric_name == "tpu.runtime.tensorcore.dutycycle.percent":
+                        raise RuntimeError("DEADLINE_EXCEEDED")
+                    if req.metric_name == "tpu.runtime.hbm.memory.usage.bytes":
+                        return SimpleNamespace(
+                            metric=SimpleNamespace(metrics=[_make_simple_item(0, 12 * 1024**3)])
+                        )
+                    if req.metric_name == "tpu.runtime.hbm.memory.total.bytes":
+                        return SimpleNamespace(
+                            metric=SimpleNamespace(metrics=[_make_simple_item(0, 32 * 1024**3)])
+                        )
+                    return SimpleNamespace(metric=SimpleNamespace(metrics=[]))
+
+            fake_grpc = SimpleNamespace(
+                LocalConnectionType=SimpleNamespace(LOCAL_TCP="LOCAL_TCP", UDS="UDS"),
+                local_channel_credentials=lambda conn_type: SimpleNamespace(conn_type=conn_type),
+                secure_channel=lambda addr, creds, options=None: SimpleNamespace(addr=addr),
+            )
+            fake_pb2 = SimpleNamespace(
+                MetricRequest=lambda metric_name: SimpleNamespace(metric_name=metric_name)
+            )
+            fake_pb2_grpc = SimpleNamespace(RuntimeMetricServiceStub=_SlowDutyFastHbmStub)
+
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.dict(tpu_exporter._GRPC_CHANNELS, {}, clear=True),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_load_grpc_runtime_modules",
+                    return_value=(fake_grpc, fake_pb2, fake_pb2_grpc),
+                ),
+            ):
+                partial_grpc_snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin="tpu-info",
+                    tpu_info_timeout_s=2.0,
+                    chip_id_map={"0000:00:06.0": "0"},
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=root / "no-shm",
+                )
+            # First RPC (dutycycle) was capped well below full 2.0s budget (<= 2.0 * 0.65 / 4),
+            # and HBM RPCs still succeeded despite dutycycle failing!
+            self.assertEqual(len(seen_grpc_timeouts), 4)
+            self.assertLessEqual(seen_grpc_timeouts[0][1], 0.5)
+            self.assertEqual(partial_grpc_snap.devices[0].hbm_used_bytes, 12 * 1024**3)
+            self.assertEqual(partial_grpc_snap.devices[0].hbm_total_bytes, 32 * 1024**3)
+
+            # 3. When gRPC consumes its reserved 65% slice and fails completely, CLI
+            #    fallback MUST still receive the reserved ~35% budget and succeed!
+            cli_timeouts: list[float] = []
+
+            def _stalled_grpc(*args, **kwargs):
+                grpc_to = float(kwargs.get("timeout_s", 0.0))
+                self.assertLessEqual(grpc_to, 0.27)
+                _time.sleep(min(0.12, grpc_to))
+                return False, "gRPC timed out", {}
+
+            def _ok_cli(*args, **kwargs):
+                cli_timeouts.append(float(kwargs.get("timeout_s", 0.0)))
+                rows = tpu_exporter.parse_tpu_info_output(
+                    "TPU Runtime Utilization\n"
+                    "| Chip | HBM Usage (GiB)      | Duty cycle |\n"
+                    "|------|----------------------|------------|\n"
+                    "| 0    | 6.00 GiB / 32.00 GiB | 45.00%     |\n"
+                )
+                return True, None, rows
+
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.object(tpu_exporter, "_query_grpc_runtime_metrics", side_effect=_stalled_grpc),
+                mock.patch.object(tpu_exporter, "_run_tpu_info", side_effect=_ok_cli),
+            ):
+                fb_snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin="tpu-info",
+                    tpu_info_timeout_s=0.4,
+                    chip_id_map={"0000:00:06.0": "0"},
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=root / "no-shm",
+                )
+            self.assertEqual(len(cli_timeouts), 1)
+            self.assertGreaterEqual(cli_timeouts[0], 0.1)
+            self.assertTrue(fb_snap.tpu_info_available)
+            self.assertEqual(fb_snap.devices[0].duty_cycle_percent, 45.0)
+
             # When CLI fails fast, Python fallback receives strictly the remaining shared budget.
             def _fast_fail_cli(*args, **kwargs):
                 _time.sleep(0.05)
