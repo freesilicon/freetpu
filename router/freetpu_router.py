@@ -60,6 +60,7 @@ from router.hooks import (  # noqa: E402
     UsageEvent,
     UsageMeterHook,
     load_hook_from_spec,
+    validate_hook_for_role,
 )
 from router.metrics import RouterMetrics  # noqa: E402
 from router.tpu_telemetry import (  # noqa: E402
@@ -562,15 +563,24 @@ class _BoundedSSEReader:
         deadline: Optional[float] = None,
         max_bytes: Optional[int] = None,
     ) -> Tuple[bytes, bool]:
-        """Read one SSE line (`...\\n`) or EOF (`b""`).
+        """Read one WHATWG SSE line (`...\\r\\n`, `...\\n`, or `...\\r`) or EOF (`b""`).
 
         Returns `(line, exceeded_max_bytes)`. Raises `TimeoutError` if `deadline`
-        expires before a newline or EOF arrives.
+        expires before a line terminator or EOF arrives.
         """
         while True:
             nl_idx = self._buf.find(b"\n")
-            if nl_idx != -1:
+            cr_idx = self._buf.find(b"\r")
+            end: Optional[int] = None
+            if cr_idx != -1 and (nl_idx == -1 or cr_idx < nl_idx):
+                if cr_idx + 1 < len(self._buf) and self._buf[cr_idx + 1] == 10:
+                    end = cr_idx + 2
+                else:
+                    end = cr_idx + 1
+            elif nl_idx != -1:
                 end = nl_idx + 1
+
+            if end is not None:
                 if max_bytes is not None and end > max_bytes:
                     return b"", True
                 out = bytes(self._buf[:end])
@@ -1085,7 +1095,11 @@ def build_hooks_from_config(
                 raise ValueError(
                     f"Bearer auth settings {misplaced!r} require auth.type='bearer'"
                 )
-            resolved_auth = load_hook_from_spec(spec.strip(), auth_cfg.get("kwargs"))
+            resolved_auth = load_hook_from_spec(
+                spec.strip(),
+                auth_cfg.get("kwargs"),
+                role="auth",
+            )
         elif auth_type == "bearer":
             raw_tokens = auth_cfg.get("tokens")
             tokens: List[str] = []
@@ -1138,7 +1152,11 @@ def build_hooks_from_config(
         usage_cfg = config.usage_meter
         spec = usage_cfg.get("hook")
         if spec:
-            resolved_usage = load_hook_from_spec(str(spec), usage_cfg.get("kwargs"))
+            resolved_usage = load_hook_from_spec(
+                str(spec),
+                usage_cfg.get("kwargs"),
+                role="usage_meter",
+            )
         elif usage_cfg.get("type") == "jsonl" or usage_cfg.get("jsonl_path"):
             jsonl_path = usage_cfg.get("jsonl_path") or "freetpu_router_usage.jsonl"
             resolved_usage = JsonlUsageMeterHook(str(jsonl_path))
@@ -1150,10 +1168,17 @@ def build_hooks_from_config(
         scaler_cfg = config.scaler
         spec = scaler_cfg.get("hook")
         if spec:
-            resolved_scaler = load_hook_from_spec(str(spec), scaler_cfg.get("kwargs"))
+            resolved_scaler = load_hook_from_spec(
+                str(spec),
+                scaler_cfg.get("kwargs"),
+                role="scaler",
+            )
         else:
             resolved_scaler = NoOpScalerHook()
 
+    validate_hook_for_role(resolved_auth, "auth")
+    validate_hook_for_role(resolved_usage, "usage_meter")
+    validate_hook_for_role(resolved_scaler, "scaler")
     return resolved_auth, resolved_usage, resolved_scaler
 
 
@@ -2020,6 +2045,7 @@ class _SSEReactorTask:
         "current_event_type",
         "scan_pos",
         "event_start",
+        "skip_leading_lf",
         "saw_done_sentinel",
         "upstream_read_error",
         "downstream_write_error",
@@ -2054,6 +2080,7 @@ class _SSEReactorTask:
         event_data_lines: List[bytes],
         current_event_type: str,
         chunked_downstream: bool = True,
+        skip_leading_lf: bool = False,
         max_write_buf_bytes: Optional[int] = None,
         write_timeout_s: Optional[float] = None,
     ) -> None:
@@ -2091,6 +2118,7 @@ class _SSEReactorTask:
         self.current_event_type = current_event_type
         self.scan_pos = 0
         self.event_start = 0
+        self.skip_leading_lf = skip_leading_lf
         self.saw_done_sentinel = False
         self.upstream_read_error = False
         self.downstream_write_error = False
@@ -2363,17 +2391,38 @@ class _SSEReactor:
         buf = task.sse_buf
         flush_end = 0
         while True:
+            if task.skip_leading_lf:
+                if task.scan_pos >= len(buf):
+                    break
+                task.skip_leading_lf = False
+                if buf[task.scan_pos] == 10:
+                    was_event_start = task.event_start == task.scan_pos
+                    task.scan_pos += 1
+                    if was_event_start:
+                        task.event_start = task.scan_pos
+                        flush_end = task.scan_pos
+                    continue
             nl_idx = buf.find(b"\n", task.scan_pos)
-            if nl_idx == -1:
+            cr_idx = buf.find(b"\r", task.scan_pos)
+            if nl_idx == -1 and cr_idx == -1:
                 if len(buf) - task.event_start > task.max_event_bytes:
                     task.size_limit_exceeded = True
                 break
-            line_end = nl_idx + 1
+            if cr_idx != -1 and (nl_idx == -1 or cr_idx < nl_idx):
+                content_end = cr_idx
+                if cr_idx + 1 < len(buf) and buf[cr_idx + 1] == 10:
+                    line_end = cr_idx + 2
+                else:
+                    line_end = cr_idx + 1
+                    if line_end == len(buf):
+                        task.skip_leading_lf = True
+            else:
+                content_end = nl_idx
+                line_end = nl_idx + 1
             if line_end - task.event_start > task.max_event_bytes:
                 task.size_limit_exceeded = True
                 break
-            line_len = line_end - task.scan_pos
-            if line_len == 1 or (line_len == 2 and buf[task.scan_pos] == 13):
+            if content_end == task.scan_pos:
                 ev_type = task.current_event_type
                 task.current_event_type = ""
                 made_progress, is_done = task.on_event_fn(ev_type, task.event_data_lines)
@@ -2388,9 +2437,6 @@ class _SSEReactor:
                 if task.saw_done_sentinel:
                     break
             else:
-                content_end = line_end - 1
-                if content_end > task.scan_pos and buf[content_end - 1] == 13:
-                    content_end -= 1
                 if buf.startswith(b"data:", task.scan_pos):
                     data_start = task.scan_pos + 5
                     if data_start < content_end and buf[data_start] == 32:
@@ -3397,6 +3443,12 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 return
             est_prompt_tokens = _estimate_prompt_tokens(req_payload)
             expected_choices = _expected_stream_choices(path, req_payload)
+            raw_stream_opts = req_payload.get("stream_options")
+            expect_final_usage = bool(
+                stream
+                and isinstance(raw_stream_opts, Mapping)
+                and raw_stream_opts.get("include_usage") is True
+            )
             # Release the decoded JSON tree before waiting on upstream inference.
             del req_payload
             parse_overhead = req_mem_reserved[0] - content_len
@@ -3412,6 +3464,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 est_prompt_tokens,
                 expected_choices,
                 ctx,
+                expect_final_usage=expect_final_usage,
             )
         finally:
             if req_mem_reserved[0] > 0:
@@ -3427,6 +3480,8 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         est_prompt_tokens: int,
         expected_choices: int,
         auth_ctx: AuthContext,
+        *,
+        expect_final_usage: bool = False,
     ) -> None:
         engine = self.server.engine
         req_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
@@ -3587,6 +3642,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         failovers=failovers,
                         est_prompt_tokens=est_prompt_tokens,
                         principal=auth_ctx.principal,
+                        expect_final_usage=expect_final_usage,
                         committed_flag=committed_flag,
                     )
                     if sse_outcome == "committed":
@@ -4027,6 +4083,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         failovers: int,
         est_prompt_tokens: int,
         principal: str,
+        expect_final_usage: bool = False,
         committed_flag: Optional[List[bool]] = None,
     ) -> Tuple[str, int, Optional[bytes]]:
         """Buffer until first generated output or terminator before committing 200 OK.
@@ -4057,6 +4114,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         pending_event_start = 0
         pending_event_has_data = False
         pending_event_type = ""
+        pre_commit_skip_leading_lf = False
         pre_commit_deadline = attempt_start + timeout_s
 
         def _extract_pending_event_payload(end_pos: int) -> bytes:
@@ -4137,6 +4195,12 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                     return "aborted", 502, None
                 pre_commit_bytes += len(line)
                 pre_commit_buf.extend(line)
+                if pre_commit_skip_leading_lf and line == b"\n":
+                    pre_commit_skip_leading_lf = False
+                    if not pending_event_has_data:
+                        pending_event_start = len(pre_commit_buf)
+                    continue
+                pre_commit_skip_leading_lf = line.endswith(b"\r")
                 if line in (b"\n", b"\r\n", b"\r"):
                     if pending_event_has_data:
                         payload_bytes = _extract_pending_event_payload(
@@ -4485,6 +4549,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                             event_data_lines=event_data_lines,
                             current_event_type=current_event_type,
                             chunked_downstream=use_chunked_downstream,
+                            skip_leading_lf=pre_commit_skip_leading_lf,
                         )
                         reactor.submit(task)
                         task.done_event.wait()
@@ -4505,20 +4570,42 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                     phase2_buf = bytearray(rem_bytes)
                     scan_pos = 0
                     event_start = 0
+                    phase2_skip_leading_lf = pre_commit_skip_leading_lf
                     while True:
                         flush_end = 0
                         while True:
+                            if phase2_skip_leading_lf:
+                                if scan_pos >= len(phase2_buf):
+                                    break
+                                phase2_skip_leading_lf = False
+                                if phase2_buf[scan_pos] == 10:
+                                    was_event_start = event_start == scan_pos
+                                    scan_pos += 1
+                                    if was_event_start:
+                                        event_start = scan_pos
+                                        flush_end = scan_pos
+                                    continue
                             nl_idx = phase2_buf.find(b"\n", scan_pos)
-                            if nl_idx == -1:
+                            cr_idx = phase2_buf.find(b"\r", scan_pos)
+                            if nl_idx == -1 and cr_idx == -1:
                                 if len(phase2_buf) - event_start > max_event_bytes:
                                     size_limit_exceeded = True
                                 break
-                            line_end = nl_idx + 1
+                            if cr_idx != -1 and (nl_idx == -1 or cr_idx < nl_idx):
+                                content_end = cr_idx
+                                if cr_idx + 1 < len(phase2_buf) and phase2_buf[cr_idx + 1] == 10:
+                                    line_end = cr_idx + 2
+                                else:
+                                    line_end = cr_idx + 1
+                                    if line_end == len(phase2_buf):
+                                        phase2_skip_leading_lf = True
+                            else:
+                                content_end = nl_idx
+                                line_end = nl_idx + 1
                             if line_end - event_start > max_event_bytes:
                                 size_limit_exceeded = True
                                 break
-                            line_len = line_end - scan_pos
-                            if line_len == 1 or (line_len == 2 and phase2_buf[scan_pos] == 13):
+                            if content_end == scan_pos:
                                 if process_sse_event():
                                     progress_deadline = time.monotonic() + timeout_s
                                 event_start = line_end
@@ -4527,9 +4614,6 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                 if saw_done_sentinel:
                                     break
                             else:
-                                content_end = line_end - 1
-                                if content_end > scan_pos and phase2_buf[content_end - 1] == 13:
-                                    content_end -= 1
                                 if phase2_buf.startswith(b"data:", scan_pos):
                                     data_start = scan_pos + 5
                                     if data_start < content_end and phase2_buf[data_start] == 32:
@@ -4610,9 +4694,14 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             all_choices_finished = all(
                 idx in finished_choice_indices for idx in range(required_choices)
             )
+            usage_satisfied = (
+                (not expect_final_usage)
+                or saw_explicit_prompt_usage
+                or saw_explicit_completion_usage
+            )
             stream_completed = (
                 not saw_upstream_error_event
-                and (saw_done_sentinel or all_choices_finished)
+                and (saw_done_sentinel or (all_choices_finished and usage_satisfied))
             )
             stream_memory_exceeded = not downstream_write_error and memory_limit_exceeded
             stream_size_exceeded = (

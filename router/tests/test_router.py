@@ -9459,6 +9459,337 @@ asyncio.run(main())
         self.assertEqual(router.engine._resp_mem_used_bytes, 0)
         self.assertTrue(router.engine._backends[0].healthy)
 
+    def test_stream_include_usage_missing_final_usage_and_done_surfaces_truncation(
+        self,
+    ) -> None:
+        include_usage_chunk_box = [False]
+        recorded_usage: List[UsageEvent] = []
+
+        class _CaptureHook:
+            def record_usage(self, event: UsageEvent) -> None:
+                recorded_usage.append(event)
+
+        class _CloseDelimSSEHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return None
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = json.dumps(
+                    {"object": "list", "data": [{"id": "m-incusage"}]}
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802
+                clen = int(self.headers.get("Content-Length", "0"))
+                if clen > 0:
+                    self.rfile.read(clen)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(
+                    b'data: {"id":"c1","object":"chat.completion.chunk","model":"m-incusage",'
+                    b'"choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}\n\n'
+                    b'data: {"id":"c1","object":"chat.completion.chunk","model":"m-incusage",'
+                    b'"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+                )
+                if include_usage_chunk_box[0]:
+                    self.wfile.write(
+                        b'data: {"id":"c1","object":"chat.completion.chunk","model":"m-incusage",'
+                        b'"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}\n\n'
+                    )
+                self.wfile.flush()
+
+        srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _CloseDelimSSEHandler))
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            backends=[
+                BackendConfig(
+                    id="incusage-b",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=f"http://127.0.0.1:{srv.server_address[1]}/v1",
+                    models=["m-incusage"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg, usage_hook=_CaptureHook()))
+        rport = router.server_address[1]
+
+        # 1. Missing both [DONE] and requested usage chunk -> surfaced as truncation (502).
+        include_usage_chunk_box[0] = False
+        conn = http.client.HTTPConnection("127.0.0.1", rport, timeout=3.0)
+        try:
+            body = json.dumps(
+                {
+                    "model": "m-incusage",
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                    "messages": [{"role": "user", "content": "hi"}],
+                }
+            ).encode("utf-8")
+            conn.request(
+                "POST",
+                "/v1/chat/completions",
+                body=body,
+                headers={"Content-Type": "application/json"},
+            )
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)
+            with self.assertRaises(http.client.IncompleteRead) as exc_info:
+                resp.read()
+            self.assertIn(b"upstream_stream_interrupted", exc_info.exception.partial)
+        finally:
+            conn.close()
+        self.assertEqual(len(recorded_usage), 1)
+        self.assertEqual(recorded_usage[0].status_code, 502)
+
+        # 2. When the requested final usage chunk arrives before close-delimited EOF -> clean 200.
+        router.engine._backends[0].healthy = True
+        router.engine._backends[0].cooldown_until_monotonic = 0.0
+        include_usage_chunk_box[0] = True
+        st_ok, _, bd_ok = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-incusage",
+                "stream": True,
+                "stream_options": {"include_usage": True},
+                "messages": [{"role": "user", "content": "hi again"}],
+            },
+        )
+        self.assertEqual(st_ok, 200)
+        self.assertIn(b'"completion_tokens":3', bd_ok)
+        self.assertEqual(len(recorded_usage), 2)
+        self.assertEqual(recorded_usage[1].status_code, 200)
+        self.assertEqual(recorded_usage[1].prompt_tokens, 7)
+        self.assertEqual(recorded_usage[1].completion_tokens, 3)
+
+    def test_sse_bare_cr_and_split_crlf_delimiters_handled_pre_and_post_commit(
+        self,
+    ) -> None:
+        recorded_usage: List[UsageEvent] = []
+
+        class _CaptureHook:
+            def record_usage(self, event: UsageEvent) -> None:
+                recorded_usage.append(event)
+
+        class _CRSseHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return None
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = json.dumps(
+                    {"object": "list", "data": [{"id": "m-crsse"}]}
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802
+                clen = int(self.headers.get("Content-Length", "0"))
+                if clen > 0:
+                    self.rfile.read(clen)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                # Pre-commit bare CR events (role-only + first token).
+                self.wfile.write(
+                    b'data: {"id":"cr1","object":"chat.completion.chunk","model":"m-crsse",'
+                    b'"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}\r\r'
+                    b'data: {"id":"cr1","object":"chat.completion.chunk","model":"m-crsse",'
+                    b'"choices":[{"index":0,"delta":{"content":"Hello "},"finish_reason":null}]}\r\r'
+                )
+                self.wfile.flush()
+                time.sleep(0.03)
+                # Post-commit chunk-split CRLF (\r at end of chunk 1, \n at start of chunk 2)
+                # followed by bare CR terminator event.
+                self.wfile.write(
+                    b'data: {"id":"cr1","object":"chat.completion.chunk","model":"m-crsse",'
+                    b'"choices":[{"index":0,"delta":{"content":"world"},"finish_reason":"stop"}]}\r'
+                )
+                self.wfile.flush()
+                time.sleep(0.03)
+                self.wfile.write(b"\n\r")
+                self.wfile.flush()
+                time.sleep(0.03)
+                self.wfile.write(b"\ndata: [DONE]\r\r")
+                self.wfile.flush()
+
+        srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _CRSseHandler))
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            backends=[
+                BackendConfig(
+                    id="crsse-b",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=f"http://127.0.0.1:{srv.server_address[1]}/v1",
+                    models=["m-crsse"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg, usage_hook=_CaptureHook()))
+        st, _, bd = _http_request(
+            router.server_address[1],
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-crsse",
+                "stream": True,
+                "messages": [{"role": "user", "content": "cr test"}],
+            },
+        )
+        self.assertEqual(st, 200)
+        self.assertIn(b"Hello ", bd)
+        self.assertIn(b"world", bd)
+        self.assertIn(b"data: [DONE]", bd)
+        self.assertEqual(len(recorded_usage), 1)
+        self.assertEqual(recorded_usage[0].status_code, 200)
+        self.assertGreater(recorded_usage[0].completion_tokens, 0)
+        self.assertTrue(router.engine._backends[0].healthy)
+
+    def test_hook_role_validation_rejects_mismatched_hooks_at_check_config_and_startup(
+        self,
+    ) -> None:
+        base_backend = BackendConfig(
+            id="hook-val-b",
+            type="pixel-tpu",
+            base_url="http://127.0.0.1:8081/v1",
+        )
+        with self.assertRaisesRegex(ValueError, "authenticate"):
+            build_hooks_from_config(
+                RouterConfig(
+                    backends=[base_backend],
+                    auth={"hook": "router.hooks:NoOpScalerHook"},
+                )
+            )
+        with self.assertRaisesRegex(ValueError, "record_usage"):
+            build_hooks_from_config(
+                RouterConfig(
+                    backends=[base_backend],
+                    usage_meter={"hook": "router.hooks:AllowAllAuthHook"},
+                )
+            )
+        with self.assertRaisesRegex(ValueError, "on_queue_pressure"):
+            build_hooks_from_config(
+                RouterConfig(
+                    backends=[base_backend],
+                    scaler={"hook": "router.hooks:NoOpUsageMeterHook"},
+                )
+            )
+
+        bad_cfg_path = Path(self._tmpdir.name) / "bad_hook_role.json"
+        bad_cfg_path.write_text(
+            json.dumps(
+                {
+                    "auth": {"hook": "router.hooks:NoOpUsageMeterHook"},
+                    "backends": [
+                        {
+                            "id": "hook-val-b",
+                            "type": "pixel-tpu",
+                            "base_url": "http://127.0.0.1:8081/v1",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        err_buf = io.StringIO()
+        with redirect_stderr(err_buf):
+            rc = router_main(["--config", str(bad_cfg_path), "--check-config"])
+        self.assertEqual(rc, 1)
+        self.assertIn("authenticate", err_buf.getvalue())
+
+    def test_tpu_exporter_stream_filters_unrelated_metrics_and_bounds_memory(
+        self,
+    ) -> None:
+        # 1. Stream ~1.2 MiB of 300,000 unrelated short lines + oversized unrelated line
+        # + valid TPU lines in small chunks (so the test server itself does not allocate
+        # 1.2 MiB inside the same process's tracemalloc window) and verify scraper peak
+        # heap stays well under 256 KiB.
+        unrelated_chunk = b"a 1\n" * 2000  # 8 KiB per write x 150 = 1.2 MB, 300k lines
+        oversized_unrelated = (f'other_metric{{blob="{"x" * 20000}"}} 1\n').encode("ascii")
+        valid_tpu = (
+            'freetpu_exporter_up 1\n'
+            'freetpu_tpu_devices_discovered 2\n'
+            'freetpu_tpu_health_status{chip="0",generation="v6e",extra="' + ("z" * 1024) + '"} 1\n'
+            'freetpu_tpu_health_status{chip="1",generation="v6e"} 1\n'
+            'freetpu_tpu_duty_cycle_percent{chip="0"} 40.0\n'
+            'freetpu_tpu_duty_cycle_percent{chip="1"} 60.0\n'
+        ).encode("utf-8")
+        total_len = (len(unrelated_chunk) * 150) + len(oversized_unrelated) + len(valid_tpu)
+
+        class _StreamingExporterHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return None
+
+            def do_GET(self) -> None:  # noqa: N802
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; version=0.0.4")
+                self.send_header("Content-Length", str(total_len))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                for _ in range(150):
+                    self.wfile.write(unrelated_chunk)
+                self.wfile.write(oversized_unrelated)
+                self.wfile.write(valid_tpu)
+                self.wfile.flush()
+
+        srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _StreamingExporterHandler))
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        metrics_url = f"http://127.0.0.1:{srv.server_address[1]}/metrics"
+
+        tracemalloc.start()
+        try:
+            tracemalloc.reset_peak()
+            telem = scrape_tpu_exporter(metrics_url, timeout_s=5.0)
+            _, peak_bytes = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        self.assertTrue(telem.reachable)
+        self.assertTrue(telem.exporter_up)
+        self.assertEqual(telem.devices_discovered, 2)
+        self.assertEqual(telem.healthy_chips, 2)
+        self.assertAlmostEqual(telem.avg_duty_cycle_percent or 0.0, 50.0)
+        self.assertEqual(telem.generations, ["v6e"])
+        # Streaming filter avoids retaining the 1.2 MB wire body or 300k PromSample/dict objects.
+        self.assertLess(peak_bytes, 256 * 1024)
+
+        # 2. Hostile exporter emitting >256 distinct TPU chip IDs fails closed cleanly.
+        many_chips = "freetpu_exporter_up 1\n" + "".join(
+            f'freetpu_tpu_health_status{{chip="c{i}"}} 1\n' for i in range(300)
+        )
+        exporter_many = self._track(_MockTpuExporter(raw_body=many_chips))
+        telem_many = scrape_tpu_exporter(exporter_many.metrics_url, timeout_s=3.0)
+        self.assertTrue(telem_many.reachable)
+        self.assertFalse(telem_many.exporter_up)
+        self.assertEqual(telem_many.error, "exporter_chip_limit_exceeded")
+
 
 def run_self_tests(verbosity: int = 1) -> int:
     """Run all router tests cleanly via unittest."""

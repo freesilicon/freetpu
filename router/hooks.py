@@ -17,7 +17,7 @@ from pathlib import Path
 import sys
 import threading
 import time
-from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 
 @dataclass
@@ -291,9 +291,34 @@ class NoOpScalerHook(ScalerHook):
         return None
 
 
+_HOOK_ROLE_REQUIRED_METHODS: Dict[str, Tuple[str, ...]] = {
+    "auth": ("authenticate",),
+    "usage_meter": ("record_usage",),
+    "scaler": ("on_queue_pressure", "on_backend_idle"),
+}
+
+
+def validate_hook_for_role(hook: Any, role: str) -> Any:
+    """Verify that `hook` exposes every callable method required for `role`."""
+    required = _HOOK_ROLE_REQUIRED_METHODS.get(role)
+    if required is None:
+        raise ValueError(f"Unknown hook role {role!r}")
+    missing = [
+        name for name in required if not callable(getattr(hook, name, None))
+    ]
+    if missing:
+        raise ValueError(
+            f"Configured {role} hook {type(hook).__name__!r} is missing required "
+            f"callable method(s): {', '.join(missing)}"
+        )
+    return hook
+
+
 def load_hook_from_spec(
     spec: str,
     kwargs: Optional[Mapping[str, Any]] = None,
+    *,
+    role: Optional[str] = None,
 ) -> Any:
     """Instantiate a hook class from a `'module.path:ClassName'` spec."""
     if ":" not in spec:
@@ -301,4 +326,9 @@ def load_hook_from_spec(
     module_name, attr_name = spec.split(":", 1)
     module = importlib.import_module(module_name.strip())
     cls = getattr(module, attr_name.strip())
-    return cls(**dict(kwargs or {}))
+    if not callable(cls):
+        raise ValueError(f"Hook target {spec!r} is not callable")
+    instance = cls(**dict(kwargs or {}))
+    if role is not None:
+        validate_hook_for_role(instance, role)
+    return instance

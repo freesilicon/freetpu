@@ -43,6 +43,13 @@ _KNOWN_TPU_METRICS = frozenset(
         "freetpu_tpu_active_pids",
     }
 )
+_KNOWN_TPU_METRICS_BYTES = frozenset(m.encode("ascii") for m in _KNOWN_TPU_METRICS)
+_MAX_TPU_METRIC_NAME_LEN = max(len(m) for m in _KNOWN_TPU_METRICS)
+_TPU_RELEVANT_LABELS = frozenset({"chip", "pci_bdf", "generation"})
+MAX_EXPORTER_LINE_BYTES = 16 * 1024
+MAX_EXPORTER_LABEL_VALUE_CHARS = 256
+MAX_TRACKED_TPU_CHIPS = 256
+MAX_TRACKED_TPU_SAMPLES = 4096
 
 _METRIC_NAME_RE = re.compile(r"[a-zA-Z_:][a-zA-Z0-9_:]*")
 _LABEL_NAME_RE = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]*")
@@ -82,12 +89,20 @@ class TpuExporterTelemetry:
         return asdict(self)
 
 
-def _parse_prometheus_sample_line(line: str) -> Optional[PromSample]:
+def _parse_prometheus_sample_line(
+    line: str,
+    *,
+    allowed_names: Optional[frozenset[str]] = None,
+    allowed_labels: Optional[frozenset[str]] = None,
+    max_label_value_chars: Optional[int] = None,
+) -> Optional[PromSample]:
     """Parse one stripped Prometheus text 0.0.4 sample line with quote-aware labels."""
     name_match = _METRIC_NAME_RE.match(line)
     if not name_match:
         return None
     name = name_match.group(0)
+    if allowed_names is not None and name not in allowed_names:
+        return None
     pos = name_match.end()
     n = len(line)
 
@@ -123,7 +138,8 @@ def _parse_prometheus_sample_line(line: str) -> Optional[PromSample]:
             if pos >= n or line[pos] != '"':
                 return None
             pos += 1
-            val_chars: List[str] = []
+            keep_label = allowed_labels is None or lname in allowed_labels
+            val_chars: Optional[List[str]] = [] if keep_label else None
             quote_closed = False
             while pos < n:
                 ch = line[pos]
@@ -131,25 +147,34 @@ def _parse_prometheus_sample_line(line: str) -> Optional[PromSample]:
                     if pos + 1 >= n:
                         return None
                     esc = line[pos + 1]
-                    if esc == "\\":
-                        val_chars.append("\\")
-                    elif esc == '"':
-                        val_chars.append('"')
-                    elif esc == "n":
-                        val_chars.append("\n")
-                    else:
-                        val_chars.append("\\" + esc)
+                    if val_chars is not None and (
+                        max_label_value_chars is None
+                        or len(val_chars) < max_label_value_chars
+                    ):
+                        if esc == "\\":
+                            val_chars.append("\\")
+                        elif esc == '"':
+                            val_chars.append('"')
+                        elif esc == "n":
+                            val_chars.append("\n")
+                        else:
+                            val_chars.append("\\" + esc)
                     pos += 2
                 elif ch == '"':
                     pos += 1
                     quote_closed = True
                     break
                 else:
-                    val_chars.append(ch)
+                    if val_chars is not None and (
+                        max_label_value_chars is None
+                        or len(val_chars) < max_label_value_chars
+                    ):
+                        val_chars.append(ch)
                     pos += 1
             if not quote_closed:
                 return None
-            labels[lname] = "".join(val_chars)
+            if val_chars is not None:
+                labels[lname] = "".join(val_chars)
             while pos < n and line[pos] in (" ", "\t"):
                 pos += 1
             if pos < n and line[pos] == ",":
@@ -176,17 +201,165 @@ def _parse_prometheus_sample_line(line: str) -> Optional[PromSample]:
     return PromSample(name=name, labels=labels, value=value)
 
 
-def parse_prometheus_text(text: str) -> List[PromSample]:
-    """Parse Prometheus text exposition format 0.0.4 into `PromSample` items."""
+def parse_prometheus_text(
+    text: str,
+    *,
+    metric_names: Optional[frozenset[str]] = None,
+    max_samples: Optional[int] = None,
+) -> List[PromSample]:
+    """Parse Prometheus text exposition format 0.0.4 into `PromSample` items.
+
+    Scans line-by-line without materializing an intermediate list of all lines,
+    and optionally filters to `metric_names` and caps retained samples.
+    """
     samples: List[PromSample] = []
-    for raw_line in text.split("\n"):
+    pos = 0
+    n = len(text)
+    while pos <= n:
+        nl = text.find("\n", pos)
+        if nl == -1:
+            raw_line = text[pos:]
+            next_pos = n + 1
+        else:
+            raw_line = text[pos:nl]
+            next_pos = nl + 1
+        pos = next_pos
         line = raw_line.strip(" \t\r")
         if not line or line.startswith("#"):
             continue
-        sample = _parse_prometheus_sample_line(line)
+        sample = _parse_prometheus_sample_line(line, allowed_names=metric_names)
         if sample is not None:
             samples.append(sample)
+            if max_samples is not None and len(samples) >= max_samples:
+                break
     return samples
+
+
+class _TpuTelemetryAggregator:
+    """Bounded streaming aggregator for `tpu-exporter` Prometheus metrics."""
+
+    def __init__(
+        self,
+        *,
+        max_chips: int = MAX_TRACKED_TPU_CHIPS,
+        max_samples: int = MAX_TRACKED_TPU_SAMPLES,
+    ) -> None:
+        self._max_chips = max(1, max_chips)
+        self._max_samples = max(1, max_samples)
+        self.samples_accepted = 0
+        self.saw_exporter_up = False
+        self.exporter_up = False
+        self.devices_discovered = 0
+        self.health_by_chip: Dict[str, float] = {}
+        self.hbm_used_by_chip: Dict[str, int] = {}
+        self.hbm_total_by_chip: Dict[str, int] = {}
+        self.hbm_ratio_by_chip: Dict[str, float] = {}
+        self.duty_by_chip: Dict[str, float] = {}
+        self.pids_by_chip: Dict[str, int] = {}
+        self.tracked_chips: set[str] = set()
+        self.generations_seen: set[str] = set()
+        self.non_finite_metrics: set[str] = set()
+        self.limit_error: Optional[str] = None
+
+    def _register_chip(self, chip_key: str) -> bool:
+        if chip_key in self.tracked_chips:
+            return True
+        if len(self.tracked_chips) >= self._max_chips:
+            self.limit_error = "exporter_chip_limit_exceeded"
+            return False
+        self.tracked_chips.add(chip_key)
+        return True
+
+    def add_sample(self, sample: PromSample) -> None:
+        if sample.name not in _KNOWN_TPU_METRICS:
+            return
+        if self.limit_error is not None:
+            return
+        if self.samples_accepted >= self._max_samples:
+            self.limit_error = "exporter_sample_limit_exceeded"
+            return
+        self.samples_accepted += 1
+
+        if not math.isfinite(sample.value):
+            self.non_finite_metrics.add(sample.name)
+            return
+
+        gen = sample.labels.get("generation")
+        if gen and len(self.generations_seen) < 32:
+            self.generations_seen.add(gen)
+
+        if sample.name == "freetpu_exporter_up":
+            self.saw_exporter_up = True
+            self.exporter_up = sample.value >= 1.0
+            return
+        if sample.name == "freetpu_tpu_devices_discovered":
+            self.devices_discovered = int(round(sample.value))
+            return
+
+        chip_key = sample.labels.get("chip", sample.labels.get("pci_bdf", "0"))
+        if not self._register_chip(chip_key):
+            return
+        if sample.name == "freetpu_tpu_health_status":
+            self.health_by_chip[chip_key] = sample.value
+        elif sample.name == "freetpu_tpu_hbm_used_bytes":
+            self.hbm_used_by_chip[chip_key] = int(round(sample.value))
+        elif sample.name == "freetpu_tpu_hbm_total_bytes":
+            self.hbm_total_by_chip[chip_key] = int(round(sample.value))
+        elif sample.name == "freetpu_tpu_hbm_utilization_ratio":
+            self.hbm_ratio_by_chip[chip_key] = float(sample.value)
+        elif sample.name == "freetpu_tpu_duty_cycle_percent":
+            self.duty_by_chip[chip_key] = float(sample.value)
+        elif sample.name == "freetpu_tpu_active_pids":
+            self.pids_by_chip[chip_key] = int(round(sample.value))
+
+    def finalize(self, *, scraped_at: Optional[float] = None) -> TpuExporterTelemetry:
+        for chip_key, used in self.hbm_used_by_chip.items():
+            if chip_key not in self.hbm_ratio_by_chip:
+                total = self.hbm_total_by_chip.get(chip_key)
+                if total and total > 0:
+                    ratio = used / float(total)
+                    if math.isfinite(ratio):
+                        self.hbm_ratio_by_chip[chip_key] = ratio
+
+        total_chips = max(len(self.health_by_chip), self.devices_discovered)
+        healthy_chips = sum(1 for v in self.health_by_chip.values() if v >= 1.0)
+        ratios = list(self.hbm_ratio_by_chip.values())
+        duties = list(self.duty_by_chip.values())
+
+        exporter_up = self.exporter_up
+        error_msg: Optional[str] = None
+        if self.limit_error is not None:
+            exporter_up = False
+            error_msg = self.limit_error
+        elif self.non_finite_metrics:
+            exporter_up = False
+            bad_names = ", ".join(sorted(self.non_finite_metrics))
+            error_msg = f"non-finite telemetry values in {bad_names}"
+        elif not self.saw_exporter_up:
+            exporter_up = False
+            error_msg = "missing freetpu_exporter_up metric"
+
+        return TpuExporterTelemetry(
+            reachable=True,
+            exporter_up=exporter_up,
+            devices_discovered=self.devices_discovered,
+            healthy_chips=healthy_chips,
+            total_chips=total_chips,
+            max_hbm_utilization_ratio=max(ratios) if ratios else None,
+            avg_hbm_utilization_ratio=(sum(ratios) / len(ratios)) if ratios else None,
+            hbm_used_bytes=(
+                sum(self.hbm_used_by_chip.values()) if self.hbm_used_by_chip else None
+            ),
+            hbm_total_bytes=(
+                sum(self.hbm_total_by_chip.values()) if self.hbm_total_by_chip else None
+            ),
+            avg_duty_cycle_percent=(sum(duties) / len(duties)) if duties else None,
+            max_duty_cycle_percent=max(duties) if duties else None,
+            active_pids=sum(self.pids_by_chip.values()),
+            generations=sorted(self.generations_seen),
+            scraped_at_unix=scraped_at if scraped_at is not None else time.time(),
+            error=error_msg,
+        )
 
 
 def summarize_tpu_samples(
@@ -195,87 +368,10 @@ def summarize_tpu_samples(
     scraped_at: Optional[float] = None,
 ) -> TpuExporterTelemetry:
     """Aggregate parsed `tpu-exporter` samples into node-level readiness stats."""
-    saw_exporter_up = False
-    exporter_up = False
-    devices_discovered = 0
-    health_by_chip: Dict[str, float] = {}
-    hbm_used_by_chip: Dict[str, int] = {}
-    hbm_total_by_chip: Dict[str, int] = {}
-    hbm_ratio_by_chip: Dict[str, float] = {}
-    duty_by_chip: Dict[str, float] = {}
-    pids_by_chip: Dict[str, int] = {}
-    generations_seen: set[str] = set()
-    non_finite_metrics: List[str] = []
-
+    agg = _TpuTelemetryAggregator()
     for sample in samples:
-        if sample.name in _KNOWN_TPU_METRICS and not math.isfinite(sample.value):
-            non_finite_metrics.append(sample.name)
-            continue
-
-        chip_key = sample.labels.get("chip", sample.labels.get("pci_bdf", "0"))
-        gen = sample.labels.get("generation")
-        if gen:
-            generations_seen.add(gen)
-
-        if sample.name == "freetpu_exporter_up":
-            saw_exporter_up = True
-            exporter_up = sample.value >= 1.0
-        elif sample.name == "freetpu_tpu_devices_discovered":
-            devices_discovered = int(round(sample.value))
-        elif sample.name == "freetpu_tpu_health_status":
-            health_by_chip[chip_key] = sample.value
-        elif sample.name == "freetpu_tpu_hbm_used_bytes":
-            hbm_used_by_chip[chip_key] = int(round(sample.value))
-        elif sample.name == "freetpu_tpu_hbm_total_bytes":
-            hbm_total_by_chip[chip_key] = int(round(sample.value))
-        elif sample.name == "freetpu_tpu_hbm_utilization_ratio":
-            hbm_ratio_by_chip[chip_key] = float(sample.value)
-        elif sample.name == "freetpu_tpu_duty_cycle_percent":
-            duty_by_chip[chip_key] = float(sample.value)
-        elif sample.name == "freetpu_tpu_active_pids":
-            pids_by_chip[chip_key] = int(round(sample.value))
-
-    # Derive HBM ratio from used/total if explicit ratio metric was omitted.
-    for chip_key, used in hbm_used_by_chip.items():
-        if chip_key not in hbm_ratio_by_chip:
-            total = hbm_total_by_chip.get(chip_key)
-            if total and total > 0:
-                ratio = used / float(total)
-                if math.isfinite(ratio):
-                    hbm_ratio_by_chip[chip_key] = ratio
-
-    total_chips = max(len(health_by_chip), devices_discovered)
-    healthy_chips = sum(1 for v in health_by_chip.values() if v >= 1.0)
-
-    ratios = list(hbm_ratio_by_chip.values())
-    duties = list(duty_by_chip.values())
-
-    error_msg: Optional[str] = None
-    if non_finite_metrics:
-        exporter_up = False
-        bad_names = ", ".join(sorted(set(non_finite_metrics)))
-        error_msg = f"non-finite telemetry values in {bad_names}"
-    elif not saw_exporter_up:
-        exporter_up = False
-        error_msg = "missing freetpu_exporter_up metric"
-
-    return TpuExporterTelemetry(
-        reachable=True,
-        exporter_up=exporter_up,
-        devices_discovered=devices_discovered,
-        healthy_chips=healthy_chips,
-        total_chips=total_chips,
-        max_hbm_utilization_ratio=max(ratios) if ratios else None,
-        avg_hbm_utilization_ratio=(sum(ratios) / len(ratios)) if ratios else None,
-        hbm_used_bytes=sum(hbm_used_by_chip.values()) if hbm_used_by_chip else None,
-        hbm_total_bytes=sum(hbm_total_by_chip.values()) if hbm_total_by_chip else None,
-        avg_duty_cycle_percent=(sum(duties) / len(duties)) if duties else None,
-        max_duty_cycle_percent=max(duties) if duties else None,
-        active_pids=sum(pids_by_chip.values()),
-        generations=sorted(generations_seen),
-        scraped_at_unix=scraped_at if scraped_at is not None else time.time(),
-        error=error_msg,
-    )
+        agg.add_sample(sample)
+    return agg.finalize(scraped_at=scraped_at)
 
 
 def evaluate_tpu_readiness(
@@ -999,6 +1095,157 @@ def _read_bounded_http_body(
         buf.clear()
 
 
+def _extract_leading_metric_name_bytes(line_bytes: bytes | bytearray) -> bytes:
+    """Return the leading ASCII Prometheus metric name bytes from a stripped line."""
+    n = len(line_bytes)
+    limit = min(n, _MAX_TPU_METRIC_NAME_LEN + 1)
+    idx = 0
+    while idx < limit:
+        b = line_bytes[idx]
+        if (
+            (65 <= b <= 90)
+            or (97 <= b <= 122)
+            or (48 <= b <= 57)
+            or b == 95
+            or b == 58
+        ):
+            idx += 1
+        else:
+            break
+    return bytes(line_bytes[:idx])
+
+
+def _stream_scrape_tpu_body(
+    resp: http.client.HTTPResponse,
+    upstream_sock: Any,
+    *,
+    deadline: float,
+    max_bytes: int = MAX_EXPORTER_RESPONSE_BYTES,
+    max_line_bytes: int = MAX_EXPORTER_LINE_BYTES,
+) -> TpuExporterTelemetry:
+    """Stream-read and aggregate only known TPU metrics in O(1) bounded memory."""
+    declared_len: Optional[int] = None
+    if not resp.chunked:
+        raw_len = resp.getheader("Content-Length")
+        if raw_len is not None:
+            try:
+                parsed_len = int(raw_len.strip())
+            except ValueError:
+                parsed_len = -1
+            if parsed_len >= 0:
+                declared_len = parsed_len
+                if declared_len > max_bytes:
+                    raise ValueError(
+                        f"Exporter response exceeded {max_bytes} byte limit"
+                    )
+
+    agg = _TpuTelemetryAggregator()
+    line_buf = bytearray()
+    line_overflow = False
+    line_overflow_is_tpu = False
+    total = 0
+
+    def _consume_line(raw_line: bytes | bytearray, overflowed: bool, overflow_tpu: bool) -> None:
+        if overflowed:
+            if overflow_tpu and agg.limit_error is None:
+                agg.limit_error = "exporter_line_limit_exceeded"
+            return
+        stripped = bytes(raw_line).strip(b" \t\r")
+        if not stripped or stripped[0] == 35:  # '#'
+            return
+        name_bytes = _extract_leading_metric_name_bytes(stripped)
+        if name_bytes not in _KNOWN_TPU_METRICS_BYTES:
+            return
+        decoded = stripped.decode("utf-8", errors="replace")
+        sample = _parse_prometheus_sample_line(
+            decoded,
+            allowed_names=_KNOWN_TPU_METRICS,
+            allowed_labels=_TPU_RELEVANT_LABELS,
+            max_label_value_chars=MAX_EXPORTER_LABEL_VALUE_CHARS,
+        )
+        if sample is not None:
+            agg.add_sample(sample)
+
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            line_buf.clear()
+            raise TimeoutError("Exporter scrape exceeded elapsed deadline")
+        if isinstance(upstream_sock, DeadlineSocket):
+            upstream_sock.deadline = deadline
+        elif upstream_sock is not None:
+            try:
+                upstream_sock.settimeout(remaining)
+            except OSError:
+                pass
+        budget_left = (max_bytes - total) + 1
+        if budget_left <= 0:
+            line_buf.clear()
+            raise ValueError(f"Exporter response exceeded {max_bytes} byte limit")
+        chunk = resp.read1(min(8192, budget_left))
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            line_buf.clear()
+            raise ValueError(f"Exporter response exceeded {max_bytes} byte limit")
+
+        pos = 0
+        clen = len(chunk)
+        while pos < clen:
+            nl = chunk.find(b"\n", pos)
+            if nl == -1:
+                segment = chunk[pos:]
+                if not line_overflow:
+                    if len(line_buf) + len(segment) > max_line_bytes:
+                        # Record whether this oversized line is a TPU metric, then discard.
+                        prefix = (bytes(line_buf) + segment[:64]).lstrip(b" \t")
+                        line_overflow = True
+                        line_overflow_is_tpu = (
+                            _extract_leading_metric_name_bytes(prefix)
+                            in _KNOWN_TPU_METRICS_BYTES
+                        )
+                        line_buf.clear()
+                    else:
+                        line_buf.extend(segment)
+                break
+            segment = chunk[pos:nl]
+            if not line_overflow:
+                if len(line_buf) + len(segment) > max_line_bytes:
+                    prefix = (bytes(line_buf) + segment[:64]).lstrip(b" \t")
+                    line_overflow = True
+                    line_overflow_is_tpu = (
+                        _extract_leading_metric_name_bytes(prefix)
+                        in _KNOWN_TPU_METRICS_BYTES
+                    )
+                    line_buf.clear()
+                elif line_buf:
+                    line_buf.extend(segment)
+                    _consume_line(line_buf, False, False)
+                    line_buf.clear()
+                else:
+                    _consume_line(segment, False, False)
+            if line_overflow:
+                _consume_line(b"", True, line_overflow_is_tpu)
+                line_overflow = False
+                line_overflow_is_tpu = False
+            pos = nl + 1
+
+    if line_overflow:
+        _consume_line(b"", True, line_overflow_is_tpu)
+    elif line_buf:
+        _consume_line(line_buf, False, False)
+        line_buf.clear()
+
+    if not resp.chunked and resp.status not in (204, 304) and not (100 <= resp.status < 200):
+        if resp.length is not None and resp.length > 0:
+            raise http.client.IncompleteRead(b"", resp.length)
+        if declared_len is not None and total < declared_len:
+            raise http.client.IncompleteRead(b"", declared_len - total)
+
+    return agg.finalize()
+
+
 def scrape_tpu_exporter(
     url: str,
     *,
@@ -1098,9 +1345,9 @@ def scrape_tpu_exporter(
                 total_chips=0,
                 error=f"HTTP {resp.status} from tpu-exporter",
             )
-        body = _read_bounded_http_body(
+        telemetry = _stream_scrape_tpu_body(
             resp, upstream_sock, deadline=deadline
-        ).decode("utf-8", errors="replace")
+        )
     except (OSError, TimeoutError, ValueError, http.client.HTTPException) as exc:
         if isinstance(exc, TimeoutError):
             safe_err = "exporter_scrape_timeout"
@@ -1141,5 +1388,4 @@ def scrape_tpu_exporter(
             except OSError:
                 pass
 
-    samples = parse_prometheus_text(body)
-    return summarize_tpu_samples(samples)
+    return telemetry
