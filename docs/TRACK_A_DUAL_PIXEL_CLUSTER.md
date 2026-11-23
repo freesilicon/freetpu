@@ -40,7 +40,7 @@ Host mock verification (`OPENBUENOS_MOCK=1`): `test-backend-ops -b EDGETPU -o MU
 
 ### 2.2 Bring Up Direct 5 Gbps USB-C CDC-NCM Link (Zero Wi-Fi Data)
 
-Connect both Pixel 10 developer units directly with a USB-C 3.2 / Thunderbolt 5 cable. From a developer shell on the USB `device` side (`mustang`), enable CDC-NCM and assign a point-to-point `/30` subnet with policy routing (`table 200`):
+Connect both Pixel 10 developer units directly with a USB-C 3.2 / Thunderbolt 5 cable. Running the USB-C `ncm0` / `usb0` link, IP address, and policy-routing commands below requires a `CAP_NET_ADMIN`-privileged shell on each device; from that shell, enable CDC-NCM on the USB `device` side (`mustang`) and assign a point-to-point `/30` subnet (`table 200`):
 
 ```bash
 # Node 2 (mustang — USB device side, SuperSpeed):
@@ -116,7 +116,7 @@ OPENBUENOS_VERBOSE=1 OPENBUENOS_WEIGHT_CACHE_MB=128 OPENBUENOS_WEIGHT_CACHE_ENTR
 | `rango` Local `EDGETPU` | Single phone | `0` | local | — | `109.79 ± 0.79` | `5.52 ± 0.82` |
 | `rango` Loopback `RPC → EDGETPU` | `127.0.0.1:50052` | `99` | local TCP | `0.51–1.77 ms` | `45.50 ± 0.21` | `1.24 ± 0.19` |
 | `rango` `EDGETPU` + `mustang` `CPU` (CPU-only peer) | USB 2.0 ADB tunnel | `14` | `30.95 s` | `5.16–10.87 ms` | `63.49 ± 0.28` | `2.26 ± 0.19` |
-| **`rango` `EDGETPU` + `mustang` `EDGETPU` (`2× buenos_a0`)** | **Direct 5 Gbps USB-C NCM (`10.99.0.2`)** | **`14`** | **`8.54 s` (`4.15×` faster)** | **`1.01–3.77 ms`** (`469–810 µs` async push) | **`45.05 ± 0.67`** | **`1.03 ± 0.11`** |
+| **`rango` `EDGETPU` + `mustang` `EDGETPU` (`2× buenos_a0`)** | **Direct 5 Gbps USB-C NCM (`10.99.0.2`)** | **`14`** | **`8.54 s` (`3.62×` faster)** | **`1.01–3.77 ms`** (`469–810 µs` async push) | **`45.05 ± 0.67`** | **`1.03 ± 0.11`** |
 
 ### 3.3 Live `/proc/<pid>/maps` Zero-Vendor-`.so` Audit (Both Nodes)
 

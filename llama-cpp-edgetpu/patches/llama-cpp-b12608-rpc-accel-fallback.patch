@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
-index e4a84cb..73d91b6 100644
+index e4a84cb..f4f2843 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
 @@ -127,7 +127,9 @@ struct rpc_msg_hello_req {
@@ -13,7 +13,15 @@ index e4a84cb..73d91b6 100644
  };
  
  struct rpc_msg_hello_rsp {
-@@ -533,6 +535,10 @@ public:
+@@ -288,6 +290,7 @@ struct ggml_backend_rpc_device_context {
+     uint32_t    device;
+     std::string name;
+     std::string description;
++    bool        accel_fallback = false;
+ };
+ 
+ struct ggml_backend_rpc_buffer_type_context {
+@@ -533,6 +536,10 @@ public:
      void work();
  
      bool get_send_tensor_hash() const { return flags & RPC_DISPATCHER_FLAGS_SEND_TENSOR_HASH; }
@@ -24,8 +32,18 @@ index e4a84cb..73d91b6 100644
  
      ~rpc_dispatcher();
  
-@@ -1427,10 +1433,27 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device,
+@@ -1425,12 +1432,35 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device,
  
+ // RPC server-side implementation
+ 
++static bool rpc_backend_is_edgetpu_accel(ggml_backend_t backend) {
++    ggml_backend_dev_t dev = backend ? ggml_backend_get_device(backend) : nullptr;
++    const char * name = dev ? ggml_backend_dev_name(dev) : nullptr;
++    return dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL &&
++           name != nullptr && std::strncmp(name, "EDGETPU", 7) == 0 &&
++           ggml_backend_buft_is_host(ggml_backend_get_default_buffer_type(backend));
++}
++
  class rpc_server {
  public:
 -    rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir)
@@ -34,9 +52,7 @@ index e4a84cb..73d91b6 100644
          stored_graphs.resize(backends.size());
          comm_states.resize(backends.size());
 +        for (ggml_backend_t backend : backends) {
-+            ggml_backend_dev_t dev = ggml_backend_get_device(backend);
-+            if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL &&
-+                ggml_backend_buft_is_host(ggml_backend_get_default_buffer_type(backend))) {
++            if (rpc_backend_is_edgetpu_accel(backend)) {
 +                cpu_fallback = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
 +                if (cpu_fallback && n_threads > 0) {
 +                    ggml_backend_reg_t cpu_reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(cpu_fallback));
@@ -53,7 +69,7 @@ index e4a84cb..73d91b6 100644
      }
      ~rpc_server();
  
-@@ -1464,6 +1487,7 @@ public:
+@@ -1464,6 +1494,7 @@ public:
  
  private:
      void sync_all_backends();
@@ -61,7 +77,7 @@ index e4a84cb..73d91b6 100644
      void comm_free_device(uint32_t dev_id);
      static bool comm_allreduce_pairwise(void * comm_ctx_v, ggml_tensor ** tensors);
      static bool comm_bootstrap_exchange(void * user_data, const void * send_buf, void * recv_buf, size_t size);
-@@ -1499,6 +1523,7 @@ private:
+@@ -1499,6 +1530,7 @@ private:
  
      std::vector<ggml_backend_t> backends;
      const char * cache_dir;
@@ -69,16 +85,14 @@ index e4a84cb..73d91b6 100644
      std::unordered_set<ggml_backend_buffer_t> buffers;
      // computed graphs cached per backend, keyed by uid
      std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
-@@ -1511,7 +1536,16 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
+@@ -1511,7 +1543,14 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
      response.major = RPC_PROTO_MAJOR_VERSION;
      response.minor = RPC_PROTO_MINOR_VERSION;
      response.patch = RPC_PROTO_PATCH_VERSION;
 -    response.flags = cache_dir ? RPC_DISPATCHER_FLAGS_SEND_TENSOR_HASH : 0;
 +    uint8_t flags = cache_dir ? RPC_DISPATCHER_FLAGS_SEND_TENSOR_HASH : 0;
 +    for (uint32_t i = 0; cpu_fallback != nullptr && i < backends.size(); ++i) {
-+        ggml_backend_dev_t dev = ggml_backend_get_device(backends[i]);
-+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL &&
-+            ggml_backend_buft_is_host(ggml_backend_get_default_buffer_type(backends[i]))) {
++        if (rpc_backend_is_edgetpu_accel(backends[i])) {
 +            flags |= (i < 6) ? (uint8_t) (1u << (RPC_DISPATCHER_FLAGS_ACCEL_FALLBACK_SHIFT + i))
 +                             : (uint8_t) RPC_DISPATCHER_FLAGS_ACCEL_FALLBACK_HI_BIT;
 +        }
@@ -87,7 +101,7 @@ index e4a84cb..73d91b6 100644
      LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
  }
  
-@@ -2181,6 +2215,331 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
+@@ -2181,6 +2220,330 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
      return result;
  }
  
@@ -365,11 +379,10 @@ index e4a84cb..73d91b6 100644
 +        }
 +    }
 +    ggml_backend_t backend = backends[device];
-+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
-+    if (!cpu_fallback || !dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_ACCEL ||
-+        !ggml_backend_buft_is_host(ggml_backend_get_default_buffer_type(backend))) {
++    if (!cpu_fallback || !rpc_backend_is_edgetpu_accel(backend)) {
 +        return ggml_backend_graph_compute_async(backend, graph);
 +    }
++    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
 +    ggml_backend_dev_t cpu_dev = ggml_backend_get_device(cpu_fallback);
 +    int i = 0;
 +    while (i < graph->n_nodes) {
@@ -419,7 +432,7 @@ index e4a84cb..73d91b6 100644
  bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
      // serialization format:
      // | device (4 bytes) | uid (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
-@@ -2266,8 +2625,12 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+@@ -2266,8 +2629,12 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
      }
      const std::chrono::duration<double, std::milli> deserialize_ms = std::chrono::steady_clock::now() - t_deserialize;
  
@@ -434,7 +447,7 @@ index e4a84cb..73d91b6 100644
      sg.graph = graph;
      LOG_DBG3("[%s] device: %u, graph build: %.3f ms\n", __func__, device, deserialize_ms.count());
      return true;
-@@ -2285,8 +2648,11 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
+@@ -2285,8 +2652,11 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
      }
      ggml_cgraph * graph = it->second.graph;
      LOG_DBG("[%s] device: %u, uid: %" PRIu64 "\n", __func__, device, request.uid);
@@ -448,7 +461,7 @@ index e4a84cb..73d91b6 100644
      return true;
  }
  
-@@ -2655,11 +3021,15 @@ rpc_server::~rpc_server() {
+@@ -2655,11 +3025,15 @@ rpc_server::~rpc_server() {
      for (auto buffer : buffers) {
          ggml_backend_buffer_free(buffer);
      }
@@ -466,7 +479,7 @@ index e4a84cb..73d91b6 100644
      uint8_t cmd;
      if (!sock->recv_data(&cmd, 1)) {
          return;
-@@ -3047,7 +3417,7 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
+@@ -3047,7 +3421,7 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
              return;
          }
          LOG_INFO("Accepted client connection\n");
@@ -475,7 +488,7 @@ index e4a84cb..73d91b6 100644
          LOG_INFO("Client connection closed\n");
      }
      rpc_transport_shutdown();
-@@ -3112,8 +3482,16 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
+@@ -3112,8 +3486,15 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
  }
  
  static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
@@ -485,8 +498,7 @@ index e4a84cb..73d91b6 100644
 +        return false;
 +    }
 +    ggml_backend_rpc_device_context * ctx = dev ? (ggml_backend_rpc_device_context *) dev->context : nullptr;
-+    auto dispatcher = ctx ? get_dispatcher(ctx->endpoint) : nullptr;
-+    if (dispatcher != nullptr && dispatcher->get_accel_fallback(ctx->device)) {
++    if (ctx != nullptr && ctx->accel_fallback) {
 +        return rpc_accel_native_mul_mat_supported(op) ||
 +               rpc_accel_native_mul_mat_id_supported(op) ||
 +               rpc_cpu_fallback_op_valid(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), op);
@@ -494,3 +506,30 @@ index e4a84cb..73d91b6 100644
      //TODO: call the remote backend and cache the results
      return true;
  }
+@@ -3394,6 +3775,10 @@ ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint) {
+         LOG_DBG3("[%s] endpoint %s already registered\n", __func__, endpoint);
+         return reg_map[endpoint];
+     }
++    auto dispatcher = get_dispatcher(endpoint);
++    if (dispatcher == nullptr) {
++        return nullptr;
++    }
+     uint32_t dev_count = ggml_backend_rpc_get_device_count(endpoint);
+     LOG_DBG2("[%s] endpoint: %s, device count: %u\n", __func__, endpoint, dev_count);
+     if (dev_count == 0) {
+@@ -3405,10 +3790,11 @@ ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint) {
+         std::string dev_name = "RPC" + std::to_string(dev_id);
+         std::string dev_desc = std::string(endpoint);
+         ggml_backend_rpc_device_context * dev_ctx = new ggml_backend_rpc_device_context {
+-            /* .endpoint    = */    endpoint,
+-            /* .device      = */    ind,
+-            /* .name        = */    dev_name,
+-            /* .description = */    dev_desc,
++            /* .endpoint       = */ endpoint,
++            /* .device         = */ ind,
++            /* .name           = */ dev_name,
++            /* .description    = */ dev_desc,
++            /* .accel_fallback = */ dispatcher->get_accel_fallback(ind),
+         };
+ 
+         ggml_backend_dev_t dev = new ggml_backend_device {
