@@ -577,6 +577,20 @@ class RouterConfig:
             raise ValueError(
                 f"Invalid routing policy {self.policy!r}; expected one of {VALID_POLICIES}"
             )
+        if not isinstance(self.host, str):
+            raise ValueError(
+                f"Invalid bind host {self.host!r}; specify an explicit bind address such as '127.0.0.1' or '0.0.0.0'"
+            )
+        cleaned_host = self.host.strip()
+        if (
+            not cleaned_host
+            or not cleaned_host.strip("[]")
+            or any(ch.isspace() for ch in cleaned_host)
+        ):
+            raise ValueError(
+                f"Invalid bind host {self.host!r}; specify an explicit bind address such as '127.0.0.1' or '0.0.0.0'"
+            )
+        self.host = cleaned_host
         seen_ids: set[str] = set()
         for b in self.backends:
             b.validate()
@@ -786,9 +800,14 @@ class RouterConfig:
         raw_auth = raw.get("auth")
         if raw_auth is not None and not isinstance(raw_auth, Mapping):
             raise ValueError("'auth' must be a JSON object")
+        raw_host = raw.get("host", "127.0.0.1")
+        if not isinstance(raw_host, str):
+            raise ValueError(
+                f"Invalid bind host {raw_host!r}; specify an explicit bind address such as '127.0.0.1' or '0.0.0.0'"
+            )
         return cls(
             backends=backends,
-            host=str(raw.get("host", "127.0.0.1")),
+            host=raw_host,
             port=_validate_int_range(
                 raw.get("port", 8080), name="port", min_value=0, max_value=65535
             ),

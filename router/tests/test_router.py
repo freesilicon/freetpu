@@ -12265,6 +12265,194 @@ asyncio.run(main())
         self.assertEqual(telem.error, "exporter_network_error:OSError")
         self.assertEqual(telemetry_mod._DNS_RESOLVER_SEMAPHORE._value, sem_before)
 
+    def test_blank_bind_host_rejected_in_config_and_cli_override(self) -> None:
+        base_backend = BackendConfig(
+            id="b-host",
+            base_url="http://127.0.0.1:8081/v1",
+            models=["m1"],
+        )
+        for bad_host in ("", "   ", "\t\n", "[]", "127.0.0.1 extra"):
+            with self.assertRaisesRegex(ValueError, "Invalid bind host"):
+                RouterConfig(host=bad_host, backends=[base_backend])
+
+        for json_host in ("", "   ", None):
+            bad_cfg_path = Path(self._tmpdir.name) / f"bad_host_{repr(json_host)}.json"
+            bad_cfg_path.write_text(
+                json.dumps(
+                    {
+                        "host": json_host,
+                        "backends": [
+                            {
+                                "id": "b1",
+                                "base_url": "http://127.0.0.1:8081/v1",
+                                "models": ["m1"],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "Invalid bind host"):
+                load_config(bad_cfg_path)
+            self.assertEqual(
+                router_main(["--check-config", "--config", str(bad_cfg_path)]),
+                1,
+            )
+
+        valid_cfg_path = Path(self._tmpdir.name) / "valid_host_cli_override.json"
+        valid_cfg_path.write_text(
+            json.dumps(
+                {
+                    "host": "127.0.0.1",
+                    "backends": [
+                        {
+                            "id": "b1",
+                            "base_url": "http://127.0.0.1:8081/v1",
+                            "models": ["m1"],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            router_main(["--check-config", "--config", str(valid_cfg_path), "--host", ""]),
+            1,
+        )
+        self.assertEqual(
+            router_main(["--check-config", "--config", str(valid_cfg_path), "--host", "   "]),
+            1,
+        )
+
+    def test_interrupted_batched_completions_deduplicates_prompt_tokens_by_prompt_index(
+        self,
+    ) -> None:
+        recorded_usage: List[UsageEvent] = []
+
+        class _RecordHook:
+            def record_usage(self, event: UsageEvent) -> None:
+                recorded_usage.append(event)
+
+        include_prompt1_choice = [False]
+
+        class _BatchedN2InterruptedHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return None
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = json.dumps(
+                    {"object": "list", "data": [{"id": "m-batch-n2"}]}
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802
+                clen = int(self.headers.get("Content-Length", "0"))
+                if clen > 0:
+                    self.rfile.read(clen)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                # Choices 0 and 1 both belong to prompt 0 (n=2); each repeats prompt 0's 15 tokens.
+                self.wfile.write(
+                    b'data: {"id":"bn2","object":"text_completion",'
+                    b'"choices":[{"index":0,"text":"a","finish_reason":null}],'
+                    b'"usage":{"prompt_tokens":15,"completion_tokens":6,"total_tokens":21}}\n\n'
+                    b'data: {"id":"bn2","object":"text_completion",'
+                    b'"choices":[{"index":1,"text":"b","finish_reason":null}],'
+                    b'"usage":{"prompt_tokens":15,"completion_tokens":9,"total_tokens":24}}\n\n'
+                )
+                if include_prompt1_choice[0]:
+                    # Choice 2 belongs to prompt 1 (20 prompt tokens, 4 completion tokens).
+                    self.wfile.write(
+                        b'data: {"id":"bn2","object":"text_completion",'
+                        b'"choices":[{"index":2,"text":"c","finish_reason":null}],'
+                        b'"usage":{"prompt_tokens":20,"completion_tokens":4,"total_tokens":24}}\n\n'
+                    )
+                self.wfile.flush()
+
+        srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _BatchedN2InterruptedHandler))
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            failure_cooldown_s=30.0,
+            backends=[
+                BackendConfig(
+                    id="batch-n2-b",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=f"http://127.0.0.1:{srv.server_address[1]}/v1",
+                    models=["m-batch-n2"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg, usage_hook=_RecordHook()))
+        rport = router.server_address[1]
+
+        def _send_interrupted_batch() -> None:
+            conn = http.client.HTTPConnection("127.0.0.1", rport, timeout=3.0)
+            try:
+                body = json.dumps(
+                    {
+                        "model": "m-batch-n2",
+                        "prompt": ["Prompt zero", "Prompt one"],
+                        "n": 2,
+                        "stream": True,
+                        "stream_options": {"include_usage": True},
+                    }
+                ).encode("utf-8")
+                conn.request(
+                    "POST",
+                    "/v1/completions",
+                    body=body,
+                    headers={"Content-Type": "application/json"},
+                )
+                resp = conn.getresponse()
+                self.assertEqual(resp.status, 200)
+                with self.assertRaises(http.client.IncompleteRead):
+                    resp.read()
+            finally:
+                conn.close()
+
+        # 1. Interrupted after choices 0 & 1 (both prompt 0): prompt counted once (15), completions summed (15).
+        _send_interrupted_batch()
+        self.assertEqual(recorded_usage[0].status_code, 502)
+        self.assertEqual(recorded_usage[0].prompt_tokens, 15)
+        self.assertEqual(recorded_usage[0].completion_tokens, 15)
+
+        # 2. Interrupted after choices 0, 1 (prompt 0) & 2 (prompt 1): prompts 15+20=35, completions 6+9+4=19.
+        router.engine._backends[0].healthy = True
+        router.engine._backends[0].cooldown_until_monotonic = 0.0
+        include_prompt1_choice[0] = True
+        _send_interrupted_batch()
+        self.assertEqual(recorded_usage[1].status_code, 502)
+        self.assertEqual(recorded_usage[1].prompt_tokens, 35)
+        self.assertEqual(recorded_usage[1].completion_tokens, 19)
+
+    def test_tpu_exporter_handles_chunk_size_overflow_error_cleanly(self) -> None:
+        exporter = self._track(_MockTpuExporter(health_status=1, generation="v6e"))
+        with mock.patch.object(
+            http.client.HTTPResponse,
+            "read1",
+            side_effect=OverflowError("Python int too large to convert to C ssize_t"),
+        ):
+            telem = scrape_tpu_exporter(
+                f"http://127.0.0.1:{exporter.server_address[1]}/metrics",
+                timeout_s=1.0,
+            )
+        self.assertFalse(telem.reachable)
+        self.assertFalse(telem.exporter_up)
+        self.assertEqual(telem.error, "exporter_error:OverflowError")
+
 
 def run_self_tests(verbosity: int = 1) -> int:
     """Run all router tests cleanly via unittest."""

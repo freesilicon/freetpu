@@ -1808,7 +1808,7 @@ class RouterEngine:
                 except json.JSONDecodeError:
                     parsed_json = None
             return resp.status, parsed_json, rtt_ms, None
-        except (OSError, TimeoutError, ValueError, http.client.HTTPException) as exc:
+        except (OSError, TimeoutError, ValueError, OverflowError, http.client.HTTPException) as exc:
             rtt_ms = (time.monotonic() - t0) * 1000.0
             return 0, None, rtt_ms, _safe_probe_error(exc)
         finally:
@@ -3146,6 +3146,10 @@ class FreeTPURouterServer(ThreadingHTTPServer):
         self.engine = engine
         self.verbose = verbose
         clean_host = str(server_address[0]).strip().strip("[]")
+        if not clean_host or any(ch.isspace() for ch in clean_host):
+            raise ValueError(
+                f"Invalid bind host {server_address[0]!r}; specify an explicit bind address such as '127.0.0.1' or '0.0.0.0'"
+            )
         self.configured_bind_host = clean_host.lower()
         try:
             ip_obj = ipaddress.ip_address(clean_host.split("%", 1)[0])
@@ -4292,7 +4296,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         principal=auth_ctx.principal,
                     )
                 return
-            except (OSError, TimeoutError, ValueError, http.client.HTTPException) as exc:
+            except (OSError, TimeoutError, ValueError, OverflowError, http.client.HTTPException) as exc:
                 if resp_mem_reserved[0] > 0:
                     engine.release_response_memory(resp_mem_reserved[0])
                     resp_mem_reserved[0] = 0
@@ -4777,16 +4781,36 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             current_event_type = ""
             required_choices = max(1, expected_choices)
             effective_prompt_batch_size = max(1, prompt_batch_size)
+            n_per_prompt = max(1, required_choices // effective_prompt_batch_size)
 
             def _aggregate_prompt_tokens(p_vals: List[int]) -> int:
                 if len(p_vals) == 1:
                     return p_vals[0]
                 if effective_prompt_batch_size <= 1:
                     return max(p_vals)
-                n_per_prompt = max(1, required_choices // effective_prompt_batch_size)
                 if n_per_prompt > 1 and len(p_vals) >= required_choices:
                     return sum(p_vals) // n_per_prompt
                 return sum(p_vals)
+
+            def _aggregate_prompt_tokens_by_choice(
+                entries: Mapping[Tuple[int, ...], Tuple[Optional[int], Optional[int]]],
+            ) -> Optional[int]:
+                by_prompt: Dict[int, int] = {}
+                for choice_keys, (p_val, _c_val) in entries.items():
+                    if p_val is None:
+                        continue
+                    if effective_prompt_batch_size <= 1:
+                        p_idx = 0
+                    elif choice_keys and choice_keys[0] >= 0:
+                        p_idx = choice_keys[0] // n_per_prompt
+                    else:
+                        p_idx = -1
+                    prev = by_prompt.get(p_idx)
+                    if prev is None or p_val > prev:
+                        by_prompt[p_idx] = p_val
+                if not by_prompt:
+                    return None
+                return sum(by_prompt.values())
 
             def process_sse_event_from(
                 ev_type: str,
@@ -4944,18 +4968,16 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                             pt if pt is not None else prev_p,
                                             ct if ct is not None else prev_c,
                                         )
-                                        p_vals = [
-                                            p
-                                            for p, _ in per_choice_usage.values()
-                                            if p is not None
-                                        ]
+                                        agg_p = _aggregate_prompt_tokens_by_choice(
+                                            per_choice_usage
+                                        )
                                         c_vals = [
                                             c
                                             for _, c in per_choice_usage.values()
                                             if c is not None
                                         ]
-                                        if p_vals:
-                                            prompt_tokens = _aggregate_prompt_tokens(p_vals)
+                                        if agg_p is not None:
+                                            prompt_tokens = agg_p
                                             saw_explicit_prompt_usage = True
                                         if c_vals:
                                             completion_tokens = sum(c_vals)
@@ -4987,13 +5009,11 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                         t_ct if t_ct is not None else prev_c,
                                     )
                                 if not saw_explicit_prompt_usage:
-                                    t_p_vals = [
-                                        p
-                                        for p, _ in per_choice_timings.values()
-                                        if p is not None
-                                    ]
-                                    if t_p_vals:
-                                        prompt_tokens = _aggregate_prompt_tokens(t_p_vals)
+                                    agg_t_p = _aggregate_prompt_tokens_by_choice(
+                                        per_choice_timings
+                                    )
+                                    if agg_t_p is not None:
+                                        prompt_tokens = agg_t_p
                                 if not saw_explicit_completion_usage:
                                     t_c_vals = [
                                         c
@@ -5372,7 +5392,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         except ClientDisconnectedError:
                             downstream_write_error = True
                             break
-                        except (OSError, TimeoutError, http.client.HTTPException):
+                        except (OSError, TimeoutError, OverflowError, http.client.HTTPException):
                             upstream_read_error = True
                             break
 

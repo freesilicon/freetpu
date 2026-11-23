@@ -1369,7 +1369,7 @@ def scrape_tpu_exporter(
         telemetry = _stream_scrape_tpu_body(
             resp, upstream_sock, deadline=deadline
         )
-    except (OSError, TimeoutError, ValueError, http.client.HTTPException) as exc:
+    except (OSError, TimeoutError, ValueError, OverflowError, http.client.HTTPException) as exc:
         if isinstance(exc, TimeoutError):
             safe_err = "exporter_scrape_timeout"
         elif isinstance(exc, ssl.SSLError):
