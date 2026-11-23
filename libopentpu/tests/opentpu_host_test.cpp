@@ -205,6 +205,17 @@ static void test_fork_closes_vfio_fds_and_static_pjrt_err() {
     if (!em || std::strstr(em, "forked") == nullptr) ok = false;
     ot_buffer_free(ba);
     ot_context_destroy(ctx);
+    // Even if a new context reuses the freed address, inherited buffers must be rejected.
+    ot_context_t* child_ctx = nullptr;
+    if (ot_context_create(&cfg, &child_ctx) != OT_OK || !child_ctx) {
+      ok = false;
+    } else {
+      bb->ctx = child_ctx;  // Simulate heap address reuse
+      if (ot_buffer_h2d(child_ctx, bb, scratch, sizeof(scratch)) != OT_ERR_DEVICE) ok = false;
+      if (ot_buffer_d2h(child_ctx, bb, scratch, sizeof(scratch)) != OT_ERR_DEVICE) ok = false;
+      if (ot_matmul_bf16(child_ctx, bb, bc, bb, 2, 2, 2) != OT_ERR_DEVICE) ok = false;
+      ot_context_destroy(child_ctx);
+    }
     // Free remaining buffers AFTER destroying ctx in the forked child (must not touch ctx).
     ot_buffer_free(bb);
     ot_buffer_free(bc);

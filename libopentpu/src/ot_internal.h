@@ -150,6 +150,7 @@ void* pjrt_static_fallback_error_raw(uint32_t error_code);
 
 struct ot_buffer {
   ot_context_t* ctx = nullptr;
+  uint64_t ctx_instance_id = 0;
   size_t size_bytes = 0;
   uint64_t hbm_addr = 0;
   bool is_mock = false;
@@ -157,6 +158,7 @@ struct ot_buffer {
 };
 
 struct ot_context {
+  uint64_t instance_id = 0;
   std::mutex mu;
   ot_config_t cfg{};
   ot_device_info_t info{};

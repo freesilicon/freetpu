@@ -3,6 +3,7 @@
 #include "ot_vliw.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <new>
@@ -10,6 +11,13 @@
 #include <vector>
 
 namespace {
+
+std::atomic<uint64_t> g_next_ctx_instance_id{1};
+
+bool is_foreign_forked_buffer(const ot_buffer_t* buf) {
+  return buf && !buf->is_mock && buf->owner_pid != 0 &&
+         buf->owner_pid != static_cast<int64_t>(::getpid());
+}
 
 inline float bf16_to_f32(uint16_t b) {
   uint32_t u = static_cast<uint32_t>(b) << 16;
@@ -83,6 +91,7 @@ ot_status_t ot_context_create(const ot_config_t* config, ot_context_t** out_ctx)
     g_last_create_error = "failed to allocate ot_context";
     return OT_ERR_NO_MEMORY;
   }
+  ctx->instance_id = g_next_ctx_instance_id.fetch_add(1, std::memory_order_relaxed);
   ctx->cfg = cfg;
 
   std::string err;
@@ -178,6 +187,7 @@ ot_status_t ot_buffer_alloc(ot_context_t* ctx, size_t size_bytes, ot_buffer_t** 
     return OT_ERR_NO_MEMORY;
   }
   buf->ctx = ctx;
+  buf->ctx_instance_id = ctx->instance_id;
   buf->size_bytes = size_bytes;
   buf->hbm_addr = hbm_addr;
   buf->is_mock = (ctx->info.is_mock != 0u);
@@ -199,12 +209,12 @@ ot_status_t ot_buffer_alloc(ot_context_t* ctx, size_t size_bytes, ot_buffer_t** 
 
 void ot_buffer_free(ot_buffer_t* buf) {
   if (!buf) return;
-  if (!buf->is_mock && buf->owner_pid != 0 &&
-      buf->owner_pid != static_cast<int64_t>(::getpid())) {
+  if (is_foreign_forked_buffer(buf)) {
     delete buf;
     return;
   }
-  if (buf->ctx && (buf->ctx->info.is_mock || buf->ctx->transport.is_owner_process())) {
+  if (buf->ctx && buf->ctx->instance_id == buf->ctx_instance_id &&
+      (buf->ctx->info.is_mock || buf->ctx->transport.is_owner_process())) {
     std::lock_guard<std::mutex> lk(buf->ctx->mu);
     auto& live = buf->ctx->live_buffers;
     auto it = std::find(live.begin(), live.end(), buf);
@@ -231,8 +241,10 @@ namespace ot {
 
 ot_status_t buffer_h2d_offset(ot_context_t* ctx, ot_buffer_t* dst, size_t dst_offset,
                               const void* host_src, size_t size_bytes) {
-  if (!ctx || !dst || !host_src || dst->ctx != ctx || dst_offset > dst->size_bytes ||
-      size_bytes > dst->size_bytes - dst_offset) {
+  if (!ctx || !dst || !host_src) return OT_ERR_INVALID_ARG;
+  if (is_foreign_forked_buffer(dst)) return OT_ERR_DEVICE;
+  if (dst->ctx != ctx || dst->ctx_instance_id != ctx->instance_id ||
+      dst_offset > dst->size_bytes || size_bytes > dst->size_bytes - dst_offset) {
     return OT_ERR_INVALID_ARG;
   }
   if (size_bytes == 0) return OT_OK;
@@ -313,7 +325,10 @@ ot_status_t ot_buffer_h2d(ot_context_t* ctx, ot_buffer_t* dst,
 
 ot_status_t ot_buffer_d2h(ot_context_t* ctx, const ot_buffer_t* src,
                           void* host_dst, size_t size_bytes) {
-  if (!ctx || !src || !host_dst || src->ctx != ctx || size_bytes > src->size_bytes) {
+  if (!ctx || !src || !host_dst) return OT_ERR_INVALID_ARG;
+  if (is_foreign_forked_buffer(src)) return OT_ERR_DEVICE;
+  if (src->ctx != ctx || src->ctx_instance_id != ctx->instance_id ||
+      size_bytes > src->size_bytes) {
     return OT_ERR_INVALID_ARG;
   }
   if (size_bytes == 0) return OT_OK;
@@ -370,8 +385,16 @@ ot_status_t ot_matmul_bf16(ot_context_t* ctx,
                            uint32_t k_dim,
                            uint32_t n_dim) {
   if (!ctx || !lhs_mk || !rhs_kn || !out_mn ||
-      lhs_mk->ctx != ctx || rhs_kn->ctx != ctx || out_mn->ctx != ctx ||
       m_dim == 0 || k_dim == 0 || n_dim == 0) {
+    return OT_ERR_INVALID_ARG;
+  }
+  if (is_foreign_forked_buffer(lhs_mk) || is_foreign_forked_buffer(rhs_kn) ||
+      is_foreign_forked_buffer(out_mn)) {
+    return OT_ERR_DEVICE;
+  }
+  if (lhs_mk->ctx != ctx || lhs_mk->ctx_instance_id != ctx->instance_id ||
+      rhs_kn->ctx != ctx || rhs_kn->ctx_instance_id != ctx->instance_id ||
+      out_mn->ctx != ctx || out_mn->ctx_instance_id != ctx->instance_id) {
     return OT_ERR_INVALID_ARG;
   }
   uint64_t need_a = static_cast<uint64_t>(m_dim) * k_dim * sizeof(uint16_t);
