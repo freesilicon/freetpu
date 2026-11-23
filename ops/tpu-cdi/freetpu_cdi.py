@@ -1696,6 +1696,8 @@ def build_cdi_spec(
         slice_devnums_str = _format_vfio_devnums(list(slice_devnums.items()))
         if slice_devnums_str:
             slice_ann_base["freetpu.dev/vfio-devnums"] = slice_devnums_str
+        if chip_id_map:
+            slice_ann_base["freetpu.dev/chip-id-source"] = "chip-id-map"
 
         for s_name in topo_slice.aliases:
             slice_edits: Dict[str, Any] = {
@@ -1703,13 +1705,10 @@ def build_cdi_spec(
             }
             if slice_env:
                 slice_edits["env"] = list(slice_env)
-            s_ann = dict(slice_ann_base)
-            if chip_id_map and _RANGE_SLICE_RE.match(s_name):
-                s_ann["freetpu.dev/chip-id-source"] = "chip-id-map"
             devices.append(
                 {
                     "name": s_name,
-                    "annotations": s_ann,
+                    "annotations": dict(slice_ann_base),
                     "containerEdits": slice_edits,
                 }
             )
@@ -1738,6 +1737,8 @@ def build_cdi_spec(
     all_devnums = _format_vfio_devnums(list(seen_group_devnums.items()))
     if all_devnums:
         all_ann["freetpu.dev/vfio-devnums"] = all_devnums
+    if chip_id_map:
+        all_ann["freetpu.dev/chip-id-source"] = "chip-id-map"
 
     all_env = _build_device_env(
         all_complete_chips,
@@ -1840,6 +1841,8 @@ def _validate_container_edits(
     errors: List[str],
     *,
     cdi_version: str = DEFAULT_CDI_VERSION,
+    global_net_by_name: Optional[Dict[str, str]] = None,
+    global_net_by_host: Optional[Dict[str, str]] = None,
 ) -> None:
     if not isinstance(edits, dict):
         errors.append(f"{context}: must be a JSON object")
@@ -1946,6 +1949,21 @@ def _validate_container_edits(
                     errors.append(f"{ndc}.name: duplicate netDevice name {iface_name!r}")
                 else:
                     seen_net_names.add(iface_name)
+                if isinstance(host_iface, str) and host_iface and isinstance(iface_name, str) and iface_name:
+                    if global_net_by_name and iface_name in global_net_by_name:
+                        global_host = global_net_by_name[iface_name]
+                        if global_host != host_iface:
+                            errors.append(
+                                f"{ndc}.name: container netDevice name {iface_name!r} conflicts with "
+                                f"global containerEdits.netDevices entry for host interface {global_host!r}"
+                            )
+                    if global_net_by_host and host_iface in global_net_by_host:
+                        global_name = global_net_by_host[host_iface]
+                        if global_name != iface_name:
+                            errors.append(
+                                f"{ndc}.hostInterfaceName: host interface {host_iface!r} conflicts with "
+                                f"global containerEdits.netDevices mapping to {global_name!r}"
+                            )
 
     if "deviceNodes" in edits:
         nodes = edits["deviceNodes"]
@@ -2108,6 +2126,8 @@ def validate_cdi_spec(spec: Any) -> List[str]:
             errors.append("annotations must be a string-to-string map")
 
     global_paths: set[str] = set()
+    global_net_by_name: Dict[str, str] = {}
+    global_net_by_host: Dict[str, str] = {}
     if "containerEdits" in spec:
         _validate_container_edits(
             spec["containerEdits"],
@@ -2121,6 +2141,15 @@ def validate_cdi_spec(spec: Any) -> List[str]:
                 for n in nodes:
                     if isinstance(n, dict) and isinstance(n.get("path"), str):
                         global_paths.add(n["path"])
+            net_devs = spec["containerEdits"].get("netDevices")
+            if isinstance(net_devs, list):
+                for nd in net_devs:
+                    if isinstance(nd, dict):
+                        h_if = nd.get("hostInterfaceName")
+                        c_nm = nd.get("name")
+                        if isinstance(h_if, str) and h_if and isinstance(c_nm, str) and c_nm:
+                            global_net_by_name.setdefault(c_nm, h_if)
+                            global_net_by_host.setdefault(h_if, c_nm)
 
     devices = spec.get("devices")
     if not isinstance(devices, list) or not devices:
@@ -2163,6 +2192,8 @@ def validate_cdi_spec(spec: Any) -> List[str]:
                 f"{dc}.containerEdits",
                 errors,
                 cdi_version=effective_version,
+                global_net_by_name=global_net_by_name,
+                global_net_by_host=global_net_by_host,
             )
             if isinstance(dev["containerEdits"], dict):
                 edits_dict = dev["containerEdits"]
@@ -2574,7 +2605,72 @@ def _verify_spec_against_host_detailed(
                         == len(live_slice_for_bdfs.physical_indices)
                     )
                 uses_explicit_chip_map = ann.get("freetpu.dev/chip-id-source") == "chip-id-map"
+                unpaired_domain_check: Optional[Tuple[Optional[int], str]] = None
                 if expected_slice is None:
+                    # On separate-slot multi-function hosts (e.g. Ironwood `tpu7x` where
+                    # sibling PCI functions occupy distinct slots and only `--chip-id-map`
+                    # identifies pairs), omitting `--chip-id-map` prevents `_compute_topology_slices`
+                    # from pairing functions into complete chips. When all live PCI/VFIO nodes,
+                    # domain membership, selector name/width, and supported chip count still match
+                    # the intact live domain, record the missing pairing map as `unverifiable`
+                    # rather than confirmed hardware drift so `--remove-if-stale` preserves the spec.
+                    unpaired_map_match = False
+                    if (
+                        chip_id_map is None
+                        and live_slice_for_bdfs is None
+                        and len(slice_domains) == 1
+                        and expected_live_bdfs
+                        and all(b in live_chips_by_bdf for b in expected_live_bdfs)
+                    ):
+                        slice_live_chips = [live_chips_by_bdf[b] for b in expected_live_bdfs]
+                        domain_key = next(iter(slice_domains))
+                        domain_bdfs = sorted(
+                            c.pci_bdf for c in live_chips if _topology_domain_key(c) == domain_key
+                        )
+                        slice_per_chip_set = {
+                            _PCI_FUNCTIONS_PER_PHYSICAL_CHIP.get(c.generation, 1)
+                            for c in slice_live_chips
+                        }
+                        slice_gens_live: List[str] = []
+                        for c in slice_live_chips:
+                            if c.generation not in slice_gens_live:
+                                slice_gens_live.append(c.generation)
+                        if (
+                            expected_live_bdfs == domain_bdfs
+                            and len(slice_per_chip_set) == 1
+                            and next(iter(slice_per_chip_set)) > 1
+                            and not _has_complete_chip_functions(slice_live_chips, live_bdf_to_phys)
+                            and (
+                                uses_explicit_chip_map
+                                or all(c.runtime_chip_id is None for c in slice_live_chips)
+                            )
+                        ):
+                            per_chip = next(iter(slice_per_chip_set))
+                            if len(slice_live_chips) % per_chip == 0:
+                                inferred_chips = len(slice_live_chips) // per_chip
+                                if _is_supported_single_host_chip_count(
+                                    inferred_chips, slice_gens_live, subhost_slice=True
+                                ):
+                                    dom_numa = domain_key[1]
+                                    dom_root = domain_key[2]
+                                    dom_root_token = _pci_bdf_token(dom_root)
+                                    expected_hw_name = (
+                                        f"numa{dom_numa}-pcie-{dom_root_token}-{inferred_chips}"
+                                        if dom_numa is not None
+                                        else f"pcie-{dom_root_token}-{inferred_chips}"
+                                    )
+                                    if name == expected_hw_name:
+                                        unpaired_map_match = True
+                                        unpaired_domain_check = (dom_numa, dom_root)
+                                    elif range_match is not None:
+                                        start_idx, end_idx = (int(p) for p in name.split("-", 1))
+                                        if (
+                                            end_idx >= start_idx
+                                            and (end_idx - start_idx + 1) == inferred_chips
+                                        ):
+                                            unpaired_map_match = True
+                                            unpaired_domain_check = (dom_numa, dom_root)
+
                     if (
                         range_width_matches
                         and chip_id_map is None
@@ -2596,6 +2692,11 @@ def _verify_spec_against_host_detailed(
                             "exposes no chip_id; underlying VFIO/PCI topology still matches live host)"
                         )
                         check_slice = live_slice_for_bdfs
+                    elif unpaired_map_match:
+                        unverifiable.append(
+                            f"device {name!r}: multi-function chip pairing cannot be verified without "
+                            "--chip-id-map (underlying VFIO/PCI topology and domain still match live host)"
+                        )
                     else:
                         errors.append(
                             f"device {name!r}: slice alias does not match any live host topology slice "
@@ -2621,28 +2722,36 @@ def _verify_spec_against_host_detailed(
                         )
                         check_slice = None
 
+                expected_dom_numa: Optional[int] = None
+                expected_dom_root: Optional[str] = None
                 if check_slice is not None:
+                    expected_dom_numa = check_slice.numa_node
+                    expected_dom_root = check_slice.pcie_root
+                elif unpaired_domain_check is not None:
+                    expected_dom_numa, expected_dom_root = unpaired_domain_check
+
+                if expected_dom_root is not None:
                     if (
                         "freetpu.dev/pcie-root" in ann
-                        and ann.get("freetpu.dev/pcie-root") != check_slice.pcie_root
+                        and ann.get("freetpu.dev/pcie-root") != expected_dom_root
                     ):
                         errors.append(
                             f"device {name!r}: stale freetpu.dev/pcie-root "
-                            f"{ann.get('freetpu.dev/pcie-root')!r} (host has {check_slice.pcie_root!r})"
+                            f"{ann.get('freetpu.dev/pcie-root')!r} (host has {expected_dom_root!r})"
                         )
-                    if check_slice.numa_node is None and "freetpu.dev/numa-node" in ann:
+                    if expected_dom_numa is None and "freetpu.dev/numa-node" in ann:
                         errors.append(
                             f"device {name!r}: unexpected freetpu.dev/numa-node "
                             f"{ann.get('freetpu.dev/numa-node')!r} when host sysfs reports no NUMA node"
                         )
                     elif (
-                        check_slice.numa_node is not None
+                        expected_dom_numa is not None
                         and "freetpu.dev/numa-node" in ann
-                        and ann.get("freetpu.dev/numa-node") != str(check_slice.numa_node)
+                        and ann.get("freetpu.dev/numa-node") != str(expected_dom_numa)
                     ):
                         errors.append(
                             f"device {name!r}: stale freetpu.dev/numa-node "
-                            f"{ann.get('freetpu.dev/numa-node')!r} (host has {str(check_slice.numa_node)!r})"
+                            f"{ann.get('freetpu.dev/numa-node')!r} (host has {str(expected_dom_numa)!r})"
                         )
             elif name == "all":
                 all_live_bdfs = sorted(c.pci_bdf for c in live_chips)

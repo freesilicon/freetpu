@@ -3909,10 +3909,10 @@ TPU Runtime Utilization
             self.assertIn("freetpu_tpu_mxu_active_cycles_total{", prom)
             self.assertIn("freetpu_tpu_dma_bytes_transferred_total{", prom)
 
-            # When an inventory-only `tpu-info` row or duty-cycle-only runtime sample sets
-            # `telemetry_source` WITHOUT providing a measured runtime `hbm_total_bytes`,
-            # SHM HBM usage (29 GiB of a 30 GiB pool on a nominal 32 GiB v6e chip) MUST
-            # also adopt SHM pool capacity (30 GiB -> 96.7%, triggering TpuHbmOOMWarning).
+            # When an inventory-only `tpu-info` row or duty-cycle-only runtime sample omits
+            # HBM usage on a device with known HBM capacity (32 GiB nominal v6e), SHM supplies
+            # `hbm_used_bytes` (29 GiB) while PRESERVING known device `hbm_total_bytes` (32 GiB)
+            # and exposing the 30 GiB pool capacity via `freetpu_tpu_shm_hbm_allocated_bytes`.
             shm_file.write_bytes(
                 struct.pack(
                     "<IIQQQQQQ",
@@ -3920,7 +3920,7 @@ TPU Runtime Utilization
                     tpu_exporter.FREETPU_SHM_VERSION,
                     6,
                     30 * 1024**3,  # hbm_allocated_bytes (30 GiB pool)
-                    29 * 1024**3,  # hbm_used_bytes (29 GiB -> 96.67%)
+                    29 * 1024**3,  # hbm_used_bytes (29 GiB -> 90.625% of 32 GiB device)
                     987654321,
                     104857600,
                     now_ns,
@@ -3955,13 +3955,13 @@ TPU Runtime Utilization
             self.assertEqual(d_inv.telemetry_source, "tpu-info")
             self.assertAlmostEqual(d_inv.duty_cycle_percent or 0.0, 45.0)
             self.assertEqual(d_inv.hbm_used_bytes, 29 * 1024**3)
-            self.assertEqual(d_inv.hbm_total_bytes, 30 * 1024**3)
-            ratio = d_inv.hbm_used_bytes / d_inv.hbm_total_bytes
-            self.assertGreater(ratio, 0.95)
+            self.assertEqual(d_inv.hbm_total_bytes, 32 * 1024**3)
+            self.assertEqual(d_inv.shm_hbm_allocated_bytes, 30 * 1024**3)
 
-            # Even when runtime supplies a 32 GiB HBM total WITHOUT HBM usage,
-            # SHM usage (29 GiB of a 30 GiB SHM pool) MUST pair with SHM pool
-            # capacity (30 GiB -> 96.7%), not the runtime's 32 GiB total (90.6%).
+            # When runtime supplies a 32 GiB device HBM total WITHOUT HBM usage,
+            # SHM usage (29 GiB from a smaller 30 GiB pool) MUST preserve the
+            # known 32 GiB device total (ratio 90.6% < 95%, avoiding false OOM
+            # alerts) and expose the 30 GiB pool via `shm_hbm_allocated_bytes`.
             total_only_row = tpu_exporter._TpuInfoRow(
                 chip_key="0",
                 hbm_used_bytes=None,
@@ -3987,8 +3987,26 @@ TPU Runtime Utilization
                 )
             d_tot = total_only_snap.devices[0]
             self.assertEqual(d_tot.hbm_used_bytes, 29 * 1024**3)
-            self.assertEqual(d_tot.hbm_total_bytes, 30 * 1024**3)
-            self.assertGreater(d_tot.hbm_used_bytes / d_tot.hbm_total_bytes, 0.95)
+            self.assertEqual(d_tot.hbm_total_bytes, 32 * 1024**3)
+            self.assertEqual(d_tot.shm_hbm_allocated_bytes, 30 * 1024**3)
+            self.assertLess(d_tot.hbm_used_bytes / d_tot.hbm_total_bytes, 0.95)
+
+            # When device capacity is genuinely unknown (`hbm_total_bytes is None`),
+            # SHM pool capacity fills `hbm_total_bytes` cleanly.
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.dict(tpu_exporter.TPU_PCI_DEVICES, {"0x006f": ("v6e", "TPU v6e", 0)}),
+            ):
+                unk_snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin=None,
+                    shm_root=shm_root,
+                )
+            self.assertEqual(unk_snap.devices[0].hbm_used_bytes, 29 * 1024**3)
+            self.assertEqual(unk_snap.devices[0].hbm_total_bytes, 30 * 1024**3)
+            self.assertEqual(unk_snap.devices[0].shm_hbm_allocated_bytes, 30 * 1024**3)
 
             # Restore original payload for subsequent SHM security/torn-read tests.
             shm_file.write_bytes(payload)

@@ -538,6 +538,45 @@ class FreeTpuCdiTests(unittest.TestCase):
         self.assertTrue(any("netDevices[1].name: must be a non-empty string" in e for e in errs4), errs4)
         self.assertTrue(any("duplicate netDevice name" in e for e in errs4), errs4)
 
+        # CDI v1.1.0 cross-scope netDevices collision: global containerEdits and a
+        # selected device's containerEdits apply together, so mapping two different
+        # host interfaces to the same fixed container-side name MUST be rejected!
+        cross_net_conflict = {
+            "cdiVersion": "1.1.0",
+            "kind": "freetpu.dev/tpu",
+            "containerEdits": {
+                "deviceNodes": [{"path": "/dev/vfio/vfio"}],
+                "netDevices": [{"hostInterfaceName": "eth1", "name": "tpu0"}],
+            },
+            "devices": [
+                {
+                    "name": "0",
+                    "containerEdits": {
+                        "deviceNodes": [{"path": "/dev/vfio/0"}],
+                        "netDevices": [{"hostInterfaceName": "eth2", "name": "tpu0"}],
+                    },
+                }
+            ],
+        }
+        cross_net_errs = freetpu_cdi.validate_cdi_spec(cross_net_conflict)
+        self.assertTrue(
+            any("conflicts with global containerEdits.netDevices" in e for e in cross_net_errs),
+            cross_net_errs,
+        )
+        cross_net_ok = {
+            **cross_net_conflict,
+            "devices": [
+                {
+                    "name": "0",
+                    "containerEdits": {
+                        "deviceNodes": [{"path": "/dev/vfio/0"}],
+                        "netDevices": [{"hostInterfaceName": "eth2", "name": "tpu1"}],
+                    },
+                }
+            ],
+        }
+        self.assertEqual(freetpu_cdi.validate_cdi_spec(cross_net_ok), [])
+
         # CNCF CDI v1.1.0 IntelRdt.closID validation: "/" (root CLOS), "" (unset), and
         # valid Linux filenames pass; paths containing "/", ".", "..", "\n", "\x00", or
         # >= 4096 bytes must fail validation.
@@ -3543,6 +3582,97 @@ class FreeTpuCdiTests(unittest.TestCase):
                     sid_mapped_all["annotations"]["freetpu.dev/pci-function-count"], "8"
                 )
                 self.assertNotIn("freetpu.dev/capacity-complete", sid_mapped_all["annotations"])
+
+                # Separate-slot 4-chip Ironwood host (8 PCI functions on NUMA 0 / 0000:00,
+                # NO sysfs `chip_id`) where ONLY `--chip-id-map` pairs functions into 4 chips:
+                # `validate --check-host --remove-if-stale` WITHOUT `--chip-id-map` MUST treat
+                # missing chip pairing as unverifiable and PRESERVE the live spec (NOT unlink it!)
+                # while validating cleanly with `--chip-id-map`!
+                iw_pair_root = root / "tpu7x_map_only_pairing"
+                iw_pair_devs = [
+                    {
+                        "bdf": f"0000:00:{4 + idx:02x}.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0076",
+                        "driver": "vfio-pci",
+                        "iommu_group": str(idx),
+                        "numa_node": "0",
+                    }
+                    for idx in range(8)
+                ]
+                iwp_sys, iwp_dev = _make_mock_pci_vfio(
+                    iw_pair_root,
+                    devices=iw_pair_devs,
+                    create_vfio_nodes=[str(i) for i in range(8)],
+                )
+                iwp_map = {dev["bdf"]: idx // 2 for idx, dev in enumerate(iw_pair_devs)}
+                iwp_map_file = iw_pair_root / "pair-map.json"
+                iwp_map_file.write_text(json.dumps(iwp_map), encoding="utf-8")
+                iwp_spec_path = iw_pair_root / "freetpu-tpu.json"
+                rc_iwp_gen, _o_iwp, err_iwp = _run_cli_inproc(
+                    [
+                        "generate",
+                        "--sysfs-root",
+                        str(iwp_sys),
+                        "--dev-root",
+                        str(iwp_dev),
+                        "--chip-id-map",
+                        str(iwp_map_file),
+                        "--output",
+                        str(iwp_spec_path),
+                        "--validate",
+                    ]
+                )
+                self.assertEqual(rc_iwp_gen, 0, err_iwp)
+                iwp_loaded = json.loads(iwp_spec_path.read_text(encoding="utf-8"))
+                iwp_by_name = {d["name"]: d for d in iwp_loaded["devices"]}
+                self.assertIn("numa0-pcie-0000-00-4", iwp_by_name)
+                self.assertIn("0-3", iwp_by_name)
+                self.assertEqual(
+                    iwp_by_name["numa0-pcie-0000-00-4"]["annotations"].get(
+                        "freetpu.dev/chip-id-source"
+                    ),
+                    "chip-id-map",
+                )
+                self.assertEqual(
+                    iwp_by_name["all"]["annotations"].get("freetpu.dev/chip-id-source"),
+                    "chip-id-map",
+                )
+                rc_iwp_nomap, _o_iwpnm, err_iwpnm = _run_cli_inproc(
+                    [
+                        "validate",
+                        str(iwp_spec_path),
+                        "--check-host",
+                        "--remove-if-stale",
+                        "--sysfs-root",
+                        str(iwp_sys),
+                        "--dev-root",
+                        str(iwp_dev),
+                    ]
+                )
+                self.assertNotEqual(rc_iwp_nomap, 0)
+                self.assertIn("Preserved live CDI spec", err_iwpnm)
+                self.assertIn("--chip-id-map", err_iwpnm)
+                self.assertTrue(
+                    iwp_spec_path.exists(),
+                    "must preserve healthy separate-slot Ironwood spec when pairing --chip-id-map is omitted",
+                )
+                rc_iwp_withmap, _o_iwpwm, err_iwpwm = _run_cli_inproc(
+                    [
+                        "validate",
+                        str(iwp_spec_path),
+                        "--check-host",
+                        "--remove-if-stale",
+                        "--chip-id-map",
+                        str(iwp_map_file),
+                        "--sysfs-root",
+                        str(iwp_sys),
+                        "--dev-root",
+                        str(iwp_dev),
+                    ]
+                )
+                self.assertEqual(rc_iwp_withmap, 0, err_iwpwm)
+                self.assertTrue(iwp_spec_path.exists())
                 sid_mapped_env = dict(
                     kv.split("=", 1) for kv in sid_mapped_all["containerEdits"]["env"]
                 )

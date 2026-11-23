@@ -2425,13 +2425,13 @@ def collect_snapshot(
             dev.shm_hbm_allocated_bytes = shm.hbm_allocated_bytes
             dev.mxu_active_cycles = shm.mxu_active_cycles
             dev.dma_bytes_transferred = shm.dma_bytes_transferred
-            used_from_shm = False
             if dev.hbm_used_bytes is None:
                 dev.hbm_used_bytes = shm.hbm_used_bytes
-                used_from_shm = True
-            if shm.hbm_allocated_bytes > 0 and (
-                dev.hbm_total_bytes is None or used_from_shm
-            ):
+            # Preserve known device HBM capacity (from runtime telemetry or PCI
+            # nominal capacity); expose the libopentpu pool size through the
+            # dedicated `freetpu_tpu_shm_hbm_allocated_bytes` metric and use it
+            # as `hbm_total_bytes` ONLY when device capacity is otherwise absent.
+            if dev.hbm_total_bytes is None and shm.hbm_allocated_bytes > 0:
                 dev.hbm_total_bytes = shm.hbm_allocated_bytes
             if dev.telemetry_source == "sysfs-fallback":
                 dev.telemetry_source = "libopentpu-shm"
