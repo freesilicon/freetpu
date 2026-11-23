@@ -10,10 +10,10 @@ namespace cloudtpu {
 
 enum class TensorStorageKind {
     DENSE = 0,
-    Q8_0_SPLIT,  // Split into (qs: [B3, B2, N, K/32, 32] S8, d: [B3, B2, N, K/32] F16)
-    Q4_0_SPLIT,  // Split into (qs: [B3, B2, N, K/32, 16] U8, d: [B3, B2, N, K/32] F16)
-    Q4_K_SPLIT,  // Split into (qs: [B3, B2, N, K/32, 16] U8, d_eff: [B3, B2, N, K/32] F32, m_eff: [B3, B2, N, K/32] F32)
-    Q6_K_SPLIT,  // Split into (qs: [B3, B2, N, K/16, 16] S8, d_eff: [B3, B2, N, K/16] F32)
+    Q8_0_SPLIT,  // K-major N-minor: (qs: [B3, B2, K/32, 32, N] S8, d: [B3, B2, K/32, N] F16)
+    Q4_0_SPLIT,  // K-major N-minor: (qs: [B3, B2, K/32, 16, N] U8, d: [B3, B2, K/32, N] F16)
+    Q4_K_SPLIT,  // K-major N-minor: (qs: [B3, B2, K/32, 16, N] U8, d_eff/m_eff: [B3, B2, K/32, N] F32/BF16)
+    Q6_K_SPLIT,  // K-major N-minor: (qs: [B3, B2, K/16, 16, N] S8, d_eff: [B3, B2, K/16, N] F32/BF16)
 };
 
 enum class TensorShardingKind {
@@ -29,6 +29,8 @@ struct TensorSpec {
     TensorStorageKind storage = TensorStorageKind::DENSE;
     int64_t dims[4] = {1, 1, 1, 1};  // Logical (global) shape [ne3, ne2, ne1, ne0]
     TensorShardingKind sharding = TensorShardingKind::REPLICATED;
+    int32_t alias_output_idx = -1;  // >= 0 emits {tf.aliasing_output = idx : i32} for in-place HBM donation
+    PjrtDType scale_dtype = PjrtDType::INVALID;  // Optional override for Q4_K/Q6_K scale/min dtype (INVALID = default)
 
     int64_t ne0() const { return dims[3]; }
     int64_t ne1() const { return dims[2]; }
@@ -110,6 +112,9 @@ struct GraphProgramSpec {
     std::vector<OpNodeSpec> ops;      // Topologically ordered ops
     std::vector<uint64_t> output_ids; // Live-out TensorSpec::ids
     int32_t spmd_chips = 1;           // Number of replica-SPMD chips (1 = single chip, 4 = tpu7x, 8 = v6e-8)
+    bool bf16_matmul = true;          // Cast split-quantized weights & activations to BF16 for MXU (dense F16/F32 stay F32)
+    bool bf16_flash_attn = false;     // Opt-in BF16 Q/K/probs/V matmuls in FLASH_ATTN_EXT (default false: F32 parity)
+    bool q4_split_dot = true;         // Q4_0/Q4_K: true = two split-X dots (zero concat); false = single concat dot
 };
 
 struct PjrtInputBinding {
@@ -117,6 +122,7 @@ struct PjrtInputBinding {
     int part = 0;  // 0 = dense or quant qs, 1 = quant d scales, 2 = quant m mins (Q4_K)
     PjrtDType dtype = PjrtDType::F32;
     std::vector<int64_t> dims;
+    bool donatable = false;
 };
 
 struct PjrtOutputBinding {

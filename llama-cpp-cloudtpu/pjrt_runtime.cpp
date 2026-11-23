@@ -14,6 +14,7 @@
 #include <locale>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_set>
 #include <utility>
 
 namespace cloudtpu {
@@ -223,10 +224,20 @@ void append_tag_bytes(std::string& out, uint32_t field_number, const std::string
     out.append(payload);
 }
 
+void append_tag_fixed64(std::string& out, uint32_t field_number, uint64_t val) {
+    append_varint(out, (static_cast<uint64_t>(field_number) << 3) | 1ULL);
+    for (int i = 0; i < 8; ++i) {
+        out.push_back(static_cast<char>((val >> (i * 8)) & 0xFFU));
+    }
+}
+
 }  // namespace
 
 std::string encode_compile_options_proto(const PjrtCompileOptions& opts) {
     // xla::ExecutableBuildOptionsProto (openxla/xla/xla/pjrt/proto/compile_options.proto)
+    // Intentionally omit field 3 (debug_options) so OpenXLA preserves compiler defaults
+    // and XLA_FLAGS (e.g. --xla_dump_to); pass flag overrides via CompileOptionsProto
+    // field 7 (env_option_overrides) instead.
     std::string ebo;
     if (opts.num_replicas > 0) {
         append_tag_varint(ebo, 4, static_cast<uint64_t>(opts.num_replicas));
@@ -264,14 +275,102 @@ std::string encode_compile_options_proto(const PjrtCompileOptions& opts) {
         }
         append_tag_bytes(ebo, 9, da);
     }
+    if (opts.alias_passthrough_params) {
+        append_tag_varint(ebo, 10, 1);
+    }
     if (opts.use_shardy_partitioner) {
         append_tag_varint(ebo, 19, 1);
     }
 
-    // xla::CompileOptionsProto { executable_build_options (field 3, length-delimited) }
+    // xla::CompileOptionsProto {
+    //   ExecutableBuildOptionsProto executable_build_options = 3;
+    //   map<string, OptionOverrideProto> env_option_overrides = 7;
+    // }
     std::string out;
     append_tag_bytes(out, 3, ebo);
+    for (const auto& ov : opts.env_option_overrides) {
+        // OptionOverrideProto {
+        //   oneof value { string string_field = 1; bool bool_field = 2; int64 int_field = 3; double double_field = 4; }
+        // }
+        std::string override_val;
+        switch (ov.kind) {
+            case PjrtOptionOverride::Kind::STRING:
+                append_tag_bytes(override_val, 1, ov.string_val);
+                break;
+            case PjrtOptionOverride::Kind::BOOL:
+                append_tag_varint(override_val, 2, ov.bool_val ? 1ULL : 0ULL);
+                break;
+            case PjrtOptionOverride::Kind::INT64:
+                append_tag_varint(override_val, 3, static_cast<uint64_t>(ov.int_val));
+                break;
+            case PjrtOptionOverride::Kind::DOUBLE: {
+                uint64_t bits = 0;
+                std::memcpy(&bits, &ov.double_val, sizeof(bits));
+                append_tag_fixed64(override_val, 4, bits);
+                break;
+            }
+        }
+        // map<string, OptionOverrideProto> entry { string key = 1; OptionOverrideProto value = 2; }
+        std::string entry;
+        append_tag_bytes(entry, 1, ov.key);
+        append_tag_bytes(entry, 2, override_val);
+        append_tag_bytes(out, 7, entry);
+    }
     return out;
+}
+
+std::string append_async_collective_libtpu_init_args(const std::string& existing_args) {
+    // Documented TPU async collective overlap flags for LIBTPU_INIT_ARGS (TorchTPU / MaxText
+    // v5e/v6e reference). These are libtpu initialization flags, NOT xla::DebugOptions fields,
+    // so they must be supplied via LIBTPU_INIT_ARGS before libtpu.so loads rather than via
+    // CompileOptionsProto.env_option_overrides.
+    static const std::pair<const char*, const char*> kFlags[] = {
+        {"xla_tpu_enable_async_collective_fusion", "true"},
+        {"xla_tpu_enable_async_collective_fusion_fuse_all_gather", "true"},
+        {"xla_tpu_enable_async_collective_fusion_multiple_steps", "true"},
+        {"xla_tpu_overlap_compute_collective_tc", "true"},
+        {"xla_enable_async_all_gather", "true"},
+    };
+
+    std::unordered_set<std::string> present;
+    {
+        std::istringstream iss(existing_args);
+        std::string tok;
+        while (iss >> tok) {
+            size_t start = 0;
+            while (start < tok.size() && tok[start] == '-') {
+                ++start;
+            }
+            if (start == 0 || start >= tok.size()) {
+                continue;
+            }
+            const size_t eq = tok.find('=', start);
+            std::string name = (eq == std::string::npos) ? tok.substr(start) : tok.substr(start, eq - start);
+            present.insert(name);
+            if (name.size() > 2 && name.compare(0, 2, "no") == 0) {
+                present.insert(name.substr(2));
+            }
+        }
+    }
+
+    std::string merged = existing_args;
+    while (!merged.empty() && std::isspace(static_cast<unsigned char>(merged.back()))) {
+        merged.pop_back();
+    }
+    for (const auto& kv : kFlags) {
+        if (present.count(kv.first) != 0) {
+            continue;
+        }
+        if (!merged.empty()) {
+            merged.push_back(' ');
+        }
+        merged.append("--");
+        merged.append(kv.first);
+        merged.push_back('=');
+        merged.append(kv.second);
+        present.insert(kv.first);
+    }
+    return merged;
 }
 
 // =========================================================================
@@ -662,6 +761,7 @@ struct MockOp {
         SELECT,
         REPLICA_ID,
         DYNAMIC_SLICE,
+        DYNAMIC_UPDATE_SLICE,
         ALL_REDUCE_ADD,
         ALL_REDUCE_MAX,
         ALL_GATHER,
@@ -760,7 +860,8 @@ static MockProgram parse_stablehlo_mlir(const std::string& mlir) {
             stmt.find("\"stablehlo.all_reduce\"") != std::string::npos ||
             stmt.find("\"stablehlo.all_gather\"") != std::string::npos ||
             stmt.find("\"stablehlo.reduce_scatter\"") != std::string::npos ||
-            stmt.find("\"stablehlo.dynamic_slice\"") != std::string::npos) {
+            stmt.find("\"stablehlo.dynamic_slice\"") != std::string::npos ||
+            stmt.find("\"stablehlo.dynamic_update_slice\"") != std::string::npos) {
             while (li + 1 < lines.size() &&
                    (stmt.find("->") == std::string::npos || stmt.rfind('>') < stmt.find("->"))) {
                 stmt += " " + lines[++li];
@@ -993,6 +1094,11 @@ static MockProgram parse_stablehlo_mlir(const std::string& mlir) {
             const size_t sp = rhs.find("slice_sizes = array<i64:");
             const size_t se = rhs.find('>', sp);
             op.dynamic_slice_sizes = parse_int_list(rhs.substr(sp + 24, se - (sp + 24)));
+        } else if (rhs.rfind("\"stablehlo.dynamic_update_slice\"", 0) == 0) {
+            op.kind = MockOp::Kind::DYNAMIC_UPDATE_SLICE;
+            const size_t lp = rhs.find('(');
+            const size_t rp = rhs.find(')', lp);
+            op.inputs = extract_ssa_refs(rhs.substr(lp + 1, rp - lp - 1));
         } else if (rhs.rfind("\"stablehlo.all_reduce\"", 0) == 0 ||
                    rhs.rfind("\"stablehlo.all_gather\"", 0) == 0 ||
                    rhs.rfind("\"stablehlo.reduce_scatter\"", 0) == 0) {
@@ -1511,6 +1617,45 @@ static MockTensor eval_mock_op(const MockOp& op,
                     src_idx += (static_cast<size_t>(starts[d]) + c) * in_strides[d];
                 }
                 std::memcpy(out.bytes.data() + i * elem_sz, a.bytes.data() + src_idx * elem_sz, elem_sz);
+            }
+            break;
+        }
+        case MockOp::Kind::DYNAMIC_UPDATE_SLICE: {
+            if (op.inputs.size() < 2) {
+                throw std::runtime_error("MockPJRT: dynamic_update_slice requires operand and update");
+            }
+            const MockTensor& operand = env.at(op.inputs[0]);
+            const MockTensor& update = env.at(op.inputs[1]);
+            const size_t rank = operand.dims.size();
+            if (operand.dtype != out.dtype || update.dtype != operand.dtype ||
+                operand.dims != out.dims || update.dims.size() != rank) {
+                throw std::runtime_error("MockPJRT: dynamic_update_slice operand/update type or rank mismatch");
+            }
+            for (size_t d = 0; d < rank; ++d) {
+                if (update.dims[d] > operand.dims[d]) {
+                    throw std::runtime_error("MockPJRT: dynamic_update_slice update dim exceeds operand dim");
+                }
+            }
+            out.bytes = operand.bytes;
+            std::vector<int64_t> starts(rank, 0);
+            for (size_t d = 0; d < rank && (d + 2) < op.inputs.size(); ++d) {
+                const int64_t st = env.at(op.inputs[d + 2]).read_i64(0);
+                const int64_t max_st = std::max<int64_t>(0, operand.dims[d] - update.dims[d]);
+                starts[d] = std::max<int64_t>(0, std::min<int64_t>(max_st, st));
+            }
+            const auto out_strides = compute_row_major_strides(out.dims);
+            const auto upd_strides = compute_row_major_strides(update.dims);
+            const size_t elem_sz = pjrt_dtype_size(out.dtype);
+            const size_t n_upd = update.num_elements();
+            for (size_t i = 0; i < n_upd; ++i) {
+                size_t rem = i;
+                size_t dst_idx = 0;
+                for (size_t d = 0; d < rank; ++d) {
+                    const size_t c = rem / upd_strides[d];
+                    rem %= upd_strides[d];
+                    dst_idx += (static_cast<size_t>(starts[d]) + c) * out_strides[d];
+                }
+                std::memcpy(out.bytes.data() + dst_idx * elem_sz, update.bytes.data() + i * elem_sz, elem_sz);
             }
             break;
         }
@@ -2292,6 +2437,11 @@ void PjrtRuntime::init(const RuntimeConfig& cfg) {
             "Live libtpu.so loading is only supported on Linux/POSIX; use mock mode on Windows");
 #else
         setenv("GRPC_VERBOSITY", "ERROR", 0);
+        if (cfg.async_collectives) {
+            const char* cur = std::getenv("LIBTPU_INIT_ARGS");
+            const std::string merged = append_async_collective_libtpu_init_args(cur ? cur : "");
+            setenv("LIBTPU_INIT_ARGS", merged.c_str(), 1);
+        }
         const std::string so_path = resolve_libtpu_path(cfg.libtpu_path);
         dl_handle_ = dlopen(so_path.c_str(), RTLD_NOW | RTLD_GLOBAL);
         if (!dl_handle_) {
@@ -2593,8 +2743,11 @@ std::vector<PjrtBufferPtr> PjrtRuntime::buffer_from_host_replicated(int num_devi
     return bufs;
 }
 
-PjrtCompileOptions PjrtRuntime::make_spmd_compile_options(int num_chips, int device_idx) const {
+PjrtCompileOptions PjrtRuntime::make_spmd_compile_options(int num_chips,
+                                                          int device_idx,
+                                                          bool alias_passthrough) const {
     PjrtCompileOptions opts;
+    opts.alias_passthrough_params = alias_passthrough;
     const int n = std::max(1, std::min(num_chips, static_cast<int>(device_infos_.size())));
     if (n <= 1) {
         opts.num_replicas = 1;
@@ -2607,6 +2760,9 @@ PjrtCompileOptions PjrtRuntime::make_spmd_compile_options(int num_chips, int dev
     } else {
         // Explicit collective replica-SPMD across n TPU chips:
         // num_replicas = n, num_partitions = 1, explicit DeviceAssignmentProto mapping [0][0..n-1].
+        // Leave env_option_overrides empty: OpenXLA's CompileOptions::ApplyOption only accepts
+        // xla::DebugOptions fields and rejects TPU-specific xla_tpu_* flags; opt-in async
+        // collective flags are passed via LIBTPU_INIT_ARGS before libtpu.so loads.
         opts.num_replicas = n;
         opts.num_partitions = 1;
         opts.use_spmd_partitioning = false;
@@ -2799,7 +2955,8 @@ void PjrtRuntime::execute(const CachedExecutablePtr& exec,
                           std::vector<PjrtBufferPtr>& outputs,
                           const std::vector<PjrtDType>& out_dtypes,
                           const std::vector<std::vector<int64_t>>& out_dims,
-                          bool sync) {
+                          bool sync,
+                          const std::vector<int64_t>* non_donatable_input_indices) {
     if (!exec || !exec->handle) {
         throw std::runtime_error("execute: null CachedExecutable");
     }
@@ -2834,6 +2991,10 @@ void PjrtRuntime::execute(const CachedExecutablePtr& exec,
 
     PJRT_ExecuteOptions opts = {};
     opts.struct_size = PJRT_ExecuteOptions_STRUCT_SIZE;
+    if (non_donatable_input_indices && !non_donatable_input_indices->empty()) {
+        opts.non_donatable_input_indices = non_donatable_input_indices->data();
+        opts.num_non_donatable_input_indices = non_donatable_input_indices->size();
+    }
 
     PJRT_Event* dev_ev[1] = {nullptr};
     const bool use_dev_event = sync && !has_ready_event_;
@@ -2895,7 +3056,8 @@ void PjrtRuntime::execute_spmd(const CachedExecutablePtr& exec,
                                std::vector<std::vector<PjrtBufferPtr>>& per_device_outputs,
                                const std::vector<PjrtDType>& out_dtypes,
                                const std::vector<std::vector<int64_t>>& out_dims,
-                               bool sync) {
+                               bool sync,
+                               const std::vector<int64_t>* non_donatable_input_indices) {
     if (!exec || !exec->handle) {
         throw std::runtime_error("execute_spmd: null CachedExecutable");
     }
@@ -2923,6 +3085,13 @@ void PjrtRuntime::execute_spmd(const CachedExecutablePtr& exec,
 
     PJRT_ExecuteOptions opts = {};
     opts.struct_size = PJRT_ExecuteOptions_STRUCT_SIZE;
+    const uint32_t raw_lid = next_launch_id_.fetch_add(1, std::memory_order_relaxed);
+    const int32_t safe_lid = static_cast<int32_t>(raw_lid & 0x7FFFFFFFU);
+    opts.launch_id = (safe_lid > 0) ? safe_lid : 1;
+    if (non_donatable_input_indices && !non_donatable_input_indices->empty()) {
+        opts.non_donatable_input_indices = non_donatable_input_indices->data();
+        opts.num_non_donatable_input_indices = non_donatable_input_indices->size();
+    }
 
     const bool use_dev_event = sync && !has_ready_event_;
     std::vector<PJRT_Event*> dev_events(use_dev_event ? n_devs : 0, nullptr);
