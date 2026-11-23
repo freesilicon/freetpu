@@ -716,6 +716,62 @@ void test_flash_attn_fully_masked_row(cloudtpu::PjrtRuntime& rt) {
     std::printf("  [PASS] FLASH_ATTN_EXT fully -INF masked row returns zero\n");
 }
 
+void test_q4_k_split_mul_mat(cloudtpu::PjrtRuntime& rt) {
+    // Verify Q4_K_SPLIT emission & execution preserves rank-4 dims for both scales (d) and mins (m).
+    constexpr int64_t M = 2, K = 32, N = 3, NB = K / 32;
+    std::vector<uint8_t> qs(static_cast<size_t>(N * NB * 16), 0);
+    std::vector<float> d(static_cast<size_t>(N * NB), 0.5f);
+    std::vector<float> m(static_cast<size_t>(N * NB), -1.0f);
+    std::vector<float> w_ref(static_cast<size_t>(N * K), 0.0f);
+    for (int64_t n = 0; n < N; ++n) {
+        d[static_cast<size_t>(n)] = 0.25f * static_cast<float>(n + 1);
+        m[static_cast<size_t>(n)] = -0.5f * static_cast<float>(n + 1);
+        for (int64_t i = 0; i < 16; ++i) {
+            const uint8_t lo = static_cast<uint8_t>((n + i) & 0x0F);
+            const uint8_t hi = static_cast<uint8_t>((n + i + 3) & 0x0F);
+            qs[static_cast<size_t>(n * 16 + i)] = static_cast<uint8_t>(lo | (hi << 4));
+            w_ref[static_cast<size_t>(n * K + i)] = static_cast<float>(lo) * d[static_cast<size_t>(n)] + m[static_cast<size_t>(n)];
+            w_ref[static_cast<size_t>(n * K + 16 + i)] = static_cast<float>(hi) * d[static_cast<size_t>(n)] + m[static_cast<size_t>(n)];
+        }
+    }
+    std::vector<float> x(static_cast<size_t>(M * K));
+    for (size_t i = 0; i < x.size(); ++i) x[i] = 0.1f * static_cast<float>(static_cast<int>(i % 7) - 3);
+
+    auto bqs = rt.buffer_from_host(0, qs.data(), cloudtpu::PjrtDType::U8, {1, 1, N, NB, 16});
+    auto bd = rt.buffer_from_host(0, d.data(), cloudtpu::PjrtDType::F32, {1, 1, N, NB});
+    auto bm = rt.buffer_from_host(0, m.data(), cloudtpu::PjrtDType::F32, {1, 1, N, NB});
+    auto bx = rt.buffer_from_host(0, x.data(), cloudtpu::PjrtDType::F32, {1, 1, M, K});
+
+    cloudtpu::GraphProgramSpec spec;
+    spec.inputs.push_back({1, cloudtpu::PjrtDType::U8, cloudtpu::TensorStorageKind::Q4_K_SPLIT, {1, 1, N, K}});
+    spec.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, K}});
+    cloudtpu::OpNodeSpec mm;
+    mm.kind = cloudtpu::CloudOpKind::MUL_MAT;
+    mm.src_ids = {1, 2};
+    mm.dst = {3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, N}};
+    mm.high_precision = true;
+    spec.ops.push_back(mm);
+    spec.output_ids = {3};
+
+    const auto prog = cloudtpu::emit_stablehlo_program(spec);
+    CHECK_TRUE(prog.input_bindings.size() == 4, "Q4_K_SPLIT MUL_MAT has 4 input bindings (qs, d, m, x)");
+    CHECK_TRUE(prog.input_bindings[2].dims == std::vector<int64_t>({1, 1, N, NB}), "Q4_K mins binding rank-4");
+
+    const auto got = run_emitted(rt, prog, {bqs, bd, bm, bx});
+    std::vector<float> expected(static_cast<size_t>(M * N), 0.0f);
+    for (int64_t r = 0; r < M; ++r) {
+        for (int64_t n = 0; n < N; ++n) {
+            float acc = 0.0f;
+            for (int64_t k = 0; k < K; ++k) {
+                acc += x[static_cast<size_t>(r * K + k)] * w_ref[static_cast<size_t>(n * K + k)];
+            }
+            expected[static_cast<size_t>(r * N + n)] = acc;
+        }
+    }
+    check_vec_close(got, expected, 1e-4f, "Q4_K_SPLIT MUL_MAT");
+    std::printf("  [PASS] Q4_K_SPLIT MUL_MAT (rank-4 scales & mins)\n");
+}
+
 }  // namespace
 
 int main() {
@@ -744,6 +800,7 @@ int main() {
     test_mul_mat_dense_and_quant(rt);
     test_rms_rope_softmax_swiglu_getrows_fused(rt);
     test_flash_attn_fully_masked_row(rt);
+    test_q4_k_split_mul_mat(rt);
     test_silicon_regressions(rt);
 
     const size_t py_maps = cloudtpu::count_libpython_mappings();

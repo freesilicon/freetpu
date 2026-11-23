@@ -85,6 +85,13 @@ struct PjrtBufferDeleter {
 
 using PjrtBufferHandle = std::unique_ptr<PJRT_Buffer, PjrtBufferDeleter>;
 
+struct PjrtEventDeleter {
+    const PJRT_Api* api = nullptr;
+    void operator()(PJRT_Event* ev) const noexcept;
+};
+
+using PjrtEventHandle = std::unique_ptr<PJRT_Event, PjrtEventDeleter>;
+
 struct PjrtBuffer {
     PjrtBufferHandle handle;
     PjrtDType dtype = PjrtDType::INVALID;
@@ -141,8 +148,10 @@ public:
                                    const std::vector<int64_t>& dims);
 
     void buffer_to_host(PJRT_Buffer* buf, void* dst, size_t dst_size);
+    PjrtEventHandle create_buffer_ready_event(PJRT_Buffer* buf);
     void await_buffer_ready(PJRT_Buffer* buf);
     void await_event(PJRT_Event* ev);
+    void await_event(PjrtEventHandle ev);
 
     // Compile StableHLO MLIR ("mlir" format) or return an owning reference to a cached executable.
     // Thread-safe LRU cache keyed by canonical structural program key and target device assignment.

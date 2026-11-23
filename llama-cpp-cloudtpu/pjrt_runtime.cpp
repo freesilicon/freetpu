@@ -297,6 +297,22 @@ void PjrtBufferDeleter::operator()(PJRT_Buffer* buf) const noexcept {
     }
 }
 
+void PjrtEventDeleter::operator()(PJRT_Event* ev) const noexcept {
+    if (!ev || !api || !PJRT_API_HAS(api, PJRT_Event_Destroy)) {
+        return;
+    }
+    PJRT_Event_Destroy_Args args = {};
+    args.struct_size = PJRT_Event_Destroy_Args_STRUCT_SIZE;
+    args.event = ev;
+    PJRT_Error* err = api->PJRT_Event_Destroy(&args);
+    if (err && PJRT_API_HAS(api, PJRT_Error_Destroy)) {
+        PJRT_Error_Destroy_Args d_args = {};
+        d_args.struct_size = PJRT_Error_Destroy_Args_STRUCT_SIZE;
+        d_args.error = err;
+        api->PJRT_Error_Destroy(&d_args);
+    }
+}
+
 size_t PjrtBuffer::num_elements() const {
     size_t n = 1;
     for (int64_t d : dims) {
@@ -2002,16 +2018,28 @@ void PjrtRuntime::await_event(PJRT_Event* ev) {
     check_error(derr, "PJRT_Event_Destroy");
 }
 
-void PjrtRuntime::await_buffer_ready(PJRT_Buffer* buf) {
-    if (!buf || !has_ready_event_) {
+void PjrtRuntime::await_event(PjrtEventHandle ev) {
+    if (!ev) {
         return;
+    }
+    await_event(ev.release());
+}
+
+PjrtEventHandle PjrtRuntime::create_buffer_ready_event(PJRT_Buffer* buf) {
+    if (!buf || !has_ready_event_) {
+        return PjrtEventHandle(nullptr, PjrtEventDeleter{api_});
     }
     PJRT_Buffer_ReadyEvent_Args r_args = {};
     r_args.struct_size = PJRT_Buffer_ReadyEvent_Args_STRUCT_SIZE;
     r_args.buffer = buf;
     check_error(api_->PJRT_Buffer_ReadyEvent(&r_args), "PJRT_Buffer_ReadyEvent");
-    if (r_args.event) {
-        await_event(r_args.event);
+    return PjrtEventHandle(r_args.event, PjrtEventDeleter{api_});
+}
+
+void PjrtRuntime::await_buffer_ready(PJRT_Buffer* buf) {
+    PjrtEventHandle ev = create_buffer_ready_event(buf);
+    if (ev) {
+        await_event(std::move(ev));
     }
 }
 

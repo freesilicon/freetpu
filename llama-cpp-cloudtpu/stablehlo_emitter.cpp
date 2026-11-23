@@ -554,7 +554,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
             th.q_qs = builder.arg_val(arg_idx - 1);
             prog.input_bindings.push_back({in.id, 0, q_dt, std::move(qs_dims)});
 
-            std::vector<int64_t> d_dims = {B3, B2, M_or_N, NB};
+            const std::vector<int64_t> d_dims = {B3, B2, M_or_N, NB};
             const std::string d_name = "%arg" + std::to_string(arg_idx++);
             builder.add_arg(d_name, d_dt, d_dims);
             th.q_d = builder.arg_val(arg_idx - 1);
@@ -565,7 +565,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                 builder.add_arg(m_name, PjrtDType::F32, d_dims);
                 th.q_m = builder.arg_val(arg_idx - 1);
                 th.has_q_m = true;
-                prog.input_bindings.push_back({in.id, 2, PjrtDType::F32, std::move(d_dims)});
+                prog.input_bindings.push_back({in.id, 2, PjrtDType::F32, d_dims});
             }
         }
         env[in.id] = std::move(th);

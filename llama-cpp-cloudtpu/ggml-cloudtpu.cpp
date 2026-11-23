@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -195,13 +196,26 @@ static bool try_build_view_slice(const struct ggml_tensor* t, ViewSlicePlan* pla
     if ((t->nb[1] % el) != 0 || (t->nb[2] % el) != 0 || (t->nb[3] % el) != 0) {
         return false;
     }
-    const int64_t s1 = std::max<int64_t>(t->ne[0], static_cast<int64_t>(t->nb[1] / el));
+    const int64_t raw_s1 = static_cast<int64_t>(t->nb[1] / el);
+    const int64_t raw_s2 = static_cast<int64_t>(t->nb[2] / el);
+    const int64_t raw_s3 = static_cast<int64_t>(t->nb[3] / el);
+    // Reject overlapping row/plane/batch strides that a non-overlapping slice cannot represent.
+    if (t->ne[1] > 1 && raw_s1 < t->ne[0]) {
+        return false;
+    }
+    const int64_t s1 = (t->ne[1] == 1) ? std::max<int64_t>(t->ne[0], raw_s1) : raw_s1;
+    if (t->ne[2] > 1 && raw_s2 < s1 * t->ne[1]) {
+        return false;
+    }
     const int64_t s2 = (t->ne[2] == 1 && t->ne[3] == 1)
-                           ? std::max<int64_t>(s1 * t->ne[1], static_cast<int64_t>(t->nb[2] / el))
-                           : static_cast<int64_t>(t->nb[2] / el);
+                           ? std::max<int64_t>(s1 * t->ne[1], raw_s2)
+                           : raw_s2;
+    if (t->ne[3] > 1 && raw_s3 < s2 * t->ne[2]) {
+        return false;
+    }
     const int64_t s3 = (t->ne[3] == 1)
-                           ? std::max<int64_t>(s2 * t->ne[2], static_cast<int64_t>(t->nb[3] / el))
-                           : static_cast<int64_t>(t->nb[3] / el);
+                           ? std::max<int64_t>(s2 * t->ne[2], raw_s3)
+                           : raw_s3;
     if (s1 <= 0 || s2 <= 0 || s3 <= 0 || (s2 % s1) != 0 || (s3 % s2) != 0) {
         return false;
     }
@@ -1165,7 +1179,7 @@ struct ggml_backend_cloudtpu_context {
     uint64_t total_subgraphs = 0;
     uint64_t total_ops_executed = 0;
     std::mutex sync_mu;
-    std::vector<cloudtpu::PjrtBufferPtr> pending_sync_buffers;
+    std::deque<cloudtpu::PjrtEventHandle> pending_sync_events;
 
     ~ggml_backend_cloudtpu_context() {
         if (env.verbose > 0) {
@@ -1806,10 +1820,10 @@ static void ggml_backend_cloudtpu_synchronize_ctx(ggml_backend_cloudtpu_context*
     if (!ctx) {
         return;
     }
-    std::vector<cloudtpu::PjrtBufferPtr> to_wait;
+    std::deque<cloudtpu::PjrtEventHandle> to_wait;
     {
         std::lock_guard<std::mutex> lock(ctx->sync_mu);
-        to_wait.swap(ctx->pending_sync_buffers);
+        to_wait.swap(ctx->pending_sync_events);
     }
     if (to_wait.empty()) {
         return;
@@ -1818,9 +1832,11 @@ static void ggml_backend_cloudtpu_synchronize_ctx(ggml_backend_cloudtpu_context*
     if (!rt.is_initialized()) {
         return;
     }
-    for (const auto& buf : to_wait) {
-        if (buf && buf->handle) {
-            rt.await_buffer_ready(buf->handle.get());
+    while (!to_wait.empty()) {
+        cloudtpu::PjrtEventHandle ev = std::move(to_wait.front());
+        to_wait.pop_front();
+        if (ev) {
+            rt.await_event(std::move(ev));
         }
     }
 }
@@ -2134,9 +2150,37 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
     if (sync_exec) {
         ggml_backend_cloudtpu_synchronize_ctx(ctx);
     } else {
-        std::lock_guard<std::mutex> lock(ctx->sync_mu);
-        ctx->pending_sync_buffers.insert(
-            ctx->pending_sync_buffers.end(), outputs.begin(), outputs.end());
+        // Track lightweight PJRT ready events instead of owning PJRT_Buffer references so
+        // GGML slot reuse immediately frees HBM, while capping in-flight events to O(1).
+        constexpr size_t kMaxPendingSyncEvents = 16;
+        std::vector<cloudtpu::PjrtEventHandle> new_events;
+        new_events.reserve(outputs.size());
+        for (const auto& buf : outputs) {
+            if (buf && buf->handle) {
+                cloudtpu::PjrtEventHandle ev = rt.create_buffer_ready_event(buf->handle.get());
+                if (ev) {
+                    new_events.push_back(std::move(ev));
+                }
+            }
+        }
+        std::deque<cloudtpu::PjrtEventHandle> overflow_events;
+        {
+            std::lock_guard<std::mutex> lock(ctx->sync_mu);
+            for (auto& ev : new_events) {
+                ctx->pending_sync_events.push_back(std::move(ev));
+            }
+            while (ctx->pending_sync_events.size() > kMaxPendingSyncEvents) {
+                overflow_events.push_back(std::move(ctx->pending_sync_events.front()));
+                ctx->pending_sync_events.pop_front();
+            }
+        }
+        while (!overflow_events.empty()) {
+            cloudtpu::PjrtEventHandle ev = std::move(overflow_events.front());
+            overflow_events.pop_front();
+            if (ev) {
+                rt.await_event(std::move(ev));
+            }
+        }
     }
 
     ctx->total_subgraphs += 1;
