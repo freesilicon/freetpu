@@ -35,8 +35,9 @@ dive_interp_rv64.bin
 *.ref.bin
 *.out.bin
 
-# Upstream llama.cpp checkouts inside llama-cpp-edgetpu/
+# Upstream llama.cpp checkouts inside llama-cpp-edgetpu/ and llama-cpp-cloudtpu/
 llama-cpp-edgetpu/upstream/
+llama-cpp-cloudtpu/upstream/
 
 # OS / editor noise
 .DS_Store
