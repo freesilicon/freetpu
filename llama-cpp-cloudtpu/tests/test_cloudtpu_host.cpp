@@ -6261,6 +6261,206 @@ void test_ggml_cgraph_reshaped_host_cpy_and_q4_bitcast_view() {
     std::printf("  [PASS] ggml_cgraph reshaped host CPY bucket writeback & 3-row BITCAST Q4_K slot-shape fallback\n");
 #endif
 }
+
+void test_ggml_cgraph_freetile_mosaic_fallback() {
+#if !defined(_WIN32)
+    // End-to-end GGML backend test exercising execute_subgraph's automatic Mosaic -> StableHLO
+    // compile retry (CLOUDTPU_FREETILE_MOSAIC=1 + CLOUDTPU_FREETILE_MOSAIC_VERSION=999) as well
+    // as normal Mosaic execution (default version 17) on an eligible Q4_K matmul (M=1, K=256, N=128).
+    const int64_t K = 256, N = 128, M = 1;
+    std::vector<uint8_t> w_raw(static_cast<size_t>(N) * 144U, 0);
+    for (int64_t r = 0; r < N; ++r) {
+        uint8_t* blk = w_raw.data() + static_cast<size_t>(r) * 144U;
+        const uint16_t d_f16 = cloudtpu::f32_to_f16(0.03f * static_cast<float>((r % 5) + 1));
+        const uint16_t dmin_f16 = cloudtpu::f32_to_f16(0.01f * static_cast<float>((r % 3) + 1));
+        std::memcpy(blk + 0, &d_f16, 2);
+        std::memcpy(blk + 2, &dmin_f16, 2);
+        for (int i = 0; i < 12; ++i) {
+            blk[4 + i] = static_cast<uint8_t>(((r * 7 + i * 5) % 15) + 1);
+        }
+        for (int i = 0; i < 128; ++i) {
+            const uint8_t lo = static_cast<uint8_t>((r * 3 + i * 5) & 0x0F);
+            const uint8_t hi = static_cast<uint8_t>((r * 5 + i * 3 + 1) & 0x0F);
+            blk[16 + i] = static_cast<uint8_t>(lo | (hi << 4));
+        }
+    }
+    std::vector<float> x_host(static_cast<size_t>(M * K));
+    for (size_t i = 0; i < x_host.size(); ++i) {
+        x_host[i] = std::sin(static_cast<float>(i) * 0.09f);
+    }
+
+    std::vector<float> ref_y(static_cast<size_t>(M * N), 0.0f);
+    {
+        ggml_backend_t cpu_be = ggml_backend_cpu_init();
+        CHECK_TRUE(cpu_be != nullptr, "cpu backend init for FreeTile Mosaic fallback ref");
+        const size_t mem = ggml_tensor_overhead() * 24 + ggml_graph_overhead() + 4096;
+        struct ggml_init_params p = {mem, nullptr, true};
+        struct ggml_context* ctx_w = ggml_init(p);
+        ggml_tensor* tw = ggml_new_tensor_2d(ctx_w, GGML_TYPE_Q4_K, K, N);
+        ggml_backend_buffer_t w_buf = ggml_backend_alloc_ctx_tensors(ctx_w, cpu_be);
+        ggml_backend_tensor_set(tw, w_raw.data(), 0, w_raw.size());
+
+        struct ggml_context* ctx_g = ggml_init(p);
+        struct ggml_cgraph* gf = ggml_new_graph(ctx_g);
+        ggml_tensor* tx = ggml_new_tensor_2d(ctx_g, GGML_TYPE_F32, K, M);
+        ggml_set_input(tx);
+        ggml_tensor* ty = ggml_mul_mat(ctx_g, tw, tx);
+        ggml_set_output(ty);
+        ggml_build_forward_expand(gf, ty);
+
+        ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu_be));
+        CHECK_TRUE(ggml_gallocr_alloc_graph(galloc, gf), "cpu alloc for FreeTile Mosaic ref");
+        ggml_backend_tensor_set(tx, x_host.data(), 0, x_host.size() * sizeof(float));
+        CHECK_TRUE(ggml_backend_graph_compute(cpu_be, gf) == GGML_STATUS_SUCCESS, "cpu compute FreeTile Mosaic ref");
+        ggml_backend_tensor_get(ty, ref_y.data(), 0, ref_y.size() * sizeof(float));
+
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx_g);
+        ggml_backend_buffer_free(w_buf);
+        ggml_free(ctx_w);
+        ggml_backend_free(cpu_be);
+    }
+    double ref_energy = 0.0;
+    for (float v : ref_y) ref_energy += static_cast<double>(v) * static_cast<double>(v);
+    CHECK_TRUE(ref_energy > 1e-2, "FreeTile Mosaic fallback CPU reference must be non-zero");
+
+    auto run_child = [&](const char* mosaic_ver, const char* label) {
+        std::fflush(stdout);
+        std::fflush(stderr);
+        const pid_t pid = fork();
+        CHECK_TRUE(pid >= 0, label);
+        if (pid == 0) {
+            setenv("CLOUDTPU_MOCK", "1", 1);
+            setenv("CLOUDTPU_MOCK_DEVICES", "1", 1);
+            setenv("CLOUDTPU_SPMD_CHIPS", "1", 1);
+            setenv("CLOUDTPU_Q4_MODE", "i4", 1);
+            setenv("CLOUDTPU_Q4K_BF16_SCALES", "0", 1);
+            setenv("CLOUDTPU_FREETILE_MOSAIC", "1", 1);
+            if (mosaic_ver != nullptr) {
+                setenv("CLOUDTPU_FREETILE_MOSAIC_VERSION", mosaic_ver, 1);
+            } else {
+                unsetenv("CLOUDTPU_FREETILE_MOSAIC_VERSION");
+            }
+            ggml_backend_t be = ggml_backend_cloudtpu_init();
+            bool ok = false;
+            if (be != nullptr) {
+                const size_t mem = ggml_tensor_overhead() * 24 + ggml_graph_overhead() + 4096;
+                struct ggml_init_params p = {mem, nullptr, true};
+                struct ggml_context* ctx_w = ggml_init(p);
+                ggml_tensor* tw = ggml_new_tensor_2d(ctx_w, GGML_TYPE_Q4_K, K, N);
+                ggml_backend_buffer_t w_buf = ggml_backend_alloc_ctx_tensors(ctx_w, be);
+                ggml_backend_tensor_set(tw, w_raw.data(), 0, w_raw.size());
+
+                struct ggml_context* ctx_g = ggml_init(p);
+                struct ggml_cgraph* gf = ggml_new_graph(ctx_g);
+                ggml_tensor* tx = ggml_new_tensor_2d(ctx_g, GGML_TYPE_F32, K, M);
+                ggml_set_input(tx);
+                ggml_tensor* ty = ggml_mul_mat(ctx_g, tw, tx);
+                ggml_set_output(ty);
+                ggml_build_forward_expand(gf, ty);
+
+                ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
+                if (ggml_gallocr_alloc_graph(galloc, gf)) {
+                    const cloudtpu::PjrtRuntime& rt_child = cloudtpu::shared_pjrt_runtime(nullptr);
+                    const cloudtpu::CacheStats st0 = rt_child.cache_stats();
+                    ggml_backend_tensor_set(tx, x_host.data(), 0, x_host.size() * sizeof(float));
+                    // Execute twice: 1st compiles (or triggers Mosaic compile-fail retry & installs fallback),
+                    // 2nd verifies cached plan reuse succeeds with identical accurate output.
+                    bool run1 = (ggml_backend_graph_compute(be, gf) == GGML_STATUS_SUCCESS);
+                    const cloudtpu::CacheStats st1 = rt_child.cache_stats();
+                    std::vector<float> got1(static_cast<size_t>(M * N), 0.0f);
+                    if (run1) {
+                        ggml_backend_tensor_get(ty, got1.data(), 0, got1.size() * sizeof(float));
+                    }
+                    bool run2 = run1 && (ggml_backend_graph_compute(be, gf) == GGML_STATUS_SUCCESS);
+                    const cloudtpu::CacheStats st2 = rt_child.cache_stats();
+                    std::vector<float> got2(static_cast<size_t>(M * N), 0.0f);
+                    if (run2) {
+                        ggml_backend_tensor_get(ty, got2.data(), 0, got2.size() * sizeof(float));
+                    }
+                    const bool expect_fallback = (mosaic_ver != nullptr);
+                    const uint64_t ca1 = st1.compile_attempts - st0.compile_attempts;
+                    const uint64_t cf1 = st1.compile_failures - st0.compile_failures;
+                    const uint64_t ma1 = st1.mosaic_compile_attempts - st0.mosaic_compile_attempts;
+                    const uint64_t ms1 = st1.mosaic_compile_successes - st0.mosaic_compile_successes;
+                    const uint64_t ex1 = st1.execute_calls - st0.execute_calls;
+                    const uint64_t ca2 = st2.compile_attempts - st0.compile_attempts;
+                    const uint64_t ex2 = st2.execute_calls - st0.execute_calls;
+                    bool stats_ok = false;
+                    if (!expect_fallback) {
+                        // Valid v17 Mosaic: 1st run compiles 1 Mosaic custom_call & executes once;
+                        // 2nd run hits cache (no second compile) & executes again.
+                        stats_ok = (ca1 == 1 && cf1 == 0 && ma1 == 1 && ms1 == 1 && ex1 == 1 &&
+                                    ca2 == 1 && ex2 == 2);
+                        // Second fresh backend context (empty plan_cache) hitting shared PJRT cache
+                        // must reuse the compiled Mosaic executable without recompiling.
+                        if (stats_ok) {
+                            ggml_backend_t be2 = ggml_backend_cloudtpu_init();
+                            if (be2 != nullptr) {
+                                struct ggml_context* ctx_w2 = ggml_init(p);
+                                ggml_tensor* tw2 = ggml_new_tensor_2d(ctx_w2, GGML_TYPE_Q4_K, K, N);
+                                ggml_backend_buffer_t w_buf2 = ggml_backend_alloc_ctx_tensors(ctx_w2, be2);
+                                ggml_backend_tensor_set(tw2, w_raw.data(), 0, w_raw.size());
+
+                                struct ggml_context* ctx_g2 = ggml_init(p);
+                                struct ggml_cgraph* gf2 = ggml_new_graph(ctx_g2);
+                                ggml_tensor* tx2 = ggml_new_tensor_2d(ctx_g2, GGML_TYPE_F32, K, M);
+                                ggml_set_input(tx2);
+                                ggml_tensor* ty2 = ggml_mul_mat(ctx_g2, tw2, tx2);
+                                ggml_set_output(ty2);
+                                ggml_build_forward_expand(gf2, ty2);
+
+                                ggml_gallocr_t galloc2 = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be2));
+                                bool run3 = ggml_gallocr_alloc_graph(galloc2, gf2);
+                                std::vector<float> got3(static_cast<size_t>(M * N), 0.0f);
+                                if (run3) {
+                                    ggml_backend_tensor_set(tx2, x_host.data(), 0, x_host.size() * sizeof(float));
+                                    run3 = (ggml_backend_graph_compute(be2, gf2) == GGML_STATUS_SUCCESS);
+                                    if (run3) {
+                                        ggml_backend_tensor_get(ty2, got3.data(), 0, got3.size() * sizeof(float));
+                                    }
+                                }
+                                const cloudtpu::CacheStats st3 = rt_child.cache_stats();
+                                const uint64_t ca3 = st3.compile_attempts - st0.compile_attempts;
+                                const uint64_t hits3 = st3.hits - st2.hits;
+                                const uint64_t ex3 = st3.execute_calls - st0.execute_calls;
+                                stats_ok = run3 && (ca3 == 1 && hits3 >= 1 && ex3 == 3) &&
+                                           (compute_nmse(got3, ref_y) < 5e-4);
+                                ggml_gallocr_free(galloc2);
+                                ggml_free(ctx_g2);
+                                ggml_backend_buffer_free(w_buf2);
+                                ggml_free(ctx_w2);
+                                ggml_backend_free(be2);
+                            } else {
+                                stats_ok = false;
+                            }
+                        }
+                    } else {
+                        // Invalid v999 Mosaic: 1st run attempts 1 Mosaic compile (fails), retries with
+                        // 1 pure StableHLO compile (succeeds, no @tpu_custom_call), executes once;
+                        // 2nd run hits cached fallback plan (still 2 compile attempts total) & executes again.
+                        stats_ok = (ca1 == 2 && cf1 == 1 && ma1 == 1 && ms1 == 0 && ex1 == 1 &&
+                                    ca2 == 2 && ex2 == 2);
+                    }
+                    ok = run2 && stats_ok && (compute_nmse(got1, ref_y) < 5e-4) && (compute_nmse(got2, ref_y) < 5e-4);
+                }
+                ggml_gallocr_free(galloc);
+                ggml_free(ctx_g);
+                ggml_backend_buffer_free(w_buf);
+                ggml_free(ctx_w);
+                ggml_backend_free(be);
+            }
+            _exit(ok ? 0 : 1);
+        }
+        int status = 0;
+        CHECK_TRUE(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0, label);
+    };
+
+    run_child(nullptr, "ggml_cgraph FreeTile Mosaic Q4_K (v17) must succeed and match CPU reference");
+    run_child("999", "ggml_cgraph FreeTile Mosaic invalid version (999) must automatically fall back to StableHLO");
+    std::printf("  [PASS] ggml_cgraph FreeTile Mosaic Q4_K (v17 + automatic v999 fallback retry & cache hit)\n");
+#endif
+}
 #endif
 
 void test_ironwood_d2d_pairing_and_sdy_mesh() {
@@ -6630,6 +6830,401 @@ void test_fp8_e4m3fn_scalar_and_matmul_parity() {
     rt.shutdown();
     std::printf("  [PASS] FP8 f8E4M3FN scalar parity, tpu7x gating, BF16 fallback, & Q8_0/Q4_K_I4 dot_general parity\n");
 }
+
+void test_freetile_mosaic_lowering(cloudtpu::PjrtRuntime& rt) {
+    // 1) Q4_K_I4 S4 (M=1 pad8, K=512, N=256) with unshifted m: w = (s4 + 8)*d + m
+    {
+        const int64_t M = 1, N = 256, NB = 16, K = NB * 32;  // K=512
+        std::vector<int8_t> qs_s4(static_cast<size_t>(NB * 32 * N));
+        std::vector<uint16_t> d_bf16(static_cast<size_t>(NB * N));
+        std::vector<uint16_t> m_bf16(static_cast<size_t>(NB * N));
+        std::vector<float> w_ref(static_cast<size_t>(N * K));
+
+        for (int64_t b = 0; b < NB; ++b) {
+            for (int64_t n = 0; n < N; ++n) {
+                const uint16_t db = cloudtpu::f32_to_bf16(0.02f * static_cast<float>((n + b) % 7 + 1));
+                const float d = cloudtpu::bf16_to_f32(db);
+                const uint16_t mb = cloudtpu::f32_to_bf16(-0.08f + 0.015f * static_cast<float>((n * 2 + b) % 9));
+                const float m = cloudtpu::bf16_to_f32(mb);
+                d_bf16[static_cast<size_t>(b * N + n)] = db;
+                m_bf16[static_cast<size_t>(b * N + n)] = mb;
+                for (int64_t k = 0; k < 32; ++k) {
+                    const int8_t s4 = static_cast<int8_t>(((n * 5 + b * 3 + k * 7) & 0x0F) - 8);
+                    qs_s4[static_cast<size_t>((b * 32 + k) * N + n)] = s4;
+                    w_ref[static_cast<size_t>(n * K + b * 32 + k)] = static_cast<float>(s4 + 8) * d + m;
+                }
+            }
+        }
+
+        std::vector<float> x(static_cast<size_t>(M * K));
+        for (size_t i = 0; i < x.size(); ++i) x[i] = std::sin(static_cast<float>(i) * 0.07f);
+        std::vector<float> ref(static_cast<size_t>(M * N), 0.0f);
+        for (int64_t n = 0; n < N; ++n) {
+            float acc = 0.0f;
+            for (int64_t k = 0; k < K; ++k) acc += x[static_cast<size_t>(k)] * w_ref[static_cast<size_t>(n * K + k)];
+            ref[static_cast<size_t>(n)] = acc;
+        }
+
+        auto bqs = rt.buffer_from_host(0, qs_s4.data(), cloudtpu::PjrtDType::S4, {1, 1, NB, 32, N});
+        auto bd = rt.buffer_from_host(0, d_bf16.data(), cloudtpu::PjrtDType::BF16, {1, 1, NB, N});
+        auto bm = rt.buffer_from_host(0, m_bf16.data(), cloudtpu::PjrtDType::BF16, {1, 1, NB, N});
+        auto bx = rt.buffer_from_host(0, x.data(), cloudtpu::PjrtDType::F32, {1, 1, M, K});
+
+        cloudtpu::GraphProgramSpec spec;
+        spec.bf16_matmul = true;
+        spec.freetile_mosaic = true;
+        cloudtpu::TensorSpec w_spec{1, cloudtpu::PjrtDType::S4, cloudtpu::TensorStorageKind::Q4_K_I4, {1, 1, N, K}};
+        w_spec.scale_dtype = cloudtpu::PjrtDType::BF16;
+        spec.inputs.push_back(w_spec);
+        spec.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, K}});
+        cloudtpu::OpNodeSpec mm;
+        mm.kind = cloudtpu::CloudOpKind::MUL_MAT;
+        mm.src_ids = {1, 2};
+        mm.dst = {3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, N}};
+        spec.ops.push_back(mm);
+        spec.output_ids = {3};
+
+        const auto prog = cloudtpu::emit_stablehlo_program(spec);
+        CHECK_TRUE(prog.mlir_text.find("stablehlo.custom_call @tpu_custom_call") != std::string::npos,
+                   "Q4_K_I4 S4 FreeTile Mosaic emits @tpu_custom_call");
+        CHECK_TRUE(prog.mlir_text.find("stablehlo.dot_general") == std::string::npos,
+                   "Q4_K_I4 S4 FreeTile Mosaic replaces dot_general");
+        bool compiled_first = false;
+        bool compiled_second = true;
+        (void)rt.compile_or_get(prog.cache_key, prog.mlir_text, 0, rt.make_spmd_compile_options(1), &compiled_first);
+        (void)rt.compile_or_get(prog.cache_key, prog.mlir_text, 0, rt.make_spmd_compile_options(1), &compiled_second);
+        CHECK_TRUE(compiled_first && !compiled_second,
+                   "compile_or_get reports out_compiled=true on miss and false on shared cache hit");
+        auto got = run_emitted(rt, prog, {bqs, bd, bm, bx});
+        CHECK_TRUE(compute_nmse(got, ref) < 5e-4, "Q4_K_I4 S4 FreeTile Mosaic NMSE < 5e-4");
+
+        // Verify invalid Mosaic dialect version fails compile cleanly & falls back to pure StableHLO
+        cloudtpu::GraphProgramSpec bad_ver = spec;
+        bad_ver.freetile_mosaic_version = 999;
+        const auto bad_prog = cloudtpu::emit_stablehlo_program(bad_ver);
+        CHECK_TRUE(bad_prog.cache_key != prog.cache_key, "Mosaic version tracked in cache_key");
+        if (rt.is_mock()) {
+            bool threw = false;
+            try {
+                (void)rt.compile_or_get(bad_prog.cache_key, bad_prog.mlir_text, 0, rt.make_spmd_compile_options(1));
+            } catch (const std::exception&) {
+                threw = true;
+            }
+            CHECK_TRUE(threw, "Invalid Mosaic dialect version rejects cleanly in MockPJRT");
+        }
+        cloudtpu::GraphProgramSpec fb_spec = bad_ver;
+        fb_spec.freetile_mosaic = false;
+        const auto fb_prog = cloudtpu::emit_stablehlo_program(fb_spec);
+        CHECK_TRUE(fb_prog.mlir_text.find("@tpu_custom_call") == std::string::npos,
+                   "Fallback program uses pure StableHLO");
+        auto got_fb = run_emitted(rt, fb_prog, {bqs, bd, bm, bx});
+        CHECK_TRUE(compute_nmse(got_fb, ref) < 5e-4, "Pure StableHLO fallback NMSE < 5e-4");
+    }
+
+    // 2) Q4_K_I4 U4 (M=2 pad8, K=256, N=128) with w = u4*d + m (no +8 shift)
+    {
+        const int64_t M = 2, N = 128, NB = 8, K = NB * 32;  // K=256
+        std::vector<uint8_t> qs_u4(static_cast<size_t>(NB * 32 * N));
+        std::vector<uint16_t> d_bf16(static_cast<size_t>(NB * N));
+        std::vector<uint16_t> m_bf16(static_cast<size_t>(NB * N));
+        std::vector<float> w_ref(static_cast<size_t>(N * K));
+        for (int64_t b = 0; b < NB; ++b) {
+            for (int64_t n = 0; n < N; ++n) {
+                const uint16_t db = cloudtpu::f32_to_bf16(0.018f * static_cast<float>((n + b * 2) % 7 + 1));
+                const float d = cloudtpu::bf16_to_f32(db);
+                const uint16_t mb = cloudtpu::f32_to_bf16(-0.10f + 0.02f * static_cast<float>((n + b) % 7));
+                const float m = cloudtpu::bf16_to_f32(mb);
+                d_bf16[static_cast<size_t>(b * N + n)] = db;
+                m_bf16[static_cast<size_t>(b * N + n)] = mb;
+                for (int64_t k = 0; k < 32; ++k) {
+                    const uint8_t u4 = static_cast<uint8_t>((n * 3 + b * 5 + k * 7) & 0x0F);
+                    qs_u4[static_cast<size_t>((b * 32 + k) * N + n)] = u4;
+                    w_ref[static_cast<size_t>(n * K + b * 32 + k)] = static_cast<float>(u4) * d + m;
+                }
+            }
+        }
+        std::vector<float> x(static_cast<size_t>(M * K));
+        for (size_t i = 0; i < x.size(); ++i) x[i] = std::sin(static_cast<float>(i) * 0.04f);
+        std::vector<float> ref(static_cast<size_t>(M * N), 0.0f);
+        for (int64_t m = 0; m < M; ++m) {
+            for (int64_t n = 0; n < N; ++n) {
+                float acc = 0.0f;
+                for (int64_t k = 0; k < K; ++k) {
+                    acc += x[static_cast<size_t>(m * K + k)] * w_ref[static_cast<size_t>(n * K + k)];
+                }
+                ref[static_cast<size_t>(m * N + n)] = acc;
+            }
+        }
+        auto bqs = rt.buffer_from_host(0, qs_u4.data(), cloudtpu::PjrtDType::U4, {1, 1, NB, 32, N});
+        auto bd = rt.buffer_from_host(0, d_bf16.data(), cloudtpu::PjrtDType::BF16, {1, 1, NB, N});
+        auto bm = rt.buffer_from_host(0, m_bf16.data(), cloudtpu::PjrtDType::BF16, {1, 1, NB, N});
+        auto bx = rt.buffer_from_host(0, x.data(), cloudtpu::PjrtDType::F32, {1, 1, M, K});
+
+        cloudtpu::GraphProgramSpec spec;
+        spec.bf16_matmul = true;
+        spec.freetile_mosaic = true;
+        cloudtpu::TensorSpec w_spec{1, cloudtpu::PjrtDType::U4, cloudtpu::TensorStorageKind::Q4_K_I4, {1, 1, N, K}};
+        w_spec.scale_dtype = cloudtpu::PjrtDType::BF16;
+        spec.inputs.push_back(w_spec);
+        spec.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, K}});
+        cloudtpu::OpNodeSpec mm;
+        mm.kind = cloudtpu::CloudOpKind::MUL_MAT;
+        mm.src_ids = {1, 2};
+        mm.dst = {3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, N}};
+        spec.ops.push_back(mm);
+        spec.output_ids = {3};
+
+        const auto prog = cloudtpu::emit_stablehlo_program(spec);
+        CHECK_TRUE(prog.mlir_text.find("stablehlo.custom_call @tpu_custom_call") != std::string::npos,
+                   "Q4_K_I4 U4 FreeTile Mosaic emits @tpu_custom_call");
+        auto got = run_emitted(rt, prog, {bqs, bd, bm, bx});
+        CHECK_TRUE(compute_nmse(got, ref) < 5e-4, "Q4_K_I4 U4 FreeTile Mosaic NMSE < 5e-4");
+
+        // Verify MockPJRT rejects unsigned ui4 inside Mosaic MLIR body (MLIR requires signless i4)
+        if (rt.is_mock()) {
+            const std::string bad_mosaic =
+                "module attributes {stable_mosaic.version = 17 : i64} { vector<256x128xui4> }";
+            // Base64 encode bad_mosaic and inject into a minimal custom_call
+            static constexpr char kB64[] =
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            std::string b64;
+            for (size_t i = 0; i < bad_mosaic.size(); i += 3) {
+                const uint32_t b0 = static_cast<unsigned char>(bad_mosaic[i]);
+                const uint32_t b1 = (i + 1 < bad_mosaic.size()) ? static_cast<unsigned char>(bad_mosaic[i + 1]) : 0U;
+                const uint32_t b2 = (i + 2 < bad_mosaic.size()) ? static_cast<unsigned char>(bad_mosaic[i + 2]) : 0U;
+                const uint32_t t = (b0 << 16) | (b1 << 8) | b2;
+                b64.push_back(kB64[(t >> 18) & 0x3F]);
+                b64.push_back(kB64[(t >> 12) & 0x3F]);
+                b64.push_back((i + 1 < bad_mosaic.size()) ? kB64[(t >> 6) & 0x3F] : '=');
+                b64.push_back((i + 2 < bad_mosaic.size()) ? kB64[t & 0x3F] : '=');
+            }
+            const std::string bad_mlir =
+                "module @bad_ui4 {\n"
+                "  func.func @main(%arg0: tensor<8x256xbf16>, %arg1: tensor<256x128xui4>) -> tensor<8x128xf32> {\n"
+                "    %0 = stablehlo.custom_call @tpu_custom_call(%arg0, %arg1) "
+                "{backend_config = \"{\\\"custom_call_config\\\": {\\\"body\\\": \\\"" + b64 +
+                "\\\", \\\"serialization_format\\\": 1}}\", kernel_name = \"ft_q4_k_bad\"} : "
+                "(tensor<8x256xbf16>, tensor<256x128xui4>) -> tensor<8x128xf32>\n"
+                "    return %0 : tensor<8x128xf32>\n"
+                "  }\n"
+                "}\n";
+            bool threw = false;
+            try {
+                (void)rt.compile_or_get("bad_ui4_mosaic_test", bad_mlir, 0, rt.make_spmd_compile_options(1));
+            } catch (const std::exception&) {
+                threw = true;
+            }
+            CHECK_TRUE(threw, "MockPJRT rejects unsigned xui4 inside Mosaic MLIR body");
+
+            // Verify MockPJRT rejects serialization_format: 10 (complete integer parse, not prefix match)
+            std::string bad_ser_mlir = prog.mlir_text;
+            const size_t ser_pos = bad_ser_mlir.find("\\\"serialization_format\\\": 1");
+            CHECK_TRUE(ser_pos != std::string::npos, "Found serialization_format: 1 in emitted Mosaic MLIR");
+            bad_ser_mlir.replace(ser_pos, 27, "\\\"serialization_format\\\": 10");
+            bool threw_ser = false;
+            try {
+                (void)rt.compile_or_get("bad_ser_fmt_10_test", bad_ser_mlir, 0, rt.make_spmd_compile_options(1));
+            } catch (const std::exception&) {
+                threw_ser = true;
+            }
+            CHECK_TRUE(threw_ser, "MockPJRT rejects serialization_format: 10 (must be exact 1)");
+        }
+    }
+
+    // 3) Q4_0_I4 U4 (M=1 pad8, K=256, N=128) with w = (u4 - 8)*d
+    {
+        const int64_t M = 1, N = 128, NB = 8, K = NB * 32;  // K=256
+        std::vector<uint8_t> qs_u4(static_cast<size_t>(NB * 32 * N));
+        std::vector<uint16_t> d_f16(static_cast<size_t>(NB * N));
+        std::vector<float> w_ref(static_cast<size_t>(N * K));
+        for (int64_t b = 0; b < NB; ++b) {
+            for (int64_t n = 0; n < N; ++n) {
+                const uint16_t dh = cloudtpu::f32_to_f16(0.025f * static_cast<float>((n + b) % 5 + 1));
+                const float d = cloudtpu::f16_to_f32(dh);
+                d_f16[static_cast<size_t>(b * N + n)] = dh;
+                for (int64_t k = 0; k < 32; ++k) {
+                    const uint8_t u4 = static_cast<uint8_t>((n * 7 + b * 3 + k * 5) & 0x0F);
+                    qs_u4[static_cast<size_t>((b * 32 + k) * N + n)] = u4;
+                    w_ref[static_cast<size_t>(n * K + b * 32 + k)] = (static_cast<float>(u4) - 8.0f) * d;
+                }
+            }
+        }
+        std::vector<float> x(static_cast<size_t>(M * K));
+        for (size_t i = 0; i < x.size(); ++i) x[i] = std::cos(static_cast<float>(i) * 0.09f);
+        std::vector<float> ref(static_cast<size_t>(M * N), 0.0f);
+        for (int64_t n = 0; n < N; ++n) {
+            float acc = 0.0f;
+            for (int64_t k = 0; k < K; ++k) acc += x[static_cast<size_t>(k)] * w_ref[static_cast<size_t>(n * K + k)];
+            ref[static_cast<size_t>(n)] = acc;
+        }
+        auto bqs = rt.buffer_from_host(0, qs_u4.data(), cloudtpu::PjrtDType::U4, {1, 1, NB, 32, N});
+        auto bd = rt.buffer_from_host(0, d_f16.data(), cloudtpu::PjrtDType::F16, {1, 1, NB, N});
+        auto bx = rt.buffer_from_host(0, x.data(), cloudtpu::PjrtDType::F32, {1, 1, M, K});
+
+        cloudtpu::GraphProgramSpec spec;
+        spec.bf16_matmul = true;
+        spec.freetile_mosaic = true;
+        cloudtpu::TensorSpec w_spec{1, cloudtpu::PjrtDType::U4, cloudtpu::TensorStorageKind::Q4_0_I4, {1, 1, N, K}};
+        spec.inputs.push_back(w_spec);
+        spec.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, K}});
+        cloudtpu::OpNodeSpec mm;
+        mm.kind = cloudtpu::CloudOpKind::MUL_MAT;
+        mm.src_ids = {1, 2};
+        mm.dst = {3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, N}};
+        spec.ops.push_back(mm);
+        spec.output_ids = {3};
+
+        const auto prog = cloudtpu::emit_stablehlo_program(spec);
+        CHECK_TRUE(prog.mlir_text.find("stablehlo.custom_call @tpu_custom_call") != std::string::npos,
+                   "Q4_0_I4 U4 FreeTile Mosaic emits @tpu_custom_call");
+        auto got = run_emitted(rt, prog, {bqs, bd, bx});
+        CHECK_TRUE(compute_nmse(got, ref) < 5e-4, "Q4_0_I4 U4 FreeTile Mosaic NMSE < 5e-4");
+    }
+
+    // 4) Q6_K_SPLIT (M=3 pad8, K=256, N=128) with FreeTile -> Mosaic tpu_custom_call
+    {
+        const int64_t M = 3, N = 128, NB = 16, K = NB * 16;  // K=256
+        std::vector<int8_t> qs_s8(static_cast<size_t>(NB * 16 * N));
+        std::vector<uint16_t> d_bf16(static_cast<size_t>(NB * N));
+        std::vector<float> w_ref(static_cast<size_t>(N * K));
+        for (int64_t b = 0; b < NB; ++b) {
+            for (int64_t n = 0; n < N; ++n) {
+                const uint16_t db = cloudtpu::f32_to_bf16(0.015f * static_cast<float>((n + b * 3) % 11 + 1));
+                const float d = cloudtpu::bf16_to_f32(db);
+                d_bf16[static_cast<size_t>(b * N + n)] = db;
+                for (int64_t k = 0; k < 16; ++k) {
+                    const int8_t q = static_cast<int8_t>(((n * 3 + b * 5 + k * 7) % 63) - 31);
+                    qs_s8[static_cast<size_t>((b * 16 + k) * N + n)] = q;
+                    w_ref[static_cast<size_t>(n * K + b * 16 + k)] = static_cast<float>(q) * d;
+                }
+            }
+        }
+        std::vector<float> x(static_cast<size_t>(M * K));
+        for (size_t i = 0; i < x.size(); ++i) x[i] = std::cos(static_cast<float>(i) * 0.05f);
+        std::vector<float> ref(static_cast<size_t>(M * N), 0.0f);
+        for (int64_t m = 0; m < M; ++m) {
+            for (int64_t n = 0; n < N; ++n) {
+                float acc = 0.0f;
+                for (int64_t k = 0; k < K; ++k) {
+                    acc += x[static_cast<size_t>(m * K + k)] * w_ref[static_cast<size_t>(n * K + k)];
+                }
+                ref[static_cast<size_t>(m * N + n)] = acc;
+            }
+        }
+
+        auto bqs = rt.buffer_from_host(0, qs_s8.data(), cloudtpu::PjrtDType::S8, {1, 1, NB, 16, N});
+        auto bd = rt.buffer_from_host(0, d_bf16.data(), cloudtpu::PjrtDType::BF16, {1, 1, NB, N});
+        auto bx = rt.buffer_from_host(0, x.data(), cloudtpu::PjrtDType::F32, {1, 1, M, K});
+
+        cloudtpu::GraphProgramSpec spec;
+        spec.bf16_matmul = true;
+        spec.freetile_mosaic = true;
+        cloudtpu::TensorSpec w_spec{1, cloudtpu::PjrtDType::S8, cloudtpu::TensorStorageKind::Q6_K_SPLIT, {1, 1, N, K}};
+        w_spec.scale_dtype = cloudtpu::PjrtDType::BF16;
+        spec.inputs.push_back(w_spec);
+        spec.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, K}});
+        cloudtpu::OpNodeSpec mm;
+        mm.kind = cloudtpu::CloudOpKind::MUL_MAT;
+        mm.src_ids = {1, 2};
+        mm.dst = {3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, N}};
+        spec.ops.push_back(mm);
+        spec.output_ids = {3};
+
+        const auto prog = cloudtpu::emit_stablehlo_program(spec);
+        CHECK_TRUE(prog.mlir_text.find("stablehlo.custom_call @tpu_custom_call") != std::string::npos,
+                   "Q6_K_SPLIT FreeTile Mosaic emits @tpu_custom_call");
+        auto got = run_emitted(rt, prog, {bqs, bd, bx});
+        CHECK_TRUE(compute_nmse(got, ref) < 5e-4, "Q6_K_SPLIT FreeTile Mosaic NMSE < 5e-4");
+    }
+
+    // 5) Unaligned shape (N=16) & non-Mosaic target (BUENOS_A0) cleanly fall back to pure StableHLO
+    {
+        cloudtpu::GraphProgramSpec spec;
+        spec.bf16_matmul = true;
+        spec.freetile_mosaic = true;
+        cloudtpu::TensorSpec w_spec{1, cloudtpu::PjrtDType::S4, cloudtpu::TensorStorageKind::Q4_K_I4, {1, 1, 16, 256}};
+        w_spec.scale_dtype = cloudtpu::PjrtDType::BF16;
+        spec.inputs.push_back(w_spec);
+        spec.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 256}});
+        cloudtpu::OpNodeSpec mm;
+        mm.kind = cloudtpu::CloudOpKind::MUL_MAT;
+        mm.src_ids = {1, 2};
+        mm.dst = {3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 16}};
+        spec.ops.push_back(mm);
+        spec.output_ids = {3};
+
+        const auto prog = cloudtpu::emit_stablehlo_program(spec);
+        CHECK_TRUE(prog.mlir_text.find("@tpu_custom_call") == std::string::npos,
+                   "Unaligned N=16 cleanly falls back to pure StableHLO");
+        CHECK_TRUE(prog.mlir_text.find("stablehlo.dot_general") != std::string::npos,
+                   "Unaligned fallback emits pure StableHLO dot_general");
+
+        cloudtpu::GraphProgramSpec b0_spec;
+        b0_spec.bf16_matmul = true;
+        b0_spec.freetile_mosaic = true;
+        b0_spec.freetile_chip_target = 3;  // BUENOS_A0 (supports_mosaic == false)
+        cloudtpu::TensorSpec b0_w{1, cloudtpu::PjrtDType::S4, cloudtpu::TensorStorageKind::Q4_K_I4, {1, 1, 128, 256}};
+        b0_w.scale_dtype = cloudtpu::PjrtDType::BF16;
+        b0_spec.inputs.push_back(b0_w);
+        b0_spec.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 256}});
+        cloudtpu::OpNodeSpec b0_mm;
+        b0_mm.kind = cloudtpu::CloudOpKind::MUL_MAT;
+        b0_mm.src_ids = {1, 2};
+        b0_mm.dst = {3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 128}};
+        b0_spec.ops.push_back(b0_mm);
+        b0_spec.output_ids = {3};
+
+        const auto b0_prog = cloudtpu::emit_stablehlo_program(b0_spec);
+        CHECK_TRUE(b0_prog.mlir_text.find("@tpu_custom_call") == std::string::npos,
+                   "BUENOS_A0 target cleanly skips Mosaic without throwing");
+        CHECK_TRUE(b0_prog.mlir_text.find("stablehlo.dot_general") != std::string::npos,
+                   "BUENOS_A0 fallback emits pure StableHLO dot_general");
+    }
+
+    // 6) Q4_K_I4 with F32 scales/mins (CLOUDTPU_Q4K_BF16_SCALES=0) preserves exact F32 cancellation:
+    //    nibble q=7 (s4=-1), d=1027/1024, m=-7*d -> exact 0.0f (BF16 narrowing would yield -0.03125/elem!)
+    {
+        const int64_t M = 1, N = 128, NB = 8, K = NB * 32;  // K=256
+        const float d_val = 1027.0f / 1024.0f;
+        const float m_val = -7.0f * d_val;
+        std::vector<int8_t> qs_s4(static_cast<size_t>(NB * 32 * N), static_cast<int8_t>(-1));  // s4=-1 => q=s4+8=7
+        std::vector<float> d_f32(static_cast<size_t>(NB * N), d_val);
+        std::vector<float> m_f32(static_cast<size_t>(NB * N), m_val);
+        std::vector<float> x(static_cast<size_t>(M * K), 1.0f);
+
+        auto bqs = rt.buffer_from_host(0, qs_s4.data(), cloudtpu::PjrtDType::S4, {1, 1, NB, 32, N});
+        auto bd = rt.buffer_from_host(0, d_f32.data(), cloudtpu::PjrtDType::F32, {1, 1, NB, N});
+        auto bm = rt.buffer_from_host(0, m_f32.data(), cloudtpu::PjrtDType::F32, {1, 1, NB, N});
+        auto bx = rt.buffer_from_host(0, x.data(), cloudtpu::PjrtDType::F32, {1, 1, M, K});
+
+        cloudtpu::GraphProgramSpec spec;
+        spec.bf16_matmul = true;
+        spec.freetile_mosaic = true;
+        cloudtpu::TensorSpec w_spec{1, cloudtpu::PjrtDType::S4, cloudtpu::TensorStorageKind::Q4_K_I4, {1, 1, N, K}};
+        w_spec.scale_dtype = cloudtpu::PjrtDType::F32;
+        spec.inputs.push_back(w_spec);
+        spec.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, K}});
+        cloudtpu::OpNodeSpec mm;
+        mm.kind = cloudtpu::CloudOpKind::MUL_MAT;
+        mm.src_ids = {1, 2};
+        mm.dst = {3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, N}};
+        spec.ops.push_back(mm);
+        spec.output_ids = {3};
+
+        const auto prog = cloudtpu::emit_stablehlo_program(spec);
+        CHECK_TRUE(prog.mlir_text.find("stablehlo.custom_call @tpu_custom_call") != std::string::npos,
+                   "F32-scale Q4_K_I4 emits @tpu_custom_call");
+        CHECK_TRUE(prog.mlir_text.find("tensor<8x128xf32>, tensor<8x128xf32>) -> tensor<8x128xf32>") != std::string::npos,
+                   "F32-scale Q4_K_I4 passes f32 d and m directly to @tpu_custom_call without BF16 narrowing");
+        auto got = run_emitted(rt, prog, {bqs, bd, bm, bx});
+        CHECK_TRUE(got.size() == static_cast<size_t>(N), "F32-scale cancellation output length");
+        for (float v : got) {
+            CHECK_NEAR(v, 0.0f, 1e-6f, "F32-scale Q4_K_I4 exact cancellation q=7, d=1027/1024, m=-7*d yields 0");
+        }
+    }
+
+    std::printf("  [PASS] FreeTile Mosaic lowering (Q4_K_I4 S4/U4/F32-scales, Q4_0_I4 U4, Q6_K_SPLIT, fallback & dialect guard)\n");
+}
 }  // namespace
 
 int main() {
@@ -6677,11 +7272,13 @@ int main() {
     test_one_graph_multilayer_decode_and_donation();
     test_one_graph_spmd_kv_donation(4);
     test_continuous_batching_padded_buckets();
+    test_freetile_mosaic_lowering(rt);
 #ifdef CLOUDTPU_HAS_GGML
     test_ggml_cgraph_odd_s4_shard_n();
     test_ggml_cgraph_reshaped_host_cpy_and_q4_bitcast_view();
     test_ggml_cgraph_one_graph_decode();
     test_ggml_cgraph_continuous_batching_buckets();
+    test_ggml_cgraph_freetile_mosaic_fallback();
 #endif
 
     const size_t py_maps = cloudtpu::count_libpython_mappings();

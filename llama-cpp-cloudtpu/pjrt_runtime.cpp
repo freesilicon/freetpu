@@ -1145,6 +1145,7 @@ struct MockOp {
         ALL_REDUCE_MAX,
         ALL_GATHER,
         REDUCE_SCATTER_ADD,
+        TPU_CUSTOM_CALL,
     };
 
     Kind kind;
@@ -1174,6 +1175,12 @@ struct MockOp {
     std::vector<int64_t> slice_strides;
     std::vector<int64_t> dynamic_slice_sizes;
     std::vector<std::vector<int64_t>> replica_groups;
+    // FreeTile Mosaic custom_call attrs
+    std::string custom_call_kernel_name;
+    int64_t custom_call_mosaic_version = 17;
+    int64_t custom_call_blk = 32;
+    bool custom_call_has_min = false;
+    double custom_call_q4_shift = 0.0;
     // Gather attrs
     std::vector<int64_t> gather_offset_dims;
     std::vector<int64_t> gather_collapsed_dims;
@@ -1524,6 +1531,156 @@ static MockProgram parse_stablehlo_mlir(const std::string& mlir) {
                     }
                     p = rb + 1;
                 }
+            }
+        } else if (rhs.rfind("stablehlo.custom_call @tpu_custom_call(", 0) == 0) {
+            op.kind = MockOp::Kind::TPU_CUSTOM_CALL;
+            const size_t lp = rhs.find('(');
+            const size_t rp = (lp != std::string::npos) ? rhs.find(')', lp) : std::string::npos;
+            if (lp == std::string::npos || rp == std::string::npos) {
+                throw std::runtime_error("MockPJRT: malformed tpu_custom_call operand list");
+            }
+            op.inputs = extract_ssa_refs(rhs.substr(lp + 1, rp - lp - 1));
+            const size_t knp = rhs.find("kernel_name = \"");
+            if (knp != std::string::npos) {
+                const size_t kne = rhs.find('"', knp + 15);
+                if (kne == std::string::npos) {
+                    throw std::runtime_error("MockPJRT: unterminated tpu_custom_call kernel_name");
+                }
+                op.custom_call_kernel_name = rhs.substr(knp + 15, kne - (knp + 15));
+            }
+            const size_t bcp = rhs.find("backend_config = \"");
+            if (bcp == std::string::npos) {
+                throw std::runtime_error("MockPJRT: tpu_custom_call missing backend_config");
+            }
+            size_t cur = bcp + 18;
+            std::string cfg_json;
+            bool closed_quote = false;
+            while (cur < rhs.size()) {
+                if (rhs[cur] == '\\' && cur + 1 < rhs.size()) {
+                    char nx = rhs[cur + 1];
+                    if (nx == 'n') cfg_json.push_back('\n');
+                    else cfg_json.push_back(nx);
+                    cur += 2;
+                } else if (rhs[cur] == '"') {
+                    closed_quote = true;
+                    break;
+                } else {
+                    cfg_json.push_back(rhs[cur++]);
+                }
+            }
+            if (!closed_quote) {
+                throw std::runtime_error("MockPJRT: unterminated tpu_custom_call backend_config");
+            }
+            const size_t sfp = cfg_json.find("\"serialization_format\"");
+            if (sfp == std::string::npos) {
+                throw std::runtime_error("MockPJRT: missing tpu_custom_call serialization_format");
+            }
+            size_t sf_cur = sfp + 22;
+            while (sf_cur < cfg_json.size() && std::isspace(static_cast<unsigned char>(cfg_json[sf_cur]))) {
+                ++sf_cur;
+            }
+            if (sf_cur >= cfg_json.size() || cfg_json[sf_cur] != ':') {
+                throw std::runtime_error("MockPJRT: malformed tpu_custom_call serialization_format");
+            }
+            ++sf_cur;
+            while (sf_cur < cfg_json.size() && std::isspace(static_cast<unsigned char>(cfg_json[sf_cur]))) {
+                ++sf_cur;
+            }
+            const size_t sf_num_start = sf_cur;
+            if (sf_cur < cfg_json.size() && (cfg_json[sf_cur] == '-' || cfg_json[sf_cur] == '+')) {
+                ++sf_cur;
+            }
+            const size_t sf_digits_start = sf_cur;
+            while (sf_cur < cfg_json.size() && std::isdigit(static_cast<unsigned char>(cfg_json[sf_cur]))) {
+                ++sf_cur;
+            }
+            const bool sf_valid_delim =
+                (sf_cur == cfg_json.size()) || cfg_json[sf_cur] == ',' || cfg_json[sf_cur] == '}' ||
+                std::isspace(static_cast<unsigned char>(cfg_json[sf_cur]));
+            if (sf_cur == sf_digits_start || !sf_valid_delim) {
+                throw std::runtime_error("MockPJRT: invalid tpu_custom_call serialization_format value");
+            }
+            const int64_t ser_fmt = std::stoll(cfg_json.substr(sf_num_start, sf_cur - sf_num_start));
+            if (ser_fmt != 1) {
+                throw std::runtime_error("MockPJRT: unsupported tpu_custom_call serialization_format: " +
+                                         std::to_string(ser_fmt));
+            }
+            const size_t bp = cfg_json.find("\"body\": \"");
+            if (bp == std::string::npos) {
+                throw std::runtime_error("MockPJRT: tpu_custom_call missing body");
+            }
+            const size_t be = cfg_json.find('"', bp + 9);
+            if (be == std::string::npos) {
+                throw std::runtime_error("MockPJRT: unterminated tpu_custom_call body");
+            }
+            const std::string b64 = cfg_json.substr(bp + 9, be - (bp + 9));
+            auto b64_val = [](unsigned char c) -> int {
+                if (c >= 'A' && c <= 'Z') return c - 'A';
+                if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+                if (c >= '0' && c <= '9') return c - '0' + 52;
+                if (c == '+') return 62;
+                if (c == '/') return 63;
+                return -1;
+            };
+            std::string mosaic_txt;
+            uint32_t acc_bits = 0;
+            int acc_cnt = 0;
+            for (unsigned char c : b64) {
+                if (c == '=') break;
+                int v = b64_val(c);
+                if (v < 0) continue;
+                acc_bits = (acc_bits << 6) | static_cast<uint32_t>(v);
+                acc_cnt += 6;
+                if (acc_cnt >= 8) {
+                    acc_cnt -= 8;
+                    mosaic_txt.push_back(static_cast<char>((acc_bits >> acc_cnt) & 0xFF));
+                }
+            }
+            const size_t vp = mosaic_txt.find("stable_mosaic.version = ");
+            if (vp == std::string::npos) {
+                throw std::runtime_error("MockPJRT: Mosaic module missing stable_mosaic.version");
+            }
+            op.custom_call_mosaic_version = std::stoll(mosaic_txt.substr(vp + 24));
+            if (op.custom_call_mosaic_version != 17) {
+                throw std::runtime_error("MockPJRT: unsupported stable_mosaic.version: " +
+                                         std::to_string(op.custom_call_mosaic_version));
+            }
+            if (mosaic_txt.find("xui4") != std::string::npos ||
+                mosaic_txt.find("xui8") != std::string::npos) {
+                throw std::runtime_error(
+                    "MockPJRT: Mosaic module must use signless integer types (i4/i8), not ui4/ui8");
+            }
+            const bool has_const_8 = (mosaic_txt.find("value = 8.000000e+00 : bf16") != std::string::npos);
+            if (op.custom_call_kernel_name.rfind("ft_q6_k_", 0) == 0) {
+                op.custom_call_blk = 16;
+                op.custom_call_has_min = false;
+                op.custom_call_q4_shift = 0.0;
+            } else if (op.custom_call_kernel_name.rfind("ft_q4_k_", 0) == 0) {
+                op.custom_call_blk = 32;
+                op.custom_call_has_min = true;
+                op.custom_call_q4_shift =
+                    (mosaic_txt.find("stable_mosaic.arith.sitofp") != std::string::npos &&
+                     has_const_8 &&
+                     mosaic_txt.find("stable_mosaic.arith.addf") != std::string::npos)
+                        ? 8.0
+                        : 0.0;
+            } else if (op.custom_call_kernel_name.rfind("ft_q4_0_", 0) == 0) {
+                op.custom_call_blk = 32;
+                op.custom_call_has_min = false;
+                op.custom_call_q4_shift =
+                    (mosaic_txt.find("stable_mosaic.arith.uitofp") != std::string::npos &&
+                     has_const_8 &&
+                     mosaic_txt.find("stable_mosaic.arith.subf") != std::string::npos)
+                        ? -8.0
+                        : 0.0;
+            } else if (op.custom_call_kernel_name.rfind("ft_q8_0_", 0) == 0) {
+                op.custom_call_blk = 32;
+                op.custom_call_has_min = false;
+                op.custom_call_q4_shift = 0.0;
+            } else {
+                op.custom_call_blk = 1;
+                op.custom_call_has_min = false;
+                op.custom_call_q4_shift = 0.0;
             }
         } else {
             throw std::runtime_error("MockPJRT: unsupported StableHLO op: " + rhs);
@@ -2049,6 +2206,59 @@ static MockTensor eval_mock_op(const MockOp& op,
                     dst_idx += (static_cast<size_t>(starts[d]) + c) * out_strides[d];
                 }
                 copy_mock_elem(out, dst_idx, update, i);
+            }
+            break;
+        }
+        case MockOp::Kind::TPU_CUSTOM_CALL: {
+            if (op.inputs.size() < 2) {
+                throw std::runtime_error("MockPJRT: tpu_custom_call requires at least 2 operands");
+            }
+            const MockTensor& x = env.at(op.inputs.at(0));
+            const MockTensor& w = env.at(op.inputs.at(1));
+            if (x.dims.size() != 2 || w.dims.size() != 2 || out.dims.size() != 2 ||
+                x.dims[1] != w.dims[0] || out.dims[0] != x.dims[0] || out.dims[1] != w.dims[1]) {
+                throw std::runtime_error("MockPJRT: tpu_custom_call operand/output shape mismatch");
+            }
+            const int64_t M = x.dims[0];
+            const int64_t K = x.dims[1];
+            const int64_t N = w.dims[1];
+            const bool has_scales = (op.inputs.size() >= 3);
+            const MockTensor* d_ptr = has_scales ? &env.at(op.inputs.at(2)) : nullptr;
+            const MockTensor* m_ptr =
+                (op.custom_call_has_min && op.inputs.size() >= 4) ? &env.at(op.inputs.at(3)) : nullptr;
+            const int64_t blk = std::max<int64_t>(1, op.custom_call_blk);
+            if (d_ptr != nullptr) {
+                if ((K % blk) != 0 || d_ptr->dims.size() != 2 ||
+                    d_ptr->dims[0] != (K / blk) || d_ptr->dims[1] != N) {
+                    throw std::runtime_error("MockPJRT: tpu_custom_call scale shape mismatch");
+                }
+            }
+            if (m_ptr != nullptr) {
+                if (d_ptr == nullptr || m_ptr->dims != d_ptr->dims) {
+                    throw std::runtime_error("MockPJRT: tpu_custom_call min shape mismatch");
+                }
+            }
+
+            for (int64_t mi = 0; mi < M; ++mi) {
+                for (int64_t ni = 0; ni < N; ++ni) {
+                    double acc = 0.0;
+                    for (int64_t ki = 0; ki < K; ++ki) {
+                        const double xv = static_cast<double>(x.read_f32(static_cast<size_t>(mi * K + ki)));
+                        double wv = static_cast<double>(w.read_f32(static_cast<size_t>(ki * N + ni)));
+                        wv += op.custom_call_q4_shift;
+                        if (d_ptr != nullptr) {
+                            const int64_t bi = ki / blk;
+                            const double dv = static_cast<double>(d_ptr->read_f32(static_cast<size_t>(bi * N + ni)));
+                            wv *= dv;
+                            if (m_ptr != nullptr) {
+                                const double mv = static_cast<double>(m_ptr->read_f32(static_cast<size_t>(bi * N + ni)));
+                                wv += mv;
+                            }
+                        }
+                        acc += xv * wv;
+                    }
+                    out.write_f32(static_cast<size_t>(mi * N + ni), static_cast<float>(acc));
+                }
             }
             break;
         }
@@ -3555,7 +3765,11 @@ void PjrtRuntime::buffer_to_host(PJRT_Buffer* buf, void* dst, size_t dst_size) {
 CachedExecutablePtr PjrtRuntime::compile_or_get(const std::string& cache_key,
                                                 const std::string& mlir_text,
                                                 int device_idx,
-                                                const PjrtCompileOptions& opts) {
+                                                const PjrtCompileOptions& opts,
+                                                bool* out_compiled) {
+    if (out_compiled != nullptr) {
+        *out_compiled = false;
+    }
     if (device_idx < 0 || device_idx >= static_cast<int>(devices_.size())) {
         throw std::out_of_range("compile_or_get: device_idx out of range");
     }
@@ -3593,6 +3807,11 @@ CachedExecutablePtr PjrtRuntime::compile_or_get(const std::string& cache_key,
     }
 
     const auto t0 = std::chrono::steady_clock::now();
+    const bool is_mosaic = (mlir_text.find("@tpu_custom_call") != std::string::npos);
+    compile_attempts_.fetch_add(1, std::memory_order_relaxed);
+    if (is_mosaic) {
+        mosaic_compile_attempts_.fetch_add(1, std::memory_order_relaxed);
+    }
 
     PJRT_Program prog = {};
     prog.struct_size = PJRT_Program_STRUCT_SIZE;
@@ -3608,7 +3827,17 @@ CachedExecutablePtr PjrtRuntime::compile_or_get(const std::string& cache_key,
     c_args.compile_options = opts_pb.data();
     c_args.compile_options_size = opts_pb.size();
 
-    check_error(api_->PJRT_Client_Compile(&c_args), "PJRT_Client_Compile");
+    PJRT_Error* c_err = api_->PJRT_Client_Compile(&c_args);
+    if (c_err != nullptr) {
+        compile_failures_.fetch_add(1, std::memory_order_relaxed);
+        check_error(c_err, "PJRT_Client_Compile");
+    }
+    if (is_mosaic) {
+        mosaic_compile_successes_.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (out_compiled != nullptr) {
+        *out_compiled = true;
+    }
     PjrtLoadedExecutableHandle loaded_handle(c_args.executable, PjrtLoadedExecutableDeleter{api_});
 
     PJRT_LoadedExecutable_GetExecutable_Args ge = {};
@@ -3774,6 +4003,7 @@ void PjrtRuntime::execute(const CachedExecutablePtr& exec,
         }
     }
 
+    execute_calls_.fetch_add(1, std::memory_order_relaxed);
     if (profile_time) {
         const auto t1 = std::chrono::steady_clock::now();
         const uint64_t exec_us = static_cast<uint64_t>(
@@ -3883,6 +4113,7 @@ void PjrtRuntime::execute_spmd(const CachedExecutablePtr& exec,
         }
     }
 
+    execute_calls_.fetch_add(1, std::memory_order_relaxed);
     if (profile_time) {
         const auto t1 = std::chrono::steady_clock::now();
         const uint64_t exec_us = static_cast<uint64_t>(
@@ -3923,6 +4154,11 @@ CacheStats PjrtRuntime::cache_stats() const {
     st.evictions = cache_evictions_;
     st.compile_us = total_compile_us_;
     st.execute_us = total_execute_us_.load(std::memory_order_relaxed);
+    st.compile_attempts = compile_attempts_.load(std::memory_order_relaxed);
+    st.compile_failures = compile_failures_.load(std::memory_order_relaxed);
+    st.mosaic_compile_attempts = mosaic_compile_attempts_.load(std::memory_order_relaxed);
+    st.mosaic_compile_successes = mosaic_compile_successes_.load(std::memory_order_relaxed);
+    st.execute_calls = execute_calls_.load(std::memory_order_relaxed);
     return st;
 }
 
