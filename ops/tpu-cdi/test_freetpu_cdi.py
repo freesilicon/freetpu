@@ -2574,6 +2574,44 @@ class FreeTpuCdiTests(unittest.TestCase):
                     self.assertEqual(spy_verify.call_count, 2)
                     self.assertEqual(spy_verify.call_args.kwargs["chip_id_map"], reordered_map)
 
+                # Running `validate --check-host --remove-if-stale` WITHOUT `--chip-id-map`
+                # on a live spec generated with `--chip-id-map` (containing `0-3`/`4-7`)
+                # where host sysfs has no `chip_id` MUST preserve the live spec (NOT unlink it!),
+                # while still unlinking on a confirmed hardware mismatch!
+                rc_nomap, _out_nm, err_nm = _run_cli_inproc(
+                    [
+                        "validate",
+                        str(gen_out),
+                        "--check-host",
+                        "--remove-if-stale",
+                        "--sysfs-root",
+                        str(sysfs_root),
+                        "--dev-root",
+                        str(dev_root),
+                    ]
+                )
+                self.assertNotEqual(rc_nomap, 0)
+                self.assertIn("Preserved live CDI spec", err_nm)
+                self.assertIn("--chip-id-map", err_nm)
+                self.assertTrue(gen_out.exists(), "must NOT unlink live spec when only --chip-id-map is missing")
+
+                rc_withmap, _out_wm, err_wm = _run_cli_inproc(
+                    [
+                        "validate",
+                        str(gen_out),
+                        "--check-host",
+                        "--remove-if-stale",
+                        "--chip-id-map",
+                        str(chip_map_file),
+                        "--sysfs-root",
+                        str(sysfs_root),
+                        "--dev-root",
+                        str(dev_root),
+                    ]
+                )
+                self.assertEqual(rc_withmap, 0, err_wm)
+                self.assertTrue(gen_out.exists())
+
                 # If publication-time host verification fails, BOTH `generate --validate`
                 # and `reconcile_cdi_spec` MUST fail closed and remove any stale spec file!
                 with mock.patch.object(
@@ -2741,6 +2779,25 @@ class FreeTpuCdiTests(unittest.TestCase):
                     any("device 'numa0-pcie-0000-00-4'" in e for e in errs_deg_old),
                     errs_deg_old,
                 )
+                # Confirmed hardware degradation on a chip-id-map spec STILL unlinks under
+                # `validate --check-host --remove-if-stale` even without `--chip-id-map`!
+                deg_mapped_copy = root / "deg_mapped_copy.json"
+                deg_mapped_copy.write_text(json.dumps(mapped_spec), encoding="utf-8")
+                rc_deg_rm, _o_drm, err_drm = _run_cli_inproc(
+                    [
+                        "validate",
+                        str(deg_mapped_copy),
+                        "--check-host",
+                        "--remove-if-stale",
+                        "--sysfs-root",
+                        str(deg_sys),
+                        "--dev-root",
+                        str(deg_dev),
+                    ]
+                )
+                self.assertNotEqual(rc_deg_rm, 0)
+                self.assertIn("Removed stale CDI spec", err_drm)
+                self.assertFalse(deg_mapped_copy.exists())
 
                 # Degraded NUMA 0 (2 TPUs disappear -> 2 chips on NUMA 0, 4 on NUMA 1):
                 # Per Google Cloud v6e docs, single-VM v6e supports {1, 4, 8} chips ONLY

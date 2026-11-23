@@ -2275,7 +2275,7 @@ def _detect_spec_vfio_mode(spec: Dict[str, Any]) -> str:
     return "auto"
 
 
-def verify_spec_against_host(
+def _verify_spec_against_host_detailed(
     spec: Any,
     *,
     sysfs_root: Path = Path("/sys"),
@@ -2283,22 +2283,24 @@ def verify_spec_against_host(
     iommu_dev_path: Optional[Path] = None,
     vfio_mode: str = "auto",
     chip_id_map: Optional[Dict[str, int]] = None,
-) -> List[str]:
+) -> Tuple[List[str], List[str]]:
     """Revalidate all effective global and per-device CDI nodes against live host VFIO/iommufd state.
 
-    Enforces exact allowlists on root, device, containerEdits, and deviceNode keys
-    (blocking case-folded Go JSON decoder fields like `Major`, `HostPath`, `Hooks`,
-    `Mounts`), verifies the exact host device CDI will inject (`hostPath` or fallback
-    `path`), validates global `containerEdits.deviceNodes`, checks that every VFIO/iommufd
-    unit still maps to the exact TPU PCI BDF(s) with zero non-TPU members and full
-    IOMMU group membership, enforces NUMA / PCIe root-complex boundaries on sub-host
-    slices, and flags changed char device numbers.
+    Returns `(confirmed_errors, unverifiable_errors)`:
+    - `confirmed_errors`: confirmed hardware, PCI, VFIO, devnum, or topology
+      mismatches that justify invalidating/unlinking a stale CDI spec.
+    - `unverifiable_errors`: numeric range aliases (e.g. `0-3`, `4-7`) whose
+      underlying VFIO/PCI/NUMA hardware still matches an intact live host slice
+      but cannot be verified because neither sysfs `chip_id` nor `--chip-id-map`
+      was supplied to validation. `validate --check-host --remove-if-stale`
+      preserves live specs when only `unverifiable_errors` occur.
     """
     sysfs_root = Path(os.path.abspath(sysfs_root))
     dev_root = Path(os.path.abspath(dev_root))
     errors: List[str] = []
+    unverifiable: List[str] = []
     if not isinstance(spec, dict):
-        return ["CDI spec root must be a JSON object"]
+        return ["CDI spec root must be a JSON object"], []
 
     unknown_root = sorted(set(spec.keys()) - _ALLOWED_SPEC_ROOT_KEYS)
     if unknown_root:
@@ -2307,7 +2309,7 @@ def verify_spec_against_host(
     try:
         norm_mode = _normalize_vfio_mode(vfio_mode)
     except ValueError as exc:
-        return [str(exc)]
+        return [str(exc)], []
     effective_mode = _detect_spec_vfio_mode(spec) if norm_mode == "auto" else norm_mode
 
     try:
@@ -2319,7 +2321,7 @@ def verify_spec_against_host(
             vfio_mode=effective_mode,
         )
     except Exception as exc:  # noqa: BLE001
-        return [f"live host VFIO discovery failed: {exc}"]
+        return [f"live host VFIO discovery failed: {exc}"], []
 
     is_iommufd = any(c.vfio_mode == "iommufd" for c in live_chips)
     expected_control_container_path = "/dev/iommu" if is_iommufd else "/dev/vfio/vfio"
@@ -2340,13 +2342,16 @@ def verify_spec_against_host(
         else _shared_group_selector(sorted(c.pci_bdf for c in u))
         for u in live_units.values()
     }
+    live_bdf_to_phys = _map_physical_chip_indices(live_chips, chip_id_map=chip_id_map)
     expected_slices_by_name: Dict[str, _TopologySlice] = {}
+    expected_slices_by_bdfs: Dict[Tuple[str, ...], _TopologySlice] = {}
     for topo_slice in _compute_topology_slices(
         live_chips,
-        _map_physical_chip_indices(live_chips, chip_id_map=chip_id_map),
+        live_bdf_to_phys,
         reserved_names=live_reserved_names,
         chip_id_map=chip_id_map,
     ):
+        expected_slices_by_bdfs[topo_slice.pci_bdfs] = topo_slice
         for alias in topo_slice.aliases:
             expected_slices_by_name[alias] = topo_slice
     groups_bdfs: Dict[str, List[str]] = {}
@@ -2542,38 +2547,74 @@ def verify_spec_against_host(
                         f"device {name!r}: sub-host slice crosses NUMA / PCIe root complex boundaries ({expected_live_bdfs})"
                     )
                 expected_slice = expected_slices_by_name.get(name)
+                check_slice = expected_slice
                 if expected_slice is None:
-                    errors.append(
-                        f"device {name!r}: slice alias does not match any live host topology slice "
-                        f"(live aliases: {sorted(expected_slices_by_name)})"
+                    range_match = _RANGE_SLICE_RE.match(name)
+                    live_slice_for_bdfs = (
+                        expected_slices_by_bdfs.get(tuple(expected_live_bdfs))
+                        if range_match is not None
+                        else None
                     )
+                    range_width_matches = False
+                    if range_match is not None and live_slice_for_bdfs is not None:
+                        start_idx, end_idx = (int(p) for p in name.split("-", 1))
+                        range_width_matches = (
+                            end_idx >= start_idx
+                            and (end_idx - start_idx + 1)
+                            == len(live_slice_for_bdfs.physical_indices)
+                        )
+                    if (
+                        range_width_matches
+                        and chip_id_map is None
+                        and live_slice_for_bdfs is not None
+                        and _resolve_verified_visibility_ordinals(
+                            live_slice_for_bdfs.chips,
+                            live_chips,
+                            live_bdf_to_phys,
+                            chip_id_map=None,
+                        )
+                        is None
+                    ):
+                        unverifiable.append(
+                            f"device {name!r}: numeric range alias cannot be verified without "
+                            "--chip-id-map (host sysfs exposes no chip_id; underlying VFIO/PCI "
+                            "topology still matches live host)"
+                        )
+                        check_slice = live_slice_for_bdfs
+                    else:
+                        errors.append(
+                            f"device {name!r}: slice alias does not match any live host topology slice "
+                            f"(live aliases: {sorted(expected_slices_by_name)})"
+                        )
                 elif expected_live_bdfs != list(expected_slice.pci_bdfs):
                     errors.append(
                         f"device {name!r}: slice alias PCI membership {expected_live_bdfs} does not "
                         f"match live host topology for {name!r} ({list(expected_slice.pci_bdfs)})"
                     )
-                else:
+                    check_slice = None
+
+                if check_slice is not None:
                     if (
                         "freetpu.dev/pcie-root" in ann
-                        and ann.get("freetpu.dev/pcie-root") != expected_slice.pcie_root
+                        and ann.get("freetpu.dev/pcie-root") != check_slice.pcie_root
                     ):
                         errors.append(
                             f"device {name!r}: stale freetpu.dev/pcie-root "
-                            f"{ann.get('freetpu.dev/pcie-root')!r} (host has {expected_slice.pcie_root!r})"
+                            f"{ann.get('freetpu.dev/pcie-root')!r} (host has {check_slice.pcie_root!r})"
                         )
-                    if expected_slice.numa_node is None and "freetpu.dev/numa-node" in ann:
+                    if check_slice.numa_node is None and "freetpu.dev/numa-node" in ann:
                         errors.append(
                             f"device {name!r}: unexpected freetpu.dev/numa-node "
                             f"{ann.get('freetpu.dev/numa-node')!r} when host sysfs reports no NUMA node"
                         )
                     elif (
-                        expected_slice.numa_node is not None
+                        check_slice.numa_node is not None
                         and "freetpu.dev/numa-node" in ann
-                        and ann.get("freetpu.dev/numa-node") != str(expected_slice.numa_node)
+                        and ann.get("freetpu.dev/numa-node") != str(check_slice.numa_node)
                     ):
                         errors.append(
                             f"device {name!r}: stale freetpu.dev/numa-node "
-                            f"{ann.get('freetpu.dev/numa-node')!r} (host has {str(expected_slice.numa_node)!r})"
+                            f"{ann.get('freetpu.dev/numa-node')!r} (host has {str(check_slice.numa_node)!r})"
                         )
             elif name == "all":
                 all_live_bdfs = sorted(c.pci_bdf for c in live_chips)
@@ -2592,7 +2633,28 @@ def verify_spec_against_host(
                     f"(spec recorded {recorded_dev_dn.get(cp)!r}, host has {live_dn!r})"
                 )
 
-    return errors
+    return errors, unverifiable
+
+
+def verify_spec_against_host(
+    spec: Any,
+    *,
+    sysfs_root: Path = Path("/sys"),
+    dev_root: Path = Path("/dev"),
+    iommu_dev_path: Optional[Path] = None,
+    vfio_mode: str = "auto",
+    chip_id_map: Optional[Dict[str, int]] = None,
+) -> List[str]:
+    """Revalidate all effective global and per-device CDI nodes against live host VFIO/iommufd state."""
+    confirmed, unverifiable = _verify_spec_against_host_detailed(
+        spec,
+        sysfs_root=sysfs_root,
+        dev_root=dev_root,
+        iommu_dev_path=iommu_dev_path,
+        vfio_mode=vfio_mode,
+        chip_id_map=chip_id_map,
+    )
+    return confirmed + unverifiable
 
 
 def _write_spec_atomic(path: Path, rendered: str) -> None:
@@ -3129,22 +3191,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             sys.stderr.write(f"Invalid JSON: {exc}\n")
             return 1
         errors = validate_cdi_spec(parsed)
+        unverifiable: List[str] = []
         if not errors and args.check_host:
             try:
                 val_chip_map = _load_chip_id_map(args.chip_id_map)
             except Exception as exc:  # noqa: BLE001
                 sys.stderr.write(f"freetpu-cdi validate failed: invalid --chip-id-map: {exc}\n")
                 return 1
-            errors.extend(
-                verify_spec_against_host(
-                    parsed,
-                    sysfs_root=args.sysfs_root,
-                    dev_root=args.dev_root,
-                    iommu_dev_path=args.iommu_dev,
-                    vfio_mode=args.vfio_mode,
-                    chip_id_map=val_chip_map,
-                )
+            host_confirmed, unverifiable = _verify_spec_against_host_detailed(
+                parsed,
+                sysfs_root=args.sysfs_root,
+                dev_root=args.dev_root,
+                iommu_dev_path=args.iommu_dev,
+                vfio_mode=args.vfio_mode,
+                chip_id_map=val_chip_map,
             )
+            errors.extend(host_confirmed)
         if errors:
             if args.check_host and args.remove_if_stale and args.spec_path != "-":
                 removed, cleanup_err = _invalidate_spec(Path(args.spec_path))
@@ -3152,8 +3214,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     sys.stderr.write(f"Removed stale CDI spec at {args.spec_path}\n")
                 elif cleanup_err:
                     sys.stderr.write(f"Failed to remove stale CDI spec at {args.spec_path}: {cleanup_err}\n")
-            for err in errors:
+            for err in errors + unverifiable:
                 sys.stderr.write(f"CDI validation error: {err}\n")
+            return 1
+        if unverifiable:
+            if args.check_host and args.remove_if_stale and args.spec_path != "-":
+                sys.stderr.write(
+                    f"Preserved live CDI spec at {args.spec_path}: hardware/VFIO identity matched "
+                    "but numeric range aliases require --chip-id-map to verify\n"
+                )
+            for warn in unverifiable:
+                sys.stderr.write(f"CDI validation error: {warn}\n")
             return 1
         suffix = " (host VFIO identity verified)" if args.check_host else ""
         spec_ver = parsed.get("cdiVersion", DEFAULT_CDI_VERSION)

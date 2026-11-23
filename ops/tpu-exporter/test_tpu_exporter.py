@@ -1863,12 +1863,85 @@ TPU Device Status
                 )
             self.assertEqual(len(multi_cli_calls), 1)
             rt_by_chip = {r.runtime_chip: r for r in multi_snap.runtime_utilization}
-            # Chip 0 keeps direct-gRPC HBM (12 GiB) & duty (40%); chip 1 keeps gRPC HBM (18 GiB)
-            # and fills its missing duty-cycle (67.5%) from fallback.
+            # Chip 0 keeps direct-gRPC HBM (12 GiB), duty (40%), and pure "libtpu-grpc" provenance;
+            # chip 1 keeps gRPC HBM (18 GiB), fills missing duty (67.5%), and records "libtpu-grpc+tpu-info"!
             self.assertEqual(rt_by_chip["0"].hbm_used_bytes, 12 * 1024**3)
             self.assertAlmostEqual(rt_by_chip["0"].duty_cycle_percent or 0.0, 40.0)
+            self.assertEqual(rt_by_chip["0"].telemetry_source, "libtpu-grpc")
+            self.assertEqual(multi_snap.devices[0].telemetry_source, "libtpu-grpc")
             self.assertEqual(rt_by_chip["1"].hbm_used_bytes, 18 * 1024**3)
             self.assertAlmostEqual(rt_by_chip["1"].duty_cycle_percent or 0.0, 67.5)
+            self.assertEqual(rt_by_chip["1"].telemetry_source, "libtpu-grpc+tpu-info")
+
+            # Multi-device provenance check: when gRPC returns a partial row for chip 0
+            # and NO row for chip 1, and fallback CLI supplies chip 1 completely,
+            # chip 0 MUST record "libtpu-grpc+tpu-info" and chip 1 MUST record "tpu-info"
+            # (NEVER stamping global "libtpu-grpc" onto fallback-only chip 1)!
+            prov_root = root / "per_device_source_provenance"
+            prov_sys, prov_dev, prov_proc = _make_mock_pci_tree(
+                prov_root,
+                devices=[
+                    {
+                        "bdf": "0000:00:06.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                        "chip_id": "0",
+                    },
+                    {
+                        "bdf": "0000:00:07.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "1",
+                        "chip_id": "1",
+                    },
+                ],
+                create_vfio_nodes=["0", "1"],
+            )
+            grpc_chip0_only_partial = {
+                "0": tpu_exporter._TpuInfoRow(
+                    chip_key="0",
+                    hbm_used_bytes=12 * 1024**3,
+                    hbm_total_bytes=32 * 1024**3,
+                    duty_cycle_percent=None,
+                    in_util_table=True,
+                )
+            }
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_query_grpc_runtime_metrics",
+                    return_value=(True, None, grpc_chip0_only_partial),
+                ),
+                mock.patch.object(tpu_exporter, "_run_tpu_info", side_effect=_fill_multi_cli),
+            ):
+                prov_snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=prov_sys,
+                    dev_root=prov_dev,
+                    proc_root=prov_proc,
+                    tpu_info_bin="tpu-info",
+                    tpu_info_timeout_s=2.0,
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=prov_root / "no-shm",
+                )
+            self.assertEqual(prov_snap.devices[0].telemetry_source, "libtpu-grpc+tpu-info")
+            self.assertEqual(prov_snap.devices[1].telemetry_source, "tpu-info")
+            prov_prom = tpu_exporter.format_prometheus_metrics(prov_snap)
+            self.assertIn(
+                'pci_bdf="0000:00:06.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/0",'
+                'vendor="0x1ae0",model="TPU v6e (Trillium)",driver="vfio-pci",iommu_group="0",'
+                'vfio_group_exclusive="true",telemetry_source="libtpu-grpc+tpu-info"',
+                prov_prom,
+            )
+            self.assertIn(
+                'pci_bdf="0000:00:07.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/1",'
+                'vendor="0x1ae0",model="TPU v6e (Trillium)",driver="vfio-pci",iommu_group="1",'
+                'vfio_group_exclusive="true",telemetry_source="tpu-info"',
+                prov_prom,
+            )
 
             # 3. When gRPC consumes its reserved 65% slice and fails completely, CLI
             #    fallback MUST still receive the reserved ~35% budget and succeed!
@@ -2620,6 +2693,13 @@ TPU Runtime Utilization
                         "tpu_info.proto.tpu_metric_service_pb2_grpc": iw_pb2_grpc,
                     },
                 ),
+                mock.patch.object(
+                    _te,
+                    "_run_tpu_info",
+                    side_effect=AssertionError(
+                        "must not spawn fallback on complete verified Ironwood per-chip gRPC reply"
+                    ),
+                ),
             ):
                 iw_snap = _te.collect_snapshot(
                     sysfs_root=iw_sysfs,
@@ -2630,71 +2710,19 @@ TPU Runtime Utilization
                     shm_root=iw_root / "no-shm",
                 )
             self.assertEqual(len(iw_snap.devices), 8)
-            # Without an explicit endpoint layout flag, 4 duty-cycle IDs `{0..3}`
-            # alongside 8 HBM IDs `{0..7}` could be a partial per-core reply rather
-            # than a 4-chip per-chip reply: MUST NOT duplicate `{0..3}` onto cores
-            # `4..7`, keep them in `runtime_unjoined_duty_cycle`, and allow fallback
-            # to resolve per-core duty cycle when available!
-            self.assertEqual([d.duty_cycle_percent for d in iw_snap.devices], [None] * 8)
+            # Complete verified 4-chip Ironwood host returning all 4 physical-chip duty
+            # readings `{0..3}` + all 8 logical-core HBM readings `{0..7}` joins cleanly
+            # via documented per-chip expansion directly over gRPC (zero fallback spawned!).
             self.assertEqual(
-                iw_snap.runtime_unjoined_duty_cycle,
-                {"0": 12.5, "1": 37.5, "2": 62.5, "3": 87.5},
+                [d.duty_cycle_percent for d in iw_snap.devices],
+                [12.5, 12.5, 37.5, 37.5, 62.5, 62.5, 87.5, 87.5],
             )
+            self.assertEqual(iw_snap.runtime_unjoined_duty_cycle, {})
             self.assertEqual(
                 [d.hbm_used_bytes for d in iw_snap.devices],
                 [(c + 1) * 10 * 1024**3 for c in range(8)],
             )
-
-            # Verify fallback IS invoked when Ironwood direct gRPC returns ambiguous
-            # `{0..3}` duty alongside `{0..7}` HBM, preserving direct-gRPC HBM while
-            # filling all 8 cores' duty cycle and clearing the unjoined series!
-            iw_fb_calls: list[float] = []
-
-            def _iw_8core_fallback(*args, **kwargs):
-                iw_fb_calls.append(float(kwargs.get("timeout_s", 0.0)))
-                lines = [
-                    "TPU Runtime Utilization",
-                    "| Chip | HBM Usage (GiB)       | Duty cycle |",
-                    "|------|-----------------------|------------|",
-                ] + [
-                    f"| {c}    | 1.00 GiB / 96.00 GiB | {12.5 + (c // 2) * 25.0:.2f}%     |"
-                    for c in range(8)
-                ]
-                return True, None, _te.parse_tpu_info_output("\n".join(lines) + "\n")
-
-            with (
-                _mock_vfio_char_lstat(),
-                mock.patch.dict(_te._GRPC_CHANNELS, {}, clear=True),
-                mock.patch.dict(
-                    sys.modules,
-                    {
-                        "grpc": _FakeGrpc,
-                        "tpu_info": SimpleNamespace(),
-                        "tpu_info.proto": SimpleNamespace(),
-                        "tpu_info.proto.tpu_metric_service_pb2": fake_pb2,
-                        "tpu_info.proto.tpu_metric_service_pb2_grpc": iw_pb2_grpc,
-                    },
-                ),
-                mock.patch.object(_te, "_run_tpu_info", side_effect=_iw_8core_fallback),
-            ):
-                iw_resolved_snap = _te.collect_snapshot(
-                    sysfs_root=iw_sysfs,
-                    dev_root=iw_dev,
-                    proc_root=iw_proc,
-                    tpu_info_bin="tpu-info",
-                    runtime_metrics_addr="127.0.0.1:8431",
-                    shm_root=iw_root / "no-shm",
-                )
-            self.assertEqual(len(iw_fb_calls), 1)
-            self.assertEqual(
-                [d.duty_cycle_percent for d in iw_resolved_snap.devices],
-                [12.5, 12.5, 37.5, 37.5, 62.5, 62.5, 87.5, 87.5],
-            )
-            self.assertEqual(
-                [d.hbm_used_bytes for d in iw_resolved_snap.devices],
-                [(c + 1) * 10 * 1024**3 for c in range(8)],
-            )
-            self.assertEqual(iw_resolved_snap.runtime_unjoined_duty_cycle, {})
+            self.assertTrue(all(d.telemetry_source == "libtpu-grpc" for d in iw_snap.devices))
 
             # Ironwood per-core duty-cycle response (8 entries 0..7 matching 8 HBM cores)
             # MUST preserve 1:1 per-core readings and NEVER double/fabricate rows 8..15!

@@ -172,6 +172,7 @@ class RuntimeTelemetry:
     hbm_total_bytes: Optional[int]
     duty_cycle_percent: Optional[float]
     hbm_bandwidth_utilization_percent: Optional[float] = None
+    telemetry_source: Optional[str] = None
 
 
 @dataclass
@@ -547,6 +548,7 @@ class _TpuInfoRow:
     hbm_bw_util_percent: Optional[float] = None
     in_chips_table: bool = False
     in_util_table: bool = False
+    sources: List[str] = field(default_factory=list)
 
 
 def _split_table_cells(line: str) -> Optional[List[str]]:
@@ -1350,6 +1352,7 @@ def _query_grpc_runtime_metrics(
     rows: Dict[str, _TpuInfoRow] = {}
     duty_by_chip: Dict[str, float] = {}
     raw_duty_ids: set[str] = set()
+    raw_hbm_ids: set[str] = set()
     last_err: Optional[str] = None
     any_rpc_ok = False
     total_rpcs = len(_GRPC_METRIC_NAMES)
@@ -1377,6 +1380,8 @@ def _query_grpc_runtime_metrics(
                 continue
             if metric_name == "tpu.runtime.tensorcore.dutycycle.percent":
                 raw_duty_ids.add(chip_id)
+            else:
+                raw_hbm_ids.add(chip_id)
             val = _extract_grpc_gauge_value(item)
             if val is None or val < 0.0:
                 continue
@@ -1398,17 +1403,22 @@ def _query_grpc_runtime_metrics(
     #   inventory or mixed/unrecognized generations), NEVER assume 1:1 joins;
     #   treat as `ambiguous` and publish raw readings in the separate unjoined series.
     # - On `devices_per_chip == 1` generations (v5e, v6e, v5p, v4), always join 1:1.
-    # - On `devices_per_chip > 1` generations (Ironwood tpu7x, v2/v3):
-    #   Without an explicit endpoint layout discriminator, a partial per-core
-    #   reply with IDs `{0..3}` is indistinguishable from a 4-chip per-chip reply,
-    #   and incomplete PCI inventory (e.g. 6 functions across 4 degraded chips)
-    #   can understate physical chip count if divided by `devices_per_chip`.
-    #   Classify as `per_core` ONLY when `_verified_dual_function_chip_count`
-    #   establishes a complete verified sibling inventory (`>= 4` chips, zero
-    #   unpaired functions) AND `len(raw_duty_int_ids) > verified_chip_count`
-    #   (pigeonhole proof: more distinct IDs than physical chips exist).
-    #   Otherwise, treat as `ambiguous`: keep duty readings in
-    #   `freetpu_tpu_runtime_unjoined_duty_cycle_percent` and allow fallback to run.
+    # - On `devices_per_chip > 1` generations (Ironwood tpu7x, v2/v3), require a
+    #   complete verified sibling PCI inventory (`verified_chip_count >= 4`, zero
+    #   unpaired functions):
+    #   1. If `len(raw_duty_int_ids) > verified_chip_count`, pigeonhole proves
+    #      1:1 `per_core` layout (e.g. 8 raw duty IDs on a 4-chip host, even if
+    #      some cores reported NaN/unset gauges or partial HBM).
+    #   2. Else if BOTH chip and core coverage are complete (`len(raw_duty_int_ids)
+    #      == verified_chip_count`, `len(all_hbm_core_ids) == verified_chip_count *
+    #      devices_per_chip`, AND `expanded(raw_duty_int_ids) == all_hbm_core_ids`),
+    #      apply upstream `libtpu` / `tpu_info` documented per-chip expansion
+    #      (`chip c -> cores c * devices_per_chip + offset`) directly over gRPC
+    #      without spawning fallback subprocesses.
+    #   3. Otherwise (incomplete PCI inventory, partial/missing HBM, partial/offset
+    #      duty IDs, or sidecar without PCI inventory), treat as `ambiguous`: keep
+    #      raw duty readings in `freetpu_tpu_runtime_unjoined_duty_cycle_percent`
+    #      and allow fallback to run within the remaining scrape budget.
     if devices_per_chip is None:
         duty_layout = "ambiguous"
     elif devices_per_chip == 1:
@@ -1419,25 +1429,51 @@ def _query_grpc_runtime_metrics(
             parsed_duty = [_parse_runtime_device_id(k) for k in raw_duty_ids]
             if all(cid is not None for cid in parsed_duty):
                 raw_duty_int_ids = {cid for cid in parsed_duty if cid is not None}
+                all_hbm_core_ids = {
+                    hid
+                    for k in raw_hbm_ids
+                    for hid in (_parse_runtime_device_id(k),)
+                    if hid is not None
+                }
                 verified_chip_count = _verified_dual_function_chip_count(
                     devices, devices_per_chip
                 )
-                if (
-                    verified_chip_count is not None
-                    and len(raw_duty_int_ids) > verified_chip_count
-                ):
-                    duty_layout = "per_core"
+                if verified_chip_count is not None:
+                    verified_core_count = verified_chip_count * devices_per_chip
+                    expanded_raw = {
+                        cid * devices_per_chip + off
+                        for cid in raw_duty_int_ids
+                        for off in range(devices_per_chip)
+                    }
+                    if len(raw_duty_int_ids) > verified_chip_count:
+                        duty_layout = "per_core"
+                    elif (
+                        len(raw_duty_int_ids) == verified_chip_count
+                        and len(all_hbm_core_ids) == verified_core_count
+                        and expanded_raw == all_hbm_core_ids
+                    ):
+                        duty_layout = "per_chip"
 
-    if duty_layout == "per_core":
+    if duty_layout == "per_chip" and devices_per_chip is not None:
+        for chip_key, duty_val in duty_by_chip.items():
+            chip_idx = _parse_runtime_device_id(chip_key)
+            if chip_idx is None:
+                continue
+            for offset in range(devices_per_chip):
+                core_key = str(chip_idx * devices_per_chip + offset)
+                row = rows.setdefault(core_key, _TpuInfoRow(chip_key=core_key))
+                row.in_util_table = True
+                row.duty_cycle_percent = duty_val
+    elif duty_layout == "per_core":
         for chip_key, duty_val in duty_by_chip.items():
             row = rows.setdefault(chip_key, _TpuInfoRow(chip_key=chip_key))
             row.in_util_table = True
             row.duty_cycle_percent = duty_val
     elif duty_by_chip:
-        # Layout is ambiguous (e.g. sidecar without PCI inventory or dual-core
-        # Ironwood where per-chip vs partial per-core IDs cannot be verified):
-        # keep `duty_cycle_percent` unset so we never duplicate or misjoin chip
-        # IDs onto logical core HBM rows, preserve the raw readings in
+        # Layout is ambiguous (e.g. sidecar without PCI inventory, incomplete
+        # PCI inventory, or partial/missing HBM/duty response): keep
+        # `duty_cycle_percent` unset so we never duplicate or misjoin chip IDs
+        # onto logical core HBM rows, preserve the raw readings in
         # `unjoined_duty_cycle_percent` for separate export, and allow fallback
         # to run within the remaining scrape budget.
         for raw_key, duty_val in duty_by_chip.items():
@@ -1964,6 +2000,23 @@ def _has_complete_utilization(rows: Dict[str, _TpuInfoRow]) -> bool:
     return all(_row_has_complete_utilization(r) for r in util_rows)
 
 
+def _tag_row_sources(rows: Dict[str, _TpuInfoRow], source_label: str) -> Dict[str, _TpuInfoRow]:
+    """Attach `source_label` provenance to rows returned by a telemetry backend."""
+    tagged: Dict[str, _TpuInfoRow] = {}
+    for k, r in rows.items():
+        copied = _copy_tpu_info_row(r)
+        if not copied.sources and (
+            copied.in_chips_table or _row_has_live_utilization(copied)
+        ):
+            copied.sources = [source_label]
+        tagged[k] = copied
+    return tagged
+
+
+def _format_row_source(row: _TpuInfoRow, default: str = "tpu-info") -> str:
+    return "+".join(row.sources) if row.sources else default
+
+
 def _copy_tpu_info_row(row: _TpuInfoRow) -> _TpuInfoRow:
     return _TpuInfoRow(
         chip_key=row.chip_key,
@@ -1976,6 +2029,7 @@ def _copy_tpu_info_row(row: _TpuInfoRow) -> _TpuInfoRow:
         hbm_bw_util_percent=row.hbm_bw_util_percent,
         in_chips_table=row.in_chips_table,
         in_util_table=row.in_util_table,
+        sources=list(row.sources),
     )
 
 
@@ -1989,29 +2043,41 @@ def _merge_runtime_rows(
     for k, r in extra_rows.items():
         existing = merged.get(k)
         if existing is not None:
+            used_extra = False
             if r.hbm_used_bytes is not None and (not prefer_base or existing.hbm_used_bytes is None):
                 existing.hbm_used_bytes = r.hbm_used_bytes
+                used_extra = True
             if r.hbm_total_bytes is not None and (not prefer_base or existing.hbm_total_bytes is None):
                 existing.hbm_total_bytes = r.hbm_total_bytes
+                used_extra = True
             if r.duty_cycle_percent is not None and (
                 not prefer_base or existing.duty_cycle_percent is None
             ):
                 existing.duty_cycle_percent = r.duty_cycle_percent
+                used_extra = True
             if r.unjoined_duty_cycle_percent is not None and (
                 not prefer_base or existing.unjoined_duty_cycle_percent is None
             ):
                 existing.unjoined_duty_cycle_percent = r.unjoined_duty_cycle_percent
+                used_extra = True
             if r.hbm_bw_util_percent is not None and (
                 not prefer_base or existing.hbm_bw_util_percent is None
             ):
                 existing.hbm_bw_util_percent = r.hbm_bw_util_percent
+                used_extra = True
             if r.chip_type and not existing.chip_type:
                 existing.chip_type = r.chip_type
             for pid in r.pids:
                 if pid not in existing.pids:
                     existing.pids.append(pid)
+            if r.in_chips_table and not existing.in_chips_table:
+                used_extra = True
             existing.in_chips_table = existing.in_chips_table or r.in_chips_table
             existing.in_util_table = existing.in_util_table or r.in_util_table
+            if used_extra:
+                for src in r.sources:
+                    if src and src not in existing.sources:
+                        existing.sources.append(src)
         else:
             merged[k] = _copy_tpu_info_row(r)
     return merged
@@ -2139,7 +2205,6 @@ def collect_snapshot(
     explicit_non_default_runtime_addr = bool(
         runtime_metrics_addr and runtime_metrics_addr != DEFAULT_RUNTIME_METRICS_ADDR
     )
-    runtime_source_label = "tpu-info"
     if not tpu_info_bin:
         # Empty/None `--tpu-info-bin` explicitly disables `libtpu` runtime
         # telemetry (direct gRPC, `tpu_info.metrics`, and CLI) across every mode.
@@ -2156,8 +2221,8 @@ def collect_snapshot(
             addr=runtime_metrics_addr,
             timeout_s=grpc_budget_s,
         )
-        if tpu_info_ok and _has_live_utilization(parsed_rows):
-            runtime_source_label = "libtpu-grpc"
+        if parsed_rows:
+            parsed_rows = _tag_row_sources(parsed_rows, "libtpu-grpc")
         if not tpu_info_ok or not _has_complete_utilization(parsed_rows):
             remaining_s = runtime_deadline - time.monotonic()
             if remaining_s >= 0.05:
@@ -2167,6 +2232,7 @@ def collect_snapshot(
                     timeout_s=remaining_s,
                 )
                 if py_ok:
+                    py_rows = _tag_row_sources(py_rows, "tpu-info-python")
                     parsed_rows = (
                         _merge_runtime_rows(parsed_rows, py_rows, prefer_base=True)
                         if parsed_rows
@@ -2186,7 +2252,8 @@ def collect_snapshot(
         # HBM + duty-cycle readings. If direct gRPC returned only partial
         # utilization (e.g. HBM succeeded while duty-cycle timed out), run
         # fallback within the remaining scrape budget and merge only the missing
-        # fields (`prefer_base=True`) so successful gRPC readings are preserved.
+        # fields (`prefer_base=True`) so successful gRPC readings are preserved
+        # while per-row source provenance records which chips used fallback.
         use_default_grpc_first = tpu_info_bin == "tpu-info"
         tpu_info_ok = False
         tpu_info_err = None
@@ -2203,8 +2270,8 @@ def collect_snapshot(
                 addr=runtime_metrics_addr,
                 timeout_s=grpc_budget_s,
             )
-            if tpu_info_ok and _has_live_utilization(parsed_rows):
-                runtime_source_label = "libtpu-grpc"
+            if parsed_rows:
+                parsed_rows = _tag_row_sources(parsed_rows, "libtpu-grpc")
 
         remaining_s = runtime_deadline - time.monotonic()
         if (not tpu_info_ok or not _has_complete_utilization(parsed_rows)) and remaining_s >= 0.05:
@@ -2213,6 +2280,7 @@ def collect_snapshot(
                 timeout_s=remaining_s,
             )
             if cli_ok:
+                cli_rows = _tag_row_sources(cli_rows, "tpu-info")
                 tpu_info_ok = True
                 tpu_info_err = None
                 parsed_rows = (
@@ -2235,6 +2303,7 @@ def collect_snapshot(
                     timeout_s=remaining_s,
                 )
                 if py_ok:
+                    py_rows = _tag_row_sources(py_rows, "tpu-info-python")
                     parsed_rows = (
                         _merge_runtime_rows(parsed_rows, py_rows, prefer_base=True)
                         if parsed_rows
@@ -2265,7 +2334,7 @@ def collect_snapshot(
                 break
 
         if chips_row is not None and not skip_pid_scan:
-            dev.telemetry_source = runtime_source_label
+            dev.telemetry_source = _format_row_source(chips_row)
 
         rt_id = resolved_rt_ids.get(dev.pci_bdf)
         if rt_id in ambiguous_rt_ids:
@@ -2286,7 +2355,7 @@ def collect_snapshot(
                 or matched_util.duty_cycle_percent is not None
                 or matched_util.hbm_bw_util_percent is not None
             ):
-                dev.telemetry_source = runtime_source_label
+                dev.telemetry_source = _format_row_source(matched_util)
             if matched_util.hbm_used_bytes is not None:
                 dev.hbm_used_bytes = matched_util.hbm_used_bytes
             if matched_util.hbm_total_bytes is not None:
@@ -2339,6 +2408,7 @@ def collect_snapshot(
             hbm_total_bytes=row.hbm_total_bytes,
             duty_cycle_percent=row.duty_cycle_percent,
             hbm_bandwidth_utilization_percent=row.hbm_bw_util_percent,
+            telemetry_source=_format_row_source(row) if row.sources else None,
         )
         for key, row in util_rows.items()
         if (
