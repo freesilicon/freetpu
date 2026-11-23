@@ -13,36 +13,88 @@
 
 namespace {
 
-void check_maps() {
+std::string mapped_basename(const std::string& maps_line) {
+  // /proc/self/maps format: addr perms offset dev inode [pathname]
+  size_t pos = 0;
+  for (int field = 0; field < 5; ++field) {
+    while (pos < maps_line.size() && maps_line[pos] == ' ') ++pos;
+    while (pos < maps_line.size() && maps_line[pos] != ' ') ++pos;
+  }
+  while (pos < maps_line.size() && maps_line[pos] == ' ') ++pos;
+  if (pos >= maps_line.size()) return "";
+  std::string path = maps_line.substr(pos);
+  const std::string deleted_suffix = " (deleted)";
+  if (path.size() >= deleted_suffix.size() &&
+      path.compare(path.size() - deleted_suffix.size(), deleted_suffix.size(), deleted_suffix) == 0) {
+    path.erase(path.size() - deleted_suffix.size());
+  }
+  size_t slash = path.rfind('/');
+  return (slash == std::string::npos) ? path : path.substr(slash + 1);
+}
+
+bool check_maps() {
   std::ifstream ifs("/proc/self/maps");
   if (!ifs.is_open()) {
-    printf("MAPS_LIBTPU=0 MAPS_LIBPYTHON=0 (non-proc host)\n");
-    return;
+    printf("MAPS_CHECK=SKIPPED (/proc/self/maps unavailable on this host)\n");
+    return true;
   }
   std::string line;
   int libtpu_cnt = 0;
   int libpython_cnt = 0;
   while (std::getline(ifs, line)) {
-    if (line.find("libtpu") != std::string::npos) libtpu_cnt++;
-    if (line.find("libpython") != std::string::npos) libpython_cnt++;
+    std::string base = mapped_basename(line);
+    if (base.compare(0, 6, "libtpu") == 0) libtpu_cnt++;
+    if (base.compare(0, 9, "libpython") == 0) libpython_cnt++;
   }
   printf("MAPS_LIBTPU=%d MAPS_LIBPYTHON=%d\n", libtpu_cnt, libpython_cnt);
+  if (libtpu_cnt > 0 || libpython_cnt > 0) {
+    fprintf(stderr, "ERROR: forbidden dependency mapped (MAPS_LIBTPU=%d MAPS_LIBPYTHON=%d)\n",
+            libtpu_cnt, libpython_cnt);
+    return false;
+  }
+  return true;
+}
+
+void print_usage(FILE* out, const char* prog) {
+  fprintf(out, "Usage: %s [--mock] [--bdf <PCI_BDF>] [--help]\n", prog ? prog : "opentpu_vfio_smoke");
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-  check_maps();
-
   ot_config_t cfg = ot_config_default();
-  if (argc > 1 && std::strcmp(argv[1], "--mock") == 0) {
-    cfg.mock_mode = 1;
+  for (int i = 1; i < argc; ++i) {
+    if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
+      print_usage(stdout, argv[0]);
+      return 0;
+    } else if (std::strcmp(argv[i], "--mock") == 0) {
+      cfg.mock_mode = 1;
+    } else if (std::strcmp(argv[i], "--bdf") == 0) {
+      if (i + 1 >= argc || argv[i + 1][0] == '\0') {
+        fprintf(stderr, "ERROR: --bdf requires a valid PCI BDF argument\n");
+        print_usage(stderr, argv[0]);
+        return 2;
+      }
+      cfg.bdf = argv[++i];
+    } else {
+      fprintf(stderr, "ERROR: unknown argument: %s\n", argv[i]);
+      print_usage(stderr, argv[0]);
+      return 2;
+    }
+  }
+
+  if (!check_maps()) {
+    return 3;
   }
 
   ot_context_t* ctx = nullptr;
   ot_status_t st = ot_context_create(&cfg, &ctx);
   if (st != OT_OK) {
-    fprintf(stderr, "ot_context_create failed: %s\n", ot_status_string(st));
+    const char* detail = ot_context_last_error(nullptr);
+    fprintf(stderr, "ot_context_create failed: %s%s%s\n",
+            ot_status_string(st),
+            (detail && detail[0]) ? " — " : "",
+            (detail && detail[0]) ? detail : "");
     return 1;
   }
 
@@ -72,7 +124,22 @@ int main(int argc, char** argv) {
       src[i] = 0xCAFE0000u ^ static_cast<uint32_t>(i * 2654435761u);
     }
     ot_status_t h2d = ot_buffer_h2d(ctx, buf, src.data(), sz);
-    ot_status_t d2h = (h2d == OT_OK) ? ot_buffer_d2h(ctx, buf, dst.data(), sz) : h2d;
+    ot_status_t clobber_st = OT_OK;
+    if (h2d == OT_OK) {
+      // Overwrite the DMA staging window with an inverted pattern via a second HBM buffer
+      // so a stale staging window cannot masquerade as a successful D2H transfer.
+      ot_buffer_t* clobber_buf = nullptr;
+      clobber_st = ot_buffer_alloc(ctx, sz, &clobber_buf);
+      if (clobber_st == OT_OK) {
+        std::vector<uint32_t> inverted(nwords);
+        for (size_t i = 0; i < nwords; ++i) inverted[i] = ~src[i];
+        clobber_st = ot_buffer_h2d(ctx, clobber_buf, inverted.data(), sz);
+        ot_buffer_free(clobber_buf);
+      }
+    }
+    ot_status_t d2h = (h2d == OT_OK && clobber_st == OT_OK)
+                          ? ot_buffer_d2h(ctx, buf, dst.data(), sz)
+                          : (h2d != OT_OK ? h2d : clobber_st);
     if (h2d == OT_OK && d2h == OT_OK) {
       bool match = (std::memcmp(src.data(), dst.data(), sz) == 0);
       printf("M2_DMA_ROUNDTRIP size=%zu: match=%d first=0x%08x last=0x%08x\n",

@@ -96,7 +96,9 @@ int main() {
     if (e->d_name[0] == '.') continue;
     std::string base = std::string("/sys/bus/pci/devices/") + e->d_name;
     if (read_link_base(base + "/driver") == "vfio-pci" &&
-        read_line(base + "/vendor") == "0x1ae0") {
+        read_line(base + "/vendor") == "0x1ae0" &&
+        read_line(base + "/device") == "0x0063" &&
+        read_line(base + "/class") == "0xff0000") {
       bdf = e->d_name;
       grp = read_link_base(base + "/iommu_group");
       break;
@@ -108,23 +110,63 @@ int main() {
     return 1;
   }
 
-  int container = open("/dev/vfio/vfio", O_RDWR);
-  int group = open(("/dev/vfio/" + grp).c_str(), O_RDWR);
-  ioctl(group, VFIO_GROUP_SET_CONTAINER, &container);
-  ioctl(container, VFIO_SET_IOMMU, VFIO_TYPE1v2_IOMMU);
+  int container = open("/dev/vfio/vfio", O_RDWR | O_CLOEXEC);
+  if (container < 0) {
+    fprintf(stderr, "open(/dev/vfio/vfio) failed: %s\n", strerror(errno));
+    return 1;
+  }
+  int group = open(("/dev/vfio/" + grp).c_str(), O_RDWR | O_CLOEXEC);
+  if (group < 0) {
+    fprintf(stderr, "open(/dev/vfio/%s) failed: %s\n", grp.c_str(), strerror(errno));
+    close(container);
+    return 1;
+  }
+  if (ioctl(group, VFIO_GROUP_SET_CONTAINER, &container) < 0) {
+    fprintf(stderr, "VFIO_GROUP_SET_CONTAINER failed: %s\n", strerror(errno));
+    close(group);
+    close(container);
+    return 1;
+  }
+  if (ioctl(container, VFIO_SET_IOMMU, VFIO_TYPE1v2_IOMMU) < 0 &&
+      ioctl(container, VFIO_SET_IOMMU, VFIO_TYPE1_IOMMU) < 0) {
+    fprintf(stderr, "VFIO_SET_IOMMU failed: %s\n", strerror(errno));
+    close(group);
+    close(container);
+    return 1;
+  }
   int dev = ioctl(group, VFIO_GROUP_GET_DEVICE_FD, bdf.c_str());
+  if (dev < 0) {
+    fprintf(stderr, "VFIO_GROUP_GET_DEVICE_FD(%s) failed: %s\n", bdf.c_str(), strerror(errno));
+    close(group);
+    close(container);
+    return 1;
+  }
 
   struct vfio_region_info r0 = {}, r4 = {};
   r0.argsz = sizeof(r0); r0.index = VFIO_PCI_BAR0_REGION_INDEX;
   r4.argsz = sizeof(r4); r4.index = VFIO_PCI_BAR4_REGION_INDEX;
-  ioctl(dev, VFIO_DEVICE_GET_REGION_INFO, &r0);
-  ioctl(dev, VFIO_DEVICE_GET_REGION_INFO, &r4);
+  if (ioctl(dev, VFIO_DEVICE_GET_REGION_INFO, &r0) < 0 ||
+      ioctl(dev, VFIO_DEVICE_GET_REGION_INFO, &r4) < 0) {
+    fprintf(stderr, "VFIO_DEVICE_GET_REGION_INFO failed: %s\n", strerror(errno));
+    close(dev);
+    close(group);
+    close(container);
+    return 1;
+  }
+
+  int scan_errors = 0;
 
   printf("=== BAR4 FULL FIRST 4 KiB NONZERO DUMP ===\n");
-  void* m4 = mmap(nullptr, r4.size, PROT_READ | PROT_WRITE, MAP_SHARED, dev, r4.offset);
-  if (m4 != MAP_FAILED) {
+  void* m4 = (r4.size > 0)
+                 ? mmap(nullptr, r4.size, PROT_READ | PROT_WRITE, MAP_SHARED, dev, r4.offset)
+                 : MAP_FAILED;
+  if (m4 == MAP_FAILED) {
+    fprintf(stderr, "mmap(BAR4, size=0x%llx) failed: %s\n",
+            (unsigned long long)r4.size, strerror(errno));
+    ++scan_errors;
+  } else {
     const volatile uint8_t* b4 = reinterpret_cast<const volatile uint8_t*>(m4);
-    dump_hex_ascii(b4, 0, 4096);
+    dump_hex_ascii(b4, 0, std::min<size_t>(static_cast<size_t>(r4.size), 4096u));
 
     printf("\n=== BAR4 FULL 16 MiB SCAN (every 64 bytes) ===\n");
     int hits4 = 0;
@@ -154,17 +196,25 @@ int main() {
   // Map BAR0 in 64 MiB chunks to scan 4 GiB at 64 KiB stride (65536 reads total)
   const size_t chunk_sz = 64ULL * 1024ULL * 1024ULL;
   int bar0_hits = 0;
+  if (r0.size == 0) {
+    fprintf(stderr, "BAR0 region size is 0\n");
+    ++scan_errors;
+  }
   for (uint64_t base_off = 0; base_off < r0.size; base_off += chunk_sz) {
-    void* m0 = mmap(nullptr, chunk_sz, PROT_READ, MAP_SHARED, dev,
+    size_t map_len = static_cast<size_t>(std::min<uint64_t>(chunk_sz, r0.size - base_off));
+    void* m0 = mmap(nullptr, map_len, PROT_READ, MAP_SHARED, dev,
                     static_cast<off_t>(r0.offset + base_off));
     if (m0 == MAP_FAILED) {
-      printf("  mmap BAR0+0x%llx failed err=%d\n", (unsigned long long)base_off, errno);
+      fprintf(stderr, "  mmap BAR0+0x%llx failed: %s\n",
+              (unsigned long long)base_off, strerror(errno));
+      ++scan_errors;
       break;
     }
     const volatile uint8_t* b0 = reinterpret_cast<const volatile uint8_t*>(m0);
     if (base_off == 0) {
       printf("  BAR0 [0x00000..0x40000] non-zero/non-ff 4KiB pages:\n");
-      for (size_t pg = 0; pg < 256 * 1024; pg += 4096) {
+      size_t dense_end = std::min<size_t>(map_len, 256u * 1024u);
+      for (size_t pg = 0; pg + 4096u <= dense_end; pg += 4096) {
         int nz = 0, zr = 0, ff = 0;
         uint32_t first_nz_off = 0, first_nz_val = 0;
         for (size_t w = 0; w < 4096; w += 4) {
@@ -183,8 +233,8 @@ int main() {
         }
       }
     }
-    // Check every 64 KiB across this 64 MiB chunk at offsets +0x0, +0x4, +0x8, +0x100
-    for (size_t off = 0; off < chunk_sz; off += 65536) {
+    // Check every 64 KiB across this chunk at offsets +0x0, +0x4, +0x8, +0x100
+    for (size_t off = 0; off + 0x104u <= map_len; off += 65536) {
       uint32_t v0 = 0xffffffffu, v4 = 0xffffffffu, v8 = 0xffffffffu, v100 = 0xffffffffu;
       bool ok = safe_r32(b0 + off, &v0) && safe_r32(b0 + off + 4, &v4) &&
                 safe_r32(b0 + off + 8, &v8) && safe_r32(b0 + off + 0x100, &v100);
@@ -197,13 +247,17 @@ int main() {
         bar0_hits++;
       }
     }
-    munmap(m0, chunk_sz);
+    munmap(m0, map_len);
   }
   printf("Total BAR0 64KiB non-0xffffffff hits across 4 GiB: %d\n", bar0_hits);
 
   close(dev);
   close(group);
   close(container);
+  if (scan_errors != 0) {
+    fprintf(stderr, "=== M1_SCAN2_FAILED (errors=%d) ===\n", scan_errors);
+    return 1;
+  }
   printf("=== M1_SCAN2_COMPLETE ===\n");
   return 0;
 }

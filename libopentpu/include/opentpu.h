@@ -40,7 +40,7 @@ typedef enum ot_status {
 typedef enum ot_chip_gen {
   OT_CHIP_UNKNOWN = 0,
   OT_CHIP_V5E     = 1, /* PCI 0x1ae0:0x0063 */
-  OT_CHIP_V6E     = 2, /* PCI 0x1ae0:0x0066 (probed dynamically) */
+  OT_CHIP_V6E     = 2, /* PCI 0x1ae0:0x006f (documented; transport not yet validated) */
   OT_CHIP_TPU7X   = 3
 } ot_chip_gen_t;
 
@@ -80,12 +80,16 @@ ot_status_t ot_context_create(const ot_config_t* config, ot_context_t** out_ctx)
 void        ot_context_destroy(ot_context_t* ctx);
 
 const char* ot_status_string(ot_status_t status);
+/* Pass NULL to retrieve the last ot_context_create() error on the calling thread. */
 const char* ot_context_last_error(const ot_context_t* ctx);
 int         ot_context_is_mock(const ot_context_t* ctx);
 
 ot_status_t ot_device_get_info(const ot_context_t* ctx, ot_device_info_t* out_info);
 
-/* IOMMU-mapped host staging & HBM device buffer management */
+/* IOMMU-mapped host staging & HBM device buffer management.
+ * Callers should free buffers before destroying their owning context; any
+ * outstanding buffers are detached during ot_context_destroy() so a later
+ * ot_buffer_free() remains safe, though transfers on detached handles fail. */
 ot_status_t ot_buffer_alloc(ot_context_t* ctx, size_t size_bytes, ot_buffer_t** out_buf);
 void        ot_buffer_free(ot_buffer_t* buf);
 size_t      ot_buffer_size(const ot_buffer_t* buf);

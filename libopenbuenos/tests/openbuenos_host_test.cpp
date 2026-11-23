@@ -4554,9 +4554,9 @@ void test_phase7_cycle3_regressions() {
 
     // 9a. Exact INT8 SwiGLU must populate stage timings when profiling is enabled.
     constexpr uint32_t K = 576u, H = 1536u, N = 576u;
-    std::vector<int8_t> xi(K, 1), wg(H * K, 1), wu(H * K, 1), wd(N * H, 1), yi(N, 0);
+    std::vector<int8_t> xi(64u * K, 1), wg(512u * K, 1), wu(512u * K, 1), wd(N * 512u, 1), yi(64u * N, 0);
     ob_swiglu_int8_desc_t id{};
-    id.m_dim = 1u; id.k_dim = K; id.h_dim = H; id.n_dim = N;
+    id.m_dim = 64u; id.k_dim = K; id.h_dim = 512u; id.n_dim = N;
     id.s_in = 0.01f; id.s_wg = 0.01f; id.s_gate = 0.05f;
     id.s_wu = 0.01f; id.s_up = 0.05f; id.s_silu = 0.05f;
     id.s_prod = 0.05f; id.s_wd = 0.01f; id.s_out = 0.05f;
@@ -4650,6 +4650,723 @@ void test_phase7_cycle3_regressions() {
   std::printf("[PASS] test_phase7_cycle3_regressions (dense 16MiB cap, immutable gen+O(1) hit, warm budget shrink, refcnt timeout retention, warm SwiGLU clip guard, cpu-only tiles_dispatched=0, int8 stage prof & single fallback count OK)\n");
 }
 
+void test_phase8a_overlapped_neon_worker_pool_and_swiglu_m64() {
+  // 1. Persistent WorkerPool correctness across thread counts {1, 2, 4, 8} + clean shutdown
+  for (uint32_t nt : {1u, 2u, 4u, 8u}) {
+    ob::WorkerPool pool;
+    pool.init(nt);
+    CHECK(pool.num_threads == nt);
+    constexpr uint32_t kTotal = 1027u;
+    std::vector<uint32_t> vals(kTotal, 0u);
+    std::vector<uint32_t> seen(kTotal, 0u);
+    pool.parallel_for_fn(kTotal, 7u, [&](uint32_t s, uint32_t e, uint32_t) {
+      for (uint32_t i = s; i < e; ++i) {
+        vals[i] = i * 3u + 17u;
+        seen[i] += 1u;
+      }
+    });
+    for (uint32_t i = 0u; i < kTotal; ++i) {
+      CHECK(seen[i] == 1u);
+      CHECK(vals[i] == i * 3u + 17u);
+    }
+    pool.shutdown();
+  }
+
+  // 2. Parallel NEON pack_ext2_*_into BIT-EXACT parity vs reference pack_ext2_for_*
+  {
+    ob::WorkerPool pool;
+    pool.init(4u);
+
+    // 2a. pack_ext2_for_tile_into (with and without bias, M=1 large tile 1536x1536)
+    {
+      constexpr uint32_t N = 576u, K = 576u;
+      std::vector<int8_t> w(static_cast<size_t>(N) * K);
+      std::vector<int32_t> b(N);
+      for (size_t i = 0; i < w.size(); ++i) w[i] = static_cast<int8_t>(static_cast<int32_t>((i * 37u + 13u) % 251u) - 125);
+      for (uint32_t n = 0; n < N; ++n) b[n] = static_cast<int32_t>(n) * 19 - 5000;
+
+      std::vector<uint8_t> ref_nb = ob::pack_ext2_for_tile(N, K, w.data(), nullptr);
+      std::vector<uint8_t> got_nb(ob::pack_ext2_size_for_tile(N, K, false), 0xAAu);
+      ob::pack_ext2_for_tile_into(got_nb.data(), N, K, w.data(), nullptr, false, &pool);
+      CHECK(got_nb == ref_nb);
+
+      std::vector<uint8_t> ref_wb = ob::pack_ext2_for_tile(N, K, w.data(), b.data());
+      std::vector<uint8_t> got_wb(ob::pack_ext2_size_for_tile(N, K, true), 0x55u);
+      ob::pack_ext2_for_tile_into(got_wb.data(), N, K, w.data(), b.data(), true, &pool);
+      CHECK(got_wb == ref_wb);
+    }
+
+    // 2b. pack_ext2_for_lt_64x_into (M=64 large tile 64x1536x1536)
+    {
+      constexpr uint32_t N = 512u, K = 576u;
+      std::vector<int8_t> w(static_cast<size_t>(N) * K);
+      std::vector<int32_t> b(N);
+      for (size_t i = 0; i < w.size(); ++i) w[i] = static_cast<int8_t>(static_cast<int32_t>((i * 53u + 7u) % 255u) - 127);
+      for (uint32_t n = 0; n < N; ++n) b[n] = static_cast<int32_t>(n) * 7 - 1234;
+
+      std::vector<uint8_t> ref_lt = ob::pack_ext2_for_lt_64x(N, K, w.data(), b.data());
+      std::vector<uint8_t> got_lt(ob::pack_ext2_size_for_lt_64x(N, K), 0xCCu);
+      ob::pack_ext2_for_lt_64x_into(got_lt.data(), N, K, w.data(), b.data(), &pool);
+      CHECK(got_lt == ref_lt);
+
+      std::vector<uint8_t> ref_lt0 = ob::pack_ext2_for_lt_64x(N, K, w.data(), nullptr);
+      std::vector<uint8_t> got_lt0(ob::pack_ext2_size_for_lt_64x(N, K), 0xDDu);
+      ob::pack_ext2_for_lt_64x_into(got_lt0.data(), N, K, w.data(), nullptr, &pool);
+      CHECK(got_lt0 == ref_lt0);
+    }
+
+    // 2c. pack_ext2_for_swiglu_into (both M=1 and M=64!)
+    for (uint32_t M : {1u, 64u}) {
+      constexpr uint32_t K = 576u, H = 512u, N = 576u;
+      std::vector<int8_t> wg(static_cast<size_t>(H) * K), wu(static_cast<size_t>(H) * K),
+          wd(static_cast<size_t>(N) * H);
+      for (size_t i = 0; i < wg.size(); ++i) {
+        wg[i] = static_cast<int8_t>(static_cast<int32_t>((i * 19u + 3u) % 241u) - 120);
+        wu[i] = static_cast<int8_t>(static_cast<int32_t>((i * 29u + 11u) % 241u) - 120);
+      }
+      for (size_t i = 0; i < wd.size(); ++i) {
+        wd[i] = static_cast<int8_t>(static_cast<int32_t>((i * 41u + 5u) % 241u) - 120);
+      }
+      std::vector<uint8_t> ref_sw = ob::pack_ext2_for_swiglu(
+          M, K, H, N, wg.data(), nullptr, wu.data(), nullptr, wd.data(), nullptr);
+      std::vector<uint8_t> got_sw(ob::pack_ext2_size_for_swiglu(M, K, H, N), 0xEEu);
+      ob::pack_ext2_for_swiglu_into(
+          got_sw.data(), M, K, H, N,
+          wg.data(), nullptr, wu.data(), nullptr, wd.data(), nullptr, &pool);
+      CHECK(got_sw == ref_sw);
+    }
+    pool.shutdown();
+  }
+
+  // 3. Fused single-pass NEON dequant_outliers_row_f32 exact parity (store_first=true/false, 0..8 outliers, non-16 tn)
+  {
+    const float nan_sentinel = std::numeric_limits<float>::quiet_NaN();
+    for (uint32_t tn : {19u, 127u, 513u, 1536u}) {
+      std::vector<int8_t> o_row(tn);
+      std::vector<float> sb(tn);
+      std::vector<std::vector<float>> cols(8u, std::vector<float>(tn));
+      const float* col_ptrs[8]{};
+      float out_vals[8]{};
+      for (uint32_t n = 0u; n < tn; ++n) {
+        o_row[n] = static_cast<int8_t>(static_cast<int32_t>((n * 23u + 5u) % 251u) - 125);
+        sb[n] = 0.002f + 0.0001f * static_cast<float>(n % 31u);
+        for (uint32_t oi = 0u; oi < 8u; ++oi) {
+          cols[oi][n] = static_cast<float>(static_cast<int32_t>((n * 7u + oi * 17u) % 41u) - 20) * 0.03f;
+        }
+      }
+      for (uint32_t oi = 0u; oi < 8u; ++oi) {
+        col_ptrs[oi] = cols[oi].data();
+        out_vals[oi] = (oi % 2u == 0u ? 1.0f : -1.0f) * (12.5f + 3.25f * static_cast<float>(oi));
+      }
+      const float sa_d = 0.075f;
+      for (uint32_t n_out : {0u, 1u, 4u, 8u}) {
+        for (bool store_first : {true, false}) {
+          std::vector<float> c_got(tn, store_first ? nan_sentinel : 1.75f);
+          std::vector<float> c_ref(tn, store_first ? 0.0f : 1.75f);
+          for (uint32_t n = 0u; n < tn; ++n) {
+            double acc = store_first ? 0.0 : 1.75;
+            acc += static_cast<double>(o_row[n]) * static_cast<double>(sa_d * sb[n]);
+            for (uint32_t oi = 0u; oi < n_out; ++oi) {
+              acc += static_cast<double>(out_vals[oi]) * static_cast<double>(cols[oi][n]);
+            }
+            c_ref[n] = static_cast<float>(acc);
+          }
+          ob::dequant_outliers_row_f32(
+              c_got.data(), o_row.data(), sb.data(), tn, sa_d, store_first,
+              n_out > 0u ? col_ptrs : nullptr, n_out > 0u ? out_vals : nullptr, n_out);
+          for (uint32_t n = 0u; n < tn; ++n) {
+            CHECK(std::isfinite(c_got[n]));
+            CHECK(std::fabs(c_got[n] - c_ref[n]) < 1e-4f);
+          }
+        }
+      }
+    }
+  }
+
+  // 4. OPENBUENOS_THREADS=1 vs 4 exact parity + OPENBUENOS_MAX_OUTLIER_COLS env knob + persistent M7A scratch reuse
+  {
+    std::vector<float> c_t1, c_t4;
+    constexpr uint32_t M = 64u, K = 576u, H = 1536u, N = 576u;
+    std::mt19937 rng(80801u);
+    std::normal_distribution<float> gd(0.0f, 1.0f);
+    std::vector<float> a64(static_cast<size_t>(M) * K);
+    for (float& v : a64) v = gd(rng) * 0.5f;
+    // Inject attention-sink outliers in multiple rows to exercise parallel outlier path
+    for (uint32_t m = 0u; m < M; m += 8u) {
+      a64[static_cast<size_t>(m) * K + 13u] = 28.0f;
+      a64[static_cast<size_t>(m) * K + 211u] = -24.0f;
+    }
+    auto make_q8 = [&](uint32_t rows, uint32_t cols) {
+      const uint32_t nb = cols / OB_QK8_0;
+      std::vector<ob_block_q8_0_t> out(static_cast<size_t>(rows) * nb);
+      const uint16_t dh = fp32_to_fp16(0.008f);
+      for (size_t i = 0; i < out.size(); ++i) {
+        out[i].d = dh;
+        for (uint32_t j = 0u; j < OB_QK8_0; ++j) {
+          out[i].qs[j] = static_cast<int8_t>(static_cast<int32_t>((i * 11u + j * 7u) % 97u) - 48);
+        }
+      }
+      return out;
+    };
+    auto wg = make_q8(H, K), wu = make_q8(H, K), wd = make_q8(N, H);
+    ob_gemm_swiglu_quant_desc_t sd{};
+    sd.w_gate_hk = wg.data(); sd.w_up_hk = wu.data(); sd.w_down_nh = wd.data();
+    sd.m_dim = M; sd.k_dim = K; sd.h_dim = H; sd.n_dim = N;
+
+    for (int mode = 0; mode < 2; ++mode) {
+      ::setenv("OPENBUENOS_THREADS", mode == 0 ? "1" : "4", 1);
+      ::setenv("OPENBUENOS_MAX_OUTLIER_COLS", mode == 0 ? "32" : "160", 1);
+      ob_config_t cfg = ob_config_default();
+      cfg.mock_mode = 1;
+      ob_context_t* ctx = nullptr;
+      CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+      CHECK(ctx->num_threads == (mode == 0 ? 1u : 4u));
+      CHECK(ctx->max_cached_outlier_cols == (mode == 0 ? 32u : 160u));
+      std::vector<uint8_t> si19 = make_synthetic_dive_interp(0x8Au);
+      TempBinaryFile ifile19;
+      CHECK(ifile19.write(si19.data(), si19.size()));
+      CHECK(ob_gemm_register_builtin_emitter(ctx, ifile19.path()) == OB_OK);
+
+      std::vector<float> c(static_cast<size_t>(M) * N, 0.0f);
+      ob_invoke_stats_t s1{}, s2{};
+      CHECK(ob_gemm_swiglu_f32_quant(ctx, a64.data(), &sd, c.data(), &s1) == OB_OK);
+      const float* gate_ptr_1 = ctx->swiglu_gate_scratch.data();
+      const size_t gate_cap_1 = ctx->swiglu_gate_scratch.capacity();
+      CHECK(gate_cap_1 >= static_cast<size_t>(M) * H);
+      // Second call must reuse persistent M7A fallback scratch without reallocation!
+      CHECK(ob_gemm_swiglu_f32_quant(ctx, a64.data(), &sd, c.data(), &s2) == OB_OK);
+      CHECK(ctx->swiglu_gate_scratch.data() == gate_ptr_1);
+      CHECK(ctx->swiglu_gate_scratch.capacity() == gate_cap_1);
+
+      if (mode == 0) c_t1 = c;
+      else c_t4 = c;
+      ob_context_destroy(ctx);
+    }
+    ::unsetenv("OPENBUENOS_THREADS");
+    ::unsetenv("OPENBUENOS_MAX_OUTLIER_COLS");
+    CHECK(c_t1.size() == c_t4.size());
+    for (size_t i = 0; i < c_t1.size(); ++i) {
+      CHECK(std::fabs(c_t1[i] - c_t4[i]) < 1e-5f);
+    }
+  }
+
+  // 5. Verify compute_swiglu_stage_dividers M=64 fix (sig_down=4.9 vs M=1 5.6) restores
+  //    qwen25_q4_64x1536x8960 exact HW-sim NMSE < 3.5e-3!
+  {
+    // Boundary check: M=64 keeps tighter d_down than M=1 while M=1 retains 5.6 headroom
+    uint32_t dg1 = 0u, du1 = 0u, dm1 = 0u, dd1 = 0u;
+    uint32_t dg64 = 0u, du64 = 0u, dm64 = 0u, dd64 = 0u;
+    ob::compute_swiglu_stage_dividers(1u,  36.0f, 1200.0f, 1020.0f, 1750.0f, 1540.0f, 1200.0f, &dg1, &du1, &dm1, &dd1);
+    ob::compute_swiglu_stage_dividers(64u, 36.0f, 1200.0f, 1020.0f, 1750.0f, 1540.0f, 1200.0f, &dg64, &du64, &dm64, &dd64);
+    CHECK(dm64 * dd64 <= dm1 * dd1);
+
+    // Full 18-chunk Qwen2.5 Q4_0 M=64x1536x8960x1536 exact HW-sim NMSE check (matches selftest --test-swiglu!)
+    constexpr uint32_t M = 64u, K = 1536u, H = 8960u, N = 1536u;
+    uint64_t s = 0x2026112157676C75ULL;
+    auto next_u = [&]() -> double {
+      s ^= s >> 12; s ^= s << 25; s ^= s >> 27;
+      return static_cast<double>((s * 2685821657736338717ULL) >> 11) * (1.0 / 9007199254740992.0);
+    };
+    auto next_g = [&]() -> float {
+      double u1 = std::max(next_u(), 1e-12);
+      double u2 = next_u();
+      return static_cast<float>(std::sqrt(-2.0 * std::log(u1)) * std::cos(6.283185307179586 * u2));
+    };
+    auto make_q4_m = [&](uint32_t rows, uint32_t cols, float scale,
+                         std::vector<ob_block_q4_0_t>* q4, std::vector<float>* deq) {
+      const uint32_t nb = cols / OB_QK8_0;
+      q4->resize(static_cast<size_t>(rows) * nb);
+      deq->resize(static_cast<size_t>(rows) * cols);
+      for (uint32_t r = 0u; r < rows; ++r) {
+        for (uint32_t bi = 0u; bi < nb; ++bi) {
+          float tmp[OB_QK8_0];
+          float am = 0.0f;
+          for (uint32_t j = 0u; j < OB_QK8_0; ++j) {
+            tmp[j] = next_g() * scale;
+            float av = std::fabs(tmp[j]);
+            if (av > am) am = av;
+          }
+          uint16_t dh = fp32_to_fp16(am > 0.0f ? (am / 7.0f) : 1.0f);
+          float d = fp16_to_fp32_ref(dh);
+          ob_block_q4_0_t& blk = (*q4)[static_cast<size_t>(r) * nb + bi];
+          blk.d = dh;
+          for (uint32_t j = 0u; j < 16u; ++j) {
+            long q0 = (d > 0.0f) ? std::lround(tmp[j] / d) : 0L;
+            long q1 = (d > 0.0f) ? std::lround(tmp[j + 16u] / d) : 0L;
+            if (q0 < -8) q0 = -8;
+            if (q0 > 7) q0 = 7;
+            if (q1 < -8) q1 = -8;
+            if (q1 > 7) q1 = 7;
+            blk.qs[j] = static_cast<uint8_t>((q0 + 8) | ((q1 + 8) << 4));
+            (*deq)[static_cast<size_t>(r) * cols + bi * OB_QK8_0 + j] = d * static_cast<float>(q0);
+            (*deq)[static_cast<size_t>(r) * cols + bi * OB_QK8_0 + j + 16u] = d * static_cast<float>(q1);
+          }
+        }
+      }
+    };
+    // Simulate representative 2-chunk H=1024 slice with full M=64 batch dynamics (identical per-chunk distribution)
+    constexpr uint32_t H_SIM = 1024u;
+    std::vector<float> a64(static_cast<size_t>(M) * K);
+    float batch_amax = 0.0f;
+    double max_row_rms = 0.0;
+    for (uint32_t m = 0u; m < M; ++m) {
+      double sq = 0.0;
+      for (uint32_t k = 0u; k < K; ++k) {
+        float v = next_g() * 0.8f;
+        a64[static_cast<size_t>(m) * K + k] = v;
+        if (std::fabs(v) > batch_amax) batch_amax = std::fabs(v);
+        sq += static_cast<double>(v) * static_cast<double>(v);
+      }
+      double rms = std::sqrt(sq / static_cast<double>(K));
+      if (rms > max_row_rms) max_row_rms = rms;
+    }
+    std::vector<ob_block_q4_0_t> g4, u4, d4;
+    std::vector<float> gd, ud, dd;
+    make_q4_m(H_SIM, K, 0.04f, &g4, &gd);
+    make_q4_m(H_SIM, K, 0.04f, &u4, &ud);
+    make_q4_m(N, H_SIM, 0.03f, &d4, &dd);
+
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+    std::vector<uint8_t> si19b = make_synthetic_dive_interp(0x8Bu);
+    TempBinaryFile ifile19b;
+    CHECK(ifile19b.write(si19b.data(), si19b.size()));
+    CHECK(ob_gemm_register_builtin_emitter(ctx, ifile19b.path()) == OB_OK);
+    ctx->swiglu_prefill_enabled = true;
+    ctx->swiglu_fast_chain_enabled = true;
+    std::vector<float> c_ref(static_cast<size_t>(M) * N, 0.0f);
+    ob_gemm_swiglu_quant_desc_t sd{};
+    sd.w_gate_hk = g4.data(); sd.w_up_hk = u4.data(); sd.w_down_nh = d4.data();
+    sd.m_dim = M; sd.k_dim = K; sd.h_dim = H_SIM; sd.n_dim = N;
+    sd.gate_is_q4_0 = 1u; sd.up_is_q4_0 = 1u; sd.down_is_q4_0 = 1u;
+    ob_invoke_stats_t sq{};
+    CHECK(ob_gemm_swiglu_f32_quant(ctx, a64.data(), &sd, c_ref.data(), &sq) == OB_OK);
+    CHECK(sq.tiles_dispatched == 2u);
+
+    // Exact HW-sim on 4 rows of M=64 using the actual M=64 packed ext[2] tiles & M=64 dividers
+    const float s_a = static_cast<float>(std::exp2(std::ceil(2.0 * std::log2(static_cast<double>(batch_amax / 127.0f))) * 0.5));
+    const float rms_aq = static_cast<float>(max_row_rms / static_cast<double>(s_a));
+    constexpr uint32_t kSimRows = 4u;
+    std::vector<int8_t> aq(static_cast<size_t>(kSimRows) * K, 0);
+    for (uint32_t m = 0u; m < kSimRows; ++m) {
+      for (uint32_t k = 0u; k < K; ++k) {
+        long q = std::lround(a64[static_cast<size_t>(m) * K + k] / s_a);
+        aq[static_cast<size_t>(m) * K + k] = static_cast<int8_t>(std::max(-127L, std::min(127L, q)));
+      }
+    }
+    auto unpack_ext2_lt64 = [](const uint8_t* e2, uint32_t N_d, uint32_t K_d, std::vector<int8_t>* w_out) {
+      w_out->assign(static_cast<size_t>(N_d) * K_d, 0);
+      const uint32_t ng = N_d / 8u;
+      const uint32_t kg = K_d / 16u;
+      const size_t grp_sz = 128u + static_cast<size_t>(kg) * 128u;
+      for (uint32_t g = 0u; g < ng; ++g) {
+        const uint8_t* gp = e2 + static_cast<size_t>(g) * grp_sz + 128u;
+        for (uint32_t kb = 0u; kb < kg; ++kb) {
+          const uint8_t* bp = gp + static_cast<size_t>(kb) * 128u;
+          for (uint32_t c = 0u; c < 8u; ++c) {
+            for (uint32_t k = 0u; k < 16u; ++k) {
+              (*w_out)[static_cast<size_t>(g * 8u + c) * K_d + kb * 16u + k] =
+                  static_cast<int8_t>(bp[c * 16u + k] ^ 0x80u);
+            }
+          }
+        }
+      }
+    };
+    std::vector<float> c_hw(static_cast<size_t>(kSimRows) * N, 0.0f);
+    uint32_t chunks_sim = 0u;
+    for (const auto& kv : ctx->weight_cache_map) {
+      const ob::CachedWeightTile* wt = kv.second;
+      if (!wt || !wt->ext2_buf) continue;
+      const uint32_t hw_h = 512u;
+      const uint8_t* e2 = static_cast<const uint8_t*>(ob_buffer_data(wt->ext2_buf));
+      const size_t sz_gu = ob::pack_ext2_size_for_lt_64x(hw_h, K);
+      std::vector<int8_t> uwg, uwu, uwd;
+      unpack_ext2_lt64(e2, hw_h, K, &uwg);
+      unpack_ext2_lt64(e2 + sz_gu, hw_h, K, &uwu);
+      unpack_ext2_lt64(e2 + 2u * sz_gu, N, hw_h, &uwd);
+      uint32_t d_gate = 0u, d_up = 0u, d_mul = 0u, d_down = 0u;
+      ob::compute_swiglu_stage_dividers(
+          M, rms_aq,
+          wt->swiglu_l2_gate_max, wt->swiglu_l2_gate_mean,
+          wt->swiglu_l2_up_max, wt->swiglu_l2_up_mean,
+          wt->swiglu_l2_down_max,
+          &d_gate, &d_up, &d_mul, &d_down);
+      const float s_gate = static_cast<float>(
+          std::exp2(std::round(2.0 * std::log2(static_cast<double>(s_a * wt->swiglu_s_wg * static_cast<float>(d_gate)))) * 0.5));
+      ob_swiglu_int8_desc_t hw_d{};
+      hw_d.m_dim = kSimRows; hw_d.k_dim = K; hw_d.h_dim = hw_h; hw_d.n_dim = N;
+      hw_d.s_in = 1.0f; hw_d.s_gate = s_gate; hw_d.s_wg = s_gate / static_cast<float>(d_gate);
+      hw_d.s_wu = 1.0f; hw_d.s_up = static_cast<float>(d_up);
+      hw_d.s_silu = s_gate; hw_d.s_prod = s_gate * hw_d.s_up * static_cast<float>(d_mul);
+      hw_d.s_wd = 1.0f / hw_d.s_prod; hw_d.s_out = static_cast<float>(d_down);
+      hw_d.wg_hk = uwg.data(); hw_d.wu_hk = uwu.data(); hw_d.wd_nh = uwd.data();
+      std::vector<int8_t> q_out(static_cast<size_t>(kSimRows) * N, 0);
+      ob::simulate_swiglu_hw_exact(aq.data(), hw_d, q_out.data());
+      if (chunks_sim == 0u) {
+        // Also verify full .dgc0 synthesis + parse succeeds for the exact 1.5x-grid M=64 dividers!
+        std::vector<uint8_t> sw_dgc0;
+        ob::SwigluSynthResult sw_parts{};
+        std::string sw_err;
+        ob_swiglu_int8_desc_t gdesc = hw_d;
+        gdesc.m_dim = M;
+        gdesc.wg_hk = nullptr; gdesc.wu_hk = nullptr; gdesc.wd_nh = nullptr;
+        CHECK(ob::build_swiglu_dgc0(gdesc, ctx->builtin_dive_interp.data(),
+                                    ctx->builtin_dive_interp.size(),
+                                    &sw_dgc0, &sw_parts, &sw_err) == OB_OK);
+        ob::ParsedDgc0 sw_parsed{};
+        CHECK(ob::parse_dgc0_buffer(sw_dgc0.data(), sw_dgc0.size(), &sw_parsed, &sw_err) == OB_OK);
+        CHECK(sw_parsed.input_sizes[0] == M * K);
+        CHECK(sw_parsed.output_sizes[0] == M * N);
+      }
+      const float out_mult = s_gate * s_a * static_cast<float>(d_up) *
+                             static_cast<float>(d_mul) * static_cast<float>(d_down);
+      for (uint32_t m = 0u; m < kSimRows; ++m) {
+        for (uint32_t n = 0u; n < N; ++n) {
+          c_hw[static_cast<size_t>(m) * N + n] +=
+              static_cast<float>(q_out[static_cast<size_t>(m) * N + n]) * out_mult * wt->row_s_b[n];
+        }
+      }
+      ++chunks_sim;
+    }
+    CHECK(chunks_sim == 2u);
+    double mse = 0.0, ref_e = 0.0;
+    for (size_t i = 0; i < c_hw.size(); ++i) {
+      double diff = static_cast<double>(c_hw[i]) - static_cast<double>(c_ref[i]);
+      mse += diff * diff;
+      ref_e += static_cast<double>(c_ref[i]) * static_cast<double>(c_ref[i]);
+    }
+    double m64_nmse = mse / std::max(ref_e, 1e-30);
+    std::printf("  [SwiGLU M=64 HW-sim] Qwen2.5 Q4_0 64x1536x1024x1536 (sig_down=4.9): NMSE=%.3e\n", m64_nmse);
+    CHECK(m64_nmse < 3.5e-3);
+    ob_context_destroy(ctx);
+    (void)H;
+  }
+
+  std::printf("[PASS] test_phase8a_overlapped_neon_worker_pool_and_swiglu_m64 (WorkerPool {1,2,4,8} + BIT-EXACT parallel NEON pack_ext2 + fused dequant+outliers + M7A scratch reuse + Qwen2.5 M=64 NMSE<3.5e-3)\n");
+}
+
+// ---------------------------------------------------------------------------
+// Test 20: Phase 8B Lock-Free SPSC Async Dequant + Bit-Exact 7-Chunk PT W8A16(FP16)
+// ---------------------------------------------------------------------------
+void test_phase8b_spsc_async_dequant_and_w8a16_pt() {
+  // 1. Default threading configuration: big-core inline default (OPENBUENOS_THREADS=1) +
+  //    lock-free 1-helper SPSC async dequant enabled by default (OPENBUENOS_ASYNC_DEQUANT=1).
+  {
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+    CHECK(ctx->num_threads == 1u);
+    CHECK(ctx->async_dequant_enabled == true);
+    CHECK(ctx->w8a16_mode == 0u);
+    ob_context_destroy(ctx);
+  }
+
+  // 2. Lock-free 1-helper SPSC AsyncDequantWorker stress test:
+  //    256 FIFO jobs wrapping the 16-slot ring 16 times, including a sleep-wakeup cycle
+  //    (>3 ms idle gap) to verify Dekker condvar sleep/wake has zero lost wakeups.
+  {
+    ob::AsyncDequantWorker worker;
+    constexpr uint32_t kJobs = 256u;
+    struct OrderCheck {
+      uint32_t id = 0u;
+      std::vector<uint32_t>* log = nullptr;
+      static void run(void* raw) {
+        OrderCheck* oc = static_cast<OrderCheck*>(raw);
+        oc->log->push_back(oc->id);
+      }
+    };
+    std::vector<uint32_t> log;
+    log.reserve(kJobs);
+    std::array<OrderCheck, ob::AsyncDequantWorker::kRingCap> slots{};
+    uint64_t last_seq = 0u;
+    for (uint32_t i = 0u; i < kJobs; ++i) {
+      if (i == 128u) {
+        worker.wait_until(last_seq);
+        // Sleep >3 ms so helper exits its 1.5 ms active spin into pthread_cond_wait
+        struct timespec ts{0, 3500000L};
+        nanosleep(&ts, nullptr);
+      }
+      // Ensure slot reuse only after previous occupant finished
+      if (i >= ob::AsyncDequantWorker::kRingCap) {
+        worker.wait_until(static_cast<uint64_t>(i - ob::AsyncDequantWorker::kRingCap + 1u));
+      }
+      OrderCheck& s = slots[i & ob::AsyncDequantWorker::kRingMask];
+      s.id = i;
+      s.log = &log;
+      last_seq = worker.push(&OrderCheck::run, &s);
+    }
+    worker.wait_until(last_seq);
+    CHECK(log.size() == kJobs);
+    for (uint32_t i = 0u; i < kJobs; ++i) {
+      CHECK(log[i] == i);
+    }
+    worker.shutdown();
+  }
+
+  // 3. NEON pack_w8a16_ext2_into bit-exact parity vs [N/32, K/2, 32, 2] (w_i8 ^ 0x80) reference
+  {
+    const std::pair<uint32_t, uint32_t> dims[] = {{512u, 512u}, {1536u, 1536u}, {2048u, 1536u}};
+    for (const auto& dn : dims) {
+      const uint32_t K = dn.first, N = dn.second;
+      std::vector<int8_t> w(static_cast<size_t>(N) * K);
+      for (size_t i = 0u; i < w.size(); ++i) {
+        w[i] = static_cast<int8_t>(static_cast<int32_t>((i * 37u + 11u) % 251u) - 125);
+      }
+      std::vector<uint8_t> got = ob::pack_w8a16_ext2(N, K, w.data());
+      CHECK(got.size() == static_cast<size_t>(N) * K);
+      size_t mismatches = 0u;
+      const uint32_t n_grp = N / 32u;
+      const uint32_t k_pairs = K / 2u;
+      for (uint32_t ng = 0u; ng < n_grp; ++ng) {
+        for (uint32_t kp = 0u; kp < k_pairs; ++kp) {
+          for (uint32_t ni = 0u; ni < 32u; ++ni) {
+            const size_t dst_off = ((static_cast<size_t>(ng) * k_pairs + kp) * 32u + ni) * 2u;
+            const size_t src_off = static_cast<size_t>(ng * 32u + ni) * K + kp * 2u;
+            const uint8_t e0 = static_cast<uint8_t>(static_cast<uint8_t>(w[src_off + 0u]) ^ 0x80u);
+            const uint8_t e1 = static_cast<uint8_t>(static_cast<uint8_t>(w[src_off + 1u]) ^ 0x80u);
+            if (got[dst_off + 0u] != e0 || got[dst_off + 1u] != e1) ++mismatches;
+          }
+        }
+      }
+      CHECK(mismatches == 0u);
+    }
+  }
+
+  // 4. NEON w8a16_pt_epilogue_f32 bit-exact parity (store_first + accum + non-16 tail)
+  {
+    constexpr uint32_t tn = 157u;
+    std::vector<float> y(tn), sb(tn), c_got(tn, 1.5f), c_ref(tn, 1.5f);
+    for (uint32_t i = 0u; i < tn; ++i) {
+      y[i] = static_cast<float>(static_cast<int>(i) - 70) * 0.25f;
+      sb[i] = 0.01f + static_cast<float>(i) * 0.0003f;
+    }
+    const float ps = 4.0f;
+    ob::w8a16_pt_epilogue_f32(c_got.data(), y.data(), sb.data(), tn, ps, true);
+    for (uint32_t i = 0u; i < tn; ++i) {
+      c_ref[i] = y[i] * (ps * sb[i]);
+      CHECK(std::fabs(c_got[i] - c_ref[i]) < 1e-6f);
+    }
+    ob::w8a16_pt_epilogue_f32(c_got.data(), y.data(), sb.data(), tn, 2.0f, false);
+    for (uint32_t i = 0u; i < tn; ++i) {
+      c_ref[i] += y[i] * (2.0f * sb[i]);
+      CHECK(std::fabs(c_got[i] - c_ref[i]) < 1e-5f);
+    }
+  }
+
+  // 5. BIT-EXACT 7-chunk PT W8A16(FP16) synthesis vs live Wave-1 rango oracle
+  //    w8a16_deq_i8_pt_1x1536x1536.dgc0 (c[0..6] = 12,880 / 12,880 bytes exact!)
+  bool oracle_verified = false;
+  {
+    const char* corpus_root = std::getenv("OPENBUENOS_CORPUS_DIR");
+    std::vector<uint8_t> raw;
+    if (corpus_root && corpus_root[0] != '\0') {
+      std::string kPtOracle =
+          std::string(corpus_root) + "/work/device-runner/phase8_perf/wave1_oracle/w8a16_deq_i8_pt_1x1536x1536.dgc0";
+      (void)read_file(kPtOracle.c_str(), &raw);
+    }
+    if (!raw.empty()) {
+      ob::ParsedDgc0 parsed{};
+      std::string err;
+      CHECK(ob::parse_dgc0_buffer(raw.data(), raw.size(), &parsed, &err) == OB_OK);
+      CHECK(parsed.input_sizes.size() == 1u && parsed.input_sizes[0] == 6144u);
+      CHECK(parsed.output_sizes.size() == 1u && parsed.output_sizes[0] == 6144u);
+      CHECK(parsed.ext_params.size == 1536u * 1536u);
+      CHECK(parsed.exec_field_14 == 55616u);
+      CHECK(parsed.dive_scratch_size == 204800u);
+
+      ob::GemmSynthResult syn{};
+      CHECK(ob::synthesize_w8a16_pt_1x_parts(1536u, 1536u, 0.015625f, nullptr, &syn, &err) == OB_OK);
+      CHECK(syn.exec_field_14 == 55616u);
+      CHECK(syn.dive_scratch_size == 204800u);
+      CHECK(syn.ext2_params.size() == 1536u * 1536u);
+
+      // Extract hardware_instruction_chunks[0..6] from oracle ext[0] DIVE FlatBuffer
+      const uint8_t* dive = raw.data() + parsed.ext_dive_vm_ir.offset;
+      const size_t dive_sz = static_cast<size_t>(parsed.ext_dive_vm_ir.size);
+      auto rd32 = [](const uint8_t* p) -> uint32_t {
+        uint32_t v = 0u;
+        std::memcpy(&v, p, 4u);
+        return v;
+      };
+      auto rd16 = [](const uint8_t* p) -> uint16_t {
+        uint16_t v = 0u;
+        std::memcpy(&v, p, 2u);
+        return v;
+      };
+      auto rd_i32 = [](const uint8_t* p) -> int32_t {
+        int32_t v = 0;
+        std::memcpy(&v, p, 4u);
+        return v;
+      };
+      const uint32_t root = rd32(dive);
+      const uint32_t vt = static_cast<uint32_t>(static_cast<int32_t>(root) - rd_i32(dive + root));
+      const uint16_t f3_off = rd16(dive + vt + 4u + 3u * 2u);
+      CHECK(f3_off != 0u);
+      const uint32_t vec_pos = root + f3_off + rd32(dive + root + f3_off);
+      const uint32_t n_chunks = rd32(dive + vec_pos);
+      CHECK(n_chunks == 7u);
+      for (uint32_t ci = 0u; ci < 7u; ++ci) {
+        const uint32_t elem_off_pos = vec_pos + 4u + ci * 4u;
+        const uint32_t tbl = elem_off_pos + rd32(dive + elem_off_pos);
+        const uint32_t tvt = static_cast<uint32_t>(static_cast<int32_t>(tbl) - rd_i32(dive + tbl));
+        const uint16_t b_off = rd16(dive + tvt + 4u);
+        const uint32_t bvec = tbl + b_off + rd32(dive + tbl + b_off);
+        const uint32_t blen = rd32(dive + bvec);
+        CHECK(bvec + 4u + blen <= dive_sz);
+        CHECK(syn.chunks[ci].size() == blen);
+        if (syn.chunks[ci].size() == blen) {
+          CHECK(std::memcmp(syn.chunks[ci].data(), dive + bvec + 4u, blen) == 0);
+        }
+      }
+      oracle_verified = true;
+    }
+  }
+
+  // 6. Full .dgc0 synthesis + parse across all 6 16-core PT W8A16(FP16) shapes +
+  //    ob_gemm_matmul_f32_w8a16_tile mock execution (normal + 50,000 prescale guard!)
+  {
+    std::string err;
+    std::vector<uint8_t> synth_interp = make_synthetic_dive_interp(0x8Cu);
+    const uint8_t* interp = synth_interp.data();
+    const size_t interp_sz = synth_interp.size();
+
+    const std::pair<uint32_t, uint32_t> shapes[] = {
+        {512u, 512u}, {1024u, 1024u}, {1536u, 1536u},
+        {2048u, 2048u}, {1536u, 2048u}, {2048u, 1536u},
+    };
+    for (const auto& sh : shapes) {
+      std::vector<uint8_t> dgc0;
+      CHECK(ob::build_dgc0_w8a16_pt_1x(sh.first, sh.second, 1.0f, nullptr,
+                                       interp, interp_sz, &dgc0, &err) == OB_OK);
+      ob::ParsedDgc0 p{};
+      CHECK(ob::parse_dgc0_buffer(dgc0.data(), dgc0.size(), &p, &err) == OB_OK);
+      CHECK(p.input_sizes.size() == 1u && p.input_sizes[0] == 4u * sh.first);
+      CHECK(p.output_sizes.size() == 1u && p.output_sizes[0] == 4u * sh.second);
+      CHECK(p.has_params && p.ext_params.size == static_cast<uint64_t>(sh.first) * sh.second);
+    }
+
+    // Exercise ob_gemm_matmul_f32_w8a16_tile in mock mode with extreme |x|=50,000 prescale guard!
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+    TempBinaryFile ifile20;
+    CHECK(ifile20.write(synth_interp.data(), synth_interp.size()));
+    CHECK(ob_gemm_register_builtin_emitter(ctx, ifile20.path()) == OB_OK);
+    constexpr uint32_t K = 1536u, N = 1536u;
+    std::vector<float> a(K, 0.25f), sb(N, 0.01f), out(N, 0.0f);
+    std::vector<int8_t> w(static_cast<size_t>(N) * K, 1);
+    for (uint32_t k = 0u; k < K; ++k) a[k] = static_cast<float>(static_cast<int>(k % 19u) - 9) * 0.1f;
+    a[42u] = 50000.0f;
+    a[900u] = -40000.0f;
+    for (uint32_t n = 0u; n < N; ++n) {
+      sb[n] = 0.005f + 0.00001f * static_cast<float>(n);
+      for (uint32_t k = 0u; k < K; ++k) {
+        w[static_cast<size_t>(n) * K + k] = static_cast<int8_t>(static_cast<int>((n * 7u + k * 13u) % 251u) - 125);
+      }
+    }
+    ob_invoke_stats_t stats{};
+    CHECK(ob_gemm_matmul_f32_w8a16_tile(ctx, a.data(), w.data(), sb.data(), K, N, out.data(), &stats) == OB_OK);
+    double err_sq = 0.0, ref_sq = 0.0;
+    for (uint32_t n = 0u; n < N; ++n) {
+      double acc = 0.0;
+      for (uint32_t k = 0u; k < K; ++k) {
+        acc += static_cast<double>(a[k]) * static_cast<double>(w[static_cast<size_t>(n) * K + k]);
+      }
+      const double ref = acc * static_cast<double>(sb[n]);
+      CHECK(std::isfinite(out[n]));
+      err_sq += (static_cast<double>(out[n]) - ref) * (static_cast<double>(out[n]) - ref);
+      ref_sq += ref * ref;
+    }
+    const double rel_l2 = std::sqrt(err_sq) / std::max(std::sqrt(ref_sq), 1e-12);
+    CHECK(rel_l2 < 5e-4);
+
+    // FP16-vs-FP32 rounding contract: 1.0f and 1.0001f both round to 1.0 in IEEE FP16, so
+    // dot([1.0, 1.0001, 0...], [1, -1, 0...]) MUST cancel to exact 0.0f on every architecture.
+    {
+      CHECK(ob::round_f32_to_fp16_f32(1.0f) == 1.0f);
+      CHECK(ob::round_f32_to_fp16_f32(1.0001f) == 1.0f);
+      CHECK(ob::round_f32_to_fp16_f32(-1.0001f) == -1.0f);
+      // Subnormal preservation: 2^-15 (3.0517578125e-5) must not flush to zero.
+      const float sub_val = 3.0517578125e-5f;
+      CHECK(ob::round_f32_to_fp16_f32(sub_val) == sub_val);
+
+      constexpr uint32_t K_r = 512u, N_r = 512u;
+      std::vector<float> a_r(K_r, 0.0f), sb_r(N_r, 1.0f), out_r(N_r, 99.0f);
+      std::vector<int8_t> w_r(static_cast<size_t>(N_r) * K_r, 0);
+      a_r[0] = 1.0f;
+      a_r[1] = 1.0001f;
+      w_r[0] = 1;
+      w_r[1] = -1;
+      ob_invoke_stats_t rstats{};
+      CHECK(ob_gemm_matmul_f32_w8a16_tile(
+                ctx, a_r.data(), w_r.data(), sb_r.data(), K_r, N_r, out_r.data(), &rstats) == OB_OK);
+      CHECK(out_r[0] == 0.0f);
+
+      // Full finite FP32 range prescale guard (e.g., 2^81 and 2^127): must stay finite without
+      // saturating FP16 inputs to infinity.
+      a_r.assign(K_r, 0.0f);
+      w_r.assign(static_cast<size_t>(N_r) * K_r, 0);
+      a_r[0] = std::ldexp(1.0f, 81);
+      w_r[0] = 3;
+      sb_r.assign(N_r, std::ldexp(1.0f, -81));
+      CHECK(ob_gemm_matmul_f32_w8a16_tile(
+                ctx, a_r.data(), w_r.data(), sb_r.data(), K_r, N_r, out_r.data(), &rstats) == OB_OK);
+      CHECK(std::isfinite(out_r[0]) && std::fabs(out_r[0] - 3.0f) < 1e-3f);
+
+      a_r[0] = std::ldexp(1.0f, 127);
+      sb_r.assign(N_r, std::ldexp(1.0f, -125));
+      CHECK(ob_gemm_matmul_f32_w8a16_tile(
+                ctx, a_r.data(), w_r.data(), sb_r.data(), K_r, N_r, out_r.data(), &rstats) == OB_OK);
+      CHECK(std::isfinite(out_r[0]) && std::fabs(out_r[0] - 12.0f) < 1e-2f);
+
+      // Epilogue scale product overflow guard: prescale_inv=2^114 * sb=2^14 would overflow FP32,
+      // while y_raw=2^-6 yields finite 2^122.
+      a_r.assign(K_r, 0.0f);
+      w_r.assign(static_cast<size_t>(N_r) * K_r, 0);
+      a_r[0] = std::ldexp(1.0f, 127);
+      a_r[1] = std::ldexp(1.0f, 108);
+      w_r[1] = 1;
+      sb_r.assign(N_r, std::ldexp(1.0f, 14));
+      CHECK(ob_gemm_matmul_f32_w8a16_tile(
+                ctx, a_r.data(), w_r.data(), sb_r.data(), K_r, N_r, out_r.data(), &rstats) == OB_OK);
+      CHECK(std::isfinite(out_r[0]) && out_r[0] == std::ldexp(1.0f, 122));
+      CHECK(std::isfinite(out_r[1]) && out_r[1] == 0.0f);
+
+      // Large finite activation energy (>= 1e20f) must preserve FP64 sum-of-squares and outlier peeling.
+      std::vector<float> a_big(256u, 1e18f);
+      a_big[7u] = 2e20f;
+      std::vector<int8_t> aq_big(256u, 0);
+      float sa_big = 0.0f;
+      std::vector<std::pair<uint32_t, float>> outliers_big;
+      ob::quantize_activation_row_split(a_big.data(), 256u, aq_big.data(), &sa_big, &outliers_big);
+      CHECK(outliers_big.size() == 1u && outliers_big[0].first == 7u && outliers_big[0].second == 2e20f);
+      CHECK(aq_big[7u] == 0 && aq_big[0u] == 127);
+
+      // High-contrast 2-spike row (50.01f, 0.001f, 1e-6f): FP64 energy recompute on outlier entry
+      // must peel both spikes and preserve the small 1e-6f values.
+      std::vector<float> a_hc(512u, 1e-6f);
+      a_hc[3u] = 50.01f;
+      a_hc[19u] = 0.001f;
+      std::vector<int8_t> aq_hc(512u, 0);
+      float sa_hc = 0.0f;
+      std::vector<std::pair<uint32_t, float>> outliers_hc;
+      ob::quantize_activation_row_split(a_hc.data(), 512u, aq_hc.data(), &sa_hc, &outliers_hc);
+      CHECK(outliers_hc.size() == 2u);
+      CHECK(outliers_hc[0].first == 3u && outliers_hc[1].first == 19u);
+      CHECK(aq_hc[3u] == 0 && aq_hc[19u] == 0 && aq_hc[0u] == 127);
+    }
+
+    ob_context_destroy(ctx);
+  }
+
+  std::printf("[PASS] test_phase8b_spsc_async_dequant_and_w8a16_pt (SPSC 256-job FIFO+sleep/wake + BIT-EXACT NEON pack_w8a16 + 7-chunk PT W8A16 oracle=%s + 6 shapes + 50k prescale guard)\n",
+              oracle_verified ? "12880/12880_EXACT" : "skipped");
+}
+
 }  // namespace
 
 int main() {
@@ -4667,6 +5384,10 @@ int main() {
       "OPENBUENOS_WEIGHT_CACHE_MB",
       "OPENBUENOS_PARAM_SWAP_SLOTS",
       "OPENBUENOS_SPIN_US",
+      "OPENBUENOS_THREADS",
+      "OPENBUENOS_ASYNC_DEQUANT",
+      "OPENBUENOS_W8A16",
+      "OPENBUENOS_MAX_OUTLIER_COLS",
       "OPENBUENOS_PROFILE",
       "OPENBUENOS_VERBOSE",
   };
@@ -4693,9 +5414,11 @@ int main() {
   test_phase7b_swiglu_chaining_2tier_and_outlier_cache();
   test_phase7_cycle2_regressions();
   test_phase7_cycle3_regressions();
+  test_phase8a_overlapped_neon_worker_pool_and_swiglu_m64();
+  test_phase8b_spsc_async_dequant_and_w8a16_pt();
 
   if (g_failures == 0) {
-    std::printf("ALL LIBOPENBUENOS HOST TESTS PASSED (20/20 suites)\n");
+    std::printf("ALL LIBOPENBUENOS HOST TESTS PASSED (22/22 suites)\n");
     return 0;
   }
   std::fprintf(stderr, "LIBOPENBUENOS HOST TESTS FAILED (%d failures)\n", g_failures);

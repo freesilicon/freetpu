@@ -94,7 +94,8 @@ std::vector<PciTarget> discover_vfio_tpus() {
     t.pci_class = read_sysfs_line(base + "/class");
     t.driver = read_sysfs_link_base(base + "/driver");
     t.iommu_group = read_sysfs_link_base(base + "/iommu_group");
-    if (t.driver == "vfio-pci" || (t.vendor == "0x1ae0" && t.pci_class == "0xff0000")) {
+    if (t.driver == "vfio-pci" && t.vendor == "0x1ae0" &&
+        t.pci_class == "0xff0000" && t.device == "0x0063") {
       out.push_back(t);
     }
   }
@@ -111,8 +112,18 @@ void check_proc_maps() {
   int libtpu_cnt = 0;
   int libpython_cnt = 0;
   while (std::getline(ifs, line)) {
-    if (line.find("libtpu") != std::string::npos) libtpu_cnt++;
-    if (line.find("libpython") != std::string::npos) libpython_cnt++;
+    size_t pos = 0;
+    for (int field = 0; field < 5; ++field) {
+      while (pos < line.size() && line[pos] == ' ') ++pos;
+      while (pos < line.size() && line[pos] != ' ') ++pos;
+    }
+    while (pos < line.size() && line[pos] == ' ') ++pos;
+    if (pos >= line.size()) continue;
+    std::string path = line.substr(pos);
+    size_t slash = path.rfind('/');
+    std::string base = (slash == std::string::npos) ? path : path.substr(slash + 1);
+    if (base.compare(0, 6, "libtpu") == 0) libtpu_cnt++;
+    if (base.compare(0, 9, "libpython") == 0) libpython_cnt++;
   }
   printf("MAPS_LIBTPU=%d MAPS_LIBPYTHON=%d\n", libtpu_cnt, libpython_cnt);
 }
@@ -355,13 +366,26 @@ int main(int argc, char** argv) {
 
   auto targets = discover_vfio_tpus();
   if (targets.empty()) {
-    fprintf(stderr, "ERROR: No vfio-pci / Google TPU PCI device found\n");
+    fprintf(stderr, "ERROR: No supported vfio-pci Google TPU (0x1ae0:0x0063, class=0xff0000) found\n");
     return 1;
   }
-  const PciTarget& tgt = (argc > 1) ? [&]() -> const PciTarget& {
-    for (const auto& t : targets) if (t.bdf == argv[1]) return t;
-    return targets[0];
-  }() : targets[0];
+  const PciTarget* selected = nullptr;
+  if (argc > 1) {
+    for (const auto& t : targets) {
+      if (t.bdf == argv[1]) {
+        selected = &t;
+        break;
+      }
+    }
+    if (!selected) {
+      fprintf(stderr, "ERROR: Requested BDF '%s' is not a supported vfio-pci Google TPU (0x1ae0:0x0063)\n",
+              argv[1]);
+      return 1;
+    }
+  } else {
+    selected = &targets[0];
+  }
+  const PciTarget& tgt = *selected;
 
   printf("Selected target: bdf=%s vendor=%s device=%s class=%s driver=%s iommu_group=%s\n",
          tgt.bdf.c_str(), tgt.vendor.c_str(), tgt.device.c_str(),

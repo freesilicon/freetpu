@@ -3,18 +3,20 @@
 #include "ot_vliw.h"
 
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <pthread.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #ifdef __linux__
 #include <dirent.h>
 #include <fcntl.h>
 #include <linux/vfio.h>
 #include <sys/ioctl.h>
-#include <sys/mman.h>
-#include <time.h>
-#include <unistd.h>
 #endif
 
 namespace ot {
@@ -39,19 +41,44 @@ void IovaAllocator::init(uint64_t base, uint64_t limit) {
 bool IovaAllocator::alloc(uint64_t size, uint64_t align, uint64_t* out_iova) {
   if (!out_iova || size == 0) return false;
   if (align == 0) align = 4096;
+  if ((align & (align - 1)) != 0) return false;
 
-  // Reuse a free block if big enough
-  for (auto& b : blocks_) {
-    if (!b.in_use && b.size >= size && (b.iova % align) == 0) {
-      b.in_use = true;
-      *out_iova = b.iova;
-      return true;
+  // Reuse a free block if big enough, splitting unused leading/trailing space.
+  for (size_t i = 0; i < blocks_.size(); ++i) {
+    if (blocks_[i].in_use) continue;
+    uint64_t b_start = blocks_[i].iova;
+    uint64_t b_size = blocks_[i].size;
+    if (b_size < size) continue;
+    uint64_t aligned = (b_start + (align - 1)) & ~(align - 1);
+    if (aligned < b_start) continue;
+    uint64_t pad = aligned - b_start;
+    if (pad > b_size || size > b_size - pad) continue;
+
+    uint64_t rem = (b_size - pad) - size;
+    if (pad > 0) {
+      blocks_[i].size = pad;
+      blocks_.insert(blocks_.begin() + static_cast<ptrdiff_t>(i + 1),
+                     IovaBlock{aligned, size, true});
+      ++i;
+    } else {
+      blocks_[i].iova = aligned;
+      blocks_[i].size = size;
+      blocks_[i].in_use = true;
     }
+    if (rem > 0) {
+      blocks_.insert(blocks_.begin() + static_cast<ptrdiff_t>(i + 1),
+                     IovaBlock{aligned + size, rem, false});
+    }
+    *out_iova = aligned;
+    return true;
   }
 
   uint64_t aligned = (next_ + (align - 1)) & ~(align - 1);
   if (aligned < next_ || aligned > limit_ || size > limit_ - aligned) {
     return false;
+  }
+  if (aligned > next_) {
+    blocks_.push_back({next_, aligned - next_, false});
   }
   blocks_.push_back({aligned, size, true});
   next_ = aligned + size;
@@ -60,9 +87,27 @@ bool IovaAllocator::alloc(uint64_t size, uint64_t align, uint64_t* out_iova) {
 }
 
 void IovaAllocator::free(uint64_t iova) {
-  for (auto& b : blocks_) {
-    if (b.in_use && b.iova == iova) {
-      b.in_use = false;
+  for (size_t i = 0; i < blocks_.size(); ++i) {
+    if (blocks_[i].in_use && blocks_[i].iova == iova) {
+      blocks_[i].in_use = false;
+      // Coalesce with next free block if contiguous.
+      if (i + 1 < blocks_.size() && !blocks_[i + 1].in_use &&
+          blocks_[i].iova + blocks_[i].size == blocks_[i + 1].iova) {
+        blocks_[i].size += blocks_[i + 1].size;
+        blocks_.erase(blocks_.begin() + static_cast<ptrdiff_t>(i + 1));
+      }
+      // Coalesce with previous free block if contiguous.
+      if (i > 0 && !blocks_[i - 1].in_use &&
+          blocks_[i - 1].iova + blocks_[i - 1].size == blocks_[i].iova) {
+        blocks_[i - 1].size += blocks_[i].size;
+        blocks_.erase(blocks_.begin() + static_cast<ptrdiff_t>(i));
+      }
+      // Trim trailing free blocks back into the bump frontier.
+      while (!blocks_.empty() && !blocks_.back().in_use &&
+             blocks_.back().iova + blocks_.back().size == next_) {
+        next_ = blocks_.back().iova;
+        blocks_.pop_back();
+      }
       return;
     }
   }
@@ -113,6 +158,7 @@ bool parse_bar4_descriptor(const uint8_t* bar4_page, size_t page_len, Bar4Descri
     if (!read_varint(p, proto_len, &pos, &tag)) return false;
     uint32_t field_num = static_cast<uint32_t>(tag >> 3);
     uint32_t wire = static_cast<uint32_t>(tag & 7u);
+    if (field_num == 0) return false;
     if (wire == 0) {
       uint64_t v = 0;
       if (!read_varint(p, proto_len, &pos, &v)) return false;
@@ -141,7 +187,205 @@ bool parse_bar4_descriptor(const uint8_t* bar4_page, size_t page_len, Bar4Descri
   return true;
 }
 
+void* alloc_aligned_anon_pages(size_t len, size_t align, std::string* err) {
+  if (len == 0) {
+    if (err) *err = "DMA arena length must be non-zero";
+    return nullptr;
+  }
+  long host_ps_raw = ::sysconf(_SC_PAGESIZE);
+  const size_t host_ps = (host_ps_raw > 0) ? static_cast<size_t>(host_ps_raw) : 4096u;
+  if ((host_ps & (host_ps - 1u)) != 0) {
+    if (err) *err = "Host page size is not a power of two";
+    return nullptr;
+  }
+  if (align == 0) align = host_ps;
+  if ((align & (align - 1u)) != 0) {
+    if (err) *err = "DMA alignment must be a power of two";
+    return nullptr;
+  }
+  if (align < host_ps) align = host_ps;
+  if ((len % host_ps) != 0) {
+    if (err) *err = "DMA arena length must be a multiple of host page size";
+    return nullptr;
+  }
+
+  if (align <= host_ps) {
+    void* p = ::mmap(nullptr, len, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) {
+      if (err) *err = std::string("mmap failed: ") + std::strerror(errno);
+      return nullptr;
+    }
+    if ((reinterpret_cast<uintptr_t>(p) & static_cast<uintptr_t>(align - 1u)) != 0) {
+      ::munmap(p, len);
+      if (err) *err = "mmap returned misaligned backing page";
+      return nullptr;
+    }
+    return p;
+  }
+
+  if (len > std::numeric_limits<size_t>::max() - align) {
+    if (err) *err = "DMA arena aligned allocation overflow";
+    return nullptr;
+  }
+  const size_t over_len = len + align;
+  void* raw = ::mmap(nullptr, over_len, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (raw == MAP_FAILED) {
+    if (err) *err = std::string("mmap failed: ") + std::strerror(errno);
+    return nullptr;
+  }
+  const uintptr_t raw_addr = reinterpret_cast<uintptr_t>(raw);
+  const uintptr_t mask = static_cast<uintptr_t>(align - 1u);
+  const uintptr_t aligned_addr = (raw_addr + mask) & ~mask;
+  if (aligned_addr < raw_addr) {
+    ::munmap(raw, over_len);
+    if (err) *err = "DMA arena aligned address wraparound";
+    return nullptr;
+  }
+  const size_t lead = static_cast<size_t>(aligned_addr - raw_addr);
+  if (lead > over_len || over_len - lead < len) {
+    ::munmap(raw, over_len);
+    if (err) *err = "DMA arena aligned subrange out of bounds";
+    return nullptr;
+  }
+  const size_t trail = over_len - lead - len;
+  if (lead > 0) (void)::munmap(raw, lead);
+  if (trail > 0) (void)::munmap(reinterpret_cast<void*>(aligned_addr + len), trail);
+  return reinterpret_cast<void*>(aligned_addr);
+}
+
+namespace {
+
+pthread_mutex_t g_vfio_fork_mu = PTHREAD_MUTEX_INITIALIZER;
+pthread_once_t g_vfio_atfork_once = PTHREAD_ONCE_INIT;
+constexpr size_t kMaxTrackedVfioTransports = 64;
+VfioTransport* g_tracked_transports[kMaxTrackedVfioTransports] = {};
+bool g_vfio_atfork_registered = false;
+
+void vfio_atfork_prepare() {
+  pthread_mutex_lock(&g_vfio_fork_mu);
+}
+
+void vfio_atfork_parent() {
+  pthread_mutex_unlock(&g_vfio_fork_mu);
+}
+
+void vfio_atfork_child() {
+  for (size_t i = 0; i < kMaxTrackedVfioTransports; ++i) {
+    VfioTransport* t = g_tracked_transports[i];
+    if (!t) continue;
+    if (t->device_fd >= 0) {
+      ::close(t->device_fd);
+      t->device_fd = -1;
+    }
+    if (t->group_fd >= 0) {
+      ::close(t->group_fd);
+      t->group_fd = -1;
+    }
+    if (t->container_fd >= 0) {
+      ::close(t->container_fd);
+      t->container_fd = -1;
+    }
+    // BAR0/BAR4 and DMA arenas are marked MADV_DONTFORK so they are not mapped
+    // in the child; clear pointers so child cleanup touches no hardware or VMAs.
+    t->bar0_mmio = nullptr;
+    t->bar0_mapped_len = 0;
+    t->bar4_mmio = nullptr;
+    t->bar4_mapped_len = 0;
+    t->ring_arena_mem = nullptr;
+    t->ring_arena_bytes = 0;
+    t->host_stage_mem = nullptr;
+    t->host_stage_size = 0;
+    t->sq_ring_mem = nullptr;
+    t->cq_ring_mem = nullptr;
+    t->status_page_mem = nullptr;
+    t->pci_cmd_saved = false;
+    t->ring_ready = false;
+    t->imem_booted = false;
+    t->dma_faulted = true;
+    g_tracked_transports[i] = nullptr;
+  }
+  pthread_mutex_unlock(&g_vfio_fork_mu);
+}
+
+void init_vfio_atfork_once() {
+  g_vfio_atfork_registered =
+      (pthread_atfork(vfio_atfork_prepare, vfio_atfork_parent, vfio_atfork_child) == 0);
+}
+
+void unregister_transport_locked(VfioTransport* t) {
+  for (size_t i = 0; i < kMaxTrackedVfioTransports; ++i) {
+    if (g_tracked_transports[i] == t) {
+      g_tracked_transports[i] = nullptr;
+    }
+  }
+}
+
+}  // namespace
+
+VfioTransport::~VfioTransport() {
+  close_device();
+}
+
+bool VfioTransport::register_fork_cleanup(std::string* err) {
+  pthread_once(&g_vfio_atfork_once, init_vfio_atfork_once);
+  if (!g_vfio_atfork_registered) {
+    if (err) *err = "pthread_atfork registration failed for VFIO transport";
+    return false;
+  }
+  pthread_mutex_lock(&g_vfio_fork_mu);
+  size_t free_slot = kMaxTrackedVfioTransports;
+  for (size_t i = 0; i < kMaxTrackedVfioTransports; ++i) {
+    if (g_tracked_transports[i] == this) {
+      pthread_mutex_unlock(&g_vfio_fork_mu);
+      return true;
+    }
+    if (g_tracked_transports[i] == nullptr && free_slot == kMaxTrackedVfioTransports) {
+      free_slot = i;
+    }
+  }
+  if (free_slot == kMaxTrackedVfioTransports) {
+    pthread_mutex_unlock(&g_vfio_fork_mu);
+    if (err) *err = "Too many concurrent live VFIO transports";
+    return false;
+  }
+  g_tracked_transports[free_slot] = this;
+  pthread_mutex_unlock(&g_vfio_fork_mu);
+  return true;
+}
+
 #ifdef __linux__
+static inline void dma_wmb() {
+#if defined(__aarch64__)
+  asm volatile("dsb oshst" ::: "memory");
+#elif defined(__arm__)
+  asm volatile("dsb ost" ::: "memory");
+#elif defined(__x86_64__) || defined(__i386__)
+  asm volatile("sfence" ::: "memory");
+#else
+  __atomic_thread_fence(__ATOMIC_RELEASE);
+#endif
+}
+
+static inline void dma_rmb() {
+#if defined(__aarch64__)
+  asm volatile("dmb oshld" ::: "memory");
+#elif defined(__arm__)
+  asm volatile("dmb osh" ::: "memory");
+#elif defined(__x86_64__) || defined(__i386__)
+  asm volatile("lfence" ::: "memory");
+#else
+  __atomic_thread_fence(__ATOMIC_ACQUIRE);
+#endif
+}
+
+static bool is_supported_vfio_device_id(uint16_t device_id) {
+  // Only TPU v5e (0x1ae0:0x0063) has a validated VFIO ring/DMA transport.
+  // Documented TPU v6e (0x1ae0:0x006f) is rejected until its transport is validated.
+  return device_id == 0x0063u;
+}
+
 static std::string sysfs_read_line(const std::string& path) {
   int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd < 0) return "";
@@ -195,6 +439,20 @@ static bool discover_linux_tpu(const char* preferred_bdf, PciDiscoveryEntry* out
       errno = 0;
       unsigned long grp_val = std::strtoul(grp_str.c_str(), &end, 10);
       if (errno != 0 || end == grp_str.c_str() || *end != '\0') continue;
+      if (!is_supported_vfio_device_id(static_cast<uint16_t>(did))) {
+        if (preferred_bdf && preferred_bdf[0] != '\0') {
+          if (err) {
+            char msg[160];
+            std::snprintf(msg, sizeof(msg),
+                          "Unsupported TPU PCI device %s (0x%04x:0x%04x); only validated v5e (0x1ae0:0x0063) is supported",
+                          bdf.c_str(), static_cast<unsigned>(vid), static_cast<unsigned>(did));
+            *err = msg;
+          }
+          ::closedir(dir);
+          return false;
+        }
+        continue;
+      }
       out->bdf = bdf;
       out->vendor_id = static_cast<uint16_t>(vid);
       out->device_id = static_cast<uint16_t>(did);
@@ -208,15 +466,22 @@ static bool discover_linux_tpu(const char* preferred_bdf, PciDiscoveryEntry* out
   ::closedir(dir);
 
   if (!found && err) {
-    *err = "No vfio-pci Google Cloud TPU (vendor=0x1ae0, class=0xff0000) discovered";
+    *err = "No supported vfio-pci Google Cloud TPU (0x1ae0:0x0063, class=0xff0000) discovered";
   }
   return found;
 }
 #endif
 
+bool VfioTransport::is_owner_process() const {
+  return owner_pid == 0 || owner_pid == static_cast<int64_t>(::getpid());
+}
+
 bool VfioTransport::open_device(const ot_config_t& cfg, ot_device_info_t* info, std::string* err) {
   if (!info) return false;
   std::memset(info, 0, sizeof(*info));
+  owner_pid = static_cast<int64_t>(::getpid());
+
+  static constexpr uint64_t kHbmAllocBase = 0x00100000ULL;
 
   if (cfg.mock_mode) {
     is_mock = true;
@@ -231,7 +496,6 @@ bool VfioTransport::open_device(const ot_config_t& cfg, ot_device_info_t* info, 
     info->bar0_size = 0x100000000ULL;
     info->bar4_size = 0x1000000ULL;
     info->msix_vectors = 128u;
-    info->hbm_bytes_total = cfg.hbm_budget_bytes ? cfg.hbm_budget_bytes : 16909336064ULL;
     info->vmem_bytes = 128ULL * 1024ULL * 1024ULL;
     info->smem_bytes = 1024ULL * 1024ULL;
     info->num_mxus = 4u;
@@ -240,10 +504,16 @@ bool VfioTransport::open_device(const ot_config_t& cfg, ot_device_info_t* info, 
 
     mock_bar0.assign(128u * 1024u, 0);
     mock_bar4.assign(64u * 1024u, 0);
-    // Mock 64 MiB HBM backing store for offline tests
+    // Mock 64 MiB HBM backing store for offline tests; honor smaller explicit budgets.
     mock_hbm.assign(64ULL * 1024ULL * 1024ULL, 0);
+    uint64_t mock_max_usable = mock_hbm.size() - kHbmAllocBase;
+    uint64_t usable_bytes = mock_max_usable;
+    if (cfg.hbm_budget_bytes > 0 && cfg.hbm_budget_bytes < usable_bytes) {
+      usable_bytes = cfg.hbm_budget_bytes;
+    }
     iova_alloc.init(0x100000ULL, 0xf0000000ULL);
-    hbm_alloc.init(0x00100000ULL, mock_hbm.size());
+    hbm_alloc.init(kHbmAllocBase, kHbmAllocBase + usable_bytes);
+    info->hbm_bytes_total = hbm_alloc.capacity_bytes();
     return true;
   }
 
@@ -256,9 +526,19 @@ bool VfioTransport::open_device(const ot_config_t& cfg, ot_device_info_t* info, 
     return false;
   }
 
+  if (!register_fork_cleanup(err)) {
+    return false;
+  }
+
+  // Acquire VFIO descriptors under g_vfio_fork_mu so a concurrent fork() cannot
+  // observe an untracked descriptor in the child process.
+  pthread_mutex_lock(&g_vfio_fork_mu);
   container_fd = ::open("/dev/vfio/vfio", O_RDWR | O_CLOEXEC);
+  int open_err = errno;
+  pthread_mutex_unlock(&g_vfio_fork_mu);
   if (container_fd < 0) {
-    if (err) *err = std::string("open(/dev/vfio/vfio) failed: ") + std::strerror(errno);
+    if (err) *err = std::string("open(/dev/vfio/vfio) failed: ") + std::strerror(open_err);
+    close_device();
     return false;
   }
   if (::ioctl(container_fd, VFIO_GET_API_VERSION) != VFIO_API_VERSION) {
@@ -268,9 +548,12 @@ bool VfioTransport::open_device(const ot_config_t& cfg, ot_device_info_t* info, 
   }
 
   std::string grp_path = "/dev/vfio/" + std::to_string(pci.iommu_group);
+  pthread_mutex_lock(&g_vfio_fork_mu);
   group_fd = ::open(grp_path.c_str(), O_RDWR | O_CLOEXEC);
+  open_err = errno;
+  pthread_mutex_unlock(&g_vfio_fork_mu);
   if (group_fd < 0) {
-    if (err) *err = "open(" + grp_path + ") failed: " + std::strerror(errno);
+    if (err) *err = "open(" + grp_path + ") failed: " + std::strerror(open_err);
     close_device();
     return false;
   }
@@ -298,15 +581,15 @@ bool VfioTransport::open_device(const ot_config_t& cfg, ot_device_info_t* info, 
     }
   }
 
+  pthread_mutex_lock(&g_vfio_fork_mu);
   device_fd = ::ioctl(group_fd, VFIO_GROUP_GET_DEVICE_FD, pci.bdf.c_str());
+  open_err = errno;
+  pthread_mutex_unlock(&g_vfio_fork_mu);
   if (device_fd < 0) {
-    if (err) *err = std::string("VFIO_GROUP_GET_DEVICE_FD failed: ") + std::strerror(errno);
+    if (err) *err = std::string("VFIO_GROUP_GET_DEVICE_FD failed: ") + std::strerror(open_err);
     close_device();
     return false;
   }
-
-  // Best-effort device function reset to ensure clean ring state across runs.
-  (void)::ioctl(device_fd, VFIO_DEVICE_RESET);
 
   struct vfio_region_info r0 = {}, r4 = {}, rcfg = {};
   r0.argsz = sizeof(r0);
@@ -331,30 +614,77 @@ bool VfioTransport::open_device(const ot_config_t& cfg, ot_device_info_t* info, 
   cfg_offset = rcfg.offset;
   cfg_size = rcfg.size;
 
+  // Re-verify live PCI vendor/device ID from config space before resetting or programming.
+  uint16_t live_vid = 0, live_did = 0;
+  if (!read_pci_config(0x00, &live_vid, sizeof(live_vid)) ||
+      !read_pci_config(0x02, &live_did, sizeof(live_did)) ||
+      live_vid != 0x1ae0u || !is_supported_vfio_device_id(live_did)) {
+    if (err) {
+      char msg[160];
+      std::snprintf(msg, sizeof(msg),
+                    "Refusing to reset/program unsupported VFIO PCI device (0x%04x:0x%04x); only 0x1ae0:0x0063 is validated",
+                    static_cast<unsigned>(live_vid), static_cast<unsigned>(live_did));
+      *err = msg;
+    }
+    close_device();
+    return false;
+  }
+
+  // Best-effort device function reset to ensure clean ring state across runs.
+  (void)::ioctl(device_fd, VFIO_DEVICE_RESET);
+
   if (bar4_size > 0 && (r4.flags & VFIO_REGION_INFO_FLAG_MMAP)) {
+    pthread_mutex_lock(&g_vfio_fork_mu);
     void* p4 = ::mmap(nullptr, static_cast<size_t>(bar4_size), PROT_READ | PROT_WRITE,
                       MAP_SHARED, device_fd, static_cast<off_t>(bar4_offset));
+    int map_err = errno;
+    if (p4 != MAP_FAILED) {
+      if (::madvise(p4, static_cast<size_t>(bar4_size), MADV_DONTFORK) != 0) {
+        map_err = errno;
+        ::munmap(p4, static_cast<size_t>(bar4_size));
+        p4 = MAP_FAILED;
+        pthread_mutex_unlock(&g_vfio_fork_mu);
+        if (err) *err = std::string("madvise(BAR4, MADV_DONTFORK) failed: ") + std::strerror(map_err);
+        close_device();
+        return false;
+      }
+      bar4_mmio = reinterpret_cast<volatile uint8_t*>(p4);
+      bar4_mapped_len = static_cast<size_t>(bar4_size);
+    }
+    pthread_mutex_unlock(&g_vfio_fork_mu);
     if (p4 == MAP_FAILED) {
-      if (err) *err = std::string("mmap(BAR4) failed: ") + std::strerror(errno);
+      if (err) *err = std::string("mmap(BAR4) failed: ") + std::strerror(map_err);
       close_device();
       return false;
     }
-    bar4_mmio = reinterpret_cast<volatile uint8_t*>(p4);
-    bar4_mapped_len = static_cast<size_t>(bar4_size);
   }
 
   // Map first 1 MiB of BAR0 covering the 0x10000..0x12000 ring controller aperture.
   if (bar0_size >= 0x20000ULL && (r0.flags & VFIO_REGION_INFO_FLAG_MMAP)) {
     size_t map_len = static_cast<size_t>(bar0_size < 0x100000ULL ? bar0_size : 0x100000ULL);
+    pthread_mutex_lock(&g_vfio_fork_mu);
     void* p0 = ::mmap(nullptr, map_len, PROT_READ | PROT_WRITE, MAP_SHARED,
                       device_fd, static_cast<off_t>(bar0_offset));
+    int map_err = errno;
+    if (p0 != MAP_FAILED) {
+      if (::madvise(p0, map_len, MADV_DONTFORK) != 0) {
+        map_err = errno;
+        ::munmap(p0, map_len);
+        p0 = MAP_FAILED;
+        pthread_mutex_unlock(&g_vfio_fork_mu);
+        if (err) *err = std::string("madvise(BAR0, MADV_DONTFORK) failed: ") + std::strerror(map_err);
+        close_device();
+        return false;
+      }
+      bar0_mmio = reinterpret_cast<volatile uint8_t*>(p0);
+      bar0_mapped_len = map_len;
+    }
+    pthread_mutex_unlock(&g_vfio_fork_mu);
     if (p0 == MAP_FAILED) {
-      if (err) *err = std::string("mmap(BAR0) failed: ") + std::strerror(errno);
+      if (err) *err = std::string("mmap(BAR0) failed: ") + std::strerror(map_err);
       close_device();
       return false;
     }
-    bar0_mmio = reinterpret_cast<volatile uint8_t*>(p0);
-    bar0_mapped_len = map_len;
   }
 
   uint16_t svid = 0, sdid = 0;
@@ -366,25 +696,21 @@ bool VfioTransport::open_device(const ot_config_t& cfg, ot_device_info_t* info, 
     return false;
   }
 
-  // Clear any stale MSI-X eventfd bindings so polling mode starts clean.
+  // Disable any active MSI-X interrupt bindings without enabling or reserving vectors
+  // for polling-only transfers (count=0 + DATA_NONE|ACTION_TRIGGER per Linux VFIO).
   struct vfio_irq_info irqi = {};
   irqi.argsz = sizeof(irqi);
   irqi.index = VFIO_PCI_MSIX_IRQ_INDEX;
   uint32_t msix_cnt = 0;
   if (::ioctl(device_fd, VFIO_DEVICE_GET_IRQ_INFO, &irqi) == 0) {
     msix_cnt = irqi.count;
-    if (msix_cnt > 0 && msix_cnt <= 256) {
-      std::vector<uint8_t> set_buf(sizeof(struct vfio_irq_set) + msix_cnt * sizeof(int), 0);
-      auto* irq_set = reinterpret_cast<struct vfio_irq_set*>(set_buf.data());
-      irq_set->argsz = static_cast<uint32_t>(set_buf.size());
-      irq_set->flags = VFIO_IRQ_SET_DATA_EVENTFD | VFIO_IRQ_SET_ACTION_TRIGGER;
-      irq_set->index = VFIO_PCI_MSIX_IRQ_INDEX;
-      irq_set->start = 0;
-      irq_set->count = msix_cnt;
-      int* fds = reinterpret_cast<int*>(irq_set->data);
-      for (uint32_t i = 0; i < msix_cnt; ++i) fds[i] = -1;
-      ::ioctl(device_fd, VFIO_DEVICE_SET_IRQS, irq_set);
-    }
+    struct vfio_irq_set irq_set = {};
+    irq_set.argsz = sizeof(irq_set);
+    irq_set.flags = VFIO_IRQ_SET_DATA_NONE | VFIO_IRQ_SET_ACTION_TRIGGER;
+    irq_set.index = VFIO_PCI_MSIX_IRQ_INDEX;
+    irq_set.start = 0;
+    irq_set.count = 0;
+    (void)::ioctl(device_fd, VFIO_DEVICE_SET_IRQS, &irq_set);
   }
 
   std::snprintf(info->bdf, sizeof(info->bdf), "%s", pci.bdf.c_str());
@@ -395,7 +721,7 @@ bool VfioTransport::open_device(const ot_config_t& cfg, ot_device_info_t* info, 
   info->iommu_group = pci.iommu_group;
   if (pci.device_id == 0x0063u) {
     info->chip_gen = OT_CHIP_V5E;
-  } else if (pci.device_id == 0x0066u || pci.device_id == 0x0065u) {
+  } else if (pci.device_id == 0x006fu) {
     info->chip_gen = OT_CHIP_V6E;
   } else {
     info->chip_gen = OT_CHIP_UNKNOWN;
@@ -403,18 +729,24 @@ bool VfioTransport::open_device(const ot_config_t& cfg, ot_device_info_t* info, 
   info->bar0_size = bar0_size;
   info->bar4_size = bar4_size;
   info->msix_vectors = msix_cnt;
-  info->hbm_bytes_total = cfg.hbm_budget_bytes ? cfg.hbm_budget_bytes : 16909336064ULL;
   info->vmem_bytes = 128ULL * 1024ULL * 1024ULL;
   info->smem_bytes = 1024ULL * 1024ULL;
   info->num_mxus = 4u;
   info->is_mock = 0u;
-  info->is_prebooted = (read32_bar4(0x08) != 0) ? 1u : 0u;
+  // Derived in ot_context_create() only after parsing a valid BAR4 descriptor.
+  info->is_prebooted = 0u;
 
   // Reserve 0x0000..0x00100000 for ring queues + 0x00100000..0x00500000 for staging.
   iova_alloc.init(0x00800000ULL, 0xf0000000ULL);
-  // 15.748 GiB usable HBM starts at 0x00100000; usable top ends before 0x3ef000000.
-  uint64_t hbm_limit = info->hbm_bytes_total < 0x3f0000000ULL ? info->hbm_bytes_total : 0x3ef000000ULL;
-  hbm_alloc.init(0x00100000ULL, hbm_limit);
+  // Usable HBM starts at kHbmAllocBase (0x00100000) and ends unconditionally at 0x3ef000000.
+  static constexpr uint64_t kHbmUsableTop = 0x3ef000000ULL;
+  static constexpr uint64_t kHbmUsableMaxBytes = kHbmUsableTop - kHbmAllocBase;
+  uint64_t usable_bytes = kHbmUsableMaxBytes;
+  if (cfg.hbm_budget_bytes > 0 && cfg.hbm_budget_bytes < usable_bytes) {
+    usable_bytes = cfg.hbm_budget_bytes;
+  }
+  hbm_alloc.init(kHbmAllocBase, kHbmAllocBase + usable_bytes);
+  info->hbm_bytes_total = hbm_alloc.capacity_bytes();
 
   if (!init_ring_queues(err)) {
     close_device();
@@ -428,27 +760,39 @@ void VfioTransport::close_device() {
   teardown_imem_state();
   teardown_ring_queues();
 #ifdef __linux__
-  if (!is_mock && device_fd >= 0 && pci_cmd_saved) {
+  if (!is_mock && is_owner_process() && device_fd >= 0 && pci_cmd_saved) {
     write_pci_config(0x04, &saved_pci_cmd, sizeof(saved_pci_cmd));
     pci_cmd_saved = false;
   }
-  if (bar0_mmio && bar0_mapped_len > 0) {
-    ::munmap(const_cast<uint8_t*>(bar0_mmio), bar0_mapped_len);
+  if (is_owner_process()) {
+    if (bar0_mmio && bar0_mapped_len > 0) {
+      ::munmap(const_cast<uint8_t*>(bar0_mmio), bar0_mapped_len);
+    }
+    if (bar4_mmio && bar4_mapped_len > 0) {
+      ::munmap(const_cast<uint8_t*>(bar4_mmio), bar4_mapped_len);
+    }
   }
-  if (bar4_mmio && bar4_mapped_len > 0) {
-    ::munmap(const_cast<uint8_t*>(bar4_mmio), bar4_mapped_len);
-  }
-  if (device_fd >= 0) ::close(device_fd);
-  if (group_fd >= 0) ::close(group_fd);
-  if (container_fd >= 0) ::close(container_fd);
 #endif
+  pthread_mutex_lock(&g_vfio_fork_mu);
+  unregister_transport_locked(this);
+  if (device_fd >= 0) {
+    ::close(device_fd);
+    device_fd = -1;
+  }
+  if (group_fd >= 0) {
+    ::close(group_fd);
+    group_fd = -1;
+  }
+  if (container_fd >= 0) {
+    ::close(container_fd);
+    container_fd = -1;
+  }
   bar0_mmio = nullptr;
   bar0_mapped_len = 0;
   bar4_mmio = nullptr;
   bar4_mapped_len = 0;
-  device_fd = -1;
-  group_fd = -1;
-  container_fd = -1;
+  owner_pid = 0;
+  pthread_mutex_unlock(&g_vfio_fork_mu);
 }
 
 bool VfioTransport::map_dma_at(void* vaddr, uint64_t iova, uint64_t size, std::string* err) {
@@ -476,7 +820,8 @@ bool VfioTransport::map_dma_at(void* vaddr, uint64_t iova, uint64_t size, std::s
 bool VfioTransport::map_dma(void* vaddr, uint64_t size, uint64_t* out_iova, std::string* err) {
   if (!vaddr || size == 0 || !out_iova) return false;
   uint64_t iova = 0;
-  if (!iova_alloc.alloc(size, 4096, &iova)) {
+  uint64_t align = iommu_min_page_size >= 4096ULL ? iommu_min_page_size : 4096ULL;
+  if (!iova_alloc.alloc(size, align, &iova)) {
     if (err) *err = "IOVA arena exhausted";
     return false;
   }
@@ -554,6 +899,7 @@ bool VfioTransport::enable_bus_master(std::string* err) {
 }
 
 bool VfioTransport::init_ring_queues(std::string* err) {
+  dma_faulted = false;
   if (is_mock) return true;
 #ifndef __linux__
   (void)err;
@@ -564,10 +910,54 @@ bool VfioTransport::init_ring_queues(std::string* err) {
     return false;
   }
 
+  // Determine the effective VFIO DMA mapping alignment: max(host page size,
+  // minimum IOMMU supported page size, 4 KiB). Mapping SQ, CQ, and the status
+  // page inside one page-aligned contiguous arena preserves fixed hardware
+  // offsets (0x0000, 0x8000, 0xa000) even on 16 KiB / 64 KiB page hosts.
+  long host_ps = ::sysconf(_SC_PAGESIZE);
+  uint64_t map_granule = (host_ps > 4096) ? static_cast<uint64_t>(host_ps) : 4096ULL;
+  struct vfio_iommu_type1_info iommu_info = {};
+  iommu_info.argsz = sizeof(iommu_info);
+  if (::ioctl(container_fd, VFIO_IOMMU_GET_INFO, &iommu_info) == 0 &&
+      (iommu_info.flags & VFIO_IOMMU_INFO_PGSIZES) && iommu_info.iova_pgsizes != 0) {
+    uint64_t min_iommu_ps = iommu_info.iova_pgsizes & (~iommu_info.iova_pgsizes + 1ULL);
+    if (min_iommu_ps > map_granule) map_granule = min_iommu_ps;
+  }
+  iommu_min_page_size = map_granule;
+
+  const uint64_t ring_min_span = kStatusPageIova + kStatusPageBytes;
+  const uint64_t aligned_ring_bytes =
+      (ring_min_span + map_granule - 1ULL) & ~(map_granule - 1ULL);
+  if (aligned_ring_bytes < ring_min_span || aligned_ring_bytes > kStageBaseIova) {
+    if (err) *err = "IOMMU page size exceeds ring controller IOVA aperture";
+    return false;
+  }
+  if ((kStageBaseIova % map_granule) != 0 || (kStageBytes % map_granule) != 0) {
+    if (err) *err = "Staging DMA window is not aligned to IOMMU page size";
+    return false;
+  }
+
+  if (map_granule > std::numeric_limits<size_t>::max()) {
+    if (err) *err = "IOMMU page size exceeds host address width";
+    return false;
+  }
+
   auto map_anon_dma = [&](uint64_t iova, size_t len) -> uint8_t* {
-    void* p = ::mmap(nullptr, len, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (p == MAP_FAILED) return nullptr;
+    pthread_mutex_lock(&g_vfio_fork_mu);
+    void* p = alloc_aligned_anon_pages(len, static_cast<size_t>(map_granule), err);
+    if (!p) {
+      pthread_mutex_unlock(&g_vfio_fork_mu);
+      return nullptr;
+    }
+    // Prevent copy-on-write page replacement across fork() while pages are pinned by VFIO.
+    if (::madvise(p, len, MADV_DONTFORK) != 0) {
+      int madv_err = errno;
+      ::munmap(p, len);
+      pthread_mutex_unlock(&g_vfio_fork_mu);
+      if (err) *err = std::string("madvise(MADV_DONTFORK) failed: ") + std::strerror(madv_err);
+      return nullptr;
+    }
+    pthread_mutex_unlock(&g_vfio_fork_mu);
     std::memset(p, 0, len);
     if (!map_dma_at(p, iova, len, err)) {
       ::munmap(p, len);
@@ -576,33 +966,24 @@ bool VfioTransport::init_ring_queues(std::string* err) {
     return reinterpret_cast<uint8_t*>(p);
   };
 
-  sq_ring_mem = map_anon_dma(kSqRingIova, kSqRingBytes);
-  if (!sq_ring_mem) {
-    if (err && err->empty()) *err = "Failed to map SQ ring buffer";
-    teardown_ring_queues();
-    return false;
-  }
-  cq_ring_mem = map_anon_dma(kCqRingIova, kCqRingBytes);
-  if (!cq_ring_mem) {
-    if (err && err->empty()) *err = "Failed to map CQ ring buffer";
-    teardown_ring_queues();
-    return false;
-  }
-  status_page_mem = reinterpret_cast<volatile uint32_t*>(
-      map_anon_dma(kStatusPageIova, kStatusPageBytes));
-  if (!status_page_mem) {
-    if (err && err->empty()) *err = "Failed to map status page buffer";
-    teardown_ring_queues();
-    return false;
-  }
-  host_stage_mem = map_anon_dma(kStageBaseIova, kStageBytes);
-  if (!host_stage_mem) {
-    if (err && err->empty()) *err = "Failed to map host DMA staging buffer";
+  ring_arena_bytes = static_cast<size_t>(aligned_ring_bytes);
+  ring_arena_mem = map_anon_dma(kSqRingIova, ring_arena_bytes);
+  if (!ring_arena_mem) {
+    if (err && err->empty()) *err = "Failed to map VFIO ring queue arena";
     teardown_ring_queues();
     return false;
   }
   host_stage_size = kStageBytes;
   host_stage_iova = kStageBaseIova;
+  host_stage_mem = map_anon_dma(kStageBaseIova, kStageBytes);
+  if (!host_stage_mem) {
+    if (err && err->empty()) *err = "Failed to map VFIO host staging window";
+    teardown_ring_queues();
+    return false;
+  }
+  sq_ring_mem = ring_arena_mem + kSqRingIova;
+  cq_ring_mem = ring_arena_mem + kCqRingIova;
+  status_page_mem = reinterpret_cast<volatile uint32_t*>(ring_arena_mem + kStatusPageIova);
 
   // Disable queue before reprogramming base addresses.
   write32_bar0(0x10000u, 0u);
@@ -659,38 +1040,42 @@ bool VfioTransport::init_ring_queues(std::string* err) {
 void VfioTransport::teardown_ring_queues() {
   teardown_imem_state();
 #ifdef __linux__
-  if (!is_mock && bar0_mmio && bar0_mapped_len >= 0x12000u && ring_ready) {
-    write32_bar0(0x10150u, 0u);
-    write32_bar0(0x10110u, 0u);
-    write32_bar0(0x10120u, 0u);
-    write32_bar0(0x10130u, 0u);
-    write32_bar0(0x11f00u, 0u);
-    write32_bar0(0x10100u, 0u);
-    write32_bar0(0x10000u, 0u);
-    write32_bar0(0x10010u, 0u);
-    write32_bar0(0x10014u, 0u);
-    write32_bar0(0x10020u, 0u);
-    write32_bar0(0x10024u, 0u);
-    write32_bar0(0x10030u, 0u);
-    write32_bar0(0x10034u, 0u);
-    write32_bar0(0x10040u, 0u);
-  }
-  auto unmap_anon_dma = [&](void* p, uint64_t iova, size_t len) {
-    if (!p || len == 0) return;
-    if (container_fd >= 0) {
-      struct vfio_iommu_type1_dma_unmap dunmap = {};
-      dunmap.argsz = sizeof(dunmap);
-      dunmap.iova = iova;
-      dunmap.size = len;
-      (void)::ioctl(container_fd, VFIO_IOMMU_UNMAP_DMA, &dunmap);
+  // Only the process that opened the VFIO device owns hardware queues and MADV_DONTFORK arenas.
+  // A forked child must never stop the parent's queues, unmap parent DMA, or munmap DONTFORK VMAs.
+  if (is_owner_process()) {
+    if (!is_mock && bar0_mmio && bar0_mapped_len >= 0x12000u && ring_ready) {
+      write32_bar0(0x10150u, 0u);
+      write32_bar0(0x10110u, 0u);
+      write32_bar0(0x10120u, 0u);
+      write32_bar0(0x10130u, 0u);
+      write32_bar0(0x11f00u, 0u);
+      write32_bar0(0x10100u, 0u);
+      write32_bar0(0x10000u, 0u);
+      write32_bar0(0x10010u, 0u);
+      write32_bar0(0x10014u, 0u);
+      write32_bar0(0x10020u, 0u);
+      write32_bar0(0x10024u, 0u);
+      write32_bar0(0x10030u, 0u);
+      write32_bar0(0x10034u, 0u);
+      write32_bar0(0x10040u, 0u);
     }
-    ::munmap(p, len);
-  };
-  unmap_anon_dma(host_stage_mem, kStageBaseIova, host_stage_size ? host_stage_size : kStageBytes);
-  unmap_anon_dma(const_cast<uint32_t*>(status_page_mem), kStatusPageIova, kStatusPageBytes);
-  unmap_anon_dma(cq_ring_mem, kCqRingIova, kCqRingBytes);
-  unmap_anon_dma(sq_ring_mem, kSqRingIova, kSqRingBytes);
+    auto unmap_anon_dma = [&](void* p, uint64_t iova, size_t len) {
+      if (!p) return;
+      if (container_fd >= 0) {
+        struct vfio_iommu_type1_dma_unmap dunmap = {};
+        dunmap.argsz = sizeof(dunmap);
+        dunmap.iova = iova;
+        dunmap.size = len;
+        (void)::ioctl(container_fd, VFIO_IOMMU_UNMAP_DMA, &dunmap);
+      }
+      ::munmap(p, len);
+    };
+    unmap_anon_dma(host_stage_mem, kStageBaseIova, host_stage_size);
+    unmap_anon_dma(ring_arena_mem, kSqRingIova, ring_arena_bytes);
+  }
 #endif
+  ring_arena_mem = nullptr;
+  ring_arena_bytes = 0;
   sq_ring_mem = nullptr;
   cq_ring_mem = nullptr;
   status_page_mem = nullptr;
@@ -699,12 +1084,53 @@ void VfioTransport::teardown_ring_queues() {
   host_stage_iova = 0;
   sq_seq = 0;
   ring_ready = false;
+  dma_faulted = false;
+}
+
+bool validate_cq_completion(uint32_t sent_seq, const uint32_t cq[8], std::string* err) {
+  if (!cq) {
+    if (err) *err = "Null CQ completion buffer";
+    return false;
+  }
+  if (cq[0] != sent_seq) {
+    if (err) {
+      char msg[128];
+      std::snprintf(msg, sizeof(msg),
+                    "CQ completion sequence mismatch: got=%u expected=%u",
+                    cq[0], sent_seq);
+      *err = msg;
+    }
+    return false;
+  }
+  if (cq[1] != 0u) {
+    if (err) {
+      char msg[160];
+      std::snprintf(msg, sizeof(msg),
+                    "VFIO CQ completion error: seq=%u status=0x%08x w2=0x%08x w3=0x%08x",
+                    cq[0], cq[1], cq[2], cq[3]);
+      *err = msg;
+    }
+    return false;
+  }
+  return true;
 }
 
 bool VfioTransport::submit_sq_wait(const uint32_t desc[32], uint32_t timeout_ms,
                                    uint32_t cq_out[8], std::string* err) {
+  if (!is_mock && !is_owner_process()) {
+    if (err) *err = "VFIO context cannot be used in a forked child process";
+    return false;
+  }
+  if (dma_faulted) {
+    if (err) *err = "VFIO DMA faulted after prior timeout; recreate context to reset device";
+    return false;
+  }
   if (is_mock) {
-    if (cq_out) std::memset(cq_out, 0, 32);
+    if (cq_out) {
+      std::memset(cq_out, 0, 32);
+      cq_out[0] = sq_seq;
+    }
+    ++sq_seq;
     return true;
   }
 #ifndef __linux__
@@ -716,46 +1142,75 @@ bool VfioTransport::submit_sq_wait(const uint32_t desc[32], uint32_t timeout_ms,
     return false;
   }
 
-  uint32_t idx = sq_seq % 256u;
+  const uint32_t sent_seq = sq_seq;
+  uint32_t idx = sent_seq % 256u;
   uint32_t* sq_slot = reinterpret_cast<uint32_t*>(sq_ring_mem + idx * 128u);
   uint32_t* cq_slot = reinterpret_cast<uint32_t*>(cq_ring_mem + idx * 32u);
+  // Poison the CQ slot before ringing the doorbell so stale entries cannot match sent_seq.
   std::memset(cq_slot, 0, 32u);
+  cq_slot[0] = ~sent_seq;
   std::memcpy(sq_slot, desc, 128u);
-  sq_slot[0] = sq_seq;
-  __sync_synchronize();
+  sq_slot[0] = sent_seq;
+  // Order DMA payload, CQ poison, and SQ descriptor writes in outer-shareable domain before MMIO doorbell.
+  dma_wmb();
 
-  uint32_t target_seq = sq_seq + 1u;
+  uint32_t target_seq = sent_seq + 1u;
   sq_seq = target_seq;
   write32_bar0(0x10018u, target_seq);
   write32_bar0(0x10044u, 0u);
 
-  const uint64_t budget_ns = static_cast<uint64_t>(timeout_ms ? timeout_ms : 5000u) * 1000000ULL;
-  struct timespec ts_start = {};
-  ::clock_gettime(CLOCK_MONOTONIC, &ts_start);
-  const uint64_t start_ns = static_cast<uint64_t>(ts_start.tv_sec) * 1000000000ULL +
-                            static_cast<uint64_t>(ts_start.tv_nsec);
-
-  for (;;) {
-    __sync_synchronize();
-    if (static_cast<int32_t>(status_page_mem[1] - target_seq) >= 0) {
-      if (cq_out) {
-        std::memcpy(cq_out, cq_slot, 32u);
-      }
-      write32_bar0(0x1002cu, target_seq);
-      return true;
+  auto quiesce_on_unverified_dma = [&]() {
+    // Quiesce the device immediately so an in-flight descriptor cannot complete
+    // late into reused staging memory or reallocated HBM.
+    dma_faulted = true;
+    ring_ready = false;
+    if (bar0_mmio && bar0_mapped_len >= 0x12000u) {
+      write32_bar0(0x10000u, 0u);
+      write32_bar0(0x10040u, 0u);
     }
-    struct timespec ts_now = {};
-    ::clock_gettime(CLOCK_MONOTONIC, &ts_now);
-    const uint64_t now_ns = static_cast<uint64_t>(ts_now.tv_sec) * 1000000000ULL +
-                            static_cast<uint64_t>(ts_now.tv_nsec);
-    if (now_ns - start_ns >= budget_ns) {
+    uint16_t cmd = 0;
+    if (read_pci_config(0x04, &cmd, sizeof(cmd)) && (cmd & 0x0004u)) {
+      cmd &= static_cast<uint16_t>(~0x0004u);  // Clear PCI_COMMAND_MASTER
+      (void)write_pci_config(0x04, &cmd, sizeof(cmd));
+    }
+    if (device_fd >= 0) {
+      (void)::ioctl(device_fd, VFIO_DEVICE_RESET);
+    }
+  };
+
+  const auto timeout = std::chrono::milliseconds(timeout_ms ? timeout_ms : 5000u);
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  for (;;) {
+    uint32_t cq_tail = __atomic_load_n(&status_page_mem[1], __ATOMIC_ACQUIRE);
+    if (static_cast<int32_t>(cq_tail - target_seq) >= 0) {
+      // Order completion entry and DMA payload reads after observing cq_tail from PCIe device.
+      dma_rmb();
+      uint32_t local_cq[8] = {};
+      std::memcpy(local_cq, cq_slot, 32u);
+      if (cq_out) {
+        std::memcpy(cq_out, local_cq, 32u);
+      }
+      if (local_cq[0] != sent_seq) {
+        // Submitted DMA has no verified completion: quiesce and quarantine context.
+        quiesce_on_unverified_dma();
+        (void)validate_cq_completion(sent_seq, local_cq, err);
+        if (err) *err += " (device quiesced; recreate context)";
+        return false;
+      }
+      dma_wmb();
+      write32_bar0(0x1002cu, target_seq);
+      return validate_cq_completion(sent_seq, local_cq, err);
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
       break;
     }
     ::usleep(10);
   }
 
+  quiesce_on_unverified_dma();
   if (err) {
-    *err = "SQ doorbell timeout waiting for completion seq=" + std::to_string(target_seq - 1u);
+    *err = "SQ doorbell timeout waiting for completion seq=" + std::to_string(target_seq - 1u) +
+           " (device quiesced; recreate context)";
   }
   return false;
 #endif
@@ -869,10 +1324,23 @@ bool VfioTransport::submit_exec_sync(uint32_t expected_exec_seq, uint32_t timeou
     std::memcpy(cq_out, local_cq, sizeof(local_cq));
   }
   if (local_cq[4] != 1u || local_cq[5] != expected_exec_seq) {
+    dma_faulted = true;
+    ring_ready = false;
+    imem_booted = false;
+#ifdef __linux__
+    if (bar0_mmio && bar0_mapped_len >= 0x12000u) {
+      write32_bar0(0x10000u, 0u);
+      write32_bar0(0x10040u, 0u);
+    }
+    if (device_fd >= 0) {
+      (void)::ioctl(device_fd, VFIO_DEVICE_RESET);
+    }
+#endif
     if (err) {
       *err = "EXEC completion mismatch: cq[4]=" + std::to_string(local_cq[4]) +
              " cq[5]=" + std::to_string(local_cq[5]) +
-             " expected=" + std::to_string(expected_exec_seq);
+             " expected=" + std::to_string(expected_exec_seq) +
+             " (device quiesced; recreate context)";
     }
     return false;
   }
@@ -902,6 +1370,14 @@ bool VfioTransport::ensure_matmul_scratch(std::string* err) {
 }
 
 bool VfioTransport::ensure_imem_booted(uint32_t timeout_ms, std::string* err) {
+  if (!is_mock && !is_owner_process()) {
+    if (err) *err = "VFIO context cannot be used in a forked child process";
+    return false;
+  }
+  if (dma_faulted) {
+    if (err) *err = "VFIO DMA faulted after prior timeout; recreate context";
+    return false;
+  }
   if (imem_booted) return true;
   if (is_mock) {
     imem_booted = true;
@@ -934,14 +1410,16 @@ bool VfioTransport::ensure_imem_booted(uint32_t timeout_ms, std::string* err) {
 }
 
 void VfioTransport::teardown_imem_state() {
-  if (scratch_rhs_hbm != 0) {
-    hbm_alloc.free(scratch_rhs_hbm);
-    scratch_rhs_hbm = 0;
+  if (is_owner_process() && !dma_faulted) {
+    if (scratch_rhs_hbm != 0) {
+      hbm_alloc.free(scratch_rhs_hbm);
+    }
+    if (scratch_lhs_hbm != 0) {
+      hbm_alloc.free(scratch_lhs_hbm);
+    }
   }
-  if (scratch_lhs_hbm != 0) {
-    hbm_alloc.free(scratch_lhs_hbm);
-    scratch_lhs_hbm = 0;
-  }
+  scratch_rhs_hbm = 0;
+  scratch_lhs_hbm = 0;
   imem_booted = false;
   exec_seq = 0;
 }

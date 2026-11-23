@@ -46,6 +46,7 @@ class IovaAllocator {
   bool alloc(uint64_t size, uint64_t align, uint64_t* out_iova);
   void free(uint64_t iova);
   uint64_t used_bytes() const;
+  uint64_t capacity_bytes() const { return limit_ > base_ ? (limit_ - base_) : 0; }
 
  private:
   uint64_t base_ = 0;
@@ -64,6 +65,10 @@ struct Bar4Descriptor {
 };
 
 bool parse_bar4_descriptor(const uint8_t* bar4_page, size_t page_len, Bar4Descriptor* out);
+
+// Allocate an anonymous page mapping of length `len` whose host virtual address
+// is aligned to `align` (power of 2, >= host page size). Caller releases with munmap(p, len).
+void* alloc_aligned_anon_pages(size_t len, size_t align, std::string* err);
 
 // VFIO + PCI device transport handle.
 struct VfioTransport {
@@ -92,14 +97,27 @@ struct VfioTransport {
   bool pci_cmd_saved = false;
 
   // Bare-metal BAR0 + 0x10000 ring queues and pinned host staging DMA memory.
+  uint8_t* ring_arena_mem = nullptr;
+  size_t   ring_arena_bytes = 0;
   uint8_t* sq_ring_mem = nullptr;
   uint8_t* cq_ring_mem = nullptr;
   volatile uint32_t* status_page_mem = nullptr;
   uint8_t* host_stage_mem = nullptr;
   size_t   host_stage_size = 0;
   uint64_t host_stage_iova = 0;
+  uint64_t iommu_min_page_size = 4096ULL;
   uint32_t sq_seq = 0;
   bool ring_ready = false;
+  bool dma_faulted = false;
+  int64_t owner_pid = 0;
+
+  bool is_owner_process() const;
+  bool register_fork_cleanup(std::string* err);
+
+  VfioTransport() = default;
+  ~VfioTransport();
+  VfioTransport(const VfioTransport&) = delete;
+  VfioTransport& operator=(const VfioTransport&) = delete;
 
   // IMEM boot/poller & kernel runtime state (initialized lazily on first live matmul).
   bool imem_booted = false;
@@ -149,27 +167,35 @@ struct VfioTransport {
 };
 
 // Internal C++ helpers shared between ot_device.cpp and ot_pjrt.cpp.
+ot_status_t buffer_h2d_offset(ot_context_t* ctx, ot_buffer_t* dst, size_t dst_offset,
+                              const void* host_src, size_t size_bytes);
 ot_status_t buffer_h2d_tiled_128x128_bf16(ot_context_t* ctx, ot_buffer_t* dst,
                                           const void* host_src_row_major);
 uint64_t context_hbm_used_bytes(const ot_context_t* ctx);
+bool validate_cq_completion(uint32_t sent_seq, const uint32_t cq[8], std::string* err);
+// Static allocation-free PJRT_Error fallback used when error allocation fails.
+void* pjrt_static_fallback_error_raw(uint32_t error_code);
 
 }  // namespace ot
 
 struct ot_buffer {
   ot_context_t* ctx = nullptr;
+  uint64_t ctx_instance_id = 0;
   size_t size_bytes = 0;
   uint64_t hbm_addr = 0;
+  bool is_mock = false;
+  int64_t owner_pid = 0;
   ot::BufferLayout layout = ot::BufferLayout::kRaw;
-  // Mock host mirror when running offline
-  std::vector<uint8_t> mock_data;
 };
 
 struct ot_context {
+  uint64_t instance_id = 0;
   std::mutex mu;
   ot_config_t cfg{};
   ot_device_info_t info{};
   ot::VfioTransport transport{};
   ot::Bar4Descriptor bar4_desc{};
+  std::vector<ot_buffer_t*> live_buffers;
   std::string last_error;
 };
 

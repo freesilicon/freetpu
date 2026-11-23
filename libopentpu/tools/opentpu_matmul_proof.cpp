@@ -151,18 +151,37 @@ void* open_opentpu_library(const std::string& explicit_path, const char* argv0,
   return nullptr;
 }
 
+std::string mapped_basename(const std::string& maps_line) {
+  size_t pos = 0;
+  for (int field = 0; field < 5; ++field) {
+    while (pos < maps_line.size() && maps_line[pos] == ' ') ++pos;
+    while (pos < maps_line.size() && maps_line[pos] != ' ') ++pos;
+  }
+  while (pos < maps_line.size() && maps_line[pos] == ' ') ++pos;
+  if (pos >= maps_line.size()) return "";
+  std::string path = maps_line.substr(pos);
+  const std::string deleted_suffix = " (deleted)";
+  if (path.size() >= deleted_suffix.size() &&
+      path.compare(path.size() - deleted_suffix.size(), deleted_suffix.size(), deleted_suffix) == 0) {
+    path.erase(path.size() - deleted_suffix.size());
+  }
+  size_t slash = path.rfind('/');
+  return (slash == std::string::npos) ? path : path.substr(slash + 1);
+}
+
 bool check_maps_clean(const char* tag) {
   std::ifstream ifs("/proc/self/maps");
   if (!ifs.is_open()) {
-    printf("[%s] MAPS_LIBTPU=0 MAPS_LIBPYTHON=0 (non-proc host)\n", tag);
+    printf("[%s] MAPS_CHECK=SKIPPED (/proc/self/maps unavailable on this host)\n", tag);
     return true;
   }
   std::string line;
   int libtpu_cnt = 0;
   int libpython_cnt = 0;
   while (std::getline(ifs, line)) {
-    if (line.find("libtpu") != std::string::npos) ++libtpu_cnt;
-    if (line.find("libpython") != std::string::npos) ++libpython_cnt;
+    std::string base = mapped_basename(line);
+    if (base.compare(0, 6, "libtpu") == 0) ++libtpu_cnt;
+    if (base.compare(0, 9, "libpython") == 0) ++libpython_cnt;
   }
   printf("[%s] MAPS_LIBTPU=%d MAPS_LIBPYTHON=%d\n", tag, libtpu_cnt, libpython_cnt);
   return (libtpu_cnt == 0 && libpython_cnt == 0);
@@ -583,7 +602,10 @@ int main(int argc, char** argv) {
   std::string lib_path;
 
   for (int i = 1; i < argc; ++i) {
-    if (std::strcmp(argv[i], "--mock") == 0) {
+    if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
+      printf("Usage: %s [--mock] [--lib <path>] [--runs <N>=3] [--help]\n", argv[0]);
+      return 0;
+    } else if (std::strcmp(argv[i], "--mock") == 0) {
       mock_mode = true;
     } else if (std::strcmp(argv[i], "--lib") == 0 && i + 1 < argc) {
       lib_path = argv[++i];
@@ -591,7 +613,7 @@ int main(int argc, char** argv) {
       num_runs = std::atoi(argv[++i]);
       if (num_runs < 3) num_runs = 3;
     } else {
-      fprintf(stderr, "Usage: %s [--mock] [--lib <path>] [--runs <N>=3]\n", argv[0]);
+      fprintf(stderr, "Usage: %s [--mock] [--lib <path>] [--runs <N>=3] [--help]\n", argv[0]);
       return 1;
     }
   }

@@ -12,6 +12,7 @@
 #include <initializer_list>
 #include <list>
 #include <mutex>
+#include <pthread.h>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -27,8 +28,100 @@ constexpr uint32_t kDefaultTimeoutMs              = 5000u;
 constexpr uint32_t kDefaultTileMaxM           = 64u;
 constexpr uint32_t kDefaultTileMaxK           = 2048u;
 constexpr uint32_t kDefaultTileMaxN           = 2048u;
+constexpr uint32_t kDefaultWorkerThreads          = 1u;
+constexpr uint32_t kDefaultMaxCachedOutlierCols   = 160u;
 
 uint64_t monotonic_now_ns();
+// Pin calling thread to non-LITTLE performance cores (Linux/Android cpufreq sysfs; no-op elsewhere).
+void pin_thread_to_perf_cores();
+
+// Lock-free 1-helper SPSC async dequant worker (zero locks/futexes during active pp512,
+// bounded ~1.5 ms idle spin -> 0% CPU during tg64/idle, pinned to non-LITTLE perf cores).
+struct AsyncDequantWorker {
+  using JobFn = void (*)(void* arg);
+  static constexpr uint32_t kRingCap = OB_MAX_CREDITS;
+  static constexpr uint32_t kRingMask = kRingCap - 1u;
+
+  struct Slot {
+    JobFn fn = nullptr;
+    void* arg = nullptr;
+  };
+
+  alignas(64) std::atomic<uint64_t> prod_idx{0u};
+  alignas(64) std::atomic<uint64_t> cons_idx{0u};
+  alignas(64) std::atomic<bool> helper_sleeping{false};
+  alignas(64) std::atomic<bool> main_waiting{false};
+  std::atomic<bool> stopping{false};
+
+  std::array<Slot, kRingCap> ring{};
+  bool started = false;
+  pthread_t thread{};
+  pthread_mutex_t wake_mu = PTHREAD_MUTEX_INITIALIZER;
+  pthread_cond_t wake_cv = PTHREAD_COND_INITIALIZER;
+  pthread_mutex_t done_mu = PTHREAD_MUTEX_INITIALIZER;
+  pthread_cond_t done_cv = PTHREAD_COND_INITIALIZER;
+
+  AsyncDequantWorker() = default;
+  ~AsyncDequantWorker();
+  AsyncDequantWorker(const AsyncDequantWorker&) = delete;
+  AsyncDequantWorker& operator=(const AsyncDequantWorker&) = delete;
+
+  bool ensure_started();
+  uint64_t push(JobFn fn, void* arg);
+  uint64_t completed_count() const { return cons_idx.load(std::memory_order_acquire); }
+  uint64_t pushed_count() const { return prod_idx.load(std::memory_order_relaxed); }
+  void wait_until(uint64_t target_seq);
+  void shutdown();
+};
+
+// Persistent pthread worker pool (zero extra Android .so dependencies; libc.so pthread only).
+struct WorkerPool {
+  using TaskFn = void (*)(void* arg, uint32_t start, uint32_t end, uint32_t tid);
+
+  uint32_t num_threads = 1u;
+  bool started = false;
+  bool stopping = false;
+  std::mutex dispatch_mu;
+  std::vector<pthread_t> threads;
+  pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+  pthread_cond_t work_cv = PTHREAD_COND_INITIALIZER;
+  pthread_cond_t done_cv = PTHREAD_COND_INITIALIZER;
+
+  uint64_t job_gen = 0u;
+  TaskFn cur_fn = nullptr;
+  void* cur_arg = nullptr;
+  uint32_t cur_total = 0u;
+  uint32_t cur_step = 1u;
+  uint32_t cur_active_workers = 0u;
+  std::atomic<uint32_t> next_item{0u};
+  std::atomic<uint32_t> workers_remaining{0u};
+
+  WorkerPool() = default;
+  ~WorkerPool();
+  WorkerPool(const WorkerPool&) = delete;
+  WorkerPool& operator=(const WorkerPool&) = delete;
+
+  void init(uint32_t requested_threads);
+  void shutdown();
+  void parallel_for(uint32_t total, uint32_t min_chunk, TaskFn fn, void* arg);
+
+  template <typename Fn>
+  void parallel_for_fn(uint32_t total, uint32_t min_chunk, Fn&& fn) {
+    if (total == 0u) return;
+    if (num_threads <= 1u || total <= min_chunk) {
+      fn(0u, total, 0u);
+      return;
+    }
+    struct Trampoline {
+      Fn* f;
+      static void run(void* p, uint32_t s, uint32_t e, uint32_t tid) {
+        (*static_cast<Trampoline*>(p)->f)(s, e, tid);
+      }
+    };
+    Trampoline tr{&fn};
+    parallel_for(total, min_chunk, &Trampoline::run, &tr);
+  }
+};
 
 // Standalone SHA-256 (zero external crypto dependencies)
 struct Sha256Digest {
@@ -165,6 +258,14 @@ ob_status_t device_wait_handle(ob_context* ctx,
                                ob_exec_handle_t handle,
                                uint32_t timeout_ms,
                                ob_invoke_stats_t* out_stats);
+
+// Non-blocking completion check + harvest for overlapped pipeline drain.
+// Returns true if `handle` is finished (or errored/not-found), setting `*out_status` and `*out_stats`.
+// Returns false immediately without blocking if `handle` is still in-flight on TPU.
+bool        device_try_wait_handle(ob_context* ctx,
+                                   ob_exec_handle_t handle,
+                                   ob_status_t* out_status,
+                                   ob_invoke_stats_t* out_stats);
 
 ob_status_t device_wait_all(ob_context* ctx, uint32_t timeout_ms);
 bool        device_attach_inflight_buffers(ob_context* ctx,
@@ -312,6 +413,15 @@ uint32_t compute_activation_rms_shift(const int8_t* aq_tile,
 bool tile_output_is_saturated(const int8_t* out_data, uint32_t tm, uint32_t tn, uint32_t hw_n);
 void dequant_accum_row_f32(float* c_row, const int8_t* o_row,
                            const float* sb_ptr, uint32_t tn, float sa_d);
+void dequant_outliers_row_f32(float* c_row,
+                              const int8_t* o_row,
+                              const float* sb_ptr,
+                              uint32_t tn,
+                              float sa_d,
+                              bool store_first,
+                              const float* const* outlier_cols,
+                              const float* outlier_vals,
+                              uint32_t num_outliers);
 void apply_activation_inplace_f32(float* c_mn, size_t count, uint32_t act);
 
 // Clean-room C++17 Tensor G5 GEMM emitter internals (implemented in ob_gemm_emitter.cpp)
@@ -347,12 +457,23 @@ ob_status_t build_dgc0_dyn_weights(const ob_gemm_desc_t& desc,
 std::vector<uint8_t> pack_ext2_for_tile(uint32_t N, uint32_t K,
                                         const int8_t* weights_nk,
                                         const int32_t* bias_n);
+size_t pack_ext2_size_for_tile(uint32_t N, uint32_t K, bool include_bias);
+void pack_ext2_for_tile_into(uint8_t* dst, uint32_t N, uint32_t K,
+                             const int8_t* weights_nk,
+                             const int32_t* bias_n,
+                             bool include_bias,
+                             WorkerPool* pool = nullptr);
 
 // Pack weights (+ optional bias) into exact buenos_a0 M=64 large-tile ext[2] layout
 // (8-channel groups: 128 B padded bias header + K/16 blocks of 8x16 weights ^ 0x80).
 std::vector<uint8_t> pack_ext2_for_lt_64x(uint32_t N, uint32_t K,
                                           const int8_t* weights_nk,
                                           const int32_t* bias_n);
+size_t pack_ext2_size_for_lt_64x(uint32_t N, uint32_t K);
+void pack_ext2_for_lt_64x_into(uint8_t* dst, uint32_t N, uint32_t K,
+                               const int8_t* weights_nk,
+                               const int32_t* bias_n,
+                               WorkerPool* pool = nullptr);
 
 // Mode-A zero-overhead (+0 B) in-place chunk[5] 0x640 + HDR_DATA SiLU/GELU fusion.
 // Allows decoupled (s_mid, zp_mid) -> (s_out, zp_out) for arbitrary quantization.
@@ -379,6 +500,29 @@ bool is_lt_1x_dim(uint32_t d);
 // (M==64, K in {512,576,1024,1536}, N in [128..1536] step 32, K+N <= 3072).
 bool is_lt_64x_shape(uint32_t M, uint32_t K, uint32_t N);
 
+// Clean-room 7-chunk per-tensor W8A16(FP16) (full FP32 accumulator, scale=1.0 default)
+// weight packer + .dgc0 emitter (ob_gemm_emitter.cpp) & NEON scale epilogue (ob_gemm.cpp).
+bool is_w8a16_pt_1x_shape(uint32_t M, uint32_t K, uint32_t N);
+size_t pack_w8a16_ext2_size(uint32_t N, uint32_t K);
+void pack_w8a16_ext2_into(uint8_t* dst, uint32_t N, uint32_t K, const int8_t* weights_nk);
+std::vector<uint8_t> pack_w8a16_ext2(uint32_t N, uint32_t K, const int8_t* weights_nk);
+ob_status_t synthesize_w8a16_pt_1x_parts(uint32_t K, uint32_t N, float pt_scale,
+                                         const int8_t* weights_nk,
+                                         GemmSynthResult* out, std::string* err);
+ob_status_t build_dgc0_w8a16_pt_1x(uint32_t K, uint32_t N, float pt_scale,
+                                   const int8_t* weights_nk,
+                                   const uint8_t* dive_interp,
+                                   size_t dive_interp_size,
+                                   std::vector<uint8_t>* out_dgc0,
+                                   std::string* err);
+void w8a16_pt_epilogue_f32(float* c_row,
+                           const float* y_raw,
+                           const float* sb_ptr,
+                           uint32_t tn,
+                           float prescale_inv,
+                           bool store_first);
+float round_f32_to_fp16_f32(float x);
+
 // Clean-room C++17 11-chunk zero-DRAM in-SRAM chained SwiGLU emitter (ob_gemm_emitter.cpp)
 struct SwigluSynthResult {
   std::array<std::vector<uint8_t>, 11> chunks;
@@ -394,6 +538,13 @@ std::vector<uint8_t> pack_ext2_for_swiglu(uint32_t M, uint32_t K, uint32_t H, ui
                                           const int8_t* wg_hk, const int32_t* bg_h,
                                           const int8_t* wu_hk, const int32_t* bu_h,
                                           const int8_t* wd_nh, const int32_t* bd_n);
+size_t pack_ext2_size_for_swiglu(uint32_t M, uint32_t K, uint32_t H, uint32_t N);
+void pack_ext2_for_swiglu_into(uint8_t* dst,
+                               uint32_t M, uint32_t K, uint32_t H, uint32_t N,
+                               const int8_t* wg_hk, const int32_t* bg_h,
+                               const int8_t* wu_hk, const int32_t* bu_h,
+                               const int8_t* wd_nh, const int32_t* bd_n,
+                               WorkerPool* pool = nullptr);
 
 ob_status_t synthesize_swiglu_parts(const ob_swiglu_int8_desc_t& desc,
                                     SwigluSynthResult* out,
@@ -497,6 +648,10 @@ struct ob_context {
   float swiglu_max_crest = 16.0f;
   uint32_t param_swap_slots = 1u;
   uint32_t spin_us = 450u; // Adaptive spin window (us) before poll(resp_efd) when ema_hw_us < 600
+  uint32_t num_threads = ob::kDefaultWorkerThreads; // OPENBUENOS_THREADS (default 1, opt-in >1)
+  bool async_dequant_enabled = true; // OPENBUENOS_ASYNC_DEQUANT (default 1, opt-out 0)
+  uint32_t w8a16_mode = 0u; // OPENBUENOS_W8A16: 0=off, 1=opt-in supported M=1
+  uint32_t max_cached_outlier_cols = ob::kDefaultMaxCachedOutlierCols; // OPENBUENOS_MAX_OUTLIER_COLS (default 160)
   uint64_t ema_hw_us = 0u; // Exponential moving average of firmware hw_execution_us
   uint32_t credit_size = OB_MAX_CREDITS;
   uint32_t fw_major = 0;
@@ -566,6 +721,7 @@ struct ob_context {
   size_t weight_cache_peak_bytes = 0;
   size_t weight_cache_max_bytes = 0;   // lazily initialized (min(2048 MiB, MemAvailable/3) on Android)
   size_t weight_cache_max_entries = 0; // FD-safe cap (default 4096, env OPENBUENOS_WEIGHT_CACHE_ENTRIES)
+  size_t outlier_cache_bytes = 0;      // Separate tracked total of cached FP32 outlier columns
   std::vector<ob::ImmutableWeightRegion> immutable_weight_regions;
   uint64_t next_immutable_region_gen = 1u;
   size_t simulated_mem_available_bytes = 0; // Optional test override for LMKD budget verification
@@ -573,6 +729,11 @@ struct ob_context {
   uint64_t weight_cache_hits = 0;
   uint64_t weight_cache_misses = 0;
   uint64_t weight_cache_evictions = 0;
+
+  // Persistent pthread worker pool (opt-in via OPENBUENOS_THREADS>1) +
+  // lock-free 1-helper SPSC async dequant worker (OPENBUENOS_ASYNC_DEQUANT=1).
+  ob::WorkerPool worker_pool;
+  ob::AsyncDequantWorker async_dequant;
 
   // Reusable GEMM host scratch buffers (eliminates per-call malloc/free in hot loop)
   std::vector<int8_t> gemm_aq_scratch;
@@ -582,6 +743,11 @@ struct ob_context {
   std::vector<float> gemm_wcol_scratch;
   std::vector<float> gemm_sa_scratch;
   std::vector<std::vector<std::pair<uint32_t, float>>> gemm_outliers_scratch;
+
+  // Persistent M7A SwiGLU fallback scratch (eliminates per-layer 36.7 MiB mmap/page-fault/munmap churn)
+  std::mutex swiglu_fb_mu;
+  std::vector<float> swiglu_gate_scratch;
+  std::vector<float> swiglu_up_scratch;
 
   // Stage profiler counters
   ob::ProfileCounters prof{};
