@@ -6,26 +6,70 @@ set -euo pipefail
 DRY_RUN=0
 MOCK_MODE=0
 ALLOW_NO_PJRT=0
+STAGE_LIBTPU=0
+LIBTPU_VERSION="${LIBTPU_VERSION:-0.0.53.1}"
+LIBTPU_DEST="${LIBTPU_DEST:-}"
+EXPECTED_PCI_PACKAGES="${EXPECTED_PCI_PACKAGES:-4}"
+EXPECTED_LOGICAL_DEVICES="${EXPECTED_LOGICAL_DEVICES:-8}"
 OUT_DIR=""
 PCI_SYSFS_DIR="${PCI_SYSFS_DIR:-/sys/bus/pci/devices}"
 
 usage() {
   cat <<'EOF'
-Usage: 00_pci_vfio_survey.sh [--out-dir DIR] [--dry-run] [--mock] [--allow-no-pjrt]
+Usage: 00_pci_vfio_survey.sh [--out-dir DIR] [--expected-packages N] [--expected-devices N]
+                             [--stage-libtpu] [--libtpu-version VER] [--libtpu-dest PATH]
+                             [--dry-run] [--mock] [--allow-no-pjrt]
 
 Non-destructive Day-1 hardware survey for Cloud TPU v7x hosts (tpu7x-standard-4t):
   - Enumerates PCI Vendor 0x1ae0 TPU/accelerator functions (excluding gVNIC / 0x02* network controllers),
     Device IDs, BAR0/BAR2/BAR4 sizes, and Resizable BAR capability size fields
   - Captures MSI-X capability counts, iommufd (/dev/iommu) and /dev/vfio/* viability
-  - Queries live PJRT device descriptions (id, coords, core_on_chip) and compares logical chiplets vs PCI functions
+  - Optionally stages standalone libtpu.so from the PyPI cp312 wheel (--stage-libtpu, default 0.0.53.1)
+    without installing JAX
+  - Queries live PJRT device descriptions (id, coords, core_on_chip) via native C++ PJRT probe with
+    automatic JAX local_devices(backend="tpu") fallback, and validates observed counts against
+    expected Ironwood package/chiplet counts (default: 4 packages / 8 logical devices on tpu7x-4t)
     (pass --allow-no-pjrt to warn instead of failing if live PJRT is unavailable)
 EOF
+}
+
+require_arg() {
+  if [[ "$1" -lt 2 ]]; then
+    echo "Option $2 requires an argument" >&2
+    usage >&2
+    exit 2
+  fi
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --out-dir)
+      require_arg "$#" "$1"
       OUT_DIR="$2"
+      shift 2
+      ;;
+    --expected-packages)
+      require_arg "$#" "$1"
+      EXPECTED_PCI_PACKAGES="$2"
+      shift 2
+      ;;
+    --expected-devices)
+      require_arg "$#" "$1"
+      EXPECTED_LOGICAL_DEVICES="$2"
+      shift 2
+      ;;
+    --stage-libtpu)
+      STAGE_LIBTPU=1
+      shift
+      ;;
+    --libtpu-version)
+      require_arg "$#" "$1"
+      LIBTPU_VERSION="$2"
+      shift 2
+      ;;
+    --libtpu-dest)
+      require_arg "$#" "$1"
+      LIBTPU_DEST="$2"
       shift 2
       ;;
     --dry-run)
@@ -52,6 +96,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+for _count_var in EXPECTED_PCI_PACKAGES EXPECTED_LOGICAL_DEVICES; do
+  if [[ ! "${!_count_var}" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: ${_count_var} must be a non-negative integer (got '${!_count_var}')" >&2
+    exit 2
+  fi
+done
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -60,9 +111,88 @@ if [[ -z "${OUT_DIR}" ]]; then
 fi
 mkdir -p "${OUT_DIR}"
 REPORT="${OUT_DIR}/00_pci_vfio_survey.txt"
+if [[ -z "${LIBTPU_DEST}" ]]; then
+  LIBTPU_DEST="${OUT_DIR}/libtpu-${LIBTPU_VERSION}.so"
+fi
 
 log() {
   echo "$*" | tee -a "${REPORT}"
+}
+
+emit_topology_status() {
+  local obs_pci="$1"
+  local obs_pjrt="$2"
+  if [[ "${obs_pjrt}" =~ ^[0-9]+$ && "${obs_pci}" -eq "${EXPECTED_PCI_PACKAGES}" && "${obs_pjrt}" -eq "${EXPECTED_LOGICAL_DEVICES}" ]]; then
+    log "STATUS: PJRT_TOPOLOGY_CAPTURED (pci_tpu_functions=${obs_pci} expected_packages=${EXPECTED_PCI_PACKAGES} pjrt_logical_devices=${obs_pjrt} expected_devices=${EXPECTED_LOGICAL_DEVICES})"
+  else
+    log "WARN: TOPOLOGY_COUNT_MISMATCH observed_pci_functions=${obs_pci} expected_packages=${EXPECTED_PCI_PACKAGES} observed_pjrt_devices=${obs_pjrt:-unknown} expected_devices=${EXPECTED_LOGICAL_DEVICES}"
+    log "STATUS: PJRT_TOPOLOGY_MISMATCH (pci_tpu_functions=${obs_pci} expected_packages=${EXPECTED_PCI_PACKAGES} pjrt_logical_devices=${obs_pjrt:-unknown} expected_devices=${EXPECTED_LOGICAL_DEVICES})"
+  fi
+}
+
+stage_libtpu_wheel() {
+  if [[ "${STAGE_LIBTPU}" -ne 1 ]]; then
+    return 0
+  fi
+  if [[ "${DRY_RUN}" -eq 1 || "${MOCK_MODE}" -eq 1 ]]; then
+    log "[LIBTPU-STAGE] Would extract libtpu/libtpu.so from PyPI libtpu==${LIBTPU_VERSION} cp312 x86_64 wheel to ${LIBTPU_DEST} (zero JAX install required)"
+    return 0
+  fi
+  if [[ -s "${LIBTPU_DEST}" ]]; then
+    log "[LIBTPU-STAGE] Reusing existing staged libtpu.so: ${LIBTPU_DEST}"
+    export LIBTPU_PATH="${LIBTPU_DEST}"
+    return 0
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    log "ERROR: --stage-libtpu requires python3 to download and extract the cp312 wheel."
+    return 1
+  fi
+  log "[LIBTPU-STAGE] Extracting libtpu/libtpu.so from PyPI libtpu==${LIBTPU_VERSION} cp312 x86_64 wheel -> ${LIBTPU_DEST}"
+  mkdir -p "$(dirname "${LIBTPU_DEST}")"
+  python3 - "${LIBTPU_VERSION}" "${LIBTPU_DEST}" <<'PYEOF' 2>&1 | tee -a "${REPORT}"
+import hashlib
+import io
+import json
+import os
+import sys
+import urllib.request
+import zipfile
+
+version, dest = sys.argv[1], sys.argv[2]
+meta_url = f"https://pypi.org/pypi/libtpu/{version}/json"
+with urllib.request.urlopen(meta_url, timeout=30) as resp:
+    meta = json.load(resp)
+
+cands = [
+    u for u in meta.get("urls", [])
+    if "cp312" in u.get("filename", "") and "x86_64" in u.get("filename", "") and u.get("filename", "").endswith(".whl")
+]
+if not cands:
+    raise SystemExit(f"No cp312 x86_64 wheel found for libtpu=={version}")
+
+whl = cands[0]
+expected_sha = (whl.get("digests") or {}).get("sha256")
+with urllib.request.urlopen(whl["url"], timeout=120) as resp:
+    whl_bytes = resp.read()
+
+actual_sha = hashlib.sha256(whl_bytes).hexdigest()
+if expected_sha and actual_sha != expected_sha:
+    raise SystemExit(f"Wheel sha256 mismatch: expected={expected_sha} actual={actual_sha}")
+
+with zipfile.ZipFile(io.BytesIO(whl_bytes)) as zf:
+    so_members = [n for n in zf.namelist() if n.endswith("/libtpu.so")]
+    if not so_members:
+        raise SystemExit(f"libtpu.so not found inside {whl['filename']}")
+    so_bytes = zf.read(so_members[0])
+
+tmp_dest = f"{dest}.tmp.{os.getpid()}"
+with open(tmp_dest, "wb") as f:
+    f.write(so_bytes)
+os.chmod(tmp_dest, 0o755)
+os.replace(tmp_dest, dest)
+print(f"LIBTPU_STAGED path={dest} wheel={whl['filename']} bytes={len(so_bytes)} sha256={actual_sha}")
+PYEOF
+  export LIBTPU_PATH="${LIBTPU_DEST}"
 }
 
 : > "${REPORT}"
@@ -70,14 +200,16 @@ log "=== FreeTPU Ironwood (tpu7x) Day-1 PCI / VFIO Survey ==="
 log "timestamp_utc=${TIMESTAMP}"
 log "hostname=$(hostname)"
 log "kernel=$(uname -srm)"
-log "dry_run=${DRY_RUN} mock_mode=${MOCK_MODE}"
+log "dry_run=${DRY_RUN} mock_mode=${MOCK_MODE} expected_packages=${EXPECTED_PCI_PACKAGES} expected_devices=${EXPECTED_LOGICAL_DEVICES} stage_libtpu=${STAGE_LIBTPU}"
 
 if [[ "${DRY_RUN}" -eq 1 ]]; then
-  log "[DRY-RUN] Would inspect /sys/bus/pci/devices for vendor=0x1ae0, read resource/iommu_group/driver, check /dev/vfio and /dev/iommu, and query libtpu.so GetPjrtApi logical count."
+  stage_libtpu_wheel
+  log "[DRY-RUN] Would inspect ${PCI_SYSFS_DIR} for vendor=0x1ae0, read resource/iommu_group/driver, check /dev/vfio and /dev/iommu, and query libtpu.so GetPjrtApi (with JAX fallback) against expected ${EXPECTED_PCI_PACKAGES} packages / ${EXPECTED_LOGICAL_DEVICES} logical devices."
   exit 0
 fi
 
-if [[ "${MOCK_MODE}" -eq 1 || "$(uname -s)" != "Linux" ]]; then
+if [[ "${MOCK_MODE}" -eq 1 || ( "$(uname -s)" != "Linux" && "${PCI_SYSFS_DIR}" == "/sys/bus/pci/devices" ) ]]; then
+  stage_libtpu_wheel
   log "[MOCK] Simulating tpu7x-4t PCI survey (4 physical PCI functions, 0x1ae0:0x0075, dual-chiplet 96 GiB/chiplet)"
   for i in 0 1 2 3; do
     log "PCI 0000:00:0$((i+4)).0 vendor=0x1ae0 device=0x0075 class=0xff0000 driver=vfio-pci iommu_group=${i} bar0=64MiB bar4=192GiB(ReBAR)"
@@ -93,8 +225,11 @@ if [[ "${MOCK_MODE}" -eq 1 || "$(uname -s)" != "Linux" ]]; then
   log "PJRT_DEVICE index=6 id=6 local_hardware_id=6 kind=\"TPU v7x\" coords=[0,1,0] core_on_chip=0"
   log "PJRT_DEVICE index=7 id=7 local_hardware_id=7 kind=\"TPU v7x\" coords=[0,1,0] core_on_chip=1"
   log "PJRT_LOGICAL_DEVICES=8 (4 packages x 2 chiplets)"
+  emit_topology_status 4 8
   exit 0
 fi
+
+stage_libtpu_wheel
 
 is_tpu_pci_class() {
   local cls_lc
@@ -180,7 +315,13 @@ if [[ -f "${REPO_ROOT}/experimental/cloud-tpu/vfio_pci_survey.py" ]] && command 
   python3 "${REPO_ROOT}/experimental/cloud-tpu/vfio_pci_survey.py" 2>&1 | tee -a "${REPORT}" || true
 fi
 
+extract_pjrt_logical_devices() {
+  printf '%s\n' "$1" | sed -n 's/^PJRT_LOGICAL_DEVICES=\([0-9][0-9]*\).*/\1/p' | tail -n 1
+}
+
 probe_live_pjrt_topology() {
+  PJRT_LOGICAL_DEVICES_COUNT=""
+  PJRT_NATIVE_FAIL_REASON=""
   local pjrt_header="${REPO_ROOT}/libopentpu/third_party/openxla/pjrt_c_api.h"
   local libtpu_path="${LIBTPU_PATH:-${TPU_LIBRARY_PATH:-}}"
   if [[ -z "${libtpu_path}" ]]; then
@@ -352,16 +493,20 @@ CPPEOF
       rm -rf "${tmp_dir}"
       if [[ "${probe_rc}" -eq 0 ]]; then
         printf '%s\n' "${probe_out}" | tee -a "${REPORT}"
+        PJRT_LOGICAL_DEVICES_COUNT="$(extract_pjrt_logical_devices "${probe_out}")"
         return 0
       fi
       printf '%s\n' "${probe_out}" | tee -a "${REPORT}"
-      PJRT_FAIL_REASON="libtpu.so PJRT probe exited ${probe_rc}"
-      return 1
+      PJRT_NATIVE_FAIL_REASON="libtpu.so PJRT probe exited ${probe_rc}"
+      PJRT_FAIL_REASON="${PJRT_NATIVE_FAIL_REASON}"
+      log "WARN: native C++ PJRT probe failed (${PJRT_NATIVE_FAIL_REASON}); falling back to python3 jax.local_devices(backend='tpu')"
     else
       local berr=""
       berr="$(tr '\n' ' ' < "${tmp_dir}/build.err")"
       rm -rf "${tmp_dir}"
-      PJRT_FAIL_REASON="failed to compile PJRT probe: ${berr}"
+      PJRT_NATIVE_FAIL_REASON="failed to compile PJRT probe: ${berr}"
+      PJRT_FAIL_REASON="${PJRT_NATIVE_FAIL_REASON}"
+      log "WARN: ${PJRT_NATIVE_FAIL_REASON}; falling back to python3 jax.local_devices(backend='tpu')"
     fi
   fi
 
@@ -391,7 +536,14 @@ PYEOF
 )" || py_rc=$?
     if [[ "${py_rc}" -eq 0 ]]; then
       printf '%s\n' "${py_out}" | tee -a "${REPORT}"
+      PJRT_LOGICAL_DEVICES_COUNT="$(extract_pjrt_logical_devices "${py_out}")"
+      if [[ -n "${PJRT_NATIVE_FAIL_REASON}" ]]; then
+        log "NOTE: JAX fallback succeeded after native PJRT probe failure (${PJRT_NATIVE_FAIL_REASON})"
+      fi
       return 0
+    fi
+    if [[ -n "${py_out}" ]]; then
+      printf '%s\n' "${py_out}" | tee -a "${REPORT}"
     fi
     PJRT_FAIL_REASON="${PJRT_FAIL_REASON:-libtpu.so not found}; jax fallback exited ${py_rc}"
     return 1
@@ -403,12 +555,14 @@ PYEOF
 
 log "--- Live PJRT Logical Device & Chiplet Topology ---"
 PJRT_FAIL_REASON=""
+PJRT_NATIVE_FAIL_REASON=""
+PJRT_LOGICAL_DEVICES_COUNT=""
 if probe_live_pjrt_topology; then
-  log "STATUS: PJRT_TOPOLOGY_CAPTURED (pci_tpu_functions=${tpu_count})"
+  emit_topology_status "${tpu_count}" "${PJRT_LOGICAL_DEVICES_COUNT}"
 else
   log "STATUS: PJRT_TOPOLOGY_UNAVAILABLE (${PJRT_FAIL_REASON})"
   if [[ "${ALLOW_NO_PJRT}" -ne 1 ]]; then
-    log "ERROR: Live PJRT topology probe failed; re-run with LIBTPU_PATH=/path/to/libtpu.so (or pass --allow-no-pjrt to record PCI-only survey)."
+    log "ERROR: Live PJRT topology probe failed; re-run with --stage-libtpu (extracts cp312 libtpu ${LIBTPU_VERSION} without JAX), LIBTPU_PATH=/path/to/libtpu.so, or --allow-no-pjrt."
     exit 1
   fi
 fi

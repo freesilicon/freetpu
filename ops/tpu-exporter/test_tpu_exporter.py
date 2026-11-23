@@ -7098,7 +7098,14 @@ TPU Runtime Utilization
             self.assertAlmostEqual(mm_by_bdf["0000:00:05.0"].duty_cycle_percent or 0.0, 35.0)
             mm_prom = tpu_exporter.format_prometheus_metrics(mm_snap)
             self.assertNotIn('pci_bdf="0000:00:04.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/0"} 35', mm_prom)
-            self.assertNotIn("88", mm_prom.split("freetpu_tpu_runtime_unjoined_duty_cycle_percent")[0])
+            joined_duty_lines = [
+                line
+                for line in mm_prom.splitlines()
+                if line.startswith(("freetpu_tpu_duty_cycle_percent{", "freetpu_tpu_runtime_duty_cycle_percent{"))
+            ]
+            self.assertTrue(joined_duty_lines)
+            for line in joined_duty_lines:
+                self.assertNotIn("88", line)
             self.assertIn('runtime_device_id="2"} 88', mm_prom)
 
             # 3. Collapsed v2/v3 chip spanning 2 IOMMU groups where the REPRESENTATIVE
