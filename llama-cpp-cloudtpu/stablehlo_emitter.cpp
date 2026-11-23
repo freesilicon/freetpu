@@ -1161,11 +1161,19 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                                 bcast_w4_batch(m_km);
                                 SsaValue x_f32 = builder.emit_convert(x_blk, PjrtDType::F32);
                                 SsaValue xsum = builder.emit_reduce_axis(x_f32, zero_f32, 4, "stablehlo.add");
-                                SsaValue xsum_mm = builder.emit_convert(xsum, mm_dt);
-                                SsaValue m_mm = builder.emit_convert(m_km, mm_dt);
+                                // Keep the shifted offset correction dot in F32 (HIGHEST precision) unless
+                                // scales are explicitly stored in BF16, so (q - 8) * d + (m + 8*d) cancels
+                                // exact-zero nibbles without asymmetric BF16 rounding residuals.
+                                const bool fast_bf16_m =
+                                    (mm_dt == PjrtDType::BF16) &&
+                                    (d_km.dtype == PjrtDType::BF16) &&
+                                    (m_km.dtype == PjrtDType::BF16);
+                                const PjrtDType m_dot_dt = fast_bf16_m ? PjrtDType::BF16 : PjrtDType::F32;
+                                SsaValue xsum_mm = builder.emit_convert(xsum, m_dot_dt);
+                                SsaValue m_mm = builder.emit_convert(m_km, m_dot_dt);
                                 SsaValue m_dot = builder.emit_dot_general(
                                     xsum_mm, m_mm, {0, 1}, {0, 1}, {3}, {2},
-                                    dot_out_dims, PjrtDType::F32, op.high_precision);
+                                    dot_out_dims, PjrtDType::F32, op.high_precision || !fast_bf16_m);
                                 acc = builder.emit_binary("stablehlo.add", acc, m_dot);
                             }
                             local_out = builder.emit_convert(acc, op.dst.dtype);

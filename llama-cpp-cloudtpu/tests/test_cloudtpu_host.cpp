@@ -2392,7 +2392,48 @@ void test_q4_i4_single_read_matmul_and_bitcast(cloudtpu::PjrtRuntime& rt) {
             }
         }
     }
-    std::printf("  [PASS] Q4_0_I4 & Q4_K_I4 single-read S4/U4/bitcast MUL_MAT (M=1, M=16, M=40)\n");
+
+    // 3) Q4_K_I4 small-batch F32-scale zero-weight exact cancellation regression:
+    //    d = 0.06256103515625, m = 0, zero nibble (u4=0 -> s4=-8, m_s4 = 8*d = 0.50048828125), x = 1.0
+    //    must cancel to exact 0.0f under bf16_matmul=true + F32 scales (no asymmetric BF16 offset rounding).
+    {
+        const int64_t N = 4, NB = 8, K = NB * 32, M = 1;
+        const float d_exact = 0.06256103515625f;
+        const float m_s4_exact = 8.0f * d_exact;  // 0.50048828125f (rounds to 0.5f in BF16!)
+        std::vector<int8_t> qs_zero(static_cast<size_t>(NB * 32 * N), static_cast<int8_t>(-8));
+        std::vector<float> d_vec(static_cast<size_t>(NB * N), d_exact);
+        std::vector<float> m_vec(static_cast<size_t>(NB * N), m_s4_exact);
+        std::vector<float> x_unit(static_cast<size_t>(M * K), 0.0f);
+        x_unit[0] = 1.0f;
+
+        auto bqs = rt.buffer_from_host(0, qs_zero.data(), cloudtpu::PjrtDType::S4, {1, 1, NB, 32, N});
+        auto bd = rt.buffer_from_host(0, d_vec.data(), cloudtpu::PjrtDType::F32, {1, 1, NB, N});
+        auto bm = rt.buffer_from_host(0, m_vec.data(), cloudtpu::PjrtDType::F32, {1, 1, NB, N});
+        auto bx = rt.buffer_from_host(0, x_unit.data(), cloudtpu::PjrtDType::F32, {1, 1, M, K});
+
+        cloudtpu::GraphProgramSpec spec;
+        spec.bf16_matmul = true;
+        cloudtpu::TensorSpec w_spec{1, cloudtpu::PjrtDType::S4, cloudtpu::TensorStorageKind::Q4_K_I4, {1, 1, N, K}};
+        w_spec.scale_dtype = cloudtpu::PjrtDType::F32;
+        spec.inputs.push_back(w_spec);
+        spec.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, K}});
+        cloudtpu::OpNodeSpec mm;
+        mm.kind = cloudtpu::CloudOpKind::MUL_MAT;
+        mm.src_ids = {1, 2};
+        mm.dst = {3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, N}};
+        spec.ops.push_back(mm);
+        spec.output_ids = {3};
+
+        const auto prog = cloudtpu::emit_stablehlo_program(spec);
+        CHECK_TRUE(prog.mlir_text.find("precision = [HIGHEST, HIGHEST]") != std::string::npos,
+                   "Q4_K_I4 F32-scale offset correction dot must emit F32 HIGHEST precision");
+        const auto got = run_emitted(rt, prog, {bqs, bd, bm, bx});
+        CHECK_TRUE(got.size() == static_cast<size_t>(M * N), "Q4_K_I4 zero-weight output size");
+        for (size_t i = 0; i < got.size(); ++i) {
+            CHECK_TRUE(got[i] == 0.0f, "Q4_K_I4 F32-scale zero-nibble weight must cancel to exact 0.0f");
+        }
+    }
+    std::printf("  [PASS] Q4_0_I4 & Q4_K_I4 single-read S4/U4/bitcast MUL_MAT (M=1, M=16, M=40 + F32 offset cancellation)\n");
 }
 
 void test_q4_i4_get_rows_coexistence(cloudtpu::PjrtRuntime& rt) {
