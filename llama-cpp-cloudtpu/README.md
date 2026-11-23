@@ -81,7 +81,16 @@ Four stacked optimizations close the single-stream and batched serving gap while
 | `Llama-3.1-8B` | **`16`** | **`756.55`** (`1.354s`) | **`787.79`** | Coherent all 16 (**`10.9x` decode**), `bucketed=83`, `kv_donation_skipped=0` |
 | `Qwen2.5-1.5B` | `1` / **`16`** | `196.32` / `148.97` (1 prefill compile) | `203.76` / **`1,331.86`** | Coherent all 16, `bucketed=14`, `kv_donation_skipped=0` |
 
-*Note: Optional free-tier Colab `V6E1` single-chip probe returned service unavailable (`UNAVAILABLE`); paid multi-chip `v6e-8` re-benchmark remains queued pending explicit approval.*
+*Note: Optional free-tier Colab `V6E1` single-chip probe returned service unavailable (`UNAVAILABLE`). Live paid `v6e-8` hardware validation results and compatibility fixes are recorded below.*
+
+#### Live `v6e-8` Verification & Compatibility Notes (`TPU v6 lite` `Aug 15 2025` `libtpu.so`, `MAPS_LIBPYTHON=0`, `LDD_LIBPYTHON=0`)
+- **Runtime & Op Parity (`CLOUDTPU_MOCK=0`):**
+  - `test_cloudtpu_host`: **`ALL PASSED (0 failures)`** on live `v6e-8` (including `S4` H2D/D2H, 1/4/8-chip SPMD collectives, `SHARD_N`/`SHARD_K`, `BF16` scales, `pad8`, 1-graph KV donation, and padded continuous-batching buckets) after normalizing zero-extended `S4` `PJRT_Buffer_ToHostBuffer` nibbles via `sign_extend_nibble` in `pjrt_runtime.cpp`.
+  - `test-backend-ops -b CLOUDTPU` (`CLOUDTPU_SPMD_CHIPS=8`): `SET_ROWS` and `RMS_NORM` passed; quantized `MUL_MAT` (`q4_K`/`q6_K`/`q4_0`/`q8_0`) passed **`381/381`**; `GET_ROWS` (`CLOUDTPU_SPMD_CHIPS=1 CLOUDTPU_Q4K_BF16_SCALES=0`, `q4_K`/`q6_K`/`q4_0`) passed **`15/15`** (`BF16_SCALES=1` trades `BF16` scale rounding `~4e-6` vs `test-backend-ops`'s `1e-7` lookup tolerance).
+- **Single-Chip `v6e-1` (`CLOUDTPU_SPMD_CHIPS=1 -sm none -mg 0`) & 8-Chip `v6e-8` (`CLOUDTPU_ASYNC_COLLECTIVES=0`):**
+  - Pinning `-sm none -mg 0` keeps single-chip runs on chip 0 instead of `llama.cpp` layer-splitting across all 8 exposed devices: `Qwen2.5-1.5B Q4_K_M` achieved **`pp512 = 16,262.01` / `tg64 = 73.92`** (`+35.6%` `tg64` vs M4A `54.52`); `Llama-3.1-8B Q4_K_M` achieved **`pp512 = 7,557.94` / `tg64 = 52.98`** and coherent `16/16` continuous batching via `llama-server -np 16 -cb -kvu` (`50.00` decode at `c=1`, `20.30` decode at `c=16`, `MAPS_LIBPYTHON=0`).
+  - Defaulting **`CLOUDTPU_ASYNC_COLLECTIVES=0`** in `ggml-cloudtpu.cpp` resolves the legacy `Aug 15 2025` `libtpu.so` `PJRT_Client_Compile: MegaChip currently works correctly only when base is zero` failure on 8-chip 1-graph execution (`Qwen2.5-1.5B` `-p 4 -n 4`: `pp4 = 61.25` / `tg4 = 28.79`, `2.54x` `tg4` vs `CLOUDTPU_FUSE_ATTN=0`).
+  - **Host `libtpu` Version Tip:** Ubuntu 22.04 Cloud TPU VMs ship Python 3.10, causing `pip install libtpu` to pull a legacy 2025 `libtpu.so` (`libtpu >= 0.0.50` wheels require Python `>=3.11`). Extract `libtpu/libtpu.so` from a current `cp312` `libtpu` wheel (e.g. `0.0.53+`) and set `LIBTPU_PATH` directly (zero Python at runtime); full `Qwen3-32B` / `Llama-3.3-70B` `P=8` re-benchmarking against `libtpu >= 0.0.53` remains next.
 
 ### M4A Multi-Chip SPMD Live Silicon Proof (`v6e-8` Trillium, `MAPS_LIBPYTHON=0`)
 
@@ -132,6 +141,10 @@ CLOUDTPU_MOCK=1 CLOUDTPU_MOCK_DEVICES=8 CLOUDTPU_SPMD_CHIPS=8 CLOUDTPU_SPMD_MIN_
 # Continuous-batching serving on TPU with unified KV cache + static padded buckets:
 LLAMA_KV_ROWS_DISABLE=1 ./llama-cpp-cloudtpu/build-host/bin/llama-server \
   -m model-q4_k_m.gguf -ngl 99 -fa 1 -np 16 -cb -kvu -c 8192 --port 8089
+
+# Pinning a single chip on a multi-chip TPU host (prevents ggml layer-splitting across CLOUDTPU0..N):
+CLOUDTPU_SPMD_CHIPS=1 ./llama-cpp-cloudtpu/build-host/bin/llama-bench \
+  -m model-q4_k_m.gguf -ngl 99 -fa 1 -sm none -mg 0 -p 512 -n 64
 ```
 
 ---
@@ -153,7 +166,7 @@ LLAMA_KV_ROWS_DISABLE=1 ./llama-cpp-cloudtpu/build-host/bin/llama-server \
 | `CLOUDTPU_Q4K_BF16_SCALES` | `1` | `1` stores `Q4_K`/`Q6_K` scales in hardware `BF16` (`0` = F32 scales) |
 | `CLOUDTPU_MM_PAD_M` | `8` | Pads small `M < N` `Q4_*_I4` and `Q6_K` matmuls to TPU MXU `(8,128)` sublane width (`0`/`1` disables) |
 | `CLOUDTPU_BATCH_BUCKETS` | `1,2,4,8,16,32,64,128,256,512` | Static continuous-batching token buckets (`0`/empty disables padding) |
-| `CLOUDTPU_ASYNC_COLLECTIVES` | `1` | `1` enables 7 XLA TPU async collective overlap flags in `DebugOptions` when `P > 1` |
+| `CLOUDTPU_ASYNC_COLLECTIVES` | `0` | Opt-in (`1`) enables 7 XLA TPU async collective overlap flags in `DebugOptions` when `P > 1` (off by default for legacy `v6e` `libtpu.so` MegaChip compatibility) |
 | `LIBTPU_PATH` / `TPU_LIBRARY_PATH` | Auto-resolved `libtpu.so` | Explicit path to `libtpu.so` (or future clean-room `libopentpu.so`) |
 | `CLOUDTPU_FUSE_GRAPHS` | `1` | `1` fuses contiguous supported GGML nodes + enables async pipelining |
 | `CLOUDTPU_CACHE_CAP` | `4096` | LRU capacity of compiled `PJRT_LoadedExecutable*` and `SubgraphPlanCache` |

@@ -2426,12 +2426,15 @@ void PjrtRuntime::buffer_to_host(PJRT_Buffer* buf, void* dst, size_t dst_size) {
         }
     }
 
-    // Handle sub-byte S4/U4 gracefully whether PJRT ToHostBuffer writes 1 B/elem or packed 0.5 B/elem.
+    // Handle sub-byte S4/U4 gracefully whether PJRT ToHostBuffer writes 1 B/elem or packed 0.5 B/elem,
+    // and normalize S4 1-B/elem outputs where PJRT leaves nibbles zero-extended (0x08..0x0F).
+    bool is_s4_buffer = false;
     if (PJRT_API_HAS(api_, PJRT_Buffer_ElementType)) {
         PJRT_Buffer_ElementType_Args et_args = {};
         et_args.struct_size = PJRT_Buffer_ElementType_Args_STRUCT_SIZE;
         et_args.buffer = buf;
         check_error(api_->PJRT_Buffer_ElementType(&et_args), "PJRT_Buffer_ElementType");
+        is_s4_buffer = (et_args.type == PJRT_Buffer_Type_S4);
         if (et_args.type == PJRT_Buffer_Type_S4 || et_args.type == PJRT_Buffer_Type_U4) {
             const PjrtDType dt = from_pjrt_buffer_type(et_args.type);
             const size_t packed_bytes = pjrt_dtype_nbytes(dt, nelems);
@@ -2496,6 +2499,12 @@ void PjrtRuntime::buffer_to_host(PJRT_Buffer* buf, void* dst, size_t dst_size) {
     check_error(api_->PJRT_Buffer_ToHostBuffer(&args), "PJRT_Buffer_ToHostBuffer");
     if (args.event) {
         await_event(args.event);
+    }
+    if (is_s4_buffer && dst_size == nelems && nelems > 0) {
+        int8_t* out = static_cast<int8_t*>(dst);
+        for (size_t i = 0; i < nelems; ++i) {
+            out[i] = sign_extend_nibble(static_cast<uint8_t>(out[i]));
+        }
     }
 }
 

@@ -49,7 +49,7 @@ struct cloudtpu_env_config {
     bool q4k_u4 = false;            // Q4_K I4/BITCAST: false = shifted S4 (m_eff += 8*d_eff), true = U4 (0..15)
     bool q4k_bf16_scales = true;    // True BF16 Q4_K/Q6_K scales (default on; CLOUDTPU_Q4K_BF16_SCALES=0 -> F32 fallback)
     int32_t mm_pad_m = 8;           // Pad small BF16 Q4_*_I4/Q6_K_SPLIT M < mm_pad_m up to mm_pad_m for MXU (<=1 disables)
-    bool async_collectives = true;  // Enable XLA TPU async collective overlap flags on multi-chip SPMD
+    bool async_collectives = false; // Opt-in XLA async collective overlap flags (disabled by default: triggers MegaChip base=0 on v6e P=8)
     uint32_t cache_cap = 4096;
     uint64_t min_elements = 0;
     std::vector<int64_t> batch_buckets = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512};  // Padded n_tokens buckets
