@@ -15,7 +15,7 @@ Upstream `ggml-org/llama.cpp` (`b12608`) treats `EDGETPU` as a host-accessible `
 2. **Unified-RAM Device Memory Reporting (`llama-cpp-edgetpu/ggml-edgetpu.cpp`)**:
    - `ggml_backend_edgetpu_device_get_memory` reports real Linux/Android physical memory (`sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGE_SIZE)`) and `/proc/meminfo` `MemAvailable`, so `ggml-rpc-server -d EDGETPU` advertises accurate remote RAM capacity (`15,575 MiB` total, `~10,400 MiB` free) to the coordinator.
 3. **Server-Side `ACCEL` + `CPU` Hybrid Subgraph Execution (`llama-cpp-edgetpu/patches/llama-cpp-b12608-rpc-accel-fallback.patch`)**:
-   - When `ggml-rpc-server` serves a host-accessible `ACCEL` device (`-d EDGETPU`), `rpc_server::compute_graph_with_accel_fallback` partitions each offloaded subgraph via `ggml_graph_view` into contiguous `EDGETPU`-supported runs (`MUL_MAT`, `MUL_MAT_ID`, and bias `ADD`, preserving sibling `Q/K/V` and `gate/up` batching) and validated server-local `CPU` fallback runs (`RMS_NORM`, `SCALE`, `ADD`/`SUB`/`MUL`/`DIV`, `MUL_MAT`, and view/no-op ops). Per-device `hello` flags advertise the hybrid capability set in `ggml_backend_rpc_device_supports_op` so remaining ops (`ROPE`, `SOFT_MAX`, `GLU`/`SILU`, KV-cache ops) run on the coordinator CPU while non-ACCEL RPC devices retain full upstream op support.
+   - When `ggml-rpc-server` serves a host-accessible `EDGETPU` `ACCEL` device (`-d EDGETPU`), `rpc_server::compute_graph_with_accel_fallback` partitions each offloaded subgraph via `ggml_graph_view` into contiguous `EDGETPU`-supported runs (`MUL_MAT`, `MUL_MAT_ID`, and bias `ADD`, preserving sibling `Q/K/V` and `gate/up` batching) and validated server-local `CPU` fallback runs (`RMS_NORM`, `SCALE`, `ADD`/`SUB`/`MUL`/`DIV`, `MUL_MAT`, `MUL_MAT_ID`, KV/copy ops `SET_ROWS`/`GET_ROWS`/`CPY`/`CONT`/`DUP`/`ROPE`, and view/no-op ops). Per-device `hello` flags cached at registration advertise the hybrid capability set in `ggml_backend_rpc_device_supports_op` so remaining ops (`SOFT_MAX`, `GLU`/`SILU`, flash-attention ops) run on the coordinator CPU while non-EDGETPU RPC devices retain full upstream op support.
 
 ---
 
@@ -56,8 +56,8 @@ OPENBUENOS_VERBOSE=1 OPENBUENOS_WEIGHT_CACHE_MB=128 OPENBUENOS_WEIGHT_CACHE_ENTR
 /data/local/tmp/llama-edgetpu-rpc/ggml-rpc-server -d EDGETPU -H 10.99.0.2 -p 50052 -t 4
 
 # Node 1 (rango — split 34/65 layers onto mustang EDGETPU, keep 31/65 layers on rango EDGETPU):
-# `--no-kv-offload` keeps KV-cache `SET_ROWS` writes on the coordinator while offloading
-# model weights and `MUL_MAT` projections to Node 2's EDGETPU RPC server.
+# `--no-kv-offload` is optional (offloaded KV cache is supported via validated CPU fallback,
+# while `--no-kv-offload` keeps KV-cache RAM and attention on the coordinator).
 OPENBUENOS_VERBOSE=1 OPENBUENOS_WEIGHT_CACHE_MB=128 OPENBUENOS_WEIGHT_CACHE_ENTRIES=256 OPENBUENOS_POOL_MB=64 \
 /data/local/tmp/llama-edgetpu-rpc/llama-completion \
   -m /data/local/tmp/llama-edgetpu/models/Qwen2.5-32B-Instruct-Q4_0.gguf \
@@ -87,7 +87,7 @@ OPENBUENOS_VERBOSE=1 OPENBUENOS_WEIGHT_CACHE_MB=128 OPENBUENOS_WEIGHT_CACHE_ENTR
   - **End-to-End Timing**: `load = 223.45 s` (`9.03 GiB` streamed over 5 Gbps USB-C NCM), `prompt eval = 0.06 t/s` (`5 tok`), `eval = 0.01 t/s` (`7 runs`).
   - **Bottleneck Diagnosis**: With `OPENBUENOS_WEIGHT_CACHE_MB=128` protecting 16 GB LMKD, every token evicted and re-packed `Q4_0 → ext[2]` weights on CPU (`wall_us / hw_us = 58.7×`). Pure Tensor G5 silicon ran ~50× faster (`~0.68 s/tok` per node), directly motivating **single-copy pre-packed `ext[2]` residency** for fast 32B decode.
 
-### 3.2 `Qwen2.5-1.5B-Q8_0` (`1.76 GiB`) Benchmark Matrix (`llama-bench -p 128 -n 32 -r 2 -t 4`, plus `--no-kv-offload 1` for `RPC → EDGETPU` rows)
+### 3.2 `Qwen2.5-1.5B-Q8_0` (`1.76 GiB`) Benchmark Matrix (`llama-bench -p 128 -n 32 -r 2 -t 4`, with optional `--no-kv-offload 1` for `RPC → EDGETPU` rows)
 
 | Topology | Interconnect | `ngl` | Model Load (`853 MiB`) | Sync Wire RTT | `pp128` (`t/s`) | `tg32` (`t/s`) |
 | --- | --- | ---: | ---: | --- | ---: | ---: |
