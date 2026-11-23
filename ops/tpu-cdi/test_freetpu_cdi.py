@@ -6293,6 +6293,175 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertIn("device 'all'", err_part)
                 self.assertFalse(spec_path.exists(), f"Stale spec must be removed: {err_part}")
 
+    def test_legacy_spec_upgrade_without_domain_annotations_withholds_degraded_bridged_slice(self) -> None:
+        import shutil
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # 1. Single-root bridged NUMA v6e-8 host: bridge `0000:00:01.0` -> bus `01`,
+            #    8 endpoints `0000:01:00.0..0000:01:07.0` on NUMA 0.
+            sysfs_root = root / "sys_bridged"
+            dev_root = root / "dev_bridged"
+            (dev_root / "vfio").mkdir(parents=True)
+            (dev_root / "vfio" / "vfio").write_text("", encoding="utf-8")
+            misc_dev = sysfs_root / "class" / "misc" / "vfio" / "dev"
+            misc_dev.parent.mkdir(parents=True, exist_ok=True)
+            misc_dev.write_text("10:196\n", encoding="utf-8")
+            pci_bus_dir = sysfs_root / "bus" / "pci" / "devices"
+            pci_bus_dir.mkdir(parents=True)
+            iommu_groups_root = sysfs_root / "kernel" / "iommu_groups"
+            iommu_groups_root.mkdir(parents=True)
+            vfio_drv = sysfs_root / "bus" / "pci" / "drivers" / "vfio-pci"
+            vfio_drv.mkdir(parents=True)
+
+            bridge_dir = sysfs_root / "devices" / "pci0000:00" / "0000:00:01.0"
+            bridge_dir.mkdir(parents=True)
+            (bridge_dir / "vendor").write_text("0x8086\n", encoding="utf-8")
+            (bridge_dir / "device").write_text("0x1234\n", encoding="utf-8")
+            (bridge_dir / "class").write_text("0x060400\n", encoding="utf-8")
+            (bridge_dir / "secondary_bus_number").write_text("1\n", encoding="utf-8")
+            (bridge_dir / "subordinate_bus_number").write_text("1\n", encoding="utf-8")
+            os.symlink(str(bridge_dir), pci_bus_dir / "0000:00:01.0")
+
+            all_bdfs = [f"0000:01:{i:02x}.0" for i in range(8)]
+            for idx, bdf in enumerate(all_bdfs):
+                ep_dir = bridge_dir / bdf
+                ep_dir.mkdir(parents=True)
+                (ep_dir / "vendor").write_text("0x1ae0\n", encoding="utf-8")
+                (ep_dir / "device").write_text("0x006f\n", encoding="utf-8")
+                (ep_dir / "numa_node").write_text("0\n", encoding="utf-8")
+                os.symlink(str(vfio_drv), ep_dir / "driver")
+                grp_dir = iommu_groups_root / str(idx)
+                (grp_dir / "devices").mkdir(parents=True)
+                os.symlink(str(ep_dir), grp_dir / "devices" / bdf)
+                os.symlink(str(grp_dir), ep_dir / "iommu_group")
+                os.symlink(str(ep_dir), pci_bus_dir / bdf)
+                (dev_root / "vfio" / str(idx)).write_text("", encoding="utf-8")
+                grp_dev = sysfs_root / "class" / "vfio" / str(idx) / "dev"
+                grp_dev.parent.mkdir(parents=True, exist_ok=True)
+                grp_dev.write_text(f"242:{idx}\n", encoding="utf-8")
+
+            # Write an older CDI spec lacking `observed-domain-bdfs`, `pcie-root`,
+            # and `numa-node` annotations (only per-device `pci-bdf` and `all`).
+            spec_path = root / "cdi" / "legacy_v6e8.json"
+            spec_path.parent.mkdir(parents=True, exist_ok=True)
+            legacy_spec = {
+                "cdiVersion": "0.6.0",
+                "kind": "freetpu.dev/tpu",
+                "annotations": {"freetpu.dev/generated-by": "freetpu-cdi"},
+                "containerEdits": {"deviceNodes": [{"path": "/dev/vfio/vfio"}]},
+                "devices": [
+                    {
+                        "name": f"pci-{bdf.replace(':', '-').replace('.', '-')}",
+                        "annotations": {"freetpu.dev/pci-bdf": bdf},
+                        "containerEdits": {"deviceNodes": [{"path": f"/dev/vfio/{idx}"}]},
+                    }
+                    for idx, bdf in enumerate(all_bdfs)
+                ]
+                + [
+                    {
+                        "name": "all",
+                        "annotations": {"freetpu.dev/pci-bdfs": ",".join(all_bdfs)},
+                        "containerEdits": {
+                            "deviceNodes": [{"path": f"/dev/vfio/{idx}"} for idx in range(8)]
+                        },
+                    }
+                ],
+            }
+            spec_path.write_text(json.dumps(legacy_spec, indent=2) + "\n", encoding="utf-8")
+
+            # Drop 4 endpoints from PCI sysfs (simulating degraded bridged v6e-8).
+            for idx in range(4, 8):
+                bdf = all_bdfs[idx]
+                (pci_bus_dir / bdf).unlink()
+                shutil.rmtree(iommu_groups_root / str(idx))
+                shutil.rmtree(bridge_dir / bdf)
+                (dev_root / "vfio" / str(idx)).unlink()
+
+            with _mock_vfio_char_devices():
+                for _pass in range(2):
+                    rc_up, _ou, err_up = _run_cli_inproc(
+                        [
+                            "generate",
+                            "--output",
+                            str(spec_path),
+                            "--single-host-env",
+                            "--validate",
+                            "--sysfs-root",
+                            str(sysfs_root),
+                            "--dev-root",
+                            str(dev_root),
+                        ]
+                    )
+                    self.assertEqual(rc_up, 0, err_up)
+                    upgraded = json.loads(spec_path.read_text(encoding="utf-8"))
+                    dev_names = {d["name"] for d in upgraded["devices"]}
+                    # Must NOT publish a 4-chip slice or `2,2,1` bounds!
+                    self.assertFalse(
+                        any(n.startswith(("numa", "pcie-")) for n in dev_names),
+                        f"Degraded bridged legacy upgrade must withhold 4-chip slices: {dev_names}",
+                    )
+                    all_dev = next(d for d in upgraded["devices"] if d["name"] == "all")
+                    all_env = dict(
+                        kv.split("=", 1) for kv in all_dev["containerEdits"].get("env", [])
+                    )
+                    self.assertNotIn("TPU_CHIPS_PER_HOST_BOUNDS", all_env)
+                    self.assertNotIn("TPU_ACCELERATOR_TYPE", all_env)
+                    # Missing legacy BDFs remain persisted under `unplaced` across passes.
+                    obs_ann = upgraded["annotations"].get("freetpu.dev/observed-domain-bdfs", "")
+                    self.assertIn("unplaced||=", obs_ann)
+                    for gone_bdf in all_bdfs[4:]:
+                        self.assertIn(gone_bdf, obs_ann)
+
+            # 2. Dual-root bridged host: root `0000:00` (bridge -> bus `01`, 4 healthy
+            #    chips) + root `0000:80` (bridge -> bus `81`, 4 vanished chips).
+            #    Upgrading a legacy spec preserves root `0000:00`'s healthy 4-chip slice
+            #    because bridge hierarchy unambiguously places bus `81` under `0000:80`!
+            bridge2_dir = sysfs_root / "devices" / "pci0000:80" / "0000:80:01.0"
+            bridge2_dir.mkdir(parents=True)
+            (bridge2_dir / "vendor").write_text("0x8086\n", encoding="utf-8")
+            (bridge2_dir / "device").write_text("0x1234\n", encoding="utf-8")
+            (bridge2_dir / "class").write_text("0x060400\n", encoding="utf-8")
+            (bridge2_dir / "secondary_bus_number").write_text("129\n", encoding="utf-8")  # 0x81
+            (bridge2_dir / "subordinate_bus_number").write_text("129\n", encoding="utf-8")
+            os.symlink(str(bridge2_dir), pci_bus_dir / "0000:80:01.0")
+
+            dual_root_legacy_bdfs = all_bdfs[:4] + [f"0000:81:{i:02x}.0" for i in range(4)]
+            spec_path2 = root / "cdi" / "legacy_dual_root.json"
+            legacy_dual_spec = {
+                "cdiVersion": "0.6.0",
+                "kind": "freetpu.dev/tpu",
+                "annotations": {"freetpu.dev/generated-by": "freetpu-cdi"},
+                "containerEdits": {"deviceNodes": [{"path": "/dev/vfio/vfio"}]},
+                "devices": [
+                    {
+                        "name": f"pci-{bdf.replace(':', '-').replace('.', '-')}",
+                        "annotations": {"freetpu.dev/pci-bdf": bdf},
+                        "containerEdits": {"deviceNodes": [{"path": f"/dev/vfio/{idx}"}]},
+                    }
+                    for idx, bdf in enumerate(dual_root_legacy_bdfs)
+                ],
+            }
+            spec_path2.write_text(json.dumps(legacy_dual_spec, indent=2) + "\n", encoding="utf-8")
+            with _mock_vfio_char_devices():
+                rc_dr2, _odr2, err_dr2 = _run_cli_inproc(
+                    [
+                        "generate",
+                        "--output",
+                        str(spec_path2),
+                        "--single-host-env",
+                        "--validate",
+                        "--sysfs-root",
+                        str(sysfs_root),
+                        "--dev-root",
+                        str(dev_root),
+                    ]
+                )
+                self.assertEqual(rc_dr2, 0, err_dr2)
+                upgraded2 = json.loads(spec_path2.read_text(encoding="utf-8"))
+                dev_names2 = {d["name"] for d in upgraded2["devices"]}
+                self.assertIn("numa0-pcie-0000-00-4", dev_names2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1662,7 +1662,11 @@ def _compute_topology_slices(
         )
 
     observed_bdf_to_domains: Dict[str, set[Tuple[str, Optional[int], str]]] = {}
+    unplaced_observed_bdfs: set[str] = set()
     for obs_dkey, obs_bdfs in (observed_domain_bdfs or {}).items():
+        if obs_dkey == _UNPLACED_OBSERVED_DOMAIN_KEY:
+            unplaced_observed_bdfs.update(obs_bdfs)
+            continue
         for obs_bdf in obs_bdfs:
             observed_bdf_to_domains.setdefault(obs_bdf, set()).add(obs_dkey)
     live_root_set = {d_k[2] for d_k in domains}
@@ -1673,55 +1677,71 @@ def _compute_topology_slices(
             live_bus_to_roots.setdefault(parsed_cb, set()).add(
                 inv_c.pcie_root or _pcie_root_complex(inv_c.pci_bdf)
             )
+    candidate_missing_bdfs: set[str] = (
+        (set(chip_id_map or ()) | unplaced_observed_bdfs) - inventory_all_bdfs
+    )
 
     slices: List[_TopologySlice] = []
     for dom_ordinal, (d_key, d_chips) in enumerate(domains.items()):
         # Withhold any NUMA/PCIe slice whose domain lost one or more PCI
         # functions (either unavailable VFIO nodes in live PCI sysfs, PCI
-        # functions previously observed in this boot's domain inventory, or
-        # missing `--chip-id-map` BDFs attributed to this domain) so a degraded
-        # single-root 8-chip v6e domain losing 4 functions can never be
+        # functions previously observed in this boot's domain inventory,
+        # unplaced BDFs upgraded from an older spec lacking domain annotations,
+        # or missing `--chip-id-map` BDFs attributed to this domain) so a
+        # degraded single-root 8-chip v6e domain losing 4 functions can never be
         # republished as a 4-chip slice with fabricated `2,2,1` topology bounds.
-        # Attribution priority for a missing mapped BDF:
+        # Attribution priority for a missing mapped/unplaced-legacy BDF:
         # 1. Exact domain recorded in same-boot `observed_domain_bdfs`.
         # 2. Unambiguous PCIe bridge hierarchy (`bridge_bus_to_roots`) or live
         #    root / shared-bus ancestry.
-        # 3. Fail closed: if a missing mapped BDF cannot be unambiguously
-        #    assigned to any specific PCIe root/domain (e.g. a disappeared
-        #    bridged endpoint on a fresh scan), withhold affected slices rather
-        #    than ignoring it and publishing a `2,2,1` slice.
+        # 3. Fail closed: if a missing BDF cannot be unambiguously assigned to
+        #    any specific PCIe root/domain (e.g. a disappeared bridged endpoint
+        #    on a fresh scan or legacy-spec upgrade), withhold affected slices
+        #    rather than ignoring it and publishing a `2,2,1` slice.
         domain_expected_bdfs = set(inventory_domain_bdfs.get(d_key, set()))
         if observed_domain_bdfs:
             domain_expected_bdfs.update(observed_domain_bdfs.get(d_key, set()))
-        if chip_id_map:
-            for map_bdf in chip_id_map:
-                if map_bdf in inventory_all_bdfs:
-                    continue
-                recorded_domains = observed_bdf_to_domains.get(map_bdf)
-                if recorded_domains:
-                    if d_key in recorded_domains:
-                        domain_expected_bdfs.add(map_bdf)
-                    continue
-                assigned_root: Optional[str] = None
-                parsed_mb = _parse_pci_domain_bus(map_bdf)
-                if parsed_mb is not None and bridge_bus_to_roots:
-                    b_roots = bridge_bus_to_roots.get(parsed_mb)
-                    if b_roots and len(b_roots) == 1:
-                        assigned_root = next(iter(b_roots))
-                if assigned_root is None:
-                    direct_root = _pcie_root_complex(map_bdf)
-                    if direct_root in live_root_set:
-                        assigned_root = direct_root
-                if assigned_root is None and parsed_mb is not None:
-                    sb_roots = live_bus_to_roots.get(parsed_mb)
-                    if sb_roots and len(sb_roots) == 1:
-                        assigned_root = next(iter(sb_roots))
-                if assigned_root is not None:
-                    if assigned_root == d_key[2]:
-                        domain_expected_bdfs.add(map_bdf)
-                else:
-                    # Unassignable missing mapped endpoint: fail closed on this domain.
-                    domain_expected_bdfs.add(map_bdf)
+            # If an older spec recorded a root-level `("pcie", None, root)` domain
+            # that has since gained NUMA locality on this root, fail closed for any
+            # missing BDFs from that root rather than silently dropping them.
+            if d_key[0] == "numa":
+                pcie_upgrade_key = ("pcie", None, d_key[2])
+                if pcie_upgrade_key not in domains and pcie_upgrade_key in observed_domain_bdfs:
+                    domain_expected_bdfs.update(
+                        b
+                        for b in observed_domain_bdfs[pcie_upgrade_key]
+                        if b not in inventory_all_bdfs
+                    )
+        for missing_bdf in candidate_missing_bdfs:
+            recorded_domains = observed_bdf_to_domains.get(missing_bdf)
+            if recorded_domains:
+                if d_key in recorded_domains or (
+                    d_key[0] == "numa"
+                    and ("pcie", None, d_key[2]) in recorded_domains
+                    and ("pcie", None, d_key[2]) not in domains
+                ):
+                    domain_expected_bdfs.add(missing_bdf)
+                continue
+            assigned_root: Optional[str] = None
+            parsed_mb = _parse_pci_domain_bus(missing_bdf)
+            if parsed_mb is not None and bridge_bus_to_roots:
+                b_roots = bridge_bus_to_roots.get(parsed_mb)
+                if b_roots and len(b_roots) == 1:
+                    assigned_root = next(iter(b_roots))
+            if assigned_root is None:
+                direct_root = _pcie_root_complex(missing_bdf)
+                if direct_root in live_root_set:
+                    assigned_root = direct_root
+            if assigned_root is None and parsed_mb is not None:
+                sb_roots = live_bus_to_roots.get(parsed_mb)
+                if sb_roots and len(sb_roots) == 1:
+                    assigned_root = next(iter(sb_roots))
+            if assigned_root is not None:
+                if assigned_root == d_key[2]:
+                    domain_expected_bdfs.add(missing_bdf)
+            else:
+                # Unassignable missing endpoint: fail closed on this domain.
+                domain_expected_bdfs.add(missing_bdf)
         available_domain_bdfs = {c.pci_bdf for c in d_chips}
         if domain_expected_bdfs and not domain_expected_bdfs.issubset(available_domain_bdfs):
             continue
@@ -1854,6 +1874,9 @@ def _format_observed_domain_bdfs(
     return ";".join(parts)
 
 
+_UNPLACED_OBSERVED_DOMAIN_KEY: Tuple[str, Optional[int], str] = ("unplaced", None, "")
+
+
 def _parse_observed_domain_bdfs(
     raw: Any,
 ) -> Dict[Tuple[str, Optional[int], str], set[str]]:
@@ -1869,13 +1892,17 @@ def _parse_observed_domain_bdfs(
         if len(tokens) != 3:
             continue
         kind_tok, numa_tok, root_val = tokens
-        if kind_tok not in ("numa", "pcie") or not root_val:
-            continue
-        numa_val: Optional[int] = None
-        if kind_tok == "numa":
-            if not numa_tok.isdigit():
+        if kind_tok == "unplaced":
+            numa_val = None
+            root_val = ""
+        else:
+            if kind_tok not in ("numa", "pcie") or not root_val:
                 continue
-            numa_val = int(numa_tok, 10)
+            numa_val = None
+            if kind_tok == "numa":
+                if not numa_tok.isdigit():
+                    continue
+                numa_val = int(numa_tok, 10)
         bdfs = {b.strip().lower() for b in bdfs_part.split(",") if b.strip()}
         if bdfs:
             out.setdefault((kind_tok, numa_val, root_val), set()).update(bdfs)
@@ -1895,9 +1922,15 @@ def _extract_observed_domain_bdfs_from_spec(
     if out:
         return out
     # Backward-compatible fallback for specs written without the root annotation.
+    # Never fabricate synthetic authoritative PCIe/NUMA domains from endpoint
+    # buses when a legacy spec lacks `freetpu.dev/pcie-root`; instead keep such
+    # BDFs under `_UNPLACED_OBSERVED_DOMAIN_KEY` so slice generation re-resolves
+    # them against live bridge/NUMA topology and fails closed if unplaceable.
     devices = spec.get("devices")
     if not isinstance(devices, list):
         return out
+    placed_bdfs: set[str] = set()
+    unplaced_bdfs: set[str] = set()
     for dev in devices:
         if not isinstance(dev, dict):
             continue
@@ -1920,11 +1953,12 @@ def _extract_observed_domain_bdfs_from_spec(
             root_val = raw_root.strip().lower()
             d_key = ("numa", numa_val, root_val) if numa_val is not None else ("pcie", None, root_val)
             out.setdefault(d_key, set()).update(bdfs)
-        elif dev.get("name") != "all":
-            for b in bdfs:
-                root_val = _pcie_root_complex(b)
-                d_key = ("numa", numa_val, root_val) if numa_val is not None else ("pcie", None, root_val)
-                out.setdefault(d_key, set()).add(b)
+            placed_bdfs.update(bdfs)
+        else:
+            unplaced_bdfs.update(bdfs)
+    remaining_unplaced = unplaced_bdfs - placed_bdfs
+    if remaining_unplaced:
+        out.setdefault(_UNPLACED_OBSERVED_DOMAIN_KEY, set()).update(remaining_unplaced)
     return out
 
 
@@ -1971,8 +2005,13 @@ def _merge_observed_domain_bdfs(
     merged: Dict[Tuple[str, Optional[int], str], set[str]] = {
         k: set(v) for k, v in (existing or {}).items()
     }
+    unplaced = merged.get(_UNPLACED_OBSERVED_DOMAIN_KEY)
     for chip in inventory:
         merged.setdefault(_topology_domain_key(chip), set()).add(chip.pci_bdf)
+        if unplaced is not None:
+            unplaced.discard(chip.pci_bdf)
+    if unplaced is not None and not unplaced:
+        merged.pop(_UNPLACED_OBSERVED_DOMAIN_KEY, None)
     return merged
 
 

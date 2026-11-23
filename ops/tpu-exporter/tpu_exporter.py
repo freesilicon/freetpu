@@ -867,9 +867,12 @@ def _run_tpu_info(
 
 
 _PY_METRICS_SUBPROCESS_HELPER = (
-    "import importlib, inspect, json, math, sys, tpu_info.device as d, tpu_info.metrics as m\n"
+    "import importlib, inspect, json, math, sys, time, tpu_info.device as d, tpu_info.metrics as m\n"
     "chip_attr, addr, timeout_s = sys.argv[1], sys.argv[2], float(sys.argv[3])\n"
     "layout = sys.argv[4] if len(sys.argv) > 4 else 'auto'\n"
+    "dpc = int(sys.argv[5], 10) if len(sys.argv) > 5 else (2 if chip_attr == 'V7X' else 1)\n"
+    "deadline = time.monotonic() + max(0.001, timeout_s)\n"
+    "serialize_reserve_s = min(0.15, max(0.005, timeout_s * 0.2))\n"
     "chip = getattr(d.TpuChip, chip_attr)\n"
     "def _invoke(fn):\n"
     "    sig = inspect.signature(fn)\n"
@@ -877,9 +880,12 @@ _PY_METRICS_SUBPROCESS_HELPER = (
     "    if 'addr' in sig.parameters:\n"
     "        kw['addr'] = addr\n"
     "    if 'timeout' in sig.parameters:\n"
-    "        kw['timeout'] = timeout_s\n"
+    "        kw['timeout'] = max(0.001, deadline - time.monotonic())\n"
     "    return fn(chip, **kw)\n"
     "def _fetch_raw_duty_resp():\n"
+    "    remaining = deadline - time.monotonic() - serialize_reserve_s\n"
+    "    if remaining <= 0.01:\n"
+    "        return None\n"
     "    try:\n"
     "        grpc_mod = importlib.import_module('grpc')\n"
     "        pb2 = pb2_grpc = None\n"
@@ -913,8 +919,11 @@ _PY_METRICS_SUBPROCESS_HELPER = (
     "                try:\n"
     "                    stub = stub_cls(chan)\n"
     "                    req = req_cls(metric_name='tpu.runtime.tensorcore.dutycycle.percent')\n"
+    "                    rem_rpc = deadline - time.monotonic() - serialize_reserve_s\n"
+    "                    if rem_rpc <= 0.01:\n"
+    "                        return None\n"
     "                    try:\n"
-    "                        return stub.GetRuntimeMetric(req, timeout=timeout_s)\n"
+    "                        return stub.GetRuntimeMetric(req, timeout=rem_rpc)\n"
     "                    except TypeError:\n"
     "                        return stub.GetRuntimeMetric(req)\n"
     "                finally:\n"
@@ -923,14 +932,19 @@ _PY_METRICS_SUBPROCESS_HELPER = (
     "                        close_fn()\n"
     "    except Exception:\n"
     "        pass\n"
+    "    if deadline - time.monotonic() - serialize_reserve_s <= 0.01:\n"
+    "        return None\n"
     "    raw_fn = getattr(m, 'get_metric_data', None)\n"
     "    if callable(raw_fn):\n"
     "        try:\n"
+    "            sig = inspect.signature(raw_fn)\n"
+    "            if 'timeout' in sig.parameters:\n"
+    "                return raw_fn(addr, 'tpu.runtime.tensorcore.dutycycle.percent', timeout=max(0.001, deadline - time.monotonic() - serialize_reserve_s))\n"
     "            return raw_fn(addr, 'tpu.runtime.tensorcore.dutycycle.percent')\n"
     "        except Exception:\n"
     "            return None\n"
     "    return None\n"
-    "def _verify_raw_ironwood_duty(usage_rows, dpc, *, per_chip_mode, require_pigeonhole=False, unjoined_only=False):\n"
+    "def _verify_raw_duty(usage_rows, dev_per_chip, *, per_chip_mode, require_pigeonhole=False, unjoined_only=False, allow_direct_id_fallback=False):\n"
     "    resp = _fetch_raw_duty_resp()\n"
     "    if resp is None:\n"
     "        return None\n"
@@ -980,14 +994,16 @@ _PY_METRICS_SUBPROCESS_HELPER = (
     "        except Exception:\n"
     "            return False\n"
     "    if per_chip_mode:\n"
-    "        expected_hbm = {cid * dpc + off for cid in all_raw_ids for off in range(dpc)}\n"
-    "        if not all_raw_ids or expected_hbm != hbm_ids:\n"
-    "            return ('unjoined', populated_vals) if populated_vals else False\n"
-    "        return (\n"
-    "            'verified',\n"
-    "            {cid * dpc + off: populated_vals[cid] for cid in populated_ids for off in range(dpc)},\n"
-    "            {cid * dpc + off for cid in unset_ids for off in range(dpc)},\n"
-    "        )\n"
+    "        expected_hbm = {cid * dev_per_chip + off for cid in all_raw_ids for off in range(dev_per_chip)}\n"
+    "        if all_raw_ids and expected_hbm == hbm_ids:\n"
+    "            return (\n"
+    "                'verified',\n"
+    "                {cid * dev_per_chip + off: populated_vals[cid] for cid in populated_ids for off in range(dev_per_chip)},\n"
+    "                {cid * dev_per_chip + off for cid in unset_ids for off in range(dev_per_chip)},\n"
+    "            )\n"
+    "        if allow_direct_id_fallback and all_raw_ids and all_raw_ids == hbm_ids:\n"
+    "            return ('verified', dict(populated_vals), unset_ids)\n"
+    "        return ('unjoined', populated_vals) if populated_vals else False\n"
     "    if not all_raw_ids or all_raw_ids != hbm_ids:\n"
     "        return ('unjoined', populated_vals) if populated_vals else False\n"
     "    if require_pigeonhole and len(all_raw_ids) <= 4:\n"
@@ -1000,7 +1016,7 @@ _PY_METRICS_SUBPROCESS_HELPER = (
     "new_fn = getattr(m, 'get_chip_usage_new', None) if chip_attr == 'V7X' else None\n"
     "if chip_attr == 'V7X' and layout == 'per-chip':\n"
     "    rows = _invoke(m.get_chip_usage)\n"
-    "    v_res = _verify_raw_ironwood_duty(rows, 2, per_chip_mode=True)\n"
+    "    v_res = _verify_raw_duty(rows, 2, per_chip_mode=True)\n"
     "    if isinstance(v_res, tuple) and v_res[0] == 'verified':\n"
     "        verified_hbm_vals, unset_hbm_ids = v_res[1], v_res[2]\n"
     "    elif isinstance(v_res, tuple) and v_res[0] == 'unjoined':\n"
@@ -1011,7 +1027,7 @@ _PY_METRICS_SUBPROCESS_HELPER = (
     "elif callable(new_fn):\n"
     "    try:\n"
     "        rows = _invoke(new_fn)\n"
-    "        v_res = _verify_raw_ironwood_duty(\n"
+    "        v_res = _verify_raw_duty(\n"
     "            rows, 2, per_chip_mode=False, require_pigeonhole=(layout == 'auto')\n"
     "        )\n"
     "        if isinstance(v_res, tuple) and v_res[0] == 'verified':\n"
@@ -1024,13 +1040,18 @@ _PY_METRICS_SUBPROCESS_HELPER = (
     "    except (AssertionError, ValueError):\n"
     "        rows = _invoke(m.get_chip_usage)\n"
     "        per_chip_fallback = True\n"
-    "        v_res = _verify_raw_ironwood_duty(\n"
+    "        v_res = _verify_raw_duty(\n"
     "            rows, 2, per_chip_mode=False, unjoined_only=True\n"
     "        )\n"
     "        if isinstance(v_res, tuple) and v_res[0] == 'unjoined':\n"
     "            unjoined_duty_vals = v_res[1]\n"
     "else:\n"
     "    rows = _invoke(m.get_chip_usage)\n"
+    "    v_res = _verify_raw_duty(\n"
+    "        rows, max(1, dpc), per_chip_mode=(dpc > 1), allow_direct_id_fallback=(dpc > 1)\n"
+    "    )\n"
+    "    if isinstance(v_res, tuple) and v_res[0] == 'verified':\n"
+    "        verified_hbm_vals, unset_hbm_ids = v_res[1], v_res[2]\n"
     "out = []\n"
     "seen_out_ids = set()\n"
     "for r in (rows or []):\n"
@@ -1105,22 +1126,26 @@ def _verify_raw_python_per_chip_duty(
     per_chip_mode: bool = True,
     require_pigeonhole: bool = False,
     unjoined_only: bool = False,
+    allow_direct_id_fallback: bool = False,
     timeout_s: float = 0.5,
 ) -> Union[Tuple[str, Dict[int, float], set[int]], Tuple[str, Dict[int, float]], bool, None]:
     """Verify raw `tensorcore.dutycycle` IDs and populated protobuf gauges via upstream
     `RuntimeMetricServiceStub.GetRuntimeMetric` (with optional `get_metric_data` fallback).
 
     Returns:
-      - `(verified_hbm_ids, unset_hbm_ids)` when raw duty IDs match HBM core IDs
-        1:1 (expanding `chip_id * devices_per_chip + offset` when
+      - `('verified', verified_hbm_vals, unset_hbm_ids)` when raw duty IDs match
+        HBM core IDs 1:1 (expanding `chip_id * devices_per_chip + offset` when
         `per_chip_mode=True`, or direct `all_raw_ids == hbm_ids` when
-        `per_chip_mode=False`). Genuine populated `0.0` gauges are included in
-        `verified_hbm_ids`; unset/invalid gauges are included in `unset_hbm_ids`.
-      - `False` when raw duty data is queried and mismatches HBM core IDs.
+        `per_chip_mode=False` or `allow_direct_id_fallback=True`). Genuine
+        populated `0.0` gauges are included in `verified_hbm_vals`; unset/invalid
+        gauges are included in `unset_hbm_ids`.
+      - `False` or `('unjoined', populated_vals)` when raw duty data is queried
+        and mismatches HBM core IDs.
       - `None` when neither `RuntimeMetricServiceStub` nor `get_metric_data` is
         available or the raw RPC raises.
     """
     resp: Any = None
+    rpc_deadline = time.monotonic() + max(0.001, float(timeout_s))
     mods = _load_grpc_runtime_modules()
     if mods is not None:
         grpc_mod, pb2, pb2_grpc = mods
@@ -1140,20 +1165,32 @@ def _verify_raw_python_per_chip_duty(
                         channel = ichan(addr)
                 stub = stub_cls(channel)
                 req = req_cls(metric_name="tpu.runtime.tensorcore.dutycycle.percent")
-                try:
-                    resp = stub.GetRuntimeMetric(req, timeout=max(0.001, float(timeout_s)))
-                except TypeError:
-                    resp = stub.GetRuntimeMetric(req)
+                rem = rpc_deadline - time.monotonic()
+                if rem > 0.01:
+                    try:
+                        resp = stub.GetRuntimeMetric(req, timeout=rem)
+                    except TypeError:
+                        resp = stub.GetRuntimeMetric(req)
             except Exception:  # noqa: BLE001
                 resp = None
-    if resp is None:
+    if resp is None and (rpc_deadline - time.monotonic()) > 0.01:
         raw_fn = getattr(metrics_mod, "get_metric_data", None)
         if not callable(raw_fn):
             return None
         try:
-            resp = raw_fn(addr, "tpu.runtime.tensorcore.dutycycle.percent")
+            sig = inspect.signature(raw_fn)
+            if "timeout" in sig.parameters:
+                resp = raw_fn(
+                    addr,
+                    "tpu.runtime.tensorcore.dutycycle.percent",
+                    timeout=max(0.001, rpc_deadline - time.monotonic()),
+                )
+            else:
+                resp = raw_fn(addr, "tpu.runtime.tensorcore.dutycycle.percent")
         except Exception:  # noqa: BLE001
             return None
+    if resp is None:
+        return None
     metric_obj = getattr(resp, "metric", None)
     entries = getattr(metric_obj, "metrics", None) if metric_obj is not None else None
     if not entries:
@@ -1200,17 +1237,19 @@ def _verify_raw_python_per_chip_duty(
             for cid in all_raw_ids
             for off in range(devices_per_chip)
         }
-        if not all_raw_ids or expected_hbm != hbm_ids:
-            return ("unjoined", populated_vals) if populated_vals else False
-        return (
-            "verified",
-            {
-                cid * devices_per_chip + off: populated_vals[cid]
-                for cid in populated_ids
-                for off in range(devices_per_chip)
-            },
-            {cid * devices_per_chip + off for cid in unset_ids for off in range(devices_per_chip)},
-        )
+        if all_raw_ids and expected_hbm == hbm_ids:
+            return (
+                "verified",
+                {
+                    cid * devices_per_chip + off: populated_vals[cid]
+                    for cid in populated_ids
+                    for off in range(devices_per_chip)
+                },
+                {cid * devices_per_chip + off for cid in unset_ids for off in range(devices_per_chip)},
+            )
+        if allow_direct_id_fallback and all_raw_ids and all_raw_ids == hbm_ids:
+            return ("verified", dict(populated_vals), unset_ids)
+        return ("unjoined", populated_vals) if populated_vals else False
     if not all_raw_ids or all_raw_ids != hbm_ids:
         return ("unjoined", populated_vals) if populated_vals else False
     # On Ironwood (`V7X`, max 4 physical chips per VM) in `auto` layout,
@@ -1374,6 +1413,8 @@ def _query_tpu_info_python_metrics(
 
         box: Dict[str, Any] = {}
         done_ev = threading.Event()
+        worker_deadline = time.monotonic() + deadline_s
+        serialize_reserve_s = min(0.15, max(0.005, deadline_s * 0.2))
 
         def _invoke_mock(fn: Any) -> Any:
             sig = inspect.signature(fn)
@@ -1381,20 +1422,28 @@ def _query_tpu_info_python_metrics(
             if "addr" in sig.parameters:
                 kw["addr"] = addr
             if "timeout" in sig.parameters:
-                kw["timeout"] = deadline_s
+                kw["timeout"] = max(0.001, worker_deadline - time.monotonic())
             return fn(chip_type, **kw)
+
+        def _duty_rem() -> float:
+            return worker_deadline - time.monotonic() - serialize_reserve_s
 
         def _worker() -> None:
             try:
                 if chip_attr == "V7X" and grpc_duty_layout == "per-chip" and callable(get_chip_usage_legacy):
                     box["rows"] = _invoke_mock(get_chip_usage_legacy)
-                    v_res = _verify_raw_python_per_chip_duty(
-                        cached_metrics_mod,
-                        addr,
-                        box["rows"] or [],
-                        inferred_dpc,
-                        per_chip_mode=True,
-                        timeout_s=deadline_s,
+                    rem = _duty_rem()
+                    v_res = (
+                        _verify_raw_python_per_chip_duty(
+                            cached_metrics_mod,
+                            addr,
+                            box["rows"] or [],
+                            inferred_dpc,
+                            per_chip_mode=True,
+                            timeout_s=rem,
+                        )
+                        if rem > 0.01
+                        else None
                     )
                     if isinstance(v_res, tuple) and v_res[0] == "verified":
                         box["verified_hbm_vals"], box["unset_hbm_ids"] = v_res[1], v_res[2]
@@ -1406,14 +1455,19 @@ def _query_tpu_info_python_metrics(
                 elif callable(get_chip_usage_new):
                     try:
                         box["rows"] = _invoke_mock(get_chip_usage_new)
-                        v_res = _verify_raw_python_per_chip_duty(
-                            cached_metrics_mod,
-                            addr,
-                            box["rows"] or [],
-                            inferred_dpc,
-                            per_chip_mode=False,
-                            require_pigeonhole=(grpc_duty_layout == "auto"),
-                            timeout_s=deadline_s,
+                        rem = _duty_rem()
+                        v_res = (
+                            _verify_raw_python_per_chip_duty(
+                                cached_metrics_mod,
+                                addr,
+                                box["rows"] or [],
+                                inferred_dpc,
+                                per_chip_mode=False,
+                                require_pigeonhole=(grpc_duty_layout == "auto"),
+                                timeout_s=rem,
+                            )
+                            if rem > 0.01
+                            else None
                         )
                         if isinstance(v_res, tuple) and v_res[0] == "verified":
                             box["verified_hbm_vals"], box["unset_hbm_ids"] = v_res[1], v_res[2]
@@ -1426,14 +1480,19 @@ def _query_tpu_info_python_metrics(
                         if callable(get_chip_usage_legacy):
                             box["rows"] = _invoke_mock(get_chip_usage_legacy)
                             box["per_chip_fallback"] = True
-                            v_res = _verify_raw_python_per_chip_duty(
-                                cached_metrics_mod,
-                                addr,
-                                box["rows"] or [],
-                                inferred_dpc,
-                                per_chip_mode=False,
-                                unjoined_only=True,
-                                timeout_s=deadline_s,
+                            rem = _duty_rem()
+                            v_res = (
+                                _verify_raw_python_per_chip_duty(
+                                    cached_metrics_mod,
+                                    addr,
+                                    box["rows"] or [],
+                                    inferred_dpc,
+                                    per_chip_mode=False,
+                                    unjoined_only=True,
+                                    timeout_s=rem,
+                                )
+                                if rem > 0.01
+                                else None
                             )
                             if isinstance(v_res, tuple) and v_res[0] == "unjoined":
                                 box["unjoined_duty_by_id"] = v_res[1]
@@ -1441,6 +1500,22 @@ def _query_tpu_info_python_metrics(
                             raise
                 else:
                     box["rows"] = _invoke_mock(get_chip_usage_legacy)
+                    rem = _duty_rem()
+                    v_res = (
+                        _verify_raw_python_per_chip_duty(
+                            cached_metrics_mod,
+                            addr,
+                            box["rows"] or [],
+                            inferred_dpc,
+                            per_chip_mode=(inferred_dpc > 1),
+                            allow_direct_id_fallback=(inferred_dpc > 1),
+                            timeout_s=rem,
+                        )
+                        if rem > 0.01
+                        else None
+                    )
+                    if isinstance(v_res, tuple) and v_res[0] == "verified":
+                        box["verified_hbm_vals"], box["unset_hbm_ids"] = v_res[1], v_res[2]
             except Exception as exc:  # noqa: BLE001
                 box["error"] = exc
             finally:
@@ -1482,6 +1557,7 @@ def _query_tpu_info_python_metrics(
                 addr,
                 str(deadline_s),
                 grpc_duty_layout,
+                str(inferred_dpc),
             ],
             timeout_s=deadline_s,
         )
@@ -2459,13 +2535,16 @@ def discover_tpu_devices(
                 else:
                     same_group_exclusive = (
                         driver == "vfio-pci"
+                        and existing.driver == "vfio-pci"
                         and bool(iommu_group)
                         and group_dir_readable.get(iommu_group, False)
                         and full_members <= {existing.pci_bdf, entry.name}
                     )
                     existing.vfio_group_exclusive = (
-                        existing.vfio_group_exclusive and same_group_exclusive
+                        same_group_exclusive and not existing.unverified_sibling_vfio
                     )
+                    if not same_group_exclusive:
+                        existing.unverified_sibling_vfio = True
                 continue
 
         chip = TpuTelemetry(
@@ -2756,18 +2835,9 @@ def _sanitize_fallback_duty_rows(
                 copied.duty_cycle_percent = None
             stripped[k] = copied
         working = stripped
-    # Restrict the Ironwood positional-zip guard strictly to hosts with
-    # Ironwood (`tpu7x`) devices; sidecars without PCI inventory and legacy
-    # `v2`/`v3`/`v4`/`v5e`/`v5p`/`v6e` hosts preserve fallback duty readings.
-    if not any(d.generation == "tpu7x" for d in devices):
-        return working
-    inferred_dpc = _infer_devices_per_chip(devices)
-    if inferred_dpc is None or inferred_dpc <= 1:
-        return working
-
-    def _strip_unverified_ironwood_zeros(src_rows: Dict[str, _TpuInfoRow]) -> Dict[str, _TpuInfoRow]:
+    def _strip_unverified_zeros(src_rows: Dict[str, _TpuInfoRow]) -> Dict[str, _TpuInfoRow]:
         """Clear `0.0` duty readings whose protobuf gauge presence was not verified
-        so stock `tpu-info` / `get_chip_usage_new()` / `get_chip_usage()` reading
+        so stock `tpu-info` / `get_chip_usage()` / `get_chip_usage_new()` reading
         unset protobuf defaults as `0.0` can never trigger `TpuMxuDutyCycleCollapse`."""
         cleaned: Dict[str, _TpuInfoRow] = {}
         for k, r in src_rows.items():
@@ -2779,6 +2849,17 @@ def _sanitize_fallback_duty_rows(
                 copied.duty_cycle_percent = None
             cleaned[k] = copied
         return cleaned
+
+    # Strip unverified `0.0%` fallback duty readings across ALL TPU generations
+    # (and PCI-less sidecars) so an unset protobuf gauge default cannot publish
+    # a false `0.0%` collapse reading when direct gRPC is unavailable. Genuine
+    # populated `0.0%` gauges verified via `RuntimeMetricServiceStub` set
+    # `duty_ids_verified=True` and are preserved.
+    if not any(d.generation == "tpu7x" for d in devices):
+        return _strip_unverified_zeros(working)
+    inferred_dpc = _infer_devices_per_chip(devices)
+    if inferred_dpc is None or inferred_dpc <= 1:
+        return _strip_unverified_zeros(working)
 
     raw_duty_rows = [
         (k, _parse_runtime_device_id(k))
@@ -2800,7 +2881,7 @@ def _sanitize_fallback_duty_rows(
         if duty_rows and all(r.duty_ids_verified for r in duty_rows):
             return working
         if len(raw_duty_rows) == 8 and raw_duty_ids == set(range(8)):
-            return _strip_unverified_ironwood_zeros(working)
+            return _strip_unverified_zeros(working)
         sanitized_pc: Dict[str, _TpuInfoRow] = {}
         for k, r in working.items():
             copied = _copy_tpu_info_row(r)
@@ -2825,7 +2906,7 @@ def _sanitize_fallback_duty_rows(
         and len(raw_duty_rows) == 8
         and raw_duty_ids == set(range(8))
     ):
-        return _strip_unverified_ironwood_zeros(working)
+        return _strip_unverified_zeros(working)
 
     expected_core_count: Optional[int] = None
     verified_chips = _verified_dual_function_chip_count(devices, inferred_dpc)
@@ -2841,7 +2922,7 @@ def _sanitize_fallback_duty_rows(
             if pid is not None
         }
         if duty_ids == set(range(expected_core_count)):
-            return _strip_unverified_ironwood_zeros(working)
+            return _strip_unverified_zeros(working)
 
     sanitized: Dict[str, _TpuInfoRow] = {}
     for k, r in working.items():

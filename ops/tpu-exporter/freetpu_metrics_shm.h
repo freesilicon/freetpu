@@ -17,15 +17,23 @@
  *   (e.g. /run/freetpu-metrics/freetpu_metrics_0000:00:06.0)
  *
  * Concurrency & freshness protocol (lockless SeqLock, single writer / multi-reader):
- *   1. Before mutating payload fields, increment `seq` to an odd value with
- *      acquire-release ordering (e.g. `__atomic_fetch_add(&s->seq, 1u, __ATOMIC_ACQ_REL)`
- *      on GCC/Clang, or call `freetpu_shm_metrics_v1_publish()` below).
- *   2. Write `hbm_allocated_bytes`, `hbm_used_bytes`, `mxu_active_cycles`,
- *      `dma_bytes_transferred`, and `timestamp_ns` (CLOCK_REALTIME Unix epoch
- *      nanoseconds heartbeat; writers MUST refresh `timestamp_ns` periodically
- *      while alive and unlink or stop refreshing on exit).
- *   3. Increment `seq` to the next even value with release ordering
- *      (`__atomic_fetch_add(&s->seq, 1u, __ATOMIC_RELEASE)`).
+ *   Writers SHOULD call `freetpu_shm_metrics_v1_publish()` below, which recovers
+ *   safely even if a prior publisher crashed mid-write and left `seq` odd on a
+ *   reused file. Manual writers MUST NOT assume `seq` starts even (blindly
+ *   performing two `+1` increments leaves a crash-retained odd `seq` odd forever):
+ *   1. Load `cur = __atomic_load_n(&s->seq, __ATOMIC_RELAXED)`, compute the
+ *      next strictly greater odd value `dirty = (cur + 1u) | 1u`, store
+ *      `s->seq = dirty` (`__ATOMIC_RELAXED`), and issue
+ *      `__atomic_thread_fence(__ATOMIC_ACQ_REL)` before mutating payload fields
+ *      (guaranteeing an odd counter regardless of whether `cur` started even or
+ *      was left odd by a crashed writer).
+ *   2. Write `magic`, `version`, `hbm_allocated_bytes`, `hbm_used_bytes`,
+ *      `mxu_active_cycles`, `dma_bytes_transferred`, and `timestamp_ns`
+ *      (CLOCK_REALTIME Unix epoch nanoseconds heartbeat; writers MUST refresh
+ *      `timestamp_ns` periodically while alive and unlink or stop refreshing on
+ *      exit).
+ *   3. Store `dirty + 1u` (guaranteed even) to `s->seq` with release ordering
+ *      (`__atomic_store_n(&s->seq, dirty + 1u, __ATOMIC_RELEASE)`).
  *
  * Readers (`ops/tpu-exporter/tpu_exporter.py`) open the publisher directory
  * with `O_DIRECTORY | O_NOFOLLOW` and verify trusted owner UID and non-group/
