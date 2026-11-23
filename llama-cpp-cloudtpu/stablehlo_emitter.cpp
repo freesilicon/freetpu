@@ -1135,7 +1135,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                         if (is_q4_factored) {
                             // Factored S4 decode/small-batch path (M <= 32):
                             //   dot_b = dot_general(x_blk, qs_mm) -> [B3, B2, NB_local, M, N_local]
-                            //   acc   = sum_nb(dot_b * d) + (Q4_K ? dot_general(xsum, m) : 0)
+                            //   acc   = sum_nb(((dot_b + 8*xsum) * d) + (Q4_K ? xsum * m : 0))
                             const PjrtDType target_4bit =
                                 (w_th.bitcast_target != PjrtDType::INVALID) ? w_th.bitcast_target : PjrtDType::S4;
                             SsaValue qs_eff = materialize_q4_i4_nibbles(builder, w_th.q_qs, target_4bit, N_local);
@@ -1185,19 +1185,19 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                             SsaValue d_f32 = builder.emit_convert(d_km, PjrtDType::F32);
                             SsaValue d_b = builder.emit_broadcast_in_dim(d_f32, {0, 1, 2, 4}, dot_b_dims);
                             SsaValue scaled = builder.emit_binary("stablehlo.multiply", dot_b, d_b);
-                            SsaValue acc = builder.emit_reduce_axis(scaled, zero_f32, 2, "stablehlo.add");
-
                             if (w_th.storage == TensorStorageKind::Q4_K_I4 && w_th.has_q_m) {
+                                // Apply each sub-block's minimum offset (xsum * m) in F32 BEFORE reducing
+                                // across blocks NB_local so a large-scale cancelling block (e.g. d=2^20,
+                                // m=-2^20) cannot swamp another block's contribution during F32 reduction.
                                 SsaValue m_km = w_th.q_m;
                                 bcast_w4_batch(m_km);
-                                // Always keep the minimum offset correction dot in F32 (HIGHEST precision) so
-                                // both (dot_b + 8*xsum) * d and xsum @ m share the exact same F32 activation sum.
                                 SsaValue m_f32 = builder.emit_convert(m_km, PjrtDType::F32);
-                                SsaValue m_dot = builder.emit_dot_general(
-                                    xsum, m_f32, {0, 1}, {0, 1}, {3}, {2},
-                                    dot_out_dims, PjrtDType::F32, /*high_precision=*/true);
-                                acc = builder.emit_binary("stablehlo.add", acc, m_dot);
+                                SsaValue m_b = builder.emit_broadcast_in_dim(m_f32, {0, 1, 2, 4}, dot_b_dims);
+                                SsaValue xsum_b = builder.emit_broadcast_in_dim(xsum, {0, 1, 3, 2}, dot_b_dims);
+                                SsaValue m_term = builder.emit_binary("stablehlo.multiply", xsum_b, m_b);
+                                scaled = builder.emit_binary("stablehlo.add", scaled, m_term);
                             }
+                            SsaValue acc = builder.emit_reduce_axis(scaled, zero_f32, 2, "stablehlo.add");
                             local_out = builder.emit_convert(acc, op.dst.dtype);
                         } else {
                             // Large-batch prefill path (M > 32): in-loop S4 dequant -> reshape [..., K, N] -> single dot_general.

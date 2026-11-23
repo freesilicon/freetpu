@@ -2433,8 +2433,10 @@ void test_q4_i4_single_read_matmul_and_bitcast(cloudtpu::PjrtRuntime& rt) {
             spec.output_ids = {3};
 
             const auto prog = cloudtpu::emit_stablehlo_program(spec);
-            CHECK_TRUE(prog.mlir_text.find("precision = [HIGHEST, HIGHEST]") != std::string::npos,
-                       "Q4_K_I4 F32-scale offset correction dot must emit F32 HIGHEST precision");
+            const size_t first_dot = prog.mlir_text.find("stablehlo.dot_general");
+            CHECK_TRUE(first_dot != std::string::npos &&
+                           prog.mlir_text.find("stablehlo.dot_general", first_dot + 1) == std::string::npos,
+                       "Q4_K_I4 factored path must apply per-block xsum*m before block reduction (no second dot_general)");
             const auto got = run_emitted(rt, prog, {bqs, bd, bm, bx});
             CHECK_TRUE(got.size() == static_cast<size_t>(M * N), "Q4_K_I4 exact-m output size");
             for (size_t i = 0; i < got.size(); ++i) {
@@ -2505,7 +2507,7 @@ void test_q4_i4_single_read_matmul_and_bitcast(cloudtpu::PjrtRuntime& rt) {
                     CHECK_TRUE(prog.mlir_text.find("precision = [DEFAULT, DEFAULT]") == std::string::npos,
                                "Q4_K_I4 F32 path (CLOUDTPU_MATMUL_BF16=0) must emit HIGHEST precision on dot_b");
                     CHECK_TRUE(prog.mlir_text.find("precision = [HIGHEST, HIGHEST]") != std::string::npos,
-                               "Q4_K_I4 F32 path must use HIGHEST precision for dot_b and m_dot");
+                               "Q4_K_I4 F32 path must use HIGHEST precision for dot_b");
                 } else {
                     CHECK_TRUE(
                         prog.mlir_text.find("(tensor<1x1x8x8x32xbf16>) -> tensor<1x1x8x8x32xf32>") != std::string::npos,
@@ -2516,6 +2518,53 @@ void test_q4_i4_single_read_matmul_and_bitcast(cloudtpu::PjrtRuntime& rt) {
                 for (float v : got) {
                     CHECK_TRUE(v == 0.0f,
                                "Q4_K_I4 zero-nibble dot_b and 8*xsum must cancel identically to 0.0f");
+                }
+            }
+        }
+
+        // (d) Cross-block cancellation regression:
+        //     Block 0 has 32 unit activations, u4=1 (s4=-7), d=2^20, m=-2^20 -> net block value 0.
+        //     Block 1 has 32 unit activations, u4=1 (s4=-7), d=1/32, m=0     -> net block value 1.0f.
+        //     Remaining blocks have d=0, m=0. Reducing d*dot_u4 before adding xsum*m would round
+        //     2^25 + 1 -> 2^25 in F32 and return 0.0f; per-block offset addition preserves exact 1.0f!
+        {
+            std::vector<int8_t> qs_one(static_cast<size_t>(NB * 32 * N), static_cast<int8_t>(-7));  // u4 = 1
+            std::vector<float> d_blk(static_cast<size_t>(NB * N), 0.0f);
+            std::vector<float> m_blk(static_cast<size_t>(NB * N), 0.0f);
+            for (int64_t n = 0; n < N; ++n) {
+                d_blk[static_cast<size_t>(0 * N + n)] = std::ldexp(1.0f, 20);
+                m_blk[static_cast<size_t>(0 * N + n)] = -std::ldexp(1.0f, 20);
+                d_blk[static_cast<size_t>(1 * N + n)] = 1.0f / 32.0f;
+                m_blk[static_cast<size_t>(1 * N + n)] = 0.0f;
+            }
+            std::vector<float> x_ones(static_cast<size_t>(M * K), 0.0f);
+            for (int64_t k = 0; k < 64; ++k) {
+                x_ones[static_cast<size_t>(k)] = 1.0f;
+            }
+            auto bqs = rt.buffer_from_host(0, qs_one.data(), cloudtpu::PjrtDType::S4, {1, 1, NB, 32, N});
+            auto bd = rt.buffer_from_host(0, d_blk.data(), cloudtpu::PjrtDType::F32, {1, 1, NB, N});
+            auto bm = rt.buffer_from_host(0, m_blk.data(), cloudtpu::PjrtDType::F32, {1, 1, NB, N});
+            auto bx = rt.buffer_from_host(0, x_ones.data(), cloudtpu::PjrtDType::F32, {1, 1, M, K});
+
+            for (bool bf16_mm : {false, true}) {
+                cloudtpu::GraphProgramSpec cspec;
+                cspec.bf16_matmul = bf16_mm;
+                cloudtpu::TensorSpec w_spec{1, cloudtpu::PjrtDType::S4, cloudtpu::TensorStorageKind::Q4_K_I4, {1, 1, N, K}};
+                w_spec.scale_dtype = cloudtpu::PjrtDType::F32;
+                cspec.inputs.push_back(w_spec);
+                cspec.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, K}});
+                cloudtpu::OpNodeSpec mm;
+                mm.kind = cloudtpu::CloudOpKind::MUL_MAT;
+                mm.src_ids = {1, 2};
+                mm.dst = {3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, N}};
+                cspec.ops.push_back(mm);
+                cspec.output_ids = {3};
+
+                const auto got = run_emitted(rt, cloudtpu::emit_stablehlo_program(cspec), {bqs, bd, bm, bx});
+                CHECK_TRUE(got.size() == static_cast<size_t>(M * N), "Q4_K_I4 cross-block cancellation output size");
+                for (float v : got) {
+                    CHECK_TRUE(v == 1.0f,
+                               "Q4_K_I4 per-block minimum offset must cancel block 0 before reducing across blocks (exact 1.0f)");
                 }
             }
         }
