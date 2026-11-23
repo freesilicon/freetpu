@@ -80,7 +80,7 @@ from router.tpu_telemetry import (  # noqa: E402
 
 __version__ = "0.1.0"
 
-RETRYABLE_STATUS_CODES = (429, 500, 502, 503, 504)
+RETRYABLE_STATUS_CODES = (401, 429, 500, 502, 503, 504)
 UNKNOWN_MODEL_LABEL = "_unknown"
 OTHER_MODEL_LABEL = "_other"
 MAX_METRIC_MODEL_LABELS = 256
@@ -1316,7 +1316,6 @@ _NON_RETRYABLE_SSE_ERROR_TYPES = frozenset(
     {
         "invalid_request_error",
         "bad_request_error",
-        "authentication_error",
         "permission_error",
         "not_found_error",
         "unprocessable_entity_error",
@@ -1328,7 +1327,6 @@ _NON_RETRYABLE_SSE_ERROR_CODES = frozenset(
         "invalid_request_error",
         "bad_request",
         "model_not_found",
-        "invalid_api_key",
     }
 )
 
@@ -1439,7 +1437,11 @@ def _classify_sse_error_event(
     err_type = str(err_mapping.get("type") or "").strip().lower()
     err_code = str(err_mapping.get("code") or "").strip().lower()
     is_client_error = (
-        (raw_status is not None and 400 <= raw_status < 500 and raw_status != 429)
+        (
+            raw_status is not None
+            and 400 <= raw_status < 500
+            and raw_status not in (401, 429)
+        )
         or err_type in _NON_RETRYABLE_SSE_ERROR_TYPES
         or err_code in _NON_RETRYABLE_SSE_ERROR_CODES
     )
@@ -1450,7 +1452,7 @@ def _classify_sse_error_event(
     else:
         status_code = (
             raw_status
-            if (raw_status is not None and (500 <= raw_status <= 599 or raw_status == 429))
+            if (raw_status is not None and (500 <= raw_status <= 599 or raw_status in (401, 429)))
             else 502
         )
         is_retryable = True
@@ -1643,6 +1645,9 @@ class BackendState:
         if not self.config.enabled:
             self.healthy = False
             self.unhealthy_reason = "disabled"
+        elif self.config.tpu_exporter_url:
+            self.healthy = False
+            self.unhealthy_reason = "tpu_readiness_pending"
 
     def effective_models(self) -> List[str]:
         if self.config.discover_models and self.discovery_succeeded:
@@ -1966,6 +1971,15 @@ class RouterEngine:
             thread.join(timeout=2.0)
 
     def _poll_loop(self) -> None:
+        needs_initial = any(
+            b.config.enabled and b.last_probe_unix is None for b in self._backends
+        )
+        if needs_initial and not self._stop_event.is_set():
+            try:
+                self.refresh_all_backends()
+                self.check_idle_backends()
+            except Exception:
+                pass
         while not self._stop_event.wait(self.config.health_poll_interval_s):
             try:
                 self.refresh_all_backends()

@@ -14628,7 +14628,7 @@ asyncio.run(main())
             self.assertEqual(st2, 200)
             self.assertEqual(len(recorded_usage), 2)
             self.assertIsNone(recorded_usage[1].ttft_ms)
-            self.assertNotIn("freetpu_router_ttft_ms_count", router.engine.metrics_text())
+            self.assertNotIn("freetpu_router_ttft_seconds_count", router.engine.metrics_text())
 
             # 3. Echoed prefix followed 150ms later by generated token: TTFT waits for the
             #    generated token (>= 120ms), NOT the immediate echoed prefix.
@@ -14652,6 +14652,10 @@ asyncio.run(main())
             self.assertIsNotNone(recorded_usage[2].ttft_ms)
             assert recorded_usage[2].ttft_ms is not None
             self.assertGreaterEqual(recorded_usage[2].ttft_ms, 120.0)
+            self.assertIn(
+                'freetpu_router_ttft_seconds_count{model="m-ttft",backend_id="ttft-backend"} 1',
+                router.engine.metrics_text(),
+            )
 
             # 4. Phase 1 arrival timestamp is preserved even if header emission / replay is slow.
             mode[0] = "prompt_progress_then_gen"
@@ -14685,9 +14689,165 @@ asyncio.run(main())
             self.assertGreaterEqual(ev4.latency_ms, 140.0)
             # TTFT was captured at Phase 1 arrival BEFORE the 150ms header/replay stall.
             self.assertLess(ev4.ttft_ms, ev4.latency_ms - 100.0)
+            self.assertIn(
+                'freetpu_router_ttft_seconds_count{model="m-ttft",backend_id="ttft-backend"} 2',
+                router.engine.metrics_text(),
+            )
         finally:
             srv.shutdown()
             srv.server_close()
+
+    def test_upstream_http_401_fails_over_to_healthy_secondary_while_client_401_stays_immediate(
+        self,
+    ) -> None:
+        bad_key_primary = self._track(
+            _MockOpenAIBackend("auth-401-primary", ["m-401"], status_code=200)
+        )
+        good_backup = self._track(
+            _MockOpenAIBackend("auth-401-backup", ["m-401"], status_code=200)
+        )
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            failure_cooldown_s=30.0,
+            auth={"type": "bearer", "tokens": ["router-client-secret"]},
+            backends=[
+                BackendConfig(
+                    id="auth-401-primary",
+                    local=True,
+                    base_url=bad_key_primary.base_url,
+                    models=["m-401"],
+                ),
+                BackendConfig(
+                    id="auth-401-backup",
+                    local=False,
+                    base_url=good_backup.base_url,
+                    models=["m-401"],
+                ),
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+        bad_key_primary.status_code = 401
+
+        # 1. Invalid client bearer token still gets immediate 401 from router without touching backends.
+        st_unauth, _, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={"model": "m-401", "messages": [{"role": "user", "content": "hi"}]},
+            headers={"Authorization": "Bearer wrong-client-token"},
+        )
+        self.assertEqual(st_unauth, 401)
+        self.assertEqual(len(good_backup.requests_seen), 0)
+
+        # 2. Valid client token: upstream 401 from primary fails over to healthy secondary.
+        st_ok, hdrs_ok, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={"model": "m-401", "messages": [{"role": "user", "content": "hi"}]},
+            headers={"Authorization": "Bearer router-client-secret"},
+        )
+        self.assertEqual(st_ok, 200)
+        self.assertEqual(hdrs_ok.get("x-freetpu-backend"), "auth-401-backup")
+        self.assertEqual(hdrs_ok.get("x-freetpu-failovers"), "1")
+        self.assertEqual(router.engine._backends[0].total_failures, 1)
+
+    def test_no_initial_probe_holds_exporter_gated_backend_unready_until_first_scrape(
+        self,
+    ) -> None:
+        allow_exporter = threading.Event()
+        exporter_calls = [0]
+
+        class _GatedExporterHandler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                pass
+
+            def do_GET(self) -> None:  # noqa: N802
+                exporter_calls[0] += 1
+                allow_exporter.wait(timeout=3.0)
+                body = (
+                    b"freetpu_exporter_up 1\n"
+                    b"freetpu_tpu_devices_discovered 1\n"
+                    b'freetpu_tpu_health_status{chip="0"} 1\n'
+                    b'freetpu_tpu_hbm_utilization_ratio{chip="0"} 0.2\n'
+                )
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        exp_srv = ThreadingHTTPServer(("127.0.0.1", 0), _GatedExporterHandler)
+        threading.Thread(target=exp_srv.serve_forever, daemon=True).start()
+        tpu_backend = self._track(_MockOpenAIBackend("tpu-async-start", ["m-async"]))
+        try:
+            cfg = RouterConfig(
+                host="127.0.0.1",
+                port=0,
+                health_poll_interval_s=60.0,
+                probe_timeout_s=2.0,
+                backends=[
+                    BackendConfig(
+                        id="tpu-async-start",
+                        base_url=tpu_backend.base_url,
+                        models=["m-async"],
+                        tpu_exporter_url=f"http://127.0.0.1:{exp_srv.server_address[1]}/metrics",
+                    )
+                ],
+            )
+            router = self._track(create_router_server(cfg, probe_on_start=False))
+            rport = router.server_address[1]
+
+            # Before exporter readiness completes, /health is 503 and inference must not route to it.
+            st_h, _, bd_h = _http_request(rport, "GET", "/health")
+            self.assertEqual(st_h, 503)
+            self.assertIn(b"tpu_readiness_pending", bd_h)
+            st_inf, _, _ = _http_request(
+                rport,
+                "POST",
+                "/v1/chat/completions",
+                body={
+                    "model": "m-async",
+                    "messages": [{"role": "user", "content": "too early"}],
+                },
+            )
+            self.assertEqual(st_inf, 503)
+            self.assertEqual(len(tpu_backend.requests_seen), 0)
+
+            # Once exporter responds, immediate async startup poll marks backend ready without waiting 60s.
+            allow_exporter.set()
+            deadline = time.monotonic() + 2.0
+            became_ready = False
+            while time.monotonic() < deadline:
+                st_now, _, _ = _http_request(rport, "GET", "/health")
+                if st_now == 200:
+                    became_ready = True
+                    break
+                time.sleep(0.05)
+            self.assertTrue(
+                became_ready,
+                "Async startup poll did not mark exporter-gated backend ready promptly",
+            )
+            self.assertGreaterEqual(exporter_calls[0], 1)
+
+            st_ok, hdrs_ok, _ = _http_request(
+                rport,
+                "POST",
+                "/v1/chat/completions",
+                body={
+                    "model": "m-async",
+                    "messages": [{"role": "user", "content": "now ready"}],
+                },
+            )
+            self.assertEqual(st_ok, 200)
+            self.assertEqual(hdrs_ok.get("x-freetpu-backend"), "tpu-async-start")
+        finally:
+            allow_exporter.set()
+            exp_srv.shutdown()
+            exp_srv.server_close()
 
 
 def run_self_tests(verbosity: int = 1) -> int:
