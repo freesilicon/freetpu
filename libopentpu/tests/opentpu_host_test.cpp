@@ -2225,6 +2225,120 @@ static void test_pjrt_multidevice_isolation_and_topology() {
     check_live_visible_rejected(neg1, 1);
   }
 
+  // 5. Setting ONLY OPENTPU_MOCK_TOPOLOGY=tpu7x-1t (with OPENTPU_MOCK_CHIP unset) must configure
+  //    every created device HAL context as TPU v7x (0x0075, 256x256 MXU, native FP8).
+  {
+    unsetenv("OPENTPU_MOCK_CHIP");
+    unsetenv("OPENTPU_MOCK_DEVICE_ID");
+    setenv("OPENTPU_MOCK", "1", 1);
+    setenv("OPENTPU_MOCK_TOPOLOGY", "tpu7x-1t", 1);
+
+    PJRT_Client_Create_Args cc = {};
+    cc.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
+    OT_CHECK(api->PJRT_Client_Create(&cc) == nullptr && cc.client != nullptr);
+
+    PJRT_Client_AddressableDevices_Args ad = {};
+    ad.struct_size = PJRT_Client_AddressableDevices_Args_STRUCT_SIZE;
+    ad.client = cc.client;
+    OT_CHECK(api->PJRT_Client_AddressableDevices(&ad) == nullptr);
+    OT_CHECK(ad.num_addressable_devices == 2u);
+
+    for (size_t i = 0; i < ad.num_addressable_devices; ++i) {
+      const ot_context_t* dev_ctx = ot::pjrt_device_context_raw(ad.addressable_devices[i]);
+      OT_CHECK(dev_ctx != nullptr);
+      ot_device_info_t dinfo = {};
+      ot_device_geometry_t dgeom = {};
+      OT_CHECK(ot_device_get_info(dev_ctx, &dinfo) == OT_OK);
+      OT_CHECK(ot_device_get_geometry(dev_ctx, &dgeom) == OT_OK);
+      OT_CHECK(dinfo.chip_gen == OT_CHIP_TPU7X);
+      OT_CHECK(dinfo.device_id == 0x0075u);
+      OT_CHECK(dgeom.mxu_rows == 256u && dgeom.mxu_cols == 256u && dgeom.supports_native_fp8 == 1u);
+    }
+
+    PJRT_Client_Destroy_Args cd = {};
+    cd.struct_size = PJRT_Client_Destroy_Args_STRUCT_SIZE;
+    cd.client = cc.client;
+    OT_CHECK(api->PJRT_Client_Destroy(&cd) == nullptr);
+  }
+
+  // 6. On an 8-device client, execute_device outside the executable's assigned_devices ([0, 1])
+  //    must be rejected with INVALID_ARGUMENT, while an assigned device succeeds.
+  {
+    unsetenv("OPENTPU_MOCK_CHIP");
+    unsetenv("OPENTPU_MOCK_DEVICE_ID");
+    setenv("OPENTPU_MOCK", "1", 1);
+    setenv("OPENTPU_MOCK_TOPOLOGY", "tpu7x-4t", 1);
+
+    PJRT_Client_Create_Args cc = {};
+    cc.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
+    OT_CHECK(api->PJRT_Client_Create(&cc) == nullptr && cc.client != nullptr);
+
+    PJRT_Client_AddressableDevices_Args ad = {};
+    ad.struct_size = PJRT_Client_AddressableDevices_Args_STRUCT_SIZE;
+    ad.client = cc.client;
+    OT_CHECK(api->PJRT_Client_AddressableDevices(&ad) == nullptr);
+    OT_CHECK(ad.num_addressable_devices == 8u);
+
+    const char opt_rep2[] = {0x1a, 0x02, 0x20, 0x02};
+    PJRT_Client_Compile_Args ca = {};
+    ca.struct_size = PJRT_Client_Compile_Args_STRUCT_SIZE;
+    ca.client = cc.client;
+    ca.program = &prog;
+    ca.compile_options = opt_rep2;
+    ca.compile_options_size = sizeof(opt_rep2);
+    OT_CHECK(api->PJRT_Client_Compile(&ca) == nullptr && ca.executable != nullptr);
+
+    std::vector<uint16_t> ones(16, 0x3f80u);
+    PJRT_Buffer* d2_a = upload_bf16(cc.client, ad.addressable_devices[2], ones, 4, 4);
+    PJRT_Buffer* d2_b = upload_bf16(cc.client, ad.addressable_devices[2], ones, 4, 4);
+    PJRT_Buffer* ins2[2] = {d2_a, d2_b};
+    PJRT_Buffer* outs2[1] = {nullptr};
+    PJRT_Buffer* const* arg_lists2[1] = {ins2};
+    PJRT_Buffer** const out_lists2[1] = {outs2};
+    PJRT_ExecuteOptions eopts = {};
+    eopts.struct_size = PJRT_ExecuteOptions_STRUCT_SIZE;
+    PJRT_LoadedExecutable_Execute_Args ex_unassigned = {};
+    ex_unassigned.struct_size = PJRT_LoadedExecutable_Execute_Args_STRUCT_SIZE;
+    ex_unassigned.executable = ca.executable;
+    ex_unassigned.options = &eopts;
+    ex_unassigned.argument_lists = arg_lists2;
+    ex_unassigned.num_devices = 1;
+    ex_unassigned.num_args = 2;
+    ex_unassigned.output_lists = out_lists2;
+    ex_unassigned.execute_device = ad.addressable_devices[2];
+    PJRT_Error* ue = api->PJRT_LoadedExecutable_Execute(&ex_unassigned);
+    OT_CHECK(ue != nullptr && get_err_code(ue) == PJRT_Error_Code_INVALID_ARGUMENT);
+    OT_CHECK(outs2[0] == nullptr);
+    destroy_pjrt_error(api, ue);
+
+    // Launching on assigned device 1 with execute_device=dev[1] succeeds.
+    PJRT_Buffer* d1_a = upload_bf16(cc.client, ad.addressable_devices[1], ones, 4, 4);
+    PJRT_Buffer* d1_b = upload_bf16(cc.client, ad.addressable_devices[1], ones, 4, 4);
+    PJRT_Buffer* ins1[2] = {d1_a, d1_b};
+    PJRT_Buffer* outs1[1] = {nullptr};
+    PJRT_Buffer* const* arg_lists1[1] = {ins1};
+    PJRT_Buffer** const out_lists1[1] = {outs1};
+    PJRT_LoadedExecutable_Execute_Args ex_assigned = ex_unassigned;
+    ex_assigned.argument_lists = arg_lists1;
+    ex_assigned.output_lists = out_lists1;
+    ex_assigned.execute_device = ad.addressable_devices[1];
+    OT_CHECK(api->PJRT_LoadedExecutable_Execute(&ex_assigned) == nullptr && outs1[0] != nullptr);
+
+    destroy_buf(d2_a);
+    destroy_buf(d2_b);
+    destroy_buf(d1_a);
+    destroy_buf(d1_b);
+    destroy_buf(outs1[0]);
+    PJRT_LoadedExecutable_Destroy_Args led = {};
+    led.struct_size = PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
+    led.executable = ca.executable;
+    OT_CHECK(api->PJRT_LoadedExecutable_Destroy(&led) == nullptr);
+    PJRT_Client_Destroy_Args cd = {};
+    cd.struct_size = PJRT_Client_Destroy_Args_STRUCT_SIZE;
+    cd.client = cc.client;
+    OT_CHECK(api->PJRT_Client_Destroy(&cd) == nullptr);
+  }
+
   unsetenv("OPENTPU_MOCK_TOPOLOGY");
   unsetenv("OPENTPU_MOCK_CHIP");
   unsetenv("OPENTPU_MOCK");

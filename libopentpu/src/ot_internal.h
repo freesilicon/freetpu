@@ -203,6 +203,8 @@ uint64_t context_hbm_used_bytes(const ot_context_t* ctx);
 bool validate_cq_completion(uint32_t sent_seq, const uint32_t cq[8], std::string* err);
 // Static allocation-free PJRT_Error fallback used when error allocation fails.
 void* pjrt_static_fallback_error_raw(uint32_t error_code);
+// Internal inspection helper for unit tests verifying per-device PJRT HAL contexts.
+const ot_context_t* pjrt_device_context_raw(const void* pjrt_device);
 
 }  // namespace ot
 

@@ -134,7 +134,7 @@ for dev_path in "${PCI_SYSFS_DIR}"/*; do
     nl -ba "${dev_path}/resource" | head -n 7 | tee -a "${REPORT}"
   fi
   if command -v lspci >/dev/null 2>&1; then
-    lspci -s "${bdf}" -nnvvv 2>/dev/null | awk '
+    lspci_out="$(lspci -s "${bdf}" -nnvvv 2>/dev/null | awk '
       function indent_len(s) {
         match(s, /^[ \t]*/)
         return RLENGTH
@@ -153,8 +153,15 @@ for dev_path in "${PCI_SYSFS_DIR}"/*; do
           next
         }
       }
+      tolower($0) ~ /<access denied>/ { print; next }
       /Google|Region |MSI-X|LnkSta:/ { print }
-    ' | tee -a "${REPORT}" || true
+    ' || true)"
+    if [[ -n "${lspci_out}" ]]; then
+      printf '%s\n' "${lspci_out}" | tee -a "${REPORT}"
+      if printf '%s\n' "${lspci_out}" | grep -qi "<access denied>"; then
+        log "WARN: PCI capability reads were denied (<access denied>) for ${bdf}; re-run with sudo to inspect Resizable BAR and MSI-X fields."
+      fi
+    fi
   fi
   tpu_count=$((tpu_count + 1))
 done
@@ -355,8 +362,15 @@ CPPEOF
     local py_out=""
     py_out="$(python3 - <<'PYEOF' 2>&1
 import jax
-devs = jax.devices()
-print(f"PJRT_BACKEND=jax")
+try:
+    devs = jax.local_devices(backend="tpu")
+except Exception as exc:
+    print(f"JAX TPU backend unavailable: {exc}")
+    raise SystemExit(10)
+if not devs:
+    print("JAX TPU backend returned 0 devices")
+    raise SystemExit(9)
+print("PJRT_BACKEND=jax-tpu")
 print(f"PJRT_LOGICAL_DEVICES={len(devs)}")
 for i, d in enumerate(devs):
     coords = getattr(d, "coords", None)
@@ -365,8 +379,6 @@ for i, d in enumerate(devs):
     hw = getattr(d, "local_hardware_id", d.id)
     coords_str = "[" + ",".join(str(c) for c in coords) + "]" if coords is not None else "[]"
     print(f'PJRT_DEVICE index={i} id={d.id} local_hardware_id={hw} kind="{kind}" coords={coords_str} core_on_chip={core}')
-if not devs:
-    raise SystemExit(9)
 PYEOF
 )" || py_rc=$?
     if [[ "${py_rc}" -eq 0 ]]; then

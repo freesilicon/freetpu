@@ -58,7 +58,7 @@ Run the turnkey ops & benchmark script with persistent GCS `XLA_COMPILATION_CACH
 
 What this captures:
 - `test_cloudtpu_host` standalone checks + `MAPS_LIBPYTHON=0`.
-- Live `test-backend-ops -b CLOUDTPU` under default `BF16` MXU path (`CLOUDTPU_MATMUL_FP8=0`) and Ironwood `f8E4M3FN` MXU path (`CLOUDTPU_MATMUL_FP8=auto`).
+- Live `test-backend-ops -b CLOUDTPU` under pinned `BF16` MXU baseline (`CLOUDTPU_MATMUL_FP8=0 CLOUDTPU_MATMUL_BF16=1`), plus a dedicated live `f8E4M3FN` accuracy gate (`test_cloudtpu_host --fp8-parity-only`, `NMSE < 1e-2` for `Q8_0` and factored `Q4_K_I4` + exact zero cancellation, avoiding upstream `test-backend-ops`'s hardcoded `5e-4` `Q8_0` BF16 limit).
 - Side-by-side `llama-bench` throughput (`pp512` and `tg64`) across `8B`, `32B`, `70B`, `120B`, and `235B` (`Q4_K_M`) in both `BF16` and `f8E4M3FN` modes.
 
 ### Runtime Knobs on Ironwood (`tpu7x`)

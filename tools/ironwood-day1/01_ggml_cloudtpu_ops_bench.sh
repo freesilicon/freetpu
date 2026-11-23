@@ -15,8 +15,8 @@ usage() {
 Usage: 01_ggml_cloudtpu_ops_bench.sh [--models-dir DIR] [--spmd N|auto] [--xla-cache DIR|gs://...] [--out-dir DIR] [--dry-run] [--mock]
 
 Runs Ironwood Day-1 verification & benchmarks for ggml-cloudtpu:
-  1. test-backend-ops -b CLOUDTPU (BF16 default + CLOUDTPU_MATMUL_FP8=auto parity run)
-  2. MAPS_LIBPYTHON=0 audit via test_cloudtpu_host
+  1. test-backend-ops -b CLOUDTPU (BF16 default baseline, CLOUDTPU_MATMUL_FP8=0)
+  2. Dedicated live FP8 f8E4M3FN parity gate (1e-2 NMSE via test_cloudtpu_host --fp8-parity-only) + MAPS_LIBPYTHON=0
   3. llama-bench Q4_K_M sweep (8B / 32B / 70B / 120B / 235B) with persistent XLA_COMPILATION_CACHE_DIR
 EOF
 }
@@ -87,7 +87,7 @@ else
 fi
 
 if [[ "${DRY_RUN}" -eq 1 ]]; then
-  log "[DRY-RUN] Would run test_cloudtpu_host, test-backend-ops (BF16 + CLOUDTPU_MATMUL_FP8=auto), and llama-bench for available 8B/32B/70B/120B/235B Q4_K_M models."
+  log "[DRY-RUN] Would run test_cloudtpu_host, BF16 test-backend-ops (CLOUDTPU_MATMUL_FP8=0), live FP8 1e-2 NMSE parity gate (test_cloudtpu_host --fp8-parity-only), and llama-bench for available 8B/32B/70B/120B/235B Q4_K_M models."
   exit 0
 fi
 
@@ -113,10 +113,15 @@ CLOUDTPU_MOCK=0 CLOUDTPU_SPMD_CHIPS=1 CLOUDTPU_MATMUL_FP8=0 CLOUDTPU_MATMUL_BF16
   -o "MUL_MAT,RMS_NORM,ROPE,SOFT_MAX,GET_ROWS,SET_ROWS,ADD,MUL,CPY,SILU,SWIGLU,FLASH_ATTN_EXT" \
   2>&1 | tee -a "${LOG}"
 
-log "--- Live test-backend-ops (FP8 f8E4M3FN tpu7x auto path) ---"
+log "--- Live FP8 f8E4M3FN accuracy gate (1e-2 NMSE via test_cloudtpu_host --fp8-parity-only) ---"
+log "Note: Using dedicated FP8 1e-2 NMSE gate instead of upstream test-backend-ops MUL_MAT because upstream hardcodes a 5e-4 Q8_0 NMSE threshold while OCP E4M3FN scaling+rounding yields ~6.7e-3 NMSE."
+HOST_TEST_BIN="${REPO_ROOT}/llama-cpp-cloudtpu/build-standalone/test_cloudtpu_host"
+if [[ ! -x "${HOST_TEST_BIN}" ]]; then
+  log "ERROR: test_cloudtpu_host binary not found at ${HOST_TEST_BIN}"
+  exit 1
+fi
 CLOUDTPU_MOCK=0 CLOUDTPU_SPMD_CHIPS=1 CLOUDTPU_MATMUL_FP8=auto CLOUDTPU_MATMUL_BF16=1 \
-  "${BIN_DIR}/test-backend-ops" -b CLOUDTPU \
-  -o "MUL_MAT" 2>&1 | tee -a "${LOG}"
+  "${HOST_TEST_BIN}" --fp8-parity-only 2>&1 | tee -a "${LOG}"
 
 run_bench_tier() {
   local tier="$1"

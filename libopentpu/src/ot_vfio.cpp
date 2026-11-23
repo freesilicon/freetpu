@@ -623,6 +623,22 @@ bool VfioTransport::open_device(const ot_config_t& cfg, ot_device_info_t* info, 
       if (parse_hex_u64(did_env, &parsed) && parsed <= 0xffffULL) {
         mock_did = static_cast<uint16_t>(parsed);
       }
+    } else if (const char* topo_env = std::getenv("OPENTPU_MOCK_TOPOLOGY")) {
+      if (std::strcmp(topo_env, "tpu7x-1t") == 0 || std::strcmp(topo_env, "tpu7x_1t") == 0 ||
+          std::strcmp(topo_env, "tpu7x-4t") == 0 || std::strcmp(topo_env, "tpu7x_4t") == 0) {
+        mock_did = 0x0075u;
+      } else if (std::strcmp(topo_env, "v6e-8") == 0 || std::strcmp(topo_env, "v6e_8") == 0) {
+        mock_did = 0x006fu;
+      } else if (std::strcmp(topo_env, "v5e-1") == 0 || std::strcmp(topo_env, "v5e_1") == 0) {
+        mock_did = 0x0063u;
+      } else if (const char* chip_env = std::getenv("OPENTPU_MOCK_CHIP")) {
+        if (std::strcmp(chip_env, "tpu7x") == 0 || std::strcmp(chip_env, "ironwood") == 0 ||
+            std::strcmp(chip_env, "v7x") == 0) {
+          mock_did = 0x0075u;
+        } else if (std::strcmp(chip_env, "v6e") == 0 || std::strcmp(chip_env, "trillium") == 0) {
+          mock_did = 0x006fu;
+        }
+      }
     } else if (const char* chip_env = std::getenv("OPENTPU_MOCK_CHIP")) {
       if (std::strcmp(chip_env, "tpu7x") == 0 || std::strcmp(chip_env, "ironwood") == 0 ||
           std::strcmp(chip_env, "v7x") == 0) {

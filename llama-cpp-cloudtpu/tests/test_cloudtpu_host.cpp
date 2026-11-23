@@ -6585,6 +6585,232 @@ void test_ironwood_d2d_pairing_and_sdy_mesh() {
     std::printf("  [PASS] Ironwood tpu7x dual-chiplet D2D Hamiltonian pairing & Shardy sdy.mesh\n");
 }
 
+void run_fp8_matmul_parity_on_runtime(cloudtpu::PjrtRuntime& rt) {
+    const int64_t K = 64, N = 8, NB = K / 32;
+    const bool rt_is_tpu7x = rt.is_tpu7x_topology();
+    auto build_q8_spec = [&](cloudtpu::Fp8MatmulMode mode, bool is_tpu7x, bool high_prec) {
+        cloudtpu::GraphProgramSpec spec;
+        spec.fp8_matmul = mode;
+        spec.target_is_tpu7x = is_tpu7x;
+        spec.bf16_matmul = true;
+        cloudtpu::TensorSpec w_spec;
+        w_spec.id = 1;
+        w_spec.dtype = cloudtpu::PjrtDType::S8;
+        w_spec.storage = cloudtpu::TensorStorageKind::Q8_0_SPLIT;
+        w_spec.scale_dtype = cloudtpu::PjrtDType::BF16;
+        w_spec.dims[0] = 1;
+        w_spec.dims[1] = 1;
+        w_spec.dims[2] = N;
+        w_spec.dims[3] = K;
+        cloudtpu::TensorSpec x_spec;
+        x_spec.id = 2;
+        x_spec.dtype = cloudtpu::PjrtDType::F32;
+        x_spec.dims[0] = 1;
+        x_spec.dims[1] = 1;
+        x_spec.dims[2] = 4;
+        x_spec.dims[3] = K;
+        spec.inputs = {w_spec, x_spec};
+        cloudtpu::OpNodeSpec mm;
+        mm.kind = cloudtpu::CloudOpKind::MUL_MAT;
+        mm.src_ids = {1, 2};
+        mm.high_precision = high_prec;
+        mm.dst.id = 3;
+        mm.dst.dtype = cloudtpu::PjrtDType::F32;
+        mm.dst.dims[0] = 1;
+        mm.dst.dims[1] = 1;
+        mm.dst.dims[2] = 4;
+        mm.dst.dims[3] = N;
+        spec.ops = {mm};
+        spec.output_ids = {3};
+        return spec;
+    };
+
+    const auto p_fp8 = cloudtpu::emit_stablehlo_program(
+        build_q8_spec(rt_is_tpu7x ? cloudtpu::Fp8MatmulMode::AUTO : cloudtpu::Fp8MatmulMode::FORCE,
+                      rt_is_tpu7x, false));
+    const auto p_bf16 = cloudtpu::emit_stablehlo_program(
+        build_q8_spec(cloudtpu::Fp8MatmulMode::OFF, rt_is_tpu7x, false));
+    CHECK_TRUE(p_fp8.mlir_text.find("xf8E4M3FN>") != std::string::npos,
+               "FP8 parity Q8_0 emits f8E4M3FN dot_general");
+
+    const int64_t M = 4;
+    std::vector<int8_t> w_qs(static_cast<size_t>(NB * 32 * N));
+    std::vector<uint16_t> w_d_bf16(static_cast<size_t>(NB * N));
+    for (int64_t nb = 0; nb < NB; ++nb) {
+        for (int64_t n = 0; n < N; ++n) {
+            const float d = 0.02f * static_cast<float>((nb * 3 + n) % 5 + 1);
+            w_d_bf16[static_cast<size_t>(nb * N + n)] = cloudtpu::f32_to_bf16(d);
+            for (int64_t k = 0; k < 32; ++k) {
+                w_qs[static_cast<size_t>((nb * 32 + k) * N + n)] =
+                    static_cast<int8_t>(((nb * 11 + k * 7 + n * 5) % 31) - 15);
+            }
+        }
+    }
+    std::vector<float> x_vals(static_cast<size_t>(M * K));
+    for (int64_t m = 0; m < M; ++m) {
+        for (int64_t k = 0; k < K; ++k) {
+            // Test tiny sub-unit scale (~1e-3) to verify dynamic absmax scaling avoids FP8 underflow.
+            x_vals[static_cast<size_t>(m * K + k)] =
+                1e-3f * std::sin(0.31f * static_cast<float>(k + 1) + 0.7f * static_cast<float>(m));
+        }
+    }
+    std::vector<float> ref(static_cast<size_t>(M * N), 0.0f);
+    for (int64_t m = 0; m < M; ++m) {
+        for (int64_t n = 0; n < N; ++n) {
+            double acc = 0.0;
+            for (int64_t nb = 0; nb < NB; ++nb) {
+                const double d = static_cast<double>(cloudtpu::bf16_to_f32(w_d_bf16[static_cast<size_t>(nb * N + n)]));
+                for (int64_t k = 0; k < 32; ++k) {
+                    const double q = static_cast<double>(w_qs[static_cast<size_t>((nb * 32 + k) * N + n)]);
+                    const double xv = static_cast<double>(x_vals[static_cast<size_t>(m * K + nb * 32 + k)]);
+                    acc += xv * (q * d);
+                }
+            }
+            ref[static_cast<size_t>(m * N + n)] = static_cast<float>(acc);
+        }
+    }
+
+    auto b_qs = rt.buffer_from_host(0, w_qs.data(), cloudtpu::PjrtDType::S8, {1, 1, NB, 32, N});
+    auto b_d = rt.buffer_from_host(0, w_d_bf16.data(), cloudtpu::PjrtDType::BF16, {1, 1, NB, N});
+    auto b_x = rt.buffer_from_host(0, x_vals.data(), cloudtpu::PjrtDType::F32, {1, 1, M, K});
+    std::array<PJRT_Buffer*, 3> in_raw = {b_qs->handle.get(), b_d->handle.get(), b_x->handle.get()};
+
+    auto run_prog = [&](const cloudtpu::EmittedProgram& ep) {
+        const auto ex = rt.compile_or_get(ep.cache_key, ep.mlir_text, 0, rt.make_spmd_compile_options(1));
+        std::vector<cloudtpu::PjrtBufferPtr> outs;
+        rt.execute(ex, 0, in_raw.data(), in_raw.size(), outs,
+                   {cloudtpu::PjrtDType::F32}, {{1, 1, M, N}}, true);
+        std::vector<float> got(static_cast<size_t>(M * N));
+        rt.buffer_to_host(outs[0]->handle.get(), got.data(), got.size() * sizeof(float));
+        return got;
+    };
+
+    const auto got_fp8 = run_prog(p_fp8);
+    const auto got_bf16 = run_prog(p_bf16);
+    double num_err_fp8 = 0.0, num_err_bf16 = 0.0, denom = 0.0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        const double df = static_cast<double>(got_fp8[i]) - static_cast<double>(ref[i]);
+        const double db = static_cast<double>(got_bf16[i]) - static_cast<double>(ref[i]);
+        num_err_fp8 += df * df;
+        num_err_bf16 += db * db;
+        denom += static_cast<double>(ref[i]) * static_cast<double>(ref[i]);
+    }
+    const double nmse_fp8 = num_err_fp8 / std::max(denom, 1e-30);
+    const double nmse_bf16 = num_err_bf16 / std::max(denom, 1e-30);
+    CHECK_TRUE(nmse_bf16 < 5e-4, "BF16 fallback Q8_0 NMSE < 5e-4");
+    CHECK_TRUE(nmse_fp8 < 1e-2, "FP8 E4M3FN dynamic-scaled Q8_0 NMSE < 1e-2");
+
+    // Factored Q4_K_I4 decode parity under FP8 E4M3FN (exact integer nibbles in [-8..15], 0 weight scale)
+    // plus exact zero cancellation when unsigned nibbles and bias m are zero.
+    {
+        const int64_t K4 = 64, N4 = 4, NB4 = K4 / 32;
+        std::vector<int8_t> s4_host(static_cast<size_t>(NB4 * 32 * N4));
+        std::vector<float> d4(static_cast<size_t>(NB4 * N4), 0.125f);
+        std::vector<float> m4(static_cast<size_t>(NB4 * N4), -0.25f);
+        for (size_t i = 0; i < s4_host.size(); ++i) {
+            s4_host[i] = static_cast<int8_t>(((i * 5 + 3) % 16) - 8);
+        }
+        std::vector<float> x4(static_cast<size_t>(K4));
+        for (int64_t k = 0; k < K4; ++k) {
+            x4[static_cast<size_t>(k)] = 0.05f * std::cos(0.19f * static_cast<float>(k));
+        }
+        std::vector<float> ref4(static_cast<size_t>(N4), 0.0f);
+        for (int64_t n = 0; n < N4; ++n) {
+            double acc = 0.0;
+            for (int64_t nb = 0; nb < NB4; ++nb) {
+                const double dv = static_cast<double>(d4[static_cast<size_t>(nb * N4 + n)]);
+                const double mv = static_cast<double>(m4[static_cast<size_t>(nb * N4 + n)]);
+                for (int64_t k = 0; k < 32; ++k) {
+                    const size_t elem = static_cast<size_t>((nb * 32 + k) * N4 + n);
+                    const double u4v = static_cast<double>(s4_host[elem] + 8);
+                    acc += static_cast<double>(x4[static_cast<size_t>(nb * 32 + k)]) * (dv * u4v + mv);
+                }
+            }
+            ref4[static_cast<size_t>(n)] = static_cast<float>(acc);
+        }
+        cloudtpu::GraphProgramSpec spec4;
+        spec4.fp8_matmul = rt_is_tpu7x ? cloudtpu::Fp8MatmulMode::AUTO : cloudtpu::Fp8MatmulMode::FORCE;
+        spec4.target_is_tpu7x = rt_is_tpu7x;
+        cloudtpu::TensorSpec w4;
+        w4.id = 1;
+        w4.dtype = cloudtpu::PjrtDType::S4;
+        w4.storage = cloudtpu::TensorStorageKind::Q4_K_I4;
+        w4.scale_dtype = cloudtpu::PjrtDType::F32;
+        w4.dims[0] = 1;
+        w4.dims[1] = 1;
+        w4.dims[2] = N4;
+        w4.dims[3] = K4;
+        cloudtpu::TensorSpec x4_spec;
+        x4_spec.id = 2;
+        x4_spec.dtype = cloudtpu::PjrtDType::F32;
+        x4_spec.dims[0] = 1;
+        x4_spec.dims[1] = 1;
+        x4_spec.dims[2] = 1;
+        x4_spec.dims[3] = K4;
+        spec4.inputs = {w4, x4_spec};
+        cloudtpu::OpNodeSpec mm4;
+        mm4.kind = cloudtpu::CloudOpKind::MUL_MAT;
+        mm4.src_ids = {1, 2};
+        mm4.dst.id = 3;
+        mm4.dst.dtype = cloudtpu::PjrtDType::F32;
+        mm4.dst.dims[0] = 1;
+        mm4.dst.dims[1] = 1;
+        mm4.dst.dims[2] = 1;
+        mm4.dst.dims[3] = N4;
+        spec4.ops = {mm4};
+        spec4.output_ids = {3};
+        const auto ep4 = cloudtpu::emit_stablehlo_program(spec4);
+        CHECK_TRUE(ep4.mlir_text.find("xf8E4M3FN>") != std::string::npos,
+                   "Q4_K_I4 emits f8E4M3FN dot_general");
+        auto b4_qs = rt.buffer_from_host(0, s4_host.data(), cloudtpu::PjrtDType::S4, {1, 1, NB4, 32, N4});
+        auto b4_d = rt.buffer_from_host(0, d4.data(), cloudtpu::PjrtDType::F32, {1, 1, NB4, N4});
+        auto b4_m = rt.buffer_from_host(0, m4.data(), cloudtpu::PjrtDType::F32, {1, 1, NB4, N4});
+        auto b4_x = rt.buffer_from_host(0, x4.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, K4});
+        std::array<PJRT_Buffer*, 4> in4 = {
+            b4_qs->handle.get(), b4_d->handle.get(), b4_m->handle.get(), b4_x->handle.get()};
+        const auto ex4 = rt.compile_or_get(ep4.cache_key, ep4.mlir_text, 0, rt.make_spmd_compile_options(1));
+        std::vector<cloudtpu::PjrtBufferPtr> out4;
+        rt.execute(ex4, 0, in4.data(), in4.size(), out4,
+                   {cloudtpu::PjrtDType::F32}, {{1, 1, 1, N4}}, true);
+        std::vector<float> got4(static_cast<size_t>(N4));
+        rt.buffer_to_host(out4[0]->handle.get(), got4.data(), got4.size() * sizeof(float));
+        double err4 = 0.0, den4 = 0.0;
+        for (int64_t i = 0; i < N4; ++i) {
+            const double d = static_cast<double>(got4[static_cast<size_t>(i)]) - static_cast<double>(ref4[static_cast<size_t>(i)]);
+            err4 += d * d;
+            den4 += static_cast<double>(ref4[static_cast<size_t>(i)]) * static_cast<double>(ref4[static_cast<size_t>(i)]);
+        }
+        CHECK_TRUE((err4 / std::max(den4, 1e-30)) < 1e-2, "FP8 E4M3FN factored Q4_K_I4 NMSE < 1e-2");
+
+        // Exact zero cancellation under FP8 E4M3FN: when all unsigned nibbles are 0 (s4 == -8)
+        // and bias m == 0, dequantized weights are identically 0. Because xsum reduces the same
+        // FP8-rounded activations as dot_b, output must be identically 0.0f.
+        std::vector<int8_t> s4_zero_u4(static_cast<size_t>(NB4 * 32 * N4), static_cast<int8_t>(-8));
+        std::vector<float> d4_large(static_cast<size_t>(NB4 * N4), 1024.0f);
+        std::vector<float> m4_zero(static_cast<size_t>(NB4 * N4), 0.0f);
+        std::vector<float> x4_inexact(static_cast<size_t>(K4));
+        for (int64_t k = 0; k < K4; ++k) {
+            x4_inexact[static_cast<size_t>(k)] =
+                1.3712345f * std::sin(0.73f * static_cast<float>(k + 1)) + 0.1111111f;
+        }
+        auto bz_qs = rt.buffer_from_host(0, s4_zero_u4.data(), cloudtpu::PjrtDType::S4, {1, 1, NB4, 32, N4});
+        auto bz_d = rt.buffer_from_host(0, d4_large.data(), cloudtpu::PjrtDType::F32, {1, 1, NB4, N4});
+        auto bz_m = rt.buffer_from_host(0, m4_zero.data(), cloudtpu::PjrtDType::F32, {1, 1, NB4, N4});
+        auto bz_x = rt.buffer_from_host(0, x4_inexact.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, K4});
+        std::array<PJRT_Buffer*, 4> inz = {
+            bz_qs->handle.get(), bz_d->handle.get(), bz_m->handle.get(), bz_x->handle.get()};
+        std::vector<cloudtpu::PjrtBufferPtr> outz;
+        rt.execute(ex4, 0, inz.data(), inz.size(), outz,
+                   {cloudtpu::PjrtDType::F32}, {{1, 1, 1, N4}}, true);
+        std::vector<float> gotz(static_cast<size_t>(N4), -1.0f);
+        rt.buffer_to_host(outz[0]->handle.get(), gotz.data(), gotz.size() * sizeof(float));
+        for (int64_t i = 0; i < N4; ++i) {
+            CHECK_TRUE(gotz[static_cast<size_t>(i)] == 0.0f,
+                       "FP8 E4M3FN Q4_K_I4 zero unsigned nibbles + zero m must cancel to exact 0.0f");
+        }
+    }
+}
+
 void test_fp8_e4m3fn_scalar_and_matmul_parity() {
     // 1. Scalar f8E4M3FN roundtrip checks (zeros, exact small ints, max finite, NaN).
     {
@@ -6621,7 +6847,7 @@ void test_fp8_e4m3fn_scalar_and_matmul_parity() {
 
     // 2. Verify gating rules (AUTO + tpu7x -> FP8, AUTO + non-tpu7x -> BF16, OFF -> BF16,
     //    FORCE -> FP8, high_precision -> F32).
-    const int64_t K = 64, N = 8, NB = K / 32;
+    const int64_t K = 64, N = 8;
     auto build_q8_spec = [&](cloudtpu::Fp8MatmulMode mode, bool is_tpu7x, bool high_prec) {
         cloudtpu::GraphProgramSpec spec;
         spec.fp8_matmul = mode;
@@ -6683,194 +6909,14 @@ void test_fp8_e4m3fn_scalar_and_matmul_parity() {
     CHECK_TRUE(p_hp_tpu7x.mlir_text.find("xf8E4M3FN>") == std::string::npos,
                "high_precision skips FP8");
 
-    // 3. Numerical parity on Host Mock (Q8_0_SPLIT + Q4_K_I4): verify tpu7x-1t FP8 dot_general
-    //    matches F32/BF16 reference with low NMSE (< 5e-3) across varying activation scales.
+    // 3. Numerical parity on Host Mock (Q8_0_SPLIT + Q4_K_I4 + exact zero cancellation).
     cloudtpu::RuntimeConfig cfg;
     cfg.mock_mode = true;
     cfg.mock_devices = 2;
     cfg.mock_profile = cloudtpu::MockTopologyProfile::TPU7X_1T;
     cloudtpu::PjrtRuntime rt;
     rt.init(cfg);
-
-    const int64_t M = 4;
-    std::vector<int8_t> w_qs(static_cast<size_t>(NB * 32 * N));
-    std::vector<uint16_t> w_d_bf16(static_cast<size_t>(NB * N));
-    std::vector<float> w_d_f32(static_cast<size_t>(NB * N));
-    for (int64_t nb = 0; nb < NB; ++nb) {
-        for (int64_t n = 0; n < N; ++n) {
-            const float d = 0.02f * static_cast<float>((nb * 3 + n) % 5 + 1);
-            w_d_f32[static_cast<size_t>(nb * N + n)] = d;
-            w_d_bf16[static_cast<size_t>(nb * N + n)] = cloudtpu::f32_to_bf16(d);
-            for (int64_t k = 0; k < 32; ++k) {
-                w_qs[static_cast<size_t>((nb * 32 + k) * N + n)] =
-                    static_cast<int8_t>(((nb * 11 + k * 7 + n * 5) % 31) - 15);
-            }
-        }
-    }
-    std::vector<float> x_vals(static_cast<size_t>(M * K));
-    for (int64_t m = 0; m < M; ++m) {
-        for (int64_t k = 0; k < K; ++k) {
-            // Test tiny sub-unit scale (~1e-3) to verify dynamic absmax scaling avoids FP8 underflow!
-            x_vals[static_cast<size_t>(m * K + k)] =
-                1e-3f * std::sin(0.31f * static_cast<float>(k + 1) + 0.7f * static_cast<float>(m));
-        }
-    }
-    std::vector<float> ref(static_cast<size_t>(M * N), 0.0f);
-    for (int64_t m = 0; m < M; ++m) {
-        for (int64_t n = 0; n < N; ++n) {
-            double acc = 0.0;
-            for (int64_t nb = 0; nb < NB; ++nb) {
-                const double d = static_cast<double>(cloudtpu::bf16_to_f32(w_d_bf16[static_cast<size_t>(nb * N + n)]));
-                for (int64_t k = 0; k < 32; ++k) {
-                    const double q = static_cast<double>(w_qs[static_cast<size_t>((nb * 32 + k) * N + n)]);
-                    const double xv = static_cast<double>(x_vals[static_cast<size_t>(m * K + nb * 32 + k)]);
-                    acc += xv * (q * d);
-                }
-            }
-            ref[static_cast<size_t>(m * N + n)] = static_cast<float>(acc);
-        }
-    }
-
-    auto b_qs = rt.buffer_from_host(0, w_qs.data(), cloudtpu::PjrtDType::S8, {1, 1, NB, 32, N});
-    auto b_d = rt.buffer_from_host(0, w_d_bf16.data(), cloudtpu::PjrtDType::BF16, {1, 1, NB, N});
-    auto b_x = rt.buffer_from_host(0, x_vals.data(), cloudtpu::PjrtDType::F32, {1, 1, M, K});
-    std::array<PJRT_Buffer*, 3> in_raw = {b_qs->handle.get(), b_d->handle.get(), b_x->handle.get()};
-
-    auto run_prog = [&](const cloudtpu::EmittedProgram& ep) {
-        const auto ex = rt.compile_or_get(ep.cache_key, ep.mlir_text, 0, rt.make_spmd_compile_options(1));
-        std::vector<cloudtpu::PjrtBufferPtr> outs;
-        rt.execute(ex, 0, in_raw.data(), in_raw.size(), outs,
-                   {cloudtpu::PjrtDType::F32}, {{1, 1, M, N}}, true);
-        std::vector<float> got(static_cast<size_t>(M * N));
-        rt.buffer_to_host(outs[0]->handle.get(), got.data(), got.size() * sizeof(float));
-        return got;
-    };
-
-    const auto got_fp8 = run_prog(p_auto_tpu7x);
-    const auto got_bf16 = run_prog(p_off_tpu7x);
-    double num_err_fp8 = 0.0, num_err_bf16 = 0.0, denom = 0.0;
-    for (size_t i = 0; i < ref.size(); ++i) {
-        const double df = static_cast<double>(got_fp8[i]) - static_cast<double>(ref[i]);
-        const double db = static_cast<double>(got_bf16[i]) - static_cast<double>(ref[i]);
-        num_err_fp8 += df * df;
-        num_err_bf16 += db * db;
-        denom += static_cast<double>(ref[i]) * static_cast<double>(ref[i]);
-    }
-    const double nmse_fp8 = num_err_fp8 / std::max(denom, 1e-30);
-    const double nmse_bf16 = num_err_bf16 / std::max(denom, 1e-30);
-    CHECK_TRUE(nmse_bf16 < 5e-4, "BF16 fallback Q8_0 NMSE < 5e-4");
-    CHECK_TRUE(nmse_fp8 < 1e-2, "FP8 E4M3FN dynamic-scaled Q8_0 NMSE < 1e-2");
-
-    // 4. Factored Q4_K_I4 decode parity under FP8 E4M3FN (exact integer nibbles in [-8..15], 0 weight scale).
-    {
-        const int64_t K4 = 64, N4 = 4, NB4 = K4 / 32;
-        std::vector<int8_t> s4_host(static_cast<size_t>(NB4 * 32 * N4));
-        std::vector<float> d4(static_cast<size_t>(NB4 * N4), 0.125f);
-        std::vector<float> m4(static_cast<size_t>(NB4 * N4), -0.25f);
-        for (size_t i = 0; i < s4_host.size(); ++i) {
-            s4_host[i] = static_cast<int8_t>(((i * 5 + 3) % 16) - 8);
-        }
-        std::vector<float> x4(static_cast<size_t>(K4));
-        for (int64_t k = 0; k < K4; ++k) {
-            x4[static_cast<size_t>(k)] = 0.05f * std::cos(0.19f * static_cast<float>(k));
-        }
-        std::vector<float> ref4(static_cast<size_t>(N4), 0.0f);
-        for (int64_t n = 0; n < N4; ++n) {
-            double acc = 0.0;
-            for (int64_t nb = 0; nb < NB4; ++nb) {
-                const double dv = static_cast<double>(d4[static_cast<size_t>(nb * N4 + n)]);
-                const double mv = static_cast<double>(m4[static_cast<size_t>(nb * N4 + n)]);
-                for (int64_t k = 0; k < 32; ++k) {
-                    const size_t elem = static_cast<size_t>((nb * 32 + k) * N4 + n);
-                    const double u4v = static_cast<double>(s4_host[elem] + 8);
-                    acc += static_cast<double>(x4[static_cast<size_t>(nb * 32 + k)]) * (dv * u4v + mv);
-                }
-            }
-            ref4[static_cast<size_t>(n)] = static_cast<float>(acc);
-        }
-        cloudtpu::GraphProgramSpec spec4;
-        spec4.fp8_matmul = cloudtpu::Fp8MatmulMode::AUTO;
-        spec4.target_is_tpu7x = true;
-        cloudtpu::TensorSpec w4;
-        w4.id = 1;
-        w4.dtype = cloudtpu::PjrtDType::S4;
-        w4.storage = cloudtpu::TensorStorageKind::Q4_K_I4;
-        w4.scale_dtype = cloudtpu::PjrtDType::F32;
-        w4.dims[0] = 1;
-        w4.dims[1] = 1;
-        w4.dims[2] = N4;
-        w4.dims[3] = K4;
-        cloudtpu::TensorSpec x4_spec;
-        x4_spec.id = 2;
-        x4_spec.dtype = cloudtpu::PjrtDType::F32;
-        x4_spec.dims[0] = 1;
-        x4_spec.dims[1] = 1;
-        x4_spec.dims[2] = 1;
-        x4_spec.dims[3] = K4;
-        spec4.inputs = {w4, x4_spec};
-        cloudtpu::OpNodeSpec mm4;
-        mm4.kind = cloudtpu::CloudOpKind::MUL_MAT;
-        mm4.src_ids = {1, 2};
-        mm4.dst.id = 3;
-        mm4.dst.dtype = cloudtpu::PjrtDType::F32;
-        mm4.dst.dims[0] = 1;
-        mm4.dst.dims[1] = 1;
-        mm4.dst.dims[2] = 1;
-        mm4.dst.dims[3] = N4;
-        spec4.ops = {mm4};
-        spec4.output_ids = {3};
-        const auto ep4 = cloudtpu::emit_stablehlo_program(spec4);
-        CHECK_TRUE(ep4.mlir_text.find("xf8E4M3FN>") != std::string::npos,
-                   "Q4_K_I4 emits f8E4M3FN dot_general on tpu7x");
-        auto b4_qs = rt.buffer_from_host(0, s4_host.data(), cloudtpu::PjrtDType::S4, {1, 1, NB4, 32, N4});
-        auto b4_d = rt.buffer_from_host(0, d4.data(), cloudtpu::PjrtDType::F32, {1, 1, NB4, N4});
-        auto b4_m = rt.buffer_from_host(0, m4.data(), cloudtpu::PjrtDType::F32, {1, 1, NB4, N4});
-        auto b4_x = rt.buffer_from_host(0, x4.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, K4});
-        std::array<PJRT_Buffer*, 4> in4 = {
-            b4_qs->handle.get(), b4_d->handle.get(), b4_m->handle.get(), b4_x->handle.get()};
-        const auto ex4 = rt.compile_or_get(ep4.cache_key, ep4.mlir_text, 0, rt.make_spmd_compile_options(1));
-        std::vector<cloudtpu::PjrtBufferPtr> out4;
-        rt.execute(ex4, 0, in4.data(), in4.size(), out4,
-                   {cloudtpu::PjrtDType::F32}, {{1, 1, 1, N4}}, true);
-        std::vector<float> got4(static_cast<size_t>(N4));
-        rt.buffer_to_host(out4[0]->handle.get(), got4.data(), got4.size() * sizeof(float));
-        double err4 = 0.0, den4 = 0.0;
-        for (int64_t i = 0; i < N4; ++i) {
-            const double d = static_cast<double>(got4[static_cast<size_t>(i)]) - static_cast<double>(ref4[static_cast<size_t>(i)]);
-            err4 += d * d;
-            den4 += static_cast<double>(ref4[static_cast<size_t>(i)]) * static_cast<double>(ref4[static_cast<size_t>(i)]);
-        }
-        CHECK_TRUE((err4 / std::max(den4, 1e-30)) < 1e-2, "FP8 E4M3FN factored Q4_K_I4 NMSE < 1e-2");
-
-        // 5. Exact zero cancellation under FP8 E4M3FN: when all unsigned nibbles are 0 (s4 == -8)
-        //    and bias m == 0, dequantized weights are identically 0. Because xsum must reduce the
-        //    same FP8-rounded activations as dot_b, output must be identically 0.0f even with
-        //    non-FP8-exact activations and large scale d.
-        std::vector<int8_t> s4_zero_u4(static_cast<size_t>(NB4 * 32 * N4), static_cast<int8_t>(-8));
-        std::vector<float> d4_large(static_cast<size_t>(NB4 * N4), 1024.0f);
-        std::vector<float> m4_zero(static_cast<size_t>(NB4 * N4), 0.0f);
-        std::vector<float> x4_inexact(static_cast<size_t>(K4));
-        for (int64_t k = 0; k < K4; ++k) {
-            x4_inexact[static_cast<size_t>(k)] =
-                1.3712345f * std::sin(0.73f * static_cast<float>(k + 1)) + 0.1111111f;
-        }
-        auto bz_qs = rt.buffer_from_host(0, s4_zero_u4.data(), cloudtpu::PjrtDType::S4, {1, 1, NB4, 32, N4});
-        auto bz_d = rt.buffer_from_host(0, d4_large.data(), cloudtpu::PjrtDType::F32, {1, 1, NB4, N4});
-        auto bz_m = rt.buffer_from_host(0, m4_zero.data(), cloudtpu::PjrtDType::F32, {1, 1, NB4, N4});
-        auto bz_x = rt.buffer_from_host(0, x4_inexact.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, K4});
-        std::array<PJRT_Buffer*, 4> inz = {
-            bz_qs->handle.get(), bz_d->handle.get(), bz_m->handle.get(), bz_x->handle.get()};
-        std::vector<cloudtpu::PjrtBufferPtr> outz;
-        rt.execute(ex4, 0, inz.data(), inz.size(), outz,
-                   {cloudtpu::PjrtDType::F32}, {{1, 1, 1, N4}}, true);
-        std::vector<float> gotz(static_cast<size_t>(N4), -1.0f);
-        rt.buffer_to_host(outz[0]->handle.get(), gotz.data(), gotz.size() * sizeof(float));
-        for (int64_t i = 0; i < N4; ++i) {
-            CHECK_TRUE(gotz[static_cast<size_t>(i)] == 0.0f,
-                       "FP8 E4M3FN Q4_K_I4 zero unsigned nibbles + zero m must cancel to exact 0.0f");
-        }
-    }
-
+    run_fp8_matmul_parity_on_runtime(rt);
     rt.shutdown();
     std::printf("  [PASS] FP8 f8E4M3FN scalar parity, tpu7x gating, BF16 fallback, & Q8_0/Q4_K_I4 dot_general parity\n");
 }
@@ -7271,15 +7317,23 @@ void test_freetile_mosaic_lowering(cloudtpu::PjrtRuntime& rt) {
 }
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    bool fp8_parity_only = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--fp8-parity-only") == 0) {
+            fp8_parity_only = true;
+        } else {
+            std::fprintf(stderr, "Usage: %s [--fp8-parity-only]\n", argv[0]);
+            return 2;
+        }
+    }
+
     bool mock_mode = true;
     if (const char* v = std::getenv("CLOUDTPU_MOCK")) {
         mock_mode = (std::atoi(v) != 0);
     }
-    std::printf("Running ggml-cloudtpu standalone tests (mock_mode=%d)...\n", mock_mode ? 1 : 0);
-
-    test_compile_options_proto();
-    test_half_bf16_conversions();
+    std::printf("Running ggml-cloudtpu standalone tests (mock_mode=%d%s)...\n",
+                mock_mode ? 1 : 0, fp8_parity_only ? ", fp8_parity_only=1" : "");
 
     cloudtpu::RuntimeConfig cfg;
     cfg.mock_mode = mock_mode;
@@ -7291,6 +7345,23 @@ int main() {
                 rt.platform_name().c_str(),
                 rt.platform_version().c_str(),
                 rt.device_info(0).kind.c_str());
+
+    if (fp8_parity_only) {
+        run_fp8_matmul_parity_on_runtime(rt);
+        std::printf("  [PASS] Live/runtime FP8 f8E4M3FN parity gate (Q8_0 & Q4_K_I4 NMSE < 1e-2 + exact zero cancellation)\n");
+        const size_t py_maps = cloudtpu::count_libpython_mappings();
+        std::printf("  MAPS_LIBPYTHON=%zu\n", py_maps);
+        if (py_maps != 0) {
+            std::fprintf(stderr, "FAIL: expected MAPS_LIBPYTHON=0, got %zu\n", py_maps);
+            ++g_failures;
+        }
+        rt.shutdown();
+        std::printf("OVERALL: %s (%d failures)\n", (g_failures == 0) ? "ALL PASSED" : "FAILED", g_failures);
+        return (g_failures == 0) ? 0 : 1;
+    }
+
+    test_compile_options_proto();
+    test_half_bf16_conversions();
 
     test_lru_cache_and_hbm_roundtrip(rt);
     test_multichip_device_assignment_and_eviction_lifetime();

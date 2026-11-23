@@ -1136,34 +1136,52 @@ PJRT_Error* ot_pjrt_client_create(PJRT_Client_Create_Args* args) {
     }
   }
 
-  ot_context_t* first_ctx = nullptr;
-  ot_status_t st = ot_context_create(&cfg, &first_ctx);
-  if (st != OT_OK) {
-    const char* detail = ot_context_last_error(nullptr);
-    std::string msg = std::string("ot_context_create failed: ") + ot_status_string(st);
-    if (detail && detail[0] != '\0') {
-      msg += " (";
-      msg += detail;
-      msg += ")";
-    }
-    return make_err(PJRT_Error_Code_INTERNAL, msg);
-  }
-
-  ot_device_info_t info = {};
-  (void)ot_device_get_info(first_ctx, &info);
-  ot_device_geometry_t geom = {};
-  (void)ot_device_get_geometry(first_ctx, &geom);
-
+  // Resolve mock topology profile BEFORE opening any ot_context_t so all created device
+  // contexts match the requested chip generation and invalid visible_devices fail early.
   std::string kind_str = "TPU v5 lite";
-  if (info.chip_gen == OT_CHIP_TPU7X) kind_str = "TPU v7x";
-  else if (info.chip_gen == OT_CHIP_V6E) kind_str = "TPU v6 lite";
-
   size_t pci_funcs = 1;
   size_t chiplets_per_func = 1;
 
   if (cfg.mock_mode) {
+    uint16_t mock_did = 0x0063u;
+    if (const char* did_env = std::getenv("OPENTPU_MOCK_DEVICE_ID")) {
+      uint64_t parsed = 0;
+      if (ot::parse_hex_u64(did_env, &parsed) && parsed <= 0xffffULL) {
+        mock_did = static_cast<uint16_t>(parsed);
+      }
+    } else if (const char* topo_env = std::getenv("OPENTPU_MOCK_TOPOLOGY")) {
+      if (std::strcmp(topo_env, "tpu7x-1t") == 0 || std::strcmp(topo_env, "tpu7x_1t") == 0 ||
+          std::strcmp(topo_env, "tpu7x-4t") == 0 || std::strcmp(topo_env, "tpu7x_4t") == 0) {
+        mock_did = 0x0075u;
+      } else if (std::strcmp(topo_env, "v6e-8") == 0 || std::strcmp(topo_env, "v6e_8") == 0) {
+        mock_did = 0x006fu;
+      } else if (std::strcmp(topo_env, "v5e-1") == 0 || std::strcmp(topo_env, "v5e_1") == 0) {
+        mock_did = 0x0063u;
+      } else if (const char* chip_env = std::getenv("OPENTPU_MOCK_CHIP")) {
+        if (std::strcmp(chip_env, "tpu7x") == 0 || std::strcmp(chip_env, "ironwood") == 0 ||
+            std::strcmp(chip_env, "v7x") == 0) {
+          mock_did = 0x0075u;
+        } else if (std::strcmp(chip_env, "v6e") == 0 || std::strcmp(chip_env, "trillium") == 0) {
+          mock_did = 0x006fu;
+        }
+      }
+    } else if (const char* chip_env = std::getenv("OPENTPU_MOCK_CHIP")) {
+      if (std::strcmp(chip_env, "tpu7x") == 0 || std::strcmp(chip_env, "ironwood") == 0 ||
+          std::strcmp(chip_env, "v7x") == 0) {
+        mock_did = 0x0075u;
+      } else if (std::strcmp(chip_env, "v6e") == 0 || std::strcmp(chip_env, "trillium") == 0) {
+        mock_did = 0x006fu;
+      }
+    }
+
+    ot_device_geometry_t mock_geom = {};
+    (void)ot::chip_geometry_for_device_id(mock_did, &mock_geom);
+    if (mock_geom.chip_gen == OT_CHIP_TPU7X) kind_str = "TPU v7x";
+    else if (mock_geom.chip_gen == OT_CHIP_V6E) kind_str = "TPU v6 lite";
+    else kind_str = "TPU v5 lite";
     chiplets_per_func =
-        geom.logical_chiplets_per_pci_func > 0 ? geom.logical_chiplets_per_pci_func : 1u;
+        mock_geom.logical_chiplets_per_pci_func > 0 ? mock_geom.logical_chiplets_per_pci_func : 1u;
+
     if (const char* topo_env = std::getenv("OPENTPU_MOCK_TOPOLOGY")) {
       if (std::strcmp(topo_env, "tpu7x-1t") == 0 || std::strcmp(topo_env, "tpu7x_1t") == 0) {
         kind_str = "TPU v7x";
@@ -1183,19 +1201,6 @@ PJRT_Error* ot_pjrt_client_create(PJRT_Client_Create_Args* args) {
         chiplets_per_func = 1;
       }
     }
-  } else {
-    // Keep live sysfs topology discovery separate from addressable PJRT devices:
-    // only expose live compute devices that have their own opened and execution-validated
-    // VFIO transport context (currently single-function TPU v5e 0x1ae0:0x0063).
-    if (info.chip_gen != OT_CHIP_V5E) {
-      ot_context_destroy(first_ctx);
-      return make_err(PJRT_Error_Code_UNIMPLEMENTED,
-                      "Live PJRT compute execution is validated on TPU v5e (0x1ae0:0x0063) only; "
-                      "unvalidated live devices/chiplets are not exposed as addressable PJRT devices");
-    }
-    kind_str = "TPU v5 lite";
-    pci_funcs = 1;
-    chiplets_per_func = 1;
   }
 
   const size_t total_logical = pci_funcs * chiplets_per_func;
@@ -1205,13 +1210,11 @@ PJRT_Error* ot_pjrt_client_create(PJRT_Client_Create_Args* args) {
     for (size_t i = 0; i < visible_devs.size(); ++i) {
       const int64_t vid = visible_devs[i];
       if (vid < 0 || static_cast<size_t>(vid) >= total_logical) {
-        ot_context_destroy(first_ctx);
         return make_err(PJRT_Error_Code_INVALID_ARGUMENT,
                         "visible_devices index out of range");
       }
       const int id = static_cast<int>(vid);
       if (std::find(selected_ids.begin(), selected_ids.end(), id) != selected_ids.end()) {
-        ot_context_destroy(first_ctx);
         return make_err(PJRT_Error_Code_INVALID_ARGUMENT,
                         "duplicate device index in visible_devices");
       }
@@ -1222,6 +1225,34 @@ PJRT_Error* ot_pjrt_client_create(PJRT_Client_Create_Args* args) {
     for (size_t i = 0; i < total_logical; ++i) {
       selected_ids.push_back(static_cast<int>(i));
     }
+  }
+
+  ot_context_t* first_ctx = nullptr;
+  ot_status_t st = ot_context_create(&cfg, &first_ctx);
+  if (st != OT_OK) {
+    const char* detail = ot_context_last_error(nullptr);
+    std::string msg = std::string("ot_context_create failed: ") + ot_status_string(st);
+    if (detail && detail[0] != '\0') {
+      msg += " (";
+      msg += detail;
+      msg += ")";
+    }
+    return make_err(PJRT_Error_Code_INTERNAL, msg);
+  }
+
+  if (!cfg.mock_mode) {
+    ot_device_info_t info = {};
+    (void)ot_device_get_info(first_ctx, &info);
+    // Keep live sysfs topology discovery separate from addressable PJRT devices:
+    // only expose live compute devices that have their own opened and execution-validated
+    // VFIO transport context (currently single-function TPU v5e 0x1ae0:0x0063).
+    if (info.chip_gen != OT_CHIP_V5E) {
+      ot_context_destroy(first_ctx);
+      return make_err(PJRT_Error_Code_UNIMPLEMENTED,
+                      "Live PJRT compute execution is validated on TPU v5e (0x1ae0:0x0063) only; "
+                      "unvalidated live devices/chiplets are not exposed as addressable PJRT devices");
+    }
+    kind_str = "TPU v5 lite";
   }
 
   auto* c = new (std::nothrow) PJRT_Client();
@@ -2404,15 +2435,26 @@ PJRT_Error* ot_pjrt_lexec_execute(PJRT_LoadedExecutable_Execute_Args* args) {
   }
   PJRT_Device* override_dev = nullptr;
   if (args->execute_device) {
+    bool in_client = false;
     for (const auto& d : le->client->devices) {
       if (d && args->execute_device == d.get()) {
-        override_dev = d.get();
+        in_client = true;
+        break;
+      }
+    }
+    if (!in_client) {
+      return make_err(PJRT_Error_Code_INVALID_ARGUMENT,
+                      "execute_device does not belong to this executable's client");
+    }
+    for (PJRT_Device* ad : le->assigned_devices) {
+      if (ad == args->execute_device) {
+        override_dev = ad;
         break;
       }
     }
     if (!override_dev) {
       return make_err(PJRT_Error_Code_INVALID_ARGUMENT,
-                      "execute_device does not belong to this executable's client");
+                      "execute_device is not in this executable's assigned devices");
     }
   }
   if (!args->argument_lists || !args->output_lists) {
@@ -3033,6 +3075,11 @@ namespace ot {
 
 void* pjrt_static_fallback_error_raw(uint32_t error_code) {
   return static_fallback_err(static_cast<PJRT_Error_Code>(error_code));
+}
+
+const ot_context_t* pjrt_device_context_raw(const void* pjrt_device) {
+  if (!pjrt_device) return nullptr;
+  return static_cast<const PJRT_Device*>(pjrt_device)->ctx;
 }
 
 }  // namespace ot
