@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 namespace {
@@ -32,6 +33,16 @@ int g_failures = 0;
             return;                                                                        \
         }                                                                                  \
     } while (0)
+
+void check_vec_close(const std::vector<float>& got,
+                     const std::vector<float>& exp,
+                     float tol,
+                     const char* msg) {
+    CHECK_TRUE(got.size() == exp.size(), msg);
+    for (size_t i = 0; i < got.size(); ++i) {
+        CHECK_NEAR(got[i], exp[i], tol, msg);
+    }
+}
 
 void test_compile_options_proto() {
     cloudtpu::PjrtCompileOptions o1;
@@ -118,7 +129,7 @@ std::vector<float> run_emitted(cloudtpu::PjrtRuntime& rt,
                                const std::vector<cloudtpu::PjrtBufferPtr>& inputs) {
     std::vector<PJRT_Buffer*> raw_in;
     for (const auto& b : inputs) raw_in.push_back(b->handle.get());
-    const auto* exec = rt.compile_or_get(prog.cache_key, prog.mlir_text);
+    const auto exec = rt.compile_or_get(prog.cache_key, prog.mlir_text, 0);
     std::vector<cloudtpu::PjrtDType> out_dts;
     std::vector<std::vector<int64_t>> out_dims;
     for (const auto& ob : prog.output_bindings) {
@@ -549,6 +560,136 @@ void test_silicon_regressions(cloudtpu::PjrtRuntime& rt) {
     std::printf("  [PASS] Silicon regressions (ROPE M=52, Q4_0/Q8_0 K=256)\n");
 }
 
+void test_multichip_device_assignment_and_eviction_lifetime() {
+    cloudtpu::RuntimeConfig cfg;
+    cfg.mock_mode = true;
+    cfg.exec_cache_cap = 1;
+    cfg.mock_device_count = 2;
+    cloudtpu::PjrtRuntime rt;
+    rt.init(cfg);
+    CHECK_TRUE(rt.device_count() == 2, "mock 2-chip device_count == 2");
+
+    cloudtpu::GraphProgramSpec spec;
+    spec.inputs.push_back({1, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 4}});
+    spec.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 4}});
+    cloudtpu::OpNodeSpec op;
+    op.kind = cloudtpu::CloudOpKind::ADD;
+    op.src_ids = {1, 2};
+    op.dst = {3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 4}};
+    spec.ops.push_back(op);
+    spec.output_ids = {3};
+    const auto prog = cloudtpu::emit_stablehlo_program(spec);
+
+    // Compile for chip 0, then compile same program for chip 1 (evicting chip 0 because cap=1).
+    const auto exec0 = rt.compile_or_get(prog.cache_key, prog.mlir_text, 0);
+    const auto exec1 = rt.compile_or_get(prog.cache_key, prog.mlir_text, 1);
+    CHECK_TRUE(exec0 != exec1, "distinct executables compiled per device");
+    CHECK_TRUE(rt.cache_stats().evictions == 1, "cap=1 evicted exec0 when exec1 inserted");
+
+    // Held shared_ptr keeps evicted exec0 alive through dispatch on chip 0.
+    const std::vector<float> a0 = {1.0f, 2.0f, 3.0f, 4.0f};
+    const std::vector<float> b0 = {10.0f, 20.0f, 30.0f, 40.0f};
+    auto ba0 = rt.buffer_from_host(0, a0.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, 4});
+    auto bb0 = rt.buffer_from_host(0, b0.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, 4});
+    PJRT_Buffer* in0[2] = {ba0->handle.get(), bb0->handle.get()};
+    std::vector<cloudtpu::PjrtBufferPtr> out0;
+    rt.execute(exec0, 0, in0, 2, out0, {cloudtpu::PjrtDType::F32}, {{1, 1, 1, 4}}, true);
+    std::vector<float> h0(4, 0.0f);
+    rt.buffer_to_host(out0[0]->handle.get(), h0.data(), h0.size() * sizeof(float));
+    check_vec_close(h0, {11.0f, 22.0f, 33.0f, 44.0f}, 1e-6f, "evicted exec0 dispatch");
+
+    // Execute exec1 on chip 1.
+    const std::vector<float> a1 = {2.0f, 4.0f, 6.0f, 8.0f};
+    const std::vector<float> b1 = {1.0f, 1.0f, 1.0f, 1.0f};
+    auto ba1 = rt.buffer_from_host(1, a1.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, 4});
+    auto bb1 = rt.buffer_from_host(1, b1.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, 4});
+    PJRT_Buffer* in1[2] = {ba1->handle.get(), bb1->handle.get()};
+    std::vector<cloudtpu::PjrtBufferPtr> out1;
+    rt.execute(exec1, 1, in1, 2, out1, {cloudtpu::PjrtDType::F32}, {{1, 1, 1, 4}}, true);
+    std::vector<float> h1(4, 0.0f);
+    rt.buffer_to_host(out1[0]->handle.get(), h1.data(), h1.size() * sizeof(float));
+    check_vec_close(h1, {3.0f, 5.0f, 7.0f, 9.0f}, 1e-6f, "chip 1 dispatch");
+
+    // Mismatched device execution must fail cleanly.
+    bool threw = false;
+    try {
+        std::vector<cloudtpu::PjrtBufferPtr> bad_out;
+        rt.execute(exec0, 1, in1, 2, bad_out, {cloudtpu::PjrtDType::F32}, {{1, 1, 1, 4}}, true);
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    CHECK_TRUE(threw, "mismatched device execution rejected");
+
+    rt.shutdown();
+    std::printf("  [PASS] Multi-chip device assignment & cache eviction lifetime\n");
+}
+
+void test_flash_attn_fully_masked_row(cloudtpu::PjrtRuntime& rt) {
+    // B=1, H_Q=1, H_KV=1, N_Q=2, N_KV=4, D=4:
+    // Query row 0 is unmasked; query row 1 is fully masked with -INFINITY and must return 0.0f.
+    constexpr int64_t B = 1, H = 1, NQ = 2, NKV = 4, D = 4;
+    const std::vector<float> q = {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.5f, 0.5f, 0.5f, 0.5f,
+    };
+    const std::vector<float> k = {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 1.0f,
+    };
+    const std::vector<float> v = {
+        1.0f, 2.0f, 3.0f, 4.0f,
+        5.0f, 6.0f, 7.0f, 8.0f,
+        9.0f, 10.0f, 11.0f, 12.0f,
+        13.0f, 14.0f, 15.0f, 16.0f,
+    };
+    const float neg_inf = -std::numeric_limits<float>::infinity();
+    const std::vector<float> mask = {
+        0.0f,    0.0f,    0.0f,    0.0f,
+        neg_inf, neg_inf, neg_inf, neg_inf,
+    };
+
+    auto bq = rt.buffer_from_host(0, q.data(), cloudtpu::PjrtDType::F32, {B, H, NQ, D});
+    auto bk = rt.buffer_from_host(0, k.data(), cloudtpu::PjrtDType::F32, {B, H, NKV, D});
+    auto bv = rt.buffer_from_host(0, v.data(), cloudtpu::PjrtDType::F32, {B, H, NKV, D});
+    auto bm = rt.buffer_from_host(0, mask.data(), cloudtpu::PjrtDType::F32, {B, H, NQ, NKV});
+
+    cloudtpu::GraphProgramSpec spec;
+    spec.inputs.push_back({1, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {B, H, NQ, D}});
+    spec.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {B, H, NKV, D}});
+    spec.inputs.push_back({3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {B, H, NKV, D}});
+    spec.inputs.push_back({4, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {B, H, NQ, NKV}});
+    cloudtpu::OpNodeSpec fa;
+    fa.kind = cloudtpu::CloudOpKind::FLASH_ATTN_EXT;
+    fa.src_ids = {1, 2, 3, 4};
+    fa.dst = {5, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {B, NQ, H, D}};
+    fa.flash_attn.scale = 1.0f;
+    fa.high_precision = true;
+    spec.ops.push_back(fa);
+    spec.output_ids = {5};
+
+    const auto out = run_emitted(rt, cloudtpu::emit_stablehlo_program(spec), {bq, bk, bv, bm});
+    // Row 0 scores = [1, 0, 0, 0] -> softmax probs
+    const float e1 = std::exp(1.0f);
+    const float denom = e1 + 3.0f;
+    const float p[4] = {e1 / denom, 1.0f / denom, 1.0f / denom, 1.0f / denom};
+    std::vector<float> expected(static_cast<size_t>(NQ * D), 0.0f);
+    for (int d = 0; d < D; ++d) {
+        float acc = 0.0f;
+        for (int j = 0; j < NKV; ++j) {
+            acc += p[j] * v[static_cast<size_t>(j * D + d)];
+        }
+        expected[static_cast<size_t>(d)] = acc;
+        expected[static_cast<size_t>(D + d)] = 0.0f;  // Fully masked row must be exact zero.
+    }
+    for (size_t i = 0; i < out.size(); ++i) {
+        CHECK_TRUE(std::isfinite(out[i]), "FLASH_ATTN_EXT output must be finite");
+    }
+    check_vec_close(out, expected, 1e-5f, "FLASH_ATTN_EXT fully masked row");
+    std::printf("  [PASS] FLASH_ATTN_EXT fully -INF masked row returns zero\n");
+}
+
 }  // namespace
 
 int main() {
@@ -573,8 +714,10 @@ int main() {
                 rt.device_info(0).kind.c_str());
 
     test_lru_cache_and_hbm_roundtrip(rt);
+    test_multichip_device_assignment_and_eviction_lifetime();
     test_mul_mat_dense_and_quant(rt);
     test_rms_rope_softmax_swiglu_getrows_fused(rt);
+    test_flash_attn_fully_masked_row(rt);
     test_silicon_regressions(rt);
 
     const size_t py_maps = cloudtpu::count_libpython_mappings();

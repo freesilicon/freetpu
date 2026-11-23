@@ -6,7 +6,9 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#if !defined(_WIN32)
 #include <dlfcn.h>
+#endif
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -202,10 +204,16 @@ void append_tag_varint(std::string& out, uint32_t field_number, uint64_t val) {
     append_varint(out, val);
 }
 
+void append_tag_bytes(std::string& out, uint32_t field_number, const std::string& payload) {
+    append_varint(out, (static_cast<uint64_t>(field_number) << 3) | 2ULL);
+    append_varint(out, payload.size());
+    out.append(payload);
+}
+
 }  // namespace
 
 std::string encode_compile_options_proto(const PjrtCompileOptions& opts) {
-    // xla::ExecutableBuildOptionsProto
+    // xla::ExecutableBuildOptionsProto (openxla/xla/xla/pjrt/proto/compile_options.proto)
     std::string ebo;
     if (opts.num_replicas > 0) {
         append_tag_varint(ebo, 4, static_cast<uint64_t>(opts.num_replicas));
@@ -216,21 +224,62 @@ std::string encode_compile_options_proto(const PjrtCompileOptions& opts) {
     if (opts.use_spmd_partitioning) {
         append_tag_varint(ebo, 6, 1);
     }
+    if (!opts.device_assignment_ids.empty()) {
+        // xla::DeviceAssignmentProto (field 9 of ExecutableBuildOptionsProto):
+        //   int32 replica_count = 1;
+        //   int32 computation_count = 2;
+        //   repeated ComputationDevice computation_devices = 3;
+        //     message ComputationDevice { repeated int64 replica_device_ids = 1; }
+        const int32_t replicas = std::max<int32_t>(1, opts.num_replicas);
+        const int32_t computations = std::max<int32_t>(1, opts.num_partitions);
+        if (opts.device_assignment_ids.size() !=
+            static_cast<size_t>(replicas) * static_cast<size_t>(computations)) {
+            throw std::runtime_error("encode_compile_options_proto: device_assignment_ids size mismatch");
+        }
+        std::string da;
+        append_tag_varint(da, 1, static_cast<uint64_t>(replicas));
+        append_tag_varint(da, 2, static_cast<uint64_t>(computations));
+        for (int32_t p = 0; p < computations; ++p) {
+            std::string packed_ids;
+            for (int32_t r = 0; r < replicas; ++r) {
+                const int64_t dev_id = opts.device_assignment_ids[static_cast<size_t>(p * replicas + r)];
+                append_varint(packed_ids, static_cast<uint64_t>(dev_id));
+            }
+            std::string comp_dev;
+            append_tag_bytes(comp_dev, 1, packed_ids);
+            append_tag_bytes(da, 3, comp_dev);
+        }
+        append_tag_bytes(ebo, 9, da);
+    }
     if (opts.use_shardy_partitioner) {
         append_tag_varint(ebo, 19, 1);
     }
 
     // xla::CompileOptionsProto { executable_build_options (field 3, length-delimited) }
     std::string out;
-    append_varint(out, (3ULL << 3) | 2ULL);
-    append_varint(out, ebo.size());
-    out.append(ebo);
+    append_tag_bytes(out, 3, ebo);
     return out;
 }
 
 // =========================================================================
-// PjrtBuffer Helpers
+// PjrtBuffer & PjrtLoadedExecutable Helpers
 // =========================================================================
+
+void PjrtLoadedExecutableDeleter::operator()(PJRT_LoadedExecutable* exec) const noexcept {
+    if (!exec || !api || !PJRT_API_HAS(api, PJRT_LoadedExecutable_Destroy)) {
+        return;
+    }
+    PJRT_LoadedExecutable_Destroy_Args args = {};
+    args.struct_size = PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
+    args.executable = exec;
+    PJRT_Error* err = api->PJRT_LoadedExecutable_Destroy(&args);
+    if (err && PJRT_API_HAS(api, PJRT_Error_Destroy)) {
+        PJRT_Error_Destroy_Args d_args = {};
+        d_args.struct_size = PJRT_Error_Destroy_Args_STRUCT_SIZE;
+        d_args.error = err;
+        api->PJRT_Error_Destroy(&d_args);
+    }
+}
 
 void PjrtBufferDeleter::operator()(PJRT_Buffer* buf) const noexcept {
     if (!buf || !api || !PJRT_API_HAS(api, PJRT_Buffer_Destroy)) {
@@ -1226,27 +1275,160 @@ struct MockError {
 };
 struct MockEvent {};
 struct MockClient;
+struct MockDeviceDescription {
+    int id = 0;
+    std::string to_str;
+};
 struct MockDevice {
     MockClient* client = nullptr;
-};
-struct MockDeviceDescription {};
-struct MockClient {
-    MockDevice device;
+    int id = 0;
     MockDeviceDescription desc;
+};
+struct MockClient {
+    std::vector<std::unique_ptr<MockDevice>> devices;
+    std::vector<PJRT_Device*> device_ptrs;
     int64_t allocated_bytes = 0;
 
-    MockClient() { device.client = this; }
+    explicit MockClient(int num_devices) {
+        const int count = std::max(1, num_devices);
+        devices.reserve(static_cast<size_t>(count));
+        device_ptrs.reserve(static_cast<size_t>(count));
+        for (int i = 0; i < count; ++i) {
+            auto d = std::make_unique<MockDevice>();
+            d->client = this;
+            d->id = i;
+            d->desc.id = i;
+            d->desc.to_str = "CLOUDTPU_MOCK(id=" + std::to_string(i) + ")";
+            device_ptrs.push_back(reinterpret_cast<PJRT_Device*>(d.get()));
+            devices.push_back(std::move(d));
+        }
+    }
 };
 struct MockBuffer {
     MockTensor tensor;
     MockClient* client = nullptr;
+    int device_id = 0;
 };
 struct MockExecutable {
     MockProgram program;
 };
 struct MockLoadedExecutable {
     MockExecutable exec;
+    int assigned_device_id = 0;
 };
+
+static bool pb_read_varint(const uint8_t* data, size_t size, size_t& pos, uint64_t& out) {
+    out = 0;
+    unsigned shift = 0;
+    while (pos < size && shift < 64) {
+        const uint8_t b = data[pos++];
+        out |= static_cast<uint64_t>(b & 0x7fU) << shift;
+        if ((b & 0x80U) == 0) {
+            return true;
+        }
+        shift += 7;
+    }
+    return false;
+}
+
+static bool pb_skip_field(const uint8_t* data, size_t size, size_t& pos, uint64_t wire_type) {
+    uint64_t v = 0;
+    switch (wire_type) {
+        case 0:
+            return pb_read_varint(data, size, pos, v);
+        case 1:
+            if (size - pos < 8) return false;
+            pos += 8;
+            return true;
+        case 2:
+            if (!pb_read_varint(data, size, pos, v) || v > size - pos) return false;
+            pos += static_cast<size_t>(v);
+            return true;
+        case 5:
+            if (size - pos < 4) return false;
+            pos += 4;
+            return true;
+        default:
+            return false;
+    }
+}
+
+static int parse_assigned_device_id_from_compile_options(const char* buf, size_t len) {
+    const auto* data = reinterpret_cast<const uint8_t*>(buf);
+    size_t pos = 0;
+    while (pos < len) {
+        uint64_t tag = 0;
+        if (!pb_read_varint(data, len, pos, tag)) break;
+        const uint64_t field = tag >> 3;
+        const uint64_t wt = tag & 7U;
+        if (field == 3 && wt == 2) {  // executable_build_options
+            uint64_t ebo_len = 0;
+            if (!pb_read_varint(data, len, pos, ebo_len) || ebo_len > len - pos) break;
+            const uint8_t* ebo = data + pos;
+            size_t epos = 0;
+            while (epos < ebo_len) {
+                uint64_t etag = 0;
+                if (!pb_read_varint(ebo, static_cast<size_t>(ebo_len), epos, etag)) break;
+                const uint64_t efield = etag >> 3;
+                const uint64_t ewt = etag & 7U;
+                if (efield == 9 && ewt == 2) {  // device_assignment
+                    uint64_t da_len = 0;
+                    if (!pb_read_varint(ebo, static_cast<size_t>(ebo_len), epos, da_len) ||
+                        da_len > ebo_len - epos) break;
+                    const uint8_t* da = ebo + epos;
+                    size_t dpos = 0;
+                    while (dpos < da_len) {
+                        uint64_t dtag = 0;
+                        if (!pb_read_varint(da, static_cast<size_t>(da_len), dpos, dtag)) break;
+                        const uint64_t dfield = dtag >> 3;
+                        const uint64_t dwt = dtag & 7U;
+                        if (dfield == 3 && dwt == 2) {  // computation_devices
+                            uint64_t cd_len = 0;
+                            if (!pb_read_varint(da, static_cast<size_t>(da_len), dpos, cd_len) ||
+                                cd_len > da_len - dpos) break;
+                            const uint8_t* cd = da + dpos;
+                            size_t cpos = 0;
+                            while (cpos < cd_len) {
+                                uint64_t ctag = 0;
+                                if (!pb_read_varint(cd, static_cast<size_t>(cd_len), cpos, ctag)) break;
+                                const uint64_t cfield = ctag >> 3;
+                                const uint64_t cwt = ctag & 7U;
+                                if (cfield == 1 && cwt == 2) {  // packed replica_device_ids
+                                    uint64_t ids_len = 0;
+                                    if (!pb_read_varint(cd, static_cast<size_t>(cd_len), cpos, ids_len) ||
+                                        ids_len > cd_len - cpos) break;
+                                    size_t ipos = 0;
+                                    uint64_t dev_id = 0;
+                                    if (pb_read_varint(cd + cpos, static_cast<size_t>(ids_len), ipos, dev_id)) {
+                                        return static_cast<int>(dev_id);
+                                    }
+                                    cpos += static_cast<size_t>(ids_len);
+                                } else if (cfield == 1 && cwt == 0) {
+                                    uint64_t dev_id = 0;
+                                    if (pb_read_varint(cd, static_cast<size_t>(cd_len), cpos, dev_id)) {
+                                        return static_cast<int>(dev_id);
+                                    }
+                                } else if (!pb_skip_field(cd, static_cast<size_t>(cd_len), cpos, cwt)) {
+                                    break;
+                                }
+                            }
+                            dpos += static_cast<size_t>(cd_len);
+                        } else if (!pb_skip_field(da, static_cast<size_t>(da_len), dpos, dwt)) {
+                            break;
+                        }
+                    }
+                    epos += static_cast<size_t>(da_len);
+                } else if (!pb_skip_field(ebo, static_cast<size_t>(ebo_len), epos, ewt)) {
+                    break;
+                }
+            }
+            pos += static_cast<size_t>(ebo_len);
+        } else if (!pb_skip_field(data, len, pos, wt)) {
+            break;
+        }
+    }
+    return 0;
+}
 
 static PJRT_Error* mock_error(const std::string& msg) {
     return reinterpret_cast<PJRT_Error*>(new MockError{msg});
@@ -1270,7 +1452,18 @@ static PJRT_Error* mock_event_destroy(PJRT_Event_Destroy_Args* args) {
 static PJRT_Error* mock_event_await(PJRT_Event_Await_Args*) { return nullptr; }
 
 static PJRT_Error* mock_client_create(PJRT_Client_Create_Args* args) {
-    args->client = reinterpret_cast<PJRT_Client*>(new MockClient());
+    int num_devices = 1;
+    if (args->create_options && args->num_options > 0) {
+        for (size_t i = 0; i < args->num_options; ++i) {
+            const PJRT_NamedValue& opt = args->create_options[i];
+            if (opt.name && opt.name_size == 17 &&
+                std::memcmp(opt.name, "mock_device_count", 17) == 0 &&
+                opt.type == PJRT_NamedValue_kInt64) {
+                num_devices = std::max(1, static_cast<int>(opt.int64_value));
+            }
+        }
+    }
+    args->client = reinterpret_cast<PJRT_Client*>(new MockClient(num_devices));
     return nullptr;
 }
 static PJRT_Error* mock_client_destroy(PJRT_Client_Destroy_Args* args) {
@@ -1291,19 +1484,18 @@ static PJRT_Error* mock_client_platform_version(PJRT_Client_PlatformVersion_Args
 }
 static PJRT_Error* mock_client_addressable_devices(PJRT_Client_AddressableDevices_Args* args) {
     auto* c = reinterpret_cast<MockClient*>(args->client);
-    static thread_local PJRT_Device* dev_arr[1];
-    dev_arr[0] = reinterpret_cast<PJRT_Device*>(&c->device);
-    args->addressable_devices = dev_arr;
-    args->num_addressable_devices = 1;
+    args->addressable_devices = c->device_ptrs.data();
+    args->num_addressable_devices = c->device_ptrs.size();
     return nullptr;
 }
 static PJRT_Error* mock_device_get_description(PJRT_Device_GetDescription_Args* args) {
     auto* d = reinterpret_cast<MockDevice*>(args->device);
-    args->device_description = reinterpret_cast<PJRT_DeviceDescription*>(&d->client->desc);
+    args->device_description = reinterpret_cast<PJRT_DeviceDescription*>(&d->desc);
     return nullptr;
 }
 static PJRT_Error* mock_dev_desc_id(PJRT_DeviceDescription_Id_Args* args) {
-    args->id = 0;
+    auto* dd = reinterpret_cast<MockDeviceDescription*>(args->device_description);
+    args->id = dd ? dd->id : 0;
     return nullptr;
 }
 static PJRT_Error* mock_dev_desc_kind(PJRT_DeviceDescription_Kind_Args* args) {
@@ -1313,9 +1505,15 @@ static PJRT_Error* mock_dev_desc_kind(PJRT_DeviceDescription_Kind_Args* args) {
     return nullptr;
 }
 static PJRT_Error* mock_dev_desc_to_string(PJRT_DeviceDescription_ToString_Args* args) {
-    static const char kStr[] = "CLOUDTPU_MOCK(id=0)";
-    args->to_string = kStr;
-    args->to_string_size = sizeof(kStr) - 1;
+    auto* dd = reinterpret_cast<MockDeviceDescription*>(args->device_description);
+    if (dd) {
+        args->to_string = dd->to_str.c_str();
+        args->to_string_size = dd->to_str.size();
+    } else {
+        static const char kStr[] = "CLOUDTPU_MOCK(id=0)";
+        args->to_string = kStr;
+        args->to_string_size = sizeof(kStr) - 1;
+    }
     return nullptr;
 }
 static PJRT_Error* mock_device_memory_stats(PJRT_Device_MemoryStats_Args* args) {
@@ -1329,6 +1527,7 @@ static PJRT_Error* mock_device_memory_stats(PJRT_Device_MemoryStats_Args* args) 
 
 static PJRT_Error* mock_buffer_from_host(PJRT_Client_BufferFromHostBuffer_Args* args) {
     auto* c = reinterpret_cast<MockClient*>(args->client);
+    auto* dev = reinterpret_cast<MockDevice*>(args->device);
     const PjrtDType dt = from_pjrt_buffer_type(args->type);
     if (dt == PjrtDType::INVALID) {
         return mock_error("MockPJRT: unsupported PJRT_Buffer_Type");
@@ -1336,6 +1535,7 @@ static PJRT_Error* mock_buffer_from_host(PJRT_Client_BufferFromHostBuffer_Args* 
     std::vector<int64_t> shape(args->dims, args->dims + args->num_dims);
     auto* mb = new MockBuffer();
     mb->client = c;
+    mb->device_id = dev ? dev->id : 0;
     mb->tensor.allocate(dt, std::move(shape));
     if (!mb->tensor.bytes.empty() && args->data) {
         std::memcpy(mb->tensor.bytes.data(), args->data, mb->tensor.bytes.size());
@@ -1392,6 +1592,8 @@ static PJRT_Error* mock_client_compile(PJRT_Client_Compile_Args* args) {
         const std::string code(args->program->code, args->program->code_size);
         auto* le = new MockLoadedExecutable();
         le->exec.program = parse_stablehlo_mlir(code);
+        le->assigned_device_id =
+            parse_assigned_device_id_from_compile_options(args->compile_options, args->compile_options_size);
         args->executable = reinterpret_cast<PJRT_LoadedExecutable*>(le);
         return nullptr;
     } catch (const std::exception& e) {
@@ -1420,6 +1622,14 @@ static PJRT_Error* mock_exec_num_outputs(PJRT_Executable_NumOutputs_Args* args) 
 static PJRT_Error* mock_loaded_exec_execute(PJRT_LoadedExecutable_Execute_Args* args) {
     try {
         auto* le = reinterpret_cast<MockLoadedExecutable*>(args->executable);
+        if (args->execute_device != nullptr) {
+            auto* req_dev = reinterpret_cast<MockDevice*>(args->execute_device);
+            if (req_dev->id != le->assigned_device_id) {
+                return mock_error("MockPJRT: execute_device id " + std::to_string(req_dev->id) +
+                                  " does not match compiled device assignment " +
+                                  std::to_string(le->assigned_device_id));
+            }
+        }
         const MockProgram& prog = le->exec.program;
         if (args->num_args != prog.args.size()) {
             return mock_error("MockPJRT: argument count mismatch");
@@ -1428,6 +1638,11 @@ static PJRT_Error* mock_loaded_exec_execute(PJRT_LoadedExecutable_Execute_Args* 
         MockClient* client = nullptr;
         for (size_t i = 0; i < args->num_args; ++i) {
             auto* mb = reinterpret_cast<MockBuffer*>(args->argument_lists[0][i]);
+            if (mb->device_id != le->assigned_device_id) {
+                return mock_error("MockPJRT: input buffer on device " + std::to_string(mb->device_id) +
+                                  " does not match executable device " +
+                                  std::to_string(le->assigned_device_id));
+            }
             if (!client) client = mb->client;
             env[prog.args[i].first] = mb->tensor;
         }
@@ -1437,6 +1652,7 @@ static PJRT_Error* mock_loaded_exec_execute(PJRT_LoadedExecutable_Execute_Args* 
         for (size_t oi = 0; oi < prog.return_names.size(); ++oi) {
             auto* out_mb = new MockBuffer();
             out_mb->client = client;
+            out_mb->device_id = le->assigned_device_id;
             out_mb->tensor = std::move(env.at(prog.return_names[oi]));
             if (client) {
                 client->allocated_bytes += static_cast<int64_t>(out_mb->tensor.bytes.size());
@@ -1562,6 +1778,10 @@ void PjrtRuntime::init(const RuntimeConfig& cfg) {
     if (is_mock_) {
         api_ = get_mock_pjrt_api();
     } else {
+#if defined(_WIN32)
+        throw std::runtime_error(
+            "Live libtpu.so loading is only supported on Linux/POSIX; use mock mode on Windows");
+#else
         setenv("GRPC_VERBOSITY", "ERROR", 0);
         const std::string so_path = resolve_libtpu_path(cfg.libtpu_path);
         dl_handle_ = dlopen(so_path.c_str(), RTLD_NOW | RTLD_GLOBAL);
@@ -1581,6 +1801,7 @@ void PjrtRuntime::init(const RuntimeConfig& cfg) {
         if (!api_) {
             throw std::runtime_error("GetPjrtApi() returned nullptr");
         }
+#endif
     }
 
     if (!PJRT_API_HAS(api_, PJRT_Error_Destroy) ||
@@ -1612,8 +1833,19 @@ void PjrtRuntime::init(const RuntimeConfig& cfg) {
         check_error(api_->PJRT_Plugin_Initialize(&init_args), "PJRT_Plugin_Initialize");
     }
 
+    PJRT_NamedValue mock_dev_opt = {};
+    mock_dev_opt.struct_size = PJRT_NamedValue_STRUCT_SIZE;
+    mock_dev_opt.name = "mock_device_count";
+    mock_dev_opt.name_size = 17;
+    mock_dev_opt.type = PJRT_NamedValue_kInt64;
+    mock_dev_opt.int64_value = std::max(1, cfg.mock_device_count);
+
     PJRT_Client_Create_Args c_args = {};
     c_args.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
+    if (is_mock_ && cfg.mock_device_count > 1) {
+        c_args.create_options = &mock_dev_opt;
+        c_args.num_options = 1;
+    }
     check_error(api_->PJRT_Client_Create(&c_args), "PJRT_Client_Create");
     client_ = c_args.client;
 
@@ -1859,21 +2091,51 @@ void PjrtRuntime::buffer_to_host(PJRT_Buffer* buf, void* dst, size_t dst_size) {
     }
 }
 
-const CachedExecutable* PjrtRuntime::compile_or_get(const std::string& cache_key,
-                                                    const std::string& mlir_text,
-                                                    const PjrtCompileOptions& opts) {
+CachedExecutablePtr PjrtRuntime::compile_or_get(const std::string& cache_key,
+                                                const std::string& mlir_text,
+                                                int device_idx,
+                                                const PjrtCompileOptions& opts) {
+    if (device_idx < 0 || device_idx >= static_cast<int>(devices_.size())) {
+        throw std::out_of_range("compile_or_get: device_idx out of range");
+    }
+
+    PjrtCompileOptions eff_opts = opts;
+    const int target_dev_id = device_infos_[static_cast<size_t>(device_idx)].id;
+    if (eff_opts.device_assignment_ids.empty() && eff_opts.num_replicas == 1 &&
+        eff_opts.num_partitions == 1 && devices_.size() > 1) {
+        eff_opts.device_assignment_ids.push_back(static_cast<int64_t>(target_dev_id));
+    }
+
+    std::string full_key = cache_key;
+    full_key.append("|dev=");
+    full_key.append(std::to_string(device_idx));
+    full_key.push_back(':');
+    full_key.append(std::to_string(target_dev_id));
+    if (eff_opts.num_replicas != 1 || eff_opts.num_partitions != 1 ||
+        !eff_opts.device_assignment_ids.empty()) {
+        full_key.append("|r=");
+        full_key.append(std::to_string(eff_opts.num_replicas));
+        full_key.append(",p=");
+        full_key.append(std::to_string(eff_opts.num_partitions));
+        full_key.append(",da=");
+        for (size_t i = 0; i < eff_opts.device_assignment_ids.size(); ++i) {
+            if (i > 0) full_key.push_back(',');
+            full_key.append(std::to_string(eff_opts.device_assignment_ids[i]));
+        }
+    }
+
     {
         std::lock_guard<std::mutex> lock(cache_mu_);
-        auto it = exec_cache_.find(cache_key);
+        auto it = exec_cache_.find(full_key);
         if (it != exec_cache_.end()) {
             cache_hits_ += 1;
             lru_order_.splice(lru_order_.begin(), lru_order_, it->second.lru_it);
-            return &it->second.exec;
+            return it->second.exec;
         }
     }
 
     const auto t0 = std::chrono::steady_clock::now();
-    const std::string opts_pb = encode_compile_options_proto(opts);
+    const std::string opts_pb = encode_compile_options_proto(eff_opts);
 
     PJRT_Program prog = {};
     prog.struct_size = PJRT_Program_STRUCT_SIZE;
@@ -1890,17 +2152,13 @@ const CachedExecutable* PjrtRuntime::compile_or_get(const std::string& cache_key
     c_args.compile_options_size = opts_pb.size();
 
     check_error(api_->PJRT_Client_Compile(&c_args), "PJRT_Client_Compile");
+    PjrtLoadedExecutableHandle loaded_handle(c_args.executable, PjrtLoadedExecutableDeleter{api_});
 
     PJRT_LoadedExecutable_GetExecutable_Args ge = {};
     ge.struct_size = PJRT_LoadedExecutable_GetExecutable_Args_STRUCT_SIZE;
-    ge.loaded_executable = c_args.executable;
+    ge.loaded_executable = loaded_handle.get();
     PJRT_Error* ge_err = api_->PJRT_LoadedExecutable_GetExecutable(&ge);
     if (ge_err || !ge.executable) {
-        PJRT_LoadedExecutable_Destroy_Args ld = {};
-        ld.struct_size = PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
-        ld.executable = c_args.executable;
-        PJRT_Error* derr = api_->PJRT_LoadedExecutable_Destroy(&ld);
-        if (derr) destroy_error(derr);
         if (ge_err) check_error(ge_err, "PJRT_LoadedExecutable_GetExecutable");
         throw std::runtime_error("PJRT_LoadedExecutable_GetExecutable returned null");
     }
@@ -1916,11 +2174,6 @@ const CachedExecutable* PjrtRuntime::compile_or_get(const std::string& cache_key
     PJRT_Error* ed_err = api_->PJRT_Executable_Destroy(&ed);
 
     if (no_err || ed_err) {
-        PJRT_LoadedExecutable_Destroy_Args ld = {};
-        ld.struct_size = PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
-        ld.executable = c_args.executable;
-        PJRT_Error* derr = api_->PJRT_LoadedExecutable_Destroy(&ld);
-        if (derr) destroy_error(derr);
         if (no_err) {
             if (ed_err) destroy_error(ed_err);
             check_error(no_err, "PJRT_Executable_NumOutputs");
@@ -1932,23 +2185,19 @@ const CachedExecutable* PjrtRuntime::compile_or_get(const std::string& cache_key
     const uint64_t compile_us = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
 
-    CachedExecutable exec;
-    exec.key = cache_key;
-    exec.handle = c_args.executable;
-    exec.num_outputs = no.num_outputs;
+    auto exec = std::make_shared<CachedExecutable>();
+    exec->key = full_key;
+    exec->handle = std::move(loaded_handle);
+    exec->device_idx = device_idx;
+    exec->num_outputs = no.num_outputs;
 
     std::lock_guard<std::mutex> lock(cache_mu_);
     // Re-check in case another thread compiled the same key concurrently.
-    auto existing = exec_cache_.find(cache_key);
+    auto existing = exec_cache_.find(full_key);
     if (existing != exec_cache_.end()) {
-        PJRT_LoadedExecutable_Destroy_Args ld = {};
-        ld.struct_size = PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
-        ld.executable = exec.handle;
-        PJRT_Error* derr = api_->PJRT_LoadedExecutable_Destroy(&ld);
-        if (derr) destroy_error(derr);
         cache_hits_ += 1;
         lru_order_.splice(lru_order_.begin(), lru_order_, existing->second.lru_it);
-        return &existing->second.exec;
+        return existing->second.exec;
     }
 
     cache_misses_ += 1;
@@ -1959,27 +2208,21 @@ const CachedExecutable* PjrtRuntime::compile_or_get(const std::string& cache_key
         const std::string& victim_key = lru_order_.back();
         auto vit = exec_cache_.find(victim_key);
         if (vit != exec_cache_.end()) {
-            PJRT_LoadedExecutable_Destroy_Args ld = {};
-            ld.struct_size = PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
-            ld.executable = vit->second.exec.handle;
-            PJRT_Error* derr = api_->PJRT_LoadedExecutable_Destroy(&ld);
-            if (derr) destroy_error(derr);
             exec_cache_.erase(vit);
             cache_evictions_ += 1;
         }
         lru_order_.pop_back();
     }
 
-    lru_order_.push_front(cache_key);
+    lru_order_.push_front(full_key);
     CacheEntry entry;
-    entry.exec = std::move(exec);
+    entry.exec = exec;
     entry.lru_it = lru_order_.begin();
-    auto [inserted_it, ok] = exec_cache_.emplace(cache_key, std::move(entry));
-    (void) ok;
-    return &inserted_it->second.exec;
+    exec_cache_.emplace(full_key, std::move(entry));
+    return exec;
 }
 
-void PjrtRuntime::execute(const CachedExecutable* exec,
+void PjrtRuntime::execute(const CachedExecutablePtr& exec,
                           int device_idx,
                           PJRT_Buffer* const* inputs,
                           size_t num_inputs,
@@ -1992,6 +2235,11 @@ void PjrtRuntime::execute(const CachedExecutable* exec,
     }
     if (device_idx < 0 || device_idx >= static_cast<int>(devices_.size())) {
         throw std::out_of_range("execute: device_idx out of range");
+    }
+    if (exec->device_idx != device_idx) {
+        throw std::runtime_error("execute: executable compiled for device " +
+                                 std::to_string(exec->device_idx) + ", cannot run on device " +
+                                 std::to_string(device_idx));
     }
     if (exec->num_outputs != out_dtypes.size() || exec->num_outputs != out_dims.size()) {
         throw std::runtime_error("execute: output count mismatch vs executable");
@@ -2011,16 +2259,15 @@ void PjrtRuntime::execute(const CachedExecutable* exec,
 
     PJRT_LoadedExecutable_Execute_Args ex = {};
     ex.struct_size = PJRT_LoadedExecutable_Execute_Args_STRUCT_SIZE;
-    ex.executable = exec->handle;
+    ex.executable = exec->handle.get();
     ex.options = &opts;
     ex.argument_lists = arg_lists;
     ex.num_devices = 1;
     ex.num_args = num_inputs;
     ex.output_lists = out_lists;
     ex.device_complete_events = use_dev_event ? dev_ev : nullptr;
-    // PJRT TPU plugins compile single-device executables with compile-time device assignment;
-    // passing nullptr avoids "execute_device not supported" errors on single-chip libtpu.so.
-    ex.execute_device = (devices_.size() > 1) ? devices_[static_cast<size_t>(device_idx)] : nullptr;
+    // Executable is statically assigned to the target chip via DeviceAssignmentProto at compile time.
+    ex.execute_device = nullptr;
 
     check_error(api_->PJRT_LoadedExecutable_Execute(&ex), "PJRT_LoadedExecutable_Execute");
 
@@ -2052,15 +2299,6 @@ void PjrtRuntime::execute(const CachedExecutable* exec,
 
 void PjrtRuntime::clear_exec_cache() {
     std::lock_guard<std::mutex> lock(cache_mu_);
-    for (auto& kv : exec_cache_) {
-        if (kv.second.exec.handle && api_ && PJRT_API_HAS(api_, PJRT_LoadedExecutable_Destroy)) {
-            PJRT_LoadedExecutable_Destroy_Args ld = {};
-            ld.struct_size = PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
-            ld.executable = kv.second.exec.handle;
-            PJRT_Error* derr = api_->PJRT_LoadedExecutable_Destroy(&ld);
-            if (derr) destroy_error(derr);
-        }
-    }
     exec_cache_.clear();
     lru_order_.clear();
 }

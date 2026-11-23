@@ -44,6 +44,7 @@ struct PjrtCompileOptions {
     int32_t num_partitions = 1;
     bool use_spmd_partitioning = true;
     bool use_shardy_partitioner = true;
+    std::vector<int64_t> device_assignment_ids;
 };
 
 // Encodes xla::CompileOptionsProto in pure C++ protobuf wire format (zero libprotobuf dep).
@@ -62,6 +63,7 @@ struct RuntimeConfig {
     bool mock_mode = false;
     int verbose = 0;
     uint32_t exec_cache_cap = 4096;
+    int mock_device_count = 1;
     std::string libtpu_path;
 };
 
@@ -94,11 +96,21 @@ struct PjrtBuffer {
 
 using PjrtBufferPtr = std::shared_ptr<PjrtBuffer>;
 
+struct PjrtLoadedExecutableDeleter {
+    const PJRT_Api* api = nullptr;
+    void operator()(PJRT_LoadedExecutable* exec) const noexcept;
+};
+
+using PjrtLoadedExecutableHandle = std::unique_ptr<PJRT_LoadedExecutable, PjrtLoadedExecutableDeleter>;
+
 struct CachedExecutable {
     std::string key;
-    PJRT_LoadedExecutable* handle = nullptr;
+    PjrtLoadedExecutableHandle handle;
+    int device_idx = 0;
     size_t num_outputs = 0;
 };
+
+using CachedExecutablePtr = std::shared_ptr<const CachedExecutable>;
 
 class PjrtRuntime {
 public:
@@ -132,13 +144,14 @@ public:
     void await_buffer_ready(PJRT_Buffer* buf);
     void await_event(PJRT_Event* ev);
 
-    // Compile StableHLO MLIR ("mlir" format) or return cached PJRT_LoadedExecutable*.
-    // Thread-safe LRU cache keyed by canonical structural program key.
-    const CachedExecutable* compile_or_get(const std::string& cache_key,
-                                           const std::string& mlir_text,
-                                           const PjrtCompileOptions& opts = {});
+    // Compile StableHLO MLIR ("mlir" format) or return an owning reference to a cached executable.
+    // Thread-safe LRU cache keyed by canonical structural program key and target device assignment.
+    CachedExecutablePtr compile_or_get(const std::string& cache_key,
+                                       const std::string& mlir_text,
+                                       int device_idx = 0,
+                                       const PjrtCompileOptions& opts = {});
 
-    void execute(const CachedExecutable* exec,
+    void execute(const CachedExecutablePtr& exec,
                  int device_idx,
                  PJRT_Buffer* const* inputs,
                  size_t num_inputs,
@@ -172,7 +185,7 @@ private:
     mutable std::mutex cache_mu_;
     using LruList = std::list<std::string>;
     struct CacheEntry {
-        CachedExecutable exec;
+        CachedExecutablePtr exec;
         LruList::iterator lru_it;
     };
     LruList lru_order_;

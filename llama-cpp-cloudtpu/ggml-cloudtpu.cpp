@@ -270,15 +270,92 @@ static bool is_supported_output_layout(const struct ggml_tensor* t) {
     return is_supported_output_layout(t->view_src);
 }
 
+static bool is_valid_strided_dense_layout(const struct ggml_tensor* t) {
+    if (!t || !is_dense_supported_type(t->type)) {
+        return false;
+    }
+    const size_t elem_sz = ggml_type_size(t->type);
+    const size_t total_bytes = ggml_nbytes(t);
+    if (elem_sz == 0 || total_bytes < elem_sz) {
+        return false;
+    }
+    size_t max_off = 0;
+    for (int d = 0; d < 4; ++d) {
+        if (t->ne[d] <= 0) {
+            return false;
+        }
+        const size_t extent = static_cast<size_t>(t->ne[d] - 1);
+        if (extent > 0 && t->nb[d] > (total_bytes - elem_sz - max_off) / extent) {
+            return false;
+        }
+        max_off += extent * t->nb[d];
+    }
+    return max_off + elem_sz <= total_bytes;
+}
+
+static void gather_strided_dense_bytes(const struct ggml_tensor* t,
+                                       const uint8_t* raw_src,
+                                       size_t raw_size,
+                                       std::vector<uint8_t>& out_dense) {
+    const size_t elem_sz = ggml_type_size(t->type);
+    const size_t n_elems = static_cast<size_t>(ggml_nelements(t));
+    out_dense.resize(n_elems * elem_sz);
+    uint8_t* dst = out_dense.data();
+    const int64_t ne0 = t->ne[0];
+    const int64_t ne1 = t->ne[1];
+    const int64_t ne2 = t->ne[2];
+    const int64_t ne3 = t->ne[3];
+    const size_t nb0 = t->nb[0];
+    const size_t nb1 = t->nb[1];
+    const size_t nb2 = t->nb[2];
+    const size_t nb3 = t->nb[3];
+    for (int64_t i3 = 0; i3 < ne3; ++i3) {
+        const size_t off3 = static_cast<size_t>(i3) * nb3;
+        for (int64_t i2 = 0; i2 < ne2; ++i2) {
+            const size_t off2 = off3 + static_cast<size_t>(i2) * nb2;
+            for (int64_t i1 = 0; i1 < ne1; ++i1) {
+                const size_t off1 = off2 + static_cast<size_t>(i1) * nb1;
+                if (nb0 == elem_sz) {
+                    const size_t row_bytes = static_cast<size_t>(ne0) * elem_sz;
+                    if (off1 + row_bytes > raw_size) {
+                        throw std::runtime_error("ggml-cloudtpu: strided gather out of bounds");
+                    }
+                    std::memcpy(dst, raw_src + off1, row_bytes);
+                    dst += row_bytes;
+                } else {
+                    for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                        const size_t off0 = off1 + static_cast<size_t>(i0) * nb0;
+                        if (off0 + elem_sz > raw_size) {
+                            throw std::runtime_error("ggml-cloudtpu: strided gather out of bounds");
+                        }
+                        std::memcpy(dst, raw_src + off0, elem_sz);
+                        dst += elem_sz;
+                    }
+                }
+            }
+        }
+    }
+}
+
 static bool is_supported_input_layout(const struct ggml_tensor* t, int depth = 0) {
     if (!t || depth > 8) {
         return false;
     }
     if (t->view_src == nullptr) {
-        return ggml_is_contiguous(t);
+        return ggml_is_contiguous(t) || is_valid_strided_dense_layout(t);
     }
     if (is_quant_split_type(t->type)) {
-        return is_supported_output_layout(t);
+        if (!is_supported_output_layout(t)) {
+            return false;
+        }
+        // Split quantized PJRT buffers encode the parent tensor's exact block shape;
+        // reject reshapes that alter logical dimensions relative to the underlying slot.
+        for (const struct ggml_tensor* cur = t; cur->view_src != nullptr; cur = cur->view_src) {
+            if (!ggml_are_same_shape(cur, cur->view_src)) {
+                return false;
+            }
+        }
+        return true;
     }
     const struct ggml_tensor* parent = view_parent(t);
     if (!parent) {
@@ -878,20 +955,51 @@ static void ggml_backend_cloudtpu_buffer_get_tensor(ggml_backend_buffer_t buffer
 static bool ggml_backend_cloudtpu_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
                                                     const struct ggml_tensor* src,
                                                     struct ggml_tensor* dst) {
+    const size_t src_bytes = ggml_nbytes(src);
+    const size_t dst_bytes = ggml_nbytes(dst);
+    if (src_bytes != dst_bytes) {
+        return false;
+    }
     if (ggml_backend_buffer_is_host(src->buffer)) {
-        ggml_backend_cloudtpu_buffer_set_tensor(buffer, dst, src->data, 0, ggml_nbytes(src));
+        if (!src->data) {
+            return false;
+        }
+        ggml_backend_cloudtpu_buffer_set_tensor(buffer, dst, src->data, 0, src_bytes);
         return true;
     }
-    if (is_cloudtpu_buffer(src->buffer) && src->type == dst->type && ggml_nbytes(src) == ggml_nbytes(dst)) {
+    // Restrict zero-copy HBM slot sharing to exact, non-view, contiguous allocations with
+    // identical type and shape. View/subview copies fall back to GGML's byte-range get/set
+    // path so parent slots are never clobbered or over-copied.
+    if (is_cloudtpu_buffer(src->buffer) &&
+        src->view_src == nullptr && dst->view_src == nullptr &&
+        ggml_is_contiguous(src) && ggml_is_contiguous(dst) &&
+        src->type == dst->type && ggml_are_same_shape(src, dst)) {
         auto* src_bctx = static_cast<ggml_backend_cloudtpu_buffer_context*>(src->buffer->context);
         auto* dst_bctx = static_cast<ggml_backend_cloudtpu_buffer_context*>(buffer->context);
         if (src_bctx->device_index == dst_bctx->device_index) {
             const size_t src_off = tensor_offset_in_buffer(src_bctx, src);
             const size_t dst_off = tensor_offset_in_buffer(dst_bctx, dst);
+            auto slot_matches_exact = [&](const CloudTpuTensorSlot& slot) -> bool {
+                return !slot.staging_dirty && slot.hbm_primary &&
+                       slot.nbytes == src_bytes && slot.ggml_dt == src->type &&
+                       slot.dims[0] == src->ne[3] && slot.dims[1] == src->ne[2] &&
+                       slot.dims[2] == src->ne[1] && slot.dims[3] == src->ne[0];
+            };
+            auto has_enclosing_parent_locked = [&](const ggml_backend_cloudtpu_buffer_context* bctx,
+                                                   size_t off, size_t nbytes) -> bool {
+                for (const auto& kv : bctx->slots) {
+                    const CloudTpuTensorSlot& s = kv.second;
+                    if (s.nbytes > nbytes && off >= s.offset && off + nbytes <= s.offset + s.nbytes) {
+                        return true;
+                    }
+                }
+                return false;
+            };
             if (src_bctx == dst_bctx) {
                 std::lock_guard<std::mutex> lock(src_bctx->mu);
                 auto sit = src_bctx->slots.find(src_off);
-                if (sit != src_bctx->slots.end() && !sit->second.staging_dirty && sit->second.hbm_primary) {
+                if (sit != src_bctx->slots.end() && slot_matches_exact(sit->second) &&
+                    !has_enclosing_parent_locked(dst_bctx, dst_off, dst_bytes)) {
                     CloudTpuTensorSlot copy = sit->second;
                     copy.offset = dst_off;
                     src_bctx->evict_overlapping_locked(dst_off, copy.nbytes, dst_off);
@@ -904,17 +1012,19 @@ static bool ggml_backend_cloudtpu_buffer_cpy_tensor(ggml_backend_buffer_t buffer
                 {
                     std::lock_guard<std::mutex> slock(src_bctx->mu);
                     auto sit = src_bctx->slots.find(src_off);
-                    if (sit != src_bctx->slots.end() && !sit->second.staging_dirty && sit->second.hbm_primary) {
+                    if (sit != src_bctx->slots.end() && slot_matches_exact(sit->second)) {
                         copy = sit->second;
                         ok = true;
                     }
                 }
                 if (ok) {
                     std::lock_guard<std::mutex> dlock(dst_bctx->mu);
-                    copy.offset = dst_off;
-                    dst_bctx->evict_overlapping_locked(dst_off, copy.nbytes, dst_off);
-                    dst_bctx->slots[dst_off] = std::move(copy);
-                    return true;
+                    if (!has_enclosing_parent_locked(dst_bctx, dst_off, dst_bytes)) {
+                        copy.offset = dst_off;
+                        dst_bctx->evict_overlapping_locked(dst_off, copy.nbytes, dst_off);
+                        dst_bctx->slots[dst_off] = std::move(copy);
+                        return true;
+                    }
                 }
             }
         }
@@ -984,6 +1094,29 @@ static size_t ggml_backend_cloudtpu_buffer_type_get_alignment(ggml_backend_buffe
     return CLOUDTPU_BUFFER_ALIGNMENT;
 }
 
+static size_t ggml_backend_cloudtpu_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft,
+                                                               const struct ggml_tensor* tensor) {
+    GGML_UNUSED(buft);
+    if (!tensor) {
+        return 0;
+    }
+    const size_t packed = ggml_nbytes(tensor);
+    const int64_t K = tensor->ne[0];
+    if (K > 0 && (K % QK_K) == 0 && (tensor->type == GGML_TYPE_Q4_K || tensor->type == GGML_TYPE_Q6_K)) {
+        const size_t n_blocks = static_cast<size_t>(K / QK_K) *
+                                static_cast<size_t>(std::max<int64_t>(1, tensor->ne[1])) *
+                                static_cast<size_t>(std::max<int64_t>(1, tensor->ne[2])) *
+                                static_cast<size_t>(std::max<int64_t>(1, tensor->ne[3]));
+        // Split HBM representation expands Q4_K (128B u8 + 32B f32 d + 32B f32 m = 192B/block)
+        // and Q6_K (256B s8 + 64B f32 d = 320B/block) relative to packed GGML blocks.
+        const size_t bytes_per_block = (tensor->type == GGML_TYPE_Q4_K) ? 192U : 320U;
+        if (n_blocks <= SIZE_MAX / bytes_per_block) {
+            return std::max(packed, n_blocks * bytes_per_block);
+        }
+    }
+    return packed;
+}
+
 static bool ggml_backend_cloudtpu_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
     GGML_UNUSED(buft);
     return false;
@@ -1003,6 +1136,8 @@ struct ggml_backend_cloudtpu_context {
     uint64_t total_graph_evals = 0;
     uint64_t total_subgraphs = 0;
     uint64_t total_ops_executed = 0;
+    std::mutex sync_mu;
+    std::vector<cloudtpu::PjrtBufferPtr> pending_sync_buffers;
 
     ~ggml_backend_cloudtpu_context() {
         if (env.verbose > 0) {
@@ -1033,6 +1168,10 @@ struct ggml_backend_cloudtpu_context {
 static bool is_view_noop_op(enum ggml_op op) {
     return op == GGML_OP_NONE || op == GGML_OP_RESHAPE || op == GGML_OP_VIEW ||
            op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
+}
+
+static bool is_skipped_graph_node(const struct ggml_tensor* node) {
+    return !node || is_view_noop_op(node->op) || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0;
 }
 
 static bool ggml_backend_cloudtpu_device_supports_op_impl(const struct ggml_tensor* op) {
@@ -1370,6 +1509,56 @@ static void resolve_tensor_hbm(cloudtpu::PjrtRuntime& rt,
                                cloudtpu::PjrtBufferPtr& out_primary,
                                cloudtpu::PjrtBufferPtr& out_scales,
                                cloudtpu::PjrtBufferPtr& out_mins) {
+    // Standalone non-contiguous dense tensors (e.g. scheduler split copies of CPU strided views)
+    // are stored as raw strided bytes and gathered into canonical dense order before dispatch.
+    if (t->view_src == nullptr && !ggml_is_contiguous(t) && is_valid_strided_dense_layout(t)) {
+        const size_t raw_bytes = ggml_nbytes(t);
+        std::vector<uint8_t> dense_bytes;
+        if (t->buffer && is_cloudtpu_buffer(t->buffer)) {
+            auto* bctx = static_cast<ggml_backend_cloudtpu_buffer_context*>(t->buffer->context);
+            const size_t t_off = tensor_offset_in_buffer(bctx, t);
+            std::vector<uint8_t> raw_host;
+            bool found = false;
+            {
+                std::lock_guard<std::mutex> lock(bctx->mu);
+                auto it = bctx->slots.find(t_off);
+                if (it != bctx->slots.end() && it->second.nbytes >= raw_bytes) {
+                    const CloudTpuTensorSlot& slot = it->second;
+                    raw_host.resize(slot.nbytes);
+                    if (slot.staging_dirty && !slot.staging.empty()) {
+                        std::memcpy(raw_host.data(), slot.staging.data(), slot.nbytes);
+                        found = true;
+                    } else if (slot.hbm_primary) {
+                        download_slot_to_host(rt, slot, raw_host.data());
+                        found = true;
+                    }
+                }
+            }
+            if (!found) {
+                if (t->op == GGML_OP_NONE) {
+                    raw_host.assign(raw_bytes, 0);
+                } else {
+                    throw std::runtime_error("ggml-cloudtpu: missing HBM slot for strided input tensor '" +
+                                             std::string(t->name) + "'");
+                }
+            }
+            gather_strided_dense_bytes(t, raw_host.data(), raw_host.size(), dense_bytes);
+        } else {
+            if (!t->data) {
+                throw std::runtime_error("ggml-cloudtpu: null host data pointer for strided tensor '" +
+                                         std::string(t->name) + "'");
+            }
+            gather_strided_dense_bytes(
+                t, static_cast<const uint8_t*>(t->data), raw_bytes, dense_bytes);
+        }
+        const cloudtpu::PjrtDType pdt = ggml_type_to_pjrt(t->type);
+        out_primary = rt.buffer_from_host(
+            device_index, dense_bytes.data(), pdt, {t->ne[3], t->ne[2], t->ne[1], t->ne[0]});
+        out_scales.reset();
+        out_mins.reset();
+        return;
+    }
+
     if (t->buffer && is_cloudtpu_buffer(t->buffer)) {
         auto* bctx = static_cast<ggml_backend_cloudtpu_buffer_context*>(t->buffer->context);
         const size_t t_off = tensor_offset_in_buffer(bctx, t);
@@ -1389,16 +1578,25 @@ static void resolve_tensor_hbm(cloudtpu::PjrtRuntime& rt,
                 return;
             }
         }
-        // Check if tensor is a contiguous view aliasing a parent slot at offset 0 with matching element count.
+        // Check if tensor is a contiguous view aliasing a parent slot at offset 0 with matching
+        // type and exact shape (split quantized PJRT buffers must never be reused across reshapes).
         if (t->view_src != nullptr && t->view_offs == 0 && ggml_is_contiguous(t)) {
             const struct ggml_tensor* base = unwrap_view_src(t);
             const size_t base_off = tensor_offset_in_buffer(bctx, base);
             auto bit = bctx->slots.find(base_off);
-            if (bit != bctx->slots.end() && bit->second.hbm_primary) {
-                out_primary = bit->second.hbm_primary;
-                out_scales = bit->second.hbm_scales;
-                out_mins = bit->second.hbm_mins;
-                return;
+            if (bit != bctx->slots.end()) {
+                if (bit->second.staging_dirty && !bit->second.staging.empty()) {
+                    upload_raw_tensor_to_slot(
+                        rt, bctx->device_index, bit->second, base, bit->second.staging.data());
+                }
+                if (bit->second.hbm_primary && bit->second.ggml_dt == t->type &&
+                    bit->second.dims[0] == t->ne[3] && bit->second.dims[1] == t->ne[2] &&
+                    bit->second.dims[2] == t->ne[1] && bit->second.dims[3] == t->ne[0]) {
+                    out_primary = bit->second.hbm_primary;
+                    out_scales = bit->second.hbm_scales;
+                    out_mins = bit->second.hbm_mins;
+                    return;
+                }
             }
         }
         // Uninitialized zero-filled HBM buffer for newly allocated leaf/KV-cache buffers before first write.
@@ -1551,21 +1749,47 @@ static cloudtpu::OpNodeSpec build_op_node_spec(const struct ggml_tensor* node,
     return spec;
 }
 
+static void ggml_backend_cloudtpu_synchronize_ctx(ggml_backend_cloudtpu_context* ctx) {
+    if (!ctx) {
+        return;
+    }
+    std::vector<cloudtpu::PjrtBufferPtr> to_wait;
+    {
+        std::lock_guard<std::mutex> lock(ctx->sync_mu);
+        to_wait.swap(ctx->pending_sync_buffers);
+    }
+    if (to_wait.empty()) {
+        return;
+    }
+    cloudtpu::PjrtRuntime& rt = cloudtpu::shared_pjrt_runtime(nullptr);
+    if (!rt.is_initialized()) {
+        return;
+    }
+    for (const auto& buf : to_wait) {
+        if (buf && buf->handle) {
+            rt.await_buffer_ready(buf->handle.get());
+        }
+    }
+}
+
 static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
                                          cloudtpu::PjrtRuntime& rt,
                                          struct ggml_cgraph* cgraph,
                                          int start_idx,
-                                         int end_idx) {
+                                         int end_idx,
+                                         bool is_final_subgraph) {
     // Identify which tensors produced inside [start_idx, end_idx) are consumed inside vs outside.
     std::unordered_set<const struct ggml_tensor*> produced_in_slice;
     std::unordered_set<const struct ggml_tensor*> consumed_inside;
     std::unordered_set<const struct ggml_tensor*> needed_outside;
     for (int i = start_idx; i < end_idx; ++i) {
-        produced_in_slice.insert(cgraph->nodes[i]);
+        if (!is_skipped_graph_node(cgraph->nodes[i])) {
+            produced_in_slice.insert(cgraph->nodes[i]);
+        }
     }
     for (int i = start_idx; i < end_idx; ++i) {
         const struct ggml_tensor* n = cgraph->nodes[i];
-        if (is_view_noop_op(n->op)) {
+        if (is_skipped_graph_node(n)) {
             continue;
         }
         for (int s = 0; s < GGML_MAX_SRC; ++s) {
@@ -1578,6 +1802,9 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
     }
     for (int i = end_idx; i < cgraph->n_nodes; ++i) {
         const struct ggml_tensor* n = cgraph->nodes[i];
+        if (!n || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
         for (int s = 0; s < GGML_MAX_SRC; ++s) {
             for (const struct ggml_tensor* cur = n->src[s]; cur != nullptr; cur = view_parent(cur)) {
                 if (produced_in_slice.count(cur)) {
@@ -1611,19 +1838,19 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
     std::vector<bool> overwritten_after_slice(static_cast<size_t>(slice_len), false);
     for (int i = start_idx; i < end_idx; ++i) {
         const struct ggml_tensor* ni = cgraph->nodes[i];
-        if (is_view_noop_op(ni->op)) {
+        if (is_skipped_graph_node(ni)) {
             continue;
         }
         for (int k = i + 1; k < end_idx; ++k) {
             const struct ggml_tensor* nk = cgraph->nodes[k];
-            if (!is_view_noop_op(nk->op) && ranges_overlap(ni, nk)) {
+            if (!is_skipped_graph_node(nk) && ranges_overlap(ni, nk)) {
                 overwritten_in_slice[static_cast<size_t>(i - start_idx)] = true;
                 break;
             }
         }
         for (int k = end_idx; k < cgraph->n_nodes; ++k) {
             const struct ggml_tensor* nk = cgraph->nodes[k];
-            if (!is_view_noop_op(nk->op) && ranges_overlap(ni, nk)) {
+            if (!is_skipped_graph_node(nk) && ranges_overlap(ni, nk)) {
                 overwritten_after_slice[static_cast<size_t>(i - start_idx)] = true;
                 break;
             }
@@ -1717,7 +1944,7 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
 
     for (int i = start_idx; i < end_idx; ++i) {
         struct ggml_tensor* node = cgraph->nodes[i];
-        if (is_view_noop_op(node->op)) {
+        if (is_skipped_graph_node(node)) {
             continue;
         }
 
@@ -1797,7 +2024,8 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
                       emitted.input_bindings.size(), prog_spec.ops.size(), emitted.output_bindings.size(),
                       emitted.mlir_text.c_str());
     }
-    const cloudtpu::CachedExecutable* exec = rt.compile_or_get(emitted.cache_key, emitted.mlir_text);
+    const cloudtpu::CachedExecutablePtr exec =
+        rt.compile_or_get(emitted.cache_key, emitted.mlir_text, ctx->device_index);
 
     // Resolve HBM PJRT_Buffer* inputs (keeping transient buffers alive through execute).
     std::vector<cloudtpu::PjrtBufferPtr> held_inputs;
@@ -1835,7 +2063,7 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
     }
 
     std::vector<cloudtpu::PjrtBufferPtr> outputs;
-    const bool sync_exec = (end_idx == cgraph->n_nodes) || !ctx->env.fuse_graphs;
+    const bool sync_exec = is_final_subgraph || !ctx->env.fuse_graphs;
     rt.execute(exec,
                ctx->device_index,
                raw_inputs.data(),
@@ -1849,10 +2077,23 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
         struct ggml_tensor* out_t = id_to_output_tensor.at(emitted.output_bindings[oi].tensor_id);
         store_tensor_hbm(rt, out_t, outputs[oi]);
     }
+    {
+        std::lock_guard<std::mutex> lock(ctx->sync_mu);
+        if (sync_exec) {
+            ctx->pending_sync_buffers.clear();
+        } else {
+            ctx->pending_sync_buffers = outputs;
+        }
+    }
 
     ctx->total_subgraphs += 1;
     ctx->total_ops_executed += prog_spec.ops.size();
     return GGML_STATUS_SUCCESS;
+}
+
+static void ggml_backend_cloudtpu_synchronize(ggml_backend_t backend) {
+    auto* ctx = static_cast<ggml_backend_cloudtpu_context*>(backend->context);
+    ggml_backend_cloudtpu_synchronize_ctx(ctx);
 }
 
 static enum ggml_status ggml_backend_cloudtpu_graph_compute(ggml_backend_t backend,
@@ -1861,10 +2102,18 @@ static enum ggml_status ggml_backend_cloudtpu_graph_compute(ggml_backend_t backe
     cloudtpu::PjrtRuntime& rt = ensure_runtime_initialized();
     ctx->total_graph_evals += 1;
 
+    int last_exec_idx = -1;
+    for (int k = cgraph->n_nodes - 1; k >= 0; --k) {
+        if (!is_skipped_graph_node(cgraph->nodes[k])) {
+            last_exec_idx = k;
+            break;
+        }
+    }
+
     int i = 0;
     try {
         while (i < cgraph->n_nodes) {
-            if (is_view_noop_op(cgraph->nodes[i]->op)) {
+            if (is_skipped_graph_node(cgraph->nodes[i])) {
                 ++i;
                 continue;
             }
@@ -1881,12 +2130,14 @@ static enum ggml_status ggml_backend_cloudtpu_graph_compute(ggml_backend_t backe
                      cgraph->nodes[i]->view_src != nullptr);
                 int fused_ops = 1;
                 if (!start_breaks_after) {
-                    while (j < cgraph->n_nodes && fused_ops < 16 &&
-                           ggml_backend_cloudtpu_device_supports_op_impl(cgraph->nodes[j])) {
+                    while (j < cgraph->n_nodes && fused_ops < 16) {
                         const struct ggml_tensor* nj = cgraph->nodes[j];
-                        if (is_view_noop_op(nj->op)) {
+                        if (is_skipped_graph_node(nj)) {
                             ++j;
                             continue;
+                        }
+                        if (!ggml_backend_cloudtpu_device_supports_op_impl(nj)) {
+                            break;
                         }
                         // Isolate KV-cache mutations (SET_ROWS), in-place views, and dynamic-n_kv
                         // attention (FLASH_ATTN_EXT) at subgraph boundaries so static-shape QKV/FFN
@@ -1898,17 +2149,19 @@ static enum ggml_status ggml_backend_cloudtpu_graph_compute(ggml_backend_t backe
                         ++j;
                         ++fused_ops;
                     }
-                    while (j > i + 1 && is_view_noop_op(cgraph->nodes[j - 1]->op)) {
+                    while (j > i + 1 && is_skipped_graph_node(cgraph->nodes[j - 1])) {
                         --j;
                     }
                 }
             }
-            const enum ggml_status st = execute_subgraph(ctx, rt, cgraph, i, j);
+            const bool is_final_subgraph = (j > last_exec_idx);
+            const enum ggml_status st = execute_subgraph(ctx, rt, cgraph, i, j, is_final_subgraph);
             if (st != GGML_STATUS_SUCCESS) {
                 return st;
             }
             i = j;
         }
+        ggml_backend_cloudtpu_synchronize_ctx(ctx);
         return GGML_STATUS_SUCCESS;
     } catch (const std::exception& e) {
         GGML_LOG_ERROR("ggml-cloudtpu: graph_compute error at node %d (%s '%s'): %s\n",
@@ -1938,7 +2191,7 @@ static struct ggml_backend_i ggml_backend_cloudtpu_i = {
     /* .set_tensor_2d_async = */ NULL,
     /* .get_tensor_2d_async = */ NULL,
     /* .cpy_tensor_async    = */ NULL,
-    /* .synchronize         = */ NULL,
+    /* .synchronize         = */ ggml_backend_cloudtpu_synchronize,
     /* .graph_plan_create   = */ NULL,
     /* .graph_plan_free     = */ NULL,
     /* .graph_plan_update   = */ NULL,
@@ -2097,7 +2350,7 @@ static cloudtpu_reg_state& get_reg_state(ggml_backend_reg_t reg) {
                         /* .alloc_buffer_n   = */ NULL,
                         /* .get_alignment    = */ ggml_backend_cloudtpu_buffer_type_get_alignment,
                         /* .get_max_size     = */ NULL,
-                        /* .get_alloc_size   = */ NULL,
+                        /* .get_alloc_size   = */ ggml_backend_cloudtpu_buffer_type_get_alloc_size,
                         /* .get_alloc_size_n = */ NULL,
                         /* .is_host          = */ ggml_backend_cloudtpu_buffer_type_is_host,
                     },

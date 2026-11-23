@@ -786,7 +786,9 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                 SsaValue zero = builder.emit_const_splat_f32(0.0f, {}, PjrtDType::F32);
                 SsaValue rsum = builder.emit_reduce_axis(exps, zero, 3, "stablehlo.add");
                 SsaValue rsum_b = builder.emit_broadcast_in_dim(rsum, {0, 1, 2}, s.dims);
-                SsaValue probs = builder.emit_binary("stablehlo.divide", exps, rsum_b);
+                SsaValue one_f = builder.emit_const_splat_f32(1.0f, s.dims, PjrtDType::F32);
+                SsaValue safe_rsum = builder.emit_binary("stablehlo.maximum", rsum_b, one_f);
+                SsaValue probs = builder.emit_binary("stablehlo.divide", exps, safe_rsum);
                 result = builder.emit_convert(probs, op.dst.dtype);
                 break;
             }
@@ -968,7 +970,9 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                 SsaValue zero = builder.emit_const_splat_f32(0.0f, {}, PjrtDType::F32);
                 SsaValue rsum = builder.emit_reduce_axis(exps, zero, 3, "stablehlo.add");
                 SsaValue rsum_b = builder.emit_broadcast_in_dim(rsum, {0, 1, 2}, sc_dims);
-                SsaValue probs = builder.emit_binary("stablehlo.divide", exps, rsum_b);
+                SsaValue one_f = builder.emit_const_splat_f32(1.0f, sc_dims, PjrtDType::F32);
+                SsaValue safe_rsum = builder.emit_binary("stablehlo.maximum", rsum_b, one_f);
+                SsaValue probs = builder.emit_binary("stablehlo.divide", exps, safe_rsum);
 
                 // out_bhqd = probs @ v : [B, H_Q, N_Q, N_KV] x [B, H_Q, N_KV, DV] -> [B, H_Q, N_Q, DV]
                 SsaValue out_bhqd = builder.emit_dot_general(
