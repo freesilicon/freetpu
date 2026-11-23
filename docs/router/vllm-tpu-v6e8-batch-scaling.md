@@ -22,7 +22,7 @@ With the preset flags (`--max-num-seqs 128`, `--max-num-batched-tokens 2048`, `-
 
 ### Persistent Model Weights & XLA Compilation Cache
 
-The default Cloud TPU VM boot disk (`100 GiB`) cannot hold `Llama-3.3-70B-Instruct` BF16 weights (`~141 GB`) plus XLA compilation artifacts, and Compute Engine Local SSD is ephemeral and discarded on Spot preemption. Cloud TPU `v6e` supports attached **Hyperdisk** rather than Persistent Disk — attach a retained **Hyperdisk Balanced** (`hyperdisk-balanced`, `>= 250 GiB` for 70B BF16 weights + caches, `auto-delete=no`, read-write mode) mounted at `/mnt/disks/tpu-cache` for Hugging Face weights (and optionally XLA cache), or use a **GCS bucket** for shared XLA caching across Spot replacements:
+The default Cloud TPU VM boot disk (`10 GB`) cannot hold the unpacked `vllm/vllm-tpu` container image (`~2.32 GB` compressed download requiring extra space in Docker storage to unpack), `Llama-3.3-70B-Instruct` BF16 weights (`~141 GB`), or XLA compilation artifacts, and Compute Engine Local SSD is ephemeral and discarded on Spot preemption. Before pulling and unpacking the pinned `vllm/vllm-tpu` image, verify sufficient free space in Docker's `data-root` storage (for example, move Docker's `data-root` onto the attached Hyperdisk mount or provision a larger boot disk). Cloud TPU `v6e` supports attached **Hyperdisk** rather than Persistent Disk — attach a retained **Hyperdisk Balanced** (`hyperdisk-balanced`, `>= 250 GiB` for 70B BF16 weights + caches, `auto-delete=no`, read-write mode) mounted at `/mnt/disks/tpu-cache` for Hugging Face weights (and optionally XLA cache and Docker `data-root`), or use a **GCS bucket** for shared XLA caching across Spot replacements:
 
 ```bash
 # Option A: Retained Hyperdisk Balanced (`--type=hyperdisk-balanced`, >=250 GiB)
@@ -54,7 +54,7 @@ Before launching either preset with `--device=freetpu.dev/tpu=all`, enable CDI i
 sudo python3 ops/tpu-cdi/freetpu_cdi.py generate --output /var/run/cdi/freetpu.json --validate
 ```
 
-Per the verified Cloud TPU `v6e-8` CDI contract (no `--privileged` required; `--net=host` is required for 8-chip `libtpu` coordinator initialization). Both BF16 presets below share `CONTAINER_FLAGS`, mounting both `HF_HUB_CACHE` and the XLA compilation cache off the retained Hyperdisk so neither weights nor compiled artifacts live on the 100 GiB boot disk:
+Per the verified Cloud TPU `v6e-8` CDI contract (no `--privileged` required; `--net=host` is required for 8-chip `libtpu` coordinator initialization). Both BF16 presets below share `CONTAINER_FLAGS`, mounting both `HF_HUB_CACHE` and the XLA compilation cache off the retained Hyperdisk so neither weights nor compiled artifacts live on the default `10 GB` boot disk:
 
 ```bash
 CONTAINER_FLAGS=(

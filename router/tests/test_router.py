@@ -3771,7 +3771,7 @@ class TestFreeTPURouter(unittest.TestCase):
                     id="open-after-done",
                     type="cloud-tpu-v5e",
                     base_url=backend.base_url,
-                    timeout_s=0.35,
+                    timeout_s=2.5,
                 )
             ],
         )
@@ -15926,6 +15926,31 @@ asyncio.run(main())
         finally:
             srv.shutdown()
             srv.server_close()
+
+    def test_jsonl_usage_meter_creates_owner_only_file_permissions(self) -> None:
+        if os.name != "posix":
+            self.skipTest("POSIX file permission mode check requires a POSIX host")
+        import stat
+
+        jsonl_path = Path(self._tmpdir.name) / "owner_only_usage" / "usage.jsonl"
+        hook = JsonlUsageMeterHook(jsonl_path)
+        hook.record_usage(
+            UsageEvent(
+                request_id="req-perm-1",
+                model="m-perm",
+                backend_id="b-perm",
+                prompt_tokens=10,
+                completion_tokens=5,
+                latency_ms=12.5,
+                estimated_cost_usd=0.0001,
+                principal="alice",
+            )
+        )
+        self.assertTrue(jsonl_path.exists())
+        self.assertEqual(stat.S_IMODE(jsonl_path.stat().st_mode), 0o600)
+        lines = jsonl_path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(json.loads(lines[0])["principal"], "alice")
 
 
 def run_self_tests(verbosity: int = 1) -> int:

@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass, field
 import hmac
 import importlib
 import json
+import os
 from pathlib import Path
 import sys
 import threading
@@ -213,7 +214,24 @@ class JsonlUsageMeterHook(UsageMeterHook):
         with self._lock:
             try:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
-                with self.path.open("a", encoding="utf-8") as fh:
+                flags = (
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_APPEND
+                    | getattr(os, "O_NOFOLLOW", 0)
+                )
+                fd = os.open(os.fspath(self.path), flags, 0o600)
+                try:
+                    if os.name == "posix" and hasattr(os, "fchmod"):
+                        try:
+                            os.fchmod(fd, 0o600)
+                        except OSError:
+                            pass
+                    fh = os.fdopen(fd, "a", encoding="utf-8")
+                except Exception:
+                    os.close(fd)
+                    raise
+                with fh:
                     fh.write(line)
                 self.events_written += 1
             except OSError as exc:
