@@ -12453,6 +12453,177 @@ asyncio.run(main())
         self.assertFalse(telem.exporter_up)
         self.assertEqual(telem.error, "exporter_error:OverflowError")
 
+    def test_unknown_usage_meter_and_scaler_types_rejected_by_validation_and_check_config(
+        self,
+    ) -> None:
+        base_backend = BackendConfig(
+            id="b-meter",
+            base_url="http://127.0.0.1:8081/v1",
+            models=["m1"],
+        )
+        with self.assertRaisesRegex(ValueError, "Invalid usage_meter.type"):
+            RouterConfig(
+                backends=[base_backend],
+                usage_meter={"type": "jsnol"},
+            )
+        with self.assertRaisesRegex(ValueError, "jsonl_path"):
+            RouterConfig(
+                backends=[base_backend],
+                usage_meter={"type": "noop", "jsonl_path": "/tmp/usage.jsonl"},
+            )
+        with self.assertRaisesRegex(ValueError, "Invalid scaler.type"):
+            RouterConfig(
+                backends=[base_backend],
+                scaler={"type": "autoscalerr"},
+            )
+
+        bad_cfg_path = Path(self._tmpdir.name) / "bad_usage_meter_type.json"
+        bad_cfg_path.write_text(
+            json.dumps(
+                {
+                    "usage_meter": {"type": "jsnol"},
+                    "backends": [
+                        {
+                            "id": "b1",
+                            "base_url": "http://127.0.0.1:8081/v1",
+                            "models": ["m1"],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            router_main(["--check-config", "--config", str(bad_cfg_path)]),
+            1,
+        )
+
+    def test_completions_echo_with_return_token_ids_does_not_subtract_suppressed_prompt(
+        self,
+    ) -> None:
+        recorded_usage: List[UsageEvent] = []
+
+        class _RecordHook:
+            def record_usage(self, event: UsageEvent) -> None:
+                recorded_usage.append(event)
+
+        long_prompt = "Q" * 400
+        mode = ["stream_with_token_ids"]
+
+        class _EchoReturnTokenIdsHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return None
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = json.dumps(
+                    {"object": "list", "data": [{"id": "m-echo-tids"}]}
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802
+                clen = int(self.headers.get("Content-Length", "0"))
+                if clen > 0:
+                    self.rfile.read(clen)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                if mode[0] == "stream_with_token_ids":
+                    # vLLM echo=true + return_token_ids=true suppresses textual prompt echo
+                    # and returns prompt_token_ids separately + choice.token_ids for output.
+                    ev = json.dumps(
+                        {
+                            "id": "cmpl-tids-1",
+                            "object": "text_completion",
+                            "prompt_token_ids": [1, 2, 3, 4],
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "text": "Hi!",
+                                    "token_ids": [9906, 0, 11],
+                                    "finish_reason": "stop",
+                                }
+                            ],
+                        }
+                    ).encode("utf-8")
+                else:
+                    # Without choice.token_ids, short completion text is still NOT zeroed out.
+                    ev = json.dumps(
+                        {
+                            "id": "cmpl-tids-2",
+                            "object": "text_completion",
+                            "prompt_token_ids": [1, 2, 3, 4],
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "text": "Short answer",
+                                    "finish_reason": "stop",
+                                }
+                            ],
+                        }
+                    ).encode("utf-8")
+                self.wfile.write(b"data: " + ev + b"\n\ndata: [DONE]\n\n")
+                self.wfile.flush()
+
+        srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _EchoReturnTokenIdsHandler))
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            backends=[
+                BackendConfig(
+                    id="echo-tids-b",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=f"http://127.0.0.1:{srv.server_address[1]}/v1",
+                    models=["m-echo-tids"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg, usage_hook=_RecordHook()))
+        rport = router.server_address[1]
+
+        # 1. With choice.token_ids: exact generated token count (3) recorded, not 0.
+        st1, _, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/completions",
+            body={
+                "model": "m-echo-tids",
+                "prompt": long_prompt,
+                "echo": True,
+                "return_token_ids": True,
+                "stream": True,
+            },
+        )
+        self.assertEqual(st1, 200)
+        self.assertEqual(recorded_usage[0].completion_tokens, 3)
+
+        # 2. Without choice.token_ids: short text (12 chars -> 3 tokens) not subtracted to 0.
+        mode[0] = "stream_text_only_with_return_token_ids"
+        st2, _, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/completions",
+            body={
+                "model": "m-echo-tids",
+                "prompt": long_prompt,
+                "echo": True,
+                "return_token_ids": True,
+                "stream": True,
+            },
+        )
+        self.assertEqual(st2, 200)
+        self.assertEqual(recorded_usage[1].completion_tokens, 3)
+
 
 def run_self_tests(verbosity: int = 1) -> int:
     """Run all router tests cleanly via unittest."""

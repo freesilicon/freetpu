@@ -42,7 +42,9 @@ from router.config import (  # noqa: E402
     RouterConfig,
     VALID_AUTH_TYPES,
     VALID_POLICIES,
+    VALID_SCALER_TYPES,
     VALID_URL_SCHEMES,
+    VALID_USAGE_METER_TYPES,
     is_loopback_host,
     load_config,
     normalize_origin,
@@ -714,8 +716,16 @@ def _echo_prompt_char_lengths(
     endpoint: str,
     req_payload: Mapping[str, Any],
 ) -> Tuple[int, ...]:
-    """Return per-prompt echoed char lengths for `/v1/completions` when `echo=true`."""
-    if endpoint != "/v1/completions" or req_payload.get("echo") is not True:
+    """Return per-prompt echoed char lengths for `/v1/completions` when `echo=true`.
+
+    Returns `()` when `return_token_ids=true` because vLLM suppresses textual
+    prompt echo and returns `prompt_token_ids` separately.
+    """
+    if (
+        endpoint != "/v1/completions"
+        or req_payload.get("echo") is not True
+        or req_payload.get("return_token_ids") is True
+    ):
         return ()
     prompt = req_payload.get("prompt")
     if isinstance(prompt, str):
@@ -996,6 +1006,23 @@ def _has_choice_audio_output(obj: Mapping[str, Any]) -> bool:
     return False
 
 
+def _extract_choice_token_id_count(obj: Mapping[str, Any]) -> int:
+    """Count integer generated `token_ids` reported across choices in `obj`."""
+    choices = obj.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return 0
+    total = 0
+    for choice in choices:
+        if not (isinstance(choice, dict) or isinstance(choice, Mapping)):
+            continue
+        token_ids = choice.get("token_ids")
+        if isinstance(token_ids, (list, tuple)):
+            total += sum(
+                1 for tok in token_ids if isinstance(tok, int) and not isinstance(tok, bool)
+            )
+    return total
+
+
 def _has_choice_token_metadata_output(obj: Mapping[str, Any]) -> bool:
     """Return True when any choice carries generated `token_ids` or non-empty `logprobs`."""
     choices = obj.get("choices")
@@ -1097,7 +1124,13 @@ def _extract_non_stream_usage(
                 saw_completion = True
 
     if not saw_completion:
-        if echo_prompt_chars:
+        resp_token_id_count = _extract_choice_token_id_count(parsed_resp)
+        has_prompt_token_ids = isinstance(
+            parsed_resp.get("prompt_token_ids"), list
+        ) and bool(parsed_resp.get("prompt_token_ids"))
+        if resp_token_id_count > 0:
+            completion_tokens = resp_token_id_count
+        elif echo_prompt_chars and not has_prompt_token_ids:
             adjusted_chars = _subtract_echoed_prompt_chars(
                 _extract_choice_output_char_counts(parsed_resp),
                 echo_prompt_chars,
@@ -1519,31 +1552,69 @@ def build_hooks_from_config(
     resolved_usage = usage_hook
     if resolved_usage is None:
         usage_cfg = config.usage_meter
+        if not isinstance(usage_cfg, Mapping):
+            raise ValueError("'usage_meter' must be a JSON object")
         spec = usage_cfg.get("hook")
-        if spec:
+        usage_type = usage_cfg.get("type")
+        if spec is not None:
+            if not isinstance(spec, str) or not spec.strip():
+                raise ValueError(
+                    f"Invalid usage_meter.hook spec {spec!r}; expected 'module:ClassName'"
+                )
+            if usage_type is not None and usage_type != "custom":
+                raise ValueError(
+                    f"Invalid usage_meter.type {usage_type!r} when usage_meter.hook is configured; "
+                    "omit 'type' or set 'custom'"
+                )
             resolved_usage = load_hook_from_spec(
-                str(spec),
+                spec.strip(),
                 usage_cfg.get("kwargs"),
                 role="usage_meter",
             )
-        elif usage_cfg.get("type") == "jsonl" or usage_cfg.get("jsonl_path"):
+        elif usage_type == "jsonl" or (usage_type is None and usage_cfg.get("jsonl_path")):
             jsonl_path = usage_cfg.get("jsonl_path") or "freetpu_router_usage.jsonl"
-            resolved_usage = JsonlUsageMeterHook(str(jsonl_path))
-        else:
+            if not isinstance(jsonl_path, str) or not jsonl_path.strip():
+                raise ValueError("usage_meter.jsonl_path must be a non-empty string")
+            resolved_usage = JsonlUsageMeterHook(jsonl_path.strip())
+        elif usage_type in (None, "noop"):
+            if usage_cfg.get("jsonl_path") is not None:
+                raise ValueError(
+                    "usage_meter.jsonl_path requires usage_meter.type='jsonl' (or omitted 'type')"
+                )
             resolved_usage = NoOpUsageMeterHook()
+        else:
+            raise ValueError(
+                f"Invalid usage_meter.type {usage_type!r}; expected one of {VALID_USAGE_METER_TYPES}"
+            )
 
     resolved_scaler = scaler_hook
     if resolved_scaler is None:
         scaler_cfg = config.scaler
+        if not isinstance(scaler_cfg, Mapping):
+            raise ValueError("'scaler' must be a JSON object")
         spec = scaler_cfg.get("hook")
-        if spec:
+        scaler_type = scaler_cfg.get("type")
+        if spec is not None:
+            if not isinstance(spec, str) or not spec.strip():
+                raise ValueError(
+                    f"Invalid scaler.hook spec {spec!r}; expected 'module:ClassName'"
+                )
+            if scaler_type is not None and scaler_type != "custom":
+                raise ValueError(
+                    f"Invalid scaler.type {scaler_type!r} when scaler.hook is configured; "
+                    "omit 'type' or set 'custom'"
+                )
             resolved_scaler = load_hook_from_spec(
-                str(spec),
+                spec.strip(),
                 scaler_cfg.get("kwargs"),
                 role="scaler",
             )
-        else:
+        elif scaler_type in (None, "noop"):
             resolved_scaler = NoOpScalerHook()
+        else:
+            raise ValueError(
+                f"Invalid scaler.type {scaler_type!r}; expected one of {VALID_SCALER_TYPES}"
+            )
 
     validate_hook_for_role(resolved_auth, "auth")
     validate_hook_for_role(resolved_usage, "usage_meter")
@@ -4757,6 +4828,8 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             completion_tokens = 0
             est_completion_chars = 0
             est_completion_chars_by_choice: Dict[int, int] = {}
+            streamed_choice_token_ids_count = 0
+            saw_prompt_token_ids = False
             saw_explicit_prompt_usage = False
             saw_explicit_completion_usage = False
             saw_interim_usage = False
@@ -4821,7 +4894,8 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 Returns `(made_progress, saw_done)`.
                 """
                 nonlocal first_content_ttft_ms, prompt_tokens, completion_tokens
-                nonlocal est_completion_chars, saw_explicit_prompt_usage
+                nonlocal est_completion_chars, streamed_choice_token_ids_count
+                nonlocal saw_prompt_token_ids, saw_explicit_prompt_usage
                 nonlocal saw_explicit_completion_usage, saw_interim_usage
                 nonlocal saw_request_wide_usage, saw_final_usage, saw_timings_completion
                 nonlocal saw_done_sentinel, saw_upstream_error_event
@@ -4894,6 +4968,13 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         output_txt = _extract_choice_output_text(obj)
                         has_audio_out = _has_choice_audio_output(obj)
                         has_token_meta_out = _has_choice_token_metadata_output(obj)
+                        if isinstance(obj.get("prompt_token_ids"), list) and obj.get(
+                            "prompt_token_ids"
+                        ):
+                            saw_prompt_token_ids = True
+                        ev_token_ids_count = _extract_choice_token_id_count(obj)
+                        if ev_token_ids_count > 0:
+                            streamed_choice_token_ids_count += ev_token_ids_count
                         if output_txt or has_audio_out or has_token_meta_out:
                             made_progress = True
                             if first_content_ttft_ms is None:
@@ -5446,17 +5527,20 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 not saw_explicit_completion_usage
                 and not saw_timings_completion
             ):
-                if echo_prompt_chars:
-                    adjusted_completion_chars = _subtract_echoed_prompt_chars(
-                        est_completion_chars_by_choice,
-                        echo_prompt_chars,
-                        required_choices=required_choices,
-                        prompt_batch_size=effective_prompt_batch_size,
-                    )
+                if streamed_choice_token_ids_count > 0:
+                    completion_tokens = streamed_choice_token_ids_count
                 else:
-                    adjusted_completion_chars = est_completion_chars
-                if adjusted_completion_chars > 0:
-                    completion_tokens = max(1, (adjusted_completion_chars + 3) // 4)
+                    if echo_prompt_chars and not saw_prompt_token_ids:
+                        adjusted_completion_chars = _subtract_echoed_prompt_chars(
+                            est_completion_chars_by_choice,
+                            echo_prompt_chars,
+                            required_choices=required_choices,
+                            prompt_batch_size=effective_prompt_batch_size,
+                        )
+                    else:
+                        adjusted_completion_chars = est_completion_chars
+                    if adjusted_completion_chars > 0:
+                        completion_tokens = max(1, (adjusted_completion_chars + 3) // 4)
             total_ms = (time.monotonic() - req_start) * 1000.0
             attempt_ms = (time.monotonic() - attempt_start) * 1000.0
             effective_ttft = (

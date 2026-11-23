@@ -14,6 +14,8 @@ from urllib.parse import urlsplit
 
 VALID_POLICIES = ("cheapest", "local_first", "lowest_latency", "round_robin")
 VALID_AUTH_TYPES = ("allow_all", "bearer")
+VALID_USAGE_METER_TYPES = ("noop", "jsonl")
+VALID_SCALER_TYPES = ("noop",)
 VALID_URL_SCHEMES = ("http", "https")
 BEARER_AUTH_ONLY_KEYS = ("tokens", "tokens_env", "exempt_paths")
 DEFAULT_MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024
@@ -784,6 +786,60 @@ class RouterConfig:
                     f"Bearer auth settings {misplaced!r} require auth.type='bearer'"
                 )
 
+        if not isinstance(self.usage_meter, Mapping):
+            raise ValueError("'usage_meter' must be a JSON object")
+        usage_spec = self.usage_meter.get("hook")
+        usage_type = self.usage_meter.get("type")
+        if usage_spec is not None:
+            if not isinstance(usage_spec, str) or ":" not in usage_spec.strip():
+                raise ValueError(
+                    f"Invalid usage_meter.hook spec {usage_spec!r}; expected 'module:ClassName'"
+                )
+            if not all(part.strip() for part in usage_spec.strip().split(":", 1)):
+                raise ValueError(
+                    f"Invalid usage_meter.hook spec {usage_spec!r}; expected 'module:ClassName'"
+                )
+            if usage_type is not None and usage_type != "custom":
+                raise ValueError(
+                    f"Invalid usage_meter.type {usage_type!r} when usage_meter.hook is configured; omit 'type' or set 'custom'"
+                )
+        elif usage_type is not None:
+            if not isinstance(usage_type, str) or usage_type not in VALID_USAGE_METER_TYPES:
+                raise ValueError(
+                    f"Invalid usage_meter.type {usage_type!r}; expected one of {VALID_USAGE_METER_TYPES}"
+                )
+        jsonl_path = self.usage_meter.get("jsonl_path")
+        if jsonl_path is not None:
+            if not isinstance(jsonl_path, str) or not jsonl_path.strip():
+                raise ValueError("usage_meter.jsonl_path must be a non-empty string")
+            if usage_spec is not None or usage_type == "noop":
+                raise ValueError(
+                    "usage_meter.jsonl_path requires usage_meter.type='jsonl' (or omitted 'type')"
+                )
+
+        if not isinstance(self.scaler, Mapping):
+            raise ValueError("'scaler' must be a JSON object")
+        scaler_spec = self.scaler.get("hook")
+        scaler_type = self.scaler.get("type")
+        if scaler_spec is not None:
+            if not isinstance(scaler_spec, str) or ":" not in scaler_spec.strip():
+                raise ValueError(
+                    f"Invalid scaler.hook spec {scaler_spec!r}; expected 'module:ClassName'"
+                )
+            if not all(part.strip() for part in scaler_spec.strip().split(":", 1)):
+                raise ValueError(
+                    f"Invalid scaler.hook spec {scaler_spec!r}; expected 'module:ClassName'"
+                )
+            if scaler_type is not None and scaler_type != "custom":
+                raise ValueError(
+                    f"Invalid scaler.type {scaler_type!r} when scaler.hook is configured; omit 'type' or set 'custom'"
+                )
+        elif scaler_type is not None:
+            if not isinstance(scaler_type, str) or scaler_type not in VALID_SCALER_TYPES:
+                raise ValueError(
+                    f"Invalid scaler.type {scaler_type!r}; expected one of {VALID_SCALER_TYPES}"
+                )
+
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "RouterConfig":
         raw_backends: Sequence[Mapping[str, Any]] = raw.get("backends") or []
@@ -800,6 +856,12 @@ class RouterConfig:
         raw_auth = raw.get("auth")
         if raw_auth is not None and not isinstance(raw_auth, Mapping):
             raise ValueError("'auth' must be a JSON object")
+        raw_usage_meter = raw.get("usage_meter")
+        if raw_usage_meter is not None and not isinstance(raw_usage_meter, Mapping):
+            raise ValueError("'usage_meter' must be a JSON object")
+        raw_scaler = raw.get("scaler")
+        if raw_scaler is not None and not isinstance(raw_scaler, Mapping):
+            raise ValueError("'scaler' must be a JSON object")
         raw_host = raw.get("host", "127.0.0.1")
         if not isinstance(raw_host, str):
             raise ValueError(
@@ -924,8 +986,8 @@ class RouterConfig:
                 raw, "trust_proxy_headers", False, context="RouterConfig"
             ),
             auth=dict(raw_auth or {}),
-            usage_meter=dict(raw.get("usage_meter") or {}),
-            scaler=dict(raw.get("scaler") or {}),
+            usage_meter=dict(raw_usage_meter or {}),
+            scaler=dict(raw_scaler or {}),
         )
 
 
