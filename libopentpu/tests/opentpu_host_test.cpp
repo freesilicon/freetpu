@@ -1579,6 +1579,157 @@ static void test_resident_imem_stub_structure() {
   printf("[PASS] test_resident_imem_stub_structure\n");
 }
 
+static void test_multigen_hal_geometry_and_rebar() {
+  ot_device_geometry_t g5 = {}, g6 = {}, g7 = {};
+  OT_CHECK(ot_chip_geometry_for_device_id(0x0063u, &g5) == OT_OK);
+  OT_CHECK(g5.chip_gen == OT_CHIP_V5E);
+  OT_CHECK(g5.mxu_rows == 128u && g5.mxu_cols == 128u);
+  OT_CHECK(g5.logical_chiplets_per_pci_func == 1u);
+  OT_CHECK(g5.hbm_bytes_per_logical_chiplet == (16ULL << 30));
+
+  OT_CHECK(ot_chip_geometry_for_device_id(0x006fu, &g6) == OT_OK);
+  OT_CHECK(g6.chip_gen == OT_CHIP_V6E);
+  OT_CHECK(g6.mxu_rows == 256u && g6.mxu_cols == 256u);
+  OT_CHECK(g6.logical_chiplets_per_pci_func == 1u);
+  OT_CHECK(g6.hbm_bytes_per_logical_chiplet == (32ULL << 30));
+
+  OT_CHECK(ot_chip_geometry_for_device_id(0x0075u, &g7) == OT_OK);
+  OT_CHECK(g7.chip_gen == OT_CHIP_TPU7X);
+  OT_CHECK(g7.mxu_rows == 256u && g7.mxu_cols == 256u);
+  OT_CHECK(g7.fp8_inner_rows == 4u && g7.fp8_inner_cols == 1u);
+  OT_CHECK(g7.supports_native_fp8 == 1u);
+  OT_CHECK(g7.logical_chiplets_per_pci_func == 2u);
+  OT_CHECK(g7.hbm_bytes_per_logical_chiplet == (96ULL << 30));
+
+  ot_device_geometry_t gbad = {};
+  OT_CHECK(ot_chip_geometry_for_device_id(0x9999u, &gbad) == OT_ERR_UNSUPPORTED);
+
+  // 64-bit Resizable BAR mmap safety clamping.
+  OT_CHECK(ot::clamp_bar_mmap_len(96ULL << 30, 16ULL << 20) == (16ULL << 20));
+  OT_CHECK(ot::clamp_bar_mmap_len(16ULL << 20, 64ULL << 20) == (16ULL << 20));
+  OT_CHECK(ot::clamp_bar_mmap_len(0ULL, 16ULL << 20) == 0u);
+
+  // Synthetic PCIe Extended Config Space (0x100 = dummy 0x0001 -> next 0x180,
+  // 0x180 = Resizable BAR 0x0015 with 1 BAR entry: BAR2 size_pow=17 -> 128 GiB).
+  uint8_t cfg_space[512];
+  std::memset(cfg_space, 0, sizeof(cfg_space));
+  auto write_le32 = [&](size_t off, uint32_t v) {
+    std::memcpy(cfg_space + off, &v, sizeof(v));
+  };
+  write_le32(0x100u, (0x180u << 20) | 0x0001u);
+  write_le32(0x180u, 0x0015u);
+  write_le32(0x184u, 0x00020000u);  // Cap register
+  write_le32(0x188u, (1u << 5) | (17u << 8) | 2u);  // 1 BAR, BAR2, 2^(20+17)=128 GiB
+
+  ot::RebarCapabilityInfo rebar;
+  OT_CHECK(ot::parse_pcie_rebar_cap(cfg_space, sizeof(cfg_space), &rebar));
+  OT_CHECK(rebar.found && rebar.cap_offset == 0x180u && rebar.num_bars == 1u);
+  OT_CHECK(rebar.bar_bytes[2] == (128ULL << 30));
+
+  // Mock chip selection for tpu7x via OPENTPU_MOCK_CHIP.
+  setenv("OPENTPU_MOCK_CHIP", "tpu7x", 1);
+  ot_config_t cfg = ot_config_default();
+  cfg.mock_mode = 1;
+  ot_context_t* ctx = nullptr;
+  OT_CHECK(ot_context_create(&cfg, &ctx) == OT_OK && ctx != nullptr);
+  ot_device_info_t info = {};
+  OT_CHECK(ot_device_get_info(ctx, &info) == OT_OK);
+  OT_CHECK(info.chip_gen == OT_CHIP_TPU7X && info.device_id == 0x0075u);
+  ot_device_geometry_t ctx_geom = {};
+  OT_CHECK(ot_device_get_geometry(ctx, &ctx_geom) == OT_OK);
+  OT_CHECK(ctx_geom.logical_chiplets_per_pci_func == 2u && ctx_geom.mxu_rows == 256u);
+  ot_context_destroy(ctx);
+  unsetenv("OPENTPU_MOCK_CHIP");
+
+  printf("[PASS] test_multigen_hal_geometry_and_rebar\n");
+}
+
+static void test_pjrt_dual_chiplet_tpu7x_enumeration() {
+  const PJRT_Api* api = GetPjrtApi();
+  OT_CHECK(api != nullptr);
+
+  auto check_topology = [&](const char* topo_name, size_t expected_logical) {
+    setenv("OPENTPU_MOCK", "1", 1);
+    setenv("OPENTPU_MOCK_CHIP", "tpu7x", 1);
+    setenv("OPENTPU_MOCK_TOPOLOGY", topo_name, 1);
+
+    PJRT_Client_Create_Args c_args = {};
+    c_args.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
+    OT_CHECK(api->PJRT_Client_Create(&c_args) == nullptr && c_args.client != nullptr);
+
+    PJRT_Client_AddressableDevices_Args d_args = {};
+    d_args.struct_size = PJRT_Client_AddressableDevices_Args_STRUCT_SIZE;
+    d_args.client = c_args.client;
+    OT_CHECK(api->PJRT_Client_AddressableDevices(&d_args) == nullptr);
+    OT_CHECK(d_args.num_addressable_devices == expected_logical);
+
+    for (size_t i = 0; i < expected_logical; ++i) {
+      PJRT_Device_GetDescription_Args gd = {};
+      gd.struct_size = PJRT_Device_GetDescription_Args_STRUCT_SIZE;
+      gd.device = d_args.addressable_devices[i];
+      OT_CHECK(api->PJRT_Device_GetDescription(&gd) == nullptr);
+
+      PJRT_DeviceDescription_Id_Args id_args = {};
+      id_args.struct_size = PJRT_DeviceDescription_Id_Args_STRUCT_SIZE;
+      id_args.device_description = gd.device_description;
+      OT_CHECK(api->PJRT_DeviceDescription_Id(&id_args) == nullptr);
+      OT_CHECK(id_args.id == static_cast<int>(i));
+
+      PJRT_DeviceDescription_Kind_Args k_args = {};
+      k_args.struct_size = PJRT_DeviceDescription_Kind_Args_STRUCT_SIZE;
+      k_args.device_description = gd.device_description;
+      OT_CHECK(api->PJRT_DeviceDescription_Kind(&k_args) == nullptr);
+      OT_CHECK(std::string(k_args.device_kind, k_args.device_kind_size) == "TPU v7x");
+
+      PJRT_DeviceDescription_Attributes_Args attr_args = {};
+      attr_args.struct_size = PJRT_DeviceDescription_Attributes_Args_STRUCT_SIZE;
+      attr_args.device_description = gd.device_description;
+      OT_CHECK(api->PJRT_DeviceDescription_Attributes(&attr_args) == nullptr);
+      OT_CHECK(attr_args.num_attributes == 2u);
+      bool saw_coords = false, saw_core = false;
+      for (size_t ai = 0; ai < attr_args.num_attributes; ++ai) {
+        const PJRT_NamedValue& a = attr_args.attributes[ai];
+        std::string aname(a.name, a.name_size);
+        if (aname == "coords") {
+          OT_CHECK(a.type == PJRT_NamedValue_kInt64List && a.value_size == 3u);
+          saw_coords = true;
+        } else if (aname == "core_on_chip") {
+          OT_CHECK(a.type == PJRT_NamedValue_kInt64 &&
+                   a.int64_value == static_cast<int64_t>(i % 2));
+          saw_core = true;
+        }
+      }
+      OT_CHECK(saw_coords && saw_core);
+    }
+
+    std::vector<int> def_assign(expected_logical, -1);
+    PJRT_Client_DefaultDeviceAssignment_Args da_args = {};
+    da_args.struct_size = PJRT_Client_DefaultDeviceAssignment_Args_STRUCT_SIZE;
+    da_args.client = c_args.client;
+    da_args.num_replicas = static_cast<int>(expected_logical);
+    da_args.num_partitions = 1;
+    da_args.default_assignment = def_assign.data();
+    da_args.default_assignment_size = def_assign.size();
+    OT_CHECK(api->PJRT_Client_DefaultDeviceAssignment(&da_args) == nullptr);
+    for (size_t i = 0; i < expected_logical; ++i) {
+      OT_CHECK(def_assign[i] == static_cast<int>(i));
+    }
+
+    PJRT_Client_Destroy_Args cd_args = {};
+    cd_args.struct_size = PJRT_Client_Destroy_Args_STRUCT_SIZE;
+    cd_args.client = c_args.client;
+    OT_CHECK(api->PJRT_Client_Destroy(&cd_args) == nullptr);
+  };
+
+  check_topology("tpu7x-1t", 2u);
+  check_topology("tpu7x-4t", 8u);
+
+  unsetenv("OPENTPU_MOCK_TOPOLOGY");
+  unsetenv("OPENTPU_MOCK_CHIP");
+  unsetenv("OPENTPU_MOCK");
+  printf("[PASS] test_pjrt_dual_chiplet_tpu7x_enumeration\n");
+}
+
 int main() {
   test_iova_allocator();
   test_bar4_descriptor_parser();
@@ -1590,6 +1741,8 @@ int main() {
   test_pjrt_api_mock();
   test_vliw_and_tiling();
   test_resident_imem_stub_structure();
+  test_multigen_hal_geometry_and_rebar();
+  test_pjrt_dual_chiplet_tpu7x_enumeration();
   printf("ALL_HOST_TESTS_PASSED\n");
   return 0;
 }

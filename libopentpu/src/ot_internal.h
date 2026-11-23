@@ -27,11 +27,34 @@ struct PciDiscoveryEntry {
   std::string driver;
   uint32_t iommu_group = 0xffffffffu;
   uint64_t bar0_size = 0;
+  uint64_t bar2_size = 0;
   uint64_t bar4_size = 0;
+};
+
+struct RebarCapabilityInfo {
+  bool found = false;
+  uint16_t cap_offset = 0;
+  uint32_t num_bars = 0;
+  uint64_t bar_bytes[6] = {};
 };
 
 // Parse a 0x1234 hex sysfs attribute safely (no exceptions).
 bool parse_hex_u64(const std::string& text, uint64_t* out);
+
+// HAL geometry lookup across Google Cloud TPU generations (0x0063 v5e, 0x006f v6e,
+// 0x0075 provisional Ironwood tpu7x dual-chiplet). Returns false on unknown device_id.
+bool chip_geometry_for_device_id(uint16_t device_id, ot_device_geometry_t* out);
+
+// Clamp a PCI BAR mmap length (e.g. 64-bit Resizable BAR) so large VRAM/HBM apertures
+// never exhaust host virtual address space.
+size_t clamp_bar_mmap_len(uint64_t bar_size, size_t max_len);
+
+// Parse PCIe Resizable BAR extended capability (ID 0x0015) from an extended PCI config
+// space buffer beginning at byte 0x100.
+bool parse_pcie_rebar_cap(const uint8_t* cfg_bytes, size_t cfg_len, RebarCapabilityInfo* out);
+
+// Enumerate all visible 0x1ae0 Google Cloud TPU PCI functions on Linux sysfs (sorted by BDF).
+bool enumerate_linux_tpus(std::vector<PciDiscoveryEntry>* out, std::string* err);
 
 // Simple monotonic IOVA bump/free-list allocator over valid IOMMU ranges.
 struct IovaBlock {

@@ -6,11 +6,13 @@
 #include "ot_internal.h"
 #include "pjrt_c_api.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <new>
 #include <string>
 #include <vector>
@@ -54,14 +56,42 @@ struct OtPjrtMemory {
 struct PJRT_DeviceDescription {
   int id = 0;
   int process_index = 0;
+  int local_hardware_id = 0;
   std::string kind = "TPU v5 lite";
   std::string debug_str = "OpenTPU:0";
+  std::vector<int64_t> coords;
+  int64_t core_on_chip = -1;
+  std::vector<PJRT_NamedValue> attrs;
+
+  void finalize_attrs() {
+    attrs.clear();
+    if (!coords.empty()) {
+      PJRT_NamedValue v = {};
+      v.struct_size = PJRT_NamedValue_STRUCT_SIZE;
+      v.name = "coords";
+      v.name_size = 6;
+      v.type = PJRT_NamedValue_kInt64List;
+      v.int64_array_value = coords.data();
+      v.value_size = coords.size();
+      attrs.push_back(v);
+    }
+    if (core_on_chip >= 0) {
+      PJRT_NamedValue v = {};
+      v.struct_size = PJRT_NamedValue_STRUCT_SIZE;
+      v.name = "core_on_chip";
+      v.name_size = 12;
+      v.type = PJRT_NamedValue_kInt64;
+      v.int64_value = core_on_chip;
+      v.value_size = 1;
+      attrs.push_back(v);
+    }
+  }
 };
 
 struct PJRT_TopologyDescription {
   std::string platform_name = "tpu";
   std::string platform_version = "OpenTPU 0.1.0";
-  PJRT_DeviceDescription* desc_ptrs[1] = {nullptr};
+  std::vector<PJRT_DeviceDescription*> desc_ptrs;
   bool owned_by_client = false;
 };
 
@@ -82,9 +112,9 @@ struct PJRT_Device {
 
 struct PJRT_Client {
   ot_context_t* ctx = nullptr;
-  PJRT_Device device{};
-  PJRT_Device* dev_ptrs[1] = {&device};
-  PJRT_Memory* mem_ptrs[1] = {&device.mem.base};
+  std::vector<std::unique_ptr<PJRT_Device>> devices;
+  std::vector<PJRT_Device*> dev_ptrs;
+  std::vector<PJRT_Memory*> mem_ptrs;
   PJRT_TopologyDescription topology{};
   std::string platform_name = "tpu";
   std::string platform_version = "OpenTPU 0.1.0";
@@ -117,6 +147,7 @@ struct PJRT_Executable {
 struct PJRT_LoadedExecutable {
   PJRT_Client* client = nullptr;
   PJRT_Executable exec{};
+  std::vector<int> assigned_device_ids = {0};
   bool deleted = false;
 };
 
@@ -1033,6 +1064,8 @@ PJRT_Error* ot_pjrt_client_create(PJRT_Client_Create_Args* args) {
   if (args->num_options > 0 && !args->create_options) {
     return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null create_options with nonzero num_options");
   }
+  std::vector<int64_t> visible_devs;
+  bool has_visible_devs = false;
   for (size_t i = 0; i < args->num_options; ++i) {
     const PJRT_NamedValue& opt = args->create_options[i];
     if (opt.name_size > 0 && !opt.name) {
@@ -1059,10 +1092,11 @@ PJRT_Error* ot_pjrt_client_create(PJRT_Client_Create_Args* args) {
       if (opt.type != PJRT_NamedValue_kInt64List) {
         return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "visible_devices must be int64 list");
       }
-      if (opt.value_size != 1 || !opt.int64_array_value || opt.int64_array_value[0] != 0) {
-        return make_err(PJRT_Error_Code_UNIMPLEMENTED,
-                        "single-device OpenTPU supports device 0 only");
+      if (opt.value_size == 0 || !opt.int64_array_value) {
+        return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "visible_devices must be non-empty");
       }
+      has_visible_devs = true;
+      visible_devs.assign(opt.int64_array_value, opt.int64_array_value + opt.value_size);
     }
   }
 
@@ -1083,25 +1117,114 @@ PJRT_Error* ot_pjrt_client_create(PJRT_Client_Create_Args* args) {
     return make_err(PJRT_Error_Code_INTERNAL, msg);
   }
 
+  ot_device_info_t info = {};
+  (void)ot_device_get_info(ctx, &info);
+  ot_device_geometry_t geom = {};
+  (void)ot_device_get_geometry(ctx, &geom);
+
+  std::string kind_str = "TPU v5 lite";
+  if (info.chip_gen == OT_CHIP_TPU7X) kind_str = "TPU v7x";
+  else if (info.chip_gen == OT_CHIP_V6E) kind_str = "TPU v6 lite";
+
+  size_t pci_funcs = 1;
+  size_t chiplets_per_func =
+      geom.logical_chiplets_per_pci_func > 0 ? geom.logical_chiplets_per_pci_func : 1u;
+
+  if (cfg.mock_mode) {
+    if (const char* topo_env = std::getenv("OPENTPU_MOCK_TOPOLOGY")) {
+      if (std::strcmp(topo_env, "tpu7x-1t") == 0 || std::strcmp(topo_env, "tpu7x_1t") == 0) {
+        kind_str = "TPU v7x";
+        pci_funcs = 1;
+        chiplets_per_func = 2;
+      } else if (std::strcmp(topo_env, "tpu7x-4t") == 0 || std::strcmp(topo_env, "tpu7x_4t") == 0) {
+        kind_str = "TPU v7x";
+        pci_funcs = 4;
+        chiplets_per_func = 2;
+      } else if (std::strcmp(topo_env, "v6e-8") == 0 || std::strcmp(topo_env, "v6e_8") == 0) {
+        kind_str = "TPU v6 lite";
+        pci_funcs = 8;
+        chiplets_per_func = 1;
+      } else if (std::strcmp(topo_env, "v5e-1") == 0 || std::strcmp(topo_env, "v5e_1") == 0) {
+        kind_str = "TPU v5 lite";
+        pci_funcs = 1;
+        chiplets_per_func = 1;
+      }
+    }
+  } else {
+    std::vector<ot::PciDiscoveryEntry> tpus;
+    if (ot::enumerate_linux_tpus(&tpus, nullptr) && !tpus.empty()) {
+      size_t same_gen = 0;
+      for (const auto& entry : tpus) {
+        if (entry.device_id == info.device_id) {
+          ++same_gen;
+        }
+      }
+      if (same_gen > 0) {
+        pci_funcs = same_gen;
+      }
+    }
+  }
+
+  const size_t total_logical = pci_funcs * chiplets_per_func;
+  if (has_visible_devs) {
+    for (int64_t vid : visible_devs) {
+      if (vid < 0 || static_cast<size_t>(vid) >= total_logical) {
+        ot_context_destroy(ctx);
+        return make_err(PJRT_Error_Code_UNIMPLEMENTED,
+                        total_logical <= 1 ? "single-device OpenTPU supports device 0 only"
+                                           : "visible_devices index out of addressable range");
+      }
+    }
+  }
+
   auto* c = new (std::nothrow) PJRT_Client();
   if (!c) {
     ot_context_destroy(ctx);
     return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, "out of memory");
   }
   c->ctx = ctx;
-  c->device.ctx = ctx;
-  c->device.mem.base.vtable = &kMemoryVtable;
-  c->device.mem.device = &c->device;
-  c->device.mem_ptrs[0] = &c->device.mem.base;
-  c->mem_ptrs[0] = &c->device.mem.base;
-  ot_device_info_t info = {};
-  if (ot_device_get_info(ctx, &info) == OT_OK) {
-    if (info.chip_gen == OT_CHIP_V6E) c->device.desc.kind = "TPU v6 lite";
-    else c->device.desc.kind = "TPU v5 lite";
+
+  // Serpentine 2x2 package walk when 4 physical packages are present (e.g. tpu7x-4t)
+  // so intra-package D2D chiplets remain consecutive pairs (0,1), (2,3), (4,5), (6,7).
+  const int64_t grid_x = (pci_funcs == 4) ? 2 : static_cast<int64_t>(pci_funcs);
+  c->devices.reserve(total_logical);
+  c->dev_ptrs.reserve(total_logical);
+  c->mem_ptrs.reserve(total_logical);
+  c->topology.desc_ptrs.reserve(total_logical);
+
+  for (size_t pkg = 0; pkg < pci_funcs; ++pkg) {
+    const int64_t y = static_cast<int64_t>(pkg) / grid_x;
+    int64_t x = static_cast<int64_t>(pkg) % grid_x;
+    if (pci_funcs == 4 && (y & 1) != 0) {
+      x = grid_x - 1 - x;
+    }
+    for (size_t core = 0; core < chiplets_per_func; ++core) {
+      const int logical_id = static_cast<int>(pkg * chiplets_per_func + core);
+      auto dev = std::make_unique<PJRT_Device>();
+      dev->ctx = ctx;
+      dev->desc.id = logical_id;
+      dev->desc.local_hardware_id = logical_id;
+      dev->desc.kind = kind_str;
+      dev->desc.debug_str = "OpenTPU:" + std::to_string(logical_id);
+      dev->desc.coords = {x, y, 0};
+      dev->desc.core_on_chip =
+          (chiplets_per_func > 1) ? static_cast<int64_t>(core) : -1;
+      dev->desc.finalize_attrs();
+      dev->mem.base.vtable = &kMemoryVtable;
+      dev->mem.id = logical_id;
+      dev->mem.debug_str = "TPU_HBM:" + std::to_string(logical_id);
+      dev->mem.device = dev.get();
+      dev->mem_ptrs[0] = &dev->mem.base;
+
+      c->dev_ptrs.push_back(dev.get());
+      c->mem_ptrs.push_back(&dev->mem.base);
+      c->topology.desc_ptrs.push_back(&dev->desc);
+      c->devices.push_back(std::move(dev));
+    }
   }
+
   c->topology.platform_name = c->platform_name;
   c->topology.platform_version = c->platform_version;
-  c->topology.desc_ptrs[0] = &c->device.desc;
   c->topology.owned_by_client = true;
   args->client = c;
   return nullptr;
@@ -1137,8 +1260,8 @@ PJRT_Error* ot_pjrt_topo_platform_version(PJRT_TopologyDescription_PlatformVersi
 PJRT_Error* ot_pjrt_topo_get_dev_descs(
     PJRT_TopologyDescription_GetDeviceDescriptions_Args* args) {
   if (!args || !args->topology) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null topology");
-  args->descriptions = args->topology->desc_ptrs;
-  args->num_descriptions = args->topology->desc_ptrs[0] ? 1 : 0;
+  args->descriptions = args->topology->desc_ptrs.data();
+  args->num_descriptions = args->topology->desc_ptrs.size();
   return nullptr;
 }
 
@@ -1158,7 +1281,9 @@ PJRT_Error* ot_pjrt_topo_serialize(PJRT_TopologyDescription_Serialize_Args* args
   auto* st = new (std::nothrow) PJRT_SerializedTopology();
   if (!st) return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, "out of memory");
   const char* kind =
-      args->topology->desc_ptrs[0] ? args->topology->desc_ptrs[0]->kind.c_str() : "unknown";
+      !args->topology->desc_ptrs.empty() && args->topology->desc_ptrs[0]
+          ? args->topology->desc_ptrs[0]->kind.c_str()
+          : "unknown";
   st->data = args->topology->platform_name + "|" + args->topology->platform_version + "|" + kind;
   args->serialized_bytes = st->data.c_str();
   args->serialized_bytes_size = st->data.size();
@@ -1170,7 +1295,9 @@ PJRT_Error* ot_pjrt_topo_serialize(PJRT_TopologyDescription_Serialize_Args* args
 PJRT_Error* ot_pjrt_topo_fingerprint(PJRT_TopologyDescription_Fingerprint_Args* args) {
   if (!args || !args->topology) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null topology");
   const char* kind =
-      args->topology->desc_ptrs[0] ? args->topology->desc_ptrs[0]->kind.c_str() : "unknown";
+      !args->topology->desc_ptrs.empty() && args->topology->desc_ptrs[0]
+          ? args->topology->desc_ptrs[0]->kind.c_str()
+          : "unknown";
   std::string key =
       args->topology->platform_name + "|" + args->topology->platform_version + "|" + kind;
   uint64_t h = 14695981039346656037ULL;
@@ -1211,50 +1338,65 @@ PJRT_Error* ot_pjrt_client_platform_version(PJRT_Client_PlatformVersion_Args* ar
 
 PJRT_Error* ot_pjrt_client_devices(PJRT_Client_Devices_Args* args) {
   if (!args || !args->client) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null client");
-  args->devices = args->client->dev_ptrs;
-  args->num_devices = 1;
+  args->devices = args->client->dev_ptrs.data();
+  args->num_devices = args->client->dev_ptrs.size();
   return nullptr;
 }
 
 PJRT_Error* ot_pjrt_client_addressable_devices(PJRT_Client_AddressableDevices_Args* args) {
   if (!args || !args->client) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null client");
-  args->addressable_devices = args->client->dev_ptrs;
-  args->num_addressable_devices = 1;
+  args->addressable_devices = args->client->dev_ptrs.data();
+  args->num_addressable_devices = args->client->dev_ptrs.size();
   return nullptr;
 }
 
 PJRT_Error* ot_pjrt_client_lookup_device(PJRT_Client_LookupDevice_Args* args) {
   if (!args || !args->client) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null client");
-  if (args->id != 0) return make_err(PJRT_Error_Code_NOT_FOUND, "unknown device id");
-  args->device = &args->client->device;
-  return nullptr;
+  for (const auto& d : args->client->devices) {
+    if (d && d->desc.id == args->id) {
+      args->device = d.get();
+      return nullptr;
+    }
+  }
+  return make_err(PJRT_Error_Code_NOT_FOUND, "unknown device id");
 }
 
 PJRT_Error* ot_pjrt_client_lookup_addr_device(PJRT_Client_LookupAddressableDevice_Args* args) {
   if (!args || !args->client) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null client");
-  if (args->local_hardware_id != 0) {
-    return make_err(PJRT_Error_Code_NOT_FOUND, "unknown local hardware id");
+  for (const auto& d : args->client->devices) {
+    if (d && d->desc.local_hardware_id == args->local_hardware_id) {
+      args->addressable_device = d.get();
+      return nullptr;
+    }
   }
-  args->addressable_device = &args->client->device;
-  return nullptr;
+  return make_err(PJRT_Error_Code_NOT_FOUND, "unknown local hardware id");
 }
 
 PJRT_Error* ot_pjrt_client_addressable_memories(PJRT_Client_AddressableMemories_Args* args) {
   if (!args || !args->client) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null client");
-  args->addressable_memories = args->client->mem_ptrs;
-  args->num_addressable_memories = 1;
+  args->addressable_memories = args->client->mem_ptrs.data();
+  args->num_addressable_memories = args->client->mem_ptrs.size();
   return nullptr;
 }
 
 PJRT_Error* ot_pjrt_client_default_device_assignment(
     PJRT_Client_DefaultDeviceAssignment_Args* args) {
-  if (!args || !args->default_assignment || args->default_assignment_size < 1) {
+  if (!args || !args->client || !args->default_assignment || args->default_assignment_size < 1) {
     return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "invalid assignment buffer");
   }
-  if (args->num_replicas != 1 || args->num_partitions != 1) {
-    return make_err(PJRT_Error_Code_UNIMPLEMENTED, "single-chip only");
+  if (args->num_partitions != 1 || args->num_replicas < 1) {
+    return make_err(PJRT_Error_Code_UNIMPLEMENTED, "num_partitions=1 only");
   }
-  args->default_assignment[0] = 0;
+  const size_t n = static_cast<size_t>(args->num_replicas);
+  if (n > args->client->devices.size()) {
+    return make_err(PJRT_Error_Code_UNIMPLEMENTED, "num_replicas exceeds addressable devices");
+  }
+  if (args->default_assignment_size < n) {
+    return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "default_assignment_size too small");
+  }
+  for (size_t i = 0; i < n; ++i) {
+    args->default_assignment[i] = args->client->devices[i]->desc.id;
+  }
   return nullptr;
 }
 
@@ -1294,9 +1436,15 @@ static bool pb_skip_field(const uint8_t* p, size_t len, size_t* pos, uint32_t wi
   return false;
 }
 
-static PJRT_Error* validate_device_assignment_proto(const uint8_t* p, size_t len) {
+static PJRT_Error* validate_device_assignment_proto(const uint8_t* p,
+                                                    size_t len,
+                                                    size_t num_devices,
+                                                    std::vector<int>* out_assigned_ids) {
   size_t pos = 0;
   size_t comp_dev_count = 0;
+  uint64_t replica_count = 1;
+  uint64_t comp_count = 1;
+  std::vector<int> assigned;
   while (pos < len) {
     uint64_t tag = 0;
     if (!pb_read_varint(p, len, &pos, &tag)) {
@@ -1304,19 +1452,27 @@ static PJRT_Error* validate_device_assignment_proto(const uint8_t* p, size_t len
     }
     uint32_t field = static_cast<uint32_t>(tag >> 3);
     uint32_t wire = static_cast<uint32_t>(tag & 0x7u);
-    if ((field == 1 || field == 2) && wire == 0) {
-      uint64_t v = 0;
-      if (!pb_read_varint(p, len, &pos, &v)) {
-        return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed device_assignment count");
+    if (field == 1 && wire == 0) {
+      if (!pb_read_varint(p, len, &pos, &replica_count)) {
+        return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed replica_count");
       }
-      if (v != 0 && v != 1) {
+      if (replica_count == 0 || replica_count > num_devices) {
         return make_err(PJRT_Error_Code_UNIMPLEMENTED,
-                        "single-device OpenTPU requires 1 replica and 1 computation");
+                        num_devices <= 1 ? "single-device OpenTPU requires 1 replica and 1 computation"
+                                         : "replica_count exceeds addressable devices");
+      }
+    } else if (field == 2 && wire == 0) {
+      if (!pb_read_varint(p, len, &pos, &comp_count)) {
+        return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed computation_count");
+      }
+      if (comp_count != 0 && comp_count != 1) {
+        return make_err(PJRT_Error_Code_UNIMPLEMENTED,
+                        "OpenTPU supports computation_count=1 only");
       }
     } else if (field == 3 && wire == 2) {
       if (++comp_dev_count > 1) {
         return make_err(PJRT_Error_Code_UNIMPLEMENTED,
-                        "single-device OpenTPU supports 1 computation device only");
+                        "OpenTPU supports 1 computation device list only");
       }
       uint64_t slen = 0;
       if (!pb_read_varint(p, len, &pos, &slen) || slen > len - pos) {
@@ -1325,7 +1481,6 @@ static PJRT_Error* validate_device_assignment_proto(const uint8_t* p, size_t len
       const uint8_t* sub = p + pos;
       size_t spos = 0;
       size_t sub_len = static_cast<size_t>(slen);
-      size_t replica_id_count = 0;
       while (spos < sub_len) {
         uint64_t stag = 0;
         if (!pb_read_varint(sub, sub_len, &spos, &stag)) {
@@ -1338,10 +1493,12 @@ static PJRT_Error* validate_device_assignment_proto(const uint8_t* p, size_t len
           if (!pb_read_varint(sub, sub_len, &spos, &did)) {
             return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed replica_device_id");
           }
-          if (did != 0 || ++replica_id_count > 1) {
+          if (did >= num_devices) {
             return make_err(PJRT_Error_Code_UNIMPLEMENTED,
-                            "single-device OpenTPU supports single device id 0 only");
+                            num_devices <= 1 ? "single-device OpenTPU supports single device id 0 only"
+                                             : "replica_device_id out of addressable range");
           }
+          assigned.push_back(static_cast<int>(did));
         } else if (sfield == 1 && swire == 2) {
           uint64_t plen = 0;
           if (!pb_read_varint(sub, sub_len, &spos, &plen) || plen > sub_len - spos) {
@@ -1353,10 +1510,12 @@ static PJRT_Error* validate_device_assignment_proto(const uint8_t* p, size_t len
             if (!pb_read_varint(sub, pend, &spos, &did)) {
               return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed packed replica_device_id");
             }
-            if (did != 0 || ++replica_id_count > 1) {
+            if (did >= num_devices) {
               return make_err(PJRT_Error_Code_UNIMPLEMENTED,
-                              "single-device OpenTPU supports single device id 0 only");
+                              num_devices <= 1 ? "single-device OpenTPU supports single device id 0 only"
+                                               : "replica_device_id out of addressable range");
             }
+            assigned.push_back(static_cast<int>(did));
           }
         } else if (!pb_skip_field(sub, sub_len, &spos, swire)) {
           return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed computation_device field");
@@ -1367,11 +1526,24 @@ static PJRT_Error* validate_device_assignment_proto(const uint8_t* p, size_t len
       return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed device_assignment field");
     }
   }
+  if (!assigned.empty()) {
+    if (assigned.size() > num_devices) {
+      return make_err(PJRT_Error_Code_UNIMPLEMENTED,
+                      num_devices <= 1 ? "single-device OpenTPU supports single device id 0 only"
+                                       : "device_assignment size exceeds addressable devices");
+    }
+    if (out_assigned_ids) *out_assigned_ids = std::move(assigned);
+  }
   return nullptr;
 }
 
-static PJRT_Error* validate_exec_build_options_proto(const uint8_t* p, size_t len) {
+static PJRT_Error* validate_exec_build_options_proto(const uint8_t* p,
+                                                     size_t len,
+                                                     size_t num_devices,
+                                                     std::vector<int>* out_assigned_ids) {
   size_t pos = 0;
+  uint64_t num_replicas = 1;
+  bool has_explicit_da = false;
   while (pos < len) {
     uint64_t tag = 0;
     if (!pb_read_varint(p, len, &pos, &tag)) {
@@ -1385,9 +1557,10 @@ static PJRT_Error* validate_exec_build_options_proto(const uint8_t* p, size_t le
         return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed device_ordinal");
       }
       int64_t ord = static_cast<int64_t>(raw);
-      if (ord != -1 && ord != 0) {
+      if (ord != -1 && (ord < 0 || static_cast<size_t>(ord) >= num_devices)) {
         return make_err(PJRT_Error_Code_INVALID_ARGUMENT,
-                        "single-device OpenTPU supports device_ordinal -1 or 0 only");
+                        num_devices <= 1 ? "single-device OpenTPU supports device_ordinal -1 or 0 only"
+                                         : "device_ordinal out of addressable device range");
       }
     } else if (field == 2 && wire == 2) {
       uint64_t slen = 0;
@@ -1396,14 +1569,25 @@ static PJRT_Error* validate_exec_build_options_proto(const uint8_t* p, size_t le
       }
       return make_err(PJRT_Error_Code_UNIMPLEMENTED,
                       "explicit result_layout is not supported (OpenTPU M4 produces dense row-major only)");
-    } else if ((field == 4 || field == 5) && wire == 0) {
+    } else if (field == 4 && wire == 0) {
       uint64_t v = 0;
       if (!pb_read_varint(p, len, &pos, &v)) {
-        return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed replica/partition count");
+        return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed replica count");
+      }
+      if (v > num_devices) {
+        return make_err(PJRT_Error_Code_UNIMPLEMENTED,
+                        num_devices <= 1 ? "single-device OpenTPU supports num_replicas=1 and num_partitions=1 only"
+                                         : "num_replicas exceeds addressable devices");
+      }
+      if (v > 0) num_replicas = v;
+    } else if (field == 5 && wire == 0) {
+      uint64_t v = 0;
+      if (!pb_read_varint(p, len, &pos, &v)) {
+        return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed partition count");
       }
       if (v != 0 && v != 1) {
         return make_err(PJRT_Error_Code_UNIMPLEMENTED,
-                        "single-device OpenTPU supports num_replicas=1 and num_partitions=1 only");
+                        "OpenTPU supports num_partitions=1 only");
       }
     } else if (field == 7 && wire == 0) {
       uint64_t auto_spmd = 0;
@@ -1419,7 +1603,9 @@ static PJRT_Error* validate_exec_build_options_proto(const uint8_t* p, size_t le
       if (!pb_read_varint(p, len, &pos, &slen) || slen > len - pos) {
         return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed device_assignment");
       }
-      PJRT_Error* err = validate_device_assignment_proto(p + pos, static_cast<size_t>(slen));
+      has_explicit_da = true;
+      PJRT_Error* err = validate_device_assignment_proto(
+          p + pos, static_cast<size_t>(slen), num_devices, out_assigned_ids);
       if (err) return err;
       pos += static_cast<size_t>(slen);
     } else if (field == 10 && wire == 0) {
@@ -1435,10 +1621,20 @@ static PJRT_Error* validate_exec_build_options_proto(const uint8_t* p, size_t le
       return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed executable_build_options field");
     }
   }
+  if (!has_explicit_da && out_assigned_ids) {
+    out_assigned_ids->clear();
+    for (uint64_t i = 0; i < num_replicas; ++i) {
+      out_assigned_ids->push_back(static_cast<int>(i));
+    }
+  }
   return nullptr;
 }
 
-static PJRT_Error* validate_single_device_compile_options(const char* data, size_t len) {
+static PJRT_Error* validate_compile_options(const char* data,
+                                            size_t len,
+                                            size_t num_devices,
+                                            std::vector<int>* out_assigned_ids) {
+  if (out_assigned_ids) *out_assigned_ids = {0};
   if (len == 0) return nullptr;
   if (!data) {
     return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null compile_options with nonzero size");
@@ -1473,7 +1669,8 @@ static PJRT_Error* validate_single_device_compile_options(const char* data, size
       if (!pb_read_varint(p, len, &pos, &slen) || slen > len - pos) {
         return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed executable_build_options length");
       }
-      PJRT_Error* err = validate_exec_build_options_proto(p + pos, static_cast<size_t>(slen));
+      PJRT_Error* err = validate_exec_build_options_proto(
+          p + pos, static_cast<size_t>(slen), num_devices, out_assigned_ids);
       if (err) return err;
       pos += static_cast<size_t>(slen);
     } else if (field == 4 && wire == 0) {
@@ -1515,8 +1712,11 @@ PJRT_Error* ot_pjrt_client_compile(PJRT_Client_Compile_Args* args) {
   if (!args || !args->client || !args->program) {
     return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null compile args");
   }
-  if (PJRT_Error* opt_err = validate_single_device_compile_options(args->compile_options,
-                                                                   args->compile_options_size)) {
+  std::vector<int> assigned_ids;
+  if (PJRT_Error* opt_err = validate_compile_options(args->compile_options,
+                                                     args->compile_options_size,
+                                                     args->client->devices.size(),
+                                                     &assigned_ids)) {
     return opt_err;
   }
   const char* fmt = args->program->format;
@@ -1546,6 +1746,10 @@ PJRT_Error* ot_pjrt_client_compile(PJRT_Client_Compile_Args* args) {
   auto* le = new (std::nothrow) PJRT_LoadedExecutable();
   if (!le) return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, "out of memory");
   le->client = args->client;
+  le->assigned_device_ids = std::move(assigned_ids);
+  if (le->assigned_device_ids.empty()) {
+    le->assigned_device_ids = {args->client->devices.empty() ? 0 : args->client->devices[0]->desc.id};
+  }
   le->exec.m_dim = m;
   le->exec.k_dim = k;
   le->exec.n_dim = n;
@@ -1562,19 +1766,32 @@ PJRT_Error* ot_pjrt_buffer_from_host_buffer(PJRT_Client_BufferFromHostBuffer_Arg
   // Per PJRT contract, non-null `memory` takes precedence over `device`.
   PJRT_Device* target_device = nullptr;
   if (args->memory) {
-    if (args->memory != &args->client->device.mem.base) {
+    for (const auto& d : args->client->devices) {
+      if (d && args->memory == &d->mem.base) {
+        target_device = d.get();
+        break;
+      }
+    }
+    if (!target_device) {
       return make_err(PJRT_Error_Code_INVALID_ARGUMENT,
                       "destination memory does not belong to this client");
     }
-    target_device = &args->client->device;
   } else if (args->device) {
-    if (args->device != &args->client->device) {
+    for (const auto& d : args->client->devices) {
+      if (d && args->device == d.get()) {
+        target_device = d.get();
+        break;
+      }
+    }
+    if (!target_device) {
       return make_err(PJRT_Error_Code_INVALID_ARGUMENT,
                       "destination device does not belong to this client");
     }
-    target_device = &args->client->device;
   } else {
-    target_device = &args->client->device;
+    if (args->client->devices.empty()) {
+      return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "client has no devices");
+    }
+    target_device = args->client->devices[0].get();
   }
 
   if (args->num_dims > 0 && !args->dims) {
@@ -1692,9 +1909,14 @@ PJRT_Error* ot_pjrt_devdesc_process_index(PJRT_DeviceDescription_ProcessIndex_Ar
 }
 
 PJRT_Error* ot_pjrt_devdesc_attributes(PJRT_DeviceDescription_Attributes_Args* args) {
-  if (!args) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null");
-  args->attributes = nullptr;
-  args->num_attributes = 0;
+  if (!args || !args->device_description) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null");
+  if (!args->device_description->attrs.empty()) {
+    args->attributes = args->device_description->attrs.data();
+    args->num_attributes = args->device_description->attrs.size();
+  } else {
+    args->attributes = nullptr;
+    args->num_attributes = 0;
+  }
   return nullptr;
 }
 
@@ -1732,8 +1954,8 @@ PJRT_Error* ot_pjrt_device_is_addressable(PJRT_Device_IsAddressable_Args* args) 
 }
 
 PJRT_Error* ot_pjrt_device_local_hw_id(PJRT_Device_LocalHardwareId_Args* args) {
-  if (!args) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null");
-  args->local_hardware_id = 0;
+  if (!args || !args->device) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null");
+  args->local_hardware_id = args->device->desc.local_hardware_id;
   return nullptr;
 }
 
@@ -1930,18 +2152,40 @@ void ot_pjrt_device_assignment_deleter(PJRT_DeviceAssignmentSerialized* da) {
   delete da;
 }
 
+static void pb_write_varint_str(std::string* out, uint64_t v) {
+  do {
+    uint8_t b = static_cast<uint8_t>(v & 0x7fu);
+    v >>= 7;
+    if (v != 0) b |= 0x80u;
+    out->push_back(static_cast<char>(b));
+  } while (v != 0);
+}
+
 PJRT_Error* ot_pjrt_lexec_get_device_assignment(
     PJRT_LoadedExecutable_GetDeviceAssignment_Args* args) {
   if (!args || !args->executable) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null");
   auto* da = new (std::nothrow) PJRT_DeviceAssignmentSerialized();
   if (!da) return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, "out of memory");
-  // Valid xla::DeviceAssignmentProto wire encoding for 1 replica x 1 computation -> device 0:
-  //   field 1 (replica_count = 1): 0x08 0x01
-  //   field 2 (computation_count = 1): 0x10 0x01
-  //   field 3 (computation_devices[0] = { field 1 (replica_device_ids = [0]) }): 0x1a 0x02 0x08 0x00
-  static constexpr char kSingleDeviceAssignmentProto[8] = {
-      0x08, 0x01, 0x10, 0x01, 0x1a, 0x02, 0x08, 0x00};
-  da->data.assign(kSingleDeviceAssignmentProto, sizeof(kSingleDeviceAssignmentProto));
+  const auto& ids = args->executable->assigned_device_ids;
+  if (ids.empty()) {
+    static constexpr char kSingleDeviceAssignmentProto[8] = {
+        0x08, 0x01, 0x10, 0x01, 0x1a, 0x02, 0x08, 0x00};
+    da->data.assign(kSingleDeviceAssignmentProto, sizeof(kSingleDeviceAssignmentProto));
+  } else {
+    // xla::DeviceAssignmentProto: replica_count (1), computation_count (2), computation_devices[0] (3).
+    da->data.push_back(0x08);
+    pb_write_varint_str(&da->data, static_cast<uint64_t>(ids.size()));
+    da->data.push_back(0x10);
+    pb_write_varint_str(&da->data, 1ULL);
+    std::string comp_sub;
+    for (int id : ids) {
+      comp_sub.push_back(0x08);
+      pb_write_varint_str(&comp_sub, static_cast<uint64_t>(id));
+    }
+    da->data.push_back(0x1a);
+    pb_write_varint_str(&da->data, static_cast<uint64_t>(comp_sub.size()));
+    da->data.append(comp_sub);
+  }
   args->serialized_bytes = da->data.c_str();
   args->serialized_bytes_size = da->data.size();
   args->serialized_device_assignment = da;
@@ -1958,8 +2202,8 @@ PJRT_Error* ot_pjrt_lexec_fingerprint(PJRT_LoadedExecutable_Fingerprint_Args* ar
 
 PJRT_Error* ot_pjrt_lexec_addr_devices(PJRT_LoadedExecutable_AddressableDevices_Args* args) {
   if (!args || !args->executable) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null");
-  args->addressable_devices = args->executable->client->dev_ptrs;
-  args->num_addressable_devices = 1;
+  args->addressable_devices = args->executable->client->dev_ptrs.data();
+  args->num_addressable_devices = args->executable->client->dev_ptrs.size();
   return nullptr;
 }
 
@@ -1975,75 +2219,105 @@ PJRT_Error* ot_pjrt_lexec_is_deleted(PJRT_LoadedExecutable_IsDeleted_Args* args)
 }
 
 PJRT_Error* ot_pjrt_lexec_execute(PJRT_LoadedExecutable_Execute_Args* args) {
-  if (!args || !args->executable || args->num_devices != 1 || args->num_args != 2) {
-    return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "expected 1 device and 2 matmul args");
+  if (!args || !args->executable || args->num_args != 2) {
+    return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "expected executable and 2 matmul args");
   }
   PJRT_LoadedExecutable* le = args->executable;
   if (le->deleted) {
     return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "executable has been deleted");
   }
-  if (args->execute_device && args->execute_device != &le->client->device) {
-    return make_err(PJRT_Error_Code_INVALID_ARGUMENT,
-                    "execute_device does not belong to this executable's client");
+  const size_t expected_devs = le->assigned_device_ids.empty() ? 1 : le->assigned_device_ids.size();
+  if (args->num_devices != expected_devs && args->num_devices != 1) {
+    return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "unexpected num_devices in Execute");
   }
-  if (!args->argument_lists || !args->argument_lists[0] ||
-      !args->output_lists || !args->output_lists[0]) {
-    return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null argument_lists or output_lists");
-  }
-  PJRT_Buffer* lhs = args->argument_lists[0][0];
-  PJRT_Buffer* rhs = args->argument_lists[0][1];
-  if (!lhs || !rhs || lhs->deleted || rhs->deleted || !lhs->ot_buf || !rhs->ot_buf) {
-    return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null or deleted input buffer");
-  }
-  if (lhs->ctx != le->client->ctx || rhs->ctx != le->client->ctx) {
-    return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "input buffer belongs to another client");
-  }
-  if (lhs->dtype != PJRT_Buffer_Type_BF16 || rhs->dtype != PJRT_Buffer_Type_BF16 ||
-      lhs->dims.size() != 2 || rhs->dims.size() != 2 ||
-      lhs->dims[0] != static_cast<int64_t>(le->exec.m_dim) ||
-      lhs->dims[1] != static_cast<int64_t>(le->exec.k_dim) ||
-      rhs->dims[0] != static_cast<int64_t>(le->exec.k_dim) ||
-      rhs->dims[1] != static_cast<int64_t>(le->exec.n_dim)) {
-    return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "input buffer dtype or shape mismatch");
-  }
-
-  size_t out_bytes = static_cast<size_t>(le->exec.m_dim) * le->exec.n_dim * sizeof(uint16_t);
-  ot_buffer_t* ot_out = nullptr;
-  ot_status_t st = ot_buffer_alloc(le->client->ctx, out_bytes, &ot_out);
-  if (st != OT_OK) return make_ot_err(le->client->ctx, st);
-
-  st = ot_matmul_bf16(le->client->ctx, lhs->ot_buf, rhs->ot_buf, ot_out,
-                      le->exec.m_dim, le->exec.k_dim, le->exec.n_dim);
-  if (st != OT_OK) {
-    ot_buffer_free(ot_out);
-    return make_ot_err(le->client->ctx, st);
-  }
-
-  auto* out_buf = new (std::nothrow) PJRT_Buffer();
-  if (!out_buf) {
-    ot_buffer_free(ot_out);
-    return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, "out of memory");
-  }
-  out_buf->ctx = le->client->ctx;
-  out_buf->device = &le->client->device;
-  out_buf->ot_buf = ot_out;
-  out_buf->logical_bytes = out_bytes;
-  out_buf->dtype = PJRT_Buffer_Type_BF16;
-  out_buf->dims = le->exec.out_dims;
-  out_buf->minor_to_major = {1, 0};
-
-  PJRT_Event* done_ev = nullptr;
-  if (args->device_complete_events) {
-    done_ev = new (std::nothrow) PJRT_Event();
-    if (!done_ev) {
-      ot_buffer_free(out_buf->ot_buf);
-      delete out_buf;
-      return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, "out of memory");
+  PJRT_Device* exec_dev = le->client->devices.empty() ? nullptr : le->client->devices[0].get();
+  if (args->execute_device) {
+    bool found = false;
+    for (const auto& d : le->client->devices) {
+      if (d && args->execute_device == d.get()) {
+        found = true;
+        exec_dev = d.get();
+        break;
+      }
+    }
+    if (!found) {
+      return make_err(PJRT_Error_Code_INVALID_ARGUMENT,
+                      "execute_device does not belong to this executable's client");
     }
   }
-  args->output_lists[0][0] = out_buf;
-  if (args->device_complete_events) {
-    args->device_complete_events[0] = done_ev;
+  if (!args->argument_lists || !args->output_lists) {
+    return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null argument_lists or output_lists");
+  }
+  for (size_t di = 0; di < args->num_devices; ++di) {
+    if (!args->argument_lists[di] || !args->output_lists[di]) {
+      return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null argument_lists or output_lists");
+    }
+    PJRT_Buffer* lhs = args->argument_lists[di][0];
+    PJRT_Buffer* rhs = args->argument_lists[di][1];
+    if (!lhs || !rhs || lhs->deleted || rhs->deleted || !lhs->ot_buf || !rhs->ot_buf) {
+      return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null or deleted input buffer");
+    }
+    if (lhs->ctx != le->client->ctx || rhs->ctx != le->client->ctx) {
+      return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "input buffer belongs to another client");
+    }
+    if (lhs->dtype != PJRT_Buffer_Type_BF16 || rhs->dtype != PJRT_Buffer_Type_BF16 ||
+        lhs->dims.size() != 2 || rhs->dims.size() != 2 ||
+        lhs->dims[0] != static_cast<int64_t>(le->exec.m_dim) ||
+        lhs->dims[1] != static_cast<int64_t>(le->exec.k_dim) ||
+        rhs->dims[0] != static_cast<int64_t>(le->exec.k_dim) ||
+        rhs->dims[1] != static_cast<int64_t>(le->exec.n_dim)) {
+      return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "input buffer dtype or shape mismatch");
+    }
+
+    size_t out_bytes = static_cast<size_t>(le->exec.m_dim) * le->exec.n_dim * sizeof(uint16_t);
+    ot_buffer_t* ot_out = nullptr;
+    ot_status_t st = ot_buffer_alloc(le->client->ctx, out_bytes, &ot_out);
+    if (st != OT_OK) return make_ot_err(le->client->ctx, st);
+
+    st = ot_matmul_bf16(le->client->ctx, lhs->ot_buf, rhs->ot_buf, ot_out,
+                        le->exec.m_dim, le->exec.k_dim, le->exec.n_dim);
+    if (st != OT_OK) {
+      ot_buffer_free(ot_out);
+      return make_ot_err(le->client->ctx, st);
+    }
+
+    PJRT_Device* out_dev = exec_dev;
+    if (!args->execute_device && di < le->assigned_device_ids.size()) {
+      const int target_id = le->assigned_device_ids[di];
+      for (const auto& d : le->client->devices) {
+        if (d && d->desc.id == target_id) {
+          out_dev = d.get();
+          break;
+        }
+      }
+    }
+
+    auto* out_buf = new (std::nothrow) PJRT_Buffer();
+    if (!out_buf) {
+      ot_buffer_free(ot_out);
+      return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, "out of memory");
+    }
+    out_buf->ctx = le->client->ctx;
+    out_buf->device = out_dev;
+    out_buf->ot_buf = ot_out;
+    out_buf->logical_bytes = out_bytes;
+    out_buf->dtype = PJRT_Buffer_Type_BF16;
+    out_buf->dims = le->exec.out_dims;
+    out_buf->minor_to_major = {1, 0};
+
+    PJRT_Event* done_ev = nullptr;
+    if (args->device_complete_events) {
+      done_ev = new (std::nothrow) PJRT_Event();
+      if (!done_ev) {
+        ot_buffer_free(out_buf->ot_buf);
+        delete out_buf;
+        return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, "out of memory");
+      }
+    }
+    args->output_lists[di][0] = out_buf;
+    if (args->device_complete_events) {
+      args->device_complete_events[di] = done_ev;
+    }
   }
   return nullptr;
 }

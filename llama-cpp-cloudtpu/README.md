@@ -111,10 +111,11 @@ When opted in via `CLOUDTPU_SPMD_CHIPS=auto` (or an explicit count such as `CLOU
 
 *Note: `v6e-8` M4A baseline proves end-to-end 8-chip 32B/70B correctness & zero-Python SPMD sharding; autoregressive `tg64` throughput is currently bottlenecked by out-of-place `SET_ROWS` (`stablehlo.scatter`), per-subgraph host sync / unfused `Q4_K` dequant, and CPU `rope_freqs.weight` graph splits on Llama-3 — targeted in the next decode acceleration slice (`dynamic_update_slice` buffer donation, whole-layer fusion, VMEM-fused dequant, and async collective overlap flags).*
 
-| Target Topology (Phase 0 Baseline, PR `#15`) | Chips (`P`) | Total HBM | `Qwen3-32B` (`Q4_K_M` / `BF16`) per chip | `Llama-3.3-70B` (`Q4_K_M` / `Q8_0` / `BF16`) per chip | Verification Status |
+| Target Topology | Logical Chiplets (`P`) | Total HBM | `Qwen3-32B` (`Q4_K_M` / `BF16`) per chiplet | `Llama-3.3-70B` (`Q4_K_M` / `Q8_0` / `BF16`) per chiplet | Verification Status |
 | --- | ---: | ---: | --- | --- | --- |
-| **`v6e-8`** (Trillium) | `8` | `256 GiB` (`32 GiB/chip`) | `~2.5 GiB` / `~8.1 GiB` | `~5.3 GiB` / `~9.4 GiB` / `~17.6 GiB` | **Verified live on `v6e-8` silicon** (`test_cloudtpu_host`, `3,820/3,820` `test-backend-ops`, `Qwen3-32B`, `Llama-3.3-70B` `39.59 GiB`, `MAPS_LIBPYTHON=0`) |
-| **`tpu7x-standard-4t`** (Ironwood) | `4` (`8` logical) | `768 GiB` (`192 GiB/chip`) | `~5.0 GiB` / `~16.3 GiB` | `~10.6 GiB` / `~18.8 GiB` / `~35.3 GiB` | Verified on 4-chip & 8-chip Host Mock; live Ironwood silicon tracked in `#21` (`WAITING_FOR_QUOTA`) |
+| **`v6e-8`** (Trillium) | `8` (`8` chips) | `256 GiB` (`32 GiB/chip`) | `~2.5 GiB` / `~8.1 GiB` | `~5.3 GiB` / `~9.4 GiB` / `~17.6 GiB` | **Verified live on `v6e-8` silicon** (`test_cloudtpu_host`, `3,820/3,820` `test-backend-ops`, `Qwen3-32B`, `Llama-3.3-70B` `39.59 GiB`, `MAPS_LIBPYTHON=0`) |
+| **`tpu7x-standard-1t`** (Ironwood) | `2` (`1` chip package, D2D pair) | `192 GiB` (`96 GiB/chiplet`) | `~10.0 GiB` / `~32.5 GiB` | `~21.2 GiB` / `~37.5 GiB` / `~70.5 GiB` | Verified on `tpu7x-1t` dual-chiplet Host Mock (`f8E4M3FN` + D2D pairing); live Day-1 runbook in [`docs/cloud-tpu/ironwood-tpu7x-day1-runbook.md`](../docs/cloud-tpu/ironwood-tpu7x-day1-runbook.md) |
+| **`tpu7x-standard-4t`** (Ironwood) | `8` (`4` chips × `2` chiplets) | `768 GiB` (`96 GiB/chiplet`, `192 GiB/chip`) | `~2.5 GiB` / `~8.1 GiB` | `~5.3 GiB` / `~9.4 GiB` / `~17.6 GiB` | Verified on `tpu7x-4t` 8-chiplet D2D-paired Host Mock (`f8E4M3FN` + Hamiltonian pairing); live Ironwood Day-1 proof in [`docs/cloud-tpu/ironwood-tpu7x-day1-runbook.md`](../docs/cloud-tpu/ironwood-tpu7x-day1-runbook.md) |
 
 ---
 
@@ -154,13 +155,16 @@ CLOUDTPU_SPMD_CHIPS=1 ./llama-cpp-cloudtpu/build-host/bin/llama-bench \
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `CLOUDTPU_MOCK` | `0` on Linux, `1` on macOS/Windows | `1` runs in-process Host Mock PJRT executing emitted StableHLO IR |
-| `CLOUDTPU_MOCK_DEVICES` | `1` | Virtual TPU chip count in Host Mock (`4` simulates `tpu7x-4t`, `8` simulates `v6e-8`) |
+| `CLOUDTPU_MOCK_DEVICES` | `1` | Virtual logical TPU chiplet count in Host Mock (`2` = `tpu7x-1t`, `8` = `v6e-8` or `tpu7x-4t` with `CLOUDTPU_MOCK_PROFILE`) |
+| `CLOUDTPU_MOCK_PROFILE` | `auto` | Host Mock hardware topology profile (`auto`, `v5e-1`, `v6e-8`, `tpu7x-1t`, `tpu7x-4t`) |
 | `CLOUDTPU_SPMD_CHIPS` | `1` (per-chip devices) | Opt-in replica-SPMD Tensor Parallelism: `1` exposes per-chip devices (`CLOUDTPU`, `CLOUDTPU1`, ...); `auto` uses all discovered chips; `2..16` sets an explicit mesh size |
 | `CLOUDTPU_SPMD_MIN_ROWS` | `256` | Minimum 2D weight matrix rows/cols required to shard across SPMD chips |
 | `CLOUDTPU_MAX_FUSE_OPS` | `4096` | Maximum GGML ops fused into a single StableHLO subgraph executable (`1..16384`) |
 | `CLOUDTPU_FUSE_ATTN` | `1` | `1` fuses `FLASH_ATTN_EXT` + KV updates into 1 PJRT graph/token (`0` splits at attention) |
 | `CLOUDTPU_DONATE_KV` | `1` | `1` enables in-place KV cache HBM donation via `dynamic_update_slice` + `{tf.aliasing_output}` |
 | `CLOUDTPU_MATMUL_BF16` | `1` | `1` casts dequantized split-quantized weights (`Q8_0`/`Q4_0`/`Q4_K`/`Q6_K`) & activations to `BF16` for TPU MXU `MUL_MAT` contraction (dense F16/F32 matmuls stay F32) |
+| `CLOUDTPU_MATMUL_FP8` | `0` | Quantized `MUL_MAT` `f8E4M3FN` MXU lowering (`0` = off / BF16 fallback, `auto` = enabled automatically on Ironwood `tpu7x`, `1` = force `f8E4M3FN` with dynamic absmax scaling) |
+| `CLOUDTPU_EMIT_SDY_MESH` | `0` | Opt-in (`1`) emits D2D-aware Shardy `sdy.mesh` module declaration aligned to Hamiltonian intra-package pairing |
 | `CLOUDTPU_FLASH_ATTN_BF16` | `0` | Opt-in (`1`) casts `FLASH_ATTN_EXT` Q/K/probs/V matmuls to `BF16` (`0` keeps F32 attention for strict GGML parity) |
 | `CLOUDTPU_Q4_MODE` | `i4` | Q4 storage/kernel path: `i4` (`S4` 0.5 B/w factored dot), `u4`, `bitcast` (`U8->S4`), `split`, `concat` |
 | `CLOUDTPU_Q4_SPLIT_DOT` | `1` | Legacy toggle (`1` -> `split`, `0` -> `concat`) when not using `CLOUDTPU_Q4_MODE` |

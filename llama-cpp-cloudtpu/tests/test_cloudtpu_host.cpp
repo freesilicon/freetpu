@@ -1351,10 +1351,13 @@ void test_collectives_p1_live_compatible(cloudtpu::PjrtRuntime& rt) {
     std::printf("  [PASS] StableHLO collectives P=1 syntax & execution (all_reduce/all_gather/reduce_scatter)\n");
 }
 
-void test_spmd_multichip_mesh(int num_chips) {
+void test_spmd_multichip_mesh(
+    int num_chips,
+    cloudtpu::MockTopologyProfile profile = cloudtpu::MockTopologyProfile::AUTO) {
     cloudtpu::RuntimeConfig cfg;
     cfg.mock_mode = true;
     cfg.mock_devices = num_chips;
+    cfg.mock_profile = profile;
     cfg.exec_cache_cap = 128;
     cloudtpu::PjrtRuntime rt;
     rt.init(cfg);
@@ -1362,10 +1365,22 @@ void test_spmd_multichip_mesh(int num_chips) {
     CHECK_TRUE(rt.device_count() == num_chips, "SPMD mock device_count");
     size_t free0 = 0, total0 = 0;
     CHECK_TRUE(rt.query_memory_stats(0, &free0, &total0), "SPMD device 0 memory stats");
-    if (num_chips == 8) {
+    if (profile == cloudtpu::MockTopologyProfile::TPU7X_1T ||
+        profile == cloudtpu::MockTopologyProfile::TPU7X_4T ||
+        rt.is_tpu7x_topology()) {
+        CHECK_TRUE(total0 == (96ULL << 30), "tpu7x 96 GiB/logical chiplet HBM3e");
+        CHECK_TRUE(rt.is_dual_chiplet_topology() && rt.d2d_group_size() == 2,
+                   "tpu7x reports dual-chiplet D2D group size 2");
+        CHECK_TRUE(rt.device_info(0).chip_id == 0 && rt.device_info(0).chiplet_id == 0,
+                   "tpu7x rank 0 chip/chiplet id");
+        CHECK_TRUE(rt.device_info(1).chip_id == 0 && rt.device_info(1).chiplet_id == 1,
+                   "tpu7x rank 1 shares physical package 0");
+    } else if (num_chips == 8) {
         CHECK_TRUE(total0 == (32ULL << 30), "v6e-8 32 GiB/chip HBM");
+        CHECK_TRUE(!rt.is_dual_chiplet_topology() && rt.d2d_group_size() == 1,
+                   "v6e-8 is single-chiplet per package");
     } else if (num_chips == 4) {
-        CHECK_TRUE(total0 == (192ULL << 30), "tpu7x-4t 192 GiB/chip HBM3e");
+        CHECK_TRUE(total0 == (32ULL << 30), "4-chip mock 32 GiB/chip HBM");
     }
 
     const auto copts = rt.make_spmd_compile_options(num_chips);
@@ -1585,7 +1600,8 @@ void test_spmd_multichip_mesh(int num_chips) {
     }
 
     rt.shutdown();
-    std::printf("  [PASS] Multi-chip SPMD mesh (%d chips: collectives + 1/P HBM + Megatron FFN)\n", num_chips);
+    std::printf("  [PASS] Multi-chip SPMD mesh (%d chips, profile=%d: collectives + 1/P HBM + Megatron FFN)\n",
+                num_chips, static_cast<int>(profile));
 }
 
 void test_spmd_unequal_k_shard_broadcast() {
@@ -6246,6 +6262,374 @@ void test_ggml_cgraph_reshaped_host_cpy_and_q4_bitcast_view() {
 #endif
 }
 #endif
+
+void test_ironwood_d2d_pairing_and_sdy_mesh() {
+    // 1. tpu7x-1t: 2 logical chiplets, 96 GiB each (192 GiB package), D2D pair (0,1).
+    {
+        cloudtpu::RuntimeConfig cfg;
+        cfg.mock_mode = true;
+        cfg.mock_devices = 2;
+        cfg.mock_profile = cloudtpu::MockTopologyProfile::TPU7X_1T;
+        cloudtpu::PjrtRuntime rt;
+        rt.init(cfg);
+        CHECK_TRUE(rt.device_count() == 2, "tpu7x-1t exposes 2 logical chiplets");
+        CHECK_TRUE(rt.is_dual_chiplet_topology() && rt.d2d_group_size() == 2,
+                   "tpu7x-1t dual-chiplet detection");
+        CHECK_TRUE(rt.is_tpu7x_topology() &&
+                       cloudtpu::is_tpu7x_device_kind(rt.device_info(0).kind),
+                   "tpu7x-1t device_kind recognition");
+        size_t f0 = 0, t0 = 0;
+        CHECK_TRUE(rt.query_memory_stats(0, &f0, &t0) && t0 == (96ULL << 30),
+                   "tpu7x-1t 96 GiB/logical chiplet HBM3e");
+        const auto sdy1 = cloudtpu::format_sdy_mesh_op(2, rt.d2d_group_size(), {0, 1});
+        CHECK_TRUE(sdy1.find("sdy.mesh @mesh = <[\"package\"=1, \"d2d\"=2]>") != std::string::npos,
+                   "tpu7x-1t sdy.mesh syntax");
+    }
+
+    // 2. tpu7x-4t with scrambled device enumeration: PjrtRuntime must reconstruct
+    //    Hamiltonian intra-package D2D pairs and serpentine 2x2 package walk.
+    {
+        cloudtpu::RuntimeConfig cfg;
+        cfg.mock_mode = true;
+        cfg.mock_devices = 8;
+        cfg.mock_profile = cloudtpu::MockTopologyProfile::TPU7X_4T;
+        cfg.mock_scramble_device_order = true;
+        cloudtpu::PjrtRuntime rt;
+        rt.init(cfg);
+
+        CHECK_TRUE(rt.device_count() == 8, "tpu7x-4t exposes 8 logical chiplets");
+        CHECK_TRUE(rt.is_dual_chiplet_topology() && rt.d2d_group_size() == 2,
+                   "tpu7x-4t dual-chiplet detection");
+
+        for (int p = 0; p < 4; ++p) {
+            const auto& d0 = rt.device_info(p * 2);
+            const auto& d1 = rt.device_info(p * 2 + 1);
+            CHECK_TRUE(d0.coords == d1.coords && !d0.coords.empty(),
+                       "tpu7x-4t D2D pair shares physical package coords");
+            CHECK_TRUE(d0.core_on_chip == 0 && d1.core_on_chip == 1,
+                       "tpu7x-4t D2D pair orders core_on_chip 0 before 1");
+            CHECK_TRUE(d0.chip_id == p && d1.chip_id == p,
+                       "tpu7x-4t logical_id/2 maps consecutive ranks to same chip");
+            CHECK_TRUE(d0.chiplet_id == 0 && d1.chiplet_id == 1,
+                       "tpu7x-4t logical_id%2 maps chiplets");
+            // Check physical serpentine unit-hop adjacency between consecutive packages.
+            const auto& next = rt.device_info(((p + 1) % 4) * 2);
+            const int64_t dist = std::llabs(d0.coords[0] - next.coords[0]) +
+                                 std::llabs(d0.coords[1] - next.coords[1]) +
+                                 std::llabs(d0.coords[2] - next.coords[2]);
+            CHECK_TRUE(dist == 1, "tpu7x-4t serpentine Hamiltonian ring keeps Manhattan distance 1");
+        }
+
+        const auto copts = rt.make_spmd_compile_options(8);
+        CHECK_TRUE(copts.device_assignment_ids.size() == 8, "tpu7x-4t 8-replica assignment");
+        const std::vector<int64_t> expected_hw = {0, 1, 2, 3, 6, 7, 4, 5};
+        CHECK_TRUE(copts.device_assignment_ids == expected_hw,
+                   "tpu7x-4t scrambled enum reordered into Hamiltonian D2D pairs {0,1, 2,3, 6,7, 4,5}");
+
+        // Verify 2-chiplet slice on tpu7x-4t gets intra-package D2D pair (0,1).
+        const auto copts_2 = rt.make_spmd_compile_options(2);
+        CHECK_TRUE(copts_2.device_assignment_ids == std::vector<int64_t>({0, 1}),
+                   "2-replica slice on tpu7x-4t uses intra-package D2D pair (0,1)");
+
+        // Emit and execute Shardy sdy.mesh + AllReduce on scrambled-enum tpu7x-4t.
+        cloudtpu::GraphProgramSpec spec;
+        spec.spmd_chips = 8;
+        spec.d2d_group_size = rt.d2d_group_size();
+        spec.emit_sdy_mesh = true;
+        spec.sdy_mesh_device_ids = copts.device_assignment_ids;
+        cloudtpu::TensorSpec in_t;
+        in_t.id = 1;
+        in_t.dtype = cloudtpu::PjrtDType::F32;
+        in_t.dims[0] = 1;
+        in_t.dims[1] = 1;
+        in_t.dims[2] = 1;
+        in_t.dims[3] = 4;
+        in_t.sharding = cloudtpu::TensorShardingKind::REPLICATED;
+        spec.inputs = {in_t};
+        cloudtpu::OpNodeSpec ar;
+        ar.kind = cloudtpu::CloudOpKind::ALL_REDUCE_SUM;
+        ar.src_ids = {1};
+        ar.dst.id = 2;
+        ar.dst.dtype = cloudtpu::PjrtDType::F32;
+        ar.dst.dims[0] = 1;
+        ar.dst.dims[1] = 1;
+        ar.dst.dims[2] = 1;
+        ar.dst.dims[3] = 4;
+        spec.ops = {ar};
+        spec.output_ids = {2};
+        const auto prog = cloudtpu::emit_stablehlo_program(spec);
+        CHECK_TRUE(prog.mlir_text.find("sdy.mesh @mesh = <[\"ici\"=4, \"d2d\"=2]>") != std::string::npos,
+                   "tpu7x-4t sdy.mesh emission");
+
+        const auto exec = rt.compile_or_get(prog.cache_key, prog.mlir_text, 0, copts);
+        std::vector<cloudtpu::PjrtBufferPtr> bufs(8);
+        std::vector<PJRT_Buffer* const*> in_ptrs(8);
+        std::vector<PJRT_Buffer*> raw(8);
+        for (int r = 0; r < 8; ++r) {
+            const float val = static_cast<float>(r + 1);
+            const std::vector<float> v = {val, val, val, val};
+            bufs[static_cast<size_t>(r)] = rt.buffer_from_host(r, v.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, 4});
+            raw[static_cast<size_t>(r)] = bufs[static_cast<size_t>(r)]->handle.get();
+            in_ptrs[static_cast<size_t>(r)] = &raw[static_cast<size_t>(r)];
+        }
+        std::vector<std::vector<cloudtpu::PjrtBufferPtr>> outs;
+        rt.execute_spmd(exec, 8, in_ptrs.data(), 1, outs, {cloudtpu::PjrtDType::F32}, {{1, 1, 1, 4}}, true);
+        std::vector<float> got(4);
+        rt.buffer_to_host(outs[0][0]->handle.get(), got.data(), sizeof(float) * 4);
+        for (int k = 0; k < 4; ++k) {
+            CHECK_NEAR(got[static_cast<size_t>(k)], 36.0f, 1e-4f, "tpu7x-4t D2D AllReduce sum 1..8=36");
+        }
+        rt.shutdown();
+    }
+    std::printf("  [PASS] Ironwood tpu7x dual-chiplet D2D Hamiltonian pairing & Shardy sdy.mesh\n");
+}
+
+void test_fp8_e4m3fn_scalar_and_matmul_parity() {
+    // 1. Scalar f8E4M3FN roundtrip checks (zeros, exact small ints, max finite, NaN).
+    {
+        CHECK_TRUE(cloudtpu::f32_to_f8e4m3fn(0.0f) == 0x00, "+0.0 -> 0x00");
+        CHECK_TRUE(cloudtpu::f32_to_f8e4m3fn(-0.0f) == 0x80, "-0.0 -> 0x80");
+        CHECK_NEAR(cloudtpu::f8e4m3fn_to_f32(0x00), 0.0f, 0.0f, "0x00 -> 0.0f");
+        CHECK_NEAR(cloudtpu::f8e4m3fn_to_f32(cloudtpu::f32_to_f8e4m3fn(1.0f)), 1.0f, 0.0f, "1.0f exact");
+        CHECK_NEAR(cloudtpu::f8e4m3fn_to_f32(cloudtpu::f32_to_f8e4m3fn(-1.5f)), -1.5f, 0.0f, "-1.5f exact");
+        CHECK_NEAR(cloudtpu::f8e4m3fn_to_f32(cloudtpu::f32_to_f8e4m3fn(448.0f)), 448.0f, 0.0f, "448.0f max finite");
+        CHECK_NEAR(cloudtpu::f8e4m3fn_to_f32(cloudtpu::f32_to_f8e4m3fn(999.0f)), 448.0f, 0.0f, "finite clamps to 448.0f");
+        CHECK_TRUE((cloudtpu::f32_to_f8e4m3fn(NAN) & 0x7FU) == 0x7FU, "NaN -> 0x7F");
+        CHECK_TRUE(std::isnan(cloudtpu::f8e4m3fn_to_f32(0x7F)), "0x7F -> NaN");
+        for (int iv = -16; iv <= 16; ++iv) {
+            const float f = static_cast<float>(iv);
+            CHECK_NEAR(cloudtpu::f8e4m3fn_to_f32(cloudtpu::f32_to_f8e4m3fn(f)), f, 0.0f,
+                       "f8E4M3FN integer [-16..16] bit-exact");
+        }
+    }
+
+    // 2. Verify gating rules (AUTO + tpu7x -> FP8, AUTO + non-tpu7x -> BF16, OFF -> BF16,
+    //    FORCE -> FP8, high_precision -> F32).
+    const int64_t K = 64, N = 8, NB = K / 32;
+    auto build_q8_spec = [&](cloudtpu::Fp8MatmulMode mode, bool is_tpu7x, bool high_prec) {
+        cloudtpu::GraphProgramSpec spec;
+        spec.fp8_matmul = mode;
+        spec.target_is_tpu7x = is_tpu7x;
+        spec.bf16_matmul = true;
+        cloudtpu::TensorSpec w_spec;
+        w_spec.id = 1;
+        w_spec.dtype = cloudtpu::PjrtDType::S8;
+        w_spec.storage = cloudtpu::TensorStorageKind::Q8_0_SPLIT;
+        w_spec.scale_dtype = cloudtpu::PjrtDType::BF16;
+        w_spec.dims[0] = 1;
+        w_spec.dims[1] = 1;
+        w_spec.dims[2] = N;
+        w_spec.dims[3] = K;
+        cloudtpu::TensorSpec x_spec;
+        x_spec.id = 2;
+        x_spec.dtype = cloudtpu::PjrtDType::F32;
+        x_spec.dims[0] = 1;
+        x_spec.dims[1] = 1;
+        x_spec.dims[2] = 4;
+        x_spec.dims[3] = K;
+        spec.inputs = {w_spec, x_spec};
+        cloudtpu::OpNodeSpec mm;
+        mm.kind = cloudtpu::CloudOpKind::MUL_MAT;
+        mm.high_precision = high_prec;
+        mm.src_ids = {1, 2};
+        mm.dst.id = 3;
+        mm.dst.dtype = cloudtpu::PjrtDType::F32;
+        mm.dst.dims[0] = 1;
+        mm.dst.dims[1] = 1;
+        mm.dst.dims[2] = 4;
+        mm.dst.dims[3] = N;
+        spec.ops = {mm};
+        spec.output_ids = {3};
+        return spec;
+    };
+
+    const auto p_auto_tpu7x = cloudtpu::emit_stablehlo_program(
+        build_q8_spec(cloudtpu::Fp8MatmulMode::AUTO, true, false));
+    const auto p_auto_v6e = cloudtpu::emit_stablehlo_program(
+        build_q8_spec(cloudtpu::Fp8MatmulMode::AUTO, false, false));
+    const auto p_off_tpu7x = cloudtpu::emit_stablehlo_program(
+        build_q8_spec(cloudtpu::Fp8MatmulMode::OFF, true, false));
+    const auto p_force_v6e = cloudtpu::emit_stablehlo_program(
+        build_q8_spec(cloudtpu::Fp8MatmulMode::FORCE, false, false));
+    const auto p_hp_tpu7x = cloudtpu::emit_stablehlo_program(
+        build_q8_spec(cloudtpu::Fp8MatmulMode::FORCE, true, true));
+
+    CHECK_TRUE(p_auto_tpu7x.mlir_text.find("xf8E4M3FN>") != std::string::npos,
+               "AUTO + target_is_tpu7x lowers to f8E4M3FN dot_general");
+    CHECK_TRUE(p_auto_v6e.mlir_text.find("xf8E4M3FN>") == std::string::npos &&
+                   p_auto_v6e.mlir_text.find("xbf16>") != std::string::npos,
+               "AUTO + non-tpu7x falls back cleanly to BF16");
+    CHECK_TRUE(p_off_tpu7x.mlir_text.find("xf8E4M3FN>") == std::string::npos &&
+                   p_off_tpu7x.mlir_text.find("xbf16>") != std::string::npos,
+               "OFF + tpu7x forces BF16 fallback");
+    CHECK_TRUE(p_force_v6e.mlir_text.find("xf8E4M3FN>") != std::string::npos,
+               "FORCE enables f8E4M3FN regardless of chip generation");
+    CHECK_TRUE(p_hp_tpu7x.mlir_text.find("xf8E4M3FN>") == std::string::npos,
+               "high_precision skips FP8");
+
+    // 3. Numerical parity on Host Mock (Q8_0_SPLIT + Q4_K_I4): verify tpu7x-1t FP8 dot_general
+    //    matches F32/BF16 reference with low NMSE (< 5e-3) across varying activation scales.
+    cloudtpu::RuntimeConfig cfg;
+    cfg.mock_mode = true;
+    cfg.mock_devices = 2;
+    cfg.mock_profile = cloudtpu::MockTopologyProfile::TPU7X_1T;
+    cloudtpu::PjrtRuntime rt;
+    rt.init(cfg);
+
+    const int64_t M = 4;
+    std::vector<int8_t> w_qs(static_cast<size_t>(NB * 32 * N));
+    std::vector<uint16_t> w_d_bf16(static_cast<size_t>(NB * N));
+    std::vector<float> w_d_f32(static_cast<size_t>(NB * N));
+    for (int64_t nb = 0; nb < NB; ++nb) {
+        for (int64_t n = 0; n < N; ++n) {
+            const float d = 0.02f * static_cast<float>((nb * 3 + n) % 5 + 1);
+            w_d_f32[static_cast<size_t>(nb * N + n)] = d;
+            w_d_bf16[static_cast<size_t>(nb * N + n)] = cloudtpu::f32_to_bf16(d);
+            for (int64_t k = 0; k < 32; ++k) {
+                w_qs[static_cast<size_t>((nb * 32 + k) * N + n)] =
+                    static_cast<int8_t>(((nb * 11 + k * 7 + n * 5) % 31) - 15);
+            }
+        }
+    }
+    std::vector<float> x_vals(static_cast<size_t>(M * K));
+    for (int64_t m = 0; m < M; ++m) {
+        for (int64_t k = 0; k < K; ++k) {
+            // Test tiny sub-unit scale (~1e-3) to verify dynamic absmax scaling avoids FP8 underflow!
+            x_vals[static_cast<size_t>(m * K + k)] =
+                1e-3f * std::sin(0.31f * static_cast<float>(k + 1) + 0.7f * static_cast<float>(m));
+        }
+    }
+    std::vector<float> ref(static_cast<size_t>(M * N), 0.0f);
+    for (int64_t m = 0; m < M; ++m) {
+        for (int64_t n = 0; n < N; ++n) {
+            double acc = 0.0;
+            for (int64_t nb = 0; nb < NB; ++nb) {
+                const double d = static_cast<double>(cloudtpu::bf16_to_f32(w_d_bf16[static_cast<size_t>(nb * N + n)]));
+                for (int64_t k = 0; k < 32; ++k) {
+                    const double q = static_cast<double>(w_qs[static_cast<size_t>((nb * 32 + k) * N + n)]);
+                    const double xv = static_cast<double>(x_vals[static_cast<size_t>(m * K + nb * 32 + k)]);
+                    acc += xv * (q * d);
+                }
+            }
+            ref[static_cast<size_t>(m * N + n)] = static_cast<float>(acc);
+        }
+    }
+
+    auto b_qs = rt.buffer_from_host(0, w_qs.data(), cloudtpu::PjrtDType::S8, {1, 1, NB, 32, N});
+    auto b_d = rt.buffer_from_host(0, w_d_bf16.data(), cloudtpu::PjrtDType::BF16, {1, 1, NB, N});
+    auto b_x = rt.buffer_from_host(0, x_vals.data(), cloudtpu::PjrtDType::F32, {1, 1, M, K});
+    std::array<PJRT_Buffer*, 3> in_raw = {b_qs->handle.get(), b_d->handle.get(), b_x->handle.get()};
+
+    auto run_prog = [&](const cloudtpu::EmittedProgram& ep) {
+        const auto ex = rt.compile_or_get(ep.cache_key, ep.mlir_text, 0, rt.make_spmd_compile_options(1));
+        std::vector<cloudtpu::PjrtBufferPtr> outs;
+        rt.execute(ex, 0, in_raw.data(), in_raw.size(), outs,
+                   {cloudtpu::PjrtDType::F32}, {{1, 1, M, N}}, true);
+        std::vector<float> got(static_cast<size_t>(M * N));
+        rt.buffer_to_host(outs[0]->handle.get(), got.data(), got.size() * sizeof(float));
+        return got;
+    };
+
+    const auto got_fp8 = run_prog(p_auto_tpu7x);
+    const auto got_bf16 = run_prog(p_off_tpu7x);
+    double num_err_fp8 = 0.0, num_err_bf16 = 0.0, denom = 0.0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        const double df = static_cast<double>(got_fp8[i]) - static_cast<double>(ref[i]);
+        const double db = static_cast<double>(got_bf16[i]) - static_cast<double>(ref[i]);
+        num_err_fp8 += df * df;
+        num_err_bf16 += db * db;
+        denom += static_cast<double>(ref[i]) * static_cast<double>(ref[i]);
+    }
+    const double nmse_fp8 = num_err_fp8 / std::max(denom, 1e-30);
+    const double nmse_bf16 = num_err_bf16 / std::max(denom, 1e-30);
+    CHECK_TRUE(nmse_bf16 < 5e-4, "BF16 fallback Q8_0 NMSE < 5e-4");
+    CHECK_TRUE(nmse_fp8 < 1e-2, "FP8 E4M3FN dynamic-scaled Q8_0 NMSE < 1e-2");
+
+    // 4. Factored Q4_K_I4 decode parity under FP8 E4M3FN (exact integer nibbles in [-8..15], 0 weight scale).
+    {
+        const int64_t K4 = 64, N4 = 4, NB4 = K4 / 32;
+        std::vector<int8_t> s4_host(static_cast<size_t>(NB4 * 32 * N4));
+        std::vector<float> d4(static_cast<size_t>(NB4 * N4), 0.125f);
+        std::vector<float> m4(static_cast<size_t>(NB4 * N4), -0.25f);
+        for (size_t i = 0; i < s4_host.size(); ++i) {
+            s4_host[i] = static_cast<int8_t>(((i * 5 + 3) % 16) - 8);
+        }
+        std::vector<float> x4(static_cast<size_t>(K4));
+        for (int64_t k = 0; k < K4; ++k) {
+            x4[static_cast<size_t>(k)] = 0.05f * std::cos(0.19f * static_cast<float>(k));
+        }
+        std::vector<float> ref4(static_cast<size_t>(N4), 0.0f);
+        for (int64_t n = 0; n < N4; ++n) {
+            double acc = 0.0;
+            for (int64_t nb = 0; nb < NB4; ++nb) {
+                const double dv = static_cast<double>(d4[static_cast<size_t>(nb * N4 + n)]);
+                const double mv = static_cast<double>(m4[static_cast<size_t>(nb * N4 + n)]);
+                for (int64_t k = 0; k < 32; ++k) {
+                    const size_t elem = static_cast<size_t>((nb * 32 + k) * N4 + n);
+                    const double u4v = static_cast<double>(s4_host[elem] + 8);
+                    acc += static_cast<double>(x4[static_cast<size_t>(nb * 32 + k)]) * (dv * u4v + mv);
+                }
+            }
+            ref4[static_cast<size_t>(n)] = static_cast<float>(acc);
+        }
+        cloudtpu::GraphProgramSpec spec4;
+        spec4.fp8_matmul = cloudtpu::Fp8MatmulMode::AUTO;
+        spec4.target_is_tpu7x = true;
+        cloudtpu::TensorSpec w4;
+        w4.id = 1;
+        w4.dtype = cloudtpu::PjrtDType::S4;
+        w4.storage = cloudtpu::TensorStorageKind::Q4_K_I4;
+        w4.scale_dtype = cloudtpu::PjrtDType::F32;
+        w4.dims[0] = 1;
+        w4.dims[1] = 1;
+        w4.dims[2] = N4;
+        w4.dims[3] = K4;
+        cloudtpu::TensorSpec x4_spec;
+        x4_spec.id = 2;
+        x4_spec.dtype = cloudtpu::PjrtDType::F32;
+        x4_spec.dims[0] = 1;
+        x4_spec.dims[1] = 1;
+        x4_spec.dims[2] = 1;
+        x4_spec.dims[3] = K4;
+        spec4.inputs = {w4, x4_spec};
+        cloudtpu::OpNodeSpec mm4;
+        mm4.kind = cloudtpu::CloudOpKind::MUL_MAT;
+        mm4.src_ids = {1, 2};
+        mm4.dst.id = 3;
+        mm4.dst.dtype = cloudtpu::PjrtDType::F32;
+        mm4.dst.dims[0] = 1;
+        mm4.dst.dims[1] = 1;
+        mm4.dst.dims[2] = 1;
+        mm4.dst.dims[3] = N4;
+        spec4.ops = {mm4};
+        spec4.output_ids = {3};
+        const auto ep4 = cloudtpu::emit_stablehlo_program(spec4);
+        CHECK_TRUE(ep4.mlir_text.find("xf8E4M3FN>") != std::string::npos,
+                   "Q4_K_I4 emits f8E4M3FN dot_general on tpu7x");
+        auto b4_qs = rt.buffer_from_host(0, s4_host.data(), cloudtpu::PjrtDType::S4, {1, 1, NB4, 32, N4});
+        auto b4_d = rt.buffer_from_host(0, d4.data(), cloudtpu::PjrtDType::F32, {1, 1, NB4, N4});
+        auto b4_m = rt.buffer_from_host(0, m4.data(), cloudtpu::PjrtDType::F32, {1, 1, NB4, N4});
+        auto b4_x = rt.buffer_from_host(0, x4.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, K4});
+        std::array<PJRT_Buffer*, 4> in4 = {
+            b4_qs->handle.get(), b4_d->handle.get(), b4_m->handle.get(), b4_x->handle.get()};
+        const auto ex4 = rt.compile_or_get(ep4.cache_key, ep4.mlir_text, 0, rt.make_spmd_compile_options(1));
+        std::vector<cloudtpu::PjrtBufferPtr> out4;
+        rt.execute(ex4, 0, in4.data(), in4.size(), out4,
+                   {cloudtpu::PjrtDType::F32}, {{1, 1, 1, N4}}, true);
+        std::vector<float> got4(static_cast<size_t>(N4));
+        rt.buffer_to_host(out4[0]->handle.get(), got4.data(), got4.size() * sizeof(float));
+        double err4 = 0.0, den4 = 0.0;
+        for (int64_t i = 0; i < N4; ++i) {
+            const double d = static_cast<double>(got4[static_cast<size_t>(i)]) - static_cast<double>(ref4[static_cast<size_t>(i)]);
+            err4 += d * d;
+            den4 += static_cast<double>(ref4[static_cast<size_t>(i)]) * static_cast<double>(ref4[static_cast<size_t>(i)]);
+        }
+        CHECK_TRUE((err4 / std::max(den4, 1e-30)) < 1e-2, "FP8 E4M3FN factored Q4_K_I4 NMSE < 1e-2");
+    }
+
+    rt.shutdown();
+    std::printf("  [PASS] FP8 f8E4M3FN scalar parity, tpu7x gating, BF16 fallback, & Q8_0/Q4_K_I4 dot_general parity\n");
+}
 }  // namespace
 
 int main() {
@@ -6279,8 +6663,12 @@ int main() {
     test_collectives_p1_live_compatible(rt);
     test_spmd_unequal_k_shard_broadcast();
     test_spmd_shard_n_get_rows_and_collectives();
-    test_spmd_multichip_mesh(4);  // tpu7x-4t (4x 192 GiB HBM3e)
-    test_spmd_multichip_mesh(8);  // v6e-8 (8x 32 GiB HBM)
+    test_spmd_multichip_mesh(2, cloudtpu::MockTopologyProfile::TPU7X_1T);  // tpu7x-1t (2x 96 GiB HBM3e chiplets)
+    test_spmd_multichip_mesh(4);                                          // 4-chip mock (4x 32 GiB HBM)
+    test_spmd_multichip_mesh(8, cloudtpu::MockTopologyProfile::V6E_8);     // v6e-8 (8x 32 GiB HBM)
+    test_spmd_multichip_mesh(8, cloudtpu::MockTopologyProfile::TPU7X_4T);  // tpu7x-4t (8x 96 GiB HBM3e chiplets)
+    test_ironwood_d2d_pairing_and_sdy_mesh();
+    test_fp8_e4m3fn_scalar_and_matmul_parity();
     test_subbyte_s4_u4_packing_and_hbm(rt);
     test_q4_i4_single_read_matmul_and_bitcast(rt);
     test_q4_i4_get_rows_coexistence(rt);
