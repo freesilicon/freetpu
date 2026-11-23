@@ -81,6 +81,7 @@ class TpuExporterTelemetry:
     hbm_total_bytes: Optional[int] = None
     avg_duty_cycle_percent: Optional[float] = None
     max_duty_cycle_percent: Optional[float] = None
+    chips_with_duty_cycle: int = 0
     active_pids: int = 0
     generations: List[str] = field(default_factory=list)
     scraped_at_unix: float = field(default_factory=time.time)
@@ -388,6 +389,7 @@ class _TpuTelemetryAggregator:
             ),
             avg_duty_cycle_percent=(sum(duties) / len(duties)) if duties else None,
             max_duty_cycle_percent=max(duties) if duties else None,
+            chips_with_duty_cycle=len(self.duty_by_chip),
             active_pids=sum(self.pids_by_chip.values()),
             generations=sorted(self.generations_seen),
             scraped_at_unix=scraped_at if scraped_at is not None else time.time(),
@@ -434,7 +436,10 @@ def evaluate_tpu_readiness(
     ):
         return False, "tpu_hbm_oom_risk"
     if max_duty_cycle_percent is not None:
-        if telemetry.max_duty_cycle_percent is None:
+        if (
+            telemetry.max_duty_cycle_percent is None
+            or telemetry.chips_with_duty_cycle < telemetry.total_chips
+        ):
             return False, "tpu_duty_cycle_missing"
         if telemetry.max_duty_cycle_percent >= max_duty_cycle_percent:
             return False, "tpu_duty_cycle_overloaded"

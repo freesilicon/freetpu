@@ -799,16 +799,43 @@ def _echo_prompt_token_counts(
     return ()
 
 
+def _echo_chat_char_length(
+    endpoint: str,
+    req_payload: Mapping[str, Any],
+) -> int:
+    """Return echoed final-assistant char count for `/v1/chat/completions` when `echo=true`."""
+    if endpoint != "/v1/chat/completions" or req_payload.get("echo") is not True:
+        return 0
+    messages = req_payload.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return 0
+    last_msg = messages[-1]
+    if not isinstance(last_msg, Mapping) or last_msg.get("role") != "assistant":
+        return 0
+    content = last_msg.get("content")
+    if isinstance(content, str):
+        return len(content)
+    if isinstance(content, list):
+        text_lengths = [
+            len(part["text"])
+            for part in content
+            if isinstance(part, Mapping) and isinstance(part.get("text"), str)
+        ]
+        if text_lengths:
+            return sum(text_lengths) + max(0, len(text_lengths) - 1)
+    return 0
+
+
 def _parse_inference_request_fields(
     raw_req: bytes,
     path: str,
 ) -> Tuple[
-    Optional[Tuple[str, bool, int, int, int, Tuple[int, ...], Tuple[int, ...], bool]],
+    Optional[Tuple[str, bool, int, int, int, Tuple[int, ...], Tuple[int, ...], int, bool]],
     Optional[Tuple[int, Optional[str], str]],
 ]:
     """Decode and validate an inbound inference JSON body in an isolated scope.
 
-    Returns `((model, stream, est_prompt_tokens, expected_choices, prompt_batch_size, echo_prompt_chars, echo_prompt_tokens, expect_final_usage), None)`
+    Returns `((model, stream, est_prompt_tokens, expected_choices, prompt_batch_size, echo_prompt_chars, echo_prompt_tokens, echo_chat_chars, expect_final_usage), None)`
     on success or `(None, (status_code, error_code, message))` on validation failure.
     Running inside a dedicated function guarantees that the decoded `str`, JSON
     `dict`, and any nested user fields (such as `stream_options`) go out of scope
@@ -854,6 +881,7 @@ def _parse_inference_request_fields(
     expected_choices = _expected_stream_choices(path, req_payload)
     echo_prompt_chars = _echo_prompt_char_lengths(path, req_payload)
     echo_prompt_tokens = _echo_prompt_token_counts(path, req_payload)
+    echo_chat_chars = _echo_chat_char_length(path, req_payload)
     raw_stream_opts = req_payload.get("stream_options")
     expect_final_usage = bool(
         stream
@@ -868,6 +896,7 @@ def _parse_inference_request_fields(
         prompt_batch_size,
         echo_prompt_chars,
         echo_prompt_tokens,
+        echo_chat_chars,
         expect_final_usage,
     ), None
 
@@ -1400,19 +1429,64 @@ def _classify_sse_error_event(
     return is_retryable, status_code, body
 
 
+def _choice_non_echo_chat_output(choice: Mapping[str, Any]) -> Tuple[bool, int]:
+    """Return `(has_non_echo_output, chat_content_chars)` for one SSE choice."""
+    text_val = choice.get("text")
+    if isinstance(text_val, str) and text_val:
+        return True, 0
+    content_chars = 0
+    for container_key in ("delta", "message"):
+        container = choice.get(container_key)
+        if not (isinstance(container, dict) or isinstance(container, Mapping)):
+            continue
+        content_val = container.get("content")
+        if isinstance(content_val, str) and content_val:
+            content_chars += len(content_val)
+        for text_key in ("refusal", "reasoning_content", "reasoning"):
+            val = container.get(text_key)
+            if isinstance(val, str) and val:
+                return True, content_chars
+        func_call = container.get("function_call")
+        if isinstance(func_call, dict) or isinstance(func_call, Mapping):
+            for fk in ("name", "arguments"):
+                fval = func_call.get(fk)
+                if isinstance(fval, str) and fval:
+                    return True, content_chars
+        tool_calls = container.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for tc in tool_calls:
+                if not (isinstance(tc, dict) or isinstance(tc, Mapping)):
+                    continue
+                fn = tc.get("function")
+                if isinstance(fn, dict) or isinstance(fn, Mapping):
+                    for fk in ("name", "arguments"):
+                        fval = fn.get(fk)
+                        if isinstance(fval, str) and fval:
+                            return True, content_chars
+        audio = container.get("audio")
+        if isinstance(audio, dict) or isinstance(audio, Mapping):
+            for ak in ("data", "transcript"):
+                aval = audio.get(ak)
+                if isinstance(aval, str) and aval:
+                    return True, content_chars
+    return False, content_chars
+
+
 def _sse_event_should_commit(
     payload_bytes: bytes,
     *,
     parsed_obj: Any = _UNSET,
     max_depth: int = DEFAULT_MAX_JSON_DEPTH,
     max_nodes: int = DEFAULT_MAX_RESPONSE_JSON_NODES,
+    echo_chat_chars: int = 0,
+    echo_chars_by_choice: Optional[Dict[int, int]] = None,
 ) -> bool:
     """Return True when a complete non-error SSE data event carries output or a terminator.
 
-    Role-only, empty-delta, and prompt-progress chunks are buffered so Spot
-    preemption before the first generated token still fails over. Raises
-    `_MalformedSSEPayloadError` on invalid UTF-8, invalid JSON, or non-object
-    JSON so pre-commit protocol corruption remains eligible for failover.
+    Role-only, empty-delta, prompt-progress, and echoed chat-prefix chunks are
+    buffered so Spot preemption before the first generated token still fails over.
+    Raises `_MalformedSSEPayloadError` on invalid UTF-8, invalid JSON, or
+    non-object JSON so pre-commit protocol corruption remains eligible for failover.
     """
     if not payload_bytes:
         return False
@@ -1434,17 +1508,44 @@ def _sse_event_should_commit(
         raise _MalformedSSEPayloadError("Upstream SSE event JSON must be an object")
     if obj.get("error") is not None or obj.get("object") == "error":
         return False
-    if (
-        _extract_choice_output_text(obj)
-        or _has_choice_audio_output(obj)
-        or _has_choice_token_metadata_output(obj)
-    ):
+    if _has_choice_audio_output(obj) or _has_choice_token_metadata_output(obj):
         return True
+    if echo_chat_chars <= 0:
+        if _extract_choice_output_text(obj):
+            return True
     choices = obj.get("choices")
     if isinstance(choices, list):
-        for choice in choices:
-            if isinstance(choice, Mapping) and choice.get("finish_reason") is not None:
+        for pos, choice in enumerate(choices):
+            if not isinstance(choice, Mapping):
+                continue
+            if choice.get("finish_reason") is not None:
                 return True
+            if echo_chat_chars > 0:
+                has_non_echo, content_chars = _choice_non_echo_chat_output(choice)
+                if has_non_echo:
+                    return True
+                if content_chars > 0:
+                    c_idx = choice.get("index")
+                    resolved_idx = (
+                        c_idx
+                        if isinstance(c_idx, int)
+                        and not isinstance(c_idx, bool)
+                        and c_idx >= 0
+                        else pos
+                    )
+                    if echo_chars_by_choice is None:
+                        if content_chars > echo_chat_chars:
+                            return True
+                    else:
+                        if (
+                            resolved_idx not in echo_chars_by_choice
+                            and len(echo_chars_by_choice) >= _MAX_TRACKED_STREAM_CHOICES
+                        ):
+                            return True
+                        new_total = echo_chars_by_choice.get(resolved_idx, 0) + content_chars
+                        echo_chars_by_choice[resolved_idx] = new_total
+                        if new_total > echo_chat_chars:
+                            return True
         if not choices and isinstance(obj.get("usage"), Mapping):
             return True
         return False
@@ -2020,16 +2121,6 @@ class RouterEngine:
                 probe_ok = True
             else:
                 probe_err = err or f"health_http_{status}"
-            if probe_ok and state.config.discover_models:
-                rem = remaining_timeout()
-                if rem > 0:
-                    m_status, m_json, _, _ = self._http_get_json(
-                        state.config, "/v1/models", rem
-                    )
-                    if 200 <= m_status < 300:
-                        models_list = _extract_models_list(m_json)
-                        if models_list is not None:
-                            discovered = models_list
         else:
             rem = remaining_timeout()
             if rem <= 0:
@@ -2072,6 +2163,17 @@ class RouterEngine:
                 max_hbm_utilization=state.config.max_hbm_utilization,
                 max_duty_cycle_percent=state.config.max_duty_cycle_percent,
             )
+
+        if state.config.health_path and probe_ok and state.config.discover_models:
+            rem = remaining_timeout()
+            if rem > 0:
+                m_status, m_json, _, _ = self._http_get_json(
+                    state.config, "/v1/models", rem
+                )
+                if 200 <= m_status < 300:
+                    models_list = _extract_models_list(m_json)
+                    if models_list is not None:
+                        discovered = models_list
 
         now_m = time.monotonic()
         with self._lock:
@@ -3773,6 +3875,223 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 if reserved_out is not None:
                     reserved_out[0] = max(0, reserved_out[0] - copy_extra)
 
+    def _read_chunked_request_body(
+        self,
+        *,
+        max_body: int,
+        max_total_req_mem: int,
+        reserved_out: Optional[List[int]] = None,
+    ) -> Tuple[Optional[bytes], Optional[Tuple[int, str, str]]]:
+        """Decode an HTTP/1.1 `Transfer-Encoding: chunked` body under size, memory, and time limits."""
+        engine = self.server.engine
+        deadline = time.monotonic() + engine.config.client_read_timeout_s
+        buf = bytearray()
+        inbuf = bytearray()
+        reserved_local = 0
+        read_fn = getattr(self.rfile, "read1", self.rfile.read)
+        max_line_bytes = 4096
+        max_trailer_bytes = 16384
+        max_trailer_lines = 64
+
+        def _read_more(max_read: int) -> Tuple[Optional[bytes], Optional[Tuple[int, str, str]]]:
+            time_left = deadline - time.monotonic()
+            if time_left <= 0:
+                return None, (408, "request_timeout", "Request body read timed out")
+            self.connection.settimeout(time_left)
+            piece = read_fn(max(1, min(65536, max_read)))
+            if not piece:
+                return None, (400, "incomplete_body", "Incomplete chunked request body")
+            return piece, None
+
+        def _read_crlf_line(limit: int) -> Tuple[Optional[bytes], Optional[Tuple[int, str, str]]]:
+            while True:
+                nl = inbuf.find(b"\n")
+                if nl != -1:
+                    if nl + 1 > limit:
+                        return None, (
+                            400,
+                            "invalid_chunked_encoding",
+                            "Chunk framing line exceeded maximum length",
+                        )
+                    line = bytes(inbuf[: nl + 1])
+                    del inbuf[: nl + 1]
+                    if not line.endswith(b"\r\n"):
+                        return None, (
+                            400,
+                            "invalid_chunked_encoding",
+                            "Chunk framing line must end with CRLF",
+                        )
+                    return line, None
+                if len(inbuf) >= limit:
+                    return None, (
+                        400,
+                        "invalid_chunked_encoding",
+                        "Chunk framing line exceeded maximum length",
+                    )
+                piece, err = _read_more(min(4096, limit - len(inbuf) + 1))
+                if err is not None or piece is None:
+                    return None, err
+                inbuf.extend(piece)
+
+        def _reserve_and_append(
+            piece: bytes | bytearray,
+        ) -> Optional[Tuple[int, str, str]]:
+            nonlocal reserved_local
+            piece_len = len(piece)
+            if piece_len <= 0:
+                return None
+            if not engine.try_reserve_request_memory(piece_len):
+                return (
+                    503,
+                    "server_memory_limit_reached",
+                    "Router request memory budget exhausted; retry later",
+                )
+            reserved_local += piece_len
+            if reserved_out is not None:
+                reserved_out[0] += piece_len
+            buf.extend(piece)
+            return None
+
+        try:
+            while True:
+                size_line, err = _read_crlf_line(max_line_bytes)
+                if err is not None or size_line is None:
+                    buf.clear()
+                    inbuf.clear()
+                    return None, err
+                size_part = size_line[:-2].split(b";", 1)[0].rstrip(b" \t")
+                if (
+                    not size_part
+                    or len(size_part) > 16
+                    or not all(b in b"0123456789abcdefABCDEF" for b in size_part)
+                ):
+                    buf.clear()
+                    inbuf.clear()
+                    return None, (
+                        400,
+                        "invalid_chunked_encoding",
+                        "Invalid chunk size in Transfer-Encoding: chunked request",
+                    )
+                chunk_size = int(size_part, 16)
+                if chunk_size == 0:
+                    trailer_bytes = 0
+                    trailer_lines = 0
+                    while True:
+                        t_line, t_err = _read_crlf_line(max_line_bytes)
+                        if t_err is not None or t_line is None:
+                            buf.clear()
+                            inbuf.clear()
+                            return None, t_err
+                        if t_line == b"\r\n":
+                            break
+                        trailer_lines += 1
+                        trailer_bytes += len(t_line)
+                        if (
+                            trailer_lines > max_trailer_lines
+                            or trailer_bytes > max_trailer_bytes
+                        ):
+                            buf.clear()
+                            inbuf.clear()
+                            return None, (
+                                400,
+                                "invalid_chunked_encoding",
+                                "Chunked request trailers exceeded maximum limit",
+                            )
+                    break
+
+                projected_len = len(buf) + chunk_size
+                if projected_len > max_body:
+                    buf.clear()
+                    inbuf.clear()
+                    return None, (
+                        413,
+                        "payload_too_large",
+                        f"Request body exceeds maximum size of {max_body} bytes",
+                    )
+                min_parse_budget = max(1, projected_len * REQUEST_MEMORY_PARSE_MULTIPLIER)
+                if min_parse_budget > max_total_req_mem:
+                    buf.clear()
+                    inbuf.clear()
+                    return None, (
+                        413,
+                        "payload_too_large",
+                        f"Request estimated parse memory ({min_parse_budget} bytes) exceeds router request memory budget ({max_total_req_mem} bytes)",
+                    )
+
+                rem_chunk = chunk_size
+                if inbuf:
+                    take = min(rem_chunk, len(inbuf))
+                    mem_err = _reserve_and_append(inbuf[:take])
+                    del inbuf[:take]
+                    if mem_err is not None:
+                        buf.clear()
+                        inbuf.clear()
+                        return None, mem_err
+                    rem_chunk -= take
+                while rem_chunk > 0:
+                    piece, err = _read_more(rem_chunk)
+                    if err is not None or piece is None:
+                        buf.clear()
+                        inbuf.clear()
+                        return None, err
+                    mem_err = _reserve_and_append(piece)
+                    if mem_err is not None:
+                        buf.clear()
+                        inbuf.clear()
+                        return None, mem_err
+                    rem_chunk -= len(piece)
+
+                while len(inbuf) < 2:
+                    piece, err = _read_more(4096)
+                    if err is not None or piece is None:
+                        buf.clear()
+                        inbuf.clear()
+                        return None, err
+                    inbuf.extend(piece)
+                if inbuf[:2] != b"\r\n":
+                    buf.clear()
+                    inbuf.clear()
+                    return None, (
+                        400,
+                        "invalid_chunked_encoding",
+                        "Chunk data must be followed by CRLF",
+                    )
+                del inbuf[:2]
+        except TimeoutError:
+            buf.clear()
+            inbuf.clear()
+            return None, (408, "request_timeout", "Request body read timed out")
+        except OSError:
+            buf.clear()
+            inbuf.clear()
+            return None, (400, "incomplete_body", "Client disconnected while uploading body")
+        finally:
+            inbuf.clear()
+
+        if len(buf) == 0:
+            return None, (400, "invalid_request_error", "Request body must be non-empty JSON")
+
+        copy_extra = max(0, (2 * len(buf)) - reserved_local)
+        if copy_extra > 0:
+            if not engine.try_reserve_request_memory(copy_extra):
+                buf.clear()
+                return None, (
+                    503,
+                    "server_memory_limit_reached",
+                    "Router request memory budget exhausted; retry later",
+                )
+            reserved_local += copy_extra
+            if reserved_out is not None:
+                reserved_out[0] += copy_extra
+        try:
+            return bytes(buf), None
+        finally:
+            buf.clear()
+            if copy_extra > 0:
+                engine.release_request_memory(copy_extra)
+                if reserved_out is not None:
+                    reserved_out[0] = max(0, reserved_out[0] - copy_extra)
+
     def _authorize(self, path: str, method: str) -> Optional[AuthContext]:
         hdrs = {k: v for k, v in self.headers.items()}
         ctx = self.server.engine.auth_hook.authenticate(hdrs, path, method)
@@ -3871,56 +4190,136 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
-        try:
-            content_len = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            self._send_bytes(
-                400,
-                "application/json",
-                _openai_error_body("Invalid Content-Length header"),
-            )
-            return
-
-        if content_len <= 0:
-            self._send_bytes(
-                400,
-                "application/json",
-                _openai_error_body("Request body must be non-empty JSON"),
-            )
-            return
-
-        max_body = self.server.engine.config.max_request_body_bytes
-        if content_len > max_body:
-            self._send_bytes(
-                413,
-                "application/json",
-                _openai_error_body(
-                    f"Request body exceeds maximum size of {max_body} bytes",
-                    code="payload_too_large",
-                ),
-            )
-            return
-
         engine = self.server.engine
+        max_body = engine.config.max_request_body_bytes
         max_total_req_mem = engine.config.max_total_request_memory_bytes
-        min_parse_budget = max(1, content_len * REQUEST_MEMORY_PARSE_MULTIPLIER)
-        if min_parse_budget > max_total_req_mem:
-            self._send_bytes(
-                413,
-                "application/json",
-                _openai_error_body(
-                    f"Request estimated parse memory ({min_parse_budget} bytes) exceeds router request memory budget ({max_total_req_mem} bytes)",
-                    code="payload_too_large",
-                ),
-            )
-            return
+
+        te_headers = self.headers.get_all("Transfer-Encoding") or []
+        cl_headers = self.headers.get_all("Content-Length") or []
+        is_chunked_req = False
+        content_len = 0
+
+        if te_headers:
+            if cl_headers:
+                self._send_bytes(
+                    400,
+                    "application/json",
+                    _openai_error_body(
+                        "Conflicting Transfer-Encoding and Content-Length headers"
+                    ),
+                )
+                return
+            codings: List[str] = []
+            for raw_hdr in te_headers:
+                for part in str(raw_hdr).split(","):
+                    token = part.strip(" \t").lower()
+                    if token:
+                        codings.append(token)
+            if not codings:
+                self._send_bytes(
+                    400,
+                    "application/json",
+                    _openai_error_body("Malformed empty Transfer-Encoding header"),
+                )
+                return
+            if codings[-1] != "chunked":
+                self._send_bytes(
+                    400,
+                    "application/json",
+                    _openai_error_body(
+                        "Transfer-Encoding on request must end with 'chunked'"
+                    ),
+                )
+                return
+            if codings != ["chunked"]:
+                self._send_bytes(
+                    501,
+                    "application/json",
+                    _openai_error_body(
+                        f"Unsupported Transfer-Encoding {codings!r}; only 'chunked' is supported",
+                        code="not_implemented",
+                    ),
+                )
+                return
+            is_chunked_req = True
+        else:
+            if cl_headers:
+                parsed_cl: Optional[int] = None
+                for raw_hdr in cl_headers:
+                    parts = [p.strip(" \t") for p in str(raw_hdr).split(",")]
+                    if not parts:
+                        parsed_cl = -1
+                        break
+                    for part in parts:
+                        if (
+                            not part
+                            or len(part) > _MAX_SAFE_INT_DIGITS
+                            or not part.isascii()
+                            or not part.isdigit()
+                        ):
+                            parsed_cl = -1
+                            break
+                        val = int(part)
+                        if parsed_cl is None:
+                            parsed_cl = val
+                        elif parsed_cl != val:
+                            parsed_cl = -1
+                            break
+                    if parsed_cl == -1:
+                        break
+                if parsed_cl is None or parsed_cl < 0:
+                    self._send_bytes(
+                        400,
+                        "application/json",
+                        _openai_error_body("Invalid Content-Length header"),
+                    )
+                    return
+                content_len = parsed_cl
+
+            if content_len <= 0:
+                self._send_bytes(
+                    400,
+                    "application/json",
+                    _openai_error_body("Request body must be non-empty JSON"),
+                )
+                return
+
+            if content_len > max_body:
+                self._send_bytes(
+                    413,
+                    "application/json",
+                    _openai_error_body(
+                        f"Request body exceeds maximum size of {max_body} bytes",
+                        code="payload_too_large",
+                    ),
+                )
+                return
+
+            min_parse_budget = max(1, content_len * REQUEST_MEMORY_PARSE_MULTIPLIER)
+            if min_parse_budget > max_total_req_mem:
+                self._send_bytes(
+                    413,
+                    "application/json",
+                    _openai_error_body(
+                        f"Request estimated parse memory ({min_parse_budget} bytes) exceeds router request memory budget ({max_total_req_mem} bytes)",
+                        code="payload_too_large",
+                    ),
+                )
+                return
 
         req_mem_reserved = [0]
         try:
-            raw_req, read_err = self._read_request_body(
-                content_len,
-                reserved_out=req_mem_reserved,
-            )
+            if is_chunked_req:
+                raw_req, read_err = self._read_chunked_request_body(
+                    max_body=max_body,
+                    max_total_req_mem=max_total_req_mem,
+                    reserved_out=req_mem_reserved,
+                )
+            else:
+                raw_req, read_err = self._read_request_body(
+                    content_len,
+                    reserved_out=req_mem_reserved,
+                )
             if read_err is not None or raw_req is None:
                 err_status, err_code, err_msg = read_err or (
                     400,
@@ -4019,14 +4418,16 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 prompt_batch_size,
                 echo_prompt_chars,
                 echo_prompt_tokens,
+                echo_chat_chars,
                 expect_final_usage,
             ) = parsed_fields
             # All decoded JSON containers went out of scope inside
             # `_parse_inference_request_fields`; release the parse reservation now.
-            parse_overhead = req_mem_reserved[0] - content_len
+            body_len = len(raw_req)
+            parse_overhead = req_mem_reserved[0] - body_len
             if parse_overhead > 0:
                 engine.release_request_memory(parse_overhead)
-                req_mem_reserved[0] = content_len
+                req_mem_reserved[0] = body_len
 
             self._handle_inference(
                 path,
@@ -4039,6 +4440,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 prompt_batch_size=prompt_batch_size,
                 echo_prompt_chars=echo_prompt_chars,
                 echo_prompt_tokens=echo_prompt_tokens,
+                echo_chat_chars=echo_chat_chars,
                 expect_final_usage=expect_final_usage,
             )
         finally:
@@ -4059,6 +4461,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         prompt_batch_size: int = 1,
         echo_prompt_chars: Sequence[int] = (),
         echo_prompt_tokens: Sequence[int] = (),
+        echo_chat_chars: int = 0,
         expect_final_usage: bool = False,
     ) -> None:
         engine = self.server.engine
@@ -4219,6 +4622,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         prompt_batch_size=prompt_batch_size,
                         echo_prompt_chars=echo_prompt_chars,
                         echo_prompt_tokens=echo_prompt_tokens,
+                        echo_chat_chars=echo_chat_chars,
                         req_id=req_id,
                         req_start=req_start,
                         attempt_start=attempt_start,
@@ -4697,6 +5101,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         prompt_batch_size: int = 1,
         echo_prompt_chars: Sequence[int] = (),
         echo_prompt_tokens: Sequence[int] = (),
+        echo_chat_chars: int = 0,
         req_id: str,
         req_start: float,
         attempt_start: float,
@@ -4736,6 +5141,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         pending_event_type = ""
         pre_commit_skip_leading_lf = False
         pre_commit_deadline = attempt_start + timeout_s
+        pre_commit_echo_chars_by_choice: Dict[int, int] = {}
 
         def _extract_pending_event_payload(end_pos: int) -> bytes:
             data_parts: List[bytes] = []
@@ -4929,6 +5335,8 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                 should_commit = _sse_event_should_commit(
                                     payload_bytes,
                                     parsed_obj=parsed_pre,
+                                    echo_chat_chars=echo_chat_chars,
+                                    echo_chars_by_choice=pre_commit_echo_chars_by_choice,
                                 )
                             except _MalformedSSEPayloadError:
                                 return (

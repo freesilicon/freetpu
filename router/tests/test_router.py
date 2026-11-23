@@ -27,7 +27,7 @@ import time
 import tracemalloc
 import unittest
 from unittest import mock
-from contextlib import redirect_stderr
+from contextlib import nullcontext, redirect_stderr
 from typing import Any, Dict, List, Optional, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -7260,7 +7260,12 @@ asyncio.run(main())
         def _forbid_select(*args: Any, **kwargs: Any) -> Any:
             raise ValueError("filedescriptor out of range in select()")
 
-        with mock.patch.object(select, "select", side_effect=_forbid_select):
+        patch_ctx = (
+            mock.patch.object(select, "select", side_effect=_forbid_select)
+            if hasattr(select, "poll")
+            else nullcontext()
+        )
+        with patch_ctx:
             st, hdrs, bd = _http_request(
                 rport,
                 "POST",
@@ -7332,7 +7337,14 @@ asyncio.run(main())
         def _forbid_select(*args: Any, **kwargs: Any) -> Any:
             raise ValueError("filedescriptor out of range in select()")
 
-        # 1. Upstream-only wait path (client_sock=None) works without select.select().
+        def _maybe_forbid_select() -> Any:
+            return (
+                mock.patch.object(select, "select", side_effect=_forbid_select)
+                if hasattr(select, "poll")
+                else nullcontext()
+            )
+
+        # 1. Upstream-only wait path (client_sock=None) works without select.select() on poll platforms.
         up_r, up_w = socket.socketpair()
         try:
             def _delayed_send() -> None:
@@ -7340,7 +7352,7 @@ asyncio.run(main())
                 up_w.sendall(b"hello")
 
             threading.Thread(target=_delayed_send, daemon=True).start()
-            with mock.patch.object(select, "select", side_effect=_forbid_select):
+            with _maybe_forbid_select():
                 ds = DeadlineSocket(up_r, time.monotonic() + 1.0, label="test-up")
                 fp = ds.makefile("rb")
                 try:
@@ -7360,7 +7372,7 @@ asyncio.run(main())
                 _abort_tcp_socket(cli_w2)
 
             threading.Thread(target=_abort_client, daemon=True).start()
-            with mock.patch.object(select, "select", side_effect=_forbid_select):
+            with _maybe_forbid_select():
                 ds2 = DeadlineSocket(
                     up_r2,
                     time.monotonic() + 1.0,
@@ -7379,7 +7391,35 @@ asyncio.run(main())
             cli_r2.close()
             cli_w2.close()
 
-        # 3. Real OS FD >= 1024 test when RLIMIT_NOFILE permits.
+        # 3. Exercise the SelectSelector fallback path explicitly (Windows path without select.poll).
+        import selectors as selectors_mod
+        import router.tpu_telemetry as tpu_telemetry_mod
+
+        sel_r, sel_w = socket.socketpair()
+        try:
+            def _delayed_sel_send() -> None:
+                time.sleep(0.02)
+                sel_w.sendall(b"win")
+
+            threading.Thread(target=_delayed_sel_send, daemon=True).start()
+            with mock.patch.object(
+                tpu_telemetry_mod, "select", object()
+            ), mock.patch.object(
+                tpu_telemetry_mod.selectors,
+                "DefaultSelector",
+                selectors_mod.SelectSelector,
+            ):
+                ds_sel = DeadlineSocket(sel_r, time.monotonic() + 1.0, label="test-sel")
+                fp_sel = ds_sel.makefile("rb")
+                try:
+                    self.assertEqual(fp_sel.read(3), b"win")
+                finally:
+                    fp_sel.close()
+        finally:
+            sel_r.close()
+            sel_w.close()
+
+        # 4. Real OS FD >= 1024 test when RLIMIT_NOFILE permits.
         soft_lim = 0
         if resource is not None and hasattr(resource, "RLIMIT_NOFILE"):
             try:
@@ -13963,6 +14003,331 @@ asyncio.run(main())
         ready_neg, reason_neg = evaluate_tpu_readiness(telem_neg, max_hbm_utilization=0.95)
         self.assertFalse(ready_neg)
         self.assertEqual(reason_neg, "tpu_exporter_invalid_metrics")
+
+    def test_probe_runs_tpu_readiness_before_stalled_optional_model_discovery(
+        self,
+    ) -> None:
+        release_models = threading.Event()
+        events_order: List[str] = []
+
+        class _SlowModelsHandler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                pass
+
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path == "/health":
+                    events_order.append("health")
+                    self.send_response(200)
+                    self.send_header("Content-Length", "2")
+                    self.end_headers()
+                    self.wfile.write(b"ok")
+                    return
+                if self.path == "/v1/models":
+                    events_order.append("models")
+                    release_models.wait(timeout=2.0)
+                    body = b'{"object":"list","data":[{"id":"m-probe"}]}'
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    try:
+                        self.wfile.write(body)
+                    except OSError:
+                        pass
+                    return
+                self.send_response(404)
+                self.end_headers()
+
+        backend_srv = ThreadingHTTPServer(("127.0.0.1", 0), _SlowModelsHandler)
+        backend_thread = threading.Thread(target=backend_srv.serve_forever, daemon=True)
+        backend_thread.start()
+
+        class _RecordingExporterHandler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                pass
+
+            def do_GET(self) -> None:  # noqa: N802
+                events_order.append("tpu_exporter")
+                body = (
+                    b"freetpu_exporter_up 1\n"
+                    b"freetpu_tpu_devices_discovered 1\n"
+                    b'freetpu_tpu_health_status{chip="0"} 1\n'
+                    b'freetpu_tpu_hbm_utilization_ratio{chip="0"} 0.2\n'
+                    b'freetpu_tpu_duty_cycle_percent{chip="0"} 15\n'
+                )
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        exp_srv = ThreadingHTTPServer(("127.0.0.1", 0), _RecordingExporterHandler)
+        exp_thread = threading.Thread(target=exp_srv.serve_forever, daemon=True)
+        exp_thread.start()
+        try:
+            cfg = RouterConfig(
+                host="127.0.0.1",
+                port=0,
+                probe_timeout_s=0.35,
+                backends=[
+                    BackendConfig(
+                        id="tpu-slow-models",
+                        base_url=f"http://127.0.0.1:{backend_srv.server_address[1]}",
+                        models=["m-probe"],
+                        health_path="/health",
+                        discover_models=True,
+                        tpu_exporter_url=f"http://127.0.0.1:{exp_srv.server_address[1]}/metrics",
+                        max_duty_cycle_percent=90.0,
+                    )
+                ],
+            )
+            router = self._track(create_router_server(cfg))
+            state = router.engine._backends[0]
+            self.assertTrue(state.healthy, f"Expected healthy worker, got {state.unhealthy_reason}")
+            self.assertIsNotNone(state.tpu_telemetry)
+            assert state.tpu_telemetry is not None
+            self.assertTrue(state.tpu_telemetry.reachable)
+            self.assertGreaterEqual(len(events_order), 2)
+            self.assertEqual(events_order[0], "health")
+            self.assertEqual(events_order[1], "tpu_exporter")
+        finally:
+            release_models.set()
+            backend_srv.shutdown()
+            backend_srv.server_close()
+            exp_srv.shutdown()
+            exp_srv.server_close()
+
+    def test_streaming_chat_echo_prefix_buffers_before_commit_and_fails_over_on_pre_token_crash(
+        self,
+    ) -> None:
+        class _EchoThenCrashHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                pass
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = b'{"object":"list","data":[{"id":"m-chat-echo"}]}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802
+                cl = int(self.headers.get("Content-Length", "0"))
+                if cl > 0:
+                    self.rfile.read(cl)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                # Emit role chunk + echoed assistant prefix ("Prefix") then drop before generating.
+                self.wfile.write(
+                    b'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}\n\n'
+                    b'data: {"choices":[{"index":0,"delta":{"content":"Prefix"}}]}\n\n'
+                )
+                self.wfile.flush()
+                self.close_connection = True
+
+        primary_srv = ThreadingHTTPServer(("127.0.0.1", 0), _EchoThenCrashHandler)
+        threading.Thread(target=primary_srv.serve_forever, daemon=True).start()
+
+        class _EchoThenGenerateHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                pass
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = b'{"object":"list","data":[{"id":"m-chat-echo"}]}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802
+                cl = int(self.headers.get("Content-Length", "0"))
+                if cl > 0:
+                    self.rfile.read(cl)
+                body = (
+                    b'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}\n\n'
+                    b'data: {"choices":[{"index":0,"delta":{"content":"Prefix"}}]}\n\n'
+                    b'data: {"choices":[{"index":0,"delta":{"content":" generated"},"finish_reason":"stop"}]}\n\n'
+                    b"data: [DONE]\n\n"
+                )
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        backup_srv = ThreadingHTTPServer(("127.0.0.1", 0), _EchoThenGenerateHandler)
+        threading.Thread(target=backup_srv.serve_forever, daemon=True).start()
+        try:
+            cfg = RouterConfig(
+                host="127.0.0.1",
+                port=0,
+                policy="local_first",
+                backends=[
+                    BackendConfig(
+                        id="echo-crash-primary",
+                        local=True,
+                        base_url=f"http://127.0.0.1:{primary_srv.server_address[1]}",
+                        models=["m-chat-echo"],
+                    ),
+                    BackendConfig(
+                        id="echo-ok-backup",
+                        local=False,
+                        base_url=f"http://127.0.0.1:{backup_srv.server_address[1]}",
+                        models=["m-chat-echo"],
+                    ),
+                ],
+            )
+            router = self._track(create_router_server(cfg))
+            st, hdrs, bd = _http_request(
+                router.server_address[1],
+                "POST",
+                "/v1/chat/completions",
+                body={
+                    "model": "m-chat-echo",
+                    "stream": True,
+                    "echo": True,
+                    "messages": [
+                        {"role": "user", "content": "continue"},
+                        {"role": "assistant", "content": "Prefix"},
+                    ],
+                },
+            )
+            self.assertEqual(st, 200)
+            self.assertEqual(hdrs.get("x-freetpu-backend"), "echo-ok-backup")
+            self.assertEqual(hdrs.get("x-freetpu-failovers"), "1")
+            self.assertIn(b"Prefix", bd)
+            self.assertIn(b" generated", bd)
+            self.assertIn(b"[DONE]", bd)
+        finally:
+            primary_srv.shutdown()
+            primary_srv.server_close()
+            backup_srv.shutdown()
+            backup_srv.server_close()
+
+    def test_chunked_post_inference_body_succeeds_and_enforces_size_and_conflict_limits(
+        self,
+    ) -> None:
+        backend = self._track(_MockOpenAIBackend("chunked-backend", ["m-chunked"]))
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            max_request_body_bytes=256,
+            backends=[
+                BackendConfig(
+                    id="chunked-backend",
+                    base_url=backend.base_url,
+                    models=["m-chunked"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        def _send_raw(raw_http: bytes) -> Tuple[int, bytes]:
+            with socket.create_connection(("127.0.0.1", rport), timeout=5.0) as sock:
+                sock.sendall(raw_http)
+                resp = bytearray()
+                while True:
+                    part = sock.recv(4096)
+                    if not part:
+                        break
+                    resp.extend(part)
+            head, _, body = bytes(resp).partition(b"\r\n\r\n")
+            status_code = int(head.split(b"\r\n", 1)[0].split(b" ")[1])
+            return status_code, body
+
+        # 1. Valid multi-chunk POST /v1/chat/completions with chunk extension and trailer succeeds.
+        payload = json.dumps(
+            {
+                "model": "m-chunked",
+                "messages": [{"role": "user", "content": "hello chunked"}],
+            }
+        ).encode("utf-8")
+        c1, c2 = payload[:17], payload[17:]
+        chunked_req = (
+            b"POST /v1/chat/completions HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Transfer-Encoding: chunked\r\n"
+            b"\r\n"
+            + f"{len(c1):x};ext=1\r\n".encode("ascii")
+            + c1
+            + b"\r\n"
+            + f"{len(c2):x}\r\n".encode("ascii")
+            + c2
+            + b"\r\n0\r\nX-Trailer: ok\r\n\r\n"
+        )
+        st_ok, body_ok = _send_raw(chunked_req)
+        self.assertEqual(st_ok, 200)
+        self.assertIn(b"chunked-backend", body_ok)
+
+        # 2. Oversized chunked body exceeding max_request_body_bytes returns 413.
+        big_payload = b'{"model":"m-chunked","messages":[{"role":"user","content":"' + (b"x" * 300) + b'"}]}'
+        oversized_req = (
+            b"POST /v1/chat/completions HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Transfer-Encoding: chunked\r\n"
+            b"\r\n"
+            + f"{len(big_payload):x}\r\n".encode("ascii")
+            + big_payload
+            + b"\r\n0\r\n\r\n"
+        )
+        st_413, _ = _send_raw(oversized_req)
+        self.assertEqual(st_413, 413)
+
+        # 3. Conflicting Transfer-Encoding + Content-Length returns 400 per RFC 9112 §6.3.
+        conflict_req = (
+            b"POST /v1/chat/completions HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Transfer-Encoding: chunked\r\n"
+            b"Content-Length: 5\r\n"
+            b"\r\n0\r\n\r\n"
+        )
+        st_400, _ = _send_raw(conflict_req)
+        self.assertEqual(st_400, 400)
+
+    def test_tpu_readiness_requires_duty_cycle_on_all_chips_when_limit_configured(
+        self,
+    ) -> None:
+        partial_duty_metrics = (
+            "freetpu_exporter_up 1\n"
+            "freetpu_tpu_devices_discovered 2\n"
+            'freetpu_tpu_health_status{chip="0"} 1\n'
+            'freetpu_tpu_health_status{chip="1"} 1\n'
+            'freetpu_tpu_hbm_utilization_ratio{chip="0"} 0.25\n'
+            'freetpu_tpu_hbm_utilization_ratio{chip="1"} 0.30\n'
+            'freetpu_tpu_duty_cycle_percent{chip="0"} 20\n'
+        )
+        exp_partial = self._track(_MockTpuExporter(raw_body=partial_duty_metrics))
+        telem_partial = scrape_tpu_exporter(exp_partial.metrics_url, timeout_s=2.0)
+        self.assertEqual(telem_partial.total_chips, 2)
+        self.assertEqual(telem_partial.chips_with_duty_cycle, 1)
+        self.assertEqual(telem_partial.max_duty_cycle_percent, 20.0)
+        self.assertTrue(evaluate_tpu_readiness(telem_partial)[0])
+        ready_partial, reason_partial = evaluate_tpu_readiness(
+            telem_partial, max_duty_cycle_percent=90.0
+        )
+        self.assertFalse(ready_partial)
+        self.assertEqual(reason_partial, "tpu_duty_cycle_missing")
+
+        full_duty_metrics = partial_duty_metrics + 'freetpu_tpu_duty_cycle_percent{chip="1"} 40\n'
+        exp_full = self._track(_MockTpuExporter(raw_body=full_duty_metrics))
+        telem_full = scrape_tpu_exporter(exp_full.metrics_url, timeout_s=2.0)
+        self.assertEqual(telem_full.chips_with_duty_cycle, 2)
+        ready_full, reason_full = evaluate_tpu_readiness(
+            telem_full, max_duty_cycle_percent=90.0
+        )
+        self.assertTrue(ready_full)
+        self.assertIsNone(reason_full)
 
 
 def run_self_tests(verbosity: int = 1) -> int:
