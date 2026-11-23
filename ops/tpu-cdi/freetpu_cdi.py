@@ -791,19 +791,18 @@ def _resolve_verified_visibility_ordinals(
     bdf_to_phys: Dict[str, int],
     *,
     chip_id_map: Optional[Dict[str, int]] = None,
-    is_full_host_all: bool = False,
 ) -> Optional[Tuple[List[int], List[int]]]:
     """Return `(visible_chip_ordinals, visible_device_ordinals)` ONLY when verified.
 
     - Requires every physical chip in `subset` to have its complete PCI function set.
-    - Uses authoritative runtime ordinals from sysfs `chip_id` or explicit `chip_id_map`
-      whenever every chip in `subset` is unambiguously mapped (checking uniqueness across
-      all host chips so conflicting IDs fail closed).
-    - Allows full-host `all` allocations (when every host chip is attached and complete)
-      to emit `0..N-1` / `0..M-1` without requiring per-BDF sysfs `chip_id`.
-    - For sub-host slices (`numa*`, `pcie*`, range aliases) without verified runtime
-      ordinals, returns `None` so CDI omits `TPU_VISIBLE_CHIPS` / `TPU_VISIBLE_DEVICES`
-      and preserves workload-provided visibility settings instead of guessing from PCI order.
+    - Requires authoritative runtime ordinals from sysfs `chip_id` or explicit
+      `chip_id_map` for EVERY chip in `subset` (checking uniqueness across all
+      host chips so conflicting or incomplete maps fail closed).
+    - Never assumes runtime ordinals are `0..N-1` (even on `all`, since Cloud TPU
+      hosts can expose non-contiguous runtime IDs such as `8,9,12,13`). When
+      verified ordinals are unavailable, returns `None` so CDI omits
+      `TPU_VISIBLE_CHIPS` and `TPU_VISIBLE_DEVICES` and preserves workload-provided
+      visibility settings.
     """
     if not subset or not _has_complete_chip_functions(subset, bdf_to_phys):
         return None
@@ -868,11 +867,6 @@ def _resolve_verified_visibility_ordinals(
                     return sub_phys, logical
             return None
 
-    if is_full_host_all:
-        phys_indices = _distinct_physical_indices(subset, bdf_to_phys)
-        if len(phys_indices) in _SUPPORTED_SINGLE_HOST_CHIP_COUNTS:
-            logical_indices = _logical_device_indices(subset, phys_indices)
-            return phys_indices, logical_indices
     return None
 
 
@@ -1053,7 +1047,6 @@ def _compute_topology_slices(
             chips,
             bdf_to_phys,
             chip_id_map=chip_id_map,
-            is_full_host_all=False,
         )
         if verified_vis is not None:
             vis_chips, _vis_devs = verified_vis
@@ -1280,7 +1273,6 @@ def build_cdi_spec(
             chips,
             bdf_to_phys,
             chip_id_map=chip_id_map,
-            is_full_host_all=False,
         )
         slice_env = _build_device_env(
             len(topo_slice.physical_indices),
@@ -1330,7 +1322,6 @@ def build_cdi_spec(
         chips,
         bdf_to_phys,
         chip_id_map=chip_id_map,
-        is_full_host_all=True,
     )
     all_ann: Dict[str, str] = {
         "freetpu.dev/allocation-unit": "all-devices",
@@ -2389,8 +2380,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "(MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353, TPU_HOST_BOUNDS=1,1,1, "
             "TPU_WORKER_HOSTNAMES=localhost, TPU_WORKER_ID=0, TPU_SKIP_MDS_QUERY=true, "
             "plus TPU_CHIPS_PER_HOST_BOUNDS and verified TPU_VISIBLE_CHIPS / "
-            "TPU_VISIBLE_DEVICES when runtime ordinals are verified via sysfs chip_id, "
-            "--chip-id-map, or full-host 'all')."
+            "TPU_VISIBLE_DEVICES when runtime ordinals are verified via sysfs chip_id "
+            "or --chip-id-map)."
         ),
     )
     gen.add_argument(

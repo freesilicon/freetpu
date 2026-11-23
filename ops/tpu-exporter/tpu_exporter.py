@@ -33,6 +33,7 @@ import argparse
 from dataclasses import asdict, dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib
+import importlib.metadata
 import importlib.util
 import inspect
 import io
@@ -998,6 +999,43 @@ _GRPC_METRIC_NAMES = (
 )
 
 
+_MIN_SAFE_INPROC_TPU_INFO_VERSION = (0, 14, 2)
+_PEP440_PREFIX_RE = re.compile(r"^([0-9]+)\.([0-9]+)(?:\.([0-9]+))?(.*)$")
+
+
+def _parse_safe_tpu_info_version(version_str: str) -> bool:
+    """Return True when `version_str` is a release >= `0.14.2` (excludes pre/dev releases of 0.14.2)."""
+    m = _PEP440_PREFIX_RE.match(version_str.strip())
+    if not m:
+        return False
+    major = int(m.group(1))
+    minor = int(m.group(2))
+    patch = int(m.group(3) or 0)
+    suffix = (m.group(4) or "").strip().lower()
+    ver = (major, minor, patch)
+    if ver > _MIN_SAFE_INPROC_TPU_INFO_VERSION:
+        return True
+    if ver < _MIN_SAFE_INPROC_TPU_INFO_VERSION:
+        return False
+    # Exact 0.14.2: accept final or post-release (e.g. "0.14.2", "0.14.2.post1"),
+    # reject pre/dev releases (e.g. "0.14.2a1", "0.14.2rc1", "0.14.2.dev0").
+    return suffix == "" or suffix.startswith(".post") or suffix.startswith("+")
+
+
+def _can_safely_import_tpu_info_inproc() -> bool:
+    """Gate in-process `tpu_info.*` imports on `tpu-info >= 0.14.2` to avoid fatal import-time crashes."""
+    if (
+        "tpu_info.proto.tpu_metric_service_pb2" in sys.modules
+        and "tpu_info.proto.tpu_metric_service_pb2_grpc" in sys.modules
+    ):
+        return True
+    try:
+        installed_ver = importlib.metadata.version("tpu-info")
+    except Exception:  # noqa: BLE001
+        return False
+    return _parse_safe_tpu_info_version(installed_ver)
+
+
 def _import_optional_module(name: str) -> Optional[Any]:
     if name in sys.modules:
         return sys.modules[name]
@@ -1011,10 +1049,14 @@ def _load_grpc_runtime_modules() -> Optional[Tuple[Any, Any, Any]]:
     grpc_mod = _import_optional_module("grpc")
     if grpc_mod is None:
         return None
-    for pb2_name, pb2_grpc_name in (
-        ("tpu_info.proto.tpu_metric_service_pb2", "tpu_info.proto.tpu_metric_service_pb2_grpc"),
-        ("tpu_metric_service_pb2", "tpu_metric_service_pb2_grpc"),
-    ):
+    candidates: List[Tuple[str, str]] = []
+    if _can_safely_import_tpu_info_inproc():
+        candidates.append(
+            ("tpu_info.proto.tpu_metric_service_pb2", "tpu_info.proto.tpu_metric_service_pb2_grpc")
+        )
+    # Standalone generated stubs never trigger `tpu_info/__init__.py`.
+    candidates.append(("tpu_metric_service_pb2", "tpu_metric_service_pb2_grpc"))
+    for pb2_name, pb2_grpc_name in candidates:
         pb2 = _import_optional_module(pb2_name)
         pb2_grpc = _import_optional_module(pb2_grpc_name)
         if pb2 is not None and pb2_grpc is not None:
@@ -1256,15 +1298,14 @@ def _query_grpc_runtime_metrics(
     # collected BEFORE filtering unset/NaN/negative gauges:
     # - On `devices_per_chip == 1` generations (v5e, v6e), always join 1:1.
     # - On `devices_per_chip > 1` generations (Ironwood tpu7x, v2/v3, v4/v5p):
-    #   Check exact observed ID sets FIRST (so sliced partitions like Ironwood
-    #   physical chips `{2,3}` with HBM cores `{4,5,6,7}` match `expanded == HBM`
-    #   before any count-based heuristic!):
+    #   Require an exact ID-set match so missing/partial HBM rows (e.g. HBM `0..5`
+    #   with physical chip duty `0..3`) can NEVER misclassify per-chip readings as
+    #   per-core:
     #   - If `raw_duty_ids == raw_hbm_ids`, treat as 1:1 per-core (never doubling
     #     when some cores had unset/NaN gauges).
-    #   - Else if `expanded(raw_duty_ids) == raw_hbm_ids` (1:N bijection), treat
-    #     as per-chip and expand only valid readings.
-    #   - Else if `raw_duty_ids <= raw_hbm_ids` and `not expanded <= raw_hbm_ids`,
-    #     treat as partial per-core (1:1).
+    #   - Else if `expanded(raw_duty_ids) == raw_hbm_ids` (exact 1:N bijection,
+    #     handling both full hosts `{0..3} -> {0..7}` and sliced partitions
+    #     `{2,3} -> {4..7}`), treat as per-chip and expand only valid readings.
     #   - Otherwise treat as ambiguous and omit duty-cycle attachment rather than
     #     misassigning readings to the wrong core.
     duty_layout = "per_core"
@@ -1284,10 +1325,6 @@ def _query_grpc_runtime_metrics(
                 and len(raw_duty_int_ids) * devices_per_chip == len(all_hbm_core_ids)
             ):
                 duty_layout = "per_chip"
-            elif raw_duty_int_ids <= all_hbm_core_ids and not (
-                expanded_raw <= all_hbm_core_ids
-            ):
-                duty_layout = "per_core"
             else:
                 duty_layout = "ambiguous"
         elif len(devices) > 0 and len(devices) % devices_per_chip == 0:

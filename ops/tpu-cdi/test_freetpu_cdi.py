@@ -230,6 +230,24 @@ class FreeTpuCdiTests(unittest.TestCase):
             self.assertEqual(
                 iso_spec["devices"][-1]["containerEdits"]["env"],
                 [
+                    "TPU_CHIPS_PER_HOST_BOUNDS=1,1,1",
+                    "MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353",
+                    "TPU_HOST_BOUNDS=1,1,1",
+                    "TPU_WORKER_HOSTNAMES=localhost",
+                    "TPU_WORKER_ID=0",
+                    "TPU_SKIP_MDS_QUERY=true",
+                ],
+            )
+            with _mock_vfio_char_devices():
+                iso_mapped = freetpu_cdi.build_cdi_spec(
+                    chips,
+                    vfio_container,
+                    single_host_env=True,
+                    chip_id_map={"0000:00:06.0": 0},
+                )
+            self.assertEqual(
+                iso_mapped["devices"][-1]["containerEdits"]["env"],
+                [
                     "TPU_VISIBLE_CHIPS=0",
                     "TPU_VISIBLE_DEVICES=0",
                     "TPU_CHIPS_PER_HOST_BOUNDS=1,1,1",
@@ -1813,13 +1831,52 @@ class FreeTpuCdiTests(unittest.TestCase):
                     kv.split("=", 1)[0]: kv.split("=", 1)[1]
                     for kv in iso_spec["devices"][-1]["containerEdits"]["env"]
                 }
-                self.assertEqual(all_env["TPU_VISIBLE_DEVICES"], "0,1,2,3")
+                # Without verified sysfs `chip_id` or complete `--chip-id-map`, even `all`
+                # MUST omit TPU_VISIBLE_CHIPS and TPU_VISIBLE_DEVICES so non-contiguous
+                # runtime IDs (e.g. 8,9,12,13) or workload masks are never overwritten.
+                self.assertNotIn("TPU_VISIBLE_CHIPS", all_env)
+                self.assertNotIn("TPU_VISIBLE_DEVICES", all_env)
                 self.assertEqual(all_env["TPU_CHIPS_PER_HOST_BOUNDS"], "2,2,1")
                 self.assertEqual(all_env["MEGASCALE_COORDINATOR_ADDRESS"], "127.0.0.1:8353")
                 self.assertEqual(all_env["TPU_HOST_BOUNDS"], "1,1,1")
                 self.assertEqual(all_env["TPU_WORKER_HOSTNAMES"], "localhost")
                 self.assertEqual(all_env["TPU_WORKER_ID"], "0")
                 self.assertEqual(all_env["TPU_SKIP_MDS_QUERY"], "true")
+
+                # Incomplete map (verifying only 1 of 4 chips as ID 4) MUST still omit
+                # visibility masks on `all` (never falling back to `0,1,2,3`!).
+                partial_map_spec = freetpu_cdi.build_cdi_spec(
+                    chips,
+                    control_node,
+                    network_mode="isolated",
+                    chip_id_map={"0000:00:01.0": 4},
+                )
+                partial_all_env = dict(
+                    kv.split("=", 1) for kv in partial_map_spec["devices"][-1]["containerEdits"]["env"]
+                )
+                self.assertNotIn("TPU_VISIBLE_CHIPS", partial_all_env)
+                self.assertNotIn("TPU_VISIBLE_DEVICES", partial_all_env)
+
+                # Complete verified map with non-contiguous v6e runtime IDs (8,9,12,13)
+                # emits those exact verified masks on `all`.
+                noncontig_map = {
+                    "0000:00:01.0": 8,
+                    "0000:00:02.0": 9,
+                    "0000:00:03.0": 12,
+                    "0000:00:04.0": 13,
+                }
+                verified_all_spec = freetpu_cdi.build_cdi_spec(
+                    chips,
+                    control_node,
+                    network_mode="isolated",
+                    chip_id_map=noncontig_map,
+                )
+                verified_all_env = dict(
+                    kv.split("=", 1)
+                    for kv in verified_all_spec["devices"][-1]["containerEdits"]["env"]
+                )
+                self.assertEqual(verified_all_env["TPU_VISIBLE_CHIPS"], "8,9,12,13")
+                self.assertEqual(verified_all_env["TPU_VISIBLE_DEVICES"], "8,9,12,13")
 
                 # Composable PCI selectors omit TPU_VISIBLE_CHIPS / TPU_VISIBLE_DEVICES /
                 # TPU_CHIPS_PER_HOST_BOUNDS so combining multiple PCI selectors never
@@ -1868,6 +1925,8 @@ class FreeTpuCdiTests(unittest.TestCase):
                         "--stdout",
                         "--validate",
                         "--single-host-env",
+                        "--chip-id-map",
+                        json.dumps(noncontig_map),
                         "--sysfs-root",
                         str(sysfs_root),
                         "--dev-root",
@@ -1879,7 +1938,8 @@ class FreeTpuCdiTests(unittest.TestCase):
                 sh_all_env = dict(
                     kv.split("=", 1) for kv in parsed_sh["devices"][-1]["containerEdits"]["env"]
                 )
-                self.assertEqual(sh_all_env["TPU_VISIBLE_DEVICES"], "0,1,2,3")
+                self.assertEqual(sh_all_env["TPU_VISIBLE_CHIPS"], "8,9,12,13")
+                self.assertEqual(sh_all_env["TPU_VISIBLE_DEVICES"], "8,9,12,13")
                 self.assertEqual(sh_all_env["TPU_CHIPS_PER_HOST_BOUNDS"], "2,2,1")
                 self.assertEqual(sh_all_env["MEGASCALE_COORDINATOR_ADDRESS"], "127.0.0.1:8353")
 
@@ -2275,10 +2335,17 @@ class FreeTpuCdiTests(unittest.TestCase):
                     [],
                 )
 
-                # Full 8-chip v6e-8 `all` uses 2,4,1 bounds and full-host 0..7 visibility.
+                # Full 8-chip v6e-8 `all` uses 2,4,1 bounds and omits visibility when unverified;
+                # with verified chip_id_map, `all` emits the verified 0..7 masks.
                 all_env = dict(kv.split("=", 1) for kv in by_name["all"]["containerEdits"]["env"])
-                self.assertEqual(all_env["TPU_VISIBLE_DEVICES"], "0,1,2,3,4,5,6,7")
+                self.assertNotIn("TPU_VISIBLE_CHIPS", all_env)
+                self.assertNotIn("TPU_VISIBLE_DEVICES", all_env)
                 self.assertEqual(all_env["TPU_CHIPS_PER_HOST_BOUNDS"], "2,4,1")
+                mapped_all_env = dict(
+                    kv.split("=", 1) for kv in mapped_by_name["all"]["containerEdits"]["env"]
+                )
+                self.assertEqual(mapped_all_env["TPU_VISIBLE_CHIPS"], "0,1,2,3,4,5,6,7")
+                self.assertEqual(mapped_all_env["TPU_VISIBLE_DEVICES"], "0,1,2,3,4,5,6,7")
 
                 # Tampering numa0 to mix 0000:00 and 0000:80 must fail --check-host!
                 tampered = json.loads(json.dumps(spec))

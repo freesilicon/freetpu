@@ -2184,6 +2184,35 @@ TPU Runtime Utilization
             self.assertIn("unavailable", err_fb or "")
             self.assertEqual(rows_fb, {})
 
+            # Crash-prone `tpu-info < 0.14.2` MUST NOT be imported in-process by
+            # `_load_grpc_runtime_modules` (preventing import-time exporter termination).
+            self.assertFalse(_te._parse_safe_tpu_info_version("0.14.1"))
+            self.assertFalse(_te._parse_safe_tpu_info_version("0.14.2rc1"))
+            self.assertFalse(_te._parse_safe_tpu_info_version("0.14.2.dev0"))
+            self.assertTrue(_te._parse_safe_tpu_info_version("0.14.2"))
+            self.assertTrue(_te._parse_safe_tpu_info_version("0.14.2.post1"))
+            self.assertTrue(_te._parse_safe_tpu_info_version("0.15.0"))
+
+            attempted_imports: list[str] = []
+
+            def _guarded_import(name: str):
+                attempted_imports.append(name)
+                if name.startswith("tpu_info"):
+                    raise AssertionError(f"must not import {name} in-process on tpu-info < 0.14.2")
+                raise ModuleNotFoundError(name)
+
+            with (
+                mock.patch.dict(sys.modules, {"grpc": _FakeGrpc}),
+                mock.patch("importlib.metadata.version", return_value="0.14.1"),
+                mock.patch("importlib.import_module", side_effect=_guarded_import),
+            ):
+                # Ensure tpu_info.proto.* are absent from sys.modules during this check.
+                sys.modules.pop("tpu_info.proto.tpu_metric_service_pb2", None)
+                sys.modules.pop("tpu_info.proto.tpu_metric_service_pb2_grpc", None)
+                self.assertIsNone(_te._load_grpc_runtime_modules())
+            self.assertFalse(any(m.startswith("tpu_info") for m in attempted_imports))
+            self.assertIn("tpu_metric_service_pb2", attempted_imports)
+
             # Ironwood (tpu7x, 0x0076) exposes 2 logical runtime cores per physical chip:
             # HBM is reported per core (0..7) while duty cycle is reported per physical chip
             # (0..3). Verify chip c's duty cycle maps onto cores (2*c, 2*c+1) rather than
@@ -2463,6 +2492,55 @@ TPU Runtime Utilization
             self.assertEqual(
                 sorted(rt.runtime_chip for rt in iw_slice_snap.runtime_utilization),
                 ["4", "5", "6", "7"],
+            )
+
+            # Partial HBM response (`0..5`, missing cores `6..7`) alongside physical-chip
+            # duty cycle (`0..3`) MUST be classified as ambiguous and omit duty cycle
+            # rather than misclassifying `{0..3}` as per-core and assigning chip 1 to core 1!
+            class _IronwoodPartialHbmDutyStub:
+                def __init__(self, channel):
+                    self.channel = channel
+
+                def GetRuntimeMetric(self, req, timeout=None):
+                    del timeout
+                    if req.metric_name == "tpu.runtime.hbm.memory.usage.bytes":
+                        items = [_make_item(c, as_int=(c + 1) * 4 * 1024**3) for c in range(6)]
+                    elif req.metric_name == "tpu.runtime.hbm.memory.total.bytes":
+                        items = [_make_item(c, as_int=96 * 1024**3) for c in range(6)]
+                    elif req.metric_name == "tpu.runtime.tensorcore.dutycycle.percent":
+                        items = [_make_item(c, as_double=20.0 * (c + 1)) for c in range(4)]
+                    else:
+                        items = []
+                    return SimpleNamespace(metric=SimpleNamespace(metrics=items))
+
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.dict(_te._GRPC_CHANNELS, {}, clear=True),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "grpc": _FakeGrpc,
+                        "tpu_info": SimpleNamespace(),
+                        "tpu_info.proto": SimpleNamespace(),
+                        "tpu_info.proto.tpu_metric_service_pb2": fake_pb2,
+                        "tpu_info.proto.tpu_metric_service_pb2_grpc": SimpleNamespace(
+                            RuntimeMetricServiceStub=_IronwoodPartialHbmDutyStub
+                        ),
+                    },
+                ),
+            ):
+                iw_partial_hbm_snap = _te.collect_snapshot(
+                    sysfs_root=iw_sysfs,
+                    dev_root=iw_dev,
+                    proc_root=iw_proc,
+                    tpu_info_bin="tpu-info",
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=iw_root / "no-shm",
+                )
+            self.assertEqual([d.duty_cycle_percent for d in iw_partial_hbm_snap.devices], [None] * 8)
+            self.assertEqual(
+                [d.hbm_used_bytes for d in iw_partial_hbm_snap.devices[:6]],
+                [(c + 1) * 4 * 1024**3 for c in range(6)],
             )
 
             # Custom `--tpu-info-bin` specified by bare name (without `/`) MUST invoke
