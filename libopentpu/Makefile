@@ -34,6 +34,7 @@ SRCS := \
 
 HDRS := \
 	$(THIS_DIR)/include/opentpu.h \
+	$(THIS_DIR)/include/opentpu_freetile.hpp \
 	$(THIS_DIR)/src/ot_internal.h \
 	$(THIS_DIR)/src/ot_vliw.h \
 	$(THIS_DIR)/third_party/openxla/pjrt_c_api.h

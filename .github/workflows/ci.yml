@@ -24,6 +24,12 @@ jobs:
           cmake --build build-cmake -j"$(nproc)"
           ctest --test-dir build-cmake --output-on-failure
 
+      - name: Configure & test freetile (Zero-Dep C++17 Tile IR)
+        run: |
+          cmake -S freetile -B build-freetile -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-freetile -j"$(nproc)"
+          ctest --test-dir build-freetile --output-on-failure
+
       - name: Configure & test llama-cpp-cloudtpu (Host Mock PJRT)
         run: |
           cmake -S llama-cpp-cloudtpu -B build-cloudtpu -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -97,6 +103,13 @@ jobs:
           python3 ops/tpu-cdi/freetpu_cdi.py --help >/dev/null
           python3 ops/tpu-exporter/test_tpu_exporter.py -v
           python3 ops/tpu-cdi/test_freetpu_cdi.py -v
+
+      - name: Run FreeTPU Router self-tests
+        run: |
+          python3 router/freetpu_router.py --self-test --verbose
+          python3 router/freetpu_router.py --check-config --config router/examples/hybrid-pixel-cloud.json
+          python3 router/freetpu_router.py --check-config --config router/examples/local-pixel-cluster.json
+          python3 router/freetpu_router.py --check-config --config router/examples/cloud-tpu-v6e8-high-batch.json
 
   clean-room-audit:
     name: Clean-Room & OSS Boundary Audit

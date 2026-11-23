@@ -2,6 +2,7 @@
 #include "ot_internal.h"
 #include "ot_vliw.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -29,6 +30,57 @@ bool parse_hex_u64(const std::string& text, uint64_t* out) {
   if (errno != 0 || end == text.c_str()) return false;
   *out = static_cast<uint64_t>(v);
   return true;
+}
+
+size_t clamp_bar_mmap_len(uint64_t bar_size, size_t max_len) {
+  if (bar_size == 0 || max_len == 0) return 0;
+  const uint64_t cap = static_cast<uint64_t>(max_len);
+  return static_cast<size_t>(bar_size < cap ? bar_size : cap);
+}
+
+bool parse_pcie_rebar_cap(const uint8_t* cfg_bytes, size_t cfg_len, RebarCapabilityInfo* out) {
+  if (!out) return false;
+  std::memset(out, 0, sizeof(*out));
+  if (!cfg_bytes || cfg_len < 0x108u) return false;
+
+  auto read_u32_le = [&](size_t off) -> uint32_t {
+    uint32_t v = 0;
+    std::memcpy(&v, cfg_bytes + off, sizeof(v));
+    return v;
+  };
+
+  size_t off = 0x100u;
+  for (int hop = 0; hop < 64 && off >= 0x100u && off + 4u <= cfg_len; ++hop) {
+    const uint32_t hdr = read_u32_le(off);
+    const uint16_t cap_id = static_cast<uint16_t>(hdr & 0xffffu);
+    const uint16_t next_off = static_cast<uint16_t>((hdr >> 20) & 0x0ffcu);
+    if (cap_id == 0xffffu || cap_id == 0x0000u) break;
+
+    if (cap_id == 0x0015u) {  // PCIe Extended Capability: Resizable BAR
+      if (off + 12u > cfg_len) return false;
+      const uint32_t ctrl0 = read_u32_le(off + 8u);
+      uint32_t nbars = (ctrl0 >> 5) & 0x7u;
+      if (nbars == 0) nbars = 1u;
+      if (nbars > 6u) nbars = 6u;
+      out->found = true;
+      out->cap_offset = static_cast<uint16_t>(off);
+      out->num_bars = nbars;
+      for (uint32_t b = 0; b < nbars; ++b) {
+        const size_t entry_off = off + 4u + static_cast<size_t>(b) * 8u;
+        if (entry_off + 8u > cfg_len) break;
+        const uint32_t ctrl = read_u32_le(entry_off + 4u);
+        const uint32_t bar_idx = ctrl & 0x7u;
+        const uint32_t size_pow = (ctrl >> 8) & 0x3fu;
+        if (bar_idx < 6u && size_pow <= 43u) {
+          out->bar_bytes[bar_idx] = 1ULL << (20u + size_pow);
+        }
+      }
+      return true;
+    }
+    if (next_off == 0 || next_off <= off) break;
+    off = next_off;
+  }
+  return false;
 }
 
 void IovaAllocator::init(uint64_t base, uint64_t limit) {
@@ -411,6 +463,80 @@ static std::string sysfs_read_link_base(const std::string& path) {
   return (pos == std::string::npos) ? s : s.substr(pos + 1);
 }
 
+static void read_sysfs_pci_bars(const std::string& res_path,
+                                uint64_t* bar0,
+                                uint64_t* bar2,
+                                uint64_t* bar4) {
+  if (bar0) *bar0 = 0;
+  if (bar2) *bar2 = 0;
+  if (bar4) *bar4 = 0;
+  int fd = ::open(res_path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return;
+  char buf[2048];
+  ssize_t n = ::read(fd, buf, sizeof(buf) - 1);
+  ::close(fd);
+  if (n <= 0) return;
+  buf[n] = '\0';
+
+  int idx = 0;
+  char* saveptr = nullptr;
+  for (char* line = ::strtok_r(buf, "\n", &saveptr);
+       line && idx <= 5;
+       line = ::strtok_r(nullptr, "\n", &saveptr), ++idx) {
+    unsigned long long start = 0, end = 0, flags = 0;
+    if (std::sscanf(line, "0x%llx 0x%llx 0x%llx", &start, &end, &flags) == 3 &&
+        end > start && (flags & 0x100ULL) == 0ULL) {
+      const uint64_t sz = static_cast<uint64_t>(end - start + 1ULL);
+      if (idx == 0 && bar0) *bar0 = sz;
+      if (idx == 2 && bar2) *bar2 = sz;
+      if (idx == 4 && bar4) *bar4 = sz;
+    }
+  }
+}
+
+bool enumerate_linux_tpus(std::vector<PciDiscoveryEntry>* out, std::string* err) {
+  if (!out) return false;
+  out->clear();
+  DIR* dir = ::opendir("/sys/bus/pci/devices");
+  if (!dir) {
+    if (err) *err = "Failed to open /sys/bus/pci/devices";
+    return false;
+  }
+  struct dirent* ent = nullptr;
+  while ((ent = ::readdir(dir)) != nullptr) {
+    if (ent->d_name[0] == '.') continue;
+    const std::string bdf(ent->d_name);
+    const std::string base = "/sys/bus/pci/devices/" + bdf;
+    uint64_t vid = 0, did = 0, cls = 0;
+    parse_hex_u64(sysfs_read_line(base + "/vendor"), &vid);
+    parse_hex_u64(sysfs_read_line(base + "/device"), &did);
+    parse_hex_u64(sysfs_read_line(base + "/class"), &cls);
+    if (vid != 0x1ae0ULL || cls != 0xff0000ULL) continue;
+
+    PciDiscoveryEntry entry;
+    entry.bdf = bdf;
+    entry.vendor_id = static_cast<uint16_t>(vid);
+    entry.device_id = static_cast<uint16_t>(did);
+    entry.pci_class = static_cast<uint32_t>(cls);
+    entry.driver = sysfs_read_link_base(base + "/driver");
+    const std::string grp_str = sysfs_read_link_base(base + "/iommu_group");
+    if (!grp_str.empty()) {
+      char* end = nullptr;
+      errno = 0;
+      unsigned long grp_val = std::strtoul(grp_str.c_str(), &end, 10);
+      if (errno == 0 && end != grp_str.c_str() && *end == '\0') {
+        entry.iommu_group = static_cast<uint32_t>(grp_val);
+      }
+    }
+    read_sysfs_pci_bars(base + "/resource", &entry.bar0_size, &entry.bar2_size, &entry.bar4_size);
+    out->push_back(std::move(entry));
+  }
+  ::closedir(dir);
+  std::sort(out->begin(), out->end(),
+            [](const PciDiscoveryEntry& a, const PciDiscoveryEntry& b) { return a.bdf < b.bdf; });
+  return true;
+}
+
 static bool discover_linux_tpu(const char* preferred_bdf, PciDiscoveryEntry* out, std::string* err) {
   DIR* dir = ::opendir("/sys/bus/pci/devices");
   if (!dir) {
@@ -470,6 +596,12 @@ static bool discover_linux_tpu(const char* preferred_bdf, PciDiscoveryEntry* out
   }
   return found;
 }
+#else
+bool enumerate_linux_tpus(std::vector<PciDiscoveryEntry>* out, std::string* err) {
+  if (out) out->clear();
+  if (err) *err = "Linux sysfs enumeration unavailable on this host";
+  return false;
+}
 #endif
 
 bool VfioTransport::is_owner_process() const {
@@ -485,20 +617,56 @@ bool VfioTransport::open_device(const ot_config_t& cfg, ot_device_info_t* info, 
 
   if (cfg.mock_mode) {
     is_mock = true;
+    uint16_t mock_did = 0x0063u;
+    const char* did_env = std::getenv("OPENTPU_MOCK_DEVICE_ID");
+    if (did_env && did_env[0] != '\0') {
+      uint64_t parsed = 0;
+      if (parse_hex_u64(did_env, &parsed) && parsed <= 0xffffULL) {
+        mock_did = static_cast<uint16_t>(parsed);
+      }
+    } else if (const char* topo_env = std::getenv("OPENTPU_MOCK_TOPOLOGY")) {
+      if (std::strcmp(topo_env, "tpu7x-1t") == 0 || std::strcmp(topo_env, "tpu7x_1t") == 0 ||
+          std::strcmp(topo_env, "tpu7x-4t") == 0 || std::strcmp(topo_env, "tpu7x_4t") == 0) {
+        mock_did = 0x0075u;
+      } else if (std::strcmp(topo_env, "v6e-8") == 0 || std::strcmp(topo_env, "v6e_8") == 0) {
+        mock_did = 0x006fu;
+      } else if (std::strcmp(topo_env, "v5e-1") == 0 || std::strcmp(topo_env, "v5e_1") == 0) {
+        mock_did = 0x0063u;
+      } else if (const char* chip_env = std::getenv("OPENTPU_MOCK_CHIP")) {
+        if (std::strcmp(chip_env, "tpu7x") == 0 || std::strcmp(chip_env, "ironwood") == 0 ||
+            std::strcmp(chip_env, "v7x") == 0) {
+          mock_did = 0x0075u;
+        } else if (std::strcmp(chip_env, "v6e") == 0 || std::strcmp(chip_env, "trillium") == 0) {
+          mock_did = 0x006fu;
+        }
+      }
+    } else if (const char* chip_env = std::getenv("OPENTPU_MOCK_CHIP")) {
+      if (std::strcmp(chip_env, "tpu7x") == 0 || std::strcmp(chip_env, "ironwood") == 0 ||
+          std::strcmp(chip_env, "v7x") == 0) {
+        mock_did = 0x0075u;
+      } else if (std::strcmp(chip_env, "v6e") == 0 || std::strcmp(chip_env, "trillium") == 0) {
+        mock_did = 0x006fu;
+      }
+    }
+    ot_device_geometry_t geom = {};
+    (void)chip_geometry_for_device_id(mock_did, &geom);
+
     std::snprintf(info->bdf, sizeof(info->bdf), "%s",
                   (cfg.bdf && cfg.bdf[0]) ? cfg.bdf : "0000:00:05.0");
     info->vendor_id = 0x1ae0u;
-    info->device_id = 0x0063u;
+    info->device_id = mock_did;
     info->subsys_vendor_id = 0x1ae0u;
     info->subsys_device_id = 0x00afu;
     info->iommu_group = 0;
-    info->chip_gen = OT_CHIP_V5E;
+    info->chip_gen = geom.chip_gen != OT_CHIP_UNKNOWN ? geom.chip_gen : OT_CHIP_V5E;
     info->bar0_size = 0x100000000ULL;
     info->bar4_size = 0x1000000ULL;
     info->msix_vectors = 128u;
-    info->vmem_bytes = 128ULL * 1024ULL * 1024ULL;
-    info->smem_bytes = 1024ULL * 1024ULL;
-    info->num_mxus = 4u;
+    info->vmem_bytes = geom.vmem_bytes_per_logical_chiplet ? geom.vmem_bytes_per_logical_chiplet
+                                                          : (128ULL * 1024ULL * 1024ULL);
+    info->smem_bytes = geom.smem_bytes_per_logical_chiplet ? geom.smem_bytes_per_logical_chiplet
+                                                          : (1024ULL * 1024ULL);
+    info->num_mxus = geom.num_mxus_per_logical_chiplet ? geom.num_mxus_per_logical_chiplet : 4u;
     info->is_mock = 1u;
     info->is_prebooted = 1u;
 
@@ -634,14 +802,17 @@ bool VfioTransport::open_device(const ot_config_t& cfg, ot_device_info_t* info, 
   (void)::ioctl(device_fd, VFIO_DEVICE_RESET);
 
   if (bar4_size > 0 && (r4.flags & VFIO_REGION_INFO_FLAG_MMAP)) {
+    // Clamp BAR4 mmap length for 64-bit Resizable BAR apertures (v7x can advertise >= GiB BARs).
+    static constexpr size_t kMaxBar4MapBytes = 16ULL * 1024ULL * 1024ULL;
+    const size_t bar4_map_len = clamp_bar_mmap_len(bar4_size, kMaxBar4MapBytes);
     pthread_mutex_lock(&g_vfio_fork_mu);
-    void* p4 = ::mmap(nullptr, static_cast<size_t>(bar4_size), PROT_READ | PROT_WRITE,
+    void* p4 = ::mmap(nullptr, bar4_map_len, PROT_READ | PROT_WRITE,
                       MAP_SHARED, device_fd, static_cast<off_t>(bar4_offset));
     int map_err = errno;
     if (p4 != MAP_FAILED) {
-      if (::madvise(p4, static_cast<size_t>(bar4_size), MADV_DONTFORK) != 0) {
+      if (::madvise(p4, bar4_map_len, MADV_DONTFORK) != 0) {
         map_err = errno;
-        ::munmap(p4, static_cast<size_t>(bar4_size));
+        ::munmap(p4, bar4_map_len);
         p4 = MAP_FAILED;
         pthread_mutex_unlock(&g_vfio_fork_mu);
         if (err) *err = std::string("madvise(BAR4, MADV_DONTFORK) failed: ") + std::strerror(map_err);
@@ -649,7 +820,7 @@ bool VfioTransport::open_device(const ot_config_t& cfg, ot_device_info_t* info, 
         return false;
       }
       bar4_mmio = reinterpret_cast<volatile uint8_t*>(p4);
-      bar4_mapped_len = static_cast<size_t>(bar4_size);
+      bar4_mapped_len = bar4_map_len;
     }
     pthread_mutex_unlock(&g_vfio_fork_mu);
     if (p4 == MAP_FAILED) {
@@ -721,8 +892,10 @@ bool VfioTransport::open_device(const ot_config_t& cfg, ot_device_info_t* info, 
   info->iommu_group = pci.iommu_group;
   if (pci.device_id == 0x0063u) {
     info->chip_gen = OT_CHIP_V5E;
-  } else if (pci.device_id == 0x006fu) {
+  } else if (pci.device_id == 0x006fu || pci.device_id == 0x006eu) {
     info->chip_gen = OT_CHIP_V6E;
+  } else if (pci.device_id == 0x0075u || pci.device_id == 0x0076u) {
+    info->chip_gen = OT_CHIP_TPU7X;
   } else {
     info->chip_gen = OT_CHIP_UNKNOWN;
   }
@@ -1117,6 +1290,8 @@ bool validate_cq_completion(uint32_t sent_seq, const uint32_t cq[8], std::string
 
 bool VfioTransport::submit_sq_wait(const uint32_t desc[32], uint32_t timeout_ms,
                                    uint32_t cq_out[8], std::string* err) {
+  last_op_timed_out = false;
+  last_op_oom = false;
   if (!is_mock && !is_owner_process()) {
     if (err) *err = "VFIO context cannot be used in a forked child process";
     return false;
@@ -1154,9 +1329,9 @@ bool VfioTransport::submit_sq_wait(const uint32_t desc[32], uint32_t timeout_ms,
   // Order DMA payload, CQ poison, and SQ descriptor writes in outer-shareable domain before MMIO doorbell.
   dma_wmb();
 
-  uint32_t target_seq = sent_seq + 1u;
-  sq_seq = target_seq;
-  write32_bar0(0x10018u, target_seq);
+  const uint32_t target_ring = (sent_seq + 1u) % 256u;
+  sq_seq = sent_seq + 1u;
+  write32_bar0(0x10018u, target_ring);
   write32_bar0(0x10044u, 0u);
 
   auto quiesce_on_unverified_dma = [&]() {
@@ -1182,7 +1357,7 @@ bool VfioTransport::submit_sq_wait(const uint32_t desc[32], uint32_t timeout_ms,
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   for (;;) {
     uint32_t cq_tail = __atomic_load_n(&status_page_mem[1], __ATOMIC_ACQUIRE);
-    if (static_cast<int32_t>(cq_tail - target_seq) >= 0) {
+    if (cq_tail == target_ring) {
       // Order completion entry and DMA payload reads after observing cq_tail from PCIe device.
       dma_rmb();
       uint32_t local_cq[8] = {};
@@ -1198,7 +1373,7 @@ bool VfioTransport::submit_sq_wait(const uint32_t desc[32], uint32_t timeout_ms,
         return false;
       }
       dma_wmb();
-      write32_bar0(0x1002cu, target_seq);
+      write32_bar0(0x1002cu, target_ring);
       return validate_cq_completion(sent_seq, local_cq, err);
     }
     if (std::chrono::steady_clock::now() >= deadline) {
@@ -1208,8 +1383,9 @@ bool VfioTransport::submit_sq_wait(const uint32_t desc[32], uint32_t timeout_ms,
   }
 
   quiesce_on_unverified_dma();
+  last_op_timed_out = true;
   if (err) {
-    *err = "SQ doorbell timeout waiting for completion seq=" + std::to_string(target_seq - 1u) +
+    *err = "SQ doorbell timeout waiting for completion seq=" + std::to_string(sent_seq) +
            " (device quiesced; recreate context)";
   }
   return false;
@@ -1293,6 +1469,10 @@ bool VfioTransport::dma_host_to_imem(uint64_t host_iova, uint64_t dst_imem, size
 bool VfioTransport::submit_core_ctrl(uint32_t ctrl_word, uint32_t timeout_ms,
                                      uint32_t cq_out[8], std::string* err) {
   if (is_mock) {
+    if (mock_core_ctrl_fail) {
+      if (err) *err = "Mock core_ctrl command failed";
+      return false;
+    }
     if (cq_out) std::memset(cq_out, 0, 32);
     return true;
   }
@@ -1304,7 +1484,13 @@ bool VfioTransport::submit_core_ctrl(uint32_t ctrl_word, uint32_t timeout_ms,
 
 bool VfioTransport::submit_exec_sync(uint32_t expected_exec_seq, uint32_t timeout_ms,
                                      uint32_t cq_out[8], std::string* err) {
-  if (is_mock) {
+  last_op_timed_out = false;
+  last_op_oom = false;
+  uint32_t local_cq[8] = {};
+  bool poll_failed = false;
+  bool timed_out = false;
+
+  if (is_mock && !mock_exec_timeout && !mock_exec_poll_error) {
     if (cq_out) {
       std::memset(cq_out, 0, 32);
       cq_out[4] = 1u;
@@ -1312,39 +1498,92 @@ bool VfioTransport::submit_exec_sync(uint32_t expected_exec_seq, uint32_t timeou
     }
     return true;
   }
-  uint32_t d[32] = {};
-  d[1] = kSqOpcodeExec;
-  d[8] = kExecOpW8;
-  d[10] = kExecOpW10;
-  uint32_t local_cq[8] = {};
-  if (!submit_sq_wait(d, timeout_ms, local_cq, err)) {
-    return false;
+  if (is_mock) {
+    if (mock_exec_poll_error) {
+      poll_failed = true;
+      if (err) *err = "Mock EXEC poll CQ failure";
+    } else {
+      timed_out = true;
+    }
+  } else {
+    uint32_t d[32] = {};
+    d[1] = kSqOpcodeExec;
+    d[8] = kExecOpW8;
+    d[10] = kExecOpW10;
+    const auto timeout = std::chrono::milliseconds(timeout_ms ? timeout_ms : 5000u);
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    for (;;) {
+      std::memset(local_cq, 0, sizeof(local_cq));
+      const auto now = std::chrono::steady_clock::now();
+      const auto rem_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+      const uint32_t sq_timeout_ms = (rem_ms > 0) ? static_cast<uint32_t>(rem_ms) : 1u;
+      if (!submit_sq_wait(d, sq_timeout_ms, local_cq, err)) {
+        poll_failed = true;
+        break;
+      }
+      if (local_cq[4] == 1u && local_cq[5] == expected_exec_seq) {
+        if (cq_out) {
+          std::memcpy(cq_out, local_cq, sizeof(local_cq));
+        }
+        return true;
+      }
+      if (std::chrono::steady_clock::now() >= deadline) {
+        timed_out = true;
+        break;
+      }
+#ifdef __linux__
+      ::usleep(25);
+#endif
+    }
   }
   if (cq_out) {
     std::memcpy(cq_out, local_cq, sizeof(local_cq));
   }
-  if (local_cq[4] != 1u || local_cq[5] != expected_exec_seq) {
-    dma_faulted = true;
-    ring_ready = false;
-    imem_booted = false;
+  // Launch doorbell has already been rung; any unconfirmed exit (deadline timeout
+  // OR SQ/CQ poll error) must fault and quiesce the device so scratch HBM is
+  // never freed under an in-flight kernel.
+  const bool was_timeout = timed_out || last_op_timed_out;
+  const bool already_faulted = dma_faulted;
+  dma_faulted = true;
+  last_op_timed_out = was_timeout;
+  ring_ready = false;
+  imem_booted = false;
+  loaded_prog_kind = 0u;
+  loaded_imem_bundles = 0u;
 #ifdef __linux__
+  if (!is_mock && !already_faulted) {
     if (bar0_mmio && bar0_mapped_len >= 0x12000u) {
       write32_bar0(0x10000u, 0u);
       write32_bar0(0x10040u, 0u);
     }
+    uint16_t cmd = 0;
+    if (read_pci_config(0x04, &cmd, sizeof(cmd)) && (cmd & 0x0004u)) {
+      cmd &= static_cast<uint16_t>(~0x0004u);
+      (void)write_pci_config(0x04, &cmd, sizeof(cmd));
+    }
     if (device_fd >= 0) {
       (void)::ioctl(device_fd, VFIO_DEVICE_RESET);
     }
+  }
+#else
+  (void)already_faulted;
 #endif
-    if (err) {
-      *err = "EXEC completion mismatch: cq[4]=" + std::to_string(local_cq[4]) +
+  if (err) {
+    if (poll_failed && !err->empty()) {
+      if (err->find("device quiesced") == std::string::npos) {
+        *err += " (EXEC unconfirmed; device quiesced; recreate context)";
+      }
+    } else if (was_timeout) {
+      *err = "EXEC completion timeout: cq[4]=" + std::to_string(local_cq[4]) +
              " cq[5]=" + std::to_string(local_cq[5]) +
              " expected=" + std::to_string(expected_exec_seq) +
              " (device quiesced; recreate context)";
+    } else {
+      *err = "EXEC poll failed before completion (device quiesced; recreate context)";
     }
-    return false;
   }
-  return true;
+  return false;
 }
 
 bool VfioTransport::ensure_matmul_scratch_slot(uint64_t* slot, std::string* err) {
@@ -1371,6 +1610,12 @@ bool VfioTransport::ensure_matmul_scratch(std::string* err) {
 }
 
 bool VfioTransport::ensure_imem_booted(uint32_t timeout_ms, std::string* err) {
+  return ensure_imem_program(/*bf16=*/1u, timeout_ms, err);
+}
+
+bool VfioTransport::ensure_imem_program(uint32_t prog_kind, uint32_t timeout_ms,
+                                        std::string* err) {
+  last_op_oom = false;
   if (!is_mock && !is_owner_process()) {
     if (err) *err = "VFIO context cannot be used in a forked child process";
     return false;
@@ -1379,9 +1624,23 @@ bool VfioTransport::ensure_imem_booted(uint32_t timeout_ms, std::string* err) {
     if (err) *err = "VFIO DMA faulted after prior timeout; recreate context";
     return false;
   }
-  if (imem_booted) return true;
+  if (imem_booted && loaded_prog_kind == prog_kind) return true;
   if (is_mock) {
+    // Invalidate prior resident cache before reloading so failed core_ctrl start
+    // never leaves stale resident metadata behind. Keep exec_seq monotonic.
+    imem_booted = false;
+    loaded_prog_kind = 0u;
+    loaded_imem_bundles = 0u;
+    uint32_t cq_out[8] = {};
+    if (!submit_core_ctrl(kCoreCtrlStart, timeout_ms, cq_out, err)) {
+      return false;
+    }
     imem_booted = true;
+    loaded_prog_kind = prog_kind;
+    loaded_imem_bundles = (prog_kind == 2u)
+        ? freetile::kV5eImemBundlesQuantQ8
+        : ((prog_kind == 3u) ? freetile::kV5eImemBundlesQuantQ4
+                             : freetile::kV5eImemBundlesBf16);
     return true;
   }
   if (!ring_ready || !host_stage_mem || host_stage_size < kResidentImemBytes) {
@@ -1389,13 +1648,26 @@ bool VfioTransport::ensure_imem_booted(uint32_t timeout_ms, std::string* err) {
     return false;
   }
 
-  const std::vector<VliwBundle> imem_prog = emit_v5e_resident_matmul_imem();
+  std::vector<VliwBundle> imem_prog;
+  if (prog_kind == 2u) {
+    imem_prog = emit_v5e_resident_freetile_quant_imem(/*is_q4=*/false);
+  } else if (prog_kind == 3u) {
+    imem_prog = emit_v5e_resident_freetile_quant_imem(/*is_q4=*/true);
+  } else {
+    imem_prog = emit_v5e_resident_freetile_bf16_imem();
+  }
   const size_t prog_bytes = imem_prog.size() * sizeof(VliwBundle);
-  if (imem_prog.size() != kResidentImemBundles || prog_bytes != kResidentImemBytes ||
-      (prog_bytes % kImemDmaAlignBytes) != 0 || prog_bytes > host_stage_size) {
-    if (err) *err = "Resident IMEM stub size or alignment invariant violated";
+  if (prog_bytes == 0 || (prog_bytes % kImemDmaAlignBytes) != 0 ||
+      prog_bytes > host_stage_size) {
+    if (err) *err = "Resident IMEM program size or alignment invariant violated";
     return false;
   }
+
+  // Invalidate cached resident program before modifying IMEM so a failed DMA
+  // upload or core-start never leaves stale resident metadata behind.
+  imem_booted = false;
+  loaded_prog_kind = 0u;
+  loaded_imem_bundles = 0u;
 
   std::memcpy(host_stage_mem, imem_prog.data(), prog_bytes);
   if (!dma_host_to_imem(host_stage_iova, /*dst_imem=*/0ULL, prog_bytes, timeout_ms, err)) {
@@ -1405,8 +1677,45 @@ bool VfioTransport::ensure_imem_booted(uint32_t timeout_ms, std::string* err) {
   if (!submit_core_ctrl(kCoreCtrlStart, timeout_ms, cq_out, err)) {
     return false;
   }
+  // Keep exec_seq monotonic across resident program switches so sync[0x1f9]
+  // from a prior program's completion can never false-match the next launch.
   imem_booted = true;
-  exec_seq = 0;
+  loaded_prog_kind = prog_kind;
+  loaded_imem_bundles = static_cast<uint32_t>(imem_prog.size());
+  return true;
+}
+
+bool VfioTransport::ensure_quant_constants(uint32_t timeout_ms, std::string* err) {
+  last_op_oom = false;
+  if (quant_const_hbm != 0) return true;
+  uint64_t hbm_addr = 0;
+  if (!hbm_alloc.alloc(40960u, 4096u, &hbm_addr)) {
+    last_op_oom = true;
+    if (err) *err = "Out of device HBM for quantized dequant constants (40 KiB)";
+    return false;
+  }
+  if (is_mock) {
+    if (mock_quant_const_upload_fail) {
+      hbm_alloc.free(hbm_addr);
+      if (err) *err = "Injected mock failure uploading quantized dequant constants";
+      return false;
+    }
+    quant_const_hbm = hbm_addr;
+    return true;
+  }
+  if (!host_stage_mem || host_stage_size < 40960u) {
+    hbm_alloc.free(hbm_addr);
+    if (err) *err = "Host DMA staging too small for quantized dequant constants";
+    return false;
+  }
+  init_quant_const_vregs_40kib(host_stage_mem);
+  if (!dma_h2d_sync(host_stage_iova, hbm_addr, 40960u, 0x10u, 0u, timeout_ms, err)) {
+    if (!dma_faulted) {
+      hbm_alloc.free(hbm_addr);
+    }
+    return false;
+  }
+  quant_const_hbm = hbm_addr;
   return true;
 }
 
@@ -1418,10 +1727,16 @@ void VfioTransport::teardown_imem_state() {
     if (scratch_lhs_hbm != 0) {
       hbm_alloc.free(scratch_lhs_hbm);
     }
+    if (quant_const_hbm != 0) {
+      hbm_alloc.free(quant_const_hbm);
+    }
   }
   scratch_rhs_hbm = 0;
   scratch_lhs_hbm = 0;
+  quant_const_hbm = 0;
   imem_booted = false;
+  loaded_prog_kind = 0;
+  loaded_imem_bundles = 0;
   exec_seq = 0;
 }
 

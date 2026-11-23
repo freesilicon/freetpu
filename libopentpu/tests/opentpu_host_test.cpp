@@ -1483,9 +1483,99 @@ static void test_vfio_imem_lifecycle_mock() {
   OT_CHECK(ctx->transport.scratch_lhs_hbm != 0 && ctx->transport.scratch_rhs_hbm != 0);
   OT_CHECK(ctx->transport.hbm_alloc.used_bytes() == 2u * ot::kTile128x128Bf16Bytes);
 
+  // 1) Monotonic exec_seq & cached loaded_imem_bundles across BF16 -> Q8 -> Q4 -> BF16 switches.
+  OT_CHECK(ctx->transport.loaded_prog_kind == 1u);
+  OT_CHECK(ctx->transport.loaded_imem_bundles == ot::freetile::kV5eImemBundlesBf16);
+  ctx->transport.exec_seq = ctx->transport.next_exec_seq();
+  OT_CHECK(ctx->transport.exec_seq == 1u);
+  OT_CHECK(ctx->transport.ensure_imem_program(2u, 1000u, &err));
+  OT_CHECK(ctx->transport.imem_booted && ctx->transport.loaded_prog_kind == 2u);
+  OT_CHECK(ctx->transport.loaded_imem_bundles == ot::freetile::kV5eImemBundlesQuantQ8);
+  OT_CHECK(ctx->transport.exec_seq == 1u && ctx->transport.next_exec_seq() == 2u);
+  ctx->transport.exec_seq = ctx->transport.next_exec_seq();
+  OT_CHECK(ctx->transport.ensure_imem_program(3u, 1000u, &err));
+  OT_CHECK(ctx->transport.imem_booted && ctx->transport.loaded_prog_kind == 3u);
+  OT_CHECK(ctx->transport.loaded_imem_bundles == ot::freetile::kV5eImemBundlesQuantQ4);
+  OT_CHECK(ctx->transport.exec_seq == 2u && ctx->transport.next_exec_seq() == 3u);
+  OT_CHECK(ctx->transport.ensure_imem_program(1u, 1000u, &err));
+  OT_CHECK(ctx->transport.imem_booted && ctx->transport.loaded_prog_kind == 1u);
+  OT_CHECK(ctx->transport.loaded_imem_bundles == ot::freetile::kV5eImemBundlesBf16);
+  OT_CHECK(ctx->transport.exec_seq == 2u);
+  ctx->transport.exec_seq = 0xffffffffu;
+  OT_CHECK(ctx->transport.next_exec_seq() == 1u);
+  ctx->transport.exec_seq = 2u;
+
+  // 2) Failed core-start during IMEM program switch must invalidate the old cache.
+  ctx->transport.mock_core_ctrl_fail = true;
+  err.clear();
+  OT_CHECK(!ctx->transport.ensure_imem_program(2u, 1000u, &err));
+  OT_CHECK(!ctx->transport.imem_booted && ctx->transport.loaded_prog_kind == 0u &&
+           ctx->transport.loaded_imem_bundles == 0u);
+  ctx->transport.mock_core_ctrl_fail = false;
+  OT_CHECK(ctx->transport.ensure_imem_program(2u, 1000u, &err));
+  OT_CHECK(ctx->transport.imem_booted && ctx->transport.loaded_prog_kind == 2u);
+
+  // 2b) ensure_quant_constants HBM OOM must set last_op_oom, and upload failure must
+  //     leave quant_const_hbm == 0 without leaking the HBM allocation.
+  {
+    const uint64_t used_before = ctx->transport.hbm_alloc.used_bytes();
+    ctx->transport.mock_quant_const_upload_fail = true;
+    err.clear();
+    OT_CHECK(!ctx->transport.ensure_quant_constants(1000u, &err));
+    OT_CHECK(!ctx->transport.last_op_oom);
+    OT_CHECK(ctx->transport.quant_const_hbm == 0ULL);
+    OT_CHECK(ctx->transport.hbm_alloc.used_bytes() == used_before);
+    ctx->transport.mock_quant_const_upload_fail = false;
+
+    const uint64_t avail =
+        ctx->transport.hbm_alloc.capacity_bytes() - ctx->transport.hbm_alloc.used_bytes();
+    uint64_t filler_addr = 0;
+    const uint64_t fill_sz = (avail > 16384ULL) ? ((avail - 16384ULL) & ~4095ULL) : 0ULL;
+    OT_CHECK(fill_sz > 0ULL && ctx->transport.hbm_alloc.alloc(fill_sz, 4096ULL, &filler_addr));
+    err.clear();
+    OT_CHECK(!ctx->transport.ensure_quant_constants(1000u, &err));
+    OT_CHECK(ctx->transport.last_op_oom);
+    OT_CHECK(ctx->transport.quant_const_hbm == 0ULL);
+    ctx->transport.hbm_alloc.free(filler_addr);
+    OT_CHECK(ctx->transport.ensure_quant_constants(1000u, &err));
+    OT_CHECK(!ctx->transport.last_op_oom && ctx->transport.quant_const_hbm != 0ULL);
+  }
+
   uint32_t cq[8] = {};
   OT_CHECK(ctx->transport.submit_exec_sync(7u, 1000u, cq, &err));
   OT_CHECK(cq[4] == 1u && cq[5] == 7u);
+  OT_CHECK(!ctx->transport.last_op_timed_out);
+
+  // 3) EXEC polling deadline expiration must report timeout (OT_ERR_TIMEOUT) & quiesce,
+  //    while non-timeout EXEC poll failures must ALSO fault & quiesce (OT_ERR_DEVICE).
+  OT_CHECK(ot::classify_transport_error(true, true) == OT_ERR_TIMEOUT);
+  OT_CHECK(ot::classify_transport_error(false, true) == OT_ERR_DEVICE);
+  OT_CHECK(ot::classify_transport_error(false, false) == OT_ERR_IOCTL);
+  ctx->transport.mock_exec_timeout = true;
+  err.clear();
+  OT_CHECK(!ctx->transport.submit_exec_sync(8u, 10u, cq, &err));
+  OT_CHECK(ctx->transport.dma_faulted);
+  OT_CHECK(ctx->transport.last_op_timed_out);
+  OT_CHECK(!ctx->transport.imem_booted && ctx->transport.loaded_prog_kind == 0u);
+  OT_CHECK(err.find("EXEC completion timeout") != std::string::npos);
+  OT_CHECK(ot::classify_transport_error(ctx->transport.last_op_timed_out,
+                                        ctx->transport.dma_faulted) == OT_ERR_TIMEOUT);
+  ctx->transport.dma_faulted = false;
+  ctx->transport.last_op_timed_out = false;
+  ctx->transport.mock_exec_timeout = false;
+
+  OT_CHECK(ctx->transport.ensure_imem_program(1u, 1000u, &err));
+  ctx->transport.mock_exec_poll_error = true;
+  err.clear();
+  OT_CHECK(!ctx->transport.submit_exec_sync(9u, 10u, cq, &err));
+  OT_CHECK(ctx->transport.dma_faulted);
+  OT_CHECK(!ctx->transport.last_op_timed_out);
+  OT_CHECK(!ctx->transport.imem_booted && ctx->transport.loaded_prog_kind == 0u);
+  OT_CHECK(err.find("device quiesced") != std::string::npos);
+  OT_CHECK(ot::classify_transport_error(ctx->transport.last_op_timed_out,
+                                        ctx->transport.dma_faulted) == OT_ERR_DEVICE);
+  ctx->transport.dma_faulted = false;
+  ctx->transport.mock_exec_poll_error = false;
 
   ctx->transport.teardown_imem_state();
   OT_CHECK(!ctx->transport.imem_booted);
@@ -1579,6 +1669,1603 @@ static void test_resident_imem_stub_structure() {
   printf("[PASS] test_resident_imem_stub_structure\n");
 }
 
+static void test_freetile_descriptor_and_planner() {
+  const ot_freetile_gemm_desc_t cdesc = ot_freetile_gemm_desc_default(128u, 4096u, 4096u);
+  OT_CHECK(cdesc.struct_size == sizeof(ot_freetile_gemm_desc_t));
+  OT_CHECK(cdesc.tile.block_m == 128u && cdesc.tile.block_k == 128u && cdesc.tile.block_n == 128u);
+  OT_CHECK(cdesc.tile.vmem_double_buffer == 1u && cdesc.tile.k_loop_accum_f32 == 1u);
+
+  const auto fdesc = ot::freetile::TileKernelDescriptor::from_c_desc(cdesc);
+  const ot::freetile::LoweringPlan bf16_plan = ot::freetile::plan_v5e_tile_gemm(fdesc);
+  OT_CHECK(bf16_plan.valid);
+  OT_CHECK(bf16_plan.tiles_m == 1u && bf16_plan.tiles_k == 32u && bf16_plan.tiles_n == 32u);
+  OT_CHECK(bf16_plan.vmem.stages == 2u);
+  OT_CHECK(bf16_plan.desc.block_spec.vmem_double_buffer);
+  OT_CHECK(bf16_plan.vmem.acc_vmem_bytes == 0u);  // Accumulators live in v48..v63 registers
+  OT_CHECK(bf16_plan.vmem.total_vmem_bytes == 2u * (32768u + 32768u) + 32768u);
+  OT_CHECK(bf16_plan.vmem.total_vmem_bytes <= 16u * 1024u * 1024u);
+
+  // Multi-K BF16 always emits 2-stage ping-pong VMEM and FP32 K-accumulation even if hints are 0;
+  // single-K BF16 uses only stage 0 (1 stage).
+  ot_freetile_gemm_desc_t bf16_hint0 = ot_freetile_gemm_desc_default(128u, 512u, 256u);
+  bf16_hint0.tile.vmem_double_buffer = 0u;
+  bf16_hint0.tile.k_loop_accum_f32 = 0u;
+  const ot::freetile::LoweringPlan bf16_hint0_plan =
+      ot::freetile::plan_v5e_tile_gemm(ot::freetile::TileKernelDescriptor::from_c_desc(bf16_hint0));
+  OT_CHECK(bf16_hint0_plan.valid);
+  OT_CHECK(bf16_hint0_plan.vmem.stages == 2u);
+  OT_CHECK(bf16_hint0_plan.desc.block_spec.vmem_double_buffer);
+  OT_CHECK(bf16_hint0_plan.desc.block_spec.k_loop_accum_f32);
+  OT_CHECK(bf16_hint0_plan.vmem.total_vmem_bytes == bf16_plan.vmem.total_vmem_bytes);
+
+  const ot_freetile_gemm_desc_t bf16_k1 = ot_freetile_gemm_desc_default(256u, 128u, 256u);
+  const ot::freetile::LoweringPlan bf16_k1_plan =
+      ot::freetile::plan_v5e_tile_gemm(ot::freetile::TileKernelDescriptor::from_c_desc(bf16_k1));
+  OT_CHECK(bf16_k1_plan.valid);
+  OT_CHECK(bf16_k1_plan.vmem.stages == 1u);
+  OT_CHECK(!bf16_k1_plan.desc.block_spec.vmem_double_buffer);
+  OT_CHECK(bf16_k1_plan.vmem.acc_vmem_bytes == 0u);
+  OT_CHECK(bf16_k1_plan.vmem.total_vmem_bytes == 1u * (32768u + 32768u) + 32768u);
+
+  ot_freetile_gemm_desc_t q4 = ot_freetile_gemm_desc_default(128u, 512u, 512u);
+  q4.rhs_dtype = OT_DTYPE_Q4_0;
+  q4.quant_mode = OT_QUANT_BLOCK_32;
+  q4.quant_group_size = OT_QK8_0;
+  const ot::freetile::LoweringPlan q4_plan =
+      ot::freetile::plan_v5e_tile_gemm(ot::freetile::TileKernelDescriptor::from_c_desc(q4));
+  OT_CHECK(q4_plan.valid);
+  // Quantized IMEM kernel is single-stage: 32 KiB LHS + 8 KiB Q4 + 32 KiB cleared scale window
+  // + 32 KiB dequant BF16 staging + 36 KiB constants + 32 KiB OUT (0 VMEM for register acc).
+  OT_CHECK(q4_plan.vmem.stages == 1u);
+  OT_CHECK(!q4_plan.desc.block_spec.vmem_double_buffer);
+  OT_CHECK(q4_plan.vmem.rhs_vmem_bytes == 8192u);
+  OT_CHECK(q4_plan.vmem.scale_vmem_bytes == 32768u);
+  OT_CHECK(q4_plan.vmem.dequant_vmem_bytes == 32768u);
+  OT_CHECK(q4_plan.vmem.const_vmem_bytes == 36864u);
+  OT_CHECK(q4_plan.vmem.acc_vmem_bytes == 0u);
+  OT_CHECK(q4_plan.vmem.total_vmem_bytes ==
+           32768u + 8192u + 32768u + 32768u + 36864u + 32768u);
+  const uint64_t expected_q4_512_hbm =
+      4ULL * (128ULL * 512ULL * 2ULL) +       // tiles_n * A
+      1ULL * (512ULL * 512ULL / 2ULL) +       // tiles_m * B_q4
+      (128ULL * 512ULL * 2ULL) +              // C
+      (1ULL * 4ULL * 4ULL) * 1024ULL +        // 1 KiB scale tile per (m,n,k) iter
+      1ULL * 36864ULL;                        // 36 KiB constants per launch chunk
+  OT_CHECK(q4_plan.hbm_bytes_moved == expected_q4_512_hbm);
+  OT_CHECK(q4_plan.hbm_bytes_moved < bf16_plan.hbm_bytes_moved);
+
+  // Verify O(1) closed-form count_v5e_launch_chunks matches the reference chunking loop
+  // across an exhaustive grid including remainder m_chunks and k_tiles >= max_iters.
+  auto ref_launch_chunks = [](uint32_t mt, uint32_t kt, uint32_t nt, uint32_t lim) -> uint64_t {
+    const uint32_t m_step = (kt >= lim) ? 1u : std::min(mt, std::max(1u, lim / kt));
+    const uint32_t n_base = (kt >= lim) ? 1u : std::max(1u, lim / kt);
+    uint64_t c = 0ULL;
+    for (uint32_t ms = 0u; ms < mt;) {
+      const uint32_t mc = std::min(m_step, mt - ms);
+      const uint32_t n_max = std::max(1u, n_base / mc);
+      for (uint32_t ns = 0u; ns < nt;) {
+        ns += std::min(n_max, nt - ns);
+        ++c;
+      }
+      ms += mc;
+    }
+    return c;
+  };
+  const uint32_t ms_grid[] = {1u, 2u, 3u, 5u, 7u, 13u, 32u};
+  const uint32_t ks_grid[] = {1u, 2u, 3u, 7u, 16u, 32u, 64u, 128u, 513u, 1023u, 1024u, 1025u, 2048u};
+  const uint32_t ns_grid[] = {1u, 2u, 3u, 5u, 9u, 32u, 65u};
+  for (uint32_t mt : ms_grid) {
+    for (uint32_t kt : ks_grid) {
+      for (uint32_t nt : ns_grid) {
+        OT_CHECK(ot::freetile::count_v5e_launch_chunks(mt, kt, nt) ==
+                 ref_launch_chunks(mt, kt, nt, ot::freetile::kV5eMaxItersPerLaunch));
+      }
+    }
+  }
+  OT_CHECK(ot::freetile::count_v5e_launch_chunks(8192u, 1024u, 8192u) == 67108864ULL);
+
+  // Multi-chunk quantized shape (2*32*32 = 2048 iters -> 2 launch chunks of 36 KiB constants).
+  ot_freetile_gemm_desc_t q8_2c = ot_freetile_gemm_desc_default(256u, 4096u, 4096u);
+  q8_2c.rhs_dtype = OT_DTYPE_Q8_0;
+  q8_2c.quant_mode = OT_QUANT_BLOCK_32;
+  q8_2c.quant_group_size = OT_QK8_0;
+  const ot::freetile::LoweringPlan q8_2c_plan =
+      ot::freetile::plan_v5e_tile_gemm(ot::freetile::TileKernelDescriptor::from_c_desc(q8_2c));
+  OT_CHECK(q8_2c_plan.valid);
+  OT_CHECK(ot::freetile::count_v5e_launch_chunks(2u, 32u, 32u) == 2u);
+  const uint64_t expected_q8_2c_hbm =
+      32ULL * (256ULL * 4096ULL * 2ULL) +
+      2ULL * (4096ULL * 4096ULL) +
+      (256ULL * 4096ULL * 2ULL) +
+      (2ULL * 32ULL * 32ULL) * 1024ULL +
+      2ULL * 36864ULL;
+  OT_CHECK(q8_2c_plan.hbm_bytes_moved == expected_q8_2c_hbm);
+
+  // Reserved Q4_K / BLOCK_256 and unsupported quantization descriptors must be rejected by planner.
+  ot_freetile_gemm_desc_t q4k = ot_freetile_gemm_desc_default(128u, 256u, 256u);
+  q4k.rhs_dtype = OT_DTYPE_Q4_K;
+  q4k.quant_mode = OT_QUANT_BLOCK_256;
+  q4k.quant_group_size = 256u;
+  OT_CHECK(!ot::freetile::plan_v5e_tile_gemm(
+                ot::freetile::TileKernelDescriptor::from_c_desc(q4k))
+                .valid);
+
+  ot_freetile_gemm_desc_t i8_none = ot_freetile_gemm_desc_default(128u, 256u, 256u);
+  i8_none.rhs_dtype = OT_DTYPE_INT8;
+  i8_none.quant_mode = OT_QUANT_NONE;
+  OT_CHECK(!ot::freetile::plan_v5e_tile_gemm(
+                ot::freetile::TileKernelDescriptor::from_c_desc(i8_none))
+                .valid);
+
+  ot_freetile_gemm_desc_t bf16_badq = ot_freetile_gemm_desc_default(128u, 256u, 256u);
+  bf16_badq.quant_mode = OT_QUANT_BLOCK_32;
+  OT_CHECK(!ot::freetile::plan_v5e_tile_gemm(
+                ot::freetile::TileKernelDescriptor::from_c_desc(bf16_badq))
+                .valid);
+
+  ot_freetile_gemm_desc_t q8_bad_sd = q8_2c;
+  q8_bad_sd.scale_dtype = OT_DTYPE_INT8;
+  OT_CHECK(!ot::freetile::plan_v5e_tile_gemm(
+                ot::freetile::TileKernelDescriptor::from_c_desc(q8_bad_sd))
+                .valid);
+
+  // High-bit-polluted uint32_t descriptor fields must NOT silently narrow to valid 8-bit enums.
+  {
+    ot_freetile_gemm_desc_t trunc_sd = q8_2c;
+    trunc_sd.scale_dtype = 257u;  // (uint8_t)257 == OT_DTYPE_F32
+    OT_CHECK(!ot::freetile::plan_v5e_tile_gemm(
+                  ot::freetile::TileKernelDescriptor::from_c_desc(trunc_sd))
+                  .valid);
+    ot_freetile_gemm_desc_t trunc_rhs = q8_2c;
+    trunc_rhs.rhs_dtype = 257u;
+    OT_CHECK(!ot::freetile::plan_v5e_tile_gemm(
+                  ot::freetile::TileKernelDescriptor::from_c_desc(trunc_rhs))
+                  .valid);
+    ot_freetile_gemm_desc_t trunc_lhs = q8_2c;
+    trunc_lhs.lhs_dtype = 256u;  // (uint8_t)256 == OT_DTYPE_BF16
+    OT_CHECK(!ot::freetile::plan_v5e_tile_gemm(
+                  ot::freetile::TileKernelDescriptor::from_c_desc(trunc_lhs))
+                  .valid);
+    ot_freetile_gemm_desc_t trunc_qm = q8_2c;
+    trunc_qm.quant_mode = 259u;  // (uint8_t)259 == OT_QUANT_BLOCK_32
+    const auto trunc_qm_desc = ot::freetile::TileKernelDescriptor::from_c_desc(trunc_qm);
+    OT_CHECK(trunc_qm_desc.quant.mode == OT_QUANT_NONE && trunc_qm_desc.has_invalid_c_field);
+    OT_CHECK(!ot::freetile::plan_v5e_tile_gemm(trunc_qm_desc).valid);
+  }
+
+  // Valid lowering plans must populate imem_bundles matching the exact emitted IMEM kernel size.
+  OT_CHECK(bf16_plan.imem_bundles > 0u &&
+           bf16_plan.imem_bundles == ot::emit_v5e_imem_for_freetile(bf16_plan).size());
+  OT_CHECK(bf16_k1_plan.imem_bundles > 0u &&
+           bf16_k1_plan.imem_bundles == ot::emit_v5e_imem_for_freetile(bf16_k1_plan).size());
+  OT_CHECK(q8_2c_plan.imem_bundles > 0u &&
+           q8_2c_plan.imem_bundles == ot::emit_v5e_imem_for_freetile(q8_2c_plan).size());
+  OT_CHECK(q4_plan.imem_bundles > 0u &&
+           q4_plan.imem_bundles == ot::emit_v5e_imem_for_freetile(q4_plan).size());
+
+  // Quantized planner must also normalize k_loop_accum_f32 to true (matching emitted FP32 accum).
+  {
+    ot_freetile_gemm_desc_t q4_acc0 = q4;
+    q4_acc0.tile.k_loop_accum_f32 = 0u;
+    const ot::freetile::LoweringPlan q4_acc0_plan =
+        ot::freetile::plan_v5e_tile_gemm(ot::freetile::TileKernelDescriptor::from_c_desc(q4_acc0));
+    OT_CHECK(q4_acc0_plan.valid);
+    OT_CHECK(q4_acc0_plan.desc.block_spec.k_loop_accum_f32);
+  }
+
+  OT_CHECK(q8_2c_plan.vmem.total_vmem_bytes ==
+           32768u + 16384u + 32768u + 32768u + 36864u + 32768u);
+
+  ot_freetile_gemm_desc_t bad = ot_freetile_gemm_desc_default(128u, 130u, 128u);
+  const ot::freetile::LoweringPlan bad_plan =
+      ot::freetile::plan_v5e_tile_gemm(ot::freetile::TileKernelDescriptor::from_c_desc(bad));
+  OT_CHECK(!bad_plan.valid);
+  printf("[PASS] test_freetile_descriptor_and_planner\n");
+}
+
+static void test_freetile_vliw_emitters_and_packing() {
+  const auto bf16_prog = ot::emit_v5e_resident_freetile_bf16_imem();
+  const auto q8_prog = ot::emit_v5e_resident_freetile_quant_imem(/*is_q4=*/false);
+  const auto q4_prog = ot::emit_v5e_resident_freetile_quant_imem(/*is_q4=*/true);
+
+  OT_CHECK(bf16_prog.size() == ot::freetile::kV5eImemBundlesBf16);
+  OT_CHECK(q8_prog.size() == ot::freetile::kV5eImemBundlesQuantQ8);
+  OT_CHECK(q4_prog.size() == ot::freetile::kV5eImemBundlesQuantQ4);
+
+  // Verify zero-alloc init_quant_const_vregs_40kib matches tile_pack_128x128_bf16 + FP32 constants.
+  {
+    std::vector<uint8_t> got_40k(40960u, 0xaau);
+    ot::init_quant_const_vregs_40kib(got_40k.data());
+    std::vector<uint16_t> sel_rm(128u * 128u, 0u);
+    for (uint32_t r = 0; r < 128u; ++r) sel_rm[r * 128u + (r >> 5)] = 0x3f80u;
+    std::vector<uint16_t> sel_ref(128u * 128u, 0u);
+    ot::tile_pack_128x128_bf16(sel_rm.data(), sel_ref.data());
+    OT_CHECK(std::memcmp(got_40k.data(), sel_ref.data(), 32768u) == 0);
+    for (uint32_t i = 0; i < 1024u; ++i) {
+      uint32_t v0 = 0, v1 = 0;
+      std::memcpy(&v0, got_40k.data() + 32768u + i * 4u, 4u);
+      std::memcpy(&v1, got_40k.data() + 36864u + i * 4u, 4u);
+      OT_CHECK(v0 == 0xc5100000u && v1 == 0xc3080000u);
+    }
+  }
+
+  for (const auto* prog : {&bf16_prog, &q8_prog, &q4_prog}) {
+    OT_CHECK(!prog->empty());
+    OT_CHECK((prog->size() * sizeof(ot::VliwBundle)) % ot::kImemDmaAlignBytes == 0u);
+    OT_CHECK(prog->size() <= 1024u);  // Strictly fits within 64 KiB resident IMEM window
+    OT_CHECK((*prog)[0].w[2] == 0x3b00060fu);
+    OT_CHECK((*prog)[25].w[2] == 0x3a8ca30fu);
+  }
+
+  ot_freetile_gemm_desc_t cq8 = ot_freetile_gemm_desc_default(128u, 256u, 256u);
+  cq8.rhs_dtype = OT_DTYPE_Q8_0;
+  cq8.quant_mode = OT_QUANT_BLOCK_32;
+  const ot::freetile::LoweringPlan p =
+      ot::freetile::plan_v5e_tile_gemm(ot::freetile::TileKernelDescriptor::from_c_desc(cq8));
+  OT_CHECK(ot::emit_v5e_imem_for_freetile(p).size() == q8_prog.size());
+
+  // Verify T(8,128)(4,1) int8 and q4 packing byte lanes.
+  std::vector<int8_t> i8_rm(128u * 128u, 0);
+  i8_rm[0u * 128u + 3u] = 17;     // r=0  -> chunk=0, sublane=0, byte 0
+  i8_rm[8u * 128u + 3u] = -5;     // r=8  -> chunk=0, sublane=0, byte 1
+  i8_rm[16u * 128u + 3u] = 42;    // r=16 -> chunk=0, sublane=0, byte 2
+  i8_rm[24u * 128u + 3u] = -128;  // r=24 -> chunk=0, sublane=0, byte 3
+  std::vector<uint32_t> i8_tiled(4096u, 0u);
+  ot::tile_pack_128x128_i8(i8_rm.data(), i8_tiled.data());
+  OT_CHECK((i8_tiled[3] & 0xffu) == 17u);
+  OT_CHECK(static_cast<int8_t>((i8_tiled[3] >> 8) & 0xffu) == -5);
+  OT_CHECK(((i8_tiled[3] >> 16) & 0xffu) == 42u);
+  OT_CHECK(static_cast<int8_t>((i8_tiled[3] >> 24) & 0xffu) == -128);
+
+  std::vector<int8_t> q4_rm(128u * 128u, 0);
+  q4_rm[0u * 128u + 5u] = -3;   // chunk4=0, lo_nib -> (-3 + 8) = 5
+  q4_rm[32u * 128u + 5u] = 6;   // chunk4=0, hi_nib -> (6 + 8) = 14
+  std::vector<uint32_t> q4_tiled(2048u, 0u);
+  ot::tile_pack_128x128_q4(q4_rm.data(), q4_tiled.data());
+  OT_CHECK((q4_tiled[5] & 0xfu) == 5u);
+  OT_CHECK(((q4_tiled[5] >> 4) & 0xfu) == 14u);
+
+  const auto ldesc = ot::OtV5eLaunchDesc::build_ex(
+      0x1000ULL, 0x2000ULL, 0x3000ULL, 0ULL, 7u, 2u, 4u, 3u, 1u, 0x4000ULL, 0x5000ULL, 32u);
+  auto read32 = [&](size_t off) {
+    uint32_t v = 0;
+    std::memcpy(&v, ldesc.bytes + off, 4);
+    return v;
+  };
+  OT_CHECK(read32(0x178u) == 2u && read32(0x180u) == 4u && read32(0x184u) == 3u);
+  OT_CHECK(read32(0x188u) == 1u && read32(0x18cu) == (0x4000u >> 9) &&
+           read32(0x194u) == (0x5000u >> 9) && read32(0x198u) == 32u);
+  printf("[PASS] test_freetile_vliw_emitters_and_packing\n");
+}
+
+static uint16_t host_f32_to_bf16(float f) {
+  uint32_t u = 0;
+  std::memcpy(&u, &f, 4);
+  u += 0x7fffu + ((u >> 16) & 1u);
+  return static_cast<uint16_t>(u >> 16);
+}
+
+static float host_bf16_to_f32(uint16_t b) {
+  uint32_t u = static_cast<uint32_t>(b) << 16;
+  float f = 0.0f;
+  std::memcpy(&f, &u, 4);
+  return f;
+}
+
+static void test_mock_multitile_and_quant_matmul() {
+  ot_config_t cfg = ot_config_default();
+  cfg.mock_mode = 1u;
+  ot_context_t* ctx = nullptr;
+  OT_CHECK(ot_context_create(&cfg, &ctx) == OT_OK && ctx != nullptr);
+
+  // 1) Multi-tile 256 x 256 x 256 BF16 GEMM via ot_matmul_bf16_ex
+  const uint32_t M = 256u, K = 256u, N = 256u;
+  std::vector<uint16_t> a_bf16(M * K), b_bf16(K * N), c_got(M * N, 0u);
+  for (size_t i = 0; i < a_bf16.size(); ++i) {
+    a_bf16[i] = host_f32_to_bf16(static_cast<float>(static_cast<int>(i % 13) - 6) * 0.125f);
+  }
+  for (size_t i = 0; i < b_bf16.size(); ++i) {
+    b_bf16[i] = host_f32_to_bf16(static_cast<float>(static_cast<int>(i % 11) - 5) * 0.25f);
+  }
+  ot_buffer_t* ba = nullptr;
+  ot_buffer_t* bb = nullptr;
+  ot_buffer_t* bc = nullptr;
+  OT_CHECK(ot_buffer_alloc(ctx, a_bf16.size() * 2u, &ba) == OT_OK);
+  OT_CHECK(ot_buffer_alloc(ctx, b_bf16.size() * 2u, &bb) == OT_OK);
+  OT_CHECK(ot_buffer_alloc(ctx, c_got.size() * 2u, &bc) == OT_OK);
+  OT_CHECK(ot_buffer_h2d(ctx, ba, a_bf16.data(), a_bf16.size() * 2u) == OT_OK);
+  OT_CHECK(ot_buffer_h2d(ctx, bb, b_bf16.data(), b_bf16.size() * 2u) == OT_OK);
+
+  const ot_freetile_gemm_desc_t bf_desc = ot_freetile_gemm_desc_default(M, K, N);
+  ot_exec_stats_t stats{};
+  OT_CHECK(ot_matmul_bf16_ex(ctx, ba, bb, bc, &bf_desc, &stats) == OT_OK);
+  OT_CHECK(stats.tiles_m == 2u && stats.tiles_k == 2u && stats.tiles_n == 2u);
+  OT_CHECK(ot_buffer_d2h(ctx, bc, c_got.data(), c_got.size() * 2u) == OT_OK);
+
+  for (uint32_t m = 0; m < M; ++m) {
+    for (uint32_t n = 0; n < N; ++n) {
+      float acc = 0.0f;
+      for (uint32_t k = 0; k < K; ++k) {
+        acc += host_bf16_to_f32(a_bf16[m * K + k]) * host_bf16_to_f32(b_bf16[k * N + n]);
+      }
+      OT_CHECK(c_got[m * N + n] == host_f32_to_bf16(acc));
+    }
+  }
+  ot_buffer_free(bc);
+  ot_buffer_free(bb);
+  ot_buffer_free(ba);
+
+  // 2) Quantized 128 x 256 x 256 Q8_0 (block-32) & Q4_0 (block-32) & INT8_PER_CHANNEL
+  const uint32_t QM = 128u, QK = 256u, QN = 256u;
+  std::vector<uint16_t> qa(QM * QK);
+  for (size_t i = 0; i < qa.size(); ++i) {
+    qa[i] = host_f32_to_bf16(static_cast<float>(static_cast<int>(i % 9) - 4) * 0.125f);
+  }
+  std::vector<int8_t> w_i8(QK * QN);
+  std::vector<uint8_t> w_q4(QK * QN / 2u, 0u);
+  std::vector<float> sc_blk((QK / 32u) * QN);
+  for (size_t i = 0; i < sc_blk.size(); ++i) {
+    sc_blk[i] = 0.0625f * static_cast<float>((i % 7u) + 1u);
+  }
+  for (uint32_t k = 0; k < QK; ++k) {
+    for (uint32_t n = 0; n < QN; ++n) {
+      const int8_t v = static_cast<int8_t>(static_cast<int>((k * 13u + n * 7u) % 15u) - 7);
+      w_i8[k * QN + n] = v;
+      const size_t lin = static_cast<size_t>(k) * QN + n;
+      const uint32_t nib = static_cast<uint32_t>(v + 8) & 0xfu;
+      w_q4[lin >> 1] |= static_cast<uint8_t>((lin & 1u) ? (nib << 4) : nib);
+    }
+  }
+
+  ot_buffer_t *bqa = nullptr, *bqi8 = nullptr, *bqq4 = nullptr, *bqsc = nullptr, *bqout = nullptr;
+  OT_CHECK(ot_buffer_alloc(ctx, qa.size() * 2u, &bqa) == OT_OK);
+  OT_CHECK(ot_buffer_alloc(ctx, w_i8.size(), &bqi8) == OT_OK);
+  OT_CHECK(ot_buffer_alloc(ctx, w_q4.size(), &bqq4) == OT_OK);
+  OT_CHECK(ot_buffer_alloc(ctx, sc_blk.size() * sizeof(float), &bqsc) == OT_OK);
+  OT_CHECK(ot_buffer_alloc(ctx, QM * QN * 2u, &bqout) == OT_OK);
+  OT_CHECK(ot_buffer_h2d(ctx, bqa, qa.data(), qa.size() * 2u) == OT_OK);
+  OT_CHECK(ot_buffer_h2d(ctx, bqi8, w_i8.data(), w_i8.size()) == OT_OK);
+  OT_CHECK(ot_buffer_h2d(ctx, bqq4, w_q4.data(), w_q4.size()) == OT_OK);
+  OT_CHECK(ot_buffer_h2d(ctx, bqsc, sc_blk.data(), sc_blk.size() * sizeof(float)) == OT_OK);
+
+  ot_freetile_gemm_desc_t q8d = ot_freetile_gemm_desc_default(QM, QK, QN);
+  q8d.rhs_dtype = OT_DTYPE_Q8_0;
+  q8d.quant_mode = OT_QUANT_BLOCK_32;
+  q8d.quant_group_size = OT_QK8_0;
+  q8d.scale_dtype = OT_DTYPE_F32;
+  OT_CHECK(ot_matmul_quant(ctx, bqa, bqi8, bqsc, bqout, &q8d, &stats) == OT_OK);
+  const uint64_t expected_q8_hbm =
+      2ULL * (static_cast<uint64_t>(QM) * QK * 2ULL) +
+      1ULL * (static_cast<uint64_t>(QK) * QN) +
+      (static_cast<uint64_t>(QM) * QN * 2ULL) +
+      (1ULL * 2ULL * 2ULL) * 1024ULL +
+      36864ULL;
+  OT_CHECK(stats.hbm_bytes_moved == expected_q8_hbm);
+  std::vector<uint16_t> out_q8(QM * QN, 0u);
+  OT_CHECK(ot_buffer_d2h(ctx, bqout, out_q8.data(), out_q8.size() * 2u) == OT_OK);
+
+  ot_freetile_gemm_desc_t q4d = ot_freetile_gemm_desc_default(QM, QK, QN);
+  q4d.rhs_dtype = OT_DTYPE_Q4_0;
+  q4d.quant_mode = OT_QUANT_BLOCK_32;
+  q4d.quant_group_size = OT_QK8_0;
+  q4d.scale_dtype = OT_DTYPE_F32;
+  OT_CHECK(ot_matmul_quant(ctx, bqa, bqq4, bqsc, bqout, &q4d, &stats) == OT_OK);
+  const uint64_t expected_q4_hbm =
+      2ULL * (static_cast<uint64_t>(QM) * QK * 2ULL) +
+      1ULL * (static_cast<uint64_t>(QK) * QN / 2ULL) +
+      (static_cast<uint64_t>(QM) * QN * 2ULL) +
+      (1ULL * 2ULL * 2ULL) * 1024ULL +
+      36864ULL;
+  OT_CHECK(stats.hbm_bytes_moved == expected_q4_hbm);
+  std::vector<uint16_t> out_q4(QM * QN, 0u);
+  OT_CHECK(ot_buffer_d2h(ctx, bqout, out_q4.data(), out_q4.size() * 2u) == OT_OK);
+
+  // Q4 values stay within [-7, 7], matching w_i8 above cleanly!
+  std::vector<uint16_t> ref_q(QM * QN, 0u);
+  for (uint32_t m = 0; m < QM; ++m) {
+    for (uint32_t n = 0; n < QN; ++n) {
+      float acc = 0.0f;
+      for (uint32_t k = 0; k < QK; ++k) {
+        const float sc = host_bf16_to_f32(host_f32_to_bf16(sc_blk[(k / 32u) * QN + n]));
+        const float wf = host_bf16_to_f32(host_f32_to_bf16(static_cast<float>(w_i8[k * QN + n]) * sc));
+        acc += host_bf16_to_f32(qa[m * QK + k]) * wf;
+      }
+      ref_q[m * QN + n] = host_f32_to_bf16(acc);
+      OT_CHECK(out_q8[m * QN + n] == ref_q[m * QN + n]);
+      OT_CHECK(out_q4[m * QN + n] == ref_q[m * QN + n]);
+    }
+  }
+
+  // 3) Scale dtype must depend strictly on desc->scale_dtype, never buffer capacity:
+  //    store BF16 scales inside a 2x-oversized (float-sized) buffer.
+  {
+    std::vector<uint16_t> sc_bf16(sc_blk.size());
+    for (size_t i = 0; i < sc_blk.size(); ++i) sc_bf16[i] = host_f32_to_bf16(sc_blk[i]);
+    ot_buffer_t* bqsc_big = nullptr;
+    OT_CHECK(ot_buffer_alloc(ctx, sc_blk.size() * sizeof(float), &bqsc_big) == OT_OK);
+    // Fill upper half with poison so accidental FP32 decoding would corrupt scales.
+    std::vector<uint8_t> sc_bytes(sc_blk.size() * sizeof(float), 0x7fu);
+    std::memcpy(sc_bytes.data(), sc_bf16.data(), sc_bf16.size() * sizeof(uint16_t));
+    OT_CHECK(ot_buffer_h2d(ctx, bqsc_big, sc_bytes.data(), sc_bytes.size()) == OT_OK);
+
+    ot_freetile_gemm_desc_t q8_bf16sc = q8d;
+    q8_bf16sc.scale_dtype = OT_DTYPE_BF16;
+    std::vector<uint16_t> out_bf16sc(QM * QN, 0u);
+    OT_CHECK(ot_matmul_quant(ctx, bqa, bqi8, bqsc_big, bqout, &q8_bf16sc, nullptr) == OT_OK);
+    OT_CHECK(ot_buffer_d2h(ctx, bqout, out_bf16sc.data(), out_bf16sc.size() * 2u) == OT_OK);
+    OT_CHECK(out_bf16sc == ref_q);
+
+    ot_freetile_gemm_desc_t bad_sd = q8d;
+    bad_sd.scale_dtype = OT_DTYPE_INT8;
+    OT_CHECK(ot_matmul_quant(ctx, bqa, bqi8, bqsc_big, bqout, &bad_sd, nullptr) ==
+             OT_ERR_INVALID_ARG);
+    bad_sd.scale_dtype = 257u;  // Must reject non-narrowed uint32_t enum value
+    OT_CHECK(ot_matmul_quant(ctx, bqa, bqi8, bqsc_big, bqout, &bad_sd, nullptr) ==
+             OT_ERR_INVALID_ARG);
+    ot_freetile_gemm_desc_t bad_rhs = q8d;
+    bad_rhs.rhs_dtype = 257u;
+    OT_CHECK(ot_matmul_quant(ctx, bqa, bqi8, bqsc_big, bqout, &bad_rhs, nullptr) ==
+             OT_ERR_INVALID_ARG);
+    ot_buffer_free(bqsc_big);
+  }
+
+  // 4) Inline interleaved ot_block_q8_0_t and ot_block_q4_0_t (rhs_scales == NULL),
+  //    both non-transposed [K/32, N] and transposed [N, K/32].
+  for (uint8_t trans = 0u; trans <= 1u; ++trans) {
+    const size_t k_blks = QK / OT_QK8_0;
+    std::vector<ot_block_q8_0_t> blk_q8(k_blks * QN);
+    std::vector<ot_block_q4_0_t> blk_q4(k_blks * QN);
+    std::memset(blk_q8.data(), 0, blk_q8.size() * sizeof(ot_block_q8_0_t));
+    std::memset(blk_q4.data(), 0, blk_q4.size() * sizeof(ot_block_q4_0_t));
+    for (size_t sg = 0; sg < k_blks; ++sg) {
+      for (size_t n = 0; n < QN; ++n) {
+        const size_t bidx = trans ? (n * k_blks + sg) : (sg * QN + n);
+        const uint16_t d = host_f32_to_bf16(sc_blk[sg * QN + n]);
+        blk_q8[bidx].d = d;
+        blk_q4[bidx].d = d;
+        for (size_t ki = 0; ki < OT_QK8_0; ++ki) {
+          const int8_t v = w_i8[(sg * OT_QK8_0 + ki) * QN + n];
+          blk_q8[bidx].qs[ki] = v;
+          const uint32_t nib = static_cast<uint32_t>(v + 8) & 0xfu;
+          blk_q4[bidx].qs[ki >> 1] |= static_cast<uint8_t>((ki & 1u) ? (nib << 4) : nib);
+        }
+      }
+    }
+    ot_buffer_t *bbq8 = nullptr, *bbq4 = nullptr;
+    OT_CHECK(ot_buffer_alloc(ctx, blk_q8.size() * sizeof(ot_block_q8_0_t), &bbq8) == OT_OK);
+    OT_CHECK(ot_buffer_alloc(ctx, blk_q4.size() * sizeof(ot_block_q4_0_t), &bbq4) == OT_OK);
+    OT_CHECK(ot_buffer_h2d(ctx, bbq8, blk_q8.data(), blk_q8.size() * sizeof(ot_block_q8_0_t)) ==
+             OT_OK);
+    OT_CHECK(ot_buffer_h2d(ctx, bbq4, blk_q4.data(), blk_q4.size() * sizeof(ot_block_q4_0_t)) ==
+             OT_OK);
+
+    ot_freetile_gemm_desc_t d_q8 = q8d;
+    d_q8.tile.rhs_transposed = trans;
+    std::vector<uint16_t> got_blk(QM * QN, 0u);
+    OT_CHECK(ot_matmul_quant(ctx, bqa, bbq8, nullptr, bqout, &d_q8, nullptr) == OT_OK);
+    OT_CHECK(ot_buffer_d2h(ctx, bqout, got_blk.data(), got_blk.size() * 2u) == OT_OK);
+    OT_CHECK(got_blk == ref_q);
+
+    ot_freetile_gemm_desc_t d_q4 = q4d;
+    d_q4.tile.rhs_transposed = trans;
+    std::fill(got_blk.begin(), got_blk.end(), 0u);
+    OT_CHECK(ot_matmul_quant(ctx, bqa, bbq4, nullptr, bqout, &d_q4, nullptr) == OT_OK);
+    OT_CHECK(ot_buffer_d2h(ctx, bqout, got_blk.data(), got_blk.size() * 2u) == OT_OK);
+    OT_CHECK(got_blk == ref_q);
+
+    ot_buffer_free(bbq4);
+    ot_buffer_free(bbq8);
+  }
+
+  // Reserved Q4_K / BLOCK_256 must return OT_ERR_UNSUPPORTED; INT8 BLOCK_32 without scales invalid.
+  {
+    ot_freetile_gemm_desc_t q4kd = q4d;
+    q4kd.rhs_dtype = OT_DTYPE_Q4_K;
+    q4kd.quant_mode = OT_QUANT_BLOCK_256;
+    q4kd.quant_group_size = 256u;
+    OT_CHECK(ot_matmul_quant(ctx, bqa, bqq4, bqsc, bqout, &q4kd, nullptr) == OT_ERR_UNSUPPORTED);
+
+    ot_freetile_gemm_desc_t i8_nosc = q8d;
+    i8_nosc.rhs_dtype = OT_DTYPE_INT8;
+    OT_CHECK(ot_matmul_quant(ctx, bqa, bqi8, nullptr, bqout, &i8_nosc, nullptr) ==
+             OT_ERR_INVALID_ARG);
+
+    // INT8 with OT_QUANT_NONE must be rejected by both planner and ot_matmul_quant.
+    ot_freetile_gemm_desc_t i8_none = q8d;
+    i8_none.rhs_dtype = OT_DTYPE_INT8;
+    i8_none.quant_mode = OT_QUANT_NONE;
+    i8_none.quant_group_size = 0u;
+    OT_CHECK(!ot::freetile::plan_v5e_tile_gemm(
+                  ot::freetile::TileKernelDescriptor::from_c_desc(i8_none))
+                  .valid);
+    OT_CHECK(ot_matmul_quant(ctx, bqa, bqi8, bqsc, bqout, &i8_none, nullptr) ==
+             OT_ERR_INVALID_ARG);
+
+    // Huge dimensions with small buffers must fail fast on buffer-size validation
+    // (O(1), never spinning in launch planning).
+    ot_freetile_gemm_desc_t huge_q = ot_freetile_gemm_desc_default(1048576u, 131072u, 1048576u);
+    huge_q.rhs_dtype = OT_DTYPE_Q8_0;
+    huge_q.quant_mode = OT_QUANT_BLOCK_32;
+    huge_q.quant_group_size = OT_QK8_0;
+    OT_CHECK(ot_matmul_quant(ctx, bqa, bqi8, bqsc, bqout, &huge_q, nullptr) ==
+             OT_ERR_INVALID_ARG);
+  }
+
+  // 5) Transposed RHS in BF16 GEMM (rhs_transposed = 1, [N, K] storage) + validation.
+  {
+    const uint32_t TM = 128u, TK = 256u, TN = 128u;
+    std::vector<uint16_t> ta(TM * TK), tb_nk(TN * TK), tc_got(TM * TN, 0u), tc_ref(TM * TN, 0u);
+    for (uint32_t m = 0; m < TM; ++m) {
+      for (uint32_t k = 0; k < TK; ++k) {
+        ta[m * TK + k] =
+            host_f32_to_bf16(static_cast<float>(static_cast<int>((m * 7u + k * 3u) % 13u) - 6) * 0.125f);
+      }
+    }
+    for (uint32_t n = 0; n < TN; ++n) {
+      for (uint32_t k = 0; k < TK; ++k) {
+        tb_nk[n * TK + k] =
+            host_f32_to_bf16(static_cast<float>(static_cast<int>((n * 11u + k * 5u) % 11u) - 5) * 0.25f);
+      }
+    }
+    for (uint32_t m = 0; m < TM; ++m) {
+      for (uint32_t n = 0; n < TN; ++n) {
+        float acc = 0.0f;
+        for (uint32_t k = 0; k < TK; ++k) {
+          acc += host_bf16_to_f32(ta[m * TK + k]) * host_bf16_to_f32(tb_nk[n * TK + k]);
+        }
+        tc_ref[m * TN + n] = host_f32_to_bf16(acc);
+      }
+    }
+    ot_buffer_t *bta = nullptr, *btb = nullptr, *btc = nullptr;
+    OT_CHECK(ot_buffer_alloc(ctx, ta.size() * 2u, &bta) == OT_OK);
+    OT_CHECK(ot_buffer_alloc(ctx, tb_nk.size() * 2u, &btb) == OT_OK);
+    OT_CHECK(ot_buffer_alloc(ctx, tc_got.size() * 2u, &btc) == OT_OK);
+    OT_CHECK(ot_buffer_h2d(ctx, bta, ta.data(), ta.size() * 2u) == OT_OK);
+    OT_CHECK(ot_buffer_h2d(ctx, btb, tb_nk.data(), tb_nk.size() * 2u) == OT_OK);
+
+    ot_freetile_gemm_desc_t tdesc = ot_freetile_gemm_desc_default(TM, TK, TN);
+    tdesc.tile.rhs_transposed = 1u;
+    OT_CHECK(ot_matmul_bf16_ex(ctx, bta, btb, btc, &tdesc, nullptr) == OT_OK);
+    OT_CHECK(ot_buffer_d2h(ctx, btc, tc_got.data(), tc_got.size() * 2u) == OT_OK);
+    OT_CHECK(tc_got == tc_ref);
+
+    // Invalid rhs_transposed > 1 must fail.
+    tdesc.tile.rhs_transposed = 2u;
+    OT_CHECK(ot_matmul_bf16_ex(ctx, bta, btb, btc, &tdesc, nullptr) == OT_ERR_INVALID_ARG);
+    ot_freetile_gemm_desc_t bad_qt = q8d;
+    bad_qt.tile.rhs_transposed = 2u;
+    OT_CHECK(ot_matmul_quant(ctx, bqa, bqi8, bqsc, bqout, &bad_qt, nullptr) == OT_ERR_INVALID_ARG);
+
+    ot_buffer_free(btc);
+    ot_buffer_free(btb);
+    ot_buffer_free(bta);
+  }
+
+  // 6) Reusing a 256x256 tiled output buffer for smaller tiled (128x128) and
+  //    non-tile-aligned (64x64) GEMMs must preserve the entire logical suffix,
+  //    and feeding a tiled output back as an aliased / mismatched-shape input
+  //    must read logical row-major elements without double-tiling.
+  {
+    const uint32_t BM = 256u, BK = 256u, BN = 256u;
+    std::vector<uint16_t> ma(BM * BK), mb(BK * BN);
+    for (size_t i = 0; i < ma.size(); ++i) {
+      ma[i] = host_f32_to_bf16(static_cast<float>(static_cast<int>(i % 13u) - 6) * 0.125f);
+    }
+    for (size_t i = 0; i < mb.size(); ++i) {
+      mb[i] = host_f32_to_bf16(static_cast<float>(static_cast<int>(i % 11u) - 5) * 0.125f);
+    }
+    ot_buffer_t *bma = nullptr, *bmb = nullptr, *bmc = nullptr;
+    OT_CHECK(ot_buffer_alloc(ctx, ma.size() * 2u, &bma) == OT_OK);
+    OT_CHECK(ot_buffer_alloc(ctx, mb.size() * 2u, &bmb) == OT_OK);
+    OT_CHECK(ot_buffer_alloc(ctx, BM * BN * 2u, &bmc) == OT_OK);
+    OT_CHECK(ot_buffer_h2d(ctx, bma, ma.data(), ma.size() * 2u) == OT_OK);
+    OT_CHECK(ot_buffer_h2d(ctx, bmb, mb.data(), mb.size() * 2u) == OT_OK);
+
+    const ot_freetile_gemm_desc_t d256 = ot_freetile_gemm_desc_default(BM, BK, BN);
+    OT_CHECK(ot_matmul_bf16_ex(ctx, bma, bmb, bmc, &d256, nullptr) == OT_OK);
+    std::vector<uint16_t> ref_256(BM * BN, 0u);
+    OT_CHECK(ot_buffer_d2h(ctx, bmc, ref_256.data(), ref_256.size() * 2u) == OT_OK);
+
+    // 6-prefix) Partial ot_buffer_d2h reads across tile boundaries (odd, 2B, mid-row,
+    //           cross-N-tile, cross-M-tile) must match full readback byte-for-byte.
+    {
+      const size_t prefix_sizes[] = {
+          1u, 2u, 3u, 127u, 256u, 257u, 300u, 512u, 513u,
+          127u * 512u + 300u, 128u * 512u, 128u * 512u + 1u,
+          128u * 512u + 256u, 128u * 512u + 300u, BM * BN * 2u - 1u};
+      const uint8_t* ref_bytes = reinterpret_cast<const uint8_t*>(ref_256.data());
+      for (size_t psz : prefix_sizes) {
+        std::vector<uint8_t> got_buf(psz + 4u, 0x5au);
+        // Test unaligned dst pointer (+1) as well as aligned pointer.
+        OT_CHECK(ot_buffer_d2h(ctx, bmc, got_buf.data() + 1u, psz) == OT_OK);
+        OT_CHECK(got_buf[0] == 0x5au);
+        OT_CHECK(std::memcmp(got_buf.data() + 1u, ref_bytes, psz) == 0);
+        OT_CHECK(got_buf[psz + 1u] == 0x5au);
+      }
+    }
+
+    // 6a) Reuse 256x256 tiled `bmc` as output for 128x128x128 GEMM (with `bmc` also aliased as LHS!).
+    std::vector<uint16_t> ref_128(128u * 128u, 0u);
+    for (uint32_t m = 0; m < 128u; ++m) {
+      for (uint32_t n = 0; n < 128u; ++n) {
+        float acc = 0.0f;
+        for (uint32_t k = 0; k < 128u; ++k) {
+          acc += host_bf16_to_f32(ref_256[m * 128u + k]) * host_bf16_to_f32(mb[k * 128u + n]);
+        }
+        ref_128[m * 128u + n] = host_f32_to_bf16(acc);
+      }
+    }
+    const ot_freetile_gemm_desc_t d128 = ot_freetile_gemm_desc_default(128u, 128u, 128u);
+    OT_CHECK(ot_matmul_bf16_ex(ctx, bmc, bmb, bmc, &d128, nullptr) == OT_OK);
+    std::vector<uint16_t> after_128(BM * BN, 0u);
+    OT_CHECK(ot_buffer_d2h(ctx, bmc, after_128.data(), after_128.size() * 2u) == OT_OK);
+    OT_CHECK(std::memcmp(after_128.data(), ref_128.data(), ref_128.size() * 2u) == 0);
+    OT_CHECK(std::memcmp(after_128.data() + ref_128.size(),
+                         ref_256.data() + ref_128.size(),
+                         (BM * BN - ref_128.size()) * 2u) == 0);
+
+    // 6b) Re-populate 256x256 tiled `bmc`, then overwrite prefix with non-tile-aligned 64x64x64 GEMM,
+    //     and verify wall_us and hbm_bytes_moved are populated on non-tile-aligned mock stats.
+    OT_CHECK(ot_matmul_bf16_ex(ctx, bma, bmb, bmc, &d256, nullptr) == OT_OK);
+    const ot_freetile_gemm_desc_t d64 = ot_freetile_gemm_desc_default(64u, 64u, 64u);
+    ot_exec_stats_t stats_64{};
+    OT_CHECK(ot_matmul_bf16_ex(ctx, bma, bmb, bmc, &d64, &stats_64) == OT_OK);
+    OT_CHECK(stats_64.wall_us > 0u);
+    OT_CHECK(stats_64.hbm_bytes_moved == 3ULL * 64ULL * 64ULL * sizeof(uint16_t));
+    std::vector<uint16_t> after_64(BM * BN, 0u);
+    OT_CHECK(ot_buffer_d2h(ctx, bmc, after_64.data(), after_64.size() * 2u) == OT_OK);
+    OT_CHECK(std::memcmp(after_64.data() + (64u * 64u),
+                         ref_256.data() + (64u * 64u),
+                         (BM * BN - 64u * 64u) * 2u) == 0);
+
+    // 6c) Feed a tiled 256x128 buffer as mismatched-shape 128x256 LHS (and aliased output) to ot_matmul_quant.
+    const ot_freetile_gemm_desc_t d256x128 = ot_freetile_gemm_desc_default(256u, 128u, 128u);
+    OT_CHECK(ot_matmul_bf16_ex(ctx, bma, bmb, bmc, &d256x128, nullptr) == OT_OK);
+    std::vector<uint16_t> lhs_logical(128u * 256u, 0u);
+    OT_CHECK(ot_buffer_d2h(ctx, bmc, lhs_logical.data(), lhs_logical.size() * 2u) == OT_OK);
+    std::vector<uint16_t> ref_q_alias(QM * QN, 0u);
+    for (uint32_t m = 0; m < QM; ++m) {
+      for (uint32_t n = 0; n < QN; ++n) {
+        float acc = 0.0f;
+        for (uint32_t k = 0; k < QK; ++k) {
+          const float sc = host_bf16_to_f32(host_f32_to_bf16(sc_blk[(k / 32u) * QN + n]));
+          const float wf = host_bf16_to_f32(host_f32_to_bf16(static_cast<float>(w_i8[k * QN + n]) * sc));
+          acc += host_bf16_to_f32(lhs_logical[m * QK + k]) * wf;
+        }
+        ref_q_alias[m * QN + n] = host_f32_to_bf16(acc);
+      }
+    }
+    OT_CHECK(ot_matmul_quant(ctx, bmc, bqi8, bqsc, bmc, &q8d, nullptr) == OT_OK);
+    std::vector<uint16_t> got_q_alias(QM * QN, 0u);
+    OT_CHECK(ot_buffer_d2h(ctx, bmc, got_q_alias.data(), got_q_alias.size() * 2u) == OT_OK);
+    OT_CHECK(got_q_alias == ref_q_alias);
+
+    ot_buffer_free(bmc);
+    ot_buffer_free(bmb);
+    ot_buffer_free(bma);
+  }
+
+  ot_buffer_free(bqout);
+  ot_buffer_free(bqsc);
+  ot_buffer_free(bqq4);
+  ot_buffer_free(bqi8);
+  ot_buffer_free(bqa);
+  ot_context_destroy(ctx);
+  printf("[PASS] test_mock_multitile_and_quant_matmul\n");
+}
+
+static void test_multigen_hal_geometry_and_rebar() {
+  ot_device_geometry_t g5 = {}, g6 = {}, g7 = {};
+  OT_CHECK(ot_chip_geometry_for_device_id(0x0063u, &g5) == OT_OK);
+  OT_CHECK(g5.chip_gen == OT_CHIP_V5E);
+  OT_CHECK(g5.mxu_rows == 128u && g5.mxu_cols == 128u);
+  OT_CHECK(g5.logical_chiplets_per_pci_func == 1u);
+  OT_CHECK(g5.hbm_bytes_per_logical_chiplet == (16ULL << 30));
+
+  OT_CHECK(ot_chip_geometry_for_device_id(0x006fu, &g6) == OT_OK);
+  OT_CHECK(g6.chip_gen == OT_CHIP_V6E);
+  OT_CHECK(g6.mxu_rows == 256u && g6.mxu_cols == 256u);
+  OT_CHECK(g6.num_mxus_per_logical_chiplet == 2u);
+  OT_CHECK(g6.logical_chiplets_per_pci_func == 1u);
+  OT_CHECK(g6.hbm_bytes_per_logical_chiplet == (32ULL << 30));
+  OT_CHECK(ot_chip_geometry_for_device_id(0x006eu, &g6) == OT_OK);
+  OT_CHECK(g6.chip_gen == OT_CHIP_V6E && g6.num_mxus_per_logical_chiplet == 2u);
+
+  for (uint16_t did7 : {static_cast<uint16_t>(0x0075u), static_cast<uint16_t>(0x0076u)}) {
+    OT_CHECK(ot_chip_geometry_for_device_id(did7, &g7) == OT_OK);
+    OT_CHECK(g7.chip_gen == OT_CHIP_TPU7X);
+    OT_CHECK(g7.pci_device_id == did7);
+    OT_CHECK(g7.mxu_rows == 256u && g7.mxu_cols == 256u);
+    OT_CHECK(g7.fp8_inner_rows == 4u && g7.fp8_inner_cols == 1u);
+    OT_CHECK(g7.supports_native_fp8 == 1u);
+    OT_CHECK(g7.logical_chiplets_per_pci_func == 2u);
+    OT_CHECK(g7.num_mxus_per_logical_chiplet == 2u);
+    OT_CHECK(g7.hbm_bytes_per_logical_chiplet == (96ULL << 30));
+    OT_CHECK(g7.vmem_bytes_per_logical_chiplet == (64ULL << 20));
+  }
+
+  ot_device_geometry_t gbad = {};
+  OT_CHECK(ot_chip_geometry_for_device_id(0x9999u, &gbad) == OT_ERR_UNSUPPORTED);
+
+  // 64-bit Resizable BAR mmap safety clamping.
+  OT_CHECK(ot::clamp_bar_mmap_len(96ULL << 30, 16ULL << 20) == (16ULL << 20));
+  OT_CHECK(ot::clamp_bar_mmap_len(16ULL << 20, 64ULL << 20) == (16ULL << 20));
+  OT_CHECK(ot::clamp_bar_mmap_len(0ULL, 16ULL << 20) == 0u);
+
+  // Synthetic PCIe Extended Config Space (0x100 = dummy 0x0001 -> next 0x180,
+  // 0x180 = Resizable BAR 0x0015 with 1 BAR entry: BAR2 size_pow=17 -> 128 GiB).
+  uint8_t cfg_space[512];
+  std::memset(cfg_space, 0, sizeof(cfg_space));
+  auto write_le32 = [&](size_t off, uint32_t v) {
+    std::memcpy(cfg_space + off, &v, sizeof(v));
+  };
+  write_le32(0x100u, (0x180u << 20) | 0x0001u);
+  write_le32(0x180u, 0x0015u);
+  write_le32(0x184u, 0x00020000u);  // Cap register
+  write_le32(0x188u, (1u << 5) | (17u << 8) | 2u);  // 1 BAR, BAR2, 2^(20+17)=128 GiB
+
+  ot::RebarCapabilityInfo rebar;
+  OT_CHECK(ot::parse_pcie_rebar_cap(cfg_space, sizeof(cfg_space), &rebar));
+  OT_CHECK(rebar.found && rebar.cap_offset == 0x180u && rebar.num_bars == 1u);
+  OT_CHECK(rebar.bar_bytes[2] == (128ULL << 30));
+
+  // Mock chip selection for tpu7x via OPENTPU_MOCK_CHIP.
+  setenv("OPENTPU_MOCK_CHIP", "tpu7x", 1);
+  ot_config_t cfg = ot_config_default();
+  cfg.mock_mode = 1;
+  ot_context_t* ctx = nullptr;
+  OT_CHECK(ot_context_create(&cfg, &ctx) == OT_OK && ctx != nullptr);
+  ot_device_info_t info = {};
+  OT_CHECK(ot_device_get_info(ctx, &info) == OT_OK);
+  OT_CHECK(info.chip_gen == OT_CHIP_TPU7X && info.device_id == 0x0075u);
+  ot_device_geometry_t ctx_geom = {};
+  OT_CHECK(ot_device_get_geometry(ctx, &ctx_geom) == OT_OK);
+  OT_CHECK(ctx_geom.logical_chiplets_per_pci_func == 2u && ctx_geom.mxu_rows == 256u &&
+           ctx_geom.vmem_bytes_per_logical_chiplet == (64ULL << 20));
+  ot_context_destroy(ctx);
+  unsetenv("OPENTPU_MOCK_CHIP");
+
+  // Guest VM VFIO Ironwood PCI Device ID (0x0076) via OPENTPU_MOCK_DEVICE_ID.
+  setenv("OPENTPU_MOCK_DEVICE_ID", "0x0076", 1);
+  ctx = nullptr;
+  OT_CHECK(ot_context_create(&cfg, &ctx) == OT_OK && ctx != nullptr);
+  OT_CHECK(ot_device_get_info(ctx, &info) == OT_OK);
+  OT_CHECK(info.chip_gen == OT_CHIP_TPU7X && info.device_id == 0x0076u &&
+           info.vmem_bytes == (64ULL << 20) && info.num_mxus == 2u);
+  ot_context_destroy(ctx);
+  unsetenv("OPENTPU_MOCK_DEVICE_ID");
+
+  printf("[PASS] test_multigen_hal_geometry_and_rebar\n");
+}
+
+static void test_pjrt_dual_chiplet_tpu7x_enumeration() {
+  const PJRT_Api* api = GetPjrtApi();
+  OT_CHECK(api != nullptr);
+
+  auto check_topology = [&](const char* topo_name, size_t expected_logical) {
+    setenv("OPENTPU_MOCK", "1", 1);
+    setenv("OPENTPU_MOCK_CHIP", "tpu7x", 1);
+    setenv("OPENTPU_MOCK_TOPOLOGY", topo_name, 1);
+
+    PJRT_Client_Create_Args c_args = {};
+    c_args.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
+    OT_CHECK(api->PJRT_Client_Create(&c_args) == nullptr && c_args.client != nullptr);
+
+    PJRT_Client_AddressableDevices_Args d_args = {};
+    d_args.struct_size = PJRT_Client_AddressableDevices_Args_STRUCT_SIZE;
+    d_args.client = c_args.client;
+    OT_CHECK(api->PJRT_Client_AddressableDevices(&d_args) == nullptr);
+    OT_CHECK(d_args.num_addressable_devices == expected_logical);
+
+    for (size_t i = 0; i < expected_logical; ++i) {
+      PJRT_Device_GetDescription_Args gd = {};
+      gd.struct_size = PJRT_Device_GetDescription_Args_STRUCT_SIZE;
+      gd.device = d_args.addressable_devices[i];
+      OT_CHECK(api->PJRT_Device_GetDescription(&gd) == nullptr);
+
+      PJRT_DeviceDescription_Id_Args id_args = {};
+      id_args.struct_size = PJRT_DeviceDescription_Id_Args_STRUCT_SIZE;
+      id_args.device_description = gd.device_description;
+      OT_CHECK(api->PJRT_DeviceDescription_Id(&id_args) == nullptr);
+      OT_CHECK(id_args.id == static_cast<int>(i));
+
+      PJRT_DeviceDescription_Kind_Args k_args = {};
+      k_args.struct_size = PJRT_DeviceDescription_Kind_Args_STRUCT_SIZE;
+      k_args.device_description = gd.device_description;
+      OT_CHECK(api->PJRT_DeviceDescription_Kind(&k_args) == nullptr);
+      OT_CHECK(std::string(k_args.device_kind, k_args.device_kind_size) == "TPU v7x");
+
+      PJRT_DeviceDescription_Attributes_Args attr_args = {};
+      attr_args.struct_size = PJRT_DeviceDescription_Attributes_Args_STRUCT_SIZE;
+      attr_args.device_description = gd.device_description;
+      OT_CHECK(api->PJRT_DeviceDescription_Attributes(&attr_args) == nullptr);
+      OT_CHECK(attr_args.num_attributes == 2u);
+      bool saw_coords = false, saw_core = false;
+      for (size_t ai = 0; ai < attr_args.num_attributes; ++ai) {
+        const PJRT_NamedValue& a = attr_args.attributes[ai];
+        std::string aname(a.name, a.name_size);
+        if (aname == "coords") {
+          OT_CHECK(a.type == PJRT_NamedValue_kInt64List && a.value_size == 3u);
+          saw_coords = true;
+        } else if (aname == "core_on_chip") {
+          OT_CHECK(a.type == PJRT_NamedValue_kInt64 &&
+                   a.int64_value == static_cast<int64_t>(i % 2));
+          saw_core = true;
+        }
+      }
+      OT_CHECK(saw_coords && saw_core);
+    }
+
+    std::vector<int> def_assign(expected_logical, -1);
+    PJRT_Client_DefaultDeviceAssignment_Args da_args = {};
+    da_args.struct_size = PJRT_Client_DefaultDeviceAssignment_Args_STRUCT_SIZE;
+    da_args.client = c_args.client;
+    da_args.num_replicas = static_cast<int>(expected_logical);
+    da_args.num_partitions = 1;
+    da_args.default_assignment = def_assign.data();
+    da_args.default_assignment_size = def_assign.size();
+    OT_CHECK(api->PJRT_Client_DefaultDeviceAssignment(&da_args) == nullptr);
+    for (size_t i = 0; i < expected_logical; ++i) {
+      OT_CHECK(def_assign[i] == static_cast<int>(i));
+    }
+
+    PJRT_Client_Destroy_Args cd_args = {};
+    cd_args.struct_size = PJRT_Client_Destroy_Args_STRUCT_SIZE;
+    cd_args.client = c_args.client;
+    OT_CHECK(api->PJRT_Client_Destroy(&cd_args) == nullptr);
+  };
+
+  check_topology("tpu7x-1t", 2u);
+  check_topology("tpu7x-4t", 8u);
+
+  unsetenv("OPENTPU_MOCK_TOPOLOGY");
+  unsetenv("OPENTPU_MOCK_CHIP");
+  unsetenv("OPENTPU_MOCK");
+  printf("[PASS] test_pjrt_dual_chiplet_tpu7x_enumeration\n");
+}
+
+static void test_pjrt_multidevice_isolation_and_topology() {
+  const PJRT_Api* api = GetPjrtApi();
+  OT_CHECK(api != nullptr);
+
+  const char* mlir_4x4 =
+      "module {\n"
+      "  func.func public @main(%a: tensor<4x4xbf16>, %b: tensor<4x4xbf16>) -> tensor<4x4xbf16> {\n"
+      "    %0 = stablehlo.dot_general %a, %b, contracting_dims = [1] x [0] : "
+      "(tensor<4x4xbf16>, tensor<4x4xbf16>) -> tensor<4x4xbf16>\n"
+      "    return %0 : tensor<4x4xbf16>\n"
+      "  }\n"
+      "}\n";
+  PJRT_Program prog = {};
+  prog.struct_size = PJRT_Program_STRUCT_SIZE;
+  prog.code = const_cast<char*>(mlir_4x4);
+  prog.code_size = std::strlen(mlir_4x4);
+  prog.format = "mlir";
+  prog.format_size = 4;
+
+  auto get_mem_used = [&](PJRT_Device* dev) -> int64_t {
+    PJRT_Device_MemoryStats_Args ms = {};
+    ms.struct_size = PJRT_Device_MemoryStats_Args_STRUCT_SIZE;
+    ms.device = dev;
+    OT_CHECK(api->PJRT_Device_MemoryStats(&ms) == nullptr);
+    return ms.bytes_in_use;
+  };
+
+  auto upload_bf16 = [&](PJRT_Client* client, PJRT_Device* dev,
+                         const std::vector<uint16_t>& data,
+                         int64_t rows, int64_t cols) -> PJRT_Buffer* {
+    int64_t dims[2] = {rows, cols};
+    PJRT_Client_BufferFromHostBuffer_Args up = {};
+    up.struct_size = PJRT_Client_BufferFromHostBuffer_Args_STRUCT_SIZE;
+    up.client = client;
+    up.data = data.data();
+    up.type = PJRT_Buffer_Type_BF16;
+    up.dims = dims;
+    up.num_dims = 2;
+    up.host_buffer_semantics = PJRT_HostBufferSemantics_kImmutableUntilTransferCompletes;
+    up.device = dev;
+    OT_CHECK(api->PJRT_Client_BufferFromHostBuffer(&up) == nullptr);
+    if (up.done_with_host_buffer) {
+      PJRT_Event_Destroy_Args ed = {};
+      ed.struct_size = PJRT_Event_Destroy_Args_STRUCT_SIZE;
+      ed.event = up.done_with_host_buffer;
+      OT_CHECK(api->PJRT_Event_Destroy(&ed) == nullptr);
+    }
+    return up.buffer;
+  };
+
+  auto destroy_buf = [&](PJRT_Buffer* b) {
+    if (!b) return;
+    PJRT_Buffer_Destroy_Args bd = {};
+    bd.struct_size = PJRT_Buffer_Destroy_Args_STRUCT_SIZE;
+    bd.buffer = b;
+    OT_CHECK(api->PJRT_Buffer_Destroy(&bd) == nullptr);
+  };
+
+  auto get_err_code = [&](PJRT_Error* err) -> PJRT_Error_Code {
+    PJRT_Error_GetCode_Args gc = {};
+    gc.struct_size = PJRT_Error_GetCode_Args_STRUCT_SIZE;
+    gc.error = err;
+    OT_CHECK(api->PJRT_Error_GetCode(&gc) == nullptr);
+    return gc.code;
+  };
+
+  // 1. Topology serialization & fingerprint must distinguish 2-chiplet vs 8-chiplet layouts.
+  {
+    auto capture_topo = [&](const char* topo_name, std::string* out_ser, uint64_t* out_fp) {
+      setenv("OPENTPU_MOCK", "1", 1);
+      setenv("OPENTPU_MOCK_CHIP", "tpu7x", 1);
+      setenv("OPENTPU_MOCK_TOPOLOGY", topo_name, 1);
+
+      PJRT_Client_Create_Args cc = {};
+      cc.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
+      OT_CHECK(api->PJRT_Client_Create(&cc) == nullptr && cc.client != nullptr);
+
+      PJRT_Client_TopologyDescription_Args td = {};
+      td.struct_size = PJRT_Client_TopologyDescription_Args_STRUCT_SIZE;
+      td.client = cc.client;
+      OT_CHECK(api->PJRT_Client_TopologyDescription(&td) == nullptr && td.topology != nullptr);
+
+      PJRT_TopologyDescription_Serialize_Args ser = {};
+      ser.struct_size = PJRT_TopologyDescription_Serialize_Args_STRUCT_SIZE;
+      ser.topology = td.topology;
+      OT_CHECK(api->PJRT_TopologyDescription_Serialize(&ser) == nullptr);
+      OT_CHECK(ser.serialized_bytes != nullptr && ser.serialized_bytes_size > 0);
+      out_ser->assign(ser.serialized_bytes, ser.serialized_bytes_size);
+      ser.serialized_topology_deleter(ser.serialized_topology);
+
+      PJRT_TopologyDescription_Fingerprint_Args fp = {};
+      fp.struct_size = PJRT_TopologyDescription_Fingerprint_Args_STRUCT_SIZE;
+      fp.topology = td.topology;
+      OT_CHECK(api->PJRT_TopologyDescription_Fingerprint(&fp) == nullptr);
+      *out_fp = fp.fingerprint;
+
+      PJRT_Client_Destroy_Args cd = {};
+      cd.struct_size = PJRT_Client_Destroy_Args_STRUCT_SIZE;
+      cd.client = cc.client;
+      OT_CHECK(api->PJRT_Client_Destroy(&cd) == nullptr);
+    };
+
+    std::string ser_2a, ser_2b, ser_8;
+    uint64_t fp_2a = 0, fp_2b = 0, fp_8 = 0;
+    capture_topo("tpu7x-1t", &ser_2a, &fp_2a);
+    capture_topo("tpu7x-1t", &ser_2b, &fp_2b);
+    capture_topo("tpu7x-4t", &ser_8, &fp_8);
+
+    OT_CHECK(ser_2a == ser_2b && fp_2a == fp_2b);
+    OT_CHECK(ser_2a != ser_8);
+    OT_CHECK(fp_2a != fp_8);
+    OT_CHECK(ser_2a.find("n=2") != std::string::npos);
+    OT_CHECK(ser_8.find("n=8") != std::string::npos);
+  }
+
+  // 2. visible_devices=[1] on 2-chiplet mock must restrict devices, memories, lookup, and default assignment.
+  {
+    setenv("OPENTPU_MOCK", "1", 1);
+    setenv("OPENTPU_MOCK_CHIP", "tpu7x", 1);
+    setenv("OPENTPU_MOCK_TOPOLOGY", "tpu7x-1t", 1);
+
+    // Reject empty, duplicate, negative, and out-of-range visible_devices with INVALID_ARGUMENT.
+    auto check_bad_visible = [&](const int64_t* vals, size_t cnt) {
+      PJRT_NamedValue opt = {};
+      opt.struct_size = PJRT_NamedValue_STRUCT_SIZE;
+      opt.name = "visible_devices";
+      opt.name_size = 15;
+      opt.type = PJRT_NamedValue_kInt64List;
+      opt.int64_array_value = vals;
+      opt.value_size = cnt;
+      PJRT_Client_Create_Args cc = {};
+      cc.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
+      cc.create_options = &opt;
+      cc.num_options = 1;
+      PJRT_Error* e = api->PJRT_Client_Create(&cc);
+      OT_CHECK(e != nullptr);
+      OT_CHECK(get_err_code(e) == PJRT_Error_Code_INVALID_ARGUMENT);
+      destroy_pjrt_error(api, e);
+    };
+    const int64_t dup_vals[2] = {1, 1};
+    const int64_t oor_vals[1] = {2};
+    const int64_t neg_vals[1] = {-1};
+    check_bad_visible(nullptr, 0);
+    check_bad_visible(dup_vals, 2);
+    check_bad_visible(oor_vals, 1);
+    check_bad_visible(neg_vals, 1);
+
+    // Valid visible_devices=[1] -> exposes ONLY device 1 and memory 1, assigns device 1 by default.
+    const int64_t vis1[1] = {1};
+    PJRT_NamedValue opt = {};
+    opt.struct_size = PJRT_NamedValue_STRUCT_SIZE;
+    opt.name = "visible_devices";
+    opt.name_size = 15;
+    opt.type = PJRT_NamedValue_kInt64List;
+    opt.int64_array_value = vis1;
+    opt.value_size = 1;
+    PJRT_Client_Create_Args cc = {};
+    cc.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
+    cc.create_options = &opt;
+    cc.num_options = 1;
+    OT_CHECK(api->PJRT_Client_Create(&cc) == nullptr && cc.client != nullptr);
+
+    PJRT_Client_Devices_Args da = {};
+    da.struct_size = PJRT_Client_Devices_Args_STRUCT_SIZE;
+    da.client = cc.client;
+    OT_CHECK(api->PJRT_Client_Devices(&da) == nullptr);
+    OT_CHECK(da.num_devices == 1u);
+
+    PJRT_Client_AddressableDevices_Args ad = {};
+    ad.struct_size = PJRT_Client_AddressableDevices_Args_STRUCT_SIZE;
+    ad.client = cc.client;
+    OT_CHECK(api->PJRT_Client_AddressableDevices(&ad) == nullptr);
+    OT_CHECK(ad.num_addressable_devices == 1u && ad.addressable_devices[0] == da.devices[0]);
+
+    PJRT_Device_GetDescription_Args gd = {};
+    gd.struct_size = PJRT_Device_GetDescription_Args_STRUCT_SIZE;
+    gd.device = ad.addressable_devices[0];
+    OT_CHECK(api->PJRT_Device_GetDescription(&gd) == nullptr);
+    PJRT_DeviceDescription_Id_Args did = {};
+    did.struct_size = PJRT_DeviceDescription_Id_Args_STRUCT_SIZE;
+    did.device_description = gd.device_description;
+    OT_CHECK(api->PJRT_DeviceDescription_Id(&did) == nullptr);
+    OT_CHECK(did.id == 1);
+
+    PJRT_Client_AddressableMemories_Args am = {};
+    am.struct_size = PJRT_Client_AddressableMemories_Args_STRUCT_SIZE;
+    am.client = cc.client;
+    OT_CHECK(api->PJRT_Client_AddressableMemories(&am) == nullptr);
+    OT_CHECK(am.num_addressable_memories == 1u);
+    PJRT_Memory_Id_Args mid = {};
+    mid.struct_size = PJRT_Memory_Id_Args_STRUCT_SIZE;
+    mid.memory = am.addressable_memories[0];
+    OT_CHECK(api->PJRT_Memory_Id(&mid) == nullptr);
+    OT_CHECK(mid.id == 1);
+
+    PJRT_Client_LookupDevice_Args ld0 = {};
+    ld0.struct_size = PJRT_Client_LookupDevice_Args_STRUCT_SIZE;
+    ld0.client = cc.client;
+    ld0.id = 0;
+    PJRT_Error* ld0_err = api->PJRT_Client_LookupDevice(&ld0);
+    OT_CHECK(ld0_err != nullptr && get_err_code(ld0_err) == PJRT_Error_Code_NOT_FOUND);
+    destroy_pjrt_error(api, ld0_err);
+
+    PJRT_Client_LookupDevice_Args ld1 = {};
+    ld1.struct_size = PJRT_Client_LookupDevice_Args_STRUCT_SIZE;
+    ld1.client = cc.client;
+    ld1.id = 1;
+    OT_CHECK(api->PJRT_Client_LookupDevice(&ld1) == nullptr &&
+             ld1.device == ad.addressable_devices[0]);
+
+    int def_assign[1] = {-1};
+    PJRT_Client_DefaultDeviceAssignment_Args dda = {};
+    dda.struct_size = PJRT_Client_DefaultDeviceAssignment_Args_STRUCT_SIZE;
+    dda.client = cc.client;
+    dda.num_replicas = 1;
+    dda.num_partitions = 1;
+    dda.default_assignment = def_assign;
+    dda.default_assignment_size = 1;
+    OT_CHECK(api->PJRT_Client_DefaultDeviceAssignment(&dda) == nullptr);
+    OT_CHECK(def_assign[0] == 1);
+
+    // Default compile on visible_devices=[1] assigns device 1 and executes cleanly.
+    PJRT_Client_Compile_Args ca = {};
+    ca.struct_size = PJRT_Client_Compile_Args_STRUCT_SIZE;
+    ca.client = cc.client;
+    ca.program = &prog;
+    OT_CHECK(api->PJRT_Client_Compile(&ca) == nullptr && ca.executable != nullptr);
+    PJRT_LoadedExecutable_AddressableDevices_Args lead = {};
+    lead.struct_size = PJRT_LoadedExecutable_AddressableDevices_Args_STRUCT_SIZE;
+    lead.executable = ca.executable;
+    OT_CHECK(api->PJRT_LoadedExecutable_AddressableDevices(&lead) == nullptr);
+    OT_CHECK(lead.num_addressable_devices == 1u &&
+             lead.addressable_devices[0] == ad.addressable_devices[0]);
+
+    std::vector<uint16_t> ones(16, 0x3f80u);
+    PJRT_Buffer* b0 = upload_bf16(cc.client, ad.addressable_devices[0], ones, 4, 4);
+    PJRT_Buffer* b1 = upload_bf16(cc.client, ad.addressable_devices[0], ones, 4, 4);
+    PJRT_Buffer* ins[2] = {b0, b1};
+    PJRT_Buffer* outs[1] = {nullptr};
+    PJRT_Buffer* const* arg_lists[1] = {ins};
+    PJRT_Buffer** const out_lists[1] = {outs};
+    PJRT_ExecuteOptions eopts = {};
+    eopts.struct_size = PJRT_ExecuteOptions_STRUCT_SIZE;
+    PJRT_LoadedExecutable_Execute_Args ex = {};
+    ex.struct_size = PJRT_LoadedExecutable_Execute_Args_STRUCT_SIZE;
+    ex.executable = ca.executable;
+    ex.options = &eopts;
+    ex.argument_lists = arg_lists;
+    ex.num_devices = 1;
+    ex.num_args = 2;
+    ex.output_lists = out_lists;
+    OT_CHECK(api->PJRT_LoadedExecutable_Execute(&ex) == nullptr && outs[0] != nullptr);
+    PJRT_Buffer_Device_Args obd = {};
+    obd.struct_size = PJRT_Buffer_Device_Args_STRUCT_SIZE;
+    obd.buffer = outs[0];
+    OT_CHECK(api->PJRT_Buffer_Device(&obd) == nullptr && obd.device == ad.addressable_devices[0]);
+
+    destroy_buf(b0);
+    destroy_buf(b1);
+    destroy_buf(outs[0]);
+    PJRT_LoadedExecutable_Destroy_Args led = {};
+    led.struct_size = PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
+    led.executable = ca.executable;
+    OT_CHECK(api->PJRT_LoadedExecutable_Destroy(&led) == nullptr);
+    PJRT_Client_Destroy_Args cd = {};
+    cd.struct_size = PJRT_Client_Destroy_Args_STRUCT_SIZE;
+    cd.client = cc.client;
+    OT_CHECK(api->PJRT_Client_Destroy(&cd) == nullptr);
+  }
+
+  // 3. 2-chiplet mock: per-device isolated HBM, 1-replica executable returns 1 device,
+  //    and 2-replica Execute failure on replica 1 leaks zero buffers/events from replica 0.
+  {
+    setenv("OPENTPU_MOCK", "1", 1);
+    setenv("OPENTPU_MOCK_CHIP", "tpu7x", 1);
+    setenv("OPENTPU_MOCK_TOPOLOGY", "tpu7x-1t", 1);
+
+    PJRT_Client_Create_Args cc = {};
+    cc.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
+    OT_CHECK(api->PJRT_Client_Create(&cc) == nullptr && cc.client != nullptr);
+
+    PJRT_Client_AddressableDevices_Args ad = {};
+    ad.struct_size = PJRT_Client_AddressableDevices_Args_STRUCT_SIZE;
+    ad.client = cc.client;
+    OT_CHECK(api->PJRT_Client_AddressableDevices(&ad) == nullptr);
+    OT_CHECK(ad.num_addressable_devices == 2u);
+    PJRT_Device* dev0 = ad.addressable_devices[0];
+    PJRT_Device* dev1 = ad.addressable_devices[1];
+
+    // Isolated mock contexts: uploading to dev0 changes dev0 HBM only, leaving dev1 at 0.
+    std::vector<uint16_t> ones(16, 0x3f80u);
+    std::vector<uint16_t> twos(16, 0x4000u);
+    PJRT_Buffer* d0_a = upload_bf16(cc.client, dev0, ones, 4, 4);
+    PJRT_Buffer* d0_b = upload_bf16(cc.client, dev0, ones, 4, 4);
+    OT_CHECK(get_mem_used(dev0) > 0);
+    OT_CHECK(get_mem_used(dev1) == 0);
+
+    // 1-replica executable on 2-chiplet client must advertise ONLY 1 assigned device and execute with num_devices=1.
+    PJRT_Client_Compile_Args ca1 = {};
+    ca1.struct_size = PJRT_Client_Compile_Args_STRUCT_SIZE;
+    ca1.client = cc.client;
+    ca1.program = &prog;
+    OT_CHECK(api->PJRT_Client_Compile(&ca1) == nullptr && ca1.executable != nullptr);
+
+    PJRT_LoadedExecutable_AddressableDevices_Args lead1 = {};
+    lead1.struct_size = PJRT_LoadedExecutable_AddressableDevices_Args_STRUCT_SIZE;
+    lead1.executable = ca1.executable;
+    OT_CHECK(api->PJRT_LoadedExecutable_AddressableDevices(&lead1) == nullptr);
+    OT_CHECK(lead1.num_addressable_devices == 1u && lead1.addressable_devices[0] == dev0);
+
+    PJRT_Buffer* ins1[2] = {d0_a, d0_b};
+    PJRT_Buffer* outs1[1] = {nullptr};
+    PJRT_Buffer* const* arg_lists1[1] = {ins1};
+    PJRT_Buffer** const out_lists1[1] = {outs1};
+    PJRT_ExecuteOptions eopts = {};
+    eopts.struct_size = PJRT_ExecuteOptions_STRUCT_SIZE;
+    PJRT_LoadedExecutable_Execute_Args ex1 = {};
+    ex1.struct_size = PJRT_LoadedExecutable_Execute_Args_STRUCT_SIZE;
+    ex1.executable = ca1.executable;
+    ex1.options = &eopts;
+    ex1.argument_lists = arg_lists1;
+    ex1.num_devices = 1;
+    ex1.num_args = 2;
+    ex1.output_lists = out_lists1;
+    OT_CHECK(api->PJRT_LoadedExecutable_Execute(&ex1) == nullptr && outs1[0] != nullptr);
+    destroy_buf(outs1[0]);
+
+    PJRT_LoadedExecutable_Destroy_Args led1 = {};
+    led1.struct_size = PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
+    led1.executable = ca1.executable;
+    OT_CHECK(api->PJRT_LoadedExecutable_Destroy(&led1) == nullptr);
+
+    // Reject mismatched num_replicas vs explicit device_assignment with INVALID_ARGUMENT.
+    {
+      // field 3 (exec_build_options): field 4 (num_replicas=2) + field 9 (1x1 device_assignment=[0])
+      const char opt_rep2_da1[] = {
+          0x1a, 0x0c,
+          0x20, 0x02,
+          0x4a, 0x08, 0x08, 0x01, 0x10, 0x01, 0x1a, 0x02, 0x08, 0x00};
+      PJRT_Client_Compile_Args bad_m = {};
+      bad_m.struct_size = PJRT_Client_Compile_Args_STRUCT_SIZE;
+      bad_m.client = cc.client;
+      bad_m.program = &prog;
+      bad_m.compile_options = opt_rep2_da1;
+      bad_m.compile_options_size = sizeof(opt_rep2_da1);
+      PJRT_Error* me = api->PJRT_Client_Compile(&bad_m);
+      OT_CHECK(me != nullptr && get_err_code(me) == PJRT_Error_Code_INVALID_ARGUMENT);
+      destroy_pjrt_error(api, me);
+
+      // field 3 (exec_build_options): field 4 (num_replicas=1) + field 9 (2x1 device_assignment=[0, 1])
+      const char opt_rep1_da2[] = {
+          0x1a, 0x0e,
+          0x20, 0x01,
+          0x4a, 0x0a, 0x08, 0x02, 0x10, 0x01, 0x1a, 0x04, 0x08, 0x00, 0x08, 0x01};
+      bad_m.compile_options = opt_rep1_da2;
+      bad_m.compile_options_size = sizeof(opt_rep1_da2);
+      bad_m.executable = nullptr;
+      me = api->PJRT_Client_Compile(&bad_m);
+      OT_CHECK(me != nullptr && get_err_code(me) == PJRT_Error_Code_INVALID_ARGUMENT);
+      destroy_pjrt_error(api, me);
+    }
+
+    // 2-replica executable: replica 0 valid, replica 1 has shape mismatch -> must fail with zero leaks.
+    const char opt_rep2[] = {0x1a, 0x02, 0x20, 0x02};
+    PJRT_Client_Compile_Args ca2 = {};
+    ca2.struct_size = PJRT_Client_Compile_Args_STRUCT_SIZE;
+    ca2.client = cc.client;
+    ca2.program = &prog;
+    ca2.compile_options = opt_rep2;
+    ca2.compile_options_size = sizeof(opt_rep2);
+    OT_CHECK(api->PJRT_Client_Compile(&ca2) == nullptr && ca2.executable != nullptr);
+
+    PJRT_LoadedExecutable_AddressableDevices_Args lead2 = {};
+    lead2.struct_size = PJRT_LoadedExecutable_AddressableDevices_Args_STRUCT_SIZE;
+    lead2.executable = ca2.executable;
+    OT_CHECK(api->PJRT_LoadedExecutable_AddressableDevices(&lead2) == nullptr);
+    OT_CHECK(lead2.num_addressable_devices == 2u &&
+             lead2.addressable_devices[0] == dev0 &&
+             lead2.addressable_devices[1] == dev1);
+
+    PJRT_Buffer* d1_a = upload_bf16(cc.client, dev1, twos, 4, 4);
+    std::vector<uint16_t> bad_rhs_data(8, 0x4000u);
+    PJRT_Buffer* d1_bad = upload_bf16(cc.client, dev1, bad_rhs_data, 2, 4);
+
+    const int64_t dev0_used_before = get_mem_used(dev0);
+    const int64_t dev1_used_before = get_mem_used(dev1);
+
+    PJRT_Buffer* r0_in[2] = {d0_a, d0_b};
+    PJRT_Buffer* r1_bad_in[2] = {d1_a, d1_bad};
+    PJRT_Buffer* const* bad_arg_lists[2] = {r0_in, r1_bad_in};
+    PJRT_Buffer* r0_out[1] = {nullptr};
+    PJRT_Buffer* r1_out[1] = {nullptr};
+    PJRT_Buffer** const rep_out_lists[2] = {r0_out, r1_out};
+    PJRT_Event* rep_evs[2] = {nullptr, nullptr};
+
+    PJRT_LoadedExecutable_Execute_Args ex_fail = {};
+    ex_fail.struct_size = PJRT_LoadedExecutable_Execute_Args_STRUCT_SIZE;
+    ex_fail.executable = ca2.executable;
+    ex_fail.options = &eopts;
+    ex_fail.argument_lists = bad_arg_lists;
+    ex_fail.num_devices = 2;
+    ex_fail.num_args = 2;
+    ex_fail.output_lists = rep_out_lists;
+    ex_fail.device_complete_events = rep_evs;
+    PJRT_Error* fail_err = api->PJRT_LoadedExecutable_Execute(&ex_fail);
+    OT_CHECK(fail_err != nullptr);
+    OT_CHECK(get_err_code(fail_err) == PJRT_Error_Code_INVALID_ARGUMENT);
+    destroy_pjrt_error(api, fail_err);
+
+    // Caller outputs/events untouched and dev0 HBM released completely (zero leaked buffers/events).
+    OT_CHECK(r0_out[0] == nullptr && r1_out[0] == nullptr);
+    OT_CHECK(rep_evs[0] == nullptr && rep_evs[1] == nullptr);
+    OT_CHECK(get_mem_used(dev0) == dev0_used_before);
+    OT_CHECK(get_mem_used(dev1) == dev1_used_before);
+
+    // Valid 2-replica Execute succeeds on both devices independently.
+    PJRT_Buffer* d1_b = upload_bf16(cc.client, dev1, twos, 4, 4);
+    PJRT_Buffer* r1_ok_in[2] = {d1_a, d1_b};
+    PJRT_Buffer* const* ok_arg_lists[2] = {r0_in, r1_ok_in};
+    PJRT_LoadedExecutable_Execute_Args ex_ok = ex_fail;
+    ex_ok.argument_lists = ok_arg_lists;
+    OT_CHECK(api->PJRT_LoadedExecutable_Execute(&ex_ok) == nullptr);
+    OT_CHECK(r0_out[0] != nullptr && r1_out[0] != nullptr);
+    OT_CHECK(rep_evs[0] != nullptr && rep_evs[1] != nullptr);
+
+    std::vector<uint16_t> out0_h(16, 0), out1_h(16, 0);
+    auto read_back = [&](PJRT_Buffer* b, std::vector<uint16_t>& dst) {
+      PJRT_Buffer_ToHostBuffer_Args th = {};
+      th.struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE;
+      th.src = b;
+      th.dst = dst.data();
+      th.dst_size = dst.size() * sizeof(uint16_t);
+      OT_CHECK(api->PJRT_Buffer_ToHostBuffer(&th) == nullptr);
+      if (th.event) {
+        PJRT_Event_Destroy_Args ed = {};
+        ed.struct_size = PJRT_Event_Destroy_Args_STRUCT_SIZE;
+        ed.event = th.event;
+        OT_CHECK(api->PJRT_Event_Destroy(&ed) == nullptr);
+      }
+    };
+    read_back(r0_out[0], out0_h);
+    read_back(r1_out[0], out1_h);
+    for (uint16_t v : out0_h) OT_CHECK(v == 0x4080u);  // 4 * (1 * 1) = 4.0
+    for (uint16_t v : out1_h) OT_CHECK(v == 0x4180u);  // 4 * (2 * 2) = 16.0
+
+    for (PJRT_Event* ev : rep_evs) {
+      PJRT_Event_Destroy_Args ed = {};
+      ed.struct_size = PJRT_Event_Destroy_Args_STRUCT_SIZE;
+      ed.event = ev;
+      OT_CHECK(api->PJRT_Event_Destroy(&ed) == nullptr);
+    }
+    for (PJRT_Buffer* b : {d0_a, d0_b, d1_a, d1_b, d1_bad, r0_out[0], r1_out[0]}) {
+      destroy_buf(b);
+    }
+    PJRT_LoadedExecutable_Destroy_Args led2 = {};
+    led2.struct_size = PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
+    led2.executable = ca2.executable;
+    OT_CHECK(api->PJRT_LoadedExecutable_Destroy(&led2) == nullptr);
+    PJRT_Client_Destroy_Args cd = {};
+    cd.struct_size = PJRT_Client_Destroy_Args_STRUCT_SIZE;
+    cd.client = cc.client;
+    OT_CHECK(api->PJRT_Client_Destroy(&cd) == nullptr);
+  }
+
+  // 4. Live mode (OPENTPU_MOCK unset): invalid visible_devices must be rejected with INVALID_ARGUMENT
+  //    BEFORE attempting to open or reset any VFIO device (which would fail with INTERNAL on host).
+  {
+    unsetenv("OPENTPU_MOCK");
+    unsetenv("OPENTPU_MOCK_CHIP");
+    unsetenv("OPENTPU_MOCK_TOPOLOGY");
+    auto check_live_visible_rejected = [&](const int64_t* vals, size_t cnt) {
+      PJRT_NamedValue opt = {};
+      opt.struct_size = PJRT_NamedValue_STRUCT_SIZE;
+      opt.name = "visible_devices";
+      opt.name_size = 15;
+      opt.type = PJRT_NamedValue_kInt64List;
+      opt.int64_array_value = vals;
+      opt.value_size = cnt;
+      PJRT_Client_Create_Args cc = {};
+      cc.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
+      cc.create_options = &opt;
+      cc.num_options = 1;
+      PJRT_Error* e = api->PJRT_Client_Create(&cc);
+      OT_CHECK(e != nullptr);
+      OT_CHECK(get_err_code(e) == PJRT_Error_Code_INVALID_ARGUMENT);
+      destroy_pjrt_error(api, e);
+    };
+    const int64_t dev1[1] = {1};
+    const int64_t dup0[2] = {0, 0};
+    const int64_t neg1[1] = {-1};
+    check_live_visible_rejected(dev1, 1);
+    check_live_visible_rejected(dup0, 2);
+    check_live_visible_rejected(neg1, 1);
+  }
+
+  // 5. Setting ONLY OPENTPU_MOCK_TOPOLOGY=tpu7x-1t (with OPENTPU_MOCK_CHIP unset) must configure
+  //    every created device HAL context as TPU v7x (0x0075, 256x256 MXU, native FP8).
+  {
+    unsetenv("OPENTPU_MOCK_CHIP");
+    unsetenv("OPENTPU_MOCK_DEVICE_ID");
+    setenv("OPENTPU_MOCK", "1", 1);
+    setenv("OPENTPU_MOCK_TOPOLOGY", "tpu7x-1t", 1);
+
+    PJRT_Client_Create_Args cc = {};
+    cc.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
+    OT_CHECK(api->PJRT_Client_Create(&cc) == nullptr && cc.client != nullptr);
+
+    PJRT_Client_AddressableDevices_Args ad = {};
+    ad.struct_size = PJRT_Client_AddressableDevices_Args_STRUCT_SIZE;
+    ad.client = cc.client;
+    OT_CHECK(api->PJRT_Client_AddressableDevices(&ad) == nullptr);
+    OT_CHECK(ad.num_addressable_devices == 2u);
+
+    for (size_t i = 0; i < ad.num_addressable_devices; ++i) {
+      const ot_context_t* dev_ctx = ot::pjrt_device_context_raw(ad.addressable_devices[i]);
+      OT_CHECK(dev_ctx != nullptr);
+      ot_device_info_t dinfo = {};
+      ot_device_geometry_t dgeom = {};
+      OT_CHECK(ot_device_get_info(dev_ctx, &dinfo) == OT_OK);
+      OT_CHECK(ot_device_get_geometry(dev_ctx, &dgeom) == OT_OK);
+      OT_CHECK(dinfo.chip_gen == OT_CHIP_TPU7X);
+      OT_CHECK(dinfo.device_id == 0x0075u);
+      OT_CHECK(dgeom.mxu_rows == 256u && dgeom.mxu_cols == 256u && dgeom.supports_native_fp8 == 1u);
+    }
+
+    PJRT_Client_Destroy_Args cd = {};
+    cd.struct_size = PJRT_Client_Destroy_Args_STRUCT_SIZE;
+    cd.client = cc.client;
+    OT_CHECK(api->PJRT_Client_Destroy(&cd) == nullptr);
+  }
+
+  // 6. On an 8-device client, execute_device outside the executable's assigned_devices ([0, 1])
+  //    must be rejected with INVALID_ARGUMENT, while an assigned device succeeds.
+  {
+    unsetenv("OPENTPU_MOCK_CHIP");
+    unsetenv("OPENTPU_MOCK_DEVICE_ID");
+    setenv("OPENTPU_MOCK", "1", 1);
+    setenv("OPENTPU_MOCK_TOPOLOGY", "tpu7x-4t", 1);
+
+    PJRT_Client_Create_Args cc = {};
+    cc.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
+    OT_CHECK(api->PJRT_Client_Create(&cc) == nullptr && cc.client != nullptr);
+
+    PJRT_Client_AddressableDevices_Args ad = {};
+    ad.struct_size = PJRT_Client_AddressableDevices_Args_STRUCT_SIZE;
+    ad.client = cc.client;
+    OT_CHECK(api->PJRT_Client_AddressableDevices(&ad) == nullptr);
+    OT_CHECK(ad.num_addressable_devices == 8u);
+
+    const char opt_rep2[] = {0x1a, 0x02, 0x20, 0x02};
+    PJRT_Client_Compile_Args ca = {};
+    ca.struct_size = PJRT_Client_Compile_Args_STRUCT_SIZE;
+    ca.client = cc.client;
+    ca.program = &prog;
+    ca.compile_options = opt_rep2;
+    ca.compile_options_size = sizeof(opt_rep2);
+    OT_CHECK(api->PJRT_Client_Compile(&ca) == nullptr && ca.executable != nullptr);
+
+    std::vector<uint16_t> ones(16, 0x3f80u);
+    PJRT_Buffer* d2_a = upload_bf16(cc.client, ad.addressable_devices[2], ones, 4, 4);
+    PJRT_Buffer* d2_b = upload_bf16(cc.client, ad.addressable_devices[2], ones, 4, 4);
+    PJRT_Buffer* ins2[2] = {d2_a, d2_b};
+    PJRT_Buffer* outs2[1] = {nullptr};
+    PJRT_Buffer* const* arg_lists2[1] = {ins2};
+    PJRT_Buffer** const out_lists2[1] = {outs2};
+    PJRT_ExecuteOptions eopts = {};
+    eopts.struct_size = PJRT_ExecuteOptions_STRUCT_SIZE;
+    PJRT_LoadedExecutable_Execute_Args ex_unassigned = {};
+    ex_unassigned.struct_size = PJRT_LoadedExecutable_Execute_Args_STRUCT_SIZE;
+    ex_unassigned.executable = ca.executable;
+    ex_unassigned.options = &eopts;
+    ex_unassigned.argument_lists = arg_lists2;
+    ex_unassigned.num_devices = 1;
+    ex_unassigned.num_args = 2;
+    ex_unassigned.output_lists = out_lists2;
+    ex_unassigned.execute_device = ad.addressable_devices[2];
+    PJRT_Error* ue = api->PJRT_LoadedExecutable_Execute(&ex_unassigned);
+    OT_CHECK(ue != nullptr && get_err_code(ue) == PJRT_Error_Code_INVALID_ARGUMENT);
+    OT_CHECK(outs2[0] == nullptr);
+    destroy_pjrt_error(api, ue);
+
+    // Launching on assigned device 1 with execute_device=dev[1] succeeds.
+    PJRT_Buffer* d1_a = upload_bf16(cc.client, ad.addressable_devices[1], ones, 4, 4);
+    PJRT_Buffer* d1_b = upload_bf16(cc.client, ad.addressable_devices[1], ones, 4, 4);
+    PJRT_Buffer* ins1[2] = {d1_a, d1_b};
+    PJRT_Buffer* outs1[1] = {nullptr};
+    PJRT_Buffer* const* arg_lists1[1] = {ins1};
+    PJRT_Buffer** const out_lists1[1] = {outs1};
+    PJRT_LoadedExecutable_Execute_Args ex_assigned = ex_unassigned;
+    ex_assigned.argument_lists = arg_lists1;
+    ex_assigned.output_lists = out_lists1;
+    ex_assigned.execute_device = ad.addressable_devices[1];
+    OT_CHECK(api->PJRT_LoadedExecutable_Execute(&ex_assigned) == nullptr && outs1[0] != nullptr);
+
+    destroy_buf(d2_a);
+    destroy_buf(d2_b);
+    destroy_buf(d1_a);
+    destroy_buf(d1_b);
+    destroy_buf(outs1[0]);
+    PJRT_LoadedExecutable_Destroy_Args led = {};
+    led.struct_size = PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
+    led.executable = ca.executable;
+    OT_CHECK(api->PJRT_LoadedExecutable_Destroy(&led) == nullptr);
+    PJRT_Client_Destroy_Args cd = {};
+    cd.struct_size = PJRT_Client_Destroy_Args_STRUCT_SIZE;
+    cd.client = cc.client;
+    OT_CHECK(api->PJRT_Client_Destroy(&cd) == nullptr);
+  }
+
+  // 7. With visible_devices=[1, 3], compile device_ordinal=1 must resolve to the 2nd visible
+  //    device (global ID 3), NOT global device ID 1, and device_ordinal=2 must be rejected.
+  {
+    unsetenv("OPENTPU_MOCK_CHIP");
+    unsetenv("OPENTPU_MOCK_DEVICE_ID");
+    setenv("OPENTPU_MOCK", "1", 1);
+    setenv("OPENTPU_MOCK_TOPOLOGY", "tpu7x-4t", 1);
+
+    const int64_t vis13[2] = {1, 3};
+    PJRT_NamedValue nv = {};
+    nv.struct_size = PJRT_NamedValue_STRUCT_SIZE;
+    nv.name = "visible_devices";
+    nv.name_size = std::strlen("visible_devices");
+    nv.type = PJRT_NamedValue_kInt64List;
+    nv.int64_array_value = vis13;
+    nv.value_size = 2;
+
+    PJRT_Client_Create_Args cc = {};
+    cc.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
+    cc.create_options = &nv;
+    cc.num_options = 1;
+    OT_CHECK(api->PJRT_Client_Create(&cc) == nullptr && cc.client != nullptr);
+
+    PJRT_Client_AddressableDevices_Args ad = {};
+    ad.struct_size = PJRT_Client_AddressableDevices_Args_STRUCT_SIZE;
+    ad.client = cc.client;
+    OT_CHECK(api->PJRT_Client_AddressableDevices(&ad) == nullptr);
+    OT_CHECK(ad.num_addressable_devices == 2u);
+
+    auto get_dev_id = [&](PJRT_Device* d) -> int {
+      PJRT_Device_GetDescription_Args gd = {};
+      gd.struct_size = PJRT_Device_GetDescription_Args_STRUCT_SIZE;
+      gd.device = d;
+      OT_CHECK(api->PJRT_Device_GetDescription(&gd) == nullptr);
+      PJRT_DeviceDescription_Id_Args id = {};
+      id.struct_size = PJRT_DeviceDescription_Id_Args_STRUCT_SIZE;
+      id.device_description = gd.device_description;
+      OT_CHECK(api->PJRT_DeviceDescription_Id(&id) == nullptr);
+      return id.id;
+    };
+    OT_CHECK(get_dev_id(ad.addressable_devices[0]) == 1);
+    OT_CHECK(get_dev_id(ad.addressable_devices[1]) == 3);
+
+    // CompileOptions { executable_build_options (field 3) { device_ordinal (field 1) = 1 } }
+    const char opt_ord1[] = {0x1a, 0x02, 0x08, 0x01};
+    PJRT_Client_Compile_Args ca = {};
+    ca.struct_size = PJRT_Client_Compile_Args_STRUCT_SIZE;
+    ca.client = cc.client;
+    ca.program = &prog;
+    ca.compile_options = opt_ord1;
+    ca.compile_options_size = sizeof(opt_ord1);
+    OT_CHECK(api->PJRT_Client_Compile(&ca) == nullptr && ca.executable != nullptr);
+
+    PJRT_LoadedExecutable_AddressableDevices_Args ead = {};
+    ead.struct_size = PJRT_LoadedExecutable_AddressableDevices_Args_STRUCT_SIZE;
+    ead.executable = ca.executable;
+    OT_CHECK(api->PJRT_LoadedExecutable_AddressableDevices(&ead) == nullptr);
+    OT_CHECK(ead.num_addressable_devices == 1u);
+    OT_CHECK(ead.addressable_devices[0] == ad.addressable_devices[1]);
+    OT_CHECK(get_dev_id(ead.addressable_devices[0]) == 3);
+
+    // Out-of-range ordinal (device_ordinal=2 >= visible_count=2) must fail with INVALID_ARGUMENT.
+    const char opt_ord2[] = {0x1a, 0x02, 0x08, 0x02};
+    PJRT_Client_Compile_Args ca_bad = ca;
+    ca_bad.compile_options = opt_ord2;
+    ca_bad.compile_options_size = sizeof(opt_ord2);
+    ca_bad.executable = nullptr;
+    PJRT_Error* oob_err = api->PJRT_Client_Compile(&ca_bad);
+    OT_CHECK(oob_err != nullptr && get_err_code(oob_err) == PJRT_Error_Code_INVALID_ARGUMENT);
+    OT_CHECK(ca_bad.executable == nullptr);
+    destroy_pjrt_error(api, oob_err);
+
+    PJRT_LoadedExecutable_Destroy_Args led = {};
+    led.struct_size = PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
+    led.executable = ca.executable;
+    OT_CHECK(api->PJRT_LoadedExecutable_Destroy(&led) == nullptr);
+    PJRT_Client_Destroy_Args cd = {};
+    cd.struct_size = PJRT_Client_Destroy_Args_STRUCT_SIZE;
+    cd.client = cc.client;
+    OT_CHECK(api->PJRT_Client_Destroy(&cd) == nullptr);
+  }
+
+  // 8. Conflicting mock topology + device ID / chip selectors must fail with INVALID_ARGUMENT,
+  //    while matching guest Ironwood VFIO ID (0x0076) + tpu7x-4t succeeds consistently.
+  {
+    setenv("OPENTPU_MOCK", "1", 1);
+    unsetenv("OPENTPU_MOCK_CHIP");
+    setenv("OPENTPU_MOCK_TOPOLOGY", "tpu7x-4t", 1);
+    setenv("OPENTPU_MOCK_DEVICE_ID", "0x0063", 1);
+
+    PJRT_Client_Create_Args cc_bad_did = {};
+    cc_bad_did.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
+    PJRT_Error* err_did = api->PJRT_Client_Create(&cc_bad_did);
+    OT_CHECK(err_did != nullptr && get_err_code(err_did) == PJRT_Error_Code_INVALID_ARGUMENT);
+    OT_CHECK(cc_bad_did.client == nullptr);
+    destroy_pjrt_error(api, err_did);
+
+    unsetenv("OPENTPU_MOCK_DEVICE_ID");
+    setenv("OPENTPU_MOCK_CHIP", "v5e", 1);
+    PJRT_Client_Create_Args cc_bad_chip = {};
+    cc_bad_chip.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
+    PJRT_Error* err_chip = api->PJRT_Client_Create(&cc_bad_chip);
+    OT_CHECK(err_chip != nullptr && get_err_code(err_chip) == PJRT_Error_Code_INVALID_ARGUMENT);
+    OT_CHECK(cc_bad_chip.client == nullptr);
+    destroy_pjrt_error(api, err_chip);
+
+    unsetenv("OPENTPU_MOCK_CHIP");
+    setenv("OPENTPU_MOCK_DEVICE_ID", "0x0076", 1);
+    PJRT_Client_Create_Args cc_ok = {};
+    cc_ok.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
+    OT_CHECK(api->PJRT_Client_Create(&cc_ok) == nullptr && cc_ok.client != nullptr);
+    PJRT_Client_AddressableDevices_Args ad = {};
+    ad.struct_size = PJRT_Client_AddressableDevices_Args_STRUCT_SIZE;
+    ad.client = cc_ok.client;
+    OT_CHECK(api->PJRT_Client_AddressableDevices(&ad) == nullptr);
+    OT_CHECK(ad.num_addressable_devices == 8u);
+    ot_device_info_t dinfo = {};
+    OT_CHECK(ot_device_get_info(ot::pjrt_device_context_raw(ad.addressable_devices[0]), &dinfo) == OT_OK);
+    OT_CHECK(dinfo.chip_gen == OT_CHIP_TPU7X && dinfo.device_id == 0x0076u);
+
+    PJRT_Client_Destroy_Args cd = {};
+    cd.struct_size = PJRT_Client_Destroy_Args_STRUCT_SIZE;
+    cd.client = cc_ok.client;
+    OT_CHECK(api->PJRT_Client_Destroy(&cd) == nullptr);
+    unsetenv("OPENTPU_MOCK_DEVICE_ID");
+  }
+
+  unsetenv("OPENTPU_MOCK_TOPOLOGY");
+  unsetenv("OPENTPU_MOCK_CHIP");
+  unsetenv("OPENTPU_MOCK");
+  printf("[PASS] test_pjrt_multidevice_isolation_and_topology\n");
+}
+
 int main() {
   test_iova_allocator();
   test_bar4_descriptor_parser();
@@ -1590,6 +3277,12 @@ int main() {
   test_pjrt_api_mock();
   test_vliw_and_tiling();
   test_resident_imem_stub_structure();
+  test_freetile_descriptor_and_planner();
+  test_freetile_vliw_emitters_and_packing();
+  test_mock_multitile_and_quant_matmul();
+  test_multigen_hal_geometry_and_rebar();
+  test_pjrt_dual_chiplet_tpu7x_enumeration();
+  test_pjrt_multidevice_isolation_and_topology();
   printf("ALL_HOST_TESTS_PASSED\n");
   return 0;
 }

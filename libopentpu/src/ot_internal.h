@@ -27,11 +27,34 @@ struct PciDiscoveryEntry {
   std::string driver;
   uint32_t iommu_group = 0xffffffffu;
   uint64_t bar0_size = 0;
+  uint64_t bar2_size = 0;
   uint64_t bar4_size = 0;
+};
+
+struct RebarCapabilityInfo {
+  bool found = false;
+  uint16_t cap_offset = 0;
+  uint32_t num_bars = 0;
+  uint64_t bar_bytes[6] = {};
 };
 
 // Parse a 0x1234 hex sysfs attribute safely (no exceptions).
 bool parse_hex_u64(const std::string& text, uint64_t* out);
+
+// HAL geometry lookup across Google Cloud TPU generations (0x0063 v5e, 0x006e/0x006f v6e,
+// 0x0075/0x0076 Ironwood tpu7x dual-chiplet). Returns false on unknown device_id.
+bool chip_geometry_for_device_id(uint16_t device_id, ot_device_geometry_t* out);
+
+// Clamp a PCI BAR mmap length (e.g. 64-bit Resizable BAR) so large VRAM/HBM apertures
+// never exhaust host virtual address space.
+size_t clamp_bar_mmap_len(uint64_t bar_size, size_t max_len);
+
+// Parse PCIe Resizable BAR extended capability (ID 0x0015) from an extended PCI config
+// space buffer beginning at byte 0x100.
+bool parse_pcie_rebar_cap(const uint8_t* cfg_bytes, size_t cfg_len, RebarCapabilityInfo* out);
+
+// Enumerate all visible 0x1ae0 Google Cloud TPU PCI functions on Linux sysfs (sorted by BDF).
+bool enumerate_linux_tpus(std::vector<PciDiscoveryEntry>* out, std::string* err);
 
 // Simple monotonic IOVA bump/free-list allocator over valid IOMMU ranges.
 struct IovaBlock {
@@ -109,6 +132,12 @@ struct VfioTransport {
   uint32_t sq_seq = 0;
   bool ring_ready = false;
   bool dma_faulted = false;
+  bool last_op_timed_out = false;
+  bool last_op_oom = false;
+  bool mock_exec_timeout = false;
+  bool mock_exec_poll_error = false;
+  bool mock_core_ctrl_fail = false;
+  bool mock_quant_const_upload_fail = false;
   int64_t owner_pid = 0;
 
   bool is_owner_process() const;
@@ -121,9 +150,13 @@ struct VfioTransport {
 
   // IMEM boot/poller & kernel runtime state (initialized lazily on first live matmul).
   bool imem_booted = false;
+  uint32_t loaded_prog_kind = 0;  // 0=none, 1=bf16, 2=q8, 3=q4
+  uint32_t loaded_imem_bundles = 0;
   uint64_t scratch_lhs_hbm = 0;
   uint64_t scratch_rhs_hbm = 0;
+  uint64_t quant_const_hbm = 0;   // 40 KiB Sel + -2304.0f + -136.0f constants
   uint32_t exec_seq = 0;
+  uint32_t next_exec_seq() const { return (exec_seq == 0xffffffffu) ? 1u : (exec_seq + 1u); }
 
   IovaAllocator iova_alloc;
   IovaAllocator hbm_alloc;
@@ -153,6 +186,8 @@ struct VfioTransport {
   bool submit_exec_sync(uint32_t expected_exec_seq, uint32_t timeout_ms,
                         uint32_t cq_out[8], std::string* err);
   bool ensure_imem_booted(uint32_t timeout_ms, std::string* err);
+  bool ensure_imem_program(uint32_t prog_kind, uint32_t timeout_ms, std::string* err);
+  bool ensure_quant_constants(uint32_t timeout_ms, std::string* err);
   bool ensure_matmul_scratch_slot(uint64_t* slot, std::string* err);
   bool ensure_matmul_scratch(std::string* err);
   void teardown_imem_state();
@@ -178,8 +213,11 @@ ot_status_t buffer_d2h_tiled_128x128_bf16(ot_context_t* ctx, const ot_buffer_t* 
                                           void* host_dst_tiled);
 uint64_t context_hbm_used_bytes(const ot_context_t* ctx);
 bool validate_cq_completion(uint32_t sent_seq, const uint32_t cq[8], std::string* err);
+ot_status_t classify_transport_error(bool last_op_timed_out, bool dma_faulted);
 // Static allocation-free PJRT_Error fallback used when error allocation fails.
 void* pjrt_static_fallback_error_raw(uint32_t error_code);
+// Internal inspection helper for unit tests verifying per-device PJRT HAL contexts.
+const ot_context_t* pjrt_device_context_raw(const void* pjrt_device);
 
 }  // namespace ot
 
@@ -191,6 +229,8 @@ struct ot_buffer {
   bool is_mock = false;
   int64_t owner_pid = 0;
   ot::BufferLayout layout = ot::BufferLayout::kRaw;
+  uint32_t tiled_rows = 0;
+  uint32_t tiled_cols = 0;
 };
 
 struct ot_context {
