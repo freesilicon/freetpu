@@ -725,11 +725,11 @@ void test_flash_attn_fully_masked_row(cloudtpu::PjrtRuntime& rt) {
     for (int d = 0; d < D; ++d) {
         k_poison[static_cast<size_t>(2 * D + d)] = nan_f;    // masked for all queries
         v_poison[static_cast<size_t>(2 * D + d)] = pos_inf;  // masked for all queries
-        v_poison[static_cast<size_t>(3 * D + d)] = nan_f;    // masked for q0, visible to q1
     }
+    v_poison[static_cast<size_t>(3 * D + 0)] = nan_f;  // only channel 0 poisoned; channels 1..D-1 remain finite
     const std::vector<float> mask_iso = {
         0.0f,    0.0f,    neg_inf, neg_inf,  // q0 sees rows 0, 1 only
-        neg_inf, neg_inf, neg_inf, 0.0f,     // q1 sees poisoned row 3 only
+        neg_inf, neg_inf, neg_inf, 0.0f,     // q1 sees row 3 only (ch0=NaN, ch1..3=finite)
     };
     auto bkp = rt.buffer_from_host(0, k_poison.data(), cloudtpu::PjrtDType::F32, {B, H, NKV, D});
     auto bvp = rt.buffer_from_host(0, v_poison.data(), cloudtpu::PjrtDType::F32, {B, H, NKV, D});
@@ -741,8 +741,12 @@ void test_flash_attn_fully_masked_row(cloudtpu::PjrtRuntime& rt) {
     std::vector<float> q0_exp(static_cast<size_t>(D));
     for (int d = 0; d < D; ++d) {
         q0_exp[static_cast<size_t>(d)] = p0 * v[static_cast<size_t>(d)] + p1 * v[static_cast<size_t>(D + d)];
-        CHECK_TRUE(std::isnan(out_iso[static_cast<size_t>(D + d)]),
-                   "query attending to NaN V row should still surface NaN");
+    }
+    CHECK_TRUE(std::isnan(out_iso[static_cast<size_t>(D + 0)]),
+               "query attending to NaN V channel should surface NaN on that channel");
+    for (int d = 1; d < D; ++d) {
+        CHECK_TRUE(std::fabs(out_iso[static_cast<size_t>(D + d)] - v[static_cast<size_t>(3 * D + d)]) < 1e-5f,
+                   "unaffected finite V channels must remain preserved");
     }
     check_vec_close(q0_got, q0_exp, 1e-5f, "FLASH_ATTN_EXT masked NaN/Inf KV isolation");
     std::printf("  [PASS] FLASH_ATTN_EXT isolates masked NaN/Inf K/V rows\n");

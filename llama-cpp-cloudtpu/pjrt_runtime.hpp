@@ -148,7 +148,7 @@ public:
     void init(const RuntimeConfig& cfg);
     void shutdown();
 
-    bool is_initialized() const { return api_ != nullptr && client_ != nullptr; }
+    bool is_initialized() const { return initialized_; }
     bool is_mock() const { return is_mock_; }
     bool has_ready_event() const { return has_ready_event_; }
 
@@ -198,6 +198,7 @@ private:
     std::string resolve_libtpu_path(const std::string& override_path) const;
 
     RuntimeConfig cfg_;
+    bool initialized_ = false;
     bool is_mock_ = false;
     bool has_ready_event_ = false;
     void* dl_handle_ = nullptr;

@@ -1901,9 +1901,10 @@ std::string PjrtRuntime::resolve_libtpu_path(const std::string& override_path) c
 }
 
 void PjrtRuntime::init(const RuntimeConfig& cfg) {
-    if (is_initialized()) {
+    if (initialized_) {
         return;
     }
+    try {
     cfg_ = cfg;
     is_mock_ = cfg.mock_mode;
 
@@ -2058,9 +2059,15 @@ void PjrtRuntime::init(const RuntimeConfig& cfg) {
         }
         device_infos_.push_back(std::move(info));
     }
+    initialized_ = true;
+    } catch (...) {
+        shutdown();
+        throw;
+    }
 }
 
 void PjrtRuntime::shutdown() {
+    initialized_ = false;
     clear_exec_cache();
     if (client_ && api_ && PJRT_API_HAS(api_, PJRT_Client_Destroy)) {
         PJRT_Client_Destroy_Args args = {};
@@ -2074,6 +2081,9 @@ void PjrtRuntime::shutdown() {
     }
     devices_.clear();
     device_infos_.clear();
+    platform_name_.clear();
+    platform_version_.clear();
+    has_ready_event_ = false;
     api_ = nullptr;
     // Intentionally skip dlclose(dl_handle_) for libtpu singleton thread-safety.
 }

@@ -1051,14 +1051,10 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                     out_bhqd = builder.emit_dot_general(
                         probs, v_fin, {0, 1}, {0, 1}, {3}, {2}, {B, H_Q, N_Q, DV}, PjrtDType::F32, op.high_precision);
                     SsaValue v_bad = builder.emit_select(v_is_fin, v_zeros, v_ones);
-                    SsaValue v_bad_row = builder.emit_reduce_axis(v_bad, zero_scalar, 3, "stablehlo.maximum");
-                    SsaValue v_bad_col = builder.emit_reshape(v_bad_row, {B, H_Q, N_KV, 1});
                     SsaValue q_bad = builder.emit_dot_general(
-                        probs, v_bad_col, {0, 1}, {0, 1}, {3}, {2}, {B, H_Q, N_Q, 1}, PjrtDType::F32, false);
-                    SsaValue q_bad_3d = builder.emit_reshape(q_bad, {B, H_Q, N_Q});
-                    SsaValue q_bad_b = builder.emit_broadcast_in_dim(q_bad_3d, {0, 1, 2}, {B, H_Q, N_Q, DV});
+                        probs, v_bad, {0, 1}, {0, 1}, {3}, {2}, {B, H_Q, N_Q, DV}, PjrtDType::F32, false);
                     SsaValue q_has_bad = builder.emit_compare(
-                        "GT", q_bad_b, builder.emit_const_splat_f32(0.0f, {B, H_Q, N_Q, DV}, PjrtDType::F32));
+                        "GT", q_bad, builder.emit_const_splat_f32(0.0f, {B, H_Q, N_Q, DV}, PjrtDType::F32));
                     SsaValue nan_out = builder.emit_const_splat_f32(
                         std::numeric_limits<float>::quiet_NaN(), {B, H_Q, N_Q, DV}, PjrtDType::F32);
                     out_bhqd = builder.emit_select(q_has_bad, nan_out, out_bhqd);
