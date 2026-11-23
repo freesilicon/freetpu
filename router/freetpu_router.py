@@ -1467,6 +1467,50 @@ def _bounded_sse_json_loads(
             engine.release_response_memory(parse_extra)
 
 
+def _mapping_indicates_model_not_found(
+    mapping: Mapping[str, Any],
+    *,
+    is_http_404: bool = True,
+    raw_status: Optional[int] = None,
+) -> bool:
+    """Return True when an error mapping indicates a missing model rather than a route 404."""
+    code = mapping.get("code")
+    if isinstance(code, str) and code.strip().lower() == "model_not_found":
+        return True
+    err_type = mapping.get("type")
+    err_type_norm = err_type.strip().lower() if isinstance(err_type, str) else ""
+    is_not_found_context = (
+        is_http_404
+        or raw_status == 404
+        or "notfound" in err_type_norm
+        or err_type_norm == "not_found_error"
+    )
+    param = mapping.get("param")
+    if isinstance(param, str) and param.strip().lower() == "model":
+        return is_not_found_context
+    param_absent_or_empty = param is None or (isinstance(param, str) and not param.strip())
+    code_is_404_or_none = (
+        code is None
+        or (isinstance(code, int) and not isinstance(code, bool) and code == 404)
+        or (isinstance(code, str) and code.strip() == "404")
+    )
+    status_allows_404 = is_http_404 or raw_status in (None, 404)
+    if (
+        param_absent_or_empty
+        and status_allows_404
+        and err_type_norm in ("notfounderror", "not_found_error")
+        and code_is_404_or_none
+    ):
+        msg = mapping.get("message")
+        if isinstance(msg, str):
+            msg_low = msg.lower()
+            if "model" in msg_low and (
+                "does not exist" in msg_low or "not found" in msg_low
+            ):
+                return True
+    return False
+
+
 def _is_model_not_found_404(status_code: int, body: bytes) -> bool:
     """Return True when an upstream 404 JSON error indicates the worker lacks the requested model."""
     if status_code != 404 or not body or len(body) > MAX_ERROR_RESPONSE_BYTES:
@@ -1488,11 +1532,7 @@ def _is_model_not_found_404(status_code: int, body: bytes) -> bool:
         candidates.append(inner)
     candidates.append(obj)
     for mapping in candidates:
-        param = mapping.get("param")
-        if isinstance(param, str) and param.strip().lower() == "model":
-            return True
-        code = mapping.get("code")
-        if isinstance(code, str) and code.strip().lower() == "model_not_found":
+        if _mapping_indicates_model_not_found(mapping):
             return True
     return False
 
@@ -1558,9 +1598,13 @@ def _classify_sse_error_event(
 
     err_type = str(err_mapping.get("type") or "").strip().lower()
     err_code = str(err_mapping.get("code") or "").strip().lower()
-    err_param = str(err_mapping.get("param") or "").strip().lower()
-    is_model_not_found = (err_code == "model_not_found") or (
-        err_param == "model" and (raw_status == 404 or "notfound" in err_type or err_type == "not_found_error")
+    is_model_not_found = _mapping_indicates_model_not_found(
+        err_mapping, is_http_404=False, raw_status=raw_status
+    ) or (
+        isinstance(parsed, Mapping)
+        and _mapping_indicates_model_not_found(
+            parsed, is_http_404=False, raw_status=raw_status
+        )
     )
     is_client_error = (
         (
@@ -1676,12 +1720,15 @@ def _sse_event_should_commit(
     required_choices: int = 1,
     prompt_batch_size: int = 1,
     echo_chars_by_choice: Optional[Dict[int, int]] = None,
+    finished_choices: Optional[set[int]] = None,
+    finished_count: Optional[List[int]] = None,
     generated_out: Optional[List[bool]] = None,
 ) -> bool:
     """Return True when a complete non-error SSE data event carries output or a terminator.
 
-    Role-only, empty-delta, prompt-progress, and echoed chat/completion prefix
-    chunks are buffered so Spot preemption before the first generated token
+    Role-only, empty-delta, prompt-progress, echoed chat/completion prefix
+    chunks, and partial finish-only events (when `required_choices > 1`) are
+    buffered so Spot preemption before generated output or full completion
     still fails over. When `generated_out` is provided, sets
     `generated_out[0] = True` iff this event carries actual generated output
     (not echoed input or a finish-only / usage-only / `[DONE]` terminator).
@@ -1726,17 +1773,23 @@ def _sse_event_should_commit(
         for pos, choice in enumerate(choices):
             if not isinstance(choice, Mapping):
                 continue
+            c_idx = choice.get("index")
+            resolved_idx = (
+                c_idx
+                if isinstance(c_idx, int)
+                and not isinstance(c_idx, bool)
+                and c_idx >= 0
+                else pos
+            )
             if choice.get("finish_reason") is not None:
                 saw_finish = True
+                if finished_choices is not None:
+                    if resolved_idx not in finished_choices:
+                        if finished_count is not None:
+                            finished_count[0] += 1
+                        if len(finished_choices) < _MAX_TRACKED_STREAM_CHOICES:
+                            finished_choices.add(resolved_idx)
             if has_echo_prefix:
-                c_idx = choice.get("index")
-                resolved_idx = (
-                    c_idx
-                    if isinstance(c_idx, int)
-                    and not isinstance(c_idx, bool)
-                    and c_idx >= 0
-                    else pos
-                )
                 if echo_chat_chars > 0:
                     has_non_echo, echoed_field_chars = _choice_non_echo_chat_output(choice)
                     echo_limit = echo_chat_chars
@@ -1774,10 +1827,24 @@ def _sse_event_should_commit(
                             if generated_out is not None:
                                 generated_out[0] = True
                             return True
+        if required_choices > 1 and finished_choices is not None:
+            if required_choices <= _MAX_TRACKED_STREAM_CHOICES:
+                all_choices_finished = len(finished_choices) >= required_choices and all(
+                    idx in finished_choices for idx in range(required_choices)
+                )
+            else:
+                done_count = (
+                    finished_count[0]
+                    if finished_count is not None
+                    else len(finished_choices)
+                )
+                all_choices_finished = done_count >= required_choices
+        else:
+            all_choices_finished = True
         if saw_finish:
-            return True
+            return all_choices_finished
         if not choices and isinstance(obj.get("usage"), Mapping):
-            return True
+            return all_choices_finished
         return False
     if "prompt_progress" in obj:
         return False
@@ -5456,6 +5523,8 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         pre_commit_skip_leading_lf = False
         pre_commit_deadline = attempt_start + timeout_s
         pre_commit_echo_chars_by_choice: Dict[int, int] = {}
+        pre_commit_finished_choices: set[int] = set()
+        pre_commit_finished_count = [0]
 
         def _extract_pending_event_payload(end_pos: int) -> bytes:
             data_parts: List[bytes] = []
@@ -5655,6 +5724,8 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                     required_choices=max(1, expected_choices),
                                     prompt_batch_size=max(1, prompt_batch_size),
                                     echo_chars_by_choice=pre_commit_echo_chars_by_choice,
+                                    finished_choices=pre_commit_finished_choices,
+                                    finished_count=pre_commit_finished_count,
                                     generated_out=pre_commit_generated,
                                 )
                             except _MalformedSSEPayloadError:

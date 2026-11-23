@@ -9165,6 +9165,9 @@ asyncio.run(main())
         )
         self.assertEqual(st, 413)
         self.assertIn(b"payload_too_large", bd)
+        rel_deadline = time.monotonic() + 2.0
+        while router.engine._req_mem_used_bytes != 0 and time.monotonic() < rel_deadline:
+            time.sleep(0.01)
         self.assertEqual(router.engine._req_mem_used_bytes, 0)
 
     def test_prometheus_parser_splits_only_on_lf_preserving_cr_and_unicode_line_separators(
@@ -15604,6 +15607,234 @@ asyncio.run(main())
             primary_srv.server_close()
             fallback_srv.shutdown()
             fallback_srv.server_close()
+
+    def test_vllm_numeric_404_model_miss_fails_over_while_route_404_does_not(
+        self,
+    ) -> None:
+        primary_404_body: List[bytes] = [
+            json.dumps(
+                {
+                    "object": "error",
+                    "message": "The model `llama` does not exist.",
+                    "type": "NotFoundError",
+                    "param": None,
+                    "code": 404,
+                }
+            ).encode("utf-8")
+        ]
+
+        class _Custom404Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                pass
+
+            def do_GET(self) -> None:  # noqa: N802
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def do_POST(self) -> None:  # noqa: N802
+                cl = int(self.headers.get("Content-Length", "0"))
+                if cl > 0:
+                    self.rfile.read(cl)
+                body = primary_404_body[0]
+                self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        primary_srv = ThreadingHTTPServer(("127.0.0.1", 0), _Custom404Handler)
+        threading.Thread(target=primary_srv.serve_forever, daemon=True).start()
+        backup = self._track(_MockOpenAIBackend("vllm-404-backup", ["llama"]))
+        try:
+            cfg = RouterConfig(
+                host="127.0.0.1",
+                port=0,
+                policy="local_first",
+                failure_cooldown_s=60.0,
+                backends=[
+                    BackendConfig(
+                        id="vllm-404-primary",
+                        local=True,
+                        discover_models=False,
+                        health_path="/health",
+                        base_url=f"http://127.0.0.1:{primary_srv.server_address[1]}",
+                        models=["*"],
+                    ),
+                    BackendConfig(
+                        id="vllm-404-backup",
+                        local=False,
+                        base_url=backup.base_url,
+                        models=["llama"],
+                    ),
+                ],
+            )
+            router = self._track(create_router_server(cfg))
+            rport = router.server_address[1]
+
+            # 1. vLLM 0.10.2 numeric 404 + NotFoundError + param=null + model message -> fails over.
+            st1, hdrs1, _ = _http_request(
+                rport,
+                "POST",
+                "/v1/chat/completions",
+                body={"model": "llama", "messages": [{"role": "user", "content": "hi"}]},
+            )
+            self.assertEqual(st1, 200)
+            self.assertEqual(hdrs1.get("x-freetpu-backend"), "vllm-404-backup")
+            self.assertEqual(hdrs1.get("x-freetpu-failovers"), "1")
+            self.assertTrue(router.engine._backends[0].healthy)
+            self.assertEqual(router.engine._backends[0].cooldown_until_monotonic, 0.0)
+            self.assertEqual(len(backup.requests_seen), 1)
+
+            # 2. Ordinary FastAPI route 404 {"detail": "Not Found"} -> does NOT fail over.
+            primary_404_body[0] = b'{"detail":"Not Found"}'
+            st2, hdrs2, _ = _http_request(
+                rport,
+                "POST",
+                "/v1/chat/completions",
+                body={"model": "llama", "messages": [{"role": "user", "content": "hi"}]},
+            )
+            self.assertEqual(st2, 404)
+            self.assertEqual(hdrs2.get("x-freetpu-backend"), "vllm-404-primary")
+            self.assertEqual(hdrs2.get("x-freetpu-failovers"), "0")
+            self.assertEqual(len(backup.requests_seen), 1)
+
+            # 3. Non-model NotFoundError ("Route not found") -> does NOT fail over.
+            primary_404_body[0] = json.dumps(
+                {
+                    "error": {
+                        "type": "NotFoundError",
+                        "code": 404,
+                        "message": "Route not found",
+                    }
+                }
+            ).encode("utf-8")
+            st3, hdrs3, _ = _http_request(
+                rport,
+                "POST",
+                "/v1/chat/completions",
+                body={"model": "llama", "messages": [{"role": "user", "content": "hi"}]},
+            )
+            self.assertEqual(st3, 404)
+            self.assertEqual(hdrs3.get("x-freetpu-backend"), "vllm-404-primary")
+            self.assertEqual(hdrs3.get("x-freetpu-failovers"), "0")
+            self.assertEqual(len(backup.requests_seen), 1)
+        finally:
+            primary_srv.shutdown()
+            primary_srv.server_close()
+
+    def test_multi_choice_stream_buffers_partial_finish_only_and_fails_over_on_disconnect(
+        self,
+    ) -> None:
+        class _PartialFinishDropHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                pass
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = b'{"object":"list","data":[{"id":"m-n2"}]}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802
+                cl = int(self.headers.get("Content-Length", "0"))
+                if cl > 0:
+                    self.rfile.read(cl)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                # Choice 0 finishes empty, then worker drops before choice 1 produces output or finishes.
+                self.wfile.write(
+                    b'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}\n\n'
+                    b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+                )
+                self.wfile.flush()
+                self.close_connection = True
+
+        class _CompleteN2Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                pass
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = b'{"object":"list","data":[{"id":"m-n2"}]}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802
+                cl = int(self.headers.get("Content-Length", "0"))
+                if cl > 0:
+                    self.rfile.read(cl)
+                body = (
+                    b'data: {"choices":[{"index":0,"delta":{"content":"c0"},"finish_reason":"stop"}]}\n\n'
+                    b'data: {"choices":[{"index":1,"delta":{"content":"c1"},"finish_reason":"stop"}]}\n\n'
+                    b"data: [DONE]\n\n"
+                )
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        primary_srv = ThreadingHTTPServer(("127.0.0.1", 0), _PartialFinishDropHandler)
+        backup_srv = ThreadingHTTPServer(("127.0.0.1", 0), _CompleteN2Handler)
+        threading.Thread(target=primary_srv.serve_forever, daemon=True).start()
+        threading.Thread(target=backup_srv.serve_forever, daemon=True).start()
+        try:
+            cfg = RouterConfig(
+                host="127.0.0.1",
+                port=0,
+                policy="local_first",
+                backends=[
+                    BackendConfig(
+                        id="n2-primary",
+                        local=True,
+                        base_url=f"http://127.0.0.1:{primary_srv.server_address[1]}",
+                        models=["m-n2"],
+                    ),
+                    BackendConfig(
+                        id="n2-backup",
+                        local=False,
+                        base_url=f"http://127.0.0.1:{backup_srv.server_address[1]}",
+                        models=["m-n2"],
+                    ),
+                ],
+            )
+            router = self._track(create_router_server(cfg))
+            st, hdrs, bd = _http_request(
+                router.server_address[1],
+                "POST",
+                "/v1/chat/completions",
+                body={
+                    "model": "m-n2",
+                    "n": 2,
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "two choices"}],
+                },
+            )
+            self.assertEqual(st, 200)
+            self.assertEqual(hdrs.get("x-freetpu-backend"), "n2-backup")
+            self.assertEqual(hdrs.get("x-freetpu-failovers"), "1")
+            self.assertIn(b"c0", bd)
+            self.assertIn(b"c1", bd)
+            self.assertIn(b"[DONE]", bd)
+        finally:
+            primary_srv.shutdown()
+            primary_srv.server_close()
+            backup_srv.shutdown()
+            backup_srv.server_close()
 
 
 def run_self_tests(verbosity: int = 1) -> int:
