@@ -12,11 +12,13 @@
 #   selectors so two independent 4-chip workloads can share one v6e-8 host
 #   without port 8353 collisions or hostNetwork privilege escalation. When sysfs `chip_id` files
 #   are present (or `--chip-id-map <json>` is passed to `freetpu_cdi.py`), CDI
-#   also injects verified TPU_VISIBLE_CHIPS and TPU_VISIBLE_DEVICES; on hosts
-#   without sysfs `chip_id` and without `--chip-id-map`, set TPU_VISIBLE_CHIPS
-#   and TPU_VISIBLE_DEVICES explicitly on the Pod container (or pass
-#   `--chip-id-map`). (Without `--single-host-env`, CDI preserves workload env
-#   for multi-host jobs.)
+#   also injects verified TPU_VISIBLE_CHIPS and TPU_VISIBLE_DEVICES (pass
+#   `--omit-visible-env` for PyTorch/XLA `xmp.spawn()` so each rank assigns its
+#   own chip via `os.environ.setdefault` instead of inheriting a full-slice mask);
+#   on hosts without sysfs `chip_id` and without `--chip-id-map`, set
+#   TPU_VISIBLE_CHIPS and TPU_VISIBLE_DEVICES explicitly on the Pod container
+#   (or pass `--chip-id-map`). (Without `--single-host-env`, CDI preserves
+#   workload env for multi-host jobs.)
 # - Partitions v6e-8 TPU endpoints along physical NUMA / PCIe root-complex
 #   boundaries (`0000:00` NUMA 0 chips 0..3 vs `0000:80` NUMA 1 chips 4..7)
 #   so the DRA ResourceClaimTemplate selects TPU locality within one NUMA

@@ -3218,6 +3218,94 @@ class FreeTpuCdiTests(unittest.TestCase):
                     "0000:80",
                 )
 
+                # If the FIRST root (`0000:00`) disappears on a shared-NUMA-0 host,
+                # `sync` MUST retain `pcie-0000-80-4` (alongside the now-unique `numa0-4`)
+                # so workloads pinned to `pcie-0000-80-4` continue starting cleanly!
+                sn_lost0_sys, sn_lost0_dev = _make_mock_pci_vfio(
+                    root / "shared_numa0_lost_root0",
+                    devices=shared_numa_devs[4:],
+                    create_vfio_nodes=[str(i) for i in range(4, 8)],
+                )
+                sn_lost0_out = root / "shared_numa0_lost_root0.json"
+                ok_snl, msg_snl = freetpu_cdi.reconcile_cdi_spec(
+                    sn_lost0_out,
+                    sysfs_root=sn_lost0_sys,
+                    dev_root=sn_lost0_dev,
+                )
+                self.assertTrue(ok_snl, msg_snl)
+                snl_spec = json.loads(sn_lost0_out.read_text(encoding="utf-8"))
+                snl_by_name = {d["name"]: d for d in snl_spec["devices"]}
+                self.assertNotIn("pcie-0000-00-4", snl_by_name)
+                self.assertIn("pcie-0000-80-4", snl_by_name)
+                self.assertIn("numa0-4", snl_by_name)
+                self.assertEqual(
+                    snl_by_name["pcie-0000-80-4"]["annotations"]["freetpu.dev/pcie-root"],
+                    "0000:80",
+                )
+
+                # `--single-host-env --omit-visible-env` (for PyTorch/XLA `xmp.spawn()`)
+                # MUST omit TPU_VISIBLE_CHIPS / TPU_VISIBLE_DEVICES even when verified
+                # chip IDs are supplied, while retaining isolated networking and topology
+                # bounds (`TPU_CHIPS_PER_HOST_BOUNDS`, `TPU_ACCELERATOR_TYPE`, etc.)!
+                sn_chip_map = {shared_numa_devs[i]["bdf"]: i for i in range(8)}
+                rc_ov, out_ov, err_ov = _run_cli_inproc(
+                    [
+                        "generate",
+                        "--stdout",
+                        "--validate",
+                        "--single-host-env",
+                        "--omit-visible-env",
+                        "--chip-id-map",
+                        json.dumps(sn_chip_map),
+                        "--sysfs-root",
+                        str(sn_sys),
+                        "--dev-root",
+                        str(sn_dev),
+                    ]
+                )
+                self.assertEqual(rc_ov, 0, err_ov)
+                ov_spec = json.loads(out_ov)
+                ov_by_name = {d["name"]: d for d in ov_spec["devices"]}
+                self.assertIn("0-3", ov_by_name)
+                for sel in ("pcie-0000-00-4", "0-3", "all"):
+                    sel_env = dict(
+                        kv.split("=", 1) for kv in ov_by_name[sel]["containerEdits"]["env"]
+                    )
+                    self.assertNotIn("TPU_VISIBLE_CHIPS", sel_env)
+                    self.assertNotIn("TPU_VISIBLE_DEVICES", sel_env)
+                    self.assertIn("TPU_CHIPS_PER_HOST_BOUNDS", sel_env)
+                    self.assertIn("TPU_ACCELERATOR_TYPE", sel_env)
+                    self.assertEqual(sel_env["TPU_WORKER_HOSTNAMES"], "localhost")
+                    self.assertEqual(sel_env["TPU_WORKER_ID"], "0")
+                    self.assertEqual(sel_env["TPU_SKIP_MDS_QUERY"], "true")
+
+                ov_sync_out = root / "omit_visible_sync.json"
+                rc_ovs, _o_ovs, err_ovs = _run_cli_inproc(
+                    [
+                        "sync",
+                        "--once",
+                        "--output",
+                        str(ov_sync_out),
+                        "--single-host-env",
+                        "--omit-visible-env",
+                        "--chip-id-map",
+                        json.dumps(sn_chip_map),
+                        "--sysfs-root",
+                        str(sn_sys),
+                        "--dev-root",
+                        str(sn_dev),
+                    ]
+                )
+                self.assertEqual(rc_ovs, 0, err_ovs)
+                ovs_spec = json.loads(ov_sync_out.read_text(encoding="utf-8"))
+                ovs_by_name = {d["name"]: d for d in ovs_spec["devices"]}
+                ovs_env = dict(
+                    kv.split("=", 1) for kv in ovs_by_name["pcie-0000-00-4"]["containerEdits"]["env"]
+                )
+                self.assertNotIn("TPU_VISIBLE_CHIPS", ovs_env)
+                self.assertNotIn("TPU_VISIBLE_DEVICES", ovs_env)
+                self.assertEqual(ovs_env["TPU_ACCELERATOR_TYPE"], "v6e-4")
+
             # Verify Kubernetes DRA example manifest uses stable resource.k8s.io/v1 API
             # and accurately qualifies Kubernetes 1.34 DRA Topology Manager limitation.
             dra_path = CDI_DIR / "manifests" / "k8s-tpu-dra-example.yaml"
@@ -3237,6 +3325,7 @@ class FreeTpuCdiTests(unittest.TestCase):
             self.assertIn("TPU_SKIP_MDS_QUERY=true", dra_text)
             self.assertIn("freetpu.dev/tpu=numa0-4", dra_text)
             self.assertIn("freetpu.dev/tpu=numa1-4", dra_text)
+            self.assertIn("--omit-visible-env", dra_text)
 
             # Verify README keeps containerd GHSA-33vj-92qq-66hc security prerequisite
             # before the general Quickstart section and documents --chip-id-map /
@@ -3247,6 +3336,7 @@ class FreeTpuCdiTests(unittest.TestCase):
             self.assertLess(sec_idx, qs_idx)
             self.assertNotIn("2.1.x+", readme_text)
             self.assertIn("--chip-id-map", readme_text)
+            self.assertIn("--omit-visible-env", readme_text)
             self.assertIn("-e TPU_VISIBLE_CHIPS=", readme_text)
             self.assertIn("-e TPU_VISIBLE_DEVICES=", readme_text)
             self.assertIn("TPU_ACCELERATOR_TYPE", readme_text)

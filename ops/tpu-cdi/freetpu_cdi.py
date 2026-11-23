@@ -1199,6 +1199,7 @@ def _build_device_env(
     single_host_env: bool = False,
     include_bounds_env: bool = True,
     verified_visibility: Optional[Tuple[Sequence[int], Sequence[int]]] = None,
+    omit_visible_env: bool = False,
 ) -> List[str]:
     """Build per-device CDI `containerEdits.env` entries.
 
@@ -1212,8 +1213,10 @@ def _build_device_env(
       discovery is disabled via `TPU_SKIP_MDS_QUERY=true`).
     - `TPU_VISIBLE_CHIPS` and `TPU_VISIBLE_DEVICES` are emitted ONLY when
       `verified_visibility` supplies verified runtime ordinals (from sysfs
-      `chip_id` or explicit `--chip-id-map`), preserving workload-provided
-      visibility when ordinals are unverified.
+      `chip_id` or explicit `--chip-id-map`) AND `omit_visible_env` is False.
+      Pass `omit_visible_env=True` (`--omit-visible-env`) for multi-process
+      launchers such as PyTorch/XLA `xmp.spawn()` that assign per-rank chip
+      visibility via `os.environ.setdefault`.
     - Independently composable unit selectors (`pci-*`, `group-pci-*`) omit
       visibility, host bounds, and accelerator type so combining multiple
       selectors never overwrites OCI env settings.
@@ -1226,7 +1229,7 @@ def _build_device_env(
         include_bounds_env
         and _is_supported_single_host_chip_count(physical_chip_count, generations)
     ):
-        if verified_visibility is not None:
+        if verified_visibility is not None and not omit_visible_env:
             vis_chips, vis_devices = verified_visibility
             env.append("TPU_VISIBLE_CHIPS=" + ",".join(str(idx) for idx in vis_chips))
             env.append("TPU_VISIBLE_DEVICES=" + ",".join(str(idx) for idx in vis_devices))
@@ -1326,16 +1329,14 @@ def _compute_topology_slices(
         discovered_numa = d_key[1]
         pcie_root = d_key[2]
         slice_chip_count = len(slice_phys_indices)
-        # Capacity-pinned and topology-identity-bound selector names
-        # (`numa<node>-<chips>` / `pcie-<root>-<chips>`) ensure neither partial
-        # chip loss nor loss of an earlier PCIe root can shrink or retarget an
-        # existing selector to a different root complex.
+        # Always emit the stable root-qualified selector (`pcie-<root>-<chips>`)
+        # alongside any unique `numa<node>-<chips>` alias so workloads pinned to
+        # `pcie-<root>-<chips>` (e.g. when two roots share a NUMA node) stay valid
+        # even if a sibling root disappears and makes `numa<node>-<chips>` unique.
         pcie_root_token = _pci_bdf_token(pcie_root)
-        candidate_names = (
-            [f"numa{discovered_numa}-{slice_chip_count}"]
-            if use_explicit_numa and discovered_numa is not None
-            else [f"pcie-{pcie_root_token}-{slice_chip_count}"]
-        )
+        candidate_names: List[str] = [f"pcie-{pcie_root_token}-{slice_chip_count}"]
+        if use_explicit_numa and discovered_numa is not None:
+            candidate_names.insert(0, f"numa{discovered_numa}-{slice_chip_count}")
         verified_vis = _resolve_verified_visibility_ordinals(
             d_chips,
             chips,
@@ -1402,6 +1403,7 @@ def build_cdi_spec(
     single_host_env: bool = False,
     cdi_version: str = DEFAULT_CDI_VERSION,
     chip_id_map: Optional[Dict[str, int]] = None,
+    omit_visible_env: bool = False,
 ) -> Dict[str, Any]:
     """Build a CNCF CDI JSON specification dictionary (default: CDI v0.6.0, host-safe env).
 
@@ -1572,6 +1574,7 @@ def build_cdi_spec(
             single_host_env=inject_single_host_env,
             include_bounds_env=True,
             verified_visibility=slice_visibility,
+            omit_visible_env=omit_visible_env,
         )
         slice_ann_base: Dict[str, str] = {
             "freetpu.dev/allocation-unit": topo_slice.allocation_unit,
@@ -1635,6 +1638,7 @@ def build_cdi_spec(
         single_host_env=inject_single_host_env,
         include_bounds_env=all_supported_topology,
         verified_visibility=all_visibility,
+        omit_visible_env=omit_visible_env,
     )
     all_edits: Dict[str, Any] = {"deviceNodes": list(seen_group_nodes.values())}
     if all_env:
@@ -2537,6 +2541,7 @@ def reconcile_cdi_spec(
     cdi_version: str = DEFAULT_CDI_VERSION,
     vfio_mode: str = "auto",
     chip_id_map: Optional[Dict[str, int]] = None,
+    omit_visible_env: bool = False,
 ) -> Tuple[bool, str]:
     """Generate, validate, and atomically publish a live CDI spec, invalidating stale files on error."""
     if not isinstance(kind, str) or not _CDI_KIND_RE.match(kind):
@@ -2563,6 +2568,7 @@ def reconcile_cdi_spec(
             single_host_env=single_host_env,
             cdi_version=cdi_version,
             chip_id_map=chip_id_map,
+            omit_visible_env=omit_visible_env,
         )
     except Exception as exc:  # noqa: BLE001
         removed, cleanup_err = _invalidate_spec(output_path)
@@ -2682,9 +2688,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Opt in to injecting single-host isolated libtpu env overrides "
             "(MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353, TPU_HOST_BOUNDS=1,1,1, "
             "TPU_WORKER_HOSTNAMES=localhost, TPU_WORKER_ID=0, TPU_SKIP_MDS_QUERY=true, "
-            "plus TPU_CHIPS_PER_HOST_BOUNDS and verified TPU_VISIBLE_CHIPS / "
-            "TPU_VISIBLE_DEVICES when runtime ordinals are verified via sysfs chip_id "
-            "or --chip-id-map)."
+            "plus TPU_CHIPS_PER_HOST_BOUNDS, TPU_ACCELERATOR_TYPE, and verified "
+            "TPU_VISIBLE_CHIPS / TPU_VISIBLE_DEVICES when runtime ordinals are verified "
+            "via sysfs chip_id or --chip-id-map unless --omit-visible-env is set)."
+        ),
+    )
+    gen.add_argument(
+        "--omit-visible-env",
+        action="store_true",
+        default=False,
+        help=(
+            "With --single-host-env, omit TPU_VISIBLE_CHIPS and TPU_VISIBLE_DEVICES "
+            "while keeping isolated networking and topology settings (required for "
+            "multi-process launchers like PyTorch/XLA xmp.spawn() that assign per-rank "
+            "visibility via os.environ.setdefault)."
         ),
     )
     gen.add_argument(
@@ -2834,6 +2851,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Opt in to injecting single-host isolated libtpu environment overrides.",
     )
     sync.add_argument(
+        "--omit-visible-env",
+        action="store_true",
+        default=False,
+        help=(
+            "With --single-host-env, omit TPU_VISIBLE_CHIPS and TPU_VISIBLE_DEVICES "
+            "so multi-process launchers like PyTorch/XLA xmp.spawn() can assign per-rank "
+            "visibility via os.environ.setdefault."
+        ),
+    )
+    sync.add_argument(
         "--sysfs-root",
         type=Path,
         default=Path("/sys"),
@@ -2925,6 +2952,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 single_host_env=args.single_host_env,
                 cdi_version=args.cdi_version,
                 chip_id_map=parsed_chip_map,
+                omit_visible_env=args.omit_visible_env,
             )
         except Exception as exc:  # noqa: BLE001
             if not args.stdout and not args.allow_missing_vfio:
@@ -3051,6 +3079,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 cdi_version=args.cdi_version,
                 vfio_mode=args.vfio_mode,
                 chip_id_map=parsed_chip_map,
+                omit_visible_env=args.omit_visible_env,
             )
             sys.stderr.write(f"freetpu-cdi sync: {msg}\n")
             return 0 if ok else 1
@@ -3079,6 +3108,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     cdi_version=args.cdi_version,
                     vfio_mode=args.vfio_mode,
                     chip_id_map=parsed_chip_map,
+                    omit_visible_env=args.omit_visible_env,
                 )
             except Exception as exc:  # noqa: BLE001
                 removed, cleanup_err = _invalidate_spec(args.output)

@@ -2593,6 +2593,58 @@ TPU Runtime Utilization
                 [(c + 1) * 4 * 1024**3 for c in range(4)],
             )
 
+            # Conclusive per-core duty-cycle response (8 distinct IDs 0..7 on a 4-chip /
+            # 8-core Ironwood host) MUST keep all 8 duty readings even when HBM RPCs
+            # return only 6 partial cores (0..5)!
+            class _IronwoodFullPerCoreDutyPartialHbmStub:
+                def __init__(self, channel):
+                    self.channel = channel
+
+                def GetRuntimeMetric(self, req, timeout=None):
+                    del timeout
+                    if req.metric_name == "tpu.runtime.hbm.memory.usage.bytes":
+                        items = [_make_item(c, as_int=(c + 1) * 4 * 1024**3) for c in range(6)]
+                    elif req.metric_name == "tpu.runtime.hbm.memory.total.bytes":
+                        items = [_make_item(c, as_int=96 * 1024**3) for c in range(6)]
+                    elif req.metric_name == "tpu.runtime.tensorcore.dutycycle.percent":
+                        items = [_make_item(c, as_double=10.0 * (c + 1)) for c in range(8)]
+                    else:
+                        items = []
+                    return SimpleNamespace(metric=SimpleNamespace(metrics=items))
+
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.dict(_te._GRPC_CHANNELS, {}, clear=True),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "grpc": _FakeGrpc,
+                        "tpu_info": SimpleNamespace(),
+                        "tpu_info.proto": SimpleNamespace(),
+                        "tpu_info.proto.tpu_metric_service_pb2": fake_pb2,
+                        "tpu_info.proto.tpu_metric_service_pb2_grpc": SimpleNamespace(
+                            RuntimeMetricServiceStub=_IronwoodFullPerCoreDutyPartialHbmStub
+                        ),
+                    },
+                ),
+            ):
+                iw_full_duty_partial_hbm_snap = _te.collect_snapshot(
+                    sysfs_root=iw_sysfs,
+                    dev_root=iw_dev,
+                    proc_root=iw_proc,
+                    tpu_info_bin="tpu-info",
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=iw_root / "no-shm",
+                )
+            self.assertEqual(
+                [d.duty_cycle_percent for d in iw_full_duty_partial_hbm_snap.devices],
+                [10.0 * (c + 1) for c in range(8)],
+            )
+            self.assertEqual(
+                [d.hbm_used_bytes for d in iw_full_duty_partial_hbm_snap.devices[:6]],
+                [(c + 1) * 4 * 1024**3 for c in range(6)],
+            )
+
             # Custom `--tpu-info-bin` specified by bare name (without `/`) MUST invoke
             # that configured executable via PATH instead of taking the default gRPC shortcut.
             custom_rows = _te.parse_tpu_info_output(

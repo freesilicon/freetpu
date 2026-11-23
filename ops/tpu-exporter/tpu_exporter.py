@@ -1298,54 +1298,65 @@ def _query_grpc_runtime_metrics(
     # collected BEFORE filtering unset/NaN/negative gauges:
     # - On `devices_per_chip == 1` generations (v5e, v6e), always join 1:1.
     # - On `devices_per_chip > 1` generations (Ironwood tpu7x, v2/v3, v4/v5p):
-    #   Require unambiguous layout evidence so partial HBM replies (e.g. HBM
-    #   `0..3` or `0..5` alongside physical-chip duty `0..3` on an 8-core /
-    #   4-chip Ironwood host) can NEVER misclassify per-chip readings as per-core:
-    #   - Classify as 1:1 `per_core` ONLY when `raw_duty_ids == raw_hbm_ids` AND
-    #     `raw_duty_ids` provides positive per-core evidence beyond equality with
-    #     a partial HBM set (`len(raw_duty_ids) > expected_chip_count` OR any ID
-    #     `>= expected_chip_count`, which cannot be a physical chip ID on the
-    #     discovered host).
-    #   - Else if `expanded(raw_duty_ids) == raw_hbm_ids` (exact 1:N bijection,
-    #     handling both full hosts `{0..3} -> {0..7}` and sliced partitions
-    #     `{2,3} -> {4..7}`), treat as `per_chip` and expand only valid readings.
-    #   - Otherwise treat as `ambiguous` and omit duty-cycle attachment rather
-    #     than misassigning readings to the wrong core.
+    #   Determine per-chip vs per-core layout without letting partial HBM replies
+    #   discard conclusive per-core duty readings OR misclassify physical-chip IDs:
+    #   - If `all_hbm_core_ids` is present and `expanded(raw_duty_ids) == raw_hbm_ids`
+    #     (exact 1:N bijection, handling full hosts `{0..3} -> {0..7}`, sliced
+    #     partitions `{2,3} -> {4..7}`, and non-zero offsets `{4,5} -> {8..11}`),
+    #     treat as `per_chip` and expand only valid readings.
+    #   - Else if `expected_chip_count` is known and `raw_duty_ids` conclusively
+    #     proves per-core layout — either by pigeonhole count (`len(raw_duty_ids)
+    #     > expected_chip_count`, e.g. 8 distinct duty IDs on a 4-chip host even
+    #     when HBM only returned 6 cores!) or by containing zero-based logical
+    #     core IDs `>= expected_chip_count` within `[0, expected_core_count)` —
+    #     treat as 1:1 `per_core` independently of partial HBM coverage.
+    #   - Else if HBM is completely absent and `raw_duty_ids == {0..expected_chip_count-1}`,
+    #     treat as `per_chip`.
+    #   - Otherwise (e.g. partial HBM `{0..3}` + duty `{0..3}` on an 8-core /
+    #     4-chip host, where `{0..3}` could equally be physical chips or cores)
+    #     treat as `ambiguous` and omit duty-cycle attachment.
     duty_layout = "per_core"
     if devices_per_chip > 1 and duty_by_chip and all(k.isdigit() for k in raw_duty_ids):
         raw_duty_int_ids = {int(k) for k in raw_duty_ids}
         all_hbm_core_ids = {int(k) for k in raw_hbm_ids if k.isdigit()}
-        expected_chip_count = (
-            len(devices) // devices_per_chip
+        expected_core_count = (
+            len(devices)
             if len(devices) > 0 and len(devices) % devices_per_chip == 0
+            else None
+        )
+        expected_chip_count = (
+            expected_core_count // devices_per_chip
+            if expected_core_count is not None
             else None
         )
         has_unambiguous_per_core_ids = expected_chip_count is not None and (
             len(raw_duty_int_ids) > expected_chip_count
-            or any(cid >= expected_chip_count for cid in raw_duty_int_ids)
+            or (
+                expected_core_count is not None
+                and all(0 <= cid < expected_core_count for cid in raw_duty_int_ids)
+                and all(0 <= hid < expected_core_count for hid in all_hbm_core_ids)
+                and any(cid >= expected_chip_count for cid in raw_duty_int_ids)
+            )
         )
-        if all_hbm_core_ids:
-            expanded_raw = {
-                cid * devices_per_chip + off
-                for cid in raw_duty_int_ids
-                for off in range(devices_per_chip)
-            }
-            if raw_duty_int_ids == all_hbm_core_ids and has_unambiguous_per_core_ids:
-                duty_layout = "per_core"
-            elif (
-                expanded_raw == all_hbm_core_ids
-                and len(raw_duty_int_ids) * devices_per_chip == len(all_hbm_core_ids)
-            ):
-                duty_layout = "per_chip"
-            else:
-                duty_layout = "ambiguous"
-        elif expected_chip_count is not None:
-            if has_unambiguous_per_core_ids:
-                duty_layout = "per_core"
-            elif raw_duty_int_ids == set(range(expected_chip_count)):
-                duty_layout = "per_chip"
-            else:
-                duty_layout = "ambiguous"
+        expanded_raw = {
+            cid * devices_per_chip + off
+            for cid in raw_duty_int_ids
+            for off in range(devices_per_chip)
+        }
+        if (
+            all_hbm_core_ids
+            and expanded_raw == all_hbm_core_ids
+            and len(raw_duty_int_ids) * devices_per_chip == len(all_hbm_core_ids)
+        ):
+            duty_layout = "per_chip"
+        elif has_unambiguous_per_core_ids:
+            duty_layout = "per_core"
+        elif (
+            not all_hbm_core_ids
+            and expected_chip_count is not None
+            and raw_duty_int_ids == set(range(expected_chip_count))
+        ):
+            duty_layout = "per_chip"
         else:
             duty_layout = "ambiguous"
 
