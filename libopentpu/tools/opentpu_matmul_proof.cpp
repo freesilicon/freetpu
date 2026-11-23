@@ -543,6 +543,19 @@ bool run_pjrt_api_proof(void* lib, bool mock_mode, int num_runs) {
     PJRT_Buffer* outs[1] = {nullptr};
 
     auto upload = [&](const void* data, PJRT_Buffer** out_b) -> bool {
+      static const int64_t kMinorToMajor[2] = {1, 0};
+      static const int64_t kTileDims[4] = {2, 128, 2, 1};
+      static const size_t kTileDimSizes[2] = {2, 2};
+      PJRT_Buffer_MemoryLayout native_layout = {};
+      native_layout.struct_size = PJRT_Buffer_MemoryLayout_STRUCT_SIZE;
+      native_layout.type = PJRT_Buffer_MemoryLayout_Type_Tiled;
+      native_layout.tiled.struct_size = PJRT_Buffer_MemoryLayout_Tiled_STRUCT_SIZE;
+      native_layout.tiled.minor_to_major = kMinorToMajor;
+      native_layout.tiled.minor_to_major_size = 2;
+      native_layout.tiled.tile_dims = kTileDims;
+      native_layout.tiled.tile_dim_sizes = kTileDimSizes;
+      native_layout.tiled.num_tiles = 2;
+
       PJRT_Client_BufferFromHostBuffer_Args a = {};
       a.struct_size = PJRT_Client_BufferFromHostBuffer_Args_STRUCT_SIZE;
       a.client = client;
@@ -552,6 +565,7 @@ bool run_pjrt_api_proof(void* lib, bool mock_mode, int num_runs) {
       a.num_dims = 2;
       a.host_buffer_semantics = PJRT_HostBufferSemantics_kImmutableUntilTransferCompletes;
       a.device = ad.addressable_devices[0];
+      a.device_layout = &native_layout;
       if (PJRT_Error* e = api->PJRT_Client_BufferFromHostBuffer(&a)) {
         print_pjrt_error(api, "BufferFromHostBuffer", e);
         return false;

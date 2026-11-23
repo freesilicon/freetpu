@@ -1192,6 +1192,97 @@ static void test_pjrt_api_mock() {
   edest.executable = ge.executable;
   OT_CHECK(api->PJRT_Executable_Destroy(&edest) == nullptr);
 
+  // Verify default (null device_layout) 128x128 BF16 upload remains dense while explicit
+  // {1,0:T(2,128)(2,1)} stores native tiled bytes and reports matching repeated tiling.
+  {
+    const int64_t d2[2] = {128, 128};
+    const int64_t m2m[2] = {1, 0};
+    const int64_t valid_tiles[4] = {2, 128, 2, 1};
+    const size_t valid_tile_sizes[2] = {2, 2};
+    const int64_t bad_tiles[2] = {2, 128};
+    const size_t bad_tile_sizes[1] = {2};
+    std::vector<uint16_t> tile_src(128u * 128u, 0x3f80u);
+    tile_src[128] = 0x4000u;
+
+    PJRT_Client_BufferFromHostBuffer_Args up_dense = {};
+    up_dense.struct_size = PJRT_Client_BufferFromHostBuffer_Args_STRUCT_SIZE;
+    up_dense.client = cc.client;
+    up_dense.data = tile_src.data();
+    up_dense.type = PJRT_Buffer_Type_BF16;
+    up_dense.dims = d2;
+    up_dense.num_dims = 2;
+    up_dense.device = ad.addressable_devices[0];
+    OT_CHECK(api->PJRT_Client_BufferFromHostBuffer(&up_dense) == nullptr);
+    PJRT_Buffer_GetMemoryLayout_Args ml_dense = {};
+    ml_dense.struct_size = PJRT_Buffer_GetMemoryLayout_Args_STRUCT_SIZE;
+    ml_dense.buffer = up_dense.buffer;
+    OT_CHECK(api->PJRT_Buffer_GetMemoryLayout(&ml_dense) == nullptr);
+    OT_CHECK(ml_dense.layout.tiled.num_tiles == 0);
+    PJRT_Event_Destroy_Args evd = {};
+    evd.struct_size = PJRT_Event_Destroy_Args_STRUCT_SIZE;
+    evd.event = up_dense.done_with_host_buffer;
+    OT_CHECK(api->PJRT_Event_Destroy(&evd) == nullptr);
+    PJRT_Buffer_Destroy_Args bd = {};
+    bd.struct_size = PJRT_Buffer_Destroy_Args_STRUCT_SIZE;
+    bd.buffer = up_dense.buffer;
+    OT_CHECK(api->PJRT_Buffer_Destroy(&bd) == nullptr);
+
+    PJRT_Buffer_MemoryLayout good_layout = {};
+    good_layout.struct_size = PJRT_Buffer_MemoryLayout_STRUCT_SIZE;
+    good_layout.type = PJRT_Buffer_MemoryLayout_Type_Tiled;
+    good_layout.tiled.struct_size = PJRT_Buffer_MemoryLayout_Tiled_STRUCT_SIZE;
+    good_layout.tiled.minor_to_major = m2m;
+    good_layout.tiled.minor_to_major_size = 2;
+    good_layout.tiled.tile_dims = valid_tiles;
+    good_layout.tiled.tile_dim_sizes = valid_tile_sizes;
+    good_layout.tiled.num_tiles = 2;
+
+    PJRT_Client_BufferFromHostBuffer_Args up_tiled = {};
+    up_tiled.struct_size = PJRT_Client_BufferFromHostBuffer_Args_STRUCT_SIZE;
+    up_tiled.client = cc.client;
+    up_tiled.data = tile_src.data();
+    up_tiled.type = PJRT_Buffer_Type_BF16;
+    up_tiled.dims = d2;
+    up_tiled.num_dims = 2;
+    up_tiled.device = ad.addressable_devices[0];
+    up_tiled.device_layout = &good_layout;
+    OT_CHECK(api->PJRT_Client_BufferFromHostBuffer(&up_tiled) == nullptr);
+    PJRT_Buffer_GetMemoryLayout_Args ml_tiled = {};
+    ml_tiled.struct_size = PJRT_Buffer_GetMemoryLayout_Args_STRUCT_SIZE;
+    ml_tiled.buffer = up_tiled.buffer;
+    OT_CHECK(api->PJRT_Buffer_GetMemoryLayout(&ml_tiled) == nullptr);
+    OT_CHECK(ml_tiled.layout.tiled.num_tiles == 2 &&
+             ml_tiled.layout.tiled.tile_dim_sizes[0] == 2 &&
+             ml_tiled.layout.tiled.tile_dim_sizes[1] == 2 &&
+             ml_tiled.layout.tiled.tile_dims[0] == 2 &&
+             ml_tiled.layout.tiled.tile_dims[1] == 128 &&
+             ml_tiled.layout.tiled.tile_dims[2] == 2 &&
+             ml_tiled.layout.tiled.tile_dims[3] == 1);
+    evd.event = up_tiled.done_with_host_buffer;
+    OT_CHECK(api->PJRT_Event_Destroy(&evd) == nullptr);
+    bd.buffer = up_tiled.buffer;
+    OT_CHECK(api->PJRT_Buffer_Destroy(&bd) == nullptr);
+
+    // Reject single-tile {1,0:T(2,128)} and reject explicit tiled + strided host.
+    PJRT_Buffer_MemoryLayout wrong_layout = good_layout;
+    wrong_layout.tiled.tile_dims = bad_tiles;
+    wrong_layout.tiled.tile_dim_sizes = bad_tile_sizes;
+    wrong_layout.tiled.num_tiles = 1;
+    PJRT_Client_BufferFromHostBuffer_Args up_wrong = up_tiled;
+    up_wrong.device_layout = &wrong_layout;
+    PJRT_Error* wrong_err = api->PJRT_Client_BufferFromHostBuffer(&up_wrong);
+    OT_CHECK(wrong_err != nullptr);
+    destroy_pjrt_error(api, wrong_err);
+
+    const int64_t transposed_strides[2] = {2, 256};
+    PJRT_Client_BufferFromHostBuffer_Args up_strided = up_tiled;
+    up_strided.byte_strides = transposed_strides;
+    up_strided.num_byte_strides = 2;
+    PJRT_Error* strided_err = api->PJRT_Client_BufferFromHostBuffer(&up_strided);
+    OT_CHECK(strided_err != nullptr);
+    destroy_pjrt_error(api, strided_err);
+  }
+
   PJRT_Client_Destroy_Args cd = {};
   cd.struct_size = PJRT_Client_Destroy_Args_STRUCT_SIZE;
   cd.client = cc.client;
