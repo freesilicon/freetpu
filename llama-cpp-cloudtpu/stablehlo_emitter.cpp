@@ -131,8 +131,16 @@ public:
 
     SsaValue emit_compare(const char* dir, const SsaValue& a, const SsaValue& b) {
         SsaValue out = next_val(PjrtDType::PRED, a.dims);
+        const char* cmp_type = "FLOAT";
+        if (a.dtype == PjrtDType::S8 || a.dtype == PjrtDType::S16 ||
+            a.dtype == PjrtDType::S32 || a.dtype == PjrtDType::S64) {
+            cmp_type = "SIGNED";
+        } else if (a.dtype == PjrtDType::U8 || a.dtype == PjrtDType::U32 ||
+                   a.dtype == PjrtDType::PRED) {
+            cmp_type = "UNSIGNED";
+        }
         body_ << "    " << out.name << " = stablehlo.compare " << dir << ", " << a.name << ", " << b.name
-              << ", FLOAT : (" << a.mlir_type() << ", " << b.mlir_type() << ") -> "
+              << ", " << cmp_type << " : (" << a.mlir_type() << ", " << b.mlir_type() << ") -> "
               << out.mlir_type() << "\n";
         return out;
     }
@@ -325,6 +333,111 @@ public:
         return out;
     }
 
+    SsaValue emit_replica_id() {
+        SsaValue out = next_val(PjrtDType::U32, {});
+        body_ << "    " << out.name << " = \"stablehlo.replica_id\"() : () -> tensor<ui32>\n";
+        return out;
+    }
+
+    SsaValue emit_dynamic_slice(const SsaValue& x,
+                                const std::vector<SsaValue>& start_indices,
+                                const std::vector<int64_t>& slice_sizes) {
+        SsaValue out = next_val(x.dtype, slice_sizes);
+        body_ << "    " << out.name << " = \"stablehlo.dynamic_slice\"(" << x.name;
+        for (const auto& idx : start_indices) {
+            body_ << ", " << idx.name;
+        }
+        body_ << ") {\n"
+              << "      slice_sizes = array<i64: ";
+        for (size_t i = 0; i < slice_sizes.size(); ++i) {
+            if (i > 0) body_ << ", ";
+            body_ << slice_sizes[i];
+        }
+        body_ << ">\n    } : (" << x.mlir_type();
+        for (const auto& idx : start_indices) {
+            body_ << ", " << idx.mlir_type();
+        }
+        body_ << ") -> " << out.mlir_type() << "\n";
+        return out;
+    }
+
+    static std::string format_replica_groups_1d(int32_t num_chips) {
+        std::ostringstream oss = make_classic_stream();
+        oss << "dense<[[";
+        for (int32_t i = 0; i < num_chips; ++i) {
+            if (i > 0) oss << ", ";
+            oss << i;
+        }
+        oss << "]]> : tensor<1x" << num_chips << "xi64>";
+        return oss.str();
+    }
+
+    SsaValue emit_all_reduce(const SsaValue& x, int32_t num_chips, const char* reducer_op) {
+        SsaValue out = next_val(x.dtype, x.dims);
+        const std::string scalar_t = format_mlir_tensor_type(x.dtype, {});
+        const std::string lhs_arg = next_tmp_name("ar_lhs");
+        const std::string rhs_arg = next_tmp_name("ar_rhs");
+        const std::string acc_val = next_tmp_name("ar_acc");
+        body_ << "    " << out.name << " = \"stablehlo.all_reduce\"(" << x.name << ") ({\n"
+              << "    ^bb0(" << lhs_arg << ": " << scalar_t << ", " << rhs_arg << ": " << scalar_t << "):\n"
+              << "      " << acc_val << " = " << reducer_op << " " << lhs_arg << ", " << rhs_arg
+              << " : " << scalar_t << "\n"
+              << "      stablehlo.return " << acc_val << " : " << scalar_t << "\n"
+              << "    }) {\n"
+              << "      replica_groups = " << format_replica_groups_1d(num_chips) << ",\n"
+              << "      channel_handle = #stablehlo.channel_handle<handle = 0, type = 0>\n"
+              << "    } : (" << x.mlir_type() << ") -> " << out.mlir_type() << "\n";
+        return out;
+    }
+
+    SsaValue emit_all_gather(const SsaValue& x, int64_t gather_dim, int32_t num_chips) {
+        if (num_chips <= 0) {
+            throw std::invalid_argument("emit_all_gather: num_chips must be positive");
+        }
+        if (gather_dim < 0 || static_cast<size_t>(gather_dim) >= x.dims.size()) {
+            throw std::invalid_argument("emit_all_gather: gather_dim out of bounds");
+        }
+        std::vector<int64_t> out_dims = x.dims;
+        out_dims[static_cast<size_t>(gather_dim)] *= static_cast<int64_t>(num_chips);
+        SsaValue out = next_val(x.dtype, out_dims);
+        body_ << "    " << out.name << " = \"stablehlo.all_gather\"(" << x.name << ") {\n"
+              << "      all_gather_dim = " << gather_dim << " : i64,\n"
+              << "      replica_groups = " << format_replica_groups_1d(num_chips) << ",\n"
+              << "      channel_handle = #stablehlo.channel_handle<handle = 0, type = 0>\n"
+              << "    } : (" << x.mlir_type() << ") -> " << out.mlir_type() << "\n";
+        return out;
+    }
+
+    SsaValue emit_reduce_scatter(const SsaValue& x, int64_t scatter_dim, int32_t num_chips, const char* reducer_op) {
+        if (num_chips <= 0) {
+            throw std::invalid_argument("emit_reduce_scatter: num_chips must be positive");
+        }
+        if (scatter_dim < 0 || static_cast<size_t>(scatter_dim) >= x.dims.size()) {
+            throw std::invalid_argument("emit_reduce_scatter: scatter_dim out of bounds");
+        }
+        std::vector<int64_t> out_dims = x.dims;
+        if (out_dims[static_cast<size_t>(scatter_dim)] % num_chips != 0) {
+            throw std::invalid_argument("emit_reduce_scatter: scatter_dim not divisible by num_chips");
+        }
+        out_dims[static_cast<size_t>(scatter_dim)] /= static_cast<int64_t>(num_chips);
+        SsaValue out = next_val(x.dtype, out_dims);
+        const std::string scalar_t = format_mlir_tensor_type(x.dtype, {});
+        const std::string lhs_arg = next_tmp_name("rs_lhs");
+        const std::string rhs_arg = next_tmp_name("rs_rhs");
+        const std::string acc_val = next_tmp_name("rs_acc");
+        body_ << "    " << out.name << " = \"stablehlo.reduce_scatter\"(" << x.name << ") ({\n"
+              << "    ^bb0(" << lhs_arg << ": " << scalar_t << ", " << rhs_arg << ": " << scalar_t << "):\n"
+              << "      " << acc_val << " = " << reducer_op << " " << lhs_arg << ", " << rhs_arg
+              << " : " << scalar_t << "\n"
+              << "      stablehlo.return " << acc_val << " : " << scalar_t << "\n"
+              << "    }) {\n"
+              << "      scatter_dimension = " << scatter_dim << " : i64,\n"
+              << "      replica_groups = " << format_replica_groups_1d(num_chips) << ",\n"
+              << "      channel_handle = #stablehlo.channel_handle<handle = 0, type = 0>\n"
+              << "    } : (" << x.mlir_type() << ") -> " << out.mlir_type() << "\n";
+        return out;
+    }
+
     std::string finish(const std::vector<SsaValue>& outputs) const {
         std::ostringstream mod = make_classic_stream();
         mod << "module @ggml_cloudtpu {\n";
@@ -406,6 +519,8 @@ SsaValue dequantize_split_weight(StableHloBuilder& b,
         SsaValue lo_u8 = b.emit_binary("stablehlo.and", qs, mask);
         SsaValue hi_u8 = b.emit_binary("stablehlo.shift_right_logical", qs, shift4);
         SsaValue cat_u8 = b.emit_concatenate({lo_u8, hi_u8}, 4);
+        // Convert U8 -> S32 -> float so TPU VPU uses native 32-bit S32->F32 hardware conversion
+        // (empirically ~19% faster on v5e-1 Q4_K_M than direct U8->F32).
         SsaValue cat_i32 = b.emit_convert(cat_u8, PjrtDType::S32);
         if (storage == TensorStorageKind::Q4_0_SPLIT) {
             SsaValue eight = b.emit_const_splat_int(8, blk_dims, PjrtDType::S32);
@@ -525,14 +640,14 @@ uint64_t fnv1a_64(const std::string& s) {
     return h;
 }
 
-std::string build_canonical_cache_key(const std::string& mlir_text) {
-    // Structural key combining size + two independent FNV hashes (64-bit normal + 64-bit salted)
-    // and exact length to prevent collisions without external SHA libraries.
+std::string build_canonical_cache_key(const std::string& mlir_text, int32_t spmd_chips) {
+    // Structural key combining size + two independent FNV hashes (64-bit normal + 64-bit salted),
+    // exact length, and SPMD chip count to prevent collisions without external SHA libraries.
     const uint64_t h1 = fnv1a_64(mlir_text);
     const uint64_t h2 = fnv1a_64(std::string("cloudtpu_v1:") + mlir_text);
     std::ostringstream oss = make_classic_stream();
     oss << std::hex << std::setfill('0') << std::setw(16) << h1
-        << std::setw(16) << h2 << "_" << std::dec << mlir_text.size();
+        << std::setw(16) << h2 << "_" << std::dec << mlir_text.size() << "_p" << spmd_chips;
     return oss.str();
 }
 
@@ -541,9 +656,12 @@ std::string build_canonical_cache_key(const std::string& mlir_text) {
 EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
     EmittedProgram prog;
     StableHloBuilder builder;
+    const int32_t P = std::max<int32_t>(1, spec.spmd_chips);
 
     struct TensorHandle {
         TensorStorageKind storage = TensorStorageKind::DENSE;
+        TensorShardingKind sharding = TensorShardingKind::REPLICATED;
+        int64_t logical_k = 0;
         SsaValue dense;
         SsaValue q_qs;
         SsaValue q_d;
@@ -557,10 +675,23 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
     for (const TensorSpec& in : spec.inputs) {
         TensorHandle th;
         th.storage = in.storage;
+        th.sharding = (P > 1) ? in.sharding : TensorShardingKind::REPLICATED;
+        th.logical_k = in.dims[3];
         const int64_t B3 = in.dims[0];
         const int64_t B2 = in.dims[1];
-        const int64_t M_or_N = in.dims[2];
-        const int64_t K = in.dims[3];
+        int64_t M_or_N = in.dims[2];
+        int64_t K = in.dims[3];
+        if (th.sharding == TensorShardingKind::SHARD_N) {
+            if (M_or_N % P != 0) {
+                throw std::runtime_error("emit_stablehlo_program: SHARD_N dim not divisible by spmd_chips");
+            }
+            M_or_N /= P;
+        } else if (th.sharding == TensorShardingKind::SHARD_K) {
+            if (K % P != 0) {
+                throw std::runtime_error("emit_stablehlo_program: SHARD_K dim not divisible by spmd_chips");
+            }
+            K /= P;
+        }
 
         if (in.storage == TensorStorageKind::DENSE) {
             std::vector<int64_t> dims = {B3, B2, M_or_N, K};
@@ -616,13 +747,30 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
             builder, th.storage, th.q_qs, th.q_d, th.has_q_m ? &th.q_m : nullptr, dequant_dt);
     };
 
+    auto resolve_replicated = [&](uint64_t id, PjrtDType dequant_dt = PjrtDType::BF16) -> SsaValue {
+        const TensorHandle& th = env.at(id);
+        SsaValue v = resolve_dense(id, dequant_dt);
+        if (P > 1 && th.sharding == TensorShardingKind::SHARD_N) {
+            return builder.emit_all_gather(v, 2, P);
+        }
+        if (P > 1 && th.sharding == TensorShardingKind::SHARD_K) {
+            return builder.emit_all_gather(v, 3, P);
+        }
+        return v;
+    };
+
     for (const OpNodeSpec& op : spec.ops) {
         const std::vector<int64_t> dst_dims = {op.dst.dims[0], op.dst.dims[1], op.dst.dims[2], op.dst.dims[3]};
         SsaValue result;
+        TensorShardingKind out_sharding = TensorShardingKind::REPLICATED;
 
         switch (op.kind) {
             case CloudOpKind::MUL_MAT: {
-                SsaValue x = resolve_dense(op.src_ids.at(1), PjrtDType::F32);
+                const TensorShardingKind w_sh = env.at(op.src_ids.at(0)).sharding;
+                const TensorShardingKind x_sh = env.at(op.src_ids.at(1)).sharding;
+                SsaValue x = (x_sh == TensorShardingKind::SHARD_K && w_sh == TensorShardingKind::SHARD_K)
+                                 ? resolve_dense(op.src_ids.at(1), PjrtDType::F32)
+                                 : resolve_replicated(op.src_ids.at(1), PjrtDType::F32);
                 const PjrtDType deq_dt =
                     (op.high_precision || x.dtype == PjrtDType::F32) ? PjrtDType::F32 : PjrtDType::BF16;
                 SsaValue w = resolve_dense(op.src_ids.at(0), deq_dt);
@@ -647,12 +795,40 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                     w = builder.emit_reshape(wb, {x.dims[0], x.dims[1], w.dims[2], w.dims[3]});
                 }
 
-                result = builder.emit_dot_general(
-                    x, w, {0, 1}, {0, 1}, {3}, {3}, dst_dims, op.dst.dtype, op.high_precision);
+                if (P > 1 && w_sh == TensorShardingKind::SHARD_N) {
+                    const std::vector<int64_t> local_out_dims = {x.dims[0], x.dims[1], x.dims[2], w.dims[2]};
+                    SsaValue local_out = builder.emit_dot_general(
+                        x, w, {0, 1}, {0, 1}, {3}, {3}, local_out_dims, op.dst.dtype, op.high_precision);
+                    if (op.keep_sharded_out) {
+                        result = local_out;
+                        out_sharding = TensorShardingKind::SHARD_K;
+                    } else {
+                        result = builder.emit_all_gather(local_out, 3, P);
+                        out_sharding = TensorShardingKind::REPLICATED;
+                    }
+                } else if (P > 1 && w_sh == TensorShardingKind::SHARD_K) {
+                    if (x_sh != TensorShardingKind::SHARD_K) {
+                        const int64_t K_local = w.dims[3];
+                        SsaValue rid = builder.emit_replica_id();
+                        SsaValue rid_i32 = builder.emit_convert(rid, PjrtDType::S32);
+                        SsaValue k_local_c = builder.emit_const_splat_int(K_local, {}, PjrtDType::S32);
+                        SsaValue k_off = builder.emit_binary("stablehlo.multiply", rid_i32, k_local_c);
+                        SsaValue zero_i32 = builder.emit_const_splat_int(0, {}, PjrtDType::S32);
+                        x = builder.emit_dynamic_slice(
+                            x, {zero_i32, zero_i32, zero_i32, k_off}, {x.dims[0], x.dims[1], x.dims[2], K_local});
+                    }
+                    SsaValue partial = builder.emit_dot_general(
+                        x, w, {0, 1}, {0, 1}, {3}, {3}, dst_dims, op.dst.dtype, op.high_precision);
+                    result = builder.emit_all_reduce(partial, P, "stablehlo.add");
+                    out_sharding = TensorShardingKind::REPLICATED;
+                } else {
+                    result = builder.emit_dot_general(
+                        x, w, {0, 1}, {0, 1}, {3}, {3}, dst_dims, op.dst.dtype, op.high_precision);
+                }
                 break;
             }
             case CloudOpKind::RMS_NORM: {
-                SsaValue x_in = resolve_dense(op.src_ids.at(0), PjrtDType::F32);
+                SsaValue x_in = resolve_replicated(op.src_ids.at(0), PjrtDType::F32);
                 SsaValue x = builder.emit_convert(x_in, PjrtDType::F32);
                 const std::vector<int64_t> red_dims = {x.dims[0], x.dims[1], x.dims[2]};
                 SsaValue sq = builder.emit_binary("stablehlo.multiply", x, x);
@@ -670,8 +846,8 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                 break;
             }
             case CloudOpKind::ROPE: {
-                SsaValue x_in = resolve_dense(op.src_ids.at(0), PjrtDType::F32);
-                SsaValue pos_in = resolve_dense(op.src_ids.at(1), PjrtDType::S32);
+                SsaValue x_in = resolve_replicated(op.src_ids.at(0), PjrtDType::F32);
+                SsaValue pos_in = resolve_replicated(op.src_ids.at(1), PjrtDType::S32);
                 SsaValue x = builder.emit_convert(x_in, PjrtDType::F32);
 
                 const int64_t B3 = x.dims[0];
@@ -688,7 +864,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
 
                 SsaValue inv_freq_c = builder.emit_const_1d_f32(inv_freq, {1, half});
                 if (op.src_ids.size() > 2 && op.src_ids[2] != 0) {
-                    SsaValue ff_raw = resolve_dense(op.src_ids[2], PjrtDType::F32);
+                    SsaValue ff_raw = resolve_replicated(op.src_ids[2], PjrtDType::F32);
                     SsaValue ff_f32 = builder.emit_convert(ff_raw, PjrtDType::F32);
                     SsaValue ff_slice = builder.emit_slice(ff_f32, {0, 0, 0, 0}, {1, 1, 1, half});
                     SsaValue ff_2d = builder.emit_reshape(ff_slice, {1, half});
@@ -762,17 +938,30 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                 break;
             }
             case CloudOpKind::SILU: {
-                SsaValue x = resolve_dense(op.src_ids.at(0), PjrtDType::F32);
+                const TensorShardingKind x_sh = env.at(op.src_ids.at(0)).sharding;
+                SsaValue x = (x_sh == TensorShardingKind::SHARD_K)
+                                 ? resolve_dense(op.src_ids.at(0), PjrtDType::F32)
+                                 : resolve_replicated(op.src_ids.at(0), PjrtDType::F32);
                 result = builder.emit_convert(emit_silu(builder, x), op.dst.dtype);
+                out_sharding = (x_sh == TensorShardingKind::SHARD_K) ? TensorShardingKind::SHARD_K
+                                                                     : TensorShardingKind::REPLICATED;
                 break;
             }
             case CloudOpKind::SWIGLU: {
                 SsaValue gate, up;
                 if (op.src_ids.size() >= 2 && op.src_ids[1] != 0) {
-                    gate = resolve_dense(op.src_ids[0], PjrtDType::F32);
-                    up = resolve_dense(op.src_ids[1], PjrtDType::F32);
+                    const TensorShardingKind g_sh = env.at(op.src_ids[0]).sharding;
+                    const TensorShardingKind u_sh = env.at(op.src_ids[1]).sharding;
+                    if (g_sh == TensorShardingKind::SHARD_K && u_sh == TensorShardingKind::SHARD_K) {
+                        gate = resolve_dense(op.src_ids[0], PjrtDType::F32);
+                        up = resolve_dense(op.src_ids[1], PjrtDType::F32);
+                        out_sharding = TensorShardingKind::SHARD_K;
+                    } else {
+                        gate = resolve_replicated(op.src_ids[0], PjrtDType::F32);
+                        up = resolve_replicated(op.src_ids[1], PjrtDType::F32);
+                    }
                 } else {
-                    SsaValue packed = resolve_dense(op.src_ids.at(0), PjrtDType::F32);
+                    SsaValue packed = resolve_replicated(op.src_ids.at(0), PjrtDType::F32);
                     const int64_t nc = packed.dims[3] / 2;
                     SsaValue h0 = builder.emit_slice(packed, {0, 0, 0, 0}, {packed.dims[0], packed.dims[1], packed.dims[2], nc});
                     SsaValue h1 = builder.emit_slice(packed, {0, 0, 0, nc}, {packed.dims[0], packed.dims[1], packed.dims[2], 2 * nc});
@@ -786,14 +975,14 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                 break;
             }
             case CloudOpKind::SOFT_MAX: {
-                SsaValue x_in = resolve_dense(op.src_ids.at(0), PjrtDType::F32);
+                SsaValue x_in = resolve_replicated(op.src_ids.at(0), PjrtDType::F32);
                 SsaValue s = builder.emit_convert(x_in, PjrtDType::F32);
                 if (op.soft_max.scale != 1.0f) {
                     SsaValue sc = builder.emit_const_splat_f32(op.soft_max.scale, s.dims, PjrtDType::F32);
                     s = builder.emit_binary("stablehlo.multiply", s, sc);
                 }
                 if (op.src_ids.size() > 1 && op.src_ids[1] != 0) {
-                    SsaValue m_raw = resolve_dense(op.src_ids[1], PjrtDType::F32);
+                    SsaValue m_raw = resolve_replicated(op.src_ids[1], PjrtDType::F32);
                     SsaValue m = builder.emit_convert(m_raw, PjrtDType::F32);
                     if (m.dims[2] > s.dims[2]) {
                         m = builder.emit_slice(m, {0, 0, 0, 0}, {m.dims[0], m.dims[1], s.dims[2], m.dims[3]});
@@ -833,7 +1022,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
             }
             case CloudOpKind::GET_ROWS: {
                 const TensorHandle& tbl = env.at(op.src_ids.at(0));
-                SsaValue idx_raw = resolve_dense(op.src_ids.at(1), PjrtDType::S32);
+                SsaValue idx_raw = resolve_replicated(op.src_ids.at(1), PjrtDType::S32);
                 // idx_raw: [1, B3, B2, N_idx] -> [B3, B2, N_idx, 1]
                 const int64_t B3 = dst_dims[0];
                 const int64_t B2 = dst_dims[1];
@@ -842,11 +1031,41 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                 SsaValue idx3 = builder.emit_iota(0, idx_col_dims, PjrtDType::S32);
                 SsaValue idx2 = builder.emit_iota(1, idx_col_dims, PjrtDType::S32);
                 SsaValue idx1 = builder.emit_reshape(idx_raw, idx_col_dims);
-                SsaValue start_indices = builder.emit_concatenate({idx3, idx2, idx1}, 3);
 
+                const bool is_shard_n = (P > 1 && tbl.sharding == TensorShardingKind::SHARD_N);
+                SsaValue start_indices;
+                SsaValue in_range;
+                if (is_shard_n) {
+                    // Row-sharded lookup: gather only the N_idx requested rows on each replica's
+                    // local shard, mask out non-local rows to 0, and all_reduce(add) the small
+                    // [B3, B2, N_idx, K] result instead of all-gathering the entire table.
+                    const int64_t local_rows =
+                        (tbl.storage == TensorStorageKind::DENSE) ? tbl.dense.dims[2] : tbl.q_d.dims[2];
+                    SsaValue rid_s32 = builder.emit_convert(builder.emit_replica_id(), PjrtDType::S32);
+                    SsaValue rid_b = builder.emit_broadcast_in_dim(rid_s32, {}, idx_col_dims);
+                    SsaValue local_rows_c = builder.emit_const_splat_int(local_rows, idx_col_dims, PjrtDType::S32);
+                    SsaValue row_start = builder.emit_binary("stablehlo.multiply", rid_b, local_rows_c);
+                    SsaValue row_end = builder.emit_binary("stablehlo.add", row_start, local_rows_c);
+                    SsaValue ge_start = builder.emit_compare("GE", idx1, row_start);
+                    SsaValue lt_end = builder.emit_compare("LT", idx1, row_end);
+                    in_range = builder.emit_binary("stablehlo.and", ge_start, lt_end);
+
+                    SsaValue rel_idx = builder.emit_binary("stablehlo.subtract", idx1, row_start);
+                    SsaValue zero_idx = builder.emit_const_splat_int(0, idx_col_dims, PjrtDType::S32);
+                    SsaValue max_idx = builder.emit_const_splat_int(
+                        std::max<int64_t>(0, local_rows - 1), idx_col_dims, PjrtDType::S32);
+                    SsaValue clamped_lo = builder.emit_binary("stablehlo.maximum", rel_idx, zero_idx);
+                    SsaValue local_idx1 = builder.emit_binary("stablehlo.minimum", clamped_lo, max_idx);
+                    start_indices = builder.emit_concatenate({idx3, idx2, local_idx1}, 3);
+                } else {
+                    start_indices = builder.emit_concatenate({idx3, idx2, idx1}, 3);
+                }
+
+                SsaValue local_rows_val;
                 if (tbl.storage == TensorStorageKind::DENSE) {
-                    SsaValue gathered = builder.emit_gather_3d_rows(tbl.dense, start_indices, dst_dims);
-                    result = builder.emit_convert(gathered, op.dst.dtype);
+                    const std::vector<int64_t> local_dst = {B3, B2, N_idx, tbl.dense.dims[3]};
+                    SsaValue gathered = builder.emit_gather_3d_rows(tbl.dense, start_indices, local_dst);
+                    local_rows_val = builder.emit_convert(gathered, op.dst.dtype);
                 } else {
                     // Gather quantized blocks first, then dequantize only the selected N_idx rows!
                     const int64_t NB = tbl.q_d.dims[3];
@@ -862,15 +1081,31 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                         g_m = builder.emit_gather_3d_rows(tbl.q_m, start_indices, {B3, B2, N_idx, NB});
                         g_m_ptr = &g_m;
                     }
-                    result = dequantize_split_weight(builder, tbl.storage, g_qs, g_d, g_m_ptr, op.dst.dtype);
+                    local_rows_val = dequantize_split_weight(builder, tbl.storage, g_qs, g_d, g_m_ptr, op.dst.dtype);
+                }
+
+                if (is_shard_n) {
+                    SsaValue mask_b = builder.emit_broadcast_in_dim(in_range, {0, 1, 2, 3}, dst_dims);
+                    const bool dst_is_int = (op.dst.dtype == PjrtDType::S8 || op.dst.dtype == PjrtDType::U8 ||
+                                             op.dst.dtype == PjrtDType::S16 || op.dst.dtype == PjrtDType::S32 ||
+                                             op.dst.dtype == PjrtDType::U32 || op.dst.dtype == PjrtDType::S64);
+                    SsaValue zeros_dst = dst_is_int
+                                             ? builder.emit_const_splat_int(0, dst_dims, op.dst.dtype)
+                                             : builder.emit_const_splat_f32(0.0f, dst_dims, op.dst.dtype);
+                    SsaValue masked = builder.emit_select(mask_b, local_rows_val, zeros_dst);
+                    result = builder.emit_all_reduce(masked, P, "stablehlo.add");
+                } else if (P > 1 && tbl.sharding == TensorShardingKind::SHARD_K) {
+                    result = builder.emit_all_gather(local_rows_val, 3, P);
+                } else {
+                    result = local_rows_val;
                 }
                 break;
             }
             case CloudOpKind::SET_ROWS: {
                 // src_ids: [0]=src_updates (b), [1]=row_indices (c), [2]=dst_table (a)
-                SsaValue upd_raw = resolve_dense(op.src_ids.at(0), op.dst.dtype);
-                SsaValue idx_raw = resolve_dense(op.src_ids.at(1), PjrtDType::S32);
-                SsaValue tbl = resolve_dense(op.src_ids.at(2), op.dst.dtype);
+                SsaValue upd_raw = resolve_replicated(op.src_ids.at(0), op.dst.dtype);
+                SsaValue idx_raw = resolve_replicated(op.src_ids.at(1), PjrtDType::S32);
+                SsaValue tbl = resolve_replicated(op.src_ids.at(2), op.dst.dtype);
                 SsaValue upd = builder.emit_convert(upd_raw, tbl.dtype);
                 const int64_t B3 = upd.dims[0];
                 const int64_t B2 = upd.dims[1];
@@ -892,10 +1127,28 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
             }
             case CloudOpKind::ADD:
             case CloudOpKind::MUL: {
-                SsaValue a = resolve_dense(op.src_ids.at(0), op.dst.dtype);
-                SsaValue b = resolve_dense(op.src_ids.at(1), op.dst.dtype);
-                SsaValue ab = broadcast_4d(builder, a, dst_dims);
-                SsaValue bb = broadcast_4d(builder, b, dst_dims);
+                const TensorHandle& a_th = env.at(op.src_ids.at(0));
+                const TensorHandle& b_th = env.at(op.src_ids.at(1));
+                SsaValue a, b;
+                std::vector<int64_t> calc_dims = dst_dims;
+                // Only run the local SHARD_K fast path when both operands have equal logical K
+                // widths matching the output; unequal K widths require periodic repeat-broadcast
+                // over the full logical K axis, so gather via resolve_replicated first.
+                if (P > 1 &&
+                    a_th.sharding == TensorShardingKind::SHARD_K &&
+                    b_th.sharding == TensorShardingKind::SHARD_K &&
+                    a_th.logical_k == b_th.logical_k &&
+                    a_th.logical_k == dst_dims[3]) {
+                    a = resolve_dense(op.src_ids.at(0), op.dst.dtype);
+                    b = resolve_dense(op.src_ids.at(1), op.dst.dtype);
+                    calc_dims[3] /= P;
+                    out_sharding = TensorShardingKind::SHARD_K;
+                } else {
+                    a = resolve_replicated(op.src_ids.at(0), op.dst.dtype);
+                    b = resolve_replicated(op.src_ids.at(1), op.dst.dtype);
+                }
+                SsaValue ab = broadcast_4d(builder, a, calc_dims);
+                SsaValue bb = broadcast_4d(builder, b, calc_dims);
                 const PjrtDType calc_dt = (op.dst.dtype == PjrtDType::F32) ? PjrtDType::F32 : PjrtDType::F32;
                 SsaValue af = builder.emit_convert(ab, calc_dt);
                 SsaValue bf = builder.emit_convert(bb, calc_dt);
@@ -905,7 +1158,10 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                 break;
             }
             case CloudOpKind::SCALE: {
-                SsaValue a = resolve_dense(op.src_ids.at(0), PjrtDType::F32);
+                const TensorShardingKind a_sh = env.at(op.src_ids.at(0)).sharding;
+                SsaValue a = (a_sh == TensorShardingKind::SHARD_K)
+                                 ? resolve_dense(op.src_ids.at(0), PjrtDType::F32)
+                                 : resolve_replicated(op.src_ids.at(0), PjrtDType::F32);
                 SsaValue af = builder.emit_convert(a, PjrtDType::F32);
                 SsaValue sc = builder.emit_const_splat_f32(op.scale, af.dims, PjrtDType::F32);
                 SsaValue res_f = builder.emit_binary("stablehlo.multiply", af, sc);
@@ -914,35 +1170,58 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                     res_f = builder.emit_binary("stablehlo.add", res_f, bi);
                 }
                 result = builder.emit_convert(res_f, op.dst.dtype);
+                out_sharding = (a_sh == TensorShardingKind::SHARD_K) ? TensorShardingKind::SHARD_K
+                                                                     : TensorShardingKind::REPLICATED;
                 break;
             }
             case CloudOpKind::CPY:
             case CloudOpKind::RESHAPE: {
-                SsaValue a = resolve_dense(op.src_ids.at(0), op.dst.dtype);
+                SsaValue a = resolve_replicated(op.src_ids.at(0), op.dst.dtype);
                 SsaValue c = builder.emit_convert(a, op.dst.dtype);
                 result = builder.emit_reshape(c, dst_dims);
                 break;
             }
             case CloudOpKind::TRANSPOSE: {
-                SsaValue a = resolve_dense(op.src_ids.at(0), op.dst.dtype);
+                SsaValue a = resolve_replicated(op.src_ids.at(0), op.dst.dtype);
                 SsaValue t = builder.emit_transpose(a, {op.perm[0], op.perm[1], op.perm[2], op.perm[3]});
                 result = builder.emit_convert(t, op.dst.dtype);
                 break;
             }
             case CloudOpKind::SLICE: {
-                SsaValue a = resolve_dense(op.src_ids.at(0), op.dst.dtype);
+                SsaValue a = resolve_replicated(op.src_ids.at(0), op.dst.dtype);
                 SsaValue cur = op.slice_reshape.empty() ? a : builder.emit_reshape(a, op.slice_reshape);
                 SsaValue sl = builder.emit_slice(cur, op.slice_starts, op.slice_limits);
                 SsaValue rs = builder.emit_reshape(sl, dst_dims);
                 result = builder.emit_convert(rs, op.dst.dtype);
                 break;
             }
+            case CloudOpKind::ALL_REDUCE_SUM: {
+                SsaValue a = resolve_dense(op.src_ids.at(0), op.dst.dtype);
+                SsaValue c = builder.emit_convert(a, op.dst.dtype);
+                result = builder.emit_all_reduce(c, P, "stablehlo.add");
+                break;
+            }
+            case CloudOpKind::ALL_GATHER: {
+                SsaValue a = resolve_dense(op.src_ids.at(0), op.dst.dtype);
+                SsaValue c = builder.emit_convert(a, op.dst.dtype);
+                result = builder.emit_all_gather(c, op.collective_dim, P);
+                break;
+            }
+            case CloudOpKind::REDUCE_SCATTER_SUM: {
+                SsaValue a = resolve_dense(op.src_ids.at(0), op.dst.dtype);
+                SsaValue c = builder.emit_convert(a, op.dst.dtype);
+                result = builder.emit_reduce_scatter(c, op.collective_dim, P, "stablehlo.add");
+                // Keep explicit reduce_scatter outputs replica-local so downstream CPY/RESHAPE
+                // operates on the scattered shape rather than all-gathering into a mismatched shape.
+                out_sharding = TensorShardingKind::REPLICATED;
+                break;
+            }
             case CloudOpKind::FLASH_ATTN_EXT: {
                 // q: [B, H_Q, N_Q, DK], k: [B, H_KV, N_KV, DK], v: [B, H_KV, N_KV, DV], mask (opt): [B_m, H_m, N_Q_pad, N_KV]
                 // dst: [B, N_Q, H_Q, DV] F32
-                SsaValue q = builder.emit_convert(resolve_dense(op.src_ids.at(0), PjrtDType::F32), PjrtDType::F32);
-                SsaValue k = builder.emit_convert(resolve_dense(op.src_ids.at(1), PjrtDType::F32), PjrtDType::F32);
-                SsaValue v = builder.emit_convert(resolve_dense(op.src_ids.at(2), PjrtDType::F32), PjrtDType::F32);
+                SsaValue q = builder.emit_convert(resolve_replicated(op.src_ids.at(0), PjrtDType::F32), PjrtDType::F32);
+                SsaValue k = builder.emit_convert(resolve_replicated(op.src_ids.at(1), PjrtDType::F32), PjrtDType::F32);
+                SsaValue v = builder.emit_convert(resolve_replicated(op.src_ids.at(2), PjrtDType::F32), PjrtDType::F32);
 
                 const int64_t B = q.dims[0];
                 const int64_t H_Q = q.dims[1];
@@ -973,7 +1252,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                 SsaValue zero_scalar = builder.emit_const_splat_f32(0.0f, {}, PjrtDType::F32);
 
                 if (has_mask) {
-                    SsaValue m = builder.emit_convert(resolve_dense(op.src_ids[3], PjrtDType::F32), PjrtDType::F32);
+                    SsaValue m = builder.emit_convert(resolve_replicated(op.src_ids[3], PjrtDType::F32), PjrtDType::F32);
                     if (m.dims[2] > N_Q) {
                         m = builder.emit_slice(m, {0, 0, 0, 0}, {m.dims[0], m.dims[1], N_Q, m.dims[3]});
                     }
@@ -1081,6 +1360,8 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
 
         TensorHandle out_th;
         out_th.storage = TensorStorageKind::DENSE;
+        out_th.sharding = out_sharding;
+        out_th.logical_k = op.dst.dims[3];
         out_th.dense = std::move(result);
         env[op.dst.id] = std::move(out_th);
     }
@@ -1088,13 +1369,21 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
     std::vector<SsaValue> return_vals;
     return_vals.reserve(spec.output_ids.size());
     for (uint64_t oid : spec.output_ids) {
-        const SsaValue& ov = env.at(oid).dense;
+        const TensorHandle& th = env.at(oid);
+        SsaValue ov = th.dense;
+        if (P > 1) {
+            if (th.sharding == TensorShardingKind::SHARD_N) {
+                ov = builder.emit_all_gather(ov, 2, P);
+            } else if (th.sharding == TensorShardingKind::SHARD_K) {
+                ov = builder.emit_all_gather(ov, 3, P);
+            }
+        }
         return_vals.push_back(ov);
         prog.output_bindings.push_back({oid, ov.dtype, ov.dims});
     }
 
     prog.mlir_text = builder.finish(return_vals);
-    prog.cache_key = build_canonical_cache_key(prog.mlir_text);
+    prog.cache_key = build_canonical_cache_key(prog.mlir_text, P);
     return prog;
 }
 
