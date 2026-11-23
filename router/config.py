@@ -127,30 +127,40 @@ def is_loopback_host(host: str) -> bool:
 
 def sanitize_url(url: str) -> str:
     """Strip userinfo credentials, query strings, and fragments before logging or displaying."""
+    cleaned = url.strip()
+    if "://" not in cleaned:
+        return "<redacted invalid URL>"
     try:
-        parts = urlsplit(url)
+        parts = urlsplit(cleaned)
     except ValueError:
-        cleaned = url.split("#", 1)[0].split("?", 1)[0]
-        if "://" in cleaned:
-            scheme, rest = cleaned.split("://", 1)
-            if "/" in rest:
-                authority, tail = rest.split("/", 1)
-                if "@" in authority:
-                    authority = authority.rsplit("@", 1)[1]
-                return f"{scheme}://{authority}/{tail}"
-            if "@" in rest:
-                rest = rest.rsplit("@", 1)[1]
-            return f"{scheme}://{rest}"
-        return cleaned
+        stripped = cleaned.split("#", 1)[0].split("?", 1)[0]
+        scheme, rest = stripped.split("://", 1)
+        if (
+            not scheme
+            or not rest
+            or not scheme[0].isalpha()
+            or not all(c.isalnum() or c in "+-." for c in scheme)
+        ):
+            return "<redacted invalid URL>"
+        if "/" in rest:
+            authority, tail = rest.split("/", 1)
+            if "@" in authority:
+                authority = authority.rsplit("@", 1)[1]
+            return f"{scheme}://{authority}/{tail}"
+        if "@" in rest:
+            rest = rest.rsplit("@", 1)[1]
+        return f"{scheme}://{rest}"
+    if not parts.scheme or not parts.netloc:
+        return "<redacted invalid URL>"
     netloc = parts.netloc.rsplit("@", 1)[1] if "@" in parts.netloc else parts.netloc
     if (
         netloc == parts.netloc
         and not parts.query
         and not parts.fragment
-        and "?" not in url
-        and "#" not in url
+        and "?" not in cleaned
+        and "#" not in cleaned
     ):
-        return url
+        return cleaned
     return parts._replace(netloc=netloc, query="", fragment="").geturl()
 
 

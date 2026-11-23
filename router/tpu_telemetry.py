@@ -77,6 +77,7 @@ class TpuExporterTelemetry:
     total_chips: int
     max_hbm_utilization_ratio: Optional[float] = None
     avg_hbm_utilization_ratio: Optional[float] = None
+    chips_with_hbm: int = 0
     hbm_used_bytes: Optional[int] = None
     hbm_total_bytes: Optional[int] = None
     avg_duty_cycle_percent: Optional[float] = None
@@ -381,6 +382,7 @@ class _TpuTelemetryAggregator:
             total_chips=total_chips,
             max_hbm_utilization_ratio=max(ratios) if ratios else None,
             avg_hbm_utilization_ratio=(sum(ratios) / len(ratios)) if ratios else None,
+            chips_with_hbm=len(self.hbm_ratio_by_chip),
             hbm_used_bytes=(
                 sum(self.hbm_used_by_chip.values()) if self.hbm_used_by_chip else None
             ),
@@ -435,6 +437,14 @@ def evaluate_tpu_readiness(
         and telemetry.max_hbm_utilization_ratio >= max_hbm_utilization
     ):
         return False, "tpu_hbm_oom_risk"
+    has_hbm_telemetry = (
+        telemetry.max_hbm_utilization_ratio is not None
+        or telemetry.hbm_used_bytes is not None
+        or telemetry.hbm_total_bytes is not None
+        or telemetry.chips_with_hbm > 0
+    )
+    if has_hbm_telemetry and telemetry.chips_with_hbm < telemetry.total_chips:
+        return False, "tpu_hbm_missing"
     if max_duty_cycle_percent is not None:
         if (
             telemetry.max_duty_cycle_percent is None

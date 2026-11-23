@@ -14329,6 +14329,178 @@ asyncio.run(main())
         self.assertTrue(ready_full)
         self.assertIsNone(reason_full)
 
+    def test_streaming_chat_echo_excludes_echoed_assistant_prefix_from_fallback_usage(
+        self,
+    ) -> None:
+        recorded_usage: List[UsageEvent] = []
+
+        class _RecordHook:
+            def record_usage(self, event: UsageEvent) -> None:
+                recorded_usage.append(event)
+
+        echoed_prefix = "A" * 400  # 100 estimated tokens if wrongly counted
+        generated_tail = "12345678"  # 8 chars -> 2 estimated completion tokens
+
+        class _ChatEchoStreamHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                pass
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = b'{"object":"list","data":[{"id":"m-chat-echo-usage"}]}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802
+                cl = int(self.headers.get("Content-Length", "0"))
+                if cl > 0:
+                    self.rfile.read(cl)
+                chunk1 = json.dumps(
+                    {"choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}}]}
+                ).encode("utf-8")
+                chunk2 = json.dumps(
+                    {"choices": [{"index": 0, "delta": {"content": echoed_prefix}}]}
+                ).encode("utf-8")
+                chunk3 = json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": generated_tail},
+                                "finish_reason": "stop",
+                            }
+                        ]
+                    }
+                ).encode("utf-8")
+                body = (
+                    b"data: " + chunk1 + b"\n\n"
+                    b"data: " + chunk2 + b"\n\n"
+                    b"data: " + chunk3 + b"\n\n"
+                    b"data: [DONE]\n\n"
+                )
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), _ChatEchoStreamHandler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            cfg = RouterConfig(
+                host="127.0.0.1",
+                port=0,
+                backends=[
+                    BackendConfig(
+                        id="chat-echo-usage",
+                        base_url=f"http://127.0.0.1:{srv.server_address[1]}",
+                        models=["m-chat-echo-usage"],
+                    )
+                ],
+            )
+            router = self._track(create_router_server(cfg, usage_hook=_RecordHook()))
+            st, _, bd = _http_request(
+                router.server_address[1],
+                "POST",
+                "/v1/chat/completions",
+                body={
+                    "model": "m-chat-echo-usage",
+                    "stream": True,
+                    "echo": True,
+                    "messages": [
+                        {"role": "user", "content": "continue"},
+                        {"role": "assistant", "content": echoed_prefix},
+                    ],
+                },
+            )
+            self.assertEqual(st, 200)
+            self.assertIn(generated_tail.encode("utf-8"), bd)
+            self.assertEqual(len(recorded_usage), 1)
+            self.assertEqual(recorded_usage[0].completion_tokens, 2)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_invalid_url_without_authority_redacts_credentials_in_diagnostics(
+        self,
+    ) -> None:
+        bad_urls = (
+            "http:alice:supersecret@host:8000",
+            "alice:supersecret@host:8000",
+            "http:///alice:supersecret@host:8000",
+            "alice:supersecret@http://bad\u2100host/v1",
+        )
+        for bad_url in bad_urls:
+            with self.subTest(bad_url=bad_url):
+                sanitized = sanitize_url(bad_url)
+                self.assertNotIn("alice", sanitized)
+                self.assertNotIn("supersecret", sanitized)
+                with self.assertRaises(ValueError) as ctx:
+                    validate_http_url(bad_url, field_name="backend base_url", allow_query=False)
+                err_msg = str(ctx.exception)
+                self.assertNotIn("alice", err_msg)
+                self.assertNotIn("supersecret", err_msg)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_path = Path(tmpdir) / "bad_url.json"
+            cfg_path.write_text(
+                json.dumps(
+                    {
+                        "backends": [
+                            {
+                                "id": "bad-cred-url",
+                                "base_url": "http:alice:supersecret@host:8000",
+                                "models": ["m1"],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            err_buf = io.StringIO()
+            with redirect_stderr(err_buf):
+                rc = router_main(["--config", str(cfg_path), "--check-config"])
+            self.assertNotEqual(rc, 0)
+            stderr_out = err_buf.getvalue()
+            self.assertNotIn("alice", stderr_out)
+            self.assertNotIn("supersecret", stderr_out)
+
+    def test_tpu_readiness_requires_hbm_coverage_across_all_chips_when_hbm_reported(
+        self,
+    ) -> None:
+        partial_hbm_metrics = (
+            "freetpu_exporter_up 1\n"
+            "freetpu_tpu_devices_discovered 2\n"
+            'freetpu_tpu_health_status{chip="0"} 1\n'
+            'freetpu_tpu_health_status{chip="1"} 1\n'
+            'freetpu_tpu_hbm_utilization_ratio{chip="0"} 0.25\n'
+        )
+        exp_partial = self._track(_MockTpuExporter(raw_body=partial_hbm_metrics))
+        telem_partial = scrape_tpu_exporter(exp_partial.metrics_url, timeout_s=2.0)
+        self.assertEqual(telem_partial.total_chips, 2)
+        self.assertEqual(telem_partial.chips_with_hbm, 1)
+        ready_p, reason_p = evaluate_tpu_readiness(
+            telem_partial, max_hbm_utilization=0.95
+        )
+        self.assertFalse(ready_p)
+        self.assertEqual(reason_p, "tpu_hbm_missing")
+
+        full_hbm_metrics = (
+            partial_hbm_metrics
+            + 'freetpu_tpu_hbm_used_bytes{chip="1"} 4000000000\n'
+            + 'freetpu_tpu_hbm_total_bytes{chip="1"} 16000000000\n'
+        )
+        exp_full = self._track(_MockTpuExporter(raw_body=full_hbm_metrics))
+        telem_full = scrape_tpu_exporter(exp_full.metrics_url, timeout_s=2.0)
+        self.assertEqual(telem_full.chips_with_hbm, 2)
+        ready_f, reason_f = evaluate_tpu_readiness(telem_full, max_hbm_utilization=0.95)
+        self.assertTrue(ready_f)
+        self.assertIsNone(reason_f)
+
 
 def run_self_tests(verbosity: int = 1) -> int:
     """Run all router tests cleanly via unittest."""

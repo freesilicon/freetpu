@@ -1052,6 +1052,35 @@ def _extract_choice_output_char_counts(obj: Mapping[str, Any]) -> Dict[int, int]
     return counts
 
 
+def _extract_choice_chat_content_char_counts(obj: Mapping[str, Any]) -> Dict[int, int]:
+    """Return `{choice_index: char_count}` for `delta.content`/`message.content` strings."""
+    choices = obj.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return {}
+    counts: Dict[int, int] = {}
+    for pos, choice in enumerate(choices):
+        if not (isinstance(choice, dict) or isinstance(choice, Mapping)):
+            continue
+        content_len = 0
+        for container_key in ("delta", "message"):
+            container = choice.get(container_key)
+            if not (isinstance(container, dict) or isinstance(container, Mapping)):
+                continue
+            cval = container.get("content")
+            if isinstance(cval, str) and cval:
+                content_len += len(cval)
+        if content_len <= 0:
+            continue
+        c_idx = choice.get("index")
+        resolved_idx = (
+            c_idx
+            if isinstance(c_idx, int) and not isinstance(c_idx, bool) and c_idx >= 0
+            else pos
+        )
+        counts[resolved_idx] = counts.get(resolved_idx, 0) + content_len
+    return counts
+
+
 def _subtract_echoed_prompt_chars(
     chars_by_choice: Mapping[int, int],
     echo_prompt_chars: Sequence[int],
@@ -1201,6 +1230,7 @@ def _extract_non_stream_usage(
     parsed_resp: Optional[Mapping[str, Any]] = None,
     echo_prompt_chars: Sequence[int] = (),
     echo_prompt_tokens: Sequence[int] = (),
+    echo_chat_chars: int = 0,
     expected_choices: int = 1,
     prompt_batch_size: int = 1,
 ) -> Tuple[int, int]:
@@ -1262,6 +1292,18 @@ def _extract_non_stream_usage(
                 required_choices=expected_choices,
                 prompt_batch_size=prompt_batch_size,
             )
+        elif echo_chat_chars > 0:
+            output_txt = _extract_choice_output_text(parsed_resp)
+            if output_txt:
+                echoed_chat_total = sum(
+                    min(c_len, echo_chat_chars)
+                    for c_len in _extract_choice_chat_content_char_counts(
+                        parsed_resp
+                    ).values()
+                )
+                adjusted_chars = max(0, len(output_txt) - echoed_chat_total)
+                if adjusted_chars > 0:
+                    completion_tokens = max(1, (adjusted_chars + 3) // 4)
         else:
             output_txt = _extract_choice_output_text(parsed_resp)
             if output_txt:
@@ -4854,6 +4896,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                                 parsed_resp=loaded_resp,
                                                 echo_prompt_chars=echo_prompt_chars,
                                                 echo_prompt_tokens=echo_prompt_tokens,
+                                                echo_chat_chars=echo_chat_chars,
                                                 expected_choices=expected_choices,
                                                 prompt_batch_size=prompt_batch_size,
                                             )
@@ -5377,6 +5420,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             completion_tokens = 0
             est_completion_chars = 0
             est_completion_chars_by_choice: Dict[int, int] = {}
+            est_chat_content_chars_by_choice: Dict[int, int] = {}
             streamed_choice_token_ids_count = 0
             saw_explicit_prompt_usage = False
             saw_explicit_completion_usage = False
@@ -5557,6 +5601,19 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                         ):
                                             est_completion_chars_by_choice[c_idx] = (
                                                 est_completion_chars_by_choice.get(c_idx, 0) + c_len
+                                            )
+                                if echo_chat_chars > 0:
+                                    for c_idx, c_len in _extract_choice_chat_content_char_counts(
+                                        obj
+                                    ).items():
+                                        if (
+                                            c_idx in est_chat_content_chars_by_choice
+                                            or len(est_chat_content_chars_by_choice)
+                                            < max_tracked_choices
+                                        ):
+                                            est_chat_content_chars_by_choice[c_idx] = (
+                                                est_chat_content_chars_by_choice.get(c_idx, 0)
+                                                + c_len
                                             )
                         usage = obj.get("usage")
                         if isinstance(usage, dict):
@@ -6183,6 +6240,18 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         required_choices=required_choices,
                         prompt_batch_size=effective_prompt_batch_size,
                     )
+                elif echo_chat_chars > 0:
+                    echoed_chat_total = sum(
+                        min(c_len, echo_chat_chars)
+                        for c_len in est_chat_content_chars_by_choice.values()
+                    )
+                    adjusted_completion_chars = max(
+                        0, est_completion_chars - echoed_chat_total
+                    )
+                    if adjusted_completion_chars > 0:
+                        completion_tokens = max(
+                            1, (adjusted_completion_chars + 3) // 4
+                        )
                 else:
                     if est_completion_chars > 0:
                         completion_tokens = max(1, (est_completion_chars + 3) // 4)
