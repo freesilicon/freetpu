@@ -53,7 +53,7 @@
  #endif
  #ifdef GGML_USE_CPU
          register_backend(ggml_backend_cpu_reg());
-@@ -601,6 +612,9 @@
+@@ -590,6 +601,9 @@
      ggml_backend_load_best("hexagon",  silent, dir_path);
      ggml_backend_load_best("musa",     silent, dir_path);
      ggml_backend_load_best("openvino", silent, dir_path);
