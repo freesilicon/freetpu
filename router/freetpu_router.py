@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 from collections import OrderedDict, deque
+import contextlib
 from dataclasses import dataclass, field
 import errno
 import hashlib
@@ -26,7 +27,7 @@ import ssl
 import sys
 import threading
 import time
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 import uuid
 
@@ -36,6 +37,8 @@ if __package__ in (None, ""):
 from router.config import (  # noqa: E402
     BEARER_AUTH_ONLY_KEYS,
     BackendConfig,
+    DEFAULT_MAX_JSON_DEPTH,
+    DEFAULT_MAX_RESPONSE_JSON_NODES,
     RouterConfig,
     VALID_AUTH_TYPES,
     VALID_POLICIES,
@@ -615,7 +618,13 @@ class _BoundedSSEReader:
                 to_read = min(to_read, budget_left)
             if self._available_fn is not None:
                 avail = self._available_fn()
-                to_read = min(to_read, max(1, avail))
+                # Leave parse headroom under tight shared response-memory budgets
+                # so lookahead bytes from later events cannot starve parsing of
+                # the current SSE event.
+                to_read = min(
+                    to_read,
+                    max(1, avail // REQUEST_MEMORY_PARSE_MULTIPLIER),
+                )
 
             chunk = self._resp.read1(to_read)
             if not chunk:
@@ -976,9 +985,57 @@ _NON_RETRYABLE_SSE_ERROR_CODES = frozenset(
 )
 
 
+_UNSET: Any = object()
+
+
+@contextlib.contextmanager
+def _bounded_sse_json_loads(
+    payload_bytes: bytes,
+    *,
+    engine: "RouterEngine",
+    strict_utf8: bool = True,
+) -> Iterator[Any]:
+    """Validate JSON complexity and reserve peak parse memory for one SSE payload."""
+    containers = [0]
+    nodes = _validate_json_structure(
+        payload_bytes,
+        max_depth=engine.config.max_json_depth,
+        max_nodes=engine.config.max_response_json_nodes,
+        containers_out=containers,
+    )
+    needed_mem = _estimate_json_parse_memory(
+        payload_bytes,
+        nodes=nodes,
+        containers=containers[0],
+    )
+    parse_extra = max(0, needed_mem - len(payload_bytes))
+    if parse_extra > 0 and not engine.try_reserve_response_memory(parse_extra):
+        raise _MemoryBudgetExceededError("Router response memory budget exhausted")
+    obj: Any = None
+    try:
+        text = (
+            payload_bytes.decode("utf-8")
+            if strict_utf8
+            else payload_bytes.decode("utf-8", errors="replace")
+        )
+        try:
+            obj = json.loads(text)
+        finally:
+            del text
+        yield obj
+    finally:
+        obj = None
+        if parse_extra > 0:
+            engine.release_response_memory(parse_extra)
+
+
 def _classify_sse_error_event(
     event_type: str,
     payload_bytes: bytes,
+    *,
+    parsed_obj: Any = _UNSET,
+    max_depth: int = DEFAULT_MAX_JSON_DEPTH,
+    max_nodes: int = DEFAULT_MAX_RESPONSE_JSON_NODES,
 ) -> Optional[Tuple[bool, int, bytes]]:
     """Classify an upstream SSE error event before committing a 200 stream.
 
@@ -986,12 +1043,26 @@ def _classify_sse_error_event(
     `(is_retryable, http_status, json_body_bytes)`.
     """
     is_event_err = event_type.strip().lower() == "error"
-    parsed: Any = None
-    if payload_bytes and payload_bytes != b"[DONE]":
-        try:
-            parsed = json.loads(payload_bytes.decode("utf-8", errors="replace"))
-        except json.JSONDecodeError:
-            parsed = None
+    if parsed_obj is not _UNSET:
+        parsed: Any = parsed_obj
+    else:
+        parsed = None
+        if payload_bytes and payload_bytes != b"[DONE]":
+            try:
+                _validate_json_structure(
+                    payload_bytes,
+                    max_depth=max_depth,
+                    max_nodes=max_nodes,
+                )
+            except _JsonStructureLimitError:
+                if not is_event_err:
+                    raise
+                parsed = None
+            else:
+                try:
+                    parsed = json.loads(payload_bytes.decode("utf-8", errors="replace"))
+                except json.JSONDecodeError:
+                    parsed = None
 
     has_err_obj = isinstance(parsed, Mapping) and (
         parsed.get("error") is not None or parsed.get("object") == "error"
@@ -1052,7 +1123,13 @@ def _classify_sse_error_event(
     return is_retryable, status_code, body
 
 
-def _sse_event_should_commit(payload_bytes: bytes) -> bool:
+def _sse_event_should_commit(
+    payload_bytes: bytes,
+    *,
+    parsed_obj: Any = _UNSET,
+    max_depth: int = DEFAULT_MAX_JSON_DEPTH,
+    max_nodes: int = DEFAULT_MAX_RESPONSE_JSON_NODES,
+) -> bool:
     """Return True when a complete non-error SSE data event carries output or a terminator.
 
     Role-only, empty-delta, and prompt-progress chunks are buffered so Spot
@@ -1064,10 +1141,18 @@ def _sse_event_should_commit(payload_bytes: bytes) -> bool:
         return False
     if payload_bytes == b"[DONE]":
         return True
-    try:
-        obj = json.loads(payload_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise _MalformedSSEPayloadError("Malformed JSON in upstream SSE event") from exc
+    if parsed_obj is not _UNSET:
+        obj = parsed_obj
+    else:
+        _validate_json_structure(
+            payload_bytes,
+            max_depth=max_depth,
+            max_nodes=max_nodes,
+        )
+        try:
+            obj = json.loads(payload_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise _MalformedSSEPayloadError("Malformed JSON in upstream SSE event") from exc
     if not isinstance(obj, Mapping):
         raise _MalformedSSEPayloadError("Upstream SSE event JSON must be an object")
     if obj.get("error") is not None or obj.get("object") == "error":
@@ -2554,7 +2639,16 @@ class _SSEReactor:
             if content_end == task.scan_pos:
                 ev_type = task.current_event_type
                 task.current_event_type = ""
-                made_progress, is_done = task.on_event_fn(ev_type, task.event_data_lines)
+                try:
+                    made_progress, is_done = task.on_event_fn(ev_type, task.event_data_lines)
+                except _MemoryBudgetExceededError:
+                    task.event_data_lines.clear()
+                    task.memory_limit_exceeded = True
+                    break
+                except _JsonStructureLimitError:
+                    task.event_data_lines.clear()
+                    task.size_limit_exceeded = True
+                    break
                 task.event_data_lines.clear()
                 if is_done and not made_progress:
                     # Upstream emitted [DONE] without satisfying required stream_options
@@ -3726,7 +3820,6 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         est_prompt_tokens=est_prompt_tokens,
                         principal=auth_ctx.principal,
                         expect_final_usage=expect_final_usage,
-                        is_legacy_completions=(endpoint == "/v1/completions"),
                         committed_flag=committed_flag,
                     )
                     if sse_outcome == "committed":
@@ -4168,7 +4261,6 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         est_prompt_tokens: int,
         principal: str,
         expect_final_usage: bool = False,
-        is_legacy_completions: bool = False,
         committed_flag: Optional[List[bool]] = None,
     ) -> Tuple[str, int, Optional[bytes]]:
         """Buffer until first generated output or terminator before committing 200 OK.
@@ -4295,34 +4387,120 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         pending_event_has_data = False
                         pending_event_type = ""
                         pending_event_start = len(pre_commit_buf)
-                        err_info = _classify_sse_error_event(ev_type, payload_bytes)
-                        if err_info is not None:
-                            is_retryable, err_status, err_body = err_info
-                            if is_retryable:
-                                return "retryable_error", err_status, err_body
-                            return "client_error", err_status, err_body
-                        if payload_bytes == b"[DONE]" and expect_final_usage:
-                            return (
-                                "retryable_error",
-                                502,
-                                _openai_error_body(
-                                    "Upstream SSE backend sent [DONE] without requested usage chunk",
-                                    error_type="bad_gateway",
-                                    code="upstream_stream_error",
-                                ),
+                        parsed_pre: Any = None
+                        pre_parse_extra = 0
+                        pre_parse_invalid_utf8 = False
+                        pre_parse_invalid_json = False
+                        if payload_bytes and payload_bytes != b"[DONE]":
+                            pre_containers = [0]
+                            try:
+                                pre_nodes = _validate_json_structure(
+                                    payload_bytes,
+                                    max_depth=engine.config.max_json_depth,
+                                    max_nodes=engine.config.max_response_json_nodes,
+                                    containers_out=pre_containers,
+                                )
+                            except _JsonStructureLimitError:
+                                if ev_type.strip().lower() == "error":
+                                    return (
+                                        "retryable_error",
+                                        502,
+                                        _openai_error_body(
+                                            "Upstream SSE error event exceeded structural complexity limits",
+                                            error_type="bad_gateway",
+                                            code="upstream_sse_error",
+                                        ),
+                                    )
+                                return (
+                                    "response_too_large",
+                                    502,
+                                    _openai_error_body(
+                                        "Upstream SSE event JSON exceeded structural complexity limits",
+                                        error_type="bad_gateway",
+                                        code="response_too_large",
+                                    ),
+                                )
+                            pre_needed = _estimate_json_parse_memory(
+                                payload_bytes,
+                                nodes=pre_nodes,
+                                containers=pre_containers[0],
                             )
+                            pre_parse_extra = max(0, pre_needed - len(payload_bytes))
+                            if pre_parse_extra > 0 and not engine.try_reserve_response_memory(
+                                pre_parse_extra
+                            ):
+                                return (
+                                    "memory_limit_exceeded",
+                                    503,
+                                    _openai_error_body(
+                                        "Router response memory budget exhausted; retry later",
+                                        error_type="service_unavailable",
+                                        code="server_memory_limit_reached",
+                                    ),
+                                )
                         try:
-                            should_commit = _sse_event_should_commit(payload_bytes)
-                        except _MalformedSSEPayloadError:
-                            return (
-                                "retryable_error",
-                                502,
-                                _openai_error_body(
-                                    "Upstream SSE backend emitted malformed JSON payload before first token",
-                                    error_type="bad_gateway",
-                                    code="upstream_stream_error",
-                                ),
+                            if payload_bytes and payload_bytes != b"[DONE]":
+                                try:
+                                    pre_text = payload_bytes.decode("utf-8")
+                                except UnicodeDecodeError:
+                                    pre_parse_invalid_utf8 = True
+                                    pre_text = payload_bytes.decode("utf-8", errors="replace")
+                                try:
+                                    parsed_pre = json.loads(pre_text)
+                                except json.JSONDecodeError:
+                                    pre_parse_invalid_json = True
+                                    parsed_pre = None
+                                finally:
+                                    del pre_text
+                            err_info = _classify_sse_error_event(
+                                ev_type,
+                                payload_bytes,
+                                parsed_obj=parsed_pre,
                             )
+                            if err_info is not None:
+                                is_retryable, err_status, err_body = err_info
+                                if is_retryable:
+                                    return "retryable_error", err_status, err_body
+                                return "client_error", err_status, err_body
+                            if payload_bytes == b"[DONE]" and expect_final_usage:
+                                return (
+                                    "retryable_error",
+                                    502,
+                                    _openai_error_body(
+                                        "Upstream SSE backend sent [DONE] without requested usage chunk",
+                                        error_type="bad_gateway",
+                                        code="upstream_stream_error",
+                                    ),
+                                )
+                            if pre_parse_invalid_utf8 or pre_parse_invalid_json:
+                                return (
+                                    "retryable_error",
+                                    502,
+                                    _openai_error_body(
+                                        "Upstream SSE backend emitted malformed JSON payload before first token",
+                                        error_type="bad_gateway",
+                                        code="upstream_stream_error",
+                                    ),
+                                )
+                            try:
+                                should_commit = _sse_event_should_commit(
+                                    payload_bytes,
+                                    parsed_obj=parsed_pre,
+                                )
+                            except _MalformedSSEPayloadError:
+                                return (
+                                    "retryable_error",
+                                    502,
+                                    _openai_error_body(
+                                        "Upstream SSE backend emitted malformed JSON payload before first token",
+                                        error_type="bad_gateway",
+                                        code="upstream_stream_error",
+                                    ),
+                                )
+                        finally:
+                            parsed_pre = None
+                            if pre_parse_extra > 0:
+                                engine.release_response_memory(pre_parse_extra)
                         if should_commit:
                             first_chunk_time = time.monotonic()
                             break
@@ -4349,6 +4527,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             est_completion_chars = 0
             saw_explicit_prompt_usage = False
             saw_explicit_completion_usage = False
+            saw_interim_usage = False
             saw_final_usage = False
             saw_timings_completion = False
             saw_done_sentinel = False
@@ -4372,7 +4551,8 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 """
                 nonlocal first_content_ttft_ms, prompt_tokens, completion_tokens
                 nonlocal est_completion_chars, saw_explicit_prompt_usage
-                nonlocal saw_explicit_completion_usage, saw_final_usage, saw_timings_completion
+                nonlocal saw_explicit_completion_usage, saw_interim_usage
+                nonlocal saw_final_usage, saw_timings_completion
                 nonlocal saw_done_sentinel, saw_upstream_error_event
                 if not data_lines:
                     return False, False
@@ -4390,82 +4570,99 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                     saw_done_sentinel = True
                     return True, True
                 try:
-                    obj = json.loads(payload_bytes)
+                    with _bounded_sse_json_loads(
+                        payload_bytes,
+                        engine=engine,
+                        strict_utf8=True,
+                    ) as obj:
+                        if not isinstance(obj, dict):
+                            saw_upstream_error_event = True
+                            return False, False
+                        if (
+                            ev_type.strip().lower() == "error"
+                            or obj.get("error") is not None
+                            or obj.get("object") == "error"
+                        ):
+                            saw_upstream_error_event = True
+                            return False, False
+                        made_progress = False
+                        choices = obj.get("choices")
+                        event_has_terminal_choice = False
+                        event_has_non_terminal_choice = False
+                        if isinstance(choices, list):
+                            for choice in choices:
+                                if not isinstance(choice, dict):
+                                    continue
+                                if choice.get("finish_reason") is not None:
+                                    made_progress = True
+                                    event_has_terminal_choice = True
+                                    c_idx = choice.get("index")
+                                    if (
+                                        isinstance(c_idx, int)
+                                        and not isinstance(c_idx, bool)
+                                        and c_idx >= 0
+                                    ):
+                                        finished_choice_indices.add(c_idx)
+                                    else:
+                                        finished_choice_indices.add(len(finished_choice_indices))
+                                else:
+                                    event_has_non_terminal_choice = True
+                        output_txt = _extract_choice_output_text(obj)
+                        has_audio_out = _has_choice_audio_output(obj)
+                        has_token_meta_out = _has_choice_token_metadata_output(obj)
+                        if output_txt or has_audio_out or has_token_meta_out:
+                            made_progress = True
+                            if first_content_ttft_ms is None:
+                                first_content_ttft_ms = (time.monotonic() - req_start) * 1000.0
+                            if output_txt:
+                                est_completion_chars += len(output_txt)
+                        usage = obj.get("usage")
+                        if isinstance(usage, dict):
+                            got_usage_count = False
+                            pt = _safe_nonneg_int(usage.get("prompt_tokens"))
+                            if pt is not None:
+                                prompt_tokens = pt
+                                saw_explicit_prompt_usage = True
+                                got_usage_count = True
+                                made_progress = True
+                            ct = _safe_nonneg_int(usage.get("completion_tokens"))
+                            if ct is not None:
+                                completion_tokens = ct
+                                saw_explicit_completion_usage = True
+                                got_usage_count = True
+                                made_progress = True
+                            has_choices = isinstance(choices, list) and len(choices) > 0
+                            if got_usage_count and has_choices and (
+                                event_has_non_terminal_choice or not event_has_terminal_choice
+                            ):
+                                saw_interim_usage = True
+                            all_choices_finished_now = all(
+                                idx in finished_choice_indices for idx in range(required_choices)
+                            )
+                            if got_usage_count and (
+                                not has_choices
+                                or (
+                                    event_has_terminal_choice
+                                    and all_choices_finished_now
+                                    and not saw_interim_usage
+                                )
+                            ):
+                                saw_final_usage = True
+                        timings = obj.get("timings")
+                        if isinstance(timings, dict):
+                            if not saw_explicit_prompt_usage:
+                                pt = _safe_nonneg_int(timings.get("prompt_n"))
+                                if pt is not None:
+                                    prompt_tokens = pt
+                            if not saw_explicit_completion_usage:
+                                ct = _safe_nonneg_int(timings.get("predicted_n"))
+                                if ct is not None:
+                                    completion_tokens = ct
+                                    saw_timings_completion = True
+                        return made_progress, False
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     saw_upstream_error_event = True
                     return False, False
-                if not isinstance(obj, dict):
-                    saw_upstream_error_event = True
-                    return False, False
-                if (
-                    ev_type.strip().lower() == "error"
-                    or obj.get("error") is not None
-                    or obj.get("object") == "error"
-                ):
-                    saw_upstream_error_event = True
-                    return False, False
-                made_progress = False
-                choices = obj.get("choices")
-                event_has_terminal_choice = False
-                if isinstance(choices, list):
-                    for choice in choices:
-                        if isinstance(choice, dict) and choice.get("finish_reason") is not None:
-                            made_progress = True
-                            event_has_terminal_choice = True
-                            c_idx = choice.get("index")
-                            if isinstance(c_idx, int) and not isinstance(c_idx, bool) and c_idx >= 0:
-                                finished_choice_indices.add(c_idx)
-                            else:
-                                finished_choice_indices.add(len(finished_choice_indices))
-                output_txt = _extract_choice_output_text(obj)
-                has_audio_out = _has_choice_audio_output(obj)
-                has_token_meta_out = _has_choice_token_metadata_output(obj)
-                if output_txt or has_audio_out or has_token_meta_out:
-                    made_progress = True
-                    if first_content_ttft_ms is None:
-                        first_content_ttft_ms = (time.monotonic() - req_start) * 1000.0
-                    if output_txt:
-                        est_completion_chars += len(output_txt)
-                usage = obj.get("usage")
-                if isinstance(usage, dict):
-                    got_usage_count = False
-                    pt = _safe_nonneg_int(usage.get("prompt_tokens"))
-                    if pt is not None:
-                        prompt_tokens = pt
-                        saw_explicit_prompt_usage = True
-                        got_usage_count = True
-                        made_progress = True
-                    ct = _safe_nonneg_int(usage.get("completion_tokens"))
-                    if ct is not None:
-                        completion_tokens = ct
-                        saw_explicit_completion_usage = True
-                        got_usage_count = True
-                        made_progress = True
-                    has_choices = isinstance(choices, list) and len(choices) > 0
-                    all_choices_finished_now = all(
-                        idx in finished_choice_indices for idx in range(required_choices)
-                    )
-                    if got_usage_count and (
-                        not has_choices
-                        or (
-                            is_legacy_completions
-                            and event_has_terminal_choice
-                            and all_choices_finished_now
-                        )
-                    ):
-                        saw_final_usage = True
-                timings = obj.get("timings")
-                if isinstance(timings, dict):
-                    if not saw_explicit_prompt_usage:
-                        pt = _safe_nonneg_int(timings.get("prompt_n"))
-                        if pt is not None:
-                            prompt_tokens = pt
-                    if not saw_explicit_completion_usage:
-                        ct = _safe_nonneg_int(timings.get("predicted_n"))
-                        if ct is not None:
-                            completion_tokens = ct
-                            saw_timings_completion = True
-                return made_progress, False
 
             def process_sse_event() -> bool:
                 nonlocal current_event_type
@@ -4506,21 +4703,43 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 str(getattr(self, "request_version", "HTTP/1.1"))
             )
 
-            def write_chunk(data: bytes | bytearray | memoryview) -> None:
+            client_write_timeout_s = max(0.01, engine.config.client_read_timeout_s)
+
+            def write_chunk(data: bytes | bytearray | memoryview) -> float:
+                """Write one downstream SSE chunk under `client_write_timeout_s`; return elapsed seconds."""
                 if not data:
-                    return
+                    return 0.0
                 if use_chunked_downstream:
-                    self.connection.sendall(f"{len(data):x}\r\n".encode("ascii"))
-                    self.connection.sendall(data)
-                    self.connection.sendall(b"\r\n")
+                    framed: bytes | bytearray | memoryview = (
+                        f"{len(data):x}\r\n".encode("ascii") + bytes(data) + b"\r\n"
+                    )
                 else:
-                    self.connection.sendall(data)
+                    framed = data
+                write_start = time.monotonic()
+                write_deadline = write_start + client_write_timeout_s
+                view = memoryview(framed)
+                sent = 0
+                total = len(view)
+                try:
+                    while sent < total:
+                        rem_w = write_deadline - time.monotonic()
+                        if rem_w <= 0:
+                            raise TimeoutError("Downstream client write timed out")
+                        self.connection.settimeout(rem_w)
+                        n = self.connection.send(view[sent:])
+                        if n <= 0:
+                            raise BrokenPipeError("Downstream client connection closed")
+                        sent += n
+                finally:
+                    view.release()
+                return max(0.0, time.monotonic() - write_start)
 
             self.close_connection = True
             _, acao = self._resolve_cors_header()
             if committed_flag is not None:
                 committed_flag[0] = True
             try:
+                self.connection.settimeout(client_write_timeout_s)
                 self.send_response(resp.status)
                 self.send_header(
                     "Content-Type",
@@ -4552,10 +4771,20 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         )
                     else:
                         ln_end = nl + 1
-                    inspect_sse_line(bytes(pre_commit_buf[scan:ln_end]))
+                    try:
+                        inspect_sse_line(bytes(pre_commit_buf[scan:ln_end]))
+                    except _MemoryBudgetExceededError:
+                        event_data_lines.clear()
+                        memory_limit_exceeded = True
+                        break
+                    except _JsonStructureLimitError:
+                        event_data_lines.clear()
+                        size_limit_exceeded = True
+                        break
                     scan = ln_end
-                write_chunk(pre_commit_buf)
-            except (BrokenPipeError, ConnectionResetError, OSError):
+                if not memory_limit_exceeded and not size_limit_exceeded:
+                    write_chunk(pre_commit_buf)
+            except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
                 downstream_write_error = True
             finally:
                 # Immediately drop pre-commit buffer and release its shared memory reservation.
@@ -4564,7 +4793,12 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 pre_commit_bytes = 0
                 release_sse_mem(flushed_pre_bytes)
 
-            if not downstream_write_error and not saw_done_sentinel:
+            if (
+                not downstream_write_error
+                and not saw_done_sentinel
+                and not memory_limit_exceeded
+                and not size_limit_exceeded
+            ):
                 if isinstance(upstream_sock, DeadlineSocket):
                     upstream_sock._check_client_on_fast_read = False
                 progress_deadline = time.monotonic() + timeout_s
@@ -4714,9 +4948,18 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                             if content_end == scan_pos:
                                 ev_type_cur = current_event_type
                                 current_event_type = ""
-                                ev_progress, ev_done = process_sse_event_from(
-                                    ev_type_cur, event_data_lines
-                                )
+                                try:
+                                    ev_progress, ev_done = process_sse_event_from(
+                                        ev_type_cur, event_data_lines
+                                    )
+                                except _MemoryBudgetExceededError:
+                                    event_data_lines.clear()
+                                    memory_limit_exceeded = True
+                                    break
+                                except _JsonStructureLimitError:
+                                    event_data_lines.clear()
+                                    size_limit_exceeded = True
+                                    break
                                 event_data_lines.clear()
                                 if ev_done and not ev_progress:
                                     upstream_read_error = True
@@ -4744,8 +4987,8 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
 
                         if flush_end > 0:
                             try:
-                                write_chunk(bytes(phase2_buf[:flush_end]))
-                            except (BrokenPipeError, ConnectionResetError, OSError):
+                                write_elapsed = write_chunk(bytes(phase2_buf[:flush_end]))
+                            except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
                                 downstream_write_error = True
                                 break
                             finally:
@@ -4753,10 +4996,13 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                 scan_pos -= flush_end
                                 event_start -= flush_end
                                 release_sse_mem(flush_end)
+                            # Exclude downstream backpressure time from the upstream progress timer.
+                            progress_deadline += write_elapsed
 
                         if (
                             saw_done_sentinel
                             or size_limit_exceeded
+                            or memory_limit_exceeded
                             or upstream_read_error
                             or phase2_eof
                         ):

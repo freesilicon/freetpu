@@ -10621,7 +10621,7 @@ asyncio.run(main())
             )
             self.assertEqual(st_bad, 403, f"expected 403 for Origin={bad_origin}")
 
-    def test_legacy_completions_accepts_terminal_choice_usage_while_chat_requires_final_frame(
+    def test_terminal_choice_usage_accepted_for_completions_and_chat_while_continuous_usage_enforced(
         self,
     ) -> None:
         recorded_usage: List[UsageEvent] = []
@@ -10666,6 +10666,17 @@ asyncio.run(main())
                         b'"usage":{"prompt_tokens":12,"completion_tokens":4,"total_tokens":16}}\n\n'
                         b"data: [DONE]\n\n"
                     )
+                elif stream_mode[0] == "chat_llama_terminal_usage":
+                    # llama-server b6210 style: no interim usage on non-terminal chunks,
+                    # final usage attached to the terminal chat choice chunk.
+                    self.wfile.write(
+                        b'data: {"id":"chat-llama-1","object":"chat.completion.chunk",'
+                        b'"choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}\n\n'
+                        b'data: {"id":"chat-llama-1","object":"chat.completion.chunk",'
+                        b'"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],'
+                        b'"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}\n\n'
+                        b"data: [DONE]\n\n"
+                    )
                 elif stream_mode[0] == "legacy_interim_only":
                     self.wfile.write(
                         b'data: {"id":"cmpl-2","object":"text_completion",'
@@ -10676,11 +10687,14 @@ asyncio.run(main())
                         b"data: [DONE]\n\n"
                     )
                 else:
-                    # /v1/chat/completions with usage attached to a non-empty choices chunk
-                    # (no separate choices:[] final usage frame).
+                    # vLLM continuous_usage_stats=true: interim usage on non-terminal chunk
+                    # AND terminal choice chunk, but missing final choices:[] usage frame.
                     self.wfile.write(
-                        b'data: {"id":"chat-1","object":"chat.completion.chunk",'
-                        b'"choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":"stop"}],'
+                        b'data: {"id":"chat-vllm-1","object":"chat.completion.chunk",'
+                        b'"choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}],'
+                        b'"usage":{"prompt_tokens":10,"completion_tokens":1,"total_tokens":11}}\n\n'
+                        b'data: {"id":"chat-vllm-1","object":"chat.completion.chunk",'
+                        b'"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],'
                         b'"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}\n\n'
                         b"data: [DONE]\n\n"
                     )
@@ -10726,7 +10740,28 @@ asyncio.run(main())
         self.assertEqual(recorded_usage[0].completion_tokens, 4)
         self.assertEqual(router.engine._backends[0].total_failures, 0)
 
-        # 2. /v1/completions with usage only on non-terminal chunk still withholds [DONE].
+        # 2. /v1/chat/completions with llama-server b6210 terminal choice + usage succeeds cleanly.
+        stream_mode[0] = "chat_llama_terminal_usage"
+        st_chat, _, bd_chat = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-legacy-usage",
+                "stream": True,
+                "stream_options": {"include_usage": True},
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        self.assertEqual(st_chat, 200)
+        self.assertIn(b"data: [DONE]", bd_chat)
+        self.assertEqual(len(recorded_usage), 2)
+        self.assertEqual(recorded_usage[1].status_code, 200)
+        self.assertEqual(recorded_usage[1].prompt_tokens, 10)
+        self.assertEqual(recorded_usage[1].completion_tokens, 2)
+        self.assertEqual(router.engine._backends[0].total_failures, 0)
+
+        # 3. /v1/completions with usage only on non-terminal chunk still withholds [DONE].
         stream_mode[0] = "legacy_interim_only"
         conn = http.client.HTTPConnection("127.0.0.1", rport, timeout=3.0)
         try:
@@ -10752,12 +10787,12 @@ asyncio.run(main())
             self.assertNotIn(b"data: [DONE]", exc_info.exception.partial)
         finally:
             conn.close()
-        self.assertEqual(recorded_usage[1].status_code, 502)
+        self.assertEqual(recorded_usage[2].status_code, 502)
 
-        # 3. /v1/chat/completions still requires a separate choices:[] final usage frame.
+        # 4. vLLM continuous_usage_stats chat stream missing final choices:[] frame still rejects [DONE].
         router.engine._backends[0].healthy = True
         router.engine._backends[0].cooldown_until_monotonic = 0.0
-        stream_mode[0] = "chat_choice_usage_only"
+        stream_mode[0] = "chat_vllm_continuous_missing_final"
         conn = http.client.HTTPConnection("127.0.0.1", rport, timeout=3.0)
         try:
             body = json.dumps(
@@ -10782,7 +10817,7 @@ asyncio.run(main())
             self.assertNotIn(b"data: [DONE]", exc_info.exception.partial)
         finally:
             conn.close()
-        self.assertEqual(recorded_usage[2].status_code, 502)
+        self.assertEqual(recorded_usage[3].status_code, 502)
 
     def test_tpu_exporter_https_retries_alternate_address_on_tls_stall_and_cert_error(
         self,
@@ -10951,6 +10986,327 @@ asyncio.run(main())
                     pass
             stall_srv.close()
             stall_thread.join(timeout=2.5)
+
+    def test_sse_json_complexity_and_parse_memory_limits_enforced_pre_and_post_commit(
+        self,
+    ) -> None:
+        recorded_usage: List[UsageEvent] = []
+
+        class _RecordHook:
+            def record_usage(self, event: UsageEvent) -> None:
+                recorded_usage.append(event)
+
+        deep_json = (b"[" * 2500) + (b"]" * 2500)
+        # Dense JSON array of empty dicts: ~9 KiB wire bytes, >64 KiB estimated parse memory.
+        dense_json = b'{"x":[' + b",".join([b"{}"] * 3000) + b"]}"
+        valid_first = (
+            b'data: {"id":"c1","object":"chat.completion.chunk",'
+            b'"choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}\n\n'
+        )
+        mode = ["pre_deep"]
+
+        class _ComplexSSEHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return None
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = json.dumps(
+                    {"object": "list", "data": [{"id": "m-sse-complex"}]}
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802
+                clen = int(self.headers.get("Content-Length", "0"))
+                if clen > 0:
+                    self.rfile.read(clen)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                if mode[0] == "pre_deep":
+                    self.wfile.write(b"data: " + deep_json + b"\n\ndata: [DONE]\n\n")
+                elif mode[0] == "post_deep":
+                    self.wfile.write(valid_first)
+                    self.wfile.flush()
+                    self.wfile.write(b"data: " + deep_json + b"\n\ndata: [DONE]\n\n")
+                elif mode[0] == "pre_dense":
+                    self.wfile.write(b"data: " + dense_json + b"\n\ndata: [DONE]\n\n")
+                else:
+                    self.wfile.write(valid_first)
+                    self.wfile.flush()
+                    self.wfile.write(b"data: " + dense_json + b"\n\ndata: [DONE]\n\n")
+                self.wfile.flush()
+
+        srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _ComplexSSEHandler))
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            max_total_response_memory_bytes=64 * 1024,
+            max_sse_pre_commit_bytes=32 * 1024,
+            failure_cooldown_s=30.0,
+            backends=[
+                BackendConfig(
+                    id="sse-complex-b",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=f"http://127.0.0.1:{srv.server_address[1]}/v1",
+                    models=["m-sse-complex"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg, usage_hook=_RecordHook()))
+        rport = router.server_address[1]
+
+        # 1. Pre-commit deeply nested SSE JSON returns clean 502 (no RecursionError / drop).
+        st1, _, bd1 = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-sse-complex",
+                "stream": True,
+                "messages": [{"role": "user", "content": "pre-deep"}],
+            },
+        )
+        self.assertEqual(st1, 502)
+        self.assertIn(b"response_too_large", bd1)
+        self.assertEqual(router.engine._resp_mem_used_bytes, 0)
+
+        # 2. Post-commit deeply nested SSE JSON emits response_too_large and withholds [DONE].
+        mode[0] = "post_deep"
+        conn = http.client.HTTPConnection("127.0.0.1", rport, timeout=3.0)
+        try:
+            body = json.dumps(
+                {
+                    "model": "m-sse-complex",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "post-deep"}],
+                }
+            ).encode("utf-8")
+            conn.request(
+                "POST",
+                "/v1/chat/completions",
+                body=body,
+                headers={"Content-Type": "application/json"},
+            )
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)
+            with self.assertRaises(http.client.IncompleteRead) as exc_info:
+                resp.read()
+            self.assertIn(b"response_too_large", exc_info.exception.partial)
+            self.assertNotIn(b"data: [DONE]", exc_info.exception.partial)
+        finally:
+            conn.close()
+        self.assertEqual(recorded_usage[-1].status_code, 502)
+        self.assertEqual(router.engine._resp_mem_used_bytes, 0)
+
+        # 3. Pre-commit dense SSE JSON exceeding parse memory budget returns 503 without cooldown.
+        mode[0] = "pre_dense"
+        st3, _, bd3 = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-sse-complex",
+                "stream": True,
+                "messages": [{"role": "user", "content": "pre-dense"}],
+            },
+        )
+        self.assertEqual(st3, 503)
+        self.assertIn(b"server_memory_limit_reached", bd3)
+        self.assertEqual(router.engine._backends[0].total_failures, 0)
+        self.assertEqual(router.engine._resp_mem_used_bytes, 0)
+
+        # 4. Post-commit dense SSE JSON exceeding parse memory budget emits 503 error without cooldown.
+        mode[0] = "post_dense"
+        conn = http.client.HTTPConnection("127.0.0.1", rport, timeout=3.0)
+        try:
+            body = json.dumps(
+                {
+                    "model": "m-sse-complex",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "post-dense"}],
+                }
+            ).encode("utf-8")
+            conn.request(
+                "POST",
+                "/v1/chat/completions",
+                body=body,
+                headers={"Content-Type": "application/json"},
+            )
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)
+            with self.assertRaises(http.client.IncompleteRead) as exc_info:
+                resp.read()
+            self.assertIn(b"server_memory_limit_reached", exc_info.exception.partial)
+            self.assertNotIn(b"data: [DONE]", exc_info.exception.partial)
+        finally:
+            conn.close()
+        self.assertEqual(recorded_usage[-1].status_code, 503)
+        self.assertEqual(router.engine._backends[0].total_failures, 0)
+        self.assertEqual(router.engine._resp_mem_used_bytes, 0)
+
+    def test_blocking_sse_path_excludes_downstream_write_delay_from_upstream_timeout(
+        self,
+    ) -> None:
+        recorded_usage: List[UsageEvent] = []
+
+        class _RecordHook:
+            def record_usage(self, event: UsageEvent) -> None:
+                recorded_usage.append(event)
+
+        class _TwoChunkSSEHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return None
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = json.dumps(
+                    {"object": "list", "data": [{"id": "m-slow-client"}]}
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802
+                clen = int(self.headers.get("Content-Length", "0"))
+                if clen > 0:
+                    self.rfile.read(clen)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(
+                    b'data: {"id":"sc1","object":"chat.completion.chunk",'
+                    b'"choices":[{"index":0,"delta":{"content":"First"},"finish_reason":null}]}\n\n'
+                )
+                self.wfile.flush()
+                time.sleep(0.05)
+                self.wfile.write(
+                    b'data: {"id":"sc1","object":"chat.completion.chunk",'
+                    b'"choices":[{"index":0,"delta":{"content":"Second"},"finish_reason":null}]}\n\n'
+                )
+                self.wfile.flush()
+                time.sleep(0.05)
+                self.wfile.write(
+                    b'data: {"id":"sc1","object":"chat.completion.chunk",'
+                    b'"choices":[{"index":0,"delta":{"content":"Done"},"finish_reason":"stop"}]}\n\n'
+                    b"data: [DONE]\n\n"
+                )
+                self.wfile.flush()
+
+        srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _TwoChunkSSEHandler))
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            request_timeout_s=0.25,
+            client_read_timeout_s=1.2,
+            failure_cooldown_s=30.0,
+            backends=[
+                BackendConfig(
+                    id="slow-client-b",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=f"http://127.0.0.1:{srv.server_address[1]}/v1",
+                    models=["m-slow-client"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg, usage_hook=_RecordHook()))
+        rport = router.server_address[1]
+        # Ensure serve_forever() has started sse_reactor before patching it to None.
+        st_h, _, _ = _http_request(rport, "GET", "/health")
+        self.assertEqual(st_h, 200)
+
+        orig_send = socket.socket.send
+        delayed_once = [False]
+        stall_mode = [False]
+
+        def _slow_downstream_send(sock_self: socket.socket, data: Any, *args: Any) -> int:
+            try:
+                is_router_client_sock = sock_self.getsockname()[1] == rport
+            except OSError:
+                is_router_client_sock = False
+            if is_router_client_sock:
+                raw = bytes(data)
+                if b"Second" in raw:
+                    if stall_mode[0]:
+                        raise TimeoutError("simulated client write timeout")
+                    if not delayed_once[0]:
+                        delayed_once[0] = True
+                        # Delay exceeds backend request_timeout_s (0.25s) but fits client_read_timeout_s (1.2s).
+                        time.sleep(0.35)
+            return orig_send(sock_self, data, *args)
+
+        # Force the blocking Phase 2 SSE path (same path used for HTTPS backends).
+        with mock.patch.object(router, "sse_reactor", None):
+            # 1. Slow client write > backend timeout must NOT truncate stream or cool down backend.
+            with mock.patch.object(socket.socket, "send", new=_slow_downstream_send):
+                st_ok, _, bd_ok = _http_request(
+                    rport,
+                    "POST",
+                    "/v1/chat/completions",
+                    body={
+                        "model": "m-slow-client",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "slow-ok"}],
+                    },
+                )
+            self.assertTrue(delayed_once[0])
+            self.assertEqual(st_ok, 200)
+            self.assertIn(b"First", bd_ok)
+            self.assertIn(b"Second", bd_ok)
+            self.assertIn(b"data: [DONE]", bd_ok)
+            self.assertEqual(recorded_usage[-1].status_code, 200)
+            self.assertEqual(router.engine._backends[0].total_failures, 0)
+            self.assertEqual(router.engine._backends[0].cooldown_until_monotonic, 0.0)
+
+            # 2. Client write timeout records 499 without penalizing the healthy backend.
+            stall_mode[0] = True
+            with mock.patch.object(socket.socket, "send", new=_slow_downstream_send):
+                conn = http.client.HTTPConnection("127.0.0.1", rport, timeout=3.0)
+                try:
+                    body = json.dumps(
+                        {
+                            "model": "m-slow-client",
+                            "stream": True,
+                            "messages": [{"role": "user", "content": "slow-timeout"}],
+                        }
+                    ).encode("utf-8")
+                    conn.request(
+                        "POST",
+                        "/v1/chat/completions",
+                        body=body,
+                        headers={"Content-Type": "application/json"},
+                    )
+                    resp = conn.getresponse()
+                    self.assertEqual(resp.status, 200)
+                    with self.assertRaises(http.client.IncompleteRead):
+                        resp.read()
+                finally:
+                    conn.close()
+        deadline = time.monotonic() + 1.0
+        while len(recorded_usage) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(len(recorded_usage), 2)
+        self.assertEqual(recorded_usage[1].status_code, 499)
+        self.assertEqual(router.engine._backends[0].total_failures, 0)
+        self.assertEqual(router.engine._backends[0].cooldown_until_monotonic, 0.0)
 
 
 def run_self_tests(verbosity: int = 1) -> int:
