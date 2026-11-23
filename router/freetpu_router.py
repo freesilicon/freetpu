@@ -709,6 +709,33 @@ def _parse_inference_request_fields(
     return (model, stream, est_prompt_tokens, expected_choices, expect_final_usage), None
 
 
+def _json_serialized_char_len(val: Any) -> int:
+    """Estimate compact serialized character length of a parsed JSON value in O(1) extra memory."""
+    if val is None:
+        return 4
+    if isinstance(val, bool):
+        return 4 if val else 5
+    if isinstance(val, str):
+        return len(val) + 2
+    if isinstance(val, (int, float)):
+        return len(str(val))
+    if isinstance(val, list):
+        total = 2
+        for idx, item in enumerate(val):
+            if idx > 0:
+                total += 1
+            total += _json_serialized_char_len(item)
+        return total
+    if isinstance(val, Mapping):
+        total = 2
+        for idx, (k, v) in enumerate(val.items()):
+            if idx > 0:
+                total += 1
+            total += len(str(k)) + 3 + _json_serialized_char_len(v)
+        return total
+    return len(str(val))
+
+
 def _estimate_prompt_tokens(payload: Mapping[str, Any]) -> int:
     total_chars = 0
     explicit_tokens = 0
@@ -717,13 +744,27 @@ def _estimate_prompt_tokens(payload: Mapping[str, Any]) -> int:
         for msg in messages:
             if not isinstance(msg, Mapping):
                 continue
-            content = msg.get("content")
-            if isinstance(content, str):
-                total_chars += len(content)
-            elif isinstance(content, list):
-                for part in content:
-                    if isinstance(part, Mapping) and isinstance(part.get("text"), str):
-                        total_chars += len(part["text"])
+            for text_key in ("content", "refusal", "reasoning_content", "reasoning", "name"):
+                val = msg.get(text_key)
+                if isinstance(val, str):
+                    total_chars += len(val)
+                elif text_key == "content" and isinstance(val, list):
+                    for part in val:
+                        if isinstance(part, Mapping) and isinstance(part.get("text"), str):
+                            total_chars += len(part["text"])
+            msg_tool_calls = msg.get("tool_calls")
+            if isinstance(msg_tool_calls, list) and msg_tool_calls:
+                total_chars += _json_serialized_char_len(msg_tool_calls)
+            msg_func_call = msg.get("function_call")
+            if isinstance(msg_func_call, Mapping) and msg_func_call:
+                total_chars += _json_serialized_char_len(msg_func_call)
+    for schema_key in ("tools", "functions"):
+        schema_val = payload.get(schema_key)
+        if isinstance(schema_val, list) and schema_val:
+            total_chars += _json_serialized_char_len(schema_val)
+    tool_choice = payload.get("tool_choice")
+    if isinstance(tool_choice, Mapping) and tool_choice:
+        total_chars += _json_serialized_char_len(tool_choice)
     prompt = payload.get("prompt")
     if isinstance(prompt, str):
         total_chars += len(prompt)
@@ -806,6 +847,27 @@ def _has_choice_audio_output(obj: Mapping[str, Any]) -> bool:
                     aval = audio.get(ak)
                     if isinstance(aval, str) and aval:
                         return True
+    return False
+
+
+def _has_choice_token_metadata_output(obj: Mapping[str, Any]) -> bool:
+    """Return True when any choice carries generated `token_ids` or non-empty `logprobs`."""
+    choices = obj.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return False
+    for choice in choices:
+        if not (isinstance(choice, dict) or isinstance(choice, Mapping)):
+            continue
+        token_ids = choice.get("token_ids")
+        if isinstance(token_ids, (list, tuple)) and len(token_ids) > 0:
+            return True
+        logprobs = choice.get("logprobs")
+        if isinstance(logprobs, (list, tuple)) and len(logprobs) > 0:
+            return True
+        if isinstance(logprobs, Mapping):
+            for lval in logprobs.values():
+                if isinstance(lval, (list, tuple, Mapping, str)) and len(lval) > 0:
+                    return True
     return False
 
 
@@ -1010,7 +1072,11 @@ def _sse_event_should_commit(payload_bytes: bytes) -> bool:
         raise _MalformedSSEPayloadError("Upstream SSE event JSON must be an object")
     if obj.get("error") is not None or obj.get("object") == "error":
         return False
-    if _extract_choice_output_text(obj) or _has_choice_audio_output(obj):
+    if (
+        _extract_choice_output_text(obj)
+        or _has_choice_audio_output(obj)
+        or _has_choice_token_metadata_output(obj)
+    ):
         return True
     choices = obj.get("choices")
     if isinstance(choices, list):
@@ -2490,6 +2556,11 @@ class _SSEReactor:
                 task.current_event_type = ""
                 made_progress, is_done = task.on_event_fn(ev_type, task.event_data_lines)
                 task.event_data_lines.clear()
+                if is_done and not made_progress:
+                    # Upstream emitted [DONE] without satisfying required stream_options
+                    # (e.g., missing requested final usage); withhold [DONE] and signal error.
+                    task.upstream_read_error = True
+                    break
                 if is_done:
                     task.saw_done_sentinel = True
                 if made_progress:
@@ -4221,6 +4292,16 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                             if is_retryable:
                                 return "retryable_error", err_status, err_body
                             return "client_error", err_status, err_body
+                        if payload_bytes == b"[DONE]" and expect_final_usage:
+                            return (
+                                "retryable_error",
+                                502,
+                                _openai_error_body(
+                                    "Upstream SSE backend sent [DONE] without requested usage chunk",
+                                    error_type="bad_gateway",
+                                    code="upstream_stream_error",
+                                ),
+                            )
                         try:
                             should_commit = _sse_event_should_commit(payload_bytes)
                         except _MalformedSSEPayloadError:
@@ -4294,6 +4375,9 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 if not payload_bytes:
                     return False, False
                 if payload_bytes == b"[DONE]":
+                    if expect_final_usage and not saw_final_usage:
+                        saw_upstream_error_event = True
+                        return False, True
                     saw_done_sentinel = True
                     return True, True
                 try:
@@ -4336,7 +4420,8 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                 finished_choice_indices.add(len(finished_choice_indices))
                 output_txt = _extract_choice_output_text(obj)
                 has_audio_out = _has_choice_audio_output(obj)
-                if output_txt or has_audio_out:
+                has_token_meta_out = _has_choice_token_metadata_output(obj)
+                if output_txt or has_audio_out or has_token_meta_out:
                     made_progress = True
                     if first_content_ttft_ms is None:
                         first_content_ttft_ms = (time.monotonic() - req_start) * 1000.0
@@ -4618,7 +4703,16 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                 size_limit_exceeded = True
                                 break
                             if content_end == scan_pos:
-                                if process_sse_event():
+                                ev_type_cur = current_event_type
+                                current_event_type = ""
+                                ev_progress, ev_done = process_sse_event_from(
+                                    ev_type_cur, event_data_lines
+                                )
+                                event_data_lines.clear()
+                                if ev_done and not ev_progress:
+                                    upstream_read_error = True
+                                    break
+                                if ev_progress:
                                     progress_deadline = time.monotonic() + timeout_s
                                 event_start = line_end
                                 flush_end = line_end
@@ -4651,7 +4745,12 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                 event_start -= flush_end
                                 release_sse_mem(flush_end)
 
-                        if saw_done_sentinel or size_limit_exceeded or phase2_eof:
+                        if (
+                            saw_done_sentinel
+                            or size_limit_exceeded
+                            or upstream_read_error
+                            or phase2_eof
+                        ):
                             break
 
                         rem = progress_deadline - time.monotonic()
@@ -4709,7 +4808,8 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             usage_satisfied = (not expect_final_usage) or saw_final_usage
             stream_completed = (
                 not saw_upstream_error_event
-                and (saw_done_sentinel or (all_choices_finished and usage_satisfied))
+                and usage_satisfied
+                and (saw_done_sentinel or all_choices_finished)
             )
             stream_memory_exceeded = not downstream_write_error and memory_limit_exceeded
             stream_size_exceeded = (

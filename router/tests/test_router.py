@@ -49,6 +49,7 @@ from router.freetpu_router import (  # noqa: E402
     _open_http_connection,
     _read_bounded_http_response,
     _safe_nonneg_int,
+    _sse_event_should_commit,
     _validate_json_structure,
     build_hooks_from_config,
     create_router_server,
@@ -8404,13 +8405,11 @@ asyncio.run(main())
     def test_ipv6_loopback_listener_binds_and_serves_requests(self) -> None:
         if not socket.has_ipv6:
             self.skipTest("IPv6 not supported in this Python build")
-        probe = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
         try:
-            probe.bind(("::1", 0))
+            with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as probe:
+                probe.bind(("::1", 0))
         except OSError:
             self.skipTest("IPv6 loopback ::1 unavailable on this host")
-        finally:
-            probe.close()
 
         backend = self._track(_MockOpenAIBackend("ipv6-b", ["m-v6"]))
         cfg = RouterConfig(
@@ -10032,6 +10031,366 @@ asyncio.run(main())
         self.assertIsNotNone(seen_timeouts[0])
         self.assertLess(seen_timeouts[0] or 99.0, 0.4)
         self.assertLess(elapsed, 0.6)
+
+    def test_prompt_token_estimate_includes_tool_schemas_and_tool_call_history(
+        self,
+    ) -> None:
+        recorded_usage: List[UsageEvent] = []
+
+        class _CaptureHook:
+            def record_usage(self, event: UsageEvent) -> None:
+                recorded_usage.append(event)
+
+        backend = self._track(
+            _MockOpenAIBackend(
+                "tool-prompt-b",
+                ["m-toolprompt"],
+                custom_sse_chunks=[
+                    {
+                        "id": "c1",
+                        "object": "chat.completion.chunk",
+                        "model": "m-toolprompt",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": "done"},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                    }
+                ],
+            )
+        )
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            backends=[
+                BackendConfig(
+                    id="tool-prompt-b",
+                    type="cloud-tpu-v6e",
+                    base_url=backend.base_url,
+                    cost_per_1m_prompt_usd=1.0,
+                    cost_per_1m_completion_usd=2.0,
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg, usage_hook=_CaptureHook()))
+        tools_catalog = [
+            {
+                "type": "function",
+                "function": {
+                    "name": f"search_codebase_{i}",
+                    "description": "Search repository files with regex and glob filters " * 4,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "pattern": {"type": "string"},
+                            "path": {"type": "string"},
+                        },
+                        "required": ["pattern"],
+                    },
+                },
+            }
+            for i in range(6)
+        ]
+        prior_tool_calls = [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "search_codebase_0",
+                    "arguments": json.dumps({"pattern": "estimate_prompt_tokens", "path": "router/" + ("a" * 200)}),
+                },
+            }
+        ]
+        st, _, _ = _http_request(
+            router.server_address[1],
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-toolprompt",
+                "stream": True,
+                "tools": tools_catalog,
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": None, "tool_calls": prior_tool_calls},
+                    {"role": "tool", "name": "search_codebase_0", "tool_call_id": "call_1", "content": "ok"},
+                ],
+            },
+        )
+        self.assertEqual(st, 200)
+        self.assertEqual(len(recorded_usage), 1)
+        # Without tools/tool_calls, "hi"+"ok" would estimate ~1 token; with them >400 tokens.
+        self.assertGreater(recorded_usage[0].prompt_tokens, 400)
+        self.assertGreater(recorded_usage[0].estimated_cost_usd, 0.0004)
+
+    def test_stream_include_usage_withholds_done_when_final_usage_missing(
+        self,
+    ) -> None:
+        recorded_usage: List[UsageEvent] = []
+        pre_commit_only_done = [False]
+
+        class _CaptureHook:
+            def record_usage(self, event: UsageEvent) -> None:
+                recorded_usage.append(event)
+
+        class _DoneNoUsageHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return None
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = json.dumps(
+                    {"object": "list", "data": [{"id": "m-donenousage"}]}
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802
+                clen = int(self.headers.get("Content-Length", "0"))
+                if clen > 0:
+                    self.rfile.read(clen)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                if not pre_commit_only_done[0]:
+                    self.wfile.write(
+                        b'data: {"id":"c1","object":"chat.completion.chunk","model":"m-donenousage",'
+                        b'"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}\n\n'
+                    )
+                    self.wfile.flush()
+                    time.sleep(0.02)
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+
+        srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _DoneNoUsageHandler))
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            backends=[
+                BackendConfig(
+                    id="donenousage-b",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=f"http://127.0.0.1:{srv.server_address[1]}/v1",
+                    models=["m-donenousage"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg, usage_hook=_CaptureHook()))
+        rport = router.server_address[1]
+
+        # 1. Post-commit [DONE] without final usage under include_usage=true -> [DONE] withheld, 502 recorded.
+        pre_commit_only_done[0] = False
+        conn = http.client.HTTPConnection("127.0.0.1", rport, timeout=3.0)
+        try:
+            body = json.dumps(
+                {
+                    "model": "m-donenousage",
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                    "messages": [{"role": "user", "content": "hi"}],
+                }
+            ).encode("utf-8")
+            conn.request(
+                "POST",
+                "/v1/chat/completions",
+                body=body,
+                headers={"Content-Type": "application/json"},
+            )
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)
+            with self.assertRaises(http.client.IncompleteRead) as exc_info:
+                resp.read()
+            self.assertIn(b"upstream_stream_interrupted", exc_info.exception.partial)
+            self.assertNotIn(b"data: [DONE]", exc_info.exception.partial)
+        finally:
+            conn.close()
+        self.assertEqual(len(recorded_usage), 1)
+        self.assertEqual(recorded_usage[0].status_code, 502)
+
+        # 2. Pre-commit [DONE] without usage under include_usage=true -> rejected 502 before committing 200.
+        router.engine._backends[0].healthy = True
+        router.engine._backends[0].cooldown_until_monotonic = 0.0
+        pre_commit_only_done[0] = True
+        st_pre, _, bd_pre = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-donenousage",
+                "stream": True,
+                "stream_options": {"include_usage": True},
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        self.assertEqual(st_pre, 502)
+        self.assertIn(b"upstream_stream_error", bd_pre)
+
+    def test_streamed_choice_token_ids_and_logprobs_commit_while_prompt_token_ids_buffers(
+        self,
+    ) -> None:
+        # Role-only + top-level prompt_token_ids / empty logprobs must keep buffering.
+        self.assertFalse(
+            _sse_event_should_commit(
+                json.dumps(
+                    {
+                        "id": "c1",
+                        "object": "chat.completion.chunk",
+                        "prompt_token_ids": [1, 2, 3],
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"role": "assistant"},
+                                "logprobs": {"content": []},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                ).encode("utf-8")
+            )
+        )
+        # Choice-level token_ids commits immediately.
+        self.assertTrue(
+            _sse_event_should_commit(
+                json.dumps(
+                    {
+                        "id": "c1",
+                        "object": "chat.completion.chunk",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {},
+                                "token_ids": [42],
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                ).encode("utf-8")
+            )
+        )
+        # Choice-level non-empty logprobs commits immediately.
+        self.assertTrue(
+            _sse_event_should_commit(
+                json.dumps(
+                    {
+                        "id": "c1",
+                        "object": "chat.completion.chunk",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {},
+                                "logprobs": {
+                                    "content": [{"token": "x", "logprob": -0.1}]
+                                },
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                ).encode("utf-8")
+            )
+        )
+
+        # End-to-end live commit proof for a token_ids-only chunk before upstream releases rest.
+        release_rest = threading.Event()
+
+        class _TokenMetaSSEHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return None
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = json.dumps(
+                    {"object": "list", "data": [{"id": "m-tokmeta"}]}
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802
+                clen = int(self.headers.get("Content-Length", "0"))
+                if clen > 0:
+                    self.rfile.read(clen)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(
+                    b'data: {"id":"tm1","object":"chat.completion.chunk","prompt_token_ids":[1,2],'
+                    b'"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}\n\n'
+                    b'data: {"id":"tm1","object":"chat.completion.chunk",'
+                    b'"choices":[{"index":0,"delta":{},"token_ids":[42],"finish_reason":null}]}\n\n'
+                )
+                self.wfile.flush()
+                release_rest.wait(timeout=3.0)
+                self.wfile.write(
+                    b'data: {"id":"tm1","object":"chat.completion.chunk",'
+                    b'"choices":[{"index":0,"delta":{},"logprobs":{"content":[{"token":"ok","logprob":-0.1}]},"finish_reason":"stop"}]}\n\n'
+                    b"data: [DONE]\n\n"
+                )
+                self.wfile.flush()
+
+        srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _TokenMetaSSEHandler))
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            backends=[
+                BackendConfig(
+                    id="tokmeta-b",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=f"http://127.0.0.1:{srv.server_address[1]}/v1",
+                    models=["m-tokmeta"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", router.server_address[1], timeout=3.0
+        )
+        try:
+            body = json.dumps(
+                {
+                    "model": "m-tokmeta",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "meta"}],
+                }
+            ).encode("utf-8")
+            conn.request(
+                "POST",
+                "/v1/chat/completions",
+                body=body,
+                headers={"Content-Type": "application/json"},
+            )
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)
+            seen = bytearray()
+            while b'"token_ids":[42]' not in seen:
+                part = resp.read1(4096)
+                if not part:
+                    break
+                seen.extend(part)
+            self.assertIn(b'"token_ids":[42]', seen)
+            release_rest.set()
+            seen.extend(resp.read())
+        finally:
+            release_rest.set()
+            conn.close()
+        self.assertIn(b"data: [DONE]", seen)
 
 
 def run_self_tests(verbosity: int = 1) -> int:
