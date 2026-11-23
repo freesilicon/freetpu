@@ -55,16 +55,36 @@ bool check_maps() {
   return true;
 }
 
+void print_usage(FILE* out, const char* prog) {
+  fprintf(out, "Usage: %s [--mock] [--bdf <PCI_BDF>] [--help]\n", prog ? prog : "opentpu_vfio_smoke");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (!check_maps()) {
-    return 3;
+  ot_config_t cfg = ot_config_default();
+  for (int i = 1; i < argc; ++i) {
+    if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
+      print_usage(stdout, argv[0]);
+      return 0;
+    } else if (std::strcmp(argv[i], "--mock") == 0) {
+      cfg.mock_mode = 1;
+    } else if (std::strcmp(argv[i], "--bdf") == 0) {
+      if (i + 1 >= argc || argv[i + 1][0] == '\0') {
+        fprintf(stderr, "ERROR: --bdf requires a valid PCI BDF argument\n");
+        print_usage(stderr, argv[0]);
+        return 2;
+      }
+      cfg.bdf = argv[++i];
+    } else {
+      fprintf(stderr, "ERROR: unknown argument: %s\n", argv[i]);
+      print_usage(stderr, argv[0]);
+      return 2;
+    }
   }
 
-  ot_config_t cfg = ot_config_default();
-  if (argc > 1 && std::strcmp(argv[1], "--mock") == 0) {
-    cfg.mock_mode = 1;
+  if (!check_maps()) {
+    return 3;
   }
 
   ot_context_t* ctx = nullptr;

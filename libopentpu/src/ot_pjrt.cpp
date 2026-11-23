@@ -1686,6 +1686,11 @@ PJRT_Error* ot_pjrt_device_memory_stats(PJRT_Device_MemoryStats_Args* args) {
   if (!args || !args->device || !args->device->ctx) {
     return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null");
   }
+  if (!args->device->ctx->info.is_mock &&
+      !args->device->ctx->transport.is_owner_process()) {
+    return make_err(PJRT_Error_Code_FAILED_PRECONDITION,
+                    "VFIO context cannot be used in a forked child process");
+  }
   uint64_t used = 0;
   uint64_t limit = 0;
   {
