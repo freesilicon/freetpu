@@ -31,24 +31,36 @@ groups:
             TPU HBM usage exceeded 95% of capacity for 1 minute. Trigger dynamic
             batch-size reduction, KV cache eviction, or re-sharding before OOM.
 
+      # Scoped explicitly to targets labeled `expected_tpu_activity="sustained"`
+      # (e.g. continuous training jobs via Prometheus scrape relabeling) AND
+      # gated on active HBM allocation. An initialized libtpu runtime reports 0%
+      # duty cycle while idle, so warmed-up inference replicas with zero traffic
+      # must NOT fire this critical alert; for inference pools, gate low duty
+      # cycle on a serving-layer demand signal (e.g. in-flight requests > 0).
       - alert: TpuMxuDutyCycleCollapse
         expr: |
           (
-            avg_over_time(freetpu_tpu_duty_cycle_percent[5m]) < 10
+            avg_over_time(freetpu_tpu_duty_cycle_percent{expected_tpu_activity="sustained"}[5m]) < 10
+            and
+            freetpu_tpu_hbm_used_bytes{expected_tpu_activity="sustained"} > 0
           )
           or
           (
-            avg_over_time(freetpu_tpu_runtime_duty_cycle_percent{pci_bdf="unmapped"}[5m]) < 10
+            avg_over_time(freetpu_tpu_runtime_duty_cycle_percent{pci_bdf="unmapped",expected_tpu_activity="sustained"}[5m]) < 10
+            and
+            freetpu_tpu_runtime_hbm_used_bytes{pci_bdf="unmapped",expected_tpu_activity="sustained"} > 0
           )
         for: 5m
         labels:
           severity: critical
         annotations:
-          summary: "TPU MXU duty cycle collapsed (<10%) on {{ $labels.node }}"
+          summary: "TPU MXU duty cycle collapsed (<10%) on sustained workload {{ $labels.node }}"
           description: >-
-            TensorCore / MXU duty cycle remained below 10% over 5 minutes while
-            runtime telemetry is active. Investigate input-pipeline stalls or
-            ICI collective barriers.
+            TensorCore / MXU duty cycle remained below 10% over 5 minutes on a
+            target labeled expected_tpu_activity="sustained" with active HBM
+            allocation. Investigate input-pipeline stalls or ICI collective
+            barriers. Idle/warmed-up inference replicas are excluded unless
+            explicitly gated on serving demand.
 
       - alert: TpuPcieAerFault
         # 5m range window provides multiple scrapes even at Prometheus's default

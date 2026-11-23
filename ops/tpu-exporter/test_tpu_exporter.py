@@ -2137,6 +2137,82 @@ TPU Runtime Utilization
             self.assertIn("unavailable", err_fb or "")
             self.assertEqual(rows_fb, {})
 
+            # Ironwood (tpu7x, 0x0076) exposes 2 logical runtime cores per physical chip:
+            # HBM is reported per core (0..7) while duty cycle is reported per physical chip
+            # (0..3). Verify chip c's duty cycle maps onto cores (2*c, 2*c+1) rather than
+            # misassigning chip 1's duty cycle onto core 1 of chip 0.
+            iw_root = root / "ironwood_grpc"
+            iw_sysfs, iw_dev, iw_proc = _make_mock_pci_tree(
+                iw_root,
+                devices=[
+                    {
+                        "bdf": f"0000:00:{4 + i:02x}.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0076",
+                        "driver": "vfio-pci",
+                        "iommu_group": str(i),
+                        "chip_id": str(i),
+                    }
+                    for i in range(8)
+                ],
+                create_vfio_nodes=[str(i) for i in range(8)],
+            )
+
+            class _IronwoodStub:
+                def __init__(self, channel):
+                    self.channel = channel
+
+                def GetRuntimeMetric(self, req, timeout=None):
+                    del timeout
+                    if req.metric_name == "tpu.runtime.hbm.memory.usage.bytes":
+                        items = [_make_item(c, as_int=(c + 1) * 10 * 1024**3) for c in range(8)]
+                    elif req.metric_name == "tpu.runtime.hbm.memory.total.bytes":
+                        items = [_make_item(c, as_int=96 * 1024**3) for c in range(8)]
+                    elif req.metric_name == "tpu.runtime.tensorcore.dutycycle.percent":
+                        # 4 physical chips (0..3), NOT 8 logical cores!
+                        items = [
+                            _make_item(0, as_double=12.5),
+                            _make_item(1, as_double=37.5),
+                            _make_item(2, as_double=62.5),
+                            _make_item(3, as_double=87.5),
+                        ]
+                    elif req.metric_name == "tpu.runtime.hbm.utilization.percent":
+                        items = [_make_item(c, as_double=50.0 + c) for c in range(8)]
+                    else:
+                        items = []
+                    return SimpleNamespace(metric=SimpleNamespace(metrics=items))
+
+            iw_pb2_grpc = SimpleNamespace(RuntimeMetricServiceStub=_IronwoodStub)
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.dict(_te._GRPC_CHANNELS, {}, clear=True),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "grpc": _FakeGrpc,
+                        "tpu_info": SimpleNamespace(),
+                        "tpu_info.proto": SimpleNamespace(),
+                        "tpu_info.proto.tpu_metric_service_pb2": fake_pb2,
+                        "tpu_info.proto.tpu_metric_service_pb2_grpc": iw_pb2_grpc,
+                    },
+                ),
+            ):
+                iw_snap = _te.collect_snapshot(
+                    sysfs_root=iw_sysfs,
+                    dev_root=iw_dev,
+                    proc_root=iw_proc,
+                    tpu_info_bin="tpu-info",
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=iw_root / "no-shm",
+                )
+            self.assertEqual(len(iw_snap.devices), 8)
+            expected_duty = [12.5, 12.5, 37.5, 37.5, 62.5, 62.5, 87.5, 87.5]
+            self.assertEqual([d.duty_cycle_percent for d in iw_snap.devices], expected_duty)
+            self.assertEqual(
+                [d.hbm_used_bytes for d in iw_snap.devices],
+                [(c + 1) * 10 * 1024**3 for c in range(8)],
+            )
+
     def test_shm_seqlock_mmap_reader_including_torn_read_retry(self) -> None:
         import struct
 
@@ -2390,7 +2466,14 @@ TPU Runtime Utilization
                 self.assertIn(rule_name, alerts_text)
             # Runtime fallback branches must restrict to unmapped chips to avoid duplicate alerts.
             self.assertIn('freetpu_tpu_runtime_hbm_used_bytes{pci_bdf="unmapped"}', alerts_text)
-            self.assertIn('freetpu_tpu_runtime_duty_cycle_percent{pci_bdf="unmapped"}', alerts_text)
+            self.assertIn(
+                'freetpu_tpu_runtime_duty_cycle_percent{pci_bdf="unmapped",expected_tpu_activity="sustained"}',
+                alerts_text,
+            )
+            # Duty cycle collapse must be gated on sustained activity + HBM allocation so idle inference replicas don't page.
+            self.assertIn('expected_tpu_activity="sustained"', alerts_text)
+            self.assertIn('freetpu_tpu_hbm_used_bytes{expected_tpu_activity="sustained"} > 0', alerts_text)
+            self.assertIn("inference replicas", alerts_text)
             # PCIe AER alert must use a multi-scrape window ([5m], not [1m]).
             self.assertIn("increase(freetpu_pcie_aer_fatal_total[5m]) > 0", alerts_text)
             self.assertNotIn("freetpu_pcie_aer_fatal_total[1m]", alerts_text)

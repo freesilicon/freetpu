@@ -50,14 +50,15 @@
 #      default whenever usable; on Linux 6.8+ `iommufd`-only hosts (or with
 #      explicit `--vfio-mode iommufd`), `freetpu_cdi.py` emits `/dev/iommu` +
 #      verified `<pci>/vfio-dev/vfioN` nodes (mount `/dev/iommu` and
-#      `/dev/vfio/devices` into `freetpu-cdi-sync` on `iommufd` nodes). In
-#      default `--network-mode isolated`, CDI (default `v0.6.0` for containerd
-#      2.0/2.1+ compatibility) injects `MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353`,
-#      `TPU_HOST_BOUNDS=1,1,1`, `TPU_SKIP_MDS_QUERY=1` (and slice-scoped
-#      `TPU_CHIPS_PER_HOST_BOUNDS` + `TPU_VISIBLE_DEVICES` on full-allocation
-#      selectors `numa*`/`0-3`/`all`) so single-host TPU pods do NOT require
-#      `hostNetwork: true` and can share a `v6e-8` across NUMA slices without
-#      port `8353` collisions.
+#      `/dev/vfio/devices` into `freetpu-cdi-sync` on `iommufd` nodes). By
+#      default (`--network-mode host`, without `--single-host-env`), CDI
+#      (default `v0.6.0` for containerd 2.0/2.1+ compatibility) preserves
+#      workload-provided `libtpu` environment variables so multi-host TPU pods
+#      never lose peer discovery on spec refresh. Add `--single-host-env` (or
+#      `--network-mode isolated`) only on dedicated single-host / sub-host
+#      isolated node pools to inject `MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353`,
+#      `TPU_HOST_BOUNDS=1,1,1`, `TPU_SKIP_MDS_QUERY=1`, and slice-scoped
+#      `TPU_CHIPS_PER_HOST_BOUNDS` + `TPU_VISIBLE_DEVICES`.
 #      VFIO MEMLOCK PREREQUISITE: CDI device injection does not configure
 #      `RLIMIT_MEMLOCK` or Linux capabilities, and Kubernetes Pods have no
 #      `--ulimit` field. On self-managed nodes inheriting a restrictive systemd
@@ -277,8 +278,6 @@ spec:
             - /var/run/cdi/freetpu.json
             - --interval
             - "15"
-            - --network-mode
-            - isolated
             - --unlink-on-exit
           # Report Ready only while `/var/run/cdi/freetpu.json` exists and passes
           # live host VFIO verification (read-only; the sync loop owns writes/cleanup).

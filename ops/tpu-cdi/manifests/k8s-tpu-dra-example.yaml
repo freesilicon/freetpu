@@ -1,21 +1,24 @@
-# Starter Kubernetes Dynamic Resource Allocation (DRA) manifest for FreeTPU
-# Cloud TPU v6e-8 / v5e-8 sub-host topology-aware partitioning (Section 4).
+# Starter Kubernetes Dynamic Resource Allocation (DRA) manifest (`resource.k8s.io/v1`,
+# stable in Kubernetes 1.34+) for FreeTPU Cloud TPU v6e-8 / v5e-8 sub-host
+# topology-aware partitioning.
 #
 # Key properties:
 # - Uses standard Kubernetes CNI networking (`hostNetwork` omitted / false):
-#   CDI (default v0.6.0, opt-in --cdi-version 1.1.0) injects
-#   MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353, TPU_HOST_BOUNDS=1,1,1,
+#   when `freetpu_cdi.py` is run with opt-in `--single-host-env` (or
+#   `--network-mode isolated`), CDI (default v0.6.0, opt-in --cdi-version 1.1.0)
+#   injects MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353, TPU_HOST_BOUNDS=1,1,1,
 #   slice-scoped TPU_CHIPS_PER_HOST_BOUNDS=2,2,1, TPU_VISIBLE_DEVICES, and
-#   TPU_SKIP_MDS_QUERY=1 on slice selectors so two independent 4-chip
-#   workloads can share one v6e-8 host without port 8353 collisions or
-#   hostNetwork privilege escalation.
+#   TPU_SKIP_MDS_QUERY=1 on slice selectors so two independent 4-chip workloads
+#   can share one v6e-8 host without port 8353 collisions or hostNetwork
+#   privilege escalation. (Without `--single-host-env`, CDI preserves workload
+#   env for multi-host jobs.)
 # - Partitions v6e-8 strictly along physical NUMA / PCIe root-complex
 #   boundaries (`0000:00` NUMA 0 chips 0..3 vs `0000:80` NUMA 1 chips 4..7)
 #   so host-to-device DMA never crosses CPU UPI/QPI interconnects.
 # - Legacy `/dev/vfio/<group>` (default when usable) and Linux 6.8+ `iommufd`
 #   (`--vfio-mode iommufd` / pure-iommufd fallback) are handled by `freetpu_cdi.py`.
 ---
-apiVersion: resource.k8s.io/v1beta1
+apiVersion: resource.k8s.io/v1
 kind: DeviceClass
 metadata:
   name: freetpu-tpu-v6e
@@ -26,7 +29,7 @@ spec:
 ---
 # Example ResourceSlice published by a node-local `freetpu-dra-driver` DaemonSet
 # for a single Cloud TPU v6e-8 host (`0000:00` on NUMA 0, `0000:80` on NUMA 1).
-apiVersion: resource.k8s.io/v1beta1
+apiVersion: resource.k8s.io/v1
 kind: ResourceSlice
 metadata:
   name: v6e-8-node-0-freetpu
@@ -39,45 +42,43 @@ spec:
     resourceSliceCount: 1
   devices:
     - name: numa0-slice
-      basic:
-        attributes:
-          generation:
-            string: "v6e"
-          numa_node:
-            string: "0"
-          pcie_root:
-            string: "0000:00"
-          cdi_selector:
-            string: "freetpu.dev/tpu=numa0"
-          chips:
-            int: 4
-          memoryGiB:
-            int: 128
-        capacity:
-          memory:
-            value: 128Gi
+      attributes:
+        generation:
+          string: "v6e"
+        numa_node:
+          string: "0"
+        pcie_root:
+          string: "0000:00"
+        cdi_selector:
+          string: "freetpu.dev/tpu=numa0"
+        chips:
+          int: 4
+        memoryGiB:
+          int: 128
+      capacity:
+        memory:
+          value: 128Gi
     - name: numa1-slice
-      basic:
-        attributes:
-          generation:
-            string: "v6e"
-          numa_node:
-            string: "1"
-          pcie_root:
-            string: "0000:80"
-          cdi_selector:
-            string: "freetpu.dev/tpu=numa1"
-          chips:
-            int: 4
-          memoryGiB:
-            int: 128
-        capacity:
-          memory:
-            value: 128Gi
+      attributes:
+        generation:
+          string: "v6e"
+        numa_node:
+          string: "1"
+        pcie_root:
+          string: "0000:80"
+        cdi_selector:
+          string: "freetpu.dev/tpu=numa1"
+        chips:
+          int: 4
+        memoryGiB:
+          int: 128
+      capacity:
+        memory:
+          value: 128Gi
 ---
 # Topology-aware 4-chip ResourceClaimTemplate pinned to a single NUMA domain
 # (avoids cross-socket UPI/QPI DMA and eliminates hostNetwork: true).
-apiVersion: resource.k8s.io/v1beta1
+apiVersion: resource.k8s.io/v1
 kind: ResourceClaimTemplate
 metadata:
   name: tpu-v6e-4chip-numa0
@@ -87,13 +88,14 @@ spec:
     devices:
       requests:
         - name: tpu-slice
-          deviceClassName: freetpu-tpu-v6e
-          selectors:
-            - cel:
-                expression: >-
-                  device.attributes["freetpu.dev"].numa_node == "0" &&
-                  device.attributes["freetpu.dev"].chips == 4 &&
-                  device.attributes["freetpu.dev"].memoryGiB >= 120
+          exactly:
+            deviceClassName: freetpu-tpu-v6e
+            selectors:
+              - cel:
+                  expression: >-
+                    device.attributes["freetpu.dev"].numa_node == "0" &&
+                    device.attributes["freetpu.dev"].chips == 4 &&
+                    device.attributes["freetpu.dev"].memoryGiB >= 120
 ---
 # Network-isolated 4-chip Cloud TPU workload Pod (NO hostNetwork: true, NO privileged: true).
 apiVersion: v1
@@ -103,8 +105,9 @@ metadata:
   namespace: default
 spec:
   restartPolicy: Never
-  # hostNetwork is intentionally omitted (false): CDI containerEdits.env
-  # binds Megascale coordinator to 127.0.0.1:8353 inside this Pod's network namespace.
+  # hostNetwork is intentionally omitted (false): when freetpu_cdi.py runs with
+  # --single-host-env, CDI containerEdits.env binds Megascale coordinator to
+  # 127.0.0.1:8353 inside this Pod's network namespace.
   containers:
     - name: jax-worker
       image: python:3.12-slim

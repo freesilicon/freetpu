@@ -222,6 +222,23 @@ _GEN_TO_TPU_CHIP_ATTR: Dict[str, str] = {
     "tpu7x": "V7X",
 }
 
+# Logical runtime devices/cores per physical TPU chip (matches upstream
+# `tpu_info.device.TpuChip`: v2/v3/v7x expose 2 logical devices per physical
+# chip while v4/v5e/v5p/v6e expose 1). `libtpu` reports HBM metrics per logical
+# device/core and `tpu.runtime.tensorcore.dutycycle.percent` per physical chip.
+_GEN_DEVICES_PER_CHIP: Dict[str, int] = {
+    "v2": 2,
+    "v3": 2,
+    "v2-v3": 2,
+    "v4": 1,
+    "v4lite": 1,
+    "v5e": 1,
+    "v5p": 1,
+    "v6e": 1,
+    "v6e-pf": 1,
+    "tpu7x": 2,
+}
+
 
 def _read_fdinfo_flags(fdinfo_path: Path) -> Tuple[Optional[int], bool]:
     """Read octal open `flags:` from `/proc/<pid>/fdinfo/<fd>`.
@@ -1065,6 +1082,18 @@ def _extract_grpc_gauge_value(metric_item: Any) -> Optional[float]:
     return None
 
 
+def _infer_devices_per_chip(devices: Sequence[TpuTelemetry]) -> int:
+    """Infer logical runtime devices per physical chip from discovered PCI generations."""
+    counts = {
+        _GEN_DEVICES_PER_CHIP[d.generation]
+        for d in devices
+        if d.generation in _GEN_DEVICES_PER_CHIP
+    }
+    if len(counts) == 1:
+        return next(iter(counts))
+    return 1
+
+
 def _query_grpc_runtime_metrics(
     devices: Sequence[TpuTelemetry],
     addr: Optional[str] = "127.0.0.1:8431",
@@ -1073,12 +1102,15 @@ def _query_grpc_runtime_metrics(
     """Query `libtpu` RuntimeMetricService directly in-process over gRPC (`localhost:8431`).
 
     Eliminates `tpu-info` CLI/Python subprocess churn and works cleanly when
-    `grpcio` and `tpu_metric_service` proto stubs are installed. Falls back
-    gracefully when `grpcio` or proto stubs are unavailable.
+    `grpcio` and `tpu_metric_service` proto stubs are installed. Maps per-chip
+    `tpu.runtime.tensorcore.dutycycle.percent` readings across each chip's
+    logical runtime devices using `_GEN_DEVICES_PER_CHIP` (matching upstream
+    `tpu_info/metrics.py` & `device.py`, e.g. 2 logical cores per physical chip
+    on Ironwood `tpu7x` and v2/v3) before joining with per-core HBM series.
+    Falls back gracefully when `grpcio` or proto stubs are unavailable.
     """
     if not addr:
         return False, "runtime metrics gRPC address disabled", {}
-    del devices  # RuntimeMetricService exposes all active chips on the endpoint.
 
     mods = _load_grpc_runtime_modules()
     if mods is None:
@@ -1101,7 +1133,9 @@ def _query_grpc_runtime_metrics(
     if not callable(rpc_fn):
         return False, "RuntimeMetricServiceStub.GetRuntimeMetric unavailable", {}
 
+    devices_per_chip = _infer_devices_per_chip(devices)
     rows: Dict[str, _TpuInfoRow] = {}
+    duty_by_chip: Dict[str, float] = {}
     last_err: Optional[str] = None
     any_rpc_ok = False
     for metric_name in _GRPC_METRIC_NAMES:
@@ -1125,16 +1159,32 @@ def _query_grpc_runtime_metrics(
             val = _extract_grpc_gauge_value(item)
             if chip_id is None or val is None or val < 0.0:
                 continue
+            if metric_name == "tpu.runtime.tensorcore.dutycycle.percent":
+                duty_by_chip[chip_id] = float(val)
+                continue
             row = rows.setdefault(chip_id, _TpuInfoRow(chip_key=chip_id))
             row.in_util_table = True
             if metric_name == "tpu.runtime.hbm.memory.usage.bytes":
                 row.hbm_used_bytes = int(round(val))
             elif metric_name == "tpu.runtime.hbm.memory.total.bytes" and val > 0:
                 row.hbm_total_bytes = int(round(val))
-            elif metric_name == "tpu.runtime.tensorcore.dutycycle.percent":
-                row.duty_cycle_percent = float(val)
             elif metric_name == "tpu.runtime.hbm.utilization.percent":
                 row.hbm_bw_util_percent = float(val)
+
+    # Join per-chip duty cycle onto logical runtime cores using devices_per_chip:
+    # chip `c` covers logical cores `c * devices_per_chip + offset` (core_id // devices_per_chip == c).
+    for chip_key, duty_val in duty_by_chip.items():
+        if devices_per_chip > 1 and chip_key.isdigit():
+            chip_idx = int(chip_key)
+            for offset in range(devices_per_chip):
+                core_key = str(chip_idx * devices_per_chip + offset)
+                row = rows.setdefault(core_key, _TpuInfoRow(chip_key=core_key))
+                row.in_util_table = True
+                row.duty_cycle_percent = duty_val
+        else:
+            row = rows.setdefault(chip_key, _TpuInfoRow(chip_key=chip_key))
+            row.in_util_table = True
+            row.duty_cycle_percent = duty_val
 
     if not rows:
         if not any_rpc_ok and last_err:

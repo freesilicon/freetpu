@@ -15,13 +15,14 @@ Also supports:
   - Legacy VFIO (`/dev/vfio/vfio` + `/dev/vfio/<iommu_group>`) preserved as
     default when usable, plus explicit `--vfio-mode iommufd` (or `cdev`) opt-in
     and pure-iommufd fallback (`/dev/iommu` + verified `<pci>/vfio-dev/vfioN`)
-  - Isolated container networking without `--net=host` via CDI
-    `containerEdits.env` (`MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353`,
-    `TPU_HOST_BOUNDS=1,1,1`, `TPU_SKIP_MDS_QUERY=1`; with slice-scoped
-    `TPU_CHIPS_PER_HOST_BOUNDS` and `TPU_VISIBLE_DEVICES` injected only on
-    full-allocation selectors `numa*`/`0-3`/`all` so composable `pci-*`
-    selectors never overwrite each other), or explicit `--network-mode host`
-    for multi-host slices
+  - Opt-in single-host isolated container networking via `--single-host-env`
+    (or `--network-mode isolated`), injecting `MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353`,
+    `TPU_HOST_BOUNDS=1,1,1`, `TPU_SKIP_MDS_QUERY=1` (plus physical-chip-derived
+    `TPU_CHIPS_PER_HOST_BOUNDS` and `TPU_VISIBLE_DEVICES` on full-allocation
+    selectors `numa*`/`0-3`/`all` only). By default (`--network-mode host`,
+    without `--single-host-env`), no `libtpu` environment overrides are injected
+    so existing multi-host workloads retain their configured peer discovery,
+    visibility, and bounds.
   - `validate`: strict CNCF CDI structural & live host VFIO/iommufd validator
   - `sync`: boot-scoped generator/reconciler that invalidates stale specs on drift
   - `docker-args`: prints Docker / Podman CLI flags (memlock default; optional IPC_LOCK)
@@ -90,13 +91,26 @@ _CDI_CONTAINER_EDITS_KEYS_V07 = _CDI_CONTAINER_EDITS_KEYS_V06 | frozenset(
 )
 _CDI_CONTAINER_EDITS_KEYS_V11 = _CDI_CONTAINER_EDITS_KEYS_V07 | frozenset({"netDevices"})
 # Exact CNCF CDI specs-go/config.go IntelRdt JSON keys:
-# v0.7.0+: closID (string), l3CacheSchema (string), memBwSchema (string)
-# v1.1.0+: schemata ([]string), enableMonitoring (bool)
-_ALLOWED_INTEL_RDT_KEYS_V07 = frozenset({"closID", "l3CacheSchema", "memBwSchema"})
-_ALLOWED_INTEL_RDT_KEYS_V11 = _ALLOWED_INTEL_RDT_KEYS_V07 | frozenset(
-    {"schemata", "enableMonitoring"}
+# v0.7.0 - v1.0.0: closID (string), l3CacheSchema (string), memBwSchema (string),
+#                  enableCMT (bool), enableMBM (bool)
+# v1.1.0:          closID (string), l3CacheSchema (string), memBwSchema (string),
+#                  schemata ([]string), enableMonitoring (bool)
+#                  (enableCMT and enableMBM were removed in v1.1.0)
+_ALLOWED_INTEL_RDT_KEYS_V07 = frozenset(
+    {"closID", "l3CacheSchema", "memBwSchema", "enableCMT", "enableMBM"}
+)
+_ALLOWED_INTEL_RDT_KEYS_V11 = frozenset(
+    {"closID", "l3CacheSchema", "memBwSchema", "schemata", "enableMonitoring"}
 )
 _ALLOWED_NET_DEVICE_KEYS = frozenset({"hostInterfaceName", "name"})
+# PCI functions (chiplets/cores) exposed per physical TPU chip.
+# Ironwood (`tpu7x`: 0x0075/0x0076) and legacy v2/v3 (`0x0027`) expose 2 PCI
+# functions per physical chip; single-function generations default to 1.
+_PCI_FUNCTIONS_PER_PHYSICAL_CHIP: Dict[str, int] = {
+    "v2-v3": 2,
+    "tpu7x": 2,
+}
+_SYSFS_PCI_ROOT_RE = re.compile(r"^pci([0-9a-fA-F]{4,}:[0-9a-fA-F]{2})\Z")
 _ALLOWED_HOOK_NAMES = frozenset(
     {
         "prestart",
@@ -324,11 +338,32 @@ def _resolve_iommufd_cdev(
 
 
 def _pcie_root_complex(pci_bdf: str) -> str:
-    """Return `<domain>:<bus>` PCIe root-complex prefix for a BDF (e.g. `0000:00` or `0000:80`)."""
+    """Return `<domain>:<bus>` prefix from a PCI BDF (fallback when sysfs root bridge is absent)."""
     parts = pci_bdf.strip().split(":")
     if len(parts) >= 2:
         return f"{parts[0]}:{parts[1]}"
     return pci_bdf.strip()
+
+
+def _resolve_pcie_root_complex(pci_entry: Path) -> str:
+    """Derive the PCIe root complex (`<domain>:<root_bus>`) from resolved sysfs ancestry.
+
+    On Linux, `/sys/bus/pci/devices/<bdf>` symlinks into
+    `/sys/devices/pci<domain>:<root_bus>/<bridges...>/<bdf>`. Walking the
+    resolved path finds the host bridge (`pciXXXX:XX`) so chips behind PCIe
+    switches on different downstream bus numbers stay in the same topology
+    domain. Falls back to `_pcie_root_complex(pci_entry.name)` for flat
+    synthetic fixtures without a `pciXXXX:XX` ancestor directory.
+    """
+    try:
+        resolved = Path(os.path.realpath(pci_entry))
+    except OSError:
+        resolved = pci_entry
+    for part in resolved.parts:
+        m = _SYSFS_PCI_ROOT_RE.match(part)
+        if m:
+            return m.group(1).lower()
+    return _pcie_root_complex(pci_entry.name)
 
 
 def _parse_numa_node(pci_entry: Path) -> Optional[int]:
@@ -490,7 +525,7 @@ def discover_tpu_chips(
             )
 
         numa_node = _parse_numa_node(entry)
-        pcie_root = _pcie_root_complex(entry.name)
+        pcie_root = _resolve_pcie_root_complex(entry)
 
         if use_iommufd:
             cdev_name, kernel_cdev_dn = _resolve_iommufd_cdev(entry, sysfs_root)
@@ -607,8 +642,77 @@ def _format_vfio_devnums(entries: Sequence[Tuple[str, Optional[str]]]) -> Option
     return ",".join(f"{cp}={dn}" for cp, dn in pairs)
 
 
+def _map_physical_chip_indices(chips: Sequence[DiscoveredChip]) -> Dict[str, int]:
+    """Map each discovered PCI BDF to its physical TPU chip ordinal (`0..N-1`).
+
+    Generations with 1 PCI function per physical chip (`v5e`, `v5p`, `v6e`, etc.)
+    map 1:1. Dual-function/chiplet generations (`tpu7x` Ironwood `0x0075`/`0x0076`
+    and legacy `v2-v3`) group two PCI functions per physical chip (pairing
+    functions on the same PCI slot `DDDD:BB:DD` when present, or consecutive
+    functions in deterministic enumeration order otherwise), so host bounds match
+    physical chip topology (e.g. 8 Ironwood PCI functions -> 4 physical chips ->
+    `2,2,1`) while every PCI function remains attached for VFIO allocation.
+    """
+    bdf_to_phys: Dict[str, int] = {}
+    slot_counts: Dict[Tuple[str, str], int] = {}
+    for c in chips:
+        base_slot = c.pci_bdf.rsplit(".", 1)[0]
+        key = (c.generation, base_slot)
+        slot_counts[key] = slot_counts.get(key, 0) + 1
+
+    slot_to_phys: Dict[Tuple[str, str], int] = {}
+    gen_pending_phys: Dict[str, Tuple[int, int]] = {}  # gen -> (phys_id, remaining_slots)
+    next_phys = 0
+
+    for c in chips:
+        per_chip = _PCI_FUNCTIONS_PER_PHYSICAL_CHIP.get(c.generation, 1)
+        if per_chip <= 1:
+            bdf_to_phys[c.pci_bdf] = next_phys
+            next_phys += 1
+            continue
+
+        base_slot = c.pci_bdf.rsplit(".", 1)[0]
+        slot_key = (c.generation, base_slot)
+        if slot_counts.get(slot_key, 0) > 1:
+            if slot_key not in slot_to_phys:
+                slot_to_phys[slot_key] = next_phys
+                next_phys += 1
+            bdf_to_phys[c.pci_bdf] = slot_to_phys[slot_key]
+            continue
+
+        pending = gen_pending_phys.get(c.generation)
+        if pending is not None and pending[1] > 0:
+            phys_id, rem = pending
+            bdf_to_phys[c.pci_bdf] = phys_id
+            if rem - 1 > 0:
+                gen_pending_phys[c.generation] = (phys_id, rem - 1)
+            else:
+                gen_pending_phys.pop(c.generation, None)
+        else:
+            phys_id = next_phys
+            next_phys += 1
+            bdf_to_phys[c.pci_bdf] = phys_id
+            gen_pending_phys[c.generation] = (phys_id, per_chip - 1)
+
+    return bdf_to_phys
+
+
+def _distinct_physical_indices(
+    subset: Sequence[DiscoveredChip],
+    bdf_to_phys: Dict[str, int],
+) -> List[int]:
+    seen: set[int] = set()
+    ordered: List[int] = []
+    for c in subset:
+        idx = bdf_to_phys[c.pci_bdf]
+        if idx not in seen:
+            seen.add(idx)
+            ordered.append(idx)
+    return ordered
+
+
 def _chips_per_host_bounds(chip_count: int, generations: Sequence[str]) -> str:
-    """Return `TPU_CHIPS_PER_HOST_BOUNDS` (`X,Y,Z`) matching the slice size and generation."""
+    """Return `TPU_CHIPS_PER_HOST_BOUNDS` (`X,Y,Z`) matching physical chip count and generation."""
     if chip_count <= 1:
         return "1,1,1"
     if chip_count == 2:
@@ -616,44 +720,52 @@ def _chips_per_host_bounds(chip_count: int, generations: Sequence[str]) -> str:
     if chip_count == 4:
         return "2,2,1"
     if chip_count == 8:
-        if any(g in ("v4", "v4lite", "v5p") for g in generations):
+        if any(g in ("v4", "v4lite", "v5p", "tpu7x") for g in generations):
             return "2,2,2"
         return "2,4,1"
     return f"1,{chip_count},1"
 
 
 def _build_device_env(
-    chip_indices: Sequence[int],
+    physical_chip_indices: Sequence[int],
     generations: Sequence[str],
     *,
-    network_mode: str = "isolated",
+    single_host_env: bool = False,
     include_visibility_env: bool = True,
 ) -> List[str]:
     """Build per-device CDI `containerEdits.env` entries.
 
-    `TPU_VISIBLE_DEVICES` and `TPU_CHIPS_PER_HOST_BOUNDS` are injected only on
-    full-allocation / slice selectors (`numa*`, `0-3`/`4-7`, `all`). Omitting
-    them on independently composable unit selectors (`pci-*`, `group-pci-*`)
-    prevents later selectors from overwriting earlier ones in OCI env merging.
+    By default (`single_host_env=False`), returns an empty list so CDI never
+    overwrites workload-configured multi-host peer discovery, visibility, or
+    host bounds. When `single_host_env=True` is explicitly opted in:
+    - All selectors receive isolated loopback Megascale / single-host overrides.
+    - Full-allocation / slice selectors (`numa*`, `0-3`/`4-7`, `all`) also
+      receive `TPU_VISIBLE_DEVICES` and physical-chip-derived
+      `TPU_CHIPS_PER_HOST_BOUNDS`.
+    - Independently composable unit selectors (`pci-*`, `group-pci-*`) omit
+      `TPU_VISIBLE_DEVICES` and `TPU_CHIPS_PER_HOST_BOUNDS` so combining
+      multiple selectors never overwrites visibility in OCI env merging.
     """
+    if not single_host_env:
+        return []
+
     env: List[str] = []
     if include_visibility_env:
-        visible = ",".join(str(idx) for idx in chip_indices)
-        bounds = _chips_per_host_bounds(len(chip_indices), generations)
+        visible = ",".join(str(idx) for idx in physical_chip_indices)
+        bounds = _chips_per_host_bounds(len(physical_chip_indices), generations)
         env.extend(
             [
                 f"TPU_VISIBLE_DEVICES={visible}",
                 f"TPU_CHIPS_PER_HOST_BOUNDS={bounds}",
             ]
         )
-    if network_mode == "isolated":
-        env.extend(
-            [
-                "MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353",
-                "TPU_HOST_BOUNDS=1,1,1",
-                "TPU_SKIP_MDS_QUERY=1",
-            ]
-        )
+    env.extend(
+        [
+            "MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353",
+            "TPU_HOST_BOUNDS=1,1,1",
+            "TPU_SKIP_MDS_QUERY=1",
+        ]
+    )
     return env
 
 
@@ -683,10 +795,18 @@ def build_cdi_spec(
     vfio_container_host_path: Path,
     *,
     kind: str = CDI_KIND,
-    network_mode: str = "isolated",
+    network_mode: str = "host",
+    single_host_env: bool = False,
     cdi_version: str = DEFAULT_CDI_VERSION,
 ) -> Dict[str, Any]:
-    """Build a CNCF CDI JSON specification dictionary (default: CDI v0.6.0)."""
+    """Build a CNCF CDI JSON specification dictionary (default: CDI v0.6.0, host-safe env).
+
+    By default (`network_mode="host"`, `single_host_env=False`), no `libtpu`
+    environment overrides are injected so existing multi-host workloads retain
+    their configured peer discovery, visibility, and host bounds. Pass
+    `single_host_env=True` (or `network_mode="isolated"`) to explicitly opt
+    into single-host isolated container environment injection.
+    """
     if not isinstance(cdi_version, str) or cdi_version not in SUPPORTED_CDI_VERSIONS:
         raise ValueError(
             f"Unsupported CDI version {cdi_version!r}: expected one of {list(SUPPORTED_CDI_VERSIONS)}"
@@ -710,6 +830,9 @@ def build_cdi_spec(
                 f"IOMMU group contains non-TPU device(s): {', '.join(chip.non_tpu_group_members)}"
             )
 
+    inject_single_host_env = bool(single_host_env or network_mode == "isolated")
+    effective_network_mode = "isolated" if inject_single_host_env else "host"
+
     is_iommufd = any(c.vfio_mode == "iommufd" for c in chips) or (
         vfio_container_host_path.name == "iommu"
     )
@@ -722,10 +845,12 @@ def build_cdi_spec(
         "env": [
             f"FREETPU_CDI_VERSION={cdi_version}",
             f"FREETPU_IOMMU_MODE={'iommufd' if is_iommufd else 'vfio-group'}",
-            f"FREETPU_NETWORK_MODE={network_mode}",
+            f"FREETPU_NETWORK_MODE={effective_network_mode}",
             f"FREETPU_VFIO_CONTAINER={control_container_path}",
         ],
     }
+
+    bdf_to_phys = _map_physical_chip_indices(chips)
 
     devices: List[Dict[str, Any]] = []
     seen_group_nodes: Dict[str, Dict[str, Any]] = {}
@@ -755,10 +880,11 @@ def build_cdi_spec(
         for c in unit_chips:
             if c.generation not in unit_gens:
                 unit_gens.append(c.generation)
+        unit_phys_indices = _distinct_physical_indices(unit_chips, bdf_to_phys)
         unit_env = _build_device_env(
-            [c.index for c in unit_chips],
+            unit_phys_indices,
             unit_gens,
-            network_mode=network_mode,
+            single_host_env=inject_single_host_env,
             include_visibility_env=False,
         )
         unit_edits: Dict[str, Any] = {"deviceNodes": [dict(n) for n in unit_nodes]}
@@ -801,7 +927,7 @@ def build_cdi_spec(
             ann = {
                 "freetpu.dev/allocation-unit": "shared-iommu-group",
                 "freetpu.dev/shared-iommu-group": "true",
-                "freetpu.dev/chip-count": str(len(unit_chips)),
+                "freetpu.dev/chip-count": str(len(unit_phys_indices)),
                 "freetpu.dev/pci-bdfs": ",".join(unit_bdfs),
                 "freetpu.dev/generations": ",".join(unit_gens),
                 "freetpu.dev/iommu-group": rep.iommu_group,
@@ -809,6 +935,8 @@ def build_cdi_spec(
                 "freetpu.dev/optional-cap-add": "IPC_LOCK",
                 "freetpu.dev/required-ulimit-memlock": "-1",
             }
+            if len(unit_chips) != len(unit_phys_indices):
+                ann["freetpu.dev/pci-function-count"] = str(len(unit_chips))
             if rep.numa_node is not None:
                 ann["freetpu.dev/numa-node"] = str(rep.numa_node)
             if devnums_str:
@@ -855,22 +983,22 @@ def build_cdi_spec(
 
             slice_nodes, slice_devnums = _dedup_device_nodes(d_chips)
             slice_bdfs = sorted(c.pci_bdf for c in d_chips)
-            slice_indices = [c.index for c in d_chips]
+            slice_phys_indices = _distinct_physical_indices(d_chips, bdf_to_phys)
             slice_gens: List[str] = []
             for c in d_chips:
                 if c.generation not in slice_gens:
                     slice_gens.append(c.generation)
             slice_env = _build_device_env(
-                slice_indices,
+                slice_phys_indices,
                 slice_gens,
-                network_mode=network_mode,
+                single_host_env=inject_single_host_env,
                 include_visibility_env=True,
             )
             numa_label = str(d_key[1]) if use_explicit_numa and d_key[1] is not None else str(dom_ordinal)
             pcie_root = d_key[2]
             slice_ann_base: Dict[str, str] = {
                 "freetpu.dev/allocation-unit": "numa-slice",
-                "freetpu.dev/chip-count": str(len(d_chips)),
+                "freetpu.dev/chip-count": str(len(slice_phys_indices)),
                 "freetpu.dev/pci-bdfs": ",".join(slice_bdfs),
                 "freetpu.dev/generations": ",".join(slice_gens),
                 "freetpu.dev/numa-node": numa_label,
@@ -878,61 +1006,72 @@ def build_cdi_spec(
                 "freetpu.dev/optional-cap-add": "IPC_LOCK",
                 "freetpu.dev/required-ulimit-memlock": "-1",
             }
+            if len(d_chips) != len(slice_phys_indices):
+                slice_ann_base["freetpu.dev/pci-function-count"] = str(len(d_chips))
             slice_devnums_str = _format_vfio_devnums(list(slice_devnums.items()))
             if slice_devnums_str:
                 slice_ann_base["freetpu.dev/vfio-devnums"] = slice_devnums_str
 
             candidate_names = [f"numa{numa_label}"]
-            if slice_indices == list(range(slice_indices[0], slice_indices[0] + len(slice_indices))):
-                candidate_names.append(f"{slice_indices[0]}-{slice_indices[-1]}")
+            if slice_phys_indices == list(
+                range(slice_phys_indices[0], slice_phys_indices[0] + len(slice_phys_indices))
+            ):
+                candidate_names.append(f"{slice_phys_indices[0]}-{slice_phys_indices[-1]}")
 
             for s_name in candidate_names:
                 if s_name in used_names or s_name == "all":
                     continue
                 used_names.add(s_name)
+                slice_edits: Dict[str, Any] = {
+                    "deviceNodes": [dict(n) for n in slice_nodes],
+                }
+                if slice_env:
+                    slice_edits["env"] = list(slice_env)
                 devices.append(
                     {
                         "name": s_name,
                         "annotations": dict(slice_ann_base),
-                        "containerEdits": {
-                            "deviceNodes": [dict(n) for n in slice_nodes],
-                            "env": list(slice_env),
-                        },
+                        "containerEdits": slice_edits,
                     }
                 )
 
+    all_phys_indices = _distinct_physical_indices(chips, bdf_to_phys)
     all_ann: Dict[str, str] = {
         "freetpu.dev/allocation-unit": "all-devices",
-        "freetpu.dev/chip-count": str(len(chips)),
+        "freetpu.dev/chip-count": str(len(all_phys_indices)),
         "freetpu.dev/pci-bdfs": ",".join(sorted(all_bdfs)),
         "freetpu.dev/generations": ",".join(all_generations),
         "freetpu.dev/optional-cap-add": "IPC_LOCK",
         "freetpu.dev/required-ulimit-memlock": "-1",
     }
+    if len(chips) != len(all_phys_indices):
+        all_ann["freetpu.dev/pci-function-count"] = str(len(chips))
     all_devnums = _format_vfio_devnums(list(seen_group_devnums.items()))
     if all_devnums:
         all_ann["freetpu.dev/vfio-devnums"] = all_devnums
+
+    all_env = _build_device_env(
+        all_phys_indices,
+        all_generations,
+        single_host_env=inject_single_host_env,
+        include_visibility_env=True,
+    )
+    all_edits: Dict[str, Any] = {"deviceNodes": list(seen_group_nodes.values())}
+    if all_env:
+        all_edits["env"] = all_env
 
     devices.append(
         {
             "name": "all",
             "annotations": all_ann,
-            "containerEdits": {
-                "deviceNodes": list(seen_group_nodes.values()),
-                "env": _build_device_env(
-                    [c.index for c in chips],
-                    all_generations,
-                    network_mode=network_mode,
-                    include_visibility_env=True,
-                ),
-            },
+            "containerEdits": all_edits,
         }
     )
 
     root_ann: Dict[str, str] = {
         "freetpu.dev/generated-by": "freetpu-cdi",
         "freetpu.dev/iommu-mode": "iommufd" if is_iommufd else "vfio-group",
-        "freetpu.dev/network-mode": network_mode,
+        "freetpu.dev/network-mode": effective_network_mode,
         "freetpu.dev/optional-cap-add": "IPC_LOCK",
         "freetpu.dev/required-ulimit-memlock": "-1",
     }
@@ -1051,21 +1190,24 @@ def _validate_container_edits(
             for str_field in ("closID", "l3CacheSchema", "memBwSchema"):
                 if str_field in irdt and not isinstance(irdt[str_field], str):
                     errors.append(f"{context}.intelRdt.{str_field}: must be a string")
+            for bool_field in ("enableCMT", "enableMBM", "enableMonitoring"):
+                if bool_field in irdt and bool_field in allowed_irdt_keys:
+                    if not isinstance(irdt[bool_field], bool):
+                        errors.append(f"{context}.intelRdt.{bool_field}: must be a boolean")
             if "schemata" in irdt and "schemata" in allowed_irdt_keys:
                 schemata = irdt["schemata"]
                 if not isinstance(schemata, list) or not all(
                     isinstance(item, str) for item in schemata
                 ):
                     errors.append(f"{context}.intelRdt.schemata: must be a list of strings")
-            if "enableMonitoring" in irdt and "enableMonitoring" in allowed_irdt_keys:
-                if not isinstance(irdt["enableMonitoring"], bool):
-                    errors.append(f"{context}.intelRdt.enableMonitoring: must be a boolean")
 
     if "netDevices" in edits and "netDevices" in allowed_edits_keys:
         net_devs = edits["netDevices"]
         if not isinstance(net_devs, list):
             errors.append(f"{context}.netDevices: must be a list")
         else:
+            seen_host_ifaces: set[str] = set()
+            seen_net_names: set[str] = set()
             for idx, nd in enumerate(net_devs):
                 ndc = f"{context}.netDevices[{idx}]"
                 if not isinstance(nd, dict):
@@ -1076,10 +1218,20 @@ def _validate_container_edits(
                     errors.append(
                         f"{ndc}: unsupported CDI v{cdi_version} netDevice keys: {sorted(unknown_nd)}"
                     )
-                if not isinstance(nd.get("hostInterfaceName"), str) or not nd["hostInterfaceName"]:
+                host_iface = nd.get("hostInterfaceName")
+                if not isinstance(host_iface, str) or not host_iface:
                     errors.append(f"{ndc}.hostInterfaceName: must be a non-empty string")
-                if "name" in nd and not isinstance(nd["name"], str):
-                    errors.append(f"{ndc}.name: must be a string")
+                elif host_iface in seen_host_ifaces:
+                    errors.append(f"{ndc}.hostInterfaceName: duplicate hostInterfaceName {host_iface!r}")
+                else:
+                    seen_host_ifaces.add(host_iface)
+                iface_name = nd.get("name")
+                if not isinstance(iface_name, str) or not iface_name:
+                    errors.append(f"{ndc}.name: must be a non-empty string")
+                elif iface_name in seen_net_names:
+                    errors.append(f"{ndc}.name: duplicate netDevice name {iface_name!r}")
+                else:
+                    seen_net_names.add(iface_name)
 
     if "deviceNodes" in edits:
         nodes = edits["deviceNodes"]
@@ -1731,7 +1883,8 @@ def reconcile_cdi_spec(
     sysfs_root: Path = Path("/sys"),
     dev_root: Path = Path("/dev"),
     kind: str = CDI_KIND,
-    network_mode: str = "isolated",
+    network_mode: str = "host",
+    single_host_env: bool = False,
     iommu_dev_path: Optional[Path] = None,
     cdi_version: str = DEFAULT_CDI_VERSION,
     vfio_mode: str = "auto",
@@ -1758,6 +1911,7 @@ def reconcile_cdi_spec(
             vfio_container,
             kind=kind,
             network_mode=network_mode,
+            single_host_env=single_host_env,
             cdi_version=cdi_version,
         )
     except Exception as exc:  # noqa: BLE001
@@ -1850,12 +2004,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
     gen.add_argument(
         "--network-mode",
         choices=sorted(NETWORK_MODES),
-        default="isolated",
+        default="host",
         help=(
-            "Container networking mode (default: isolated, injecting single-host "
-            "MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353, TPU_HOST_BOUNDS=1,1,1, "
-            "and TPU_SKIP_MDS_QUERY=1 so --net=host is not required; use 'host' "
-            "for multi-host slices)."
+            "Container networking mode (default: 'host', preserving workload-provided "
+            "libtpu peer discovery, visibility, and host bounds for multi-host compatibility; "
+            "pass 'isolated' or --single-host-env to opt into single-host loopback "
+            "Megascale/bounds/MDS-skip overrides)."
+        ),
+    )
+    gen.add_argument(
+        "--single-host-env",
+        action="store_true",
+        default=False,
+        help=(
+            "Opt in to injecting single-host isolated libtpu env overrides "
+            "(MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353, TPU_HOST_BOUNDS=1,1,1, "
+            "TPU_SKIP_MDS_QUERY=1, plus slice-scoped TPU_VISIBLE_DEVICES and "
+            "TPU_CHIPS_PER_HOST_BOUNDS on full-allocation selectors)."
         ),
     )
     gen.add_argument(
@@ -1978,8 +2143,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     sync.add_argument(
         "--network-mode",
         choices=sorted(NETWORK_MODES),
-        default="isolated",
-        help="Container networking mode ('isolated' default, or 'host' for multi-host slices).",
+        default="host",
+        help="Container networking mode ('host' default preserving workload env; 'isolated' or --single-host-env opts into single-host overrides).",
+    )
+    sync.add_argument(
+        "--single-host-env",
+        action="store_true",
+        default=False,
+        help="Opt in to injecting single-host isolated libtpu environment overrides.",
     )
     sync.add_argument(
         "--sysfs-root",
@@ -2056,6 +2227,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 vfio_container,
                 kind=args.kind,
                 network_mode=args.network_mode,
+                single_host_env=args.single_host_env,
                 cdi_version=args.cdi_version,
             )
         except Exception as exc:  # noqa: BLE001
@@ -2156,6 +2328,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 dev_root=args.dev_root,
                 kind=args.kind,
                 network_mode=args.network_mode,
+                single_host_env=args.single_host_env,
                 iommu_dev_path=args.iommu_dev,
                 cdi_version=args.cdi_version,
                 vfio_mode=args.vfio_mode,
@@ -2182,6 +2355,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     dev_root=args.dev_root,
                     kind=args.kind,
                     network_mode=args.network_mode,
+                    single_host_env=args.single_host_env,
                     iommu_dev_path=args.iommu_dev,
                     cdi_version=args.cdi_version,
                     vfio_mode=args.vfio_mode,

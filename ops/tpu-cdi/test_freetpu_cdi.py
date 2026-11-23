@@ -202,11 +202,21 @@ class FreeTpuCdiTests(unittest.TestCase):
                 spec["devices"][0]["containerEdits"]["deviceNodes"][0]["path"],
                 "/dev/vfio/0",
             )
-            # Composable single-chip PCI selector omits TPU_VISIBLE_DEVICES and
-            # TPU_CHIPS_PER_HOST_BOUNDS so multiple requested selectors never
-            # overwrite each other in OCI env merging; `all` injects full visibility.
+            # Default host-safe mode preserves workload-provided libtpu env vars
+            # (no MEGASCALE/TPU_VISIBLE_DEVICES/TPU_CHIPS_PER_HOST_BOUNDS/TPU_SKIP_MDS_QUERY).
+            self.assertNotIn("env", spec["devices"][0]["containerEdits"])
+            self.assertNotIn("env", spec["devices"][-1]["containerEdits"])
+            self.assertIn("FREETPU_NETWORK_MODE=host", spec["containerEdits"]["env"])
+
+            # Opt-in single_host_env injects isolated overrides; composable single-chip
+            # PCI selector still omits TPU_VISIBLE_DEVICES / TPU_CHIPS_PER_HOST_BOUNDS,
+            # while `all` injects full visibility and bounds.
+            with _mock_vfio_char_devices():
+                iso_spec = freetpu_cdi.build_cdi_spec(
+                    chips, vfio_container, single_host_env=True
+                )
             self.assertEqual(
-                spec["devices"][0]["containerEdits"]["env"],
+                iso_spec["devices"][0]["containerEdits"]["env"],
                 [
                     "MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353",
                     "TPU_HOST_BOUNDS=1,1,1",
@@ -214,7 +224,7 @@ class FreeTpuCdiTests(unittest.TestCase):
                 ],
             )
             self.assertEqual(
-                spec["devices"][-1]["containerEdits"]["env"],
+                iso_spec["devices"][-1]["containerEdits"]["env"],
                 [
                     "TPU_VISIBLE_DEVICES=0",
                     "TPU_CHIPS_PER_HOST_BOUNDS=1,1,1",
@@ -385,8 +395,52 @@ class FreeTpuCdiTests(unittest.TestCase):
         errs_v06 = freetpu_cdi.validate_cdi_spec(v06_with_v11)
         self.assertTrue(any("intelRdt" in e and "0.6.0" in e for e in errs_v06), errs_v06)
 
-        # CDI v0.8.0 accepts closID/l3CacheSchema/memBwSchema, but rejects v1.1.0-only
-        # schemata/enableMonitoring and netDevices.
+        # CDI v0.7.0 - v1.0.0 accept boolean enableCMT and enableMBM on intelRdt,
+        # reject non-boolean values, and reject v1.1.0-only schemata/enableMonitoring.
+        for older_ver in ("0.7.0", "0.8.0", "1.0.0"):
+            older_ok = {
+                "cdiVersion": older_ver,
+                "kind": "freetpu.dev/tpu",
+                "containerEdits": {
+                    "deviceNodes": [{"path": "/dev/vfio/vfio"}],
+                    "intelRdt": {
+                        "closID": "tpu",
+                        "l3CacheSchema": "L3:0=7f0",
+                        "memBwSchema": "MB:0=50",
+                        "enableCMT": True,
+                        "enableMBM": False,
+                    },
+                },
+                "devices": [
+                    {
+                        "name": "0",
+                        "containerEdits": {"deviceNodes": [{"path": "/dev/vfio/0"}]},
+                    }
+                ],
+            }
+            self.assertEqual(freetpu_cdi.validate_cdi_spec(older_ok), [], older_ver)
+
+        v08_bad_cmt = {
+            "cdiVersion": "0.8.0",
+            "kind": "freetpu.dev/tpu",
+            "containerEdits": {
+                "deviceNodes": [{"path": "/dev/vfio/vfio"}],
+                "intelRdt": {
+                    "enableCMT": "true",
+                    "enableMBM": 1,
+                },
+            },
+            "devices": [
+                {
+                    "name": "0",
+                    "containerEdits": {"deviceNodes": [{"path": "/dev/vfio/0"}]},
+                }
+            ],
+        }
+        errs_v08_cmt = freetpu_cdi.validate_cdi_spec(v08_bad_cmt)
+        self.assertTrue(any("intelRdt.enableCMT" in e for e in errs_v08_cmt), errs_v08_cmt)
+        self.assertTrue(any("intelRdt.enableMBM" in e for e in errs_v08_cmt), errs_v08_cmt)
+
         v08_with_v11_irdt = {
             "cdiVersion": "0.8.0",
             "kind": "freetpu.dev/tpu",
@@ -410,8 +464,8 @@ class FreeTpuCdiTests(unittest.TestCase):
         errs_v08 = freetpu_cdi.validate_cdi_spec(v08_with_v11_irdt)
         self.assertTrue(any("schemata" in e and "enableMonitoring" in e for e in errs_v08), errs_v08)
 
-        # Invalid/deprecated IntelRdt keys (`l3CacheAllocation`, `memBwAllocation`) and
-        # wrong field types must all be rejected.
+        # CDI v1.1.0 removes enableCMT/enableMBM, rejects legacy/invalid IntelRdt keys
+        # and wrong types, and requires non-empty unique netDevices[].name.
         bad_v11_spec = {
             "cdiVersion": "1.1.0",
             "kind": "freetpu.dev/tpu",
@@ -423,10 +477,18 @@ class FreeTpuCdiTests(unittest.TestCase):
                     "memBwSchema": True,
                     "schemata": "L3:0=7f0",
                     "enableMonitoring": "yes",
+                    "enableCMT": True,
+                    "enableMBM": True,
                     "l3CacheAllocation": "L3:0=7f0",
                     "memBwAllocation": "MB:0=50",
                 },
                 "additionalGids": ["not-an-int"],
+                "netDevices": [
+                    {"hostInterfaceName": "eth1"},
+                    {"hostInterfaceName": "eth2", "name": ""},
+                    {"hostInterfaceName": "eth3", "name": "tpu0"},
+                    {"hostInterfaceName": "eth4", "name": "tpu0"},
+                ],
             },
             "devices": [
                 {
@@ -437,12 +499,16 @@ class FreeTpuCdiTests(unittest.TestCase):
         }
         errs4 = freetpu_cdi.validate_cdi_spec(bad_v11_spec)
         self.assertTrue(any("l3CacheAllocation" in e and "memBwAllocation" in e for e in errs4), errs4)
+        self.assertTrue(any("enableCMT" in e and "enableMBM" in e for e in errs4), errs4)
         self.assertTrue(any("intelRdt.closID" in e for e in errs4), errs4)
         self.assertTrue(any("intelRdt.l3CacheSchema" in e for e in errs4), errs4)
         self.assertTrue(any("intelRdt.memBwSchema" in e for e in errs4), errs4)
         self.assertTrue(any("intelRdt.schemata" in e for e in errs4), errs4)
         self.assertTrue(any("intelRdt.enableMonitoring" in e for e in errs4), errs4)
         self.assertTrue(any("additionalGids" in e for e in errs4), errs4)
+        self.assertTrue(any("netDevices[0].name: must be a non-empty string" in e for e in errs4), errs4)
+        self.assertTrue(any("netDevices[1].name: must be a non-empty string" in e for e in errs4), errs4)
+        self.assertTrue(any("duplicate netDevice name" in e for e in errs4), errs4)
 
     def test_rejects_vfio_group_with_non_tpu_devices_and_non_vfio_driver(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1566,9 +1632,17 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertTrue(any(".timeout: must be a positive integer" in e for e in mal_errs), mal_errs)
                 self.assertTrue(any("unsupported CDI v0.6.0 hook keys" in e for e in mal_errs), mal_errs)
 
-                # 7. Per-device containerEdits injects isolated libtpu env vars by default.
+                # 7. Default per-device containerEdits preserves workload env (no libtpu overrides);
+                #    opt-in `single_host_env=True` injects isolated libtpu env vars.
                 clean_spec = freetpu_cdi.build_cdi_spec(chips_live, vfio_c)
                 for dev_entry in clean_spec["devices"]:
+                    self.assertNotIn("env", dev_entry["containerEdits"])
+                    self.assertIn("annotations", dev_entry)
+
+                isolated_spec = freetpu_cdi.build_cdi_spec(
+                    chips_live, vfio_c, single_host_env=True
+                )
+                for dev_entry in isolated_spec["devices"]:
                     self.assertIn("env", dev_entry["containerEdits"])
                     self.assertIn(
                         "MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353",
@@ -1576,7 +1650,6 @@ class FreeTpuCdiTests(unittest.TestCase):
                     )
                     self.assertIn("TPU_HOST_BOUNDS=1,1,1", dev_entry["containerEdits"]["env"])
                     self.assertIn("TPU_SKIP_MDS_QUERY=1", dev_entry["containerEdits"]["env"])
-                    self.assertIn("annotations", dev_entry)
 
                 # 8. Empty per-device containerEdits is rejected (CDI requires >= 1 edit per device).
                 empty_dev_spec = {
@@ -1706,17 +1779,48 @@ class FreeTpuCdiTests(unittest.TestCase):
                     chips, control_node, network_mode="host"
                 )
                 self.assertEqual(freetpu_cdi.validate_cdi_spec(host_spec), [])
-                # In host mode, composable PCI selectors omit empty env altogether.
-                self.assertNotIn("env", host_spec["devices"][0]["containerEdits"])
-                host_env = {
-                    kv.split("=", 1)[0]: kv.split("=", 1)[1]
-                    for kv in host_spec["devices"][-1]["containerEdits"]["env"]
-                }
-                self.assertEqual(host_env["TPU_VISIBLE_DEVICES"], "0,1,2,3")
-                self.assertEqual(host_env["TPU_CHIPS_PER_HOST_BOUNDS"], "2,2,1")
-                self.assertNotIn("MEGASCALE_COORDINATOR_ADDRESS", host_env)
-                self.assertNotIn("TPU_HOST_BOUNDS", host_env)
-                self.assertNotIn("TPU_SKIP_MDS_QUERY", host_env)
+                # In default/host mode, NO selector injects libtpu env overrides so
+                # multi-host jobs preserve workload-configured visibility, bounds, and coordinator.
+                for dev_entry in host_spec["devices"]:
+                    self.assertNotIn("env", dev_entry["containerEdits"])
+
+                # CLI `generate` defaults to host-safe mode; `--single-host-env` opts in.
+                rc_def, out_def, err_def = _run_cli_inproc(
+                    [
+                        "generate",
+                        "--stdout",
+                        "--validate",
+                        "--sysfs-root",
+                        str(sysfs_root),
+                        "--dev-root",
+                        str(dev_root),
+                    ]
+                )
+                self.assertEqual(rc_def, 0, err_def)
+                parsed_def = json.loads(out_def)
+                for dev_entry in parsed_def["devices"]:
+                    self.assertNotIn("env", dev_entry["containerEdits"])
+
+                rc_sh, out_sh, err_sh = _run_cli_inproc(
+                    [
+                        "generate",
+                        "--stdout",
+                        "--validate",
+                        "--single-host-env",
+                        "--sysfs-root",
+                        str(sysfs_root),
+                        "--dev-root",
+                        str(dev_root),
+                    ]
+                )
+                self.assertEqual(rc_sh, 0, err_sh)
+                parsed_sh = json.loads(out_sh)
+                sh_all_env = dict(
+                    kv.split("=", 1) for kv in parsed_sh["devices"][-1]["containerEdits"]["env"]
+                )
+                self.assertEqual(sh_all_env["TPU_VISIBLE_DEVICES"], "0,1,2,3")
+                self.assertEqual(sh_all_env["TPU_CHIPS_PER_HOST_BOUNDS"], "2,2,1")
+                self.assertEqual(sh_all_env["MEGASCALE_COORDINATOR_ADDRESS"], "127.0.0.1:8353")
 
         rc_iso, out_iso, _ = _run_cli_inproc(["docker-args", "--device", "numa0"])
         self.assertEqual(rc_iso, 0)
@@ -2021,7 +2125,9 @@ class FreeTpuCdiTests(unittest.TestCase):
                 chips, control_node = freetpu_cdi.discover_tpu_chips(
                     sysfs_root=sysfs_root, dev_root=dev_root
                 )
-                spec = freetpu_cdi.build_cdi_spec(chips, control_node)
+                spec = freetpu_cdi.build_cdi_spec(
+                    chips, control_node, single_host_env=True
+                )
                 self.assertEqual(freetpu_cdi.validate_cdi_spec(spec), [])
                 self.assertEqual(
                     freetpu_cdi.verify_spec_against_host(
@@ -2086,37 +2192,122 @@ class FreeTpuCdiTests(unittest.TestCase):
                     errs_cross,
                 )
 
-            # Verify tpu7x Ironwood recognition for BOTH 0x0075 and Google's 0x0076 IDs.
+            # Verify tpu7x Ironwood 4-chip VM (8 PCI functions across 0x0076 / 0x0075):
+            # all 8 PCI functions remain allocated in VFIO deviceNodes while host bounds
+            # use the 4 physical chips (`2,2,1`, NOT `2,4,1`).
             root_7x = root / "tpu7x"
+            ironwood_devices = [
+                {
+                    "bdf": f"0000:00:0{4 + i:x}.0",
+                    "vendor": "0x1ae0",
+                    "device": "0x0076" if i < 3 else "0x0075",
+                    "driver": "vfio-pci",
+                    "iommu_group": str(i),
+                    "numa_node": "0",
+                }
+                for i in range(4)
+            ] + [
+                {
+                    "bdf": f"0000:80:0{i:x}.0",
+                    "vendor": "0x1ae0",
+                    "device": "0x0076",
+                    "driver": "vfio-pci",
+                    "iommu_group": str(4 + i),
+                    "numa_node": "1",
+                }
+                for i in range(4)
+            ]
             sysfs_7x, dev_7x = _make_mock_pci_vfio(
                 root_7x,
-                devices=[
-                    {
-                        "bdf": "0000:00:06.0",
-                        "vendor": "0x1ae0",
-                        "device": "0x0075",
-                        "driver": "vfio-pci",
-                        "iommu_group": "0",
-                    },
-                    {
-                        "bdf": "0000:00:07.0",
-                        "vendor": "0x1ae0",
-                        "device": "0x0076",
-                        "driver": "vfio-pci",
-                        "iommu_group": "1",
-                    },
-                ],
-                create_vfio_nodes=["0", "1"],
+                devices=ironwood_devices,
+                create_vfio_nodes=[str(i) for i in range(8)],
             )
             with _mock_vfio_char_devices():
                 chips_7x, ctrl_7x = freetpu_cdi.discover_tpu_chips(
                     sysfs_root=sysfs_7x, dev_root=dev_7x
                 )
-                self.assertEqual([c.generation for c in chips_7x], ["tpu7x", "tpu7x"])
-                self.assertEqual([c.device_id for c in chips_7x], ["0x0075", "0x0076"])
-                self.assertIn("Ironwood", chips_7x[1].model_name)
-                spec_7x = freetpu_cdi.build_cdi_spec(chips_7x, ctrl_7x)
+                self.assertEqual(len(chips_7x), 8)
+                self.assertTrue(all(c.generation == "tpu7x" for c in chips_7x))
+                self.assertIn("0x0075", {c.device_id for c in chips_7x})
+                self.assertIn("0x0076", {c.device_id for c in chips_7x})
+                spec_7x = freetpu_cdi.build_cdi_spec(
+                    chips_7x, ctrl_7x, single_host_env=True
+                )
                 self.assertEqual(freetpu_cdi.validate_cdi_spec(spec_7x), [])
+                by_name_7x = {d["name"]: d for d in spec_7x["devices"]}
+                all_7x = by_name_7x["all"]
+                # All 8 VFIO function nodes are attached.
+                self.assertEqual(len(all_7x["containerEdits"]["deviceNodes"]), 8)
+                self.assertEqual(all_7x["annotations"]["freetpu.dev/chip-count"], "4")
+                self.assertEqual(all_7x["annotations"]["freetpu.dev/pci-function-count"], "8")
+                all_7x_env = dict(kv.split("=", 1) for kv in all_7x["containerEdits"]["env"])
+                self.assertEqual(all_7x_env["TPU_CHIPS_PER_HOST_BOUNDS"], "2,2,1")
+                self.assertEqual(all_7x_env["TPU_VISIBLE_DEVICES"], "0,1,2,3")
+                # Each NUMA half holds 2 physical chips (4 PCI functions) -> 1,2,1.
+                numa0_7x_env = dict(
+                    kv.split("=", 1) for kv in by_name_7x["numa0"]["containerEdits"]["env"]
+                )
+                self.assertEqual(len(by_name_7x["numa0"]["containerEdits"]["deviceNodes"]), 4)
+                self.assertEqual(numa0_7x_env["TPU_CHIPS_PER_HOST_BOUNDS"], "1,2,1")
+                self.assertEqual(numa0_7x_env["TPU_VISIBLE_DEVICES"], "0,1")
+
+            # Verify PCIe root resolution from sysfs ancestry when endpoints sit behind
+            # PCIe switches on distinct downstream bus numbers (without numa_node files).
+            sw_root = root / "pcie_switch"
+            sw_sys = sw_root / "sys"
+            sw_dev = sw_root / "dev"
+            (sw_sys / "bus" / "pci" / "devices").mkdir(parents=True, exist_ok=True)
+            (sw_sys / "kernel" / "iommu_groups").mkdir(parents=True, exist_ok=True)
+            (sw_dev / "vfio").mkdir(parents=True, exist_ok=True)
+            (sw_dev / "vfio" / "vfio").write_text("", encoding="utf-8")
+            misc_d = sw_sys / "class" / "misc" / "vfio" / "dev"
+            misc_d.parent.mkdir(parents=True, exist_ok=True)
+            misc_d.write_text("10:196\n", encoding="utf-8")
+            drv_vfio = sw_sys / "bus" / "pci" / "drivers" / "vfio-pci"
+            drv_vfio.mkdir(parents=True, exist_ok=True)
+
+            switch_specs = [
+                ("pci0000:00", "0000:00:01.0/0000:01:00.0", f"0000:0{2 + i}:00.0", str(i))
+                for i in range(4)
+            ] + [
+                ("pci0000:80", "0000:80:01.0/0000:81:00.0", f"0000:8{2 + i}:00.0", str(4 + i))
+                for i in range(4)
+            ]
+            for host_bridge, bridge_chain, bdf, grp in switch_specs:
+                real_dev = sw_sys / "devices" / host_bridge / bridge_chain / bdf
+                real_dev.mkdir(parents=True, exist_ok=True)
+                (real_dev / "vendor").write_text("0x1ae0\n", encoding="utf-8")
+                (real_dev / "device").write_text("0x006f\n", encoding="utf-8")
+                os.symlink(str(drv_vfio), real_dev / "driver")
+                grp_dir = sw_sys / "kernel" / "iommu_groups" / grp
+                (grp_dir / "devices").mkdir(parents=True, exist_ok=True)
+                os.symlink(str(real_dev), grp_dir / "devices" / bdf)
+                os.symlink(str(grp_dir), real_dev / "iommu_group")
+                os.symlink(str(real_dev), sw_sys / "bus" / "pci" / "devices" / bdf)
+                (sw_dev / "vfio" / grp).write_text("", encoding="utf-8")
+                gd = sw_sys / "class" / "vfio" / grp / "dev"
+                gd.parent.mkdir(parents=True, exist_ok=True)
+                gd.write_text(f"242:{grp}\n", encoding="utf-8")
+
+            with _mock_vfio_char_devices():
+                sw_chips, sw_ctrl = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=sw_sys, dev_root=sw_dev
+                )
+                self.assertEqual(
+                    [c.pcie_root for c in sw_chips],
+                    ["0000:00"] * 4 + ["0000:80"] * 4,
+                )
+                sw_spec = freetpu_cdi.build_cdi_spec(sw_chips, sw_ctrl)
+                sw_names = {d["name"] for d in sw_spec["devices"]}
+                self.assertTrue({"numa0", "0-3", "numa1", "4-7", "all"} <= sw_names, sw_names)
+
+            # Verify Kubernetes DRA example manifest uses stable resource.k8s.io/v1 API.
+            dra_path = CDI_DIR / "manifests" / "k8s-tpu-dra-example.yaml"
+            dra_text = dra_path.read_text(encoding="utf-8")
+            self.assertNotIn("resource.k8s.io/v1beta1", dra_text)
+            self.assertEqual(dra_text.count("apiVersion: resource.k8s.io/v1"), 3)
+            self.assertNotIn("basic:", dra_text)
+            self.assertIn("exactly:", dra_text)
 
 
 if __name__ == "__main__":

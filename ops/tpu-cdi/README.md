@@ -1,6 +1,6 @@
 # `freetpu-cdi` — Open CNCF CDI Toolkit for Cloud TPUs
 
-`freetpu_cdi.py` is an open, zero-dependency CNCF Container Device Interface (CDI) spec generator for VFIO-backed Google Cloud TPUs (`v5e`, `v5p`, `v6e` Trillium, and `tpu7x` Ironwood). By default it emits **CDI `v0.6.0`** (the minimum version needed by all generated fields and compatible with stock containerd `2.0.x` / `2.1.x+`), with `--cdi-version 1.1.0` available as an explicit opt-in. It scans `/sys/bus/pci/devices/*` (`vendor=0x1ae0`), preserves legacy VFIO (`/dev/vfio/vfio` + `/dev/vfio/<iommu_group>`) as the default whenever usable (with explicit `--vfio-mode iommufd` / `cdev` opt-in and pure-`iommufd` fallback using verified `<pci>/vfio-dev/vfioN` sysfs associations), verifies full IOMMU group isolation and groups sibling chips sharing an IOMMU group into a single allocation unit in both modes, omits static `major`/`minor` numbers from `deviceNodes` while tracking live char device numbers in `freetpu.dev/vfio-devnums` annotations, groups multi-root hosts (e.g. `v6e-8` `0000:00` vs `0000:80`) into NUMA-aware 4-chip slices (`numa0`, `numa1`, `0-3`, `4-7`), injects isolated `libtpu` environment overrides (`MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353`, `TPU_HOST_BOUNDS=1,1,1`, `TPU_SKIP_MDS_QUERY=1` — plus slice-scoped `TPU_CHIPS_PER_HOST_BOUNDS` and `TPU_VISIBLE_DEVICES` on full-allocation selectors `numa*`/`0-3`/`all` only, omitting them on composable `pci-*`/`group-pci-*` selectors so multiple requested selectors never overwrite each other) so single-host containers do **not** require `--net=host`, and emits a boot-scoped spec at `/var/run/cdi/freetpu.json` (tmpfs, cleared across reboots).
+`freetpu_cdi.py` is an open, zero-dependency CNCF Container Device Interface (CDI) spec generator for VFIO-backed Google Cloud TPUs (`v5e`, `v5p`, `v6e` Trillium, and `tpu7x` Ironwood). By default it emits **CDI `v0.6.0`** (the minimum version needed by all generated fields and compatible with stock containerd `2.0.x` / `2.1.x+`), with `--cdi-version 1.1.0` available as an explicit opt-in. It scans `/sys/bus/pci/devices/*` (`vendor=0x1ae0`), preserves legacy VFIO (`/dev/vfio/vfio` + `/dev/vfio/<iommu_group>`) as the default whenever usable (with explicit `--vfio-mode iommufd` / `cdev` opt-in and pure-`iommufd` fallback using verified `<pci>/vfio-dev/vfioN` sysfs associations), verifies full IOMMU group isolation and groups sibling chips sharing an IOMMU group into a single allocation unit in both modes, omits static `major`/`minor` numbers from `deviceNodes` while tracking live char device numbers in `freetpu.dev/vfio-devnums` annotations, groups multi-root hosts (e.g. `v6e-8` `0000:00` vs `0000:80`, resolved via sysfs PCI host-bridge ancestry) into NUMA-aware sub-host slices (`numa0`, `numa1`, `0-3`, `4-7`), preserves workload-provided `libtpu` environment variables by default (`--network-mode host`, safe for multi-host slices) with opt-in `--single-host-env` / `--network-mode isolated` overrides (`MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353`, `TPU_HOST_BOUNDS=1,1,1`, `TPU_SKIP_MDS_QUERY=1` — plus physical-chip-derived `TPU_CHIPS_PER_HOST_BOUNDS` and `TPU_VISIBLE_DEVICES` on full-allocation selectors `numa*`/`0-3`/`all` only, omitting them on composable `pci-*`/`group-pci-*` selectors), and emits a boot-scoped spec at `/var/run/cdi/freetpu.json` (tmpfs, cleared across reboots).
 
 > **Scope note:** Legacy `/dev/accel*` Cloud TPU hosts (e.g. Cloud TPU `v2`, `v3`, `v4` using Google's `accel` driver instead of `vfio-pci`) are not supported by VFIO CDI passthrough.
 
@@ -37,17 +37,20 @@ docker run --rm \
   python:3.12-slim \
   python3 -c "import os; print(os.listdir('/dev/vfio'))"
 
-# Attach a NUMA-aligned 4-chip slice on a v6e-8 WITHOUT --net=host (CDI injects
-# MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353, TPU_HOST_BOUNDS=1,1,1,
-# TPU_CHIPS_PER_HOST_BOUNDS=2,2,1, TPU_VISIBLE_DEVICES, and TPU_SKIP_MDS_QUERY=1):
+# Opt in to single-host isolated env overrides so a NUMA-aligned 4-chip slice on a v6e-8
+# runs WITHOUT --net=host (injects MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353,
+# TPU_HOST_BOUNDS=1,1,1, TPU_CHIPS_PER_HOST_BOUNDS=2,2,1, TPU_VISIBLE_DEVICES,
+# and TPU_SKIP_MDS_QUERY=1 on slice/all selectors):
+sudo python3 ops/tpu-cdi/freetpu_cdi.py generate --single-host-env --output /var/run/cdi/freetpu.json --validate
+
 docker run --rm \
   --device=freetpu.dev/tpu=numa0 \
   --ulimit memlock=-1:-1 \
   my-jax-tpu-image:latest
 
-# Or pass --network-mode host for multi-host slices, --vfio-mode iommufd for Linux 6.8+ cdev,
-# or --cdi-version 1.1.0 when targeting CDI 1.1.0-capable runtimes:
-python3 ops/tpu-cdi/freetpu_cdi.py generate --network-mode host --output /var/run/cdi/freetpu.json --validate
+# Default generation preserves workload-provided libtpu env vars for multi-host slices;
+# pass --vfio-mode iommufd for Linux 6.8+ cdev or --cdi-version 1.1.0 for CDI 1.1.0 runtimes:
+python3 ops/tpu-cdi/freetpu_cdi.py generate --output /var/run/cdi/freetpu.json --validate
 ```
 
 Linux VFIO type1 DMA pinning requires a sufficient `RLIMIT_MEMLOCK` configured **before** OCI container startup (`docker run` / `podman run`), because CNCF CDI does not configure rlimits or capabilities and an OCI `createContainer` hook executes after `runc` loads process settings. `--ulimit memlock=-1:-1` (or a bounded limit covering the workload's pinned DMA buffers) works without extra Linux capabilities; `--cap-add=IPC_LOCK` is only needed as an optional bypass (`docker-args --cap-ipc-lock`) when the runtime cannot raise `RLIMIT_MEMLOCK`. Use `python3 ops/tpu-cdi/freetpu_cdi.py docker-args` to emit the recommended flags:
