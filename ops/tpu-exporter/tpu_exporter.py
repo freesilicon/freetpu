@@ -1404,7 +1404,9 @@ def _query_grpc_runtime_metrics(
                 has_unambiguous_per_core_ids = expected_chip_count is not None and (
                     len(raw_duty_int_ids) > expected_chip_count
                     or (
-                        expected_core_count is not None
+                        bool(all_hbm_core_ids)
+                        and 0 in all_hbm_core_ids
+                        and expected_core_count is not None
                         and all(0 <= cid < expected_core_count for cid in raw_duty_int_ids)
                         and all(0 <= hid < expected_core_count for hid in all_hbm_core_ids)
                         and any(cid >= expected_chip_count for cid in raw_duty_int_ids)
@@ -2976,13 +2978,23 @@ class _ExporterHandler(BaseHTTPRequestHandler):
         self._send(404, "text/plain; charset=utf-8", "not found\n")
 
 
-def _load_chip_id_map(path: Optional[Path]) -> Optional[Dict[str, str]]:
-    if path is None:
+def _load_chip_id_map(raw: Optional[Path | str]) -> Optional[Dict[str, str]]:
+    if raw is None:
         return None
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(raw, dict):
-        raise ValueError(f"--chip-id-map must be a JSON object: {path}")
-    return {str(k): str(v) for k, v in raw.items()}
+    if isinstance(raw, Path):
+        text = raw.read_text(encoding="utf-8")
+    else:
+        text = str(raw).strip()
+        if not text:
+            return None
+        # Detect inline JSON before probing the filesystem so long inline maps
+        # (>255 bytes) never fail with ENAMETOOLONG in Path.is_file().
+        if not text.startswith(("{", "[")):
+            text = Path(text).read_text(encoding="utf-8")
+    parsed = json.loads(text)
+    if not isinstance(parsed, dict):
+        raise ValueError(f"--chip-id-map must be a JSON object: {raw}")
+    return {str(k): str(v) for k, v in parsed.items()}
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -3053,10 +3065,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--chip-id-map",
-        type=Path,
+        type=str,
         default=None,
         help=(
-            "Optional JSON mapping {pci_bdf_or_unique_vfio_path: runtime_chip_id} "
+            "Optional inline JSON or file path mapping {pci_bdf_or_unique_vfio_path: runtime_chip_id} "
             "for verified tpu-info joins (shared VFIO groups require explicit PCI BDF keys)."
         ),
     )

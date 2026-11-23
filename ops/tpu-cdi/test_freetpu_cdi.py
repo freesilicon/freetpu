@@ -3338,6 +3338,24 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertEqual(sid_mapped_env["TPU_VISIBLE_CHIPS"], "4,5,6,7")
                 self.assertEqual(sid_mapped_env["TPU_VISIBLE_DEVICES"], "8,9,10,11,12,13,14,15")
 
+                # Long (>260-byte) formatted inline JSON `--chip-id-map` MUST parse
+                # directly without calling Path.is_file() (preventing ENAMETOOLONG on
+                # 255-byte NAME_MAX filesystems).
+                import errno as _errno
+
+                long_inline_json = json.dumps(
+                    {f"0000:00:{4 + i:02x}.0": i for i in range(12)}, indent=4
+                )
+                self.assertGreater(len(long_inline_json), 260)
+                with mock.patch.object(
+                    Path,
+                    "is_file",
+                    side_effect=OSError(_errno.ENAMETOOLONG, "File name too long"),
+                ):
+                    parsed_long_map = freetpu_cdi._load_chip_id_map(long_inline_json)
+                self.assertEqual(len(parsed_long_map or {}), 12)
+                self.assertEqual((parsed_long_map or {})["0000:00:0f.0"], 11)
+
                 # Healthy multifunction Ironwood (no chip_id required): 04.0/04.1 + 05.0/05.1
                 # on NUMA 0 and 80:00.0/00.1 + 80:01.0/01.1 on NUMA 1 pair cleanly!
                 mf_ok_devs = [

@@ -407,9 +407,16 @@ def _load_chip_id_map(raw: Optional[str]) -> Optional[Dict[str, int]]:
     if raw is None or not str(raw).strip():
         return None
     text = str(raw).strip()
-    path = Path(text)
-    if path.is_file():
-        text = path.read_text(encoding="utf-8")
+    # Parse inline JSON before probing the filesystem so valid inline maps
+    # exceeding NAME_MAX (255 bytes) never fail with ENAMETOOLONG in is_file().
+    if not text.startswith(("{", "[")):
+        path = Path(text)
+        try:
+            is_file = path.is_file()
+        except OSError:
+            is_file = False
+        if is_file:
+            text = path.read_text(encoding="utf-8")
     data = json.loads(text)
     if not isinstance(data, dict):
         raise ValueError("--chip-id-map must be a JSON object mapping PCI BDF strings to integer IDs")

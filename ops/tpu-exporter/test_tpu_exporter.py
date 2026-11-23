@@ -3122,6 +3122,53 @@ TPU Runtime Utilization
                 {"0": 12.5, "1": 37.5, "2": 62.5, "3": 87.5},
             )
 
+            # Offset Ironwood physical-chip duty IDs `{4, 5}` without HBM IDs MUST ALSO
+            # stay unjoined rather than being treated as logical cores 4 & 5 just because
+            # `4 >= expected_chip_count (4)`!
+            class _IronwoodOffsetDutyNoHbmStub:
+                def __init__(self, channel):
+                    self.channel = channel
+
+                def GetRuntimeMetric(self, req, timeout=None):
+                    del timeout
+                    if req.metric_name == "tpu.runtime.tensorcore.dutycycle.percent":
+                        items = [
+                            _make_item(4, as_double=22.5),
+                            _make_item(5, as_double=77.5),
+                        ]
+                        return SimpleNamespace(metric=SimpleNamespace(metrics=items))
+                    return SimpleNamespace(metric=SimpleNamespace(metrics=[]))
+
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.dict(_te._GRPC_CHANNELS, {}, clear=True),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "grpc": _FakeGrpc,
+                        "tpu_info": SimpleNamespace(),
+                        "tpu_info.proto": SimpleNamespace(),
+                        "tpu_info.proto.tpu_metric_service_pb2": fake_pb2,
+                        "tpu_info.proto.tpu_metric_service_pb2_grpc": SimpleNamespace(
+                            RuntimeMetricServiceStub=_IronwoodOffsetDutyNoHbmStub
+                        ),
+                    },
+                ),
+            ):
+                iw_offset_no_hbm_snap = _te.collect_snapshot(
+                    sysfs_root=iw_sysfs,
+                    dev_root=iw_dev,
+                    proc_root=iw_proc,
+                    tpu_info_bin="tpu-info",
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=iw_root / "no-shm",
+                )
+            self.assertTrue(all(d.duty_cycle_percent is None for d in iw_offset_no_hbm_snap.devices))
+            self.assertEqual(
+                iw_offset_no_hbm_snap.runtime_unjoined_duty_cycle,
+                {"4": 22.5, "5": 77.5},
+            )
+
             # Partial fallback after ambiguous gRPC duty-cycle: if CLI supplies joined
             # duty for ONLY 1 device ("0"), MUST retain the raw unjoined series so the
             # remaining 3 readings do not disappear; full joined coverage clears it.
@@ -4063,10 +4110,22 @@ TPU Runtime Utilization
             self.assertIn("increase(freetpu_pcie_aer_fatal_total[5m]) > 0", alerts_text)
             self.assertNotIn("freetpu_pcie_aer_fatal_total[1m]", alerts_text)
             # Spot preemption alert must clarify monitoring-only scope, workload-local checkpointing,
-            # and retain observed TRUE notices via max_over_time past VM shutdown / Alertmanager group_wait.
-            self.assertIn("max_over_time(gcp_metadata_preempted_status[2m]) == 1", alerts_text)
+            # and retain observed TRUE notices via max_over_time past VM shutdown and Alertmanager's
+            # default 5m group_interval ([6m]).
+            self.assertIn("max_over_time(gcp_metadata_preempted_status[6m]) == 1", alerts_text)
+            self.assertIn("group_interval", alerts_text)
             self.assertIn("Monitoring alert only", alerts_text)
             self.assertIn("workload-local metadata watcher or SIGTERM", alerts_text)
+
+            # Long (>260-byte) inline JSON `--chip-id-map` MUST parse cleanly without
+            # probing the filesystem (no ENAMETOOLONG on 255-byte NAME_MAX filesystems).
+            long_inline_map = json.dumps(
+                {f"0000:00:{4 + i:02x}.0": str(i) for i in range(12)}, indent=4
+            )
+            self.assertGreater(len(long_inline_map), 260)
+            loaded_inline = tpu_exporter._load_chip_id_map(long_inline_map)
+            self.assertEqual(len(loaded_inline or {}), 12)
+            self.assertEqual((loaded_inline or {})["0000:00:0f.0"], "11")
 
     def _assert_valid_prometheus_text(self, text: str) -> None:
         lines = [ln for ln in text.splitlines() if ln.strip()]
