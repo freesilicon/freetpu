@@ -46,7 +46,7 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
      std::unordered_set<ggml_backend_buffer_t> buffers;
      // computed graphs cached per backend, keyed by uid
      std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
-@@ -2179,8 +2198,214 @@
+@@ -2179,6 +2198,233 @@
      }
      result->view_offs = tensor->view_offs;
      return result;
@@ -128,8 +128,8 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 +        }
 +    }
 +    return true;
- }
- 
++}
++
 +static bool rpc_node_storage_valid(
 +        const ggml_tensor * node,
 +        const std::unordered_set<ggml_backend_buffer_t> & buffers) {
@@ -145,12 +145,17 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 +}
 +
 +static bool rpc_cpu_fallback_op_valid(ggml_backend_dev_t cpu_dev, const ggml_tensor * node) {
-+    if (node == nullptr || cpu_dev == nullptr) {
++    if (node == nullptr) {
 +        return false;
 +    }
 +    auto f32_contig = [](const ggml_tensor * t) {
 +        return t != nullptr && !ggml_is_empty(t) && t->type == GGML_TYPE_F32 &&
 +               ggml_is_contiguous(t) && t->ne[0] <= INT32_MAX / 2 && ggml_nrows(t) <= INT32_MAX / 2;
++    };
++    auto row_contig = [](const ggml_tensor * t) {
++        return t != nullptr && !ggml_is_empty(t) && (uint32_t) t->type < GGML_TYPE_COUNT &&
++               ggml_blck_size(t->type) > 0 && (t->ne[0] % ggml_blck_size(t->type)) == 0 &&
++               t->nb[0] == ggml_type_size(t->type) && ggml_is_contiguous_rows(t);
 +    };
 +    switch (node->op) {
 +        case GGML_OP_NONE:
@@ -172,7 +177,7 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 +                    return false;
 +                }
 +            }
-+            return ggml_backend_dev_supports_op(cpu_dev, node);
++            return cpu_dev == nullptr || ggml_backend_dev_supports_op(cpu_dev, node);
 +        }
 +        case GGML_OP_ADD:
 +        case GGML_OP_SUB:
@@ -182,7 +187,23 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 +            const ggml_tensor * src1 = node->src[1];
 +            return f32_contig(node) && f32_contig(src0) && f32_contig(src1) &&
 +                   ggml_are_same_shape(src0, node) && ggml_can_repeat(src1, src0) &&
-+                   ggml_backend_dev_supports_op(cpu_dev, node);
++                   (cpu_dev == nullptr || ggml_backend_dev_supports_op(cpu_dev, node));
++        }
++        case GGML_OP_MUL_MAT: {
++            const ggml_tensor * src0 = node->src[0];
++            const ggml_tensor * src1 = node->src[1];
++            if (!row_contig(node) || !row_contig(src0) || !row_contig(src1) ||
++                node->type != GGML_TYPE_F32 ||
++                (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16 && src1->type != GGML_TYPE_BF16) ||
++                (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_BF16 &&
++                 ggml_get_type_traits(src0->type)->to_float == nullptr)) {
++                return false;
++            }
++            return src0->ne[0] == src1->ne[0] && node->ne[0] == src0->ne[1] &&
++                   node->ne[1] == src1->ne[1] && node->ne[2] == src1->ne[2] &&
++                   node->ne[3] == src1->ne[3] &&
++                   (src1->ne[2] % src0->ne[2]) == 0 && (src1->ne[3] % src0->ne[3]) == 0 &&
++                   (cpu_dev == nullptr || ggml_backend_dev_supports_op(cpu_dev, node));
 +        }
 +        default:
 +            return false;
@@ -242,7 +263,7 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 +            }
 +        } else {
 +            for (int k = i; k < j; ++k) {
-+                if (!rpc_cpu_fallback_op_valid(cpu_dev, graph->nodes[k])) {
++                if (cpu_dev == nullptr || !rpc_cpu_fallback_op_valid(cpu_dev, graph->nodes[k])) {
 +                    LOG_ERROR("[%s] rejecting disallowed CPU fallback op %d at node %d\n",
 +                              __func__, (int) graph->nodes[k]->op, k);
 +                    return GGML_STATUS_FAILED;
@@ -256,12 +277,10 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 +        i = j;
 +    }
 +    return GGML_STATUS_SUCCESS;
-+}
-+
+ }
+ 
  bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
-     // serialization format:
-     // | device (4 bytes) | uid (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
-@@ -2266,8 +2491,12 @@
+@@ -2266,8 +2512,12 @@
      }
      const std::chrono::duration<double, std::milli> deserialize_ms = std::chrono::steady_clock::now() - t_deserialize;
  
@@ -276,7 +295,7 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
      sg.graph = graph;
      LOG_DBG3("[%s] device: %u, graph build: %.3f ms\n", __func__, device, deserialize_ms.count());
      return true;
-@@ -2285,8 +2514,11 @@
+@@ -2285,8 +2535,11 @@
      }
      ggml_cgraph * graph = it->second.graph;
      LOG_DBG("[%s] device: %u, uid: %" PRIu64 "\n", __func__, device, request.uid);
@@ -290,14 +309,15 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
      return true;
  }
  
-@@ -2655,11 +2887,15 @@
+@@ -2654,12 +2907,16 @@
+     }
      for (auto buffer : buffers) {
          ggml_backend_buffer_free(buffer);
-     }
++    }
 +    if (cpu_fallback != nullptr) {
 +        ggml_backend_free(cpu_fallback);
 +        cpu_fallback = nullptr;
-+    }
+     }
  }
  
  static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
@@ -308,7 +328,7 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
      uint8_t cmd;
      if (!sock->recv_data(&cmd, 1)) {
          return;
-@@ -3047,7 +3283,7 @@
+@@ -3047,7 +3304,7 @@
              return;
          }
          LOG_INFO("Accepted client connection\n");
@@ -317,14 +337,15 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
          LOG_INFO("Client connection closed\n");
      }
      rpc_transport_shutdown();
-@@ -3113,9 +3349,8 @@
+@@ -3113,9 +3370,8 @@
  
  static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
      GGML_UNUSED(dev);
 -    GGML_UNUSED(op);
-     //TODO: call the remote backend and cache the results
+-    //TODO: call the remote backend and cache the results
 -    return true;
-+    return rpc_op_is_supported_on_rpc(op);
++    return rpc_op_is_supported_on_rpc(op) &&
++           rpc_cpu_fallback_op_valid(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), op);
  }
  
  static bool ggml_backend_rpc_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {

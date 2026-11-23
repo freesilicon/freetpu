@@ -15,7 +15,7 @@ Upstream `ggml-org/llama.cpp` (`b12608`) treats `EDGETPU` as a host-accessible `
 2. **Unified-RAM Device Memory Reporting (`llama-cpp-edgetpu/ggml-edgetpu.cpp`)**:
    - `ggml_backend_edgetpu_device_get_memory` reports real Linux/Android physical memory (`sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGE_SIZE)`) and `/proc/meminfo` `MemAvailable`, so `ggml-rpc-server -d EDGETPU` advertises accurate remote RAM capacity (`15,575 MiB` total, `~10,400 MiB` free) to the coordinator.
 3. **Server-Side `ACCEL` + `CPU` Hybrid Subgraph Execution (`llama-cpp-edgetpu/patches/llama-cpp-b12608-rpc-accel-fallback.patch`)**:
-   - When `ggml-rpc-server` serves a host-accessible `ACCEL` device (`-d EDGETPU`), `rpc_server::compute_graph_with_accel_fallback` partitions each offloaded layer graph via `ggml_graph_view` into contiguous `EDGETPU`-supported runs (`MUL_MAT` + bias `ADD`, preserving sibling `Q/K/V` and `gate/up` batching) and unsupported glue-op runs executed in-place on a server-local `CPU` backend. Entire offloaded layers remain on Node 2 without per-op network bounces.
+   - When `ggml-rpc-server` serves a host-accessible `ACCEL` device (`-d EDGETPU`), `rpc_server::compute_graph_with_accel_fallback` partitions each offloaded subgraph via `ggml_graph_view` into contiguous `EDGETPU`-supported runs (`MUL_MAT` + bias `ADD`, preserving sibling `Q/K/V` and `gate/up` batching) and validated server-local `CPU` fallback runs (`RMS_NORM`, `SCALE`, `ADD`/`SUB`/`MUL`/`DIV`, `MUL_MAT`, and view/no-op ops). `ggml_backend_rpc_device_supports_op` advertises the matching capability set so remaining ops (`ROPE`, `SOFT_MAX`, `GLU`/`SILU`, KV-cache ops) run on the coordinator CPU without closing the RPC connection.
 
 ---
 
