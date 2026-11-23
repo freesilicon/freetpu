@@ -5,8 +5,13 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Writers (e.g. libopentpu.so) publish per-chip counters with mode 0600/0644
- * (never group/world-writable) owned by a trusted publisher UID to:
- *   /dev/shm/freetpu_metrics_<pci_bdf>   (e.g. /dev/shm/freetpu_metrics_0000:00:06.0)
+ * (never group/world-writable) owned by a trusted publisher UID inside a
+ * publisher-controlled, non-group/world-writable directory (mode 0700/0750/0755,
+ * owned by a trusted publisher UID — NOT world-writable `/dev/shm` where
+ * unrelated local users can pre-create predictable filenames under the sticky
+ * bit):
+ *   /dev/shm/freetpu/freetpu_metrics_<pci_bdf>
+ *   (e.g. /dev/shm/freetpu/freetpu_metrics_0000:00:06.0)
  *
  * Concurrency & freshness protocol (lockless SeqLock, single writer / multi-reader):
  *   1. Before mutating payload fields, increment `seq` to an odd value with
@@ -19,12 +24,15 @@
  *   3. Increment `seq` to the next even value with release ordering
  *      (`__atomic_fetch_add(&s->seq, 1u, __ATOMIC_RELEASE)`).
  *
- * Readers (`ops/tpu-exporter/tpu_exporter.py`) open with `O_NOFOLLOW`, verify
- * regular-file type, trusted owner UID, and non-group/world-writable mode via
- * `fstat`, then read via `pread` (avoiding `mmap` SIGBUS on truncation),
- * checking `magic`, `version`, even/unchanged `seq`, and `timestamp_ns`
- * freshness (`now_ns - timestamp_ns <= max_age_ns`, default 30s). Expired
- * samples from stopped/crashed publishers are omitted.
+ * Readers (`ops/tpu-exporter/tpu_exporter.py`) open the publisher directory
+ * with `O_DIRECTORY | O_NOFOLLOW` and verify trusted owner UID and non-group/
+ * world-writable permissions via `fstat`, then open each metric file relative
+ * to that directory fd with `O_NOFOLLOW`, verify regular-file type, trusted
+ * owner UID, and non-group/world-writable mode via `fstat`, and read via
+ * `pread` (avoiding `mmap` SIGBUS on truncation), checking `magic`, `version`,
+ * even/unchanged `seq`, and `timestamp_ns` freshness (`now_ns - timestamp_ns
+ * <= max_age_ns`, default 30s). Expired samples from stopped/crashed publishers
+ * are omitted.
  */
 
 #ifndef FREETPU_METRICS_SHM_H
@@ -36,6 +44,8 @@
 extern "C" {
 #endif
 
+#define FREETPU_METRICS_SHM_DEFAULT_DIR             "/dev/shm/freetpu"
+#define FREETPU_METRICS_SHM_FILE_PREFIX             "freetpu_metrics_"
 #define FREETPU_METRICS_SHM_MAGIC                   0x46545055u /* "FTPU" little-endian */
 #define FREETPU_METRICS_SHM_VERSION                 1u
 #define FREETPU_METRICS_SHM_SIZE                    56u

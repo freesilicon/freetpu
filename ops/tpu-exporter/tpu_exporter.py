@@ -7,9 +7,10 @@ v5p, v6e Trillium, and tpu7x pending live HW confirmation), scrapes:
   - Direct `libtpu` gRPC / `RuntimeMetricService` (`localhost:8431`) when
     `grpcio` and protobuf stubs are available (with graceful fallback and zero
     unconditional `tpu-info` subprocess churn)
-  - Lockless SeqLock `/dev/shm/freetpu_metrics_<bdf>` `pread` telemetry for
-    bare-metal `libopentpu.so` (`ops/tpu-exporter/freetpu_metrics_shm.h`),
-    authenticated via opened-fd owner UID and non-group/world-writable mode
+  - Lockless SeqLock `/dev/shm/freetpu/freetpu_metrics_<bdf>` `pread` telemetry
+    for bare-metal `libopentpu.so` (`ops/tpu-exporter/freetpu_metrics_shm.h`),
+    authenticated via publisher-controlled directory + opened-fd owner UID and
+    non-group/world-writable permissions
   - Pure `libtpu`-free sysfs PCIe AER counters (`aer_dev_correctable`,
     `aer_dev_fatal`)
   - Optional GCP Spot preemption metadata gauge
@@ -106,6 +107,7 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
 FREETPU_SHM_MAGIC = 0x46545055
 FREETPU_SHM_VERSION = 1
+DEFAULT_SHM_ROOT = Path("/dev/shm/freetpu")
 DEFAULT_SHM_MAX_AGE_S = 30.0
 _SHM_HEADER_STRUCT = struct.Struct("<IIQ")
 _SHM_PAYLOAD_STRUCT = struct.Struct("<QQQQQ")
@@ -1383,7 +1385,7 @@ def _query_grpc_runtime_metrics(
 
 def read_shm_seqlock_metrics(
     pci_bdf: str,
-    shm_root: Optional[Path] = Path("/dev/shm"),
+    shm_root: Optional[Path] = DEFAULT_SHM_ROOT,
     *,
     max_retries: int = 64,
     trusted_uids: Optional[Sequence[int]] = None,
@@ -1392,11 +1394,17 @@ def read_shm_seqlock_metrics(
 ) -> Optional[ShmMetrics]:
     """Read bare-metal `libopentpu.so` telemetry from `<shm_root>/freetpu_metrics_<bdf>` via SeqLock `pread`.
 
-    Authenticates the publisher and sample freshness on the opened file descriptor:
-    - rejects world-writable directories that lack the sticky bit (`S_ISVTX`);
-    - opens with `O_NOFOLLOW | O_NONBLOCK` to avoid symlink/FIFO TOCTOU races;
-    - requires a regular file owned by an allowed UID (default: current `euid`)
-      with neither group-write (`0o020`) nor world-write (`0o002`) permissions;
+    Authenticates the publisher directory, metric file, and sample freshness on
+    opened file descriptors:
+    - requires `shm_root` (default `/dev/shm/freetpu`) to be a non-symlink
+      publisher-controlled directory opened with `O_DIRECTORY | O_NOFOLLOW`,
+      owned by an allowed UID (default: current `euid`) with neither group-write
+      (`0o020`) nor world-write (`0o002`) permissions (rejecting shared `/dev/shm`
+      so unrelated local users cannot pre-create predictable filenames);
+    - opens `freetpu_metrics_<bdf>` relative to the verified directory fd with
+      `O_NOFOLLOW | O_NONBLOCK` to avoid symlink/FIFO/rename TOCTOU races;
+    - requires a regular file owned by an allowed UID with neither group-write
+      (`0o020`) nor world-write (`0o002`) permissions;
     - reads via `os.pread` (never `mmap`) so concurrent truncation cannot raise
       `SIGBUS` and instead fails closed with `None`;
     - requires a fresh publisher heartbeat `timestamp_ns` within `max_age_s`
@@ -1408,32 +1416,42 @@ def read_shm_seqlock_metrics(
     if "/" in pci_bdf or "\\" in pci_bdf or ".." in pci_bdf:
         return None
 
-    shm_dir = Path(shm_root)
-    try:
-        dir_st = os.stat(shm_dir)
-    except OSError:
-        return None
-    if not stat.S_ISDIR(dir_st.st_mode):
-        return None
-    if (dir_st.st_mode & stat.S_IWOTH) != 0 and (dir_st.st_mode & stat.S_ISVTX) == 0:
-        return None
-
     allowed_uids = (
         {int(u) for u in trusted_uids}
         if trusted_uids is not None
         else {os.geteuid()}
     )
 
-    shm_path = shm_dir / f"freetpu_metrics_{pci_bdf}"
+    shm_dir = Path(shm_root)
+    dir_open_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        dir_fd = os.open(shm_dir, dir_open_flags)
+    except OSError:
+        return None
+
     open_flags = (
         os.O_RDONLY
         | getattr(os, "O_NOFOLLOW", 0)
         | getattr(os, "O_NONBLOCK", 0)
     )
     try:
-        fd = os.open(shm_path, open_flags)
-    except OSError:
-        return None
+        dir_st = os.fstat(dir_fd)
+        if not stat.S_ISDIR(dir_st.st_mode):
+            return None
+        if dir_st.st_uid not in allowed_uids:
+            return None
+        if (dir_st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)) != 0:
+            return None
+        try:
+            fd = os.open(f"freetpu_metrics_{pci_bdf}", open_flags, dir_fd=dir_fd)
+        except OSError:
+            return None
+    finally:
+        os.close(dir_fd)
     try:
         fd_st = os.fstat(fd)
         if not stat.S_ISREG(fd_st.st_mode):
@@ -1982,7 +2000,7 @@ def collect_snapshot(
     *,
     skip_pid_scan: bool = False,
     runtime_metrics_addr: Optional[str] = DEFAULT_RUNTIME_METRICS_ADDR,
-    shm_root: Optional[Path] = Path("/dev/shm"),
+    shm_root: Optional[Path] = DEFAULT_SHM_ROOT,
     shm_trusted_uids: Optional[Sequence[int]] = None,
     shm_max_age_s: float = DEFAULT_SHM_MAX_AGE_S,
     gcp_metadata_preemption: bool = False,
@@ -2595,7 +2613,7 @@ class _ExporterServer(ThreadingHTTPServer):
         chip_id_map: Optional[Dict[str, str]] = None,
         skip_pid_scan: bool = False,
         runtime_metrics_addr: Optional[str] = "127.0.0.1:8431",
-        shm_root: Optional[Path] = Path("/dev/shm"),
+        shm_root: Optional[Path] = DEFAULT_SHM_ROOT,
         shm_trusted_uids: Optional[Sequence[int]] = None,
         shm_max_age_s: float = DEFAULT_SHM_MAX_AGE_S,
         gcp_metadata_preemption: bool = False,
@@ -2904,8 +2922,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--shm-root",
         type=Path,
-        default=Path("/dev/shm"),
-        help="Shared-memory directory for libopentpu.so SeqLock files (default: /dev/shm).",
+        default=DEFAULT_SHM_ROOT,
+        help=(
+            f"Publisher-controlled shared-memory directory for libopentpu.so SeqLock files "
+            f"(default: {DEFAULT_SHM_ROOT}; must be owned by a trusted UID and not group/world-writable)."
+        ),
     )
     parser.add_argument(
         "--shm-trusted-uid",

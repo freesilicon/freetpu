@@ -48,9 +48,14 @@ docker run --rm \
 # On hosts without sysfs `chip_id` files, pass `--chip-id-map` (JSON object or file
 # mapping PCI BDF -> verified runtime chip ID) so CDI also injects verified
 # TPU_VISIBLE_CHIPS and TPU_VISIBLE_DEVICES (and stable `0-3`/`4-7` range aliases).
-# For PyTorch/XLA `xmp.spawn()` (which assigns per-rank visibility via
-# `os.environ.setdefault`), add `--omit-visible-env` so CDI keeps isolated networking
-# and topology bounds while letting each spawned rank bind its own chip:
+# For multi-process PyTorch/XLA workloads on a sub-host slice, add `--omit-visible-env`
+# so CDI omits the full-slice visibility mask while keeping isolated networking and
+# topology bounds — NOTE that `--omit-visible-env` alone is NOT sufficient with stock
+# `xmp.spawn()`, which scans container `/sys/bus/pci/devices` (seeing all 8 host TPUs
+# on a `v6e-8`) and assigns zero-based local ranks `0..N-1`; use a slice-aware launcher
+# that sets BOTH the worker process count (`nprocs` / `PJRT_LOCAL_PROCESS_COUNT=4`) AND
+# each rank's actual assigned chip ID (`TPU_VISIBLE_CHIPS=<chip_id>`, e.g. `4`,`5`,`6`,`7`
+# on the upper slice):
 sudo python3 ops/tpu-cdi/freetpu_cdi.py generate \
   --single-host-env \
   --chip-id-map /etc/freetpu/chip-id-map.json \

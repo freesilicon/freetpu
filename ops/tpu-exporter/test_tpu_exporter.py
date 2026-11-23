@@ -2828,6 +2828,8 @@ TPU Runtime Utilization
             root = Path(tmp)
             shm_root = root / "shm"
             shm_root.mkdir(parents=True, exist_ok=True)
+            os.chmod(shm_root, 0o750)
+            self.assertEqual(tpu_exporter.DEFAULT_SHM_ROOT, Path("/dev/shm/freetpu"))
             sysfs_root, dev_root, proc_root = _make_mock_pci_tree(
                 root,
                 devices=[
@@ -2988,18 +2990,35 @@ TPU Runtime Utilization
                 tpu_exporter.read_shm_seqlock_metrics("0000:00:0c.0", shm_root=shm_root)
             )
 
-            # World-writable directory lacking sticky bit must be rejected.
-            unsticky_dir = root / "world_writable_no_sticky"
-            unsticky_dir.mkdir(parents=True, exist_ok=True)
-            (unsticky_dir / "freetpu_metrics_0000:00:0b.0").write_bytes(payload)
-            os.chmod(unsticky_dir / "freetpu_metrics_0000:00:0b.0", 0o600)
-            os.chmod(unsticky_dir, 0o777)
+            # Any group-writable or world-writable directory (including sticky 0o1777 like
+            # shared `/dev/shm`), symlinked SHM directory, or untrusted-UID directory MUST
+            # be rejected so unrelated local users cannot squat on predictable filenames.
+            unsafe_dir = root / "unsafe_shm_dir"
+            unsafe_dir.mkdir(parents=True, exist_ok=True)
+            (unsafe_dir / "freetpu_metrics_0000:00:0b.0").write_bytes(payload)
+            os.chmod(unsafe_dir / "freetpu_metrics_0000:00:0b.0", 0o600)
             try:
-                self.assertIsNone(
-                    tpu_exporter.read_shm_seqlock_metrics("0000:00:0b.0", shm_root=unsticky_dir)
-                )
+                for bad_mode in (0o777, 0o1777, 0o770):
+                    os.chmod(unsafe_dir, bad_mode)
+                    self.assertIsNone(
+                        tpu_exporter.read_shm_seqlock_metrics("0000:00:0b.0", shm_root=unsafe_dir),
+                        f"Expected mode {oct(bad_mode)} SHM dir to be rejected",
+                    )
             finally:
-                os.chmod(unsticky_dir, 0o700)
+                os.chmod(unsafe_dir, 0o700)
+
+            sym_dir = root / "shm_dir_symlink"
+            os.symlink(shm_root, sym_dir)
+            self.assertIsNone(
+                tpu_exporter.read_shm_seqlock_metrics("0000:00:0b.0", shm_root=sym_dir)
+            )
+            self.assertIsNone(
+                tpu_exporter.read_shm_seqlock_metrics(
+                    "0000:00:0b.0",
+                    shm_root=shm_root,
+                    trusted_uids=[os.geteuid() + 1],
+                )
+            )
 
             # Concurrent truncation during pread fails closed cleanly (no SIGBUS).
             orig_pread = os.pread
@@ -3089,6 +3108,8 @@ TPU Runtime Utilization
             self.assertIsNone(re.search(r"(?<!_)atomic_fetch_add\(", shm_hdr_text))
             self.assertIn("__atomic_fetch_add(&s->seq", shm_hdr_text)
             self.assertIn("freetpu_shm_metrics_v1_publish", shm_hdr_text)
+            self.assertIn('FREETPU_METRICS_SHM_DEFAULT_DIR', shm_hdr_text)
+            self.assertIn('"/dev/shm/freetpu"', shm_hdr_text)
 
             # Missing heartbeat (timestamp_ns=0) and far-future timestamps fail closed.
             for bad_ts in (0, now_ns + 3600 * 1_000_000_000):

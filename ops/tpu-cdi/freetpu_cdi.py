@@ -1008,7 +1008,7 @@ def _is_supported_all_topology(
     if n_chips == 2:
         return domain_phys_counts == [2]
     if n_chips == 4:
-        if gen == "tpu7x":
+        if gen in ("tpu7x", "v5p"):
             return domain_phys_counts in ([4], [2, 2])
         return domain_phys_counts == [4]
     if n_chips == 8:
@@ -2699,9 +2699,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=False,
         help=(
             "With --single-host-env, omit TPU_VISIBLE_CHIPS and TPU_VISIBLE_DEVICES "
-            "while keeping isolated networking and topology settings (required for "
-            "multi-process launchers like PyTorch/XLA xmp.spawn() that assign per-rank "
-            "visibility via os.environ.setdefault)."
+            "while keeping isolated networking and topology settings (for slice-aware "
+            "multi-process launchers such as PyTorch/XLA that set both process count "
+            "and each rank's assigned chip ID rather than inheriting a full-slice mask)."
         ),
     )
     gen.add_argument(
@@ -2856,8 +2856,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=False,
         help=(
             "With --single-host-env, omit TPU_VISIBLE_CHIPS and TPU_VISIBLE_DEVICES "
-            "so multi-process launchers like PyTorch/XLA xmp.spawn() can assign per-rank "
-            "visibility via os.environ.setdefault."
+            "for slice-aware multi-process launchers (e.g. PyTorch/XLA) that set both "
+            "process count and each rank's assigned chip ID."
         ),
     )
     sync.add_argument(

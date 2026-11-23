@@ -2851,6 +2851,61 @@ class FreeTpuCdiTests(unittest.TestCase):
                         [],
                     )
 
+                # Standard 4-chip `v5p` VM (`0x0062`) spans two NUMA nodes (2 chips on
+                # NUMA 0 + 2 chips on NUMA 1): `--single-host-env` MUST recognize this
+                # documented `[2, 2]` v5p host topology on `all` and emit `2,2,1` and
+                # `v5p-8` (while still omitting unsupported 2-chip sub-host slices!).
+                v5p_devices = [
+                    {
+                        "bdf": f"0000:00:0{4 + i:x}.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0062",
+                        "driver": "vfio-pci",
+                        "iommu_group": str(i),
+                        "numa_node": "0",
+                        "chip_id": str(i),
+                    }
+                    for i in range(2)
+                ] + [
+                    {
+                        "bdf": f"0000:80:0{i:x}.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0062",
+                        "driver": "vfio-pci",
+                        "iommu_group": str(2 + i),
+                        "numa_node": "1",
+                        "chip_id": str(2 + i),
+                    }
+                    for i in range(2)
+                ]
+                v5p_sys, v5p_dev = _make_mock_pci_vfio(
+                    root / "v5p_4chip_dual_numa",
+                    devices=v5p_devices,
+                    create_vfio_nodes=["0", "1", "2", "3"],
+                )
+                v5p_chips, v5p_ctrl = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=v5p_sys, dev_root=v5p_dev
+                )
+                v5p_spec = freetpu_cdi.build_cdi_spec(
+                    v5p_chips, v5p_ctrl, single_host_env=True
+                )
+                v5p_by_name = {d["name"]: d for d in v5p_spec["devices"]}
+                self.assertNotIn("numa0-2", v5p_by_name)
+                self.assertNotIn("numa1-2", v5p_by_name)
+                v5p_all_env = dict(
+                    kv.split("=", 1) for kv in v5p_by_name["all"]["containerEdits"]["env"]
+                )
+                self.assertEqual(v5p_all_env["TPU_CHIPS_PER_HOST_BOUNDS"], "2,2,1")
+                self.assertEqual(v5p_all_env["TPU_ACCELERATOR_TYPE"], "v5p-8")
+                self.assertEqual(v5p_all_env["TPU_VISIBLE_CHIPS"], "0,1,2,3")
+                self.assertEqual(v5p_all_env["TPU_VISIBLE_DEVICES"], "0,1,2,3")
+                self.assertEqual(
+                    freetpu_cdi.verify_spec_against_host(
+                        v5p_spec, sysfs_root=v5p_sys, dev_root=v5p_dev
+                    ),
+                    [],
+                )
+
             # Verify tpu7x Ironwood 4-chip VM (8 PCI functions across 0x0076 / 0x0075):
             # all 8 PCI functions remain allocated in VFIO deviceNodes while host bounds
             # use the 4 physical chips (`2,2,1`, NOT `2,4,1`).
@@ -3326,6 +3381,7 @@ class FreeTpuCdiTests(unittest.TestCase):
             self.assertIn("freetpu.dev/tpu=numa0-4", dra_text)
             self.assertIn("freetpu.dev/tpu=numa1-4", dra_text)
             self.assertIn("--omit-visible-env", dra_text)
+            self.assertIn("PJRT_LOCAL_PROCESS_COUNT", dra_text)
 
             # Verify README keeps containerd GHSA-33vj-92qq-66hc security prerequisite
             # before the general Quickstart section and documents --chip-id-map /
@@ -3337,6 +3393,8 @@ class FreeTpuCdiTests(unittest.TestCase):
             self.assertNotIn("2.1.x+", readme_text)
             self.assertIn("--chip-id-map", readme_text)
             self.assertIn("--omit-visible-env", readme_text)
+            self.assertIn("PJRT_LOCAL_PROCESS_COUNT", readme_text)
+            self.assertIn("slice-aware launcher", readme_text)
             self.assertIn("-e TPU_VISIBLE_CHIPS=", readme_text)
             self.assertIn("-e TPU_VISIBLE_DEVICES=", readme_text)
             self.assertIn("TPU_ACCELERATOR_TYPE", readme_text)
