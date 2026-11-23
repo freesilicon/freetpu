@@ -160,6 +160,7 @@ class TpuTelemetry:
     aer_correctable_total: Optional[int] = None
     aer_fatal_total: Optional[int] = None
     sibling_aer_counters: Dict[str, Tuple[Optional[int], Optional[int]]] = field(default_factory=dict)
+    sibling_iommu_groups: List[str] = field(default_factory=list)
     shm_hbm_allocated_bytes: Optional[int] = None
     mxu_active_cycles: Optional[int] = None
     dma_bytes_transferred: Optional[int] = None
@@ -186,7 +187,6 @@ class ExporterSnapshot:
     devices: List[TpuTelemetry]
     runtime_utilization: List[RuntimeTelemetry] = field(default_factory=list)
     runtime_unjoined_duty_cycle: Dict[str, float] = field(default_factory=dict)
-    runtime_unjoined_duty_cycle_complete: bool = False
     gcp_preempted_status: Optional[int] = None
 
 
@@ -956,18 +956,12 @@ def _parse_python_usage_entries(
             and math.isfinite(float(duty))
             and duty >= 0
         ):
-            if item_per_chip_fb and devices_per_chip > 1:
-                # `get_chip_usage` expanded per-chip duty rows after `get_chip_usage_new`
-                # failed with a row-count mismatch in `auto` mode: preserve ALL HBM rows
-                # and record the deduplicated raw chip-level duty readings as unjoined so
-                # we never misattribute an ambiguous reply across cores.
-                if parsed_id % devices_per_chip == 0:
-                    raw_chip_key = str(parsed_id // devices_per_chip)
-                    raw_row = rows.setdefault(raw_chip_key, _TpuInfoRow(chip_key=raw_chip_key))
-                    raw_row.in_util_table = True
-                    raw_row.unjoined_duty_cycle_percent = float(duty)
-            else:
+            if not item_per_chip_fb:
                 row.duty_cycle_percent = float(duty)
+            # When `get_chip_usage` ran only as a fallback after `get_chip_usage_new`
+            # failed in `auto` mode, preserve its HBM usage/total rows and do NOT
+            # infer raw duty IDs from HBM `device_id` (`get_chip_usage` labels rows
+            # with HBM IDs, not raw duty IDs).
 
     if not rows:
         return False, f"tpu_info.metrics returned no parseable chip entries from {addr}", {}
@@ -1983,6 +1977,12 @@ def discover_tpu_devices(
                     existing.hbm_total_bytes = nominal_hbm if nominal_hbm > 0 else None
                 if aer_correctable is not None or aer_fatal is not None:
                     existing.sibling_aer_counters[entry.name] = (aer_correctable, aer_fatal)
+                if (
+                    iommu_group
+                    and iommu_group != existing.iommu_group
+                    and iommu_group not in existing.sibling_iommu_groups
+                ):
+                    existing.sibling_iommu_groups.append(iommu_group)
                 continue
 
         # A VFIO group is exclusive to this TPU ONLY when we verified the full
@@ -2397,18 +2397,20 @@ def collect_snapshot(
     shared_vfio = _shared_vfio_paths(devices)
     validate_chip_id_map(devices, chip_id_map)
 
-    # Scan /proc/<pid>/fd for open handles to <dev_root>/vfio/<group> unless
-    # decoupled (`skip_pid_scan=True`, used by unprivileged workload sidecars).
-    real_vfio_paths = [
-        str(dev_root / "vfio" / d.iommu_group)
-        for d in devices
-        if d.iommu_group
-    ]
-    expected_vfio_devnums: Dict[str, Optional[str]] = {
-        str(dev_root / "vfio" / d.iommu_group): _read_kernel_vfio_devnum(sysfs_root, d.iommu_group)
-        for d in devices
-        if d.iommu_group
-    }
+    # Scan /proc/<pid>/fd for open handles to <dev_root>/vfio/<group> (including
+    # any separate-group sibling PCI functions collapsed onto legacy v2/v3 chips)
+    # unless decoupled (`skip_pid_scan=True`, used by unprivileged workload sidecars).
+    real_vfio_paths: List[str] = []
+    expected_vfio_devnums: Dict[str, Optional[str]] = {}
+    for d in devices:
+        dev_groups = ([d.iommu_group] if d.iommu_group else []) + [
+            sg for sg in d.sibling_iommu_groups if sg and sg != d.iommu_group
+        ]
+        for grp in dev_groups:
+            vp = str(dev_root / "vfio" / grp)
+            if vp not in expected_vfio_devnums:
+                real_vfio_paths.append(vp)
+                expected_vfio_devnums[vp] = _read_kernel_vfio_devnum(sysfs_root, grp)
     if skip_pid_scan:
         proc_pids: Dict[str, List[int]] = {}
         proc_fd_accessible = False
@@ -2573,9 +2575,17 @@ def collect_snapshot(
     ) = _resolve_device_runtime_mapping(devices, parsed_rows, shared_vfio, chip_id_map)
 
     for dev in devices:
-        dev_real_vfio = str(dev_root / "vfio" / dev.iommu_group) if dev.iommu_group else ""
-        pids = list(proc_pids.get(dev_real_vfio, []))
-        host_rdev = vfio_rdevs.get(dev_real_vfio) if dev_real_vfio else None
+        dev_groups = ([dev.iommu_group] if dev.iommu_group else []) + [
+            sg for sg in dev.sibling_iommu_groups if sg and sg != dev.iommu_group
+        ]
+        dev_vfio_paths = [str(dev_root / "vfio" / grp) for grp in dev_groups]
+        pids_set: set[int] = set()
+        all_rdevs_verified = bool(dev_vfio_paths)
+        for vp in dev_vfio_paths:
+            pids_set.update(proc_pids.get(vp, []))
+            if vfio_rdevs.get(vp) is None:
+                all_rdevs_verified = False
+        pids = sorted(pids_set)
 
         # Attach `TPU Chips` rows strictly by verified /dev/vfio/<group> or PCI BDF.
         chips_row: Optional[_TpuInfoRow] = None
@@ -2644,7 +2654,7 @@ def collect_snapshot(
         # permission denials AND this device's `/dev/vfio/<group>` character device
         # number (`st_rdev`) was verified, so a missing/unreadable/non-char VFIO node
         # never emits a false zero PID count as valid billing coverage.
-        dev.pid_telemetry_available = proc_fd_accessible and (host_rdev is not None)
+        dev.pid_telemetry_available = proc_fd_accessible and all_rdevs_verified
         if not dev.pid_telemetry_available:
             overall_pid_available = False
             dev.active_pids = []
@@ -2703,51 +2713,6 @@ def collect_snapshot(
         if not _is_unjoined_duty_covered(key)
     }
 
-    # Unjoined duty-cycle telemetry is marked complete (`1`) when verified PCI
-    # hardware inventory establishes the host's physical chip count, unjoined
-    # readings cover at least every physical chip on the host (e.g. all 4 chips
-    # on a 4-chip Ironwood host, where `> 4` IDs already join directly as
-    # `per_core`), AND every runtime row with positive HBM allocation is covered
-    # (either directly by key or via its physical chip `core_id // dpc`). Partial
-    # replies (e.g. 1 idle chip's duty + a different busy chip's HBM whose duty
-    # sample is missing) and sidecars without PCI inventory stay `0`.
-    expected_physical_chips: Optional[int] = None
-    if inferred_dpc == 1 and devices:
-        expected_physical_chips = len(devices)
-    elif inferred_dpc is not None and inferred_dpc > 1 and devices:
-        verified_chips_for_unjoined = _verified_dual_function_chip_count(devices, inferred_dpc)
-        if verified_chips_for_unjoined is not None:
-            expected_physical_chips = verified_chips_for_unjoined
-        else:
-            known_gens_unjoined = {
-                d.generation for d in devices if d.generation in _GEN_DEVICES_PER_CHIP
-            }
-            if known_gens_unjoined and known_gens_unjoined <= {"v2", "v3", "v2-v3"} and len(devices) >= 4:
-                expected_physical_chips = len(devices)
-
-    active_hbm_keys = {
-        key
-        for key, row in util_rows.items()
-        if row.hbm_used_bytes is not None and row.hbm_used_bytes > 0
-    }
-    covered_duty_keys = set(runtime_unjoined_duty.keys()) | joined_duty_keys
-
-    def _active_hbm_key_covered(hbm_key: str) -> bool:
-        if hbm_key in covered_duty_keys:
-            return True
-        if inferred_dpc is not None and inferred_dpc > 1:
-            parsed_hid = _parse_runtime_device_id(hbm_key)
-            if parsed_hid is not None and str(parsed_hid // inferred_dpc) in runtime_unjoined_duty:
-                return True
-        return False
-
-    runtime_unjoined_duty_complete = bool(
-        runtime_unjoined_duty
-        and expected_physical_chips is not None
-        and len(runtime_unjoined_duty) >= expected_physical_chips
-        and all(_active_hbm_key_covered(k) for k in active_hbm_keys)
-    )
-
     gcp_preempted: Optional[int] = None
     if gcp_metadata_preemption:
         gcp_preempted = query_gcp_preemption_status(
@@ -2765,7 +2730,6 @@ def collect_snapshot(
         devices=devices,
         runtime_utilization=runtime_telemetry,
         runtime_unjoined_duty_cycle=runtime_unjoined_duty,
-        runtime_unjoined_duty_cycle_complete=runtime_unjoined_duty_complete,
         gcp_preempted_status=gcp_preempted,
     )
 
@@ -3069,12 +3033,6 @@ def format_prometheus_metrics(snapshot: ExporterSnapshot) -> str:
             "TPU Runtime Utilization MXU duty cycle percentage keyed by raw libtpu reported ID when chip-to-core layout cannot be verified from PCI inventory.",
             "gauge",
             unjoined_duty_samples,
-        )
-        add_metric(
-            "freetpu_tpu_runtime_unjoined_duty_cycle_complete",
-            "Whether unjoined runtime duty-cycle readings cover all verified host physical TPU chips and active HBM allocations (1 = complete, 0 = partial/unverified).",
-            "gauge",
-            [({}, "1" if snapshot.runtime_unjoined_duty_cycle_complete else "0")],
         )
     add_metric(
         "freetpu_tpu_runtime_hbm_bandwidth_utilization_percent",

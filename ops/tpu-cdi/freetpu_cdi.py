@@ -1696,7 +1696,7 @@ def build_cdi_spec(
         slice_devnums_str = _format_vfio_devnums(list(slice_devnums.items()))
         if slice_devnums_str:
             slice_ann_base["freetpu.dev/vfio-devnums"] = slice_devnums_str
-        if chip_id_map:
+        if chip_id_map and any(c.pci_bdf in chip_id_map for c in topo_slice.chips):
             slice_ann_base["freetpu.dev/chip-id-source"] = "chip-id-map"
 
         for s_name in topo_slice.aliases:
@@ -1737,7 +1737,7 @@ def build_cdi_spec(
     all_devnums = _format_vfio_devnums(list(seen_group_devnums.items()))
     if all_devnums:
         all_ann["freetpu.dev/vfio-devnums"] = all_devnums
-    if chip_id_map:
+    if chip_id_map and any(c.pci_bdf in chip_id_map for c in chips):
         all_ann["freetpu.dev/chip-id-source"] = "chip-id-map"
 
     all_env = _build_device_env(
@@ -3420,7 +3420,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             try:
                 val_chip_map = _load_chip_id_map(args.chip_id_map)
             except Exception as exc:  # noqa: BLE001
-                sys.stderr.write(f"freetpu-cdi validate failed: invalid --chip-id-map: {exc}\n")
+                drift_suffix = ""
+                if args.remove_if_stale and args.spec_path != "-":
+                    drift_suffix = _revalidate_existing_spec_on_map_failure(
+                        Path(args.spec_path),
+                        sysfs_root=args.sysfs_root,
+                        dev_root=args.dev_root,
+                        iommu_dev_path=args.iommu_dev,
+                        vfio_mode=args.vfio_mode,
+                    )
+                sys.stderr.write(
+                    f"freetpu-cdi validate failed: invalid --chip-id-map: {exc}{drift_suffix}\n"
+                )
                 return 1
             host_confirmed, unverifiable = _verify_spec_against_host_detailed(
                 parsed,

@@ -54,31 +54,6 @@ groups:
             and
             freetpu_tpu_runtime_hbm_used_bytes{pci_bdf="unmapped",expected_tpu_activity="sustained"} > 0
           )
-          or
-          (
-            max by (job, instance, node) (
-              avg_over_time(freetpu_tpu_runtime_unjoined_duty_cycle_percent{expected_tpu_activity="sustained"}[5m])
-            ) < 10
-            and on(job, instance)
-            max by (job, instance) (
-              freetpu_tpu_runtime_unjoined_duty_cycle_percent{expected_tpu_activity="sustained"} >= 0
-            )
-            and on(job, instance) (
-              freetpu_tpu_runtime_unjoined_duty_cycle_complete{expected_tpu_activity="sustained"} == 1
-              and
-              min_over_time(freetpu_tpu_runtime_unjoined_duty_cycle_complete{expected_tpu_activity="sustained"}[5m]) == 1
-            )
-            and on(job, instance) (
-              max by (job, instance) (freetpu_tpu_runtime_hbm_used_bytes{pci_bdf="unmapped",expected_tpu_activity="sustained"} > 0)
-              or
-              max by (job, instance) (freetpu_tpu_hbm_used_bytes{expected_tpu_activity="sustained"} > 0)
-            )
-            unless on(job, instance) (
-              max by (job, instance) (avg_over_time(freetpu_tpu_duty_cycle_percent{expected_tpu_activity="sustained"}[5m])) >= 10
-              or
-              max by (job, instance) (avg_over_time(freetpu_tpu_runtime_duty_cycle_percent{pci_bdf="unmapped",expected_tpu_activity="sustained"}[5m])) >= 10
-            )
-          )
         for: 5m
         labels:
           severity: critical
@@ -90,6 +65,45 @@ groups:
             allocation. Investigate input-pipeline stalls or ICI collective
             barriers. Idle/warmed-up inference replicas are excluded unless
             explicitly gated on serving demand.
+
+      # Advisory warning for direct-gRPC unjoined duty-cycle telemetry (e.g.
+      # unprivileged sidecars without PCI inventory or ambiguous multi-core
+      # hosts in `--grpc-duty-layout=auto`). Raw unjoined IDs cannot prove
+      # per-device coverage across all active allocations, so this stays a
+      # target-level warning rather than a critical page; configure PCI
+      # inventory or explicit `--grpc-duty-layout` for deterministic per-device
+      # critical paging via `TpuMxuDutyCycleCollapse`.
+      - alert: TpuUnjoinedDutyCycleLow
+        expr: |
+          max by (job, instance, node) (
+            avg_over_time(freetpu_tpu_runtime_unjoined_duty_cycle_percent{expected_tpu_activity="sustained"}[5m])
+          ) < 10
+          and on(job, instance)
+          max by (job, instance) (
+            freetpu_tpu_runtime_unjoined_duty_cycle_percent{expected_tpu_activity="sustained"} >= 0
+          )
+          and on(job, instance) (
+            max by (job, instance) (freetpu_tpu_runtime_hbm_used_bytes{pci_bdf="unmapped",expected_tpu_activity="sustained"} > 0)
+            or
+            max by (job, instance) (freetpu_tpu_hbm_used_bytes{expected_tpu_activity="sustained"} > 0)
+          )
+          unless on(job, instance) (
+            max by (job, instance) (avg_over_time(freetpu_tpu_duty_cycle_percent{expected_tpu_activity="sustained"}[5m])) >= 10
+            or
+            max by (job, instance) (avg_over_time(freetpu_tpu_runtime_duty_cycle_percent{pci_bdf="unmapped",expected_tpu_activity="sustained"}[5m])) >= 10
+          )
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Unjoined TPU MXU duty cycle low (<10%) on {{ $labels.node }}"
+          description: >-
+            Observed raw unjoined MXU duty-cycle samples stayed below 10% over
+            5 minutes on a sustained-activity target with active HBM allocation.
+            Because unjoined raw IDs cannot verify per-device coverage on
+            ambiguous multi-core or no-PCI sidecar targets, inspect the workload
+            and configure PCI inventory or explicit --grpc-duty-layout for
+            deterministic per-device critical alerting.
 
       - alert: TpuPcieAerFault
         # 5m range window provides multiple scrapes even at Prometheus's default

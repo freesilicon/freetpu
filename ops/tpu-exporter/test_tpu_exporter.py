@@ -959,6 +959,67 @@ TPU Device Status
             self.assertTrue(v3.pci_enabled)
             self.assertFalse(v3.healthy)
 
+            # When a legacy 0x0027 dual-function chip's two PCI functions have
+            # SEPARATE VFIO groups (10 and 11), `/proc/<pid>/fd` scanning MUST
+            # inspect BOTH sibling VFIO paths so a workload holding only the
+            # collapsed sibling's VFIO device is still captured in `active_pids`!
+            sib_root = root / "legacy_sibling_vfio_pid"
+            sib_sys, sib_dev, sib_proc = _make_mock_pci_tree(
+                sib_root,
+                devices=[
+                    {
+                        "bdf": "0000:00:04.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0027",
+                        "subsystem_device": "0x004e",
+                        "driver": "vfio-pci",
+                        "iommu_group": "10",
+                    },
+                    {
+                        "bdf": "0000:00:04.1",
+                        "vendor": "0x1ae0",
+                        "device": "0x0027",
+                        "subsystem_device": "0x004e",
+                        "driver": "vfio-pci",
+                        "iommu_group": "11",
+                    },
+                ],
+                create_vfio_nodes=["10", "11"],
+            )
+            fd_dir = sib_proc / "9999" / "fd"
+            fdinfo_dir = sib_proc / "9999" / "fdinfo"
+            fd_dir.mkdir(parents=True)
+            fdinfo_dir.mkdir(parents=True)
+            os.symlink(str(sib_dev / "vfio" / "11"), fd_dir / "3")
+            (fdinfo_dir / "3").write_text("pos:\t0\nflags:\t02\n", encoding="utf-8")
+            import stat as _stat
+            from unittest import mock as _mock
+
+            orig_stat = os.stat
+            st11 = orig_stat(sib_dev / "vfio" / "11")
+            id11 = (st11.st_dev, st11.st_ino)
+
+            def _mock_sib_stat(path_arg, *args, **kwargs):
+                st = orig_stat(path_arg, *args, **kwargs)
+                if (st.st_dev, st.st_ino) == id11:
+                    fake = _mock.MagicMock()
+                    fake.st_mode = _stat.S_IFCHR | 0o600
+                    fake.st_rdev = os.makedev(242, 11)
+                    return fake
+                return st
+
+            with _mock_vfio_char_lstat(), _mock.patch.object(os, "stat", side_effect=_mock_sib_stat):
+                sib_snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=sib_sys,
+                    dev_root=sib_dev,
+                    proc_root=sib_proc,
+                    tpu_info_bin=None,
+                )
+            self.assertEqual(len(sib_snap.devices), 1)
+            self.assertEqual(sib_snap.devices[0].sibling_iommu_groups, ["11"])
+            self.assertTrue(sib_snap.devices[0].pid_telemetry_available)
+            self.assertEqual(sib_snap.devices[0].active_pids, [9999])
+
     def test_proc_vfio_pid_matches_by_char_dev_rdev_not_pathname(self) -> None:
         import stat as _stat
         from unittest import mock
@@ -2752,11 +2813,8 @@ TPU Runtime Utilization
                 iw_auto_snap.runtime_unjoined_duty_cycle,
                 {"0": 12.5, "1": 37.5, "2": 62.5, "3": 87.5},
             )
-            # Complete 4-chip unjoined reply covering all 4 physical chips and all
-            # 8 active HBM cores MUST mark unjoined duty coverage complete (`1`)!
-            self.assertTrue(iw_auto_snap.runtime_unjoined_duty_cycle_complete)
             iw_auto_prom = _te.format_prometheus_metrics(iw_auto_snap)
-            self.assertIn("freetpu_tpu_runtime_unjoined_duty_cycle_complete 1", iw_auto_prom)
+            self.assertNotIn("freetpu_tpu_runtime_unjoined_duty_cycle_complete", iw_auto_prom)
             self.assertEqual(
                 [d.hbm_used_bytes for d in iw_auto_snap.devices],
                 [(c + 1) * 10 * 1024**3 for c in range(8)],
@@ -2908,10 +2966,13 @@ TPU Runtime Utilization
             )
             self.assertEqual(len(fb_rows), 8)
             self.assertEqual(fb_rows["7"].hbm_used_bytes, 16 * 1024**3)
-            self.assertTrue(all(r.duty_cycle_percent is None for r in fb_rows.values()))
-            self.assertEqual(
-                {k: r.unjoined_duty_cycle_percent for k, r in fb_rows.items() if r.unjoined_duty_cycle_percent is not None},
-                {"0": 12.5, "1": 37.5, "2": 62.5, "3": 87.5},
+            # In `auto` mode, legacy `get_chip_usage` fallback preserves HBM rows
+            # ONLY and MUST NOT infer raw duty IDs from HBM `device_id`s!
+            self.assertTrue(
+                all(
+                    r.duty_cycle_percent is None and r.unjoined_duty_cycle_percent is None
+                    for r in fb_rows.values()
+                )
             )
             self.assertTrue(pc_ok, pc_err)
             self.assertEqual(
@@ -3369,10 +3430,7 @@ TPU Runtime Utilization
                 'freetpu_tpu_runtime_unjoined_duty_cycle_percent{runtime_device_id="3"} 87.5',
                 no_pci_prom,
             )
-            # Without PCI inventory (sidecar), unjoined duty coverage cannot be verified
-            # across all host devices, so the completeness gauge MUST be 0!
-            self.assertFalse(no_pci_snap.runtime_unjoined_duty_cycle_complete)
-            self.assertIn("freetpu_tpu_runtime_unjoined_duty_cycle_complete 0", no_pci_prom)
+            self.assertNotIn("freetpu_tpu_runtime_unjoined_duty_cycle_complete", no_pci_prom)
 
             # Ironwood (8 PCI functions) with duty-cycle IDs `{0..3}` and NO HBM IDs:
             # MUST NOT assume physical-chip granularity and expand across all 8 cores
@@ -4765,6 +4823,7 @@ TPU Runtime Utilization
             for rule_name in (
                 "TpuHbmOOMWarning",
                 "TpuMxuDutyCycleCollapse",
+                "TpuUnjoinedDutyCycleLow",
                 "TpuPcieAerFault",
                 "GcpSpotPreemption",
             ):
@@ -4775,17 +4834,14 @@ TPU Runtime Utilization
                 'freetpu_tpu_runtime_duty_cycle_percent{pci_bdf="unmapped",expected_tpu_activity="sustained"}',
                 alerts_text,
             )
-            # Duty cycle collapse must be gated on sustained activity + current instant duty sample + HBM allocation
-            # across per-PCI, runtime-unmapped, AND direct-gRPC unjoined sidecar series.
+            # Duty cycle collapse (critical) stays strictly on verified joined series;
+            # unjoined direct-gRPC telemetry uses a separate target-level advisory warning.
             self.assertIn('expected_tpu_activity="sustained"', alerts_text)
             self.assertIn('freetpu_tpu_duty_cycle_percent{expected_tpu_activity="sustained"} >= 0', alerts_text)
             self.assertIn(
                 'freetpu_tpu_runtime_duty_cycle_percent{pci_bdf="unmapped",expected_tpu_activity="sustained"} >= 0',
                 alerts_text,
             )
-            # Unjoined branch MUST aggregate at the scrape-target level (`max by (job, instance, node)`)
-            # so idle unallocated devices on a partially-used host never trigger false critical pages,
-            # and suppress when any joined duty series on the target is healthy (`>= 10`).
             self.assertIn("max by (job, instance, node) (", alerts_text)
             self.assertIn(
                 'avg_over_time(freetpu_tpu_runtime_unjoined_duty_cycle_percent{expected_tpu_activity="sustained"}[5m])',
@@ -4795,14 +4851,7 @@ TPU Runtime Utilization
                 'freetpu_tpu_runtime_unjoined_duty_cycle_percent{expected_tpu_activity="sustained"} >= 0',
                 alerts_text,
             )
-            self.assertIn(
-                'freetpu_tpu_runtime_unjoined_duty_cycle_complete{expected_tpu_activity="sustained"} == 1',
-                alerts_text,
-            )
-            self.assertIn(
-                'min_over_time(freetpu_tpu_runtime_unjoined_duty_cycle_complete{expected_tpu_activity="sustained"}[5m]) == 1',
-                alerts_text,
-            )
+            self.assertNotIn("freetpu_tpu_runtime_unjoined_duty_cycle_complete", alerts_text)
             self.assertIn("and on(job, instance)", alerts_text)
             self.assertIn("unless on(job, instance)", alerts_text)
             self.assertIn('freetpu_tpu_hbm_used_bytes{expected_tpu_activity="sustained"} > 0', alerts_text)

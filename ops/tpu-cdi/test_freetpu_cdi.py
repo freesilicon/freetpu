@@ -3085,6 +3085,136 @@ class FreeTpuCdiTests(unittest.TestCase):
                     "must withdraw stale CDI spec on confirmed VFIO drift when --chip-id-map fails to load at sync startup",
                 )
 
+                # Same hardware-drift revalidation MUST also run in `validate --check-host
+                # --remove-if-stale --chip-id-map <broken>` so broken map files never leave
+                # stale VFIO specs published when live hardware has drifted!
+                val_drift_spec = drift_root / "freetpu-validate-drift.json"
+                (drift_dev / "vfio" / "3").touch()
+                drift_map_file.write_text(
+                    json.dumps({f"0000:00:{4 + i:02x}.0": i for i in range(4)}),
+                    encoding="utf-8",
+                )
+                rc_vd_gen, _o_vdg, err_vdg = _run_cli_inproc(
+                    [
+                        "generate",
+                        "--sysfs-root",
+                        str(drift_sys),
+                        "--dev-root",
+                        str(drift_dev),
+                        "--chip-id-map",
+                        str(drift_map_file),
+                        "--output",
+                        str(val_drift_spec),
+                        "--validate",
+                    ]
+                )
+                self.assertEqual(rc_vd_gen, 0, err_vdg)
+                self.assertTrue(val_drift_spec.exists())
+                drift_map_file.write_text("{malformed-for-validate", encoding="utf-8")
+                (drift_dev / "vfio" / "3").unlink()
+                rc_vd_val, _o_vdv, err_vdv = _run_cli_inproc(
+                    [
+                        "validate",
+                        str(val_drift_spec),
+                        "--check-host",
+                        "--remove-if-stale",
+                        "--chip-id-map",
+                        str(drift_map_file),
+                        "--sysfs-root",
+                        str(drift_sys),
+                        "--dev-root",
+                        str(drift_dev),
+                    ]
+                )
+                self.assertNotEqual(rc_vd_val, 0)
+                self.assertIn("confirmed hardware drift", err_vdv)
+                self.assertFalse(
+                    val_drift_spec.exists(),
+                    "must withdraw stale CDI spec on confirmed VFIO drift when validate's --chip-id-map cannot be loaded",
+                )
+
+                # Per-slice chip-ID provenance: when `--chip-id-map` covers ONLY NUMA 1
+                # while NUMA 0 uses sysfs `chip_id`s, ONLY NUMA 1 gets `chip-id-source=chip-id-map`;
+                # a later change to NUMA 0's sysfs `chip_id`s MUST be caught as confirmed drift
+                # and unlink under `validate --check-host --remove-if-stale` without the map!
+                part_root = root / "v6e8_partial_map_provenance"
+                part_sys, part_dev = _make_mock_pci_vfio(
+                    part_root,
+                    devices=[
+                        {
+                            "bdf": f"0000:00:{4 + i:02x}.0",
+                            "vendor": "0x1ae0",
+                            "device": "0x006f",
+                            "driver": "vfio-pci",
+                            "iommu_group": str(i),
+                            "numa_node": "0",
+                            "chip_id": str(i),
+                        }
+                        for i in range(4)
+                    ]
+                    + [
+                        {
+                            "bdf": f"0000:80:{4 + i:02x}.0",
+                            "vendor": "0x1ae0",
+                            "device": "0x006f",
+                            "driver": "vfio-pci",
+                            "iommu_group": str(4 + i),
+                            "numa_node": "1",
+                        }
+                        for i in range(4)
+                    ],
+                    create_vfio_nodes=[str(i) for i in range(8)],
+                )
+                numa1_only_map = {f"0000:80:{4 + i:02x}.0": 4 + i for i in range(4)}
+                numa1_map_file = part_root / "numa1-map.json"
+                numa1_map_file.write_text(json.dumps(numa1_only_map), encoding="utf-8")
+                part_spec_path = part_root / "freetpu-partial-map.json"
+                rc_pm_gen, _o_pmg, err_pmg = _run_cli_inproc(
+                    [
+                        "generate",
+                        "--sysfs-root",
+                        str(part_sys),
+                        "--dev-root",
+                        str(part_dev),
+                        "--chip-id-map",
+                        str(numa1_map_file),
+                        "--output",
+                        str(part_spec_path),
+                        "--validate",
+                    ]
+                )
+                self.assertEqual(rc_pm_gen, 0, err_pmg)
+                part_by_name = {
+                    d["name"]: d
+                    for d in json.loads(part_spec_path.read_text(encoding="utf-8"))["devices"]
+                }
+                self.assertNotIn("freetpu.dev/chip-id-source", part_by_name["0-3"]["annotations"])
+                self.assertEqual(
+                    part_by_name["4-7"]["annotations"].get("freetpu.dev/chip-id-source"),
+                    "chip-id-map",
+                )
+                # Corrupt NUMA 0 sysfs chip_id -> mapless validate MUST unlink!
+                (part_sys / "bus/pci/devices/0000:00:05.0/chip_id").write_text(
+                    "0\n", encoding="utf-8"
+                )
+                rc_pm_val, _o_pmv, _err_pmv = _run_cli_inproc(
+                    [
+                        "validate",
+                        str(part_spec_path),
+                        "--check-host",
+                        "--remove-if-stale",
+                        "--sysfs-root",
+                        str(part_sys),
+                        "--dev-root",
+                        str(part_dev),
+                    ]
+                )
+                self.assertNotEqual(rc_pm_val, 0)
+                self.assertFalse(
+                    part_spec_path.exists(),
+                    "must unlink spec when sysfs-derived NUMA 0 slice drifts even though NUMA 1 used --chip-id-map",
+                )
+
                 # Sysfs-derived range alias in DEFAULT host-safe mode (NO --single-host-env,
                 # NO injected TPU_VISIBLE_CHIPS, NO --chip-id-map): when live sysfs `chip_id`s
                 # later conflict (duplicate "0"), `validate --check-host --remove-if-stale`
