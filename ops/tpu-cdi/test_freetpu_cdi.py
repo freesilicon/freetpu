@@ -5624,7 +5624,8 @@ class FreeTpuCdiTests(unittest.TestCase):
 
                 # Even on a fresh scan with no prior spec, 4 surviving chips with
                 # non-contiguous sysfs `chip_id`s (`0, 2, 5, 7`) MUST NOT emit `pcie-0000-00-4`
-                # or `2,2,1` bounds.
+                # or `2,2,1` bounds — including when `--chip-id-map '{}'` or an unrelated-domain
+                # map is supplied!
                 gap_devs = [
                     {
                         "bdf": f"0000:00:{4 + i:02x}.0",
@@ -5644,15 +5645,144 @@ class FreeTpuCdiTests(unittest.TestCase):
                 gap_chips, gap_ctrl = freetpu_cdi.discover_tpu_chips(
                     sysfs_root=gap_sys, dev_root=gap_dev
                 )
-                gap_spec = freetpu_cdi.build_cdi_spec(
-                    gap_chips, gap_ctrl, single_host_env=True
+                for map_label, cmap in (
+                    ("no_map", None),
+                    ("empty_map", {}),
+                    ("unrelated_domain_map", {"0000:80:04.0": 4}),
+                ):
+                    gap_spec = freetpu_cdi.build_cdi_spec(
+                        gap_chips, gap_ctrl, single_host_env=True, chip_id_map=cmap
+                    )
+                    gap_names = {d["name"] for d in gap_spec["devices"]}
+                    self.assertNotIn("pcie-0000-00-4", gap_names, map_label)
+                    for dev_entry in gap_spec["devices"]:
+                        env_list = dev_entry.get("containerEdits", {}).get("env", [])
+                        self.assertNotIn("TPU_CHIPS_PER_HOST_BOUNDS=2,2,1", env_list, map_label)
+                        self.assertNotIn("TPU_ACCELERATOR_TYPE=v6e-4", env_list, map_label)
+
+                # Rerunning `generate --output <existing> --validate` after 4 PCI functions
+                # disappear from a single-root v6e-8 MUST carry forward the existing spec's
+                # boot-observed domain inventory and withhold `pcie-0000-00-4` & `2,2,1`!
+                gen_loss_sys, gen_loss_dev = _make_mock_pci_vfio(
+                    root / "single_root_v6e8_gen_loss",
+                    devices=devs,
+                    create_vfio_nodes=[str(i) for i in range(8)],
                 )
-                gap_names = {d["name"] for d in gap_spec["devices"]}
-                self.assertNotIn("pcie-0000-00-4", gap_names)
-                for dev_entry in gap_spec["devices"]:
+                gen_loss_spec_path = root / "cdi" / "gen_loss_freetpu.json"
+                rc_g1, _o1, err_g1 = _run_cli_inproc(
+                    [
+                        "generate",
+                        "--output",
+                        str(gen_loss_spec_path),
+                        "--validate",
+                        "--single-host-env",
+                        "--sysfs-root",
+                        str(gen_loss_sys),
+                        "--dev-root",
+                        str(gen_loss_dev),
+                    ]
+                )
+                self.assertEqual(rc_g1, 0, err_g1)
+                for idx in range(4, 8):
+                    shutil.rmtree(
+                        gen_loss_sys / "bus" / "pci" / "devices" / f"0000:00:{4 + idx:02x}.0"
+                    )
+                    (gen_loss_dev / "vfio" / str(idx)).unlink()
+                rc_g2, _o2, err_g2 = _run_cli_inproc(
+                    [
+                        "generate",
+                        "--output",
+                        str(gen_loss_spec_path),
+                        "--validate",
+                        "--single-host-env",
+                        "--sysfs-root",
+                        str(gen_loss_sys),
+                        "--dev-root",
+                        str(gen_loss_dev),
+                    ]
+                )
+                self.assertEqual(rc_g2, 0, err_g2)
+                g2_spec = json.loads(gen_loss_spec_path.read_text(encoding="utf-8"))
+                g2_names = {d["name"] for d in g2_spec["devices"]}
+                self.assertNotIn("pcie-0000-00-4", g2_names)
+                self.assertNotIn("0-3", g2_names)
+                for dev_entry in g2_spec["devices"]:
                     env_list = dev_entry.get("containerEdits", {}).get("env", [])
                     self.assertNotIn("TPU_CHIPS_PER_HOST_BOUNDS=2,2,1", env_list)
                     self.assertNotIn("TPU_ACCELERATOR_TYPE=v6e-4", env_list)
+
+                # Healthy map-dependent 4-chip v6e spec with non-contiguous runtime IDs
+                # `8,9,12,13` (matching non-contiguous sysfs IDs) MUST be preserved as
+                # `unverifiable` (NOT deleted as confirmed drift!) when validated without
+                # `--chip-id-map` under `--remove-if-stale` OR during transient `sync` map loss!
+                nc_devs = [
+                    {
+                        "bdf": f"0000:00:{1 + i:02x}.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": str(i),
+                        "chip_id": str(cid),
+                    }
+                    for i, cid in enumerate((8, 9, 12, 13))
+                ]
+                nc_sys, nc_dev = _make_mock_pci_vfio(
+                    root / "noncontig_map_preserved",
+                    devices=nc_devs,
+                    create_vfio_nodes=[str(i) for i in range(4)],
+                )
+                nc_map = {nc_devs[i]["bdf"]: cid for i, cid in enumerate((8, 9, 12, 13))}
+                nc_spec_path = root / "cdi" / "nc_freetpu.json"
+                rc_nc, _onc, err_nc = _run_cli_inproc(
+                    [
+                        "generate",
+                        "--output",
+                        str(nc_spec_path),
+                        "--validate",
+                        "--single-host-env",
+                        "--chip-id-map",
+                        json.dumps(nc_map),
+                        "--sysfs-root",
+                        str(nc_sys),
+                        "--dev-root",
+                        str(nc_dev),
+                    ]
+                )
+                self.assertEqual(rc_nc, 0, err_nc)
+                nc_spec = json.loads(nc_spec_path.read_text(encoding="utf-8"))
+                self.assertIn("pcie-0000-00-4", {d["name"] for d in nc_spec["devices"]})
+
+                # `validate --check-host --remove-if-stale` WITHOUT `--chip-id-map` MUST
+                # return non-zero (unverifiable) while PRESERVING the healthy spec on disk!
+                rc_nc_val, _onv, err_nc_val = _run_cli_inproc(
+                    [
+                        "validate",
+                        str(nc_spec_path),
+                        "--check-host",
+                        "--remove-if-stale",
+                        "--sysfs-root",
+                        str(nc_sys),
+                        "--dev-root",
+                        str(nc_dev),
+                    ]
+                )
+                self.assertNotEqual(rc_nc_val, 0)
+                self.assertTrue(
+                    nc_spec_path.exists(),
+                    f"Healthy non-contiguous map-backed spec must be preserved without map: {err_nc_val}",
+                )
+
+                # Transient map reload failure in `sync` (`_revalidate_existing_spec_on_map_failure`)
+                # MUST also preserve the healthy spec!
+                drift_msg = freetpu_cdi._revalidate_existing_spec_on_map_failure(
+                    nc_spec_path,
+                    sysfs_root=nc_sys,
+                    dev_root=nc_dev,
+                    iommu_dev_path=None,
+                    vfio_mode="auto",
+                )
+                self.assertEqual(drift_msg, "")
+                self.assertTrue(nc_spec_path.exists())
 
     def test_all_selector_revalidates_map_dependent_topology_with_omit_visible_env(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

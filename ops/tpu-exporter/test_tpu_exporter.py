@@ -2564,6 +2564,7 @@ TPU Runtime Utilization
                         items = [
                             _make_item(0, as_int=16 * 1024**3),
                             _make_item("1", as_int=64 * 1024**3),
+                            _make_item(2, as_int=8 * 1024**3),
                             _make_item(None, as_int=999),  # unset AttrValue must be ignored
                             _make_item(99),  # unset Gauge must be ignored
                         ]
@@ -2571,16 +2572,19 @@ TPU Runtime Utilization
                         items = [
                             _make_item(0, as_int=32 * 1024**3),
                             _make_item("1", as_int=96 * 1024**3),
+                            _make_item(2, as_int=16 * 1024**3),
                         ]
                     elif req.metric_name == "tpu.runtime.tensorcore.dutycycle.percent":
                         items = [
                             _make_item(0, as_double=72.5),
                             _make_item("1", as_double=88.0),
+                            _make_item(2, as_double=25.0),
                         ]
                     elif req.metric_name == "tpu.runtime.hbm.utilization.percent":
                         items = [
                             _make_item(0, as_double=63.2),
                             _make_item("1", as_double=41.0),
+                            _make_item(2, as_double=19.5),
                         ]
                     else:
                         items = []
@@ -2678,7 +2682,7 @@ TPU Runtime Utilization
             # Unset AttrValue and unset Gauge entries must not appear in runtime_utilization.
             self.assertEqual(
                 sorted(rt.runtime_chip for rt in snap1.runtime_utilization),
-                ["0", "1"],
+                ["0", "1", "2"],
             )
             self.assertIn(
                 "tpu.runtime.hbm.utilization.percent",
@@ -4267,7 +4271,7 @@ TPU Runtime Utilization
             self.assertTrue(unmapped_grpc_snap.tpu_info_available)
             self.assertTrue(all(d.hbm_used_bytes is None for d in unmapped_grpc_snap.devices))
             self.assertTrue(all(d.duty_cycle_percent is None for d in unmapped_grpc_snap.devices))
-            self.assertEqual(len(unmapped_grpc_snap.runtime_utilization), 2)
+            self.assertEqual(len(unmapped_grpc_snap.runtime_utilization), 3)
             self.assertTrue(all(rt.mapped_pci_bdf is None for rt in unmapped_grpc_snap.runtime_utilization))
 
             # Even when `tpu-info` CLI Process Monitor prints guessed `/dev/vfio/0` and
@@ -6197,6 +6201,163 @@ TPU Runtime Utilization
             self.assertAlmostEqual(rpc_by_bdf["0000:00:05.0"].duty_cycle_percent or 0.0, 55.0)
             # Core 7: unset gauge MUST be stripped to None!
             self.assertIsNone(rpc_by_bdf["0000:00:0b.0"].duty_cycle_percent)
+
+            # 6. Ambiguous Ironwood `auto` Python fallback returning HBM `{0,1,2,3}`
+            #    and raw duty `{0,1,2,3}` (`len <= 4`) MUST NOT be treated as proved
+            #    per-core; duty MUST stay stripped/unjoined instead of misattributing
+            #    physical chip duty to logical cores 0..3!
+            class _RpcDuty4Stub:
+                def __init__(self, _chan: object) -> None:
+                    pass
+
+                def GetRuntimeMetric(self, req: object, timeout: float = 0.0) -> object:
+                    pts = [_MetricPoint(i, 42.0 + i) for i in range(4)]
+                    return types.SimpleNamespace(metric=types.SimpleNamespace(metrics=pts))
+
+            fake_proto_grpc_4 = types.ModuleType("tpu_info.proto.tpu_metric_service_pb2_grpc")
+            fake_proto_grpc_4.RuntimeMetricServiceStub = _RpcDuty4Stub  # type: ignore[attr-defined]
+            fake_metrics_4 = types.ModuleType("tpu_info.metrics")
+
+            def _iw_usage_4(_chip: object, addr: str = "") -> list[_FakeUsage]:
+                return [
+                    _FakeUsage(i, 16 * 1024**3, 192 * 1024**3, 42.0 + i)
+                    for i in range(4)
+                ]
+
+            fake_metrics_4.get_chip_usage_new = _iw_usage_4  # type: ignore[attr-defined]
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "grpc": fake_grpc_mod,
+                        "tpu_info": types.ModuleType("tpu_info"),
+                        "tpu_info.device": fake_dev_mod,
+                        "tpu_info.metrics": fake_metrics_4,
+                        "tpu_info.proto": types.ModuleType("tpu_info.proto"),
+                        "tpu_info.proto.tpu_metric_service_pb2": fake_proto_pb2,
+                        "tpu_info.proto.tpu_metric_service_pb2_grpc": fake_proto_grpc_4,
+                    },
+                ),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_query_grpc_runtime_metrics",
+                    return_value=(False, "direct grpc failed", {}),
+                ),
+            ):
+                amb_snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=rpc_sys,
+                    dev_root=rpc_dev,
+                    proc_root=rpc_proc,
+                    skip_pid_scan=True,
+                    runtime_metrics_addr="127.0.0.1:59433",
+                    grpc_duty_layout="auto",
+                    shm_root=root / "no-shm",
+                )
+            for dev in amb_snap.devices:
+                self.assertIsNone(
+                    dev.duty_cycle_percent,
+                    f"Ambiguous 4-entry Ironwood auto fallback must not join duty onto {dev.pci_bdf}",
+                )
+
+            # 7a. 4-device v6e host with ONLY device 0 mapped (`chip_id="0"`) + direct gRPC
+            #     returning 1 row for device 0 MUST STILL trigger fallback because 1 < 4!
+            v4_one_sys, v4_one_dev, v4_one_proc = _make_mock_pci_tree(
+                root / "v6e4_one_mapped",
+                devices=[
+                    {
+                        "bdf": f"0000:00:{4 + i:02x}.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": str(i),
+                        **({"chip_id": "0"} if i == 0 else {}),
+                    }
+                    for i in range(4)
+                ],
+                create_vfio_nodes=[str(i) for i in range(4)],
+            )
+            partial_grpc_1 = {
+                "0": tpu_exporter._TpuInfoRow(
+                    chip_key="0",
+                    hbm_used_bytes=4 * 1024**3,
+                    hbm_total_bytes=32 * 1024**3,
+                    duty_cycle_percent=50.0,
+                    in_util_table=True,
+                    duty_ids_verified=True,
+                )
+            }
+            fb_one_calls: list[float] = []
+
+            def _fb_one(_devs: object, *, addr: object, timeout_s: float, grpc_duty_layout: str = "auto") -> tuple[bool, None, dict[str, tpu_exporter._TpuInfoRow]]:
+                fb_one_calls.append(timeout_s)
+                return True, None, full_fallback_4
+
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_query_grpc_runtime_metrics",
+                    return_value=(True, None, partial_grpc_1),
+                ),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_query_tpu_info_python_metrics",
+                    side_effect=_fb_one,
+                ),
+            ):
+                v4_one_snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=v4_one_sys,
+                    dev_root=v4_one_dev,
+                    proc_root=v4_one_proc,
+                    skip_pid_scan=True,
+                    shm_root=root / "no-shm",
+                )
+            self.assertEqual(len(fb_one_calls), 1)
+            self.assertEqual(
+                {r.runtime_chip for r in v4_one_snap.runtime_utilization},
+                {"0", "1", "2", "3"},
+            )
+
+            # 7b. 4-device v6e host where CLI fallback returns only 2 rows MUST STILL
+            #     trigger Python fallback because 2 < 4 visible PCI devices!
+            py_after_cli_calls: list[float] = []
+
+            def _fb_after_cli(_devs: object, *, addr: object, timeout_s: float, grpc_duty_layout: str = "auto") -> tuple[bool, None, dict[str, tpu_exporter._TpuInfoRow]]:
+                py_after_cli_calls.append(timeout_s)
+                return True, None, full_fallback_4
+
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_query_grpc_runtime_metrics",
+                    return_value=(False, "grpc down", {}),
+                ),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_run_tpu_info",
+                    return_value=(True, None, partial_grpc_2),
+                ),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_query_tpu_info_python_metrics",
+                    side_effect=_fb_after_cli,
+                ),
+            ):
+                cli_partial_snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=v4_one_sys,
+                    dev_root=v4_one_dev,
+                    proc_root=v4_one_proc,
+                    tpu_info_bin="tpu-info",
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=root / "no-shm",
+                )
+            self.assertEqual(len(py_after_cli_calls), 1)
+            self.assertEqual(
+                {r.runtime_chip for r in cli_partial_snap.runtime_utilization},
+                {"0", "1", "2", "3"},
+            )
 
     def _assert_valid_prometheus_text(self, text: str) -> None:
         lines = [ln for ln in text.splitlines() if ln.strip()]

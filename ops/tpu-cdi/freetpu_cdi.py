@@ -1664,10 +1664,14 @@ def _compute_topology_slices(
             is_contiguous = bool(
                 vis_chips and vis_chips == list(range(vis_chips[0], vis_chips[0] + len(vis_chips)))
             )
-            # Without an explicit `--chip-id-map`, non-contiguous sysfs `chip_id`s
-            # (e.g. `0, 2, 5, 7`) indicate missing chips in a degraded domain rather
-            # than a verified contiguous 2x2 sub-host torus slice; withhold the slice.
-            if chip_id_map is None and not is_contiguous:
+            # Only bypass the non-contiguous sysfs `chip_id` guard when
+            # `--chip-id-map` explicitly maps EVERY PCI BDF in this slice
+            # (so empty `{}` or an unrelated-domain map cannot let degraded
+            # sysfs IDs like `{0, 2, 5, 7}` publish a 4-chip slice or `2,2,1`).
+            slice_fully_mapped = bool(
+                chip_id_map and all(c.pci_bdf in chip_id_map for c in d_chips)
+            )
+            if not slice_fully_mapped and not is_contiguous:
                 continue
             if is_contiguous:
                 candidate_names.append(f"{vis_chips[0]}-{vis_chips[-1]}")
@@ -1808,6 +1812,42 @@ def _extract_observed_domain_bdfs_from_spec(
                 d_key = ("numa", numa_val, root_val) if numa_val is not None else ("pcie", None, root_val)
                 out.setdefault(d_key, set()).add(b)
     return out
+
+
+def _read_host_boot_id() -> Optional[str]:
+    """Read Linux kernel boot_id when available to scope persisted PCI inventory to one boot."""
+    try:
+        val = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+        return val or None
+    except OSError:
+        return None
+
+
+def _load_same_boot_observed_domains(
+    spec_path: Path,
+) -> Dict[Tuple[str, Optional[int], str], set[str]]:
+    """Load boot-observed per-domain PCI BDFs from an existing spec file if from the same boot."""
+    try:
+        if not spec_path.exists():
+            return {}
+        existing_spec = _load_json_strict_keys(spec_path.read_text(encoding="utf-8"))
+        if not isinstance(existing_spec, dict):
+            return {}
+        root_ann = existing_spec.get("annotations")
+        existing_boot_id = (
+            root_ann.get("freetpu.dev/boot-id") if isinstance(root_ann, dict) else None
+        )
+        current_boot_id = _read_host_boot_id()
+        if (
+            isinstance(existing_boot_id, str)
+            and existing_boot_id.strip()
+            and current_boot_id
+            and existing_boot_id.strip() != current_boot_id
+        ):
+            return {}
+        return _extract_observed_domain_bdfs_from_spec(existing_spec)
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 def _merge_observed_domain_bdfs(
@@ -2110,8 +2150,11 @@ def build_cdi_spec(
         missing_map_all = bool(
             chip_id_map and any(b not in all_bdfs_set for b in chip_id_map)
         )
+        all_fully_mapped = bool(
+            chip_id_map and all(c.pci_bdf in chip_id_map for c in chips)
+        )
         noncontig_sysfs_all = bool(
-            chip_id_map is None
+            not all_fully_mapped
             and all_visibility is not None
             and len(all_visibility[0]) >= 2
             and all_visibility[0]
@@ -2192,6 +2235,9 @@ def build_cdi_spec(
     observed_domains_str = _format_observed_domain_bdfs(merged_observed_domains)
     if observed_domains_str:
         root_ann["freetpu.dev/observed-domain-bdfs"] = observed_domains_str
+    boot_id = _read_host_boot_id()
+    if boot_id:
+        root_ann["freetpu.dev/boot-id"] = boot_id
 
     return {
         "cdiVersion": cdi_version,
@@ -3046,13 +3092,14 @@ def _verify_spec_against_host_detailed(
                 uses_explicit_chip_map = ann.get("freetpu.dev/chip-id-source") == "chip-id-map"
                 unpaired_domain_check: Optional[Tuple[Optional[int], str]] = None
                 if expected_slice is None:
-                    # On separate-slot multi-function hosts (e.g. Ironwood `tpu7x` where
-                    # sibling PCI functions occupy distinct slots and only `--chip-id-map`
-                    # identifies pairs), omitting `--chip-id-map` prevents `_compute_topology_slices`
-                    # from pairing functions into complete chips. When all live PCI/VFIO nodes,
-                    # domain membership, selector name/width, and supported chip count still match
-                    # the intact live domain, record the missing pairing map as `unverifiable`
-                    # rather than confirmed hardware drift so `--remove-if-stale` preserves the spec.
+                    # When a map-dependent slice (`freetpu.dev/chip-id-source=chip-id-map`)
+                    # is validated WITHOUT `--chip-id-map`, `_compute_topology_slices` may
+                    # withhold it either because (a) separate-slot multi-function chips need
+                    # `--chip-id-map` for pairing, or (b) non-contiguous sysfs `chip_id`s
+                    # (e.g. `8,9,12,13`) require `--chip-id-map` to verify slice topology.
+                    # Verify all hardware/PCI/VFIO/domain/bounds invariants independently;
+                    # if everything matches the intact live domain, classify as `unverifiable`
+                    # rather than confirmed drift so healthy specs are preserved.
                     unpaired_map_match = False
                     if (
                         chip_id_map is None
@@ -3060,13 +3107,26 @@ def _verify_spec_against_host_detailed(
                         and len(slice_domains) == 1
                         and expected_live_bdfs
                         and all(b in live_chips_by_bdf for b in expected_live_bdfs)
+                        and uses_explicit_chip_map
                     ):
                         slice_live_chips = [live_chips_by_bdf[b] for b in expected_live_bdfs]
                         domain_key = next(iter(slice_domains))
-                        domain_bdfs = sorted(
+                        domain_inv_bdfs = {
                             c.pci_bdf
                             for c in live_pci_inventory
                             if _topology_domain_key(c) == domain_key
+                        }
+                        domain_expected_bdfs = sorted(
+                            domain_inv_bdfs | merged_live_observed.get(domain_key, set())
+                        )
+                        live_group_to_domains: Dict[str, set[Tuple[str, Optional[int], str]]] = {}
+                        for inv_c in live_pci_inventory:
+                            live_group_to_domains.setdefault(inv_c.iommu_group, set()).add(
+                                _topology_domain_key(inv_c)
+                            )
+                        splits_iommu = any(
+                            len(live_group_to_domains.get(c.iommu_group, set())) > 1
+                            for c in slice_live_chips
                         )
                         slice_per_chip_set = {
                             _PCI_FUNCTIONS_PER_PHYSICAL_CHIP.get(c.generation, 1)
@@ -3076,12 +3136,33 @@ def _verify_spec_against_host_detailed(
                         for c in slice_live_chips:
                             if c.generation not in slice_gens_live:
                                 slice_gens_live.append(c.generation)
-                        if (
-                            expected_live_bdfs == domain_bdfs
-                            and len(slice_per_chip_set) == 1
+                        needs_map_pairing = (
+                            len(slice_per_chip_set) == 1
                             and next(iter(slice_per_chip_set)) > 1
                             and not _has_complete_chip_functions(slice_live_chips, live_bdf_to_phys)
-                            and uses_explicit_chip_map
+                        )
+                        live_slice_vis_nomap = _resolve_verified_visibility_ordinals(
+                            slice_live_chips,
+                            live_chips,
+                            live_bdf_to_phys,
+                            chip_id_map=None,
+                            host_pci_inventory=live_pci_inventory,
+                        )
+                        needs_map_noncontig = bool(
+                            live_slice_vis_nomap is not None
+                            and live_slice_vis_nomap[0]
+                            != list(
+                                range(
+                                    live_slice_vis_nomap[0][0],
+                                    live_slice_vis_nomap[0][0] + len(live_slice_vis_nomap[0]),
+                                )
+                            )
+                        )
+                        if (
+                            expected_live_bdfs == domain_expected_bdfs
+                            and not splits_iommu
+                            and len(slice_per_chip_set) == 1
+                            and (needs_map_pairing or needs_map_noncontig)
                         ):
                             per_chip = next(iter(slice_per_chip_set))
                             if len(slice_live_chips) % per_chip == 0:
@@ -3097,17 +3178,44 @@ def _verify_spec_against_host_detailed(
                                         if dom_numa is not None
                                         else f"pcie-{dom_root_token}-{inferred_chips}"
                                     )
-                                    if name == expected_hw_name:
-                                        unpaired_map_match = True
-                                        unpaired_domain_check = (dom_numa, dom_root)
-                                    elif range_match is not None:
+                                    name_matches = name == expected_hw_name
+                                    if not name_matches and range_match is not None:
                                         start_idx, end_idx = (int(p) for p in name.split("-", 1))
-                                        if (
+                                        name_matches = (
                                             end_idx >= start_idx
                                             and (end_idx - start_idx + 1) == inferred_chips
-                                        ):
-                                            unpaired_map_match = True
-                                            unpaired_domain_check = (dom_numa, dom_root)
+                                        )
+                                    chip_count_ok = (
+                                        "freetpu.dev/chip-count" not in ann
+                                        or ann.get("freetpu.dev/chip-count") == str(inferred_chips)
+                                    )
+                                    exp_slice_topo = dict(
+                                        kv.split("=", 1)
+                                        for kv in _build_device_env(
+                                            inferred_chips,
+                                            slice_gens_live,
+                                            single_host_env=True,
+                                            include_bounds_env=True,
+                                            verified_visibility=None,
+                                            omit_visible_env=True,
+                                        )
+                                        if "=" in kv
+                                    )
+                                    topo_env_ok = True
+                                    for env_src in (
+                                        global_edits.get("env") if isinstance(global_edits, dict) else None,
+                                        edits.get("env") if isinstance(edits, dict) else None,
+                                    ):
+                                        if isinstance(env_src, list):
+                                            for entry in env_src:
+                                                if isinstance(entry, str) and "=" in entry:
+                                                    ek, ev = entry.split("=", 1)
+                                                    if ek in ("TPU_CHIPS_PER_HOST_BOUNDS", "TPU_ACCELERATOR_TYPE", "TPU_SKIP_MDS_QUERY"):
+                                                        if ev.strip() != exp_slice_topo.get(ek):
+                                                            topo_env_ok = False
+                                    if name_matches and chip_count_ok and topo_env_ok:
+                                        unpaired_map_match = True
+                                        unpaired_domain_check = (dom_numa, dom_root)
 
                     if (
                         range_width_matches
@@ -3123,8 +3231,9 @@ def _verify_spec_against_host_detailed(
                         check_slice = live_slice_for_bdfs
                     elif unpaired_map_match:
                         unverifiable.append(
-                            f"device {name!r}: multi-function chip pairing cannot be verified without "
-                            "--chip-id-map (underlying VFIO/PCI topology and domain still match live host)"
+                            f"device {name!r}: map-dependent slice topology/pairing cannot be "
+                            "verified without --chip-id-map (underlying VFIO/PCI topology and "
+                            "domain still match live host)"
                         )
                     else:
                         errors.append(
@@ -3241,9 +3350,10 @@ def _verify_spec_against_host_detailed(
                     live_all_complete, live_all_incomplete = _count_complete_chips(
                         live_chips, live_bdf_to_phys
                     )
-                    live_all_supported = _is_supported_all_topology(
+                    live_all_supported_base = _is_supported_all_topology(
                         live_chips, live_bdf_to_phys, live_all_gens
                     )
+                    live_all_supported = live_all_supported_base
                     live_all_vis = _resolve_verified_visibility_ordinals(
                         live_chips,
                         live_chips,
@@ -3261,8 +3371,11 @@ def _verify_spec_against_host_detailed(
                     live_missing_map = bool(
                         chip_id_map and any(b not in live_all_bdfs_set for b in chip_id_map)
                     )
+                    live_all_fully_mapped = bool(
+                        chip_id_map and all(c.pci_bdf in chip_id_map for c in live_chips)
+                    )
                     live_noncontig_sysfs = bool(
-                        chip_id_map is None
+                        not live_all_fully_mapped
                         and live_all_vis is not None
                         and len(live_all_vis[0]) >= 2
                         and live_all_vis[0]
@@ -3328,13 +3441,39 @@ def _verify_spec_against_host_detailed(
                         uses_explicit_chip_map_all = (
                             ann.get("freetpu.dev/chip-id-source") == "chip-id-map"
                         )
+                        base_topo_env = dict(
+                            kv.split("=", 1)
+                            for kv in _build_device_env(
+                                live_all_complete,
+                                live_all_gens,
+                                single_host_env=True,
+                                include_bounds_env=live_all_supported_base,
+                                verified_visibility=None,
+                                omit_visible_env=True,
+                            )
+                            if "=" in kv
+                        )
+                        noncontig_map_only = (
+                            live_noncontig_sysfs
+                            and live_all_supported_base
+                            and not live_missing_obs
+                            and (
+                                "freetpu.dev/chip-count" not in ann
+                                or ann.get("freetpu.dev/chip-count") == str(live_all_complete)
+                            )
+                            and all(
+                                ev == base_topo_env.get(ek)
+                                for ek, ev in all_injected_topo.items()
+                            )
+                        )
                         if (
                             chip_id_map is None
                             and uses_explicit_chip_map_all
-                            and live_all_incomplete > 0
+                            and not live_missing_obs
+                            and (live_all_incomplete > 0 or noncontig_map_only)
                         ):
                             unverifiable.append(
-                                "device 'all': map-dependent multi-function chip pairing/topology "
+                                "device 'all': map-dependent chip pairing/topology "
                                 "cannot be verified without --chip-id-map "
                                 "(underlying VFIO/PCI endpoints still match live host)"
                             )
@@ -3510,13 +3649,8 @@ def reconcile_cdi_spec(
     prior_observed: Dict[Tuple[str, Optional[int], str], set[str]] = {
         k: set(v) for k, v in (observed_domain_bdfs or {}).items()
     }
-    try:
-        if output_path.exists():
-            existing_spec = _load_json_strict_keys(output_path.read_text(encoding="utf-8"))
-            for d_k, bdfs_s in _extract_observed_domain_bdfs_from_spec(existing_spec).items():
-                prior_observed.setdefault(d_k, set()).update(bdfs_s)
-    except Exception:  # noqa: BLE001
-        pass
+    for d_k, bdfs_s in _load_same_boot_observed_domains(output_path).items():
+        prior_observed.setdefault(d_k, set()).update(bdfs_s)
 
     try:
         chips, vfio_container, full_pci_inventory = _discover_tpu_chips_with_inventory(
@@ -3957,6 +4091,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             return 1
 
+        prior_gen_observed: Dict[Tuple[str, Optional[int], str], set[str]] = (
+            _load_same_boot_observed_domains(args.output)
+            if not args.stdout and not args.allow_missing_vfio
+            else {}
+        )
         try:
             chips, vfio_container, full_pci_inventory = _discover_tpu_chips_with_inventory(
                 sysfs_root=args.sysfs_root,
@@ -3964,6 +4103,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 allow_missing_vfio=args.allow_missing_vfio,
                 iommu_dev_path=args.iommu_dev,
                 vfio_mode=args.vfio_mode,
+            )
+            merged_gen_observed = _merge_observed_domain_bdfs(
+                prior_gen_observed, full_pci_inventory
             )
             spec = build_cdi_spec(
                 chips,
@@ -3975,6 +4117,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 chip_id_map=parsed_chip_map,
                 omit_visible_env=args.omit_visible_env,
                 host_pci_inventory=full_pci_inventory,
+                observed_domain_bdfs=merged_gen_observed,
             )
         except Exception as exc:  # noqa: BLE001
             if not args.stdout and not args.allow_missing_vfio:
@@ -3997,6 +4140,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         iommu_dev_path=args.iommu_dev,
                         vfio_mode=args.vfio_mode,
                         chip_id_map=parsed_chip_map,
+                        observed_domain_bdfs=merged_gen_observed,
                     )
                 )
             if errors:

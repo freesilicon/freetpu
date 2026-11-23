@@ -930,7 +930,7 @@ _PY_METRICS_SUBPROCESS_HELPER = (
     "        except Exception:\n"
     "            return None\n"
     "    return None\n"
-    "def _verify_raw_ironwood_duty(usage_rows, dpc, *, per_chip_mode):\n"
+    "def _verify_raw_ironwood_duty(usage_rows, dpc, *, per_chip_mode, require_pigeonhole=False):\n"
     "    resp = _fetch_raw_duty_resp()\n"
     "    if resp is None:\n"
     "        return None\n"
@@ -985,6 +985,8 @@ _PY_METRICS_SUBPROCESS_HELPER = (
     "        )\n"
     "    if not all_raw_ids or all_raw_ids != hbm_ids:\n"
     "        return False\n"
+    "    if require_pigeonhole and len(all_raw_ids) <= 4:\n"
+    "        return False\n"
     "    return (populated_ids, unset_ids)\n"
     "per_chip_fallback = False\n"
     "verified_hbm_ids = set()\n"
@@ -1000,7 +1002,9 @@ _PY_METRICS_SUBPROCESS_HELPER = (
     "elif callable(new_fn):\n"
     "    try:\n"
     "        rows = _invoke(new_fn)\n"
-    "        v_res = _verify_raw_ironwood_duty(rows, 2, per_chip_mode=False)\n"
+    "        v_res = _verify_raw_ironwood_duty(\n"
+    "            rows, 2, per_chip_mode=False, require_pigeonhole=(layout == 'auto')\n"
+    "        )\n"
     "        if isinstance(v_res, tuple):\n"
     "            verified_hbm_ids, unset_hbm_ids = v_res\n"
     "        elif v_res is False:\n"
@@ -1064,6 +1068,7 @@ def _verify_raw_python_per_chip_duty(
     devices_per_chip: int,
     *,
     per_chip_mode: bool = True,
+    require_pigeonhole: bool = False,
     timeout_s: float = 0.5,
 ) -> Union[Tuple[set[int], set[int]], bool, None]:
     """Verify raw `tensorcore.dutycycle` IDs and populated protobuf gauges via upstream
@@ -1162,6 +1167,12 @@ def _verify_raw_python_per_chip_duty(
             {cid * devices_per_chip + off for cid in unset_ids for off in range(devices_per_chip)},
         )
     if not all_raw_ids or all_raw_ids != hbm_ids:
+        return False
+    # On Ironwood (`V7X`, max 4 physical chips per VM) in `auto` layout,
+    # matching ID sets with `<= 4` entries (e.g. `{0,1,2,3}` vs `{0,1,2,3}`)
+    # remain ambiguous between 4 logical cores and 4 physical chips; require
+    # pigeonhole proof (`len(all_raw_ids) > 4`) unless `--grpc-duty-layout=per-core`.
+    if require_pigeonhole and len(all_raw_ids) <= 4:
         return False
     return populated_ids, unset_ids
 
@@ -1322,6 +1333,7 @@ def _query_tpu_info_python_metrics(
                             box["rows"] or [],
                             inferred_dpc,
                             per_chip_mode=False,
+                            require_pigeonhole=(grpc_duty_layout == "auto"),
                             timeout_s=deadline_s,
                         )
                         if isinstance(v_res, tuple):
@@ -2601,13 +2613,12 @@ def _has_complete_utilization(
         return False
     if not all(_row_has_complete_utilization(r) for r in util_rows.values()):
         return False
-    if expected_runtime_ids:
-        complete_ids = {
-            k for k, r in util_rows.items() if _row_has_complete_utilization(r)
-        }
-        if not expected_runtime_ids.issubset(complete_ids):
-            return False
-    elif min_expected_rows > 0 and len(util_rows) < min_expected_rows:
+    complete_ids = {
+        k for k, r in util_rows.items() if _row_has_complete_utilization(r)
+    }
+    if min_expected_rows > 0 and len(complete_ids) < min_expected_rows:
+        return False
+    if expected_runtime_ids and not expected_runtime_ids.issubset(complete_ids):
         return False
     return True
 
@@ -3102,7 +3113,9 @@ def collect_snapshot(
                 (
                     not tpu_info_ok
                     or not _has_complete_utilization(
-                        parsed_rows, expected_runtime_ids=expected_runtime_ids
+                        parsed_rows,
+                        expected_runtime_ids=expected_runtime_ids,
+                        min_expected_rows=len(devices),
                     )
                 )
                 and runtime_metrics_addr
