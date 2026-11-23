@@ -50,7 +50,27 @@ enum class DType : uint8_t {
   kQ8_0 = 3,
   kQ4_0 = 4,
   kQ4_K = 5,
+  kInvalid = 0xff,
 };
+
+// Validate raw uint32_t C ABI dtype without silent narrowing to uint8_t.
+inline DType dtype_from_c(uint32_t raw) {
+  switch (raw) {
+    case OT_DTYPE_BF16: return DType::kBf16;
+    case OT_DTYPE_F32:  return DType::kF32;
+    case OT_DTYPE_INT8: return DType::kInt8;
+    case OT_DTYPE_Q8_0: return DType::kQ8_0;
+    case OT_DTYPE_Q4_0: return DType::kQ4_0;
+    case OT_DTYPE_Q4_K: return DType::kQ4_K;
+    default:            return DType::kInvalid;
+  }
+}
+
+inline bool is_valid_c_quant_mode(uint32_t raw) {
+  return raw == OT_QUANT_NONE || raw == OT_QUANT_PER_TENSOR ||
+         raw == OT_QUANT_PER_CHANNEL || raw == OT_QUANT_BLOCK_32 ||
+         raw == OT_QUANT_BLOCK_256;
+}
 
 struct TileBlockSpec {
   uint32_t block_m = 128u;
@@ -79,6 +99,7 @@ struct TileKernelDescriptor {
   TileBlockSpec block_spec{};
   QuantSpec quant{};
   bool rhs_transposed = false;
+  bool has_invalid_c_field = false;
 
   static TileKernelDescriptor from_c_desc(const ot_freetile_gemm_desc_t& c) {
     TileKernelDescriptor d;
@@ -91,14 +112,19 @@ struct TileKernelDescriptor {
     d.block_spec.vmem_double_buffer = (c.tile.vmem_double_buffer != 0u);
     d.block_spec.k_loop_accum_f32 = (c.tile.k_loop_accum_f32 != 0u);
     d.rhs_transposed = (c.tile.rhs_transposed != 0u);
-    d.lhs_dtype = static_cast<DType>(c.lhs_dtype);
-    d.rhs_dtype = static_cast<DType>(c.rhs_dtype);
-    d.out_dtype = static_cast<DType>(c.out_dtype);
+    d.lhs_dtype = dtype_from_c(c.lhs_dtype);
+    d.rhs_dtype = dtype_from_c(c.rhs_dtype);
+    d.out_dtype = dtype_from_c(c.out_dtype);
     d.op_kind = (d.rhs_dtype == DType::kBf16) ? OpKind::kMatmul : OpKind::kMatmulDequant;
-    d.quant.mode = static_cast<ot_quant_mode_t>(c.quant_mode);
+    const bool qm_ok = is_valid_c_quant_mode(c.quant_mode);
+    d.quant.mode = qm_ok ? static_cast<ot_quant_mode_t>(c.quant_mode)
+                         : static_cast<ot_quant_mode_t>(-1);
     d.quant.group_size = c.quant_group_size;
     d.quant.per_tensor_scale = c.quant_scale;
-    d.quant.scale_dtype = static_cast<DType>(c.scale_dtype);
+    d.quant.scale_dtype = dtype_from_c(c.scale_dtype);
+    d.has_invalid_c_field =
+        !qm_ok || (c.tile.rhs_transposed > 1u) ||
+        (c.struct_size != 0u && c.struct_size != sizeof(ot_freetile_gemm_desc_t));
     return d;
   }
 };
@@ -130,6 +156,10 @@ struct LoweringPlan {
 // Shared descriptor contract validator used by both plan_v5e_tile_gemm() and
 // ot_matmul_bf16_ex() / ot_matmul_quant() so planner and runtime strictly agree.
 inline bool validate_v5e_tile_gemm_desc(const TileKernelDescriptor& desc, std::string* error) {
+  if (desc.has_invalid_c_field) {
+    if (error) *error = "Invalid C descriptor field value";
+    return false;
+  }
   const uint32_t bm = desc.block_spec.block_m;
   const uint32_t bk = desc.block_spec.block_k;
   const uint32_t bn = desc.block_spec.block_n;
@@ -221,6 +251,8 @@ inline LoweringPlan plan_v5e_tile_gemm(const TileKernelDescriptor& desc) {
   // - FP32 accumulators (v48..v63) live in vector registers, not VMEM (acc_vmem_bytes = 0).
   const uint32_t stages = (!is_quant && plan.tiles_k > 1u) ? 2u : 1u;
   plan.desc.block_spec.vmem_double_buffer = (stages == 2u);
+  // Both resident v5e IMEM kernels always accumulate across K tiles in FP32 registers (v48..v63).
+  plan.desc.block_spec.k_loop_accum_f32 = true;
   plan.vmem.stages = stages;
   plan.vmem.lhs_vmem_bytes = bm * bk * 2u;
   size_t rhs_elem_num = 2u;

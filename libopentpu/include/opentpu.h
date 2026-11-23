@@ -157,7 +157,7 @@ typedef struct ot_tile_shape {
   uint32_t block_k;            /* VMEM K tile width (default 128 on v5e) */
   uint32_t block_n;            /* VMEM N tile width (default 128 on v5e) */
   uint8_t  vmem_double_buffer; /* Hint: multi-K BF16 uses 2-stage ping-pong; quant uses 1-stage */
-  uint8_t  k_loop_accum_f32;   /* 1 = accumulate FP32 across K tiles */
+  uint8_t  k_loop_accum_f32;   /* Hint (0 -> default): v5e resident GEMM always accumulates FP32 */
   uint8_t  rhs_transposed;     /* 0 = [K, N], 1 = [N, K] */
   uint8_t  reserved;
 } ot_tile_shape_t;
@@ -173,8 +173,8 @@ typedef struct ot_freetile_gemm_desc {
   uint32_t        out_dtype;        /* enum ot_dtype */
   uint32_t        quant_mode;       /* enum ot_quant_mode */
   uint32_t        quant_group_size; /* 32 (or 0) for BLOCK_32, 0 otherwise */
-  float           quant_scale;      /* Per-tensor scale when rhs_scales is NULL */
-  uint32_t        scale_dtype;      /* Element dtype of rhs_scales: OT_DTYPE_BF16 or OT_DTYPE_F32 */
+  float           quant_scale;      /* Per-tensor scale when rhs_scales is NULL (rounded to BF16 on v5e) */
+  uint32_t        scale_dtype;      /* Element dtype of rhs_scales: OT_DTYPE_BF16 or OT_DTYPE_F32 (rounded to BF16 on v5e MXU scale broadcast) */
   uint32_t        flags;
 } ot_freetile_gemm_desc_t;
 
@@ -215,7 +215,10 @@ ot_status_t ot_matmul_bf16_ex(ot_context_t* ctx,
  *   offset-8 packed 4-bit weights in [K, N] (rhs_transposed == 0) or [N, K]
  *   (rhs_transposed == 1); rhs_scales stores 1 (PER_TENSOR), N (PER_CHANNEL),
  *   or [K/32, N] (BLOCK_32) scales of element type desc->scale_dtype
- *   (OT_DTYPE_BF16 or OT_DTYPE_F32).
+ *   (OT_DTYPE_BF16 or OT_DTYPE_F32). Because the v5e IMEM kernel broadcasts
+ *   block scales through the BF16 MXU before VPU dequantization, OT_DTYPE_F32
+ *   host scales (and scalar quant_scale) are rounded to BF16 prior to weight
+ *   scaling identically in both live hardware and offline mock execution.
  * - Inline block layout (rhs_scales == NULL with Q8_0/Q4_0 + BLOCK_32):
  *   rhs_quant stores interleaved ot_block_q8_0_t or ot_block_q4_0_t records.
  * - OT_DTYPE_Q4_K and OT_QUANT_BLOCK_256 are reserved and return OT_ERR_UNSUPPORTED. */

@@ -1654,15 +1654,17 @@ static void test_freetile_descriptor_and_planner() {
   OT_CHECK(bf16_plan.vmem.total_vmem_bytes == 2u * (32768u + 32768u) + 32768u);
   OT_CHECK(bf16_plan.vmem.total_vmem_bytes <= 16u * 1024u * 1024u);
 
-  // Multi-K BF16 always emits 2-stage ping-pong VMEM even if vmem_double_buffer hint is 0;
+  // Multi-K BF16 always emits 2-stage ping-pong VMEM and FP32 K-accumulation even if hints are 0;
   // single-K BF16 uses only stage 0 (1 stage).
   ot_freetile_gemm_desc_t bf16_hint0 = ot_freetile_gemm_desc_default(128u, 512u, 256u);
   bf16_hint0.tile.vmem_double_buffer = 0u;
+  bf16_hint0.tile.k_loop_accum_f32 = 0u;
   const ot::freetile::LoweringPlan bf16_hint0_plan =
       ot::freetile::plan_v5e_tile_gemm(ot::freetile::TileKernelDescriptor::from_c_desc(bf16_hint0));
   OT_CHECK(bf16_hint0_plan.valid);
   OT_CHECK(bf16_hint0_plan.vmem.stages == 2u);
   OT_CHECK(bf16_hint0_plan.desc.block_spec.vmem_double_buffer);
+  OT_CHECK(bf16_hint0_plan.desc.block_spec.k_loop_accum_f32);
   OT_CHECK(bf16_hint0_plan.vmem.total_vmem_bytes == bf16_plan.vmem.total_vmem_bytes);
 
   const ot_freetile_gemm_desc_t bf16_k1 = ot_freetile_gemm_desc_default(256u, 128u, 256u);
@@ -1775,6 +1777,40 @@ static void test_freetile_descriptor_and_planner() {
   OT_CHECK(!ot::freetile::plan_v5e_tile_gemm(
                 ot::freetile::TileKernelDescriptor::from_c_desc(q8_bad_sd))
                 .valid);
+
+  // High-bit-polluted uint32_t descriptor fields must NOT silently narrow to valid 8-bit enums.
+  {
+    ot_freetile_gemm_desc_t trunc_sd = q8_2c;
+    trunc_sd.scale_dtype = 257u;  // (uint8_t)257 == OT_DTYPE_F32
+    OT_CHECK(!ot::freetile::plan_v5e_tile_gemm(
+                  ot::freetile::TileKernelDescriptor::from_c_desc(trunc_sd))
+                  .valid);
+    ot_freetile_gemm_desc_t trunc_rhs = q8_2c;
+    trunc_rhs.rhs_dtype = 257u;
+    OT_CHECK(!ot::freetile::plan_v5e_tile_gemm(
+                  ot::freetile::TileKernelDescriptor::from_c_desc(trunc_rhs))
+                  .valid);
+    ot_freetile_gemm_desc_t trunc_lhs = q8_2c;
+    trunc_lhs.lhs_dtype = 256u;  // (uint8_t)256 == OT_DTYPE_BF16
+    OT_CHECK(!ot::freetile::plan_v5e_tile_gemm(
+                  ot::freetile::TileKernelDescriptor::from_c_desc(trunc_lhs))
+                  .valid);
+    ot_freetile_gemm_desc_t trunc_qm = q8_2c;
+    trunc_qm.quant_mode = 259u;  // (uint8_t)259 == OT_QUANT_BLOCK_32
+    OT_CHECK(!ot::freetile::plan_v5e_tile_gemm(
+                  ot::freetile::TileKernelDescriptor::from_c_desc(trunc_qm))
+                  .valid);
+  }
+
+  // Quantized planner must also normalize k_loop_accum_f32 to true (matching emitted FP32 accum).
+  {
+    ot_freetile_gemm_desc_t q4_acc0 = q4;
+    q4_acc0.tile.k_loop_accum_f32 = 0u;
+    const ot::freetile::LoweringPlan q4_acc0_plan =
+        ot::freetile::plan_v5e_tile_gemm(ot::freetile::TileKernelDescriptor::from_c_desc(q4_acc0));
+    OT_CHECK(q4_acc0_plan.valid);
+    OT_CHECK(q4_acc0_plan.desc.block_spec.k_loop_accum_f32);
+  }
 
   OT_CHECK(q8_2c_plan.vmem.total_vmem_bytes ==
            32768u + 16384u + 32768u + 32768u + 36864u + 32768u);
@@ -2000,6 +2036,13 @@ static void test_mock_multitile_and_quant_matmul() {
     ot_freetile_gemm_desc_t bad_sd = q8d;
     bad_sd.scale_dtype = OT_DTYPE_INT8;
     OT_CHECK(ot_matmul_quant(ctx, bqa, bqi8, bqsc_big, bqout, &bad_sd, nullptr) ==
+             OT_ERR_INVALID_ARG);
+    bad_sd.scale_dtype = 257u;  // Must reject non-narrowed uint32_t enum value
+    OT_CHECK(ot_matmul_quant(ctx, bqa, bqi8, bqsc_big, bqout, &bad_sd, nullptr) ==
+             OT_ERR_INVALID_ARG);
+    ot_freetile_gemm_desc_t bad_rhs = q8d;
+    bad_rhs.rhs_dtype = 257u;
+    OT_CHECK(ot_matmul_quant(ctx, bqa, bqi8, bqsc_big, bqout, &bad_rhs, nullptr) ==
              OT_ERR_INVALID_ARG);
     ot_buffer_free(bqsc_big);
   }
