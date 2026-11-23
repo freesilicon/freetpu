@@ -210,7 +210,7 @@ public:
                       bool sync);
 
     void clear_exec_cache();
-    bool touch_exec_cache(const std::string& full_key);
+    CachedExecutablePtr get_cached_exec(const std::string& full_key);
     bool has_cached_exec(const std::string& full_key) const;
     CacheStats cache_stats() const;
     uint64_t eviction_epoch() const { return eviction_epoch_.load(std::memory_order_acquire); }

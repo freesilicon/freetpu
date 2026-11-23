@@ -896,7 +896,8 @@ static void upload_raw_tensor_to_slot(cloudtpu::PjrtRuntime& rt,
                                       CloudTpuTensorSlot& slot,
                                       const struct ggml_tensor* tensor,
                                       const void* raw_data,
-                                      bool allow_sharding = true) {
+                                      bool allow_sharding = true,
+                                      const cloudtpu::TensorShardingKind* forced_sharding = nullptr) {
     slot.ggml_dt = tensor->type;
     slot.dims[0] = tensor->ne[3];
     slot.dims[1] = tensor->ne[2];
@@ -907,7 +908,9 @@ static void upload_raw_tensor_to_slot(cloudtpu::PjrtRuntime& rt,
     const int64_t B2 = tensor->ne[2];
     const int64_t N = tensor->ne[1];
     const int64_t K = tensor->ne[0];
-    const cloudtpu::TensorShardingKind sh = choose_upload_sharding(tensor, spmd_chips, spmd_min_rows, allow_sharding);
+    const cloudtpu::TensorShardingKind sh =
+        forced_sharding ? *forced_sharding
+                        : choose_upload_sharding(tensor, spmd_chips, spmd_min_rows, allow_sharding);
     slot.sharding = sh;
 
     const bool is_contig = ggml_is_contiguous(tensor);
@@ -1121,6 +1124,7 @@ static bool patch_view_into_root_slot_locked(cloudtpu::PjrtRuntime& rt,
         CloudTpuTensorSlot& parent = bctx->slots[root_off];
         parent.offset = root_off;
         parent.nbytes = root_bytes;
+        parent.sharding = cloudtpu::TensorShardingKind::REPLICATED;
         parent.hbm_primary.clear();
         parent.hbm_scales.clear();
         parent.hbm_mins.clear();
@@ -1169,6 +1173,8 @@ static bool patch_view_into_root_slot_locked(cloudtpu::PjrtRuntime& rt,
         parent.staging = std::move(tmp);
         parent.staging_dirty = true;
     }
+    // View-patched root slots flush as REPLICATED so subviews never mismatch sharding.
+    parent.sharding = cloudtpu::TensorShardingKind::REPLICATED;
     if (src_data != nullptr) {
         std::memcpy(parent.staging.data() + rel, src_data, size);
     } else {
@@ -1295,6 +1301,7 @@ static void ggml_backend_cloudtpu_buffer_memset_tensor(ggml_backend_buffer_t buf
                 CloudTpuTensorSlot& slot = bctx->slots[t_off];
                 slot.offset = t_off;
                 slot.nbytes = t_bytes;
+                slot.sharding = cloudtpu::TensorShardingKind::REPLICATED;
                 slot.hbm_primary.clear();
                 slot.hbm_scales.clear();
                 slot.hbm_mins.clear();
@@ -1372,6 +1379,8 @@ static void ggml_backend_cloudtpu_buffer_set_tensor(ggml_backend_buffer_t buffer
                 CloudTpuTensorSlot& slot = bctx->slots[t_off];
                 slot.offset = t_off;
                 slot.nbytes = t_bytes;
+                slot.sharding = choose_upload_sharding(
+                    tensor, bctx->spmd_chips, bctx->spmd_min_rows, /*allow_sharding=*/true);
                 slot.hbm_primary.clear();
                 slot.hbm_scales.clear();
                 slot.hbm_mins.clear();
@@ -1388,9 +1397,10 @@ static void ggml_backend_cloudtpu_buffer_set_tensor(ggml_backend_buffer_t buffer
                     CloudTpuTensorSlot next;
                     next.offset = slot_ptr->offset;
                     next.nbytes = slot_ptr->nbytes;
+                    const cloudtpu::TensorShardingKind slot_sh = slot_ptr->sharding;
                     upload_raw_tensor_to_slot(
                         rt, bctx->device_index, bctx->spmd_chips, bctx->spmd_min_rows,
-                        next, tensor, slot_ptr->staging.data(), /*allow_sharding=*/true);
+                        next, tensor, slot_ptr->staging.data(), /*allow_sharding=*/true, &slot_sh);
                     *slot_ptr = std::move(next);
                 } catch (const std::exception& e) {
                     if (!is_compute_buf) {
@@ -1698,7 +1708,9 @@ struct PlanInputBinding {
 };
 
 struct CachedSubgraphPlan {
-    cloudtpu::CachedExecutablePtr exec;
+    // Non-owning key into PjrtRuntime's shared LRU executable cache; dispatch acquires a live
+    // CachedExecutablePtr via rt.get_cached_exec(exec_key) so evicted executables are never retained.
+    std::string exec_key;
     size_t num_emitted_ops = 0;
     std::vector<PlanInputBinding> input_bindings;
     std::vector<cloudtpu::PjrtDType> out_dtypes;
@@ -2169,9 +2181,8 @@ static cloudtpu::TensorShardingKind lookup_tensor_sharding(const struct ggml_ten
     std::lock_guard<std::mutex> lock(bctx->mu);
     auto it = bctx->slots.find(t_off);
     if (it != bctx->slots.end()) {
-        if (it->second.staging_dirty) {
-            return choose_upload_sharding(t, bctx->spmd_chips, bctx->spmd_min_rows, true);
-        }
+        // Slot records its canonical shard layout at staging/upload time so all aliases
+        // (including same-shape zero-offset views) compile and upload with one layout.
         return it->second.sharding;
     }
     if (t->view_src != nullptr && t->view_offs == 0 && ggml_is_contiguous(t)) {
@@ -2274,9 +2285,14 @@ static void resolve_tensor_hbm(cloudtpu::PjrtRuntime& rt,
                 CloudTpuTensorSlot next;
                 next.offset = slot.offset;
                 next.nbytes = slot.nbytes;
+                const cloudtpu::TensorShardingKind slot_sh = slot.sharding;
+                const struct ggml_tensor* upload_t =
+                    (t->view_src != nullptr && t->view_offs == 0 && ggml_is_contiguous(t))
+                        ? unwrap_view_src(t)
+                        : t;
                 upload_raw_tensor_to_slot(
                     rt, bctx->device_index, bctx->spmd_chips, bctx->spmd_min_rows,
-                    next, t, slot.staging.data(), /*allow_sharding=*/true);
+                    next, upload_t, slot.staging.data(), /*allow_sharding=*/true, &slot_sh);
                 slot = std::move(next);
             }
             if (slot.has_hbm() && slot.ggml_dt == t->type &&
@@ -2304,9 +2320,10 @@ static void resolve_tensor_hbm(cloudtpu::PjrtRuntime& rt,
                     CloudTpuTensorSlot next;
                     next.offset = bit->second.offset;
                     next.nbytes = bit->second.nbytes;
+                    const cloudtpu::TensorShardingKind slot_sh = bit->second.sharding;
                     upload_raw_tensor_to_slot(
                         rt, bctx->device_index, bctx->spmd_chips, bctx->spmd_min_rows,
-                        next, base, bit->second.staging.data(), /*allow_sharding=*/true);
+                        next, base, bit->second.staging.data(), /*allow_sharding=*/true, &slot_sh);
                     bit->second = std::move(next);
                 }
                 if (bit->second.has_hbm() && bit->second.ggml_dt == t->type &&
@@ -2833,7 +2850,7 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
         const uint64_t cur_epoch = rt.eviction_epoch();
         if (ctx->plan_cache_epoch != cur_epoch) {
             for (auto it = ctx->plan_cache.begin(); it != ctx->plan_cache.end();) {
-                if (!it->second.exec || !rt.has_cached_exec(it->second.exec->key)) {
+                if (it->second.exec_key.empty() || !rt.has_cached_exec(it->second.exec_key)) {
                     it = ctx->plan_cache.erase(it);
                 } else {
                     ++it;
@@ -3072,10 +3089,12 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
     }
 
     ctx->scratch_key.hash = hash_sig_words(sig);
+    cloudtpu::CachedExecutablePtr exec;
     const CachedSubgraphPlan* plan_ptr = nullptr;
     auto pit = ctx->plan_cache.find(ctx->scratch_key);
     if (pit != ctx->plan_cache.end()) {
-        if (pit->second.exec && rt.touch_exec_cache(pit->second.exec->key)) {
+        exec = rt.get_cached_exec(pit->second.exec_key);
+        if (exec) {
             ctx->plan_hits += 1;
             plan_ptr = &pit->second;
         } else {
@@ -3233,11 +3252,11 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
                           emitted.mlir_text.c_str());
         }
         const cloudtpu::PjrtCompileOptions copts = rt.make_spmd_compile_options(P, ctx->device_index);
-        const cloudtpu::CachedExecutablePtr exec = rt.compile_or_get(
+        exec = rt.compile_or_get(
             emitted.cache_key, emitted.mlir_text, (P > 1) ? 0 : ctx->device_index, copts);
 
         CachedSubgraphPlan new_plan;
-        new_plan.exec = exec;
+        new_plan.exec_key = exec->key;
         new_plan.num_emitted_ops = prog_spec.ops.size();
         new_plan.input_bindings.reserve(emitted.input_bindings.size());
         for (const auto& ib : emitted.input_bindings) {
@@ -3304,7 +3323,7 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
             const auto& vec = (ib.part == 0) ? rp.primary : ((ib.part == 1) ? rp.scales : rp.mins);
             ctx->scratch_raw_inputs.push_back(vec[0]->handle.get());
         }
-        rt.execute(plan.exec,
+        rt.execute(exec,
                    ctx->device_index,
                    ctx->scratch_raw_inputs.data(),
                    ctx->scratch_raw_inputs.size(),
@@ -3342,7 +3361,7 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
             }
             ctx->scratch_spmd_input_ptrs[d] = row.data();
         }
-        rt.execute_spmd(plan.exec,
+        rt.execute_spmd(exec,
                         P,
                         ctx->scratch_spmd_input_ptrs.data(),
                         plan.input_bindings.size(),
@@ -3412,19 +3431,20 @@ static enum ggml_status ggml_backend_cloudtpu_graph_compute(ggml_backend_t backe
                                                             struct ggml_cgraph* cgraph) {
     auto* ctx = static_cast<ggml_backend_cloudtpu_context*>(backend->context);
     ctx->total_graph_evals += 1;
-    compute_cgraph_liveness(ctx, cgraph);
-
-    int last_exec_idx = -1;
-    for (int k = cgraph->n_nodes - 1; k >= 0; --k) {
-        if (!is_skipped_graph_node(cgraph->nodes[k])) {
-            last_exec_idx = k;
-            break;
-        }
-    }
 
     const int max_fuse = std::max(1, ctx->env.max_fuse_ops);
     int i = 0;
     try {
+        compute_cgraph_liveness(ctx, cgraph);
+
+        int last_exec_idx = -1;
+        for (int k = cgraph->n_nodes - 1; k >= 0; --k) {
+            if (!is_skipped_graph_node(cgraph->nodes[k])) {
+                last_exec_idx = k;
+                break;
+            }
+        }
+
         cloudtpu::PjrtRuntime& rt = ensure_runtime_initialized();
         while (i < cgraph->n_nodes) {
             if (is_skipped_graph_node(cgraph->nodes[i])) {
