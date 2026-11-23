@@ -88,6 +88,16 @@ class RouterMetrics:
         self._estimated_cost_usd_total: Dict[Tuple[str, str], float] = defaultdict(float)
         self._ttft_histograms: Dict[Tuple[str, str], _HistogramSeries] = {}
         self._latency_histograms: Dict[Tuple[str, str], _HistogramSeries] = {}
+        self._usage_meter_errors_total: int = 0
+
+    def record_usage_meter_error(self) -> int:
+        with self._lock:
+            self._usage_meter_errors_total += 1
+            return self._usage_meter_errors_total
+
+    def usage_meter_errors_total(self) -> int:
+        with self._lock:
+            return self._usage_meter_errors_total
 
     def inc_inflight(self, backend_id: str) -> int:
         with self._lock:
@@ -221,6 +231,7 @@ class RouterMetrics:
             ]
             ttft_copy = dict(self._ttft_histograms)
             lat_copy = dict(self._latency_histograms)
+            usage_meter_errors = self._usage_meter_errors_total
 
         backend_list = list(backend_snapshots)
         for snap in backend_list:
@@ -270,6 +281,12 @@ class RouterMetrics:
             "Estimated cumulative inference cost in USD per model and backend.",
             "counter",
             cost_samples,
+        )
+        emit_simple(
+            "freetpu_router_usage_meter_errors_total",
+            "Total errors encountered while persisting usage metering records.",
+            "counter",
+            [({}, str(usage_meter_errors))],
         )
         emit_histogram(
             "freetpu_router_ttft_seconds",

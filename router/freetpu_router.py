@@ -1160,6 +1160,9 @@ class RouterEngine:
         self._poller_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._poll_thread: Optional[threading.Thread] = None
+        self._usage_err_log_lock = threading.Lock()
+        self._usage_err_last_log_monotonic: Optional[float] = None
+        self._usage_err_suppressed = 0
 
     def start_background_poller(self) -> None:
         with self._poller_lock:
@@ -1631,14 +1634,16 @@ class RouterEngine:
         data = [models_map[k] for k in sorted(models_map.keys())]
         return {"object": "list", "data": data}
 
-    def health_payload(self) -> Tuple[int, Dict[str, Any]]:
+    def health_payload(self, *, detailed: bool = True) -> Tuple[int, Dict[str, Any]]:
         now_m = time.monotonic()
         with self._lock:
             snaps = [b.snapshot(now_m) for b in self._backends]
         healthy_count = sum(1 for s in snaps if s["enabled"] and s["healthy"])
-        enabled_count = sum(1 for s in snaps if s["enabled"])
         status_str = "ok" if healthy_count > 0 else "degraded"
         http_code = 200 if healthy_count > 0 else 503
+        if not detailed:
+            return http_code, {"status": status_str}
+        enabled_count = sum(1 for s in snaps if s["enabled"])
         payload = {
             "status": status_str,
             "version": __version__,
@@ -1676,6 +1681,37 @@ class RouterEngine:
             self.scaler_hook.on_queue_pressure(event)
         except Exception:
             pass
+
+    def _on_usage_hook_error(self, exc: Exception) -> None:
+        total_errors = self.metrics.record_usage_meter_error()
+        if isinstance(self.usage_hook, JsonlUsageMeterHook):
+            # JsonlUsageMeterHook already emitted its own rate-limited stderr warning.
+            return
+        now = time.monotonic()
+        with self._usage_err_log_lock:
+            if (
+                self._usage_err_last_log_monotonic is None
+                or (now - self._usage_err_last_log_monotonic) >= 30.0
+            ):
+                suppressed = self._usage_err_suppressed
+                self._usage_err_suppressed = 0
+                self._usage_err_last_log_monotonic = now
+                suffix = (
+                    f" ({suppressed} suppressed since last warning)"
+                    if suppressed > 0
+                    else ""
+                )
+                try:
+                    print(
+                        f"[freetpu-router] WARNING: usage meter hook failed: "
+                        f"{type(exc).__name__}: {exc} "
+                        f"(total_usage_meter_errors={total_errors}){suffix}",
+                        file=sys.stderr,
+                    )
+                except OSError:
+                    pass
+            else:
+                self._usage_err_suppressed += 1
 
     def _record_usage(
         self,
@@ -1720,8 +1756,8 @@ class RouterEngine:
         )
         try:
             self.usage_hook.record_usage(event)
-        except Exception:
-            pass
+        except Exception as exc:
+            self._on_usage_hook_error(exc)
 
     def _record_terminal_failure(
         self,
@@ -1763,8 +1799,8 @@ class RouterEngine:
         )
         try:
             self.usage_hook.record_usage(event)
-        except Exception:
-            pass
+        except Exception as exc:
+            self._on_usage_hook_error(exc)
 
 
 def _openai_error_body(
@@ -3016,7 +3052,8 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/health":
-            code, payload = self.server.engine.health_payload()
+            detailed = ctx.metadata.get("authenticated", True) is not False
+            code, payload = self.server.engine.health_payload(detailed=detailed)
             self._send_json(code, payload)
             return
 

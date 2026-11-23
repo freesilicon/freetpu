@@ -14,6 +14,7 @@ import hmac
 import importlib
 import json
 from pathlib import Path
+import sys
 import threading
 import time
 from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence
@@ -86,8 +87,31 @@ class BearerTokenAuthHook(AuthHook):
         path: str,
         method: str,
     ) -> AuthContext:
+        auth_header = ""
+        for k, v in headers.items():
+            if k.lower() == "authorization":
+                auth_header = v.strip()
+                break
+
+        if self._token_principals and auth_header.lower().startswith("bearer "):
+            presented = auth_header[7:].strip()
+            matched_principal: Optional[str] = None
+            for token, principal in self._token_principals.items():
+                if hmac.compare_digest(presented.encode("utf-8"), token.encode("utf-8")):
+                    matched_principal = principal
+            if matched_principal is not None:
+                return AuthContext(
+                    authorized=True,
+                    principal=matched_principal,
+                    metadata={"authenticated": True},
+                )
+
         if path in self._exempt_paths:
-            return AuthContext(authorized=True, principal="health-probe")
+            return AuthContext(
+                authorized=True,
+                principal="health-probe",
+                metadata={"authenticated": False, "exempt_path": True},
+            )
 
         if not self._token_principals:
             return AuthContext(
@@ -96,12 +120,6 @@ class BearerTokenAuthHook(AuthHook):
                 status_code=401,
             )
 
-        auth_header = ""
-        for k, v in headers.items():
-            if k.lower() == "authorization":
-                auth_header = v.strip()
-                break
-
         if not auth_header.lower().startswith("bearer "):
             return AuthContext(
                 authorized=False,
@@ -109,20 +127,11 @@ class BearerTokenAuthHook(AuthHook):
                 status_code=401,
             )
 
-        presented = auth_header[7:].strip()
-        matched_principal: Optional[str] = None
-        for token, principal in self._token_principals.items():
-            if hmac.compare_digest(presented.encode("utf-8"), token.encode("utf-8")):
-                matched_principal = principal
-
-        if matched_principal is None:
-            return AuthContext(
-                authorized=False,
-                error_message="Invalid bearer token",
-                status_code=401,
-            )
-
-        return AuthContext(authorized=True, principal=matched_principal)
+        return AuthContext(
+            authorized=False,
+            error_message="Invalid bearer token",
+            status_code=401,
+        )
 
 
 @dataclass
@@ -180,19 +189,59 @@ class JsonlUsageMeterHook(UsageMeterHook):
         path: Path | str,
         *,
         callback: Optional[Callable[[UsageEvent], None]] = None,
+        error_log_interval_s: float = 30.0,
+        error_stream: Optional[Any] = None,
     ) -> None:
         self.path = Path(path)
         self._callback = callback
         self._lock = threading.Lock()
         self.events_written: int = 0
+        self.write_errors: int = 0
+        self._error_log_interval_s = max(0.0, float(error_log_interval_s))
+        self._error_stream = error_stream
+        self._last_error_log_monotonic: Optional[float] = None
+        self._suppressed_errors: int = 0
 
     def record_usage(self, event: UsageEvent) -> None:
         line = json.dumps(event.to_dict(), sort_keys=True) + "\n"
         with self._lock:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("a", encoding="utf-8") as fh:
-                fh.write(line)
-            self.events_written += 1
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                with self.path.open("a", encoding="utf-8") as fh:
+                    fh.write(line)
+                self.events_written += 1
+            except OSError as exc:
+                self.write_errors += 1
+                now = time.monotonic()
+                if (
+                    self._last_error_log_monotonic is None
+                    or (now - self._last_error_log_monotonic) >= self._error_log_interval_s
+                ):
+                    suppressed = self._suppressed_errors
+                    self._suppressed_errors = 0
+                    self._last_error_log_monotonic = now
+                    stream = (
+                        self._error_stream
+                        if self._error_stream is not None
+                        else sys.stderr
+                    )
+                    suffix = (
+                        f" ({suppressed} suppressed since last warning)"
+                        if suppressed > 0
+                        else ""
+                    )
+                    try:
+                        print(
+                            f"[freetpu-router] WARNING: failed to append JSONL usage record to "
+                            f"{self.path}: {type(exc).__name__}: {exc} "
+                            f"(total_write_errors={self.write_errors}){suffix}",
+                            file=stream,
+                        )
+                    except OSError:
+                        pass
+                else:
+                    self._suppressed_errors += 1
+                raise
         if self._callback is not None:
             self._callback(event)
 

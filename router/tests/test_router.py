@@ -8721,6 +8721,158 @@ asyncio.run(main())
         self.assertAlmostEqual(telem.avg_duty_cycle_percent or 0.0, 70.0)
         self.assertAlmostEqual(telem.max_duty_cycle_percent or 0.0, 80.0)
 
+    def test_jsonl_usage_write_failures_increment_counters_and_rate_limit_warnings(
+        self,
+    ) -> None:
+        backend = self._track(_MockOpenAIBackend("meter-err-b", ["m-meter"]))
+        # Pointing JSONL path at an existing directory deterministically triggers
+        # OSError (IsADirectoryError) even when tests run as root in CI containers.
+        bad_jsonl_dir = Path(self._tmpdir.name) / "not_a_file_dir"
+        bad_jsonl_dir.mkdir(exist_ok=True)
+        err_stream = io.StringIO()
+        usage_hook = JsonlUsageMeterHook(
+            bad_jsonl_dir,
+            error_log_interval_s=60.0,
+            error_stream=err_stream,
+        )
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            backends=[
+                BackendConfig(
+                    id="meter-err-b",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=backend.base_url,
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg, usage_hook=usage_hook))
+        rport = router.server_address[1]
+
+        for idx in range(3):
+            st, _, _ = _http_request(
+                rport,
+                "POST",
+                "/v1/chat/completions",
+                body={
+                    "model": "m-meter",
+                    "messages": [{"role": "user", "content": f"req-{idx}"}],
+                },
+            )
+            self.assertEqual(st, 200)
+
+        self.assertEqual(usage_hook.events_written, 0)
+        self.assertEqual(usage_hook.write_errors, 3)
+        self.assertEqual(router.engine.metrics.usage_meter_errors_total(), 3)
+
+        st_m, _, mbody = _http_request(rport, "GET", "/metrics")
+        self.assertEqual(st_m, 200)
+        self.assertIn("freetpu_router_usage_meter_errors_total 3", mbody.decode("utf-8"))
+
+        # Rate-limited: 3 rapid failures emit only 1 warning line.
+        warn_lines = [ln for ln in err_stream.getvalue().splitlines() if ln.strip()]
+        self.assertEqual(len(warn_lines), 1)
+        self.assertIn("total_write_errors=1", warn_lines[0])
+
+        # Simulate interval expiry and trigger a 4th failure -> emits 2nd warning with suppressed count.
+        usage_hook._last_error_log_monotonic = time.monotonic() - 120.0
+        st4, _, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-meter",
+                "messages": [{"role": "user", "content": "req-3"}],
+            },
+        )
+        self.assertEqual(st4, 200)
+        self.assertEqual(usage_hook.write_errors, 4)
+        self.assertEqual(router.engine.metrics.usage_meter_errors_total(), 4)
+        warn_lines_after = [ln for ln in err_stream.getvalue().splitlines() if ln.strip()]
+        self.assertEqual(len(warn_lines_after), 2)
+        self.assertIn("total_write_errors=4", warn_lines_after[1])
+        self.assertIn("2 suppressed", warn_lines_after[1])
+
+    def test_bearer_auth_health_returns_minimal_unauthenticated_and_detailed_authenticated(
+        self,
+    ) -> None:
+        backend = self._track(_MockOpenAIBackend("secret-tpu-b", ["m-secret-model"]))
+        exporter = self._track(_MockTpuExporter(health_status=1, generation="v6e"))
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            auth={"type": "bearer", "tokens": ["health-secret-tok"]},
+            backends=[
+                BackendConfig(
+                    id="secret-tpu-b",
+                    type="cloud-tpu-v6e",
+                    base_url=backend.base_url,
+                    tpu_exporter_url=exporter.metrics_url,
+                    metadata={"rack": "us-west-private-rack"},
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        # 1. Unauthenticated /health returns status-only payload with zero backend metadata.
+        st_unauth, _, bd_unauth = _http_request(rport, "GET", "/health")
+        self.assertEqual(st_unauth, 200)
+        self.assertEqual(json.loads(bd_unauth), {"status": "ok"})
+        text_unauth = bd_unauth.decode("utf-8")
+        self.assertNotIn("secret-tpu-b", text_unauth)
+        self.assertNotIn("m-secret-model", text_unauth)
+        self.assertNotIn("us-west-private-rack", text_unauth)
+        self.assertNotIn(backend.base_url, text_unauth)
+
+        # 2. Invalid bearer token on exempt /health still returns only minimal status.
+        st_bad, _, bd_bad = _http_request(
+            rport,
+            "GET",
+            "/health",
+            headers={"Authorization": "Bearer wrong-token"},
+        )
+        self.assertEqual(st_bad, 200)
+        self.assertEqual(json.loads(bd_bad), {"status": "ok"})
+
+        # 3. Valid bearer token on /health returns full backend details, URL, models, and TPU telemetry.
+        st_auth, _, bd_auth = _http_request(
+            rport,
+            "GET",
+            "/health",
+            headers={"Authorization": "Bearer health-secret-tok"},
+        )
+        self.assertEqual(st_auth, 200)
+        parsed_auth = json.loads(bd_auth)
+        self.assertEqual(parsed_auth["status"], "ok")
+        self.assertEqual(parsed_auth["healthy_backends"], 1)
+        self.assertEqual(len(parsed_auth["backends"]), 1)
+        snap = parsed_auth["backends"][0]
+        self.assertEqual(snap["id"], "secret-tpu-b")
+        self.assertEqual(snap["metadata"], {"rack": "us-west-private-rack"})
+        self.assertIn("m-secret-model", snap["models"])
+        self.assertIsNotNone(snap["tpu_telemetry"])
+
+        # 4. Degraded state returns 503 minimal status unauthenticated and 503 full details authenticated.
+        exporter.health_status = 0
+        router.engine.refresh_all_backends()
+        st_deg_unauth, _, bd_deg_unauth = _http_request(rport, "GET", "/health")
+        self.assertEqual(st_deg_unauth, 503)
+        self.assertEqual(json.loads(bd_deg_unauth), {"status": "degraded"})
+
+        st_deg_auth, _, bd_deg_auth = _http_request(
+            rport,
+            "GET",
+            "/health",
+            headers={"Authorization": "Bearer health-secret-tok"},
+        )
+        self.assertEqual(st_deg_auth, 503)
+        parsed_deg = json.loads(bd_deg_auth)
+        self.assertEqual(parsed_deg["status"], "degraded")
+        self.assertEqual(parsed_deg["healthy_backends"], 0)
+        self.assertEqual(len(parsed_deg["backends"]), 1)
+
 
 def run_self_tests(verbosity: int = 1) -> int:
     """Run all router tests cleanly via unittest."""
