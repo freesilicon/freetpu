@@ -2871,6 +2871,10 @@ class _SSEReactor:
     def is_failed(self) -> bool:
         return self._failed
 
+    @property
+    def is_closed(self) -> bool:
+        return self._closed
+
     def start(self) -> None:
         with self._start_lock:
             if self._thread is not None and self._thread.is_alive():
@@ -3549,6 +3553,7 @@ class FreeTPURouterServer(ThreadingHTTPServer):
         self._conn_semaphore = threading.BoundedSemaphore(
             self.effective_max_concurrent_connections
         )
+        self._reactor_lock = threading.Lock()
         self.sse_reactor = _SSEReactor()
         super().__init__((clean_host, server_address[1]), _RouterRequestHandler)
 
@@ -3581,15 +3586,21 @@ class FreeTPURouterServer(ThreadingHTTPServer):
 
     def serve_forever(self, poll_interval: float = 0.5) -> None:
         self.engine.start_background_poller()
-        self.sse_reactor.start()
+        with self._reactor_lock:
+            if self.sse_reactor.is_closed or self.sse_reactor.is_failed:
+                self.sse_reactor = _SSEReactor()
+            reactor = self.sse_reactor
+        reactor.start()
         try:
             super().serve_forever(poll_interval=poll_interval)
         finally:
-            self.sse_reactor.stop()
+            reactor.stop()
             self.engine.stop_background_poller()
 
     def server_close(self) -> None:
-        self.sse_reactor.stop()
+        with self._reactor_lock:
+            reactor = self.sse_reactor
+        reactor.stop()
         self.engine.stop_background_poller()
         super().server_close()
 
@@ -6034,6 +6045,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                     not phase2_eof
                     and reactor is not None
                     and not reactor.is_failed
+                    and not reactor.is_closed
                     and isinstance(raw_tcp_sock, socket.socket)
                     and not isinstance(raw_tcp_sock, ssl.SSLSocket)
                     and isinstance(self.connection, socket.socket)

@@ -3418,7 +3418,8 @@ class TestFreeTPURouter(unittest.TestCase):
         # Cost: 30 * 1.0 / 1e6 + 12 * 2.0 / 1e6 = 0.000054
         self.assertAlmostEqual(captured[0].estimated_cost_usd, 0.000054, places=8)
 
-        # Explicit OpenAI usage chunk overrides earlier timings and is not overwritten later.
+        # Explicit OpenAI usage chunk overrides earlier timings and is NOT overwritten
+        # by later timings frames arriving after usage.
         worker.custom_sse_chunks = timings_chunks + [
             {
                 "id": "chatcmpl-timings",
@@ -3426,7 +3427,14 @@ class TestFreeTPURouter(unittest.TestCase):
                 "model": "m-timings",
                 "choices": [],
                 "usage": {"prompt_tokens": 30, "completion_tokens": 15},
-            }
+            },
+            {
+                "id": "chatcmpl-timings",
+                "object": "chat.completion.chunk",
+                "model": "m-timings",
+                "choices": [],
+                "timings": {"prompt_n": 99, "predicted_n": 99},
+            },
         ]
         status, _, _ = _http_request(
             rport,
@@ -3440,7 +3448,10 @@ class TestFreeTPURouter(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(len(captured), 2)
+        self.assertEqual(captured[1].prompt_tokens, 30)
         self.assertEqual(captured[1].completion_tokens, 15)
+        # Cost: 30 * 1.0 / 1e6 + 15 * 2.0 / 1e6 = 0.000060
+        self.assertAlmostEqual(captured[1].estimated_cost_usd, 0.000060, places=8)
 
     def test_long_prompt_progress_stream_beyond_64_events_succeeds(self) -> None:
         primary = self._track(_MockOpenAIBackend("llama-progress", ["m-prog"]))
@@ -10569,7 +10580,7 @@ asyncio.run(main())
             host="127.0.0.1",
             port=0,
             cors_allowed_origins=[
-                "https://App.Example:443/",
+                "https://App.Example:443",
                 "http://plain.example:80",
                 "https://[::1]:443",
                 "https://custom.example:8443",
@@ -13776,6 +13787,7 @@ asyncio.run(main())
         listener.listen(4)
         port = listener.getsockname()[1]
         stop_evt = threading.Event()
+        release_conn = threading.Event()
 
         def _serve() -> None:
             listener.settimeout(0.2)
@@ -13798,8 +13810,8 @@ asyncio.run(main())
                             b"\r\n"
                             + chunked_wire
                         )
-                        # Keep socket open briefly to verify chunked terminator ends read without timeout.
-                        time.sleep(0.3)
+                        # Keep socket open until the scraper returns on the terminal 0-chunk.
+                        release_conn.wait(timeout=5.0)
                     else:
                         conn.sendall(
                             b"HTTP/1.1 200 OK\r\n"
@@ -13824,6 +13836,7 @@ asyncio.run(main())
                 f"http://127.0.0.1:{port}/metrics",
                 timeout_s=1.0,
             )
+            release_conn.set()
             self.assertTrue(telem.reachable, msg=f"unexpected error: {telem.error}")
             self.assertTrue(telem.exporter_up)
             self.assertEqual(telem.healthy_chips, 1)
@@ -13838,6 +13851,7 @@ asyncio.run(main())
             self.assertFalse(telem_bad.reachable)
             self.assertFalse(evaluate_tpu_readiness(telem_bad)[0])
         finally:
+            release_conn.set()
             stop_evt.set()
             listener.close()
             thread.join(timeout=2.0)
@@ -14848,6 +14862,112 @@ asyncio.run(main())
             allow_exporter.set()
             exp_srv.shutdown()
             exp_srv.server_close()
+
+    def test_server_restart_restores_sse_reactor_streaming(self) -> None:
+        backend = self._track(_MockOpenAIBackend("restart-sse-b", ["m-restart"]))
+        backend.custom_sse_chunks = [
+            {"choices": [{"index": 0, "delta": {"content": "chunk-one "}}]},
+            {"choices": [{"index": 0, "delta": {"content": "chunk-two"}, "finish_reason": "stop"}]},
+        ]
+        backend.stream_chunk_delay_s = 0.02
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            backends=[
+                BackendConfig(
+                    id="restart-sse-b",
+                    base_url=backend.base_url,
+                    models=["m-restart"],
+                )
+            ],
+        )
+        router = create_router_server(cfg)
+        rport = router.server_address[1]
+        t1 = threading.Thread(target=router.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+        t1.start()
+        try:
+            st1, _, bd1 = _http_request(
+                rport,
+                "POST",
+                "/v1/chat/completions",
+                body={
+                    "model": "m-restart",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "first"}],
+                },
+            )
+            self.assertEqual(st1, 200)
+            self.assertIn(b"chunk-one ", bd1)
+            self.assertIn(b"chunk-two", bd1)
+            self.assertIn(b"[DONE]", bd1)
+
+            # Shut down the server (stops SSE reactor), then restart serve_forever() on the same instance.
+            router.shutdown()
+            t1.join(timeout=2.0)
+            self.assertTrue(router.sse_reactor.is_closed)
+
+            t2 = threading.Thread(target=router.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+            t2.start()
+            try:
+                st2, _, bd2 = _http_request(
+                    rport,
+                    "POST",
+                    "/v1/chat/completions",
+                    body={
+                        "model": "m-restart",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "second"}],
+                    },
+                )
+                self.assertEqual(st2, 200)
+                self.assertIn(b"chunk-one ", bd2)
+                self.assertIn(b"chunk-two", bd2)
+                self.assertIn(b"[DONE]", bd2)
+                self.assertFalse(router.sse_reactor.is_closed)
+            finally:
+                router.shutdown()
+                t2.join(timeout=2.0)
+        finally:
+            router.server_close()
+
+    def test_cors_allowed_origins_rejects_paths_trailing_slash_queries_and_credentials(
+        self,
+    ) -> None:
+        base_backend = BackendConfig(
+            id="cors-check-b",
+            base_url="http://127.0.0.1:8000",
+            models=["m1"],
+        )
+        ok_cfg = RouterConfig(
+            host="127.0.0.1",
+            port=8080,
+            cors_allowed_origins=["https://app.example", "http://localhost:3000", "*"],
+            backends=[base_backend],
+        )
+        ok_cfg.validate()
+        self.assertEqual(
+            ok_cfg.cors_allowed_origins,
+            ["https://app.example", "http://localhost:3000", "*"],
+        )
+
+        invalid_entries = (
+            "https://app.example/chat",
+            "https://app.example/",
+            "https://app.example?x=1",
+            "https://app.example#frag",
+            "https://user:secret@app.example",
+            "ftp://app.example",
+        )
+        for bad_origin in invalid_entries:
+            with self.subTest(bad_origin=bad_origin):
+                with self.assertRaises(ValueError) as ctx:
+                    RouterConfig(
+                        host="127.0.0.1",
+                        port=8080,
+                        cors_allowed_origins=[bad_origin],
+                        backends=[base_backend],
+                    )
+                self.assertNotIn("secret", str(ctx.exception))
 
 
 def run_self_tests(verbosity: int = 1) -> int:

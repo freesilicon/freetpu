@@ -178,7 +178,7 @@ def normalize_origin(origin: str) -> Optional[tuple[str, str, int]]:
         return None
     if parts.username is not None or parts.password is not None or "@" in parts.netloc:
         return None
-    if parts.path not in ("", "/") or parts.query or parts.fragment:
+    if parts.path != "" or parts.query or parts.fragment or "?" in cleaned or "#" in cleaned:
         return None
     host = (parts.hostname or "").lower()
     if not host:
@@ -755,7 +755,11 @@ class RouterConfig:
                 )
                 normalized_origins.append(canonical)
             else:
-                normalized_origins.append(origin.rstrip("/"))
+                raise ValueError(
+                    f"Invalid cors_allowed_origins entry {sanitize_url(origin)!r}: "
+                    "expected '*' or a strict origin like 'https://app.example' "
+                    "with no path, query, fragment, or credentials"
+                )
         self.cors_allowed_origins = normalized_origins
 
         if not isinstance(self.auth, Mapping):
