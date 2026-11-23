@@ -13,6 +13,25 @@
 
 namespace {
 
+std::string mapped_basename(const std::string& maps_line) {
+  // /proc/self/maps format: addr perms offset dev inode [pathname]
+  size_t pos = 0;
+  for (int field = 0; field < 5; ++field) {
+    while (pos < maps_line.size() && maps_line[pos] == ' ') ++pos;
+    while (pos < maps_line.size() && maps_line[pos] != ' ') ++pos;
+  }
+  while (pos < maps_line.size() && maps_line[pos] == ' ') ++pos;
+  if (pos >= maps_line.size()) return "";
+  std::string path = maps_line.substr(pos);
+  const std::string deleted_suffix = " (deleted)";
+  if (path.size() >= deleted_suffix.size() &&
+      path.compare(path.size() - deleted_suffix.size(), deleted_suffix.size(), deleted_suffix) == 0) {
+    path.erase(path.size() - deleted_suffix.size());
+  }
+  size_t slash = path.rfind('/');
+  return (slash == std::string::npos) ? path : path.substr(slash + 1);
+}
+
 bool check_maps() {
   std::ifstream ifs("/proc/self/maps");
   if (!ifs.is_open()) {
@@ -23,8 +42,9 @@ bool check_maps() {
   int libtpu_cnt = 0;
   int libpython_cnt = 0;
   while (std::getline(ifs, line)) {
-    if (line.find("libtpu") != std::string::npos) libtpu_cnt++;
-    if (line.find("libpython") != std::string::npos) libpython_cnt++;
+    std::string base = mapped_basename(line);
+    if (base.compare(0, 6, "libtpu") == 0) libtpu_cnt++;
+    if (base.compare(0, 9, "libpython") == 0) libpython_cnt++;
   }
   printf("MAPS_LIBTPU=%d MAPS_LIBPYTHON=%d\n", libtpu_cnt, libpython_cnt);
   if (libtpu_cnt > 0 || libpython_cnt > 0) {

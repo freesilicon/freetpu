@@ -112,8 +112,18 @@ void check_proc_maps() {
   int libtpu_cnt = 0;
   int libpython_cnt = 0;
   while (std::getline(ifs, line)) {
-    if (line.find("libtpu") != std::string::npos) libtpu_cnt++;
-    if (line.find("libpython") != std::string::npos) libpython_cnt++;
+    size_t pos = 0;
+    for (int field = 0; field < 5; ++field) {
+      while (pos < line.size() && line[pos] == ' ') ++pos;
+      while (pos < line.size() && line[pos] != ' ') ++pos;
+    }
+    while (pos < line.size() && line[pos] == ' ') ++pos;
+    if (pos >= line.size()) continue;
+    std::string path = line.substr(pos);
+    size_t slash = path.rfind('/');
+    std::string base = (slash == std::string::npos) ? path : path.substr(slash + 1);
+    if (base.compare(0, 6, "libtpu") == 0) libtpu_cnt++;
+    if (base.compare(0, 9, "libpython") == 0) libpython_cnt++;
   }
   printf("MAPS_LIBTPU=%d MAPS_LIBPYTHON=%d\n", libtpu_cnt, libpython_cnt);
 }

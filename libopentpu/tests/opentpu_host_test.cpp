@@ -314,6 +314,8 @@ static void test_pjrt_api_mock() {
     const char opt_da_dev1[] = {0x1a, 0x0a, 0x4a, 0x08, 0x08, 0x01, 0x10, 0x01, 0x1a, 0x02, 0x08, 0x01};
     // field 2 (parameter_is_tupled_arguments=1)
     const char opt_tupled[] = {0x10, 0x01};
+    // field 4 (compile_portable_executable=1)
+    const char opt_portable[] = {0x20, 0x01};
     // malformed truncated varint
     const char opt_bad[] = {static_cast<char>(0x80)};
     auto expect_compile_fail = [&](const char* opts, size_t sz, PJRT_Error_Code want) {
@@ -336,6 +338,7 @@ static void test_pjrt_api_mock() {
     expect_compile_fail(opt_res_layout, sizeof(opt_res_layout), PJRT_Error_Code_UNIMPLEMENTED);
     expect_compile_fail(opt_da_dev1, sizeof(opt_da_dev1), PJRT_Error_Code_UNIMPLEMENTED);
     expect_compile_fail(opt_tupled, sizeof(opt_tupled), PJRT_Error_Code_UNIMPLEMENTED);
+    expect_compile_fail(opt_portable, sizeof(opt_portable), PJRT_Error_Code_UNIMPLEMENTED);
     expect_compile_fail(opt_bad, sizeof(opt_bad), PJRT_Error_Code_INVALID_ARGUMENT);
   }
 
@@ -717,6 +720,24 @@ static void test_pjrt_api_mock() {
     OT_CHECK(dm2.memory->vtable->get_user_data(dm2.memory, &key_a) == &val_a);
     // Re-attach destructor and verify PJRT_Client_Destroy invokes it.
     dm2.memory->vtable->set_user_data(dm2.memory, &key_a, &g_mem_dtor_calls, inc_dtor);
+
+    // Executing client 1's executable with execute_device from client 2 must fail.
+    PJRT_Buffer* dummy_in[2] = {fdev.buffer, fdev.buffer};
+    PJRT_Buffer** dummy_in_lists[1] = {dummy_in};
+    PJRT_Buffer* dummy_out[1] = {nullptr};
+    PJRT_Buffer** dummy_out_lists[1] = {dummy_out};
+    PJRT_LoadedExecutable_Execute_Args bad_ex = {};
+    bad_ex.struct_size = PJRT_LoadedExecutable_Execute_Args_STRUCT_SIZE;
+    bad_ex.executable = ca.executable;
+    bad_ex.num_devices = 1;
+    bad_ex.num_args = 2;
+    bad_ex.argument_lists = dummy_in_lists;
+    bad_ex.output_lists = dummy_out_lists;
+    bad_ex.execute_device = ad2.addressable_devices[0];
+    PJRT_Error* ex_dev_err = api->PJRT_LoadedExecutable_Execute(&bad_ex);
+    OT_CHECK(ex_dev_err != nullptr);
+    destroy_pjrt_error(api, ex_dev_err);
+
     OT_CHECK(api->PJRT_Client_Destroy(&cd2) == nullptr);
     OT_CHECK(g_mem_dtor_calls == 2);
   }

@@ -1221,6 +1221,15 @@ static PJRT_Error* validate_single_device_compile_options(const char* data, size
       PJRT_Error* err = validate_exec_build_options_proto(p + pos, static_cast<size_t>(slen));
       if (err) return err;
       pos += static_cast<size_t>(slen);
+    } else if (field == 4 && wire == 0) {
+      uint64_t portable = 0;
+      if (!pb_read_varint(p, len, &pos, &portable)) {
+        return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed compile_portable_executable");
+      }
+      if (portable != 0) {
+        return make_err(PJRT_Error_Code_UNIMPLEMENTED,
+                        "portable executables are not supported by OpenTPU M4");
+      }
     } else if (field == 6 && wire == 2) {
       uint64_t slen = 0;
       if (!pb_read_varint(p, len, &pos, &slen) || slen > len - pos) {
@@ -1231,6 +1240,15 @@ static PJRT_Error* validate_single_device_compile_options(const char* data, size
                         "multi-slice compilation is not supported on single-device OpenTPU");
       }
       pos += static_cast<size_t>(slen);
+    } else if (field == 8 && wire == 0) {
+      uint64_t prec = 0;
+      if (!pb_read_varint(p, len, &pos, &prec)) {
+        return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed matrix_unit_operand_precision");
+      }
+      if (prec != 0) {
+        return make_err(PJRT_Error_Code_UNIMPLEMENTED,
+                        "non-default matrix_unit_operand_precision is not supported by OpenTPU M4");
+      }
     } else if (!pb_skip_field(p, len, &pos, wire)) {
       return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed compile_options field");
     }
@@ -1682,6 +1700,14 @@ PJRT_Error* ot_pjrt_lexec_execute(PJRT_LoadedExecutable_Execute_Args* args) {
   PJRT_LoadedExecutable* le = args->executable;
   if (le->deleted) {
     return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "executable has been deleted");
+  }
+  if (args->execute_device && args->execute_device != &le->client->device) {
+    return make_err(PJRT_Error_Code_INVALID_ARGUMENT,
+                    "execute_device does not belong to this executable's client");
+  }
+  if (!args->argument_lists || !args->argument_lists[0] ||
+      !args->output_lists || !args->output_lists[0]) {
+    return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null argument_lists or output_lists");
   }
   PJRT_Buffer* lhs = args->argument_lists[0][0];
   PJRT_Buffer* rhs = args->argument_lists[0][1];
