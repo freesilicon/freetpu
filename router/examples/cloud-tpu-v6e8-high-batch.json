@@ -1,0 +1,78 @@
+{
+  "host": "127.0.0.1",
+  "port": 8080,
+  "policy": "lowest_latency",
+  "health_poll_interval_s": 5.0,
+  "failure_cooldown_s": 10.0,
+  "request_timeout_s": 180.0,
+  "probe_timeout_s": 3.0,
+  "queue_pressure_threshold": 128,
+  "backend_idle_timeout_s": 300.0,
+  "max_concurrent_connections": 256,
+  "auth": {
+    "type": "allow_all"
+  },
+  "usage_meter": {
+    "type": "noop"
+  },
+  "scaler": {
+    "type": "noop"
+  },
+  "backends": [
+    {
+      "id": "cloud-tpu-v6e-8-spot",
+      "type": "cloud-tpu-v6e",
+      "local": false,
+      "spot": true,
+      "base_url": "http://127.0.0.1:8000/v1",
+      "health_path": "/health",
+      "tpu_exporter_url": "http://127.0.0.1:9400/metrics",
+      "max_hbm_utilization": 0.92,
+      "max_inflight": 128,
+      "timeout_s": 180.0,
+      "models": [
+        "Qwen/Qwen3-32B",
+        "unsloth/Llama-3.3-70B-Instruct"
+      ],
+      "discover_models": true,
+      "cost_per_1m_prompt_usd": 0.18,
+      "cost_per_1m_completion_usd": 0.36,
+      "priority": 10,
+      "metadata": {
+        "silicon": "Cloud TPU v6e-8 (Trillium)",
+        "hbm_gib": 256,
+        "tensor_parallel": 8,
+        "target_concurrency": "64-128",
+        "capacity_tier": "spot"
+      }
+    },
+    {
+      "id": "cloud-tpu-v6e-8-ondemand",
+      "type": "cloud-tpu-v6e",
+      "local": false,
+      "spot": false,
+      "enabled": false,
+      "base_url": "http://127.0.0.1:8001/v1",
+      "health_path": "/health",
+      "tpu_exporter_url": "http://127.0.0.1:9401/metrics",
+      "max_hbm_utilization": 0.92,
+      "max_inflight": 128,
+      "timeout_s": 180.0,
+      "models": [
+        "Qwen/Qwen3-32B",
+        "unsloth/Llama-3.3-70B-Instruct"
+      ],
+      "discover_models": true,
+      "cost_per_1m_prompt_usd": 0.30,
+      "cost_per_1m_completion_usd": 0.60,
+      "priority": 20,
+      "metadata": {
+        "silicon": "Cloud TPU v6e-8 (Trillium)",
+        "hbm_gib": 256,
+        "tensor_parallel": 8,
+        "target_concurrency": "64-128",
+        "capacity_tier": "on-demand-failover"
+      }
+    }
+  ]
+}
