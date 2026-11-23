@@ -863,6 +863,33 @@ _PY_METRICS_SUBPROCESS_HELPER = (
 )
 
 
+_MAX_RUNTIME_DEVICE_ID = 65535
+
+
+def _parse_runtime_device_id(raw: Any) -> Optional[int]:
+    """Parse a bounded non-negative ASCII decimal runtime device ID (`0..65535`).
+
+    Rejects booleans, negative integers, Unicode digits (such as `'²'` which
+    `str.isdigit()` accepts but `int()` rejects), non-numeric strings, and
+    oversized decimal strings (exceeding Python's `int_max_str_digits`) without
+    raising.
+    """
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw if 0 <= raw <= _MAX_RUNTIME_DEVICE_ID else None
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text or len(text) > 5 or not text.isascii() or not text.isdigit():
+            return None
+        try:
+            val = int(text)
+        except ValueError:
+            return None
+        return val if 0 <= val <= _MAX_RUNTIME_DEVICE_ID else None
+    return None
+
+
 def _parse_python_usage_entries(
     entries: Iterable[Any],
     addr: str,
@@ -879,16 +906,32 @@ def _parse_python_usage_entries(
             mem_used = getattr(item, "memory_usage", None)
             mem_total = getattr(item, "total_memory", None)
             duty = getattr(item, "duty_cycle_pct", None)
-        if dev_id is None:
+        parsed_id = _parse_runtime_device_id(dev_id)
+        if parsed_id is None:
             continue
-        key = str(dev_id)
+        key = str(parsed_id)
         row = rows.setdefault(key, _TpuInfoRow(chip_key=key))
         row.in_util_table = True
-        if isinstance(mem_used, (int, float)) and not isinstance(mem_used, bool) and mem_used >= 0:
+        if (
+            isinstance(mem_used, (int, float))
+            and not isinstance(mem_used, bool)
+            and math.isfinite(float(mem_used))
+            and mem_used >= 0
+        ):
             row.hbm_used_bytes = int(mem_used)
-        if isinstance(mem_total, (int, float)) and not isinstance(mem_total, bool) and mem_total > 0:
+        if (
+            isinstance(mem_total, (int, float))
+            and not isinstance(mem_total, bool)
+            and math.isfinite(float(mem_total))
+            and mem_total > 0
+        ):
             row.hbm_total_bytes = int(mem_total)
-        if isinstance(duty, (int, float)) and not isinstance(duty, bool) and duty >= 0:
+        if (
+            isinstance(duty, (int, float))
+            and not isinstance(duty, bool)
+            and math.isfinite(float(duty))
+            and duty >= 0
+        ):
             row.duty_cycle_percent = float(duty)
 
     if not rows:
@@ -1143,7 +1186,7 @@ def _get_grpc_channel(grpc_mod: Any, addr: str) -> Any:
 
 
 def _extract_grpc_chip_id(metric_item: Any) -> Optional[str]:
-    """Decode device/chip ID from published `tpu_metric_service.proto` `Metric.attribute.value`."""
+    """Decode and validate a bounded numeric device/chip ID from `tpu_metric_service.proto`."""
     attr = getattr(metric_item, "attribute", None)
     if attr is None:
         return None
@@ -1158,19 +1201,19 @@ def _extract_grpc_chip_id(metric_item: Any) -> Optional[str]:
         except Exception:  # noqa: BLE001
             selected = None
         if selected == "string_attr":
-            str_val = getattr(val, "string_attr", None)
-            return str_val.strip() if isinstance(str_val, str) and str_val.strip() else None
+            parsed = _parse_runtime_device_id(getattr(val, "string_attr", None))
+            return str(parsed) if parsed is not None else None
         if selected == "int_attr":
-            int_val = getattr(val, "int_attr", None)
-            return str(int_val) if isinstance(int_val, int) and not isinstance(int_val, bool) else None
+            parsed = _parse_runtime_device_id(getattr(val, "int_attr", None))
+            return str(parsed) if parsed is not None else None
         return None
 
-    str_val = getattr(val, "string_attr", None)
-    if isinstance(str_val, str) and str_val.strip():
-        return str_val.strip()
-    int_val = getattr(val, "int_attr", None)
-    if isinstance(int_val, int) and not isinstance(int_val, bool):
-        return str(int_val)
+    str_parsed = _parse_runtime_device_id(getattr(val, "string_attr", None))
+    if str_parsed is not None:
+        return str(str_parsed)
+    int_parsed = _parse_runtime_device_id(getattr(val, "int_attr", None))
+    if int_parsed is not None:
+        return str(int_parsed)
     return None
 
 
@@ -1329,63 +1372,66 @@ def _query_grpc_runtime_metrics(
     #     when HBM only returned 6 cores!) or by containing zero-based logical
     #     core IDs `>= expected_chip_count` within `[0, expected_core_count)` —
     #     treat as 1:1 `per_core` independently of partial HBM coverage.
-    #   - Else if HBM is completely absent and `raw_duty_ids == {0..expected_chip_count-1}`,
-    #     treat as `per_chip`.
-    #   - Otherwise (e.g. partial HBM `{0..3}` + duty `{0..3}` on an 8-core /
-    #     4-chip host, where `{0..3}` could equally be physical chips or cores)
-    #     treat as `ambiguous` and omit duty-cycle attachment.
+    #   - Otherwise (including when HBM IDs are completely absent and duty IDs
+    #     are `{0..3}` on an 8-function / 4-chip host — which could equally be
+    #     4 logical cores on a sliced runtime OR 4 physical chips — or partial
+    #     HBM `{0..3}` + duty `{0..3}`), treat as `ambiguous` and publish the raw
+    #     readings in the unjoined series rather than expanding across cores.
     if devices_per_chip is None:
         duty_layout = "ambiguous"
     else:
         duty_layout = "per_core"
-        if devices_per_chip > 1 and duty_by_chip and all(k.isdigit() for k in raw_duty_ids):
-            raw_duty_int_ids = {int(k) for k in raw_duty_ids}
-            all_hbm_core_ids = {int(k) for k in raw_hbm_ids if k.isdigit()}
-            expected_core_count = (
-                len(devices)
-                if len(devices) > 0 and len(devices) % devices_per_chip == 0
-                else None
-            )
-            expected_chip_count = (
-                expected_core_count // devices_per_chip
-                if expected_core_count is not None
-                else None
-            )
-            has_unambiguous_per_core_ids = expected_chip_count is not None and (
-                len(raw_duty_int_ids) > expected_chip_count
-                or (
-                    expected_core_count is not None
-                    and all(0 <= cid < expected_core_count for cid in raw_duty_int_ids)
-                    and all(0 <= hid < expected_core_count for hid in all_hbm_core_ids)
-                    and any(cid >= expected_chip_count for cid in raw_duty_int_ids)
+        if devices_per_chip > 1 and duty_by_chip:
+            parsed_duty = [_parse_runtime_device_id(k) for k in raw_duty_ids]
+            if all(cid is not None for cid in parsed_duty):
+                raw_duty_int_ids = {cid for cid in parsed_duty if cid is not None}
+                all_hbm_core_ids = {
+                    hid
+                    for k in raw_hbm_ids
+                    for hid in (_parse_runtime_device_id(k),)
+                    if hid is not None
+                }
+                expected_core_count = (
+                    len(devices)
+                    if len(devices) > 0 and len(devices) % devices_per_chip == 0
+                    else None
                 )
-            )
-            expanded_raw = {
-                cid * devices_per_chip + off
-                for cid in raw_duty_int_ids
-                for off in range(devices_per_chip)
-            }
-            if (
-                all_hbm_core_ids
-                and expanded_raw == all_hbm_core_ids
-                and len(raw_duty_int_ids) * devices_per_chip == len(all_hbm_core_ids)
-            ):
-                duty_layout = "per_chip"
-            elif has_unambiguous_per_core_ids:
-                duty_layout = "per_core"
-            elif (
-                not all_hbm_core_ids
-                and expected_chip_count is not None
-                and raw_duty_int_ids == set(range(expected_chip_count))
-            ):
-                duty_layout = "per_chip"
+                expected_chip_count = (
+                    expected_core_count // devices_per_chip
+                    if expected_core_count is not None
+                    else None
+                )
+                has_unambiguous_per_core_ids = expected_chip_count is not None and (
+                    len(raw_duty_int_ids) > expected_chip_count
+                    or (
+                        expected_core_count is not None
+                        and all(0 <= cid < expected_core_count for cid in raw_duty_int_ids)
+                        and all(0 <= hid < expected_core_count for hid in all_hbm_core_ids)
+                        and any(cid >= expected_chip_count for cid in raw_duty_int_ids)
+                    )
+                )
+                expanded_raw = {
+                    cid * devices_per_chip + off
+                    for cid in raw_duty_int_ids
+                    for off in range(devices_per_chip)
+                }
+                if (
+                    all_hbm_core_ids
+                    and expanded_raw == all_hbm_core_ids
+                    and len(raw_duty_int_ids) * devices_per_chip == len(all_hbm_core_ids)
+                ):
+                    duty_layout = "per_chip"
+                elif has_unambiguous_per_core_ids:
+                    duty_layout = "per_core"
+                else:
+                    duty_layout = "ambiguous"
             else:
                 duty_layout = "ambiguous"
 
     if duty_layout != "ambiguous":
         for chip_key, duty_val in duty_by_chip.items():
-            if duty_layout == "per_chip" and devices_per_chip is not None and chip_key.isdigit():
-                chip_idx = int(chip_key)
+            chip_idx = _parse_runtime_device_id(chip_key)
+            if duty_layout == "per_chip" and devices_per_chip is not None and chip_idx is not None:
                 for offset in range(devices_per_chip):
                     core_key = str(chip_idx * devices_per_chip + offset)
                     row = rows.setdefault(core_key, _TpuInfoRow(chip_key=core_key))
@@ -2307,15 +2353,19 @@ def collect_snapshot(
         )
     ]
 
-    has_joined_duty = any(r.duty_cycle_percent is not None for r in util_rows.values())
+    unjoined_duty_candidates: Dict[str, float] = {
+        key: row.unjoined_duty_cycle_percent
+        for key, row in util_rows.items()
+        if row.unjoined_duty_cycle_percent is not None
+    }
+    joined_duty_count = sum(1 for r in util_rows.values() if r.duty_cycle_percent is not None)
+    all_util_rows_have_joined_duty = (
+        bool(util_rows)
+        and joined_duty_count == len(util_rows)
+        and joined_duty_count >= len(unjoined_duty_candidates)
+    )
     runtime_unjoined_duty: Dict[str, float] = (
-        {}
-        if has_joined_duty
-        else {
-            key: row.unjoined_duty_cycle_percent
-            for key, row in util_rows.items()
-            if row.unjoined_duty_cycle_percent is not None
-        }
+        {} if all_util_rows_have_joined_duty else unjoined_duty_candidates
     )
 
     gcp_preempted: Optional[int] = None
@@ -2604,11 +2654,15 @@ def format_prometheus_metrics(snapshot: ExporterSnapshot) -> str:
         runtime_duty,
     )
     if snapshot.runtime_unjoined_duty_cycle:
+        def _unjoined_sort_key(kv: Tuple[str, float]) -> Tuple[int, Any]:
+            parsed_id = _parse_runtime_device_id(kv[0])
+            return (0, parsed_id) if parsed_id is not None else (1, kv[0])
+
         unjoined_duty_samples = [
             ({"runtime_device_id": raw_id}, _fmt_float(val))
             for raw_id, val in sorted(
                 snapshot.runtime_unjoined_duty_cycle.items(),
-                key=lambda kv: (0, int(kv[0])) if kv[0].isdigit() else (1, kv[0]),
+                key=_unjoined_sort_key,
             )
         ]
         add_metric(

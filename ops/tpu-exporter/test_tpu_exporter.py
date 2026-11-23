@@ -3072,6 +3072,198 @@ TPU Runtime Utilization
                 'freetpu_tpu_runtime_unjoined_duty_cycle_percent{runtime_device_id="3"} 87.5',
                 no_pci_prom,
             )
+
+            # Ironwood (8 PCI functions) with duty-cycle IDs `{0..3}` and NO HBM IDs:
+            # MUST NOT assume physical-chip granularity and expand across all 8 cores
+            # (a 4-core sliced runtime also reports per-core IDs 0..3). Keep unjoined!
+            class _IronwoodDutyOnlyNoHbmStub:
+                def __init__(self, channel):
+                    self.channel = channel
+
+                def GetRuntimeMetric(self, req, timeout=None):
+                    del timeout
+                    if req.metric_name == "tpu.runtime.tensorcore.dutycycle.percent":
+                        items = [
+                            _make_item(0, as_double=12.5),
+                            _make_item(1, as_double=37.5),
+                            _make_item(2, as_double=62.5),
+                            _make_item(3, as_double=87.5),
+                        ]
+                        return SimpleNamespace(metric=SimpleNamespace(metrics=items))
+                    return SimpleNamespace(metric=SimpleNamespace(metrics=[]))
+
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.dict(_te._GRPC_CHANNELS, {}, clear=True),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "grpc": _FakeGrpc,
+                        "tpu_info": SimpleNamespace(),
+                        "tpu_info.proto": SimpleNamespace(),
+                        "tpu_info.proto.tpu_metric_service_pb2": fake_pb2,
+                        "tpu_info.proto.tpu_metric_service_pb2_grpc": SimpleNamespace(
+                            RuntimeMetricServiceStub=_IronwoodDutyOnlyNoHbmStub
+                        ),
+                    },
+                ),
+            ):
+                iw_no_hbm_snap = _te.collect_snapshot(
+                    sysfs_root=iw_sysfs,
+                    dev_root=iw_dev,
+                    proc_root=iw_proc,
+                    tpu_info_bin="tpu-info",
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=iw_root / "no-shm",
+                )
+            self.assertTrue(all(d.duty_cycle_percent is None for d in iw_no_hbm_snap.devices))
+            self.assertEqual(
+                iw_no_hbm_snap.runtime_unjoined_duty_cycle,
+                {"0": 12.5, "1": 37.5, "2": 62.5, "3": 87.5},
+            )
+
+            # Partial fallback after ambiguous gRPC duty-cycle: if CLI supplies joined
+            # duty for ONLY 1 device ("0"), MUST retain the raw unjoined series so the
+            # remaining 3 readings do not disappear; full joined coverage clears it.
+            def _partial_1row_cli(*args, **kwargs):
+                rows = _te.parse_tpu_info_output(
+                    "TPU Runtime Utilization\n"
+                    "| Chip | HBM Usage (GiB)      | Duty cycle |\n"
+                    "|------|----------------------|------------|\n"
+                    "| 0    | 10.00 GiB / 96.00 GiB | 12.50%    |\n"
+                )
+                return True, None, rows
+
+            def _full_8row_cli(*args, **kwargs):
+                lines = [
+                    "TPU Runtime Utilization",
+                    "| Chip | HBM Usage (GiB)       | Duty cycle |",
+                    "|------|-----------------------|------------|",
+                ] + [
+                    f"| {c}    | 10.00 GiB / 96.00 GiB | {12.5 + (c // 2) * 25.0:.2f}%     |"
+                    for c in range(8)
+                ]
+                return True, None, _te.parse_tpu_info_output("\n".join(lines) + "\n")
+
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.dict(_te._GRPC_CHANNELS, {}, clear=True),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "grpc": _FakeGrpc,
+                        "tpu_info": SimpleNamespace(),
+                        "tpu_info.proto": SimpleNamespace(),
+                        "tpu_info.proto.tpu_metric_service_pb2": fake_pb2,
+                        "tpu_info.proto.tpu_metric_service_pb2_grpc": SimpleNamespace(
+                            RuntimeMetricServiceStub=_IronwoodDutyOnlyNoHbmStub
+                        ),
+                    },
+                ),
+                mock.patch.object(_te, "_run_tpu_info", side_effect=_partial_1row_cli),
+            ):
+                iw_partial_fb_snap = _te.collect_snapshot(
+                    sysfs_root=iw_sysfs,
+                    dev_root=iw_dev,
+                    proc_root=iw_proc,
+                    tpu_info_bin="tpu-info",
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=iw_root / "no-shm",
+                )
+            self.assertEqual(
+                iw_partial_fb_snap.runtime_unjoined_duty_cycle,
+                {"0": 12.5, "1": 37.5, "2": 62.5, "3": 87.5},
+            )
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.dict(_te._GRPC_CHANNELS, {}, clear=True),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "grpc": _FakeGrpc,
+                        "tpu_info": SimpleNamespace(),
+                        "tpu_info.proto": SimpleNamespace(),
+                        "tpu_info.proto.tpu_metric_service_pb2": fake_pb2,
+                        "tpu_info.proto.tpu_metric_service_pb2_grpc": SimpleNamespace(
+                            RuntimeMetricServiceStub=_IronwoodDutyOnlyNoHbmStub
+                        ),
+                    },
+                ),
+                mock.patch.object(_te, "_run_tpu_info", side_effect=_full_8row_cli),
+            ):
+                iw_full_fb_snap = _te.collect_snapshot(
+                    sysfs_root=iw_sysfs,
+                    dev_root=iw_dev,
+                    proc_root=iw_proc,
+                    tpu_info_bin="tpu-info",
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=iw_root / "no-shm",
+                )
+            self.assertEqual(iw_full_fb_snap.runtime_unjoined_duty_cycle, {})
+
+            # Malformed gRPC device IDs (Unicode superscripts like "²", huge decimal
+            # strings >4300 digits, negative integers, non-numeric strings) MUST be
+            # skipped safely at decode time without raising ValueError or aborting scrapes.
+            for bad_id in ("²", "9" * 5000, "-1", "chip-bad", 70000, -5, True):
+                self.assertIsNone(_te._parse_runtime_device_id(bad_id))
+
+            class _MalformedIdStub:
+                def __init__(self, channel):
+                    self.channel = channel
+
+                def GetRuntimeMetric(self, req, timeout=None):
+                    del timeout
+                    if req.metric_name == "tpu.runtime.hbm.memory.usage.bytes":
+                        items = [
+                            _make_item("²", as_int=1024),
+                            _make_item("9" * 5000, as_int=2048),
+                            _make_item(0, as_int=16 * 1024**3),
+                        ]
+                    elif req.metric_name == "tpu.runtime.hbm.memory.total.bytes":
+                        items = [
+                            _make_item("²", as_int=4096),
+                            _make_item(0, as_int=32 * 1024**3),
+                        ]
+                    elif req.metric_name == "tpu.runtime.tensorcore.dutycycle.percent":
+                        items = [
+                            _make_item("²", as_double=99.0),
+                            _make_item("9" * 5000, as_double=88.0),
+                            _make_item(0, as_double=44.5),
+                        ]
+                    else:
+                        items = []
+                    return SimpleNamespace(metric=SimpleNamespace(metrics=items))
+
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.dict(_te._GRPC_CHANNELS, {}, clear=True),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "grpc": _FakeGrpc,
+                        "tpu_info": SimpleNamespace(),
+                        "tpu_info.proto": SimpleNamespace(),
+                        "tpu_info.proto.tpu_metric_service_pb2": fake_pb2,
+                        "tpu_info.proto.tpu_metric_service_pb2_grpc": SimpleNamespace(
+                            RuntimeMetricServiceStub=_MalformedIdStub
+                        ),
+                    },
+                ),
+            ):
+                malformed_snap = _te.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin="tpu-info",
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=root / "no-shm",
+                )
+            self.assertTrue(malformed_snap.tpu_info_available)
+            self.assertEqual([rt.runtime_chip for rt in malformed_snap.runtime_utilization], ["0"])
+            self.assertEqual(malformed_snap.devices[0].hbm_used_bytes, 16 * 1024**3)
+            self.assertAlmostEqual(malformed_snap.devices[0].duty_cycle_percent or 0.0, 44.5)
+            self._assert_valid_prometheus_text(_te.format_prometheus_metrics(malformed_snap))
+
             self.assertEqual(iw_snap.devices[0].device_id, "0x0076")
             self.assertEqual(iw_snap.devices[7].device_id, "0x0075")
             self.assertEqual(iw_snap.devices[7].generation, "tpu7x")
