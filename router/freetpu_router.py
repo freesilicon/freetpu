@@ -1081,6 +1081,26 @@ def _extract_choice_chat_content_char_counts(obj: Mapping[str, Any]) -> Dict[int
     return counts
 
 
+def _echo_prompt_limit_for_choice(
+    choice_idx: int,
+    echo_prompt_chars: Sequence[int],
+    *,
+    required_choices: int = 1,
+    prompt_batch_size: int = 1,
+) -> int:
+    """Return the echoed prompt char length corresponding to `choice_idx`."""
+    if not echo_prompt_chars:
+        return 0
+    eff_batch = max(1, prompt_batch_size)
+    n_per_prompt = max(1, max(1, required_choices) // eff_batch)
+    p_slot = choice_idx // n_per_prompt
+    if 0 <= p_slot < len(echo_prompt_chars):
+        return echo_prompt_chars[p_slot]
+    if len(echo_prompt_chars) == 1:
+        return echo_prompt_chars[0]
+    return 0
+
+
 def _subtract_echoed_prompt_chars(
     chars_by_choice: Mapping[int, int],
     echo_prompt_chars: Sequence[int],
@@ -1091,17 +1111,14 @@ def _subtract_echoed_prompt_chars(
     """Subtract echoed prompt character lengths from per-choice completion character totals."""
     if not echo_prompt_chars:
         return sum(chars_by_choice.values())
-    eff_batch = max(1, prompt_batch_size)
-    n_per_prompt = max(1, max(1, required_choices) // eff_batch)
     adjusted = 0
     for c_idx, c_chars in chars_by_choice.items():
-        p_slot = c_idx // n_per_prompt
-        if 0 <= p_slot < len(echo_prompt_chars):
-            echo_len = echo_prompt_chars[p_slot]
-        elif len(echo_prompt_chars) == 1:
-            echo_len = echo_prompt_chars[0]
-        else:
-            echo_len = 0
+        echo_len = _echo_prompt_limit_for_choice(
+            c_idx,
+            echo_prompt_chars,
+            required_choices=required_choices,
+            prompt_batch_size=prompt_batch_size,
+        )
         adjusted += max(0, c_chars - echo_len)
     return adjusted
 
@@ -1516,6 +1533,21 @@ def _choice_non_echo_chat_output(choice: Mapping[str, Any]) -> Tuple[bool, int]:
     return False, content_chars
 
 
+def _choice_non_echo_completion_output(choice: Mapping[str, Any]) -> Tuple[bool, int]:
+    """Return `(has_non_echo_output, completion_text_chars)` for one `/v1/completions` choice."""
+    text_val = choice.get("text")
+    text_chars = len(text_val) if isinstance(text_val, str) and text_val else 0
+    for container_key in ("delta", "message"):
+        container = choice.get(container_key)
+        if not (isinstance(container, dict) or isinstance(container, Mapping)):
+            continue
+        for text_key in ("content", "refusal", "reasoning_content", "reasoning"):
+            val = container.get(text_key)
+            if isinstance(val, str) and val:
+                return True, text_chars
+    return False, text_chars
+
+
 def _sse_event_should_commit(
     payload_bytes: bytes,
     *,
@@ -1523,18 +1555,21 @@ def _sse_event_should_commit(
     max_depth: int = DEFAULT_MAX_JSON_DEPTH,
     max_nodes: int = DEFAULT_MAX_RESPONSE_JSON_NODES,
     echo_chat_chars: int = 0,
+    echo_prompt_chars: Sequence[int] = (),
+    required_choices: int = 1,
+    prompt_batch_size: int = 1,
     echo_chars_by_choice: Optional[Dict[int, int]] = None,
     generated_out: Optional[List[bool]] = None,
 ) -> bool:
     """Return True when a complete non-error SSE data event carries output or a terminator.
 
-    Role-only, empty-delta, prompt-progress, and echoed chat-prefix chunks are
-    buffered so Spot preemption before the first generated token still fails over.
-    When `generated_out` is provided, sets `generated_out[0] = True` iff this
-    event carries actual generated output (not echoed chat input or a
-    finish-only / usage-only / `[DONE]` terminator). Raises
-    `_MalformedSSEPayloadError` on invalid UTF-8, invalid JSON, or non-object
-    JSON so pre-commit protocol corruption remains eligible for failover.
+    Role-only, empty-delta, prompt-progress, and echoed chat/completion prefix
+    chunks are buffered so Spot preemption before the first generated token
+    still fails over. When `generated_out` is provided, sets
+    `generated_out[0] = True` iff this event carries actual generated output
+    (not echoed input or a finish-only / usage-only / `[DONE]` terminator).
+    Raises `_MalformedSSEPayloadError` on invalid UTF-8, invalid JSON, or
+    non-object JSON so pre-commit protocol corruption remains eligible for failover.
     """
     if generated_out is not None:
         generated_out[0] = False
@@ -1562,7 +1597,8 @@ def _sse_event_should_commit(
         if generated_out is not None:
             generated_out[0] = True
         return True
-    if echo_chat_chars <= 0:
+    has_echo_prefix = (echo_chat_chars > 0) or bool(echo_prompt_chars)
+    if not has_echo_prefix:
         if _extract_choice_output_text(obj):
             if generated_out is not None:
                 generated_out[0] = True
@@ -1575,23 +1611,33 @@ def _sse_event_should_commit(
                 continue
             if choice.get("finish_reason") is not None:
                 saw_finish = True
-            if echo_chat_chars > 0:
-                has_non_echo, content_chars = _choice_non_echo_chat_output(choice)
+            if has_echo_prefix:
+                c_idx = choice.get("index")
+                resolved_idx = (
+                    c_idx
+                    if isinstance(c_idx, int)
+                    and not isinstance(c_idx, bool)
+                    and c_idx >= 0
+                    else pos
+                )
+                if echo_chat_chars > 0:
+                    has_non_echo, echoed_field_chars = _choice_non_echo_chat_output(choice)
+                    echo_limit = echo_chat_chars
+                else:
+                    has_non_echo, echoed_field_chars = _choice_non_echo_completion_output(choice)
+                    echo_limit = _echo_prompt_limit_for_choice(
+                        resolved_idx,
+                        echo_prompt_chars,
+                        required_choices=required_choices,
+                        prompt_batch_size=prompt_batch_size,
+                    )
                 if has_non_echo:
                     if generated_out is not None:
                         generated_out[0] = True
                     return True
-                if content_chars > 0:
-                    c_idx = choice.get("index")
-                    resolved_idx = (
-                        c_idx
-                        if isinstance(c_idx, int)
-                        and not isinstance(c_idx, bool)
-                        and c_idx >= 0
-                        else pos
-                    )
+                if echoed_field_chars > 0:
                     if echo_chars_by_choice is None:
-                        if content_chars > echo_chat_chars:
+                        if echoed_field_chars > echo_limit:
                             if generated_out is not None:
                                 generated_out[0] = True
                             return True
@@ -1603,9 +1649,11 @@ def _sse_event_should_commit(
                             if generated_out is not None:
                                 generated_out[0] = True
                             return True
-                        new_total = echo_chars_by_choice.get(resolved_idx, 0) + content_chars
+                        new_total = (
+                            echo_chars_by_choice.get(resolved_idx, 0) + echoed_field_chars
+                        )
                         echo_chars_by_choice[resolved_idx] = new_total
-                        if new_total > echo_chat_chars:
+                        if new_total > echo_limit:
                             if generated_out is not None:
                                 generated_out[0] = True
                             return True
@@ -5426,6 +5474,9 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                     payload_bytes,
                                     parsed_obj=parsed_pre,
                                     echo_chat_chars=echo_chat_chars,
+                                    echo_prompt_chars=echo_prompt_chars,
+                                    required_choices=max(1, expected_choices),
+                                    prompt_batch_size=max(1, prompt_batch_size),
                                     echo_chars_by_choice=pre_commit_echo_chars_by_choice,
                                     generated_out=pre_commit_generated,
                                 )
@@ -5667,32 +5718,57 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                             if first_token_ttft_ms is None and not replaying_pre_commit:
                                 has_generated_out = has_audio_out or has_token_meta_out
                                 if not has_generated_out and output_txt:
-                                    if echo_chat_chars <= 0:
+                                    if echo_chat_chars <= 0 and not echo_prompt_chars:
                                         has_generated_out = True
                                     elif isinstance(choices, list):
                                         for pos, choice in enumerate(choices):
                                             if not isinstance(choice, dict):
                                                 continue
-                                            has_non_echo, content_chars = (
-                                                _choice_non_echo_chat_output(choice)
+                                            c_idx = choice.get("index")
+                                            resolved_idx = (
+                                                c_idx
+                                                if isinstance(c_idx, int)
+                                                and not isinstance(c_idx, bool)
+                                                and c_idx >= 0
+                                                else pos
                                             )
-                                            if has_non_echo:
-                                                has_generated_out = True
-                                                break
-                                            if content_chars > 0:
-                                                c_idx = choice.get("index")
-                                                resolved_idx = (
-                                                    c_idx
-                                                    if isinstance(c_idx, int)
-                                                    and not isinstance(c_idx, bool)
-                                                    and c_idx >= 0
-                                                    else pos
+                                            if echo_chat_chars > 0:
+                                                has_non_echo, echoed_chars = (
+                                                    _choice_non_echo_chat_output(choice)
                                                 )
-                                                if (
-                                                    est_chat_content_chars_by_choice.get(
-                                                        resolved_idx, 0
-                                                    )
+                                                if has_non_echo:
+                                                    has_generated_out = True
+                                                    break
+                                                if echoed_chars > 0 and (
+                                                    resolved_idx
+                                                    not in est_chat_content_chars_by_choice
+                                                    or est_chat_content_chars_by_choice[
+                                                        resolved_idx
+                                                    ]
                                                     > echo_chat_chars
+                                                ):
+                                                    has_generated_out = True
+                                                    break
+                                            else:
+                                                has_non_echo, echoed_chars = (
+                                                    _choice_non_echo_completion_output(choice)
+                                                )
+                                                if has_non_echo:
+                                                    has_generated_out = True
+                                                    break
+                                                echo_limit = _echo_prompt_limit_for_choice(
+                                                    resolved_idx,
+                                                    echo_prompt_chars,
+                                                    required_choices=required_choices,
+                                                    prompt_batch_size=effective_prompt_batch_size,
+                                                )
+                                                if echoed_chars > 0 and (
+                                                    resolved_idx
+                                                    not in est_completion_chars_by_choice
+                                                    or est_completion_chars_by_choice[
+                                                        resolved_idx
+                                                    ]
+                                                    > echo_limit
                                                 ):
                                                     has_generated_out = True
                                                     break

@@ -258,7 +258,7 @@ class BackendConfig:
     timeout_s: Optional[float] = None
     health_path: Optional[str] = None
     tpu_exporter_url: Optional[str] = None
-    max_hbm_utilization: float = 0.95
+    max_hbm_utilization: Optional[float] = 0.95
     max_duty_cycle_percent: Optional[float] = None
     api_key: Optional[str] = None
     api_key_env: Optional[str] = None
@@ -320,13 +320,14 @@ class BackendConfig:
             name=f"{ctx} cost_per_1m_completion_usd",
             min_value=0.0,
         )
-        _validate_finite_number(
-            self.max_hbm_utilization,
-            name=f"{ctx} max_hbm_utilization",
-            min_value=0.0,
-            strictly_greater=True,
-            max_value=1.0,
-        )
+        if self.max_hbm_utilization is not None:
+            _validate_finite_number(
+                self.max_hbm_utilization,
+                name=f"{ctx} max_hbm_utilization",
+                min_value=0.0,
+                strictly_greater=True,
+                max_value=1.0,
+            )
         if self.max_duty_cycle_percent is not None:
             _validate_finite_number(
                 self.max_duty_cycle_percent,
@@ -462,12 +463,17 @@ class BackendConfig:
             min_value=0.0,
         )
 
-        max_hbm = _validate_finite_number(
-            raw.get("max_hbm_utilization", 0.95),
-            name=f"{ctx} max_hbm_utilization",
-            min_value=0.0,
-            strictly_greater=True,
-            max_value=1.0,
+        raw_max_hbm = raw.get("max_hbm_utilization", 0.95)
+        max_hbm = (
+            _validate_finite_number(
+                raw_max_hbm,
+                name=f"{ctx} max_hbm_utilization",
+                min_value=0.0,
+                strictly_greater=True,
+                max_value=1.0,
+            )
+            if raw_max_hbm is not None
+            else None
         )
 
         max_duty = raw.get("max_duty_cycle_percent")

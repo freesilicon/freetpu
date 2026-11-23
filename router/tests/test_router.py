@@ -8230,6 +8230,7 @@ asyncio.run(main())
             "freetpu_exporter_up 1\n"
             "freetpu_tpu_devices_discovered 1\n"
             'freetpu_tpu_health_status{chip="0"} 1\n'
+            'freetpu_tpu_hbm_utilization_ratio{chip="0"} 0.25\n'
             'freetpu_tpu_duty_cycle_percent{chip="0"} 97.\n'
         )
         telem_duty = summarize_tpu_samples(parse_prometheus_text(duty_text))
@@ -8323,11 +8324,15 @@ asyncio.run(main())
         self.assertFalse(ready_m)
         self.assertEqual(reason_m, "tpu_unhealthy")
 
-        # 3. All 8 of 8 chips healthy -> ready.
-        healthy_lines = [
-            "freetpu_exporter_up 1",
-            "freetpu_tpu_devices_discovered 8",
-        ] + [f'freetpu_tpu_health_status{{chip="{i}"}} 1' for i in range(8)]
+        # 3. All 8 of 8 chips healthy (with HBM telemetry) -> ready.
+        healthy_lines = (
+            [
+                "freetpu_exporter_up 1",
+                "freetpu_tpu_devices_discovered 8",
+            ]
+            + [f'freetpu_tpu_health_status{{chip="{i}"}} 1' for i in range(8)]
+            + [f'freetpu_tpu_hbm_utilization_ratio{{chip="{i}"}} 0.25' for i in range(8)]
+        )
         telem_ok = summarize_tpu_samples(
             parse_prometheus_text("\n".join(healthy_lines))
         )
@@ -13505,6 +13510,7 @@ asyncio.run(main())
             b"freetpu_exporter_up 1\n"
             b"freetpu_tpu_devices_discovered 1\n"
             b'freetpu_tpu_health_status{chip="0"} 1\n'
+            b'freetpu_tpu_hbm_utilization_ratio{chip="0"} 0.25\n'
         )
         mode = ["dup_truncated"]
 
@@ -14968,6 +14974,231 @@ asyncio.run(main())
                         backends=[base_backend],
                     )
                 self.assertNotIn("secret", str(ctx.exception))
+
+    def test_legacy_completions_stream_echo_buffers_prompt_for_failover_and_skips_echo_only_ttft(
+        self,
+    ) -> None:
+        recorded_usage: List[UsageEvent] = []
+
+        class _RecordHook:
+            def record_usage(self, event: UsageEvent) -> None:
+                recorded_usage.append(event)
+
+        prompt_str = "Legacy echo prompt"
+
+        class _EchoDropHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                pass
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = b'{"object":"list","data":[{"id":"m-legacy-echo"}]}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802
+                cl = int(self.headers.get("Content-Length", "0"))
+                if cl > 0:
+                    self.rfile.read(cl)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                # Emit only the echoed prompt and then drop connection before generating.
+                echo_ev = json.dumps(
+                    {"choices": [{"index": 0, "text": prompt_str}]}
+                ).encode("utf-8")
+                self.wfile.write(b"data: " + echo_ev + b"\n\n")
+                self.wfile.flush()
+                self.close_connection = True
+
+        backup_mode = ["generate"]
+
+        class _EchoOkHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                pass
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = b'{"object":"list","data":[{"id":"m-legacy-echo"}]}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802
+                cl = int(self.headers.get("Content-Length", "0"))
+                if cl > 0:
+                    self.rfile.read(cl)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                if backup_mode[0] == "echo_only":
+                    ev = json.dumps(
+                        {
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "text": prompt_str,
+                                    "finish_reason": "length",
+                                }
+                            ]
+                        }
+                    ).encode("utf-8")
+                    self.wfile.write(b"data: " + ev + b"\n\ndata: [DONE]\n\n")
+                    self.wfile.flush()
+                else:
+                    ev1 = json.dumps(
+                        {"choices": [{"index": 0, "text": prompt_str}]}
+                    ).encode("utf-8")
+                    self.wfile.write(b"data: " + ev1 + b"\n\n")
+                    self.wfile.flush()
+                    time.sleep(0.12)
+                    ev2 = json.dumps(
+                        {
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "text": " answer!",
+                                    "finish_reason": "stop",
+                                }
+                            ]
+                        }
+                    ).encode("utf-8")
+                    self.wfile.write(b"data: " + ev2 + b"\n\ndata: [DONE]\n\n")
+                    self.wfile.flush()
+                self.close_connection = True
+
+        primary_srv = ThreadingHTTPServer(("127.0.0.1", 0), _EchoDropHandler)
+        backup_srv = ThreadingHTTPServer(("127.0.0.1", 0), _EchoOkHandler)
+        threading.Thread(target=primary_srv.serve_forever, daemon=True).start()
+        threading.Thread(target=backup_srv.serve_forever, daemon=True).start()
+        try:
+            cfg = RouterConfig(
+                host="127.0.0.1",
+                port=0,
+                policy="local_first",
+                failure_cooldown_s=30.0,
+                backends=[
+                    BackendConfig(
+                        id="legacy-echo-primary",
+                        local=True,
+                        base_url=f"http://127.0.0.1:{primary_srv.server_address[1]}",
+                        models=["m-legacy-echo"],
+                    ),
+                    BackendConfig(
+                        id="legacy-echo-backup",
+                        local=False,
+                        base_url=f"http://127.0.0.1:{backup_srv.server_address[1]}",
+                        models=["m-legacy-echo"],
+                    ),
+                ],
+            )
+            router = self._track(create_router_server(cfg, usage_hook=_RecordHook()))
+            rport = router.server_address[1]
+
+            # 1. Primary drops after sending only echoed prompt -> router fails over to backup,
+            #    and TTFT reflects delayed generation on backup (>= 100ms), not immediate echo.
+            st1, hdrs1, bd1 = _http_request(
+                rport,
+                "POST",
+                "/v1/completions",
+                body={
+                    "model": "m-legacy-echo",
+                    "prompt": prompt_str,
+                    "echo": True,
+                    "stream": True,
+                },
+            )
+            self.assertEqual(st1, 200)
+            self.assertEqual(hdrs1.get("x-freetpu-backend"), "legacy-echo-backup")
+            self.assertEqual(hdrs1.get("x-freetpu-failovers"), "1")
+            self.assertIn(prompt_str.encode("utf-8"), bd1)
+            self.assertIn(b" answer!", bd1)
+            self.assertEqual(len(recorded_usage), 1)
+            self.assertIsNotNone(recorded_usage[0].ttft_ms)
+            assert recorded_usage[0].ttft_ms is not None
+            self.assertGreaterEqual(recorded_usage[0].ttft_ms, 100.0)
+            self.assertIn(
+                'freetpu_router_ttft_seconds_count{model="m-legacy-echo",backend_id="legacy-echo-backup"} 1',
+                router.engine.metrics_text(),
+            )
+
+            # 2. Echo-only max_tokens=0 stream commits cleanly with ttft_ms=None (count stays 1).
+            backup_mode[0] = "echo_only"
+            st2, _, bd2 = _http_request(
+                rport,
+                "POST",
+                "/v1/completions",
+                body={
+                    "model": "m-legacy-echo",
+                    "prompt": prompt_str,
+                    "echo": True,
+                    "max_tokens": 0,
+                    "stream": True,
+                },
+            )
+            self.assertEqual(st2, 200)
+            self.assertIn(prompt_str.encode("utf-8"), bd2)
+            self.assertEqual(len(recorded_usage), 2)
+            self.assertIsNone(recorded_usage[1].ttft_ms)
+            self.assertEqual(recorded_usage[1].completion_tokens, 0)
+            self.assertIn(
+                'freetpu_router_ttft_seconds_count{model="m-legacy-echo",backend_id="legacy-echo-backup"} 1',
+                router.engine.metrics_text(),
+            )
+        finally:
+            primary_srv.shutdown()
+            primary_srv.server_close()
+            backup_srv.shutdown()
+            backup_srv.server_close()
+
+    def test_tpu_readiness_fails_when_all_hbm_metrics_missing_unless_ceiling_opted_out(
+        self,
+    ) -> None:
+        no_hbm_metrics = (
+            "freetpu_exporter_up 1\n"
+            "freetpu_tpu_devices_discovered 2\n"
+            'freetpu_tpu_health_status{chip="0"} 1\n'
+            'freetpu_tpu_health_status{chip="1"} 1\n'
+        )
+        exp = self._track(_MockTpuExporter(raw_body=no_hbm_metrics))
+        telem = scrape_tpu_exporter(exp.metrics_url, timeout_s=2.0)
+        self.assertEqual(telem.total_chips, 2)
+        self.assertEqual(telem.healthy_chips, 2)
+        self.assertEqual(telem.chips_with_hbm, 0)
+
+        # With default / configured HBM ceiling (0.95), 0 HBM metrics must fail readiness.
+        ready_default, reason_default = evaluate_tpu_readiness(
+            telem, max_hbm_utilization=0.95
+        )
+        self.assertFalse(ready_default)
+        self.assertEqual(reason_default, "tpu_hbm_missing")
+
+        # Explicit opt-out (max_hbm_utilization=None) allows health-only readiness.
+        ready_opt_out, reason_opt_out = evaluate_tpu_readiness(
+            telem, max_hbm_utilization=None
+        )
+        self.assertTrue(ready_opt_out)
+        self.assertIsNone(reason_opt_out)
+
+        # Config validation also accepts explicit max_hbm_utilization=None opt-out.
+        opt_out_backend = BackendConfig.from_dict(
+            {
+                "id": "tpu-no-hbm-limit",
+                "base_url": "http://127.0.0.1:8000",
+                "models": ["m1"],
+                "max_hbm_utilization": None,
+            }
+        )
+        self.assertIsNone(opt_out_backend.max_hbm_utilization)
 
 
 def run_self_tests(verbosity: int = 1) -> int:

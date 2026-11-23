@@ -414,7 +414,7 @@ def summarize_tpu_samples(
 def evaluate_tpu_readiness(
     telemetry: TpuExporterTelemetry,
     *,
-    max_hbm_utilization: float = 0.95,
+    max_hbm_utilization: Optional[float] = 0.95,
     max_duty_cycle_percent: Optional[float] = None,
 ) -> Tuple[bool, Optional[str]]:
     """Return `(is_ready, unready_reason)` for a backend given its TPU telemetry."""
@@ -432,19 +432,17 @@ def evaluate_tpu_readiness(
         return False, "tpu_no_devices_discovered"
     if telemetry.healthy_chips < telemetry.total_chips:
         return False, "tpu_unhealthy"
-    if (
-        telemetry.max_hbm_utilization_ratio is not None
-        and telemetry.max_hbm_utilization_ratio >= max_hbm_utilization
-    ):
-        return False, "tpu_hbm_oom_risk"
-    has_hbm_telemetry = (
-        telemetry.max_hbm_utilization_ratio is not None
-        or telemetry.hbm_used_bytes is not None
-        or telemetry.hbm_total_bytes is not None
-        or telemetry.chips_with_hbm > 0
-    )
-    if has_hbm_telemetry and telemetry.chips_with_hbm < telemetry.total_chips:
-        return False, "tpu_hbm_missing"
+    if max_hbm_utilization is not None:
+        if (
+            telemetry.max_hbm_utilization_ratio is not None
+            and telemetry.max_hbm_utilization_ratio >= max_hbm_utilization
+        ):
+            return False, "tpu_hbm_oom_risk"
+        if (
+            telemetry.max_hbm_utilization_ratio is None
+            or telemetry.chips_with_hbm < telemetry.total_chips
+        ):
+            return False, "tpu_hbm_missing"
     if max_duty_cycle_percent is not None:
         if (
             telemetry.max_duty_cycle_percent is None
