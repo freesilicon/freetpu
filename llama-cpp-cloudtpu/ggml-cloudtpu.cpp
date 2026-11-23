@@ -52,7 +52,7 @@ struct cloudtpu_env_config {
     bool async_collectives = true;  // Enable XLA TPU async collective overlap flags on multi-chip SPMD
     uint32_t cache_cap = 4096;
     uint64_t min_elements = 0;
-    std::vector<int64_t> batch_buckets = {1, 2, 4, 8, 16};  // Continuous batching padded n_tokens buckets
+    std::vector<int64_t> batch_buckets = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512};  // Padded n_tokens buckets
     std::string libtpu_path;
 };
 
@@ -3425,6 +3425,7 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
             bucket_plan = cloudtpu::analyze_program_token_axes(bucket_built.prog_spec, cand_T, bucket_B);
             if (bucket_plan.success && bucket_plan.id_token_axis.empty()) {
                 bucket_plan.success = false;
+                bucket_plan.fail_reason = "id_token_axis_empty";
             }
             if (bucket_plan.success) {
                 for (size_t oi = 0; oi < bucket_built.output_nodes.size(); ++oi) {
@@ -3433,10 +3434,18 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
                         if (cit != ctx->cgraph_node_idx.end() &&
                             ctx->liveness.last_consumer[static_cast<size_t>(cit->second)] >= end_idx) {
                             bucket_plan.success = false;
+                            bucket_plan.fail_reason = "downstream_cgraph_consumer";
                             break;
                         }
                     }
                 }
+            }
+            if (!bucket_plan.success && ctx->env.verbose >= 2) {
+                GGML_LOG_INFO("ggml-cloudtpu: batch bucket skipped [%d..%d) T=%lld B=%lld reason=%s\n",
+                              start_idx, end_idx,
+                              static_cast<long long>(cand_T),
+                              static_cast<long long>(bucket_B),
+                              bucket_plan.fail_reason.empty() ? "unknown" : bucket_plan.fail_reason.c_str());
             }
         }
     }

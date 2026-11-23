@@ -152,8 +152,8 @@ std::string format_mlir_tensor_type(PjrtDType dtype, const std::vector<int64_t>&
 // Continuous Batching Padded Buckets & Safe Dataflow Token-Axis Propagation
 // =========================================================================
 
-// Parses CLOUDTPU_BATCH_BUCKETS (default "1,2,4,8,16", sorted unique positive ints;
-// "0" or "" disables bucketing and returns an empty vector).
+// Parses CLOUDTPU_BATCH_BUCKETS (default "1,2,4,8,16,32,64,128,256,512", sorted unique
+// positive ints; "0" or "" disables bucketing and returns an empty vector).
 std::vector<int64_t> parse_batch_buckets(const char* env_val);
 
 // Returns smallest bucket B >= n_tokens if 1 <= n_tokens <= buckets.back(), else 0.
@@ -174,6 +174,7 @@ struct BucketAnalysisResult {
     std::vector<TokenInputPadKind> input_pad_kind;
     std::vector<int> op_dst_token_axis;   // Parallel to GraphProgramSpec::ops (-1 or 0..3)
     std::vector<int> output_token_axis;   // Parallel to GraphProgramSpec::output_ids (-1 or 0..3)
+    std::string fail_reason;              // Populated when success == false for diagnostics
 };
 
 // Maps src_ax through a contiguous reshape from src_dims to dst_dims via unique outer/inner product

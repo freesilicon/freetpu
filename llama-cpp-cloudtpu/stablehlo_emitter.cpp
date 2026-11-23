@@ -1749,7 +1749,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
 
 std::vector<int64_t> parse_batch_buckets(const char* env_val) {
     if (env_val == nullptr) {
-        return {1, 2, 4, 8, 16};
+        return {1, 2, 4, 8, 16, 32, 64, 128, 256, 512};
     }
     std::string raw(env_val);
     size_t start = 0;
@@ -1877,12 +1877,42 @@ bool bucket_view_slice_dims(const int64_t parent_dims[4],
     return true;
 }
 
+static const char* cloud_op_kind_name(CloudOpKind kind) {
+    switch (kind) {
+        case CloudOpKind::MUL_MAT: return "MUL_MAT";
+        case CloudOpKind::RMS_NORM: return "RMS_NORM";
+        case CloudOpKind::ROPE: return "ROPE";
+        case CloudOpKind::SILU: return "SILU";
+        case CloudOpKind::SWIGLU: return "SWIGLU";
+        case CloudOpKind::SOFT_MAX: return "SOFT_MAX";
+        case CloudOpKind::GET_ROWS: return "GET_ROWS";
+        case CloudOpKind::SET_ROWS: return "SET_ROWS";
+        case CloudOpKind::ADD: return "ADD";
+        case CloudOpKind::MUL: return "MUL";
+        case CloudOpKind::SCALE: return "SCALE";
+        case CloudOpKind::CPY: return "CPY";
+        case CloudOpKind::RESHAPE: return "RESHAPE";
+        case CloudOpKind::TRANSPOSE: return "TRANSPOSE";
+        case CloudOpKind::SLICE: return "SLICE";
+        case CloudOpKind::FLASH_ATTN_EXT: return "FLASH_ATTN_EXT";
+        case CloudOpKind::ALL_REDUCE_SUM: return "ALL_REDUCE_SUM";
+        case CloudOpKind::ALL_GATHER: return "ALL_GATHER";
+        case CloudOpKind::REDUCE_SCATTER_SUM: return "REDUCE_SCATTER_SUM";
+    }
+    return "UNKNOWN";
+}
+
 BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
                                                 int64_t orig_tokens,
                                                 int64_t bucket_tokens) {
     BucketAnalysisResult out;
+    auto fail_with = [&](const std::string& reason) -> BucketAnalysisResult {
+        BucketAnalysisResult failed;
+        failed.fail_reason = reason;
+        return failed;
+    };
     if (orig_tokens < 1 || bucket_tokens <= orig_tokens) {
-        return out;
+        return fail_with("invalid_tokens");
     }
 
     struct ValInfo {
@@ -1891,6 +1921,7 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
         bool is_external = false;
         bool is_dense = true;
         bool is_donated = false;
+        bool allow_pre_padded = false;
         TensorShardingKind sharding = TensorShardingKind::REPLICATED;
         int ax = -2;  // -2 = unknown, -1 = batch-invariant, 0..3 = token axis
         TokenInputPadKind pad = TokenInputPadKind::NONE;
@@ -1904,7 +1935,7 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
 
     for (const TensorSpec& in : spec.inputs) {
         if (in.id == 0 || id_to_idx.count(in.id)) {
-            return out;
+            return fail_with("invalid_input_id");
         }
         ValInfo vi;
         vi.id = in.id;
@@ -1925,7 +1956,7 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
 
     for (const OpNodeSpec& op : spec.ops) {
         if (op.dst.id == 0 || id_to_idx.count(op.dst.id)) {
-            return out;
+            return fail_with("invalid_op_dst_id");
         }
         ValInfo vi;
         vi.id = op.dst.id;
@@ -1942,7 +1973,7 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
 
     for (uint64_t oid : spec.output_ids) {
         if (!id_to_idx.count(oid)) {
-            return out;
+            return fail_with("missing_output_id");
         }
     }
 
@@ -1955,20 +1986,38 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
         return true;
     };
 
+    std::string detail_reason;
+    auto note_reason = [&](const std::string& r) {
+        if (detail_reason.empty()) {
+            detail_reason = r;
+        }
+    };
+
     bool changed = false;
     auto set_ax = [&](size_t idx, int new_ax) -> bool {
         ValInfo& vi = vals[idx];
         if (new_ax >= 0) {
-            if (new_ax > 3 || vi.dims[new_ax] != orig_tokens) {
+            if (new_ax > 3) {
+                note_reason("invalid_axis");
+                return false;
+            }
+            const bool dim_ok = vi.allow_pre_padded
+                                    ? (vi.dims[new_ax] >= orig_tokens && vi.dims[new_ax] < bucket_tokens)
+                                    : (vi.dims[new_ax] == orig_tokens);
+            if (!dim_ok) {
+                note_reason(vi.is_external ? "input_dim_mismatch" : "op_dim_mismatch");
                 return false;
             }
             if (!vi.is_dense || vi.is_donated) {
+                note_reason(vi.is_donated ? "donated_conflict" : "non_dense_conflict");
                 return false;
             }
             if (vi.sharding == TensorShardingKind::SHARD_N && new_ax == 2) {
+                note_reason("shard_n_conflict");
                 return false;
             }
             if (vi.sharding == TensorShardingKind::SHARD_K && new_ax == 3) {
+                note_reason("shard_k_conflict");
                 return false;
             }
         }
@@ -1977,7 +2026,11 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
             changed = true;
             return true;
         }
-        return vi.ax == new_ax;
+        if (vi.ax != new_ax) {
+            note_reason(vi.is_external ? "input_conflict" : "axis_conflict");
+            return false;
+        }
+        return true;
     };
 
     auto set_pad = [&](size_t idx, TokenInputPadKind kind) -> bool {
@@ -1989,7 +2042,11 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
             vi.pad = kind;
             return true;
         }
-        return vi.pad == kind;
+        if (vi.pad != kind) {
+            note_reason("pad_kind_conflict");
+            return false;
+        }
+        return true;
     };
 
     auto is_1d_tokens = [&](size_t idx) -> bool {
@@ -2000,6 +2057,36 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
     auto is_1d_scalar = [&](size_t idx) -> bool {
         const auto& d = vals[idx].dims;
         return d[0] == 1 && d[1] == 1 && d[2] == 1 && d[3] == 1;
+    };
+
+    auto assign_attention_mask = [&](size_t m_i, int active_ax) -> bool {
+        if (active_ax == 2 && vals[m_i].dims[2] == orig_tokens) {
+            return set_ax(m_i, 2) && set_pad(m_i, TokenInputPadKind::ZERO);
+        }
+        if (active_ax == 2 && vals[m_i].dims[2] > orig_tokens && vals[m_i].dims[2] < bucket_tokens) {
+            if (!vals[m_i].is_external || !vals[m_i].is_dense || vals[m_i].is_donated ||
+                vals[m_i].sharding != TensorShardingKind::REPLICATED) {
+                return false;
+            }
+            if (vals[m_i].ax != -2 && !(vals[m_i].ax == 2 && vals[m_i].allow_pre_padded)) {
+                return false;
+            }
+            vals[m_i].allow_pre_padded = true;
+            return set_ax(m_i, 2) && set_pad(m_i, TokenInputPadKind::ZERO);
+        }
+        if (active_ax == 2 && vals[m_i].dims[2] >= bucket_tokens) {
+            return set_ax(m_i, -1);
+        }
+        if (vals[m_i].dims[active_ax] == 1 && orig_tokens > 1) {
+            if (vals[m_i].ax == -2) {
+                return set_ax(m_i, -1);
+            }
+            return vals[m_i].ax == -1;
+        }
+        if (vals[m_i].dims[active_ax] == orig_tokens) {
+            return set_ax(m_i, active_ax) && set_pad(m_i, TokenInputPadKind::ZERO);
+        }
+        return false;
     };
 
     auto propagate_op = [&](const OpNodeSpec& op, bool allow_mm_seed) -> bool {
@@ -2027,10 +2114,17 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
                         if (!set_ax(idx_i, -1) || !set_ax(dst_i, -1)) return false;
                     }
                 } else if (vals[tbl_i].ax == 2) {
-                    if (vals[idx_i].dims[3] != orig_tokens) {
-                        return false;
-                    }
-                    if (!set_ax(idx_i, 3) || !set_pad(idx_i, TokenInputPadKind::ZERO) || !set_ax(dst_i, 2)) {
+                    if (vals[idx_i].dims[3] == orig_tokens) {
+                        if (!set_ax(idx_i, 3) || !set_pad(idx_i, TokenInputPadKind::ZERO) || !set_ax(dst_i, 2)) {
+                            return false;
+                        }
+                    } else if (vals[idx_i].dims[3] >= 1 && vals[idx_i].dims[3] < orig_tokens) {
+                        // Partial output gather (e.g. final-layer inp_out_ids with N_out < T):
+                        // gathers valid rows inside [0..T-1] from the B-padded table and yields fixed N_out.
+                        if (!set_ax(idx_i, -1) || !set_ax(dst_i, -1)) {
+                            return false;
+                        }
+                    } else {
                         return false;
                     }
                 } else if (vals[tbl_i].ax >= 0) {
@@ -2104,13 +2198,7 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
                 if (op.src_ids.size() > 3 && op.src_ids[3] != 0) {
                     size_t m_i = 0;
                     if (!lookup_idx(op.src_ids[3], &m_i)) return false;
-                    if (vals[m_i].dims[2] == orig_tokens) {
-                        if (!set_ax(m_i, 2) || !set_pad(m_i, TokenInputPadKind::ZERO)) return false;
-                    } else if (vals[m_i].dims[2] >= bucket_tokens) {
-                        if (!set_ax(m_i, -1)) return false;
-                    } else {
-                        return false;
-                    }
+                    if (!assign_attention_mask(m_i, 2)) return false;
                 }
                 return true;
             }
@@ -2176,29 +2264,29 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
                 if (op.src_ids.size() < 2) return false;
                 size_t a_i = 0, b_i = 0;
                 if (!lookup_idx(op.src_ids[0], &a_i) || !lookup_idx(op.src_ids[1], &b_i)) return false;
-                if (vals[a_i].ax >= 0) {
-                    const int ta = vals[a_i].ax;
-                    if (!set_ax(dst_i, ta)) return false;
-                    if (vals[b_i].dims[ta] == 1 && (orig_tokens > 1 || !vals[b_i].is_external || !vals[a_i].is_external)) {
-                        if (vals[b_i].ax == -2 && !set_ax(b_i, -1)) return false;
-                    } else if (vals[b_i].dims[ta] == orig_tokens && orig_tokens > 1) {
-                        if (!set_ax(b_i, ta)) return false;
-                    } else if (vals[b_i].dims[ta] != 1) {
-                        return false;
+                auto propagate_active_side = [&](size_t active_i, size_t other_i) -> bool {
+                    const int t_ax = vals[active_i].ax;
+                    if (!set_ax(dst_i, t_ax)) return false;
+                    if (vals[other_i].dims[t_ax] == 1 &&
+                        (orig_tokens > 1 || !vals[other_i].is_external || !vals[active_i].is_external)) {
+                        if (vals[other_i].ax == -2) {
+                            return set_ax(other_i, -1);
+                        }
+                        return vals[other_i].ax == -1;
                     }
-                }
-                if (vals[b_i].ax >= 0) {
-                    const int tb = vals[b_i].ax;
-                    if (vals[a_i].dims[tb] != orig_tokens) return false;
-                    if (!set_ax(a_i, tb) || !set_ax(dst_i, tb)) return false;
-                }
-                if (vals[a_i].ax == -1 && vals[b_i].ax == -1) {
-                    if (!set_ax(dst_i, -1)) return false;
-                }
+                    if (vals[other_i].dims[t_ax] == orig_tokens && orig_tokens > 1) {
+                        return set_ax(other_i, t_ax);
+                    }
+                    return vals[other_i].dims[t_ax] == 1;
+                };
+                if (vals[a_i].ax >= 0 && !propagate_active_side(a_i, b_i)) return false;
+                if (vals[b_i].ax >= 0 && !propagate_active_side(b_i, a_i)) return false;
+                if (vals[a_i].ax == -1 && vals[b_i].ax == -1 && !set_ax(dst_i, -1)) return false;
                 if (vals[dst_i].ax >= 0) {
                     const int td = vals[dst_i].ax;
                     if (!set_ax(a_i, td)) return false;
-                    if (vals[b_i].dims[td] == 1 && (orig_tokens > 1 || !vals[b_i].is_external || !vals[a_i].is_external)) {
+                    if (vals[b_i].dims[td] == 1 &&
+                        (orig_tokens > 1 || !vals[b_i].is_external || !vals[a_i].is_external)) {
                         if (vals[b_i].ax == -2 && !set_ax(b_i, -1)) return false;
                     } else if (vals[b_i].dims[td] == orig_tokens && orig_tokens > 1) {
                         if (!set_ax(b_i, td)) return false;
@@ -2221,16 +2309,7 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
                     size_t m_i = 0;
                     if (!lookup_idx(op.src_ids[1], &m_i)) return false;
                     if (vals[x_i].ax >= 0) {
-                        const int tx = vals[x_i].ax;
-                        if (tx == 2 && vals[m_i].dims[2] >= bucket_tokens) {
-                            if (!set_ax(m_i, -1)) return false;
-                        } else if (vals[m_i].dims[tx] == 1 && orig_tokens > 1) {
-                            if (vals[m_i].ax == -2 && !set_ax(m_i, -1)) return false;
-                        } else if (vals[m_i].dims[tx] == orig_tokens) {
-                            if (!set_ax(m_i, tx) || !set_pad(m_i, TokenInputPadKind::ZERO)) return false;
-                        } else {
-                            return false;
-                        }
+                        if (!assign_attention_mask(m_i, vals[x_i].ax)) return false;
                     } else if (vals[x_i].ax == -1) {
                         if (!set_ax(m_i, -1)) return false;
                     }
@@ -2355,25 +2434,50 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
         return false;
     };
 
+    auto op_fail_label = [&](size_t oi, const OpNodeSpec& op) -> std::string {
+        std::string r = "op=" + std::to_string(oi) + ":" + cloud_op_kind_name(op.kind);
+        if (!detail_reason.empty()) {
+            r += "(" + detail_reason + ")";
+        }
+        return r;
+    };
+
+    std::string fail_reason;
     auto run_fixed_point = [&](bool seed_mm) -> bool {
         const size_t max_iters = std::max<size_t>(4, spec.ops.size() * 2 + 4);
         for (size_t iter = 0; iter < max_iters; ++iter) {
             changed = false;
             for (size_t oi = 0; oi < spec.ops.size(); ++oi) {
-                if (!propagate_op(spec.ops[oi], false)) return false;
+                detail_reason.clear();
+                if (!propagate_op(spec.ops[oi], false)) {
+                    fail_reason = op_fail_label(oi, spec.ops[oi]);
+                    return false;
+                }
             }
             for (size_t ri = spec.ops.size(); ri-- > 0;) {
-                if (!propagate_op(spec.ops[ri], false)) return false;
+                detail_reason.clear();
+                if (!propagate_op(spec.ops[ri], false)) {
+                    fail_reason = op_fail_label(ri, spec.ops[ri]);
+                    return false;
+                }
             }
             if (!changed) {
                 if (seed_mm) {
                     bool seeded = false;
-                    for (const OpNodeSpec& op : spec.ops) {
+                    for (size_t oi = 0; oi < spec.ops.size(); ++oi) {
+                        const OpNodeSpec& op = spec.ops[oi];
                         if (op.kind != CloudOpKind::MUL_MAT || op.src_ids.size() < 2) continue;
                         size_t x_i = 0, dst_i = 0;
-                        if (!lookup_idx(op.src_ids[1], &x_i) || !lookup_idx(op.dst.id, &dst_i)) return false;
+                        if (!lookup_idx(op.src_ids[1], &x_i) || !lookup_idx(op.dst.id, &dst_i)) {
+                            fail_reason = op_fail_label(oi, op);
+                            return false;
+                        }
                         if (vals[x_i].ax == -2 && vals[dst_i].ax == -2 && vals[x_i].dims[2] == orig_tokens) {
-                            if (!propagate_op(op, true)) return false;
+                            detail_reason.clear();
+                            if (!propagate_op(op, true)) {
+                                fail_reason = op_fail_label(oi, op);
+                                return false;
+                            }
                             seeded = true;
                             break;
                         }
@@ -2389,10 +2493,10 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
     };
 
     if (!run_fixed_point(false)) {
-        return out;
+        return fail_with(fail_reason);
     }
     if (!run_fixed_point(true)) {
-        return out;
+        return fail_with(fail_reason);
     }
 
     // Finalize any remaining unassigned external inputs as batch-invariant, propagate once more,
@@ -2403,16 +2507,17 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
         }
     }
     if (!run_fixed_point(false)) {
-        return out;
+        return fail_with(fail_reason);
     }
     for (ValInfo& vi : vals) {
         if (vi.ax == -2) {
             vi.ax = -1;
         }
     }
-    for (const OpNodeSpec& op : spec.ops) {
-        if (!propagate_op(op, false)) {
-            return out;
+    for (size_t oi = 0; oi < spec.ops.size(); ++oi) {
+        detail_reason.clear();
+        if (!propagate_op(spec.ops[oi], false)) {
+            return fail_with(op_fail_label(oi, spec.ops[oi]));
         }
     }
 
@@ -2424,7 +2529,7 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
         }
     }
     if (!any_token_varying) {
-        return out;
+        return fail_with("no_token_varying_tensors");
     }
 
     out.input_token_axis.resize(spec.inputs.size(), -1);
@@ -2432,9 +2537,11 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
     for (size_t i = 0; i < spec.inputs.size(); ++i) {
         const ValInfo& vi = vals[i];
         if (vi.ax >= 0) {
-            if (!vi.is_dense || vi.is_donated || vi.sharding != TensorShardingKind::REPLICATED ||
-                vi.dims[vi.ax] != orig_tokens) {
-                return BucketAnalysisResult{};
+            const bool dim_ok = vi.allow_pre_padded
+                                    ? (vi.dims[vi.ax] >= orig_tokens && vi.dims[vi.ax] < bucket_tokens)
+                                    : (vi.dims[vi.ax] == orig_tokens);
+            if (!vi.is_dense || vi.is_donated || vi.sharding != TensorShardingKind::REPLICATED || !dim_ok) {
+                return fail_with("input_validation_failed");
             }
             out.input_token_axis[i] = vi.ax;
             out.input_pad_kind[i] = (vi.pad == TokenInputPadKind::NONE) ? TokenInputPadKind::ZERO : vi.pad;
@@ -2451,7 +2558,7 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
     for (size_t i = 0; i < spec.output_ids.size(); ++i) {
         size_t idx = 0;
         if (!lookup_idx(spec.output_ids[i], &idx)) {
-            return BucketAnalysisResult{};
+            return fail_with("missing_output_id");
         }
         out.output_token_axis[i] = vals[idx].ax;
     }
@@ -2487,7 +2594,10 @@ bool apply_program_batch_bucket(GraphProgramSpec& spec, const BucketAnalysisResu
         os.ax = plan.input_token_axis[i];
         orig_map[spec.inputs[i].id] = os;
         if (os.ax >= 0) {
-            if (spec.inputs[i].dims[os.ax] != plan.orig_tokens) return false;
+            if (spec.inputs[i].dims[os.ax] < plan.orig_tokens ||
+                spec.inputs[i].dims[os.ax] >= plan.bucket_tokens) {
+                return false;
+            }
             spec.inputs[i].dims[os.ax] = plan.bucket_tokens;
         }
     }
