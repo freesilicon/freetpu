@@ -1931,8 +1931,10 @@ static cloudtpu::OpNodeSpec build_op_node_spec(const struct ggml_tensor* node,
     switch (node->op) {
         case GGML_OP_MUL_MAT: {
             spec.kind = cloudtpu::CloudOpKind::MUL_MAT;
-            const enum ggml_prec prec = ggml_prec_get_src(node, 1);
-            spec.high_precision = (prec == GGML_PREC_F32);
+            spec.high_precision =
+                (ggml_prec_get_acc(node) == GGML_PREC_F32) ||
+                (ggml_prec_get_src(node, 0) == GGML_PREC_F32) ||
+                (ggml_prec_get_src(node, 1) == GGML_PREC_F32);
             break;
         }
         case GGML_OP_RMS_NORM:
