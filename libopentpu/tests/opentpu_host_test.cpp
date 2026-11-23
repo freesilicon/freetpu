@@ -179,6 +179,36 @@ static void test_pjrt_api_mock() {
   pi.struct_size = PJRT_Plugin_Initialize_Args_STRUCT_SIZE;
   OT_CHECK(api->PJRT_Plugin_Initialize(&pi) == nullptr);
 
+  // Distributed client create_options (node_id != 0 or num_nodes != 1) must be rejected.
+  {
+    PJRT_NamedValue bad_node = {};
+    bad_node.struct_size = PJRT_NamedValue_STRUCT_SIZE;
+    bad_node.name = "node_id";
+    bad_node.name_size = 7;
+    bad_node.type = PJRT_NamedValue_kInt64;
+    bad_node.int64_value = 1;
+    bad_node.value_size = 1;
+    PJRT_Client_Create_Args bad_cc = {};
+    bad_cc.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
+    bad_cc.create_options = &bad_node;
+    bad_cc.num_options = 1;
+    PJRT_Error* ne = api->PJRT_Client_Create(&bad_cc);
+    OT_CHECK(ne != nullptr);
+    destroy_pjrt_error(api, ne);
+
+    PJRT_NamedValue bad_count = {};
+    bad_count.struct_size = PJRT_NamedValue_STRUCT_SIZE;
+    bad_count.name = "num_nodes";
+    bad_count.name_size = 9;
+    bad_count.type = PJRT_NamedValue_kInt64;
+    bad_count.int64_value = 4;
+    bad_count.value_size = 1;
+    bad_cc.create_options = &bad_count;
+    PJRT_Error* ce = api->PJRT_Client_Create(&bad_cc);
+    OT_CHECK(ce != nullptr);
+    destroy_pjrt_error(api, ce);
+  }
+
   PJRT_Client_Create_Args cc = {};
   cc.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
   OT_CHECK(api->PJRT_Client_Create(&cc) == nullptr);
@@ -349,14 +379,14 @@ static void test_pjrt_api_mock() {
   {
     const char* mlir_default_prec =
         "module {\n"
-        "  func.func public @main(%a: tensor<128x128xbf16> {jax.arg_info = \"a\"},\n"
+        "  func.func public @main(%a: tensor<128 x 128 x bf16> {jax.arg_info = \"inputs//left\"},\n"
         "                         %b: tensor<128x128xbf16> {mhlo.layout_mode = \"default\"})\n"
-        "      -> (tensor<128x128xbf16> {jax.result_info = \"\"}) {\n"
+        "      -> (tensor<128 x 128 x bf16> {jax.result_info = \"\"}) {\n"
         "    %0 = stablehlo.dot_general %a, %b,\n"
         "      contracting_dims = [1] x [0],\n"
         "      precision = [DEFAULT, DEFAULT]\n"
-        "      : (tensor<128x128xbf16>, tensor<128x128xbf16>) -> tensor<128x128xbf16>\n"
-        "    return %0 : tensor<128x128xbf16>\n"
+        "      : (tensor<128 x 128 x bf16>, tensor<128x128xbf16>) -> tensor<128 x 128 x bf16>\n"
+        "    return %0 : tensor<128 x 128 x bf16>\n"
         "  }\n"
         "}\n";
     PJRT_Program p_def = prog;

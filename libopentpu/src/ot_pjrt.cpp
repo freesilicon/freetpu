@@ -260,15 +260,19 @@ bool parse_strict_u32(const std::string& s, uint32_t* out) {
 
 bool parse_bf16_2d_tensor_type(const std::string& raw, uint32_t* d0, uint32_t* d1) {
   std::string s = trim_ws(raw);
-  if (s.size() < 12 || s.compare(0, 7, "tensor<") != 0 || s.back() != '>') return false;
-  std::string inner = s.substr(7, s.size() - 8);
+  if (s.compare(0, 6, "tensor") != 0 || s.empty() || s.back() != '>') return false;
+  size_t lt = 6;
+  while (lt < s.size() && std::isspace(static_cast<unsigned char>(s[lt]))) ++lt;
+  if (lt >= s.size() || s[lt] != '<') return false;
+  std::string inner = trim_ws(s.substr(lt + 1, s.size() - lt - 2));
   size_t x1 = inner.find('x');
   if (x1 == std::string::npos) return false;
   size_t x2 = inner.find('x', x1 + 1);
   if (x2 == std::string::npos) return false;
-  if (inner.substr(x2 + 1) != "bf16") return false;
-  return parse_strict_u32(inner.substr(0, x1), d0) &&
-         parse_strict_u32(inner.substr(x1 + 1, x2 - x1 - 1), d1);
+  if (inner.find('x', x2 + 1) != std::string::npos) return false;
+  if (trim_ws(inner.substr(x2 + 1)) != "bf16") return false;
+  return parse_strict_u32(trim_ws(inner.substr(0, x1)), d0) &&
+         parse_strict_u32(trim_ws(inner.substr(x1 + 1, x2 - x1 - 1)), d1);
 }
 
 bool is_valid_ssa_name(const std::string& s) {
@@ -284,12 +288,31 @@ std::string strip_line_comments(const std::string& s) {
   std::string out;
   out.reserve(s.size());
   size_t i = 0;
+  bool in_str = false;
   while (i < s.size()) {
-    if (i + 1 < s.size() && s[i] == '/' && s[i + 1] == '/') {
+    char c = s[i];
+    if (in_str) {
+      out.push_back(c);
+      ++i;
+      if (c == '\\' && i < s.size()) {
+        out.push_back(s[i++]);
+      } else if (c == '"') {
+        in_str = false;
+      }
+      continue;
+    }
+    if (c == '"') {
+      in_str = true;
+      out.push_back(c);
+      ++i;
+      continue;
+    }
+    if (i + 1 < s.size() && c == '/' && s[i + 1] == '/') {
       while (i < s.size() && s[i] != '\n') ++i;
       continue;
     }
-    out.push_back(s[i++]);
+    out.push_back(c);
+    ++i;
   }
   return out;
 }
@@ -817,6 +840,42 @@ PJRT_Error* ot_pjrt_event_on_ready(PJRT_Event_OnReady_Args* args) {
 
 PJRT_Error* ot_pjrt_client_create(PJRT_Client_Create_Args* args) {
   if (!args) return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null args");
+  if (args->num_options > 0 && !args->create_options) {
+    return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null create_options with nonzero num_options");
+  }
+  for (size_t i = 0; i < args->num_options; ++i) {
+    const PJRT_NamedValue& opt = args->create_options[i];
+    if (opt.name_size > 0 && !opt.name) {
+      return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null create_options name");
+    }
+    std::string name(opt.name ? opt.name : "", opt.name_size);
+    if (name == "node_id") {
+      if (opt.type != PJRT_NamedValue_kInt64) {
+        return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "node_id must be int64");
+      }
+      if (opt.int64_value != 0) {
+        return make_err(PJRT_Error_Code_UNIMPLEMENTED,
+                        "single-process OpenTPU supports node_id=0 only");
+      }
+    } else if (name == "num_nodes") {
+      if (opt.type != PJRT_NamedValue_kInt64) {
+        return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "num_nodes must be int64");
+      }
+      if (opt.int64_value != 1) {
+        return make_err(PJRT_Error_Code_UNIMPLEMENTED,
+                        "single-process OpenTPU supports num_nodes=1 only");
+      }
+    } else if (name == "visible_devices" || name == "allowed_devices") {
+      if (opt.type != PJRT_NamedValue_kInt64List) {
+        return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "visible_devices must be int64 list");
+      }
+      if (opt.value_size != 1 || !opt.int64_array_value || opt.int64_array_value[0] != 0) {
+        return make_err(PJRT_Error_Code_UNIMPLEMENTED,
+                        "single-device OpenTPU supports device 0 only");
+      }
+    }
+  }
+
   ot_config_t cfg = ot_config_default();
   const char* mock_env = std::getenv("OPENTPU_MOCK");
   if (mock_env && std::strcmp(mock_env, "1") == 0) cfg.mock_mode = 1;
