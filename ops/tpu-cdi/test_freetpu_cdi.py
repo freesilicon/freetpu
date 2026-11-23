@@ -2987,30 +2987,20 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertEqual(all_7x_env["TPU_VISIBLE_DEVICES"], "0,1,2,3,4,5,6,7")
                 # PyTorch/XLA `torch_xla/_internal/tpu.py` version regex must match every emitted type.
                 pytorch_xla_re = re.compile(r"^(?:v|tpu)(\d)([A-Za-z]?){7}-(\d+)$")
-                for atype in ("v5litepod-1", "v6e-4", "v6e-8", "tpu7x-4", "tpu7x-8"):
+                for atype in ("v5litepod-1", "v6e-4", "v6e-8", "v5p-8", "tpu7x-8"):
                     self.assertRegex(atype, pytorch_xla_re)
-                # Each NUMA half holds 2 physical chips (4 logical devices):
-                # numa0-2 -> chips 0,1 / logical devices 0,1,2,3; numa1-2 -> chips 2,3 / devices 4,5,6,7.
-                numa0_7x_env = dict(
-                    kv.split("=", 1) for kv in by_name_7x["numa0-2"]["containerEdits"]["env"]
-                )
-                self.assertEqual(len(by_name_7x["numa0-2"]["containerEdits"]["deviceNodes"]), 4)
-                self.assertEqual(numa0_7x_env["TPU_CHIPS_PER_HOST_BOUNDS"], "1,2,1")
-                self.assertEqual(numa0_7x_env["TPU_ACCELERATOR_TYPE"], "tpu7x-4")
-                self.assertEqual(numa0_7x_env["TPU_VISIBLE_CHIPS"], "0,1")
-                self.assertEqual(numa0_7x_env["TPU_VISIBLE_DEVICES"], "0,1,2,3")
-
-                numa1_7x_env = dict(
-                    kv.split("=", 1) for kv in by_name_7x["numa1-2"]["containerEdits"]["env"]
-                )
-                self.assertEqual(numa1_7x_env["TPU_CHIPS_PER_HOST_BOUNDS"], "1,2,1")
-                self.assertEqual(numa1_7x_env["TPU_ACCELERATOR_TYPE"], "tpu7x-4")
-                self.assertEqual(numa1_7x_env["TPU_VISIBLE_CHIPS"], "2,3")
-                self.assertEqual(numa1_7x_env["TPU_VISIBLE_DEVICES"], "4,5,6,7")
+                # Without a verified ICI mesh topology, 2-chip Ironwood sub-host slice
+                # presets (`numa0-2`/`numa1-2`, `1,2,1`, `tpu7x-4`) MUST NOT be emitted;
+                # raw per-chiplet selectors and full-host 4-chip `all` (`2,2,1`/`tpu7x-8`)
+                # remain published!
+                self.assertNotIn("numa0-2", by_name_7x)
+                self.assertNotIn("numa1-2", by_name_7x)
+                self.assertNotIn("0-1", by_name_7x)
+                self.assertNotIn("2-3", by_name_7x)
 
                 # Ironwood 4-chip host missing 1 PCI function/chiplet in NUMA 1 (only 7 VFIO nodes):
                 # `all` MUST omit TPU_VISIBLE_CHIPS, TPU_VISIBLE_DEVICES, TPU_CHIPS_PER_HOST_BOUNDS,
-                # and TPU_ACCELERATOR_TYPE (never advertising 0..7 or 2,2,1!).
+                # TPU_ACCELERATOR_TYPE, and TPU_SKIP_MDS_QUERY (never advertising 0..7 or 2,2,1!).
                 root_7x_deg = root / "tpu7x_missing_chiplet"
                 sysfs_7x_deg, dev_7x_deg = _make_mock_pci_vfio(
                     root_7x_deg,
@@ -3032,18 +3022,18 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertNotIn("TPU_VISIBLE_DEVICES", all_7x_deg_env)
                 self.assertNotIn("TPU_CHIPS_PER_HOST_BOUNDS", all_7x_deg_env)
                 self.assertNotIn("TPU_ACCELERATOR_TYPE", all_7x_deg_env)
+                self.assertNotIn("TPU_SKIP_MDS_QUERY", all_7x_deg_env)
                 self.assertNotIn("numa1-2", by_name_7x_deg)
-                self.assertIn("numa0-2", by_name_7x_deg)
+                self.assertNotIn("numa0-2", by_name_7x_deg)
 
-                # Ironwood 4-chip host missing 1 PCI function in the FIRST root (NUMA 0 has 3
-                # functions, NUMA 1 still has all 4 functions): unmatched NUMA 0 function MUST
-                # NOT pair across topology domains with NUMA 1 — `numa0-2` is withdrawn while
-                # healthy 4-function `numa1-2` remains published!
-                root_7x_deg0 = root / "tpu7x_missing_first_root_chiplet"
+                # Degraded 2-chip Ironwood host (only NUMA 1's 4 functions / 2 chips survive):
+                # MUST NOT emit `numa1-2`, `1,2,1`, `tpu7x-4`, or `TPU_SKIP_MDS_QUERY=true`
+                # without a verified ICI topology!
+                root_7x_deg0 = root / "tpu7x_only_two_chips"
                 sysfs_7x_deg0, dev_7x_deg0 = _make_mock_pci_vfio(
                     root_7x_deg0,
-                    devices=ironwood_devices[1:],  # drop 1 chiplet from FIRST root (NUMA 0)
-                    create_vfio_nodes=[str(i) for i in range(1, 8)],
+                    devices=ironwood_devices[4:],
+                    create_vfio_nodes=[str(i) for i in range(4, 8)],
                 )
                 chips_7x_deg0, ctrl_7x_deg0 = freetpu_cdi.discover_tpu_chips(
                     sysfs_root=sysfs_7x_deg0, dev_root=dev_7x_deg0
@@ -3053,22 +3043,15 @@ class FreeTpuCdiTests(unittest.TestCase):
                 )
                 by_name_7x_deg0 = {d["name"]: d for d in spec_7x_deg0["devices"]}
                 self.assertNotIn("numa0-2", by_name_7x_deg0)
-                self.assertIn("numa1-2", by_name_7x_deg0)
-                self.assertIn("2-3", by_name_7x_deg0)
-                self.assertEqual(len(by_name_7x_deg0["numa1-2"]["containerEdits"]["deviceNodes"]), 4)
-                n1_deg0_env = dict(
-                    kv.split("=", 1) for kv in by_name_7x_deg0["numa1-2"]["containerEdits"]["env"]
-                )
-                self.assertEqual(n1_deg0_env["TPU_CHIPS_PER_HOST_BOUNDS"], "1,2,1")
-                self.assertEqual(n1_deg0_env["TPU_ACCELERATOR_TYPE"], "tpu7x-4")
-                self.assertEqual(n1_deg0_env["TPU_VISIBLE_CHIPS"], "2,3")
-                self.assertEqual(n1_deg0_env["TPU_VISIBLE_DEVICES"], "4,5,6,7")
+                self.assertNotIn("numa1-2", by_name_7x_deg0)
+                self.assertNotIn("2-3", by_name_7x_deg0)
                 all_7x_deg0_env = dict(
                     kv.split("=", 1) for kv in by_name_7x_deg0["all"]["containerEdits"]["env"]
                 )
                 self.assertNotIn("TPU_VISIBLE_CHIPS", all_7x_deg0_env)
                 self.assertNotIn("TPU_CHIPS_PER_HOST_BOUNDS", all_7x_deg0_env)
                 self.assertNotIn("TPU_ACCELERATOR_TYPE", all_7x_deg0_env)
+                self.assertNotIn("TPU_SKIP_MDS_QUERY", all_7x_deg0_env)
 
                 # Orphaned Ironwood functions from TWO distinct degraded chips in the same
                 # domain (1 intact chip + 1 orphan from chip 1 + 1 orphan from chip 2 = 4
@@ -3232,8 +3215,8 @@ class FreeTpuCdiTests(unittest.TestCase):
                     sid_chips, sid_ctrl, single_host_env=True
                 )
                 sid_by_name = {d["name"]: d for d in sid_spec["devices"]}
-                self.assertIn("numa0-2", sid_by_name)
-                self.assertIn("numa1-2", sid_by_name)
+                self.assertNotIn("numa0-2", sid_by_name)
+                self.assertNotIn("numa1-2", sid_by_name)
                 sid_all_env = dict(
                     kv.split("=", 1) for kv in sid_by_name["all"]["containerEdits"]["env"]
                 )
@@ -3278,8 +3261,8 @@ class FreeTpuCdiTests(unittest.TestCase):
                     mfok_chips, mfok_ctrl, single_host_env=True
                 )
                 mfok_by_name = {d["name"]: d for d in mfok_spec["devices"]}
-                self.assertIn("numa0-2", mfok_by_name)
-                self.assertIn("numa1-2", mfok_by_name)
+                self.assertNotIn("numa0-2", mfok_by_name)
+                self.assertNotIn("numa1-2", mfok_by_name)
                 mfok_all_env = dict(
                     kv.split("=", 1) for kv in mfok_by_name["all"]["containerEdits"]["env"]
                 )
@@ -3664,6 +3647,27 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertNotIn("numa0-pcie-0000-00-4", ortn_deg_by_name)
                 self.assertIn("numa1-4", ortn_deg_by_name)
                 self.assertIn("numa1-pcie-0000-00-4", ortn_deg_by_name)
+
+                # Drop ALL 4 chips on NUMA 0: `numa1-pcie-0000-00-4` MUST STILL be
+                # preserved (alongside `numa1-4` and now-unambiguous `pcie-0000-00-4`)
+                # so existing workloads pinned to `numa1-pcie-0000-00-4` keep starting!
+                ortn_lost0_sys, ortn_lost0_dev = _make_mock_pci_vfio(
+                    root / "one_root_two_numa_lost_numa0",
+                    devices=one_root_two_numa_devs[4:],
+                    create_vfio_nodes=[str(i) for i in range(4, 8)],
+                )
+                ortn_lost0_out = root / "one_root_two_numa_lost_numa0.json"
+                ok_ol0, msg_ol0 = freetpu_cdi.reconcile_cdi_spec(
+                    ortn_lost0_out, sysfs_root=ortn_lost0_sys, dev_root=ortn_lost0_dev
+                )
+                self.assertTrue(ok_ol0, msg_ol0)
+                ol0_spec = json.loads(ortn_lost0_out.read_text(encoding="utf-8"))
+                ol0_by_name = {d["name"]: d for d in ol0_spec["devices"]}
+                self.assertNotIn("numa0-4", ol0_by_name)
+                self.assertNotIn("numa0-pcie-0000-00-4", ol0_by_name)
+                self.assertIn("numa1-4", ol0_by_name)
+                self.assertIn("numa1-pcie-0000-00-4", ol0_by_name)
+                self.assertIn("pcie-0000-00-4", ol0_by_name)
 
             # Verify Kubernetes DRA example manifest uses stable resource.k8s.io/v1 API
             # and accurately qualifies Kubernetes 1.34 DRA Topology Manager limitation.

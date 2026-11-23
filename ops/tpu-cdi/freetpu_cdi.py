@@ -973,11 +973,11 @@ def _distinct_physical_indices(
 
 
 # Supported single-host Cloud TPU physical chip topologies per generation.
-# Per Google Cloud TPU docs, single-VM `v6e`, `v5e`, `v5p`, and `v4` hosts
-# support `{1, 4, 8}` physical chips (NOT 2 — 2 surviving chips in a degraded
-# 4-chip v6e NUMA domain could be diagonal members of the 2x2 torus), while
-# dual-chiplet `tpu7x` (Ironwood) supports `{1, 2, 4, 8}` physical chips
-# (e.g. a 2-chip / 4-core `tpu7x-4` NUMA half on a 4-chip `tpu7x-8` host).
+# Per Google Cloud TPU docs, single-VM `v6e`, `v5e`, `v5p`, `v4`, and `tpu7x`
+# (Ironwood, documented 4-chip `2x2x1` VM) hosts support `{1, 4, 8}` physical
+# chips — NOT 2, because PCIe/NUMA locality alone cannot verify that two chips
+# form a contiguous `1,2,1` ICI mesh (e.g. two surviving v6e chips could be a
+# 2x2 diagonal, and Ironwood documents 4-chip single-host topology).
 # Sub-host slice selectors (`numa*`, `pcie-*`, range aliases) are emitted ONLY
 # when a domain's live physical chip count is supported for its generation and
 # every chip has its full PCI function set.
@@ -987,7 +987,7 @@ _SUPPORTED_SINGLE_HOST_CHIP_COUNTS_BY_GEN: Dict[str, frozenset[int]] = {
     "v5e": frozenset({1, 4, 8}),
     "v5p": frozenset({1, 4, 8}),
     "v4": frozenset({1, 4, 8}),
-    "tpu7x": frozenset({1, 2, 4, 8}),
+    "tpu7x": frozenset({1, 4, 8}),
 }
 _DEFAULT_SUPPORTED_SINGLE_HOST_CHIP_COUNTS = frozenset({1, 4, 8})
 
@@ -1209,7 +1209,7 @@ def _tpu_accelerator_type(
     - `v5e` -> `v5litepod-<chips>` (e.g. `v5litepod-1`, `v5litepod-4`, `v5litepod-8`)
     - `v5p` -> `v5p-<cores>` (`chips * 2`, e.g. `v5p-8`)
     - `v4` -> `v4-<cores>` (`chips * 2`, e.g. `v4-8`)
-    - `tpu7x` (Ironwood) -> `tpu7x-<cores>` (`chips * 2`, e.g. `tpu7x-4`, `tpu7x-8`)
+    - `tpu7x` (Ironwood) -> `tpu7x-<cores>` (`chips * 2`, e.g. `tpu7x-8`)
     """
     if not _is_supported_single_host_chip_count(physical_chip_count, generations):
         return None
@@ -1382,23 +1382,23 @@ def _compute_topology_slices(
         discovered_numa = d_key[1]
         pcie_root = d_key[2]
         slice_chip_count = len(slice_phys_indices)
-        # Emit stable root-qualified `pcie-<root>-<chips>` whenever the root maps
-        # to a single domain (including shared-NUMA dual-root hosts so losing a
-        # sibling root never breaks workloads pinned to `pcie-<root>-<chips>`).
-        # When one PCIe root spans multiple NUMA domains, suppress the ambiguous
-        # root-only alias and emit domain-qualified `numa<node>-pcie-<root>-<chips>`
-        # alongside any unique `numa<node>-<chips>` selector.
+        # Always emit the full NUMA-and-root-qualified selector
+        # (`numa<node>-pcie-<root>-<chips>`) whenever NUMA locality is known so
+        # workloads pinned to it keep working even if a sibling NUMA domain on
+        # the same PCIe root disappears. Also emit `numa<node>-<chips>` when the
+        # NUMA node is unique and root-only `pcie-<root>-<chips>` when the root
+        # spans a single NUMA domain (suppressing ambiguous root-only aliases).
         pcie_root_token = _pci_bdf_token(pcie_root)
         root_spans_multiple_domains = len(root_to_domains.get(pcie_root, set())) > 1
         candidate_names: List[str] = []
         if use_explicit_numa and discovered_numa is not None:
             candidate_names.append(f"numa{discovered_numa}-{slice_chip_count}")
-        if not root_spans_multiple_domains:
-            candidate_names.append(f"pcie-{pcie_root_token}-{slice_chip_count}")
-        elif discovered_numa is not None:
+        if discovered_numa is not None:
             candidate_names.append(
                 f"numa{discovered_numa}-pcie-{pcie_root_token}-{slice_chip_count}"
             )
+        if not root_spans_multiple_domains:
+            candidate_names.append(f"pcie-{pcie_root_token}-{slice_chip_count}")
         verified_vis = _resolve_verified_visibility_ordinals(
             d_chips,
             chips,

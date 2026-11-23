@@ -1716,6 +1716,41 @@ TPU Device Status
             self.assertTrue(fb_snap.tpu_info_available)
             self.assertEqual(fb_snap.devices[0].duty_cycle_percent, 45.0)
 
+            # 4. Sidecar (`skip_pid_scan=True`) and non-default runtime-address modes
+            #    MUST ALSO reserve ~35% of the shared budget for the Python fallback!
+            sidecar_py_timeouts: list[float] = []
+
+            def _ok_py(*args, **kwargs):
+                sidecar_py_timeouts.append(float(kwargs.get("timeout_s", 0.0)))
+                rows = tpu_exporter.parse_tpu_info_output(
+                    "TPU Runtime Utilization\n"
+                    "| Chip | HBM Usage (GiB)      | Duty cycle |\n"
+                    "|------|----------------------|------------|\n"
+                    "| 0    | 8.00 GiB / 32.00 GiB | 55.00%     |\n"
+                )
+                return True, None, rows
+
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.object(tpu_exporter, "_query_grpc_runtime_metrics", side_effect=_stalled_grpc),
+                mock.patch.object(tpu_exporter, "_query_tpu_info_python_metrics", side_effect=_ok_py),
+            ):
+                sc_snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin="tpu-info",
+                    tpu_info_timeout_s=0.4,
+                    chip_id_map={"0000:00:06.0": "0"},
+                    skip_pid_scan=True,
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=root / "no-shm",
+                )
+            self.assertEqual(len(sidecar_py_timeouts), 1)
+            self.assertGreaterEqual(sidecar_py_timeouts[0], 0.1)
+            self.assertTrue(sc_snap.tpu_info_available)
+            self.assertEqual(sc_snap.devices[0].duty_cycle_percent, 55.0)
+
             # When CLI fails fast, Python fallback receives strictly the remaining shared budget.
             def _fast_fail_cli(*args, **kwargs):
                 _time.sleep(0.05)
@@ -3426,6 +3461,37 @@ TPU Runtime Utilization
                 self.assertEqual(len(captured_handlers), 1)
                 self.assertIsInstance(captured_handlers[0], urllib.request.ProxyHandler)
                 self.assertEqual(captured_handlers[0].proxies, {})
+
+            # HTTP protocol errors (e.g. BadStatusLine / IncompleteRead from a malformed
+            # metadata reply) MUST return None for the preemption gauge and never abort
+            # the rest of the TPU scrape!
+            import http.client
+
+            for proto_exc in (
+                http.client.BadStatusLine("HTTP/1.1"),
+                http.client.IncompleteRead(b"tru"),
+            ):
+                with mock.patch.object(urllib.request, "urlopen", side_effect=proto_exc):
+                    self.assertIsNone(
+                        tpu_exporter.query_gcp_preemption_status(
+                            "http://127.0.0.1:1/preempted", timeout_s=0.5
+                        )
+                    )
+                with (
+                    _mock_vfio_char_lstat(),
+                    mock.patch.object(urllib.request, "urlopen", side_effect=proto_exc),
+                ):
+                    proto_snap = tpu_exporter.collect_snapshot(
+                        sysfs_root=sysfs_root,
+                        dev_root=dev_root,
+                        proc_root=proc_root,
+                        tpu_info_bin=None,
+                        shm_root=root / "no-shm",
+                        gcp_metadata_preemption=True,
+                        gcp_metadata_url="http://127.0.0.1:1/preempted",
+                    )
+                self.assertIsNone(proto_snap.gcp_preempted_status)
+                self.assertEqual(len(proto_snap.devices), 2)
 
             alerts_path = EXPORTER_DIR / "prometheus-alerts.yml"
             self.assertTrue(alerts_path.is_file())

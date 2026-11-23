@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import http.client
 import importlib
 import importlib.metadata
 import importlib.util
@@ -1578,7 +1579,7 @@ def query_gcp_preemption_status(
             resp_ctx = urllib.request.urlopen(req, timeout=effective_timeout)
         with resp_ctx as resp:
             body = resp.read(256).decode("utf-8", errors="replace").strip().lower()
-    except (OSError, urllib.error.URLError, ValueError):
+    except (OSError, urllib.error.URLError, http.client.HTTPException, ValueError):
         return None
     if body == "true":
         return 1
@@ -2049,12 +2050,15 @@ def collect_snapshot(
         tpu_info_ok, tpu_info_err, parsed_rows = False, "tpu-info disabled", {}
     elif skip_pid_scan or explicit_non_default_runtime_addr:
         # Sidecar / no-PID mode OR explicit non-default `--runtime-metrics-addr`:
-        # try direct in-process gRPC first, then fall back to `tpu_info.metrics`
-        # within the remaining deadline. Never spawn the `tpu-info` CLI subprocess.
+        # try direct in-process gRPC first (capped at 65% of the shared runtime
+        # budget so 35% remains reserved for the Python `tpu_info.metrics`
+        # fallback if gRPC RPCs stall to their deadlines). Never spawn the
+        # `tpu-info` CLI subprocess.
+        grpc_budget_s = runtime_budget_s * 0.65
         tpu_info_ok, tpu_info_err, parsed_rows = _query_grpc_runtime_metrics(
             devices,
             addr=runtime_metrics_addr,
-            timeout_s=runtime_budget_s,
+            timeout_s=grpc_budget_s,
         )
         if tpu_info_ok:
             runtime_source_label = "libtpu-grpc"
