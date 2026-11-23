@@ -10621,6 +10621,337 @@ asyncio.run(main())
             )
             self.assertEqual(st_bad, 403, f"expected 403 for Origin={bad_origin}")
 
+    def test_legacy_completions_accepts_terminal_choice_usage_while_chat_requires_final_frame(
+        self,
+    ) -> None:
+        recorded_usage: List[UsageEvent] = []
+
+        class _RecordHook:
+            def record_usage(self, event: UsageEvent) -> None:
+                recorded_usage.append(event)
+
+        stream_mode = ["legacy_terminal_usage"]
+
+        class _LegacyUsageSSEHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return None
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = json.dumps(
+                    {"object": "list", "data": [{"id": "m-legacy-usage"}]}
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802
+                clen = int(self.headers.get("Content-Length", "0"))
+                if clen > 0:
+                    self.rfile.read(clen)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                if stream_mode[0] == "legacy_terminal_usage":
+                    self.wfile.write(
+                        b'data: {"id":"cmpl-1","object":"text_completion",'
+                        b'"choices":[{"index":0,"text":"Hello","finish_reason":null}]}\n\n'
+                        b'data: {"id":"cmpl-1","object":"text_completion",'
+                        b'"choices":[{"index":0,"text":" world","finish_reason":"stop"}],'
+                        b'"usage":{"prompt_tokens":12,"completion_tokens":4,"total_tokens":16}}\n\n'
+                        b"data: [DONE]\n\n"
+                    )
+                elif stream_mode[0] == "legacy_interim_only":
+                    self.wfile.write(
+                        b'data: {"id":"cmpl-2","object":"text_completion",'
+                        b'"choices":[{"index":0,"text":"Hello","finish_reason":null}],'
+                        b'"usage":{"prompt_tokens":12,"completion_tokens":1,"total_tokens":13}}\n\n'
+                        b'data: {"id":"cmpl-2","object":"text_completion",'
+                        b'"choices":[{"index":0,"text":" world","finish_reason":"stop"}]}\n\n'
+                        b"data: [DONE]\n\n"
+                    )
+                else:
+                    # /v1/chat/completions with usage attached to a non-empty choices chunk
+                    # (no separate choices:[] final usage frame).
+                    self.wfile.write(
+                        b'data: {"id":"chat-1","object":"chat.completion.chunk",'
+                        b'"choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":"stop"}],'
+                        b'"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}\n\n'
+                        b"data: [DONE]\n\n"
+                    )
+                self.wfile.flush()
+
+        srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _LegacyUsageSSEHandler))
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            failure_cooldown_s=30.0,
+            backends=[
+                BackendConfig(
+                    id="legacy-usage-b",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=f"http://127.0.0.1:{srv.server_address[1]}/v1",
+                    models=["m-legacy-usage"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg, usage_hook=_RecordHook()))
+        rport = router.server_address[1]
+
+        # 1. /v1/completions with llama-server terminal choice + usage succeeds cleanly.
+        st_ok, _, bd_ok = _http_request(
+            rport,
+            "POST",
+            "/v1/completions",
+            body={
+                "model": "m-legacy-usage",
+                "prompt": "Say hello",
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            },
+        )
+        self.assertEqual(st_ok, 200)
+        self.assertIn(b"data: [DONE]", bd_ok)
+        self.assertEqual(len(recorded_usage), 1)
+        self.assertEqual(recorded_usage[0].status_code, 200)
+        self.assertEqual(recorded_usage[0].prompt_tokens, 12)
+        self.assertEqual(recorded_usage[0].completion_tokens, 4)
+        self.assertEqual(router.engine._backends[0].total_failures, 0)
+
+        # 2. /v1/completions with usage only on non-terminal chunk still withholds [DONE].
+        stream_mode[0] = "legacy_interim_only"
+        conn = http.client.HTTPConnection("127.0.0.1", rport, timeout=3.0)
+        try:
+            body = json.dumps(
+                {
+                    "model": "m-legacy-usage",
+                    "prompt": "Say hello",
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                }
+            ).encode("utf-8")
+            conn.request(
+                "POST",
+                "/v1/completions",
+                body=body,
+                headers={"Content-Type": "application/json"},
+            )
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)
+            with self.assertRaises(http.client.IncompleteRead) as exc_info:
+                resp.read()
+            self.assertIn(b"upstream_stream_interrupted", exc_info.exception.partial)
+            self.assertNotIn(b"data: [DONE]", exc_info.exception.partial)
+        finally:
+            conn.close()
+        self.assertEqual(recorded_usage[1].status_code, 502)
+
+        # 3. /v1/chat/completions still requires a separate choices:[] final usage frame.
+        router.engine._backends[0].healthy = True
+        router.engine._backends[0].cooldown_until_monotonic = 0.0
+        stream_mode[0] = "chat_choice_usage_only"
+        conn = http.client.HTTPConnection("127.0.0.1", rport, timeout=3.0)
+        try:
+            body = json.dumps(
+                {
+                    "model": "m-legacy-usage",
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                    "messages": [{"role": "user", "content": "hi"}],
+                }
+            ).encode("utf-8")
+            conn.request(
+                "POST",
+                "/v1/chat/completions",
+                body=body,
+                headers={"Content-Type": "application/json"},
+            )
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)
+            with self.assertRaises(http.client.IncompleteRead) as exc_info:
+                resp.read()
+            self.assertIn(b"upstream_stream_interrupted", exc_info.exception.partial)
+            self.assertNotIn(b"data: [DONE]", exc_info.exception.partial)
+        finally:
+            conn.close()
+        self.assertEqual(recorded_usage[2].status_code, 502)
+
+    def test_tpu_exporter_https_retries_alternate_address_on_tls_stall_and_cert_error(
+        self,
+    ) -> None:
+        from router import tpu_telemetry as telemetry_mod
+
+        exporter = self._track(_MockTpuExporter(health_status=1, generation="v6e"))
+        good_port = exporter.server_address[1]
+
+        # Listener that accepts TCP immediately then stalls forever during TLS handshake.
+        stall_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        stall_srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        stall_srv.bind(("127.0.0.1", 0))
+        stall_srv.listen(4)
+        stall_port = stall_srv.getsockname()[1]
+        accepted_stall: List[socket.socket] = []
+
+        def _accept_and_stall() -> None:
+            try:
+                c, _ = stall_srv.accept()
+                accepted_stall.append(c)
+                time.sleep(2.0)
+            except OSError:
+                pass
+
+        stall_thread = threading.Thread(target=_accept_and_stall, daemon=True)
+        stall_thread.start()
+
+        class _PassThroughTLSSock:
+            """Test double wrapping a connected socket to verify TLS handshake + cleanup."""
+
+            def __init__(self, raw_sock: socket.socket, *, fail_cert: bool = False) -> None:
+                self._raw = raw_sock
+                self._fail_cert = fail_cert
+                self.handshake_called = False
+                self.closed = False
+
+            def do_handshake(self) -> None:
+                self.handshake_called = True
+                if self._fail_cert:
+                    raise ssl.SSLCertVerificationError(1, "certificate verify failed")
+
+            def close(self) -> None:
+                self.closed = True
+                self._raw.close()
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._raw, name)
+
+        real_ssl_ctx = ssl.create_default_context()
+        wrapped_calls: List[Tuple[int, Optional[str], bool]] = []
+        created_wrappers: List[_PassThroughTLSSock] = []
+        mode = ["tls_stall_then_good"]
+
+        class _FailoverTestSSLContext:
+            def wrap_socket(
+                self,
+                sock: socket.socket,
+                *,
+                server_hostname: Optional[str] = None,
+                do_handshake_on_connect: bool = True,
+            ) -> Any:
+                peer_port = sock.getpeername()[1]
+                wrapped_calls.append((peer_port, server_hostname, do_handshake_on_connect))
+                if mode[0] == "tls_stall_then_good" and peer_port == stall_port:
+                    return real_ssl_ctx.wrap_socket(
+                        sock,
+                        server_hostname=server_hostname,
+                        do_handshake_on_connect=do_handshake_on_connect,
+                    )
+                fail_cert = (
+                    mode[0] == "all_bad_cert"
+                    or (mode[0] == "bad_cert_then_good" and peer_port == stall_port)
+                )
+                wrapper = _PassThroughTLSSock(sock, fail_cert=fail_cert)
+                created_wrappers.append(wrapper)
+                return wrapper
+
+        fake_infos = [
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("127.0.0.1", stall_port),
+            ),
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("127.0.0.1", good_port),
+            ),
+        ]
+        try:
+            # 1. Address 0 accepts TCP then stalls in real TLS handshake -> times out within
+            #    attempt budget and falls back to address 1.
+            t0 = time.monotonic()
+            with (
+                mock.patch.object(
+                    telemetry_mod, "_resolve_host_with_deadline", return_value=fake_infos
+                ),
+                mock.patch.object(
+                    ssl, "create_default_context", return_value=_FailoverTestSSLContext()
+                ),
+            ):
+                telem = scrape_tpu_exporter(
+                    f"https://tls-tpu.local:{good_port}/metrics",
+                    timeout_s=0.6,
+                )
+            elapsed = time.monotonic() - t0
+            self.assertTrue(telem.reachable)
+            self.assertTrue(telem.exporter_up)
+            self.assertEqual(telem.healthy_chips, 1)
+            self.assertLess(elapsed, 0.6)
+            self.assertEqual(len(wrapped_calls), 2)
+            self.assertEqual(wrapped_calls[0], (stall_port, "tls-tpu.local", False))
+            self.assertEqual(wrapped_calls[1], (good_port, "tls-tpu.local", False))
+            self.assertTrue(created_wrappers[-1].handshake_called)
+
+            # 2. Address 0 fails TLS certificate verification -> closes socket 0 and retries addr 1.
+            wrapped_calls.clear()
+            created_wrappers.clear()
+            mode[0] = "bad_cert_then_good"
+            with (
+                mock.patch.object(
+                    telemetry_mod, "_resolve_host_with_deadline", return_value=fake_infos
+                ),
+                mock.patch.object(
+                    ssl, "create_default_context", return_value=_FailoverTestSSLContext()
+                ),
+            ):
+                telem_cert = scrape_tpu_exporter(
+                    f"https://tls-tpu.local:{good_port}/metrics",
+                    timeout_s=0.6,
+                )
+            self.assertTrue(telem_cert.reachable)
+            self.assertEqual(telem_cert.healthy_chips, 1)
+            self.assertEqual(len(created_wrappers), 2)
+            self.assertTrue(created_wrappers[0].closed)
+            self.assertTrue(created_wrappers[1].handshake_called)
+
+            # 3. If ALL addresses fail certificate verification, scrape fails closed.
+            wrapped_calls.clear()
+            created_wrappers.clear()
+            mode[0] = "all_bad_cert"
+            with (
+                mock.patch.object(
+                    telemetry_mod, "_resolve_host_with_deadline", return_value=fake_infos
+                ),
+                mock.patch.object(
+                    ssl, "create_default_context", return_value=_FailoverTestSSLContext()
+                ),
+            ):
+                telem_fail = scrape_tpu_exporter(
+                    f"https://tls-tpu.local:{good_port}/metrics",
+                    timeout_s=0.6,
+                )
+            self.assertFalse(telem_fail.reachable)
+            self.assertTrue(all(w.closed for w in created_wrappers))
+        finally:
+            for c in accepted_stall:
+                try:
+                    c.close()
+                except OSError:
+                    pass
+            stall_srv.close()
+            stall_thread.join(timeout=2.5)
+
 
 def run_self_tests(verbosity: int = 1) -> int:
     """Run all router tests cleanly via unittest."""

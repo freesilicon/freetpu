@@ -677,66 +677,73 @@ def _create_deadline_connection(
     sock: Optional[socket.socket] = None
     num_addrs = len(infos)
     for idx, (af, socktype, proto, _canonname, sa) in enumerate(infos):
-        rem = deadline - time.monotonic()
+        now = time.monotonic()
+        rem = deadline - now
         if rem <= 0:
             raise TimeoutError(f"{label} exceeded elapsed deadline")
         addrs_left = num_addrs - idx
         # Reserve time for alternate addresses and HTTP I/O when trying a nonfinal
-        # address so one silently blackholed IP cannot exhaust the scrape deadline.
+        # address so one silently blackholed IP or stalled TLS handshake cannot
+        # exhaust the scrape deadline.
         attempt_timeout = rem / (addrs_left + 1) if addrs_left > 1 else rem
+        attempt_deadline = min(deadline, now + attempt_timeout)
         cand_sock: Optional[socket.socket] = None
+        tls_sock: Optional[ssl.SSLSocket] = None
         try:
             cand_sock = socket.socket(af, socktype, proto)
             cand_sock.settimeout(attempt_timeout)
             cand_sock.connect(sa)
-            sock = cand_sock
+            if ssl_context is not None:
+                tls_rem = attempt_deadline - time.monotonic()
+                if tls_rem <= 0:
+                    raise TimeoutError(f"{label} exceeded attempt deadline")
+                cand_sock.settimeout(tls_rem)
+                tls_sock = ssl_context.wrap_socket(
+                    cand_sock,
+                    server_hostname=server_hostname or host,
+                    do_handshake_on_connect=False,
+                )
+                _tls_handshake_with_deadline(
+                    tls_sock,
+                    deadline=attempt_deadline,
+                    label=label,
+                )
+                sock = tls_sock
+            else:
+                sock = cand_sock
             last_err = None
             break
-        except OSError as exc:
+        except (OSError, ssl.SSLError) as exc:
             last_err = exc
-            if cand_sock is not None:
+            if tls_sock is not None:
+                try:
+                    tls_sock.close()
+                except OSError:
+                    pass
+            elif cand_sock is not None:
                 try:
                     cand_sock.close()
                 except OSError:
                     pass
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"{label} exceeded elapsed deadline") from exc
-
-    if sock is None:
-        if last_err is not None:
-            raise last_err
-        raise OSError("getaddrinfo returns an empty list")
-
-    if ssl_context is not None:
-        rem = deadline - time.monotonic()
-        if rem <= 0:
-            try:
-                sock.close()
-            except OSError:
-                pass
-            raise TimeoutError(f"{label} exceeded elapsed deadline")
-        tls_sock: Optional[ssl.SSLSocket] = None
-        try:
-            sock.settimeout(rem)
-            tls_sock = ssl_context.wrap_socket(
-                sock,
-                server_hostname=server_hostname or host,
-                do_handshake_on_connect=False,
-            )
-            _tls_handshake_with_deadline(tls_sock, deadline=deadline, label=label)
-            sock = tls_sock
         except BaseException:
             if tls_sock is not None:
                 try:
                     tls_sock.close()
                 except OSError:
                     pass
-            else:
+            elif cand_sock is not None:
                 try:
-                    sock.close()
+                    cand_sock.close()
                 except OSError:
                     pass
             raise
+
+    if sock is None:
+        if last_err is not None:
+            raise last_err
+        raise OSError("getaddrinfo returns an empty list")
 
     rem = deadline - time.monotonic()
     if rem <= 0:

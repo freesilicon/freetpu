@@ -3726,6 +3726,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         est_prompt_tokens=est_prompt_tokens,
                         principal=auth_ctx.principal,
                         expect_final_usage=expect_final_usage,
+                        is_legacy_completions=(endpoint == "/v1/completions"),
                         committed_flag=committed_flag,
                     )
                     if sse_outcome == "committed":
@@ -4167,6 +4168,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         est_prompt_tokens: int,
         principal: str,
         expect_final_usage: bool = False,
+        is_legacy_completions: bool = False,
         committed_flag: Optional[List[bool]] = None,
     ) -> Tuple[str, int, Optional[bytes]]:
         """Buffer until first generated output or terminator before committing 200 OK.
@@ -4404,10 +4406,12 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                     return False, False
                 made_progress = False
                 choices = obj.get("choices")
+                event_has_terminal_choice = False
                 if isinstance(choices, list):
                     for choice in choices:
                         if isinstance(choice, dict) and choice.get("finish_reason") is not None:
                             made_progress = True
+                            event_has_terminal_choice = True
                             c_idx = choice.get("index")
                             if isinstance(c_idx, int) and not isinstance(c_idx, bool) and c_idx >= 0:
                                 finished_choice_indices.add(c_idx)
@@ -4438,7 +4442,17 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         got_usage_count = True
                         made_progress = True
                     has_choices = isinstance(choices, list) and len(choices) > 0
-                    if got_usage_count and not has_choices:
+                    all_choices_finished_now = all(
+                        idx in finished_choice_indices for idx in range(required_choices)
+                    )
+                    if got_usage_count and (
+                        not has_choices
+                        or (
+                            is_legacy_completions
+                            and event_has_terminal_choice
+                            and all_choices_finished_now
+                        )
+                    ):
                         saw_final_usage = True
                 timings = obj.get("timings")
                 if isinstance(timings, dict):
