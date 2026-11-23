@@ -10,14 +10,14 @@ Live Phase 1 `v6e-8` serving measurements showed:
 - **Extreme decode bandwidth bound:** The Trillium BF16 roofline ridge point is `7,344 / 12.8 ≈ 574` tokens/step (`560` at `13.1 TB/s`), so `c=1..16` operates at **0.1%–1.2% MFU**.
 - **`c=8 -> c=16` proxy cliff (now fixed):** The initial `ThreadingHTTPServer` router hit a model-independent `+7.2 ms/step` stall from `listen(5)` SYN backlog saturation, Nagle/Delayed-ACK without `TCP_NODELAY`, per-chunk thread/GIL/JSON contention, and upstream HTTP/1.1 keep-alive waits (`active_inflight` ghost counts and `5.6–6.0 s` EWMA `latency_ms`).
 - **Router fix in this branch:** `_SSEReactor` (`selectors.DefaultSelector` event-loop pump), `request_queue_size = 1024`, `TCP_NODELAY` on client/upstream sockets, `"Connection": "close"` upstream headers, single-pass SSE parsing, and `_BackendSlotLease` RAII guarantees keep router overhead `<0.5 ms/chunk` at `c=128` with `active_inflight == 0` after every request.
-- **Next hardware unlock (`c=64..128` BF16):** Scaling batch concurrency from `c=16` to `c=64..128` with async multi-step scheduling and 256-aligned token budgets projects **4×–7×** aggregate `tok/s` while keeping model weights in native BF16 (`65.5 GB` on 32B, `141 GB` on 70B).
+- **Next hardware unlock (`c=64..128` BF16):** Scaling batch concurrency from `c=16` to `c=64..128` with async multi-step scheduling and power-of-two `num_tokens` compilation buckets up to `2048` projects **4×–7×** aggregate `tok/s` while keeping model weights in native BF16 (`65.5 GB` on 32B, `141 GB` on 70B).
 
 ---
 
 ## 2. TPU Shape Compilation & Persistent XLA Cache
 
-Trillium (`v6e`) uses `256×256` systolic MXUs; reduction/output dimensions align to `256` (and intermediate dimensions to `128`). With the preset flags (`--max-num-seqs 128`, `--max-num-batched-tokens 2048`, `--enable-chunked-prefill`), upstream `tpu-inference` compiles:
-- **Token-count (`num_tokens`) padding buckets** up to `--max-num-batched-tokens 2048` (`256`-aligned for Trillium MXUs, covering single-token decode steps through chunked prefills).
+With the preset flags (`--max-num-seqs 128`, `--max-num-batched-tokens 2048`, `--enable-chunked-prefill`) and default bucket settings, pinned `vllm/vllm-tpu:v0.33.0` (`tpu-inference`) compiles:
+- **Power-of-two token-count (`num_tokens`) padding buckets** starting at `16` (`16, 32, 64, 128, 256, 512, 1024, 2048`) up to `--max-num-batched-tokens 2048` (so decode steps at `c=64` and `c=128` use distinct shapes below `256`).
 - **A single attention request bucket** sized to `--max-num-seqs 128` by default (unless attention request bucketing is explicitly enabled in the container configuration).
 
 ### Persistent XLA Compilation Cache

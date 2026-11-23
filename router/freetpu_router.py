@@ -153,21 +153,29 @@ class _JsonStructureLimitError(ValueError):
     """Raised when inbound JSON exceeds nesting depth or structural node budgets."""
 
 
+class _MalformedSSEPayloadError(Exception):
+    """Raised when an upstream SSE data frame contains invalid or non-object JSON before commit."""
+
+
 def _validate_json_structure(
     text: str | bytes | bytearray,
     *,
     max_depth: int,
     max_nodes: int,
+    containers_out: Optional[List[int]] = None,
 ) -> int:
     """Validate JSON nesting depth and structural count in O(1) working memory.
 
     Accepts UTF-8 `bytes`/`bytearray` (avoiding decoded string allocation before
     validation) or `str`, and returns the number of structural JSON tokens seen.
+    When `containers_out` is provided (a 1-element list), stores the count of
+    object/array container openings (`{` and `[`) seen outside strings.
     """
     n = len(text)
     i = 0
     depth = 0
     nodes = 0
+    containers = 0
     if isinstance(text, (bytes, bytearray)):
         # UTF-8 is ASCII-compatible: structural ASCII bytes never appear inside
         # multi-byte UTF-8 sequences (all continuation/lead bytes are >= 0x80).
@@ -178,6 +186,8 @@ def _validate_json_structure(
                 while True:
                     q = text.find(b'"', i)
                     if q == -1:
+                        if containers_out is not None:
+                            containers_out[0] = containers
                         return nodes
                     bs = 0
                     j = q - 1
@@ -195,6 +205,7 @@ def _validate_json_structure(
                     raise _JsonStructureLimitError(
                         f"JSON nesting depth exceeds maximum limit of {max_depth}"
                     )
+                containers += 1
                 nodes += 1
                 if nodes > max_nodes:
                     raise _JsonStructureLimitError(
@@ -210,6 +221,8 @@ def _validate_json_structure(
                         f"JSON structure exceeds maximum limit of {max_nodes} elements"
                     )
             i += 1
+        if containers_out is not None:
+            containers_out[0] = containers
         return nodes
 
     while i < n:
@@ -221,6 +234,8 @@ def _validate_json_structure(
                 q = text.find('"', i)
                 if q == -1:
                     # Unclosed string literal; let json.loads report exact JSONDecodeError.
+                    if containers_out is not None:
+                        containers_out[0] = containers
                     return nodes
                 bs = 0
                 j = q - 1
@@ -238,6 +253,7 @@ def _validate_json_structure(
                 raise _JsonStructureLimitError(
                     f"JSON nesting depth exceeds maximum limit of {max_depth}"
                 )
+            containers += 1
             nodes += 1
             if nodes > max_nodes:
                 raise _JsonStructureLimitError(
@@ -253,10 +269,17 @@ def _validate_json_structure(
                     f"JSON structure exceeds maximum limit of {max_nodes} elements"
                 )
         i += 1
+    if containers_out is not None:
+        containers_out[0] = containers
     return nodes
 
 
-def _estimate_json_parse_memory(raw: bytes, *, nodes: int = 0) -> int:
+def _estimate_json_parse_memory(
+    raw: bytes,
+    *,
+    nodes: int = 0,
+    containers: int = 0,
+) -> int:
     """Estimate peak CPython working-set bytes while decoding and parsing UTF-8 JSON.
 
     Accounts for PEP-393 flexible string widening (UCS-1 / UCS-2 / UCS-4),
@@ -275,7 +298,14 @@ def _estimate_json_parse_memory(raw: bytes, *, nodes: int = 0) -> int:
         base_mult = 10
     else:
         base_mult = 6
-    dense_node_overhead = max(0, nodes - 64) * 32
+    if nodes > 64:
+        if containers > 0:
+            separators = max(0, nodes - containers)
+            dense_node_overhead = (containers * 240) + (separators * 64)
+        else:
+            dense_node_overhead = nodes * 128
+    else:
+        dense_node_overhead = 0
     return max(n * base_mult, n * (base_mult - 1) + dense_node_overhead)
 
 
@@ -865,18 +895,20 @@ def _sse_event_should_commit(payload_bytes: bytes) -> bool:
     """Return True when a complete non-error SSE data event carries output or a terminator.
 
     Role-only, empty-delta, and prompt-progress chunks are buffered so Spot
-    preemption before the first generated token still fails over.
+    preemption before the first generated token still fails over. Raises
+    `_MalformedSSEPayloadError` on invalid UTF-8, invalid JSON, or non-object
+    JSON so pre-commit protocol corruption remains eligible for failover.
     """
     if not payload_bytes:
         return False
     if payload_bytes == b"[DONE]":
         return True
     try:
-        obj = json.loads(payload_bytes.decode("utf-8", errors="replace"))
-    except json.JSONDecodeError:
-        return True
+        obj = json.loads(payload_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _MalformedSSEPayloadError("Malformed JSON in upstream SSE event") from exc
     if not isinstance(obj, Mapping):
-        return True
+        raise _MalformedSSEPayloadError("Upstream SSE event JSON must be an object")
     if obj.get("error") is not None or obj.get("object") == "error":
         return False
     if _extract_choice_output_text(obj):
@@ -3182,11 +3214,13 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             except OSError:
                 pass
 
+            req_containers = [0]
             try:
                 req_nodes = _validate_json_structure(
                     raw_req,
                     max_depth=engine.config.max_json_depth,
                     max_nodes=engine.config.max_json_nodes,
+                    containers_out=req_containers,
                 )
             except _JsonStructureLimitError as exc:
                 self._send_bytes(
@@ -3199,7 +3233,11 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
 
-            needed_parse_mem = _estimate_json_parse_memory(raw_req, nodes=req_nodes)
+            needed_parse_mem = _estimate_json_parse_memory(
+                raw_req,
+                nodes=req_nodes,
+                containers=req_containers[0],
+            )
             if needed_parse_mem > max_total_req_mem:
                 self._send_bytes(
                     413,
@@ -3636,11 +3674,13 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                             # PEP-393 peak parse memory before decoding, extract usage,
                             # and drop the parsed tree immediately.
                             resp_nodes: Optional[int] = None
+                            resp_containers = [0]
                             try:
                                 resp_nodes = _validate_json_structure(
                                     raw_resp,
                                     max_depth=engine.config.max_json_depth,
                                     max_nodes=engine.config.max_response_json_nodes,
+                                    containers_out=resp_containers,
                                 )
                             except _JsonStructureLimitError:
                                 if resp_mem_reserved[0] > 0:
@@ -3663,7 +3703,9 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                 )
                             if resp_nodes is not None:
                                 needed_resp_mem = _estimate_json_parse_memory(
-                                    raw_resp, nodes=resp_nodes
+                                    raw_resp,
+                                    nodes=resp_nodes,
+                                    containers=resp_containers[0],
                                 )
                                 parse_extra = max(0, needed_resp_mem - resp_mem_reserved[0])
                                 if parse_extra > 0:
@@ -4018,7 +4060,19 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                             if is_retryable:
                                 return "retryable_error", err_status, err_body
                             return "client_error", err_status, err_body
-                        if _sse_event_should_commit(payload_bytes):
+                        try:
+                            should_commit = _sse_event_should_commit(payload_bytes)
+                        except _MalformedSSEPayloadError:
+                            return (
+                                "retryable_error",
+                                502,
+                                _openai_error_body(
+                                    "Upstream SSE backend emitted malformed JSON payload before first token",
+                                    error_type="bad_gateway",
+                                    code="upstream_stream_error",
+                                ),
+                            )
+                        if should_commit:
                             first_chunk_time = time.monotonic()
                             break
                     else:

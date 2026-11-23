@@ -179,8 +179,8 @@ def _parse_prometheus_sample_line(line: str) -> Optional[PromSample]:
 def parse_prometheus_text(text: str) -> List[PromSample]:
     """Parse Prometheus text exposition format 0.0.4 into `PromSample` items."""
     samples: List[PromSample] = []
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
+    for raw_line in text.split("\n"):
+        line = raw_line.strip(" \t\r")
         if not line or line.startswith("#"):
             continue
         sample = _parse_prometheus_sample_line(line)

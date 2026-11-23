@@ -44,6 +44,7 @@ from router.freetpu_router import (  # noqa: E402
     _MemoryBudgetExceededError,
     _apply_cli_overrides,
     _build_cli_parser,
+    _estimate_json_parse_memory,
     _join_backend_url,
     _open_http_connection,
     _read_bounded_http_response,
@@ -7282,6 +7283,9 @@ asyncio.run(main())
             playbook.index("python3 router/freetpu_router.py"),
         )
         self.assertIn("single attention request bucket", playbook.lower())
+        self.assertIn("power-of-two", playbook.lower())
+        self.assertIn("16, 32, 64, 128, 256, 512, 1024, 2048", playbook)
+        self.assertNotIn("256-aligned", playbook)
         self.assertNotIn("vllm/vllm-tpu:latest", playbook)
         self.assertIn("vllm/vllm-tpu:v0.33.0", playbook)
         self.assertIn(
@@ -8872,6 +8876,235 @@ asyncio.run(main())
         self.assertEqual(parsed_deg["status"], "degraded")
         self.assertEqual(parsed_deg["healthy_backends"], 0)
         self.assertEqual(len(parsed_deg["backends"]), 1)
+
+    def test_malformed_pre_commit_sse_json_fails_over_instead_of_committing_200(
+        self,
+    ) -> None:
+        # Raw HTTP primary backend that passes /v1/models health probes but returns
+        # malformed JSON (or non-object JSON) in its first SSE data frame.
+        bad_payload_box = [b"data: {corrupted-json\n\n"]
+
+        class _CorruptSSEHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return None
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = json.dumps(
+                    {"object": "list", "data": [{"id": "m-corrupt-sse"}]}
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802
+                clen = int(self.headers.get("Content-Length", "0"))
+                if clen > 0:
+                    self.rfile.read(clen)
+                body = bad_payload_box[0]
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+
+        corrupt_srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _CorruptSSEHandler))
+        corrupt_srv.daemon_threads = True
+        threading.Thread(target=corrupt_srv.serve_forever, daemon=True).start()
+        corrupt_port = corrupt_srv.server_address[1]
+
+        healthy_fallback = self._track(
+            _MockOpenAIBackend("healthy-sse-fallback", ["m-corrupt-sse"])
+        )
+
+        # 1. With a healthy fallback, both malformed JSON and non-object JSON fail over cleanly.
+        for bad_frame in (b"data: {corrupted-json\n\n", b"data: 12345\n\n"):
+            with self.subTest(bad_frame=bad_frame):
+                bad_payload_box[0] = bad_frame
+                cfg = RouterConfig(
+                    host="127.0.0.1",
+                    port=0,
+                    policy="local_first",
+                    backends=[
+                        BackendConfig(
+                            id="corrupt-primary",
+                            type="pixel-tpu",
+                            local=True,
+                            priority=0,
+                            base_url=f"http://127.0.0.1:{corrupt_port}/v1",
+                            models=["m-corrupt-sse"],
+                        ),
+                        BackendConfig(
+                            id="healthy-sse-fallback",
+                            type="cloud-tpu-v6e",
+                            local=False,
+                            priority=1,
+                            base_url=healthy_fallback.base_url,
+                            models=["m-corrupt-sse"],
+                        ),
+                    ],
+                )
+                router = self._track(create_router_server(cfg))
+                rport = router.server_address[1]
+                st, hdrs, bd = _http_request(
+                    rport,
+                    "POST",
+                    "/v1/chat/completions",
+                    body={
+                        "model": "m-corrupt-sse",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                )
+                self.assertEqual(st, 200)
+                self.assertEqual(hdrs["x-freetpu-backend"], "healthy-sse-fallback")
+                self.assertEqual(hdrs["x-freetpu-failovers"], "1")
+                self.assertIn(b"data: [DONE]", bd)
+                self.assertNotIn(b"corrupted-json", bd)
+
+        # 2. Without a fallback, malformed pre-commit JSON returns HTTP 502 instead of committing 200.
+        bad_payload_box[0] = b"data: {corrupted-json\n\n"
+        cfg_solo = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            backends=[
+                BackendConfig(
+                    id="corrupt-only",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=f"http://127.0.0.1:{corrupt_port}/v1",
+                    models=["m-corrupt-sse"],
+                )
+            ],
+        )
+        router_solo = self._track(create_router_server(cfg_solo))
+        st_solo, _, bd_solo = _http_request(
+            router_solo.server_address[1],
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-corrupt-sse",
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        self.assertEqual(st_solo, 502)
+        self.assertIn(b"upstream_stream_error", bd_solo)
+
+    def test_json_memory_estimator_covers_dense_container_working_set(self) -> None:
+        def _deep_sizeof(obj: Any, seen: Optional[set[int]] = None) -> int:
+            if seen is None:
+                seen = set()
+            oid = id(obj)
+            if oid in seen:
+                return 0
+            seen.add(oid)
+            total = sys.getsizeof(obj)
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    total += _deep_sizeof(k, seen) + _deep_sizeof(v, seen)
+            elif isinstance(obj, list):
+                for item in obj:
+                    total += _deep_sizeof(item, seen)
+            return total
+
+        dense_cases = [
+            [{"a": 1} for _ in range(10000)],
+            [{} for _ in range(10000)],
+            [{f"k{i}": f"v{i}"} for i in range(5000)],
+        ]
+        for payload in dense_cases:
+            raw = json.dumps(payload).encode("utf-8")
+            containers = [0]
+            nodes = _validate_json_structure(
+                raw,
+                max_depth=64,
+                max_nodes=262144,
+                containers_out=containers,
+            )
+            est = _estimate_json_parse_memory(
+                raw, nodes=nodes, containers=containers[0]
+            )
+            text = raw.decode("utf-8")
+            parsed = json.loads(text)
+            actual = sys.getsizeof(raw) + sys.getsizeof(text) + _deep_sizeof(parsed)
+            self.assertGreaterEqual(
+                est,
+                actual,
+                f"Estimated {est} bytes < actual {actual} bytes for dense payload",
+            )
+
+        # End-to-end: 10,000 one-field objects (~100 KB wire, ~2.1 MB actual) is rejected
+        # with 413 against a 1.5 MB total request memory budget instead of slipping through.
+        backend = self._track(_MockOpenAIBackend("dense-mem-b", ["m-dense"]))
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            max_json_nodes=65536,
+            max_total_request_memory_bytes=1_500_000,
+            backends=[
+                BackendConfig(
+                    id="dense-mem-b",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=backend.base_url,
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        st, _, bd = _http_request(
+            router.server_address[1],
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-dense",
+                "messages": [{"role": "user", "content": "dense"}],
+                "extra_items": [{"a": 1} for _ in range(10000)],
+            },
+        )
+        self.assertEqual(st, 413)
+        self.assertIn(b"payload_too_large", bd)
+        self.assertEqual(router.engine._req_mem_used_bytes, 0)
+
+    def test_prometheus_parser_splits_only_on_lf_preserving_cr_and_unicode_line_separators(
+        self,
+    ) -> None:
+        prom_text = (
+            'freetpu_exporter_up 1\r\n'
+            'freetpu_tpu_devices_discovered 3\n'
+            'freetpu_tpu_health_status{chip="0",desc="before\rafter"} 1\n'
+            'freetpu_tpu_health_status{chip="1",desc="ls\u2028here"} 1\n'
+            'freetpu_tpu_health_status{chip="2",desc="ps\u2029here"} 1\r\n'
+            'freetpu_tpu_duty_cycle_percent{chip="0",desc="cr\rlabel"} 30.0\n'
+            'freetpu_tpu_duty_cycle_percent{chip="1",desc="u2028\u2028label"} 60.0\n'
+            'freetpu_tpu_duty_cycle_percent{chip="2",desc="u2029\u2029label"} 90.0\n'
+        )
+        samples = parse_prometheus_text(prom_text)
+        by_key = {(s.name, s.labels.get("chip", "")): s for s in samples}
+        self.assertEqual(
+            by_key[("freetpu_tpu_health_status", "0")].labels["desc"],
+            "before\rafter",
+        )
+        self.assertEqual(
+            by_key[("freetpu_tpu_health_status", "1")].labels["desc"],
+            "ls\u2028here",
+        )
+        self.assertEqual(
+            by_key[("freetpu_tpu_health_status", "2")].labels["desc"],
+            "ps\u2029here",
+        )
+        telem = summarize_tpu_samples(samples)
+        self.assertTrue(telem.exporter_up)
+        self.assertEqual(telem.devices_discovered, 3)
+        self.assertEqual(telem.healthy_chips, 3)
+        self.assertEqual(telem.total_chips, 3)
+        self.assertAlmostEqual(telem.avg_duty_cycle_percent or 0.0, 60.0)
 
 
 def run_self_tests(verbosity: int = 1) -> int:
