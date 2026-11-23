@@ -2581,6 +2581,10 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
                 size_t x_i = 0;
                 if (!lookup_idx(op.src_ids[0], &x_i)) return false;
                 if (vals[x_i].ax == 3 || vals[dst_i].ax == 3) return false;
+                if (op.soft_max.max_bias > 0.0f && (vals[x_i].ax == 1 || vals[dst_i].ax == 1)) {
+                    note_reason("softmax_alibi_head_axis");
+                    return false;
+                }
                 if (vals[x_i].ax != -2 && !set_ax(dst_i, vals[x_i].ax)) return false;
                 if (vals[dst_i].ax != -2 && !set_ax(x_i, vals[dst_i].ax)) return false;
                 if (op.src_ids.size() > 1 && op.src_ids[1] != 0) {

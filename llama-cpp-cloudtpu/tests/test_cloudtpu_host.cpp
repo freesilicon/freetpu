@@ -6,6 +6,10 @@
 #include "ggml-backend.h"
 #include "ggml-cloudtpu.h"
 #include "ggml-cpu.h"
+#if !defined(_WIN32)
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 #endif
 
 #include <cmath>
@@ -2608,6 +2612,109 @@ void test_q4_i4_spmd_sharding() {
         }
     }
 
+    // 1b) SHARD_N across P=4 chips with ODD per-chip N_local (N=12 -> N_local=3) in native S4 mode
+    {
+        const int64_t N = 12, N_local = N / P, NB = 8, K = NB * 32, M = 8;
+        std::vector<int8_t> qs_km(static_cast<size_t>(NB * 32 * N));
+        std::vector<float> d_km(static_cast<size_t>(NB * N));
+        std::vector<float> m_s4_km(static_cast<size_t>(NB * N));
+        std::vector<float> w_ref(static_cast<size_t>(N * K));
+        for (int64_t b = 0; b < NB; ++b) {
+            for (int64_t n = 0; n < N; ++n) {
+                const float d = 0.03f * static_cast<float>((n + b * 2) % 7 + 1);
+                const float m = -0.10f + 0.02f * static_cast<float>(n % 5);
+                d_km[static_cast<size_t>(b * N + n)] = d;
+                m_s4_km[static_cast<size_t>(b * N + n)] = m + 8.0f * d;
+                for (int64_t k = 0; k < 32; ++k) {
+                    const uint8_t u4 = static_cast<uint8_t>((n * 5 + b * 3 + k * 7) & 0x0F);
+                    const int8_t s4 = static_cast<int8_t>(static_cast<int>(u4) - 8);
+                    qs_km[static_cast<size_t>((b * 32 + k) * N + n)] = s4;
+                    w_ref[static_cast<size_t>(n * K + b * 32 + k)] = static_cast<float>(u4) * d + m;
+                }
+            }
+        }
+        std::vector<float> x(static_cast<size_t>(M * K));
+        for (size_t i = 0; i < x.size(); ++i) x[i] = std::sin(static_cast<float>(i) * 0.11f);
+        std::vector<float> ref(static_cast<size_t>(M * N), 0.0f);
+        for (int64_t m = 0; m < M; ++m) {
+            for (int64_t n = 0; n < N; ++n) {
+                float acc = 0.0f;
+                for (int64_t k = 0; k < K; ++k) {
+                    acc += x[static_cast<size_t>(m * K + k)] * w_ref[static_cast<size_t>(n * K + k)];
+                }
+                ref[static_cast<size_t>(m * N + n)] = acc;
+            }
+        }
+
+        cloudtpu::GraphProgramSpec spec;
+        spec.spmd_chips = P;
+        spec.bf16_matmul = true;
+        cloudtpu::TensorSpec w_spec{1, cloudtpu::PjrtDType::S4, cloudtpu::TensorStorageKind::Q4_K_I4, {1, 1, N, K}};
+        w_spec.sharding = cloudtpu::TensorShardingKind::SHARD_N;
+        w_spec.scale_dtype = cloudtpu::PjrtDType::F32;
+        spec.inputs.push_back(w_spec);
+        spec.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, K}});
+        cloudtpu::OpNodeSpec mm;
+        mm.kind = cloudtpu::CloudOpKind::MUL_MAT;
+        mm.src_ids = {1, 2};
+        mm.dst = {3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, N}};
+        spec.ops.push_back(mm);
+        spec.output_ids = {3};
+        const auto prog = cloudtpu::emit_stablehlo_program(spec);
+
+        size_t free_before = 0, free_after = 0, total_b = 0;
+        CHECK_TRUE(rt.query_memory_stats(0, &free_before, &total_b), "SPMD odd S4 mem before");
+        std::vector<std::vector<cloudtpu::PjrtBufferPtr>> per_dev(static_cast<size_t>(P));
+        for (int p = 0; p < P; ++p) {
+            std::vector<int8_t> qs_s(static_cast<size_t>(NB * 32 * N_local));
+            std::vector<float> d_s(static_cast<size_t>(NB * N_local));
+            std::vector<float> m_s(static_cast<size_t>(NB * N_local));
+            for (int64_t bk = 0; bk < NB * 32; ++bk) {
+                for (int64_t nl = 0; nl < N_local; ++nl) {
+                    qs_s[static_cast<size_t>(bk * N_local + nl)] =
+                        qs_km[static_cast<size_t>(bk * N + p * N_local + nl)];
+                }
+            }
+            for (int64_t b = 0; b < NB; ++b) {
+                for (int64_t nl = 0; nl < N_local; ++nl) {
+                    d_s[static_cast<size_t>(b * N_local + nl)] = d_km[static_cast<size_t>(b * N + p * N_local + nl)];
+                    m_s[static_cast<size_t>(b * N_local + nl)] = m_s4_km[static_cast<size_t>(b * N + p * N_local + nl)];
+                }
+            }
+            per_dev[static_cast<size_t>(p)].push_back(
+                rt.buffer_from_host(p, qs_s.data(), cloudtpu::PjrtDType::S4, {1, 1, NB, 32, N_local}));
+            per_dev[static_cast<size_t>(p)].push_back(
+                rt.buffer_from_host(p, d_s.data(), cloudtpu::PjrtDType::F32, {1, 1, NB, N_local}));
+            per_dev[static_cast<size_t>(p)].push_back(
+                rt.buffer_from_host(p, m_s.data(), cloudtpu::PjrtDType::F32, {1, 1, NB, N_local}));
+            per_dev[static_cast<size_t>(p)].push_back(
+                rt.buffer_from_host(p, x.data(), cloudtpu::PjrtDType::F32, {1, 1, M, K}));
+        }
+        CHECK_TRUE(rt.query_memory_stats(0, &free_after, &total_b), "SPMD odd S4 mem after");
+        const size_t expected_chip0 =
+            cloudtpu::pjrt_dtype_nbytes(cloudtpu::PjrtDType::S4, static_cast<size_t>(NB * 32 * N_local)) +
+            static_cast<size_t>(NB * N_local) * 2 * sizeof(float) +
+            x.size() * sizeof(float);
+        CHECK_TRUE((free_before - free_after) == expected_chip0,
+                   "SPMD odd-width SHARD_N Q4_K_I4 chip0 uses 0.5B/weight / P");
+
+        const auto exec = rt.compile_or_get(prog.cache_key, prog.mlir_text, 0, copts);
+        std::vector<std::vector<PJRT_Buffer*>> raw_in(static_cast<size_t>(P));
+        std::vector<PJRT_Buffer* const*> in_ptrs(static_cast<size_t>(P));
+        for (int p = 0; p < P; ++p) {
+            for (const auto& b : per_dev[static_cast<size_t>(p)]) raw_in[static_cast<size_t>(p)].push_back(b->handle.get());
+            in_ptrs[static_cast<size_t>(p)] = raw_in[static_cast<size_t>(p)].data();
+        }
+        std::vector<std::vector<cloudtpu::PjrtBufferPtr>> outs;
+        rt.execute_spmd(exec, P, in_ptrs.data(), prog.input_bindings.size(), outs,
+                        {cloudtpu::PjrtDType::F32}, {{1, 1, M, N}}, true);
+        for (int p = 0; p < P; ++p) {
+            std::vector<float> got(ref.size());
+            rt.buffer_to_host(outs[static_cast<size_t>(p)][0]->handle.get(), got.data(), got.size() * sizeof(float));
+            CHECK_TRUE(compute_nmse(got, ref) < 5e-4, "SPMD odd-width SHARD_N Q4_K_I4 P=4 NMSE < 5e-4");
+        }
+    }
+
     // 2) SHARD_K across P=4 chips (N=16, K=512 -> K_local=128 (NB_local=4), M=8 -> all_reduce)
     {
         const int64_t N = 16, NB = 16, NB_local = NB / P, K = NB * 32, K_local = NB_local * 32, M = 8;
@@ -4659,8 +4766,69 @@ void test_continuous_batching_padded_buckets() {
                    "shared reshaped input with ZERO (ROPE) and NEG_ONE (SET_ROWS) must fail closed");
     }
 
+    // 5) SOFT_MAX with active ALiBi (max_bias > 0) must reject head-axis (ax==1) bucketing so ALiBi slopes
+    //    stay invariant to padding, while non-ALiBi and non-head-axis SOFT_MAX still bucket cleanly.
+    {
+        const int64_t T = 3, B = 4, D = 8;
+        auto make_alibi_head_spec = [&](float max_bias) {
+            cloudtpu::GraphProgramSpec sp;
+            sp.inputs.push_back({1, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 16, D}});
+            sp.inputs.push_back({2, cloudtpu::PjrtDType::S32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, T}});
+            sp.inputs.push_back({3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, D}});
+            cloudtpu::OpNodeSpec gr;
+            gr.kind = cloudtpu::CloudOpKind::GET_ROWS;
+            gr.src_ids = {1, 2};
+            gr.dst = {4, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, T, D}};
+            sp.ops.push_back(gr);
+            cloudtpu::OpNodeSpec rsh;
+            rsh.kind = cloudtpu::CloudOpKind::RESHAPE;
+            rsh.src_ids = {4};
+            rsh.dst = {5, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, T, 1, D}};
+            sp.ops.push_back(rsh);
+            cloudtpu::OpNodeSpec sm;
+            sm.kind = cloudtpu::CloudOpKind::SOFT_MAX;
+            sm.src_ids = {5, 3};
+            sm.soft_max.scale = 1.0f;
+            sm.soft_max.max_bias = max_bias;
+            sm.dst = {6, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, T, 1, D}};
+            sp.ops.push_back(sm);
+            sp.output_ids = {6};
+            return sp;
+        };
+
+        const auto alibi_head = cloudtpu::analyze_program_token_axes(make_alibi_head_spec(8.0f), T, B);
+        CHECK_TRUE(!alibi_head.success && alibi_head.fail_reason.find("softmax_alibi_head_axis") != std::string::npos,
+                   "ALiBi SOFT_MAX with token axis on head dim (ax==1) must reject bucketing");
+
+        const auto non_alibi_head = cloudtpu::analyze_program_token_axes(make_alibi_head_spec(0.0f), T, B);
+        CHECK_TRUE(non_alibi_head.success && non_alibi_head.output_token_axis[0] == 1,
+                   "non-ALiBi SOFT_MAX on ax==1 must still bucket cleanly");
+
+        // ALiBi SOFT_MAX with token axis on query dim (ax==2, fixed 4 heads on ax==1) must still bucket cleanly
+        cloudtpu::GraphProgramSpec alibi_q;
+        alibi_q.inputs.push_back({1, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 4, T, D}});
+        alibi_q.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, T, D}});
+        alibi_q.inputs.push_back({3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, D, D}});
+        cloudtpu::OpNodeSpec sm_q;
+        sm_q.kind = cloudtpu::CloudOpKind::SOFT_MAX;
+        sm_q.src_ids = {1, 2};
+        sm_q.soft_max.scale = 1.0f;
+        sm_q.soft_max.max_bias = 8.0f;
+        sm_q.dst = {4, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 4, T, D}};
+        alibi_q.ops.push_back(sm_q);
+        cloudtpu::OpNodeSpec mm_q;
+        mm_q.kind = cloudtpu::CloudOpKind::MUL_MAT;
+        mm_q.src_ids = {3, 4};
+        mm_q.dst = {5, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 4, T, D}};
+        alibi_q.ops.push_back(mm_q);
+        alibi_q.output_ids = {5};
+        const auto alibi_q_plan = cloudtpu::analyze_program_token_axes(alibi_q, T, B);
+        CHECK_TRUE(alibi_q_plan.success && alibi_q_plan.output_token_axis[0] == 2,
+                   "ALiBi SOFT_MAX with token axis on ax==2 (fixed heads) must bucket cleanly");
+    }
+
     rt.shutdown();
-    std::printf("  [PASS] Continuous batching padded buckets (T=5..8 -> B=8 + N_out<T + mixed_embd + reshaped SET_ROWS: misses=1, hits=3, parity < 1e-4, 0 KV corruption)\n");
+    std::printf("  [PASS] Continuous batching padded buckets (T=5..8 -> B=8 + N_out<T + mixed_embd + reshaped SET_ROWS + ALiBi guard: misses=1, hits=3, parity < 1e-4, 0 KV corruption)\n");
 }
 
 #ifdef CLOUDTPU_HAS_GGML
@@ -5391,6 +5559,115 @@ void test_ggml_cgraph_continuous_batching_buckets() {
 
     std::printf("  [PASS] ggml_cgraph CB buckets (T=5..8: plan_misses=1, plan_hits=3, parity < 1e-4, 0 KV corruption)\n");
 }
+
+void test_ggml_cgraph_odd_s4_shard_n() {
+#if !defined(_WIN32)
+    // Run each CLOUDTPU_Q4_MODE in a fresh process because ggml_backend_cloudtpu_reg()
+    // latches process-wide SPMD/Q4 environment settings on first initialization.
+    const int64_t K = 256, N = 12, M = 4;
+    const size_t w_nbytes = static_cast<size_t>(N) * 144U;
+    std::vector<uint8_t> w_raw(w_nbytes, 0);
+    for (size_t b = 0; b < static_cast<size_t>(N); ++b) {
+        uint8_t* p = w_raw.data() + b * 144U;
+        const uint16_t d = cloudtpu::f32_to_f16(0.02f * static_cast<float>((b % 5) + 1));
+        const uint16_t dm = cloudtpu::f32_to_f16(0.01f * static_cast<float>((b % 3) + 1));
+        std::memcpy(p + 0, &d, 2);
+        std::memcpy(p + 2, &dm, 2);
+        for (size_t i = 0; i < 12; ++i) p[4 + i] = static_cast<uint8_t>((b * 3 + i * 5 + 1) & 0x3F);
+        for (size_t i = 0; i < 128; ++i) p[16 + i] = static_cast<uint8_t>((b * 11 + i * 7) & 0xFF);
+    }
+    std::vector<float> x_host(static_cast<size_t>(M * K));
+    for (size_t i = 0; i < x_host.size(); ++i) x_host[i] = std::sin(static_cast<float>(i + 1) * 0.13f);
+
+    auto run_mode = [&](ggml_backend_t be, size_t* w_hbm_delta_out) -> std::vector<float> {
+        std::vector<float> out_y;
+        const size_t mem = ggml_tensor_overhead() * 16 + ggml_graph_overhead() + 4096;
+        struct ggml_init_params wp = {mem, nullptr, true};
+        struct ggml_context* ctx_w = ggml_init(wp);
+        ggml_tensor* tw = ggml_new_tensor_2d(ctx_w, GGML_TYPE_Q4_K, K, N);
+        ggml_set_name(tw, "output.weight");
+        size_t free_before = 0, free_after = 0, total_b = 0;
+        if (w_hbm_delta_out) {
+            ggml_backend_dev_memory(ggml_backend_get_device(be), &free_before, &total_b);
+        }
+        ggml_backend_buffer_t w_buf = ggml_backend_alloc_ctx_tensors(ctx_w, be);
+        ggml_backend_tensor_set(tw, w_raw.data(), 0, w_raw.size());
+        if (w_hbm_delta_out) {
+            ggml_backend_dev_memory(ggml_backend_get_device(be), &free_after, &total_b);
+            *w_hbm_delta_out = (free_before >= free_after) ? (free_before - free_after) : 0;
+        }
+
+        struct ggml_context* ctx_g = ggml_init(wp);
+        struct ggml_cgraph* gf = ggml_new_graph(ctx_g);
+        ggml_tensor* tx = ggml_new_tensor_2d(ctx_g, GGML_TYPE_F32, K, M);
+        ggml_set_input(tx);
+        ggml_tensor* ty = ggml_mul_mat(ctx_g, tw, tx);
+        ggml_set_output(ty);
+        ggml_build_forward_expand(gf, ty);
+
+        ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
+        if (ggml_gallocr_alloc_graph(galloc, gf)) {
+            ggml_backend_tensor_set(tx, x_host.data(), 0, x_host.size() * sizeof(float));
+            if (ggml_backend_graph_compute(be, gf) == GGML_STATUS_SUCCESS) {
+                out_y.resize(static_cast<size_t>(M * N), 0.0f);
+                ggml_backend_tensor_get(ty, out_y.data(), 0, out_y.size() * sizeof(float));
+            }
+        }
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx_g);
+        ggml_backend_buffer_free(w_buf);
+        ggml_free(ctx_w);
+        return out_y;
+    };
+
+    ggml_backend_t cpu_be = ggml_backend_cpu_init();
+    CHECK_TRUE(cpu_be != nullptr, "cpu init for odd S4 SHARD_N test");
+    const std::vector<float> ref = run_mode(cpu_be, nullptr);
+    ggml_backend_free(cpu_be);
+    CHECK_TRUE(ref.size() == static_cast<size_t>(M * N), "cpu ref for odd S4 SHARD_N");
+
+    struct ModeCase {
+        const char* mode;
+        size_t expected_chip0_bytes;
+    };
+    // K=256 (< 4*256 so SHARD_K is unavailable), N=12 (N/4 = 3 odd):
+    // native i4/u4 SHARD_N uses 3 rows/chip (3 * 192B = 576B);
+    // bitcast keeps even-width restriction and replicates all 12 rows (12 * 192B = 2304B).
+    const ModeCase cases[] = {
+        {"i4", 576U},
+        {"u4", 576U},
+        {"bitcast", 2304U},
+    };
+    std::fflush(stdout);
+    std::fflush(stderr);
+    for (const ModeCase& tc : cases) {
+        const pid_t pid = fork();
+        CHECK_TRUE(pid >= 0, "fork for isolated ggml_backend_cloudtpu_reg test");
+        if (pid == 0) {
+            setenv("CLOUDTPU_MOCK", "1", 1);
+            setenv("CLOUDTPU_MOCK_DEVICES", "4", 1);
+            setenv("CLOUDTPU_SPMD_CHIPS", "4", 1);
+            setenv("CLOUDTPU_SPMD_MIN_ROWS", "8", 1);
+            setenv("CLOUDTPU_Q4K_BF16_SCALES", "0", 1);
+            setenv("CLOUDTPU_Q4_MODE", tc.mode, 1);
+            ggml_backend_t be = ggml_backend_cloudtpu_init();
+            size_t delta = 0;
+            bool ok = false;
+            if (be != nullptr) {
+                const std::vector<float> got = run_mode(be, &delta);
+                ggml_backend_free(be);
+                ok = (got.size() == ref.size() && compute_nmse(got, ref) < 5e-4 &&
+                      delta == tc.expected_chip0_bytes);
+            }
+            _exit(ok ? 0 : 1);
+        }
+        int status = 0;
+        CHECK_TRUE(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                   "odd-width Q4_K SHARD_N child check failed (i4/u4 must shard 1/4 HBM; bitcast replicates)");
+    }
+    std::printf("  [PASS] ggml_cgraph odd-width SHARD_N (N=12/P=4 -> 3 rows/chip: i4/u4=576B sharded, bitcast=2304B replicated)\n");
+#endif
+}
 #endif
 }  // namespace
 
@@ -5436,6 +5713,7 @@ int main() {
     test_one_graph_spmd_kv_donation(4);
     test_continuous_batching_padded_buckets();
 #ifdef CLOUDTPU_HAS_GGML
+    test_ggml_cgraph_odd_s4_shard_n();
     test_ggml_cgraph_one_graph_decode();
     test_ggml_cgraph_continuous_batching_buckets();
 #endif

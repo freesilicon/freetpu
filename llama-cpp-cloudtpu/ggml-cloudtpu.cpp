@@ -1178,11 +1178,12 @@ static cloudtpu::TensorShardingKind choose_upload_sharding(const struct ggml_ten
     if (is_q && (K % q_align) != 0) {
         return cloudtpu::TensorShardingKind::REPLICATED;
     }
-    // Single-read 4-bit packed weights need even per-chip N for byte-aligned bitcast/S4 rows.
-    const bool is_q4_packed =
+    // Packed U8 bitcast mode stores two rows per byte and requires an even per-chip N;
+    // native S4/U4 mode transfers 1 host byte/element and supports arbitrary odd per-chip N.
+    const bool is_q4_bitcast =
         (tensor->type == GGML_TYPE_Q4_0 || tensor->type == GGML_TYPE_Q4_K) &&
-        (q4_mode == CloudTpuQ4Mode::I4 || q4_mode == CloudTpuQ4Mode::BITCAST);
-    const int64_t n_align = is_q4_packed ? (static_cast<int64_t>(spmd_chips) * 2) : static_cast<int64_t>(spmd_chips);
+        (q4_mode == CloudTpuQ4Mode::BITCAST);
+    const int64_t n_align = is_q4_bitcast ? (static_cast<int64_t>(spmd_chips) * 2) : static_cast<int64_t>(spmd_chips);
     // Prefer SHARD_K for row-parallel FFN down projections and embedding tables (enables 1-collective
     // Megatron-LM FFN and low-comm sharded GET_ROWS); use SHARD_N for all other large 2D weights.
     const bool prefer_k = (tensor->name[0] != '\0') &&
