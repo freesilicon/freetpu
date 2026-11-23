@@ -90,7 +90,37 @@ Four stacked optimizations close the single-stream and batched serving gap while
 - **Single-Chip `v6e-1` (`CLOUDTPU_SPMD_CHIPS=1 -sm none -mg 0`) & 8-Chip `v6e-8` (`CLOUDTPU_SPMD_CHIPS=8 CLOUDTPU_ASYNC_COLLECTIVES=0`):**
   - Pinning `-sm none -mg 0` keeps single-chip runs on chip 0 instead of `llama.cpp` layer-splitting across all 8 exposed devices: `Qwen2.5-1.5B Q4_K_M` achieved **`pp512 = 16,262.01` / `tg64 = 73.92`** (`+35.6%` `tg64` vs M4A `54.52`); `Llama-3.1-8B Q4_K_M` achieved **`pp512 = 7,557.94` / `tg64 = 52.98`** and coherent `16/16` continuous batching via `llama-server -np 16 -cb -kvu` (`50.00` decode at `c=1`, `20.30` decode at `c=16`, `MAPS_LIBPYTHON=0`).
   - Keeping **`CLOUDTPU_ASYNC_COLLECTIVES=0`** by default in `ggml-cloudtpu.cpp` avoids the legacy `Aug 15 2025` `libtpu.so` `PJRT_Client_Compile: MegaChip currently works correctly only when base is zero` failure on 8-chip 1-graph execution (`Qwen2.5-1.5B` `-p 4 -n 4`: `pp4 = 61.25` / `tg4 = 28.79`, `2.54x` `tg4` vs `CLOUDTPU_FUSE_ATTN=0`).
-  - **Host `libtpu` Version Tip:** Ubuntu 22.04 Cloud TPU VMs ship Python 3.10, causing `pip install libtpu` to pull a legacy 2025 `libtpu.so` (`libtpu >= 0.0.50` wheels require Python `>=3.11`). Extract `libtpu/libtpu.so` from a current `cp312` `libtpu` wheel (e.g. `0.0.53+`) and set `LIBTPU_PATH` directly (zero Python at runtime); full `Qwen3-32B` / `Llama-3.3-70B` `P=8` re-benchmarking against `libtpu >= 0.0.53` remains next.
+  - **Host `libtpu` Version Tip:** Ubuntu 22.04 Cloud TPU VMs ship Python 3.10, causing `pip install libtpu` to pull a legacy 2025 `libtpu.so` (`libtpu >= 0.0.50` wheels require Python `>=3.11`). Extracting `libtpu/libtpu.so` directly from the PyPI `cp312` `manylinux_2_31_x86_64` wheel and setting `LIBTPU_PATH` avoids any Python dependency at runtime (`MAPS_LIBPYTHON=0`).
+
+#### Live `v6e-8` Verification (`libtpu 0.0.53.1`, `Nov 17 2026` `TFRT TPU v6 lite`, `fedad85`, `MAPS_LIBPYTHON=0`, `LDD_LIBPYTHON=0`)
+- **Clean `cp312` `libtpu 0.0.53.1` Extraction (Zero Runtime Python):**
+  ```bash
+  python3 -c '
+  import io, json, urllib.request, zipfile
+  meta = json.load(urllib.request.urlopen("https://pypi.org/pypi/libtpu/0.0.53.1/json", timeout=30))
+  whl = [u["url"] for u in meta["urls"] if "cp312" in u["filename"] and "x86_64" in u["filename"]][0]
+  zf = zipfile.ZipFile(io.BytesIO(urllib.request.urlopen(whl, timeout=120).read()))
+  so = [n for n in zf.namelist() if n.endswith("/libtpu.so")][0]
+  open("libtpu-0.0.53.1.so", "wb").write(zf.read(so))
+  '
+  export LIBTPU_PATH="$PWD/libtpu-0.0.53.1.so"
+  ```
+- **Standalone Suite & `ASYNC_COLLECTIVES=1` Findings (`CLOUDTPU_MOCK=0`):**
+  - `test_cloudtpu_host` (`CLOUDTPU_MOCK=0`, `LIBTPU_PATH=libtpu-0.0.53.1.so`): `28` passing test groups with `1` assertion failure at `tests/test_cloudtpu_host.cpp:1059` (`Opt-in BF16 FLASH_ATTN_EXT should reflect BF16 rounding (0.5f)`), `MAPS_LIBPYTHON=0`.
+  - **`CLOUDTPU_ASYNC_COLLECTIVES=1` on `libtpu 0.0.53.1` `v6e` (`ghostlite`):** `PJRT_Client_Create` fails initialization with `Continuation fusion for AllGather is enabled on platform ghostlite (variant: ), but it is not supported/recommended on platforms other than TPU v5e... Please disable it with xla_tpu_enable_async_collective_fusion=false` (`0` devices exposed, causing `llama-bench` to fall back to host CPU). Keep **`CLOUDTPU_ASYNC_COLLECTIVES=0`** (default) on `v6e`.
+- **End-to-End `v6e-8` Benchmarks (`llama-bench -ngl 99 -fa 1 -p 512 -n 64 -r 3` & `llama-cli`, `libtpu 0.0.53.1`):**
+  *(3-iteration means include run-1 XLA cold JIT compile in stddev.)*
+
+| Model (GGUF `Q4_K_M`) | Size | Chips (`P`) | `pp512` (tok/s) | `tg64` (tok/s) | Speedup vs Legacy `v6e` `libtpu.so` | Notes |
+| --- | ---: | ---: | ---: | ---: | --- | --- |
+| `Qwen2.5-1.5B-Instruct` | `934.69 MiB` | `1` (`-sm none -mg 0`) | `16,651.60 ± 3,111.77` | **`183.01 ± 60.32`** | **2.48x `tg64`** (`73.92`) | `llama-cli` coherent (`17 * 23 = 391`) |
+| `Qwen2.5-1.5B-Instruct` | `934.69 MiB` | `8` (`SPMD`) | `11,424.67 ± 787.76` | **`68.86 ± 20.19`** | **5.68x `tg64`** (`12.13` M4A) | `llama-cli` coherent (`391`) |
+| `Meta-Llama-3.1-8B-Instruct` | `4.58 GiB` | `1` (`-sm none -mg 0`) | `7,594.14 ± 1,681.51` | **`91.62 ± 28.00`** | **1.73x `tg64`** (`52.98`) | `llama-cli` coherent (`17 * 23 = 391`) |
+| `Meta-Llama-3.1-8B-Instruct` | `4.58 GiB` | `8` (`SPMD`) | `7,974.23 ± 2,478.81` | **`65.04 ± 8.00`** | — | `llama-cli` coherent (`17 * 23 = 391`) |
+| `Qwen3-32B` | `18.40 GiB` | `8` (`SPMD`) | **`3,609.05 ± 171.84`** | **`29.00 ± 1.54`** | **4.03x `tg64`** (`7.20` M4A) | `llama-cli` coherent (`17 * 23 = 391`) |
+
+  - `Llama-3.1-8B P=1` continuous batching (`llama-server -ngl 99 -fa 1 -sm none -mg 0 -np 16 -cb -kvu -c 8192` w/ `LLAMA_KV_ROWS_DISABLE=1`, `MAPS_LIBPYTHON=0`): `16/16` coherent replies (`sum_decode_tok_s` `8.51` / `17.24` / `22.26` / `28.19` and cold-compile wall throughput `4.15` / `11.43` / `2.50` / `3.71` tok/s across `c=1, 4, 8, 16`; `c=1` timing check: `8.51` decode `tok/s`).
+  - `Llama-3.3-70B-Instruct` (`Q4_K_M`, `39.59 GiB`, `P=8`): GGUF downloaded and entered weight load (`Loading model...`), deferred before `llama-bench` completion due to the VM time cap.
 
 ### M4A Multi-Chip SPMD Live Silicon Proof (`v6e-8` Trillium, `MAPS_LIBPYTHON=0`)
 
