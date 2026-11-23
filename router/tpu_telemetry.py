@@ -44,10 +44,9 @@ _KNOWN_TPU_METRICS = frozenset(
     }
 )
 
-_METRIC_LINE_RE = re.compile(
-    r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?\s+(\S+)(?:\s+[+-]?[0-9]+)?$"
-)
-_LABEL_RE = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"')
+_METRIC_NAME_RE = re.compile(r"[a-zA-Z_:][a-zA-Z0-9_:]*")
+_LABEL_NAME_RE = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]*")
+_SAMPLE_VALUE_TAIL_RE = re.compile(r"[ \t]+(\S+)(?:[ \t]+[+-]?[0-9]+)?$")
 
 
 @dataclass
@@ -83,8 +82,98 @@ class TpuExporterTelemetry:
         return asdict(self)
 
 
-def _unescape_label(raw: str) -> str:
-    return raw.replace(r"\\", "\\").replace(r"\n", "\n").replace(r"\"", '"')
+def _parse_prometheus_sample_line(line: str) -> Optional[PromSample]:
+    """Parse one stripped Prometheus text 0.0.4 sample line with quote-aware labels."""
+    name_match = _METRIC_NAME_RE.match(line)
+    if not name_match:
+        return None
+    name = name_match.group(0)
+    pos = name_match.end()
+    n = len(line)
+
+    ws_end = pos
+    while ws_end < n and line[ws_end] in (" ", "\t"):
+        ws_end += 1
+
+    labels: Dict[str, str] = {}
+    if ws_end < n and line[ws_end] == "{":
+        pos = ws_end + 1
+        closed = False
+        while pos < n:
+            while pos < n and line[pos] in (" ", "\t"):
+                pos += 1
+            if pos >= n:
+                return None
+            if line[pos] == "}":
+                pos += 1
+                closed = True
+                break
+            lname_match = _LABEL_NAME_RE.match(line, pos)
+            if not lname_match:
+                return None
+            lname = lname_match.group(0)
+            pos = lname_match.end()
+            while pos < n and line[pos] in (" ", "\t"):
+                pos += 1
+            if pos >= n or line[pos] != "=":
+                return None
+            pos += 1
+            while pos < n and line[pos] in (" ", "\t"):
+                pos += 1
+            if pos >= n or line[pos] != '"':
+                return None
+            pos += 1
+            val_chars: List[str] = []
+            quote_closed = False
+            while pos < n:
+                ch = line[pos]
+                if ch == "\\":
+                    if pos + 1 >= n:
+                        return None
+                    esc = line[pos + 1]
+                    if esc == "\\":
+                        val_chars.append("\\")
+                    elif esc == '"':
+                        val_chars.append('"')
+                    elif esc == "n":
+                        val_chars.append("\n")
+                    else:
+                        val_chars.append("\\" + esc)
+                    pos += 2
+                elif ch == '"':
+                    pos += 1
+                    quote_closed = True
+                    break
+                else:
+                    val_chars.append(ch)
+                    pos += 1
+            if not quote_closed:
+                return None
+            labels[lname] = "".join(val_chars)
+            while pos < n and line[pos] in (" ", "\t"):
+                pos += 1
+            if pos < n and line[pos] == ",":
+                pos += 1
+                continue
+            if pos < n and line[pos] == "}":
+                pos += 1
+                closed = True
+                break
+            return None
+        if not closed:
+            return None
+
+    tail_match = _SAMPLE_VALUE_TAIL_RE.match(line, pos)
+    if not tail_match:
+        return None
+    val_str = tail_match.group(1)
+    if "_" in val_str:
+        return None
+    try:
+        value = float(val_str)
+    except ValueError:
+        return None
+    return PromSample(name=name, labels=labels, value=value)
 
 
 def parse_prometheus_text(text: str) -> List[PromSample]:
@@ -94,21 +183,9 @@ def parse_prometheus_text(text: str) -> List[PromSample]:
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
-        match = _METRIC_LINE_RE.match(line)
-        if not match:
-            continue
-        name, label_str, val_str = match.group(1), match.group(2), match.group(3)
-        if "_" in val_str:
-            continue
-        try:
-            value = float(val_str)
-        except ValueError:
-            continue
-        labels: Dict[str, str] = {}
-        if label_str:
-            for lmatch in _LABEL_RE.finditer(label_str):
-                labels[lmatch.group(1)] = _unescape_label(lmatch.group(2))
-        samples.append(PromSample(name=name, labels=labels, value=value))
+        sample = _parse_prometheus_sample_line(line)
+        if sample is not None:
+            samples.append(sample)
     return samples
 
 
@@ -883,11 +960,12 @@ def _read_bounded_http_body(
                     raise ValueError(
                         f"Exporter response exceeded {max_bytes} byte limit"
                     )
-    chunks: List[bytes] = []
+    buf = bytearray()
     total = 0
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            buf.clear()
             raise TimeoutError("Exporter scrape exceeded elapsed deadline")
         if isinstance(upstream_sock, DeadlineSocket):
             upstream_sock.deadline = deadline
@@ -898,21 +976,27 @@ def _read_bounded_http_body(
                 pass
         budget_left = (max_bytes - total) + 1
         if budget_left <= 0:
+            buf.clear()
             raise ValueError(f"Exporter response exceeded {max_bytes} byte limit")
         chunk = resp.read1(min(8192, budget_left))
         if not chunk:
             break
         total += len(chunk)
         if total > max_bytes:
+            buf.clear()
             raise ValueError(f"Exporter response exceeded {max_bytes} byte limit")
-        chunks.append(chunk)
-    raw = b"".join(chunks)
+        buf.extend(chunk)
     if not resp.chunked and resp.status not in (204, 304) and not (100 <= resp.status < 200):
         if resp.length is not None and resp.length > 0:
-            raise http.client.IncompleteRead(raw, resp.length)
-        if declared_len is not None and len(raw) < declared_len:
-            raise http.client.IncompleteRead(raw, declared_len - len(raw))
-    return raw
+            buf.clear()
+            raise http.client.IncompleteRead(b"", resp.length)
+        if declared_len is not None and total < declared_len:
+            buf.clear()
+            raise http.client.IncompleteRead(b"", declared_len - total)
+    try:
+        return bytes(buf)
+    finally:
+        buf.clear()
 
 
 def scrape_tpu_exporter(

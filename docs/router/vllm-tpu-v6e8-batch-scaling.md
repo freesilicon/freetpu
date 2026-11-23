@@ -1,16 +1,16 @@
-# Cloud TPU `v6e-8` High-Batch (`c=64–128`) & Dynamic W8A8 INT8 Serving Playbook
+# Cloud TPU `v6e-8` High-Batch (`c=64–128`) BF16 Serving Playbook
 
-Ready-to-run `vllm/vllm-tpu:v0.33.0` launch presets and FreeTPU Router configuration for scaling dense `Qwen3-32B` and `Llama-3.3-70B` models on Cloud TPU `v6e-8` (Trillium, `256 GiB` HBM, `12.8–13.1 TB/s` HBM BW, `7,344 TFLOP/s` BF16 / `14,688 TOPS` INT8).
+Ready-to-run `vllm/vllm-tpu:v0.33.0` BF16 launch presets and FreeTPU Router configuration for scaling dense `Qwen3-32B` and `Llama-3.3-70B` models on Cloud TPU `v6e-8` (Trillium, `256 GiB` HBM, `12.8–13.1 TB/s` HBM BW, `7,344 TFLOP/s` BF16).
 
 ---
 
-## 1. Why High-Batch (`c=64–128`) & INT8 Matter on `v6e-8`
+## 1. Why High-Batch (`c=64–128`) Matters on `v6e-8`
 
 Live Phase 1 `v6e-8` serving measurements showed:
 - **Extreme decode bandwidth bound:** The Trillium BF16 roofline ridge point is `7,344 / 12.8 ≈ 574` tokens/step (`560` at `13.1 TB/s`), so `c=1..16` operates at **0.1%–1.2% MFU**.
 - **`c=8 -> c=16` proxy cliff (now fixed):** The initial `ThreadingHTTPServer` router hit a model-independent `+7.2 ms/step` stall from `listen(5)` SYN backlog saturation, Nagle/Delayed-ACK without `TCP_NODELAY`, per-chunk thread/GIL/JSON contention, and upstream HTTP/1.1 keep-alive waits (`active_inflight` ghost counts and `5.6–6.0 s` EWMA `latency_ms`).
 - **Router fix in this branch:** `_SSEReactor` (`selectors.DefaultSelector` event-loop pump), `request_queue_size = 1024`, `TCP_NODELAY` on client/upstream sockets, `"Connection": "close"` upstream headers, single-pass SSE parsing, and `_BackendSlotLease` RAII guarantees keep router overhead `<0.5 ms/chunk` at `c=128` with `active_inflight == 0` after every request.
-- **Next hardware unlock (`c=64..128` + dynamic W8A8 INT8):** Scaling batch concurrency from `c=16` to `c=64..128` with async multi-step scheduling and 256-aligned token budgets projects **4×–7×** aggregate `tok/s`, and switching BF16 weights to native TPU dynamic `W8A8` INT8 halves per-step HBM weight streaming (`65.5 -> ~33 GB` on 32B, `141 -> ~71 GB` on 70B).
+- **Next hardware unlock (`c=64..128` BF16):** Scaling batch concurrency from `c=16` to `c=64..128` with async multi-step scheduling and 256-aligned token budgets projects **4×–7×** aggregate `tok/s` while keeping model weights in native BF16 (`65.5 GB` on 32B, `141 GB` on 70B).
 
 ---
 
@@ -95,32 +95,6 @@ docker run -d --name vllm-llama70b-highbatch "${CONTAINER_FLAGS[@]}" \
   python3 -m vllm.entrypoints.openai.api_server \
     --host 127.0.0.1 --port 8000 \
     --model unsloth/Llama-3.3-70B-Instruct \
-    --tensor-parallel-size 8 \
-    --dtype bfloat16 \
-    --max-model-len 4096 \
-    --max-num-seqs 128 \
-    --max-num-batched-tokens 2048 \
-    --enable-chunked-prefill \
-    --gpu-memory-utilization 0.90 \
-    --async-scheduling \
-    --additional-config '{"enable_continue_decode": true}'
-```
-
-### Preset C: Dense Native TPU Dynamic `W8A8` INT8 (`compressed-tensors`)
-
-Trillium `v6e` delivers `1,836 TOPS/chip` (`14,688 TOPS` across 8 chips) on native `int8` MXUs while halving weight HBM reads vs BF16 (`33 GB` on 32B, `71 GB` on 70B). The pinned `vllm/vllm-tpu:v0.33.0` TPU `compressed-tensors` linear loader supports dense models using **symmetric per-tensor or per-channel INT8 weights** with **dynamic per-token INT8 activations (`W8A8`)** — per-group weight quantization, weight-only `W8A16`, and fused-expert MoE INT8 `W8A8` checkpoints are not supported by that loader.
-
-```bash
-# Set MODEL_W8A8 to a Hugging Face compressed-tensors dense W8A8 INT8 repo ID
-# (symmetric per-tensor or per-channel INT8 weights + dynamic per-token INT8 activations;
-# for a local host directory, add -v /path/to/checkpoint:/models/dense-w8a8:ro
-# and pass --model /models/dense-w8a8).
-docker run -d --name vllm-int8-highbatch "${CONTAINER_FLAGS[@]}" \
-  vllm/vllm-tpu:v0.33.0 \
-  python3 -m vllm.entrypoints.openai.api_server \
-    --host 127.0.0.1 --port 8000 \
-    --model "${MODEL_W8A8}" \
-    --quantization compressed-tensors \
     --tensor-parallel-size 8 \
     --dtype bfloat16 \
     --max-model-len 4096 \

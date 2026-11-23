@@ -288,10 +288,12 @@ def _read_bounded_http_response(
     label: str = "Upstream response",
     chunk_size: int = 65536,
     reserve_fn: Optional[Callable[[int], bool]] = None,
+    release_fn: Optional[Callable[[int], None]] = None,
     reserved_out: Optional[List[int]] = None,
 ) -> bytes:
     """Incrementally read an HTTP response body under byte cap, memory budget, and elapsed deadline."""
     declared_len: Optional[int] = None
+    reserved_local = 0
     if not resp.chunked:
         raw_len = resp.getheader("Content-Length")
         if raw_len is not None:
@@ -310,13 +312,15 @@ def _read_bounded_http_response(
                         raise _MemoryBudgetExceededError(
                             "Router response memory budget exhausted"
                         )
+                    reserved_local += declared_len
                     if reserved_out is not None:
                         reserved_out[0] += declared_len
-    chunks: List[bytes] = []
+    buf = bytearray()
     total = 0
     while True:
         rem = deadline - time.monotonic()
         if rem <= 0:
+            buf.clear()
             raise TimeoutError(f"{label} exceeded elapsed deadline")
         if isinstance(upstream_sock, DeadlineSocket):
             upstream_sock.deadline = deadline
@@ -327,6 +331,7 @@ def _read_bounded_http_response(
                 pass
         budget_left = (max_bytes - total) + 1
         if budget_left <= 0:
+            buf.clear()
             raise _UpstreamResponseTooLargeError(
                 f"{label} exceeded {max_bytes} byte limit"
             )
@@ -335,27 +340,52 @@ def _read_bounded_http_response(
             break
         total += len(chunk)
         if total > max_bytes:
+            buf.clear()
             raise _UpstreamResponseTooLargeError(
                 f"{label} exceeded {max_bytes} byte limit"
             )
-        if reserve_fn is not None and reserved_out is not None and total > reserved_out[0]:
-            delta = total - reserved_out[0]
+        if reserve_fn is not None and total > reserved_local:
+            delta = total - reserved_local
             if not reserve_fn(delta):
+                buf.clear()
                 raise _MemoryBudgetExceededError(
                     "Router response memory budget exhausted"
                 )
-            reserved_out[0] += delta
-        chunks.append(chunk)
-    raw = b"".join(chunks)
+            reserved_local += delta
+            if reserved_out is not None:
+                reserved_out[0] += delta
+        buf.extend(chunk)
     if (
         not resp.chunked
         and resp.status not in (204, 304)
         and not (100 <= resp.status < 200)
     ):
         if resp.length is not None and resp.length > 0:
-            raise http.client.IncompleteRead(raw, resp.length)
-        if declared_len is not None and len(raw) < declared_len:
-            raise http.client.IncompleteRead(raw, declared_len - len(raw))
+            buf.clear()
+            raise http.client.IncompleteRead(b"", resp.length)
+        if declared_len is not None and total < declared_len:
+            buf.clear()
+            raise http.client.IncompleteRead(b"", declared_len - total)
+    copy_extra = 0
+    if total > 0 and reserve_fn is not None:
+        copy_extra = max(0, (2 * total) - reserved_local)
+        if copy_extra > 0:
+            if not reserve_fn(copy_extra):
+                buf.clear()
+                raise _MemoryBudgetExceededError(
+                    "Router response memory budget exhausted"
+                )
+            reserved_local += copy_extra
+            if reserved_out is not None:
+                reserved_out[0] += copy_extra
+    try:
+        raw = bytes(buf)
+    finally:
+        buf.clear()
+        if copy_extra > 0 and release_fn is not None:
+            release_fn(copy_extra)
+            if reserved_out is not None:
+                reserved_out[0] = max(0, reserved_out[0] - copy_extra)
     return raw
 _CORS_ALLOWED_HEADERS = ", ".join(
     (
@@ -2910,25 +2940,32 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         """Read exactly `content_len` bytes within the configured wall-clock deadline."""
         timeout_s = self.server.engine.config.client_read_timeout_s
         deadline = time.monotonic() + timeout_s
-        chunks: List[bytes] = []
+        buf = bytearray()
         remaining = content_len
         read_fn = getattr(self.rfile, "read1", self.rfile.read)
         try:
             while remaining > 0:
                 time_left = deadline - time.monotonic()
                 if time_left <= 0:
+                    buf.clear()
                     return None, (408, "request_timeout", "Request body read timed out")
                 self.connection.settimeout(time_left)
                 chunk = read_fn(min(65536, remaining))
                 if not chunk:
+                    buf.clear()
                     return None, (400, "incomplete_body", "Incomplete request body")
-                chunks.append(chunk)
+                buf.extend(chunk)
                 remaining -= len(chunk)
         except TimeoutError:
+            buf.clear()
             return None, (408, "request_timeout", "Request body read timed out")
         except OSError:
+            buf.clear()
             return None, (400, "incomplete_body", "Client disconnected while uploading body")
-        return b"".join(chunks), None
+        try:
+            return bytes(buf), None
+        finally:
+            buf.clear()
 
     def _authorize(self, path: str, method: str) -> Optional[AuthContext]:
         hdrs = {k: v for k, v in self.headers.items()}
@@ -3058,7 +3095,18 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             return
 
         engine = self.server.engine
+        max_total_req_mem = engine.config.max_total_request_memory_bytes
         parse_budget = max(1, content_len * REQUEST_MEMORY_PARSE_MULTIPLIER)
+        if parse_budget > max_total_req_mem:
+            self._send_bytes(
+                413,
+                "application/json",
+                _openai_error_body(
+                    f"Request estimated parse memory ({parse_budget} bytes) exceeds router request memory budget ({max_total_req_mem} bytes)",
+                    code="payload_too_large",
+                ),
+            )
+            return
         if not engine.try_reserve_request_memory(parse_budget):
             self._send_bytes(
                 503,
@@ -3115,6 +3163,16 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 return
 
             needed_parse_mem = _estimate_json_parse_memory(raw_req, nodes=req_nodes)
+            if needed_parse_mem > max_total_req_mem:
+                self._send_bytes(
+                    413,
+                    "application/json",
+                    _openai_error_body(
+                        f"Request estimated parse memory ({needed_parse_mem} bytes) exceeds router request memory budget ({max_total_req_mem} bytes)",
+                        code="payload_too_large",
+                    ),
+                )
+                return
             if needed_parse_mem > reserved_mem:
                 extra_parse_mem = needed_parse_mem - reserved_mem
                 if not engine.try_reserve_request_memory(extra_parse_mem):
@@ -3490,6 +3548,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                             deadline=attempt_deadline,
                             label=f"Backend {backend.config.id!r} response",
                             reserve_fn=engine.try_reserve_response_memory,
+                            release_fn=engine.release_response_memory,
                             reserved_out=resp_mem_reserved,
                         )
                     except _MemoryBudgetExceededError:

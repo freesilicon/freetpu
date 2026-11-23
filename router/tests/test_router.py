@@ -41,10 +41,12 @@ from router.config import (  # noqa: E402
 from router.freetpu_router import (  # noqa: E402
     FreeTPURouterServer,
     MAX_RR_CURSORS,
+    _MemoryBudgetExceededError,
     _apply_cli_overrides,
     _build_cli_parser,
     _join_backend_url,
     _open_http_connection,
+    _read_bounded_http_response,
     _safe_nonneg_int,
     _validate_json_structure,
     build_hooks_from_config,
@@ -7245,6 +7247,9 @@ asyncio.run(main())
         playbook = (
             REPO_ROOT / "docs/router/vllm-tpu-v6e8-batch-scaling.md"
         ).read_text(encoding="utf-8")
+        router_readme = (REPO_ROOT / "docs/router/README.md").read_text(
+            encoding="utf-8"
+        )
         self.assertNotIn("XLA_COMPILATION_CACHE_DIR", playbook)
         self.assertNotIn("local NVMe", playbook)
         self.assertNotIn("Load-Time MXFP4", playbook)
@@ -7261,8 +7266,14 @@ asyncio.run(main())
         self.assertIn("-e JAX_COMPILATION_CACHE_DIR=", playbook)
         self.assertIn("-e VLLM_XLA_CACHE_PATH=", playbook)
         self.assertIn("-e LIBTPU_INIT_ARGS=", playbook)
-        self.assertNotIn("W8A8/W8A16", playbook)
-        self.assertNotIn("W8A16/W8A8", playbook)
+        self.assertIn("Qwen/Qwen3-32B", playbook)
+        self.assertIn("unsloth/Llama-3.3-70B-Instruct", playbook)
+        self.assertNotIn("Preset C", playbook)
+        self.assertNotIn("compressed-tensors", playbook)
+        self.assertNotIn("W8A8", playbook)
+        self.assertNotIn("W8A16", playbook)
+        self.assertNotIn("W8A8", router_readme)
+        self.assertNotIn("W8A16", router_readme)
         self.assertNotIn("gpt-oss-120b", playbook)
         self.assertIn("ops/tpu-exporter/tpu_exporter.py", playbook)
         self.assertIn("127.0.0.1:9400/metrics", playbook)
@@ -7277,9 +7288,6 @@ asyncio.run(main())
             """--additional-config '{"enable_continue_decode": true}'""",
             playbook,
         )
-        self.assertIn("symmetric per-tensor or per-channel", playbook.lower())
-        self.assertIn("dynamic per-token", playbook.lower())
-        self.assertIn("per-group", playbook.lower())
 
     def test_deadline_socket_waits_support_high_fds_without_select_select(self) -> None:
         def _forbid_select(*args: Any, **kwargs: Any) -> Any:
@@ -7616,7 +7624,7 @@ asyncio.run(main())
         self.assertEqual(router.engine._req_mem_used_bytes, 0)
 
         # 2. Same-sized body with one raw UTF-8 supplementary char (UCS-4 4x str widening)
-        # requires 10x (~3000 bytes) > 2000 -> rejected before decoding with 503.
+        # requires 10x (~3000 bytes) > 2000 total budget -> permanent 413 payload_too_large.
         ucs4_raw = json.dumps(
             {
                 "model": "m-ucs4",
@@ -7634,14 +7642,14 @@ asyncio.run(main())
             )
             resp = conn.getresponse()
             bd_ucs4 = resp.read()
-            self.assertEqual(resp.status, 503)
-            self.assertIn(b"server_memory_limit_reached", bd_ucs4)
+            self.assertEqual(resp.status, 413)
+            self.assertIn(b"payload_too_large", bd_ucs4)
         finally:
             conn.close()
         self.assertEqual(router.engine._req_mem_used_bytes, 0)
 
         # 3. Same-sized pure-ASCII body with a \uD83D\uDE00 surrogate escape also widens
-        # parsed string memory -> rejected before decoding with 503.
+        # parsed string memory beyond total budget -> permanent 413 payload_too_large.
         esc_raw = (
             '{"model":"m-ucs4","messages":[{"role":"user","content":"'
             + ("a" * 228)
@@ -7657,8 +7665,8 @@ asyncio.run(main())
             )
             resp2 = conn2.getresponse()
             bd_esc = resp2.read()
-            self.assertEqual(resp2.status, 503)
-            self.assertIn(b"server_memory_limit_reached", bd_esc)
+            self.assertEqual(resp2.status, 413)
+            self.assertIn(b"payload_too_large", bd_esc)
         finally:
             conn2.close()
         self.assertEqual(router.engine._req_mem_used_bytes, 0)
@@ -8498,6 +8506,220 @@ asyncio.run(main())
             sock2.close()
         self.assertIn(b"200 OK", raw_sse)
         self.assertIn(b"data: [DONE]", raw_sse)
+
+    def test_bounded_http_response_accumulates_contiguously_and_budgets_final_copy(
+        self,
+    ) -> None:
+        class _FragmentedChunkedResp:
+            chunked = True
+            status = 200
+            length = None
+
+            def __init__(self, payload: bytes) -> None:
+                self._payload = payload
+                self._idx = 0
+
+            def getheader(self, name: str) -> Optional[str]:
+                return None
+
+            def read1(self, amt: int) -> bytes:
+                if self._idx >= len(self._payload):
+                    return b""
+                # Simulate 1-byte HTTP chunk frames.
+                b = self._payload[self._idx : self._idx + 1]
+                self._idx += 1
+                return b
+
+        # 1. Many 1-byte chunks accumulate cleanly and reserve 2x during bytes(buf),
+        # then release the temporary copy reservation via release_fn.
+        payload = b"x" * 1024
+        used = [0]
+        peak = [0]
+        budget = 2048
+
+        def _reserve(n: int) -> bool:
+            if used[0] + n > budget:
+                return False
+            used[0] += n
+            if used[0] > peak[0]:
+                peak[0] = used[0]
+            return True
+
+        def _release(n: int) -> None:
+            used[0] = max(0, used[0] - n)
+
+        reserved_box = [0]
+        out = _read_bounded_http_response(
+            _FragmentedChunkedResp(payload),  # type: ignore[arg-type]
+            None,
+            max_bytes=4096,
+            deadline=time.monotonic() + 5.0,
+            reserve_fn=_reserve,
+            release_fn=_release,
+            reserved_out=reserved_box,
+        )
+        self.assertEqual(out, payload)
+        self.assertEqual(peak[0], 2048)
+        self.assertEqual(used[0], 1024)
+        self.assertEqual(reserved_box[0], 1024)
+
+        # 2. If budget covers accumulation (1024) but not the duplicate bytes(buf) copy
+        # (2048), _read_bounded_http_response rejects before copying.
+        used_tight = [0]
+        reserved_tight = [0]
+        budget_tight = 1500
+
+        def _reserve_tight(n: int) -> bool:
+            if used_tight[0] + n > budget_tight:
+                return False
+            used_tight[0] += n
+            return True
+
+        with self.assertRaises(_MemoryBudgetExceededError):
+            _read_bounded_http_response(
+                _FragmentedChunkedResp(payload),  # type: ignore[arg-type]
+                None,
+                max_bytes=4096,
+                deadline=time.monotonic() + 5.0,
+                reserve_fn=_reserve_tight,
+                release_fn=lambda n: used_tight.__setitem__(0, max(0, used_tight[0] - n)),
+                reserved_out=reserved_tight,
+            )
+        self.assertEqual(used_tight[0], 1024)
+        self.assertEqual(reserved_tight[0], 1024)
+
+    def test_permanent_request_memory_limit_returns_413_vs_contention_503(
+        self,
+    ) -> None:
+        slow_b = self._track(
+            _MockOpenAIBackend("mem-perm-b", ["m-perm"], latency_s=0.35)
+        )
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            max_request_body_bytes=10000,
+            max_total_request_memory_bytes=2000,
+            backends=[
+                BackendConfig(
+                    id="mem-perm-b",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=slow_b.base_url,
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        # 1. Single ASCII request whose upfront 4x parse_budget exceeds total budget
+        # (600 * 4 = 2400 > 2000) returns permanent 413 even when router is idle.
+        st_upfront, _, bd_upfront = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-perm",
+                "messages": [{"role": "user", "content": "x" * 540}],
+            },
+        )
+        self.assertEqual(st_upfront, 413)
+        self.assertIn(b"payload_too_large", bd_upfront)
+        self.assertEqual(router.engine._req_mem_used_bytes, 0)
+
+        # 2. Single request with \u escape whose post-read 9x estimate exceeds total budget
+        # (280 * 9 = 2520 > 2000) returns permanent 413 even when router is idle.
+        esc_body = (
+            '{"model":"m-perm","messages":[{"role":"user","content":"'
+            + ("x" * 210)
+            + '\\u0041"}]}'
+        ).encode("ascii")
+        conn = http.client.HTTPConnection("127.0.0.1", rport, timeout=3.0)
+        try:
+            conn.request(
+                "POST",
+                "/v1/chat/completions",
+                body=esc_body,
+                headers={"Content-Type": "application/json"},
+            )
+            resp = conn.getresponse()
+            bd_esc = resp.read()
+            self.assertEqual(resp.status, 413)
+            self.assertIn(b"payload_too_large", bd_esc)
+        finally:
+            conn.close()
+        self.assertEqual(router.engine._req_mem_used_bytes, 0)
+
+        # 3. Request that DOES fit when idle (~450 * 4 = 1800 <= 2000) returns retryable 503
+        # only under temporary concurrent contention, then succeeds when idle.
+        fit_payload = {
+            "model": "m-perm",
+            "messages": [{"role": "user", "content": "y" * 380}],
+        }
+        first_res: Dict[str, Any] = {}
+
+        def _send_first() -> None:
+            st, _, _ = _http_request(
+                rport, "POST", "/v1/chat/completions", body=fit_payload
+            )
+            first_res["status"] = st
+
+        t1 = threading.Thread(target=_send_first, daemon=True)
+        t1.start()
+        deadline = time.monotonic() + 2.0
+        while slow_b.current_inflight < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertGreaterEqual(slow_b.current_inflight, 1)
+
+        st_busy, _, bd_busy = _http_request(
+            rport, "POST", "/v1/chat/completions", body=fit_payload
+        )
+        self.assertEqual(st_busy, 503)
+        self.assertIn(b"server_memory_limit_reached", bd_busy)
+
+        t1.join(timeout=3.0)
+        self.assertEqual(first_res.get("status"), 200)
+        self.assertEqual(router.engine._req_mem_used_bytes, 0)
+
+    def test_prometheus_parser_preserves_samples_with_braces_in_quoted_labels(
+        self,
+    ) -> None:
+        prom_text = "\n".join(
+            [
+                "# HELP freetpu_tpu_health_status TPU chip health",
+                'freetpu_exporter_up{} 1',
+                'freetpu_tpu_devices_discovered{meta="cluster}prod",} 2',
+                'freetpu_tpu_health_status{chip="0",meta="a}b",note="q=\\"}end\\\\"} 1 1700000000',
+                'freetpu_tpu_health_status{chip="1",literal_bs="\\\\n}",newline="l1\\nl2}"} 1',
+                'freetpu_tpu_duty_cycle_percent{chip="0",desc="brace}inside"} 60.0',
+                'freetpu_tpu_duty_cycle_percent{chip="1",desc="escaped \\"}\\""} 80.0',
+                # Malformed unterminated quote must be ignored without breaking valid lines.
+                'freetpu_tpu_health_status{chip="2",meta="unclosed} 0',
+            ]
+        )
+        samples = parse_prometheus_text(prom_text)
+        by_key = {(s.name, s.labels.get("chip", "")): s for s in samples}
+
+        self.assertIn(("freetpu_exporter_up", ""), by_key)
+        self.assertEqual(by_key[("freetpu_exporter_up", "")].value, 1.0)
+        self.assertEqual(
+            by_key[("freetpu_tpu_devices_discovered", "")].labels["meta"],
+            "cluster}prod",
+        )
+        s0 = by_key[("freetpu_tpu_health_status", "0")]
+        self.assertEqual(s0.labels["meta"], "a}b")
+        self.assertEqual(s0.labels["note"], 'q="}end\\')
+        s1 = by_key[("freetpu_tpu_health_status", "1")]
+        self.assertEqual(s1.labels["literal_bs"], r"\n}")
+        self.assertEqual(s1.labels["newline"], "l1\nl2}")
+        self.assertNotIn(("freetpu_tpu_health_status", "2"), by_key)
+
+        telem = summarize_tpu_samples(samples)
+        self.assertTrue(telem.exporter_up)
+        self.assertEqual(telem.devices_discovered, 2)
+        self.assertEqual(telem.healthy_chips, 2)
+        self.assertEqual(telem.total_chips, 2)
+        self.assertAlmostEqual(telem.avg_duty_cycle_percent or 0.0, 70.0)
+        self.assertAlmostEqual(telem.max_duty_cycle_percent or 0.0, 80.0)
 
 
 def run_self_tests(verbosity: int = 1) -> int:
