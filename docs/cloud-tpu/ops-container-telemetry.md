@@ -9,7 +9,7 @@ FreeTPU Pillar 6 brings GPU-grade operational ergonomics (`dcgm-exporter` + `nvi
 | NVIDIA GPU Stack | FreeTPU Cloud TPU Equivalent | Path |
 | --- | --- | --- |
 | `nvidia-dcgm-exporter` | `tpu-exporter` (`:9400/metrics`) | [`ops/tpu-exporter/tpu_exporter.py`](../../ops/tpu-exporter/tpu_exporter.py) |
-| `nvidia-ctk cdi generate` | `freetpu-cdi generate` (CNCF CDI `v1.1.0`) | [`ops/tpu-cdi/freetpu_cdi.py`](../../ops/tpu-cdi/freetpu_cdi.py) |
+| `nvidia-ctk cdi generate` | `freetpu-cdi generate` (CNCF CDI `v0.6.0` default, `--cdi-version 1.1.0` opt-in) | [`ops/tpu-cdi/freetpu_cdi.py`](../../ops/tpu-cdi/freetpu_cdi.py) |
 | `k8s-device-plugin` / GPU Operator | K8s DaemonSet + DRA / CDI Pod Manifests | [`ops/tpu-cdi/manifests/`](../../ops/tpu-cdi/manifests/k8s-tpu-cdi-daemonset.yaml) |
 
 VFIO-backed Cloud TPU VMs (`v5e`, `v5p`, `v6e` Trillium) expose each TPU chip as a PCI function (`vendor=0x1ae0`) bound to the standard Linux `vfio-pci` kernel driver, with per-IOMMU-group character nodes at `/dev/vfio/<group>` and the shared VFIO container at `/dev/vfio/vfio`.
@@ -28,6 +28,7 @@ VFIO-backed Cloud TPU VMs (`v5e`, `v5p`, `v6e` Trillium) expose each TPU chip as
 | `0x006e` | `v6e-pf` | TPU v6e (PF) | 32 GiB | `vfio-pci` (`/dev/vfio/*`, sysfs/VFIO inventory + CDI; upstream `tpu-info` CLI discovery omits `0x006e`, while `tpu_exporter.py` maps `0x006e` to `TpuChip.V6E` and queries a reachable `libtpu` endpoint via direct gRPC or `tpu_info.metrics` fallback) |
 | `0x006f` | `v6e` | TPU v6e (Trillium) | 32 GiB | `vfio-pci` (`/dev/vfio/*`, full exporter + CDI) |
 | `0x0075` | `tpu7x` | TPU tpu7x (Ironwood, pending live hardware confirmation `#21`) | 192 GiB | `vfio-pci` (`/dev/vfio/*` or `iommufd`, pending live HW confirmation) |
+| `0x0076` | `tpu7x` | TPU tpu7x (Ironwood) | 192 GiB | `vfio-pci` (`/dev/vfio/*` or `iommufd`, matches upstream `tpu-info` Ironwood ID) |
 
 > **TPU v6e PF (`0x006e`) note:** Upstream `tpu-info` CLI discovery recognizes the v6e virtual function (`0x006f`) and omits the physical function (`0x006e`), exiting before querying `libtpu` if only `0x006e` is present. On PF-only `0x006e` hosts, `tpu_exporter.py` maps `0x006e` directly to `TpuChip.V6E` and falls back to the Python `tpu_info.metrics` gRPC client against `--runtime-metrics-addr` (default `127.0.0.1:8431`) when the `tpu-info` Python package is installed, so live HBM and duty-cycle telemetry works on PF-only hosts without reconfiguring PCI devices (while PCI/VFIO inventory, readiness, active PIDs, and `freetpu-cdi` work without `tpu-info`).
 

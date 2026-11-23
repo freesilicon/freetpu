@@ -4,7 +4,8 @@
  * Copyright 2026 FreeTPU Authors
  * SPDX-License-Identifier: Apache-2.0
  *
- * Writers (e.g. libopentpu.so) publish per-chip counters to:
+ * Writers (e.g. libopentpu.so) publish per-chip counters with mode 0600/0644
+ * (never group/world-writable) owned by a trusted publisher UID to:
  *   /dev/shm/freetpu_metrics_<pci_bdf>   (e.g. /dev/shm/freetpu_metrics_0000:00:06.0)
  *
  * Concurrency protocol (lockless SeqLock, single writer / multi-reader):
@@ -14,9 +15,10 @@
  *      and `dma_bytes_transferred`.
  *   3. Increment `seq` to the next even value with release ordering.
  *
- * Readers (`ops/tpu-exporter/tpu_exporter.py`) mmap read-only, check `magic`
- * and `version`, spin/retry while `(seq & 1) != 0`, read the 32-byte payload,
- * and verify `seq` is unchanged afterward.
+ * Readers (`ops/tpu-exporter/tpu_exporter.py`) open with `O_NOFOLLOW`, verify
+ * regular-file type, trusted owner UID, and non-group/world-writable mode via
+ * `fstat`, then read via `pread` (avoiding `mmap` SIGBUS on truncation),
+ * checking `magic`, `version`, and even/unchanged `seq` across the payload read.
  */
 
 #ifndef FREETPU_METRICS_SHM_H

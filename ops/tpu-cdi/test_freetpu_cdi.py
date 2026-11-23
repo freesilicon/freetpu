@@ -191,7 +191,7 @@ class FreeTpuCdiTests(unittest.TestCase):
                 errors = freetpu_cdi.validate_cdi_spec(spec)
                 self.assertEqual(errors, [])
 
-            self.assertEqual(spec["cdiVersion"], "1.1.0")
+            self.assertEqual(spec["cdiVersion"], "0.6.0")
             self.assertEqual(spec["kind"], "freetpu.dev/tpu")
             names = [d["name"] for d in spec["devices"]]
             self.assertEqual(names, ["pci-0000-00-06-0", "all"])
@@ -202,8 +202,19 @@ class FreeTpuCdiTests(unittest.TestCase):
                 spec["devices"][0]["containerEdits"]["deviceNodes"][0]["path"],
                 "/dev/vfio/0",
             )
+            # Composable single-chip PCI selector omits TPU_VISIBLE_DEVICES and
+            # TPU_CHIPS_PER_HOST_BOUNDS so multiple requested selectors never
+            # overwrite each other in OCI env merging; `all` injects full visibility.
             self.assertEqual(
                 spec["devices"][0]["containerEdits"]["env"],
+                [
+                    "MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353",
+                    "TPU_HOST_BOUNDS=1,1,1",
+                    "TPU_SKIP_MDS_QUERY=1",
+                ],
+            )
+            self.assertEqual(
+                spec["devices"][-1]["containerEdits"]["env"],
                 [
                     "TPU_VISIBLE_DEVICES=0",
                     "TPU_CHIPS_PER_HOST_BOUNDS=1,1,1",
@@ -305,15 +316,15 @@ class FreeTpuCdiTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
             )
-            self.assertIn("VALID CNCF CDI v1.1.0 spec", val_res.stdout)
+            self.assertIn("VALID CNCF CDI v0.6.0 spec", val_res.stdout)
 
     def test_validate_rejects_invalid_and_incomplete_per_device_specs(self) -> None:
-        bad_version = {"cdiVersion": "0.6.0", "kind": "freetpu.dev/tpu", "devices": []}
+        bad_version = {"cdiVersion": "0.5.0", "kind": "freetpu.dev/tpu", "devices": []}
         errs = freetpu_cdi.validate_cdi_spec(bad_version)
         self.assertTrue(any("cdiVersion" in e for e in errs))
 
         bad_edits = {
-            "cdiVersion": "1.1.0",
+            "cdiVersion": "0.6.0",
             "kind": "freetpu.dev/tpu",
             "containerEdits": {
                 "deviceNodes": [{"path": "/dev/vfio/vfio"}],
@@ -331,7 +342,7 @@ class FreeTpuCdiTests(unittest.TestCase):
 
         # Device "0" lacks any /dev/vfio/<group> node even though "all" provides one.
         incomplete_per_device = {
-            "cdiVersion": "1.1.0",
+            "cdiVersion": "0.6.0",
             "kind": "freetpu.dev/tpu",
             "containerEdits": {"deviceNodes": [{"path": "/dev/vfio/vfio"}]},
             "devices": [
@@ -342,14 +353,22 @@ class FreeTpuCdiTests(unittest.TestCase):
         errs3 = freetpu_cdi.validate_cdi_spec(incomplete_per_device)
         self.assertTrue(any("devices[0]" in e and "/dev/vfio/<iommu_group>" in e for e in errs3))
 
-        # CDI v1.1.0 supports intelRdt and additionalGids with proper schema validation.
+        # CDI v1.1.0 supports exact specs-go IntelRdt keys (`closID`, `l3CacheSchema`,
+        # `memBwSchema`, `schemata`, `enableMonitoring`), `additionalGids`, and `netDevices`.
         v11_spec = {
             "cdiVersion": "1.1.0",
             "kind": "freetpu.dev/tpu",
             "containerEdits": {
                 "deviceNodes": [{"path": "/dev/vfio/vfio"}],
-                "intelRdt": {"closID": "tpu"},
+                "intelRdt": {
+                    "closID": "tpu",
+                    "l3CacheSchema": "L3:0=7f0",
+                    "memBwSchema": "MB:0=50",
+                    "schemata": ["L3:0=7f0"],
+                    "enableMonitoring": True,
+                },
                 "additionalGids": [1000],
+                "netDevices": [{"hostInterfaceName": "eth1", "name": "tpu0"}],
             },
             "devices": [
                 {
@@ -360,12 +379,53 @@ class FreeTpuCdiTests(unittest.TestCase):
         }
         self.assertEqual(freetpu_cdi.validate_cdi_spec(v11_spec), [])
 
+        # CDI v0.6.0 must reject v0.7+/v1.1+ fields (intelRdt, additionalGids, netDevices).
+        v06_with_v11 = json.loads(json.dumps(v11_spec))
+        v06_with_v11["cdiVersion"] = "0.6.0"
+        errs_v06 = freetpu_cdi.validate_cdi_spec(v06_with_v11)
+        self.assertTrue(any("intelRdt" in e and "0.6.0" in e for e in errs_v06), errs_v06)
+
+        # CDI v0.8.0 accepts closID/l3CacheSchema/memBwSchema, but rejects v1.1.0-only
+        # schemata/enableMonitoring and netDevices.
+        v08_with_v11_irdt = {
+            "cdiVersion": "0.8.0",
+            "kind": "freetpu.dev/tpu",
+            "containerEdits": {
+                "deviceNodes": [{"path": "/dev/vfio/vfio"}],
+                "intelRdt": {
+                    "closID": "tpu",
+                    "l3CacheSchema": "L3:0=7f0",
+                    "memBwSchema": "MB:0=50",
+                    "schemata": ["L3:0=7f0"],
+                    "enableMonitoring": True,
+                },
+            },
+            "devices": [
+                {
+                    "name": "0",
+                    "containerEdits": {"deviceNodes": [{"path": "/dev/vfio/0"}]},
+                }
+            ],
+        }
+        errs_v08 = freetpu_cdi.validate_cdi_spec(v08_with_v11_irdt)
+        self.assertTrue(any("schemata" in e and "enableMonitoring" in e for e in errs_v08), errs_v08)
+
+        # Invalid/deprecated IntelRdt keys (`l3CacheAllocation`, `memBwAllocation`) and
+        # wrong field types must all be rejected.
         bad_v11_spec = {
             "cdiVersion": "1.1.0",
             "kind": "freetpu.dev/tpu",
             "containerEdits": {
                 "deviceNodes": [{"path": "/dev/vfio/vfio"}],
-                "intelRdt": {"unknownField": "x"},
+                "intelRdt": {
+                    "closID": 42,
+                    "l3CacheSchema": ["bad"],
+                    "memBwSchema": True,
+                    "schemata": "L3:0=7f0",
+                    "enableMonitoring": "yes",
+                    "l3CacheAllocation": "L3:0=7f0",
+                    "memBwAllocation": "MB:0=50",
+                },
                 "additionalGids": ["not-an-int"],
             },
             "devices": [
@@ -376,8 +436,13 @@ class FreeTpuCdiTests(unittest.TestCase):
             ],
         }
         errs4 = freetpu_cdi.validate_cdi_spec(bad_v11_spec)
-        self.assertTrue(any("intelRdt" in e for e in errs4))
-        self.assertTrue(any("additionalGids" in e for e in errs4))
+        self.assertTrue(any("l3CacheAllocation" in e and "memBwAllocation" in e for e in errs4), errs4)
+        self.assertTrue(any("intelRdt.closID" in e for e in errs4), errs4)
+        self.assertTrue(any("intelRdt.l3CacheSchema" in e for e in errs4), errs4)
+        self.assertTrue(any("intelRdt.memBwSchema" in e for e in errs4), errs4)
+        self.assertTrue(any("intelRdt.schemata" in e for e in errs4), errs4)
+        self.assertTrue(any("intelRdt.enableMonitoring" in e for e in errs4), errs4)
+        self.assertTrue(any("additionalGids" in e for e in errs4), errs4)
 
     def test_rejects_vfio_group_with_non_tpu_devices_and_non_vfio_driver(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -616,7 +681,30 @@ class FreeTpuCdiTests(unittest.TestCase):
                 check=True,
             )
             parsed = json.loads(res_ok.stdout)
-            self.assertEqual(parsed["cdiVersion"], "1.1.0")
+            self.assertEqual(parsed["cdiVersion"], "0.6.0")
+
+            # Explicit --cdi-version 1.1.0 opt-in works on CLI.
+            res_v11 = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "generate",
+                    "--allow-missing-vfio",
+                    "--stdout",
+                    "--validate",
+                    "--cdi-version",
+                    "1.1.0",
+                    "--sysfs-root",
+                    str(sysfs_root),
+                    "--dev-root",
+                    str(dev_root),
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            parsed_v11 = json.loads(res_v11.stdout)
+            self.assertEqual(parsed_v11["cdiVersion"], "1.1.0")
 
     def test_host_revalidation_and_sync_invalidate_stale_vfio_group_specs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1432,7 +1520,7 @@ class FreeTpuCdiTests(unittest.TestCase):
 
                 # 6. Non-string/unhashable JSON fields in type/hookName/mounts/hooks produce validation errors (no TypeError).
                 malformed_spec = {
-                    "cdiVersion": "1.1.0",
+                    "cdiVersion": "0.6.0",
                     "kind": "freetpu.dev/tpu",
                     "devices": [
                         {
@@ -1472,11 +1560,11 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertTrue(any(".fileMode:" in e for e in mal_errs), mal_errs)
                 self.assertTrue(any(".options: must be a list of strings" in e for e in mal_errs), mal_errs)
                 self.assertTrue(any(".type: must be a string" in e for e in mal_errs), mal_errs)
-                self.assertTrue(any("unsupported CDI v1.1.0 mount keys" in e for e in mal_errs), mal_errs)
+                self.assertTrue(any("unsupported CDI v0.6.0 mount keys" in e for e in mal_errs), mal_errs)
                 self.assertTrue(any("invalid OCI hookName" in e for e in mal_errs), mal_errs)
                 self.assertTrue(any(".args: must be a list of strings" in e for e in mal_errs), mal_errs)
                 self.assertTrue(any(".timeout: must be a positive integer" in e for e in mal_errs), mal_errs)
-                self.assertTrue(any("unsupported CDI v1.1.0 hook keys" in e for e in mal_errs), mal_errs)
+                self.assertTrue(any("unsupported CDI v0.6.0 hook keys" in e for e in mal_errs), mal_errs)
 
                 # 7. Per-device containerEdits injects isolated libtpu env vars by default.
                 clean_spec = freetpu_cdi.build_cdi_spec(chips_live, vfio_c)
@@ -1490,9 +1578,9 @@ class FreeTpuCdiTests(unittest.TestCase):
                     self.assertIn("TPU_SKIP_MDS_QUERY=1", dev_entry["containerEdits"]["env"])
                     self.assertIn("annotations", dev_entry)
 
-                # 8. Empty per-device containerEdits is rejected (CDI v1.1.0 requires >= 1 edit per device).
+                # 8. Empty per-device containerEdits is rejected (CDI requires >= 1 edit per device).
                 empty_dev_spec = {
-                    "cdiVersion": "1.1.0",
+                    "cdiVersion": "0.6.0",
                     "kind": "freetpu.dev/tpu",
                     "containerEdits": {
                         "deviceNodes": [
@@ -1604,10 +1692,22 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertEqual(all_env["TPU_HOST_BOUNDS"], "1,1,1")
                 self.assertEqual(all_env["TPU_SKIP_MDS_QUERY"], "1")
 
+                # Composable PCI selectors omit TPU_VISIBLE_DEVICES / TPU_CHIPS_PER_HOST_BOUNDS
+                # so combining multiple PCI selectors never overwrites visibility in OCI env.
+                pci0_iso_env = {
+                    kv.split("=", 1)[0]: kv.split("=", 1)[1]
+                    for kv in iso_spec["devices"][0]["containerEdits"]["env"]
+                }
+                self.assertNotIn("TPU_VISIBLE_DEVICES", pci0_iso_env)
+                self.assertNotIn("TPU_CHIPS_PER_HOST_BOUNDS", pci0_iso_env)
+                self.assertEqual(pci0_iso_env["MEGASCALE_COORDINATOR_ADDRESS"], "127.0.0.1:8353")
+
                 host_spec = freetpu_cdi.build_cdi_spec(
                     chips, control_node, network_mode="host"
                 )
                 self.assertEqual(freetpu_cdi.validate_cdi_spec(host_spec), [])
+                # In host mode, composable PCI selectors omit empty env altogether.
+                self.assertNotIn("env", host_spec["devices"][0]["containerEdits"])
                 host_env = {
                     kv.split("=", 1)[0]: kv.split("=", 1)[1]
                     for kv in host_spec["devices"][-1]["containerEdits"]["env"]
@@ -1629,11 +1729,12 @@ class FreeTpuCdiTests(unittest.TestCase):
         self.assertEqual(rc_host, 0)
         self.assertIn("--net=host", out_host)
 
-    def test_iommufd_dual_path_auto_detection_and_host_validation(self) -> None:
+    def test_iommufd_preserves_legacy_default_requires_sysfs_cdev_and_groups_iommu_siblings(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            # 1. Pure iommufd host (no /dev/vfio/vfio, /dev/iommu present, verified vfio-dev/vfioN).
             sysfs_root, dev_root = _make_mock_pci_vfio(
-                root,
+                root / "pure_iommufd",
                 devices=[
                     {
                         "bdf": "0000:00:0b.0",
@@ -1696,7 +1797,7 @@ class FreeTpuCdiTests(unittest.TestCase):
 
                 # Incomplete iommufd spec lacking /dev/vfio/devices/vfioN must fail validation.
                 bad_iommufd = {
-                    "cdiVersion": "1.1.0",
+                    "cdiVersion": "0.6.0",
                     "kind": "freetpu.dev/tpu",
                     "containerEdits": {"deviceNodes": [{"path": "/dev/iommu"}]},
                     "devices": [{"name": "0", "containerEdits": {"env": ["FOO=bar"]}}],
@@ -1704,6 +1805,187 @@ class FreeTpuCdiTests(unittest.TestCase):
                 bad_errs = freetpu_cdi.validate_cdi_spec(bad_iommufd)
                 self.assertTrue(
                     any("/dev/vfio/devices/vfioN" in e for e in bad_errs), bad_errs
+                )
+
+            # 2. Dual-interface host: BOTH legacy VFIO and /dev/iommu exist.
+            #    Default `vfio_mode="auto"` MUST preserve legacy VFIO (even when TPU
+            #    cdevs are absent or present); explicit `--vfio-mode iommufd`/`cdev` opts in.
+            dual_sysfs, dual_dev = _make_mock_pci_vfio(
+                root / "dual_interface",
+                devices=[
+                    {
+                        "bdf": "0000:00:0b.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "3",
+                        "iommufd_cdev": "vfio4",
+                    }
+                ],
+                create_vfio_container=True,
+                create_vfio_nodes=["3"],
+                create_iommu=True,
+                create_iommufd_cdevs=["vfio4"],
+            )
+            with _mock_vfio_char_devices():
+                chips_auto, ctrl_auto = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=dual_sysfs, dev_root=dual_dev
+                )
+                self.assertEqual(ctrl_auto, dual_dev / "vfio" / "vfio")
+                self.assertEqual(chips_auto[0].vfio_mode, "vfio-group")
+                self.assertEqual(chips_auto[0].vfio_container_path, "/dev/vfio/3")
+                legacy_spec = freetpu_cdi.build_cdi_spec(chips_auto, ctrl_auto)
+                self.assertEqual(
+                    freetpu_cdi.verify_spec_against_host(
+                        legacy_spec, sysfs_root=dual_sysfs, dev_root=dual_dev
+                    ),
+                    [],
+                )
+
+                # Explicit opt-in `--vfio-mode cdev` / `iommufd` selects cdev on the same host
+                # and validates cleanly with `verify_spec_against_host`!
+                chips_cdev, ctrl_cdev = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=dual_sysfs, dev_root=dual_dev, vfio_mode="cdev"
+                )
+                self.assertEqual(ctrl_cdev, dual_dev / "iommu")
+                self.assertEqual(chips_cdev[0].vfio_mode, "iommufd")
+                self.assertEqual(chips_cdev[0].vfio_container_path, "/dev/vfio/devices/vfio4")
+                cdev_spec = freetpu_cdi.build_cdi_spec(chips_cdev, ctrl_cdev)
+                self.assertEqual(
+                    freetpu_cdi.verify_spec_against_host(
+                        cdev_spec, sysfs_root=dual_sysfs, dev_root=dual_dev
+                    ),
+                    [],
+                )
+
+            # 3. Missing `<pci>/vfio-dev/vfioN` association MUST fail closed even when
+            #    `/dev/vfio/devices/vfio0` and `/sys/class/vfio-dev/vfio0/dev` exist
+            #    (never guess `vfio0` from TPU enumeration index!).
+            no_assoc_sysfs, no_assoc_dev = _make_mock_pci_vfio(
+                root / "no_cdev_assoc",
+                devices=[
+                    {
+                        "bdf": "0000:00:0b.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "3",
+                        # intentionally omit iommufd_cdev!
+                    }
+                ],
+                create_vfio_container=True,
+                create_vfio_nodes=["3"],
+                create_iommu=True,
+                create_iommufd_cdevs=["vfio0"],  # belongs to some other device!
+            )
+            with _mock_vfio_char_devices():
+                # Default auto still succeeds via legacy VFIO without failing or invalidating!
+                chips_safe, ctrl_safe = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=no_assoc_sysfs, dev_root=no_assoc_dev
+                )
+                self.assertEqual(ctrl_safe, no_assoc_dev / "vfio" / "vfio")
+                self.assertEqual(chips_safe[0].vfio_mode, "vfio-group")
+
+                # Explicit iommufd mode MUST fail closed instead of guessing vfio0.
+                with self.assertRaisesRegex(RuntimeError, "missing sysfs association directory"):
+                    freetpu_cdi.discover_tpu_chips(
+                        sysfs_root=no_assoc_sysfs,
+                        dev_root=no_assoc_dev,
+                        vfio_mode="iommufd",
+                    )
+
+            # 4. Shared IOMMU group in iommufd mode MUST group sibling cdevs into ONE
+            #    allocation unit and suppress cross-domain sub-host slices.
+            shared_sysfs, shared_dev = _make_mock_pci_vfio(
+                root / "shared_iommufd",
+                devices=[
+                    {
+                        "bdf": "0000:00:0b.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "7",
+                        "numa_node": "0",
+                        "iommufd_cdev": "vfio0",
+                    },
+                    {
+                        "bdf": "0000:00:0c.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "7",  # shared IOMMU group with 0000:00:0b.0
+                        "numa_node": "0",
+                        "iommufd_cdev": "vfio1",
+                    },
+                    {
+                        "bdf": "0000:80:00.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "7",  # crosses NUMA 0 / NUMA 1 boundary!
+                        "numa_node": "1",
+                        "iommufd_cdev": "vfio2",
+                    },
+                    {
+                        "bdf": "0000:80:01.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "8",
+                        "numa_node": "1",
+                        "iommufd_cdev": "vfio3",
+                    },
+                ],
+                create_vfio_container=False,
+                create_vfio_nodes=[],
+                create_iommu=True,
+                create_iommufd_cdevs=["vfio0", "vfio1", "vfio2", "vfio3"],
+            )
+            with _mock_vfio_char_devices():
+                chips_sh, ctrl_sh = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=shared_sysfs, dev_root=shared_dev, vfio_mode="iommufd"
+                )
+                spec_sh = freetpu_cdi.build_cdi_spec(chips_sh, ctrl_sh)
+                self.assertEqual(freetpu_cdi.validate_cdi_spec(spec_sh), [])
+                self.assertEqual(
+                    freetpu_cdi.verify_spec_against_host(
+                        spec_sh, sysfs_root=shared_sysfs, dev_root=shared_dev
+                    ),
+                    [],
+                )
+                sh_names = [d["name"] for d in spec_sh["devices"]]
+                # Group 7 siblings become ONE shared-group unit; cross-domain numa0/numa1 suppressed!
+                self.assertEqual(
+                    sh_names,
+                    [
+                        "group-pci-0000-00-0b-0_0000-00-0c-0_0000-80-00-0",
+                        "pci-0000-80-01-0",
+                        "all",
+                    ],
+                )
+                self.assertNotIn("numa0", sh_names)
+                self.assertNotIn("numa1", sh_names)
+                self.assertEqual(
+                    [n["path"] for n in spec_sh["devices"][0]["containerEdits"]["deviceNodes"]],
+                    [
+                        "/dev/vfio/devices/vfio0",
+                        "/dev/vfio/devices/vfio1",
+                        "/dev/vfio/devices/vfio2",
+                    ],
+                )
+                # Tampering spec to expose only ONE chip of shared group 7 must fail --check-host!
+                partial_spec = json.loads(json.dumps(spec_sh))
+                partial_spec["devices"][0]["name"] = "pci-0000-00-0b-0"
+                partial_spec["devices"][0]["annotations"]["freetpu.dev/pci-bdfs"] = "0000:00:0b.0"
+                partial_spec["devices"][0]["containerEdits"]["deviceNodes"] = [
+                    partial_spec["devices"][0]["containerEdits"]["deviceNodes"][0]
+                ]
+                errs_partial = freetpu_cdi.verify_spec_against_host(
+                    partial_spec, sysfs_root=shared_sysfs, dev_root=shared_dev
+                )
+                self.assertTrue(
+                    any("partial IOMMU group allocation" in e for e in errs_partial),
+                    errs_partial,
                 )
 
     def test_v6e8_numa_pcie_root_complex_subhost_slices_and_tpu7x(self) -> None:
@@ -1804,7 +2086,7 @@ class FreeTpuCdiTests(unittest.TestCase):
                     errs_cross,
                 )
 
-            # Verify tpu7x (0x0075) recognition (pending live HW confirmation #21).
+            # Verify tpu7x Ironwood recognition for BOTH 0x0075 and Google's 0x0076 IDs.
             root_7x = root / "tpu7x"
             sysfs_7x, dev_7x = _make_mock_pci_vfio(
                 root_7x,
@@ -1815,16 +2097,26 @@ class FreeTpuCdiTests(unittest.TestCase):
                         "device": "0x0075",
                         "driver": "vfio-pci",
                         "iommu_group": "0",
-                    }
+                    },
+                    {
+                        "bdf": "0000:00:07.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0076",
+                        "driver": "vfio-pci",
+                        "iommu_group": "1",
+                    },
                 ],
-                create_vfio_nodes=["0"],
+                create_vfio_nodes=["0", "1"],
             )
             with _mock_vfio_char_devices():
-                chips_7x, _ = freetpu_cdi.discover_tpu_chips(
+                chips_7x, ctrl_7x = freetpu_cdi.discover_tpu_chips(
                     sysfs_root=sysfs_7x, dev_root=dev_7x
                 )
-                self.assertEqual(chips_7x[0].generation, "tpu7x")
-                self.assertIn("pending live hardware confirmation", chips_7x[0].model_name)
+                self.assertEqual([c.generation for c in chips_7x], ["tpu7x", "tpu7x"])
+                self.assertEqual([c.device_id for c in chips_7x], ["0x0075", "0x0076"])
+                self.assertIn("Ironwood", chips_7x[1].model_name)
+                spec_7x = freetpu_cdi.build_cdi_spec(chips_7x, ctrl_7x)
+                self.assertEqual(freetpu_cdi.validate_cdi_spec(spec_7x), [])
 
 
 if __name__ == "__main__":

@@ -46,13 +46,16 @@
 #      (`SIGTERM`), `freetpu-cdi-sync` passes `--unlink-on-exit` to remove
 #      `/var/run/cdi/freetpu.json`; after forced termination (`SIGKILL`), delete
 #      `/var/run/cdi/freetpu.json` on the host manually.
-#      On Linux 6.8+ `iommufd` hosts, `freetpu_cdi.py` auto-detects `/dev/iommu`
-#      and emits `/dev/iommu` + `/dev/vfio/devices/vfioN` (mount `/dev/iommu`
-#      and `/dev/vfio/devices` into `freetpu-cdi-sync` if running on `iommufd`
-#      nodes). In default `--network-mode isolated`, CDI v1.1.0 injects
-#      `MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353`, `TPU_HOST_BOUNDS=1,1,1`,
-#      slice-scoped `TPU_CHIPS_PER_HOST_BOUNDS`, `TPU_VISIBLE_DEVICES`, and
-#      `TPU_SKIP_MDS_QUERY=1` so single-host TPU pods do NOT require
+#      Legacy VFIO (`/dev/vfio/vfio` + `/dev/vfio/<group>`) is preserved as the
+#      default whenever usable; on Linux 6.8+ `iommufd`-only hosts (or with
+#      explicit `--vfio-mode iommufd`), `freetpu_cdi.py` emits `/dev/iommu` +
+#      verified `<pci>/vfio-dev/vfioN` nodes (mount `/dev/iommu` and
+#      `/dev/vfio/devices` into `freetpu-cdi-sync` on `iommufd` nodes). In
+#      default `--network-mode isolated`, CDI (default `v0.6.0` for containerd
+#      2.0/2.1+ compatibility) injects `MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353`,
+#      `TPU_HOST_BOUNDS=1,1,1`, `TPU_SKIP_MDS_QUERY=1` (and slice-scoped
+#      `TPU_CHIPS_PER_HOST_BOUNDS` + `TPU_VISIBLE_DEVICES` on full-allocation
+#      selectors `numa*`/`0-3`/`all`) so single-host TPU pods do NOT require
 #      `hostNetwork: true` and can share a `v6e-8` across NUMA slices without
 #      port `8353` collisions.
 #      VFIO MEMLOCK PREREQUISITE: CDI device injection does not configure

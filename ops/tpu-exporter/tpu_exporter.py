@@ -7,8 +7,9 @@ v5p, v6e Trillium, and tpu7x pending live HW confirmation), scrapes:
   - Direct `libtpu` gRPC / `RuntimeMetricService` (`localhost:8431`) when
     `grpcio` and protobuf stubs are available (with graceful fallback and zero
     unconditional `tpu-info` subprocess churn)
-  - Lockless SeqLock `/dev/shm/freetpu_metrics_<bdf>` `mmap` telemetry for
-    bare-metal `libopentpu.so` (`ops/tpu-exporter/freetpu_metrics_shm.h`)
+  - Lockless SeqLock `/dev/shm/freetpu_metrics_<bdf>` `pread` telemetry for
+    bare-metal `libopentpu.so` (`ops/tpu-exporter/freetpu_metrics_shm.h`),
+    authenticated via opened-fd owner UID and non-group/world-writable mode
   - Pure `libtpu`-free sysfs PCIe AER counters (`aer_dev_correctable`,
     `aer_dev_fatal`)
   - Optional GCP Spot preemption metadata gauge
@@ -37,7 +38,6 @@ import inspect
 import io
 import json
 import math
-import mmap
 import os
 from pathlib import Path
 import re
@@ -67,6 +67,7 @@ TPU_PCI_DEVICES: Dict[str, Tuple[str, str, int]] = {
     "0x006e": ("v6e-pf", "TPU v6e (PF)", 32 * 1024**3),
     "0x006f": ("v6e", "TPU v6e (Trillium)", 32 * 1024**3),
     "0x0075": ("tpu7x", "TPU tpu7x (Ironwood, pending live hardware confirmation #21)", 192 * 1024**3),
+    "0x0076": ("tpu7x", "TPU tpu7x (Ironwood)", 192 * 1024**3),
 }
 
 # Legacy Cloud TPU v2/v3 (0x0027) expose two PCI core functions per physical chip
@@ -218,6 +219,7 @@ _GEN_TO_TPU_CHIP_ATTR: Dict[str, str] = {
     "v5p": "V5P",
     "v6e": "V6E",
     "v6e-pf": "V6E",
+    "tpu7x": "V7X",
 }
 
 
@@ -966,7 +968,7 @@ _GRPC_METRIC_NAMES = (
     "tpu.runtime.tensorcore.dutycycle.percent",
     "tpu.runtime.hbm.memory.usage.bytes",
     "tpu.runtime.hbm.memory.total.bytes",
-    "tpu.runtime.hbm.memory.bandwidth.utilization.percent",
+    "tpu.runtime.hbm.utilization.percent",
 )
 
 
@@ -1004,42 +1006,62 @@ def _get_grpc_channel(grpc_mod: Any, addr: str) -> Any:
 
 
 def _extract_grpc_chip_id(metric_item: Any) -> Optional[str]:
+    """Decode device/chip ID from published `tpu_metric_service.proto` `Metric.attribute.value`."""
     attr = getattr(metric_item, "attribute", None)
     if attr is None:
         return None
     val = getattr(attr, "value", None)
-    if val is not None:
-        str_val = getattr(val, "string_value", None)
-        if isinstance(str_val, str) and str_val.strip():
-            return str_val.strip()
-        int_val = getattr(val, "int_value", None)
-        if isinstance(int_val, int) and not isinstance(int_val, bool):
-            return str(int_val)
-    for key_attr in ("device_id", "chip_id", "int_value", "string_value"):
-        v = getattr(attr, key_attr, None)
-        if v is not None and str(v).strip():
-            return str(v).strip()
+    if val is None:
+        return None
+
+    which_fn = getattr(val, "WhichOneof", None)
+    if callable(which_fn):
+        try:
+            selected = which_fn("attr")
+        except Exception:  # noqa: BLE001
+            selected = None
+        if selected == "string_attr":
+            str_val = getattr(val, "string_attr", None)
+            return str_val.strip() if isinstance(str_val, str) and str_val.strip() else None
+        if selected == "int_attr":
+            int_val = getattr(val, "int_attr", None)
+            return str(int_val) if isinstance(int_val, int) and not isinstance(int_val, bool) else None
+        return None
+
+    str_val = getattr(val, "string_attr", None)
+    if isinstance(str_val, str) and str_val.strip():
+        return str_val.strip()
+    int_val = getattr(val, "int_attr", None)
+    if isinstance(int_val, int) and not isinstance(int_val, bool):
+        return str(int_val)
     return None
 
 
 def _extract_grpc_gauge_value(metric_item: Any) -> Optional[float]:
+    """Decode numeric gauge reading from `tpu_metric_service.proto` `Metric.gauge`."""
     gauge = getattr(metric_item, "gauge", None)
     if gauge is None:
         return None
-    for field_name in ("as_double", "as_float", "as_int", "value"):
+    which_fn = getattr(gauge, "WhichOneof", None)
+    if callable(which_fn):
+        try:
+            selected = which_fn("value")
+        except Exception:  # noqa: BLE001
+            selected = None
+        if selected not in ("as_double", "as_int"):
+            return None
+        raw = getattr(gauge, selected, None)
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            fval = float(raw)
+            return fval if math.isfinite(fval) else None
+        return None
+
+    for field_name in ("as_double", "as_int"):
         raw = getattr(gauge, field_name, None)
         if isinstance(raw, (int, float)) and not isinstance(raw, bool):
-            # In protobuf3, distinguish unset 0 if gauge has WhichOneof('value').
-            which_fn = getattr(gauge, "WhichOneof", None)
-            if callable(which_fn):
-                try:
-                    selected = which_fn("value")
-                    if selected and selected != field_name:
-                        continue
-                except Exception:  # noqa: BLE001
-                    pass
-            if math.isfinite(float(raw)):
-                return float(raw)
+            fval = float(raw)
+            if math.isfinite(fval):
+                return fval
     return None
 
 
@@ -1111,7 +1133,7 @@ def _query_grpc_runtime_metrics(
                 row.hbm_total_bytes = int(round(val))
             elif metric_name == "tpu.runtime.tensorcore.dutycycle.percent":
                 row.duty_cycle_percent = float(val)
-            elif metric_name == "tpu.runtime.hbm.memory.bandwidth.utilization.percent":
+            elif metric_name == "tpu.runtime.hbm.utilization.percent":
                 row.hbm_bw_util_percent = float(val)
 
     if not rows:
@@ -1126,43 +1148,81 @@ def read_shm_seqlock_metrics(
     shm_root: Optional[Path] = Path("/dev/shm"),
     *,
     max_retries: int = 64,
+    trusted_uids: Optional[Sequence[int]] = None,
 ) -> Optional[ShmMetrics]:
-    """Read bare-metal `libopentpu.so` telemetry from `/dev/shm/freetpu_metrics_<bdf>` via lockless SeqLock mmap."""
+    """Read bare-metal `libopentpu.so` telemetry from `<shm_root>/freetpu_metrics_<bdf>` via SeqLock `pread`.
+
+    Authenticates the publisher on the opened file descriptor before reading:
+    - rejects world-writable directories that lack the sticky bit (`S_ISVTX`);
+    - opens with `O_NOFOLLOW | O_NONBLOCK` to avoid symlink/FIFO TOCTOU races;
+    - requires a regular file owned by an allowed UID (default: current `euid`)
+      with neither group-write (`0o020`) nor world-write (`0o002`) permissions;
+    - reads via `os.pread` (never `mmap`) so concurrent truncation cannot raise
+      `SIGBUS` and instead fails closed with `None`.
+    """
     if shm_root is None or not pci_bdf:
         return None
     if "/" in pci_bdf or "\\" in pci_bdf or ".." in pci_bdf:
         return None
 
-    shm_path = Path(shm_root) / f"freetpu_metrics_{pci_bdf}"
+    shm_dir = Path(shm_root)
     try:
-        st = os.lstat(shm_path)
+        dir_st = os.stat(shm_dir)
     except OSError:
         return None
-    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+    if not stat.S_ISDIR(dir_st.st_mode):
         return None
-    if st.st_size < _SHM_FULL_STRUCT.size:
+    if (dir_st.st_mode & stat.S_IWOTH) != 0 and (dir_st.st_mode & stat.S_ISVTX) == 0:
         return None
 
+    allowed_uids = (
+        {int(u) for u in trusted_uids}
+        if trusted_uids is not None
+        else {os.geteuid()}
+    )
+
+    shm_path = shm_dir / f"freetpu_metrics_{pci_bdf}"
+    open_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
-        fd = os.open(shm_path, os.O_RDONLY)
+        fd = os.open(shm_path, open_flags)
     except OSError:
         return None
-    mm: Optional[mmap.mmap] = None
     try:
         fd_st = os.fstat(fd)
+        if not stat.S_ISREG(fd_st.st_mode):
+            return None
+        if fd_st.st_uid not in allowed_uids:
+            return None
+        if (fd_st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)) != 0:
+            return None
         if fd_st.st_size < _SHM_FULL_STRUCT.size:
             return None
-        mm = mmap.mmap(fd, _SHM_FULL_STRUCT.size, access=mmap.ACCESS_READ)
+
         for _ in range(max(1, max_retries)):
-            magic, version, seq1 = _SHM_HEADER_STRUCT.unpack_from(mm, 0)
+            hdr = os.pread(fd, _SHM_HEADER_STRUCT.size, 0)
+            if len(hdr) < _SHM_HEADER_STRUCT.size:
+                return None
+            magic, version, seq1 = _SHM_HEADER_STRUCT.unpack_from(hdr, 0)
             if magic != FREETPU_SHM_MAGIC or version != FREETPU_SHM_VERSION:
                 return None
             if (seq1 & 1) != 0:
                 time.sleep(0)
                 continue
-            hbm_alloc, hbm_used, mxu_cycles, dma_bytes = _SHM_PAYLOAD_STRUCT.unpack_from(mm, 16)
-            (seq2,) = _SHM_SEQ_STRUCT.unpack_from(mm, 8)
+            payload = os.pread(fd, _SHM_PAYLOAD_STRUCT.size, 16)
+            if len(payload) < _SHM_PAYLOAD_STRUCT.size:
+                return None
+            seq2_raw = os.pread(fd, _SHM_SEQ_STRUCT.size, 8)
+            if len(seq2_raw) < _SHM_SEQ_STRUCT.size:
+                return None
+            (seq2,) = _SHM_SEQ_STRUCT.unpack_from(seq2_raw, 0)
             if seq1 == seq2:
+                hbm_alloc, hbm_used, mxu_cycles, dma_bytes = _SHM_PAYLOAD_STRUCT.unpack_from(
+                    payload, 0
+                )
                 return ShmMetrics(
                     hbm_allocated_bytes=hbm_alloc,
                     hbm_used_bytes=hbm_used,
@@ -1174,11 +1234,6 @@ def read_shm_seqlock_metrics(
     except (OSError, ValueError, struct.error):
         return None
     finally:
-        if mm is not None:
-            try:
-                mm.close()
-            except OSError:
-                pass
         try:
             os.close(fd)
         except OSError:
@@ -1566,6 +1621,7 @@ def collect_snapshot(
     skip_pid_scan: bool = False,
     runtime_metrics_addr: Optional[str] = DEFAULT_RUNTIME_METRICS_ADDR,
     shm_root: Optional[Path] = Path("/dev/shm"),
+    shm_trusted_uids: Optional[Sequence[int]] = None,
     gcp_metadata_preemption: bool = False,
     gcp_metadata_url: str = DEFAULT_GCP_METADATA_PREEMPTED_URL,
     gcp_metadata_timeout_s: float = 0.5,
@@ -1766,7 +1822,11 @@ def collect_snapshot(
                 dev.hbm_bandwidth_utilization_percent = matched_util.hbm_bw_util_percent
 
         # Bare-metal libopentpu.so SeqLock /dev/shm/freetpu_metrics_<bdf> telemetry.
-        shm = read_shm_seqlock_metrics(dev.pci_bdf, shm_root=shm_root)
+        shm = read_shm_seqlock_metrics(
+            dev.pci_bdf,
+            shm_root=shm_root,
+            trusted_uids=shm_trusted_uids,
+        )
         if shm is not None:
             dev.shm_hbm_allocated_bytes = shm.hbm_allocated_bytes
             dev.mxu_active_cycles = shm.mxu_active_cycles
@@ -2206,6 +2266,7 @@ class _ExporterServer(ThreadingHTTPServer):
         skip_pid_scan: bool = False,
         runtime_metrics_addr: Optional[str] = "127.0.0.1:8431",
         shm_root: Optional[Path] = Path("/dev/shm"),
+        shm_trusted_uids: Optional[Sequence[int]] = None,
         gcp_metadata_preemption: bool = False,
         gcp_metadata_url: str = DEFAULT_GCP_METADATA_PREEMPTED_URL,
         gcp_metadata_timeout_s: float = 0.5,
@@ -2221,6 +2282,7 @@ class _ExporterServer(ThreadingHTTPServer):
         self.skip_pid_scan = skip_pid_scan
         self.runtime_metrics_addr = runtime_metrics_addr
         self.shm_root = shm_root
+        self.shm_trusted_uids = tuple(shm_trusted_uids) if shm_trusted_uids is not None else None
         self.gcp_metadata_preemption = gcp_metadata_preemption
         self.gcp_metadata_url = gcp_metadata_url
         self.gcp_metadata_timeout_s = gcp_metadata_timeout_s
@@ -2276,6 +2338,7 @@ class _ExporterServer(ThreadingHTTPServer):
                 skip_pid_scan=self.skip_pid_scan,
                 runtime_metrics_addr=self.runtime_metrics_addr,
                 shm_root=self.shm_root,
+                shm_trusted_uids=self.shm_trusted_uids,
                 gcp_metadata_preemption=self.gcp_metadata_preemption,
                 gcp_metadata_url=self.gcp_metadata_url,
                 gcp_metadata_timeout_s=self.gcp_metadata_timeout_s,
@@ -2512,6 +2575,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Shared-memory directory for libopentpu.so SeqLock files (default: /dev/shm).",
     )
     parser.add_argument(
+        "--shm-trusted-uid",
+        dest="shm_trusted_uids",
+        action="append",
+        type=int,
+        default=None,
+        help=(
+            "Trusted owner UID for SeqLock SHM files (repeatable; defaults to "
+            "the exporter's effective UID only; group/world-writable files are always rejected)."
+        ),
+    )
+    parser.add_argument(
         "--gcp-metadata-preemption",
         action="store_true",
         default=False,
@@ -2566,6 +2640,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 skip_pid_scan=args.no_pid_scan,
                 runtime_metrics_addr=runtime_metrics_addr,
                 shm_root=args.shm_root,
+                shm_trusted_uids=args.shm_trusted_uids,
                 gcp_metadata_preemption=args.gcp_metadata_preemption,
                 gcp_metadata_url=args.gcp_metadata_url,
                 gcp_metadata_timeout_s=args.gcp_metadata_timeout,
@@ -2591,6 +2666,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         skip_pid_scan=args.no_pid_scan,
         runtime_metrics_addr=runtime_metrics_addr,
         shm_root=args.shm_root,
+        shm_trusted_uids=args.shm_trusted_uids,
         gcp_metadata_preemption=args.gcp_metadata_preemption,
         gcp_metadata_url=args.gcp_metadata_url,
         gcp_metadata_timeout_s=args.gcp_metadata_timeout,

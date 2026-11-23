@@ -1930,13 +1930,20 @@ TPU Runtime Utilization
                     {
                         "bdf": "0000:00:0c.0",
                         "vendor": "0x1ae0",
-                        "device": "0x0075",  # tpu7x (pending live HW confirmation #21)
+                        "device": "0x0076",  # Google's published Ironwood PCI ID
                         "driver": "vfio-pci",
                         "iommu_group": "2",
                         "chip_id": "1",
                     },
+                    {
+                        "bdf": "0000:00:0d.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0075",  # tpu7x alias (pending live HW confirmation #21)
+                        "driver": "vfio-pci",
+                        "iommu_group": "4",
+                    },
                 ],
-                create_vfio_nodes=["3", "2"],
+                create_vfio_nodes=["3", "2", "4"],
             )
 
             created_channels: list[str] = []
@@ -1952,10 +1959,71 @@ TPU Runtime Utilization
                 def __init__(self, metric_name: str):
                     self.metric_name = metric_name
 
-            def _make_item(chip_id: int, *, as_int=None, as_double=None):
-                gauge = SimpleNamespace(as_int=as_int, as_double=as_double)
-                attr = SimpleNamespace(value=SimpleNamespace(int_value=chip_id, string_value=""))
-                return SimpleNamespace(attribute=attr, gauge=gauge)
+            # Realistic proto3-semantics stubs matching published `tpu_metric_service.proto`:
+            # - `AttrValue` uses `int_attr` / `string_attr` (oneof `attr`), NOT `int_value`/`string_value`.
+            # - `Gauge` uses `as_int` / `as_double` (oneof `value`).
+            # - Unset fields default to 0 / "" / 0.0 and WhichOneof returns None.
+            class _ProtoAttrValue:
+                __slots__ = ("string_attr", "int_attr", "_which")
+
+                def __init__(self, *, string_attr=None, int_attr=None):
+                    self.string_attr = ""
+                    self.int_attr = 0
+                    self._which = None
+                    if string_attr is not None:
+                        self.string_attr = string_attr
+                        self._which = "string_attr"
+                    elif int_attr is not None:
+                        self.int_attr = int_attr
+                        self._which = "int_attr"
+
+                def WhichOneof(self, name: str):
+                    if name == "attr":
+                        return self._which
+                    raise ValueError(name)
+
+            class _ProtoAttribute:
+                __slots__ = ("key", "value")
+
+                def __init__(self, key: str, value: _ProtoAttrValue):
+                    self.key = key
+                    self.value = value
+
+            class _ProtoGauge:
+                __slots__ = ("as_double", "as_int", "_which")
+
+                def __init__(self, *, as_double=None, as_int=None):
+                    self.as_double = 0.0
+                    self.as_int = 0
+                    self._which = None
+                    if as_double is not None:
+                        self.as_double = float(as_double)
+                        self._which = "as_double"
+                    elif as_int is not None:
+                        self.as_int = int(as_int)
+                        self._which = "as_int"
+
+                def WhichOneof(self, name: str):
+                    if name == "value":
+                        return self._which
+                    raise ValueError(name)
+
+            class _ProtoMetric:
+                __slots__ = ("attribute", "gauge")
+
+                def __init__(self, attribute: _ProtoAttribute, gauge: _ProtoGauge):
+                    self.attribute = attribute
+                    self.gauge = gauge
+
+            def _make_item(chip_id, *, as_int=None, as_double=None):
+                gauge = _ProtoGauge(as_int=as_int, as_double=as_double)
+                if isinstance(chip_id, str):
+                    val = _ProtoAttrValue(string_attr=chip_id)
+                elif isinstance(chip_id, int):
+                    val = _ProtoAttrValue(int_attr=chip_id)
+                else:
+                    val = _ProtoAttrValue()
+                return _ProtoMetric(_ProtoAttribute("device_id", val), gauge)
 
             class _FakeStub:
                 def __init__(self, channel):
@@ -1966,22 +2034,24 @@ TPU Runtime Utilization
                     if req.metric_name == "tpu.runtime.hbm.memory.usage.bytes":
                         items = [
                             _make_item(0, as_int=16 * 1024**3),
-                            _make_item(1, as_int=64 * 1024**3),
+                            _make_item("1", as_int=64 * 1024**3),
+                            _make_item(None, as_int=999),  # unset AttrValue must be ignored
+                            _make_item(99),  # unset Gauge must be ignored
                         ]
                     elif req.metric_name == "tpu.runtime.hbm.memory.total.bytes":
                         items = [
                             _make_item(0, as_int=32 * 1024**3),
-                            _make_item(1, as_int=192 * 1024**3),
+                            _make_item("1", as_int=192 * 1024**3),
                         ]
                     elif req.metric_name == "tpu.runtime.tensorcore.dutycycle.percent":
                         items = [
                             _make_item(0, as_double=72.5),
-                            _make_item(1, as_double=88.0),
+                            _make_item("1", as_double=88.0),
                         ]
-                    elif req.metric_name == "tpu.runtime.hbm.memory.bandwidth.utilization.percent":
+                    elif req.metric_name == "tpu.runtime.hbm.utilization.percent":
                         items = [
                             _make_item(0, as_double=63.2),
-                            _make_item(1, as_double=41.0),
+                            _make_item("1", as_double=41.0),
                         ]
                     else:
                         items = []
@@ -2036,9 +2106,24 @@ TPU Runtime Utilization
             self.assertAlmostEqual(
                 snap1.devices[0].hbm_bandwidth_utilization_percent or 0.0, 63.2
             )
+            self.assertEqual(snap1.devices[1].device_id, "0x0076")
             self.assertEqual(snap1.devices[1].generation, "tpu7x")
             self.assertEqual(snap1.devices[1].hbm_used_bytes, 64 * 1024**3)
             self.assertEqual(snap1.devices[1].hbm_total_bytes, 192 * 1024**3)
+            self.assertAlmostEqual(
+                snap1.devices[1].hbm_bandwidth_utilization_percent or 0.0, 41.0
+            )
+            self.assertEqual(snap1.devices[2].device_id, "0x0075")
+            self.assertEqual(snap1.devices[2].generation, "tpu7x")
+            # Unset AttrValue and unset Gauge entries must not appear in runtime_utilization.
+            self.assertEqual(
+                sorted(rt.runtime_chip for rt in snap1.runtime_utilization),
+                ["0", "1"],
+            )
+            self.assertIn(
+                "tpu.runtime.hbm.utilization.percent",
+                [name for name, _ in rpc_calls],
+            )
 
             prom = _te.format_prometheus_metrics(snap1)
             self._assert_valid_prometheus_text(prom)
@@ -2085,6 +2170,7 @@ TPU Runtime Utilization
                 104857600,  # dma_bytes_transferred
             )
             shm_file.write_bytes(payload)
+            os.chmod(shm_file, 0o600)
 
             with _mock_vfio_char_lstat():
                 snap = tpu_exporter.collect_snapshot(
@@ -2106,11 +2192,66 @@ TPU Runtime Utilization
             self.assertIn("freetpu_tpu_mxu_active_cycles_total{", prom)
             self.assertIn("freetpu_tpu_dma_bytes_transferred_total{", prom)
 
+            # Security checks: reject untrusted owner UID, group/world-writable modes,
+            # symlinks, and world-writable directories without sticky bit.
+            self.assertIsNone(
+                tpu_exporter.read_shm_seqlock_metrics(
+                    "0000:00:0b.0",
+                    shm_root=shm_root,
+                    trusted_uids=[os.geteuid() + 1],
+                )
+            )
+            os.chmod(shm_file, 0o660)
+            self.assertIsNone(
+                tpu_exporter.read_shm_seqlock_metrics("0000:00:0b.0", shm_root=shm_root)
+            )
+            os.chmod(shm_file, 0o666)
+            self.assertIsNone(
+                tpu_exporter.read_shm_seqlock_metrics("0000:00:0b.0", shm_root=shm_root)
+            )
+            os.chmod(shm_file, 0o600)
+
+            sym_shm = shm_root / "freetpu_metrics_0000:00:0c.0"
+            os.symlink(shm_file, sym_shm)
+            self.assertIsNone(
+                tpu_exporter.read_shm_seqlock_metrics("0000:00:0c.0", shm_root=shm_root)
+            )
+
+            # World-writable directory lacking sticky bit must be rejected.
+            unsticky_dir = root / "world_writable_no_sticky"
+            unsticky_dir.mkdir(parents=True, exist_ok=True)
+            (unsticky_dir / "freetpu_metrics_0000:00:0b.0").write_bytes(payload)
+            os.chmod(unsticky_dir / "freetpu_metrics_0000:00:0b.0", 0o600)
+            os.chmod(unsticky_dir, 0o777)
+            try:
+                self.assertIsNone(
+                    tpu_exporter.read_shm_seqlock_metrics("0000:00:0b.0", shm_root=unsticky_dir)
+                )
+            finally:
+                os.chmod(unsticky_dir, 0o700)
+
+            # Concurrent truncation during pread fails closed cleanly (no SIGBUS).
+            orig_pread = os.pread
+            pread_calls = {"n": 0}
+
+            def _truncating_pread(fd: int, n: int, offset: int) -> bytes:
+                pread_calls["n"] += 1
+                if pread_calls["n"] == 2:
+                    return b""  # simulated truncation between header and payload
+                return orig_pread(fd, n, offset)
+
+            with mock.patch.object(os, "pread", side_effect=_truncating_pread):
+                self.assertIsNone(
+                    tpu_exporter.read_shm_seqlock_metrics("0000:00:0b.0", shm_root=shm_root)
+                )
+
             # Torn read on attempt 1 (seq1=4, seq2=6) must retry and succeed on attempt 2 (seq=6).
-            seq_reads = iter([(4,), (6,), (6,)])
+            seq_reads = iter([(6,), (4,)])
             orig_seq_struct = tpu_exporter._SHM_SEQ_STRUCT
 
             class _SeqProxy:
+                size = orig_seq_struct.size
+
                 def unpack_from(self, buf, offset=0):
                     try:
                         return next(seq_reads)
@@ -2247,6 +2388,15 @@ TPU Runtime Utilization
                 "GcpSpotPreemption",
             ):
                 self.assertIn(rule_name, alerts_text)
+            # Runtime fallback branches must restrict to unmapped chips to avoid duplicate alerts.
+            self.assertIn('freetpu_tpu_runtime_hbm_used_bytes{pci_bdf="unmapped"}', alerts_text)
+            self.assertIn('freetpu_tpu_runtime_duty_cycle_percent{pci_bdf="unmapped"}', alerts_text)
+            # PCIe AER alert must use a multi-scrape window ([5m], not [1m]).
+            self.assertIn("increase(freetpu_pcie_aer_fatal_total[5m]) > 0", alerts_text)
+            self.assertNotIn("freetpu_pcie_aer_fatal_total[1m]", alerts_text)
+            # Spot preemption alert must clarify monitoring-only scope and workload-local checkpointing.
+            self.assertIn("Monitoring alert only", alerts_text)
+            self.assertIn("workload-local metadata watcher or SIGTERM", alerts_text)
 
     def _assert_valid_prometheus_text(self, text: str) -> None:
         lines = [ln for ln in text.splitlines() if ln.strip()]

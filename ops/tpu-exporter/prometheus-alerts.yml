@@ -1,4 +1,14 @@
 # Prometheus alerting rules for FreeTPU Cloud TPU fleets (ops/tpu-exporter/tpu_exporter.py).
+#
+# Scrape/evaluation timing notes:
+# - Pair with ops/tpu-exporter/prometheus-scrape.yml (`scrape_interval: 15s`,
+#   `evaluation_interval: 15s`). Range windows (`[5m]`) also retain >= 5 samples
+#   at Prometheus's default 1m scrape interval.
+# - Runtime-only fallback clauses (`{pci_bdf="unmapped"}`) fire ONLY for chips
+#   that could not be mapped to a PCI BDF, preventing duplicate alerts when a
+#   runtime chip is already mapped to a PCI-labeled metric.
+# - `GcpSpotPreemption` is for fleet observability/incident tracking only — do
+#   NOT rely on Prometheus scraping for time-critical Spot checkpointing.
 groups:
   - name: freetpu-tpu-alerts
     rules:
@@ -9,8 +19,8 @@ groups:
           )
           or
           (
-            freetpu_tpu_runtime_hbm_used_bytes
-            / (freetpu_tpu_runtime_hbm_total_bytes > 0) > 0.95
+            freetpu_tpu_runtime_hbm_used_bytes{pci_bdf="unmapped"}
+            / (freetpu_tpu_runtime_hbm_total_bytes{pci_bdf="unmapped"} > 0) > 0.95
           )
         for: 1m
         labels:
@@ -28,7 +38,7 @@ groups:
           )
           or
           (
-            avg_over_time(freetpu_tpu_runtime_duty_cycle_percent[5m]) < 10
+            avg_over_time(freetpu_tpu_runtime_duty_cycle_percent{pci_bdf="unmapped"}[5m]) < 10
           )
         for: 5m
         labels:
@@ -41,7 +51,9 @@ groups:
             ICI collective barriers.
 
       - alert: TpuPcieAerFault
-        expr: increase(freetpu_pcie_aer_fatal_total[1m]) > 0
+        # 5m range window provides multiple scrapes even at Prometheus's default
+        # 1m scrape interval (and 20 samples at the recommended 15s interval).
+        expr: increase(freetpu_pcie_aer_fatal_total[5m]) > 0
         for: 0m
         labels:
           severity: critical
@@ -52,13 +64,22 @@ groups:
             increased on TPU device {{ $labels.pci_bdf }}. Cordon the node and
             run hardware diagnostics / reboot.
 
+      # Monitoring/observability alert only (requires short scrape/evaluation
+      # intervals such as 15s in prometheus-scrape.yml; Prometheus's default 1m
+      # interval can miss GCP Spot's best-effort <=30s shutdown window).
+      # Time-critical checkpointing MUST use a workload-local metadata watcher
+      # (`wait_for_change=true`) or SIGTERM handler inside the training job.
       - alert: GcpSpotPreemption
         expr: gcp_metadata_preempted_status == 1
         for: 0m
         labels:
           severity: warning
         annotations:
-          summary: "GCP Spot preemption notice active on {{ $labels.node }}"
+          summary: "GCP Spot preemption notice observed on {{ $labels.node }}"
           description: >-
-            GCP instance metadata reported preempted=TRUE. Trigger asynchronous
-            checkpointing (e.g. Orbax) immediately before VM termination.
+            Monitoring alert only: GCP instance metadata reported
+            preempted=TRUE on {{ $labels.node }}. Because Spot VMs have zero
+            guaranteed advance notice and a best-effort shutdown window of up to
+            30s, time-critical checkpointing (e.g. Orbax emergency checkpoint)
+            must be driven by a workload-local metadata watcher or SIGTERM
+            shutdown handler rather than Prometheus scrape/alert evaluation.
