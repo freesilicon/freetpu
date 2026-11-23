@@ -21,6 +21,8 @@ enum class PjrtDType {
     BF16,
     S8,
     U8,
+    S4,
+    U4,
     S16,
     S32,
     U32,
@@ -30,7 +32,17 @@ enum class PjrtDType {
 PJRT_Buffer_Type to_pjrt_buffer_type(PjrtDType dt);
 PjrtDType from_pjrt_buffer_type(PJRT_Buffer_Type dt);
 const char* pjrt_dtype_mlir_name(PjrtDType dt);
+size_t pjrt_dtype_bits(PjrtDType dt);
 size_t pjrt_dtype_size(PjrtDType dt);
+size_t pjrt_dtype_nbytes(PjrtDType dt, size_t num_elements);
+size_t pjrt_host_nbytes(PjrtDType dt, size_t num_elements);
+
+// Sub-byte 4-bit packing/unpacking in XLA little-endian nibble order:
+// even element index -> low nibble bits [3:0], odd element index -> high nibble bits [7:4].
+void pack_s4_from_i8(const int8_t* src, size_t nelems, uint8_t* dst_packed);
+void unpack_s4_to_i8(const uint8_t* src_packed, size_t nelems, int8_t* dst);
+void pack_u4_from_u8(const uint8_t* src, size_t nelems, uint8_t* dst_packed);
+void unpack_u4_to_u8(const uint8_t* src_packed, size_t nelems, uint8_t* dst);
 
 // Pure C++17 half/bfloat16 conversion helpers (zero external dependencies).
 uint16_t f32_to_bf16(float f);

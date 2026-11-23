@@ -10,10 +10,12 @@ namespace cloudtpu {
 
 enum class TensorStorageKind {
     DENSE = 0,
-    Q8_0_SPLIT,  // Split into (qs: [B3, B2, N, K] S8, d: [B3, B2, N, K/32] F16)
-    Q4_0_SPLIT,  // Split into (qs: [B3, B2, N, K/2] U8, d: [B3, B2, N, K/32] F16)
-    Q4_K_SPLIT,  // Split into (qs: [B3, B2, N, K/2] U8, d_eff: [B3, B2, N, K/32] F32/F16, m_eff: [B3, B2, N, K/32] F32/F16)
-    Q6_K_SPLIT,  // Split into (qs: [B3, B2, N, K] S8, d_eff: [B3, B2, N, K/16] F32/F16)
+    Q8_0_SPLIT,  // Split into (qs: [B3, B2, NB, 32, N] S8, d: [B3, B2, NB, N] F16)
+    Q4_0_SPLIT,  // Split into (qs: [B3, B2, NB, 16, N] U8, d: [B3, B2, NB, N] F16)
+    Q4_K_SPLIT,  // Split into (qs: [B3, B2, NB, 16, N] U8, d_eff: [B3, B2, NB, N] F32/F16, m_eff: [B3, B2, NB, N] F32/F16)
+    Q6_K_SPLIT,  // Split into (qs: [B3, B2, NB, 16, N] S8, d_eff: [B3, B2, NB, N] F32/F16)
+    Q4_0_I4,     // Single-read K-major (qs: [B3, B2, NB, 32, N] S4/U4 or [..., N/2] U8 bitcast, d: [B3, B2, NB, N] F16)
+    Q4_K_I4,     // Single-read K-major (qs: [B3, B2, NB, 32, N] S4/U4 or [..., N/2] U8 bitcast, d_eff/m_eff: [B3, B2, NB, N] F32/F16)
 };
 
 enum class TensorShardingKind {
@@ -30,7 +32,8 @@ struct TensorSpec {
     int64_t dims[4] = {1, 1, 1, 1};  // Logical (global) shape [ne3, ne2, ne1, ne0]
     TensorShardingKind sharding = TensorShardingKind::REPLICATED;
     int32_t alias_output_idx = -1;  // >= 0 emits {tf.aliasing_output = idx : i32} for in-place HBM donation
-    PjrtDType scale_dtype = PjrtDType::INVALID;  // Optional override for Q4_K/Q6_K scale/min dtype (INVALID = default)
+    PjrtDType scale_dtype = PjrtDType::INVALID;     // Optional override for Q4_K/Q6_K scale/min dtype (INVALID = default)
+    PjrtDType bitcast_target = PjrtDType::INVALID;  // For Q4_*_I4 with dtype==U8: target 4-bit type (INVALID defaults to S4)
 
     int64_t ne0() const { return dims[3]; }
     int64_t ne1() const { return dims[2]; }

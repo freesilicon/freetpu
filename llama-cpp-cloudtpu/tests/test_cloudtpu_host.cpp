@@ -910,6 +910,599 @@ void test_spmd_multichip_mesh(int num_chips) {
     std::printf("  [PASS] Multi-chip SPMD mesh (%d chips: collectives + 1/P HBM + Megatron FFN)\n", num_chips);
 }
 
+double compute_nmse(const std::vector<float>& got, const std::vector<float>& ref) {
+    double se = 0.0, sref = 0.0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        const double diff = static_cast<double>(got[i]) - static_cast<double>(ref[i]);
+        se += diff * diff;
+        sref += static_cast<double>(ref[i]) * static_cast<double>(ref[i]);
+    }
+    return se / std::max(1e-12, sref);
+}
+
+void test_subbyte_s4_u4_packing_and_hbm(cloudtpu::PjrtRuntime& rt) {
+    CHECK_TRUE(cloudtpu::pjrt_dtype_bits(cloudtpu::PjrtDType::S4) == 4, "S4 bits == 4");
+    CHECK_TRUE(cloudtpu::pjrt_dtype_bits(cloudtpu::PjrtDType::U4) == 4, "U4 bits == 4");
+    CHECK_TRUE(cloudtpu::pjrt_dtype_size(cloudtpu::PjrtDType::S4) == 0, "S4 sub-byte dtype_size == 0");
+    CHECK_TRUE(cloudtpu::pjrt_dtype_size(cloudtpu::PjrtDType::S8) == 1, "S8 dtype_size == 1");
+    CHECK_TRUE(cloudtpu::pjrt_dtype_size(cloudtpu::PjrtDType::F32) == 4, "F32 dtype_size == 4");
+    CHECK_TRUE(cloudtpu::pjrt_dtype_nbytes(cloudtpu::PjrtDType::S4, 0) == 0, "S4 0 elems == 0 B");
+    CHECK_TRUE(cloudtpu::pjrt_dtype_nbytes(cloudtpu::PjrtDType::S4, 1) == 1, "S4 1 elem == 1 B");
+    CHECK_TRUE(cloudtpu::pjrt_dtype_nbytes(cloudtpu::PjrtDType::S4, 2) == 1, "S4 2 elems == 1 B");
+    CHECK_TRUE(cloudtpu::pjrt_dtype_nbytes(cloudtpu::PjrtDType::U4, 3) == 2, "U4 3 elems == 2 B");
+    CHECK_TRUE(cloudtpu::pjrt_dtype_nbytes(cloudtpu::PjrtDType::S4, 512) == 256, "S4 512 elems == 256 B");
+    CHECK_TRUE(cloudtpu::pjrt_host_nbytes(cloudtpu::PjrtDType::S4, 512) == 512, "S4 host ABI 1 B/elem");
+    CHECK_TRUE(cloudtpu::pjrt_host_nbytes(cloudtpu::PjrtDType::F16, 10) == 20, "F16 host ABI 2 B/elem");
+
+    // Odd-length S4 pack/unpack roundtrip & little-endian nibble verification
+    std::vector<int8_t> s4_src = {-8, -7, -1, 0, 1, 7, -5, 3, -2, 6, -4, 2, 5, -3, 4, -6, 7};
+    std::vector<uint8_t> s4_packed(cloudtpu::pjrt_dtype_nbytes(cloudtpu::PjrtDType::S4, s4_src.size()), 0);
+    std::vector<int8_t> s4_back(s4_src.size(), 0);
+    cloudtpu::pack_s4_from_i8(s4_src.data(), s4_src.size(), s4_packed.data());
+    CHECK_TRUE(s4_packed[0] == static_cast<uint8_t>(((-8) & 0x0F) | (((-7) & 0x0F) << 4)),
+               "pack_s4 little-endian nibble layout");
+    cloudtpu::unpack_s4_to_i8(s4_packed.data(), s4_src.size(), s4_back.data());
+    CHECK_TRUE(s4_back == s4_src, "pack/unpack S4 odd-length roundtrip");
+
+    std::vector<uint8_t> u4_src = {0, 15, 7, 8, 1, 14, 9, 2, 13, 3, 12, 4, 11, 5, 10, 6, 15};
+    std::vector<uint8_t> u4_packed(cloudtpu::pjrt_dtype_nbytes(cloudtpu::PjrtDType::U4, u4_src.size()), 0);
+    std::vector<uint8_t> u4_back(u4_src.size(), 0);
+    cloudtpu::pack_u4_from_u8(u4_src.data(), u4_src.size(), u4_packed.data());
+    CHECK_TRUE(u4_packed[0] == static_cast<uint8_t>(0x00U | (0x0FU << 4)),
+               "pack_u4 little-endian nibble layout");
+    cloudtpu::unpack_u4_to_u8(u4_packed.data(), u4_src.size(), u4_back.data());
+    CHECK_TRUE(u4_back == u4_src, "pack/unpack U4 odd-length roundtrip");
+
+    // Host Mock HBM 0.5 B/weight accounting & H2D/D2H roundtrip (1 B/elem host ABI)
+    size_t free_before = 0, free_after = 0, total_b = 0;
+    CHECK_TRUE(rt.query_memory_stats(0, &free_before, &total_b), "query_memory_stats before S4");
+    {
+        std::vector<int8_t> s4_host(4096);
+        for (size_t i = 0; i < s4_host.size(); ++i) {
+            s4_host[i] = static_cast<int8_t>(static_cast<int>(i % 16) - 8);
+        }
+        auto bs4 = rt.buffer_from_host(0, s4_host.data(), cloudtpu::PjrtDType::S4, {1, 1, 64, 64});
+        CHECK_TRUE(bs4->num_elements() == 4096, "S4 num_elements == 4096");
+        CHECK_TRUE(bs4->num_bytes() == 2048, "S4 num_bytes == 0.5 B/elem (2048)");
+        CHECK_TRUE(rt.query_memory_stats(0, &free_after, &total_b), "query_memory_stats after S4");
+        if (rt.platform_name() == "tpu-mock") {
+            CHECK_TRUE((free_before - free_after) == 2048, "Mock HBM tracks 0.5 B/weight for S4");
+        }
+
+        std::vector<int8_t> s4_roundtrip(4096, 0);
+        rt.buffer_to_host(bs4->handle.get(), s4_roundtrip.data(), s4_roundtrip.size());
+        CHECK_TRUE(s4_roundtrip == s4_host, "S4 H2D/D2H 1-B/elem roundtrip");
+
+        auto bu4 = rt.buffer_from_host(0, u4_src.data(), cloudtpu::PjrtDType::U4, {1, 1, 1, 17});
+        CHECK_TRUE(bu4->num_bytes() == 9, "odd U4 num_bytes == 9");
+        std::vector<uint8_t> u4_roundtrip(17, 0);
+        rt.buffer_to_host(bu4->handle.get(), u4_roundtrip.data(), u4_roundtrip.size());
+        CHECK_TRUE(u4_roundtrip == u4_src, "odd U4 H2D/D2H roundtrip");
+    }
+    std::printf("  [PASS] Sub-byte S4/U4 packing, 0.5 B/weight HBM, and H2D/D2H roundtrip\n");
+}
+
+void test_q4_i4_single_read_matmul_and_bitcast(cloudtpu::PjrtRuntime& rt) {
+    // 1) Q4_0_I4: Direct S4 single-read + bitcast U8 + M=1, M=16 (factored), M=40 (in-loop reshape)
+    {
+        const int64_t N = 16, NB = 4, K = NB * 32;  // K=128
+        std::vector<int8_t> qs_s4(static_cast<size_t>(NB * 32 * N));
+        std::vector<uint8_t> qs_u8_bc(static_cast<size_t>(NB * 32 * (N / 2)));
+        std::vector<uint16_t> d_km(static_cast<size_t>(NB * N));
+        std::vector<float> w_ref(static_cast<size_t>(N * K));
+
+        for (int64_t b = 0; b < NB; ++b) {
+            for (int64_t n = 0; n < N; ++n) {
+                const uint16_t d16 = cloudtpu::f32_to_f16(0.04f * static_cast<float>((n + b) % 7 + 1));
+                d_km[static_cast<size_t>(b * N + n)] = d16;
+                const float scale = cloudtpu::f16_to_f32(d16);
+                for (int64_t k = 0; k < 32; ++k) {
+                    const uint8_t u4 = static_cast<uint8_t>((n * 5 + b * 7 + k * 3 + 1) & 0x0F);
+                    const int8_t s4 = static_cast<int8_t>(static_cast<int>(u4) - 8);
+                    const size_t idx = static_cast<size_t>((b * 32 + k) * N + n);
+                    qs_s4[idx] = s4;
+                    w_ref[static_cast<size_t>(n * K + b * 32 + k)] = static_cast<float>(s4) * scale;
+                }
+            }
+            for (int64_t k = 0; k < 32; ++k) {
+                for (int64_t nb_pair = 0; nb_pair < N / 2; ++nb_pair) {
+                    const size_t base_s = static_cast<size_t>((b * 32 + k) * N + nb_pair * 2);
+                    const uint8_t lo = static_cast<uint8_t>(qs_s4[base_s]) & 0x0FU;
+                    const uint8_t hi = static_cast<uint8_t>(qs_s4[base_s + 1]) & 0x0FU;
+                    qs_u8_bc[static_cast<size_t>((b * 32 + k) * (N / 2) + nb_pair)] = static_cast<uint8_t>(lo | (hi << 4));
+                }
+            }
+        }
+
+        auto bqs_s4 = rt.buffer_from_host(0, qs_s4.data(), cloudtpu::PjrtDType::S4, {1, 1, NB, 32, N});
+        auto bqs_bc = rt.buffer_from_host(0, qs_u8_bc.data(), cloudtpu::PjrtDType::U8, {1, 1, NB, 32, N / 2});
+        auto bd = rt.buffer_from_host(0, d_km.data(), cloudtpu::PjrtDType::F16, {1, 1, NB, N});
+
+        for (int64_t M : {int64_t(1), int64_t(16), int64_t(40)}) {
+            std::vector<float> x(static_cast<size_t>(M * K));
+            for (size_t i = 0; i < x.size(); ++i) x[i] = std::cos(static_cast<float>(i) * 0.17f);
+            auto bx = rt.buffer_from_host(0, x.data(), cloudtpu::PjrtDType::F32, {1, 1, M, K});
+
+            std::vector<float> ref(static_cast<size_t>(M * N), 0.0f);
+            for (int64_t m = 0; m < M; ++m) {
+                for (int64_t n = 0; n < N; ++n) {
+                    float acc = 0.0f;
+                    for (int64_t k = 0; k < K; ++k) {
+                        acc += x[static_cast<size_t>(m * K + k)] * w_ref[static_cast<size_t>(n * K + k)];
+                    }
+                    ref[static_cast<size_t>(m * N + n)] = acc;
+                }
+            }
+
+            // Direct S4
+            {
+                cloudtpu::GraphProgramSpec spec;
+                spec.bf16_matmul = (M != 40);
+                spec.inputs.push_back({1, cloudtpu::PjrtDType::S4, cloudtpu::TensorStorageKind::Q4_0_I4, {1, 1, N, K}});
+                spec.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, K}});
+                cloudtpu::OpNodeSpec mm;
+                mm.kind = cloudtpu::CloudOpKind::MUL_MAT;
+                mm.src_ids = {1, 2};
+                mm.dst = {3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, N}};
+                spec.ops.push_back(mm);
+                spec.output_ids = {3};
+                const auto prog = cloudtpu::emit_stablehlo_program(spec);
+                CHECK_TRUE(prog.mlir_text.find("i4>") != std::string::npos, "Q4_0_I4 MLIR uses i4 tensor");
+                CHECK_TRUE(prog.mlir_text.find("shift_right_logical") == std::string::npos,
+                           "Q4_0_I4 MLIR must not nibble-shift");
+                auto got = run_emitted(rt, prog, {bqs_s4, bd, bx});
+                const double nmse = compute_nmse(got, ref);
+                CHECK_TRUE(nmse < 5e-4, "Q4_0_I4 direct S4 MUL_MAT NMSE < 5e-4");
+            }
+
+            // U8 -> bitcast_convert -> S4
+            if (M == 16 || M == 40) {
+                cloudtpu::GraphProgramSpec spec;
+                spec.bf16_matmul = true;
+                cloudtpu::TensorSpec w_spec{1, cloudtpu::PjrtDType::U8, cloudtpu::TensorStorageKind::Q4_0_I4, {1, 1, N, K}};
+                w_spec.bitcast_target = cloudtpu::PjrtDType::S4;
+                spec.inputs.push_back(w_spec);
+                spec.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, K}});
+                cloudtpu::OpNodeSpec mm;
+                mm.kind = cloudtpu::CloudOpKind::MUL_MAT;
+                mm.src_ids = {1, 2};
+                mm.dst = {3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, N}};
+                spec.ops.push_back(mm);
+                spec.output_ids = {3};
+                const auto prog = cloudtpu::emit_stablehlo_program(spec);
+                CHECK_TRUE(prog.mlir_text.find("stablehlo.bitcast_convert") != std::string::npos,
+                           "Q4_0_I4 bitcast mode emits bitcast_convert");
+                auto got = run_emitted(rt, prog, {bqs_bc, bd, bx});
+                const double nmse = compute_nmse(got, ref);
+                CHECK_TRUE(nmse < 5e-4, "Q4_0_I4 bitcast_convert MUL_MAT NMSE < 5e-4");
+            }
+        }
+    }
+
+    // 2) Q4_K_I4: Unified shifted S4 (m_s4 = m + 8*d) with F32 & F16 scales, plus U4 (0..15) & bitcast
+    {
+        const int64_t N = 16, NB = 8, K = NB * 32;  // K=256 (1 QK_K block)
+        std::vector<int8_t> qs_s4(static_cast<size_t>(NB * 32 * N));
+        std::vector<uint8_t> qs_u4(static_cast<size_t>(NB * 32 * N));
+        std::vector<uint8_t> qs_u8_bc(static_cast<size_t>(NB * 32 * (N / 2)));
+        std::vector<float> d_f32(static_cast<size_t>(NB * N));
+        std::vector<float> m_orig_f32(static_cast<size_t>(NB * N));
+        std::vector<float> m_s4_f32(static_cast<size_t>(NB * N));
+        std::vector<uint16_t> d_f16(static_cast<size_t>(NB * N));
+        std::vector<uint16_t> m_s4_f16(static_cast<size_t>(NB * N));
+        std::vector<float> w_ref(static_cast<size_t>(N * K));
+
+        for (int64_t b = 0; b < NB; ++b) {
+            for (int64_t n = 0; n < N; ++n) {
+                const float d = 0.03f * static_cast<float>((n * 2 + b) % 9 + 1);
+                const float m = -0.15f + 0.025f * static_cast<float>((n + b * 3) % 11);
+                const size_t bn = static_cast<size_t>(b * N + n);
+                d_f32[bn] = d;
+                m_orig_f32[bn] = m;
+                m_s4_f32[bn] = m + 8.0f * d;
+                d_f16[bn] = cloudtpu::f32_to_f16(d);
+                m_s4_f16[bn] = cloudtpu::f32_to_f16(m_s4_f32[bn]);
+                for (int64_t k = 0; k < 32; ++k) {
+                    const uint8_t u4 = static_cast<uint8_t>((n * 7 + b * 3 + k * 5) & 0x0F);
+                    const int8_t s4 = static_cast<int8_t>(static_cast<int>(u4) - 8);
+                    const size_t idx = static_cast<size_t>((b * 32 + k) * N + n);
+                    qs_s4[idx] = s4;
+                    qs_u4[idx] = u4;
+                    w_ref[static_cast<size_t>(n * K + b * 32 + k)] = static_cast<float>(u4) * d + m;
+                }
+            }
+            for (int64_t k = 0; k < 32; ++k) {
+                for (int64_t nb_pair = 0; nb_pair < N / 2; ++nb_pair) {
+                    const size_t base_s = static_cast<size_t>((b * 32 + k) * N + nb_pair * 2);
+                    const uint8_t lo = static_cast<uint8_t>(qs_s4[base_s]) & 0x0FU;
+                    const uint8_t hi = static_cast<uint8_t>(qs_s4[base_s + 1]) & 0x0FU;
+                    qs_u8_bc[static_cast<size_t>((b * 32 + k) * (N / 2) + nb_pair)] = static_cast<uint8_t>(lo | (hi << 4));
+                }
+            }
+        }
+
+        auto bqs_s4 = rt.buffer_from_host(0, qs_s4.data(), cloudtpu::PjrtDType::S4, {1, 1, NB, 32, N});
+        auto bqs_u4 = rt.buffer_from_host(0, qs_u4.data(), cloudtpu::PjrtDType::U4, {1, 1, NB, 32, N});
+        auto bqs_bc = rt.buffer_from_host(0, qs_u8_bc.data(), cloudtpu::PjrtDType::U8, {1, 1, NB, 32, N / 2});
+        auto bd_f32 = rt.buffer_from_host(0, d_f32.data(), cloudtpu::PjrtDType::F32, {1, 1, NB, N});
+        auto bm_s4_f32 = rt.buffer_from_host(0, m_s4_f32.data(), cloudtpu::PjrtDType::F32, {1, 1, NB, N});
+        auto bm_orig_f32 = rt.buffer_from_host(0, m_orig_f32.data(), cloudtpu::PjrtDType::F32, {1, 1, NB, N});
+        auto bd_f16 = rt.buffer_from_host(0, d_f16.data(), cloudtpu::PjrtDType::F16, {1, 1, NB, N});
+        auto bm_s4_f16 = rt.buffer_from_host(0, m_s4_f16.data(), cloudtpu::PjrtDType::F16, {1, 1, NB, N});
+
+        for (int64_t M : {int64_t(1), int64_t(16), int64_t(40)}) {
+            std::vector<float> x(static_cast<size_t>(M * K));
+            for (size_t i = 0; i < x.size(); ++i) x[i] = std::sin(static_cast<float>(i) * 0.11f) + 0.25f;
+            auto bx = rt.buffer_from_host(0, x.data(), cloudtpu::PjrtDType::F32, {1, 1, M, K});
+            std::vector<float> ref(static_cast<size_t>(M * N), 0.0f);
+            for (int64_t m = 0; m < M; ++m) {
+                for (int64_t n = 0; n < N; ++n) {
+                    float acc = 0.0f;
+                    for (int64_t k = 0; k < K; ++k) {
+                        acc += x[static_cast<size_t>(m * K + k)] * w_ref[static_cast<size_t>(n * K + k)];
+                    }
+                    ref[static_cast<size_t>(m * N + n)] = acc;
+                }
+            }
+
+            // Unified S4 + F32 scales
+            {
+                cloudtpu::GraphProgramSpec spec;
+                spec.bf16_matmul = true;
+                cloudtpu::TensorSpec w_spec{1, cloudtpu::PjrtDType::S4, cloudtpu::TensorStorageKind::Q4_K_I4, {1, 1, N, K}};
+                w_spec.scale_dtype = cloudtpu::PjrtDType::F32;
+                spec.inputs.push_back(w_spec);
+                spec.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, K}});
+                cloudtpu::OpNodeSpec mm;
+                mm.kind = cloudtpu::CloudOpKind::MUL_MAT;
+                mm.src_ids = {1, 2};
+                mm.dst = {3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, N}};
+                spec.ops.push_back(mm);
+                spec.output_ids = {3};
+                auto got = run_emitted(rt, cloudtpu::emit_stablehlo_program(spec), {bqs_s4, bd_f32, bm_s4_f32, bx});
+                CHECK_TRUE(compute_nmse(got, ref) < 5e-4, "Q4_K_I4 unified S4 F32-scales NMSE < 5e-4");
+            }
+
+            // Unified S4 + F16 scales (M=16)
+            if (M == 16) {
+                cloudtpu::GraphProgramSpec spec;
+                spec.bf16_matmul = true;
+                cloudtpu::TensorSpec w_spec{1, cloudtpu::PjrtDType::S4, cloudtpu::TensorStorageKind::Q4_K_I4, {1, 1, N, K}};
+                w_spec.scale_dtype = cloudtpu::PjrtDType::F16;
+                spec.inputs.push_back(w_spec);
+                spec.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, K}});
+                cloudtpu::OpNodeSpec mm;
+                mm.kind = cloudtpu::CloudOpKind::MUL_MAT;
+                mm.src_ids = {1, 2};
+                mm.dst = {3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, N}};
+                spec.ops.push_back(mm);
+                spec.output_ids = {3};
+                auto got = run_emitted(rt, cloudtpu::emit_stablehlo_program(spec), {bqs_s4, bd_f16, bm_s4_f16, bx});
+                CHECK_TRUE(compute_nmse(got, ref) < 5e-4, "Q4_K_I4 unified S4 F16-scales NMSE < 5e-4");
+
+                // Optional U4 (ui4) + orig m
+                cloudtpu::GraphProgramSpec u4_spec = spec;
+                u4_spec.inputs[0].dtype = cloudtpu::PjrtDType::U4;
+                u4_spec.inputs[0].scale_dtype = cloudtpu::PjrtDType::F32;
+                auto got_u4 = run_emitted(rt, cloudtpu::emit_stablehlo_program(u4_spec), {bqs_u4, bd_f32, bm_orig_f32, bx});
+                CHECK_TRUE(compute_nmse(got_u4, ref) < 5e-4, "Q4_K_I4 U4 NMSE < 5e-4");
+
+                // Bitcast U8 -> S4
+                cloudtpu::GraphProgramSpec bc_spec = spec;
+                bc_spec.inputs[0].dtype = cloudtpu::PjrtDType::U8;
+                bc_spec.inputs[0].bitcast_target = cloudtpu::PjrtDType::S4;
+                bc_spec.inputs[0].scale_dtype = cloudtpu::PjrtDType::F32;
+                const auto bc_prog = cloudtpu::emit_stablehlo_program(bc_spec);
+                CHECK_TRUE(bc_prog.mlir_text.find("stablehlo.bitcast_convert") != std::string::npos,
+                           "Q4_K_I4 bitcast emits bitcast_convert");
+                auto got_bc = run_emitted(rt, bc_prog, {bqs_bc, bd_f32, bm_s4_f32, bx});
+                CHECK_TRUE(compute_nmse(got_bc, ref) < 5e-4, "Q4_K_I4 bitcast NMSE < 5e-4");
+            }
+        }
+    }
+    std::printf("  [PASS] Q4_0_I4 & Q4_K_I4 single-read S4/U4/bitcast MUL_MAT (M=1, M=16, M=40)\n");
+}
+
+void test_q4_i4_get_rows_coexistence(cloudtpu::PjrtRuntime& rt) {
+    // Shared Q4_K_I4 table used simultaneously in GET_ROWS (incl. odd+even indices) and MUL_MAT
+    const int64_t N = 16, NB = 8, K = NB * 32;
+    std::vector<int8_t> qs_s4(static_cast<size_t>(NB * 32 * N));
+    std::vector<uint8_t> qs_u8_bc(static_cast<size_t>(NB * 32 * (N / 2)));
+    std::vector<float> d_f32(static_cast<size_t>(NB * N));
+    std::vector<float> m_s4_f32(static_cast<size_t>(NB * N));
+    std::vector<float> w_ref(static_cast<size_t>(N * K));
+    for (int64_t b = 0; b < NB; ++b) {
+        for (int64_t n = 0; n < N; ++n) {
+            const float d = 0.04f * static_cast<float>((n + b * 3) % 7 + 1);
+            const float m = -0.1f + 0.02f * static_cast<float>(n % 5);
+            d_f32[static_cast<size_t>(b * N + n)] = d;
+            m_s4_f32[static_cast<size_t>(b * N + n)] = m + 8.0f * d;
+            for (int64_t k = 0; k < 32; ++k) {
+                const uint8_t u4 = static_cast<uint8_t>((n * 3 + b * 11 + k * 7) & 0x0F);
+                const int8_t s4 = static_cast<int8_t>(static_cast<int>(u4) - 8);
+                qs_s4[static_cast<size_t>((b * 32 + k) * N + n)] = s4;
+                w_ref[static_cast<size_t>(n * K + b * 32 + k)] = static_cast<float>(u4) * d + m;
+            }
+        }
+        for (int64_t k = 0; k < 32; ++k) {
+            for (int64_t p = 0; p < N / 2; ++p) {
+                const size_t s = static_cast<size_t>((b * 32 + k) * N + p * 2);
+                qs_u8_bc[static_cast<size_t>((b * 32 + k) * (N / 2) + p)] = static_cast<uint8_t>(
+                    (static_cast<uint8_t>(qs_s4[s]) & 0x0FU) |
+                    ((static_cast<uint8_t>(qs_s4[s + 1]) & 0x0FU) << 4));
+            }
+        }
+    }
+    auto bqs_s4 = rt.buffer_from_host(0, qs_s4.data(), cloudtpu::PjrtDType::S4, {1, 1, NB, 32, N});
+    auto bqs_bc = rt.buffer_from_host(0, qs_u8_bc.data(), cloudtpu::PjrtDType::U8, {1, 1, NB, 32, N / 2});
+    auto bd = rt.buffer_from_host(0, d_f32.data(), cloudtpu::PjrtDType::F32, {1, 1, NB, N});
+    auto bm = rt.buffer_from_host(0, m_s4_f32.data(), cloudtpu::PjrtDType::F32, {1, 1, NB, N});
+
+    const std::vector<int32_t> row_idx = {3, 0, 15, 2};
+    auto bidx = rt.buffer_from_host(0, row_idx.data(), cloudtpu::PjrtDType::S32, {1, 1, 1, 4});
+
+    // Build combined graph: rows = GET_ROWS(tbl, idx), y = MUL_MAT(tbl, rows)
+    for (bool use_bitcast : {false, true}) {
+        cloudtpu::GraphProgramSpec spec;
+        spec.bf16_matmul = true;
+        cloudtpu::TensorSpec tbl_spec{
+            1,
+            use_bitcast ? cloudtpu::PjrtDType::U8 : cloudtpu::PjrtDType::S4,
+            cloudtpu::TensorStorageKind::Q4_K_I4,
+            {1, 1, N, K}};
+        tbl_spec.scale_dtype = cloudtpu::PjrtDType::F32;
+        tbl_spec.bitcast_target = cloudtpu::PjrtDType::S4;
+        spec.inputs.push_back(tbl_spec);
+        spec.inputs.push_back({2, cloudtpu::PjrtDType::S32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 4}});
+
+        cloudtpu::OpNodeSpec gr;
+        gr.kind = cloudtpu::CloudOpKind::GET_ROWS;
+        gr.src_ids = {1, 2};
+        gr.dst = {10, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 4, K}};
+
+        cloudtpu::OpNodeSpec mm;
+        mm.kind = cloudtpu::CloudOpKind::MUL_MAT;
+        mm.src_ids = {1, 10};
+        mm.dst = {11, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 4, N}};
+
+        spec.ops = {gr, mm};
+        spec.output_ids = {10, 11};
+        const auto prog = cloudtpu::emit_stablehlo_program(spec);
+        const auto* exec = rt.compile_or_get(prog.cache_key, prog.mlir_text);
+        std::vector<PJRT_Buffer*> raw_in = {
+            (use_bitcast ? bqs_bc : bqs_s4)->handle.get(),
+            bd->handle.get(),
+            bm->handle.get(),
+            bidx->handle.get()};
+        std::vector<cloudtpu::PjrtBufferPtr> outs;
+        rt.execute(exec, 0, raw_in.data(), raw_in.size(), outs,
+                   {cloudtpu::PjrtDType::F32, cloudtpu::PjrtDType::F32},
+                   {{1, 1, 4, K}, {1, 1, 4, N}}, true);
+
+        std::vector<float> got_rows(static_cast<size_t>(4 * K));
+        std::vector<float> got_mm(static_cast<size_t>(4 * N));
+        rt.buffer_to_host(outs[0]->handle.get(), got_rows.data(), got_rows.size() * sizeof(float));
+        rt.buffer_to_host(outs[1]->handle.get(), got_mm.data(), got_mm.size() * sizeof(float));
+
+        for (size_t r = 0; r < 4; ++r) {
+            const int64_t row = row_idx[r];
+            for (int64_t k = 0; k < K; ++k) {
+                CHECK_NEAR(got_rows[r * static_cast<size_t>(K) + static_cast<size_t>(k)],
+                           w_ref[static_cast<size_t>(row * K + k)], 1e-4f, "GET_ROWS on Q4_K_I4 table");
+            }
+        }
+        std::vector<float> ref_mm(static_cast<size_t>(4 * N), 0.0f);
+        for (size_t r = 0; r < 4; ++r) {
+            const int64_t row = row_idx[r];
+            for (int64_t n = 0; n < N; ++n) {
+                float acc = 0.0f;
+                for (int64_t k = 0; k < K; ++k) {
+                    acc += w_ref[static_cast<size_t>(row * K + k)] * w_ref[static_cast<size_t>(n * K + k)];
+                }
+                ref_mm[r * static_cast<size_t>(N) + static_cast<size_t>(n)] = acc;
+            }
+        }
+        CHECK_TRUE(compute_nmse(got_mm, ref_mm) < 5e-4, "GET_ROWS + MUL_MAT Q4_K_I4 coexistence NMSE < 5e-4");
+    }
+    std::printf("  [PASS] GET_ROWS + MUL_MAT coexistence on Q4_K_I4 (direct S4 & U8 bitcast)\n");
+}
+
+void test_q4_i4_spmd_sharding() {
+    constexpr int P = 4;
+    cloudtpu::RuntimeConfig cfg;
+    cfg.mock_mode = true;
+    cfg.mock_devices = P;
+    cfg.exec_cache_cap = 64;
+    cloudtpu::PjrtRuntime rt;
+    rt.init(cfg);
+    const auto copts = rt.make_spmd_compile_options(P, 0, false, true);
+
+    // 1) SHARD_N across P=4 chips (N=32 -> N_local=8 even, K=256) + 0.5 B/weight 1/P HBM check
+    {
+        const int64_t N = 32, N_local = N / P, NB = 8, K = NB * 32, M = 8;
+        std::vector<int8_t> qs_km(static_cast<size_t>(NB * 32 * N));
+        std::vector<float> d_km(static_cast<size_t>(NB * N));
+        std::vector<float> m_s4_km(static_cast<size_t>(NB * N));
+        std::vector<float> w_ref(static_cast<size_t>(N * K));
+        for (int64_t b = 0; b < NB; ++b) {
+            for (int64_t n = 0; n < N; ++n) {
+                const float d = 0.03f * static_cast<float>((n + b) % 7 + 1);
+                const float m = -0.1f + 0.02f * static_cast<float>(n % 9);
+                d_km[static_cast<size_t>(b * N + n)] = d;
+                m_s4_km[static_cast<size_t>(b * N + n)] = m + 8.0f * d;
+                for (int64_t k = 0; k < 32; ++k) {
+                    const uint8_t u4 = static_cast<uint8_t>((n * 5 + b * 3 + k) & 0x0F);
+                    const int8_t s4 = static_cast<int8_t>(static_cast<int>(u4) - 8);
+                    qs_km[static_cast<size_t>((b * 32 + k) * N + n)] = s4;
+                    w_ref[static_cast<size_t>(n * K + b * 32 + k)] = static_cast<float>(u4) * d + m;
+                }
+            }
+        }
+        std::vector<float> x(static_cast<size_t>(M * K));
+        for (size_t i = 0; i < x.size(); ++i) x[i] = std::sin(static_cast<float>(i) * 0.19f);
+        std::vector<float> ref(static_cast<size_t>(M * N), 0.0f);
+        for (int64_t m = 0; m < M; ++m) {
+            for (int64_t n = 0; n < N; ++n) {
+                float acc = 0.0f;
+                for (int64_t k = 0; k < K; ++k) {
+                    acc += x[static_cast<size_t>(m * K + k)] * w_ref[static_cast<size_t>(n * K + k)];
+                }
+                ref[static_cast<size_t>(m * N + n)] = acc;
+            }
+        }
+
+        cloudtpu::GraphProgramSpec spec;
+        spec.spmd_chips = P;
+        spec.bf16_matmul = true;
+        cloudtpu::TensorSpec w_spec{1, cloudtpu::PjrtDType::S4, cloudtpu::TensorStorageKind::Q4_K_I4, {1, 1, N, K}, cloudtpu::TensorShardingKind::SHARD_N};
+        w_spec.scale_dtype = cloudtpu::PjrtDType::F32;
+        spec.inputs.push_back(w_spec);
+        spec.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, K}, cloudtpu::TensorShardingKind::REPLICATED});
+        cloudtpu::OpNodeSpec mm;
+        mm.kind = cloudtpu::CloudOpKind::MUL_MAT;
+        mm.src_ids = {1, 2};
+        mm.dst = {3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, N}};
+        spec.ops.push_back(mm);
+        spec.output_ids = {3};
+        const auto prog = cloudtpu::emit_stablehlo_program(spec);
+        CHECK_TRUE(prog.mlir_text.find("stablehlo.all_gather") != std::string::npos,
+                   "SHARD_N Q4_K_I4 emits all_gather");
+
+        size_t free_before = 0, free_after = 0, total_b = 0;
+        CHECK_TRUE(rt.query_memory_stats(0, &free_before, &total_b), "SPMD S4 mem before");
+
+        std::vector<std::vector<cloudtpu::PjrtBufferPtr>> per_dev(static_cast<size_t>(P));
+        for (int p = 0; p < P; ++p) {
+            std::vector<int8_t> qs_p(static_cast<size_t>(NB * 32 * N_local));
+            std::vector<float> d_p(static_cast<size_t>(NB * N_local));
+            std::vector<float> m_p(static_cast<size_t>(NB * N_local));
+            for (int64_t b = 0; b < NB; ++b) {
+                std::memcpy(d_p.data() + static_cast<size_t>(b * N_local),
+                            d_km.data() + static_cast<size_t>(b * N + p * N_local),
+                            static_cast<size_t>(N_local) * sizeof(float));
+                std::memcpy(m_p.data() + static_cast<size_t>(b * N_local),
+                            m_s4_km.data() + static_cast<size_t>(b * N + p * N_local),
+                            static_cast<size_t>(N_local) * sizeof(float));
+                for (int64_t k = 0; k < 32; ++k) {
+                    std::memcpy(qs_p.data() + static_cast<size_t>((b * 32 + k) * N_local),
+                                qs_km.data() + static_cast<size_t>((b * 32 + k) * N + p * N_local),
+                                static_cast<size_t>(N_local));
+                }
+            }
+            per_dev[static_cast<size_t>(p)] = {
+                rt.buffer_from_host(p, qs_p.data(), cloudtpu::PjrtDType::S4, {1, 1, NB, 32, N_local}),
+                rt.buffer_from_host(p, d_p.data(), cloudtpu::PjrtDType::F32, {1, 1, NB, N_local}),
+                rt.buffer_from_host(p, m_p.data(), cloudtpu::PjrtDType::F32, {1, 1, NB, N_local}),
+                rt.buffer_from_host(p, x.data(), cloudtpu::PjrtDType::F32, {1, 1, M, K})};
+        }
+
+        CHECK_TRUE(rt.query_memory_stats(0, &free_after, &total_b), "SPMD S4 mem after");
+        const size_t expected_chip0 =
+            cloudtpu::pjrt_dtype_nbytes(cloudtpu::PjrtDType::S4, static_cast<size_t>(NB * 32 * N_local)) +
+            static_cast<size_t>(NB * N_local) * 2 * sizeof(float) +
+            x.size() * sizeof(float);
+        CHECK_TRUE((free_before - free_after) == expected_chip0, "SPMD Q4_K_I4 chip0 uses 0.5B/weight / P");
+
+        const auto* exec = rt.compile_or_get(prog.cache_key, prog.mlir_text, copts);
+        std::vector<std::vector<PJRT_Buffer*>> raw_in(static_cast<size_t>(P));
+        std::vector<PJRT_Buffer* const*> in_ptrs(static_cast<size_t>(P));
+        for (int p = 0; p < P; ++p) {
+            for (const auto& b : per_dev[static_cast<size_t>(p)]) raw_in[static_cast<size_t>(p)].push_back(b->handle.get());
+            in_ptrs[static_cast<size_t>(p)] = raw_in[static_cast<size_t>(p)].data();
+        }
+        std::vector<std::vector<cloudtpu::PjrtBufferPtr>> outs;
+        rt.execute_spmd(exec, P, in_ptrs.data(), prog.input_bindings.size(), outs,
+                        {cloudtpu::PjrtDType::F32}, {{1, 1, M, N}}, true);
+        for (int p = 0; p < P; ++p) {
+            std::vector<float> got(ref.size());
+            rt.buffer_to_host(outs[static_cast<size_t>(p)][0]->handle.get(), got.data(), got.size() * sizeof(float));
+            CHECK_TRUE(compute_nmse(got, ref) < 5e-4, "SPMD SHARD_N Q4_K_I4 P=4 NMSE < 5e-4");
+        }
+    }
+
+    // 2) SHARD_K across P=4 chips (N=16, K=512 -> K_local=128 (NB_local=4), M=8 -> all_reduce)
+    {
+        const int64_t N = 16, NB = 16, NB_local = NB / P, K = NB * 32, K_local = NB_local * 32, M = 8;
+        std::vector<int8_t> qs_km(static_cast<size_t>(NB * 32 * N));
+        std::vector<float> d_km(static_cast<size_t>(NB * N));
+        std::vector<float> m_s4_km(static_cast<size_t>(NB * N));
+        std::vector<float> w_ref(static_cast<size_t>(N * K));
+        for (int64_t b = 0; b < NB; ++b) {
+            for (int64_t n = 0; n < N; ++n) {
+                const float d = 0.025f * static_cast<float>((n + b * 2) % 7 + 1);
+                const float m = -0.08f + 0.015f * static_cast<float>(n % 7);
+                d_km[static_cast<size_t>(b * N + n)] = d;
+                m_s4_km[static_cast<size_t>(b * N + n)] = m + 8.0f * d;
+                for (int64_t k = 0; k < 32; ++k) {
+                    const uint8_t u4 = static_cast<uint8_t>((n * 3 + b * 5 + k * 2) & 0x0F);
+                    const int8_t s4 = static_cast<int8_t>(static_cast<int>(u4) - 8);
+                    qs_km[static_cast<size_t>((b * 32 + k) * N + n)] = s4;
+                    w_ref[static_cast<size_t>(n * K + b * 32 + k)] = static_cast<float>(u4) * d + m;
+                }
+            }
+        }
+        std::vector<float> x(static_cast<size_t>(M * K));
+        for (size_t i = 0; i < x.size(); ++i) x[i] = std::cos(static_cast<float>(i) * 0.13f);
+        std::vector<float> ref(static_cast<size_t>(M * N), 0.0f);
+        for (int64_t m = 0; m < M; ++m) {
+            for (int64_t n = 0; n < N; ++n) {
+                float acc = 0.0f;
+                for (int64_t k = 0; k < K; ++k) {
+                    acc += x[static_cast<size_t>(m * K + k)] * w_ref[static_cast<size_t>(n * K + k)];
+                }
+                ref[static_cast<size_t>(m * N + n)] = acc;
+            }
+        }
+
+        cloudtpu::GraphProgramSpec spec;
+        spec.spmd_chips = P;
+        spec.bf16_matmul = true;
+        cloudtpu::TensorSpec w_spec{1, cloudtpu::PjrtDType::S4, cloudtpu::TensorStorageKind::Q4_K_I4, {1, 1, N, K}, cloudtpu::TensorShardingKind::SHARD_K};
+        w_spec.scale_dtype = cloudtpu::PjrtDType::F32;
+        spec.inputs.push_back(w_spec);
+        spec.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, K}, cloudtpu::TensorShardingKind::REPLICATED});
+        cloudtpu::OpNodeSpec mm;
+        mm.kind = cloudtpu::CloudOpKind::MUL_MAT;
+        mm.src_ids = {1, 2};
+        mm.dst = {3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, N}};
+        spec.ops.push_back(mm);
+        spec.output_ids = {3};
+        const auto prog = cloudtpu::emit_stablehlo_program(spec);
+        CHECK_TRUE(prog.mlir_text.find("stablehlo.all_reduce") != std::string::npos,
+                   "SHARD_K Q4_K_I4 emits all_reduce");
+
+        std::vector<std::vector<cloudtpu::PjrtBufferPtr>> per_dev(static_cast<size_t>(P));
+        for (int p = 0; p < P; ++p) {
+            const size_t qs_off = static_cast<size_t>(p * NB_local * 32 * N);
+            const size_t d_off = static_cast<size_t>(p * NB_local * N);
+            per_dev[static_cast<size_t>(p)] = {
+                rt.buffer_from_host(p, qs_km.data() + qs_off, cloudtpu::PjrtDType::S4, {1, 1, NB_local, 32, N}),
+                rt.buffer_from_host(p, d_km.data() + d_off, cloudtpu::PjrtDType::F32, {1, 1, NB_local, N}),
+                rt.buffer_from_host(p, m_s4_km.data() + d_off, cloudtpu::PjrtDType::F32, {1, 1, NB_local, N}),
+                rt.buffer_from_host(p, x.data(), cloudtpu::PjrtDType::F32, {1, 1, M, K})};
+            (void) K_local;
+        }
+        const auto* exec = rt.compile_or_get(prog.cache_key, prog.mlir_text, copts);
+        std::vector<std::vector<PJRT_Buffer*>> raw_in(static_cast<size_t>(P));
+        std::vector<PJRT_Buffer* const*> in_ptrs(static_cast<size_t>(P));
+        for (int p = 0; p < P; ++p) {
+            for (const auto& b : per_dev[static_cast<size_t>(p)]) raw_in[static_cast<size_t>(p)].push_back(b->handle.get());
+            in_ptrs[static_cast<size_t>(p)] = raw_in[static_cast<size_t>(p)].data();
+        }
+        std::vector<std::vector<cloudtpu::PjrtBufferPtr>> outs;
+        rt.execute_spmd(exec, P, in_ptrs.data(), prog.input_bindings.size(), outs,
+                        {cloudtpu::PjrtDType::F32}, {{1, 1, M, N}}, true);
+        for (int p = 0; p < P; ++p) {
+            std::vector<float> got(ref.size());
+            rt.buffer_to_host(outs[static_cast<size_t>(p)][0]->handle.get(), got.data(), got.size() * sizeof(float));
+            CHECK_TRUE(compute_nmse(got, ref) < 5e-4, "SPMD SHARD_K Q4_K_I4 P=4 NMSE < 5e-4");
+        }
+    }
+
+    rt.shutdown();
+    std::printf("  [PASS] SPMD SHARD_N & SHARD_K Q4_K_I4 (P=4, 0.5 B/weight HBM parity)\n");
+}
+
 }  // namespace
 
 int main() {
@@ -934,12 +1527,16 @@ int main() {
                 rt.device_info(0).kind.c_str());
 
     test_lru_cache_and_hbm_roundtrip(rt);
+    test_subbyte_s4_u4_packing_and_hbm(rt);
     test_mul_mat_dense_and_quant(rt);
+    test_q4_i4_single_read_matmul_and_bitcast(rt);
+    test_q4_i4_get_rows_coexistence(rt);
     test_rms_rope_softmax_swiglu_getrows_fused(rt);
     test_silicon_regressions(rt);
     test_collectives_p1_live_compatible(rt);
     test_spmd_multichip_mesh(4);  // tpu7x-4t (4x 192 GiB HBM3e)
     test_spmd_multichip_mesh(8);  // v6e-8 (8x 32 GiB HBM)
+    test_q4_i4_spmd_sharding();
 
     const size_t py_maps = cloudtpu::count_libpython_mappings();
     std::printf("  MAPS_LIBPYTHON=%zu\n", py_maps);

@@ -106,6 +106,16 @@ public:
         return out;
     }
 
+    SsaValue emit_bitcast_convert(const SsaValue& x, const std::vector<int64_t>& out_dims, PjrtDType dst_dt) {
+        if (x.dtype == dst_dt && x.dims == out_dims) {
+            return x;
+        }
+        SsaValue out = next_val(dst_dt, out_dims);
+        body_ << "    " << out.name << " = stablehlo.bitcast_convert " << x.name << " : ("
+              << x.mlir_type() << ") -> " << out.mlir_type() << "\n";
+        return out;
+    }
+
     SsaValue emit_binary(const char* op_name, const SsaValue& a, const SsaValue& b) {
         SsaValue out = next_val(a.dtype, a.dims);
         body_ << "    " << out.name << " = " << op_name << " " << a.name << ", " << b.name
@@ -498,6 +508,7 @@ SsaValue dequantize_row_major_blocks(StableHloBuilder& b,
                                      const SsaValue& qs,
                                      const SsaValue& d,
                                      const SsaValue* m_opt,
+                                     PjrtDType effective_q_dt,
                                      PjrtDType out_dt) {
     const int64_t B3 = d.dims[0];
     const int64_t B2 = d.dims[1];
@@ -513,6 +524,22 @@ SsaValue dequantize_row_major_blocks(StableHloBuilder& b,
         SsaValue d_c = b.emit_convert(d, calc_dt);
         SsaValue d_b = b.emit_broadcast_in_dim(d_c, {0, 1, 2, 3}, blk_dims);
         SsaValue scaled = b.emit_binary("stablehlo.multiply", q_f, d_b);
+        return b.emit_convert(b.emit_reshape(scaled, {B3, B2, N, K}), out_dt);
+    }
+    if (storage == TensorStorageKind::Q4_0_I4 || storage == TensorStorageKind::Q4_K_I4) {
+        SsaValue q_f = b.emit_convert(qs, calc_dt);
+        if (storage == TensorStorageKind::Q4_0_I4 && effective_q_dt == PjrtDType::U4) {
+            SsaValue eight = b.emit_const_splat_f32(8.0f, blk_dims, calc_dt);
+            q_f = b.emit_binary("stablehlo.subtract", q_f, eight);
+        }
+        SsaValue d_c = b.emit_convert(d, calc_dt);
+        SsaValue d_b = b.emit_broadcast_in_dim(d_c, {0, 1, 2, 3}, blk_dims);
+        SsaValue scaled = b.emit_binary("stablehlo.multiply", q_f, d_b);
+        if (storage == TensorStorageKind::Q4_K_I4 && m_opt != nullptr) {
+            SsaValue m_c = b.emit_convert(*m_opt, calc_dt);
+            SsaValue m_b = b.emit_broadcast_in_dim(m_c, {0, 1, 2, 3}, blk_dims);
+            scaled = b.emit_binary("stablehlo.add", scaled, m_b);
+        }
         return b.emit_convert(b.emit_reshape(scaled, {B3, B2, N, K}), out_dt);
     }
     if (storage == TensorStorageKind::Q4_0_SPLIT || storage == TensorStorageKind::Q4_K_SPLIT) {
@@ -542,14 +569,36 @@ SsaValue dequantize_row_major_blocks(StableHloBuilder& b,
     throw std::runtime_error("dequantize_row_major_blocks: unexpected storage kind");
 }
 
+SsaValue materialize_q4_i4_nibbles(StableHloBuilder& b,
+                                   const SsaValue& qs,
+                                   PjrtDType target_4bit,
+                                   int64_t N_local) {
+    if (qs.dtype == PjrtDType::S4 || qs.dtype == PjrtDType::U4) {
+        return qs;
+    }
+    if (qs.dtype == PjrtDType::U8) {
+        std::vector<int64_t> bc_dims = qs.dims;
+        bc_dims.push_back(2);
+        SsaValue bc = b.emit_bitcast_convert(qs, bc_dims, target_4bit);
+        std::vector<int64_t> flat_dims = qs.dims;
+        flat_dims.back() = N_local;
+        return b.emit_reshape(bc, flat_dims);
+    }
+    throw std::runtime_error("materialize_q4_i4_nibbles: unexpected qs dtype");
+}
+
 // TPU-native K-major N-minor dequantization (zero minor-dim tile padding, zero weight reshape,
 // zero broadcast reshape):
-//   Q8_0_SPLIT: qs [B3, B2, NB, 32, N] S8,  d [B3, B2, NB, N] F16     -> [B3, B2, NB, 32, N]
-//   Q6_K_SPLIT: qs [B3, B2, NB, 16, N] S8,  d [B3, B2, NB, N] F32/F16 -> [B3, B2, NB, 16, N]
+//   Q8_0_SPLIT: qs [B3, B2, NB, 32, N] S8,      d [B3, B2, NB, N] F16     -> [B3, B2, NB, 32, N]
+//   Q6_K_SPLIT: qs [B3, B2, NB, 16, N] S8,      d [B3, B2, NB, N] F32/F16 -> [B3, B2, NB, 16, N]
+//   Q4_0_I4:    qs [B3, B2, NB, 32, N] S4/U4,   d [B3, B2, NB, N] F16     -> [B3, B2, NB, 32, N]
+//   Q4_K_I4:    qs [B3, B2, NB, 32, N] S4/U4, d/m [B3, B2, NB, N] F32/F16 -> [B3, B2, NB, 32, N]
 SsaValue dequantize_k_major_blocks(StableHloBuilder& b,
                                    TensorStorageKind storage,
                                    const SsaValue& qs,
                                    const SsaValue& d,
+                                   const SsaValue* m_opt,
+                                   PjrtDType bitcast_target,
                                    PjrtDType out_dt) {
     const int64_t B3 = d.dims[0];
     const int64_t B2 = d.dims[1];
@@ -558,10 +607,25 @@ SsaValue dequantize_k_major_blocks(StableHloBuilder& b,
     const int64_t blk_elems = (storage == TensorStorageKind::Q6_K_SPLIT) ? 16 : 32;
     const std::vector<int64_t> km_dims = {B3, B2, NB, blk_elems, N};
 
-    SsaValue q_f = b.emit_convert(qs, PjrtDType::F32);
+    SsaValue qs_eff = qs;
+    if (storage == TensorStorageKind::Q4_0_I4 || storage == TensorStorageKind::Q4_K_I4) {
+        const PjrtDType target_4bit = (bitcast_target != PjrtDType::INVALID) ? bitcast_target : PjrtDType::S4;
+        qs_eff = materialize_q4_i4_nibbles(b, qs, target_4bit, N);
+    }
+
+    SsaValue q_f = b.emit_convert(qs_eff, PjrtDType::F32);
+    if (storage == TensorStorageKind::Q4_0_I4 && qs_eff.dtype == PjrtDType::U4) {
+        SsaValue eight = b.emit_const_splat_f32(8.0f, km_dims, PjrtDType::F32);
+        q_f = b.emit_binary("stablehlo.subtract", q_f, eight);
+    }
     SsaValue d_c = b.emit_convert(d, PjrtDType::F32);
     SsaValue d_b = b.emit_broadcast_in_dim(d_c, {0, 1, 2, 4}, km_dims);
     SsaValue scaled = b.emit_binary("stablehlo.multiply", q_f, d_b);
+    if (storage == TensorStorageKind::Q4_K_I4 && m_opt != nullptr) {
+        SsaValue m_c = b.emit_convert(*m_opt, PjrtDType::F32);
+        SsaValue m_b = b.emit_broadcast_in_dim(m_c, {0, 1, 2, 4}, km_dims);
+        scaled = b.emit_binary("stablehlo.add", scaled, m_b);
+    }
     return b.emit_convert(scaled, out_dt);
 }
 
@@ -614,6 +678,7 @@ SsaValue dequantize_split_weight(StableHloBuilder& b,
                                  const SsaValue& qs,
                                  const SsaValue& d,
                                  const SsaValue* m_opt,
+                                 PjrtDType bitcast_target,
                                  PjrtDType out_dt) {
     const int64_t B3 = d.dims[0];
     const int64_t B2 = d.dims[1];
@@ -622,8 +687,9 @@ SsaValue dequantize_split_weight(StableHloBuilder& b,
     const int64_t blk_elems = (storage == TensorStorageKind::Q6_K_SPLIT) ? 16 : 32;
     const int64_t K = NB * blk_elems;
 
-    if (storage == TensorStorageKind::Q8_0_SPLIT || storage == TensorStorageKind::Q6_K_SPLIT) {
-        SsaValue km = dequantize_k_major_blocks(b, storage, qs, d, out_dt);
+    if (storage == TensorStorageKind::Q8_0_SPLIT || storage == TensorStorageKind::Q6_K_SPLIT ||
+        storage == TensorStorageKind::Q4_0_I4 || storage == TensorStorageKind::Q4_K_I4) {
+        SsaValue km = dequantize_k_major_blocks(b, storage, qs, d, m_opt, bitcast_target, out_dt);
         SsaValue nm = b.emit_transpose(km, {0, 1, 4, 2, 3});
         return b.emit_reshape(nm, {B3, B2, N, K});
     }
@@ -755,6 +821,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
     struct TensorHandle {
         TensorStorageKind storage = TensorStorageKind::DENSE;
         TensorShardingKind sharding = TensorShardingKind::REPLICATED;
+        PjrtDType bitcast_target = PjrtDType::S4;
         SsaValue dense;
         SsaValue q_qs;
         SsaValue q_d;
@@ -769,6 +836,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
         TensorHandle th;
         th.storage = in.storage;
         th.sharding = (P > 1) ? in.sharding : TensorShardingKind::REPLICATED;
+        th.bitcast_target = (in.bitcast_target != PjrtDType::INVALID) ? in.bitcast_target : PjrtDType::S4;
         const int64_t B3 = in.dims[0];
         const int64_t B2 = in.dims[1];
         int64_t M_or_N = in.dims[2];
@@ -796,29 +864,43 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
             th.dense = builder.arg_val(arg_idx - 1);
             prog.input_bindings.push_back({in.id, 0, in.dtype, std::move(dims), alias_out >= 0});
         } else {
+            const bool is_i4_storage =
+                (in.storage == TensorStorageKind::Q4_0_I4 || in.storage == TensorStorageKind::Q4_K_I4);
             const int64_t blk_elems = (in.storage == TensorStorageKind::Q6_K_SPLIT) ? 16 : 32;
             if (K <= 0 || (K % blk_elems) != 0) {
                 throw std::runtime_error("emit_stablehlo_program: quantized tensor K alignment error");
             }
             const int64_t NB = K / blk_elems;
-            const PjrtDType q_dt =
-                (in.storage == TensorStorageKind::Q8_0_SPLIT || in.storage == TensorStorageKind::Q6_K_SPLIT)
-                    ? PjrtDType::S8
-                    : PjrtDType::U8;
-            const int64_t qs_blk =
-                (in.storage == TensorStorageKind::Q8_0_SPLIT || in.storage == TensorStorageKind::Q6_K_SPLIT)
-                    ? blk_elems
-                    : 16;
+            PjrtDType q_dt = PjrtDType::U8;
+            int64_t qs_blk = 16;
+            int64_t qs_n = M_or_N;
+            if (in.storage == TensorStorageKind::Q8_0_SPLIT || in.storage == TensorStorageKind::Q6_K_SPLIT) {
+                q_dt = PjrtDType::S8;
+                qs_blk = blk_elems;
+            } else if (is_i4_storage) {
+                qs_blk = 32;
+                if (in.dtype == PjrtDType::U8) {
+                    if ((M_or_N % 2) != 0) {
+                        throw std::runtime_error("emit_stablehlo_program: Q4_*_I4 bitcast mode requires even local N");
+                    }
+                    q_dt = PjrtDType::U8;
+                    qs_n = M_or_N / 2;
+                } else {
+                    q_dt = (in.dtype == PjrtDType::U4) ? PjrtDType::U4 : PjrtDType::S4;
+                }
+            }
             const PjrtDType default_d_dt =
-                (in.storage == TensorStorageKind::Q4_K_SPLIT || in.storage == TensorStorageKind::Q6_K_SPLIT)
+                (in.storage == TensorStorageKind::Q4_K_SPLIT ||
+                 in.storage == TensorStorageKind::Q4_K_I4 ||
+                 in.storage == TensorStorageKind::Q6_K_SPLIT)
                     ? PjrtDType::F32
                     : PjrtDType::F16;
             const PjrtDType d_dt = (in.scale_dtype != PjrtDType::INVALID) ? in.scale_dtype : default_d_dt;
 
             // TPU-native K-major N-minor layout:
-            //   qs: [B3, B2, NB, qs_blk, N]  -> minor dims (16/32, N) align with (8, 128) TPU tiles (0% padding)
-            //   d:  [B3, B2, NB, N]          -> broadcasts along axis 3 without any reshape
-            std::vector<int64_t> qs_dims = {B3, B2, NB, qs_blk, M_or_N};
+            //   qs: [B3, B2, NB, qs_blk, qs_n] -> minor dims (16/32, qs_n) align with (8, 128) TPU tiles
+            //   d:  [B3, B2, NB, N]            -> broadcasts along axis 3 without any reshape
+            std::vector<int64_t> qs_dims = {B3, B2, NB, qs_blk, qs_n};
             const std::string q_name = "%arg" + std::to_string(arg_idx++);
             builder.add_arg(q_name, q_dt, qs_dims);
             th.q_qs = builder.arg_val(arg_idx - 1);
@@ -830,7 +912,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
             th.q_d = builder.arg_val(arg_idx - 1);
             prog.input_bindings.push_back({in.id, 1, d_dt, d_dims, false});
 
-            if (in.storage == TensorStorageKind::Q4_K_SPLIT) {
+            if (in.storage == TensorStorageKind::Q4_K_SPLIT || in.storage == TensorStorageKind::Q4_K_I4) {
                 const std::string m_name = "%arg" + std::to_string(arg_idx++);
                 builder.add_arg(m_name, d_dt, d_dims);
                 th.q_m = builder.arg_val(arg_idx - 1);
@@ -847,7 +929,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
             return th.dense;
         }
         return dequantize_split_weight(
-            builder, th.storage, th.q_qs, th.q_d, th.has_q_m ? &th.q_m : nullptr, dequant_dt);
+            builder, th.storage, th.q_qs, th.q_d, th.has_q_m ? &th.q_m : nullptr, th.bitcast_target, dequant_dt);
     };
 
     auto resolve_replicated = [&](uint64_t id, PjrtDType dequant_dt = PjrtDType::BF16) -> SsaValue {
@@ -919,17 +1001,89 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                             wt = builder.emit_reshape(wb, {x.dims[0], x.dims[1], wt.dims[2], wt.dims[3], wt.dims[4]});
                         }
                     };
+                    auto bcast_w4_batch = [&](SsaValue& wt) {
+                        // wt: [B3_w, B2_w, D2, D3] -> [B3_x, B2_x, D2, D3]
+                        if (wt.dims[0] != x.dims[0] || wt.dims[1] != x.dims[1]) {
+                            const int64_t r3 = x.dims[0] / wt.dims[0];
+                            const int64_t r2 = x.dims[1] / wt.dims[1];
+                            SsaValue wr = builder.emit_reshape(
+                                wt, {wt.dims[0], 1, wt.dims[1], 1, wt.dims[2], wt.dims[3]});
+                            SsaValue wb = builder.emit_broadcast_in_dim(
+                                wr, {0, 1, 2, 3, 4, 5},
+                                {wt.dims[0], r3, wt.dims[1], r2, wt.dims[2], wt.dims[3]});
+                            wt = builder.emit_reshape(wb, {x.dims[0], x.dims[1], wt.dims[2], wt.dims[3]});
+                        }
+                    };
 
                     const std::vector<int64_t> local_out_dims = {x.dims[0], x.dims[1], x.dims[2], N_local};
                     SsaValue local_out;
                     if (w_th.storage == TensorStorageKind::Q8_0_SPLIT ||
                         w_th.storage == TensorStorageKind::Q6_K_SPLIT) {
-                        SsaValue w_km = dequantize_k_major_blocks(builder, w_th.storage, w_th.q_qs, w_th.q_d, mm_dt);
+                        SsaValue w_km = dequantize_k_major_blocks(
+                            builder, w_th.storage, w_th.q_qs, w_th.q_d,
+                            nullptr, w_th.bitcast_target, mm_dt);
                         bcast_w5_batch(w_km);
                         SsaValue x_blk = builder.emit_reshape(x, {x.dims[0], x.dims[1], x.dims[2], NB_local, blk_elems});
                         local_out = builder.emit_dot_general(
                             x_blk, w_km, {0, 1}, {0, 1}, {3, 4}, {2, 3}, local_out_dims, op.dst.dtype,
                             op.high_precision);
+                    } else if (w_th.storage == TensorStorageKind::Q4_0_I4 ||
+                               w_th.storage == TensorStorageKind::Q4_K_I4) {
+                        const int64_t m_total = x.dims[0] * x.dims[1] * x.dims[2];
+                        if (m_total <= 32) {
+                            // Factored S4 decode/small-batch path (M <= 32):
+                            //   dot_b = dot_general(x_blk, qs_mm) -> [B3, B2, NB_local, M, N_local]
+                            //   acc   = sum_nb(dot_b * d) + (Q4_K ? dot_general(xsum, m) : 0)
+                            const PjrtDType target_4bit =
+                                (w_th.bitcast_target != PjrtDType::INVALID) ? w_th.bitcast_target : PjrtDType::S4;
+                            SsaValue qs_eff = materialize_q4_i4_nibbles(builder, w_th.q_qs, target_4bit, N_local);
+                            bcast_w5_batch(qs_eff);
+                            SsaValue d_km = w_th.q_d;
+                            bcast_w4_batch(d_km);
+
+                            SsaValue x_blk = builder.emit_reshape(
+                                x, {x.dims[0], x.dims[1], x.dims[2], NB_local, blk_elems});
+                            SsaValue qs_mm = builder.emit_convert(qs_eff, mm_dt);
+                            if (w_th.storage == TensorStorageKind::Q4_0_I4 && qs_eff.dtype == PjrtDType::U4) {
+                                SsaValue eight = builder.emit_const_splat_f32(8.0f, qs_mm.dims, mm_dt);
+                                qs_mm = builder.emit_binary("stablehlo.subtract", qs_mm, eight);
+                            }
+                            const std::vector<int64_t> dot_b_dims = {
+                                x.dims[0], x.dims[1], NB_local, x.dims[2], N_local};
+                            SsaValue dot_b = builder.emit_dot_general(
+                                x_blk, qs_mm, {0, 1, 3}, {0, 1, 2}, {4}, {3},
+                                dot_b_dims, PjrtDType::F32, op.high_precision);
+                            SsaValue d_f32 = builder.emit_convert(d_km, PjrtDType::F32);
+                            SsaValue d_b = builder.emit_broadcast_in_dim(d_f32, {0, 1, 2, 4}, dot_b_dims);
+                            SsaValue scaled = builder.emit_binary("stablehlo.multiply", dot_b, d_b);
+                            SsaValue zero_f32 = builder.emit_const_splat_f32(0.0f, {}, PjrtDType::F32);
+                            SsaValue acc = builder.emit_reduce_axis(scaled, zero_f32, 2, "stablehlo.add");
+
+                            if (w_th.storage == TensorStorageKind::Q4_K_I4 && w_th.has_q_m) {
+                                SsaValue m_km = w_th.q_m;
+                                bcast_w4_batch(m_km);
+                                SsaValue x_f32 = builder.emit_convert(x_blk, PjrtDType::F32);
+                                SsaValue xsum = builder.emit_reduce_axis(x_f32, zero_f32, 4, "stablehlo.add");
+                                SsaValue xsum_mm = builder.emit_convert(xsum, mm_dt);
+                                SsaValue m_mm = builder.emit_convert(m_km, mm_dt);
+                                SsaValue m_dot = builder.emit_dot_general(
+                                    xsum_mm, m_mm, {0, 1}, {0, 1}, {3}, {2},
+                                    local_out_dims, PjrtDType::F32, op.high_precision);
+                                acc = builder.emit_binary("stablehlo.add", acc, m_dot);
+                            }
+                            local_out = builder.emit_convert(acc, op.dst.dtype);
+                        } else {
+                            // Large-batch prefill path (M > 32): in-loop S4 dequant -> reshape [..., K, N] -> single dot_general.
+                            SsaValue w_km = dequantize_k_major_blocks(
+                                builder, w_th.storage, w_th.q_qs, w_th.q_d,
+                                w_th.has_q_m ? &w_th.q_m : nullptr, w_th.bitcast_target, mm_dt);
+                            bcast_w5_batch(w_km);
+                            SsaValue w_2d = builder.emit_reshape(
+                                w_km, {x.dims[0], x.dims[1], K_local, N_local});
+                            local_out = builder.emit_dot_general(
+                                x, w_2d, {0, 1}, {0, 1}, {3}, {2}, local_out_dims, op.dst.dtype,
+                                op.high_precision);
+                        }
                     } else {
                         SsaValue w_lo, w_hi;
                         dequantize_q4_k_major_halves(
@@ -1259,8 +1413,39 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                     // producing row-major [B3, B2, N_idx, NB, qs_blk] + [B3, B2, N_idx, NB], then dequantize!
                     const int64_t NB = tbl.q_d.dims[2];
                     const int64_t qs_blk = tbl.q_qs.dims[3];
-                    SsaValue g_qs = builder.emit_gather_3d_last_axis(
-                        tbl.q_qs, start_indices, {B3, B2, N_idx, NB, qs_blk});
+                    SsaValue g_qs;
+                    PjrtDType eff_q_dt = tbl.q_qs.dtype;
+                    if ((tbl.storage == TensorStorageKind::Q4_0_I4 ||
+                         tbl.storage == TensorStorageKind::Q4_K_I4) &&
+                        tbl.q_qs.dtype == PjrtDType::U8) {
+                        // Packed bitcast U8 [..., 32, N/2]: gather byte idx >> 1 in ui8, extract nibble (idx & 1).
+                        SsaValue one = builder.emit_const_splat_int(1, idx_col_dims, PjrtDType::S32);
+                        SsaValue byte_idx1 = builder.emit_binary("stablehlo.shift_right_logical", idx1, one);
+                        SsaValue nib_sel = builder.emit_binary("stablehlo.and", idx1, one);
+                        SsaValue byte_start_indices = builder.emit_concatenate({idx3, idx2, byte_idx1}, 3);
+                        SsaValue g_u8 = builder.emit_gather_3d_last_axis(
+                            tbl.q_qs, byte_start_indices, {B3, B2, N_idx, NB, qs_blk});
+                        SsaValue g_s32 = builder.emit_convert(g_u8, PjrtDType::S32);
+                        SsaValue four = builder.emit_const_splat_int(4, idx_col_dims, PjrtDType::S32);
+                        SsaValue shift_amt = builder.emit_reshape(
+                            builder.emit_binary("stablehlo.multiply", nib_sel, four), {B3, B2, N_idx});
+                        SsaValue shift_b = builder.emit_broadcast_in_dim(shift_amt, {0, 1, 2}, g_s32.dims);
+                        SsaValue shifted = builder.emit_binary("stablehlo.shift_right_logical", g_s32, shift_b);
+                        SsaValue mask_15 = builder.emit_const_splat_int(0x0F, g_s32.dims, PjrtDType::S32);
+                        SsaValue nib_u = builder.emit_binary("stablehlo.and", shifted, mask_15);
+                        eff_q_dt = tbl.bitcast_target;
+                        if (eff_q_dt == PjrtDType::S4) {
+                            SsaValue eight_i = builder.emit_const_splat_int(8, g_s32.dims, PjrtDType::S32);
+                            SsaValue plus8 = builder.emit_binary("stablehlo.add", nib_u, eight_i);
+                            SsaValue masked = builder.emit_binary("stablehlo.and", plus8, mask_15);
+                            g_qs = builder.emit_binary("stablehlo.subtract", masked, eight_i);
+                        } else {
+                            g_qs = nib_u;
+                        }
+                    } else {
+                        g_qs = builder.emit_gather_3d_last_axis(
+                            tbl.q_qs, start_indices, {B3, B2, N_idx, NB, qs_blk});
+                    }
                     SsaValue g_d = builder.emit_gather_3d_last_axis(
                         tbl.q_d, start_indices, {B3, B2, N_idx, NB});
                     SsaValue g_m;
@@ -1271,7 +1456,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                         g_m_ptr = &g_m;
                     }
                     SsaValue local_deq = dequantize_row_major_blocks(
-                        builder, tbl.storage, g_qs, g_d, g_m_ptr, op.dst.dtype);
+                        builder, tbl.storage, g_qs, g_d, g_m_ptr, eff_q_dt, op.dst.dtype);
                     result = (P > 1 && tbl.sharding == TensorShardingKind::SHARD_K)
                                  ? builder.emit_all_gather(local_deq, 3, P)
                                  : local_deq;

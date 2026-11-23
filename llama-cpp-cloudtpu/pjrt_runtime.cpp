@@ -134,6 +134,8 @@ PJRT_Buffer_Type to_pjrt_buffer_type(PjrtDType dt) {
         case PjrtDType::BF16: return PJRT_Buffer_Type_BF16;
         case PjrtDType::S8: return PJRT_Buffer_Type_S8;
         case PjrtDType::U8: return PJRT_Buffer_Type_U8;
+        case PjrtDType::S4: return PJRT_Buffer_Type_S4;
+        case PjrtDType::U4: return PJRT_Buffer_Type_U4;
         case PjrtDType::S16: return PJRT_Buffer_Type_S16;
         case PjrtDType::S32: return PJRT_Buffer_Type_S32;
         case PjrtDType::U32: return PJRT_Buffer_Type_U32;
@@ -149,6 +151,8 @@ PjrtDType from_pjrt_buffer_type(PJRT_Buffer_Type dt) {
         case PJRT_Buffer_Type_BF16: return PjrtDType::BF16;
         case PJRT_Buffer_Type_S8: return PjrtDType::S8;
         case PJRT_Buffer_Type_U8: return PjrtDType::U8;
+        case PJRT_Buffer_Type_S4: return PjrtDType::S4;
+        case PJRT_Buffer_Type_U4: return PjrtDType::U4;
         case PJRT_Buffer_Type_S16: return PjrtDType::S16;
         case PJRT_Buffer_Type_S32: return PjrtDType::S32;
         case PJRT_Buffer_Type_U32: return PjrtDType::U32;
@@ -164,6 +168,8 @@ const char* pjrt_dtype_mlir_name(PjrtDType dt) {
         case PjrtDType::BF16: return "bf16";
         case PjrtDType::S8: return "i8";
         case PjrtDType::U8: return "ui8";
+        case PjrtDType::S4: return "i4";
+        case PjrtDType::U4: return "ui4";
         case PjrtDType::S16: return "i16";
         case PjrtDType::S32: return "i32";
         case PjrtDType::U32: return "ui32";
@@ -172,18 +178,87 @@ const char* pjrt_dtype_mlir_name(PjrtDType dt) {
     }
 }
 
-size_t pjrt_dtype_size(PjrtDType dt) {
+size_t pjrt_dtype_bits(PjrtDType dt) {
     switch (dt) {
-        case PjrtDType::S64: return 8;
+        case PjrtDType::S64: return 64;
         case PjrtDType::F32:
         case PjrtDType::S32:
-        case PjrtDType::U32: return 4;
+        case PjrtDType::U32: return 32;
         case PjrtDType::F16:
         case PjrtDType::BF16:
-        case PjrtDType::S16: return 2;
+        case PjrtDType::S16: return 16;
         case PjrtDType::S8:
-        case PjrtDType::U8: return 1;
+        case PjrtDType::U8: return 8;
+        case PjrtDType::S4:
+        case PjrtDType::U4: return 4;
         default: return 0;
+    }
+}
+
+size_t pjrt_dtype_size(PjrtDType dt) {
+    return pjrt_dtype_bits(dt) / 8;
+}
+
+size_t pjrt_dtype_nbytes(PjrtDType dt, size_t num_elements) {
+    const size_t bits = pjrt_dtype_bits(dt);
+    if (bits == 0 || num_elements == 0) {
+        return 0;
+    }
+    return (num_elements / 8) * bits + ((num_elements % 8) * bits + 7) / 8;
+}
+
+size_t pjrt_host_nbytes(PjrtDType dt, size_t num_elements) {
+    const size_t bits = pjrt_dtype_bits(dt);
+    if (bits == 0 || num_elements == 0) {
+        return 0;
+    }
+    // OpenXLA PJRT BufferFromHostBuffer(byte_strides=nullptr) reads 1 byte per element for S4/U4.
+    const size_t host_elem_bytes = (bits < 8) ? 1 : (bits / 8);
+    return num_elements * host_elem_bytes;
+}
+
+static inline int8_t sign_extend_nibble(uint8_t nib) {
+    const uint8_t u = nib & 0x0FU;
+    return static_cast<int8_t>((u & 0x08U) ? (static_cast<int>(u) - 16) : static_cast<int>(u));
+}
+
+void pack_u4_from_u8(const uint8_t* src, size_t nelems, uint8_t* dst_packed) {
+    const size_t pairs = nelems / 2;
+    for (size_t i = 0; i < pairs; ++i) {
+        const uint8_t lo = src[2 * i] & 0x0FU;
+        const uint8_t hi = src[2 * i + 1] & 0x0FU;
+        dst_packed[i] = static_cast<uint8_t>(lo | (hi << 4));
+    }
+    if ((nelems & 1U) != 0U) {
+        dst_packed[pairs] = src[nelems - 1] & 0x0FU;
+    }
+}
+
+void unpack_u4_to_u8(const uint8_t* src_packed, size_t nelems, uint8_t* dst) {
+    const size_t pairs = nelems / 2;
+    for (size_t i = 0; i < pairs; ++i) {
+        const uint8_t b = src_packed[i];
+        dst[2 * i] = b & 0x0FU;
+        dst[2 * i + 1] = (b >> 4) & 0x0FU;
+    }
+    if ((nelems & 1U) != 0U) {
+        dst[nelems - 1] = src_packed[pairs] & 0x0FU;
+    }
+}
+
+void pack_s4_from_i8(const int8_t* src, size_t nelems, uint8_t* dst_packed) {
+    pack_u4_from_u8(reinterpret_cast<const uint8_t*>(src), nelems, dst_packed);
+}
+
+void unpack_s4_to_i8(const uint8_t* src_packed, size_t nelems, int8_t* dst) {
+    const size_t pairs = nelems / 2;
+    for (size_t i = 0; i < pairs; ++i) {
+        const uint8_t b = src_packed[i];
+        dst[2 * i] = sign_extend_nibble(b);
+        dst[2 * i + 1] = sign_extend_nibble(b >> 4);
+    }
+    if ((nelems & 1U) != 0U) {
+        dst[nelems - 1] = sign_extend_nibble(src_packed[pairs]);
     }
 }
 
@@ -306,7 +381,7 @@ size_t PjrtBuffer::num_elements() const {
 }
 
 size_t PjrtBuffer::num_bytes() const {
-    return num_elements() * pjrt_dtype_size(dtype);
+    return pjrt_dtype_nbytes(dtype, num_elements());
 }
 
 // =========================================================================
@@ -331,7 +406,7 @@ struct MockTensor {
     void allocate(PjrtDType dt, std::vector<int64_t> shape) {
         dtype = dt;
         dims = std::move(shape);
-        bytes.assign(num_elements() * pjrt_dtype_size(dt), 0);
+        bytes.assign(pjrt_dtype_nbytes(dt, num_elements()), 0);
     }
 
     float read_f32(size_t idx) const {
@@ -355,6 +430,9 @@ struct MockTensor {
                 return static_cast<float>(reinterpret_cast<const int8_t*>(bytes.data())[idx]);
             case PjrtDType::U8:
                 return static_cast<float>(bytes[idx]);
+            case PjrtDType::S4:
+            case PjrtDType::U4:
+                return static_cast<float>(read_i64(idx));
             case PjrtDType::S16: {
                 int16_t v = 0;
                 std::memcpy(&v, bytes.data() + idx * 2, 2);
@@ -405,6 +483,10 @@ struct MockTensor {
                 bytes[idx] = uv;
                 break;
             }
+            case PjrtDType::S4:
+            case PjrtDType::U4:
+                write_i64(idx, static_cast<int64_t>(std::lround(v)));
+                break;
             case PjrtDType::S16: {
                 const int16_t iv = static_cast<int16_t>(std::lround(v));
                 std::memcpy(bytes.data() + idx * 2, &iv, 2);
@@ -456,6 +538,15 @@ struct MockTensor {
                 return reinterpret_cast<const int8_t*>(bytes.data())[idx];
             case PjrtDType::U8:
                 return static_cast<int64_t>(bytes[idx]);
+            case PjrtDType::S4: {
+                const uint8_t b = bytes[idx >> 1];
+                const uint8_t nib = ((idx & 1U) == 0U) ? (b & 0x0FU) : ((b >> 4) & 0x0FU);
+                return static_cast<int64_t>(sign_extend_nibble(nib));
+            }
+            case PjrtDType::U4: {
+                const uint8_t b = bytes[idx >> 1];
+                return static_cast<int64_t>(((idx & 1U) == 0U) ? (b & 0x0FU) : ((b >> 4) & 0x0FU));
+            }
             default:
                 return static_cast<int64_t>(read_f32(idx));
         }
@@ -489,12 +580,35 @@ struct MockTensor {
             case PjrtDType::U8:
                 bytes[idx] = static_cast<uint8_t>(v);
                 break;
+            case PjrtDType::S4:
+            case PjrtDType::U4: {
+                const size_t bi = idx >> 1;
+                const uint8_t nib = static_cast<uint8_t>(v) & 0x0FU;
+                if ((idx & 1U) == 0U) {
+                    bytes[bi] = static_cast<uint8_t>((bytes[bi] & 0xF0U) | nib);
+                } else {
+                    bytes[bi] = static_cast<uint8_t>((bytes[bi] & 0x0FU) | (nib << 4));
+                }
+                break;
+            }
             default:
                 write_f32(idx, static_cast<float>(v));
                 break;
         }
     }
 };
+
+static inline void copy_mock_elem(MockTensor& dst, size_t dst_idx, const MockTensor& src, size_t src_idx) {
+    const size_t bits = pjrt_dtype_bits(dst.dtype);
+    if (bits < 8) {
+        dst.write_i64(dst_idx, src.read_i64(src_idx));
+    } else {
+        const size_t elem_sz = bits / 8;
+        std::memcpy(dst.bytes.data() + dst_idx * elem_sz,
+                    src.bytes.data() + src_idx * elem_sz,
+                    elem_sz);
+    }
+}
 
 struct MockTypeSpec {
     PjrtDType dtype = PjrtDType::INVALID;
@@ -515,6 +629,8 @@ static PjrtDType parse_mlir_dtype(const std::string& tok) {
     if (tok == "bf16") return PjrtDType::BF16;
     if (tok == "i8" || tok == "si8") return PjrtDType::S8;
     if (tok == "ui8") return PjrtDType::U8;
+    if (tok == "i4" || tok == "si4") return PjrtDType::S4;
+    if (tok == "ui4") return PjrtDType::U4;
     if (tok == "i16" || tok == "si16") return PjrtDType::S16;
     if (tok == "i32" || tok == "si32") return PjrtDType::S32;
     if (tok == "ui32") return PjrtDType::U32;
@@ -595,11 +711,19 @@ static std::vector<size_t> compute_row_major_strides(const std::vector<int64_t>&
     return strides;
 }
 
+static bool is_mock_int_dtype(PjrtDType dt) {
+    return dt == PjrtDType::S4 || dt == PjrtDType::U4 ||
+           dt == PjrtDType::S8 || dt == PjrtDType::U8 ||
+           dt == PjrtDType::S16 || dt == PjrtDType::S32 ||
+           dt == PjrtDType::U32 || dt == PjrtDType::S64;
+}
+
 struct MockOp {
     enum class Kind {
         CONSTANT,
         IOTA,
         CONVERT,
+        BITCAST_CONVERT,
         ADD,
         SUBTRACT,
         MULTIPLY,
@@ -750,9 +874,7 @@ static MockProgram parse_stablehlo_mlir(const std::string& mlir) {
             const size_t d0 = rhs.find("dense<");
             const size_t d1 = rhs.rfind('>');
             const std::string lit = trim_copy(rhs.substr(d0 + 6, d1 - (d0 + 6)));
-            const bool is_int = (op.out_type.dtype == PjrtDType::S8 || op.out_type.dtype == PjrtDType::U8 ||
-                                 op.out_type.dtype == PjrtDType::S16 || op.out_type.dtype == PjrtDType::S32 ||
-                                 op.out_type.dtype == PjrtDType::S64);
+            const bool is_int = is_mock_int_dtype(op.out_type.dtype);
             if (!lit.empty() && lit.front() == '[') {
                 op.is_splat = false;
                 std::string inner = lit.substr(1, lit.size() - 2);
@@ -775,6 +897,9 @@ static MockProgram parse_stablehlo_mlir(const std::string& mlir) {
             op.iota_dim = std::stoll(rhs.substr(dp + 6));
         } else if (rhs.rfind("stablehlo.convert ", 0) == 0) {
             op.kind = MockOp::Kind::CONVERT;
+            op.inputs = extract_ssa_refs(rhs.substr(0, colon));
+        } else if (rhs.rfind("stablehlo.bitcast_convert ", 0) == 0) {
+            op.kind = MockOp::Kind::BITCAST_CONVERT;
             op.inputs = extract_ssa_refs(rhs.substr(0, colon));
         } else if (rhs.rfind("stablehlo.add ", 0) == 0) {
             op.kind = MockOp::Kind::ADD;
@@ -972,9 +1097,7 @@ static MockTensor eval_mock_op(const MockOp& op,
     out.allocate(op.out_type.dtype, op.out_type.dims);
     const size_t n_out = out.num_elements();
 
-    const bool is_int = (out.dtype == PjrtDType::S8 || out.dtype == PjrtDType::U8 ||
-                         out.dtype == PjrtDType::S16 || out.dtype == PjrtDType::S32 ||
-                         out.dtype == PjrtDType::U32 || out.dtype == PjrtDType::S64);
+    const bool is_int = is_mock_int_dtype(out.dtype);
 
     switch (op.kind) {
         case MockOp::Kind::CONSTANT: {
@@ -1004,15 +1127,23 @@ static MockTensor eval_mock_op(const MockOp& op,
         }
         case MockOp::Kind::CONVERT: {
             const MockTensor& a = env.at(op.inputs[0]);
-            const bool src_int = (a.dtype == PjrtDType::S8 || a.dtype == PjrtDType::U8 ||
-                                  a.dtype == PjrtDType::S16 || a.dtype == PjrtDType::S32 ||
-                                  a.dtype == PjrtDType::U32 || a.dtype == PjrtDType::S64);
+            const bool src_int = is_mock_int_dtype(a.dtype);
             for (size_t i = 0; i < n_out; ++i) {
                 if (is_int && src_int) out.write_i64(i, a.read_i64(i));
                 else if (is_int) out.write_i64(i, static_cast<int64_t>(a.read_f32(i)));
                 else if (src_int) out.write_f32(i, static_cast<float>(a.read_i64(i)));
                 else out.write_f32(i, a.read_f32(i));
             }
+            break;
+        }
+        case MockOp::Kind::BITCAST_CONVERT: {
+            const MockTensor& a = env.at(op.inputs[0]);
+            const size_t bits_in = pjrt_dtype_bits(a.dtype);
+            const size_t bits_out = pjrt_dtype_bits(out.dtype);
+            if (a.num_elements() * bits_in != n_out * bits_out || a.bytes.size() != out.bytes.size()) {
+                throw std::runtime_error("MockPJRT: bitcast_convert total bitwidth mismatch");
+            }
+            out.bytes = a.bytes;
             break;
         }
         case MockOp::Kind::ADD:
@@ -1024,6 +1155,8 @@ static MockTensor eval_mock_op(const MockOp& op,
         case MockOp::Kind::SHR_LOGICAL: {
             const MockTensor& a = env.at(op.inputs[0]);
             const MockTensor& b = env.at(op.inputs[1]);
+            const size_t out_bits = pjrt_dtype_bits(out.dtype);
+            const uint64_t bit_mask = (out_bits >= 64) ? ~0ULL : ((1ULL << out_bits) - 1ULL);
             for (size_t i = 0; i < n_out; ++i) {
                 if (is_int) {
                     const int64_t va = a.read_i64(i);
@@ -1036,7 +1169,8 @@ static MockTensor eval_mock_op(const MockOp& op,
                     else if (op.kind == MockOp::Kind::MAXIMUM) vr = std::max(va, vb);
                     else if (op.kind == MockOp::Kind::BIT_AND) vr = (va & vb);
                     else if (op.kind == MockOp::Kind::SHR_LOGICAL) {
-                        vr = static_cast<int64_t>(static_cast<uint64_t>(va) >> static_cast<unsigned>(vb));
+                        const uint64_t ua = static_cast<uint64_t>(va) & bit_mask;
+                        vr = static_cast<int64_t>(ua >> static_cast<unsigned>(vb));
                     }
                     out.write_i64(i, vr);
                 } else {
@@ -1082,7 +1216,6 @@ static MockTensor eval_mock_op(const MockOp& op,
             const MockTensor& a = env.at(op.inputs[0]);
             const auto out_strides = compute_row_major_strides(out.dims);
             const auto in_strides = compute_row_major_strides(a.dims);
-            const size_t elem_sz = pjrt_dtype_size(out.dtype);
             for (size_t i = 0; i < n_out; ++i) {
                 size_t rem = i;
                 size_t src_idx = 0;
@@ -1096,7 +1229,7 @@ static MockTensor eval_mock_op(const MockOp& op,
                     const int64_t c = (a.dims[sd] == 1) ? 0 : out_coord[od];
                     src_idx += static_cast<size_t>(c) * in_strides[sd];
                 }
-                std::memcpy(out.bytes.data() + i * elem_sz, a.bytes.data() + src_idx * elem_sz, elem_sz);
+                copy_mock_elem(out, i, a, src_idx);
             }
             break;
         }
@@ -1104,7 +1237,6 @@ static MockTensor eval_mock_op(const MockOp& op,
             const MockTensor& a = env.at(op.inputs[0]);
             const auto out_strides = compute_row_major_strides(out.dims);
             const auto in_strides = compute_row_major_strides(a.dims);
-            const size_t elem_sz = pjrt_dtype_size(out.dtype);
             for (size_t i = 0; i < n_out; ++i) {
                 size_t rem = i;
                 size_t src_idx = 0;
@@ -1113,7 +1245,7 @@ static MockTensor eval_mock_op(const MockOp& op,
                     rem %= out_strides[d];
                     src_idx += c * in_strides[static_cast<size_t>(op.dims_attr[d])];
                 }
-                std::memcpy(out.bytes.data() + i * elem_sz, a.bytes.data() + src_idx * elem_sz, elem_sz);
+                copy_mock_elem(out, i, a, src_idx);
             }
             break;
         }
@@ -1121,7 +1253,6 @@ static MockTensor eval_mock_op(const MockOp& op,
             const MockTensor& a = env.at(op.inputs[0]);
             const auto out_strides = compute_row_major_strides(out.dims);
             const auto in_strides = compute_row_major_strides(a.dims);
-            const size_t elem_sz = pjrt_dtype_size(out.dtype);
             for (size_t i = 0; i < n_out; ++i) {
                 size_t rem = i;
                 size_t src_idx = 0;
@@ -1132,14 +1263,13 @@ static MockTensor eval_mock_op(const MockOp& op,
                                       c * static_cast<size_t>(op.slice_strides[d]);
                     src_idx += sc * in_strides[d];
                 }
-                std::memcpy(out.bytes.data() + i * elem_sz, a.bytes.data() + src_idx * elem_sz, elem_sz);
+                copy_mock_elem(out, i, a, src_idx);
             }
             break;
         }
         case MockOp::Kind::CONCATENATE: {
             const auto out_strides = compute_row_major_strides(out.dims);
             const size_t cdim = static_cast<size_t>(op.concat_dim);
-            const size_t elem_sz = pjrt_dtype_size(out.dtype);
             int64_t offset = 0;
             for (const std::string& in_name : op.inputs) {
                 const MockTensor& a = env.at(in_name);
@@ -1154,7 +1284,7 @@ static MockTensor eval_mock_op(const MockOp& op,
                         const size_t dc = (d == cdim) ? (c + static_cast<size_t>(offset)) : c;
                         dst_idx += dc * out_strides[d];
                     }
-                    std::memcpy(out.bytes.data() + dst_idx * elem_sz, a.bytes.data() + i * elem_sz, elem_sz);
+                    copy_mock_elem(out, dst_idx, a, i);
                 }
                 offset += a.dims[cdim];
             }
@@ -1263,7 +1393,6 @@ static MockTensor eval_mock_op(const MockOp& op,
             const auto op_strides = compute_row_major_strides(operand.dims);
             const auto idx_strides = compute_row_major_strides(indices.dims);
             const auto out_strides = compute_row_major_strides(out.dims);
-            const size_t elem_sz = pjrt_dtype_size(out.dtype);
 
             std::vector<bool> is_offset_dim(out.dims.size(), false);
             for (int64_t d : op.gather_offset_dims) is_offset_dim[static_cast<size_t>(d)] = true;
@@ -1315,7 +1444,7 @@ static MockTensor eval_mock_op(const MockOp& op,
                 for (size_t d = 0; d < operand.dims.size(); ++d) {
                     src_idx += static_cast<size_t>(op_coord[d]) * op_strides[d];
                 }
-                std::memcpy(out.bytes.data() + oi * elem_sz, operand.bytes.data() + src_idx * elem_sz, elem_sz);
+                copy_mock_elem(out, oi, operand, src_idx);
             }
             break;
         }
@@ -1351,9 +1480,16 @@ static MockTensor eval_mock_op(const MockOp& op,
                         const size_t src_row = static_cast<size_t>(b3) * upd_strides[0] +
                                                static_cast<size_t>(b2) * upd_strides[1] +
                                                static_cast<size_t>(ni) * upd_strides[2];
-                        std::memcpy(out.bytes.data() + dst_row * elem_sz,
-                                    updates.bytes.data() + src_row * elem_sz,
-                                    static_cast<size_t>(D) * elem_sz);
+                        if (elem_sz == 0) {
+                            for (int64_t d = 0; d < D; ++d) {
+                                copy_mock_elem(out, dst_row + static_cast<size_t>(d),
+                                               updates, src_row + static_cast<size_t>(d));
+                            }
+                        } else {
+                            std::memcpy(out.bytes.data() + dst_row * elem_sz,
+                                        updates.bytes.data() + src_row * elem_sz,
+                                        static_cast<size_t>(D) * elem_sz);
+                        }
                     }
                 }
             }
@@ -1374,7 +1510,6 @@ static MockTensor eval_mock_op(const MockOp& op,
             }
             const auto out_strides = compute_row_major_strides(out.dims);
             const auto in_strides = compute_row_major_strides(a.dims);
-            const size_t elem_sz = pjrt_dtype_size(out.dtype);
             for (size_t i = 0; i < n_out; ++i) {
                 size_t rem = i;
                 size_t src_idx = 0;
@@ -1383,7 +1518,7 @@ static MockTensor eval_mock_op(const MockOp& op,
                     rem %= out_strides[d];
                     src_idx += (static_cast<size_t>(starts[d]) + c) * in_strides[d];
                 }
-                std::memcpy(out.bytes.data() + i * elem_sz, a.bytes.data() + src_idx * elem_sz, elem_sz);
+                copy_mock_elem(out, i, a, src_idx);
             }
             break;
         }
@@ -1400,7 +1535,6 @@ static MockTensor eval_mock_op(const MockOp& op,
             }
             const auto out_strides = compute_row_major_strides(out.dims);
             const auto upd_strides = compute_row_major_strides(update.dims);
-            const size_t elem_sz = pjrt_dtype_size(out.dtype);
             const size_t n_upd = update.num_elements();
             for (size_t i = 0; i < n_upd; ++i) {
                 size_t rem = i;
@@ -1410,7 +1544,7 @@ static MockTensor eval_mock_op(const MockOp& op,
                     rem %= upd_strides[d];
                     dst_idx += (static_cast<size_t>(starts[d]) + c) * out_strides[d];
                 }
-                std::memcpy(out.bytes.data() + dst_idx * elem_sz, update.bytes.data() + i * elem_sz, elem_sz);
+                copy_mock_elem(out, dst_idx, update, i);
             }
             break;
         }
@@ -1466,7 +1600,6 @@ static void eval_mock_collective(const MockOp& op,
             gathered.allocate(op.out_type.dtype, op.out_type.dims);
             const size_t cdim = static_cast<size_t>(op.collective_dim);
             const auto out_strides = compute_row_major_strides(gathered.dims);
-            const size_t elem_sz = pjrt_dtype_size(gathered.dtype);
             int64_t offset = 0;
             for (int64_t r : grp) {
                 const MockTensor& src = envs.at(static_cast<size_t>(r)).at(op.inputs[0]);
@@ -1481,8 +1614,7 @@ static void eval_mock_collective(const MockOp& op,
                         const size_t dc = (d == cdim) ? (c + static_cast<size_t>(offset)) : c;
                         dst_idx += dc * out_strides[d];
                     }
-                    std::memcpy(gathered.bytes.data() + dst_idx * elem_sz,
-                                src.bytes.data() + i * elem_sz, elem_sz);
+                    copy_mock_elem(gathered, dst_idx, src, i);
                 }
                 offset += src.dims[cdim];
             }
@@ -1505,7 +1637,6 @@ static void eval_mock_collective(const MockOp& op,
             const int64_t chunk = op.out_type.dims[sdim];
             const auto full_strides = compute_row_major_strides(full.dims);
             const auto out_strides = compute_row_major_strides(op.out_type.dims);
-            const size_t elem_sz = pjrt_dtype_size(op.out_type.dtype);
             for (size_t gi = 0; gi < grp.size(); ++gi) {
                 MockTensor shard;
                 shard.allocate(op.out_type.dtype, op.out_type.dims);
@@ -1520,8 +1651,7 @@ static void eval_mock_collective(const MockOp& op,
                         const size_t sc = (d == sdim) ? (c + static_cast<size_t>(start)) : c;
                         src_idx += sc * full_strides[d];
                     }
-                    std::memcpy(shard.bytes.data() + i * elem_sz,
-                                full.bytes.data() + src_idx * elem_sz, elem_sz);
+                    copy_mock_elem(shard, i, full, src_idx);
                 }
                 envs.at(static_cast<size_t>(grp[gi]))[op.out_name] = std::move(shard);
             }
@@ -1691,7 +1821,14 @@ static PJRT_Error* mock_buffer_from_host(PJRT_Client_BufferFromHostBuffer_Args* 
     mb->device = d;
     mb->tensor.allocate(dt, std::move(shape));
     if (!mb->tensor.bytes.empty() && args->data) {
-        std::memcpy(mb->tensor.bytes.data(), args->data, mb->tensor.bytes.size());
+        const size_t nelems = mb->tensor.num_elements();
+        if (dt == PjrtDType::S4) {
+            pack_s4_from_i8(static_cast<const int8_t*>(args->data), nelems, mb->tensor.bytes.data());
+        } else if (dt == PjrtDType::U4) {
+            pack_u4_from_u8(static_cast<const uint8_t*>(args->data), nelems, mb->tensor.bytes.data());
+        } else {
+            std::memcpy(mb->tensor.bytes.data(), args->data, mb->tensor.bytes.size());
+        }
     }
     if (d) {
         d->allocated_bytes.fetch_add(static_cast<int64_t>(mb->tensor.bytes.size()), std::memory_order_relaxed);
@@ -1708,6 +1845,11 @@ static PJRT_Error* mock_buffer_destroy(PJRT_Buffer_Destroy_Args* args) {
     delete mb;
     return nullptr;
 }
+static PJRT_Error* mock_buffer_element_type(PJRT_Buffer_ElementType_Args* args) {
+    auto* mb = reinterpret_cast<MockBuffer*>(args->buffer);
+    args->type = to_pjrt_buffer_type(mb->tensor.dtype);
+    return nullptr;
+}
 static PJRT_Error* mock_buffer_dimensions(PJRT_Buffer_Dimensions_Args* args) {
     auto* mb = reinterpret_cast<MockBuffer*>(args->buffer);
     args->dims = mb->tensor.dims.empty() ? nullptr : mb->tensor.dims.data();
@@ -1716,16 +1858,24 @@ static PJRT_Error* mock_buffer_dimensions(PJRT_Buffer_Dimensions_Args* args) {
 }
 static PJRT_Error* mock_buffer_to_host(PJRT_Buffer_ToHostBuffer_Args* args) {
     auto* mb = reinterpret_cast<MockBuffer*>(args->src);
+    const size_t nelems = mb->tensor.num_elements();
+    const size_t host_bytes = pjrt_host_nbytes(mb->tensor.dtype, nelems);
     if (!args->dst) {
-        args->dst_size = mb->tensor.bytes.size();
+        args->dst_size = host_bytes;
         args->event = nullptr;
         return nullptr;
     }
-    if (args->dst_size < mb->tensor.bytes.size()) {
+    if (args->dst_size < host_bytes) {
         return mock_error("MockPJRT: ToHostBuffer dst_size too small");
     }
-    if (!mb->tensor.bytes.empty()) {
-        std::memcpy(args->dst, mb->tensor.bytes.data(), mb->tensor.bytes.size());
+    if (nelems > 0) {
+        if (mb->tensor.dtype == PjrtDType::S4) {
+            unpack_s4_to_i8(mb->tensor.bytes.data(), nelems, static_cast<int8_t*>(args->dst));
+        } else if (mb->tensor.dtype == PjrtDType::U4) {
+            unpack_u4_to_u8(mb->tensor.bytes.data(), nelems, static_cast<uint8_t*>(args->dst));
+        } else {
+            std::memcpy(args->dst, mb->tensor.bytes.data(), mb->tensor.bytes.size());
+        }
     }
     args->event = reinterpret_cast<PJRT_Event*>(new MockEvent());
     return nullptr;
@@ -1850,6 +2000,7 @@ static const PJRT_Api* get_mock_pjrt_api() {
         a.PJRT_Executable_Destroy = mock_exec_destroy;
         a.PJRT_Executable_NumOutputs = mock_exec_num_outputs;
         a.PJRT_Buffer_Destroy = mock_buffer_destroy;
+        a.PJRT_Buffer_ElementType = mock_buffer_element_type;
         a.PJRT_Buffer_Dimensions = mock_buffer_dimensions;
         a.PJRT_Buffer_ToHostBuffer = mock_buffer_to_host;
         a.PJRT_Buffer_ReadyEvent = mock_buffer_ready_event;
@@ -2249,11 +2400,15 @@ void PjrtRuntime::buffer_to_host(PJRT_Buffer* buf, void* dst, size_t dst_size) {
     std::vector<int64_t> minor_to_major;
     PJRT_Buffer_MemoryLayout host_layout = {};
     bool use_host_layout = false;
+    size_t nelems = 1;
     if (PJRT_API_HAS(api_, PJRT_Buffer_Dimensions)) {
         PJRT_Buffer_Dimensions_Args dim_args = {};
         dim_args.struct_size = PJRT_Buffer_Dimensions_Args_STRUCT_SIZE;
         dim_args.buffer = buf;
         check_error(api_->PJRT_Buffer_Dimensions(&dim_args), "PJRT_Buffer_Dimensions");
+        for (size_t i = 0; i < dim_args.num_dims; ++i) {
+            nelems *= static_cast<size_t>(dim_args.dims[i]);
+        }
         if (dim_args.num_dims > 1) {
             minor_to_major.resize(dim_args.num_dims);
             for (size_t i = 0; i < dim_args.num_dims; ++i) {
@@ -2268,6 +2423,67 @@ void PjrtRuntime::buffer_to_host(PJRT_Buffer* buf, void* dst, size_t dst_size) {
             host_layout.tiled.tile_dim_sizes = nullptr;
             host_layout.tiled.num_tiles = 0;
             use_host_layout = true;
+        }
+    }
+
+    // Handle sub-byte S4/U4 gracefully whether PJRT ToHostBuffer writes 1 B/elem or packed 0.5 B/elem.
+    if (PJRT_API_HAS(api_, PJRT_Buffer_ElementType)) {
+        PJRT_Buffer_ElementType_Args et_args = {};
+        et_args.struct_size = PJRT_Buffer_ElementType_Args_STRUCT_SIZE;
+        et_args.buffer = buf;
+        check_error(api_->PJRT_Buffer_ElementType(&et_args), "PJRT_Buffer_ElementType");
+        if (et_args.type == PJRT_Buffer_Type_S4 || et_args.type == PJRT_Buffer_Type_U4) {
+            const PjrtDType dt = from_pjrt_buffer_type(et_args.type);
+            const size_t packed_bytes = pjrt_dtype_nbytes(dt, nelems);
+            PJRT_Buffer_ToHostBuffer_Args q_args = {};
+            q_args.struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE;
+            q_args.src = buf;
+            q_args.host_layout = use_host_layout ? &host_layout : nullptr;
+            q_args.dst = nullptr;
+            q_args.dst_size = 0;
+            check_error(api_->PJRT_Buffer_ToHostBuffer(&q_args), "PJRT_Buffer_ToHostBuffer(size)");
+            if (q_args.event) {
+                await_event(q_args.event);
+            }
+            const size_t needed = q_args.dst_size;
+            if (needed == packed_bytes && dst_size == nelems && nelems > packed_bytes) {
+                std::vector<uint8_t> tmp(needed);
+                PJRT_Buffer_ToHostBuffer_Args d_args = {};
+                d_args.struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE;
+                d_args.src = buf;
+                d_args.host_layout = use_host_layout ? &host_layout : nullptr;
+                d_args.dst = tmp.data();
+                d_args.dst_size = tmp.size();
+                check_error(api_->PJRT_Buffer_ToHostBuffer(&d_args), "PJRT_Buffer_ToHostBuffer");
+                if (d_args.event) {
+                    await_event(d_args.event);
+                }
+                if (dt == PjrtDType::S4) {
+                    unpack_s4_to_i8(tmp.data(), nelems, static_cast<int8_t*>(dst));
+                } else {
+                    unpack_u4_to_u8(tmp.data(), nelems, static_cast<uint8_t*>(dst));
+                }
+                return;
+            }
+            if (needed == nelems && dst_size == packed_bytes && nelems > packed_bytes) {
+                std::vector<uint8_t> tmp(needed);
+                PJRT_Buffer_ToHostBuffer_Args d_args = {};
+                d_args.struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE;
+                d_args.src = buf;
+                d_args.host_layout = use_host_layout ? &host_layout : nullptr;
+                d_args.dst = tmp.data();
+                d_args.dst_size = tmp.size();
+                check_error(api_->PJRT_Buffer_ToHostBuffer(&d_args), "PJRT_Buffer_ToHostBuffer");
+                if (d_args.event) {
+                    await_event(d_args.event);
+                }
+                if (dt == PjrtDType::S4) {
+                    pack_s4_from_i8(reinterpret_cast<const int8_t*>(tmp.data()), nelems, static_cast<uint8_t*>(dst));
+                } else {
+                    pack_u4_from_u8(tmp.data(), nelems, static_cast<uint8_t*>(dst));
+                }
+                return;
+            }
         }
     }
 
