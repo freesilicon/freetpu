@@ -674,16 +674,32 @@ class _BoundedSSEReader:
             self._buf.extend(chunk)
 
 
+def _echo_prompt_char_lengths(
+    endpoint: str,
+    req_payload: Mapping[str, Any],
+) -> Tuple[int, ...]:
+    """Return per-prompt echoed char lengths for `/v1/completions` when `echo=true`."""
+    if endpoint != "/v1/completions" or req_payload.get("echo") is not True:
+        return ()
+    prompt = req_payload.get("prompt")
+    if isinstance(prompt, str):
+        return (len(prompt),)
+    if isinstance(prompt, list) and prompt:
+        if all(isinstance(item, str) for item in prompt):
+            return tuple(len(item) for item in prompt)
+    return ()
+
+
 def _parse_inference_request_fields(
     raw_req: bytes,
     path: str,
 ) -> Tuple[
-    Optional[Tuple[str, bool, int, int, int, bool]],
+    Optional[Tuple[str, bool, int, int, int, Tuple[int, ...], bool]],
     Optional[Tuple[int, Optional[str], str]],
 ]:
     """Decode and validate an inbound inference JSON body in an isolated scope.
 
-    Returns `((model, stream, est_prompt_tokens, expected_choices, prompt_batch_size, expect_final_usage), None)`
+    Returns `((model, stream, est_prompt_tokens, expected_choices, prompt_batch_size, echo_prompt_chars, expect_final_usage), None)`
     on success or `(None, (status_code, error_code, message))` on validation failure.
     Running inside a dedicated function guarantees that the decoded `str`, JSON
     `dict`, and any nested user fields (such as `stream_options`) go out of scope
@@ -729,6 +745,7 @@ def _parse_inference_request_fields(
     est_prompt_tokens = _estimate_prompt_tokens(req_payload)
     prompt_batch_size = _expected_stream_prompt_batch_size(path, req_payload)
     expected_choices = _expected_stream_choices(path, req_payload)
+    echo_prompt_chars = _echo_prompt_char_lengths(path, req_payload)
     raw_stream_opts = req_payload.get("stream_options")
     expect_final_usage = bool(
         stream
@@ -741,6 +758,7 @@ def _parse_inference_request_fields(
         est_prompt_tokens,
         expected_choices,
         prompt_batch_size,
+        echo_prompt_chars,
         expect_final_usage,
     ), None
 
@@ -820,6 +838,45 @@ def _estimate_prompt_tokens(payload: Mapping[str, Any]) -> int:
     return explicit_tokens + char_tokens
 
 
+def _extract_single_choice_output_text(choice: Mapping[str, Any]) -> str:
+    """Extract generated text and tool-call output from one choice entry."""
+    parts: List[str] = []
+    text_val = choice.get("text")
+    if isinstance(text_val, str) and text_val:
+        parts.append(text_val)
+    for container_key in ("delta", "message"):
+        container = choice.get(container_key)
+        if not (isinstance(container, dict) or isinstance(container, Mapping)):
+            continue
+        for text_key in ("content", "refusal", "reasoning_content", "reasoning"):
+            val = container.get(text_key)
+            if isinstance(val, str) and val:
+                parts.append(val)
+        func_call = container.get("function_call")
+        if isinstance(func_call, dict) or isinstance(func_call, Mapping):
+            for fk in ("name", "arguments"):
+                fval = func_call.get(fk)
+                if isinstance(fval, str) and fval:
+                    parts.append(fval)
+        tool_calls = container.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for tc in tool_calls:
+                if not (isinstance(tc, dict) or isinstance(tc, Mapping)):
+                    continue
+                fn = tc.get("function")
+                if isinstance(fn, dict) or isinstance(fn, Mapping):
+                    for fk in ("name", "arguments"):
+                        fval = fn.get(fk)
+                        if isinstance(fval, str) and fval:
+                            parts.append(fval)
+        audio = container.get("audio")
+        if isinstance(audio, dict) or isinstance(audio, Mapping):
+            transcript = audio.get("transcript")
+            if isinstance(transcript, str) and transcript:
+                parts.append(transcript)
+    return "".join(parts)
+
+
 def _extract_choice_output_text(obj: Mapping[str, Any]) -> str:
     """Extract all generated text and tool-call output across every choice."""
     choices = obj.get("choices")
@@ -829,40 +886,57 @@ def _extract_choice_output_text(obj: Mapping[str, Any]) -> str:
     for choice in choices:
         if not (isinstance(choice, dict) or isinstance(choice, Mapping)):
             continue
-        text_val = choice.get("text")
-        if isinstance(text_val, str) and text_val:
-            parts.append(text_val)
-        for container_key in ("delta", "message"):
-            container = choice.get(container_key)
-            if not (isinstance(container, dict) or isinstance(container, Mapping)):
-                continue
-            for text_key in ("content", "refusal", "reasoning_content", "reasoning"):
-                val = container.get(text_key)
-                if isinstance(val, str) and val:
-                    parts.append(val)
-            func_call = container.get("function_call")
-            if isinstance(func_call, dict) or isinstance(func_call, Mapping):
-                for fk in ("name", "arguments"):
-                    fval = func_call.get(fk)
-                    if isinstance(fval, str) and fval:
-                        parts.append(fval)
-            tool_calls = container.get("tool_calls")
-            if isinstance(tool_calls, list):
-                for tc in tool_calls:
-                    if not (isinstance(tc, dict) or isinstance(tc, Mapping)):
-                        continue
-                    fn = tc.get("function")
-                    if isinstance(fn, dict) or isinstance(fn, Mapping):
-                        for fk in ("name", "arguments"):
-                            fval = fn.get(fk)
-                            if isinstance(fval, str) and fval:
-                                parts.append(fval)
-            audio = container.get("audio")
-            if isinstance(audio, dict) or isinstance(audio, Mapping):
-                transcript = audio.get("transcript")
-                if isinstance(transcript, str) and transcript:
-                    parts.append(transcript)
+        txt = _extract_single_choice_output_text(choice)
+        if txt:
+            parts.append(txt)
     return "".join(parts)
+
+
+def _extract_choice_output_char_counts(obj: Mapping[str, Any]) -> Dict[int, int]:
+    """Return `{choice_index: char_count}` for generated output text in `obj`."""
+    choices = obj.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return {}
+    counts: Dict[int, int] = {}
+    for pos, choice in enumerate(choices):
+        if not (isinstance(choice, dict) or isinstance(choice, Mapping)):
+            continue
+        txt = _extract_single_choice_output_text(choice)
+        if not txt:
+            continue
+        c_idx = choice.get("index")
+        resolved_idx = (
+            c_idx
+            if isinstance(c_idx, int) and not isinstance(c_idx, bool) and c_idx >= 0
+            else pos
+        )
+        counts[resolved_idx] = counts.get(resolved_idx, 0) + len(txt)
+    return counts
+
+
+def _subtract_echoed_prompt_chars(
+    chars_by_choice: Mapping[int, int],
+    echo_prompt_chars: Sequence[int],
+    *,
+    required_choices: int = 1,
+    prompt_batch_size: int = 1,
+) -> int:
+    """Subtract echoed prompt character lengths from per-choice completion character totals."""
+    if not echo_prompt_chars:
+        return sum(chars_by_choice.values())
+    eff_batch = max(1, prompt_batch_size)
+    n_per_prompt = max(1, max(1, required_choices) // eff_batch)
+    adjusted = 0
+    for c_idx, c_chars in chars_by_choice.items():
+        p_slot = c_idx // n_per_prompt
+        if 0 <= p_slot < len(echo_prompt_chars):
+            echo_len = echo_prompt_chars[p_slot]
+        elif len(echo_prompt_chars) == 1:
+            echo_len = echo_prompt_chars[0]
+        else:
+            echo_len = 0
+        adjusted += max(0, c_chars - echo_len)
+    return adjusted
 
 
 def _has_choice_audio_output(obj: Mapping[str, Any]) -> bool:
@@ -944,6 +1018,9 @@ def _extract_non_stream_usage(
     est_prompt_tokens: int,
     *,
     parsed_resp: Optional[Mapping[str, Any]] = None,
+    echo_prompt_chars: Sequence[int] = (),
+    expected_choices: int = 1,
+    prompt_batch_size: int = 1,
 ) -> Tuple[int, int]:
     """Extract `(prompt_tokens, completion_tokens)` preferring upstream counts."""
     prompt_tokens = est_prompt_tokens
@@ -984,9 +1061,19 @@ def _extract_non_stream_usage(
                 saw_completion = True
 
     if not saw_completion:
-        output_txt = _extract_choice_output_text(parsed_resp)
-        if output_txt:
-            completion_tokens = max(1, (len(output_txt) + 3) // 4)
+        if echo_prompt_chars:
+            adjusted_chars = _subtract_echoed_prompt_chars(
+                _extract_choice_output_char_counts(parsed_resp),
+                echo_prompt_chars,
+                required_choices=expected_choices,
+                prompt_batch_size=prompt_batch_size,
+            )
+            if adjusted_chars > 0:
+                completion_tokens = max(1, (adjusted_chars + 3) // 4)
+        else:
+            output_txt = _extract_choice_output_text(parsed_resp)
+            if output_txt:
+                completion_tokens = max(1, (len(output_txt) + 3) // 4)
 
     return prompt_tokens, completion_tokens
 
@@ -3684,6 +3771,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 est_prompt_tokens,
                 expected_choices,
                 prompt_batch_size,
+                echo_prompt_chars,
                 expect_final_usage,
             ) = parsed_fields
             # All decoded JSON containers went out of scope inside
@@ -3702,6 +3790,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 expected_choices,
                 ctx,
                 prompt_batch_size=prompt_batch_size,
+                echo_prompt_chars=echo_prompt_chars,
                 expect_final_usage=expect_final_usage,
             )
         finally:
@@ -3720,6 +3809,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         auth_ctx: AuthContext,
         *,
         prompt_batch_size: int = 1,
+        echo_prompt_chars: Sequence[int] = (),
         expect_final_usage: bool = False,
     ) -> None:
         engine = self.server.engine
@@ -3876,6 +3966,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         model=model,
                         expected_choices=expected_choices,
                         prompt_batch_size=prompt_batch_size,
+                        echo_prompt_chars=echo_prompt_chars,
                         req_id=req_id,
                         req_start=req_start,
                         attempt_start=attempt_start,
@@ -4105,6 +4196,9 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                                 raw_resp,
                                                 est_prompt_tokens,
                                                 parsed_resp=loaded_resp,
+                                                echo_prompt_chars=echo_prompt_chars,
+                                                expected_choices=expected_choices,
+                                                prompt_batch_size=prompt_batch_size,
                                             )
                                         )
                                         del loaded_resp
@@ -4348,6 +4442,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         model: str,
         expected_choices: int,
         prompt_batch_size: int = 1,
+        echo_prompt_chars: Sequence[int] = (),
         req_id: str,
         req_start: float,
         attempt_start: float,
@@ -4619,6 +4714,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             prompt_tokens = est_prompt_tokens
             completion_tokens = 0
             est_completion_chars = 0
+            est_completion_chars_by_choice: Dict[int, int] = {}
             saw_explicit_prompt_usage = False
             saw_explicit_completion_usage = False
             saw_interim_usage = False
@@ -4742,6 +4838,13 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                 first_content_ttft_ms = (time.monotonic() - req_start) * 1000.0
                             if output_txt:
                                 est_completion_chars += len(output_txt)
+                                if echo_prompt_chars:
+                                    for c_idx, c_len in _extract_choice_output_char_counts(
+                                        obj
+                                    ).items():
+                                        est_completion_chars_by_choice[c_idx] = (
+                                            est_completion_chars_by_choice.get(c_idx, 0) + c_len
+                                        )
                         usage = obj.get("usage")
                         if isinstance(usage, dict):
                             pt = _safe_nonneg_int(usage.get("prompt_tokens"))
@@ -5283,9 +5386,18 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             if (
                 not saw_explicit_completion_usage
                 and not saw_timings_completion
-                and est_completion_chars > 0
             ):
-                completion_tokens = max(1, (est_completion_chars + 3) // 4)
+                if echo_prompt_chars:
+                    adjusted_completion_chars = _subtract_echoed_prompt_chars(
+                        est_completion_chars_by_choice,
+                        echo_prompt_chars,
+                        required_choices=required_choices,
+                        prompt_batch_size=effective_prompt_batch_size,
+                    )
+                else:
+                    adjusted_completion_chars = est_completion_chars
+                if adjusted_completion_chars > 0:
+                    completion_tokens = max(1, (adjusted_completion_chars + 3) // 4)
             total_ms = (time.monotonic() - req_start) * 1000.0
             attempt_ms = (time.monotonic() - attempt_start) * 1000.0
             effective_ttft = (

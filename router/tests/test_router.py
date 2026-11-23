@@ -11,7 +11,10 @@ import io
 import json
 import os
 from pathlib import Path
-import resource
+try:
+    import resource
+except ImportError:
+    resource = None  # type: ignore[assignment]
 import select
 import socket
 import ssl
@@ -6734,7 +6737,7 @@ asyncio.run(main())
             asyncio.run(run_batch(rport, 1))
 
             soft_nofile: Optional[int] = None
-            if hasattr(resource, "RLIMIT_NOFILE"):
+            if resource is not None and hasattr(resource, "RLIMIT_NOFILE"):
                 try:
                     soft_nofile, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
                 except (OSError, ValueError):
@@ -7376,7 +7379,12 @@ asyncio.run(main())
             cli_w2.close()
 
         # 3. Real OS FD >= 1024 test when RLIMIT_NOFILE permits.
-        soft_lim, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+        soft_lim = 0
+        if resource is not None and hasattr(resource, "RLIMIT_NOFILE"):
+            try:
+                soft_lim, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+            except (OSError, ValueError):
+                soft_lim = 0
         if soft_lim > 1060 and hasattr(select, "poll"):
             s_r, s_w = socket.socketpair()
             high_fd: Optional[int] = None
@@ -11661,11 +11669,7 @@ asyncio.run(main())
         from router import freetpu_router as router_mod
 
         self.assertEqual(config_mod.DEFAULT_MAX_CONCURRENT_CONNECTIONS, 256)
-        try:
-            import resource
-        except ImportError:
-            resource = None  # type: ignore[assignment]
-        if resource is not None:
+        if resource is not None and hasattr(resource, "RLIMIT_NOFILE"):
             with mock.patch.object(
                 resource, "getrlimit", return_value=(1024, 4096)
             ):
@@ -11859,6 +11863,207 @@ asyncio.run(main())
             s2.close()
             c1.close()
             c2.close()
+
+    def test_completions_echo_true_excludes_echoed_prompt_from_fallback_completion_cost(
+        self,
+    ) -> None:
+        recorded_usage: List[UsageEvent] = []
+
+        class _RecordHook:
+            def record_usage(self, event: UsageEvent) -> None:
+                recorded_usage.append(event)
+
+        long_prompt = "P" * 400
+        mode = ["stream_echo_only"]
+
+        class _EchoCompletionsHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return None
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = json.dumps(
+                    {"object": "list", "data": [{"id": "m-echo"}]}
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802
+                clen = int(self.headers.get("Content-Length", "0"))
+                if clen > 0:
+                    self.rfile.read(clen)
+                if mode[0] == "non_stream_echo_only":
+                    body = json.dumps(
+                        {
+                            "id": "cmpl-echo-ns",
+                            "object": "text_completion",
+                            "model": "m-echo",
+                            "choices": [
+                                {"index": 0, "text": long_prompt, "finish_reason": "length"}
+                            ],
+                        }
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                if mode[0] == "stream_echo_only":
+                    ev = json.dumps(
+                        {
+                            "id": "cmpl-echo-1",
+                            "object": "text_completion",
+                            "choices": [
+                                {"index": 0, "text": long_prompt, "finish_reason": "length"}
+                            ],
+                        }
+                    ).encode("utf-8")
+                    self.wfile.write(b"data: " + ev + b"\n\ndata: [DONE]\n\n")
+                elif mode[0] == "stream_echo_plus_suffix":
+                    ev1 = json.dumps(
+                        {
+                            "id": "cmpl-echo-2",
+                            "object": "text_completion",
+                            "choices": [
+                                {"index": 0, "text": long_prompt, "finish_reason": None}
+                            ],
+                        }
+                    ).encode("utf-8")
+                    ev2 = json.dumps(
+                        {
+                            "id": "cmpl-echo-2",
+                            "object": "text_completion",
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "text": " generated reply",
+                                    "finish_reason": "stop",
+                                }
+                            ],
+                        }
+                    ).encode("utf-8")
+                    self.wfile.write(
+                        b"data: " + ev1 + b"\n\ndata: " + ev2 + b"\n\ndata: [DONE]\n\n"
+                    )
+                else:
+                    ev = json.dumps(
+                        {
+                            "id": "cmpl-echo-3",
+                            "object": "text_completion",
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "text": long_prompt + " generated reply",
+                                    "finish_reason": "stop",
+                                }
+                            ],
+                            "usage": {
+                                "prompt_tokens": 95,
+                                "completion_tokens": 7,
+                                "total_tokens": 102,
+                            },
+                        }
+                    ).encode("utf-8")
+                    self.wfile.write(b"data: " + ev + b"\n\ndata: [DONE]\n\n")
+                self.wfile.flush()
+
+        srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _EchoCompletionsHandler))
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            backends=[
+                BackendConfig(
+                    id="echo-b",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=f"http://127.0.0.1:{srv.server_address[1]}/v1",
+                    models=["m-echo"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg, usage_hook=_RecordHook()))
+        rport = router.server_address[1]
+
+        # 1. Echo-only streaming scoring (no usage/timings): 0 completion tokens.
+        st1, _, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/completions",
+            body={
+                "model": "m-echo",
+                "prompt": long_prompt,
+                "echo": True,
+                "max_tokens": 0,
+                "stream": True,
+            },
+        )
+        self.assertEqual(st1, 200)
+        self.assertEqual(recorded_usage[0].prompt_tokens, 100)
+        self.assertEqual(recorded_usage[0].completion_tokens, 0)
+
+        # 2. Echo + 16-char suffix streaming (no usage/timings): only suffix counted (4 tokens).
+        mode[0] = "stream_echo_plus_suffix"
+        st2, _, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/completions",
+            body={
+                "model": "m-echo",
+                "prompt": long_prompt,
+                "echo": True,
+                "stream": True,
+            },
+        )
+        self.assertEqual(st2, 200)
+        self.assertEqual(recorded_usage[1].completion_tokens, 4)
+
+        # 3. Explicit upstream usage still takes precedence over echo-adjusted fallback.
+        mode[0] = "stream_echo_explicit_usage"
+        st3, _, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/completions",
+            body={
+                "model": "m-echo",
+                "prompt": long_prompt,
+                "echo": True,
+                "stream": True,
+            },
+        )
+        self.assertEqual(st3, 200)
+        self.assertEqual(recorded_usage[2].prompt_tokens, 95)
+        self.assertEqual(recorded_usage[2].completion_tokens, 7)
+
+        # 4. Non-streaming echo-only scoring (no usage/timings): 0 completion tokens.
+        mode[0] = "non_stream_echo_only"
+        st4, _, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/completions",
+            body={
+                "model": "m-echo",
+                "prompt": long_prompt,
+                "echo": True,
+                "max_tokens": 0,
+                "stream": False,
+            },
+        )
+        self.assertEqual(st4, 200)
+        self.assertEqual(recorded_usage[3].completion_tokens, 0)
 
 
 def run_self_tests(verbosity: int = 1) -> int:
