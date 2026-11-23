@@ -4524,8 +4524,143 @@ void test_continuous_batching_padded_buckets() {
                    "tiny KV_CAP==T cache must stay unbucketed while mixed_embd buckets to ax=2");
     }
 
+    // 4) Reshaped S64 SET_ROWS index propagates NEG_ONE to the underlying input (0 overwrite of KV row 0),
+    //    while non-shape computed indices and ZERO/NEG_ONE pad conflicts fail closed.
+    {
+        const int64_t T = 5, B = 8, KV_R = 16, D_R = 4;
+        cloudtpu::GraphProgramSpec rspec;
+        rspec.inputs.push_back({1, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, T, D_R}});
+        rspec.inputs.push_back({2, cloudtpu::PjrtDType::S64, cloudtpu::TensorStorageKind::DENSE, {1, 1, T, 1}});
+        cloudtpu::TensorSpec kv_in{3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, KV_R, D_R}};
+        kv_in.alias_output_idx = 0;
+        rspec.inputs.push_back(kv_in);
+
+        cloudtpu::OpNodeSpec rsh;
+        rsh.kind = cloudtpu::CloudOpKind::RESHAPE;
+        rsh.src_ids = {2};
+        rsh.dst = {4, cloudtpu::PjrtDType::S64, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, T}};
+        rspec.ops.push_back(rsh);
+
+        cloudtpu::OpNodeSpec sr;
+        sr.kind = cloudtpu::CloudOpKind::SET_ROWS;
+        sr.src_ids = {1, 4, 3};
+        sr.dst = {5, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, KV_R, D_R}};
+        rspec.ops.push_back(sr);
+        rspec.output_ids = {5};
+
+        const cloudtpu::BucketAnalysisResult rplan = cloudtpu::analyze_program_token_axes(rspec, T, B);
+        CHECK_TRUE(rplan.success, "reshaped S64 SET_ROWS index must bucket cleanly");
+        CHECK_TRUE(rplan.input_token_axis[1] == 2 && rplan.input_pad_kind[1] == cloudtpu::TokenInputPadKind::NEG_ONE,
+                   "reshaped S64 SET_ROWS index must propagate NEG_ONE pad kind to underlying input");
+
+        cloudtpu::GraphProgramSpec bspec = rspec;
+        CHECK_TRUE(cloudtpu::apply_program_batch_bucket(bspec, rplan), "apply_program_batch_bucket for reshaped SET_ROWS");
+        const cloudtpu::EmittedProgram bprog = cloudtpu::emit_stablehlo_program(bspec);
+
+        std::vector<float> upd(static_cast<size_t>(T * D_R));
+        for (size_t i = 0; i < upd.size(); ++i) upd[i] = 10.0f + static_cast<float>(i);
+        const std::vector<int64_t> raw_idx = {2, 5, 7, 10, 12};
+        std::vector<float> kv_init(static_cast<size_t>(KV_R * D_R));
+        for (size_t i = 0; i < kv_init.size(); ++i) kv_init[i] = -77.5f - static_cast<float>(i);
+
+        const int64_t upd_orig[4] = {1, 1, T, D_R};
+        const int64_t upd_pdims[4] = {1, 1, B, D_R};
+        std::vector<float> upd_pad(static_cast<size_t>(B * D_R), 0.0f);
+        cloudtpu::pad_dense_host_tensor(
+            upd.data(), upd_pad.data(), cloudtpu::PjrtDType::F32, upd_orig, upd_pdims,
+            rplan.input_token_axis[0], rplan.input_pad_kind[0]);
+
+        const int64_t idx_orig[4] = {1, 1, T, 1};
+        const int64_t idx_pdims[4] = {1, 1, B, 1};
+        std::vector<int64_t> idx_pad(static_cast<size_t>(B), 0);
+        cloudtpu::pad_dense_host_tensor(
+            raw_idx.data(), idx_pad.data(), cloudtpu::PjrtDType::S64, idx_orig, idx_pdims,
+            rplan.input_token_axis[1], rplan.input_pad_kind[1]);
+        auto b_upd = rt.buffer_from_host(0, upd_pad.data(), cloudtpu::PjrtDType::F32, {1, 1, B, D_R});
+        auto b_idx = rt.buffer_from_host(0, idx_pad.data(), cloudtpu::PjrtDType::S64, {1, 1, B, 1});
+        auto b_kv = rt.buffer_from_host(0, kv_init.data(), cloudtpu::PjrtDType::F32, {1, 1, KV_R, D_R});
+
+        const auto copts = rt.make_spmd_compile_options(1, 0, false);
+        const auto exec = rt.compile_or_get(bprog.cache_key, bprog.mlir_text, 0, copts);
+        std::vector<PJRT_Buffer*> raw_in = {b_upd->handle.get(), b_idx->handle.get(), b_kv->handle.get()};
+        std::vector<cloudtpu::PjrtBufferPtr> outs;
+        rt.execute(exec, 0, raw_in.data(), raw_in.size(), outs,
+                   {cloudtpu::PjrtDType::F32}, {{1, 1, KV_R, D_R}}, true);
+        std::vector<float> kv_after(static_cast<size_t>(KV_R * D_R), 0.0f);
+        rt.buffer_to_host(outs[0]->handle.get(), kv_after.data(), kv_after.size() * sizeof(float));
+
+        for (int64_t r = 0; r < KV_R; ++r) {
+            int64_t match_t = -1;
+            for (int64_t t = 0; t < T; ++t) {
+                if (raw_idx[static_cast<size_t>(t)] == r) match_t = t;
+            }
+            for (int64_t d = 0; d < D_R; ++d) {
+                const size_t off = static_cast<size_t>(r * D_R + d);
+                const float exp = (match_t >= 0) ? upd[static_cast<size_t>(match_t * D_R + d)] : kv_init[off];
+                CHECK_NEAR(kv_after[off], exp, 1e-5f,
+                           "reshaped SET_ROWS index NEG_ONE padding must preserve KV row 0 and all untouched rows");
+            }
+        }
+
+        // Non-shape computed index (ADD) must fail closed instead of zero-padding and overwriting KV row 0
+        cloudtpu::GraphProgramSpec cspec;
+        cspec.inputs.push_back({1, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, T, D_R}});
+        cspec.inputs.push_back({2, cloudtpu::PjrtDType::S32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, T}});
+        cspec.inputs.push_back({3, cloudtpu::PjrtDType::S32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 1}});
+        cloudtpu::TensorSpec ckv{4, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, KV_R, D_R}};
+        ckv.alias_output_idx = 0;
+        cspec.inputs.push_back(ckv);
+        cloudtpu::OpNodeSpec add_idx;
+        add_idx.kind = cloudtpu::CloudOpKind::ADD;
+        add_idx.src_ids = {2, 3};
+        add_idx.dst = {5, cloudtpu::PjrtDType::S32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, T}};
+        cspec.ops.push_back(add_idx);
+        cloudtpu::OpNodeSpec csr;
+        csr.kind = cloudtpu::CloudOpKind::SET_ROWS;
+        csr.src_ids = {1, 5, 4};
+        csr.dst = {6, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, KV_R, D_R}};
+        cspec.ops.push_back(csr);
+        cspec.output_ids = {6};
+        const cloudtpu::BucketAnalysisResult cplan = cloudtpu::analyze_program_token_axes(cspec, T, B);
+        CHECK_TRUE(!cplan.success && cplan.fail_reason.find("neg_one_computed_index") != std::string::npos,
+                   "computed ADD SET_ROWS index must fail closed with neg_one_computed_index");
+
+        // Conflicting ZERO (ROPE pos) + NEG_ONE (SET_ROWS idx) on the same reshaped input must fail closed
+        cloudtpu::GraphProgramSpec conflict_spec;
+        conflict_spec.inputs.push_back({1, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, T, 1, D_R}});
+        conflict_spec.inputs.push_back({2, cloudtpu::PjrtDType::S32, cloudtpu::TensorStorageKind::DENSE, {1, 1, T, 1}});
+        cloudtpu::TensorSpec xkv{3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, KV_R, D_R}};
+        xkv.alias_output_idx = 0;
+        conflict_spec.inputs.push_back(xkv);
+        cloudtpu::OpNodeSpec r_pos;
+        r_pos.kind = cloudtpu::CloudOpKind::RESHAPE;
+        r_pos.src_ids = {2};
+        r_pos.dst = {4, cloudtpu::PjrtDType::S32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, T}};
+        conflict_spec.ops.push_back(r_pos);
+        cloudtpu::OpNodeSpec rope_op;
+        rope_op.kind = cloudtpu::CloudOpKind::ROPE;
+        rope_op.src_ids = {1, 4};
+        rope_op.dst = {5, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, T, 1, D_R}};
+        rope_op.rope.n_dims = static_cast<int32_t>(D_R);
+        conflict_spec.ops.push_back(rope_op);
+        cloudtpu::OpNodeSpec flat_op;
+        flat_op.kind = cloudtpu::CloudOpKind::RESHAPE;
+        flat_op.src_ids = {5};
+        flat_op.dst = {6, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, T, D_R}};
+        conflict_spec.ops.push_back(flat_op);
+        cloudtpu::OpNodeSpec xsr;
+        xsr.kind = cloudtpu::CloudOpKind::SET_ROWS;
+        xsr.src_ids = {6, 4, 3};
+        xsr.dst = {7, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, KV_R, D_R}};
+        conflict_spec.ops.push_back(xsr);
+        conflict_spec.output_ids = {7};
+        const cloudtpu::BucketAnalysisResult xplan = cloudtpu::analyze_program_token_axes(conflict_spec, T, B);
+        CHECK_TRUE(!xplan.success && xplan.fail_reason.find("pad_kind_conflict") != std::string::npos,
+                   "shared reshaped input with ZERO (ROPE) and NEG_ONE (SET_ROWS) must fail closed");
+    }
+
     rt.shutdown();
-    std::printf("  [PASS] Continuous batching padded buckets (T=5..8 -> B=8 + N_out<T + mixed_embd SET_ROWS: misses=1, hits=3, parity < 1e-4, 0 KV corruption)\n");
+    std::printf("  [PASS] Continuous batching padded buckets (T=5..8 -> B=8 + N_out<T + mixed_embd + reshaped SET_ROWS: misses=1, hits=3, parity < 1e-4, 0 KV corruption)\n");
 }
 
 #ifdef CLOUDTPU_HAS_GGML

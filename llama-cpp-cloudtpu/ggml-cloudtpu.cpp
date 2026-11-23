@@ -49,7 +49,7 @@ struct cloudtpu_env_config {
     CloudTpuQ4Mode q4_mode = CloudTpuQ4Mode::I4;  // Single-read S4/U4 default (overridden by CLOUDTPU_Q4_MODE / CLOUDTPU_Q4_SPLIT_DOT)
     bool q4_split_dot = true;       // Q4_0/Q4_K SPLIT vs CONCAT selection when q4_mode is SPLIT/CONCAT
     bool q4k_u4 = false;            // Q4_K I4/BITCAST: false = shifted S4 (m_eff += 8*d_eff), true = U4 (0..15)
-    bool q4k_bf16_scales = true;    // True BF16 Q4_K/Q6_K scales (default on; CLOUDTPU_Q4K_BF16_SCALES=0 -> F32 fallback)
+    bool q4k_bf16_scales = false;   // Opt-in hardware BF16 Q4_K/Q6_K scales (default false: full F32 scale precision for GET_ROWS parity)
     int32_t mm_pad_m = 8;           // Pad small BF16 Q4_*_I4/Q6_K_SPLIT M < mm_pad_m up to mm_pad_m for MXU (<=1 disables)
     bool async_collectives = false; // Opt-in LIBTPU_INIT_ARGS TPU async collective overlap flags before libtpu init
     uint32_t cache_cap = 4096;
@@ -590,7 +590,7 @@ struct ggml_backend_cloudtpu_buffer_context {
     int device_index = 0;
     int spmd_chips = 1;
     int spmd_min_rows = 256;
-    bool q4k_bf16_scales = true;
+    bool q4k_bf16_scales = false;
     CloudTpuQ4Mode q4_mode = CloudTpuQ4Mode::I4;
     bool q4k_u4 = false;
     uintptr_t virtual_base = 0;
@@ -1346,7 +1346,7 @@ static void upload_raw_tensor_to_slot(cloudtpu::PjrtRuntime& rt,
                                       const void* raw_data,
                                       bool allow_sharding = true,
                                       const cloudtpu::TensorShardingKind* forced_sharding = nullptr,
-                                      bool q4k_bf16_scales = true,
+                                      bool q4k_bf16_scales = false,
                                       CloudTpuQ4Mode q4_mode = CloudTpuQ4Mode::I4,
                                       bool q4k_u4 = false) {
     slot.ggml_dt = tensor->type;
@@ -2236,7 +2236,7 @@ struct cloudtpu_buft_context {
     int device_index = 0;
     int spmd_chips = 1;
     int spmd_min_rows = 256;
-    bool q4k_bf16_scales = true;
+    bool q4k_bf16_scales = false;
     CloudTpuQ4Mode q4_mode = CloudTpuQ4Mode::I4;
     bool q4k_u4 = false;
     std::string name;

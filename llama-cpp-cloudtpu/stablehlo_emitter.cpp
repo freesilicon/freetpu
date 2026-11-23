@@ -2097,6 +2097,7 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
         bool is_donated = false;
         bool allow_pre_padded = false;
         TensorShardingKind sharding = TensorShardingKind::REPLICATED;
+        int producer_op_idx = -1;
         int ax = -2;  // -2 = unknown, -1 = batch-invariant, 0..3 = token axis
         TokenInputPadKind pad = TokenInputPadKind::NONE;
     };
@@ -2129,7 +2130,8 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
         if (in.id > max_id) max_id = in.id;
     }
 
-    for (const OpNodeSpec& op : spec.ops) {
+    for (size_t oi = 0; oi < spec.ops.size(); ++oi) {
+        const OpNodeSpec& op = spec.ops[oi];
         if (op.dst.id == 0 || id_to_idx.count(op.dst.id)) {
             return fail_with("invalid_op_dst_id");
         }
@@ -2142,6 +2144,7 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
         vi.is_external = false;
         vi.is_dense = (op.dst.storage == TensorStorageKind::DENSE);
         vi.sharding = op.keep_sharded_out ? TensorShardingKind::SHARD_K : TensorShardingKind::REPLICATED;
+        vi.producer_op_idx = static_cast<int>(oi);
         id_to_idx[op.dst.id] = vals.size();
         vals.push_back(vi);
         if (op.dst.id > max_id) max_id = op.dst.id;
@@ -2210,21 +2213,60 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
     };
 
     auto set_pad = [&](size_t idx, TokenInputPadKind kind) -> bool {
-        ValInfo& vi = vals[idx];
-        if (!vi.is_external || kind == TokenInputPadKind::NONE) {
+        if (kind == TokenInputPadKind::NONE) {
             return true;
         }
-        if (kind == TokenInputPadKind::NEG_ONE &&
-            vi.dtype != PjrtDType::S32 && vi.dtype != PjrtDType::S64) {
-            note_reason("neg_one_invalid_dtype");
-            return false;
+        size_t cur = idx;
+        for (size_t depth = 0; depth <= spec.ops.size(); ++depth) {
+            ValInfo& vi = vals[cur];
+            if (kind == TokenInputPadKind::NEG_ONE &&
+                vi.dtype != PjrtDType::S32 && vi.dtype != PjrtDType::S64) {
+                note_reason("neg_one_invalid_dtype");
+                return false;
+            }
+            if (vi.is_external) {
+                if (vi.pad == TokenInputPadKind::NONE) {
+                    vi.pad = kind;
+                    return true;
+                }
+                if (vi.pad != kind) {
+                    note_reason("pad_kind_conflict");
+                    return false;
+                }
+                return true;
+            }
+            if (vi.producer_op_idx < 0 || static_cast<size_t>(vi.producer_op_idx) >= spec.ops.size()) {
+                if (kind == TokenInputPadKind::NEG_ONE) {
+                    note_reason("neg_one_computed_index");
+                    return false;
+                }
+                return true;
+            }
+            const OpNodeSpec& prod = spec.ops[static_cast<size_t>(vi.producer_op_idx)];
+            const bool value_preserving_shape_op =
+                (prod.kind == CloudOpKind::RESHAPE ||
+                 prod.kind == CloudOpKind::CPY ||
+                 prod.kind == CloudOpKind::TRANSPOSE ||
+                 prod.kind == CloudOpKind::SLICE);
+            if (!value_preserving_shape_op || prod.src_ids.empty()) {
+                if (kind == TokenInputPadKind::NEG_ONE) {
+                    note_reason("neg_one_computed_index");
+                    return false;
+                }
+                return true;
+            }
+            size_t src_i = 0;
+            if (!lookup_idx(prod.src_ids[0], &src_i)) {
+                if (kind == TokenInputPadKind::NEG_ONE) {
+                    note_reason("neg_one_computed_index");
+                    return false;
+                }
+                return true;
+            }
+            cur = src_i;
         }
-        if (vi.pad == TokenInputPadKind::NONE) {
-            vi.pad = kind;
-            return true;
-        }
-        if (vi.pad != kind) {
-            note_reason("pad_kind_conflict");
+        if (kind == TokenInputPadKind::NEG_ONE) {
+            note_reason("neg_one_computed_index");
             return false;
         }
         return true;
@@ -2781,6 +2823,8 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
             }
             out.input_token_axis[i] = vi.ax;
             out.input_pad_kind[i] = (vi.pad == TokenInputPadKind::NONE) ? TokenInputPadKind::ZERO : vi.pad;
+        } else if (vi.pad == TokenInputPadKind::NEG_ONE) {
+            return fail_with("neg_one_unbucketed_input");
         }
     }
 
