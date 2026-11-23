@@ -1604,14 +1604,7 @@ PJRT_Error* ot_pjrt_buffer_from_host_buffer(PJRT_Client_BufferFromHostBuffer_Arg
         return up_err;
       }
     } else {
-      const bool is_128x128_bf16 =
-          (args->type == PJRT_Buffer_Type_BF16 && args->num_dims == 2u &&
-           args->dims[0] == 128 && args->dims[1] == 128);
-      if (is_128x128_bf16) {
-        st = ot::buffer_h2d_tiled_128x128_bf16(args->client->ctx, ot_buf, args->data);
-      } else {
-        st = ot_buffer_h2d(args->client->ctx, ot_buf, args->data, logical_bytes);
-      }
+      st = ot_buffer_h2d(args->client->ctx, ot_buf, args->data, logical_bytes);
       if (st != OT_OK) {
         ot_buffer_free(ot_buf);
         return make_ot_err(args->client->ctx, st);

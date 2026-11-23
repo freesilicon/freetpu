@@ -2,6 +2,7 @@ HOST_CC  ?= clang
 HOST_CXX ?= clang++
 HOST_AR  ?= ar
 
+STATIC_LIBSTDCPP ?= 0
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
   SHLIB_EXT := dylib
@@ -9,8 +10,13 @@ ifeq ($(UNAME_S),Darwin)
   EXE_LDFLAGS :=
 else
   SHLIB_EXT := so
-  SHLIB_FLAGS := -shared -static-libstdc++ -static-libgcc -Wl,--as-needed -Wl,--exclude-libs,ALL
-  EXE_LDFLAGS := -static-libstdc++ -static-libgcc -Wl,--as-needed
+  ifeq ($(STATIC_LIBSTDCPP),1)
+    SHLIB_FLAGS := -shared -static-libstdc++ -static-libgcc -Wl,--as-needed -Wl,--exclude-libs,ALL
+    EXE_LDFLAGS := -static-libstdc++ -static-libgcc -Wl,--as-needed
+  else
+    SHLIB_FLAGS := -shared -Wl,--as-needed
+    EXE_LDFLAGS := -Wl,--as-needed
+  endif
 endif
 
 THIS_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
