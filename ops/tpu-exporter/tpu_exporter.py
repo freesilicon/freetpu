@@ -846,23 +846,35 @@ def _run_tpu_info(
 _PY_METRICS_SUBPROCESS_HELPER = (
     "import inspect, json, sys, tpu_info.device as d, tpu_info.metrics as m\n"
     "chip_attr, addr, timeout_s = sys.argv[1], sys.argv[2], float(sys.argv[3])\n"
+    "layout = sys.argv[4] if len(sys.argv) > 4 else 'auto'\n"
     "chip = getattr(d.TpuChip, chip_attr)\n"
-    "fn = getattr(m, 'get_chip_usage_new', None) if chip_attr == 'V7X' else None\n"
-    "if not callable(fn):\n"
-    "    fn = m.get_chip_usage\n"
-    "sig = inspect.signature(fn)\n"
-    "kw = {}\n"
-    "if 'addr' in sig.parameters:\n"
-    "    kw['addr'] = addr\n"
-    "if 'timeout' in sig.parameters:\n"
-    "    kw['timeout'] = timeout_s\n"
-    "rows = fn(chip, **kw)\n"
+    "def _invoke(fn):\n"
+    "    sig = inspect.signature(fn)\n"
+    "    kw = {}\n"
+    "    if 'addr' in sig.parameters:\n"
+    "        kw['addr'] = addr\n"
+    "    if 'timeout' in sig.parameters:\n"
+    "        kw['timeout'] = timeout_s\n"
+    "    return fn(chip, **kw)\n"
+    "per_chip_fallback = False\n"
+    "new_fn = getattr(m, 'get_chip_usage_new', None) if chip_attr == 'V7X' else None\n"
+    "if chip_attr == 'V7X' and layout == 'per-chip':\n"
+    "    rows = _invoke(m.get_chip_usage)\n"
+    "elif callable(new_fn):\n"
+    "    try:\n"
+    "        rows = _invoke(new_fn)\n"
+    "    except (AssertionError, ValueError):\n"
+    "        rows = _invoke(m.get_chip_usage)\n"
+    "        per_chip_fallback = True\n"
+    "else:\n"
+    "    rows = _invoke(m.get_chip_usage)\n"
     "out = [\n"
     "    {\n"
     "        'device_id': getattr(r, 'device_id', None),\n"
     "        'memory_usage': getattr(r, 'memory_usage', None),\n"
     "        'total_memory': getattr(r, 'total_memory', None),\n"
     "        'duty_cycle_pct': getattr(r, 'duty_cycle_pct', None),\n"
+    "        '_per_chip_fallback': per_chip_fallback,\n"
     "    }\n"
     "    for r in (rows or [])\n"
     "]\n"
@@ -900,6 +912,9 @@ def _parse_runtime_device_id(raw: Any) -> Optional[int]:
 def _parse_python_usage_entries(
     entries: Iterable[Any],
     addr: str,
+    *,
+    per_chip_fallback: bool = False,
+    devices_per_chip: int = 2,
 ) -> Tuple[bool, Optional[str], Dict[str, _TpuInfoRow]]:
     rows: Dict[str, _TpuInfoRow] = {}
     for item in entries:
@@ -908,11 +923,13 @@ def _parse_python_usage_entries(
             mem_used = item.get("memory_usage")
             mem_total = item.get("total_memory")
             duty = item.get("duty_cycle_pct")
+            item_per_chip_fb = bool(item.get("_per_chip_fallback", per_chip_fallback))
         else:
             dev_id = getattr(item, "device_id", None)
             mem_used = getattr(item, "memory_usage", None)
             mem_total = getattr(item, "total_memory", None)
             duty = getattr(item, "duty_cycle_pct", None)
+            item_per_chip_fb = per_chip_fallback
         parsed_id = _parse_runtime_device_id(dev_id)
         if parsed_id is None:
             continue
@@ -939,7 +956,18 @@ def _parse_python_usage_entries(
             and math.isfinite(float(duty))
             and duty >= 0
         ):
-            row.duty_cycle_percent = float(duty)
+            if item_per_chip_fb and devices_per_chip > 1:
+                # `get_chip_usage` expanded per-chip duty rows after `get_chip_usage_new`
+                # failed with a row-count mismatch in `auto` mode: preserve ALL HBM rows
+                # and record the deduplicated raw chip-level duty readings as unjoined so
+                # we never misattribute an ambiguous reply across cores.
+                if parsed_id % devices_per_chip == 0:
+                    raw_chip_key = str(parsed_id // devices_per_chip)
+                    raw_row = rows.setdefault(raw_chip_key, _TpuInfoRow(chip_key=raw_chip_key))
+                    raw_row.in_util_table = True
+                    raw_row.unjoined_duty_cycle_percent = float(duty)
+            else:
+                row.duty_cycle_percent = float(duty)
 
     if not rows:
         return False, f"tpu_info.metrics returned no parseable chip entries from {addr}", {}
@@ -950,6 +978,7 @@ def _query_tpu_info_python_metrics(
     devices: Sequence[TpuTelemetry],
     addr: Optional[str] = "127.0.0.1:8431",
     timeout_s: float = 5.0,
+    grpc_duty_layout: str = "auto",
 ) -> Tuple[bool, Optional[str], Dict[str, _TpuInfoRow]]:
     """Query `libtpu` runtime HBM & duty-cycle metrics via `tpu_info.metrics` with a hard deadline.
 
@@ -972,6 +1001,7 @@ def _query_tpu_info_python_metrics(
             break
     if chip_attr is None:
         return False, "unable to map discovered TPU generation to tpu_info.device.TpuChip", {}
+    inferred_dpc = _infer_devices_per_chip(devices) or 2
 
     # Support in-memory mocked `tpu_info.metrics` modules in unit tests with a
     # bounded worker thread; for real installed packages, execute in an isolated
@@ -979,30 +1009,48 @@ def _query_tpu_info_python_metrics(
     cached_metrics_mod = sys.modules.get("tpu_info.metrics")
     if cached_metrics_mod is not None and not getattr(cached_metrics_mod, "__file__", None):
         tpu_device_mod = sys.modules.get("tpu_info.device")
-        get_chip_usage = (
+        get_chip_usage_new = (
             getattr(cached_metrics_mod, "get_chip_usage_new", None)
             if chip_attr == "V7X"
             else None
         )
-        if not callable(get_chip_usage):
-            get_chip_usage = getattr(cached_metrics_mod, "get_chip_usage", None)
+        get_chip_usage_legacy = getattr(cached_metrics_mod, "get_chip_usage", None)
         tpu_chip_enum = getattr(tpu_device_mod, "TpuChip", None) if tpu_device_mod is not None else None
-        if not callable(get_chip_usage) or tpu_chip_enum is None or not hasattr(tpu_chip_enum, chip_attr):
+        if (
+            (not callable(get_chip_usage_new) and not callable(get_chip_usage_legacy))
+            or tpu_chip_enum is None
+            or not hasattr(tpu_chip_enum, chip_attr)
+        ):
             return False, "tpu_info.metrics.get_chip_usage unavailable", {}
         chip_type = getattr(tpu_chip_enum, chip_attr)
 
         box: Dict[str, Any] = {}
         done_ev = threading.Event()
 
+        def _invoke_mock(fn: Any) -> Any:
+            sig = inspect.signature(fn)
+            kw: Dict[str, Any] = {}
+            if "addr" in sig.parameters:
+                kw["addr"] = addr
+            if "timeout" in sig.parameters:
+                kw["timeout"] = deadline_s
+            return fn(chip_type, **kw)
+
         def _worker() -> None:
             try:
-                sig = inspect.signature(get_chip_usage)
-                kw: Dict[str, Any] = {}
-                if "addr" in sig.parameters:
-                    kw["addr"] = addr
-                if "timeout" in sig.parameters:
-                    kw["timeout"] = deadline_s
-                box["rows"] = get_chip_usage(chip_type, **kw)
+                if chip_attr == "V7X" and grpc_duty_layout == "per-chip" and callable(get_chip_usage_legacy):
+                    box["rows"] = _invoke_mock(get_chip_usage_legacy)
+                elif callable(get_chip_usage_new):
+                    try:
+                        box["rows"] = _invoke_mock(get_chip_usage_new)
+                    except (AssertionError, ValueError):
+                        if callable(get_chip_usage_legacy):
+                            box["rows"] = _invoke_mock(get_chip_usage_legacy)
+                            box["per_chip_fallback"] = True
+                        else:
+                            raise
+                else:
+                    box["rows"] = _invoke_mock(get_chip_usage_legacy)
             except Exception as exc:  # noqa: BLE001
                 box["error"] = exc
             finally:
@@ -1017,7 +1065,12 @@ def _query_tpu_info_python_metrics(
         usage_list = box.get("rows")
         if not usage_list:
             return False, f"tpu_info.metrics returned no runtime usage rows from {addr}", {}
-        return _parse_python_usage_entries(usage_list, addr)
+        return _parse_python_usage_entries(
+            usage_list,
+            addr,
+            per_chip_fallback=bool(box.get("per_chip_fallback", False)),
+            devices_per_chip=inferred_dpc,
+        )
 
     try:
         if importlib.util.find_spec("tpu_info") is None:
@@ -1027,7 +1080,15 @@ def _query_tpu_info_python_metrics(
 
     try:
         proc = _run_subprocess_bounded(
-            [sys.executable, "-c", _PY_METRICS_SUBPROCESS_HELPER, chip_attr, addr, str(deadline_s)],
+            [
+                sys.executable,
+                "-c",
+                _PY_METRICS_SUBPROCESS_HELPER,
+                chip_attr,
+                addr,
+                str(deadline_s),
+                grpc_duty_layout,
+            ],
             timeout_s=deadline_s,
         )
     except subprocess.TimeoutExpired:
@@ -1047,7 +1108,7 @@ def _query_tpu_info_python_metrics(
 
     if not isinstance(parsed_json, list) or not parsed_json:
         return False, f"tpu_info.metrics returned no runtime usage rows from {addr}", {}
-    return _parse_python_usage_entries(parsed_json, addr)
+    return _parse_python_usage_entries(parsed_json, addr, devices_per_chip=inferred_dpc)
 
 
 _GRPC_CHANNEL_LOCK = threading.Lock()
@@ -2110,7 +2171,11 @@ def _sanitize_fallback_duty_rows(
     if not rows:
         return rows
     inferred_dpc = _infer_devices_per_chip(devices)
-    if inferred_dpc == 1:
+    # Apply the multi-core positional-zip guard ONLY when PCI inventory confirms
+    # a multi-core-per-chip host (`devices_per_chip > 1`); sidecars without PCI
+    # inventory (`inferred_dpc is None`) and single-core-per-chip generations
+    # (`v4`, `v5e`, `v5p`, `v6e`) preserve Python/CLI fallback duty readings.
+    if inferred_dpc is None or inferred_dpc <= 1:
         return rows
 
     expected_core_count: Optional[int] = None
@@ -2389,6 +2454,7 @@ def collect_snapshot(
                     devices,
                     addr=runtime_metrics_addr,
                     timeout_s=remaining_s,
+                    grpc_duty_layout=grpc_duty_layout,
                 )
                 if py_ok:
                     py_rows = _sanitize_fallback_duty_rows(py_rows, devices)
@@ -2484,6 +2550,7 @@ def collect_snapshot(
                     devices,
                     addr=runtime_metrics_addr,
                     timeout_s=remaining_s,
+                    grpc_duty_layout=grpc_duty_layout,
                 )
                 if py_ok:
                     py_rows = _sanitize_fallback_duty_rows(py_rows, devices)
@@ -2636,25 +2703,27 @@ def collect_snapshot(
         if not _is_unjoined_duty_covered(key)
     }
 
-    # Unjoined duty-cycle telemetry is marked complete (`1`) ONLY when we have
-    # verified PCI hardware inventory establishing the host's logical runtime
-    # device count, every logical device on the host has a duty reading, AND
-    # every runtime row with positive HBM allocation is covered — preventing
-    # partial unjoined replies (e.g. an idle TPU's duty + a different busy TPU's
-    # HBM whose duty sample is missing) from triggering critical collapse alerts.
-    expected_logical_devices: Optional[int] = None
+    # Unjoined duty-cycle telemetry is marked complete (`1`) when verified PCI
+    # hardware inventory establishes the host's physical chip count, unjoined
+    # readings cover at least every physical chip on the host (e.g. all 4 chips
+    # on a 4-chip Ironwood host, where `> 4` IDs already join directly as
+    # `per_core`), AND every runtime row with positive HBM allocation is covered
+    # (either directly by key or via its physical chip `core_id // dpc`). Partial
+    # replies (e.g. 1 idle chip's duty + a different busy chip's HBM whose duty
+    # sample is missing) and sidecars without PCI inventory stay `0`.
+    expected_physical_chips: Optional[int] = None
     if inferred_dpc == 1 and devices:
-        expected_logical_devices = len(devices)
+        expected_physical_chips = len(devices)
     elif inferred_dpc is not None and inferred_dpc > 1 and devices:
         verified_chips_for_unjoined = _verified_dual_function_chip_count(devices, inferred_dpc)
         if verified_chips_for_unjoined is not None:
-            expected_logical_devices = verified_chips_for_unjoined * inferred_dpc
+            expected_physical_chips = verified_chips_for_unjoined
         else:
             known_gens_unjoined = {
                 d.generation for d in devices if d.generation in _GEN_DEVICES_PER_CHIP
             }
             if known_gens_unjoined and known_gens_unjoined <= {"v2", "v3", "v2-v3"} and len(devices) >= 4:
-                expected_logical_devices = len(devices) * inferred_dpc
+                expected_physical_chips = len(devices)
 
     active_hbm_keys = {
         key
@@ -2662,11 +2731,21 @@ def collect_snapshot(
         if row.hbm_used_bytes is not None and row.hbm_used_bytes > 0
     }
     covered_duty_keys = set(runtime_unjoined_duty.keys()) | joined_duty_keys
+
+    def _active_hbm_key_covered(hbm_key: str) -> bool:
+        if hbm_key in covered_duty_keys:
+            return True
+        if inferred_dpc is not None and inferred_dpc > 1:
+            parsed_hid = _parse_runtime_device_id(hbm_key)
+            if parsed_hid is not None and str(parsed_hid // inferred_dpc) in runtime_unjoined_duty:
+                return True
+        return False
+
     runtime_unjoined_duty_complete = bool(
         runtime_unjoined_duty
-        and expected_logical_devices is not None
-        and len(runtime_unjoined_duty) >= expected_logical_devices
-        and active_hbm_keys.issubset(covered_duty_keys)
+        and expected_physical_chips is not None
+        and len(runtime_unjoined_duty) >= expected_physical_chips
+        and all(_active_hbm_key_covered(k) for k in active_hbm_keys)
     )
 
     gcp_preempted: Optional[int] = None
@@ -2993,7 +3072,7 @@ def format_prometheus_metrics(snapshot: ExporterSnapshot) -> str:
         )
         add_metric(
             "freetpu_tpu_runtime_unjoined_duty_cycle_complete",
-            "Whether unjoined runtime duty-cycle readings cover all verified host TPU logical devices and active HBM allocations (1 = complete, 0 = partial/unverified).",
+            "Whether unjoined runtime duty-cycle readings cover all verified host physical TPU chips and active HBM allocations (1 = complete, 0 = partial/unverified).",
             "gauge",
             [({}, "1" if snapshot.runtime_unjoined_duty_cycle_complete else "0")],
         )

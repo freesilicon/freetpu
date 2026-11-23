@@ -2752,6 +2752,11 @@ TPU Runtime Utilization
                 iw_auto_snap.runtime_unjoined_duty_cycle,
                 {"0": 12.5, "1": 37.5, "2": 62.5, "3": 87.5},
             )
+            # Complete 4-chip unjoined reply covering all 4 physical chips and all
+            # 8 active HBM cores MUST mark unjoined duty coverage complete (`1`)!
+            self.assertTrue(iw_auto_snap.runtime_unjoined_duty_cycle_complete)
+            iw_auto_prom = _te.format_prometheus_metrics(iw_auto_snap)
+            self.assertIn("freetpu_tpu_runtime_unjoined_duty_cycle_complete 1", iw_auto_prom)
             self.assertEqual(
                 [d.hbm_used_bytes for d in iw_auto_snap.devices],
                 [(c + 1) * 10 * 1024**3 for c in range(8)],
@@ -2851,6 +2856,82 @@ TPU Runtime Utilization
             self.assertTrue(py_ok, py_err)
             self.assertEqual(v7x_py_calls, ["new:V7X:127.0.0.1:8431"])
             self.assertEqual(len(py_rows), 8)
+
+            # When `get_chip_usage_new` fails on Ironwood (`AssertionError` because
+            # 4 physical-chip duty rows != 8 HBM rows), fall back to `get_chip_usage`
+            # so usable HBM telemetry is NEVER lost (keeping raw duty unjoined in
+            # `auto` mode and joined in explicit `per-chip` mode).
+            v7x_fb_calls: List[str] = []
+
+            def _v7x_new_asserts(*args, **kwargs):
+                v7x_fb_calls.append("new_assert")
+                raise AssertionError("Metrics not found for all chips")
+
+            def _v7x_legacy_per_chip(chip_type, addr="localhost:8431"):
+                v7x_fb_calls.append(f"legacy:{chip_type}:{addr}")
+                return [
+                    SimpleNamespace(
+                        device_id=c,
+                        memory_usage=(c + 1) * 2 * 1024**3,
+                        total_memory=96 * 1024**3,
+                        duty_cycle_pct=12.5 + (c // 2) * 25.0,
+                    )
+                    for c in range(8)
+                ]
+
+            with mock.patch.dict(
+                sys.modules,
+                {
+                    "tpu_info.device": SimpleNamespace(TpuChip=SimpleNamespace(V7X="V7X")),
+                    "tpu_info.metrics": SimpleNamespace(
+                        get_chip_usage=_v7x_legacy_per_chip,
+                        get_chip_usage_new=_v7x_new_asserts,
+                    ),
+                },
+            ):
+                fb_ok, fb_err, fb_rows = _te._query_tpu_info_python_metrics(
+                    iw_snap.devices,
+                    addr="127.0.0.1:8431",
+                    timeout_s=1.0,
+                    grpc_duty_layout="auto",
+                )
+                pc_ok, pc_err, pc_rows = _te._query_tpu_info_python_metrics(
+                    iw_snap.devices,
+                    addr="127.0.0.1:8431",
+                    timeout_s=1.0,
+                    grpc_duty_layout="per-chip",
+                )
+            self.assertTrue(fb_ok, fb_err)
+            self.assertEqual(
+                v7x_fb_calls,
+                ["new_assert", "legacy:V7X:127.0.0.1:8431", "legacy:V7X:127.0.0.1:8431"],
+            )
+            self.assertEqual(len(fb_rows), 8)
+            self.assertEqual(fb_rows["7"].hbm_used_bytes, 16 * 1024**3)
+            self.assertTrue(all(r.duty_cycle_percent is None for r in fb_rows.values()))
+            self.assertEqual(
+                {k: r.unjoined_duty_cycle_percent for k, r in fb_rows.items() if r.unjoined_duty_cycle_percent is not None},
+                {"0": 12.5, "1": 37.5, "2": 62.5, "3": 87.5},
+            )
+            self.assertTrue(pc_ok, pc_err)
+            self.assertEqual(
+                [pc_rows[str(c)].duty_cycle_percent for c in range(8)],
+                [12.5, 12.5, 37.5, 37.5, 62.5, 62.5, 87.5, 87.5],
+            )
+
+            # Sidecar without PCI inventory (`devices=[]`): `_sanitize_fallback_duty_rows`
+            # MUST preserve valid duty-cycle readings from the Python fallback!
+            sidecar_rows = {
+                "0": _te._TpuInfoRow(
+                    chip_key="0",
+                    hbm_used_bytes=8 * 1024**3,
+                    hbm_total_bytes=32 * 1024**3,
+                    duty_cycle_percent=64.0,
+                    in_util_table=True,
+                )
+            }
+            kept_sidecar = _te._sanitize_fallback_duty_rows(sidecar_rows, [])
+            self.assertAlmostEqual(kept_sidecar["0"].duty_cycle_percent or 0.0, 64.0)
 
             # Ironwood per-core duty-cycle response (8 entries 0..7 matching 8 HBM cores)
             # MUST preserve 1:1 per-core readings and NEVER double/fabricate rows 8..15!

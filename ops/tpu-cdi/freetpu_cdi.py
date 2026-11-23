@@ -2640,10 +2640,7 @@ def _verify_spec_against_host_detailed(
                             and len(slice_per_chip_set) == 1
                             and next(iter(slice_per_chip_set)) > 1
                             and not _has_complete_chip_functions(slice_live_chips, live_bdf_to_phys)
-                            and (
-                                uses_explicit_chip_map
-                                or all(c.runtime_chip_id is None for c in slice_live_chips)
-                            )
+                            and uses_explicit_chip_map
                         ):
                             per_chip = next(iter(slice_per_chip_set))
                             if len(slice_live_chips) % per_chip == 0:
@@ -2675,21 +2672,12 @@ def _verify_spec_against_host_detailed(
                         range_width_matches
                         and chip_id_map is None
                         and live_slice_for_bdfs is not None
-                        and (
-                            uses_explicit_chip_map
-                            or _resolve_verified_visibility_ordinals(
-                                live_slice_for_bdfs.chips,
-                                live_chips,
-                                live_bdf_to_phys,
-                                chip_id_map=None,
-                            )
-                            is None
-                        )
+                        and uses_explicit_chip_map
                     ):
                         unverifiable.append(
-                            f"device {name!r}: numeric range alias cannot be verified without "
-                            "--chip-id-map (spec depends on explicit --chip-id-map or host sysfs "
-                            "exposes no chip_id; underlying VFIO/PCI topology still matches live host)"
+                            f"device {name!r}: numeric range alias was generated with "
+                            "--chip-id-map and cannot be verified without that map "
+                            "(underlying VFIO/PCI topology still matches live host)"
                         )
                         check_slice = live_slice_for_bdfs
                     elif unpaired_map_match:
@@ -3280,6 +3268,43 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _revalidate_existing_spec_on_map_failure(
+    output_path: Path,
+    *,
+    sysfs_root: Path,
+    dev_root: Path,
+    iommu_dev_path: Optional[Path],
+    vfio_mode: str,
+) -> str:
+    """Validate any already-published CDI spec against live PCI/VFIO hardware
+    when `--chip-id-map` cannot be loaded or reloaded, withdrawing it
+    immediately on confirmed hardware drift while preserving intact hardware specs.
+    """
+    if not output_path.exists():
+        return ""
+    confirmed_drift: List[str] = []
+    try:
+        existing_spec = _load_json_strict_keys(output_path.read_text(encoding="utf-8"))
+        confirmed_drift.extend(validate_cdi_spec(existing_spec))
+        if not confirmed_drift:
+            host_confirmed, _unverifiable = _verify_spec_against_host_detailed(
+                existing_spec,
+                sysfs_root=sysfs_root,
+                dev_root=dev_root,
+                iommu_dev_path=iommu_dev_path,
+                vfio_mode=vfio_mode,
+                chip_id_map=None,
+            )
+            confirmed_drift.extend(host_confirmed)
+    except Exception as check_exc:  # noqa: BLE001
+        confirmed_drift.append(f"existing spec unreadable: {check_exc}")
+    if confirmed_drift:
+        removed, cleanup_err = _invalidate_spec(output_path)
+        inv = _format_invalidation_suffix(output_path, removed, cleanup_err)
+        return f"; confirmed hardware drift ({confirmed_drift[0]}){inv}"
+    return ""
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
@@ -3439,7 +3464,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         try:
             parsed_chip_map = _load_chip_id_map(args.chip_id_map)
         except Exception as exc:  # noqa: BLE001
-            sys.stderr.write(f"freetpu-cdi sync failed: invalid --chip-id-map: {exc}\n")
+            drift_suffix = _revalidate_existing_spec_on_map_failure(
+                args.output,
+                sysfs_root=args.sysfs_root,
+                dev_root=args.dev_root,
+                iommu_dev_path=args.iommu_dev,
+                vfio_mode=args.vfio_mode,
+            )
+            sys.stderr.write(
+                f"freetpu-cdi sync failed: invalid --chip-id-map: {exc}{drift_suffix}\n"
+            )
             return 1
         if args.once:
             ok, msg = reconcile_cdi_spec(
@@ -3479,33 +3513,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     tick_chip_map = _load_chip_id_map(args.chip_id_map)
                 except Exception as exc:  # noqa: BLE001
                     ok = False
-                    # Even when the chip-id-map file cannot be reloaded, keep
-                    # validating any published CDI spec against live PCI/VFIO
-                    # hardware and withdraw it immediately on confirmed drift.
-                    drift_suffix = ""
-                    if args.output.exists():
-                        confirmed_drift: List[str] = []
-                        try:
-                            existing_spec = _load_json_strict_keys(
-                                args.output.read_text(encoding="utf-8")
-                            )
-                            confirmed_drift.extend(validate_cdi_spec(existing_spec))
-                            if not confirmed_drift:
-                                host_confirmed, _unverifiable = _verify_spec_against_host_detailed(
-                                    existing_spec,
-                                    sysfs_root=args.sysfs_root,
-                                    dev_root=args.dev_root,
-                                    iommu_dev_path=args.iommu_dev,
-                                    vfio_mode=args.vfio_mode,
-                                    chip_id_map=None,
-                                )
-                                confirmed_drift.extend(host_confirmed)
-                        except Exception as check_exc:  # noqa: BLE001
-                            confirmed_drift.append(f"existing spec unreadable: {check_exc}")
-                        if confirmed_drift:
-                            removed, cleanup_err = _invalidate_spec(args.output)
-                            inv = _format_invalidation_suffix(args.output, removed, cleanup_err)
-                            drift_suffix = f"; confirmed hardware drift ({confirmed_drift[0]}){inv}"
+                    drift_suffix = _revalidate_existing_spec_on_map_failure(
+                        args.output,
+                        sysfs_root=args.sysfs_root,
+                        dev_root=args.dev_root,
+                        iommu_dev_path=args.iommu_dev,
+                        vfio_mode=args.vfio_mode,
+                    )
                     msg = (
                         f"failed to reload --chip-id-map {args.chip_id_map!r}: {exc}"
                         f"{drift_suffix or ' (preserving verified hardware spec; skipping publish)'}"

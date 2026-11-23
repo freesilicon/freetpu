@@ -3036,6 +3036,115 @@ class FreeTpuCdiTests(unittest.TestCase):
                     "must withdraw stale CDI spec on confirmed VFIO drift even when --chip-id-map reload fails",
                 )
 
+                # Same hardware-drift revalidation MUST also run if `--chip-id-map`
+                # fails to load at `sync` STARTUP (e.g. service restart after crash).
+                start_drift_spec = drift_root / "freetpu-startup-drift.json"
+                # Regenerate with a temporary valid map while node 3 is absent? Write a stale spec first!
+                (drift_dev / "vfio" / "3").touch()
+                drift_map_file.write_text(
+                    json.dumps({f"0000:00:{4 + i:02x}.0": i for i in range(4)}),
+                    encoding="utf-8",
+                )
+                rc_sd_gen, _o_sdg, err_sdg = _run_cli_inproc(
+                    [
+                        "generate",
+                        "--sysfs-root",
+                        str(drift_sys),
+                        "--dev-root",
+                        str(drift_dev),
+                        "--chip-id-map",
+                        str(drift_map_file),
+                        "--output",
+                        str(start_drift_spec),
+                        "--validate",
+                    ]
+                )
+                self.assertEqual(rc_sd_gen, 0, err_sdg)
+                self.assertTrue(start_drift_spec.exists())
+                # Now break the map file AND delete VFIO node 3 BEFORE `sync` starts.
+                drift_map_file.write_text("{malformed-at-startup", encoding="utf-8")
+                (drift_dev / "vfio" / "3").unlink()
+                rc_sd_sync, _o_sds, err_sds = _run_cli_inproc(
+                    [
+                        "sync",
+                        "--once",
+                        "--sysfs-root",
+                        str(drift_sys),
+                        "--dev-root",
+                        str(drift_dev),
+                        "--chip-id-map",
+                        str(drift_map_file),
+                        "--output",
+                        str(start_drift_spec),
+                    ]
+                )
+                self.assertNotEqual(rc_sd_sync, 0)
+                self.assertIn("confirmed hardware drift", err_sds)
+                self.assertFalse(
+                    start_drift_spec.exists(),
+                    "must withdraw stale CDI spec on confirmed VFIO drift when --chip-id-map fails to load at sync startup",
+                )
+
+                # Sysfs-derived range alias in DEFAULT host-safe mode (NO --single-host-env,
+                # NO injected TPU_VISIBLE_CHIPS, NO --chip-id-map): when live sysfs `chip_id`s
+                # later conflict (duplicate "0"), `validate --check-host --remove-if-stale`
+                # MUST withdraw the stale `0-3` range alias as confirmed drift!
+                default_conf_root = root / "sysfs_conflict_default"
+                default_conf_spec = default_conf_root / "freetpu-default-sysfs.json"
+                sc_sys2, sc_dev2 = _make_mock_pci_vfio(
+                    default_conf_root,
+                    devices=[
+                        {
+                            "bdf": f"0000:00:{4 + i:02x}.0",
+                            "vendor": "0x1ae0",
+                            "device": "0x006f",
+                            "driver": "vfio-pci",
+                            "iommu_group": str(i),
+                            "numa_node": "0",
+                            "chip_id": str(i),
+                        }
+                        for i in range(4)
+                    ],
+                    create_vfio_nodes=[str(i) for i in range(4)],
+                )
+                rc_dc_gen, _o_dcg, err_dcg = _run_cli_inproc(
+                    [
+                        "generate",
+                        "--sysfs-root",
+                        str(sc_sys2),
+                        "--dev-root",
+                        str(sc_dev2),
+                        "--output",
+                        str(default_conf_spec),
+                        "--validate",
+                    ]
+                )
+                self.assertEqual(rc_dc_gen, 0, err_dcg)
+                self.assertIn(
+                    "0-3",
+                    {d["name"] for d in json.loads(default_conf_spec.read_text(encoding="utf-8"))["devices"]},
+                )
+                (sc_sys2 / "bus/pci/devices/0000:00:05.0/chip_id").write_text(
+                    "0\n", encoding="utf-8"
+                )
+                rc_dc_val, _o_dcv, err_dcv = _run_cli_inproc(
+                    [
+                        "validate",
+                        str(default_conf_spec),
+                        "--check-host",
+                        "--remove-if-stale",
+                        "--sysfs-root",
+                        str(sc_sys2),
+                        "--dev-root",
+                        str(sc_dev2),
+                    ]
+                )
+                self.assertNotEqual(rc_dc_val, 0)
+                self.assertFalse(
+                    default_conf_spec.exists(),
+                    "must unlink default-mode sysfs-derived 0-3 alias when live sysfs chip_id values conflict",
+                )
+
                 # Sysfs-derived visibility mask (generated WITHOUT --chip-id-map):
                 # if live sysfs `chip_id`s later conflict (duplicate "0"), `validate
                 # --check-host --remove-if-stale` MUST treat it as confirmed drift
