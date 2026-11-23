@@ -315,12 +315,24 @@ class _TpuTelemetryAggregator:
         if sample.name == "freetpu_tpu_health_status":
             self.health_by_chip[chip_key] = sample.value
         elif sample.name == "freetpu_tpu_hbm_used_bytes":
+            if sample.value < 0.0:
+                self.add_malformed_metric(sample.name)
+                return
             self.hbm_used_by_chip[chip_key] = int(round(sample.value))
         elif sample.name == "freetpu_tpu_hbm_total_bytes":
+            if sample.value <= 0.0:
+                self.add_malformed_metric(sample.name)
+                return
             self.hbm_total_by_chip[chip_key] = int(round(sample.value))
         elif sample.name == "freetpu_tpu_hbm_utilization_ratio":
+            if sample.value < 0.0:
+                self.add_malformed_metric(sample.name)
+                return
             self.hbm_ratio_by_chip[chip_key] = float(sample.value)
         elif sample.name == "freetpu_tpu_duty_cycle_percent":
+            if sample.value < 0.0:
+                self.add_malformed_metric(sample.name)
+                return
             self.duty_by_chip[chip_key] = float(sample.value)
         elif sample.name == "freetpu_tpu_active_pids":
             self.pids_by_chip[chip_key] = int(round(sample.value))
@@ -421,12 +433,11 @@ def evaluate_tpu_readiness(
         and telemetry.max_hbm_utilization_ratio >= max_hbm_utilization
     ):
         return False, "tpu_hbm_oom_risk"
-    if (
-        max_duty_cycle_percent is not None
-        and telemetry.max_duty_cycle_percent is not None
-        and telemetry.max_duty_cycle_percent >= max_duty_cycle_percent
-    ):
-        return False, "tpu_duty_cycle_overloaded"
+    if max_duty_cycle_percent is not None:
+        if telemetry.max_duty_cycle_percent is None:
+            return False, "tpu_duty_cycle_missing"
+        if telemetry.max_duty_cycle_percent >= max_duty_cycle_percent:
+            return False, "tpu_duty_cycle_overloaded"
     return True, None
 
 

@@ -13802,6 +13802,168 @@ asyncio.run(main())
             listener.close()
             thread.join(timeout=2.0)
 
+    def test_windows_selector_cap_and_reactor_value_error_releases_waiting_tasks(
+        self,
+    ) -> None:
+        import selectors as selectors_mod
+        from router import freetpu_router as router_mod
+
+        with mock.patch.object(router_mod.sys, "platform", "win32"):
+            self.assertEqual(
+                router_mod._effective_max_concurrent_connections(256), 250
+            )
+            self.assertEqual(
+                router_mod._effective_max_concurrent_connections(100), 100
+            )
+        with mock.patch.object(
+            router_mod.selectors, "DefaultSelector", selectors_mod.SelectSelector
+        ):
+            self.assertEqual(
+                router_mod._effective_max_concurrent_connections(512), 250
+            )
+
+        # If selector.select() raises ValueError, reactor exits cleanly and releases waiting tasks.
+        reactor = router_mod._SSEReactor()
+        up_a, up_b = socket.socketpair()
+        cli_a, cli_b = socket.socketpair()
+        try:
+            cfg = RouterConfig(
+                host="127.0.0.1",
+                port=0,
+                backends=[
+                    BackendConfig(
+                        id="sel-err-b",
+                        local=True,
+                        base_url="http://127.0.0.1:8081/v1",
+                        models=["m1"],
+                    )
+                ],
+            )
+            engine = router_mod.RouterEngine(cfg)
+            task = router_mod._SSEReactorTask(
+                upstream_sock=up_a,
+                client_sock=cli_a,
+                engine=engine,
+                sse_buf=bytearray(),
+                raw_buf=bytearray(),
+                chunked=False,
+                chunk_left=None,
+                remaining_content_length=None,
+                max_event_bytes=65536,
+                timeout_s=5.0,
+                progress_deadline=time.monotonic() + 5.0,
+                sse_mem_box=[0],
+                on_event_fn=lambda _t, _l: (False, False),
+                event_data_lines=[],
+                current_event_type="",
+                chunked_downstream=False,
+            )
+            with mock.patch.object(
+                reactor._selector,
+                "select",
+                side_effect=ValueError("too many file descriptors in select()"),
+            ):
+                reactor.submit(task)
+                self.assertTrue(
+                    task.done_event.wait(timeout=2.0),
+                    "Waiting handler deadlocked after selector ValueError",
+                )
+            self.assertTrue(task.upstream_read_error)
+        finally:
+            reactor.stop()
+            for s in (up_a, up_b, cli_a, cli_b):
+                try:
+                    s.close()
+                except OSError:
+                    pass
+
+    def test_upstream_http_429_fails_over_and_cools_down_overloaded_backend(
+        self,
+    ) -> None:
+        overloaded = self._track(
+            _MockOpenAIBackend("tgi-429-primary", ["m-429"], status_code=200)
+        )
+        backup = self._track(
+            _MockOpenAIBackend("tgi-429-backup", ["m-429"], status_code=200)
+        )
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            policy="local_first",
+            failure_cooldown_s=30.0,
+            backends=[
+                BackendConfig(
+                    id="tgi-429-primary",
+                    local=True,
+                    base_url=overloaded.base_url,
+                    models=["m-429"],
+                ),
+                BackendConfig(
+                    id="tgi-429-backup",
+                    local=False,
+                    base_url=backup.base_url,
+                    models=["m-429"],
+                ),
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        overloaded.status_code = 429
+        st, hdrs, _ = _http_request(
+            router.server_address[1],
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-429",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        self.assertEqual(st, 200)
+        self.assertEqual(hdrs.get("x-freetpu-backend"), "tgi-429-backup")
+        self.assertEqual(hdrs.get("x-freetpu-failovers"), "1")
+        primary_state = router.engine._backends[0]
+        self.assertEqual(primary_state.total_failures, 1)
+        self.assertGreater(primary_state.cooldown_until_monotonic, time.monotonic())
+
+    def test_tpu_readiness_requires_duty_cycle_when_limit_configured_and_rejects_negative_hbm_ratio(
+        self,
+    ) -> None:
+        # 1. Missing duty-cycle sample fails readiness when max_duty_cycle_percent is configured.
+        no_duty_metrics = (
+            "freetpu_exporter_up 1\n"
+            "freetpu_tpu_devices_discovered 1\n"
+            'freetpu_tpu_health_status{chip="0"} 1\n'
+            'freetpu_tpu_hbm_utilization_ratio{chip="0"} 0.25\n'
+        )
+        exp_no_duty = self._track(_MockTpuExporter(raw_body=no_duty_metrics))
+        telem_no_duty = scrape_tpu_exporter(exp_no_duty.metrics_url, timeout_s=2.0)
+        self.assertTrue(telem_no_duty.reachable)
+        self.assertTrue(telem_no_duty.exporter_up)
+        self.assertIsNone(telem_no_duty.max_duty_cycle_percent)
+        self.assertTrue(evaluate_tpu_readiness(telem_no_duty)[0])
+        ready_duty, reason_duty = evaluate_tpu_readiness(
+            telem_no_duty, max_duty_cycle_percent=90.0
+        )
+        self.assertFalse(ready_duty)
+        self.assertEqual(reason_duty, "tpu_duty_cycle_missing")
+
+        # 2. Negative HBM ratio (-1) alongside 98% byte counters is rejected as invalid telemetry.
+        neg_ratio_metrics = (
+            "freetpu_exporter_up 1\n"
+            "freetpu_tpu_devices_discovered 1\n"
+            'freetpu_tpu_health_status{chip="0"} 1\n'
+            'freetpu_tpu_hbm_used_bytes{chip="0"} 9800000000\n'
+            'freetpu_tpu_hbm_total_bytes{chip="0"} 10000000000\n'
+            'freetpu_tpu_hbm_utilization_ratio{chip="0"} -1\n'
+        )
+        exp_neg = self._track(_MockTpuExporter(raw_body=neg_ratio_metrics))
+        telem_neg = scrape_tpu_exporter(exp_neg.metrics_url, timeout_s=2.0)
+        self.assertTrue(telem_neg.reachable)
+        self.assertFalse(telem_neg.exporter_up)
+        self.assertIn("freetpu_tpu_hbm_utilization_ratio", telem_neg.error or "")
+        ready_neg, reason_neg = evaluate_tpu_readiness(telem_neg, max_hbm_utilization=0.95)
+        self.assertFalse(ready_neg)
+        self.assertEqual(reason_neg, "tpu_exporter_invalid_metrics")
+
 
 def run_self_tests(verbosity: int = 1) -> int:
     """Run all router tests cleanly via unittest."""

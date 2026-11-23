@@ -80,7 +80,7 @@ from router.tpu_telemetry import (  # noqa: E402
 
 __version__ = "0.1.0"
 
-RETRYABLE_STATUS_CODES = (500, 502, 503, 504)
+RETRYABLE_STATUS_CODES = (429, 500, 502, 503, 504)
 UNKNOWN_MODEL_LABEL = "_unknown"
 OTHER_MODEL_LABEL = "_other"
 MAX_METRIC_MODEL_LABELS = 256
@@ -2683,13 +2683,22 @@ class _SSEReactor:
         self._pending: deque[_SSEReactorTask] = deque()
         self._active: set[_SSEReactorTask] = set()
         self._stop_event = threading.Event()
+        self._closed = False
+        self._failed = False
         self._thread: Optional[threading.Thread] = None
         self._start_lock = threading.Lock()
+
+    @property
+    def is_failed(self) -> bool:
+        return self._failed
 
     def start(self) -> None:
         with self._start_lock:
             if self._thread is not None and self._thread.is_alive():
                 return
+            with self._pending_lock:
+                if self._closed or self._failed:
+                    return
             self._stop_event.clear()
             self._thread = threading.Thread(
                 target=self._run,
@@ -2699,6 +2708,8 @@ class _SSEReactor:
             self._thread.start()
 
     def stop(self) -> None:
+        with self._pending_lock:
+            self._closed = True
         self._stop_event.set()
         try:
             self._wake_w.send(b"\x00")
@@ -2710,6 +2721,12 @@ class _SSEReactor:
             self._thread = None
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=2.0)
+        with self._pending_lock:
+            pending_tasks = list(self._pending)
+            self._pending.clear()
+        for task in pending_tasks:
+            task.downstream_write_error = True
+            self._finish_task(task)
         for sock in (self._wake_r, self._wake_w):
             try:
                 self._selector.unregister(sock)
@@ -2725,13 +2742,17 @@ class _SSEReactor:
             pass
 
     def submit(self, task: _SSEReactorTask) -> None:
-        if self._stop_event.is_set():
-            task.downstream_write_error = True
-            task.done_event.set()
-            return
-        self.start()
         with self._pending_lock:
+            if self._closed or self._stop_event.is_set():
+                task.downstream_write_error = True
+                task.done_event.set()
+                return
+            if self._failed:
+                task.upstream_read_error = True
+                task.done_event.set()
+                return
             self._pending.append(task)
+        self.start()
         try:
             self._wake_w.send(b"\x01")
         except BlockingIOError:
@@ -3213,74 +3234,92 @@ class _SSEReactor:
         return task.progress_deadline
 
     def _run(self) -> None:
-        while not self._stop_event.is_set():
-            self._drain_pending()
-            now_m = time.monotonic()
-            timeout: Optional[float] = None
-            if self._active:
-                earliest = min(self._task_deadline(t) for t in self._active)
-                timeout = max(0.0, earliest - now_m)
-            try:
-                events = self._selector.select(timeout=timeout)
-            except OSError:
-                break
-            now_m = time.monotonic()
-            for key, mask in events:
-                tag = key.data
-                if tag is None:
-                    try:
-                        while self._wake_r.recv(4096):
-                            pass
-                    except BlockingIOError:
-                        pass
-                    except OSError:
-                        pass
-                    continue
-                kind, task = tag
-                if task not in self._active:
-                    continue
+        try:
+            while not self._stop_event.is_set():
+                self._drain_pending()
+                now_m = time.monotonic()
+                timeout: Optional[float] = None
+                if self._active:
+                    earliest = min(self._task_deadline(t) for t in self._active)
+                    timeout = max(0.0, earliest - now_m)
                 try:
-                    if kind == "up":
-                        self._on_upstream_ready(task)
-                    else:
-                        if mask & selectors.EVENT_WRITE:
-                            self._on_client_writable(task)
-                        if task in self._active and (mask & selectors.EVENT_READ):
-                            self._on_client_readable(task)
-                except Exception:
-                    task.upstream_read_error = True
-                    self._finish_task(task)
-            if self._active:
-                expired = [
-                    t for t in self._active if now_m >= self._task_deadline(t)
-                ]
-                for task in expired:
-                    if task.write_buf and task.write_deadline is not None:
-                        task.downstream_write_error = True
-                    else:
+                    events = self._selector.select(timeout=timeout)
+                except (OSError, ValueError):
+                    break
+                now_m = time.monotonic()
+                for key, mask in events:
+                    tag = key.data
+                    if tag is None:
+                        try:
+                            while self._wake_r.recv(4096):
+                                pass
+                        except BlockingIOError:
+                            pass
+                        except OSError:
+                            pass
+                        continue
+                    kind, task = tag
+                    if task not in self._active:
+                        continue
+                    try:
+                        if kind == "up":
+                            self._on_upstream_ready(task)
+                        else:
+                            if mask & selectors.EVENT_WRITE:
+                                self._on_client_writable(task)
+                            if task in self._active and (mask & selectors.EVENT_READ):
+                                self._on_client_readable(task)
+                    except Exception:
                         task.upstream_read_error = True
-                    self._finish_task(task)
-
-        for task in list(self._active):
-            task.downstream_write_error = True
-            self._finish_task(task)
-        with self._pending_lock:
-            while self._pending:
-                task = self._pending.popleft()
-                task.downstream_write_error = True
+                        self._finish_task(task)
+                if self._active:
+                    expired = [
+                        t for t in self._active if now_m >= self._task_deadline(t)
+                    ]
+                    for task in expired:
+                        if task.write_buf and task.write_deadline is not None:
+                            task.downstream_write_error = True
+                        else:
+                            task.upstream_read_error = True
+                        self._finish_task(task)
+        finally:
+            stopping = self._stop_event.is_set()
+            for task in list(self._active):
+                if stopping:
+                    task.downstream_write_error = True
+                else:
+                    task.upstream_read_error = True
+                self._finish_task(task)
+            with self._pending_lock:
+                if stopping:
+                    self._closed = True
+                else:
+                    self._failed = True
+                pending_tasks = list(self._pending)
+                self._pending.clear()
+            for task in pending_tasks:
+                if stopping:
+                    task.downstream_write_error = True
+                else:
+                    task.upstream_read_error = True
                 self._finish_task(task)
 
 
 _FD_HEADROOM_RESERVED = 64
+_SELECT_SELECTOR_MAX_CONNECTIONS = 250
 
 
 def _effective_max_concurrent_connections(configured: int) -> int:
-    """Clamp concurrent admission to leave FD headroom for upstream sockets and probes.
+    """Clamp concurrent admission to leave FD and selector headroom for upstream sockets.
 
     Each active inference holds up to 2 sockets (client + upstream), plus fixed
     process descriptors (stdio, listener, reactor wakeup pipe, background probes).
+    On Windows or `SelectSelector` (512-socket `select()` ceiling), also cap
+    admission so `2 * N + 1` stays safely below 512.
     """
     limit = max(1, int(configured))
+    if sys.platform == "win32" or selectors.DefaultSelector is selectors.SelectSelector:
+        limit = min(limit, _SELECT_SELECTOR_MAX_CONNECTIONS)
     try:
         import resource
 
@@ -5451,6 +5490,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 use_reactor = (
                     not phase2_eof
                     and reactor is not None
+                    and not reactor.is_failed
                     and isinstance(raw_tcp_sock, socket.socket)
                     and not isinstance(raw_tcp_sock, ssl.SSLSocket)
                     and isinstance(self.connection, socket.socket)
