@@ -117,7 +117,10 @@ def is_loopback_host(host: str) -> bool:
     # trailing-dot numeric spellings such as `127.0.0.1.` to DNS resolution.
     addr_str = cleaned.split("%", 1)[0]
     try:
-        return ipaddress.ip_address(addr_str).is_loopback
+        ip_obj = ipaddress.ip_address(addr_str)
+        if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped is not None:
+            ip_obj = ip_obj.ipv4_mapped
+        return ip_obj.is_loopback
     except ValueError:
         return False
 

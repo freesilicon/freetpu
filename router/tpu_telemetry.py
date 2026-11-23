@@ -54,6 +54,7 @@ MAX_TRACKED_TPU_SAMPLES = 4096
 _METRIC_NAME_RE = re.compile(r"[a-zA-Z_:][a-zA-Z0-9_:]*")
 _LABEL_NAME_RE = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]*")
 _SAMPLE_VALUE_TAIL_RE = re.compile(r"[ \t]+(\S+)(?:[ \t]+[+-]?[0-9]+)?$")
+_LABELED_SAMPLE_VALUE_TAIL_RE = re.compile(r"[ \t]*(\S+)(?:[ \t]+[+-]?[0-9]+)?$")
 
 
 @dataclass
@@ -111,7 +112,9 @@ def _parse_prometheus_sample_line(
         ws_end += 1
 
     labels: Dict[str, str] = {}
+    has_label_block = False
     if ws_end < n and line[ws_end] == "{":
+        has_label_block = True
         pos = ws_end + 1
         closed = False
         while pos < n:
@@ -188,7 +191,10 @@ def _parse_prometheus_sample_line(
         if not closed:
             return None
 
-    tail_match = _SAMPLE_VALUE_TAIL_RE.match(line, pos)
+    tail_re = (
+        _LABELED_SAMPLE_VALUE_TAIL_RE if has_label_block else _SAMPLE_VALUE_TAIL_RE
+    )
+    tail_match = tail_re.match(line, pos)
     if not tail_match:
         return None
     val_str = tail_match.group(1)

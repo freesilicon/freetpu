@@ -12536,17 +12536,17 @@ asyncio.run(main())
                 self.send_header("Connection", "close")
                 self.end_headers()
                 if mode[0] == "stream_with_token_ids":
-                    # vLLM echo=true + return_token_ids=true suppresses textual prompt echo
-                    # and returns prompt_token_ids separately + choice.token_ids for output.
+                    # vLLM v0.33.0 echo=true + return_token_ids=true suppresses textual prompt
+                    # echo and emits prompt_token_ids inside the streamed choice alongside token_ids.
                     ev = json.dumps(
                         {
                             "id": "cmpl-tids-1",
                             "object": "text_completion",
-                            "prompt_token_ids": [1, 2, 3, 4],
                             "choices": [
                                 {
                                     "index": 0,
                                     "text": "Hi!",
+                                    "prompt_token_ids": [1, 2, 3, 4],
                                     "token_ids": [9906, 0, 11],
                                     "finish_reason": "stop",
                                 }
@@ -12554,16 +12554,17 @@ asyncio.run(main())
                         }
                     ).encode("utf-8")
                 else:
-                    # Without choice.token_ids, short completion text is still NOT zeroed out.
+                    # Without choice.token_ids, choice-level prompt_token_ids still suppresses
+                    # echoed-prompt subtraction so short completion text is NOT zeroed out.
                     ev = json.dumps(
                         {
                             "id": "cmpl-tids-2",
                             "object": "text_completion",
-                            "prompt_token_ids": [1, 2, 3, 4],
                             "choices": [
                                 {
                                     "index": 0,
                                     "text": "Short answer",
+                                    "prompt_token_ids": [1, 2, 3, 4],
                                     "finish_reason": "stop",
                                 }
                             ],
@@ -12591,7 +12592,27 @@ asyncio.run(main())
         router = self._track(create_router_server(cfg, usage_hook=_RecordHook()))
         rport = router.server_address[1]
 
-        # 1. With choice.token_ids: exact generated token count (3) recorded, not 0.
+        # Choice-level prompt_token_ids alone (no text/token_ids/finish_reason) still buffers pre-commit.
+        self.assertFalse(
+            _sse_event_should_commit(
+                json.dumps(
+                    {
+                        "id": "cmpl-buf",
+                        "object": "text_completion",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "text": "",
+                                "prompt_token_ids": [1, 2, 3, 4],
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                ).encode("utf-8")
+            )
+        )
+
+        # 1. With choice.token_ids + choice.prompt_token_ids: exact generated token count (3) recorded.
         st1, _, _ = _http_request(
             rport,
             "POST",
@@ -12607,8 +12628,9 @@ asyncio.run(main())
         self.assertEqual(st1, 200)
         self.assertEqual(recorded_usage[0].completion_tokens, 3)
 
-        # 2. Without choice.token_ids: short text (12 chars -> 3 tokens) not subtracted to 0.
-        mode[0] = "stream_text_only_with_return_token_ids"
+        # 2. Without return_token_ids or choice.token_ids, choice.prompt_token_ids still prevents
+        # subtracting the 400-char prompt from short completion text (12 chars -> 3 tokens).
+        mode[0] = "stream_text_only_with_choice_prompt_token_ids"
         st2, _, _ = _http_request(
             rport,
             "POST",
@@ -12617,12 +12639,287 @@ asyncio.run(main())
                 "model": "m-echo-tids",
                 "prompt": long_prompt,
                 "echo": True,
-                "return_token_ids": True,
                 "stream": True,
             },
         )
         self.assertEqual(st2, 200)
         self.assertEqual(recorded_usage[1].completion_tokens, 3)
+
+    def test_sse_excess_empty_choice_usage_frames_rejected_without_progress_renewal(
+        self,
+    ) -> None:
+        recorded_usage: List[UsageEvent] = []
+
+        class _RecordHook:
+            def record_usage(self, event: UsageEvent) -> None:
+                recorded_usage.append(event)
+
+        class _RunawayUsageHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return None
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = json.dumps(
+                    {"object": "list", "data": [{"id": "m-runaway-usage"}]}
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802
+                clen = int(self.headers.get("Content-Length", "0"))
+                if clen > 0:
+                    self.rfile.read(clen)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                tok = (
+                    b'data: {"id":"c1","object":"chat.completion.chunk","choices":'
+                    b'[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}\n\n'
+                )
+                usage_ev = (
+                    b'data: {"id":"c1","object":"chat.completion.chunk","choices":[],'
+                    b'"usage":{"prompt_tokens":10,"completion_tokens":5}}\n\n'
+                )
+                self.wfile.write(tok + usage_ev)
+                self.wfile.flush()
+                try:
+                    for _ in range(50):
+                        self.wfile.write(usage_ev)
+                        self.wfile.flush()
+                        time.sleep(0.01)
+                except OSError:
+                    pass
+
+        srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _RunawayUsageHandler))
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            request_timeout_s=2.0,
+            backends=[
+                BackendConfig(
+                    id="runaway-usage-b",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=f"http://127.0.0.1:{srv.server_address[1]}/v1",
+                    models=["m-runaway-usage"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg, usage_hook=_RecordHook()))
+        rport = router.server_address[1]
+
+        t0 = time.monotonic()
+        conn = http.client.HTTPConnection("127.0.0.1", rport, timeout=3.0)
+        try:
+            conn.request(
+                "POST",
+                "/v1/chat/completions",
+                body=json.dumps(
+                    {
+                        "model": "m-runaway-usage",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": True,
+                        "stream_options": {"include_usage": True},
+                    }
+                ).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)
+            raw_stream = b""
+            try:
+                raw_stream = resp.read()
+            except http.client.IncompleteRead as exc:
+                raw_stream = exc.partial
+        finally:
+            conn.close()
+        elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, 1.5)
+        self.assertEqual(raw_stream.count(b'"usage"'), 1)
+        self.assertEqual(len(recorded_usage), 1)
+        self.assertEqual(recorded_usage[0].status_code, 502)
+        self.assertEqual(recorded_usage[0].prompt_tokens, 10)
+        self.assertEqual(recorded_usage[0].completion_tokens, 5)
+        self.assertEqual(router.engine._backends[0].total_failures, 1)
+
+    def test_dual_stack_ipv4_mapped_ipv6_listener_accepts_ipv4_host_and_peer_loopback(
+        self,
+    ) -> None:
+        from email.message import Message
+        from router.config import is_loopback_host
+        from router.freetpu_router import (
+            RouterEngine,
+            _RouterRequestHandler,
+            _verify_connected_peer_for_credentials,
+        )
+
+        self.assertTrue(is_loopback_host("::ffff:127.0.0.1"))
+        self.assertFalse(is_loopback_host("::ffff:192.0.2.10"))
+
+        class _FakeSock:
+            def __init__(self, local_ip: str, peer_ip: str) -> None:
+                self._local_ip = local_ip
+                self._peer_ip = peer_ip
+
+            def getsockname(self) -> Tuple[str, int, int, int]:
+                return (self._local_ip, 8080, 0, 0)
+
+            def getpeername(self) -> Tuple[str, int, int, int]:
+                return (self._peer_ip, 54321, 0, 0)
+
+        class _FakeConn:
+            def __init__(self, peer_ip: str) -> None:
+                self.sock = _FakeSock("::ffff:127.0.0.1", peer_ip)
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        cfg = RouterConfig(
+            host="::",
+            port=8080,
+            backends=[
+                BackendConfig(
+                    id="b-dual",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url="http://127.0.0.1:8081/v1",
+                    models=["m1"],
+                )
+            ],
+        )
+        engine = RouterEngine(cfg)
+        fake_server = mock.MagicMock()
+        fake_server.configured_bind_host = "::"
+        fake_server.server_address = ("::", 8080, 0, 0)
+        fake_server.engine = engine
+
+        handler = object.__new__(_RouterRequestHandler)
+        handler.server = fake_server
+        handler.connection = _FakeSock("::ffff:192.0.2.10", "::ffff:192.0.2.50")
+
+        hdrs_ok = Message()
+        hdrs_ok["Host"] = "192.0.2.10:8080"
+        handler.headers = hdrs_ok
+        self.assertTrue(handler._validate_request_host())
+
+        hdrs_bad = Message()
+        hdrs_bad["Host"] = "192.0.2.99:8080"
+        handler.headers = hdrs_bad
+        self.assertFalse(handler._validate_request_host())
+
+        # Peer loopback check unwraps IPv4-mapped IPv6 addresses.
+        backend = cfg.backends[0]
+        _verify_connected_peer_for_credentials(
+            _FakeConn("::ffff:127.0.0.1"),  # type: ignore[arg-type]
+            backend,
+            "http",
+            "secret-key",
+        )
+        bad_conn = _FakeConn("::ffff:192.0.2.10")
+        with self.assertRaises(ValueError):
+            _verify_connected_peer_for_credentials(
+                bad_conn,  # type: ignore[arg-type]
+                backend,
+                "http",
+                "secret-key",
+            )
+        self.assertTrue(bad_conn.closed)
+
+    def test_cors_exposes_router_response_headers_for_allowed_origins(self) -> None:
+        mock_backend = self._track(
+            _MockOpenAIBackend("cors-exp-b", ["m-cors-exp"])
+        )
+        threading.Thread(target=mock_backend.serve_forever, daemon=True).start()
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            cors_allowed_origins=["https://app.example.com"],
+            backends=[
+                BackendConfig(
+                    id="cors-exp-b",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=mock_backend.base_url,
+                    models=["m-cors-exp"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+        expected_exposed = "X-FreeTPU-Backend, X-FreeTPU-Failovers, X-FreeTPU-Request-Id"
+
+        st_ns, hdrs_ns, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            headers={"Origin": "https://app.example.com"},
+            body={
+                "model": "m-cors-exp",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": False,
+            },
+        )
+        self.assertEqual(st_ns, 200)
+        self.assertEqual(hdrs_ns.get("access-control-allow-origin"), "https://app.example.com")
+        self.assertEqual(hdrs_ns.get("access-control-expose-headers"), expected_exposed)
+
+        st_s, hdrs_s, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            headers={"Origin": "https://app.example.com"},
+            body={
+                "model": "m-cors-exp",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+        )
+        self.assertEqual(st_s, 200)
+        self.assertEqual(hdrs_s.get("access-control-allow-origin"), "https://app.example.com")
+        self.assertEqual(hdrs_s.get("access-control-expose-headers"), expected_exposed)
+
+    def test_prometheus_compact_labeled_sample_without_space_after_brace(self) -> None:
+        compact_metrics = "\n".join(
+            [
+                "freetpu_exporter_up 1",
+                "freetpu_exporter_up1",
+                'freetpu_tpu_devices_discovered 1',
+                'freetpu_tpu_health_status{chip="0"}1',
+                'freetpu_tpu_hbm_utilization_ratio{chip="0",generation="v5e"}0.42 1700000000000',
+            ]
+        ) + "\n"
+        parsed = parse_prometheus_text(compact_metrics)
+        by_name = {s.name: s for s in parsed}
+        self.assertIn("freetpu_tpu_health_status", by_name)
+        self.assertEqual(by_name["freetpu_tpu_health_status"].labels, {"chip": "0"})
+        self.assertEqual(by_name["freetpu_tpu_health_status"].value, 1.0)
+        self.assertIn("freetpu_tpu_hbm_utilization_ratio", by_name)
+        self.assertAlmostEqual(by_name["freetpu_tpu_hbm_utilization_ratio"].value, 0.42)
+        self.assertNotIn("freetpu_exporter_up1", by_name)
+
+        exporter = self._track(_MockTpuExporter(raw_body=compact_metrics))
+        threading.Thread(target=exporter.serve_forever, daemon=True).start()
+        telemetry = scrape_tpu_exporter(
+            exporter.metrics_url,
+            timeout_s=2.0,
+        )
+        self.assertTrue(telemetry.reachable)
+        self.assertTrue(telemetry.exporter_up)
+        self.assertEqual(telemetry.healthy_chips, 1)
+        self.assertEqual(telemetry.total_chips, 1)
+        self.assertAlmostEqual(telemetry.max_hbm_utilization_ratio or 0.0, 0.42)
+        ready, reason = evaluate_tpu_readiness(telemetry)
+        self.assertTrue(ready, msg=f"unexpected unready reason: {reason}")
 
 
 def run_self_tests(verbosity: int = 1) -> int:

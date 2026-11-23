@@ -458,6 +458,33 @@ _CORS_ALLOWED_HEADERS = ", ".join(
 )
 
 
+_CORS_EXPOSED_HEADERS = ", ".join(
+    (
+        "X-FreeTPU-Backend",
+        "X-FreeTPU-Failovers",
+        "X-FreeTPU-Request-Id",
+    )
+)
+_MAX_TRACKED_STREAM_CHOICES = 1024
+
+
+def _normalize_socket_host_variants(raw_addr: str) -> set[str]:
+    """Return normalized host/IP spellings for a socket address, unwrapping IPv4-mapped IPv6."""
+    cleaned = str(raw_addr).strip().lower().strip("[]")
+    if not cleaned:
+        return set()
+    hosts: set[str] = {cleaned}
+    addr_no_zone = cleaned.split("%", 1)[0]
+    try:
+        ip_obj = ipaddress.ip_address(addr_no_zone)
+    except ValueError:
+        return hosts
+    hosts.add(str(ip_obj))
+    if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped is not None:
+        hosts.add(str(ip_obj.ipv4_mapped))
+    return hosts
+
+
 def _join_backend_url(
     base_url: str,
     endpoint: str,
@@ -548,7 +575,10 @@ def _verify_connected_peer_for_credentials(
         )
     try:
         peer_ip = str(peer_sock.getpeername()[0]).split("%", 1)[0]
-        is_peer_loopback = ipaddress.ip_address(peer_ip).is_loopback
+        ip_obj = ipaddress.ip_address(peer_ip)
+        if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped is not None:
+            ip_obj = ip_obj.ipv4_mapped
+        is_peer_loopback = ip_obj.is_loopback
     except (OSError, ValueError, IndexError):
         is_peer_loopback = False
     if not is_peer_loopback:
@@ -1006,6 +1036,22 @@ def _has_choice_audio_output(obj: Mapping[str, Any]) -> bool:
     return False
 
 
+def _has_prompt_token_ids(obj: Mapping[str, Any]) -> bool:
+    """Return True when response root or any choice carries non-empty `prompt_token_ids`."""
+    root_ids = obj.get("prompt_token_ids")
+    if isinstance(root_ids, (list, tuple)) and len(root_ids) > 0:
+        return True
+    choices = obj.get("choices")
+    if isinstance(choices, list):
+        for choice in choices:
+            if not (isinstance(choice, dict) or isinstance(choice, Mapping)):
+                continue
+            c_ids = choice.get("prompt_token_ids")
+            if isinstance(c_ids, (list, tuple)) and len(c_ids) > 0:
+                return True
+    return False
+
+
 def _extract_choice_token_id_count(obj: Mapping[str, Any]) -> int:
     """Count integer generated `token_ids` reported across choices in `obj`."""
     choices = obj.get("choices")
@@ -1125,9 +1171,7 @@ def _extract_non_stream_usage(
 
     if not saw_completion:
         resp_token_id_count = _extract_choice_token_id_count(parsed_resp)
-        has_prompt_token_ids = isinstance(
-            parsed_resp.get("prompt_token_ids"), list
-        ) and bool(parsed_resp.get("prompt_token_ids"))
+        has_prompt_token_ids = _has_prompt_token_ids(parsed_resp)
         if resp_token_id_count > 0:
             completion_tokens = resp_token_id_count
         elif echo_prompt_chars and not has_prompt_token_ids:
@@ -3337,31 +3381,30 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             getattr(self.server, "configured_bind_host", "")
         ).strip().lower().strip("[]")
         if configured_host and configured_host not in ("0.0.0.0", "::"):
-            trusted.add(configured_host)
+            trusted.update(_normalize_socket_host_variants(configured_host))
             if is_loopback_host(configured_host):
                 trusted.update({"localhost", "127.0.0.1", "::1"})
         bound_host = str(self.server.server_address[0]).strip().lower().strip("[]")
         if is_loopback_host(bound_host):
-            trusted.update({"localhost", "127.0.0.1", "::1", bound_host})
+            trusted.update({"localhost", "127.0.0.1", "::1"})
+            trusted.update(_normalize_socket_host_variants(bound_host))
         elif bound_host in ("0.0.0.0", "::", ""):
             trusted.update({"localhost", "127.0.0.1", "::1"})
             sock = getattr(self, "connection", None)
             if sock is not None:
                 try:
-                    local_ip = str(sock.getsockname()[0]).strip().lower().strip("[]")
-                    if local_ip:
-                        trusted.add(local_ip)
-                except OSError:
+                    local_variants = _normalize_socket_host_variants(sock.getsockname()[0])
+                    trusted.update(local_variants)
+                except (OSError, IndexError):
                     pass
         else:
-            trusted.add(bound_host)
+            trusted.update(_normalize_socket_host_variants(bound_host))
             sock = getattr(self, "connection", None)
             if sock is not None:
                 try:
-                    local_ip = str(sock.getsockname()[0]).strip().lower().strip("[]")
-                    if local_ip:
-                        trusted.add(local_ip)
-                except OSError:
+                    local_variants = _normalize_socket_host_variants(sock.getsockname()[0])
+                    trusted.update(local_variants)
+                except (OSError, IndexError):
                     pass
         return trusted
 
@@ -3399,7 +3442,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         if host_origin is None:
             return False
         _, host_name, _ = host_origin
-        if host_name not in self._trusted_listener_hosts():
+        if not (_normalize_socket_host_variants(host_name) & self._trusted_listener_hosts()):
             return False
         parts = urlsplit(f"{eff_scheme}://{host_val}")
         bound_port = int(self.server.server_address[1])
@@ -3451,7 +3494,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             return False
         _, host_name, host_port = host_origin
         bound_port = int(self.server.server_address[1])
-        if host_name not in self._trusted_listener_hosts():
+        if not (_normalize_socket_host_variants(host_name) & self._trusted_listener_hosts()):
             return False
         return host_port == bound_port
 
@@ -3523,6 +3566,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         if acao is None:
             return
         self.send_header("Access-Control-Allow-Origin", acao)
+        self.send_header("Access-Control-Expose-Headers", _CORS_EXPOSED_HEADERS)
         if acao != "*":
             self.send_header("Vary", "Origin")
 
@@ -4845,7 +4889,11 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             per_choice_timings: Dict[
                 Tuple[int, ...], Tuple[Optional[int], Optional[int]]
             ] = {}
-            empty_choice_usage_frames: List[Tuple[Optional[int], Optional[int]]] = []
+            empty_choice_usage_count = 0
+            empty_choice_prompt_count = 0
+            empty_choice_prompt_sum = 0
+            empty_choice_prompt_max = 0
+            empty_choice_completion_sum = 0
             upstream_read_error = False
             size_limit_exceeded = False
             memory_limit_exceeded = False
@@ -4855,15 +4903,10 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             required_choices = max(1, expected_choices)
             effective_prompt_batch_size = max(1, prompt_batch_size)
             n_per_prompt = max(1, required_choices // effective_prompt_batch_size)
-
-            def _aggregate_prompt_tokens(p_vals: List[int]) -> int:
-                if len(p_vals) == 1:
-                    return p_vals[0]
-                if effective_prompt_batch_size <= 1:
-                    return max(p_vals)
-                if n_per_prompt > 1 and len(p_vals) >= required_choices:
-                    return sum(p_vals) // n_per_prompt
-                return sum(p_vals)
+            max_final_usage_frames = min(required_choices, _MAX_TRACKED_STREAM_CHOICES)
+            max_tracked_choices = min(
+                max(64, required_choices), _MAX_TRACKED_STREAM_CHOICES
+            )
 
             def _aggregate_prompt_tokens_by_choice(
                 entries: Mapping[Tuple[int, ...], Tuple[Optional[int], Optional[int]]],
@@ -4899,6 +4942,9 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 nonlocal saw_explicit_completion_usage, saw_interim_usage
                 nonlocal saw_request_wide_usage, saw_final_usage, saw_timings_completion
                 nonlocal saw_done_sentinel, saw_upstream_error_event
+                nonlocal empty_choice_usage_count, empty_choice_prompt_count
+                nonlocal empty_choice_prompt_sum, empty_choice_prompt_max
+                nonlocal empty_choice_completion_sum
                 if not data_lines:
                     return False, False
                 payload_bytes = (
@@ -4961,16 +5007,18 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                         resolved_idx = c_idx
                                     else:
                                         resolved_idx = len(finished_choice_indices)
-                                    finished_choice_indices.add(resolved_idx)
+                                    if (
+                                        resolved_idx in finished_choice_indices
+                                        or len(finished_choice_indices) < max_tracked_choices
+                                    ):
+                                        finished_choice_indices.add(resolved_idx)
                                     event_terminal_indices.append(resolved_idx)
                                 else:
                                     event_has_non_terminal_choice = True
                         output_txt = _extract_choice_output_text(obj)
                         has_audio_out = _has_choice_audio_output(obj)
                         has_token_meta_out = _has_choice_token_metadata_output(obj)
-                        if isinstance(obj.get("prompt_token_ids"), list) and obj.get(
-                            "prompt_token_ids"
-                        ):
+                        if _has_prompt_token_ids(obj):
                             saw_prompt_token_ids = True
                         ev_token_ids_count = _extract_choice_token_id_count(obj)
                         if ev_token_ids_count > 0:
@@ -4985,47 +5033,70 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                     for c_idx, c_len in _extract_choice_output_char_counts(
                                         obj
                                     ).items():
-                                        est_completion_chars_by_choice[c_idx] = (
-                                            est_completion_chars_by_choice.get(c_idx, 0) + c_len
-                                        )
+                                        if (
+                                            c_idx in est_completion_chars_by_choice
+                                            or len(est_completion_chars_by_choice)
+                                            < max_tracked_choices
+                                        ):
+                                            est_completion_chars_by_choice[c_idx] = (
+                                                est_completion_chars_by_choice.get(c_idx, 0) + c_len
+                                            )
                         usage = obj.get("usage")
                         if isinstance(usage, dict):
                             pt = _safe_nonneg_int(usage.get("prompt_tokens"))
                             ct = _safe_nonneg_int(usage.get("completion_tokens"))
                             got_usage_count = (pt is not None) or (ct is not None)
                             if got_usage_count:
-                                made_progress = True
                                 has_choices = isinstance(choices, list) and len(choices) > 0
-                                all_choices_finished_now = all(
-                                    idx in finished_choice_indices
-                                    for idx in range(required_choices)
+                                all_choices_finished_now = (
+                                    len(finished_choice_indices) >= required_choices
+                                    and all(
+                                        idx in finished_choice_indices
+                                        for idx in range(required_choices)
+                                    )
                                 )
                                 if not has_choices:
                                     # Empty-choices usage frame: OpenAI/vLLM emit a single
                                     # request-wide total at the end, whereas llama-server on
                                     # multi-choice streams (n > 1 / batched prompts) can emit
                                     # one empty-choices usage frame per finished choice.
+                                    if empty_choice_usage_count >= max_final_usage_frames:
+                                        saw_upstream_error_event = True
+                                        return False, True
+                                    made_progress = True
                                     saw_request_wide_usage = True
-                                    empty_choice_usage_frames.append((pt, ct))
-                                    p_vals = [
-                                        p for p, _ in empty_choice_usage_frames if p is not None
-                                    ]
-                                    c_vals = [
-                                        c for _, c in empty_choice_usage_frames if c is not None
-                                    ]
-                                    if p_vals:
-                                        prompt_tokens = _aggregate_prompt_tokens(p_vals)
+                                    empty_choice_usage_count += 1
+                                    if pt is not None:
+                                        empty_choice_prompt_count += 1
+                                        empty_choice_prompt_sum += pt
+                                        if pt > empty_choice_prompt_max:
+                                            empty_choice_prompt_max = pt
+                                        if empty_choice_prompt_count == 1:
+                                            prompt_tokens = empty_choice_prompt_sum
+                                        elif effective_prompt_batch_size <= 1:
+                                            prompt_tokens = empty_choice_prompt_max
+                                        elif (
+                                            n_per_prompt > 1
+                                            and empty_choice_prompt_count >= required_choices
+                                        ):
+                                            prompt_tokens = (
+                                                empty_choice_prompt_sum // n_per_prompt
+                                            )
+                                        else:
+                                            prompt_tokens = empty_choice_prompt_sum
                                         saw_explicit_prompt_usage = True
-                                    if c_vals:
-                                        completion_tokens = sum(c_vals)
+                                    if ct is not None:
+                                        empty_choice_completion_sum += ct
+                                        completion_tokens = empty_choice_completion_sum
                                         saw_explicit_completion_usage = True
                                     if (
                                         required_choices <= 1
                                         or all_choices_finished_now
-                                        or len(empty_choice_usage_frames) >= required_choices
+                                        or empty_choice_usage_count >= required_choices
                                     ):
                                         saw_final_usage = True
                                 else:
+                                    made_progress = True
                                     is_terminal_only_usage = (
                                         event_has_terminal_choice
                                         and not event_has_non_terminal_choice
@@ -5042,6 +5113,12 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                             if event_choice_indices
                                             else (-1,)
                                         )
+                                        if (
+                                            usage_key not in per_choice_usage
+                                            and len(per_choice_usage) >= max_tracked_choices
+                                        ):
+                                            saw_upstream_error_event = True
+                                            return False, True
                                         prev_p, prev_c = per_choice_usage.get(
                                             usage_key, (None, None)
                                         )
@@ -5077,11 +5154,17 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                 if event_choice_indices:
                                     t_key = tuple(sorted(set(event_choice_indices)))
                                     per_choice_timings.pop((-1,), None)
-                                    prev_p, prev_c = per_choice_timings.get(t_key, (None, None))
-                                    per_choice_timings[t_key] = (
-                                        t_pt if t_pt is not None else prev_p,
-                                        t_ct if t_ct is not None else prev_c,
-                                    )
+                                    if (
+                                        t_key in per_choice_timings
+                                        or len(per_choice_timings) < max_tracked_choices
+                                    ):
+                                        prev_p, prev_c = per_choice_timings.get(
+                                            t_key, (None, None)
+                                        )
+                                        per_choice_timings[t_key] = (
+                                            t_pt if t_pt is not None else prev_p,
+                                            t_ct if t_ct is not None else prev_c,
+                                        )
                                 else:
                                     prev_p, prev_c = per_choice_timings.get((-1,), (None, None))
                                     per_choice_timings.clear()
@@ -5110,11 +5193,13 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                     return False, False
 
             def process_sse_event() -> bool:
-                nonlocal current_event_type
+                nonlocal current_event_type, upstream_read_error
                 ev_type = current_event_type
                 current_event_type = ""
-                made_progress, _ = process_sse_event_from(ev_type, event_data_lines)
+                made_progress, is_done = process_sse_event_from(ev_type, event_data_lines)
                 event_data_lines.clear()
+                if is_done and not made_progress:
+                    upstream_read_error = True
                 return made_progress
 
             def inspect_sse_line(raw_line: bytes) -> bool:
@@ -5226,8 +5311,14 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         event_data_lines.clear()
                         size_limit_exceeded = True
                         break
+                    if upstream_read_error:
+                        break
                     scan = ln_end
-                if not memory_limit_exceeded and not size_limit_exceeded:
+                if (
+                    not memory_limit_exceeded
+                    and not size_limit_exceeded
+                    and not upstream_read_error
+                ):
                     write_chunk(pre_commit_buf)
             except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
                 downstream_write_error = True
@@ -5243,6 +5334,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 and not saw_done_sentinel
                 and not memory_limit_exceeded
                 and not size_limit_exceeded
+                and not upstream_read_error
             ):
                 if isinstance(upstream_sock, DeadlineSocket):
                     upstream_sock._check_client_on_fast_read = False
@@ -5502,8 +5594,11 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
 
             # Per WHATWG SSE spec, discard any incomplete (unterminated) event data at EOF
             # rather than letting it satisfy completion checks.
-            all_choices_finished = all(
-                idx in finished_choice_indices for idx in range(required_choices)
+            all_choices_finished = (
+                len(finished_choice_indices) >= required_choices
+                and all(
+                    idx in finished_choice_indices for idx in range(required_choices)
+                )
             )
             usage_satisfied = (not expect_final_usage) or saw_final_usage
             stream_completed = (
