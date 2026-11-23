@@ -15428,6 +15428,183 @@ asyncio.run(main())
         parsed = json.loads(body.decode("utf-8"))
         self.assertEqual(parsed["error"]["code"], "request_header_fields_too_large")
 
+    def test_model_not_found_404_tries_other_backends_without_cooling_down_worker(
+        self,
+    ) -> None:
+        def _make_selective_server(
+            backend_id: str,
+            served_model: str,
+            *,
+            top_level_vllm_error: bool = False,
+        ) -> ThreadingHTTPServer:
+            class _SelectiveHandler(BaseHTTPRequestHandler):
+                protocol_version = "HTTP/1.1"
+
+                def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                    pass
+
+                def do_GET(self) -> None:  # noqa: N802
+                    if self.path == "/health":
+                        self.send_response(200)
+                        self.send_header("Content-Length", "2")
+                        self.end_headers()
+                        self.wfile.write(b"ok")
+                        return
+                    body = json.dumps(
+                        {"object": "list", "data": [{"id": served_model}]}
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def do_POST(self) -> None:  # noqa: N802
+                    cl = int(self.headers.get("Content-Length", "0"))
+                    req = json.loads(self.rfile.read(cl).decode("utf-8"))
+                    req_model = req.get("model")
+                    if req_model != served_model:
+                        if top_level_vllm_error:
+                            err_obj: Dict[str, Any] = {
+                                "object": "error",
+                                "message": f"The model `{req_model}` does not exist.",
+                                "type": "NotFoundError",
+                                "param": "model",
+                                "code": 404,
+                            }
+                        else:
+                            err_obj = {
+                                "error": {
+                                    "message": f"The model `{req_model}` does not exist.",
+                                    "type": "NotFoundError",
+                                    "param": "model",
+                                    "code": 404,
+                                }
+                            }
+                        body = json.dumps(err_obj).encode("utf-8")
+                        self.send_response(404)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
+                    ok_body = json.dumps(
+                        {
+                            "id": f"chatcmpl-{backend_id}",
+                            "object": "chat.completion",
+                            "model": served_model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": f"served-by:{backend_id}",
+                                    },
+                                    "finish_reason": "stop",
+                                }
+                            ],
+                            "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+                        }
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(ok_body)))
+                    self.end_headers()
+                    self.wfile.write(ok_body)
+
+            srv = ThreadingHTTPServer(("127.0.0.1", 0), _SelectiveHandler)
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            return srv
+
+        primary_srv = _make_selective_server(
+            "wildcard-primary", "local-model", top_level_vllm_error=False
+        )
+        fallback_srv = _make_selective_server(
+            "fallback-llama", "llama", top_level_vllm_error=True
+        )
+        try:
+            cfg = RouterConfig(
+                host="127.0.0.1",
+                port=0,
+                policy="local_first",
+                failure_cooldown_s=60.0,
+                backends=[
+                    BackendConfig(
+                        id="wildcard-primary",
+                        local=True,
+                        discover_models=False,
+                        health_path="/health",
+                        base_url=f"http://127.0.0.1:{primary_srv.server_address[1]}",
+                        models=["*"],
+                    ),
+                    BackendConfig(
+                        id="fallback-llama",
+                        local=False,
+                        discover_models=False,
+                        health_path="/health",
+                        base_url=f"http://127.0.0.1:{fallback_srv.server_address[1]}",
+                        models=["*"],
+                    ),
+                ],
+            )
+            router = self._track(create_router_server(cfg))
+            rport = router.server_address[1]
+
+            # (a) Request for `llama` tries wildcard primary (404 param=model), fails over to fallback.
+            st1, hdrs1, bd1 = _http_request(
+                rport,
+                "POST",
+                "/v1/chat/completions",
+                body={
+                    "model": "llama",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+            self.assertEqual(st1, 200)
+            self.assertEqual(hdrs1.get("x-freetpu-backend"), "fallback-llama")
+            self.assertEqual(hdrs1.get("x-freetpu-failovers"), "1")
+            self.assertIn(b"served-by:fallback-llama", bd1)
+
+            # (b) Primary stays healthy (not cooled down) and serves its own model immediately.
+            primary_state = router.engine._backends[0]
+            self.assertTrue(primary_state.healthy)
+            self.assertEqual(primary_state.cooldown_until_monotonic, 0.0)
+            self.assertEqual(primary_state.total_failures, 0)
+
+            st2, hdrs2, bd2 = _http_request(
+                rport,
+                "POST",
+                "/v1/chat/completions",
+                body={
+                    "model": "local-model",
+                    "messages": [{"role": "user", "content": "hi local"}],
+                },
+            )
+            self.assertEqual(st2, 200)
+            self.assertEqual(hdrs2.get("x-freetpu-backend"), "wildcard-primary")
+            self.assertEqual(hdrs2.get("x-freetpu-failovers"), "0")
+            self.assertIn(b"served-by:wildcard-primary", bd2)
+
+            # (c) When NO candidate serves the model, router returns 404 cleanly to the client.
+            st3, _, bd3 = _http_request(
+                rport,
+                "POST",
+                "/v1/chat/completions",
+                body={
+                    "model": "unknown-model",
+                    "messages": [{"role": "user", "content": "hi unknown"}],
+                },
+            )
+            self.assertEqual(st3, 404)
+            self.assertIn(b"unknown-model", bd3)
+            self.assertTrue(router.engine._backends[0].healthy)
+            self.assertTrue(router.engine._backends[1].healthy)
+        finally:
+            primary_srv.shutdown()
+            primary_srv.server_close()
+            fallback_srv.shutdown()
+            fallback_srv.server_close()
+
 
 def run_self_tests(verbosity: int = 1) -> int:
     """Run all router tests cleanly via unittest."""

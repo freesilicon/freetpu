@@ -1467,6 +1467,36 @@ def _bounded_sse_json_loads(
             engine.release_response_memory(parse_extra)
 
 
+def _is_model_not_found_404(status_code: int, body: bytes) -> bool:
+    """Return True when an upstream 404 JSON error indicates the worker lacks the requested model."""
+    if status_code != 404 or not body or len(body) > MAX_ERROR_RESPONSE_BYTES:
+        return False
+    try:
+        _validate_json_structure(
+            body,
+            max_depth=DEFAULT_MAX_JSON_DEPTH,
+            max_nodes=DEFAULT_MAX_RESPONSE_JSON_NODES,
+        )
+        obj = json.loads(body.decode("utf-8"))
+    except (_JsonStructureLimitError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return False
+    if not isinstance(obj, Mapping):
+        return False
+    candidates: List[Mapping[str, Any]] = []
+    inner = obj.get("error")
+    if isinstance(inner, Mapping):
+        candidates.append(inner)
+    candidates.append(obj)
+    for mapping in candidates:
+        param = mapping.get("param")
+        if isinstance(param, str) and param.strip().lower() == "model":
+            return True
+        code = mapping.get("code")
+        if isinstance(code, str) and code.strip().lower() == "model_not_found":
+            return True
+    return False
+
+
 def _classify_sse_error_event(
     event_type: str,
     payload_bytes: bytes,
@@ -1528,6 +1558,10 @@ def _classify_sse_error_event(
 
     err_type = str(err_mapping.get("type") or "").strip().lower()
     err_code = str(err_mapping.get("code") or "").strip().lower()
+    err_param = str(err_mapping.get("param") or "").strip().lower()
+    is_model_not_found = (err_code == "model_not_found") or (
+        err_param == "model" and (raw_status == 404 or "notfound" in err_type or err_type == "not_found_error")
+    )
     is_client_error = (
         (
             raw_status is not None
@@ -1536,10 +1570,16 @@ def _classify_sse_error_event(
         )
         or err_type in _NON_RETRYABLE_SSE_ERROR_TYPES
         or err_code in _NON_RETRYABLE_SSE_ERROR_CODES
+        or is_model_not_found
     )
 
     if is_client_error:
-        status_code = raw_status if (raw_status is not None and 400 <= raw_status < 500) else 400
+        if raw_status is not None and 400 <= raw_status < 500:
+            status_code = raw_status
+        elif is_model_not_found:
+            status_code = 404
+        else:
+            status_code = 400
         is_retryable = False
     else:
         status_code = (
@@ -1549,7 +1589,9 @@ def _classify_sse_error_event(
         )
         is_retryable = True
 
-    if isinstance(parsed, Mapping) and parsed.get("error") is not None:
+    if isinstance(parsed, Mapping) and (
+        parsed.get("error") is not None or parsed.get("object") == "error"
+    ):
         body = (json.dumps(parsed) + "\n").encode("utf-8")
     elif isinstance(parsed, Mapping):
         msg = str(parsed.get("message") or "Upstream SSE error")
@@ -4911,6 +4953,19 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                             0,
                         )
                     elif sse_outcome == "client_error":
+                        if sse_err_body and _is_model_not_found_404(sse_err_status, sse_err_body):
+                            # Backend does not serve this model: try other candidates without
+                            # cooling down or marking this worker unhealthy for its other models.
+                            last_error_status = 404
+                            last_error_msg = (
+                                f"Backend {backend.config.id!r} does not serve model {model!r}"
+                            )
+                            last_error_type = "invalid_request_error"
+                            last_error_code = "model_not_found"
+                            last_error_body = sse_err_body
+                            last_error_content_type = "application/json"
+                            prev_failure = (backend.config.id, "model_not_found")
+                            continue
                         latency_ms = (time.monotonic() - req_start) * 1000.0
                         attempt_ms = (time.monotonic() - attempt_start) * 1000.0
                         non_stream_result = (
@@ -5120,6 +5175,24 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                             completion_tokens_val,
                                         )
                         else:
+                            if resp.status == 404 and _is_model_not_found_404(
+                                resp.status, raw_resp
+                            ):
+                                # Worker does not host the requested model (e.g. wildcard backend
+                                # with discover_models=False): try remaining candidates without
+                                # penalizing this worker's health or cooldown.
+                                last_error_status = 404
+                                last_error_msg = (
+                                    f"Backend {backend.config.id!r} does not serve model {model!r}"
+                                )
+                                last_error_type = "invalid_request_error"
+                                last_error_code = "model_not_found"
+                                last_error_body = raw_resp
+                                last_error_content_type = (
+                                    resp.getheader("Content-Type") or "application/json"
+                                )
+                                prev_failure = (backend.config.id, "model_not_found")
+                                continue
                             latency_ms = (time.monotonic() - req_start) * 1000.0
                             attempt_ms = (time.monotonic() - attempt_start) * 1000.0
                             content_type = resp.getheader("Content-Type") or "application/json"
