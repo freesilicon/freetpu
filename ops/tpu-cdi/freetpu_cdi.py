@@ -8,8 +8,8 @@ to generate a boot-scoped CNCF Container Device Interface (CDI) specification
 `--cdi-version 1.1.0`, output default: /var/run/cdi/freetpu.json) exposing:
   - `freetpu.dev/tpu=pci-<bdf>` (and `group-pci-...` for shared IOMMU groups)
   - NUMA / PCIe-root-complex-aware capacity-pinned sub-host presets (`numa0-4`,
-    `numa1-4`, `pcie0-4`, `0-3`, `4-7`) on multi-root hosts (e.g. Cloud TPU v6e-8
-    `0000:00` vs `0000:80`)
+    `numa1-4`, `pcie-0000-00-4`, `0-3`, `4-7`) on multi-root hosts (e.g. Cloud
+    TPU v6e-8 `0000:00` vs `0000:80`)
   - `freetpu.dev/tpu=all`
 
 Also supports:
@@ -422,6 +422,53 @@ def _load_chip_id_map(raw: Optional[str]) -> Optional[Dict[str, int]]:
     return result
 
 
+def _legacy_vfio_control_usable(
+    legacy_control: Path,
+    effective_iommu: Path,
+    sysfs_root: Path,
+    *,
+    legacy_is_iommu_compat: bool,
+    allow_missing_vfio: bool,
+) -> bool:
+    """Return True iff the legacy VFIO control node exists and matches kernel sysfs."""
+    control_node = (
+        effective_iommu
+        if (legacy_is_iommu_compat and legacy_control.is_symlink())
+        else legacy_control
+    )
+    if not control_node.exists():
+        return False
+    if allow_missing_vfio:
+        return True
+    actual_dn = _stat_char_devnum(control_node)
+    if actual_dn is None:
+        return False
+    kernel_dn = (
+        _read_kernel_iommu_devnum(sysfs_root)
+        if legacy_is_iommu_compat
+        else _read_kernel_vfio_devnum(sysfs_root, group=None)
+    )
+    return kernel_dn is not None and actual_dn == kernel_dn
+
+
+def _iommufd_control_usable(
+    effective_iommu: Path,
+    sysfs_root: Path,
+    *,
+    allow_missing_vfio: bool,
+) -> bool:
+    """Return True iff `/dev/iommu` exists and matches kernel sysfs `misc/iommu/dev`."""
+    if not effective_iommu.exists():
+        return False
+    if allow_missing_vfio:
+        return True
+    actual_dn = _stat_char_devnum(effective_iommu)
+    if actual_dn is None:
+        return False
+    kernel_dn = _read_kernel_iommu_devnum(sysfs_root)
+    return kernel_dn is not None and actual_dn == kernel_dn
+
+
 def _iommufd_cdev_usable(
     tpu_candidates: Sequence[Tuple[Path, str, str, str]],
     sysfs_root: Path,
@@ -552,28 +599,47 @@ def discover_tpu_chips(
     elif norm_mode == "legacy":
         use_iommufd = False
     else:
-        # auto: preserve legacy VFIO whenever its control node and group nodes
-        # are usable. On Linux kernels where `/dev/vfio/vfio` is an iommufd
-        # compatibility symlink/node (`CONFIG_IOMMUFD_VFIO_CONTAINER`), legacy
-        # `/dev/vfio/<group>` access can still be active without `vfio-dev/vfioN`
-        # cdevs enabled, so only switch to iommufd cdev automatically when legacy
-        # groups are unusable AND every TPU exposes a verified cdev.
+        # auto: prefer legacy VFIO whenever BOTH its control node and all
+        # `/dev/vfio/<iommu_group>` nodes are verified and usable. On Linux 6.8+
+        # (`CONFIG_IOMMUFD_VFIO_CONTAINER`), `/dev/vfio/vfio` may be exposed as
+        # either a compatibility symlink or a real misc char device even when
+        # legacy `/dev/vfio/<group>` nodes are omitted; in that case fall back
+        # to iommufd cdev whenever `/dev/iommu` and every TPU's `vfio-dev/vfioN`
+        # cdev are verified and usable. Never fall back past an unrecognized
+        # symlink at `/dev/vfio/vfio`.
         if not has_legacy_control:
             use_iommufd = has_iommu_control
-        elif legacy_is_iommu_compat and has_iommu_control:
+        elif has_iommu_control and not (
+            legacy_control.is_symlink() and not legacy_is_iommu_compat
+        ):
+            legacy_ctrl_usable = _legacy_vfio_control_usable(
+                legacy_control,
+                effective_iommu,
+                sysfs_root,
+                legacy_is_iommu_compat=legacy_is_iommu_compat,
+                allow_missing_vfio=allow_missing_vfio,
+            )
             groups_usable = _legacy_vfio_groups_usable(
                 tpu_candidates,
                 sysfs_root,
                 dev_root,
                 allow_missing_vfio=allow_missing_vfio,
             )
-            cdevs_usable = _iommufd_cdev_usable(
-                tpu_candidates,
-                sysfs_root,
-                dev_root,
-                allow_missing_vfio=allow_missing_vfio,
-            )
-            use_iommufd = (not groups_usable) and cdevs_usable
+            if legacy_ctrl_usable and groups_usable:
+                use_iommufd = False
+            else:
+                iommu_ctrl_usable = _iommufd_control_usable(
+                    effective_iommu,
+                    sysfs_root,
+                    allow_missing_vfio=allow_missing_vfio,
+                )
+                cdevs_usable = _iommufd_cdev_usable(
+                    tpu_candidates,
+                    sysfs_root,
+                    dev_root,
+                    allow_missing_vfio=allow_missing_vfio,
+                )
+                use_iommufd = iommu_ctrl_usable and cdevs_usable
         else:
             use_iommufd = False
 
@@ -868,14 +934,43 @@ def _distinct_physical_indices(
     return ordered
 
 
-# Supported single-host Cloud TPU physical chip topologies. Sub-host slice
-# selectors (`numa*`, `pcie*`, range aliases) are emitted ONLY when a domain's
-# live physical chip count is a supported multi-chip topology and every chip has
-# its full PCI function set, so degraded topologies (e.g. 3 chips on a 4-chip
-# NUMA half after one TPU disappears) withdraw the selector instead of exposing
-# unsupported shapes like `TPU_CHIPS_PER_HOST_BOUNDS=1,3,1`.
-_SUPPORTED_SINGLE_HOST_CHIP_COUNTS = frozenset({1, 2, 4, 8})
-_SUPPORTED_SUBHOST_SLICE_CHIP_COUNTS = frozenset({2, 4, 8})
+# Supported single-host Cloud TPU physical chip topologies per generation.
+# Per Google Cloud TPU docs, single-VM `v6e`, `v5e`, `v5p`, and `v4` hosts
+# support `{1, 4, 8}` physical chips (NOT 2 — 2 surviving chips in a degraded
+# 4-chip v6e NUMA domain could be diagonal members of the 2x2 torus), while
+# dual-chiplet `tpu7x` (Ironwood) supports `{1, 2, 4, 8}` physical chips
+# (e.g. a 2-chip / 4-core `tpu7x-4` NUMA half on a 4-chip `tpu7x-8` host).
+# Sub-host slice selectors (`numa*`, `pcie-*`, range aliases) are emitted ONLY
+# when a domain's live physical chip count is supported for its generation and
+# every chip has its full PCI function set.
+_SUPPORTED_SINGLE_HOST_CHIP_COUNTS_BY_GEN: Dict[str, frozenset[int]] = {
+    "v6e": frozenset({1, 4, 8}),
+    "v6e-pf": frozenset({1, 4, 8}),
+    "v5e": frozenset({1, 4, 8}),
+    "v5p": frozenset({1, 4, 8}),
+    "v4": frozenset({1, 4, 8}),
+    "tpu7x": frozenset({1, 2, 4, 8}),
+}
+_DEFAULT_SUPPORTED_SINGLE_HOST_CHIP_COUNTS = frozenset({1, 4, 8})
+
+
+def _is_supported_single_host_chip_count(
+    physical_chip_count: int,
+    generations: Sequence[str],
+    *,
+    subhost_slice: bool = False,
+) -> bool:
+    """Return True iff `physical_chip_count` is a supported single-host topology for `generations`."""
+    if subhost_slice and physical_chip_count < 2:
+        return False
+    norm_gens = {"v6e" if g == "v6e-pf" else g for g in generations if g}
+    if len(norm_gens) != 1:
+        return False
+    gen = next(iter(norm_gens))
+    allowed = _SUPPORTED_SINGLE_HOST_CHIP_COUNTS_BY_GEN.get(
+        gen, _DEFAULT_SUPPORTED_SINGLE_HOST_CHIP_COUNTS
+    )
+    return physical_chip_count in allowed
 
 
 def _has_complete_chip_functions(
@@ -1035,7 +1130,7 @@ def _tpu_accelerator_type(
     - `v4` -> `v4-<cores>` (`chips * 2`, e.g. `v4-8`)
     - `tpu7x` (Ironwood) -> `tpu7x-<cores>` (`chips * 2`, e.g. `tpu7x-4`, `tpu7x-8`)
     """
-    if physical_chip_count not in _SUPPORTED_SINGLE_HOST_CHIP_COUNTS:
+    if not _is_supported_single_host_chip_count(physical_chip_count, generations):
         return None
     norm_gens = {"v6e" if g == "v6e-pf" else g for g in generations if g}
     if len(norm_gens) != 1:
@@ -1086,7 +1181,7 @@ def _build_device_env(
     env: List[str] = []
     if (
         include_bounds_env
-        and physical_chip_count in _SUPPORTED_SINGLE_HOST_CHIP_COUNTS
+        and _is_supported_single_host_chip_count(physical_chip_count, generations)
     ):
         if verified_visibility is not None:
             vis_chips, vis_devices = verified_visibility
@@ -1172,28 +1267,31 @@ def _compute_topology_slices(
 
         slice_bdfs = tuple(sorted(c.pci_bdf for c in d_chips))
         slice_phys_indices = tuple(_distinct_physical_indices(d_chips, bdf_to_phys))
-        if (
-            len(slice_phys_indices) not in _SUPPORTED_SUBHOST_SLICE_CHIP_COUNTS
-            or not _has_complete_chip_functions(d_chips, bdf_to_phys)
-        ):
-            continue
-        slice_logical_indices = tuple(_logical_device_indices(d_chips, slice_phys_indices))
         slice_gens: List[str] = []
         for c in d_chips:
             if c.generation not in slice_gens:
                 slice_gens.append(c.generation)
+        if (
+            not _is_supported_single_host_chip_count(
+                len(slice_phys_indices), slice_gens, subhost_slice=True
+            )
+            or not _has_complete_chip_functions(d_chips, bdf_to_phys)
+        ):
+            continue
+        slice_logical_indices = tuple(_logical_device_indices(d_chips, slice_phys_indices))
 
         discovered_numa = d_key[1]
         pcie_root = d_key[2]
         slice_chip_count = len(slice_phys_indices)
-        # Capacity-pinned topology selector names (`numa<node>-<chips>` /
-        # `pcie<domain>-<chips>`) ensure a degraded 4->2 chip domain withdraws
-        # `numa0-4` (failing 4-chip claims closed) instead of republishing the
-        # same selector with half its expected capacity.
+        # Capacity-pinned and topology-identity-bound selector names
+        # (`numa<node>-<chips>` / `pcie-<root>-<chips>`) ensure neither partial
+        # chip loss nor loss of an earlier PCIe root can shrink or retarget an
+        # existing selector to a different root complex.
+        pcie_root_token = _pci_bdf_token(pcie_root)
         candidate_names = (
             [f"numa{discovered_numa}-{slice_chip_count}"]
             if use_explicit_numa and discovered_numa is not None
-            else [f"pcie{dom_ordinal}-{slice_chip_count}"]
+            else [f"pcie-{pcie_root_token}-{slice_chip_count}"]
         )
         verified_vis = _resolve_verified_visibility_ordinals(
             d_chips,
@@ -1412,8 +1510,8 @@ def build_cdi_spec(
             )
 
     # Emit NUMA / PCIe-root-complex-aware capacity-pinned sub-host slice presets
-    # (e.g. `numa0-4`, `numa1-4`, `pcie0-4`, `0-3`, `4-7` on `v6e-8`) strictly
-    # within matching NUMA / PCIe root complex boundaries.
+    # (e.g. `numa0-4`, `numa1-4`, `pcie-0000-00-4`, `0-3`, `4-7` on `v6e-8`)
+    # strictly within matching NUMA / PCIe root complex boundaries.
     used_names = {d["name"] for d in devices}
     for topo_slice in _compute_topology_slices(
         chips, bdf_to_phys, reserved_names=used_names, chip_id_map=chip_id_map

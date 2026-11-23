@@ -44,13 +44,15 @@ spec:
 ---
 # Example ResourceSlice published by a node-local `freetpu-dra-driver` DaemonSet
 # for a single Cloud TPU v6e-8 host (`0000:00` on NUMA 0, `0000:80` on NUMA 1).
-# Note: `freetpu_cdi.py` emits capacity-pinned sub-host slice selectors
-# (`numa<node>-<chips>`, e.g. `numa0-4`, `numa1-4`, or `pcie<domain>-<chips>`)
-# so if a 4-chip NUMA half drops to 3 chips (unsupported) OR 2 chips (valid
-# `numa0-2` only), `numa0-4` is withdrawn and any 4-chip claim bound to
-# `freetpu.dev/tpu=numa0-4` fails closed instead of silently shrinking. A DRA
-# driver publishing `ResourceSlice` objects must still reconcile against live
-# CDI selectors and withdraw degraded slices before scheduling new claims.
+# Note: `freetpu_cdi.py` emits capacity-pinned, root-bound sub-host slice
+# selectors (`numa<node>-<chips>`, e.g. `numa0-4`, `numa1-4`, or
+# `pcie-<root>-<chips>`) only for supported generation topologies (`{4, 8}`
+# chips for `v6e` / `v5e` / `v5p`, `{2, 4, 8}` for `tpu7x`). If a 4-chip v6e
+# NUMA half drops to 3 or 2 chips, `numa0-4` is withdrawn completely (no
+# degraded 2-chip v6e slice is emitted) so 4-chip claims fail closed instead
+# of silently shrinking or attaching an unverified torus diagonal. A DRA driver
+# publishing `ResourceSlice` objects must still reconcile against live CDI
+# selectors and withdraw degraded slices before scheduling new claims.
 apiVersion: resource.k8s.io/v1
 kind: ResourceSlice
 metadata:

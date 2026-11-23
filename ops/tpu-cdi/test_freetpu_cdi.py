@@ -2143,6 +2143,63 @@ class FreeTpuCdiTests(unittest.TestCase):
                     any("/dev/vfio/devices/vfioN" in e for e in bad_errs), bad_errs
                 )
 
+            # 1e. Linux 6.8+ `CONFIG_IOMMUFD_VFIO_CONTAINER` real char `/dev/vfio/vfio`
+            #     with its OWN misc devnum (`10:196`) when legacy `/dev/vfio/<group>`
+            #     nodes are omitted from the device mount, while `/dev/iommu` + verified
+            #     cdevs ARE present: `vfio_mode="auto"` MUST check legacy group usability
+            #     and fall back to verified iommufd cdev instead of failing discovery!
+            compat_char_sys, compat_char_dev = _make_mock_pci_vfio(
+                root / "compat_char_no_groups_cdev_ready",
+                devices=[
+                    {
+                        "bdf": "0000:00:0b.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "1",
+                        "iommufd_cdev": "vfio0",
+                    },
+                    {
+                        "bdf": "0000:00:0c.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "2",
+                        "iommufd_cdev": "vfio1",
+                    },
+                ],
+                create_vfio_container=True,   # real char `/dev/vfio/vfio` with own misc/vfio/dev!
+                create_vfio_nodes=[],         # legacy `/dev/vfio/<group>` omitted!
+                create_iommu=True,
+                create_iommufd_cdevs=["vfio0", "vfio1"],
+            )
+            with _mock_vfio_char_devices():
+                cc_chips, cc_ctrl = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=compat_char_sys,
+                    dev_root=compat_char_dev,
+                    vfio_mode="auto",
+                )
+                self.assertEqual(cc_ctrl, compat_char_dev / "iommu")
+                self.assertEqual([c.vfio_mode for c in cc_chips], ["iommufd", "iommufd"])
+                cc_spec = freetpu_cdi.build_cdi_spec(cc_chips, cc_ctrl)
+                self.assertEqual(freetpu_cdi.validate_cdi_spec(cc_spec), [])
+                self.assertEqual(
+                    freetpu_cdi.verify_spec_against_host(
+                        cc_spec,
+                        sysfs_root=compat_char_sys,
+                        dev_root=compat_char_dev,
+                    ),
+                    [],
+                )
+                cc_out = root / "compat_char_cdev.json"
+                cc_ok, cc_msg = freetpu_cdi.reconcile_cdi_spec(
+                    cc_out,
+                    sysfs_root=compat_char_sys,
+                    dev_root=compat_char_dev,
+                    vfio_mode="auto",
+                )
+                self.assertTrue(cc_ok, cc_msg)
+
             # 2. Dual-interface host: BOTH legacy VFIO and /dev/iommu exist.
             #    Default `vfio_mode="auto"` MUST preserve legacy VFIO (even when TPU
             #    cdevs are absent or present); explicit `--vfio-mode iommufd`/`cdev` opts in.
@@ -2656,9 +2713,10 @@ class FreeTpuCdiTests(unittest.TestCase):
                 )
 
                 # Degraded NUMA 0 (2 TPUs disappear -> 2 chips on NUMA 0, 4 on NUMA 1):
-                # `numa0-4` MUST be withdrawn (failing 4-chip DRA claims closed!) while
-                # `numa0-2` is published with explicit 2-chip capacity and healthy `numa1-4`
-                # stays published!
+                # Per Google Cloud v6e docs, single-VM v6e supports {1, 4, 8} chips ONLY
+                # (2 surviving chips in a degraded 2x2 slice could be a torus diagonal!).
+                # BOTH `numa0-4` AND `numa0-2` MUST be withdrawn (never injecting `v6e-2`
+                # or `1,2,1`!), while healthy 4-chip `numa1-4` stays published!
                 deg2_root = root / "v6e8_degraded_numa0_two_chips"
                 deg2_sys, deg2_dev = _make_mock_pci_vfio(
                     deg2_root,
@@ -2676,11 +2734,15 @@ class FreeTpuCdiTests(unittest.TestCase):
                 deg2_spec = json.loads(deg2_out.read_text(encoding="utf-8"))
                 deg2_by_name = {d["name"]: d for d in deg2_spec["devices"]}
                 self.assertNotIn("numa0-4", deg2_by_name)
+                self.assertNotIn("numa0-2", deg2_by_name)
                 self.assertNotIn("numa0", deg2_by_name)
-                self.assertIn("numa0-2", deg2_by_name)
-                self.assertEqual(deg2_by_name["numa0-2"]["annotations"]["freetpu.dev/chip-count"], "2")
                 self.assertIn("numa1-4", deg2_by_name)
                 self.assertEqual(deg2_by_name["numa1-4"]["annotations"]["freetpu.dev/chip-count"], "4")
+                deg2_all_env = dict(
+                    kv.split("=", 1) for kv in deg2_by_name["all"]["containerEdits"]["env"]
+                )
+                self.assertNotIn("TPU_CHIPS_PER_HOST_BOUNDS", deg2_all_env)
+                self.assertNotIn("TPU_ACCELERATOR_TYPE", deg2_all_env)
                 errs_deg2_old = freetpu_cdi.verify_spec_against_host(
                     spec, sysfs_root=deg2_sys, dev_root=deg2_dev
                 )
@@ -2916,18 +2978,124 @@ class FreeTpuCdiTests(unittest.TestCase):
                     [],
                 )
                 sw_by_name = {d["name"]: d for d in sw_spec["devices"]}
-                self.assertTrue({"pcie0-4", "pcie1-4", "all"} <= set(sw_by_name), sw_by_name.keys())
+                self.assertTrue(
+                    {"pcie-0000-00-4", "pcie-0000-80-4", "all"} <= set(sw_by_name),
+                    sw_by_name.keys(),
+                )
+                self.assertNotIn("pcie0-4", sw_by_name)
+                self.assertNotIn("pcie1-4", sw_by_name)
                 self.assertNotIn("0-3", sw_by_name)
                 self.assertNotIn("4-7", sw_by_name)
                 self.assertNotIn("numa0-4", sw_by_name)
                 self.assertNotIn("numa1-4", sw_by_name)
-                self.assertNotIn("freetpu.dev/numa-node", sw_by_name["pcie0-4"]["annotations"])
-                self.assertNotIn("freetpu.dev/numa-node", sw_by_name["pcie1-4"]["annotations"])
-                self.assertEqual(sw_by_name["pcie0-4"]["annotations"]["freetpu.dev/pcie-domain"], "0")
-                self.assertEqual(sw_by_name["pcie1-4"]["annotations"]["freetpu.dev/pcie-domain"], "1")
+                self.assertNotIn("freetpu.dev/numa-node", sw_by_name["pcie-0000-00-4"]["annotations"])
+                self.assertNotIn("freetpu.dev/numa-node", sw_by_name["pcie-0000-80-4"]["annotations"])
+                self.assertEqual(
+                    sw_by_name["pcie-0000-00-4"]["annotations"]["freetpu.dev/pcie-root"],
+                    "0000:00",
+                )
+                self.assertEqual(
+                    sw_by_name["pcie-0000-80-4"]["annotations"]["freetpu.dev/pcie-root"],
+                    "0000:80",
+                )
 
-            # When two PCIe roots SHARE Linux NUMA node 0, BOTH slices must keep
-            # `freetpu.dev/numa-node == "0"` (never writing domain ordinal "1" as NUMA node 1).
+            # On a 3-PCIe-root host (`0000:00`, `0000:40`, `0000:80`, no numa_node),
+            # losing root `0000:00` MUST withdraw `pcie-0000-00-4` while keeping
+            # `pcie-0000-40-4` and `pcie-0000-80-4` bound to their exact roots
+            # (NEVER shifting ordinals to retarget root 0's selector onto root 1!).
+            tri_root = root / "three_pcie_roots"
+            tri_devs = (
+                [
+                    {
+                        "bdf": f"0000:00:0{i:x}.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": str(i),
+                    }
+                    for i in range(4)
+                ]
+                + [
+                    {
+                        "bdf": f"0000:40:0{i:x}.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": str(4 + i),
+                    }
+                    for i in range(4)
+                ]
+                + [
+                    {
+                        "bdf": f"0000:80:0{i:x}.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": str(8 + i),
+                    }
+                    for i in range(4)
+                ]
+            )
+            tri_sys, tri_dev = _make_mock_pci_vfio(
+                tri_root / "all3",
+                devices=tri_devs,
+                create_vfio_nodes=[str(i) for i in range(12)],
+            )
+            tri_lost0_sys, tri_lost0_dev = _make_mock_pci_vfio(
+                tri_root / "lost_root0",
+                devices=tri_devs[4:],  # drop entire 0000:00 root, keep 0000:40 and 0000:80
+                create_vfio_nodes=[str(i) for i in range(4, 12)],
+            )
+            with _mock_vfio_char_devices():
+                tri_chips, tri_ctrl = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=tri_sys, dev_root=tri_dev
+                )
+                tri_spec = freetpu_cdi.build_cdi_spec(tri_chips, tri_ctrl)
+                tri_by_name = {d["name"]: d for d in tri_spec["devices"]}
+                self.assertTrue(
+                    {"pcie-0000-00-4", "pcie-0000-40-4", "pcie-0000-80-4"} <= set(tri_by_name),
+                    tri_by_name.keys(),
+                )
+                self.assertEqual(
+                    freetpu_cdi.verify_spec_against_host(
+                        tri_spec, sysfs_root=tri_sys, dev_root=tri_dev
+                    ),
+                    [],
+                )
+
+                tri_lost_chips, tri_lost_ctrl = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=tri_lost0_sys, dev_root=tri_lost0_dev
+                )
+                tri_lost_spec = freetpu_cdi.build_cdi_spec(tri_lost_chips, tri_lost_ctrl)
+                tri_lost_by_name = {d["name"]: d for d in tri_lost_spec["devices"]}
+                self.assertNotIn("pcie-0000-00-4", tri_lost_by_name)
+                self.assertIn("pcie-0000-40-4", tri_lost_by_name)
+                self.assertIn("pcie-0000-80-4", tri_lost_by_name)
+                self.assertEqual(
+                    tri_lost_by_name["pcie-0000-40-4"]["annotations"]["freetpu.dev/pcie-root"],
+                    "0000:40",
+                )
+                self.assertEqual(
+                    tri_lost_by_name["pcie-0000-80-4"]["annotations"]["freetpu.dev/pcie-root"],
+                    "0000:80",
+                )
+                self.assertEqual(
+                    freetpu_cdi.verify_spec_against_host(
+                        tri_lost_spec, sysfs_root=tri_lost0_sys, dev_root=tri_lost0_dev
+                    ),
+                    [],
+                )
+                errs_lost0 = freetpu_cdi.verify_spec_against_host(
+                    tri_spec, sysfs_root=tri_lost0_sys, dev_root=tri_lost0_dev
+                )
+                self.assertTrue(
+                    any("device 'pcie-0000-00-4'" in e for e in errs_lost0),
+                    errs_lost0,
+                )
+
+            # When two PCIe roots SHARE Linux NUMA node 0 (4 v6e chips per root), BOTH slices
+            # must keep `freetpu.dev/numa-node == "0"` and use root-bound `pcie-<root>-4` names
+            # (never writing domain ordinal "1" as NUMA node 1).
             shared_numa_root = root / "shared_numa0"
             shared_numa_devs = [
                 {
@@ -2938,22 +3106,22 @@ class FreeTpuCdiTests(unittest.TestCase):
                     "iommu_group": str(i),
                     "numa_node": "0",
                 }
-                for i in range(2)
+                for i in range(4)
             ] + [
                 {
                     "bdf": f"0000:80:0{i:x}.0",
                     "vendor": "0x1ae0",
                     "device": "0x006f",
                     "driver": "vfio-pci",
-                    "iommu_group": str(2 + i),
+                    "iommu_group": str(4 + i),
                     "numa_node": "0",
                 }
-                for i in range(2)
+                for i in range(4)
             ]
             sn_sys, sn_dev = _make_mock_pci_vfio(
                 shared_numa_root,
                 devices=shared_numa_devs,
-                create_vfio_nodes=["0", "1", "2", "3"],
+                create_vfio_nodes=[str(i) for i in range(8)],
             )
             with _mock_vfio_char_devices():
                 sn_chips, sn_ctrl = freetpu_cdi.discover_tpu_chips(
@@ -2961,13 +3129,25 @@ class FreeTpuCdiTests(unittest.TestCase):
                 )
                 sn_spec = freetpu_cdi.build_cdi_spec(sn_chips, sn_ctrl)
                 sn_by_name = {d["name"]: d for d in sn_spec["devices"]}
-                self.assertIn("pcie0-2", sn_by_name)
-                self.assertIn("pcie1-2", sn_by_name)
-                self.assertNotIn("numa1-2", sn_by_name)
-                self.assertEqual(sn_by_name["pcie0-2"]["annotations"]["freetpu.dev/numa-node"], "0")
-                self.assertEqual(sn_by_name["pcie1-2"]["annotations"]["freetpu.dev/numa-node"], "0")
-                self.assertEqual(sn_by_name["pcie0-2"]["annotations"]["freetpu.dev/pcie-domain"], "0")
-                self.assertEqual(sn_by_name["pcie1-2"]["annotations"]["freetpu.dev/pcie-domain"], "1")
+                self.assertIn("pcie-0000-00-4", sn_by_name)
+                self.assertIn("pcie-0000-80-4", sn_by_name)
+                self.assertNotIn("numa1-4", sn_by_name)
+                self.assertEqual(
+                    sn_by_name["pcie-0000-00-4"]["annotations"]["freetpu.dev/numa-node"],
+                    "0",
+                )
+                self.assertEqual(
+                    sn_by_name["pcie-0000-80-4"]["annotations"]["freetpu.dev/numa-node"],
+                    "0",
+                )
+                self.assertEqual(
+                    sn_by_name["pcie-0000-00-4"]["annotations"]["freetpu.dev/pcie-root"],
+                    "0000:00",
+                )
+                self.assertEqual(
+                    sn_by_name["pcie-0000-80-4"]["annotations"]["freetpu.dev/pcie-root"],
+                    "0000:80",
+                )
 
             # Verify Kubernetes DRA example manifest uses stable resource.k8s.io/v1 API
             # and accurately qualifies Kubernetes 1.34 DRA Topology Manager limitation.

@@ -2543,6 +2543,56 @@ TPU Runtime Utilization
                 [(c + 1) * 4 * 1024**3 for c in range(6)],
             )
 
+            # Partial HBM response `{0, 1, 2, 3}` alongside EQUAL duty-cycle IDs `{0, 1, 2, 3}`
+            # on an 8-core / 4-chip Ironwood host is STILL ambiguous (could be physical chips
+            # 0..3 rather than cores 0..3!) and MUST omit duty cycle rather than assigning
+            # chip 1's duty reading to core 1 of chip 0!
+            class _IronwoodEqualPartialHbmDutyStub:
+                def __init__(self, channel):
+                    self.channel = channel
+
+                def GetRuntimeMetric(self, req, timeout=None):
+                    del timeout
+                    if req.metric_name == "tpu.runtime.hbm.memory.usage.bytes":
+                        items = [_make_item(c, as_int=(c + 1) * 4 * 1024**3) for c in range(4)]
+                    elif req.metric_name == "tpu.runtime.hbm.memory.total.bytes":
+                        items = [_make_item(c, as_int=96 * 1024**3) for c in range(4)]
+                    elif req.metric_name == "tpu.runtime.tensorcore.dutycycle.percent":
+                        items = [_make_item(c, as_double=20.0 * (c + 1)) for c in range(4)]
+                    else:
+                        items = []
+                    return SimpleNamespace(metric=SimpleNamespace(metrics=items))
+
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.dict(_te._GRPC_CHANNELS, {}, clear=True),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "grpc": _FakeGrpc,
+                        "tpu_info": SimpleNamespace(),
+                        "tpu_info.proto": SimpleNamespace(),
+                        "tpu_info.proto.tpu_metric_service_pb2": fake_pb2,
+                        "tpu_info.proto.tpu_metric_service_pb2_grpc": SimpleNamespace(
+                            RuntimeMetricServiceStub=_IronwoodEqualPartialHbmDutyStub
+                        ),
+                    },
+                ),
+            ):
+                iw_eq_partial_snap = _te.collect_snapshot(
+                    sysfs_root=iw_sysfs,
+                    dev_root=iw_dev,
+                    proc_root=iw_proc,
+                    tpu_info_bin="tpu-info",
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=iw_root / "no-shm",
+                )
+            self.assertEqual([d.duty_cycle_percent for d in iw_eq_partial_snap.devices], [None] * 8)
+            self.assertEqual(
+                [d.hbm_used_bytes for d in iw_eq_partial_snap.devices[:4]],
+                [(c + 1) * 4 * 1024**3 for c in range(4)],
+            )
+
             # Custom `--tpu-info-bin` specified by bare name (without `/`) MUST invoke
             # that configured executable via PATH instead of taking the default gRPC shortcut.
             custom_rows = _te.parse_tpu_info_output(
@@ -2979,6 +3029,14 @@ TPU Runtime Utilization
                     now_ns=now_ns + 121 * 1_000_000_000,
                 )
             )
+
+            # Verify the C/C++ SHM header documents GCC/Clang-compatible atomic operations
+            # against the plain `uint64_t seq` ABI field (not C11 `atomic_fetch_add(&s->seq, 1)`).
+            shm_hdr_path = Path(__file__).resolve().parent / "freetpu_metrics_shm.h"
+            shm_hdr_text = shm_hdr_path.read_text(encoding="utf-8")
+            self.assertIsNone(re.search(r"(?<!_)atomic_fetch_add\(", shm_hdr_text))
+            self.assertIn("__atomic_fetch_add(&s->seq", shm_hdr_text)
+            self.assertIn("freetpu_shm_metrics_v1_publish", shm_hdr_text)
 
             # Missing heartbeat (timestamp_ns=0) and far-future timestamps fail closed.
             for bad_ts in (0, now_ns + 3600 * 1_000_000_000):
