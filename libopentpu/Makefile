@@ -2,13 +2,21 @@ HOST_CC  ?= clang
 HOST_CXX ?= clang++
 HOST_AR  ?= ar
 
+STATIC_LIBSTDCPP ?= 0
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
   SHLIB_EXT := dylib
   SHLIB_FLAGS := -dynamiclib
+  EXE_LDFLAGS :=
 else
   SHLIB_EXT := so
-  SHLIB_FLAGS := -shared -Wl,--as-needed
+  ifeq ($(STATIC_LIBSTDCPP),1)
+    SHLIB_FLAGS := -shared -static-libstdc++ -static-libgcc -Wl,--as-needed -Wl,--exclude-libs,ALL
+    EXE_LDFLAGS := -static-libstdc++ -static-libgcc -Wl,--as-needed
+  else
+    SHLIB_FLAGS := -shared -Wl,--as-needed
+    EXE_LDFLAGS := -Wl,--as-needed
+  endif
 endif
 
 THIS_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
@@ -36,12 +44,13 @@ SHLIB     := $(BUILD_DIR)/libopentpu.$(SHLIB_EXT)
 STLIB     := $(BUILD_DIR)/libopentpu.a
 HOST_TEST := $(BUILD_DIR)/opentpu_host_test
 SMOKE_BIN := $(BUILD_DIR)/opentpu_vfio_smoke
+PROOF_BIN := $(BUILD_DIR)/opentpu_matmul_proof
 
 .PHONY: all host test verify-header-host clean
 
 all: host
 
-host: $(SHLIB) $(STLIB) $(HOST_TEST) $(SMOKE_BIN)
+host: $(SHLIB) $(STLIB) $(HOST_TEST) $(SMOKE_BIN) $(PROOF_BIN)
 
 $(BUILD_DIR)/obj/%.o: $(THIS_DIR)/src/%.cpp $(HDRS)
 	@mkdir -p $(dir $@)
@@ -63,9 +72,14 @@ $(SMOKE_BIN): $(THIS_DIR)/tools/opentpu_vfio_smoke.cpp $(SHLIB) $(HDRS)
 	@mkdir -p $(dir $@)
 	$(HOST_CXX) $(CXXFLAGS) $< $(SHLIB) -Wl,-rpath,$(BUILD_DIR) -o $@ $(LDFLAGS)
 
-test: verify-header-host $(HOST_TEST) $(SMOKE_BIN)
+$(PROOF_BIN): $(THIS_DIR)/tools/opentpu_matmul_proof.cpp $(SHLIB) $(HDRS)
+	@mkdir -p $(dir $@)
+	$(HOST_CXX) $(CXXFLAGS) $< -o $@ $(EXE_LDFLAGS) $(LDFLAGS)
+
+test: verify-header-host $(HOST_TEST) $(SMOKE_BIN) $(PROOF_BIN)
 	$(HOST_TEST)
 	$(SMOKE_BIN) --mock
+	$(PROOF_BIN) --mock --lib $(SHLIB)
 
 verify-header-host: $(THIS_DIR)/include/opentpu.h
 	$(HOST_CC) -x c -std=c11 -fsyntax-only -Wall -Wextra -Werror $<

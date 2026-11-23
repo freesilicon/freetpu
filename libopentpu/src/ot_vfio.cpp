@@ -302,6 +302,7 @@ void vfio_atfork_child() {
     t->status_page_mem = nullptr;
     t->pci_cmd_saved = false;
     t->ring_ready = false;
+    t->imem_booted = false;
     t->dma_faulted = true;
     g_tracked_transports[i] = nullptr;
   }
@@ -433,7 +434,11 @@ static bool discover_linux_tpu(const char* preferred_bdf, PciDiscoveryEntry* out
     std::string drv = sysfs_read_link_base(base + "/driver");
     std::string grp_str = sysfs_read_link_base(base + "/iommu_group");
 
-    if (drv == "vfio-pci" && vid == 0x1ae0ULL && cls == 0xff0000ULL) {
+    if (drv == "vfio-pci" && vid == 0x1ae0ULL && cls == 0xff0000ULL && !grp_str.empty()) {
+      char* end = nullptr;
+      errno = 0;
+      unsigned long grp_val = std::strtoul(grp_str.c_str(), &end, 10);
+      if (errno != 0 || end == grp_str.c_str() || *end != '\0') continue;
       if (!is_supported_vfio_device_id(static_cast<uint16_t>(did))) {
         if (preferred_bdf && preferred_bdf[0] != '\0') {
           if (err) {
@@ -453,7 +458,7 @@ static bool discover_linux_tpu(const char* preferred_bdf, PciDiscoveryEntry* out
       out->device_id = static_cast<uint16_t>(did);
       out->pci_class = static_cast<uint32_t>(cls);
       out->driver = drv;
-      out->iommu_group = static_cast<uint32_t>(std::strtoul(grp_str.c_str(), nullptr, 10));
+      out->iommu_group = static_cast<uint32_t>(grp_val);
       found = true;
       break;
     }
@@ -752,6 +757,7 @@ bool VfioTransport::open_device(const ot_config_t& cfg, ot_device_info_t* info, 
 }
 
 void VfioTransport::close_device() {
+  teardown_imem_state();
   teardown_ring_queues();
 #ifdef __linux__
   if (!is_mock && is_owner_process() && device_fd >= 0 && pci_cmd_saved) {
@@ -1032,6 +1038,7 @@ bool VfioTransport::init_ring_queues(std::string* err) {
 }
 
 void VfioTransport::teardown_ring_queues() {
+  teardown_imem_state();
 #ifdef __linux__
   // Only the process that opened the VFIO device owns hardware queues and MADV_DONTFORK arenas.
   // A forked child must never stop the parent's queues, unmap parent DMA, or munmap DONTFORK VMAs.
@@ -1142,7 +1149,6 @@ bool VfioTransport::submit_sq_wait(const uint32_t desc[32], uint32_t timeout_ms,
   // Poison the CQ slot before ringing the doorbell so stale entries cannot match sent_seq.
   std::memset(cq_slot, 0, 32u);
   cq_slot[0] = ~sent_seq;
-
   std::memcpy(sq_slot, desc, 128u);
   sq_slot[0] = sent_seq;
   // Order DMA payload, CQ poison, and SQ descriptor writes in outer-shareable domain before MMIO doorbell.
@@ -1218,6 +1224,14 @@ bool VfioTransport::dma_transfer_sync(uint64_t host_iova, uint64_t dev_addr, siz
     return false;
   }
   uint64_t qwords = len_bytes / 8u;
+  if (qwords > 0xffffffffULL) {
+    if (err) *err = "DMA transfer length exceeds 32-bit qword count";
+    return false;
+  }
+  if ((dev_addr >> 36) != 0ULL) {
+    if (err) *err = "Device HBM address exceeds 36-bit aperture";
+    return false;
+  }
   uint32_t d[32] = {};
   d[1] = kSqOpcodeDma;
   d[8] = (static_cast<uint32_t>(qwords & 0xffffu) << 16) | 0x1001u;
@@ -1246,6 +1260,169 @@ bool VfioTransport::dma_transfer_sync(uint64_t host_iova, uint64_t dev_addr, siz
 
   uint32_t cq_out[8] = {};
   return submit_sq_wait(d, timeout_ms, cq_out, err);
+}
+
+bool VfioTransport::dma_h2d_sync(uint64_t host_iova, uint64_t dst_hbm, size_t len_bytes,
+                                 uint32_t w28, uint32_t w29, uint32_t timeout_ms,
+                                 std::string* err) {
+  return dma_transfer_sync(host_iova, dst_hbm, len_bytes, /*is_h2d=*/true,
+                           0x40000000u, w28, w29, timeout_ms, err);
+}
+
+bool VfioTransport::dma_d2h_sync(uint64_t host_iova, uint64_t src_hbm, size_t len_bytes,
+                                 uint32_t w28, uint32_t w29, uint32_t timeout_ms,
+                                 std::string* err) {
+  return dma_transfer_sync(host_iova, src_hbm, len_bytes, /*is_h2d=*/false,
+                           0x40000000u, w28, w29, timeout_ms, err);
+}
+
+bool VfioTransport::dma_host_to_imem(uint64_t host_iova, uint64_t dst_imem, size_t len_bytes,
+                                     uint32_t timeout_ms, std::string* err) {
+  if (len_bytes == 0 || (len_bytes % kImemDmaAlignBytes) != 0) {
+    if (err) *err = "Host->IMEM DMA length must be a positive multiple of 512 bytes (8 bundles)";
+    return false;
+  }
+  if ((dst_imem % kImemDmaAlignBytes) != 0 || (dst_imem >> 32) != 0ULL) {
+    if (err) *err = "Host->IMEM DMA destination must be 512-byte aligned within 32-bit IMEM space";
+    return false;
+  }
+  return dma_transfer_sync(host_iova, dst_imem, len_bytes, /*is_h2d=*/true,
+                           kImemDmaDstFlagsHi, kImemDmaW28, kImemDmaW29, timeout_ms, err);
+}
+
+bool VfioTransport::submit_core_ctrl(uint32_t ctrl_word, uint32_t timeout_ms,
+                                     uint32_t cq_out[8], std::string* err) {
+  if (is_mock) {
+    if (cq_out) std::memset(cq_out, 0, 32);
+    return true;
+  }
+  uint32_t d[32] = {};
+  d[1] = kSqOpcodeCoreCtrl;
+  d[8] = ctrl_word;
+  return submit_sq_wait(d, timeout_ms, cq_out, err);
+}
+
+bool VfioTransport::submit_exec_sync(uint32_t expected_exec_seq, uint32_t timeout_ms,
+                                     uint32_t cq_out[8], std::string* err) {
+  if (is_mock) {
+    if (cq_out) {
+      std::memset(cq_out, 0, 32);
+      cq_out[4] = 1u;
+      cq_out[5] = expected_exec_seq;
+    }
+    return true;
+  }
+  uint32_t d[32] = {};
+  d[1] = kSqOpcodeExec;
+  d[8] = kExecOpW8;
+  d[10] = kExecOpW10;
+  uint32_t local_cq[8] = {};
+  if (!submit_sq_wait(d, timeout_ms, local_cq, err)) {
+    return false;
+  }
+  if (cq_out) {
+    std::memcpy(cq_out, local_cq, sizeof(local_cq));
+  }
+  if (local_cq[4] != 1u || local_cq[5] != expected_exec_seq) {
+    dma_faulted = true;
+    ring_ready = false;
+    imem_booted = false;
+#ifdef __linux__
+    if (bar0_mmio && bar0_mapped_len >= 0x12000u) {
+      write32_bar0(0x10000u, 0u);
+      write32_bar0(0x10040u, 0u);
+    }
+    if (device_fd >= 0) {
+      (void)::ioctl(device_fd, VFIO_DEVICE_RESET);
+    }
+#endif
+    if (err) {
+      *err = "EXEC completion mismatch: cq[4]=" + std::to_string(local_cq[4]) +
+             " cq[5]=" + std::to_string(local_cq[5]) +
+             " expected=" + std::to_string(expected_exec_seq) +
+             " (device quiesced; recreate context)";
+    }
+    return false;
+  }
+  return true;
+}
+
+bool VfioTransport::ensure_matmul_scratch_slot(uint64_t* slot, std::string* err) {
+  if (!slot) return false;
+  if (*slot != 0) return true;
+  if (!hbm_alloc.alloc(kTile128x128Bf16Bytes, 4096ULL, slot)) {
+    if (err) *err = "Failed to allocate HBM matmul scratch buffer";
+    return false;
+  }
+  return true;
+}
+
+bool VfioTransport::ensure_matmul_scratch(std::string* err) {
+  const bool had_lhs = (scratch_lhs_hbm != 0);
+  if (!ensure_matmul_scratch_slot(&scratch_lhs_hbm, err)) return false;
+  if (!ensure_matmul_scratch_slot(&scratch_rhs_hbm, err)) {
+    if (!had_lhs && scratch_lhs_hbm != 0) {
+      hbm_alloc.free(scratch_lhs_hbm);
+      scratch_lhs_hbm = 0;
+    }
+    return false;
+  }
+  return true;
+}
+
+bool VfioTransport::ensure_imem_booted(uint32_t timeout_ms, std::string* err) {
+  if (!is_mock && !is_owner_process()) {
+    if (err) *err = "VFIO context cannot be used in a forked child process";
+    return false;
+  }
+  if (dma_faulted) {
+    if (err) *err = "VFIO DMA faulted after prior timeout; recreate context";
+    return false;
+  }
+  if (imem_booted) return true;
+  if (is_mock) {
+    imem_booted = true;
+    return true;
+  }
+  if (!ring_ready || !host_stage_mem || host_stage_size < kResidentImemBytes) {
+    if (err) *err = "VFIO ring queues or host DMA staging unavailable for IMEM boot";
+    return false;
+  }
+
+  const std::vector<VliwBundle> imem_prog = emit_v5e_resident_matmul_imem();
+  const size_t prog_bytes = imem_prog.size() * sizeof(VliwBundle);
+  if (imem_prog.size() != kResidentImemBundles || prog_bytes != kResidentImemBytes ||
+      (prog_bytes % kImemDmaAlignBytes) != 0 || prog_bytes > host_stage_size) {
+    if (err) *err = "Resident IMEM stub size or alignment invariant violated";
+    return false;
+  }
+
+  std::memcpy(host_stage_mem, imem_prog.data(), prog_bytes);
+  if (!dma_host_to_imem(host_stage_iova, /*dst_imem=*/0ULL, prog_bytes, timeout_ms, err)) {
+    return false;
+  }
+  uint32_t cq_out[8] = {};
+  if (!submit_core_ctrl(kCoreCtrlStart, timeout_ms, cq_out, err)) {
+    return false;
+  }
+  imem_booted = true;
+  exec_seq = 0;
+  return true;
+}
+
+void VfioTransport::teardown_imem_state() {
+  if (is_owner_process() && !dma_faulted) {
+    if (scratch_rhs_hbm != 0) {
+      hbm_alloc.free(scratch_rhs_hbm);
+    }
+    if (scratch_lhs_hbm != 0) {
+      hbm_alloc.free(scratch_lhs_hbm);
+    }
+  }
+  scratch_rhs_hbm = 0;
+  scratch_lhs_hbm = 0;
+  imem_booted = false;
+  exec_seq = 0;
 }
 
 uint32_t VfioTransport::read32_bar4(uint64_t off) const {

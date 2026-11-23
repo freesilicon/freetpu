@@ -4,7 +4,9 @@
 #include "ot_vliw.h"
 #include "pjrt_c_api.h"
 
+#include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -32,6 +34,60 @@ static void destroy_pjrt_error(const PJRT_Api* api, PJRT_Error* err) {
   d.error = err;
   api->PJRT_Error_Destroy(&d);
 }
+
+namespace {
+
+inline float test_bf16_to_f32(uint16_t b) {
+  uint32_t u = static_cast<uint32_t>(b) << 16;
+  float f = 0.0f;
+  std::memcpy(&f, &u, sizeof(f));
+  return f;
+}
+
+inline uint16_t test_f32_to_bf16(float f) {
+  uint32_t u = 0;
+  std::memcpy(&u, &f, sizeof(u));
+  if ((u & 0x7fffffffU) > 0x7f800000U) {
+    return static_cast<uint16_t>((u >> 16) | 0x0040U);
+  }
+  uint32_t lsb = (u >> 16) & 1U;
+  u += 0x7fffU + lsb;
+  return static_cast<uint16_t>(u >> 16);
+}
+
+inline uint64_t splitmix64(uint64_t* state) {
+  uint64_t z = (*state += 0x9e3779b97f4a7c15ULL);
+  z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+  return z ^ (z >> 31);
+}
+
+void fill_random_bf16(std::vector<uint16_t>* dst, uint64_t seed, int half_steps, float scale) {
+  const uint64_t span = static_cast<uint64_t>(2 * half_steps + 1);
+  uint64_t rng = seed;
+  for (uint16_t& v : *dst) {
+    int q = static_cast<int>(splitmix64(&rng) % span) - half_steps;
+    v = test_f32_to_bf16(static_cast<float>(q) * scale);
+  }
+}
+
+std::vector<uint16_t> ref_matmul(const std::vector<uint16_t>& a, const std::vector<uint16_t>& b,
+                                 uint32_t m, uint32_t k, uint32_t n) {
+  std::vector<uint16_t> out(static_cast<size_t>(m) * n, 0);
+  for (uint32_t r = 0; r < m; ++r) {
+    for (uint32_t c = 0; c < n; ++c) {
+      float acc = 0.0f;
+      for (uint32_t j = 0; j < k; ++j) {
+        acc += test_bf16_to_f32(a[static_cast<size_t>(r) * k + j]) *
+               test_bf16_to_f32(b[static_cast<size_t>(j) * n + c]);
+      }
+      out[static_cast<size_t>(r) * n + c] = test_f32_to_bf16(acc);
+    }
+  }
+  return out;
+}
+
+}  // namespace
 
 static void test_iova_allocator() {
   ot::IovaAllocator alloc;
@@ -278,11 +334,10 @@ static void test_mock_dma_and_matmul() {
   OT_CHECK(ot_matmul_bf16(ctx, ba, foreign, bc, M, K, N) == OT_ERR_INVALID_ARG);
   OT_CHECK(ot_matmul_bf16(ctx, ba, bb, foreign, M, K, N) == OT_ERR_INVALID_ARG);
 
-  // Overlapping output and input buffers must be rejected without mutating inputs.
-  OT_CHECK(ot_matmul_bf16(ctx, ba, bb, ba, M, K, N) == OT_ERR_INVALID_ARG);
-  OT_CHECK(ot_matmul_bf16(ctx, ba, bb, bb, M, K, N) == OT_ERR_INVALID_ARG);
-  // Identical lhs and rhs into a disjoint output remains valid.
+  // Identical lhs and rhs into a disjoint output and in-place aliasing remain valid.
   OT_CHECK(ot_matmul_bf16(ctx, ba, ba, bc, M, K, N) == OT_OK);
+  OT_CHECK(ot_matmul_bf16(ctx, ba, bb, ba, M, K, N) == OT_OK);
+  OT_CHECK(ot_buffer_h2d(ctx, ba, ones.data(), ones.size() * 2) == OT_OK);
 
   // Explicit smaller HBM budget in mock mode clamps capacity and enforces OT_ERR_NOMEM.
   ot_config_t cfg_small = ot_config_default();
@@ -1101,9 +1156,17 @@ static void test_pjrt_api_mock() {
   }
 
   std::vector<uint16_t> out_h(128 * 128, 0);
+  const int64_t dense_m2m[2] = {1, 0};
+  PJRT_Buffer_MemoryLayout dense_host_layout = {};
+  dense_host_layout.struct_size = PJRT_Buffer_MemoryLayout_STRUCT_SIZE;
+  dense_host_layout.type = PJRT_Buffer_MemoryLayout_Type_Tiled;
+  dense_host_layout.tiled.struct_size = PJRT_Buffer_MemoryLayout_Tiled_STRUCT_SIZE;
+  dense_host_layout.tiled.minor_to_major = dense_m2m;
+  dense_host_layout.tiled.minor_to_major_size = 2;
   PJRT_Buffer_ToHostBuffer_Args th = {};
   th.struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE;
   th.src = outs[0];
+  th.host_layout = &dense_host_layout;
   th.dst = out_h.data();
   th.dst_size = out_h.size() * 2;
   OT_CHECK(api->PJRT_Buffer_ToHostBuffer(&th) == nullptr);
@@ -1136,6 +1199,123 @@ static void test_pjrt_api_mock() {
   edest.struct_size = PJRT_Executable_Destroy_Args_STRUCT_SIZE;
   edest.executable = ge.executable;
   OT_CHECK(api->PJRT_Executable_Destroy(&edest) == nullptr);
+
+  // Verify default (null device_layout) 128x128 BF16 upload remains dense while explicit
+  // {1,0:T(2,128)(2,1)} stores native tiled bytes and reports matching repeated tiling.
+  {
+    const int64_t d2[2] = {128, 128};
+    const int64_t m2m[2] = {1, 0};
+    const int64_t valid_tiles[4] = {2, 128, 2, 1};
+    const size_t valid_tile_sizes[2] = {2, 2};
+    const int64_t bad_tiles[2] = {2, 128};
+    const size_t bad_tile_sizes[1] = {2};
+    std::vector<uint16_t> tile_src(128u * 128u, 0x3f80u);
+    tile_src[128] = 0x4000u;
+
+    PJRT_Client_BufferFromHostBuffer_Args up_dense = {};
+    up_dense.struct_size = PJRT_Client_BufferFromHostBuffer_Args_STRUCT_SIZE;
+    up_dense.client = cc.client;
+    up_dense.data = tile_src.data();
+    up_dense.type = PJRT_Buffer_Type_BF16;
+    up_dense.dims = d2;
+    up_dense.num_dims = 2;
+    up_dense.device = ad.addressable_devices[0];
+    OT_CHECK(api->PJRT_Client_BufferFromHostBuffer(&up_dense) == nullptr);
+    PJRT_Buffer_GetMemoryLayout_Args ml_dense = {};
+    ml_dense.struct_size = PJRT_Buffer_GetMemoryLayout_Args_STRUCT_SIZE;
+    ml_dense.buffer = up_dense.buffer;
+    OT_CHECK(api->PJRT_Buffer_GetMemoryLayout(&ml_dense) == nullptr);
+    OT_CHECK(ml_dense.layout.tiled.num_tiles == 0);
+    PJRT_Event_Destroy_Args evd = {};
+    evd.struct_size = PJRT_Event_Destroy_Args_STRUCT_SIZE;
+    evd.event = up_dense.done_with_host_buffer;
+    OT_CHECK(api->PJRT_Event_Destroy(&evd) == nullptr);
+    PJRT_Buffer_Destroy_Args bd = {};
+    bd.struct_size = PJRT_Buffer_Destroy_Args_STRUCT_SIZE;
+    bd.buffer = up_dense.buffer;
+    OT_CHECK(api->PJRT_Buffer_Destroy(&bd) == nullptr);
+
+    PJRT_Buffer_MemoryLayout good_layout = {};
+    good_layout.struct_size = PJRT_Buffer_MemoryLayout_STRUCT_SIZE;
+    good_layout.type = PJRT_Buffer_MemoryLayout_Type_Tiled;
+    good_layout.tiled.struct_size = PJRT_Buffer_MemoryLayout_Tiled_STRUCT_SIZE;
+    good_layout.tiled.minor_to_major = m2m;
+    good_layout.tiled.minor_to_major_size = 2;
+    good_layout.tiled.tile_dims = valid_tiles;
+    good_layout.tiled.tile_dim_sizes = valid_tile_sizes;
+    good_layout.tiled.num_tiles = 2;
+
+    PJRT_Client_BufferFromHostBuffer_Args up_tiled = {};
+    up_tiled.struct_size = PJRT_Client_BufferFromHostBuffer_Args_STRUCT_SIZE;
+    up_tiled.client = cc.client;
+    up_tiled.data = tile_src.data();
+    up_tiled.type = PJRT_Buffer_Type_BF16;
+    up_tiled.dims = d2;
+    up_tiled.num_dims = 2;
+    up_tiled.device = ad.addressable_devices[0];
+    up_tiled.device_layout = &good_layout;
+    OT_CHECK(api->PJRT_Client_BufferFromHostBuffer(&up_tiled) == nullptr);
+    PJRT_Buffer_GetMemoryLayout_Args ml_tiled = {};
+    ml_tiled.struct_size = PJRT_Buffer_GetMemoryLayout_Args_STRUCT_SIZE;
+    ml_tiled.buffer = up_tiled.buffer;
+    OT_CHECK(api->PJRT_Buffer_GetMemoryLayout(&ml_tiled) == nullptr);
+    OT_CHECK(ml_tiled.layout.tiled.num_tiles == 2 &&
+             ml_tiled.layout.tiled.tile_dim_sizes[0] == 2 &&
+             ml_tiled.layout.tiled.tile_dim_sizes[1] == 2 &&
+             ml_tiled.layout.tiled.tile_dims[0] == 2 &&
+             ml_tiled.layout.tiled.tile_dims[1] == 128 &&
+             ml_tiled.layout.tiled.tile_dims[2] == 2 &&
+             ml_tiled.layout.tiled.tile_dims[3] == 1);
+
+    // Null host_layout preserves source {1,0:T(2,128)(2,1)} layout: (r=1,c=0) -> index 1.
+    std::vector<uint16_t> out_native(128u * 128u, 0);
+    PJRT_Buffer_ToHostBuffer_Args th_native = {};
+    th_native.struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE;
+    th_native.src = up_tiled.buffer;
+    th_native.dst = out_native.data();
+    th_native.dst_size = out_native.size() * sizeof(uint16_t);
+    OT_CHECK(api->PJRT_Buffer_ToHostBuffer(&th_native) == nullptr);
+    evd.event = th_native.event;
+    OT_CHECK(api->PJRT_Event_Destroy(&evd) == nullptr);
+    OT_CHECK(out_native[1] == 0x4000u && out_native[128] == 0x3f80u);
+
+    // Explicit dense host_layout unpacks {1,0:T(2,128)(2,1)} to row-major: (r=1,c=0) -> index 128.
+    std::vector<uint16_t> out_unpacked(128u * 128u, 0);
+    PJRT_Buffer_ToHostBuffer_Args th_dense = {};
+    th_dense.struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE;
+    th_dense.src = up_tiled.buffer;
+    th_dense.host_layout = &dense_host_layout;
+    th_dense.dst = out_unpacked.data();
+    th_dense.dst_size = out_unpacked.size() * sizeof(uint16_t);
+    OT_CHECK(api->PJRT_Buffer_ToHostBuffer(&th_dense) == nullptr);
+    evd.event = th_dense.event;
+    OT_CHECK(api->PJRT_Event_Destroy(&evd) == nullptr);
+    OT_CHECK(out_unpacked[128] == 0x4000u && out_unpacked[1] == 0x3f80u);
+
+    evd.event = up_tiled.done_with_host_buffer;
+    OT_CHECK(api->PJRT_Event_Destroy(&evd) == nullptr);
+    bd.buffer = up_tiled.buffer;
+    OT_CHECK(api->PJRT_Buffer_Destroy(&bd) == nullptr);
+
+    // Reject single-tile {1,0:T(2,128)} and reject explicit tiled + strided host.
+    PJRT_Buffer_MemoryLayout wrong_layout = good_layout;
+    wrong_layout.tiled.tile_dims = bad_tiles;
+    wrong_layout.tiled.tile_dim_sizes = bad_tile_sizes;
+    wrong_layout.tiled.num_tiles = 1;
+    PJRT_Client_BufferFromHostBuffer_Args up_wrong = up_tiled;
+    up_wrong.device_layout = &wrong_layout;
+    PJRT_Error* wrong_err = api->PJRT_Client_BufferFromHostBuffer(&up_wrong);
+    OT_CHECK(wrong_err != nullptr);
+    destroy_pjrt_error(api, wrong_err);
+
+    const int64_t transposed_strides[2] = {2, 256};
+    PJRT_Client_BufferFromHostBuffer_Args up_strided = up_tiled;
+    up_strided.byte_strides = transposed_strides;
+    up_strided.num_byte_strides = 2;
+    PJRT_Error* strided_err = api->PJRT_Client_BufferFromHostBuffer(&up_strided);
+    OT_CHECK(strided_err != nullptr);
+    destroy_pjrt_error(api, strided_err);
+  }
 
   PJRT_Client_Destroy_Args cd = {};
   cd.struct_size = PJRT_Client_Destroy_Args_STRUCT_SIZE;
@@ -1188,14 +1368,228 @@ static void test_vliw_and_tiling() {
   printf("[PASS] test_vliw_and_tiling\n");
 }
 
+static void test_layout_tiling_and_aliasing() {
+  ot_config_t cfg = ot_config_default();
+  cfg.mock_mode = 1;
+  ot_context_t* ctx = nullptr;
+  ot_context_t* other_ctx = nullptr;
+  OT_CHECK(ot_context_create(&cfg, &ctx) == OT_OK);
+  OT_CHECK(ot_context_create(&cfg, &other_ctx) == OT_OK);
+
+  const uint32_t M = 128u, K = 128u, N = 128u;
+  const size_t nbytes = static_cast<size_t>(M) * N * sizeof(uint16_t);
+  ot_buffer_t *ba = nullptr, *bb = nullptr, *bc = nullptr, *bd = nullptr, *be = nullptr;
+  ot_buffer_t* foreign = nullptr;
+  OT_CHECK(ot_buffer_alloc(ctx, nbytes, &ba) == OT_OK);
+  OT_CHECK(ot_buffer_alloc(ctx, nbytes, &bb) == OT_OK);
+  OT_CHECK(ot_buffer_alloc(ctx, nbytes, &bc) == OT_OK);
+  OT_CHECK(ot_buffer_alloc(ctx, nbytes, &bd) == OT_OK);
+  OT_CHECK(ot_buffer_alloc(ctx, nbytes, &be) == OT_OK);
+  OT_CHECK(ot_buffer_alloc(other_ctx, nbytes, &foreign) == OT_OK);
+
+  std::vector<uint16_t> a(M * K), b(K * N), d(K * N), got(M * N);
+  fill_random_bf16(&a, 0x1111ULL, 16, 0.125f);
+  fill_random_bf16(&b, 0x2222ULL, 16, 0.125f);
+  fill_random_bf16(&d, 0x3333ULL, 2, 0.25f);
+  OT_CHECK(ot_buffer_h2d(ctx, foreign, a.data(), nbytes) == OT_ERR_INVALID_ARG);
+  OT_CHECK(ot_buffer_d2h(ctx, foreign, got.data(), nbytes) == OT_ERR_INVALID_ARG);
+  OT_CHECK(ot_matmul_bf16(ctx, foreign, bb, bc, M, K, N) == OT_ERR_INVALID_ARG);
+
+  std::vector<uint16_t> ref_ab = ref_matmul(a, b, M, K, N);
+  OT_CHECK(ot_buffer_h2d(ctx, ba, a.data(), nbytes) == OT_OK);
+  OT_CHECK(ot_buffer_h2d(ctx, bb, b.data(), nbytes) == OT_OK);
+  OT_CHECK(ba->layout == ot::BufferLayout::kRaw);
+  OT_CHECK(ot_matmul_bf16(ctx, ba, bb, bc, M, K, N) == OT_OK);
+  OT_CHECK(bc->layout == ot::BufferLayout::kTiled2x128Bf16);
+
+  std::vector<uint16_t> expected_tiled(M * N);
+  ot::tile_pack_128x128_bf16(ref_ab.data(), expected_tiled.data());
+  OT_CHECK(std::memcmp(ctx->transport.mock_hbm.data() + bc->hbm_addr,
+                       expected_tiled.data(), nbytes) == 0);
+
+  OT_CHECK(ot_buffer_d2h(ctx, bc, got.data(), nbytes) == OT_OK);
+  OT_CHECK(got == ref_ab);
+  std::vector<uint16_t> partial(150, 0);
+  OT_CHECK(ot_buffer_d2h(ctx, bc, partial.data(), partial.size() * 2) == OT_OK);
+  OT_CHECK(std::memcmp(partial.data(), ref_ab.data(), partial.size() * 2) == 0);
+
+  std::vector<uint16_t> ref_abd = ref_matmul(ref_ab, d, M, K, N);
+  OT_CHECK(ot::buffer_h2d_tiled_128x128_bf16(ctx, bd, d.data()) == OT_OK);
+  OT_CHECK(bd->layout == ot::BufferLayout::kTiled2x128Bf16);
+  OT_CHECK(ot_matmul_bf16(ctx, bc, bd, be, M, K, N) == OT_OK);
+  OT_CHECK(ot_buffer_d2h(ctx, be, got.data(), nbytes) == OT_OK);
+  OT_CHECK(got == ref_abd);
+
+  std::vector<uint16_t> patch(64, 0x4000u);
+  OT_CHECK(ot_buffer_h2d(ctx, bc, patch.data(), patch.size() * 2) == OT_OK);
+  OT_CHECK(bc->layout == ot::BufferLayout::kRaw);
+  OT_CHECK(ot_buffer_d2h(ctx, bc, got.data(), nbytes) == OT_OK);
+  OT_CHECK(std::memcmp(got.data(), patch.data(), patch.size() * 2) == 0);
+  OT_CHECK(std::memcmp(got.data() + 64, ref_ab.data() + 64, (M * N - 64) * 2) == 0);
+
+  std::vector<uint16_t> ref_aa = ref_matmul(a, a, M, K, N);
+  OT_CHECK(ot_buffer_h2d(ctx, ba, a.data(), nbytes) == OT_OK);
+  OT_CHECK(ot_matmul_bf16(ctx, ba, ba, ba, M, K, N) == OT_OK);
+  OT_CHECK(ot_buffer_d2h(ctx, ba, got.data(), nbytes) == OT_OK);
+  OT_CHECK(got == ref_aa);
+
+  // Smaller mock matmul reusing a tiled 128x128 output buffer must preserve the unwritten suffix.
+  OT_CHECK(ot_buffer_h2d(ctx, ba, a.data(), nbytes) == OT_OK);
+  OT_CHECK(ot_buffer_h2d(ctx, bb, b.data(), nbytes) == OT_OK);
+  OT_CHECK(ot_matmul_bf16(ctx, ba, bb, bc, M, K, N) == OT_OK);
+  OT_CHECK(bc->layout == ot::BufferLayout::kTiled2x128Bf16);
+  std::vector<uint16_t> sm_a(16u * 32u), sm_b(32u * 24u), sm_got(16u * 24u);
+  fill_random_bf16(&sm_a, 0x4444ULL, 8, 0.25f);
+  fill_random_bf16(&sm_b, 0x5555ULL, 8, 0.25f);
+  std::vector<uint16_t> sm_ref = ref_matmul(sm_a, sm_b, 16u, 32u, 24u);
+  OT_CHECK(ot_buffer_h2d(ctx, ba, sm_a.data(), sm_a.size() * 2) == OT_OK);
+  OT_CHECK(ot_buffer_h2d(ctx, bb, sm_b.data(), sm_b.size() * 2) == OT_OK);
+  OT_CHECK(ot_matmul_bf16(ctx, ba, bb, bc, 16u, 32u, 24u) == OT_OK);
+  OT_CHECK(bc->layout == ot::BufferLayout::kRaw);
+  OT_CHECK(ot_buffer_d2h(ctx, bc, sm_got.data(), sm_got.size() * 2) == OT_OK);
+  OT_CHECK(sm_got == sm_ref);
+  OT_CHECK(ot_buffer_d2h(ctx, bc, got.data(), nbytes) == OT_OK);
+  OT_CHECK(std::memcmp(got.data(), sm_ref.data(), sm_ref.size() * 2) == 0);
+  OT_CHECK(std::memcmp(got.data() + sm_ref.size(), ref_ab.data() + sm_ref.size(),
+                       (M * N - sm_ref.size()) * 2) == 0);
+
+  ot_buffer_free(foreign);
+  ot_buffer_free(be);
+  ot_buffer_free(bd);
+  ot_buffer_free(bc);
+  ot_buffer_free(bb);
+  ot_buffer_free(ba);
+  ot_context_destroy(other_ctx);
+  ot_context_destroy(ctx);
+  printf("[PASS] test_layout_tiling_and_aliasing\n");
+}
+
+static void test_vfio_imem_lifecycle_mock() {
+  ot_config_t cfg = ot_config_default();
+  cfg.mock_mode = 1;
+  ot_context_t* ctx = nullptr;
+  OT_CHECK(ot_context_create(&cfg, &ctx) == OT_OK);
+
+  std::string err;
+  OT_CHECK(!ctx->transport.imem_booted);
+  OT_CHECK(ctx->transport.ensure_imem_booted(1000u, &err));
+  OT_CHECK(ctx->transport.imem_booted);
+  OT_CHECK(ctx->transport.ensure_imem_booted(1000u, &err));
+
+  OT_CHECK(ctx->transport.ensure_matmul_scratch_slot(&ctx->transport.scratch_lhs_hbm, &err));
+  OT_CHECK(ctx->transport.scratch_lhs_hbm != 0 && ctx->transport.scratch_rhs_hbm == 0);
+  OT_CHECK(ctx->transport.hbm_alloc.used_bytes() == ot::kTile128x128Bf16Bytes);
+  OT_CHECK(ctx->transport.ensure_matmul_scratch(&err));
+  OT_CHECK(ctx->transport.scratch_lhs_hbm != 0 && ctx->transport.scratch_rhs_hbm != 0);
+  OT_CHECK(ctx->transport.hbm_alloc.used_bytes() == 2u * ot::kTile128x128Bf16Bytes);
+
+  uint32_t cq[8] = {};
+  OT_CHECK(ctx->transport.submit_exec_sync(7u, 1000u, cq, &err));
+  OT_CHECK(cq[4] == 1u && cq[5] == 7u);
+
+  ctx->transport.teardown_imem_state();
+  OT_CHECK(!ctx->transport.imem_booted);
+  OT_CHECK(ctx->transport.scratch_lhs_hbm == 0 && ctx->transport.scratch_rhs_hbm == 0);
+  OT_CHECK(ctx->transport.hbm_alloc.used_bytes() == 0);
+
+  ot_context_destroy(ctx);
+  printf("[PASS] test_vfio_imem_lifecycle_mock\n");
+}
+
+static void test_resident_imem_stub_structure() {
+  auto bundle_eq = [](const ot::VliwBundle& a, const ot::VliwBundle& b) -> bool {
+    return std::memcmp(a.w, b.w, sizeof(a.w)) == 0;
+  };
+  const ot::VliwBundle nop = ot::VliwBundle::nop();
+
+  {
+    const ot::VliwBundle w1ff = ot::VliwBundle::make_sync_wait_imm(0x1ffu, 512u);
+    OT_CHECK(w1ff.w[2] == 0x3a8ca30fu && w1ff.w[12] == 0xfc000000u && w1ff.w[13] == 0x00040007u);
+    const ot::VliwBundle s1ff = ot::VliwBundle::make_sync_sub_imm(0x1ffu, 512u);
+    OT_CHECK(s1ff.w[2] == 0x3a0ca10fu && s1ff.w[12] == 0xfc000000u &&
+             s1ff.w[13] == 0xfffc0007u && s1ff.w[14] == 0x0f000003u);
+
+    const ot::VliwBundle w33 = ot::VliwBundle::make_sync_wait_imm(0x33u, 32768u);
+    OT_CHECK(w33.w[2] == 0x3a8ca30fu && w33.w[12] == 0xcc000000u && w33.w[13] == 0x01000000u);
+    const ot::VliwBundle s33 = ot::VliwBundle::make_sync_sub_imm(0x33u, 32768u);
+    OT_CHECK(s33.w[2] == 0x3a0ca10fu && s33.w[12] == 0xcc000000u &&
+             s33.w[13] == 0xff000000u && s33.w[14] == 0x0f000003u);
+    const ot::VliwBundle c33 = ot::VliwBundle::make_sync_clear(0x33u);
+    OT_CHECK(c33.w[2] == 0x3a0ca70fu && c33.w[12] == 0xcc000000u && c33.w[13] == 0x00004000u);
+
+    const ot::VliwBundle l_out = ot::VliwBundle::make_smem_load_ldesc(2u, 0x190u);
+    OT_CHECK(l_out.w[13] == 0xfff90000u && l_out.w[14] == 0x0e041008u);
+    const ot::VliwBundle l_lhs = ot::VliwBundle::make_smem_load_ldesc(18u, 0x174u);
+    OT_CHECK(l_lhs.w[13] == 0xfff74000u && l_lhs.w[14] == 0x0e041048u);
+    const ot::VliwBundle l_rhs = ot::VliwBundle::make_smem_load_ldesc(1u, 0x170u);
+    OT_CHECK(l_rhs.w[13] == 0xfff70000u && l_rhs.w[14] == 0x0e041004u);
+
+    const ot::VliwBundle f = ot::VliwBundle::make_fence();
+    OT_CHECK(f.w[14] == 0x0f000000u && f.w[15] == 0x55700900u);
+    const ot::VliwBundle br0 = ot::VliwBundle::make_br_abs(0u);
+    OT_CHECK(br0.w[13] == 0u && br0.w[14] == 0x0f000000u && br0.w[15] == 0x55700400u);
+  }
+
+  const std::vector<ot::VliwBundle> imem = ot::emit_v5e_resident_matmul_imem();
+  OT_CHECK(imem.size() == ot::kResidentImemBundles);
+  OT_CHECK(imem.size() * sizeof(ot::VliwBundle) == ot::kResidentImemBytes);
+  OT_CHECK((ot::kResidentImemBytes % ot::kImemDmaAlignBytes) == 0u);
+
+  OT_CHECK(imem[0].w[2] == 0x3b00060fu && imem[0].w[15] == 0x55700dc4u);
+  OT_CHECK(imem[3].w[13] == 0xfffe8007u && imem[3].w[14] == 0x8e04100cu);
+  OT_CHECK(imem[14].w[2] == 0x3a0a200fu && imem[14].w[13] == (ot::kSyncFlagExecDone << 14));
+  OT_CHECK(bundle_eq(imem[2], nop) && bundle_eq(imem[4], nop) && bundle_eq(imem[6], nop));
+  for (size_t pc = 8; pc <= 12; ++pc) OT_CHECK(bundle_eq(imem[pc], nop));
+  OT_CHECK(bundle_eq(imem[15], nop) && bundle_eq(imem[16], nop));
+
+  OT_CHECK(imem[17].w[15] == 0x55701101u);
+  OT_CHECK(imem[18].w[2] == 0x3a82a30fu && imem[18].w[13] == 0x00040000u);
+  OT_CHECK(imem[19].w[2] == 0x3a02a10fu && imem[19].w[13] == 0xfffc0000u);
+  OT_CHECK(bundle_eq(imem[20], nop));
+
+  OT_CHECK(imem[24].w[13] == (ot::kSyncFlagLdescDma << 14) && imem[24].w[14] == 0x0211f000u);
+  OT_CHECK(bundle_eq(imem[25], ot::VliwBundle::make_sync_wait_imm(0x1ffu, 512u)));
+  OT_CHECK(bundle_eq(imem[26], ot::VliwBundle::make_sync_sub_imm(0x1ffu, 512u)));
+  OT_CHECK(bundle_eq(imem[27], ot::VliwBundle::make_fence()));
+
+  OT_CHECK(bundle_eq(imem[28], ot::VliwBundle::make_smem_load_ldesc(2u, 0x190u)));
+  OT_CHECK(bundle_eq(imem[29], ot::VliwBundle::make_smem_load_ldesc(18u, 0x174u)));
+  OT_CHECK(bundle_eq(imem[30], ot::VliwBundle::make_smem_load_ldesc(1u, 0x170u)));
+  for (size_t pc = 31; pc <= 36; ++pc) OT_CHECK(bundle_eq(imem[pc], nop));
+  OT_CHECK(imem[37].w[14] == 0x4e01bee8u && imem[37].w[15] == 0x55780000u);
+  for (size_t pc = 40; pc <= 44; ++pc) OT_CHECK(bundle_eq(imem[pc], nop));
+  OT_CHECK(imem[45].w[13] == (ot::kSyncFlagLhsDma << 14) && imem[45].w[14] == 0x0013d000u);
+  OT_CHECK(bundle_eq(imem[46], ot::VliwBundle::make_sync_wait_imm(0x33u, 32768u)));
+  OT_CHECK(bundle_eq(imem[47], ot::VliwBundle::make_sync_sub_imm(0x33u, 32768u)));
+  OT_CHECK(bundle_eq(imem[48], ot::VliwBundle::make_sync_clear(0x33u)));
+  OT_CHECK(imem[49].w[14] == 0x0f000000u && imem[49].w[15] == 0x55700dc0u);
+  OT_CHECK(bundle_eq(imem[50], nop));
+
+  const std::vector<ot::VliwBundle> body = ot::emit_v5e_matmul_128x128_body();
+  OT_CHECK(body.size() == 58u);
+  for (size_t i = 0; i < body.size(); ++i) {
+    OT_CHECK(bundle_eq(imem[51u + i], body[i]));
+  }
+
+  OT_CHECK(bundle_eq(imem[109], nop));
+  OT_CHECK(bundle_eq(imem[110], ot::VliwBundle::make_br_abs(0u)));
+  for (size_t pc = 111; pc < ot::kResidentImemBundles; ++pc) {
+    OT_CHECK(bundle_eq(imem[pc], nop));
+  }
+  printf("[PASS] test_resident_imem_stub_structure\n");
+}
+
 int main() {
   test_iova_allocator();
   test_bar4_descriptor_parser();
   test_aligned_dma_arena_alloc();
   test_fork_closes_vfio_fds_and_static_pjrt_err();
   test_mock_dma_and_matmul();
+  test_layout_tiling_and_aliasing();
+  test_vfio_imem_lifecycle_mock();
   test_pjrt_api_mock();
   test_vliw_and_tiling();
+  test_resident_imem_stub_structure();
   printf("ALL_HOST_TESTS_PASSED\n");
   return 0;
 }

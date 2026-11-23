@@ -275,6 +275,33 @@ PJRT_Error* make_err(PJRT_Error_Code code, const std::string& msg) {
   return &e->base;
 }
 
+PJRT_Error_Code ot_status_to_pjrt_code(ot_status_t st) {
+  switch (st) {
+    case OT_OK: return PJRT_Error_Code_OK;
+    case OT_ERR_INVALID_ARG: return PJRT_Error_Code_INVALID_ARGUMENT;
+    case OT_ERR_NO_MEMORY: return PJRT_Error_Code_RESOURCE_EXHAUSTED;
+    case OT_ERR_TIMEOUT: return PJRT_Error_Code_DEADLINE_EXCEEDED;
+    case OT_ERR_UNSUPPORTED: return PJRT_Error_Code_UNIMPLEMENTED;
+    case OT_ERR_NOT_FOUND: return PJRT_Error_Code_NOT_FOUND;
+    case OT_ERR_BUSY: return PJRT_Error_Code_UNAVAILABLE;
+    case OT_ERR_DEVICE:
+    case OT_ERR_IOCTL:
+    case OT_ERR_IO:
+    default:
+      return PJRT_Error_Code_INTERNAL;
+  }
+}
+
+PJRT_Error* make_ot_err(ot_context_t* ctx, ot_status_t st) {
+  std::string msg = ot_status_string(st);
+  const char* detail = ctx ? ot_context_last_error(ctx) : "";
+  if (detail && detail[0] != '\0') {
+    msg += ": ";
+    msg += detail;
+  }
+  return make_err(ot_status_to_pjrt_code(st), msg);
+}
+
 size_t dtype_bytes(PJRT_Buffer_Type t) {
   switch (t) {
     case PJRT_Buffer_Type_PRED:
@@ -850,6 +877,31 @@ bool is_supported_dense_layout(const PJRT_Buffer_MemoryLayout* layout,
     return is_dense_row_major_strides(dims, num_dims, layout->strides.byte_strides, elem_sz);
   }
   return false;
+}
+
+// Native v5e pair-major 128x128 BF16 packing places (r, c) at (r/2)*256 + c*2 + (r%2),
+// which corresponds to XLA repeated-tiling layout {1,0:T(2,128)(2,1)}.
+bool is_supported_tiled_2x128_layout(const PJRT_Buffer_MemoryLayout* layout,
+                                     PJRT_Buffer_Type dtype,
+                                     const int64_t* dims, size_t num_dims) {
+  if (!layout || layout->type != PJRT_Buffer_MemoryLayout_Type_Tiled) return false;
+  if (dtype != PJRT_Buffer_Type_BF16 || num_dims != 2u || !dims ||
+      dims[0] != 128 || dims[1] != 128) {
+    return false;
+  }
+  if (layout->tiled.minor_to_major_size != 2u || !layout->tiled.minor_to_major ||
+      layout->tiled.minor_to_major[0] != 1 || layout->tiled.minor_to_major[1] != 0) {
+    return false;
+  }
+  if (layout->tiled.num_tiles != 2u || !layout->tiled.tile_dim_sizes || !layout->tiled.tile_dims) {
+    return false;
+  }
+  return layout->tiled.tile_dim_sizes[0] == 2u &&
+         layout->tiled.tile_dim_sizes[1] == 2u &&
+         layout->tiled.tile_dims[0] == 2 &&
+         layout->tiled.tile_dims[1] == 128 &&
+         layout->tiled.tile_dims[2] == 2 &&
+         layout->tiled.tile_dims[3] == 1;
 }
 
 PJRT_Error* upload_strided_host_buffer(ot_context_t* ctx, ot_buffer_t* dst_buf,
@@ -1463,11 +1515,6 @@ PJRT_Error* ot_pjrt_client_compile(PJRT_Client_Compile_Args* args) {
   if (!args || !args->client || !args->program) {
     return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "null compile args");
   }
-  if (!ot_context_is_mock(args->client->ctx)) {
-    return make_err(PJRT_Error_Code_UNIMPLEMENTED,
-                    "OpenTPU M4 live-VFIO MXU execution is not yet available "
-                    "(standalone clean-room IMEM boot stub pending); compile supported in mock mode only");
-  }
   if (PJRT_Error* opt_err = validate_single_device_compile_options(args->compile_options,
                                                                    args->compile_options_size)) {
     return opt_err;
@@ -1491,6 +1538,10 @@ PJRT_Error* ot_pjrt_client_compile(PJRT_Client_Compile_Args* args) {
   if (!parse_stablehlo_matmul(args->program->code, args->program->code_size, &m, &k, &n)) {
     return make_err(PJRT_Error_Code_UNIMPLEMENTED,
                     "OpenTPU M4 lowers single-op textual StableHLO bf16 dot_general only");
+  }
+  if (!ot_context_is_mock(args->client->ctx) && (m != 128u || k != 128u || n != 128u)) {
+    return make_err(PJRT_Error_Code_UNIMPLEMENTED,
+                    "Live hardware BF16 matmul currently supports 128x128x128 only");
   }
   auto* le = new (std::nothrow) PJRT_LoadedExecutable();
   if (!le) return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, "out of memory");
@@ -1550,10 +1601,21 @@ PJRT_Error* ot_pjrt_buffer_from_host_buffer(PJRT_Client_BufferFromHostBuffer_Arg
       return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "invalid byte_strides");
     }
   }
-  if (args->device_layout &&
+  const bool explicit_tiled_2x128 =
+      args->device_layout &&
+      is_supported_tiled_2x128_layout(args->device_layout, args->type, args->dims, args->num_dims);
+  if (args->device_layout && !explicit_tiled_2x128 &&
       !is_supported_dense_layout(args->device_layout, args->dims, args->num_dims, elem_sz)) {
+    return make_err(
+        PJRT_Error_Code_UNIMPLEMENTED,
+        "unsupported device_layout (dense row-major or 128x128 bf16 {1,0:T(2,128)(2,1)} only)");
+  }
+  const bool is_noncontiguous_host =
+      args->num_byte_strides != 0 &&
+      !is_dense_row_major_strides(args->dims, args->num_dims, args->byte_strides, elem_sz);
+  if (explicit_tiled_2x128 && is_noncontiguous_host) {
     return make_err(PJRT_Error_Code_UNIMPLEMENTED,
-                    "unsupported device_layout (dense row-major only)");
+                    "strided host upload with explicit tiled device_layout is not supported");
   }
 
   if (elems > 0 && !args->data) {
@@ -1565,11 +1627,10 @@ PJRT_Error* ot_pjrt_buffer_from_host_buffer(PJRT_Client_BufferFromHostBuffer_Arg
   size_t alloc_bytes = logical_bytes == 0 ? 1 : logical_bytes;
   ot_buffer_t* ot_buf = nullptr;
   ot_status_t st = ot_buffer_alloc(args->client->ctx, alloc_bytes, &ot_buf);
-  if (st != OT_OK) return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, ot_status_string(st));
+  if (st != OT_OK) return make_ot_err(args->client->ctx, st);
 
   if (elems > 0) {
-    if (args->num_byte_strides != 0 &&
-        !is_dense_row_major_strides(args->dims, args->num_dims, args->byte_strides, elem_sz)) {
+    if (is_noncontiguous_host) {
       PJRT_Error* up_err = upload_strided_host_buffer(
           args->client->ctx, ot_buf, args->data, args->dims, args->num_dims, args->byte_strides,
           elem_sz, elems);
@@ -1578,10 +1639,16 @@ PJRT_Error* ot_pjrt_buffer_from_host_buffer(PJRT_Client_BufferFromHostBuffer_Arg
         return up_err;
       }
     } else {
-      st = ot_buffer_h2d(args->client->ctx, ot_buf, args->data, logical_bytes);
+      // Per PJRT contract, device_layout == nullptr requests dense major-to-minor storage.
+      // Callers requesting native TPU {1,0:T(2,128)(2,1)} storage avoid dispatch-time repacking.
+      if (explicit_tiled_2x128) {
+        st = ot::buffer_h2d_tiled_128x128_bf16(args->client->ctx, ot_buf, args->data);
+      } else {
+        st = ot_buffer_h2d(args->client->ctx, ot_buf, args->data, logical_bytes);
+      }
       if (st != OT_OK) {
         ot_buffer_free(ot_buf);
-        return make_err(PJRT_Error_Code_INTERNAL, ot_status_string(st));
+        return make_ot_err(args->client->ctx, st);
       }
     }
   }
@@ -1943,15 +2010,13 @@ PJRT_Error* ot_pjrt_lexec_execute(PJRT_LoadedExecutable_Execute_Args* args) {
   size_t out_bytes = static_cast<size_t>(le->exec.m_dim) * le->exec.n_dim * sizeof(uint16_t);
   ot_buffer_t* ot_out = nullptr;
   ot_status_t st = ot_buffer_alloc(le->client->ctx, out_bytes, &ot_out);
-  if (st != OT_OK) return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, ot_status_string(st));
+  if (st != OT_OK) return make_ot_err(le->client->ctx, st);
 
   st = ot_matmul_bf16(le->client->ctx, lhs->ot_buf, rhs->ot_buf, ot_out,
                       le->exec.m_dim, le->exec.k_dim, le->exec.n_dim);
   if (st != OT_OK) {
     ot_buffer_free(ot_out);
-    PJRT_Error_Code code =
-        (st == OT_ERR_UNSUPPORTED) ? PJRT_Error_Code_UNIMPLEMENTED : PJRT_Error_Code_INTERNAL;
-    return make_err(code, ot_status_string(st));
+    return make_ot_err(le->client->ctx, st);
   }
 
   auto* out_buf = new (std::nothrow) PJRT_Buffer();
@@ -2028,6 +2093,14 @@ PJRT_Error* ot_pjrt_buf_mem_layout(PJRT_Buffer_GetMemoryLayout_Args* args) {
   args->layout.tiled.struct_size = PJRT_Buffer_MemoryLayout_Tiled_STRUCT_SIZE;
   args->layout.tiled.minor_to_major = args->buffer->minor_to_major.data();
   args->layout.tiled.minor_to_major_size = args->buffer->minor_to_major.size();
+  if (!args->buffer->deleted && args->buffer->ot_buf &&
+      args->buffer->ot_buf->layout == ot::BufferLayout::kTiled2x128Bf16) {
+    static const int64_t kTileDims2x128_2x1[4] = {2, 128, 2, 1};
+    static const size_t kTileDimSizes2x128_2x1[2] = {2, 2};
+    args->layout.tiled.tile_dims = kTileDims2x128_2x1;
+    args->layout.tiled.tile_dim_sizes = kTileDimSizes2x128_2x1;
+    args->layout.tiled.num_tiles = 2;
+  }
   return nullptr;
 }
 
@@ -2081,11 +2154,18 @@ PJRT_Error* ot_pjrt_buf_to_host(PJRT_Buffer_ToHostBuffer_Args* args) {
     return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "buffer has been deleted");
   }
   size_t elem_sz = dtype_bytes(args->src->dtype);
-  if (args->host_layout &&
-      !is_supported_dense_layout(args->host_layout, args->src->dims.data(), args->src->dims.size(),
-                                 elem_sz)) {
-    return make_err(PJRT_Error_Code_UNIMPLEMENTED,
-                    "unsupported host_layout (dense row-major only)");
+  const bool req_tiled =
+      args->host_layout &&
+      is_supported_tiled_2x128_layout(args->host_layout, args->src->dtype,
+                                      args->src->dims.data(), args->src->dims.size());
+  const bool req_dense =
+      args->host_layout &&
+      is_supported_dense_layout(args->host_layout, args->src->dims.data(),
+                                args->src->dims.size(), elem_sz);
+  if (args->host_layout && !req_dense && !req_tiled) {
+    return make_err(
+        PJRT_Error_Code_UNIMPLEMENTED,
+        "unsupported host_layout (dense row-major or 128x128 bf16 {1,0:T(2,128)(2,1)} only)");
   }
   size_t need = args->src->logical_bytes;
   if (!args->dst) {
@@ -2099,10 +2179,18 @@ PJRT_Error* ot_pjrt_buf_to_host(PJRT_Buffer_ToHostBuffer_Args* args) {
   auto* ev = new (std::nothrow) PJRT_Event();
   if (!ev) return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, "out of memory");
   if (need > 0) {
-    ot_status_t st = ot_buffer_d2h(args->src->ctx, args->src->ot_buf, args->dst, need);
+    ot_status_t st = OT_OK;
+    if (!args->host_layout) {
+      // Per PJRT 0.116 contract, null host_layout reads back in the source buffer's layout.
+      st = ot::buffer_d2h_raw(args->src->ctx, args->src->ot_buf, args->dst, need);
+    } else if (req_tiled) {
+      st = ot::buffer_d2h_tiled_128x128_bf16(args->src->ctx, args->src->ot_buf, args->dst);
+    } else {
+      st = ot_buffer_d2h(args->src->ctx, args->src->ot_buf, args->dst, need);
+    }
     if (st != OT_OK) {
       delete ev;
-      return make_err(PJRT_Error_Code_INTERNAL, ot_status_string(st));
+      return make_ot_err(args->src->ctx, st);
     }
   }
   args->event = ev;

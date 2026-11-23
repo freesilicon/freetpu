@@ -3,6 +3,7 @@ project(opentpu VERSION 0.1.0 LANGUAGES C CXX)
 
 option(OPENTPU_BUILD_TESTS "Build libopentpu host unit tests" ON)
 option(OPENTPU_BUILD_TOOLS "Build libopentpu VFIO diagnostic tools" ON)
+option(OPENTPU_STATIC_LIBSTDCPP "Statically link libstdc++/libgcc on Linux" OFF)
 
 add_library(opentpu SHARED
   src/ot_vfio.cpp
@@ -28,6 +29,11 @@ target_include_directories(opentpu
 
 if (UNIX AND NOT APPLE)
   target_link_libraries(opentpu PUBLIC m pthread dl)
+  if (OPENTPU_STATIC_LIBSTDCPP)
+    target_link_options(opentpu PRIVATE -static-libstdc++ -static-libgcc -Wl,--as-needed -Wl,--exclude-libs,ALL)
+  else()
+    target_link_options(opentpu PRIVATE -Wl,--as-needed)
+  endif()
 else()
   target_link_libraries(opentpu PUBLIC m)
 endif()
@@ -50,6 +56,31 @@ if (OPENTPU_BUILD_TOOLS)
   target_link_libraries(opentpu_vfio_smoke PRIVATE opentpu)
   target_compile_features(opentpu_vfio_smoke PRIVATE cxx_std_17)
   target_compile_options(opentpu_vfio_smoke PRIVATE -Wall -Wextra -Werror -fno-exceptions -fno-rtti)
+
+  add_executable(opentpu_matmul_proof tools/opentpu_matmul_proof.cpp)
+  add_dependencies(opentpu_matmul_proof opentpu)
+  target_include_directories(opentpu_matmul_proof PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/openxla
+  )
+  target_compile_features(opentpu_matmul_proof PRIVATE cxx_std_17)
+  target_compile_options(opentpu_matmul_proof PRIVATE -Wall -Wextra -Werror -fno-exceptions -fno-rtti)
+  if (UNIX AND NOT APPLE)
+    target_link_libraries(opentpu_matmul_proof PRIVATE dl m)
+    if (OPENTPU_STATIC_LIBSTDCPP)
+      target_link_options(opentpu_matmul_proof PRIVATE -static-libstdc++ -static-libgcc -Wl,--as-needed)
+    else()
+      target_link_options(opentpu_matmul_proof PRIVATE -Wl,--as-needed)
+    endif()
+  else()
+    target_link_libraries(opentpu_matmul_proof PRIVATE m)
+  endif()
+
+  if (OPENTPU_BUILD_TESTS)
+    add_test(NAME opentpu_vfio_smoke_mock COMMAND opentpu_vfio_smoke --mock)
+    add_test(NAME opentpu_matmul_proof_mock
+             COMMAND opentpu_matmul_proof --mock --lib $<TARGET_FILE:opentpu>)
+  endif()
 
   if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(vfio_m1_probe tools/vfio_m1_probe.cpp)
