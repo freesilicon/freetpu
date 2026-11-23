@@ -1900,20 +1900,21 @@ def _has_live_utilization(rows: Dict[str, _TpuInfoRow]) -> bool:
     return any(_row_has_live_utilization(r) for r in rows.values())
 
 
-def _has_live_hbm(rows: Dict[str, _TpuInfoRow]) -> bool:
-    return any(
-        r.in_util_table and r.hbm_used_bytes is not None and r.hbm_total_bytes is not None
-        for r in rows.values()
+def _row_has_complete_utilization(row: _TpuInfoRow) -> bool:
+    return (
+        row.in_util_table
+        and row.hbm_used_bytes is not None
+        and row.hbm_total_bytes is not None
+        and row.duty_cycle_percent is not None
     )
 
 
-def _has_live_duty_cycle(rows: Dict[str, _TpuInfoRow]) -> bool:
-    return any(r.in_util_table and r.duty_cycle_percent is not None for r in rows.values())
-
-
 def _has_complete_utilization(rows: Dict[str, _TpuInfoRow]) -> bool:
-    """Return True when runtime rows contain both HBM usage/total and duty-cycle readings."""
-    return _has_live_hbm(rows) and _has_live_duty_cycle(rows)
+    """Return True when every observed runtime device row has both HBM usage/total and duty-cycle."""
+    util_rows = [r for r in rows.values() if r.in_util_table]
+    if not util_rows:
+        return False
+    return all(_row_has_complete_utilization(r) for r in util_rows)
 
 
 def _copy_tpu_info_row(row: _TpuInfoRow) -> _TpuInfoRow:
@@ -1994,13 +1995,19 @@ def _resolve_device_runtime_mapping(
 
     for dev in devices:
         is_shared_vfio = bool(dev.vfio_device and dev.vfio_device in shared_vfio)
-        verified_runtime_id = dev.runtime_chip_id
-        if not verified_runtime_id and chip_id_map:
+        verified_runtime_id: Optional[str] = None
+        # Explicit operator `--chip-id-map` overrides sysfs `chip_id` before
+        # duplicate detection so dual-function Ironwood hosts where sibling
+        # PCI functions share a physical sysfs `chip_id` can still supply unique
+        # per-BDF logical runtime core IDs.
+        if chip_id_map:
             mapped = chip_id_map.get(dev.pci_bdf)
             if mapped is None and not is_shared_vfio and dev.vfio_device:
                 mapped = chip_id_map.get(dev.vfio_device)
             if mapped is not None:
-                verified_runtime_id = str(mapped)
+                verified_runtime_id = str(mapped).strip() or None
+        if not verified_runtime_id:
+            verified_runtime_id = dev.runtime_chip_id
         resolved_rt_ids[dev.pci_bdf] = verified_runtime_id
         if verified_runtime_id:
             rt_id_claimants.setdefault(verified_runtime_id, []).append(dev.pci_bdf)

@@ -1789,6 +1789,87 @@ TPU Device Status
             self.assertEqual(filled_hbm_snap.devices[0].hbm_total_bytes, 32 * 1024**3)
             self.assertAlmostEqual(filled_hbm_snap.devices[0].duty_cycle_percent or 0.0, 73.0)
 
+            # 2c. Per-device completeness check: one complete row (or HBM on chip 0 +
+            #     duty on chip 1) MUST NOT suppress fallback when another runtime device
+            #     is missing HBM or duty-cycle, AND fallback merges strictly missing
+            #     fields while preserving already-collected gRPC readings per row!
+            cross_row_partial = {
+                "0": tpu_exporter._TpuInfoRow(
+                    chip_key="0",
+                    hbm_used_bytes=12 * 1024**3,
+                    hbm_total_bytes=32 * 1024**3,
+                    duty_cycle_percent=None,
+                    in_util_table=True,
+                ),
+                "1": tpu_exporter._TpuInfoRow(
+                    chip_key="1",
+                    hbm_used_bytes=None,
+                    hbm_total_bytes=None,
+                    duty_cycle_percent=82.0,
+                    in_util_table=True,
+                ),
+            }
+            self.assertFalse(tpu_exporter._has_complete_utilization(cross_row_partial))
+
+            one_complete_one_partial = {
+                "0": tpu_exporter._TpuInfoRow(
+                    chip_key="0",
+                    hbm_used_bytes=12 * 1024**3,
+                    hbm_total_bytes=32 * 1024**3,
+                    duty_cycle_percent=40.0,
+                    in_util_table=True,
+                ),
+                "1": tpu_exporter._TpuInfoRow(
+                    chip_key="1",
+                    hbm_used_bytes=18 * 1024**3,
+                    hbm_total_bytes=32 * 1024**3,
+                    duty_cycle_percent=None,
+                    in_util_table=True,
+                ),
+            }
+            self.assertFalse(tpu_exporter._has_complete_utilization(one_complete_one_partial))
+
+            multi_cli_calls: list[float] = []
+
+            def _fill_multi_cli(*args, **kwargs):
+                multi_cli_calls.append(float(kwargs.get("timeout_s", 0.0)))
+                rows = tpu_exporter.parse_tpu_info_output(
+                    "TPU Runtime Utilization\n"
+                    "| Chip | HBM Usage (GiB)      | Duty cycle |\n"
+                    "|------|----------------------|------------|\n"
+                    "| 0    | 5.00 GiB / 32.00 GiB | 25.00%     |\n"
+                    "| 1    | 6.00 GiB / 32.00 GiB | 67.50%     |\n"
+                )
+                return True, None, rows
+
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_query_grpc_runtime_metrics",
+                    return_value=(True, None, one_complete_one_partial),
+                ),
+                mock.patch.object(tpu_exporter, "_run_tpu_info", side_effect=_fill_multi_cli),
+            ):
+                multi_snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin="tpu-info",
+                    tpu_info_timeout_s=2.0,
+                    chip_id_map={"0000:00:06.0": "0"},
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=root / "no-shm",
+                )
+            self.assertEqual(len(multi_cli_calls), 1)
+            rt_by_chip = {r.runtime_chip: r for r in multi_snap.runtime_utilization}
+            # Chip 0 keeps direct-gRPC HBM (12 GiB) & duty (40%); chip 1 keeps gRPC HBM (18 GiB)
+            # and fills its missing duty-cycle (67.5%) from fallback.
+            self.assertEqual(rt_by_chip["0"].hbm_used_bytes, 12 * 1024**3)
+            self.assertAlmostEqual(rt_by_chip["0"].duty_cycle_percent or 0.0, 40.0)
+            self.assertEqual(rt_by_chip["1"].hbm_used_bytes, 18 * 1024**3)
+            self.assertAlmostEqual(rt_by_chip["1"].duty_cycle_percent or 0.0, 67.5)
+
             # 3. When gRPC consumes its reserved 65% slice and fails completely, CLI
             #    fallback MUST still receive the reserved ~35% budget and succeed!
             cli_timeouts: list[float] = []
@@ -2946,6 +3027,77 @@ TPU Runtime Utilization
             self.assertEqual(iw_snap.devices[7].device_id, "0x0075")
             self.assertEqual(iw_snap.devices[7].generation, "tpu7x")
             self.assertEqual(iw_snap.devices[7].hbm_nominal_bytes, 96 * 1024**3)
+
+            # Ironwood host where sibling PCI functions share a physical sysfs `chip_id`
+            # (`0, 0, 1, 1, 2, 2, 3, 3`): without `--chip-id-map`, shared IDs stay
+            # safely ambiguous/unmapped; WITH explicit per-BDF `--chip-id-map` core IDs
+            # (`0..7`), explicit mappings override the shared sysfs ID before duplicate
+            # detection so every core's HBM and duty cycle attaches cleanly!
+            iw_shared_root = root / "ironwood_shared_sysfs_chip_id"
+            iw_shared_sysfs, iw_shared_dev, iw_shared_proc = _make_mock_pci_tree(
+                iw_shared_root,
+                devices=[
+                    {
+                        "bdf": f"0000:00:{4 + (i // 2):02x}.{i % 2}",
+                        "vendor": "0x1ae0",
+                        "device": "0x0076",
+                        "driver": "vfio-pci",
+                        "iommu_group": str(i),
+                        "chip_id": str(i // 2),  # shared physical chip_id per sibling pair!
+                    }
+                    for i in range(8)
+                ],
+                create_vfio_nodes=[str(i) for i in range(8)],
+            )
+            iw_explicit_map = {
+                f"0000:00:{4 + (i // 2):02x}.{i % 2}": str(i) for i in range(8)
+            }
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.dict(_te._GRPC_CHANNELS, {}, clear=True),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "grpc": _FakeGrpc,
+                        "tpu_info": SimpleNamespace(),
+                        "tpu_info.proto": SimpleNamespace(),
+                        "tpu_info.proto.tpu_metric_service_pb2": fake_pb2,
+                        "tpu_info.proto.tpu_metric_service_pb2_grpc": iw_pb2_grpc,
+                    },
+                ),
+            ):
+                iw_shared_unmapped = _te.collect_snapshot(
+                    sysfs_root=iw_shared_sysfs,
+                    dev_root=iw_shared_dev,
+                    proc_root=iw_shared_proc,
+                    tpu_info_bin="tpu-info",
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=iw_shared_root / "no-shm",
+                )
+                iw_shared_mapped = _te.collect_snapshot(
+                    sysfs_root=iw_shared_sysfs,
+                    dev_root=iw_shared_dev,
+                    proc_root=iw_shared_proc,
+                    tpu_info_bin="tpu-info",
+                    chip_id_map=iw_explicit_map,
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=iw_shared_root / "no-shm",
+                )
+            # Without --chip-id-map, shared sysfs chip_id stays safely unmapped.
+            self.assertTrue(all(d.hbm_used_bytes is None for d in iw_shared_unmapped.devices))
+            # With explicit per-BDF --chip-id-map, all 8 cores attach to their exact PCI BDFs!
+            self.assertEqual(
+                [d.runtime_chip_id for d in iw_shared_mapped.devices],
+                [str(i) for i in range(8)],
+            )
+            self.assertEqual(
+                [d.hbm_used_bytes for d in iw_shared_mapped.devices],
+                [(i + 1) * 10 * 1024**3 for i in range(8)],
+            )
+            self.assertEqual(
+                [d.duty_cycle_percent for d in iw_shared_mapped.devices],
+                [12.5, 12.5, 37.5, 37.5, 62.5, 62.5, 87.5, 87.5],
+            )
 
             # Custom `--tpu-info-bin` specified by bare name (without `/`) MUST invoke
             # that configured executable via PATH instead of taking the default gRPC shortcut.

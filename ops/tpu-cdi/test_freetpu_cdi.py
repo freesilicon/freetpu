@@ -2980,6 +2980,8 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertEqual(len(all_7x["containerEdits"]["deviceNodes"]), 8)
                 self.assertEqual(all_7x["annotations"]["freetpu.dev/chip-count"], "4")
                 self.assertEqual(all_7x["annotations"]["freetpu.dev/pci-function-count"], "8")
+                self.assertNotIn("freetpu.dev/capacity-complete", all_7x["annotations"])
+                self.assertNotIn("freetpu.dev/incomplete-pci-functions", all_7x["annotations"])
                 all_7x_env = dict(kv.split("=", 1) for kv in all_7x["containerEdits"]["env"])
                 self.assertEqual(all_7x_env["TPU_CHIPS_PER_HOST_BOUNDS"], "2,2,1")
                 self.assertEqual(all_7x_env["TPU_ACCELERATOR_TYPE"], "tpu7x-8")
@@ -3179,6 +3181,13 @@ class FreeTpuCdiTests(unittest.TestCase):
                 )
                 self.assertNotIn("TPU_CHIPS_PER_HOST_BOUNDS", mfo_all_env)
                 self.assertNotIn("TPU_ACCELERATOR_TYPE", mfo_all_env)
+                # 1 complete chip (04.0+04.1) + 2 orphaned functions (05.0, 06.0) -> chip-count=1,
+                # NOT 3, with pci-function-count=4, incomplete-pci-functions=2, capacity-complete=false.
+                mfo_all_ann = mfo_by_name["all"]["annotations"]
+                self.assertEqual(mfo_all_ann["freetpu.dev/chip-count"], "1")
+                self.assertEqual(mfo_all_ann["freetpu.dev/pci-function-count"], "4")
+                self.assertEqual(mfo_all_ann["freetpu.dev/incomplete-pci-functions"], "2")
+                self.assertEqual(mfo_all_ann["freetpu.dev/capacity-complete"], "false")
 
                 # Separate-slot Ironwood with verified chip_ids {0, 1, 2, 4} (intact chip 0
                 # + orphan 2 from chip 1 + orphan 4 from chip 2): MUST NOT pair 2 & 4!
@@ -3247,6 +3256,13 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertNotIn("TPU_CHIPS_PER_HOST_BOUNDS", idu_all_env)
                 self.assertNotIn("TPU_ACCELERATOR_TYPE", idu_all_env)
                 self.assertNotIn("TPU_SKIP_MDS_QUERY", idu_all_env)
+                # 4 unpaired/orphaned Ironwood functions (0 complete chips) MUST advertise
+                # chip-count=0, pci-function-count=4, incomplete-pci-functions=4, capacity-complete=false!
+                idu_all_ann = idu_by_name["all"]["annotations"]
+                self.assertEqual(idu_all_ann["freetpu.dev/chip-count"], "0")
+                self.assertEqual(idu_all_ann["freetpu.dev/pci-function-count"], "4")
+                self.assertEqual(idu_all_ann["freetpu.dev/incomplete-pci-functions"], "4")
+                self.assertEqual(idu_all_ann["freetpu.dev/capacity-complete"], "false")
 
                 # Separate-slot Ironwood with explicit SHARED physical chip IDs
                 # (0,0,1,1 on NUMA 0; 2,2,3,3 on NUMA 1): pairs verified siblings cleanly!

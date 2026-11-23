@@ -1057,6 +1057,33 @@ def _is_supported_all_topology(
     return False
 
 
+def _count_complete_chips(
+    subset: Sequence[DiscoveredChip],
+    bdf_to_phys: Dict[str, int],
+) -> Tuple[int, int]:
+    """Return `(complete_chip_count, incomplete_pci_function_count)` for `subset`.
+
+    Only physical chips exposing their full expected PCI function set (e.g.
+    both chiplets on `tpu7x` Ironwood or legacy `v2-v3`) are counted in
+    `complete_chip_count`. Unpaired/orphaned functions are excluded from chip
+    capacity and tallied in `incomplete_pci_function_count`.
+    """
+    counts_by_phys: Dict[int, Tuple[int, str]] = {}
+    for c in subset:
+        phys = bdf_to_phys[c.pci_bdf]
+        cnt, gen = counts_by_phys.get(phys, (0, c.generation))
+        counts_by_phys[phys] = (cnt + 1, gen)
+    complete_chips = 0
+    incomplete_fns = 0
+    for cnt, gen in counts_by_phys.values():
+        expected = _PCI_FUNCTIONS_PER_PHYSICAL_CHIP.get(gen, 1)
+        if cnt == expected:
+            complete_chips += 1
+        else:
+            incomplete_fns += cnt
+    return complete_chips, incomplete_fns
+
+
 def _has_complete_chip_functions(
     subset: Sequence[DiscoveredChip],
     bdf_to_phys: Dict[str, int],
@@ -1064,16 +1091,8 @@ def _has_complete_chip_functions(
     """Return True when every physical chip in `subset` exposes its full expected PCI function set."""
     if not subset:
         return False
-    counts_by_phys: Dict[int, Tuple[int, str]] = {}
-    for c in subset:
-        phys = bdf_to_phys[c.pci_bdf]
-        cnt, gen = counts_by_phys.get(phys, (0, c.generation))
-        counts_by_phys[phys] = (cnt + 1, gen)
-    for cnt, gen in counts_by_phys.values():
-        expected = _PCI_FUNCTIONS_PER_PHYSICAL_CHIP.get(gen, 1)
-        if cnt != expected:
-            return False
-    return True
+    complete_chips, incomplete_fns = _count_complete_chips(subset, bdf_to_phys)
+    return complete_chips > 0 and incomplete_fns == 0
 
 
 def _resolve_verified_visibility_ordinals(
@@ -1595,11 +1614,14 @@ def build_cdi_spec(
             # Expose shared IOMMU groups strictly as a single hardware-backed
             # allocation unit so callers never assume device-level VFIO isolation
             # between sibling chips and selectors never shift onto different chips.
+            unit_complete_chips, unit_incomplete_fns = _count_complete_chips(
+                unit_chips, bdf_to_phys
+            )
             selector = _shared_group_selector(unit_bdfs)
             ann = {
                 "freetpu.dev/allocation-unit": "shared-iommu-group",
                 "freetpu.dev/shared-iommu-group": "true",
-                "freetpu.dev/chip-count": str(len(unit_phys_indices)),
+                "freetpu.dev/chip-count": str(unit_complete_chips),
                 "freetpu.dev/pci-bdfs": ",".join(unit_bdfs),
                 "freetpu.dev/generations": ",".join(unit_gens),
                 "freetpu.dev/iommu-group": rep.iommu_group,
@@ -1607,8 +1629,11 @@ def build_cdi_spec(
                 "freetpu.dev/optional-cap-add": "IPC_LOCK",
                 "freetpu.dev/required-ulimit-memlock": "-1",
             }
-            if len(unit_chips) != len(unit_phys_indices):
+            if len(unit_chips) != unit_complete_chips or unit_incomplete_fns > 0:
                 ann["freetpu.dev/pci-function-count"] = str(len(unit_chips))
+            if unit_incomplete_fns > 0:
+                ann["freetpu.dev/incomplete-pci-functions"] = str(unit_incomplete_fns)
+                ann["freetpu.dev/capacity-complete"] = "false"
             if rep.numa_node is not None:
                 ann["freetpu.dev/numa-node"] = str(rep.numa_node)
             if devnums_str:
@@ -1677,7 +1702,7 @@ def build_cdi_spec(
                 }
             )
 
-    all_phys_indices = _distinct_physical_indices(chips, bdf_to_phys)
+    all_complete_chips, all_incomplete_fns = _count_complete_chips(chips, bdf_to_phys)
     all_supported_topology = _is_supported_all_topology(chips, bdf_to_phys, all_generations)
     all_visibility = _resolve_verified_visibility_ordinals(
         chips,
@@ -1687,20 +1712,23 @@ def build_cdi_spec(
     )
     all_ann: Dict[str, str] = {
         "freetpu.dev/allocation-unit": "all-devices",
-        "freetpu.dev/chip-count": str(len(all_phys_indices)),
+        "freetpu.dev/chip-count": str(all_complete_chips),
         "freetpu.dev/pci-bdfs": ",".join(sorted(all_bdfs)),
         "freetpu.dev/generations": ",".join(all_generations),
         "freetpu.dev/optional-cap-add": "IPC_LOCK",
         "freetpu.dev/required-ulimit-memlock": "-1",
     }
-    if len(chips) != len(all_phys_indices):
+    if len(chips) != all_complete_chips or all_incomplete_fns > 0:
         all_ann["freetpu.dev/pci-function-count"] = str(len(chips))
+    if all_incomplete_fns > 0:
+        all_ann["freetpu.dev/incomplete-pci-functions"] = str(all_incomplete_fns)
+        all_ann["freetpu.dev/capacity-complete"] = "false"
     all_devnums = _format_vfio_devnums(list(seen_group_devnums.items()))
     if all_devnums:
         all_ann["freetpu.dev/vfio-devnums"] = all_devnums
 
     all_env = _build_device_env(
-        len(all_phys_indices),
+        all_complete_chips,
         all_generations,
         single_host_env=inject_single_host_env,
         include_bounds_env=all_supported_topology,
