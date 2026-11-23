@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <new>
@@ -527,41 +528,115 @@ ot_status_t ot_matmul_bf16(ot_context_t* ctx,
     ctx->last_error = "Context faulted after prior DMA timeout; recreate context";
     return OT_ERR_DEVICE;
   }
-  if (ctx->info.is_mock) {
-    std::vector<uint16_t> a(static_cast<size_t>(m_dim) * k_dim);
-    std::vector<uint16_t> b(static_cast<size_t>(k_dim) * n_dim);
-    ot_status_t st = read_buffer_row_major_locked(
-        ctx, lhs_mk, reinterpret_cast<uint8_t*>(a.data()), static_cast<size_t>(need_a));
-    if (st != OT_OK) return st;
-    st = read_buffer_row_major_locked(
-        ctx, rhs_kn, reinterpret_cast<uint8_t*>(b.data()), static_cast<size_t>(need_b));
-    if (st != OT_OK) return st;
+  auto ranges_overlap = [](const ot_buffer_t* x, const ot_buffer_t* y) -> bool {
+    if (x == y) return true;
+    if (x->size_bytes == 0 || y->size_bytes == 0) return false;
+    uint64_t x_end = x->hbm_addr + x->size_bytes;
+    uint64_t y_end = y->hbm_addr + y->size_bytes;
+    return x->hbm_addr < y_end && y->hbm_addr < x_end;
+  };
 
-    std::vector<uint16_t> c_rm(static_cast<size_t>(m_dim) * n_dim, 0);
+  if (ctx->info.is_mock) {
+    struct MallocGuard {
+      uint16_t* p = nullptr;
+      ~MallocGuard() { std::free(p); }
+    };
+    const size_t hbm_sz = ctx->transport.mock_hbm.size();
+    auto in_mock_bounds = [&](uint64_t addr, uint64_t len) -> bool {
+      return addr <= hbm_sz && len <= hbm_sz - addr;
+    };
+    if (!in_mock_bounds(lhs_mk->hbm_addr, need_a) ||
+        !in_mock_bounds(rhs_kn->hbm_addr, need_b) ||
+        !in_mock_bounds(out_mn->hbm_addr, need_c)) {
+      ctx->last_error = "Mock HBM matmul range out of bounds";
+      return OT_ERR_DEVICE;
+    }
+
+    MallocGuard a_tmp, b_tmp;
+    const uint16_t* a_ptr = nullptr;
+    const uint16_t* b_ptr = nullptr;
+    const bool lhs_needs_copy =
+        (lhs_mk->layout == ot::BufferLayout::kTiled2x128Bf16) || ranges_overlap(lhs_mk, out_mn);
+    const bool rhs_needs_copy =
+        (rhs_kn->layout == ot::BufferLayout::kTiled2x128Bf16) || ranges_overlap(rhs_kn, out_mn);
+
+    if (lhs_needs_copy) {
+      a_tmp.p = static_cast<uint16_t*>(std::malloc(static_cast<size_t>(need_a)));
+      if (!a_tmp.p) return OT_ERR_NO_MEMORY;
+      ot_status_t st = read_buffer_row_major_locked(
+          ctx, lhs_mk, reinterpret_cast<uint8_t*>(a_tmp.p), static_cast<size_t>(need_a));
+      if (st != OT_OK) return st;
+      a_ptr = a_tmp.p;
+    } else {
+      a_ptr = reinterpret_cast<const uint16_t*>(ctx->transport.mock_hbm.data() + lhs_mk->hbm_addr);
+    }
+
+    if (rhs_needs_copy) {
+      if (rhs_kn == lhs_mk && need_b == need_a && a_tmp.p) {
+        b_ptr = a_tmp.p;
+      } else {
+        b_tmp.p = static_cast<uint16_t*>(std::malloc(static_cast<size_t>(need_b)));
+        if (!b_tmp.p) return OT_ERR_NO_MEMORY;
+        ot_status_t st = read_buffer_row_major_locked(
+            ctx, rhs_kn, reinterpret_cast<uint8_t*>(b_tmp.p), static_cast<size_t>(need_b));
+        if (st != OT_OK) return st;
+        b_ptr = b_tmp.p;
+      }
+    } else {
+      b_ptr = reinterpret_cast<const uint16_t*>(ctx->transport.mock_hbm.data() + rhs_kn->hbm_addr);
+    }
+
+    if (m_dim == 128u && k_dim == 128u && n_dim == 128u) {
+      MallocGuard c_rm, c_tiled;
+      c_rm.p = static_cast<uint16_t*>(std::malloc(ot::kTile128x128Bf16Bytes));
+      c_tiled.p = static_cast<uint16_t*>(std::malloc(ot::kTile128x128Bf16Bytes));
+      if (!c_rm.p || !c_tiled.p) return OT_ERR_NO_MEMORY;
+      for (uint32_t m = 0; m < m_dim; ++m) {
+        for (uint32_t n = 0; n < n_dim; ++n) {
+          float acc = 0.0f;
+          for (uint32_t k = 0; k < k_dim; ++k) {
+            acc += bf16_to_f32(a_ptr[static_cast<size_t>(m) * k_dim + k]) *
+                   bf16_to_f32(b_ptr[static_cast<size_t>(k) * n_dim + n]);
+          }
+          c_rm.p[static_cast<size_t>(m) * n_dim + n] = f32_to_bf16(acc);
+        }
+      }
+      ot::tile_pack_128x128_bf16(c_rm.p, c_tiled.p);
+      std::memcpy(ctx->transport.mock_hbm.data() + out_mn->hbm_addr,
+                  c_tiled.p, ot::kTile128x128Bf16Bytes);
+      out_mn->layout = ot::BufferLayout::kTiled2x128Bf16;
+      return OT_OK;
+    }
+
+    // If reusing a tiled output buffer for a smaller raw matmul, unpack the 32 KiB
+    // tile in-place first so unwritten suffix bytes remain valid row-major data.
+    if (out_mn->layout == ot::BufferLayout::kTiled2x128Bf16 &&
+        need_c < ot::kTile128x128Bf16Bytes) {
+      MallocGuard prev_rm;
+      prev_rm.p = static_cast<uint16_t*>(std::malloc(ot::kTile128x128Bf16Bytes));
+      if (!prev_rm.p) return OT_ERR_NO_MEMORY;
+      ot_status_t st = read_buffer_row_major_locked(
+          ctx, out_mn, reinterpret_cast<uint8_t*>(prev_rm.p), ot::kTile128x128Bf16Bytes);
+      if (st != OT_OK) return st;
+      st = raw_h2d_locked(ctx, out_mn->hbm_addr, out_mn->size_bytes, 0u,
+                          reinterpret_cast<const uint8_t*>(prev_rm.p),
+                          ot::kTile128x128Bf16Bytes);
+      if (st != OT_OK) return st;
+      out_mn->layout = ot::BufferLayout::kRaw;
+    }
+
+    auto* c_ptr = reinterpret_cast<uint16_t*>(ctx->transport.mock_hbm.data() + out_mn->hbm_addr);
     for (uint32_t m = 0; m < m_dim; ++m) {
       for (uint32_t n = 0; n < n_dim; ++n) {
         float acc = 0.0f;
         for (uint32_t k = 0; k < k_dim; ++k) {
-          acc += bf16_to_f32(a[static_cast<size_t>(m) * k_dim + k]) *
-                 bf16_to_f32(b[static_cast<size_t>(k) * n_dim + n]);
+          acc += bf16_to_f32(a_ptr[static_cast<size_t>(m) * k_dim + k]) *
+                 bf16_to_f32(b_ptr[static_cast<size_t>(k) * n_dim + n]);
         }
-        c_rm[static_cast<size_t>(m) * n_dim + n] = f32_to_bf16(acc);
+        c_ptr[static_cast<size_t>(m) * n_dim + n] = f32_to_bf16(acc);
       }
     }
-
-    if (m_dim == 128u && k_dim == 128u && n_dim == 128u) {
-      std::vector<uint16_t> c_tiled(128u * 128u);
-      ot::tile_pack_128x128_bf16(c_rm.data(), c_tiled.data());
-      st = raw_h2d_locked(ctx, out_mn->hbm_addr, out_mn->size_bytes, 0u,
-                          reinterpret_cast<const uint8_t*>(c_tiled.data()),
-                          ot::kTile128x128Bf16Bytes);
-      if (st != OT_OK) return st;
-      out_mn->layout = ot::BufferLayout::kTiled2x128Bf16;
-    } else {
-      return write_buffer_raw_locked(ctx, out_mn, 0u,
-                                     reinterpret_cast<const uint8_t*>(c_rm.data()),
-                                     static_cast<size_t>(need_c));
-    }
+    out_mn->layout = ot::BufferLayout::kRaw;
     return OT_OK;
   }
 
@@ -588,14 +663,6 @@ ot_status_t ot_matmul_bf16(ot_context_t* ctx,
       return OT_ERR_DEVICE;
     }
     return OT_ERR_IOCTL;
-  };
-
-  auto ranges_overlap = [](const ot_buffer_t* x, const ot_buffer_t* y) -> bool {
-    if (x == y) return true;
-    if (x->size_bytes == 0 || y->size_bytes == 0) return false;
-    uint64_t x_end = x->hbm_addr + x->size_bytes;
-    uint64_t y_end = y->hbm_addr + y->size_bytes;
-    return x->hbm_addr < y_end && y->hbm_addr < x_end;
   };
 
   std::string err;
