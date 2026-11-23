@@ -84,11 +84,13 @@ su -c '
 '
 
 # Node 1 (rango — split 34/65 layers onto mustang EDGETPU, keep 31/65 layers on rango EDGETPU):
+# Note: `--no-kv-offload` keeps KV-cache `SET_ROWS` writes on the coordinator while offloading
+# model weights and `MUL_MAT` projections to Node 2's EDGETPU RPC server.
 su -c '
   OPENBUENOS_VERBOSE=1 OPENBUENOS_WEIGHT_CACHE_MB=128 OPENBUENOS_WEIGHT_CACHE_ENTRIES=256 OPENBUENOS_POOL_MB=64 \
   /data/local/tmp/llama-edgetpu-rpc/llama-completion \
     -m /data/local/tmp/llama-edgetpu/models/Qwen2.5-32B-Instruct-Q4_0.gguf \
-    --rpc 10.99.0.2:50052 -ngl 34 -c 256 -b 64 -ub 64 -t 4 -no-cnv \
+    --rpc 10.99.0.2:50052 -ngl 34 --no-kv-offload -c 256 -b 64 -ub 64 -t 4 -no-cnv \
     -p "The capital of France is" -n 8 --temp 0 --no-display-prompt
 '
 ```
