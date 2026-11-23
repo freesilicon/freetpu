@@ -3053,6 +3053,76 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertNotIn("TPU_ACCELERATOR_TYPE", all_7x_deg0_env)
                 self.assertNotIn("TPU_SKIP_MDS_QUERY", all_7x_deg0_env)
 
+                # Degraded 1-chip Ironwood (`tpu7x`, 2 sibling PCI functions = 1 physical chip)
+                # and degraded 1-chip `v5p` hosts: both generations are strictly 4-chip-per-VM
+                # (`tpu7x-8`, `v5p-8`), so `all` is still published with its devices, but
+                # `--single-host-env` MUST NOT inject unsupported `tpu7x-2`/`v5p-2`/`1,1,1`
+                # bounds or `TPU_SKIP_MDS_QUERY=true`.
+                one_chip_7x_devs = [
+                    {
+                        "bdf": "0000:00:04.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x0076",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                        "numa_node": "0",
+                    },
+                    {
+                        "bdf": "0000:00:04.1",
+                        "vendor": "0x1ae0",
+                        "device": "0x0076",
+                        "driver": "vfio-pci",
+                        "iommu_group": "1",
+                        "numa_node": "0",
+                    },
+                ]
+                o7x_sys, o7x_dev = _make_mock_pci_vfio(
+                    root / "tpu7x_one_chip_degraded",
+                    devices=one_chip_7x_devs,
+                    create_vfio_nodes=["0", "1"],
+                )
+                o7x_chips, o7x_ctrl = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=o7x_sys, dev_root=o7x_dev
+                )
+                o7x_spec = freetpu_cdi.build_cdi_spec(
+                    o7x_chips, o7x_ctrl, single_host_env=True
+                )
+                o7x_all = {d["name"]: d for d in o7x_spec["devices"]}["all"]
+                o7x_env = dict(
+                    kv.split("=", 1) for kv in o7x_all["containerEdits"].get("env", [])
+                )
+                self.assertNotIn("TPU_ACCELERATOR_TYPE", o7x_env)
+                self.assertNotIn("TPU_CHIPS_PER_HOST_BOUNDS", o7x_env)
+                self.assertNotIn("TPU_SKIP_MDS_QUERY", o7x_env)
+
+                one_chip_v5p_sys, one_chip_v5p_dev = _make_mock_pci_vfio(
+                    root / "v5p_one_chip_degraded",
+                    devices=[
+                        {
+                            "bdf": "0000:00:04.0",
+                            "vendor": "0x1ae0",
+                            "device": "0x0062",
+                            "driver": "vfio-pci",
+                            "iommu_group": "0",
+                            "numa_node": "0",
+                        }
+                    ],
+                    create_vfio_nodes=["0"],
+                )
+                ov5p_chips, ov5p_ctrl = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=one_chip_v5p_sys, dev_root=one_chip_v5p_dev
+                )
+                ov5p_spec = freetpu_cdi.build_cdi_spec(
+                    ov5p_chips, ov5p_ctrl, single_host_env=True
+                )
+                ov5p_all = {d["name"]: d for d in ov5p_spec["devices"]}["all"]
+                ov5p_env = dict(
+                    kv.split("=", 1) for kv in ov5p_all["containerEdits"].get("env", [])
+                )
+                self.assertNotIn("TPU_ACCELERATOR_TYPE", ov5p_env)
+                self.assertNotIn("TPU_CHIPS_PER_HOST_BOUNDS", ov5p_env)
+                self.assertNotIn("TPU_SKIP_MDS_QUERY", ov5p_env)
+
                 # Orphaned Ironwood functions from TWO distinct degraded chips in the same
                 # domain (1 intact chip + 1 orphan from chip 1 + 1 orphan from chip 2 = 4
                 # functions total) MUST NOT be falsely paired into a 2nd complete chip!

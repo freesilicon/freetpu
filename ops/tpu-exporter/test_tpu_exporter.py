@@ -1676,6 +1676,119 @@ TPU Device Status
             self.assertEqual(partial_grpc_snap.devices[0].hbm_used_bytes, 12 * 1024**3)
             self.assertEqual(partial_grpc_snap.devices[0].hbm_total_bytes, 32 * 1024**3)
 
+            # 2b. When direct gRPC returns HBM without duty-cycle (partial reply),
+            #     fallback MUST run with the remaining scrape budget, fill in the
+            #     missing duty-cycle, AND preserve direct gRPC's HBM readings
+            #     (both in host CLI fallback mode and sidecar Python fallback mode)!
+            partial_cli_calls: list[float] = []
+
+            def _fill_duty_cli(*args, **kwargs):
+                partial_cli_calls.append(float(kwargs.get("timeout_s", 0.0)))
+                rows = tpu_exporter.parse_tpu_info_output(
+                    "TPU Runtime Utilization\n"
+                    "| Chip | HBM Usage (GiB)      | Duty cycle |\n"
+                    "|------|----------------------|------------|\n"
+                    "| 0    | 9.00 GiB / 32.00 GiB | 61.50%     |\n"
+                )
+                return True, None, rows
+
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.dict(tpu_exporter._GRPC_CHANNELS, {}, clear=True),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_load_grpc_runtime_modules",
+                    return_value=(fake_grpc, fake_pb2, fake_pb2_grpc),
+                ),
+                mock.patch.object(tpu_exporter, "_run_tpu_info", side_effect=_fill_duty_cli),
+            ):
+                filled_host_snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin="tpu-info",
+                    tpu_info_timeout_s=2.0,
+                    chip_id_map={"0000:00:06.0": "0"},
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=root / "no-shm",
+                )
+            self.assertEqual(len(partial_cli_calls), 1)
+            self.assertGreater(partial_cli_calls[0], 0.5)
+            # Preserved direct-gRPC HBM (12 GiB, not overwritten by CLI's 9 GiB) + filled duty (61.5%).
+            self.assertEqual(filled_host_snap.devices[0].hbm_used_bytes, 12 * 1024**3)
+            self.assertEqual(filled_host_snap.devices[0].hbm_total_bytes, 32 * 1024**3)
+            self.assertAlmostEqual(filled_host_snap.devices[0].duty_cycle_percent or 0.0, 61.5)
+
+            partial_py_calls: list[float] = []
+
+            def _fill_duty_py(*args, **kwargs):
+                partial_py_calls.append(float(kwargs.get("timeout_s", 0.0)))
+                rows = tpu_exporter.parse_tpu_info_output(
+                    "TPU Runtime Utilization\n"
+                    "| Chip | HBM Usage (GiB)      | Duty cycle |\n"
+                    "|------|----------------------|------------|\n"
+                    "| 0    | 7.00 GiB / 32.00 GiB | 58.00%     |\n"
+                )
+                return True, None, rows
+
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.dict(tpu_exporter._GRPC_CHANNELS, {}, clear=True),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_load_grpc_runtime_modules",
+                    return_value=(fake_grpc, fake_pb2, fake_pb2_grpc),
+                ),
+                mock.patch.object(
+                    tpu_exporter, "_query_tpu_info_python_metrics", side_effect=_fill_duty_py
+                ),
+            ):
+                filled_sidecar_snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin="tpu-info",
+                    tpu_info_timeout_s=2.0,
+                    chip_id_map={"0000:00:06.0": "0"},
+                    skip_pid_scan=True,
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=root / "no-shm",
+                )
+            self.assertEqual(len(partial_py_calls), 1)
+            self.assertEqual(filled_sidecar_snap.devices[0].hbm_used_bytes, 12 * 1024**3)
+            self.assertEqual(filled_sidecar_snap.devices[0].hbm_total_bytes, 32 * 1024**3)
+            self.assertAlmostEqual(filled_sidecar_snap.devices[0].duty_cycle_percent or 0.0, 58.0)
+
+            # Conversely, when direct gRPC returns duty-cycle only (HBM timed out),
+            # fallback fills missing HBM while preserving gRPC's duty-cycle reading.
+            duty_only_row = tpu_exporter._TpuInfoRow(
+                chip_key="0",
+                duty_cycle_percent=73.0,
+                in_util_table=True,
+            )
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.object(
+                    tpu_exporter,
+                    "_query_grpc_runtime_metrics",
+                    return_value=(True, None, {"0": duty_only_row}),
+                ),
+                mock.patch.object(tpu_exporter, "_run_tpu_info", side_effect=_fill_duty_cli),
+            ):
+                filled_hbm_snap = tpu_exporter.collect_snapshot(
+                    sysfs_root=sysfs_root,
+                    dev_root=dev_root,
+                    proc_root=proc_root,
+                    tpu_info_bin="tpu-info",
+                    tpu_info_timeout_s=2.0,
+                    chip_id_map={"0000:00:06.0": "0"},
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=root / "no-shm",
+                )
+            self.assertEqual(filled_hbm_snap.devices[0].hbm_used_bytes, 9 * 1024**3)
+            self.assertEqual(filled_hbm_snap.devices[0].hbm_total_bytes, 32 * 1024**3)
+            self.assertAlmostEqual(filled_hbm_snap.devices[0].duty_cycle_percent or 0.0, 73.0)
+
             # 3. When gRPC consumes its reserved 65% slice and fails completely, CLI
             #    fallback MUST still receive the reserved ~35% budget and succeed!
             cli_timeouts: list[float] = []
@@ -2076,7 +2189,7 @@ TPU Runtime Utilization
                     {
                         "bdf": "0000:00:0b.0",
                         "vendor": "0x1ae0",
-                        "device": "0x006f",
+                        "device": "0x006f",  # TPU v6e (devices_per_chip=1)
                         "driver": "vfio-pci",
                         "iommu_group": "3",
                         "chip_id": "0",
@@ -2084,7 +2197,7 @@ TPU Runtime Utilization
                     {
                         "bdf": "0000:00:0c.0",
                         "vendor": "0x1ae0",
-                        "device": "0x0076",  # Google's published Ironwood PCI ID
+                        "device": "0x0062",  # TPU v5p (devices_per_chip=1)
                         "driver": "vfio-pci",
                         "iommu_group": "2",
                         "chip_id": "1",
@@ -2092,7 +2205,7 @@ TPU Runtime Utilization
                     {
                         "bdf": "0000:00:0d.0",
                         "vendor": "0x1ae0",
-                        "device": "0x0075",  # tpu7x alias (pending live HW confirmation #21)
+                        "device": "0x0063",  # TPU v5e (devices_per_chip=1)
                         "driver": "vfio-pci",
                         "iommu_group": "4",
                     },
@@ -2305,17 +2418,17 @@ TPU Runtime Utilization
             self.assertAlmostEqual(
                 snap1.devices[0].hbm_bandwidth_utilization_percent or 0.0, 63.2
             )
-            self.assertEqual(snap1.devices[1].device_id, "0x0076")
-            self.assertEqual(snap1.devices[1].generation, "tpu7x")
+            self.assertEqual(snap1.devices[1].device_id, "0x0062")
+            self.assertEqual(snap1.devices[1].generation, "v5p")
             self.assertEqual(snap1.devices[1].hbm_used_bytes, 64 * 1024**3)
             self.assertEqual(snap1.devices[1].hbm_total_bytes, 96 * 1024**3)
             self.assertAlmostEqual(
                 snap1.devices[1].hbm_bandwidth_utilization_percent or 0.0, 41.0
             )
-            self.assertEqual(snap1.devices[2].device_id, "0x0075")
-            self.assertEqual(snap1.devices[2].generation, "tpu7x")
-            self.assertEqual(snap1.devices[2].hbm_nominal_bytes, 96 * 1024**3)
-            self.assertEqual(snap1.devices[2].hbm_total_bytes, 96 * 1024**3)
+            self.assertEqual(snap1.devices[2].device_id, "0x0063")
+            self.assertEqual(snap1.devices[2].generation, "v5e")
+            self.assertEqual(snap1.devices[2].hbm_nominal_bytes, 16 * 1024**3)
+            self.assertEqual(snap1.devices[2].hbm_total_bytes, 16 * 1024**3)
             # Unset AttrValue and unset Gauge entries must not appear in runtime_utilization.
             self.assertEqual(
                 sorted(rt.runtime_chip for rt in snap1.runtime_utilization),
@@ -2378,7 +2491,7 @@ TPU Runtime Utilization
                     {
                         "bdf": f"0000:00:{4 + i:02x}.0",
                         "vendor": "0x1ae0",
-                        "device": "0x0076",
+                        "device": "0x0075" if i == 7 else "0x0076",
                         "driver": "vfio-pci",
                         "iommu_group": str(i),
                         "chip_id": str(i),
@@ -2798,6 +2911,41 @@ TPU Runtime Utilization
                 [d.hbm_used_bytes for d in iw_full_duty_partial_hbm_snap.devices[:6]],
                 [(c + 1) * 4 * 1024**3 for c in range(6)],
             )
+
+            # Sidecar WITHOUT PCI inventory (`devices=[]`): MUST NOT default
+            # `devices_per_chip=1` and misjoin 4 physical-chip Ironwood duty readings
+            # `{0..3}` onto 8 logical-core HBM rows `{0..7}` (putting chip 1's duty
+            # onto core 1 of chip 0)! HBM rows stay intact and duty is kept unjoined.
+            self.assertIsNone(_te._infer_devices_per_chip([]))
+            with (
+                mock.patch.dict(_te._GRPC_CHANNELS, {}, clear=True),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "grpc": _FakeGrpc,
+                        "tpu_info": SimpleNamespace(),
+                        "tpu_info.proto": SimpleNamespace(),
+                        "tpu_info.proto.tpu_metric_service_pb2": fake_pb2,
+                        "tpu_info.proto.tpu_metric_service_pb2_grpc": SimpleNamespace(
+                            RuntimeMetricServiceStub=_IronwoodStub
+                        ),
+                    },
+                ),
+            ):
+                no_pci_ok, no_pci_err, no_pci_rows = _te._query_grpc_runtime_metrics(
+                    [], addr="127.0.0.1:8431"
+                )
+            self.assertTrue(no_pci_ok, no_pci_err)
+            self.assertEqual(sorted(no_pci_rows.keys(), key=int), [str(c) for c in range(8)])
+            for core_idx in range(8):
+                self.assertEqual(
+                    no_pci_rows[str(core_idx)].hbm_used_bytes, (core_idx + 1) * 10 * 1024**3
+                )
+                self.assertIsNone(no_pci_rows[str(core_idx)].duty_cycle_percent)
+            self.assertEqual(iw_snap.devices[0].device_id, "0x0076")
+            self.assertEqual(iw_snap.devices[7].device_id, "0x0075")
+            self.assertEqual(iw_snap.devices[7].generation, "tpu7x")
+            self.assertEqual(iw_snap.devices[7].hbm_nominal_bytes, 96 * 1024**3)
 
             # Custom `--tpu-info-bin` specified by bare name (without `/`) MUST invoke
             # that configured executable via PATH instead of taking the default gRPC shortcut.

@@ -973,11 +973,14 @@ def _distinct_physical_indices(
 
 
 # Supported single-host Cloud TPU physical chip topologies per generation.
-# Per Google Cloud TPU docs, single-VM `v6e`, `v5e`, `v5p`, `v4`, and `tpu7x`
-# (Ironwood, documented 4-chip `2x2x1` VM) hosts support `{1, 4, 8}` physical
-# chips — NOT 2, because PCIe/NUMA locality alone cannot verify that two chips
-# form a contiguous `1,2,1` ICI mesh (e.g. two surviving v6e chips could be a
-# 2x2 diagonal, and Ironwood documents 4-chip single-host topology).
+# Per Google Cloud TPU docs (`tpu-machines#tpu_topology`):
+# - `v6e` and `v5e` single-VM hosts support `{1, 4, 8}` physical chips (NOT 2,
+#   because PCIe/NUMA locality alone cannot verify that two surviving chips form
+#   a contiguous `1,2,1` ICI mesh rather than a 2x2 diagonal).
+# - `v5p`, `v4`, and `tpu7x` (Ironwood) VMs are strictly 4-chip-per-VM hosts
+#   (`v5p-8`, `v4-8`, `tpu7x-8`), so degraded 1-, 2-, or 3-chip inventory can
+#   still be published without injecting unsupported `tpu7x-2`/`v5p-2` or
+#   `1,1,1` isolated runtime overrides.
 # Sub-host slice selectors (`numa*`, `pcie-*`, range aliases) are emitted ONLY
 # when a domain's live physical chip count is supported for its generation and
 # every chip has its full PCI function set.
@@ -985,11 +988,11 @@ _SUPPORTED_SINGLE_HOST_CHIP_COUNTS_BY_GEN: Dict[str, frozenset[int]] = {
     "v6e": frozenset({1, 4, 8}),
     "v6e-pf": frozenset({1, 4, 8}),
     "v5e": frozenset({1, 4, 8}),
-    "v5p": frozenset({1, 4, 8}),
-    "v4": frozenset({1, 4, 8}),
-    "tpu7x": frozenset({1, 4, 8}),
+    "v5p": frozenset({4}),
+    "v4": frozenset({4}),
+    "tpu7x": frozenset({4}),
 }
-_DEFAULT_SUPPORTED_SINGLE_HOST_CHIP_COUNTS = frozenset({1, 4, 8})
+_DEFAULT_SUPPORTED_SINGLE_HOST_CHIP_COUNTS: frozenset[int] = frozenset()
 
 
 def _is_supported_single_host_chip_count(
