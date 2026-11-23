@@ -1553,6 +1553,7 @@ def _compute_topology_slices(
     reserved_names: Optional[set[str]] = None,
     chip_id_map: Optional[Dict[str, int]] = None,
     host_pci_inventory: Optional[Sequence[DiscoveredChip]] = None,
+    observed_domain_bdfs: Optional[Dict[Tuple[str, Optional[int], str], set[str]]] = None,
 ) -> List[_TopologySlice]:
     """Compute valid single-domain NUMA / PCIe sub-host slices and their canonical aliases.
 
@@ -1570,6 +1571,7 @@ def _compute_topology_slices(
         return []
 
     full_inventory = host_pci_inventory if host_pci_inventory is not None else chips
+    inventory_all_bdfs = {inv_chip.pci_bdf for inv_chip in full_inventory}
     inventory_domain_bdfs: Dict[Tuple[str, Optional[int], str], set[str]] = {}
     for inv_chip in full_inventory:
         inventory_domain_bdfs.setdefault(_topology_domain_key(inv_chip), set()).add(
@@ -1590,14 +1592,24 @@ def _compute_topology_slices(
 
     slices: List[_TopologySlice] = []
     for dom_ordinal, (d_key, d_chips) in enumerate(domains.items()):
-        # Withhold any NUMA/PCIe slice whose domain lost one or more VFIO-ready
-        # PCI functions compared to the full host PCI inventory (e.g. an 8-chip
-        # single-root v6e domain losing 4 VFIO nodes must NOT be republished as
-        # a 4-chip slice with `2,2,1` topology bounds). Other unaffected domains
-        # whose PCI functions are all VFIO-available remain publishable.
-        domain_inv_bdfs = inventory_domain_bdfs.get(d_key, set())
+        # Withhold any NUMA/PCIe slice whose domain lost one or more PCI
+        # functions (either unavailable VFIO nodes in live PCI sysfs, PCI
+        # functions previously observed in this boot's domain inventory, or
+        # missing `--chip-id-map` BDFs on the same PCIe root) so a degraded
+        # single-root 8-chip v6e domain losing 4 functions can never be
+        # republished as a 4-chip slice with fabricated `2,2,1` topology bounds.
+        domain_expected_bdfs = set(inventory_domain_bdfs.get(d_key, set()))
+        if observed_domain_bdfs:
+            domain_expected_bdfs.update(observed_domain_bdfs.get(d_key, set()))
+        if chip_id_map:
+            for map_bdf in chip_id_map:
+                if (
+                    map_bdf not in inventory_all_bdfs
+                    and _pcie_root_complex(map_bdf) == d_key[2]
+                ):
+                    domain_expected_bdfs.add(map_bdf)
         available_domain_bdfs = {c.pci_bdf for c in d_chips}
-        if domain_inv_bdfs and not domain_inv_bdfs.issubset(available_domain_bdfs):
+        if domain_expected_bdfs and not domain_expected_bdfs.issubset(available_domain_bdfs):
             continue
         if len(d_chips) < 2:
             continue
@@ -1649,7 +1661,15 @@ def _compute_topology_slices(
         )
         if verified_vis is not None:
             vis_chips, _vis_devs = verified_vis
-            if vis_chips and vis_chips == list(range(vis_chips[0], vis_chips[0] + len(vis_chips))):
+            is_contiguous = bool(
+                vis_chips and vis_chips == list(range(vis_chips[0], vis_chips[0] + len(vis_chips)))
+            )
+            # Without an explicit `--chip-id-map`, non-contiguous sysfs `chip_id`s
+            # (e.g. `0, 2, 5, 7`) indicate missing chips in a degraded domain rather
+            # than a verified contiguous 2x2 sub-host torus slice; withhold the slice.
+            if chip_id_map is None and not is_contiguous:
+                continue
+            if is_contiguous:
                 candidate_names.append(f"{vis_chips[0]}-{vis_chips[-1]}")
 
         aliases: List[str] = []
@@ -1698,6 +1718,110 @@ def _topology_domain_key(chip: DiscoveredChip) -> Tuple[str, Optional[int], str]
     return ("pcie", None, root)
 
 
+def _format_observed_domain_bdfs(
+    domain_bdfs: Dict[Tuple[str, Optional[int], str], set[str]],
+) -> str:
+    """Serialize per-domain observed PCI BDF sets deterministically for boot-scoped annotations."""
+    parts: List[str] = []
+    for d_key in sorted(
+        domain_bdfs,
+        key=lambda k: (k[0], -1 if k[1] is None else k[1], k[2]),
+    ):
+        bdfs = sorted(b for b in domain_bdfs[d_key] if b)
+        if not bdfs:
+            continue
+        kind_tok, numa_val, root_val = d_key
+        numa_tok = "" if numa_val is None else str(numa_val)
+        parts.append(f"{kind_tok}|{numa_tok}|{root_val}={','.join(bdfs)}")
+    return ";".join(parts)
+
+
+def _parse_observed_domain_bdfs(
+    raw: Any,
+) -> Dict[Tuple[str, Optional[int], str], set[str]]:
+    out: Dict[Tuple[str, Optional[int], str], set[str]] = {}
+    if not isinstance(raw, str) or not raw.strip():
+        return out
+    for entry in raw.split(";"):
+        entry = entry.strip()
+        if not entry or "=" not in entry:
+            continue
+        key_part, bdfs_part = entry.split("=", 1)
+        tokens = key_part.split("|")
+        if len(tokens) != 3:
+            continue
+        kind_tok, numa_tok, root_val = tokens
+        if kind_tok not in ("numa", "pcie") or not root_val:
+            continue
+        numa_val: Optional[int] = None
+        if kind_tok == "numa":
+            if not numa_tok.isdigit():
+                continue
+            numa_val = int(numa_tok, 10)
+        bdfs = {b.strip().lower() for b in bdfs_part.split(",") if b.strip()}
+        if bdfs:
+            out.setdefault((kind_tok, numa_val, root_val), set()).update(bdfs)
+    return out
+
+
+def _extract_observed_domain_bdfs_from_spec(
+    spec: Any,
+) -> Dict[Tuple[str, Optional[int], str], set[str]]:
+    """Recover boot-observed domain PCI BDFs from an existing CDI spec."""
+    out: Dict[Tuple[str, Optional[int], str], set[str]] = {}
+    if not isinstance(spec, dict):
+        return out
+    root_ann = spec.get("annotations")
+    if isinstance(root_ann, dict):
+        out = _parse_observed_domain_bdfs(root_ann.get("freetpu.dev/observed-domain-bdfs"))
+    if out:
+        return out
+    # Backward-compatible fallback for specs written without the root annotation.
+    devices = spec.get("devices")
+    if not isinstance(devices, list):
+        return out
+    for dev in devices:
+        if not isinstance(dev, dict):
+            continue
+        ann = dev.get("annotations")
+        if not isinstance(ann, dict):
+            continue
+        bdfs: List[str] = []
+        if isinstance(ann.get("freetpu.dev/pci-bdf"), str) and ann["freetpu.dev/pci-bdf"].strip():
+            bdfs = [ann["freetpu.dev/pci-bdf"].strip().lower()]
+        elif isinstance(ann.get("freetpu.dev/pci-bdfs"), str) and ann["freetpu.dev/pci-bdfs"].strip():
+            bdfs = [b.strip().lower() for b in ann["freetpu.dev/pci-bdfs"].split(",") if b.strip()]
+        if not bdfs:
+            continue
+        raw_numa = ann.get("freetpu.dev/numa-node")
+        numa_val: Optional[int] = None
+        if isinstance(raw_numa, str) and raw_numa.strip().isdigit():
+            numa_val = int(raw_numa.strip(), 10)
+        raw_root = ann.get("freetpu.dev/pcie-root")
+        if isinstance(raw_root, str) and raw_root.strip():
+            root_val = raw_root.strip().lower()
+            d_key = ("numa", numa_val, root_val) if numa_val is not None else ("pcie", None, root_val)
+            out.setdefault(d_key, set()).update(bdfs)
+        elif dev.get("name") != "all":
+            for b in bdfs:
+                root_val = _pcie_root_complex(b)
+                d_key = ("numa", numa_val, root_val) if numa_val is not None else ("pcie", None, root_val)
+                out.setdefault(d_key, set()).add(b)
+    return out
+
+
+def _merge_observed_domain_bdfs(
+    existing: Optional[Dict[Tuple[str, Optional[int], str], set[str]]],
+    inventory: Sequence[DiscoveredChip],
+) -> Dict[Tuple[str, Optional[int], str], set[str]]:
+    merged: Dict[Tuple[str, Optional[int], str], set[str]] = {
+        k: set(v) for k, v in (existing or {}).items()
+    }
+    for chip in inventory:
+        merged.setdefault(_topology_domain_key(chip), set()).add(chip.pci_bdf)
+    return merged
+
+
 def build_cdi_spec(
     chips: Sequence[DiscoveredChip],
     vfio_container_host_path: Path,
@@ -1709,6 +1833,7 @@ def build_cdi_spec(
     chip_id_map: Optional[Dict[str, int]] = None,
     omit_visible_env: bool = False,
     host_pci_inventory: Optional[Sequence[DiscoveredChip]] = None,
+    observed_domain_bdfs: Optional[Dict[Tuple[str, Optional[int], str], set[str]]] = None,
 ) -> Dict[str, Any]:
     """Build a CNCF CDI JSON specification dictionary (default: CDI v0.6.0, host-safe env).
 
@@ -1879,6 +2004,10 @@ def build_cdi_spec(
         if chip_id_map
         else bdf_to_phys
     )
+    merged_observed_domains = _merge_observed_domain_bdfs(
+        observed_domain_bdfs,
+        host_pci_inventory if host_pci_inventory is not None else chips,
+    )
     used_names = {d["name"] for d in devices}
     for topo_slice in _compute_topology_slices(
         chips,
@@ -1886,6 +2015,7 @@ def build_cdi_spec(
         reserved_names=used_names,
         chip_id_map=chip_id_map,
         host_pci_inventory=host_pci_inventory,
+        observed_domain_bdfs=merged_observed_domains,
     ):
         slice_nodes, slice_devnums = _dedup_device_nodes(topo_slice.chips)
         slice_visibility = _resolve_verified_visibility_ordinals(
@@ -1970,6 +2100,27 @@ def build_cdi_spec(
             chip_id_map=chip_id_map,
             host_pci_inventory=host_pci_inventory,
         )
+        observed_host_bdfs: set[str] = set()
+        for dom_bdfs in merged_observed_domains.values():
+            observed_host_bdfs.update(dom_bdfs)
+        all_bdfs_set = set(all_bdfs)
+        missing_observed_all = bool(
+            observed_host_bdfs and not observed_host_bdfs.issubset(all_bdfs_set)
+        )
+        missing_map_all = bool(
+            chip_id_map and any(b not in all_bdfs_set for b in chip_id_map)
+        )
+        noncontig_sysfs_all = bool(
+            chip_id_map is None
+            and all_visibility is not None
+            and len(all_visibility[0]) >= 2
+            and all_visibility[0]
+            != list(range(all_visibility[0][0], all_visibility[0][0] + len(all_visibility[0])))
+        )
+        if all_complete_chips >= 2 and (
+            missing_observed_all or missing_map_all or noncontig_sysfs_all
+        ):
+            all_supported_topology = False
         all_visibility_nomap = (
             _resolve_verified_visibility_ordinals(
                 chips,
@@ -2038,6 +2189,9 @@ def build_cdi_spec(
     )
     if root_devnums:
         root_ann["freetpu.dev/vfio-devnums"] = root_devnums
+    observed_domains_str = _format_observed_domain_bdfs(merged_observed_domains)
+    if observed_domains_str:
+        root_ann["freetpu.dev/observed-domain-bdfs"] = observed_domains_str
 
     return {
         "cdiVersion": cdi_version,
@@ -2600,6 +2754,7 @@ def _verify_spec_against_host_detailed(
     iommu_dev_path: Optional[Path] = None,
     vfio_mode: str = "auto",
     chip_id_map: Optional[Dict[str, int]] = None,
+    observed_domain_bdfs: Optional[Dict[Tuple[str, Optional[int], str], set[str]]] = None,
 ) -> Tuple[List[str], List[str]]:
     """Revalidate all effective global and per-device CDI nodes against live host VFIO/iommufd state.
 
@@ -2659,6 +2814,13 @@ def _verify_spec_against_host_detailed(
         else _shared_group_selector(sorted(c.pci_bdf for c in u))
         for u in live_units.values()
     }
+    spec_observed_domains = _extract_observed_domain_bdfs_from_spec(spec)
+    if observed_domain_bdfs:
+        for d_k, bdfs_s in observed_domain_bdfs.items():
+            spec_observed_domains.setdefault(d_k, set()).update(bdfs_s)
+    merged_live_observed = _merge_observed_domain_bdfs(
+        spec_observed_domains, live_pci_inventory
+    )
     live_bdf_to_phys = _map_physical_chip_indices(live_chips, chip_id_map=chip_id_map)
     expected_slices_by_name: Dict[str, _TopologySlice] = {}
     expected_slices_by_bdfs: Dict[Tuple[str, ...], _TopologySlice] = {}
@@ -2668,6 +2830,7 @@ def _verify_spec_against_host_detailed(
         reserved_names=live_reserved_names,
         chip_id_map=chip_id_map,
         host_pci_inventory=live_pci_inventory,
+        observed_domain_bdfs=merged_live_observed,
     ):
         expected_slices_by_bdfs[topo_slice.pci_bdfs] = topo_slice
         for alias in topo_slice.aliases:
@@ -3019,6 +3182,46 @@ def _verify_spec_against_host_detailed(
                             f"device {name!r}: stale freetpu.dev/numa-node "
                             f"{ann.get('freetpu.dev/numa-node')!r} (host has {str(expected_dom_numa)!r})"
                         )
+                if check_slice is not None:
+                    if (
+                        "freetpu.dev/chip-count" in ann
+                        and ann.get("freetpu.dev/chip-count") != str(len(check_slice.physical_indices))
+                    ):
+                        errors.append(
+                            f"device {name!r}: stale freetpu.dev/chip-count "
+                            f"{ann.get('freetpu.dev/chip-count')!r} (host slice has "
+                            f"{len(check_slice.physical_indices)})"
+                        )
+                    slice_expected_topo = dict(
+                        kv.split("=", 1)
+                        for kv in _build_device_env(
+                            len(check_slice.physical_indices),
+                            check_slice.generations,
+                            single_host_env=True,
+                            include_bounds_env=True,
+                            verified_visibility=None,
+                            omit_visible_env=True,
+                        )
+                        if "=" in kv
+                    )
+                    slice_injected_topo: Dict[str, str] = {}
+                    for env_src in (
+                        global_edits.get("env") if isinstance(global_edits, dict) else None,
+                        edits.get("env") if isinstance(edits, dict) else None,
+                    ):
+                        if isinstance(env_src, list):
+                            for entry in env_src:
+                                if isinstance(entry, str) and "=" in entry:
+                                    ek, ev = entry.split("=", 1)
+                                    if ek in ("TPU_CHIPS_PER_HOST_BOUNDS", "TPU_ACCELERATOR_TYPE", "TPU_SKIP_MDS_QUERY"):
+                                        slice_injected_topo[ek] = ev.strip()
+                    for ek, ev in slice_injected_topo.items():
+                        exp_v = slice_expected_topo.get(ek)
+                        if exp_v is None or ev != exp_v:
+                            errors.append(
+                                f"device {name!r}: stale injected {ek}={ev!r} "
+                                f"(live host slice expects {exp_v!r})"
+                            )
             elif name == "all":
                 all_pci_bdfs = sorted(c.pci_bdf for c in live_pci_inventory)
                 if expected_live_bdfs != all_pci_bdfs:
@@ -3026,6 +3229,118 @@ def _verify_spec_against_host_detailed(
                         f"device 'all': exposed VFIO groups {expected_live_bdfs} do not match "
                         f"all live host TPU PCI devices {all_pci_bdfs}"
                     )
+                else:
+                    # Revalidate recorded chip capacity and injected topology overrides
+                    # (e.g. `TPU_CHIPS_PER_HOST_BOUNDS`, `TPU_ACCELERATOR_TYPE`,
+                    # `TPU_SKIP_MDS_QUERY`) on `all` even when `--omit-visible-env`
+                    # omitted `TPU_VISIBLE_CHIPS`/`TPU_VISIBLE_DEVICES`.
+                    live_all_gens: List[str] = []
+                    for c in live_chips:
+                        if c.generation not in live_all_gens:
+                            live_all_gens.append(c.generation)
+                    live_all_complete, live_all_incomplete = _count_complete_chips(
+                        live_chips, live_bdf_to_phys
+                    )
+                    live_all_supported = _is_supported_all_topology(
+                        live_chips, live_bdf_to_phys, live_all_gens
+                    )
+                    live_all_vis = _resolve_verified_visibility_ordinals(
+                        live_chips,
+                        live_chips,
+                        live_bdf_to_phys,
+                        chip_id_map=chip_id_map,
+                        host_pci_inventory=live_pci_inventory,
+                    )
+                    live_obs_bdfs: set[str] = set()
+                    for dom_bdfs in merged_live_observed.values():
+                        live_obs_bdfs.update(dom_bdfs)
+                    live_all_bdfs_set = set(all_pci_bdfs)
+                    live_missing_obs = bool(
+                        live_obs_bdfs and not live_obs_bdfs.issubset(live_all_bdfs_set)
+                    )
+                    live_missing_map = bool(
+                        chip_id_map and any(b not in live_all_bdfs_set for b in chip_id_map)
+                    )
+                    live_noncontig_sysfs = bool(
+                        chip_id_map is None
+                        and live_all_vis is not None
+                        and len(live_all_vis[0]) >= 2
+                        and live_all_vis[0]
+                        != list(
+                            range(
+                                live_all_vis[0][0],
+                                live_all_vis[0][0] + len(live_all_vis[0]),
+                            )
+                        )
+                    )
+                    if live_all_complete >= 2 and (
+                        live_missing_obs or live_missing_map or live_noncontig_sysfs
+                    ):
+                        live_all_supported = False
+                    expected_all_topo = dict(
+                        kv.split("=", 1)
+                        for kv in _build_device_env(
+                            live_all_complete,
+                            live_all_gens,
+                            single_host_env=True,
+                            include_bounds_env=live_all_supported,
+                            verified_visibility=None,
+                            omit_visible_env=True,
+                        )
+                        if "=" in kv
+                    )
+                    all_injected_topo: Dict[str, str] = {}
+                    for env_src in (
+                        global_edits.get("env") if isinstance(global_edits, dict) else None,
+                        edits.get("env") if isinstance(edits, dict) else None,
+                    ):
+                        if isinstance(env_src, list):
+                            for entry in env_src:
+                                if isinstance(entry, str) and "=" in entry:
+                                    ek, ev = entry.split("=", 1)
+                                    if ek in ("TPU_CHIPS_PER_HOST_BOUNDS", "TPU_ACCELERATOR_TYPE", "TPU_SKIP_MDS_QUERY"):
+                                        all_injected_topo[ek] = ev.strip()
+                    all_mismatches: List[str] = []
+                    if (
+                        "freetpu.dev/chip-count" in ann
+                        and ann.get("freetpu.dev/chip-count") != str(live_all_complete)
+                    ):
+                        all_mismatches.append(
+                            f"stale freetpu.dev/chip-count {ann.get('freetpu.dev/chip-count')!r} "
+                            f"(live host has {live_all_complete} complete chip(s))"
+                        )
+                    if (
+                        live_all_incomplete > 0
+                        and ann.get("freetpu.dev/capacity-complete") != "false"
+                    ):
+                        all_mismatches.append(
+                            f"live host has {live_all_incomplete} incomplete multi-function PCI "
+                            "endpoint(s) not reflected in freetpu.dev/capacity-complete"
+                        )
+                    for ek, ev in all_injected_topo.items():
+                        exp_v = expected_all_topo.get(ek)
+                        if not live_all_supported or exp_v is None or ev != exp_v:
+                            all_mismatches.append(
+                                f"stale injected {ek}={ev!r} "
+                                f"(live host topology authorizes {exp_v!r})"
+                            )
+                    if all_mismatches:
+                        uses_explicit_chip_map_all = (
+                            ann.get("freetpu.dev/chip-id-source") == "chip-id-map"
+                        )
+                        if (
+                            chip_id_map is None
+                            and uses_explicit_chip_map_all
+                            and live_all_incomplete > 0
+                        ):
+                            unverifiable.append(
+                                "device 'all': map-dependent multi-function chip pairing/topology "
+                                "cannot be verified without --chip-id-map "
+                                "(underlying VFIO/PCI endpoints still match live host)"
+                            )
+                        else:
+                            for m_err in all_mismatches:
+                                errors.append(f"device 'all': {m_err}")
 
         # Revalidate any injected `TPU_VISIBLE_CHIPS` / `TPU_VISIBLE_DEVICES` env
         # masks against live verified runtime ordinals for this selector's PCI BDFs
@@ -3110,6 +3425,7 @@ def verify_spec_against_host(
     iommu_dev_path: Optional[Path] = None,
     vfio_mode: str = "auto",
     chip_id_map: Optional[Dict[str, int]] = None,
+    observed_domain_bdfs: Optional[Dict[Tuple[str, Optional[int], str], set[str]]] = None,
 ) -> List[str]:
     """Revalidate all effective global and per-device CDI nodes against live host VFIO/iommufd state."""
     confirmed, unverifiable = _verify_spec_against_host_detailed(
@@ -3119,6 +3435,7 @@ def verify_spec_against_host(
         iommu_dev_path=iommu_dev_path,
         vfio_mode=vfio_mode,
         chip_id_map=chip_id_map,
+        observed_domain_bdfs=observed_domain_bdfs,
     )
     return confirmed + unverifiable
 
@@ -3174,6 +3491,7 @@ def reconcile_cdi_spec(
     vfio_mode: str = "auto",
     chip_id_map: Optional[Dict[str, int]] = None,
     omit_visible_env: bool = False,
+    observed_domain_bdfs: Optional[Dict[Tuple[str, Optional[int], str], set[str]]] = None,
 ) -> Tuple[bool, str]:
     """Generate, validate, and atomically publish a live CDI spec, invalidating stale files on error."""
     if not isinstance(kind, str) or not _CDI_KIND_RE.match(kind):
@@ -3184,6 +3502,22 @@ def reconcile_cdi_spec(
         return False, f"Unsupported CDI version {cdi_version!r} (existing spec preserved)"
     if vfio_mode not in VFIO_MODES:
         return False, f"Invalid vfio_mode {vfio_mode!r} (existing spec preserved)"
+
+    # Carry forward boot-observed PCI domain inventory from any existing spec at
+    # `output_path` (and caller-provided sync state) so PCI function hot-unplug /
+    # link-down inside a single-domain host (e.g. v6e-8 dropping to 4 PCI devices)
+    # cannot republish an unverified 4-chip slice or fabricated `2,2,1` bounds.
+    prior_observed: Dict[Tuple[str, Optional[int], str], set[str]] = {
+        k: set(v) for k, v in (observed_domain_bdfs or {}).items()
+    }
+    try:
+        if output_path.exists():
+            existing_spec = _load_json_strict_keys(output_path.read_text(encoding="utf-8"))
+            for d_k, bdfs_s in _extract_observed_domain_bdfs_from_spec(existing_spec).items():
+                prior_observed.setdefault(d_k, set()).update(bdfs_s)
+    except Exception:  # noqa: BLE001
+        pass
+
     try:
         chips, vfio_container, full_pci_inventory = _discover_tpu_chips_with_inventory(
             sysfs_root=sysfs_root,
@@ -3192,6 +3526,10 @@ def reconcile_cdi_spec(
             iommu_dev_path=iommu_dev_path,
             vfio_mode=vfio_mode,
         )
+        merged_observed = _merge_observed_domain_bdfs(prior_observed, full_pci_inventory)
+        if observed_domain_bdfs is not None:
+            for d_k, bdfs_s in merged_observed.items():
+                observed_domain_bdfs.setdefault(d_k, set()).update(bdfs_s)
         spec = build_cdi_spec(
             chips,
             vfio_container,
@@ -3202,6 +3540,7 @@ def reconcile_cdi_spec(
             chip_id_map=chip_id_map,
             omit_visible_env=omit_visible_env,
             host_pci_inventory=full_pci_inventory,
+            observed_domain_bdfs=merged_observed,
         )
     except Exception as exc:  # noqa: BLE001
         removed, cleanup_err = _invalidate_spec(output_path)
@@ -3218,6 +3557,7 @@ def reconcile_cdi_spec(
                 iommu_dev_path=iommu_dev_path,
                 vfio_mode=vfio_mode,
                 chip_id_map=chip_id_map,
+                observed_domain_bdfs=merged_observed,
             )
         )
     if errors:
@@ -3806,6 +4146,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         last_msg = ""
         interval = max(1.0, float(args.interval))
+        sync_observed_domains: Dict[Tuple[str, Optional[int], str], set[str]] = {}
         chip_map_is_file = bool(
             args.chip_id_map and not str(args.chip_id_map).strip().startswith(("{", "["))
         )
@@ -3848,6 +4189,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     vfio_mode=args.vfio_mode,
                     chip_id_map=tick_chip_map,
                     omit_visible_env=args.omit_visible_env,
+                    observed_domain_bdfs=sync_observed_domains,
                 )
             except Exception as exc:  # noqa: BLE001
                 removed, cleanup_err = _invalidate_spec(args.output)

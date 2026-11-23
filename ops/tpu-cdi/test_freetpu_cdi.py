@@ -5463,6 +5463,8 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertEqual(n0_env2.get("TPU_VISIBLE_CHIPS"), "0,1,2,3")
 
     def test_degraded_single_root_v6e_domain_withholds_4chip_slice_and_2x2_bounds(self) -> None:
+        import shutil
+
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             # Single-root 8-chip v6e host with no NUMA locality (`numa_node` absent):
@@ -5579,6 +5581,196 @@ class FreeTpuCdiTests(unittest.TestCase):
                     any("pcie-0000-00-4" in e for e in forged_errs),
                     forged_errs,
                 )
+
+                # Now simulate PCI loss from sysfs itself (4 PCI functions removed from sysfs,
+                # not just missing `/dev/vfio/<group>` nodes) on a single-domain v6e-8 host:
+                # across BOTH tick 2 and tick 3 of `reconcile_cdi_spec`, `pcie-0000-00-4`,
+                # `0-3`, and fabricated `2,2,1` / `v6e-4` bounds MUST stay withheld!
+                pci_loss_sys, pci_loss_dev = _make_mock_pci_vfio(
+                    root / "single_root_v6e8_pci_loss",
+                    devices=devs,
+                    create_vfio_nodes=[str(i) for i in range(8)],
+                )
+                pci_loss_spec = root / "cdi" / "pci_loss_freetpu.json"
+                ok_p1, msg_p1 = freetpu_cdi.reconcile_cdi_spec(
+                    pci_loss_spec,
+                    sysfs_root=pci_loss_sys,
+                    dev_root=pci_loss_dev,
+                    single_host_env=True,
+                )
+                self.assertTrue(ok_p1, msg_p1)
+                for idx in range(4, 8):
+                    shutil.rmtree(
+                        pci_loss_sys / "bus" / "pci" / "devices" / f"0000:00:{4 + idx:02x}.0"
+                    )
+                    (pci_loss_dev / "vfio" / str(idx)).unlink()
+
+                for tick_label in ("tick2", "tick3"):
+                    ok_pt, msg_pt = freetpu_cdi.reconcile_cdi_spec(
+                        pci_loss_spec,
+                        sysfs_root=pci_loss_sys,
+                        dev_root=pci_loss_dev,
+                        single_host_env=True,
+                    )
+                    self.assertTrue(ok_pt, f"{tick_label}: {msg_pt}")
+                    pt_spec = json.loads(pci_loss_spec.read_text(encoding="utf-8"))
+                    pt_names = {d["name"] for d in pt_spec["devices"]}
+                    self.assertNotIn("pcie-0000-00-4", pt_names, tick_label)
+                    self.assertNotIn("0-3", pt_names, tick_label)
+                    for dev_entry in pt_spec["devices"]:
+                        env_list = dev_entry.get("containerEdits", {}).get("env", [])
+                        self.assertNotIn("TPU_CHIPS_PER_HOST_BOUNDS=2,2,1", env_list, tick_label)
+                        self.assertNotIn("TPU_ACCELERATOR_TYPE=v6e-4", env_list, tick_label)
+
+                # Even on a fresh scan with no prior spec, 4 surviving chips with
+                # non-contiguous sysfs `chip_id`s (`0, 2, 5, 7`) MUST NOT emit `pcie-0000-00-4`
+                # or `2,2,1` bounds.
+                gap_devs = [
+                    {
+                        "bdf": f"0000:00:{4 + i:02x}.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": str(i),
+                        "chip_id": str(cid),
+                    }
+                    for i, cid in enumerate((0, 2, 5, 7))
+                ]
+                gap_sys, gap_dev = _make_mock_pci_vfio(
+                    root / "single_root_v6e_gaps",
+                    devices=gap_devs,
+                    create_vfio_nodes=[str(i) for i in range(4)],
+                )
+                gap_chips, gap_ctrl = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=gap_sys, dev_root=gap_dev
+                )
+                gap_spec = freetpu_cdi.build_cdi_spec(
+                    gap_chips, gap_ctrl, single_host_env=True
+                )
+                gap_names = {d["name"] for d in gap_spec["devices"]}
+                self.assertNotIn("pcie-0000-00-4", gap_names)
+                for dev_entry in gap_spec["devices"]:
+                    env_list = dev_entry.get("containerEdits", {}).get("env", [])
+                    self.assertNotIn("TPU_CHIPS_PER_HOST_BOUNDS=2,2,1", env_list)
+                    self.assertNotIn("TPU_ACCELERATOR_TYPE=v6e-4", env_list)
+
+    def test_all_selector_revalidates_map_dependent_topology_with_omit_visible_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # Dual-NUMA separate-slot Ironwood (`tpu7x`, 8 PCI functions = 4 chips)
+            # where `--chip-id-map` establishes chiplet pairing.
+            iw_devs = [
+                {
+                    "bdf": f"0000:00:{4 + i:02x}.0",
+                    "vendor": "0x1ae0",
+                    "device": "0x0076",
+                    "driver": "vfio-pci",
+                    "iommu_group": str(i),
+                    "numa_node": "0",
+                }
+                for i in range(4)
+            ] + [
+                {
+                    "bdf": f"0000:80:{4 + i:02x}.0",
+                    "vendor": "0x1ae0",
+                    "device": "0x0076",
+                    "driver": "vfio-pci",
+                    "iommu_group": str(4 + i),
+                    "numa_node": "1",
+                }
+                for i in range(4)
+            ]
+            sysfs_root, dev_root = _make_mock_pci_vfio(
+                root / "iw_dual_numa_omit_vis",
+                devices=iw_devs,
+                create_vfio_nodes=[str(i) for i in range(8)],
+            )
+            full_map = {iw_devs[i]["bdf"]: i // 2 for i in range(8)}
+            partial_map = {iw_devs[i]["bdf"]: i // 2 for i in range(7)}  # missing 1 sibling!
+            spec_path = root / "cdi" / "iw_freetpu.json"
+
+            with _mock_vfio_char_devices():
+                rc_gen, _out_gen, err_gen = _run_cli_inproc(
+                    [
+                        "generate",
+                        "--output",
+                        str(spec_path),
+                        "--validate",
+                        "--single-host-env",
+                        "--omit-visible-env",
+                        "--chip-id-map",
+                        json.dumps(full_map),
+                        "--sysfs-root",
+                        str(sysfs_root),
+                        "--dev-root",
+                        str(dev_root),
+                    ]
+                )
+                self.assertEqual(rc_gen, 0, err_gen)
+                spec = json.loads(spec_path.read_text(encoding="utf-8"))
+                all_entry = next(d for d in spec["devices"] if d["name"] == "all")
+                all_env = dict(
+                    kv.split("=", 1) for kv in all_entry["containerEdits"]["env"]
+                )
+                self.assertEqual(all_entry["annotations"]["freetpu.dev/chip-count"], "4")
+                self.assertEqual(all_env["TPU_CHIPS_PER_HOST_BOUNDS"], "2,2,1")
+                self.assertEqual(all_env["TPU_ACCELERATOR_TYPE"], "tpu7x-8")
+                self.assertEqual(all_env["TPU_SKIP_MDS_QUERY"], "true")
+                self.assertNotIn("TPU_VISIBLE_CHIPS", all_env)
+                self.assertNotIn("TPU_VISIBLE_DEVICES", all_env)
+
+                # Validation with the full map succeeds.
+                rc_ok, _out_ok, err_ok = _run_cli_inproc(
+                    [
+                        "validate",
+                        str(spec_path),
+                        "--check-host",
+                        "--chip-id-map",
+                        json.dumps(full_map),
+                        "--sysfs-root",
+                        str(sysfs_root),
+                        "--dev-root",
+                        str(dev_root),
+                    ]
+                )
+                self.assertEqual(rc_ok, 0, err_ok)
+
+                # Validation WITHOUT `--chip-id-map` + `--remove-if-stale` fails (unverifiable)
+                # while preserving the intact hardware spec.
+                rc_nomap, _out_nomap, err_nomap = _run_cli_inproc(
+                    [
+                        "validate",
+                        str(spec_path),
+                        "--check-host",
+                        "--remove-if-stale",
+                        "--sysfs-root",
+                        str(sysfs_root),
+                        "--dev-root",
+                        str(dev_root),
+                    ]
+                )
+                self.assertNotEqual(rc_nomap, 0)
+                self.assertTrue(spec_path.exists(), f"Should preserve spec without map: {err_nomap}")
+
+                # Validation with a map MISSING one sibling MUST fail `--check-host`
+                # and withdraw the stale spec under `--remove-if-stale`!
+                rc_part, _out_part, err_part = _run_cli_inproc(
+                    [
+                        "validate",
+                        str(spec_path),
+                        "--check-host",
+                        "--remove-if-stale",
+                        "--chip-id-map",
+                        json.dumps(partial_map),
+                        "--sysfs-root",
+                        str(sysfs_root),
+                        "--dev-root",
+                        str(dev_root),
+                    ]
+                )
+                self.assertNotEqual(rc_part, 0)
+                self.assertIn("device 'all'", err_part)
+                self.assertFalse(spec_path.exists(), f"Stale spec must be removed: {err_part}")
 
 
 if __name__ == "__main__":
