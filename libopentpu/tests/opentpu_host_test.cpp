@@ -316,6 +316,8 @@ static void test_pjrt_api_mock() {
     const char opt_tupled[] = {0x10, 0x01};
     // field 4 (compile_portable_executable=1)
     const char opt_portable[] = {0x20, 0x01};
+    // field 10 (matrix_unit_operand_precision=HIGH(2))
+    const char opt_mat_prec[] = {0x50, 0x02};
     // malformed truncated varint
     const char opt_bad[] = {static_cast<char>(0x80)};
     auto expect_compile_fail = [&](const char* opts, size_t sz, PJRT_Error_Code want) {
@@ -339,6 +341,7 @@ static void test_pjrt_api_mock() {
     expect_compile_fail(opt_da_dev1, sizeof(opt_da_dev1), PJRT_Error_Code_UNIMPLEMENTED);
     expect_compile_fail(opt_tupled, sizeof(opt_tupled), PJRT_Error_Code_UNIMPLEMENTED);
     expect_compile_fail(opt_portable, sizeof(opt_portable), PJRT_Error_Code_UNIMPLEMENTED);
+    expect_compile_fail(opt_mat_prec, sizeof(opt_mat_prec), PJRT_Error_Code_UNIMPLEMENTED);
     expect_compile_fail(opt_bad, sizeof(opt_bad), PJRT_Error_Code_INVALID_ARGUMENT);
   }
 
@@ -406,6 +409,24 @@ static void test_pjrt_api_mock() {
     PJRT_Error* hlp_err = api->PJRT_Client_Compile(&ca_hlp);
     OT_CHECK(hlp_err != nullptr);
     destroy_pjrt_error(api, hlp_err);
+
+    // Unterminated enclosing module (missing final '}') must be rejected.
+    const char* mlir_unterm =
+        "module {\n"
+        "  func.func @main(%a: tensor<128x128xbf16>, %b: tensor<128x128xbf16>) -> tensor<128x128xbf16> {\n"
+        "    %0 = stablehlo.dot_general %a, %b, contracting_dims = [1] x [0] : (tensor<128x128xbf16>, tensor<128x128xbf16>) -> tensor<128x128xbf16>\n"
+        "    return %0 : tensor<128x128xbf16>\n"
+        "  }\n";
+    PJRT_Program p_unt = prog;
+    p_unt.code = const_cast<char*>(mlir_unterm);
+    p_unt.code_size = std::strlen(mlir_unterm);
+    PJRT_Client_Compile_Args ca_unt = {};
+    ca_unt.struct_size = PJRT_Client_Compile_Args_STRUCT_SIZE;
+    ca_unt.client = cc.client;
+    ca_unt.program = &p_unt;
+    PJRT_Error* unt_err = api->PJRT_Client_Compile(&ca_unt);
+    OT_CHECK(unt_err != nullptr);
+    destroy_pjrt_error(api, unt_err);
   }
 
   // Valid 1x1 compile_options (including field 9 device_assignment for device 0) must succeed.

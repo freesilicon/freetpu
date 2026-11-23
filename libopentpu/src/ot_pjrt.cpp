@@ -479,15 +479,21 @@ bool parse_stablehlo_matmul(const char* code, size_t len, uint32_t* m_out,
   if (pos >= cleaned.size() || cleaned[pos] != '{') return false;
   size_t lbrace = pos;
 
-  // Extract matching function body `{ ... }`.
-  int depth = 1;
-  size_t rbrace = lbrace + 1;
-  while (rbrace < cleaned.size() && depth > 0) {
-    if (cleaned[rbrace] == '{') ++depth;
-    else if (cleaned[rbrace] == '}') --depth;
-    if (depth > 0) ++rbrace;
+  // Extract matching function body `{ ... }` and validate enclosing module termination.
+  size_t rbrace = find_matching_delim(cleaned, lbrace, '{', '}');
+  if (rbrace == std::string::npos) return false;
+  std::string prefix = trim_ws(cleaned.substr(0, fpos));
+  std::string tail = trim_ws(cleaned.substr(rbrace + 1));
+  if (pre_depth == 0) {
+    if (!prefix.empty() || !tail.empty()) return false;
+  } else {
+    if (prefix.compare(0, 6, "module") != 0 || prefix.size() <= 6 ||
+        (!std::isspace(static_cast<unsigned char>(prefix[6])) && prefix[6] != '{') ||
+        prefix.back() != '{') {
+      return false;
+    }
+    if (tail != "}") return false;
   }
-  if (depth != 0) return false;
 
   // Split function body into exactly two statements (dot op + return), treating line breaks
   // as ordinary whitespace so wrapped StableHLO ops compile cleanly.
@@ -1240,7 +1246,7 @@ static PJRT_Error* validate_single_device_compile_options(const char* data, size
                         "multi-slice compilation is not supported on single-device OpenTPU");
       }
       pos += static_cast<size_t>(slen);
-    } else if (field == 8 && wire == 0) {
+    } else if (field == 10 && wire == 0) {
       uint64_t prec = 0;
       if (!pb_read_varint(p, len, &pos, &prec)) {
         return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "malformed matrix_unit_operand_precision");
