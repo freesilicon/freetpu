@@ -18,6 +18,18 @@ overlay_backend() {
         exit 1
     fi
 
+    local patch_file="$ROOT/patches/llama-cpp-b12608-cloudtpu.patch"
+    local need_apply=0
+    if git -C "$SRC" apply --reverse --check "$patch_file" 2>/dev/null; then
+        : # Complete overlay patch is already applied.
+    elif git -C "$SRC" apply --check "$patch_file" 2>/dev/null; then
+        need_apply=1
+    else
+        echo "ERROR: llama.cpp tree at '$SRC' has a partially applied or conflicting CLOUDTPU overlay." >&2
+        echo "Reset '$SRC' to clean tag b12608 before re-running $0." >&2
+        exit 1
+    fi
+
     mkdir -p "$SRC/ggml/src/ggml-cloudtpu/third_party/openxla"
     cp "$ROOT/ggml-cloudtpu.h" "$SRC/ggml/include/ggml-cloudtpu.h"
     cp "$ROOT/ggml-cloudtpu.cpp" \
@@ -27,15 +39,8 @@ overlay_backend() {
        "$SRC/ggml/src/ggml-cloudtpu/"
     cp "$ROOT/../libopentpu/third_party/openxla/pjrt_c_api.h" "$SRC/ggml/src/ggml-cloudtpu/third_party/openxla/"
 
-    local patch_file="$ROOT/patches/llama-cpp-b12608-cloudtpu.patch"
-    if git -C "$SRC" apply --reverse --check "$patch_file" 2>/dev/null; then
-        : # Complete overlay patch is already applied.
-    elif git -C "$SRC" apply --check "$patch_file" 2>/dev/null; then
+    if [[ "$need_apply" -eq 1 ]]; then
         git -C "$SRC" apply "$patch_file"
-    else
-        echo "ERROR: llama.cpp tree at '$SRC' has a partially applied or conflicting CLOUDTPU overlay." >&2
-        echo "Reset '$SRC' to clean tag b12608 before re-running $0." >&2
-        exit 1
     fi
 }
 
