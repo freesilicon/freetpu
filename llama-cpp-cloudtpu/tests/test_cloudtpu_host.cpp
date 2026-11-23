@@ -6578,7 +6578,49 @@ void test_freetile_mosaic_lowering(cloudtpu::PjrtRuntime& rt) {
                    "BUENOS_A0 fallback emits pure StableHLO dot_general");
     }
 
-    std::printf("  [PASS] FreeTile Mosaic lowering (Q4_K_I4 S4/U4, Q4_0_I4 U4, Q6_K_SPLIT, fallback & dialect guard)\n");
+    // 6) Q4_K_I4 with F32 scales/mins (CLOUDTPU_Q4K_BF16_SCALES=0) preserves exact F32 cancellation:
+    //    nibble q=7 (s4=-1), d=1027/1024, m=-7*d -> exact 0.0f (BF16 narrowing would yield -0.03125/elem!)
+    {
+        const int64_t M = 1, N = 128, NB = 8, K = NB * 32;  // K=256
+        const float d_val = 1027.0f / 1024.0f;
+        const float m_val = -7.0f * d_val;
+        std::vector<int8_t> qs_s4(static_cast<size_t>(NB * 32 * N), static_cast<int8_t>(-1));  // s4=-1 => q=s4+8=7
+        std::vector<float> d_f32(static_cast<size_t>(NB * N), d_val);
+        std::vector<float> m_f32(static_cast<size_t>(NB * N), m_val);
+        std::vector<float> x(static_cast<size_t>(M * K), 1.0f);
+
+        auto bqs = rt.buffer_from_host(0, qs_s4.data(), cloudtpu::PjrtDType::S4, {1, 1, NB, 32, N});
+        auto bd = rt.buffer_from_host(0, d_f32.data(), cloudtpu::PjrtDType::F32, {1, 1, NB, N});
+        auto bm = rt.buffer_from_host(0, m_f32.data(), cloudtpu::PjrtDType::F32, {1, 1, NB, N});
+        auto bx = rt.buffer_from_host(0, x.data(), cloudtpu::PjrtDType::F32, {1, 1, M, K});
+
+        cloudtpu::GraphProgramSpec spec;
+        spec.bf16_matmul = true;
+        spec.freetile_mosaic = true;
+        cloudtpu::TensorSpec w_spec{1, cloudtpu::PjrtDType::S4, cloudtpu::TensorStorageKind::Q4_K_I4, {1, 1, N, K}};
+        w_spec.scale_dtype = cloudtpu::PjrtDType::F32;
+        spec.inputs.push_back(w_spec);
+        spec.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, K}});
+        cloudtpu::OpNodeSpec mm;
+        mm.kind = cloudtpu::CloudOpKind::MUL_MAT;
+        mm.src_ids = {1, 2};
+        mm.dst = {3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, N}};
+        spec.ops.push_back(mm);
+        spec.output_ids = {3};
+
+        const auto prog = cloudtpu::emit_stablehlo_program(spec);
+        CHECK_TRUE(prog.mlir_text.find("stablehlo.custom_call @tpu_custom_call") != std::string::npos,
+                   "F32-scale Q4_K_I4 emits @tpu_custom_call");
+        CHECK_TRUE(prog.mlir_text.find("tensor<8x128xf32>, tensor<8x128xf32>) -> tensor<8x128xf32>") != std::string::npos,
+                   "F32-scale Q4_K_I4 passes f32 d and m directly to @tpu_custom_call without BF16 narrowing");
+        auto got = run_emitted(rt, prog, {bqs, bd, bm, bx});
+        CHECK_TRUE(got.size() == static_cast<size_t>(N), "F32-scale cancellation output length");
+        for (float v : got) {
+            CHECK_NEAR(v, 0.0f, 1e-6f, "F32-scale Q4_K_I4 exact cancellation q=7, d=1027/1024, m=-7*d yields 0");
+        }
+    }
+
+    std::printf("  [PASS] FreeTile Mosaic lowering (Q4_K_I4 S4/U4/F32-scales, Q4_0_I4 U4, Q6_K_SPLIT, fallback & dialect guard)\n");
 }
 }  // namespace
 

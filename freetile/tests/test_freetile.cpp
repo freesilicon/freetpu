@@ -266,6 +266,68 @@ int main() {
         CHECK_TRUE(!ok && !reason.empty(), "Unknown QuantFormat cleanly rejected with diagnostic");
     }
 
+    // 11. F32 scales/mins preserved without BF16 narrowing in TileKernel & Mosaic MLIR
+    {
+        freetile::TileKernel k_f32s;
+        std::string reason;
+        CHECK_TRUE(freetile::plan_quant_matmul_kernel(
+            freetile::ChipTarget::V5E, 1, 256, 128, freetile::QuantFormat::Q4_K,
+            freetile::DType::F32, freetile::DType::F32, false, &k_f32s, &reason),
+            ("Q4_K F32 scales plan failed: " + reason).c_str());
+        CHECK_TRUE(k_f32s.matmul.scale_dtype == freetile::DType::F32 &&
+                   k_f32s.operands[2].dtype == freetile::DType::F32 &&
+                   k_f32s.operands[3].dtype == freetile::DType::F32,
+                   "Q4_K preserves F32 d/m operand dtypes");
+        const auto em_f32s = freetile::emit_mosaic_kernel(k_f32s);
+        CHECK_TRUE(em_f32s.mosaic_mlir.find("memref<8x128xf32, #tpu.memory_space<vmem>>") != std::string::npos,
+                   "F32 scale/min memrefs emitted as f32");
+        CHECK_TRUE(em_f32s.mosaic_mlir.find("vector<1x128xbf16>) -> vector<1x128xf32>") == std::string::npos,
+                   "F32 scale/min skips bf16->f32 extf");
+    }
+
+    // 12. Unsupported memory spaces (e.g. 4096x4096 BF16 HBM weight window on V5E) rejected
+    {
+        freetile::TileKernel bad_hbm;
+        bad_hbm.name = "ft_dense_hbm_bypass";
+        bad_hbm.target = freetile::ChipTarget::V5E;
+        bad_hbm.grid.dims = {1};
+        bad_hbm.grid.semantics = {freetile::DimensionSemantics::PARALLEL};
+        bad_hbm.grid.bm = 8;
+        bad_hbm.grid.bn = 4096;
+        bad_hbm.grid.bk = 4096;
+        bad_hbm.matmul.m = 8;
+        bad_hbm.matmul.m_padded = 8;
+        bad_hbm.matmul.n = 4096;
+        bad_hbm.matmul.k = 4096;
+        bad_hbm.matmul.quant = freetile::QuantFormat::NONE;
+        bad_hbm.matmul.quant_block_size = 1;
+        bad_hbm.matmul.has_min = false;
+        bad_hbm.matmul.act_dtype = freetile::DType::BF16;
+        bad_hbm.matmul.weight_dtype = freetile::DType::BF16;
+        bad_hbm.matmul.out_dtype = freetile::DType::F32;
+        bad_hbm.operands.push_back({"x", freetile::MemorySpace::VMEM, freetile::DType::BF16, {8, 4096}, {8, 4096}, false, false});
+        bad_hbm.operands.push_back({"w", freetile::MemorySpace::HBM, freetile::DType::BF16, {4096, 4096}, {4096, 4096}, false, false});
+        bad_hbm.operands.push_back({"out", freetile::MemorySpace::VMEM, freetile::DType::F32, {8, 4096}, {8, 4096}, true, false});
+
+        std::string verr;
+        CHECK_TRUE(!bad_hbm.validate(&verr), "4096x4096 HBM-tagged weight window rejected by validate()");
+        bool threw = false;
+        try {
+            (void)freetile::emit_mosaic_kernel(bad_hbm);
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        CHECK_TRUE(threw, "4096x4096 HBM-tagged weight window throws in emit_mosaic_kernel()");
+
+        // Even a small SMEM-tagged operand must be rejected on Mosaic targets
+        freetile::TileKernel bad_smem;
+        CHECK_TRUE(freetile::plan_quant_matmul_kernel(
+            freetile::ChipTarget::V5E, 8, 64, 128, freetile::QuantFormat::NONE,
+            freetile::DType::BF16, freetile::DType::F32, false, &bad_smem), "Plan small dense kernel");
+        bad_smem.operands[1].space = freetile::MemorySpace::SMEM;
+        CHECK_TRUE(!bad_smem.validate(&verr), "SMEM-tagged weight window rejected on Mosaic target");
+    }
+
     std::printf("PASS: all freetile unit tests succeeded!\n");
     return 0;
 }

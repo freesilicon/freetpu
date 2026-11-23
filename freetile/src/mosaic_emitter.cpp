@@ -255,13 +255,14 @@ MosaicEmitResult emit_mosaic_kernel(const TileKernel& kernel, int64_t mosaic_ver
         tile_acc = b.next_val();
         b.emit_tpu_matmul(tile_acc, x_vec, w_bf16, zero_acc, bm, bk, bn);
     } else {
+        const DType scale_dt = kernel.matmul.scale_dtype;
         const std::string d_vec = b.next_val();
-        b.emit_vector_load_2d(d_vec, arg_d, c0, {nb_tile, bn}, DType::BF16);
+        b.emit_vector_load_2d(d_vec, arg_d, c0, {nb_tile, bn}, scale_dt);
 
         std::string m_vec;
         if (has_min) {
             m_vec = b.next_val();
-            b.emit_vector_load_2d(m_vec, arg_m, c0, {nb_tile, bn}, DType::BF16);
+            b.emit_vector_load_2d(m_vec, arg_m, c0, {nb_tile, bn}, scale_dt);
         }
 
         const std::string out_f32_t = format_vector_type({bm, bn}, DType::F32);
@@ -278,8 +279,7 @@ MosaicEmitResult emit_mosaic_kernel(const TileKernel& kernel, int64_t mosaic_ver
             const int64_t k_off = blk_i * blk;
             const std::string x_blk = b.next_val();
             const std::string w_blk = b.next_val();
-            const std::string d_blk_bf16 = b.next_val();
-            const std::string d_blk_f32 = b.next_val();
+            const std::string d_blk_raw = b.next_val();
             const std::string prod = b.next_val();
             const std::string d_bcast = b.next_val();
             const std::string scaled = b.next_val();
@@ -294,14 +294,18 @@ MosaicEmitResult emit_mosaic_kernel(const TileKernel& kernel, int64_t mosaic_ver
                      << format_vector_type({bk, bn}, DType::BF16) << ") -> "
                      << format_vector_type({blk, bn}, DType::BF16) << "\n";
 
-            b.body() << "    " << d_blk_bf16 << " = \"stable_mosaic.vector.extract_strided_slice\"(" << d_vec
+            b.body() << "    " << d_blk_raw << " = \"stable_mosaic.vector.extract_strided_slice\"(" << d_vec
                      << ") {offsets = [" << blk_i << ", 0], sizes = [1, " << bn << "], strides = [1, 1]} : ("
-                     << format_vector_type({nb_tile, bn}, DType::BF16) << ") -> "
-                     << format_vector_type({1, bn}, DType::BF16) << "\n";
+                     << format_vector_type({nb_tile, bn}, scale_dt) << ") -> "
+                     << format_vector_type({1, bn}, scale_dt) << "\n";
 
-            b.body() << "    " << d_blk_f32 << " = \"stable_mosaic.arith.extf\"(" << d_blk_bf16 << ") : ("
-                     << format_vector_type({1, bn}, DType::BF16) << ") -> "
-                     << format_vector_type({1, bn}, DType::F32) << "\n";
+            std::string d_blk_f32 = d_blk_raw;
+            if (scale_dt != DType::F32) {
+                d_blk_f32 = b.next_val();
+                b.body() << "    " << d_blk_f32 << " = \"stable_mosaic.arith.extf\"(" << d_blk_raw << ") : ("
+                         << format_vector_type({1, bn}, scale_dt) << ") -> "
+                         << format_vector_type({1, bn}, DType::F32) << "\n";
+            }
 
             b.emit_tpu_matmul(prod, x_blk, w_blk, zero_acc, bm, blk, bn);
 
@@ -320,8 +324,7 @@ MosaicEmitResult emit_mosaic_kernel(const TileKernel& kernel, int64_t mosaic_ver
                 const std::string xsum_1d = b.next_val();
                 const std::string xsum_2d = b.next_val();
                 const std::string xsum_bcast = b.next_val();
-                const std::string m_blk_bf16 = b.next_val();
-                const std::string m_blk_f32 = b.next_val();
+                const std::string m_blk_raw = b.next_val();
                 const std::string m_bcast = b.next_val();
                 const std::string m_term = b.next_val();
                 const std::string scaled_plus_m = b.next_val();
@@ -339,13 +342,17 @@ MosaicEmitResult emit_mosaic_kernel(const TileKernel& kernel, int64_t mosaic_ver
                          << format_vector_type({bm, 1}, DType::F32) << "\n";
                 b.body() << "    " << xsum_bcast << " = \"stable_mosaic.vector.broadcast\"(" << xsum_2d << ") : ("
                          << format_vector_type({bm, 1}, DType::F32) << ") -> " << out_f32_t << "\n";
-                b.body() << "    " << m_blk_bf16 << " = \"stable_mosaic.vector.extract_strided_slice\"(" << m_vec
+                b.body() << "    " << m_blk_raw << " = \"stable_mosaic.vector.extract_strided_slice\"(" << m_vec
                          << ") {offsets = [" << blk_i << ", 0], sizes = [1, " << bn << "], strides = [1, 1]} : ("
-                         << format_vector_type({nb_tile, bn}, DType::BF16) << ") -> "
-                         << format_vector_type({1, bn}, DType::BF16) << "\n";
-                b.body() << "    " << m_blk_f32 << " = \"stable_mosaic.arith.extf\"(" << m_blk_bf16 << ") : ("
-                         << format_vector_type({1, bn}, DType::BF16) << ") -> "
-                         << format_vector_type({1, bn}, DType::F32) << "\n";
+                         << format_vector_type({nb_tile, bn}, scale_dt) << ") -> "
+                         << format_vector_type({1, bn}, scale_dt) << "\n";
+                std::string m_blk_f32 = m_blk_raw;
+                if (scale_dt != DType::F32) {
+                    m_blk_f32 = b.next_val();
+                    b.body() << "    " << m_blk_f32 << " = \"stable_mosaic.arith.extf\"(" << m_blk_raw << ") : ("
+                             << format_vector_type({1, bn}, scale_dt) << ") -> "
+                             << format_vector_type({1, bn}, DType::F32) << "\n";
+                }
                 b.body() << "    " << m_bcast << " = \"stable_mosaic.vector.broadcast\"(" << m_blk_f32 << ") : ("
                          << format_vector_type({1, bn}, DType::F32) << ") -> " << out_f32_t << "\n";
                 b.body() << "    " << m_term << " = \"stable_mosaic.arith.mulf\"(" << xsum_bcast << ", " << m_bcast

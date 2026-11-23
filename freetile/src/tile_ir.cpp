@@ -326,8 +326,8 @@ bool TileKernel::validate(std::string* err) const {
             return fail(err, "Dense TileMatmul weight_dtype must be BF16");
         }
     } else {
-        if (matmul.scale_dtype != DType::BF16) {
-            return fail(err, "Quantized TileMatmul scale_dtype must be BF16");
+        if (matmul.scale_dtype != DType::BF16 && matmul.scale_dtype != DType::F32) {
+            return fail(err, "Quantized TileMatmul scale_dtype must be BF16 or F32");
         }
         const DType expected_w_dt =
             (matmul.quant == QuantFormat::Q4_K || matmul.quant == QuantFormat::Q4_0)
@@ -338,6 +338,13 @@ bool TileKernel::validate(std::string* err) const {
         }
     }
 
+    auto valid_tile_space = [&](MemorySpace sp) -> bool {
+        if (prof.supports_mosaic) {
+            return sp == MemorySpace::VMEM;
+        }
+        return sp == MemorySpace::SRAM || sp == MemorySpace::VMEM;
+    };
+
     auto check_operand = [&](size_t idx,
                              const char* label,
                              int64_t g0,
@@ -347,6 +354,10 @@ bool TileKernel::validate(std::string* err) const {
                              DType expected_dt,
                              bool expected_output) -> bool {
         const SramTile& op = operands[idx];
+        if (!valid_tile_space(op.space)) {
+            return fail(err, std::string("SramTile operand ") + label +
+                                 " memory space is unsupported for target (Mosaic requires VMEM)");
+        }
         if (op.window_bounds.size() != 2 || op.global_shape.size() != 2) {
             return fail(err, std::string("SramTile operand ") + label + " must be 2D");
         }
@@ -389,6 +400,9 @@ bool TileKernel::validate(std::string* err) const {
     }
 
     for (const SramTile& sc : scratch) {
+        if (!valid_tile_space(sc.space)) {
+            return fail(err, "SramTile scratch memory space is unsupported for target (Mosaic requires VMEM)");
+        }
         if (sc.window_bounds.size() != 2 ||
             sc.window_bounds[0] != grid.bm || sc.window_bounds[1] != grid.bn) {
             return fail(err, "SramTile scratch window_bounds must match {bm, bn}");
@@ -532,6 +546,9 @@ bool plan_quant_matmul_kernel(ChipTarget target,
                 cand.grid.semantics = {DimensionSemantics::PARALLEL, DimensionSemantics::ARBITRARY};
             }
 
+            // Preserve F32 (or lossless F16 -> F32) scale/min precision unless caller opted into BF16 scales.
+            const DType planned_scale_dt = (scale_dt == DType::BF16) ? DType::BF16 : DType::F32;
+
             cand.matmul.m = m;
             cand.matmul.m_padded = override_bm;
             cand.matmul.n = n;
@@ -542,7 +559,7 @@ bool plan_quant_matmul_kernel(ChipTarget target,
             cand.matmul.unsigned_q4 = unsigned_q4;
             cand.matmul.act_dtype = DType::BF16;
             cand.matmul.weight_dtype = w_dt;
-            cand.matmul.scale_dtype = DType::BF16;
+            cand.matmul.scale_dtype = planned_scale_dt;
             cand.matmul.out_dtype = out_dt;
             cand.matmul.factored_m_term = (fmt == QuantFormat::Q4_K);
             cand.matmul.post_dot_scale = (fmt != QuantFormat::NONE);
@@ -555,9 +572,9 @@ bool plan_quant_matmul_kernel(ChipTarget target,
             if (fmt != QuantFormat::NONE) {
                 const int64_t nb = k / blk;
                 const int64_t nb_tile = bk / blk;
-                cand.operands.push_back({"d", sram_space, DType::BF16, {nb, n}, {nb_tile, bn}, false, false});
+                cand.operands.push_back({"d", sram_space, planned_scale_dt, {nb, n}, {nb_tile, bn}, false, false});
                 if (cand.matmul.has_min) {
-                    cand.operands.push_back({"m", sram_space, DType::BF16, {nb, n}, {nb_tile, bn}, false, false});
+                    cand.operands.push_back({"m", sram_space, planned_scale_dt, {nb, n}, {nb_tile, bn}, false, false});
                 }
             }
             cand.operands.push_back({"out", sram_space, out_dt, {override_bm, n}, {override_bm, bn}, true, false});

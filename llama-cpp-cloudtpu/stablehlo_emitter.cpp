@@ -1180,10 +1180,18 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                                              w_th.q_qs.dtype == PjrtDType::U4);
                             const freetile::DType ft_out_dt =
                                 (op.dst.dtype == PjrtDType::F32) ? freetile::DType::F32 : freetile::DType::BF16;
+                            const bool use_f32_scales =
+                                (w_th.q_d.dtype != PjrtDType::BF16) ||
+                                (w_th.storage == TensorStorageKind::Q4_K_I4 && w_th.has_q_m &&
+                                 w_th.q_m.dtype != PjrtDType::BF16);
+                            const freetile::DType ft_scale_dt =
+                                use_f32_scales ? freetile::DType::F32 : freetile::DType::BF16;
+                            const PjrtDType cc_scale_dt =
+                                use_f32_scales ? PjrtDType::F32 : PjrtDType::BF16;
 
                             freetile::TileKernel ft_kernel;
                             if (freetile::plan_quant_matmul_kernel(ft_chip, m_orig, K_local, N_local, ft_fmt,
-                                                                   freetile::DType::BF16, ft_out_dt, unsigned_q4,
+                                                                   ft_scale_dt, ft_out_dt, unsigned_q4,
                                                                    &ft_kernel)) {
                                 const int64_t ft_m_pad = ft_kernel.matmul.m_padded;
                                 SsaValue x_ft_4d = x;
@@ -1197,13 +1205,13 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                                                       ? materialize_q4_i4_nibbles(builder, w_th.q_qs, target_4bit, N_local)
                                                       : w_th.q_qs;
                                 SsaValue w_2d = builder.emit_reshape(qs_eff, {K_local, N_local});
-                                SsaValue d_bf16 = builder.emit_convert(w_th.q_d, PjrtDType::BF16);
-                                SsaValue d_2d = builder.emit_reshape(d_bf16, {NB_local, N_local});
+                                SsaValue d_cc = builder.emit_convert(w_th.q_d, cc_scale_dt);
+                                SsaValue d_2d = builder.emit_reshape(d_cc, {NB_local, N_local});
 
                                 std::vector<SsaValue> cc_ops = {x_2d, w_2d, d_2d};
                                 if (ft_kernel.matmul.has_min && w_th.has_q_m) {
-                                    SsaValue m_bf16 = builder.emit_convert(w_th.q_m, PjrtDType::BF16);
-                                    SsaValue m_2d = builder.emit_reshape(m_bf16, {NB_local, N_local});
+                                    SsaValue m_cc = builder.emit_convert(w_th.q_m, cc_scale_dt);
+                                    SsaValue m_2d = builder.emit_reshape(m_cc, {NB_local, N_local});
                                     cc_ops.push_back(m_2d);
                                 }
 
