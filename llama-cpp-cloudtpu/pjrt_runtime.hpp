@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -112,6 +113,46 @@ struct PjrtEventDeleter {
 };
 
 using PjrtEventHandle = std::unique_ptr<PJRT_Event, PjrtEventDeleter>;
+
+// Bounded per-launch queue of PJRT buffer-ready events. Capping by outstanding launch
+// (rather than raw event count) keeps multi-chip multi-output launches (>max_launches events)
+// asynchronous without ever forcing a launch to wait on itself.
+class PendingSyncLaunchQueue {
+public:
+    static constexpr size_t kDefaultMaxLaunches = 16;
+
+    std::deque<std::vector<PjrtEventHandle>> enqueue(std::vector<PjrtEventHandle>&& launch_events,
+                                                     size_t max_launches = kDefaultMaxLaunches) {
+        std::deque<std::vector<PjrtEventHandle>> overflow;
+        if (launch_events.empty()) {
+            return overflow;
+        }
+        const size_t cap = (max_launches == 0) ? 1 : max_launches;
+        std::lock_guard<std::mutex> lock(mu_);
+        while (launches_.size() >= cap) {
+            overflow.push_back(std::move(launches_.front()));
+            launches_.pop_front();
+        }
+        launches_.push_back(std::move(launch_events));
+        return overflow;
+    }
+
+    std::deque<std::vector<PjrtEventHandle>> drain_all() {
+        std::deque<std::vector<PjrtEventHandle>> all;
+        std::lock_guard<std::mutex> lock(mu_);
+        all.swap(launches_);
+        return all;
+    }
+
+    size_t pending_launches() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return launches_.size();
+    }
+
+private:
+    mutable std::mutex mu_;
+    std::deque<std::vector<PjrtEventHandle>> launches_;
+};
 
 struct PjrtBuffer {
     PjrtBufferHandle handle;

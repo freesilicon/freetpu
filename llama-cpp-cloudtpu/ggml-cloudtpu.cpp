@@ -1882,8 +1882,7 @@ struct ggml_backend_cloudtpu_context {
     uint64_t total_graph_evals = 0;
     uint64_t total_subgraphs = 0;
     uint64_t total_ops_executed = 0;
-    std::mutex sync_mu;
-    std::deque<cloudtpu::PjrtEventHandle> pending_sync_events;
+    cloudtpu::PendingSyncLaunchQueue pending_sync_launches;
     uint64_t plan_hits = 0;
     uint64_t plan_misses = 0;
 
@@ -2870,15 +2869,24 @@ static cloudtpu::OpNodeSpec build_op_node_spec(const struct ggml_tensor* node,
     return spec;
 }
 
+static void await_sync_launches(cloudtpu::PjrtRuntime& rt,
+                                std::deque<std::vector<cloudtpu::PjrtEventHandle>>& launches) {
+    while (!launches.empty()) {
+        std::vector<cloudtpu::PjrtEventHandle> launch = std::move(launches.front());
+        launches.pop_front();
+        for (auto& ev : launch) {
+            if (ev) {
+                rt.await_event(std::move(ev));
+            }
+        }
+    }
+}
+
 static void ggml_backend_cloudtpu_synchronize_ctx(ggml_backend_cloudtpu_context* ctx) {
     if (!ctx) {
         return;
     }
-    std::deque<cloudtpu::PjrtEventHandle> to_wait;
-    {
-        std::lock_guard<std::mutex> lock(ctx->sync_mu);
-        to_wait.swap(ctx->pending_sync_events);
-    }
+    std::deque<std::vector<cloudtpu::PjrtEventHandle>> to_wait = ctx->pending_sync_launches.drain_all();
     if (to_wait.empty()) {
         return;
     }
@@ -2886,13 +2894,7 @@ static void ggml_backend_cloudtpu_synchronize_ctx(ggml_backend_cloudtpu_context*
     if (!rt.is_initialized()) {
         return;
     }
-    while (!to_wait.empty()) {
-        cloudtpu::PjrtEventHandle ev = std::move(to_wait.front());
-        to_wait.pop_front();
-        if (ev) {
-            rt.await_event(std::move(ev));
-        }
-    }
+    await_sync_launches(rt, to_wait);
 }
 
 static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
@@ -3557,28 +3559,13 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
     }
     if (sync_exec) {
         ggml_backend_cloudtpu_synchronize_ctx(ctx);
-    } else {
-        // Track lightweight PJRT ready events instead of owning PJRT_Buffer references so
-        // GGML slot reuse immediately frees HBM, while capping in-flight events to O(1).
-        constexpr size_t kMaxPendingSyncEvents = 16;
-        std::deque<cloudtpu::PjrtEventHandle> overflow_events;
-        {
-            std::lock_guard<std::mutex> lock(ctx->sync_mu);
-            for (auto& ev : new_events) {
-                ctx->pending_sync_events.push_back(std::move(ev));
-            }
-            while (ctx->pending_sync_events.size() > kMaxPendingSyncEvents) {
-                overflow_events.push_back(std::move(ctx->pending_sync_events.front()));
-                ctx->pending_sync_events.pop_front();
-            }
-        }
-        while (!overflow_events.empty()) {
-            cloudtpu::PjrtEventHandle ev = std::move(overflow_events.front());
-            overflow_events.pop_front();
-            if (ev) {
-                rt.await_event(std::move(ev));
-            }
-        }
+    } else if (!new_events.empty()) {
+        // Track lightweight PJRT ready events per launch instead of owning PJRT_Buffer references
+        // so GGML slot reuse frees HBM immediately while capping outstanding launches (not raw
+        // per-chip/per-output events) so a single SPMD launch never forces waiting on itself.
+        std::deque<std::vector<cloudtpu::PjrtEventHandle>> overflow_launches =
+            ctx->pending_sync_launches.enqueue(std::move(new_events));
+        await_sync_launches(rt, overflow_launches);
     }
 
     ctx->total_subgraphs += 1;
@@ -3753,6 +3740,7 @@ static const char* ggml_backend_cloudtpu_get_name(ggml_backend_t backend) {
 }
 
 static void ggml_backend_cloudtpu_free(ggml_backend_t backend) {
+    ggml_backend_cloudtpu_synchronize(backend);
     auto* ctx = static_cast<ggml_backend_cloudtpu_context*>(backend->context);
     delete ctx;
     delete backend;

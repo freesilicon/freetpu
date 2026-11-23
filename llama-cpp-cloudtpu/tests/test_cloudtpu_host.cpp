@@ -1686,8 +1686,74 @@ void test_spmd_shard_n_get_rows_and_collectives() {
             CHECK_TRUE(dtype_rejected, "MockPJRT must reject mismatched SPMD input dtype");
         }
 
+        // 5) PendingSyncLaunchQueue: a single 8-chip 3-output (24-event) launch must stay queued
+        //    without forcing a wait on itself, and exceeding the launch cap drains only the oldest launch.
+        {
+            cloudtpu::RuntimeConfig cfg8;
+            cfg8.mock_mode = true;
+            cfg8.mock_devices = 8;
+            cfg8.exec_cache_cap = 16;
+            cloudtpu::PjrtRuntime rt8;
+            rt8.init(cfg8);
+
+            const std::vector<float> dummy(4, 1.0f);
+            std::vector<cloudtpu::PjrtBufferPtr> chip_bufs;
+            chip_bufs.reserve(8);
+            for (int d = 0; d < 8; ++d) {
+                chip_bufs.push_back(rt8.buffer_from_host(d, dummy.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, 4}));
+            }
+
+            auto make_24_event_launch = [&]() -> std::vector<cloudtpu::PjrtEventHandle> {
+                std::vector<cloudtpu::PjrtEventHandle> evs;
+                evs.reserve(24);
+                for (int out = 0; out < 3; ++out) {
+                    for (int d = 0; d < 8; ++d) {
+                        auto ev = rt8.create_buffer_ready_event(chip_bufs[static_cast<size_t>(d)]->handle.get());
+                        if (ev) {
+                            evs.push_back(std::move(ev));
+                        }
+                    }
+                }
+                return evs;
+            };
+
+            cloudtpu::PendingSyncLaunchQueue q;
+            constexpr size_t kCap = cloudtpu::PendingSyncLaunchQueue::kDefaultMaxLaunches;
+            auto first_launch = make_24_event_launch();
+            CHECK_TRUE(first_launch.size() == 24, "8-chip 3-output launch created 24 valid events");
+            auto ov0 = q.enqueue(std::move(first_launch), kCap);
+            CHECK_TRUE(ov0.empty(), "Single 24-event 8-chip launch must not trigger self-wait overflow");
+            CHECK_TRUE(q.pending_launches() == 1, "Single 24-event launch counts as 1 pending launch");
+
+            for (size_t k = 1; k < kCap; ++k) {
+                auto ov = q.enqueue(make_24_event_launch(), kCap);
+                CHECK_TRUE(ov.empty(), "Up to kCap launches must stay queued without overflow");
+            }
+            CHECK_TRUE(q.pending_launches() == kCap, "Queue holds exactly kCap launches");
+
+            auto ov_exceed = q.enqueue(make_24_event_launch(), kCap);
+            CHECK_TRUE(ov_exceed.size() == 1 && ov_exceed.front().size() == 24,
+                       "Exceeding launch cap drains exactly 1 oldest 24-event launch");
+            CHECK_TRUE(q.pending_launches() == kCap, "Queue stays capped at kCap launches after overflow");
+            for (auto& ev : ov_exceed.front()) {
+                rt8.await_event(std::move(ev));
+            }
+
+            auto remaining = q.drain_all();
+            CHECK_TRUE(remaining.size() == kCap && q.pending_launches() == 0,
+                       "drain_all returns all remaining launches and empties queue");
+            for (auto& launch : remaining) {
+                CHECK_TRUE(launch.size() == 24, "Each drained launch has all 24 events intact");
+                for (auto& ev : launch) {
+                    rt8.await_event(std::move(ev));
+                }
+            }
+            chip_bufs.clear();
+            rt8.shutdown();
+        }
+
         rt.shutdown();
-        std::printf("  [PASS] SPMD REDUCE_SCATTER_SUM -> CPY, S32 precision, & collective/input bounds checks\n");
+        std::printf("  [PASS] SPMD REDUCE_SCATTER_SUM -> CPY, S32 precision, bounds checks, & per-launch async queue\n");
     }
 }
 
