@@ -40,7 +40,7 @@ Host mock verification (`OPENBUENOS_MOCK=1`): `test-backend-ops -b EDGETPU -o MU
 
 ### 2.2 Bring Up Direct 5 Gbps USB-C CDC-NCM Link (Zero Wi-Fi Data)
 
-Connect both Pixel 10 developer units directly with a USB-C 3.2 / Thunderbolt 5 cable. Running the USB-C `ncm0` / `usb0` link, IP address, and policy-routing commands below requires a `CAP_NET_ADMIN`-privileged shell on each device; from that shell, enable CDC-NCM on the USB `device` side (`mustang`) and assign a point-to-point `/30` subnet (`table 200`):
+Connect both Pixel 10 developer units directly with a USB-C 3.2 / Thunderbolt 5 cable. Run the USB-C `ncm0` / `usb0` interface, IP address, and route configuration commands on each device with network-interface administration permissions (a standard default `adb shell` cannot configure kernel network interfaces). On the USB `device` side (`mustang`), enable CDC-NCM and assign a point-to-point `/30` subnet (`table 200`):
 
 ```bash
 # Node 2 (mustang — USB device side, SuperSpeed):
