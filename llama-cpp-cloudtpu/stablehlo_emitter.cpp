@@ -1,8 +1,11 @@
 #include "stablehlo_emitter.hpp"
 
 #include <algorithm>
+#include <cctype>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <limits>
@@ -126,6 +129,16 @@ public:
         return out;
     }
 
+    SsaValue emit_bitcast_convert(const SsaValue& x, const std::vector<int64_t>& out_dims, PjrtDType dst_dt) {
+        if (x.dtype == dst_dt && x.dims == out_dims) {
+            return x;
+        }
+        SsaValue out = next_val(dst_dt, out_dims);
+        body_ << "    " << out.name << " = stablehlo.bitcast_convert " << x.name << " : ("
+              << x.mlir_type() << ") -> " << out.mlir_type() << "\n";
+        return out;
+    }
+
     SsaValue emit_binary(const char* op_name, const SsaValue& a, const SsaValue& b) {
         SsaValue out = next_val(a.dtype, a.dims);
         body_ << "    " << out.name << " = " << op_name << " " << a.name << ", " << b.name
@@ -136,10 +149,10 @@ public:
     SsaValue emit_compare(const char* dir, const SsaValue& a, const SsaValue& b) {
         SsaValue out = next_val(PjrtDType::PRED, a.dims);
         const char* cmp_type = "FLOAT";
-        if (a.dtype == PjrtDType::S8 || a.dtype == PjrtDType::S16 ||
+        if (a.dtype == PjrtDType::S4 || a.dtype == PjrtDType::S8 || a.dtype == PjrtDType::S16 ||
             a.dtype == PjrtDType::S32 || a.dtype == PjrtDType::S64) {
             cmp_type = "SIGNED";
-        } else if (a.dtype == PjrtDType::U8 || a.dtype == PjrtDType::U32 ||
+        } else if (a.dtype == PjrtDType::U4 || a.dtype == PjrtDType::U8 || a.dtype == PjrtDType::U32 ||
                    a.dtype == PjrtDType::PRED) {
             cmp_type = "UNSIGNED";
         }
@@ -554,6 +567,7 @@ SsaValue dequantize_row_major_blocks(StableHloBuilder& b,
                                      const SsaValue& qs,
                                      const SsaValue& d,
                                      const SsaValue* m_opt,
+                                     PjrtDType effective_q_dt,
                                      PjrtDType out_dt) {
     const int64_t B3 = d.dims[0];
     const int64_t B2 = d.dims[1];
@@ -569,6 +583,25 @@ SsaValue dequantize_row_major_blocks(StableHloBuilder& b,
         SsaValue d_c = b.emit_convert(d, calc_dt);
         SsaValue d_b = b.emit_broadcast_in_dim(d_c, {0, 1, 2, 3}, blk_dims);
         SsaValue scaled = b.emit_binary("stablehlo.multiply", q_f, d_b);
+        return b.emit_convert(b.emit_reshape(scaled, {B3, B2, N, K}), out_dt);
+    }
+    if (storage == TensorStorageKind::Q4_0_I4 || storage == TensorStorageKind::Q4_K_I4) {
+        SsaValue q_f = b.emit_convert(qs, calc_dt);
+        if (storage == TensorStorageKind::Q4_0_I4 && effective_q_dt == PjrtDType::U4) {
+            SsaValue eight = b.emit_const_splat_f32(8.0f, blk_dims, calc_dt);
+            q_f = b.emit_binary("stablehlo.subtract", q_f, eight);
+        } else if (storage == TensorStorageKind::Q4_K_I4 && effective_q_dt == PjrtDType::S4) {
+            SsaValue eight = b.emit_const_splat_f32(8.0f, blk_dims, calc_dt);
+            q_f = b.emit_binary("stablehlo.add", q_f, eight);
+        }
+        SsaValue d_c = b.emit_convert(d, calc_dt);
+        SsaValue d_b = b.emit_broadcast_in_dim(d_c, {0, 1, 2, 3}, blk_dims);
+        SsaValue scaled = b.emit_binary("stablehlo.multiply", q_f, d_b);
+        if (storage == TensorStorageKind::Q4_K_I4 && m_opt != nullptr) {
+            SsaValue m_c = b.emit_convert(*m_opt, calc_dt);
+            SsaValue m_b = b.emit_broadcast_in_dim(m_c, {0, 1, 2, 3}, blk_dims);
+            scaled = b.emit_binary("stablehlo.add", scaled, m_b);
+        }
         return b.emit_convert(b.emit_reshape(scaled, {B3, B2, N, K}), out_dt);
     }
     if (storage == TensorStorageKind::Q4_0_SPLIT || storage == TensorStorageKind::Q4_K_SPLIT) {
@@ -598,14 +631,36 @@ SsaValue dequantize_row_major_blocks(StableHloBuilder& b,
     throw std::runtime_error("dequantize_row_major_blocks: unexpected storage kind");
 }
 
+SsaValue materialize_q4_i4_nibbles(StableHloBuilder& b,
+                                   const SsaValue& qs,
+                                   PjrtDType target_4bit,
+                                   int64_t N_local) {
+    if (qs.dtype == PjrtDType::S4 || qs.dtype == PjrtDType::U4) {
+        return qs;
+    }
+    if (qs.dtype == PjrtDType::U8) {
+        std::vector<int64_t> bc_dims = qs.dims;
+        bc_dims.push_back(2);
+        SsaValue bc = b.emit_bitcast_convert(qs, bc_dims, target_4bit);
+        std::vector<int64_t> flat_dims = qs.dims;
+        flat_dims.back() = N_local;
+        return b.emit_reshape(bc, flat_dims);
+    }
+    throw std::runtime_error("materialize_q4_i4_nibbles: unexpected qs dtype");
+}
+
 // TPU-native K-major N-minor dequantization (zero minor-dim tile padding, zero weight reshape,
 // zero broadcast reshape):
-//   Q8_0_SPLIT: qs [B3, B2, NB, 32, N] S8,  d [B3, B2, NB, N] F16      -> [B3, B2, NB, 32, N]
-//   Q6_K_SPLIT: qs [B3, B2, NB, 16, N] S8,  d [B3, B2, NB, N] F32/BF16 -> [B3, B2, NB, 16, N]
+//   Q8_0_SPLIT: qs [B3, B2, NB, 32, N] S8,      d [B3, B2, NB, N] F16      -> [B3, B2, NB, 32, N]
+//   Q6_K_SPLIT: qs [B3, B2, NB, 16, N] S8,      d [B3, B2, NB, N] F32/BF16 -> [B3, B2, NB, 16, N]
+//   Q4_0_I4:    qs [B3, B2, NB, 32, N] S4/U4,   d [B3, B2, NB, N] F16      -> [B3, B2, NB, 32, N]
+//   Q4_K_I4:    qs [B3, B2, NB, 32, N] S4/U4, d/m [B3, B2, NB, N] F32/BF16 -> [B3, B2, NB, 32, N]
 SsaValue dequantize_k_major_blocks(StableHloBuilder& b,
                                    TensorStorageKind storage,
                                    const SsaValue& qs,
                                    const SsaValue& d,
+                                   const SsaValue* m_opt,
+                                   PjrtDType bitcast_target,
                                    PjrtDType out_dt) {
     const int64_t B3 = d.dims[0];
     const int64_t B2 = d.dims[1];
@@ -614,10 +669,41 @@ SsaValue dequantize_k_major_blocks(StableHloBuilder& b,
     const int64_t blk_elems = (storage == TensorStorageKind::Q6_K_SPLIT) ? 16 : 32;
     const std::vector<int64_t> km_dims = {B3, B2, NB, blk_elems, N};
 
-    SsaValue q_f = b.emit_convert(qs, PjrtDType::F32);
+    SsaValue qs_eff = qs;
+    if (storage == TensorStorageKind::Q4_0_I4 || storage == TensorStorageKind::Q4_K_I4) {
+        const PjrtDType target_4bit = (bitcast_target != PjrtDType::INVALID) ? bitcast_target : PjrtDType::S4;
+        qs_eff = materialize_q4_i4_nibbles(b, qs, target_4bit, N);
+    }
+
+    // Only bypass F32 dequantization when there is no additive minimum offset (e.g. Q6_K_SPLIT
+    // lm_head): Q4_K_I4 must apply its minimum offset m in F32 before rounding to BF16 so
+    // small net weights after cancellation are never erased by intermediate BF16 rounding.
+    const bool fast_bf16 =
+        (out_dt == PjrtDType::BF16 && d.dtype == PjrtDType::BF16 &&
+         m_opt == nullptr &&
+         !(storage == TensorStorageKind::Q4_0_I4 && qs_eff.dtype == PjrtDType::U4));
+    if (fast_bf16) {
+        SsaValue q_bf = b.emit_convert(qs_eff, PjrtDType::BF16);
+        SsaValue d_b = b.emit_broadcast_in_dim(d, {0, 1, 2, 4}, km_dims);
+        return b.emit_binary("stablehlo.multiply", q_bf, d_b);
+    }
+
+    SsaValue q_f = b.emit_convert(qs_eff, PjrtDType::F32);
+    if (storage == TensorStorageKind::Q4_0_I4 && qs_eff.dtype == PjrtDType::U4) {
+        SsaValue eight = b.emit_const_splat_f32(8.0f, km_dims, PjrtDType::F32);
+        q_f = b.emit_binary("stablehlo.subtract", q_f, eight);
+    } else if (storage == TensorStorageKind::Q4_K_I4 && qs_eff.dtype == PjrtDType::S4) {
+        SsaValue eight = b.emit_const_splat_f32(8.0f, km_dims, PjrtDType::F32);
+        q_f = b.emit_binary("stablehlo.add", q_f, eight);
+    }
     SsaValue d_c = b.emit_convert(d, PjrtDType::F32);
     SsaValue d_b = b.emit_broadcast_in_dim(d_c, {0, 1, 2, 4}, km_dims);
     SsaValue scaled = b.emit_binary("stablehlo.multiply", q_f, d_b);
+    if (storage == TensorStorageKind::Q4_K_I4 && m_opt != nullptr) {
+        SsaValue m_c = b.emit_convert(*m_opt, PjrtDType::F32);
+        SsaValue m_b = b.emit_broadcast_in_dim(m_c, {0, 1, 2, 4}, km_dims);
+        scaled = b.emit_binary("stablehlo.add", scaled, m_b);
+    }
     return b.emit_convert(scaled, out_dt);
 }
 
@@ -670,6 +756,7 @@ SsaValue dequantize_split_weight(StableHloBuilder& b,
                                  const SsaValue& qs,
                                  const SsaValue& d,
                                  const SsaValue* m_opt,
+                                 PjrtDType bitcast_target,
                                  PjrtDType out_dt) {
     const int64_t B3 = d.dims[0];
     const int64_t B2 = d.dims[1];
@@ -678,8 +765,9 @@ SsaValue dequantize_split_weight(StableHloBuilder& b,
     const int64_t blk_elems = (storage == TensorStorageKind::Q6_K_SPLIT) ? 16 : 32;
     const int64_t K = NB * blk_elems;
 
-    if (storage == TensorStorageKind::Q8_0_SPLIT || storage == TensorStorageKind::Q6_K_SPLIT) {
-        SsaValue km = dequantize_k_major_blocks(b, storage, qs, d, out_dt);
+    if (storage == TensorStorageKind::Q8_0_SPLIT || storage == TensorStorageKind::Q6_K_SPLIT ||
+        storage == TensorStorageKind::Q4_0_I4 || storage == TensorStorageKind::Q4_K_I4) {
+        SsaValue km = dequantize_k_major_blocks(b, storage, qs, d, m_opt, bitcast_target, out_dt);
         SsaValue nm = b.emit_transpose(km, {0, 1, 4, 2, 3});
         return b.emit_reshape(nm, {B3, B2, N, K});
     }
@@ -790,14 +878,17 @@ uint64_t fnv1a_64(const std::string& s) {
     return h;
 }
 
-std::string build_canonical_cache_key(const std::string& mlir_text, int32_t spmd_chips) {
+std::string build_canonical_cache_key(const std::string& mlir_text, int32_t spmd_chips, int32_t mm_pad_m) {
     // Structural key combining size + two independent FNV hashes (64-bit normal + 64-bit salted),
-    // exact length, and SPMD chip count to prevent collisions without external SHA libraries.
+    // exact length, SPMD chip count, and non-default mm_pad_m to prevent collisions without external SHA libraries.
     const uint64_t h1 = fnv1a_64(mlir_text);
     const uint64_t h2 = fnv1a_64(std::string("cloudtpu_v1:") + mlir_text);
     std::ostringstream oss = make_classic_stream();
     oss << std::hex << std::setfill('0') << std::setw(16) << h1
         << std::setw(16) << h2 << "_" << std::dec << mlir_text.size() << "_p" << spmd_chips;
+    if (mm_pad_m != 8) {
+        oss << "_pm" << mm_pad_m;
+    }
     return oss.str();
 }
 
@@ -811,6 +902,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
     struct TensorHandle {
         TensorStorageKind storage = TensorStorageKind::DENSE;
         TensorShardingKind sharding = TensorShardingKind::REPLICATED;
+        PjrtDType bitcast_target = PjrtDType::S4;
         int64_t logical_k = 0;
         SsaValue dense;
         SsaValue q_qs;
@@ -826,6 +918,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
         TensorHandle th;
         th.storage = in.storage;
         th.sharding = (P > 1) ? in.sharding : TensorShardingKind::REPLICATED;
+        th.bitcast_target = (in.bitcast_target != PjrtDType::INVALID) ? in.bitcast_target : PjrtDType::S4;
         th.logical_k = in.dims[3];
         const int64_t B3 = in.dims[0];
         const int64_t B2 = in.dims[1];
@@ -854,29 +947,43 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
             th.dense = builder.arg_val(arg_idx - 1);
             prog.input_bindings.push_back({in.id, 0, in.dtype, std::move(dims), alias_out >= 0});
         } else {
+            const bool is_i4_storage =
+                (in.storage == TensorStorageKind::Q4_0_I4 || in.storage == TensorStorageKind::Q4_K_I4);
             const int64_t blk_elems = (in.storage == TensorStorageKind::Q6_K_SPLIT) ? 16 : 32;
             if (K <= 0 || (K % blk_elems) != 0) {
                 throw std::runtime_error("emit_stablehlo_program: quantized tensor K alignment error");
             }
             const int64_t NB = K / blk_elems;
-            const PjrtDType q_dt =
-                (in.storage == TensorStorageKind::Q8_0_SPLIT || in.storage == TensorStorageKind::Q6_K_SPLIT)
-                    ? PjrtDType::S8
-                    : PjrtDType::U8;
-            const int64_t qs_blk =
-                (in.storage == TensorStorageKind::Q8_0_SPLIT || in.storage == TensorStorageKind::Q6_K_SPLIT)
-                    ? blk_elems
-                    : 16;
+            PjrtDType q_dt = PjrtDType::U8;
+            int64_t qs_blk = 16;
+            int64_t qs_n = M_or_N;
+            if (in.storage == TensorStorageKind::Q8_0_SPLIT || in.storage == TensorStorageKind::Q6_K_SPLIT) {
+                q_dt = PjrtDType::S8;
+                qs_blk = blk_elems;
+            } else if (is_i4_storage) {
+                qs_blk = 32;
+                if (in.dtype == PjrtDType::U8) {
+                    if ((M_or_N % 2) != 0) {
+                        throw std::runtime_error("emit_stablehlo_program: Q4_*_I4 bitcast mode requires even local N");
+                    }
+                    q_dt = PjrtDType::U8;
+                    qs_n = M_or_N / 2;
+                } else {
+                    q_dt = (in.dtype == PjrtDType::U4) ? PjrtDType::U4 : PjrtDType::S4;
+                }
+            }
             const PjrtDType default_d_dt =
-                (in.storage == TensorStorageKind::Q4_K_SPLIT || in.storage == TensorStorageKind::Q6_K_SPLIT)
+                (in.storage == TensorStorageKind::Q4_K_SPLIT ||
+                 in.storage == TensorStorageKind::Q4_K_I4 ||
+                 in.storage == TensorStorageKind::Q6_K_SPLIT)
                     ? PjrtDType::F32
                     : PjrtDType::F16;
             const PjrtDType d_dt = (in.scale_dtype != PjrtDType::INVALID) ? in.scale_dtype : default_d_dt;
 
             // TPU-native K-major N-minor layout:
-            //   qs: [B3, B2, NB, qs_blk, N]  -> minor dims (16/32, N) align with (8, 128) TPU tiles (0% padding)
-            //   d:  [B3, B2, NB, N]          -> broadcasts along axis 3 without any reshape
-            std::vector<int64_t> qs_dims = {B3, B2, NB, qs_blk, M_or_N};
+            //   qs: [B3, B2, NB, qs_blk, qs_n] -> minor dims (16/32, qs_n) align with (8, 128) TPU tiles
+            //   d:  [B3, B2, NB, N]            -> broadcasts along axis 3 without any reshape
+            std::vector<int64_t> qs_dims = {B3, B2, NB, qs_blk, qs_n};
             const std::string q_name = "%arg" + std::to_string(arg_idx++);
             builder.add_arg(q_name, q_dt, qs_dims);
             th.q_qs = builder.arg_val(arg_idx - 1);
@@ -888,7 +995,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
             th.q_d = builder.arg_val(arg_idx - 1);
             prog.input_bindings.push_back({in.id, 1, d_dt, d_dims, false});
 
-            if (in.storage == TensorStorageKind::Q4_K_SPLIT) {
+            if (in.storage == TensorStorageKind::Q4_K_SPLIT || in.storage == TensorStorageKind::Q4_K_I4) {
                 const std::string m_name = "%arg" + std::to_string(arg_idx++);
                 builder.add_arg(m_name, d_dt, d_dims);
                 th.q_m = builder.arg_val(arg_idx - 1);
@@ -905,7 +1012,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
             return th.dense;
         }
         return dequantize_split_weight(
-            builder, th.storage, th.q_qs, th.q_d, th.has_q_m ? &th.q_m : nullptr, dequant_dt);
+            builder, th.storage, th.q_qs, th.q_d, th.has_q_m ? &th.q_m : nullptr, th.bitcast_target, dequant_dt);
     };
 
     auto resolve_replicated = [&](uint64_t id, PjrtDType dequant_dt = PjrtDType::BF16) -> SsaValue {
@@ -977,17 +1084,133 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                             wt = builder.emit_reshape(wb, {x.dims[0], x.dims[1], wt.dims[2], wt.dims[3], wt.dims[4]});
                         }
                     };
+                    auto bcast_w4_batch = [&](SsaValue& wt) {
+                        // wt: [B3_w, B2_w, D2, D3] -> [B3_x, B2_x, D2, D3]
+                        if (wt.dims[0] != x.dims[0] || wt.dims[1] != x.dims[1]) {
+                            const int64_t r3 = x.dims[0] / wt.dims[0];
+                            const int64_t r2 = x.dims[1] / wt.dims[1];
+                            SsaValue wr = builder.emit_reshape(
+                                wt, {wt.dims[0], 1, wt.dims[1], 1, wt.dims[2], wt.dims[3]});
+                            SsaValue wb = builder.emit_broadcast_in_dim(
+                                wr, {0, 1, 2, 3, 4, 5},
+                                {wt.dims[0], r3, wt.dims[1], r2, wt.dims[2], wt.dims[3]});
+                            wt = builder.emit_reshape(wb, {x.dims[0], x.dims[1], wt.dims[2], wt.dims[3]});
+                        }
+                    };
 
                     const std::vector<int64_t> local_out_dims = {x.dims[0], x.dims[1], x.dims[2], N_local};
+                    const int64_t m_orig = x.dims[2];
+                    const int64_t m_total = x.dims[0] * x.dims[1] * m_orig;
+                    const bool is_q4_i4 = (w_th.storage == TensorStorageKind::Q4_0_I4 ||
+                                           w_th.storage == TensorStorageKind::Q4_K_I4);
+                    const bool is_q4_factored = is_q4_i4 && (m_total <= 32);
+                    const bool apply_pad_m =
+                        use_bf16_mxu && !op.high_precision && spec.mm_pad_m > 1 &&
+                        x.dims[0] == 1 && x.dims[1] == 1 &&
+                        m_orig >= 1 && m_orig < spec.mm_pad_m &&
+                        (w_th.storage == TensorStorageKind::Q6_K_SPLIT ||
+                         (is_q4_factored && spec.mm_pad_m <= 32));
+                    SsaValue x_mm = x;
+                    if (apply_pad_m) {
+                        const int64_t m_pad = spec.mm_pad_m;
+                        SsaValue pad_zeros = builder.emit_const_splat_f32(
+                            0.0f, {1, 1, m_pad - m_orig, x.dims[3]}, x.dtype);
+                        x_mm = builder.emit_concatenate({x, pad_zeros}, 2);
+                    }
+                    const std::vector<int64_t> dot_out_dims = {x_mm.dims[0], x_mm.dims[1], x_mm.dims[2], N_local};
+
                     SsaValue local_out;
                     if (w_th.storage == TensorStorageKind::Q8_0_SPLIT ||
                         w_th.storage == TensorStorageKind::Q6_K_SPLIT) {
-                        SsaValue w_km = dequantize_k_major_blocks(builder, w_th.storage, w_th.q_qs, w_th.q_d, mm_dt);
+                        SsaValue w_km = dequantize_k_major_blocks(
+                            builder, w_th.storage, w_th.q_qs, w_th.q_d,
+                            nullptr, w_th.bitcast_target, mm_dt);
                         bcast_w5_batch(w_km);
-                        SsaValue x_blk = builder.emit_reshape(x, {x.dims[0], x.dims[1], x.dims[2], NB_local, blk_elems});
+                        SsaValue x_blk = builder.emit_reshape(
+                            x_mm, {x_mm.dims[0], x_mm.dims[1], x_mm.dims[2], NB_local, blk_elems});
                         local_out = builder.emit_dot_general(
-                            x_blk, w_km, {0, 1}, {0, 1}, {3, 4}, {2, 3}, local_out_dims, op.dst.dtype,
+                            x_blk, w_km, {0, 1}, {0, 1}, {3, 4}, {2, 3}, dot_out_dims, op.dst.dtype,
                             op.high_precision);
+                    } else if (is_q4_i4) {
+                        if (is_q4_factored) {
+                            // Factored S4 decode/small-batch path (M <= 32):
+                            //   dot_b = dot_general(x_blk, qs_mm) -> [B3, B2, NB_local, M, N_local]
+                            //   acc   = sum_nb(((dot_b + 8*xsum) * d) + (Q4_K ? xsum * m : 0))
+                            const PjrtDType target_4bit =
+                                (w_th.bitcast_target != PjrtDType::INVALID) ? w_th.bitcast_target : PjrtDType::S4;
+                            SsaValue qs_eff = materialize_q4_i4_nibbles(builder, w_th.q_qs, target_4bit, N_local);
+                            bcast_w5_batch(qs_eff);
+                            SsaValue d_km = w_th.q_d;
+                            bcast_w4_batch(d_km);
+
+                            SsaValue x_blk = builder.emit_reshape(
+                                x_mm, {x_mm.dims[0], x_mm.dims[1], x_mm.dims[2], NB_local, blk_elems});
+                            SsaValue qs_mm = builder.emit_convert(qs_eff, mm_dt);
+                            if (w_th.storage == TensorStorageKind::Q4_0_I4 && qs_eff.dtype == PjrtDType::U4) {
+                                SsaValue eight = builder.emit_const_splat_f32(8.0f, qs_mm.dims, mm_dt);
+                                qs_mm = builder.emit_binary("stablehlo.subtract", qs_mm, eight);
+                            }
+                            const std::vector<int64_t> dot_b_dims = {
+                                x_mm.dims[0], x_mm.dims[1], NB_local, x_mm.dims[2], N_local};
+                            // Match activation precision between dot_b and xsum:
+                            // - BF16 MXU path (mm_dt == BF16): x_blk is BF16, so xsum reduces
+                            //   convert(x_blk -> F32) of those exact BF16-rounded activations.
+                            // - F32 path (mm_dt == F32, e.g. CLOUDTPU_MATMUL_BF16=0): require
+                            //   precision = [HIGHEST, HIGHEST] on dot_b so TPU MXU does not round
+                            //   F32 dot inputs to BF16 while xsum uses full F32 precision.
+                            const bool dot_b_high_precision =
+                                op.high_precision || (mm_dt == PjrtDType::F32);
+                            SsaValue dot_b = builder.emit_dot_general(
+                                x_blk, qs_mm, {0, 1, 3}, {0, 1, 2}, {4}, {3},
+                                dot_b_dims, PjrtDType::F32, dot_b_high_precision);
+                            SsaValue zero_f32 = builder.emit_const_splat_f32(0.0f, {}, PjrtDType::F32);
+                            const bool q4k_needs_xsum =
+                                (w_th.storage == TensorStorageKind::Q4_K_I4) &&
+                                (qs_eff.dtype == PjrtDType::S4 || w_th.has_q_m);
+                            SsaValue xsum;
+                            if (q4k_needs_xsum) {
+                                SsaValue x_f32 = builder.emit_convert(x_blk, PjrtDType::F32);
+                                xsum = builder.emit_reduce_axis(x_f32, zero_f32, 4, "stablehlo.add");
+                            }
+                            if (w_th.storage == TensorStorageKind::Q4_K_I4 && qs_eff.dtype == PjrtDType::S4) {
+                                // Restore unsigned nibble contribution dot(x, u4) = dot(x, s4) + 8*sum(x)
+                                // BEFORE scaling by d, preserving exact cancellation for zero nibbles even
+                                // when 8*d >> |m| without pre-shifting m into m + 8*d.
+                                SsaValue eight_f32 = builder.emit_const_splat_f32(8.0f, xsum.dims, PjrtDType::F32);
+                                SsaValue eight_xsum = builder.emit_binary("stablehlo.multiply", xsum, eight_f32);
+                                SsaValue eight_xsum_b =
+                                    builder.emit_broadcast_in_dim(eight_xsum, {0, 1, 3, 2}, dot_b_dims);
+                                dot_b = builder.emit_binary("stablehlo.add", dot_b, eight_xsum_b);
+                            }
+                            SsaValue d_f32 = builder.emit_convert(d_km, PjrtDType::F32);
+                            SsaValue d_b = builder.emit_broadcast_in_dim(d_f32, {0, 1, 2, 4}, dot_b_dims);
+                            SsaValue scaled = builder.emit_binary("stablehlo.multiply", dot_b, d_b);
+                            if (w_th.storage == TensorStorageKind::Q4_K_I4 && w_th.has_q_m) {
+                                // Apply each sub-block's minimum offset (xsum * m) in F32 BEFORE reducing
+                                // across blocks NB_local so a large-scale cancelling block (e.g. d=2^20,
+                                // m=-2^20) cannot swamp another block's contribution during F32 reduction.
+                                SsaValue m_km = w_th.q_m;
+                                bcast_w4_batch(m_km);
+                                SsaValue m_f32 = builder.emit_convert(m_km, PjrtDType::F32);
+                                SsaValue m_b = builder.emit_broadcast_in_dim(m_f32, {0, 1, 2, 4}, dot_b_dims);
+                                SsaValue xsum_b = builder.emit_broadcast_in_dim(xsum, {0, 1, 3, 2}, dot_b_dims);
+                                SsaValue m_term = builder.emit_binary("stablehlo.multiply", xsum_b, m_b);
+                                scaled = builder.emit_binary("stablehlo.add", scaled, m_term);
+                            }
+                            SsaValue acc = builder.emit_reduce_axis(scaled, zero_f32, 2, "stablehlo.add");
+                            local_out = builder.emit_convert(acc, op.dst.dtype);
+                        } else {
+                            // Large-batch prefill path (M > 32): in-loop S4 dequant -> reshape [..., K, N] -> single dot_general.
+                            SsaValue w_km = dequantize_k_major_blocks(
+                                builder, w_th.storage, w_th.q_qs, w_th.q_d,
+                                w_th.has_q_m ? &w_th.q_m : nullptr, w_th.bitcast_target, mm_dt);
+                            bcast_w5_batch(w_km);
+                            SsaValue w_2d = builder.emit_reshape(
+                                w_km, {x.dims[0], x.dims[1], K_local, N_local});
+                            local_out = builder.emit_dot_general(
+                                x, w_2d, {0, 1}, {0, 1}, {3}, {2}, local_out_dims, op.dst.dtype,
+                                op.high_precision);
+                        }
                     } else {
                         SsaValue w_lo, w_hi;
                         dequantize_q4_k_major_halves(
@@ -1023,6 +1246,10 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                                 x_blk, w_cat, {0, 1}, {0, 1}, {3, 4, 5}, {2, 3, 4}, local_out_dims, op.dst.dtype,
                                 op.high_precision);
                         }
+                    }
+
+                    if (apply_pad_m) {
+                        local_out = builder.emit_slice(local_out, {0, 0, 0, 0}, {1, 1, m_orig, N_local});
                     }
 
                     if (P > 1 && w_sh == TensorShardingKind::SHARD_N) {
@@ -1303,6 +1530,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
 
                 const bool is_shard_n = (P > 1 && tbl.sharding == TensorShardingKind::SHARD_N);
                 SsaValue start_indices;
+                SsaValue eff_idx1 = idx1;
                 SsaValue in_range;
                 if (is_shard_n) {
                     // Row-sharded lookup: gather only the N_idx requested rows on each replica's
@@ -1325,8 +1553,8 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                     SsaValue max_idx = builder.emit_const_splat_int(
                         std::max<int64_t>(0, local_rows - 1), idx_col_dims, PjrtDType::S32);
                     SsaValue clamped_lo = builder.emit_binary("stablehlo.maximum", rel_idx, zero_idx);
-                    SsaValue local_idx1 = builder.emit_binary("stablehlo.minimum", clamped_lo, max_idx);
-                    start_indices = builder.emit_concatenate({idx3, idx2, local_idx1}, 3);
+                    eff_idx1 = builder.emit_binary("stablehlo.minimum", clamped_lo, max_idx);
+                    start_indices = builder.emit_concatenate({idx3, idx2, eff_idx1}, 3);
                 } else {
                     start_indices = builder.emit_concatenate({idx3, idx2, idx1}, 3);
                 }
@@ -1341,8 +1569,39 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                     // producing row-major [B3, B2, N_idx, NB, qs_blk] + [B3, B2, N_idx, NB], then dequantize!
                     const int64_t NB = tbl.q_d.dims[2];
                     const int64_t qs_blk = tbl.q_qs.dims[3];
-                    SsaValue g_qs = builder.emit_gather_3d_last_axis(
-                        tbl.q_qs, start_indices, {B3, B2, N_idx, NB, qs_blk});
+                    SsaValue g_qs;
+                    PjrtDType eff_q_dt = tbl.q_qs.dtype;
+                    if ((tbl.storage == TensorStorageKind::Q4_0_I4 ||
+                         tbl.storage == TensorStorageKind::Q4_K_I4) &&
+                        tbl.q_qs.dtype == PjrtDType::U8) {
+                        // Packed bitcast U8 [..., 32, N_local/2]: gather byte (eff_idx1 >> 1), extract nibble (eff_idx1 & 1).
+                        SsaValue one = builder.emit_const_splat_int(1, idx_col_dims, PjrtDType::S32);
+                        SsaValue byte_idx1 = builder.emit_binary("stablehlo.shift_right_logical", eff_idx1, one);
+                        SsaValue nib_sel = builder.emit_binary("stablehlo.and", eff_idx1, one);
+                        SsaValue byte_start_indices = builder.emit_concatenate({idx3, idx2, byte_idx1}, 3);
+                        SsaValue g_u8 = builder.emit_gather_3d_last_axis(
+                            tbl.q_qs, byte_start_indices, {B3, B2, N_idx, NB, qs_blk});
+                        SsaValue g_s32 = builder.emit_convert(g_u8, PjrtDType::S32);
+                        SsaValue four = builder.emit_const_splat_int(4, idx_col_dims, PjrtDType::S32);
+                        SsaValue shift_amt = builder.emit_reshape(
+                            builder.emit_binary("stablehlo.multiply", nib_sel, four), {B3, B2, N_idx});
+                        SsaValue shift_b = builder.emit_broadcast_in_dim(shift_amt, {0, 1, 2}, g_s32.dims);
+                        SsaValue shifted = builder.emit_binary("stablehlo.shift_right_logical", g_s32, shift_b);
+                        SsaValue mask_15 = builder.emit_const_splat_int(0x0F, g_s32.dims, PjrtDType::S32);
+                        SsaValue nib_u = builder.emit_binary("stablehlo.and", shifted, mask_15);
+                        eff_q_dt = tbl.bitcast_target;
+                        if (eff_q_dt == PjrtDType::S4) {
+                            SsaValue eight_i = builder.emit_const_splat_int(8, g_s32.dims, PjrtDType::S32);
+                            SsaValue plus8 = builder.emit_binary("stablehlo.add", nib_u, eight_i);
+                            SsaValue masked = builder.emit_binary("stablehlo.and", plus8, mask_15);
+                            g_qs = builder.emit_binary("stablehlo.subtract", masked, eight_i);
+                        } else {
+                            g_qs = nib_u;
+                        }
+                    } else {
+                        g_qs = builder.emit_gather_3d_last_axis(
+                            tbl.q_qs, start_indices, {B3, B2, N_idx, NB, qs_blk});
+                    }
                     SsaValue g_d = builder.emit_gather_3d_last_axis(
                         tbl.q_d, start_indices, {B3, B2, N_idx, NB});
                     SsaValue g_m;
@@ -1353,14 +1612,16 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                         g_m_ptr = &g_m;
                     }
                     local_rows_val = dequantize_row_major_blocks(
-                        builder, tbl.storage, g_qs, g_d, g_m_ptr, op.dst.dtype);
+                        builder, tbl.storage, g_qs, g_d, g_m_ptr, eff_q_dt, op.dst.dtype);
                 }
 
                 if (is_shard_n) {
                     SsaValue mask_b = builder.emit_broadcast_in_dim(in_range, {0, 1, 2, 3}, dst_dims);
-                    const bool dst_is_int = (op.dst.dtype == PjrtDType::S8 || op.dst.dtype == PjrtDType::U8 ||
-                                             op.dst.dtype == PjrtDType::S16 || op.dst.dtype == PjrtDType::S32 ||
-                                             op.dst.dtype == PjrtDType::U32 || op.dst.dtype == PjrtDType::S64);
+                    const bool dst_is_int = (op.dst.dtype == PjrtDType::PRED || op.dst.dtype == PjrtDType::S4 ||
+                                             op.dst.dtype == PjrtDType::U4 || op.dst.dtype == PjrtDType::S8 ||
+                                             op.dst.dtype == PjrtDType::U8 || op.dst.dtype == PjrtDType::S16 ||
+                                             op.dst.dtype == PjrtDType::S32 || op.dst.dtype == PjrtDType::U32 ||
+                                             op.dst.dtype == PjrtDType::S64);
                     SsaValue zeros_dst = dst_is_int
                                              ? builder.emit_const_splat_int(0, dst_dims, op.dst.dtype)
                                              : builder.emit_const_splat_f32(0.0f, dst_dims, op.dst.dtype);
@@ -1685,8 +1946,1173 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
     }
 
     prog.mlir_text = builder.finish(return_vals);
-    prog.cache_key = build_canonical_cache_key(prog.mlir_text, P);
+    prog.cache_key = build_canonical_cache_key(prog.mlir_text, P, spec.mm_pad_m);
     return prog;
+}
+
+bool checked_tensor_nbytes(const int64_t dims[4], size_t elem_bytes, size_t* out_bytes) {
+    if (!dims || !out_bytes || elem_bytes == 0) {
+        return false;
+    }
+    size_t acc = elem_bytes;
+    for (int d = 0; d < 4; ++d) {
+        if (dims[d] < 0) {
+            return false;
+        }
+        const uint64_t udim = static_cast<uint64_t>(dims[d]);
+        if (udim > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+            return false;
+        }
+        const size_t sdim = static_cast<size_t>(udim);
+        if (sdim == 0) {
+            *out_bytes = 0;
+            return true;
+        }
+        if (acc > std::numeric_limits<size_t>::max() / sdim) {
+            return false;
+        }
+        acc *= sdim;
+    }
+    *out_bytes = acc;
+    return true;
+}
+
+std::vector<int64_t> parse_batch_buckets(const char* env_val) {
+    if (env_val == nullptr) {
+        return {1, 2, 4, 8, 16, 32, 64, 128, 256, 512};
+    }
+    std::string raw(env_val);
+    size_t start = 0;
+    while (start < raw.size() && std::isspace(static_cast<unsigned char>(raw[start]))) {
+        ++start;
+    }
+    size_t end = raw.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(raw[end - 1]))) {
+        --end;
+    }
+    const std::string trimmed = raw.substr(start, end - start);
+    if (trimmed.empty() || trimmed == "0" || trimmed == "off" || trimmed == "false") {
+        return {};
+    }
+
+    std::vector<int64_t> buckets;
+    size_t pos = 0;
+    while (pos < trimmed.size()) {
+        size_t sep = trimmed.find_first_of(", \t\r\n", pos);
+        if (sep == std::string::npos) {
+            sep = trimmed.size();
+        }
+        if (sep > pos) {
+            const std::string tok = trimmed.substr(pos, sep - pos);
+            char* endptr = nullptr;
+            errno = 0;
+            const long long val = std::strtoll(tok.c_str(), &endptr, 10);
+            if (errno == 0 && endptr != tok.c_str() && *endptr == '\0' &&
+                val > 0 && val <= static_cast<long long>(kMaxBatchBucketTokens)) {
+                buckets.push_back(static_cast<int64_t>(val));
+            }
+        }
+        pos = sep + 1;
+    }
+    std::sort(buckets.begin(), buckets.end());
+    buckets.erase(std::unique(buckets.begin(), buckets.end()), buckets.end());
+    return buckets;
+}
+
+int64_t select_batch_bucket(int64_t n_tokens, const std::vector<int64_t>& buckets) {
+    if (n_tokens < 1 || buckets.empty() || n_tokens > buckets.back()) {
+        return 0;
+    }
+    for (int64_t b : buckets) {
+        if (b >= n_tokens) {
+            return b;
+        }
+    }
+    return 0;
+}
+
+int map_token_axis_reshape(const int64_t* src_dims,
+                           size_t src_rank,
+                           int src_ax,
+                           const int64_t* dst_dims,
+                           size_t dst_rank) {
+    if (!src_dims || !dst_dims || src_ax < 0 || static_cast<size_t>(src_ax) >= src_rank || dst_rank == 0) {
+        return -1;
+    }
+    const int64_t target_dim = src_dims[src_ax];
+    if (target_dim <= 0) {
+        return -1;
+    }
+    int64_t outer = 1;
+    for (int k = 0; k < src_ax; ++k) {
+        outer *= src_dims[k];
+    }
+    int64_t inner = 1;
+    for (size_t k = static_cast<size_t>(src_ax) + 1; k < src_rank; ++k) {
+        inner *= src_dims[k];
+    }
+    int found = -1;
+    for (size_t d = 0; d < dst_rank; ++d) {
+        if (dst_dims[d] != target_dim) {
+            continue;
+        }
+        int64_t d_outer = 1;
+        for (size_t k = 0; k < d; ++k) {
+            d_outer *= dst_dims[k];
+        }
+        int64_t d_inner = 1;
+        for (size_t k = d + 1; k < dst_rank; ++k) {
+            d_inner *= dst_dims[k];
+        }
+        if (d_outer == outer && d_inner == inner) {
+            if (found >= 0) {
+                return -1;
+            }
+            found = static_cast<int>(d);
+        }
+    }
+    return found;
+}
+
+bool bucket_view_slice_dims(const int64_t parent_dims[4],
+                            int parent_token_axis,
+                            int64_t orig_tokens,
+                            int64_t bucket_tokens,
+                            std::vector<int64_t>& reshape_dims,
+                            std::vector<int64_t>& starts,
+                            std::vector<int64_t>& limits) {
+    if (parent_token_axis < 0) {
+        return true;
+    }
+    if (parent_token_axis > 3 || parent_dims[parent_token_axis] != orig_tokens || bucket_tokens <= orig_tokens) {
+        return false;
+    }
+    const int64_t* cur_ptr = reshape_dims.empty() ? parent_dims : reshape_dims.data();
+    const size_t cur_rank = reshape_dims.empty() ? 4 : reshape_dims.size();
+    if (starts.size() != cur_rank || limits.size() != cur_rank) {
+        return false;
+    }
+    const int cur_ax = reshape_dims.empty()
+                           ? parent_token_axis
+                           : map_token_axis_reshape(parent_dims, 4, parent_token_axis, cur_ptr, cur_rank);
+    if (cur_ax < 0) {
+        return false;
+    }
+    const size_t uax = static_cast<size_t>(cur_ax);
+    if (starts[uax] != 0 || limits[uax] != orig_tokens || cur_ptr[uax] != orig_tokens) {
+        return false;
+    }
+    if (!reshape_dims.empty()) {
+        reshape_dims[uax] = bucket_tokens;
+    }
+    limits[uax] = bucket_tokens;
+    return true;
+}
+
+static const char* cloud_op_kind_name(CloudOpKind kind) {
+    switch (kind) {
+        case CloudOpKind::MUL_MAT: return "MUL_MAT";
+        case CloudOpKind::RMS_NORM: return "RMS_NORM";
+        case CloudOpKind::ROPE: return "ROPE";
+        case CloudOpKind::SILU: return "SILU";
+        case CloudOpKind::SWIGLU: return "SWIGLU";
+        case CloudOpKind::SOFT_MAX: return "SOFT_MAX";
+        case CloudOpKind::GET_ROWS: return "GET_ROWS";
+        case CloudOpKind::SET_ROWS: return "SET_ROWS";
+        case CloudOpKind::ADD: return "ADD";
+        case CloudOpKind::MUL: return "MUL";
+        case CloudOpKind::SCALE: return "SCALE";
+        case CloudOpKind::CPY: return "CPY";
+        case CloudOpKind::RESHAPE: return "RESHAPE";
+        case CloudOpKind::TRANSPOSE: return "TRANSPOSE";
+        case CloudOpKind::SLICE: return "SLICE";
+        case CloudOpKind::FLASH_ATTN_EXT: return "FLASH_ATTN_EXT";
+        case CloudOpKind::ALL_REDUCE_SUM: return "ALL_REDUCE_SUM";
+        case CloudOpKind::ALL_GATHER: return "ALL_GATHER";
+        case CloudOpKind::REDUCE_SCATTER_SUM: return "REDUCE_SCATTER_SUM";
+    }
+    return "UNKNOWN";
+}
+
+BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
+                                                int64_t orig_tokens,
+                                                int64_t bucket_tokens) {
+    BucketAnalysisResult out;
+    auto fail_with = [&](const std::string& reason) -> BucketAnalysisResult {
+        BucketAnalysisResult failed;
+        failed.fail_reason = reason;
+        return failed;
+    };
+    if (orig_tokens < 1 || bucket_tokens <= orig_tokens) {
+        return fail_with("invalid_tokens");
+    }
+    if (bucket_tokens > kMaxBatchBucketTokens) {
+        return fail_with("bucket_tokens_too_large");
+    }
+
+    struct ValInfo {
+        uint64_t id = 0;
+        PjrtDType dtype = PjrtDType::F32;
+        int64_t dims[4] = {1, 1, 1, 1};
+        bool is_external = false;
+        bool is_dense = true;
+        bool is_donated = false;
+        bool allow_pre_padded = false;
+        TensorShardingKind sharding = TensorShardingKind::REPLICATED;
+        int producer_op_idx = -1;
+        int ax = -2;  // -2 = unknown, -1 = batch-invariant, 0..3 = token axis
+        TokenInputPadKind pad = TokenInputPadKind::NONE;
+    };
+
+    std::vector<ValInfo> vals;
+    vals.reserve(spec.inputs.size() + spec.ops.size());
+    std::unordered_map<uint64_t, size_t> id_to_idx;
+    id_to_idx.reserve((spec.inputs.size() + spec.ops.size()) * 2 + 1);
+    uint64_t max_id = 0;
+
+    for (const TensorSpec& in : spec.inputs) {
+        if (in.id == 0 || id_to_idx.count(in.id)) {
+            return fail_with("invalid_input_id");
+        }
+        ValInfo vi;
+        vi.id = in.id;
+        vi.dtype = in.dtype;
+        for (int d = 0; d < 4; ++d) {
+            vi.dims[d] = in.dims[d];
+        }
+        vi.is_external = true;
+        vi.is_dense = (in.storage == TensorStorageKind::DENSE);
+        vi.is_donated = (in.alias_output_idx >= 0);
+        vi.sharding = in.sharding;
+        if (!vi.is_dense || vi.is_donated) {
+            vi.ax = -1;
+        }
+        id_to_idx[in.id] = vals.size();
+        vals.push_back(vi);
+        if (in.id > max_id) max_id = in.id;
+    }
+
+    for (size_t oi = 0; oi < spec.ops.size(); ++oi) {
+        const OpNodeSpec& op = spec.ops[oi];
+        if (op.dst.id == 0 || id_to_idx.count(op.dst.id)) {
+            return fail_with("invalid_op_dst_id");
+        }
+        ValInfo vi;
+        vi.id = op.dst.id;
+        vi.dtype = op.dst.dtype;
+        for (int d = 0; d < 4; ++d) {
+            vi.dims[d] = op.dst.dims[d];
+        }
+        vi.is_external = false;
+        vi.is_dense = (op.dst.storage == TensorStorageKind::DENSE);
+        vi.sharding = op.keep_sharded_out ? TensorShardingKind::SHARD_K : TensorShardingKind::REPLICATED;
+        vi.producer_op_idx = static_cast<int>(oi);
+        id_to_idx[op.dst.id] = vals.size();
+        vals.push_back(vi);
+        if (op.dst.id > max_id) max_id = op.dst.id;
+    }
+
+    for (uint64_t oid : spec.output_ids) {
+        if (!id_to_idx.count(oid)) {
+            return fail_with("missing_output_id");
+        }
+    }
+
+    auto lookup_idx = [&](uint64_t id, size_t* idx_out) -> bool {
+        auto it = id_to_idx.find(id);
+        if (it == id_to_idx.end()) {
+            return false;
+        }
+        *idx_out = it->second;
+        return true;
+    };
+
+    std::string detail_reason;
+    auto note_reason = [&](const std::string& r) {
+        if (detail_reason.empty()) {
+            detail_reason = r;
+        }
+    };
+
+    bool changed = false;
+    auto set_ax = [&](size_t idx, int new_ax) -> bool {
+        ValInfo& vi = vals[idx];
+        if (new_ax >= 0) {
+            if (new_ax > 3) {
+                note_reason("invalid_axis");
+                return false;
+            }
+            const bool dim_ok = vi.allow_pre_padded
+                                    ? (vi.dims[new_ax] >= orig_tokens && vi.dims[new_ax] < bucket_tokens)
+                                    : (vi.dims[new_ax] == orig_tokens);
+            if (!dim_ok) {
+                note_reason(vi.is_external ? "input_dim_mismatch" : "op_dim_mismatch");
+                return false;
+            }
+            if (!vi.is_dense || vi.is_donated) {
+                note_reason(vi.is_donated ? "donated_conflict" : "non_dense_conflict");
+                return false;
+            }
+            if (vi.sharding == TensorShardingKind::SHARD_N && new_ax == 2) {
+                note_reason("shard_n_conflict");
+                return false;
+            }
+            if (vi.sharding == TensorShardingKind::SHARD_K && new_ax == 3) {
+                note_reason("shard_k_conflict");
+                return false;
+            }
+        }
+        if (vi.ax == -2) {
+            vi.ax = new_ax;
+            changed = true;
+            return true;
+        }
+        if (vi.ax != new_ax) {
+            note_reason(vi.is_external ? "input_conflict" : "axis_conflict");
+            return false;
+        }
+        return true;
+    };
+
+    auto set_pad = [&](size_t idx, TokenInputPadKind kind) -> bool {
+        if (kind == TokenInputPadKind::NONE) {
+            return true;
+        }
+        size_t cur = idx;
+        for (size_t depth = 0; depth <= spec.ops.size(); ++depth) {
+            ValInfo& vi = vals[cur];
+            if (kind == TokenInputPadKind::NEG_ONE &&
+                vi.dtype != PjrtDType::S32 && vi.dtype != PjrtDType::S64) {
+                note_reason("neg_one_invalid_dtype");
+                return false;
+            }
+            if (vi.is_external) {
+                if (vi.pad == TokenInputPadKind::NONE) {
+                    vi.pad = kind;
+                    return true;
+                }
+                if (vi.pad != kind) {
+                    note_reason("pad_kind_conflict");
+                    return false;
+                }
+                return true;
+            }
+            if (vi.producer_op_idx < 0 || static_cast<size_t>(vi.producer_op_idx) >= spec.ops.size()) {
+                if (kind == TokenInputPadKind::NEG_ONE) {
+                    note_reason("neg_one_computed_index");
+                    return false;
+                }
+                return true;
+            }
+            const OpNodeSpec& prod = spec.ops[static_cast<size_t>(vi.producer_op_idx)];
+            const bool value_preserving_shape_op =
+                (prod.kind == CloudOpKind::RESHAPE ||
+                 prod.kind == CloudOpKind::CPY ||
+                 prod.kind == CloudOpKind::TRANSPOSE ||
+                 prod.kind == CloudOpKind::SLICE);
+            if (!value_preserving_shape_op || prod.src_ids.empty()) {
+                if (kind == TokenInputPadKind::NEG_ONE) {
+                    note_reason("neg_one_computed_index");
+                    return false;
+                }
+                return true;
+            }
+            size_t src_i = 0;
+            if (!lookup_idx(prod.src_ids[0], &src_i)) {
+                if (kind == TokenInputPadKind::NEG_ONE) {
+                    note_reason("neg_one_computed_index");
+                    return false;
+                }
+                return true;
+            }
+            cur = src_i;
+        }
+        if (kind == TokenInputPadKind::NEG_ONE) {
+            note_reason("neg_one_computed_index");
+            return false;
+        }
+        return true;
+    };
+
+    auto is_1d_tokens = [&](size_t idx) -> bool {
+        const auto& d = vals[idx].dims;
+        return d[0] == 1 && d[1] == 1 && d[2] == 1 && d[3] == orig_tokens;
+    };
+
+    auto is_1d_scalar = [&](size_t idx) -> bool {
+        const auto& d = vals[idx].dims;
+        return d[0] == 1 && d[1] == 1 && d[2] == 1 && d[3] == 1;
+    };
+
+    auto assign_attention_mask = [&](size_t m_i, int active_ax) -> bool {
+        if (active_ax == 2 && vals[m_i].dims[2] == orig_tokens) {
+            return set_ax(m_i, 2) && set_pad(m_i, TokenInputPadKind::ZERO);
+        }
+        if (active_ax == 2 && vals[m_i].dims[2] > orig_tokens && vals[m_i].dims[2] < bucket_tokens) {
+            if (!vals[m_i].is_external || !vals[m_i].is_dense || vals[m_i].is_donated ||
+                vals[m_i].sharding != TensorShardingKind::REPLICATED) {
+                return false;
+            }
+            if (vals[m_i].ax != -2 && !(vals[m_i].ax == 2 && vals[m_i].allow_pre_padded)) {
+                return false;
+            }
+            vals[m_i].allow_pre_padded = true;
+            return set_ax(m_i, 2) && set_pad(m_i, TokenInputPadKind::ZERO);
+        }
+        if (active_ax == 2 && vals[m_i].dims[2] >= bucket_tokens) {
+            return set_ax(m_i, -1);
+        }
+        if (vals[m_i].dims[active_ax] == 1 && orig_tokens > 1) {
+            if (vals[m_i].ax == -2) {
+                return set_ax(m_i, -1);
+            }
+            return vals[m_i].ax == -1;
+        }
+        if (vals[m_i].dims[active_ax] == orig_tokens) {
+            return set_ax(m_i, active_ax) && set_pad(m_i, TokenInputPadKind::ZERO);
+        }
+        return false;
+    };
+
+    // Identify true KV-cache tensors from donated buffers and FLASH_ATTN_EXT K/V feeds so
+    // non-KV token tables (e.g. build_inp_embd mixed_embd) can still bucket along axis 2.
+    std::vector<bool> is_kv(vals.size(), false);
+    for (size_t i = 0; i < spec.inputs.size(); ++i) {
+        if (vals[i].is_donated) {
+            is_kv[i] = true;
+        }
+    }
+    for (const OpNodeSpec& op : spec.ops) {
+        if (op.kind == CloudOpKind::FLASH_ATTN_EXT && op.src_ids.size() >= 3) {
+            size_t k_i = 0, v_i = 0;
+            if (lookup_idx(op.src_ids[1], &k_i)) is_kv[k_i] = true;
+            if (lookup_idx(op.src_ids[2], &v_i)) is_kv[v_i] = true;
+        }
+    }
+    for (bool kv_changed = true; kv_changed;) {
+        kv_changed = false;
+        for (const OpNodeSpec& op : spec.ops) {
+            size_t dst_i = 0;
+            if (!lookup_idx(op.dst.id, &dst_i)) continue;
+            if (op.kind == CloudOpKind::SET_ROWS && op.src_ids.size() >= 3) {
+                size_t kv_i = 0;
+                if (!lookup_idx(op.src_ids[2], &kv_i)) continue;
+                if (is_kv[dst_i] && !is_kv[kv_i]) {
+                    is_kv[kv_i] = true;
+                    kv_changed = true;
+                }
+                if (is_kv[kv_i] && !is_kv[dst_i]) {
+                    is_kv[dst_i] = true;
+                    kv_changed = true;
+                }
+            } else if ((op.kind == CloudOpKind::CPY || op.kind == CloudOpKind::RESHAPE ||
+                        op.kind == CloudOpKind::TRANSPOSE || op.kind == CloudOpKind::SLICE) &&
+                       !op.src_ids.empty() && is_kv[dst_i]) {
+                size_t x_i = 0;
+                if (lookup_idx(op.src_ids[0], &x_i) && !is_kv[x_i]) {
+                    is_kv[x_i] = true;
+                    kv_changed = true;
+                }
+            }
+        }
+    }
+    for (size_t i = 0; i < vals.size(); ++i) {
+        if (is_kv[i] && !set_ax(i, -1)) {
+            return fail_with("kv_axis_conflict");
+        }
+    }
+
+    auto propagate_op = [&](const OpNodeSpec& op, bool allow_mm_seed) -> bool {
+        size_t dst_i = 0;
+        if (!lookup_idx(op.dst.id, &dst_i)) return false;
+
+        switch (op.kind) {
+            case CloudOpKind::GET_ROWS: {
+                if (op.src_ids.size() < 2) return false;
+                size_t tbl_i = 0, idx_i = 0;
+                if (!lookup_idx(op.src_ids[0], &tbl_i) || !lookup_idx(op.src_ids[1], &idx_i)) return false;
+                // Require 1D token indices [1, 1, 1, N_idx]
+                if (vals[idx_i].dims[0] != 1 || vals[idx_i].dims[1] != 1 || vals[idx_i].dims[2] != 1) {
+                    return false;
+                }
+                if (vals[tbl_i].ax == -2 && vals[tbl_i].is_external) {
+                    if (!set_ax(tbl_i, -1)) return false;
+                }
+                if (vals[tbl_i].ax == -1) {
+                    if (vals[idx_i].dims[3] == orig_tokens) {
+                        if (!set_ax(idx_i, 3) || !set_pad(idx_i, TokenInputPadKind::ZERO) || !set_ax(dst_i, 2)) {
+                            return false;
+                        }
+                    } else {
+                        if (!set_ax(idx_i, -1) || !set_ax(dst_i, -1)) return false;
+                    }
+                } else if (vals[tbl_i].ax == 2) {
+                    if (vals[idx_i].dims[3] == orig_tokens) {
+                        if (!set_ax(idx_i, 3) || !set_pad(idx_i, TokenInputPadKind::ZERO) || !set_ax(dst_i, 2)) {
+                            return false;
+                        }
+                    } else if (vals[idx_i].dims[3] >= 1 && vals[idx_i].dims[3] < orig_tokens) {
+                        // Partial output gather (e.g. final-layer inp_out_ids with N_out < T):
+                        // gathers valid rows inside [0..T-1] from the B-padded table and yields fixed N_out.
+                        if (!set_ax(idx_i, -1) || !set_ax(dst_i, -1)) {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                } else if (vals[tbl_i].ax >= 0) {
+                    return false;
+                }
+                if (vals[dst_i].ax >= 0 && vals[dst_i].ax != 2) return false;
+                if (vals[idx_i].ax >= 0 && vals[idx_i].ax != 3) return false;
+                return true;
+            }
+            case CloudOpKind::SET_ROWS: {
+                if (op.src_ids.size() < 3) return false;
+                size_t upd_i = 0, idx_i = 0, kv_i = 0;
+                if (!lookup_idx(op.src_ids[0], &upd_i) ||
+                    !lookup_idx(op.src_ids[1], &idx_i) ||
+                    !lookup_idx(op.src_ids[2], &kv_i)) {
+                    return false;
+                }
+                if (vals[idx_i].dims[0] != 1 || vals[idx_i].dims[1] != 1 || vals[idx_i].dims[2] != 1) {
+                    return false;
+                }
+                if (is_kv[kv_i] || is_kv[dst_i] || vals[kv_i].dims[2] != orig_tokens) {
+                    if (!set_ax(kv_i, -1) || !set_ax(dst_i, -1)) return false;
+                } else {
+                    // Non-KV token-table SET_ROWS (e.g. build_inp_embd mixed_embd): bucket base table and output.
+                    if (!set_ax(kv_i, 2) || !set_pad(kv_i, TokenInputPadKind::ZERO) || !set_ax(dst_i, 2)) {
+                        return false;
+                    }
+                }
+                if (vals[idx_i].dims[3] == orig_tokens) {
+                    if (!set_ax(idx_i, 3) || !set_pad(idx_i, TokenInputPadKind::NEG_ONE) || !set_ax(upd_i, 2)) {
+                        return false;
+                    }
+                } else {
+                    if (!set_ax(idx_i, -1) || !set_ax(upd_i, -1)) return false;
+                }
+                return true;
+            }
+            case CloudOpKind::ROPE: {
+                if (op.src_ids.size() < 2) return false;
+                size_t x_i = 0, pos_i = 0;
+                if (!lookup_idx(op.src_ids[0], &x_i) || !lookup_idx(op.src_ids[1], &pos_i)) return false;
+                if (op.src_ids.size() > 2 && op.src_ids[2] != 0) {
+                    size_t ff_i = 0;
+                    if (!lookup_idx(op.src_ids[2], &ff_i) || !set_ax(ff_i, -1)) return false;
+                }
+                if (is_1d_tokens(pos_i)) {
+                    if (vals[x_i].dims[1] != orig_tokens) return false;
+                    if (!set_ax(x_i, 1) || !set_ax(pos_i, 3) || !set_pad(pos_i, TokenInputPadKind::ZERO) ||
+                        !set_ax(dst_i, 1)) {
+                        return false;
+                    }
+                } else if (is_1d_scalar(pos_i)) {
+                    if (!set_ax(pos_i, -1)) return false;
+                    if (vals[x_i].ax != -2) {
+                        if (vals[x_i].ax == 1 || vals[x_i].ax == 3) return false;
+                        if (!set_ax(dst_i, vals[x_i].ax)) return false;
+                    }
+                    if (vals[dst_i].ax != -2) {
+                        if (vals[dst_i].ax == 1 || vals[dst_i].ax == 3) return false;
+                        if (!set_ax(x_i, vals[dst_i].ax)) return false;
+                    }
+                } else {
+                    return false;
+                }
+                return true;
+            }
+            case CloudOpKind::FLASH_ATTN_EXT: {
+                if (op.src_ids.size() < 3) return false;
+                size_t q_i = 0, k_i = 0, v_i = 0;
+                if (!lookup_idx(op.src_ids[0], &q_i) ||
+                    !lookup_idx(op.src_ids[1], &k_i) ||
+                    !lookup_idx(op.src_ids[2], &v_i)) {
+                    return false;
+                }
+                if (!set_ax(k_i, -1) || !set_ax(v_i, -1)) return false;
+                if (vals[q_i].dims[2] != orig_tokens) return false;
+                if (!set_ax(q_i, 2) || !set_ax(dst_i, 1)) return false;
+                if (op.src_ids.size() > 3 && op.src_ids[3] != 0) {
+                    size_t m_i = 0;
+                    if (!lookup_idx(op.src_ids[3], &m_i)) return false;
+                    if (!assign_attention_mask(m_i, 2)) return false;
+                }
+                return true;
+            }
+            case CloudOpKind::MUL_MAT: {
+                if (op.src_ids.size() < 2) return false;
+                size_t w_i = 0, x_i = 0;
+                if (!lookup_idx(op.src_ids[0], &w_i) || !lookup_idx(op.src_ids[1], &x_i)) return false;
+                if (!set_ax(w_i, -1)) return false;
+                if (vals[x_i].ax == 3 || vals[dst_i].ax == 3) return false;
+                if (vals[x_i].ax != -2) {
+                    const int tx = vals[x_i].ax;
+                    if ((tx == 0 || tx == 1) && vals[w_i].dims[tx] != 1) return false;
+                    if (!set_ax(dst_i, tx)) return false;
+                }
+                if (vals[dst_i].ax != -2) {
+                    const int td = vals[dst_i].ax;
+                    if ((td == 0 || td == 1) && vals[w_i].dims[td] != 1) return false;
+                    if (!set_ax(x_i, td)) return false;
+                }
+                if (allow_mm_seed && vals[x_i].ax == -2 && vals[dst_i].ax == -2 &&
+                    vals[x_i].dims[2] == orig_tokens) {
+                    if (!set_ax(x_i, 2) || !set_ax(dst_i, 2)) return false;
+                }
+                return true;
+            }
+            case CloudOpKind::RMS_NORM: {
+                if (op.src_ids.empty()) return false;
+                size_t x_i = 0;
+                if (!lookup_idx(op.src_ids[0], &x_i)) return false;
+                if (vals[x_i].ax == 3 || vals[dst_i].ax == 3) return false;
+                if (vals[x_i].ax != -2 && !set_ax(dst_i, vals[x_i].ax)) return false;
+                if (vals[dst_i].ax != -2 && !set_ax(x_i, vals[dst_i].ax)) return false;
+                return true;
+            }
+            case CloudOpKind::SILU:
+            case CloudOpKind::SCALE: {
+                if (op.src_ids.empty()) return false;
+                size_t x_i = 0;
+                if (!lookup_idx(op.src_ids[0], &x_i)) return false;
+                if (vals[x_i].ax != -2 && !set_ax(dst_i, vals[x_i].ax)) return false;
+                if (vals[dst_i].ax != -2 && !set_ax(x_i, vals[dst_i].ax)) return false;
+                return true;
+            }
+            case CloudOpKind::SWIGLU: {
+                if (op.src_ids.empty()) return false;
+                size_t a_i = 0;
+                if (!lookup_idx(op.src_ids[0], &a_i)) return false;
+                if (op.src_ids.size() < 2 || op.src_ids[1] == 0) {
+                    if (vals[a_i].ax == 3 || vals[dst_i].ax == 3) return false;
+                    if (vals[a_i].ax != -2 && !set_ax(dst_i, vals[a_i].ax)) return false;
+                    if (vals[dst_i].ax != -2 && !set_ax(a_i, vals[dst_i].ax)) return false;
+                } else {
+                    size_t b_i = 0;
+                    if (!lookup_idx(op.src_ids[1], &b_i)) return false;
+                    if (vals[a_i].ax != -2 && (!set_ax(b_i, vals[a_i].ax) || !set_ax(dst_i, vals[a_i].ax))) return false;
+                    if (vals[b_i].ax != -2 && (!set_ax(a_i, vals[b_i].ax) || !set_ax(dst_i, vals[b_i].ax))) return false;
+                    if (vals[dst_i].ax != -2 && (!set_ax(a_i, vals[dst_i].ax) || !set_ax(b_i, vals[dst_i].ax))) return false;
+                }
+                return true;
+            }
+            case CloudOpKind::ADD:
+            case CloudOpKind::MUL: {
+                if (op.src_ids.size() < 2) return false;
+                size_t a_i = 0, b_i = 0;
+                if (!lookup_idx(op.src_ids[0], &a_i) || !lookup_idx(op.src_ids[1], &b_i)) return false;
+                auto propagate_active_side = [&](size_t active_i, size_t other_i) -> bool {
+                    const int t_ax = vals[active_i].ax;
+                    if (!set_ax(dst_i, t_ax)) return false;
+                    if (vals[other_i].dims[t_ax] == 1 &&
+                        (orig_tokens > 1 || !vals[other_i].is_external || !vals[active_i].is_external)) {
+                        if (vals[other_i].ax == -2) {
+                            return set_ax(other_i, -1);
+                        }
+                        return vals[other_i].ax == -1;
+                    }
+                    if (vals[other_i].dims[t_ax] == orig_tokens && orig_tokens > 1) {
+                        return set_ax(other_i, t_ax);
+                    }
+                    return vals[other_i].dims[t_ax] == 1;
+                };
+                if (vals[a_i].ax >= 0 && !propagate_active_side(a_i, b_i)) return false;
+                if (vals[b_i].ax >= 0 && !propagate_active_side(b_i, a_i)) return false;
+                if (vals[a_i].ax == -1 && vals[b_i].ax == -1 && !set_ax(dst_i, -1)) return false;
+                if (vals[dst_i].ax >= 0) {
+                    const int td = vals[dst_i].ax;
+                    if (!set_ax(a_i, td)) return false;
+                    if (vals[b_i].dims[td] == 1 &&
+                        (orig_tokens > 1 || !vals[b_i].is_external || !vals[a_i].is_external)) {
+                        if (vals[b_i].ax == -2 && !set_ax(b_i, -1)) return false;
+                    } else if (vals[b_i].dims[td] == orig_tokens && orig_tokens > 1) {
+                        if (!set_ax(b_i, td)) return false;
+                    } else if (vals[b_i].dims[td] != 1) {
+                        return false;
+                    }
+                } else if (vals[dst_i].ax == -1) {
+                    if (!set_ax(a_i, -1) || !set_ax(b_i, -1)) return false;
+                }
+                return true;
+            }
+            case CloudOpKind::SOFT_MAX: {
+                if (op.src_ids.empty()) return false;
+                size_t x_i = 0;
+                if (!lookup_idx(op.src_ids[0], &x_i)) return false;
+                if (vals[x_i].ax == 3 || vals[dst_i].ax == 3) return false;
+                if (op.soft_max.max_bias > 0.0f && (vals[x_i].ax == 1 || vals[dst_i].ax == 1)) {
+                    note_reason("softmax_alibi_head_axis");
+                    return false;
+                }
+                if (vals[x_i].ax != -2 && !set_ax(dst_i, vals[x_i].ax)) return false;
+                if (vals[dst_i].ax != -2 && !set_ax(x_i, vals[dst_i].ax)) return false;
+                if (op.src_ids.size() > 1 && op.src_ids[1] != 0) {
+                    size_t m_i = 0;
+                    if (!lookup_idx(op.src_ids[1], &m_i)) return false;
+                    if (vals[x_i].ax >= 0) {
+                        if (!assign_attention_mask(m_i, vals[x_i].ax)) return false;
+                    } else if (vals[x_i].ax == -1) {
+                        if (!set_ax(m_i, -1)) return false;
+                    }
+                }
+                return true;
+            }
+            case CloudOpKind::CPY:
+            case CloudOpKind::RESHAPE: {
+                if (op.src_ids.empty()) return false;
+                size_t x_i = 0;
+                if (!lookup_idx(op.src_ids[0], &x_i)) return false;
+                const bool same_shape =
+                    (vals[x_i].dims[0] == vals[dst_i].dims[0] && vals[x_i].dims[1] == vals[dst_i].dims[1] &&
+                     vals[x_i].dims[2] == vals[dst_i].dims[2] && vals[x_i].dims[3] == vals[dst_i].dims[3]);
+                if (same_shape) {
+                    if (vals[x_i].ax != -2 && !set_ax(dst_i, vals[x_i].ax)) return false;
+                    if (vals[dst_i].ax != -2 && !set_ax(x_i, vals[dst_i].ax)) return false;
+                    return true;
+                }
+                if (vals[x_i].ax >= 0) {
+                    const int d_ax = map_token_axis_reshape(vals[x_i].dims, 4, vals[x_i].ax, vals[dst_i].dims, 4);
+                    if (d_ax < 0 || !set_ax(dst_i, d_ax)) return false;
+                } else if (vals[x_i].ax == -1) {
+                    if (!set_ax(dst_i, -1)) return false;
+                }
+                if (vals[dst_i].ax >= 0) {
+                    const int s_ax = map_token_axis_reshape(vals[dst_i].dims, 4, vals[dst_i].ax, vals[x_i].dims, 4);
+                    if (s_ax < 0 || !set_ax(x_i, s_ax)) return false;
+                } else if (vals[dst_i].ax == -1) {
+                    if (!set_ax(x_i, -1)) return false;
+                }
+                return true;
+            }
+            case CloudOpKind::TRANSPOSE: {
+                if (op.src_ids.empty()) return false;
+                size_t x_i = 0;
+                if (!lookup_idx(op.src_ids[0], &x_i)) return false;
+                if (vals[x_i].ax >= 0) {
+                    int d_ax = -1;
+                    for (int j = 0; j < 4; ++j) {
+                        if (op.perm[j] == vals[x_i].ax) {
+                            d_ax = j;
+                            break;
+                        }
+                    }
+                    if (d_ax < 0 || !set_ax(dst_i, d_ax)) return false;
+                } else if (vals[x_i].ax == -1) {
+                    if (!set_ax(dst_i, -1)) return false;
+                }
+                if (vals[dst_i].ax >= 0) {
+                    const int64_t p = op.perm[vals[dst_i].ax];
+                    if (p < 0 || p > 3 || !set_ax(x_i, static_cast<int>(p))) return false;
+                } else if (vals[dst_i].ax == -1) {
+                    if (!set_ax(x_i, -1)) return false;
+                }
+                return true;
+            }
+            case CloudOpKind::SLICE: {
+                if (op.src_ids.empty()) return false;
+                size_t x_i = 0;
+                if (!lookup_idx(op.src_ids[0], &x_i)) return false;
+                const int64_t* cur_dims = op.slice_reshape.empty() ? vals[x_i].dims : op.slice_reshape.data();
+                const size_t cur_rank = op.slice_reshape.empty() ? 4 : op.slice_reshape.size();
+                if (cur_rank == 0 || op.slice_starts.size() != cur_rank || op.slice_limits.size() != cur_rank) {
+                    return false;
+                }
+                std::vector<int64_t> sl_dims(cur_rank);
+                for (size_t r = 0; r < cur_rank; ++r) {
+                    sl_dims[r] = op.slice_limits[r] - op.slice_starts[r];
+                }
+                if (vals[x_i].ax >= 0) {
+                    const int cur_ax = op.slice_reshape.empty()
+                                           ? vals[x_i].ax
+                                           : map_token_axis_reshape(vals[x_i].dims, 4, vals[x_i].ax, cur_dims, cur_rank);
+                    if (cur_ax < 0) return false;
+                    const size_t uax = static_cast<size_t>(cur_ax);
+                    if (op.slice_starts[uax] != 0 || op.slice_limits[uax] != cur_dims[uax] ||
+                        cur_dims[uax] != orig_tokens) {
+                        return false;
+                    }
+                    const int d_ax = map_token_axis_reshape(sl_dims.data(), cur_rank, cur_ax, vals[dst_i].dims, 4);
+                    if (d_ax < 0 || !set_ax(dst_i, d_ax)) return false;
+                } else if (vals[x_i].ax == -1) {
+                    if (!set_ax(dst_i, -1)) return false;
+                }
+                if (vals[dst_i].ax >= 0) {
+                    const int cur_ax = map_token_axis_reshape(vals[dst_i].dims, 4, vals[dst_i].ax, sl_dims.data(), cur_rank);
+                    if (cur_ax < 0) return false;
+                    const size_t uax = static_cast<size_t>(cur_ax);
+                    if (op.slice_starts[uax] != 0 || op.slice_limits[uax] != cur_dims[uax] ||
+                        cur_dims[uax] != orig_tokens) {
+                        return false;
+                    }
+                    const int s_ax = op.slice_reshape.empty()
+                                         ? cur_ax
+                                         : map_token_axis_reshape(cur_dims, cur_rank, cur_ax, vals[x_i].dims, 4);
+                    if (s_ax < 0 || !set_ax(x_i, s_ax)) return false;
+                } else if (vals[dst_i].ax == -1) {
+                    if (!set_ax(x_i, -1)) return false;
+                }
+                return true;
+            }
+            case CloudOpKind::ALL_REDUCE_SUM: {
+                if (op.src_ids.empty()) return false;
+                size_t x_i = 0;
+                if (!lookup_idx(op.src_ids[0], &x_i)) return false;
+                if (vals[x_i].ax != -2 && !set_ax(dst_i, vals[x_i].ax)) return false;
+                if (vals[dst_i].ax != -2 && !set_ax(x_i, vals[dst_i].ax)) return false;
+                return true;
+            }
+            case CloudOpKind::ALL_GATHER:
+            case CloudOpKind::REDUCE_SCATTER_SUM: {
+                if (op.src_ids.empty()) return false;
+                size_t x_i = 0;
+                if (!lookup_idx(op.src_ids[0], &x_i)) return false;
+                if (vals[x_i].ax == op.collective_dim || vals[dst_i].ax == op.collective_dim) return false;
+                if (vals[x_i].ax != -2 && !set_ax(dst_i, vals[x_i].ax)) return false;
+                if (vals[dst_i].ax != -2 && !set_ax(x_i, vals[dst_i].ax)) return false;
+                return true;
+            }
+        }
+        return false;
+    };
+
+    auto op_fail_label = [&](size_t oi, const OpNodeSpec& op) -> std::string {
+        std::string r = "op=" + std::to_string(oi) + ":" + cloud_op_kind_name(op.kind);
+        if (!detail_reason.empty()) {
+            r += "(" + detail_reason + ")";
+        }
+        return r;
+    };
+
+    std::string fail_reason;
+    auto run_fixed_point = [&](bool seed_mm) -> bool {
+        const size_t max_iters = std::max<size_t>(4, spec.ops.size() * 2 + 4);
+        for (size_t iter = 0; iter < max_iters; ++iter) {
+            changed = false;
+            for (size_t oi = 0; oi < spec.ops.size(); ++oi) {
+                detail_reason.clear();
+                if (!propagate_op(spec.ops[oi], false)) {
+                    fail_reason = op_fail_label(oi, spec.ops[oi]);
+                    return false;
+                }
+            }
+            for (size_t ri = spec.ops.size(); ri-- > 0;) {
+                detail_reason.clear();
+                if (!propagate_op(spec.ops[ri], false)) {
+                    fail_reason = op_fail_label(ri, spec.ops[ri]);
+                    return false;
+                }
+            }
+            if (!changed) {
+                if (seed_mm) {
+                    bool seeded = false;
+                    for (size_t oi = 0; oi < spec.ops.size(); ++oi) {
+                        const OpNodeSpec& op = spec.ops[oi];
+                        if (op.kind != CloudOpKind::MUL_MAT || op.src_ids.size() < 2) continue;
+                        size_t x_i = 0, dst_i = 0;
+                        if (!lookup_idx(op.src_ids[1], &x_i) || !lookup_idx(op.dst.id, &dst_i)) {
+                            fail_reason = op_fail_label(oi, op);
+                            return false;
+                        }
+                        if (vals[x_i].ax == -2 && vals[dst_i].ax == -2 && vals[x_i].dims[2] == orig_tokens) {
+                            detail_reason.clear();
+                            if (!propagate_op(op, true)) {
+                                fail_reason = op_fail_label(oi, op);
+                                return false;
+                            }
+                            seeded = true;
+                            break;
+                        }
+                    }
+                    if (seeded) {
+                        continue;
+                    }
+                }
+                break;
+            }
+        }
+        return true;
+    };
+
+    if (!run_fixed_point(false)) {
+        return fail_with(fail_reason);
+    }
+    if (!run_fixed_point(true)) {
+        return fail_with(fail_reason);
+    }
+
+    // Finalize any remaining unassigned external inputs as batch-invariant, propagate once more,
+    // and then verify all op constraints cleanly.
+    for (ValInfo& vi : vals) {
+        if (vi.is_external && vi.ax == -2) {
+            vi.ax = -1;
+        }
+    }
+    if (!run_fixed_point(false)) {
+        return fail_with(fail_reason);
+    }
+    for (ValInfo& vi : vals) {
+        if (vi.ax == -2) {
+            vi.ax = -1;
+        }
+    }
+    for (size_t oi = 0; oi < spec.ops.size(); ++oi) {
+        detail_reason.clear();
+        if (!propagate_op(spec.ops[oi], false)) {
+            return fail_with(op_fail_label(oi, spec.ops[oi]));
+        }
+    }
+
+    bool any_token_varying = false;
+    for (const ValInfo& vi : vals) {
+        if (vi.ax >= 0) {
+            any_token_varying = true;
+            break;
+        }
+    }
+    if (!any_token_varying) {
+        return fail_with("no_token_varying_tensors");
+    }
+
+    out.input_token_axis.resize(spec.inputs.size(), -1);
+    out.input_pad_kind.resize(spec.inputs.size(), TokenInputPadKind::NONE);
+    for (size_t i = 0; i < spec.inputs.size(); ++i) {
+        const ValInfo& vi = vals[i];
+        if (vi.ax >= 0) {
+            const bool dim_ok = vi.allow_pre_padded
+                                    ? (vi.dims[vi.ax] >= orig_tokens && vi.dims[vi.ax] < bucket_tokens)
+                                    : (vi.dims[vi.ax] == orig_tokens);
+            if (!vi.is_dense || vi.is_donated || vi.sharding != TensorShardingKind::REPLICATED || !dim_ok) {
+                return fail_with("input_validation_failed");
+            }
+            const size_t elem_sz = pjrt_dtype_size(vi.dtype);
+            int64_t pdims[4] = {vi.dims[0], vi.dims[1], vi.dims[2], vi.dims[3]};
+            pdims[vi.ax] = bucket_tokens;
+            size_t orig_b = 0, padded_b = 0;
+            if (!checked_tensor_nbytes(vi.dims, elem_sz, &orig_b) ||
+                !checked_tensor_nbytes(pdims, elem_sz, &padded_b) ||
+                padded_b < orig_b) {
+                return fail_with("padded_size_overflow");
+            }
+            out.input_token_axis[i] = vi.ax;
+            out.input_pad_kind[i] = (vi.pad == TokenInputPadKind::NONE) ? TokenInputPadKind::ZERO : vi.pad;
+        } else if (vi.pad == TokenInputPadKind::NEG_ONE) {
+            return fail_with("neg_one_unbucketed_input");
+        }
+    }
+
+    const size_t n_in = spec.inputs.size();
+    out.op_dst_token_axis.resize(spec.ops.size(), -1);
+    for (size_t i = 0; i < spec.ops.size(); ++i) {
+        out.op_dst_token_axis[i] = vals[n_in + i].ax;
+    }
+
+    out.output_token_axis.resize(spec.output_ids.size(), -1);
+    for (size_t i = 0; i < spec.output_ids.size(); ++i) {
+        size_t idx = 0;
+        if (!lookup_idx(spec.output_ids[i], &idx)) {
+            return fail_with("missing_output_id");
+        }
+        const ValInfo& vo = vals[idx];
+        if (vo.ax >= 0) {
+            const size_t elem_sz = pjrt_dtype_size(vo.dtype);
+            int64_t pdims[4] = {vo.dims[0], vo.dims[1], vo.dims[2], vo.dims[3]};
+            pdims[vo.ax] = bucket_tokens;
+            size_t orig_b = 0, padded_b = 0;
+            if (!checked_tensor_nbytes(vo.dims, elem_sz, &orig_b) ||
+                !checked_tensor_nbytes(pdims, elem_sz, &padded_b) ||
+                padded_b < orig_b) {
+                return fail_with("padded_size_overflow");
+            }
+        }
+        out.output_token_axis[i] = vo.ax;
+    }
+
+    if (max_id <= 1048576ULL) {
+        out.id_token_axis.assign(static_cast<size_t>(max_id) + 1, -1);
+        for (const ValInfo& vi : vals) {
+            out.id_token_axis[static_cast<size_t>(vi.id)] = vi.ax;
+        }
+    }
+
+    out.orig_tokens = orig_tokens;
+    out.bucket_tokens = bucket_tokens;
+    out.success = true;
+    return out;
+}
+
+bool apply_program_batch_bucket(GraphProgramSpec& spec, const BucketAnalysisResult& plan) {
+    if (!plan.success || plan.bucket_tokens <= plan.orig_tokens ||
+        plan.input_token_axis.size() != spec.inputs.size() ||
+        plan.op_dst_token_axis.size() != spec.ops.size()) {
+        return false;
+    }
+    struct OrigShape {
+        int64_t dims[4];
+        int ax;
+    };
+    std::unordered_map<uint64_t, OrigShape> orig_map;
+    orig_map.reserve((spec.inputs.size() + spec.ops.size()) * 2 + 1);
+    for (size_t i = 0; i < spec.inputs.size(); ++i) {
+        OrigShape os;
+        for (int d = 0; d < 4; ++d) os.dims[d] = spec.inputs[i].dims[d];
+        os.ax = plan.input_token_axis[i];
+        orig_map[spec.inputs[i].id] = os;
+        if (os.ax >= 0) {
+            if (spec.inputs[i].dims[os.ax] < plan.orig_tokens ||
+                spec.inputs[i].dims[os.ax] >= plan.bucket_tokens) {
+                return false;
+            }
+            spec.inputs[i].dims[os.ax] = plan.bucket_tokens;
+        }
+    }
+    for (size_t i = 0; i < spec.ops.size(); ++i) {
+        OpNodeSpec& op = spec.ops[i];
+        OrigShape os;
+        for (int d = 0; d < 4; ++d) os.dims[d] = op.dst.dims[d];
+        os.ax = plan.op_dst_token_axis[i];
+        orig_map[op.dst.id] = os;
+        if (op.kind == CloudOpKind::SLICE && !op.src_ids.empty()) {
+            auto it = orig_map.find(op.src_ids[0]);
+            if (it == orig_map.end()) return false;
+            if (it->second.ax >= 0) {
+                if (!bucket_view_slice_dims(it->second.dims,
+                                            it->second.ax,
+                                            plan.orig_tokens,
+                                            plan.bucket_tokens,
+                                            op.slice_reshape,
+                                            op.slice_starts,
+                                            op.slice_limits)) {
+                    return false;
+                }
+            }
+        }
+        if (os.ax >= 0) {
+            if (op.dst.dims[os.ax] != plan.orig_tokens) return false;
+            op.dst.dims[os.ax] = plan.bucket_tokens;
+        }
+    }
+    return true;
+}
+
+void pad_dense_host_tensor(const void* src,
+                           void* dst,
+                           PjrtDType dtype,
+                           const int64_t orig_dims[4],
+                           const int64_t padded_dims[4],
+                           int token_axis,
+                           TokenInputPadKind pad_kind) {
+    const size_t elem_bytes = pjrt_dtype_size(dtype);
+    if (elem_bytes == 0 || token_axis < 0 || token_axis >= 4) {
+        throw std::invalid_argument("pad_dense_host_tensor: invalid dtype or token_axis");
+    }
+    const int64_t T = orig_dims[token_axis];
+    const int64_t B = padded_dims[token_axis];
+    if (T < 0 || B < T) {
+        throw std::invalid_argument("pad_dense_host_tensor: invalid token dims");
+    }
+    for (int d = 0; d < 4; ++d) {
+        if (d != token_axis && orig_dims[d] != padded_dims[d]) {
+            throw std::invalid_argument("pad_dense_host_tensor: non-token dim mismatch");
+        }
+    }
+    size_t orig_total_bytes = 0, padded_total_bytes = 0;
+    if (!checked_tensor_nbytes(orig_dims, elem_bytes, &orig_total_bytes) ||
+        !checked_tensor_nbytes(padded_dims, elem_bytes, &padded_total_bytes) ||
+        padded_total_bytes < orig_total_bytes) {
+        throw std::overflow_error("pad_dense_host_tensor: tensor byte size overflow");
+    }
+    size_t outer = 1;
+    for (int d = 0; d < token_axis; ++d) {
+        outer *= static_cast<size_t>(orig_dims[d]);
+    }
+    size_t inner = 1;
+    for (int d = token_axis + 1; d < 4; ++d) {
+        inner *= static_cast<size_t>(orig_dims[d]);
+    }
+    const size_t src_chunk_bytes = static_cast<size_t>(T) * inner * elem_bytes;
+    const size_t dst_chunk_bytes = static_cast<size_t>(B) * inner * elem_bytes;
+    const size_t pad_elems = static_cast<size_t>(B - T) * inner;
+    const size_t pad_bytes = pad_elems * elem_bytes;
+
+    const uint8_t* src_u8 = static_cast<const uint8_t*>(src);
+    uint8_t* dst_u8 = static_cast<uint8_t*>(dst);
+    for (size_t o = 0; o < outer; ++o) {
+        if (src_chunk_bytes > 0) {
+            if (src_u8 != nullptr) {
+                std::memcpy(dst_u8 + o * dst_chunk_bytes, src_u8 + o * src_chunk_bytes, src_chunk_bytes);
+            } else {
+                std::memset(dst_u8 + o * dst_chunk_bytes, 0, src_chunk_bytes);
+            }
+        }
+        uint8_t* pad_ptr = dst_u8 + o * dst_chunk_bytes + src_chunk_bytes;
+        if (pad_bytes == 0) {
+            continue;
+        }
+        if (pad_kind == TokenInputPadKind::NEG_ONE) {
+            if (dtype == PjrtDType::S32) {
+                const int32_t v = -1;
+                for (size_t i = 0; i < pad_elems; ++i) {
+                    std::memcpy(pad_ptr + i * sizeof(int32_t), &v, sizeof(int32_t));
+                }
+            } else if (dtype == PjrtDType::S64) {
+                const int64_t v = -1;
+                for (size_t i = 0; i < pad_elems; ++i) {
+                    std::memcpy(pad_ptr + i * sizeof(int64_t), &v, sizeof(int64_t));
+                }
+            } else {
+                throw std::invalid_argument("pad_dense_host_tensor: NEG_ONE requires S32 or S64");
+            }
+        } else {
+            std::memset(pad_ptr, 0, pad_bytes);
+        }
+    }
+}
+
+void slice_dense_host_tensor(const void* src,
+                             void* dst,
+                             size_t elem_bytes,
+                             const int64_t padded_dims[4],
+                             const int64_t logical_dims[4],
+                             int token_axis) {
+    if (elem_bytes == 0 || token_axis < 0 || token_axis >= 4) {
+        throw std::invalid_argument("slice_dense_host_tensor: invalid elem_bytes or token_axis");
+    }
+    const int64_t T = logical_dims[token_axis];
+    const int64_t B = padded_dims[token_axis];
+    if (T < 0 || B < T) {
+        throw std::invalid_argument("slice_dense_host_tensor: invalid token dims");
+    }
+    for (int d = 0; d < 4; ++d) {
+        if (d != token_axis && padded_dims[d] != logical_dims[d]) {
+            throw std::invalid_argument("slice_dense_host_tensor: non-token dim mismatch");
+        }
+    }
+    size_t padded_total_bytes = 0, logical_total_bytes = 0;
+    if (!checked_tensor_nbytes(padded_dims, elem_bytes, &padded_total_bytes) ||
+        !checked_tensor_nbytes(logical_dims, elem_bytes, &logical_total_bytes) ||
+        padded_total_bytes < logical_total_bytes) {
+        throw std::overflow_error("slice_dense_host_tensor: tensor byte size overflow");
+    }
+    size_t outer = 1;
+    for (int d = 0; d < token_axis; ++d) {
+        outer *= static_cast<size_t>(logical_dims[d]);
+    }
+    size_t inner = 1;
+    for (int d = token_axis + 1; d < 4; ++d) {
+        inner *= static_cast<size_t>(logical_dims[d]);
+    }
+    const size_t src_chunk_bytes = static_cast<size_t>(B) * inner * elem_bytes;
+    const size_t dst_chunk_bytes = static_cast<size_t>(T) * inner * elem_bytes;
+    const uint8_t* src_u8 = static_cast<const uint8_t*>(src);
+    uint8_t* dst_u8 = static_cast<uint8_t*>(dst);
+    for (size_t o = 0; o < outer; ++o) {
+        if (dst_chunk_bytes > 0) {
+            std::memcpy(dst_u8 + o * dst_chunk_bytes, src_u8 + o * src_chunk_bytes, dst_chunk_bytes);
+        }
+    }
 }
 
 }  // namespace cloudtpu

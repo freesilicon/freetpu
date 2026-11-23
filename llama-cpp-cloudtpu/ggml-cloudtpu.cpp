@@ -27,23 +27,34 @@ namespace {
 
 constexpr size_t CLOUDTPU_BUFFER_ALIGNMENT = 64;
 
+enum class CloudTpuQ4Mode {
+    I4 = 0,       // Direct PJRT_Buffer_Type_S4 (or U4 for Q4_K) -> stablehlo.convert -> single dot
+    BITCAST = 1,  // Packed U8 [..., 32, N/2] -> stablehlo.bitcast_convert -> i4 -> single dot
+    SPLIT = 2,    // M4C split-X U8 [..., 16, N] two-dot
+    CONCAT = 3,   // M4C U8 [..., 16, N] single concat dot
+};
+
 struct cloudtpu_env_config {
     bool mock_mode = false;
     int mock_devices = 1;
     int spmd_chips = 1;       // 1 = default per-chip devices, 0 = opt-in auto (all rt.device_count()), >1 = explicit SPMD chip count
     int spmd_min_rows = 256;  // Minimum weight rows/cols to shard across SPMD chips
-    int max_fuse_ops = 512;   // Max ops per fused StableHLO subgraph
+    int max_fuse_ops = 4096;  // Max ops per fused StableHLO subgraph
     int verbose = 0;
     bool fuse_graphs = true;
-    bool fuse_attn = false;         // Fuse FLASH_ATTN_EXT with following O_proj/FFN ops
+    bool fuse_attn = true;          // Fuse FLASH_ATTN_EXT with following O_proj/FFN ops
     bool donate_kv = true;          // Donate KV cache HBM buffers in-place on SET_ROWS
     bool bf16_matmul = true;        // Cast split-quantized weights & activations to BF16 for MXU (dense F16/F32 stay F32)
     bool bf16_flash_attn = false;   // Opt-in BF16 Q/K/probs/V matmuls in FLASH_ATTN_EXT (default false: F32 parity)
-    bool q4_split_dot = true;       // Q4_0/Q4_K: true = split-X two-dot (zero concat); false = single concat dot
-    bool q4k_bf16_scales = false;   // Optional BF16 Q4_K/Q6_K scales (default off: F32 scales +9% faster on v5e-1)
+    CloudTpuQ4Mode q4_mode = CloudTpuQ4Mode::I4;  // Single-read S4/U4 default (overridden by CLOUDTPU_Q4_MODE / CLOUDTPU_Q4_SPLIT_DOT)
+    bool q4_split_dot = true;       // Q4_0/Q4_K SPLIT vs CONCAT selection when q4_mode is SPLIT/CONCAT
+    bool q4k_u4 = false;            // Q4_K I4/BITCAST: false = signed S4 (q-8, unshifted m_eff), true = U4 (0..15)
+    bool q4k_bf16_scales = false;   // Opt-in hardware BF16 Q4_K/Q6_K scales (default false: full F32 scale precision for GET_ROWS parity)
+    int32_t mm_pad_m = 8;           // Pad small BF16 Q4_*_I4/Q6_K_SPLIT M < mm_pad_m up to mm_pad_m for MXU (<=1 disables)
     bool async_collectives = false; // Opt-in LIBTPU_INIT_ARGS TPU async collective overlap flags before libtpu init
     uint32_t cache_cap = 4096;
     uint64_t min_elements = 0;
+    std::vector<int64_t> batch_buckets = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512};  // Padded n_tokens buckets
     std::string libtpu_path;
 };
 
@@ -81,8 +92,8 @@ static cloudtpu_env_config load_env_config() {
     }
     if (const char* v = std::getenv("CLOUDTPU_MAX_FUSE_OPS")) {
         const int parsed = std::atoi(v);
-        if (parsed >= 1 && parsed <= 2048) {
-            cfg.max_fuse_ops = parsed;
+        if (parsed >= 1) {
+            cfg.max_fuse_ops = std::min(parsed, 16384);
         }
     }
     if (const char* v = std::getenv("CLOUDTPU_VERBOSE")) {
@@ -105,9 +116,34 @@ static cloudtpu_env_config load_env_config() {
     }
     if (const char* v = std::getenv("CLOUDTPU_Q4_SPLIT_DOT")) {
         cfg.q4_split_dot = (std::atoi(v) != 0);
+        cfg.q4_mode = cfg.q4_split_dot ? CloudTpuQ4Mode::SPLIT : CloudTpuQ4Mode::CONCAT;
+    }
+    if (const char* v = std::getenv("CLOUDTPU_Q4_MODE")) {
+        if (std::strcmp(v, "i4") == 0 || std::strcmp(v, "s4") == 0) {
+            cfg.q4_mode = CloudTpuQ4Mode::I4;
+            cfg.q4k_u4 = false;
+        } else if (std::strcmp(v, "u4") == 0) {
+            cfg.q4_mode = CloudTpuQ4Mode::I4;
+            cfg.q4k_u4 = true;
+        } else if (std::strcmp(v, "bitcast") == 0) {
+            cfg.q4_mode = CloudTpuQ4Mode::BITCAST;
+        } else if (std::strcmp(v, "split") == 0) {
+            cfg.q4_mode = CloudTpuQ4Mode::SPLIT;
+            cfg.q4_split_dot = true;
+        } else if (std::strcmp(v, "concat") == 0) {
+            cfg.q4_mode = CloudTpuQ4Mode::CONCAT;
+            cfg.q4_split_dot = false;
+        }
+    }
+    if (const char* v = std::getenv("CLOUDTPU_Q4K_U4")) {
+        cfg.q4k_u4 = (std::atoi(v) != 0);
     }
     if (const char* v = std::getenv("CLOUDTPU_Q4K_BF16_SCALES")) {
         cfg.q4k_bf16_scales = (std::atoi(v) != 0);
+    }
+    if (const char* v = std::getenv("CLOUDTPU_MM_PAD_M")) {
+        const int parsed = std::atoi(v);
+        cfg.mm_pad_m = (parsed <= 1) ? 1 : parsed;
     }
     if (const char* v = std::getenv("CLOUDTPU_ASYNC_COLLECTIVES")) {
         cfg.async_collectives = (std::atoi(v) != 0);
@@ -123,6 +159,9 @@ static cloudtpu_env_config load_env_config() {
         if (parsed > 0) {
             cfg.min_elements = static_cast<uint64_t>(parsed);
         }
+    }
+    if (const char* v = std::getenv("CLOUDTPU_BATCH_BUCKETS")) {
+        cfg.batch_buckets = cloudtpu::parse_batch_buckets(v);
     }
     if (const char* v = std::getenv("LIBTPU_PATH")) {
         cfg.libtpu_path = v;
@@ -519,7 +558,10 @@ struct CloudTpuTensorSlot {
     cloudtpu::TensorShardingKind sharding = cloudtpu::TensorShardingKind::REPLICATED;
     cloudtpu::PjrtDType dtype = cloudtpu::PjrtDType::F32;
     cloudtpu::PjrtDType scale_dtype = cloudtpu::PjrtDType::INVALID;
-    int64_t dims[4] = {1, 1, 1, 1};
+    cloudtpu::PjrtDType bitcast_target = cloudtpu::PjrtDType::S4;
+    int64_t dims[4] = {1, 1, 1, 1};      // Logical shape [ne3, ne2, ne1, ne0]
+    int64_t hbm_dims[4] = {1, 1, 1, 1};  // Physical HBM shape (padded along hbm_token_axis when >= 0)
+    int hbm_token_axis = -1;             // -1 = unpadded; 0..3 = token axis padded on HBM
     // Single-chip: size() == 1 (on device_index). Multi-chip SPMD: size() == spmd_chips (devices 0..P-1).
     std::vector<cloudtpu::PjrtBufferPtr> hbm_primary;
     std::vector<cloudtpu::PjrtBufferPtr> hbm_scales;
@@ -549,6 +591,8 @@ struct ggml_backend_cloudtpu_buffer_context {
     int spmd_chips = 1;
     int spmd_min_rows = 256;
     bool q4k_bf16_scales = false;
+    CloudTpuQ4Mode q4_mode = CloudTpuQ4Mode::I4;
+    bool q4k_u4 = false;
     uintptr_t virtual_base = 0;
     size_t size = 0;
     uint8_t clear_value = 0;
@@ -802,10 +846,309 @@ static bool is_replicated_cache_or_mask_name(const char* name) {
            std::strstr(name, "_state_") != nullptr;
 }
 
+struct Q4SlotPlan {
+    cloudtpu::TensorStorageKind storage = cloudtpu::TensorStorageKind::DENSE;
+    cloudtpu::PjrtDType q_dtype = cloudtpu::PjrtDType::U8;
+    cloudtpu::PjrtDType bitcast_target = cloudtpu::PjrtDType::S4;
+};
+
+static inline void write_nibble_4bit(uint8_t* dst_packed, size_t idx, uint8_t val4) {
+    const size_t bi = idx >> 1;
+    const uint8_t nib = val4 & 0x0FU;
+    if ((idx & 1U) == 0U) {
+        dst_packed[bi] = static_cast<uint8_t>((dst_packed[bi] & 0xF0U) | nib);
+    } else {
+        dst_packed[bi] = static_cast<uint8_t>((dst_packed[bi] & 0x0FU) | (nib << 4));
+    }
+}
+
+static inline uint8_t read_nibble_4bit(const uint8_t* src_packed, size_t idx) {
+    const uint8_t b = src_packed[idx >> 1];
+    return ((idx & 1U) == 0U) ? (b & 0x0FU) : ((b >> 4) & 0x0FU);
+}
+
+static Q4SlotPlan resolve_q4_slot_plan(enum ggml_type t,
+                                        int64_t K,
+                                        int64_t N,
+                                        int spmd_chips,
+                                        cloudtpu::TensorShardingKind sh,
+                                        CloudTpuQ4Mode q4_mode,
+                                        bool q4k_u4) {
+    Q4SlotPlan plan;
+    if (t == GGML_TYPE_Q4_0) {
+        if ((K % QK4_0) != 0) {
+            return plan;
+        }
+        const int64_t n_local = (spmd_chips > 1 && sh == cloudtpu::TensorShardingKind::SHARD_N) ? (N / spmd_chips) : N;
+        if (q4_mode == CloudTpuQ4Mode::I4) {
+            plan.storage = cloudtpu::TensorStorageKind::Q4_0_I4;
+            plan.q_dtype = cloudtpu::PjrtDType::S4;
+            plan.bitcast_target = cloudtpu::PjrtDType::S4;
+            return plan;
+        }
+        if (q4_mode == CloudTpuQ4Mode::BITCAST && (n_local % 2) == 0) {
+            plan.storage = cloudtpu::TensorStorageKind::Q4_0_I4;
+            plan.q_dtype = cloudtpu::PjrtDType::U8;
+            plan.bitcast_target = cloudtpu::PjrtDType::S4;
+            return plan;
+        }
+        plan.storage = cloudtpu::TensorStorageKind::Q4_0_SPLIT;
+        plan.q_dtype = cloudtpu::PjrtDType::U8;
+        return plan;
+    }
+    if (t == GGML_TYPE_Q4_K) {
+        if ((K % QK_K) != 0) {
+            return plan;
+        }
+        const int64_t n_local = (spmd_chips > 1 && sh == cloudtpu::TensorShardingKind::SHARD_N) ? (N / spmd_chips) : N;
+        const cloudtpu::PjrtDType target4 = q4k_u4 ? cloudtpu::PjrtDType::U4 : cloudtpu::PjrtDType::S4;
+        if (q4_mode == CloudTpuQ4Mode::I4) {
+            plan.storage = cloudtpu::TensorStorageKind::Q4_K_I4;
+            plan.q_dtype = target4;
+            plan.bitcast_target = target4;
+            return plan;
+        }
+        if (q4_mode == CloudTpuQ4Mode::BITCAST && (n_local % 2) == 0) {
+            plan.storage = cloudtpu::TensorStorageKind::Q4_K_I4;
+            plan.q_dtype = cloudtpu::PjrtDType::U8;
+            plan.bitcast_target = target4;
+            return plan;
+        }
+        plan.storage = cloudtpu::TensorStorageKind::Q4_K_SPLIT;
+        plan.q_dtype = cloudtpu::PjrtDType::U8;
+        return plan;
+    }
+    return plan;
+}
+
+static inline uint8_t encode_q4_host_elem(uint8_t u4_nib, bool use_s4) {
+    const uint8_t u = u4_nib & 0x0FU;
+    return use_s4 ? static_cast<uint8_t>(static_cast<int8_t>(static_cast<int>(u) - 8)) : u;
+}
+
+static void unpack_q4_0_to_i4(const block_q4_0* src,
+                               size_t B,
+                               size_t N,
+                               size_t nb,
+                               bool use_s4,
+                               bool packed_nibbles,
+                               std::vector<uint8_t>& out_qs,
+                               std::vector<uint16_t>& out_d_km) {
+    out_d_km.resize(B * nb * N);
+    const size_t total_elems = B * nb * QK4_0 * N;
+    out_qs.assign(packed_nibbles ? cloudtpu::pjrt_dtype_nbytes(cloudtpu::PjrtDType::S4, total_elems) : total_elems, 0);
+    const uint8_t xor_mask = use_s4 ? 0x08U : 0x00U;
+
+    for (size_t b = 0; b < B; ++b) {
+        for (size_t n = 0; n < N; ++n) {
+            const block_q4_0* row = src + (b * N + n) * nb;
+            for (size_t blk = 0; blk < nb; ++blk) {
+                std::memcpy(&out_d_km[(b * nb + blk) * N + n], &row[blk].d, sizeof(uint16_t));
+            }
+        }
+        if (!packed_nibbles) {
+            for (size_t blk = 0; blk < nb; ++blk) {
+                for (size_t n = 0; n < N; ++n) {
+                    const uint8_t* sq = src[((b * N + n) * nb) + blk].qs;
+                    for (size_t j = 0; j < QK4_0 / 2; ++j) {
+                        const uint8_t byte = sq[j];
+                        out_qs[((b * nb + blk) * QK4_0 + j) * N + n] = encode_q4_host_elem(byte & 0x0FU, use_s4);
+                        out_qs[((b * nb + blk) * QK4_0 + (j + 16)) * N + n] = encode_q4_host_elem(byte >> 4, use_s4);
+                    }
+                }
+            }
+        } else if ((N & 1U) == 0U) {
+            const size_t n_half = N / 2;
+            for (size_t blk = 0; blk < nb; ++blk) {
+                for (size_t j = 0; j < QK4_0 / 2; ++j) {
+                    uint8_t* dst_lo = out_qs.data() + (((b * nb + blk) * QK4_0 + j) * n_half);
+                    uint8_t* dst_hi = out_qs.data() + (((b * nb + blk) * QK4_0 + (j + 16)) * n_half);
+                    for (size_t nh = 0; nh < n_half; ++nh) {
+                        const uint8_t b0 = src[((b * N + (2 * nh + 0)) * nb) + blk].qs[j];
+                        const uint8_t b1 = src[((b * N + (2 * nh + 1)) * nb) + blk].qs[j];
+                        dst_lo[nh] = static_cast<uint8_t>(((b0 & 0x0FU) ^ xor_mask) | (((b1 & 0x0FU) ^ xor_mask) << 4));
+                        dst_hi[nh] = static_cast<uint8_t>((((b0 >> 4) & 0x0FU) ^ xor_mask) | ((((b1 >> 4) & 0x0FU) ^ xor_mask) << 4));
+                    }
+                }
+            }
+        } else {
+            for (size_t blk = 0; blk < nb; ++blk) {
+                for (size_t n = 0; n < N; ++n) {
+                    const uint8_t* sq = src[((b * N + n) * nb) + blk].qs;
+                    for (size_t j = 0; j < QK4_0 / 2; ++j) {
+                        const uint8_t byte = sq[j];
+                        const size_t idx_lo = (((b * nb + blk) * QK4_0 + j) * N + n);
+                        const size_t idx_hi = (((b * nb + blk) * QK4_0 + (j + 16)) * N + n);
+                        write_nibble_4bit(out_qs.data(), idx_lo, (byte & 0x0FU) ^ xor_mask);
+                        write_nibble_4bit(out_qs.data(), idx_hi, ((byte >> 4) & 0x0FU) ^ xor_mask);
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void pack_i4_to_q4_0(const uint8_t* qs_km,
+                               const uint16_t* d_km,
+                               size_t B,
+                               size_t N,
+                               size_t nb,
+                               bool use_s4,
+                               bool packed_nibbles,
+                               block_q4_0* dst) {
+    const uint8_t xor_mask = use_s4 ? 0x08U : 0x00U;
+    for (size_t b = 0; b < B; ++b) {
+        for (size_t n = 0; n < N; ++n) {
+            block_q4_0* row = dst + (b * N + n) * nb;
+            for (size_t blk = 0; blk < nb; ++blk) {
+                std::memcpy(&row[blk].d, &d_km[(b * nb + blk) * N + n], sizeof(uint16_t));
+                for (size_t j = 0; j < QK4_0 / 2; ++j) {
+                    const size_t idx_lo = (((b * nb + blk) * QK4_0 + j) * N + n);
+                    const size_t idx_hi = (((b * nb + blk) * QK4_0 + (j + 16)) * N + n);
+                    const uint8_t raw_lo = packed_nibbles ? read_nibble_4bit(qs_km, idx_lo) : (qs_km[idx_lo] & 0x0FU);
+                    const uint8_t raw_hi = packed_nibbles ? read_nibble_4bit(qs_km, idx_hi) : (qs_km[idx_hi] & 0x0FU);
+                    const uint8_t lo = raw_lo ^ xor_mask;
+                    const uint8_t hi = raw_hi ^ xor_mask;
+                    row[blk].qs[j] = static_cast<uint8_t>((lo & 0x0FU) | ((hi & 0x0FU) << 4));
+                }
+            }
+        }
+    }
+}
+
+static void unpack_q4_K_to_i4(const block_q4_K* src,
+                               size_t B,
+                               size_t N,
+                               size_t nb_k,
+                               bool use_s4,
+                               bool packed_nibbles,
+                               std::vector<uint8_t>& out_qs,
+                               std::vector<float>& out_d_km,
+                               std::vector<float>& out_m_km) {
+    const size_t nb32 = nb_k * 8;
+    out_d_km.resize(B * nb32 * N);
+    out_m_km.resize(B * nb32 * N);
+    const size_t total_elems = B * nb32 * 32 * N;
+    out_qs.assign(packed_nibbles ? cloudtpu::pjrt_dtype_nbytes(cloudtpu::PjrtDType::S4, total_elems) : total_elems, 0);
+    const uint8_t xor_mask = use_s4 ? 0x08U : 0x00U;
+
+    for (size_t b = 0; b < B; ++b) {
+        for (size_t n = 0; n < N; ++n) {
+            const block_q4_K* row = src + (b * N + n) * nb_k;
+            for (size_t bk = 0; bk < nb_k; ++bk) {
+                uint16_t d16 = 0, dmin16 = 0;
+                const auto* raw_blk = reinterpret_cast<const uint8_t*>(&row[bk]);
+                std::memcpy(&d16, raw_blk + 0, sizeof(uint16_t));
+                std::memcpy(&dmin16, raw_blk + 2, sizeof(uint16_t));
+                const float d = cloudtpu::f16_to_f32(d16);
+                const float dmin = cloudtpu::f16_to_f32(dmin16);
+                for (int is = 0; is < 8; ++is) {
+                    uint8_t sc = 0, m = 0;
+                    get_scale_min_k4_local(is, row[bk].scales, &sc, &m);
+                    const float de = d * static_cast<float>(sc);
+                    const float me = -(dmin * static_cast<float>(m));
+                    const size_t sub = bk * 8 + static_cast<size_t>(is);
+                    out_d_km[(b * nb32 + sub) * N + n] = de;
+                    out_m_km[(b * nb32 + sub) * N + n] = me;
+                }
+            }
+        }
+        if (!packed_nibbles) {
+            for (size_t bk = 0; bk < nb_k; ++bk) {
+                for (size_t n = 0; n < N; ++n) {
+                    const uint8_t* sq = src[((b * N + n) * nb_k) + bk].qs;
+                    for (int g = 0; g < 4; ++g) {
+                        const size_t sub0 = bk * 8 + static_cast<size_t>(2 * g + 0);
+                        const size_t sub1 = bk * 8 + static_cast<size_t>(2 * g + 1);
+                        for (int l = 0; l < 32; ++l) {
+                            const uint8_t q = sq[32 * g + l];
+                            out_qs[((b * nb32 + sub0) * 32 + static_cast<size_t>(l)) * N + n] =
+                                encode_q4_host_elem(q & 0x0FU, use_s4);
+                            out_qs[((b * nb32 + sub1) * 32 + static_cast<size_t>(l)) * N + n] =
+                                encode_q4_host_elem(q >> 4, use_s4);
+                        }
+                    }
+                }
+            }
+        } else if ((N & 1U) == 0U) {
+            const size_t n_half = N / 2;
+            for (size_t bk = 0; bk < nb_k; ++bk) {
+                for (int g = 0; g < 4; ++g) {
+                    const size_t sub0 = bk * 8 + static_cast<size_t>(2 * g + 0);
+                    const size_t sub1 = bk * 8 + static_cast<size_t>(2 * g + 1);
+                    for (int l = 0; l < 32; ++l) {
+                        uint8_t* dst0 = out_qs.data() + (((b * nb32 + sub0) * 32 + static_cast<size_t>(l)) * n_half);
+                        uint8_t* dst1 = out_qs.data() + (((b * nb32 + sub1) * 32 + static_cast<size_t>(l)) * n_half);
+                        for (size_t nh = 0; nh < n_half; ++nh) {
+                            const uint8_t q0 = src[((b * N + (2 * nh + 0)) * nb_k) + bk].qs[32 * g + l];
+                            const uint8_t q1 = src[((b * N + (2 * nh + 1)) * nb_k) + bk].qs[32 * g + l];
+                            dst0[nh] = static_cast<uint8_t>(((q0 & 0x0FU) ^ xor_mask) | (((q1 & 0x0FU) ^ xor_mask) << 4));
+                            dst1[nh] = static_cast<uint8_t>((((q0 >> 4) & 0x0FU) ^ xor_mask) | ((((q1 >> 4) & 0x0FU) ^ xor_mask) << 4));
+                        }
+                    }
+                }
+            }
+        } else {
+            for (size_t bk = 0; bk < nb_k; ++bk) {
+                for (size_t n = 0; n < N; ++n) {
+                    const uint8_t* sq = src[((b * N + n) * nb_k) + bk].qs;
+                    for (int g = 0; g < 4; ++g) {
+                        const size_t sub0 = bk * 8 + static_cast<size_t>(2 * g + 0);
+                        const size_t sub1 = bk * 8 + static_cast<size_t>(2 * g + 1);
+                        for (int l = 0; l < 32; ++l) {
+                            const uint8_t q = sq[32 * g + l];
+                            const size_t idx0 = (((b * nb32 + sub0) * 32 + static_cast<size_t>(l)) * N + n);
+                            const size_t idx1 = (((b * nb32 + sub1) * 32 + static_cast<size_t>(l)) * N + n);
+                            write_nibble_4bit(out_qs.data(), idx0, (q & 0x0FU) ^ xor_mask);
+                            write_nibble_4bit(out_qs.data(), idx1, ((q >> 4) & 0x0FU) ^ xor_mask);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void pack_i4_to_q4_K(const uint8_t* qs_km,
+                               const uint8_t* meta,
+                               size_t B,
+                               size_t N,
+                               size_t nb_k,
+                               bool use_s4,
+                               bool packed_nibbles,
+                               block_q4_K* dst) {
+    const size_t nb32 = nb_k * 8;
+    const uint8_t xor_mask = use_s4 ? 0x08U : 0x00U;
+    for (size_t b = 0; b < B; ++b) {
+        for (size_t n = 0; n < N; ++n) {
+            const size_t row_blk_base = (b * N + n) * nb_k;
+            for (size_t bk = 0; bk < nb_k; ++bk) {
+                const size_t bi = row_blk_base + bk;
+                std::memcpy(reinterpret_cast<uint8_t*>(&dst[bi]), meta + bi * 16, 16);
+                uint8_t* q = dst[bi].qs;
+                for (int g = 0; g < 4; ++g) {
+                    const size_t sub0 = bk * 8 + static_cast<size_t>(2 * g + 0);
+                    const size_t sub1 = bk * 8 + static_cast<size_t>(2 * g + 1);
+                    for (int l = 0; l < 32; ++l) {
+                        const size_t idx0 = (((b * nb32 + sub0) * 32 + static_cast<size_t>(l)) * N + n);
+                        const size_t idx1 = (((b * nb32 + sub1) * 32 + static_cast<size_t>(l)) * N + n);
+                        const uint8_t raw0 = packed_nibbles ? read_nibble_4bit(qs_km, idx0) : (qs_km[idx0] & 0x0FU);
+                        const uint8_t raw1 = packed_nibbles ? read_nibble_4bit(qs_km, idx1) : (qs_km[idx1] & 0x0FU);
+                        const uint8_t v0 = raw0 ^ xor_mask;
+                        const uint8_t v1 = raw1 ^ xor_mask;
+                        q[32 * g + l] = static_cast<uint8_t>((v0 & 0x0FU) | ((v1 & 0x0FU) << 4));
+                    }
+                }
+            }
+        }
+    }
+}
+
 static cloudtpu::TensorShardingKind choose_upload_sharding(const struct ggml_tensor* tensor,
                                                            int spmd_chips,
                                                            int spmd_min_rows,
-                                                           bool allow_sharding) {
+                                                           bool allow_sharding,
+                                                           CloudTpuQ4Mode q4_mode = CloudTpuQ4Mode::SPLIT) {
     if (!allow_sharding || spmd_chips <= 1 || !tensor || tensor->view_src != nullptr) {
         return cloudtpu::TensorShardingKind::REPLICATED;
     }
@@ -832,6 +1175,12 @@ static cloudtpu::TensorShardingKind choose_upload_sharding(const struct ggml_ten
     if (is_q && (K % q_align) != 0) {
         return cloudtpu::TensorShardingKind::REPLICATED;
     }
+    // Packed U8 bitcast mode stores two rows per byte and requires an even per-chip N;
+    // native S4/U4 mode transfers 1 host byte/element and supports arbitrary odd per-chip N.
+    const bool is_q4_bitcast =
+        (tensor->type == GGML_TYPE_Q4_0 || tensor->type == GGML_TYPE_Q4_K) &&
+        (q4_mode == CloudTpuQ4Mode::BITCAST);
+    const int64_t n_align = is_q4_bitcast ? (static_cast<int64_t>(spmd_chips) * 2) : static_cast<int64_t>(spmd_chips);
     // Prefer SHARD_K for row-parallel FFN down projections and embedding tables (enables 1-collective
     // Megatron-LM FFN and low-comm sharded GET_ROWS); use SHARD_N for all other large 2D weights.
     const bool prefer_k = (tensor->name[0] != '\0') &&
@@ -840,7 +1189,7 @@ static cloudtpu::TensorShardingKind choose_upload_sharding(const struct ggml_ten
     if (prefer_k && K >= spmd_min_rows && (K % (static_cast<int64_t>(spmd_chips) * q_align)) == 0) {
         return cloudtpu::TensorShardingKind::SHARD_K;
     }
-    if (N >= spmd_min_rows && (N % spmd_chips) == 0) {
+    if (N >= spmd_min_rows && (N % n_align) == 0) {
         return cloudtpu::TensorShardingKind::SHARD_N;
     }
     if (K >= spmd_min_rows && (K % (static_cast<int64_t>(spmd_chips) * q_align)) == 0) {
@@ -902,7 +1251,8 @@ static std::vector<cloudtpu::PjrtBufferPtr> upload_sharded_part(cloudtpu::PjrtRu
     const int ax = (shard_axis >= 0) ? shard_axis
                                      : ((sharding == cloudtpu::TensorShardingKind::SHARD_N) ? 2 : 3);
     const uint8_t* raw = static_cast<const uint8_t*>(data);
-    const size_t elem_sz = cloudtpu::pjrt_dtype_size(dtype);
+    // OpenXLA PJRT BufferFromHostBuffer(byte_strides=nullptr) reads 1 byte per element for S4/U4.
+    const size_t elem_sz = cloudtpu::pjrt_host_nbytes(dtype, 1);
     std::vector<int64_t> local_dims = global_dims;
     const int64_t ax_full = global_dims[static_cast<size_t>(ax)];
     const int64_t ax_local = ax_full / spmd_chips;
@@ -964,7 +1314,7 @@ static void download_sharded_part(cloudtpu::PjrtRuntime& rt,
     for (size_t i = static_cast<size_t>(ax) + 1; i < ldims.size(); ++i) {
         inner_elems *= static_cast<size_t>(ldims[i]);
     }
-    const size_t elem_sz = cloudtpu::pjrt_dtype_size(bufs[0]->dtype);
+    const size_t elem_sz = cloudtpu::pjrt_host_nbytes(bufs[0]->dtype, 1);
     const size_t local_chunk_bytes = static_cast<size_t>(ldims[static_cast<size_t>(ax)]) * inner_elems * elem_sz;
     if (outer_elems == 1) {
         for (size_t p = 0; p < P; ++p) {
@@ -994,12 +1344,19 @@ static void upload_raw_tensor_to_slot(cloudtpu::PjrtRuntime& rt,
                                       const void* raw_data,
                                       bool allow_sharding = true,
                                       const cloudtpu::TensorShardingKind* forced_sharding = nullptr,
-                                      bool q4k_bf16_scales = false) {
+                                      bool q4k_bf16_scales = false,
+                                      CloudTpuQ4Mode q4_mode = CloudTpuQ4Mode::I4,
+                                      bool q4k_u4 = false) {
     slot.ggml_dt = tensor->type;
     slot.dims[0] = tensor->ne[3];
     slot.dims[1] = tensor->ne[2];
     slot.dims[2] = tensor->ne[1];
     slot.dims[3] = tensor->ne[0];
+    slot.hbm_dims[0] = slot.dims[0];
+    slot.hbm_dims[1] = slot.dims[1];
+    slot.hbm_dims[2] = slot.dims[2];
+    slot.hbm_dims[3] = slot.dims[3];
+    slot.hbm_token_axis = -1;
 
     const int64_t B3 = tensor->ne[3];
     const int64_t B2 = tensor->ne[2];
@@ -1008,9 +1365,10 @@ static void upload_raw_tensor_to_slot(cloudtpu::PjrtRuntime& rt,
     const size_t B = static_cast<size_t>(B3 * B2);
     const cloudtpu::TensorShardingKind sh =
         forced_sharding ? *forced_sharding
-                        : choose_upload_sharding(tensor, spmd_chips, spmd_min_rows, allow_sharding);
+                        : choose_upload_sharding(tensor, spmd_chips, spmd_min_rows, allow_sharding, q4_mode);
     slot.sharding = sh;
     slot.scale_dtype = cloudtpu::PjrtDType::INVALID;
+    slot.bitcast_target = cloudtpu::PjrtDType::S4;
     const int q5_shard_ax = (sh == cloudtpu::TensorShardingKind::SHARD_N) ? 4 : 2;
     const int q4_shard_ax = (sh == cloudtpu::TensorShardingKind::SHARD_N) ? 3 : 2;
 
@@ -1035,69 +1393,104 @@ static void upload_raw_tensor_to_slot(cloudtpu::PjrtRuntime& rt,
         slot.hbm_mins.clear();
     } else if (is_contig && tensor->type == GGML_TYPE_Q4_0 && (K % QK4_0) == 0) {
         const size_t nb = static_cast<size_t>(K / QK4_0);
-        const size_t nrows = static_cast<size_t>(B3 * B2 * N);
-        std::vector<uint8_t> qs;
-        std::vector<uint16_t> d;
-        unpack_q4_0_to_split(static_cast<const block_q4_0*>(raw_data), nrows, nb, qs, d);
-        auto qs_km = transpose_n_to_minor(qs.data(), B, static_cast<size_t>(N), static_cast<size_t>(K / 2));
-        auto d_km = transpose_n_to_minor(d.data(), B, static_cast<size_t>(N), nb);
-        slot.storage = cloudtpu::TensorStorageKind::Q4_0_SPLIT;
-        slot.dtype = cloudtpu::PjrtDType::U8;
+        const Q4SlotPlan q4p = resolve_q4_slot_plan(tensor->type, K, N, spmd_chips, sh, q4_mode, q4k_u4);
+        slot.storage = q4p.storage;
+        slot.dtype = q4p.q_dtype;
         slot.scale_dtype = cloudtpu::PjrtDType::F16;
-        slot.hbm_primary = upload_sharded_part(
-            rt, device_index, spmd_chips, sh, qs_km.data(), cloudtpu::PjrtDType::U8,
-            {B3, B2, static_cast<int64_t>(nb), QK4_0 / 2, N}, q5_shard_ax);
-        slot.hbm_scales = upload_sharded_part(
-            rt, device_index, spmd_chips, sh, d_km.data(), cloudtpu::PjrtDType::F16,
-            {B3, B2, static_cast<int64_t>(nb), N}, q4_shard_ax);
-        slot.hbm_mins.clear();
+        slot.bitcast_target = q4p.bitcast_target;
+        if (q4p.storage == cloudtpu::TensorStorageKind::Q4_0_I4) {
+            std::vector<uint8_t> qs_data;
+            std::vector<uint16_t> d_km;
+            const bool use_s4 = (q4p.bitcast_target == cloudtpu::PjrtDType::S4);
+            const bool packed_nibbles = (q4p.q_dtype == cloudtpu::PjrtDType::U8);
+            unpack_q4_0_to_i4(static_cast<const block_q4_0*>(raw_data), B, static_cast<size_t>(N), nb,
+                              use_s4, packed_nibbles, qs_data, d_km);
+            const std::vector<int64_t> qs_dims = packed_nibbles
+                                                     ? std::vector<int64_t>{B3, B2, static_cast<int64_t>(nb), QK4_0, N / 2}
+                                                     : std::vector<int64_t>{B3, B2, static_cast<int64_t>(nb), QK4_0, N};
+            slot.hbm_primary = upload_sharded_part(
+                rt, device_index, spmd_chips, sh, qs_data.data(), q4p.q_dtype, qs_dims, q5_shard_ax);
+            slot.hbm_scales = upload_sharded_part(
+                rt, device_index, spmd_chips, sh, d_km.data(), cloudtpu::PjrtDType::F16,
+                {B3, B2, static_cast<int64_t>(nb), N}, q4_shard_ax);
+            slot.hbm_mins.clear();
+        } else {
+            const size_t nrows = static_cast<size_t>(B3 * B2 * N);
+            std::vector<uint8_t> qs;
+            std::vector<uint16_t> d;
+            unpack_q4_0_to_split(static_cast<const block_q4_0*>(raw_data), nrows, nb, qs, d);
+            auto qs_km = transpose_n_to_minor(qs.data(), B, static_cast<size_t>(N), static_cast<size_t>(K / 2));
+            auto d_km = transpose_n_to_minor(d.data(), B, static_cast<size_t>(N), nb);
+            slot.hbm_primary = upload_sharded_part(
+                rt, device_index, spmd_chips, sh, qs_km.data(), cloudtpu::PjrtDType::U8,
+                {B3, B2, static_cast<int64_t>(nb), QK4_0 / 2, N}, q5_shard_ax);
+            slot.hbm_scales = upload_sharded_part(
+                rt, device_index, spmd_chips, sh, d_km.data(), cloudtpu::PjrtDType::F16,
+                {B3, B2, static_cast<int64_t>(nb), N}, q4_shard_ax);
+            slot.hbm_mins.clear();
+        }
     } else if (is_contig && tensor->type == GGML_TYPE_Q4_K && (K % QK_K) == 0) {
         const size_t nb_k = static_cast<size_t>(K / QK_K);
         const int64_t nb32 = K / 32;
         const size_t nrows = static_cast<size_t>(B3 * B2 * N);
         const size_t total_k_blocks = nrows * nb_k;
         const auto* src_blk = static_cast<const block_q4_K*>(raw_data);
-        std::vector<uint8_t> qs;
-        std::vector<float> d_eff;
-        std::vector<float> m_eff;
-        unpack_q4_K_to_split(src_blk, nrows, nb_k, qs, d_eff, m_eff);
         slot.quant_meta.resize(total_k_blocks * 16);
         for (size_t b = 0; b < total_k_blocks; ++b) {
             std::memcpy(slot.quant_meta.data() + b * 16, &src_blk[b], 16);
         }
-        auto qs_km = transpose_n_to_minor(qs.data(), B, static_cast<size_t>(N), static_cast<size_t>(K / 2));
-        slot.storage = cloudtpu::TensorStorageKind::Q4_K_SPLIT;
-        slot.dtype = cloudtpu::PjrtDType::U8;
-        slot.hbm_primary = upload_sharded_part(
-            rt, device_index, spmd_chips, sh, qs_km.data(), cloudtpu::PjrtDType::U8,
-            {B3, B2, nb32, 16, N}, q5_shard_ax);
+        const Q4SlotPlan q4p = resolve_q4_slot_plan(tensor->type, K, N, spmd_chips, sh, q4_mode, q4k_u4);
+        slot.storage = q4p.storage;
+        slot.dtype = q4p.q_dtype;
+        slot.bitcast_target = q4p.bitcast_target;
+        std::vector<float> d_km_f32;
+        std::vector<float> m_km_f32;
+        if (q4p.storage == cloudtpu::TensorStorageKind::Q4_K_I4) {
+            std::vector<uint8_t> qs_data;
+            const bool use_s4 = (q4p.bitcast_target == cloudtpu::PjrtDType::S4);
+            const bool packed_nibbles = (q4p.q_dtype == cloudtpu::PjrtDType::U8);
+            unpack_q4_K_to_i4(src_blk, B, static_cast<size_t>(N), nb_k, use_s4, packed_nibbles,
+                              qs_data, d_km_f32, m_km_f32);
+            const std::vector<int64_t> qs_dims = packed_nibbles
+                                                     ? std::vector<int64_t>{B3, B2, nb32, 32, N / 2}
+                                                     : std::vector<int64_t>{B3, B2, nb32, 32, N};
+            slot.hbm_primary = upload_sharded_part(
+                rt, device_index, spmd_chips, sh, qs_data.data(), q4p.q_dtype, qs_dims, q5_shard_ax);
+        } else {
+            std::vector<uint8_t> qs;
+            std::vector<float> d_eff;
+            std::vector<float> m_eff;
+            unpack_q4_K_to_split(src_blk, nrows, nb_k, qs, d_eff, m_eff);
+            auto qs_km = transpose_n_to_minor(qs.data(), B, static_cast<size_t>(N), static_cast<size_t>(K / 2));
+            d_km_f32 = transpose_n_to_minor(d_eff.data(), B, static_cast<size_t>(N), static_cast<size_t>(nb32));
+            m_km_f32 = transpose_n_to_minor(m_eff.data(), B, static_cast<size_t>(N), static_cast<size_t>(nb32));
+            slot.hbm_primary = upload_sharded_part(
+                rt, device_index, spmd_chips, sh, qs_km.data(), cloudtpu::PjrtDType::U8,
+                {B3, B2, nb32, 16, N}, q5_shard_ax);
+        }
         if (q4k_bf16_scales) {
             // Store compact effective scales in BF16 (full F32 8-bit exponent range) rather than
             // F16 so large finite products (e.g. d * sc > 65504) never overflow to Inf/NaN.
-            std::vector<uint16_t> d_bf16(d_eff.size());
-            std::vector<uint16_t> m_bf16(m_eff.size());
-            for (size_t i = 0; i < d_eff.size(); ++i) {
-                d_bf16[i] = cloudtpu::f32_to_bf16(d_eff[i]);
-                m_bf16[i] = cloudtpu::f32_to_bf16(m_eff[i]);
+            std::vector<uint16_t> d_km_bf16(d_km_f32.size());
+            std::vector<uint16_t> m_km_bf16(m_km_f32.size());
+            for (size_t i = 0; i < d_km_f32.size(); ++i) {
+                d_km_bf16[i] = cloudtpu::f32_to_bf16(d_km_f32[i]);
+                m_km_bf16[i] = cloudtpu::f32_to_bf16(m_km_f32[i]);
             }
-            auto d_km = transpose_n_to_minor(d_bf16.data(), B, static_cast<size_t>(N), static_cast<size_t>(nb32));
-            auto m_km = transpose_n_to_minor(m_bf16.data(), B, static_cast<size_t>(N), static_cast<size_t>(nb32));
             slot.scale_dtype = cloudtpu::PjrtDType::BF16;
             slot.hbm_scales = upload_sharded_part(
-                rt, device_index, spmd_chips, sh, d_km.data(), cloudtpu::PjrtDType::BF16,
+                rt, device_index, spmd_chips, sh, d_km_bf16.data(), cloudtpu::PjrtDType::BF16,
                 {B3, B2, nb32, N}, q4_shard_ax);
             slot.hbm_mins = upload_sharded_part(
-                rt, device_index, spmd_chips, sh, m_km.data(), cloudtpu::PjrtDType::BF16,
+                rt, device_index, spmd_chips, sh, m_km_bf16.data(), cloudtpu::PjrtDType::BF16,
                 {B3, B2, nb32, N}, q4_shard_ax);
         } else {
-            auto d_km = transpose_n_to_minor(d_eff.data(), B, static_cast<size_t>(N), static_cast<size_t>(nb32));
-            auto m_km = transpose_n_to_minor(m_eff.data(), B, static_cast<size_t>(N), static_cast<size_t>(nb32));
             slot.scale_dtype = cloudtpu::PjrtDType::F32;
             slot.hbm_scales = upload_sharded_part(
-                rt, device_index, spmd_chips, sh, d_km.data(), cloudtpu::PjrtDType::F32,
+                rt, device_index, spmd_chips, sh, d_km_f32.data(), cloudtpu::PjrtDType::F32,
                 {B3, B2, nb32, N}, q4_shard_ax);
             slot.hbm_mins = upload_sharded_part(
-                rt, device_index, spmd_chips, sh, m_km.data(), cloudtpu::PjrtDType::F32,
+                rt, device_index, spmd_chips, sh, m_km_f32.data(), cloudtpu::PjrtDType::F32,
                 {B3, B2, nb32, N}, q4_shard_ax);
         }
     } else if (is_contig && tensor->type == GGML_TYPE_Q6_K && (K % QK_K) == 0) {
@@ -1205,6 +1598,19 @@ static void download_slot_to_host(cloudtpu::PjrtRuntime& rt,
         auto qs = transpose_minor_to_n(qs_km.data(), B, N, K / 2);
         auto d = transpose_minor_to_n(d_km.data(), B, N, nb);
         pack_split_to_q4_0(qs.data(), d.data(), total_blocks, static_cast<block_q4_0*>(dst_full));
+    } else if (slot.storage == cloudtpu::TensorStorageKind::Q4_0_I4) {
+        const size_t total_blocks = slot.hbm_scales[0]->num_elements() * shard_mul;
+        const size_t nb = K / QK4_0;
+        const size_t total_elems = total_blocks * QK4_0;
+        const bool packed_nibbles = (slot.dtype == cloudtpu::PjrtDType::U8);
+        std::vector<uint8_t> qs_data(
+            packed_nibbles ? cloudtpu::pjrt_dtype_nbytes(cloudtpu::PjrtDType::S4, total_elems) : total_elems);
+        std::vector<uint16_t> d_km(total_blocks);
+        download_sharded_part(rt, slot.sharding, slot.hbm_primary, qs_data.data(), qs_data.size(), q5_shard_ax);
+        download_sharded_part(rt, slot.sharding, slot.hbm_scales, d_km.data(), d_km.size() * sizeof(uint16_t), q4_shard_ax);
+        const bool is_s4 = (slot.dtype == cloudtpu::PjrtDType::S4) ||
+                           (slot.dtype == cloudtpu::PjrtDType::U8 && slot.bitcast_target == cloudtpu::PjrtDType::S4);
+        pack_i4_to_q4_0(qs_data.data(), d_km.data(), B, N, nb, is_s4, packed_nibbles, static_cast<block_q4_0*>(dst_full));
     } else if (slot.storage == cloudtpu::TensorStorageKind::Q4_K_SPLIT) {
         const size_t total_sub = slot.hbm_scales[0]->num_elements() * shard_mul;
         const size_t total_k_blocks = total_sub / 8;
@@ -1212,6 +1618,17 @@ static void download_slot_to_host(cloudtpu::PjrtRuntime& rt,
         download_sharded_part(rt, slot.sharding, slot.hbm_primary, qs_km.data(), qs_km.size(), q5_shard_ax);
         auto qs = transpose_minor_to_n(qs_km.data(), B, N, K / 2);
         pack_split_to_q4_K(qs.data(), slot.quant_meta.data(), total_k_blocks, static_cast<block_q4_K*>(dst_full));
+    } else if (slot.storage == cloudtpu::TensorStorageKind::Q4_K_I4) {
+        const size_t total_sub = slot.hbm_scales[0]->num_elements() * shard_mul;
+        const size_t nb_k = K / QK_K;
+        const size_t total_elems = total_sub * 32;
+        const bool packed_nibbles = (slot.dtype == cloudtpu::PjrtDType::U8);
+        std::vector<uint8_t> qs_data(
+            packed_nibbles ? cloudtpu::pjrt_dtype_nbytes(cloudtpu::PjrtDType::S4, total_elems) : total_elems);
+        download_sharded_part(rt, slot.sharding, slot.hbm_primary, qs_data.data(), qs_data.size(), q5_shard_ax);
+        const bool is_s4 = (slot.dtype == cloudtpu::PjrtDType::S4) ||
+                           (slot.dtype == cloudtpu::PjrtDType::U8 && slot.bitcast_target == cloudtpu::PjrtDType::S4);
+        pack_i4_to_q4_K(qs_data.data(), slot.quant_meta.data(), B, N, nb_k, is_s4, packed_nibbles, static_cast<block_q4_K*>(dst_full));
     } else if (slot.storage == cloudtpu::TensorStorageKind::Q6_K_SPLIT) {
         const size_t total_sub = slot.hbm_scales[0]->num_elements() * shard_mul;
         const size_t total_k_blocks = total_sub / 16;
@@ -1219,6 +1636,19 @@ static void download_slot_to_host(cloudtpu::PjrtRuntime& rt,
         download_sharded_part(rt, slot.sharding, slot.hbm_primary, qs_km.data(), qs_km.size(), q5_shard_ax);
         auto qs = transpose_minor_to_n(qs_km.data(), B, N, K);
         pack_split_to_q6_K(qs.data(), slot.quant_meta.data(), total_k_blocks, static_cast<block_q6_K*>(dst_full));
+    } else if (slot.hbm_token_axis >= 0 && slot.hbm_token_axis < 4 &&
+               slot.hbm_dims[slot.hbm_token_axis] > slot.dims[slot.hbm_token_axis] &&
+               slot.storage == cloudtpu::TensorStorageKind::DENSE) {
+        const size_t elem_sz = cloudtpu::pjrt_dtype_size(slot.dtype);
+        size_t hbm_bytes = 0;
+        if (!cloudtpu::checked_tensor_nbytes(slot.hbm_dims, elem_sz, &hbm_bytes) ||
+            hbm_bytes < slot.nbytes) {
+            throw std::overflow_error("ggml-cloudtpu: padded HBM slot byte size overflow");
+        }
+        std::vector<uint8_t> hbm_tmp(hbm_bytes);
+        download_sharded_part(rt, slot.sharding, slot.hbm_primary, hbm_tmp.data(), hbm_bytes);
+        cloudtpu::slice_dense_host_tensor(
+            hbm_tmp.data(), dst_full, elem_sz, slot.hbm_dims, slot.dims, slot.hbm_token_axis);
     } else {
         download_sharded_part(rt, slot.sharding, slot.hbm_primary, dst_full, slot.nbytes);
     }
@@ -1263,7 +1693,7 @@ static bool patch_view_into_root_slot_locked(cloudtpu::PjrtRuntime& rt,
     auto pit = bctx->slots.find(root_off);
     if (pit == bctx->slots.end() || pit->second.nbytes != root_bytes) {
         const cloudtpu::TensorShardingKind root_sh = choose_upload_sharding(
-            root, bctx->spmd_chips, bctx->spmd_min_rows, /*allow_sharding=*/true);
+            root, bctx->spmd_chips, bctx->spmd_min_rows, /*allow_sharding=*/true, bctx->q4_mode);
         const size_t rel_new = (t_off - root_off) + offset;
         if (rel_new == 0 && size == root_bytes) {
             CloudTpuTensorSlot next;
@@ -1272,12 +1702,14 @@ static bool patch_view_into_root_slot_locked(cloudtpu::PjrtRuntime& rt,
             if (src_data != nullptr) {
                 upload_raw_tensor_to_slot(
                     rt, bctx->device_index, bctx->spmd_chips, bctx->spmd_min_rows,
-                    next, root, src_data, /*allow_sharding=*/true, &root_sh, bctx->q4k_bf16_scales);
+                    next, root, src_data, /*allow_sharding=*/true, &root_sh,
+                    bctx->q4k_bf16_scales, bctx->q4_mode, bctx->q4k_u4);
             } else {
                 std::vector<uint8_t> tmp(root_bytes, fill_value);
                 upload_raw_tensor_to_slot(
                     rt, bctx->device_index, bctx->spmd_chips, bctx->spmd_min_rows,
-                    next, root, tmp.data(), /*allow_sharding=*/true, &root_sh, bctx->q4k_bf16_scales);
+                    next, root, tmp.data(), /*allow_sharding=*/true, &root_sh,
+                    bctx->q4k_bf16_scales, bctx->q4_mode, bctx->q4k_u4);
             }
             bctx->evict_overlapping_locked(root_off, root_bytes, root_off);
             bctx->slots[root_off] = std::move(next);
@@ -1307,7 +1739,8 @@ static bool patch_view_into_root_slot_locked(cloudtpu::PjrtRuntime& rt,
             next.nbytes = parent.nbytes;
             upload_raw_tensor_to_slot(
                 rt, bctx->device_index, bctx->spmd_chips, bctx->spmd_min_rows,
-                next, root, parent.staging.data(), /*allow_sharding=*/true, &root_sh, bctx->q4k_bf16_scales);
+                next, root, parent.staging.data(), /*allow_sharding=*/true, &root_sh,
+                bctx->q4k_bf16_scales, bctx->q4_mode, bctx->q4k_u4);
             parent = std::move(next);
         }
         return true;
@@ -1322,12 +1755,14 @@ static bool patch_view_into_root_slot_locked(cloudtpu::PjrtRuntime& rt,
         if (src_data != nullptr) {
             upload_raw_tensor_to_slot(
                 rt, bctx->device_index, bctx->spmd_chips, bctx->spmd_min_rows,
-                next, root, src_data, /*allow_sharding=*/true, &root_sh, bctx->q4k_bf16_scales);
+                next, root, src_data, /*allow_sharding=*/true, &root_sh,
+                bctx->q4k_bf16_scales, bctx->q4_mode, bctx->q4k_u4);
         } else {
             std::vector<uint8_t> tmp(root_bytes, fill_value);
             upload_raw_tensor_to_slot(
                 rt, bctx->device_index, bctx->spmd_chips, bctx->spmd_min_rows,
-                next, root, tmp.data(), /*allow_sharding=*/true, &root_sh, bctx->q4k_bf16_scales);
+                next, root, tmp.data(), /*allow_sharding=*/true, &root_sh,
+                bctx->q4k_bf16_scales, bctx->q4_mode, bctx->q4k_u4);
         }
         parent = std::move(next);
         return true;
@@ -1358,7 +1793,8 @@ static bool patch_view_into_root_slot_locked(cloudtpu::PjrtRuntime& rt,
         next.nbytes = parent.nbytes;
         upload_raw_tensor_to_slot(
             rt, bctx->device_index, bctx->spmd_chips, bctx->spmd_min_rows,
-            next, root, parent.staging.data(), /*allow_sharding=*/true, &root_sh, bctx->q4k_bf16_scales);
+            next, root, parent.staging.data(), /*allow_sharding=*/true, &root_sh,
+            bctx->q4k_bf16_scales, bctx->q4_mode, bctx->q4k_u4);
         parent = std::move(next);
     }
     return true;
@@ -1445,7 +1881,8 @@ static void ggml_backend_cloudtpu_buffer_memset_tensor(ggml_backend_buffer_t buf
             next.nbytes = t_bytes;
             upload_raw_tensor_to_slot(
                 rt, bctx->device_index, bctx->spmd_chips, bctx->spmd_min_rows,
-                next, tensor, tmp.data(), /*allow_sharding=*/true, nullptr, bctx->q4k_bf16_scales);
+                next, tensor, tmp.data(), /*allow_sharding=*/true, nullptr,
+                bctx->q4k_bf16_scales, bctx->q4_mode, bctx->q4k_u4);
             bctx->evict_overlapping_locked(t_off, t_bytes, t_off);
             bctx->slots[t_off] = std::move(next);
         } else {
@@ -1472,7 +1909,7 @@ static void ggml_backend_cloudtpu_buffer_memset_tensor(ggml_backend_buffer_t buf
                 slot.offset = t_off;
                 slot.nbytes = t_bytes;
                 slot.sharding = choose_upload_sharding(
-                    tensor, bctx->spmd_chips, bctx->spmd_min_rows, /*allow_sharding=*/true);
+                    tensor, bctx->spmd_chips, bctx->spmd_min_rows, /*allow_sharding=*/true, bctx->q4_mode);
                 slot.hbm_primary.clear();
                 slot.hbm_scales.clear();
                 slot.hbm_mins.clear();
@@ -1523,7 +1960,8 @@ static void ggml_backend_cloudtpu_buffer_set_tensor(ggml_backend_buffer_t buffer
             next.nbytes = t_bytes;
             upload_raw_tensor_to_slot(
                 rt, bctx->device_index, bctx->spmd_chips, bctx->spmd_min_rows,
-                next, tensor, data, /*allow_sharding=*/true, nullptr, bctx->q4k_bf16_scales);
+                next, tensor, data, /*allow_sharding=*/true, nullptr,
+                bctx->q4k_bf16_scales, bctx->q4_mode, bctx->q4k_u4);
             bctx->evict_overlapping_locked(t_off, t_bytes, t_off);
             bctx->slots[t_off] = std::move(next);
         } else {
@@ -1551,7 +1989,7 @@ static void ggml_backend_cloudtpu_buffer_set_tensor(ggml_backend_buffer_t buffer
                 slot.offset = t_off;
                 slot.nbytes = t_bytes;
                 slot.sharding = choose_upload_sharding(
-                    tensor, bctx->spmd_chips, bctx->spmd_min_rows, /*allow_sharding=*/true);
+                    tensor, bctx->spmd_chips, bctx->spmd_min_rows, /*allow_sharding=*/true, bctx->q4_mode);
                 slot.hbm_primary.clear();
                 slot.hbm_scales.clear();
                 slot.hbm_mins.clear();
@@ -1571,7 +2009,8 @@ static void ggml_backend_cloudtpu_buffer_set_tensor(ggml_backend_buffer_t buffer
                     const cloudtpu::TensorShardingKind slot_sh = slot_ptr->sharding;
                     upload_raw_tensor_to_slot(
                         rt, bctx->device_index, bctx->spmd_chips, bctx->spmd_min_rows,
-                        next, tensor, slot_ptr->staging.data(), /*allow_sharding=*/true, &slot_sh, bctx->q4k_bf16_scales);
+                        next, tensor, slot_ptr->staging.data(), /*allow_sharding=*/true, &slot_sh,
+                        bctx->q4k_bf16_scales, bctx->q4_mode, bctx->q4k_u4);
                     *slot_ptr = std::move(next);
                 } catch (const std::exception& e) {
                     if (!is_compute_buf) {
@@ -1617,9 +2056,18 @@ static void ggml_backend_cloudtpu_buffer_get_tensor(ggml_backend_buffer_t buffer
             throw std::runtime_error("ggml-cloudtpu: get_tensor on failed slot '" +
                                      std::string(tensor->name) + "': " + slot.upload_error);
         }
-        if (offset == 0 && size == slot.nbytes && slot.storage == cloudtpu::TensorStorageKind::DENSE &&
+        const bool is_padded_slot =
+            (slot.hbm_token_axis >= 0 && slot.hbm_token_axis < 4 &&
+             slot.hbm_dims[slot.hbm_token_axis] > slot.dims[slot.hbm_token_axis]);
+        if (offset == 0 && size == slot.nbytes && !is_padded_slot &&
+            slot.storage == cloudtpu::TensorStorageKind::DENSE &&
             slot.sharding == cloudtpu::TensorShardingKind::REPLICATED && !slot.staging_dirty && slot.has_hbm()) {
             rt.buffer_to_host(slot.hbm_primary[0]->handle.get(), data, size);
+            return;
+        }
+        if (offset == 0 && size == slot.nbytes && is_padded_slot &&
+            slot.storage == cloudtpu::TensorStorageKind::DENSE && !slot.staging_dirty && slot.has_hbm()) {
+            download_slot_to_host(rt, slot, data);
             return;
         }
         std::vector<uint8_t> tmp(slot.nbytes);
@@ -1636,11 +2084,13 @@ static void ggml_backend_cloudtpu_buffer_get_tensor(ggml_backend_buffer_t buffer
                 throw std::runtime_error("ggml-cloudtpu: get_tensor on failed parent slot '" +
                                          std::string(tensor->name) + "': " + parent.upload_error);
             }
-            std::vector<uint8_t> tmp(parent.nbytes);
-            download_slot_to_host(rt, parent, tmp.data());
             const size_t rel = (t_off - parent.offset) + offset;
-            std::memcpy(data, tmp.data() + rel, size);
-            return;
+            if (rel + size <= parent.nbytes) {
+                std::vector<uint8_t> tmp(parent.nbytes);
+                download_slot_to_host(rt, parent, tmp.data());
+                std::memcpy(data, tmp.data() + rel, size);
+                return;
+            }
         }
     }
 
@@ -1786,6 +2236,8 @@ struct cloudtpu_buft_context {
     int spmd_chips = 1;
     int spmd_min_rows = 256;
     bool q4k_bf16_scales = false;
+    CloudTpuQ4Mode q4_mode = CloudTpuQ4Mode::I4;
+    bool q4k_u4 = false;
     std::string name;
 };
 
@@ -1809,6 +2261,8 @@ static ggml_backend_buffer_t ggml_backend_cloudtpu_buffer_type_alloc_buffer(ggml
         bctx->spmd_chips = btc->spmd_chips;
         bctx->spmd_min_rows = btc->spmd_min_rows;
         bctx->q4k_bf16_scales = btc->q4k_bf16_scales;
+        bctx->q4_mode = btc->q4_mode;
+        bctx->q4k_u4 = btc->q4k_u4;
         bctx->virtual_base = g_next_virtual_base.fetch_add(aligned_span, std::memory_order_relaxed);
         bctx->size = size;
 
@@ -1860,7 +2314,7 @@ static size_t cloudtpu_tensor_per_chip_alloc_size(ggml_backend_buffer_type_t buf
     auto* btc = buft ? static_cast<cloudtpu_buft_context*>(buft->context) : nullptr;
     if (btc && btc->spmd_chips > 1 && tensor && tensor->op == GGML_OP_NONE && tensor->view_src == nullptr) {
         const cloudtpu::TensorShardingKind sh = choose_upload_sharding(
-            tensor, btc->spmd_chips, btc->spmd_min_rows, /*allow_sharding=*/true);
+            tensor, btc->spmd_chips, btc->spmd_min_rows, /*allow_sharding=*/true, btc->q4_mode);
         if (sh != cloudtpu::TensorShardingKind::REPLICATED) {
             const size_t p = static_cast<size_t>(btc->spmd_chips);
             sz = (sz + p - 1) / p;
@@ -1925,6 +2379,8 @@ static ggml_backend_buffer_t ggml_backend_cloudtpu_buffer_type_alloc_buffer_n(
         bctx->spmd_chips = btc->spmd_chips;
         bctx->spmd_min_rows = btc->spmd_min_rows;
         bctx->q4k_bf16_scales = btc->q4k_bf16_scales;
+        bctx->q4_mode = btc->q4_mode;
+        bctx->q4k_u4 = btc->q4k_u4;
         bctx->virtual_base = g_next_virtual_base.fetch_add(aligned_span, std::memory_order_relaxed);
         bctx->size = per_chip_total;
 
@@ -2023,6 +2479,36 @@ struct ResolvedTensorBuffers {
     std::vector<cloudtpu::PjrtBufferPtr> mins;
 };
 
+struct SigCacheEntry {
+    uint32_t id = 0;
+    uint64_t slot_epoch = 0;
+    uint32_t root_leaf_idx = UINT32_MAX;
+};
+
+struct CloudSlotKey {
+    ggml_backend_buffer_t buffer = nullptr;
+    uintptr_t data_addr = 0;
+
+    bool valid() const noexcept { return buffer != nullptr && data_addr != 0; }
+    bool operator==(const CloudSlotKey& o) const noexcept {
+        return buffer == o.buffer && data_addr == o.data_addr;
+    }
+};
+
+struct CloudSlotKeyHash {
+    size_t operator()(const CloudSlotKey& k) const noexcept {
+        const size_t h1 = std::hash<const void*>{}(k.buffer);
+        const size_t h2 = std::hash<uintptr_t>{}(k.data_addr);
+        return h1 ^ (h2 * 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
+    }
+};
+
+struct InSliceSlotSig {
+    uint32_t id = 0;
+    const struct ggml_tensor* root = nullptr;
+    uint64_t epoch = 0;
+};
+
 struct ggml_backend_cloudtpu_context {
     int device_index = 0;
     int spmd_chips = 1;
@@ -2033,6 +2519,9 @@ struct ggml_backend_cloudtpu_context {
     cloudtpu::PendingSyncLaunchQueue pending_sync_launches;
     uint64_t plan_hits = 0;
     uint64_t plan_misses = 0;
+    uint64_t total_kv_donated = 0;
+    uint64_t total_kv_donation_skipped = 0;
+    uint64_t total_bucketed_subgraphs = 0;
 
     // Fast-path structural SubgraphPlanCache (skips MLIR emission & compile_or_get on decode hit)
     uint64_t plan_cache_epoch = 0;
@@ -2042,10 +2531,14 @@ struct ggml_backend_cloudtpu_context {
     CGraphLiveness liveness;
     std::unordered_map<const struct ggml_tensor*, int> cgraph_node_idx;
     SubgraphSigKey scratch_key;
-    std::unordered_map<const struct ggml_tensor*, uint32_t> scratch_tensor_to_id;
+    std::unordered_map<const struct ggml_tensor*, SigCacheEntry> scratch_tensor_to_id;
+    std::unordered_set<const struct ggml_tensor*> scratch_slice_computed;
+    std::unordered_map<CloudSlotKey, InSliceSlotSig, CloudSlotKeyHash> scratch_slot_sig_state;
+    std::vector<uint32_t> scratch_leaf_ssa_uses;
     std::vector<const struct ggml_tensor*> scratch_inputs;
     std::vector<cloudtpu::TensorShardingKind> scratch_input_sharding;
     std::vector<cloudtpu::PjrtDType> scratch_input_scale_dt;
+    std::vector<Q4SlotPlan> scratch_input_q4_plans;
     std::vector<struct ggml_tensor*> scratch_outputs;
     std::vector<ResolvedTensorBuffers> scratch_resolved;
     std::vector<PJRT_Buffer*> scratch_raw_inputs;
@@ -2062,8 +2555,8 @@ struct ggml_backend_cloudtpu_context {
                 const cloudtpu::CacheStats st = rt.cache_stats();
                 GGML_LOG_INFO(
                     "ggml-cloudtpu: summary device=%d spmd_chips=%d mock=%d maps_libpython=%zu evals=%llu subgraphs=%llu ops=%llu "
-                    "plan_hits=%llu plan_misses=%llu cache_entries=%zu cache_hits=%llu cache_misses=%llu cache_evictions=%llu "
-                    "compile_us=%llu execute_us=%llu\n",
+                    "plan_hits=%llu plan_misses=%llu kv_donated=%llu kv_donation_skipped=%llu cache_entries=%zu cache_hits=%llu cache_misses=%llu cache_evictions=%llu "
+                    "compile_us=%llu execute_us=%llu bucketed=%llu\n",
                     device_index,
                     spmd_chips,
                     rt.is_mock() ? 1 : 0,
@@ -2073,12 +2566,15 @@ struct ggml_backend_cloudtpu_context {
                     static_cast<unsigned long long>(total_ops_executed),
                     static_cast<unsigned long long>(plan_hits),
                     static_cast<unsigned long long>(plan_misses),
+                    static_cast<unsigned long long>(total_kv_donated),
+                    static_cast<unsigned long long>(total_kv_donation_skipped),
                     st.entries,
                     static_cast<unsigned long long>(st.hits),
                     static_cast<unsigned long long>(st.misses),
                     static_cast<unsigned long long>(st.evictions),
                     static_cast<unsigned long long>(st.compile_us),
-                    static_cast<unsigned long long>(st.execute_us));
+                    static_cast<unsigned long long>(st.execute_us),
+                    static_cast<unsigned long long>(total_bucketed_subgraphs));
             }
         }
     }
@@ -2439,7 +2935,8 @@ static bool ggml_backend_cloudtpu_device_supports_op_impl(const struct ggml_tens
 
 static cloudtpu::TensorSpec tensor_to_spec(const struct ggml_tensor* t,
                                            uint64_t id,
-                                           cloudtpu::TensorShardingKind sharding = cloudtpu::TensorShardingKind::REPLICATED) {
+                                           cloudtpu::TensorShardingKind sharding = cloudtpu::TensorShardingKind::REPLICATED,
+                                           const Q4SlotPlan* q4_plan = nullptr) {
     cloudtpu::TensorSpec ts;
     ts.id = id;
     ts.dims[0] = t->ne[3];
@@ -2451,11 +2948,23 @@ static cloudtpu::TensorSpec tensor_to_spec(const struct ggml_tensor* t,
         ts.storage = cloudtpu::TensorStorageKind::Q8_0_SPLIT;
         ts.dtype = cloudtpu::PjrtDType::S8;
     } else if (t->type == GGML_TYPE_Q4_0) {
-        ts.storage = cloudtpu::TensorStorageKind::Q4_0_SPLIT;
-        ts.dtype = cloudtpu::PjrtDType::U8;
+        if (q4_plan && q4_plan->storage != cloudtpu::TensorStorageKind::DENSE) {
+            ts.storage = q4_plan->storage;
+            ts.dtype = q4_plan->q_dtype;
+            ts.bitcast_target = q4_plan->bitcast_target;
+        } else {
+            ts.storage = cloudtpu::TensorStorageKind::Q4_0_SPLIT;
+            ts.dtype = cloudtpu::PjrtDType::U8;
+        }
     } else if (t->type == GGML_TYPE_Q4_K) {
-        ts.storage = cloudtpu::TensorStorageKind::Q4_K_SPLIT;
-        ts.dtype = cloudtpu::PjrtDType::U8;
+        if (q4_plan && q4_plan->storage != cloudtpu::TensorStorageKind::DENSE) {
+            ts.storage = q4_plan->storage;
+            ts.dtype = q4_plan->q_dtype;
+            ts.bitcast_target = q4_plan->bitcast_target;
+        } else {
+            ts.storage = cloudtpu::TensorStorageKind::Q4_K_SPLIT;
+            ts.dtype = cloudtpu::PjrtDType::U8;
+        }
     } else if (t->type == GGML_TYPE_Q6_K) {
         ts.storage = cloudtpu::TensorStorageKind::Q6_K_SPLIT;
         ts.dtype = cloudtpu::PjrtDType::S8;
@@ -2472,22 +2981,76 @@ static cloudtpu::TensorShardingKind lookup_tensor_sharding(const struct ggml_ten
     }
     auto* bctx = static_cast<ggml_backend_cloudtpu_buffer_context*>(t->buffer->context);
     const size_t t_off = tensor_offset_in_buffer(bctx, t);
+    auto slot_matches_tensor = [](const CloudTpuTensorSlot& s, const struct ggml_tensor* tensor) -> bool {
+        return s.ggml_dt == tensor->type &&
+               s.dims[0] == tensor->ne[3] && s.dims[1] == tensor->ne[2] &&
+               s.dims[2] == tensor->ne[1] && s.dims[3] == tensor->ne[0];
+    };
     std::lock_guard<std::mutex> lock(bctx->mu);
     auto it = bctx->slots.find(t_off);
-    if (it != bctx->slots.end()) {
-        // Slot records its canonical shard layout at staging/upload time so all aliases
-        // (including same-shape zero-offset views) compile and upload with one layout.
+    if (it != bctx->slots.end() && slot_matches_tensor(it->second, t)) {
+        // Slot records its canonical shard layout at staging/upload time so all matching
+        // same-shape aliases compile and upload with one layout.
         return it->second.sharding;
     }
     if (t->view_src != nullptr && t->view_offs == 0 && ggml_is_contiguous(t)) {
         const struct ggml_tensor* base = unwrap_view_src(t);
         const size_t base_off = tensor_offset_in_buffer(bctx, base);
         auto bit = bctx->slots.find(base_off);
-        if (bit != bctx->slots.end()) {
+        if (bit != bctx->slots.end() && slot_matches_tensor(bit->second, t)) {
             return bit->second.sharding;
         }
     }
     return cloudtpu::TensorShardingKind::REPLICATED;
+}
+
+static Q4SlotPlan lookup_tensor_q4_plan(const struct ggml_tensor* t,
+                                        int spmd_chips,
+                                        cloudtpu::TensorShardingKind sh,
+                                        CloudTpuQ4Mode default_q4_mode,
+                                        bool default_q4k_u4) {
+    if (!t || (t->type != GGML_TYPE_Q4_0 && t->type != GGML_TYPE_Q4_K)) {
+        return {};
+    }
+    if (t->buffer && is_cloudtpu_buffer(t->buffer)) {
+        auto* bctx = static_cast<ggml_backend_cloudtpu_buffer_context*>(t->buffer->context);
+        const size_t t_off = tensor_offset_in_buffer(bctx, t);
+        auto slot_matches_q4_tensor = [](const CloudTpuTensorSlot& s, const struct ggml_tensor* tensor) -> bool {
+            return s.has_hbm() && !s.staging_dirty &&
+                   s.storage != cloudtpu::TensorStorageKind::DENSE &&
+                   s.ggml_dt == tensor->type &&
+                   s.dims[0] == tensor->ne[3] && s.dims[1] == tensor->ne[2] &&
+                   s.dims[2] == tensor->ne[1] && s.dims[3] == tensor->ne[0];
+        };
+        std::lock_guard<std::mutex> lock(bctx->mu);
+        auto it = bctx->slots.find(t_off);
+        if (it != bctx->slots.end()) {
+            if (slot_matches_q4_tensor(it->second, t)) {
+                Q4SlotPlan plan;
+                plan.storage = it->second.storage;
+                plan.q_dtype = it->second.dtype;
+                plan.bitcast_target = it->second.bitcast_target;
+                return plan;
+            }
+            return resolve_q4_slot_plan(
+                t->type, t->ne[0], t->ne[1], bctx->spmd_chips, sh, bctx->q4_mode, bctx->q4k_u4);
+        }
+        if (t->view_src != nullptr && t->view_offs == 0 && ggml_is_contiguous(t)) {
+            const struct ggml_tensor* base = unwrap_view_src(t);
+            const size_t base_off = tensor_offset_in_buffer(bctx, base);
+            auto bit = bctx->slots.find(base_off);
+            if (bit != bctx->slots.end() && slot_matches_q4_tensor(bit->second, t)) {
+                Q4SlotPlan plan;
+                plan.storage = bit->second.storage;
+                plan.q_dtype = bit->second.dtype;
+                plan.bitcast_target = bit->second.bitcast_target;
+                return plan;
+            }
+        }
+        return resolve_q4_slot_plan(
+            t->type, t->ne[0], t->ne[1], bctx->spmd_chips, sh, bctx->q4_mode, bctx->q4k_u4);
+    }
+    return resolve_q4_slot_plan(t->type, t->ne[0], t->ne[1], spmd_chips, sh, default_q4_mode, default_q4k_u4);
 }
 
 static cloudtpu::PjrtDType lookup_tensor_scale_dtype(const struct ggml_tensor* t, bool default_q4k_bf16) {
@@ -2511,12 +3074,35 @@ static cloudtpu::PjrtDType lookup_tensor_scale_dtype(const struct ggml_tensor* t
 }
 
 static const struct ggml_tensor* canonical_root(const struct ggml_tensor* t) {
-    if (t && t->view_src != nullptr && t->view_offs == 0 &&
-        ggml_nelements(t) == ggml_nelements(t->view_src) &&
-        t->type == t->view_src->type) {
-        return unwrap_view_src(t);
+    if (t && t->view_src != nullptr && t->view_offs == 0) {
+        const struct ggml_tensor* root = unwrap_view_src(t);
+        if (root && ggml_nelements(t) == ggml_nelements(root) && t->type == root->type) {
+            return root;
+        }
     }
     return t;
+}
+
+// Populates `out` from an existing HBM slot, slicing back to logical shape if `slot` was stored padded.
+static void resolve_unpadded_slot_buffers(cloudtpu::PjrtRuntime& rt,
+                                          int device_index,
+                                          int spmd_chips,
+                                          const CloudTpuTensorSlot& slot,
+                                          ResolvedTensorBuffers& out) {
+    out.sharding = slot.sharding;
+    if (slot.hbm_token_axis >= 0 && slot.hbm_token_axis < 4 &&
+        slot.hbm_dims[slot.hbm_token_axis] > slot.dims[slot.hbm_token_axis]) {
+        std::vector<uint8_t> raw_host(slot.nbytes);
+        download_slot_to_host(rt, slot, raw_host.data());
+        out.primary = upload_sharded_part(
+            rt, device_index, spmd_chips, slot.sharding,
+            raw_host.data(), slot.dtype,
+            {slot.dims[0], slot.dims[1], slot.dims[2], slot.dims[3]});
+    } else {
+        out.primary = slot.hbm_primary;
+    }
+    out.scales = slot.hbm_scales;
+    out.mins = slot.hbm_mins;
 }
 
 // Resolves a GGML tensor to HBM buffers (fetching from CloudTpuBuffer or uploading transient host tensor).
@@ -2524,6 +3110,8 @@ static void resolve_tensor_hbm(cloudtpu::PjrtRuntime& rt,
                                int device_index,
                                int spmd_chips,
                                bool q4k_bf16_scales,
+                               CloudTpuQ4Mode q4_mode,
+                               bool q4k_u4,
                                const struct ggml_tensor* t,
                                ResolvedTensorBuffers& out) {
     // Standalone non-contiguous dense tensors (e.g. scheduler split copies of CPU strided views)
@@ -2605,27 +3193,25 @@ static void resolve_tensor_hbm(cloudtpu::PjrtRuntime& rt,
                 throw CloudTpuAllocError("ggml-cloudtpu: prior HBM upload failed for tensor '" +
                                          std::string(t->name) + "': " + slot.upload_error);
             }
-            if (slot.staging_dirty && !slot.staging.empty()) {
+            const struct ggml_tensor* upload_t =
+                (t->view_src != nullptr && t->view_offs == 0 && ggml_is_contiguous(t))
+                    ? unwrap_view_src(t)
+                    : t;
+            if (slot.staging_dirty && !slot.staging.empty() && slot.nbytes == ggml_nbytes(upload_t)) {
                 CloudTpuTensorSlot next;
                 next.offset = slot.offset;
                 next.nbytes = slot.nbytes;
                 const cloudtpu::TensorShardingKind slot_sh = slot.sharding;
-                const struct ggml_tensor* upload_t =
-                    (t->view_src != nullptr && t->view_offs == 0 && ggml_is_contiguous(t))
-                        ? unwrap_view_src(t)
-                        : t;
                 upload_raw_tensor_to_slot(
                     rt, bctx->device_index, bctx->spmd_chips, bctx->spmd_min_rows,
-                    next, upload_t, slot.staging.data(), /*allow_sharding=*/true, &slot_sh, bctx->q4k_bf16_scales);
+                    next, upload_t, slot.staging.data(), /*allow_sharding=*/true, &slot_sh,
+                    bctx->q4k_bf16_scales, bctx->q4_mode, bctx->q4k_u4);
                 slot = std::move(next);
             }
             if (slot.has_hbm() && slot.ggml_dt == t->type &&
                 slot.dims[0] == t->ne[3] && slot.dims[1] == t->ne[2] &&
                 slot.dims[2] == t->ne[1] && slot.dims[3] == t->ne[0]) {
-                out.sharding = slot.sharding;
-                out.primary = slot.hbm_primary;
-                out.scales = slot.hbm_scales;
-                out.mins = slot.hbm_mins;
+                resolve_unpadded_slot_buffers(rt, bctx->device_index, bctx->spmd_chips, slot, out);
                 return;
             }
         }
@@ -2647,16 +3233,14 @@ static void resolve_tensor_hbm(cloudtpu::PjrtRuntime& rt,
                     const cloudtpu::TensorShardingKind slot_sh = bit->second.sharding;
                     upload_raw_tensor_to_slot(
                         rt, bctx->device_index, bctx->spmd_chips, bctx->spmd_min_rows,
-                        next, base, bit->second.staging.data(), /*allow_sharding=*/true, &slot_sh, bctx->q4k_bf16_scales);
+                        next, base, bit->second.staging.data(), /*allow_sharding=*/true, &slot_sh,
+                        bctx->q4k_bf16_scales, bctx->q4_mode, bctx->q4k_u4);
                     bit->second = std::move(next);
                 }
                 if (bit->second.has_hbm() && bit->second.ggml_dt == t->type &&
                     bit->second.dims[0] == t->ne[3] && bit->second.dims[1] == t->ne[2] &&
                     bit->second.dims[2] == t->ne[1] && bit->second.dims[3] == t->ne[0]) {
-                    out.sharding = bit->second.sharding;
-                    out.primary = bit->second.hbm_primary;
-                    out.scales = bit->second.hbm_scales;
-                    out.mins = bit->second.hbm_mins;
+                    resolve_unpadded_slot_buffers(rt, bctx->device_index, bctx->spmd_chips, bit->second, out);
                     return;
                 }
             }
@@ -2671,20 +3255,54 @@ static void resolve_tensor_hbm(cloudtpu::PjrtRuntime& rt,
                 }
             }
         }
-        // Uninitialized fill-byte HBM buffer for newly allocated leaf/KV-cache buffers before first write.
-        // Never silently materialize a computed graph activation node (t->op != GGML_OP_NONE).
+        // Extract a contiguous sub-range from an existing live parent slot (e.g. a 3-row Q4_K
+        // alias over a 4-row BITCAST Q4_K slot) without evicting or zeroing the parent weights.
         const cloudtpu::PjrtDType pdt = ggml_type_to_pjrt(t->type);
         const bool quant_ok = is_quant_split_type(t->type) &&
                               (t->ne[0] % quant_split_k_alignment(t->type)) == 0;
         if (t->op == GGML_OP_NONE && (pdt != cloudtpu::PjrtDType::INVALID || quant_ok) && ggml_is_contiguous(t)) {
             const size_t t_bytes = ggml_nbytes(t);
+            for (const auto& kv : bctx->slots) {
+                const CloudTpuTensorSlot& parent = kv.second;
+                if (t_bytes <= parent.nbytes && t_off >= parent.offset &&
+                    (t_off - parent.offset) <= parent.nbytes - t_bytes) {
+                    std::vector<uint8_t> slice_bytes;
+                    const size_t rel = t_off - parent.offset;
+                    if (parent.staging_dirty && !parent.staging.empty() && parent.staging.size() >= rel + t_bytes) {
+                        slice_bytes.assign(parent.staging.begin() + static_cast<std::ptrdiff_t>(rel),
+                                           parent.staging.begin() + static_cast<std::ptrdiff_t>(rel + t_bytes));
+                    } else if (parent.has_hbm()) {
+                        std::vector<uint8_t> parent_host(parent.nbytes);
+                        download_slot_to_host(rt, parent, parent_host.data());
+                        slice_bytes.assign(parent_host.begin() + static_cast<std::ptrdiff_t>(rel),
+                                           parent_host.begin() + static_cast<std::ptrdiff_t>(rel + t_bytes));
+                    }
+                    if (slice_bytes.size() == t_bytes) {
+                        CloudTpuTensorSlot tmp;
+                        tmp.offset = t_off;
+                        tmp.nbytes = t_bytes;
+                        upload_raw_tensor_to_slot(
+                            rt, bctx->device_index, bctx->spmd_chips, bctx->spmd_min_rows,
+                            tmp, t, slice_bytes.data(), /*allow_sharding=*/false, nullptr,
+                            bctx->q4k_bf16_scales, bctx->q4_mode, bctx->q4k_u4);
+                        out.sharding = tmp.sharding;
+                        out.primary = std::move(tmp.hbm_primary);
+                        out.scales = std::move(tmp.hbm_scales);
+                        out.mins = std::move(tmp.hbm_mins);
+                        return;
+                    }
+                }
+            }
+            // Uninitialized fill-byte HBM buffer for newly allocated leaf/KV-cache buffers before first write.
+            // Never silently materialize a computed graph activation node (t->op != GGML_OP_NONE).
             std::vector<uint8_t> init_bytes(t_bytes, bctx->clear_value);
             CloudTpuTensorSlot next;
             next.offset = t_off;
             next.nbytes = t_bytes;
             upload_raw_tensor_to_slot(
                 rt, bctx->device_index, bctx->spmd_chips, bctx->spmd_min_rows,
-                next, t, init_bytes.data(), /*allow_sharding=*/false, nullptr, bctx->q4k_bf16_scales);
+                next, t, init_bytes.data(), /*allow_sharding=*/false, nullptr,
+                bctx->q4k_bf16_scales, bctx->q4_mode, bctx->q4k_u4);
             bctx->evict_overlapping_locked(t_off, t_bytes, t_off);
             CloudTpuTensorSlot& slot = (bctx->slots[t_off] = std::move(next));
             out.sharding = slot.sharding;
@@ -2705,16 +3323,214 @@ static void resolve_tensor_hbm(cloudtpu::PjrtRuntime& rt,
     CloudTpuTensorSlot tmp_slot;
     tmp_slot.nbytes = ggml_nbytes(t);
     upload_raw_tensor_to_slot(
-        rt, device_index, spmd_chips, 0, tmp_slot, t, t->data, false, nullptr, q4k_bf16_scales);
+        rt, device_index, spmd_chips, 0, tmp_slot, t, t->data, false, nullptr,
+        q4k_bf16_scales, q4_mode, q4k_u4);
     out.sharding = tmp_slot.sharding;
     out.primary = std::move(tmp_slot.hbm_primary);
     out.scales = std::move(tmp_slot.hbm_scales);
     out.mins = std::move(tmp_slot.hbm_mins);
 }
 
+// Pads a token-varying dense input along `token_axis` from T to `bucket_tokens` (B) with
+// zero-corruption sentinel values (-1 for SET_ROWS scatter indices, 0 for GET_ROWS/ROPE/mask/dense).
+static void upload_padded_token_input(cloudtpu::PjrtRuntime& rt,
+                                      int device_index,
+                                      int spmd_chips,
+                                      const struct ggml_tensor* t,
+                                      int token_axis,
+                                      int64_t bucket_tokens,
+                                      cloudtpu::TokenInputPadKind pad_kind,
+                                      ResolvedTensorBuffers& out) {
+    const cloudtpu::PjrtDType pdt = ggml_type_to_pjrt(t->type);
+    if (pdt == cloudtpu::PjrtDType::INVALID || !ggml_is_contiguous(t) ||
+        token_axis < 0 || token_axis >= 4) {
+        throw std::runtime_error("ggml-cloudtpu: unsupported padded token input '" + std::string(t->name) + "'");
+    }
+    const int64_t orig_dims[4] = {t->ne[3], t->ne[2], t->ne[1], t->ne[0]};
+    if (bucket_tokens < orig_dims[token_axis] || bucket_tokens > cloudtpu::kMaxBatchBucketTokens) {
+        throw std::overflow_error("ggml-cloudtpu: invalid or oversized padded bucket for '" +
+                                  std::string(t->name) + "'");
+    }
+    int64_t padded_dims[4] = {orig_dims[0], orig_dims[1], orig_dims[2], orig_dims[3]};
+    padded_dims[token_axis] = bucket_tokens;
+    const std::vector<int64_t> padded_vec = {padded_dims[0], padded_dims[1], padded_dims[2], padded_dims[3]};
+    const size_t t_bytes = ggml_nbytes(t);
+    size_t padded_bytes = 0;
+    if (!cloudtpu::checked_tensor_nbytes(padded_dims, cloudtpu::pjrt_dtype_size(pdt), &padded_bytes) ||
+        padded_bytes < t_bytes) {
+        throw std::overflow_error("ggml-cloudtpu: padded host buffer byte size overflow for '" +
+                                  std::string(t->name) + "'");
+    }
+
+    out.sharding = cloudtpu::TensorShardingKind::REPLICATED;
+    out.scales.clear();
+    out.mins.clear();
+
+    if (t->buffer && is_cloudtpu_buffer(t->buffer)) {
+        auto* bctx = static_cast<ggml_backend_cloudtpu_buffer_context*>(t->buffer->context);
+        const size_t t_off = tensor_offset_in_buffer(bctx, t);
+        std::vector<uint8_t> raw_host;
+        bool have_raw = false;
+        bool fill_init = false;
+        uint8_t fill_byte = 0;
+        {
+            std::lock_guard<std::mutex> lock(bctx->mu);
+            fill_byte = bctx->clear_value;
+            auto it = bctx->slots.find(t_off);
+            const CloudTpuTensorSlot* slot_ptr = (it != bctx->slots.end()) ? &it->second : nullptr;
+            if (!slot_ptr && t->view_src != nullptr && t->view_offs == 0 && ggml_is_contiguous(t)) {
+                const struct ggml_tensor* base = unwrap_view_src(t);
+                const size_t base_off = tensor_offset_in_buffer(bctx, base);
+                auto bit = bctx->slots.find(base_off);
+                if (bit != bctx->slots.end()) {
+                    slot_ptr = &bit->second;
+                }
+            }
+            if (slot_ptr) {
+                const CloudTpuTensorSlot& slot = *slot_ptr;
+                if (slot.upload_failed) {
+                    throw CloudTpuAllocError("ggml-cloudtpu: prior HBM upload failed for padded tensor '" +
+                                             std::string(t->name) + "': " + slot.upload_error);
+                }
+                if (!slot.staging_dirty && slot.has_hbm() && slot.ggml_dt == t->type &&
+                    slot.hbm_token_axis == token_axis &&
+                    slot.hbm_dims[0] == padded_dims[0] && slot.hbm_dims[1] == padded_dims[1] &&
+                    slot.hbm_dims[2] == padded_dims[2] && slot.hbm_dims[3] == padded_dims[3] &&
+                    slot.sharding == cloudtpu::TensorShardingKind::REPLICATED &&
+                    pad_kind != cloudtpu::TokenInputPadKind::NEG_ONE) {
+                    out.sharding = slot.sharding;
+                    out.primary = slot.hbm_primary;
+                    return;
+                }
+                if (slot.staging_dirty && !slot.staging.empty() && slot.nbytes == t_bytes) {
+                    raw_host.assign(slot.staging.begin(), slot.staging.end());
+                    have_raw = true;
+                } else if (slot.has_hbm() && slot.ggml_dt == t->type &&
+                           slot.dims[0] == orig_dims[0] && slot.dims[1] == orig_dims[1] &&
+                           slot.dims[2] == orig_dims[2] && slot.dims[3] == orig_dims[3]) {
+                    raw_host.resize(t_bytes);
+                    download_slot_to_host(rt, slot, raw_host.data());
+                    have_raw = true;
+                }
+            }
+            if (!have_raw && t->view_src != nullptr) {
+                for (const auto& kv : bctx->slots) {
+                    const CloudTpuTensorSlot& parent = kv.second;
+                    if (t_off >= parent.offset && t_off + t_bytes <= parent.offset + parent.nbytes) {
+                        if (parent.upload_failed) {
+                            throw CloudTpuAllocError("ggml-cloudtpu: prior HBM upload failed for padded parent '" +
+                                                     std::string(t->name) + "': " + parent.upload_error);
+                        }
+                        std::vector<uint8_t> parent_host(parent.nbytes);
+                        download_slot_to_host(rt, parent, parent_host.data());
+                        const size_t rel = t_off - parent.offset;
+                        raw_host.resize(t_bytes);
+                        std::memcpy(raw_host.data(), parent_host.data() + rel, t_bytes);
+                        have_raw = true;
+                        break;
+                    }
+                }
+            }
+            if (!have_raw) {
+                const size_t t_end = t_off + t_bytes;
+                for (const auto& kv : bctx->slots) {
+                    const CloudTpuTensorSlot& s = kv.second;
+                    if (s.upload_failed && s.offset < t_end && t_off < s.offset + s.nbytes) {
+                        throw CloudTpuAllocError("ggml-cloudtpu: prior HBM upload failed for padded tensor '" +
+                                                 std::string(t->name) + "': " + s.upload_error);
+                    }
+                }
+            }
+            if (!have_raw && t->op == GGML_OP_NONE) {
+                fill_init = true;
+            }
+        }
+        if (!have_raw && !fill_init) {
+            throw std::runtime_error("ggml-cloudtpu: missing HBM slot for padded input tensor '" +
+                                     std::string(t->name) + "' (op=" + std::string(ggml_op_desc(t)) + ")");
+        }
+        if (!have_raw && fill_byte != 0) {
+            raw_host.assign(t_bytes, fill_byte);
+            have_raw = true;
+        }
+        std::vector<uint8_t> padded_host(padded_bytes, 0);
+        cloudtpu::pad_dense_host_tensor(
+            have_raw ? raw_host.data() : nullptr,
+            padded_host.data(),
+            pdt,
+            orig_dims,
+            padded_dims,
+            token_axis,
+            pad_kind);
+        out.primary = upload_sharded_part(
+            rt, device_index, spmd_chips, cloudtpu::TensorShardingKind::REPLICATED,
+            padded_host.data(), pdt, padded_vec);
+        return;
+    }
+
+    if (!t->data) {
+        throw std::runtime_error("ggml-cloudtpu: null host data pointer for padded tensor '" +
+                                 std::string(t->name) + "'");
+    }
+    std::vector<uint8_t> padded_host(padded_bytes, 0);
+    cloudtpu::pad_dense_host_tensor(
+        t->data, padded_host.data(), pdt, orig_dims, padded_dims, token_axis, pad_kind);
+    out.primary = upload_sharded_part(
+        rt, device_index, spmd_chips, cloudtpu::TensorShardingKind::REPLICATED,
+        padded_host.data(), pdt, padded_vec);
+}
+
+// Records logical and physical (possibly bucket-padded) HBM shapes on `slot`.
+static void set_slot_hbm_dims(CloudTpuTensorSlot& slot,
+                              const struct ggml_tensor* target,
+                              const cloudtpu::PjrtBufferPtr& buf,
+                              int out_token_axis) {
+    slot.dims[0] = target->ne[3];
+    slot.dims[1] = target->ne[2];
+    slot.dims[2] = target->ne[1];
+    slot.dims[3] = target->ne[0];
+    slot.hbm_token_axis = -1;
+    for (int d = 0; d < 4; ++d) {
+        slot.hbm_dims[d] = slot.dims[d];
+    }
+    if (out_token_axis >= 0 && out_token_axis < 4 && buf && buf->dims.size() == 4 &&
+        buf->dims[static_cast<size_t>(out_token_axis)] > slot.dims[out_token_axis]) {
+        slot.hbm_token_axis = out_token_axis;
+        for (int d = 0; d < 4; ++d) {
+            slot.hbm_dims[d] = buf->dims[static_cast<size_t>(d)];
+        }
+    }
+}
+
+// Copies a PJRT output buffer to a host destination buffer, slicing `[0..T)` if bucket-padded.
+static void copy_output_buffer_to_host_ptr(cloudtpu::PjrtRuntime& rt,
+                                           const struct ggml_tensor* t,
+                                           const cloudtpu::PjrtBufferPtr& buf,
+                                           int out_token_axis,
+                                           void* dst) {
+    if (out_token_axis >= 0 && out_token_axis < 4 && buf && buf->dims.size() == 4 &&
+        buf->dims[static_cast<size_t>(out_token_axis)] > t->ne[3 - out_token_axis]) {
+        const size_t elem_sz = ggml_type_size(t->type);
+        const int64_t logical_dims[4] = {t->ne[3], t->ne[2], t->ne[1], t->ne[0]};
+        const int64_t padded_dims[4] = {buf->dims[0], buf->dims[1], buf->dims[2], buf->dims[3]};
+        size_t hbm_bytes = 0;
+        if (!cloudtpu::checked_tensor_nbytes(padded_dims, elem_sz, &hbm_bytes) ||
+            hbm_bytes < ggml_nbytes(t)) {
+            throw std::overflow_error("ggml-cloudtpu: padded output buffer byte size overflow");
+        }
+        std::vector<uint8_t> hbm_tmp(hbm_bytes);
+        rt.buffer_to_host(buf->handle.get(), hbm_tmp.data(), hbm_bytes);
+        cloudtpu::slice_dense_host_tensor(
+            hbm_tmp.data(), dst, elem_sz, padded_dims, logical_dims, out_token_axis);
+    } else {
+        rt.buffer_to_host(buf->handle.get(), dst, ggml_nbytes(t));
+    }
+}
+
 static void store_tensor_hbm_single(cloudtpu::PjrtRuntime& rt,
                                     struct ggml_tensor* t,
-                                    cloudtpu::PjrtBufferPtr buf) {
+                                    cloudtpu::PjrtBufferPtr buf,
+                                    int out_token_axis = -1) {
     if (t->buffer && is_cloudtpu_buffer(t->buffer)) {
         auto* bctx = static_cast<ggml_backend_cloudtpu_buffer_context*>(t->buffer->context);
         // For full-buffer in-place views (like SET_ROWS or ROPE inplace), store directly under
@@ -2729,7 +3545,7 @@ static void store_tensor_hbm_single(cloudtpu::PjrtRuntime& rt,
                 const size_t t_off = tensor_offset_in_buffer(bctx, t);
                 const size_t t_bytes = ggml_nbytes(t);
                 std::vector<uint8_t> slice_bytes(t_bytes);
-                rt.buffer_to_host(buf->handle.get(), slice_bytes.data(), t_bytes);
+                copy_output_buffer_to_host_ptr(rt, t, buf, out_token_axis, slice_bytes.data());
                 std::lock_guard<std::mutex> lock(bctx->mu);
                 if (patch_view_into_root_slot_locked(
                         rt, bctx, t->buffer, t, t_off, 0, t_bytes, slice_bytes.data(), 0,
@@ -2750,10 +3566,7 @@ static void store_tensor_hbm_single(cloudtpu::PjrtRuntime& rt,
         slot.sharding = cloudtpu::TensorShardingKind::REPLICATED;
         slot.dtype = buf->dtype;
         slot.scale_dtype = cloudtpu::PjrtDType::INVALID;
-        slot.dims[0] = target->ne[3];
-        slot.dims[1] = target->ne[2];
-        slot.dims[2] = target->ne[1];
-        slot.dims[3] = target->ne[0];
+        set_slot_hbm_dims(slot, target, buf, out_token_axis);
         slot.hbm_primary.resize(1);
         slot.hbm_primary[0] = std::move(buf);
         slot.hbm_scales.clear();
@@ -2768,14 +3581,16 @@ static void store_tensor_hbm_single(cloudtpu::PjrtRuntime& rt,
     }
 
     if (t->data) {
-        rt.buffer_to_host(buf->handle.get(), t->data, ggml_nbytes(t));
+        const struct ggml_tensor* shape_t = canonical_root(t);
+        copy_output_buffer_to_host_ptr(rt, shape_t, buf, out_token_axis, t->data);
     }
 }
 
 static void store_tensor_hbm_spmd(cloudtpu::PjrtRuntime& rt,
                                   struct ggml_tensor* t,
                                   const std::vector<std::vector<cloudtpu::PjrtBufferPtr>>& per_dev_outs,
-                                  size_t out_idx) {
+                                  size_t out_idx,
+                                  int out_token_axis = -1) {
     if (t->buffer && is_cloudtpu_buffer(t->buffer)) {
         auto* bctx = static_cast<ggml_backend_cloudtpu_buffer_context*>(t->buffer->context);
         const struct ggml_tensor* target = t;
@@ -2787,7 +3602,7 @@ static void store_tensor_hbm_spmd(cloudtpu::PjrtRuntime& rt,
                 const size_t t_off = tensor_offset_in_buffer(bctx, t);
                 const size_t t_bytes = ggml_nbytes(t);
                 std::vector<uint8_t> slice_bytes(t_bytes);
-                rt.buffer_to_host(per_dev_outs[0][out_idx]->handle.get(), slice_bytes.data(), t_bytes);
+                copy_output_buffer_to_host_ptr(rt, t, per_dev_outs[0][out_idx], out_token_axis, slice_bytes.data());
                 std::lock_guard<std::mutex> lock(bctx->mu);
                 if (patch_view_into_root_slot_locked(
                         rt, bctx, t->buffer, t, t_off, 0, t_bytes, slice_bytes.data(), 0,
@@ -2799,6 +3614,7 @@ static void store_tensor_hbm_spmd(cloudtpu::PjrtRuntime& rt,
         const size_t t_off = tensor_offset_in_buffer(bctx, target);
         const size_t t_bytes = ggml_nbytes(target);
         const size_t P = per_dev_outs.size();
+        const auto& ref_buf = per_dev_outs[0][out_idx];
         std::lock_guard<std::mutex> lock(bctx->mu);
         bctx->evict_overlapping_locked(t_off, t_bytes, t_off);
         CloudTpuTensorSlot& slot = bctx->slots[t_off];
@@ -2807,12 +3623,9 @@ static void store_tensor_hbm_spmd(cloudtpu::PjrtRuntime& rt,
         slot.ggml_dt = target->type;
         slot.storage = cloudtpu::TensorStorageKind::DENSE;
         slot.sharding = cloudtpu::TensorShardingKind::REPLICATED;
-        slot.dtype = per_dev_outs[0][out_idx]->dtype;
+        slot.dtype = ref_buf->dtype;
         slot.scale_dtype = cloudtpu::PjrtDType::INVALID;
-        slot.dims[0] = target->ne[3];
-        slot.dims[1] = target->ne[2];
-        slot.dims[2] = target->ne[1];
-        slot.dims[3] = target->ne[0];
+        set_slot_hbm_dims(slot, target, ref_buf, out_token_axis);
         slot.hbm_primary.resize(P);
         for (size_t p = 0; p < P; ++p) {
             slot.hbm_primary[p] = per_dev_outs[p][out_idx];
@@ -2829,7 +3642,8 @@ static void store_tensor_hbm_spmd(cloudtpu::PjrtRuntime& rt,
     }
 
     if (t->data && !per_dev_outs.empty()) {
-        rt.buffer_to_host(per_dev_outs[0][out_idx]->handle.get(), t->data, ggml_nbytes(t));
+        const struct ggml_tensor* shape_t = canonical_root(t);
+        copy_output_buffer_to_host_ptr(rt, shape_t, per_dev_outs[0][out_idx], out_token_axis, t->data);
     }
 }
 
@@ -2877,6 +3691,98 @@ static bool tensor_range_covers(const struct ggml_tensor* outer, const struct gg
     const uintptr_t i0 = reinterpret_cast<uintptr_t>(inner->data);
     const uintptr_t i1 = i0 + i_bytes;
     return o0 <= i0 && o1 >= i1;
+}
+
+static CloudSlotKey make_slot_key(const struct ggml_tensor* t) {
+    if (!t || !t->buffer || !is_cloudtpu_buffer(t->buffer) || !t->data) {
+        return {};
+    }
+    return {t->buffer, reinterpret_cast<uintptr_t>(t->data)};
+}
+
+// Returns the canonical root tensor updated in-place by `node` iff `node` produces a complete,
+// dense, contiguous representation of that root slot suitable for in-slice SSA forwarding.
+static const struct ggml_tensor* get_forwardable_inplace_root(const struct ggml_tensor* node) {
+    if (!node || is_skipped_graph_node(node)) {
+        return nullptr;
+    }
+    if (node->op != GGML_OP_SET_ROWS && node->view_src == nullptr) {
+        return nullptr;
+    }
+    if (!node->buffer || !is_cloudtpu_buffer(node->buffer) || !node->data) {
+        return nullptr;
+    }
+    if (!is_supported_output_layout(node) || !is_dense_supported_type(node->type)) {
+        return nullptr;
+    }
+    const struct ggml_tensor* root = canonical_root(node);
+    if (!root || root->buffer != node->buffer || root->data != node->data ||
+        root->type != node->type || !ggml_is_contiguous(root) ||
+        ggml_nelements(root) != ggml_nelements(node)) {
+        return nullptr;
+    }
+    if (node->op == GGML_OP_SET_ROWS) {
+        if (!node->src[2]) {
+            return nullptr;
+        }
+        const struct ggml_tensor* tbl_root = canonical_root(node->src[2]);
+        if (!tbl_root || tbl_root->buffer != root->buffer || tbl_root->data != root->data ||
+            tbl_root->type != root->type || ggml_nelements(tbl_root) != ggml_nelements(root)) {
+            return nullptr;
+        }
+    }
+    return root;
+}
+
+static bool can_collapse_view_chain_to_leaf(const struct ggml_tensor* t,
+                                            const struct ggml_tensor* target_leaf,
+                                            int depth = 0) {
+    if (!t || depth > 8) {
+        return false;
+    }
+    if (t == target_leaf) {
+        return true;
+    }
+    const struct ggml_tensor* parent = view_parent(t);
+    if (!t->view_src || !parent ||
+        !(is_dense_supported_type(t->type) || t->type == GGML_TYPE_I64) ||
+        t->type != parent->type) {
+        return false;
+    }
+    if ((t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE) && t->view_offs == parent->view_offs) {
+        return can_collapse_view_chain_to_leaf(parent, target_leaf, depth + 1);
+    }
+    if (t->view_offs == parent->view_offs && ggml_is_contiguous(t) &&
+        ggml_is_contiguous(parent) && ggml_nelements(t) == ggml_nelements(parent)) {
+        return can_collapse_view_chain_to_leaf(parent, target_leaf, depth + 1);
+    }
+    const struct ggml_tensor* slice_base = nullptr;
+    if (try_build_view_slice(t, nullptr, &slice_base) && slice_base != nullptr) {
+        return can_collapse_view_chain_to_leaf(slice_base, target_leaf, depth + 1);
+    }
+    return false;
+}
+
+static bool is_alias_tracked_write(const struct ggml_tensor* t) {
+    return !t || t->op == GGML_OP_SET_ROWS || t->view_src != nullptr ||
+           !t->buffer || !is_cloudtpu_buffer(t->buffer);
+}
+
+// True when `node` at cgraph index `node_idx` is a pure ggml_gallocr scratch intermediate
+// whose consumers have all finished before `before_idx` (and is not an output or alias write),
+// so a later standalone CloudTPU write reusing part of its byte range safely retires it.
+static bool is_dead_gallocr_scratch(const ggml_backend_cloudtpu_context* ctx,
+                                    const struct ggml_tensor* node,
+                                    int node_idx,
+                                    int before_idx) {
+    if (!node || node_idx < 0 || is_alias_tracked_write(node)) {
+        return false;
+    }
+    if ((node->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
+        return false;
+    }
+    const int last_use = ctx->liveness.last_consumer[static_cast<size_t>(node_idx)];
+    return last_use >= 0 && last_use < before_idx;
 }
 
 static void compute_cgraph_liveness(ggml_backend_cloudtpu_context* ctx, const struct ggml_cgraph* cgraph) {
@@ -2938,8 +3844,15 @@ static void compute_cgraph_liveness(ggml_backend_cloudtpu_context* ctx, const st
         auto& active = active_by_buf[nk->buffer];
         for (size_t a = 0; a < active.size();) {
             // Only treat a later write as killing an earlier write when it completely covers
-            // the earlier byte range; partial subview overwrites must preserve untouched bytes.
-            if (b0 <= active[a].start && b1 >= active[a].end) {
+            // the earlier byte range, OR when a standalone compute op reuses freed ggml_gallocr
+            // scratch bytes of a dead non-output intermediate whose consumers already finished;
+            // partial subview overwrites of live/output buffers must preserve untouched bytes.
+            const bool covers = (b0 <= active[a].start && b1 >= active[a].end);
+            const bool overlaps = (active[a].start < b1 && b0 < active[a].end);
+            const bool dead_scratch_reuse =
+                overlaps && !is_alias_tracked_write(nk) &&
+                is_dead_gallocr_scratch(ctx, cgraph->nodes[active[a].node_idx], active[a].node_idx, k);
+            if (covers || dead_scratch_reuse) {
                 ctx->liveness.first_overwrite[static_cast<size_t>(active[a].node_idx)] = k;
                 active[a] = active.back();
                 active.pop_back();
@@ -3080,6 +3993,309 @@ static void ggml_backend_cloudtpu_synchronize_ctx(ggml_backend_cloudtpu_context*
     await_sync_launches(rt, to_wait);
 }
 
+struct BuiltSubgraphSpec {
+    cloudtpu::GraphProgramSpec prog_spec;
+    std::unordered_map<uint64_t, uint32_t> id_to_input_idx;
+    std::vector<const struct ggml_tensor*> input_nodes;
+    std::vector<const struct ggml_tensor*> output_nodes;
+};
+
+static int64_t detect_slice_candidate_tokens(const struct ggml_cgraph* cgraph,
+                                             int start_idx,
+                                             int end_idx,
+                                             int64_t max_bucket) {
+    if (max_bucket <= 0) {
+        return 0;
+    }
+    for (int i = start_idx; i < end_idx; ++i) {
+        const struct ggml_tensor* node = cgraph->nodes[i];
+        if (is_skipped_graph_node(node)) {
+            continue;
+        }
+        switch (node->op) {
+            case GGML_OP_GET_ROWS: {
+                const struct ggml_tensor* idx = node->src[1];
+                if (idx && idx->ne[1] == 1 && idx->ne[2] == 1 && idx->ne[3] == 1 &&
+                    idx->ne[0] >= 1 && idx->ne[0] <= max_bucket) {
+                    return idx->ne[0];
+                }
+                break;
+            }
+            case GGML_OP_SET_ROWS: {
+                const struct ggml_tensor* idx = node->src[1];
+                if (idx && idx->ne[1] == 1 && idx->ne[2] == 1 && idx->ne[3] == 1 &&
+                    idx->ne[0] >= 1 && idx->ne[0] <= max_bucket) {
+                    return idx->ne[0];
+                }
+                break;
+            }
+            case GGML_OP_ROPE: {
+                const struct ggml_tensor* x = node->src[0];
+                const struct ggml_tensor* pos = node->src[1];
+                if (x && pos && pos->ne[1] == 1 && pos->ne[2] == 1 && pos->ne[3] == 1 &&
+                    x->ne[2] == pos->ne[0] && pos->ne[0] >= 1 && pos->ne[0] <= max_bucket) {
+                    return pos->ne[0];
+                }
+                break;
+            }
+            case GGML_OP_FLASH_ATTN_EXT: {
+                const struct ggml_tensor* q = node->src[0];
+                if (q && q->ne[1] >= 1 && q->ne[1] <= max_bucket) {
+                    return q->ne[1];
+                }
+                break;
+            }
+            case GGML_OP_MUL_MAT: {
+                const struct ggml_tensor* src1 = node->src[1];
+                if (src1 && src1->ne[1] >= 1 && src1->ne[1] <= max_bucket) {
+                    return src1->ne[1];
+                }
+                break;
+            }
+            default:
+                break;
+        }
+    }
+    return 0;
+}
+
+static BuiltSubgraphSpec build_subgraph_program_spec(const ggml_backend_cloudtpu_context* ctx,
+                                                     const struct ggml_cgraph* cgraph,
+                                                     int start_idx,
+                                                     int end_idx,
+                                                     int P,
+                                                     const std::vector<uint8_t>& live_out_flags,
+                                                     const std::vector<uint8_t>& keep_sharded_flags,
+                                                     const std::vector<int32_t>* input_alias_out,
+                                                     bool use_scratch_input_meta) {
+    BuiltSubgraphSpec built;
+    cloudtpu::GraphProgramSpec& prog_spec = built.prog_spec;
+    prog_spec.spmd_chips = P;
+    prog_spec.bf16_matmul = ctx->env.bf16_matmul;
+    prog_spec.bf16_flash_attn = ctx->env.bf16_flash_attn;
+    prog_spec.q4_split_dot = ctx->env.q4_split_dot;
+    prog_spec.mm_pad_m = ctx->env.mm_pad_m;
+
+    struct SpecCacheEntry {
+        uint64_t id = 0;
+        uint64_t slot_epoch = 0;
+    };
+    struct InSliceSlotSpec {
+        uint64_t id = 0;
+        const struct ggml_tensor* root = nullptr;
+        uint64_t epoch = 0;
+    };
+    std::unordered_map<const struct ggml_tensor*, SpecCacheEntry> tensor_to_id;
+    std::unordered_set<const struct ggml_tensor*> spec_computed_nodes;
+    std::unordered_map<CloudSlotKey, InSliceSlotSpec, CloudSlotKeyHash> slot_spec_state;
+    uint64_t spec_next_id = 1;
+    uint64_t spec_slot_epoch = 0;
+    uint32_t next_in_idx = 0;
+
+    auto get_or_register_input = [&](auto& self, const struct ggml_tensor* t) -> uint64_t {
+        if (!t) return 0;
+        if (spec_computed_nodes.count(t)) {
+            return tensor_to_id.at(t).id;
+        }
+        const struct ggml_tensor* root_t = unwrap_view_src(t);
+        const CloudSlotKey root_sk = make_slot_key(root_t);
+        uint64_t cur_epoch = 0;
+        if (root_sk.valid()) {
+            auto sit = slot_spec_state.find(root_sk);
+            if (sit != slot_spec_state.end()) {
+                cur_epoch = sit->second.epoch;
+            }
+        }
+        auto it = tensor_to_id.find(t);
+        if (it != tensor_to_id.end() && it->second.slot_epoch == cur_epoch) {
+            return it->second.id;
+        }
+        const struct ggml_tensor* parent = view_parent(t);
+        if (t->view_src != nullptr && parent != nullptr &&
+            (is_dense_supported_type(t->type) || t->type == GGML_TYPE_I64) &&
+            t->type == parent->type) {
+            if (t->op == GGML_OP_PERMUTE && t->view_offs == parent->view_offs) {
+                const uint64_t base_id = self(self, parent);
+                const uint64_t tid = spec_next_id++;
+                cloudtpu::OpNodeSpec p_op;
+                p_op.kind = cloudtpu::CloudOpKind::TRANSPOSE;
+                p_op.src_ids = {base_id};
+                p_op.dst = tensor_to_spec(t, tid);
+                const int32_t* ax = static_cast<const int32_t*>(t->op_params);
+                int inv[4] = {0, 1, 2, 3};
+                for (int g = 0; g < 4; ++g) inv[ax[g]] = g;
+                for (int h = 0; h < 4; ++h) p_op.perm[h] = 3 - inv[3 - h];
+                prog_spec.ops.push_back(std::move(p_op));
+                tensor_to_id[t] = {tid, cur_epoch};
+                return tid;
+            }
+            if (t->op == GGML_OP_TRANSPOSE && t->view_offs == parent->view_offs) {
+                const uint64_t base_id = self(self, parent);
+                const uint64_t tid = spec_next_id++;
+                cloudtpu::OpNodeSpec p_op;
+                p_op.kind = cloudtpu::CloudOpKind::TRANSPOSE;
+                p_op.src_ids = {base_id};
+                p_op.dst = tensor_to_spec(t, tid);
+                p_op.perm[0] = 0;
+                p_op.perm[1] = 1;
+                p_op.perm[2] = 3;
+                p_op.perm[3] = 2;
+                prog_spec.ops.push_back(std::move(p_op));
+                tensor_to_id[t] = {tid, cur_epoch};
+                return tid;
+            }
+            if (t->view_offs == parent->view_offs && ggml_is_contiguous(t) &&
+                ggml_is_contiguous(parent) &&
+                ggml_nelements(t) == ggml_nelements(parent)) {
+                const uint64_t base_id = self(self, parent);
+                const uint64_t rid = spec_next_id++;
+                cloudtpu::OpNodeSpec r_op;
+                r_op.kind = cloudtpu::CloudOpKind::RESHAPE;
+                r_op.src_ids = {base_id};
+                r_op.dst = tensor_to_spec(t, rid);
+                prog_spec.ops.push_back(std::move(r_op));
+                tensor_to_id[t] = {rid, cur_epoch};
+                return rid;
+            }
+            ViewSlicePlan vplan;
+            const struct ggml_tensor* slice_base = nullptr;
+            if (try_build_view_slice(t, &vplan, &slice_base)) {
+                const uint64_t base_id = self(self, slice_base);
+                const uint64_t sid = spec_next_id++;
+                cloudtpu::OpNodeSpec s_op;
+                s_op.kind = cloudtpu::CloudOpKind::SLICE;
+                s_op.src_ids = {base_id};
+                s_op.dst = tensor_to_spec(t, sid);
+                s_op.slice_reshape = std::move(vplan.reshape_dims);
+                s_op.slice_starts = std::move(vplan.starts);
+                s_op.slice_limits = std::move(vplan.limits);
+                prog_spec.ops.push_back(std::move(s_op));
+                tensor_to_id[t] = {sid, cur_epoch};
+                return sid;
+            }
+        }
+        const CloudSlotKey leaf_sk = make_slot_key(t);
+        if (leaf_sk.valid()) {
+            auto sit = slot_spec_state.find(leaf_sk);
+            if (sit != slot_spec_state.end() && sit->second.root != nullptr &&
+                is_dense_supported_type(t->type) && t->type == sit->second.root->type &&
+                ggml_is_contiguous(t) && ggml_nelements(t) == ggml_nelements(sit->second.root)) {
+                const struct ggml_tensor* r = sit->second.root;
+                if (t->ne[0] == r->ne[0] && t->ne[1] == r->ne[1] &&
+                    t->ne[2] == r->ne[2] && t->ne[3] == r->ne[3]) {
+                    tensor_to_id[t] = {sit->second.id, sit->second.epoch};
+                    return sit->second.id;
+                }
+                const uint64_t rid = spec_next_id++;
+                cloudtpu::OpNodeSpec r_op;
+                r_op.kind = cloudtpu::CloudOpKind::RESHAPE;
+                r_op.src_ids = {sit->second.id};
+                r_op.dst = tensor_to_spec(t, rid);
+                prog_spec.ops.push_back(std::move(r_op));
+                tensor_to_id[t] = {rid, sit->second.epoch};
+                return rid;
+            }
+        }
+        const uint64_t id = spec_next_id++;
+        const uint32_t in_idx = next_in_idx++;
+        const cloudtpu::TensorShardingKind sh = use_scratch_input_meta
+                                                    ? ctx->scratch_input_sharding[in_idx]
+                                                    : lookup_tensor_sharding(t, P);
+        const cloudtpu::PjrtDType sdt = use_scratch_input_meta
+                                            ? ctx->scratch_input_scale_dt[in_idx]
+                                            : lookup_tensor_scale_dtype(t, ctx->env.q4k_bf16_scales);
+        const Q4SlotPlan q4p = use_scratch_input_meta
+                                   ? ctx->scratch_input_q4_plans[in_idx]
+                                   : lookup_tensor_q4_plan(t, P, sh, ctx->env.q4_mode, ctx->env.q4k_u4);
+        tensor_to_id[t] = {id, 0};
+        built.id_to_input_idx[id] = in_idx;
+        built.input_nodes.push_back(t);
+        cloudtpu::TensorSpec ts = tensor_to_spec(t, id, sh, &q4p);
+        ts.scale_dtype = sdt;
+        ts.alias_output_idx = (input_alias_out != nullptr) ? (*input_alias_out)[in_idx] : -1;
+        prog_spec.inputs.push_back(std::move(ts));
+        return id;
+    };
+
+    for (int i = start_idx; i < end_idx; ++i) {
+        struct ggml_tensor* node = cgraph->nodes[i];
+        if (is_skipped_graph_node(node)) {
+            continue;
+        }
+        std::vector<uint64_t> src_ids;
+        if (node->op == GGML_OP_ROPE || node->op == GGML_OP_SOFT_MAX) {
+            src_ids.push_back(get_or_register_input(get_or_register_input, node->src[0]));
+            src_ids.push_back(get_or_register_input(get_or_register_input, node->src[1]));
+            if (node->src[2]) src_ids.push_back(get_or_register_input(get_or_register_input, node->src[2]));
+        } else if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+            src_ids.push_back(get_or_register_input(get_or_register_input, node->src[0]));
+            src_ids.push_back(get_or_register_input(get_or_register_input, node->src[1]));
+            src_ids.push_back(get_or_register_input(get_or_register_input, node->src[2]));
+            if (node->src[3]) src_ids.push_back(get_or_register_input(get_or_register_input, node->src[3]));
+        } else if (node->op == GGML_OP_GLU) {
+            src_ids.push_back(get_or_register_input(get_or_register_input, node->src[0]));
+            if (node->src[1]) src_ids.push_back(get_or_register_input(get_or_register_input, node->src[1]));
+        } else if (node->op == GGML_OP_CPY || node->op == GGML_OP_CONT) {
+            src_ids.push_back(get_or_register_input(get_or_register_input, node->src[0]));
+        } else {
+            for (int s = 0; s < GGML_MAX_SRC && node->src[s] != nullptr; ++s) {
+                src_ids.push_back(get_or_register_input(get_or_register_input, node->src[s]));
+            }
+        }
+
+        const size_t rel_idx = static_cast<size_t>(i - start_idx);
+        const uint64_t dst_id = spec_next_id++;
+        cloudtpu::OpNodeSpec op_spec = build_op_node_spec(node, dst_id, src_ids);
+        op_spec.keep_sharded_out = (keep_sharded_flags[rel_idx] != 0);
+        prog_spec.ops.push_back(std::move(op_spec));
+        spec_computed_nodes.insert(node);
+        tensor_to_id[node] = {dst_id, 0};
+
+        uint64_t store_id = dst_id;
+        const struct ggml_tensor* root = canonical_root(node);
+        if (root != node && (root->ne[0] != node->ne[0] || root->ne[1] != node->ne[1] ||
+                             root->ne[2] != node->ne[2] || root->ne[3] != node->ne[3])) {
+            const uint64_t rid = spec_next_id++;
+            cloudtpu::OpNodeSpec r_op;
+            r_op.kind = cloudtpu::CloudOpKind::RESHAPE;
+            r_op.src_ids = {dst_id};
+            r_op.dst = tensor_to_spec(root, rid);
+            prog_spec.ops.push_back(std::move(r_op));
+            store_id = rid;
+        }
+
+        const struct ggml_tensor* fwd_root = get_forwardable_inplace_root(node);
+        if (fwd_root != nullptr) {
+            const CloudSlotKey sk = make_slot_key(fwd_root);
+            if (sk.valid()) {
+                for (auto sit = slot_spec_state.begin(); sit != slot_spec_state.end();) {
+                    if (!(sit->first == sk) && tensor_ranges_overlap(fwd_root, sit->second.root)) {
+                        sit = slot_spec_state.erase(sit);
+                    } else {
+                        ++sit;
+                    }
+                }
+                const uint64_t ep = ++spec_slot_epoch;
+                slot_spec_state[sk] = {store_id, fwd_root, ep};
+            }
+        } else if (node->buffer && is_cloudtpu_buffer(node->buffer) && node->data) {
+            for (auto sit = slot_spec_state.begin(); sit != slot_spec_state.end();) {
+                if (tensor_ranges_overlap(node, sit->second.root)) {
+                    sit = slot_spec_state.erase(sit);
+                } else {
+                    ++sit;
+                }
+            }
+        }
+
+        if (live_out_flags[rel_idx]) {
+            prog_spec.output_ids.push_back(store_id);
+            built.output_nodes.push_back(node);
+        }
+    }
+    return built;
+}
+
 static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
                                          cloudtpu::PjrtRuntime& rt,
                                          struct ggml_cgraph* cgraph,
@@ -3214,12 +4430,67 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
     };
     prune_evicted_plans();
 
+    // 3b. Continuous batching padded buckets: analyze dataflow token_axis only when 1 <= T < B.
+    BuiltSubgraphSpec bucket_built;
+    cloudtpu::BucketAnalysisResult bucket_plan;
+    if (!ctx->env.batch_buckets.empty()) {
+        const int64_t cand_T = detect_slice_candidate_tokens(
+            cgraph, start_idx, end_idx, ctx->env.batch_buckets.back());
+        const int64_t bucket_B = (cand_T >= 1) ? cloudtpu::select_batch_bucket(cand_T, ctx->env.batch_buckets) : 0;
+        if (bucket_B > cand_T) {
+            bucket_built = build_subgraph_program_spec(
+                ctx, cgraph, start_idx, end_idx, P, live_out_flags, keep_sharded_flags, nullptr, false);
+            bucket_plan = cloudtpu::analyze_program_token_axes(bucket_built.prog_spec, cand_T, bucket_B);
+            if (bucket_plan.success && bucket_plan.id_token_axis.empty()) {
+                bucket_plan.success = false;
+                bucket_plan.fail_reason = "id_token_axis_empty";
+            }
+            if (bucket_plan.success) {
+                for (size_t ii = 0; ii < bucket_built.input_nodes.size(); ++ii) {
+                    if (bucket_plan.input_token_axis[ii] >= 0) {
+                        const struct ggml_tensor* inp = bucket_built.input_nodes[ii];
+                        if (!inp || !ggml_is_contiguous(inp) ||
+                            ggml_type_to_pjrt(inp->type) == cloudtpu::PjrtDType::INVALID) {
+                            bucket_plan.success = false;
+                            bucket_plan.fail_reason = "non_contiguous_padded_input";
+                            break;
+                        }
+                    }
+                }
+            }
+            if (bucket_plan.success) {
+                for (size_t oi = 0; oi < bucket_built.output_nodes.size(); ++oi) {
+                    if (bucket_plan.output_token_axis[oi] >= 0) {
+                        auto cit = ctx->cgraph_node_idx.find(bucket_built.output_nodes[oi]);
+                        if (cit != ctx->cgraph_node_idx.end() &&
+                            ctx->liveness.last_consumer[static_cast<size_t>(cit->second)] >= end_idx) {
+                            bucket_plan.success = false;
+                            bucket_plan.fail_reason = "downstream_cgraph_consumer";
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!bucket_plan.success && ctx->env.verbose >= 2) {
+                GGML_LOG_INFO("ggml-cloudtpu: batch bucket skipped [%d..%d) T=%lld B=%lld reason=%s\n",
+                              start_idx, end_idx,
+                              static_cast<long long>(cand_T),
+                              static_cast<long long>(bucket_B),
+                              bucket_plan.fail_reason.empty() ? "unknown" : bucket_plan.fail_reason.c_str());
+            }
+        }
+    }
+
     // 4. Single-pass structural signature + ordered leaf input/output discovery (zero MLIR emission!).
     ctx->scratch_key.words.clear();
     ctx->scratch_tensor_to_id.clear();
+    ctx->scratch_slice_computed.clear();
+    ctx->scratch_slot_sig_state.clear();
+    ctx->scratch_leaf_ssa_uses.clear();
     ctx->scratch_inputs.clear();
     ctx->scratch_input_sharding.clear();
     ctx->scratch_input_scale_dt.clear();
+    ctx->scratch_input_q4_plans.clear();
     ctx->scratch_outputs.clear();
 
     auto& sig = ctx->scratch_key.words;
@@ -3229,13 +4500,39 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
                   (ctx->env.async_collectives ? 2ULL : 0ULL) |
                   (ctx->env.donate_kv ? 4ULL : 0ULL) |
                   (ctx->env.q4_split_dot ? 8ULL : 0ULL) |
-                  (ctx->env.bf16_flash_attn ? 16ULL : 0ULL));
+                  (ctx->env.bf16_flash_attn ? 16ULL : 0ULL) |
+                  (ctx->env.q4k_u4 ? 32ULL : 0ULL) |
+                  (static_cast<uint64_t>(ctx->env.q4_mode) << 8));
+    sig_push(sig, static_cast<uint64_t>(ctx->env.mm_pad_m));
     uint32_t next_id = 1;
+    uint64_t sig_slot_epoch = 0;
 
-    auto register_input_sig = [&](auto& self, const struct ggml_tensor* t) -> uint32_t {
-        if (!t) return 0;
+    auto sig_ne = [&](const struct ggml_tensor* t, uint32_t id, int ggml_dim) -> uint64_t {
+        if (bucket_plan.success && static_cast<size_t>(id) < bucket_plan.id_token_axis.size()) {
+            const int ax = bucket_plan.id_token_axis[static_cast<size_t>(id)];
+            if (ax >= 0 && (3 - ax) == ggml_dim) {
+                return static_cast<uint64_t>(bucket_plan.bucket_tokens);
+            }
+        }
+        return static_cast<uint64_t>(t->ne[ggml_dim]);
+    };
+
+    auto register_input_sig = [&](auto& self, const struct ggml_tensor* t) -> SigCacheEntry {
+        if (!t) return {};
+        if (ctx->scratch_slice_computed.count(t)) {
+            return ctx->scratch_tensor_to_id.at(t);
+        }
+        const struct ggml_tensor* root_t = unwrap_view_src(t);
+        const CloudSlotKey root_sk = make_slot_key(root_t);
+        uint64_t cur_epoch = 0;
+        if (root_sk.valid()) {
+            auto sit = ctx->scratch_slot_sig_state.find(root_sk);
+            if (sit != ctx->scratch_slot_sig_state.end()) {
+                cur_epoch = sit->second.epoch;
+            }
+        }
         auto it = ctx->scratch_tensor_to_id.find(t);
-        if (it != ctx->scratch_tensor_to_id.end()) {
+        if (it != ctx->scratch_tensor_to_id.end() && it->second.slot_epoch == cur_epoch) {
             return it->second;
         }
         const struct ggml_tensor* parent = view_parent(t);
@@ -3243,63 +4540,82 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
             (is_dense_supported_type(t->type) || t->type == GGML_TYPE_I64) &&
             t->type == parent->type) {
             if (t->op == GGML_OP_PERMUTE && t->view_offs == parent->view_offs) {
-                const uint32_t base_id = self(self, parent);
+                const SigCacheEntry base = self(self, parent);
                 const uint32_t tid = next_id++;
                 const int32_t* ax = static_cast<const int32_t*>(t->op_params);
                 sig_push(sig, 2ULL);
-                sig_push(sig, base_id);
+                sig_push(sig, base.id);
                 sig_push(sig, static_cast<uint64_t>(t->type));
-                sig_push(sig, static_cast<uint64_t>(t->ne[0]));
-                sig_push(sig, static_cast<uint64_t>(t->ne[1]));
-                sig_push(sig, static_cast<uint64_t>(t->ne[2]));
-                sig_push(sig, static_cast<uint64_t>(t->ne[3]));
+                sig_push(sig, sig_ne(t, tid, 0));
+                sig_push(sig, sig_ne(t, tid, 1));
+                sig_push(sig, sig_ne(t, tid, 2));
+                sig_push(sig, sig_ne(t, tid, 3));
                 sig_push(sig, (static_cast<uint64_t>(ax[0] & 3) << 0) |
                               (static_cast<uint64_t>(ax[1] & 3) << 4) |
                               (static_cast<uint64_t>(ax[2] & 3) << 8) |
                               (static_cast<uint64_t>(ax[3] & 3) << 12));
-                ctx->scratch_tensor_to_id[t] = tid;
-                return tid;
+                const SigCacheEntry entry{tid, cur_epoch, base.root_leaf_idx};
+                ctx->scratch_tensor_to_id[t] = entry;
+                return entry;
             }
             if (t->op == GGML_OP_TRANSPOSE && t->view_offs == parent->view_offs) {
-                const uint32_t base_id = self(self, parent);
+                const SigCacheEntry base = self(self, parent);
                 const uint32_t tid = next_id++;
                 sig_push(sig, 3ULL);
-                sig_push(sig, base_id);
+                sig_push(sig, base.id);
                 sig_push(sig, static_cast<uint64_t>(t->type));
-                sig_push(sig, static_cast<uint64_t>(t->ne[0]));
-                sig_push(sig, static_cast<uint64_t>(t->ne[1]));
-                sig_push(sig, static_cast<uint64_t>(t->ne[2]));
-                sig_push(sig, static_cast<uint64_t>(t->ne[3]));
-                ctx->scratch_tensor_to_id[t] = tid;
-                return tid;
+                sig_push(sig, sig_ne(t, tid, 0));
+                sig_push(sig, sig_ne(t, tid, 1));
+                sig_push(sig, sig_ne(t, tid, 2));
+                sig_push(sig, sig_ne(t, tid, 3));
+                const SigCacheEntry entry{tid, cur_epoch, base.root_leaf_idx};
+                ctx->scratch_tensor_to_id[t] = entry;
+                return entry;
             }
             if (t->view_offs == parent->view_offs && ggml_is_contiguous(t) &&
                 ggml_is_contiguous(parent) &&
                 ggml_nelements(t) == ggml_nelements(parent)) {
-                const uint32_t base_id = self(self, parent);
+                const SigCacheEntry base = self(self, parent);
                 const uint32_t rid = next_id++;
                 sig_push(sig, 4ULL);
-                sig_push(sig, base_id);
+                sig_push(sig, base.id);
                 sig_push(sig, static_cast<uint64_t>(t->type));
-                sig_push(sig, static_cast<uint64_t>(t->ne[0]));
-                sig_push(sig, static_cast<uint64_t>(t->ne[1]));
-                sig_push(sig, static_cast<uint64_t>(t->ne[2]));
-                sig_push(sig, static_cast<uint64_t>(t->ne[3]));
-                ctx->scratch_tensor_to_id[t] = rid;
-                return rid;
+                sig_push(sig, sig_ne(t, rid, 0));
+                sig_push(sig, sig_ne(t, rid, 1));
+                sig_push(sig, sig_ne(t, rid, 2));
+                sig_push(sig, sig_ne(t, rid, 3));
+                const SigCacheEntry entry{rid, cur_epoch, base.root_leaf_idx};
+                ctx->scratch_tensor_to_id[t] = entry;
+                return entry;
             }
             ViewSlicePlan vplan;
             const struct ggml_tensor* slice_base = nullptr;
             if (try_build_view_slice(t, &vplan, &slice_base)) {
-                const uint32_t base_id = self(self, slice_base);
+                const SigCacheEntry base = self(self, slice_base);
                 const uint32_t sid = next_id++;
+                if (bucket_plan.success &&
+                    static_cast<size_t>(base.id) < bucket_plan.id_token_axis.size() &&
+                    bucket_plan.id_token_axis[static_cast<size_t>(base.id)] >= 0) {
+                    const int64_t parent_dims[4] = {
+                        slice_base->ne[3], slice_base->ne[2], slice_base->ne[1], slice_base->ne[0]};
+                    if (!cloudtpu::bucket_view_slice_dims(
+                            parent_dims,
+                            bucket_plan.id_token_axis[static_cast<size_t>(base.id)],
+                            bucket_plan.orig_tokens,
+                            bucket_plan.bucket_tokens,
+                            vplan.reshape_dims,
+                            vplan.starts,
+                            vplan.limits)) {
+                        throw std::runtime_error("ggml-cloudtpu: SLICE bucketing mismatch");
+                    }
+                }
                 sig_push(sig, 5ULL);
-                sig_push(sig, base_id);
+                sig_push(sig, base.id);
                 sig_push(sig, static_cast<uint64_t>(t->type));
-                sig_push(sig, static_cast<uint64_t>(t->ne[0]));
-                sig_push(sig, static_cast<uint64_t>(t->ne[1]));
-                sig_push(sig, static_cast<uint64_t>(t->ne[2]));
-                sig_push(sig, static_cast<uint64_t>(t->ne[3]));
+                sig_push(sig, sig_ne(t, sid, 0));
+                sig_push(sig, sig_ne(t, sid, 1));
+                sig_push(sig, sig_ne(t, sid, 2));
+                sig_push(sig, sig_ne(t, sid, 3));
                 sig_push(sig, vplan.reshape_dims.size());
                 for (int64_t d : vplan.reshape_dims) sig_push(sig, static_cast<uint64_t>(d));
                 sig_push(sig, vplan.starts.size());
@@ -3307,26 +4623,63 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
                     sig_push(sig, static_cast<uint64_t>(vplan.starts[k]));
                     sig_push(sig, static_cast<uint64_t>(vplan.limits[k]));
                 }
-                ctx->scratch_tensor_to_id[t] = sid;
-                return sid;
+                const SigCacheEntry entry{sid, cur_epoch, base.root_leaf_idx};
+                ctx->scratch_tensor_to_id[t] = entry;
+                return entry;
+            }
+        }
+        // In-slice SSA forwarding: if this leaf aliases a canonical root already written in-slice
+        // (e.g. KV cache after SET_ROWS), resolve to the post-update SSA tensor instead of adding a duplicate leaf.
+        const CloudSlotKey leaf_sk = make_slot_key(t);
+        if (leaf_sk.valid()) {
+            auto sit = ctx->scratch_slot_sig_state.find(leaf_sk);
+            if (sit != ctx->scratch_slot_sig_state.end() && sit->second.root != nullptr &&
+                is_dense_supported_type(t->type) && t->type == sit->second.root->type &&
+                ggml_is_contiguous(t) && ggml_nelements(t) == ggml_nelements(sit->second.root)) {
+                const struct ggml_tensor* r = sit->second.root;
+                if (t->ne[0] == r->ne[0] && t->ne[1] == r->ne[1] &&
+                    t->ne[2] == r->ne[2] && t->ne[3] == r->ne[3]) {
+                    const SigCacheEntry entry{sit->second.id, sit->second.epoch, UINT32_MAX};
+                    ctx->scratch_tensor_to_id[t] = entry;
+                    return entry;
+                }
+                const uint32_t rid = next_id++;
+                sig_push(sig, 4ULL);
+                sig_push(sig, sit->second.id);
+                sig_push(sig, static_cast<uint64_t>(t->type));
+                sig_push(sig, sig_ne(t, rid, 0));
+                sig_push(sig, sig_ne(t, rid, 1));
+                sig_push(sig, sig_ne(t, rid, 2));
+                sig_push(sig, sig_ne(t, rid, 3));
+                const SigCacheEntry entry{rid, sit->second.epoch, UINT32_MAX};
+                ctx->scratch_tensor_to_id[t] = entry;
+                return entry;
             }
         }
         const uint32_t id = next_id++;
+        const uint32_t leaf_idx = static_cast<uint32_t>(ctx->scratch_inputs.size());
         const cloudtpu::TensorShardingKind sh = lookup_tensor_sharding(t, P);
         const cloudtpu::PjrtDType sdt = lookup_tensor_scale_dtype(t, ctx->env.q4k_bf16_scales);
-        ctx->scratch_tensor_to_id[t] = id;
+        const Q4SlotPlan q4p = lookup_tensor_q4_plan(t, P, sh, ctx->env.q4_mode, ctx->env.q4k_u4);
+        const SigCacheEntry entry{id, 0, leaf_idx};
+        ctx->scratch_tensor_to_id[t] = entry;
         ctx->scratch_inputs.push_back(t);
         ctx->scratch_input_sharding.push_back(sh);
         ctx->scratch_input_scale_dt.push_back(sdt);
+        ctx->scratch_input_q4_plans.push_back(q4p);
+        ctx->scratch_leaf_ssa_uses.push_back(0);
         sig_push(sig, 1ULL);
-        sig_push(sig, (static_cast<uint64_t>(t->type) << 16) |
+        sig_push(sig, (static_cast<uint64_t>(t->type) << 40) |
+                      (static_cast<uint64_t>(q4p.storage) << 32) |
+                      (static_cast<uint64_t>(q4p.q_dtype) << 24) |
+                      (static_cast<uint64_t>(q4p.bitcast_target) << 16) |
                       (static_cast<uint64_t>(sdt) << 8) |
                       static_cast<uint64_t>(sh));
-        sig_push(sig, static_cast<uint64_t>(t->ne[0]));
-        sig_push(sig, static_cast<uint64_t>(t->ne[1]));
-        sig_push(sig, static_cast<uint64_t>(t->ne[2]));
-        sig_push(sig, static_cast<uint64_t>(t->ne[3]));
-        return id;
+        sig_push(sig, sig_ne(t, id, 0));
+        sig_push(sig, sig_ne(t, id, 1));
+        sig_push(sig, sig_ne(t, id, 2));
+        sig_push(sig, sig_ne(t, id, 3));
+        return entry;
     };
 
     for (int i = start_idx; i < end_idx; ++i) {
@@ -3337,40 +4690,69 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
         const size_t rel_idx = static_cast<size_t>(i - start_idx);
         uint32_t sids[GGML_MAX_SRC];
         size_t n_src = 0;
+        auto push_sig_src = [&](const struct ggml_tensor* s_ptr) {
+            const SigCacheEntry se = register_input_sig(register_input_sig, s_ptr);
+            sids[n_src++] = se.id;
+            if (se.root_leaf_idx != UINT32_MAX) {
+                ctx->scratch_leaf_ssa_uses[se.root_leaf_idx] += 1;
+            }
+        };
         if (node->op == GGML_OP_ROPE || node->op == GGML_OP_SOFT_MAX) {
-            sids[n_src++] = register_input_sig(register_input_sig, node->src[0]);
-            sids[n_src++] = register_input_sig(register_input_sig, node->src[1]);
-            if (node->src[2]) sids[n_src++] = register_input_sig(register_input_sig, node->src[2]);
+            push_sig_src(node->src[0]);
+            push_sig_src(node->src[1]);
+            if (node->src[2]) push_sig_src(node->src[2]);
         } else if (node->op == GGML_OP_FLASH_ATTN_EXT) {
-            sids[n_src++] = register_input_sig(register_input_sig, node->src[0]);
-            sids[n_src++] = register_input_sig(register_input_sig, node->src[1]);
-            sids[n_src++] = register_input_sig(register_input_sig, node->src[2]);
-            if (node->src[3]) sids[n_src++] = register_input_sig(register_input_sig, node->src[3]);
+            push_sig_src(node->src[0]);
+            push_sig_src(node->src[1]);
+            push_sig_src(node->src[2]);
+            if (node->src[3]) push_sig_src(node->src[3]);
         } else if (node->op == GGML_OP_GLU) {
-            sids[n_src++] = register_input_sig(register_input_sig, node->src[0]);
-            if (node->src[1]) sids[n_src++] = register_input_sig(register_input_sig, node->src[1]);
+            push_sig_src(node->src[0]);
+            if (node->src[1]) push_sig_src(node->src[1]);
         } else if (node->op == GGML_OP_CPY || node->op == GGML_OP_CONT) {
             // GGML_OP_CPY (including ggml_cast) places the uncomputed destination in src[1];
             // only src[0] is read as a PJRT input.
-            sids[n_src++] = register_input_sig(register_input_sig, node->src[0]);
+            push_sig_src(node->src[0]);
         } else {
             for (int s = 0; s < GGML_MAX_SRC && node->src[s] != nullptr; ++s) {
-                sids[n_src++] = register_input_sig(register_input_sig, node->src[s]);
+                push_sig_src(node->src[s]);
             }
         }
 
         const uint32_t dst_id = next_id++;
-        ctx->scratch_tensor_to_id[node] = dst_id;
+        ctx->scratch_slice_computed.insert(node);
+        ctx->scratch_tensor_to_id[node] = {dst_id, 0, UINT32_MAX};
 
         bool needs_root_reshape = false;
-        const struct ggml_tensor* root = nullptr;
-        if (node->view_src != nullptr && node->view_offs == 0 &&
-            ggml_nelements(node) == ggml_nelements(node->view_src)) {
-            root = unwrap_view_src(node);
-            if (root && (root->ne[0] != node->ne[0] || root->ne[1] != node->ne[1] ||
-                         root->ne[2] != node->ne[2] || root->ne[3] != node->ne[3])) {
-                needs_root_reshape = true;
-                next_id++;
+        const struct ggml_tensor* root = canonical_root(node);
+        uint32_t store_sig_id = dst_id;
+        if (root != node && (root->ne[0] != node->ne[0] || root->ne[1] != node->ne[1] ||
+                             root->ne[2] != node->ne[2] || root->ne[3] != node->ne[3])) {
+            needs_root_reshape = true;
+            store_sig_id = next_id++;
+        }
+
+        const struct ggml_tensor* fwd_root = get_forwardable_inplace_root(node);
+        if (fwd_root != nullptr) {
+            const CloudSlotKey sk = make_slot_key(fwd_root);
+            if (sk.valid()) {
+                for (auto sit = ctx->scratch_slot_sig_state.begin(); sit != ctx->scratch_slot_sig_state.end();) {
+                    if (!(sit->first == sk) && tensor_ranges_overlap(fwd_root, sit->second.root)) {
+                        sit = ctx->scratch_slot_sig_state.erase(sit);
+                    } else {
+                        ++sit;
+                    }
+                }
+                const uint64_t ep = ++sig_slot_epoch;
+                ctx->scratch_slot_sig_state[sk] = {store_sig_id, fwd_root, ep};
+            }
+        } else if (node->buffer && is_cloudtpu_buffer(node->buffer) && node->data) {
+            for (auto sit = ctx->scratch_slot_sig_state.begin(); sit != ctx->scratch_slot_sig_state.end();) {
+                if (tensor_ranges_overlap(node, sit->second.root)) {
+                    sit = ctx->scratch_slot_sig_state.erase(sit);
+                } else {
+                    ++sit;
+                }
             }
         }
 
@@ -3382,17 +4764,17 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
                       (static_cast<uint64_t>(is_live_out) << 0) |
                       (static_cast<uint64_t>(keep_sh) << 1) |
                       (static_cast<uint64_t>(needs_root_reshape ? 1 : 0) << 2));
-        sig_push(sig, static_cast<uint64_t>(node->ne[0]));
-        sig_push(sig, static_cast<uint64_t>(node->ne[1]));
-        sig_push(sig, static_cast<uint64_t>(node->ne[2]));
-        sig_push(sig, static_cast<uint64_t>(node->ne[3]));
+        sig_push(sig, sig_ne(node, dst_id, 0));
+        sig_push(sig, sig_ne(node, dst_id, 1));
+        sig_push(sig, sig_ne(node, dst_id, 2));
+        sig_push(sig, sig_ne(node, dst_id, 3));
         sig_push(sig, n_src);
         for (size_t s = 0; s < n_src; ++s) sig_push(sig, sids[s]);
         if (needs_root_reshape && root) {
-            sig_push(sig, static_cast<uint64_t>(root->ne[0]));
-            sig_push(sig, static_cast<uint64_t>(root->ne[1]));
-            sig_push(sig, static_cast<uint64_t>(root->ne[2]));
-            sig_push(sig, static_cast<uint64_t>(root->ne[3]));
+            sig_push(sig, sig_ne(root, store_sig_id, 0));
+            sig_push(sig, sig_ne(root, store_sig_id, 1));
+            sig_push(sig, sig_ne(root, store_sig_id, 2));
+            sig_push(sig, sig_ne(root, store_sig_id, 3));
         }
 
         // Exact op-parameter bits
@@ -3470,8 +4852,9 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
                 dst_root->data != tbl_root->data || dst_root->type != tbl_root->type ||
                 out_node->type != tbl_in->type || dst_root->type != tbl_in->type ||
                 !ggml_is_contiguous(dst_root) || !ggml_is_contiguous(tbl_in) ||
-                dst_root->ne[0] != tbl_in->ne[0] || dst_root->ne[1] != tbl_in->ne[1] ||
-                dst_root->ne[2] != tbl_in->ne[2] || dst_root->ne[3] != tbl_in->ne[3]) {
+                dst_root->ne[0] != tbl_root->ne[0] || dst_root->ne[1] != tbl_root->ne[1] ||
+                dst_root->ne[2] != tbl_root->ne[2] || dst_root->ne[3] != tbl_root->ne[3] ||
+                ggml_nelements(tbl_in) != ggml_nelements(tbl_root)) {
                 continue;
             }
             if (is_quant_split_type(tbl_in->type)) {
@@ -3481,8 +4864,17 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
             bool dup_slot = false;
             for (size_t ii = 0; ii < ctx->scratch_inputs.size(); ++ii) {
                 const struct ggml_tensor* cand = ctx->scratch_inputs[ii];
-                if (cand == tbl_in) {
-                    found_in = ii;
+                const struct ggml_tensor* croot = canonical_root(cand);
+                if (croot && croot->buffer == dst_root->buffer && croot->data == dst_root->data) {
+                    if (found_in == SIZE_MAX &&
+                        cand->type == dst_root->type &&
+                        cand->ne[0] == dst_root->ne[0] && cand->ne[1] == dst_root->ne[1] &&
+                        cand->ne[2] == dst_root->ne[2] && cand->ne[3] == dst_root->ne[3]) {
+                        found_in = ii;
+                    } else {
+                        dup_slot = true;
+                        break;
+                    }
                 } else if (tensor_ranges_overlap(cand, dst_root)) {
                     dup_slot = true;
                     break;
@@ -3497,21 +4889,13 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
                 ctx->scratch_input_sharding[found_in] != cloudtpu::TensorShardingKind::REPLICATED) {
                 continue;
             }
-            // Verify tbl_in is consumed only once inside [start_idx, end_idx) (by out_node->src[2]).
-            int uses = 0;
-            for (int k = start_idx; k < end_idx; ++k) {
-                const struct ggml_tensor* nk = cgraph->nodes[k];
-                if (is_skipped_graph_node(nk)) continue;
-                for (int s = 0; s < GGML_MAX_SRC && nk->src[s] != nullptr; ++s) {
-                    for (const struct ggml_tensor* cur = nk->src[s]; cur != nullptr; cur = view_parent(cur)) {
-                        if (cur == tbl_in) {
-                            ++uses;
-                            break;
-                        }
-                    }
-                }
-            }
-            if (uses == 1) {
+            // Verify pre-SET_ROWS leaf input is consumed ONLY once in the lowered SSA program
+            // (downstream VIEW/FLASH_ATTN_EXT reads in the same slice consume the forwarded post-SET_ROWS SSA value).
+            // Never donate a token-varying non-KV buffer (e.g. mixed_embd) whose H2D upload is bucket-padded.
+            const bool bucketed_input =
+                (bucket_plan.success && found_in < bucket_plan.input_token_axis.size() &&
+                 bucket_plan.input_token_axis[found_in] >= 0);
+            if (!bucketed_input && ctx->scratch_leaf_ssa_uses[found_in] == 1) {
                 input_alias_out[found_in] = static_cast<int32_t>(oi);
                 has_alias = true;
             }
@@ -3541,152 +4925,22 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
     }
     if (plan_ptr == nullptr) {
         ctx->plan_misses += 1;
-        // Build full GraphProgramSpec & compile/lookup PJRT executable on plan miss.
-        cloudtpu::GraphProgramSpec prog_spec;
-        prog_spec.spmd_chips = P;
-        prog_spec.bf16_matmul = ctx->env.bf16_matmul;
-        prog_spec.bf16_flash_attn = ctx->env.bf16_flash_attn;
-        prog_spec.q4_split_dot = ctx->env.q4_split_dot;
-        std::unordered_map<const struct ggml_tensor*, uint64_t> tensor_to_id;
-        std::unordered_map<uint64_t, uint32_t> id_to_input_idx;
-        uint64_t spec_next_id = 1;
-        uint32_t next_in_idx = 0;
-
-        auto get_or_register_input = [&](auto& self, const struct ggml_tensor* t) -> uint64_t {
-            if (!t) return 0;
-            auto it = tensor_to_id.find(t);
-            if (it != tensor_to_id.end()) {
-                return it->second;
+        BuiltSubgraphSpec built_miss;
+        BuiltSubgraphSpec* active_built = &bucket_built;
+        if (bucket_plan.success) {
+            for (size_t ii = 0; ii < bucket_built.prog_spec.inputs.size(); ++ii) {
+                bucket_built.prog_spec.inputs[ii].alias_output_idx = input_alias_out[ii];
             }
-            const struct ggml_tensor* parent = view_parent(t);
-            if (t->view_src != nullptr && parent != nullptr &&
-                (is_dense_supported_type(t->type) || t->type == GGML_TYPE_I64) &&
-                t->type == parent->type) {
-                if (t->op == GGML_OP_PERMUTE && t->view_offs == parent->view_offs) {
-                    const uint64_t base_id = self(self, parent);
-                    const uint64_t tid = spec_next_id++;
-                    cloudtpu::OpNodeSpec p_op;
-                    p_op.kind = cloudtpu::CloudOpKind::TRANSPOSE;
-                    p_op.src_ids = {base_id};
-                    p_op.dst = tensor_to_spec(t, tid);
-                    const int32_t* ax = static_cast<const int32_t*>(t->op_params);
-                    int inv[4] = {0, 1, 2, 3};
-                    for (int g = 0; g < 4; ++g) inv[ax[g]] = g;
-                    for (int h = 0; h < 4; ++h) p_op.perm[h] = 3 - inv[3 - h];
-                    prog_spec.ops.push_back(std::move(p_op));
-                    tensor_to_id[t] = tid;
-                    return tid;
-                }
-                if (t->op == GGML_OP_TRANSPOSE && t->view_offs == parent->view_offs) {
-                    const uint64_t base_id = self(self, parent);
-                    const uint64_t tid = spec_next_id++;
-                    cloudtpu::OpNodeSpec p_op;
-                    p_op.kind = cloudtpu::CloudOpKind::TRANSPOSE;
-                    p_op.src_ids = {base_id};
-                    p_op.dst = tensor_to_spec(t, tid);
-                    p_op.perm[0] = 0;
-                    p_op.perm[1] = 1;
-                    p_op.perm[2] = 3;
-                    p_op.perm[3] = 2;
-                    prog_spec.ops.push_back(std::move(p_op));
-                    tensor_to_id[t] = tid;
-                    return tid;
-                }
-                if (t->view_offs == parent->view_offs && ggml_is_contiguous(t) &&
-                    ggml_is_contiguous(parent) &&
-                    ggml_nelements(t) == ggml_nelements(parent)) {
-                    const uint64_t base_id = self(self, parent);
-                    const uint64_t rid = spec_next_id++;
-                    cloudtpu::OpNodeSpec r_op;
-                    r_op.kind = cloudtpu::CloudOpKind::RESHAPE;
-                    r_op.src_ids = {base_id};
-                    r_op.dst = tensor_to_spec(t, rid);
-                    prog_spec.ops.push_back(std::move(r_op));
-                    tensor_to_id[t] = rid;
-                    return rid;
-                }
-                ViewSlicePlan vplan;
-                const struct ggml_tensor* slice_base = nullptr;
-                if (try_build_view_slice(t, &vplan, &slice_base)) {
-                    const uint64_t base_id = self(self, slice_base);
-                    const uint64_t sid = spec_next_id++;
-                    cloudtpu::OpNodeSpec s_op;
-                    s_op.kind = cloudtpu::CloudOpKind::SLICE;
-                    s_op.src_ids = {base_id};
-                    s_op.dst = tensor_to_spec(t, sid);
-                    s_op.slice_reshape = std::move(vplan.reshape_dims);
-                    s_op.slice_starts = std::move(vplan.starts);
-                    s_op.slice_limits = std::move(vplan.limits);
-                    prog_spec.ops.push_back(std::move(s_op));
-                    tensor_to_id[t] = sid;
-                    return sid;
-                }
+            if (!cloudtpu::apply_program_batch_bucket(bucket_built.prog_spec, bucket_plan)) {
+                throw std::runtime_error("ggml-cloudtpu: failed to apply batch bucket to program spec");
             }
-            const uint64_t id = spec_next_id++;
-            const uint32_t in_idx = next_in_idx++;
-            const cloudtpu::TensorShardingKind sh = ctx->scratch_input_sharding[in_idx];
-            tensor_to_id[t] = id;
-            id_to_input_idx[id] = in_idx;
-            cloudtpu::TensorSpec ts = tensor_to_spec(t, id, sh);
-            ts.scale_dtype = ctx->scratch_input_scale_dt[in_idx];
-            ts.alias_output_idx = input_alias_out[in_idx];
-            prog_spec.inputs.push_back(std::move(ts));
-            return id;
-        };
-
-        for (int i = start_idx; i < end_idx; ++i) {
-            struct ggml_tensor* node = cgraph->nodes[i];
-            if (is_skipped_graph_node(node)) {
-                continue;
-            }
-            std::vector<uint64_t> src_ids;
-            if (node->op == GGML_OP_ROPE || node->op == GGML_OP_SOFT_MAX) {
-                src_ids.push_back(get_or_register_input(get_or_register_input, node->src[0]));
-                src_ids.push_back(get_or_register_input(get_or_register_input, node->src[1]));
-                if (node->src[2]) src_ids.push_back(get_or_register_input(get_or_register_input, node->src[2]));
-            } else if (node->op == GGML_OP_FLASH_ATTN_EXT) {
-                src_ids.push_back(get_or_register_input(get_or_register_input, node->src[0]));
-                src_ids.push_back(get_or_register_input(get_or_register_input, node->src[1]));
-                src_ids.push_back(get_or_register_input(get_or_register_input, node->src[2]));
-                if (node->src[3]) src_ids.push_back(get_or_register_input(get_or_register_input, node->src[3]));
-            } else if (node->op == GGML_OP_GLU) {
-                src_ids.push_back(get_or_register_input(get_or_register_input, node->src[0]));
-                if (node->src[1]) src_ids.push_back(get_or_register_input(get_or_register_input, node->src[1]));
-            } else if (node->op == GGML_OP_CPY || node->op == GGML_OP_CONT) {
-                src_ids.push_back(get_or_register_input(get_or_register_input, node->src[0]));
-            } else {
-                for (int s = 0; s < GGML_MAX_SRC && node->src[s] != nullptr; ++s) {
-                    src_ids.push_back(get_or_register_input(get_or_register_input, node->src[s]));
-                }
-            }
-
-            const size_t rel_idx = static_cast<size_t>(i - start_idx);
-            const uint64_t dst_id = spec_next_id++;
-            cloudtpu::OpNodeSpec op_spec = build_op_node_spec(node, dst_id, src_ids);
-            op_spec.keep_sharded_out = (keep_sharded_flags[rel_idx] != 0);
-            prog_spec.ops.push_back(std::move(op_spec));
-            tensor_to_id[node] = dst_id;
-
-            uint64_t store_id = dst_id;
-            if (node->view_src != nullptr && node->view_offs == 0 &&
-                ggml_nelements(node) == ggml_nelements(node->view_src)) {
-                const struct ggml_tensor* root = unwrap_view_src(node);
-                if (root && (root->ne[0] != node->ne[0] || root->ne[1] != node->ne[1] ||
-                             root->ne[2] != node->ne[2] || root->ne[3] != node->ne[3])) {
-                    const uint64_t rid = spec_next_id++;
-                    cloudtpu::OpNodeSpec r_op;
-                    r_op.kind = cloudtpu::CloudOpKind::RESHAPE;
-                    r_op.src_ids = {dst_id};
-                    r_op.dst = tensor_to_spec(root, rid);
-                    prog_spec.ops.push_back(std::move(r_op));
-                    store_id = rid;
-                }
-            }
-
-            if (live_out_flags[rel_idx]) {
-                prog_spec.output_ids.push_back(store_id);
-            }
+        } else {
+            built_miss = build_subgraph_program_spec(
+                ctx, cgraph, start_idx, end_idx, P, live_out_flags, keep_sharded_flags, &input_alias_out, true);
+            active_built = &built_miss;
         }
+        const cloudtpu::GraphProgramSpec& prog_spec = active_built->prog_spec;
+        const auto& id_to_input_idx = active_built->id_to_input_idx;
 
         const cloudtpu::EmittedProgram emitted = cloudtpu::emit_stablehlo_program(prog_spec);
         if (ctx->env.verbose >= 3) {
@@ -3757,8 +5011,18 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
     const size_t n_in = ctx->scratch_inputs.size();
     ctx->scratch_resolved.resize(n_in);
     for (size_t k = 0; k < n_in; ++k) {
-        resolve_tensor_hbm(
-            rt, ctx->device_index, P, ctx->env.q4k_bf16_scales, ctx->scratch_inputs[k], ctx->scratch_resolved[k]);
+        const int token_ax = bucket_plan.success ? bucket_plan.input_token_axis[k] : -1;
+        if (token_ax >= 0) {
+            upload_padded_token_input(
+                rt, ctx->device_index, P, ctx->scratch_inputs[k],
+                token_ax, bucket_plan.bucket_tokens, bucket_plan.input_pad_kind[k],
+                ctx->scratch_resolved[k]);
+        } else {
+            resolve_tensor_hbm(
+                rt, ctx->device_index, P, ctx->env.q4k_bf16_scales,
+                ctx->env.q4_mode, ctx->env.q4k_u4,
+                ctx->scratch_inputs[k], ctx->scratch_resolved[k]);
+        }
     }
 
     // Keep TPU execution fully pipelined across intermediate subgraphs when fuse_graphs is enabled;
@@ -3795,7 +5059,10 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
                     }
                 }
                 if (!safe) {
+                    ++ctx->total_kv_donation_skipped;
                     ctx->scratch_non_donatable.push_back(static_cast<int64_t>(bi));
+                } else {
+                    ++ctx->total_kv_donated;
                 }
             }
         }
@@ -3821,7 +5088,8 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
             }
         }
         for (size_t oi = 0; oi < ctx->scratch_outputs.size(); ++oi) {
-            store_tensor_hbm_single(rt, ctx->scratch_outputs[oi], std::move(ctx->scratch_outputs_1d[oi]));
+            const int out_ax = bucket_plan.success ? bucket_plan.output_token_axis[oi] : -1;
+            store_tensor_hbm_single(rt, ctx->scratch_outputs[oi], std::move(ctx->scratch_outputs_1d[oi]), out_ax);
         }
         if (plan.has_donation) {
             for (const auto& ib : plan.input_bindings) {
@@ -3866,7 +5134,10 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
                     }
                 }
                 if (!safe) {
+                    ++ctx->total_kv_donation_skipped;
                     ctx->scratch_non_donatable.push_back(static_cast<int64_t>(bi));
+                } else {
+                    ++ctx->total_kv_donated;
                 }
             }
         }
@@ -3894,7 +5165,8 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
             }
         }
         for (size_t oi = 0; oi < ctx->scratch_outputs.size(); ++oi) {
-            store_tensor_hbm_spmd(rt, ctx->scratch_outputs[oi], ctx->scratch_spmd_outputs, oi);
+            const int out_ax = bucket_plan.success ? bucket_plan.output_token_axis[oi] : -1;
+            store_tensor_hbm_spmd(rt, ctx->scratch_outputs[oi], ctx->scratch_spmd_outputs, oi, out_ax);
         }
         if (plan.has_donation) {
             for (const auto& ib : plan.input_bindings) {
@@ -3916,6 +5188,9 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
     }
 
     ctx->total_subgraphs += 1;
+    if (bucket_plan.success) {
+        ctx->total_bucketed_subgraphs += 1;
+    }
     ctx->total_ops_executed += plan.num_emitted_ops;
     return GGML_STATUS_SUCCESS;
 }
@@ -3960,20 +5235,52 @@ static enum ggml_status ggml_backend_cloudtpu_graph_compute(ggml_backend_t backe
             }
             int j = i + 1;
             if (ctx->env.fuse_graphs) {
-                // Isolate dynamic-n_kv attention (FLASH_ATTN_EXT) at subgraph boundaries unless
-                // CLOUDTPU_FUSE_ATTN=1 is enabled.
+                // Isolate attention (FLASH_ATTN_EXT) at subgraph boundaries when CLOUDTPU_FUSE_ATTN=0.
                 const bool start_is_attn = (!ctx->env.fuse_attn && cgraph->nodes[i]->op == GGML_OP_FLASH_ATTN_EXT);
                 if (!start_is_attn) {
-                    std::vector<const struct ggml_tensor*> inplace_writes;
-                    std::vector<const struct ggml_tensor*> slice_writes;
-                    auto tracks_alias_write = [](const struct ggml_tensor* t) -> bool {
-                        return t->op == GGML_OP_SET_ROWS || t->view_src != nullptr ||
-                               !t->buffer || !is_cloudtpu_buffer(t->buffer);
+                    struct SliceWriteRecord {
+                        const struct ggml_tensor* node = nullptr;
+                        const struct ggml_tensor* root = nullptr;
+                        CloudSlotKey slot_key;
+                        int cgraph_idx = -1;
+                        bool forwardable = false;
+                        bool active_alias_target = true;
                     };
-                    slice_writes.push_back(cgraph->nodes[i]);
-                    if (tracks_alias_write(cgraph->nodes[i])) {
-                        inplace_writes.push_back(cgraph->nodes[i]);
-                    }
+                    std::vector<SliceWriteRecord> inplace_writes;
+                    std::unordered_map<CloudSlotKey, size_t, CloudSlotKeyHash> latest_slot_write;
+                    std::vector<std::pair<const struct ggml_tensor*, int>> slice_writes;
+                    auto record_slice_node = [&](const struct ggml_tensor* node, int idx) {
+                        slice_writes.push_back({node, idx});
+                        if (node->data) {
+                            for (auto& prev : inplace_writes) {
+                                if (prev.active_alias_target && tensor_ranges_overlap(node, prev.node)) {
+                                    prev.active_alias_target = false;
+                                    if (prev.forwardable && prev.slot_key.valid()) {
+                                        auto lit = latest_slot_write.find(prev.slot_key);
+                                        if (lit != latest_slot_write.end() && &inplace_writes[lit->second] == &prev) {
+                                            latest_slot_write.erase(lit);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if (is_alias_tracked_write(node)) {
+                            SliceWriteRecord rec;
+                            rec.node = node;
+                            rec.cgraph_idx = idx;
+                            rec.root = get_forwardable_inplace_root(node);
+                            rec.forwardable = (rec.root != nullptr);
+                            if (rec.forwardable) {
+                                rec.slot_key = make_slot_key(rec.root);
+                            }
+                            const size_t rec_idx = inplace_writes.size();
+                            inplace_writes.push_back(rec);
+                            if (rec.forwardable && rec.slot_key.valid()) {
+                                latest_slot_write[rec.slot_key] = rec_idx;
+                            }
+                        }
+                    };
+                    record_slice_node(cgraph->nodes[i], i);
                     int fused_ops = 1;
                     while (j < cgraph->n_nodes && fused_ops < max_fuse) {
                         const struct ggml_tensor* nj = cgraph->nodes[j];
@@ -3987,52 +5294,117 @@ static enum ggml_status ggml_backend_cloudtpu_graph_compute(ggml_backend_t backe
                         if (!ctx->env.fuse_attn && nj->op == GGML_OP_FLASH_ATTN_EXT) {
                             break;
                         }
-                        // Guard against aliasing a previous in-place or host-backed write in this
-                        // slice via a different ggml_tensor* (e.g. a fresh view of a KV cache or
-                        // host table updated by SET_ROWS/CPY), and split before any write that
-                        // partially overlaps an earlier write in this slice so both writes
-                        // materialize in exact graph order.
+                        // Allow fusing downstream VIEW/PERMUTE/RESHAPE/SLICE reads (e.g. FLASH_ATTN_EXT
+                        // reading KV cache after SET_ROWS) via in-slice SSA forwarding when the prior
+                        // write cleanly updates the full canonical root; split on unforwardable
+                        // host-backed/partial/overlapping writes or stale pre-overwrite dependencies.
                         bool alias_conflict = false;
-                        for (const struct ggml_tensor* pw : slice_writes) {
-                            if (tensor_ranges_overlap(nj, pw) && !tensor_range_covers(nj, pw)) {
-                                alias_conflict = true;
-                                break;
+                        const bool nj_is_alias_write = is_alias_tracked_write(nj);
+                        for (const auto& pw : slice_writes) {
+                            if (tensor_ranges_overlap(nj, pw.first) && !tensor_range_covers(nj, pw.first)) {
+                                if (nj_is_alias_write || !is_dead_gallocr_scratch(ctx, pw.first, pw.second, j)) {
+                                    alias_conflict = true;
+                                    break;
+                                }
                             }
                         }
                         if (!alias_conflict && !inplace_writes.empty()) {
-                            const int max_src =
-                                (nj->op == GGML_OP_CPY || nj->op == GGML_OP_CONT) ? 1 : GGML_MAX_SRC;
-                            for (int s = 0; s < max_src && nj->src[s] != nullptr && !alias_conflict; ++s) {
-                                for (const struct ggml_tensor* iw : inplace_writes) {
-                                    bool direct_ssa = false;
-                                    for (const struct ggml_tensor* cur = nj->src[s]; cur != nullptr;
-                                         cur = view_parent(cur)) {
-                                        if (cur == iw) {
-                                            direct_ssa = true;
+                            int max_check_src = GGML_MAX_SRC;
+                            if (nj->op == GGML_OP_ROPE || nj->op == GGML_OP_SOFT_MAX) {
+                                max_check_src = 3;
+                            } else if (nj->op == GGML_OP_FLASH_ATTN_EXT) {
+                                max_check_src = 4;
+                            } else if (nj->op == GGML_OP_GLU) {
+                                max_check_src = 2;
+                            } else if (nj->op == GGML_OP_CPY || nj->op == GGML_OP_CONT) {
+                                max_check_src = 1;
+                            }
+                            for (int s = 0; s < max_check_src && nj->src[s] != nullptr && !alias_conflict; ++s) {
+                                const struct ggml_tensor* src = nj->src[s];
+                                const struct ggml_tensor* leaf_base = nullptr;
+                                bool resolved_direct_ssa = false;
+                                for (const struct ggml_tensor* cur = src; cur != nullptr; cur = view_parent(cur)) {
+                                    if (!is_skipped_graph_node(cur)) {
+                                        auto nit = ctx->cgraph_node_idx.find(cur);
+                                        if (nit != ctx->cgraph_node_idx.end() && nit->second >= i && nit->second < j) {
+                                            const int cur_idx = nit->second;
+                                            bool overwritten_by_later_iw = false;
+                                            for (const auto& iw : inplace_writes) {
+                                                if (iw.node == cur) {
+                                                    if (!iw.active_alias_target) {
+                                                        overwritten_by_later_iw = true;
+                                                    }
+                                                    break;
+                                                }
+                                                if (iw.cgraph_idx > cur_idx && iw.active_alias_target &&
+                                                    tensor_ranges_overlap(cur, iw.node)) {
+                                                    overwritten_by_later_iw = true;
+                                                    break;
+                                                }
+                                            }
+                                            if (overwritten_by_later_iw) {
+                                                alias_conflict = true;
+                                            }
+                                            resolved_direct_ssa = true;
                                             break;
                                         }
                                     }
-                                    if (direct_ssa) {
-                                        continue;  // Direct SSA dependency on iw (incl. views of iw) is safe
+                                    if (view_parent(cur) == nullptr) {
+                                        leaf_base = cur;
+                                        break;
                                     }
-                                    for (const struct ggml_tensor* cur = nj->src[s]; cur != nullptr;
-                                         cur = view_parent(cur)) {
-                                        if (tensor_ranges_overlap(cur, iw)) {
+                                }
+                                if (!resolved_direct_ssa && !alias_conflict) {
+                                    bool has_overlap = false;
+                                    for (const auto& iw : inplace_writes) {
+                                        if (iw.active_alias_target &&
+                                            (tensor_ranges_overlap(src, iw.node) ||
+                                             (leaf_base && tensor_ranges_overlap(leaf_base, iw.node)))) {
+                                            has_overlap = true;
+                                            break;
+                                        }
+                                    }
+                                    if (has_overlap) {
+                                        bool can_forward = false;
+                                        const CloudSlotKey base_key = make_slot_key(leaf_base);
+                                        auto lit = base_key.valid() ? latest_slot_write.find(base_key)
+                                                                    : latest_slot_write.end();
+                                        if (lit != latest_slot_write.end()) {
+                                            const auto& latest_iw = inplace_writes[lit->second];
+                                            if (latest_iw.active_alias_target && latest_iw.forwardable &&
+                                                latest_iw.root != nullptr &&
+                                                is_dense_supported_type(leaf_base->type) &&
+                                                leaf_base->type == latest_iw.root->type &&
+                                                ggml_is_contiguous(leaf_base) &&
+                                                ggml_nelements(leaf_base) == ggml_nelements(latest_iw.root)) {
+                                                bool other_active_overlap = false;
+                                                for (size_t wi = 0; wi < inplace_writes.size(); ++wi) {
+                                                    if (wi == lit->second) continue;
+                                                    const auto& iw = inplace_writes[wi];
+                                                    if (iw.active_alias_target &&
+                                                        (tensor_ranges_overlap(src, iw.node) ||
+                                                         tensor_ranges_overlap(leaf_base, iw.node))) {
+                                                        other_active_overlap = true;
+                                                        break;
+                                                    }
+                                                }
+                                                if (!other_active_overlap &&
+                                                    can_collapse_view_chain_to_leaf(src, leaf_base)) {
+                                                    can_forward = true;
+                                                }
+                                            }
+                                        }
+                                        if (!can_forward) {
                                             alias_conflict = true;
-                                            break;
                                         }
                                     }
-                                    if (alias_conflict) break;
                                 }
                             }
                         }
                         if (alias_conflict) {
                             break;
                         }
-                        slice_writes.push_back(nj);
-                        if (tracks_alias_write(nj)) {
-                            inplace_writes.push_back(nj);
-                        }
+                        record_slice_node(nj, j);
                         ++j;
                         ++fused_ops;
                     }
@@ -4290,6 +5662,8 @@ static cloudtpu_reg_state& get_reg_state(ggml_backend_reg_t reg) {
                 btc->spmd_chips = spmd;
                 btc->spmd_min_rows = env.spmd_min_rows;
                 btc->q4k_bf16_scales = env.q4k_bf16_scales;
+                btc->q4_mode = env.q4_mode;
+                btc->q4k_u4 = env.q4k_u4;
                 btc->name = state.dev_ctxs[static_cast<size_t>(i)]->name;
                 state.bufts[static_cast<size_t>(i)] = {
                     /* .iface   = */ {
