@@ -31,9 +31,15 @@ struct cloudtpu_env_config {
     int mock_devices = 1;
     int spmd_chips = 0;       // 0 = auto (use all rt.device_count()), 1 = single chip, >1 = explicit SPMD chip count
     int spmd_min_rows = 256;  // Minimum weight rows/cols to shard across SPMD chips
-    int max_fuse_ops = 64;    // Max ops per fused StableHLO subgraph
+    int max_fuse_ops = 512;   // Max ops per fused StableHLO subgraph
     int verbose = 0;
     bool fuse_graphs = true;
+    bool fuse_attn = false;         // Fuse FLASH_ATTN_EXT with following O_proj/FFN ops
+    bool donate_kv = true;          // Donate KV cache HBM buffers in-place on SET_ROWS
+    bool bf16_matmul = true;        // Dequantize quantized/low-bit weights & activations to BF16 for MXU
+    bool q4_split_dot = true;       // Q4_0/Q4_K: true = split-X two-dot (zero concat); false = single concat dot
+    bool q4k_bf16_scales = false;   // Optional F16 Q4_K/Q6_K scales (default off: F32 scales +9% faster on v5e-1)
+    bool async_collectives = true;  // Enable XLA TPU async collective overlap flags on multi-chip SPMD
     uint32_t cache_cap = 4096;
     uint64_t min_elements = 0;
     std::string libtpu_path;
@@ -73,7 +79,7 @@ static cloudtpu_env_config load_env_config() {
     }
     if (const char* v = std::getenv("CLOUDTPU_MAX_FUSE_OPS")) {
         const int parsed = std::atoi(v);
-        if (parsed >= 1 && parsed <= 512) {
+        if (parsed >= 1 && parsed <= 2048) {
             cfg.max_fuse_ops = parsed;
         }
     }
@@ -82,6 +88,24 @@ static cloudtpu_env_config load_env_config() {
     }
     if (const char* v = std::getenv("CLOUDTPU_FUSE_GRAPHS")) {
         cfg.fuse_graphs = (std::atoi(v) != 0);
+    }
+    if (const char* v = std::getenv("CLOUDTPU_FUSE_ATTN")) {
+        cfg.fuse_attn = (std::atoi(v) != 0);
+    }
+    if (const char* v = std::getenv("CLOUDTPU_DONATE_KV")) {
+        cfg.donate_kv = (std::atoi(v) != 0);
+    }
+    if (const char* v = std::getenv("CLOUDTPU_MATMUL_BF16")) {
+        cfg.bf16_matmul = (std::atoi(v) != 0);
+    }
+    if (const char* v = std::getenv("CLOUDTPU_Q4_SPLIT_DOT")) {
+        cfg.q4_split_dot = (std::atoi(v) != 0);
+    }
+    if (const char* v = std::getenv("CLOUDTPU_Q4K_BF16_SCALES")) {
+        cfg.q4k_bf16_scales = (std::atoi(v) != 0);
+    }
+    if (const char* v = std::getenv("CLOUDTPU_ASYNC_COLLECTIVES")) {
+        cfg.async_collectives = (std::atoi(v) != 0);
     }
     if (const char* v = std::getenv("CLOUDTPU_CACHE_CAP")) {
         const long long parsed = std::atoll(v);
@@ -357,6 +381,7 @@ struct CloudTpuTensorSlot {
     cloudtpu::TensorStorageKind storage = cloudtpu::TensorStorageKind::DENSE;
     cloudtpu::TensorShardingKind sharding = cloudtpu::TensorShardingKind::REPLICATED;
     cloudtpu::PjrtDType dtype = cloudtpu::PjrtDType::F32;
+    cloudtpu::PjrtDType scale_dtype = cloudtpu::PjrtDType::INVALID;
     int64_t dims[4] = {1, 1, 1, 1};
     // Single-chip: size() == 1 (on device_index). Multi-chip SPMD: size() == spmd_chips (devices 0..P-1).
     std::vector<cloudtpu::PjrtBufferPtr> hbm_primary;
@@ -373,6 +398,7 @@ struct ggml_backend_cloudtpu_buffer_context {
     int device_index = 0;
     int spmd_chips = 1;
     int spmd_min_rows = 256;
+    bool q4k_bf16_scales = true;
     uintptr_t virtual_base = 0;
     size_t size = 0;
 
@@ -661,55 +687,91 @@ static cloudtpu::TensorShardingKind choose_upload_sharding(const struct ggml_ten
     return cloudtpu::TensorShardingKind::REPLICATED;
 }
 
-// Uploads a row-major tensor part [B3, B2, N, D3, (optional D4)] across 1 or P chips per sharding.
+template <typename T>
+static std::vector<T> transpose_n_to_minor(const T* src, size_t B, size_t N, size_t K_outer) {
+    // [B, N, K_outer] -> [B, K_outer, N] (places N as the minor dimension for TPU (8,128) tiles)
+    std::vector<T> dst(B * K_outer * N);
+    for (size_t b = 0; b < B; ++b) {
+        const T* sb = src + b * N * K_outer;
+        T* db = dst.data() + b * K_outer * N;
+        for (size_t n = 0; n < N; ++n) {
+            const T* row = sb + n * K_outer;
+            for (size_t k = 0; k < K_outer; ++k) {
+                db[k * N + n] = row[k];
+            }
+        }
+    }
+    return dst;
+}
+
+template <typename T>
+static std::vector<T> transpose_minor_to_n(const T* src, size_t B, size_t N, size_t K_outer) {
+    // [B, K_outer, N] -> [B, N, K_outer]
+    std::vector<T> dst(B * N * K_outer);
+    for (size_t b = 0; b < B; ++b) {
+        const T* sb = src + b * K_outer * N;
+        T* db = dst.data() + b * N * K_outer;
+        for (size_t k = 0; k < K_outer; ++k) {
+            const T* row = sb + k * N;
+            for (size_t n = 0; n < N; ++n) {
+                db[n * K_outer + k] = row[n];
+            }
+        }
+    }
+    return dst;
+}
+
+// Uploads a row-major tensor part across 1 or P chips, sharding along shard_axis when P > 1.
+// Default shard_axis == -1 uses DENSE layout (SHARD_N -> axis 2, SHARD_K -> axis 3).
 static std::vector<cloudtpu::PjrtBufferPtr> upload_sharded_part(cloudtpu::PjrtRuntime& rt,
                                                                 int device_index,
                                                                 int spmd_chips,
                                                                 cloudtpu::TensorShardingKind sharding,
                                                                 const void* data,
                                                                 cloudtpu::PjrtDType dtype,
-                                                                const std::vector<int64_t>& global_dims) {
+                                                                const std::vector<int64_t>& global_dims,
+                                                                int shard_axis = -1) {
     if (spmd_chips <= 1) {
         return {rt.buffer_from_host(device_index, data, dtype, global_dims)};
     }
     if (sharding == cloudtpu::TensorShardingKind::REPLICATED) {
         return rt.buffer_from_host_replicated(spmd_chips, data, dtype, global_dims);
     }
+    const int ax = (shard_axis >= 0) ? shard_axis
+                                     : ((sharding == cloudtpu::TensorShardingKind::SHARD_N) ? 2 : 3);
     const uint8_t* raw = static_cast<const uint8_t*>(data);
     const size_t elem_sz = cloudtpu::pjrt_dtype_size(dtype);
+    std::vector<int64_t> local_dims = global_dims;
+    const int64_t ax_full = global_dims[static_cast<size_t>(ax)];
+    const int64_t ax_local = ax_full / spmd_chips;
+    local_dims[static_cast<size_t>(ax)] = ax_local;
+
+    size_t outer_elems = 1;
+    for (int i = 0; i < ax; ++i) outer_elems *= static_cast<size_t>(global_dims[static_cast<size_t>(i)]);
+    size_t inner_elems = 1;
+    for (size_t i = static_cast<size_t>(ax) + 1; i < global_dims.size(); ++i) {
+        inner_elems *= static_cast<size_t>(global_dims[i]);
+    }
+    const size_t full_chunk_bytes = static_cast<size_t>(ax_full) * inner_elems * elem_sz;
+    const size_t local_chunk_bytes = static_cast<size_t>(ax_local) * inner_elems * elem_sz;
+
     std::vector<cloudtpu::PjrtBufferPtr> bufs;
     bufs.reserve(static_cast<size_t>(spmd_chips));
-
-    if (sharding == cloudtpu::TensorShardingKind::SHARD_N) {
-        // B3==1, B2==1, split dim 2 (N) into P contiguous slices of N/P rows.
-        std::vector<int64_t> local_dims = global_dims;
-        local_dims[2] /= spmd_chips;
-        size_t shard_elems = 1;
-        for (int64_t d : local_dims) shard_elems *= static_cast<size_t>(d);
-        const size_t shard_bytes = shard_elems * elem_sz;
+    if (outer_elems == 1) {
         for (int p = 0; p < spmd_chips; ++p) {
-            bufs.push_back(rt.buffer_from_host(p, raw + static_cast<size_t>(p) * shard_bytes, dtype, local_dims));
+            bufs.push_back(rt.buffer_from_host(
+                p, raw + static_cast<size_t>(p) * local_chunk_bytes, dtype, local_dims));
         }
         return bufs;
     }
 
-    // SHARD_K: B3==1, B2==1, split dim 3 (D3) into P column slices across every row r in [0, N).
-    std::vector<int64_t> local_dims = global_dims;
-    const int64_t N = global_dims[2];
-    const int64_t D3 = global_dims[3];
-    const int64_t D3_local = D3 / spmd_chips;
-    local_dims[3] = D3_local;
-    size_t inner_elems = 1;
-    for (size_t i = 4; i < global_dims.size(); ++i) inner_elems *= static_cast<size_t>(global_dims[i]);
-    const size_t full_row_bytes = static_cast<size_t>(D3) * inner_elems * elem_sz;
-    const size_t local_row_bytes = static_cast<size_t>(D3_local) * inner_elems * elem_sz;
-    std::vector<uint8_t> tmp(static_cast<size_t>(N) * local_row_bytes);
+    std::vector<uint8_t> tmp(outer_elems * local_chunk_bytes);
     for (int p = 0; p < spmd_chips; ++p) {
-        const size_t col_off = static_cast<size_t>(p) * local_row_bytes;
-        for (int64_t r = 0; r < N; ++r) {
-            std::memcpy(tmp.data() + static_cast<size_t>(r) * local_row_bytes,
-                        raw + static_cast<size_t>(r) * full_row_bytes + col_off,
-                        local_row_bytes);
+        const size_t col_off = static_cast<size_t>(p) * local_chunk_bytes;
+        for (size_t o = 0; o < outer_elems; ++o) {
+            std::memcpy(tmp.data() + o * local_chunk_bytes,
+                        raw + o * full_chunk_bytes + col_off,
+                        local_chunk_bytes);
         }
         bufs.push_back(rt.buffer_from_host(p, tmp.data(), dtype, local_dims));
     }
@@ -720,7 +782,8 @@ static void download_sharded_part(cloudtpu::PjrtRuntime& rt,
                                   cloudtpu::TensorShardingKind sharding,
                                   const std::vector<cloudtpu::PjrtBufferPtr>& bufs,
                                   void* dst,
-                                  size_t dst_bytes) {
+                                  size_t dst_bytes,
+                                  int shard_axis = -1) {
     if (bufs.empty() || !bufs[0]) {
         return;
     }
@@ -728,32 +791,34 @@ static void download_sharded_part(cloudtpu::PjrtRuntime& rt,
         rt.buffer_to_host(bufs[0]->handle.get(), dst, dst_bytes);
         return;
     }
+    const int ax = (shard_axis >= 0) ? shard_axis
+                                     : ((sharding == cloudtpu::TensorShardingKind::SHARD_N) ? 2 : 3);
     uint8_t* out = static_cast<uint8_t*>(dst);
     const size_t P = bufs.size();
-    if (sharding == cloudtpu::TensorShardingKind::SHARD_N) {
-        const size_t shard_bytes = bufs[0]->num_bytes();
+    const auto& ldims = bufs[0]->dims;
+    size_t outer_elems = 1;
+    for (int i = 0; i < ax; ++i) outer_elems *= static_cast<size_t>(ldims[static_cast<size_t>(i)]);
+    size_t inner_elems = 1;
+    for (size_t i = static_cast<size_t>(ax) + 1; i < ldims.size(); ++i) {
+        inner_elems *= static_cast<size_t>(ldims[i]);
+    }
+    const size_t elem_sz = cloudtpu::pjrt_dtype_size(bufs[0]->dtype);
+    const size_t local_chunk_bytes = static_cast<size_t>(ldims[static_cast<size_t>(ax)]) * inner_elems * elem_sz;
+    if (outer_elems == 1) {
         for (size_t p = 0; p < P; ++p) {
-            rt.buffer_to_host(bufs[p]->handle.get(), out + p * shard_bytes, shard_bytes);
+            rt.buffer_to_host(bufs[p]->handle.get(), out + p * local_chunk_bytes, local_chunk_bytes);
         }
         return;
     }
-    // SHARD_K: interleave each shard's row slices back into full row-major tensor.
-    const auto& ldims = bufs[0]->dims;
-    const int64_t N = ldims[2];
-    const int64_t D3_local = ldims[3];
-    size_t inner_elems = 1;
-    for (size_t i = 4; i < ldims.size(); ++i) inner_elems *= static_cast<size_t>(ldims[i]);
-    const size_t elem_sz = cloudtpu::pjrt_dtype_size(bufs[0]->dtype);
-    const size_t local_row_bytes = static_cast<size_t>(D3_local) * inner_elems * elem_sz;
-    const size_t full_row_bytes = local_row_bytes * P;
-    std::vector<uint8_t> tmp(static_cast<size_t>(N) * local_row_bytes);
+    const size_t full_chunk_bytes = local_chunk_bytes * P;
+    std::vector<uint8_t> tmp(outer_elems * local_chunk_bytes);
     for (size_t p = 0; p < P; ++p) {
         rt.buffer_to_host(bufs[p]->handle.get(), tmp.data(), tmp.size());
-        const size_t col_off = p * local_row_bytes;
-        for (int64_t r = 0; r < N; ++r) {
-            std::memcpy(out + static_cast<size_t>(r) * full_row_bytes + col_off,
-                        tmp.data() + static_cast<size_t>(r) * local_row_bytes,
-                        local_row_bytes);
+        const size_t col_off = p * local_chunk_bytes;
+        for (size_t o = 0; o < outer_elems; ++o) {
+            std::memcpy(out + o * full_chunk_bytes + col_off,
+                        tmp.data() + o * local_chunk_bytes,
+                        local_chunk_bytes);
         }
     }
 }
@@ -765,7 +830,8 @@ static void upload_raw_tensor_to_slot(cloudtpu::PjrtRuntime& rt,
                                       CloudTpuTensorSlot& slot,
                                       const struct ggml_tensor* tensor,
                                       const void* raw_data,
-                                      bool allow_sharding = true) {
+                                      bool allow_sharding = true,
+                                      bool q4k_bf16_scales = true) {
     slot.ggml_dt = tensor->type;
     slot.dims[0] = tensor->ne[3];
     slot.dims[1] = tensor->ne[2];
@@ -776,8 +842,12 @@ static void upload_raw_tensor_to_slot(cloudtpu::PjrtRuntime& rt,
     const int64_t B2 = tensor->ne[2];
     const int64_t N = tensor->ne[1];
     const int64_t K = tensor->ne[0];
+    const size_t B = static_cast<size_t>(B3 * B2);
     const cloudtpu::TensorShardingKind sh = choose_upload_sharding(tensor, spmd_chips, spmd_min_rows, allow_sharding);
     slot.sharding = sh;
+    slot.scale_dtype = cloudtpu::PjrtDType::INVALID;
+    const int q5_shard_ax = (sh == cloudtpu::TensorShardingKind::SHARD_N) ? 4 : 2;
+    const int q4_shard_ax = (sh == cloudtpu::TensorShardingKind::SHARD_N) ? 3 : 2;
 
     if (tensor->type == GGML_TYPE_Q8_0 && (K % QK8_0) == 0) {
         const size_t nb = static_cast<size_t>(K / QK8_0);
@@ -785,14 +855,17 @@ static void upload_raw_tensor_to_slot(cloudtpu::PjrtRuntime& rt,
         std::vector<int8_t> qs;
         std::vector<uint16_t> d;
         unpack_q8_0_to_split(static_cast<const block_q8_0*>(raw_data), nrows, nb, qs, d);
+        auto qs_km = transpose_n_to_minor(qs.data(), B, static_cast<size_t>(N), static_cast<size_t>(K));
+        auto d_km = transpose_n_to_minor(d.data(), B, static_cast<size_t>(N), nb);
         slot.storage = cloudtpu::TensorStorageKind::Q8_0_SPLIT;
         slot.dtype = cloudtpu::PjrtDType::S8;
+        slot.scale_dtype = cloudtpu::PjrtDType::F16;
         slot.hbm_primary = upload_sharded_part(
-            rt, device_index, spmd_chips, sh, qs.data(), cloudtpu::PjrtDType::S8,
-            {B3, B2, N, static_cast<int64_t>(nb), QK8_0});
+            rt, device_index, spmd_chips, sh, qs_km.data(), cloudtpu::PjrtDType::S8,
+            {B3, B2, static_cast<int64_t>(nb), QK8_0, N}, q5_shard_ax);
         slot.hbm_scales = upload_sharded_part(
-            rt, device_index, spmd_chips, sh, d.data(), cloudtpu::PjrtDType::F16,
-            {B3, B2, N, static_cast<int64_t>(nb)});
+            rt, device_index, spmd_chips, sh, d_km.data(), cloudtpu::PjrtDType::F16,
+            {B3, B2, static_cast<int64_t>(nb), N}, q4_shard_ax);
         slot.hbm_mins.clear();
     } else if (tensor->type == GGML_TYPE_Q4_0 && (K % QK4_0) == 0) {
         const size_t nb = static_cast<size_t>(K / QK4_0);
@@ -800,14 +873,17 @@ static void upload_raw_tensor_to_slot(cloudtpu::PjrtRuntime& rt,
         std::vector<uint8_t> qs;
         std::vector<uint16_t> d;
         unpack_q4_0_to_split(static_cast<const block_q4_0*>(raw_data), nrows, nb, qs, d);
+        auto qs_km = transpose_n_to_minor(qs.data(), B, static_cast<size_t>(N), static_cast<size_t>(K / 2));
+        auto d_km = transpose_n_to_minor(d.data(), B, static_cast<size_t>(N), nb);
         slot.storage = cloudtpu::TensorStorageKind::Q4_0_SPLIT;
         slot.dtype = cloudtpu::PjrtDType::U8;
+        slot.scale_dtype = cloudtpu::PjrtDType::F16;
         slot.hbm_primary = upload_sharded_part(
-            rt, device_index, spmd_chips, sh, qs.data(), cloudtpu::PjrtDType::U8,
-            {B3, B2, N, static_cast<int64_t>(nb), QK4_0 / 2});
+            rt, device_index, spmd_chips, sh, qs_km.data(), cloudtpu::PjrtDType::U8,
+            {B3, B2, static_cast<int64_t>(nb), QK4_0 / 2, N}, q5_shard_ax);
         slot.hbm_scales = upload_sharded_part(
-            rt, device_index, spmd_chips, sh, d.data(), cloudtpu::PjrtDType::F16,
-            {B3, B2, N, static_cast<int64_t>(nb)});
+            rt, device_index, spmd_chips, sh, d_km.data(), cloudtpu::PjrtDType::F16,
+            {B3, B2, static_cast<int64_t>(nb), N}, q4_shard_ax);
         slot.hbm_mins.clear();
     } else if (tensor->type == GGML_TYPE_Q4_K && (K % QK_K) == 0) {
         const size_t nb_k = static_cast<size_t>(K / QK_K);
@@ -823,14 +899,39 @@ static void upload_raw_tensor_to_slot(cloudtpu::PjrtRuntime& rt,
         for (size_t b = 0; b < total_k_blocks; ++b) {
             std::memcpy(slot.quant_meta.data() + b * 16, &src_blk[b], 16);
         }
+        auto qs_km = transpose_n_to_minor(qs.data(), B, static_cast<size_t>(N), static_cast<size_t>(K / 2));
         slot.storage = cloudtpu::TensorStorageKind::Q4_K_SPLIT;
         slot.dtype = cloudtpu::PjrtDType::U8;
         slot.hbm_primary = upload_sharded_part(
-            rt, device_index, spmd_chips, sh, qs.data(), cloudtpu::PjrtDType::U8, {B3, B2, N, nb32, 16});
-        slot.hbm_scales = upload_sharded_part(
-            rt, device_index, spmd_chips, sh, d_eff.data(), cloudtpu::PjrtDType::F32, {B3, B2, N, nb32});
-        slot.hbm_mins = upload_sharded_part(
-            rt, device_index, spmd_chips, sh, m_eff.data(), cloudtpu::PjrtDType::F32, {B3, B2, N, nb32});
+            rt, device_index, spmd_chips, sh, qs_km.data(), cloudtpu::PjrtDType::U8,
+            {B3, B2, nb32, 16, N}, q5_shard_ax);
+        if (q4k_bf16_scales) {
+            std::vector<uint16_t> d_f16(d_eff.size());
+            std::vector<uint16_t> m_f16(m_eff.size());
+            for (size_t i = 0; i < d_eff.size(); ++i) {
+                d_f16[i] = cloudtpu::f32_to_f16(d_eff[i]);
+                m_f16[i] = cloudtpu::f32_to_f16(m_eff[i]);
+            }
+            auto d_km = transpose_n_to_minor(d_f16.data(), B, static_cast<size_t>(N), static_cast<size_t>(nb32));
+            auto m_km = transpose_n_to_minor(m_f16.data(), B, static_cast<size_t>(N), static_cast<size_t>(nb32));
+            slot.scale_dtype = cloudtpu::PjrtDType::F16;
+            slot.hbm_scales = upload_sharded_part(
+                rt, device_index, spmd_chips, sh, d_km.data(), cloudtpu::PjrtDType::F16,
+                {B3, B2, nb32, N}, q4_shard_ax);
+            slot.hbm_mins = upload_sharded_part(
+                rt, device_index, spmd_chips, sh, m_km.data(), cloudtpu::PjrtDType::F16,
+                {B3, B2, nb32, N}, q4_shard_ax);
+        } else {
+            auto d_km = transpose_n_to_minor(d_eff.data(), B, static_cast<size_t>(N), static_cast<size_t>(nb32));
+            auto m_km = transpose_n_to_minor(m_eff.data(), B, static_cast<size_t>(N), static_cast<size_t>(nb32));
+            slot.scale_dtype = cloudtpu::PjrtDType::F32;
+            slot.hbm_scales = upload_sharded_part(
+                rt, device_index, spmd_chips, sh, d_km.data(), cloudtpu::PjrtDType::F32,
+                {B3, B2, nb32, N}, q4_shard_ax);
+            slot.hbm_mins = upload_sharded_part(
+                rt, device_index, spmd_chips, sh, m_km.data(), cloudtpu::PjrtDType::F32,
+                {B3, B2, nb32, N}, q4_shard_ax);
+        }
     } else if (tensor->type == GGML_TYPE_Q6_K && (K % QK_K) == 0) {
         const size_t nb_k = static_cast<size_t>(K / QK_K);
         const int64_t nb16 = K / 16;
@@ -845,12 +946,29 @@ static void upload_raw_tensor_to_slot(cloudtpu::PjrtRuntime& rt,
             std::memcpy(slot.quant_meta.data() + b * 18 + 0, &src_blk[b].d, 2);
             std::memcpy(slot.quant_meta.data() + b * 18 + 2, src_blk[b].scales, 16);
         }
+        auto qs_km = transpose_n_to_minor(qs.data(), B, static_cast<size_t>(N), static_cast<size_t>(K));
         slot.storage = cloudtpu::TensorStorageKind::Q6_K_SPLIT;
         slot.dtype = cloudtpu::PjrtDType::S8;
         slot.hbm_primary = upload_sharded_part(
-            rt, device_index, spmd_chips, sh, qs.data(), cloudtpu::PjrtDType::S8, {B3, B2, N, nb16, 16});
-        slot.hbm_scales = upload_sharded_part(
-            rt, device_index, spmd_chips, sh, d_eff.data(), cloudtpu::PjrtDType::F32, {B3, B2, N, nb16});
+            rt, device_index, spmd_chips, sh, qs_km.data(), cloudtpu::PjrtDType::S8,
+            {B3, B2, nb16, 16, N}, q5_shard_ax);
+        if (q4k_bf16_scales) {
+            std::vector<uint16_t> d_f16(d_eff.size());
+            for (size_t i = 0; i < d_eff.size(); ++i) {
+                d_f16[i] = cloudtpu::f32_to_f16(d_eff[i]);
+            }
+            auto d_km = transpose_n_to_minor(d_f16.data(), B, static_cast<size_t>(N), static_cast<size_t>(nb16));
+            slot.scale_dtype = cloudtpu::PjrtDType::F16;
+            slot.hbm_scales = upload_sharded_part(
+                rt, device_index, spmd_chips, sh, d_km.data(), cloudtpu::PjrtDType::F16,
+                {B3, B2, nb16, N}, q4_shard_ax);
+        } else {
+            auto d_km = transpose_n_to_minor(d_eff.data(), B, static_cast<size_t>(N), static_cast<size_t>(nb16));
+            slot.scale_dtype = cloudtpu::PjrtDType::F32;
+            slot.hbm_scales = upload_sharded_part(
+                rt, device_index, spmd_chips, sh, d_km.data(), cloudtpu::PjrtDType::F32,
+                {B3, B2, nb16, N}, q4_shard_ax);
+        }
         slot.hbm_mins.clear();
     } else {
         const cloudtpu::PjrtDType pdt = ggml_type_to_pjrt(tensor->type);
@@ -889,31 +1007,45 @@ static void download_slot_to_host(cloudtpu::PjrtRuntime& rt,
     }
     const size_t shard_mul =
         (slot.sharding == cloudtpu::TensorShardingKind::REPLICATED) ? 1 : slot.hbm_primary.size();
+    const size_t B = static_cast<size_t>(slot.dims[0] * slot.dims[1]);
+    const size_t N = static_cast<size_t>(slot.dims[2]);
+    const size_t K = static_cast<size_t>(slot.dims[3]);
+    const int q5_shard_ax = (slot.sharding == cloudtpu::TensorShardingKind::SHARD_N) ? 4 : 2;
+    const int q4_shard_ax = (slot.sharding == cloudtpu::TensorShardingKind::SHARD_N) ? 3 : 2;
+
     if (slot.storage == cloudtpu::TensorStorageKind::Q8_0_SPLIT) {
         const size_t total_blocks = slot.hbm_scales[0]->num_elements() * shard_mul;
-        std::vector<int8_t> qs(total_blocks * QK8_0);
-        std::vector<uint16_t> d(total_blocks);
-        download_sharded_part(rt, slot.sharding, slot.hbm_primary, qs.data(), qs.size());
-        download_sharded_part(rt, slot.sharding, slot.hbm_scales, d.data(), d.size() * sizeof(uint16_t));
+        const size_t nb = K / QK8_0;
+        std::vector<int8_t> qs_km(total_blocks * QK8_0);
+        std::vector<uint16_t> d_km(total_blocks);
+        download_sharded_part(rt, slot.sharding, slot.hbm_primary, qs_km.data(), qs_km.size(), q5_shard_ax);
+        download_sharded_part(rt, slot.sharding, slot.hbm_scales, d_km.data(), d_km.size() * sizeof(uint16_t), q4_shard_ax);
+        auto qs = transpose_minor_to_n(qs_km.data(), B, N, K);
+        auto d = transpose_minor_to_n(d_km.data(), B, N, nb);
         pack_split_to_q8_0(qs.data(), d.data(), total_blocks, static_cast<block_q8_0*>(dst_full));
     } else if (slot.storage == cloudtpu::TensorStorageKind::Q4_0_SPLIT) {
         const size_t total_blocks = slot.hbm_scales[0]->num_elements() * shard_mul;
-        std::vector<uint8_t> qs(total_blocks * (QK4_0 / 2));
-        std::vector<uint16_t> d(total_blocks);
-        download_sharded_part(rt, slot.sharding, slot.hbm_primary, qs.data(), qs.size());
-        download_sharded_part(rt, slot.sharding, slot.hbm_scales, d.data(), d.size() * sizeof(uint16_t));
+        const size_t nb = K / QK4_0;
+        std::vector<uint8_t> qs_km(total_blocks * (QK4_0 / 2));
+        std::vector<uint16_t> d_km(total_blocks);
+        download_sharded_part(rt, slot.sharding, slot.hbm_primary, qs_km.data(), qs_km.size(), q5_shard_ax);
+        download_sharded_part(rt, slot.sharding, slot.hbm_scales, d_km.data(), d_km.size() * sizeof(uint16_t), q4_shard_ax);
+        auto qs = transpose_minor_to_n(qs_km.data(), B, N, K / 2);
+        auto d = transpose_minor_to_n(d_km.data(), B, N, nb);
         pack_split_to_q4_0(qs.data(), d.data(), total_blocks, static_cast<block_q4_0*>(dst_full));
     } else if (slot.storage == cloudtpu::TensorStorageKind::Q4_K_SPLIT) {
         const size_t total_sub = slot.hbm_scales[0]->num_elements() * shard_mul;
         const size_t total_k_blocks = total_sub / 8;
-        std::vector<uint8_t> qs(total_sub * 16);
-        download_sharded_part(rt, slot.sharding, slot.hbm_primary, qs.data(), qs.size());
+        std::vector<uint8_t> qs_km(total_sub * 16);
+        download_sharded_part(rt, slot.sharding, slot.hbm_primary, qs_km.data(), qs_km.size(), q5_shard_ax);
+        auto qs = transpose_minor_to_n(qs_km.data(), B, N, K / 2);
         pack_split_to_q4_K(qs.data(), slot.quant_meta.data(), total_k_blocks, static_cast<block_q4_K*>(dst_full));
     } else if (slot.storage == cloudtpu::TensorStorageKind::Q6_K_SPLIT) {
         const size_t total_sub = slot.hbm_scales[0]->num_elements() * shard_mul;
         const size_t total_k_blocks = total_sub / 16;
-        std::vector<int8_t> qs(total_sub * 16);
-        download_sharded_part(rt, slot.sharding, slot.hbm_primary, qs.data(), qs.size());
+        std::vector<int8_t> qs_km(total_sub * 16);
+        download_sharded_part(rt, slot.sharding, slot.hbm_primary, qs_km.data(), qs_km.size(), q5_shard_ax);
+        auto qs = transpose_minor_to_n(qs_km.data(), B, N, K);
         pack_split_to_q6_K(qs.data(), slot.quant_meta.data(), total_k_blocks, static_cast<block_q6_K*>(dst_full));
     } else {
         download_sharded_part(rt, slot.sharding, slot.hbm_primary, dst_full, slot.nbytes);
@@ -962,7 +1094,7 @@ static void ggml_backend_cloudtpu_buffer_memset_tensor(ggml_backend_buffer_t buf
                 std::memset(parent.staging.data() + rel, value, size);
                 upload_raw_tensor_to_slot(
                     rt, bctx->device_index, bctx->spmd_chips, bctx->spmd_min_rows,
-                    parent, root, parent.staging.data(), false);
+                    parent, root, parent.staging.data(), false, bctx->q4k_bf16_scales);
                 return;
             }
         }
@@ -976,7 +1108,7 @@ static void ggml_backend_cloudtpu_buffer_memset_tensor(ggml_backend_buffer_t buf
         std::vector<uint8_t> tmp(t_bytes, value);
         upload_raw_tensor_to_slot(
             rt, bctx->device_index, bctx->spmd_chips, bctx->spmd_min_rows,
-            slot, tensor, tmp.data(), false);
+            slot, tensor, tmp.data(), false, bctx->q4k_bf16_scales);
     } else {
         if (!slot.staging_dirty) {
             slot.staging.assign(t_bytes, 0);
@@ -1024,7 +1156,7 @@ static void ggml_backend_cloudtpu_buffer_set_tensor(ggml_backend_buffer_t buffer
                 std::memcpy(parent.staging.data() + rel, data, size);
                 upload_raw_tensor_to_slot(
                     rt, bctx->device_index, bctx->spmd_chips, bctx->spmd_min_rows,
-                    parent, root, parent.staging.data(), false);
+                    parent, root, parent.staging.data(), false, bctx->q4k_bf16_scales);
                 return;
             }
         }
@@ -1037,7 +1169,7 @@ static void ggml_backend_cloudtpu_buffer_set_tensor(ggml_backend_buffer_t buffer
     if (offset == 0 && size == t_bytes) {
         upload_raw_tensor_to_slot(
             rt, bctx->device_index, bctx->spmd_chips, bctx->spmd_min_rows,
-            slot, tensor, data, true);
+            slot, tensor, data, true, bctx->q4k_bf16_scales);
     } else {
         if (!slot.staging_dirty) {
             slot.staging.assign(t_bytes, 0);
@@ -1051,7 +1183,7 @@ static void ggml_backend_cloudtpu_buffer_set_tensor(ggml_backend_buffer_t buffer
         if (offset + size == t_bytes) {
             upload_raw_tensor_to_slot(
                 rt, bctx->device_index, bctx->spmd_chips, bctx->spmd_min_rows,
-                slot, tensor, slot.staging.data(), true);
+                slot, tensor, slot.staging.data(), true, bctx->q4k_bf16_scales);
         }
     }
 }
@@ -1181,6 +1313,7 @@ struct cloudtpu_buft_context {
     int device_index = 0;
     int spmd_chips = 1;
     int spmd_min_rows = 256;
+    bool q4k_bf16_scales = true;
     std::string name;
 };
 
@@ -1202,6 +1335,7 @@ static ggml_backend_buffer_t ggml_backend_cloudtpu_buffer_type_alloc_buffer(ggml
     bctx->device_index = btc->device_index;
     bctx->spmd_chips = btc->spmd_chips;
     bctx->spmd_min_rows = btc->spmd_min_rows;
+    bctx->q4k_bf16_scales = btc->q4k_bf16_scales;
     bctx->virtual_base = g_next_virtual_base.fetch_add(aligned_span, std::memory_order_relaxed);
     bctx->size = size;
 
@@ -1244,11 +1378,13 @@ struct SubgraphSigHash {
 struct PlanInputBinding {
     uint32_t input_idx = 0;
     int part = 0;  // 0 = primary/qs, 1 = scales, 2 = mins
+    bool donatable = false;
 };
 
 struct CachedSubgraphPlan {
     const cloudtpu::CachedExecutable* exec = nullptr;
     size_t num_emitted_ops = 0;
+    bool has_donation = false;
     std::vector<PlanInputBinding> input_bindings;
     std::vector<cloudtpu::PjrtDType> out_dtypes;
     std::vector<std::vector<int64_t>> out_dims;
@@ -1288,9 +1424,11 @@ struct ggml_backend_cloudtpu_context {
     std::unordered_map<const struct ggml_tensor*, uint32_t> scratch_tensor_to_id;
     std::vector<const struct ggml_tensor*> scratch_inputs;
     std::vector<cloudtpu::TensorShardingKind> scratch_input_sharding;
+    std::vector<cloudtpu::PjrtDType> scratch_input_scale_dt;
     std::vector<struct ggml_tensor*> scratch_outputs;
     std::vector<ResolvedTensorBuffers> scratch_resolved;
     std::vector<PJRT_Buffer*> scratch_raw_inputs;
+    std::vector<int64_t> scratch_non_donatable;
     std::vector<std::vector<PJRT_Buffer*>> scratch_spmd_inputs;
     std::vector<PJRT_Buffer* const*> scratch_spmd_input_ptrs;
     std::vector<cloudtpu::PjrtBufferPtr> scratch_outputs_1d;
@@ -1413,15 +1551,17 @@ static bool ggml_backend_cloudtpu_device_supports_op_impl(const struct ggml_tens
             if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
                 return false;
             }
-            if (n_dims <= 0 || (n_dims % 2) != 0 || n_offs < 0 || (n_offs % 2) != 0 ||
-                n_offs + n_dims > src0->ne[0]) {
+            const int32_t eff_n_dims = (n_dims == 0) ? static_cast<int32_t>(src0->ne[0]) : n_dims;
+            if (n_dims < 0 || eff_n_dims <= 0 || (eff_n_dims % 2) != 0 || n_offs < 0 || (n_offs % 2) != 0 ||
+                n_offs + eff_n_dims > src0->ne[0]) {
                 return false;
             }
             if (src1->ne[0] != src0->ne[2]) {
                 return false;
             }
             if (src2 != nullptr &&
-                (src2->type != GGML_TYPE_F32 || !is_supported_input_layout(src2) || src2->ne[0] < n_dims / 2)) {
+                (src2->type != GGML_TYPE_F32 || !is_supported_input_layout(src2) ||
+                 (n_dims > 0 && src2->ne[0] < eff_n_dims / 2))) {
                 return false;
             }
             return true;
@@ -1687,10 +1827,39 @@ static cloudtpu::TensorShardingKind lookup_tensor_sharding(const struct ggml_ten
     return cloudtpu::TensorShardingKind::REPLICATED;
 }
 
+static cloudtpu::PjrtDType lookup_tensor_scale_dtype(const struct ggml_tensor* t, bool default_q4k_bf16) {
+    if (!t || !is_quant_split_type(t->type)) {
+        return cloudtpu::PjrtDType::INVALID;
+    }
+    if (t->type == GGML_TYPE_Q8_0 || t->type == GGML_TYPE_Q4_0) {
+        return cloudtpu::PjrtDType::F16;
+    }
+    if (t->buffer && is_cloudtpu_buffer(t->buffer)) {
+        auto* bctx = static_cast<ggml_backend_cloudtpu_buffer_context*>(t->buffer->context);
+        const size_t t_off = tensor_offset_in_buffer(bctx, t);
+        std::lock_guard<std::mutex> lock(bctx->mu);
+        auto it = bctx->slots.find(t_off);
+        if (it != bctx->slots.end() && it->second.scale_dtype != cloudtpu::PjrtDType::INVALID) {
+            return it->second.scale_dtype;
+        }
+        return bctx->q4k_bf16_scales ? cloudtpu::PjrtDType::F16 : cloudtpu::PjrtDType::F32;
+    }
+    return default_q4k_bf16 ? cloudtpu::PjrtDType::F16 : cloudtpu::PjrtDType::F32;
+}
+
+static const struct ggml_tensor* canonical_root(const struct ggml_tensor* t) {
+    if (t && t->view_src != nullptr && t->view_offs == 0 &&
+        ggml_nelements(t) == ggml_nelements(t->view_src)) {
+        return unwrap_view_src(t);
+    }
+    return t;
+}
+
 // Resolves a GGML tensor to HBM buffers (fetching from CloudTpuBuffer or uploading transient host tensor).
 static void resolve_tensor_hbm(cloudtpu::PjrtRuntime& rt,
                                int device_index,
                                int spmd_chips,
+                               bool q4k_bf16_scales,
                                const struct ggml_tensor* t,
                                ResolvedTensorBuffers& out) {
     if (t->buffer && is_cloudtpu_buffer(t->buffer)) {
@@ -1703,7 +1872,7 @@ static void resolve_tensor_hbm(cloudtpu::PjrtRuntime& rt,
             if (slot.staging_dirty && !slot.staging.empty()) {
                 upload_raw_tensor_to_slot(
                     rt, bctx->device_index, bctx->spmd_chips, bctx->spmd_min_rows,
-                    slot, t, slot.staging.data(), true);
+                    slot, t, slot.staging.data(), true, bctx->q4k_bf16_scales);
             }
             if (slot.has_hbm() && slot.ggml_dt == t->type &&
                 slot.dims[0] == t->ne[3] && slot.dims[1] == t->ne[2] &&
@@ -1740,7 +1909,7 @@ static void resolve_tensor_hbm(cloudtpu::PjrtRuntime& rt,
             slot.nbytes = t_bytes;
             upload_raw_tensor_to_slot(
                 rt, bctx->device_index, bctx->spmd_chips, bctx->spmd_min_rows,
-                slot, t, zeros.data(), false);
+                slot, t, zeros.data(), false, bctx->q4k_bf16_scales);
             out.sharding = slot.sharding;
             out.primary = slot.hbm_primary;
             out.scales = slot.hbm_scales;
@@ -1758,7 +1927,7 @@ static void resolve_tensor_hbm(cloudtpu::PjrtRuntime& rt,
     }
     CloudTpuTensorSlot tmp_slot;
     tmp_slot.nbytes = ggml_nbytes(t);
-    upload_raw_tensor_to_slot(rt, device_index, spmd_chips, 0, tmp_slot, t, t->data, false);
+    upload_raw_tensor_to_slot(rt, device_index, spmd_chips, 0, tmp_slot, t, t->data, false, q4k_bf16_scales);
     out.sharding = tmp_slot.sharding;
     out.primary = std::move(tmp_slot.hbm_primary);
     out.scales = std::move(tmp_slot.hbm_scales);
@@ -1967,7 +2136,7 @@ static cloudtpu::OpNodeSpec build_op_node_spec(const struct ggml_tensor* node,
         case GGML_OP_ROPE: {
             spec.kind = cloudtpu::CloudOpKind::ROPE;
             const int32_t* p = node->op_params;
-            spec.rope.n_dims = p[1];
+            spec.rope.n_dims = (p[1] == 0) ? static_cast<int32_t>(node->src[0]->ne[0]) : p[1];
             spec.rope.mode = p[2];
             spec.rope.n_ctx_orig = p[4];
             spec.rope.truncate = ggml_rope_get_truncate(node);
@@ -2152,11 +2321,16 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
     ctx->scratch_tensor_to_id.clear();
     ctx->scratch_inputs.clear();
     ctx->scratch_input_sharding.clear();
+    ctx->scratch_input_scale_dt.clear();
     ctx->scratch_outputs.clear();
 
     auto& sig = ctx->scratch_key.words;
     sig_push(sig, static_cast<uint64_t>(P));
     sig_push(sig, static_cast<uint64_t>(compute_ops));
+    sig_push(sig, (ctx->env.bf16_matmul ? 1ULL : 0ULL) |
+                  (ctx->env.async_collectives ? 2ULL : 0ULL) |
+                  (ctx->env.donate_kv ? 4ULL : 0ULL) |
+                  (ctx->env.q4_split_dot ? 8ULL : 0ULL));
     uint32_t next_id = 1;
 
     auto register_input_sig = [&](auto& self, const struct ggml_tensor* t) -> uint32_t {
@@ -2238,11 +2412,15 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
         }
         const uint32_t id = next_id++;
         const cloudtpu::TensorShardingKind sh = lookup_tensor_sharding(t, P);
+        const cloudtpu::PjrtDType sdt = lookup_tensor_scale_dtype(t, ctx->env.q4k_bf16_scales);
         ctx->scratch_tensor_to_id[t] = id;
         ctx->scratch_inputs.push_back(t);
         ctx->scratch_input_sharding.push_back(sh);
+        ctx->scratch_input_scale_dt.push_back(sdt);
         sig_push(sig, 1ULL);
-        sig_push(sig, (static_cast<uint64_t>(t->type) << 8) | static_cast<uint64_t>(sh));
+        sig_push(sig, (static_cast<uint64_t>(t->type) << 16) |
+                      (static_cast<uint64_t>(sdt) << 8) |
+                      static_cast<uint64_t>(sh));
         sig_push(sig, static_cast<uint64_t>(t->ne[0]));
         sig_push(sig, static_cast<uint64_t>(t->ne[1]));
         sig_push(sig, static_cast<uint64_t>(t->ne[2]));
@@ -2363,6 +2541,77 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
         }
     }
 
+    // Identify safe in-place KV-cache buffer donations (SET_ROWS leaf table -> live-out same HBM slot).
+    std::vector<int32_t> input_alias_out(ctx->scratch_inputs.size(), -1);
+    bool has_alias = false;
+    if (ctx->env.donate_kv && !ctx->scratch_inputs.empty() && !ctx->scratch_outputs.empty()) {
+        for (size_t oi = 0; oi < ctx->scratch_outputs.size(); ++oi) {
+            const struct ggml_tensor* out_node = ctx->scratch_outputs[oi];
+            if (!out_node || out_node->op != GGML_OP_SET_ROWS || !out_node->src[2]) {
+                continue;
+            }
+            if (!out_node->buffer || !is_cloudtpu_buffer(out_node->buffer)) {
+                continue;
+            }
+            const struct ggml_tensor* dst_root = canonical_root(out_node);
+            const struct ggml_tensor* tbl_in = out_node->src[2];
+            const struct ggml_tensor* tbl_root = canonical_root(tbl_in);
+            if (!dst_root || !tbl_root || dst_root->buffer != tbl_root->buffer ||
+                dst_root->data != tbl_root->data || dst_root->type != tbl_root->type ||
+                dst_root->ne[0] != tbl_in->ne[0] || dst_root->ne[1] != tbl_in->ne[1] ||
+                dst_root->ne[2] != tbl_in->ne[2] || dst_root->ne[3] != tbl_in->ne[3]) {
+                continue;
+            }
+            if (is_quant_split_type(tbl_in->type)) {
+                continue;
+            }
+            size_t found_in = SIZE_MAX;
+            bool dup_slot = false;
+            for (size_t ii = 0; ii < ctx->scratch_inputs.size(); ++ii) {
+                const struct ggml_tensor* cand = ctx->scratch_inputs[ii];
+                if (cand == tbl_in) {
+                    found_in = ii;
+                } else {
+                    const struct ggml_tensor* croot = canonical_root(cand);
+                    if (croot && croot->buffer == dst_root->buffer && croot->data == dst_root->data) {
+                        dup_slot = true;
+                        break;
+                    }
+                }
+            }
+            if (found_in == SIZE_MAX || dup_slot || input_alias_out[found_in] >= 0 ||
+                ctx->scratch_input_sharding[found_in] != cloudtpu::TensorShardingKind::REPLICATED) {
+                continue;
+            }
+            // Verify tbl_in is consumed only once inside [start_idx, end_idx) (by out_node->src[2]).
+            int uses = 0;
+            for (int k = start_idx; k < end_idx; ++k) {
+                const struct ggml_tensor* nk = cgraph->nodes[k];
+                if (is_view_noop_op(nk->op)) continue;
+                for (int s = 0; s < GGML_MAX_SRC && nk->src[s] != nullptr; ++s) {
+                    for (const struct ggml_tensor* cur = nk->src[s]; cur != nullptr; cur = view_parent(cur)) {
+                        if (cur == tbl_in) {
+                            ++uses;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (uses == 1) {
+                input_alias_out[found_in] = static_cast<int32_t>(oi);
+                has_alias = true;
+            }
+        }
+    }
+    if (has_alias) {
+        sig_push(sig, 7ULL);
+        for (size_t ii = 0; ii < input_alias_out.size(); ++ii) {
+            if (input_alias_out[ii] >= 0) {
+                sig_push(sig, (static_cast<uint64_t>(ii) << 32) | static_cast<uint64_t>(input_alias_out[ii]));
+            }
+        }
+    }
+
     ctx->scratch_key.hash = hash_sig_words(sig);
     const CachedSubgraphPlan* plan_ptr = nullptr;
     auto pit = ctx->plan_cache.find(ctx->scratch_key);
@@ -2374,6 +2623,8 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
         // Build full GraphProgramSpec & compile/lookup PJRT executable on plan miss.
         cloudtpu::GraphProgramSpec prog_spec;
         prog_spec.spmd_chips = P;
+        prog_spec.bf16_matmul = ctx->env.bf16_matmul;
+        prog_spec.q4_split_dot = ctx->env.q4_split_dot;
         std::unordered_map<const struct ggml_tensor*, uint64_t> tensor_to_id;
         std::unordered_map<uint64_t, uint32_t> id_to_input_idx;
         uint64_t spec_next_id = 1;
@@ -2452,7 +2703,10 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
             const cloudtpu::TensorShardingKind sh = ctx->scratch_input_sharding[in_idx];
             tensor_to_id[t] = id;
             id_to_input_idx[id] = in_idx;
-            prog_spec.inputs.push_back(tensor_to_spec(t, id, sh));
+            cloudtpu::TensorSpec ts = tensor_to_spec(t, id, sh);
+            ts.scale_dtype = ctx->scratch_input_scale_dt[in_idx];
+            ts.alias_output_idx = input_alias_out[in_idx];
+            prog_spec.inputs.push_back(std::move(ts));
             return id;
         };
 
@@ -2515,19 +2769,27 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
                           emitted.input_bindings.size(), prog_spec.ops.size(), emitted.output_bindings.size(),
                           emitted.mlir_text.c_str());
         }
-        const cloudtpu::PjrtCompileOptions copts = rt.make_spmd_compile_options(P, ctx->device_index);
+        const cloudtpu::PjrtCompileOptions copts =
+            rt.make_spmd_compile_options(P, ctx->device_index, has_alias, ctx->env.async_collectives);
         std::string exec_cache_key = emitted.cache_key;
         if (P <= 1 && rt.device_count() > 1) {
             exec_cache_key += "|dev=" + std::to_string(ctx->device_index);
+        }
+        if (has_alias) {
+            exec_cache_key += "|alias";
+        }
+        if (P > 1 && !ctx->env.async_collectives) {
+            exec_cache_key += "|noasync";
         }
         const cloudtpu::CachedExecutable* exec = rt.compile_or_get(exec_cache_key, emitted.mlir_text, copts);
 
         CachedSubgraphPlan new_plan;
         new_plan.exec = exec;
         new_plan.num_emitted_ops = prog_spec.ops.size();
+        new_plan.has_donation = has_alias;
         new_plan.input_bindings.reserve(emitted.input_bindings.size());
         for (const auto& ib : emitted.input_bindings) {
-            new_plan.input_bindings.push_back({id_to_input_idx.at(ib.tensor_id), ib.part});
+            new_plan.input_bindings.push_back({id_to_input_idx.at(ib.tensor_id), ib.part, ib.donatable});
         }
         new_plan.out_dtypes.reserve(emitted.output_bindings.size());
         new_plan.out_dims.reserve(emitted.output_bindings.size());
@@ -2550,23 +2812,53 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
     const CachedSubgraphPlan& plan = *plan_ptr;
 
     // 5. Resolve each unique leaf input ONCE into flat scratch_resolved[].
+    if (plan.has_donation) {
+        // Drop previous subgraph's sync handles so they do not inflate use_count() on donated KV slots.
+        ctx->last_pending_buffers.clear();
+    }
     const size_t n_in = ctx->scratch_inputs.size();
     ctx->scratch_resolved.resize(n_in);
     for (size_t k = 0; k < n_in; ++k) {
-        resolve_tensor_hbm(rt, ctx->device_index, P, ctx->scratch_inputs[k], ctx->scratch_resolved[k]);
+        resolve_tensor_hbm(
+            rt, ctx->device_index, P, ctx->env.q4k_bf16_scales, ctx->scratch_inputs[k], ctx->scratch_resolved[k]);
     }
 
     // Keep TPU execution fully pipelined across subgraphs and ggml_backend_sched splits when
     // fuse_graphs is enabled; PJRT_Buffer_ToHostBuffer and ggml_backend_cloudtpu_synchronize
     // synchronize on demand when host readback is requested.
     const bool sync_exec = !ctx->env.fuse_graphs;
+    ctx->scratch_non_donatable.clear();
     if (P <= 1) {
         ctx->scratch_raw_inputs.clear();
         ctx->scratch_raw_inputs.reserve(plan.input_bindings.size());
-        for (const auto& ib : plan.input_bindings) {
+        for (size_t bi = 0; bi < plan.input_bindings.size(); ++bi) {
+            const auto& ib = plan.input_bindings[bi];
             const auto& rp = ctx->scratch_resolved[ib.input_idx];
             const auto& vec = (ib.part == 0) ? rp.primary : ((ib.part == 1) ? rp.scales : rp.mins);
-            ctx->scratch_raw_inputs.push_back(vec[0]->handle.get());
+            PJRT_Buffer* raw_ptr = vec[0]->handle.get();
+            ctx->scratch_raw_inputs.push_back(raw_ptr);
+        }
+        if (plan.has_donation) {
+            for (size_t bi = 0; bi < plan.input_bindings.size(); ++bi) {
+                const auto& ib = plan.input_bindings[bi];
+                if (!ib.donatable) continue;
+                const auto& rp = ctx->scratch_resolved[ib.input_idx];
+                // Exclusive ownership check: 1 ref in bctx->slots + 1 ref in scratch_resolved == 2,
+                // and raw PJRT_Buffer* must not appear twice in argument list.
+                bool safe = (rp.primary.size() == 1 && rp.primary[0] && rp.primary[0].use_count() == 2);
+                if (safe) {
+                    PJRT_Buffer* raw_ptr = ctx->scratch_raw_inputs[bi];
+                    for (size_t bj = 0; bj < ctx->scratch_raw_inputs.size(); ++bj) {
+                        if (bj != bi && ctx->scratch_raw_inputs[bj] == raw_ptr) {
+                            safe = false;
+                            break;
+                        }
+                    }
+                }
+                if (!safe) {
+                    ctx->scratch_non_donatable.push_back(static_cast<int64_t>(bi));
+                }
+            }
         }
         rt.execute(plan.exec,
                    ctx->device_index,
@@ -2575,7 +2867,8 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
                    ctx->scratch_outputs_1d,
                    plan.out_dtypes,
                    plan.out_dims,
-                   sync_exec);
+                   sync_exec,
+                   ctx->scratch_non_donatable.empty() ? nullptr : &ctx->scratch_non_donatable);
 
         ctx->last_pending_buffers.clear();
         for (size_t oi = 0; oi < ctx->scratch_outputs.size(); ++oi) {
@@ -2583,6 +2876,13 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
                 ctx->last_pending_buffers.push_back(ctx->scratch_outputs_1d[oi]);
             }
             store_tensor_hbm_single(rt, ctx->scratch_outputs[oi], std::move(ctx->scratch_outputs_1d[oi]));
+        }
+        if (plan.has_donation) {
+            for (const auto& ib : plan.input_bindings) {
+                if (ib.donatable) {
+                    ctx->scratch_resolved[ib.input_idx].primary.clear();
+                }
+            }
         }
     } else {
         const size_t n_devs = static_cast<size_t>(P);
@@ -2599,6 +2899,28 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
             }
             ctx->scratch_spmd_input_ptrs[d] = row.data();
         }
+        if (plan.has_donation) {
+            for (size_t bi = 0; bi < plan.input_bindings.size(); ++bi) {
+                const auto& ib = plan.input_bindings[bi];
+                if (!ib.donatable) continue;
+                const auto& rp = ctx->scratch_resolved[ib.input_idx];
+                bool safe = (rp.primary.size() == n_devs);
+                for (size_t d = 0; safe && d < n_devs; ++d) {
+                    if (!rp.primary[d] || rp.primary[d].use_count() != 2) {
+                        safe = false;
+                    }
+                    PJRT_Buffer* raw_ptr = ctx->scratch_spmd_inputs[d][bi];
+                    for (size_t bj = 0; safe && bj < plan.input_bindings.size(); ++bj) {
+                        if (bj != bi && ctx->scratch_spmd_inputs[d][bj] == raw_ptr) {
+                            safe = false;
+                        }
+                    }
+                }
+                if (!safe) {
+                    ctx->scratch_non_donatable.push_back(static_cast<int64_t>(bi));
+                }
+            }
+        }
         rt.execute_spmd(plan.exec,
                         P,
                         ctx->scratch_spmd_input_ptrs.data(),
@@ -2606,7 +2928,8 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
                         ctx->scratch_spmd_outputs,
                         plan.out_dtypes,
                         plan.out_dims,
-                        sync_exec);
+                        sync_exec,
+                        ctx->scratch_non_donatable.empty() ? nullptr : &ctx->scratch_non_donatable);
 
         ctx->last_pending_buffers.clear();
         for (size_t oi = 0; oi < ctx->scratch_outputs.size(); ++oi) {
@@ -2614,6 +2937,13 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
                 ctx->last_pending_buffers.push_back(ctx->scratch_spmd_outputs[0][oi]);
             }
             store_tensor_hbm_spmd(rt, ctx->scratch_outputs[oi], ctx->scratch_spmd_outputs, oi);
+        }
+        if (plan.has_donation) {
+            for (const auto& ib : plan.input_bindings) {
+                if (ib.donatable) {
+                    ctx->scratch_resolved[ib.input_idx].primary.clear();
+                }
+            }
         }
     }
 
@@ -2644,9 +2974,9 @@ static enum ggml_status ggml_backend_cloudtpu_graph_compute(ggml_backend_t backe
             }
             int j = i + 1;
             if (ctx->env.fuse_graphs) {
-                // Isolate dynamic-n_kv attention (FLASH_ATTN_EXT) at subgraph boundaries so all
-                // static-shape QKV/ROPE/SET_ROWS/FFN subgraphs stay 100% cache-hit across decode tokens.
-                const bool start_is_attn = (cgraph->nodes[i]->op == GGML_OP_FLASH_ATTN_EXT);
+                // Isolate dynamic-n_kv attention (FLASH_ATTN_EXT) at subgraph boundaries unless
+                // CLOUDTPU_FUSE_ATTN=1 is enabled.
+                const bool start_is_attn = (!ctx->env.fuse_attn && cgraph->nodes[i]->op == GGML_OP_FLASH_ATTN_EXT);
                 if (!start_is_attn) {
                     std::vector<const struct ggml_tensor*> inplace_writes;
                     if (cgraph->nodes[i]->op == GGML_OP_SET_ROWS || cgraph->nodes[i]->view_src != nullptr) {
@@ -2660,7 +2990,7 @@ static enum ggml_status ggml_backend_cloudtpu_graph_compute(ggml_backend_t backe
                             ++j;
                             continue;
                         }
-                        if (nj->op == GGML_OP_FLASH_ATTN_EXT) {
+                        if (!ctx->env.fuse_attn && nj->op == GGML_OP_FLASH_ATTN_EXT) {
                             break;
                         }
                         // Guard against aliasing a previous in-place write in this slice via a
@@ -2922,6 +3252,7 @@ static cloudtpu_reg_state& get_reg_state(ggml_backend_reg_t reg) {
                 btc->device_index = i;
                 btc->spmd_chips = spmd;
                 btc->spmd_min_rows = env.spmd_min_rows;
+                btc->q4k_bf16_scales = env.q4k_bf16_scales;
                 btc->name = state.dev_ctxs[static_cast<size_t>(i)]->name;
                 state.bufts[static_cast<size_t>(i)] = {
                     /* .iface   = */ {

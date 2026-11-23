@@ -217,6 +217,18 @@ void append_tag_bytes(std::string& out, uint32_t field_number, const std::string
 std::string encode_compile_options_proto(const PjrtCompileOptions& opts) {
     // xla::ExecutableBuildOptionsProto (openxla/xla/xla/pjrt/proto/compile_options.proto)
     std::string ebo;
+    if (!opts.backend_extra_options.empty()) {
+        // xla::DebugOptions (field 3 of ExecutableBuildOptionsProto):
+        //   map<string, string> xla_backend_extra_options = 500;
+        std::string dbg;
+        for (const auto& kv : opts.backend_extra_options) {
+            std::string entry;
+            append_tag_bytes(entry, 1, kv.first);
+            append_tag_bytes(entry, 2, kv.second);
+            append_tag_bytes(dbg, 500, entry);
+        }
+        append_tag_bytes(ebo, 3, dbg);
+    }
     if (opts.num_replicas > 0) {
         append_tag_varint(ebo, 4, static_cast<uint64_t>(opts.num_replicas));
     }
@@ -251,6 +263,9 @@ std::string encode_compile_options_proto(const PjrtCompileOptions& opts) {
             append_tag_bytes(da, 3, comp_dev);
         }
         append_tag_bytes(ebo, 9, da);
+    }
+    if (opts.alias_passthrough_params) {
+        append_tag_varint(ebo, 10, 1);
     }
     if (opts.use_shardy_partitioner) {
         append_tag_varint(ebo, 19, 1);
@@ -610,6 +625,7 @@ struct MockOp {
         SCATTER_3D_ROWS,
         REPLICA_ID,
         DYNAMIC_SLICE,
+        DYNAMIC_UPDATE_SLICE,
         ALL_REDUCE_ADD,
         ALL_REDUCE_MAX,
         ALL_GATHER,
@@ -707,7 +723,8 @@ static MockProgram parse_stablehlo_mlir(const std::string& mlir) {
             stmt.find("\"stablehlo.all_reduce\"") != std::string::npos ||
             stmt.find("\"stablehlo.all_gather\"") != std::string::npos ||
             stmt.find("\"stablehlo.reduce_scatter\"") != std::string::npos ||
-            stmt.find("\"stablehlo.dynamic_slice\"") != std::string::npos) {
+            stmt.find("\"stablehlo.dynamic_slice\"") != std::string::npos ||
+            stmt.find("\"stablehlo.dynamic_update_slice\"") != std::string::npos) {
             while (li + 1 < lines.size() &&
                    (stmt.find("->") == std::string::npos || stmt.rfind('>') < stmt.find("->"))) {
                 stmt += " " + lines[++li];
@@ -892,6 +909,11 @@ static MockProgram parse_stablehlo_mlir(const std::string& mlir) {
             const size_t sp = rhs.find("slice_sizes = array<i64:");
             const size_t se = rhs.find('>', sp);
             op.dynamic_slice_sizes = parse_int_list(rhs.substr(sp + 24, se - (sp + 24)));
+        } else if (rhs.rfind("\"stablehlo.dynamic_update_slice\"", 0) == 0) {
+            op.kind = MockOp::Kind::DYNAMIC_UPDATE_SLICE;
+            const size_t lp = rhs.find('(');
+            const size_t rp = rhs.find(')', lp);
+            op.inputs = extract_ssa_refs(rhs.substr(lp + 1, rp - lp - 1));
         } else if (rhs.rfind("\"stablehlo.all_reduce\"", 0) == 0 ||
                    rhs.rfind("\"stablehlo.all_gather\"", 0) == 0 ||
                    rhs.rfind("\"stablehlo.reduce_scatter\"", 0) == 0) {
@@ -1362,6 +1384,33 @@ static MockTensor eval_mock_op(const MockOp& op,
                     src_idx += (static_cast<size_t>(starts[d]) + c) * in_strides[d];
                 }
                 std::memcpy(out.bytes.data() + i * elem_sz, a.bytes.data() + src_idx * elem_sz, elem_sz);
+            }
+            break;
+        }
+        case MockOp::Kind::DYNAMIC_UPDATE_SLICE: {
+            const MockTensor& operand = env.at(op.inputs[0]);
+            const MockTensor& update = env.at(op.inputs[1]);
+            out.bytes = operand.bytes;
+            const size_t rank = operand.dims.size();
+            std::vector<int64_t> starts(rank, 0);
+            for (size_t d = 0; d < rank && (d + 2) < op.inputs.size(); ++d) {
+                const int64_t st = env.at(op.inputs[d + 2]).read_i64(0);
+                const int64_t max_st = std::max<int64_t>(0, operand.dims[d] - update.dims[d]);
+                starts[d] = std::max<int64_t>(0, std::min<int64_t>(max_st, st));
+            }
+            const auto out_strides = compute_row_major_strides(out.dims);
+            const auto upd_strides = compute_row_major_strides(update.dims);
+            const size_t elem_sz = pjrt_dtype_size(out.dtype);
+            const size_t n_upd = update.num_elements();
+            for (size_t i = 0; i < n_upd; ++i) {
+                size_t rem = i;
+                size_t dst_idx = 0;
+                for (size_t d = 0; d < rank; ++d) {
+                    const size_t c = rem / upd_strides[d];
+                    rem %= upd_strides[d];
+                    dst_idx += (static_cast<size_t>(starts[d]) + c) * out_strides[d];
+                }
+                std::memcpy(out.bytes.data() + dst_idx * elem_sz, update.bytes.data() + i * elem_sz, elem_sz);
             }
             break;
         }
@@ -2149,8 +2198,12 @@ std::vector<PjrtBufferPtr> PjrtRuntime::buffer_from_host_replicated(int num_devi
     return bufs;
 }
 
-PjrtCompileOptions PjrtRuntime::make_spmd_compile_options(int num_chips, int device_idx) const {
+PjrtCompileOptions PjrtRuntime::make_spmd_compile_options(int num_chips,
+                                                          int device_idx,
+                                                          bool alias_passthrough,
+                                                          bool async_collectives) const {
     PjrtCompileOptions opts;
+    opts.alias_passthrough_params = alias_passthrough;
     const int n = std::max(1, std::min(num_chips, static_cast<int>(device_infos_.size())));
     if (n <= 1) {
         opts.num_replicas = 1;
@@ -2170,6 +2223,17 @@ PjrtCompileOptions PjrtRuntime::make_spmd_compile_options(int num_chips, int dev
         opts.device_assignment_ids.resize(static_cast<size_t>(n));
         for (int i = 0; i < n; ++i) {
             opts.device_assignment_ids[static_cast<size_t>(i)] = device_infos_[static_cast<size_t>(i)].id;
+        }
+        if (async_collectives) {
+            opts.backend_extra_options = {
+                {"xla_tpu_enable_async_collective_fusion", "true"},
+                {"xla_tpu_overlap_compute_collective_tc", "true"},
+                {"xla_tpu_enable_async_collective_fusion_multiple_steps", "true"},
+                {"xla_enable_async_all_gather", "true"},
+                {"xla_enable_async_all_reduce", "true"},
+                {"xla_tpu_enable_async_collective_fusion_fuse_all_gather", "true"},
+                {"xla_tpu_enable_async_collective_fusion_fuse_all_reduce", "true"},
+            };
         }
     }
     return opts;
@@ -2347,7 +2411,8 @@ void PjrtRuntime::execute(const CachedExecutable* exec,
                           std::vector<PjrtBufferPtr>& outputs,
                           const std::vector<PjrtDType>& out_dtypes,
                           const std::vector<std::vector<int64_t>>& out_dims,
-                          bool sync) {
+                          bool sync,
+                          const std::vector<int64_t>* non_donatable_input_indices) {
     if (!exec || !exec->handle) {
         throw std::runtime_error("execute: null CachedExecutable");
     }
@@ -2376,6 +2441,10 @@ void PjrtRuntime::execute(const CachedExecutable* exec,
 
     PJRT_ExecuteOptions opts = {};
     opts.struct_size = PJRT_ExecuteOptions_STRUCT_SIZE;
+    if (non_donatable_input_indices && !non_donatable_input_indices->empty()) {
+        opts.non_donatable_input_indices = non_donatable_input_indices->data();
+        opts.num_non_donatable_input_indices = non_donatable_input_indices->size();
+    }
 
     PJRT_Event* dev_ev[1] = {nullptr};
     const bool use_dev_event = sync && !has_ready_event_;
@@ -2430,7 +2499,8 @@ void PjrtRuntime::execute_spmd(const CachedExecutable* exec,
                                std::vector<std::vector<PjrtBufferPtr>>& per_device_outputs,
                                const std::vector<PjrtDType>& out_dtypes,
                                const std::vector<std::vector<int64_t>>& out_dims,
-                               bool sync) {
+                               bool sync,
+                               const std::vector<int64_t>* non_donatable_input_indices) {
     if (!exec || !exec->handle) {
         throw std::runtime_error("execute_spmd: null CachedExecutable");
     }
@@ -2453,6 +2523,12 @@ void PjrtRuntime::execute_spmd(const CachedExecutable* exec,
 
     PJRT_ExecuteOptions opts = {};
     opts.struct_size = PJRT_ExecuteOptions_STRUCT_SIZE;
+    const int lid = next_launch_id_.fetch_add(1, std::memory_order_relaxed);
+    opts.launch_id = (lid > 0) ? lid : 1;
+    if (non_donatable_input_indices && !non_donatable_input_indices->empty()) {
+        opts.non_donatable_input_indices = non_donatable_input_indices->data();
+        opts.num_non_donatable_input_indices = non_donatable_input_indices->size();
+    }
 
     const bool use_dev_event = sync && !has_ready_event_;
     std::vector<PJRT_Event*> dev_events(use_dev_event ? n_devs : 0, nullptr);

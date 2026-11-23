@@ -71,7 +71,29 @@ void test_compile_options_proto() {
     };
     CHECK_TRUE(p_da.size() == sizeof(exp_da), "device_assignment proto length mismatch");
     CHECK_TRUE(std::memcmp(p_da.data(), exp_da, sizeof(exp_da)) == 0, "device_assignment proto bytes mismatch");
-    std::printf("  [PASS] compile_options_proto (incl. DeviceAssignmentProto 8-chip)\n");
+
+    // Alias passthrough + DebugOptions.xla_backend_extra_options (field 3 -> repeated field 500)
+    cloudtpu::PjrtCompileOptions opt_extra;
+    opt_extra.alias_passthrough_params = true;
+    opt_extra.backend_extra_options = {
+        {"xla_tpu_enable_async_collective_fusion", "true"},
+        {"xla_enable_async_all_reduce", "true"},
+    };
+    const std::string p_extra = cloudtpu::encode_compile_options_proto(opt_extra);
+    CHECK_TRUE(p_extra.find("xla_tpu_enable_async_collective_fusion") != std::string::npos,
+               "backend_extra_options fusion key missing");
+    CHECK_TRUE(p_extra.find("xla_enable_async_all_reduce") != std::string::npos,
+               "backend_extra_options all_reduce key missing");
+    // Field 10 tag = (10<<3)|0 = 0x50 followed by 0x01
+    bool found_alias_tag = false;
+    for (size_t i = 0; i + 1 < p_extra.size(); ++i) {
+        if (static_cast<uint8_t>(p_extra[i]) == 0x50 && static_cast<uint8_t>(p_extra[i + 1]) == 0x01) {
+            found_alias_tag = true;
+            break;
+        }
+    }
+    CHECK_TRUE(found_alias_tag, "alias_passthrough_params (field 10) missing");
+    std::printf("  [PASS] compile_options_proto (incl. DeviceAssignmentProto, alias_passthrough, DebugOptions)\n");
 }
 
 void test_half_bf16_conversions() {
@@ -192,15 +214,18 @@ void test_mul_mat_dense_and_quant(cloudtpu::PjrtRuntime& rt) {
         }
     }
 
-    // 2) Q4_0_SPLIT x F32
+    // 2) Q4_0_SPLIT x F32 (K-major N-minor: qs [1, 1, NB=1, 16, N], d [1, 1, NB=1, N])
     std::vector<uint8_t> qs(N * 16);
     std::vector<uint16_t> d(N);
+    std::vector<uint8_t> qs_km(16 * N);
     for (int64_t n = 0; n < N; ++n) {
         d[n] = cloudtpu::f32_to_f16(0.5f * static_cast<float>(n + 1));
         for (int64_t j = 0; j < 16; ++j) {
             const uint8_t lo = static_cast<uint8_t>((j + n + 5) & 0x0F);
             const uint8_t hi = static_cast<uint8_t>((j * 3 + 9) & 0x0F);
-            qs[n * 16 + j] = static_cast<uint8_t>(lo | (hi << 4));
+            const uint8_t packed = static_cast<uint8_t>(lo | (hi << 4));
+            qs[n * 16 + j] = packed;
+            qs_km[j * N + n] = packed;
         }
     }
     std::vector<float> x1(K);
@@ -217,8 +242,8 @@ void test_mul_mat_dense_and_quant(cloudtpu::PjrtRuntime& rt) {
     qspec.output_ids = {3};
 
     const auto qprog = cloudtpu::emit_stablehlo_program(qspec);
-    auto bqs = rt.buffer_from_host(0, qs.data(), cloudtpu::PjrtDType::U8, {1, 1, N, 1, 16});
-    auto bd = rt.buffer_from_host(0, d.data(), cloudtpu::PjrtDType::F16, {1, 1, N, 1});
+    auto bqs = rt.buffer_from_host(0, qs_km.data(), cloudtpu::PjrtDType::U8, {1, 1, 1, 16, N});
+    auto bd = rt.buffer_from_host(0, d.data(), cloudtpu::PjrtDType::F16, {1, 1, 1, N});
     auto bx1 = rt.buffer_from_host(0, x1.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, K});
     auto qgot = run_emitted(rt, qprog, {bqs, bd, bx1});
 
@@ -426,29 +451,29 @@ void test_silicon_regressions(cloudtpu::PjrtRuntime& rt) {
     done_rope52:;
     }
 
-    // 2) Q4_0_SPLIT (N=16, NB=8, K=256): dequant-only CPY + MUL_MAT (M=4)
+    // 2) Q4_0_SPLIT (N=16, NB=8, K=256): dequant-only CPY + MUL_MAT (M=4, both split-dot and single-dot)
     {
         const int64_t N = 16, NB = 8, K = NB * 32, M = 4;
-        std::vector<uint8_t> qs(static_cast<size_t>(N * NB * 16));
-        std::vector<uint16_t> d(static_cast<size_t>(N * NB));
+        std::vector<uint8_t> qs_km(static_cast<size_t>(NB * 16 * N));
+        std::vector<uint16_t> d_km(static_cast<size_t>(NB * N));
         std::vector<float> w_ref(static_cast<size_t>(N * K));
         for (int64_t n = 0; n < N; ++n) {
             for (int64_t b = 0; b < NB; ++b) {
                 const float sc = 0.05f * static_cast<float>((n + b) % 7 + 1);
                 const uint16_t d16 = cloudtpu::f32_to_f16(sc);
-                d[static_cast<size_t>(n * NB + b)] = d16;
+                d_km[static_cast<size_t>(b * N + n)] = d16;
                 const float scale = cloudtpu::f16_to_f32(d16);
                 for (int64_t j = 0; j < 16; ++j) {
                     const uint8_t lo = static_cast<uint8_t>((n * 3 + b * 5 + j) & 0x0F);
                     const uint8_t hi = static_cast<uint8_t>((n * 7 + b * 11 + j * 3 + 2) & 0x0F);
-                    qs[static_cast<size_t>((n * NB + b) * 16 + j)] = static_cast<uint8_t>(lo | (hi << 4));
+                    qs_km[static_cast<size_t>((b * 16 + j) * N + n)] = static_cast<uint8_t>(lo | (hi << 4));
                     w_ref[static_cast<size_t>(n * K + b * 32 + j)] = static_cast<float>(static_cast<int>(lo) - 8) * scale;
                     w_ref[static_cast<size_t>(n * K + b * 32 + j + 16)] = static_cast<float>(static_cast<int>(hi) - 8) * scale;
                 }
             }
         }
-        auto bqs = rt.buffer_from_host(0, qs.data(), cloudtpu::PjrtDType::U8, {1, 1, N, NB, 16});
-        auto bd = rt.buffer_from_host(0, d.data(), cloudtpu::PjrtDType::F16, {1, 1, N, NB});
+        auto bqs = rt.buffer_from_host(0, qs_km.data(), cloudtpu::PjrtDType::U8, {1, 1, NB, 16, N});
+        auto bd = rt.buffer_from_host(0, d_km.data(), cloudtpu::PjrtDType::F16, {1, 1, NB, N});
 
         // Dequant-only check
         {
@@ -476,14 +501,15 @@ void test_silicon_regressions(cloudtpu::PjrtRuntime& rt) {
             }
         }
 
-        // MUL_MAT Q4_0 K=256 check
+        // MUL_MAT Q4_0 K=256 check (both split-dot and single-dot)
         std::vector<float> x(static_cast<size_t>(M * K));
         for (size_t i = 0; i < x.size(); ++i) {
             x[i] = std::cos(static_cast<float>(i) * 0.17f);
         }
         auto bx = rt.buffer_from_host(0, x.data(), cloudtpu::PjrtDType::F32, {1, 1, M, K});
-        {
+        for (bool split_dot : {true, false}) {
             cloudtpu::GraphProgramSpec mspec;
+            mspec.q4_split_dot = split_dot;
             mspec.inputs.push_back({1, cloudtpu::PjrtDType::U8, cloudtpu::TensorStorageKind::Q4_0_SPLIT, {1, 1, N, K}});
             mspec.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, K}});
             cloudtpu::OpNodeSpec mm;
@@ -507,7 +533,8 @@ void test_silicon_regressions(cloudtpu::PjrtRuntime& rt) {
             }
             const double nmse = se / std::max(1e-12, sref);
             if (nmse > 5e-4) {
-                std::fprintf(stderr, "FAIL [Q4_0 MUL_MAT K=256]: nmse=%.6f got[0]=%.5f\n", nmse, ygot[0]);
+                std::fprintf(stderr, "FAIL [Q4_0 MUL_MAT K=256 split=%d]: nmse=%.6f got[0]=%.5f\n",
+                             split_dot ? 1 : 0, nmse, ygot[0]);
                 ++g_failures;
             }
         }
@@ -516,17 +543,17 @@ void test_silicon_regressions(cloudtpu::PjrtRuntime& rt) {
     // 3) Q8_0_SPLIT (N=16, NB=8, K=256, M=4)
     {
         const int64_t N = 16, NB = 8, K = NB * 32, M = 4;
-        std::vector<int8_t> qs(static_cast<size_t>(N * NB * 32));
-        std::vector<uint16_t> d(static_cast<size_t>(N * NB));
+        std::vector<int8_t> qs_km(static_cast<size_t>(NB * 32 * N));
+        std::vector<uint16_t> d_km(static_cast<size_t>(NB * N));
         std::vector<float> w_ref(static_cast<size_t>(N * K));
         for (int64_t n = 0; n < N; ++n) {
             for (int64_t b = 0; b < NB; ++b) {
                 const uint16_t d16 = cloudtpu::f32_to_f16(0.01f * static_cast<float>((n + b) % 5 + 1));
-                d[static_cast<size_t>(n * NB + b)] = d16;
+                d_km[static_cast<size_t>(b * N + n)] = d16;
                 const float scale = cloudtpu::f16_to_f32(d16);
                 for (int64_t j = 0; j < 32; ++j) {
                     const int8_t q = static_cast<int8_t>(((n * 13 + b * 29 + j * 7) % 251) - 125);
-                    qs[static_cast<size_t>((n * NB + b) * 32 + j)] = q;
+                    qs_km[static_cast<size_t>((b * 32 + j) * N + n)] = q;
                     w_ref[static_cast<size_t>(n * K + b * 32 + j)] = static_cast<float>(q) * scale;
                 }
             }
@@ -534,8 +561,8 @@ void test_silicon_regressions(cloudtpu::PjrtRuntime& rt) {
         std::vector<float> x(static_cast<size_t>(M * K));
         for (size_t i = 0; i < x.size(); ++i) x[i] = std::sin(static_cast<float>(i) * 0.23f);
 
-        auto bqs = rt.buffer_from_host(0, qs.data(), cloudtpu::PjrtDType::S8, {1, 1, N, NB, 32});
-        auto bd = rt.buffer_from_host(0, d.data(), cloudtpu::PjrtDType::F16, {1, 1, N, NB});
+        auto bqs = rt.buffer_from_host(0, qs_km.data(), cloudtpu::PjrtDType::S8, {1, 1, NB, 32, N});
+        auto bd = rt.buffer_from_host(0, d_km.data(), cloudtpu::PjrtDType::F16, {1, 1, NB, N});
         auto bx = rt.buffer_from_host(0, x.data(), cloudtpu::PjrtDType::F32, {1, 1, M, K});
         cloudtpu::GraphProgramSpec mspec;
         mspec.inputs.push_back({1, cloudtpu::PjrtDType::S8, cloudtpu::TensorStorageKind::Q8_0_SPLIT, {1, 1, N, K}});
@@ -566,7 +593,57 @@ void test_silicon_regressions(cloudtpu::PjrtRuntime& rt) {
         }
     }
 
-    std::printf("  [PASS] Silicon regressions (ROPE M=52, Q4_0/Q8_0 K=256)\n");
+    // 4) Single-token SET_ROWS -> dynamic_update_slice + {tf.aliasing_output = 0 : i32}
+    {
+        const int64_t R = 8, D = 4;
+        std::vector<float> tbl(static_cast<size_t>(R * D), 0.0f);
+        for (size_t i = 0; i < tbl.size(); ++i) tbl[i] = static_cast<float>(i);
+        std::vector<float> upd = {101.0f, 102.0f, 103.0f, 104.0f};
+        int32_t row_idx = 5;
+
+        cloudtpu::GraphProgramSpec spec;
+        spec.inputs.push_back({1, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, D}});
+        spec.inputs.push_back({2, cloudtpu::PjrtDType::S32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 1}});
+        cloudtpu::TensorSpec kv_in{3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, R, D}};
+        kv_in.alias_output_idx = 0;
+        spec.inputs.push_back(kv_in);
+        cloudtpu::OpNodeSpec sr;
+        sr.kind = cloudtpu::CloudOpKind::SET_ROWS;
+        sr.src_ids = {1, 2, 3};
+        sr.dst = {4, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, R, D}};
+        spec.ops.push_back(sr);
+        spec.output_ids = {4};
+
+        const auto prog = cloudtpu::emit_stablehlo_program(spec);
+        CHECK_TRUE(prog.mlir_text.find("stablehlo.dynamic_update_slice") != std::string::npos,
+                   "single-row SET_ROWS must emit dynamic_update_slice");
+        CHECK_TRUE(prog.mlir_text.find("stablehlo.scatter") == std::string::npos,
+                   "single-row SET_ROWS must not emit scatter");
+        CHECK_TRUE(prog.mlir_text.find("{tf.aliasing_output = 0 : i32}") != std::string::npos,
+                   "donated KV arg must emit tf.aliasing_output = 0");
+        CHECK_TRUE(prog.input_bindings.size() == 3 && prog.input_bindings[2].donatable,
+                   "donated KV binding flag must be set");
+
+        auto bupd = rt.buffer_from_host(0, upd.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, D});
+        auto bidx = rt.buffer_from_host(0, &row_idx, cloudtpu::PjrtDType::S32, {1, 1, 1, 1});
+        auto btbl = rt.buffer_from_host(0, tbl.data(), cloudtpu::PjrtDType::F32, {1, 1, R, D});
+        const auto copts = rt.make_spmd_compile_options(1, 0, true, true);
+        const auto* exec = rt.compile_or_get(prog.cache_key + "|alias_test", prog.mlir_text, copts);
+        std::vector<PJRT_Buffer*> raw_in = {bupd->handle.get(), bidx->handle.get(), btbl->handle.get()};
+        std::vector<cloudtpu::PjrtBufferPtr> outs;
+        rt.execute(exec, 0, raw_in.data(), raw_in.size(), outs,
+                   {cloudtpu::PjrtDType::F32}, {{1, 1, R, D}}, true);
+        std::vector<float> got(static_cast<size_t>(R * D));
+        rt.buffer_to_host(outs[0]->handle.get(), got.data(), got.size() * sizeof(float));
+        for (int64_t r = 0; r < R; ++r) {
+            for (int64_t d = 0; d < D; ++d) {
+                const float exp_v = (r == row_idx) ? upd[static_cast<size_t>(d)] : tbl[static_cast<size_t>(r * D + d)];
+                CHECK_NEAR(got[static_cast<size_t>(r * D + d)], exp_v, 1e-5f, "SET_ROWS DUS KV update");
+            }
+        }
+    }
+
+    std::printf("  [PASS] Silicon regressions (ROPE M=52, Q4_0/Q8_0 K=256, DUS+KV donation)\n");
 }
 
 void test_collectives_p1_live_compatible(cloudtpu::PjrtRuntime& rt) {
@@ -617,6 +694,7 @@ void test_spmd_multichip_mesh(int num_chips) {
     const auto copts = rt.make_spmd_compile_options(num_chips);
     CHECK_TRUE(copts.num_replicas == num_chips && copts.num_partitions == 1, "SPMD compile options");
     CHECK_TRUE(static_cast<int>(copts.device_assignment_ids.size()) == num_chips, "SPMD DeviceAssignment ids");
+    CHECK_TRUE(copts.backend_extra_options.size() == 7, "SPMD async collective overlap flags (7)");
 
     auto run_spmd = [&](const cloudtpu::EmittedProgram& prog,
                         const std::vector<std::vector<cloudtpu::PjrtBufferPtr>>& per_dev_in) {
