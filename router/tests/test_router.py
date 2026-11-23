@@ -13013,6 +13013,123 @@ asyncio.run(main())
         self.assertTrue(bstate.healthy)
         self.assertEqual(bstate.cooldown_until_monotonic, 0.0)
 
+    def test_non_streaming_completion_omits_ttft_histogram_while_streaming_records_it(
+        self,
+    ) -> None:
+        recorded_usage: List[UsageEvent] = []
+
+        class _RecordHook:
+            def record_usage(self, event: UsageEvent) -> None:
+                recorded_usage.append(event)
+
+        backend = self._track(_MockOpenAIBackend("ttft-sep-b", ["m-ttft-sep"]))
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            backends=[
+                BackendConfig(
+                    id="ttft-sep-b",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=backend.base_url,
+                    models=["m-ttft-sep"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg, usage_hook=_RecordHook()))
+        rport = router.server_address[1]
+
+        st_ns, _, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-ttft-sep",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": False,
+            },
+        )
+        self.assertEqual(st_ns, 200)
+        self.assertEqual(len(recorded_usage), 1)
+        self.assertIsNone(recorded_usage[0].ttft_ms)
+
+        st_m1, _, metrics_1_bytes = _http_request(rport, "GET", "/metrics")
+        self.assertEqual(st_m1, 200)
+        metrics_1 = metrics_1_bytes.decode("utf-8")
+        self.assertIn(
+            'freetpu_router_request_duration_seconds_count{model="m-ttft-sep",backend_id="ttft-sep-b"} 1',
+            metrics_1,
+        )
+        self.assertNotIn(
+            'freetpu_router_ttft_seconds_count{model="m-ttft-sep",backend_id="ttft-sep-b"}',
+            metrics_1,
+        )
+
+        st_s, _, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-ttft-sep",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+        )
+        self.assertEqual(st_s, 200)
+        self.assertEqual(len(recorded_usage), 2)
+        self.assertIsNotNone(recorded_usage[1].ttft_ms)
+
+        st_m2, _, metrics_2_bytes = _http_request(rport, "GET", "/metrics")
+        self.assertEqual(st_m2, 200)
+        metrics_2 = metrics_2_bytes.decode("utf-8")
+        self.assertIn(
+            'freetpu_router_request_duration_seconds_count{model="m-ttft-sep",backend_id="ttft-sep-b"} 2',
+            metrics_2,
+        )
+        self.assertIn(
+            'freetpu_router_ttft_seconds_count{model="m-ttft-sep",backend_id="ttft-sep-b"} 1',
+            metrics_2,
+        )
+
+    def test_tpu_exporter_rejects_unterminated_trailing_line_as_incomplete(
+        self,
+    ) -> None:
+        class _TruncatedCloseDelimExporter(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return None
+
+            def do_GET(self) -> None:  # noqa: N802
+                # Close-delimited response truncated mid-value ("0.9" cut off from "0.97")
+                # with no trailing newline.
+                body = (
+                    b"freetpu_exporter_up 1\n"
+                    b"freetpu_tpu_devices_discovered 1\n"
+                    b'freetpu_tpu_health_status{chip="0"} 1\n'
+                    b'freetpu_tpu_hbm_utilization_ratio{chip="0"} 0.9'
+                )
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; version=0.0.4")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+
+        srv = self._track(
+            ThreadingHTTPServer(("127.0.0.1", 0), _TruncatedCloseDelimExporter)
+        )
+        telem = scrape_tpu_exporter(
+            f"http://127.0.0.1:{srv.server_address[1]}/metrics",
+            timeout_s=2.0,
+        )
+        self.assertFalse(telem.reachable)
+        self.assertFalse(telem.exporter_up)
+        self.assertEqual(telem.error, "exporter_incomplete_response")
+        ready, reason = evaluate_tpu_readiness(telem)
+        self.assertFalse(ready)
+        self.assertEqual(reason, "tpu_exporter_unreachable")
+
 
 def run_self_tests(verbosity: int = 1) -> int:
     """Run all router tests cleanly via unittest."""

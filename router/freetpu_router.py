@@ -4491,7 +4491,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         prompt_tokens=prompt_tokens,
                         completion_tokens=completion_tokens,
                         latency_ms=latency_ms,
-                        ttft_ms=latency_ms if 200 <= resp_status < 300 else None,
+                        ttft_ms=None,
                         stream=stream,
                         failovers=failovers,
                         principal=auth_ctx.principal,

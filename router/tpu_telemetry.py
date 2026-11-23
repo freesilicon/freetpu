@@ -1258,11 +1258,12 @@ def _stream_scrape_tpu_body(
                 line_overflow_is_tpu = False
             pos = nl + 1
 
-    if line_overflow:
-        _consume_line(b"", True, line_overflow_is_tpu)
-    elif line_buf:
-        _consume_line(line_buf, False, False)
+    if line_overflow or line_buf:
+        # Prometheus text exposition 0.0.4 requires every line to terminate with '\n';
+        # treat an unterminated trailing buffer at EOF as a truncated/incomplete scrape
+        # so partial values (e.g. "0.9" cut from "0.97") cannot produce false readiness.
         line_buf.clear()
+        raise http.client.IncompleteRead(b"")
 
     if not resp.chunked and resp.status not in (204, 304) and not (100 <= resp.status < 200):
         if resp.length is not None and resp.length > 0:
