@@ -25,7 +25,7 @@ overlay_backend() {
        "$ROOT/stablehlo_emitter.hpp" "$ROOT/stablehlo_emitter.cpp" \
        "$ROOT/CMakeLists.txt" \
        "$SRC/ggml/src/ggml-cloudtpu/"
-    cp "$ROOT/third_party/openxla/pjrt_c_api.h" "$SRC/ggml/src/ggml-cloudtpu/third_party/openxla/"
+    cp "$ROOT/../libopentpu/third_party/openxla/pjrt_c_api.h" "$SRC/ggml/src/ggml-cloudtpu/third_party/openxla/"
 
     if ! grep -q "GGML_CLOUDTPU" "$SRC/ggml/CMakeLists.txt"; then
         git -C "$SRC" apply "$ROOT/patches/llama-cpp-b12608-cloudtpu.patch" || \
