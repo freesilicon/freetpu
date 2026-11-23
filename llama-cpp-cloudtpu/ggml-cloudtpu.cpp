@@ -8,6 +8,7 @@
 
 #include "pjrt_runtime.hpp"
 #include "stablehlo_emitter.hpp"
+#include "freetile/tile_ir.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -51,6 +52,8 @@ struct cloudtpu_env_config {
     bool q4k_u4 = false;            // Q4_K I4/BITCAST: false = signed S4 (q-8, unshifted m_eff), true = U4 (0..15)
     bool q4k_bf16_scales = false;   // Opt-in hardware BF16 Q4_K/Q6_K scales (default false: full F32 scale precision for GET_ROWS parity)
     int32_t mm_pad_m = 8;           // Pad small BF16 Q4_*_I4/Q6_K_SPLIT M < mm_pad_m up to mm_pad_m for MXU (<=1 disables)
+    bool freetile_mosaic = false;   // CLOUDTPU_FREETILE_MOSAIC=1: emit FreeTile -> Mosaic tpu_custom_call
+    int64_t freetile_mosaic_version = -1;  // CLOUDTPU_FREETILE_MOSAIC_VERSION: optional dialect version override
     bool async_collectives = false; // Opt-in LIBTPU_INIT_ARGS TPU async collective overlap flags before libtpu init
     uint32_t cache_cap = 4096;
     uint64_t min_elements = 0;
@@ -144,6 +147,15 @@ static cloudtpu_env_config load_env_config() {
     if (const char* v = std::getenv("CLOUDTPU_MM_PAD_M")) {
         const int parsed = std::atoi(v);
         cfg.mm_pad_m = (parsed <= 1) ? 1 : parsed;
+    }
+    if (const char* v = std::getenv("CLOUDTPU_FREETILE_MOSAIC")) {
+        cfg.freetile_mosaic = (std::atoi(v) != 0);
+    }
+    if (const char* v = std::getenv("CLOUDTPU_FREETILE_MOSAIC_VERSION")) {
+        const long long parsed = std::atoll(v);
+        if (parsed > 0) {
+            cfg.freetile_mosaic_version = static_cast<int64_t>(parsed);
+        }
     }
     if (const char* v = std::getenv("CLOUDTPU_ASYNC_COLLECTIVES")) {
         cfg.async_collectives = (std::atoi(v) != 0);
@@ -2522,6 +2534,8 @@ struct ggml_backend_cloudtpu_context {
     uint64_t total_kv_donated = 0;
     uint64_t total_kv_donation_skipped = 0;
     uint64_t total_bucketed_subgraphs = 0;
+    uint64_t mosaic_compiles = 0;
+    uint64_t mosaic_fallbacks = 0;
 
     // Fast-path structural SubgraphPlanCache (skips MLIR emission & compile_or_get on decode hit)
     uint64_t plan_cache_epoch = 0;
@@ -2555,7 +2569,8 @@ struct ggml_backend_cloudtpu_context {
                 const cloudtpu::CacheStats st = rt.cache_stats();
                 GGML_LOG_INFO(
                     "ggml-cloudtpu: summary device=%d spmd_chips=%d mock=%d maps_libpython=%zu evals=%llu subgraphs=%llu ops=%llu "
-                    "plan_hits=%llu plan_misses=%llu kv_donated=%llu kv_donation_skipped=%llu cache_entries=%zu cache_hits=%llu cache_misses=%llu cache_evictions=%llu "
+                    "plan_hits=%llu plan_misses=%llu kv_donated=%llu kv_donation_skipped=%llu mosaic_compiles=%llu mosaic_fallbacks=%llu "
+                    "cache_entries=%zu cache_hits=%llu cache_misses=%llu cache_evictions=%llu "
                     "compile_us=%llu execute_us=%llu bucketed=%llu\n",
                     device_index,
                     spmd_chips,
@@ -2568,6 +2583,8 @@ struct ggml_backend_cloudtpu_context {
                     static_cast<unsigned long long>(plan_misses),
                     static_cast<unsigned long long>(total_kv_donated),
                     static_cast<unsigned long long>(total_kv_donation_skipped),
+                    static_cast<unsigned long long>(mosaic_compiles),
+                    static_cast<unsigned long long>(mosaic_fallbacks),
                     st.entries,
                     static_cast<unsigned long long>(st.hits),
                     static_cast<unsigned long long>(st.misses),
@@ -4075,6 +4092,15 @@ static BuiltSubgraphSpec build_subgraph_program_spec(const ggml_backend_cloudtpu
     prog_spec.bf16_flash_attn = ctx->env.bf16_flash_attn;
     prog_spec.q4_split_dot = ctx->env.q4_split_dot;
     prog_spec.mm_pad_m = ctx->env.mm_pad_m;
+    prog_spec.freetile_mosaic = ctx->env.freetile_mosaic;
+    prog_spec.freetile_mosaic_version = ctx->env.freetile_mosaic_version;
+    if (ctx->env.freetile_mosaic) {
+        cloudtpu::PjrtRuntime& rt = cloudtpu::shared_pjrt_runtime(nullptr);
+        if (rt.is_initialized() && ctx->device_index >= 0 && ctx->device_index < rt.device_count()) {
+            const freetile::ChipTarget ct = freetile::detect_chip_target(rt.device_info(ctx->device_index).kind);
+            prog_spec.freetile_chip_target = static_cast<int32_t>(ct);
+        }
+    }
 
     struct SpecCacheEntry {
         uint64_t id = 0;
@@ -4502,8 +4528,12 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
                   (ctx->env.q4_split_dot ? 8ULL : 0ULL) |
                   (ctx->env.bf16_flash_attn ? 16ULL : 0ULL) |
                   (ctx->env.q4k_u4 ? 32ULL : 0ULL) |
+                  (ctx->env.freetile_mosaic ? 64ULL : 0ULL) |
                   (static_cast<uint64_t>(ctx->env.q4_mode) << 8));
     sig_push(sig, static_cast<uint64_t>(ctx->env.mm_pad_m));
+    if (ctx->env.freetile_mosaic) {
+        sig_push(sig, static_cast<uint64_t>(ctx->env.freetile_mosaic_version));
+    }
     uint32_t next_id = 1;
     uint64_t sig_slot_epoch = 0;
 
@@ -4939,10 +4969,10 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
                 ctx, cgraph, start_idx, end_idx, P, live_out_flags, keep_sharded_flags, &input_alias_out, true);
             active_built = &built_miss;
         }
-        const cloudtpu::GraphProgramSpec& prog_spec = active_built->prog_spec;
+        cloudtpu::GraphProgramSpec& prog_spec = active_built->prog_spec;
         const auto& id_to_input_idx = active_built->id_to_input_idx;
 
-        const cloudtpu::EmittedProgram emitted = cloudtpu::emit_stablehlo_program(prog_spec);
+        cloudtpu::EmittedProgram emitted = cloudtpu::emit_stablehlo_program(prog_spec);
         if (ctx->env.verbose >= 3) {
             GGML_LOG_INFO("ggml-cloudtpu: subgraph [%d..%d) spmd=%d inputs=%zu ops=%zu outs=%zu\n%s\n",
                           start_idx, end_idx, P,
@@ -4953,8 +4983,27 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
         // never implicitly donates an unchecked passthrough copy's source buffer.
         const cloudtpu::PjrtCompileOptions copts =
             rt.make_spmd_compile_options(P, ctx->device_index, /*alias_passthrough=*/false);
-        exec = rt.compile_or_get(
-            emitted.cache_key, emitted.mlir_text, (P > 1) ? 0 : ctx->device_index, copts);
+        const int compile_dev = (P > 1) ? 0 : ctx->device_index;
+        const bool used_mosaic =
+            prog_spec.freetile_mosaic && emitted.mlir_text.find("@tpu_custom_call") != std::string::npos;
+        if (used_mosaic) {
+            try {
+                bool compiled_now = false;
+                exec = rt.compile_or_get(emitted.cache_key, emitted.mlir_text, compile_dev, copts, &compiled_now);
+                if (compiled_now) {
+                    ctx->mosaic_compiles += 1;
+                }
+            } catch (const std::exception& e) {
+                ctx->mosaic_fallbacks += 1;
+                GGML_LOG_WARN("ggml-cloudtpu: FreeTile Mosaic compile failed (%s); falling back to pure StableHLO\n",
+                              e.what());
+                prog_spec.freetile_mosaic = false;
+                emitted = cloudtpu::emit_stablehlo_program(prog_spec);
+                exec = rt.compile_or_get(emitted.cache_key, emitted.mlir_text, compile_dev, copts);
+            }
+        } else {
+            exec = rt.compile_or_get(emitted.cache_key, emitted.mlir_text, compile_dev, copts);
+        }
 
         CachedSubgraphPlan new_plan;
         new_plan.exec_key = exec->key;
