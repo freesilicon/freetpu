@@ -4118,14 +4118,17 @@ static BuiltSubgraphSpec build_subgraph_program_spec(const ggml_backend_cloudtpu
     prog_spec.spmd_chips = P;
     prog_spec.bf16_matmul = ctx->env.bf16_matmul;
     prog_spec.fp8_matmul = ctx->env.fp8_matmul;
-    prog_spec.target_is_tpu7x = ctx->rt && ctx->rt->is_tpu7x_topology();
-    prog_spec.d2d_group_size = ctx->rt ? ctx->rt->d2d_group_size() : 1;
     prog_spec.emit_sdy_mesh = ctx->env.emit_sdy_mesh;
-    if (prog_spec.emit_sdy_mesh && ctx->rt && P > 1) {
-        const int n_assign = std::min(P, ctx->rt->device_count());
-        prog_spec.sdy_mesh_device_ids.reserve(static_cast<size_t>(n_assign));
-        for (int i = 0; i < n_assign; ++i) {
-            prog_spec.sdy_mesh_device_ids.push_back(ctx->rt->device_info(i).id);
+    cloudtpu::PjrtRuntime& rt_shared = cloudtpu::shared_pjrt_runtime(nullptr);
+    if (rt_shared.is_initialized()) {
+        prog_spec.target_is_tpu7x = rt_shared.is_tpu7x_topology();
+        prog_spec.d2d_group_size = rt_shared.d2d_group_size();
+        if (prog_spec.emit_sdy_mesh && P > 1) {
+            const int n_assign = std::min(P, rt_shared.device_count());
+            prog_spec.sdy_mesh_device_ids.reserve(static_cast<size_t>(n_assign));
+            for (int i = 0; i < n_assign; ++i) {
+                prog_spec.sdy_mesh_device_ids.push_back(rt_shared.device_info(i).id);
+            }
         }
     }
     prog_spec.bf16_flash_attn = ctx->env.bf16_flash_attn;
@@ -4569,10 +4572,10 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
                   (ctx->env.q4k_u4 ? 32ULL : 0ULL) |
                   (ctx->env.freetile_mosaic ? 64ULL : 0ULL) |
                   (ctx->env.emit_sdy_mesh ? 128ULL : 0ULL) |
-                  ((ctx->rt && ctx->rt->is_tpu7x_topology()) ? 256ULL : 0ULL) |
+                  (rt.is_tpu7x_topology() ? 256ULL : 0ULL) |
                   (static_cast<uint64_t>(ctx->env.q4_mode) << 9) |
                   (static_cast<uint64_t>(ctx->env.fp8_matmul) << 13) |
-                  (static_cast<uint64_t>(ctx->rt ? ctx->rt->d2d_group_size() : 1) << 17));
+                  (static_cast<uint64_t>(rt.d2d_group_size()) << 17));
     sig_push(sig, static_cast<uint64_t>(ctx->env.mm_pad_m));
     if (ctx->env.freetile_mosaic) {
         sig_push(sig, static_cast<uint64_t>(ctx->env.freetile_mosaic_version));
