@@ -5,19 +5,30 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
+#include <limits>
+#include <locale>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
 
 namespace cloudtpu {
 
-std::string format_mlir_tensor_type(PjrtDType dtype, const std::vector<int64_t>& dims) {
+namespace {
+std::ostringstream make_classic_stream() {
     std::ostringstream oss;
+    oss.imbue(std::locale::classic());
+    return oss;
+}
+}  // namespace
+
+std::string format_mlir_tensor_type(PjrtDType dtype, const std::vector<int64_t>& dims) {
+    std::ostringstream oss = make_classic_stream();
     oss << "tensor<";
     for (int64_t d : dims) {
         oss << d << "x";
@@ -38,15 +49,19 @@ struct SsaValue {
 
 std::string format_f32_literal(float v) {
     if (!std::isfinite(v)) {
-        v = (v < 0.0f) ? -3.40282347e+38f : 3.40282347e+38f;
+        uint32_t bits = 0;
+        std::memcpy(&bits, &v, sizeof(bits));
+        std::ostringstream oss = make_classic_stream();
+        oss << "0x" << std::uppercase << std::hex << std::setw(8) << std::setfill('0') << bits;
+        return oss.str();
     }
-    std::ostringstream oss;
+    std::ostringstream oss = make_classic_stream();
     oss << std::scientific << std::setprecision(8) << v;
     return oss.str();
 }
 
 std::string format_dims_bracket(const std::vector<int64_t>& dims) {
-    std::ostringstream oss;
+    std::ostringstream oss = make_classic_stream();
     oss << "[";
     for (size_t i = 0; i < dims.size(); ++i) {
         if (i > 0) oss << ", ";
@@ -58,6 +73,7 @@ std::string format_dims_bracket(const std::vector<int64_t>& dims) {
 
 class StableHloBuilder {
 public:
+    StableHloBuilder() { body_.imbue(std::locale::classic()); }
     void add_arg(const std::string& arg_name,
                  PjrtDType dtype,
                  const std::vector<int64_t>& dims,
@@ -69,6 +85,11 @@ public:
     SsaValue arg_val(size_t idx) const { return args_.at(idx); }
 
     SsaValue emit_const_splat_f32(float val, const std::vector<int64_t>& dims, PjrtDType dt = PjrtDType::F32) {
+        if (!std::isfinite(val) && dt != PjrtDType::F32) {
+            // MLIR 32-bit IEEE hex float literals require f32; convert cleanly to target float type.
+            SsaValue f32_val = emit_const_splat_f32(val, dims, PjrtDType::F32);
+            return emit_convert(f32_val, dt);
+        }
         SsaValue out = next_val(dt, dims);
         body_ << "    " << out.name << " = stablehlo.constant dense<" << format_f32_literal(val)
               << "> : " << out.mlir_type() << "\n";
@@ -125,6 +146,30 @@ public:
         SsaValue out = next_val(a.dtype, a.dims);
         body_ << "    " << out.name << " = " << op_name << " " << a.name << ", " << b.name
               << " : " << out.mlir_type() << "\n";
+        return out;
+    }
+
+    SsaValue emit_compare(const char* dir, const SsaValue& a, const SsaValue& b) {
+        SsaValue out = next_val(PjrtDType::PRED, a.dims);
+        const char* cmp_type = "FLOAT";
+        if (a.dtype == PjrtDType::S4 || a.dtype == PjrtDType::S8 || a.dtype == PjrtDType::S16 ||
+            a.dtype == PjrtDType::S32 || a.dtype == PjrtDType::S64) {
+            cmp_type = "SIGNED";
+        } else if (a.dtype == PjrtDType::U4 || a.dtype == PjrtDType::U8 || a.dtype == PjrtDType::U32 ||
+                   a.dtype == PjrtDType::PRED) {
+            cmp_type = "UNSIGNED";
+        }
+        body_ << "    " << out.name << " = stablehlo.compare " << dir << ", " << a.name << ", " << b.name
+              << ", " << cmp_type << " : (" << a.mlir_type() << ", " << b.mlir_type() << ") -> "
+              << out.mlir_type() << "\n";
+        return out;
+    }
+
+    SsaValue emit_select(const SsaValue& pred, const SsaValue& on_true, const SsaValue& on_false) {
+        SsaValue out = next_val(on_true.dtype, on_true.dims);
+        body_ << "    " << out.name << " = \"stablehlo.select\"(" << pred.name << ", " << on_true.name
+              << ", " << on_false.name << ") : (" << pred.mlir_type() << ", " << on_true.mlir_type()
+              << ", " << on_false.mlir_type() << ") -> " << out.mlir_type() << "\n";
         return out;
     }
 
@@ -411,7 +456,7 @@ public:
     }
 
     static std::string format_replica_groups_1d(int32_t num_chips) {
-        std::ostringstream oss;
+        std::ostringstream oss = make_classic_stream();
         oss << "dense<[[";
         for (int32_t i = 0; i < num_chips; ++i) {
             if (i > 0) oss << ", ";
@@ -440,6 +485,12 @@ public:
     }
 
     SsaValue emit_all_gather(const SsaValue& x, int64_t gather_dim, int32_t num_chips) {
+        if (num_chips <= 0) {
+            throw std::invalid_argument("emit_all_gather: num_chips must be positive");
+        }
+        if (gather_dim < 0 || static_cast<size_t>(gather_dim) >= x.dims.size()) {
+            throw std::invalid_argument("emit_all_gather: gather_dim out of bounds");
+        }
         std::vector<int64_t> out_dims = x.dims;
         out_dims[static_cast<size_t>(gather_dim)] *= static_cast<int64_t>(num_chips);
         SsaValue out = next_val(x.dtype, out_dims);
@@ -452,9 +503,15 @@ public:
     }
 
     SsaValue emit_reduce_scatter(const SsaValue& x, int64_t scatter_dim, int32_t num_chips, const char* reducer_op) {
+        if (num_chips <= 0) {
+            throw std::invalid_argument("emit_reduce_scatter: num_chips must be positive");
+        }
+        if (scatter_dim < 0 || static_cast<size_t>(scatter_dim) >= x.dims.size()) {
+            throw std::invalid_argument("emit_reduce_scatter: scatter_dim out of bounds");
+        }
         std::vector<int64_t> out_dims = x.dims;
         if (out_dims[static_cast<size_t>(scatter_dim)] % num_chips != 0) {
-            throw std::runtime_error("emit_reduce_scatter: scatter_dim not divisible by num_chips");
+            throw std::invalid_argument("emit_reduce_scatter: scatter_dim not divisible by num_chips");
         }
         out_dims[static_cast<size_t>(scatter_dim)] /= static_cast<int64_t>(num_chips);
         SsaValue out = next_val(x.dtype, out_dims);
@@ -476,7 +533,7 @@ public:
     }
 
     std::string finish(const std::vector<SsaValue>& outputs) const {
-        std::ostringstream mod;
+        std::ostringstream mod = make_classic_stream();
         mod << "module @ggml_cloudtpu {\n";
         mod << "  func.func public @main(";
         for (size_t i = 0; i < args_.size(); ++i) {
@@ -515,13 +572,13 @@ public:
 
 private:
     SsaValue next_val(PjrtDType dt, std::vector<int64_t> dims) {
-        std::ostringstream oss;
+        std::ostringstream oss = make_classic_stream();
         oss << "%v" << next_id_++;
         return {oss.str(), dt, std::move(dims)};
     }
 
     std::string next_tmp_name(const char* prefix) {
-        std::ostringstream oss;
+        std::ostringstream oss = make_classic_stream();
         oss << "%" << prefix << "_" << next_id_++;
         return oss.str();
     }
@@ -562,6 +619,9 @@ SsaValue dequantize_row_major_blocks(StableHloBuilder& b,
         if (storage == TensorStorageKind::Q4_0_I4 && effective_q_dt == PjrtDType::U4) {
             SsaValue eight = b.emit_const_splat_f32(8.0f, blk_dims, calc_dt);
             q_f = b.emit_binary("stablehlo.subtract", q_f, eight);
+        } else if (storage == TensorStorageKind::Q4_K_I4 && effective_q_dt == PjrtDType::S4) {
+            SsaValue eight = b.emit_const_splat_f32(8.0f, blk_dims, calc_dt);
+            q_f = b.emit_binary("stablehlo.add", q_f, eight);
         }
         SsaValue d_c = b.emit_convert(d, calc_dt);
         SsaValue d_b = b.emit_broadcast_in_dim(d_c, {0, 1, 2, 3}, blk_dims);
@@ -620,10 +680,10 @@ SsaValue materialize_q4_i4_nibbles(StableHloBuilder& b,
 
 // TPU-native K-major N-minor dequantization (zero minor-dim tile padding, zero weight reshape,
 // zero broadcast reshape):
-//   Q8_0_SPLIT: qs [B3, B2, NB, 32, N] S8,      d [B3, B2, NB, N] F16     -> [B3, B2, NB, 32, N]
-//   Q6_K_SPLIT: qs [B3, B2, NB, 16, N] S8,      d [B3, B2, NB, N] F32/F16 -> [B3, B2, NB, 16, N]
-//   Q4_0_I4:    qs [B3, B2, NB, 32, N] S4/U4,   d [B3, B2, NB, N] F16     -> [B3, B2, NB, 32, N]
-//   Q4_K_I4:    qs [B3, B2, NB, 32, N] S4/U4, d/m [B3, B2, NB, N] F32/F16 -> [B3, B2, NB, 32, N]
+//   Q8_0_SPLIT: qs [B3, B2, NB, 32, N] S8,      d [B3, B2, NB, N] F16      -> [B3, B2, NB, 32, N]
+//   Q6_K_SPLIT: qs [B3, B2, NB, 16, N] S8,      d [B3, B2, NB, N] F32/BF16 -> [B3, B2, NB, 16, N]
+//   Q4_0_I4:    qs [B3, B2, NB, 32, N] S4/U4,   d [B3, B2, NB, N] F16      -> [B3, B2, NB, 32, N]
+//   Q4_K_I4:    qs [B3, B2, NB, 32, N] S4/U4, d/m [B3, B2, NB, N] F32/BF16 -> [B3, B2, NB, 32, N]
 SsaValue dequantize_k_major_blocks(StableHloBuilder& b,
                                    TensorStorageKind storage,
                                    const SsaValue& qs,
@@ -644,25 +704,26 @@ SsaValue dequantize_k_major_blocks(StableHloBuilder& b,
         qs_eff = materialize_q4_i4_nibbles(b, qs, target_4bit, N);
     }
 
+    // Only bypass F32 dequantization when there is no additive minimum offset (e.g. Q6_K_SPLIT
+    // lm_head): Q4_K_I4 must apply its minimum offset m in F32 before rounding to BF16 so
+    // small net weights after cancellation are never erased by intermediate BF16 rounding.
     const bool fast_bf16 =
         (out_dt == PjrtDType::BF16 && d.dtype == PjrtDType::BF16 &&
-         (m_opt == nullptr || m_opt->dtype == PjrtDType::BF16) &&
+         m_opt == nullptr &&
          !(storage == TensorStorageKind::Q4_0_I4 && qs_eff.dtype == PjrtDType::U4));
     if (fast_bf16) {
         SsaValue q_bf = b.emit_convert(qs_eff, PjrtDType::BF16);
         SsaValue d_b = b.emit_broadcast_in_dim(d, {0, 1, 2, 4}, km_dims);
-        SsaValue scaled = b.emit_binary("stablehlo.multiply", q_bf, d_b);
-        if (storage == TensorStorageKind::Q4_K_I4 && m_opt != nullptr) {
-            SsaValue m_b = b.emit_broadcast_in_dim(*m_opt, {0, 1, 2, 4}, km_dims);
-            scaled = b.emit_binary("stablehlo.add", scaled, m_b);
-        }
-        return scaled;
+        return b.emit_binary("stablehlo.multiply", q_bf, d_b);
     }
 
     SsaValue q_f = b.emit_convert(qs_eff, PjrtDType::F32);
     if (storage == TensorStorageKind::Q4_0_I4 && qs_eff.dtype == PjrtDType::U4) {
         SsaValue eight = b.emit_const_splat_f32(8.0f, km_dims, PjrtDType::F32);
         q_f = b.emit_binary("stablehlo.subtract", q_f, eight);
+    } else if (storage == TensorStorageKind::Q4_K_I4 && qs_eff.dtype == PjrtDType::S4) {
+        SsaValue eight = b.emit_const_splat_f32(8.0f, km_dims, PjrtDType::F32);
+        q_f = b.emit_binary("stablehlo.add", q_f, eight);
     }
     SsaValue d_c = b.emit_convert(d, PjrtDType::F32);
     SsaValue d_b = b.emit_broadcast_in_dim(d_c, {0, 1, 2, 4}, km_dims);
@@ -856,7 +917,7 @@ std::string build_canonical_cache_key(const std::string& mlir_text,
     // exact length, SPMD chip count, and non-default flags to prevent collisions without external SHA libraries.
     const uint64_t h1 = fnv1a_64(mlir_text);
     const uint64_t h2 = fnv1a_64(std::string("cloudtpu_v1:") + mlir_text);
-    std::ostringstream oss;
+    std::ostringstream oss = make_classic_stream();
     oss << std::hex << std::setfill('0') << std::setw(16) << h1
         << std::setw(16) << h2 << "_" << std::dec << mlir_text.size() << "_p" << spmd_chips;
     if (mm_pad_m != 8) {
@@ -879,6 +940,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
         TensorStorageKind storage = TensorStorageKind::DENSE;
         TensorShardingKind sharding = TensorShardingKind::REPLICATED;
         PjrtDType bitcast_target = PjrtDType::S4;
+        int64_t logical_k = 0;
         SsaValue dense;
         SsaValue q_qs;
         SsaValue q_d;
@@ -894,6 +956,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
         th.storage = in.storage;
         th.sharding = (P > 1) ? in.sharding : TensorShardingKind::REPLICATED;
         th.bitcast_target = (in.bitcast_target != PjrtDType::INVALID) ? in.bitcast_target : PjrtDType::S4;
+        th.logical_k = in.dims[3];
         const int64_t B3 = in.dims[0];
         const int64_t B2 = in.dims[1];
         int64_t M_or_N = in.dims[2];
@@ -963,7 +1026,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
             th.q_qs = builder.arg_val(arg_idx - 1);
             prog.input_bindings.push_back({in.id, 0, q_dt, std::move(qs_dims), false});
 
-            std::vector<int64_t> d_dims = {B3, B2, NB, M_or_N};
+            const std::vector<int64_t> d_dims = {B3, B2, NB, M_or_N};
             const std::string d_name = "%arg" + std::to_string(arg_idx++);
             builder.add_arg(d_name, d_dt, d_dims);
             th.q_d = builder.arg_val(arg_idx - 1);
@@ -974,7 +1037,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                 builder.add_arg(m_name, d_dt, d_dims);
                 th.q_m = builder.arg_val(arg_idx - 1);
                 th.has_q_m = true;
-                prog.input_bindings.push_back({in.id, 2, d_dt, std::move(d_dims), false});
+                prog.input_bindings.push_back({in.id, 2, d_dt, d_dims, false});
             }
         }
         env[in.id] = std::move(th);
@@ -1014,9 +1077,8 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                 SsaValue x = (x_sh == TensorShardingKind::SHARD_K && w_sh == TensorShardingKind::SHARD_K)
                                  ? resolve_dense(op.src_ids.at(1), PjrtDType::F32)
                                  : resolve_replicated(op.src_ids.at(1), PjrtDType::F32);
-                const bool w_is_f32_dense =
-                    (w_th.storage == TensorStorageKind::DENSE && w_th.dense.dtype == PjrtDType::F32);
-                const bool use_bf16_mxu = spec.bf16_matmul && !op.high_precision && !w_is_f32_dense;
+                const bool w_is_quant_split = (w_th.storage != TensorStorageKind::DENSE);
+                const bool use_bf16_mxu = spec.bf16_matmul && !op.high_precision && w_is_quant_split;
                 const PjrtDType deq_dt =
                     use_bf16_mxu ? PjrtDType::BF16
                                  : ((op.high_precision || x.dtype == PjrtDType::F32) ? PjrtDType::F32 : PjrtDType::BF16);
@@ -1039,10 +1101,11 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                             x, {zero_i32, zero_i32, zero_i32, k_off}, {x.dims[0], x.dims[1], x.dims[2], K_local});
                     }
 
-                    const PjrtDType mm_dt = use_bf16_mxu ? PjrtDType::BF16
-                                                         : ((deq_dt == PjrtDType::F32 || x.dtype == PjrtDType::F32)
-                                                                ? PjrtDType::F32
-                                                                : PjrtDType::BF16);
+                    const PjrtDType mm_dt =
+                        use_bf16_mxu ? PjrtDType::BF16
+                                     : ((op.high_precision || deq_dt == PjrtDType::F32 || x.dtype == PjrtDType::F32)
+                                            ? PjrtDType::F32
+                                            : PjrtDType::BF16);
                     x = builder.emit_convert(x, mm_dt);
 
                     auto bcast_w5_batch = [&](SsaValue& wt) {
@@ -1078,7 +1141,91 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                     const bool is_q4_i4 = (w_th.storage == TensorStorageKind::Q4_0_I4 ||
                                            w_th.storage == TensorStorageKind::Q4_K_I4);
                     const bool is_q4_factored = is_q4_i4 && (m_total <= 32);
+
+                    bool emitted_freetile_mosaic = false;
+                    SsaValue local_out;
+                    const bool freetile_storage_ok =
+                        (w_th.storage == TensorStorageKind::Q4_K_I4 && w_th.has_q_m) ||
+                        w_th.storage == TensorStorageKind::Q6_K_SPLIT ||
+                        w_th.storage == TensorStorageKind::Q4_0_I4 ||
+                        w_th.storage == TensorStorageKind::Q8_0_SPLIT;
+                    if (spec.freetile_mosaic && use_bf16_mxu && !op.high_precision && freetile_storage_ok &&
+                        x.dims[0] == 1 && x.dims[1] == 1 && x.dims[3] == K_local &&
+                        w_th.q_d.dims[0] == 1 && w_th.q_d.dims[1] == 1 &&
+                        w_th.q_qs.dims[0] == 1 && w_th.q_qs.dims[1] == 1) {
+                        freetile::ChipTarget ft_chip = freetile::ChipTarget::V5E;
+                        if (spec.freetile_chip_target == static_cast<int32_t>(freetile::ChipTarget::V6E)) {
+                            ft_chip = freetile::ChipTarget::V6E;
+                        } else if (spec.freetile_chip_target == static_cast<int32_t>(freetile::ChipTarget::TPU7X)) {
+                            ft_chip = freetile::ChipTarget::TPU7X;
+                        } else if (spec.freetile_chip_target == static_cast<int32_t>(freetile::ChipTarget::BUENOS_A0)) {
+                            ft_chip = freetile::ChipTarget::BUENOS_A0;
+                        }
+                        if (freetile::target_profile(ft_chip).supports_mosaic) {
+                            freetile::QuantFormat ft_fmt = freetile::QuantFormat::NONE;
+                            if (w_th.storage == TensorStorageKind::Q4_K_I4) {
+                                ft_fmt = freetile::QuantFormat::Q4_K;
+                            } else if (w_th.storage == TensorStorageKind::Q6_K_SPLIT) {
+                                ft_fmt = freetile::QuantFormat::Q6_K;
+                            } else if (w_th.storage == TensorStorageKind::Q4_0_I4) {
+                                ft_fmt = freetile::QuantFormat::Q4_0;
+                            } else {
+                                ft_fmt = freetile::QuantFormat::Q8_0;
+                            }
+
+                            const PjrtDType target_4bit =
+                                (w_th.bitcast_target != PjrtDType::INVALID) ? w_th.bitcast_target : PjrtDType::S4;
+                            const bool unsigned_q4 =
+                                is_q4_i4 && ((w_th.q_qs.dtype == PjrtDType::U8 && target_4bit == PjrtDType::U4) ||
+                                             w_th.q_qs.dtype == PjrtDType::U4);
+                            const freetile::DType ft_out_dt =
+                                (op.dst.dtype == PjrtDType::F32) ? freetile::DType::F32 : freetile::DType::BF16;
+
+                            freetile::TileKernel ft_kernel;
+                            if (freetile::plan_quant_matmul_kernel(ft_chip, m_orig, K_local, N_local, ft_fmt,
+                                                                   freetile::DType::BF16, ft_out_dt, unsigned_q4,
+                                                                   &ft_kernel)) {
+                                const int64_t ft_m_pad = ft_kernel.matmul.m_padded;
+                                SsaValue x_ft_4d = x;
+                                if (m_orig < ft_m_pad) {
+                                    SsaValue pad_z = builder.emit_const_splat_f32(
+                                        0.0f, {1, 1, ft_m_pad - m_orig, K_local}, PjrtDType::BF16);
+                                    x_ft_4d = builder.emit_concatenate({x, pad_z}, 2);
+                                }
+                                SsaValue x_2d = builder.emit_reshape(x_ft_4d, {ft_m_pad, K_local});
+                                SsaValue qs_eff = is_q4_i4
+                                                      ? materialize_q4_i4_nibbles(builder, w_th.q_qs, target_4bit, N_local)
+                                                      : w_th.q_qs;
+                                SsaValue w_2d = builder.emit_reshape(qs_eff, {K_local, N_local});
+                                SsaValue d_bf16 = builder.emit_convert(w_th.q_d, PjrtDType::BF16);
+                                SsaValue d_2d = builder.emit_reshape(d_bf16, {NB_local, N_local});
+
+                                std::vector<SsaValue> cc_ops = {x_2d, w_2d, d_2d};
+                                if (ft_kernel.matmul.has_min && w_th.has_q_m) {
+                                    SsaValue m_bf16 = builder.emit_convert(w_th.q_m, PjrtDType::BF16);
+                                    SsaValue m_2d = builder.emit_reshape(m_bf16, {NB_local, N_local});
+                                    cc_ops.push_back(m_2d);
+                                }
+
+                                const freetile::MosaicEmitResult mosaic =
+                                    freetile::emit_mosaic_kernel(ft_kernel, spec.freetile_mosaic_version);
+                                const PjrtDType cc_out_dt =
+                                    (ft_out_dt == freetile::DType::F32) ? PjrtDType::F32 : PjrtDType::BF16;
+                                SsaValue cc_out = builder.emit_tpu_custom_call(
+                                    cc_ops, {ft_m_pad, N_local}, cc_out_dt, mosaic.backend_config_json,
+                                    mosaic.kernel_name);
+                                SsaValue out_4d = builder.emit_reshape(cc_out, {1, 1, ft_m_pad, N_local});
+                                if (m_orig < ft_m_pad) {
+                                    out_4d = builder.emit_slice(out_4d, {0, 0, 0, 0}, {1, 1, m_orig, N_local});
+                                }
+                                local_out = builder.emit_convert(out_4d, op.dst.dtype);
+                                emitted_freetile_mosaic = true;
+                            }
+                        }
+                    }
+
                     const bool apply_pad_m =
+                        !emitted_freetile_mosaic &&
                         use_bf16_mxu && !op.high_precision && spec.mm_pad_m > 1 &&
                         x.dims[0] == 1 && x.dims[1] == 1 &&
                         m_orig >= 1 && m_orig < spec.mm_pad_m &&
@@ -1093,81 +1240,6 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                     }
                     const std::vector<int64_t> dot_out_dims = {x_mm.dims[0], x_mm.dims[1], x_mm.dims[2], N_local};
 
-                    bool emitted_freetile_mosaic = false;
-                    SsaValue local_out;
-                    if (spec.freetile_mosaic && use_bf16_mxu && !op.high_precision &&
-                        x.dims[0] == 1 && x.dims[1] == 1 && w_th.q_d.dims[0] == 1 && w_th.q_d.dims[1] == 1 &&
-                        (w_th.storage == TensorStorageKind::Q4_K_I4 ||
-                         w_th.storage == TensorStorageKind::Q6_K_SPLIT ||
-                         w_th.storage == TensorStorageKind::Q4_0_I4 ||
-                         w_th.storage == TensorStorageKind::Q8_0_SPLIT)) {
-                        freetile::QuantFormat ft_fmt = freetile::QuantFormat::NONE;
-                        if (w_th.storage == TensorStorageKind::Q4_K_I4) {
-                            ft_fmt = freetile::QuantFormat::Q4_K;
-                        } else if (w_th.storage == TensorStorageKind::Q6_K_SPLIT) {
-                            ft_fmt = freetile::QuantFormat::Q6_K;
-                        } else if (w_th.storage == TensorStorageKind::Q4_0_I4) {
-                            ft_fmt = freetile::QuantFormat::Q4_0;
-                        } else {
-                            ft_fmt = freetile::QuantFormat::Q8_0;
-                        }
-
-                        const bool is_i4_w =
-                            (w_th.storage == TensorStorageKind::Q4_K_I4 || w_th.storage == TensorStorageKind::Q4_0_I4);
-                        const PjrtDType target_4bit =
-                            (w_th.bitcast_target != PjrtDType::INVALID) ? w_th.bitcast_target : PjrtDType::S4;
-                        const bool unsigned_q4 =
-                            is_i4_w && ((w_th.q_qs.dtype == PjrtDType::U8 && target_4bit == PjrtDType::U4) ||
-                                        w_th.q_qs.dtype == PjrtDType::U4);
-
-                        const freetile::ChipTarget ft_chip =
-                            (spec.freetile_chip_target == 1) ? freetile::ChipTarget::V6E
-                            : (spec.freetile_chip_target == 2) ? freetile::ChipTarget::TPU7X
-                                                               : freetile::ChipTarget::V5E;
-                        const freetile::DType ft_out_dt =
-                            (op.dst.dtype == PjrtDType::F32) ? freetile::DType::F32 : freetile::DType::BF16;
-
-                        freetile::TileKernel ft_kernel;
-                        if (freetile::plan_quant_matmul_kernel(ft_chip, m_orig, K_local, N_local, ft_fmt,
-                                                               freetile::DType::BF16, ft_out_dt, unsigned_q4,
-                                                               &ft_kernel)) {
-                            const int64_t ft_m_pad = ft_kernel.matmul.m_padded;
-                            SsaValue x_ft_4d = x;
-                            if (m_orig < ft_m_pad) {
-                                SsaValue pad_z = builder.emit_const_splat_f32(
-                                    0.0f, {1, 1, ft_m_pad - m_orig, K_local}, PjrtDType::BF16);
-                                x_ft_4d = builder.emit_concatenate({x, pad_z}, 2);
-                            }
-                            SsaValue x_2d = builder.emit_reshape(x_ft_4d, {ft_m_pad, K_local});
-                            SsaValue qs_eff = is_i4_w
-                                                  ? materialize_q4_i4_nibbles(builder, w_th.q_qs, target_4bit, N_local)
-                                                  : w_th.q_qs;
-                            SsaValue w_2d = builder.emit_reshape(qs_eff, {K_local, N_local});
-                            SsaValue d_bf16 = builder.emit_convert(w_th.q_d, PjrtDType::BF16);
-                            SsaValue d_2d = builder.emit_reshape(d_bf16, {NB_local, N_local});
-
-                            std::vector<SsaValue> cc_ops = {x_2d, w_2d, d_2d};
-                            if (ft_kernel.matmul.has_min && w_th.has_q_m) {
-                                SsaValue m_bf16 = builder.emit_convert(w_th.q_m, PjrtDType::BF16);
-                                SsaValue m_2d = builder.emit_reshape(m_bf16, {NB_local, N_local});
-                                cc_ops.push_back(m_2d);
-                            }
-
-                            const freetile::MosaicEmitResult mosaic =
-                                freetile::emit_mosaic_kernel(ft_kernel, spec.freetile_mosaic_version);
-                            const PjrtDType cc_out_dt =
-                                (ft_out_dt == freetile::DType::F32) ? PjrtDType::F32 : PjrtDType::BF16;
-                            SsaValue cc_out = builder.emit_tpu_custom_call(
-                                cc_ops, {ft_m_pad, N_local}, cc_out_dt, mosaic.backend_config_json, mosaic.kernel_name);
-                            SsaValue out_4d = builder.emit_reshape(cc_out, {1, 1, ft_m_pad, N_local});
-                            if (m_orig < ft_m_pad) {
-                                out_4d = builder.emit_slice(out_4d, {0, 0, 0, 0}, {1, 1, m_orig, N_local});
-                            }
-                            local_out = builder.emit_convert(out_4d, op.dst.dtype);
-                            emitted_freetile_mosaic = true;
-                        }
-                    }
-
                     if (emitted_freetile_mosaic) {
                         // Collectives handled uniformly below (skipping apply_pad_m slice).
                     } else if (w_th.storage == TensorStorageKind::Q8_0_SPLIT ||
@@ -1176,7 +1248,8 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                             builder, w_th.storage, w_th.q_qs, w_th.q_d,
                             nullptr, w_th.bitcast_target, mm_dt);
                         bcast_w5_batch(w_km);
-                        SsaValue x_blk = builder.emit_reshape(x_mm, {x_mm.dims[0], x_mm.dims[1], x_mm.dims[2], NB_local, blk_elems});
+                        SsaValue x_blk = builder.emit_reshape(
+                            x_mm, {x_mm.dims[0], x_mm.dims[1], x_mm.dims[2], NB_local, blk_elems});
                         local_out = builder.emit_dot_general(
                             x_blk, w_km, {0, 1}, {0, 1}, {3, 4}, {2, 3}, dot_out_dims, op.dst.dtype,
                             op.high_precision);
@@ -1184,7 +1257,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                         if (is_q4_factored) {
                             // Factored S4 decode/small-batch path (M <= 32):
                             //   dot_b = dot_general(x_blk, qs_mm) -> [B3, B2, NB_local, M, N_local]
-                            //   acc   = sum_nb(dot_b * d) + (Q4_K ? dot_general(xsum, m) : 0)
+                            //   acc   = sum_nb(((dot_b + 8*xsum) * d) + (Q4_K ? xsum * m : 0))
                             const PjrtDType target_4bit =
                                 (w_th.bitcast_target != PjrtDType::INVALID) ? w_th.bitcast_target : PjrtDType::S4;
                             SsaValue qs_eff = materialize_q4_i4_nibbles(builder, w_th.q_qs, target_4bit, N_local);
@@ -1201,27 +1274,52 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                             }
                             const std::vector<int64_t> dot_b_dims = {
                                 x_mm.dims[0], x_mm.dims[1], NB_local, x_mm.dims[2], N_local};
+                            // Match activation precision between dot_b and xsum:
+                            // - BF16 MXU path (mm_dt == BF16): x_blk is BF16, so xsum reduces
+                            //   convert(x_blk -> F32) of those exact BF16-rounded activations.
+                            // - F32 path (mm_dt == F32, e.g. CLOUDTPU_MATMUL_BF16=0): require
+                            //   precision = [HIGHEST, HIGHEST] on dot_b so TPU MXU does not round
+                            //   F32 dot inputs to BF16 while xsum uses full F32 precision.
+                            const bool dot_b_high_precision =
+                                op.high_precision || (mm_dt == PjrtDType::F32);
                             SsaValue dot_b = builder.emit_dot_general(
                                 x_blk, qs_mm, {0, 1, 3}, {0, 1, 2}, {4}, {3},
-                                dot_b_dims, PjrtDType::F32, op.high_precision);
+                                dot_b_dims, PjrtDType::F32, dot_b_high_precision);
+                            SsaValue zero_f32 = builder.emit_const_splat_f32(0.0f, {}, PjrtDType::F32);
+                            const bool q4k_needs_xsum =
+                                (w_th.storage == TensorStorageKind::Q4_K_I4) &&
+                                (qs_eff.dtype == PjrtDType::S4 || w_th.has_q_m);
+                            SsaValue xsum;
+                            if (q4k_needs_xsum) {
+                                SsaValue x_f32 = builder.emit_convert(x_blk, PjrtDType::F32);
+                                xsum = builder.emit_reduce_axis(x_f32, zero_f32, 4, "stablehlo.add");
+                            }
+                            if (w_th.storage == TensorStorageKind::Q4_K_I4 && qs_eff.dtype == PjrtDType::S4) {
+                                // Restore unsigned nibble contribution dot(x, u4) = dot(x, s4) + 8*sum(x)
+                                // BEFORE scaling by d, preserving exact cancellation for zero nibbles even
+                                // when 8*d >> |m| without pre-shifting m into m + 8*d.
+                                SsaValue eight_f32 = builder.emit_const_splat_f32(8.0f, xsum.dims, PjrtDType::F32);
+                                SsaValue eight_xsum = builder.emit_binary("stablehlo.multiply", xsum, eight_f32);
+                                SsaValue eight_xsum_b =
+                                    builder.emit_broadcast_in_dim(eight_xsum, {0, 1, 3, 2}, dot_b_dims);
+                                dot_b = builder.emit_binary("stablehlo.add", dot_b, eight_xsum_b);
+                            }
                             SsaValue d_f32 = builder.emit_convert(d_km, PjrtDType::F32);
                             SsaValue d_b = builder.emit_broadcast_in_dim(d_f32, {0, 1, 2, 4}, dot_b_dims);
                             SsaValue scaled = builder.emit_binary("stablehlo.multiply", dot_b, d_b);
-                            SsaValue zero_f32 = builder.emit_const_splat_f32(0.0f, {}, PjrtDType::F32);
-                            SsaValue acc = builder.emit_reduce_axis(scaled, zero_f32, 2, "stablehlo.add");
-
                             if (w_th.storage == TensorStorageKind::Q4_K_I4 && w_th.has_q_m) {
+                                // Apply each sub-block's minimum offset (xsum * m) in F32 BEFORE reducing
+                                // across blocks NB_local so a large-scale cancelling block (e.g. d=2^20,
+                                // m=-2^20) cannot swamp another block's contribution during F32 reduction.
                                 SsaValue m_km = w_th.q_m;
                                 bcast_w4_batch(m_km);
-                                SsaValue x_f32 = builder.emit_convert(x_blk, PjrtDType::F32);
-                                SsaValue xsum = builder.emit_reduce_axis(x_f32, zero_f32, 4, "stablehlo.add");
-                                SsaValue xsum_mm = builder.emit_convert(xsum, mm_dt);
-                                SsaValue m_mm = builder.emit_convert(m_km, mm_dt);
-                                SsaValue m_dot = builder.emit_dot_general(
-                                    xsum_mm, m_mm, {0, 1}, {0, 1}, {3}, {2},
-                                    dot_out_dims, PjrtDType::F32, op.high_precision);
-                                acc = builder.emit_binary("stablehlo.add", acc, m_dot);
+                                SsaValue m_f32 = builder.emit_convert(m_km, PjrtDType::F32);
+                                SsaValue m_b = builder.emit_broadcast_in_dim(m_f32, {0, 1, 2, 4}, dot_b_dims);
+                                SsaValue xsum_b = builder.emit_broadcast_in_dim(xsum, {0, 1, 3, 2}, dot_b_dims);
+                                SsaValue m_term = builder.emit_binary("stablehlo.multiply", xsum_b, m_b);
+                                scaled = builder.emit_binary("stablehlo.add", scaled, m_term);
                             }
+                            SsaValue acc = builder.emit_reduce_axis(scaled, zero_f32, 2, "stablehlo.add");
                             local_out = builder.emit_convert(acc, op.dst.dtype);
                         } else {
                             // Large-batch prefill path (M > 32): in-loop S4 dequant -> reshape [..., K, N] -> single dot_general.
@@ -1272,7 +1370,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                         }
                     }
 
-                    if (!emitted_freetile_mosaic && apply_pad_m) {
+                    if (apply_pad_m) {
                         local_out = builder.emit_slice(local_out, {0, 0, 0, 0}, {1, 1, m_orig, N_local});
                     }
 
@@ -1295,9 +1393,9 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
 
                 SsaValue w = resolve_dense(op.src_ids.at(0), deq_dt);
 
-                if (use_bf16_mxu) {
-                    w = builder.emit_convert(w, PjrtDType::BF16);
-                    x = builder.emit_convert(x, PjrtDType::BF16);
+                if (op.high_precision) {
+                    w = builder.emit_convert(w, PjrtDType::F32);
+                    x = builder.emit_convert(x, PjrtDType::F32);
                 } else if (w.dtype != x.dtype) {
                     const PjrtDType common =
                         (w.dtype == PjrtDType::F32 || x.dtype == PjrtDType::F32) ? PjrtDType::F32 : PjrtDType::BF16;
@@ -1534,7 +1632,9 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                 SsaValue zero = builder.emit_const_splat_f32(0.0f, {}, PjrtDType::F32);
                 SsaValue rsum = builder.emit_reduce_axis(exps, zero, 3, "stablehlo.add");
                 SsaValue rsum_b = builder.emit_broadcast_in_dim(rsum, {0, 1, 2}, s.dims);
-                SsaValue probs = builder.emit_binary("stablehlo.divide", exps, rsum_b);
+                SsaValue one_f = builder.emit_const_splat_f32(1.0f, s.dims, PjrtDType::F32);
+                SsaValue safe_rsum = builder.emit_binary("stablehlo.maximum", rsum_b, one_f);
+                SsaValue probs = builder.emit_binary("stablehlo.divide", exps, safe_rsum);
                 result = builder.emit_convert(probs, op.dst.dtype);
                 break;
             }
@@ -1549,20 +1649,43 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                 SsaValue idx3 = builder.emit_iota(0, idx_col_dims, PjrtDType::S32);
                 SsaValue idx2 = builder.emit_iota(1, idx_col_dims, PjrtDType::S32);
                 SsaValue idx1 = builder.emit_reshape(idx_raw, idx_col_dims);
-                SsaValue start_indices = builder.emit_concatenate({idx3, idx2, idx1}, 3);
 
-                if (P > 1 && tbl.sharding == TensorShardingKind::SHARD_N) {
-                    // Fallback for row-sharded tables: all-gather along row dim then gather.
-                    SsaValue full_tbl = resolve_replicated(op.src_ids.at(0), op.dst.dtype);
-                    SsaValue gathered = builder.emit_gather_3d_rows(full_tbl, start_indices, dst_dims);
-                    result = builder.emit_convert(gathered, op.dst.dtype);
-                } else if (tbl.storage == TensorStorageKind::DENSE) {
+                const bool is_shard_n = (P > 1 && tbl.sharding == TensorShardingKind::SHARD_N);
+                SsaValue start_indices;
+                SsaValue eff_idx1 = idx1;
+                SsaValue in_range;
+                if (is_shard_n) {
+                    // Row-sharded lookup: gather only the N_idx requested rows on each replica's
+                    // local shard, mask out non-local rows to 0, and all_reduce(add) the small
+                    // [B3, B2, N_idx, K] result instead of all-gathering the entire table.
+                    // K-major quantized tables store N along dim 3 ([B3, B2, NB, N_local]).
+                    const int64_t local_rows =
+                        (tbl.storage == TensorStorageKind::DENSE) ? tbl.dense.dims[2] : tbl.q_d.dims[3];
+                    SsaValue rid_s32 = builder.emit_convert(builder.emit_replica_id(), PjrtDType::S32);
+                    SsaValue rid_b = builder.emit_broadcast_in_dim(rid_s32, {}, idx_col_dims);
+                    SsaValue local_rows_c = builder.emit_const_splat_int(local_rows, idx_col_dims, PjrtDType::S32);
+                    SsaValue row_start = builder.emit_binary("stablehlo.multiply", rid_b, local_rows_c);
+                    SsaValue row_end = builder.emit_binary("stablehlo.add", row_start, local_rows_c);
+                    SsaValue ge_start = builder.emit_compare("GE", idx1, row_start);
+                    SsaValue lt_end = builder.emit_compare("LT", idx1, row_end);
+                    in_range = builder.emit_binary("stablehlo.and", ge_start, lt_end);
+
+                    SsaValue rel_idx = builder.emit_binary("stablehlo.subtract", idx1, row_start);
+                    SsaValue zero_idx = builder.emit_const_splat_int(0, idx_col_dims, PjrtDType::S32);
+                    SsaValue max_idx = builder.emit_const_splat_int(
+                        std::max<int64_t>(0, local_rows - 1), idx_col_dims, PjrtDType::S32);
+                    SsaValue clamped_lo = builder.emit_binary("stablehlo.maximum", rel_idx, zero_idx);
+                    eff_idx1 = builder.emit_binary("stablehlo.minimum", clamped_lo, max_idx);
+                    start_indices = builder.emit_concatenate({idx3, idx2, eff_idx1}, 3);
+                } else {
+                    start_indices = builder.emit_concatenate({idx3, idx2, idx1}, 3);
+                }
+
+                SsaValue local_rows_val;
+                if (tbl.storage == TensorStorageKind::DENSE) {
                     const std::vector<int64_t> local_dst = {B3, B2, N_idx, tbl.dense.dims[3]};
                     SsaValue gathered = builder.emit_gather_3d_rows(tbl.dense, start_indices, local_dst);
-                    SsaValue conv = builder.emit_convert(gathered, op.dst.dtype);
-                    result = (P > 1 && tbl.sharding == TensorShardingKind::SHARD_K)
-                                 ? builder.emit_all_gather(conv, 3, P)
-                                 : conv;
+                    local_rows_val = builder.emit_convert(gathered, op.dst.dtype);
                 } else {
                     // Gather only the selected N_idx rows along the last axis (N) from K-major tables,
                     // producing row-major [B3, B2, N_idx, NB, qs_blk] + [B3, B2, N_idx, NB], then dequantize!
@@ -1573,10 +1696,10 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                     if ((tbl.storage == TensorStorageKind::Q4_0_I4 ||
                          tbl.storage == TensorStorageKind::Q4_K_I4) &&
                         tbl.q_qs.dtype == PjrtDType::U8) {
-                        // Packed bitcast U8 [..., 32, N/2]: gather byte idx >> 1 in ui8, extract nibble (idx & 1).
+                        // Packed bitcast U8 [..., 32, N_local/2]: gather byte (eff_idx1 >> 1), extract nibble (eff_idx1 & 1).
                         SsaValue one = builder.emit_const_splat_int(1, idx_col_dims, PjrtDType::S32);
-                        SsaValue byte_idx1 = builder.emit_binary("stablehlo.shift_right_logical", idx1, one);
-                        SsaValue nib_sel = builder.emit_binary("stablehlo.and", idx1, one);
+                        SsaValue byte_idx1 = builder.emit_binary("stablehlo.shift_right_logical", eff_idx1, one);
+                        SsaValue nib_sel = builder.emit_binary("stablehlo.and", eff_idx1, one);
                         SsaValue byte_start_indices = builder.emit_concatenate({idx3, idx2, byte_idx1}, 3);
                         SsaValue g_u8 = builder.emit_gather_3d_last_axis(
                             tbl.q_qs, byte_start_indices, {B3, B2, N_idx, NB, qs_blk});
@@ -1610,11 +1733,26 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                             tbl.q_m, start_indices, {B3, B2, N_idx, NB});
                         g_m_ptr = &g_m;
                     }
-                    SsaValue local_deq = dequantize_row_major_blocks(
+                    local_rows_val = dequantize_row_major_blocks(
                         builder, tbl.storage, g_qs, g_d, g_m_ptr, eff_q_dt, op.dst.dtype);
-                    result = (P > 1 && tbl.sharding == TensorShardingKind::SHARD_K)
-                                 ? builder.emit_all_gather(local_deq, 3, P)
-                                 : local_deq;
+                }
+
+                if (is_shard_n) {
+                    SsaValue mask_b = builder.emit_broadcast_in_dim(in_range, {0, 1, 2, 3}, dst_dims);
+                    const bool dst_is_int = (op.dst.dtype == PjrtDType::PRED || op.dst.dtype == PjrtDType::S4 ||
+                                             op.dst.dtype == PjrtDType::U4 || op.dst.dtype == PjrtDType::S8 ||
+                                             op.dst.dtype == PjrtDType::U8 || op.dst.dtype == PjrtDType::S16 ||
+                                             op.dst.dtype == PjrtDType::S32 || op.dst.dtype == PjrtDType::U32 ||
+                                             op.dst.dtype == PjrtDType::S64);
+                    SsaValue zeros_dst = dst_is_int
+                                             ? builder.emit_const_splat_int(0, dst_dims, op.dst.dtype)
+                                             : builder.emit_const_splat_f32(0.0f, dst_dims, op.dst.dtype);
+                    SsaValue masked = builder.emit_select(mask_b, local_rows_val, zeros_dst);
+                    result = builder.emit_all_reduce(masked, P, "stablehlo.add");
+                } else if (P > 1 && tbl.sharding == TensorShardingKind::SHARD_K) {
+                    result = builder.emit_all_gather(local_rows_val, 3, P);
+                } else {
+                    result = local_rows_val;
                 }
                 break;
             }
@@ -1627,26 +1765,40 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                 const int64_t B3 = upd.dims[0];
                 const int64_t B2 = upd.dims[1];
                 const int64_t N_upd = upd.dims[2];
+                // Preserve S64 indices to avoid truncating valid >INT32_MAX row indices.
+                const PjrtDType idx_dt =
+                    (idx_raw.dtype == PjrtDType::S64) ? PjrtDType::S64 : PjrtDType::S32;
                 // Single-token decode fast path: emit O(1) in-place dynamic_update_slice instead of
                 // scatter when updating a single contiguous row slice across all batches/heads.
+                // Guard out-of-range indices (< 0 or >= n_rows) by selecting the existing row at
+                // the clamped destination before the update, matching scatter's discard semantics
+                // while keeping dynamic_update_slice as the sole final user of tbl for in-place donation.
                 if (N_upd == 1 && idx_raw.dims[0] == 1 && idx_raw.dims[1] == 1 &&
                     idx_raw.dims[2] == 1 && idx_raw.dims[3] == 1 &&
                     upd.dims[0] == tbl.dims[0] && upd.dims[1] == tbl.dims[1] && upd.dims[3] == tbl.dims[3]) {
-                    SsaValue idx_s32 = builder.emit_convert(idx_raw, PjrtDType::S32);
-                    SsaValue row_scalar = builder.emit_reshape(idx_s32, {});
-                    SsaValue zero_i32 = builder.emit_const_splat_int(0, {}, PjrtDType::S32);
+                    SsaValue idx_typed = builder.emit_convert(idx_raw, idx_dt);
+                    SsaValue row_scalar = builder.emit_reshape(idx_typed, {});
+                    SsaValue zero_idx = builder.emit_const_splat_int(0, {}, idx_dt);
+                    SsaValue n_rows_c = builder.emit_const_splat_int(tbl.dims[2], {}, idx_dt);
+                    SsaValue ge_zero = builder.emit_compare("GE", row_scalar, zero_idx);
+                    SsaValue lt_rows = builder.emit_compare("LT", row_scalar, n_rows_c);
+                    SsaValue in_bounds = builder.emit_binary("stablehlo.and", ge_zero, lt_rows);
+                    SsaValue in_bounds_b = builder.emit_broadcast_in_dim(in_bounds, {}, upd.dims);
+                    SsaValue cur_row = builder.emit_dynamic_slice(
+                        tbl, {zero_idx, zero_idx, row_scalar, zero_idx}, upd.dims);
+                    SsaValue safe_upd = builder.emit_select(in_bounds_b, upd, cur_row);
                     SsaValue updated = builder.emit_dynamic_update_slice(
-                        tbl, upd, {zero_i32, zero_i32, row_scalar, zero_i32});
+                        tbl, safe_upd, {zero_idx, zero_idx, row_scalar, zero_idx});
                     result = builder.emit_convert(updated, op.dst.dtype);
                     break;
                 }
                 // idx_raw GGML [N_upd, B2_i, B3_i, 1] -> HLO [1, B3_i, B2_i, N_upd] -> reshape [B3_i, B2_i, N_upd, 1]
-                SsaValue idx_s32 = builder.emit_convert(idx_raw, PjrtDType::S32);
-                SsaValue idx_4d = builder.emit_reshape(idx_s32, {idx_raw.dims[1], idx_raw.dims[2], idx_raw.dims[3], 1});
+                SsaValue idx_typed = builder.emit_convert(idx_raw, idx_dt);
+                SsaValue idx_4d = builder.emit_reshape(idx_typed, {idx_raw.dims[1], idx_raw.dims[2], idx_raw.dims[3], 1});
                 const std::vector<int64_t> idx_col_dims = {B3, B2, N_upd, 1};
                 SsaValue idx_b = broadcast_4d(builder, idx_4d, idx_col_dims);
-                SsaValue idx3 = builder.emit_iota(0, idx_col_dims, PjrtDType::S32);
-                SsaValue idx2 = builder.emit_iota(1, idx_col_dims, PjrtDType::S32);
+                SsaValue idx3 = builder.emit_iota(0, idx_col_dims, idx_dt);
+                SsaValue idx2 = builder.emit_iota(1, idx_col_dims, idx_dt);
                 SsaValue scatter_indices = builder.emit_concatenate({idx3, idx2, idx_b}, 3);
                 SsaValue scattered = builder.emit_scatter_3d_rows(tbl, scatter_indices, upd);
                 result = builder.emit_convert(scattered, op.dst.dtype);
@@ -1654,11 +1806,18 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
             }
             case CloudOpKind::ADD:
             case CloudOpKind::MUL: {
-                const TensorShardingKind a_sh = env.at(op.src_ids.at(0)).sharding;
-                const TensorShardingKind b_sh = env.at(op.src_ids.at(1)).sharding;
+                const TensorHandle& a_th = env.at(op.src_ids.at(0));
+                const TensorHandle& b_th = env.at(op.src_ids.at(1));
                 SsaValue a, b;
                 std::vector<int64_t> calc_dims = dst_dims;
-                if (P > 1 && a_sh == TensorShardingKind::SHARD_K && b_sh == TensorShardingKind::SHARD_K) {
+                // Only run the local SHARD_K fast path when both operands have equal logical K
+                // widths matching the output; unequal K widths require periodic repeat-broadcast
+                // over the full logical K axis, so gather via resolve_replicated first.
+                if (P > 1 &&
+                    a_th.sharding == TensorShardingKind::SHARD_K &&
+                    b_th.sharding == TensorShardingKind::SHARD_K &&
+                    a_th.logical_k == b_th.logical_k &&
+                    a_th.logical_k == dst_dims[3]) {
                     a = resolve_dense(op.src_ids.at(0), op.dst.dtype);
                     b = resolve_dense(op.src_ids.at(1), op.dst.dtype);
                     calc_dims[3] /= P;
@@ -1731,7 +1890,9 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                 SsaValue a = resolve_dense(op.src_ids.at(0), op.dst.dtype);
                 SsaValue c = builder.emit_convert(a, op.dst.dtype);
                 result = builder.emit_reduce_scatter(c, op.collective_dim, P, "stablehlo.add");
-                out_sharding = (op.collective_dim == 2) ? TensorShardingKind::SHARD_N : TensorShardingKind::SHARD_K;
+                // Keep explicit reduce_scatter outputs replica-local so downstream CPY/RESHAPE
+                // operates on the scattered shape rather than all-gathering into a mismatched shape.
+                out_sharding = TensorShardingKind::REPLICATED;
                 break;
             }
             case CloudOpKind::FLASH_ATTN_EXT: {
@@ -1762,7 +1923,39 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
 
                 // scores = q @ k^T : [B, H_Q, N_Q, N_KV]
                 const std::vector<int64_t> sc_dims = {B, H_Q, N_Q, N_KV};
-                const bool use_bf16_attn = spec.bf16_matmul && !op.high_precision;
+                const bool has_mask = (op.src_ids.size() > 3 && op.src_ids[3] != 0);
+                SsaValue m_b;
+                SsaValue visible;
+                SsaValue zeros_sc;
+                SsaValue neg_inf_sc;
+                SsaValue zero_scalar = builder.emit_const_splat_f32(0.0f, {}, PjrtDType::F32);
+
+                if (has_mask) {
+                    SsaValue m = builder.emit_convert(resolve_replicated(op.src_ids[3], PjrtDType::F32), PjrtDType::F32);
+                    if (m.dims[2] > N_Q) {
+                        m = builder.emit_slice(m, {0, 0, 0, 0}, {m.dims[0], m.dims[1], N_Q, m.dims[3]});
+                    }
+                    m_b = broadcast_4d(builder, m, sc_dims);
+                    neg_inf_sc = builder.emit_const_splat_f32(
+                        -std::numeric_limits<float>::infinity(), sc_dims, PjrtDType::F32);
+                    visible = builder.emit_compare("GT", m_b, neg_inf_sc);
+                    zeros_sc = builder.emit_const_splat_f32(0.0f, sc_dims, PjrtDType::F32);
+                    SsaValue ones_sc = builder.emit_const_splat_f32(1.0f, sc_dims, PjrtDType::F32);
+                    SsaValue vis_f32 = builder.emit_select(visible, ones_sc, zeros_sc);
+                    SsaValue any_vis_f32 = builder.emit_reduce_axis(vis_f32, zero_scalar, 2, "stablehlo.maximum");
+                    SsaValue any_vis = builder.emit_compare(
+                        "GT", any_vis_f32, builder.emit_const_splat_f32(0.0f, {B, H_Q, N_KV}, PjrtDType::F32));
+                    // Zero out K and V rows that are masked for every query before matmuls so
+                    // uninitialized/other-sequence non-finite KV entries cannot contaminate results.
+                    SsaValue any_vis_k = builder.emit_broadcast_in_dim(any_vis, {0, 1, 2}, {B, H_Q, N_KV, DK});
+                    k = builder.emit_select(
+                        any_vis_k, k, builder.emit_const_splat_f32(0.0f, {B, H_Q, N_KV, DK}, PjrtDType::F32));
+                    SsaValue any_vis_v = builder.emit_broadcast_in_dim(any_vis, {0, 1, 2}, {B, H_Q, N_KV, DV});
+                    v = builder.emit_select(
+                        any_vis_v, v, builder.emit_const_splat_f32(0.0f, {B, H_Q, N_KV, DV}, PjrtDType::F32));
+                }
+
+                const bool use_bf16_attn = spec.bf16_flash_attn && !op.high_precision;
                 SsaValue q_mm = use_bf16_attn ? builder.emit_convert(q, PjrtDType::BF16) : q;
                 SsaValue k_mm = use_bf16_attn ? builder.emit_convert(k, PjrtDType::BF16) : k;
                 SsaValue scores = builder.emit_dot_general(
@@ -1771,7 +1964,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                     SsaValue sc = builder.emit_const_splat_f32(op.flash_attn.scale, sc_dims, PjrtDType::F32);
                     scores = builder.emit_binary("stablehlo.multiply", scores, sc);
                 }
-                if (op.flash_attn.logit_softcap > 0.0f) {
+                if (op.flash_attn.logit_softcap != 0.0f) {
                     const float cap = op.flash_attn.logit_softcap;
                     SsaValue inv_cap = builder.emit_const_splat_f32(1.0f / cap, sc_dims, PjrtDType::F32);
                     SsaValue cap_c = builder.emit_const_splat_f32(cap, sc_dims, PjrtDType::F32);
@@ -1779,12 +1972,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                     scores = builder.emit_unary("stablehlo.tanh", scores);
                     scores = builder.emit_binary("stablehlo.multiply", scores, cap_c);
                 }
-                if (op.src_ids.size() > 3 && op.src_ids[3] != 0) {
-                    SsaValue m = builder.emit_convert(resolve_replicated(op.src_ids[3], PjrtDType::F32), PjrtDType::F32);
-                    if (m.dims[2] > N_Q) {
-                        m = builder.emit_slice(m, {0, 0, 0, 0}, {m.dims[0], m.dims[1], N_Q, m.dims[3]});
-                    }
-                    m = broadcast_4d(builder, m, sc_dims);
+                if (has_mask) {
                     if (op.flash_attn.max_bias > 0.0f) {
                         const uint32_t n_head = static_cast<uint32_t>(H_Q);
                         const uint32_t n_head_log2 = 1U << static_cast<uint32_t>(std::floor(std::log2(n_head)));
@@ -1798,27 +1986,56 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                         }
                         SsaValue sl_c = builder.emit_const_1d_f32(slopes, {1, H_Q, 1, 1});
                         SsaValue sl_b = builder.emit_broadcast_in_dim(sl_c, {0, 1, 2, 3}, sc_dims);
-                        m = builder.emit_binary("stablehlo.multiply", m, sl_b);
+                        m_b = builder.emit_binary("stablehlo.multiply", m_b, sl_b);
                     }
-                    scores = builder.emit_binary("stablehlo.add", scores, m);
+                    SsaValue scores_added = builder.emit_binary("stablehlo.add", scores, m_b);
+                    scores = builder.emit_select(visible, scores_added, neg_inf_sc);
                 }
 
                 // Softmax along N_KV (dim 3)
-                SsaValue neg_inf = builder.emit_const_splat_f32(-3.40282347e+38f, {}, PjrtDType::F32);
-                SsaValue rmax = builder.emit_reduce_axis(scores, neg_inf, 3, "stablehlo.maximum");
+                SsaValue neg_flt = builder.emit_const_splat_f32(-3.40282347e+38f, {}, PjrtDType::F32);
+                SsaValue rmax = builder.emit_reduce_axis(scores, neg_flt, 3, "stablehlo.maximum");
                 SsaValue rmax_b = builder.emit_broadcast_in_dim(rmax, {0, 1, 2}, sc_dims);
                 SsaValue shifted = builder.emit_binary("stablehlo.subtract", scores, rmax_b);
                 SsaValue exps = builder.emit_unary("stablehlo.exponential", shifted);
-                SsaValue zero = builder.emit_const_splat_f32(0.0f, {}, PjrtDType::F32);
-                SsaValue rsum = builder.emit_reduce_axis(exps, zero, 3, "stablehlo.add");
+                if (has_mask) {
+                    exps = builder.emit_select(visible, exps, zeros_sc);
+                }
+                SsaValue rsum = builder.emit_reduce_axis(exps, zero_scalar, 3, "stablehlo.add");
                 SsaValue rsum_b = builder.emit_broadcast_in_dim(rsum, {0, 1, 2}, sc_dims);
-                SsaValue probs = builder.emit_binary("stablehlo.divide", exps, rsum_b);
+                SsaValue one_f = builder.emit_const_splat_f32(1.0f, sc_dims, PjrtDType::F32);
+                SsaValue safe_rsum = builder.emit_binary("stablehlo.maximum", rsum_b, one_f);
+                SsaValue probs = builder.emit_binary("stablehlo.divide", exps, safe_rsum);
 
                 // out_bhqd = probs @ v : [B, H_Q, N_Q, N_KV] x [B, H_Q, N_KV, DV] -> [B, H_Q, N_Q, DV]
                 SsaValue probs_mm = use_bf16_attn ? builder.emit_convert(probs, PjrtDType::BF16) : probs;
-                SsaValue v_mm = use_bf16_attn ? builder.emit_convert(v, PjrtDType::BF16) : v;
-                SsaValue out_bhqd = builder.emit_dot_general(
-                    probs_mm, v_mm, {0, 1}, {0, 1}, {3}, {2}, {B, H_Q, N_Q, DV}, PjrtDType::F32, op.high_precision);
+                SsaValue out_bhqd;
+                if (has_mask) {
+                    // Prevent 0.0 * (NaN/Inf) contamination when one query masks a KV row that
+                    // another query in the same batch attends to, while still propagating NaN to
+                    // any query whose visible attended value is non-finite.
+                    const std::vector<int64_t> v_dims = {B, H_Q, N_KV, DV};
+                    SsaValue v_zeros = builder.emit_const_splat_f32(0.0f, v_dims, PjrtDType::F32);
+                    SsaValue v_ones = builder.emit_const_splat_f32(1.0f, v_dims, PjrtDType::F32);
+                    SsaValue v_diff = builder.emit_binary("stablehlo.subtract", v, v);
+                    SsaValue v_is_fin = builder.emit_compare("EQ", v_diff, v_zeros);
+                    SsaValue v_fin = builder.emit_select(v_is_fin, v, v_zeros);
+                    SsaValue v_fin_mm = use_bf16_attn ? builder.emit_convert(v_fin, PjrtDType::BF16) : v_fin;
+                    out_bhqd = builder.emit_dot_general(
+                        probs_mm, v_fin_mm, {0, 1}, {0, 1}, {3}, {2}, {B, H_Q, N_Q, DV}, PjrtDType::F32, op.high_precision);
+                    SsaValue v_bad = builder.emit_select(v_is_fin, v_zeros, v_ones);
+                    SsaValue q_bad = builder.emit_dot_general(
+                        probs, v_bad, {0, 1}, {0, 1}, {3}, {2}, {B, H_Q, N_Q, DV}, PjrtDType::F32, false);
+                    SsaValue q_has_bad = builder.emit_compare(
+                        "GT", q_bad, builder.emit_const_splat_f32(0.0f, {B, H_Q, N_Q, DV}, PjrtDType::F32));
+                    SsaValue nan_out = builder.emit_const_splat_f32(
+                        std::numeric_limits<float>::quiet_NaN(), {B, H_Q, N_Q, DV}, PjrtDType::F32);
+                    out_bhqd = builder.emit_select(q_has_bad, nan_out, out_bhqd);
+                } else {
+                    SsaValue v_mm = use_bf16_attn ? builder.emit_convert(v, PjrtDType::BF16) : v;
+                    out_bhqd = builder.emit_dot_general(
+                        probs_mm, v_mm, {0, 1}, {0, 1}, {3}, {2}, {B, H_Q, N_Q, DV}, PjrtDType::F32, op.high_precision);
+                }
                 // Permute [B, H_Q, N_Q, DV] -> [B, N_Q, H_Q, DV]
                 SsaValue out_permuted = builder.emit_transpose(out_bhqd, {0, 2, 1, 3});
                 result = builder.emit_convert(out_permuted, op.dst.dtype);
@@ -1829,13 +2046,9 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
         TensorHandle out_th;
         out_th.storage = TensorStorageKind::DENSE;
         out_th.sharding = out_sharding;
+        out_th.logical_k = op.dst.dims[3];
         out_th.dense = std::move(result);
         env[op.dst.id] = std::move(out_th);
-    }
-
-    std::unordered_map<uint64_t, CloudOpKind> producer_kind;
-    for (const OpNodeSpec& op : spec.ops) {
-        producer_kind[op.dst.id] = op.kind;
     }
 
     std::vector<SsaValue> return_vals;
@@ -1843,8 +2056,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
     for (uint64_t oid : spec.output_ids) {
         const TensorHandle& th = env.at(oid);
         SsaValue ov = th.dense;
-        const bool is_rs = (producer_kind.count(oid) && producer_kind[oid] == CloudOpKind::REDUCE_SCATTER_SUM);
-        if (P > 1 && !is_rs) {
+        if (P > 1) {
             if (th.sharding == TensorShardingKind::SHARD_N) {
                 ov = builder.emit_all_gather(ov, 2, P);
             } else if (th.sharding == TensorShardingKind::SHARD_K) {
@@ -1861,9 +2073,36 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
     return prog;
 }
 
+bool checked_tensor_nbytes(const int64_t dims[4], size_t elem_bytes, size_t* out_bytes) {
+    if (!dims || !out_bytes || elem_bytes == 0) {
+        return false;
+    }
+    size_t acc = elem_bytes;
+    for (int d = 0; d < 4; ++d) {
+        if (dims[d] < 0) {
+            return false;
+        }
+        const uint64_t udim = static_cast<uint64_t>(dims[d]);
+        if (udim > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+            return false;
+        }
+        const size_t sdim = static_cast<size_t>(udim);
+        if (sdim == 0) {
+            *out_bytes = 0;
+            return true;
+        }
+        if (acc > std::numeric_limits<size_t>::max() / sdim) {
+            return false;
+        }
+        acc *= sdim;
+    }
+    *out_bytes = acc;
+    return true;
+}
+
 std::vector<int64_t> parse_batch_buckets(const char* env_val) {
     if (env_val == nullptr) {
-        return {1, 2, 4, 8, 16};
+        return {1, 2, 4, 8, 16, 32, 64, 128, 256, 512};
     }
     std::string raw(env_val);
     size_t start = 0;
@@ -1889,8 +2128,10 @@ std::vector<int64_t> parse_batch_buckets(const char* env_val) {
         if (sep > pos) {
             const std::string tok = trimmed.substr(pos, sep - pos);
             char* endptr = nullptr;
+            errno = 0;
             const long long val = std::strtoll(tok.c_str(), &endptr, 10);
-            if (endptr != tok.c_str() && *endptr == '\0' && val > 0) {
+            if (errno == 0 && endptr != tok.c_str() && *endptr == '\0' &&
+                val > 0 && val <= static_cast<long long>(kMaxBatchBucketTokens)) {
                 buckets.push_back(static_cast<int64_t>(val));
             }
         }
@@ -1991,21 +2232,57 @@ bool bucket_view_slice_dims(const int64_t parent_dims[4],
     return true;
 }
 
+static const char* cloud_op_kind_name(CloudOpKind kind) {
+    switch (kind) {
+        case CloudOpKind::MUL_MAT: return "MUL_MAT";
+        case CloudOpKind::RMS_NORM: return "RMS_NORM";
+        case CloudOpKind::ROPE: return "ROPE";
+        case CloudOpKind::SILU: return "SILU";
+        case CloudOpKind::SWIGLU: return "SWIGLU";
+        case CloudOpKind::SOFT_MAX: return "SOFT_MAX";
+        case CloudOpKind::GET_ROWS: return "GET_ROWS";
+        case CloudOpKind::SET_ROWS: return "SET_ROWS";
+        case CloudOpKind::ADD: return "ADD";
+        case CloudOpKind::MUL: return "MUL";
+        case CloudOpKind::SCALE: return "SCALE";
+        case CloudOpKind::CPY: return "CPY";
+        case CloudOpKind::RESHAPE: return "RESHAPE";
+        case CloudOpKind::TRANSPOSE: return "TRANSPOSE";
+        case CloudOpKind::SLICE: return "SLICE";
+        case CloudOpKind::FLASH_ATTN_EXT: return "FLASH_ATTN_EXT";
+        case CloudOpKind::ALL_REDUCE_SUM: return "ALL_REDUCE_SUM";
+        case CloudOpKind::ALL_GATHER: return "ALL_GATHER";
+        case CloudOpKind::REDUCE_SCATTER_SUM: return "REDUCE_SCATTER_SUM";
+    }
+    return "UNKNOWN";
+}
+
 BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
                                                 int64_t orig_tokens,
                                                 int64_t bucket_tokens) {
     BucketAnalysisResult out;
+    auto fail_with = [&](const std::string& reason) -> BucketAnalysisResult {
+        BucketAnalysisResult failed;
+        failed.fail_reason = reason;
+        return failed;
+    };
     if (orig_tokens < 1 || bucket_tokens <= orig_tokens) {
-        return out;
+        return fail_with("invalid_tokens");
+    }
+    if (bucket_tokens > kMaxBatchBucketTokens) {
+        return fail_with("bucket_tokens_too_large");
     }
 
     struct ValInfo {
         uint64_t id = 0;
+        PjrtDType dtype = PjrtDType::F32;
         int64_t dims[4] = {1, 1, 1, 1};
         bool is_external = false;
         bool is_dense = true;
         bool is_donated = false;
+        bool allow_pre_padded = false;
         TensorShardingKind sharding = TensorShardingKind::REPLICATED;
+        int producer_op_idx = -1;
         int ax = -2;  // -2 = unknown, -1 = batch-invariant, 0..3 = token axis
         TokenInputPadKind pad = TokenInputPadKind::NONE;
     };
@@ -2018,10 +2295,11 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
 
     for (const TensorSpec& in : spec.inputs) {
         if (in.id == 0 || id_to_idx.count(in.id)) {
-            return out;
+            return fail_with("invalid_input_id");
         }
         ValInfo vi;
         vi.id = in.id;
+        vi.dtype = in.dtype;
         for (int d = 0; d < 4; ++d) {
             vi.dims[d] = in.dims[d];
         }
@@ -2037,18 +2315,21 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
         if (in.id > max_id) max_id = in.id;
     }
 
-    for (const OpNodeSpec& op : spec.ops) {
+    for (size_t oi = 0; oi < spec.ops.size(); ++oi) {
+        const OpNodeSpec& op = spec.ops[oi];
         if (op.dst.id == 0 || id_to_idx.count(op.dst.id)) {
-            return out;
+            return fail_with("invalid_op_dst_id");
         }
         ValInfo vi;
         vi.id = op.dst.id;
+        vi.dtype = op.dst.dtype;
         for (int d = 0; d < 4; ++d) {
             vi.dims[d] = op.dst.dims[d];
         }
         vi.is_external = false;
         vi.is_dense = (op.dst.storage == TensorStorageKind::DENSE);
         vi.sharding = op.keep_sharded_out ? TensorShardingKind::SHARD_K : TensorShardingKind::REPLICATED;
+        vi.producer_op_idx = static_cast<int>(oi);
         id_to_idx[op.dst.id] = vals.size();
         vals.push_back(vi);
         if (op.dst.id > max_id) max_id = op.dst.id;
@@ -2056,7 +2337,7 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
 
     for (uint64_t oid : spec.output_ids) {
         if (!id_to_idx.count(oid)) {
-            return out;
+            return fail_with("missing_output_id");
         }
     }
 
@@ -2069,20 +2350,38 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
         return true;
     };
 
+    std::string detail_reason;
+    auto note_reason = [&](const std::string& r) {
+        if (detail_reason.empty()) {
+            detail_reason = r;
+        }
+    };
+
     bool changed = false;
     auto set_ax = [&](size_t idx, int new_ax) -> bool {
         ValInfo& vi = vals[idx];
         if (new_ax >= 0) {
-            if (new_ax > 3 || vi.dims[new_ax] != orig_tokens) {
+            if (new_ax > 3) {
+                note_reason("invalid_axis");
+                return false;
+            }
+            const bool dim_ok = vi.allow_pre_padded
+                                    ? (vi.dims[new_ax] >= orig_tokens && vi.dims[new_ax] < bucket_tokens)
+                                    : (vi.dims[new_ax] == orig_tokens);
+            if (!dim_ok) {
+                note_reason(vi.is_external ? "input_dim_mismatch" : "op_dim_mismatch");
                 return false;
             }
             if (!vi.is_dense || vi.is_donated) {
+                note_reason(vi.is_donated ? "donated_conflict" : "non_dense_conflict");
                 return false;
             }
             if (vi.sharding == TensorShardingKind::SHARD_N && new_ax == 2) {
+                note_reason("shard_n_conflict");
                 return false;
             }
             if (vi.sharding == TensorShardingKind::SHARD_K && new_ax == 3) {
+                note_reason("shard_k_conflict");
                 return false;
             }
         }
@@ -2091,19 +2390,71 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
             changed = true;
             return true;
         }
-        return vi.ax == new_ax;
+        if (vi.ax != new_ax) {
+            note_reason(vi.is_external ? "input_conflict" : "axis_conflict");
+            return false;
+        }
+        return true;
     };
 
     auto set_pad = [&](size_t idx, TokenInputPadKind kind) -> bool {
-        ValInfo& vi = vals[idx];
-        if (!vi.is_external || kind == TokenInputPadKind::NONE) {
+        if (kind == TokenInputPadKind::NONE) {
             return true;
         }
-        if (vi.pad == TokenInputPadKind::NONE) {
-            vi.pad = kind;
-            return true;
+        size_t cur = idx;
+        for (size_t depth = 0; depth <= spec.ops.size(); ++depth) {
+            ValInfo& vi = vals[cur];
+            if (kind == TokenInputPadKind::NEG_ONE &&
+                vi.dtype != PjrtDType::S32 && vi.dtype != PjrtDType::S64) {
+                note_reason("neg_one_invalid_dtype");
+                return false;
+            }
+            if (vi.is_external) {
+                if (vi.pad == TokenInputPadKind::NONE) {
+                    vi.pad = kind;
+                    return true;
+                }
+                if (vi.pad != kind) {
+                    note_reason("pad_kind_conflict");
+                    return false;
+                }
+                return true;
+            }
+            if (vi.producer_op_idx < 0 || static_cast<size_t>(vi.producer_op_idx) >= spec.ops.size()) {
+                if (kind == TokenInputPadKind::NEG_ONE) {
+                    note_reason("neg_one_computed_index");
+                    return false;
+                }
+                return true;
+            }
+            const OpNodeSpec& prod = spec.ops[static_cast<size_t>(vi.producer_op_idx)];
+            const bool value_preserving_shape_op =
+                (prod.kind == CloudOpKind::RESHAPE ||
+                 prod.kind == CloudOpKind::CPY ||
+                 prod.kind == CloudOpKind::TRANSPOSE ||
+                 prod.kind == CloudOpKind::SLICE);
+            if (!value_preserving_shape_op || prod.src_ids.empty()) {
+                if (kind == TokenInputPadKind::NEG_ONE) {
+                    note_reason("neg_one_computed_index");
+                    return false;
+                }
+                return true;
+            }
+            size_t src_i = 0;
+            if (!lookup_idx(prod.src_ids[0], &src_i)) {
+                if (kind == TokenInputPadKind::NEG_ONE) {
+                    note_reason("neg_one_computed_index");
+                    return false;
+                }
+                return true;
+            }
+            cur = src_i;
         }
-        return vi.pad == kind;
+        if (kind == TokenInputPadKind::NEG_ONE) {
+            note_reason("neg_one_computed_index");
+            return false;
+        }
+        return true;
     };
 
     auto is_1d_tokens = [&](size_t idx) -> bool {
@@ -2115,6 +2466,84 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
         const auto& d = vals[idx].dims;
         return d[0] == 1 && d[1] == 1 && d[2] == 1 && d[3] == 1;
     };
+
+    auto assign_attention_mask = [&](size_t m_i, int active_ax) -> bool {
+        if (active_ax == 2 && vals[m_i].dims[2] == orig_tokens) {
+            return set_ax(m_i, 2) && set_pad(m_i, TokenInputPadKind::ZERO);
+        }
+        if (active_ax == 2 && vals[m_i].dims[2] > orig_tokens && vals[m_i].dims[2] < bucket_tokens) {
+            if (!vals[m_i].is_external || !vals[m_i].is_dense || vals[m_i].is_donated ||
+                vals[m_i].sharding != TensorShardingKind::REPLICATED) {
+                return false;
+            }
+            if (vals[m_i].ax != -2 && !(vals[m_i].ax == 2 && vals[m_i].allow_pre_padded)) {
+                return false;
+            }
+            vals[m_i].allow_pre_padded = true;
+            return set_ax(m_i, 2) && set_pad(m_i, TokenInputPadKind::ZERO);
+        }
+        if (active_ax == 2 && vals[m_i].dims[2] >= bucket_tokens) {
+            return set_ax(m_i, -1);
+        }
+        if (vals[m_i].dims[active_ax] == 1 && orig_tokens > 1) {
+            if (vals[m_i].ax == -2) {
+                return set_ax(m_i, -1);
+            }
+            return vals[m_i].ax == -1;
+        }
+        if (vals[m_i].dims[active_ax] == orig_tokens) {
+            return set_ax(m_i, active_ax) && set_pad(m_i, TokenInputPadKind::ZERO);
+        }
+        return false;
+    };
+
+    // Identify true KV-cache tensors from donated buffers and FLASH_ATTN_EXT K/V feeds so
+    // non-KV token tables (e.g. build_inp_embd mixed_embd) can still bucket along axis 2.
+    std::vector<bool> is_kv(vals.size(), false);
+    for (size_t i = 0; i < spec.inputs.size(); ++i) {
+        if (vals[i].is_donated) {
+            is_kv[i] = true;
+        }
+    }
+    for (const OpNodeSpec& op : spec.ops) {
+        if (op.kind == CloudOpKind::FLASH_ATTN_EXT && op.src_ids.size() >= 3) {
+            size_t k_i = 0, v_i = 0;
+            if (lookup_idx(op.src_ids[1], &k_i)) is_kv[k_i] = true;
+            if (lookup_idx(op.src_ids[2], &v_i)) is_kv[v_i] = true;
+        }
+    }
+    for (bool kv_changed = true; kv_changed;) {
+        kv_changed = false;
+        for (const OpNodeSpec& op : spec.ops) {
+            size_t dst_i = 0;
+            if (!lookup_idx(op.dst.id, &dst_i)) continue;
+            if (op.kind == CloudOpKind::SET_ROWS && op.src_ids.size() >= 3) {
+                size_t kv_i = 0;
+                if (!lookup_idx(op.src_ids[2], &kv_i)) continue;
+                if (is_kv[dst_i] && !is_kv[kv_i]) {
+                    is_kv[kv_i] = true;
+                    kv_changed = true;
+                }
+                if (is_kv[kv_i] && !is_kv[dst_i]) {
+                    is_kv[dst_i] = true;
+                    kv_changed = true;
+                }
+            } else if ((op.kind == CloudOpKind::CPY || op.kind == CloudOpKind::RESHAPE ||
+                        op.kind == CloudOpKind::TRANSPOSE || op.kind == CloudOpKind::SLICE) &&
+                       !op.src_ids.empty() && is_kv[dst_i]) {
+                size_t x_i = 0;
+                if (lookup_idx(op.src_ids[0], &x_i) && !is_kv[x_i]) {
+                    is_kv[x_i] = true;
+                    kv_changed = true;
+                }
+            }
+        }
+    }
+    for (size_t i = 0; i < vals.size(); ++i) {
+        if (is_kv[i] && !set_ax(i, -1)) {
+            return fail_with("kv_axis_conflict");
+        }
+    }
 
     auto propagate_op = [&](const OpNodeSpec& op, bool allow_mm_seed) -> bool {
         size_t dst_i = 0;
@@ -2141,10 +2570,17 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
                         if (!set_ax(idx_i, -1) || !set_ax(dst_i, -1)) return false;
                     }
                 } else if (vals[tbl_i].ax == 2) {
-                    if (vals[idx_i].dims[3] != orig_tokens) {
-                        return false;
-                    }
-                    if (!set_ax(idx_i, 3) || !set_pad(idx_i, TokenInputPadKind::ZERO) || !set_ax(dst_i, 2)) {
+                    if (vals[idx_i].dims[3] == orig_tokens) {
+                        if (!set_ax(idx_i, 3) || !set_pad(idx_i, TokenInputPadKind::ZERO) || !set_ax(dst_i, 2)) {
+                            return false;
+                        }
+                    } else if (vals[idx_i].dims[3] >= 1 && vals[idx_i].dims[3] < orig_tokens) {
+                        // Partial output gather (e.g. final-layer inp_out_ids with N_out < T):
+                        // gathers valid rows inside [0..T-1] from the B-padded table and yields fixed N_out.
+                        if (!set_ax(idx_i, -1) || !set_ax(dst_i, -1)) {
+                            return false;
+                        }
+                    } else {
                         return false;
                     }
                 } else if (vals[tbl_i].ax >= 0) {
@@ -2162,9 +2598,16 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
                     !lookup_idx(op.src_ids[2], &kv_i)) {
                     return false;
                 }
-                if (!set_ax(kv_i, -1) || !set_ax(dst_i, -1)) return false;
                 if (vals[idx_i].dims[0] != 1 || vals[idx_i].dims[1] != 1 || vals[idx_i].dims[2] != 1) {
                     return false;
+                }
+                if (is_kv[kv_i] || is_kv[dst_i] || vals[kv_i].dims[2] != orig_tokens) {
+                    if (!set_ax(kv_i, -1) || !set_ax(dst_i, -1)) return false;
+                } else {
+                    // Non-KV token-table SET_ROWS (e.g. build_inp_embd mixed_embd): bucket base table and output.
+                    if (!set_ax(kv_i, 2) || !set_pad(kv_i, TokenInputPadKind::ZERO) || !set_ax(dst_i, 2)) {
+                        return false;
+                    }
                 }
                 if (vals[idx_i].dims[3] == orig_tokens) {
                     if (!set_ax(idx_i, 3) || !set_pad(idx_i, TokenInputPadKind::NEG_ONE) || !set_ax(upd_i, 2)) {
@@ -2218,13 +2661,7 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
                 if (op.src_ids.size() > 3 && op.src_ids[3] != 0) {
                     size_t m_i = 0;
                     if (!lookup_idx(op.src_ids[3], &m_i)) return false;
-                    if (vals[m_i].dims[2] == orig_tokens) {
-                        if (!set_ax(m_i, 2) || !set_pad(m_i, TokenInputPadKind::ZERO)) return false;
-                    } else if (vals[m_i].dims[2] >= bucket_tokens) {
-                        if (!set_ax(m_i, -1)) return false;
-                    } else {
-                        return false;
-                    }
+                    if (!assign_attention_mask(m_i, 2)) return false;
                 }
                 return true;
             }
@@ -2290,29 +2727,29 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
                 if (op.src_ids.size() < 2) return false;
                 size_t a_i = 0, b_i = 0;
                 if (!lookup_idx(op.src_ids[0], &a_i) || !lookup_idx(op.src_ids[1], &b_i)) return false;
-                if (vals[a_i].ax >= 0) {
-                    const int ta = vals[a_i].ax;
-                    if (!set_ax(dst_i, ta)) return false;
-                    if (vals[b_i].dims[ta] == 1 && (orig_tokens > 1 || !vals[b_i].is_external || !vals[a_i].is_external)) {
-                        if (vals[b_i].ax == -2 && !set_ax(b_i, -1)) return false;
-                    } else if (vals[b_i].dims[ta] == orig_tokens && orig_tokens > 1) {
-                        if (!set_ax(b_i, ta)) return false;
-                    } else if (vals[b_i].dims[ta] != 1) {
-                        return false;
+                auto propagate_active_side = [&](size_t active_i, size_t other_i) -> bool {
+                    const int t_ax = vals[active_i].ax;
+                    if (!set_ax(dst_i, t_ax)) return false;
+                    if (vals[other_i].dims[t_ax] == 1 &&
+                        (orig_tokens > 1 || !vals[other_i].is_external || !vals[active_i].is_external)) {
+                        if (vals[other_i].ax == -2) {
+                            return set_ax(other_i, -1);
+                        }
+                        return vals[other_i].ax == -1;
                     }
-                }
-                if (vals[b_i].ax >= 0) {
-                    const int tb = vals[b_i].ax;
-                    if (vals[a_i].dims[tb] != orig_tokens) return false;
-                    if (!set_ax(a_i, tb) || !set_ax(dst_i, tb)) return false;
-                }
-                if (vals[a_i].ax == -1 && vals[b_i].ax == -1) {
-                    if (!set_ax(dst_i, -1)) return false;
-                }
+                    if (vals[other_i].dims[t_ax] == orig_tokens && orig_tokens > 1) {
+                        return set_ax(other_i, t_ax);
+                    }
+                    return vals[other_i].dims[t_ax] == 1;
+                };
+                if (vals[a_i].ax >= 0 && !propagate_active_side(a_i, b_i)) return false;
+                if (vals[b_i].ax >= 0 && !propagate_active_side(b_i, a_i)) return false;
+                if (vals[a_i].ax == -1 && vals[b_i].ax == -1 && !set_ax(dst_i, -1)) return false;
                 if (vals[dst_i].ax >= 0) {
                     const int td = vals[dst_i].ax;
                     if (!set_ax(a_i, td)) return false;
-                    if (vals[b_i].dims[td] == 1 && (orig_tokens > 1 || !vals[b_i].is_external || !vals[a_i].is_external)) {
+                    if (vals[b_i].dims[td] == 1 &&
+                        (orig_tokens > 1 || !vals[b_i].is_external || !vals[a_i].is_external)) {
                         if (vals[b_i].ax == -2 && !set_ax(b_i, -1)) return false;
                     } else if (vals[b_i].dims[td] == orig_tokens && orig_tokens > 1) {
                         if (!set_ax(b_i, td)) return false;
@@ -2329,22 +2766,17 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
                 size_t x_i = 0;
                 if (!lookup_idx(op.src_ids[0], &x_i)) return false;
                 if (vals[x_i].ax == 3 || vals[dst_i].ax == 3) return false;
+                if (op.soft_max.max_bias > 0.0f && (vals[x_i].ax == 1 || vals[dst_i].ax == 1)) {
+                    note_reason("softmax_alibi_head_axis");
+                    return false;
+                }
                 if (vals[x_i].ax != -2 && !set_ax(dst_i, vals[x_i].ax)) return false;
                 if (vals[dst_i].ax != -2 && !set_ax(x_i, vals[dst_i].ax)) return false;
                 if (op.src_ids.size() > 1 && op.src_ids[1] != 0) {
                     size_t m_i = 0;
                     if (!lookup_idx(op.src_ids[1], &m_i)) return false;
                     if (vals[x_i].ax >= 0) {
-                        const int tx = vals[x_i].ax;
-                        if (tx == 2 && vals[m_i].dims[2] >= bucket_tokens) {
-                            if (!set_ax(m_i, -1)) return false;
-                        } else if (vals[m_i].dims[tx] == 1 && orig_tokens > 1) {
-                            if (vals[m_i].ax == -2 && !set_ax(m_i, -1)) return false;
-                        } else if (vals[m_i].dims[tx] == orig_tokens) {
-                            if (!set_ax(m_i, tx) || !set_pad(m_i, TokenInputPadKind::ZERO)) return false;
-                        } else {
-                            return false;
-                        }
+                        if (!assign_attention_mask(m_i, vals[x_i].ax)) return false;
                     } else if (vals[x_i].ax == -1) {
                         if (!set_ax(m_i, -1)) return false;
                     }
@@ -2469,25 +2901,50 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
         return false;
     };
 
+    auto op_fail_label = [&](size_t oi, const OpNodeSpec& op) -> std::string {
+        std::string r = "op=" + std::to_string(oi) + ":" + cloud_op_kind_name(op.kind);
+        if (!detail_reason.empty()) {
+            r += "(" + detail_reason + ")";
+        }
+        return r;
+    };
+
+    std::string fail_reason;
     auto run_fixed_point = [&](bool seed_mm) -> bool {
         const size_t max_iters = std::max<size_t>(4, spec.ops.size() * 2 + 4);
         for (size_t iter = 0; iter < max_iters; ++iter) {
             changed = false;
             for (size_t oi = 0; oi < spec.ops.size(); ++oi) {
-                if (!propagate_op(spec.ops[oi], false)) return false;
+                detail_reason.clear();
+                if (!propagate_op(spec.ops[oi], false)) {
+                    fail_reason = op_fail_label(oi, spec.ops[oi]);
+                    return false;
+                }
             }
             for (size_t ri = spec.ops.size(); ri-- > 0;) {
-                if (!propagate_op(spec.ops[ri], false)) return false;
+                detail_reason.clear();
+                if (!propagate_op(spec.ops[ri], false)) {
+                    fail_reason = op_fail_label(ri, spec.ops[ri]);
+                    return false;
+                }
             }
             if (!changed) {
                 if (seed_mm) {
                     bool seeded = false;
-                    for (const OpNodeSpec& op : spec.ops) {
+                    for (size_t oi = 0; oi < spec.ops.size(); ++oi) {
+                        const OpNodeSpec& op = spec.ops[oi];
                         if (op.kind != CloudOpKind::MUL_MAT || op.src_ids.size() < 2) continue;
                         size_t x_i = 0, dst_i = 0;
-                        if (!lookup_idx(op.src_ids[1], &x_i) || !lookup_idx(op.dst.id, &dst_i)) return false;
+                        if (!lookup_idx(op.src_ids[1], &x_i) || !lookup_idx(op.dst.id, &dst_i)) {
+                            fail_reason = op_fail_label(oi, op);
+                            return false;
+                        }
                         if (vals[x_i].ax == -2 && vals[dst_i].ax == -2 && vals[x_i].dims[2] == orig_tokens) {
-                            if (!propagate_op(op, true)) return false;
+                            detail_reason.clear();
+                            if (!propagate_op(op, true)) {
+                                fail_reason = op_fail_label(oi, op);
+                                return false;
+                            }
                             seeded = true;
                             break;
                         }
@@ -2503,10 +2960,10 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
     };
 
     if (!run_fixed_point(false)) {
-        return out;
+        return fail_with(fail_reason);
     }
     if (!run_fixed_point(true)) {
-        return out;
+        return fail_with(fail_reason);
     }
 
     // Finalize any remaining unassigned external inputs as batch-invariant, propagate once more,
@@ -2517,16 +2974,17 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
         }
     }
     if (!run_fixed_point(false)) {
-        return out;
+        return fail_with(fail_reason);
     }
     for (ValInfo& vi : vals) {
         if (vi.ax == -2) {
             vi.ax = -1;
         }
     }
-    for (const OpNodeSpec& op : spec.ops) {
-        if (!propagate_op(op, false)) {
-            return out;
+    for (size_t oi = 0; oi < spec.ops.size(); ++oi) {
+        detail_reason.clear();
+        if (!propagate_op(spec.ops[oi], false)) {
+            return fail_with(op_fail_label(oi, spec.ops[oi]));
         }
     }
 
@@ -2538,7 +2996,7 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
         }
     }
     if (!any_token_varying) {
-        return out;
+        return fail_with("no_token_varying_tensors");
     }
 
     out.input_token_axis.resize(spec.inputs.size(), -1);
@@ -2546,12 +3004,25 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
     for (size_t i = 0; i < spec.inputs.size(); ++i) {
         const ValInfo& vi = vals[i];
         if (vi.ax >= 0) {
-            if (!vi.is_dense || vi.is_donated || vi.sharding != TensorShardingKind::REPLICATED ||
-                vi.dims[vi.ax] != orig_tokens) {
-                return BucketAnalysisResult{};
+            const bool dim_ok = vi.allow_pre_padded
+                                    ? (vi.dims[vi.ax] >= orig_tokens && vi.dims[vi.ax] < bucket_tokens)
+                                    : (vi.dims[vi.ax] == orig_tokens);
+            if (!vi.is_dense || vi.is_donated || vi.sharding != TensorShardingKind::REPLICATED || !dim_ok) {
+                return fail_with("input_validation_failed");
+            }
+            const size_t elem_sz = pjrt_dtype_size(vi.dtype);
+            int64_t pdims[4] = {vi.dims[0], vi.dims[1], vi.dims[2], vi.dims[3]};
+            pdims[vi.ax] = bucket_tokens;
+            size_t orig_b = 0, padded_b = 0;
+            if (!checked_tensor_nbytes(vi.dims, elem_sz, &orig_b) ||
+                !checked_tensor_nbytes(pdims, elem_sz, &padded_b) ||
+                padded_b < orig_b) {
+                return fail_with("padded_size_overflow");
             }
             out.input_token_axis[i] = vi.ax;
             out.input_pad_kind[i] = (vi.pad == TokenInputPadKind::NONE) ? TokenInputPadKind::ZERO : vi.pad;
+        } else if (vi.pad == TokenInputPadKind::NEG_ONE) {
+            return fail_with("neg_one_unbucketed_input");
         }
     }
 
@@ -2565,9 +3036,21 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
     for (size_t i = 0; i < spec.output_ids.size(); ++i) {
         size_t idx = 0;
         if (!lookup_idx(spec.output_ids[i], &idx)) {
-            return BucketAnalysisResult{};
+            return fail_with("missing_output_id");
         }
-        out.output_token_axis[i] = vals[idx].ax;
+        const ValInfo& vo = vals[idx];
+        if (vo.ax >= 0) {
+            const size_t elem_sz = pjrt_dtype_size(vo.dtype);
+            int64_t pdims[4] = {vo.dims[0], vo.dims[1], vo.dims[2], vo.dims[3]};
+            pdims[vo.ax] = bucket_tokens;
+            size_t orig_b = 0, padded_b = 0;
+            if (!checked_tensor_nbytes(vo.dims, elem_sz, &orig_b) ||
+                !checked_tensor_nbytes(pdims, elem_sz, &padded_b) ||
+                padded_b < orig_b) {
+                return fail_with("padded_size_overflow");
+            }
+        }
+        out.output_token_axis[i] = vo.ax;
     }
 
     if (max_id <= 1048576ULL) {
@@ -2601,7 +3084,10 @@ bool apply_program_batch_bucket(GraphProgramSpec& spec, const BucketAnalysisResu
         os.ax = plan.input_token_axis[i];
         orig_map[spec.inputs[i].id] = os;
         if (os.ax >= 0) {
-            if (spec.inputs[i].dims[os.ax] != plan.orig_tokens) return false;
+            if (spec.inputs[i].dims[os.ax] < plan.orig_tokens ||
+                spec.inputs[i].dims[os.ax] >= plan.bucket_tokens) {
+                return false;
+            }
             spec.inputs[i].dims[os.ax] = plan.bucket_tokens;
         }
     }
@@ -2654,6 +3140,12 @@ void pad_dense_host_tensor(const void* src,
         if (d != token_axis && orig_dims[d] != padded_dims[d]) {
             throw std::invalid_argument("pad_dense_host_tensor: non-token dim mismatch");
         }
+    }
+    size_t orig_total_bytes = 0, padded_total_bytes = 0;
+    if (!checked_tensor_nbytes(orig_dims, elem_bytes, &orig_total_bytes) ||
+        !checked_tensor_nbytes(padded_dims, elem_bytes, &padded_total_bytes) ||
+        padded_total_bytes < orig_total_bytes) {
+        throw std::overflow_error("pad_dense_host_tensor: tensor byte size overflow");
     }
     size_t outer = 1;
     for (int d = 0; d < token_axis; ++d) {
@@ -2720,6 +3212,12 @@ void slice_dense_host_tensor(const void* src,
         if (d != token_axis && padded_dims[d] != logical_dims[d]) {
             throw std::invalid_argument("slice_dense_host_tensor: non-token dim mismatch");
         }
+    }
+    size_t padded_total_bytes = 0, logical_total_bytes = 0;
+    if (!checked_tensor_nbytes(padded_dims, elem_bytes, &padded_total_bytes) ||
+        !checked_tensor_nbytes(logical_dims, elem_bytes, &logical_total_bytes) ||
+        padded_total_bytes < logical_total_bytes) {
+        throw std::overflow_error("slice_dense_host_tensor: tensor byte size overflow");
     }
     size_t outer = 1;
     for (int d = 0; d < token_axis; ++d) {

@@ -3030,7 +3030,11 @@ typedef PJRT_Error* PJRT_Compile(PJRT_Compile_Args* args);
 
 // -------------------------------- API access ---------------------------------
 
+#ifdef __cplusplus
+#define _PJRT_API_STRUCT_FIELD(fn_type) ::fn_type* fn_type
+#else
 #define _PJRT_API_STRUCT_FIELD(fn_type) fn_type* fn_type
+#endif
 
 // Please modify PJRT_Api_STRUCT_SIZE if the last field of PJRT_Api is changed.
 typedef struct PJRT_Api {

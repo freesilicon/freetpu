@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <limits>
 #include <sstream>
 
 namespace freetile {
@@ -22,6 +23,23 @@ bool fail(std::string* err, const std::string& msg) {
     return false;
 }
 
+size_t sat_mul_size(size_t a, size_t b) {
+    if (a == 0 || b == 0) {
+        return 0;
+    }
+    if (a > std::numeric_limits<size_t>::max() / b) {
+        return std::numeric_limits<size_t>::max();
+    }
+    return a * b;
+}
+
+size_t sat_add_size(size_t a, size_t b) {
+    if (a > std::numeric_limits<size_t>::max() - b) {
+        return std::numeric_limits<size_t>::max();
+    }
+    return a + b;
+}
+
 size_t tile_elements(const std::vector<int64_t>& shape) {
     if (shape.empty()) {
         return 0;
@@ -31,7 +49,7 @@ size_t tile_elements(const std::vector<int64_t>& shape) {
         if (d <= 0) {
             return 0;
         }
-        prod *= static_cast<size_t>(d);
+        prod = sat_mul_size(prod, static_cast<size_t>(d));
     }
     return prod;
 }
@@ -148,7 +166,14 @@ size_t dtype_bits(DType dt) {
 
 size_t dtype_nbytes(DType dt, size_t num_elements) {
     const size_t bits = dtype_bits(dt);
-    return (num_elements * bits + 7) / 8;
+    if (bits == 0 || num_elements == 0) {
+        return 0;
+    }
+    const size_t total_bits = sat_mul_size(num_elements, bits);
+    if (total_bits == std::numeric_limits<size_t>::max()) {
+        return std::numeric_limits<size_t>::max();
+    }
+    return sat_add_size(total_bits, 7) / 8;
 }
 
 const char* quant_format_name(QuantFormat fmt) {
@@ -199,18 +224,20 @@ size_t TileKernel::vmem_footprint_bytes() const {
                     break;
                 }
             }
-            total += double_buf ? (tile_bytes * 2) : tile_bytes;
+            total = sat_add_size(total, double_buf ? sat_mul_size(tile_bytes, 2) : tile_bytes);
         }
     }
     for (const SramTile& sc : scratch) {
         if (sc.space == MemorySpace::VMEM || sc.space == MemorySpace::SRAM) {
-            total += dtype_nbytes(sc.dtype, tile_elements(sc.window_bounds));
+            total = sat_add_size(total, dtype_nbytes(sc.dtype, tile_elements(sc.window_bounds)));
         }
     }
     // Account for unpacked BF16 weight tile when weight is S4/U4/S8.
-    if (matmul.quant != QuantFormat::NONE && (matmul.weight_dtype == DType::S4 || matmul.weight_dtype == DType::U4 ||
-                                              matmul.weight_dtype == DType::S8)) {
-        total += dtype_nbytes(DType::BF16, static_cast<size_t>(grid.bk * grid.bn));
+    if (matmul.quant != QuantFormat::NONE && grid.bk > 0 && grid.bn > 0 &&
+        (matmul.weight_dtype == DType::S4 || matmul.weight_dtype == DType::U4 ||
+         matmul.weight_dtype == DType::S8)) {
+        const size_t elems = sat_mul_size(static_cast<size_t>(grid.bk), static_cast<size_t>(grid.bn));
+        total = sat_add_size(total, dtype_nbytes(DType::BF16, elems));
     }
     return total;
 }
@@ -280,9 +307,30 @@ bool TileKernel::validate(std::string* err) const {
     if (operands.size() != expected_ops) {
         return fail(err, "TileKernel operand count mismatch for QuantFormat");
     }
+    if (matmul.act_dtype != DType::BF16) {
+        return fail(err, "TileMatmul act_dtype must be BF16");
+    }
+    if (matmul.out_dtype != DType::BF16 && matmul.out_dtype != DType::F32) {
+        return fail(err, "TileMatmul out_dtype must be BF16 or F32");
+    }
+    if (matmul.quant != QuantFormat::NONE && matmul.scale_dtype != DType::BF16) {
+        return fail(err, "Quantized TileMatmul scale_dtype must be BF16");
+    }
     for (const SramTile& op : operands) {
         if (op.window_bounds.size() != 2 || op.global_shape.size() != 2) {
             return fail(err, "SramTile operands must be 2D");
+        }
+        for (size_t d = 0; d < 2; ++d) {
+            if (op.window_bounds[d] <= 0 || op.global_shape[d] <= 0 ||
+                op.global_shape[d] < op.window_bounds[d] ||
+                (op.global_shape[d] % op.window_bounds[d]) != 0) {
+                return fail(err, "SramTile global_shape must be positive and evenly divisible by window_bounds");
+            }
+        }
+    }
+    for (const SramTile& sc : scratch) {
+        if (sc.window_bounds.size() != 2 || sc.window_bounds[0] <= 0 || sc.window_bounds[1] <= 0) {
+            return fail(err, "SramTile scratch must have positive 2D window_bounds");
         }
     }
     if (vmem_footprint_bytes() > prof.vmem_bytes) {
@@ -316,7 +364,7 @@ bool plan_quant_matmul_kernel(ChipTarget target,
         return fail(reason, "Decode/small-batch FreeTile kernel supports M <= 64");
     }
     if ((n % prof.lane_align) != 0) {
-        return fail(reason, "N must be divisible by target lane_align (128)");
+        return fail(reason, "N must be divisible by target lane_align");
     }
     if (out_dt != DType::BF16 && out_dt != DType::F32) {
         return fail(reason, "Output dtype must be BF16 or F32");
@@ -335,14 +383,14 @@ bool plan_quant_matmul_kernel(ChipTarget target,
         return fail(reason, "K must be divisible by quant_block_size * 8");
     }
 
-    std::vector<int64_t> bn_cands = {2048, 1024, 512, 256, 128};
+    std::vector<int64_t> bn_cands = {2048, 1024, 512, 256, 128, 64};
     std::vector<int64_t> bk_cands = {2048, 1024, 512, 256, 128};
     int64_t override_bm = m_pad;
     if (planner_cfg != nullptr && planner_cfg->schedule_hook != nullptr) {
         const TileShapeOverride ov = planner_cfg->schedule_hook(
             target, m, k, n, fmt, scale_dt, out_dt, unsigned_q4, planner_cfg->hook_user_data);
         if (ov.active) {
-            if (ov.bm >= m && (ov.bm % prof.sublane_align) == 0) {
+            if (ov.bm >= m && ov.bm <= 1024 && (ov.bm % prof.sublane_align) == 0) {
                 override_bm = ov.bm;
             }
             if (ov.bn > 0) {
@@ -372,7 +420,7 @@ bool plan_quant_matmul_kernel(ChipTarget target,
     bool found = false;
     TileKernel best;
     for (int64_t bn : bn_cands) {
-        if (bn < prof.lane_align || (n % bn) != 0) {
+        if (bn < prof.lane_align || (bn % prof.lane_align) != 0 || (n % bn) != 0) {
             continue;
         }
         for (int64_t bk : bk_cands) {

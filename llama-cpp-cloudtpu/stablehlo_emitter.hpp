@@ -10,12 +10,12 @@ namespace cloudtpu {
 
 enum class TensorStorageKind {
     DENSE = 0,
-    Q8_0_SPLIT,  // Split into (qs: [B3, B2, NB, 32, N] S8, d: [B3, B2, NB, N] F16)
-    Q4_0_SPLIT,  // Split into (qs: [B3, B2, NB, 16, N] U8, d: [B3, B2, NB, N] F16)
-    Q4_K_SPLIT,  // Split into (qs: [B3, B2, NB, 16, N] U8, d_eff: [B3, B2, NB, N] F32/F16, m_eff: [B3, B2, NB, N] F32/F16)
-    Q6_K_SPLIT,  // Split into (qs: [B3, B2, NB, 16, N] S8, d_eff: [B3, B2, NB, N] F32/F16)
-    Q4_0_I4,     // Single-read K-major (qs: [B3, B2, NB, 32, N] S4/U4 or [..., N/2] U8 bitcast, d: [B3, B2, NB, N] F16)
-    Q4_K_I4,     // Single-read K-major (qs: [B3, B2, NB, 32, N] S4/U4 or [..., N/2] U8 bitcast, d_eff/m_eff: [B3, B2, NB, N] F32/F16)
+    Q8_0_SPLIT,  // K-major N-minor: (qs: [B3, B2, K/32, 32, N] S8, d: [B3, B2, K/32, N] F16)
+    Q4_0_SPLIT,  // K-major N-minor: (qs: [B3, B2, K/32, 16, N] U8, d: [B3, B2, K/32, N] F16)
+    Q4_K_SPLIT,  // K-major N-minor: (qs: [B3, B2, K/32, 16, N] U8, d_eff/m_eff: [B3, B2, K/32, N] F32/BF16)
+    Q6_K_SPLIT,  // K-major N-minor: (qs: [B3, B2, K/16, 16, N] S8, d_eff: [B3, B2, K/16, N] F32/BF16)
+    Q4_0_I4,     // Single-read K-major: (qs: [B3, B2, K/32, 32, N] S4/U4 or [..., N/2] U8 bitcast, d: [B3, B2, K/32, N] F16)
+    Q4_K_I4,     // Single-read K-major: (qs: [B3, B2, K/32, 32, N] S4/U4 or [..., N/2] U8 bitcast, d_eff/m_eff: [B3, B2, K/32, N] F32/BF16)
 };
 
 enum class TensorShardingKind {
@@ -115,11 +115,12 @@ struct GraphProgramSpec {
     std::vector<OpNodeSpec> ops;      // Topologically ordered ops
     std::vector<uint64_t> output_ids; // Live-out TensorSpec::ids
     int32_t spmd_chips = 1;           // Number of replica-SPMD chips (1 = single chip, 4 = tpu7x, 8 = v6e-8)
-    bool bf16_matmul = true;          // Dequantize quantized/low-bit weights & activations to BF16 for MXU
+    bool bf16_matmul = true;          // Cast split-quantized weights & activations to BF16 for MXU (dense F16/F32 stay F32)
+    bool bf16_flash_attn = false;     // Opt-in BF16 Q/K/probs/V matmuls in FLASH_ATTN_EXT (default false: F32 parity)
     bool q4_split_dot = true;         // Q4_0/Q4_K: true = two split-X dots (zero concat); false = single concat dot
     int32_t mm_pad_m = 8;             // Pad small BF16 Q4_*_I4/Q6_K_SPLIT M < mm_pad_m up to mm_pad_m for MXU (<=1 disables)
     bool freetile_mosaic = false;     // Lower eligible quantized matmuls via FreeTile -> Mosaic tpu_custom_call
-    int32_t freetile_chip_target = 0; // freetile::ChipTarget (0=V5E, 1=V6E, 2=TPU7X)
+    int32_t freetile_chip_target = 0; // freetile::ChipTarget (0=V5E, 1=V6E, 2=TPU7X, 3=BUENOS_A0)
     int64_t freetile_mosaic_version = -1; // -1 = target default; >0 overrides stable_mosaic.version
 };
 
@@ -155,8 +156,15 @@ std::string format_mlir_tensor_type(PjrtDType dtype, const std::vector<int64_t>&
 // Continuous Batching Padded Buckets & Safe Dataflow Token-Axis Propagation
 // =========================================================================
 
-// Parses CLOUDTPU_BATCH_BUCKETS (default "1,2,4,8,16", sorted unique positive ints;
-// "0" or "" disables bucketing and returns an empty vector).
+// Maximum supported batch bucket token count (prevents oversized/overflowing host padding buffers).
+constexpr int64_t kMaxBatchBucketTokens = 131072;
+
+// Overflow-checked byte count for a 4D dense tensor: dims[0]*dims[1]*dims[2]*dims[3]*elem_bytes.
+// Returns false on null pointers, elem_bytes == 0, negative dims, or size_t multiplication overflow.
+bool checked_tensor_nbytes(const int64_t dims[4], size_t elem_bytes, size_t* out_bytes);
+
+// Parses CLOUDTPU_BATCH_BUCKETS (default "1,2,4,8,16,32,64,128,256,512", sorted unique
+// positive ints <= kMaxBatchBucketTokens; "0" or "" disables bucketing and returns an empty vector).
 std::vector<int64_t> parse_batch_buckets(const char* env_val);
 
 // Returns smallest bucket B >= n_tokens if 1 <= n_tokens <= buckets.back(), else 0.
@@ -177,6 +185,7 @@ struct BucketAnalysisResult {
     std::vector<TokenInputPadKind> input_pad_kind;
     std::vector<int> op_dst_token_axis;   // Parallel to GraphProgramSpec::ops (-1 or 0..3)
     std::vector<int> output_token_axis;   // Parallel to GraphProgramSpec::output_ids (-1 or 0..3)
+    std::string fail_reason;              // Populated when success == false for diagnostics
 };
 
 // Maps src_ax through a contiguous reshape from src_dims to dst_dims via unique outer/inner product

@@ -233,6 +233,18 @@ MosaicEmitResult emit_mosaic_kernel(const TileKernel& kernel, int64_t mosaic_ver
             b.body() << "    " << w_sub << " = \"stable_mosaic.arith.subf\"(" << w_bf16 << ", " << eight_v
                      << ") {fastmath = #arith.fastmath<none>} : (" << w_vt << ", " << w_vt << ") -> " << w_vt << "\n";
             w_bf16 = w_sub;
+        } else if (kernel.matmul.quant == QuantFormat::Q4_K && !kernel.matmul.unsigned_q4) {
+            // Q4_K stores unshifted minimums m alongside signed S4 nibbles (q - 8 in [-8..7]);
+            // adding 8.0 in BF16 restores exact unsigned nibbles [0..15] before scaling by d.
+            const std::string eight_s = b.next_val();
+            const std::string eight_v = b.next_val();
+            const std::string w_add = b.next_val();
+            const std::string w_vt = format_vector_type({bk, bn}, DType::BF16);
+            b.body() << "    " << eight_s << " = \"stable_mosaic.arith.constant\"() {value = 8.000000e+00 : bf16} : () -> bf16\n";
+            b.body() << "    " << eight_v << " = \"stable_mosaic.vector.broadcast\"(" << eight_s << ") : (bf16) -> " << w_vt << "\n";
+            b.body() << "    " << w_add << " = \"stable_mosaic.arith.addf\"(" << w_bf16 << ", " << eight_v
+                     << ") {fastmath = #arith.fastmath<none>} : (" << w_vt << ", " << w_vt << ") -> " << w_vt << "\n";
+            w_bf16 = w_add;
         }
     }
 

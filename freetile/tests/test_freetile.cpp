@@ -46,11 +46,21 @@ int main() {
         const auto emitted = freetile::emit_mosaic_kernel(k_ffn);
         CHECK_TRUE(emitted.mosaic_mlir.find("stable_mosaic.version = 17") != std::string::npos, "Mosaic v17 attr");
         CHECK_TRUE(emitted.mosaic_mlir.find("stable_mosaic.arith.sitofp") != std::string::npos, "S4 sitofp");
+        CHECK_TRUE(emitted.mosaic_mlir.find("value = 8.000000e+00 : bf16") != std::string::npos, "Q4_K S4 +8 unshift const");
+        CHECK_TRUE(emitted.mosaic_mlir.find("stable_mosaic.arith.addf") != std::string::npos, "Q4_K S4 +8 addf");
         CHECK_TRUE(emitted.mosaic_mlir.find("stable_mosaic.tpu.matmul") != std::string::npos, "tpu.matmul");
         CHECK_TRUE(emitted.mosaic_mlir.find("stable_mosaic.vector.multi_reduction") != std::string::npos, "Q4_K factored x_sum");
         CHECK_TRUE(emitted.mosaic_mlir.find("@transform_4") != std::string::npos, "5 window transforms");
         CHECK_TRUE(emitted.mosaic_mlir.find("memref<8x2048xf32, #tpu.memory_space<vmem>>") != std::string::npos, "F32 output");
         CHECK_TRUE(emitted.backend_config_json.find("\"serialization_format\": 1") != std::string::npos, "serialization_format 1");
+
+        freetile::TileKernel k_q4k_u4;
+        CHECK_TRUE(freetile::plan_quant_matmul_kernel(
+            freetile::ChipTarget::V5E, 1, 1024, 1024, freetile::QuantFormat::Q4_K,
+            freetile::DType::BF16, freetile::DType::F32, true, &k_q4k_u4), "Q4_K U4 1024x1024");
+        const auto em_q4k_u4 = freetile::emit_mosaic_kernel(k_q4k_u4);
+        CHECK_TRUE(em_q4k_u4.mosaic_mlir.find("stable_mosaic.arith.uitofp") != std::string::npos, "Q4_K U4 uitofp");
+        CHECK_TRUE(em_q4k_u4.mosaic_mlir.find("value = 8.000000e+00 : bf16") == std::string::npos, "Q4_K U4 has no +8 shift");
     }
 
     // 3. Single-K Q6_K and Q4_0 and Q8_0
