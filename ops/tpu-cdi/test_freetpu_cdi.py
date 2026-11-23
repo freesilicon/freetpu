@@ -3310,6 +3310,34 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertEqual(sid_all_env["TPU_ACCELERATOR_TYPE"], "tpu7x-8")
                 self.assertEqual(sid_all_env["TPU_SKIP_MDS_QUERY"], "true")
 
+                # Supplying a distinct logical `--chip-id-map` (e.g. logical device IDs 8..15)
+                # on that same separate-slot Ironwood host MUST preserve sysfs physical sibling
+                # pairing (chip-count=4, full isolated topology) while applying the logical map
+                # to `TPU_VISIBLE_CHIPS` / `TPU_VISIBLE_DEVICES`!
+                sid_logical_map = {
+                    dev["bdf"]: 8 + idx for idx, dev in enumerate(shared_id_7x_devs)
+                }
+                sid_mapped_spec = freetpu_cdi.build_cdi_spec(
+                    sid_chips,
+                    sid_ctrl,
+                    single_host_env=True,
+                    chip_id_map=sid_logical_map,
+                )
+                sid_mapped_all = {d["name"]: d for d in sid_mapped_spec["devices"]}["all"]
+                self.assertEqual(sid_mapped_all["annotations"]["freetpu.dev/chip-count"], "4")
+                self.assertEqual(
+                    sid_mapped_all["annotations"]["freetpu.dev/pci-function-count"], "8"
+                )
+                self.assertNotIn("freetpu.dev/capacity-complete", sid_mapped_all["annotations"])
+                sid_mapped_env = dict(
+                    kv.split("=", 1) for kv in sid_mapped_all["containerEdits"]["env"]
+                )
+                self.assertEqual(sid_mapped_env["TPU_CHIPS_PER_HOST_BOUNDS"], "2,2,1")
+                self.assertEqual(sid_mapped_env["TPU_ACCELERATOR_TYPE"], "tpu7x-8")
+                self.assertEqual(sid_mapped_env["TPU_SKIP_MDS_QUERY"], "true")
+                self.assertEqual(sid_mapped_env["TPU_VISIBLE_CHIPS"], "4,5,6,7")
+                self.assertEqual(sid_mapped_env["TPU_VISIBLE_DEVICES"], "8,9,10,11,12,13,14,15")
+
                 # Healthy multifunction Ironwood (no chip_id required): 04.0/04.1 + 05.0/05.1
                 # on NUMA 0 and 80:00.0/00.1 + 80:01.0/01.1 on NUMA 1 pair cleanly!
                 mf_ok_devs = [

@@ -183,6 +183,7 @@ class ExporterSnapshot:
     pid_telemetry_available: bool
     devices: List[TpuTelemetry]
     runtime_utilization: List[RuntimeTelemetry] = field(default_factory=list)
+    runtime_unjoined_duty_cycle: Dict[str, float] = field(default_factory=dict)
     gcp_preempted_status: Optional[int] = None
 
 
@@ -542,6 +543,7 @@ class _TpuInfoRow:
     hbm_used_bytes: Optional[int] = None
     hbm_total_bytes: Optional[int] = None
     duty_cycle_percent: Optional[float] = None
+    unjoined_duty_cycle_percent: Optional[float] = None
     hbm_bw_util_percent: Optional[float] = None
     in_chips_table: bool = False
     in_util_table: bool = False
@@ -1393,15 +1395,17 @@ def _query_grpc_runtime_metrics(
                 row = rows.setdefault(chip_key, _TpuInfoRow(chip_key=chip_key))
                 row.in_util_table = True
                 row.duty_cycle_percent = duty_val
+    elif duty_by_chip:
+        # Layout is ambiguous (e.g. sidecar without PCI inventory where physical-chip
+        # vs logical-core IDs cannot be verified): keep `duty_cycle_percent` unset so
+        # we never misjoin chip IDs onto logical core HBM rows, and preserve the raw
+        # readings in `unjoined_duty_cycle_percent` for separate export.
+        for raw_key, duty_val in duty_by_chip.items():
+            row = rows.setdefault(raw_key, _TpuInfoRow(chip_key=raw_key))
+            row.in_util_table = True
+            row.unjoined_duty_cycle_percent = duty_val
 
     if not rows:
-        if duty_by_chip and duty_layout == "ambiguous":
-            return (
-                False,
-                last_err
-                or f"gRPC duty-cycle layout ambiguous without established PCI generation ({addr})",
-                {},
-            )
         if not any_rpc_ok and last_err:
             return False, last_err, {}
         return False, last_err or f"gRPC RuntimeMetricService returned no live metrics from {addr}", {}
@@ -1892,6 +1896,7 @@ def _row_has_live_utilization(row: _TpuInfoRow) -> bool:
         row.hbm_used_bytes is not None
         or row.hbm_total_bytes is not None
         or row.duty_cycle_percent is not None
+        or row.unjoined_duty_cycle_percent is not None
         or row.hbm_bw_util_percent is not None
     )
 
@@ -1925,6 +1930,7 @@ def _copy_tpu_info_row(row: _TpuInfoRow) -> _TpuInfoRow:
         hbm_used_bytes=row.hbm_used_bytes,
         hbm_total_bytes=row.hbm_total_bytes,
         duty_cycle_percent=row.duty_cycle_percent,
+        unjoined_duty_cycle_percent=row.unjoined_duty_cycle_percent,
         hbm_bw_util_percent=row.hbm_bw_util_percent,
         in_chips_table=row.in_chips_table,
         in_util_table=row.in_util_table,
@@ -1949,6 +1955,10 @@ def _merge_runtime_rows(
                 not prefer_base or existing.duty_cycle_percent is None
             ):
                 existing.duty_cycle_percent = r.duty_cycle_percent
+            if r.unjoined_duty_cycle_percent is not None and (
+                not prefer_base or existing.unjoined_duty_cycle_percent is None
+            ):
+                existing.unjoined_duty_cycle_percent = r.unjoined_duty_cycle_percent
             if r.hbm_bw_util_percent is not None and (
                 not prefer_base or existing.hbm_bw_util_percent is None
             ):
@@ -2297,6 +2307,17 @@ def collect_snapshot(
         )
     ]
 
+    has_joined_duty = any(r.duty_cycle_percent is not None for r in util_rows.values())
+    runtime_unjoined_duty: Dict[str, float] = (
+        {}
+        if has_joined_duty
+        else {
+            key: row.unjoined_duty_cycle_percent
+            for key, row in util_rows.items()
+            if row.unjoined_duty_cycle_percent is not None
+        }
+    )
+
     gcp_preempted: Optional[int] = None
     if gcp_metadata_preemption:
         gcp_preempted = query_gcp_preemption_status(
@@ -2313,6 +2334,7 @@ def collect_snapshot(
         pid_telemetry_available=overall_pid_available,
         devices=devices,
         runtime_utilization=runtime_telemetry,
+        runtime_unjoined_duty_cycle=runtime_unjoined_duty,
         gcp_preempted_status=gcp_preempted,
     )
 
@@ -2581,6 +2603,20 @@ def format_prometheus_metrics(snapshot: ExporterSnapshot) -> str:
         "gauge",
         runtime_duty,
     )
+    if snapshot.runtime_unjoined_duty_cycle:
+        unjoined_duty_samples = [
+            ({"runtime_device_id": raw_id}, _fmt_float(val))
+            for raw_id, val in sorted(
+                snapshot.runtime_unjoined_duty_cycle.items(),
+                key=lambda kv: (0, int(kv[0])) if kv[0].isdigit() else (1, kv[0]),
+            )
+        ]
+        add_metric(
+            "freetpu_tpu_runtime_unjoined_duty_cycle_percent",
+            "TPU Runtime Utilization MXU duty cycle percentage keyed by raw libtpu reported ID when chip-to-core layout cannot be verified from PCI inventory.",
+            "gauge",
+            unjoined_duty_samples,
+        )
     add_metric(
         "freetpu_tpu_runtime_hbm_bandwidth_utilization_percent",
         "TPU Runtime Utilization HBM bandwidth utilization percentage keyed by libtpu runtime chip ID.",

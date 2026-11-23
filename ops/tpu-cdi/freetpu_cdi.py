@@ -897,27 +897,32 @@ def _map_physical_chip_indices(
         key = (c.generation, base_slot)
         slot_counts[key] = slot_counts.get(key, 0) + 1
 
-    def _raw_id(chip: DiscoveredChip) -> Optional[int]:
-        if chip_id_map and chip.pci_bdf in chip_id_map:
-            return chip_id_map[chip.pci_bdf]
-        return chip.runtime_chip_id
-
     # Identify functions explicitly sharing the SAME physical chip ID within one
     # topology domain (never pairing distinct unique IDs via integer division).
-    shared_rid_counts: Dict[Tuple[str, int], int] = {}
-    shared_rid_domains: Dict[Tuple[str, int], set[Tuple[str, Optional[int], str]]] = {}
+    # Preserve raw sysfs `chip_id` for physical sibling pairing so passing a
+    # logical per-function `--chip-id-map` (e.g. `0..7` for visibility masks on
+    # Ironwood where siblings share physical sysfs `chip_id` `0..3`) never masks
+    # the sysfs sibling relationship. Fall back to `chip_id_map` only when sysfs
+    # `chip_id` is absent.
+    shared_sysfs_counts: Dict[Tuple[str, int], int] = {}
+    shared_sysfs_domains: Dict[Tuple[str, int], set[Tuple[str, Optional[int], str]]] = {}
+    shared_map_counts: Dict[Tuple[str, int], int] = {}
+    shared_map_domains: Dict[Tuple[str, int], set[Tuple[str, Optional[int], str]]] = {}
     for c in chips:
         per_chip = _PCI_FUNCTIONS_PER_PHYSICAL_CHIP.get(c.generation, 1)
         if per_chip <= 1:
             continue
-        rid = _raw_id(c)
-        if rid is not None:
-            rkey = (c.generation, int(rid))
-            shared_rid_counts[rkey] = shared_rid_counts.get(rkey, 0) + 1
-            shared_rid_domains.setdefault(rkey, set()).add(_topology_domain_key(c))
+        if c.runtime_chip_id is not None:
+            rkey = (c.generation, int(c.runtime_chip_id))
+            shared_sysfs_counts[rkey] = shared_sysfs_counts.get(rkey, 0) + 1
+            shared_sysfs_domains.setdefault(rkey, set()).add(_topology_domain_key(c))
+        elif chip_id_map and c.pci_bdf in chip_id_map:
+            mkey = (c.generation, int(chip_id_map[c.pci_bdf]))
+            shared_map_counts[mkey] = shared_map_counts.get(mkey, 0) + 1
+            shared_map_domains.setdefault(mkey, set()).add(_topology_domain_key(c))
 
     slot_to_phys: Dict[Tuple[str, str], int] = {}
-    shared_rid_to_phys: Dict[Tuple[str, Tuple[str, Optional[int], str], int], int] = {}
+    shared_rid_to_phys: Dict[Tuple[str, str, Tuple[str, Optional[int], str], int], int] = {}
     next_phys = 0
 
     for c in chips:
@@ -936,14 +941,25 @@ def _map_physical_chip_indices(
             bdf_to_phys[c.pci_bdf] = slot_to_phys[slot_key]
             continue
 
-        rid = _raw_id(c)
-        if rid is not None:
-            rkey = (c.generation, int(rid))
+        if c.runtime_chip_id is not None:
+            rkey = (c.generation, int(c.runtime_chip_id))
             if (
-                shared_rid_counts.get(rkey, 0) == per_chip
-                and len(shared_rid_domains.get(rkey, set())) == 1
+                shared_sysfs_counts.get(rkey, 0) == per_chip
+                and len(shared_sysfs_domains.get(rkey, set())) == 1
             ):
-                vkey = (c.generation, _topology_domain_key(c), int(rid))
+                vkey = ("sysfs", c.generation, _topology_domain_key(c), int(c.runtime_chip_id))
+                if vkey not in shared_rid_to_phys:
+                    shared_rid_to_phys[vkey] = next_phys
+                    next_phys += 1
+                bdf_to_phys[c.pci_bdf] = shared_rid_to_phys[vkey]
+                continue
+        elif chip_id_map and c.pci_bdf in chip_id_map:
+            mkey = (c.generation, int(chip_id_map[c.pci_bdf]))
+            if (
+                shared_map_counts.get(mkey, 0) == per_chip
+                and len(shared_map_domains.get(mkey, set())) == 1
+            ):
+                vkey = ("map", c.generation, _topology_domain_key(c), int(chip_id_map[c.pci_bdf]))
                 if vkey not in shared_rid_to_phys:
                     shared_rid_to_phys[vkey] = next_phys
                     next_phys += 1

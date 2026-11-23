@@ -3023,6 +3023,55 @@ TPU Runtime Utilization
                     no_pci_rows[str(core_idx)].hbm_used_bytes, (core_idx + 1) * 10 * 1024**3
                 )
                 self.assertIsNone(no_pci_rows[str(core_idx)].duty_cycle_percent)
+            # Raw duty-cycle readings MUST still be preserved in the separate unjoined
+            # runtime series keyed by reported ID so sidecars without PCI inventory or
+            # `tpu-info` fallback never lose duty-cycle monitoring.
+            empty_pci_root = root / "sidecar_no_pci"
+            (empty_pci_root / "sys" / "bus" / "pci" / "devices").mkdir(parents=True)
+            (empty_pci_root / "dev").mkdir(parents=True)
+            (empty_pci_root / "proc").mkdir(parents=True)
+            with (
+                mock.patch.dict(_te._GRPC_CHANNELS, {}, clear=True),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "grpc": _FakeGrpc,
+                        "tpu_info": SimpleNamespace(),
+                        "tpu_info.proto": SimpleNamespace(),
+                        "tpu_info.proto.tpu_metric_service_pb2": fake_pb2,
+                        "tpu_info.proto.tpu_metric_service_pb2_grpc": SimpleNamespace(
+                            RuntimeMetricServiceStub=_IronwoodStub
+                        ),
+                    },
+                ),
+            ):
+                no_pci_snap = _te.collect_snapshot(
+                    sysfs_root=empty_pci_root / "sys",
+                    dev_root=empty_pci_root / "dev",
+                    proc_root=empty_pci_root / "proc",
+                    tpu_info_bin="tpu-info",
+                    skip_pid_scan=True,
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=empty_pci_root / "no-shm",
+                )
+            self.assertTrue(no_pci_snap.tpu_info_available)
+            self.assertEqual(len(no_pci_snap.runtime_utilization), 8)
+            self.assertTrue(all(rt.duty_cycle_percent is None for rt in no_pci_snap.runtime_utilization))
+            self.assertEqual(
+                no_pci_snap.runtime_unjoined_duty_cycle,
+                {"0": 12.5, "1": 37.5, "2": 62.5, "3": 87.5},
+            )
+            no_pci_prom = _te.format_prometheus_metrics(no_pci_snap)
+            self._assert_valid_prometheus_text(no_pci_prom)
+            self.assertNotIn("freetpu_tpu_runtime_duty_cycle_percent{", no_pci_prom)
+            self.assertIn(
+                'freetpu_tpu_runtime_unjoined_duty_cycle_percent{runtime_device_id="0"} 12.5',
+                no_pci_prom,
+            )
+            self.assertIn(
+                'freetpu_tpu_runtime_unjoined_duty_cycle_percent{runtime_device_id="3"} 87.5',
+                no_pci_prom,
+            )
             self.assertEqual(iw_snap.devices[0].device_id, "0x0076")
             self.assertEqual(iw_snap.devices[7].device_id, "0x0075")
             self.assertEqual(iw_snap.devices[7].generation, "tpu7x")
@@ -3809,8 +3858,13 @@ TPU Runtime Utilization
                 'freetpu_tpu_runtime_duty_cycle_percent{pci_bdf="unmapped",expected_tpu_activity="sustained"}',
                 alerts_text,
             )
-            # Duty cycle collapse must be gated on sustained activity + HBM allocation so idle inference replicas don't page.
+            # Duty cycle collapse must be gated on sustained activity + current instant duty sample + HBM allocation.
             self.assertIn('expected_tpu_activity="sustained"', alerts_text)
+            self.assertIn('freetpu_tpu_duty_cycle_percent{expected_tpu_activity="sustained"} >= 0', alerts_text)
+            self.assertIn(
+                'freetpu_tpu_runtime_duty_cycle_percent{pci_bdf="unmapped",expected_tpu_activity="sustained"} >= 0',
+                alerts_text,
+            )
             self.assertIn('freetpu_tpu_hbm_used_bytes{expected_tpu_activity="sustained"} > 0', alerts_text)
             self.assertIn("inference replicas", alerts_text)
             # PCIe AER alert must use a multi-scrape window ([5m], not [1m]).
