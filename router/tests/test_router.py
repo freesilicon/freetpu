@@ -13511,6 +13511,128 @@ asyncio.run(main())
         self.assertFalse(telem_bad.reachable)
         self.assertFalse(evaluate_tpu_readiness(telem_bad)[0])
 
+    def test_completions_echo_token_id_prompt_excludes_echoed_tokens_from_fallback(
+        self,
+    ) -> None:
+        recorded_usage: List[UsageEvent] = []
+
+        class _RecordHook:
+            def record_usage(self, event: UsageEvent) -> None:
+                recorded_usage.append(event)
+
+        class _EchoTokenIdsPromptHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return None
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = json.dumps(
+                    {"object": "list", "data": [{"id": "m-echo-tokid-prompt"}]}
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802
+                clen = int(self.headers.get("Content-Length", "0"))
+                req_obj = json.loads(self.rfile.read(clen).decode("utf-8"))
+                if req_obj.get("stream"):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    # Echoed 100-token prompt (~400 chars) + 12 chars of generated output, no usage.
+                    ev1 = json.dumps(
+                        {
+                            "id": "cmpl-tokid-s1",
+                            "object": "text_completion",
+                            "choices": [{"index": 0, "text": "P" * 400, "finish_reason": None}],
+                        }
+                    ).encode("utf-8")
+                    ev2 = json.dumps(
+                        {
+                            "id": "cmpl-tokid-s1",
+                            "object": "text_completion",
+                            "choices": [{"index": 0, "text": "Short answer", "finish_reason": "stop"}],
+                        }
+                    ).encode("utf-8")
+                    self.wfile.write(
+                        b"data: " + ev1 + b"\n\ndata: " + ev2 + b"\n\ndata: [DONE]\n\n"
+                    )
+                    self.wfile.flush()
+                else:
+                    body = json.dumps(
+                        {
+                            "id": "cmpl-tokid-ns1",
+                            "object": "text_completion",
+                            "choices": [
+                                {"index": 0, "text": ("P" * 400) + "Short answer", "finish_reason": "stop"},
+                                {"index": 1, "text": ("Q" * 200) + "Eight ch", "finish_reason": "stop"},
+                            ],
+                        }
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(body)
+
+        srv = self._track(
+            ThreadingHTTPServer(("127.0.0.1", 0), _EchoTokenIdsPromptHandler)
+        )
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            backends=[
+                BackendConfig(
+                    id="echo-tokid-b",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=f"http://127.0.0.1:{srv.server_address[1]}/v1",
+                    models=["m-echo-tokid-prompt"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg, usage_hook=_RecordHook()))
+        rport = router.server_address[1]
+
+        # 1. Streamed single token-ID prompt (100 tokens) with echo=True: 412 chars -> 103 - 100 = 3 tokens.
+        st1, _, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/completions",
+            body={
+                "model": "m-echo-tokid-prompt",
+                "prompt": list(range(100)),
+                "echo": True,
+                "stream": True,
+            },
+        )
+        self.assertEqual(st1, 200)
+        self.assertEqual(recorded_usage[0].prompt_tokens, 100)
+        self.assertEqual(recorded_usage[0].completion_tokens, 3)
+
+        # 2. Non-streamed batched token-ID prompts (100 + 50 tokens) with echo=True: (103-100) + (52-50) = 5 tokens.
+        st2, _, _ = _http_request(
+            rport,
+            "POST",
+            "/v1/completions",
+            body={
+                "model": "m-echo-tokid-prompt",
+                "prompt": [list(range(100)), list(range(50))],
+                "echo": True,
+                "stream": False,
+            },
+        )
+        self.assertEqual(st2, 200)
+        self.assertEqual(recorded_usage[1].prompt_tokens, 150)
+        self.assertEqual(recorded_usage[1].completion_tokens, 5)
+
 
 def run_self_tests(verbosity: int = 1) -> int:
     """Run all router tests cleanly via unittest."""

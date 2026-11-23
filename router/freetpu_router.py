@@ -775,16 +775,39 @@ def _echo_prompt_char_lengths(
     return ()
 
 
+def _echo_prompt_token_counts(
+    endpoint: str,
+    req_payload: Mapping[str, Any],
+) -> Tuple[int, ...]:
+    """Return per-prompt token counts for `/v1/completions` token-ID prompts when `echo=true`."""
+    if (
+        endpoint != "/v1/completions"
+        or req_payload.get("echo") is not True
+        or req_payload.get("return_token_ids") is True
+    ):
+        return ()
+    prompt = req_payload.get("prompt")
+    if isinstance(prompt, list) and prompt:
+        if all(isinstance(item, int) and not isinstance(item, bool) for item in prompt):
+            return (len(prompt),)
+        if all(isinstance(item, list) for item in prompt):
+            return tuple(
+                sum(1 for tok in item if isinstance(tok, int) and not isinstance(tok, bool))
+                for item in prompt
+            )
+    return ()
+
+
 def _parse_inference_request_fields(
     raw_req: bytes,
     path: str,
 ) -> Tuple[
-    Optional[Tuple[str, bool, int, int, int, Tuple[int, ...], bool]],
+    Optional[Tuple[str, bool, int, int, int, Tuple[int, ...], Tuple[int, ...], bool]],
     Optional[Tuple[int, Optional[str], str]],
 ]:
     """Decode and validate an inbound inference JSON body in an isolated scope.
 
-    Returns `((model, stream, est_prompt_tokens, expected_choices, prompt_batch_size, echo_prompt_chars, expect_final_usage), None)`
+    Returns `((model, stream, est_prompt_tokens, expected_choices, prompt_batch_size, echo_prompt_chars, echo_prompt_tokens, expect_final_usage), None)`
     on success or `(None, (status_code, error_code, message))` on validation failure.
     Running inside a dedicated function guarantees that the decoded `str`, JSON
     `dict`, and any nested user fields (such as `stream_options`) go out of scope
@@ -829,6 +852,7 @@ def _parse_inference_request_fields(
     prompt_batch_size = _expected_stream_prompt_batch_size(path, req_payload)
     expected_choices = _expected_stream_choices(path, req_payload)
     echo_prompt_chars = _echo_prompt_char_lengths(path, req_payload)
+    echo_prompt_tokens = _echo_prompt_token_counts(path, req_payload)
     raw_stream_opts = req_payload.get("stream_options")
     expect_final_usage = bool(
         stream
@@ -842,6 +866,7 @@ def _parse_inference_request_fields(
         expected_choices,
         prompt_batch_size,
         echo_prompt_chars,
+        echo_prompt_tokens,
         expect_final_usage,
     ), None
 
@@ -1022,6 +1047,32 @@ def _subtract_echoed_prompt_chars(
     return adjusted
 
 
+def _estimate_completion_tokens_minus_echoed_prompt_tokens(
+    chars_by_choice: Mapping[int, int],
+    echo_prompt_tokens: Sequence[int],
+    *,
+    required_choices: int = 1,
+    prompt_batch_size: int = 1,
+) -> int:
+    """Estimate completion tokens per choice after subtracting echoed token-ID prompt counts."""
+    eff_batch = max(1, prompt_batch_size)
+    n_per_prompt = max(1, max(1, required_choices) // eff_batch)
+    total_tokens = 0
+    for c_idx, c_chars in chars_by_choice.items():
+        if c_chars <= 0:
+            continue
+        est_choice_tokens = max(1, (c_chars + 3) // 4)
+        p_slot = c_idx // n_per_prompt
+        if 0 <= p_slot < len(echo_prompt_tokens):
+            echo_toks = echo_prompt_tokens[p_slot]
+        elif len(echo_prompt_tokens) == 1:
+            echo_toks = echo_prompt_tokens[0]
+        else:
+            echo_toks = 0
+        total_tokens += max(0, est_choice_tokens - echo_toks)
+    return total_tokens
+
+
 def _has_choice_audio_output(obj: Mapping[str, Any]) -> bool:
     """Return True when any choice carries generated audio data or transcript."""
     choices = obj.get("choices")
@@ -1119,6 +1170,7 @@ def _extract_non_stream_usage(
     *,
     parsed_resp: Optional[Mapping[str, Any]] = None,
     echo_prompt_chars: Sequence[int] = (),
+    echo_prompt_tokens: Sequence[int] = (),
     expected_choices: int = 1,
     prompt_batch_size: int = 1,
 ) -> Tuple[int, int]:
@@ -1173,6 +1225,13 @@ def _extract_non_stream_usage(
             )
             if adjusted_chars > 0:
                 completion_tokens = max(1, (adjusted_chars + 3) // 4)
+        elif echo_prompt_tokens:
+            completion_tokens = _estimate_completion_tokens_minus_echoed_prompt_tokens(
+                _extract_choice_output_char_counts(parsed_resp),
+                echo_prompt_tokens,
+                required_choices=expected_choices,
+                prompt_batch_size=prompt_batch_size,
+            )
         else:
             output_txt = _extract_choice_output_text(parsed_resp)
             if output_txt:
@@ -3918,6 +3977,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 expected_choices,
                 prompt_batch_size,
                 echo_prompt_chars,
+                echo_prompt_tokens,
                 expect_final_usage,
             ) = parsed_fields
             # All decoded JSON containers went out of scope inside
@@ -3937,6 +3997,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 ctx,
                 prompt_batch_size=prompt_batch_size,
                 echo_prompt_chars=echo_prompt_chars,
+                echo_prompt_tokens=echo_prompt_tokens,
                 expect_final_usage=expect_final_usage,
             )
         finally:
@@ -3956,6 +4017,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         *,
         prompt_batch_size: int = 1,
         echo_prompt_chars: Sequence[int] = (),
+        echo_prompt_tokens: Sequence[int] = (),
         expect_final_usage: bool = False,
     ) -> None:
         engine = self.server.engine
@@ -4114,6 +4176,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         expected_choices=expected_choices,
                         prompt_batch_size=prompt_batch_size,
                         echo_prompt_chars=echo_prompt_chars,
+                        echo_prompt_tokens=echo_prompt_tokens,
                         req_id=req_id,
                         req_start=req_start,
                         attempt_start=attempt_start,
@@ -4344,6 +4407,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                                 est_prompt_tokens,
                                                 parsed_resp=loaded_resp,
                                                 echo_prompt_chars=echo_prompt_chars,
+                                                echo_prompt_tokens=echo_prompt_tokens,
                                                 expected_choices=expected_choices,
                                                 prompt_batch_size=prompt_batch_size,
                                             )
@@ -4590,6 +4654,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         expected_choices: int,
         prompt_batch_size: int = 1,
         echo_prompt_chars: Sequence[int] = (),
+        echo_prompt_tokens: Sequence[int] = (),
         req_id: str,
         req_start: float,
         attempt_start: float,
@@ -5031,7 +5096,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                 first_content_ttft_ms = (time.monotonic() - req_start) * 1000.0
                             if output_txt:
                                 est_completion_chars += len(output_txt)
-                                if echo_prompt_chars:
+                                if echo_prompt_chars or echo_prompt_tokens:
                                     for c_idx, c_len in _extract_choice_output_char_counts(
                                         obj
                                     ).items():
@@ -5651,18 +5716,25 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             ):
                 if streamed_choice_token_ids_count > 0:
                     completion_tokens = streamed_choice_token_ids_count
-                else:
-                    if echo_prompt_chars:
-                        adjusted_completion_chars = _subtract_echoed_prompt_chars(
-                            est_completion_chars_by_choice,
-                            echo_prompt_chars,
-                            required_choices=required_choices,
-                            prompt_batch_size=effective_prompt_batch_size,
-                        )
-                    else:
-                        adjusted_completion_chars = est_completion_chars
+                elif echo_prompt_chars:
+                    adjusted_completion_chars = _subtract_echoed_prompt_chars(
+                        est_completion_chars_by_choice,
+                        echo_prompt_chars,
+                        required_choices=required_choices,
+                        prompt_batch_size=effective_prompt_batch_size,
+                    )
                     if adjusted_completion_chars > 0:
                         completion_tokens = max(1, (adjusted_completion_chars + 3) // 4)
+                elif echo_prompt_tokens:
+                    completion_tokens = _estimate_completion_tokens_minus_echoed_prompt_tokens(
+                        est_completion_chars_by_choice,
+                        echo_prompt_tokens,
+                        required_choices=required_choices,
+                        prompt_batch_size=effective_prompt_batch_size,
+                    )
+                else:
+                    if est_completion_chars > 0:
+                        completion_tokens = max(1, (est_completion_chars + 3) // 4)
             total_ms = (time.monotonic() - req_start) * 1000.0
             attempt_ms = (time.monotonic() - attempt_start) * 1000.0
             effective_ttft = (

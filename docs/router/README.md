@@ -8,7 +8,7 @@ Built exclusively on the Python 3 standard library (`http.server`, `http.client`
 
 ## 60-Second Quickstart
 
-> **Prerequisite for live routing (steps 3–4):** Steps 1–2 run completely offline with zero hardware. Before starting the router in step 3, ensure at least one OpenAI-compatible inference worker (for example, `llama-server --host 127.0.0.1 --port 8081 --alias qwen2.5-1.5b-q8_0 -m <model.gguf>` or `vLLM`) is already listening on one of the backend ports defined in `router/examples/hybrid-pixel-cloud.json` (`8081–8084`, or edit the config to point at your running worker URL). Without a healthy backend listening, `/v1/models` returns an empty list.
+> **Prerequisite for live routing (steps 3–4):** Steps 1–2 run completely offline with zero hardware. Before starting the router in step 3, ensure at least one OpenAI-compatible inference worker (for example, `llama-server --host 127.0.0.1 --port 8081 --alias qwen2.5-1.5b-q8_0 -m <model.gguf>` or `vLLM`) is already listening on one of the backend ports defined in `router/examples/hybrid-pixel-cloud.json` (or edit the config to point at your running worker URL). Local workers on ports `8081–8082` work standalone, while the Cloud TPU entries on ports `8083` and `8084` also configure `tpu_exporter_url` readiness checks (`127.0.0.1:9400/metrics` and `127.0.0.1:9401/metrics`) and require reachable `ops/tpu-exporter/tpu_exporter.py` instances before the router marks them healthy. Without a healthy backend listening, `/v1/models` returns an empty list.
 
 ```bash
 # 1. Run the offline end-to-end self-test suite (zero TPU hardware required)
