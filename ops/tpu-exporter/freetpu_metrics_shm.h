@@ -47,7 +47,7 @@ extern "C" {
 
 #define FREETPU_METRICS_SHM_DEFAULT_DIR             "/run/freetpu-metrics"
 #define FREETPU_METRICS_SHM_FILE_PREFIX             "freetpu_metrics_"
-#define FREETPU_METRICS_SHM_MAGIC                   0x46545055u /* "FTPU" little-endian */
+#define FREETPU_METRICS_SHM_MAGIC                   0x55505446u /* "FTPU" little-endian ('F','T','P','U') */
 #define FREETPU_METRICS_SHM_VERSION                 1u
 #define FREETPU_METRICS_SHM_SIZE                    56u
 #define FREETPU_METRICS_SHM_DEFAULT_MAX_AGE_SECONDS 30u

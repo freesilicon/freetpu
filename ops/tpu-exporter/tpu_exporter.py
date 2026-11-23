@@ -106,7 +106,7 @@ _MEM_PAIR_RE = re.compile(
 _PCT_RE = re.compile(r"(?<![0-9A-Za-z._+-])([+-]?[0-9]+(?:\.[0-9]+)?)\s*%")
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
-FREETPU_SHM_MAGIC = 0x46545055
+FREETPU_SHM_MAGIC = 0x55505446  # ASCII "FTPU" in little-endian byte order ('F','T','P','U')
 FREETPU_SHM_VERSION = 1
 DEFAULT_SHM_ROOT = Path("/run/freetpu-metrics")
 DEFAULT_SHM_MAX_AGE_S = 30.0
@@ -2099,13 +2099,37 @@ def _row_has_complete_utilization(row: _TpuInfoRow) -> bool:
     )
 
 
-def _expected_runtime_ids_for_devices(
+def _resolve_raw_device_runtime_ids(
     devices: Sequence[TpuTelemetry],
     shared_vfio: set[str],
     chip_id_map: Optional[Dict[str, str]],
-) -> set[str]:
-    """Return the set of non-ambiguous expected runtime IDs established by
-    verified sysfs `chip_id` and/or explicit `--chip-id-map`."""
+) -> Tuple[Dict[str, Optional[str]], set[str]]:
+    """Resolve per-BDF runtime IDs and post-override ambiguous IDs.
+
+    Checks raw sysfs `chip_id` sharing BEFORE applying `--chip-id-map` overrides:
+    if >1 PCI device shares a raw sysfs `chip_id` (e.g. Ironwood sibling PCI
+    functions sharing a physical chip ID), neither that shared raw ID nor any
+    unmapped function of that multi-core generation may inherit a physical sysfs
+    `chip_id` as a logical runtime core ID when a partial `--chip-id-map` maps
+    only its sibling.
+    """
+    raw_sysfs_counts: Dict[str, int] = {}
+    raw_sysfs_gen_counts: Dict[Tuple[str, str], int] = {}
+    for dev in devices:
+        if dev.runtime_chip_id:
+            raw_sysfs_counts[dev.runtime_chip_id] = (
+                raw_sysfs_counts.get(dev.runtime_chip_id, 0) + 1
+            )
+            raw_sysfs_gen_counts[(dev.generation, dev.runtime_chip_id)] = (
+                raw_sysfs_gen_counts.get((dev.generation, dev.runtime_chip_id), 0) + 1
+            )
+    shared_raw_sysfs_ids = {rid for rid, cnt in raw_sysfs_counts.items() if cnt > 1}
+    physical_sysfs_gens = {
+        gen
+        for (gen, _rid), cnt in raw_sysfs_gen_counts.items()
+        if cnt > 1 and _GEN_DEVICES_PER_CHIP.get(gen, 1) > 1
+    }
+
     resolved_by_bdf: Dict[str, Optional[str]] = {}
     claimants: Dict[str, List[str]] = {}
     for dev in devices:
@@ -2117,12 +2141,29 @@ def _expected_runtime_ids_for_devices(
                 mapped = chip_id_map.get(dev.vfio_device)
             if mapped is not None:
                 rt_id = str(mapped).strip() or None
-        if not rt_id:
-            rt_id = dev.runtime_chip_id
+        if not rt_id and dev.runtime_chip_id:
+            if (
+                dev.runtime_chip_id not in shared_raw_sysfs_ids
+                and dev.generation not in physical_sysfs_gens
+            ):
+                rt_id = dev.runtime_chip_id
         resolved_by_bdf[dev.pci_bdf] = rt_id
         if rt_id:
             claimants.setdefault(rt_id, []).append(dev.pci_bdf)
     ambiguous = {rt for rt, bdfs in claimants.items() if len(bdfs) > 1}
+    return resolved_by_bdf, ambiguous
+
+
+def _expected_runtime_ids_for_devices(
+    devices: Sequence[TpuTelemetry],
+    shared_vfio: set[str],
+    chip_id_map: Optional[Dict[str, str]],
+) -> set[str]:
+    """Return the set of non-ambiguous expected runtime IDs established by
+    verified sysfs `chip_id` and/or explicit `--chip-id-map`."""
+    resolved_by_bdf, ambiguous = _resolve_raw_device_runtime_ids(
+        devices, shared_vfio, chip_id_map
+    )
     return {
         rt
         for rt in resolved_by_bdf.values()
@@ -2318,31 +2359,11 @@ def _resolve_device_runtime_mapping(
     ambiguous so it remains keyed strictly by runtime ID (`pci_bdf="unmapped"`).
     """
     util_rows = {k: r for k, r in parsed_rows.items() if r.in_util_table}
-    resolved_rt_ids: Dict[str, Optional[str]] = {}
-    rt_id_claimants: Dict[str, List[str]] = {}
+    resolved_rt_ids, ambiguous_rt_ids = _resolve_raw_device_runtime_ids(
+        devices, shared_vfio, chip_id_map
+    )
     prospective_util_key: Dict[str, Optional[str]] = {}
     util_key_claimants: Dict[str, List[str]] = {}
-
-    for dev in devices:
-        is_shared_vfio = bool(dev.vfio_device and dev.vfio_device in shared_vfio)
-        verified_runtime_id: Optional[str] = None
-        # Explicit operator `--chip-id-map` overrides sysfs `chip_id` before
-        # duplicate detection so dual-function Ironwood hosts where sibling
-        # PCI functions share a physical sysfs `chip_id` can still supply unique
-        # per-BDF logical runtime core IDs.
-        if chip_id_map:
-            mapped = chip_id_map.get(dev.pci_bdf)
-            if mapped is None and not is_shared_vfio and dev.vfio_device:
-                mapped = chip_id_map.get(dev.vfio_device)
-            if mapped is not None:
-                verified_runtime_id = str(mapped).strip() or None
-        if not verified_runtime_id:
-            verified_runtime_id = dev.runtime_chip_id
-        resolved_rt_ids[dev.pci_bdf] = verified_runtime_id
-        if verified_runtime_id:
-            rt_id_claimants.setdefault(verified_runtime_id, []).append(dev.pci_bdf)
-
-    ambiguous_rt_ids = {rt for rt, bdfs in rt_id_claimants.items() if len(bdfs) > 1}
 
     for dev in devices:
         is_shared_vfio = bool(dev.vfio_device and dev.vfio_device in shared_vfio)
@@ -2598,9 +2619,9 @@ def collect_snapshot(
             dev.telemetry_source = _format_row_source(chips_row)
 
         rt_id = resolved_rt_ids.get(dev.pci_bdf)
-        if rt_id in ambiguous_rt_ids:
+        if rt_id is None or rt_id in ambiguous_rt_ids:
             dev.runtime_chip_id = None
-        elif rt_id:
+        else:
             dev.runtime_chip_id = rt_id
 
         matched_key = prospective_util_key.get(dev.pci_bdf)

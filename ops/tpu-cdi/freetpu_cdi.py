@@ -492,27 +492,38 @@ def _iommufd_cdev_usable(
     dev_root: Path,
     *,
     allow_missing_vfio: bool,
+    require_all: bool = True,
 ) -> bool:
-    """Return True iff every discovered TPU exposes a verified iommufd VFIO cdev."""
+    """Return True iff all (or when `require_all=False`, at least one full IOMMU
+    group of) discovered TPUs expose verified iommufd VFIO cdevs."""
     if not tpu_candidates:
         return False
+    group_ok: Dict[str, bool] = {}
     for entry, _device_id, _gen, _model_name in tpu_candidates:
+        iommu_group = _read_symlink_name(entry / "iommu_group") or ""
+        entry_ok = True
         try:
             cdev_name, kernel_cdev_dn = _resolve_iommufd_cdev(entry, sysfs_root)
         except RuntimeError:
-            return False
-        if not allow_missing_vfio:
+            entry_ok = False
+            cdev_name, kernel_cdev_dn = "", None
+        if entry_ok and not allow_missing_vfio:
             cdev_path = dev_root / "vfio" / "devices" / cdev_name
             if not cdev_path.exists():
-                return False
-            actual_cdev_dn = _stat_char_devnum(cdev_path)
-            if (
-                actual_cdev_dn is None
-                or kernel_cdev_dn is None
-                or actual_cdev_dn != kernel_cdev_dn
-            ):
-                return False
-    return True
+                entry_ok = False
+            else:
+                actual_cdev_dn = _stat_char_devnum(cdev_path)
+                if (
+                    actual_cdev_dn is None
+                    or kernel_cdev_dn is None
+                    or actual_cdev_dn != kernel_cdev_dn
+                ):
+                    entry_ok = False
+        if not entry_ok and require_all:
+            return False
+        if iommu_group:
+            group_ok[iommu_group] = group_ok.get(iommu_group, True) and entry_ok
+    return True if require_all else any(group_ok.values())
 
 
 def _legacy_vfio_groups_usable(
@@ -521,27 +532,34 @@ def _legacy_vfio_groups_usable(
     dev_root: Path,
     *,
     allow_missing_vfio: bool,
+    require_all: bool = True,
 ) -> bool:
-    """Return True iff every discovered TPU exposes a verified legacy `/dev/vfio/<group>` node."""
+    """Return True iff all (or when `require_all=False`, at least one)
+    discovered TPU IOMMU groups expose verified legacy `/dev/vfio/<group>` nodes."""
     if not tpu_candidates:
         return False
+    group_ok: Dict[str, bool] = {}
     for entry, _device_id, _gen, _model_name in tpu_candidates:
         iommu_group = _read_symlink_name(entry / "iommu_group") or ""
-        if not iommu_group:
-            return False
-        if not allow_missing_vfio:
+        entry_ok = bool(iommu_group)
+        if entry_ok and not allow_missing_vfio:
             group_path = dev_root / "vfio" / iommu_group
             if not group_path.exists():
-                return False
-            actual_group_dn = _stat_char_devnum(group_path)
-            kernel_group_dn = _read_kernel_vfio_devnum(sysfs_root, group=iommu_group)
-            if (
-                actual_group_dn is None
-                or kernel_group_dn is None
-                or actual_group_dn != kernel_group_dn
-            ):
-                return False
-    return True
+                entry_ok = False
+            else:
+                actual_group_dn = _stat_char_devnum(group_path)
+                kernel_group_dn = _read_kernel_vfio_devnum(sysfs_root, group=iommu_group)
+                if (
+                    actual_group_dn is None
+                    or kernel_group_dn is None
+                    or actual_group_dn != kernel_group_dn
+                ):
+                    entry_ok = False
+        if not entry_ok and require_all:
+            return False
+        if iommu_group:
+            group_ok[iommu_group] = group_ok.get(iommu_group, True) and entry_ok
+    return True if require_all else any(group_ok.values())
 
 
 def discover_tpu_chips(
@@ -656,7 +674,24 @@ def discover_tpu_chips(
                     dev_root,
                     allow_missing_vfio=allow_missing_vfio,
                 )
-                use_iommufd = iommu_ctrl_usable and cdevs_usable
+                if iommu_ctrl_usable and cdevs_usable:
+                    use_iommufd = True
+                elif legacy_ctrl_usable and _legacy_vfio_groups_usable(
+                    tpu_candidates,
+                    sysfs_root,
+                    dev_root,
+                    allow_missing_vfio=allow_missing_vfio,
+                    require_all=False,
+                ):
+                    use_iommufd = False
+                else:
+                    use_iommufd = iommu_ctrl_usable and _iommufd_cdev_usable(
+                        tpu_candidates,
+                        sysfs_root,
+                        dev_root,
+                        allow_missing_vfio=allow_missing_vfio,
+                        require_all=False,
+                    )
         else:
             use_iommufd = False
 
@@ -718,7 +753,9 @@ def discover_tpu_chips(
                     f"does not match kernel sysfs {kernel_label} {kernel_container_dn!r}"
                 )
 
-    chips: List[DiscoveredChip] = []
+    candidate_chips: List[DiscoveredChip] = []
+    failed_vfio_groups: set[str] = set()
+    first_vfio_node_error: Optional[Exception] = None
     for entry, device_id, gen, model_name in tpu_candidates:
         driver = _read_symlink_name(entry / "driver") or "unbound"
         if driver != "vfio-pci" and not allow_missing_vfio:
@@ -760,64 +797,93 @@ def discover_tpu_chips(
         numa_node = _parse_numa_node(entry)
         pcie_root = _resolve_pcie_root_complex(entry)
 
+        # If a single IOMMU group loses its `/dev/vfio/<group>` or iommufd cdev
+        # node (or fails per-group char/devnum verification) while its PCI entry
+        # remains in sysfs, withdraw that entire IOMMU group and any selectors
+        # depending on it rather than aborting discovery for independently
+        # verified healthy groups on other NUMA slices. Fail closed with the
+        # captured error if zero verified groups remain.
         if use_iommufd:
-            cdev_name, kernel_cdev_dn = _resolve_iommufd_cdev(entry, sysfs_root)
+            try:
+                cdev_name, kernel_cdev_dn = _resolve_iommufd_cdev(entry, sysfs_root)
+            except RuntimeError as exc:
+                if allow_missing_vfio:
+                    raise
+                failed_vfio_groups.add(iommu_group)
+                if first_vfio_node_error is None:
+                    first_vfio_node_error = exc
+                continue
             vfio_host_path = dev_root / "vfio" / "devices" / cdev_name
             vfio_container_path = f"/dev/vfio/devices/{cdev_name}"
             chip_vfio_mode = "iommufd"
             iommufd_cdev = cdev_name
             if not allow_missing_vfio:
+                node_exc: Optional[Exception] = None
                 if not vfio_host_path.exists():
-                    raise FileNotFoundError(
+                    node_exc = FileNotFoundError(
                         f"iommufd VFIO cdev not found for {entry.name}: {vfio_host_path}"
                     )
-                actual_cdev_dn = _stat_char_devnum(vfio_host_path)
-                if actual_cdev_dn is None:
-                    raise RuntimeError(
-                        f"iommufd VFIO cdev for {entry.name} is not a character device: {vfio_host_path}"
-                    )
-                if kernel_cdev_dn is None:
-                    raise RuntimeError(
-                        f"Unable to verify kernel device number for iommufd VFIO cdev {cdev_name} ({entry.name}): "
-                        f"missing {entry}/vfio-dev/{cdev_name}/dev"
-                    )
-                if actual_cdev_dn != kernel_cdev_dn:
-                    raise RuntimeError(
-                        f"iommufd VFIO cdev {vfio_host_path} for {entry.name} has device number "
-                        f"{actual_cdev_dn!r}, which does not match kernel sysfs {cdev_name}/dev {kernel_cdev_dn!r}"
-                    )
+                else:
+                    actual_cdev_dn = _stat_char_devnum(vfio_host_path)
+                    if actual_cdev_dn is None:
+                        node_exc = RuntimeError(
+                            f"iommufd VFIO cdev for {entry.name} is not a character device: {vfio_host_path}"
+                        )
+                    elif kernel_cdev_dn is None:
+                        node_exc = RuntimeError(
+                            f"Unable to verify kernel device number for iommufd VFIO cdev {cdev_name} ({entry.name}): "
+                            f"missing {entry}/vfio-dev/{cdev_name}/dev"
+                        )
+                    elif actual_cdev_dn != kernel_cdev_dn:
+                        node_exc = RuntimeError(
+                            f"iommufd VFIO cdev {vfio_host_path} for {entry.name} has device number "
+                            f"{actual_cdev_dn!r}, which does not match kernel sysfs {cdev_name}/dev {kernel_cdev_dn!r}"
+                        )
+                if node_exc is not None:
+                    failed_vfio_groups.add(iommu_group)
+                    if first_vfio_node_error is None:
+                        first_vfio_node_error = node_exc
+                    continue
         else:
             vfio_host_path = dev_root / "vfio" / iommu_group
             vfio_container_path = f"/dev/vfio/{iommu_group}"
             chip_vfio_mode = "vfio-group"
             iommufd_cdev = None
             if not allow_missing_vfio:
+                node_exc = None
                 if not vfio_host_path.exists():
-                    raise FileNotFoundError(
+                    node_exc = FileNotFoundError(
                         f"VFIO group node not found for {entry.name}: {vfio_host_path}"
                     )
-                actual_group_dn = _stat_char_devnum(vfio_host_path)
-                if actual_group_dn is None:
-                    raise RuntimeError(
-                        f"VFIO group node for {entry.name} is not a character device: {vfio_host_path}"
-                    )
-                kernel_group_dn = _read_kernel_vfio_devnum(sysfs_root, group=iommu_group)
-                if kernel_group_dn is None:
-                    raise RuntimeError(
-                        f"Unable to verify kernel device number for VFIO group {iommu_group} ({entry.name}): "
-                        f"missing {sysfs_root}/class/vfio/{iommu_group}/dev and "
-                        f"{sysfs_root}/devices/virtual/vfio/{iommu_group}/dev"
-                    )
-                if actual_group_dn != kernel_group_dn:
-                    raise RuntimeError(
-                        f"VFIO group node {vfio_host_path} for {entry.name} has device number "
-                        f"{actual_group_dn!r}, which does not match kernel sysfs group {iommu_group} "
-                        f"device number {kernel_group_dn!r}"
-                    )
+                else:
+                    actual_group_dn = _stat_char_devnum(vfio_host_path)
+                    if actual_group_dn is None:
+                        node_exc = RuntimeError(
+                            f"VFIO group node for {entry.name} is not a character device: {vfio_host_path}"
+                        )
+                    else:
+                        kernel_group_dn = _read_kernel_vfio_devnum(sysfs_root, group=iommu_group)
+                        if kernel_group_dn is None:
+                            node_exc = RuntimeError(
+                                f"Unable to verify kernel device number for VFIO group {iommu_group} ({entry.name}): "
+                                f"missing {sysfs_root}/class/vfio/{iommu_group}/dev and "
+                                f"{sysfs_root}/devices/virtual/vfio/{iommu_group}/dev"
+                            )
+                        elif actual_group_dn != kernel_group_dn:
+                            node_exc = RuntimeError(
+                                f"VFIO group node {vfio_host_path} for {entry.name} has device number "
+                                f"{actual_group_dn!r}, which does not match kernel sysfs group {iommu_group} "
+                                f"device number {kernel_group_dn!r}"
+                            )
+                if node_exc is not None:
+                    failed_vfio_groups.add(iommu_group)
+                    if first_vfio_node_error is None:
+                        first_vfio_node_error = node_exc
+                    continue
 
-        chips.append(
+        candidate_chips.append(
             DiscoveredChip(
-                index=len(chips),
+                index=len(candidate_chips),
                 pci_bdf=entry.name,
                 vendor_id=GOOGLE_PCI_VENDOR_ID,
                 device_id=device_id,
@@ -836,7 +902,36 @@ def discover_tpu_chips(
             )
         )
 
+    # Drop every sibling belonging to any failed IOMMU group so shared groups
+    # (e.g. in iommufd cdev mode) are never partially exposed, then re-index.
+    chips: List[DiscoveredChip] = []
+    for cand in candidate_chips:
+        if cand.iommu_group in failed_vfio_groups:
+            continue
+        chips.append(
+            DiscoveredChip(
+                index=len(chips),
+                pci_bdf=cand.pci_bdf,
+                vendor_id=cand.vendor_id,
+                device_id=cand.device_id,
+                generation=cand.generation,
+                model_name=cand.model_name,
+                driver=cand.driver,
+                iommu_group=cand.iommu_group,
+                vfio_host_path=cand.vfio_host_path,
+                vfio_container_path=cand.vfio_container_path,
+                non_tpu_group_members=cand.non_tpu_group_members,
+                numa_node=cand.numa_node,
+                pcie_root=cand.pcie_root,
+                vfio_mode=cand.vfio_mode,
+                iommufd_cdev=cand.iommufd_cdev,
+                runtime_chip_id=cand.runtime_chip_id,
+            )
+        )
+
     if not chips:
+        if first_vfio_node_error is not None:
+            raise first_vfio_node_error
         raise RuntimeError(
             f"No known Google TPU PCI devices (vendor={GOOGLE_PCI_VENDOR_ID}) found under {pci_dir}"
         )
@@ -3323,7 +3418,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         try:
             parsed_chip_map = _load_chip_id_map(args.chip_id_map)
         except Exception as exc:  # noqa: BLE001
-            sys.stderr.write(f"freetpu-cdi generate failed: invalid --chip-id-map: {exc}\n")
+            drift_suffix = ""
+            if not args.stdout and not args.allow_missing_vfio:
+                drift_suffix = _revalidate_existing_spec_on_map_failure(
+                    args.output,
+                    sysfs_root=args.sysfs_root,
+                    dev_root=args.dev_root,
+                    iommu_dev_path=args.iommu_dev,
+                    vfio_mode=args.vfio_mode,
+                )
+            sys.stderr.write(
+                f"freetpu-cdi generate failed: invalid --chip-id-map: {exc}{drift_suffix}\n"
+            )
             return 1
 
         try:

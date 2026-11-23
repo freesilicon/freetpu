@@ -4025,8 +4025,21 @@ TPU Runtime Utilization
                     runtime_metrics_addr="127.0.0.1:8431",
                     shm_root=iw_shared_root / "no-shm",
                 )
+                # Partial `--chip-id-map` covering ONLY one function of physical chip 1
+                # (`0000:00:05.0 -> "2"`) MUST NOT let unmapped sibling `0000:00:05.1`
+                # inherit physical sysfs `chip_id="1"` as logical core `"1"`.
+                iw_shared_partial = _te.collect_snapshot(
+                    sysfs_root=iw_shared_sysfs,
+                    dev_root=iw_shared_dev,
+                    proc_root=iw_shared_proc,
+                    tpu_info_bin="tpu-info",
+                    chip_id_map={"0000:00:05.0": "2"},
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=iw_shared_root / "no-shm",
+                )
             # Without --chip-id-map, shared sysfs chip_id stays safely unmapped.
             self.assertTrue(all(d.hbm_used_bytes is None for d in iw_shared_unmapped.devices))
+            self.assertTrue(all(d.runtime_chip_id is None for d in iw_shared_unmapped.devices))
             # With explicit per-BDF --chip-id-map, all 8 cores attach to their exact PCI BDFs!
             self.assertEqual(
                 [d.runtime_chip_id for d in iw_shared_mapped.devices],
@@ -4040,6 +4053,18 @@ TPU Runtime Utilization
                 [d.duty_cycle_percent for d in iw_shared_mapped.devices],
                 [11.0 * (i + 1) for i in range(8)],
             )
+            partial_by_bdf = {d.pci_bdf: d for d in iw_shared_partial.devices}
+            self.assertEqual(partial_by_bdf["0000:00:05.0"].runtime_chip_id, "2")
+            self.assertEqual(partial_by_bdf["0000:00:05.0"].hbm_used_bytes, 3 * 8 * 1024**3)
+            self.assertEqual(partial_by_bdf["0000:00:05.0"].duty_cycle_percent, 33.0)
+            for bdf, dev in partial_by_bdf.items():
+                if bdf != "0000:00:05.0":
+                    self.assertIsNone(dev.runtime_chip_id, f"{bdf} must not inherit physical chip_id")
+                    self.assertIsNone(dev.hbm_used_bytes, f"{bdf} must not join HBM without core ID")
+                    self.assertIsNone(dev.duty_cycle_percent, f"{bdf} must not join duty without core ID")
+            partial_rt_by_id = {u.runtime_chip: u for u in iw_shared_partial.runtime_utilization}
+            self.assertEqual(partial_rt_by_id["2"].mapped_pci_bdf, "0000:00:05.0")
+            self.assertIsNone(partial_rt_by_id["1"].mapped_pci_bdf)
 
             # Custom `--tpu-info-bin` specified by bare name (without `/`) MUST invoke
             # that configured executable via PATH instead of taking the default gRPC shortcut.
@@ -4241,6 +4266,9 @@ TPU Runtime Utilization
             )
 
             now_ns = time.time_ns()
+            self.assertEqual(struct.pack("<I", tpu_exporter.FREETPU_SHM_MAGIC), b"FTPU")
+            shm_header = (EXPORTER_DIR / "freetpu_metrics_shm.h").read_text(encoding="utf-8")
+            self.assertIn("0x55505446u", shm_header)
             shm_file = shm_root / "freetpu_metrics_0000:00:0b.0"
             payload = struct.pack(
                 "<IIQQQQQQ",

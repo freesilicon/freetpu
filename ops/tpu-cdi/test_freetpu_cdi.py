@@ -4768,6 +4768,207 @@ class FreeTpuCdiTests(unittest.TestCase):
             self.assertIn("--chip-id-map", dra_text)
             self.assertIn("TPU_ACCELERATOR_TYPE", dra_text)
 
+    def test_missing_vfio_group_node_retains_healthy_numa_slice_and_withdraws_broken_group(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            v6e8_devices = [
+                {
+                    "bdf": f"0000:00:{4 + i:02x}.0",
+                    "vendor": "0x1ae0",
+                    "device": "0x006f",
+                    "driver": "vfio-pci",
+                    "iommu_group": str(i),
+                    "numa_node": "0",
+                    "chip_id": str(i),
+                }
+                for i in range(4)
+            ] + [
+                {
+                    "bdf": f"0000:80:{4 + i:02x}.0",
+                    "vendor": "0x1ae0",
+                    "device": "0x006f",
+                    "driver": "vfio-pci",
+                    "iommu_group": str(4 + i),
+                    "numa_node": "1",
+                    "chip_id": str(4 + i),
+                }
+                for i in range(4)
+            ]
+            sysfs_root, dev_root = _make_mock_pci_vfio(
+                root / "v6e8_partial_vfio",
+                devices=v6e8_devices,
+                create_vfio_nodes=[str(i) for i in range(8)],
+            )
+            spec_path = root / "cdi" / "freetpu.json"
+
+            with _mock_vfio_char_devices():
+                ok_full, msg_full = freetpu_cdi.reconcile_cdi_spec(
+                    spec_path, sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                self.assertTrue(ok_full, msg_full)
+                full_spec = json.loads(spec_path.read_text(encoding="utf-8"))
+                full_names = {d["name"] for d in full_spec["devices"]}
+                self.assertIn("numa0-pcie-0000-00-4", full_names)
+                self.assertIn("numa1-pcie-0000-80-4", full_names)
+
+                # Group 7 loses `/dev/vfio/7` while `0000:80:07.0` stays in PCI sysfs.
+                (dev_root / "vfio" / "7").unlink()
+
+                # Old 8-chip spec fails host validation because `/dev/vfio/7` is gone.
+                stale_errs = freetpu_cdi.verify_spec_against_host(
+                    full_spec, sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                self.assertTrue(any("does not exist" in e for e in stale_errs), stale_errs)
+
+                # `reconcile_cdi_spec` / `sync` keeps the healthy NUMA 0 slice published
+                # and withdraws group 7 + the broken NUMA 1 slice instead of deleting the spec.
+                ok_deg, msg_deg = freetpu_cdi.reconcile_cdi_spec(
+                    spec_path, sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                self.assertTrue(ok_deg, msg_deg)
+                self.assertTrue(spec_path.exists())
+                deg_spec = json.loads(spec_path.read_text(encoding="utf-8"))
+                deg_names = {d["name"] for d in deg_spec["devices"]}
+                self.assertIn("numa0-pcie-0000-00-4", deg_names)
+                self.assertIn("0-3", deg_names)
+                self.assertNotIn("numa1-pcie-0000-80-4", deg_names)
+                self.assertNotIn("4-7", deg_names)
+                self.assertNotIn("pci-0000-80-07-0", deg_names)
+                self.assertIn("pci-0000-80-06-0", deg_names)
+                self.assertEqual(
+                    freetpu_cdi.verify_spec_against_host(
+                        deg_spec, sysfs_root=sysfs_root, dev_root=dev_root
+                    ),
+                    [],
+                )
+
+                # When ALL remaining `/dev/vfio/<group>` nodes vanish, fail closed and remove stale spec.
+                for i in range(7):
+                    (dev_root / "vfio" / str(i)).unlink()
+                ok_all_gone, msg_all_gone = freetpu_cdi.reconcile_cdi_spec(
+                    spec_path, sysfs_root=sysfs_root, dev_root=dev_root
+                )
+                self.assertFalse(ok_all_gone)
+                self.assertIn("removed stale", msg_all_gone)
+                self.assertFalse(spec_path.exists())
+
+            # Shared IOMMU group in iommufd mode: losing one sibling cdev must withdraw
+            # the ENTIRE shared group (no partial exposure) while retaining healthy group 8.
+            sh_sys, sh_dev = _make_mock_pci_vfio(
+                root / "shared_iommufd_partial",
+                devices=[
+                    {
+                        "bdf": "0000:00:0b.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "7",
+                        "iommufd_cdev": "vfio0",
+                    },
+                    {
+                        "bdf": "0000:00:0c.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "7",
+                        "iommufd_cdev": "vfio1",
+                    },
+                    {
+                        "bdf": "0000:80:01.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "8",
+                        "iommufd_cdev": "vfio2",
+                    },
+                ],
+                create_vfio_container=False,
+                create_vfio_nodes=[],
+                create_iommu=True,
+                create_iommufd_cdevs=["vfio0", "vfio2"],  # vfio1 missing!
+            )
+            with _mock_vfio_char_devices():
+                sh_chips, _sh_ctrl = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=sh_sys, dev_root=sh_dev, vfio_mode="iommufd"
+                )
+                self.assertEqual([c.pci_bdf for c in sh_chips], ["0000:80:01.0"])
+
+    def test_generate_invalid_chip_map_revalidates_and_withdraws_on_hardware_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sysfs_root, dev_root = _make_mock_pci_vfio(
+                root,
+                devices=[
+                    {
+                        "bdf": "0000:00:06.0",
+                        "vendor": "0x1ae0",
+                        "device": "0x006f",
+                        "driver": "vfio-pci",
+                        "iommu_group": "0",
+                    }
+                ],
+                create_vfio_nodes=["0"],
+            )
+            spec_path = root / "cdi" / "freetpu.json"
+            map_path = root / "chip_map.json"
+            map_path.write_text('{"0000:00:06.0": 0}\n', encoding="utf-8")
+
+            with _mock_vfio_char_devices():
+                rc_ok, _out, err = _run_cli_inproc(
+                    [
+                        "generate",
+                        "--output",
+                        str(spec_path),
+                        "--chip-id-map",
+                        str(map_path),
+                        "--sysfs-root",
+                        str(sysfs_root),
+                        "--dev-root",
+                        str(dev_root),
+                    ]
+                )
+                self.assertEqual(rc_ok, 0, err)
+                self.assertTrue(spec_path.exists())
+
+                # Malformed chip map with intact hardware preserves the live spec.
+                map_path.write_text("{not-json", encoding="utf-8")
+                rc_intact, _out2, err2 = _run_cli_inproc(
+                    [
+                        "generate",
+                        "--output",
+                        str(spec_path),
+                        "--chip-id-map",
+                        str(map_path),
+                        "--sysfs-root",
+                        str(sysfs_root),
+                        "--dev-root",
+                        str(dev_root),
+                    ]
+                )
+                self.assertNotEqual(rc_intact, 0)
+                self.assertIn("invalid --chip-id-map", err2)
+                self.assertTrue(spec_path.exists())
+
+                # Confirmed hardware drift (VFIO node disappeared) + malformed chip map withdraws stale spec.
+                (dev_root / "vfio" / "0").unlink()
+                rc_drift, _out3, err3 = _run_cli_inproc(
+                    [
+                        "generate",
+                        "--output",
+                        str(spec_path),
+                        "--chip-id-map",
+                        str(map_path),
+                        "--sysfs-root",
+                        str(sysfs_root),
+                        "--dev-root",
+                        str(dev_root),
+                    ]
+                )
+                self.assertNotEqual(rc_drift, 0)
+                self.assertIn("confirmed hardware drift", err3)
+                self.assertIn("removed stale", err3)
+                self.assertFalse(spec_path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
