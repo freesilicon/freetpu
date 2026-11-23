@@ -7,8 +7,9 @@ to generate a boot-scoped CNCF Container Device Interface (CDI) specification
 (default: CDI v0.6.0 for broad containerd 2.0/2.1+ compatibility, with opt-in
 `--cdi-version 1.1.0`, output default: /var/run/cdi/freetpu.json) exposing:
   - `freetpu.dev/tpu=pci-<bdf>` (and `group-pci-...` for shared IOMMU groups)
-  - NUMA / PCIe-root-complex-aware 4-chip sub-host presets (`numa0`, `numa1`,
-    `0-3`, `4-7`) on multi-root hosts (e.g. Cloud TPU v6e-8 `0000:00` vs `0000:80`)
+  - NUMA / PCIe-root-complex-aware capacity-pinned sub-host presets (`numa0-4`,
+    `numa1-4`, `pcie0-4`, `0-3`, `4-7`) on multi-root hosts (e.g. Cloud TPU v6e-8
+    `0000:00` vs `0000:80`)
   - `freetpu.dev/tpu=all`
 
 Also supports:
@@ -421,6 +422,64 @@ def _load_chip_id_map(raw: Optional[str]) -> Optional[Dict[str, int]]:
     return result
 
 
+def _iommufd_cdev_usable(
+    tpu_candidates: Sequence[Tuple[Path, str, str, str]],
+    sysfs_root: Path,
+    dev_root: Path,
+    *,
+    allow_missing_vfio: bool,
+) -> bool:
+    """Return True iff every discovered TPU exposes a verified iommufd VFIO cdev."""
+    if not tpu_candidates:
+        return False
+    for entry, _device_id, _gen, _model_name in tpu_candidates:
+        try:
+            cdev_name, kernel_cdev_dn = _resolve_iommufd_cdev(entry, sysfs_root)
+        except RuntimeError:
+            return False
+        if not allow_missing_vfio:
+            cdev_path = dev_root / "vfio" / "devices" / cdev_name
+            if not cdev_path.exists():
+                return False
+            actual_cdev_dn = _stat_char_devnum(cdev_path)
+            if (
+                actual_cdev_dn is None
+                or kernel_cdev_dn is None
+                or actual_cdev_dn != kernel_cdev_dn
+            ):
+                return False
+    return True
+
+
+def _legacy_vfio_groups_usable(
+    tpu_candidates: Sequence[Tuple[Path, str, str, str]],
+    sysfs_root: Path,
+    dev_root: Path,
+    *,
+    allow_missing_vfio: bool,
+) -> bool:
+    """Return True iff every discovered TPU exposes a verified legacy `/dev/vfio/<group>` node."""
+    if not tpu_candidates:
+        return False
+    for entry, _device_id, _gen, _model_name in tpu_candidates:
+        iommu_group = _read_symlink_name(entry / "iommu_group") or ""
+        if not iommu_group:
+            return False
+        if not allow_missing_vfio:
+            group_path = dev_root / "vfio" / iommu_group
+            if not group_path.exists():
+                return False
+            actual_group_dn = _stat_char_devnum(group_path)
+            kernel_group_dn = _read_kernel_vfio_devnum(sysfs_root, group=iommu_group)
+            if (
+                actual_group_dn is None
+                or kernel_group_dn is None
+                or actual_group_dn != kernel_group_dn
+            ):
+                return False
+    return True
+
+
 def discover_tpu_chips(
     sysfs_root: Path = Path("/sys"),
     dev_root: Path = Path("/dev"),
@@ -443,6 +502,24 @@ def discover_tpu_chips(
     pci_dir = sysfs_root / "bus" / "pci" / "devices"
     if not pci_dir.is_dir():
         raise FileNotFoundError(f"PCI sysfs directory not found: {pci_dir}")
+
+    pci_entries = sorted(pci_dir.iterdir(), key=lambda p: p.name)
+    group_members, kernel_group_members = _collect_iommu_group_members(sysfs_root, pci_entries)
+
+    tpu_candidates: List[Tuple[Path, str, str, str]] = []
+    tpu_bdfs: set[str] = set()
+    for entry in pci_entries:
+        vendor_raw = _read_text(entry / "vendor")
+        if not vendor_raw or _normalize_hex_id(vendor_raw) != GOOGLE_PCI_VENDOR_ID:
+            continue
+
+        device_id = _normalize_hex_id(_read_text(entry / "device") or "0x0000")
+        if device_id not in TPU_PCI_DEVICES:
+            # Skip non-TPU Google PCI functions under vendor 0x1ae0 (e.g. gVNIC 0x0042).
+            continue
+        gen, model_name = TPU_PCI_DEVICES[device_id]
+        tpu_candidates.append((entry, device_id, gen, model_name))
+        tpu_bdfs.add(entry.name)
 
     legacy_control = dev_root / "vfio" / "vfio"
     effective_iommu = (
@@ -475,10 +552,30 @@ def discover_tpu_chips(
     elif norm_mode == "legacy":
         use_iommufd = False
     else:
-        # auto: preserve native legacy VFIO whenever its control node exists;
-        # use iommufd when legacy /dev/vfio/vfio is absent OR is a compatibility
-        # symlink/node to /dev/iommu and /dev/iommu exists.
-        use_iommufd = ((not has_legacy_control) or legacy_is_iommu_compat) and has_iommu_control
+        # auto: preserve legacy VFIO whenever its control node and group nodes
+        # are usable. On Linux kernels where `/dev/vfio/vfio` is an iommufd
+        # compatibility symlink/node (`CONFIG_IOMMUFD_VFIO_CONTAINER`), legacy
+        # `/dev/vfio/<group>` access can still be active without `vfio-dev/vfioN`
+        # cdevs enabled, so only switch to iommufd cdev automatically when legacy
+        # groups are unusable AND every TPU exposes a verified cdev.
+        if not has_legacy_control:
+            use_iommufd = has_iommu_control
+        elif legacy_is_iommu_compat and has_iommu_control:
+            groups_usable = _legacy_vfio_groups_usable(
+                tpu_candidates,
+                sysfs_root,
+                dev_root,
+                allow_missing_vfio=allow_missing_vfio,
+            )
+            cdevs_usable = _iommufd_cdev_usable(
+                tpu_candidates,
+                sysfs_root,
+                dev_root,
+                allow_missing_vfio=allow_missing_vfio,
+            )
+            use_iommufd = (not groups_usable) and cdevs_usable
+        else:
+            use_iommufd = False
 
     if use_iommufd:
         control_node = effective_iommu
@@ -504,7 +601,11 @@ def discover_tpu_chips(
                     f"does not match kernel sysfs misc/iommu/dev {kernel_iommu_dn!r}"
                 )
     else:
-        control_node = legacy_control
+        control_node = (
+            effective_iommu
+            if (legacy_is_iommu_compat and legacy_control.is_symlink())
+            else legacy_control
+        )
         if not allow_missing_vfio:
             if not control_node.exists():
                 raise FileNotFoundError(
@@ -517,35 +618,22 @@ def discover_tpu_chips(
                 raise RuntimeError(
                     f"VFIO control node is not a character device: {control_node}"
                 )
-            kernel_container_dn = _read_kernel_vfio_devnum(sysfs_root, group=None)
+            if legacy_is_iommu_compat:
+                kernel_container_dn = _read_kernel_iommu_devnum(sysfs_root)
+                kernel_label = "misc/iommu/dev"
+            else:
+                kernel_container_dn = _read_kernel_vfio_devnum(sysfs_root, group=None)
+                kernel_label = "misc/vfio/dev"
             if kernel_container_dn is None:
                 raise RuntimeError(
                     f"Unable to verify kernel device number for VFIO control node {control_node} "
-                    f"(missing {sysfs_root}/class/misc/vfio/dev and {sysfs_root}/devices/virtual/misc/vfio/dev)"
+                    f"(missing {sysfs_root}/class/{kernel_label} and {sysfs_root}/devices/virtual/{kernel_label})"
                 )
             if actual_container_dn != kernel_container_dn:
                 raise RuntimeError(
                     f"VFIO control node {control_node} device number {actual_container_dn!r} "
-                    f"does not match kernel sysfs misc/vfio/dev {kernel_container_dn!r}"
+                    f"does not match kernel sysfs {kernel_label} {kernel_container_dn!r}"
                 )
-
-    pci_entries = sorted(pci_dir.iterdir(), key=lambda p: p.name)
-    group_members, kernel_group_members = _collect_iommu_group_members(sysfs_root, pci_entries)
-
-    tpu_candidates: List[Tuple[Path, str, str, str]] = []
-    tpu_bdfs: set[str] = set()
-    for entry in pci_entries:
-        vendor_raw = _read_text(entry / "vendor")
-        if not vendor_raw or _normalize_hex_id(vendor_raw) != GOOGLE_PCI_VENDOR_ID:
-            continue
-
-        device_id = _normalize_hex_id(_read_text(entry / "device") or "0x0000")
-        if device_id not in TPU_PCI_DEVICES:
-            # Skip non-TPU Google PCI functions under vendor 0x1ae0 (e.g. gVNIC 0x0042).
-            continue
-        gen, model_name = TPU_PCI_DEVICES[device_id]
-        tpu_candidates.append((entry, device_id, gen, model_name))
-        tpu_bdfs.add(entry.name)
 
     chips: List[DiscoveredChip] = []
     for entry, device_id, gen, model_name in tpu_candidates:
@@ -1097,10 +1185,15 @@ def _compute_topology_slices(
 
         discovered_numa = d_key[1]
         pcie_root = d_key[2]
+        slice_chip_count = len(slice_phys_indices)
+        # Capacity-pinned topology selector names (`numa<node>-<chips>` /
+        # `pcie<domain>-<chips>`) ensure a degraded 4->2 chip domain withdraws
+        # `numa0-4` (failing 4-chip claims closed) instead of republishing the
+        # same selector with half its expected capacity.
         candidate_names = (
-            [f"numa{discovered_numa}"]
+            [f"numa{discovered_numa}-{slice_chip_count}"]
             if use_explicit_numa and discovered_numa is not None
-            else [f"pcie{dom_ordinal}"]
+            else [f"pcie{dom_ordinal}-{slice_chip_count}"]
         )
         verified_vis = _resolve_verified_visibility_ordinals(
             d_chips,
@@ -1203,9 +1296,7 @@ def build_cdi_spec(
     inject_single_host_env = bool(single_host_env or network_mode == "isolated")
     effective_network_mode = "isolated" if inject_single_host_env else "host"
 
-    is_iommufd = any(c.vfio_mode == "iommufd" for c in chips) or (
-        vfio_container_host_path.name == "iommu"
-    )
+    is_iommufd = any(c.vfio_mode == "iommufd" for c in chips)
     control_container_path = "/dev/iommu" if is_iommufd else "/dev/vfio/vfio"
     container_devnum = _stat_char_devnum(vfio_container_host_path)
     global_edits: Dict[str, Any] = {
@@ -1320,9 +1411,9 @@ def build_cdi_spec(
                 }
             )
 
-    # Emit NUMA / PCIe-root-complex-aware sub-host slice presets (e.g. `numa0`,
-    # `numa1`, `pcie0`, `0-3`, `4-7` on `v6e-8`) strictly within matching NUMA /
-    # PCIe root complex boundaries.
+    # Emit NUMA / PCIe-root-complex-aware capacity-pinned sub-host slice presets
+    # (e.g. `numa0-4`, `numa1-4`, `pcie0-4`, `0-3`, `4-7` on `v6e-8`) strictly
+    # within matching NUMA / PCIe root complex boundaries.
     used_names = {d["name"] for d in devices}
     for topo_slice in _compute_topology_slices(
         chips, bdf_to_phys, reserved_names=used_names, chip_id_map=chip_id_map
@@ -2338,6 +2429,17 @@ def reconcile_cdi_spec(
         return False, f"discovery failed: {exc}{suffix}"
 
     errors = validate_cdi_spec(spec)
+    if not errors:
+        errors.extend(
+            verify_spec_against_host(
+                spec,
+                sysfs_root=sysfs_root,
+                dev_root=dev_root,
+                iommu_dev_path=iommu_dev_path,
+                vfio_mode=vfio_mode,
+                chip_id_map=chip_id_map,
+            )
+        )
     if errors:
         removed, cleanup_err = _invalidate_spec(output_path)
         suffix = _format_invalidation_suffix(output_path, removed, cleanup_err)
@@ -2695,6 +2797,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         if args.validate:
             errors = validate_cdi_spec(spec)
+            if not errors and not args.allow_missing_vfio:
+                errors.extend(
+                    verify_spec_against_host(
+                        spec,
+                        sysfs_root=args.sysfs_root,
+                        dev_root=args.dev_root,
+                        iommu_dev_path=args.iommu_dev,
+                        vfio_mode=args.vfio_mode,
+                        chip_id_map=parsed_chip_map,
+                    )
+                )
             if errors:
                 if not args.stdout and not args.allow_missing_vfio:
                     removed, cleanup_err = _invalidate_spec(args.output)

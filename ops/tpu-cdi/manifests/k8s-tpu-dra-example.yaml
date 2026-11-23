@@ -44,10 +44,13 @@ spec:
 ---
 # Example ResourceSlice published by a node-local `freetpu-dra-driver` DaemonSet
 # for a single Cloud TPU v6e-8 host (`0000:00` on NUMA 0, `0000:80` on NUMA 1).
-# Note: `freetpu_cdi.py` withdraws a sub-host slice selector (e.g. `numa0`) if
-# a chip disappears and leaves an unsupported topology (such as 3 chips); a DRA
-# driver publishing `ResourceSlice` objects must reconcile against live CDI
-# selectors and withdraw degraded slices before scheduling new 4-chip claims.
+# Note: `freetpu_cdi.py` emits capacity-pinned sub-host slice selectors
+# (`numa<node>-<chips>`, e.g. `numa0-4`, `numa1-4`, or `pcie<domain>-<chips>`)
+# so if a 4-chip NUMA half drops to 3 chips (unsupported) OR 2 chips (valid
+# `numa0-2` only), `numa0-4` is withdrawn and any 4-chip claim bound to
+# `freetpu.dev/tpu=numa0-4` fails closed instead of silently shrinking. A DRA
+# driver publishing `ResourceSlice` objects must still reconcile against live
+# CDI selectors and withdraw degraded slices before scheduling new claims.
 apiVersion: resource.k8s.io/v1
 kind: ResourceSlice
 metadata:
@@ -69,7 +72,7 @@ spec:
         pcie_root:
           string: "0000:00"
         cdi_selector:
-          string: "freetpu.dev/tpu=numa0"
+          string: "freetpu.dev/tpu=numa0-4"
         chips:
           int: 4
         memoryGiB:
@@ -86,7 +89,7 @@ spec:
         pcie_root:
           string: "0000:80"
         cdi_selector:
-          string: "freetpu.dev/tpu=numa1"
+          string: "freetpu.dev/tpu=numa1-4"
         chips:
           int: 4
         memoryGiB:
