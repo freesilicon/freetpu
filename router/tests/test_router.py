@@ -7284,14 +7284,11 @@ asyncio.run(main())
         self.assertIn("hyperdisk-balanced", playbook)
         self.assertNotIn("Retained Persistent Disk", playbook)
         self.assertIn("gs://", playbook)
-        self.assertIn(
-            "export JAX_COMPILATION_CACHE_DIR=/var/cache/freetpu-xla-cache",
-            playbook,
-        )
-        self.assertIn(
-            "export VLLM_XLA_CACHE_PATH=/var/cache/freetpu-xla-cache",
-            playbook,
-        )
+        self.assertNotIn("/var/cache/freetpu-xla-cache", playbook)
+        self.assertIn("export XLA_CACHE_DIR=/mnt/disks/tpu-cache/xla", playbook)
+        self.assertIn("export JAX_COMPILATION_CACHE_DIR=/xla-cache", playbook)
+        self.assertIn("export VLLM_XLA_CACHE_PATH=/xla-cache", playbook)
+        self.assertIn("/mnt/disks/tpu-cache/xla}:/xla-cache", playbook)
         self.assertIn("-e JAX_COMPILATION_CACHE_DIR=", playbook)
         self.assertIn("-e VLLM_XLA_CACHE_PATH=", playbook)
         self.assertIn("-e LIBTPU_INIT_ARGS=", playbook)
@@ -8712,6 +8709,9 @@ asyncio.run(main())
 
         t1.join(timeout=3.0)
         self.assertEqual(first_res.get("status"), 200)
+        rel_deadline = time.monotonic() + 1.0
+        while router.engine._req_mem_used_bytes != 0 and time.monotonic() < rel_deadline:
+            time.sleep(0.01)
         self.assertEqual(router.engine._req_mem_used_bytes, 0)
 
     def test_prometheus_parser_preserves_samples_with_braces_in_quoted_labels(
@@ -9854,6 +9854,9 @@ asyncio.run(main())
 
         t.join(timeout=3.0)
         self.assertEqual(res.get("status"), 200)
+        rel_deadline = time.monotonic() + 1.0
+        while router.engine._req_mem_used_bytes != 0 and time.monotonic() < rel_deadline:
+            time.sleep(0.01)
         self.assertEqual(router.engine._req_mem_used_bytes, 0)
 
     def test_tpu_readiness_counts_all_observed_chips_when_discovery_missing_or_undercounts(
@@ -9892,6 +9895,143 @@ asyncio.run(main())
         one = parse_prometheus_text(text, max_samples=1)
         self.assertEqual(len(one), 1)
         self.assertEqual(one[0].name, "freetpu_exporter_up")
+
+    def test_stream_include_usage_interim_usage_without_final_usage_surfaces_truncation(
+        self,
+    ) -> None:
+        recorded_usage: List[UsageEvent] = []
+
+        class _CaptureHook:
+            def record_usage(self, event: UsageEvent) -> None:
+                recorded_usage.append(event)
+
+        class _InterimUsageSSEHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return None
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = json.dumps(
+                    {"object": "list", "data": [{"id": "m-interim"}]}
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802
+                clen = int(self.headers.get("Content-Length", "0"))
+                if clen > 0:
+                    self.rfile.read(clen)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                # vLLM continuous-usage style: non-empty choices chunk carries interim usage,
+                # followed by EOF BEFORE final empty-choices usage frame and [DONE].
+                self.wfile.write(
+                    b'data: {"id":"c1","object":"chat.completion.chunk","model":"m-interim",'
+                    b'"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}],'
+                    b'"usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}}\n\n'
+                    b'data: {"id":"c1","object":"chat.completion.chunk","model":"m-interim",'
+                    b'"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],'
+                    b'"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}\n\n'
+                )
+                self.wfile.flush()
+
+        srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _InterimUsageSSEHandler))
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            backends=[
+                BackendConfig(
+                    id="interim-b",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=f"http://127.0.0.1:{srv.server_address[1]}/v1",
+                    models=["m-interim"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg, usage_hook=_CaptureHook()))
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", router.server_address[1], timeout=3.0
+        )
+        try:
+            body = json.dumps(
+                {
+                    "model": "m-interim",
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                    "messages": [{"role": "user", "content": "hi"}],
+                }
+            ).encode("utf-8")
+            conn.request(
+                "POST",
+                "/v1/chat/completions",
+                body=body,
+                headers={"Content-Type": "application/json"},
+            )
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)
+            with self.assertRaises(http.client.IncompleteRead) as exc_info:
+                resp.read()
+            self.assertIn(b"upstream_stream_interrupted", exc_info.exception.partial)
+        finally:
+            conn.close()
+        self.assertEqual(len(recorded_usage), 1)
+        self.assertEqual(recorded_usage[0].status_code, 502)
+
+    def test_tpu_exporter_multi_address_connect_falls_back_when_first_addr_stalls(
+        self,
+    ) -> None:
+        from router import tpu_telemetry as telemetry_mod
+
+        exporter = self._track(_MockTpuExporter(health_status=1, generation="v6e"))
+        exp_port = exporter.server_address[1]
+        stalled_addr = ("198.51.100.1", exp_port)
+        good_addr = ("127.0.0.1", exp_port)
+        fake_infos = [
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", stalled_addr),
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", good_addr),
+        ]
+        orig_connect = socket.socket.connect
+        seen_timeouts: List[Optional[float]] = []
+
+        def _fake_connect(sock_self: socket.socket, address: Any) -> Any:
+            if address == stalled_addr:
+                t = sock_self.gettimeout()
+                seen_timeouts.append(t)
+                if t is not None and t > 0:
+                    time.sleep(min(t, 0.35))
+                raise TimeoutError("timed out")
+            return orig_connect(sock_self, address)
+
+        t0 = time.monotonic()
+        with (
+            mock.patch.object(
+                telemetry_mod, "_resolve_host_with_deadline", return_value=fake_infos
+            ),
+            mock.patch.object(socket.socket, "connect", new=_fake_connect),
+        ):
+            telem = scrape_tpu_exporter(
+                f"http://dual-stack-tpu.local:{exp_port}/metrics",
+                timeout_s=0.6,
+            )
+        elapsed = time.monotonic() - t0
+
+        self.assertTrue(telem.reachable)
+        self.assertTrue(telem.exporter_up)
+        self.assertEqual(telem.healthy_chips, 1)
+        self.assertEqual(len(seen_timeouts), 1)
+        self.assertIsNotNone(seen_timeouts[0])
+        self.assertLess(seen_timeouts[0] or 99.0, 0.4)
+        self.assertLess(elapsed, 0.6)
 
 
 def run_self_tests(verbosity: int = 1) -> int:

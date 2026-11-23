@@ -4259,6 +4259,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             est_completion_chars = 0
             saw_explicit_prompt_usage = False
             saw_explicit_completion_usage = False
+            saw_final_usage = False
             saw_timings_completion = False
             saw_done_sentinel = False
             saw_upstream_error_event = False
@@ -4281,7 +4282,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 """
                 nonlocal first_content_ttft_ms, prompt_tokens, completion_tokens
                 nonlocal est_completion_chars, saw_explicit_prompt_usage
-                nonlocal saw_explicit_completion_usage, saw_timings_completion
+                nonlocal saw_explicit_completion_usage, saw_final_usage, saw_timings_completion
                 nonlocal saw_done_sentinel, saw_upstream_error_event
                 if not data_lines:
                     return False, False
@@ -4343,16 +4344,22 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         est_completion_chars += len(output_txt)
                 usage = obj.get("usage")
                 if isinstance(usage, dict):
+                    got_usage_count = False
                     pt = _safe_nonneg_int(usage.get("prompt_tokens"))
                     if pt is not None:
                         prompt_tokens = pt
                         saw_explicit_prompt_usage = True
+                        got_usage_count = True
                         made_progress = True
                     ct = _safe_nonneg_int(usage.get("completion_tokens"))
                     if ct is not None:
                         completion_tokens = ct
                         saw_explicit_completion_usage = True
+                        got_usage_count = True
                         made_progress = True
+                    has_choices = isinstance(choices, list) and len(choices) > 0
+                    if got_usage_count and not has_choices:
+                        saw_final_usage = True
                 timings = obj.get("timings")
                 if isinstance(timings, dict):
                     if not saw_explicit_prompt_usage:
@@ -4699,11 +4706,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             all_choices_finished = all(
                 idx in finished_choice_indices for idx in range(required_choices)
             )
-            usage_satisfied = (
-                (not expect_final_usage)
-                or saw_explicit_prompt_usage
-                or saw_explicit_completion_usage
-            )
+            usage_satisfied = (not expect_final_usage) or saw_final_usage
             stream_completed = (
                 not saw_upstream_error_event
                 and (saw_done_sentinel or (all_choices_finished and usage_satisfied))

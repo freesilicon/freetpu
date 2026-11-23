@@ -26,12 +26,14 @@ The default Cloud TPU VM boot disk (`100 GiB`) cannot hold `Llama-3.3-70B-Instru
 
 ```bash
 # Option A: Retained Hyperdisk Balanced (`--type=hyperdisk-balanced`, >=250 GiB)
-# attached in read-write mode (with `auto-delete=no` so weights and caches survive
-# Spot preemption and can be reattached/remounted on replacement v6e-8 VMs):
+# attached in read-write mode (with `auto-delete=no` so weights and compiled XLA
+# artifacts both survive Spot preemption and can be reattached/remounted on
+# replacement v6e-8 VMs):
 export HF_HUB_CACHE=/mnt/disks/tpu-cache/hf
-export JAX_COMPILATION_CACHE_DIR=/var/cache/freetpu-xla-cache
-export VLLM_XLA_CACHE_PATH=/var/cache/freetpu-xla-cache
-mkdir -p "$HF_HUB_CACHE" "$JAX_COMPILATION_CACHE_DIR"
+export XLA_CACHE_DIR=/mnt/disks/tpu-cache/xla
+export JAX_COMPILATION_CACHE_DIR=/xla-cache
+export VLLM_XLA_CACHE_PATH=/xla-cache
+mkdir -p "$HF_HUB_CACHE" "$XLA_CACHE_DIR"
 
 # Option B: Shared GCS bucket for XLA cache across ephemeral Spot fleets (recommended;
 # still keep HF_HUB_CACHE on a >=250 GiB Hyperdisk Balanced volume for 70B BF16 weights):
@@ -44,7 +46,7 @@ mkdir -p "$HF_HUB_CACHE" "$JAX_COMPILATION_CACHE_DIR"
 
 ## 3. Non-Privileged CDI Container Base Flags
 
-Per the verified Cloud TPU `v6e-8` CDI contract (no `--privileged` required; `--net=host` is required for 8-chip `libtpu` coordinator initialization). Both BF16 presets below share `CONTAINER_FLAGS`, mounting `HF_HUB_CACHE` off the boot disk so downloaded weights never fill the container writable layer:
+Per the verified Cloud TPU `v6e-8` CDI contract (no `--privileged` required; `--net=host` is required for 8-chip `libtpu` coordinator initialization). Both BF16 presets below share `CONTAINER_FLAGS`, mounting both `HF_HUB_CACHE` and the XLA compilation cache off the retained Hyperdisk so neither weights nor compiled artifacts live on the 100 GiB boot disk:
 
 ```bash
 CONTAINER_FLAGS=(
@@ -56,9 +58,9 @@ CONTAINER_FLAGS=(
   --shm-size=64G
   -v "${HF_HUB_CACHE:-/mnt/disks/tpu-cache/hf}:/hf-cache"
   -e HF_HUB_CACHE=/hf-cache
-  -v /var/cache/freetpu-xla-cache:/var/cache/freetpu-xla-cache
-  -e JAX_COMPILATION_CACHE_DIR="${JAX_COMPILATION_CACHE_DIR:-/var/cache/freetpu-xla-cache}"
-  -e VLLM_XLA_CACHE_PATH="${VLLM_XLA_CACHE_PATH:-/var/cache/freetpu-xla-cache}"
+  -v "${XLA_CACHE_DIR:-/mnt/disks/tpu-cache/xla}:/xla-cache"
+  -e JAX_COMPILATION_CACHE_DIR="${JAX_COMPILATION_CACHE_DIR:-/xla-cache}"
+  -e VLLM_XLA_CACHE_PATH="${VLLM_XLA_CACHE_PATH:-/xla-cache}"
   -e LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:-}"
 )
 ```

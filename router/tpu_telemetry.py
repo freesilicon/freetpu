@@ -675,14 +675,19 @@ def _create_deadline_connection(
 
     last_err: Optional[OSError] = None
     sock: Optional[socket.socket] = None
-    for af, socktype, proto, _canonname, sa in infos:
+    num_addrs = len(infos)
+    for idx, (af, socktype, proto, _canonname, sa) in enumerate(infos):
         rem = deadline - time.monotonic()
         if rem <= 0:
             raise TimeoutError(f"{label} exceeded elapsed deadline")
+        addrs_left = num_addrs - idx
+        # Reserve time for alternate addresses and HTTP I/O when trying a nonfinal
+        # address so one silently blackholed IP cannot exhaust the scrape deadline.
+        attempt_timeout = rem / (addrs_left + 1) if addrs_left > 1 else rem
         cand_sock: Optional[socket.socket] = None
         try:
             cand_sock = socket.socket(af, socktype, proto)
-            cand_sock.settimeout(rem)
+            cand_sock.settimeout(attempt_timeout)
             cand_sock.connect(sa)
             sock = cand_sock
             last_err = None
