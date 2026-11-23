@@ -1106,6 +1106,8 @@ static bool patch_view_into_root_slot_locked(cloudtpu::PjrtRuntime& rt,
     }
     auto pit = bctx->slots.find(root_off);
     if (pit == bctx->slots.end() || pit->second.nbytes != root_bytes) {
+        const cloudtpu::TensorShardingKind root_sh = choose_upload_sharding(
+            root, bctx->spmd_chips, bctx->spmd_min_rows, /*allow_sharding=*/true);
         const size_t rel_new = (t_off - root_off) + offset;
         if (rel_new == 0 && size == root_bytes) {
             CloudTpuTensorSlot next;
@@ -1114,12 +1116,12 @@ static bool patch_view_into_root_slot_locked(cloudtpu::PjrtRuntime& rt,
             if (src_data != nullptr) {
                 upload_raw_tensor_to_slot(
                     rt, bctx->device_index, bctx->spmd_chips, bctx->spmd_min_rows,
-                    next, root, src_data, /*allow_sharding=*/false);
+                    next, root, src_data, /*allow_sharding=*/true, &root_sh);
             } else {
                 std::vector<uint8_t> tmp(root_bytes, fill_value);
                 upload_raw_tensor_to_slot(
                     rt, bctx->device_index, bctx->spmd_chips, bctx->spmd_min_rows,
-                    next, root, tmp.data(), /*allow_sharding=*/false);
+                    next, root, tmp.data(), /*allow_sharding=*/true, &root_sh);
             }
             bctx->evict_overlapping_locked(root_off, root_bytes, root_off);
             bctx->slots[root_off] = std::move(next);
@@ -1135,7 +1137,7 @@ static bool patch_view_into_root_slot_locked(cloudtpu::PjrtRuntime& rt,
         CloudTpuTensorSlot& parent = bctx->slots[root_off];
         parent.offset = root_off;
         parent.nbytes = root_bytes;
-        parent.sharding = cloudtpu::TensorShardingKind::REPLICATED;
+        parent.sharding = root_sh;
         parent.hbm_primary.clear();
         parent.hbm_scales.clear();
         parent.hbm_mins.clear();
@@ -1149,12 +1151,13 @@ static bool patch_view_into_root_slot_locked(cloudtpu::PjrtRuntime& rt,
             next.nbytes = parent.nbytes;
             upload_raw_tensor_to_slot(
                 rt, bctx->device_index, bctx->spmd_chips, bctx->spmd_min_rows,
-                next, root, parent.staging.data(), /*allow_sharding=*/false);
+                next, root, parent.staging.data(), /*allow_sharding=*/true, &root_sh);
             parent = std::move(next);
         }
         return true;
     }
     CloudTpuTensorSlot& parent = pit->second;
+    const cloudtpu::TensorShardingKind root_sh = parent.sharding;
     const size_t rel = (t_off - parent.offset) + offset;
     if (rel == 0 && size == root_bytes) {
         CloudTpuTensorSlot next;
@@ -1163,12 +1166,12 @@ static bool patch_view_into_root_slot_locked(cloudtpu::PjrtRuntime& rt,
         if (src_data != nullptr) {
             upload_raw_tensor_to_slot(
                 rt, bctx->device_index, bctx->spmd_chips, bctx->spmd_min_rows,
-                next, root, src_data, /*allow_sharding=*/false);
+                next, root, src_data, /*allow_sharding=*/true, &root_sh);
         } else {
             std::vector<uint8_t> tmp(root_bytes, fill_value);
             upload_raw_tensor_to_slot(
                 rt, bctx->device_index, bctx->spmd_chips, bctx->spmd_min_rows,
-                next, root, tmp.data(), /*allow_sharding=*/false);
+                next, root, tmp.data(), /*allow_sharding=*/true, &root_sh);
         }
         parent = std::move(next);
         return true;
@@ -1184,8 +1187,8 @@ static bool patch_view_into_root_slot_locked(cloudtpu::PjrtRuntime& rt,
         parent.staging = std::move(tmp);
         parent.staging_dirty = true;
     }
-    // View-patched root slots flush as REPLICATED so subviews never mismatch sharding.
-    parent.sharding = cloudtpu::TensorShardingKind::REPLICATED;
+    // Preserve the root slot's existing shard layout so a partial view patch never expands
+    // a sharded 2D matrix into P replicated per-chip copies.
     if (src_data != nullptr) {
         std::memcpy(parent.staging.data() + rel, src_data, size);
     } else {
@@ -1199,7 +1202,7 @@ static bool patch_view_into_root_slot_locked(cloudtpu::PjrtRuntime& rt,
         next.nbytes = parent.nbytes;
         upload_raw_tensor_to_slot(
             rt, bctx->device_index, bctx->spmd_chips, bctx->spmd_min_rows,
-            next, root, parent.staging.data(), /*allow_sharding=*/false);
+            next, root, parent.staging.data(), /*allow_sharding=*/true, &root_sh);
         parent = std::move(next);
     }
     return true;
@@ -1665,6 +1668,7 @@ static size_t ggml_backend_cloudtpu_buffer_type_get_alignment(ggml_backend_buffe
 
 static size_t ggml_backend_cloudtpu_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft,
                                                                const struct ggml_tensor* tensor) {
+    GGML_UNUSED(buft);
     if (!tensor) {
         return 0;
     }
@@ -1682,27 +1686,122 @@ static size_t ggml_backend_cloudtpu_buffer_type_get_alloc_size(ggml_backend_buff
             base_size = std::max(base_size, n_blocks * bytes_per_block);
         }
     }
-    // Under SPMD (P > 1), the unified device reports P * min_chip_hbm. Sharded 2D weights occupy
-    // base_size / P per chip (base_size total across P chips), whereas replicated leaf tensors
-    // (KV/state caches, norms, biases, masks, small or 3D tensors) and replicated compute outputs
-    // permitted by GGML's TAG_ALLOC_SIZE_EXPAND contract (MUL_MAT, MUL_MAT_ID, FLASH_ATTN_EXT,
-    // etc.) retain a full copy on every chip (P * base_size total across P chips).
+    // Under SPMD (P > 1), the unified device reports per-chip HBM (min_chip_hbm). Returning 1x
+    // base_size here satisfies GGML's >= ggml_nbytes and TAG_ALLOC_SIZE_EXPAND invariants while
+    // charging every replicated compute op (ADD, MUL, RMS_NORM, MUL_MAT, FLASH_ATTN_EXT, etc.)
+    // its exact per-chip HBM footprint; sharded leaf weights are charged 1/P per chip in
+    // get_alloc_size_n / alloc_buffer_n.
+    return base_size;
+}
+
+static size_t cloudtpu_tensor_per_chip_alloc_size(ggml_backend_buffer_type_t buft,
+                                                  const struct ggml_tensor* tensor) {
+    size_t sz = ggml_backend_cloudtpu_buffer_type_get_alloc_size(buft, tensor);
     auto* btc = buft ? static_cast<cloudtpu_buft_context*>(buft->context) : nullptr;
-    if (btc && btc->spmd_chips > 1 && tensor->view_src == nullptr) {
-        bool replicate_charge = false;
-        if (tensor->op == GGML_OP_NONE) {
-            const cloudtpu::TensorShardingKind sh = choose_upload_sharding(
-                tensor, btc->spmd_chips, btc->spmd_min_rows, /*allow_sharding=*/true);
-            replicate_charge = (sh == cloudtpu::TensorShardingKind::REPLICATED);
-        } else if (ggml_op_alloc_size_may_expand(tensor->op)) {
-            replicate_charge = true;
-        }
-        if (replicate_charge) {
+    if (btc && btc->spmd_chips > 1 && tensor && tensor->op == GGML_OP_NONE && tensor->view_src == nullptr) {
+        const cloudtpu::TensorShardingKind sh = choose_upload_sharding(
+            tensor, btc->spmd_chips, btc->spmd_min_rows, /*allow_sharding=*/true);
+        if (sh != cloudtpu::TensorShardingKind::REPLICATED) {
             const size_t p = static_cast<size_t>(btc->spmd_chips);
-            return (base_size <= SIZE_MAX / p) ? (base_size * p) : SIZE_MAX;
+            sz = (sz + p - 1) / p;
         }
     }
-    return base_size;
+    return sz;
+}
+
+static size_t ggml_backend_cloudtpu_buffer_type_get_alloc_size_n(ggml_backend_buffer_type_t buft,
+                                                                 struct ggml_tensor** tensors,
+                                                                 int n_tensors) {
+    const size_t align = CLOUDTPU_BUFFER_ALIGNMENT;
+    size_t total = 0;
+    for (int i = 0; i < n_tensors; ++i) {
+        struct ggml_tensor* t = tensors[i];
+        if (!t || t->data != nullptr || t->view_src != nullptr) {
+            continue;
+        }
+        const size_t sz = cloudtpu_tensor_per_chip_alloc_size(buft, t);
+        const size_t padded = (sz + align - 1) & ~(align - 1);
+        total = (padded <= SIZE_MAX - total) ? (total + padded) : SIZE_MAX;
+    }
+    return total;
+}
+
+static ggml_backend_buffer_t ggml_backend_cloudtpu_buffer_type_alloc_buffer_n(
+    ggml_backend_buffer_type_t buft,
+    struct ggml_tensor** tensors,
+    int n_tensors) {
+    auto* btc = static_cast<cloudtpu_buft_context*>(buft->context);
+    const size_t align = CLOUDTPU_BUFFER_ALIGNMENT;
+    size_t virtual_span = 0;
+    size_t per_chip_total = 0;
+    bool has_unalloc_tensor = false;
+    for (int i = 0; i < n_tensors; ++i) {
+        struct ggml_tensor* t = tensors[i];
+        if (!t || t->data != nullptr || t->view_src != nullptr) {
+            continue;
+        }
+        has_unalloc_tensor = true;
+        const size_t full_sz = ggml_backend_cloudtpu_buffer_type_get_alloc_size(buft, t);
+        const size_t full_pad = (full_sz + align - 1) & ~(align - 1);
+        const size_t chip_sz = cloudtpu_tensor_per_chip_alloc_size(buft, t);
+        const size_t chip_pad = (chip_sz + align - 1) & ~(align - 1);
+        if (full_pad > SIZE_MAX - virtual_span || chip_pad > SIZE_MAX - per_chip_total) {
+            GGML_LOG_ERROR("ggml-cloudtpu: alloc_buffer_n size overflow\n");
+            return NULL;
+        }
+        virtual_span += full_pad;
+        per_chip_total += chip_pad;
+    }
+    if (!has_unalloc_tensor || virtual_span == 0) {
+        return NULL;
+    }
+    try {
+        ensure_runtime_initialized();
+        const size_t aligned_span = std::max<size_t>(
+            align,
+            ((virtual_span + align - 1) & ~(align - 1)) + 4096);
+        auto* bctx = new ggml_backend_cloudtpu_buffer_context();
+        bctx->device_index = btc->device_index;
+        bctx->spmd_chips = btc->spmd_chips;
+        bctx->spmd_min_rows = btc->spmd_min_rows;
+        bctx->virtual_base = g_next_virtual_base.fetch_add(aligned_span, std::memory_order_relaxed);
+        bctx->size = per_chip_total;
+
+        ggml_backend_buffer_t buffer =
+            ggml_backend_buffer_init(buft, ggml_backend_cloudtpu_buffer_i, bctx, per_chip_total);
+        if (!buffer) {
+            delete bctx;
+            return NULL;
+        }
+        // Assign strictly disjoint full-size virtual offsets so tensor_offset_in_buffer and
+        // overlap tracking never collide, while buffer->size reports exact per-chip HBM.
+        size_t cur_off = 0;
+        for (int i = 0; i < n_tensors; ++i) {
+            struct ggml_tensor* t = tensors[i];
+            if (!t || t->data != nullptr || t->view_src != nullptr) {
+                continue;
+            }
+            const size_t full_sz = ggml_backend_cloudtpu_buffer_type_get_alloc_size(buft, t);
+            const size_t full_pad = (full_sz + align - 1) & ~(align - 1);
+            t->buffer = buffer;
+            t->data = reinterpret_cast<void*>(bctx->virtual_base + cur_off);
+            cur_off += full_pad;
+        }
+        for (int i = 0; i < n_tensors; ++i) {
+            struct ggml_tensor* t = tensors[i];
+            if (!t || t->view_src == nullptr || t->buffer != nullptr) {
+                continue;
+            }
+            if (ggml_backend_view_init(t) != GGML_STATUS_SUCCESS) {
+                ggml_backend_buffer_free(buffer);
+                return NULL;
+            }
+        }
+        return buffer;
+    } catch (const std::exception& e) {
+        GGML_LOG_ERROR("ggml-cloudtpu: alloc_buffer_n failed (per_chip=%zu): %s\n", per_chip_total, e.what());
+        return NULL;
+    }
 }
 
 static bool ggml_backend_cloudtpu_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
@@ -3710,11 +3809,11 @@ static void ggml_backend_cloudtpu_device_get_memory(ggml_backend_dev_t dev, size
                 min_total = std::min(min_total, t);
             }
             // Symmetric SPMD allocations are bounded by the most constrained chip (min_free).
-            // Reporting P * min_free pairs with get_alloc_size charging 1x for sharded weights
-            // (base_size / P per chip) and P * base_size for replicated leaf buffers (KV cache).
-            const size_t p = static_cast<size_t>(dc->spmd_chips);
-            *free = (min_free <= SIZE_MAX / p) ? (min_free * p) : SIZE_MAX;
-            *total = (min_total <= SIZE_MAX / p) ? (min_total * p) : SIZE_MAX;
+            // Reporting per-chip min_free pairs with get_alloc_size_n / alloc_buffer_n charging
+            // sharded weights 1/P per chip and replicated KV/compute buffers 1x per chip (including
+            // non-expandable compute ops like ADD/MUL/RMS_NORM and per-chip --fit-target margins).
+            *free = min_free;
+            *total = min_total;
             return;
         }
         if (!rt.query_memory_stats(dc->device_index, free, total)) {
@@ -3808,7 +3907,8 @@ static cloudtpu_reg_state& get_reg_state(ggml_backend_reg_t reg) {
             cloudtpu::PjrtRuntime& rt = ensure_runtime_initialized();
             const int spmd = resolve_spmd_chips(env, rt);
             // When SPMD spans multiple chips (e.g. v6e-8 or tpu7x-4t), expose one unified
-            // logical CLOUDTPU device aggregating all chips' HBM for seamless TP offload.
+            // logical CLOUDTPU device reporting per-chip HBM capacity (with sharded weights
+            // charged 1/P per chip and replicated KV/compute buffers charged 1x per chip).
             const int count = (spmd > 1) ? 1 : std::max(1, rt.device_count());
             state.dev_ctxs.reserve(static_cast<size_t>(count));
             state.devices.resize(static_cast<size_t>(count));
@@ -3844,11 +3944,11 @@ static cloudtpu_reg_state& get_reg_state(ggml_backend_reg_t reg) {
                     /* .iface   = */ {
                         /* .get_name         = */ ggml_backend_cloudtpu_buffer_type_get_name,
                         /* .alloc_buffer     = */ ggml_backend_cloudtpu_buffer_type_alloc_buffer,
-                        /* .alloc_buffer_n   = */ NULL,
+                        /* .alloc_buffer_n   = */ ggml_backend_cloudtpu_buffer_type_alloc_buffer_n,
                         /* .get_alignment    = */ ggml_backend_cloudtpu_buffer_type_get_alignment,
                         /* .get_max_size     = */ NULL,
                         /* .get_alloc_size   = */ ggml_backend_cloudtpu_buffer_type_get_alloc_size,
-                        /* .get_alloc_size_n = */ NULL,
+                        /* .get_alloc_size_n = */ ggml_backend_cloudtpu_buffer_type_get_alloc_size_n,
                         /* .is_host          = */ ggml_backend_cloudtpu_buffer_type_is_host,
                     },
                     /* .device  = */ &state.devices[static_cast<size_t>(i)],
