@@ -1016,6 +1016,8 @@ static void ggml_backend_cloudtpu_buffer_memset_tensor(ggml_backend_buffer_t buf
     auto* bctx = static_cast<ggml_backend_cloudtpu_buffer_context*>(buffer->context);
     const size_t t_bytes = ggml_nbytes(tensor);
     const bool partial_view = is_partial_view_write(bctx, buffer, tensor, offset, size);
+    const bool is_compute_buf =
+        (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE);
     try {
         cloudtpu::PjrtRuntime& rt = ensure_runtime_initialized();
         const size_t t_off = tensor_offset_in_buffer(bctx, tensor);
@@ -1026,12 +1028,13 @@ static void ggml_backend_cloudtpu_buffer_memset_tensor(ggml_backend_buffer_t buf
             return;
         }
         if (offset == 0 && size == t_bytes) {
-            bctx->evict_overlapping_locked(t_off, t_bytes, t_off);
-            CloudTpuTensorSlot& slot = bctx->slots[t_off];
-            slot.offset = t_off;
-            slot.nbytes = t_bytes;
             std::vector<uint8_t> tmp(t_bytes, value);
-            upload_raw_tensor_to_slot(rt, bctx->device_index, slot, tensor, tmp.data());
+            CloudTpuTensorSlot next;
+            next.offset = t_off;
+            next.nbytes = t_bytes;
+            upload_raw_tensor_to_slot(rt, bctx->device_index, next, tensor, tmp.data());
+            bctx->evict_overlapping_locked(t_off, t_bytes, t_off);
+            bctx->slots[t_off] = std::move(next);
         } else {
             auto it = bctx->slots.find(t_off);
             if (it != bctx->slots.end() && it->second.nbytes == t_bytes) {
@@ -1065,14 +1068,15 @@ static void ggml_backend_cloudtpu_buffer_memset_tensor(ggml_backend_buffer_t buf
             }
         }
     } catch (const std::exception& e) {
-        if (partial_view || offset != 0 || size != t_bytes) {
-            // Preserve any existing valid root/slot data intact when a partial write fails.
-            GGML_LOG_ERROR("ggml-cloudtpu: partial memset_tensor failed for '%s': %s\n",
-                           (tensor && tensor->name[0] != '\0') ? tensor->name : "?",
-                           e.what());
-            throw;
+        if (is_compute_buf && !partial_view && offset == 0 && size == t_bytes) {
+            record_buffer_upload_failure(bctx, buffer, tensor, "memset_tensor", e.what());
+            return;
         }
-        record_buffer_upload_failure(bctx, buffer, tensor, "memset_tensor", e.what());
+        // Preserve any existing valid weights / KV-cache slot intact and propagate to caller.
+        GGML_LOG_ERROR("ggml-cloudtpu: memset_tensor failed for '%s': %s\n",
+                       (tensor && tensor->name[0] != '\0') ? tensor->name : "?",
+                       e.what());
+        throw;
     }
 }
 
@@ -1087,6 +1091,8 @@ static void ggml_backend_cloudtpu_buffer_set_tensor(ggml_backend_buffer_t buffer
     auto* bctx = static_cast<ggml_backend_cloudtpu_buffer_context*>(buffer->context);
     const size_t t_bytes = ggml_nbytes(tensor);
     const bool partial_view = is_partial_view_write(bctx, buffer, tensor, offset, size);
+    const bool is_compute_buf =
+        (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE);
     try {
         cloudtpu::PjrtRuntime& rt = ensure_runtime_initialized();
         const size_t t_off = tensor_offset_in_buffer(bctx, tensor);
@@ -1097,11 +1103,12 @@ static void ggml_backend_cloudtpu_buffer_set_tensor(ggml_backend_buffer_t buffer
             return;
         }
         if (offset == 0 && size == t_bytes) {
+            CloudTpuTensorSlot next;
+            next.offset = t_off;
+            next.nbytes = t_bytes;
+            upload_raw_tensor_to_slot(rt, bctx->device_index, next, tensor, data);
             bctx->evict_overlapping_locked(t_off, t_bytes, t_off);
-            CloudTpuTensorSlot& slot = bctx->slots[t_off];
-            slot.offset = t_off;
-            slot.nbytes = t_bytes;
-            upload_raw_tensor_to_slot(rt, bctx->device_index, slot, tensor, data);
+            bctx->slots[t_off] = std::move(next);
         } else {
             auto it = bctx->slots.find(t_off);
             CloudTpuTensorSlot* slot_ptr = nullptr;
@@ -1136,7 +1143,7 @@ static void ggml_backend_cloudtpu_buffer_set_tensor(ggml_backend_buffer_t buffer
                 slot_ptr = &slot;
             }
             // If full buffer has been populated via tail write, flush to HBM immediately;
-            // on HBM OOM, keep staging intact so graph_compute can report GGML_STATUS_ALLOC_FAILED.
+            // on compute buffers keep staging intact on OOM so graph_compute reports ALLOC_FAILED.
             if (offset + size == t_bytes) {
                 try {
                     CloudTpuTensorSlot next;
@@ -1146,6 +1153,9 @@ static void ggml_backend_cloudtpu_buffer_set_tensor(ggml_backend_buffer_t buffer
                         rt, bctx->device_index, next, tensor, slot_ptr->staging.data());
                     *slot_ptr = std::move(next);
                 } catch (const std::exception& e) {
+                    if (!is_compute_buf) {
+                        throw;
+                    }
                     GGML_LOG_ERROR("ggml-cloudtpu: deferred tail flush failed for '%s' (keeping staging): %s\n",
                                    (tensor && tensor->name[0] != '\0') ? tensor->name : "?",
                                    e.what());
@@ -1153,15 +1163,15 @@ static void ggml_backend_cloudtpu_buffer_set_tensor(ggml_backend_buffer_t buffer
             }
         }
     } catch (const std::exception& e) {
-        if (partial_view || offset != 0 || size != t_bytes) {
-            // Preserve any existing valid root/slot data intact when a partial write fails
-            // (e.g., session sequence restore on a shared KV cache).
-            GGML_LOG_ERROR("ggml-cloudtpu: partial set_tensor failed for '%s': %s\n",
-                           (tensor && tensor->name[0] != '\0') ? tensor->name : "?",
-                           e.what());
-            throw;
+        if (is_compute_buf && !partial_view && offset == 0 && size == t_bytes) {
+            record_buffer_upload_failure(bctx, buffer, tensor, "set_tensor", e.what());
+            return;
         }
-        record_buffer_upload_failure(bctx, buffer, tensor, "set_tensor", e.what());
+        // Preserve any existing valid weights / KV-cache slot intact and propagate to caller.
+        GGML_LOG_ERROR("ggml-cloudtpu: set_tensor failed for '%s': %s\n",
+                       (tensor && tensor->name[0] != '\0') ? tensor->name : "?",
+                       e.what());
+        throw;
     }
 }
 

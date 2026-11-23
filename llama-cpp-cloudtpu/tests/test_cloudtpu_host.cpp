@@ -794,6 +794,37 @@ void test_q4_k_split_mul_mat(cloudtpu::PjrtRuntime& rt) {
     const auto sr_out = run_emitted(rt, sr_prog, {b_upd, b_idx, b_tbl});
     check_vec_close(sr_out, {1.0f, 2.0f, 9.0f, 8.0f, 5.0f, 6.0f}, 1e-6f, "SET_ROWS S64");
     std::printf("  [PASS] SET_ROWS preserves 64-bit scatter indices\n");
+
+    // 7. FP16 subnormal rounding preserves sticky bits above 2^-25
+    const float half_sub = std::ldexp(1.0f, -25);
+    const float just_above_half_sub = std::nextafter(half_sub, 1.0f);
+    CHECK_TRUE(cloudtpu::f32_to_f16(half_sub) == 0x0000U, "exact 2^-25 rounds to even 0");
+    CHECK_TRUE(cloudtpu::f32_to_f16(just_above_half_sub) == 0x0001U,
+               "nextafter(2^-25, +inf) rounds to smallest positive FP16 subnormal");
+    CHECK_TRUE(cloudtpu::f32_to_f16(-just_above_half_sub) == 0x8001U,
+               "-nextafter(2^-25, +inf) rounds to smallest negative FP16 subnormal");
+    std::printf("  [PASS] FP16 subnormal sticky-bit rounding\n");
+
+    // 8. SCALE with non-finite bias preserves IEEE -inf literal in StableHLO and mock execution
+    std::vector<float> sc_in = {1.0f, 2.0f, 3.0f, 4.0f};
+    auto b_sc = rt.buffer_from_host(0, sc_in.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, 4});
+    cloudtpu::GraphProgramSpec sc_spec;
+    sc_spec.inputs.push_back({1, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 4}});
+    cloudtpu::OpNodeSpec sc_op;
+    sc_op.kind = cloudtpu::CloudOpKind::SCALE;
+    sc_op.src_ids = {1};
+    sc_op.dst = {2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 4}};
+    sc_op.scale = 1.0f;
+    sc_op.bias = -std::numeric_limits<float>::infinity();
+    sc_spec.ops.push_back(sc_op);
+    sc_spec.output_ids = {2};
+    const auto sc_prog = cloudtpu::emit_stablehlo_program(sc_spec);
+    CHECK_TRUE(sc_prog.mlir_text.find("0xFF800000") != std::string::npos,
+               "non-finite -inf constant must emit exact IEEE hex literal");
+    const auto sc_out = run_emitted(rt, sc_prog, {b_sc});
+    CHECK_TRUE(sc_out.size() == 4 && std::isinf(sc_out[0]) && sc_out[0] < 0.0f,
+               "SCALE with -inf bias must produce -inf output");
+    std::printf("  [PASS] SCALE preserves non-finite -inf constant\n");
 }
 
 }  // namespace

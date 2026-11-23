@@ -33,7 +33,11 @@ struct SsaValue {
 
 std::string format_f32_literal(float v) {
     if (!std::isfinite(v)) {
-        v = (v < 0.0f) ? -3.40282347e+38f : 3.40282347e+38f;
+        uint32_t bits = 0;
+        std::memcpy(&bits, &v, sizeof(bits));
+        std::ostringstream oss;
+        oss << "0x" << std::uppercase << std::hex << std::setw(8) << std::setfill('0') << bits;
+        return oss.str();
     }
     std::ostringstream oss;
     oss << std::scientific << std::setprecision(8) << v;
@@ -60,6 +64,11 @@ public:
     SsaValue arg_val(size_t idx) const { return args_.at(idx); }
 
     SsaValue emit_const_splat_f32(float val, const std::vector<int64_t>& dims, PjrtDType dt = PjrtDType::F32) {
+        if (!std::isfinite(val) && dt != PjrtDType::F32) {
+            // MLIR 32-bit IEEE hex float literals require f32; convert cleanly to target float type.
+            SsaValue f32_val = emit_const_splat_f32(val, dims, PjrtDType::F32);
+            return emit_convert(f32_val, dt);
+        }
         SsaValue out = next_val(dt, dims);
         body_ << "    " << out.name << " = stablehlo.constant dense<" << format_f32_literal(val)
               << "> : " << out.mlir_type() << "\n";

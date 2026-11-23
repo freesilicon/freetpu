@@ -60,7 +60,10 @@ uint16_t f32_to_f16(float f) {
         if (exp < -10) {
             return static_cast<uint16_t>(sign);
         }
-        mant = (mant | 0x00800000U) >> (1 - exp);
+        const uint32_t shift = static_cast<uint32_t>(1 - exp);
+        const uint32_t full = mant | 0x00800000U;
+        const uint32_t sticky = ((full & ((1U << shift) - 1U)) != 0U) ? 1U : 0U;
+        mant = (full >> shift) | sticky;
         const uint32_t round_bits = mant & 0x00001fffU;
         const uint32_t lsb = (mant >> 13) & 1U;
         if (round_bits > 0x00001000U || (round_bits == 0x00001000U && lsb != 0)) {
@@ -733,6 +736,15 @@ static MockProgram parse_stablehlo_mlir(const std::string& mlir) {
             const bool is_int = (op.out_type.dtype == PjrtDType::S8 || op.out_type.dtype == PjrtDType::U8 ||
                                  op.out_type.dtype == PjrtDType::S16 || op.out_type.dtype == PjrtDType::S32 ||
                                  op.out_type.dtype == PjrtDType::S64);
+            auto parse_mlir_float = [](const std::string& s) -> double {
+                if (s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+                    const uint32_t bits = static_cast<uint32_t>(std::stoul(s, nullptr, 16));
+                    float f = 0.0f;
+                    std::memcpy(&f, &bits, sizeof(f));
+                    return static_cast<double>(f);
+                }
+                return std::stod(s);
+            };
             if (!lit.empty() && lit.front() == '[') {
                 op.is_splat = false;
                 std::string inner = lit.substr(1, lit.size() - 2);
@@ -742,12 +754,12 @@ static MockProgram parse_stablehlo_mlir(const std::string& mlir) {
                     tok = trim_copy(tok);
                     if (tok.empty()) continue;
                     if (is_int) op.array_i.push_back(std::stoll(tok));
-                    else op.array_f.push_back(std::stod(tok));
+                    else op.array_f.push_back(parse_mlir_float(tok));
                 }
             } else {
                 op.is_splat = true;
                 if (is_int) op.scalar_i = std::stoll(lit);
-                else op.scalar_f = std::stod(lit);
+                else op.scalar_f = parse_mlir_float(lit);
             }
         } else if (rhs.rfind("stablehlo.iota ", 0) == 0) {
             op.kind = MockOp::Kind::IOTA;
