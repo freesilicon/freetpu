@@ -2469,6 +2469,56 @@ void test_q4_i4_single_read_matmul_and_bitcast(cloudtpu::PjrtRuntime& rt) {
                 }
             }
         }
+
+        // (c) Activation precision parity between dot_b and 8*xsum for zero unsigned nibbles (s4=-8)
+        //     with x = 1 + 2^-9 (rounds to 1.0 in BF16) under both bf16_matmul=false and bf16_matmul=true:
+        {
+            std::vector<int8_t> qs_zero(static_cast<size_t>(NB * 32 * N), static_cast<int8_t>(-8));
+            std::vector<float> d_one(static_cast<size_t>(NB * N), 1.0f);
+            std::vector<float> m_zero(static_cast<size_t>(NB * N), 0.0f);
+            std::vector<float> x_sub_bf16(static_cast<size_t>(M * K), 0.0f);
+            for (int64_t k = 0; k < 32; ++k) {
+                x_sub_bf16[static_cast<size_t>(k)] = 1.0f + std::ldexp(1.0f, -9);
+            }
+            auto bqs = rt.buffer_from_host(0, qs_zero.data(), cloudtpu::PjrtDType::S4, {1, 1, NB, 32, N});
+            auto bd = rt.buffer_from_host(0, d_one.data(), cloudtpu::PjrtDType::F32, {1, 1, NB, N});
+            auto bm = rt.buffer_from_host(0, m_zero.data(), cloudtpu::PjrtDType::F32, {1, 1, NB, N});
+            auto bx = rt.buffer_from_host(0, x_sub_bf16.data(), cloudtpu::PjrtDType::F32, {1, 1, M, K});
+
+            for (bool bf16_mm : {false, true}) {
+                cloudtpu::GraphProgramSpec pspec;
+                pspec.bf16_matmul = bf16_mm;
+                cloudtpu::TensorSpec w_spec{1, cloudtpu::PjrtDType::S4, cloudtpu::TensorStorageKind::Q4_K_I4, {1, 1, N, K}};
+                w_spec.scale_dtype = cloudtpu::PjrtDType::F32;
+                pspec.inputs.push_back(w_spec);
+                pspec.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, K}});
+                cloudtpu::OpNodeSpec mm;
+                mm.kind = cloudtpu::CloudOpKind::MUL_MAT;
+                mm.high_precision = false;
+                mm.src_ids = {1, 2};
+                mm.dst = {3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, M, N}};
+                pspec.ops.push_back(mm);
+                pspec.output_ids = {3};
+
+                const auto prog = cloudtpu::emit_stablehlo_program(pspec);
+                if (!bf16_mm) {
+                    CHECK_TRUE(prog.mlir_text.find("precision = [DEFAULT, DEFAULT]") == std::string::npos,
+                               "Q4_K_I4 F32 path (CLOUDTPU_MATMUL_BF16=0) must emit HIGHEST precision on dot_b");
+                    CHECK_TRUE(prog.mlir_text.find("precision = [HIGHEST, HIGHEST]") != std::string::npos,
+                               "Q4_K_I4 F32 path must use HIGHEST precision for dot_b and m_dot");
+                } else {
+                    CHECK_TRUE(
+                        prog.mlir_text.find("(tensor<1x1x8x8x32xbf16>) -> tensor<1x1x8x8x32xf32>") != std::string::npos,
+                        "Q4_K_I4 BF16 path must widen BF16-rounded x_blk to F32 before reducing xsum");
+                }
+                const auto got = run_emitted(rt, prog, {bqs, bd, bm, bx});
+                CHECK_TRUE(got.size() == static_cast<size_t>(M * N), "Q4_K_I4 zero-nibble precision parity size");
+                for (float v : got) {
+                    CHECK_TRUE(v == 0.0f,
+                               "Q4_K_I4 zero-nibble dot_b and 8*xsum must cancel identically to 0.0f");
+                }
+            }
+        }
     }
     std::printf("  [PASS] Q4_0_I4 & Q4_K_I4 single-read S4/U4/bitcast MUL_MAT (M=1, M=16, M=40 + F32 offset cancellation)\n");
 }
@@ -5657,7 +5707,10 @@ void test_ggml_cgraph_continuous_batching_buckets() {
                                         static_cast<size_t>(V_out) * sizeof(float),
                                         y_row1.size() * sizeof(float));
                 for (int64_t v = 0; v < V_out; ++v) {
-                    if (std::fabs(y_row1[static_cast<size_t>(v)] - y[static_cast<size_t>(V_out + v)]) > 1e-6f) {
+                    const float p_val = y_row1[static_cast<size_t>(v)];
+                    const float f_val = y[static_cast<size_t>(V_out + v)];
+                    if (!std::isfinite(p_val) || !std::isfinite(f_val) ||
+                        std::fabs(p_val - f_val) > 1e-6f) {
                         ggml_free(ctx_g);
                         ggml_gallocr_free(galloc);
                         ggml_backend_buffer_free(kv_buf);
@@ -5698,17 +5751,59 @@ void test_ggml_cgraph_continuous_batching_buckets() {
         return out;
     };
 
-    // 1) T=5,6,7,8 sequence with default CLOUDTPU_BATCH_BUCKETS -> plan_misses=1, plan_hits=3
+    // 1) T=5,6,7,8 sequence with default CLOUDTPU_BATCH_BUCKETS -> plan_misses=1, plan_hits=3,
+    //    and verify every step's logits (including all cache-hit steps) and final KV state match
+    //    the identical T=5,6,7,8 sequence run with bucketing disabled.
+    const int64_t fixed_slots[8] = {2, 5, 8, 11, 14, 17, 20, 22};
     const CbRunResult seq_res = run_steps({5, 6, 7, 8}, nullptr);
-    CHECK_TRUE(seq_res.ok, "ggml CB bucket sequence T=5,6,7,8 succeeded");
+    const CbRunResult seq_unbucketed = run_steps({5, 6, 7, 8}, "0");
+    CHECK_TRUE(seq_res.ok && seq_unbucketed.ok, "ggml CB bucket sequence T=5,6,7,8 succeeded");
     const uint64_t misses = parse_log_u64(seq_res.logs, "plan_misses");
     const uint64_t hits = parse_log_u64(seq_res.logs, "plan_hits");
     const uint64_t bucketed = parse_log_u64(seq_res.logs, "bucketed");
     CHECK_TRUE(misses == 1 && hits == 3, "ggml CB T=5,6,7,8 must yield plan_misses==1, plan_hits==3");
     CHECK_TRUE(bucketed == 3, "ggml CB T=5,6,7 must increment bucketed==3");
+    CHECK_TRUE(parse_log_u64(seq_unbucketed.logs, "bucketed") == 0,
+               "ggml CB unbucketed reference T=5,6,7,8 must have bucketed==0");
+    CHECK_TRUE(seq_res.logits_per_step.size() == 4 && seq_unbucketed.logits_per_step.size() == 4,
+               "ggml CB T=5,6,7,8 must return 4 step logit buffers");
+    for (size_t s = 0; s < seq_res.logits_per_step.size(); ++s) {
+        CHECK_TRUE(seq_res.logits_per_step[s].size() == seq_unbucketed.logits_per_step[s].size(),
+                   "ggml CB sequence step logit size must match unbucketed");
+        for (size_t i = 0; i < seq_res.logits_per_step[s].size(); ++i) {
+            CHECK_TRUE(std::isfinite(seq_res.logits_per_step[s][i]) &&
+                           std::isfinite(seq_unbucketed.logits_per_step[s][i]),
+                       "ggml CB sequence logits must be finite");
+            CHECK_NEAR(seq_res.logits_per_step[s][i], seq_unbucketed.logits_per_step[s][i], 1e-4f,
+                       "ggml CB sequence logits (incl. cache hits) must match unbucketed < 1e-4");
+        }
+    }
+    for (int64_t l = 0; l < n_layers; ++l) {
+        for (int64_t slot = 0; slot < KV_CAP; ++slot) {
+            bool active = false;
+            for (int64_t t = 0; t < 8; ++t) {
+                if (fixed_slots[static_cast<size_t>(t)] == slot) {
+                    active = true;
+                    break;
+                }
+            }
+            for (int64_t d = 0; d < D_KV; ++d) {
+                const size_t off = static_cast<size_t>(slot * D_KV + d);
+                if (!active) {
+                    CHECK_TRUE(seq_res.kc_after[static_cast<size_t>(l)][off] == sentinel_kv[off] &&
+                                   seq_res.vc_after[static_cast<size_t>(l)][off] == sentinel_kv[off],
+                               "ggml CB sequence unused KV slots must remain untouched");
+                }
+                CHECK_TRUE(seq_res.kc_after[static_cast<size_t>(l)][off] ==
+                               seq_unbucketed.kc_after[static_cast<size_t>(l)][off] &&
+                               seq_res.vc_after[static_cast<size_t>(l)][off] ==
+                                   seq_unbucketed.vc_after[static_cast<size_t>(l)][off],
+                           "ggml CB sequence final KV state after cache hits must match unbucketed");
+            }
+        }
+    }
 
     // 2) Single-step parity (< 1e-4) vs unbucketed (CLOUDTPU_BATCH_BUCKETS=0) and zero KV corruption
-    const int64_t fixed_slots[8] = {2, 5, 8, 11, 14, 17, 20, 22};
     for (int64_t T : {int64_t(5), int64_t(6), int64_t(7)}) {
         const CbRunResult b_res = run_steps({T}, nullptr);
         const CbRunResult u_res = run_steps({T}, "0");

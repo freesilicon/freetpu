@@ -1152,9 +1152,17 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                             }
                             const std::vector<int64_t> dot_b_dims = {
                                 x_mm.dims[0], x_mm.dims[1], NB_local, x_mm.dims[2], N_local};
+                            // Match activation precision between dot_b and xsum:
+                            // - BF16 MXU path (mm_dt == BF16): x_blk is BF16, so xsum reduces
+                            //   convert(x_blk -> F32) of those exact BF16-rounded activations.
+                            // - F32 path (mm_dt == F32, e.g. CLOUDTPU_MATMUL_BF16=0): require
+                            //   precision = [HIGHEST, HIGHEST] on dot_b so TPU MXU does not round
+                            //   F32 dot inputs to BF16 while xsum uses full F32 precision.
+                            const bool dot_b_high_precision =
+                                op.high_precision || (mm_dt == PjrtDType::F32);
                             SsaValue dot_b = builder.emit_dot_general(
                                 x_blk, qs_mm, {0, 1, 3}, {0, 1, 2}, {4}, {3},
-                                dot_b_dims, PjrtDType::F32, op.high_precision);
+                                dot_b_dims, PjrtDType::F32, dot_b_high_precision);
                             SsaValue zero_f32 = builder.emit_const_splat_f32(0.0f, {}, PjrtDType::F32);
                             const bool q4k_needs_xsum =
                                 (w_th.storage == TensorStorageKind::Q4_K_I4) &&
