@@ -126,6 +126,8 @@ def _make_mock_pci_vfio(
         (d / "device").write_text(dev["device"] + "\n", encoding="utf-8")
         if "numa_node" in dev:
             (d / "numa_node").write_text(dev["numa_node"] + "\n", encoding="utf-8")
+        if "chip_id" in dev:
+            (d / "chip_id").write_text(dev["chip_id"] + "\n", encoding="utf-8")
         if "iommufd_cdev" in dev:
             cdev_name = dev["iommufd_cdev"]
             suffix = cdev_name.removeprefix("vfio")
@@ -2209,12 +2211,17 @@ class FreeTpuCdiTests(unittest.TestCase):
                         for b in numa0["annotations"]["freetpu.dev/pci-bdfs"].split(",")
                     )
                 )
+                # Without verified sysfs `chip_id` or explicit `--chip-id-map`, sub-host
+                # slices MUST omit TPU_VISIBLE_CHIPS / TPU_VISIBLE_DEVICES so workload-
+                # provided visibility is preserved (never guessed from PCI discovery order),
+                # while still setting slice-scoped TPU_CHIPS_PER_HOST_BOUNDS=2,2,1.
                 n0_env = dict(kv.split("=", 1) for kv in numa0["containerEdits"]["env"])
-                self.assertEqual(n0_env["TPU_VISIBLE_DEVICES"], "0,1,2,3")
+                self.assertNotIn("TPU_VISIBLE_CHIPS", n0_env)
+                self.assertNotIn("TPU_VISIBLE_DEVICES", n0_env)
                 self.assertEqual(n0_env["TPU_CHIPS_PER_HOST_BOUNDS"], "2,2,1")
                 self.assertEqual(n0_env["MEGASCALE_COORDINATOR_ADDRESS"], "127.0.0.1:8353")
 
-                # NUMA 1 slice strictly binds 0000:80:* chips 4..7 with 2,2,1 bounds.
+                # NUMA 1 slice strictly binds 0000:80:* with 2,2,1 bounds (visibility omitted).
                 numa1 = by_name["numa1"]
                 self.assertEqual(numa1["annotations"]["freetpu.dev/pcie-root"], "0000:80")
                 self.assertEqual(numa1["annotations"]["freetpu.dev/numa-node"], "1")
@@ -2225,10 +2232,33 @@ class FreeTpuCdiTests(unittest.TestCase):
                     )
                 )
                 n1_env = dict(kv.split("=", 1) for kv in numa1["containerEdits"]["env"])
-                self.assertEqual(n1_env["TPU_VISIBLE_DEVICES"], "4,5,6,7")
+                self.assertNotIn("TPU_VISIBLE_CHIPS", n1_env)
+                self.assertNotIn("TPU_VISIBLE_DEVICES", n1_env)
                 self.assertEqual(n1_env["TPU_CHIPS_PER_HOST_BOUNDS"], "2,2,1")
 
-                # Full 8-chip v6e-8 `all` uses 2,4,1 bounds.
+                # With explicit `--chip-id-map` where runtime IDs differ from PCI order
+                # (NUMA 0 -> runtime 4,5,6,7; NUMA 1 -> runtime 0,1,2,3), sub-host slices
+                # emit the VERIFIED runtime ordinals (never PCI discovery order!).
+                reordered_map = {
+                    **{v6e8_devices[i]["bdf"]: 4 + i for i in range(4)},
+                    **{v6e8_devices[4 + i]["bdf"]: i for i in range(4)},
+                }
+                mapped_spec = freetpu_cdi.build_cdi_spec(
+                    chips, control_node, single_host_env=True, chip_id_map=reordered_map
+                )
+                mapped_by_name = {d["name"]: d for d in mapped_spec["devices"]}
+                m_n0_env = dict(
+                    kv.split("=", 1) for kv in mapped_by_name["numa0"]["containerEdits"]["env"]
+                )
+                self.assertEqual(m_n0_env["TPU_VISIBLE_CHIPS"], "4,5,6,7")
+                self.assertEqual(m_n0_env["TPU_VISIBLE_DEVICES"], "4,5,6,7")
+                m_n1_env = dict(
+                    kv.split("=", 1) for kv in mapped_by_name["numa1"]["containerEdits"]["env"]
+                )
+                self.assertEqual(m_n1_env["TPU_VISIBLE_CHIPS"], "0,1,2,3")
+                self.assertEqual(m_n1_env["TPU_VISIBLE_DEVICES"], "0,1,2,3")
+
+                # Full 8-chip v6e-8 `all` uses 2,4,1 bounds and full-host 0..7 visibility.
                 all_env = dict(kv.split("=", 1) for kv in by_name["all"]["containerEdits"]["env"])
                 self.assertEqual(all_env["TPU_VISIBLE_DEVICES"], "0,1,2,3,4,5,6,7")
                 self.assertEqual(all_env["TPU_CHIPS_PER_HOST_BOUNDS"], "2,4,1")
@@ -2344,6 +2374,7 @@ class FreeTpuCdiTests(unittest.TestCase):
                     "driver": "vfio-pci",
                     "iommu_group": str(i),
                     "numa_node": "0",
+                    "chip_id": str(i),
                 }
                 for i in range(4)
             ] + [
@@ -2354,6 +2385,7 @@ class FreeTpuCdiTests(unittest.TestCase):
                     "driver": "vfio-pci",
                     "iommu_group": str(4 + i),
                     "numa_node": "1",
+                    "chip_id": str(4 + i),
                 }
                 for i in range(4)
             ]
@@ -2400,6 +2432,32 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertEqual(numa1_7x_env["TPU_CHIPS_PER_HOST_BOUNDS"], "1,2,1")
                 self.assertEqual(numa1_7x_env["TPU_VISIBLE_CHIPS"], "2,3")
                 self.assertEqual(numa1_7x_env["TPU_VISIBLE_DEVICES"], "4,5,6,7")
+
+                # Ironwood 4-chip host missing 1 PCI function/chiplet (only 7 VFIO nodes):
+                # `all` MUST omit TPU_VISIBLE_CHIPS, TPU_VISIBLE_DEVICES, and
+                # TPU_CHIPS_PER_HOST_BOUNDS (never advertising 0..7 or 2,2,1!).
+                root_7x_deg = root / "tpu7x_missing_chiplet"
+                sysfs_7x_deg, dev_7x_deg = _make_mock_pci_vfio(
+                    root_7x_deg,
+                    devices=ironwood_devices[:7],  # drop 1 chiplet -> 7 functions
+                    create_vfio_nodes=[str(i) for i in range(7)],
+                )
+                chips_7x_deg, ctrl_7x_deg = freetpu_cdi.discover_tpu_chips(
+                    sysfs_root=sysfs_7x_deg, dev_root=dev_7x_deg
+                )
+                spec_7x_deg = freetpu_cdi.build_cdi_spec(
+                    chips_7x_deg, ctrl_7x_deg, single_host_env=True
+                )
+                by_name_7x_deg = {d["name"]: d for d in spec_7x_deg["devices"]}
+                self.assertEqual(len(by_name_7x_deg["all"]["containerEdits"]["deviceNodes"]), 7)
+                all_7x_deg_env = dict(
+                    kv.split("=", 1) for kv in by_name_7x_deg["all"]["containerEdits"]["env"]
+                )
+                self.assertNotIn("TPU_VISIBLE_CHIPS", all_7x_deg_env)
+                self.assertNotIn("TPU_VISIBLE_DEVICES", all_7x_deg_env)
+                self.assertNotIn("TPU_CHIPS_PER_HOST_BOUNDS", all_7x_deg_env)
+                self.assertNotIn("numa1", by_name_7x_deg)
+                self.assertIn("numa0", by_name_7x_deg)
 
             # Verify PCIe root resolution from sysfs ancestry when endpoints sit behind
             # PCIe switches on distinct downstream bus numbers (without numa_node files).

@@ -2367,6 +2367,59 @@ TPU Runtime Utilization
                 [(c + 1) * 4 * 1024**3 for c in range(8)],
             )
 
+            # Ironwood sliced partition exposing physical chips 2 & 3: runtime reports
+            # duty-cycle IDs `{2, 3}` and HBM core IDs `{4, 5, 6, 7}`. Exact set expansion
+            # (`{2, 3}` -> `{4, 5, 6, 7} == HBM`) MUST classify as per-chip BEFORE any
+            # chip-count comparison so cores 4..7 receive their duty-cycle readings!
+            class _IronwoodSlicedChips23Stub:
+                def __init__(self, channel):
+                    self.channel = channel
+
+                def GetRuntimeMetric(self, req, timeout=None):
+                    del timeout
+                    if req.metric_name == "tpu.runtime.hbm.memory.usage.bytes":
+                        items = [_make_item(c, as_int=(c + 1) * 5 * 1024**3) for c in (4, 5, 6, 7)]
+                    elif req.metric_name == "tpu.runtime.hbm.memory.total.bytes":
+                        items = [_make_item(c, as_int=96 * 1024**3) for c in (4, 5, 6, 7)]
+                    elif req.metric_name == "tpu.runtime.tensorcore.dutycycle.percent":
+                        items = [_make_item(2, as_double=42.5), _make_item(3, as_double=84.0)]
+                    else:
+                        items = []
+                    return SimpleNamespace(metric=SimpleNamespace(metrics=items))
+
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.dict(_te._GRPC_CHANNELS, {}, clear=True),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "grpc": _FakeGrpc,
+                        "tpu_info": SimpleNamespace(),
+                        "tpu_info.proto": SimpleNamespace(),
+                        "tpu_info.proto.tpu_metric_service_pb2": fake_pb2,
+                        "tpu_info.proto.tpu_metric_service_pb2_grpc": SimpleNamespace(
+                            RuntimeMetricServiceStub=_IronwoodSlicedChips23Stub
+                        ),
+                    },
+                ),
+            ):
+                iw_slice_snap = _te.collect_snapshot(
+                    sysfs_root=iw_sysfs,
+                    dev_root=iw_dev,
+                    proc_root=iw_proc,
+                    tpu_info_bin="tpu-info",
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=iw_root / "no-shm",
+                )
+            self.assertEqual(
+                [d.duty_cycle_percent for d in iw_slice_snap.devices],
+                [None, None, None, None, 42.5, 42.5, 84.0, 84.0],
+            )
+            self.assertEqual(
+                sorted(rt.runtime_chip for rt in iw_slice_snap.runtime_utilization),
+                ["4", "5", "6", "7"],
+            )
+
             # Custom `--tpu-info-bin` specified by bare name (without `/`) MUST invoke
             # that configured executable via PATH instead of taking the default gRPC shortcut.
             custom_rows = _te.parse_tpu_info_output(
@@ -2925,6 +2978,50 @@ TPU Runtime Utilization
             self.assertIsNone(bad_url_snap.gcp_preempted_status)
             self.assertEqual(len(bad_url_snap.devices), 2)
             self.assertEqual(bad_url_snap.devices[0].aer_correctable_total, 3)
+
+            # Built-in GCP metadata endpoints (`metadata.google.internal` and
+            # `169.254.169.254`) MUST bypass HTTP proxies via ProxyHandler({}).
+            for direct_url in (
+                tpu_exporter.DEFAULT_GCP_METADATA_PREEMPTED_URL,
+                "http://169.254.169.254/computeMetadata/v1/instance/preempted",
+            ):
+                captured_handlers = []
+
+                class _FakeResp:
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *exc):
+                        return False
+
+                    def read(self, n=-1):
+                        del n
+                        return b"TRUE"
+
+                class _FakeOpener:
+                    def open(self, req, timeout=None):
+                        del timeout
+                        self.req = req
+                        return _FakeResp()
+
+                def _fake_build_opener(*handlers):
+                    captured_handlers.extend(handlers)
+                    return _FakeOpener()
+
+                with (
+                    mock.patch.dict(os.environ, {"HTTP_PROXY": "http://127.0.0.1:9", "http_proxy": "http://127.0.0.1:9"}),
+                    mock.patch.object(urllib.request, "build_opener", side_effect=_fake_build_opener),
+                    mock.patch.object(
+                        urllib.request,
+                        "urlopen",
+                        side_effect=AssertionError("must bypass proxy via ProxyHandler({}) for built-in metadata host"),
+                    ),
+                ):
+                    status = tpu_exporter.query_gcp_preemption_status(direct_url, timeout_s=0.5)
+                self.assertEqual(status, 1)
+                self.assertEqual(len(captured_handlers), 1)
+                self.assertIsInstance(captured_handlers[0], urllib.request.ProxyHandler)
+                self.assertEqual(captured_handlers[0].proxies, {})
 
             alerts_path = EXPORTER_DIR / "prometheus-alerts.yml"
             self.assertTrue(alerts_path.is_file())

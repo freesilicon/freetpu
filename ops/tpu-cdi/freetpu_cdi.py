@@ -145,6 +145,7 @@ class DiscoveredChip:
     pcie_root: str = ""
     vfio_mode: str = "vfio-group"
     iommufd_cdev: Optional[str] = None
+    runtime_chip_id: Optional[int] = None
 
 
 def _normalize_hex_id(raw: str) -> str:
@@ -379,6 +380,47 @@ def _parse_numa_node(pci_entry: Path) -> Optional[int]:
     return val if val >= 0 else None
 
 
+def _parse_runtime_chip_id(pci_entry: Path) -> Optional[int]:
+    """Read optional sysfs `chip_id` integer when exported by the kernel driver."""
+    raw = _read_text(pci_entry / "chip_id")
+    if raw is None:
+        return None
+    try:
+        val = int(raw, 10)
+    except ValueError:
+        return None
+    return val if val >= 0 else None
+
+
+def _load_chip_id_map(raw: Optional[str]) -> Optional[Dict[str, int]]:
+    """Parse `--chip-id-map` JSON object or file path mapping PCI BDF -> non-negative runtime int ID."""
+    if raw is None or not str(raw).strip():
+        return None
+    text = str(raw).strip()
+    path = Path(text)
+    if path.is_file():
+        text = path.read_text(encoding="utf-8")
+    data = json.loads(text)
+    if not isinstance(data, dict):
+        raise ValueError("--chip-id-map must be a JSON object mapping PCI BDF strings to integer IDs")
+    result: Dict[str, int] = {}
+    for k, v in data.items():
+        if not isinstance(k, str) or not k.strip():
+            raise ValueError(f"Invalid --chip-id-map key {k!r}: must be a non-empty PCI BDF string")
+        if isinstance(v, bool):
+            raise ValueError(f"Invalid --chip-id-map value for {k!r}: boolean is not a chip ID")
+        if isinstance(v, str) and v.strip().isdigit():
+            iv = int(v.strip(), 10)
+        elif isinstance(v, int) and v >= 0:
+            iv = v
+        else:
+            raise ValueError(
+                f"Invalid --chip-id-map value {v!r} for {k!r}: must be a non-negative integer"
+            )
+        result[k.strip()] = iv
+    return result
+
+
 def discover_tpu_chips(
     sysfs_root: Path = Path("/sys"),
     dev_root: Path = Path("/dev"),
@@ -601,6 +643,7 @@ def discover_tpu_chips(
                 pcie_root=pcie_root,
                 vfio_mode=chip_vfio_mode,
                 iommufd_cdev=iommufd_cdev,
+                runtime_chip_id=_parse_runtime_chip_id(entry),
             )
         )
 
@@ -725,18 +768,112 @@ _SUPPORTED_SUBHOST_SLICE_CHIP_COUNTS = frozenset({2, 4, 8})
 
 def _has_complete_chip_functions(
     subset: Sequence[DiscoveredChip],
-    physical_chip_count: int,
+    bdf_to_phys: Dict[str, int],
 ) -> bool:
-    """Return True when every physical chip in `subset` exposes its expected PCI function count."""
-    if physical_chip_count <= 0:
+    """Return True when every physical chip in `subset` exposes its full expected PCI function set."""
+    if not subset:
         return False
-    per_chip_set = {
-        _PCI_FUNCTIONS_PER_PHYSICAL_CHIP.get(c.generation, 1) for c in subset
-    }
-    if len(per_chip_set) != 1:
-        return len(subset) == physical_chip_count
-    per_chip = next(iter(per_chip_set))
-    return len(subset) == physical_chip_count * per_chip
+    counts_by_phys: Dict[int, Tuple[int, str]] = {}
+    for c in subset:
+        phys = bdf_to_phys[c.pci_bdf]
+        cnt, gen = counts_by_phys.get(phys, (0, c.generation))
+        counts_by_phys[phys] = (cnt + 1, gen)
+    for cnt, gen in counts_by_phys.values():
+        expected = _PCI_FUNCTIONS_PER_PHYSICAL_CHIP.get(gen, 1)
+        if cnt != expected:
+            return False
+    return True
+
+
+def _resolve_verified_visibility_ordinals(
+    subset: Sequence[DiscoveredChip],
+    all_chips: Sequence[DiscoveredChip],
+    bdf_to_phys: Dict[str, int],
+    *,
+    chip_id_map: Optional[Dict[str, int]] = None,
+    is_full_host_all: bool = False,
+) -> Optional[Tuple[List[int], List[int]]]:
+    """Return `(visible_chip_ordinals, visible_device_ordinals)` ONLY when verified.
+
+    - Requires every physical chip in `subset` to have its complete PCI function set.
+    - Uses authoritative runtime ordinals from sysfs `chip_id` or explicit `chip_id_map`
+      whenever every chip in `subset` is unambiguously mapped (checking uniqueness across
+      all host chips so conflicting IDs fail closed).
+    - Allows full-host `all` allocations (when every host chip is attached and complete)
+      to emit `0..N-1` / `0..M-1` without requiring per-BDF sysfs `chip_id`.
+    - For sub-host slices (`numa*`, `pcie*`, range aliases) without verified runtime
+      ordinals, returns `None` so CDI omits `TPU_VISIBLE_CHIPS` / `TPU_VISIBLE_DEVICES`
+      and preserves workload-provided visibility settings instead of guessing from PCI order.
+    """
+    if not subset or not _has_complete_chip_functions(subset, bdf_to_phys):
+        return None
+
+    def _raw_id(chip: DiscoveredChip) -> Optional[int]:
+        if chip_id_map and chip.pci_bdf in chip_id_map:
+            return chip_id_map[chip.pci_bdf]
+        return chip.runtime_chip_id
+
+    subset_raw: List[Optional[int]] = [_raw_id(c) for c in subset]
+    if all(rid is not None for rid in subset_raw):
+        per_chip_set = {
+            _PCI_FUNCTIONS_PER_PHYSICAL_CHIP.get(c.generation, 1) for c in subset
+        }
+        if len(per_chip_set) == 1:
+            per_chip = next(iter(per_chip_set))
+            all_raw_by_bdf: Dict[str, int] = {}
+            for c in all_chips:
+                rid = _raw_id(c)
+                if rid is not None:
+                    all_raw_by_bdf[c.pci_bdf] = rid
+
+            if per_chip == 1:
+                # Every claimed runtime ID across the host must be unique.
+                if len(set(all_raw_by_bdf.values())) == len(all_raw_by_bdf):
+                    ords = sorted(int(rid) for rid in subset_raw if rid is not None)
+                    return ords, list(ords)
+                return None
+
+            # Dual-function/chiplet generations (e.g. Ironwood per_chip=2):
+            # Case A: distinct logical device IDs per PCI function (e.g. 4,5,6,7 -> chips 2,3).
+            sub_ids = [int(rid) for rid in subset_raw if rid is not None]
+            if len(set(sub_ids)) == len(sub_ids) and len(set(all_raw_by_bdf.values())) == len(
+                all_raw_by_bdf
+            ):
+                phys_set = sorted({oid // per_chip for oid in sub_ids})
+                expected_logical = [
+                    p * per_chip + off for p in phys_set for off in range(per_chip)
+                ]
+                if sorted(sub_ids) == expected_logical:
+                    return phys_set, expected_logical
+                return None
+
+            # Case B: physical chip ID shared by both PCI functions of each chip.
+            phys_to_rids: Dict[int, set[int]] = {}
+            for c in all_chips:
+                rid = all_raw_by_bdf.get(c.pci_bdf)
+                if rid is not None:
+                    phys_to_rids.setdefault(bdf_to_phys[c.pci_bdf], set()).add(rid)
+            if all(len(rids) == 1 for rids in phys_to_rids.values()):
+                claimed_phys_rids = [next(iter(rids)) for rids in phys_to_rids.values()]
+                if len(set(claimed_phys_rids)) == len(claimed_phys_rids):
+                    sub_phys = sorted(
+                        {
+                            next(iter(phys_to_rids[bdf_to_phys[c.pci_bdf]]))
+                            for c in subset
+                        }
+                    )
+                    logical = [
+                        p * per_chip + off for p in sub_phys for off in range(per_chip)
+                    ]
+                    return sub_phys, logical
+            return None
+
+    if is_full_host_all:
+        phys_indices = _distinct_physical_indices(subset, bdf_to_phys)
+        if len(phys_indices) in _SUPPORTED_SINGLE_HOST_CHIP_COUNTS:
+            logical_indices = _logical_device_indices(subset, phys_indices)
+            return phys_indices, logical_indices
+    return None
 
 
 def _chips_per_host_bounds(chip_count: int, generations: Sequence[str]) -> str:
@@ -780,12 +917,12 @@ def _logical_device_indices(
 
 
 def _build_device_env(
-    physical_chip_indices: Sequence[int],
-    logical_device_indices: Sequence[int],
+    physical_chip_count: int,
     generations: Sequence[str],
     *,
     single_host_env: bool = False,
-    include_visibility_env: bool = True,
+    include_bounds_env: bool = True,
+    verified_visibility: Optional[Tuple[Sequence[int], Sequence[int]]] = None,
 ) -> List[str]:
     """Build per-device CDI `containerEdits.env` entries.
 
@@ -794,30 +931,30 @@ def _build_device_env(
     host bounds. When `single_host_env=True` is explicitly opted in:
     - All selectors receive isolated loopback Megascale / single-host overrides.
     - Full-allocation / slice selectors (`numa*`, `pcie*`, `0-3`/`4-7`, `all`)
-      also receive physical chip mask `TPU_VISIBLE_CHIPS`, logical device mask
-      `TPU_VISIBLE_DEVICES`, and physical-chip-derived `TPU_CHIPS_PER_HOST_BOUNDS`.
+      with supported complete chip counts receive `TPU_CHIPS_PER_HOST_BOUNDS`.
+    - `TPU_VISIBLE_CHIPS` and `TPU_VISIBLE_DEVICES` are emitted ONLY when
+      `verified_visibility` supplies verified runtime ordinals (from sysfs
+      `chip_id`, explicit `--chip-id-map`, or a complete full-host `all`
+      allocation), preserving workload-provided visibility when ordinals are
+      unverified on sub-host slices.
     - Independently composable unit selectors (`pci-*`, `group-pci-*`) omit
-      `TPU_VISIBLE_CHIPS`, `TPU_VISIBLE_DEVICES`, and `TPU_CHIPS_PER_HOST_BOUNDS`
-      so combining multiple selectors never overwrites visibility in OCI env merging.
+      visibility and host bounds so combining multiple selectors never
+      overwrites visibility in OCI env merging.
     """
     if not single_host_env:
         return []
 
     env: List[str] = []
     if (
-        include_visibility_env
-        and len(physical_chip_indices) in _SUPPORTED_SINGLE_HOST_CHIP_COUNTS
+        include_bounds_env
+        and physical_chip_count in _SUPPORTED_SINGLE_HOST_CHIP_COUNTS
     ):
-        visible_chips = ",".join(str(idx) for idx in physical_chip_indices)
-        visible_devices = ",".join(str(idx) for idx in logical_device_indices)
-        bounds = _chips_per_host_bounds(len(physical_chip_indices), generations)
-        env.extend(
-            [
-                f"TPU_VISIBLE_CHIPS={visible_chips}",
-                f"TPU_VISIBLE_DEVICES={visible_devices}",
-                f"TPU_CHIPS_PER_HOST_BOUNDS={bounds}",
-            ]
-        )
+        if verified_visibility is not None:
+            vis_chips, vis_devices = verified_visibility
+            env.append("TPU_VISIBLE_CHIPS=" + ",".join(str(idx) for idx in vis_chips))
+            env.append("TPU_VISIBLE_DEVICES=" + ",".join(str(idx) for idx in vis_devices))
+        bounds = _chips_per_host_bounds(physical_chip_count, generations)
+        env.append(f"TPU_CHIPS_PER_HOST_BOUNDS={bounds}")
     env.extend(
         [
             "MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353",
@@ -887,7 +1024,7 @@ def _compute_topology_slices(
         slice_phys_indices = tuple(_distinct_physical_indices(d_chips, bdf_to_phys))
         if (
             len(slice_phys_indices) not in _SUPPORTED_SUBHOST_SLICE_CHIP_COUNTS
-            or not _has_complete_chip_functions(d_chips, len(slice_phys_indices))
+            or not _has_complete_chip_functions(d_chips, bdf_to_phys)
         ):
             continue
         slice_logical_indices = tuple(_logical_device_indices(d_chips, slice_phys_indices))
@@ -962,6 +1099,7 @@ def build_cdi_spec(
     network_mode: str = "host",
     single_host_env: bool = False,
     cdi_version: str = DEFAULT_CDI_VERSION,
+    chip_id_map: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Any]:
     """Build a CNCF CDI JSON specification dictionary (default: CDI v0.6.0, host-safe env).
 
@@ -1045,13 +1183,12 @@ def build_cdi_spec(
             if c.generation not in unit_gens:
                 unit_gens.append(c.generation)
         unit_phys_indices = _distinct_physical_indices(unit_chips, bdf_to_phys)
-        unit_logical_indices = _logical_device_indices(unit_chips, unit_phys_indices)
         unit_env = _build_device_env(
-            unit_phys_indices,
-            unit_logical_indices,
+            len(unit_phys_indices),
             unit_gens,
             single_host_env=inject_single_host_env,
-            include_visibility_env=False,
+            include_bounds_env=False,
+            verified_visibility=None,
         )
         unit_edits: Dict[str, Any] = {"deviceNodes": [dict(n) for n in unit_nodes]}
         if unit_env:
@@ -1121,12 +1258,19 @@ def build_cdi_spec(
     used_names = {d["name"] for d in devices}
     for topo_slice in _compute_topology_slices(chips, bdf_to_phys, reserved_names=used_names):
         slice_nodes, slice_devnums = _dedup_device_nodes(topo_slice.chips)
+        slice_visibility = _resolve_verified_visibility_ordinals(
+            topo_slice.chips,
+            chips,
+            bdf_to_phys,
+            chip_id_map=chip_id_map,
+            is_full_host_all=False,
+        )
         slice_env = _build_device_env(
-            topo_slice.physical_indices,
-            topo_slice.logical_indices,
+            len(topo_slice.physical_indices),
             topo_slice.generations,
             single_host_env=inject_single_host_env,
-            include_visibility_env=True,
+            include_bounds_env=True,
+            verified_visibility=slice_visibility,
         )
         slice_ann_base: Dict[str, str] = {
             "freetpu.dev/allocation-unit": topo_slice.allocation_unit,
@@ -1163,7 +1307,14 @@ def build_cdi_spec(
             )
 
     all_phys_indices = _distinct_physical_indices(chips, bdf_to_phys)
-    all_logical_indices = _logical_device_indices(chips, all_phys_indices)
+    all_complete = _has_complete_chip_functions(chips, bdf_to_phys)
+    all_visibility = _resolve_verified_visibility_ordinals(
+        chips,
+        chips,
+        bdf_to_phys,
+        chip_id_map=chip_id_map,
+        is_full_host_all=True,
+    )
     all_ann: Dict[str, str] = {
         "freetpu.dev/allocation-unit": "all-devices",
         "freetpu.dev/chip-count": str(len(all_phys_indices)),
@@ -1179,11 +1330,11 @@ def build_cdi_spec(
         all_ann["freetpu.dev/vfio-devnums"] = all_devnums
 
     all_env = _build_device_env(
-        all_phys_indices,
-        all_logical_indices,
+        len(all_phys_indices),
         all_generations,
         single_host_env=inject_single_host_env,
-        include_visibility_env=True,
+        include_bounds_env=all_complete,
+        verified_visibility=all_visibility,
     )
     all_edits: Dict[str, Any] = {"deviceNodes": list(seen_group_nodes.values())}
     if all_env:
@@ -2083,6 +2234,7 @@ def reconcile_cdi_spec(
     iommu_dev_path: Optional[Path] = None,
     cdi_version: str = DEFAULT_CDI_VERSION,
     vfio_mode: str = "auto",
+    chip_id_map: Optional[Dict[str, int]] = None,
 ) -> Tuple[bool, str]:
     """Generate, validate, and atomically publish a live CDI spec, invalidating stale files on error."""
     if not isinstance(kind, str) or not _CDI_KIND_RE.match(kind):
@@ -2108,6 +2260,7 @@ def reconcile_cdi_spec(
             network_mode=network_mode,
             single_host_env=single_host_env,
             cdi_version=cdi_version,
+            chip_id_map=chip_id_map,
         )
     except Exception as exc:  # noqa: BLE001
         removed, cleanup_err = _invalidate_spec(output_path)
@@ -2216,8 +2369,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Opt in to injecting single-host isolated libtpu env overrides "
             "(MEGASCALE_COORDINATOR_ADDRESS=127.0.0.1:8353, TPU_HOST_BOUNDS=1,1,1, "
             "TPU_WORKER_HOSTNAMES=localhost, TPU_WORKER_ID=0, TPU_SKIP_MDS_QUERY=true, "
-            "plus slice-scoped TPU_VISIBLE_CHIPS, TPU_VISIBLE_DEVICES, and "
-            "TPU_CHIPS_PER_HOST_BOUNDS on full-allocation selectors)."
+            "plus TPU_CHIPS_PER_HOST_BOUNDS and verified TPU_VISIBLE_CHIPS / "
+            "TPU_VISIBLE_DEVICES when runtime ordinals are verified via sysfs chip_id, "
+            "--chip-id-map, or full-host 'all')."
+        ),
+    )
+    gen.add_argument(
+        "--chip-id-map",
+        default=None,
+        help=(
+            "Optional JSON object or file path mapping PCI BDF -> verified runtime "
+            "chip/device ordinal (used with --single-host-env to emit authoritative "
+            "TPU_VISIBLE_CHIPS / TPU_VISIBLE_DEVICES on sub-host slices)."
         ),
     )
     gen.add_argument(
@@ -2367,6 +2530,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional override path for /dev/iommu probing (default: <dev-root>/iommu).",
     )
+    sync.add_argument(
+        "--chip-id-map",
+        default=None,
+        help=(
+            "Optional JSON object or file path mapping PCI BDF -> verified runtime "
+            "chip/device ordinal for --single-host-env sub-host slice visibility."
+        ),
+    )
 
     dargs = sub.add_parser(
         "docker-args",
@@ -2412,6 +2583,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 1
 
         try:
+            parsed_chip_map = _load_chip_id_map(args.chip_id_map)
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(f"freetpu-cdi generate failed: invalid --chip-id-map: {exc}\n")
+            return 1
+
+        try:
             chips, vfio_container = discover_tpu_chips(
                 sysfs_root=args.sysfs_root,
                 dev_root=args.dev_root,
@@ -2426,6 +2603,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 network_mode=args.network_mode,
                 single_host_env=args.single_host_env,
                 cdi_version=args.cdi_version,
+                chip_id_map=parsed_chip_map,
             )
         except Exception as exc:  # noqa: BLE001
             if not args.stdout and not args.allow_missing_vfio:
@@ -2518,6 +2696,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not isinstance(args.kind, str) or not _CDI_KIND_RE.match(args.kind):
             sys.stderr.write(f"freetpu-cdi sync failed: Invalid CDI kind {args.kind!r}\n")
             return 1
+        try:
+            parsed_chip_map = _load_chip_id_map(args.chip_id_map)
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(f"freetpu-cdi sync failed: invalid --chip-id-map: {exc}\n")
+            return 1
         if args.once:
             ok, msg = reconcile_cdi_spec(
                 args.output,
@@ -2529,6 +2712,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 iommu_dev_path=args.iommu_dev,
                 cdi_version=args.cdi_version,
                 vfio_mode=args.vfio_mode,
+                chip_id_map=parsed_chip_map,
             )
             sys.stderr.write(f"freetpu-cdi sync: {msg}\n")
             return 0 if ok else 1
@@ -2556,6 +2740,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     iommu_dev_path=args.iommu_dev,
                     cdi_version=args.cdi_version,
                     vfio_mode=args.vfio_mode,
+                    chip_id_map=parsed_chip_map,
                 )
             except Exception as exc:  # noqa: BLE001
                 removed, cleanup_err = _invalidate_spec(args.output)

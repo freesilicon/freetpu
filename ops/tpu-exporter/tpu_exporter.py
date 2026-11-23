@@ -52,6 +52,7 @@ import threading
 import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import urllib.error
+import urllib.parse
 import urllib.request
 
 GOOGLE_PCI_VENDOR_ID = "0x1ae0"
@@ -1190,37 +1191,38 @@ def _query_grpc_runtime_metrics(
     # collected BEFORE filtering unset/NaN/negative gauges:
     # - On `devices_per_chip == 1` generations (v5e, v6e), always join 1:1.
     # - On `devices_per_chip > 1` generations (Ironwood tpu7x, v2/v3, v4/v5p):
-    #   - If raw duty-cycle IDs match the core set or include any ID >= chip_count,
-    #     treat the response as per-core (1:1) and never duplicate usable readings
-    #     across cores with missing values.
-    #   - Expand per-chip (`c -> c * devices_per_chip + offset`) ONLY when raw
-    #     duty-cycle IDs match the full physical-chip ID set for the core/device
-    #     layout (and expand only entries with valid readings).
-    #   - If a partial numeric response is ambiguous (cannot distinguish per-chip
-    #     from per-core), omit those ambiguous duty-cycle readings rather than
-    #     misassigning them to the wrong core.
+    #   Check exact observed ID sets FIRST (so sliced partitions like Ironwood
+    #   physical chips `{2,3}` with HBM cores `{4,5,6,7}` match `expanded == HBM`
+    #   before any count-based heuristic!):
+    #   - If `raw_duty_ids == raw_hbm_ids`, treat as 1:1 per-core (never doubling
+    #     when some cores had unset/NaN gauges).
+    #   - Else if `expanded(raw_duty_ids) == raw_hbm_ids` (1:N bijection), treat
+    #     as per-chip and expand only valid readings.
+    #   - Else if `raw_duty_ids <= raw_hbm_ids` and `not expanded <= raw_hbm_ids`,
+    #     treat as partial per-core (1:1).
+    #   - Otherwise treat as ambiguous and omit duty-cycle attachment rather than
+    #     misassigning readings to the wrong core.
     duty_layout = "per_core"
     if devices_per_chip > 1 and duty_by_chip and all(k.isdigit() for k in raw_duty_ids):
         raw_duty_int_ids = {int(k) for k in raw_duty_ids}
         all_hbm_core_ids = {int(k) for k in raw_hbm_ids if k.isdigit()}
         if all_hbm_core_ids:
-            expected_chip_ids = {cid // devices_per_chip for cid in all_hbm_core_ids}
-            expected_chip_count = len(expected_chip_ids)
             expanded_raw = {
                 cid * devices_per_chip + off
                 for cid in raw_duty_int_ids
                 for off in range(devices_per_chip)
             }
-            if raw_duty_int_ids == all_hbm_core_ids or any(
-                cid >= expected_chip_count for cid in raw_duty_int_ids
-            ):
+            if raw_duty_int_ids == all_hbm_core_ids:
                 duty_layout = "per_core"
             elif (
-                raw_duty_int_ids == expected_chip_ids
+                expanded_raw == all_hbm_core_ids
                 and len(raw_duty_int_ids) * devices_per_chip == len(all_hbm_core_ids)
-                and expanded_raw == all_hbm_core_ids
             ):
                 duty_layout = "per_chip"
+            elif raw_duty_int_ids <= all_hbm_core_ids and not (
+                expanded_raw <= all_hbm_core_ids
+            ):
+                duty_layout = "per_core"
             else:
                 duty_layout = "ambiguous"
         elif len(devices) > 0 and len(devices) % devices_per_chip == 0:
@@ -1409,14 +1411,29 @@ def read_pcie_aer_counters(pci_entry: Path) -> Tuple[Optional[int], Optional[int
     )
 
 
+_GCP_METADATA_DIRECT_HOSTS = frozenset({"metadata.google.internal", "169.254.169.254"})
+
+
 def query_gcp_preemption_status(
     url: str = DEFAULT_GCP_METADATA_PREEMPTED_URL,
     timeout_s: float = 0.5,
 ) -> Optional[int]:
-    """Query GCP instance preemption metadata (`1` if preempted, `0` if healthy, `None` if unavailable)."""
+    """Query GCP instance preemption metadata (`1` if preempted, `0` if healthy, `None` if unavailable).
+
+    Bypasses process HTTP proxies for Compute Engine's built-in metadata endpoints
+    (`metadata.google.internal` and `169.254.169.254`) so VM proxy settings do not
+    silently break Spot preemption polling when `NO_PROXY` omits the metadata host.
+    """
     try:
         req = urllib.request.Request(url, headers={"Metadata-Flavor": "Google"})
-        with urllib.request.urlopen(req, timeout=max(0.05, float(timeout_s))) as resp:
+        host = (urllib.parse.urlparse(url).hostname or "").lower()
+        effective_timeout = max(0.05, float(timeout_s))
+        if host in _GCP_METADATA_DIRECT_HOSTS:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            resp_ctx = opener.open(req, timeout=effective_timeout)
+        else:
+            resp_ctx = urllib.request.urlopen(req, timeout=effective_timeout)
+        with resp_ctx as resp:
             body = resp.read(256).decode("utf-8", errors="replace").strip().lower()
     except (OSError, urllib.error.URLError, ValueError):
         return None
