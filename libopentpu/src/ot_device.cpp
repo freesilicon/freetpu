@@ -142,6 +142,15 @@ ot_status_t raw_d2h_locked(ot_context_t* ctx, uint64_t src_hbm,
   return OT_OK;
 }
 
+struct ScopedBuf {
+  uint8_t* ptr = nullptr;
+  explicit ScopedBuf(size_t bytes) : ptr(static_cast<uint8_t*>(std::malloc(bytes))) {}
+  ~ScopedBuf() { std::free(ptr); }
+  ScopedBuf(const ScopedBuf&) = delete;
+  ScopedBuf& operator=(const ScopedBuf&) = delete;
+  uint16_t* u16() const { return reinterpret_cast<uint16_t*>(ptr); }
+};
+
 ot_status_t read_buffer_row_major_locked(ot_context_t* ctx, const ot_buffer_t* src,
                                          uint8_t* dst_bytes, size_t size_bytes) {
   if (size_bytes == 0) return OT_OK;
@@ -152,16 +161,27 @@ ot_status_t read_buffer_row_major_locked(ot_context_t* ctx, const ot_buffer_t* s
     ctx->last_error = "Invalid tiled buffer size";
     return OT_ERR_INVALID_ARG;
   }
-  std::vector<uint16_t> tiled(128u * 128u);
-  ot_status_t st = raw_d2h_locked(ctx, src->hbm_addr,
-                                  reinterpret_cast<uint8_t*>(tiled.data()),
-                                  ot::kTile128x128Bf16Bytes);
+  ScopedBuf tiled(ot::kTile128x128Bf16Bytes);
+  if (!tiled.ptr) {
+    ctx->last_error = "Failed to allocate host tile readback workspace";
+    return OT_ERR_NO_MEMORY;
+  }
+  ot_status_t st = raw_d2h_locked(ctx, src->hbm_addr, tiled.ptr, ot::kTile128x128Bf16Bytes);
   if (st != OT_OK) return st;
 
-  std::vector<uint16_t> rm(128u * 128u);
-  ot::tile_unpack_128x128_bf16(tiled.data(), rm.data());
-  const size_t first = std::min(size_bytes, ot::kTile128x128Bf16Bytes);
-  std::memcpy(dst_bytes, rm.data(), first);
+  if (size_bytes >= ot::kTile128x128Bf16Bytes &&
+      (reinterpret_cast<uintptr_t>(dst_bytes) % alignof(uint16_t)) == 0) {
+    ot::tile_unpack_128x128_bf16(tiled.u16(), reinterpret_cast<uint16_t*>(dst_bytes));
+  } else {
+    ScopedBuf rm(ot::kTile128x128Bf16Bytes);
+    if (!rm.ptr) {
+      ctx->last_error = "Failed to allocate host tile unpack workspace";
+      return OT_ERR_NO_MEMORY;
+    }
+    ot::tile_unpack_128x128_bf16(tiled.u16(), rm.u16());
+    const size_t first = std::min(size_bytes, ot::kTile128x128Bf16Bytes);
+    std::memcpy(dst_bytes, rm.ptr, first);
+  }
   if (size_bytes > ot::kTile128x128Bf16Bytes) {
     return raw_d2h_locked(ctx, src->hbm_addr + ot::kTile128x128Bf16Bytes,
                           dst_bytes + ot::kTile128x128Bf16Bytes,
@@ -176,14 +196,18 @@ ot_status_t write_buffer_raw_locked(ot_context_t* ctx, ot_buffer_t* dst, size_t 
   // materialize the tiled prefix to row-major first so untouched logical bytes survive.
   if (dst->layout == ot::BufferLayout::kTiled2x128Bf16 &&
       !(dst_offset == 0 && size_bytes >= ot::kTile128x128Bf16Bytes)) {
-    std::vector<uint8_t> rm(ot::kTile128x128Bf16Bytes, 0);
-    ot_status_t st = read_buffer_row_major_locked(ctx, dst, rm.data(), rm.size());
+    ScopedBuf rm(ot::kTile128x128Bf16Bytes);
+    if (!rm.ptr) {
+      ctx->last_error = "Failed to allocate host tile materialize workspace";
+      return OT_ERR_NO_MEMORY;
+    }
+    ot_status_t st = read_buffer_row_major_locked(ctx, dst, rm.ptr, ot::kTile128x128Bf16Bytes);
     if (st != OT_OK) return st;
     if (dst_offset < ot::kTile128x128Bf16Bytes) {
       size_t overlap = std::min(size_bytes, ot::kTile128x128Bf16Bytes - dst_offset);
-      std::memcpy(rm.data() + dst_offset, src_bytes, overlap);
+      std::memcpy(rm.ptr + dst_offset, src_bytes, overlap);
     }
-    st = raw_h2d_locked(ctx, dst->hbm_addr, dst->size_bytes, 0u, rm.data(), rm.size());
+    st = raw_h2d_locked(ctx, dst->hbm_addr, dst->size_bytes, 0u, rm.ptr, ot::kTile128x128Bf16Bytes);
     if (st != OT_OK) return st;
     dst->layout = ot::BufferLayout::kRaw;
     if (dst_offset + size_bytes > ot::kTile128x128Bf16Bytes) {
@@ -218,17 +242,75 @@ ot_status_t buffer_h2d_tiled_128x128_bf16(ot_context_t* ctx, ot_buffer_t* dst,
   if (!ctx->info.is_mock && !ctx->transport.is_owner_process()) {
     return OT_ERR_DEVICE;
   }
-  std::vector<uint16_t> rm(128u * 128u);
-  std::memcpy(rm.data(), host_src_row_major, kTile128x128Bf16Bytes);
-  std::vector<uint16_t> tiled(128u * 128u);
-  tile_pack_128x128_bf16(rm.data(), tiled.data());
+  ScopedBuf tiled(kTile128x128Bf16Bytes);
+  if (!tiled.ptr) return OT_ERR_NO_MEMORY;
+  if ((reinterpret_cast<uintptr_t>(host_src_row_major) % alignof(uint16_t)) == 0) {
+    tile_pack_128x128_bf16(static_cast<const uint16_t*>(host_src_row_major), tiled.u16());
+  } else {
+    ScopedBuf rm(kTile128x128Bf16Bytes);
+    if (!rm.ptr) return OT_ERR_NO_MEMORY;
+    std::memcpy(rm.ptr, host_src_row_major, kTile128x128Bf16Bytes);
+    tile_pack_128x128_bf16(rm.u16(), tiled.u16());
+  }
 
   std::lock_guard<std::mutex> lk(ctx->mu);
   ot_status_t st = raw_h2d_locked(ctx, dst->hbm_addr, dst->size_bytes, 0u,
-                                  reinterpret_cast<const uint8_t*>(tiled.data()),
-                                  kTile128x128Bf16Bytes);
+                                  tiled.ptr, kTile128x128Bf16Bytes);
   if (st != OT_OK) return st;
   dst->layout = BufferLayout::kTiled2x128Bf16;
+  return OT_OK;
+}
+
+ot_status_t buffer_d2h_raw(ot_context_t* ctx, const ot_buffer_t* src,
+                           void* host_dst, size_t size_bytes) {
+  if (!ctx || !src || !host_dst) return OT_ERR_INVALID_ARG;
+  if (is_foreign_forked_buffer(src)) return OT_ERR_DEVICE;
+  if (src->ctx != ctx || src->ctx_instance_id != ctx->instance_id ||
+      size_bytes > src->size_bytes) {
+    return OT_ERR_INVALID_ARG;
+  }
+  if (size_bytes == 0) return OT_OK;
+  if (!ctx->info.is_mock && !ctx->transport.is_owner_process()) {
+    return OT_ERR_DEVICE;
+  }
+  std::lock_guard<std::mutex> lk(ctx->mu);
+  return raw_d2h_locked(ctx, src->hbm_addr, static_cast<uint8_t*>(host_dst), size_bytes);
+}
+
+ot_status_t buffer_d2h_tiled_128x128_bf16(ot_context_t* ctx, const ot_buffer_t* src,
+                                          void* host_dst_tiled) {
+  if (!ctx || !src || !host_dst_tiled) return OT_ERR_INVALID_ARG;
+  if (is_foreign_forked_buffer(src)) return OT_ERR_DEVICE;
+  if (src->ctx != ctx || src->ctx_instance_id != ctx->instance_id ||
+      src->size_bytes < kTile128x128Bf16Bytes) {
+    return OT_ERR_INVALID_ARG;
+  }
+  if (!ctx->info.is_mock && !ctx->transport.is_owner_process()) {
+    return OT_ERR_DEVICE;
+  }
+  std::lock_guard<std::mutex> lk(ctx->mu);
+  if (src->layout == BufferLayout::kTiled2x128Bf16) {
+    return raw_d2h_locked(ctx, src->hbm_addr, static_cast<uint8_t*>(host_dst_tiled),
+                          kTile128x128Bf16Bytes);
+  }
+  ScopedBuf rm(kTile128x128Bf16Bytes);
+  if (!rm.ptr) {
+    ctx->last_error = "Failed to allocate host tile pack workspace";
+    return OT_ERR_NO_MEMORY;
+  }
+  ot_status_t st = raw_d2h_locked(ctx, src->hbm_addr, rm.ptr, kTile128x128Bf16Bytes);
+  if (st != OT_OK) return st;
+  if ((reinterpret_cast<uintptr_t>(host_dst_tiled) % alignof(uint16_t)) == 0) {
+    tile_pack_128x128_bf16(rm.u16(), static_cast<uint16_t*>(host_dst_tiled));
+  } else {
+    ScopedBuf tiled(kTile128x128Bf16Bytes);
+    if (!tiled.ptr) {
+      ctx->last_error = "Failed to allocate host tile pack output workspace";
+      return OT_ERR_NO_MEMORY;
+    }
+    tile_pack_128x128_bf16(rm.u16(), tiled.u16());
+    std::memcpy(host_dst_tiled, tiled.ptr, kTile128x128Bf16Bytes);
+  }
   return OT_OK;
 }
 
@@ -306,12 +388,12 @@ ot_status_t ot_context_create(const ot_config_t* config, ot_context_t** out_ctx)
     if (ctx->transport.bar4_mmio && ctx->transport.bar4_mapped_len >= 0x20) {
       size_t read_len = ctx->transport.bar4_mapped_len < 4096u ? ctx->transport.bar4_mapped_len : 4096u;
       read_len &= ~size_t{3u};
-      std::vector<uint8_t> page(read_len, 0);
-      for (size_t i = 0; i < page.size(); i += 4) {
+      uint8_t page[4096] = {};
+      for (size_t i = 0; i < read_len; i += 4) {
         uint32_t w = ctx->transport.read32_bar4(i);
-        std::memcpy(page.data() + i, &w, 4);
+        std::memcpy(page + i, &w, 4);
       }
-      if (ot::parse_bar4_descriptor(page.data(), page.size(), &ctx->bar4_desc)) {
+      if (ot::parse_bar4_descriptor(page, read_len, &ctx->bar4_desc)) {
         ctx->info.is_prebooted = 1u;
       }
     }
@@ -697,17 +779,18 @@ ot_status_t ot_matmul_bf16(ot_context_t* ctx,
       return OT_OK;
     }
 
-    // Raw row-major input in HBM: D2H -> pack {1,0:T(2,128)} -> H2D into scratch.
-    std::vector<uint16_t> rm(128u * 128u);
-    ot_status_t st = raw_d2h_locked(ctx, src->hbm_addr,
-                                    reinterpret_cast<uint8_t*>(rm.data()),
-                                    ot::kTile128x128Bf16Bytes);
+    // Raw row-major input in HBM: D2H -> pack {1,0:T(2,128)(2,1)} -> H2D into scratch.
+    ScopedBuf rm(ot::kTile128x128Bf16Bytes);
+    ScopedBuf tiled(ot::kTile128x128Bf16Bytes);
+    if (!rm.ptr || !tiled.ptr) {
+      ctx->last_error = "Failed to allocate host tile pack workspace";
+      return OT_ERR_NO_MEMORY;
+    }
+    ot_status_t st = raw_d2h_locked(ctx, src->hbm_addr, rm.ptr, ot::kTile128x128Bf16Bytes);
     if (st != OT_OK) return st;
-    std::vector<uint16_t> tiled(128u * 128u);
-    ot::tile_pack_128x128_bf16(rm.data(), tiled.data());
+    ot::tile_pack_128x128_bf16(rm.u16(), tiled.u16());
     st = raw_h2d_locked(ctx, dst_scratch, ot::kTile128x128Bf16Bytes, 0u,
-                        reinterpret_cast<const uint8_t*>(tiled.data()),
-                        ot::kTile128x128Bf16Bytes);
+                        tiled.ptr, ot::kTile128x128Bf16Bytes);
     if (st != OT_OK) return st;
     *out_hbm = dst_scratch;
     return OT_OK;

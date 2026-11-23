@@ -610,9 +610,18 @@ bool run_pjrt_api_proof(void* lib, bool mock_mode, int num_runs) {
     destroy_event(dev_ev[0]);
 
     std::fill(host_c.begin(), host_c.end(), 0u);
+    static const int64_t kDenseMinorToMajor[2] = {1, 0};
+    PJRT_Buffer_MemoryLayout dense_host_layout = {};
+    dense_host_layout.struct_size = PJRT_Buffer_MemoryLayout_STRUCT_SIZE;
+    dense_host_layout.type = PJRT_Buffer_MemoryLayout_Type_Tiled;
+    dense_host_layout.tiled.struct_size = PJRT_Buffer_MemoryLayout_Tiled_STRUCT_SIZE;
+    dense_host_layout.tiled.minor_to_major = kDenseMinorToMajor;
+    dense_host_layout.tiled.minor_to_major_size = 2;
+
     PJRT_Buffer_ToHostBuffer_Args th = {};
     th.struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE;
     th.src = outs[0];
+    th.host_layout = &dense_host_layout;
     th.dst = host_c.data();
     th.dst_size = host_c.size() * sizeof(uint16_t);
     if (PJRT_Error* e = api->PJRT_Buffer_ToHostBuffer(&th)) {

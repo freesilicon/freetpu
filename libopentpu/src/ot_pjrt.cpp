@@ -2154,11 +2154,18 @@ PJRT_Error* ot_pjrt_buf_to_host(PJRT_Buffer_ToHostBuffer_Args* args) {
     return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "buffer has been deleted");
   }
   size_t elem_sz = dtype_bytes(args->src->dtype);
-  if (args->host_layout &&
-      !is_supported_dense_layout(args->host_layout, args->src->dims.data(), args->src->dims.size(),
-                                 elem_sz)) {
-    return make_err(PJRT_Error_Code_UNIMPLEMENTED,
-                    "unsupported host_layout (dense row-major only)");
+  const bool req_tiled =
+      args->host_layout &&
+      is_supported_tiled_2x128_layout(args->host_layout, args->src->dtype,
+                                      args->src->dims.data(), args->src->dims.size());
+  const bool req_dense =
+      args->host_layout &&
+      is_supported_dense_layout(args->host_layout, args->src->dims.data(),
+                                args->src->dims.size(), elem_sz);
+  if (args->host_layout && !req_dense && !req_tiled) {
+    return make_err(
+        PJRT_Error_Code_UNIMPLEMENTED,
+        "unsupported host_layout (dense row-major or 128x128 bf16 {1,0:T(2,128)(2,1)} only)");
   }
   size_t need = args->src->logical_bytes;
   if (!args->dst) {
@@ -2172,7 +2179,15 @@ PJRT_Error* ot_pjrt_buf_to_host(PJRT_Buffer_ToHostBuffer_Args* args) {
   auto* ev = new (std::nothrow) PJRT_Event();
   if (!ev) return make_err(PJRT_Error_Code_RESOURCE_EXHAUSTED, "out of memory");
   if (need > 0) {
-    ot_status_t st = ot_buffer_d2h(args->src->ctx, args->src->ot_buf, args->dst, need);
+    ot_status_t st = OT_OK;
+    if (!args->host_layout) {
+      // Per PJRT 0.116 contract, null host_layout reads back in the source buffer's layout.
+      st = ot::buffer_d2h_raw(args->src->ctx, args->src->ot_buf, args->dst, need);
+    } else if (req_tiled) {
+      st = ot::buffer_d2h_tiled_128x128_bf16(args->src->ctx, args->src->ot_buf, args->dst);
+    } else {
+      st = ot_buffer_d2h(args->src->ctx, args->src->ot_buf, args->dst, need);
+    }
     if (st != OT_OK) {
       delete ev;
       return make_ot_err(args->src->ctx, st);

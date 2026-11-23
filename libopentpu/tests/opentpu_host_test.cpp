@@ -1156,9 +1156,17 @@ static void test_pjrt_api_mock() {
   }
 
   std::vector<uint16_t> out_h(128 * 128, 0);
+  const int64_t dense_m2m[2] = {1, 0};
+  PJRT_Buffer_MemoryLayout dense_host_layout = {};
+  dense_host_layout.struct_size = PJRT_Buffer_MemoryLayout_STRUCT_SIZE;
+  dense_host_layout.type = PJRT_Buffer_MemoryLayout_Type_Tiled;
+  dense_host_layout.tiled.struct_size = PJRT_Buffer_MemoryLayout_Tiled_STRUCT_SIZE;
+  dense_host_layout.tiled.minor_to_major = dense_m2m;
+  dense_host_layout.tiled.minor_to_major_size = 2;
   PJRT_Buffer_ToHostBuffer_Args th = {};
   th.struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE;
   th.src = outs[0];
+  th.host_layout = &dense_host_layout;
   th.dst = out_h.data();
   th.dst_size = out_h.size() * 2;
   OT_CHECK(api->PJRT_Buffer_ToHostBuffer(&th) == nullptr);
@@ -1258,6 +1266,32 @@ static void test_pjrt_api_mock() {
              ml_tiled.layout.tiled.tile_dims[1] == 128 &&
              ml_tiled.layout.tiled.tile_dims[2] == 2 &&
              ml_tiled.layout.tiled.tile_dims[3] == 1);
+
+    // Null host_layout preserves source {1,0:T(2,128)(2,1)} layout: (r=1,c=0) -> index 1.
+    std::vector<uint16_t> out_native(128u * 128u, 0);
+    PJRT_Buffer_ToHostBuffer_Args th_native = {};
+    th_native.struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE;
+    th_native.src = up_tiled.buffer;
+    th_native.dst = out_native.data();
+    th_native.dst_size = out_native.size() * sizeof(uint16_t);
+    OT_CHECK(api->PJRT_Buffer_ToHostBuffer(&th_native) == nullptr);
+    evd.event = th_native.event;
+    OT_CHECK(api->PJRT_Event_Destroy(&evd) == nullptr);
+    OT_CHECK(out_native[1] == 0x4000u && out_native[128] == 0x3f80u);
+
+    // Explicit dense host_layout unpacks {1,0:T(2,128)(2,1)} to row-major: (r=1,c=0) -> index 128.
+    std::vector<uint16_t> out_unpacked(128u * 128u, 0);
+    PJRT_Buffer_ToHostBuffer_Args th_dense = {};
+    th_dense.struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE;
+    th_dense.src = up_tiled.buffer;
+    th_dense.host_layout = &dense_host_layout;
+    th_dense.dst = out_unpacked.data();
+    th_dense.dst_size = out_unpacked.size() * sizeof(uint16_t);
+    OT_CHECK(api->PJRT_Buffer_ToHostBuffer(&th_dense) == nullptr);
+    evd.event = th_dense.event;
+    OT_CHECK(api->PJRT_Event_Destroy(&evd) == nullptr);
+    OT_CHECK(out_unpacked[128] == 0x4000u && out_unpacked[1] == 0x3f80u);
+
     evd.event = up_tiled.done_with_host_buffer;
     OT_CHECK(api->PJRT_Event_Destroy(&evd) == nullptr);
     bd.buffer = up_tiled.buffer;

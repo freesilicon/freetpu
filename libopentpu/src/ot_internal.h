@@ -172,6 +172,10 @@ ot_status_t buffer_h2d_offset(ot_context_t* ctx, ot_buffer_t* dst, size_t dst_of
                               const void* host_src, size_t size_bytes);
 ot_status_t buffer_h2d_tiled_128x128_bf16(ot_context_t* ctx, ot_buffer_t* dst,
                                           const void* host_src_row_major);
+ot_status_t buffer_d2h_raw(ot_context_t* ctx, const ot_buffer_t* src,
+                           void* host_dst, size_t size_bytes);
+ot_status_t buffer_d2h_tiled_128x128_bf16(ot_context_t* ctx, const ot_buffer_t* src,
+                                          void* host_dst_tiled);
 uint64_t context_hbm_used_bytes(const ot_context_t* ctx);
 bool validate_cq_completion(uint32_t sent_seq, const uint32_t cq[8], std::string* err);
 // Static allocation-free PJRT_Error fallback used when error allocation fails.
