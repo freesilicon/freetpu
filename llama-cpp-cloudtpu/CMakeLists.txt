@@ -17,14 +17,28 @@ if (COMMAND ggml_add_backend_library)
         message(FATAL_ERROR "ggml-cloudtpu: pjrt_c_api.h not found (set -DCLOUDTPU_PJRT_INCLUDE_DIR=<path>)")
     endif()
 
+    if (EXISTS "${CMAKE_CURRENT_LIST_DIR}/freetile/include/freetile/tile_ir.hpp")
+        set(CLOUDTPU_FREETILE_DIR "${CMAKE_CURRENT_LIST_DIR}/freetile")
+    else()
+        set(CLOUDTPU_FREETILE_DIR "${CMAKE_CURRENT_LIST_DIR}/../freetile")
+    endif()
+    if (NOT EXISTS "${CLOUDTPU_FREETILE_DIR}/include/freetile/tile_ir.hpp")
+        message(FATAL_ERROR "ggml-cloudtpu: freetile headers not found at ${CLOUDTPU_FREETILE_DIR}")
+    endif()
+
     ggml_add_backend_library(ggml-cloudtpu
         ggml-cloudtpu.cpp
         pjrt_runtime.cpp
         stablehlo_emitter.cpp
+        "${CLOUDTPU_FREETILE_DIR}/src/tile_ir.cpp"
+        "${CLOUDTPU_FREETILE_DIR}/src/mosaic_emitter.cpp"
     )
 
     target_compile_features(ggml-cloudtpu PRIVATE cxx_std_17)
-    target_include_directories(ggml-cloudtpu PRIVATE "${CMAKE_CURRENT_LIST_DIR}")
+    target_include_directories(ggml-cloudtpu PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}"
+        "${CLOUDTPU_FREETILE_DIR}/include"
+    )
     target_include_directories(ggml-cloudtpu SYSTEM PRIVATE "${CLOUDTPU_PJRT_INCLUDE_DIR}")
 
     if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
@@ -63,11 +77,25 @@ else()
         message(FATAL_ERROR "ggml-cloudtpu: pjrt_c_api.h not found (set -DCLOUDTPU_PJRT_INCLUDE_DIR=<path>)")
     endif()
 
+    if (EXISTS "${CMAKE_CURRENT_LIST_DIR}/freetile/include/freetile/tile_ir.hpp")
+        set(CLOUDTPU_FREETILE_DIR "${CMAKE_CURRENT_LIST_DIR}/freetile")
+    else()
+        set(CLOUDTPU_FREETILE_DIR "${CMAKE_CURRENT_LIST_DIR}/../freetile")
+    endif()
+    if (NOT EXISTS "${CLOUDTPU_FREETILE_DIR}/include/freetile/tile_ir.hpp")
+        message(FATAL_ERROR "ggml-cloudtpu: freetile headers not found at ${CLOUDTPU_FREETILE_DIR}")
+    endif()
+
     add_library(cloudtpu_core STATIC
         pjrt_runtime.cpp
         stablehlo_emitter.cpp
+        "${CLOUDTPU_FREETILE_DIR}/src/tile_ir.cpp"
+        "${CLOUDTPU_FREETILE_DIR}/src/mosaic_emitter.cpp"
     )
-    target_include_directories(cloudtpu_core PUBLIC "${CMAKE_CURRENT_LIST_DIR}")
+    target_include_directories(cloudtpu_core PUBLIC
+        "${CMAKE_CURRENT_LIST_DIR}"
+        "${CLOUDTPU_FREETILE_DIR}/include"
+    )
     target_include_directories(cloudtpu_core SYSTEM PUBLIC "${CLOUDTPU_PJRT_INCLUDE_DIR}")
     if (NOT WIN32)
         target_link_libraries(cloudtpu_core PUBLIC ${CMAKE_DL_LIBS} Threads::Threads)

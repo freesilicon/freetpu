@@ -1,5 +1,8 @@
 #include "stablehlo_emitter.hpp"
 
+#include "freetile/mosaic_emitter.hpp"
+#include "freetile/tile_ir.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
@@ -279,6 +282,33 @@ public:
               << ", precision = [" << prec << ", " << prec << "] : ("
               << lhs.mlir_type() << ", " << rhs.mlir_type() << ") -> "
               << out.mlir_type() << "\n";
+        return out;
+    }
+
+    SsaValue emit_tpu_custom_call(const std::vector<SsaValue>& operands,
+                                  const std::vector<int64_t>& out_dims,
+                                  PjrtDType out_dtype,
+                                  const std::string& backend_config_json,
+                                  const std::string& kernel_name) {
+        SsaValue out = next_val(out_dtype, out_dims);
+        body_ << "    " << out.name << " = stablehlo.custom_call @tpu_custom_call(";
+        for (size_t i = 0; i < operands.size(); ++i) {
+            if (i > 0) body_ << ", ";
+            body_ << operands[i].name;
+        }
+        body_ << ") {backend_config = \"" << freetile::escape_mlir_string_literal(backend_config_json)
+              << "\", kernel_name = \"" << freetile::escape_mlir_string_literal(kernel_name)
+              << "\", operand_layouts = [";
+        for (size_t i = 0; i < operands.size(); ++i) {
+            if (i > 0) body_ << ", ";
+            body_ << "dense<[1, 0]> : tensor<2xindex>";
+        }
+        body_ << "], result_layouts = [dense<[1, 0]> : tensor<2xindex>]} : (";
+        for (size_t i = 0; i < operands.size(); ++i) {
+            if (i > 0) body_ << ", ";
+            body_ << operands[i].mlir_type();
+        }
+        body_ << ") -> " << out.mlir_type() << "\n";
         return out;
     }
 
@@ -878,9 +908,14 @@ uint64_t fnv1a_64(const std::string& s) {
     return h;
 }
 
-std::string build_canonical_cache_key(const std::string& mlir_text, int32_t spmd_chips, int32_t mm_pad_m) {
+std::string build_canonical_cache_key(const std::string& mlir_text,
+                                      int32_t spmd_chips,
+                                      int32_t mm_pad_m,
+                                      bool freetile_mosaic,
+                                      int32_t freetile_chip_target,
+                                      int64_t freetile_mosaic_version) {
     // Structural key combining size + two independent FNV hashes (64-bit normal + 64-bit salted),
-    // exact length, SPMD chip count, and non-default mm_pad_m to prevent collisions without external SHA libraries.
+    // exact length, SPMD chip count, and non-default flags to prevent collisions without external SHA libraries.
     const uint64_t h1 = fnv1a_64(mlir_text);
     const uint64_t h2 = fnv1a_64(std::string("cloudtpu_v1:") + mlir_text);
     std::ostringstream oss = make_classic_stream();
@@ -888,6 +923,9 @@ std::string build_canonical_cache_key(const std::string& mlir_text, int32_t spmd
         << std::setw(16) << h2 << "_" << std::dec << mlir_text.size() << "_p" << spmd_chips;
     if (mm_pad_m != 8) {
         oss << "_pm" << mm_pad_m;
+    }
+    if (freetile_mosaic) {
+        oss << "_ftm" << freetile_chip_target << "_v" << freetile_mosaic_version;
     }
     return oss.str();
 }
@@ -1104,7 +1142,99 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                     const bool is_q4_i4 = (w_th.storage == TensorStorageKind::Q4_0_I4 ||
                                            w_th.storage == TensorStorageKind::Q4_K_I4);
                     const bool is_q4_factored = is_q4_i4 && (m_total <= 32);
+
+                    bool emitted_freetile_mosaic = false;
+                    SsaValue local_out;
+                    const bool freetile_storage_ok =
+                        (w_th.storage == TensorStorageKind::Q4_K_I4 && w_th.has_q_m) ||
+                        w_th.storage == TensorStorageKind::Q6_K_SPLIT ||
+                        w_th.storage == TensorStorageKind::Q4_0_I4 ||
+                        w_th.storage == TensorStorageKind::Q8_0_SPLIT;
+                    if (spec.freetile_mosaic && use_bf16_mxu && !op.high_precision && freetile_storage_ok &&
+                        x.dims[0] == 1 && x.dims[1] == 1 && x.dims[3] == K_local &&
+                        w_th.q_d.dims[0] == 1 && w_th.q_d.dims[1] == 1 &&
+                        w_th.q_qs.dims[0] == 1 && w_th.q_qs.dims[1] == 1) {
+                        freetile::ChipTarget ft_chip = freetile::ChipTarget::V5E;
+                        if (spec.freetile_chip_target == static_cast<int32_t>(freetile::ChipTarget::V6E)) {
+                            ft_chip = freetile::ChipTarget::V6E;
+                        } else if (spec.freetile_chip_target == static_cast<int32_t>(freetile::ChipTarget::TPU7X)) {
+                            ft_chip = freetile::ChipTarget::TPU7X;
+                        } else if (spec.freetile_chip_target == static_cast<int32_t>(freetile::ChipTarget::BUENOS_A0)) {
+                            ft_chip = freetile::ChipTarget::BUENOS_A0;
+                        }
+                        if (freetile::target_profile(ft_chip).supports_mosaic) {
+                            freetile::QuantFormat ft_fmt = freetile::QuantFormat::NONE;
+                            if (w_th.storage == TensorStorageKind::Q4_K_I4) {
+                                ft_fmt = freetile::QuantFormat::Q4_K;
+                            } else if (w_th.storage == TensorStorageKind::Q6_K_SPLIT) {
+                                ft_fmt = freetile::QuantFormat::Q6_K;
+                            } else if (w_th.storage == TensorStorageKind::Q4_0_I4) {
+                                ft_fmt = freetile::QuantFormat::Q4_0;
+                            } else {
+                                ft_fmt = freetile::QuantFormat::Q8_0;
+                            }
+
+                            const PjrtDType target_4bit =
+                                (w_th.bitcast_target != PjrtDType::INVALID) ? w_th.bitcast_target : PjrtDType::S4;
+                            const bool unsigned_q4 =
+                                is_q4_i4 && ((w_th.q_qs.dtype == PjrtDType::U8 && target_4bit == PjrtDType::U4) ||
+                                             w_th.q_qs.dtype == PjrtDType::U4);
+                            const freetile::DType ft_out_dt =
+                                (op.dst.dtype == PjrtDType::F32) ? freetile::DType::F32 : freetile::DType::BF16;
+                            const bool use_f32_scales =
+                                (w_th.q_d.dtype != PjrtDType::BF16) ||
+                                (w_th.storage == TensorStorageKind::Q4_K_I4 && w_th.has_q_m &&
+                                 w_th.q_m.dtype != PjrtDType::BF16);
+                            const freetile::DType ft_scale_dt =
+                                use_f32_scales ? freetile::DType::F32 : freetile::DType::BF16;
+                            const PjrtDType cc_scale_dt =
+                                use_f32_scales ? PjrtDType::F32 : PjrtDType::BF16;
+
+                            freetile::TileKernel ft_kernel;
+                            if (freetile::plan_quant_matmul_kernel(ft_chip, m_orig, K_local, N_local, ft_fmt,
+                                                                   ft_scale_dt, ft_out_dt, unsigned_q4,
+                                                                   &ft_kernel)) {
+                                const int64_t ft_m_pad = ft_kernel.matmul.m_padded;
+                                SsaValue x_ft_4d = x;
+                                if (m_orig < ft_m_pad) {
+                                    SsaValue pad_z = builder.emit_const_splat_f32(
+                                        0.0f, {1, 1, ft_m_pad - m_orig, K_local}, PjrtDType::BF16);
+                                    x_ft_4d = builder.emit_concatenate({x, pad_z}, 2);
+                                }
+                                SsaValue x_2d = builder.emit_reshape(x_ft_4d, {ft_m_pad, K_local});
+                                SsaValue qs_eff = is_q4_i4
+                                                      ? materialize_q4_i4_nibbles(builder, w_th.q_qs, target_4bit, N_local)
+                                                      : w_th.q_qs;
+                                SsaValue w_2d = builder.emit_reshape(qs_eff, {K_local, N_local});
+                                SsaValue d_cc = builder.emit_convert(w_th.q_d, cc_scale_dt);
+                                SsaValue d_2d = builder.emit_reshape(d_cc, {NB_local, N_local});
+
+                                std::vector<SsaValue> cc_ops = {x_2d, w_2d, d_2d};
+                                if (ft_kernel.matmul.has_min && w_th.has_q_m) {
+                                    SsaValue m_cc = builder.emit_convert(w_th.q_m, cc_scale_dt);
+                                    SsaValue m_2d = builder.emit_reshape(m_cc, {NB_local, N_local});
+                                    cc_ops.push_back(m_2d);
+                                }
+
+                                const freetile::MosaicEmitResult mosaic =
+                                    freetile::emit_mosaic_kernel(ft_kernel, spec.freetile_mosaic_version);
+                                const PjrtDType cc_out_dt =
+                                    (ft_out_dt == freetile::DType::F32) ? PjrtDType::F32 : PjrtDType::BF16;
+                                SsaValue cc_out = builder.emit_tpu_custom_call(
+                                    cc_ops, {ft_m_pad, N_local}, cc_out_dt, mosaic.backend_config_json,
+                                    mosaic.kernel_name);
+                                SsaValue out_4d = builder.emit_reshape(cc_out, {1, 1, ft_m_pad, N_local});
+                                if (m_orig < ft_m_pad) {
+                                    out_4d = builder.emit_slice(out_4d, {0, 0, 0, 0}, {1, 1, m_orig, N_local});
+                                }
+                                local_out = builder.emit_convert(out_4d, op.dst.dtype);
+                                emitted_freetile_mosaic = true;
+                            }
+                        }
+                    }
+
                     const bool apply_pad_m =
+                        !emitted_freetile_mosaic &&
                         use_bf16_mxu && !op.high_precision && spec.mm_pad_m > 1 &&
                         x.dims[0] == 1 && x.dims[1] == 1 &&
                         m_orig >= 1 && m_orig < spec.mm_pad_m &&
@@ -1119,8 +1249,9 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                     }
                     const std::vector<int64_t> dot_out_dims = {x_mm.dims[0], x_mm.dims[1], x_mm.dims[2], N_local};
 
-                    SsaValue local_out;
-                    if (w_th.storage == TensorStorageKind::Q8_0_SPLIT ||
+                    if (emitted_freetile_mosaic) {
+                        // Collectives handled uniformly below (skipping apply_pad_m slice).
+                    } else if (w_th.storage == TensorStorageKind::Q8_0_SPLIT ||
                         w_th.storage == TensorStorageKind::Q6_K_SPLIT) {
                         SsaValue w_km = dequantize_k_major_blocks(
                             builder, w_th.storage, w_th.q_qs, w_th.q_d,
@@ -1946,7 +2077,8 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
     }
 
     prog.mlir_text = builder.finish(return_vals);
-    prog.cache_key = build_canonical_cache_key(prog.mlir_text, P, spec.mm_pad_m);
+    prog.cache_key = build_canonical_cache_key(
+        prog.mlir_text, P, spec.mm_pad_m, spec.freetile_mosaic, spec.freetile_chip_target, spec.freetile_mosaic_version);
     return prog;
 }
 

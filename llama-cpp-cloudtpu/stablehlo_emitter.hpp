@@ -119,6 +119,9 @@ struct GraphProgramSpec {
     bool bf16_flash_attn = false;     // Opt-in BF16 Q/K/probs/V matmuls in FLASH_ATTN_EXT (default false: F32 parity)
     bool q4_split_dot = true;         // Q4_0/Q4_K: true = two split-X dots (zero concat); false = single concat dot
     int32_t mm_pad_m = 8;             // Pad small BF16 Q4_*_I4/Q6_K_SPLIT M < mm_pad_m up to mm_pad_m for MXU (<=1 disables)
+    bool freetile_mosaic = false;     // Lower eligible quantized matmuls via FreeTile -> Mosaic tpu_custom_call
+    int32_t freetile_chip_target = 0; // freetile::ChipTarget (0=V5E, 1=V6E, 2=TPU7X, 3=BUENOS_A0)
+    int64_t freetile_mosaic_version = -1; // -1 = target default; >0 overrides stable_mosaic.version
 };
 
 struct PjrtInputBinding {
