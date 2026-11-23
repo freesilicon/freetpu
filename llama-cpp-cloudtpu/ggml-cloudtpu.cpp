@@ -2827,12 +2827,22 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
         }
     }
 
-    // 3. Invalidate plan_cache if PJRT runtime evicted any executable.
-    const uint64_t rt_epoch = rt.eviction_epoch();
-    if (ctx->plan_cache_epoch != rt_epoch) {
-        ctx->plan_cache.clear();
-        ctx->plan_cache_epoch = rt_epoch;
-    }
+    // 3. Selectively prune plan_cache entries whose executables were evicted by PJRT runtime,
+    //    preserving plans whose executables survived eviction.
+    auto prune_evicted_plans = [&]() {
+        const uint64_t cur_epoch = rt.eviction_epoch();
+        if (ctx->plan_cache_epoch != cur_epoch) {
+            for (auto it = ctx->plan_cache.begin(); it != ctx->plan_cache.end();) {
+                if (!it->second.exec || !rt.has_cached_exec(it->second.exec->key)) {
+                    it = ctx->plan_cache.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            ctx->plan_cache_epoch = cur_epoch;
+        }
+    };
+    prune_evicted_plans();
 
     // 4. Single-pass structural signature + ordered leaf input/output discovery (zero MLIR emission!).
     ctx->scratch_key.words.clear();
@@ -3065,9 +3075,14 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
     const CachedSubgraphPlan* plan_ptr = nullptr;
     auto pit = ctx->plan_cache.find(ctx->scratch_key);
     if (pit != ctx->plan_cache.end()) {
-        ctx->plan_hits += 1;
-        plan_ptr = &pit->second;
-    } else {
+        if (pit->second.exec && rt.touch_exec_cache(pit->second.exec->key)) {
+            ctx->plan_hits += 1;
+            plan_ptr = &pit->second;
+        } else {
+            ctx->plan_cache.erase(pit);
+        }
+    }
+    if (plan_ptr == nullptr) {
         ctx->plan_misses += 1;
         // Build full GraphProgramSpec & compile/lookup PJRT executable on plan miss.
         cloudtpu::GraphProgramSpec prog_spec;
@@ -3235,11 +3250,10 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
             new_plan.out_dims.push_back(ob.dims);
         }
 
-        // Refresh epoch in case compile_or_get triggered an eviction.
-        const uint64_t post_epoch = rt.eviction_epoch();
-        if (ctx->plan_cache_epoch != post_epoch || ctx->plan_cache.size() >= ctx->env.cache_cap) {
-            ctx->plan_cache.clear();
-            ctx->plan_cache_epoch = post_epoch;
+        // Selectively prune any entries evicted by compile_or_get, preserving surviving plans.
+        prune_evicted_plans();
+        if (ctx->plan_cache.size() >= ctx->env.cache_cap && !ctx->plan_cache.empty()) {
+            ctx->plan_cache.erase(ctx->plan_cache.begin());
         }
         auto [ins_it, ok] = ctx->plan_cache.emplace(ctx->scratch_key, std::move(new_plan));
         (void) ok;
@@ -3813,31 +3827,29 @@ ggml_backend_t ggml_backend_cloudtpu_init_device(int device_index) {
         return nullptr;
     }
     cloudtpu::PjrtRuntime& rt = *rt_ptr;
-    const int spmd = resolve_spmd_chips(env, rt);
-    const int max_dev = (spmd > 1) ? 1 : rt.device_count();
-    if (device_index < 0 || device_index >= max_dev) {
-        GGML_LOG_ERROR("ggml-cloudtpu: invalid device_index=%d (exposed_devices=%d, spmd_chips=%d)\n",
-                       device_index, max_dev, spmd);
-        return nullptr;
-    }
 
     ggml_backend_reg_t reg = ggml_backend_cloudtpu_reg();
-    if (static_cast<size_t>(device_index) >= ggml_backend_reg_dev_count(reg)) {
-        GGML_LOG_ERROR("ggml-cloudtpu: device_index=%d unavailable in registry (reg_count=%zu)\n",
-                       device_index, ggml_backend_reg_dev_count(reg));
+    const size_t reg_count = ggml_backend_reg_dev_count(reg);
+    if (device_index < 0 || static_cast<size_t>(device_index) >= reg_count) {
+        GGML_LOG_ERROR("ggml-cloudtpu: invalid device_index=%d (exposed_devices=%zu)\n",
+                       device_index, reg_count);
         return nullptr;
     }
+    ggml_backend_dev_t dev = ggml_backend_reg_dev_get(reg, static_cast<size_t>(device_index));
+    auto* dc = static_cast<cloudtpu_dev_context*>(dev->context);
+    const int spmd = dc->spmd_chips;
 
     auto* ctx = new ggml_backend_cloudtpu_context();
-    ctx->device_index = device_index;
+    ctx->device_index = dc->device_index;
     ctx->spmd_chips = spmd;
     ctx->env = env;
+    ctx->env.spmd_chips = spmd;
 
     if (env.verbose > 0) {
-        const auto& info = rt.device_info(device_index);
+        const auto& info = rt.device_info(dc->device_index);
         GGML_LOG_INFO(
             "ggml-cloudtpu: initialized device %d (%s, platform=%s %s, spmd_chips=%d, mock=%d, fuse=%d, max_fuse=%d, hbm_limit=%lld)\n",
-            device_index,
+            dc->device_index,
             info.kind.c_str(),
             rt.platform_name().c_str(),
             rt.platform_version().c_str(),
@@ -3851,7 +3863,7 @@ ggml_backend_t ggml_backend_cloudtpu_init_device(int device_index) {
     ggml_backend_t backend = new ggml_backend{
         /* .guid    = */ ggml_backend_cloudtpu_guid(),
         /* .iface   = */ ggml_backend_cloudtpu_i,
-        /* .device  = */ ggml_backend_reg_dev_get(reg, static_cast<size_t>(device_index)),
+        /* .device  = */ dev,
         /* .context = */ ctx,
     };
     return backend;

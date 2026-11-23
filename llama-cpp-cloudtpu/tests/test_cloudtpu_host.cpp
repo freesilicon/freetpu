@@ -142,7 +142,47 @@ void test_lru_cache_and_hbm_roundtrip(cloudtpu::PjrtRuntime& rt) {
     CHECK_TRUE(st.hits == 1, "LRU cache hits == 1");
     CHECK_TRUE(st.misses == 3, "LRU cache misses == 3");
     CHECK_TRUE(st.evictions == 1, "LRU cache evictions == 1");
-    std::printf("  [PASS] H2D/D2H roundtrip & executable LRU cache\n");
+
+    // Verify touch_exec_cache refreshes runtime LRU recency (cap=3: 2 recurring subgraphs +
+    // 2 alternating dynamic attention shapes must evict the older attention shape, never the
+    // recurring subgraphs).
+    {
+        cloudtpu::RuntimeConfig cap3;
+        cap3.mock_mode = true;
+        cap3.exec_cache_cap = 3;
+        cloudtpu::PjrtRuntime rt3;
+        rt3.init(cap3);
+
+        const auto p_rec0 = make_add(4);
+        const auto p_rec1 = make_add(8);
+        const auto p_attn0 = make_add(16);
+        const auto p_attn1 = make_add(32);
+
+        const auto ex_rec0 = rt3.compile_or_get(p_rec0.cache_key, p_rec0.mlir_text);
+        const auto ex_rec1 = rt3.compile_or_get(p_rec1.cache_key, p_rec1.mlir_text);
+        const auto ex_attn0 = rt3.compile_or_get(p_attn0.cache_key, p_attn0.mlir_text);
+        // Simulate decode step plan-cache hits refreshing recurring executables in runtime LRU.
+        CHECK_TRUE(rt3.touch_exec_cache(ex_rec0->key), "touch_exec_cache finds rec0");
+        CHECK_TRUE(rt3.touch_exec_cache(ex_rec1->key), "touch_exec_cache finds rec1");
+        // Compiling a new attention shape should evict attn0, NOT rec0 or rec1.
+        const auto ex_attn1 = rt3.compile_or_get(p_attn1.cache_key, p_attn1.mlir_text);
+        CHECK_TRUE(rt3.has_cached_exec(ex_rec0->key), "rec0 survives eviction after touch_exec_cache");
+        CHECK_TRUE(rt3.has_cached_exec(ex_rec1->key), "rec1 survives eviction after touch_exec_cache");
+        CHECK_TRUE(rt3.has_cached_exec(ex_attn1->key), "attn1 present in cache");
+        CHECK_TRUE(!rt3.has_cached_exec(ex_attn0->key), "stale attn0 evicted first");
+        CHECK_TRUE(!rt3.touch_exec_cache(ex_attn0->key), "touch_exec_cache returns false for evicted entry");
+        // Next step: touch rec0/rec1 again and verify alternating back to attn0 evicts attn1.
+        CHECK_TRUE(rt3.touch_exec_cache(ex_rec0->key), "rec0 still hits after attn1 insert");
+        CHECK_TRUE(rt3.touch_exec_cache(ex_rec1->key), "rec1 still hits after attn1 insert");
+        const auto ex_attn0_b = rt3.compile_or_get(p_attn0.cache_key, p_attn0.mlir_text);
+        CHECK_TRUE(rt3.has_cached_exec(ex_rec0->key) && rt3.has_cached_exec(ex_rec1->key),
+                   "recurring subgraphs never evicted across alternating attention shapes");
+        CHECK_TRUE(rt3.has_cached_exec(ex_attn0_b->key) && !rt3.has_cached_exec(ex_attn1->key),
+                   "alternating attention shape evicts previous attention shape");
+        rt3.shutdown();
+    }
+
+    std::printf("  [PASS] H2D/D2H roundtrip & executable LRU cache (incl. touch_exec_cache recency)\n");
 }
 
 std::vector<float> run_emitted(cloudtpu::PjrtRuntime& rt,

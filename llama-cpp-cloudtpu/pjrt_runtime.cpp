@@ -2987,6 +2987,22 @@ void PjrtRuntime::clear_exec_cache() {
     eviction_epoch_.fetch_add(1, std::memory_order_release);
 }
 
+bool PjrtRuntime::touch_exec_cache(const std::string& full_key) {
+    std::lock_guard<std::mutex> lock(cache_mu_);
+    auto it = exec_cache_.find(full_key);
+    if (it == exec_cache_.end()) {
+        return false;
+    }
+    cache_hits_ += 1;
+    lru_order_.splice(lru_order_.begin(), lru_order_, it->second.lru_it);
+    return true;
+}
+
+bool PjrtRuntime::has_cached_exec(const std::string& full_key) const {
+    std::lock_guard<std::mutex> lock(cache_mu_);
+    return exec_cache_.find(full_key) != exec_cache_.end();
+}
+
 CacheStats PjrtRuntime::cache_stats() const {
     std::lock_guard<std::mutex> lock(cache_mu_);
     CacheStats st;
