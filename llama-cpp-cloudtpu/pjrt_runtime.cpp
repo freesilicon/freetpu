@@ -639,6 +639,7 @@ struct MockOp {
         MULTIPLY,
         DIVIDE,
         MAXIMUM,
+        MINIMUM,
         BIT_AND,
         SHR_LOGICAL,
         RSQRT,
@@ -860,6 +861,9 @@ static MockProgram parse_stablehlo_mlir(const std::string& mlir) {
         } else if (rhs.rfind("stablehlo.maximum ", 0) == 0) {
             op.kind = MockOp::Kind::MAXIMUM;
             op.inputs = extract_ssa_refs(rhs.substr(0, colon));
+        } else if (rhs.rfind("stablehlo.minimum ", 0) == 0) {
+            op.kind = MockOp::Kind::MINIMUM;
+            op.inputs = extract_ssa_refs(rhs.substr(0, colon));
         } else if (rhs.rfind("stablehlo.and ", 0) == 0) {
             op.kind = MockOp::Kind::BIT_AND;
             op.inputs = extract_ssa_refs(rhs.substr(0, colon));
@@ -1047,9 +1051,10 @@ static MockTensor eval_mock_op(const MockOp& op,
     out.allocate(op.out_type.dtype, op.out_type.dims);
     const size_t n_out = out.num_elements();
 
-    const bool is_int = (out.dtype == PjrtDType::S8 || out.dtype == PjrtDType::U8 ||
-                         out.dtype == PjrtDType::S16 || out.dtype == PjrtDType::S32 ||
-                         out.dtype == PjrtDType::U32 || out.dtype == PjrtDType::S64);
+    const bool is_int = (out.dtype == PjrtDType::PRED || out.dtype == PjrtDType::S8 ||
+                         out.dtype == PjrtDType::U8 || out.dtype == PjrtDType::S16 ||
+                         out.dtype == PjrtDType::S32 || out.dtype == PjrtDType::U32 ||
+                         out.dtype == PjrtDType::S64);
 
     switch (op.kind) {
         case MockOp::Kind::CONSTANT: {
@@ -1095,6 +1100,7 @@ static MockTensor eval_mock_op(const MockOp& op,
         case MockOp::Kind::MULTIPLY:
         case MockOp::Kind::DIVIDE:
         case MockOp::Kind::MAXIMUM:
+        case MockOp::Kind::MINIMUM:
         case MockOp::Kind::BIT_AND:
         case MockOp::Kind::SHR_LOGICAL: {
             const MockTensor& a = env.at(op.inputs[0]);
@@ -1104,11 +1110,12 @@ static MockTensor eval_mock_op(const MockOp& op,
                     const int64_t va = a.read_i64(i);
                     const int64_t vb = b.read_i64(i);
                     int64_t vr = 0;
-                    if (op.kind == MockOp::Kind::ADD) vr = va + vb;
-                    else if (op.kind == MockOp::Kind::SUBTRACT) vr = va - vb;
-                    else if (op.kind == MockOp::Kind::MULTIPLY) vr = va * vb;
+                    if (op.kind == MockOp::Kind::ADD) vr = static_cast<int64_t>(static_cast<uint64_t>(va) + static_cast<uint64_t>(vb));
+                    else if (op.kind == MockOp::Kind::SUBTRACT) vr = static_cast<int64_t>(static_cast<uint64_t>(va) - static_cast<uint64_t>(vb));
+                    else if (op.kind == MockOp::Kind::MULTIPLY) vr = static_cast<int64_t>(static_cast<uint64_t>(va) * static_cast<uint64_t>(vb));
                     else if (op.kind == MockOp::Kind::DIVIDE) vr = (vb != 0) ? (va / vb) : 0;
                     else if (op.kind == MockOp::Kind::MAXIMUM) vr = std::max(va, vb);
+                    else if (op.kind == MockOp::Kind::MINIMUM) vr = std::min(va, vb);
                     else if (op.kind == MockOp::Kind::BIT_AND) vr = (va & vb);
                     else if (op.kind == MockOp::Kind::SHR_LOGICAL) {
                         vr = static_cast<int64_t>(static_cast<uint64_t>(va) >> static_cast<unsigned>(vb));
@@ -1123,6 +1130,7 @@ static MockTensor eval_mock_op(const MockOp& op,
                     else if (op.kind == MockOp::Kind::MULTIPLY) vr = va * vb;
                     else if (op.kind == MockOp::Kind::DIVIDE) vr = va / vb;
                     else if (op.kind == MockOp::Kind::MAXIMUM) vr = std::max(va, vb);
+                    else if (op.kind == MockOp::Kind::MINIMUM) vr = std::min(va, vb);
                     out.write_f32(i, vr);
                 }
             }
@@ -1520,6 +1528,12 @@ static bool is_mock_collective_op(MockOp::Kind k) {
            k == MockOp::Kind::ALL_GATHER || k == MockOp::Kind::REDUCE_SCATTER_ADD;
 }
 
+static bool is_mock_integer_dtype(PjrtDType dt) {
+    return dt == PjrtDType::PRED || dt == PjrtDType::S8 || dt == PjrtDType::U8 ||
+           dt == PjrtDType::S16 || dt == PjrtDType::S32 || dt == PjrtDType::U32 ||
+           dt == PjrtDType::S64;
+}
+
 static void eval_mock_collective(const MockOp& op,
                                  std::vector<std::unordered_map<std::string, MockTensor>>& envs) {
     const size_t P = envs.size();
@@ -1536,17 +1550,31 @@ static void eval_mock_collective(const MockOp& op,
             MockTensor acc;
             acc.allocate(op.out_type.dtype, op.out_type.dims);
             const size_t n = acc.num_elements();
+            const bool int_dt = is_mock_integer_dtype(acc.dtype);
             for (size_t gi = 0; gi < grp.size(); ++gi) {
                 const size_t r = static_cast<size_t>(grp[gi]);
                 const MockTensor& src = envs.at(r).at(op.inputs[0]);
                 for (size_t i = 0; i < n; ++i) {
-                    const float v = src.read_f32(i);
-                    if (gi == 0) {
-                        acc.write_f32(i, v);
-                    } else if (op.kind == MockOp::Kind::ALL_REDUCE_ADD) {
-                        acc.write_f32(i, acc.read_f32(i) + v);
+                    if (int_dt) {
+                        const int64_t v = src.read_i64(i);
+                        if (gi == 0) {
+                            acc.write_i64(i, v);
+                        } else if (op.kind == MockOp::Kind::ALL_REDUCE_ADD) {
+                            acc.write_i64(
+                                i, static_cast<int64_t>(static_cast<uint64_t>(acc.read_i64(i)) +
+                                                        static_cast<uint64_t>(v)));
+                        } else {
+                            acc.write_i64(i, std::max(acc.read_i64(i), v));
+                        }
                     } else {
-                        acc.write_f32(i, std::max(acc.read_f32(i), v));
+                        const float v = src.read_f32(i);
+                        if (gi == 0) {
+                            acc.write_f32(i, v);
+                        } else if (op.kind == MockOp::Kind::ALL_REDUCE_ADD) {
+                            acc.write_f32(i, acc.read_f32(i) + v);
+                        } else {
+                            acc.write_f32(i, std::max(acc.read_f32(i), v));
+                        }
                     }
                 }
             }
@@ -1586,11 +1614,20 @@ static void eval_mock_collective(const MockOp& op,
             MockTensor full;
             full.allocate(first.dtype, first.dims);
             const size_t n_full = full.num_elements();
+            const bool int_dt = is_mock_integer_dtype(full.dtype);
             for (size_t gi = 0; gi < grp.size(); ++gi) {
                 const MockTensor& src = envs.at(static_cast<size_t>(grp[gi])).at(op.inputs[0]);
                 for (size_t i = 0; i < n_full; ++i) {
-                    const float v = src.read_f32(i);
-                    full.write_f32(i, (gi == 0) ? v : (full.read_f32(i) + v));
+                    if (int_dt) {
+                        const int64_t v = src.read_i64(i);
+                        full.write_i64(
+                            i, (gi == 0) ? v
+                                         : static_cast<int64_t>(static_cast<uint64_t>(full.read_i64(i)) +
+                                                                static_cast<uint64_t>(v)));
+                    } else {
+                        const float v = src.read_f32(i);
+                        full.write_f32(i, (gi == 0) ? v : (full.read_f32(i) + v));
+                    }
                 }
             }
             const size_t sdim = static_cast<size_t>(op.collective_dim);

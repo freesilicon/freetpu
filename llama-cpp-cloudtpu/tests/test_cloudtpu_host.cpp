@@ -1301,6 +1301,258 @@ void test_spmd_unequal_k_shard_broadcast() {
     std::printf("  [PASS] SPMD P=2 unequal-width SHARD_K broadcast ([1024, 32] + [512, 32] ADD/MUL)\n");
 }
 
+void test_spmd_shard_n_get_rows_and_collectives() {
+    // 1) P=4 SHARD_N GET_ROWS (both DENSE F32 and Q8_0_SPLIT): must NOT all_gather the full table;
+    //    must gather only requested rows on each replica and all_reduce the small lookup result.
+    {
+        constexpr int P = 4;
+        constexpr int64_t N = 16;  // 4 rows per chip
+        constexpr int64_t N_LOCAL = N / P;
+        constexpr int64_t K = 32;
+        constexpr int64_t N_IDX = 5;
+
+        cloudtpu::RuntimeConfig cfg;
+        cfg.mock_mode = true;
+        cfg.mock_devices = P;
+        cfg.exec_cache_cap = 64;
+        cloudtpu::PjrtRuntime rt;
+        rt.init(cfg);
+        const auto copts = rt.make_spmd_compile_options(P);
+
+        const std::vector<int32_t> indices = {13, 0, 7, 15, 4};
+
+        // Dense F32 SHARD_N table
+        std::vector<float> tbl(static_cast<size_t>(N * K));
+        for (int64_t r = 0; r < N; ++r) {
+            for (int64_t c = 0; c < K; ++c) {
+                tbl[static_cast<size_t>(r * K + c)] = static_cast<float>(r * 100 + c) * 0.25f;
+            }
+        }
+        cloudtpu::GraphProgramSpec spec;
+        spec.spmd_chips = P;
+        spec.inputs.push_back(
+            {1, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, N, K}, cloudtpu::TensorShardingKind::SHARD_N});
+        spec.inputs.push_back(
+            {2, cloudtpu::PjrtDType::S32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, N_IDX}, cloudtpu::TensorShardingKind::REPLICATED});
+        cloudtpu::OpNodeSpec op;
+        op.kind = cloudtpu::CloudOpKind::GET_ROWS;
+        op.src_ids = {1, 2};
+        op.dst = {3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, N_IDX, K}};
+        spec.ops.push_back(op);
+        spec.output_ids = {3};
+
+        const auto prog = cloudtpu::emit_stablehlo_program(spec);
+        CHECK_TRUE(prog.mlir_text.find("stablehlo.all_gather") == std::string::npos,
+                   "SHARD_N GET_ROWS must not all_gather the full embedding table");
+        CHECK_TRUE(prog.mlir_text.find("stablehlo.replica_id") != std::string::npos &&
+                       prog.mlir_text.find("stablehlo.all_reduce") != std::string::npos,
+                   "SHARD_N GET_ROWS must use replica_id local gather + all_reduce");
+
+        std::vector<std::vector<cloudtpu::PjrtBufferPtr>> per_dev(P);
+        std::vector<std::vector<PJRT_Buffer*>> raw_in(P);
+        std::vector<PJRT_Buffer* const*> in_ptrs(P);
+        for (int p = 0; p < P; ++p) {
+            auto bt = rt.buffer_from_host(
+                p, tbl.data() + static_cast<size_t>(p * N_LOCAL * K), cloudtpu::PjrtDType::F32, {1, 1, N_LOCAL, K});
+            auto bi = rt.buffer_from_host(p, indices.data(), cloudtpu::PjrtDType::S32, {1, 1, 1, N_IDX});
+            per_dev[static_cast<size_t>(p)] = {bt, bi};
+            raw_in[static_cast<size_t>(p)] = {bt->handle.get(), bi->handle.get()};
+            in_ptrs[static_cast<size_t>(p)] = raw_in[static_cast<size_t>(p)].data();
+        }
+        const auto exec = rt.compile_or_get(prog.cache_key, prog.mlir_text, 0, copts);
+        std::vector<std::vector<cloudtpu::PjrtBufferPtr>> outs;
+        rt.execute_spmd(exec, P, in_ptrs.data(), prog.input_bindings.size(), outs,
+                        {cloudtpu::PjrtDType::F32}, {{1, 1, N_IDX, K}}, true);
+        for (int p = 0; p < P; ++p) {
+            std::vector<float> got(static_cast<size_t>(N_IDX * K));
+            rt.buffer_to_host(outs[static_cast<size_t>(p)][0]->handle.get(), got.data(), got.size() * sizeof(float));
+            for (int64_t ii = 0; ii < N_IDX; ++ii) {
+                const int64_t row = indices[static_cast<size_t>(ii)];
+                for (int64_t c = 0; c < K; ++c) {
+                    CHECK_NEAR(got[static_cast<size_t>(ii * K + c)],
+                               tbl[static_cast<size_t>(row * K + c)], 1e-5f, "SHARD_N GET_ROWS dense");
+                }
+            }
+        }
+
+        // Quantized Q8_0_SPLIT SHARD_N table (K=32, 1 block per row)
+        std::vector<int8_t> qs(static_cast<size_t>(N * K));
+        std::vector<uint16_t> ds(static_cast<size_t>(N));
+        for (int64_t r = 0; r < N; ++r) {
+            ds[static_cast<size_t>(r)] = cloudtpu::f32_to_f16(0.5f * static_cast<float>(r + 1));
+            for (int64_t c = 0; c < K; ++c) {
+                qs[static_cast<size_t>(r * K + c)] = static_cast<int8_t>((r + c) % 19 - 9);
+            }
+        }
+        cloudtpu::GraphProgramSpec qspec;
+        qspec.spmd_chips = P;
+        qspec.inputs.push_back(
+            {1, cloudtpu::PjrtDType::S8, cloudtpu::TensorStorageKind::Q8_0_SPLIT, {1, 1, N, K}, cloudtpu::TensorShardingKind::SHARD_N});
+        qspec.inputs.push_back(
+            {2, cloudtpu::PjrtDType::S32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, N_IDX}, cloudtpu::TensorShardingKind::REPLICATED});
+        qspec.ops.push_back(op);
+        qspec.output_ids = {3};
+        const auto qprog = cloudtpu::emit_stablehlo_program(qspec);
+        CHECK_TRUE(qprog.mlir_text.find("stablehlo.all_gather") == std::string::npos,
+                   "Q8_0_SPLIT SHARD_N GET_ROWS must not all_gather the full table");
+        std::vector<std::vector<cloudtpu::PjrtBufferPtr>> q_per_dev(P);
+        std::vector<std::vector<PJRT_Buffer*>> q_raw_in(P);
+        std::vector<PJRT_Buffer* const*> q_in_ptrs(P);
+        for (int p = 0; p < P; ++p) {
+            auto bq = rt.buffer_from_host(
+                p, qs.data() + static_cast<size_t>(p * N_LOCAL * K), cloudtpu::PjrtDType::S8, {1, 1, N_LOCAL, 1, K});
+            auto bd = rt.buffer_from_host(
+                p, ds.data() + static_cast<size_t>(p * N_LOCAL), cloudtpu::PjrtDType::F16, {1, 1, N_LOCAL, 1});
+            auto bi = rt.buffer_from_host(p, indices.data(), cloudtpu::PjrtDType::S32, {1, 1, 1, N_IDX});
+            q_per_dev[static_cast<size_t>(p)] = {bq, bd, bi};
+            q_raw_in[static_cast<size_t>(p)] = {bq->handle.get(), bd->handle.get(), bi->handle.get()};
+            q_in_ptrs[static_cast<size_t>(p)] = q_raw_in[static_cast<size_t>(p)].data();
+        }
+        const auto qexec = rt.compile_or_get(qprog.cache_key, qprog.mlir_text, 0, copts);
+        std::vector<std::vector<cloudtpu::PjrtBufferPtr>> qouts;
+        rt.execute_spmd(qexec, P, q_in_ptrs.data(), qprog.input_bindings.size(), qouts,
+                        {cloudtpu::PjrtDType::F32}, {{1, 1, N_IDX, K}}, true);
+        std::vector<float> qgot(static_cast<size_t>(N_IDX * K));
+        rt.buffer_to_host(qouts[0][0]->handle.get(), qgot.data(), qgot.size() * sizeof(float));
+        for (int64_t ii = 0; ii < N_IDX; ++ii) {
+            const int64_t row = indices[static_cast<size_t>(ii)];
+            const float scale = cloudtpu::f16_to_f32(ds[static_cast<size_t>(row)]);
+            for (int64_t c = 0; c < K; ++c) {
+                const float exp_v = static_cast<float>(qs[static_cast<size_t>(row * K + c)]) * scale;
+                CHECK_NEAR(qgot[static_cast<size_t>(ii * K + c)], exp_v, 1e-4f, "SHARD_N GET_ROWS Q8_0");
+            }
+        }
+        rt.shutdown();
+        std::printf("  [PASS] SPMD P=4 SHARD_N GET_ROWS (dense + Q8_0_SPLIT, zero all_gather)\n");
+    }
+
+    // 2) P=2 REDUCE_SCATTER_SUM feeding downstream CPY preserves replica-local shape without all_gather.
+    // 3) Integer S32 precision preservation (16777217) in MockPJRT ALL_REDUCE_SUM & REDUCE_SCATTER_SUM.
+    {
+        constexpr int P = 2;
+        cloudtpu::RuntimeConfig cfg;
+        cfg.mock_mode = true;
+        cfg.mock_devices = P;
+        cfg.exec_cache_cap = 64;
+        cloudtpu::PjrtRuntime rt;
+        rt.init(cfg);
+        const auto copts = rt.make_spmd_compile_options(P);
+
+        // REDUCE_SCATTER_SUM [1,1,1,4] -> [1,1,1,2] -> CPY [1,1,1,2]
+        cloudtpu::GraphProgramSpec rs_cpy_spec;
+        rs_cpy_spec.spmd_chips = P;
+        rs_cpy_spec.inputs.push_back({1, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 4}});
+        cloudtpu::OpNodeSpec rs_op;
+        rs_op.kind = cloudtpu::CloudOpKind::REDUCE_SCATTER_SUM;
+        rs_op.collective_dim = 3;
+        rs_op.src_ids = {1};
+        rs_op.dst = {2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 2}};
+        cloudtpu::OpNodeSpec cpy_op;
+        cpy_op.kind = cloudtpu::CloudOpKind::CPY;
+        cpy_op.src_ids = {2};
+        cpy_op.dst = {3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 2}};
+        rs_cpy_spec.ops = {rs_op, cpy_op};
+        rs_cpy_spec.output_ids = {3};
+
+        const auto rs_prog = cloudtpu::emit_stablehlo_program(rs_cpy_spec);
+        CHECK_TRUE(rs_prog.mlir_text.find("stablehlo.all_gather") == std::string::npos,
+                   "REDUCE_SCATTER_SUM -> CPY must stay replica-local (no all_gather)");
+        const std::vector<float> r0 = {1.0f, 2.0f, 3.0f, 4.0f};
+        const std::vector<float> r1 = {10.0f, 20.0f, 30.0f, 40.0f};
+        auto b0 = rt.buffer_from_host(0, r0.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, 4});
+        auto b1 = rt.buffer_from_host(1, r1.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, 4});
+        PJRT_Buffer* in0[1] = {b0->handle.get()};
+        PJRT_Buffer* in1[1] = {b1->handle.get()};
+        PJRT_Buffer* const* in_ptrs[2] = {in0, in1};
+        const auto rs_exec = rt.compile_or_get(rs_prog.cache_key, rs_prog.mlir_text, 0, copts);
+        std::vector<std::vector<cloudtpu::PjrtBufferPtr>> rs_outs;
+        rt.execute_spmd(rs_exec, P, in_ptrs, 1, rs_outs, {cloudtpu::PjrtDType::F32}, {{1, 1, 1, 2}}, true);
+        std::vector<float> h0(2), h1(2);
+        rt.buffer_to_host(rs_outs[0][0]->handle.get(), h0.data(), h0.size() * sizeof(float));
+        rt.buffer_to_host(rs_outs[1][0]->handle.get(), h1.data(), h1.size() * sizeof(float));
+        check_vec_close(h0, {11.0f, 22.0f}, 1e-5f, "REDUCE_SCATTER -> CPY chip 0");
+        check_vec_close(h1, {33.0f, 44.0f}, 1e-5f, "REDUCE_SCATTER -> CPY chip 1");
+
+        // Exact S32 precision preservation in ALL_REDUCE_SUM (P=1 & P=2) and REDUCE_SCATTER_SUM (P=2)
+        constexpr int32_t kOddInt = 16777217;  // 2^24 + 1 (not exactly representable in F32)
+        const std::vector<int32_t> i0 = {kOddInt, 0, kOddInt, 1};
+        const std::vector<int32_t> i1 = {0, kOddInt, kOddInt, 2};
+        auto bi0 = rt.buffer_from_host(0, i0.data(), cloudtpu::PjrtDType::S32, {1, 1, 1, 4});
+        auto bi1 = rt.buffer_from_host(1, i1.data(), cloudtpu::PjrtDType::S32, {1, 1, 1, 4});
+
+        // P=1 S32 ALL_REDUCE_SUM identity on 16777217
+        {
+            cloudtpu::GraphProgramSpec s1;
+            s1.spmd_chips = 1;
+            s1.inputs.push_back({1, cloudtpu::PjrtDType::S32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 4}});
+            cloudtpu::OpNodeSpec aop;
+            aop.kind = cloudtpu::CloudOpKind::ALL_REDUCE_SUM;
+            aop.src_ids = {1};
+            aop.dst = {2, cloudtpu::PjrtDType::S32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 4}};
+            s1.ops.push_back(aop);
+            s1.output_ids = {2};
+            const auto p1 = cloudtpu::emit_stablehlo_program(s1);
+            const auto e1 = rt.compile_or_get(p1.cache_key, p1.mlir_text, 0);
+            PJRT_Buffer* raw1[1] = {bi0->handle.get()};
+            std::vector<cloudtpu::PjrtBufferPtr> o1;
+            rt.execute(e1, 0, raw1, 1, o1, {cloudtpu::PjrtDType::S32}, {{1, 1, 1, 4}}, true);
+            std::vector<int32_t> got1(4, 0);
+            rt.buffer_to_host(o1[0]->handle.get(), got1.data(), got1.size() * sizeof(int32_t));
+            CHECK_TRUE(got1[0] == kOddInt && got1[2] == kOddInt,
+                       "P=1 S32 ALL_REDUCE_SUM must preserve 16777217 exactly");
+        }
+
+        // P=2 S32 ALL_REDUCE_SUM + REDUCE_SCATTER_SUM on 16777217
+        {
+            cloudtpu::GraphProgramSpec s2;
+            s2.spmd_chips = P;
+            s2.inputs.push_back({1, cloudtpu::PjrtDType::S32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 4}});
+            cloudtpu::OpNodeSpec aop;
+            aop.kind = cloudtpu::CloudOpKind::ALL_REDUCE_SUM;
+            aop.src_ids = {1};
+            aop.dst = {2, cloudtpu::PjrtDType::S32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 4}};
+            s2.ops.push_back(aop);
+            s2.output_ids = {2};
+            const auto p2 = cloudtpu::emit_stablehlo_program(s2);
+            const auto e2 = rt.compile_or_get(p2.cache_key, p2.mlir_text, 0, copts);
+            PJRT_Buffer* raw_a[1] = {bi0->handle.get()};
+            PJRT_Buffer* raw_b[1] = {bi1->handle.get()};
+            PJRT_Buffer* const* raw_ptrs[2] = {raw_a, raw_b};
+            std::vector<std::vector<cloudtpu::PjrtBufferPtr>> o2;
+            rt.execute_spmd(e2, P, raw_ptrs, 1, o2, {cloudtpu::PjrtDType::S32}, {{1, 1, 1, 4}}, true);
+            std::vector<int32_t> got2(4, 0);
+            rt.buffer_to_host(o2[0][0]->handle.get(), got2.data(), got2.size() * sizeof(int32_t));
+            CHECK_TRUE(got2[0] == kOddInt && got2[1] == kOddInt &&
+                           got2[2] == (kOddInt * 2) && got2[3] == 3,
+                       "P=2 S32 ALL_REDUCE_SUM must preserve 16777217 exactly");
+
+            cloudtpu::GraphProgramSpec rs2;
+            rs2.spmd_chips = P;
+            rs2.inputs.push_back({1, cloudtpu::PjrtDType::S32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 4}});
+            cloudtpu::OpNodeSpec rop;
+            rop.kind = cloudtpu::CloudOpKind::REDUCE_SCATTER_SUM;
+            rop.collective_dim = 3;
+            rop.src_ids = {1};
+            rop.dst = {2, cloudtpu::PjrtDType::S32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 1, 2}};
+            rs2.ops.push_back(rop);
+            rs2.output_ids = {2};
+            const auto pr2 = cloudtpu::emit_stablehlo_program(rs2);
+            const auto er2 = rt.compile_or_get(pr2.cache_key, pr2.mlir_text, 0, copts);
+            std::vector<std::vector<cloudtpu::PjrtBufferPtr>> or2;
+            rt.execute_spmd(er2, P, raw_ptrs, 1, or2, {cloudtpu::PjrtDType::S32}, {{1, 1, 1, 2}}, true);
+            std::vector<int32_t> gr0(2, 0), gr1(2, 0);
+            rt.buffer_to_host(or2[0][0]->handle.get(), gr0.data(), gr0.size() * sizeof(int32_t));
+            rt.buffer_to_host(or2[1][0]->handle.get(), gr1.data(), gr1.size() * sizeof(int32_t));
+            CHECK_TRUE(gr0[0] == kOddInt && gr0[1] == kOddInt &&
+                           gr1[0] == (kOddInt * 2) && gr1[1] == 3,
+                       "P=2 S32 REDUCE_SCATTER_SUM must preserve 16777217 exactly");
+        }
+
+        rt.shutdown();
+        std::printf("  [PASS] SPMD REDUCE_SCATTER_SUM -> CPY & exact S32 collective precision (16777217)\n");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -1333,6 +1585,7 @@ int main() {
     test_silicon_regressions(rt);
     test_collectives_p1_live_compatible(rt);
     test_spmd_unequal_k_shard_broadcast();
+    test_spmd_shard_n_get_rows_and_collectives();
     test_spmd_multichip_mesh(4);  // tpu7x-4t (4x 192 GiB HBM3e)
     test_spmd_multichip_mesh(8);  // v6e-8 (8x 32 GiB HBM)
 
