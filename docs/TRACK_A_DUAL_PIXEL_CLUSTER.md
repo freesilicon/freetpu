@@ -38,31 +38,9 @@ Shared library: [libc.so]
 ```
 Host mock verification (`OPENBUENOS_MOCK=1`): `test-backend-ops -b EDGETPU -o MUL_MAT` → **`327/327` PASS**.
 
-### 2.2 Bring Up Direct 5 Gbps USB-C CDC-NCM Link (Zero Wi-Fi Data)
+### 2.2 Direct 5 Gbps USB-C CDC-NCM Link (Zero Wi-Fi Data)
 
-Connect both Pixel 10 developer units directly with a USB-C 3.2 / Thunderbolt 5 cable. Run the interface and routing commands below on a Linux/Android device shell configured to manage USB network interfaces, enabling CDC-NCM on the USB `device` side (`mustang`) and assigning a point-to-point `/30` subnet (`table 200`):
-
-```bash
-# Node 2 (mustang — USB device side, SuperSpeed):
-svc usb setFunctions ncm
-sleep 2
-ip addr flush dev ncm0 2>/dev/null || true
-ip link set ncm0 up
-ip addr add 10.99.0.2/30 dev ncm0
-ip route replace 10.99.0.0/30 dev ncm0 table 200
-ip rule del to 10.99.0.0/30 lookup 200 2>/dev/null || true
-ip rule add pref 100 to 10.99.0.0/30 lookup 200
-
-# Node 1 (rango — USB host side, 5000M SuperSpeed):
-ip link set usb0 up
-ip addr add 10.99.0.1/30 dev usb0 2>/dev/null || true
-ip route replace 10.99.0.0/30 dev usb0 src 10.99.0.1 table 200
-ip rule del to 10.99.0.0/30 lookup 200 2>/dev/null || true
-ip rule add pref 100 to 10.99.0.0/30 lookup 200
-echo on > /sys/bus/usb/devices/2-1/power/control 2>/dev/null || true
-echo 50 > /sys/class/net/usb0/cdc_ncm/tx_timer_usecs
-ping -c 10 -i 0.02 10.99.0.2
-```
+Connect both Pixel 10 devices with a USB-C 3.2 cable using Android USB Ethernet (CDC-NCM) on a dedicated point-to-point `/30` subnet (`10.99.0.1` on Node 1, `10.99.0.2` on Node 2) with Wi-Fi disabled in Android Settings so traffic stays strictly on the direct USB-C link.
 
 Measured direct link: **`1.49 ms` min / `2.35 ms` avg** ping RTT (`0%` loss), **`1.01–3.77 ms`** sync RPC RTT (`GET_DEVICE_MEMORY` / `ALLOC_BUFFER`), and **`469–810 µs`** async `GRAPH_COMPUTE` push.
 
