@@ -5795,6 +5795,171 @@ void test_ggml_cgraph_odd_s4_shard_n() {
     std::printf("  [PASS] ggml_cgraph odd-width SHARD_N (N=12/P=4 -> 3 rows/chip: i4/u4=576B sharded, bitcast=2304B replicated)\n");
 #endif
 }
+
+void test_ggml_cgraph_reshaped_host_cpy_and_q4_bitcast_view() {
+#if !defined(_WIN32)
+    // 1) Bucketed CPY into a reshaped host view [1,1,5,32] over host root [1,5,4,8]
+    //    must slice using canonical root shape [1,5,4,8] (axis 1: 8 -> 5) without shape mismatch.
+    {
+        const int64_t T = 5, D = 32;
+        std::vector<float> w_data(static_cast<size_t>(D * D));
+        std::vector<float> x_data(static_cast<size_t>(T * D));
+        for (size_t i = 0; i < w_data.size(); ++i) w_data[i] = 0.05f * std::sin(static_cast<float>(i + 1) * 0.19f);
+        for (size_t i = 0; i < x_data.size(); ++i) x_data[i] = 0.25f * std::cos(static_cast<float>(i + 1) * 0.13f);
+        std::vector<float> ref(static_cast<size_t>(T * D), 0.0f);
+        for (int64_t t = 0; t < T; ++t) {
+            for (int64_t o = 0; o < D; ++o) {
+                float acc = 0.0f;
+                for (int64_t k = 0; k < D; ++k) {
+                    acc += x_data[static_cast<size_t>(t * D + k)] * w_data[static_cast<size_t>(o * D + k)];
+                }
+                ref[static_cast<size_t>(t * D + o)] = acc;
+            }
+        }
+        std::fflush(stdout);
+        std::fflush(stderr);
+        const pid_t pid = fork();
+        CHECK_TRUE(pid >= 0, "fork for reshaped host CPY bucket test");
+        if (pid == 0) {
+            setenv("CLOUDTPU_MOCK", "1", 1);
+            setenv("CLOUDTPU_MOCK_DEVICES", "1", 1);
+            setenv("CLOUDTPU_SPMD_CHIPS", "1", 1);
+            setenv("CLOUDTPU_BATCH_BUCKETS", "1,2,4,8", 1);
+            setenv("CLOUDTPU_VERBOSE", "1", 1);
+            GgmlLogCapture cap;
+            ggml_backend_t be = ggml_backend_cloudtpu_init();
+            bool ok = false;
+            if (be != nullptr) {
+                const size_t mem = ggml_tensor_overhead() * 32 + ggml_graph_overhead() + 4096;
+                struct ggml_init_params p = {mem, nullptr, true};
+                struct ggml_context* ctx_w = ggml_init(p);
+                ggml_tensor* tw = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, D, D);
+                ggml_backend_buffer_t w_buf = ggml_backend_alloc_ctx_tensors(ctx_w, be);
+                ggml_backend_tensor_set(tw, w_data.data(), 0, w_data.size() * sizeof(float));
+
+                std::vector<float> host_dst(static_cast<size_t>(T * D), -999.0f);
+                struct ggml_context* ctx_g = ggml_init(p);
+                struct ggml_cgraph* gf = ggml_new_graph(ctx_g);
+                ggml_tensor* tx = ggml_new_tensor_2d(ctx_g, GGML_TYPE_F32, D, T);
+                ggml_set_input(tx);
+                ggml_tensor* ty = ggml_mul_mat(ctx_g, tw, tx);
+
+                ggml_tensor* dst_root = ggml_new_tensor_4d(ctx_g, GGML_TYPE_F32, 8, 4, T, 1);
+                dst_root->data = host_dst.data();
+                ggml_tensor* dst_view = ggml_reshape_2d(ctx_g, dst_root, D, T);
+                ggml_tensor* cpy = ggml_cpy(ctx_g, ty, dst_view);
+                ggml_set_output(cpy);
+                ggml_build_forward_expand(gf, cpy);
+
+                ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
+                if (ggml_gallocr_alloc_graph(galloc, gf)) {
+                    ggml_backend_tensor_set(tx, x_data.data(), 0, x_data.size() * sizeof(float));
+                    if (ggml_backend_graph_compute(be, gf) == GGML_STATUS_SUCCESS) {
+                        ok = true;
+                        for (size_t i = 0; i < ref.size(); ++i) {
+                            if (std::fabs(host_dst[i] - ref[i]) > 1e-4f || !std::isfinite(host_dst[i])) {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+                ggml_gallocr_free(galloc);
+                ggml_free(ctx_g);
+                ggml_backend_buffer_free(w_buf);
+                ggml_free(ctx_w);
+                ggml_backend_free(be);
+                if (parse_log_u64(cap.buf, "bucketed") != 1) {
+                    ok = false;
+                }
+            }
+            _exit(ok ? 0 : 1);
+        }
+        int status = 0;
+        CHECK_TRUE(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                   "bucketed CPY into reshaped host view must slice with canonical root shape");
+    }
+
+    // 2) 3-row Q4_K tensor aliasing offset 0 of a 4-row BITCAST Q4_K slot on 1 chip must resolve Q4_K_SPLIT
+    //    (not inherit incompatible packed U8 BITCAST layout from the 4-row slot at the same offset).
+    {
+        const int64_t K = 256, N_FULL = 4, N_VIEW = 3, M = 2;
+        std::vector<uint8_t> w_raw(static_cast<size_t>(N_FULL) * 144U, 0);
+        for (size_t b = 0; b < static_cast<size_t>(N_FULL); ++b) {
+            uint8_t* p = w_raw.data() + b * 144U;
+            const uint16_t d = cloudtpu::f32_to_f16(0.02f * static_cast<float>(b + 1));
+            const uint16_t dm = cloudtpu::f32_to_f16(0.01f * static_cast<float>(b + 1));
+            std::memcpy(p + 0, &d, 2);
+            std::memcpy(p + 2, &dm, 2);
+            for (size_t i = 0; i < 12; ++i) p[4 + i] = static_cast<uint8_t>((b * 5 + i * 3 + 1) & 0x3F);
+            for (size_t i = 0; i < 128; ++i) p[16 + i] = static_cast<uint8_t>((b * 13 + i * 7) & 0xFF);
+        }
+        std::vector<float> x_host(static_cast<size_t>(M * K));
+        for (size_t i = 0; i < x_host.size(); ++i) x_host[i] = std::sin(static_cast<float>(i + 1) * 0.11f);
+
+        std::fflush(stdout);
+        std::fflush(stderr);
+        const pid_t pid = fork();
+        CHECK_TRUE(pid >= 0, "fork for 3-row BITCAST Q4_K slot-shape test");
+        if (pid == 0) {
+            setenv("CLOUDTPU_MOCK", "1", 1);
+            setenv("CLOUDTPU_MOCK_DEVICES", "1", 1);
+            setenv("CLOUDTPU_SPMD_CHIPS", "1", 1);
+            setenv("CLOUDTPU_Q4_MODE", "bitcast", 1);
+            setenv("CLOUDTPU_Q4K_BF16_SCALES", "0", 1);
+            ggml_backend_t be = ggml_backend_cloudtpu_init();
+            bool ok = false;
+            if (be != nullptr) {
+                const size_t mem = ggml_tensor_overhead() * 24 + ggml_graph_overhead() + 4096;
+                struct ggml_init_params p = {mem, nullptr, true};
+                struct ggml_context* ctx_w = ggml_init(p);
+                ggml_tensor* tw4 = ggml_new_tensor_2d(ctx_w, GGML_TYPE_Q4_K, K, N_FULL);
+                ggml_backend_buffer_t w_buf = ggml_backend_alloc_ctx_tensors(ctx_w, be);
+                // Populate bctx->slots[0] with the 4-row BITCAST (Q4_K_I4 + U8) slot
+                ggml_backend_tensor_set(tw4, w_raw.data(), 0, w_raw.size());
+
+                // Now create a 3-row Q4_K tensor at the exact same buffer offset 0 (different shape)
+                struct ggml_context* ctx_g = ggml_init(p);
+                struct ggml_cgraph* gf = ggml_new_graph(ctx_g);
+                ggml_tensor* tx = ggml_new_tensor_2d(ctx_g, GGML_TYPE_F32, K, M);
+                ggml_set_input(tx);
+                ggml_tensor* tw3 = ggml_new_tensor_2d(ctx_g, GGML_TYPE_Q4_K, K, N_VIEW);
+                tw3->buffer = tw4->buffer;
+                tw3->data = tw4->data;
+                ggml_tensor* ty = ggml_mul_mat(ctx_g, tw3, tx);
+                ggml_set_output(ty);
+                ggml_build_forward_expand(gf, ty);
+
+                ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
+                if (ggml_gallocr_alloc_graph(galloc, gf)) {
+                    ggml_backend_tensor_set(tx, x_host.data(), 0, x_host.size() * sizeof(float));
+                    if (ggml_backend_graph_compute(be, gf) == GGML_STATUS_SUCCESS) {
+                        std::vector<float> got(static_cast<size_t>(M * N_VIEW), -1.0f);
+                        ggml_backend_tensor_get(ty, got.data(), 0, got.size() * sizeof(float));
+                        ok = true;
+                        for (float v : got) {
+                            if (std::fabs(v) > 1e-5f || !std::isfinite(v)) {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+                ggml_gallocr_free(galloc);
+                ggml_free(ctx_g);
+                ggml_backend_buffer_free(w_buf);
+                ggml_free(ctx_w);
+                ggml_backend_free(be);
+            }
+            _exit(ok ? 0 : 1);
+        }
+        int status = 0;
+        CHECK_TRUE(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                   "3-row Q4_K tensor at 4-row BITCAST slot offset must fall back cleanly to Q4_K_SPLIT");
+    }
+    std::printf("  [PASS] ggml_cgraph reshaped host CPY bucket writeback & 3-row BITCAST Q4_K slot-shape fallback\n");
+#endif
+}
 #endif
 }  // namespace
 
@@ -5841,6 +6006,7 @@ int main() {
     test_continuous_batching_padded_buckets();
 #ifdef CLOUDTPU_HAS_GGML
     test_ggml_cgraph_odd_s4_shard_n();
+    test_ggml_cgraph_reshaped_host_cpy_and_q4_bitcast_view();
     test_ggml_cgraph_one_graph_decode();
     test_ggml_cgraph_continuous_batching_buckets();
 #endif
