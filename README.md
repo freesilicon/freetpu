@@ -155,6 +155,7 @@ export OPENBUENOS_DIVE_INTERP_PATH=/data/local/tmp/tpu_open_stack/dive_interp_rv
 - [`libopenbuenos` Guide](docs/libopenbuenos/README.md) & [`ggml-edgetpu` Guide](docs/llama-cpp-edgetpu/README.md)
 - [Headless Colab TPU Tooling](docs/cloud-tpu/colab-headless-tooling.md) — Track B `v6e-1`/`v5e-1` headless harness (`tools/colab_tpu_bench.py`), Colab MCP/`v1beta` contract & Track C boundaries
 - [Cloud TPU Ops: Container CDI & Prometheus Telemetry](docs/cloud-tpu/ops-container-telemetry.md) — Zero-dep `tpu-exporter` (`:9400/metrics`) & `freetpu-cdi` CNCF CDI `v0.6.0` (`freetpu.dev/tpu=all`) Docker/K8s manifests
+- [FreeTPU Router v0 Guide](docs/router/README.md) — OpenAI-compatible router across Pixel Tensor G5 clusters, local hosts, and Cloud TPU slices
 
 ---
 

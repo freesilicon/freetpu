@@ -1,0 +1,92 @@
+{
+  "host": "127.0.0.1",
+  "port": 8080,
+  "policy": "local_first",
+  "health_poll_interval_s": 10.0,
+  "failure_cooldown_s": 15.0,
+  "request_timeout_s": 120.0,
+  "probe_timeout_s": 2.5,
+  "queue_pressure_threshold": 16,
+  "backend_idle_timeout_s": 300.0,
+  "auth": {
+    "type": "allow_all"
+  },
+  "usage_meter": {
+    "type": "noop"
+  },
+  "scaler": {
+    "type": "noop"
+  },
+  "backends": [
+    {
+      "id": "pixel-g5-cluster",
+      "type": "pixel-tpu",
+      "local": true,
+      "spot": false,
+      "base_url": "http://127.0.0.1:8081/v1",
+      "models": ["qwen2.5-1.5b-q8_0", "qwen2.5-32b-q4_0"],
+      "discover_models": true,
+      "cost_per_1m_prompt_usd": 0.0,
+      "cost_per_1m_completion_usd": 0.0,
+      "priority": 10,
+      "metadata": {
+        "silicon": "Tensor G5 (buenos_a0)",
+        "topology": "dual-phone USB-C 5Gbps RPC cluster"
+      }
+    },
+    {
+      "id": "mac-host-local",
+      "type": "mac-local",
+      "local": true,
+      "spot": false,
+      "base_url": "http://127.0.0.1:8082/v1",
+      "models": ["qwen2.5-1.5b-q8_0", "smollm2-135m-q8_0"],
+      "discover_models": true,
+      "cost_per_1m_prompt_usd": 0.0,
+      "cost_per_1m_completion_usd": 0.0,
+      "priority": 20,
+      "metadata": {
+        "silicon": "Host CPU/GPU llama-server"
+      }
+    },
+    {
+      "id": "cloud-tpu-v5e-spot",
+      "type": "cloud-tpu-v5e",
+      "local": false,
+      "spot": true,
+      "base_url": "http://127.0.0.1:8083/v1",
+      "tpu_exporter_url": "http://127.0.0.1:9400/metrics",
+      "max_hbm_utilization": 0.90,
+      "max_duty_cycle_percent": 98.0,
+      "models": ["qwen2.5-32b-q4_0", "llama-3.3-70b-int8"],
+      "discover_models": true,
+      "cost_per_1m_prompt_usd": 0.15,
+      "cost_per_1m_completion_usd": 0.30,
+      "priority": 30,
+      "api_key_env": "FREETPU_CLOUD_BACKEND_TOKEN",
+      "metadata": {
+        "generation": "v5e",
+        "capacity_tier": "spot"
+      }
+    },
+    {
+      "id": "cloud-tpu-v6e-ondemand",
+      "type": "cloud-tpu-v6e",
+      "local": false,
+      "spot": false,
+      "base_url": "http://127.0.0.1:8084/v1",
+      "tpu_exporter_url": "http://127.0.0.1:9401/metrics",
+      "max_hbm_utilization": 0.92,
+      "models": ["qwen2.5-32b-q4_0", "llama-3.3-70b-int8"],
+      "discover_models": true,
+      "cost_per_1m_prompt_usd": 0.45,
+      "cost_per_1m_completion_usd": 0.90,
+      "priority": 40,
+      "api_key_env": "FREETPU_CLOUD_BACKEND_TOKEN",
+      "metadata": {
+        "generation": "v6e",
+        "capacity_tier": "on-demand"
+      }
+    }
+  ]
+}
