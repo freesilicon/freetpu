@@ -10873,6 +10873,9 @@ asyncio.run(main())
         mode = ["tls_stall_then_good"]
 
         class _FailoverTestSSLContext:
+            def __getattr__(self, name: str) -> Any:
+                return getattr(real_ssl_ctx, name)
+
             def wrap_socket(
                 self,
                 sock: socket.socket,
@@ -10895,6 +10898,11 @@ asyncio.run(main())
                 wrapper = _PassThroughTLSSock(sock, fail_cert=fail_cert)
                 created_wrappers.append(wrapper)
                 return wrapper
+
+        # Python 3.10/3.11 HTTPSConnection.__init__ reads verify_mode and check_hostname.
+        probe_ctx = _FailoverTestSSLContext()
+        self.assertEqual(probe_ctx.verify_mode, real_ssl_ctx.verify_mode)
+        self.assertEqual(probe_ctx.check_hostname, real_ssl_ctx.check_hostname)
 
         fake_infos = [
             (
@@ -11559,6 +11567,91 @@ asyncio.run(main())
                 os.environ.pop(env_key, None)
             else:
                 os.environ[env_key] = prev_val
+
+    def test_streamed_multi_choice_chat_accumulates_multiple_empty_choice_usage_frames(
+        self,
+    ) -> None:
+        recorded_usage: List[UsageEvent] = []
+
+        class _RecordHook:
+            def record_usage(self, event: UsageEvent) -> None:
+                recorded_usage.append(event)
+
+        class _MultiChoiceUsageSSEHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return None
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = json.dumps(
+                    {"object": "list", "data": [{"id": "m-n2-usage"}]}
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802
+                clen = int(self.headers.get("Content-Length", "0"))
+                if clen > 0:
+                    self.rfile.read(clen)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                # llama-server n=2 chat stream: separate choices:[] usage frame after each choice.
+                self.wfile.write(
+                    b'data: {"id":"c-n2","object":"chat.completion.chunk",'
+                    b'"choices":[{"index":0,"delta":{"content":"First"},"finish_reason":"stop"}]}\n\n'
+                    b'data: {"id":"c-n2","object":"chat.completion.chunk","choices":[],'
+                    b'"usage":{"prompt_tokens":10,"completion_tokens":6,"total_tokens":16}}\n\n'
+                    b'data: {"id":"c-n2","object":"chat.completion.chunk",'
+                    b'"choices":[{"index":1,"delta":{"content":"Second"},"finish_reason":"stop"}]}\n\n'
+                    b'data: {"id":"c-n2","object":"chat.completion.chunk","choices":[],'
+                    b'"usage":{"prompt_tokens":10,"completion_tokens":9,"total_tokens":19}}\n\n'
+                    b"data: [DONE]\n\n"
+                )
+                self.wfile.flush()
+
+        srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _MultiChoiceUsageSSEHandler))
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            backends=[
+                BackendConfig(
+                    id="n2-usage-b",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=f"http://127.0.0.1:{srv.server_address[1]}/v1",
+                    models=["m-n2-usage"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg, usage_hook=_RecordHook()))
+        st, _, bd = _http_request(
+            router.server_address[1],
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-n2-usage",
+                "n": 2,
+                "stream": True,
+                "stream_options": {"include_usage": True},
+                "messages": [{"role": "user", "content": "two choices"}],
+            },
+        )
+        self.assertEqual(st, 200)
+        self.assertIn(b"data: [DONE]", bd)
+        self.assertEqual(len(recorded_usage), 1)
+        self.assertEqual(recorded_usage[0].status_code, 200)
+        # Single shared prompt counted once (10); completion tokens summed across both choices (6+9=15).
+        self.assertEqual(recorded_usage[0].prompt_tokens, 10)
+        self.assertEqual(recorded_usage[0].completion_tokens, 15)
 
 
 def run_self_tests(verbosity: int = 1) -> int:

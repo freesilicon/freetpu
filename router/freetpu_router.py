@@ -524,6 +524,18 @@ def _ensure_safe_credential_transport(
         )
 
 
+def _expected_stream_prompt_batch_size(
+    endpoint: str,
+    req_payload: Mapping[str, Any],
+) -> int:
+    if endpoint == "/v1/completions":
+        prompt = req_payload.get("prompt")
+        if isinstance(prompt, list) and prompt:
+            if all(isinstance(item, (str, list)) for item in prompt):
+                return len(prompt)
+    return 1
+
+
 def _expected_stream_choices(endpoint: str, req_payload: Mapping[str, Any]) -> int:
     raw_n = req_payload.get("n", 1)
     n_val = (
@@ -531,12 +543,7 @@ def _expected_stream_choices(endpoint: str, req_payload: Mapping[str, Any]) -> i
         if isinstance(raw_n, int) and not isinstance(raw_n, bool) and raw_n >= 1
         else 1
     )
-    if endpoint == "/v1/completions":
-        prompt = req_payload.get("prompt")
-        if isinstance(prompt, list) and prompt:
-            if all(isinstance(item, (str, list)) for item in prompt):
-                return len(prompt) * n_val
-    return n_val
+    return _expected_stream_prompt_batch_size(endpoint, req_payload) * n_val
 
 
 class _BoundedSSEReader:
@@ -671,12 +678,12 @@ def _parse_inference_request_fields(
     raw_req: bytes,
     path: str,
 ) -> Tuple[
-    Optional[Tuple[str, bool, int, int, bool]],
+    Optional[Tuple[str, bool, int, int, int, bool]],
     Optional[Tuple[int, Optional[str], str]],
 ]:
     """Decode and validate an inbound inference JSON body in an isolated scope.
 
-    Returns `((model, stream, est_prompt_tokens, expected_choices, expect_final_usage), None)`
+    Returns `((model, stream, est_prompt_tokens, expected_choices, prompt_batch_size, expect_final_usage), None)`
     on success or `(None, (status_code, error_code, message))` on validation failure.
     Running inside a dedicated function guarantees that the decoded `str`, JSON
     `dict`, and any nested user fields (such as `stream_options`) go out of scope
@@ -720,6 +727,7 @@ def _parse_inference_request_fields(
         )
 
     est_prompt_tokens = _estimate_prompt_tokens(req_payload)
+    prompt_batch_size = _expected_stream_prompt_batch_size(path, req_payload)
     expected_choices = _expected_stream_choices(path, req_payload)
     raw_stream_opts = req_payload.get("stream_options")
     expect_final_usage = bool(
@@ -727,7 +735,14 @@ def _parse_inference_request_fields(
         and isinstance(raw_stream_opts, Mapping)
         and raw_stream_opts.get("include_usage") is True
     )
-    return (model, stream, est_prompt_tokens, expected_choices, expect_final_usage), None
+    return (
+        model,
+        stream,
+        est_prompt_tokens,
+        expected_choices,
+        prompt_batch_size,
+        expect_final_usage,
+    ), None
 
 
 def _json_serialized_char_len(val: Any) -> int:
@@ -3641,6 +3656,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 stream,
                 est_prompt_tokens,
                 expected_choices,
+                prompt_batch_size,
                 expect_final_usage,
             ) = parsed_fields
             # All decoded JSON containers went out of scope inside
@@ -3658,6 +3674,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 est_prompt_tokens,
                 expected_choices,
                 ctx,
+                prompt_batch_size=prompt_batch_size,
                 expect_final_usage=expect_final_usage,
             )
         finally:
@@ -3675,6 +3692,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         expected_choices: int,
         auth_ctx: AuthContext,
         *,
+        prompt_batch_size: int = 1,
         expect_final_usage: bool = False,
     ) -> None:
         engine = self.server.engine
@@ -3830,6 +3848,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         backend=backend,
                         model=model,
                         expected_choices=expected_choices,
+                        prompt_batch_size=prompt_batch_size,
                         req_id=req_id,
                         req_start=req_start,
                         attempt_start=attempt_start,
@@ -4271,6 +4290,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         backend: BackendState,
         model: str,
         expected_choices: int,
+        prompt_batch_size: int = 1,
         req_id: str,
         req_start: float,
         attempt_start: float,
@@ -4554,6 +4574,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             per_choice_terminal_usage: Dict[
                 Tuple[int, ...], Tuple[Optional[int], Optional[int]]
             ] = {}
+            empty_choice_usage_frames: List[Tuple[Optional[int], Optional[int]]] = []
             upstream_read_error = False
             size_limit_exceeded = False
             memory_limit_exceeded = False
@@ -4561,6 +4582,17 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             event_data_lines: List[bytes] = []
             current_event_type = ""
             required_choices = max(1, expected_choices)
+            effective_prompt_batch_size = max(1, prompt_batch_size)
+
+            def _aggregate_prompt_tokens(p_vals: List[int]) -> int:
+                if len(p_vals) == 1:
+                    return p_vals[0]
+                if effective_prompt_batch_size <= 1:
+                    return max(p_vals)
+                n_per_prompt = max(1, required_choices // effective_prompt_batch_size)
+                if n_per_prompt > 1 and len(p_vals) >= required_choices:
+                    return sum(p_vals) // n_per_prompt
+                return sum(p_vals)
 
             def process_sse_event_from(
                 ev_type: str,
@@ -4648,16 +4680,35 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                             if got_usage_count:
                                 made_progress = True
                                 has_choices = isinstance(choices, list) and len(choices) > 0
+                                all_choices_finished_now = all(
+                                    idx in finished_choice_indices
+                                    for idx in range(required_choices)
+                                )
                                 if not has_choices:
-                                    # Authoritative request-wide final usage frame (OpenAI / vLLM).
+                                    # Empty-choices usage frame: OpenAI/vLLM emit a single
+                                    # request-wide total at the end, whereas llama-server on
+                                    # multi-choice streams (n > 1 / batched prompts) can emit
+                                    # one empty-choices usage frame per finished choice.
                                     saw_request_wide_usage = True
-                                    if pt is not None:
-                                        prompt_tokens = pt
+                                    empty_choice_usage_frames.append((pt, ct))
+                                    p_vals = [
+                                        p for p, _ in empty_choice_usage_frames if p is not None
+                                    ]
+                                    c_vals = [
+                                        c for _, c in empty_choice_usage_frames if c is not None
+                                    ]
+                                    if p_vals:
+                                        prompt_tokens = _aggregate_prompt_tokens(p_vals)
                                         saw_explicit_prompt_usage = True
-                                    if ct is not None:
-                                        completion_tokens = ct
+                                    if c_vals:
+                                        completion_tokens = sum(c_vals)
                                         saw_explicit_completion_usage = True
-                                    saw_final_usage = True
+                                    if (
+                                        required_choices <= 1
+                                        or all_choices_finished_now
+                                        or len(empty_choice_usage_frames) >= required_choices
+                                    ):
+                                        saw_final_usage = True
                                 else:
                                     is_terminal_only_usage = (
                                         event_has_terminal_choice
@@ -4685,7 +4736,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                             if c is not None
                                         ]
                                         if p_vals:
-                                            prompt_tokens = sum(p_vals)
+                                            prompt_tokens = _aggregate_prompt_tokens(p_vals)
                                             saw_explicit_prompt_usage = True
                                         if c_vals:
                                             completion_tokens = sum(c_vals)
@@ -4697,10 +4748,6 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                                         if ct is not None:
                                             completion_tokens = ct
                                             saw_explicit_completion_usage = True
-                                    all_choices_finished_now = all(
-                                        idx in finished_choice_indices
-                                        for idx in range(required_choices)
-                                    )
                                     if (
                                         is_terminal_only_usage
                                         and all_choices_finished_now
