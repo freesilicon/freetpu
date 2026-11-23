@@ -1503,6 +1503,934 @@ void test_q4_i4_spmd_sharding() {
     std::printf("  [PASS] SPMD SHARD_N & SHARD_K Q4_K_I4 (P=4, 0.5 B/weight HBM parity)\n");
 }
 
+struct DecodeTestLayer {
+    std::vector<float> attn_norm;
+    std::vector<float> wq;
+    std::vector<float> wk;
+    std::vector<float> wv;
+    std::vector<float> wo;
+    std::vector<float> ffn_norm;
+    std::vector<float> wgate;
+    std::vector<float> wup;
+    std::vector<float> wdown;
+};
+
+struct DecodeTestModel {
+    int64_t n_layers = 2;
+    int64_t E = 32;
+    int64_t H_Q = 4;
+    int64_t H_KV = 2;
+    int64_t D = 8;
+    int64_t H_ff = 64;
+    int64_t KV_CAP = 8;
+    int64_t N_KV = 6;  // Static bucket (< KV_CAP) mirroring llama.cpp padded KV views
+    std::vector<DecodeTestLayer> layers;
+};
+
+DecodeTestModel make_decode_test_model() {
+    DecodeTestModel m;
+    m.layers.resize(static_cast<size_t>(m.n_layers));
+    const int64_t D_Q = m.H_Q * m.D;
+    const int64_t D_KV = m.H_KV * m.D;
+    auto fill = [](std::vector<float>& v, int64_t n, float scale, float phase) {
+        v.resize(static_cast<size_t>(n));
+        for (int64_t i = 0; i < n; ++i) {
+            v[static_cast<size_t>(i)] = scale * std::sin(static_cast<float>(i + 1) * 0.17f + phase);
+        }
+    };
+    for (int64_t l = 0; l < m.n_layers; ++l) {
+        const float lp = static_cast<float>(l) * 0.7f;
+        DecodeTestLayer& ly = m.layers[static_cast<size_t>(l)];
+        ly.attn_norm.resize(static_cast<size_t>(m.E));
+        ly.ffn_norm.resize(static_cast<size_t>(m.E));
+        for (int64_t i = 0; i < m.E; ++i) {
+            ly.attn_norm[static_cast<size_t>(i)] = 0.8f + 0.1f * std::cos(static_cast<float>(i) * 0.3f + lp);
+            ly.ffn_norm[static_cast<size_t>(i)] = 0.85f + 0.1f * std::sin(static_cast<float>(i) * 0.25f + lp);
+        }
+        fill(ly.wq, D_Q * m.E, 0.18f, 0.1f + lp);
+        fill(ly.wk, D_KV * m.E, 0.17f, 0.3f + lp);
+        fill(ly.wv, D_KV * m.E, 0.16f, 0.5f + lp);
+        fill(ly.wo, m.E * D_Q, 0.15f, 0.7f + lp);
+        fill(ly.wgate, m.H_ff * m.E, 0.14f, 0.9f + lp);
+        fill(ly.wup, m.H_ff * m.E, 0.14f, 1.1f + lp);
+        fill(ly.wdown, m.E * m.H_ff, 0.12f, 1.3f + lp);
+    }
+    return m;
+}
+
+std::vector<float> scalar_decode_step(const DecodeTestModel& m,
+                                      const std::vector<float>& x_in,
+                                      int32_t pos,
+                                      std::vector<std::vector<float>>& k_caches,
+                                      std::vector<std::vector<float>>& v_caches) {
+    const int64_t D_Q = m.H_Q * m.D;
+    const int64_t D_KV = m.H_KV * m.D;
+    const float eps = 1e-5f;
+    auto rms_mul = [&](const std::vector<float>& x, const std::vector<float>& w) {
+        double ss = 0.0;
+        for (float v : x) ss += static_cast<double>(v) * static_cast<double>(v);
+        const float inv = 1.0f / std::sqrt(static_cast<float>(ss / static_cast<double>(m.E)) + eps);
+        std::vector<float> out(static_cast<size_t>(m.E));
+        for (int64_t i = 0; i < m.E; ++i) out[static_cast<size_t>(i)] = x[static_cast<size_t>(i)] * inv * w[static_cast<size_t>(i)];
+        return out;
+    };
+    auto matvec = [](const std::vector<float>& w, const std::vector<float>& x, int64_t rows, int64_t cols) {
+        std::vector<float> out(static_cast<size_t>(rows), 0.0f);
+        for (int64_t r = 0; r < rows; ++r) {
+            float acc = 0.0f;
+            for (int64_t c = 0; c < cols; ++c) {
+                acc += w[static_cast<size_t>(r * cols + c)] * x[static_cast<size_t>(c)];
+            }
+            out[static_cast<size_t>(r)] = acc;
+        }
+        return out;
+    };
+    auto rope_neox = [&](std::vector<float>& t, int64_t n_heads) {
+        const int64_t half = m.D / 2;
+        for (int64_t h = 0; h < n_heads; ++h) {
+            float* p = t.data() + static_cast<size_t>(h * m.D);
+            for (int64_t i = 0; i < half; ++i) {
+                const float inv_f = std::pow(10000.0f, -2.0f * static_cast<float>(i) / static_cast<float>(m.D));
+                const float ang = static_cast<float>(pos) * inv_f;
+                const float c = std::cos(ang);
+                const float s = std::sin(ang);
+                const float x0 = p[static_cast<size_t>(i)];
+                const float x1 = p[static_cast<size_t>(i + half)];
+                p[static_cast<size_t>(i)] = x0 * c - x1 * s;
+                p[static_cast<size_t>(i + half)] = x0 * s + x1 * c;
+            }
+        }
+    };
+
+    std::vector<float> h = x_in;
+    for (int64_t l = 0; l < m.n_layers; ++l) {
+        const DecodeTestLayer& ly = m.layers[static_cast<size_t>(l)];
+        const std::vector<float> xn = rms_mul(h, ly.attn_norm);
+        std::vector<float> q = matvec(ly.wq, xn, D_Q, m.E);
+        std::vector<float> k = matvec(ly.wk, xn, D_KV, m.E);
+        std::vector<float> v = matvec(ly.wv, xn, D_KV, m.E);
+        rope_neox(q, m.H_Q);
+        rope_neox(k, m.H_KV);
+
+        for (int64_t d = 0; d < D_KV; ++d) {
+            k_caches[static_cast<size_t>(l)][static_cast<size_t>(pos * D_KV + d)] =
+                cloudtpu::f16_to_f32(cloudtpu::f32_to_f16(k[static_cast<size_t>(d)]));
+            v_caches[static_cast<size_t>(l)][static_cast<size_t>(pos * D_KV + d)] =
+                cloudtpu::f16_to_f32(cloudtpu::f32_to_f16(v[static_cast<size_t>(d)]));
+        }
+
+        const float scale = 1.0f / std::sqrt(static_cast<float>(m.D));
+        const int64_t gqa = m.H_Q / m.H_KV;
+        std::vector<float> attn_out(static_cast<size_t>(D_Q), 0.0f);
+        for (int64_t hq = 0; hq < m.H_Q; ++hq) {
+            const int64_t hk = hq / gqa;
+            std::vector<float> sc(static_cast<size_t>(m.N_KV), 0.0f);
+            float smax = -std::numeric_limits<float>::infinity();
+            for (int64_t t = 0; t < m.N_KV; ++t) {
+                float dot = 0.0f;
+                for (int64_t d = 0; d < m.D; ++d) {
+                    dot += q[static_cast<size_t>(hq * m.D + d)] *
+                           k_caches[static_cast<size_t>(l)][static_cast<size_t>(t * D_KV + hk * m.D + d)];
+                }
+                const float mask_v = (t <= pos) ? 0.0f : -std::numeric_limits<float>::infinity();
+                sc[static_cast<size_t>(t)] = dot * scale + mask_v;
+                if (sc[static_cast<size_t>(t)] > smax) smax = sc[static_cast<size_t>(t)];
+            }
+            float ssum = 0.0f;
+            for (int64_t t = 0; t < m.N_KV; ++t) {
+                sc[static_cast<size_t>(t)] = std::exp(sc[static_cast<size_t>(t)] - smax);
+                ssum += sc[static_cast<size_t>(t)];
+            }
+            for (int64_t t = 0; t < m.N_KV; ++t) {
+                const float p = sc[static_cast<size_t>(t)] / ssum;
+                for (int64_t d = 0; d < m.D; ++d) {
+                    attn_out[static_cast<size_t>(hq * m.D + d)] +=
+                        p * v_caches[static_cast<size_t>(l)][static_cast<size_t>(t * D_KV + hk * m.D + d)];
+                }
+            }
+        }
+        const std::vector<float> oproj = matvec(ly.wo, attn_out, m.E, D_Q);
+        for (int64_t i = 0; i < m.E; ++i) h[static_cast<size_t>(i)] += oproj[static_cast<size_t>(i)];
+
+        const std::vector<float> fn = rms_mul(h, ly.ffn_norm);
+        const std::vector<float> gf = matvec(ly.wgate, fn, m.H_ff, m.E);
+        const std::vector<float> uf = matvec(ly.wup, fn, m.H_ff, m.E);
+        std::vector<float> sw(static_cast<size_t>(m.H_ff));
+        for (int64_t j = 0; j < m.H_ff; ++j) {
+            const float gv = gf[static_cast<size_t>(j)];
+            sw[static_cast<size_t>(j)] = (gv / (1.0f + std::exp(-gv))) * uf[static_cast<size_t>(j)];
+        }
+        const std::vector<float> dn = matvec(ly.wdown, sw, m.E, m.H_ff);
+        for (int64_t i = 0; i < m.E; ++i) h[static_cast<size_t>(i)] += dn[static_cast<size_t>(i)];
+    }
+    return h;
+}
+
+std::vector<uint16_t> make_causal_mask_f16(int32_t pos, int64_t n_kv) {
+    std::vector<uint16_t> mask(static_cast<size_t>(n_kv));
+    for (int64_t t = 0; t < n_kv; ++t) {
+        const float v = (t <= pos) ? 0.0f : -std::numeric_limits<float>::infinity();
+        mask[static_cast<size_t>(t)] = cloudtpu::f32_to_f16(v);
+    }
+    return mask;
+}
+
+cloudtpu::GraphProgramSpec build_one_graph_decode_spec(const DecodeTestModel& m, int32_t spmd_chips) {
+    const int64_t D_Q = m.H_Q * m.D;
+    const int64_t D_KV = m.H_KV * m.D;
+    const auto DENSE = cloudtpu::TensorStorageKind::DENSE;
+    const auto F32 = cloudtpu::PjrtDType::F32;
+    const auto F16 = cloudtpu::PjrtDType::F16;
+    const auto S32 = cloudtpu::PjrtDType::S32;
+    const auto REP = cloudtpu::TensorShardingKind::REPLICATED;
+
+    cloudtpu::GraphProgramSpec spec;
+    spec.spmd_chips = spmd_chips;
+    spec.bf16_matmul = false;
+    uint64_t next_id = 1;
+
+    const uint64_t id_x0 = next_id++;
+    const uint64_t id_pos = next_id++;
+    const uint64_t id_mask = next_id++;
+    spec.inputs.push_back({id_x0, F32, DENSE, {1, 1, 1, m.E}, REP});
+    spec.inputs.push_back({id_pos, S32, DENSE, {1, 1, 1, 1}, REP});
+    spec.inputs.push_back({id_mask, F16, DENSE, {1, 1, 1, m.N_KV}, REP});
+
+    std::vector<uint64_t> kv_out_ids;
+    uint64_t cur_x = id_x0;
+    for (int64_t l = 0; l < m.n_layers; ++l) {
+        auto add_in = [&](cloudtpu::PjrtDType dt, int64_t d2, int64_t d3, int32_t alias_idx = -1) {
+            const uint64_t tid = next_id++;
+            cloudtpu::TensorSpec ts{tid, dt, DENSE, {1, 1, d2, d3}, REP, alias_idx};
+            spec.inputs.push_back(ts);
+            return tid;
+        };
+        const uint64_t id_an = add_in(F32, 1, m.E);
+        const uint64_t id_wq = add_in(F32, D_Q, m.E);
+        const uint64_t id_wk = add_in(F32, D_KV, m.E);
+        const uint64_t id_wv = add_in(F32, D_KV, m.E);
+        const uint64_t id_kcache = add_in(F16, m.KV_CAP, D_KV, static_cast<int32_t>(2 * l));
+        const uint64_t id_vcache = add_in(F16, m.KV_CAP, D_KV, static_cast<int32_t>(2 * l + 1));
+        const uint64_t id_wo = add_in(F32, m.E, D_Q);
+        const uint64_t id_fn = add_in(F32, 1, m.E);
+        const uint64_t id_wg = add_in(F32, m.H_ff, m.E);
+        const uint64_t id_wu = add_in(F32, m.H_ff, m.E);
+        const uint64_t id_wd = add_in(F32, m.E, m.H_ff);
+
+        auto add_op = [&](cloudtpu::CloudOpKind kind,
+                          std::vector<uint64_t> srcs,
+                          cloudtpu::PjrtDType dt,
+                          int64_t d0,
+                          int64_t d1,
+                          int64_t d2,
+                          int64_t d3) {
+            const uint64_t oid = next_id++;
+            cloudtpu::OpNodeSpec op;
+            op.kind = kind;
+            op.src_ids = std::move(srcs);
+            op.dst = {oid, dt, DENSE, {d0, d1, d2, d3}};
+            spec.ops.push_back(std::move(op));
+            return spec.ops.back();
+        };
+
+        const uint64_t id_rn = [&]() {
+            auto op = add_op(cloudtpu::CloudOpKind::RMS_NORM, {cur_x}, F32, 1, 1, 1, m.E);
+            spec.ops.back().eps = 1e-5f;
+            return op.dst.id;
+        }();
+        const uint64_t id_xin = add_op(cloudtpu::CloudOpKind::MUL, {id_rn, id_an}, F32, 1, 1, 1, m.E).dst.id;
+
+        auto emit_mm = [&](uint64_t w, uint64_t act, int64_t out_dim) {
+            auto op = add_op(cloudtpu::CloudOpKind::MUL_MAT, {w, act}, F32, 1, 1, 1, out_dim);
+            spec.ops.back().high_precision = true;
+            return op.dst.id;
+        };
+        const uint64_t id_q2d = emit_mm(id_wq, id_xin, D_Q);
+        const uint64_t id_k2d = emit_mm(id_wk, id_xin, D_KV);
+        const uint64_t id_v2d = emit_mm(id_wv, id_xin, D_KV);
+
+        const uint64_t id_q3d = add_op(cloudtpu::CloudOpKind::RESHAPE, {id_q2d}, F32, 1, 1, m.H_Q, m.D).dst.id;
+        const uint64_t id_k3d = add_op(cloudtpu::CloudOpKind::RESHAPE, {id_k2d}, F32, 1, 1, m.H_KV, m.D).dst.id;
+
+        auto emit_rope = [&](uint64_t src, int64_t n_heads) {
+            auto op = add_op(cloudtpu::CloudOpKind::ROPE, {src, id_pos}, F32, 1, 1, n_heads, m.D);
+            spec.ops.back().rope.n_dims = static_cast<int32_t>(m.D);
+            spec.ops.back().rope.mode = 2;
+            spec.ops.back().rope.freq_base = 10000.0f;
+            spec.ops.back().rope.freq_scale = 1.0f;
+            spec.ops.back().rope.attn_factor = 1.0f;
+            return op.dst.id;
+        };
+        const uint64_t id_qr = emit_rope(id_q3d, m.H_Q);
+        const uint64_t id_kr = emit_rope(id_k3d, m.H_KV);
+        const uint64_t id_kflat = add_op(cloudtpu::CloudOpKind::RESHAPE, {id_kr}, F32, 1, 1, 1, D_KV).dst.id;
+
+        const uint64_t id_kset =
+            add_op(cloudtpu::CloudOpKind::SET_ROWS, {id_kflat, id_pos, id_kcache}, F16, 1, 1, m.KV_CAP, D_KV).dst.id;
+        const uint64_t id_vset =
+            add_op(cloudtpu::CloudOpKind::SET_ROWS, {id_v2d, id_pos, id_vcache}, F16, 1, 1, m.KV_CAP, D_KV).dst.id;
+        kv_out_ids.push_back(id_kset);
+        kv_out_ids.push_back(id_vset);
+
+        auto emit_kv_view_perm = [&](uint64_t src_set) {
+            add_op(cloudtpu::CloudOpKind::SLICE, {src_set}, F16, 1, m.N_KV, m.H_KV, m.D);
+            spec.ops.back().slice_starts = {0, 0, 0, 0};
+            spec.ops.back().slice_limits = {1, 1, m.N_KV, D_KV};
+            const uint64_t sl_id = spec.ops.back().dst.id;
+
+            add_op(cloudtpu::CloudOpKind::TRANSPOSE, {sl_id}, F16, 1, m.H_KV, m.N_KV, m.D);
+            spec.ops.back().perm[0] = 0;
+            spec.ops.back().perm[1] = 2;
+            spec.ops.back().perm[2] = 1;
+            spec.ops.back().perm[3] = 3;
+            return spec.ops.back().dst.id;
+        };
+        const uint64_t id_kp = emit_kv_view_perm(id_kset);
+        const uint64_t id_vp = emit_kv_view_perm(id_vset);
+
+        add_op(cloudtpu::CloudOpKind::TRANSPOSE, {id_qr}, F32, 1, m.H_Q, 1, m.D);
+        spec.ops.back().perm[0] = 0;
+        spec.ops.back().perm[1] = 2;
+        spec.ops.back().perm[2] = 1;
+        spec.ops.back().perm[3] = 3;
+        const uint64_t id_qp = spec.ops.back().dst.id;
+
+        add_op(cloudtpu::CloudOpKind::FLASH_ATTN_EXT, {id_qp, id_kp, id_vp, id_mask}, F32, 1, 1, m.H_Q, m.D);
+        spec.ops.back().high_precision = true;
+        spec.ops.back().flash_attn.scale = 1.0f / std::sqrt(static_cast<float>(m.D));
+        const uint64_t id_attn = spec.ops.back().dst.id;
+
+        const uint64_t id_aflat = add_op(cloudtpu::CloudOpKind::RESHAPE, {id_attn}, F32, 1, 1, 1, D_Q).dst.id;
+        const uint64_t id_oproj = emit_mm(id_wo, id_aflat, m.E);
+        const uint64_t id_hmid = add_op(cloudtpu::CloudOpKind::ADD, {cur_x, id_oproj}, F32, 1, 1, 1, m.E).dst.id;
+
+        const uint64_t id_fnorm = [&]() {
+            auto op = add_op(cloudtpu::CloudOpKind::RMS_NORM, {id_hmid}, F32, 1, 1, 1, m.E);
+            spec.ops.back().eps = 1e-5f;
+            return op.dst.id;
+        }();
+        const uint64_t id_fin = add_op(cloudtpu::CloudOpKind::MUL, {id_fnorm, id_fn}, F32, 1, 1, 1, m.E).dst.id;
+        const uint64_t id_gf = emit_mm(id_wg, id_fin, m.H_ff);
+        const uint64_t id_uf = emit_mm(id_wu, id_fin, m.H_ff);
+        const uint64_t id_sw = add_op(cloudtpu::CloudOpKind::SWIGLU, {id_gf, id_uf}, F32, 1, 1, 1, m.H_ff).dst.id;
+        const uint64_t id_dn = emit_mm(id_wd, id_sw, m.E);
+        cur_x = add_op(cloudtpu::CloudOpKind::ADD, {id_hmid, id_dn}, F32, 1, 1, 1, m.E).dst.id;
+    }
+
+    spec.output_ids = kv_out_ids;
+    spec.output_ids.push_back(cur_x);
+    return spec;
+}
+
+void test_one_graph_multilayer_decode_and_donation() {
+    cloudtpu::RuntimeConfig cfg;
+    cfg.mock_mode = true;
+    cfg.exec_cache_cap = 64;
+    cloudtpu::PjrtRuntime rt;
+    rt.init(cfg);
+
+    const DecodeTestModel m = make_decode_test_model();
+    const int64_t D_Q = m.H_Q * m.D;
+    const int64_t D_KV = m.H_KV * m.D;
+
+    const cloudtpu::GraphProgramSpec spec = build_one_graph_decode_spec(m, 1);
+    const cloudtpu::EmittedProgram prog = cloudtpu::emit_stablehlo_program(spec);
+
+    // Verify all 4 KV caches emit {tf.aliasing_output = 0..3 : i32} and donatable bindings
+    int donatable_count = 0;
+    for (const auto& b : prog.input_bindings) {
+        if (b.donatable) ++donatable_count;
+    }
+    CHECK_TRUE(donatable_count == 4, "all 4 KV cache buffers must be donatable in 1-graph spec");
+    for (int32_t k = 0; k < 4; ++k) {
+        const std::string tag = "{tf.aliasing_output = " + std::to_string(k) + " : i32}";
+        CHECK_TRUE(prog.mlir_text.find(tag) != std::string::npos, "missing aliasing_output attr in 1-graph MLIR");
+    }
+
+    struct LayerBufs {
+        cloudtpu::PjrtBufferPtr an, wq, wk, wv, kc, vc, wo, fn, wg, wu, wd;
+    };
+    std::vector<LayerBufs> lbufs(static_cast<size_t>(m.n_layers));
+    const std::vector<uint16_t> zeros_kv(static_cast<size_t>(m.KV_CAP * D_KV), 0);
+    for (int64_t l = 0; l < m.n_layers; ++l) {
+        const DecodeTestLayer& ly = m.layers[static_cast<size_t>(l)];
+        LayerBufs& b = lbufs[static_cast<size_t>(l)];
+        b.an = rt.buffer_from_host(0, ly.attn_norm.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, m.E});
+        b.wq = rt.buffer_from_host(0, ly.wq.data(), cloudtpu::PjrtDType::F32, {1, 1, D_Q, m.E});
+        b.wk = rt.buffer_from_host(0, ly.wk.data(), cloudtpu::PjrtDType::F32, {1, 1, D_KV, m.E});
+        b.wv = rt.buffer_from_host(0, ly.wv.data(), cloudtpu::PjrtDType::F32, {1, 1, D_KV, m.E});
+        b.kc = rt.buffer_from_host(0, zeros_kv.data(), cloudtpu::PjrtDType::F16, {1, 1, m.KV_CAP, D_KV});
+        b.vc = rt.buffer_from_host(0, zeros_kv.data(), cloudtpu::PjrtDType::F16, {1, 1, m.KV_CAP, D_KV});
+        b.wo = rt.buffer_from_host(0, ly.wo.data(), cloudtpu::PjrtDType::F32, {1, 1, m.E, D_Q});
+        b.fn = rt.buffer_from_host(0, ly.ffn_norm.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, m.E});
+        b.wg = rt.buffer_from_host(0, ly.wgate.data(), cloudtpu::PjrtDType::F32, {1, 1, m.H_ff, m.E});
+        b.wu = rt.buffer_from_host(0, ly.wup.data(), cloudtpu::PjrtDType::F32, {1, 1, m.H_ff, m.E});
+        b.wd = rt.buffer_from_host(0, ly.wdown.data(), cloudtpu::PjrtDType::F32, {1, 1, m.E, m.H_ff});
+    }
+
+    std::vector<cloudtpu::PjrtDType> out_dts;
+    std::vector<std::vector<int64_t>> out_dims;
+    for (const auto& ob : prog.output_bindings) {
+        out_dts.push_back(ob.dtype);
+        out_dims.push_back(ob.dims);
+    }
+
+    std::vector<std::vector<float>> ref_k(static_cast<size_t>(m.n_layers),
+                                          std::vector<float>(static_cast<size_t>(m.KV_CAP * D_KV), 0.0f));
+    std::vector<std::vector<float>> ref_v(static_cast<size_t>(m.n_layers),
+                                          std::vector<float>(static_cast<size_t>(m.KV_CAP * D_KV), 0.0f));
+
+    uint64_t misses_after_0 = 0;
+    uint64_t hits_after_0 = 0;
+    const auto copts = rt.make_spmd_compile_options(1, 0, true, true);
+    for (int32_t pos = 0; pos < 4; ++pos) {
+        std::vector<float> x_step(static_cast<size_t>(m.E));
+        for (int64_t i = 0; i < m.E; ++i) {
+            x_step[static_cast<size_t>(i)] =
+                0.2f * std::cos(static_cast<float>(pos * 13 + i) * 0.21f);
+        }
+        const std::vector<uint16_t> mask_f16 = make_causal_mask_f16(pos, m.N_KV);
+
+        auto bx = rt.buffer_from_host(0, x_step.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, m.E});
+        auto bp = rt.buffer_from_host(0, &pos, cloudtpu::PjrtDType::S32, {1, 1, 1, 1});
+        auto bm = rt.buffer_from_host(0, mask_f16.data(), cloudtpu::PjrtDType::F16, {1, 1, 1, m.N_KV});
+
+        std::vector<PJRT_Buffer*> raw_in = {bx->handle.get(), bp->handle.get(), bm->handle.get()};
+        for (int64_t l = 0; l < m.n_layers; ++l) {
+            const LayerBufs& b = lbufs[static_cast<size_t>(l)];
+            raw_in.push_back(b.an->handle.get());
+            raw_in.push_back(b.wq->handle.get());
+            raw_in.push_back(b.wk->handle.get());
+            raw_in.push_back(b.wv->handle.get());
+            raw_in.push_back(b.kc->handle.get());
+            raw_in.push_back(b.vc->handle.get());
+            raw_in.push_back(b.wo->handle.get());
+            raw_in.push_back(b.fn->handle.get());
+            raw_in.push_back(b.wg->handle.get());
+            raw_in.push_back(b.wu->handle.get());
+            raw_in.push_back(b.wd->handle.get());
+        }
+
+        const auto* exec = rt.compile_or_get(prog.cache_key, prog.mlir_text, copts);
+        std::vector<cloudtpu::PjrtBufferPtr> outs;
+        rt.execute(exec, 0, raw_in.data(), raw_in.size(), outs, out_dts, out_dims, true);
+        CHECK_TRUE(outs.size() == 5, "expected 4 donated KV outputs + 1 hidden output");
+
+        // Feed donated KV buffers into next decode position without H2D re-upload
+        for (int64_t l = 0; l < m.n_layers; ++l) {
+            lbufs[static_cast<size_t>(l)].kc = outs[static_cast<size_t>(2 * l)];
+            lbufs[static_cast<size_t>(l)].vc = outs[static_cast<size_t>(2 * l + 1)];
+        }
+
+        const cloudtpu::CacheStats st = rt.cache_stats();
+        if (pos == 0) {
+            misses_after_0 = st.misses;
+            hits_after_0 = st.hits;
+        } else {
+            CHECK_TRUE(st.misses == misses_after_0, "zero recompilations expected on advancing decode pos");
+            CHECK_TRUE(st.hits == hits_after_0 + static_cast<uint64_t>(pos), "plan/cache hits must track pos");
+        }
+
+        std::vector<float> got(static_cast<size_t>(m.E));
+        rt.buffer_to_host(outs[4]->handle.get(), got.data(), got.size() * sizeof(float));
+        const std::vector<float> exp = scalar_decode_step(m, x_step, pos, ref_k, ref_v);
+        for (int64_t i = 0; i < m.E; ++i) {
+            CHECK_NEAR(got[static_cast<size_t>(i)], exp[static_cast<size_t>(i)], 1e-4f,
+                       "1-graph 2-layer decode parity across pos");
+        }
+    }
+
+    rt.shutdown();
+    std::printf("  [PASS] 1-graph 2-layer fused decode + 4x KV donation (0 recompiles across pos=0..3, parity < 1e-4)\n");
+}
+
+void test_one_graph_spmd_kv_donation(int num_chips) {
+    cloudtpu::RuntimeConfig cfg;
+    cfg.mock_mode = true;
+    cfg.mock_devices = num_chips;
+    cfg.exec_cache_cap = 64;
+    cloudtpu::PjrtRuntime rt;
+    rt.init(cfg);
+
+    const DecodeTestModel m = make_decode_test_model();
+    const int64_t D_Q = m.H_Q * m.D;
+    const int64_t D_KV = m.H_KV * m.D;
+    const cloudtpu::GraphProgramSpec spec = build_one_graph_decode_spec(m, num_chips);
+    const cloudtpu::EmittedProgram prog = cloudtpu::emit_stablehlo_program(spec);
+    const auto copts = rt.make_spmd_compile_options(num_chips);
+    const auto* exec = rt.compile_or_get(prog.cache_key, prog.mlir_text, copts);
+
+    std::vector<cloudtpu::PjrtDType> out_dts;
+    std::vector<std::vector<int64_t>> out_dims;
+    for (const auto& ob : prog.output_bindings) {
+        out_dts.push_back(ob.dtype);
+        out_dims.push_back(ob.dims);
+    }
+
+    const std::vector<uint16_t> zeros_kv(static_cast<size_t>(m.KV_CAP * D_KV), 0);
+    struct PerChipLayer {
+        cloudtpu::PjrtBufferPtr an, wq, wk, wv, kc, vc, wo, fn, wg, wu, wd;
+    };
+    std::vector<std::vector<PerChipLayer>> dev_layers(static_cast<size_t>(num_chips));
+    for (int d = 0; d < num_chips; ++d) {
+        dev_layers[static_cast<size_t>(d)].resize(static_cast<size_t>(m.n_layers));
+        for (int64_t l = 0; l < m.n_layers; ++l) {
+            const DecodeTestLayer& ly = m.layers[static_cast<size_t>(l)];
+            PerChipLayer& b = dev_layers[static_cast<size_t>(d)][static_cast<size_t>(l)];
+            b.an = rt.buffer_from_host(d, ly.attn_norm.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, m.E});
+            b.wq = rt.buffer_from_host(d, ly.wq.data(), cloudtpu::PjrtDType::F32, {1, 1, D_Q, m.E});
+            b.wk = rt.buffer_from_host(d, ly.wk.data(), cloudtpu::PjrtDType::F32, {1, 1, D_KV, m.E});
+            b.wv = rt.buffer_from_host(d, ly.wv.data(), cloudtpu::PjrtDType::F32, {1, 1, D_KV, m.E});
+            b.kc = rt.buffer_from_host(d, zeros_kv.data(), cloudtpu::PjrtDType::F16, {1, 1, m.KV_CAP, D_KV});
+            b.vc = rt.buffer_from_host(d, zeros_kv.data(), cloudtpu::PjrtDType::F16, {1, 1, m.KV_CAP, D_KV});
+            b.wo = rt.buffer_from_host(d, ly.wo.data(), cloudtpu::PjrtDType::F32, {1, 1, m.E, D_Q});
+            b.fn = rt.buffer_from_host(d, ly.ffn_norm.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, m.E});
+            b.wg = rt.buffer_from_host(d, ly.wgate.data(), cloudtpu::PjrtDType::F32, {1, 1, m.H_ff, m.E});
+            b.wu = rt.buffer_from_host(d, ly.wup.data(), cloudtpu::PjrtDType::F32, {1, 1, m.H_ff, m.E});
+            b.wd = rt.buffer_from_host(d, ly.wdown.data(), cloudtpu::PjrtDType::F32, {1, 1, m.E, m.H_ff});
+        }
+    }
+
+    std::vector<std::vector<float>> ref_k(static_cast<size_t>(m.n_layers),
+                                          std::vector<float>(static_cast<size_t>(m.KV_CAP * D_KV), 0.0f));
+    std::vector<std::vector<float>> ref_v(static_cast<size_t>(m.n_layers),
+                                          std::vector<float>(static_cast<size_t>(m.KV_CAP * D_KV), 0.0f));
+
+    for (int32_t pos = 0; pos < 3; ++pos) {
+        std::vector<float> x_step(static_cast<size_t>(m.E));
+        for (int64_t i = 0; i < m.E; ++i) x_step[static_cast<size_t>(i)] = 0.25f * std::sin(static_cast<float>(pos * 7 + i) * 0.19f);
+        const std::vector<uint16_t> mask_f16 = make_causal_mask_f16(pos, m.N_KV);
+
+        std::vector<cloudtpu::PjrtBufferPtr> bx(static_cast<size_t>(num_chips)), bp(static_cast<size_t>(num_chips)),
+            bm(static_cast<size_t>(num_chips));
+        std::vector<std::vector<PJRT_Buffer*>> raw_in(static_cast<size_t>(num_chips));
+        std::vector<PJRT_Buffer* const*> in_ptrs(static_cast<size_t>(num_chips));
+        for (int d = 0; d < num_chips; ++d) {
+            bx[static_cast<size_t>(d)] = rt.buffer_from_host(d, x_step.data(), cloudtpu::PjrtDType::F32, {1, 1, 1, m.E});
+            bp[static_cast<size_t>(d)] = rt.buffer_from_host(d, &pos, cloudtpu::PjrtDType::S32, {1, 1, 1, 1});
+            bm[static_cast<size_t>(d)] = rt.buffer_from_host(d, mask_f16.data(), cloudtpu::PjrtDType::F16, {1, 1, 1, m.N_KV});
+            raw_in[static_cast<size_t>(d)] = {
+                bx[static_cast<size_t>(d)]->handle.get(),
+                bp[static_cast<size_t>(d)]->handle.get(),
+                bm[static_cast<size_t>(d)]->handle.get(),
+            };
+            for (int64_t l = 0; l < m.n_layers; ++l) {
+                const PerChipLayer& b = dev_layers[static_cast<size_t>(d)][static_cast<size_t>(l)];
+                raw_in[static_cast<size_t>(d)].push_back(b.an->handle.get());
+                raw_in[static_cast<size_t>(d)].push_back(b.wq->handle.get());
+                raw_in[static_cast<size_t>(d)].push_back(b.wk->handle.get());
+                raw_in[static_cast<size_t>(d)].push_back(b.wv->handle.get());
+                raw_in[static_cast<size_t>(d)].push_back(b.kc->handle.get());
+                raw_in[static_cast<size_t>(d)].push_back(b.vc->handle.get());
+                raw_in[static_cast<size_t>(d)].push_back(b.wo->handle.get());
+                raw_in[static_cast<size_t>(d)].push_back(b.fn->handle.get());
+                raw_in[static_cast<size_t>(d)].push_back(b.wg->handle.get());
+                raw_in[static_cast<size_t>(d)].push_back(b.wu->handle.get());
+                raw_in[static_cast<size_t>(d)].push_back(b.wd->handle.get());
+            }
+            in_ptrs[static_cast<size_t>(d)] = raw_in[static_cast<size_t>(d)].data();
+        }
+
+        std::vector<std::vector<cloudtpu::PjrtBufferPtr>> outs;
+        rt.execute_spmd(exec, num_chips, in_ptrs.data(), prog.input_bindings.size(), outs, out_dts, out_dims, true);
+        const std::vector<float> exp = scalar_decode_step(m, x_step, pos, ref_k, ref_v);
+        for (int d = 0; d < num_chips; ++d) {
+            for (int64_t l = 0; l < m.n_layers; ++l) {
+                dev_layers[static_cast<size_t>(d)][static_cast<size_t>(l)].kc = outs[static_cast<size_t>(d)][static_cast<size_t>(2 * l)];
+                dev_layers[static_cast<size_t>(d)][static_cast<size_t>(l)].vc = outs[static_cast<size_t>(d)][static_cast<size_t>(2 * l + 1)];
+            }
+            std::vector<float> got(static_cast<size_t>(m.E));
+            rt.buffer_to_host(outs[static_cast<size_t>(d)][4]->handle.get(), got.data(), got.size() * sizeof(float));
+            for (int64_t i = 0; i < m.E; ++i) {
+                CHECK_NEAR(got[static_cast<size_t>(i)], exp[static_cast<size_t>(i)], 1e-4f, "SPMD multi-step KV donation parity");
+            }
+        }
+    }
+    rt.shutdown();
+    std::printf("  [PASS] Multi-chip SPMD (%d chips) 1-graph 2-layer decode + repeated KV donation\n", num_chips);
+}
+
+#ifdef CLOUDTPU_HAS_GGML
+struct ScopedEnv {
+    std::string key;
+    bool had = false;
+    std::string old_val;
+    explicit ScopedEnv(const char* k, const char* v) : key(k) {
+        const char* cur = std::getenv(k);
+        if (cur) {
+            had = true;
+            old_val = cur;
+        }
+        if (v) {
+            setenv(k, v, 1);
+        } else {
+            unsetenv(k);
+        }
+    }
+    ~ScopedEnv() {
+        if (had) {
+            setenv(key.c_str(), old_val.c_str(), 1);
+        } else {
+            unsetenv(key.c_str());
+        }
+    }
+};
+
+struct GgmlLogCapture {
+    std::string buf;
+    ggml_log_callback prev_cb = nullptr;
+    void* prev_ud = nullptr;
+    static void callback(enum ggml_log_level level, const char* text, void* user_data) {
+        (void) level;
+        if (text && user_data) {
+            static_cast<GgmlLogCapture*>(user_data)->buf += text;
+        }
+    }
+    GgmlLogCapture() {
+        ggml_log_get(&prev_cb, &prev_ud);
+        ggml_log_set(&GgmlLogCapture::callback, this);
+    }
+    ~GgmlLogCapture() {
+        ggml_log_set(prev_cb, prev_ud);
+    }
+};
+
+uint64_t parse_log_u64(const std::string& log, const char* field) {
+    const std::string key = std::string(field) + "=";
+    const size_t pos = log.rfind(key);
+    if (pos == std::string::npos) return UINT64_MAX;
+    return std::strtoull(log.c_str() + pos + key.size(), nullptr, 10);
+}
+
+struct GgmlDecodeExecResult {
+    std::vector<std::vector<float>> step_outputs;
+    std::vector<uint16_t> k0_after;
+    std::vector<uint16_t> v0_after;
+    std::string logs;
+};
+
+GgmlDecodeExecResult run_ggml_decode_sequence(const DecodeTestModel& m,
+                                              ggml_backend_t backend,
+                                              int num_steps,
+                                              bool* ok_out) {
+    GgmlDecodeExecResult res;
+    *ok_out = false;
+    const int64_t D_Q = m.H_Q * m.D;
+    const int64_t D_KV = m.H_KV * m.D;
+
+    const size_t w_mem = ggml_tensor_overhead() * 64 + 1024;
+    struct ggml_init_params wp = {w_mem, nullptr, true};
+    struct ggml_context* ctx_w = ggml_init(wp);
+    struct ggml_context* ctx_kv = ggml_init(wp);
+    if (!ctx_w || !ctx_kv) return res;
+
+    struct WLayer {
+        ggml_tensor *an, *wq, *wk, *wv, *wo, *fn, *wg, *wu, *wd;
+        ggml_tensor *kc, *vc;
+    };
+    std::vector<WLayer> wl(static_cast<size_t>(m.n_layers));
+    for (int64_t l = 0; l < m.n_layers; ++l) {
+        WLayer& w = wl[static_cast<size_t>(l)];
+        w.an = ggml_new_tensor_1d(ctx_w, GGML_TYPE_F32, m.E);
+        w.wq = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, m.E, D_Q);
+        w.wk = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, m.E, D_KV);
+        w.wv = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, m.E, D_KV);
+        w.wo = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, D_Q, m.E);
+        w.fn = ggml_new_tensor_1d(ctx_w, GGML_TYPE_F32, m.E);
+        w.wg = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, m.E, m.H_ff);
+        w.wu = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, m.E, m.H_ff);
+        w.wd = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, m.H_ff, m.E);
+        w.kc = ggml_new_tensor_2d(ctx_kv, GGML_TYPE_F16, D_KV, m.KV_CAP);
+        w.vc = ggml_new_tensor_2d(ctx_kv, GGML_TYPE_F16, D_KV, m.KV_CAP);
+    }
+
+    ggml_backend_buffer_t w_buf = ggml_backend_alloc_ctx_tensors(ctx_w, backend);
+    ggml_backend_buffer_t kv_buf = ggml_backend_alloc_ctx_tensors(ctx_kv, backend);
+    if (!w_buf || !kv_buf) {
+        if (kv_buf) ggml_backend_buffer_free(kv_buf);
+        if (w_buf) ggml_backend_buffer_free(w_buf);
+        ggml_free(ctx_kv);
+        ggml_free(ctx_w);
+        return res;
+    }
+
+    const std::vector<uint16_t> zeros_kv(static_cast<size_t>(m.KV_CAP * D_KV), 0);
+    for (int64_t l = 0; l < m.n_layers; ++l) {
+        const DecodeTestLayer& ly = m.layers[static_cast<size_t>(l)];
+        const WLayer& w = wl[static_cast<size_t>(l)];
+        ggml_backend_tensor_set(w.an, ly.attn_norm.data(), 0, ly.attn_norm.size() * sizeof(float));
+        ggml_backend_tensor_set(w.wq, ly.wq.data(), 0, ly.wq.size() * sizeof(float));
+        ggml_backend_tensor_set(w.wk, ly.wk.data(), 0, ly.wk.size() * sizeof(float));
+        ggml_backend_tensor_set(w.wv, ly.wv.data(), 0, ly.wv.size() * sizeof(float));
+        ggml_backend_tensor_set(w.wo, ly.wo.data(), 0, ly.wo.size() * sizeof(float));
+        ggml_backend_tensor_set(w.fn, ly.ffn_norm.data(), 0, ly.ffn_norm.size() * sizeof(float));
+        ggml_backend_tensor_set(w.wg, ly.wgate.data(), 0, ly.wgate.size() * sizeof(float));
+        ggml_backend_tensor_set(w.wu, ly.wup.data(), 0, ly.wup.size() * sizeof(float));
+        ggml_backend_tensor_set(w.wd, ly.wdown.data(), 0, ly.wdown.size() * sizeof(float));
+        ggml_backend_tensor_set(w.kc, zeros_kv.data(), 0, zeros_kv.size() * sizeof(uint16_t));
+        ggml_backend_tensor_set(w.vc, zeros_kv.data(), 0, zeros_kv.size() * sizeof(uint16_t));
+    }
+
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    for (int32_t pos = 0; pos < num_steps; ++pos) {
+        const size_t g_mem = ggml_tensor_overhead() * 256 + ggml_graph_overhead() + 4096;
+        struct ggml_init_params gp = {g_mem, nullptr, true};
+        struct ggml_context* ctx_g = ggml_init(gp);
+        struct ggml_cgraph* gf = ggml_new_graph(ctx_g);
+
+        ggml_tensor* inp_x = ggml_new_tensor_2d(ctx_g, GGML_TYPE_F32, m.E, 1);
+        ggml_tensor* inp_pos = ggml_new_tensor_1d(ctx_g, GGML_TYPE_I32, 1);
+        ggml_tensor* inp_row_idx = ggml_new_tensor_1d(ctx_g, GGML_TYPE_I64, 1);
+        ggml_tensor* inp_mask = ggml_new_tensor_4d(ctx_g, GGML_TYPE_F16, m.N_KV, 1, 1, 1);
+        ggml_set_input(inp_x);
+        ggml_set_input(inp_pos);
+        ggml_set_input(inp_row_idx);
+        ggml_set_input(inp_mask);
+
+        ggml_tensor* cur = inp_x;
+        for (int64_t l = 0; l < m.n_layers; ++l) {
+            const WLayer& w = wl[static_cast<size_t>(l)];
+            ggml_tensor* rn = ggml_rms_norm(ctx_g, cur, 1e-5f);
+            ggml_tensor* xin = ggml_mul(ctx_g, rn, w.an);
+            ggml_tensor* q = ggml_mul_mat(ctx_g, w.wq, xin);
+            ggml_tensor* k = ggml_mul_mat(ctx_g, w.wk, xin);
+            ggml_tensor* v = ggml_mul_mat(ctx_g, w.wv, xin);
+
+            ggml_tensor* q3 = ggml_reshape_3d(ctx_g, q, m.D, m.H_Q, 1);
+            ggml_tensor* k3 = ggml_reshape_3d(ctx_g, k, m.D, m.H_KV, 1);
+            ggml_tensor* qr = ggml_rope_ext(
+                ctx_g, q3, inp_pos, nullptr, static_cast<int>(m.D), GGML_ROPE_TYPE_NEOX, 0,
+                10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            ggml_tensor* kr = ggml_rope_ext(
+                ctx_g, k3, inp_pos, nullptr, static_cast<int>(m.D), GGML_ROPE_TYPE_NEOX, 0,
+                10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            ggml_tensor* kflat = ggml_reshape_2d(ctx_g, kr, D_KV, 1);
+
+            ggml_tensor* kset = ggml_set_rows(ctx_g, w.kc, kflat, inp_row_idx);
+            ggml_tensor* vset = ggml_set_rows(ctx_g, w.vc, v, inp_row_idx);
+            ggml_build_forward_expand(gf, kset);
+            ggml_build_forward_expand(gf, vset);
+
+            ggml_tensor* kview = ggml_view_4d(
+                ctx_g, w.kc, m.D, m.H_KV, m.N_KV, 1,
+                static_cast<size_t>(m.D) * ggml_element_size(w.kc), w.kc->nb[1], w.kc->nb[2], 0);
+            ggml_tensor* vview = ggml_view_4d(
+                ctx_g, w.vc, m.D, m.H_KV, m.N_KV, 1,
+                static_cast<size_t>(m.D) * ggml_element_size(w.vc), w.vc->nb[1], w.vc->nb[2], 0);
+            ggml_tensor* qp = ggml_permute(ctx_g, qr, 0, 2, 1, 3);
+            ggml_tensor* kp = ggml_permute(ctx_g, kview, 0, 2, 1, 3);
+            ggml_tensor* vp = ggml_permute(ctx_g, vview, 0, 2, 1, 3);
+
+            ggml_tensor* attn = ggml_flash_attn_ext(
+                ctx_g, qp, kp, vp, inp_mask, 1.0f / std::sqrt(static_cast<float>(m.D)), 0.0f, 0.0f);
+            ggml_prec_set_acc(attn, GGML_PREC_F32);
+            ggml_tensor* aflat = ggml_reshape_2d(ctx_g, attn, D_Q, 1);
+            ggml_tensor* oproj = ggml_mul_mat(ctx_g, w.wo, aflat);
+            ggml_tensor* hmid = ggml_add(ctx_g, cur, oproj);
+
+            ggml_tensor* fn = ggml_rms_norm(ctx_g, hmid, 1e-5f);
+            ggml_tensor* fin = ggml_mul(ctx_g, fn, w.fn);
+            ggml_tensor* fg = ggml_mul_mat(ctx_g, w.wg, fin);
+            ggml_tensor* fu = ggml_mul_mat(ctx_g, w.wu, fin);
+            ggml_tensor* sw = ggml_swiglu_split(ctx_g, fg, fu);
+            ggml_tensor* dn = ggml_mul_mat(ctx_g, w.wd, sw);
+            cur = ggml_add(ctx_g, hmid, dn);
+        }
+        ggml_set_output(cur);
+        ggml_build_forward_expand(gf, cur);
+
+        if (!ggml_gallocr_alloc_graph(galloc, gf)) {
+            ggml_free(ctx_g);
+            ggml_gallocr_free(galloc);
+            ggml_backend_buffer_free(kv_buf);
+            ggml_backend_buffer_free(w_buf);
+            ggml_free(ctx_kv);
+            ggml_free(ctx_w);
+            return res;
+        }
+
+        std::vector<float> x_step(static_cast<size_t>(m.E));
+        for (int64_t i = 0; i < m.E; ++i) {
+            x_step[static_cast<size_t>(i)] =
+                0.2f * std::cos(static_cast<float>(pos * 13 + i) * 0.21f);
+        }
+        const int64_t row_idx64 = pos;
+        const std::vector<uint16_t> mask_f16 = make_causal_mask_f16(pos, m.N_KV);
+        ggml_backend_tensor_set(inp_x, x_step.data(), 0, x_step.size() * sizeof(float));
+        ggml_backend_tensor_set(inp_pos, &pos, 0, sizeof(pos));
+        ggml_backend_tensor_set(inp_row_idx, &row_idx64, 0, sizeof(row_idx64));
+        ggml_backend_tensor_set(inp_mask, mask_f16.data(), 0, mask_f16.size() * sizeof(uint16_t));
+
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+            ggml_free(ctx_g);
+            ggml_gallocr_free(galloc);
+            ggml_backend_buffer_free(kv_buf);
+            ggml_backend_buffer_free(w_buf);
+            ggml_free(ctx_kv);
+            ggml_free(ctx_w);
+            return res;
+        }
+        std::vector<float> y(static_cast<size_t>(m.E), 0.0f);
+        ggml_backend_tensor_get(cur, y.data(), 0, y.size() * sizeof(float));
+        res.step_outputs.push_back(std::move(y));
+        ggml_free(ctx_g);
+    }
+
+    res.k0_after.resize(static_cast<size_t>(m.KV_CAP * D_KV));
+    res.v0_after.resize(static_cast<size_t>(m.KV_CAP * D_KV));
+    ggml_backend_tensor_get(wl[0].kc, res.k0_after.data(), 0, res.k0_after.size() * sizeof(uint16_t));
+    ggml_backend_tensor_get(wl[0].vc, res.v0_after.data(), 0, res.v0_after.size() * sizeof(uint16_t));
+
+    ggml_gallocr_free(galloc);
+    ggml_backend_buffer_free(kv_buf);
+    ggml_backend_buffer_free(w_buf);
+    ggml_free(ctx_kv);
+    ggml_free(ctx_w);
+    *ok_out = true;
+    return res;
+}
+
+void test_ggml_cgraph_one_graph_decode() {
+    ScopedEnv env_mock("CLOUDTPU_MOCK", "1");
+    ScopedEnv env_verb("CLOUDTPU_VERBOSE", "1");
+    ScopedEnv env_fuse_cap("CLOUDTPU_MAX_FUSE_OPS", nullptr);   // Verify default 4096
+    ScopedEnv env_fuse_attn("CLOUDTPU_FUSE_ATTN", nullptr);     // Verify default true
+    ScopedEnv env_fuse_graphs("CLOUDTPU_FUSE_GRAPHS", nullptr); // Verify default true
+    ScopedEnv env_bf16("CLOUDTPU_BF16_MATMUL", "0");            // Isolate fusion/donation parity (< 1e-4)
+
+    const DecodeTestModel m = make_decode_test_model();
+
+    // CPU reference across pos=0..3
+    ggml_backend_t cpu_be = ggml_backend_cpu_init();
+    CHECK_TRUE(cpu_be != nullptr, "cpu backend init");
+    bool ok_cpu = false;
+    const auto cpu_res = run_ggml_decode_sequence(m, cpu_be, 4, &ok_cpu);
+    ggml_backend_free(cpu_be);
+    CHECK_TRUE(ok_cpu && cpu_res.step_outputs.size() == 4, "cpu 2-layer decode reference");
+
+    // 1) Single step under default fusion caps/flags: MUST collapse to subgraphs == 1
+    {
+        GgmlLogCapture cap;
+        ggml_backend_t tpu_be = ggml_backend_cloudtpu_init();
+        CHECK_TRUE(tpu_be != nullptr, "cloudtpu init (1-step)");
+        bool ok_tpu = false;
+        const auto tpu_res = run_ggml_decode_sequence(m, tpu_be, 1, &ok_tpu);
+        ggml_backend_free(tpu_be);
+        CHECK_TRUE(ok_tpu && tpu_res.step_outputs.size() == 1, "cloudtpu 1-step 2-layer decode");
+        const uint64_t evals = parse_log_u64(cap.buf, "evals");
+        const uint64_t subgraphs = parse_log_u64(cap.buf, "subgraphs");
+        const uint64_t misses = parse_log_u64(cap.buf, "plan_misses");
+        const uint64_t donated = parse_log_u64(cap.buf, "kv_donated");
+        const uint64_t skipped = parse_log_u64(cap.buf, "kv_donation_skipped");
+        CHECK_TRUE(evals == 1 && subgraphs == 1 && misses == 1,
+                   "2-layer RMS_NORM->QKV->ROPE->SET_ROWS->VIEW->FLASH_ATTN_EXT->O_PROJ->FFN must fuse into 1 subgraph");
+        CHECK_TRUE(donated == 4 && skipped == 0,
+                   "all 4 KV cache buffers must donate cleanly with zero non_donatable conflicts");
+        for (int64_t i = 0; i < m.E; ++i) {
+            CHECK_NEAR(tpu_res.step_outputs[0][static_cast<size_t>(i)],
+                       cpu_res.step_outputs[0][static_cast<size_t>(i)],
+                       1e-4f, "ggml 1-step parity vs CPU");
+        }
+    }
+
+    // 2) Repeated pos=0..3 calls: subgraphs == 4 (1/token), plan_hits == 3, plan_misses == 1, KV readback matches
+    GgmlDecodeExecResult tpu_4res;
+    {
+        GgmlLogCapture cap;
+        ggml_backend_t tpu_be = ggml_backend_cloudtpu_init();
+        CHECK_TRUE(tpu_be != nullptr, "cloudtpu init (4-step)");
+        bool ok_tpu = false;
+        tpu_4res = run_ggml_decode_sequence(m, tpu_be, 4, &ok_tpu);
+        ggml_backend_free(tpu_be);
+        CHECK_TRUE(ok_tpu && tpu_4res.step_outputs.size() == 4, "cloudtpu 4-step 2-layer decode");
+        const uint64_t evals = parse_log_u64(cap.buf, "evals");
+        const uint64_t subgraphs = parse_log_u64(cap.buf, "subgraphs");
+        const uint64_t hits = parse_log_u64(cap.buf, "plan_hits");
+        const uint64_t misses = parse_log_u64(cap.buf, "plan_misses");
+        const uint64_t donated = parse_log_u64(cap.buf, "kv_donated");
+        const uint64_t skipped = parse_log_u64(cap.buf, "kv_donation_skipped");
+        CHECK_TRUE(evals == 4 && subgraphs == 4 && hits == 3 && misses == 1,
+                   "4 decode steps must yield 4 subgraphs, 3 plan_hits, 1 plan_miss");
+        CHECK_TRUE(donated == 16 && skipped == 0,
+                   "all 4 KV cache buffers must donate cleanly across pos=0..3");
+        for (int s = 0; s < 4; ++s) {
+            for (int64_t i = 0; i < m.E; ++i) {
+                CHECK_NEAR(tpu_4res.step_outputs[static_cast<size_t>(s)][static_cast<size_t>(i)],
+                           cpu_res.step_outputs[static_cast<size_t>(s)][static_cast<size_t>(i)],
+                           1e-4f, "ggml 4-step 1-graph parity vs CPU");
+            }
+        }
+        for (size_t i = 0; i < cpu_res.k0_after.size(); ++i) {
+            CHECK_NEAR(cloudtpu::f16_to_f32(tpu_4res.k0_after[i]),
+                       cloudtpu::f16_to_f32(cpu_res.k0_after[i]),
+                       2e-3f, "donated K0 cache readback parity vs CPU");
+            CHECK_NEAR(cloudtpu::f16_to_f32(tpu_4res.v0_after[i]),
+                       cloudtpu::f16_to_f32(cpu_res.v0_after[i]),
+                       2e-3f, "donated V0 cache readback parity vs CPU");
+        }
+    }
+
+    // 3) CLOUDTPU_FUSE_ATTN=0 splits at FLASH_ATTN_EXT (2+ pass reference) and matches 1-graph identically
+    {
+        ScopedEnv env_no_attn("CLOUDTPU_FUSE_ATTN", "0");
+        GgmlLogCapture cap;
+        ggml_backend_t tpu_split = ggml_backend_cloudtpu_init();
+        CHECK_TRUE(tpu_split != nullptr, "cloudtpu init (CLOUDTPU_FUSE_ATTN=0)");
+        bool ok_split = false;
+        const auto split_res = run_ggml_decode_sequence(m, tpu_split, 4, &ok_split);
+        ggml_backend_free(tpu_split);
+        CHECK_TRUE(ok_split && split_res.step_outputs.size() == 4, "cloudtpu 2-pass split reference");
+        const uint64_t subgraphs = parse_log_u64(cap.buf, "subgraphs");
+        CHECK_TRUE(subgraphs > 4, "CLOUDTPU_FUSE_ATTN=0 must split attention subgraphs");
+        for (int s = 0; s < 4; ++s) {
+            for (int64_t i = 0; i < m.E; ++i) {
+                CHECK_NEAR(tpu_4res.step_outputs[static_cast<size_t>(s)][static_cast<size_t>(i)],
+                           split_res.step_outputs[static_cast<size_t>(s)][static_cast<size_t>(i)],
+                           1e-5f, "1-graph fused vs CLOUDTPU_FUSE_ATTN=0 2-pass reference");
+            }
+        }
+    }
+
+    // 4) CLOUDTPU_MAX_FUSE_OPS=25 env override splits cleanly while preserving parity
+    {
+        ScopedEnv env_cap("CLOUDTPU_MAX_FUSE_OPS", "25");
+        GgmlLogCapture cap;
+        ggml_backend_t tpu_cap = ggml_backend_cloudtpu_init();
+        CHECK_TRUE(tpu_cap != nullptr, "cloudtpu init (CLOUDTPU_MAX_FUSE_OPS=25)");
+        bool ok_cap = false;
+        const auto cap_res = run_ggml_decode_sequence(m, tpu_cap, 1, &ok_cap);
+        ggml_backend_free(tpu_cap);
+        CHECK_TRUE(ok_cap && parse_log_u64(cap.buf, "subgraphs") > 1,
+                   "CLOUDTPU_MAX_FUSE_OPS=25 override must split 2-layer decode");
+        for (int64_t i = 0; i < m.E; ++i) {
+            CHECK_NEAR(cap_res.step_outputs[0][static_cast<size_t>(i)],
+                       cpu_res.step_outputs[0][static_cast<size_t>(i)],
+                       1e-4f, "CLOUDTPU_MAX_FUSE_OPS=25 parity vs CPU");
+        }
+    }
+
+    // 5) Default CLOUDTPU_BF16_MATMUL (unset) still fuses into subgraphs == 1 & passes bounded parity
+    {
+        ScopedEnv env_bf16_default("CLOUDTPU_BF16_MATMUL", nullptr);
+        GgmlLogCapture cap;
+        ggml_backend_t tpu_def = ggml_backend_cloudtpu_init();
+        CHECK_TRUE(tpu_def != nullptr, "cloudtpu init (default env)");
+        bool ok_def = false;
+        const auto def_res = run_ggml_decode_sequence(m, tpu_def, 1, &ok_def);
+        ggml_backend_free(tpu_def);
+        CHECK_TRUE(ok_def && parse_log_u64(cap.buf, "subgraphs") == 1,
+                   "default CLOUDTPU env must execute 2-layer decode in 1 subgraph");
+        for (int64_t i = 0; i < m.E; ++i) {
+            CHECK_NEAR(def_res.step_outputs[0][static_cast<size_t>(i)],
+                       cpu_res.step_outputs[0][static_cast<size_t>(i)],
+                       1e-2f, "default BF16 1-graph bounded parity vs CPU");
+        }
+    }
+
+    std::printf("  [PASS] ggml_cgraph 2-layer 1-graph decode + KV donation + plan_hits=3 parity\n");
+}
+#endif
+
 }  // namespace
 
 int main() {
@@ -1537,6 +2465,11 @@ int main() {
     test_spmd_multichip_mesh(4);  // tpu7x-4t (4x 192 GiB HBM3e)
     test_spmd_multichip_mesh(8);  // v6e-8 (8x 32 GiB HBM)
     test_q4_i4_spmd_sharding();
+    test_one_graph_multilayer_decode_and_donation();
+    test_one_graph_spmd_kv_donation(4);
+#ifdef CLOUDTPU_HAS_GGML
+    test_ggml_cgraph_one_graph_decode();
+#endif
 
     const size_t py_maps = cloudtpu::count_libpython_mappings();
     std::printf("  MAPS_LIBPYTHON=%zu\n", py_maps);
