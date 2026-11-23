@@ -40,7 +40,7 @@ Host mock verification (`OPENBUENOS_MOCK=1`): `test-backend-ops -b EDGETPU -o MU
 
 ### 2.2 Bring Up Direct 5 Gbps USB-C CDC-NCM Link (Zero Wi-Fi Data)
 
-Connect both rooted Pixel 10s directly with a USB-C 3.2 / Thunderbolt 5 cable (use Wireless Debugging strictly as an out-of-band control shell). On the USB `device` side (`mustang`), enable CDC-NCM and assign a point-to-point `/30` subnet with high-priority policy routing (`table 200`):
+Connect both rooted Pixel 10s directly with a USB-C 3.2 / Thunderbolt 5 cable (if using Wireless Debugging during initial link setup, disable Wi-Fi on Node 2 before starting the unauthenticated RPC server so only the point-to-point USB-C NCM link is active). On the USB `device` side (`mustang`), enable CDC-NCM and assign a point-to-point `/30` subnet with high-priority policy routing (`table 200`):
 
 ```bash
 # Node 2 (mustang — USB device side, super-speed):
@@ -75,14 +75,9 @@ Measured direct link: **`1.49 ms` min / `2.35 ms` avg** ping RTT (`0%` loss), **
 Bound the per-node `ext[2]` DMA-BUF LRU weight cache (`OPENBUENOS_WEIGHT_CACHE_MB=128`, `OPENBUENOS_POOL_MB=64`) to stay comfortably below Android LMKD limits while holding `~9 GiB` of model weights per phone:
 
 ```bash
-# Node 2 (mustang — isolate TCP 50052 strictly to `ncm0` BEFORE starting the root RPC server):
-# Per upstream llama.cpp, ggml-rpc-server is unauthenticated. Either disable Wi-Fi (`svc wifi disable`)
-# before launch, or enforce an ingress rule allowing TCP 50052 only from `10.99.0.1` over `ncm0`:
+# Node 2 (mustang — disable Wi-Fi BEFORE launching the unauthenticated RPC server so only ncm0 is active):
 su -c '
-  iptables -D INPUT -p tcp --dport 50052 -i ncm0 -s 10.99.0.1/32 -d 10.99.0.2/32 -j ACCEPT 2>/dev/null || true
-  iptables -D INPUT -p tcp --dport 50052 -j DROP 2>/dev/null || true
-  iptables -I INPUT 1 -p tcp --dport 50052 -j DROP
-  iptables -I INPUT 1 -p tcp --dport 50052 -i ncm0 -s 10.99.0.1/32 -d 10.99.0.2/32 -j ACCEPT
+  svc wifi disable
   OPENBUENOS_VERBOSE=1 OPENBUENOS_WEIGHT_CACHE_MB=128 OPENBUENOS_WEIGHT_CACHE_ENTRIES=256 OPENBUENOS_POOL_MB=64 \
   /data/local/tmp/llama-edgetpu-rpc/ggml-rpc-server -d EDGETPU -H 10.99.0.2 -p 50052 -t 4
 '
