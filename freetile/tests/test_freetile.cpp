@@ -215,6 +215,44 @@ int main() {
             freetile::DType::BF16, freetile::DType::BF16, false, &k_d96, &reason),
             ("Dense M=8 K=96 N=128 plan failed: " + reason).c_str());
         CHECK_TRUE(k_d96.grid.bk == 96 && k_d96.validate(&reason), "Dense K=96 selects bk=96 and validates");
+
+        // M=8, K=192, N=128 on V5E: 192 % 128 != 0, so split-K bk=64 is illegal; whole-K bk=192 fits VMEM
+        freetile::TileKernel k_d192;
+        CHECK_TRUE(freetile::plan_quant_matmul_kernel(
+            freetile::ChipTarget::V5E, 8, 192, 128, freetile::QuantFormat::NONE,
+            freetile::DType::BF16, freetile::DType::F32, false, &k_d192, &reason),
+            ("Dense M=8 K=192 N=128 plan failed: " + reason).c_str());
+        CHECK_TRUE(k_d192.grid.bk == 192 && k_d192.grid.dims.size() == 1 && k_d192.validate(&reason),
+                   "Dense K=192 selects whole-K bk=192 (1D grid) instead of unaligned split-K bk=64");
+
+        // Manually constructed unaligned split-K (bk=64 on K=192) on V5E must fail validate() & throw on emit
+        freetile::TileKernel bad_splitk = k_d192;
+        bad_splitk.grid.bk = 64;
+        bad_splitk.grid.dims = {1, 3};
+        bad_splitk.grid.semantics = {freetile::DimensionSemantics::PARALLEL, freetile::DimensionSemantics::ARBITRARY};
+        bad_splitk.operands[0].window_bounds = {8, 64};
+        bad_splitk.operands[1].window_bounds = {64, 128};
+        bad_splitk.scratch.push_back(
+            {"acc", freetile::MemorySpace::VMEM, freetile::DType::F32, {8, 128}, {8, 128}, false, true});
+        std::string verr;
+        CHECK_TRUE(!bad_splitk.validate(&verr), "Unaligned Mosaic split-K bk=64 on K=192 rejected by validate()");
+        bool threw = false;
+        try {
+            (void)freetile::emit_mosaic_kernel(bad_splitk);
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        CHECK_TRUE(threw, "Unaligned Mosaic split-K bk=64 throws in emit_mosaic_kernel()");
+
+        // When K is not divisible by 128 and whole-K exceeds V5E 16 MiB VMEM (65600*128*2 = 16.8 MiB),
+        // planner must cleanly fail instead of emitting an unaligned split-K window
+        freetile::TileKernel bad_huge;
+        std::string huge_reason;
+        CHECK_TRUE(!freetile::plan_quant_matmul_kernel(
+            freetile::ChipTarget::V5E, 8, 65600, 128, freetile::QuantFormat::NONE,
+            freetile::DType::BF16, freetile::DType::F32, false, &bad_huge, &huge_reason),
+            "Oversized non-128-aligned dense K cleanly fails when whole-K exceeds VMEM");
+        CHECK_TRUE(!huge_reason.empty(), "Oversized non-128-aligned dense K provides diagnostic");
     }
 
     // 9. Positional activation window transforms (renaming operand 0 to "act" preserves transforms)

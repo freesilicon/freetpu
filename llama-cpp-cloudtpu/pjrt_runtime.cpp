@@ -3258,6 +3258,11 @@ CachedExecutablePtr PjrtRuntime::compile_or_get(const std::string& cache_key,
     }
 
     const auto t0 = std::chrono::steady_clock::now();
+    const bool is_mosaic = (mlir_text.find("@tpu_custom_call") != std::string::npos);
+    compile_attempts_.fetch_add(1, std::memory_order_relaxed);
+    if (is_mosaic) {
+        mosaic_compile_attempts_.fetch_add(1, std::memory_order_relaxed);
+    }
 
     PJRT_Program prog = {};
     prog.struct_size = PJRT_Program_STRUCT_SIZE;
@@ -3273,7 +3278,14 @@ CachedExecutablePtr PjrtRuntime::compile_or_get(const std::string& cache_key,
     c_args.compile_options = opts_pb.data();
     c_args.compile_options_size = opts_pb.size();
 
-    check_error(api_->PJRT_Client_Compile(&c_args), "PJRT_Client_Compile");
+    PJRT_Error* c_err = api_->PJRT_Client_Compile(&c_args);
+    if (c_err != nullptr) {
+        compile_failures_.fetch_add(1, std::memory_order_relaxed);
+        check_error(c_err, "PJRT_Client_Compile");
+    }
+    if (is_mosaic) {
+        mosaic_compile_successes_.fetch_add(1, std::memory_order_relaxed);
+    }
     PjrtLoadedExecutableHandle loaded_handle(c_args.executable, PjrtLoadedExecutableDeleter{api_});
 
     PJRT_LoadedExecutable_GetExecutable_Args ge = {};
@@ -3439,6 +3451,7 @@ void PjrtRuntime::execute(const CachedExecutablePtr& exec,
         }
     }
 
+    execute_calls_.fetch_add(1, std::memory_order_relaxed);
     if (profile_time) {
         const auto t1 = std::chrono::steady_clock::now();
         const uint64_t exec_us = static_cast<uint64_t>(
@@ -3548,6 +3561,7 @@ void PjrtRuntime::execute_spmd(const CachedExecutablePtr& exec,
         }
     }
 
+    execute_calls_.fetch_add(1, std::memory_order_relaxed);
     if (profile_time) {
         const auto t1 = std::chrono::steady_clock::now();
         const uint64_t exec_us = static_cast<uint64_t>(
@@ -3588,6 +3602,11 @@ CacheStats PjrtRuntime::cache_stats() const {
     st.evictions = cache_evictions_;
     st.compile_us = total_compile_us_;
     st.execute_us = total_execute_us_.load(std::memory_order_relaxed);
+    st.compile_attempts = compile_attempts_.load(std::memory_order_relaxed);
+    st.compile_failures = compile_failures_.load(std::memory_order_relaxed);
+    st.mosaic_compile_attempts = mosaic_compile_attempts_.load(std::memory_order_relaxed);
+    st.mosaic_compile_successes = mosaic_compile_successes_.load(std::memory_order_relaxed);
+    st.execute_calls = execute_calls_.load(std::memory_order_relaxed);
     return st;
 }
 

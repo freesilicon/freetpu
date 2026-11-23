@@ -307,6 +307,9 @@ bool TileKernel::validate(std::string* err) const {
 
     const size_t n_tiles = static_cast<size_t>(matmul.n / grid.bn);
     const size_t k_tiles = static_cast<size_t>(matmul.k / grid.bk);
+    if (prof.supports_mosaic && k_tiles > 1 && (grid.bk % prof.lane_align) != 0) {
+        return fail(err, "Mosaic split-K activation window (bk < K) must be divisible by target lane_align (128)");
+    }
     if (k_tiles == 1) {
         if (grid.dims.size() != 1 || grid.dims[0] != static_cast<int64_t>(n_tiles)) {
             return fail(err, "Single-K TileGrid must be 1D {N/bn}");
@@ -493,13 +496,17 @@ bool plan_quant_matmul_kernel(ChipTarget target,
     std::vector<int64_t> bn_cands = {2048, 1024, 512, 256, 128, 64};
     std::vector<int64_t> bk_cands = {2048, 1024, 512, 256, 128};
     if (fmt == QuantFormat::NONE) {
-        if (k < 128 && k >= min_bk && (k % min_bk) == 0) {
+        // On Mosaic TPU targets, split-K activation windows must be lane-aligned (divisible by 128),
+        // while a whole-K window (bk == k) is valid for any sublane-aligned K that fits VMEM.
+        if (k >= min_bk && (k % min_bk) == 0 && (k % prof.lane_align) != 0) {
             bk_cands.push_back(k);
         }
-        bk_cands.push_back(64);
-        bk_cands.push_back(32);
-        bk_cands.push_back(16);
-        bk_cands.push_back(8);
+        if (!prof.supports_mosaic) {
+            bk_cands.push_back(64);
+            bk_cands.push_back(32);
+            bk_cands.push_back(16);
+            bk_cands.push_back(8);
+        }
     }
     int64_t override_bm = m_pad;
     if (planner_cfg != nullptr && planner_cfg->schedule_hook != nullptr) {
@@ -541,6 +548,9 @@ bool plan_quant_matmul_kernel(ChipTarget target,
         }
         for (int64_t bk : bk_cands) {
             if (bk < min_bk || (bk % min_bk) != 0 || (k % bk) != 0 || (bk % blk) != 0) {
+                continue;
+            }
+            if (prof.supports_mosaic && bk < k && (bk % prof.lane_align) != 0) {
                 continue;
             }
             if (fmt != QuantFormat::NONE && ((bk / blk) % prof.sublane_align) != 0) {

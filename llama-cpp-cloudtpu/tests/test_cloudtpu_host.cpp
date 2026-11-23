@@ -6345,20 +6345,45 @@ void test_ggml_cgraph_freetile_mosaic_fallback() {
 
                 ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
                 if (ggml_gallocr_alloc_graph(galloc, gf)) {
+                    const cloudtpu::PjrtRuntime& rt_child = cloudtpu::shared_pjrt_runtime(nullptr);
+                    const cloudtpu::CacheStats st0 = rt_child.cache_stats();
                     ggml_backend_tensor_set(tx, x_host.data(), 0, x_host.size() * sizeof(float));
                     // Execute twice: 1st compiles (or triggers Mosaic compile-fail retry & installs fallback),
                     // 2nd verifies cached plan reuse succeeds with identical accurate output.
                     bool run1 = (ggml_backend_graph_compute(be, gf) == GGML_STATUS_SUCCESS);
+                    const cloudtpu::CacheStats st1 = rt_child.cache_stats();
                     std::vector<float> got1(static_cast<size_t>(M * N), 0.0f);
                     if (run1) {
                         ggml_backend_tensor_get(ty, got1.data(), 0, got1.size() * sizeof(float));
                     }
                     bool run2 = run1 && (ggml_backend_graph_compute(be, gf) == GGML_STATUS_SUCCESS);
+                    const cloudtpu::CacheStats st2 = rt_child.cache_stats();
                     std::vector<float> got2(static_cast<size_t>(M * N), 0.0f);
                     if (run2) {
                         ggml_backend_tensor_get(ty, got2.data(), 0, got2.size() * sizeof(float));
                     }
-                    ok = run2 && (compute_nmse(got1, ref_y) < 5e-4) && (compute_nmse(got2, ref_y) < 5e-4);
+                    const bool expect_fallback = (mosaic_ver != nullptr);
+                    const uint64_t ca1 = st1.compile_attempts - st0.compile_attempts;
+                    const uint64_t cf1 = st1.compile_failures - st0.compile_failures;
+                    const uint64_t ma1 = st1.mosaic_compile_attempts - st0.mosaic_compile_attempts;
+                    const uint64_t ms1 = st1.mosaic_compile_successes - st0.mosaic_compile_successes;
+                    const uint64_t ex1 = st1.execute_calls - st0.execute_calls;
+                    const uint64_t ca2 = st2.compile_attempts - st0.compile_attempts;
+                    const uint64_t ex2 = st2.execute_calls - st0.execute_calls;
+                    bool stats_ok = false;
+                    if (!expect_fallback) {
+                        // Valid v17 Mosaic: 1st run compiles 1 Mosaic custom_call & executes once;
+                        // 2nd run hits cache (no second compile) & executes again.
+                        stats_ok = (ca1 == 1 && cf1 == 0 && ma1 == 1 && ms1 == 1 && ex1 == 1 &&
+                                    ca2 == 1 && ex2 == 2);
+                    } else {
+                        // Invalid v999 Mosaic: 1st run attempts 1 Mosaic compile (fails), retries with
+                        // 1 pure StableHLO compile (succeeds, no @tpu_custom_call), executes once;
+                        // 2nd run hits cached fallback plan (still 2 compile attempts total) & executes again.
+                        stats_ok = (ca1 == 2 && cf1 == 1 && ma1 == 1 && ms1 == 0 && ex1 == 1 &&
+                                    ca2 == 2 && ex2 == 2);
+                    }
+                    ok = run2 && stats_ok && (compute_nmse(got1, ref_y) < 5e-4) && (compute_nmse(got2, ref_y) < 5e-4);
                 }
                 ggml_gallocr_free(galloc);
                 ggml_free(ctx_g);

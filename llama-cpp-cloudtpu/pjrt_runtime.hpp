@@ -165,6 +165,11 @@ struct CacheStats {
     uint64_t evictions = 0;
     uint64_t compile_us = 0;
     uint64_t execute_us = 0;
+    uint64_t compile_attempts = 0;
+    uint64_t compile_failures = 0;
+    uint64_t mosaic_compile_attempts = 0;
+    uint64_t mosaic_compile_successes = 0;
+    uint64_t execute_calls = 0;
 };
 
 class PjrtRuntime;
@@ -363,6 +368,11 @@ private:
     uint64_t cache_misses_ = 0;
     uint64_t cache_evictions_ = 0;
     uint64_t total_compile_us_ = 0;
+    std::atomic<uint64_t> compile_attempts_{0};
+    std::atomic<uint64_t> compile_failures_{0};
+    std::atomic<uint64_t> mosaic_compile_attempts_{0};
+    std::atomic<uint64_t> mosaic_compile_successes_{0};
+    std::atomic<uint64_t> execute_calls_{0};
     std::atomic<uint64_t> total_execute_us_{0};
     std::atomic<uint64_t> eviction_epoch_{0};
     std::atomic<uint32_t> next_launch_id_{1};
