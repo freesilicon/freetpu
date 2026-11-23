@@ -493,8 +493,7 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t*                  ctx,
  *   - M > 8 (default): separate batched M7A lt_64x* GEMMs on TPU.
  *   - Opt-in chained M=64 prefill: requires OPENBUENOS_SWIGLU_PREFILL=1, batched
  *     large tiles enabled (default on unless OPENBUENOS_DISABLE_BATCHED_LARGE_TILES=1),
- *     Q8_0 weights for all three projections (gate, up, and down), and passing the
- *     activation/norm clipping guards below.
+ *     Q8_0 or Q4_0 weights, and passing the activation/norm clipping guards below.
  *
  * Automatically handles arbitrary M (chunking M > 64 internally), exact CPU FP32
  * reference in mock_mode=1, and clean M7A batched fallback for unsupported shapes,
@@ -578,6 +577,24 @@ ob_status_t ob_gemm_swiglu_int8(ob_context_t*                ctx,
                                 const ob_swiglu_int8_desc_t* desc,
                                 int8_t*                      y_mn,
                                 ob_invoke_stats_t*           out_stats);
+
+/*
+ * Native 7-chunk per-tensor W8A16(FP16) single-tile GEMM with full FP32 accumulator
+ * and NEON per-channel scale epilogue (zero activation quantization, zero outlier peel):
+ *   C[n] = (sum_{k=0..K-1} FP16(A[k]) * int8(W[n, k])) * sb_n[n]
+ *
+ * Supported 16-core M=1 shapes: K, N in {512, 1024, 1536, 2048}.
+ * Automatically applies a power-of-2 row prescale guard when max(|A|) > 32768.0f
+ * to prevent IEEE FP16 input saturation (max finite 65504.0f).
+ */
+ob_status_t ob_gemm_matmul_f32_w8a16_tile(ob_context_t*      ctx,
+                                          const float*       a_k,
+                                          const int8_t*      w_nk,
+                                          const float*       sb_n,
+                                          uint32_t           k_dim,
+                                          uint32_t           n_dim,
+                                          float*             c_n,
+                                          ob_invoke_stats_t* out_stats);
 
 #ifdef __cplusplus
 } /* extern "C" */

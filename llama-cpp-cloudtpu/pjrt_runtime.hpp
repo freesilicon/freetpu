@@ -5,9 +5,11 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <list>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -16,6 +18,7 @@ namespace cloudtpu {
 
 enum class PjrtDType {
     INVALID = 0,
+    PRED,
     F32,
     F16,
     BF16,
@@ -25,6 +28,21 @@ enum class PjrtDType {
     S32,
     U32,
     S64,
+};
+
+class PjrtError : public std::runtime_error {
+public:
+    PjrtError(PJRT_Error_Code code, const std::string& msg)
+        : std::runtime_error(msg), code_(code) {}
+
+    PJRT_Error_Code code() const noexcept { return code_; }
+
+    bool is_resource_exhausted() const noexcept {
+        return code_ == PJRT_Error_Code_RESOURCE_EXHAUSTED;
+    }
+
+private:
+    PJRT_Error_Code code_;
 };
 
 PJRT_Buffer_Type to_pjrt_buffer_type(PjrtDType dt);
@@ -92,6 +110,53 @@ struct PjrtBufferDeleter {
 
 using PjrtBufferHandle = std::unique_ptr<PJRT_Buffer, PjrtBufferDeleter>;
 
+struct PjrtEventDeleter {
+    const PJRT_Api* api = nullptr;
+    void operator()(PJRT_Event* ev) const noexcept;
+};
+
+using PjrtEventHandle = std::unique_ptr<PJRT_Event, PjrtEventDeleter>;
+
+// Bounded per-launch queue of PJRT buffer-ready events. Capping by outstanding launch
+// (rather than raw event count) keeps multi-chip multi-output launches (>max_launches events)
+// asynchronous without ever forcing a launch to wait on itself.
+class PendingSyncLaunchQueue {
+public:
+    static constexpr size_t kDefaultMaxLaunches = 16;
+
+    std::deque<std::vector<PjrtEventHandle>> enqueue(std::vector<PjrtEventHandle>&& launch_events,
+                                                     size_t max_launches = kDefaultMaxLaunches) {
+        std::deque<std::vector<PjrtEventHandle>> overflow;
+        if (launch_events.empty()) {
+            return overflow;
+        }
+        const size_t cap = (max_launches == 0) ? 1 : max_launches;
+        std::lock_guard<std::mutex> lock(mu_);
+        while (launches_.size() >= cap) {
+            overflow.push_back(std::move(launches_.front()));
+            launches_.pop_front();
+        }
+        launches_.push_back(std::move(launch_events));
+        return overflow;
+    }
+
+    std::deque<std::vector<PjrtEventHandle>> drain_all() {
+        std::deque<std::vector<PjrtEventHandle>> all;
+        std::lock_guard<std::mutex> lock(mu_);
+        all.swap(launches_);
+        return all;
+    }
+
+    size_t pending_launches() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return launches_.size();
+    }
+
+private:
+    mutable std::mutex mu_;
+    std::deque<std::vector<PjrtEventHandle>> launches_;
+};
+
 struct PjrtBuffer {
     PjrtBufferHandle handle;
     PjrtDType dtype = PjrtDType::INVALID;
@@ -103,11 +168,22 @@ struct PjrtBuffer {
 
 using PjrtBufferPtr = std::shared_ptr<PjrtBuffer>;
 
+struct PjrtLoadedExecutableDeleter {
+    const PJRT_Api* api = nullptr;
+    void operator()(PJRT_LoadedExecutable* exec) const noexcept;
+};
+
+using PjrtLoadedExecutableHandle = std::unique_ptr<PJRT_LoadedExecutable, PjrtLoadedExecutableDeleter>;
+
 struct CachedExecutable {
     std::string key;
-    PJRT_LoadedExecutable* handle = nullptr;
+    PjrtLoadedExecutableHandle handle;
+    int device_idx = 0;
+    int num_replicas = 1;
     size_t num_outputs = 0;
 };
+
+using CachedExecutablePtr = std::shared_ptr<const CachedExecutable>;
 
 class PjrtRuntime {
 public:
@@ -121,7 +197,7 @@ public:
     void init(const RuntimeConfig& cfg);
     void shutdown();
 
-    bool is_initialized() const { return api_ != nullptr && client_ != nullptr; }
+    bool is_initialized() const { return initialized_; }
     bool is_mock() const { return is_mock_; }
     bool has_ready_event() const { return has_ready_event_; }
 
@@ -143,8 +219,10 @@ public:
                                                            const std::vector<int64_t>& dims);
 
     void buffer_to_host(PJRT_Buffer* buf, void* dst, size_t dst_size);
+    PjrtEventHandle create_buffer_ready_event(PJRT_Buffer* buf);
     void await_buffer_ready(PJRT_Buffer* buf);
     void await_event(PJRT_Event* ev);
+    void await_event(PjrtEventHandle ev);
 
     // Builds compile options (including DeviceAssignmentProto for multi-chip SPMD or
     // explicit single-device targeting on multi-chip hosts, alias_passthrough_params,
@@ -154,13 +232,14 @@ public:
                                                  bool alias_passthrough = false,
                                                  bool async_collectives = true) const;
 
-    // Compile StableHLO MLIR ("mlir" format) or return cached PJRT_LoadedExecutable*.
-    // Thread-safe LRU cache keyed by canonical structural program key.
-    const CachedExecutable* compile_or_get(const std::string& cache_key,
-                                           const std::string& mlir_text,
-                                           const PjrtCompileOptions& opts = {});
+    // Compile StableHLO MLIR ("mlir" format) or return an owning reference to a cached executable.
+    // Thread-safe LRU cache keyed by canonical structural program key and target device assignment.
+    CachedExecutablePtr compile_or_get(const std::string& cache_key,
+                                       const std::string& mlir_text,
+                                       int device_idx = 0,
+                                       const PjrtCompileOptions& opts = {});
 
-    void execute(const CachedExecutable* exec,
+    void execute(const CachedExecutablePtr& exec,
                  int device_idx,
                  PJRT_Buffer* const* inputs,
                  size_t num_inputs,
@@ -170,7 +249,7 @@ public:
                  bool sync,
                  const std::vector<int64_t>* non_donatable_input_indices = nullptr);
 
-    void execute_spmd(const CachedExecutable* exec,
+    void execute_spmd(const CachedExecutablePtr& exec,
                       int num_devices,
                       PJRT_Buffer* const* const* per_device_inputs,
                       size_t num_inputs,
@@ -181,6 +260,8 @@ public:
                       const std::vector<int64_t>* non_donatable_input_indices = nullptr);
 
     void clear_exec_cache();
+    CachedExecutablePtr get_cached_exec(const std::string& full_key);
+    bool has_cached_exec(const std::string& full_key) const;
     CacheStats cache_stats() const;
     uint64_t eviction_epoch() const { return eviction_epoch_.load(std::memory_order_acquire); }
 
@@ -193,6 +274,7 @@ private:
     std::string resolve_libtpu_path(const std::string& override_path) const;
 
     RuntimeConfig cfg_;
+    bool initialized_ = false;
     bool is_mock_ = false;
     bool has_ready_event_ = false;
     void* dl_handle_ = nullptr;
@@ -206,7 +288,7 @@ private:
     mutable std::mutex cache_mu_;
     using LruList = std::list<std::string>;
     struct CacheEntry {
-        CachedExecutable exec;
+        CachedExecutablePtr exec;
         LruList::iterator lru_it;
     };
     LruList lru_order_;
@@ -217,7 +299,7 @@ private:
     uint64_t total_compile_us_ = 0;
     std::atomic<uint64_t> total_execute_us_{0};
     std::atomic<uint64_t> eviction_epoch_{0};
-    std::atomic<int> next_launch_id_{1};
+    std::atomic<uint32_t> next_launch_id_{1};
 };
 
 // Shared process-wide PJRT runtime singleton (libtpu.so owns exclusive /dev/vfio/0 per process).

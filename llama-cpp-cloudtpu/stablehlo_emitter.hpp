@@ -10,10 +10,10 @@ namespace cloudtpu {
 
 enum class TensorStorageKind {
     DENSE = 0,
-    Q8_0_SPLIT,  // Split into (qs: [B3, B2, N, K] S8, d: [B3, B2, N, K/32] F16)
-    Q4_0_SPLIT,  // Split into (qs: [B3, B2, N, K/2] U8, d: [B3, B2, N, K/32] F16)
-    Q4_K_SPLIT,  // Split into (qs: [B3, B2, N, K/2] U8, d_eff: [B3, B2, N, K/32] F32/F16, m_eff: [B3, B2, N, K/32] F32/F16)
-    Q6_K_SPLIT,  // Split into (qs: [B3, B2, N, K] S8, d_eff: [B3, B2, N, K/16] F32/F16)
+    Q8_0_SPLIT,  // K-major N-minor: (qs: [B3, B2, K/32, 32, N] S8, d: [B3, B2, K/32, N] F16)
+    Q4_0_SPLIT,  // K-major N-minor: (qs: [B3, B2, K/32, 16, N] U8, d: [B3, B2, K/32, N] F16)
+    Q4_K_SPLIT,  // K-major N-minor: (qs: [B3, B2, K/32, 16, N] U8, d_eff/m_eff: [B3, B2, K/32, N] F32/F16)
+    Q6_K_SPLIT,  // K-major N-minor: (qs: [B3, B2, K/16, 16, N] S8, d_eff: [B3, B2, K/16, N] F32/F16)
 };
 
 enum class TensorShardingKind {
