@@ -992,18 +992,23 @@ std::string format_sdy_mesh_op(int32_t num_chips,
     } else {
         oss << "sdy.mesh @mesh = <[\"replica\"=" << n << "]";
     }
+    bool valid_perm = (static_cast<int32_t>(device_ids.size()) == n);
     bool is_non_identity = false;
-    if (static_cast<int32_t>(device_ids.size()) == n) {
+    if (valid_perm) {
+        std::vector<uint8_t> seen(static_cast<size_t>(n), 0);
         for (int32_t i = 0; i < n; ++i) {
-            if (device_ids[static_cast<size_t>(i)] != static_cast<int64_t>(i)) {
-                is_non_identity = true;
+            const int64_t v = device_ids[static_cast<size_t>(i)];
+            if (v < 0 || v >= static_cast<int64_t>(n) || seen[static_cast<size_t>(v)] != 0) {
+                valid_perm = false;
                 break;
             }
+            seen[static_cast<size_t>(v)] = 1;
+            if (v != static_cast<int64_t>(i)) {
+                is_non_identity = true;
+            }
         }
-    } else if (!device_ids.empty()) {
-        is_non_identity = true;
     }
-    if (is_non_identity) {
+    if (valid_perm && is_non_identity) {
         oss << ", device_ids=[";
         for (size_t i = 0; i < device_ids.size(); ++i) {
             if (i > 0) oss << ", ";

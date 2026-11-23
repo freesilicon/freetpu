@@ -123,14 +123,22 @@ CLOUDTPU_MOCK=0 CLOUDTPU_SPMD_CHIPS=1 CLOUDTPU_MATMUL_FP8=auto CLOUDTPU_MATMUL_B
 
 run_bench_tier() {
   local tier="$1"
-  local pattern="$2"
+  local size_token="$2"
   local model_path=""
   if [[ -d "${MODELS_DIR}" ]]; then
     local matches=()
     local line=""
+    local base_lc=""
+    local size_lc=""
+    size_lc="$(printf '%s' "${size_token}" | tr '[:upper:]' '[:lower:]')"
     while IFS= read -r line; do
-      [[ -n "${line}" ]] && matches+=("${line}")
-    done < <(find "${MODELS_DIR}" -maxdepth 3 -type f -iname "${pattern}" 2>/dev/null | LC_ALL=C sort)
+      [[ -n "${line}" ]] || continue
+      base_lc="$(basename "${line}" | tr '[:upper:]' '[:lower:]')"
+      if printf '%s\n' "${base_lc}" | grep -Eq "(^|[^0-9.])${size_lc}([^0-9a-z]|$)" &&
+         printf '%s\n' "${base_lc}" | grep -Eq "q4_k_m"; then
+        matches+=("${line}")
+      fi
+    done < <(find "${MODELS_DIR}" -maxdepth 3 -type f -iname "*.gguf" 2>/dev/null | LC_ALL=C sort)
 
     local f=""
     for f in "${matches[@]+"${matches[@]}"}"; do
@@ -149,7 +157,7 @@ run_bench_tier() {
     fi
   fi
   if [[ -z "${model_path}" ]]; then
-    log "[SKIP] ${tier}: no single-file or shard-00001 GGUF matching '${pattern}' in ${MODELS_DIR}"
+    log "[SKIP] ${tier}: no single-file or shard-00001 Q4_K_M GGUF matching size token '${size_token}' in ${MODELS_DIR}"
     return 0
   fi
   for fp8_mode in 0 auto; do
@@ -160,10 +168,10 @@ run_bench_tier() {
   done
 }
 
-run_bench_tier "8B" "*8b*q4_k_m*.gguf"
-run_bench_tier "32B" "*32b*q4_k_m*.gguf"
-run_bench_tier "70B" "*70b*q4_k_m*.gguf"
-run_bench_tier "120B" "*120b*q4_k_m*.gguf"
-run_bench_tier "235B" "*235b*q4_k_m*.gguf"
+run_bench_tier "8B" "8b"
+run_bench_tier "32B" "32b"
+run_bench_tier "70B" "70b"
+run_bench_tier "120B" "120b"
+run_bench_tier "235B" "235b"
 
 echo "Benchmark log written to: ${LOG}"

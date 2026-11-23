@@ -594,6 +594,54 @@ size_t PjrtBuffer::num_bytes() const {
     return pjrt_dtype_nbytes(dtype, num_elements());
 }
 
+int mock_profile_device_count(MockTopologyProfile profile) {
+    switch (profile) {
+        case MockTopologyProfile::V5E_1:    return 1;
+        case MockTopologyProfile::TPU7X_1T: return 2;
+        case MockTopologyProfile::V6E_8:    return 8;
+        case MockTopologyProfile::TPU7X_4T: return 8;
+        case MockTopologyProfile::AUTO:     return 0;
+    }
+    return 0;
+}
+
+RuntimeConfig RuntimeConfig::from_env() {
+    RuntimeConfig cfg;
+#if defined(__linux__)
+    cfg.mock_mode = false;
+#else
+    cfg.mock_mode = true;
+#endif
+    if (const char* v = std::getenv("CLOUDTPU_MOCK")) {
+        cfg.mock_mode = (std::atoi(v) != 0);
+    }
+    int env_devices = 0;
+    if (const char* v = std::getenv("CLOUDTPU_MOCK_DEVICES")) {
+        const int parsed = std::atoi(v);
+        if (parsed >= 1 && parsed <= 16) {
+            env_devices = parsed;
+            cfg.mock_devices = parsed;
+        }
+    }
+    if (const char* v = std::getenv("CLOUDTPU_MOCK_PROFILE")) {
+        cfg.mock_profile = parse_mock_topology_profile(v);
+    }
+    const int profile_devs = mock_profile_device_count(cfg.mock_profile);
+    if (profile_devs > 0) {
+        if (env_devices > 0 && env_devices != profile_devs) {
+            std::fprintf(stderr,
+                         "ggml-cloudtpu: CLOUDTPU_MOCK_DEVICES=%d conflicts with named "
+                         "CLOUDTPU_MOCK_PROFILE (expects %d logical devices); using %d\n",
+                         env_devices, profile_devs, profile_devs);
+        }
+        cfg.mock_devices = profile_devs;
+    }
+    if (const char* v = std::getenv("CLOUDTPU_MOCK_SCRAMBLE_ORDER")) {
+        cfg.mock_scramble_device_order = (std::atoi(v) != 0);
+    }
+    return cfg;
+}
+
 MockTopologyProfile parse_mock_topology_profile(const char* val) {
     if (!val || val[0] == '\0') {
         return MockTopologyProfile::AUTO;
@@ -2706,9 +2754,6 @@ static PJRT_Error* mock_client_create(PJRT_Client_Create_Args* args) {
     int n_devs = 1;
     MockTopologyProfile profile = MockTopologyProfile::AUTO;
     bool scramble_order = false;
-    if (const char* penv = std::getenv("CLOUDTPU_MOCK_PROFILE")) {
-        profile = parse_mock_topology_profile(penv);
-    }
     if (args->create_options && args->num_options > 0) {
         for (size_t i = 0; i < args->num_options; ++i) {
             const PJRT_NamedValue& opt = args->create_options[i];
@@ -2721,14 +2766,6 @@ static PJRT_Error* mock_client_create(PJRT_Client_Create_Args* args) {
                 profile = parse_mock_topology_profile(pstr.c_str());
             } else if (opt_name == "mock_scramble_order" && opt.type == PJRT_NamedValue_kBool) {
                 scramble_order = opt.bool_value;
-            }
-        }
-    }
-    if (n_devs <= 1) {
-        if (const char* v = std::getenv("CLOUDTPU_MOCK_DEVICES")) {
-            const int parsed = std::atoi(v);
-            if (parsed > 1 && parsed <= 16) {
-                n_devs = parsed;
             }
         }
     }

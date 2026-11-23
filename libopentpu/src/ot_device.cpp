@@ -588,7 +588,7 @@ bool chip_geometry_for_device_id(uint16_t device_id, ot_device_geometry_t* out) 
       out->fp8_inner_rows = 4u;
       out->fp8_inner_cols = 1u;
       out->logical_chiplets_per_pci_func = 2u;
-      out->num_mxus_per_logical_chiplet = 4u;
+      out->num_mxus_per_logical_chiplet = 2u;
       out->supports_native_fp8 = 1u;
       out->hbm_bytes_per_logical_chiplet = 96ULL << 30;
       out->vmem_bytes_per_logical_chiplet = 64ULL << 20;

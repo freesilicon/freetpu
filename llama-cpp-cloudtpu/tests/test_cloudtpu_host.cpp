@@ -6532,6 +6532,18 @@ void test_ironwood_d2d_pairing_and_sdy_mesh() {
         CHECK_TRUE(copts_2.device_assignment_ids == std::vector<int64_t>({0, 1}),
                    "2-replica slice on tpu7x-4t uses intra-package D2D pair (0,1)");
 
+        // Verify 6-chiplet slice on 8-chiplet tpu7x-4t keeps physical PJRT DeviceAssignment [0,1,2,3,6,7],
+        // while sdy.mesh NEVER emits out-of-range physical IDs (6,7) for a 6-device logical mesh!
+        const auto copts_6 = rt.make_spmd_compile_options(6);
+        CHECK_TRUE(copts_6.device_assignment_ids == std::vector<int64_t>({0, 1, 2, 3, 6, 7}),
+                   "6-replica slice on scrambled tpu7x-4t preserves physical Hamiltonian PJRT IDs [0,1,2,3,6,7]");
+        const auto sdy6_phys = cloudtpu::format_sdy_mesh_op(6, 2, copts_6.device_assignment_ids);
+        CHECK_TRUE(sdy6_phys == "sdy.mesh @mesh = <[\"ici\"=3, \"d2d\"=2]>",
+                   "sdy.mesh rejects out-of-range physical PJRT IDs 6/7 for P=6 logical mesh");
+        const auto sdy6_perm = cloudtpu::format_sdy_mesh_op(6, 2, {0, 1, 4, 5, 2, 3});
+        CHECK_TRUE(sdy6_perm == "sdy.mesh @mesh = <[\"ici\"=3, \"d2d\"=2], device_ids=[0, 1, 4, 5, 2, 3]>",
+                   "sdy.mesh emits valid 0..P-1 logical permutation when reordered within P=6");
+
         // Emit and execute Shardy sdy.mesh + AllReduce on scrambled-enum tpu7x-4t.
         cloudtpu::GraphProgramSpec spec;
         spec.spmd_chips = 8;
@@ -6597,25 +6609,45 @@ void test_ironwood_d2d_pairing_and_sdy_mesh() {
                    "Named profile tpu7x-4t overrides conflicting mock_devices=4 to 8 logical chiplets");
         rt.shutdown();
 
+        const char* prev_mock_raw = std::getenv("CLOUDTPU_MOCK");
         const char* prev_devs_raw = std::getenv("CLOUDTPU_MOCK_DEVICES");
         const char* prev_prof_raw = std::getenv("CLOUDTPU_MOCK_PROFILE");
+        const bool had_mock = (prev_mock_raw != nullptr);
         const bool had_devs = (prev_devs_raw != nullptr);
         const bool had_prof = (prev_prof_raw != nullptr);
+        const std::string prev_mock = had_mock ? prev_mock_raw : "";
         const std::string prev_devs = had_devs ? prev_devs_raw : "";
         const std::string prev_prof = had_prof ? prev_prof_raw : "";
+        setenv("CLOUDTPU_MOCK", "1", 1);
         setenv("CLOUDTPU_MOCK_DEVICES", "4", 1);
         setenv("CLOUDTPU_MOCK_PROFILE", "tpu7x-4t", 1);
-        cloudtpu::RuntimeConfig env_cfg;
-        env_cfg.mock_mode = true;
+        // 3a. RuntimeConfig::from_env() enforces named profile count (8) over conflicting CLOUDTPU_MOCK_DEVICES=4.
+        const cloudtpu::RuntimeConfig env_cfg = cloudtpu::RuntimeConfig::from_env();
+        CHECK_TRUE(env_cfg.mock_devices == 8 && env_cfg.mock_profile == cloudtpu::MockTopologyProfile::TPU7X_4T,
+                   "RuntimeConfig::from_env() overrides conflicting CLOUDTPU_MOCK_DEVICES=4 to 8 for tpu7x-4t");
         cloudtpu::PjrtRuntime env_rt;
         env_rt.init(env_cfg);
         CHECK_TRUE(env_rt.device_count() == 8,
-                   "Env CLOUDTPU_MOCK_PROFILE=tpu7x-4t overrides CLOUDTPU_MOCK_DEVICES=4 to 8 logical chiplets");
+                   "Env CLOUDTPU_MOCK_PROFILE=tpu7x-4t via from_env() exposes 8 logical chiplets");
         env_rt.shutdown();
+
+        // 3b. Explicit programmatic RuntimeConfig with AUTO profile and mock_devices=4 must NOT be
+        //     overridden to 8 by ambient CLOUDTPU_MOCK_PROFILE=tpu7x-4t in the environment.
+        cloudtpu::RuntimeConfig prog_cfg;
+        prog_cfg.mock_mode = true;
+        prog_cfg.mock_devices = 4;
+        prog_cfg.mock_profile = cloudtpu::MockTopologyProfile::AUTO;
+        cloudtpu::PjrtRuntime prog_rt;
+        prog_rt.init(prog_cfg);
+        CHECK_TRUE(prog_rt.device_count() == 4,
+                   "Explicit RuntimeConfig(AUTO, mock_devices=4) ignores ambient CLOUDTPU_MOCK_PROFILE=tpu7x-4t");
+        prog_rt.shutdown();
         if (had_prof) setenv("CLOUDTPU_MOCK_PROFILE", prev_prof.c_str(), 1);
         else unsetenv("CLOUDTPU_MOCK_PROFILE");
         if (had_devs) setenv("CLOUDTPU_MOCK_DEVICES", prev_devs.c_str(), 1);
         else unsetenv("CLOUDTPU_MOCK_DEVICES");
+        if (had_mock) setenv("CLOUDTPU_MOCK", prev_mock.c_str(), 1);
+        else unsetenv("CLOUDTPU_MOCK");
     }
     std::printf("  [PASS] Ironwood tpu7x dual-chiplet D2D Hamiltonian pairing & Shardy sdy.mesh\n");
 }
@@ -7370,7 +7402,7 @@ int main(int argc, char** argv) {
     std::printf("Running ggml-cloudtpu standalone tests (mock_mode=%d%s)...\n",
                 mock_mode ? 1 : 0, fp8_parity_only ? ", fp8_parity_only=1" : "");
 
-    cloudtpu::RuntimeConfig cfg;
+    cloudtpu::RuntimeConfig cfg = fp8_parity_only ? cloudtpu::RuntimeConfig::from_env() : cloudtpu::RuntimeConfig{};
     cfg.mock_mode = mock_mode;
     cfg.exec_cache_cap = 256;
     cloudtpu::PjrtRuntime rt;

@@ -1604,6 +1604,7 @@ static void test_multigen_hal_geometry_and_rebar() {
     OT_CHECK(g7.fp8_inner_rows == 4u && g7.fp8_inner_cols == 1u);
     OT_CHECK(g7.supports_native_fp8 == 1u);
     OT_CHECK(g7.logical_chiplets_per_pci_func == 2u);
+    OT_CHECK(g7.num_mxus_per_logical_chiplet == 2u);
     OT_CHECK(g7.hbm_bytes_per_logical_chiplet == (96ULL << 30));
     OT_CHECK(g7.vmem_bytes_per_logical_chiplet == (64ULL << 20));
   }
@@ -1655,7 +1656,7 @@ static void test_multigen_hal_geometry_and_rebar() {
   OT_CHECK(ot_context_create(&cfg, &ctx) == OT_OK && ctx != nullptr);
   OT_CHECK(ot_device_get_info(ctx, &info) == OT_OK);
   OT_CHECK(info.chip_gen == OT_CHIP_TPU7X && info.device_id == 0x0076u &&
-           info.vmem_bytes == (64ULL << 20));
+           info.vmem_bytes == (64ULL << 20) && info.num_mxus == 2u);
   ot_context_destroy(ctx);
   unsetenv("OPENTPU_MOCK_DEVICE_ID");
 

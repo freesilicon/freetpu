@@ -184,6 +184,10 @@ struct RuntimeConfig {
     uint32_t exec_cache_cap = 4096;
     bool async_collectives = false;  // Opt-in LIBTPU_INIT_ARGS async collective overlap flags before libtpu init
     std::string libtpu_path;
+
+    // Populates RuntimeConfig from CLOUDTPU_MOCK* env vars; named CLOUDTPU_MOCK_PROFILE
+    // dictates its documented logical device count when set.
+    static RuntimeConfig from_env();
 };
 
 struct CacheStats {

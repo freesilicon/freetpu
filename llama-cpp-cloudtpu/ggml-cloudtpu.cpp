@@ -4124,11 +4124,11 @@ static BuiltSubgraphSpec build_subgraph_program_spec(const ggml_backend_cloudtpu
         prog_spec.target_is_tpu7x = rt_shared.is_tpu7x_topology();
         prog_spec.d2d_group_size = rt_shared.d2d_group_size();
         if (prog_spec.emit_sdy_mesh && P > 1) {
-            const int n_assign = std::min(P, rt_shared.device_count());
-            prog_spec.sdy_mesh_device_ids.reserve(static_cast<size_t>(n_assign));
-            for (int i = 0; i < n_assign; ++i) {
-                prog_spec.sdy_mesh_device_ids.push_back(rt_shared.device_info(i).id);
-            }
+            // Physical PJRT device placement (e.g. Hamiltonian D2D-paired subset [0,1,2,3,6,7])
+            // is encoded by PJRT DeviceAssignmentProto (mapping logical replica r in 0..P-1 to
+            // physical device id). Shardy sdy.mesh operates over logical mesh device IDs 0..P-1,
+            // which are already ordered consecutively in Hamiltonian D2D pairs (identity 0..P-1).
+            prog_spec.sdy_mesh_device_ids.clear();
         }
     }
     prog_spec.bf16_flash_attn = ctx->env.bf16_flash_attn;
