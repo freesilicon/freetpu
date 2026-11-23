@@ -31,6 +31,7 @@ overlay_backend() {
     fi
 
     mkdir -p "$SRC/ggml/src/ggml-cloudtpu/third_party/openxla"
+    mkdir -p "$SRC/ggml/src/ggml-cloudtpu/freetile/include/freetile" "$SRC/ggml/src/ggml-cloudtpu/freetile/src"
     cp "$ROOT/ggml-cloudtpu.h" "$SRC/ggml/include/ggml-cloudtpu.h"
     cp "$ROOT/ggml-cloudtpu.cpp" \
        "$ROOT/pjrt_runtime.hpp" "$ROOT/pjrt_runtime.cpp" \
@@ -38,6 +39,8 @@ overlay_backend() {
        "$ROOT/CMakeLists.txt" \
        "$SRC/ggml/src/ggml-cloudtpu/"
     cp "$ROOT/../libopentpu/third_party/openxla/pjrt_c_api.h" "$SRC/ggml/src/ggml-cloudtpu/third_party/openxla/"
+    cp "$ROOT/../freetile/include/freetile/"*.hpp "$SRC/ggml/src/ggml-cloudtpu/freetile/include/freetile/"
+    cp "$ROOT/../freetile/src/"*.cpp "$SRC/ggml/src/ggml-cloudtpu/freetile/src/"
 
     if [[ "$need_apply" -eq 1 ]]; then
         git -C "$SRC" apply "$patch_file"
