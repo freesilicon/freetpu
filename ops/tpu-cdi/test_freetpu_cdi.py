@@ -576,6 +576,63 @@ class FreeTpuCdiTests(unittest.TestCase):
             ],
         }
         self.assertEqual(freetpu_cdi.validate_cdi_spec(cross_net_ok), [])
+        # Per CNCF CDI v1.1.0, a device-level netDevice entry for the SAME
+        # hostInterfaceName overrides the global mapping (yielding one interface),
+        # and even frees the old container name for another host interface.
+        cross_net_override_ok = {
+            **cross_net_conflict,
+            "devices": [
+                {
+                    "name": "0",
+                    "containerEdits": {
+                        "deviceNodes": [{"path": "/dev/vfio/0"}],
+                        "netDevices": [{"hostInterfaceName": "eth1", "name": "tpu1"}],
+                    },
+                }
+            ],
+        }
+        self.assertEqual(freetpu_cdi.validate_cdi_spec(cross_net_override_ok), [])
+        cross_net_swap_ok = {
+            **cross_net_conflict,
+            "devices": [
+                {
+                    "name": "0",
+                    "containerEdits": {
+                        "deviceNodes": [{"path": "/dev/vfio/0"}],
+                        "netDevices": [
+                            {"hostInterfaceName": "eth1", "name": "tpu1"},
+                            {"hostInterfaceName": "eth2", "name": "tpu0"},
+                        ],
+                    },
+                }
+            ],
+        }
+        self.assertEqual(freetpu_cdi.validate_cdi_spec(cross_net_swap_ok), [])
+        cross_net_override_collide = {
+            "cdiVersion": "1.1.0",
+            "kind": "freetpu.dev/tpu",
+            "containerEdits": {
+                "deviceNodes": [{"path": "/dev/vfio/vfio"}],
+                "netDevices": [
+                    {"hostInterfaceName": "eth1", "name": "tpu0"},
+                    {"hostInterfaceName": "eth2", "name": "tpu1"},
+                ],
+            },
+            "devices": [
+                {
+                    "name": "0",
+                    "containerEdits": {
+                        "deviceNodes": [{"path": "/dev/vfio/0"}],
+                        "netDevices": [{"hostInterfaceName": "eth1", "name": "tpu1"}],
+                    },
+                }
+            ],
+        }
+        override_collide_errs = freetpu_cdi.validate_cdi_spec(cross_net_override_collide)
+        self.assertTrue(
+            any("conflicts with global containerEdits.netDevices" in e for e in override_collide_errs),
+            override_collide_errs,
+        )
 
         # CNCF CDI v1.1.0 IntelRdt.closID validation: "/" (root CLOS), "" (unset), and
         # valid Linux filenames pass; paths containing "/", ".", "..", "\n", "\x00", or
@@ -5082,6 +5139,93 @@ class FreeTpuCdiTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(ValueError, "[Dd]uplicate"):
                 freetpu_cdi._load_chip_id_map(bad_json)
+        # Mixed-case / padded BDF keys MUST be normalized to lowercase sysfs format.
+        self.assertEqual(
+            freetpu_cdi._load_chip_id_map('{" 0000:00:0A.0 ": 3}'),
+            {"0000:00:0a.0": 3},
+        )
+
+    def test_partial_chip_map_resolving_cross_slice_conflict_preserves_live_spec(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # Both NUMA 0 and NUMA 1 report conflicting sysfs chip_id 0..3.
+            conflict_devs = [
+                {
+                    "bdf": f"0000:00:{4 + i:02x}.0",
+                    "vendor": "0x1ae0",
+                    "device": "0x006f",
+                    "driver": "vfio-pci",
+                    "iommu_group": str(i),
+                    "numa_node": "0",
+                    "chip_id": str(i),
+                }
+                for i in range(4)
+            ] + [
+                {
+                    "bdf": f"0000:80:{4 + i:02x}.0",
+                    "vendor": "0x1ae0",
+                    "device": "0x006f",
+                    "driver": "vfio-pci",
+                    "iommu_group": str(4 + i),
+                    "numa_node": "1",
+                    "chip_id": str(i),  # collides with NUMA 0!
+                }
+                for i in range(4)
+            ]
+            sysfs_root, dev_root = _make_mock_pci_vfio(
+                root / "cross_slice_conflict",
+                devices=conflict_devs,
+                create_vfio_nodes=[str(i) for i in range(8)],
+            )
+            # Partial map moves ONLY NUMA 0 to 4..7; NUMA 1's `0-3` alias also depends on it!
+            partial_map = {f"0000:00:{4 + i:02x}.0": 4 + i for i in range(4)}
+            map_file = root / "partial_map.json"
+            map_file.write_text(json.dumps(partial_map), encoding="utf-8")
+            spec_path = root / "cdi" / "freetpu.json"
+
+            with _mock_vfio_char_devices():
+                rc_gen, _out, err = _run_cli_inproc(
+                    [
+                        "generate",
+                        "--output",
+                        str(spec_path),
+                        "--single-host-env",
+                        "--chip-id-map",
+                        str(map_file),
+                        "--sysfs-root",
+                        str(sysfs_root),
+                        "--dev-root",
+                        str(dev_root),
+                        "--validate",
+                    ]
+                )
+                self.assertEqual(rc_gen, 0, err)
+                spec = json.loads(spec_path.read_text(encoding="utf-8"))
+                by_name = {d["name"]: d for d in spec["devices"]}
+                self.assertIn("0-3", by_name)
+                self.assertIn("4-7", by_name)
+                self.assertEqual(by_name["0-3"]["annotations"].get("freetpu.dev/chip-id-source"), "chip-id-map")
+                self.assertEqual(
+                    by_name["numa1-pcie-0000-80-4"]["annotations"].get("freetpu.dev/chip-id-source"),
+                    "chip-id-map",
+                )
+
+                # Validating without `--chip-id-map` MUST preserve the intact live spec!
+                rc_val, _out2, err2 = _run_cli_inproc(
+                    [
+                        "validate",
+                        str(spec_path),
+                        "--check-host",
+                        "--remove-if-stale",
+                        "--sysfs-root",
+                        str(sysfs_root),
+                        "--dev-root",
+                        str(dev_root),
+                    ]
+                )
+                self.assertNotEqual(rc_val, 0)
+                self.assertIn("Preserved live CDI spec", err2)
+                self.assertTrue(spec_path.exists())
 
 
 if __name__ == "__main__":

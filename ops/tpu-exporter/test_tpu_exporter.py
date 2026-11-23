@@ -3098,6 +3098,75 @@ TPU Runtime Utilization
                 [11.0, 22.0, 33.0, 44.0, None, None, None, None],
             )
 
+            # When direct gRPC reports an explicitly UNSET duty gauge for core 7
+            # (even when core 7 also misses HBM, forcing stock fallback to run),
+            # stock fallback returning `0.0` for that unset protobuf gauge MUST NOT
+            # overwrite core 7's unknown duty with a false `0.0%` collapse reading!
+            class _IronwoodOneUnsetDutyAndMissingHbmStub:
+                def __init__(self, channel):
+                    self.channel = channel
+
+                def GetRuntimeMetric(self, req, timeout=None):
+                    del timeout
+                    if req.metric_name == "tpu.runtime.hbm.memory.usage.bytes":
+                        # Core 7 omits HBM usage so fallback runs!
+                        items = [_make_item(c, as_int=(c + 1) * 4 * 1024**3) for c in range(7)]
+                    elif req.metric_name == "tpu.runtime.hbm.memory.total.bytes":
+                        items = [_make_item(c, as_int=96 * 1024**3) for c in range(8)]
+                    elif req.metric_name == "tpu.runtime.tensorcore.dutycycle.percent":
+                        items = [
+                            _make_item(c, as_double=11.0 * (c + 1)) for c in range(7)
+                        ] + [_make_item(7)]  # unset protobuf gauge!
+                    else:
+                        items = []
+                    return SimpleNamespace(metric=SimpleNamespace(metrics=items))
+
+            stock_fb_rows = {
+                str(c): _te._TpuInfoRow(
+                    chip_key=str(c),
+                    hbm_used_bytes=(c + 1) * 4 * 1024**3,
+                    hbm_total_bytes=96 * 1024**3,
+                    duty_cycle_percent=(11.0 * (c + 1) if c < 7 else 0.0),  # protobuf default 0.0!
+                    in_util_table=True,
+                )
+                for c in range(8)
+            }
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.dict(_te._GRPC_CHANNELS, {}, clear=True),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "grpc": _FakeGrpc,
+                        "tpu_info": SimpleNamespace(),
+                        "tpu_info.proto": SimpleNamespace(),
+                        "tpu_info.proto.tpu_metric_service_pb2": fake_pb2,
+                        "tpu_info.proto.tpu_metric_service_pb2_grpc": SimpleNamespace(
+                            RuntimeMetricServiceStub=_IronwoodOneUnsetDutyAndMissingHbmStub
+                        ),
+                    },
+                ),
+                mock.patch.object(
+                    _te, "_run_tpu_info", return_value=(True, None, stock_fb_rows)
+                ),
+                mock.patch.object(
+                    _te, "_query_tpu_info_python_metrics", return_value=(True, None, stock_fb_rows)
+                ),
+            ):
+                iw_unset_fb_snap = _te.collect_snapshot(
+                    sysfs_root=iw_sysfs,
+                    dev_root=iw_dev,
+                    proc_root=iw_proc,
+                    tpu_info_bin="tpu-info",
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=iw_root / "no-shm",
+                )
+            self.assertEqual(iw_unset_fb_snap.devices[7].hbm_used_bytes, 32 * 1024**3)
+            self.assertEqual(
+                [d.duty_cycle_percent for d in iw_unset_fb_snap.devices],
+                [11.0, 22.0, 33.0, 44.0, 55.0, 66.0, 77.0, None],
+            )
+
             # Ambiguous partial response (only raw IDs {0, 1} on an 8-core / 4-chip host)
             # MUST omit ambiguous duty-cycle readings instead of guessing chip vs core.
             class _IronwoodAmbiguousDutyStub:
@@ -4913,6 +4982,11 @@ TPU Runtime Utilization
             ):
                 with self.assertRaisesRegex(ValueError, "Duplicate"):
                     tpu_exporter._load_chip_id_map(bad_map_json)
+            # Mixed-case PCI BDF keys MUST normalize to lowercase; VFIO paths stay trimmed.
+            self.assertEqual(
+                tpu_exporter._load_chip_id_map('{" 0000:00:0A.0 ": "3", " /dev/vfio/1 ": "4"}'),
+                {"0000:00:0a.0": "3", "/dev/vfio/1": "4"},
+            )
 
     def test_filtered_ironwood_pci_view_requires_per_core_evidence_or_chip_map(self) -> None:
         from unittest import mock

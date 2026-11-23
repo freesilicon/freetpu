@@ -550,6 +550,7 @@ class _TpuInfoRow:
     hbm_bw_util_percent: Optional[float] = None
     in_chips_table: bool = False
     in_util_table: bool = False
+    duty_unset_in_grpc: bool = False
     sources: List[str] = field(default_factory=list)
 
 
@@ -1429,6 +1430,7 @@ def _query_grpc_runtime_metrics(
     devices_per_chip = _infer_devices_per_chip(devices)
     rows: Dict[str, _TpuInfoRow] = {}
     duty_by_chip: Dict[str, float] = {}
+    unset_duty_ids: set[str] = set()
     raw_duty_ids: set[str] = set()
     raw_hbm_ids: set[str] = set()
     last_err: Optional[str] = None
@@ -1462,6 +1464,8 @@ def _query_grpc_runtime_metrics(
                 raw_hbm_ids.add(chip_id)
             val = _extract_grpc_gauge_value(item)
             if val is None or val < 0.0:
+                if metric_name == "tpu.runtime.tensorcore.dutycycle.percent":
+                    unset_duty_ids.add(chip_id)
                 continue
             if metric_name == "tpu.runtime.tensorcore.dutycycle.percent":
                 duty_by_chip[chip_id] = float(val)
@@ -1514,7 +1518,7 @@ def _query_grpc_runtime_metrics(
         duty_layout = "per_core"
     else:
         duty_layout = "ambiguous"
-        if duty_by_chip:
+        if raw_duty_ids:
             parsed_duty = [_parse_runtime_device_id(k) for k in raw_duty_ids]
             if all(cid is not None for cid in parsed_duty):
                 raw_duty_int_ids = {cid for cid in parsed_duty if cid is not None}
@@ -1579,10 +1583,44 @@ def _query_grpc_runtime_metrics(
             row.in_util_table = True
             row.unjoined_duty_cycle_percent = duty_val
 
-    if not rows:
+    # Record explicitly unset/invalid duty-cycle gauges returned by live gRPC so
+    # stock `tpu-info` / `tpu_info.metrics` fallbacks (which read unset protobuf
+    # doubles as `0.0` without checking field presence) can never turn an unknown
+    # duty reading into a false 0% collapse alert.
+    unresolved_unset = unset_duty_ids - set(duty_by_chip)
+    if unresolved_unset:
+        unset_target_keys: set[str] = set()
+        if duty_layout == "per_chip" and devices_per_chip is not None:
+            for chip_key in unresolved_unset:
+                chip_idx = _parse_runtime_device_id(chip_key)
+                if chip_idx is None:
+                    unset_target_keys.add(chip_key)
+                    continue
+                for offset in range(devices_per_chip):
+                    unset_target_keys.add(str(chip_idx * devices_per_chip + offset))
+        elif duty_layout == "per_core":
+            unset_target_keys.update(unresolved_unset)
+        else:
+            for chip_key in unresolved_unset:
+                unset_target_keys.add(chip_key)
+                if devices_per_chip is not None and devices_per_chip > 1:
+                    chip_idx = _parse_runtime_device_id(chip_key)
+                    if chip_idx is not None:
+                        for offset in range(devices_per_chip):
+                            unset_target_keys.add(str(chip_idx * devices_per_chip + offset))
+        for tk in unset_target_keys:
+            row = rows.setdefault(tk, _TpuInfoRow(chip_key=tk))
+            row.in_util_table = True
+            row.duty_unset_in_grpc = True
+
+    if not _has_live_utilization(rows):
         if not any_rpc_ok and last_err:
             return False, last_err, {}
-        return False, last_err or f"gRPC RuntimeMetricService returned no live metrics from {addr}", {}
+        return (
+            False,
+            last_err or f"gRPC RuntimeMetricService returned no live metrics from {addr}",
+            rows if any(r.duty_unset_in_grpc for r in rows.values()) else {},
+        )
     return True, None, rows
 
 
@@ -2095,7 +2133,7 @@ def _row_has_complete_utilization(row: _TpuInfoRow) -> bool:
         row.in_util_table
         and row.hbm_used_bytes is not None
         and row.hbm_total_bytes is not None
-        and row.duty_cycle_percent is not None
+        and (row.duty_cycle_percent is not None or row.duty_unset_in_grpc)
     )
 
 
@@ -2239,32 +2277,43 @@ def _has_complete_utilization(
 def _sanitize_fallback_duty_rows(
     rows: Dict[str, _TpuInfoRow],
     devices: Sequence[TpuTelemetry],
+    *,
+    unset_duty_ids: Optional[set[str]] = None,
 ) -> Dict[str, _TpuInfoRow]:
-    """Strip unverified fallback `duty_cycle_percent` joins on Ironwood (`tpu7x`) hosts.
+    """Strip unverified fallback `duty_cycle_percent` joins on Ironwood (`tpu7x`) hosts
+    and block stock fallbacks from turning gRPC-unset duty gauges into `0.0%`.
 
     Upstream `tpu_info.metrics.get_chip_usage_new` (used strictly on Ironwood
     `V7X` by both the `tpu-info` CLI and Python API) sorts HBM and duty-cycle
     replies separately and zips them by position without checking that IDs
-    match. Legacy `v2`/`v3`/`v4`/`v5e`/`v5p`/`v6e` use `get_chip_usage`, which
-    already expands per-chip duty readings cleanly into per-core rows even when
-    PCI visibility is partial. On Ironwood (`tpu7x`), accept fallback
-    `duty_cycle_percent` ONLY when fallback covers the full contiguous verified
-    host core set (`0..verified_chips * devices_per_chip - 1`), where equal-
-    length positional zipping is provably 1:1. For partial/subset Ironwood
-    replies (e.g. HBM cores `{2,3}` zipped against chip duty `{0,1}`), preserve
-    HBM fields and leave `duty_cycle_percent` unset so raw gRPC duty stays
-    unjoined instead of being misattributed to the wrong PCI device.
+    match, and stock `tpu-info` / `tpu_info.metrics` read unset protobuf duty
+    gauges as `0.0` without checking field presence. Legacy `v2`/`v3`/`v4`/
+    `v5e`/`v5p`/`v6e` use `get_chip_usage`, which already expands per-chip duty
+    readings cleanly into per-core rows even when PCI visibility is partial.
+    On Ironwood (`tpu7x`), accept fallback `duty_cycle_percent` ONLY when
+    fallback covers the full contiguous verified host core set
+    (`0..verified_chips * devices_per_chip - 1`) with populated gauges, where
+    equal-length positional zipping is provably 1:1.
     """
     if not rows:
         return rows
+    working = rows
+    if unset_duty_ids:
+        stripped: Dict[str, _TpuInfoRow] = {}
+        for k, r in rows.items():
+            copied = _copy_tpu_info_row(r)
+            if k in unset_duty_ids and copied.duty_cycle_percent is not None:
+                copied.duty_cycle_percent = None
+            stripped[k] = copied
+        working = stripped
     # Restrict the `get_chip_usage_new` positional-zip guard strictly to
     # Ironwood (`tpu7x`); sidecars without PCI inventory and legacy
     # `v2`/`v3`/`v4`/`v5e`/`v5p`/`v6e` hosts preserve fallback duty readings.
     if not any(d.generation == "tpu7x" for d in devices):
-        return rows
+        return working
     inferred_dpc = _infer_devices_per_chip(devices)
     if inferred_dpc is None or inferred_dpc <= 1:
-        return rows
+        return working
 
     expected_core_count: Optional[int] = None
     verified_chips = _verified_dual_function_chip_count(devices, inferred_dpc)
@@ -2274,16 +2323,16 @@ def _sanitize_fallback_duty_rows(
     if expected_core_count is not None:
         duty_ids = {
             pid
-            for k, r in rows.items()
+            for k, r in working.items()
             if r.in_util_table and r.duty_cycle_percent is not None
             for pid in (_parse_runtime_device_id(k),)
             if pid is not None
         }
         if duty_ids == set(range(expected_core_count)):
-            return rows
+            return working
 
     sanitized: Dict[str, _TpuInfoRow] = {}
-    for k, r in rows.items():
+    for k, r in working.items():
         copied = _copy_tpu_info_row(r)
         if copied.duty_cycle_percent is not None:
             copied.duty_cycle_percent = None
@@ -2320,6 +2369,7 @@ def _copy_tpu_info_row(row: _TpuInfoRow) -> _TpuInfoRow:
         hbm_bw_util_percent=row.hbm_bw_util_percent,
         in_chips_table=row.in_chips_table,
         in_util_table=row.in_util_table,
+        duty_unset_in_grpc=row.duty_unset_in_grpc,
         sources=list(row.sources),
     )
 
@@ -2349,10 +2399,12 @@ def _merge_runtime_rows(
                 existing.hbm_total_bytes = r.hbm_total_bytes
                 used_extra = True
             if r.duty_cycle_percent is not None and (
-                not keep_existing or existing.duty_cycle_percent is None
+                not keep_existing
+                or (existing.duty_cycle_percent is None and not existing.duty_unset_in_grpc)
             ):
                 existing.duty_cycle_percent = r.duty_cycle_percent
                 used_extra = True
+            existing.duty_unset_in_grpc = existing.duty_unset_in_grpc or r.duty_unset_in_grpc
             if r.unjoined_duty_cycle_percent is not None and (
                 not keep_existing or existing.unjoined_duty_cycle_percent is None
             ):
@@ -2539,7 +2591,12 @@ def collect_snapshot(
                     grpc_duty_layout=grpc_duty_layout,
                 )
                 if py_ok:
-                    py_rows = _sanitize_fallback_duty_rows(py_rows, devices)
+                    grpc_unset_duty_ids = {
+                        k for k, r in parsed_rows.items() if r.duty_unset_in_grpc
+                    }
+                    py_rows = _sanitize_fallback_duty_rows(
+                        py_rows, devices, unset_duty_ids=grpc_unset_duty_ids
+                    )
                     py_rows = _tag_row_sources(py_rows, "tpu-info-python")
                     parsed_rows = _merge_runtime_rows(
                         parsed_rows,
@@ -2611,7 +2668,12 @@ def collect_snapshot(
                 # to stock `tpu-info` executables; preserve duty-cycle readings
                 # produced by custom operator wrappers passed via `--tpu-info-bin`.
                 if Path(tpu_info_bin).name in ("tpu-info", "tpu_info"):
-                    cli_rows = _sanitize_fallback_duty_rows(cli_rows, devices)
+                    grpc_unset_duty_ids = {
+                        k for k, r in parsed_rows.items() if r.duty_unset_in_grpc
+                    }
+                    cli_rows = _sanitize_fallback_duty_rows(
+                        cli_rows, devices, unset_duty_ids=grpc_unset_duty_ids
+                    )
                 cli_rows = _tag_row_sources(cli_rows, "tpu-info")
                 tpu_info_ok = True
                 tpu_info_err = None
@@ -2642,7 +2704,12 @@ def collect_snapshot(
                     grpc_duty_layout=grpc_duty_layout,
                 )
                 if py_ok:
-                    py_rows = _sanitize_fallback_duty_rows(py_rows, devices)
+                    grpc_unset_duty_ids = {
+                        k for k, r in parsed_rows.items() if r.duty_unset_in_grpc
+                    }
+                    py_rows = _sanitize_fallback_duty_rows(
+                        py_rows, devices, unset_duty_ids=grpc_unset_duty_ids
+                    )
                     py_rows = _tag_row_sources(py_rows, "tpu-info-python")
                     parsed_rows = _merge_runtime_rows(
                         parsed_rows,
@@ -3462,7 +3529,8 @@ def _load_chip_id_map(raw: Optional[Path | str]) -> Optional[Dict[str, str]]:
                     f"Duplicate --chip-id-map key {k!r} (conflicts with {seen_norm[norm_cmp]!r})"
                 )
             seen_norm[norm_cmp] = k
-            obj[norm_k] = v
+            store_k = norm_k if norm_k.startswith("/") else norm_cmp
+            obj[store_k] = v
         return obj
 
     parsed = json.loads(text, object_pairs_hook=_no_duplicate_keys)

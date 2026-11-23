@@ -443,7 +443,7 @@ def _load_chip_id_map(raw: Optional[str]) -> Optional[Dict[str, int]]:
             raise ValueError(
                 f"Invalid --chip-id-map value {v!r} for {k!r}: must be a non-negative integer"
             )
-        result[norm_k] = iv
+        result[norm_cmp] = iv
     return result
 
 
@@ -1766,6 +1766,11 @@ def build_cdi_spec(
     # Emit NUMA / PCIe-root-complex-aware capacity-pinned sub-host slice presets
     # (e.g. `numa0-pcie-0000-00-4`, `numa1-pcie-0000-80-4`, `0-3`, `4-7` on `v6e-8`)
     # strictly within matching NUMA / PCIe root complex boundaries.
+    bdf_to_phys_nomap = (
+        _map_physical_chip_indices(chips, chip_id_map=None)
+        if chip_id_map
+        else bdf_to_phys
+    )
     used_names = {d["name"] for d in devices}
     for topo_slice in _compute_topology_slices(
         chips, bdf_to_phys, reserved_names=used_names, chip_id_map=chip_id_map
@@ -1776,6 +1781,16 @@ def build_cdi_spec(
             chips,
             bdf_to_phys,
             chip_id_map=chip_id_map,
+        )
+        slice_visibility_nomap = (
+            _resolve_verified_visibility_ordinals(
+                topo_slice.chips,
+                chips,
+                bdf_to_phys_nomap,
+                chip_id_map=None,
+            )
+            if chip_id_map
+            else slice_visibility
         )
         slice_env = _build_device_env(
             len(topo_slice.physical_indices),
@@ -1804,7 +1819,13 @@ def build_cdi_spec(
         slice_devnums_str = _format_vfio_devnums(list(slice_devnums.items()))
         if slice_devnums_str:
             slice_ann_base["freetpu.dev/vfio-devnums"] = slice_devnums_str
-        if chip_id_map and any(c.pci_bdf in chip_id_map for c in topo_slice.chips):
+        # Mark a slice as map-dependent whenever `--chip-id-map` directly covers
+        # any BDF in the slice OR resolves a host-wide sysfs conflict that would
+        # otherwise make this slice's aliases/visibility unverifiable without the map.
+        if chip_id_map and (
+            any(c.pci_bdf in chip_id_map for c in topo_slice.chips)
+            or slice_visibility != slice_visibility_nomap
+        ):
             slice_ann_base["freetpu.dev/chip-id-source"] = "chip-id-map"
 
         for s_name in topo_slice.aliases:
@@ -1829,6 +1850,16 @@ def build_cdi_spec(
         bdf_to_phys,
         chip_id_map=chip_id_map,
     )
+    all_visibility_nomap = (
+        _resolve_verified_visibility_ordinals(
+            chips,
+            chips,
+            bdf_to_phys_nomap,
+            chip_id_map=None,
+        )
+        if chip_id_map
+        else all_visibility
+    )
     all_ann: Dict[str, str] = {
         "freetpu.dev/allocation-unit": "all-devices",
         "freetpu.dev/chip-count": str(all_complete_chips),
@@ -1845,7 +1876,10 @@ def build_cdi_spec(
     all_devnums = _format_vfio_devnums(list(seen_group_devnums.items()))
     if all_devnums:
         all_ann["freetpu.dev/vfio-devnums"] = all_devnums
-    if chip_id_map and any(c.pci_bdf in chip_id_map for c in chips):
+    if chip_id_map and (
+        any(c.pci_bdf in chip_id_map for c in chips)
+        or all_visibility != all_visibility_nomap
+    ):
         all_ann["freetpu.dev/chip-id-source"] = "chip-id-map"
 
     all_env = _build_device_env(
@@ -2033,6 +2067,7 @@ def _validate_container_edits(
         else:
             seen_host_ifaces: set[str] = set()
             seen_net_names: set[str] = set()
+            valid_net_entries: List[Tuple[str, str, str]] = []
             for idx, nd in enumerate(net_devs):
                 ndc = f"{context}.netDevices[{idx}]"
                 if not isinstance(nd, dict):
@@ -2058,20 +2093,28 @@ def _validate_container_edits(
                 else:
                     seen_net_names.add(iface_name)
                 if isinstance(host_iface, str) and host_iface and isinstance(iface_name, str) and iface_name:
-                    if global_net_by_name and iface_name in global_net_by_name:
-                        global_host = global_net_by_name[iface_name]
-                        if global_host != host_iface:
-                            errors.append(
-                                f"{ndc}.name: container netDevice name {iface_name!r} conflicts with "
-                                f"global containerEdits.netDevices entry for host interface {global_host!r}"
-                            )
-                    if global_net_by_host and host_iface in global_net_by_host:
-                        global_name = global_net_by_host[host_iface]
-                        if global_name != iface_name:
-                            errors.append(
-                                f"{ndc}.hostInterfaceName: host interface {host_iface!r} conflicts with "
-                                f"global containerEdits.netDevices mapping to {global_name!r}"
-                            )
+                    valid_net_entries.append((ndc, host_iface, iface_name))
+            # Per CNCF CDI v1.1.0 (`pkg/cdi/container-edits.go`), global and
+            # device-level `netDevices` apply into an OCI map keyed by
+            # `hostInterfaceName`: a device entry for the same host interface
+            # overrides the global mapping rather than conflicting with it.
+            # Reject collisions only when two distinct host interfaces end up
+            # mapped to the same container-side destination `name`.
+            if global_net_by_host and valid_net_entries:
+                effective_by_host: Dict[str, str] = dict(global_net_by_host)
+                for _ndc, h_if, c_nm in valid_net_entries:
+                    effective_by_host[h_if] = c_nm
+                for ndc, h_if, c_nm in valid_net_entries:
+                    conflicting_hosts = sorted(
+                        other_h
+                        for other_h, other_nm in effective_by_host.items()
+                        if other_h != h_if and other_nm == c_nm
+                    )
+                    if conflicting_hosts:
+                        errors.append(
+                            f"{ndc}.name: container netDevice name {c_nm!r} conflicts with "
+                            f"global containerEdits.netDevices entry for host interface {conflicting_hosts[0]!r}"
+                        )
 
     if "deviceNodes" in edits:
         nodes = edits["deviceNodes"]
