@@ -42,6 +42,8 @@ mkdir -p "$HF_HUB_CACHE" "$XLA_CACHE_DIR"
 # export LIBTPU_INIT_ARGS="--xla_tpu_enable_persistent_cache=true"
 ```
 
+> **Shared cache security note:** JAX trusts compiled artifacts loaded from `JAX_COMPILATION_CACHE_DIR` / `VLLM_XLA_CACHE_PATH` (a maliciously crafted cache entry can achieve arbitrary code execution under the serving worker identity). Restrict write IAM permissions on any shared GCS bucket or prefix strictly to trusted serving service accounts, and isolate workloads in different trust domains into separate cache buckets or prefixes.
+
 ---
 
 ## 3. Non-Privileged CDI Container Base Flags

@@ -3154,8 +3154,15 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
         if allowed:
             if "*" in allowed:
                 return True, "*"
-            if origin.rstrip("/") in allowed:
-                return True, origin
+            origin_norm = normalize_origin(origin)
+            origin_exact = origin.rstrip("/")
+            for entry in allowed:
+                if origin_norm is not None:
+                    entry_norm = normalize_origin(entry)
+                    if entry_norm is not None and entry_norm == origin_norm:
+                        return True, origin
+                elif entry.rstrip("/") == origin_exact:
+                    return True, origin
         if self._is_same_origin(origin):
             return True, None
         return False, None
@@ -4375,31 +4382,19 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 if not payload_bytes:
                     return False, False
                 if payload_bytes == b"[DONE]":
-                    if expect_final_usage and not saw_final_usage:
+                    if saw_upstream_error_event or (expect_final_usage and not saw_final_usage):
                         saw_upstream_error_event = True
                         return False, True
                     saw_done_sentinel = True
                     return True, True
                 try:
                     obj = json.loads(payload_bytes)
-                except UnicodeDecodeError:
-                    try:
-                        obj = json.loads(payload_bytes.decode("utf-8", errors="replace"))
-                    except json.JSONDecodeError:
-                        if ev_type.strip().lower() == "error":
-                            saw_upstream_error_event = True
-                            return False, False
-                        return True, False
-                except json.JSONDecodeError:
-                    if ev_type.strip().lower() == "error":
-                        saw_upstream_error_event = True
-                        return False, False
-                    return True, False
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    saw_upstream_error_event = True
+                    return False, False
                 if not isinstance(obj, dict):
-                    if ev_type.strip().lower() == "error":
-                        saw_upstream_error_event = True
-                        return False, False
-                    return True, False
+                    saw_upstream_error_event = True
+                    return False, False
                 if (
                     ev_type.strip().lower() == "error"
                     or obj.get("error") is not None

@@ -695,7 +695,22 @@ class RouterConfig:
             if not isinstance(raw_origin, str) or not raw_origin.strip():
                 raise ValueError("cors_allowed_origins entries must be non-empty strings")
             origin = raw_origin.strip()
-            normalized_origins.append("*" if origin == "*" else origin.rstrip("/"))
+            if origin == "*":
+                normalized_origins.append("*")
+                continue
+            parsed_origin = normalize_origin(origin)
+            if parsed_origin is not None:
+                scheme, host, port = parsed_origin
+                host_fmt = f"[{host}]" if ":" in host else host
+                default_port = 443 if scheme == "https" else 80
+                canonical = (
+                    f"{scheme}://{host_fmt}"
+                    if port == default_port
+                    else f"{scheme}://{host_fmt}:{port}"
+                )
+                normalized_origins.append(canonical)
+            else:
+                normalized_origins.append(origin.rstrip("/"))
         self.cors_allowed_origins = normalized_origins
 
         if not isinstance(self.auth, Mapping):

@@ -7320,6 +7320,9 @@ asyncio.run(main())
             """--additional-config '{"enable_continue_decode": true}'""",
             playbook,
         )
+        self.assertIn("arbitrary code execution", playbook.lower())
+        self.assertIn("write iam", playbook.lower())
+        self.assertIn("trust domains", playbook.lower())
 
     def test_deadline_socket_waits_support_high_fds_without_select_select(self) -> None:
         def _forbid_select(*args: Any, **kwargs: Any) -> Any:
@@ -10391,6 +10394,232 @@ asyncio.run(main())
             release_rest.set()
             conn.close()
         self.assertIn(b"data: [DONE]", seen)
+
+    def test_malformed_committed_sse_event_marks_failure_and_withholds_done(self) -> None:
+        recorded_usage: List[UsageEvent] = []
+
+        class _RecordHook:
+            def record_usage(self, event: UsageEvent) -> None:
+                recorded_usage.append(event)
+
+        payload_mode = ["malformed_then_done"]
+
+        class _MalformedPostCommitSSEHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return None
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = json.dumps(
+                    {"object": "list", "data": [{"id": "m-malformed-sse"}]}
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802
+                clen = int(self.headers.get("Content-Length", "0"))
+                if clen > 0:
+                    self.rfile.read(clen)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                if payload_mode[0] == "malformed_then_done":
+                    self.wfile.write(
+                        b'data: {"id":"m1","object":"chat.completion.chunk",'
+                        b'"choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}\n\n'
+                    )
+                    self.wfile.flush()
+                    self.wfile.write(b"data: {corrupted_json\n\ndata: [DONE]\n\n")
+                else:
+                    self.wfile.write(
+                        b'data: {"id":"m2","object":"chat.completion.chunk",'
+                        b'"choices":[{"index":0,"delta":{"content":"Done"},"finish_reason":"stop"}]}\n\n'
+                    )
+                    self.wfile.flush()
+                    self.wfile.write(b"data: [1, 2, 3]\n\n")
+                self.wfile.flush()
+
+        srv = self._track(
+            ThreadingHTTPServer(("127.0.0.1", 0), _MalformedPostCommitSSEHandler)
+        )
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            failure_cooldown_s=30.0,
+            backends=[
+                BackendConfig(
+                    id="malformed-sse-b",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=f"http://127.0.0.1:{srv.server_address[1]}/v1",
+                    models=["m-malformed-sse"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg, usage_hook=_RecordHook()))
+        rport = router.server_address[1]
+
+        # 1. Malformed JSON followed by [DONE]: withhold [DONE], emit error, record 502, mark unhealthy.
+        conn = http.client.HTTPConnection("127.0.0.1", rport, timeout=3.0)
+        try:
+            body = json.dumps(
+                {
+                    "model": "m-malformed-sse",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "hi"}],
+                }
+            ).encode("utf-8")
+            conn.request(
+                "POST",
+                "/v1/chat/completions",
+                body=body,
+                headers={"Content-Type": "application/json"},
+            )
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)
+            with self.assertRaises(http.client.IncompleteRead) as exc_info:
+                resp.read()
+            self.assertIn(b"upstream_stream_interrupted", exc_info.exception.partial)
+            self.assertNotIn(b"data: [DONE]", exc_info.exception.partial)
+        finally:
+            conn.close()
+        self.assertEqual(len(recorded_usage), 1)
+        self.assertEqual(recorded_usage[0].status_code, 502)
+        self.assertEqual(router.engine._backends[0].total_failures, 1)
+        self.assertEqual(
+            router.engine._backends[0].unhealthy_reason, "stream_truncated_mid_response"
+        )
+        self.assertGreater(
+            router.engine._backends[0].cooldown_until_monotonic, time.monotonic()
+        )
+
+        # 2. Non-object JSON after finish_reason="stop": still record 502 and mark failed/cooldown.
+        router.engine._backends[0].healthy = True
+        router.engine._backends[0].cooldown_until_monotonic = 0.0
+        payload_mode[0] = "non_object_after_stop"
+        conn = http.client.HTTPConnection("127.0.0.1", rport, timeout=3.0)
+        try:
+            body = json.dumps(
+                {
+                    "model": "m-malformed-sse",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "hi2"}],
+                }
+            ).encode("utf-8")
+            conn.request(
+                "POST",
+                "/v1/chat/completions",
+                body=body,
+                headers={"Content-Type": "application/json"},
+            )
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)
+            with self.assertRaises(http.client.IncompleteRead) as exc_info:
+                resp.read()
+            self.assertIn(b"upstream_stream_interrupted", exc_info.exception.partial)
+        finally:
+            conn.close()
+        self.assertEqual(len(recorded_usage), 2)
+        self.assertEqual(recorded_usage[1].status_code, 502)
+        self.assertEqual(router.engine._backends[0].total_failures, 2)
+        self.assertGreater(
+            router.engine._backends[0].cooldown_until_monotonic, time.monotonic()
+        )
+
+    def test_cors_allowlist_matches_explicit_default_ports_and_case(self) -> None:
+        backend = self._track(_MockOpenAIBackend("cors-port-b", ["m-corsport"]))
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            cors_allowed_origins=[
+                "https://App.Example:443/",
+                "http://plain.example:80",
+                "https://[::1]:443",
+                "https://custom.example:8443",
+            ],
+            backends=[
+                BackendConfig(
+                    id="cors-port-b",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=backend.base_url,
+                    models=["m-corsport"],
+                )
+            ],
+        )
+        cfg.validate()
+        self.assertEqual(
+            cfg.cors_allowed_origins,
+            [
+                "https://app.example",
+                "http://plain.example",
+                "https://[::1]",
+                "https://custom.example:8443",
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        # Preflight and POST with browser-serialized default-port origins succeed.
+        st_opt, hdr_opt, _ = _http_request(
+            rport,
+            "OPTIONS",
+            "/v1/chat/completions",
+            headers={
+                "Origin": "https://app.example",
+                "Access-Control-Request-Method": "POST",
+            },
+        )
+        self.assertEqual(st_opt, 204)
+        self.assertEqual(
+            hdr_opt.get("access-control-allow-origin"), "https://app.example"
+        )
+
+        for ok_origin in (
+            "https://app.example",
+            "https://app.example:443",
+            "http://plain.example",
+            "https://[::1]",
+            "https://custom.example:8443",
+        ):
+            st_ok, hdr_ok, _ = _http_request(
+                rport,
+                "POST",
+                "/v1/chat/completions",
+                headers={"Origin": ok_origin},
+                body={
+                    "model": "m-corsport",
+                    "messages": [{"role": "user", "content": "ok"}],
+                },
+            )
+            self.assertEqual(st_ok, 200, f"expected 200 for Origin={ok_origin}")
+            self.assertEqual(hdr_ok.get("access-control-allow-origin"), ok_origin)
+
+        # Mismatched scheme or non-default port must still be rejected with 403.
+        for bad_origin in (
+            "http://app.example",
+            "https://app.example:8443",
+            "https://custom.example",
+        ):
+            st_bad, _, _ = _http_request(
+                rport,
+                "POST",
+                "/v1/chat/completions",
+                headers={"Origin": bad_origin},
+                body={
+                    "model": "m-corsport",
+                    "messages": [{"role": "user", "content": "no"}],
+                },
+            )
+            self.assertEqual(st_bad, 403, f"expected 403 for Origin={bad_origin}")
 
 
 def run_self_tests(verbosity: int = 1) -> int:
