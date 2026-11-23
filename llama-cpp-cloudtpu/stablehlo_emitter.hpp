@@ -117,6 +117,7 @@ struct GraphProgramSpec {
     int32_t spmd_chips = 1;           // Number of replica-SPMD chips (1 = single chip, 4 = tpu7x, 8 = v6e-8)
     bool bf16_matmul = true;          // Dequantize quantized/low-bit weights & activations to BF16 for MXU
     bool q4_split_dot = true;         // Q4_0/Q4_K: true = two split-X dots (zero concat); false = single concat dot
+    int32_t mm_pad_m = 8;             // Pad small BF16 Q4_*_I4/Q6_K_SPLIT M < mm_pad_m up to mm_pad_m for MXU (<=1 disables)
 };
 
 struct PjrtInputBinding {

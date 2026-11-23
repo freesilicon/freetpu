@@ -613,6 +613,21 @@ SsaValue dequantize_k_major_blocks(StableHloBuilder& b,
         qs_eff = materialize_q4_i4_nibbles(b, qs, target_4bit, N);
     }
 
+    const bool fast_bf16 =
+        (out_dt == PjrtDType::BF16 && d.dtype == PjrtDType::BF16 &&
+         (m_opt == nullptr || m_opt->dtype == PjrtDType::BF16) &&
+         !(storage == TensorStorageKind::Q4_0_I4 && qs_eff.dtype == PjrtDType::U4));
+    if (fast_bf16) {
+        SsaValue q_bf = b.emit_convert(qs_eff, PjrtDType::BF16);
+        SsaValue d_b = b.emit_broadcast_in_dim(d, {0, 1, 2, 4}, km_dims);
+        SsaValue scaled = b.emit_binary("stablehlo.multiply", q_bf, d_b);
+        if (storage == TensorStorageKind::Q4_K_I4 && m_opt != nullptr) {
+            SsaValue m_b = b.emit_broadcast_in_dim(*m_opt, {0, 1, 2, 4}, km_dims);
+            scaled = b.emit_binary("stablehlo.add", scaled, m_b);
+        }
+        return scaled;
+    }
+
     SsaValue q_f = b.emit_convert(qs_eff, PjrtDType::F32);
     if (storage == TensorStorageKind::Q4_0_I4 && qs_eff.dtype == PjrtDType::U4) {
         SsaValue eight = b.emit_const_splat_f32(8.0f, km_dims, PjrtDType::F32);
@@ -800,14 +815,17 @@ uint64_t fnv1a_64(const std::string& s) {
     return h;
 }
 
-std::string build_canonical_cache_key(const std::string& mlir_text, int32_t spmd_chips) {
+std::string build_canonical_cache_key(const std::string& mlir_text, int32_t spmd_chips, int32_t mm_pad_m) {
     // Structural key combining size + two independent FNV hashes (64-bit normal + 64-bit salted),
-    // exact length, and SPMD chip count to prevent collisions without external SHA libraries.
+    // exact length, SPMD chip count, and non-default mm_pad_m to prevent collisions without external SHA libraries.
     const uint64_t h1 = fnv1a_64(mlir_text);
     const uint64_t h2 = fnv1a_64(std::string("cloudtpu_v1:") + mlir_text);
     std::ostringstream oss;
     oss << std::hex << std::setfill('0') << std::setw(16) << h1
         << std::setw(16) << h2 << "_" << std::dec << mlir_text.size() << "_p" << spmd_chips;
+    if (mm_pad_m != 8) {
+        oss << "_pm" << mm_pad_m;
+    }
     return oss.str();
 }
 
@@ -1016,6 +1034,26 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                     };
 
                     const std::vector<int64_t> local_out_dims = {x.dims[0], x.dims[1], x.dims[2], N_local};
+                    const int64_t m_orig = x.dims[2];
+                    const int64_t m_total = x.dims[0] * x.dims[1] * m_orig;
+                    const bool is_q4_i4 = (w_th.storage == TensorStorageKind::Q4_0_I4 ||
+                                           w_th.storage == TensorStorageKind::Q4_K_I4);
+                    const bool is_q4_factored = is_q4_i4 && (m_total <= 32);
+                    const bool apply_pad_m =
+                        use_bf16_mxu && !op.high_precision && spec.mm_pad_m > 1 &&
+                        x.dims[0] == 1 && x.dims[1] == 1 &&
+                        m_orig >= 1 && m_orig < spec.mm_pad_m &&
+                        (w_th.storage == TensorStorageKind::Q6_K_SPLIT ||
+                         (is_q4_factored && spec.mm_pad_m <= 32));
+                    SsaValue x_mm = x;
+                    if (apply_pad_m) {
+                        const int64_t m_pad = spec.mm_pad_m;
+                        SsaValue pad_zeros = builder.emit_const_splat_f32(
+                            0.0f, {1, 1, m_pad - m_orig, x.dims[3]}, x.dtype);
+                        x_mm = builder.emit_concatenate({x, pad_zeros}, 2);
+                    }
+                    const std::vector<int64_t> dot_out_dims = {x_mm.dims[0], x_mm.dims[1], x_mm.dims[2], N_local};
+
                     SsaValue local_out;
                     if (w_th.storage == TensorStorageKind::Q8_0_SPLIT ||
                         w_th.storage == TensorStorageKind::Q6_K_SPLIT) {
@@ -1023,14 +1061,12 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                             builder, w_th.storage, w_th.q_qs, w_th.q_d,
                             nullptr, w_th.bitcast_target, mm_dt);
                         bcast_w5_batch(w_km);
-                        SsaValue x_blk = builder.emit_reshape(x, {x.dims[0], x.dims[1], x.dims[2], NB_local, blk_elems});
+                        SsaValue x_blk = builder.emit_reshape(x_mm, {x_mm.dims[0], x_mm.dims[1], x_mm.dims[2], NB_local, blk_elems});
                         local_out = builder.emit_dot_general(
-                            x_blk, w_km, {0, 1}, {0, 1}, {3, 4}, {2, 3}, local_out_dims, op.dst.dtype,
+                            x_blk, w_km, {0, 1}, {0, 1}, {3, 4}, {2, 3}, dot_out_dims, op.dst.dtype,
                             op.high_precision);
-                    } else if (w_th.storage == TensorStorageKind::Q4_0_I4 ||
-                               w_th.storage == TensorStorageKind::Q4_K_I4) {
-                        const int64_t m_total = x.dims[0] * x.dims[1] * x.dims[2];
-                        if (m_total <= 32) {
+                    } else if (is_q4_i4) {
+                        if (is_q4_factored) {
                             // Factored S4 decode/small-batch path (M <= 32):
                             //   dot_b = dot_general(x_blk, qs_mm) -> [B3, B2, NB_local, M, N_local]
                             //   acc   = sum_nb(dot_b * d) + (Q4_K ? dot_general(xsum, m) : 0)
@@ -1042,14 +1078,14 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                             bcast_w4_batch(d_km);
 
                             SsaValue x_blk = builder.emit_reshape(
-                                x, {x.dims[0], x.dims[1], x.dims[2], NB_local, blk_elems});
+                                x_mm, {x_mm.dims[0], x_mm.dims[1], x_mm.dims[2], NB_local, blk_elems});
                             SsaValue qs_mm = builder.emit_convert(qs_eff, mm_dt);
                             if (w_th.storage == TensorStorageKind::Q4_0_I4 && qs_eff.dtype == PjrtDType::U4) {
                                 SsaValue eight = builder.emit_const_splat_f32(8.0f, qs_mm.dims, mm_dt);
                                 qs_mm = builder.emit_binary("stablehlo.subtract", qs_mm, eight);
                             }
                             const std::vector<int64_t> dot_b_dims = {
-                                x.dims[0], x.dims[1], NB_local, x.dims[2], N_local};
+                                x_mm.dims[0], x_mm.dims[1], NB_local, x_mm.dims[2], N_local};
                             SsaValue dot_b = builder.emit_dot_general(
                                 x_blk, qs_mm, {0, 1, 3}, {0, 1, 2}, {4}, {3},
                                 dot_b_dims, PjrtDType::F32, op.high_precision);
@@ -1068,7 +1104,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                                 SsaValue m_mm = builder.emit_convert(m_km, mm_dt);
                                 SsaValue m_dot = builder.emit_dot_general(
                                     xsum_mm, m_mm, {0, 1}, {0, 1}, {3}, {2},
-                                    local_out_dims, PjrtDType::F32, op.high_precision);
+                                    dot_out_dims, PjrtDType::F32, op.high_precision);
                                 acc = builder.emit_binary("stablehlo.add", acc, m_dot);
                             }
                             local_out = builder.emit_convert(acc, op.dst.dtype);
@@ -1119,6 +1155,10 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
                                 x_blk, w_cat, {0, 1}, {0, 1}, {3, 4, 5}, {2, 3, 4}, local_out_dims, op.dst.dtype,
                                 op.high_precision);
                         }
+                    }
+
+                    if (apply_pad_m) {
+                        local_out = builder.emit_slice(local_out, {0, 0, 0, 0}, {1, 1, m_orig, N_local});
                     }
 
                     if (P > 1 && w_sh == TensorShardingKind::SHARD_N) {
@@ -1701,7 +1741,7 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
     }
 
     prog.mlir_text = builder.finish(return_vals);
-    prog.cache_key = build_canonical_cache_key(prog.mlir_text, P);
+    prog.cache_key = build_canonical_cache_key(prog.mlir_text, P, spec.mm_pad_m);
     return prog;
 }
 
