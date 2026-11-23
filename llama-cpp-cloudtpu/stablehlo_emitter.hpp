@@ -16,12 +16,19 @@ enum class TensorStorageKind {
     Q6_K_SPLIT,  // Split into (qs: [B3, B2, N, K/16, 16] S8, d_eff: [B3, B2, N, K/16] F32)
 };
 
+enum class TensorShardingKind {
+    REPLICATED = 0,
+    SHARD_N,  // Sharded evenly across spmd_chips along StableHLO dim 2 (GGML ne[1] rows)
+    SHARD_K,  // Sharded evenly across spmd_chips along StableHLO dim 3 (GGML ne[0] cols)
+};
+
 // Row-major tensor descriptor (GGML ne[0..3] maps to row-major dims[0..3] = {ne3, ne2, ne1, ne0}).
 struct TensorSpec {
     uint64_t id = 0;  // Unique tensor slot id inside a GraphProgramSpec
     PjrtDType dtype = PjrtDType::F32;
     TensorStorageKind storage = TensorStorageKind::DENSE;
-    int64_t dims[4] = {1, 1, 1, 1};  // [ne3, ne2, ne1, ne0]
+    int64_t dims[4] = {1, 1, 1, 1};  // Logical (global) shape [ne3, ne2, ne1, ne0]
+    TensorShardingKind sharding = TensorShardingKind::REPLICATED;
 
     int64_t ne0() const { return dims[3]; }
     int64_t ne1() const { return dims[2]; }
@@ -46,6 +53,9 @@ enum class CloudOpKind {
     TRANSPOSE,
     SLICE,
     FLASH_ATTN_EXT,
+    ALL_REDUCE_SUM,
+    ALL_GATHER,
+    REDUCE_SCATTER_SUM,
 };
 
 struct RopeParams {
@@ -80,6 +90,8 @@ struct OpNodeSpec {
 
     // Op-specific parameters
     bool high_precision = false;  // MUL_MAT: GGML_PREC_F32
+    bool keep_sharded_out = false;  // SPMD MUL_MAT(SHARD_N): keep output as SHARD_K (Megatron FFN)
+    int64_t collective_dim = 3;     // ALL_GATHER / REDUCE_SCATTER axis
     float eps = 1e-5f;            // RMS_NORM
     float scale = 1.0f;           // SCALE
     float bias = 0.0f;            // SCALE
@@ -97,6 +109,7 @@ struct GraphProgramSpec {
     std::vector<TensorSpec> inputs;   // External live-in tensors
     std::vector<OpNodeSpec> ops;      // Topologically ordered ops
     std::vector<uint64_t> output_ids; // Live-out TensorSpec::ids
+    int32_t spmd_chips = 1;           // Number of replica-SPMD chips (1 = single chip, 4 = tpu7x, 8 = v6e-8)
 };
 
 struct PjrtInputBinding {
