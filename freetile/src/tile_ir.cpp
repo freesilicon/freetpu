@@ -119,7 +119,7 @@ TargetProfile target_profile(ChipTarget target) {
             p.vmem_bytes = 64ULL * 1024ULL * 1024ULL;
             p.smem_bytes = 1024ULL * 1024ULL;
             p.supports_mosaic = true;
-            p.supports_s4_native = true;
+            p.supports_s4_native = false;
             p.supports_bf16 = true;
             p.mosaic_version = 17;
             break;

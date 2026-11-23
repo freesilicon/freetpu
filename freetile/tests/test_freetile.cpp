@@ -23,7 +23,8 @@ int main() {
         const auto b0 = freetile::target_profile(freetile::ChipTarget::BUENOS_A0);
         CHECK_TRUE(v5e.mxu_m == 128 && v5e.vmem_bytes == 16ULL * 1024ULL * 1024ULL && v5e.supports_mosaic, "V5E profile");
         CHECK_TRUE(v6e.mxu_m == 256 && v6e.vmem_bytes == 32ULL * 1024ULL * 1024ULL && v6e.supports_mosaic, "V6E profile");
-        CHECK_TRUE(t7x.mxu_m == 256 && t7x.vmem_bytes == 64ULL * 1024ULL * 1024ULL && t7x.supports_mosaic, "TPU7X profile");
+        CHECK_TRUE(t7x.mxu_m == 256 && t7x.vmem_bytes == 64ULL * 1024ULL * 1024ULL &&
+                   t7x.supports_mosaic && !t7x.supports_s4_native, "TPU7X profile");
         CHECK_TRUE(!b0.supports_mosaic && b0.lane_align == 64, "BUENOS_A0 hook profile");
         CHECK_TRUE(freetile::detect_chip_target("TPU v5 lite") == freetile::ChipTarget::V5E, "detect v5e");
         CHECK_TRUE(freetile::detect_chip_target("TPU v6e Trillium") == freetile::ChipTarget::V6E, "detect v6e");
