@@ -15836,6 +15836,97 @@ asyncio.run(main())
             backup_srv.shutdown()
             backup_srv.server_close()
 
+    def test_embedded_url_credentials_rejected_and_redacted_in_config_and_check_config(
+        self,
+    ) -> None:
+        for cred_url in (
+            "https://alice:secret@host:8000",
+            "http://alice@127.0.0.1:8000/v1",
+            "https://@host:8000/metrics",
+        ):
+            with self.assertRaises(ValueError) as ctx_b:
+                BackendConfig(id="cred-b", base_url=cred_url)
+            msg_b = str(ctx_b.exception)
+            self.assertIn("embedded url credentials", msg_b.lower())
+            self.assertNotIn("alice", msg_b)
+            self.assertNotIn("secret", msg_b)
+
+            with self.assertRaises(ValueError) as ctx_e:
+                BackendConfig(
+                    id="cred-e",
+                    base_url="http://127.0.0.1:8081/v1",
+                    tpu_exporter_url=cred_url,
+                )
+            msg_e = str(ctx_e.exception)
+            self.assertIn("embedded url credentials", msg_e.lower())
+            self.assertNotIn("alice", msg_e)
+            self.assertNotIn("secret", msg_e)
+
+        bad_cfg_path = Path(self._tmpdir.name) / "embedded_cred_url.json"
+        bad_cfg_path.write_text(
+            json.dumps(
+                {
+                    "backends": [
+                        {
+                            "id": "cred-cli",
+                            "base_url": "https://alice:secret@host:8000",
+                            "models": ["m1"],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        stderr_buf = io.StringIO()
+        with redirect_stderr(stderr_buf):
+            rc = router_main(["--check-config", "--config", str(bad_cfg_path)])
+        self.assertNotEqual(rc, 0)
+        stderr_text = stderr_buf.getvalue()
+        self.assertIn("embedded url credentials", stderr_text.lower())
+        self.assertNotIn("alice", stderr_text)
+        self.assertNotIn("secret", stderr_text)
+
+    def test_tpu_exporter_http_206_partial_content_rejected_for_readiness(self) -> None:
+        partial_metrics = (
+            "freetpu_exporter_up 1\n"
+            "freetpu_tpu_devices_discovered 1\n"
+            'freetpu_tpu_chip_healthy{chip="0"} 1\n'
+            'freetpu_tpu_hbm_utilization_ratio{chip="0"} 0.25\n'
+        ).encode("utf-8")
+
+        class _Partial206ExporterHandler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: Any) -> None:
+                pass
+
+            def do_GET(self) -> None:
+                self.send_response(206)
+                self.send_header("Content-Type", "text/plain; version=0.0.4")
+                self.send_header("Content-Range", f"bytes 0-{len(partial_metrics) - 1}/9999")
+                self.send_header("Content-Length", str(len(partial_metrics)))
+                self.end_headers()
+                self.wfile.write(partial_metrics)
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), _Partial206ExporterHandler)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            telem = scrape_tpu_exporter(
+                f"http://127.0.0.1:{srv.server_address[1]}/metrics",
+                timeout_s=2.0,
+            )
+            self.assertFalse(telem.reachable)
+            self.assertFalse(telem.exporter_up)
+            self.assertEqual(telem.error, "HTTP 206 from tpu-exporter")
+            ready, reason = evaluate_tpu_readiness(
+                telem,
+                max_hbm_utilization=0.95,
+            )
+            self.assertFalse(ready)
+            self.assertEqual(reason, "tpu_exporter_unreachable")
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
 
 def run_self_tests(verbosity: int = 1) -> int:
     """Run all router tests cleanly via unittest."""

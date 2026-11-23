@@ -238,6 +238,11 @@ def validate_http_url(
             f"Invalid {field_name} {sanitize_url(cleaned)!r}: "
             "port out of range 1..65535"
         )
+    if parts.username is not None or parts.password is not None or "@" in parts.netloc:
+        raise ValueError(
+            f"Invalid {field_name} {sanitize_url(cleaned)!r}: "
+            "embedded URL credentials are not supported; configure api_key or api_key_env instead"
+        )
     return cleaned
 
 

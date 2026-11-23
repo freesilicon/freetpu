@@ -1454,7 +1454,7 @@ def scrape_tpu_exporter(
             conn.sock = deadline_sock
         resp = conn.getresponse()
         upstream_sock = deadline_sock if deadline_sock is not None else raw_sock
-        if resp.status < 200 or resp.status >= 300:
+        if resp.status != 200:
             return TpuExporterTelemetry(
                 reachable=False,
                 exporter_up=False,
