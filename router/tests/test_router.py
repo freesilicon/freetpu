@@ -9201,6 +9201,264 @@ asyncio.run(main())
             time.sleep(0.01)
         self.assertEqual(router.engine._req_mem_used_bytes, 0)
 
+    def test_streamed_delta_audio_commits_immediately_and_advances_progress(
+        self,
+    ) -> None:
+        release_rest = threading.Event()
+        recorded_usage: List[UsageEvent] = []
+
+        class _CaptureHook:
+            def record_usage(self, event: UsageEvent) -> None:
+                recorded_usage.append(event)
+
+        class _AudioSSEHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return None
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = json.dumps(
+                    {"object": "list", "data": [{"id": "m-audio"}]}
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802
+                clen = int(self.headers.get("Content-Length", "0"))
+                if clen > 0:
+                    self.rfile.read(clen)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+
+                def _emit(payload: Dict[str, Any]) -> None:
+                    self.wfile.write(
+                        f"data: {json.dumps(payload)}\n\n".encode("utf-8")
+                    )
+                    self.wfile.flush()
+
+                # Role-only preamble followed immediately by first audio-only chunk.
+                _emit(
+                    {
+                        "id": "chatcmpl-audio",
+                        "object": "chat.completion.chunk",
+                        "model": "m-audio",
+                        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                    }
+                )
+                _emit(
+                    {
+                        "id": "chatcmpl-audio",
+                        "object": "chat.completion.chunk",
+                        "model": "m-audio",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"audio": {"id": "aud_1", "data": "A" * 512}},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                )
+                # Wait until client confirms it received the first audio chunk live.
+                release_rest.wait(timeout=3.0)
+                # Stream 10 more audio-only chunks (>5 KiB total, exceeding 4 KiB pre-commit cap,
+                # and spanning >550ms > 450ms request_timeout_s to prove audio advances progress).
+                for idx in range(10):
+                    time.sleep(0.055)
+                    _emit(
+                        {
+                            "id": "chatcmpl-audio",
+                            "object": "chat.completion.chunk",
+                            "model": "m-audio",
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"audio": {"data": f"{idx:02d}" + ("B" * 510)}},
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                    )
+                _emit(
+                    {
+                        "id": "chatcmpl-audio",
+                        "object": "chat.completion.chunk",
+                        "model": "m-audio",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"audio": {"transcript": "spoken audio hello"}},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                    }
+                )
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+
+        srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _AudioSSEHandler))
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            max_sse_pre_commit_bytes=4096,
+            request_timeout_s=0.45,
+            backends=[
+                BackendConfig(
+                    id="audio-b",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=f"http://127.0.0.1:{srv.server_address[1]}/v1",
+                    models=["m-audio"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg, usage_hook=_CaptureHook()))
+        rport = router.server_address[1]
+
+        conn = http.client.HTTPConnection("127.0.0.1", rport, timeout=5.0)
+        try:
+            body = json.dumps(
+                {
+                    "model": "m-audio",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "speak"}],
+                }
+            ).encode("utf-8")
+            conn.request(
+                "POST",
+                "/v1/chat/completions",
+                body=body,
+                headers={"Content-Type": "application/json"},
+            )
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)
+            received = bytearray()
+            # Read until the first audio chunk arrives live BEFORE releasing the rest.
+            while b'"aud_1"' not in received:
+                part = resp.read1(4096)
+                if not part:
+                    break
+                received.extend(part)
+            self.assertIn(b'"aud_1"', received)
+            release_rest.set()
+            received.extend(resp.read())
+        finally:
+            release_rest.set()
+            conn.close()
+
+        self.assertIn(b"spoken audio hello", received)
+        self.assertIn(b"data: [DONE]", received)
+        self.assertEqual(len(recorded_usage), 1)
+        self.assertEqual(recorded_usage[0].status_code, 200)
+        self.assertGreater(recorded_usage[0].completion_tokens, 0)
+        self.assertEqual(router.engine.metrics.total_inflight(), 0)
+        self.assertEqual(router.engine._resp_mem_used_bytes, 0)
+
+    def test_pre_commit_short_keepalive_lines_buffered_contiguously_within_budget(
+        self,
+    ) -> None:
+        keepalive_count_box = [1000]
+
+        class _KeepaliveSSEHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return None
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = json.dumps(
+                    {"object": "list", "data": [{"id": "m-ka-contig"}]}
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802
+                clen = int(self.headers.get("Content-Length", "0"))
+                if clen > 0:
+                    self.rfile.read(clen)
+                body = (
+                    (b":\n\n" * keepalive_count_box[0])
+                    + b'data: {"id":"chatcmpl-ka","object":"chat.completion.chunk","model":"m-ka-contig","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n'
+                    + b"data: [DONE]\n\n"
+                )
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                    self.wfile.flush()
+                except OSError:
+                    pass
+
+        srv = self._track(ThreadingHTTPServer(("127.0.0.1", 0), _KeepaliveSSEHandler))
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        cfg = RouterConfig(
+            host="127.0.0.1",
+            port=0,
+            max_sse_pre_commit_bytes=8192,
+            max_total_response_memory_bytes=4096,
+            backends=[
+                BackendConfig(
+                    id="ka-contig-b",
+                    type="pixel-tpu",
+                    local=True,
+                    base_url=f"http://127.0.0.1:{srv.server_address[1]}/v1",
+                    models=["m-ka-contig"],
+                )
+            ],
+        )
+        router = self._track(create_router_server(cfg))
+        rport = router.server_address[1]
+
+        # 1. 1,000 short keepalive lines (3,000 B + ~180 B output <= 4,096 B budget) succeed cleanly.
+        keepalive_count_box[0] = 1000
+        st_ok, _, bd_ok = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-ka-contig",
+                "stream": True,
+                "messages": [{"role": "user", "content": "ka ok"}],
+            },
+        )
+        self.assertEqual(st_ok, 200)
+        self.assertIn(b"data: [DONE]", bd_ok)
+        self.assertEqual(router.engine._resp_mem_used_bytes, 0)
+
+        # 2. 1,500 short keepalive lines (4,500 B > 4,096 B budget) rejected cleanly with 503.
+        keepalive_count_box[0] = 1500
+        st_over, _, bd_over = _http_request(
+            rport,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "model": "m-ka-contig",
+                "stream": True,
+                "messages": [{"role": "user", "content": "ka over"}],
+            },
+        )
+        self.assertEqual(st_over, 503)
+        self.assertIn(b"server_memory_limit_reached", bd_over)
+        self.assertEqual(router.engine._resp_mem_used_bytes, 0)
+        self.assertTrue(router.engine._backends[0].healthy)
+
 
 def run_self_tests(verbosity: int = 1) -> int:
     """Run all router tests cleanly via unittest."""

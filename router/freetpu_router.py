@@ -707,7 +707,33 @@ def _extract_choice_output_text(obj: Mapping[str, Any]) -> str:
                             fval = fn.get(fk)
                             if isinstance(fval, str) and fval:
                                 parts.append(fval)
+            audio = container.get("audio")
+            if isinstance(audio, dict) or isinstance(audio, Mapping):
+                transcript = audio.get("transcript")
+                if isinstance(transcript, str) and transcript:
+                    parts.append(transcript)
     return "".join(parts)
+
+
+def _has_choice_audio_output(obj: Mapping[str, Any]) -> bool:
+    """Return True when any choice carries generated audio data or transcript."""
+    choices = obj.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return False
+    for choice in choices:
+        if not (isinstance(choice, dict) or isinstance(choice, Mapping)):
+            continue
+        for container_key in ("delta", "message"):
+            container = choice.get(container_key)
+            if not (isinstance(container, dict) or isinstance(container, Mapping)):
+                continue
+            audio = container.get("audio")
+            if isinstance(audio, dict) or isinstance(audio, Mapping):
+                for ak in ("data", "transcript"):
+                    aval = audio.get(ak)
+                    if isinstance(aval, str) and aval:
+                        return True
+    return False
 
 
 _MAX_SAFE_INT_DIGITS = 18
@@ -911,7 +937,7 @@ def _sse_event_should_commit(payload_bytes: bytes) -> bool:
         raise _MalformedSSEPayloadError("Upstream SSE event JSON must be an object")
     if obj.get("error") is not None or obj.get("object") == "error":
         return False
-    if _extract_choice_output_text(obj):
+    if _extract_choice_output_text(obj) or _has_choice_audio_output(obj):
         return True
     choices = obj.get("choices")
     if isinstance(choices, list):
@@ -4024,13 +4050,39 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             available_fn=engine.available_response_memory,
             reserved_out=sse_mem_box,
         )
-        pre_commit_lines: List[bytes] = []
+        pre_commit_buf = bytearray()
         pre_commit_bytes = 0
         max_pre_commit_bytes = engine.config.max_sse_pre_commit_bytes
         first_chunk_time: Optional[float] = None
-        pending_event_data: List[bytes] = []
+        pending_event_start = 0
+        pending_event_has_data = False
         pending_event_type = ""
         pre_commit_deadline = attempt_start + timeout_s
+
+        def _extract_pending_event_payload(end_pos: int) -> bytes:
+            data_parts: List[bytes] = []
+            scan = pending_event_start
+            while scan < end_pos:
+                nl = pre_commit_buf.find(b"\n", scan, end_pos)
+                cr = pre_commit_buf.find(b"\r", scan, end_pos)
+                if nl == -1 and cr == -1:
+                    ln_end = end_pos
+                elif cr != -1 and (nl == -1 or cr < nl):
+                    ln_end = cr + 2 if (cr + 1 < end_pos and pre_commit_buf[cr + 1] == 10) else cr + 1
+                else:
+                    ln_end = nl + 1
+                cline = bytes(pre_commit_buf[scan:ln_end]).rstrip(b"\r\n")
+                if cline.startswith(b"data:"):
+                    dval = cline[5:]
+                    if dval.startswith(b" "):
+                        dval = dval[1:]
+                    data_parts.append(dval)
+                scan = ln_end
+            if not data_parts:
+                return b""
+            if len(data_parts) == 1:
+                return data_parts[0].strip()
+            return b"\n".join(data_parts).strip()
 
         def release_sse_mem(amount: int) -> None:
             if amount <= 0:
@@ -4084,13 +4136,16 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                     # EOF before generated output/terminator -> retryable failure.
                     return "aborted", 502, None
                 pre_commit_bytes += len(line)
-                pre_commit_lines.append(line)
+                pre_commit_buf.extend(line)
                 if line in (b"\n", b"\r\n", b"\r"):
-                    if pending_event_data:
-                        payload_bytes = b"\n".join(pending_event_data).strip()
+                    if pending_event_has_data:
+                        payload_bytes = _extract_pending_event_payload(
+                            len(pre_commit_buf) - len(line)
+                        )
                         ev_type = pending_event_type
-                        pending_event_data.clear()
+                        pending_event_has_data = False
                         pending_event_type = ""
+                        pending_event_start = len(pre_commit_buf)
                         err_info = _classify_sse_error_event(ev_type, payload_bytes)
                         if err_info is not None:
                             is_retryable, err_status, err_body = err_info
@@ -4114,6 +4169,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                             break
                     else:
                         pending_event_type = ""
+                        pending_event_start = len(pre_commit_buf)
                     continue
                 content_line = line.rstrip(b"\r\n")
                 if content_line.startswith(b":"):
@@ -4121,10 +4177,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 if content_line.startswith(b"event:"):
                     pending_event_type = content_line[6:].strip().decode("utf-8", errors="replace")
                 elif content_line.startswith(b"data:"):
-                    data_val = content_line[5:]
-                    if data_val.startswith(b" "):
-                        data_val = data_val[1:]
-                    pending_event_data.append(data_val)
+                    pending_event_has_data = True
 
             # Phase 2: upstream delivered output or valid terminator -> commit chunked response.
             # Downstream write errors from here on must never trigger backend failover.
@@ -4212,11 +4265,13 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                             else:
                                 finished_choice_indices.add(len(finished_choice_indices))
                 output_txt = _extract_choice_output_text(obj)
-                if output_txt:
+                has_audio_out = _has_choice_audio_output(obj)
+                if output_txt or has_audio_out:
                     made_progress = True
                     if first_content_ttft_ms is None:
                         first_content_ttft_ms = (time.monotonic() - req_start) * 1000.0
-                    est_completion_chars += len(output_txt)
+                    if output_txt:
+                        est_completion_chars += len(output_txt)
                 usage = obj.get("usage")
                 if isinstance(usage, dict):
                     pt = _safe_nonneg_int(usage.get("prompt_tokens"))
@@ -4281,13 +4336,13 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 str(getattr(self, "request_version", "HTTP/1.1"))
             )
 
-            def write_chunk(data: bytes) -> None:
+            def write_chunk(data: bytes | bytearray | memoryview) -> None:
                 if not data:
                     return
                 if use_chunked_downstream:
-                    self.connection.sendall(
-                        f"{len(data):x}\r\n".encode("ascii") + data + b"\r\n"
-                    )
+                    self.connection.sendall(f"{len(data):x}\r\n".encode("ascii"))
+                    self.connection.sendall(data)
+                    self.connection.sendall(b"\r\n")
                 else:
                     self.connection.sendall(data)
 
@@ -4312,15 +4367,30 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 self.send_header("X-FreeTPU-Request-Id", req_id)
                 self.end_headers()
 
-                for buffered in pre_commit_lines:
-                    inspect_sse_line(buffered)
-                write_chunk(b"".join(pre_commit_lines))
+                scan = 0
+                pre_len = len(pre_commit_buf)
+                while scan < pre_len:
+                    nl = pre_commit_buf.find(b"\n", scan, pre_len)
+                    cr = pre_commit_buf.find(b"\r", scan, pre_len)
+                    if nl == -1 and cr == -1:
+                        ln_end = pre_len
+                    elif cr != -1 and (nl == -1 or cr < nl):
+                        ln_end = (
+                            cr + 2
+                            if (cr + 1 < pre_len and pre_commit_buf[cr + 1] == 10)
+                            else cr + 1
+                        )
+                    else:
+                        ln_end = nl + 1
+                    inspect_sse_line(bytes(pre_commit_buf[scan:ln_end]))
+                    scan = ln_end
+                write_chunk(pre_commit_buf)
             except (BrokenPipeError, ConnectionResetError, OSError):
                 downstream_write_error = True
             finally:
                 # Immediately drop pre-commit buffer and release its shared memory reservation.
                 flushed_pre_bytes = pre_commit_bytes
-                pre_commit_lines.clear()
+                pre_commit_buf.clear()
                 pre_commit_bytes = 0
                 release_sse_mem(flushed_pre_bytes)
 
@@ -4640,7 +4710,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
 
             return "committed", recorded_status, None
         finally:
-            pre_commit_lines.clear()
+            pre_commit_buf.clear()
             if sse_mem_box[0] > 0:
                 engine.release_response_memory(sse_mem_box[0])
                 sse_mem_box[0] = 0
