@@ -153,8 +153,15 @@ std::string format_mlir_tensor_type(PjrtDType dtype, const std::vector<int64_t>&
 // Continuous Batching Padded Buckets & Safe Dataflow Token-Axis Propagation
 // =========================================================================
 
+// Maximum supported batch bucket token count (prevents oversized/overflowing host padding buffers).
+constexpr int64_t kMaxBatchBucketTokens = 131072;
+
+// Overflow-checked byte count for a 4D dense tensor: dims[0]*dims[1]*dims[2]*dims[3]*elem_bytes.
+// Returns false on null pointers, elem_bytes == 0, negative dims, or size_t multiplication overflow.
+bool checked_tensor_nbytes(const int64_t dims[4], size_t elem_bytes, size_t* out_bytes);
+
 // Parses CLOUDTPU_BATCH_BUCKETS (default "1,2,4,8,16,32,64,128,256,512", sorted unique
-// positive ints; "0" or "" disables bucketing and returns an empty vector).
+// positive ints <= kMaxBatchBucketTokens; "0" or "" disables bucketing and returns an empty vector).
 std::vector<int64_t> parse_batch_buckets(const char* env_val);
 
 // Returns smallest bucket B >= n_tokens if 1 <= n_tokens <= buckets.back(), else 0.

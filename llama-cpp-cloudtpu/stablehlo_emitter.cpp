@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -1953,6 +1954,33 @@ EmittedProgram emit_stablehlo_program(const GraphProgramSpec& spec) {
     return prog;
 }
 
+bool checked_tensor_nbytes(const int64_t dims[4], size_t elem_bytes, size_t* out_bytes) {
+    if (!dims || !out_bytes || elem_bytes == 0) {
+        return false;
+    }
+    size_t acc = elem_bytes;
+    for (int d = 0; d < 4; ++d) {
+        if (dims[d] < 0) {
+            return false;
+        }
+        const uint64_t udim = static_cast<uint64_t>(dims[d]);
+        if (udim > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+            return false;
+        }
+        const size_t sdim = static_cast<size_t>(udim);
+        if (sdim == 0) {
+            *out_bytes = 0;
+            return true;
+        }
+        if (acc > std::numeric_limits<size_t>::max() / sdim) {
+            return false;
+        }
+        acc *= sdim;
+    }
+    *out_bytes = acc;
+    return true;
+}
+
 std::vector<int64_t> parse_batch_buckets(const char* env_val) {
     if (env_val == nullptr) {
         return {1, 2, 4, 8, 16, 32, 64, 128, 256, 512};
@@ -1981,8 +2009,10 @@ std::vector<int64_t> parse_batch_buckets(const char* env_val) {
         if (sep > pos) {
             const std::string tok = trimmed.substr(pos, sep - pos);
             char* endptr = nullptr;
+            errno = 0;
             const long long val = std::strtoll(tok.c_str(), &endptr, 10);
-            if (endptr != tok.c_str() && *endptr == '\0' && val > 0) {
+            if (errno == 0 && endptr != tok.c_str() && *endptr == '\0' &&
+                val > 0 && val <= static_cast<long long>(kMaxBatchBucketTokens)) {
                 buckets.push_back(static_cast<int64_t>(val));
             }
         }
@@ -2119,6 +2149,9 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
     };
     if (orig_tokens < 1 || bucket_tokens <= orig_tokens) {
         return fail_with("invalid_tokens");
+    }
+    if (bucket_tokens > kMaxBatchBucketTokens) {
+        return fail_with("bucket_tokens_too_large");
     }
 
     struct ValInfo {
@@ -2858,6 +2891,15 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
             if (!vi.is_dense || vi.is_donated || vi.sharding != TensorShardingKind::REPLICATED || !dim_ok) {
                 return fail_with("input_validation_failed");
             }
+            const size_t elem_sz = pjrt_dtype_size(vi.dtype);
+            int64_t pdims[4] = {vi.dims[0], vi.dims[1], vi.dims[2], vi.dims[3]};
+            pdims[vi.ax] = bucket_tokens;
+            size_t orig_b = 0, padded_b = 0;
+            if (!checked_tensor_nbytes(vi.dims, elem_sz, &orig_b) ||
+                !checked_tensor_nbytes(pdims, elem_sz, &padded_b) ||
+                padded_b < orig_b) {
+                return fail_with("padded_size_overflow");
+            }
             out.input_token_axis[i] = vi.ax;
             out.input_pad_kind[i] = (vi.pad == TokenInputPadKind::NONE) ? TokenInputPadKind::ZERO : vi.pad;
         } else if (vi.pad == TokenInputPadKind::NEG_ONE) {
@@ -2877,7 +2919,19 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
         if (!lookup_idx(spec.output_ids[i], &idx)) {
             return fail_with("missing_output_id");
         }
-        out.output_token_axis[i] = vals[idx].ax;
+        const ValInfo& vo = vals[idx];
+        if (vo.ax >= 0) {
+            const size_t elem_sz = pjrt_dtype_size(vo.dtype);
+            int64_t pdims[4] = {vo.dims[0], vo.dims[1], vo.dims[2], vo.dims[3]};
+            pdims[vo.ax] = bucket_tokens;
+            size_t orig_b = 0, padded_b = 0;
+            if (!checked_tensor_nbytes(vo.dims, elem_sz, &orig_b) ||
+                !checked_tensor_nbytes(pdims, elem_sz, &padded_b) ||
+                padded_b < orig_b) {
+                return fail_with("padded_size_overflow");
+            }
+        }
+        out.output_token_axis[i] = vo.ax;
     }
 
     if (max_id <= 1048576ULL) {
@@ -2968,6 +3022,12 @@ void pad_dense_host_tensor(const void* src,
             throw std::invalid_argument("pad_dense_host_tensor: non-token dim mismatch");
         }
     }
+    size_t orig_total_bytes = 0, padded_total_bytes = 0;
+    if (!checked_tensor_nbytes(orig_dims, elem_bytes, &orig_total_bytes) ||
+        !checked_tensor_nbytes(padded_dims, elem_bytes, &padded_total_bytes) ||
+        padded_total_bytes < orig_total_bytes) {
+        throw std::overflow_error("pad_dense_host_tensor: tensor byte size overflow");
+    }
     size_t outer = 1;
     for (int d = 0; d < token_axis; ++d) {
         outer *= static_cast<size_t>(orig_dims[d]);
@@ -3033,6 +3093,12 @@ void slice_dense_host_tensor(const void* src,
         if (d != token_axis && padded_dims[d] != logical_dims[d]) {
             throw std::invalid_argument("slice_dense_host_tensor: non-token dim mismatch");
         }
+    }
+    size_t padded_total_bytes = 0, logical_total_bytes = 0;
+    if (!checked_tensor_nbytes(padded_dims, elem_bytes, &padded_total_bytes) ||
+        !checked_tensor_nbytes(logical_dims, elem_bytes, &logical_total_bytes) ||
+        padded_total_bytes < logical_total_bytes) {
+        throw std::overflow_error("slice_dense_host_tensor: tensor byte size overflow");
     }
     size_t outer = 1;
     for (int d = 0; d < token_axis; ++d) {

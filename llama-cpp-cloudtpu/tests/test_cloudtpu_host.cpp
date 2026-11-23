@@ -4904,8 +4904,58 @@ void test_continuous_batching_padded_buckets() {
                    "ALiBi SOFT_MAX with token axis on ax==2 (fixed heads) must bucket cleanly");
     }
 
+    // 6) Oversized CLOUDTPU_BATCH_BUCKETS rejection & overflow-checked padded tensor byte sizing
+    {
+        const std::vector<int64_t> parsed = cloudtpu::parse_batch_buckets(
+            "1,8,131072,131073,99999999999999999999999,-4,0,abc");
+        const std::vector<int64_t> expected = {1, 8, cloudtpu::kMaxBatchBucketTokens};
+        CHECK_TRUE(parsed == expected,
+                   "parse_batch_buckets must reject entries > kMaxBatchBucketTokens, ERANGE, <=0, and invalid tokens");
+
+        size_t nb = 0;
+        const int64_t ok_dims[4] = {1, 4, 8, 64};
+        CHECK_TRUE(cloudtpu::checked_tensor_nbytes(ok_dims, 4, &nb) && nb == 8192U,
+                   "checked_tensor_nbytes valid shape");
+        const int64_t neg_dims[4] = {1, -2, 8, 64};
+        CHECK_TRUE(!cloudtpu::checked_tensor_nbytes(neg_dims, 4, &nb),
+                   "checked_tensor_nbytes rejects negative dims");
+        CHECK_TRUE(!cloudtpu::checked_tensor_nbytes(ok_dims, 0, &nb),
+                   "checked_tensor_nbytes rejects zero elem_bytes");
+        const int64_t ovf_dims[4] = {1LL << 30, 1LL << 30, 16, 1};
+        CHECK_TRUE(!cloudtpu::checked_tensor_nbytes(ovf_dims, 4, &nb),
+                   "checked_tensor_nbytes rejects size_t multiplication overflow");
+
+        cloudtpu::GraphProgramSpec ov_spec;
+        ov_spec.inputs.push_back({1, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 5, 16}});
+        ov_spec.inputs.push_back({2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 16, 16}});
+        cloudtpu::OpNodeSpec mm;
+        mm.kind = cloudtpu::CloudOpKind::MUL_MAT;
+        mm.src_ids = {2, 1};
+        mm.dst = {3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 5, 16}};
+        ov_spec.ops.push_back(mm);
+        ov_spec.output_ids = {3};
+        const auto too_big = cloudtpu::analyze_program_token_axes(ov_spec, 5, cloudtpu::kMaxBatchBucketTokens + 1);
+        CHECK_TRUE(!too_big.success && too_big.fail_reason == "bucket_tokens_too_large",
+                   "analyze_program_token_axes must reject bucket_tokens > kMaxBatchBucketTokens");
+
+        cloudtpu::GraphProgramSpec ov_mm_spec;
+        ov_mm_spec.inputs.push_back(
+            {1, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1LL << 26, 1LL << 26, 5, 16}});
+        ov_mm_spec.inputs.push_back(
+            {2, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1, 1, 16, 16}});
+        cloudtpu::OpNodeSpec ov_mm;
+        ov_mm.kind = cloudtpu::CloudOpKind::MUL_MAT;
+        ov_mm.src_ids = {2, 1};
+        ov_mm.dst = {3, cloudtpu::PjrtDType::F32, cloudtpu::TensorStorageKind::DENSE, {1LL << 26, 1LL << 26, 5, 16}};
+        ov_mm_spec.ops.push_back(ov_mm);
+        ov_mm_spec.output_ids = {3};
+        const auto ov_plan = cloudtpu::analyze_program_token_axes(ov_mm_spec, 5, 8192);
+        CHECK_TRUE(!ov_plan.success && ov_plan.fail_reason == "padded_size_overflow",
+                   "analyze_program_token_axes must fail closed on padded tensor byte overflow");
+    }
+
     rt.shutdown();
-    std::printf("  [PASS] Continuous batching padded buckets (T=5..8 -> B=8 + N_out<T + mixed_embd + reshaped SET_ROWS + ALiBi guard: misses=1, hits=3, parity < 1e-4, 0 KV corruption)\n");
+    std::printf("  [PASS] Continuous batching padded buckets (T=5..8 -> B=8 + N_out<T + mixed_embd + reshaped SET_ROWS + ALiBi + overflow guards: misses=1, hits=3, parity < 1e-4, 0 KV corruption)\n");
 }
 
 #ifdef CLOUDTPU_HAS_GGML

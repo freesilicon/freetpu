@@ -1639,11 +1639,12 @@ static void download_slot_to_host(cloudtpu::PjrtRuntime& rt,
     } else if (slot.hbm_token_axis >= 0 && slot.hbm_token_axis < 4 &&
                slot.hbm_dims[slot.hbm_token_axis] > slot.dims[slot.hbm_token_axis] &&
                slot.storage == cloudtpu::TensorStorageKind::DENSE) {
-        const size_t hbm_nelems =
-            static_cast<size_t>(slot.hbm_dims[0]) * static_cast<size_t>(slot.hbm_dims[1]) *
-            static_cast<size_t>(slot.hbm_dims[2]) * static_cast<size_t>(slot.hbm_dims[3]);
         const size_t elem_sz = cloudtpu::pjrt_dtype_size(slot.dtype);
-        const size_t hbm_bytes = hbm_nelems * elem_sz;
+        size_t hbm_bytes = 0;
+        if (!cloudtpu::checked_tensor_nbytes(slot.hbm_dims, elem_sz, &hbm_bytes) ||
+            hbm_bytes < slot.nbytes) {
+            throw std::overflow_error("ggml-cloudtpu: padded HBM slot byte size overflow");
+        }
         std::vector<uint8_t> hbm_tmp(hbm_bytes);
         download_sharded_part(rt, slot.sharding, slot.hbm_primary, hbm_tmp.data(), hbm_bytes);
         cloudtpu::slice_dense_host_tensor(
@@ -3303,13 +3304,20 @@ static void upload_padded_token_input(cloudtpu::PjrtRuntime& rt,
         throw std::runtime_error("ggml-cloudtpu: unsupported padded token input '" + std::string(t->name) + "'");
     }
     const int64_t orig_dims[4] = {t->ne[3], t->ne[2], t->ne[1], t->ne[0]};
+    if (bucket_tokens < orig_dims[token_axis] || bucket_tokens > cloudtpu::kMaxBatchBucketTokens) {
+        throw std::overflow_error("ggml-cloudtpu: invalid or oversized padded bucket for '" +
+                                  std::string(t->name) + "'");
+    }
     int64_t padded_dims[4] = {orig_dims[0], orig_dims[1], orig_dims[2], orig_dims[3]};
     padded_dims[token_axis] = bucket_tokens;
     const std::vector<int64_t> padded_vec = {padded_dims[0], padded_dims[1], padded_dims[2], padded_dims[3]};
     const size_t t_bytes = ggml_nbytes(t);
-    const size_t padded_elems = static_cast<size_t>(padded_dims[0]) * static_cast<size_t>(padded_dims[1]) *
-                                static_cast<size_t>(padded_dims[2]) * static_cast<size_t>(padded_dims[3]);
-    const size_t padded_bytes = padded_elems * cloudtpu::pjrt_dtype_size(pdt);
+    size_t padded_bytes = 0;
+    if (!cloudtpu::checked_tensor_nbytes(padded_dims, cloudtpu::pjrt_dtype_size(pdt), &padded_bytes) ||
+        padded_bytes < t_bytes) {
+        throw std::overflow_error("ggml-cloudtpu: padded host buffer byte size overflow for '" +
+                                  std::string(t->name) + "'");
+    }
 
     out.sharding = cloudtpu::TensorShardingKind::REPLICATED;
     out.scales.clear();
@@ -3460,11 +3468,15 @@ static void copy_output_buffer_to_host_ptr(cloudtpu::PjrtRuntime& rt,
     if (out_token_axis >= 0 && out_token_axis < 4 && buf && buf->dims.size() == 4 &&
         buf->dims[static_cast<size_t>(out_token_axis)] > t->ne[3 - out_token_axis]) {
         const size_t elem_sz = ggml_type_size(t->type);
-        const size_t hbm_bytes = buf->num_elements() * elem_sz;
-        std::vector<uint8_t> hbm_tmp(hbm_bytes);
-        rt.buffer_to_host(buf->handle.get(), hbm_tmp.data(), hbm_bytes);
         const int64_t logical_dims[4] = {t->ne[3], t->ne[2], t->ne[1], t->ne[0]};
         const int64_t padded_dims[4] = {buf->dims[0], buf->dims[1], buf->dims[2], buf->dims[3]};
+        size_t hbm_bytes = 0;
+        if (!cloudtpu::checked_tensor_nbytes(padded_dims, elem_sz, &hbm_bytes) ||
+            hbm_bytes < ggml_nbytes(t)) {
+            throw std::overflow_error("ggml-cloudtpu: padded output buffer byte size overflow");
+        }
+        std::vector<uint8_t> hbm_tmp(hbm_bytes);
+        rt.buffer_to_host(buf->handle.get(), hbm_tmp.data(), hbm_bytes);
         cloudtpu::slice_dense_host_tensor(
             hbm_tmp.data(), dst, elem_sz, padded_dims, logical_dims, out_token_axis);
     } else {
