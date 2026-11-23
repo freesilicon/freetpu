@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 import ipaddress
 import json
 import math
@@ -34,6 +34,11 @@ DEFAULT_MAX_SSE_PRE_COMMIT_BYTES = 1024 * 1024
 
 def _has_control_chars(value: str) -> bool:
     return any(ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F for ch in value)
+
+
+def _has_invalid_request_target_chars(value: str) -> bool:
+    """Return True if a URL path/query contains whitespace, control, or non-ASCII chars."""
+    return any(ord(ch) <= 0x20 or ord(ch) >= 0x7F for ch in value)
 
 
 def _validate_credential_string(
@@ -133,7 +138,11 @@ def sanitize_url(url: str) -> str:
     `@`, whitespace, or missing `://`) can never leak into diagnostics.
     """
     cleaned = url.strip()
-    if "://" not in cleaned or any(ch.isspace() for ch in cleaned):
+    if (
+        "://" not in cleaned
+        or any(ch.isspace() for ch in cleaned)
+        or _has_control_chars(cleaned)
+    ):
         return "<redacted invalid URL>"
     try:
         parts = urlsplit(cleaned)
@@ -243,6 +252,16 @@ def validate_http_url(
             f"Invalid {field_name} {sanitize_url(cleaned)!r}: "
             "embedded URL credentials are not supported; configure api_key or api_key_env instead"
         )
+    if (
+        any(ord(ch) <= 0x20 or ord(ch) == 0x7F for ch in cleaned)
+        or _has_invalid_request_target_chars(parts.path)
+        or (allow_query and _has_invalid_request_target_chars(parts.query))
+    ):
+        raise ValueError(
+            f"Invalid {field_name} {sanitize_url(cleaned)!r}: "
+            "URL path/query contains whitespace, control, or non-ASCII characters; "
+            "percent-encode spaces (for example '%20')"
+        )
     return cleaned
 
 
@@ -311,6 +330,19 @@ class BackendConfig:
                 allow_query=True,
             )
         ctx = f"Backend {self.id!r}"
+        if self.health_path is not None:
+            if not isinstance(self.health_path, str):
+                raise ValueError(f"{ctx} field 'health_path' must be a string")
+            cleaned_hp = self.health_path.strip()
+            if not cleaned_hp:
+                self.health_path = None
+            else:
+                if _has_invalid_request_target_chars(cleaned_hp):
+                    raise ValueError(
+                        f"{ctx} field 'health_path' contains whitespace, control, or "
+                        "non-ASCII characters; percent-encode spaces (for example '%20')"
+                    )
+                self.health_path = cleaned_hp
         if not isinstance(self.models, list) or not all(
             isinstance(m, str) for m in self.models
         ):
@@ -607,14 +639,16 @@ class RouterConfig:
     cors_allowed_origins: List[str] = field(default_factory=list)
     public_origin: Optional[str] = None
     trust_proxy_headers: bool = False
+    allow_unauthenticated_network: bool = False
     auth: Dict[str, Any] = field(default_factory=dict)
     usage_meter: Dict[str, Any] = field(default_factory=dict)
     scaler: Dict[str, Any] = field(default_factory=dict)
+    _defer_network_auth_check: InitVar[bool] = False
 
-    def __post_init__(self) -> None:
-        self.validate()
+    def __post_init__(self, _defer_network_auth_check: bool = False) -> None:
+        self.validate(check_network_auth=not _defer_network_auth_check)
 
-    def validate(self) -> None:
+    def validate(self, *, check_network_auth: bool = True) -> None:
         if self.policy not in VALID_POLICIES:
             raise ValueError(
                 f"Invalid routing policy {self.policy!r}; expected one of {VALID_POLICIES}"
@@ -717,6 +751,11 @@ class RouterConfig:
         if not isinstance(self.trust_proxy_headers, bool):
             raise ValueError(
                 f"trust_proxy_headers must be a boolean, got {self.trust_proxy_headers!r}"
+            )
+        if not isinstance(self.allow_unauthenticated_network, bool):
+            raise ValueError(
+                "allow_unauthenticated_network must be a boolean, "
+                f"got {self.allow_unauthenticated_network!r}"
             )
         if self.public_origin is not None:
             if not isinstance(self.public_origin, str) or normalize_origin(self.public_origin) is None:
@@ -830,6 +869,22 @@ class RouterConfig:
                     f"Bearer auth settings {misplaced!r} require auth.type='bearer'"
                 )
 
+        if check_network_auth:
+            auth_is_allow_all = (auth_spec is None) and (
+                auth_type is None or auth_type == "allow_all"
+            )
+            if (
+                not is_loopback_host(self.host)
+                and auth_is_allow_all
+                and not self.allow_unauthenticated_network
+            ):
+                raise ValueError(
+                    f"Refusing to bind unauthenticated router on non-loopback host {self.host!r} "
+                    "with auth.type='allow_all'; configure auth.type='bearer' "
+                    "(--bearer-token-env / custom auth.hook) or explicitly opt in with "
+                    "allow_unauthenticated_network=true (--allow-unauthenticated-network)"
+                )
+
         if not isinstance(self.usage_meter, Mapping):
             raise ValueError("'usage_meter' must be a JSON object")
         usage_spec = self.usage_meter.get("hook")
@@ -885,7 +940,12 @@ class RouterConfig:
                 )
 
     @classmethod
-    def from_dict(cls, raw: Mapping[str, Any]) -> "RouterConfig":
+    def from_dict(
+        cls,
+        raw: Mapping[str, Any],
+        *,
+        defer_network_auth_check: bool = False,
+    ) -> "RouterConfig":
         raw_backends_val = raw.get("backends")
         if raw_backends_val is None:
             raw_backends: Sequence[Any] = []
@@ -1038,16 +1098,27 @@ class RouterConfig:
             trust_proxy_headers=_require_bool(
                 raw, "trust_proxy_headers", False, context="RouterConfig"
             ),
+            allow_unauthenticated_network=_require_bool(
+                raw, "allow_unauthenticated_network", False, context="RouterConfig"
+            ),
             auth=dict(raw_auth or {}),
             usage_meter=dict(raw_usage_meter or {}),
             scaler=dict(raw_scaler or {}),
+            _defer_network_auth_check=defer_network_auth_check,
         )
 
 
-def load_config(path: Path | str) -> RouterConfig:
+def load_config(
+    path: Path | str,
+    *,
+    defer_network_auth_check: bool = False,
+) -> RouterConfig:
     """Load and validate a `RouterConfig` from a JSON file."""
     cfg_path = Path(path)
     data = json.loads(cfg_path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError(f"Expected JSON object in {cfg_path}")
-    return RouterConfig.from_dict(data)
+    return RouterConfig.from_dict(
+        data,
+        defer_network_auth_check=defer_network_auth_check,
+    )

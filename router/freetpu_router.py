@@ -3006,6 +3006,7 @@ class _SSEReactorTask:
         "saw_done_sentinel",
         "upstream_read_error",
         "downstream_write_error",
+        "downstream_framing_broken",
         "size_limit_exceeded",
         "memory_limit_exceeded",
         "eof",
@@ -3079,6 +3080,7 @@ class _SSEReactorTask:
         self.saw_done_sentinel = False
         self.upstream_read_error = False
         self.downstream_write_error = False
+        self.downstream_framing_broken = False
         self.size_limit_exceeded = False
         self.memory_limit_exceeded = False
         self.eof = False
@@ -3259,6 +3261,7 @@ class _SSEReactor:
                 pass
             task.client_nonblocking_set = False
         if task.write_buf:
+            task.downstream_framing_broken = True
             rem = len(task.write_buf)
             task.write_buf.clear()
             self._release_mem(task, rem)
@@ -3280,6 +3283,7 @@ class _SSEReactor:
         if not framed:
             return True
         remaining: bytes
+        wrote_partial = False
         if not task.write_buf:
             try:
                 sent = task.client_sock.send(framed)
@@ -3297,6 +3301,7 @@ class _SSEReactor:
                     return False
                 if sent >= len(framed):
                     return True
+                wrote_partial = True
                 remaining = framed[sent:]
         else:
             remaining = framed
@@ -3306,7 +3311,10 @@ class _SSEReactor:
             task.downstream_write_error = True
             return False
         if not task.engine.try_reserve_response_memory(rem_len):
-            task.downstream_write_error = True
+            task.memory_limit_exceeded = True
+            task.upstream_done = True
+            if wrote_partial or task.write_buf:
+                task.downstream_framing_broken = True
             return False
         task.sse_mem_box[0] += rem_len
         was_empty = not task.write_buf
@@ -5802,6 +5810,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
             size_limit_exceeded = False
             memory_limit_exceeded = False
             downstream_write_error = False
+            downstream_framing_broken = False
             event_data_lines: List[bytes] = []
             current_event_type = ""
             required_choices = max(1, expected_choices)
@@ -6452,6 +6461,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                         saw_done_sentinel = task.saw_done_sentinel
                         upstream_read_error = task.upstream_read_error
                         downstream_write_error = task.downstream_write_error
+                        downstream_framing_broken = task.downstream_framing_broken
                         size_limit_exceeded = task.size_limit_exceeded
                         memory_limit_exceeded = task.memory_limit_exceeded
                 if not use_reactor and not memory_limit_exceeded and not downstream_write_error:
@@ -6708,7 +6718,7 @@ class _RouterRequestHandler(BaseHTTPRequestHandler):
                 status_code=recorded_status,
             )
 
-            if not downstream_write_error:
+            if not downstream_write_error and not downstream_framing_broken:
                 try:
                     if stream_memory_exceeded:
                         err_event = (
@@ -6761,6 +6771,10 @@ def create_router_server(
     verbose: bool = False,
 ) -> FreeTPURouterServer:
     """Create a configured `FreeTPURouterServer` ready to call `.serve_forever()`."""
+    has_explicit_auth = auth_hook is not None and not isinstance(
+        auth_hook, AllowAllAuthHook
+    )
+    config.validate(check_network_auth=not has_explicit_auth)
     engine = RouterEngine(
         config,
         auth_hook=auth_hook,
@@ -6799,6 +6813,14 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         help=(
             "Environment variable name holding a bearer token required on API "
             "requests (repeatable; avoids exposing live tokens in process argv)."
+        ),
+    )
+    parser.add_argument(
+        "--allow-unauthenticated-network",
+        action="store_true",
+        help=(
+            "Explicitly permit binding outside loopback with auth.type='allow_all' "
+            "(dangerous on shared networks; prefer --bearer-token-env)."
         ),
     )
     parser.add_argument(
@@ -6852,6 +6874,8 @@ def _apply_cli_overrides(cfg: RouterConfig, args: argparse.Namespace) -> None:
         if "exempt_paths" in existing_auth:
             new_auth["exempt_paths"] = existing_auth["exempt_paths"]
         cfg.auth = new_auth
+    if getattr(args, "allow_unauthenticated_network", False):
+        cfg.allow_unauthenticated_network = True
     if args.cors_origins:
         cfg.cors_allowed_origins = list(args.cors_origins)
     if args.usage_jsonl:
@@ -6879,7 +6903,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.error("--config is required unless --self-test is passed")
 
     try:
-        cfg = load_config(args.config)
+        cfg = load_config(args.config, defer_network_auth_check=True)
         _apply_cli_overrides(cfg, args)
         cfg.validate()
         if args.check_config:

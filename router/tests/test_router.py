@@ -4974,7 +4974,8 @@ class TestFreeTPURouter(unittest.TestCase):
                                 b"HTTP/1.1 200 OK\r\n"
                                 b"Content-Type: text/event-stream; charset=utf-8\r\n"
                                 b"Transfer-Encoding: chunked\r\n"
-                                b"Connection: close\r\n\r\n"
+                                b"Connection: close\r\n"
+                                b"\r\n"  # terminate HTTP response headers
                             )
                             if send_first_token:
                                 sock.sendall(
@@ -12840,6 +12841,7 @@ asyncio.run(main())
         cfg = RouterConfig(
             host="::",
             port=8080,
+            allow_unauthenticated_network=True,
             backends=[
                 BackendConfig(
                     id="b-dual",
@@ -15951,6 +15953,367 @@ asyncio.run(main())
         lines = jsonl_path.read_text(encoding="utf-8").splitlines()
         self.assertEqual(len(lines), 1)
         self.assertEqual(json.loads(lines[0])["principal"], "alice")
+
+    def test_non_loopback_bind_requires_auth_or_explicit_opt_in(self) -> None:
+        base_backend = BackendConfig(
+            id="b-net",
+            type="pixel-tpu",
+            local=True,
+            base_url="http://127.0.0.1:8081/v1",
+            models=["m1"],
+        )
+        # 1. Non-loopback host with allow_all (default) fails RouterConfig validation.
+        with self.assertRaises(ValueError) as ctx_def:
+            RouterConfig(host="0.0.0.0", port=0, backends=[base_backend])
+        self.assertIn("allow_unauthenticated_network", str(ctx_def.exception))
+
+        # 2. Succeeds with bearer auth OR explicit allow_unauthenticated_network=True.
+        cfg_auth = RouterConfig(
+            host="0.0.0.0",
+            port=0,
+            backends=[base_backend],
+            auth={"type": "bearer", "tokens": ["tok-net-1"]},
+        )
+        self.assertEqual(cfg_auth.host, "0.0.0.0")
+        cfg_optin = RouterConfig(
+            host="0.0.0.0",
+            port=0,
+            backends=[base_backend],
+            allow_unauthenticated_network=True,
+        )
+        self.assertTrue(cfg_optin.allow_unauthenticated_network)
+
+        # 3. CLI --check-config with --host 0.0.0.0 fails by default, succeeds with
+        #    --bearer-token-env or --allow-unauthenticated-network.
+        cfg_path = Path(self._tmpdir.name) / "loopback_hybrid.json"
+        cfg_path.write_text(
+            json.dumps(
+                {
+                    "host": "127.0.0.1",
+                    "port": 8080,
+                    "auth": {"type": "allow_all"},
+                    "backends": [
+                        {
+                            "id": "b-net",
+                            "base_url": "http://127.0.0.1:8081/v1",
+                            "models": ["m1"],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        err_buf = io.StringIO()
+        with redirect_stderr(err_buf):
+            rc_fail = router_main(
+                ["--check-config", "--config", str(cfg_path), "--host", "0.0.0.0"]
+            )
+        self.assertNotEqual(rc_fail, 0)
+        self.assertIn("allow_unauthenticated_network", err_buf.getvalue())
+
+        with mock.patch.dict(os.environ, {"FREETPU_NET_TEST_TOK": "net-secret-tok"}):
+            rc_bearer = router_main(
+                [
+                    "--check-config",
+                    "--config",
+                    str(cfg_path),
+                    "--host",
+                    "0.0.0.0",
+                    "--bearer-token-env",
+                    "FREETPU_NET_TEST_TOK",
+                ]
+            )
+        self.assertEqual(rc_bearer, 0)
+
+        rc_optin = router_main(
+            [
+                "--check-config",
+                "--config",
+                str(cfg_path),
+                "--host",
+                "0.0.0.0",
+                "--allow-unauthenticated-network",
+            ]
+        )
+        self.assertEqual(rc_optin, 0)
+
+        # 4. Config file already specifying 0.0.0.0 + allow_all can still be secured via CLI.
+        net_cfg_path = Path(self._tmpdir.name) / "non_loopback_allow_all.json"
+        net_cfg_path.write_text(
+            json.dumps(
+                {
+                    "host": "0.0.0.0",
+                    "port": 8080,
+                    "auth": {"type": "allow_all"},
+                    "backends": [
+                        {
+                            "id": "b-net",
+                            "base_url": "http://127.0.0.1:8081/v1",
+                            "models": ["m1"],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        err_buf2 = io.StringIO()
+        with redirect_stderr(err_buf2):
+            rc_net_fail = router_main(["--check-config", "--config", str(net_cfg_path)])
+        self.assertNotEqual(rc_net_fail, 0)
+        with mock.patch.dict(os.environ, {"FREETPU_NET_TEST_TOK": "net-secret-tok"}):
+            rc_net_bearer = router_main(
+                [
+                    "--check-config",
+                    "--config",
+                    str(net_cfg_path),
+                    "--bearer-token-env",
+                    "FREETPU_NET_TEST_TOK",
+                ]
+            )
+        self.assertEqual(rc_net_bearer, 0)
+
+    def test_backend_url_and_health_path_reject_unescaped_spaces_and_control_chars(
+        self,
+    ) -> None:
+        # Unescaped space and control chars rejected with percent-encode guidance.
+        for bad_url in (
+            "http://127.0.0.1:8000/v1/my model",
+            "http://127.0.0.1:8000/v1/my\tmodel",
+            "http://127.0.0.1:8000/v1/my\nmodel",
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                BackendConfig(id="space-b", base_url=bad_url)
+            self.assertIn("percent-encode", str(ctx.exception).lower())
+
+        with self.assertRaises(ValueError) as ctx_hp:
+            BackendConfig(
+                id="space-hp",
+                base_url="http://127.0.0.1:8000/v1",
+                health_path="/my health",
+            )
+        self.assertIn("percent-encode", str(ctx_hp.exception).lower())
+
+        # Percent-encoded space is accepted cleanly.
+        ok_cfg = BackendConfig(
+            id="enc-b",
+            base_url="http://127.0.0.1:8000/v1/my%20model",
+            health_path="/my%20health",
+            models=["m1"],
+        )
+        self.assertEqual(ok_cfg.base_url, "http://127.0.0.1:8000/v1/my%20model")
+        self.assertEqual(ok_cfg.health_path, "/my%20health")
+
+        # --check-config also rejects unescaped space in base_url.
+        bad_cfg_path = Path(self._tmpdir.name) / "space_url.json"
+        bad_cfg_path.write_text(
+            json.dumps(
+                {
+                    "backends": [
+                        {
+                            "id": "space-cli",
+                            "base_url": "http://127.0.0.1:8000/v1/my model",
+                            "models": ["m1"],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        err_buf = io.StringIO()
+        with redirect_stderr(err_buf):
+            rc = router_main(["--check-config", "--config", str(bad_cfg_path)])
+        self.assertNotEqual(rc, 0)
+        self.assertIn("percent-encode", err_buf.getvalue().lower())
+
+    def test_sse_reactor_partial_write_memory_exhaustion_records_503_overload_not_499(
+        self,
+    ) -> None:
+        import errno
+        from router import freetpu_router as router_mod
+        from router.hooks import CallbackUsageMeterHook
+
+        first_ev = (
+            "data: "
+            + json.dumps(
+                {
+                    "id": "chatcmpl-oom-1",
+                    "object": "chat.completion.chunk",
+                    "model": "m-oom",
+                    "choices": [
+                        {"index": 0, "delta": {"content": "first"}, "finish_reason": None}
+                    ],
+                }
+            )
+            + "\n\n"
+        ).encode("utf-8")
+        second_ev = (
+            "data: "
+            + json.dumps(
+                {
+                    "id": "chatcmpl-oom-1",
+                    "object": "chat.completion.chunk",
+                    "model": "m-oom",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": "second-" + ("x" * 2048)},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+            )
+            + "\n\n"
+        ).encode("utf-8")
+
+        class _TwoChunkSSEHandler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: Any) -> None:
+                pass
+
+            def do_GET(self) -> None:
+                body = json.dumps(
+                    {"object": "list", "data": [{"id": "m-oom"}]}
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:
+                cl = int(self.headers.get("Content-Length") or "0")
+                if cl > 0:
+                    self.rfile.read(cl)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(first_ev)
+                self.wfile.flush()
+                time.sleep(0.05)
+                try:
+                    self.wfile.write(second_ev)
+                    self.wfile.flush()
+                    time.sleep(0.2)
+                except OSError:
+                    pass
+
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), _TwoChunkSSEHandler)
+        t_up = threading.Thread(target=upstream.serve_forever, daemon=True)
+        t_up.start()
+        try:
+            for mode in ("eagain_clean_framing", "partial_write_broken_framing"):
+                usage_events: List[UsageEvent] = []
+                cfg = RouterConfig(
+                    host="127.0.0.1",
+                    port=0,
+                    max_total_response_memory_bytes=1_000_000,
+                    backends=[
+                        BackendConfig(
+                            id=f"oom-{mode}",
+                            base_url=f"http://127.0.0.1:{upstream.server_address[1]}",
+                            models=["m-oom"],
+                        )
+                    ],
+                )
+                router = self._track(
+                    create_router_server(
+                        cfg,
+                        usage_hook=CallbackUsageMeterHook(usage_events.append),
+                    )
+                )
+                orig_enqueue = router_mod._SSEReactor._enqueue_client_write
+                triggered = [False]
+
+                def _forced_oom_enqueue(
+                    reactor_self: Any,
+                    task: Any,
+                    framed: bytes,
+                    _mode: str = mode,
+                    _orig: Any = orig_enqueue,
+                ) -> bool:
+                    if not triggered[0] and b"second-" in framed:
+                        triggered[0] = True
+                        orig_sock = task.client_sock
+
+                        class _ShortSendSock:
+                            def send(self, data: bytes) -> int:
+                                if _mode == "eagain_clean_framing":
+                                    raise BlockingIOError(errno.EAGAIN, "would block")
+                                # Partial write: accept only first 8 bytes of the chunk.
+                                return orig_sock.send(data[:8])
+
+                            def __getattr__(self, name: str) -> Any:
+                                return getattr(orig_sock, name)
+
+                        task.client_sock = _ShortSendSock()
+                        try:
+                            with mock.patch.object(
+                                task.engine,
+                                "try_reserve_response_memory",
+                                return_value=False,
+                            ):
+                                return _orig(reactor_self, task, framed)
+                        finally:
+                            task.client_sock = orig_sock
+                    return _orig(reactor_self, task, framed)
+
+                with mock.patch.object(
+                    router_mod._SSEReactor,
+                    "_enqueue_client_write",
+                    _forced_oom_enqueue,
+                ):
+                    conn = http.client.HTTPConnection(
+                        "127.0.0.1", router.server_address[1], timeout=3.0
+                    )
+                    try:
+                        conn.request(
+                            "POST",
+                            "/v1/chat/completions",
+                            body=json.dumps(
+                                {
+                                    "model": "m-oom",
+                                    "stream": True,
+                                    "messages": [{"role": "user", "content": "hi"}],
+                                }
+                            ).encode("utf-8"),
+                            headers={"Content-Type": "application/json"},
+                        )
+                        resp = conn.getresponse()
+                        self.assertEqual(resp.status, 200)
+                        try:
+                            raw_body = resp.read()
+                        except http.client.IncompleteRead as exc:
+                            raw_body = exc.partial
+                    finally:
+                        conn.close()
+
+                self.assertTrue(triggered[0], f"mode={mode} did not trigger reactor OOM")
+                # Wait briefly for usage hook / metrics to finalize.
+                dl = time.monotonic() + 2.0
+                while not usage_events and time.monotonic() < dl:
+                    time.sleep(0.01)
+                self.assertEqual(len(usage_events), 1, f"mode={mode}")
+                self.assertEqual(
+                    usage_events[0].status_code,
+                    503,
+                    f"mode={mode} expected 503 overload, got {usage_events[0].status_code}",
+                )
+                _, _, metrics_raw = _http_request(
+                    router.server_address[1], "GET", "/metrics"
+                )
+                metrics_text = metrics_raw.decode("utf-8")
+                self.assertIn(
+                    f'freetpu_router_requests_total{{model="m-oom",backend_id="oom-{mode}",status="503"}} 1',
+                    metrics_text,
+                )
+                self.assertNotIn('status="499"', metrics_text)
+                if mode == "eagain_clean_framing":
+                    self.assertIn(b"server_memory_limit_reached", raw_body)
+                else:
+                    self.assertNotIn(b"server_memory_limit_reached", raw_body)
+        finally:
+            upstream.shutdown()
+            upstream.server_close()
 
 
 def run_self_tests(verbosity: int = 1) -> int:
