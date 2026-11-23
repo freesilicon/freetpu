@@ -64,6 +64,11 @@ groups:
               freetpu_tpu_runtime_unjoined_duty_cycle_percent{expected_tpu_activity="sustained"} >= 0
             )
             and on(job, instance) (
+              freetpu_tpu_runtime_unjoined_duty_cycle_complete{expected_tpu_activity="sustained"} == 1
+              and
+              min_over_time(freetpu_tpu_runtime_unjoined_duty_cycle_complete{expected_tpu_activity="sustained"}[5m]) == 1
+            )
+            and on(job, instance) (
               max by (job, instance) (freetpu_tpu_runtime_hbm_used_bytes{pci_bdf="unmapped",expected_tpu_activity="sustained"} > 0)
               or
               max by (job, instance) (freetpu_tpu_hbm_used_bytes{expected_tpu_activity="sustained"} > 0)

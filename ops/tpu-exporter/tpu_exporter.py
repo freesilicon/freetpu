@@ -159,6 +159,7 @@ class TpuTelemetry:
     hbm_bandwidth_utilization_percent: Optional[float] = None
     aer_correctable_total: Optional[int] = None
     aer_fatal_total: Optional[int] = None
+    sibling_aer_counters: Dict[str, Tuple[Optional[int], Optional[int]]] = field(default_factory=dict)
     shm_hbm_allocated_bytes: Optional[int] = None
     mxu_active_cycles: Optional[int] = None
     dma_bytes_transferred: Optional[int] = None
@@ -185,6 +186,7 @@ class ExporterSnapshot:
     devices: List[TpuTelemetry]
     runtime_utilization: List[RuntimeTelemetry] = field(default_factory=list)
     runtime_unjoined_duty_cycle: Dict[str, float] = field(default_factory=dict)
+    runtime_unjoined_duty_cycle_complete: bool = False
     gcp_preempted_status: Optional[int] = None
 
 
@@ -1902,8 +1904,11 @@ def discover_tpu_devices(
             and vfio_container_verified
         )
 
+        aer_correctable, aer_fatal = read_pcie_aer_counters(entry)
+
         # Group dual-core legacy TPU v2/v3 (0x0027) PCI functions sharing the same
-        # base PCI address (`DDDD:BB:DD`) into one physical chip record.
+        # base PCI address (`DDDD:BB:DD`) into one physical chip record while
+        # retaining per-function PCIe AER counters keyed by each sibling's own BDF.
         if device_id in LEGACY_DUAL_FUNCTION_DEVICE_IDS:
             base_addr = entry.name.rsplit(".", 1)[0]
             existing = legacy_by_base_addr.get(base_addr)
@@ -1915,6 +1920,8 @@ def discover_tpu_devices(
                     existing.model_name = model_name
                     existing.hbm_nominal_bytes = nominal_hbm
                     existing.hbm_total_bytes = nominal_hbm if nominal_hbm > 0 else None
+                if aer_correctable is not None or aer_fatal is not None:
+                    existing.sibling_aer_counters[entry.name] = (aer_correctable, aer_fatal)
                 continue
 
         # A VFIO group is exclusive to this TPU ONLY when we verified the full
@@ -1927,8 +1934,6 @@ def discover_tpu_devices(
             and group_dir_readable.get(iommu_group, False)
             and full_members == {entry.name}
         )
-
-        aer_correctable, aer_fatal = read_pcie_aer_counters(entry)
 
         chip = TpuTelemetry(
             chip_index=len(discovered),
@@ -2379,7 +2384,7 @@ def collect_snapshot(
             parsed_rows, expected_runtime_ids=expected_runtime_ids
         ):
             remaining_s = runtime_deadline - time.monotonic()
-            if remaining_s >= 0.05:
+            if remaining_s >= 0.01:
                 py_ok, py_err, py_rows = _query_tpu_info_python_metrics(
                     devices,
                     addr=runtime_metrics_addr,
@@ -2414,7 +2419,9 @@ def collect_snapshot(
         tpu_info_ok = False
         tpu_info_err = None
         parsed_rows = {}
+        attempted_grpc = False
         if use_default_grpc_first and runtime_metrics_addr:
+            attempted_grpc = True
             # Reserve 35% of the shared runtime scrape budget for the fallback
             # path when fallback is enabled so a stalled gRPC RPC cannot starve
             # fallback telemetry.
@@ -2431,12 +2438,16 @@ def collect_snapshot(
                 parsed_rows = _tag_row_sources(parsed_rows, "libtpu-grpc")
 
         remaining_s = runtime_deadline - time.monotonic()
+        # When the configured CLI is the primary/first backend (e.g. a custom
+        # executable or disabled direct gRPC), run whenever positive time
+        # remains — even at the minimum 50 ms scrape budget after setup overhead.
+        cli_has_budget = (remaining_s > 0.0) if not attempted_grpc else (remaining_s >= 0.01)
         if (
             not tpu_info_ok
             or not _has_complete_utilization(
                 parsed_rows, expected_runtime_ids=expected_runtime_ids
             )
-        ) and remaining_s >= 0.05:
+        ) and cli_has_budget:
             cli_ok, cli_err, cli_rows = _run_tpu_info(
                 tpu_info_bin=tpu_info_bin,
                 timeout_s=remaining_s,
@@ -2467,7 +2478,7 @@ def collect_snapshot(
                     )
                 )
                 and runtime_metrics_addr
-                and remaining_s >= 0.05
+                and remaining_s >= 0.01
             ):
                 py_ok, _py_err, py_rows = _query_tpu_info_python_metrics(
                     devices,
@@ -2625,6 +2636,39 @@ def collect_snapshot(
         if not _is_unjoined_duty_covered(key)
     }
 
+    # Unjoined duty-cycle telemetry is marked complete (`1`) ONLY when we have
+    # verified PCI hardware inventory establishing the host's logical runtime
+    # device count, every logical device on the host has a duty reading, AND
+    # every runtime row with positive HBM allocation is covered — preventing
+    # partial unjoined replies (e.g. an idle TPU's duty + a different busy TPU's
+    # HBM whose duty sample is missing) from triggering critical collapse alerts.
+    expected_logical_devices: Optional[int] = None
+    if inferred_dpc == 1 and devices:
+        expected_logical_devices = len(devices)
+    elif inferred_dpc is not None and inferred_dpc > 1 and devices:
+        verified_chips_for_unjoined = _verified_dual_function_chip_count(devices, inferred_dpc)
+        if verified_chips_for_unjoined is not None:
+            expected_logical_devices = verified_chips_for_unjoined * inferred_dpc
+        else:
+            known_gens_unjoined = {
+                d.generation for d in devices if d.generation in _GEN_DEVICES_PER_CHIP
+            }
+            if known_gens_unjoined and known_gens_unjoined <= {"v2", "v3", "v2-v3"} and len(devices) >= 4:
+                expected_logical_devices = len(devices) * inferred_dpc
+
+    active_hbm_keys = {
+        key
+        for key, row in util_rows.items()
+        if row.hbm_used_bytes is not None and row.hbm_used_bytes > 0
+    }
+    covered_duty_keys = set(runtime_unjoined_duty.keys()) | joined_duty_keys
+    runtime_unjoined_duty_complete = bool(
+        runtime_unjoined_duty
+        and expected_logical_devices is not None
+        and len(runtime_unjoined_duty) >= expected_logical_devices
+        and active_hbm_keys.issubset(covered_duty_keys)
+    )
+
     gcp_preempted: Optional[int] = None
     if gcp_metadata_preemption:
         gcp_preempted = query_gcp_preemption_status(
@@ -2642,6 +2686,7 @@ def collect_snapshot(
         devices=devices,
         runtime_utilization=runtime_telemetry,
         runtime_unjoined_duty_cycle=runtime_unjoined_duty,
+        runtime_unjoined_duty_cycle_complete=runtime_unjoined_duty_complete,
         gcp_preempted_status=gcp_preempted,
     )
 
@@ -2774,6 +2819,16 @@ def format_prometheus_metrics(snapshot: ExporterSnapshot) -> str:
             aer_corr_samples.append((stable_counter_labels, str(d.aer_correctable_total)))
         if d.aer_fatal_total is not None:
             aer_fatal_samples.append((stable_counter_labels, str(d.aer_fatal_total)))
+        for sib_bdf, (sib_corr, sib_fatal) in sorted(d.sibling_aer_counters.items()):
+            sib_aer_labels = {
+                "pci_bdf": sib_bdf,
+                "device_id": d.device_id,
+                "generation": d.generation,
+            }
+            if sib_corr is not None:
+                aer_corr_samples.append((sib_aer_labels, str(sib_corr)))
+            if sib_fatal is not None:
+                aer_fatal_samples.append((sib_aer_labels, str(sib_fatal)))
         if d.shm_hbm_allocated_bytes is not None:
             shm_hbm_alloc_samples.append((base_labels, str(d.shm_hbm_allocated_bytes)))
         if d.mxu_active_cycles is not None:
@@ -2935,6 +2990,12 @@ def format_prometheus_metrics(snapshot: ExporterSnapshot) -> str:
             "TPU Runtime Utilization MXU duty cycle percentage keyed by raw libtpu reported ID when chip-to-core layout cannot be verified from PCI inventory.",
             "gauge",
             unjoined_duty_samples,
+        )
+        add_metric(
+            "freetpu_tpu_runtime_unjoined_duty_cycle_complete",
+            "Whether unjoined runtime duty-cycle readings cover all verified host TPU logical devices and active HBM allocations (1 = complete, 0 = partial/unverified).",
+            "gauge",
+            [({}, "1" if snapshot.runtime_unjoined_duty_cycle_complete else "0")],
         )
     add_metric(
         "freetpu_tpu_runtime_hbm_bandwidth_utilization_percent",

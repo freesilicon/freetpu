@@ -2960,6 +2960,142 @@ class FreeTpuCdiTests(unittest.TestCase):
                 self.assertEqual(env_b["TPU_VISIBLE_CHIPS"], "2,3,6,7")
                 self.assertEqual(env_b["TPU_VISIBLE_DEVICES"], "2,3,6,7")
 
+                # If `--chip-id-map` cannot be reloaded AND live PCI/VFIO hardware
+                # drifts (e.g. a TPU VFIO node disappears), continuous `sync` MUST
+                # still detect confirmed hardware drift and withdraw the stale spec!
+                drift_root = root / "sync_broken_map_hw_drift"
+                drift_sys, drift_dev = _make_mock_pci_vfio(
+                    drift_root,
+                    devices=[
+                        {
+                            "bdf": f"0000:00:{4 + i:02x}.0",
+                            "vendor": "0x1ae0",
+                            "device": "0x006f",
+                            "driver": "vfio-pci",
+                            "iommu_group": str(i),
+                            "numa_node": "0",
+                        }
+                        for i in range(4)
+                    ],
+                    create_vfio_nodes=[str(i) for i in range(4)],
+                )
+                drift_map_file = drift_root / "drift-map.json"
+                drift_map_file.write_text(
+                    json.dumps({f"0000:00:{4 + i:02x}.0": i for i in range(4)}),
+                    encoding="utf-8",
+                )
+                drift_spec_path = drift_root / "freetpu-drift.json"
+                drift_sigs: Dict[int, Any] = {}
+                drift_ticks = {"n": 0}
+                drift_clock = {"t": 0.0}
+
+                def _drift_signal(sig_num, handler):
+                    drift_sigs[sig_num] = handler
+                    return None
+
+                def _drift_monotonic():
+                    return drift_clock["t"]
+
+                def _drift_sleep(_dt):
+                    drift_clock["t"] += 2.0
+                    drift_ticks["n"] += 1
+                    if drift_ticks["n"] == 1:
+                        self.assertTrue(drift_spec_path.exists())
+                        # Break chip-id-map AND remove a VFIO group node simultaneously.
+                        drift_map_file.write_text("{broken", encoding="utf-8")
+                        (drift_dev / "vfio" / "3").unlink()
+                    else:
+                        drift_sigs[freetpu_cdi.signal.SIGTERM](
+                            freetpu_cdi.signal.SIGTERM, None
+                        )
+
+                with (
+                    mock.patch.object(freetpu_cdi.signal, "signal", side_effect=_drift_signal),
+                    mock.patch.object(freetpu_cdi.time, "monotonic", side_effect=_drift_monotonic),
+                    mock.patch.object(freetpu_cdi.time, "sleep", side_effect=_drift_sleep),
+                ):
+                    rc_dr, _o_dr, err_dr = _run_cli_inproc(
+                        [
+                            "sync",
+                            "--sysfs-root",
+                            str(drift_sys),
+                            "--dev-root",
+                            str(drift_dev),
+                            "--chip-id-map",
+                            str(drift_map_file),
+                            "--output",
+                            str(drift_spec_path),
+                            "--interval",
+                            "1",
+                        ]
+                    )
+                self.assertEqual(rc_dr, 0, err_dr)
+                self.assertIn("confirmed hardware drift", err_dr)
+                self.assertFalse(
+                    drift_spec_path.exists(),
+                    "must withdraw stale CDI spec on confirmed VFIO drift even when --chip-id-map reload fails",
+                )
+
+                # Sysfs-derived visibility mask (generated WITHOUT --chip-id-map):
+                # if live sysfs `chip_id`s later conflict (duplicate "0"), `validate
+                # --check-host --remove-if-stale` MUST treat it as confirmed drift
+                # and withdraw the unsubstantiated spec!
+                sysfs_conf_root = root / "sysfs_conflict_vis"
+                sc_sys, sc_dev = _make_mock_pci_vfio(
+                    sysfs_conf_root,
+                    devices=[
+                        {
+                            "bdf": f"0000:00:{4 + i:02x}.0",
+                            "vendor": "0x1ae0",
+                            "device": "0x006f",
+                            "driver": "vfio-pci",
+                            "iommu_group": str(i),
+                            "numa_node": "0",
+                            "chip_id": str(i),
+                        }
+                        for i in range(4)
+                    ],
+                    create_vfio_nodes=[str(i) for i in range(4)],
+                )
+                sc_spec_path = sysfs_conf_root / "freetpu-sysfs.json"
+                rc_sc_gen, _o_scg, err_scg = _run_cli_inproc(
+                    [
+                        "generate",
+                        "--sysfs-root",
+                        str(sc_sys),
+                        "--dev-root",
+                        str(sc_dev),
+                        "--single-host-env",
+                        "--output",
+                        str(sc_spec_path),
+                        "--validate",
+                    ]
+                )
+                self.assertEqual(rc_sc_gen, 0, err_scg)
+                self.assertTrue(sc_spec_path.exists())
+                # Create a live sysfs chip_id conflict (duplicate "0").
+                (sc_sys / "bus/pci/devices/0000:00:05.0/chip_id").write_text(
+                    "0\n", encoding="utf-8"
+                )
+                rc_sc_val, _o_scv, err_scv = _run_cli_inproc(
+                    [
+                        "validate",
+                        str(sc_spec_path),
+                        "--check-host",
+                        "--remove-if-stale",
+                        "--sysfs-root",
+                        str(sc_sys),
+                        "--dev-root",
+                        str(sc_dev),
+                    ]
+                )
+                self.assertNotEqual(rc_sc_val, 0)
+                self.assertIn("conflicting or missing sysfs chip_id", err_scv)
+                self.assertFalse(
+                    sc_spec_path.exists(),
+                    "must unlink sysfs-derived CDI spec when live sysfs chip_id values conflict",
+                )
+
                 # If publication-time host verification fails, BOTH `generate --validate`
                 # and `reconcile_cdi_spec` MUST fail closed and remove any stale spec file!
                 with mock.patch.object(

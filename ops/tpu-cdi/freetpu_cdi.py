@@ -2807,10 +2807,15 @@ def _verify_spec_against_host_detailed(
                                 f"device {name!r}: stale injected {ek}={injected_val!r} "
                                 f"(live host expects {exp_val!r})"
                             )
-            elif chip_id_map is None:
+            elif chip_id_map is None and uses_explicit_chip_map_env:
                 unverifiable.append(
+                    f"device {name!r}: injected {', '.join(sorted(injected_vis))} was generated "
+                    "with --chip-id-map and cannot be verified without that map"
+                )
+            elif chip_id_map is None:
+                errors.append(
                     f"device {name!r}: injected {', '.join(sorted(injected_vis))} cannot be "
-                    "verified without --chip-id-map (live host does not expose verifiable chip_id ordinals)"
+                    "verified against live host sysfs chip_id ordinals (conflicting or missing sysfs chip_id)"
                 )
             else:
                 errors.append(
@@ -3474,7 +3479,37 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     tick_chip_map = _load_chip_id_map(args.chip_id_map)
                 except Exception as exc:  # noqa: BLE001
                     ok = False
-                    msg = f"failed to reload --chip-id-map {args.chip_id_map!r}: {exc} (skipping tick)"
+                    # Even when the chip-id-map file cannot be reloaded, keep
+                    # validating any published CDI spec against live PCI/VFIO
+                    # hardware and withdraw it immediately on confirmed drift.
+                    drift_suffix = ""
+                    if args.output.exists():
+                        confirmed_drift: List[str] = []
+                        try:
+                            existing_spec = _load_json_strict_keys(
+                                args.output.read_text(encoding="utf-8")
+                            )
+                            confirmed_drift.extend(validate_cdi_spec(existing_spec))
+                            if not confirmed_drift:
+                                host_confirmed, _unverifiable = _verify_spec_against_host_detailed(
+                                    existing_spec,
+                                    sysfs_root=args.sysfs_root,
+                                    dev_root=args.dev_root,
+                                    iommu_dev_path=args.iommu_dev,
+                                    vfio_mode=args.vfio_mode,
+                                    chip_id_map=None,
+                                )
+                                confirmed_drift.extend(host_confirmed)
+                        except Exception as check_exc:  # noqa: BLE001
+                            confirmed_drift.append(f"existing spec unreadable: {check_exc}")
+                        if confirmed_drift:
+                            removed, cleanup_err = _invalidate_spec(args.output)
+                            inv = _format_invalidation_suffix(args.output, removed, cleanup_err)
+                            drift_suffix = f"; confirmed hardware drift ({confirmed_drift[0]}){inv}"
+                    msg = (
+                        f"failed to reload --chip-id-map {args.chip_id_map!r}: {exc}"
+                        f"{drift_suffix or ' (preserving verified hardware spec; skipping publish)'}"
+                    )
                     if msg != last_msg or not ok:
                         sys.stderr.write(f"freetpu-cdi sync: {msg}\n")
                         sys.stderr.flush()

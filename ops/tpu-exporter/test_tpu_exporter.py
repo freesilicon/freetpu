@@ -903,6 +903,20 @@ TPU Device Status
                 create_vfio_container=False,
                 create_vfio_nodes=[],
             )
+            # Write PCIe AER counters to BOTH functions (.0 and collapsed sibling .1)
+            # of the legacy v2 chip so we prove per-function AER export isn't lost.
+            (sysfs_root / "bus/pci/devices/0000:00:04.0/aer_dev_correctable").write_text(
+                "RxErr 2\nTOTAL_ERR_COR 2\n", encoding="utf-8"
+            )
+            (sysfs_root / "bus/pci/devices/0000:00:04.0/aer_dev_fatal").write_text(
+                "DLP 0\nTOTAL_ERR_FATAL 0\n", encoding="utf-8"
+            )
+            (sysfs_root / "bus/pci/devices/0000:00:04.1/aer_dev_correctable").write_text(
+                "RxErr 5\nTOTAL_ERR_COR 5\n", encoding="utf-8"
+            )
+            (sysfs_root / "bus/pci/devices/0000:00:04.1/aer_dev_fatal").write_text(
+                "DLP 1\nTOTAL_ERR_FATAL 1\n", encoding="utf-8"
+            )
             with _mock_vfio_char_lstat():
                 snap = tpu_exporter.collect_snapshot(
                     sysfs_root=sysfs_root,
@@ -919,6 +933,23 @@ TPU Device Status
             self.assertEqual(v2.model_name, "TPU v2")
             self.assertEqual(v2.hbm_total_bytes, 16 * 1024**3)
             self.assertFalse(v2.healthy)
+            self.assertEqual(v2.aer_correctable_total, 2)
+            self.assertEqual(v2.aer_fatal_total, 0)
+            self.assertEqual(v2.sibling_aer_counters.get("0000:00:04.1"), (5, 1))
+            prom_legacy = tpu_exporter.format_prometheus_metrics(snap)
+            self._assert_valid_prometheus_text(prom_legacy)
+            self.assertIn(
+                'freetpu_pcie_aer_correctable_total{pci_bdf="0000:00:04.0",device_id="0x0027",generation="v2"} 2',
+                prom_legacy,
+            )
+            self.assertIn(
+                'freetpu_pcie_aer_correctable_total{pci_bdf="0000:00:04.1",device_id="0x0027",generation="v2"} 5',
+                prom_legacy,
+            )
+            self.assertIn(
+                'freetpu_pcie_aer_fatal_total{pci_bdf="0000:00:04.1",device_id="0x0027",generation="v2"} 1',
+                prom_legacy,
+            )
 
             v3 = snap.devices[1]
             self.assertEqual(v3.pci_bdf, "0000:00:05.0")
@@ -3257,6 +3288,10 @@ TPU Runtime Utilization
                 'freetpu_tpu_runtime_unjoined_duty_cycle_percent{runtime_device_id="3"} 87.5',
                 no_pci_prom,
             )
+            # Without PCI inventory (sidecar), unjoined duty coverage cannot be verified
+            # across all host devices, so the completeness gauge MUST be 0!
+            self.assertFalse(no_pci_snap.runtime_unjoined_duty_cycle_complete)
+            self.assertIn("freetpu_tpu_runtime_unjoined_duty_cycle_complete 0", no_pci_prom)
 
             # Ironwood (8 PCI functions) with duty-cycle IDs `{0..3}` and NO HBM IDs:
             # MUST NOT assume physical-chip granularity and expand across all 8 cores
@@ -3586,6 +3621,39 @@ TPU Runtime Utilization
             self.assertAlmostEqual(iw_custom_snap.devices[3].duty_cycle_percent or 0.0, 37.5)
             self.assertEqual(iw_custom_snap.devices[2].hbm_used_bytes, 30 * 1024**3)
             self.assertEqual(iw_custom_snap.devices[3].hbm_used_bytes, 40 * 1024**3)
+
+            # Even at the minimum clamped 50ms scrape budget (`tpu_info_timeout_s=0.05`
+            # or `0.01`), a configured custom CLI (first backend) MUST still be invoked
+            # rather than skipped after setup consumes a fraction of a millisecond!
+            min_budget_calls: List[float] = []
+
+            def _fast_custom_cli(*, tpu_info_bin, timeout_s):
+                min_budget_calls.append(timeout_s)
+                rows = _te.parse_tpu_info_output(
+                    "TPU Runtime Utilization\n"
+                    "| Chip | HBM Usage (GiB)       | Duty cycle |\n"
+                    "|------|-----------------------|------------|\n"
+                    "| 2    | 30.00 GiB / 96.00 GiB | 12.50%     |\n"
+                )
+                return True, None, rows
+
+            with (
+                _mock_vfio_char_lstat(),
+                mock.patch.object(_te, "_run_tpu_info", side_effect=_fast_custom_cli),
+            ):
+                min_budget_snap = _te.collect_snapshot(
+                    sysfs_root=iw_sysfs,
+                    dev_root=iw_dev,
+                    proc_root=iw_proc,
+                    tpu_info_bin=str(custom_iw_wrapper),
+                    tpu_info_timeout_s=0.05,
+                    runtime_metrics_addr="127.0.0.1:8431",
+                    shm_root=iw_root / "no-shm",
+                )
+            self.assertEqual(len(min_budget_calls), 1)
+            self.assertGreater(min_budget_calls[0], 0.0)
+            self.assertTrue(min_budget_snap.tpu_info_available)
+            self.assertAlmostEqual(min_budget_snap.devices[2].duty_cycle_percent or 0.0, 12.5)
 
             # 4-device v6e host where direct gRPC returns complete HBM + duty rows for
             # ONLY 2 devices (`0, 1`) and omits devices `2, 3`: `_has_complete_utilization`
@@ -4644,6 +4712,14 @@ TPU Runtime Utilization
             )
             self.assertIn(
                 'freetpu_tpu_runtime_unjoined_duty_cycle_percent{expected_tpu_activity="sustained"} >= 0',
+                alerts_text,
+            )
+            self.assertIn(
+                'freetpu_tpu_runtime_unjoined_duty_cycle_complete{expected_tpu_activity="sustained"} == 1',
+                alerts_text,
+            )
+            self.assertIn(
+                'min_over_time(freetpu_tpu_runtime_unjoined_duty_cycle_complete{expected_tpu_activity="sustained"}[5m]) == 1',
                 alerts_text,
             )
             self.assertIn("and on(job, instance)", alerts_text)
