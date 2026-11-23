@@ -2089,6 +2089,54 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
         return false;
     };
 
+    // Identify true KV-cache tensors from donated buffers and FLASH_ATTN_EXT K/V feeds so
+    // non-KV token tables (e.g. build_inp_embd mixed_embd) can still bucket along axis 2.
+    std::vector<bool> is_kv(vals.size(), false);
+    for (size_t i = 0; i < spec.inputs.size(); ++i) {
+        if (vals[i].is_donated) {
+            is_kv[i] = true;
+        }
+    }
+    for (const OpNodeSpec& op : spec.ops) {
+        if (op.kind == CloudOpKind::FLASH_ATTN_EXT && op.src_ids.size() >= 3) {
+            size_t k_i = 0, v_i = 0;
+            if (lookup_idx(op.src_ids[1], &k_i)) is_kv[k_i] = true;
+            if (lookup_idx(op.src_ids[2], &v_i)) is_kv[v_i] = true;
+        }
+    }
+    for (bool kv_changed = true; kv_changed;) {
+        kv_changed = false;
+        for (const OpNodeSpec& op : spec.ops) {
+            size_t dst_i = 0;
+            if (!lookup_idx(op.dst.id, &dst_i)) continue;
+            if (op.kind == CloudOpKind::SET_ROWS && op.src_ids.size() >= 3) {
+                size_t kv_i = 0;
+                if (!lookup_idx(op.src_ids[2], &kv_i)) continue;
+                if (is_kv[dst_i] && !is_kv[kv_i]) {
+                    is_kv[kv_i] = true;
+                    kv_changed = true;
+                }
+                if (is_kv[kv_i] && !is_kv[dst_i]) {
+                    is_kv[dst_i] = true;
+                    kv_changed = true;
+                }
+            } else if ((op.kind == CloudOpKind::CPY || op.kind == CloudOpKind::RESHAPE ||
+                        op.kind == CloudOpKind::TRANSPOSE || op.kind == CloudOpKind::SLICE) &&
+                       !op.src_ids.empty() && is_kv[dst_i]) {
+                size_t x_i = 0;
+                if (lookup_idx(op.src_ids[0], &x_i) && !is_kv[x_i]) {
+                    is_kv[x_i] = true;
+                    kv_changed = true;
+                }
+            }
+        }
+    }
+    for (size_t i = 0; i < vals.size(); ++i) {
+        if (is_kv[i] && !set_ax(i, -1)) {
+            return fail_with("kv_axis_conflict");
+        }
+    }
+
     auto propagate_op = [&](const OpNodeSpec& op, bool allow_mm_seed) -> bool {
         size_t dst_i = 0;
         if (!lookup_idx(op.dst.id, &dst_i)) return false;
@@ -2142,9 +2190,16 @@ BucketAnalysisResult analyze_program_token_axes(const GraphProgramSpec& spec,
                     !lookup_idx(op.src_ids[2], &kv_i)) {
                     return false;
                 }
-                if (!set_ax(kv_i, -1) || !set_ax(dst_i, -1)) return false;
                 if (vals[idx_i].dims[0] != 1 || vals[idx_i].dims[1] != 1 || vals[idx_i].dims[2] != 1) {
                     return false;
+                }
+                if (is_kv[kv_i] || is_kv[dst_i] || vals[kv_i].dims[2] != orig_tokens) {
+                    if (!set_ax(kv_i, -1) || !set_ax(dst_i, -1)) return false;
+                } else {
+                    // Non-KV token-table SET_ROWS (e.g. build_inp_embd mixed_embd): bucket base table and output.
+                    if (!set_ax(kv_i, 2) || !set_pad(kv_i, TokenInputPadKind::ZERO) || !set_ax(dst_i, 2)) {
+                        return false;
+                    }
                 }
                 if (vals[idx_i].dims[3] == orig_tokens) {
                     if (!set_ax(idx_i, 3) || !set_pad(idx_i, TokenInputPadKind::NEG_ONE) || !set_ax(upd_i, 2)) {

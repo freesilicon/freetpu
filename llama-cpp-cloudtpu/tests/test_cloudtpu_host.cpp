@@ -2480,7 +2480,8 @@ cloudtpu::GraphProgramSpec build_cb_decode_spec(const CbModelDims& m,
                                                 int64_t mask_rows,
                                                 bool use_s64_kv_idx,
                                                 int64_t n_out = -1,
-                                                bool dual_out_res_norm = false) {
+                                                bool dual_out_res_norm = false,
+                                                bool use_mixed_embd_set_rows = false) {
     const int64_t eff_n_out = (n_out >= 0) ? n_out : T;
     const int64_t D_Q = m.H_Q * m.D;
     const int64_t D_KV = m.H_KV * m.D;
@@ -2513,6 +2514,14 @@ cloudtpu::GraphProgramSpec build_cb_decode_spec(const CbModelDims& m,
     spec.inputs.push_back({id_row_idx, use_s64_kv_idx ? S64 : S32, DENSE, {1, 1, 1, T}, REP});
     spec.inputs.push_back({id_mask, F16, DENSE, {1, 1, mask_rows, m.N_KV}, REP});
     spec.inputs.push_back({id_out_ids, S32, DENSE, {1, 1, 1, eff_n_out}, REP});
+    uint64_t id_mixed_tbl = 0;
+    uint64_t id_mixed_slots = 0;
+    if (use_mixed_embd_set_rows) {
+        id_mixed_tbl = next_id++;
+        id_mixed_slots = next_id++;
+        spec.inputs.push_back({id_mixed_tbl, F32, DENSE, {1, 1, T, m.E}, REP});
+        spec.inputs.push_back({id_mixed_slots, S32, DENSE, {1, 1, 1, T}, REP});
+    }
 
     auto add_op = [&](cloudtpu::CloudOpKind kind,
                       std::vector<uint64_t> srcs,
@@ -2531,6 +2540,10 @@ cloudtpu::GraphProgramSpec build_cb_decode_spec(const CbModelDims& m,
     };
 
     uint64_t cur_x = add_op(cloudtpu::CloudOpKind::GET_ROWS, {id_emb_tbl, id_tokens}, F32, 1, 1, T, m.E).dst.id;
+    if (use_mixed_embd_set_rows) {
+        cur_x = add_op(cloudtpu::CloudOpKind::SET_ROWS, {cur_x, id_mixed_slots, id_mixed_tbl},
+                       F32, 1, 1, T, m.E).dst.id;
+    }
     uint64_t last_hmid = cur_x;
     std::vector<uint64_t> kv_out_ids;
 
@@ -2933,6 +2946,7 @@ void test_continuous_batching_padded_buckets() {
                                  int64_t bucket_B,
                                  const cloudtpu::BucketAnalysisResult* plan,
                                  bool use_s64,
+                                 bool use_mixed_embd,
                                  std::vector<int64_t>& active_slots_out,
                                  std::vector<cloudtpu::PjrtBufferPtr>& owned_bufs_out) {
         owned_bufs_out.clear();
@@ -2991,6 +3005,20 @@ void test_continuous_batching_padded_buckets() {
         }
         push_padded(mask.data(), cloudtpu::PjrtDType::F16, d_mk, 4);
         push_padded(out_ids.data(), cloudtpu::PjrtDType::S32, d_out_1d, 5);
+        if (use_mixed_embd) {
+            std::vector<float> mixed_tbl(static_cast<size_t>(T * m.E), 0.0f);
+            std::vector<int32_t> mixed_slots(static_cast<size_t>(T));
+            for (int64_t t = 0; t < T; ++t) {
+                mixed_slots[static_cast<size_t>(t)] = static_cast<int32_t>(T - 1 - t);
+                for (int64_t e = 0; e < m.E; ++e) {
+                    mixed_tbl[static_cast<size_t>(t * m.E + e)] =
+                        0.05f * std::cos(static_cast<float>(t * m.E + e) * 0.11f);
+                }
+            }
+            const int64_t d_tbl[4] = {1, 1, T, m.E};
+            push_padded(mixed_tbl.data(), cloudtpu::PjrtDType::F32, d_tbl, 6);
+            push_padded(mixed_slots.data(), cloudtpu::PjrtDType::S32, d_1d, 7);
+        }
     };
 
     auto run_step = [&](const cloudtpu::GraphProgramSpec& run_spec,
@@ -3002,9 +3030,10 @@ void test_continuous_batching_padded_buckets() {
                         const cloudtpu::BucketAnalysisResult* plan,
                         bool use_s64,
                         std::vector<std::vector<cloudtpu::PjrtBufferPtr>>& kv_bufs,
-                        std::vector<int64_t>& active_slots_out) {
+                        std::vector<int64_t>& active_slots_out,
+                        bool use_mixed_embd = false) {
         std::vector<cloudtpu::PjrtBufferPtr> step_in;
-        make_step_buffers(T, n_out, mask_rows, bucket_B, plan, use_s64, active_slots_out, step_in);
+        make_step_buffers(T, n_out, mask_rows, bucket_B, plan, use_s64, use_mixed_embd, active_slots_out, step_in);
         std::vector<PJRT_Buffer*> raw_in;
         raw_in.push_back(b_emb->handle.get());
         for (const auto& p : step_in) raw_in.push_back(p->handle.get());
@@ -3232,8 +3261,83 @@ void test_continuous_batching_padded_buckets() {
         }
     }
 
+    // 3d) build_inp_embd non-KV SET_ROWS(upd=[1,1,T,E], idx=[1,1,1,T], tbl=[1,1,T,E]) alongside
+    //     FLASH_ATTN_EXT KV SET_ROWS([1,1,KV_CAP,D_KV]) across T=5,6,7,8 -> B=8
+    {
+        auto kv_seq = init_kv_pair();
+        const cloudtpu::CacheStats st_before = rt.cache_stats();
+        std::string key_ref;
+        for (int64_t T : {int64_t(5), int64_t(6), int64_t(7), int64_t(8)}) {
+            const int64_t B = cloudtpu::select_batch_bucket(T, {1, 2, 4, 8, 16});
+            cloudtpu::GraphProgramSpec spec = build_cb_decode_spec(m, T, T, true, 1, true, true);
+            cloudtpu::BucketAnalysisResult plan;
+            if (B > T) {
+                plan = cloudtpu::analyze_program_token_axes(spec, T, B);
+                CHECK_TRUE(plan.success && plan.input_token_axis[6] == 2 &&
+                               plan.input_pad_kind[6] == cloudtpu::TokenInputPadKind::ZERO &&
+                               plan.input_token_axis[7] == 3 &&
+                               plan.input_pad_kind[7] == cloudtpu::TokenInputPadKind::NEG_ONE &&
+                               plan.op_dst_token_axis[1] == 2,
+                           "build_inp_embd non-KV SET_ROWS must bucket tbl/dst to ax=2 and slots to ax=3 (-1)");
+                CHECK_TRUE(cloudtpu::apply_program_batch_bucket(spec, plan), "apply mixed_embd bucket");
+                CHECK_TRUE(spec.inputs[6].dims[2] == B && spec.ops[1].dst.dims[2] == B,
+                           "mixed_embd tbl and SET_ROWS dst must resize to [1,1,B,E]");
+                CHECK_TRUE(spec.inputs[12].dims[2] == m.KV_CAP,
+                           "KV cache input must stay at [1,1,KV_CAP,D_KV]");
+            }
+            const cloudtpu::EmittedProgram prog = cloudtpu::emit_stablehlo_program(spec);
+            if (key_ref.empty()) {
+                key_ref = prog.cache_key;
+            } else {
+                CHECK_TRUE(prog.cache_key == key_ref,
+                           "mixed_embd SET_ROWS T=5,6,7,8 bucketed specs must share identical cache_key");
+            }
+            std::vector<int64_t> active_slots;
+            run_step(spec, prog, T, 1, T, B, (B > T) ? &plan : nullptr, true, kv_seq, active_slots, true);
+        }
+        const cloudtpu::CacheStats st_after = rt.cache_stats();
+        CHECK_TRUE(st_after.misses - st_before.misses == 1,
+                   "mixed_embd SET_ROWS T=5,6,7,8 must have misses == 1");
+        CHECK_TRUE(st_after.hits - st_before.hits == 3,
+                   "mixed_embd SET_ROWS T=5,6,7,8 must have hits == 3");
+
+        for (int64_t T : {int64_t(5), int64_t(6), int64_t(7)}) {
+            auto kv_buck = init_kv_pair();
+            auto kv_unb = init_kv_pair();
+            cloudtpu::GraphProgramSpec spec_u = build_cb_decode_spec(m, T, T, true, 1, true, true);
+            const cloudtpu::EmittedProgram prog_u = cloudtpu::emit_stablehlo_program(spec_u);
+            std::vector<int64_t> slots_u;
+            const std::vector<float> logits_u =
+                run_step(spec_u, prog_u, T, 1, T, T, nullptr, true, kv_unb, slots_u, true);
+
+            cloudtpu::GraphProgramSpec spec_b = spec_u;
+            const cloudtpu::BucketAnalysisResult plan = cloudtpu::analyze_program_token_axes(spec_b, T, 8);
+            CHECK_TRUE(plan.success && cloudtpu::apply_program_batch_bucket(spec_b, plan),
+                       "mixed_embd SET_ROWS bucket parity");
+            const cloudtpu::EmittedProgram prog_b = cloudtpu::emit_stablehlo_program(spec_b);
+            std::vector<int64_t> slots_b;
+            const std::vector<float> logits_b =
+                run_step(spec_b, prog_b, T, 1, T, 8, &plan, true, kv_buck, slots_b, true);
+            for (size_t i = 0; i < logits_b.size(); ++i) {
+                CHECK_NEAR(logits_b[i], logits_u[i], 1e-4f,
+                           "mixed_embd SET_ROWS bucketed logits parity < 1e-4 vs unbucketed");
+            }
+            verify_kv_preservation(kv_buck, kv_unb, slots_b);
+        }
+
+        // Verify tiny donated KV cache with KV_CAP == T is still protected by is_kv while mixed_embd buckets
+        CbModelDims m_tiny = m;
+        m_tiny.KV_CAP = 5;
+        m_tiny.N_KV = 4;
+        const cloudtpu::GraphProgramSpec tiny_spec = build_cb_decode_spec(m_tiny, 5, 5, true, 1, true, true);
+        const cloudtpu::BucketAnalysisResult tiny_plan = cloudtpu::analyze_program_token_axes(tiny_spec, 5, 8);
+        CHECK_TRUE(tiny_plan.success && tiny_plan.input_token_axis[6] == 2 &&
+                       tiny_plan.input_token_axis[12] == -1 && tiny_plan.input_token_axis[13] == -1,
+                   "tiny KV_CAP==T cache must stay unbucketed while mixed_embd buckets to ax=2");
+    }
+
     rt.shutdown();
-    std::printf("  [PASS] Continuous batching padded buckets (T=5..8 -> B=8 + N_out<T prefill: misses=1, hits=3, parity < 1e-4, 0 KV corruption)\n");
+    std::printf("  [PASS] Continuous batching padded buckets (T=5..8 -> B=8 + N_out<T + mixed_embd SET_ROWS: misses=1, hits=3, parity < 1e-4, 0 KV corruption)\n");
 }
 
 #ifdef CLOUDTPU_HAS_GGML

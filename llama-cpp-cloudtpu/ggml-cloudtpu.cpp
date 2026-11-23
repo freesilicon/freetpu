@@ -3843,7 +3843,11 @@ static enum ggml_status execute_subgraph(ggml_backend_cloudtpu_context* ctx,
             }
             // Verify pre-SET_ROWS leaf input is consumed ONLY once in the lowered SSA program
             // (downstream VIEW/FLASH_ATTN_EXT reads in the same slice consume the forwarded post-SET_ROWS SSA value).
-            if (ctx->scratch_leaf_ssa_uses[found_in] == 1) {
+            // Never donate a token-varying non-KV buffer (e.g. mixed_embd) whose H2D upload is bucket-padded.
+            const bool bucketed_input =
+                (bucket_plan.success && found_in < bucket_plan.input_token_axis.size() &&
+                 bucket_plan.input_token_axis[found_in] >= 0);
+            if (!bucketed_input && ctx->scratch_leaf_ssa_uses[found_in] == 1) {
                 input_alias_out[found_in] = static_cast<int32_t>(oi);
                 has_alias = true;
             }
