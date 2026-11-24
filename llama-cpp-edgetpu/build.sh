@@ -28,6 +28,10 @@ overlay_backend() {
         git -C "$SRC" apply "$ROOT/patches/llama-cpp-b12608-edgetpu.patch" || \
             patch -d "$SRC" -p1 < "$ROOT/patches/llama-cpp-b12608-edgetpu.patch"
     fi
+    if ! grep -q "compute_graph_with_accel_fallback" "$SRC/ggml/src/ggml-rpc/ggml-rpc.cpp"; then
+        git -C "$SRC" apply "$ROOT/patches/llama-cpp-b12608-rpc-accel-fallback.patch" || \
+            patch -d "$SRC" -p1 < "$ROOT/patches/llama-cpp-b12608-rpc-accel-fallback.patch"
+    fi
 }
 
 build_host() {
@@ -38,6 +42,8 @@ build_host() {
         -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_SHARED_LIBS=OFF \
         -DGGML_EDGETPU=ON \
+        -DGGML_RPC=ON \
+        -DGGML_RPC_RDMA=OFF \
         -DGGML_METAL=OFF \
         -DGGML_BLAS=OFF \
         -DGGML_OPENMP=OFF \
@@ -45,7 +51,7 @@ build_host() {
         -DLLAMA_BUILD_TOOLS=ON \
         -DLLAMA_OPENSSL=OFF \
         -DOPENBUENOS_DIR="$OB"
-    "$CMAKE" --build "$ROOT/build-host" --target test-backend-ops llama-cli llama-bench llama-completion -j"$JOBS"
+    "$CMAKE" --build "$ROOT/build-host" --target test-backend-ops llama-cli llama-bench llama-completion ggml-rpc-server -j"$JOBS"
 }
 
 build_android() {
@@ -60,19 +66,21 @@ build_android() {
         -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_SHARED_LIBS=OFF \
         -DGGML_EDGETPU=ON \
+        -DGGML_RPC=ON \
+        -DGGML_RPC_RDMA=OFF \
         -DGGML_OPENMP=OFF \
         -DGGML_CPU_ARM_ARCH="armv8.2-a+dotprod+fp16+i8mm" \
         -DLLAMA_BUILD_TESTS=ON \
         -DLLAMA_BUILD_TOOLS=ON \
         -DLLAMA_OPENSSL=OFF \
         -DOPENBUENOS_DIR="$OB"
-    "$CMAKE" --build "$ROOT/build-android-arm64" --target test-backend-ops llama-cli llama-bench llama-completion -j"$JOBS"
+    "$CMAKE" --build "$ROOT/build-android-arm64" --target test-backend-ops llama-cli llama-bench llama-completion ggml-rpc-server -j"$JOBS"
 
     echo "=== Stripping & verifying zero-Google-.so Android ARM64 binaries ==="
     local llvm_bin="$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin"
     local strip_dir="$ROOT/build-android-arm64/stripped"
     mkdir -p "$strip_dir"
-    local bins=(llama-cli llama-bench llama-completion test-backend-ops)
+    local bins=(llama-cli llama-bench llama-completion test-backend-ops ggml-rpc-server)
     for b in "${bins[@]}"; do
         "$llvm_bin/llvm-strip" -o "$strip_dir/$b" "$ROOT/build-android-arm64/bin/$b"
         local needed

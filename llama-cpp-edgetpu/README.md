@@ -11,8 +11,9 @@ Clean-room GGML `ACCEL` backend (`EDGETPU`, device `"Pixel Tensor G5 (buenos_a0)
 - `openbuenos_shim.c` — Standalone host mock shim when building without `libopenbuenos.a`
 - `CMakeLists.txt` — Backend CMake module (`ggml/src/ggml-edgetpu/CMakeLists.txt`)
 - `patches/llama-cpp-b12608-edgetpu.patch` — Minimal 3-file integration patch against `ggml-org/llama.cpp` tag `b12608`
+- `patches/llama-cpp-b12608-rpc-accel-fallback.patch` — Enables `ggml-rpc-server -d EDGETPU` hybrid `ACCEL` + `CPU` layer execution via `ggml_graph_view`
 - `tests/test_edgetpu_llm_shapes.cpp` — LLM shape accuracy sweep (`Q8_0 x F32`, `Q8_0 x Q8_0`, `F32 x F32`) & hybrid `ggml_backend_sched` routing verification
-- `build.sh` — Overlay + host/Android ARM64 build + ELF `DT_NEEDED` audit script
+- `build.sh` — Overlay + host/Android ARM64 build (`GGML_EDGETPU=ON`, `GGML_RPC=ON`, `ggml-rpc-server`) + ELF `DT_NEEDED` audit script
 
 ---
 
@@ -63,4 +64,4 @@ Clean-room GGML `ACCEL` backend (`EDGETPU`, device `"Pixel Tensor G5 (buenos_a0)
 - **`Qwen2.5-1.5B-Q8_0`**: `pp512 = 105.87 t/s` (**`-21.5%` steady-state system `mJ/tok` vs 4-thread ARM64 CPU**), `tg64 = 5.85 t/s`, **`22/22` verbatim CPU token match**
 - **`Qwen2.5-1.5B-Q4_0`**: `pp128 = 118.55 t/s`, `pp512 = 93.94 t/s`, `tg64 = 5.55 t/s` (`7.16 t/s` cold)
 
-See [docs/llama-cpp-edgetpu/README.md](../docs/llama-cpp-edgetpu/README.md) and [docs/PHASE6_PERF_REPORT.md](../docs/PHASE6_PERF_REPORT.md) for full architecture details, energy tables, and test outputs.
+See [docs/llama-cpp-edgetpu/README.md](../docs/llama-cpp-edgetpu/README.md), [docs/PHASE6_PERF_REPORT.md](../docs/PHASE6_PERF_REPORT.md), and [docs/TRACK_A_DUAL_PIXEL_CLUSTER.md](../docs/TRACK_A_DUAL_PIXEL_CLUSTER.md) for architecture details, energy tables, and dual-Pixel `32B Q4_0` cluster proof.
