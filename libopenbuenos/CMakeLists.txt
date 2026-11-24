@@ -68,6 +68,20 @@ if (OPENBUENOS_BUILD_TESTS)
     install(TARGETS openbuenos_selftest RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
   endif()
 
+  add_executable(tpu_soc_probe tests/tpu_soc_probe.cpp)
+  target_link_libraries(tpu_soc_probe PRIVATE openbuenos)
+  target_include_directories(tpu_soc_probe PRIVATE
+    ${OPENBUENOS_ROOT}/docs/kernel-abi
+  )
+  target_compile_features(tpu_soc_probe PRIVATE cxx_std_17)
+  target_compile_options(tpu_soc_probe PRIVATE ${OPENBUENOS_COMPILE_FLAGS})
+  if (ANDROID)
+    target_compile_options(tpu_soc_probe PRIVATE -fPIE)
+    target_link_options(tpu_soc_probe PRIVATE -pie -static-libstdc++ -Wl,--as-needed)
+  elseif (UNIX AND NOT APPLE AND OPENBUENOS_INSTALL_SELFTEST)
+    install(TARGETS tpu_soc_probe RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  endif()
+
   if (NOT ANDROID)
     add_executable(openbuenos_host_test tests/openbuenos_host_test.cpp)
     target_link_libraries(openbuenos_host_test PRIVATE openbuenos)
@@ -80,6 +94,7 @@ if (OPENBUENOS_BUILD_TESTS)
     target_compile_options(openbuenos_host_test PRIVATE ${OPENBUENOS_COMPILE_FLAGS})
     enable_testing()
     add_test(NAME openbuenos_host_test COMMAND openbuenos_host_test)
+    add_test(NAME tpu_soc_probe_mock COMMAND tpu_soc_probe --mock)
   endif()
 endif()
 
