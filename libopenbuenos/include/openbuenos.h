@@ -383,8 +383,14 @@ ob_status_t ob_gemm_register_emitter(ob_context_t*      ctx,
  *
  * `dive_interp_path` loads the external RV64 DIVE interpreter binary (ext[1],
  * 638,977 B raw image, or extracts ext[1] automatically if a .dgc0 file is
- * passed). If NULL or empty, checks env `OPENBUENOS_DIVE_INTERP_PATH` and
- * falls back to "/data/local/tmp/tpu_open_stack/dive_interp_rv64.bin".
+ * passed). If NULL or empty, checks `OPENBUENOS_DIVE_INTERP_PATH` and then
+ * probes XDG/FHS/Android locations (`$XDG_DATA_HOME/freetpu/dive_interp_rv64.bin`,
+ * `$HOME/.local/share/freetpu/dive_interp_rv64.bin`,
+ * `/usr/local/share/freetpu/dive_interp_rv64.bin`,
+ * `/usr/share/freetpu/dive_interp_rv64.bin`,
+ * `/usr/lib/firmware/google/dive_interp_rv64.bin`,
+ * `/usr/share/omamobile/tpu/dive_interp_rv64.bin`,
+ * `/data/local/tmp/tpu_open_stack/dive_interp_rv64.bin`).
  */
 ob_status_t ob_gemm_register_builtin_emitter(ob_context_t* ctx,
                                              const char*   dive_interp_path);

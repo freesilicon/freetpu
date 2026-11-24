@@ -1,9 +1,18 @@
 cmake_minimum_required(VERSION 3.18)
 project(openbuenos VERSION 0.1.0 LANGUAGES C CXX)
 
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
 option(OPENBUENOS_BUILD_TESTS "Build libopenbuenos self-test / host unit test binaries" ON)
+option(OPENBUENOS_INSTALL_SELFTEST "Install openbuenos_selftest utility" ON)
+option(OPENBUENOS_WERROR "Treat compiler warnings as errors" ON)
 
 set(OPENBUENOS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
+set(OPENBUENOS_COMPILE_FLAGS -Wall -Wextra -fno-exceptions -fno-rtti)
+if (OPENBUENOS_WERROR)
+  list(APPEND OPENBUENOS_COMPILE_FLAGS -Werror)
+endif()
 
 add_library(openbuenos STATIC
   src/ob_sha256.cpp
@@ -18,26 +27,25 @@ add_library(openbuenos STATIC
 
 add_library(openbuenos::openbuenos ALIAS openbuenos)
 
-target_compile_features(openbuenos PRIVATE cxx_std_17)
-target_compile_options(openbuenos PRIVATE
-  -Wall -Wextra -Werror -fno-exceptions -fno-rtti
-)
+set_target_properties(openbuenos PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_compile_features(openbuenos PUBLIC cxx_std_17)
+target_compile_options(openbuenos PRIVATE ${OPENBUENOS_COMPILE_FLAGS})
 
 target_include_directories(openbuenos
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
   PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${OPENBUENOS_ROOT}/docs/baremetal-vii
-    ${OPENBUENOS_ROOT}/docs/kernel-abi
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+    $<BUILD_INTERFACE:${OPENBUENOS_ROOT}/docs/baremetal-vii>
+    $<BUILD_INTERFACE:${OPENBUENOS_ROOT}/docs/kernel-abi>
 )
 
 if (UNIX AND NOT APPLE)
-  if (ANDROID)
-    target_link_libraries(openbuenos PUBLIC m)
-  else()
-    target_link_libraries(openbuenos PUBLIC m pthread)
+  target_link_libraries(openbuenos PUBLIC m)
+  if (NOT ANDROID)
+    find_package(Threads REQUIRED)
+    target_link_libraries(openbuenos PUBLIC Threads::Threads)
   endif()
 elseif (APPLE)
   target_link_libraries(openbuenos PUBLIC m)
@@ -52,10 +60,12 @@ if (OPENBUENOS_BUILD_TESTS)
     ${OPENBUENOS_ROOT}/docs/kernel-abi
   )
   target_compile_features(openbuenos_selftest PRIVATE cxx_std_17)
-  target_compile_options(openbuenos_selftest PRIVATE -Wall -Wextra -Werror -fno-exceptions -fno-rtti)
+  target_compile_options(openbuenos_selftest PRIVATE ${OPENBUENOS_COMPILE_FLAGS})
   if (ANDROID)
     target_compile_options(openbuenos_selftest PRIVATE -fPIE)
     target_link_options(openbuenos_selftest PRIVATE -pie -static-libstdc++ -Wl,--as-needed)
+  elseif (UNIX AND NOT APPLE AND OPENBUENOS_INSTALL_SELFTEST)
+    install(TARGETS openbuenos_selftest RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
   endif()
 
   if (NOT ANDROID)
@@ -67,8 +77,40 @@ if (OPENBUENOS_BUILD_TESTS)
       ${OPENBUENOS_ROOT}/docs/kernel-abi
     )
     target_compile_features(openbuenos_host_test PRIVATE cxx_std_17)
-    target_compile_options(openbuenos_host_test PRIVATE -Wall -Wextra -Werror -fno-exceptions -fno-rtti)
+    target_compile_options(openbuenos_host_test PRIVATE ${OPENBUENOS_COMPILE_FLAGS})
     enable_testing()
     add_test(NAME openbuenos_host_test COMMAND openbuenos_host_test)
   endif()
 endif()
+
+install(TARGETS openbuenos
+  EXPORT openbuenosTargets
+  ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+)
+install(FILES include/openbuenos.h
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+install(FILES ${OPENBUENOS_ROOT}/docs/kernel-abi/edgetpu_buenos_uapi.h
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/freetpu
+)
+install(EXPORT openbuenosTargets
+  FILE openbuenosTargets.cmake
+  NAMESPACE openbuenos::
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/openbuenos
+)
+configure_package_config_file(
+  ${CMAKE_CURRENT_SOURCE_DIR}/cmake/openbuenosConfig.cmake.in
+  ${CMAKE_CURRENT_BINARY_DIR}/openbuenosConfig.cmake
+  INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/openbuenos
+)
+write_basic_package_version_file(
+  ${CMAKE_CURRENT_BINARY_DIR}/openbuenosConfigVersion.cmake
+  VERSION ${PROJECT_VERSION}
+  COMPATIBILITY SameMajorVersion
+)
+install(FILES
+  ${CMAKE_CURRENT_BINARY_DIR}/openbuenosConfig.cmake
+  ${CMAKE_CURRENT_BINARY_DIR}/openbuenosConfigVersion.cmake
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/openbuenos
+)

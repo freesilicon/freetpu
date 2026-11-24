@@ -95,10 +95,49 @@ build_android() {
     ls -lh "$strip_dir"
 }
 
+build_linux_arm64() {
+    echo "=== Building libopenbuenos (build/linux-arm64) ==="
+    "$CMAKE" -S "$OB" -B "$OB/build/linux-arm64" -G Ninja \
+        -DCMAKE_MAKE_PROGRAM="$NINJA" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+    "$CMAKE" --build "$OB/build/linux-arm64" -j"$JOBS"
+
+    overlay_backend
+    echo "=== Building Linux ARM64 llama.cpp + ggml-edgetpu (build-linux-arm64) ==="
+    "$CMAKE" -S "$SRC" -B "$ROOT/build-linux-arm64" -G Ninja \
+        -DCMAKE_MAKE_PROGRAM="$NINJA" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DGGML_EDGETPU=ON \
+        -DGGML_RPC=ON \
+        -DGGML_RPC_RDMA=OFF \
+        -DGGML_OPENMP=ON \
+        -DGGML_CPU_ARM_ARCH="armv8.2-a+dotprod+fp16+i8mm" \
+        -DLLAMA_BUILD_TESTS=ON \
+        -DLLAMA_BUILD_TOOLS=ON \
+        -DLLAMA_OPENSSL=OFF \
+        -DOPENBUENOS_DIR="$OB"
+    "$CMAKE" --build "$ROOT/build-linux-arm64" --target test-backend-ops llama-cli llama-bench llama-completion ggml-rpc-server -j"$JOBS"
+
+    if command -v readelf >/dev/null 2>&1; then
+        echo "=== Verifying zero-Google-.so Linux ARM64 binaries ==="
+        for b in llama-cli llama-bench llama-completion test-backend-ops ggml-rpc-server; do
+            local needed
+            needed="$(readelf -d "$ROOT/build-linux-arm64/bin/$b" | grep 'NEEDED' || true)"
+            if echo "$needed" | grep -Eqi 'libedgetpu|libdarwinn|libgxp|liblitert'; then
+                echo "ERROR: Forbidden Google TPU library found in $b!" >&2
+                exit 1
+            fi
+        done
+    fi
+}
+
 case "$mode" in
-    overlay) overlay_backend ;;
-    host)    build_host ;;
-    android) build_android ;;
-    all)     build_host; build_android ;;
-    *)       echo "Usage: $0 [overlay|host|android|all]" >&2; exit 2 ;;
+    overlay)     overlay_backend ;;
+    host)        build_host ;;
+    linux-arm64) build_linux_arm64 ;;
+    android)     build_android ;;
+    all)         build_host; build_android ;;
+    *)           echo "Usage: $0 [overlay|host|linux-arm64|android|all]" >&2; exit 2 ;;
 esac

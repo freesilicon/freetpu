@@ -12,6 +12,7 @@
 #include <dirent.h>
 #include <random>
 #include <string>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <unordered_set>
 #include <vector>
@@ -5367,6 +5368,57 @@ void test_phase8b_spsc_async_dequant_and_w8a16_pt() {
               oracle_verified ? "12880/12880_EXACT" : "skipped");
 }
 
+void test_dive_interp_xdg_probe() {
+  char dir_tmpl[] = "/tmp/ob_xdg_XXXXXX";
+  char* tmp_root = ::mkdtemp(dir_tmpl);
+  CHECK(tmp_root != nullptr);
+  if (!tmp_root) return;
+
+  std::string freetpu_dir = std::string(tmp_root) + "/freetpu";
+  CHECK(::mkdir(freetpu_dir.c_str(), 0700) == 0);
+  std::string bin_path = freetpu_dir + "/dive_interp_rv64.bin";
+
+  std::vector<uint8_t> img = make_synthetic_dive_interp(0x3Cu);
+  FILE* fp = std::fopen(bin_path.c_str(), "wb");
+  CHECK(fp != nullptr);
+  if (fp) {
+    CHECK(std::fwrite(img.data(), 1, img.size(), fp) == img.size());
+    std::fclose(fp);
+  }
+
+  const char* prev_xdg = std::getenv("XDG_DATA_HOME");
+  std::string saved_xdg = prev_xdg ? prev_xdg : "";
+  const char* prev_override = std::getenv("OPENBUENOS_DIVE_INTERP_PATH");
+  std::string saved_override = prev_override ? prev_override : "";
+
+  ::unsetenv("OPENBUENOS_DIVE_INTERP_PATH");
+  ::setenv("XDG_DATA_HOME", tmp_root, 1);
+
+  ob_config_t cfg = ob_config_default();
+  cfg.mock_mode = 1;
+  ob_context_t* ctx = nullptr;
+  CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+  CHECK(ob_gemm_register_builtin_emitter(ctx, nullptr) == OB_OK);
+  ob_context_destroy(ctx);
+
+  // Restore environment and remove temp artifacts.
+  if (prev_xdg) {
+    ::setenv("XDG_DATA_HOME", saved_xdg.c_str(), 1);
+  } else {
+    ::unsetenv("XDG_DATA_HOME");
+  }
+  if (prev_override) {
+    ::setenv("OPENBUENOS_DIVE_INTERP_PATH", saved_override.c_str(), 1);
+  } else {
+    ::unsetenv("OPENBUENOS_DIVE_INTERP_PATH");
+  }
+  ::unlink(bin_path.c_str());
+  ::rmdir(freetpu_dir.c_str());
+  ::rmdir(tmp_root);
+
+  std::printf("[PASS] test_dive_interp_xdg_probe\n");
+}
+
 }  // namespace
 
 int main() {
@@ -5416,9 +5468,10 @@ int main() {
   test_phase7_cycle3_regressions();
   test_phase8a_overlapped_neon_worker_pool_and_swiglu_m64();
   test_phase8b_spsc_async_dequant_and_w8a16_pt();
+  test_dive_interp_xdg_probe();
 
   if (g_failures == 0) {
-    std::printf("ALL LIBOPENBUENOS HOST TESTS PASSED (22/22 suites)\n");
+    std::printf("ALL LIBOPENBUENOS HOST TESTS PASSED (23/23 suites)\n");
     return 0;
   }
   std::fprintf(stderr, "LIBOPENBUENOS HOST TESTS FAILED (%d failures)\n", g_failures);

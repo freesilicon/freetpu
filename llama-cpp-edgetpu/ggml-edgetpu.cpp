@@ -19,7 +19,6 @@
 #include <mutex>
 #include <unordered_map>
 #include <vector>
-
 #if defined(__linux__) || defined(__ANDROID__)
 #include <unistd.h>
 #endif
@@ -32,11 +31,10 @@
 
 namespace {
 
-constexpr size_t       EDGETPU_BUFFER_ALIGNMENT         = 64;
-constexpr uint32_t     EDGETPU_DEFAULT_CACHE_CAP        = 2048u;
-constexpr uint32_t     EDGETPU_DEFAULT_POOL_MAX_BYTES   = 128u * 1024u * 1024u;
-constexpr int64_t      EDGETPU_DEFAULT_GLU_MAX_M        = 64;
-constexpr const char * EDGETPU_DEFAULT_DIVE_INTERP_PATH = "/data/local/tmp/tpu_open_stack/dive_interp_rv64.bin";
+constexpr size_t   EDGETPU_BUFFER_ALIGNMENT       = 64;
+constexpr uint32_t EDGETPU_DEFAULT_CACHE_CAP      = 2048u;
+constexpr uint32_t EDGETPU_DEFAULT_POOL_MAX_BYTES = 128u * 1024u * 1024u;
+constexpr int64_t  EDGETPU_DEFAULT_GLU_MAX_M      = 64;
 
 struct edgetpu_env_config {
     bool         mock_mode             = false;
@@ -61,7 +59,7 @@ struct edgetpu_env_config {
     bool         has_priority          = false;
     uint8_t      perf_mode             = 0; // 0 -> libopenbuenos default, 1..5 = DVFS perf tier
     bool         has_perf_mode         = false;
-    const char * dive_interp_path      = EDGETPU_DEFAULT_DIVE_INTERP_PATH;
+    const char * dive_interp_path      = nullptr;
 };
 
 static bool parse_env_u8(const char * name, uint8_t * out) {
@@ -82,6 +80,10 @@ static edgetpu_env_config load_env_config() {
     edgetpu_env_config cfg;
 #if defined(__ANDROID__)
     cfg.mock_mode = false;
+#elif defined(__linux__) && (defined(__aarch64__) || defined(__arm__))
+    // Native ARM/ARM64 Linux (e.g. OmaMobile / Arch Linux ARM): run hardware
+    // mode when /dev/edgetpu-soc exists, otherwise fall back to mock mode.
+    cfg.mock_mode = (::access("/dev/edgetpu-soc", F_OK) != 0);
 #else
     cfg.mock_mode = true;
 #endif
@@ -2943,13 +2945,14 @@ ggml_backend_t ggml_backend_edgetpu_init(void) {
 
     const char * interp_path = (env.dive_interp_path && env.dive_interp_path[0] != '\0')
                                    ? env.dive_interp_path
-                                   : EDGETPU_DEFAULT_DIVE_INTERP_PATH;
+                                   : nullptr;
     bool emitter_ok = false;
     if (!env.mock_mode) {
         st = ob_gemm_register_builtin_emitter(ob_ctx, interp_path);
         if (st != OB_OK) {
             GGML_LOG_ERROR("ggml-edgetpu: ob_gemm_register_builtin_emitter('%s') failed (%s): %s\n",
-                           interp_path, ob_status_string(st), ob_context_last_error(ob_ctx));
+                           interp_path ? interp_path : "<auto>",
+                           ob_status_string(st), ob_context_last_error(ob_ctx));
             GGML_LOG_ERROR("ggml-edgetpu: refusing silent CPU fallback in hardware mode (mock_mode=0); "
                            "ensure dive_interp_rv64.bin exists or set OPENBUENOS_DIVE_INTERP_PATH / OPENBUENOS_MOCK=1\n");
             ob_context_destroy(ob_ctx);
