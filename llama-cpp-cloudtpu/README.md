@@ -92,7 +92,7 @@ Four stacked optimizations close the single-stream and batched serving gap while
   - Keeping **`CLOUDTPU_ASYNC_COLLECTIVES=0`** by default in `ggml-cloudtpu.cpp` avoids the legacy `Aug 15 2025` `libtpu.so` `PJRT_Client_Compile: MegaChip currently works correctly only when base is zero` failure on 8-chip 1-graph execution (`Qwen2.5-1.5B` `-p 4 -n 4`: `pp4 = 61.25` / `tg4 = 28.79`, `2.54x` `tg4` vs `CLOUDTPU_FUSE_ATTN=0`).
   - **Host `libtpu` Version Tip:** Ubuntu 22.04 Cloud TPU VMs ship Python 3.10, causing `pip install libtpu` to pull a legacy 2025 `libtpu.so` (`libtpu >= 0.0.50` wheels require Python `>=3.11`). Extracting `libtpu/libtpu.so` directly from the PyPI `cp312` `manylinux_2_31_x86_64` wheel and setting `LIBTPU_PATH` avoids any Python dependency at runtime (`MAPS_LIBPYTHON=0`).
 
-#### Live `v6e-8` Verification (`libtpu 0.0.53.1`, `Nov 17 2026` `TFRT TPU v6 lite`, `fedad85`, `MAPS_LIBPYTHON=0`, `LDD_LIBPYTHON=0`)
+#### Live `v6e-4` / `v6e-8` Verification (`libtpu 0.0.53.1`, `Nov 17 2026` `TFRT TPU v6 lite`, `fedad85` / `d88ad85`, `MAPS_LIBPYTHON=0`, `LDD_LIBPYTHON=0`)
 - **Clean `cp312` `libtpu 0.0.53.1` Extraction (Zero Runtime Python):**
   ```bash
   python3 -c '
@@ -108,7 +108,7 @@ Four stacked optimizations close the single-stream and batched serving gap while
 - **Standalone Suite & `ASYNC_COLLECTIVES=1` Findings (`CLOUDTPU_MOCK=0`):**
   - `test_cloudtpu_host` (`CLOUDTPU_MOCK=0`, `LIBTPU_PATH=libtpu-0.0.53.1.so`): `28` passing test groups with `1` assertion failure at `tests/test_cloudtpu_host.cpp:1059` (`Opt-in BF16 FLASH_ATTN_EXT should reflect BF16 rounding (0.5f)`), `MAPS_LIBPYTHON=0`.
   - **`CLOUDTPU_ASYNC_COLLECTIVES=1` on `libtpu 0.0.53.1` `v6e` (`ghostlite`):** `PJRT_Client_Create` fails initialization with `Continuation fusion for AllGather is enabled on platform ghostlite (variant: ), but it is not supported/recommended on platforms other than TPU v5e... Please disable it with xla_tpu_enable_async_collective_fusion=false` (`0` devices exposed, causing `llama-bench` to fall back to host CPU). Keep **`CLOUDTPU_ASYNC_COLLECTIVES=0`** (default) on `v6e`.
-- **End-to-End `v6e-8` Benchmarks (`llama-bench -ngl 99 -fa 1 -p 512 -n 64 -r 3` & `llama-cli`, `libtpu 0.0.53.1`):**
+- **End-to-End `v6e-4` / `v6e-8` Benchmarks (`llama-bench -ngl 99 -fa 1 -p 512 -n 64 -r 3` & `llama-cli`, `libtpu 0.0.53.1`):**
   *(3-iteration means include run-1 XLA cold JIT compile in stddev.)*
 
 | Model (GGUF `Q4_K_M`) | Size | Chips (`P`) | `pp512` (tok/s) | `tg64` (tok/s) | Speedup vs Legacy `v6e` `libtpu.so` | Notes |
@@ -118,9 +118,11 @@ Four stacked optimizations close the single-stream and batched serving gap while
 | `Meta-Llama-3.1-8B-Instruct` | `4.58 GiB` | `1` (`-sm none -mg 0`) | `7,594.14 ± 1,681.51` | **`91.62 ± 28.00`** | **1.73x `tg64`** (`52.98`) | `llama-cli` coherent (`17 * 23 = 391`) |
 | `Meta-Llama-3.1-8B-Instruct` | `4.58 GiB` | `8` (`SPMD`) | `7,974.23 ± 2,478.81` | **`65.04 ± 8.00`** | — | `llama-cli` coherent (`17 * 23 = 391`) |
 | `Qwen3-32B` | `18.40 GiB` | `8` (`SPMD`) | **`3,609.05 ± 171.84`** | **`29.00 ± 1.54`** | **4.03x `tg64`** (`7.20` M4A) | `llama-cli` coherent (`17 * 23 = 391`) |
+| `Llama-3.3-70B-Instruct` | `39.59 GiB` | `4` (`v6e-4` `SPMD`) | **`1,386.88 ± 2.48`** | **`21.83 ± 0.06`** | **9.79x `tg64`** (`2.23` M4A `v6e-8`) | `2.45x` prefill / `2.90x` decode vs `P=8` at half chip count (`d88ad85`); `llama-cli` interrupted mid-load on teardown |
+| `Llama-3.3-70B-Instruct` | `39.59 GiB` | `8` (`v6e-8` `SPMD`) | `564.93 ± 16.60` | **`7.52 ± 0.05`** | **3.37x `tg64`** (`2.23` M4A) | `llama-cli` coherent (`17 * 23 = 391`, `d88ad85`) |
 
   - `Llama-3.1-8B P=1` continuous batching (`llama-server -ngl 99 -fa 1 -sm none -mg 0 -np 16 -cb -kvu -c 8192` w/ `LLAMA_KV_ROWS_DISABLE=1`, `MAPS_LIBPYTHON=0`): `16/16` coherent replies (`sum_decode_tok_s` `8.51` / `17.24` / `22.26` / `28.19` and cold-compile wall throughput `4.15` / `11.43` / `2.50` / `3.71` tok/s across `c=1, 4, 8, 16`; `c=1` timing check: `8.51` decode `tok/s`).
-  - `Llama-3.3-70B-Instruct` (`Q4_K_M`, `39.59 GiB`, `P=8`): GGUF downloaded and entered weight load (`Loading model...`), deferred before `llama-bench` completion due to the VM time cap.
+  - **70B Mesh Sizing (`v6e-4` vs `v6e-8`):** `Llama-3.3-70B-Instruct Q4_K_M` (`39.59 GiB`, `~10 GiB/chip` on `v6e-4` out of `32 GiB/chip` HBM) runs **`2.45x` faster prefill** (`1,386.88` vs `564.93` tok/s) and **`2.90x` faster decode** (`21.83` vs `7.52` tok/s) on `v6e-4` (`P=4`) than `v6e-8` (`P=8`) at half the chip count due to lower ICI collective overhead across fewer replicas (measured on `d88ad85`, `LDD_LIBPYTHON=0`, `MAPS_LIBPYTHON=0`).
 
 ### M4A Multi-Chip SPMD Live Silicon Proof (`v6e-8` Trillium, `MAPS_LIBPYTHON=0`)
 
