@@ -75,7 +75,8 @@ enum ob_stat_flags {
   OB_STAT_FLAG_MOCK         = (1u << 0),
   OB_STAT_FLAG_CACHE_HIT    = (1u << 1),
   OB_STAT_FLAG_CPU_FALLBACK = (1u << 2),
-  OB_STAT_FLAG_EMITTER_USED = (1u << 3)
+  OB_STAT_FLAG_EMITTER_USED = (1u << 3),
+  OB_STAT_FLAG_FREETILE     = (1u << 4)
 };
 
 /* =========================================================================
@@ -246,6 +247,20 @@ ob_status_t ob_context_set_perf_mode(ob_context_t* ctx, uint32_t perf_mode);
 ob_status_t ob_context_set_profile(ob_context_t* ctx, int enable);
 ob_status_t ob_context_get_profile(const ob_context_t* ctx, ob_profile_stats_t* out_profile);
 ob_status_t ob_context_reset_profile(ob_context_t* ctx);
+
+/*
+ * Opt-in / defaultable FreeTile BUENOS_A0 VLIW/DGC0 emitter switch.
+ *
+ * When enabled (via OPENBUENOS_FREETILE=1, compile-time OPENBUENOS_FREETILE_DEFAULT_ON,
+ * or ob_context_set_freetile(ctx, 1)), supported W8A8/W8A16/fused-activation kernels
+ * are emitted through freetile::buenos_emitter with automatic fallback to the legacy
+ * builtin ob_gemm_emitter for unsupported shapes or epilogues (e.g. chained SwiGLU).
+ */
+int         ob_context_get_freetile(const ob_context_t* ctx);
+ob_status_t ob_context_set_freetile(ob_context_t* ctx, int enable);
+ob_status_t ob_context_freetile_stats(const ob_context_t* ctx,
+                                      uint64_t*           out_emitted,
+                                      uint64_t*           out_fallbacks);
 
 /* =========================================================================
  * DMA-BUF Slab / Pool Buffer API (/dev/dma_heap/system + EDGETPU_MAP_DMABUF)

@@ -325,6 +325,7 @@ bool run_libopenbuenos_gemm(const char* dev_path,
   }
 
   const bool emitter_used = (stats.flags & OB_STAT_FLAG_EMITTER_USED) != 0u;
+  const bool freetile_used = (stats.flags & OB_STAT_FLAG_FREETILE) != 0u;
   if (require_tpu_gemm && (!emitter_used || (!mock && stats.hw_execution_us == 0u))) {
     std::fprintf(stderr, "libopenbuenos: TPU GEMM check failed (emitter_used=%d hw_us=%llu)\n",
                  emitter_used ? 1 : 0,
@@ -334,11 +335,12 @@ bool run_libopenbuenos_gemm(const char* dev_path,
   }
 
   std::printf("gemm_probe: PASS shape=1x64x64 mock=%d credits=%u buf_iova=0x%llx "
-              "emitter=%s flags=0x%x hw_us=%llu wall_us=%llu worst_err=%lld\n",
+              "emitter=%s freetile=%d flags=0x%x hw_us=%llu wall_us=%llu worst_err=%lld\n",
               ob_context_is_mock(ctx),
               static_cast<unsigned>(ob_context_credit_size(ctx)),
               static_cast<unsigned long long>(buf_iova),
               emitter_attached ? (emitter_used ? "attached+used" : "attached") : "none(cpu_fallback)",
+              (ob_context_get_freetile(ctx) || freetile_used) ? 1 : 0,
               static_cast<unsigned>(stats.flags),
               static_cast<unsigned long long>(stats.hw_execution_us),
               static_cast<unsigned long long>(stats.wall_time_us),

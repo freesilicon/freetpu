@@ -12,8 +12,8 @@ HOST_AR  ?= ar
 THIS_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 ROOT     := $(abspath $(THIS_DIR)/..)
 
-INCS := -I$(THIS_DIR)/include -I$(THIS_DIR)/src -I$(ROOT)/docs/baremetal-vii -I$(ROOT)/docs/kernel-abi
-COMMON_CXXFLAGS := -std=c++17 -O2 -Wall -Wextra -Werror -fno-exceptions -fno-rtti $(INCS)
+INCS := -I$(THIS_DIR)/include -I$(THIS_DIR)/src -I$(ROOT)/freetile/include -I$(ROOT)/docs/baremetal-vii -I$(ROOT)/docs/kernel-abi
+COMMON_CXXFLAGS := -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror -fno-exceptions -fno-rtti -DOPENBUENOS_WITH_FREETILE=1 -DOPENBUENOS_FREETILE_DEFAULT_ON_VAL=0 $(INCS)
 ANDROID_CXXFLAGS := $(COMMON_CXXFLAGS) -fPIE
 ANDROID_LDFLAGS  := -pie -static-libstdc++ -Wl,--as-needed -lm
 HOST_CXXFLAGS    := $(COMMON_CXXFLAGS)
@@ -26,20 +26,29 @@ SRCS := \
 	$(THIS_DIR)/src/ob_worker_pool.cpp \
 	$(THIS_DIR)/src/ob_device.cpp \
 	$(THIS_DIR)/src/ob_graph.cpp \
+	$(THIS_DIR)/src/ob_freetile_bridge.cpp \
 	$(THIS_DIR)/src/ob_gemm_emitter.cpp \
 	$(THIS_DIR)/src/ob_gemm.cpp
+
+FREETILE_SRCS := \
+	$(ROOT)/freetile/src/tile_ir.cpp \
+	$(ROOT)/freetile/src/buenos_emitter.cpp
 
 HDRS := \
 	$(THIS_DIR)/include/openbuenos.h \
 	$(THIS_DIR)/src/ob_internal.h \
+	$(ROOT)/freetile/include/freetile/tile_ir.hpp \
+	$(ROOT)/freetile/include/freetile/buenos_emitter.hpp \
 	$(ROOT)/docs/baremetal-vii/litebuf_vii_wire.h \
 	$(ROOT)/docs/kernel-abi/edgetpu_buenos_uapi.h
 
 HOST_DIR    := $(THIS_DIR)/build/host
 ANDROID_DIR := $(THIS_DIR)/build/android-arm64
 
-HOST_OBJS    := $(patsubst $(THIS_DIR)/src/%.cpp,$(HOST_DIR)/obj/%.o,$(SRCS))
-ANDROID_OBJS := $(patsubst $(THIS_DIR)/src/%.cpp,$(ANDROID_DIR)/obj/%.o,$(SRCS))
+HOST_OBJS    := $(patsubst $(THIS_DIR)/src/%.cpp,$(HOST_DIR)/obj/%.o,$(SRCS)) \
+                $(patsubst $(ROOT)/freetile/src/%.cpp,$(HOST_DIR)/obj/freetile_%.o,$(FREETILE_SRCS))
+ANDROID_OBJS := $(patsubst $(THIS_DIR)/src/%.cpp,$(ANDROID_DIR)/obj/%.o,$(SRCS)) \
+                $(patsubst $(ROOT)/freetile/src/%.cpp,$(ANDROID_DIR)/obj/freetile_%.o,$(FREETILE_SRCS))
 
 HOST_LIB     := $(HOST_DIR)/libopenbuenos.a
 HOST_TEST    := $(HOST_DIR)/openbuenos_host_test
@@ -58,6 +67,10 @@ $(HOST_DIR)/obj/%.o: $(THIS_DIR)/src/%.cpp $(HDRS)
 	@mkdir -p $(dir $@)
 	$(HOST_CXX) $(HOST_CXXFLAGS) -c $< -o $@
 
+$(HOST_DIR)/obj/freetile_%.o: $(ROOT)/freetile/src/%.cpp $(HDRS)
+	@mkdir -p $(dir $@)
+	$(HOST_CXX) $(HOST_CXXFLAGS) -c $< -o $@
+
 $(HOST_LIB): $(HOST_OBJS)
 	@mkdir -p $(dir $@)
 	$(HOST_AR) rcs $@ $(HOST_OBJS)
@@ -67,6 +80,10 @@ $(HOST_TEST): $(THIS_DIR)/tests/openbuenos_host_test.cpp $(HOST_LIB) $(HDRS)
 	$(HOST_CXX) $(HOST_CXXFLAGS) $< $(HOST_LIB) -o $@ $(HOST_LDFLAGS)
 
 $(ANDROID_DIR)/obj/%.o: $(THIS_DIR)/src/%.cpp $(HDRS)
+	@mkdir -p $(dir $@)
+	$(ANDROID_CXX) $(ANDROID_CXXFLAGS) -c $< -o $@
+
+$(ANDROID_DIR)/obj/freetile_%.o: $(ROOT)/freetile/src/%.cpp $(HDRS)
 	@mkdir -p $(dir $@)
 	$(ANDROID_CXX) $(ANDROID_CXXFLAGS) -c $< -o $@
 

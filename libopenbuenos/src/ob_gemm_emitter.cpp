@@ -5586,15 +5586,39 @@ ob_status_t builtin_gemm_emitter_cb(const ob_gemm_desc_t* desc,
     return OB_ERR_INVALID_ARG;
   }
 
-  GemmSynthResult parts{};
+  ctx->last_emit_was_freetile = false;
+  std::vector<uint8_t> dgc0;
   std::string err;
+
+  if (ctx->freetile_enabled) {
+    std::string ft_err;
+    ob_status_t ft_st = freetile_try_emit_w8a8_dgc0(
+        *desc,
+        ctx->builtin_dive_interp.data(),
+        ctx->builtin_dive_interp.size(),
+        &dgc0,
+        &ft_err);
+    if (ft_st == OB_OK && !dgc0.empty()) {
+      ctx->last_emit_was_freetile = true;
+      *out_size = dgc0.size();
+      if (!out_buf || out_cap < dgc0.size()) {
+        return OB_ERR_OVERFLOW;
+      }
+      ctx->freetile_emits.fetch_add(1u, std::memory_order_relaxed);
+      std::memcpy(out_buf, dgc0.data(), dgc0.size());
+      return OB_OK;
+    }
+    ctx->freetile_fallbacks.fetch_add(1u, std::memory_order_relaxed);
+    dgc0.clear();
+  }
+
+  GemmSynthResult parts{};
   ob_status_t st = synthesize_gemm_parts(*desc, &parts, &err);
   if (st != OB_OK) {
     if (!err.empty()) set_last_error(ctx, err);
     return st;
   }
 
-  std::vector<uint8_t> dgc0;
   st = build_dgc0_from_parts(*desc, parts,
                              ctx->builtin_dive_interp.data(),
                              ctx->builtin_dive_interp.size(),

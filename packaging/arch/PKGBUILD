@@ -2,9 +2,14 @@
 # Maintainer: OmaMobile Contributors
 #
 # Clean-room userspace stack for Tensor G5 (laguna) EdgeTPU (/dev/edgetpu-soc):
-#   - libopenbuenos static library (built -fPIC) + CMake package + headers
-#   - tpu_baremetal_runner and openbuenos_selftest CLI utilities
+#   - libopenbuenos static library (built -fPIC, wired with FreeTile BUENOS_A0) + CMake package + headers
+#   - tpu_soc_probe, openbuenos_selftest, and tpu_baremetal_runner CLI utilities
 #   - udev rules for non-root access to /dev/edgetpu-soc and /dev/dma_heap/system
+#
+# Runtime emitter selection:
+#   - OPENBUENOS_FREETILE=1 enables the zero-dep C++17 FreeTile BUENOS_A0 VLIW/DGC0
+#     emitter with automatic fallback to legacy ob_gemm_emitter for unsupported shapes/epilogues.
+#   - Set -DOPENBUENOS_FREETILE_DEFAULT_ON=ON at build time to make FreeTile default-on.
 #
 # Proprietary firmware (google/edgetpu-buenos.fw) and the RV64 interpreter binary
 # (dive_interp_rv64.bin) are NOT packaged here; extract them from the device
@@ -12,8 +17,8 @@
 
 pkgname=omamobile-freetpu
 pkgver=0.1.0
-pkgrel=1
-pkgdesc='Clean-room userspace runtime and bare-metal runner for Google Tensor G5 (laguna) EdgeTPU'
+pkgrel=2
+pkgdesc='Clean-room userspace runtime, FreeTile BUENOS_A0 emitter, and bare-metal runner for Google Tensor G5 (laguna) EdgeTPU'
 arch=(aarch64)
 url='https://github.com/saariuslystoned/freetpu'
 license=(Apache-2.0)
@@ -22,7 +27,7 @@ makedepends=(cmake ninja gcc)
 optdepends=(
   'linux-omamobile: mainline Tensor G5 EdgeTPU kernel driver (/dev/edgetpu-soc)'
 )
-provides=(libopenbuenos freetpu)
+provides=(libopenbuenos freetpu freetile)
 source=(
   "freetpu-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz"
   99-edgetpu.rules
@@ -34,6 +39,8 @@ build() {
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX=/usr \
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+    -DOPENBUENOS_ENABLE_FREETILE=ON \
+    -DOPENBUENOS_FREETILE_DEFAULT_ON=OFF \
     -DOPENBUENOS_BUILD_TESTS=ON \
     -DOPENBUENOS_INSTALL_SELFTEST=ON \
     -DOPENBUENOS_WERROR=OFF

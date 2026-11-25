@@ -144,8 +144,17 @@ bool inspect_buenos_dgc0(const uint8_t* data,
 // Lowers a validated ChipTarget::BUENOS_A0 TileKernel directly into Tensor G5
 // (buenos_a0) 7-chunk VLIW descriptors, DIVE VM IR (ext[0]), packed parameters (ext[2]),
 // and (when opts.dive_interp is supplied) a complete 64-byte-aligned DGC0 executable.
-// Throws std::runtime_error on invalid kernel, unsupported target/shape, or invalid options.
+// Non-throwing variant safe for -fno-exceptions builds (e.g. libopenbuenos).
+bool try_emit_buenos_kernel(const TileKernel& kernel,
+                            const BuenosEmitOptions& opts,
+                            BuenosEmitResult* out_result,
+                            std::string* err = nullptr);
+
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS)
+// Convenience wrapper that throws std::runtime_error on invalid kernel,
+// unsupported target/shape, or invalid options.
 BuenosEmitResult emit_buenos_kernel(const TileKernel& kernel,
                                     const BuenosEmitOptions& opts = {});
+#endif
 
 }  // namespace freetile

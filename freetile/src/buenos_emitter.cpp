@@ -18,7 +18,9 @@
 #include <iomanip>
 #include <locale>
 #include <sstream>
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS)
 #include <stdexcept>
+#endif
 #include <string>
 #include <utility>
 #include <vector>
@@ -5857,19 +5859,24 @@ bool inspect_buenos_dgc0(const uint8_t* data,
     return true;
 }
 
-BuenosEmitResult emit_buenos_kernel(const TileKernel& kernel,
-                                    const BuenosEmitOptions& opts) {
-    std::string err;
-    if (!kernel.validate(&err)) {
-        throw std::runtime_error("emit_buenos_kernel: invalid TileKernel: " + err);
+bool try_emit_buenos_kernel(const TileKernel& kernel,
+                            const BuenosEmitOptions& opts,
+                            BuenosEmitResult* out_result,
+                            std::string* err) {
+    if (out_result == nullptr) {
+        return set_err(err, "emit_buenos_kernel: out_result is null");
+    }
+    std::string local_err;
+    if (!kernel.validate(&local_err)) {
+        return set_err(err, "emit_buenos_kernel: invalid TileKernel: " + local_err);
     }
     if (kernel.target != ChipTarget::BUENOS_A0) {
-        throw std::runtime_error(std::string("emit_buenos_kernel: target ") +
-                                 chip_target_name(kernel.target) + " is not BUENOS_A0");
+        return set_err(err, std::string("emit_buenos_kernel: target ") +
+                                chip_target_name(kernel.target) + " is not BUENOS_A0");
     }
     if (kernel.matmul.quant != QuantFormat::Q8_0 && kernel.matmul.quant != QuantFormat::NONE) {
-        throw std::runtime_error(std::string("emit_buenos_kernel: unsupported QuantFormat ") +
-                                 quant_format_name(kernel.matmul.quant) + " on BUENOS_A0");
+        return set_err(err, std::string("emit_buenos_kernel: unsupported QuantFormat ") +
+                                quant_format_name(kernel.matmul.quant) + " on BUENOS_A0");
     }
 
     const uint32_t M = static_cast<uint32_t>(kernel.matmul.m);
@@ -5903,13 +5910,13 @@ BuenosEmitResult emit_buenos_kernel(const TileKernel& kernel,
 
     if (mode == BuenosKernelMode::W8A16_PT_1X) {
         if (!is_buenos_w8a16_shape(M, K, N)) {
-            throw std::runtime_error("emit_buenos_kernel: W8A16_PT_1X requires M=1 and K, N in {512, 1024, 1536, 2048}");
+            return set_err(err, "emit_buenos_kernel: W8A16_PT_1X requires M=1 and K, N in {512, 1024, 1536, 2048}");
         }
         if (act != EpilogueActivation::NONE) {
-            throw std::runtime_error("emit_buenos_kernel: W8A16_PT_1X does not support fused epilogue activations");
+            return set_err(err, "emit_buenos_kernel: W8A16_PT_1X does not support fused epilogue activations");
         }
         if (opts.w8a16_pt_scale <= 0.0f) {
-            throw std::runtime_error("emit_buenos_kernel: W8A16_PT_1X requires w8a16_pt_scale > 0");
+            return set_err(err, "emit_buenos_kernel: W8A16_PT_1X requires w8a16_pt_scale > 0");
         }
 
         res.ext2_params = buenos_pack_w8a16_ext2(N, K, opts.weights_nk);
@@ -5960,23 +5967,24 @@ BuenosEmitResult emit_buenos_kernel(const TileKernel& kernel,
         std::ostringstream key = make_classic_stream();
         key << "buenos_w8a16_" << hex_digest_prefix(digest, 8u) << "_" << res.ext0_dive.size();
         res.cache_key = key.str();
-        return res;
+        *out_result = std::move(res);
+        return true;
     }
 
     // W8A8_INT8 or W8A8_DYN_WEIGHTS
     if (opts.zp_w != 0) {
-        throw std::runtime_error("emit_buenos_kernel: buenos_a0 FC ISA requires symmetric weights (zp_w == 0)");
+        return set_err(err, "emit_buenos_kernel: buenos_a0 FC ISA requires symmetric weights (zp_w == 0)");
     }
     if (opts.s_in <= 0.0f || opts.s_w <= 0.0f || opts.s_out <= 0.0f) {
-        throw std::runtime_error("emit_buenos_kernel: quantization scales must be strictly positive");
+        return set_err(err, "emit_buenos_kernel: quantization scales must be strictly positive");
     }
     if (act != EpilogueActivation::NONE && act != EpilogueActivation::RELU &&
         act != EpilogueActivation::RELU6 && act != EpilogueActivation::SILU &&
         act != EpilogueActivation::GELU) {
-        throw std::runtime_error("emit_buenos_kernel: unsupported EpilogueActivation");
+        return set_err(err, "emit_buenos_kernel: unsupported EpilogueActivation");
     }
-    if (!is_buenos_w8a8_shape(M, K, N, &err)) {
-        throw std::runtime_error("emit_buenos_kernel: " + err);
+    if (!is_buenos_w8a8_shape(M, K, N, &local_err)) {
+        return set_err(err, "emit_buenos_kernel: " + local_err);
     }
 
     const bool is_dyn = (mode == BuenosKernelMode::W8A8_DYN_WEIGHTS);
@@ -6066,8 +6074,8 @@ BuenosEmitResult emit_buenos_kernel(const TileKernel& kernel,
         if (!buenos_apply_mode_a_fusion_c5(&res.chunks[5], act,
                                            mac_s_out, mac_zp_out,
                                            opts.s_out, opts.zp_out,
-                                           &res.mode_a_max_lsb_err, &err)) {
-            throw std::runtime_error("emit_buenos_kernel: " + err);
+                                           &res.mode_a_max_lsb_err, &local_err)) {
+            return set_err(err, "emit_buenos_kernel: " + local_err);
         }
     }
 
@@ -6105,7 +6113,8 @@ BuenosEmitResult emit_buenos_kernel(const TileKernel& kernel,
         std::ostringstream key = make_classic_stream();
         key << "buenos_dyn_" << hex_digest_prefix(digest, 8u) << "_" << res.ext0_dive.size();
         res.cache_key = key.str();
-        return res;
+        *out_result = std::move(res);
+        return true;
     }
 
     res.ext0_dive = build_dive_ext0_clean(res.chunks, M, K, N);
@@ -6161,7 +6170,20 @@ BuenosEmitResult emit_buenos_kernel(const TileKernel& kernel,
     std::ostringstream key = make_classic_stream();
     key << "buenos_w8a8_" << hex_digest_prefix(digest, 8u) << "_" << res.ext0_dive.size();
     res.cache_key = key.str();
+    *out_result = std::move(res);
+    return true;
+}
+
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS)
+BuenosEmitResult emit_buenos_kernel(const TileKernel& kernel,
+                                    const BuenosEmitOptions& opts) {
+    BuenosEmitResult res;
+    std::string err;
+    if (!try_emit_buenos_kernel(kernel, opts, &res, &err)) {
+        throw std::runtime_error(err);
+    }
     return res;
 }
+#endif
 
 }  // namespace freetile

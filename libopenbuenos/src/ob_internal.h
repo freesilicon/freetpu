@@ -207,6 +207,7 @@ struct CachedGraph {
   ob_buffer* reg_cmd_buf = nullptr;
   bool owns_image_buf = true;
   bool owns_params_buf = true;
+  bool emitted_by_freetile = false;
   uint32_t ref_count = 0;
   std::list<CachedGraph*>::iterator lru_it;
   bool in_cache = false;
@@ -593,6 +594,28 @@ ob_status_t builtin_gemm_emitter_cb(const ob_gemm_desc_t* desc,
                                     size_t* out_size,
                                     void* user_data);
 
+// FreeTile BUENOS_A0 VLIW/DGC0 emitter bridge (implemented in ob_freetile_bridge.cpp).
+bool        freetile_is_compiled_in();
+ob_status_t freetile_try_emit_w8a8_dgc0(const ob_gemm_desc_t& desc,
+                                        const uint8_t* dive_interp,
+                                        size_t dive_interp_size,
+                                        std::vector<uint8_t>* out_dgc0,
+                                        std::string* err);
+ob_status_t freetile_try_emit_w8a16_dgc0(uint32_t K,
+                                         uint32_t N,
+                                         float pt_scale,
+                                         const int8_t* weights_nk,
+                                         const uint8_t* dive_interp,
+                                         size_t dive_interp_size,
+                                         std::vector<uint8_t>* out_dgc0,
+                                         std::string* err);
+ob_status_t freetile_try_emit_dyn_weights_dgc0(const ob_gemm_desc_t& desc,
+                                               const uint8_t* dive_interp,
+                                               size_t dive_interp_size,
+                                               std::vector<uint8_t>* out_dgc0,
+                                               uint32_t* out_ext2_bytes,
+                                               std::string* err);
+
 struct ImmutableWeightRegion {
   uintptr_t begin = 0u;
   uintptr_t end = 0u;
@@ -651,6 +674,10 @@ struct ob_context {
   uint32_t num_threads = ob::kDefaultWorkerThreads; // OPENBUENOS_THREADS (default 1, opt-in >1)
   bool async_dequant_enabled = true; // OPENBUENOS_ASYNC_DEQUANT (default 1, opt-out 0)
   uint32_t w8a16_mode = 0u; // OPENBUENOS_W8A16: 0=off, 1=opt-in supported M=1
+  bool freetile_enabled = false; // OPENBUENOS_FREETILE: opt-in or build-defaultable FreeTile emitter
+  bool last_emit_was_freetile = false;
+  std::atomic<uint64_t> freetile_emits{0u};
+  std::atomic<uint64_t> freetile_fallbacks{0u};
   uint32_t max_cached_outlier_cols = ob::kDefaultMaxCachedOutlierCols; // OPENBUENOS_MAX_OUTLIER_COLS (default 160)
   uint64_t ema_hw_us = 0u; // Exponential moving average of firmware hw_execution_us
   uint32_t credit_size = OB_MAX_CREDITS;

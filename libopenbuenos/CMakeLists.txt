@@ -7,23 +7,39 @@ include(CMakePackageConfigHelpers)
 option(OPENBUENOS_BUILD_TESTS "Build libopenbuenos self-test / host unit test binaries" ON)
 option(OPENBUENOS_INSTALL_SELFTEST "Install openbuenos_selftest utility" ON)
 option(OPENBUENOS_WERROR "Treat compiler warnings as errors" ON)
+option(OPENBUENOS_ENABLE_FREETILE "Wire clean-room FreeTile BUENOS_A0 VLIW/DGC0 emitter into libopenbuenos" ON)
+option(OPENBUENOS_FREETILE_DEFAULT_ON "Default OPENBUENOS_FREETILE to enabled unless overridden by env" OFF)
 
 set(OPENBUENOS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
-set(OPENBUENOS_COMPILE_FLAGS -Wall -Wextra -fno-exceptions -fno-rtti)
+set(OPENBUENOS_COMPILE_FLAGS -Wall -Wextra -Wpedantic -fno-exceptions -fno-rtti)
 if (OPENBUENOS_WERROR)
   list(APPEND OPENBUENOS_COMPILE_FLAGS -Werror)
 endif()
 
-add_library(openbuenos STATIC
+set(OPENBUENOS_SOURCES
   src/ob_sha256.cpp
   src/ob_dgc0.cpp
   src/ob_buffer_pool.cpp
   src/ob_worker_pool.cpp
   src/ob_device.cpp
   src/ob_graph.cpp
+  src/ob_freetile_bridge.cpp
   src/ob_gemm_emitter.cpp
   src/ob_gemm.cpp
 )
+
+set(_ob_use_freetile OFF)
+if (OPENBUENOS_ENABLE_FREETILE AND EXISTS "${OPENBUENOS_ROOT}/freetile/include/freetile/buenos_emitter.hpp")
+  set(_ob_use_freetile ON)
+  if (NOT TARGET freetile)
+    list(APPEND OPENBUENOS_SOURCES
+      ${OPENBUENOS_ROOT}/freetile/src/tile_ir.cpp
+      ${OPENBUENOS_ROOT}/freetile/src/buenos_emitter.cpp
+    )
+  endif()
+endif()
+
+add_library(openbuenos STATIC ${OPENBUENOS_SOURCES})
 
 add_library(openbuenos::openbuenos ALIAS openbuenos)
 
@@ -31,12 +47,27 @@ set_target_properties(openbuenos PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_features(openbuenos PUBLIC cxx_std_17)
 target_compile_options(openbuenos PRIVATE ${OPENBUENOS_COMPILE_FLAGS})
 
+if (_ob_use_freetile)
+  target_compile_definitions(openbuenos PRIVATE OPENBUENOS_WITH_FREETILE=1)
+  if (OPENBUENOS_FREETILE_DEFAULT_ON)
+    target_compile_definitions(openbuenos PRIVATE OPENBUENOS_FREETILE_DEFAULT_ON_VAL=1)
+  else()
+    target_compile_definitions(openbuenos PRIVATE OPENBUENOS_FREETILE_DEFAULT_ON_VAL=0)
+  endif()
+  if (TARGET freetile)
+    target_link_libraries(openbuenos PRIVATE $<BUILD_INTERFACE:freetile>)
+  endif()
+else()
+  target_compile_definitions(openbuenos PRIVATE OPENBUENOS_WITH_FREETILE=0 OPENBUENOS_FREETILE_DEFAULT_ON_VAL=0)
+endif()
+
 target_include_directories(openbuenos
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
   PRIVATE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+    $<BUILD_INTERFACE:${OPENBUENOS_ROOT}/freetile/include>
     $<BUILD_INTERFACE:${OPENBUENOS_ROOT}/docs/baremetal-vii>
     $<BUILD_INTERFACE:${OPENBUENOS_ROOT}/docs/kernel-abi>
 )
