@@ -689,6 +689,23 @@ int test_malibu_profile_and_router() {
         CHECK_TRUE(dec.engine == MalibuComputeEngine::EDGETPU_NANO, "Vision -> Nano-TPU");
     }
 
+    // 6) Sub-512 ATTENTION_LONG_CTX honors prof.cpu.has_sme2 (SME2 vs NEON fallback)
+    {
+        MalibuRouteRequest req;
+        req.phase = MalibuWorkloadPhase::ATTENTION_LONG_CTX;
+        req.seq_len = 256u;
+        req.batch_m = 1u;
+        CHECK_TRUE(route_malibu_workload(req, &dec, prof, &err), err.c_str());
+        CHECK_TRUE(dec.engine == MalibuComputeEngine::CPU_SME2 && dec.requires_syscall_barrier,
+                   "Sub-512 attention on SME2 profile -> CPU_SME2");
+
+        MalibuHardwareProfile no_sme2 = prof;
+        no_sme2.cpu.has_sme2 = false;
+        CHECK_TRUE(route_malibu_workload(req, &dec, no_sme2, &err), err.c_str());
+        CHECK_TRUE(dec.engine == MalibuComputeEngine::CPU_NEON && !dec.requires_syscall_barrier,
+                   "Sub-512 attention without SME2 -> CPU_NEON");
+    }
+
     return 0;
 }
 

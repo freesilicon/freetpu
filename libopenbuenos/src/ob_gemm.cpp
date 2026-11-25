@@ -890,10 +890,10 @@ void compute_swiglu_stage_dividers_impl(uint32_t m_dim,
 
 uint64_t hash_swiglu_graph_key(uint32_t hw_m, uint32_t hw_k, uint32_t hw_h, uint32_t hw_n,
                                uint32_t d_gate, uint32_t d_up, uint32_t d_mul, uint32_t d_down,
-                               float s_gate, uint32_t slot_bucket) {
+                               float s_gate, uint32_t slot_bucket, bool freetile = false) {
   uint32_t sg_bits = 0u;
   std::memcpy(&sg_bits, &s_gate, sizeof(sg_bits));
-  uint64_t h = 0x535749474C555F31ULL; // "SWIGLU_1"
+  uint64_t h = freetile ? 0x46545F5357494731ULL : 0x535749474C555F31ULL; // "FT_SWIG1" / "SWIGLU_1"
   uint32_t hdr[10] = {
       hw_m, hw_k, hw_h, hw_n, d_gate, d_up, d_mul, d_down, sg_bits, slot_bucket
   };
@@ -918,20 +918,36 @@ ob_status_t acquire_swiglu_entry(ob_context* ctx,
   }
   std::vector<uint8_t> dgc0;
   std::string err;
+  bool emitted_by_freetile = false;
+  ob_status_t st = OB_ERR_UNSUPPORTED;
   if (ctx->freetile_enabled) {
-    // 11-chunk chained SwiGLU is not yet lowered by freetile::buenos_emitter;
-    // automatically fall back to legacy ob_gemm_emitter.
-    ctx->freetile_fallbacks.fetch_add(1u, std::memory_order_relaxed);
+    std::string ft_err;
+    st = freetile_try_emit_swiglu_dgc0(
+        desc, ctx->builtin_dive_interp.data(), ctx->builtin_dive_interp.size(),
+        &dgc0, &ft_err);
+    if (st == OB_OK && !dgc0.empty()) {
+      ctx->freetile_emits.fetch_add(1u, std::memory_order_relaxed);
+      emitted_by_freetile = true;
+    } else {
+      ctx->freetile_fallbacks.fetch_add(1u, std::memory_order_relaxed);
+      dgc0.clear();
+    }
   }
-  ob_status_t st = build_swiglu_dgc0(
-      desc, ctx->builtin_dive_interp.data(), ctx->builtin_dive_interp.size(),
-      &dgc0, nullptr, &err);
+  if (!emitted_by_freetile) {
+    st = build_swiglu_dgc0(
+        desc, ctx->builtin_dive_interp.data(), ctx->builtin_dive_interp.size(),
+        &dgc0, nullptr, &err);
+  }
   if (st != OB_OK) {
     if (!err.empty()) set_last_error(ctx, err);
     return st;
   }
-  return graph_register_dgc0_internal(
+  st = graph_register_dgc0_internal(
       ctx, dgc0.data(), dgc0.size(), cache_key, true, out_entry, out_cache_hit);
+  if (st == OB_OK && *out_entry && !(*out_cache_hit) && emitted_by_freetile) {
+    (*out_entry)->emitted_by_freetile = true;
+  }
+  return st;
 }
 
 uint64_t hash_w8a16_shape_key(uint32_t hw_k, uint32_t hw_n, float pt_scale,
@@ -4569,7 +4585,7 @@ ob_status_t ob_gemm_swiglu_int8(ob_context_t* ctx,
   }
 
   // Unique graph cache key binding shape + all 9 exact float scales (weight-agnostic Probe-A!)
-  uint64_t gkey = 0x535749385F303031ULL; // "SWI8_001"
+  uint64_t gkey = ctx->freetile_enabled ? 0x46545F5357493831ULL : 0x535749385F303031ULL;
   uint32_t shdr[4] = {M, K, H, N};
   float sf[9] = {
       desc->s_in, desc->s_wg, desc->s_gate,
@@ -4598,6 +4614,7 @@ ob_status_t ob_gemm_swiglu_int8(ob_context_t* ctx,
     ob_buffer_free(wbuf);
     return st;
   }
+  const bool entry_freetile = (entry && entry->emitted_by_freetile);
 
   const size_t in_bytes = static_cast<size_t>(M) * K;
   const size_t out_bytes = static_cast<size_t>(M) * N;
@@ -4685,6 +4702,7 @@ ob_status_t ob_gemm_swiglu_int8(ob_context_t* ctx,
     out_stats->cache_hits = was_hit ? 1u : 0u;
     if (ctx->mock_mode) out_stats->flags |= OB_STAT_FLAG_MOCK;
     out_stats->flags |= OB_STAT_FLAG_EMITTER_USED;
+    if (entry_freetile) out_stats->flags |= OB_STAT_FLAG_FREETILE;
     if (was_hit) out_stats->flags |= OB_STAT_FLAG_CACHE_HIT;
   }
   return OB_OK;
@@ -5212,7 +5230,7 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
                 eff_d_down <<= 1u;
                 const uint64_t rkey = ob::hash_swiglu_graph_key(
                     ms.hw_m, K, p.hw_h, N, p.d_gate, p.d_up, p.d_mul, eff_d_down,
-                    p.s_gate, p.slot % param_swap_slots);
+                    p.s_gate, p.slot % param_swap_slots, ctx->freetile_enabled);
                 ob_swiglu_int8_desc_t rdesc =
                     make_graph_desc(p.hw_h, p.d_gate, p.d_up, p.d_mul, eff_d_down, p.s_gate);
                 const uint64_t trs0 = prof_on ? ob::monotonic_now_ns() : 0u;
@@ -5220,6 +5238,7 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
                 bool rhit = false;
                 rst = ob::acquire_swiglu_entry(ctx, rdesc, rkey, &rentry, &rhit);
                 if (rst != OB_OK) break;
+                if (rentry && rentry->emitted_by_freetile) agg_flags |= OB_STAT_FLAG_FREETILE;
                 if (rhit) total_hits += 1u;
                 ob_exec_handle_t rh = 0u;
                 rst = ob::device_submit_execute_async(
@@ -5789,7 +5808,7 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
         const float s_gate = s_gate_cand;
         const uint64_t gkey = ob::hash_swiglu_graph_key(
             ms.hw_m, K, hw_h, N, d_gate, d_up, d_mul, d_down,
-            s_gate, slot % param_swap_slots);
+            s_gate, slot % param_swap_slots, ctx->freetile_enabled);
         ob_swiglu_int8_desc_t gd = make_graph_desc(hw_h, d_gate, d_up, d_mul, d_down, s_gate);
 
         const uint64_t ts0 = prof_on ? ob::monotonic_now_ns() : 0u;
@@ -5802,6 +5821,7 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
           return gst;
         }
         agg_flags |= OB_STAT_FLAG_EMITTER_USED;
+        if (entry && entry->emitted_by_freetile) agg_flags |= OB_STAT_FLAG_FREETILE;
         if (was_hit) total_hits += 1u;
 
         ob_buffer* out_buf = nullptr;

@@ -5618,13 +5618,64 @@ void test_freetile_buenos_wire_parity_and_fallback() {
     CHECK((sl.flags & OB_STAT_FLAG_FREETILE) == 0u);
   }
 
-  // 6. Automatic fallback to ob_gemm_emitter on unsupported shape/epilogue (chained SwiGLU +
-  //    unsupported activation code) without erroring out.
+  // 6. 11-chunk chained SwiGLU emits via FreeTile (0 byte diffs, 0 fallbacks) AND
+  //    unsupported activation code still falls back cleanly without erroring out.
   {
     uint64_t emits_before = 0u, fb_before = 0u;
     CHECK(ob_context_freetile_stats(ctx_ft, &emits_before, &fb_before) == OB_OK);
+    CHECK(fb_before == 0u);
 
-    // Unsupported activation code -> FreeTile rejects, falls back to legacy emitter (also rejects).
+    // 6a. 11-chunk chained SwiGLU via FreeTile: 0 byte diffs vs legacy ob::build_swiglu_dgc0,
+    //     increments freetile_emits, keeps freetile_fallbacks == 0, sets OB_STAT_FLAG_FREETILE.
+    constexpr uint32_t M = 1u, K = 576u, H = 512u, N = 576u;
+    std::vector<int8_t> x(M * K, 1);
+    std::vector<int8_t> wg(H * K, 1);
+    std::vector<int8_t> wu(H * K, 1);
+    std::vector<int8_t> wd(N * H, 1);
+    std::vector<int8_t> y_ft(M * N, 0);
+    std::vector<int8_t> y_leg(M * N, 0);
+    ob_swiglu_int8_desc_t sdesc{};
+    sdesc.m_dim = M;
+    sdesc.k_dim = K;
+    sdesc.h_dim = H;
+    sdesc.n_dim = N;
+    sdesc.wg_hk = wg.data();
+    sdesc.wu_hk = wu.data();
+    sdesc.wd_nh = wd.data();
+    sdesc.s_in = 0.037f;
+    sdesc.s_wg = 0.019f;
+    sdesc.s_gate = 0.061f;
+    sdesc.s_wu = 0.023f;
+    sdesc.s_up = 0.071f;
+    sdesc.s_silu = 0.053f;
+    sdesc.s_prod = 0.089f;
+    sdesc.s_wd = 0.017f;
+    sdesc.s_out = 0.043f;
+
+    std::vector<uint8_t> sw_dgc_leg, sw_dgc_ft;
+    std::string sw_err_leg, sw_err_ft;
+    CHECK(ob::build_swiglu_dgc0(sdesc, interp.data(), interp.size(), &sw_dgc_leg, nullptr, &sw_err_leg) == OB_OK);
+    CHECK(ob::freetile_try_emit_swiglu_dgc0(sdesc, interp.data(), interp.size(), &sw_dgc_ft, &sw_err_ft) == OB_OK);
+    CHECK(sw_dgc_ft == sw_dgc_leg);
+
+    ob_invoke_stats_t sw_st1{}, sw_st2{}, sw_leg_st{};
+    CHECK(ob_gemm_swiglu_int8(ctx_ft, x.data(), &sdesc, y_ft.data(), &sw_st1) == OB_OK);
+    CHECK(ob_gemm_swiglu_int8(ctx_ft, x.data(), &sdesc, y_ft.data(), &sw_st2) == OB_OK);
+    CHECK(ob_gemm_swiglu_int8(ctx_leg, x.data(), &sdesc, y_leg.data(), &sw_leg_st) == OB_OK);
+    CHECK(y_ft == y_leg);
+    CHECK((sw_st1.flags & OB_STAT_FLAG_EMITTER_USED) != 0u);
+    CHECK((sw_st1.flags & OB_STAT_FLAG_FREETILE) != 0u);
+    CHECK((sw_st2.flags & OB_STAT_FLAG_FREETILE) != 0u);
+    CHECK((sw_st2.flags & OB_STAT_FLAG_CACHE_HIT) != 0u);
+    CHECK((sw_leg_st.flags & OB_STAT_FLAG_FREETILE) == 0u);
+
+    uint64_t emits_after_sw = 0u, fb_after_sw = 0u;
+    CHECK(ob_context_freetile_stats(ctx_ft, &emits_after_sw, &fb_after_sw) == OB_OK);
+    CHECK(emits_after_sw == emits_before + 1u);
+    CHECK(fb_after_sw == 0u);
+
+    // 6b. Unsupported activation code -> FreeTile rejects, increments freetile_fallbacks,
+    //     falls back to legacy emitter (which also rejects unsupported activation).
     ob_gemm_desc_t bad_act{};
     bad_act.m_dim = 1u;
     bad_act.k_dim = 64u;
@@ -5636,44 +5687,16 @@ void test_freetile_buenos_wire_parity_and_fallback() {
     size_t sz = 0u;
     CHECK(ob::builtin_gemm_emitter_cb(&bad_act, nullptr, 0u, &sz, ctx_ft) == OB_ERR_UNSUPPORTED);
 
-    // 11-chunk chained SwiGLU -> not in freetile::buenos_emitter, falls back seamlessly to ob_gemm_emitter.
-    constexpr uint32_t M = 1u, K = 576u, H = 512u, N = 576u;
-    std::vector<int8_t> x(M * K, 1);
-    std::vector<int8_t> wg(H * K, 1);
-    std::vector<int8_t> wu(H * K, 1);
-    std::vector<int8_t> wd(N * H, 1);
-    std::vector<int8_t> y(M * N, 0);
-    ob_swiglu_int8_desc_t sdesc{};
-    sdesc.m_dim = M;
-    sdesc.k_dim = K;
-    sdesc.h_dim = H;
-    sdesc.n_dim = N;
-    sdesc.wg_hk = wg.data();
-    sdesc.wu_hk = wu.data();
-    sdesc.wd_nh = wd.data();
-    sdesc.s_in = 0.03125f;
-    sdesc.s_wg = 0.015625f;
-    sdesc.s_gate = 0.0625f;
-    sdesc.s_wu = 0.015625f;
-    sdesc.s_up = 0.0625f;
-    sdesc.s_silu = 0.0625f;
-    sdesc.s_prod = 0.0625f;
-    sdesc.s_wd = 0.015625f;
-    sdesc.s_out = 0.0625f;
-    ob_invoke_stats_t sw_st{};
-    CHECK(ob_gemm_swiglu_int8(ctx_ft, x.data(), &sdesc, y.data(), &sw_st) == OB_OK);
-    CHECK((sw_st.flags & OB_STAT_FLAG_EMITTER_USED) != 0u);
-    CHECK((sw_st.flags & OB_STAT_FLAG_FREETILE) == 0u);
-
     uint64_t emits_after = 0u, fb_after = 0u;
     CHECK(ob_context_freetile_stats(ctx_ft, &emits_after, &fb_after) == OB_OK);
-    CHECK(fb_after >= fb_before + 2u);
+    CHECK(emits_after == emits_after_sw);
+    CHECK(fb_after == 1u);
   }
 
   ob_context_destroy(ctx_leg);
   ob_context_destroy(ctx_ft);
 
-  std::printf("[PASS] test_freetile_buenos_wire_parity_and_fallback (%zu W8A8/lt_1x/lt_64x/Mode-A + 6 W8A16 + dyn-weights bit-exact + fallback OK)\n",
+  std::printf("[PASS] test_freetile_buenos_wire_parity_and_fallback (%zu W8A8/lt_1x/lt_64x/Mode-A + 6 W8A16 + dyn-weights + 11-chunk SwiGLU bit-exact + fallback OK)\n",
               w8a8_checked);
 }
 

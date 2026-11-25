@@ -14,24 +14,6 @@
 #include <string>
 #include <vector>
 
-// Forward-declare S3 bridge entry points defined in libopenbuenos/src/ob_freetile_bridge.cpp
-// (ob_internal.h is outside S3 file-ownership scope and updated during post-merge integration).
-namespace ob {
-ob_status_t freetile_try_emit_swiglu_dgc0(const ob_swiglu_int8_desc_t& desc,
-                                          const uint8_t* dive_interp,
-                                          size_t dive_interp_size,
-                                          std::vector<uint8_t>* out_dgc0,
-                                          std::string* err);
-ob_status_t freetile_try_emit_w8a16_64x_dgc0(uint32_t K,
-                                             uint32_t N,
-                                             float pt_scale,
-                                             const int8_t* weights_nk,
-                                             const uint8_t* dive_interp,
-                                             size_t dive_interp_size,
-                                             std::vector<uint8_t>* out_dgc0,
-                                             std::string* err);
-}  // namespace ob
-
 namespace {
 
 #define CHECK_TRUE(cond, msg)                                                                  \

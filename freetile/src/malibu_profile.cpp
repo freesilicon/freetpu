@@ -240,12 +240,15 @@ bool route_malibu_workload(const MalibuRouteRequest& req,
                 d.reason =
                     "Route long-context (seq_len >= 512) GQA FlashAttention to Darwinn Heavy EdgeTPU";
             } else {
-                d.engine = MalibuComputeEngine::CPU_SME2;
+                d.engine = prof.cpu.has_sme2 ? MalibuComputeEngine::CPU_SME2
+                                             : MalibuComputeEngine::CPU_NEON;
                 d.fallback_engine = MalibuComputeEngine::CPU_NEON;
                 d.recommended_threads = malibu_clamp_sme2_threads(req.requested_threads, prof);
                 d.cpu_affinity_mask = prof.cpu.sme_perf_cpu_mask;
-                d.requires_syscall_barrier = prof.cpu.syscall_clears_pstate_sm;
-                d.reason = "Route sub-512 attention to SME2 CPU to avoid NPU dispatch tax";
+                d.requires_syscall_barrier = prof.cpu.has_sme2 && prof.cpu.syscall_clears_pstate_sm;
+                d.reason = prof.cpu.has_sme2
+                               ? "Route sub-512 attention to SME2 CPU to avoid NPU dispatch tax"
+                               : "Route sub-512 attention to NEON CPU (SME2 disabled in profile)";
             }
             break;
         }
