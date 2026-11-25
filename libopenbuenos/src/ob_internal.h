@@ -668,6 +668,7 @@ struct ob_context {
   // Buffer slab/pool
   std::mutex pool_mu;
   size_t pool_max_bytes = ob::kDefaultBufferPoolMaxBytes;
+  size_t pool_max_count = ob::kDefaultBufferPoolMaxCount;
   size_t pool_current_bytes = 0;
   size_t pool_current_count = 0;
   uint64_t pool_hits = 0;
@@ -720,6 +721,7 @@ struct ob_context {
   size_t weight_cache_bytes = 0;
   size_t weight_cache_peak_bytes = 0;
   size_t weight_cache_max_bytes = 0;   // lazily initialized (min(2048 MiB, MemAvailable/3) on Android)
+  size_t weight_cache_default_max_entries = ob::kDefaultWeightCacheMaxEntries;
   size_t weight_cache_max_entries = 0; // FD-safe cap (default 4096, env OPENBUENOS_WEIGHT_CACHE_ENTRIES)
   size_t outlier_cache_bytes = 0;      // Separate tracked total of cached FP32 outlier columns
   std::vector<ob::ImmutableWeightRegion> immutable_weight_regions;

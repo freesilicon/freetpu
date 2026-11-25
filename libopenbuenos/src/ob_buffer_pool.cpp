@@ -334,6 +334,16 @@ ob_status_t ob_buffer_alloc(ob_context_t* ctx,
   if (!got_pooled) {
     std::lock_guard<std::mutex> lk(ctx->pool_mu);
     ob_status_t st = ob::alloc_raw_slab(ctx, slab_size, map_flags, &slab);
+    if (st != OB_OK && !ctx->pool_lru.empty()) {
+      for (ob::PooledSlab& pooled : ctx->pool_lru) {
+        ob::buffer_destroy_slab(ctx, &pooled);
+      }
+      ctx->pool_lru.clear();
+      ctx->pool_buckets.clear();
+      ctx->pool_current_bytes = 0;
+      ctx->pool_current_count = 0;
+      st = ob::alloc_raw_slab(ctx, slab_size, map_flags, &slab);
+    }
     if (st != OB_OK) return st;
   }
 
@@ -388,7 +398,7 @@ void ob_buffer_free(ob_buffer_t* buf) {
   // Evict oldest slabs until the returned slab fits within pool_max_bytes and FD-safe count cap
   while (!ctx->pool_lru.empty() &&
          (ctx->pool_current_bytes + slab.alloc_size > ctx->pool_max_bytes ||
-          ctx->pool_current_count >= ob::kDefaultBufferPoolMaxCount)) {
+          ctx->pool_current_count >= ctx->pool_max_count)) {
     auto victim_it = std::prev(ctx->pool_lru.end());
     size_t vsz = victim_it->alloc_size;
     auto& bucket = ctx->pool_buckets[vsz];

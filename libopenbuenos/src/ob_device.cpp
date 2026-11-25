@@ -11,6 +11,7 @@
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #include "edgetpu_buenos_uapi.h"
 #endif
@@ -1179,6 +1180,31 @@ ob_status_t ob_context_create(const ob_config_t* config, ob_context_t** out_ctx)
   ctx->mock_mode = (eff.mock_mode != 0);
   ctx->cache_capacity = eff.graph_cache_capacity;
   ctx->pool_max_bytes = static_cast<size_t>(eff.buffer_pool_max_bytes);
+#if defined(__linux__)
+  if (!ctx->mock_mode) {
+    struct rlimit rl {};
+    if (::getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+      constexpr rlim_t kDesiredNofile = 8192u;
+      if (rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < kDesiredNofile) {
+        rlim_t target = (rl.rlim_max == RLIM_INFINITY)
+                            ? kDesiredNofile
+                            : std::min<rlim_t>(rl.rlim_max, kDesiredNofile);
+        if (target > rl.rlim_cur) {
+          struct rlimit raised = rl;
+          raised.rlim_cur = target;
+          if (::setrlimit(RLIMIT_NOFILE, &raised) == 0) {
+            ::getrlimit(RLIMIT_NOFILE, &rl);
+          }
+        }
+      }
+      if (rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur <= 2048u) {
+        ctx->cache_capacity = std::min<uint32_t>(ctx->cache_capacity, 96u);
+        ctx->pool_max_count = 48u;
+        ctx->weight_cache_default_max_entries = 256u;
+      }
+    }
+  }
+#endif
 
   ob_status_t st = ob::device_open(ctx);
   if (st != OB_OK) {

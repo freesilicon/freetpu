@@ -759,8 +759,8 @@ static ggml_status ggml_edgetpu_compute_forward_mul_mat(ggml_backend_edgetpu_con
                     job.is_q4_0    = 1u;
                     st = ob_gemm_matmul_f32_quant_batch(ctx->ob_ctx, a_f32, M, K, &job, 1u, &stats);
                     if (st != OB_OK) {
-                        GGML_LOG_ERROR("ggml-edgetpu: ob_gemm_matmul_f32_quant_batch (Q4_0 M=%u,K=%u,N=%u) failed: %s\n",
-                                       M, K, N, ob_status_string(st));
+                        GGML_LOG_ERROR("ggml-edgetpu: ob_gemm_matmul_f32_quant_batch (Q4_0 M=%u,K=%u,N=%u) failed: %s (%s)\n",
+                                       M, K, N, ob_status_string(st), ob_context_last_error(ctx->ob_ctx));
                         return GGML_STATUS_FAILED;
                     }
                 } else if (ctx->env.packed_q8) {
@@ -784,7 +784,8 @@ static ggml_status ggml_edgetpu_compute_forward_mul_mat(ggml_backend_edgetpu_con
                         0, 0,
                         &stats);
                     if (st != OB_OK) {
-                        GGML_LOG_ERROR("ggml-edgetpu: ob_gemm_matmul_int8 (packed Q8_0) failed: %s\n", ob_status_string(st));
+                        GGML_LOG_ERROR("ggml-edgetpu: ob_gemm_matmul_int8 (packed Q8_0) failed: %s (%s)\n",
+                                       ob_status_string(st), ob_context_last_error(ctx->ob_ctx));
                         return GGML_STATUS_FAILED;
                     }
                     for (uint32_t m = 0; m < M; ++m) {
@@ -805,8 +806,8 @@ static ggml_status ggml_edgetpu_compute_forward_mul_mat(ggml_backend_edgetpu_con
                         M, K, N,
                         &stats);
                     if (st != OB_OK) {
-                        GGML_LOG_ERROR("ggml-edgetpu: ob_gemm_matmul_f32_q8_0(M=%u,K=%u,N=%u) failed: %s\n",
-                                       M, K, N, ob_status_string(st));
+                        GGML_LOG_ERROR("ggml-edgetpu: ob_gemm_matmul_f32_q8_0(M=%u,K=%u,N=%u) failed: %s (%s)\n",
+                                       M, K, N, ob_status_string(st), ob_context_last_error(ctx->ob_ctx));
                         return GGML_STATUS_FAILED;
                     }
                 }
@@ -831,8 +832,8 @@ static ggml_status ggml_edgetpu_compute_forward_mul_mat(ggml_backend_edgetpu_con
                     0, 0,
                     &stats);
                 if (st != OB_OK) {
-                    GGML_LOG_ERROR("ggml-edgetpu: ob_gemm_matmul_int8(M=%u,K=%u,N=%u) failed: %s\n",
-                                   M, K, N, ob_status_string(st));
+                    GGML_LOG_ERROR("ggml-edgetpu: ob_gemm_matmul_int8(M=%u,K=%u,N=%u) failed: %s (%s)\n",
+                                   M, K, N, ob_status_string(st), ob_context_last_error(ctx->ob_ctx));
                     return GGML_STATUS_FAILED;
                 }
 
@@ -2256,8 +2257,8 @@ static ggml_status ggml_backend_edgetpu_graph_compute(ggml_backend_t backend, st
                             static_cast<uint32_t>(n_mm),
                             &bstats);
                         if (bst != OB_OK) {
-                            GGML_LOG_ERROR("ggml-edgetpu: ob_gemm_matmul_f32_quant_batch(n=%d,M=%u,K=%u) failed: %s\n",
-                                           n_mm, M, K, ob_status_string(bst));
+                            GGML_LOG_ERROR("ggml-edgetpu: ob_gemm_matmul_f32_quant_batch(n=%d,M=%u,K=%u) failed: %s (%s)\n",
+                                           n_mm, M, K, ob_status_string(bst), ob_context_last_error(ctx->ob_ctx));
                             return GGML_STATUS_FAILED;
                         }
 

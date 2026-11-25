@@ -493,7 +493,7 @@ void ensure_weight_cache_budget(ob_context* ctx, bool refresh_meminfo = false) {
       if (lim > 16384ul) lim = 16384ul;
       ctx->weight_cache_max_entries = static_cast<size_t>(lim);
     } else {
-      ctx->weight_cache_max_entries = kDefaultWeightCacheMaxEntries;
+      ctx->weight_cache_max_entries = ctx->weight_cache_default_max_entries;
     }
   }
 }

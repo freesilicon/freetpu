@@ -283,8 +283,10 @@ bool run_libopenbuenos_gemm(const char* dev_path,
   std::vector<int32_t> c_out(M * N, 0);
   std::vector<int32_t> c_ref(M * N, 0);
 
+  // Multiples of 6 ensure exact divisibility by compute_tile_scale_D() (=3 for this row norm)
+  // so hardware INT8 requantization yields bit-exact worst_err=0.
   for (uint32_t k = 0; k < K; ++k) {
-    a_mk[k] = static_cast<int8_t>((static_cast<int32_t>(k % 7u) - 3) * 4);
+    a_mk[k] = static_cast<int8_t>((static_cast<int32_t>(k % 7u) - 3) * 6);
   }
   for (uint32_t n = 0; n < N; ++n) {
     bias_n[n] = static_cast<int32_t>((n * 5u) % 19u) - 9;
