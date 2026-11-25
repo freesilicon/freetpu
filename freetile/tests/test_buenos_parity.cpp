@@ -10,8 +10,27 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
+
+// Forward-declare S3 bridge entry points defined in libopenbuenos/src/ob_freetile_bridge.cpp
+// (ob_internal.h is outside S3 file-ownership scope and updated during post-merge integration).
+namespace ob {
+ob_status_t freetile_try_emit_swiglu_dgc0(const ob_swiglu_int8_desc_t& desc,
+                                          const uint8_t* dive_interp,
+                                          size_t dive_interp_size,
+                                          std::vector<uint8_t>* out_dgc0,
+                                          std::string* err);
+ob_status_t freetile_try_emit_w8a16_64x_dgc0(uint32_t K,
+                                             uint32_t N,
+                                             float pt_scale,
+                                             const int8_t* weights_nk,
+                                             const uint8_t* dive_interp,
+                                             size_t dive_interp_size,
+                                             std::vector<uint8_t>* out_dgc0,
+                                             std::string* err);
+}  // namespace ob
 
 namespace {
 
@@ -700,7 +719,403 @@ int main() {
                        "Out-of-envelope shape rejected identically by libopenbuenos");
         }
     }
-    std::printf("PASS [7/7]: weight packers, pre-packed ext[2], and shape rejection parity verified\n");
+    std::printf("PASS [7/10]: weight packers, pre-packed ext[2], and shape rejection parity verified\n");
+
+    // -------------------------------------------------------------------------
+    // 8. All 6 silicon-proven 11-chunk chained SwiGLU shapes with distinct
+    //    non-PoT scales: 0 byte diffs on all 11 chunks, ext[0], ext[2], DGC0,
+    //    ob::freetile_try_emit_swiglu_dgc0 bridge, and exact Horner simulator.
+    // -------------------------------------------------------------------------
+    {
+        struct SwigluCase {
+            uint32_t m;
+            uint32_t k;
+            uint32_t h;
+            uint32_t n;
+            bool with_bias;
+            float s_in;
+            float s_wg;
+            float s_gate;
+            float s_wu;
+            float s_up;
+            float s_silu;
+            float s_prod;
+            float s_wd;
+            float s_out;
+        };
+        const std::vector<SwigluCase> swiglu_cases = {
+            {1u,  576u,  512u,  576u, true,  0.037f, 0.019f, 0.061f, 0.023f, 0.071f, 0.053f, 0.089f, 0.017f, 0.043f},
+            {1u,  576u, 1536u,  576u, true,  0.029f, 0.013f, 0.047f, 0.017f, 0.059f, 0.041f, 0.073f, 0.011f, 0.031f},
+            {1u, 1536u,  512u, 1536u, false, 0.033f, 0.021f, 0.067f, 0.019f, 0.079f, 0.067f, 0.097f, 0.023f, 0.057f},
+            {1u, 1536u, 1024u, 1536u, true,  0.027f, 0.015f, 0.055f, 0.013f, 0.063f, 0.049f, 0.083f, 0.019f, 0.047f},
+            {64u, 576u,  512u,  576u, true,  0.031f, 0.017f, 0.059f, 0.021f, 0.069f, 0.059f, 0.091f, 0.015f, 0.039f},
+            {64u, 1536u, 512u, 1536u, false, 0.023f, 0.011f, 0.043f, 0.015f, 0.051f, 0.043f, 0.079f, 0.013f, 0.037f},
+        };
+        CHECK_TRUE(swiglu_cases.size() == 6u, "SwiGLU parity suite covers all 6 silicon-proven shapes");
+
+        for (size_t i = 0u; i < swiglu_cases.size(); ++i) {
+            const auto& sc = swiglu_cases[i];
+            CHECK_TRUE(freetile::is_buenos_swiglu_shape(sc.m, sc.k, sc.h, sc.n),
+                       "is_buenos_swiglu_shape accepts proven shape");
+            CHECK_TRUE(ob::is_swiglu_shape(sc.m, sc.k, sc.h, sc.n),
+                       "ob::is_swiglu_shape accepts proven shape");
+
+            const auto wg = make_weights(sc.h, sc.k, static_cast<uint32_t>(800u + 10u * i));
+            const auto wu = make_weights(sc.h, sc.k, static_cast<uint32_t>(801u + 10u * i));
+            const auto wd = make_weights(sc.n, sc.h, static_cast<uint32_t>(802u + 10u * i));
+            const auto bg = sc.with_bias ? make_bias(sc.h, static_cast<uint32_t>(803u + 10u * i)) : std::vector<int32_t>{};
+            const auto bu = sc.with_bias ? make_bias(sc.h, static_cast<uint32_t>(804u + 10u * i)) : std::vector<int32_t>{};
+            const auto bd = sc.with_bias ? make_bias(sc.n, static_cast<uint32_t>(805u + 10u * i)) : std::vector<int32_t>{};
+
+            freetile::BuenosSwigluDesc ft_desc{};
+            ft_desc.m_dim = sc.m;
+            ft_desc.k_dim = sc.k;
+            ft_desc.h_dim = sc.h;
+            ft_desc.n_dim = sc.n;
+            ft_desc.wg_hk = wg.data();
+            ft_desc.bg_h = sc.with_bias ? bg.data() : nullptr;
+            ft_desc.wu_hk = wu.data();
+            ft_desc.bu_h = sc.with_bias ? bu.data() : nullptr;
+            ft_desc.wd_nh = wd.data();
+            ft_desc.bd_n = sc.with_bias ? bd.data() : nullptr;
+            ft_desc.s_in = sc.s_in;
+            ft_desc.s_wg = sc.s_wg;
+            ft_desc.s_gate = sc.s_gate;
+            ft_desc.s_wu = sc.s_wu;
+            ft_desc.s_up = sc.s_up;
+            ft_desc.s_silu = sc.s_silu;
+            ft_desc.s_prod = sc.s_prod;
+            ft_desc.s_wd = sc.s_wd;
+            ft_desc.s_out = sc.s_out;
+            ft_desc.dive_interp = dummy_interp.data();
+            ft_desc.dive_interp_size = dummy_interp.size();
+
+            freetile::BuenosSwigluResult ft_res{};
+            std::string ft_err;
+            CHECK_TRUE(freetile::try_emit_buenos_swiglu(ft_desc, &ft_res, &ft_err),
+                       ("try_emit_buenos_swiglu failed: " + ft_err).c_str());
+
+            // Also verify throwing wrapper returns bit-identical DGC0.
+            const freetile::BuenosSwigluResult ft_throw_res = freetile::emit_buenos_swiglu(ft_desc);
+            std::string cmp_err;
+            CHECK_TRUE(compare_bytes("swiglu throw wrapper dgc0", ft_throw_res.dgc0, ft_res.dgc0, &cmp_err),
+                       cmp_err.c_str());
+
+            // Legacy ob_gemm_emitter oracle.
+            ob_swiglu_int8_desc_t ob_desc{};
+            ob_desc.m_dim = sc.m;
+            ob_desc.k_dim = sc.k;
+            ob_desc.h_dim = sc.h;
+            ob_desc.n_dim = sc.n;
+            ob_desc.wg_hk = wg.data();
+            ob_desc.bg_h = sc.with_bias ? bg.data() : nullptr;
+            ob_desc.wu_hk = wu.data();
+            ob_desc.bu_h = sc.with_bias ? bu.data() : nullptr;
+            ob_desc.wd_nh = wd.data();
+            ob_desc.bd_n = sc.with_bias ? bd.data() : nullptr;
+            ob_desc.s_in = sc.s_in;
+            ob_desc.s_wg = sc.s_wg;
+            ob_desc.s_gate = sc.s_gate;
+            ob_desc.s_wu = sc.s_wu;
+            ob_desc.s_up = sc.s_up;
+            ob_desc.s_silu = sc.s_silu;
+            ob_desc.s_prod = sc.s_prod;
+            ob_desc.s_wd = sc.s_wd;
+            ob_desc.s_out = sc.s_out;
+
+            ob::SwigluSynthResult ob_parts{};
+            std::vector<uint8_t> ob_dgc0;
+            std::string ob_err;
+            CHECK_TRUE(ob::build_swiglu_dgc0(ob_desc, dummy_interp.data(), dummy_interp.size(),
+                                             &ob_dgc0, &ob_parts, &ob_err) == OB_OK,
+                       ("ob::build_swiglu_dgc0 failed: " + ob_err).c_str());
+
+            CHECK_TRUE(ft_res.exec_field_14 == ob_parts.exec_field_14, "SwiGLU exec_field_14 parity");
+            CHECK_TRUE(ft_res.dive_scratch_size == ob_parts.dive_scratch_size, "SwiGLU dive_scratch_size parity");
+            CHECK_TRUE(ft_res.ext2_bytes == ob_parts.ext2_params.size(), "SwiGLU ext2_bytes parity");
+            for (int ci = 0; ci < 11; ++ci) {
+                const std::string tag = "swiglu[" + std::to_string(i) + "] chunk[" + std::to_string(ci) + "]";
+                CHECK_TRUE(compare_bytes(tag.c_str(), ft_res.chunks[ci], ob_parts.chunks[ci], &cmp_err),
+                           cmp_err.c_str());
+            }
+            CHECK_TRUE(compare_bytes("swiglu ext0_dive", ft_res.ext0_dive, ob_parts.ext0_dive, &cmp_err),
+                       cmp_err.c_str());
+            CHECK_TRUE(compare_bytes("swiglu ext2_params", ft_res.ext2_params, ob_parts.ext2_params, &cmp_err),
+                       cmp_err.c_str());
+            CHECK_TRUE(compare_bytes("swiglu dgc0", ft_res.dgc0, ob_dgc0, &cmp_err), cmp_err.c_str());
+            CHECK_TRUE(verify_dgc0_inspector_parity(ft_res.dgc0, &cmp_err), cmp_err.c_str());
+
+            // Bridge parity via libopenbuenos/src/ob_freetile_bridge.cpp (0 byte diffs vs legacy).
+            std::vector<uint8_t> bridge_dgc0;
+            std::string bridge_err;
+            CHECK_TRUE(ob::freetile_try_emit_swiglu_dgc0(ob_desc, dummy_interp.data(), dummy_interp.size(),
+                                                         &bridge_dgc0, &bridge_err) == OB_OK,
+                       ("ob::freetile_try_emit_swiglu_dgc0 failed: " + bridge_err).c_str());
+            CHECK_TRUE(compare_bytes("swiglu bridge dgc0", bridge_dgc0, ob_dgc0, &cmp_err), cmp_err.c_str());
+
+            // Exact FP32-RNE Horner SwiGLU simulator parity (0 byte diffs vs ob::simulate_swiglu_hw_exact).
+            const auto x_in = make_weights(sc.m, sc.k, static_cast<uint32_t>(900u + i));
+            std::vector<int8_t> ft_y(static_cast<size_t>(sc.m) * sc.n, 0);
+            std::vector<int8_t> ob_y(static_cast<size_t>(sc.m) * sc.n, 0);
+            CHECK_TRUE(freetile::buenos_simulate_swiglu_exact(x_in.data(), ft_desc, ft_y.data(), &ft_err),
+                       ("buenos_simulate_swiglu_exact failed: " + ft_err).c_str());
+            ob::simulate_swiglu_hw_exact(x_in.data(), ob_desc, ob_y.data());
+            CHECK_TRUE(ft_y == ob_y, "SwiGLU exact Horner simulator matches libopenbuenos byte-for-byte");
+        }
+
+        // Negative validation checks (bad shape, non-positive / NaN scale).
+        freetile::BuenosSwigluDesc bad_sw{};
+        bad_sw.m_dim = 1u;
+        bad_sw.k_dim = 512u;
+        bad_sw.h_dim = 512u;
+        bad_sw.n_dim = 512u;
+        bad_sw.s_in = bad_sw.s_wg = bad_sw.s_gate = bad_sw.s_wu = bad_sw.s_up =
+            bad_sw.s_silu = bad_sw.s_prod = bad_sw.s_wd = bad_sw.s_out = 0.05f;
+        freetile::BuenosSwigluResult bad_res{};
+        std::string bad_err;
+        CHECK_TRUE(!freetile::try_emit_buenos_swiglu(bad_sw, &bad_res, &bad_err),
+                   "Unsupported SwiGLU shape rejected cleanly");
+        bad_sw.k_dim = 576u;
+        bad_sw.n_dim = 576u;
+        bad_sw.s_silu = std::numeric_limits<float>::quiet_NaN();
+        CHECK_TRUE(!freetile::try_emit_buenos_swiglu(bad_sw, &bad_res, &bad_err),
+                   "NaN SwiGLU scale rejected cleanly");
+    }
+    std::printf("PASS [8/10]: 6/6 11-chunk chained SwiGLU shapes + bridge + Horner simulator bit-exact (0 byte diffs)\n");
+
+    // -------------------------------------------------------------------------
+    // 9. Extended W8A16(FP16) emitter: M=1 K=576 / N=576 (SmolLM2-135M) AND
+    //    M=64 batched prefill W8A16_PT_64X (64x576x576, 64x1536x1536, etc.).
+    //    Verifies exact [N/32, K/2, 32, 2] w^0x80 pack parity vs libopenbuenos,
+    //    DIVE dt=7 FP32 I/O sizes, 0x980 u32[16]=0x2020_0000, CSR 0x56=0x26,
+    //    Core-0 narrow SRAM <= 786,432 B, silicon_verified=false flag, and
+    //    ob::freetile_try_emit_w8a16_64x_dgc0 bridge.
+    // -------------------------------------------------------------------------
+    {
+        auto contains_u32_le = [](const std::vector<uint8_t>& buf, uint32_t needle) -> bool {
+            for (size_t i = 0u; i + 4u <= buf.size(); i += 4u) {
+                uint32_t v = 0u;
+                std::memcpy(&v, buf.data() + i, 4u);
+                if (v == needle) return true;
+            }
+            return false;
+        };
+
+        // 9a. M=1 K=576 / N=576 W8A16_PT_1X shapes (SmolLM2-135M).
+        const std::vector<std::pair<uint32_t, uint32_t>> w8a16_576_shapes = {
+            {576u, 576u}, {576u, 512u}, {576u, 1536u}, {1536u, 576u}, {576u, 2048u},
+        };
+        for (size_t i = 0u; i < w8a16_576_shapes.size(); ++i) {
+            const uint32_t k = w8a16_576_shapes[i].first;
+            const uint32_t n = w8a16_576_shapes[i].second;
+            const auto weights = make_weights(n, k, static_cast<uint32_t>(1000u + i));
+
+            freetile::TileKernel kern;
+            std::string plan_err;
+            CHECK_TRUE(freetile::plan_buenos_matmul_kernel(
+                           1, k, n, freetile::QuantFormat::Q8_0,
+                           freetile::DType::F16, freetile::DType::F32,
+                           freetile::EpilogueActivation::NONE, &kern, &plan_err),
+                       ("plan W8A16 K=576 failed: " + plan_err).c_str());
+
+            freetile::BuenosEmitOptions opts;
+            opts.mode = freetile::BuenosKernelMode::AUTO;
+            opts.w8a16_pt_scale = 1.0f;
+            opts.weights_nk = weights.data();
+            opts.dive_interp = dummy_interp.data();
+            opts.dive_interp_size = dummy_interp.size();
+
+            const freetile::BuenosEmitResult res = freetile::emit_buenos_kernel(kern, opts);
+            CHECK_TRUE(res.resolved_mode == freetile::BuenosKernelMode::W8A16_PT_1X,
+                       "AUTO selects W8A16_PT_1X for M=1 K=576/N=576");
+            CHECK_TRUE(!res.silicon_verified,
+                       "K=576/N=576 W8A16_PT_1X marked silicon_verified=false until live rango proof");
+            CHECK_TRUE(res.ext2_bytes == n * k, "W8A16 K=576 ext2_bytes == N*K (no scales tail)");
+
+            // Exact [N/32, K/2, 32, 2] w^0x80 weight pack parity vs libopenbuenos.
+            const auto ob_w16 = ob::pack_w8a16_ext2(n, k, weights.data());
+            std::string cmp_err;
+            CHECK_TRUE(compare_bytes("w8a16 576 ext2 pack", res.ext2_params, ob_w16, &cmp_err), cmp_err.c_str());
+            // Verify HibDma 1:2 u8->FP16 marker (0x2020_0000) in chunk[5].
+            CHECK_TRUE(contains_u32_le(res.chunks[5], 0x20200000u),
+                       "W8A16 K=576 chunk[5] contains 0x980 u32[16]=0x2020_0000");
+            // Verify DGC0 container + DIVE dt=7 FP32 I/O sizes match ob::parse_dgc0_buffer.
+            CHECK_TRUE(!res.dgc0.empty() && (res.dgc0.size() % 64u) == 0u, "W8A16 K=576 DGC0 64B aligned");
+            CHECK_TRUE(verify_dgc0_inspector_parity(res.dgc0, &cmp_err), cmp_err.c_str());
+            freetile::BuenosDgc0Summary sum{};
+            CHECK_TRUE(freetile::inspect_buenos_dgc0(res.dgc0.data(), res.dgc0.size(), &sum, &cmp_err),
+                       cmp_err.c_str());
+            CHECK_TRUE(sum.input_sizes.size() == 1u && sum.input_sizes[0] == static_cast<uint64_t>(4u * k),
+                       "W8A16 K=576 FP32 input size == 4*K");
+            CHECK_TRUE(sum.output_sizes.size() == 1u && sum.output_sizes[0] == static_cast<uint64_t>(4u * n),
+                       "W8A16 K=576 FP32 output size == 4*N");
+            CHECK_TRUE(sum.has_params && sum.ext2_size == static_cast<uint64_t>(n) * k,
+                       "W8A16 K=576 DGC0 ext2_size == N*K");
+
+            // Bridge emits identical DGC0 for K=576 via freetile_try_emit_w8a16_dgc0.
+            std::vector<uint8_t> br_dgc0;
+            std::string br_err;
+            CHECK_TRUE(ob::freetile_try_emit_w8a16_dgc0(
+                           k, n, 1.0f, weights.data(), dummy_interp.data(), dummy_interp.size(),
+                           &br_dgc0, &br_err) == OB_OK,
+                       ("ob::freetile_try_emit_w8a16_dgc0 K=576 failed: " + br_err).c_str());
+            CHECK_TRUE(compare_bytes("w8a16 576 bridge dgc0", br_dgc0, res.dgc0, &cmp_err), cmp_err.c_str());
+        }
+
+        // 9b. M=64 batched prefill W8A16_PT_64X shapes (7-chunk PT, FP32 accum, zero FP16 mid overflow).
+        const std::vector<std::pair<uint32_t, uint32_t>> w8a16_64x_shapes = {
+            {512u, 512u}, {576u, 576u}, {576u, 1536u}, {1024u, 1024u}, {1536u, 576u}, {1536u, 1536u},
+        };
+        constexpr uint32_t kBuenosNarrowSramBytes = 786432u;  // 768 KiB
+        for (size_t i = 0u; i < w8a16_64x_shapes.size(); ++i) {
+            const uint32_t k = w8a16_64x_shapes[i].first;
+            const uint32_t n = w8a16_64x_shapes[i].second;
+            const uint32_t core0_sram = 128u * k + 256u * n;
+            CHECK_TRUE(core0_sram <= kBuenosNarrowSramBytes,
+                       "W8A16_PT_64X Core-0 narrow SRAM fits within 768 KiB ceiling");
+            const auto weights = make_weights(n, k, static_cast<uint32_t>(1100u + i));
+
+            freetile::TileKernel kern;
+            std::string plan_err;
+            CHECK_TRUE(freetile::plan_buenos_matmul_kernel(
+                           64, k, n, freetile::QuantFormat::Q8_0,
+                           freetile::DType::F16, freetile::DType::F32,
+                           freetile::EpilogueActivation::NONE, &kern, &plan_err),
+                       ("plan W8A16_PT_64X failed: " + plan_err).c_str());
+
+            freetile::BuenosEmitOptions opts;
+            opts.mode = freetile::BuenosKernelMode::AUTO;
+            opts.w8a16_pt_scale = 1.0f;
+            opts.weights_nk = weights.data();
+            opts.dive_interp = dummy_interp.data();
+            opts.dive_interp_size = dummy_interp.size();
+
+            const freetile::BuenosEmitResult res = freetile::emit_buenos_kernel(kern, opts);
+            CHECK_TRUE(res.resolved_mode == freetile::BuenosKernelMode::W8A16_PT_64X,
+                       "AUTO selects W8A16_PT_64X for M=64 FP16->FP32");
+            CHECK_TRUE(std::strcmp(freetile::buenos_kernel_mode_name(res.resolved_mode), "w8a16_pt_64x") == 0,
+                       "buenos_kernel_mode_name(W8A16_PT_64X) == w8a16_pt_64x");
+            CHECK_TRUE(!res.silicon_verified,
+                       "W8A16_PT_64X marked silicon_verified=false until live rango proof");
+            CHECK_TRUE(res.ext2_bytes == n * k, "W8A16_PT_64X ext2_bytes == N*K (7-chunk PT, no scales tail)");
+
+            // Exact [N/32, K/2, 32, 2] w^0x80 weight pack parity vs libopenbuenos.
+            const auto ob_w16 = ob::pack_w8a16_ext2(n, k, weights.data());
+            std::string cmp_err;
+            CHECK_TRUE(compare_bytes("w8a16 64x ext2 pack", res.ext2_params, ob_w16, &cmp_err), cmp_err.c_str());
+            // Verify CSR 0x56 = 0x26 encoded as ((0x26 << 7) | 0x56) = 0x1356 in chunk[3].
+            CHECK_TRUE(contains_u32_le(res.chunks[3], (0x26u << 7u) | 0x56u),
+                       "W8A16_PT_64X chunk[3] encodes CSR 0x56=0x26 (FP32 accum, zero FP16 mid)");
+            // Verify HibDma 1:2 u8->FP16 marker (0x2020_0000) in chunk[5].
+            CHECK_TRUE(contains_u32_le(res.chunks[5], 0x20200000u),
+                       "W8A16_PT_64X chunk[5] contains 0x980 u32[16]=0x2020_0000");
+            // Verify DGC0 container + DIVE dt=7 FP32 I/O sizes match ob::parse_dgc0_buffer.
+            CHECK_TRUE(!res.dgc0.empty() && (res.dgc0.size() % 64u) == 0u, "W8A16_PT_64X DGC0 64B aligned");
+            CHECK_TRUE(verify_dgc0_inspector_parity(res.dgc0, &cmp_err), cmp_err.c_str());
+            freetile::BuenosDgc0Summary sum{};
+            CHECK_TRUE(freetile::inspect_buenos_dgc0(res.dgc0.data(), res.dgc0.size(), &sum, &cmp_err),
+                       cmp_err.c_str());
+            CHECK_TRUE(sum.input_sizes.size() == 1u && sum.input_sizes[0] == static_cast<uint64_t>(256u * k),
+                       "W8A16_PT_64X FP32 input size == 64*K*4");
+            CHECK_TRUE(sum.output_sizes.size() == 1u && sum.output_sizes[0] == static_cast<uint64_t>(256u * n),
+                       "W8A16_PT_64X FP32 output size == 64*N*4");
+            CHECK_TRUE(sum.has_params && sum.ext2_size == static_cast<uint64_t>(n) * k,
+                       "W8A16_PT_64X DGC0 ext2_size == N*K");
+
+            // Bridge emits identical DGC0 for M=64 via freetile_try_emit_w8a16_64x_dgc0.
+            std::vector<uint8_t> br_dgc0;
+            std::string br_err;
+            CHECK_TRUE(ob::freetile_try_emit_w8a16_64x_dgc0(
+                           k, n, 1.0f, weights.data(), dummy_interp.data(), dummy_interp.size(),
+                           &br_dgc0, &br_err) == OB_OK,
+                       ("ob::freetile_try_emit_w8a16_64x_dgc0 failed: " + br_err).c_str());
+            CHECK_TRUE(compare_bytes("w8a16 64x bridge dgc0", br_dgc0, res.dgc0, &cmp_err), cmp_err.c_str());
+        }
+
+        // M=64 with K=2048 or N=2048 must be rejected (exceeds Core-0 narrow SRAM headroom).
+        CHECK_TRUE(!freetile::is_buenos_w8a16_64x_shape(64u, 2048u, 2048u),
+                   "W8A16_PT_64X rejects 64x2048x2048 (768 KiB SRAM ceiling guard)");
+    }
+    std::printf("PASS [9/10]: W8A16 K=576/N=576 (5 shapes) + W8A16_PT_64X (6 shapes) structural/DIVE/pack parity verified\n");
+
+    // -------------------------------------------------------------------------
+    // 10. Selective Mixed-Precision Auto Policy (buenos_should_prefer_w8a16).
+    // -------------------------------------------------------------------------
+    {
+        freetile::BuenosW8A16PolicyDecision dec{};
+
+        // Bulk middle-layer Q_PROJ M=1 stays W8A8 (retains 27.96 GB/s fast decode).
+        freetile::BuenosW8A16PolicyInput q_mid{};
+        q_mid.m = 1u; q_mid.k = 1536u; q_mid.n = 1536u;
+        q_mid.role = freetile::BuenosProjectionRole::Q_PROJ;
+        q_mid.layer_index = 12; q_mid.total_layers = 28;
+        q_mid.weight_quant = freetile::QuantFormat::Q4_K;
+        q_mid.act_crest_factor = 6.5f;
+        CHECK_TRUE(!freetile::buenos_should_prefer_w8a16(q_mid, &dec),
+                   "Middle-layer Q4_K Q_PROJ keeps W8A8 fast decode");
+        CHECK_TRUE(dec.recommended_mode == freetile::BuenosKernelMode::W8A8_INT8,
+                   "Middle-layer Q_PROJ recommends W8A8_INT8");
+
+        // lm_head -> W8A16_PT_1X.
+        freetile::BuenosW8A16PolicyInput lm_head = q_mid;
+        lm_head.role = freetile::BuenosProjectionRole::LM_HEAD;
+        lm_head.layer_index = -1;
+        CHECK_TRUE(freetile::buenos_should_prefer_w8a16(lm_head, &dec),
+                   "lm_head routes to W8A16");
+        CHECK_TRUE(dec.recommended_mode == freetile::BuenosKernelMode::W8A16_PT_1X &&
+                   std::strcmp(dec.reason, "lm_head") == 0,
+                   "lm_head policy reason & mode");
+
+        // down_proj (M=64 prefill, last layer) -> W8A16_PT_64X.
+        freetile::BuenosW8A16PolicyInput down_64 = q_mid;
+        down_64.m = 64u;
+        down_64.role = freetile::BuenosProjectionRole::DOWN_PROJ;
+        down_64.layer_index = 27; down_64.total_layers = 28;
+        CHECK_TRUE(freetile::buenos_should_prefer_w8a16(down_64, &dec),
+                   "M=64 down_proj routes to W8A16_PT_64X");
+        CHECK_TRUE(dec.recommended_mode == freetile::BuenosKernelMode::W8A16_PT_64X &&
+                   std::strcmp(dec.reason, "down_proj_early_or_late") == 0,
+                   "M=64 late down_proj reason & mode");
+
+        // Layer 0 and Layer 1 early-layer guard (K=576 SmolLM2).
+        freetile::BuenosW8A16PolicyInput l0 = q_mid;
+        l0.k = 576u; l0.n = 576u; l0.layer_index = 0;
+        CHECK_TRUE(freetile::buenos_should_prefer_w8a16(l0, &dec) &&
+                   std::strcmp(dec.reason, "early_layer_0_1") == 0,
+                   "Layer 0 SmolLM2 K=576 routes to W8A16");
+        l0.layer_index = 1;
+        CHECK_TRUE(freetile::buenos_should_prefer_w8a16(l0, &dec) &&
+                   std::strcmp(dec.reason, "early_layer_0_1") == 0,
+                   "Layer 1 SmolLM2 K=576 routes to W8A16");
+
+        // Q6_K sensitive tensor (e.g. v_proj in Q4_K_M GGUF).
+        freetile::BuenosW8A16PolicyInput q6k = q_mid;
+        q6k.role = freetile::BuenosProjectionRole::V_PROJ;
+        q6k.weight_quant = freetile::QuantFormat::Q6_K;
+        CHECK_TRUE(freetile::buenos_should_prefer_w8a16(q6k, &dec) &&
+                   std::strcmp(dec.reason, "q6_k_sensitive_tensor") == 0,
+                   "Q6_K tensor routes to W8A16");
+
+        // Outlier crest guard (Qwen2.5 36.7x activation sink) + FP16 prescale flag (> 32768).
+        freetile::BuenosW8A16PolicyInput crest = q_mid;
+        crest.act_crest_factor = 36.7f;
+        crest.act_absmax = 40000.0f;
+        CHECK_TRUE(freetile::buenos_should_prefer_w8a16(crest, &dec) &&
+                   std::strcmp(dec.reason, "outlier_crest_guard") == 0 &&
+                   dec.needs_fp16_prescale,
+                   "Outlier crest >= 16.0 routes to W8A16 and flags FP16 prescale > 32768");
+
+        // Unsupported shape or fused activation never routes to W8A16.
+        freetile::BuenosW8A16PolicyInput bad_act = lm_head;
+        bad_act.activation = freetile::EpilogueActivation::SILU;
+        CHECK_TRUE(!freetile::buenos_should_prefer_w8a16(bad_act, &dec),
+                   "Fused activation stays on W8A8 Mode-A");
+        freetile::BuenosW8A16PolicyInput bad_sh = lm_head;
+        bad_sh.m = 8u; bad_sh.k = 64u; bad_sh.n = 64u;
+        CHECK_TRUE(!freetile::buenos_should_prefer_w8a16(bad_sh, &dec),
+                   "Unsupported W8A16 shape stays on W8A8");
+    }
+    std::printf("PASS [10/10]: buenos_should_prefer_w8a16 selective mixed-precision policy verified\n");
     std::printf("PASS: ALL freetile BUENOS_A0 bit-exact parity checks succeeded!\n");
     return 0;
 }
