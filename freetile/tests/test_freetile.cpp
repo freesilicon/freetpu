@@ -1,3 +1,4 @@
+#include "freetile/buenos_emitter.hpp"
 #include "freetile/mosaic_emitter.hpp"
 #include "freetile/tile_ir.hpp"
 
@@ -5,6 +6,7 @@
 #include <locale>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #define CHECK_TRUE(cond, msg)                                                                  \
     do {                                                                                       \
@@ -436,6 +438,103 @@ int main() {
         for (unsigned char c : esc) {
             CHECK_TRUE(c >= 0x20U && c < 0x7FU, "Escaped MLIR string contains only printable ASCII");
         }
+    }
+
+    // 16. Zero-dep BUENOS_A0 VLIW / DGC0 emitter (Q8_0, W8A16/BF16, Mode-A SiLU/GELU, locale safety)
+    {
+        std::vector<uint8_t> dummy_interp(4096u, 0xABu);
+        dummy_interp[0] = 0x7fu;
+        dummy_interp[1] = 'E';
+        dummy_interp[2] = 'L';
+        dummy_interp[3] = 'F';
+
+        // 16a. Lower plan_quant_matmul_kernel(BUENOS_A0, 1x1024x1024 Q8_0 BF16->BF16) via AUTO -> W8A16_PT_1X
+        freetile::TileKernel k_b0_w8a16;
+        std::string reason;
+        CHECK_TRUE(freetile::plan_quant_matmul_kernel(
+                       freetile::ChipTarget::BUENOS_A0, 1, 1024, 1024, freetile::QuantFormat::Q8_0,
+                       freetile::DType::BF16, freetile::DType::BF16, false, &k_b0_w8a16, &reason),
+                   ("BUENOS_A0 Q8_0 BF16 plan failed: " + reason).c_str());
+        freetile::BuenosEmitOptions w16_opts;
+        w16_opts.w8a16_pt_scale = 0.015625f;
+        w16_opts.dive_interp = dummy_interp.data();
+        w16_opts.dive_interp_size = dummy_interp.size();
+        const auto w16_res = freetile::emit_buenos_kernel(k_b0_w8a16, w16_opts);
+        CHECK_TRUE(w16_res.resolved_mode == freetile::BuenosKernelMode::W8A16_PT_1X, "AUTO selects W8A16_PT_1X");
+        CHECK_TRUE(!w16_res.dgc0.empty() && (w16_res.dgc0.size() % 64u) == 0u, "W8A16 DGC0 64-byte aligned");
+        freetile::BuenosDgc0Summary w16_sum;
+        CHECK_TRUE(freetile::inspect_buenos_dgc0(w16_res.dgc0.data(), w16_res.dgc0.size(), &w16_sum, &reason),
+                   ("inspect_buenos_dgc0 W8A16 failed: " + reason).c_str());
+        CHECK_TRUE(w16_sum.input_sizes.size() == 1u && w16_sum.input_sizes[0] == 1024u * 4u, "W8A16 FP32 input size");
+        CHECK_TRUE(w16_sum.output_sizes.size() == 1u && w16_sum.output_sizes[0] == 1024u * 4u, "W8A16 FP32 output size");
+        CHECK_TRUE(w16_sum.has_params && w16_sum.ext2_size == 1024u * 1024u, "W8A16 ext2 size");
+
+        // 16b. Plan and emit W8A8 with Mode-A fused SiLU & GELU epilogues + simulator check
+        for (const auto act : {freetile::EpilogueActivation::SILU, freetile::EpilogueActivation::GELU}) {
+            freetile::TileKernel k_fused;
+            CHECK_TRUE(freetile::plan_buenos_matmul_kernel(
+                           4, 32, 32, freetile::QuantFormat::Q8_0,
+                           freetile::DType::S8, freetile::DType::S8, act, &k_fused, &reason),
+                       ("plan_buenos_matmul_kernel fused failed: " + reason).c_str());
+            freetile::BuenosEmitOptions fopts;
+            fopts.dive_interp = dummy_interp.data();
+            fopts.dive_interp_size = dummy_interp.size();
+            const auto fres = freetile::emit_buenos_kernel(k_fused, fopts);
+            CHECK_TRUE(fres.resolved_mode == freetile::BuenosKernelMode::W8A8_INT8, "Fused W8A8_INT8 mode");
+            CHECK_TRUE(fres.mode_a_max_lsb_err > 0.0f && fres.mode_a_max_lsb_err < 0.05f, "Mode-A LSB error bound");
+            uint8_t probe[4] = {0u, 64u, 128u, 255u};
+            int8_t out_q[4] = {0, 0, 0, 0};
+            CHECK_TRUE(freetile::buenos_simulate_c5_mode_a_fused(fres.chunks[5], probe, 4, out_q, &reason),
+                       ("buenos_simulate_c5_mode_a_fused failed: " + reason).c_str());
+            // At u_mid = 128 (q_mid = 0, x = 0), both SiLU(0) and GELU(0) equal 0.
+            CHECK_TRUE(out_q[2] == 0, "Mode-A fused activation preserves f(0) == 0");
+            freetile::BuenosDgc0Summary fsum;
+            CHECK_TRUE(freetile::inspect_buenos_dgc0(fres.dgc0.data(), fres.dgc0.size(), &fsum, &reason),
+                       ("inspect_buenos_dgc0 fused failed: " + reason).c_str());
+            CHECK_TRUE(fsum.input_sizes.size() == 1u && fsum.input_sizes[0] == 4u * 32u, "Fused input size");
+            CHECK_TRUE(fsum.output_sizes.size() == 1u && fsum.output_sizes[0] == 4u * 32u, "Fused output size");
+        }
+
+        // 16c. Dynamic-weights 2-input 0-param DGC0
+        freetile::TileKernel k_dyn;
+        CHECK_TRUE(freetile::plan_buenos_matmul_kernel(
+                       1, 1024, 1024, freetile::QuantFormat::Q8_0,
+                       freetile::DType::S8, freetile::DType::S8,
+                       freetile::EpilogueActivation::NONE, &k_dyn, &reason),
+                   "Plan BUENOS_A0 lt_1x1024x1024");
+        freetile::BuenosEmitOptions dopts;
+        dopts.mode = freetile::BuenosKernelMode::W8A8_DYN_WEIGHTS;
+        dopts.dive_interp = dummy_interp.data();
+        dopts.dive_interp_size = dummy_interp.size();
+        const auto dres = freetile::emit_buenos_kernel(k_dyn, dopts);
+        freetile::BuenosDgc0Summary dsum;
+        CHECK_TRUE(freetile::inspect_buenos_dgc0(dres.dgc0.data(), dres.dgc0.size(), &dsum, &reason),
+                   ("inspect_buenos_dgc0 dyn failed: " + reason).c_str());
+        CHECK_TRUE(dsum.input_sizes.size() == 2u && !dsum.has_params, "Dynamic weights has 2 inputs & 0 params");
+        CHECK_TRUE(dsum.input_sizes[1] == dres.ext2_bytes, "Dynamic weights input[1] matches ext2_bytes");
+
+        // 16d. Mosaic emitter rejects non-NONE epilogue activation cleanly; Buenos rejects Cloud TPU targets
+        freetile::TileKernel k_v5e;
+        CHECK_TRUE(freetile::plan_quant_matmul_kernel(
+                       freetile::ChipTarget::V5E, 8, 64, 128, freetile::QuantFormat::NONE,
+                       freetile::DType::BF16, freetile::DType::F32, false, &k_v5e),
+                   "Plan V5E dense kernel");
+        bool threw_buenos = false;
+        try {
+            (void)freetile::emit_buenos_kernel(k_v5e);
+        } catch (const std::runtime_error&) {
+            threw_buenos = true;
+        }
+        CHECK_TRUE(threw_buenos, "emit_buenos_kernel rejects V5E target");
+
+        k_v5e.matmul.activation = freetile::EpilogueActivation::SILU;
+        bool threw_mosaic_act = false;
+        try {
+            (void)freetile::emit_mosaic_kernel(k_v5e);
+        } catch (const std::runtime_error&) {
+            threw_mosaic_act = true;
+        }
+        CHECK_TRUE(threw_mosaic_act, "emit_mosaic_kernel rejects fused SiLU epilogue");
     }
 
     std::printf("PASS: all freetile unit tests succeeded!\n");
