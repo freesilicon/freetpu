@@ -87,6 +87,16 @@ enum class SyncMode {
     ASYNC_PIPELINE,
 };
 
+enum class EpilogueActivation {
+    NONE = 0,
+    RELU = 1,
+    RELU6 = 3,
+    SILU = 4,
+    GELU = 5,
+};
+
+const char* epilogue_activation_name(EpilogueActivation act);
+
 struct TileGrid {
     std::vector<int64_t> dims;                    // e.g. {N/bn, K/bk} or {N/bn}
     std::vector<DimensionSemantics> semantics;    // parallel / arbitrary per grid axis
@@ -128,6 +138,7 @@ struct TileMatmul {
     DType weight_dtype = DType::S4;
     DType scale_dtype = DType::BF16;
     DType out_dtype = DType::BF16;
+    EpilogueActivation activation = EpilogueActivation::NONE;
     bool factored_m_term = true;
     bool post_dot_scale = true;
 };

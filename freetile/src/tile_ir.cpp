@@ -238,6 +238,17 @@ const char* memory_space_name(MemorySpace space) {
     }
 }
 
+const char* epilogue_activation_name(EpilogueActivation act) {
+    switch (act) {
+        case EpilogueActivation::NONE: return "none";
+        case EpilogueActivation::RELU: return "relu";
+        case EpilogueActivation::RELU6: return "relu6";
+        case EpilogueActivation::SILU: return "silu";
+        case EpilogueActivation::GELU: return "gelu";
+        default: return "unknown";
+    }
+}
+
 size_t TileKernel::vmem_footprint_bytes() const {
     size_t total = 0;
     for (const SramTile& op : operands) {
@@ -273,16 +284,17 @@ bool TileKernel::validate(std::string* err) const {
         return fail(err, "TileKernel name must be a valid bare MLIR symbol ([A-Za-z_][A-Za-z0-9_$.-]*)");
     }
     const TargetProfile prof = target_profile(target);
+    const bool is_buenos = (target == ChipTarget::BUENOS_A0);
     if (matmul.m <= 0 || matmul.m_padded <= 0 || matmul.n <= 0 || matmul.k <= 0) {
         return fail(err, "TileMatmul dimensions must be positive");
     }
-    if (matmul.m_padded < matmul.m || (matmul.m_padded % prof.sublane_align) != 0) {
+    if (matmul.m_padded < matmul.m || (!is_buenos && (matmul.m_padded % prof.sublane_align) != 0)) {
         return fail(err, "TileMatmul m_padded must be >= m and aligned to sublane_align");
     }
     if (grid.bm != matmul.m_padded) {
         return fail(err, "TileGrid bm must equal matmul.m_padded");
     }
-    if (grid.bn <= 0 || (grid.bn % prof.lane_align) != 0 || (matmul.n % grid.bn) != 0) {
+    if (grid.bn <= 0 || (!is_buenos && (grid.bn % prof.lane_align) != 0) || (matmul.n % grid.bn) != 0) {
         return fail(err, "TileGrid bn must be positive, lane-aligned, and evenly divide N");
     }
     if (grid.bk <= 0 || (matmul.k % grid.bk) != 0) {
@@ -290,19 +302,31 @@ bool TileKernel::validate(std::string* err) const {
     }
 
     const int64_t blk = quant_block_size(matmul.quant);
-    if (blk <= 0 || matmul.quant_block_size != blk) {
-        return fail(err, "TileMatmul quant_block_size does not match QuantFormat");
+    if (blk <= 0) {
+        return fail(err, "TileMatmul QuantFormat is unsupported");
     }
-    if ((grid.bk % blk) != 0) {
-        return fail(err, "TileGrid bk must be divisible by quant_block_size");
-    }
-    if (matmul.quant != QuantFormat::NONE) {
-        const int64_t nb_tile = grid.bk / blk;
-        if ((nb_tile % prof.sublane_align) != 0) {
-            return fail(err, "Quantized tile block count (bk / blk) must be divisible by sublane_align (8)");
+    if (!is_buenos) {
+        if (matmul.quant_block_size != blk) {
+            return fail(err, "TileMatmul quant_block_size does not match QuantFormat");
         }
-    } else if ((grid.bk % prof.sublane_align) != 0) {
-        return fail(err, "Dense tile bk must be divisible by sublane_align (8)");
+        if ((grid.bk % blk) != 0) {
+            return fail(err, "TileGrid bk must be divisible by quant_block_size");
+        }
+        if (matmul.quant != QuantFormat::NONE) {
+            const int64_t nb_tile = grid.bk / blk;
+            if ((nb_tile % prof.sublane_align) != 0) {
+                return fail(err, "Quantized tile block count (bk / blk) must be divisible by sublane_align (8)");
+            }
+        } else if ((grid.bk % prof.sublane_align) != 0) {
+            return fail(err, "Dense tile bk must be divisible by sublane_align (8)");
+        }
+    } else {
+        if (matmul.quant_block_size != blk && matmul.quant_block_size != 1) {
+            return fail(err, "BUENOS_A0 TileMatmul quant_block_size must match QuantFormat or 1 (per-tensor)");
+        }
+        if (matmul.quant_block_size > 1 && (grid.bk % matmul.quant_block_size) != 0) {
+            return fail(err, "BUENOS_A0 TileGrid bk must be divisible by quant_block_size");
+        }
     }
 
     const size_t n_tiles = static_cast<size_t>(matmul.n / grid.bn);
@@ -337,31 +361,53 @@ bool TileKernel::validate(std::string* err) const {
     if (matmul.has_min != quant_has_min(matmul.quant)) {
         return fail(err, "TileMatmul has_min does not match QuantFormat");
     }
-    const size_t expected_ops = (matmul.quant == QuantFormat::NONE) ? 3
+    const bool has_scale_operand =
+        (matmul.quant != QuantFormat::NONE) &&
+        (!is_buenos || (matmul.quant_block_size > 1 && operands.size() >= 4));
+    const size_t expected_ops = !has_scale_operand ? 3
                                 : (matmul.has_min ? 5 : 4);
     if (operands.size() != expected_ops) {
         return fail(err, "TileKernel operand count mismatch for QuantFormat");
     }
-    if (matmul.act_dtype != DType::BF16) {
-        return fail(err, "TileMatmul act_dtype must be BF16");
-    }
-    if (matmul.out_dtype != DType::BF16 && matmul.out_dtype != DType::F32) {
-        return fail(err, "TileMatmul out_dtype must be BF16 or F32");
-    }
-    if (matmul.quant == QuantFormat::NONE) {
-        if (matmul.weight_dtype != DType::BF16) {
-            return fail(err, "Dense TileMatmul weight_dtype must be BF16");
+    if (!is_buenos) {
+        if (matmul.act_dtype != DType::BF16) {
+            return fail(err, "TileMatmul act_dtype must be BF16");
+        }
+        if (matmul.out_dtype != DType::BF16 && matmul.out_dtype != DType::F32) {
+            return fail(err, "TileMatmul out_dtype must be BF16 or F32");
+        }
+        if (matmul.quant == QuantFormat::NONE) {
+            if (matmul.weight_dtype != DType::BF16) {
+                return fail(err, "Dense TileMatmul weight_dtype must be BF16");
+            }
+        } else {
+            if (matmul.scale_dtype != DType::BF16 && matmul.scale_dtype != DType::F32) {
+                return fail(err, "Quantized TileMatmul scale_dtype must be BF16 or F32");
+            }
+            const DType expected_w_dt =
+                (matmul.quant == QuantFormat::Q4_K || matmul.quant == QuantFormat::Q4_0)
+                    ? (matmul.unsigned_q4 ? DType::U4 : DType::S4)
+                    : DType::S8;
+            if (matmul.weight_dtype != expected_w_dt) {
+                return fail(err, "Quantized TileMatmul weight_dtype does not match QuantFormat/unsigned_q4");
+            }
         }
     } else {
-        if (matmul.scale_dtype != DType::BF16 && matmul.scale_dtype != DType::F32) {
-            return fail(err, "Quantized TileMatmul scale_dtype must be BF16 or F32");
+        if (matmul.act_dtype != DType::S8 && matmul.act_dtype != DType::BF16 &&
+            matmul.act_dtype != DType::F16 && matmul.act_dtype != DType::F32) {
+            return fail(err, "BUENOS_A0 TileMatmul act_dtype must be S8, BF16, F16, or F32");
         }
-        const DType expected_w_dt =
-            (matmul.quant == QuantFormat::Q4_K || matmul.quant == QuantFormat::Q4_0)
-                ? (matmul.unsigned_q4 ? DType::U4 : DType::S4)
-                : DType::S8;
-        if (matmul.weight_dtype != expected_w_dt) {
-            return fail(err, "Quantized TileMatmul weight_dtype does not match QuantFormat/unsigned_q4");
+        if (matmul.out_dtype != DType::S8 && matmul.out_dtype != DType::BF16 &&
+            matmul.out_dtype != DType::F32) {
+            return fail(err, "BUENOS_A0 TileMatmul out_dtype must be S8, BF16, or F32");
+        }
+        if (matmul.weight_dtype != DType::S8 && matmul.weight_dtype != DType::BF16) {
+            return fail(err, "BUENOS_A0 TileMatmul weight_dtype must be S8 or BF16");
+        }
+        if (has_scale_operand &&
+            matmul.scale_dtype != DType::BF16 && matmul.scale_dtype != DType::F32 &&
+            matmul.scale_dtype != DType::F16) {
+            return fail(err, "BUENOS_A0 TileMatmul scale_dtype must be BF16, F16, or F32");
         }
     }
 
@@ -410,9 +456,9 @@ bool TileKernel::validate(std::string* err) const {
     if (!check_operand(op_idx++, "w", matmul.k, matmul.n, grid.bk, grid.bn, matmul.weight_dtype, false)) {
         return false;
     }
-    if (matmul.quant != QuantFormat::NONE) {
-        const int64_t nb = matmul.k / blk;
-        const int64_t nb_tile = grid.bk / blk;
+    if (has_scale_operand) {
+        const int64_t nb = matmul.k / matmul.quant_block_size;
+        const int64_t nb_tile = grid.bk / matmul.quant_block_size;
         if (!check_operand(op_idx++, "d", nb, matmul.n, nb_tile, grid.bn, matmul.scale_dtype, false)) {
             return false;
         }
