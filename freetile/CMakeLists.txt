@@ -9,6 +9,9 @@ add_library(freetile STATIC
     src/tile_ir.cpp
     src/mosaic_emitter.cpp
     src/buenos_emitter.cpp
+    src/buenos_splines.cpp
+    src/flash_attn_planner.cpp
+    src/malibu_profile.cpp
 )
 target_include_directories(freetile PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_compile_options(freetile PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -20,6 +23,14 @@ add_executable(test_freetile
 target_link_libraries(test_freetile PRIVATE freetile)
 target_compile_options(test_freetile PRIVATE -Wall -Wextra -Wpedantic -Werror)
 add_test(NAME freetile_unit_tests COMMAND test_freetile)
+
+add_executable(test_splines_and_flash_attn
+    tests/test_splines_and_flash_attn.cpp
+)
+target_link_libraries(test_splines_and_flash_attn PRIVATE freetile)
+target_compile_options(test_splines_and_flash_attn PRIVATE
+    -Wall -Wextra -Wpedantic -Werror -fno-exceptions -fno-rtti)
+add_test(NAME freetile_splines_flash_attn_tests COMMAND test_splines_and_flash_attn)
 
 option(FREETILE_BUILD_BUENOS_PARITY_TEST "Build bit-exact parity test against sibling libopenbuenos" ON)
 if(FREETILE_BUILD_BUENOS_PARITY_TEST AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../libopenbuenos/CMakeLists.txt")
