@@ -165,6 +165,11 @@ MosaicEmitResult emit_mosaic_kernel(const TileKernel& kernel, int64_t mosaic_ver
         throw std::runtime_error(std::string("emit_mosaic_kernel: target ") + prof.name +
                                  " does not support Mosaic tpu_custom_call");
     }
+    if (kernel.matmul.activation != EpilogueActivation::NONE) {
+        throw std::runtime_error(std::string("emit_mosaic_kernel: fused epilogue activation ") +
+                                 epilogue_activation_name(kernel.matmul.activation) +
+                                 " is not supported on Mosaic target");
+    }
 
     const int64_t version = (mosaic_version_override > 0) ? mosaic_version_override : prof.mosaic_version;
     const int64_t bm = kernel.grid.bm;

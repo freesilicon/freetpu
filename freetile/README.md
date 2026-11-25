@@ -1,17 +1,20 @@
-# `freetile` — Zero-Dependency C++17 Portable Tile IR & Mosaic Backend
+# `freetile` — Zero-Dependency C++17 Portable Tile IR, Mosaic & Buenos Backends
 
-`freetile/` (`namespace freetile::`) is a clean-room, zero-external-dependency C++17 tile programming IR and code generator for TPUs (`V5E`, `V6E`, `TPU7X`, plus edge `BUENOS_A0` hooks for `libopenbuenos` / `libopentpu`).
+`freetile/` (`namespace freetile::`) is a clean-room, zero-external-dependency C++17 tile programming IR and code generator for Cloud TPUs (`V5E`, `V6E`, `TPU7X`) and Edge Tensor G5 (`BUENOS_A0`).
 
 ## Design
 
 - **Zero external dependencies:** Pure C++17 standard library only (`-Wall -Wextra -Wpedantic -Werror`). No LLVM, MLIR, Python, JAX, or libprotobuf dependencies.
 - **Portable Tile IR (`include/freetile/tile_ir.hpp`):**
   - `ChipTarget` / `TargetProfile` (`V5E`, `V6E`, `TPU7X`, `BUENOS_A0`)
-  - `TileGrid`, `SramTile`, `DmaPrefetch`, `QuantFormat` (`NONE`, `Q4_K`, `Q6_K`, `Q4_0`, `Q8_0`), `TileMatmul`, `TileKernel`
+  - `TileGrid`, `SramTile`, `DmaPrefetch`, `QuantFormat` (`NONE`, `Q4_K`, `Q6_K`, `Q4_0`, `Q8_0`), `EpilogueActivation` (`NONE`, `RELU`, `RELU6`, `SILU`, `GELU`), `TileMatmul`, `TileKernel`
   - `TilePlannerConfig` & `TileScheduleHookFn` extension seam allowing external runtime/tuning layers to override `(bm, bn, bk)` schedules with zero fork.
 - **Cloud TPU Mosaic Lowering (`include/freetile/mosaic_emitter.hpp`):**
   - Lowers `TileKernel` descriptors directly to `stable_mosaic.*` MLIR (`stable_mosaic.version = 17`) with RFC 4648 base64 encoding (`serialization_format = 1`) for `stablehlo.custom_call @tpu_custom_call`.
   - Integrated into `llama-cpp-cloudtpu` behind `CLOUDTPU_FREETILE_MOSAIC=1`, with automatic runtime fallback to pure StableHLO (`Q4_K_I4`, `Q6_K_SPLIT`, `Q4_0_I4`, `Q8_0_SPLIT`) if compilation or dialect version fails.
+- **Tensor G5 (`BUENOS_A0`) VLIW / `DGC0` Lowering (`include/freetile/buenos_emitter.hpp`):**
+  - Lowers `ChipTarget::BUENOS_A0` `TileKernel` descriptors (`Q8_0` general 81-shape multi-tile, 16/9-core `lt_1x*`, batched `lt_64x*`, weight-agnostic `W8A8_DYN_WEIGHTS`, per-tensor `W8A16_PT_1X`/`BF16`, and zero-overhead Mode-A degree-4 Remez fused `SiLU`/`GELU` epilogues) directly to 7-chunk VLIW descriptors, DIVE VM IR (`ext[0]`), packed parameters (`ext[2]`), and 64-byte-aligned `DGC0` FlatBuffer executables.
+  - Pure C++17 standard library only (zero dependency on `libopenbuenos`, LLVM, MLIR, or Python). Optional `test_buenos_parity` verifies bit-exact byte-for-byte parity against `libopenbuenos` when the sibling directory is present.
 
 ## Build & Test
 
@@ -19,6 +22,12 @@
 cmake -S freetile -B freetile/build -DCMAKE_BUILD_TYPE=Release
 cmake --build freetile/build
 ctest --test-dir freetile/build --output-on-failure
+```
+
+To build `freetile` standalone without the optional `libopenbuenos` parity test:
+
+```bash
+cmake -S freetile -B freetile/build -DCMAKE_BUILD_TYPE=Release -DFREETILE_BUILD_BUENOS_PARITY_TEST=OFF
 ```
 
 ## Live `v5e-1` Silicon Verification (`MAPS_LIBPYTHON=0`, `LDD_LIBPYTHON=0`)
