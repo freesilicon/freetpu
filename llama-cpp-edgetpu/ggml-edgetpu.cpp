@@ -247,8 +247,26 @@ static void quantize_f32_rows_to_i8(const float * src,
 }
 
 static_assert(QK4_0 == QK8_0, "ggml-edgetpu requires QK4_0 == QK8_0 == 32");
+static_assert(QK_K == OB_QK_K, "ggml-edgetpu requires QK_K == OB_QK_K == 256");
+static_assert(QK4_NL == OB_QK4_NL, "ggml-edgetpu requires QK4_NL == OB_QK4_NL == 32");
 static_assert(sizeof(block_q8_0) == sizeof(ob_block_q8_0_t), "block_q8_0 must match ob_block_q8_0_t");
 static_assert(sizeof(block_q4_0) == sizeof(ob_block_q4_0_t), "block_q4_0 must match ob_block_q4_0_t");
+static_assert(sizeof(block_q4_K) == sizeof(ob_block_q4_k_t), "block_q4_K must match ob_block_q4_k_t");
+static_assert(sizeof(block_q6_K) == sizeof(ob_block_q6_k_t), "block_q6_K must match ob_block_q6_k_t");
+static_assert(sizeof(block_iq4_nl) == sizeof(ob_block_iq4_nl_t), "block_iq4_nl must match ob_block_iq4_nl_t");
+static_assert(sizeof(block_iq4_xs) == sizeof(ob_block_iq4_xs_t), "block_iq4_xs must match ob_block_iq4_xs_t");
+
+static inline bool ggml_type_to_ob_quant(enum ggml_type t, ob_quant_type_t * out) {
+    switch (t) {
+        case GGML_TYPE_Q8_0:   if (out) *out = OB_QUANT_Q8_0;   return true;
+        case GGML_TYPE_Q4_0:   if (out) *out = OB_QUANT_Q4_0;   return true;
+        case GGML_TYPE_Q4_K:   if (out) *out = OB_QUANT_Q4_K;   return true;
+        case GGML_TYPE_Q6_K:   if (out) *out = OB_QUANT_Q6_K;   return true;
+        case GGML_TYPE_IQ4_NL: if (out) *out = OB_QUANT_IQ4_NL; return true;
+        case GGML_TYPE_IQ4_XS: if (out) *out = OB_QUANT_IQ4_XS; return true;
+        default:               return false;
+    }
+}
 
 struct packed_q8_weight {
     uint32_t            k_dim = 0;
@@ -747,7 +765,8 @@ static ggml_status ggml_edgetpu_compute_forward_mul_mat(ggml_backend_edgetpu_con
             ob_invoke_stats_t stats {};
             ob_status_t st = OB_OK;
 
-            if (src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_Q4_0) {
+            ob_quant_type_t src0_qt = OB_QUANT_Q8_0;
+            if (ggml_type_to_ob_quant(src0->type, &src0_qt)) {
                 const float * a_f32 = nullptr;
                 if (src1->type == GGML_TYPE_F32) {
                     a_f32 = reinterpret_cast<const float *>(src1_ptr);
@@ -764,19 +783,21 @@ static ggml_status ggml_edgetpu_compute_forward_mul_mat(ggml_backend_edgetpu_con
                     return GGML_STATUS_FAILED;
                 }
 
-                if (src0->type == GGML_TYPE_Q4_0) {
-                    // Native zero-copy raw Q4_0 dispatch into libopenbuenos O(1) content-hashed ext[2] DMA-BUF LRU
-                    // (unpacks nibbles once on cache miss; zero per-token CPU unpack, zero duplicate host RAM).
+                if (src0_qt != OB_QUANT_Q8_0) {
+                    // Native zero-copy raw GGUF quant dispatch (Q4_0, Q4_K, Q6_K, IQ4_NL, IQ4_XS)
+                    // into libopenbuenos O(1) content-hashed ext[2] DMA-BUF LRU (unpacks once on
+                    // cache miss; zero per-token CPU unpack, zero duplicate host RAM).
                     ob_gemm_f32_quant_job_t job {};
                     job.b_nk       = src0_ptr;
                     job.c_mn       = dst_ptr;
                     job.n_dim      = N;
                     job.activation = OB_ACT_NONE;
-                    job.is_q4_0    = 1u;
+                    ob_gemm_f32_quant_job_set_type(&job, src0_qt);
                     st = ob_gemm_matmul_f32_quant_batch(ctx->ob_ctx, a_f32, M, K, &job, 1u, &stats);
                     if (st != OB_OK) {
-                        GGML_LOG_ERROR("ggml-edgetpu: ob_gemm_matmul_f32_quant_batch (Q4_0 M=%u,K=%u,N=%u) failed: %s (%s)\n",
-                                       M, K, N, ob_status_string(st), ob_context_last_error(ctx->ob_ctx));
+                        GGML_LOG_ERROR("ggml-edgetpu: ob_gemm_matmul_f32_quant_batch (%s M=%u,K=%u,N=%u) failed: %s (%s)\n",
+                                       ob_quant_type_name(src0_qt), M, K, N,
+                                       ob_status_string(st), ob_context_last_error(ctx->ob_ctx));
                         return GGML_STATUS_FAILED;
                     }
                 } else if (ctx->env.packed_q8) {
@@ -1400,7 +1421,10 @@ static ggml_status ggml_edgetpu_compute_forward_mul_mat_id(ggml_backend_edgetpu_
     const int64_t  n_expert = ne02;
     const int64_t  n_used   = ids->ne[0];
     const int64_t  n_tokens = ids->ne[1];
-    const uint8_t  is_q4_0  = (src0->type == GGML_TYPE_Q4_0) ? 1u : 0u;
+    ob_quant_type_t src0_qt = OB_QUANT_Q8_0;
+    if (!ggml_type_to_ob_quant(src0->type, &src0_qt)) {
+        return GGML_STATUS_FAILED;
+    }
 
     const auto * q8_traits = (src1->type == GGML_TYPE_Q8_0) ? ggml_get_type_traits(GGML_TYPE_Q8_0) : nullptr;
 
@@ -1491,7 +1515,7 @@ static ggml_status ggml_edgetpu_compute_forward_mul_mat_id(ggml_backend_edgetpu_
             jobs[n_jobs].c_mn       = out_row;
             jobs[n_jobs].n_dim      = N;
             jobs[n_jobs].activation = OB_ACT_NONE;
-            jobs[n_jobs].is_q4_0    = is_q4_0;
+            ob_gemm_f32_quant_job_set_type(&jobs[n_jobs], src0_qt);
             n_jobs++;
 
             if (n_jobs == MAX_BATCH_JOBS) {
@@ -1577,7 +1601,7 @@ static ggml_status ggml_edgetpu_compute_forward_mul_mat_id(ggml_backend_edgetpu_
                     job.c_mn       = c_ptr;
                     job.n_dim      = N;
                     job.activation = OB_ACT_NONE;
-                    job.is_q4_0    = is_q4_0;
+                    ob_gemm_f32_quant_job_set_type(&job, src0_qt);
 
                     ob_invoke_stats_t estats {};
                     const ob_status_t st = ob_gemm_matmul_f32_quant_batch(ctx->ob_ctx, a_ptr, 1u, K, &job, 1u, &estats);
@@ -1615,7 +1639,7 @@ static ggml_status ggml_edgetpu_compute_forward_mul_mat_id(ggml_backend_edgetpu_
                     job.c_mn       = ctx->moe_out_f32.data();
                     job.n_dim      = N;
                     job.activation = OB_ACT_NONE;
-                    job.is_q4_0    = is_q4_0;
+                    ob_gemm_f32_quant_job_set_type(&job, src0_qt);
 
                     ob_invoke_stats_t estats {};
                     const ob_status_t st = ob_gemm_matmul_f32_quant_batch(
@@ -1672,7 +1696,10 @@ static bool is_batchable_sibling_mul_mat(const struct ggml_tensor * node,
     if (!src0 || !src1) {
         return false;
     }
-    if ((src0->type != GGML_TYPE_Q8_0 && src0->type != GGML_TYPE_Q4_0) || src1->type != GGML_TYPE_F32) {
+    if (!ggml_type_to_ob_quant(src0->type, nullptr) || src1->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if ((src0->ne[0] % ggml_blck_size(src0->type)) != 0) {
         return false;
     }
     if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
@@ -1756,7 +1783,7 @@ static bool is_fusible_swiglu_mul_mat(const struct ggml_tensor * node) {
     if (!w || !x) {
         return false;
     }
-    if ((w->type != GGML_TYPE_Q8_0 && w->type != GGML_TYPE_Q4_0) || x->type != GGML_TYPE_F32) {
+    if (!ggml_type_to_ob_quant(w->type, nullptr) || x->type != GGML_TYPE_F32) {
         return false;
     }
     if (w->ne[2] != 1 || w->ne[3] != 1 || x->ne[2] != 1 || x->ne[3] != 1) {
@@ -1765,7 +1792,7 @@ static bool is_fusible_swiglu_mul_mat(const struct ggml_tensor * node) {
     if (!ggml_is_contiguous(w) || !ggml_is_contiguous(x) || !ggml_is_contiguous(node)) {
         return false;
     }
-    if ((w->ne[0] % QK8_0) != 0) {
+    if ((w->ne[0] % ggml_blck_size(w->type)) != 0) {
         return false;
     }
     return true;
@@ -1935,7 +1962,10 @@ static int try_compute_fused_swiglu(ggml_backend_edgetpu_context * ctx,
         down_mm->src[1]->ne[1] != static_cast<int64_t>(M)) {
         return 0;
     }
-    if ((K % QK8_0) != 0u || (H % QK8_0) != 0u || M == 0u || N == 0u) {
+    if ((K % static_cast<uint32_t>(ggml_blck_size(gate_mm->src[0]->type))) != 0u ||
+        (K % static_cast<uint32_t>(ggml_blck_size(up_mm->src[0]->type)))   != 0u ||
+        (H % static_cast<uint32_t>(ggml_blck_size(down_mm->src[0]->type))) != 0u ||
+        M == 0u || N == 0u) {
         return 0;
     }
 
@@ -2040,17 +2070,24 @@ static int try_compute_fused_swiglu(ggml_backend_edgetpu_context * ctx,
         a_ptr = ctx->f32_a.data();
     }
 
+    ob_quant_type_t gate_qt = OB_QUANT_Q8_0;
+    ob_quant_type_t up_qt   = OB_QUANT_Q8_0;
+    ob_quant_type_t down_qt = OB_QUANT_Q8_0;
+    if (!ggml_type_to_ob_quant(gate_mm->src[0]->type, &gate_qt) ||
+        !ggml_type_to_ob_quant(up_mm->src[0]->type, &up_qt) ||
+        !ggml_type_to_ob_quant(down_mm->src[0]->type, &down_qt)) {
+        return 0;
+    }
+
     ob_gemm_swiglu_quant_desc_t sdesc {};
-    sdesc.w_gate_hk    = gate_mm->src[0]->data;
-    sdesc.w_up_hk      = up_mm->src[0]->data;
-    sdesc.w_down_nh    = down_mm->src[0]->data;
-    sdesc.m_dim        = M;
-    sdesc.k_dim        = K;
-    sdesc.h_dim        = H;
-    sdesc.n_dim        = N;
-    sdesc.gate_is_q4_0 = (gate_mm->src[0]->type == GGML_TYPE_Q4_0) ? 1u : 0u;
-    sdesc.up_is_q4_0   = (up_mm->src[0]->type   == GGML_TYPE_Q4_0) ? 1u : 0u;
-    sdesc.down_is_q4_0 = (down_mm->src[0]->type == GGML_TYPE_Q4_0) ? 1u : 0u;
+    sdesc.w_gate_hk = gate_mm->src[0]->data;
+    sdesc.w_up_hk   = up_mm->src[0]->data;
+    sdesc.w_down_nh = down_mm->src[0]->data;
+    sdesc.m_dim     = M;
+    sdesc.k_dim     = K;
+    sdesc.h_dim     = H;
+    sdesc.n_dim     = N;
+    ob_gemm_swiglu_quant_desc_set_types(&sdesc, gate_qt, up_qt, down_qt);
 
     ob_invoke_stats_t sstats {};
     const ob_status_t sst = ob_gemm_swiglu_f32_quant(
@@ -2254,6 +2291,10 @@ static ggml_status ggml_backend_edgetpu_graph_compute(ggml_backend_t backend, st
 
                         ob_gemm_f32_quant_job_t jobs[MAX_SIBLINGS];
                         for (int k = 0; k < n_mm; ++k) {
+                            ob_quant_type_t qt = OB_QUANT_Q8_0;
+                            if (!ggml_type_to_ob_quant(mm_nodes[k]->src[0]->type, &qt)) {
+                                return GGML_STATUS_FAILED;
+                            }
                             jobs[k]            = {};
                             jobs[k].b_nk       = mm_nodes[k]->src[0]->data;
                             jobs[k].c_mn       = mm_needs_scratch[k]
@@ -2261,7 +2302,7 @@ static ggml_status ggml_backend_edgetpu_graph_compute(ggml_backend_t backend, st
                                                      : reinterpret_cast<float *>(mm_nodes[k]->data);
                             jobs[k].n_dim      = static_cast<uint32_t>(mm_nodes[k]->src[0]->ne[1]);
                             jobs[k].activation = OB_ACT_NONE;
-                            jobs[k].is_q4_0    = (mm_nodes[k]->src[0]->type == GGML_TYPE_Q4_0) ? 1u : 0u;
+                            ob_gemm_f32_quant_job_set_type(&jobs[k], qt);
                         }
 
                         ob_invoke_stats_t bstats {};
@@ -2553,14 +2594,14 @@ static bool ggml_backend_edgetpu_device_supports_op(ggml_backend_dev_t dev, cons
             }
 
             // Supported quant / precision regimes:
-            //   - Q8_0 x F32 / Q8_0 (K % 32 == 0)
-            //   - Q4_0 x F32 / Q8_0 (K % 32 == 0; lossless block-32 unpack into bounded scratch -> ext[2] DMA-BUF LRU)
+            //   - Q8_0 / Q4_0 / IQ4_NL x F32 / Q8_0 (K % 32 == 0)
+            //   - Q4_K / Q6_K / IQ4_XS x F32 / Q8_0 (K % 256 == 0)
             //   - F32  x F32        (dynamic per-row INT8 quantize -> buenos INT8 GEMM -> F32 dequantize;
             //                        requires K % 4 == 0 and N >= 8 matching Tensor G5's 8-channel n_pad width)
             bool dtype_ok = false;
-            if ((src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_Q4_0) &&
+            if (ggml_type_to_ob_quant(src0->type, nullptr) &&
                 (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_Q8_0)) {
-                dtype_ok = ((K % QK8_0) == 0);
+                dtype_ok = ((K % ggml_blck_size(src0->type)) == 0);
             } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
                 dtype_ok = ((K % 4) == 0 && N >= 8);
             }
@@ -2638,11 +2679,11 @@ static bool ggml_backend_edgetpu_device_supports_op(ggml_backend_dev_t dev, cons
             if (op->ne[0] != N || op->ne[1] != n_used || op->ne[2] != n_tokens) {
                 return false;
             }
-            if ((src0->type != GGML_TYPE_Q8_0 && src0->type != GGML_TYPE_Q4_0) ||
+            if (!ggml_type_to_ob_quant(src0->type, nullptr) ||
                 (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_Q8_0)) {
                 return false;
             }
-            if ((K % QK8_0) != 0) {
+            if ((K % ggml_blck_size(src0->type)) != 0) {
                 return false;
             }
 
