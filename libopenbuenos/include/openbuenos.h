@@ -31,6 +31,9 @@ extern "C" {
 #define OB_MAX_CREDITS       16u
 #define OB_MAX_GRAPH_IO      8u
 #define OB_QK8_0             32u
+#define OB_QK_K              256u
+#define OB_K_SCALE_SIZE      12u
+#define OB_QK4_NL            32u
 
 /* =========================================================================
  * Status Codes
@@ -79,6 +82,19 @@ enum ob_stat_flags {
   OB_STAT_FLAG_FREETILE     = (1u << 4)
 };
 
+/*
+ * Supported GGUF quantized weight block formats.
+ * Values 0 (Q8_0) and 1 (Q4_0) match legacy boolean `is_q4_0` fields for 100% ABI compatibility.
+ */
+typedef enum ob_quant_type {
+  OB_QUANT_Q8_0   = 0, /* 34 B /  32 weights (ob_block_q8_0_t) */
+  OB_QUANT_Q4_0   = 1, /* 18 B /  32 weights (ob_block_q4_0_t) */
+  OB_QUANT_Q4_K   = 2, /* 144 B / 256 weights (ob_block_q4_k_t) */
+  OB_QUANT_Q6_K   = 3, /* 210 B / 256 weights (ob_block_q6_k_t) */
+  OB_QUANT_IQ4_NL = 4, /* 18 B /  32 weights (ob_block_iq4_nl_t) */
+  OB_QUANT_IQ4_XS = 5  /* 136 B / 256 weights (ob_block_iq4_xs_t) */
+} ob_quant_type_t;
+
 /* =========================================================================
  * Opaque Handles & Public Structs
  * ========================================================================= */
@@ -90,7 +106,7 @@ typedef struct ob_graph   ob_graph_t;
 /* Opaque non-zero asynchronous execution handle (0 == invalid) */
 typedef uint64_t ob_exec_handle_t;
 
-/* ggml-compatible Q8_0 (34B: fp16 d + 32 int8) and Q4_0 (18B: fp16 d + 16 packed nibbles) blocks */
+/* ggml-compatible quantized weight block layouts */
 #if defined(__GNUC__) || defined(__clang__)
 typedef struct __attribute__((packed)) ob_block_q8_0 {
   uint16_t d;
@@ -100,6 +116,28 @@ typedef struct __attribute__((packed)) ob_block_q4_0 {
   uint16_t d;
   uint8_t  qs[OB_QK8_0 / 2];
 } ob_block_q4_0_t;
+typedef struct __attribute__((packed)) ob_block_q4_k {
+  uint16_t d;
+  uint16_t dmin;
+  uint8_t  scales[OB_K_SCALE_SIZE];
+  uint8_t  qs[OB_QK_K / 2];
+} ob_block_q4_k_t;
+typedef struct __attribute__((packed)) ob_block_q6_k {
+  uint8_t  ql[OB_QK_K / 2];
+  uint8_t  qh[OB_QK_K / 4];
+  int8_t   scales[OB_QK_K / 16];
+  uint16_t d;
+} ob_block_q6_k_t;
+typedef struct __attribute__((packed)) ob_block_iq4_nl {
+  uint16_t d;
+  uint8_t  qs[OB_QK4_NL / 2];
+} ob_block_iq4_nl_t;
+typedef struct __attribute__((packed)) ob_block_iq4_xs {
+  uint16_t d;
+  uint16_t scales_h;
+  uint8_t  scales_l[OB_QK_K / 64];
+  uint8_t  qs[OB_QK_K / 2];
+} ob_block_iq4_xs_t;
 #else
 #pragma pack(push, 1)
 typedef struct ob_block_q8_0 {
@@ -110,6 +148,28 @@ typedef struct ob_block_q4_0 {
   uint16_t d;
   uint8_t  qs[OB_QK8_0 / 2];
 } ob_block_q4_0_t;
+typedef struct ob_block_q4_k {
+  uint16_t d;
+  uint16_t dmin;
+  uint8_t  scales[OB_K_SCALE_SIZE];
+  uint8_t  qs[OB_QK_K / 2];
+} ob_block_q4_k_t;
+typedef struct ob_block_q6_k {
+  uint8_t  ql[OB_QK_K / 2];
+  uint8_t  qh[OB_QK_K / 4];
+  int8_t   scales[OB_QK_K / 16];
+  uint16_t d;
+} ob_block_q6_k_t;
+typedef struct ob_block_iq4_nl {
+  uint16_t d;
+  uint8_t  qs[OB_QK4_NL / 2];
+} ob_block_iq4_nl_t;
+typedef struct ob_block_iq4_xs {
+  uint16_t d;
+  uint16_t scales_h;
+  uint8_t  scales_l[OB_QK_K / 64];
+  uint8_t  qs[OB_QK_K / 2];
+} ob_block_iq4_xs_t;
 #pragma pack(pop)
 #endif
 
@@ -473,21 +533,41 @@ ob_status_t ob_gemm_matmul_f32_q8_0(ob_context_t*      ctx,
                                     ob_invoke_stats_t* out_stats);
 
 /*
- * Batched multi-projection FP32 x {Q8_0, Q4_0} matmul sharing one input A[m_dim, k_dim]:
- *   - `is_q4_0=1`: hashes raw ggml block_q4_0 bytes in O(1) and unpacks nibbles ONCE
- *     on weight-cache miss directly into cached ext[2] DMA-BUF (zero per-token CPU unpack).
+ * Batched multi-projection FP32 x {Q8_0, Q4_0, Q4_K, Q6_K, IQ4_NL, IQ4_XS} matmul sharing one input A[m_dim, k_dim]:
+ *   - `is_q4_0`: encodes `ob_quant_type_t` (0=Q8_0, 1=Q4_0, 2=Q4_K, 3=Q6_K, 4=IQ4_NL, 5=IQ4_XS),
+ *     preserving 100% binary & source ABI compatibility with existing Q8_0/Q4_0 callers.
+ *   - Hashes raw ggml block bytes in O(1) and unpacks ONCE on weight-cache miss directly
+ *     into cached ext[2] DMA-BUF (zero per-token CPU unpack).
  *   - `num_jobs > 1`: quantizes & outlier-peels shared A ONCE and pipelines all sibling
- *     projections (e.g. Q/K/V or gate/up) concurrently into the 16-credit async VII ring.
- *   - `activation`: OB_ACT_NONE, OB_ACT_SILU, or OB_ACT_GELU applied to each job's output.
+ *     projections (e.g. Q/K/V or gate/up, including mixed Q4_K + Q6_K) concurrently into
+ *     the 16-credit async VII ring.
+ *   - `activation`: OB_ACT_NONE, OB_ACT_RELU, OB_ACT_RELU6, OB_ACT_SILU, or OB_ACT_GELU.
  */
 typedef struct ob_gemm_f32_quant_job {
-  const void* b_nk;       /* ob_block_q8_0_t (34B/32) or ob_block_q4_0_t (18B/32) [n_dim, k_dim] */
+  const void* b_nk;       /* Contiguous quantized weight blocks [n_dim, k_dim / qk] */
   float*      c_mn;       /* output [m_dim, n_dim] row-major float32 */
   uint32_t    n_dim;
-  uint32_t    activation; /* enum ob_activation: OB_ACT_NONE / OB_ACT_SILU / OB_ACT_GELU */
-  uint8_t     is_q4_0;    /* 0 = ob_block_q8_0_t, 1 = ob_block_q4_0_t */
+  uint32_t    activation; /* enum ob_activation: OB_ACT_NONE / OB_ACT_RELU / OB_ACT_RELU6 / OB_ACT_SILU / OB_ACT_GELU */
+  uint8_t     is_q4_0;    /* ob_quant_type_t: 0=Q8_0, 1=Q4_0, 2=Q4_K, 3=Q6_K, 4=IQ4_NL, 5=IQ4_XS */
   uint8_t     reserved[3];
 } ob_gemm_f32_quant_job_t;
+
+#if defined(__GNUC__) || defined(__clang__)
+#define OB_STATIC_INLINE static inline __attribute__((unused))
+#else
+#define OB_STATIC_INLINE static inline
+#endif
+
+OB_STATIC_INLINE void ob_gemm_f32_quant_job_set_type(ob_gemm_f32_quant_job_t* job,
+                                                     ob_quant_type_t          quant_type) {
+  if (job) {
+    job->is_q4_0 = (uint8_t)quant_type;
+  }
+}
+
+OB_STATIC_INLINE ob_quant_type_t ob_gemm_f32_quant_job_get_type(const ob_gemm_f32_quant_job_t* job) {
+  return job ? (ob_quant_type_t)job->is_q4_0 : OB_QUANT_Q8_0;
+}
 
 ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t*                  ctx,
                                            const float*                   a_mk,
@@ -530,18 +610,38 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t*                  ctx,
  * retries) without host-side gate/up projection recomputation.
  */
 typedef struct ob_gemm_swiglu_quant_desc {
-  const void* w_gate_hk;    /* [h_dim, k_dim] contiguous ob_block_q8_0_t or ob_block_q4_0_t */
-  const void* w_up_hk;      /* [h_dim, k_dim] contiguous ob_block_q8_0_t or ob_block_q4_0_t */
-  const void* w_down_nh;    /* [n_dim, h_dim] contiguous ob_block_q8_0_t or ob_block_q4_0_t */
+  const void* w_gate_hk;    /* [h_dim, k_dim] contiguous quantized weight blocks */
+  const void* w_up_hk;      /* [h_dim, k_dim] contiguous quantized weight blocks */
+  const void* w_down_nh;    /* [n_dim, h_dim] contiguous quantized weight blocks */
   uint32_t    m_dim;        /* arbitrary M (handles M=1, M=64, M=128, M=512, etc.) */
-  uint32_t    k_dim;        /* k_dim % 32 == 0 */
-  uint32_t    h_dim;        /* h_dim % 32 == 0 */
+  uint32_t    k_dim;        /* multiple of gate/up block size (32 or 256) */
+  uint32_t    h_dim;        /* multiple of down block size (32 or 256) */
   uint32_t    n_dim;
-  uint8_t     gate_is_q4_0; /* 0 = Q8_0, 1 = Q4_0 */
-  uint8_t     up_is_q4_0;   /* 0 = Q8_0, 1 = Q4_0 */
-  uint8_t     down_is_q4_0; /* 0 = Q8_0, 1 = Q4_0 */
+  uint8_t     gate_is_q4_0; /* ob_quant_type_t: 0=Q8_0, 1=Q4_0, 2=Q4_K, 3=Q6_K, 4=IQ4_NL, 5=IQ4_XS */
+  uint8_t     up_is_q4_0;   /* ob_quant_type_t */
+  uint8_t     down_is_q4_0; /* ob_quant_type_t */
   uint8_t     reserved;
 } ob_gemm_swiglu_quant_desc_t;
+
+OB_STATIC_INLINE void ob_gemm_swiglu_quant_desc_set_types(ob_gemm_swiglu_quant_desc_t* desc,
+                                                          ob_quant_type_t              gate_type,
+                                                          ob_quant_type_t              up_type,
+                                                          ob_quant_type_t              down_type) {
+  if (desc) {
+    desc->gate_is_q4_0 = (uint8_t)gate_type;
+    desc->up_is_q4_0   = (uint8_t)up_type;
+    desc->down_is_q4_0 = (uint8_t)down_type;
+  }
+}
+
+/* Quantized weight format metadata & reference FP32 row dequantizer */
+uint32_t    ob_quant_block_elements(ob_quant_type_t type);
+size_t      ob_quant_block_bytes(ob_quant_type_t type);
+const char* ob_quant_type_name(ob_quant_type_t type);
+ob_status_t ob_quant_dequantize_row_f32(ob_quant_type_t type,
+                                        const void*     src_blocks,
+                                        uint32_t        k_dim,
+                                        float*          dst_f32);
 
 ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t*                      ctx,
                                      const float*                       a_mk,

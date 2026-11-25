@@ -537,6 +537,62 @@ int main() {
         CHECK_TRUE(threw_mosaic_act, "emit_mosaic_kernel rejects fused SiLU epilogue");
     }
 
+    // 17. Whole-K candidate included for lane-aligned non-power-of-two K (e.g. K=384, 1536)
+    //     under tight VMEM budgets where split-K double-buffering + scratch exceeds the cap.
+    {
+        auto bm512_only_hook = [](freetile::ChipTarget, int64_t, int64_t, int64_t, freetile::QuantFormat,
+                                  freetile::DType, freetile::DType, bool, void*) -> freetile::TileShapeOverride {
+            return {true, 512, 0, 0};
+        };
+        auto bm512_bk384_hook = [](freetile::ChipTarget, int64_t, int64_t, int64_t, freetile::QuantFormat,
+                                   freetile::DType, freetile::DType, bool, void*) -> freetile::TileShapeOverride {
+            return {true, 512, 0, 384};
+        };
+
+        const size_t cap_5pct = (freetile::target_profile(freetile::ChipTarget::V5E).vmem_bytes * 5ULL) / 100ULL;
+
+        freetile::TilePlannerConfig cfg_no_bk_hint;
+        cfg_no_bk_hint.max_vmem_pct = 5;
+        cfg_no_bk_hint.schedule_hook = bm512_only_hook;
+
+        freetile::TilePlannerConfig cfg_with_bk_hint;
+        cfg_with_bk_hint.max_vmem_pct = 5;
+        cfg_with_bk_hint.schedule_hook = bm512_bk384_hook;
+
+        freetile::TileKernel k_auto, k_hinted;
+        std::string reason;
+        CHECK_TRUE(freetile::plan_quant_matmul_kernel(
+                       freetile::ChipTarget::V5E, 64, 384, 128, freetile::QuantFormat::NONE,
+                       freetile::DType::BF16, freetile::DType::F32, false, &k_auto, &reason, &cfg_no_bk_hint),
+                   ("Dense V5E K=384 5%-VMEM plan without bk hint failed: " + reason).c_str());
+        CHECK_TRUE(freetile::plan_quant_matmul_kernel(
+                       freetile::ChipTarget::V5E, 64, 384, 128, freetile::QuantFormat::NONE,
+                       freetile::DType::BF16, freetile::DType::F32, false, &k_hinted, &reason, &cfg_with_bk_hint),
+                   ("Dense V5E K=384 5%-VMEM plan with bk=384 hint failed: " + reason).c_str());
+
+        CHECK_TRUE(k_auto.grid.bm == 512 && k_auto.grid.bn == 128 && k_auto.grid.bk == 384,
+                   "K=384 tight-VMEM selects whole-K bk=384 without needing bk hint");
+        CHECK_TRUE(k_auto.grid.dims.size() == 1 && k_auto.grid.dims[0] == 1 && k_auto.scratch.empty(),
+                   "Whole-K bk=384 uses 1D grid with zero scratch");
+        CHECK_TRUE(k_auto.vmem_footprint_bytes() == 753664ULL && k_auto.vmem_footprint_bytes() <= cap_5pct,
+                   "Whole-K bk=384 footprint 753664 B fits within 5% V5E VMEM cap (838860 B)");
+        CHECK_TRUE(k_auto.vmem_footprint_bytes() == k_hinted.vmem_footprint_bytes() &&
+                       k_auto.grid.bk == k_hinted.grid.bk,
+                   "Un-hinted plan matches bk=384 hinted plan");
+        CHECK_TRUE(k_auto.validate(&reason), ("Whole-K K=384 validate failed: " + reason).c_str());
+        const auto em_384 = freetile::emit_mosaic_kernel(k_auto);
+        CHECK_TRUE(em_384.mosaic_mlir.find("vector<512x384xbf16>") != std::string::npos,
+                   "Whole-K K=384 emits clean Mosaic MLIR");
+
+        // Also verify K=1536 lane-aligned dense planning validates cleanly on V5E without regressions.
+        freetile::TileKernel k_1536;
+        CHECK_TRUE(freetile::plan_quant_matmul_kernel(
+                       freetile::ChipTarget::V5E, 64, 1536, 128, freetile::QuantFormat::NONE,
+                       freetile::DType::BF16, freetile::DType::F32, false, &k_1536, &reason),
+                   ("Dense V5E K=1536 plan failed: " + reason).c_str());
+        CHECK_TRUE(k_1536.validate(&reason), ("Dense V5E K=1536 validate failed: " + reason).c_str());
+    }
+
     std::printf("PASS: all freetile unit tests succeeded!\n");
     return 0;
 }

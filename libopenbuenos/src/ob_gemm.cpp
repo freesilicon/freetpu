@@ -1,4 +1,5 @@
 #include "ob_internal.h"
+#include "ob_quant_unpack.hpp"
 
 #include <algorithm>
 #include <array>
@@ -622,48 +623,10 @@ uint32_t quant_scale_D_grid_impl(double raw_d) {
   return static_cast<uint32_t>(d);
 }
 
-struct RowNormStats {
-  double l2 = 0.0;
-  uint64_t l1 = 0ULL;
-  uint64_t asum = 0ULL;
-};
+using RowNormStats = quant::RowNormStats;
 
 inline RowNormStats compute_row_norm_stats(const int8_t* row, uint32_t tk) {
-  uint64_t sq = 0ULL;
-  uint64_t l1 = 0ULL;
-  int64_t ssum = 0LL;
-  uint32_t ki = 0u;
-#if defined(__ARM_NEON) && defined(__aarch64__)
-  uint32x4_t v_sq = vdupq_n_u32(0u);
-  uint32x4_t v_l1 = vdupq_n_u32(0u);
-  int32x4_t v_ss = vdupq_n_s32(0);
-  for (; ki + 16u <= tk; ki += 16u) {
-    int8x16_t v = vld1q_s8(row + ki);
-    int16x8_t lo = vmull_s8(vget_low_s8(v), vget_low_s8(v));
-    int16x8_t hi = vmull_high_s8(v, v);
-    v_sq = vpadalq_u16(v_sq, vreinterpretq_u16_s16(lo));
-    v_sq = vpadalq_u16(v_sq, vreinterpretq_u16_s16(hi));
-
-    // ABS(-128) = 0x80 == 128u when reinterpreted as uint8: exact |v| for all int8!
-    uint8x16_t av = vreinterpretq_u8_s8(vabsq_s8(v));
-    v_l1 = vpadalq_u16(v_l1, vpaddlq_u8(av));
-    v_ss = vpadalq_s16(v_ss, vpaddlq_s8(v));
-  }
-  sq = static_cast<uint64_t>(vaddvq_u32(v_sq));
-  l1 = static_cast<uint64_t>(vaddvq_u32(v_l1));
-  ssum = static_cast<int64_t>(vaddvq_s32(v_ss));
-#endif
-  for (; ki < tk; ++ki) {
-    int32_t v = static_cast<int32_t>(row[ki]);
-    sq += static_cast<uint64_t>(v * v);
-    l1 += static_cast<uint64_t>(v < 0 ? -v : v);
-    ssum += static_cast<int64_t>(v);
-  }
-  RowNormStats st{};
-  st.l2 = std::sqrt(static_cast<double>(sq));
-  st.l1 = l1;
-  st.asum = static_cast<uint64_t>(ssum < 0 ? -ssum : ssum);
-  return st;
+  return quant::compute_row_norm_stats(row, tk);
 }
 
 inline uint32_t compute_scale_D_from_maxima(double max_l2, uint64_t max_l1,
@@ -927,10 +890,10 @@ void compute_swiglu_stage_dividers_impl(uint32_t m_dim,
 
 uint64_t hash_swiglu_graph_key(uint32_t hw_m, uint32_t hw_k, uint32_t hw_h, uint32_t hw_n,
                                uint32_t d_gate, uint32_t d_up, uint32_t d_mul, uint32_t d_down,
-                               float s_gate, uint32_t slot_bucket) {
+                               float s_gate, uint32_t slot_bucket, bool freetile = false) {
   uint32_t sg_bits = 0u;
   std::memcpy(&sg_bits, &s_gate, sizeof(sg_bits));
-  uint64_t h = 0x535749474C555F31ULL; // "SWIGLU_1"
+  uint64_t h = freetile ? 0x46545F5357494731ULL : 0x535749474C555F31ULL; // "FT_SWIG1" / "SWIGLU_1"
   uint32_t hdr[10] = {
       hw_m, hw_k, hw_h, hw_n, d_gate, d_up, d_mul, d_down, sg_bits, slot_bucket
   };
@@ -955,20 +918,36 @@ ob_status_t acquire_swiglu_entry(ob_context* ctx,
   }
   std::vector<uint8_t> dgc0;
   std::string err;
+  bool emitted_by_freetile = false;
+  ob_status_t st = OB_ERR_UNSUPPORTED;
   if (ctx->freetile_enabled) {
-    // 11-chunk chained SwiGLU is not yet lowered by freetile::buenos_emitter;
-    // automatically fall back to legacy ob_gemm_emitter.
-    ctx->freetile_fallbacks.fetch_add(1u, std::memory_order_relaxed);
+    std::string ft_err;
+    st = freetile_try_emit_swiglu_dgc0(
+        desc, ctx->builtin_dive_interp.data(), ctx->builtin_dive_interp.size(),
+        &dgc0, &ft_err);
+    if (st == OB_OK && !dgc0.empty()) {
+      ctx->freetile_emits.fetch_add(1u, std::memory_order_relaxed);
+      emitted_by_freetile = true;
+    } else {
+      ctx->freetile_fallbacks.fetch_add(1u, std::memory_order_relaxed);
+      dgc0.clear();
+    }
   }
-  ob_status_t st = build_swiglu_dgc0(
-      desc, ctx->builtin_dive_interp.data(), ctx->builtin_dive_interp.size(),
-      &dgc0, nullptr, &err);
+  if (!emitted_by_freetile) {
+    st = build_swiglu_dgc0(
+        desc, ctx->builtin_dive_interp.data(), ctx->builtin_dive_interp.size(),
+        &dgc0, nullptr, &err);
+  }
   if (st != OB_OK) {
     if (!err.empty()) set_last_error(ctx, err);
     return st;
   }
-  return graph_register_dgc0_internal(
+  st = graph_register_dgc0_internal(
       ctx, dgc0.data(), dgc0.size(), cache_key, true, out_entry, out_cache_hit);
+  if (st == OB_OK && *out_entry && !(*out_cache_hit) && emitted_by_freetile) {
+    (*out_entry)->emitted_by_freetile = true;
+  }
+  return st;
 }
 
 uint64_t hash_w8a16_shape_key(uint32_t hw_k, uint32_t hw_n, float pt_scale,
@@ -1633,324 +1612,38 @@ void cpu_matmul_int8_tile(const int8_t* a_mk,
   }
 }
 
-void cpu_matmul_f32_q8_0_tile(const float* a_mk,
-                              const ob_block_q8_0_t* b_blocks,
-                              float* c_mn,
-                              uint32_t k_dim,
-                              uint32_t n_dim,
-                              uint32_t m0, uint32_t tm,
-                              uint32_t k0, uint32_t tk,
-                              uint32_t n0, uint32_t tn) {
-  const uint32_t nb_k = k_dim / OB_QK8_0;
-  const uint32_t blk0 = k0 / OB_QK8_0;
-  const uint32_t blk_cnt = tk / OB_QK8_0;
-
-  for (uint32_t mi = 0; mi < tm; ++mi) {
-    const float* a_row = a_mk + static_cast<size_t>(m0 + mi) * k_dim;
-    float* c_row = c_mn + static_cast<size_t>(m0 + mi) * n_dim + n0;
-    for (uint32_t ni = 0; ni < tn; ++ni) {
-      const ob_block_q8_0_t* b_row =
-          b_blocks + static_cast<size_t>(n0 + ni) * nb_k + blk0;
-      float acc = 0.0f;
-      for (uint32_t bi = 0; bi < blk_cnt; ++bi) {
-        const float d = fp16_to_fp32(b_row[bi].d);
-        const int8_t* qs = b_row[bi].qs;
-        const float* a_blk = a_row + static_cast<size_t>(blk0 + bi) * OB_QK8_0;
-        float bsum = 0.0f;
-        for (uint32_t j = 0; j < OB_QK8_0; ++j) {
-          bsum += a_blk[j] * static_cast<float>(qs[j]);
-        }
-        acc += d * bsum;
-      }
-      c_row[ni] += acc;
-    }
+inline uint64_t quant_tile_hash_tag(ob_quant_type_t qtype) {
+  switch (qtype) {
+    case OB_QUANT_Q8_0:   return 0x51385F5754494C45ULL; // "Q8_WTILE"
+    case OB_QUANT_Q4_0:   return 0x51345F5754494C45ULL; // "Q4_WTILE"
+    case OB_QUANT_Q4_K:   return 0x51344B5F5754494CULL; // "Q4K_WTIL"
+    case OB_QUANT_Q6_K:   return 0x51364B5F5754494CULL; // "Q6K_WTIL"
+    case OB_QUANT_IQ4_NL: return 0x4951344E5F57544CULL; // "IQ4N_WTL"
+    case OB_QUANT_IQ4_XS: return 0x495134585F57544CULL; // "IQ4X_WTL"
+    default:              return 0x51554E4B5F57544CULL;
   }
 }
 
-void requant_q8_0_rows_range(const ob_block_q8_0_t* b_blocks,
-                             uint32_t nb_k,
-                             uint32_t n0,
-                             uint32_t ni_start, uint32_t ni_end,
-                             uint32_t blk0, uint32_t blk_cnt,
-                             uint32_t tk, uint32_t hw_k,
-                             int8_t* out_bq_base,
-                             float* out_sb_base,
-                             RowNormStats* out_stats) {
-  if (blk_cnt == 1u) {
-    for (uint32_t ni = ni_start; ni < ni_end; ++ni) {
-      const ob_block_q8_0_t* b_row = b_blocks + static_cast<size_t>(n0 + ni) * nb_k + blk0;
-      out_sb_base[ni] = fp16_to_fp32(b_row[0].d);
-      int8_t* bq_row = out_bq_base + static_cast<size_t>(ni) * hw_k;
-      std::memcpy(bq_row, b_row[0].qs, OB_QK8_0);
-      if (tk < hw_k) std::memset(bq_row + tk, 0, hw_k - tk);
-      if (out_stats) out_stats[ni] = compute_row_norm_stats(bq_row, tk);
-    }
-    return;
-  }
-
-  float stack_wrow[2048];
-  std::vector<float> heap_wrow;
-  float* wrow = stack_wrow;
-  if (tk > 2048u) {
-    heap_wrow.resize(tk);
-    wrow = heap_wrow.data();
-  }
-  for (uint32_t ni = ni_start; ni < ni_end; ++ni) {
-    const ob_block_q8_0_t* b_row = b_blocks + static_cast<size_t>(n0 + ni) * nb_k + blk0;
-    float amax = 0.0f;
+inline void add_scaled_offset_row_f32(float* c_row,
+                                      const float* mu_ptr,
+                                      uint32_t tn,
+                                      float a_sum) {
+  if (a_sum == 0.0f) return;
+  uint32_t ni = 0u;
 #if defined(__ARM_NEON) && defined(__aarch64__)
-    float32x4_t v_amax = vdupq_n_f32(0.0f);
-    for (uint32_t bi = 0; bi < blk_cnt; ++bi) {
-      const float32x4_t vd = vdupq_n_f32(fp16_to_fp32(b_row[bi].d));
-      const int8_t* qs = b_row[bi].qs;
-      float* dst = wrow + static_cast<size_t>(bi) * OB_QK8_0;
-      for (uint32_t half = 0u; half < 2u; ++half) {
-        int8x16_t q8 = vld1q_s8(qs + half * 16u);
-        int16x8_t q16_lo = vmovl_s8(vget_low_s8(q8));
-        int16x8_t q16_hi = vmovl_high_s8(q8);
-        float32x4_t f0 = vmulq_f32(vd, vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16_lo))));
-        float32x4_t f1 = vmulq_f32(vd, vcvtq_f32_s32(vmovl_high_s16(q16_lo)));
-        float32x4_t f2 = vmulq_f32(vd, vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16_hi))));
-        float32x4_t f3 = vmulq_f32(vd, vcvtq_f32_s32(vmovl_high_s16(q16_hi)));
-        vst1q_f32(dst + half * 16u,       f0);
-        vst1q_f32(dst + half * 16u + 4u,  f1);
-        vst1q_f32(dst + half * 16u + 8u,  f2);
-        vst1q_f32(dst + half * 16u + 12u, f3);
-        v_amax = vmaxq_f32(v_amax, vmaxq_f32(vmaxq_f32(vabsq_f32(f0), vabsq_f32(f1)),
-                                             vmaxq_f32(vabsq_f32(f2), vabsq_f32(f3))));
-      }
-    }
-    amax = vmaxvq_f32(v_amax);
-#else
-    for (uint32_t bi = 0; bi < blk_cnt; ++bi) {
-      const float d = fp16_to_fp32(b_row[bi].d);
-      const int8_t* qs = b_row[bi].qs;
-      float* dst = wrow + static_cast<size_t>(bi) * OB_QK8_0;
-      for (uint32_t j = 0; j < OB_QK8_0; ++j) {
-        float v = d * static_cast<float>(qs[j]);
-        dst[j] = v;
-        float av = std::fabs(v);
-        if (av > amax) amax = av;
-      }
-    }
+  const float32x4_t vas = vdupq_n_f32(a_sum);
+  for (; ni + 16u <= tn; ni += 16u) {
+    vst1q_f32(c_row + ni,       vfmaq_f32(vld1q_f32(c_row + ni),       vld1q_f32(mu_ptr + ni),       vas));
+    vst1q_f32(c_row + ni + 4u,  vfmaq_f32(vld1q_f32(c_row + ni + 4u),  vld1q_f32(mu_ptr + ni + 4u),  vas));
+    vst1q_f32(c_row + ni + 8u,  vfmaq_f32(vld1q_f32(c_row + ni + 8u),  vld1q_f32(mu_ptr + ni + 8u),  vas));
+    vst1q_f32(c_row + ni + 12u, vfmaq_f32(vld1q_f32(c_row + ni + 12u), vld1q_f32(mu_ptr + ni + 12u), vas));
+  }
+  for (; ni + 4u <= tn; ni += 4u) {
+    vst1q_f32(c_row + ni, vfmaq_f32(vld1q_f32(c_row + ni), vld1q_f32(mu_ptr + ni), vas));
+  }
 #endif
-    int8_t* bq_row = out_bq_base + static_cast<size_t>(ni) * hw_k;
-    if (amax == 0.0f) {
-      out_sb_base[ni] = 0.0f;
-      std::memset(bq_row, 0, hw_k);
-      if (out_stats) out_stats[ni] = RowNormStats{};
-      continue;
-    }
-    const float sb = amax / 127.0f;
-    out_sb_base[ni] = sb;
-    const float inv_sb = 127.0f / amax;
-    quant_sym_i8_row(wrow, bq_row, tk, inv_sb);
-    if (tk < hw_k) std::memset(bq_row + tk, 0, hw_k - tk);
-    if (out_stats) out_stats[ni] = compute_row_norm_stats(bq_row, tk);
-  }
-}
-
-void requant_q8_0_rows(const ob_block_q8_0_t* b_blocks,
-                       uint32_t nb_k,
-                       uint32_t n0, uint32_t tn,
-                       uint32_t blk0, uint32_t blk_cnt,
-                       uint32_t tk, uint32_t hw_k,
-                       int8_t* out_bq_base,
-                       float* out_sb_base,
-                       WorkerPool* pool,
-                       RowNormStats* out_stats = nullptr) {
-  if (pool && tn >= 64u && static_cast<size_t>(tn) * tk >= 32768u) {
-    pool->parallel_for_fn(tn, 16u, [&](uint32_t s, uint32_t e, uint32_t) {
-      requant_q8_0_rows_range(b_blocks, nb_k, n0, s, e, blk0, blk_cnt, tk, hw_k,
-                              out_bq_base, out_sb_base, out_stats);
-    });
-  } else {
-    requant_q8_0_rows_range(b_blocks, nb_k, n0, 0u, tn, blk0, blk_cnt, tk, hw_k,
-                            out_bq_base, out_sb_base, out_stats);
-  }
-}
-
-void requant_q4_0_rows_range(const ob_block_q4_0_t* b_blocks,
-                             uint32_t nb_k,
-                             uint32_t n0,
-                             uint32_t ni_start, uint32_t ni_end,
-                             uint32_t blk0, uint32_t blk_cnt,
-                             uint32_t tk, uint32_t hw_k,
-                             int8_t* out_bq_base,
-                             float* out_sb_base,
-                             RowNormStats* out_stats) {
-  if (blk_cnt == 1u) {
-#if defined(__ARM_NEON) && defined(__aarch64__)
-    const uint8x16_t v_mask = vdupq_n_u8(0x0Fu);
-    const int8x16_t v_eight = vdupq_n_s8(8);
-#endif
-    for (uint32_t ni = ni_start; ni < ni_end; ++ni) {
-      const ob_block_q4_0_t* b_row = b_blocks + static_cast<size_t>(n0 + ni) * nb_k + blk0;
-      out_sb_base[ni] = fp16_to_fp32(b_row[0].d);
-      int8_t* bq_row = out_bq_base + static_cast<size_t>(ni) * hw_k;
-      const uint8_t* qs = b_row[0].qs;
-#if defined(__ARM_NEON) && defined(__aarch64__)
-      uint8x16_t raw = vld1q_u8(qs);
-      int8x16_t q_lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(raw, v_mask)), v_eight);
-      int8x16_t q_hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(raw, 4)), v_eight);
-      vst1q_s8(bq_row, q_lo);
-      vst1q_s8(bq_row + 16u, q_hi);
-#else
-      for (uint32_t j = 0; j < OB_QK8_0 / 2u; ++j) {
-        const uint8_t byte = qs[j];
-        bq_row[j] = static_cast<int8_t>(static_cast<int32_t>(byte & 0x0Fu) - 8);
-        bq_row[j + OB_QK8_0 / 2u] = static_cast<int8_t>(static_cast<int32_t>(byte >> 4) - 8);
-      }
-#endif
-      if (tk < hw_k) std::memset(bq_row + tk, 0, hw_k - tk);
-      if (out_stats) out_stats[ni] = compute_row_norm_stats(bq_row, tk);
-    }
-    return;
-  }
-
-  float stack_wrow[2048];
-  std::vector<float> heap_wrow;
-  float* wrow = stack_wrow;
-  if (tk > 2048u) {
-    heap_wrow.resize(tk);
-    wrow = heap_wrow.data();
-  }
-#if defined(__ARM_NEON) && defined(__aarch64__)
-  const uint8x16_t v_mask = vdupq_n_u8(0x0Fu);
-  const int8x16_t v_eight = vdupq_n_s8(8);
-#endif
-  for (uint32_t ni = ni_start; ni < ni_end; ++ni) {
-    const ob_block_q4_0_t* b_row = b_blocks + static_cast<size_t>(n0 + ni) * nb_k + blk0;
-    float amax = 0.0f;
-#if defined(__ARM_NEON) && defined(__aarch64__)
-    float32x4_t v_amax = vdupq_n_f32(0.0f);
-    for (uint32_t bi = 0; bi < blk_cnt; ++bi) {
-      const float32x4_t vd = vdupq_n_f32(fp16_to_fp32(b_row[bi].d));
-      uint8x16_t raw = vld1q_u8(b_row[bi].qs);
-      int8x16_t q_lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(raw, v_mask)), v_eight);
-      int8x16_t q_hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(raw, 4)), v_eight);
-      float* dst = wrow + static_cast<size_t>(bi) * OB_QK8_0;
-
-      // Low 16 nibbles -> dst[0..15]
-      {
-        int16x8_t s0 = vmovl_s8(vget_low_s8(q_lo));
-        int16x8_t s1 = vmovl_high_s8(q_lo);
-        float32x4_t f0 = vmulq_f32(vd, vcvtq_f32_s32(vmovl_s16(vget_low_s16(s0))));
-        float32x4_t f1 = vmulq_f32(vd, vcvtq_f32_s32(vmovl_high_s16(s0)));
-        float32x4_t f2 = vmulq_f32(vd, vcvtq_f32_s32(vmovl_s16(vget_low_s16(s1))));
-        float32x4_t f3 = vmulq_f32(vd, vcvtq_f32_s32(vmovl_high_s16(s1)));
-        vst1q_f32(dst,       f0);
-        vst1q_f32(dst + 4u,  f1);
-        vst1q_f32(dst + 8u,  f2);
-        vst1q_f32(dst + 12u, f3);
-        v_amax = vmaxq_f32(v_amax, vmaxq_f32(vmaxq_f32(vabsq_f32(f0), vabsq_f32(f1)),
-                                             vmaxq_f32(vabsq_f32(f2), vabsq_f32(f3))));
-      }
-      // High 16 nibbles -> dst[16..31]
-      {
-        int16x8_t s0 = vmovl_s8(vget_low_s8(q_hi));
-        int16x8_t s1 = vmovl_high_s8(q_hi);
-        float32x4_t f0 = vmulq_f32(vd, vcvtq_f32_s32(vmovl_s16(vget_low_s16(s0))));
-        float32x4_t f1 = vmulq_f32(vd, vcvtq_f32_s32(vmovl_high_s16(s0)));
-        float32x4_t f2 = vmulq_f32(vd, vcvtq_f32_s32(vmovl_s16(vget_low_s16(s1))));
-        float32x4_t f3 = vmulq_f32(vd, vcvtq_f32_s32(vmovl_high_s16(s1)));
-        vst1q_f32(dst + 16u, f0);
-        vst1q_f32(dst + 20u, f1);
-        vst1q_f32(dst + 24u, f2);
-        vst1q_f32(dst + 28u, f3);
-        v_amax = vmaxq_f32(v_amax, vmaxq_f32(vmaxq_f32(vabsq_f32(f0), vabsq_f32(f1)),
-                                             vmaxq_f32(vabsq_f32(f2), vabsq_f32(f3))));
-      }
-    }
-    amax = vmaxvq_f32(v_amax);
-#else
-    for (uint32_t bi = 0; bi < blk_cnt; ++bi) {
-      const float d = fp16_to_fp32(b_row[bi].d);
-      const uint8_t* qs = b_row[bi].qs;
-      float* dst = wrow + static_cast<size_t>(bi) * OB_QK8_0;
-      for (uint32_t j = 0; j < OB_QK8_0 / 2u; ++j) {
-        const uint8_t byte = qs[j];
-        float v0 = d * static_cast<float>(static_cast<int32_t>(byte & 0x0Fu) - 8);
-        float v1 = d * static_cast<float>(static_cast<int32_t>(byte >> 4) - 8);
-        dst[j] = v0;
-        dst[j + OB_QK8_0 / 2u] = v1;
-        float av0 = std::fabs(v0);
-        float av1 = std::fabs(v1);
-        if (av0 > amax) amax = av0;
-        if (av1 > amax) amax = av1;
-      }
-    }
-#endif
-    int8_t* bq_row = out_bq_base + static_cast<size_t>(ni) * hw_k;
-    if (amax == 0.0f) {
-      out_sb_base[ni] = 0.0f;
-      std::memset(bq_row, 0, hw_k);
-      if (out_stats) out_stats[ni] = RowNormStats{};
-      continue;
-    }
-    const float sb = amax / 127.0f;
-    out_sb_base[ni] = sb;
-    const float inv_sb = 127.0f / amax;
-    quant_sym_i8_row(wrow, bq_row, tk, inv_sb);
-    if (tk < hw_k) std::memset(bq_row + tk, 0, hw_k - tk);
-    if (out_stats) out_stats[ni] = compute_row_norm_stats(bq_row, tk);
-  }
-}
-
-void requant_q4_0_rows(const ob_block_q4_0_t* b_blocks,
-                       uint32_t nb_k,
-                       uint32_t n0, uint32_t tn,
-                       uint32_t blk0, uint32_t blk_cnt,
-                       uint32_t tk, uint32_t hw_k,
-                       int8_t* out_bq_base,
-                       float* out_sb_base,
-                       WorkerPool* pool,
-                       RowNormStats* out_stats = nullptr) {
-  if (pool && tn >= 64u && static_cast<size_t>(tn) * tk >= 32768u) {
-    pool->parallel_for_fn(tn, 16u, [&](uint32_t s, uint32_t e, uint32_t) {
-      requant_q4_0_rows_range(b_blocks, nb_k, n0, s, e, blk0, blk_cnt, tk, hw_k,
-                              out_bq_base, out_sb_base, out_stats);
-    });
-  } else {
-    requant_q4_0_rows_range(b_blocks, nb_k, n0, 0u, tn, blk0, blk_cnt, tk, hw_k,
-                            out_bq_base, out_sb_base, out_stats);
-  }
-}
-
-void cpu_matmul_f32_q4_0_tile(const float* a_mk,
-                              const ob_block_q4_0_t* b_blocks,
-                              float* c_mn,
-                              uint32_t k_dim,
-                              uint32_t n_dim,
-                              uint32_t m0, uint32_t tm,
-                              uint32_t k0, uint32_t tk,
-                              uint32_t n0, uint32_t tn) {
-  const uint32_t nb_k = k_dim / OB_QK8_0;
-  const uint32_t blk0 = k0 / OB_QK8_0;
-  const uint32_t blk_cnt = tk / OB_QK8_0;
-  constexpr uint32_t kHalf = OB_QK8_0 / 2u;
-
-  for (uint32_t mi = 0; mi < tm; ++mi) {
-    const float* a_row = a_mk + static_cast<size_t>(m0 + mi) * k_dim;
-    float* c_row = c_mn + static_cast<size_t>(m0 + mi) * n_dim + n0;
-    for (uint32_t ni = 0; ni < tn; ++ni) {
-      const ob_block_q4_0_t* b_row =
-          b_blocks + static_cast<size_t>(n0 + ni) * nb_k + blk0;
-      float acc = 0.0f;
-      for (uint32_t bi = 0; bi < blk_cnt; ++bi) {
-        const float d = fp16_to_fp32(b_row[bi].d);
-        const uint8_t* qs = b_row[bi].qs;
-        const float* a_blk = a_row + static_cast<size_t>(blk0 + bi) * OB_QK8_0;
-        float bsum = 0.0f;
-        for (uint32_t j = 0; j < kHalf; ++j) {
-          const uint8_t byte = qs[j];
-          bsum += a_blk[j] * static_cast<float>(static_cast<int32_t>(byte & 0x0Fu) - 8);
-          bsum += a_blk[j + kHalf] * static_cast<float>(static_cast<int32_t>(byte >> 4) - 8);
-        }
-        acc += d * bsum;
-      }
-      c_row[ni] += acc;
-    }
+  for (; ni < tn; ++ni) {
+    c_row[ni] += mu_ptr[ni] * a_sum;
   }
 }
 
@@ -2495,84 +2188,45 @@ inline void dequant_outliers_row_f32_impl(float* c_row,
   }
 }
 
-// Vectorized 4-row-at-a-time FP16->FP32 outlier column extraction from Q8_0 / Q4_0 blocks.
+// Compute exact sum of non-outlier activations in FP64 (for Q4_K algebraic dmin offset correction).
+inline float compute_row_sum_excluding_outliers(const float* a_row,
+                                                uint32_t tk,
+                                                const RowOutliers* ro) {
+  double s = 0.0;
+  if (!ro || ro->count == 0u) {
+    for (uint32_t ki = 0u; ki < tk; ++ki) {
+      s += static_cast<double>(a_row[ki]);
+    }
+  } else {
+    for (uint32_t ki = 0u; ki < tk; ++ki) {
+      bool peeled = false;
+      for (uint32_t oi = 0u; oi < ro->count; ++oi) {
+        if (ro->k_off[oi] == ki) {
+          peeled = true;
+          break;
+        }
+      }
+      if (!peeled) s += static_cast<double>(a_row[ki]);
+    }
+  }
+  return static_cast<float>(s);
+}
+
+// Extract exact FP32 outlier column across any mix of supported GGUF quant formats.
 void extract_outlier_col_impl(const ob_gemm_f32_quant_job_t* jobs,
                               const FusedSubSlice* subs,
                               uint32_t num_subs,
-                              uint32_t nb_k,
+                              uint32_t k_dim,
                               uint32_t k0,
                               uint32_t k_off,
                               float* dst_col) {
   const uint32_t abs_k = k0 + k_off;
-  const uint32_t b_idx = abs_k / OB_QK8_0;
-  const uint32_t j_idx = abs_k % OB_QK8_0;
   for (uint32_t si = 0u; si < num_subs; ++si) {
     const FusedSubSlice& sub = subs[si];
     const ob_gemm_f32_quant_job_t& job = jobs[sub.job_idx];
-    float* out_p = dst_col + sub.out_off;
-    if (job.is_q4_0 != 0u) {
-      const ob_block_q4_0_t* b_q4 = static_cast<const ob_block_q4_0_t*>(job.b_nk);
-      constexpr uint32_t kHalf = OB_QK8_0 / 2u;
-      const bool hi_nib = (j_idx >= kHalf);
-      const uint32_t byte_idx = hi_nib ? (j_idx - kHalf) : j_idx;
-      uint32_t ni = 0u;
-#if defined(__ARM_NEON) && defined(__aarch64__)
-      for (; ni + 4u <= sub.tn; ni += 4u) {
-        if (ni + 12u < sub.tn) {
-          __builtin_prefetch(&b_q4[static_cast<size_t>(sub.n0 + ni + 8u) * nb_k + b_idx], 0, 1);
-          __builtin_prefetch(&b_q4[static_cast<size_t>(sub.n0 + ni + 9u) * nb_k + b_idx], 0, 1);
-          __builtin_prefetch(&b_q4[static_cast<size_t>(sub.n0 + ni + 10u) * nb_k + b_idx], 0, 1);
-          __builtin_prefetch(&b_q4[static_cast<size_t>(sub.n0 + ni + 11u) * nb_k + b_idx], 0, 1);
-        }
-        const ob_block_q4_0_t& b0 = b_q4[static_cast<size_t>(sub.n0 + ni + 0u) * nb_k + b_idx];
-        const ob_block_q4_0_t& b1 = b_q4[static_cast<size_t>(sub.n0 + ni + 1u) * nb_k + b_idx];
-        const ob_block_q4_0_t& b2 = b_q4[static_cast<size_t>(sub.n0 + ni + 2u) * nb_k + b_idx];
-        const ob_block_q4_0_t& b3 = b_q4[static_cast<size_t>(sub.n0 + ni + 3u) * nb_k + b_idx];
-        const uint16_t dh[4] = {b0.d, b1.d, b2.d, b3.d};
-        const int32_t qv[4] = {
-            static_cast<int32_t>(hi_nib ? (b0.qs[byte_idx] >> 4) : (b0.qs[byte_idx] & 0x0Fu)) - 8,
-            static_cast<int32_t>(hi_nib ? (b1.qs[byte_idx] >> 4) : (b1.qs[byte_idx] & 0x0Fu)) - 8,
-            static_cast<int32_t>(hi_nib ? (b2.qs[byte_idx] >> 4) : (b2.qs[byte_idx] & 0x0Fu)) - 8,
-            static_cast<int32_t>(hi_nib ? (b3.qs[byte_idx] >> 4) : (b3.qs[byte_idx] & 0x0Fu)) - 8,
-        };
-        float32x4_t vd = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(dh)));
-        float32x4_t vq = vcvtq_f32_s32(vld1q_s32(qv));
-        vst1q_f32(out_p + ni, vmulq_f32(vd, vq));
-      }
-#endif
-      for (; ni < sub.tn; ++ni) {
-        const ob_block_q4_0_t& blk = b_q4[static_cast<size_t>(sub.n0 + ni) * nb_k + b_idx];
-        const uint8_t byte = blk.qs[byte_idx];
-        const int32_t q = static_cast<int32_t>(hi_nib ? (byte >> 4) : (byte & 0x0Fu)) - 8;
-        out_p[ni] = fp16_to_fp32(blk.d) * static_cast<float>(q);
-      }
-    } else {
-      const ob_block_q8_0_t* b_q8 = static_cast<const ob_block_q8_0_t*>(job.b_nk);
-      uint32_t ni = 0u;
-#if defined(__ARM_NEON) && defined(__aarch64__)
-      for (; ni + 4u <= sub.tn; ni += 4u) {
-        if (ni + 12u < sub.tn) {
-          __builtin_prefetch(&b_q8[static_cast<size_t>(sub.n0 + ni + 8u) * nb_k + b_idx], 0, 1);
-          __builtin_prefetch(&b_q8[static_cast<size_t>(sub.n0 + ni + 9u) * nb_k + b_idx], 0, 1);
-          __builtin_prefetch(&b_q8[static_cast<size_t>(sub.n0 + ni + 10u) * nb_k + b_idx], 0, 1);
-          __builtin_prefetch(&b_q8[static_cast<size_t>(sub.n0 + ni + 11u) * nb_k + b_idx], 0, 1);
-        }
-        const ob_block_q8_0_t& b0 = b_q8[static_cast<size_t>(sub.n0 + ni + 0u) * nb_k + b_idx];
-        const ob_block_q8_0_t& b1 = b_q8[static_cast<size_t>(sub.n0 + ni + 1u) * nb_k + b_idx];
-        const ob_block_q8_0_t& b2 = b_q8[static_cast<size_t>(sub.n0 + ni + 2u) * nb_k + b_idx];
-        const ob_block_q8_0_t& b3 = b_q8[static_cast<size_t>(sub.n0 + ni + 3u) * nb_k + b_idx];
-        const uint16_t dh[4] = {b0.d, b1.d, b2.d, b3.d};
-        const int32_t qv[4] = {b0.qs[j_idx], b1.qs[j_idx], b2.qs[j_idx], b3.qs[j_idx]};
-        float32x4_t vd = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(dh)));
-        float32x4_t vq = vcvtq_f32_s32(vld1q_s32(qv));
-        vst1q_f32(out_p + ni, vmulq_f32(vd, vq));
-      }
-#endif
-      for (; ni < sub.tn; ++ni) {
-        const ob_block_q8_0_t& blk = b_q8[static_cast<size_t>(sub.n0 + ni) * nb_k + b_idx];
-        out_p[ni] = fp16_to_fp32(blk.d) * static_cast<float>(blk.qs[j_idx]);
-      }
-    }
+    quant::extract_column_f32(static_cast<ob_quant_type_t>(job.is_q4_0),
+                              job.b_nk, k_dim, sub.n0, sub.tn, abs_k,
+                              dst_col + sub.out_off);
   }
 }
 
@@ -3420,10 +3074,18 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
       m_dim == 0u || k_dim == 0u || (k_dim % OB_QK8_0) != 0u) {
     return OB_ERR_INVALID_ARG;
   }
+  bool has_any_q4_k = false;
   for (uint32_t j = 0; j < num_jobs; ++j) {
-    if (!jobs[j].b_nk || !jobs[j].c_mn || jobs[j].n_dim == 0u) {
+    if (!jobs[j].b_nk || !jobs[j].c_mn || jobs[j].n_dim == 0u ||
+        !ob::quant::is_valid_type(jobs[j].is_q4_0)) {
       return OB_ERR_INVALID_ARG;
     }
+    const ob_quant_type_t qt = static_cast<ob_quant_type_t>(jobs[j].is_q4_0);
+    const uint32_t qk = ob_quant_block_elements(qt);
+    if (qk == 0u || (k_dim % qk) != 0u) {
+      return OB_ERR_INVALID_ARG;
+    }
+    if (qt == OB_QUANT_Q4_K) has_any_q4_k = true;
   }
 
   const uint64_t t0_ns = ob::monotonic_now_ns();
@@ -3476,6 +3138,8 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
     uint32_t n_uniq = 0u;
     std::array<uint32_t, 16> uniq_k_inline{};
     std::vector<uint32_t> uniq_k_overflow;
+    std::array<float, 64> a_sum_inline{};
+    std::vector<float> a_sum_overflow;
   };
 
   struct OutlierMissItem {
@@ -3510,7 +3174,7 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
     const ob_gemm_f32_quant_job_t* jobs_ptr = nullptr;
     const InputSlotMeta* im_ptr = nullptr;
     const void* raw_out = nullptr;
-    uint32_t nb_k = 0u;
+    uint32_t k_dim = 0u;
     float eff_scale_d = 1.0f;
     bool store_first = false;
     bool has_outliers = false;
@@ -3530,10 +3194,20 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
       PendingF32Tile* p = static_cast<PendingF32Tile*>(raw);
       const uint64_t tq0 = p->prof_on ? ob::monotonic_now_ns() : 0u;
       const float* sb_base = p->w_tile ? p->w_tile->row_s_b.data() : p->s_b.data();
+      const size_t sb_len = p->w_tile ? p->w_tile->row_s_b.size() : p->s_b.size();
+      const float* mu_base = (sb_len >= static_cast<size_t>(p->tn_total) * 2u)
+                                 ? (sb_base + p->tn_total)
+                                 : nullptr;
       const ob_gemm_f32_quant_job_t* jobs_p = p->jobs_ptr;
+      const InputSlotMeta* im = p->im_ptr;
+      const float* a_sum_ptr =
+          (mu_base && im)
+              ? ((p->tm <= im->a_sum_inline.size()) ? im->a_sum_inline.data() : im->a_sum_overflow.data())
+              : nullptr;
 
       if (p->is_w8a16) {
         const float* y_f32 = static_cast<const float*>(p->raw_out);
+        const float a_sum_0 = a_sum_ptr ? a_sum_ptr[0] : 0.0f;
         for (uint32_t si = 0u; si < p->num_subs; ++si) {
           const ob::FusedSubSlice& sub = p->subs[si];
           const ob_gemm_f32_quant_job_t& job = jobs_p[sub.job_idx];
@@ -3542,12 +3216,14 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
           ob::w8a16_pt_epilogue_f32(
               c_row, y_f32 + sub.out_off, sb_ptr, sub.tn,
               p->w8a16_prescale_inv, p->store_first);
+          if (mu_base && a_sum_0 != 0.0f) {
+            ob::add_scaled_offset_row_f32(c_row, mu_base + sub.out_off, sub.tn, a_sum_0);
+          }
         }
       } else {
         const int8_t* raw_i8 = static_cast<const int8_t*>(p->raw_out);
         const float* sa_ptr =
             (p->tm <= p->s_a_inline.size()) ? p->s_a_inline.data() : p->s_a_overflow.data();
-        const InputSlotMeta* im = p->im_ptr;
         const bool has_out = p->has_outliers && im != nullptr;
         const ob::RowOutliers* rows_ptr =
             has_out ? ((p->tm <= 1u) ? &im->row0 : im->rows_vec.data()) : nullptr;
@@ -3557,7 +3233,7 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
               p->dq_misses_vec.empty() ? p->dq_misses_stack.data() : p->dq_misses_vec.data();
           for (uint32_t i = 0u; i < p->dq_n_miss; ++i) {
             ob::extract_outlier_col_impl(
-                jobs_p, p->subs.data(), p->num_subs, p->nb_k, im->k0,
+                jobs_p, p->subs.data(), p->num_subs, p->k_dim, im->k0,
                 misses_ptr[i].k_off, misses_ptr[i].dst);
           }
         }
@@ -3600,6 +3276,9 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
                   c_row, o_row, sb_ptr, sub.tn, sa_d, p->store_first,
                   nullptr, nullptr, 0u);
             }
+            if (mu_base && a_sum_ptr) {
+              ob::add_scaled_offset_row_f32(c_row, mu_base + sub.out_off, sub.tn, a_sum_ptr[mi]);
+            }
           }
         }
       }
@@ -3618,7 +3297,6 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
   uint64_t reap_seq = 0u;
   uint64_t last_dq_seq = 0u;
   ob_status_t first_dq_err = OB_OK;
-  const uint32_t nb_k = k_dim / OB_QK8_0;
 
   auto release_reaped_slot = [&](PendingF32Tile& rp) {
     if (prof_on) {
@@ -3696,6 +3374,15 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
           const float* sa_ptr =
               (p.tm <= p.s_a_inline.size()) ? p.s_a_inline.data() : p.s_a_overflow.data();
           const float* sb_base = p.w_tile ? p.w_tile->row_s_b.data() : p.s_b.data();
+          const size_t sb_len = p.w_tile ? p.w_tile->row_s_b.size() : p.s_b.size();
+          const float* mu_base = (sb_len >= static_cast<size_t>(p.tn_total) * 2u)
+                                     ? (sb_base + p.tn_total)
+                                     : nullptr;
+          const InputSlotMeta& im_cur = in_slots[p.in_slot];
+          const float* a_sum_cur =
+              mu_base ? ((p.tm <= im_cur.a_sum_inline.size()) ? im_cur.a_sum_inline.data()
+                                                              : im_cur.a_sum_overflow.data())
+                      : nullptr;
           const bool store_first_now = p.is_first_k && skip_zero_init;
           auto dequant_sub = [&](const int8_t* raw_i8, uint32_t si, uint32_t scale_d_cur) {
             if (use_async_dq && last_dq_seq > 0u) {
@@ -3714,6 +3401,9 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
               ob::dequant_outliers_row_f32_impl(
                   c_row, o_row, sb_ptr, sub.tn, sa_d, store_first_now,
                   nullptr, nullptr, 0u);
+              if (mu_base && a_sum_cur) {
+                ob::add_scaled_offset_row_f32(c_row, mu_base + sub.out_off, sub.tn, a_sum_cur[mi]);
+              }
             }
             p.sub_done[si] = true;
             if (prof_on) ctx->prof.dequant_ns += (ob::monotonic_now_ns() - tq0);
@@ -3820,7 +3510,7 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
             p.jobs_ptr = jobs;
             p.im_ptr = &in_slots[p.in_slot];
             p.raw_out = raw_out_ptr;
-            p.nb_k = nb_k;
+            p.k_dim = k_dim;
             p.eff_scale_d = static_cast<float>(eff_d);
             p.store_first = p.is_first_k && skip_zero_init;
             p.prof_on = prof_on;
@@ -4124,8 +3814,6 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
       const uint32_t hw_n = grp.hw_n;
       const uint32_t tn_total = grp.tn_total;
       const uint32_t num_subs = grp.num_subs;
-      const uint32_t blk0 = k0 / OB_QK8_0;
-      const uint32_t blk_cnt = tk / OB_QK8_0;
 
       // Helper to split a rejected multi-sub horizontal fusion cleanly into 1-sub groups.
       auto fallback_split_subs = [&]() -> ob_status_t {
@@ -4202,6 +3890,9 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
             const float* a_row = a_mk + static_cast<size_t>(m0) * k_dim + k0;
             cached_a_w8a16_prescale_inv =
                 ob::prepare_w8a16_input_row_f32(a_row, tk, hw_k, a_f32_tile.data());
+            if (has_any_q4_k) {
+              im.a_sum_inline[0] = ob::compute_row_sum_excluding_outliers(a_row, tk, nullptr);
+            }
             cached_a_rms_shift = 0u;
           } else {
             ob::RowOutliers* rows_dst = &im.row0;
@@ -4285,6 +3976,18 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
             } else {
               cached_a_rms_shift = 0u;
             }
+            if (has_any_q4_k) {
+              float* a_sum_dst = im.a_sum_inline.data();
+              if (tm > im.a_sum_inline.size()) {
+                im.a_sum_overflow.resize(tm);
+                a_sum_dst = im.a_sum_overflow.data();
+              }
+              for (uint32_t mi = 0u; mi < tm; ++mi) {
+                const float* a_row = a_mk + static_cast<size_t>(m0 + mi) * k_dim + k0;
+                a_sum_dst[mi] = ob::compute_row_sum_excluding_outliers(
+                    a_row, tk, builtin_active ? &rows_dst[mi] : nullptr);
+              }
+            }
           }
 
           if (prof_on) ctx->prof.quant_ns += (ob::monotonic_now_ns() - tq0);
@@ -4299,6 +4002,13 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
         // 2. Hash & lookup (or cold-pack) ext[2] weight tile (single or horizontally fused!)
         ob::CachedWeightTile* w_tile = nullptr;
         uint32_t scale_d = 1u;
+        bool grp_has_q4_k = false;
+        for (uint32_t si = 0u; si < num_subs; ++si) {
+          if (jobs[grp.subs[si].job_idx].is_q4_0 == static_cast<uint8_t>(OB_QUANT_Q4_K)) {
+            grp_has_q4_k = true;
+            break;
+          }
+        }
         if (builtin_active) {
           const bool is_lt64_tile = (!tile_use_w8a16) && ob::is_lt_64x_shape(hw_m, hw_k, hw_n);
           const uint32_t pack_fmt = tile_use_w8a16 ? 2u : (is_lt64_tile ? 1u : 0u);
@@ -4307,16 +4017,25 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
           if (num_subs == 1u) {
             const ob::FusedSubSlice& sub = grp.subs[0];
             const ob_gemm_f32_quant_job_t& job = jobs[sub.job_idx];
-            const bool is_q4 = (job.is_q4_0 != 0u);
-            const uint64_t tag = is_q4 ? 0x51345F5754494C45ULL : 0x51385F5754494C45ULL;
+            const ob_quant_type_t qtype = static_cast<ob_quant_type_t>(job.is_q4_0);
+            const uint64_t tag = ob::quant_tile_hash_tag(qtype);
             uint32_t whdr[5] = {sub.tn, tk, hw_k, hw_n, pack_fmt};
             ob::hash128_update(&wh_st, &tag, sizeof(tag));
             ob::hash128_update(&wh_st, whdr, sizeof(whdr));
-            const size_t blk_sz = is_q4 ? sizeof(ob_block_q4_0_t) : sizeof(ob_block_q8_0_t);
-            const size_t row_blk_bytes = static_cast<size_t>(blk_cnt) * blk_sz;
-            const size_t row_stride_bytes = static_cast<size_t>(nb_k) * blk_sz;
+            const uint32_t qk = ob_quant_block_elements(qtype);
+            const size_t blk_sz = ob_quant_block_bytes(qtype);
+            const uint32_t nb_k_q = k_dim / qk;
+            const uint32_t blk_start = k0 / qk;
+            const uint32_t blk_end = (k0 + tk + qk - 1u) / qk;
+            const uint32_t blk_cnt_q = blk_end - blk_start;
+            if ((k0 % qk) != 0u || (tk % qk) != 0u) {
+              uint32_t sub_k[2] = {k0 % qk, tk};
+              ob::hash128_update(&wh_st, sub_k, sizeof(sub_k));
+            }
+            const size_t row_blk_bytes = static_cast<size_t>(blk_cnt_q) * blk_sz;
+            const size_t row_stride_bytes = static_cast<size_t>(nb_k_q) * blk_sz;
             const uint8_t* raw_base = static_cast<const uint8_t*>(job.b_nk) +
-                                      (static_cast<size_t>(sub.n0) * nb_k + blk0) * blk_sz;
+                                      (static_cast<size_t>(sub.n0) * nb_k_q + blk_start) * blk_sz;
             ob::hash_weight_tile_for_ctx(ctx, &wh_st, raw_base, row_stride_bytes, sub.tn,
                                          row_blk_bytes, strict_hash);
           } else {
@@ -4327,14 +4046,23 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
             for (uint32_t si = 0u; si < num_subs; ++si) {
               const ob::FusedSubSlice& sub = grp.subs[si];
               const ob_gemm_f32_quant_job_t& job = jobs[sub.job_idx];
-              const bool is_q4 = (job.is_q4_0 != 0u);
-              uint32_t shdr[3] = {sub.tn, sub.out_off, is_q4 ? 1u : 0u};
+              const ob_quant_type_t qtype = static_cast<ob_quant_type_t>(job.is_q4_0);
+              uint32_t shdr[3] = {sub.tn, sub.out_off, static_cast<uint32_t>(qtype)};
               ob::hash128_update(&wh_st, shdr, sizeof(shdr));
-              const size_t blk_sz = is_q4 ? sizeof(ob_block_q4_0_t) : sizeof(ob_block_q8_0_t);
-              const size_t row_blk_bytes = static_cast<size_t>(blk_cnt) * blk_sz;
-              const size_t row_stride_bytes = static_cast<size_t>(nb_k) * blk_sz;
+              const uint32_t qk = ob_quant_block_elements(qtype);
+              const size_t blk_sz = ob_quant_block_bytes(qtype);
+              const uint32_t nb_k_q = k_dim / qk;
+              const uint32_t blk_start = k0 / qk;
+              const uint32_t blk_end = (k0 + tk + qk - 1u) / qk;
+              const uint32_t blk_cnt_q = blk_end - blk_start;
+              if ((k0 % qk) != 0u || (tk % qk) != 0u) {
+                uint32_t sub_k[2] = {k0 % qk, tk};
+                ob::hash128_update(&wh_st, sub_k, sizeof(sub_k));
+              }
+              const size_t row_blk_bytes = static_cast<size_t>(blk_cnt_q) * blk_sz;
+              const size_t row_stride_bytes = static_cast<size_t>(nb_k_q) * blk_sz;
               const uint8_t* raw_base = static_cast<const uint8_t*>(job.b_nk) +
-                                        (static_cast<size_t>(sub.n0) * nb_k + blk0) * blk_sz;
+                                        (static_cast<size_t>(sub.n0) * nb_k_q + blk_start) * blk_sz;
               ob::hash_weight_tile_for_ctx(ctx, &wh_st, raw_base, row_stride_bytes, sub.tn,
                                            row_blk_bytes, strict_hash);
             }
@@ -4355,6 +4083,8 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
                           static_cast<size_t>(hw_n - tn_total) * hw_k);
             }
             std::vector<float> sb_vec(tn_total, 0.0f);
+            std::vector<float> offset_vec(grp_has_q4_k ? tn_total : 0u, 0.0f);
+            bool any_nonzero_offset = false;
             std::vector<ob::RowNormStats> row_stats(tile_use_w8a16 ? 0u : tn_total);
             uint32_t min_sub_d = 0xFFFFFFFFu;
             double all_max_l2 = 0.0;
@@ -4364,18 +4094,15 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
             for (uint32_t si = 0u; si < num_subs; ++si) {
               const ob::FusedSubSlice& sub = grp.subs[si];
               const ob_gemm_f32_quant_job_t& job = jobs[sub.job_idx];
+              const ob_quant_type_t qtype = static_cast<ob_quant_type_t>(job.is_q4_0);
               int8_t* bq_dst = b_q_tile.data() + static_cast<size_t>(sub.out_off) * hw_k;
               float* sb_dst = sb_vec.data() + sub.out_off;
+              float* off_dst = grp_has_q4_k ? (offset_vec.data() + sub.out_off) : nullptr;
               ob::RowNormStats* st_dst =
                   tile_use_w8a16 ? nullptr : (row_stats.data() + sub.out_off);
-              if (job.is_q4_0 != 0u) {
-                ob::requant_q4_0_rows(static_cast<const ob_block_q4_0_t*>(job.b_nk),
-                                      nb_k, sub.n0, sub.tn, blk0, blk_cnt,
-                                      tk, hw_k, bq_dst, sb_dst, &ctx->worker_pool, st_dst);
-              } else {
-                ob::requant_q8_0_rows(static_cast<const ob_block_q8_0_t*>(job.b_nk),
-                                      nb_k, sub.n0, sub.tn, blk0, blk_cnt,
-                                      tk, hw_k, bq_dst, sb_dst, &ctx->worker_pool, st_dst);
+              if (ob::quant::requant_rows(qtype, job.b_nk, k_dim, sub.n0, sub.tn, k0, tk, hw_k,
+                                          bq_dst, sb_dst, off_dst, &ctx->worker_pool, st_dst)) {
+                any_nonzero_offset = true;
               }
               if (!tile_use_w8a16) {
                 double sub_max_l2 = 0.0;
@@ -4395,6 +4122,9 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
                   if (sd < min_sub_d) min_sub_d = sd;
                 }
               }
+            }
+            if (any_nonzero_offset) {
+              sb_vec.insert(sb_vec.end(), offset_vec.begin(), offset_vec.end());
             }
 
             if (!tile_use_w8a16) {
@@ -4493,18 +4223,15 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
           // Non-builtin pluggable emitter path (always 1-sub)
           const ob::FusedSubSlice& sub = grp.subs[0];
           const ob_gemm_f32_quant_job_t& job = jobs[sub.job_idx];
+          const ob_quant_type_t qtype = static_cast<ob_quant_type_t>(job.is_q4_0);
           b_q_tile.assign(static_cast<size_t>(hw_n) * hw_k, 0);
           row_s_b.assign(sub.tn, 0.0f);
-          if (job.is_q4_0 != 0u) {
-            ob::requant_q4_0_rows(static_cast<const ob_block_q4_0_t*>(job.b_nk),
-                                  nb_k, sub.n0, sub.tn, blk0, blk_cnt,
-                                  tk, hw_k, b_q_tile.data(), row_s_b.data(),
-                                  &ctx->worker_pool, nullptr);
-          } else {
-            ob::requant_q8_0_rows(static_cast<const ob_block_q8_0_t*>(job.b_nk),
-                                  nb_k, sub.n0, sub.tn, blk0, blk_cnt,
-                                  tk, hw_k, b_q_tile.data(), row_s_b.data(),
-                                  &ctx->worker_pool, nullptr);
+          std::vector<float> offset_vec(grp_has_q4_k ? sub.tn : 0u, 0.0f);
+          if (ob::quant::requant_rows(qtype, job.b_nk, k_dim, sub.n0, sub.tn, k0, tk, hw_k,
+                                      b_q_tile.data(), row_s_b.data(),
+                                      grp_has_q4_k ? offset_vec.data() : nullptr,
+                                      &ctx->worker_pool, nullptr)) {
+            row_s_b.insert(row_s_b.end(), offset_vec.begin(), offset_vec.end());
           }
           scale_d = ob::compute_tile_scale_D(b_q_tile.data(), sub.tn, tk, hw_k);
         }
@@ -4724,15 +4451,10 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
         for (uint32_t si = 0u; si < num_subs; ++si) {
           const ob::FusedSubSlice& sub = grp.subs[si];
           const ob_gemm_f32_quant_job_t& job = jobs[sub.job_idx];
-          if (job.is_q4_0 != 0u) {
-            ob::cpu_matmul_f32_q4_0_tile(a_mk, static_cast<const ob_block_q4_0_t*>(job.b_nk),
-                                         job.c_mn, k_dim, job.n_dim,
-                                         m0, tm, k0, tk, sub.n0, sub.tn);
-          } else {
-            ob::cpu_matmul_f32_q8_0_tile(a_mk, static_cast<const ob_block_q8_0_t*>(job.b_nk),
-                                         job.c_mn, k_dim, job.n_dim,
-                                         m0, tm, k0, tk, sub.n0, sub.tn);
-          }
+          ob::quant::cpu_matmul_f32_tile(
+              static_cast<ob_quant_type_t>(job.is_q4_0),
+              a_mk, job.b_nk, job.c_mn, k_dim, job.n_dim,
+              m0, tm, k0, tk, sub.n0, sub.tn);
         }
       }
       return OB_OK;
@@ -4863,7 +4585,7 @@ ob_status_t ob_gemm_swiglu_int8(ob_context_t* ctx,
   }
 
   // Unique graph cache key binding shape + all 9 exact float scales (weight-agnostic Probe-A!)
-  uint64_t gkey = 0x535749385F303031ULL; // "SWI8_001"
+  uint64_t gkey = ctx->freetile_enabled ? 0x46545F5357493831ULL : 0x535749385F303031ULL;
   uint32_t shdr[4] = {M, K, H, N};
   float sf[9] = {
       desc->s_in, desc->s_wg, desc->s_gate,
@@ -4892,6 +4614,7 @@ ob_status_t ob_gemm_swiglu_int8(ob_context_t* ctx,
     ob_buffer_free(wbuf);
     return st;
   }
+  const bool entry_freetile = (entry && entry->emitted_by_freetile);
 
   const size_t in_bytes = static_cast<size_t>(M) * K;
   const size_t out_bytes = static_cast<size_t>(M) * N;
@@ -4979,6 +4702,7 @@ ob_status_t ob_gemm_swiglu_int8(ob_context_t* ctx,
     out_stats->cache_hits = was_hit ? 1u : 0u;
     if (ctx->mock_mode) out_stats->flags |= OB_STAT_FLAG_MOCK;
     out_stats->flags |= OB_STAT_FLAG_EMITTER_USED;
+    if (entry_freetile) out_stats->flags |= OB_STAT_FLAG_FREETILE;
     if (was_hit) out_stats->flags |= OB_STAT_FLAG_CACHE_HIT;
   }
   return OB_OK;
@@ -4986,252 +4710,21 @@ ob_status_t ob_gemm_swiglu_int8(ob_context_t* ctx,
 
 namespace {
 
-// Dequantize one quantized row [0..len) into float dst[0..len).
-void dequant_quant_row_f32(const void* blocks_base, uint8_t is_q4_0,
-                           uint32_t nb_stride, uint32_t row_idx,
-                           uint32_t blk0, uint32_t blk_cnt, float* dst) {
-  if (is_q4_0 != 0u) {
-    const ob_block_q4_0_t* b_row =
-        static_cast<const ob_block_q4_0_t*>(blocks_base) +
-        static_cast<size_t>(row_idx) * nb_stride + blk0;
-#if defined(__ARM_NEON) && defined(__aarch64__)
-    const uint8x16_t mask_lo = vdupq_n_u8(0x0Fu);
-    const int8x16_t bias_8 = vdupq_n_s8(-8);
-    for (uint32_t bi = 0u; bi < blk_cnt; ++bi) {
-      const float32x4_t vd = vdupq_n_f32(ob::fp16_to_fp32(b_row[bi].d));
-      float* out = dst + static_cast<size_t>(bi) * OB_QK8_0;
-      uint8x16_t raw = vld1q_u8(b_row[bi].qs);
-      int8x16_t lo8 = vaddq_s8(vreinterpretq_s8_u8(vandq_u8(raw, mask_lo)), bias_8);
-      int8x16_t hi8 = vaddq_s8(vreinterpretq_s8_u8(vshrq_n_u8(raw, 4)), bias_8);
-      int16x8_t lo16_0 = vmovl_s8(vget_low_s8(lo8));
-      int16x8_t lo16_1 = vmovl_high_s8(lo8);
-      int16x8_t hi16_0 = vmovl_s8(vget_low_s8(hi8));
-      int16x8_t hi16_1 = vmovl_high_s8(hi8);
-      vst1q_f32(out +  0u, vmulq_f32(vd, vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo16_0)))));
-      vst1q_f32(out +  4u, vmulq_f32(vd, vcvtq_f32_s32(vmovl_high_s16(lo16_0))));
-      vst1q_f32(out +  8u, vmulq_f32(vd, vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo16_1)))));
-      vst1q_f32(out + 12u, vmulq_f32(vd, vcvtq_f32_s32(vmovl_high_s16(lo16_1))));
-      vst1q_f32(out + 16u, vmulq_f32(vd, vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi16_0)))));
-      vst1q_f32(out + 20u, vmulq_f32(vd, vcvtq_f32_s32(vmovl_high_s16(hi16_0))));
-      vst1q_f32(out + 24u, vmulq_f32(vd, vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi16_1)))));
-      vst1q_f32(out + 28u, vmulq_f32(vd, vcvtq_f32_s32(vmovl_high_s16(hi16_1))));
-    }
-#else
-    constexpr uint32_t kHalf = OB_QK8_0 / 2u;
-    for (uint32_t bi = 0u; bi < blk_cnt; ++bi) {
-      const float d = ob::fp16_to_fp32(b_row[bi].d);
-      const uint8_t* qs = b_row[bi].qs;
-      float* out = dst + static_cast<size_t>(bi) * OB_QK8_0;
-      for (uint32_t j = 0u; j < kHalf; ++j) {
-        const uint8_t byte = qs[j];
-        out[j] = d * static_cast<float>(static_cast<int32_t>(byte & 0x0Fu) - 8);
-        out[j + kHalf] = d * static_cast<float>(static_cast<int32_t>(byte >> 4) - 8);
-      }
-    }
-#endif
-  } else {
-    const ob_block_q8_0_t* b_row =
-        static_cast<const ob_block_q8_0_t*>(blocks_base) +
-        static_cast<size_t>(row_idx) * nb_stride + blk0;
-#if defined(__ARM_NEON) && defined(__aarch64__)
-    for (uint32_t bi = 0u; bi < blk_cnt; ++bi) {
-      const float32x4_t vd = vdupq_n_f32(ob::fp16_to_fp32(b_row[bi].d));
-      const int8_t* qs = b_row[bi].qs;
-      float* out = dst + static_cast<size_t>(bi) * OB_QK8_0;
-      for (uint32_t off = 0u; off < OB_QK8_0; off += 16u) {
-        int8x16_t q8 = vld1q_s8(qs + off);
-        int16x8_t q16_lo = vmovl_s8(vget_low_s8(q8));
-        int16x8_t q16_hi = vmovl_high_s8(q8);
-        vst1q_f32(out + off +  0u, vmulq_f32(vd, vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16_lo)))));
-        vst1q_f32(out + off +  4u, vmulq_f32(vd, vcvtq_f32_s32(vmovl_high_s16(q16_lo))));
-        vst1q_f32(out + off +  8u, vmulq_f32(vd, vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16_hi)))));
-        vst1q_f32(out + off + 12u, vmulq_f32(vd, vcvtq_f32_s32(vmovl_high_s16(q16_hi))));
-      }
-    }
-#else
-    for (uint32_t bi = 0u; bi < blk_cnt; ++bi) {
-      const float d = ob::fp16_to_fp32(b_row[bi].d);
-      const int8_t* qs = b_row[bi].qs;
-      float* out = dst + static_cast<size_t>(bi) * OB_QK8_0;
-      for (uint32_t j = 0u; j < OB_QK8_0; ++j) {
-        out[j] = d * static_cast<float>(qs[j]);
-      }
-    }
-#endif
-  }
-}
-
-// Fast ARM64 NEON Q8_0 / Q4_0 dot product for M=1 exact-FP32 transient outlier SwiGLU fallback
-// (zero weight-cache pollution + exact FP32 precision on rare attention-sink tokens).
-float neon_dot_f32_q8_row(const float* a, const ob_block_q8_0_t* row, uint32_t nb) {
-#if defined(__ARM_NEON) && defined(__aarch64__)
-  float32x4_t acc0 = vdupq_n_f32(0.0f);
-  float32x4_t acc1 = vdupq_n_f32(0.0f);
-  for (uint32_t bi = 0u; bi < nb; ++bi) {
-    const float d = ob::fp16_to_fp32(row[bi].d);
-    const int8_t* qs = row[bi].qs;
-    const float* ap = a + static_cast<size_t>(bi) * OB_QK8_0;
-    float32x4_t bsum0 = vdupq_n_f32(0.0f);
-    float32x4_t bsum1 = vdupq_n_f32(0.0f);
-    for (uint32_t off = 0u; off < OB_QK8_0; off += 16u) {
-      int8x16_t q8 = vld1q_s8(qs + off);
-      int16x8_t q16_lo = vmovl_s8(vget_low_s8(q8));
-      int16x8_t q16_hi = vmovl_high_s8(q8);
-      bsum0 = vfmaq_f32(bsum0, vld1q_f32(ap + off),       vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16_lo))));
-      bsum1 = vfmaq_f32(bsum1, vld1q_f32(ap + off + 4u),  vcvtq_f32_s32(vmovl_high_s16(q16_lo)));
-      bsum0 = vfmaq_f32(bsum0, vld1q_f32(ap + off + 8u),  vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16_hi))));
-      bsum1 = vfmaq_f32(bsum1, vld1q_f32(ap + off + 12u), vcvtq_f32_s32(vmovl_high_s16(q16_hi)));
-    }
-    const float32x4_t vd = vdupq_n_f32(d);
-    acc0 = vfmaq_f32(acc0, bsum0, vd);
-    acc1 = vfmaq_f32(acc1, bsum1, vd);
-  }
-  return vaddvq_f32(vaddq_f32(acc0, acc1));
-#else
-  double sum = 0.0;
-  for (uint32_t bi = 0u; bi < nb; ++bi) {
-    const double d = static_cast<double>(ob::fp16_to_fp32(row[bi].d));
-    const int8_t* qs = row[bi].qs;
-    const float* ap = a + static_cast<size_t>(bi) * OB_QK8_0;
-    double bsum = 0.0;
-    for (uint32_t j = 0u; j < OB_QK8_0; ++j) bsum += static_cast<double>(ap[j]) * static_cast<double>(qs[j]);
-    sum += d * bsum;
-  }
-  return static_cast<float>(sum);
-#endif
-}
-
-float neon_dot_f32_q4_row(const float* a, const ob_block_q4_0_t* row, uint32_t nb) {
-#if defined(__ARM_NEON) && defined(__aarch64__)
-  const uint8x16_t mask_lo = vdupq_n_u8(0x0Fu);
-  const int8x16_t bias_8 = vdupq_n_s8(-8);
-  float32x4_t acc0 = vdupq_n_f32(0.0f);
-  float32x4_t acc1 = vdupq_n_f32(0.0f);
-  for (uint32_t bi = 0u; bi < nb; ++bi) {
-    const float d = ob::fp16_to_fp32(row[bi].d);
-    const float* ap = a + static_cast<size_t>(bi) * OB_QK8_0;
-    uint8x16_t raw = vld1q_u8(row[bi].qs);
-    int8x16_t lo8 = vaddq_s8(vreinterpretq_s8_u8(vandq_u8(raw, mask_lo)), bias_8);
-    int8x16_t hi8 = vaddq_s8(vreinterpretq_s8_u8(vshrq_n_u8(raw, 4)), bias_8);
-    int16x8_t lo16_0 = vmovl_s8(vget_low_s8(lo8));
-    int16x8_t lo16_1 = vmovl_high_s8(lo8);
-    int16x8_t hi16_0 = vmovl_s8(vget_low_s8(hi8));
-    int16x8_t hi16_1 = vmovl_high_s8(hi8);
-    float32x4_t bsum0 = vmulq_f32(vld1q_f32(ap + 0u),  vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo16_0))));
-    float32x4_t bsum1 = vmulq_f32(vld1q_f32(ap + 4u),  vcvtq_f32_s32(vmovl_high_s16(lo16_0)));
-    bsum0 = vfmaq_f32(bsum0, vld1q_f32(ap + 8u),  vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo16_1))));
-    bsum1 = vfmaq_f32(bsum1, vld1q_f32(ap + 12u), vcvtq_f32_s32(vmovl_high_s16(lo16_1)));
-    bsum0 = vfmaq_f32(bsum0, vld1q_f32(ap + 16u), vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi16_0))));
-    bsum1 = vfmaq_f32(bsum1, vld1q_f32(ap + 20u), vcvtq_f32_s32(vmovl_high_s16(hi16_0)));
-    bsum0 = vfmaq_f32(bsum0, vld1q_f32(ap + 24u), vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi16_1))));
-    bsum1 = vfmaq_f32(bsum1, vld1q_f32(ap + 28u), vcvtq_f32_s32(vmovl_high_s16(hi16_1)));
-    const float32x4_t vd = vdupq_n_f32(d);
-    acc0 = vfmaq_f32(acc0, bsum0, vd);
-    acc1 = vfmaq_f32(acc1, bsum1, vd);
-  }
-  return vaddvq_f32(vaddq_f32(acc0, acc1));
-#else
-  double sum = 0.0;
-  constexpr uint32_t kHalf = OB_QK8_0 / 2u;
-  for (uint32_t bi = 0u; bi < nb; ++bi) {
-    const double d = static_cast<double>(ob::fp16_to_fp32(row[bi].d));
-    const uint8_t* qs = row[bi].qs;
-    const float* ap = a + static_cast<size_t>(bi) * OB_QK8_0;
-    double bsum = 0.0;
-    for (uint32_t j = 0u; j < kHalf; ++j) {
-      const uint8_t byte = qs[j];
-      bsum += static_cast<double>(ap[j]) * static_cast<double>(static_cast<int32_t>(byte & 0x0Fu) - 8);
-      bsum += static_cast<double>(ap[j + kHalf]) * static_cast<double>(static_cast<int32_t>(byte >> 4) - 8);
-    }
-    sum += d * bsum;
-  }
-  return static_cast<float>(sum);
-#endif
-}
-
-// Exact max|w| of one quantized row directly from Q8_0/Q4_0 blocks (zero FP32 temp buffer!).
-float quant_row_max_abs(const void* blocks_base, uint8_t is_q4_0,
-                        uint32_t nb_stride, uint32_t row_idx,
-                        uint32_t blk0, uint32_t blk_cnt) {
-  float rm = 0.0f;
-  if (is_q4_0 != 0u) {
-    const ob_block_q4_0_t* b_row =
-        static_cast<const ob_block_q4_0_t*>(blocks_base) +
-        static_cast<size_t>(row_idx) * nb_stride + blk0;
-#if defined(__ARM_NEON) && defined(__aarch64__)
-    const uint8x16_t mask_lo = vdupq_n_u8(0x0Fu);
-    const int8x16_t bias_8 = vdupq_n_s8(-8);
-    for (uint32_t bi = 0u; bi < blk_cnt; ++bi) {
-      const float d = std::fabs(ob::fp16_to_fp32(b_row[bi].d));
-      if (d == 0.0f) continue;
-      uint8x16_t raw = vld1q_u8(b_row[bi].qs);
-      int8x16_t lo8 = vaddq_s8(vreinterpretq_s8_u8(vandq_u8(raw, mask_lo)), bias_8);
-      int8x16_t hi8 = vaddq_s8(vreinterpretq_s8_u8(vshrq_n_u8(raw, 4)), bias_8);
-      uint8x16_t mx = vmaxq_u8(vreinterpretq_u8_s8(vabsq_s8(lo8)),
-                               vreinterpretq_u8_s8(vabsq_s8(hi8)));
-      const float bm = d * static_cast<float>(vmaxvq_u8(mx));
-      if (bm > rm) rm = bm;
-    }
-#else
-    constexpr uint32_t kHalf = OB_QK8_0 / 2u;
-    for (uint32_t bi = 0u; bi < blk_cnt; ++bi) {
-      const float d = std::fabs(ob::fp16_to_fp32(b_row[bi].d));
-      if (d == 0.0f) continue;
-      const uint8_t* qs = b_row[bi].qs;
-      int32_t qm = 0;
-      for (uint32_t j = 0u; j < kHalf; ++j) {
-        const uint8_t byte = qs[j];
-        int32_t a0 = static_cast<int32_t>(byte & 0x0Fu) - 8;
-        int32_t a1 = static_cast<int32_t>(byte >> 4) - 8;
-        if (a0 < 0) a0 = -a0;
-        if (a1 < 0) a1 = -a1;
-        if (a0 > qm) qm = a0;
-        if (a1 > qm) qm = a1;
-      }
-      const float bm = d * static_cast<float>(qm);
-      if (bm > rm) rm = bm;
-    }
-#endif
-  } else {
-    const ob_block_q8_0_t* b_row =
-        static_cast<const ob_block_q8_0_t*>(blocks_base) +
-        static_cast<size_t>(row_idx) * nb_stride + blk0;
-#if defined(__ARM_NEON) && defined(__aarch64__)
-    for (uint32_t bi = 0u; bi < blk_cnt; ++bi) {
-      const float d = std::fabs(ob::fp16_to_fp32(b_row[bi].d));
-      if (d == 0.0f) continue;
-      uint8x16_t a0 = vreinterpretq_u8_s8(vabsq_s8(vld1q_s8(b_row[bi].qs)));
-      uint8x16_t a1 = vreinterpretq_u8_s8(vabsq_s8(vld1q_s8(b_row[bi].qs + 16u)));
-      const float bm = d * static_cast<float>(vmaxvq_u8(vmaxq_u8(a0, a1)));
-      if (bm > rm) rm = bm;
-    }
-#else
-    for (uint32_t bi = 0u; bi < blk_cnt; ++bi) {
-      const float d = std::fabs(ob::fp16_to_fp32(b_row[bi].d));
-      if (d == 0.0f) continue;
-      const int8_t* qs = b_row[bi].qs;
-      int32_t qm = 0;
-      for (uint32_t j = 0u; j < OB_QK8_0; ++j) {
-        int32_t av = static_cast<int32_t>(qs[j]);
-        if (av < 0) av = -av;
-        if (av > qm) qm = av;
-      }
-      const float bm = d * static_cast<float>(qm);
-      if (bm > rm) rm = bm;
-    }
-#endif
-  }
-  return rm;
-}
-
 void cpu_swiglu_f32_quant_slice(const float* a_slice,
                                 const ob_gemm_swiglu_quant_desc_t* d,
                                 uint32_t tm,
                                 float* c_slice,
                                 ob::WorkerPool* pool) {
   const uint32_t K = d->k_dim, H = d->h_dim, N = d->n_dim;
-  const uint32_t nb_k = K / OB_QK8_0;
-  const uint32_t nb_h = H / OB_QK8_0;
+  const ob_quant_type_t gate_qt = static_cast<ob_quant_type_t>(d->gate_is_q4_0);
+  const ob_quant_type_t up_qt   = static_cast<ob_quant_type_t>(d->up_is_q4_0);
+  const ob_quant_type_t down_qt = static_cast<ob_quant_type_t>(d->down_is_q4_0);
+  const size_t g_row_bytes = static_cast<size_t>(K / ob_quant_block_elements(gate_qt)) * ob_quant_block_bytes(gate_qt);
+  const size_t u_row_bytes = static_cast<size_t>(K / ob_quant_block_elements(up_qt))   * ob_quant_block_bytes(up_qt);
+  const size_t d_row_bytes = static_cast<size_t>(H / ob_quant_block_elements(down_qt)) * ob_quant_block_bytes(down_qt);
+  const uint8_t* wg_bytes = static_cast<const uint8_t*>(d->w_gate_hk);
+  const uint8_t* wu_bytes = static_cast<const uint8_t*>(d->w_up_hk);
+  const uint8_t* wd_bytes = static_cast<const uint8_t*>(d->w_down_nh);
   std::vector<float> mid(H, 0.0f);
   const bool par_h = (pool && pool->num_threads > 1u && H >= 512u);
   const bool par_n = (pool && pool->num_threads > 1u && N >= 256u && H >= 512u);
@@ -5239,12 +4732,8 @@ void cpu_swiglu_f32_quant_slice(const float* a_slice,
     const float* a_row = a_slice + static_cast<size_t>(mi) * K;
     auto run_h = [&](uint32_t hs, uint32_t he) {
       for (uint32_t h = hs; h < he; ++h) {
-        const float g = d->gate_is_q4_0
-            ? neon_dot_f32_q4_row(a_row, static_cast<const ob_block_q4_0_t*>(d->w_gate_hk) + static_cast<size_t>(h) * nb_k, nb_k)
-            : neon_dot_f32_q8_row(a_row, static_cast<const ob_block_q8_0_t*>(d->w_gate_hk) + static_cast<size_t>(h) * nb_k, nb_k);
-        const float u = d->up_is_q4_0
-            ? neon_dot_f32_q4_row(a_row, static_cast<const ob_block_q4_0_t*>(d->w_up_hk) + static_cast<size_t>(h) * nb_k, nb_k)
-            : neon_dot_f32_q8_row(a_row, static_cast<const ob_block_q8_0_t*>(d->w_up_hk) + static_cast<size_t>(h) * nb_k, nb_k);
+        const float g = ob::quant::dot_row_f32(gate_qt, a_row, wg_bytes + static_cast<size_t>(h) * g_row_bytes, K);
+        const float u = ob::quant::dot_row_f32(up_qt,   a_row, wu_bytes + static_cast<size_t>(h) * u_row_bytes, K);
         mid[h] = (g / (1.0f + std::exp(-g))) * u;
       }
     };
@@ -5256,9 +4745,7 @@ void cpu_swiglu_f32_quant_slice(const float* a_slice,
     float* c_row = c_slice + static_cast<size_t>(mi) * N;
     auto run_n = [&](uint32_t ns, uint32_t ne) {
       for (uint32_t n = ns; n < ne; ++n) {
-        c_row[n] = d->down_is_q4_0
-            ? neon_dot_f32_q4_row(mid.data(), static_cast<const ob_block_q4_0_t*>(d->w_down_nh) + static_cast<size_t>(n) * nb_h, nb_h)
-            : neon_dot_f32_q8_row(mid.data(), static_cast<const ob_block_q8_0_t*>(d->w_down_nh) + static_cast<size_t>(n) * nb_h, nb_h);
+        c_row[n] = ob::quant::dot_row_f32(down_qt, mid.data(), wd_bytes + static_cast<size_t>(n) * d_row_bytes, H);
       }
     };
     if (par_n) {
@@ -5347,7 +4834,17 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
   if (!ctx || !a_mk || !desc || !c_mn ||
       !desc->w_gate_hk || !desc->w_up_hk || !desc->w_down_nh ||
       desc->m_dim == 0u || desc->k_dim == 0u || desc->h_dim == 0u || desc->n_dim == 0u ||
-      (desc->k_dim % OB_QK8_0) != 0u || (desc->h_dim % OB_QK8_0) != 0u) {
+      !ob::quant::is_valid_type(desc->gate_is_q4_0) ||
+      !ob::quant::is_valid_type(desc->up_is_q4_0) ||
+      !ob::quant::is_valid_type(desc->down_is_q4_0)) {
+    return OB_ERR_INVALID_ARG;
+  }
+  const ob_quant_type_t gate_qt = static_cast<ob_quant_type_t>(desc->gate_is_q4_0);
+  const ob_quant_type_t up_qt   = static_cast<ob_quant_type_t>(desc->up_is_q4_0);
+  const ob_quant_type_t down_qt = static_cast<ob_quant_type_t>(desc->down_is_q4_0);
+  if ((desc->k_dim % ob_quant_block_elements(gate_qt)) != 0u ||
+      (desc->k_dim % ob_quant_block_elements(up_qt))   != 0u ||
+      (desc->h_dim % ob_quant_block_elements(down_qt)) != 0u) {
     return OB_ERR_INVALID_ARG;
   }
 
@@ -5451,14 +4948,13 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
   uint64_t fb_slices = 0u;
   uint16_t agg_flags = ctx->mock_mode ? static_cast<uint16_t>(OB_STAT_FLAG_MOCK) : static_cast<uint16_t>(0u);
 
-  const uint32_t nb_k = K / OB_QK8_0;
-  const uint32_t nb_h = H / OB_QK8_0;
-  const size_t g_row_bytes = static_cast<size_t>(nb_k) *
-      (desc->gate_is_q4_0 ? sizeof(ob_block_q4_0_t) : sizeof(ob_block_q8_0_t));
-  const size_t u_row_bytes = static_cast<size_t>(nb_k) *
-      (desc->up_is_q4_0 ? sizeof(ob_block_q4_0_t) : sizeof(ob_block_q8_0_t));
-  const size_t d_row_bytes = static_cast<size_t>(nb_h) *
-      (desc->down_is_q4_0 ? sizeof(ob_block_q4_0_t) : sizeof(ob_block_q8_0_t));
+  const uint32_t d_qk = ob_quant_block_elements(down_qt);
+  const size_t d_blk_sz = ob_quant_block_bytes(down_qt);
+  const size_t g_row_bytes = static_cast<size_t>(K / ob_quant_block_elements(gate_qt)) *
+                             ob_quant_block_bytes(gate_qt);
+  const size_t u_row_bytes = static_cast<size_t>(K / ob_quant_block_elements(up_qt)) *
+                             ob_quant_block_bytes(up_qt);
+  const size_t d_row_bytes = static_cast<size_t>(H / d_qk) * d_blk_sz;
 
   for (const SwigluMSlice& ms : m_slices) {
     const float* a_slice = a_mk + static_cast<size_t>(ms.m0) * K;
@@ -5734,7 +5230,7 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
                 eff_d_down <<= 1u;
                 const uint64_t rkey = ob::hash_swiglu_graph_key(
                     ms.hw_m, K, p.hw_h, N, p.d_gate, p.d_up, p.d_mul, eff_d_down,
-                    p.s_gate, p.slot % param_swap_slots);
+                    p.s_gate, p.slot % param_swap_slots, ctx->freetile_enabled);
                 ob_swiglu_int8_desc_t rdesc =
                     make_graph_desc(p.hw_h, p.d_gate, p.d_up, p.d_mul, eff_d_down, p.s_gate);
                 const uint64_t trs0 = prof_on ? ob::monotonic_now_ns() : 0u;
@@ -5742,6 +5238,7 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
                 bool rhit = false;
                 rst = ob::acquire_swiglu_entry(ctx, rdesc, rkey, &rentry, &rhit);
                 if (rst != OB_OK) break;
+                if (rentry && rentry->emitted_by_freetile) agg_flags |= OB_STAT_FLAG_FREETILE;
                 if (rhit) total_hits += 1u;
                 ob_exec_handle_t rh = 0u;
                 rst = ob::device_submit_execute_async(
@@ -5933,8 +5430,9 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
         const uint32_t h0 = hc.h0;
         const uint32_t th = hc.th;
         const uint32_t hw_h = hc.hw_h;
-        const uint32_t h_blk0 = h0 / OB_QK8_0;
-        const uint32_t h_blk_cnt = th / OB_QK8_0;
+        const uint32_t h_blk0 = h0 / d_qk;
+        const uint32_t h_blk_end = (h0 + th + d_qk - 1u) / d_qk;
+        const uint32_t h_blk_cnt = h_blk_end - h_blk0;
 
         // 1. O(1) content hash of (W_gate[h0..], W_up[h0..], W_down[:, h0..])
         const uint64_t th0 = prof_on ? ob::monotonic_now_ns() : 0u;
@@ -5946,12 +5444,14 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
         };
         ob::hash128_update(&wh_st, &wh_tag, sizeof(wh_tag));
         ob::hash128_update(&wh_st, whdr, sizeof(whdr));
+        if ((h0 % d_qk) != 0u || (th % d_qk) != 0u) {
+          uint32_t sub_h[2] = {h0 % d_qk, th};
+          ob::hash128_update(&wh_st, sub_h, sizeof(sub_h));
+        }
         const uint8_t* g_ptr = static_cast<const uint8_t*>(desc->w_gate_hk) +
                                static_cast<size_t>(h0) * g_row_bytes;
         const uint8_t* u_ptr = static_cast<const uint8_t*>(desc->w_up_hk) +
                                static_cast<size_t>(h0) * u_row_bytes;
-        const size_t d_blk_sz =
-            desc->down_is_q4_0 ? sizeof(ob_block_q4_0_t) : sizeof(ob_block_q8_0_t);
         const uint8_t* d_ptr = static_cast<const uint8_t*>(desc->w_down_nh) +
                                static_cast<size_t>(h_blk0) * d_blk_sz;
         ob::hash_weight_tile_for_ctx(ctx, &wh_st, g_ptr, g_row_bytes, th, g_row_bytes, strict_hash);
@@ -6002,17 +5502,9 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
                         static_cast<size_t>(hw_h - th) * K);
           }
           std::vector<float> row_s_u(th, 0.0f);
-          if (desc->up_is_q4_0 != 0u) {
-            ob::requant_q4_0_rows(static_cast<const ob_block_q4_0_t*>(desc->w_up_hk),
-                                  nb_k, h0, th, 0u, nb_k, K, K,
-                                  wu_q.data(), row_s_u.data(),
-                                  &ctx->worker_pool);
-          } else {
-            ob::requant_q8_0_rows(static_cast<const ob_block_q8_0_t*>(desc->w_up_hk),
-                                  nb_k, h0, th, 0u, nb_k, K, K,
-                                  wu_q.data(), row_s_u.data(),
-                                  &ctx->worker_pool);
-          }
+          ob::quant::requant_rows(up_qt, desc->w_up_hk, K, h0, th, 0u, K, K,
+                                  wu_q.data(), row_s_u.data(), nullptr,
+                                  &ctx->worker_pool, nullptr);
 
           //   b) W_down with row_s_u[h] absorbed -> wd_q[N, hw_h] + row_s_d[N]
           std::vector<int8_t> wd_q(static_cast<size_t>(N) * hw_h);
@@ -6026,8 +5518,7 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
               wrow_d = heap_wrow.data();
             }
             for (uint32_t ni = ns; ni < ne; ++ni) {
-              dequant_quant_row_f32(desc->w_down_nh, desc->down_is_q4_0,
-                                    nb_h, ni, h_blk0, h_blk_cnt, wrow_d);
+              ob::quant::dequant_row_slice_f32(down_qt, desc->w_down_nh, H, ni, h0, th, wrow_d);
               float amax_d = 0.0f;
               uint32_t hi = 0u;
 #if defined(__ARM_NEON) && defined(__aarch64__)
@@ -6064,12 +5555,12 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
             pack_wdown_range(0u, N);
           }
 
-          //   c) W_gate Pass 1: exact per-row max directly from Q8_0/Q4_0 blocks (0 B temp buffer!)
+          //   c) W_gate Pass 1: exact per-row max directly from quantized blocks
           std::vector<float> wg_row_max(th, 0.0f);
           auto scan_wgate_max = [&](uint32_t hs, uint32_t he) {
             for (uint32_t hi = hs; hi < he; ++hi) {
-              wg_row_max[hi] = quant_row_max_abs(
-                  desc->w_gate_hk, desc->gate_is_q4_0, nb_k, h0 + hi, 0u, nb_k);
+              wg_row_max[hi] = ob::quant::row_max_abs_f32(
+                  gate_qt, desc->w_gate_hk, K, h0 + hi, 0u, K);
             }
           };
           if (ctx->worker_pool.num_threads > 1u &&
@@ -6126,8 +5617,7 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
                 wrow_g = heap_wrow.data();
               }
               for (uint32_t hi = hs; hi < he; ++hi) {
-                dequant_quant_row_f32(desc->w_gate_hk, desc->gate_is_q4_0,
-                                      nb_k, h0 + hi, 0u, nb_k, wrow_g);
+                ob::quant::dequant_row_slice_f32(gate_qt, desc->w_gate_hk, K, h0 + hi, 0u, K, wrow_g);
                 int8_t* wg_row = wg_q.data() + static_cast<size_t>(hi) * K;
                 ob::quant_sym_i8_row(wrow_g, wg_row, K, inv_swg);
               }
@@ -6145,15 +5635,16 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
           //   d) Record per-stage L2, DC-sum, L1, and Linf weight norms once for runtime divider selection & exact saturation guards!
           float l2_g_max = 0.0f, l2_g_mean = 0.0f, dc_g_max = 0.0f, l1_g_max = 0.0f, linf_g_max = 0.0f;
           float l2_u_max = 0.0f, l2_u_mean = 0.0f, dc_u_max = 0.0f, l1_u_max = 0.0f, linf_u_max = 0.0f;
-          float l2_d_max = 0.0f, l2_d_mean = 0.0f;
+          float l2_d_max = 0.0f, l2_d_mean = 0.0f, dc_d_max = 0.0f;
           ob::compute_matrix_row_l2_stats(wg_q.data(), th, K, K, &l2_g_max, &l2_g_mean, &dc_g_max, &l1_g_max, &linf_g_max);
           ob::compute_matrix_row_l2_stats(wu_q.data(), th, K, K, &l2_u_max, &l2_u_mean, &dc_u_max, &l1_u_max, &linf_u_max);
-          ob::compute_matrix_row_l2_stats(wd_q.data(), N, th, hw_h, &l2_d_max, &l2_d_mean);
+          ob::compute_matrix_row_l2_stats(wd_q.data(), N, th, hw_h, &l2_d_max, &l2_d_mean, &dc_d_max);
 
-          // Reject statistically non-zero-mean gate/up weight tiles where correlated inputs
-          // could saturate intermediate INT8 stages silently despite unsaturated down output.
+          // Reject statistically non-zero-mean gate/up (or skewed Q4_K down) weight tiles so
+          // correlated inputs route cleanly to M7A fallback with exact per-row algebraic centering.
           if ((l2_g_max > 0.0f && dc_g_max > 5.5f * l2_g_max) ||
-              (l2_u_max > 0.0f && dc_u_max > 5.5f * l2_u_max)) {
+              (l2_u_max > 0.0f && dc_u_max > 5.5f * l2_u_max) ||
+              (down_qt == OB_QUANT_Q4_K && l2_d_max > 0.0f && dc_d_max > 5.5f * l2_d_max)) {
             bool sentinel_ok = false;
             if (ob::weight_cache_prepare_space_locked(ctx, 0u, ring_count, drain_one, &sentinel_ok) == OB_OK &&
                 sentinel_ok) {
@@ -6317,7 +5808,7 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
         const float s_gate = s_gate_cand;
         const uint64_t gkey = ob::hash_swiglu_graph_key(
             ms.hw_m, K, hw_h, N, d_gate, d_up, d_mul, d_down,
-            s_gate, slot % param_swap_slots);
+            s_gate, slot % param_swap_slots, ctx->freetile_enabled);
         ob_swiglu_int8_desc_t gd = make_graph_desc(hw_h, d_gate, d_up, d_mul, d_down, s_gate);
 
         const uint64_t ts0 = prof_on ? ob::monotonic_now_ns() : 0u;
@@ -6330,6 +5821,7 @@ ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t* ctx,
           return gst;
         }
         agg_flags |= OB_STAT_FLAG_EMITTER_USED;
+        if (entry && entry->emitted_by_freetile) agg_flags |= OB_STAT_FLAG_FREETILE;
         if (was_hit) total_hits += 1u;
 
         ob_buffer* out_buf = nullptr;

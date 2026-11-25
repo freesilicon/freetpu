@@ -4,15 +4,19 @@
 #include "litebuf_vii_wire.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <dirent.h>
 #include <random>
 #include <string>
 #include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
 #include <unordered_set>
 #include <vector>
@@ -5614,13 +5618,64 @@ void test_freetile_buenos_wire_parity_and_fallback() {
     CHECK((sl.flags & OB_STAT_FLAG_FREETILE) == 0u);
   }
 
-  // 6. Automatic fallback to ob_gemm_emitter on unsupported shape/epilogue (chained SwiGLU +
-  //    unsupported activation code) without erroring out.
+  // 6. 11-chunk chained SwiGLU emits via FreeTile (0 byte diffs, 0 fallbacks) AND
+  //    unsupported activation code still falls back cleanly without erroring out.
   {
     uint64_t emits_before = 0u, fb_before = 0u;
     CHECK(ob_context_freetile_stats(ctx_ft, &emits_before, &fb_before) == OB_OK);
+    CHECK(fb_before == 0u);
 
-    // Unsupported activation code -> FreeTile rejects, falls back to legacy emitter (also rejects).
+    // 6a. 11-chunk chained SwiGLU via FreeTile: 0 byte diffs vs legacy ob::build_swiglu_dgc0,
+    //     increments freetile_emits, keeps freetile_fallbacks == 0, sets OB_STAT_FLAG_FREETILE.
+    constexpr uint32_t M = 1u, K = 576u, H = 512u, N = 576u;
+    std::vector<int8_t> x(M * K, 1);
+    std::vector<int8_t> wg(H * K, 1);
+    std::vector<int8_t> wu(H * K, 1);
+    std::vector<int8_t> wd(N * H, 1);
+    std::vector<int8_t> y_ft(M * N, 0);
+    std::vector<int8_t> y_leg(M * N, 0);
+    ob_swiglu_int8_desc_t sdesc{};
+    sdesc.m_dim = M;
+    sdesc.k_dim = K;
+    sdesc.h_dim = H;
+    sdesc.n_dim = N;
+    sdesc.wg_hk = wg.data();
+    sdesc.wu_hk = wu.data();
+    sdesc.wd_nh = wd.data();
+    sdesc.s_in = 0.037f;
+    sdesc.s_wg = 0.019f;
+    sdesc.s_gate = 0.061f;
+    sdesc.s_wu = 0.023f;
+    sdesc.s_up = 0.071f;
+    sdesc.s_silu = 0.053f;
+    sdesc.s_prod = 0.089f;
+    sdesc.s_wd = 0.017f;
+    sdesc.s_out = 0.043f;
+
+    std::vector<uint8_t> sw_dgc_leg, sw_dgc_ft;
+    std::string sw_err_leg, sw_err_ft;
+    CHECK(ob::build_swiglu_dgc0(sdesc, interp.data(), interp.size(), &sw_dgc_leg, nullptr, &sw_err_leg) == OB_OK);
+    CHECK(ob::freetile_try_emit_swiglu_dgc0(sdesc, interp.data(), interp.size(), &sw_dgc_ft, &sw_err_ft) == OB_OK);
+    CHECK(sw_dgc_ft == sw_dgc_leg);
+
+    ob_invoke_stats_t sw_st1{}, sw_st2{}, sw_leg_st{};
+    CHECK(ob_gemm_swiglu_int8(ctx_ft, x.data(), &sdesc, y_ft.data(), &sw_st1) == OB_OK);
+    CHECK(ob_gemm_swiglu_int8(ctx_ft, x.data(), &sdesc, y_ft.data(), &sw_st2) == OB_OK);
+    CHECK(ob_gemm_swiglu_int8(ctx_leg, x.data(), &sdesc, y_leg.data(), &sw_leg_st) == OB_OK);
+    CHECK(y_ft == y_leg);
+    CHECK((sw_st1.flags & OB_STAT_FLAG_EMITTER_USED) != 0u);
+    CHECK((sw_st1.flags & OB_STAT_FLAG_FREETILE) != 0u);
+    CHECK((sw_st2.flags & OB_STAT_FLAG_FREETILE) != 0u);
+    CHECK((sw_st2.flags & OB_STAT_FLAG_CACHE_HIT) != 0u);
+    CHECK((sw_leg_st.flags & OB_STAT_FLAG_FREETILE) == 0u);
+
+    uint64_t emits_after_sw = 0u, fb_after_sw = 0u;
+    CHECK(ob_context_freetile_stats(ctx_ft, &emits_after_sw, &fb_after_sw) == OB_OK);
+    CHECK(emits_after_sw == emits_before + 1u);
+    CHECK(fb_after_sw == 0u);
+
+    // 6b. Unsupported activation code -> FreeTile rejects, increments freetile_fallbacks,
+    //     falls back to legacy emitter (which also rejects unsupported activation).
     ob_gemm_desc_t bad_act{};
     bad_act.m_dim = 1u;
     bad_act.k_dim = 64u;
@@ -5632,45 +5687,568 @@ void test_freetile_buenos_wire_parity_and_fallback() {
     size_t sz = 0u;
     CHECK(ob::builtin_gemm_emitter_cb(&bad_act, nullptr, 0u, &sz, ctx_ft) == OB_ERR_UNSUPPORTED);
 
-    // 11-chunk chained SwiGLU -> not in freetile::buenos_emitter, falls back seamlessly to ob_gemm_emitter.
-    constexpr uint32_t M = 1u, K = 576u, H = 512u, N = 576u;
-    std::vector<int8_t> x(M * K, 1);
-    std::vector<int8_t> wg(H * K, 1);
-    std::vector<int8_t> wu(H * K, 1);
-    std::vector<int8_t> wd(N * H, 1);
-    std::vector<int8_t> y(M * N, 0);
-    ob_swiglu_int8_desc_t sdesc{};
-    sdesc.m_dim = M;
-    sdesc.k_dim = K;
-    sdesc.h_dim = H;
-    sdesc.n_dim = N;
-    sdesc.wg_hk = wg.data();
-    sdesc.wu_hk = wu.data();
-    sdesc.wd_nh = wd.data();
-    sdesc.s_in = 0.03125f;
-    sdesc.s_wg = 0.015625f;
-    sdesc.s_gate = 0.0625f;
-    sdesc.s_wu = 0.015625f;
-    sdesc.s_up = 0.0625f;
-    sdesc.s_silu = 0.0625f;
-    sdesc.s_prod = 0.0625f;
-    sdesc.s_wd = 0.015625f;
-    sdesc.s_out = 0.0625f;
-    ob_invoke_stats_t sw_st{};
-    CHECK(ob_gemm_swiglu_int8(ctx_ft, x.data(), &sdesc, y.data(), &sw_st) == OB_OK);
-    CHECK((sw_st.flags & OB_STAT_FLAG_EMITTER_USED) != 0u);
-    CHECK((sw_st.flags & OB_STAT_FLAG_FREETILE) == 0u);
-
     uint64_t emits_after = 0u, fb_after = 0u;
     CHECK(ob_context_freetile_stats(ctx_ft, &emits_after, &fb_after) == OB_OK);
-    CHECK(fb_after >= fb_before + 2u);
+    CHECK(emits_after == emits_after_sw);
+    CHECK(fb_after == 1u);
   }
 
   ob_context_destroy(ctx_leg);
   ob_context_destroy(ctx_ft);
 
-  std::printf("[PASS] test_freetile_buenos_wire_parity_and_fallback (%zu W8A8/lt_1x/lt_64x/Mode-A + 6 W8A16 + dyn-weights bit-exact + fallback OK)\n",
+  std::printf("[PASS] test_freetile_buenos_wire_parity_and_fallback (%zu W8A8/lt_1x/lt_64x/Mode-A + 6 W8A16 + dyn-weights + 11-chunk SwiGLU bit-exact + fallback OK)\n",
               w8a8_checked);
+}
+
+// ---------------------------------------------------------------------------
+// Test 25: Roundtable S1 State-Machine Hardening (ob_device.cpp invariants)
+// ---------------------------------------------------------------------------
+void build_test_vii_response(uint8_t out[LITEBUF_VII_RESPONSE_BYTES],
+                             uint16_t resp_type,
+                             uint64_t exec_us = 0u) {
+  std::memset(out, 0, LITEBUF_VII_RESPONSE_BYTES);
+  struct litebuf_header hdr {};
+  hdr.schema_id = LITEBUF_SCHEMA_RUNTIME_MESSAGES;
+  hdr.log2_alignment = LITEBUF_LOG2_ALIGN_16;
+  hdr.root_offset = LITEBUF_HEADER_SIZE;
+  std::memcpy(out, &hdr, sizeof(hdr));
+
+  struct litebuf_vii_response_root root {};
+  root.table_size = 12u;
+  root.union_offset = 16;  // payload at offset 0x20
+  root.union_type = resp_type;
+  std::memcpy(out + LITEBUF_HEADER_SIZE, &root, sizeof(root));
+
+  if (resp_type == LITEBUF_VII_RESP_EXECUTE) {
+    uint16_t m_sz = 12u;
+    uint32_t lo = static_cast<uint32_t>(exec_us & 0xffffffffu);
+    uint32_t hi = static_cast<uint32_t>(exec_us >> 32);
+    std::memcpy(out + 0x20u, &m_sz, 2u);
+    std::memcpy(out + 0x24u, &lo, 4u);
+    std::memcpy(out + 0x28u, &hi, 4u);
+  }
+}
+
+void test_roundtable_s1_state_machine_hardening() {
+  std::vector<uint8_t> fc = make_synthetic_gemm_dgc0(1u, 16u, 16u, 0x5Au);
+  CHECK(!fc.empty());
+
+  // 1. Mock abandoned 1-credit reclaim: submit -> abandon(B) -> submit must succeed
+  //    without explicit wait, releasing B's attached reference exactly once.
+  {
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    cfg.max_inflight = 1u;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+    CHECK(ob_context_credit_size(ctx) == 1u);
+
+    ob_graph_t* g = nullptr;
+    CHECK(ob_graph_register_dgc0(ctx, fc.data(), fc.size(), 0x5101ULL, &g) == OB_OK);
+    ob_buffer_t* in_buf = nullptr;
+    ob_buffer_t* out_buf = nullptr;
+    ob_buffer_t* retired_b = nullptr;
+    CHECK(ob_buffer_alloc(ctx, 16u, OB_BUF_TO_DEVICE | OB_BUF_ZERO_INIT, &in_buf) == OB_OK);
+    CHECK(ob_buffer_alloc(ctx, 16u, OB_BUF_FROM_DEVICE | OB_BUF_ZERO_INIT, &out_buf) == OB_OK);
+    CHECK(ob_buffer_alloc(ctx, 16u, OB_BUF_BIDIRECTIONAL | OB_BUF_ZERO_INIT, &retired_b) == OB_OK);
+
+    ob_exec_handle_t h1 = 0, h_busy = 0, h2 = 0;
+    CHECK(ob_graph_submit_async(g, &in_buf, 1u, &out_buf, 1u, &h1) == OB_OK);
+    CHECK(ob_graph_submit_async(g, &in_buf, 1u, &out_buf, 1u, &h_busy) == OB_ERR_BUSY);
+
+    CHECK(ob::device_attach_inflight_buffers(ctx, h1, {retired_b}));
+    CHECK(ctx->credits[0].state == ob::CreditSlot::IN_FLIGHT);
+    CHECK(ctx->credits[0].abandoned);
+    CHECK(retired_b->refcnt.load(std::memory_order_acquire) == 2u);
+
+    // Drop caller reference: slot still holds the sole remaining reference.
+    size_t pbytes0 = 0, pcount0 = 0;
+    uint64_t ph0 = 0, pm0 = 0;
+    ob_buffer_free(retired_b);
+    CHECK(ob_context_buffer_pool_stats(ctx, &pbytes0, &pcount0, &ph0, &pm0) == OB_OK);
+    CHECK(pcount0 == 0u);
+
+    // Next submit on 1-credit mock context reclaims abandoned slot and releases retired_b once.
+    CHECK(ob_graph_submit_async(g, &in_buf, 1u, &out_buf, 1u, &h2) == OB_OK);
+    CHECK(h2 != 0u && h2 != h1);
+    size_t pbytes1 = 0, pcount1 = 0;
+    CHECK(ob_context_buffer_pool_stats(ctx, &pbytes1, &pcount1, &ph0, &pm0) == OB_OK);
+    CHECK(pcount1 == 1u);
+
+    CHECK(ob_graph_wait(ctx, h2, 1000u, nullptr) == OB_OK);
+    CHECK(ctx->inflight_count == 0u);
+    ob_graph_release(g);
+    ob_buffer_free(out_buf);
+    ob_buffer_free(in_buf);
+    ob_context_destroy(ctx);
+  }
+
+  // 2. device_try_wait_handle clears slot->abandoned and releases retired_bufs outside vii_mu.
+  {
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    cfg.max_inflight = 1u;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+
+    ob_graph_t* g = nullptr;
+    CHECK(ob_graph_register_dgc0(ctx, fc.data(), fc.size(), 0x5102ULL, &g) == OB_OK);
+    ob_buffer_t* in_buf = nullptr;
+    ob_buffer_t* out_buf = nullptr;
+    ob_buffer_t* b_ret = nullptr;
+    CHECK(ob_buffer_alloc(ctx, 16u, OB_BUF_TO_DEVICE | OB_BUF_ZERO_INIT, &in_buf) == OB_OK);
+    CHECK(ob_buffer_alloc(ctx, 16u, OB_BUF_FROM_DEVICE | OB_BUF_ZERO_INIT, &out_buf) == OB_OK);
+    CHECK(ob_buffer_alloc(ctx, 16u, OB_BUF_BIDIRECTIONAL | OB_BUF_ZERO_INIT, &b_ret) == OB_OK);
+
+    ob_exec_handle_t h1 = 0;
+    CHECK(ob_graph_submit_async(g, &in_buf, 1u, &out_buf, 1u, &h1) == OB_OK);
+    CHECK(ob::device_attach_inflight_buffers(ctx, h1, {b_ret}));
+    CHECK(b_ret->refcnt.load(std::memory_order_acquire) == 2u);
+    CHECK(ctx->credits[0].abandoned);
+    CHECK(ctx->credits[0].retired_bufs.size() == 1u);
+
+    ob_status_t tst = OB_ERR_IOCTL;
+    ob_invoke_stats_t tstats{};
+    CHECK(ob::device_try_wait_handle(ctx, h1, &tst, &tstats));
+    CHECK(tst == OB_OK);
+    CHECK(ctx->credits[0].state == ob::CreditSlot::FREE);
+    CHECK(!ctx->credits[0].abandoned);
+    CHECK(ctx->credits[0].retired_bufs.empty());
+    CHECK(b_ret->refcnt.load(std::memory_order_acquire) == 1u);
+
+    ob_buffer_free(b_ret);
+    ob_graph_release(g);
+    ob_buffer_free(out_buf);
+    ob_buffer_free(in_buf);
+    ob_context_destroy(ctx);
+  }
+
+  // 3. device_wait_all: single overall deadline on stalled IN_FLIGHT handles, fatal ioctl
+  //    non-spin, DMA ownership preserved, and concurrent harvest NOT_FOUND is not an error.
+  {
+    struct StalledTransport {
+      uint64_t now_ns = 1000000ULL;
+      int pop_mode = 0;  // 0=empty(ENOENT), 1=fatal(EIO), 2=deliver queued
+      std::deque<uint64_t> ready_seqs;
+      uint32_t poll_calls = 0;
+      uint32_t wait_all_hooks = 0;
+      bool harvest_concurrently = false;
+    } st;
+
+    ob::DeviceTestHooks hooks{};
+    hooks.user_data = &st;
+    hooks.now_ns = [](void* ud) -> uint64_t {
+      return static_cast<StalledTransport*>(ud)->now_ns;
+    };
+    hooks.submit_cmd = [](ob_context*, const void*, size_t, uint64_t, int*, void*) -> int {
+      return 0;
+    };
+    hooks.pop_resp = [](ob_context*, uint8_t resp_buf[LITEBUF_VII_RESPONSE_BYTES],
+                        uint64_t* out_seq, uint16_t* out_code, int* out_errno,
+                        void* ud) -> int {
+      auto* s = static_cast<StalledTransport*>(ud);
+      if (s->pop_mode == 1) {
+        *out_errno = EIO;
+        return -1;
+      }
+      if (s->pop_mode == 2 && !s->ready_seqs.empty()) {
+        *out_seq = s->ready_seqs.front();
+        s->ready_seqs.pop_front();
+        *out_code = 0u;
+        build_test_vii_response(resp_buf, LITEBUF_VII_RESP_EXECUTE, 120u);
+        return 0;
+      }
+      *out_errno = ENOENT;
+      return -1;
+    };
+    hooks.poll_fds = [](ob_context*, int timeout_ms, bool* out_resp, bool* out_err,
+                        int*, void* ud) -> int {
+      auto* s = static_cast<StalledTransport*>(ud);
+      s->poll_calls += 1u;
+      s->now_ns += static_cast<uint64_t>(timeout_ms) * 1000000ULL;
+      *out_resp = false;
+      *out_err = false;
+      return 0;
+    };
+
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    cfg.max_inflight = 2u;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+
+    ob_graph_t* g = nullptr;
+    CHECK(ob_graph_register_dgc0(ctx, fc.data(), fc.size(), 0x5103ULL, &g) == OB_OK);
+    ob_buffer_t* in_buf = nullptr;
+    ob_buffer_t* out_buf = nullptr;
+    ob_buffer_t* b_dma = nullptr;
+    CHECK(ob_buffer_alloc(ctx, 16u, OB_BUF_TO_DEVICE | OB_BUF_ZERO_INIT, &in_buf) == OB_OK);
+    CHECK(ob_buffer_alloc(ctx, 16u, OB_BUF_FROM_DEVICE | OB_BUF_ZERO_INIT, &out_buf) == OB_OK);
+    CHECK(ob_buffer_alloc(ctx, 16u, OB_BUF_BIDIRECTIONAL | OB_BUF_ZERO_INIT, &b_dma) == OB_OK);
+
+    ctx->test_hooks = &hooks;
+    ob_exec_handle_t h1 = 0, h2 = 0;
+    CHECK(ob_graph_submit_async(g, &in_buf, 1u, &out_buf, 1u, &h1) == OB_OK);
+    CHECK(ob_graph_submit_async(g, &in_buf, 1u, &out_buf, 1u, &h2) == OB_OK);
+    const uint32_t seq1 = ctx->credits[0].seq;
+    const uint32_t seq2 = ctx->credits[1].seq;
+    CHECK(ob::device_attach_inflight_buffers(ctx, h1, {b_dma}));
+    CHECK(b_dma->refcnt.load(std::memory_order_acquire) == 2u);
+
+    // 3a. Stalled handles: wait_all(10ms) terminates within ONE overall 10ms deadline,
+    //     not 20ms or infinite, while keeping both slots IN_FLIGHT and b_dma retained.
+    const uint64_t t0 = st.now_ns;
+    CHECK(ob::device_wait_all(ctx, 10u) == OB_ERR_TIMEOUT);
+    CHECK(st.now_ns - t0 == 10000000ULL);
+    CHECK(st.poll_calls == 1u);
+    CHECK(ctx->credits[0].state == ob::CreditSlot::IN_FLIGHT);
+    CHECK(ctx->credits[1].state == ob::CreditSlot::IN_FLIGHT);
+    CHECK(b_dma->refcnt.load(std::memory_order_acquire) == 2u);
+
+    // 3b. Fatal response ioctl error: wait_all terminates immediately with OB_ERR_IOCTL.
+    st.pop_mode = 1;
+    const uint32_t polls_before_fatal = st.poll_calls;
+    CHECK(ob::device_wait_all(ctx, 50u) == OB_ERR_IOCTL);
+    CHECK(st.poll_calls == polls_before_fatal);
+    CHECK(ctx->credits[0].state == ob::CreditSlot::IN_FLIGHT);
+    CHECK(ctx->credits[1].state == ob::CreditSlot::IN_FLIGHT);
+    CHECK(b_dma->refcnt.load(std::memory_order_acquire) == 2u);
+
+    // 3c. Deliver completions and verify wait_all reaps both and balances b_dma refcnt.
+    st.pop_mode = 2;
+    st.ready_seqs.push_back(seq1);
+    st.ready_seqs.push_back(seq2);
+    CHECK(ob::device_wait_all(ctx, 50u) == OB_OK);
+    CHECK(ctx->inflight_count == 0u);
+    CHECK(b_dma->refcnt.load(std::memory_order_acquire) == 1u);
+
+    // 3d. Concurrent harvest race: another waiter harvests h before wait_all waits on it.
+    ctx->test_hooks = nullptr;
+    ob_exec_handle_t h3 = 0;
+    CHECK(ob_graph_submit_async(g, &in_buf, 1u, &out_buf, 1u, &h3) == OB_OK);
+    ob::DeviceTestHooks conc_hooks{};
+    conc_hooks.user_data = &st;
+    conc_hooks.on_wait_all_before_wait = [](ob_context* c, ob_exec_handle_t h, void* ud) {
+      auto* s = static_cast<StalledTransport*>(ud);
+      s->wait_all_hooks += 1u;
+      if (s->harvest_concurrently) {
+        s->harvest_concurrently = false;
+        ob_status_t wst = ob_graph_wait(c, h, 1000u, nullptr);
+        if (wst != OB_OK) s->wait_all_hooks += 100u;
+      }
+    };
+    st.harvest_concurrently = true;
+    ctx->test_hooks = &conc_hooks;
+    CHECK(ob::device_wait_all(ctx, 1000u) == OB_OK);
+    CHECK(st.wait_all_hooks == 1u);
+    ctx->test_hooks = nullptr;
+
+    ob_buffer_free(b_dma);
+    ob_graph_release(g);
+    ob_buffer_free(out_buf);
+    ob_buffer_free(in_buf);
+    ob_context_destroy(ctx);
+  }
+
+  // 4. device_submit_control: EAGAIN retries bounded by deadline_ns and release vii_mu.
+  {
+    struct EagainTransport {
+      uint64_t now_ns = 5000000ULL;
+      uint32_t submit_calls = 0;
+      uint32_t poll_calls = 0;
+    } et;
+
+    ob::DeviceTestHooks hooks{};
+    hooks.user_data = &et;
+    hooks.now_ns = [](void* ud) -> uint64_t {
+      return static_cast<EagainTransport*>(ud)->now_ns;
+    };
+    hooks.submit_cmd = [](ob_context*, const void*, size_t, uint64_t, int* out_errno,
+                          void* ud) -> int {
+      static_cast<EagainTransport*>(ud)->submit_calls += 1u;
+      *out_errno = EAGAIN;
+      return -1;
+    };
+    hooks.pop_resp = [](ob_context*, uint8_t[LITEBUF_VII_RESPONSE_BYTES],
+                        uint64_t*, uint16_t*, int* out_errno, void*) -> int {
+      *out_errno = ENOENT;
+      return -1;
+    };
+    hooks.poll_fds = [](ob_context*, int timeout_ms, bool* out_resp, bool* out_err,
+                        int*, void* ud) -> int {
+      auto* e = static_cast<EagainTransport*>(ud);
+      e->poll_calls += 1u;
+      e->now_ns += static_cast<uint64_t>(timeout_ms) * 1000000ULL;
+      *out_resp = false;
+      *out_err = false;
+      return 0;
+    };
+
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+    ctx->test_hooks = &hooks;
+
+    uint8_t outer_wl[64]{};
+    size_t wl_len = litebuf_build_vii_wakelock(outer_wl, sizeof(outer_wl), 1, 0x19u, 0x15u, 0x04u);
+    CHECK(wl_len > 0u);
+    const uint64_t t0 = et.now_ns;
+    ob_status_t st = ob::device_submit_control(ctx, outer_wl, wl_len, nullptr, nullptr, 15u);
+    CHECK(st == OB_ERR_BUSY || st == OB_ERR_TIMEOUT);
+    CHECK(et.now_ns - t0 == 15000000ULL);
+    CHECK(et.submit_calls >= 1u && et.poll_calls >= 1u);
+    // vii_mu must be released on return
+    CHECK(ctx->vii_mu.try_lock());
+    ctx->vii_mu.unlock();
+
+    ctx->test_hooks = nullptr;
+    ob_context_destroy(ctx);
+  }
+
+  // 5. EINTR response probe retries without requiring a second poll wakeup, AND
+  //    poll_eventfds_locked never returns OB_ERR_TIMEOUT while now_ns < deadline_ns.
+  {
+    struct ProbeTransport {
+      uint64_t now_ns = 100000ULL;  // 0.1 ms offset for fractional-ms remainder test
+      uint32_t pop_step = 0;
+      uint32_t poll_calls = 0;
+      uint64_t target_seq = 0;
+      bool eintr_script = true;
+      uint64_t poll_advances[3] = {1000000ULL, 500000ULL, 600000ULL};
+    } pt;
+
+    ob::DeviceTestHooks hooks{};
+    hooks.user_data = &pt;
+    hooks.now_ns = [](void* ud) -> uint64_t {
+      return static_cast<ProbeTransport*>(ud)->now_ns;
+    };
+    hooks.submit_cmd = [](ob_context*, const void*, size_t, uint64_t seq, int*,
+                          void* ud) -> int {
+      static_cast<ProbeTransport*>(ud)->target_seq = seq;
+      return 0;
+    };
+    hooks.pop_resp = [](ob_context*, uint8_t resp_buf[LITEBUF_VII_RESPONSE_BYTES],
+                        uint64_t* out_seq, uint16_t* out_code, int* out_errno,
+                        void* ud) -> int {
+      auto* p = static_cast<ProbeTransport*>(ud);
+      if (p->eintr_script) {
+        const uint32_t step = p->pop_step++;
+        if (step == 0u) {
+          *out_errno = ENOENT;  // Initial probe before poll
+          return -1;
+        }
+        if (step == 1u) {
+          *out_errno = EINTR;   // Interrupted after poll cleared resp_efd
+          return -1;
+        }
+        *out_seq = p->target_seq;
+        *out_code = 0u;
+        build_test_vii_response(resp_buf, LITEBUF_VII_RESP_EXECUTE, 77u);
+        return 0;
+      }
+      *out_errno = ENOENT;
+      return -1;
+    };
+    hooks.poll_fds = [](ob_context*, int timeout_ms, bool* out_resp, bool* out_err,
+                        int*, void* ud) -> int {
+      auto* p = static_cast<ProbeTransport*>(ud);
+      const uint32_t idx = p->poll_calls++;
+      if (p->eintr_script) {
+        *out_resp = true;
+        *out_err = false;
+        return 1;
+      }
+      // Verify ceiling rounding: rem_ms must be >= ceil((deadline - now)/1ms)
+      (void)timeout_ms;
+      p->now_ns += (idx < 3u) ? p->poll_advances[idx] : 1000000ULL;
+      *out_resp = false;
+      *out_err = false;
+      return 0;
+    };
+
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+    ob_graph_t* g = nullptr;
+    CHECK(ob_graph_register_dgc0(ctx, fc.data(), fc.size(), 0x5105ULL, &g) == OB_OK);
+    ob_buffer_t* in_buf = nullptr;
+    ob_buffer_t* out_buf = nullptr;
+    CHECK(ob_buffer_alloc(ctx, 16u, OB_BUF_TO_DEVICE | OB_BUF_ZERO_INIT, &in_buf) == OB_OK);
+    CHECK(ob_buffer_alloc(ctx, 16u, OB_BUF_FROM_DEVICE | OB_BUF_ZERO_INIT, &out_buf) == OB_OK);
+
+    ctx->test_hooks = &hooks;
+
+    // 5a. EINTR after poll consumes response on retry with poll_calls == 1
+    ob_exec_handle_t h1 = 0;
+    CHECK(ob_graph_submit_async(g, &in_buf, 1u, &out_buf, 1u, &h1) == OB_OK);
+    ob_invoke_stats_t s1{};
+    CHECK(ob_graph_wait(ctx, h1, 10u, &s1) == OB_OK);
+    CHECK(pt.poll_calls == 1u);
+    CHECK(s1.hw_execution_us == 77u);
+
+    // 5b. Fractional-ms deadline guard: timeout=2ms from 100,000 ns -> deadline = 2,100,000 ns.
+    //     Poll returns 0 at 1,100,000 ns and 1,600,000 ns (< deadline) -> must NOT timeout early;
+    //     only returns OB_ERR_TIMEOUT at 2,200,000 ns (>= deadline, poll_calls == 3).
+    pt.eintr_script = false;
+    pt.poll_calls = 0;
+    pt.now_ns = 100000ULL;
+    const uint64_t expected_deadline = pt.now_ns + 2000000ULL;
+    ob_exec_handle_t h2 = 0;
+    CHECK(ob_graph_submit_async(g, &in_buf, 1u, &out_buf, 1u, &h2) == OB_OK);
+    CHECK(ob_graph_wait(ctx, h2, 2u, nullptr) == OB_ERR_TIMEOUT);
+    CHECK(pt.now_ns >= expected_deadline);
+    CHECK(pt.poll_calls == 3u);
+
+    // 5c. Sequence wraparound collision guard: while h2 is still IN_FLIGHT with seq S,
+    //     setting next_seq = S must allocate a different sequence number for h3.
+    const uint32_t s_inflight = ctx->credits[0].seq;
+    ctx->next_seq = s_inflight;
+    ob_exec_handle_t h3 = 0;
+    CHECK(ob_graph_submit_async(g, &in_buf, 1u, &out_buf, 1u, &h3) == OB_OK);
+    CHECK(ctx->credits[1].seq != s_inflight);
+
+    ctx->test_hooks = nullptr;
+    CHECK(ob_graph_wait_all(ctx, 1000u) == OB_OK);
+    ob_graph_release(g);
+    ob_buffer_free(out_buf);
+    ob_buffer_free(in_buf);
+    ob_context_destroy(ctx);
+  }
+
+  // 6. Wakelock serialization & failed-release preservation:
+  //    (a) Failed release ioctl does NOT clear fw_wakelock_held / tuple.
+  //    (b) Interleaved & multi-threaded perf_mode setters always converge to
+  //        held == (enabled && perf_mode >= 1) and matching tuple.
+  {
+    struct WakelockTransport {
+      std::atomic<bool> fail_release{false};
+      std::atomic<bool> inject_mode0_before_acquire{false};
+      std::atomic<uint32_t> acquire_rpcs{0u};
+      std::atomic<uint32_t> release_rpcs{0u};
+      std::mutex q_mu;
+      std::deque<uint64_t> pending_seqs;
+    } wt;
+
+    ob::DeviceTestHooks hooks{};
+    hooks.user_data = &wt;
+    hooks.submit_cmd = [](ob_context*, const void* buf, size_t len, uint64_t seq,
+                          int* out_errno, void* ud) -> int {
+      auto* w = static_cast<WakelockTransport*>(ud);
+      uint16_t cmd_type = 0u;
+      if (len >= LITEBUF_HEADER_SIZE + sizeof(struct litebuf_vii_command_root)) {
+        struct litebuf_vii_command_root root {};
+        std::memcpy(&root, static_cast<const uint8_t*>(buf) + LITEBUF_HEADER_SIZE, sizeof(root));
+        cmd_type = root.union_type;
+      }
+      if (cmd_type == LITEBUF_VII_CMD_RELEASE_WAKELOCK) {
+        w->release_rpcs.fetch_add(1u, std::memory_order_relaxed);
+        if (w->fail_release.load(std::memory_order_acquire)) {
+          *out_errno = EIO;
+          return -1;
+        }
+      } else if (cmd_type == LITEBUF_VII_CMD_ACQUIRE_WAKELOCK) {
+        w->acquire_rpcs.fetch_add(1u, std::memory_order_relaxed);
+      }
+      std::lock_guard<std::mutex> qlk(w->q_mu);
+      w->pending_seqs.push_back(seq);
+      return 0;
+    };
+    hooks.pop_resp = [](ob_context*, uint8_t resp_buf[LITEBUF_VII_RESPONSE_BYTES],
+                        uint64_t* out_seq, uint16_t* out_code, int* out_errno,
+                        void* ud) -> int {
+      auto* w = static_cast<WakelockTransport*>(ud);
+      std::lock_guard<std::mutex> qlk(w->q_mu);
+      if (w->pending_seqs.empty()) {
+        *out_errno = ENOENT;
+        return -1;
+      }
+      *out_seq = w->pending_seqs.front();
+      w->pending_seqs.pop_front();
+      *out_code = 0u;
+      build_test_vii_response(resp_buf, LITEBUF_VII_RESP_VOID_OK);
+      return 0;
+    };
+    hooks.poll_fds = [](ob_context*, int, bool* out_resp, bool* out_err, int*, void*) -> int {
+      *out_resp = true;
+      *out_err = false;
+      return 1;
+    };
+    hooks.on_wakelock_before_rpc = [](ob_context* c, bool acquire, void* ud) {
+      auto* w = static_cast<WakelockTransport*>(ud);
+      if (acquire && w->inject_mode0_before_acquire.exchange(false, std::memory_order_acq_rel)) {
+        // Simulate Thread B setting perf_mode=0 under vii_mu while Thread A is about
+        // to submit its stale acquire RPC!
+        std::lock_guard<std::mutex> vlk(c->vii_mu);
+        c->cfg.perf_mode = 0u;
+        c->cfg.core_power_state = 0x03u;
+        c->cfg.mem_power_state = 0x01u;
+      }
+    };
+
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+    CHECK(ctx->fw_wakelock_held);
+    const uint8_t orig_core = ctx->fw_wakelock_core;
+    const uint8_t orig_mem = ctx->fw_wakelock_mem;
+    const uint8_t orig_bitset = ctx->fw_wakelock_bitset;
+
+    ctx->test_hooks = &hooks;
+
+    // 6a. Reject release ioctl -> wakelock MUST stay recorded as held with original tuple!
+    wt.fail_release.store(true, std::memory_order_release);
+    CHECK(ob_context_set_perf_mode(ctx, 0u) == OB_OK);
+    CHECK(ctx->fw_wakelock_held);
+    CHECK(ctx->fw_wakelock_core == orig_core);
+    CHECK(ctx->fw_wakelock_mem == orig_mem);
+    CHECK(ctx->fw_wakelock_bitset == orig_bitset);
+
+    // Once firmware accepts release, retrying sync releases it cleanly.
+    wt.fail_release.store(false, std::memory_order_release);
+    ob::device_sync_fw_wakelock(ctx);
+    CHECK(!ctx->fw_wakelock_held);
+    CHECK(ctx->fw_wakelock_core == 0u && ctx->fw_wakelock_mem == 0u && ctx->fw_wakelock_bitset == 0u);
+
+    // 6b. Deterministic interleaving: mode 0 arrives right before mode 1 acquire submits.
+    //     Convergence loop must detect cfg.perf_mode == 0 after acquire and release immediately.
+    wt.inject_mode0_before_acquire.store(true, std::memory_order_release);
+    CHECK(ob_context_set_perf_mode(ctx, 1u) == OB_OK);
+    CHECK(ctx->cfg.perf_mode == 0u);
+    CHECK(!ctx->fw_wakelock_held);
+
+    // 6c. Multi-threaded race across perf_mode 0..5: at quiescence, held state & tuple MUST match cfg.
+    std::thread t_a([ctx]() {
+      for (int i = 0; i < 60; ++i) {
+        ob_context_set_perf_mode(ctx, static_cast<uint32_t>((i & 1) ? 1u : 5u));
+      }
+    });
+    std::thread t_b([ctx]() {
+      for (int i = 0; i < 60; ++i) {
+        ob_context_set_perf_mode(ctx, static_cast<uint32_t>((i & 1) ? 0u : 2u));
+      }
+    });
+    t_a.join();
+    t_b.join();
+
+    const bool expected_held = ctx->fw_wakelock_enabled && (ctx->cfg.perf_mode >= 1u);
+    CHECK(ctx->fw_wakelock_held == expected_held);
+    if (expected_held) {
+      const uint8_t cl =
+          (ctx->cfg.cluster_id != 0u) ? ctx->cfg.cluster_id : LITEBUF_DEFAULT_CLUSTER_ID;
+      const uint8_t expected_bitset = static_cast<uint8_t>(1u << (cl & 7u));
+      CHECK(ctx->fw_wakelock_core == ctx->cfg.core_power_state);
+      CHECK(ctx->fw_wakelock_mem == ctx->cfg.mem_power_state);
+      CHECK(ctx->fw_wakelock_bitset == expected_bitset);
+    }
+
+    ctx->test_hooks = nullptr;
+    ob_context_destroy(ctx);
+  }
+
+  std::printf("[PASS] test_roundtable_s1_state_machine_hardening (1-credit mock reclaim, try_wait retired_bufs, wait_all timeout/fatal/concurrent-harvest, EAGAIN bound, EINTR+frac-ms poll, seq wrap, wakelock concurrency)\n");
 }
 
 }  // namespace
@@ -5725,9 +6303,10 @@ int main() {
   test_phase8b_spsc_async_dequant_and_w8a16_pt();
   test_dive_interp_xdg_probe();
   test_freetile_buenos_wire_parity_and_fallback();
+  test_roundtable_s1_state_machine_hardening();
 
   if (g_failures == 0) {
-    std::printf("ALL LIBOPENBUENOS HOST TESTS PASSED (24/24 suites)\n");
+    std::printf("ALL LIBOPENBUENOS HOST TESTS PASSED (25/25 suites)\n");
     return 0;
   }
   std::fprintf(stderr, "LIBOPENBUENOS HOST TESTS FAILED (%d failures)\n", g_failures);

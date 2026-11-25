@@ -541,17 +541,18 @@ bool plan_quant_matmul_kernel(ChipTarget target,
 
     std::vector<int64_t> bn_cands = {2048, 1024, 512, 256, 128, 64};
     std::vector<int64_t> bk_cands = {2048, 1024, 512, 256, 128};
-    if (fmt == QuantFormat::NONE) {
-        // On Mosaic TPU targets, split-K activation windows must be lane-aligned (divisible by 128),
-        // while a whole-K window (bk == k) is valid for any sublane-aligned K that fits VMEM.
-        if (k >= min_bk && (k % min_bk) == 0 && (k % prof.lane_align) != 0) {
-            bk_cands.push_back(k);
-        }
-        if (!prof.supports_mosaic) {
-            bk_cands.push_back(64);
-            bk_cands.push_back(32);
-            bk_cands.push_back(16);
-            bk_cands.push_back(8);
+    // Whole-K (bk == k) avoids double-buffering and split-K accumulator scratch overhead,
+    // so always include k as a candidate when valid (even when k % prof.lane_align == 0,
+    // e.g. K=384 or K=1536 under tight VMEM budgets).
+    if (k >= min_bk && (k % min_bk) == 0 && (k % blk) == 0 &&
+        std::find(bk_cands.begin(), bk_cands.end(), k) == bk_cands.end()) {
+        bk_cands.push_back(k);
+    }
+    if (fmt == QuantFormat::NONE && !prof.supports_mosaic) {
+        for (int64_t small_bk : {int64_t{64}, int64_t{32}, int64_t{16}, int64_t{8}}) {
+            if (std::find(bk_cands.begin(), bk_cands.end(), small_bk) == bk_cands.end()) {
+                bk_cands.push_back(small_bk);
+            }
         }
     }
     int64_t override_bm = m_pad;

@@ -238,6 +238,39 @@ struct CreditSlot {
 // Device & VII mailbox helpers (implemented in ob_device.cpp)
 ob_status_t device_open(ob_context* ctx);
 void        device_close(ob_context* ctx);
+void        device_sync_fw_wakelock(ob_context* ctx);
+void        device_release_fw_wakelock(ob_context* ctx);
+
+// Optional offline transport & clock hooks for deterministic state-machine unit tests.
+// Always nullptr in production (zero overhead).
+struct DeviceTestHooks {
+  void* user_data = nullptr;
+  uint64_t (*now_ns)(void* user_data) = nullptr;
+  int (*submit_cmd)(ob_context* ctx,
+                    const void* outer_buf,
+                    size_t outer_len,
+                    uint64_t seq,
+                    int* out_errno,
+                    void* user_data) = nullptr;
+  int (*pop_resp)(ob_context* ctx,
+                  uint8_t resp_buf[LITEBUF_VII_RESPONSE_BYTES],
+                  uint64_t* out_seq,
+                  uint16_t* out_code,
+                  int* out_errno,
+                  void* user_data) = nullptr;
+  int (*poll_fds)(ob_context* ctx,
+                  int timeout_ms,
+                  bool* out_resp_ready,
+                  bool* out_err_ready,
+                  int* out_errno,
+                  void* user_data) = nullptr;
+  void (*on_wait_all_before_wait)(ob_context* ctx,
+                                  ob_exec_handle_t handle,
+                                  void* user_data) = nullptr;
+  void (*on_wakelock_before_rpc)(ob_context* ctx,
+                                 bool acquire,
+                                 void* user_data) = nullptr;
+};
 
 ob_status_t device_submit_control(ob_context* ctx,
                                   const void* outer_buf,
@@ -609,6 +642,19 @@ ob_status_t freetile_try_emit_w8a16_dgc0(uint32_t K,
                                          size_t dive_interp_size,
                                          std::vector<uint8_t>* out_dgc0,
                                          std::string* err);
+ob_status_t freetile_try_emit_w8a16_64x_dgc0(uint32_t K,
+                                             uint32_t N,
+                                             float pt_scale,
+                                             const int8_t* weights_nk,
+                                             const uint8_t* dive_interp,
+                                             size_t dive_interp_size,
+                                             std::vector<uint8_t>* out_dgc0,
+                                             std::string* err);
+ob_status_t freetile_try_emit_swiglu_dgc0(const ob_swiglu_int8_desc_t& desc,
+                                          const uint8_t* dive_interp,
+                                          size_t dive_interp_size,
+                                          std::vector<uint8_t>* out_dgc0,
+                                          std::string* err);
 ob_status_t freetile_try_emit_dyn_weights_dgc0(const ob_gemm_desc_t& desc,
                                                const uint8_t* dive_interp,
                                                size_t dive_interp_size,
@@ -652,12 +698,15 @@ struct ob_context {
   int err_efd = -1;
   bool wake_locked = false;
   // Firmware VII Execute +0x1c fw_priority & Litebuf AcquireWakeLock (union_type=4) state
+  // Lock order: wakelock_mu -> vii_mu -> err_mu (never acquire wakelock_mu under vii_mu).
+  std::mutex wakelock_mu;
   uint8_t fw_priority = 0x01u;
   bool fw_wakelock_enabled = true;
   bool fw_wakelock_held = false;
   uint8_t fw_wakelock_core = 0u;
   uint8_t fw_wakelock_mem = 0u;
   uint8_t fw_wakelock_bitset = 0u;
+  const ob::DeviceTestHooks* test_hooks = nullptr;
   // Cached runtime env knobs (read once on ob_context_create to eliminate hot-path getenv scans)
   bool profile_enabled = false;
   bool verbose_enabled = false;

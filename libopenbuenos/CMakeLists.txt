@@ -24,6 +24,7 @@ set(OPENBUENOS_SOURCES
   src/ob_device.cpp
   src/ob_graph.cpp
   src/ob_freetile_bridge.cpp
+  src/ob_quant_unpack.cpp
   src/ob_gemm_emitter.cpp
   src/ob_gemm.cpp
 )
@@ -126,6 +127,17 @@ if (OPENBUENOS_BUILD_TESTS)
     enable_testing()
     add_test(NAME openbuenos_host_test COMMAND openbuenos_host_test)
     add_test(NAME tpu_soc_probe_mock COMMAND tpu_soc_probe --mock)
+
+    add_executable(ob_quant_unpack_test tests/ob_quant_unpack_test.cpp)
+    target_link_libraries(ob_quant_unpack_test PRIVATE openbuenos)
+    target_include_directories(ob_quant_unpack_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${OPENBUENOS_ROOT}/docs/baremetal-vii
+      ${OPENBUENOS_ROOT}/docs/kernel-abi
+    )
+    target_compile_features(ob_quant_unpack_test PRIVATE cxx_std_17)
+    target_compile_options(ob_quant_unpack_test PRIVATE ${OPENBUENOS_COMPILE_FLAGS})
+    add_test(NAME ob_quant_unpack_test COMMAND ob_quant_unpack_test)
   endif()
 endif()
 
