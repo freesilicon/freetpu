@@ -27,6 +27,7 @@ SRCS := \
 	$(THIS_DIR)/src/ob_device.cpp \
 	$(THIS_DIR)/src/ob_graph.cpp \
 	$(THIS_DIR)/src/ob_freetile_bridge.cpp \
+	$(THIS_DIR)/src/ob_quant_unpack.cpp \
 	$(THIS_DIR)/src/ob_gemm_emitter.cpp \
 	$(THIS_DIR)/src/ob_gemm.cpp
 
@@ -37,6 +38,7 @@ FREETILE_SRCS := \
 HDRS := \
 	$(THIS_DIR)/include/openbuenos.h \
 	$(THIS_DIR)/src/ob_internal.h \
+	$(THIS_DIR)/src/ob_quant_unpack.hpp \
 	$(ROOT)/freetile/include/freetile/tile_ir.hpp \
 	$(ROOT)/freetile/include/freetile/buenos_emitter.hpp \
 	$(ROOT)/docs/baremetal-vii/litebuf_vii_wire.h \
@@ -52,6 +54,7 @@ ANDROID_OBJS := $(patsubst $(THIS_DIR)/src/%.cpp,$(ANDROID_DIR)/obj/%.o,$(SRCS))
 
 HOST_LIB     := $(HOST_DIR)/libopenbuenos.a
 HOST_TEST    := $(HOST_DIR)/openbuenos_host_test
+QUANT_TEST   := $(HOST_DIR)/ob_quant_unpack_test
 ANDROID_LIB  := $(ANDROID_DIR)/libopenbuenos.a
 ANDROID_TEST := $(ANDROID_DIR)/openbuenos_selftest
 
@@ -59,7 +62,7 @@ ANDROID_TEST := $(ANDROID_DIR)/openbuenos_selftest
 
 all: host android
 
-host: $(HOST_LIB) $(HOST_TEST)
+host: $(HOST_LIB) $(HOST_TEST) $(QUANT_TEST)
 
 android: $(ANDROID_LIB) $(ANDROID_TEST)
 
@@ -79,6 +82,10 @@ $(HOST_TEST): $(THIS_DIR)/tests/openbuenos_host_test.cpp $(HOST_LIB) $(HDRS)
 	@mkdir -p $(dir $@)
 	$(HOST_CXX) $(HOST_CXXFLAGS) $< $(HOST_LIB) -o $@ $(HOST_LDFLAGS)
 
+$(QUANT_TEST): $(THIS_DIR)/tests/ob_quant_unpack_test.cpp $(HOST_LIB) $(HDRS)
+	@mkdir -p $(dir $@)
+	$(HOST_CXX) $(HOST_CXXFLAGS) $< $(HOST_LIB) -o $@ $(HOST_LDFLAGS)
+
 $(ANDROID_DIR)/obj/%.o: $(THIS_DIR)/src/%.cpp $(HDRS)
 	@mkdir -p $(dir $@)
 	$(ANDROID_CXX) $(ANDROID_CXXFLAGS) -c $< -o $@
@@ -95,8 +102,9 @@ $(ANDROID_TEST): $(THIS_DIR)/tests/openbuenos_selftest.cpp $(ANDROID_LIB) $(HDRS
 	@mkdir -p $(dir $@)
 	$(ANDROID_CXX) $(ANDROID_CXXFLAGS) $< $(ANDROID_LIB) -o $@ $(ANDROID_LDFLAGS)
 
-test: $(HOST_TEST)
+test: $(HOST_TEST) $(QUANT_TEST)
 	$(HOST_TEST)
+	$(QUANT_TEST)
 
 verify-header-host: $(THIS_DIR)/include/openbuenos.h
 	$(HOST_CC) -x c -std=c11 -fsyntax-only -Wall -Wextra -Werror $<
