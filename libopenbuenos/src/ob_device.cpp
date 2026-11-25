@@ -2,9 +2,11 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 #if defined(__linux__)
 #include <fcntl.h>
@@ -55,20 +57,112 @@ void destroy_credit_slots(ob_context* ctx) {
   ctx->inflight_count = 0;
 }
 
+uint64_t device_now_ns(const ob_context* ctx) {
+  if (ctx && ctx->test_hooks && ctx->test_hooks->now_ns) {
+    return ctx->test_hooks->now_ns(ctx->test_hooks->user_data);
+  }
+  return monotonic_now_ns();
+}
+
+uint64_t add_ns_saturated(uint64_t base_ns, uint64_t delta_ns) {
+  constexpr uint64_t kMaxU64 = std::numeric_limits<uint64_t>::max();
+  return (delta_ns > kMaxU64 - base_ns) ? kMaxU64 : (base_ns + delta_ns);
+}
+
+bool has_transport_hooks(const ob_context* ctx) {
+  return ctx && ctx->test_hooks &&
+         (ctx->test_hooks->submit_cmd != nullptr ||
+          ctx->test_hooks->pop_resp != nullptr ||
+          ctx->test_hooks->poll_fds != nullptr);
+}
+
+bool use_transport_path(const ob_context* ctx) {
+  return ctx && (!ctx->mock_mode || has_transport_hooks(ctx));
+}
+
 uint32_t alloc_seq_locked(ob_context* ctx) {
   // buenos.ko requires seq >> 32 == 0 (32-bit sequence number).
-  uint32_t s = ctx->next_seq;
+  // Skip any sequence number still held by an IN_FLIGHT slot across 31-bit wrap.
+  for (uint32_t attempt = 0u; attempt <= ctx->credit_size; ++attempt) {
+    const uint32_t s = ctx->next_seq;
+    ctx->next_seq = (ctx->next_seq + 1u) & 0x7fffffffu;
+    bool in_use = false;
+    for (uint32_t i = 0u; i < ctx->credit_size; ++i) {
+      if (ctx->credits[i].state == CreditSlot::IN_FLIGHT && ctx->credits[i].seq == s) {
+        in_use = true;
+        break;
+      }
+    }
+    if (!in_use) return s;
+  }
+  const uint32_t s = ctx->next_seq;
   ctx->next_seq = (ctx->next_seq + 1u) & 0x7fffffffu;
   return s;
 }
 
+int device_ioctl_submit_cmd_locked(ob_context* ctx,
+                                   const void* outer_buf,
+                                   size_t outer_len,
+                                   uint32_t seq,
+                                   int* out_errno) {
+  if (ctx->test_hooks && ctx->test_hooks->submit_cmd) {
+    return ctx->test_hooks->submit_cmd(
+        ctx, outer_buf, outer_len, static_cast<uint64_t>(seq), out_errno,
+        ctx->test_hooks->user_data);
+  }
 #if defined(__linux__)
+  struct edgetpu_vii_litebuf_command_ioctl cmd {};
+  cmd.litebuf_address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(outer_buf));
+  cmd.litebuf_size = static_cast<__u32>(outer_len);
+  cmd.seq = static_cast<uint64_t>(seq);
+  if (::ioctl(ctx->tpu_fd, EDGETPU_VII_LITEBUF_COMMAND, &cmd) == 0) {
+    return 0;
+  }
+  if (out_errno) *out_errno = errno;
+  return -1;
+#else
+  (void)outer_buf;
+  (void)outer_len;
+  (void)seq;
+  if (out_errno) *out_errno = ENOSYS;
+  return -1;
+#endif
+}
+
+int device_ioctl_pop_resp_locked(ob_context* ctx,
+                                 uint8_t resp_buf[LITEBUF_VII_RESPONSE_BYTES],
+                                 uint64_t* out_seq,
+                                 uint16_t* out_code,
+                                 int* out_errno) {
+  if (ctx->test_hooks && ctx->test_hooks->pop_resp) {
+    return ctx->test_hooks->pop_resp(
+        ctx, resp_buf, out_seq, out_code, out_errno, ctx->test_hooks->user_data);
+  }
+#if defined(__linux__)
+  struct edgetpu_vii_litebuf_response_ioctl r {};
+  r.litebuf_address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(resp_buf));
+  if (::ioctl(ctx->tpu_fd, EDGETPU_VII_LITEBUF_RESPONSE, &r) == 0) {
+    if (out_seq) *out_seq = r.seq;
+    if (out_code) *out_code = r.code;
+    return 0;
+  }
+  if (out_errno) *out_errno = errno;
+  return -1;
+#else
+  (void)resp_buf;
+  (void)out_seq;
+  (void)out_code;
+  if (out_errno) *out_errno = ENOSYS;
+  return -1;
+#endif
+}
+
 // Pop one VII response from kernel and either deliver to `target_seq` or stash in
 // the matching in-flight CreditSlot (handles out-of-order completions safely).
 // Returns:
 //   1  = matched target_seq (written to target_resp / target_code)
 //   0  = popped and stashed another slot's response (caller should keep draining)
-//  -1  = queue empty (ENOENT / EAGAIN / EINTR)
+//  -1  = queue empty (ENOENT / EAGAIN)
 //  -2  = fatal ioctl error (out_err populated)
 int pop_and_demux_one_locked(ob_context* ctx,
                              bool has_target,
@@ -77,12 +171,18 @@ int pop_and_demux_one_locked(ob_context* ctx,
                              uint16_t* target_code,
                              std::string* out_err) {
   uint8_t resp_buf[LITEBUF_VII_RESPONSE_BYTES]{};
-  struct edgetpu_vii_litebuf_response_ioctl r {};
-  r.litebuf_address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(resp_buf));
+  uint64_t r_seq = 0;
+  uint16_t r_code = 0;
 
-  if (::ioctl(ctx->tpu_fd, EDGETPU_VII_LITEBUF_RESPONSE, &r) != 0) {
-    int e = errno;
-    if (e == ENOENT || e == EAGAIN || e == EINTR) return -1;
+  while (true) {
+    int e = 0;
+    if (device_ioctl_pop_resp_locked(ctx, resp_buf, &r_seq, &r_code, &e) == 0) {
+      break;
+    }
+    if (e == EINTR) {
+      continue;  // Retry interrupted response probe instead of reporting empty queue
+    }
+    if (e == ENOENT || e == EAGAIN) return -1;
     if (out_err) {
       *out_err = "EDGETPU_VII_LITEBUF_RESPONSE failed errno=" + std::to_string(e);
     }
@@ -91,11 +191,11 @@ int pop_and_demux_one_locked(ob_context* ctx,
 
   struct litebuf_vii_parsed_response parsed =
       litebuf_parse_vii_response(resp_buf, sizeof(resp_buf));
-  uint64_t now_ns = monotonic_now_ns();
+  uint64_t now_ns = device_now_ns(ctx);
 
-  if (has_target && r.seq == static_cast<uint64_t>(target_seq)) {
+  if (has_target && r_seq == static_cast<uint64_t>(target_seq)) {
     if (target_resp) *target_resp = parsed;
-    if (target_code) *target_code = r.code;
+    if (target_code) *target_code = r_code;
     return 1;
   }
 
@@ -103,13 +203,13 @@ int pop_and_demux_one_locked(ob_context* ctx,
   for (uint32_t i = 0; i < ctx->credit_size; ++i) {
     CreditSlot& slot = ctx->credits[i];
     if (slot.state == CreditSlot::IN_FLIGHT &&
-        static_cast<uint64_t>(slot.seq) == r.seq) {
+        static_cast<uint64_t>(slot.seq) == r_seq) {
       slot.complete_time_ns = now_ns;
-      slot.vii_resp_code = r.code;
-      if (r.code != 0) {
+      slot.vii_resp_code = r_code;
+      if (r_code != 0) {
         slot.state = CreditSlot::FAILED;
         slot.error_status = OB_ERR_FW_ERROR;
-        slot.error_msg = "Firmware returned non-zero VII code=" + std::to_string(r.code);
+        slot.error_msg = "Firmware returned non-zero VII code=" + std::to_string(r_code);
       } else if (!parsed.valid) {
         slot.state = CreditSlot::FAILED;
         slot.error_status = OB_ERR_FW_ERROR;
@@ -135,40 +235,128 @@ int pop_and_demux_one_locked(ob_context* ctx,
 
 ob_status_t poll_eventfds_locked(ob_context* ctx, uint64_t deadline_ns,
                                  std::string* err) {
-  uint64_t now_ns = monotonic_now_ns();
+  uint64_t now_ns = device_now_ns(ctx);
   if (now_ns >= deadline_ns) {
     if (err) *err = "Timed out waiting for VII response";
     return OB_ERR_TIMEOUT;
   }
-  int rem_ms = static_cast<int>((deadline_ns - now_ns) / 1000000ULL);
-  if (rem_ms < 1) rem_ms = 1;
+  const uint64_t rem_ns = deadline_ns - now_ns;
+  constexpr uint64_t kMaxU64 = std::numeric_limits<uint64_t>::max();
+  uint64_t rem_ms_u64 = (rem_ns > kMaxU64 - 999999ULL)
+                            ? (kMaxU64 / 1000000ULL)
+                            : ((rem_ns + 999999ULL) / 1000000ULL);
+  if (rem_ms_u64 < 1ULL) rem_ms_u64 = 1ULL;
+  if (rem_ms_u64 > static_cast<uint64_t>(INT_MAX)) {
+    rem_ms_u64 = static_cast<uint64_t>(INT_MAX);
+  }
+  const int rem_ms = static_cast<int>(rem_ms_u64);
 
-  struct pollfd pfds[2] = {{ctx->resp_efd, POLLIN, 0}, {ctx->err_efd, POLLIN, 0}};
-  int prc = ::poll(pfds, 2, rem_ms);
+  int prc = 0;
+  int poll_errno = 0;
+  bool resp_ready = false;
+  bool err_ready = false;
+
+  if (ctx->test_hooks && ctx->test_hooks->poll_fds) {
+    prc = ctx->test_hooks->poll_fds(
+        ctx, rem_ms, &resp_ready, &err_ready, &poll_errno, ctx->test_hooks->user_data);
+  } else {
+#if defined(__linux__)
+    struct pollfd pfds[2] = {{ctx->resp_efd, POLLIN, 0}, {ctx->err_efd, POLLIN, 0}};
+    prc = ::poll(pfds, 2, rem_ms);
+    if (prc < 0) {
+      poll_errno = errno;
+    } else if (prc > 0) {
+      if (pfds[1].revents & POLLIN) {
+        uint64_t val = 0;
+        if (::read(ctx->err_efd, &val, sizeof(val)) > 0) {
+          err_ready = true;
+        }
+      }
+      if (pfds[0].revents & POLLIN) {
+        uint64_t val = 0;
+        ssize_t unused = ::read(ctx->resp_efd, &val, sizeof(val));
+        (void)unused;
+        resp_ready = true;
+      }
+    }
+#else
+    if (err) *err = "Hardware poll requires Linux/Android";
+    return OB_ERR_UNSUPPORTED;
+#endif
+  }
+
   if (prc < 0) {
-    if (errno == EINTR) return OB_OK;
-    if (err) *err = "poll(resp_efd) failed errno=" + std::to_string(errno);
+    if (poll_errno == EINTR) return OB_OK;
+    if (err) *err = "poll(resp_efd) failed errno=" + std::to_string(poll_errno);
     return OB_ERR_IOCTL;
   }
   if (prc == 0) {
-    if (err) *err = "poll(resp_efd) timed out";
-    return OB_ERR_TIMEOUT;
-  }
-  if (pfds[1].revents & POLLIN) {
-    uint64_t val = 0;
-    if (::read(ctx->err_efd, &val, sizeof(val)) > 0) {
-      if (err) *err = "EdgeTPU fatal error eventfd signaled";
-      return OB_ERR_DEVICE;
+    if (device_now_ns(ctx) >= deadline_ns) {
+      if (err) *err = "poll(resp_efd) timed out";
+      return OB_ERR_TIMEOUT;
     }
+    return OB_OK;  // Clock has not reached deadline_ns yet; caller re-probes & continues
   }
-  if (pfds[0].revents & POLLIN) {
-    uint64_t val = 0;
-    ssize_t unused = ::read(ctx->resp_efd, &val, sizeof(val));
-    (void)unused;
+  if (err_ready) {
+    if (err) *err = "EdgeTPU fatal error eventfd signaled";
+    return OB_ERR_DEVICE;
   }
+  (void)resp_ready;
   return OB_OK;
 }
-#endif
+
+ob_status_t device_release_fw_wakelock_locked(ob_context* ctx, uint32_t timeout_ms) {
+  if (!ctx || !ctx->fw_wakelock_held) return OB_OK;
+  uint8_t outer_wl[64]{};
+  size_t wl_len = litebuf_build_vii_wakelock(
+      outer_wl, sizeof(outer_wl), 0,
+      ctx->fw_wakelock_core, ctx->fw_wakelock_mem, ctx->fw_wakelock_bitset);
+  if (wl_len == 0u) return OB_ERR_OVERFLOW;
+  if (ctx->test_hooks && ctx->test_hooks->on_wakelock_before_rpc) {
+    ctx->test_hooks->on_wakelock_before_rpc(ctx, false, ctx->test_hooks->user_data);
+  }
+  struct litebuf_vii_parsed_response resp {};
+  uint16_t code = 0;
+  ob_status_t st = device_submit_control(ctx, outer_wl, wl_len, &resp, &code, timeout_ms);
+  if (st == OB_OK) {
+    ctx->fw_wakelock_held = false;
+    ctx->fw_wakelock_core = 0u;
+    ctx->fw_wakelock_mem = 0u;
+    ctx->fw_wakelock_bitset = 0u;
+  }
+  return st;
+}
+
+void collect_reapable_abandoned_slots_locked(ob_context* ctx,
+                                             bool allow_mock_inflight,
+                                             std::vector<CachedGraph*>* reaped_entries,
+                                             std::vector<ob_buffer*>* reaped_bufs) {
+  for (uint32_t i = 0; i < ctx->credit_size; ++i) {
+    CreditSlot& s = ctx->credits[i];
+    const bool ready =
+        (s.state == CreditSlot::COMPLETED || s.state == CreditSlot::FAILED ||
+         (allow_mock_inflight && s.state == CreditSlot::IN_FLIGHT));
+    if (s.abandoned && ready) {
+      if (s.graph_entry) reaped_entries->push_back(s.graph_entry);
+      for (ob_buffer* rb : s.retired_bufs) {
+        if (rb) reaped_bufs->push_back(rb);
+      }
+      s.retired_bufs.clear();
+      s.state = CreditSlot::FREE;
+      s.abandoned = false;
+      s.handle = 0;
+      s.seq = 0;
+      s.graph_entry = nullptr;
+      s.error_msg.clear();
+      if (ctx->inflight_count > 0u) ctx->inflight_count -= 1u;
+    }
+  }
+}
+
+ob_status_t device_wait_handle_until(ob_context* ctx,
+                                     ob_exec_handle_t handle,
+                                     uint64_t deadline_ns,
+                                     ob_invoke_stats_t* out_stats);
 
 }  // namespace
 
@@ -270,56 +458,77 @@ ob_status_t device_open(ob_context* ctx) {
 }
 
 void device_release_fw_wakelock(ob_context* ctx) {
-  if (!ctx || !ctx->fw_wakelock_held) return;
-  uint8_t outer_wl[64]{};
-  size_t wl_len = litebuf_build_vii_wakelock(
-      outer_wl, sizeof(outer_wl), 0,
-      ctx->fw_wakelock_core, ctx->fw_wakelock_mem, ctx->fw_wakelock_bitset);
-  if (wl_len > 0u) {
-    struct litebuf_vii_parsed_response resp {};
-    uint16_t code = 0;
-    device_submit_control(ctx, outer_wl, wl_len, &resp, &code, ctx->cfg.timeout_ms);
+  if (!ctx) return;
+  std::lock_guard<std::mutex> wlk(ctx->wakelock_mu);
+  uint32_t timeout_ms = 0u;
+  {
+    std::lock_guard<std::mutex> vlk(ctx->vii_mu);
+    timeout_ms = ctx->cfg.timeout_ms;
   }
-  ctx->fw_wakelock_held = false;
-  ctx->fw_wakelock_core = 0u;
-  ctx->fw_wakelock_mem = 0u;
-  ctx->fw_wakelock_bitset = 0u;
+  (void)device_release_fw_wakelock_locked(ctx, timeout_ms);
 }
 
 void device_sync_fw_wakelock(ob_context* ctx) {
   if (!ctx) return;
-  const bool want_wl = ctx->fw_wakelock_enabled && (ctx->cfg.perf_mode >= 1u);
-  const uint8_t cl =
-      (ctx->cfg.cluster_id != 0u) ? ctx->cfg.cluster_id : LITEBUF_DEFAULT_CLUSTER_ID;
-  const uint8_t bitset = static_cast<uint8_t>(1u << (cl & 7u));
-  const uint8_t core_ps = ctx->cfg.core_power_state;
-  const uint8_t mem_ps = ctx->cfg.mem_power_state;
+  std::lock_guard<std::mutex> wlk(ctx->wakelock_mu);
+  for (int iter = 0; iter < 64; ++iter) {
+    bool want_wl = false;
+    uint8_t bitset = 0u;
+    uint8_t core_ps = 0u;
+    uint8_t mem_ps = 0u;
+    uint32_t timeout_ms = 0u;
+    {
+      std::lock_guard<std::mutex> vlk(ctx->vii_mu);
+      want_wl = ctx->fw_wakelock_enabled && (ctx->cfg.perf_mode >= 1u);
+      const uint8_t cl =
+          (ctx->cfg.cluster_id != 0u) ? ctx->cfg.cluster_id : LITEBUF_DEFAULT_CLUSTER_ID;
+      bitset = static_cast<uint8_t>(1u << (cl & 7u));
+      core_ps = ctx->cfg.core_power_state;
+      mem_ps = ctx->cfg.mem_power_state;
+      timeout_ms = ctx->cfg.timeout_ms;
+    }
 
-  if (ctx->fw_wakelock_held && want_wl &&
-      ctx->fw_wakelock_core == core_ps &&
-      ctx->fw_wakelock_mem == mem_ps &&
-      ctx->fw_wakelock_bitset == bitset) {
-    return;
-  }
-  if (ctx->fw_wakelock_held) {
-    device_release_fw_wakelock(ctx);
-  }
-  if (!want_wl) return;
+    if (!want_wl) {
+      if (!ctx->fw_wakelock_held) return;
+      if (device_release_fw_wakelock_locked(ctx, timeout_ms) != OB_OK) {
+        return;  // Keep held state intact when firmware release fails
+      }
+      continue;
+    }
 
-  uint8_t outer_wl[64]{};
-  size_t wl_len = litebuf_build_vii_wakelock(
-      outer_wl, sizeof(outer_wl), 1, core_ps, mem_ps, bitset);
-  if (wl_len == 0u) return;
+    if (ctx->fw_wakelock_held &&
+        ctx->fw_wakelock_core == core_ps &&
+        ctx->fw_wakelock_mem == mem_ps &&
+        ctx->fw_wakelock_bitset == bitset) {
+      return;
+    }
 
-  struct litebuf_vii_parsed_response resp {};
-  uint16_t code = 0;
-  ob_status_t st = device_submit_control(
-      ctx, outer_wl, wl_len, &resp, &code, ctx->cfg.timeout_ms);
-  if (st == OB_OK) {
+    if (ctx->fw_wakelock_held) {
+      if (device_release_fw_wakelock_locked(ctx, timeout_ms) != OB_OK) {
+        return;  // Keep existing held tuple intact if release fails
+      }
+    }
+
+    uint8_t outer_wl[64]{};
+    size_t wl_len = litebuf_build_vii_wakelock(
+        outer_wl, sizeof(outer_wl), 1, core_ps, mem_ps, bitset);
+    if (wl_len == 0u) return;
+
+    if (ctx->test_hooks && ctx->test_hooks->on_wakelock_before_rpc) {
+      ctx->test_hooks->on_wakelock_before_rpc(ctx, true, ctx->test_hooks->user_data);
+    }
+
+    struct litebuf_vii_parsed_response resp {};
+    uint16_t code = 0;
+    ob_status_t st = device_submit_control(
+        ctx, outer_wl, wl_len, &resp, &code, timeout_ms);
+    if (st != OB_OK) return;
+
     ctx->fw_wakelock_held = true;
     ctx->fw_wakelock_core = core_ps;
     ctx->fw_wakelock_mem = mem_ps;
     ctx->fw_wakelock_bitset = bitset;
+    // Re-read desired config under vii_mu in case another setter updated cfg during RPC.
   }
 }
 
@@ -368,7 +577,7 @@ ob_status_t device_submit_control(ob_context* ctx,
   std::lock_guard<std::mutex> lk(ctx->vii_mu);
   const uint32_t seq = alloc_seq_locked(ctx);
 
-  if (ctx->mock_mode) {
+  if (!use_transport_path(ctx)) {
     // Validate outer Litebuf header & command root structurally
     const uint8_t* p = static_cast<const uint8_t*>(outer_buf);
     struct litebuf_header hdr {};
@@ -398,22 +607,66 @@ ob_status_t device_submit_control(ob_context* ctx,
     return OB_OK;
   }
 
-#if defined(__linux__)
-  struct edgetpu_vii_litebuf_command_ioctl cmd {};
-  cmd.litebuf_address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(outer_buf));
-  cmd.litebuf_size = static_cast<__u32>(outer_len);
-  cmd.seq = static_cast<uint64_t>(seq);
+#if !defined(__linux__)
+  if (!has_transport_hooks(ctx)) {
+    (void)timeout_ms;
+    return OB_ERR_UNSUPPORTED;
+  }
+#endif
+
+  const uint32_t wait_ms = (timeout_ms > 0u) ? timeout_ms : ctx->cfg.timeout_ms;
+  const uint64_t deadline_ns =
+      add_ns_saturated(device_now_ns(ctx), static_cast<uint64_t>(wait_ms) * 1000000ULL);
 
   while (true) {
-    if (::ioctl(ctx->tpu_fd, EDGETPU_VII_LITEBUF_COMMAND, &cmd) == 0) break;
-    if (errno == EINTR || errno == EAGAIN) continue;
+    int ioctl_errno = 0;
+    if (device_ioctl_submit_cmd_locked(ctx, outer_buf, outer_len, seq, &ioctl_errno) == 0) {
+      break;
+    }
+    if (ioctl_errno == EINTR) {
+      if (device_now_ns(ctx) >= deadline_ns) {
+        set_last_error(ctx, "EDGETPU_VII_LITEBUF_COMMAND(seq=" + std::to_string(seq) +
+                                ") timed out on EINTR");
+        return OB_ERR_TIMEOUT;
+      }
+      continue;
+    }
+    if (ioctl_errno == EAGAIN) {
+      // Opportunistically drain queued responses so mailbox backpressure can clear.
+      std::string drain_err;
+      int drc = pop_and_demux_one_locked(ctx, false, 0u, nullptr, nullptr, &drain_err);
+      if (drc == -2) {
+        set_last_error(ctx, drain_err);
+        return OB_ERR_IOCTL;
+      }
+      const uint64_t now_ns = device_now_ns(ctx);
+      if (now_ns >= deadline_ns) {
+        set_last_error(ctx, "EDGETPU_VII_LITEBUF_COMMAND(seq=" + std::to_string(seq) +
+                                ") timed out on EAGAIN (queue full)");
+        return OB_ERR_BUSY;
+      }
+      if (drc == 0) {
+        continue;
+      }
+      const uint64_t slice_deadline_ns =
+          std::min<uint64_t>(deadline_ns, add_ns_saturated(now_ns, 1000000ULL));
+      std::string perr;
+      ob_status_t pst = poll_eventfds_locked(ctx, slice_deadline_ns, &perr);
+      if (pst == OB_ERR_IOCTL || pst == OB_ERR_DEVICE || pst == OB_ERR_UNSUPPORTED) {
+        set_last_error(ctx, perr);
+        return pst;
+      }
+      if (device_now_ns(ctx) >= deadline_ns) {
+        set_last_error(ctx, "EDGETPU_VII_LITEBUF_COMMAND(seq=" + std::to_string(seq) +
+                                ") timed out on EAGAIN (queue full)");
+        return OB_ERR_BUSY;
+      }
+      continue;
+    }
     set_last_error(ctx, "EDGETPU_VII_LITEBUF_COMMAND(seq=" + std::to_string(seq) +
-                            ") failed errno=" + std::to_string(errno));
+                            ") failed errno=" + std::to_string(ioctl_errno));
     return OB_ERR_IOCTL;
   }
-
-  uint32_t wait_ms = (timeout_ms > 0) ? timeout_ms : ctx->cfg.timeout_ms;
-  uint64_t deadline_ns = monotonic_now_ns() + static_cast<uint64_t>(wait_ms) * 1000000ULL;
 
   while (true) {
     struct litebuf_vii_parsed_response parsed {};
@@ -453,10 +706,6 @@ ob_status_t device_submit_control(ob_context* ctx,
       return pst;
     }
   }
-#else
-  (void)timeout_ms;
-  return OB_ERR_UNSUPPORTED;
-#endif
 }
 
 ob_status_t device_submit_execute_async(ob_context* ctx,
@@ -518,12 +767,12 @@ ob_status_t device_submit_execute_async(ob_context* ctx,
     return OB_ERR_OVERFLOW;
   }
 
+  const bool use_transport = use_transport_path(ctx);
   std::vector<CachedGraph*> reaped_entries;
   std::vector<ob_buffer*> reaped_bufs;
   {
     std::lock_guard<std::mutex> lk(ctx->vii_mu);
-#if defined(__linux__)
-    if (!ctx->mock_mode) {
+    if (use_transport) {
       bool has_abandoned = false;
       for (uint32_t i = 0; i < ctx->credit_size; ++i) {
         if (ctx->credits[i].state == CreditSlot::IN_FLIGHT && ctx->credits[i].abandoned) {
@@ -536,25 +785,7 @@ ob_status_t device_submit_execute_async(ob_context* ctx,
         if (pop_and_demux_one_locked(ctx, false, 0u, nullptr, nullptr, &rerr) != 0) break;
       }
     }
-#endif
-    for (uint32_t i = 0; i < ctx->credit_size; ++i) {
-      CreditSlot& s = ctx->credits[i];
-      if (s.abandoned &&
-          (s.state == CreditSlot::COMPLETED || s.state == CreditSlot::FAILED)) {
-        if (s.graph_entry) reaped_entries.push_back(s.graph_entry);
-        for (ob_buffer* rb : s.retired_bufs) {
-          if (rb) reaped_bufs.push_back(rb);
-        }
-        s.retired_bufs.clear();
-        s.state = CreditSlot::FREE;
-        s.abandoned = false;
-        s.handle = 0;
-        s.seq = 0;
-        s.graph_entry = nullptr;
-        s.error_msg.clear();
-        if (ctx->inflight_count > 0u) ctx->inflight_count -= 1u;
-      }
-    }
+    collect_reapable_abandoned_slots_locked(ctx, !use_transport, &reaped_entries, &reaped_bufs);
   }
   if (!reaped_entries.empty()) {
     std::lock_guard<std::mutex> clk(ctx->cache_mu);
@@ -606,29 +837,28 @@ ob_status_t device_submit_execute_async(ob_context* ctx,
   }
 
   const uint32_t seq = alloc_seq_locked(ctx);
-  const uint64_t now_ns = monotonic_now_ns();
+  const uint64_t now_ns = device_now_ns(ctx);
 
-  if (!ctx->mock_mode) {
-#if defined(__linux__)
-    struct edgetpu_vii_litebuf_command_ioctl cmd {};
-    cmd.litebuf_address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(outer_exec));
-    cmd.litebuf_size = static_cast<__u32>(outer_exec_len);
-    cmd.seq = static_cast<uint64_t>(seq);
-
+  if (use_transport) {
+#if !defined(__linux__)
+    if (!has_transport_hooks(ctx)) {
+      return OB_ERR_UNSUPPORTED;
+    }
+#endif
     while (true) {
-      if (::ioctl(ctx->tpu_fd, EDGETPU_VII_LITEBUF_COMMAND, &cmd) == 0) break;
-      if (errno == EINTR) continue;
-      if (errno == EAGAIN) {
+      int ioctl_errno = 0;
+      if (device_ioctl_submit_cmd_locked(ctx, outer_exec, outer_exec_len, seq, &ioctl_errno) == 0) {
+        break;
+      }
+      if (ioctl_errno == EINTR) continue;
+      if (ioctl_errno == EAGAIN) {
         set_last_error(ctx, "EDGETPU_VII_LITEBUF_COMMAND returned EAGAIN (queue full)");
         return OB_ERR_BUSY;
       }
       set_last_error(ctx, "EDGETPU_VII_LITEBUF_COMMAND(seq=" + std::to_string(seq) +
-                              ") failed errno=" + std::to_string(errno));
+                              ") failed errno=" + std::to_string(ioctl_errno));
       return OB_ERR_IOCTL;
     }
-#else
-    return OB_ERR_UNSUPPORTED;
-#endif
   }
 
   const ob_exec_handle_t handle = ctx->next_exec_handle++;
@@ -649,12 +879,15 @@ ob_status_t device_submit_execute_async(ob_context* ctx,
   return OB_OK;
 }
 
-ob_status_t device_wait_handle(ob_context* ctx,
-                               ob_exec_handle_t handle,
-                               uint32_t timeout_ms,
-                               ob_invoke_stats_t* out_stats) {
+namespace {
+
+ob_status_t device_wait_handle_until(ob_context* ctx,
+                                     ob_exec_handle_t handle,
+                                     uint64_t deadline_ns,
+                                     ob_invoke_stats_t* out_stats) {
   if (!ctx || handle == 0u) return OB_ERR_INVALID_ARG;
 
+  const bool use_transport = use_transport_path(ctx);
   CachedGraph* completed_entry = nullptr;
   std::vector<CachedGraph*> reaped_entries;
   std::vector<ob_buffer*> retired_to_free;
@@ -676,27 +909,32 @@ ob_status_t device_wait_handle(ob_context* ctx,
       return OB_ERR_NOT_FOUND;
     }
 
-    if (ctx->mock_mode) {
-      slot->complete_time_ns = monotonic_now_ns();
+    if (!use_transport) {
+      slot->complete_time_ns = device_now_ns(ctx);
       slot->state = CreditSlot::COMPLETED;
       slot->vii_resp_code = 0;
       slot->error_status = OB_OK;
     } else {
-#if defined(__linux__)
-      uint32_t wait_ms = (timeout_ms > 0) ? timeout_ms : ctx->cfg.timeout_ms;
-      const uint64_t wait_start_ns = monotonic_now_ns();
-      const uint64_t deadline_ns =
-          wait_start_ns + static_cast<uint64_t>(wait_ms) * 1000000ULL;
+#if !defined(__linux__)
+      if (!has_transport_hooks(ctx)) {
+        (void)deadline_ns;
+        return OB_ERR_UNSUPPORTED;
+      }
+#endif
+      const uint64_t wait_start_ns = device_now_ns(ctx);
 
       // Adaptive bounded user-space spin before poll(resp_efd):
       // eliminates 150-350 us kernel wake/schedule jitter when TPU finishes in 40-400 us
       // (covers both SmolLM2 ~266 us and Qwen2.5 SwiGLU ~215-350 us chunks),
-      // while sleeping in poll() immediately for long ops (ema_hw_us >= 600 us) or spin_us == 0.
-      const bool allow_spin = (ctx->spin_us > 0u) &&
+      // while sleeping in poll() immediately for long ops (ema_hw_us >= 600 us),
+      // spin_us == 0, or deterministic fake-clock tests.
+      const bool fake_clock = (ctx->test_hooks && ctx->test_hooks->now_ns != nullptr);
+      const bool allow_spin = !fake_clock && (ctx->spin_us > 0u) &&
                               (ctx->ema_hw_us == 0u || ctx->ema_hw_us < 600u);
       const uint64_t spin_deadline_ns = allow_spin
           ? std::min<uint64_t>(deadline_ns,
-                               wait_start_ns + static_cast<uint64_t>(ctx->spin_us) * 1000ULL)
+                               add_ns_saturated(wait_start_ns,
+                                                static_cast<uint64_t>(ctx->spin_us) * 1000ULL))
           : 0u;
       bool used_poll = false;
       uint32_t spin_iters = 0u;
@@ -714,13 +952,14 @@ ob_status_t device_wait_handle(ob_context* ctx,
         if (slot->state != CreditSlot::IN_FLIGHT) break;
 
         if (allow_spin && !used_poll) {
-          uint64_t now_ns = monotonic_now_ns();
+          uint64_t now_ns = device_now_ns(ctx);
           if (now_ns < spin_deadline_ns) {
             ++spin_iters;
             // Pace non-blocking ioctl probes every ~4 us to avoid kernel lock contention
             // with the IRQ handler while catching completion within <= 4 us.
-            const uint64_t next_probe_ns = std::min<uint64_t>(spin_deadline_ns, now_ns + 4000ULL);
-            while (monotonic_now_ns() < next_probe_ns) {
+            const uint64_t next_probe_ns =
+                std::min<uint64_t>(spin_deadline_ns, add_ns_saturated(now_ns, 4000ULL));
+            while (device_now_ns(ctx) < next_probe_ns) {
 #if defined(__aarch64__)
               asm volatile("yield" ::: "memory");
 #elif defined(__x86_64__)
@@ -749,10 +988,6 @@ ob_status_t device_wait_handle(ob_context* ctx,
           ctx->ema_hw_us = (ctx->ema_hw_us * 3u + slot->hw_execution_us) >> 2u;
         }
       }
-#else
-      (void)timeout_ms;
-      return OB_ERR_UNSUPPORTED;
-#endif
     }
 
     // Harvest slot & release credit
@@ -783,24 +1018,7 @@ ob_status_t device_wait_handle(ob_context* ctx,
     slot->retired_bufs.clear();
     if (ctx->inflight_count > 0u) ctx->inflight_count -= 1u;
 
-    for (uint32_t i = 0; i < ctx->credit_size; ++i) {
-      CreditSlot& s = ctx->credits[i];
-      if (s.abandoned &&
-          (s.state == CreditSlot::COMPLETED || s.state == CreditSlot::FAILED)) {
-        if (s.graph_entry) reaped_entries.push_back(s.graph_entry);
-        for (ob_buffer* rb : s.retired_bufs) {
-          if (rb) retired_to_free.push_back(rb);
-        }
-        s.retired_bufs.clear();
-        s.state = CreditSlot::FREE;
-        s.abandoned = false;
-        s.handle = 0;
-        s.seq = 0;
-        s.graph_entry = nullptr;
-        s.error_msg.clear();
-        if (ctx->inflight_count > 0u) ctx->inflight_count -= 1u;
-      }
-    }
+    collect_reapable_abandoned_slots_locked(ctx, !use_transport, &reaped_entries, &retired_to_free);
   }
 
   // Release graph refs outside vii_mu to respect cache_mu -> vii_mu lock order
@@ -819,6 +1037,19 @@ ob_status_t device_wait_handle(ob_context* ctx,
   return result;
 }
 
+}  // namespace
+
+ob_status_t device_wait_handle(ob_context* ctx,
+                               ob_exec_handle_t handle,
+                               uint32_t timeout_ms,
+                               ob_invoke_stats_t* out_stats) {
+  if (!ctx || handle == 0u) return OB_ERR_INVALID_ARG;
+  const uint32_t wait_ms = (timeout_ms > 0u) ? timeout_ms : ctx->cfg.timeout_ms;
+  const uint64_t deadline_ns =
+      add_ns_saturated(device_now_ns(ctx), static_cast<uint64_t>(wait_ms) * 1000000ULL);
+  return device_wait_handle_until(ctx, handle, deadline_ns, out_stats);
+}
+
 bool device_try_wait_handle(ob_context* ctx,
                             ob_exec_handle_t handle,
                             ob_status_t* out_status,
@@ -828,7 +1059,10 @@ bool device_try_wait_handle(ob_context* ctx,
     return true;
   }
 
+  const bool use_transport = use_transport_path(ctx);
   CachedGraph* completed_entry = nullptr;
+  std::vector<CachedGraph*> reaped_entries;
+  std::vector<ob_buffer*> retired_to_free;
   ob_status_t result = OB_OK;
   ob_invoke_stats_t stats {};
 
@@ -848,13 +1082,17 @@ bool device_try_wait_handle(ob_context* ctx,
       return true;
     }
 
-    if (ctx->mock_mode) {
-      slot->complete_time_ns = monotonic_now_ns();
+    if (!use_transport) {
+      slot->complete_time_ns = device_now_ns(ctx);
       slot->state = CreditSlot::COMPLETED;
       slot->vii_resp_code = 0;
       slot->error_status = OB_OK;
     } else {
-#if defined(__linux__)
+#if !defined(__linux__)
+      if (!has_transport_hooks(ctx)) {
+        return false;
+      }
+#endif
       while (slot->state == CreditSlot::IN_FLIGHT) {
         std::string err;
         int rc = pop_and_demux_one_locked(ctx, false, 0u, nullptr, nullptr, &err);
@@ -877,9 +1115,6 @@ bool device_try_wait_handle(ob_context* ctx,
           ctx->ema_hw_us = (ctx->ema_hw_us * 3u + slot->hw_execution_us) >> 2u;
         }
       }
-#else
-      return false;
-#endif
     }
 
     completed_entry = slot->graph_entry;
@@ -900,16 +1135,27 @@ bool device_try_wait_handle(ob_context* ctx,
     }
 
     slot->state = CreditSlot::FREE;
+    slot->abandoned = false;
     slot->handle = 0;
     slot->seq = 0;
     slot->graph_entry = nullptr;
     slot->error_msg.clear();
+    retired_to_free = std::move(slot->retired_bufs);
+    slot->retired_bufs.clear();
     if (ctx->inflight_count > 0u) ctx->inflight_count -= 1u;
+
+    collect_reapable_abandoned_slots_locked(ctx, !use_transport, &reaped_entries, &retired_to_free);
   }
 
-  if (completed_entry) {
+  if (completed_entry || !reaped_entries.empty()) {
     std::lock_guard<std::mutex> clk(ctx->cache_mu);
-    graph_entry_unref_locked(ctx, completed_entry);
+    if (completed_entry) graph_entry_unref_locked(ctx, completed_entry);
+    for (CachedGraph* ge : reaped_entries) {
+      graph_entry_unref_locked(ctx, ge);
+    }
+  }
+  for (ob_buffer* rb : retired_to_free) {
+    if (rb) ob_buffer_free(rb);
   }
 
   if (out_stats) *out_stats = stats;
@@ -919,21 +1165,46 @@ bool device_try_wait_handle(ob_context* ctx,
 
 ob_status_t device_wait_all(ob_context* ctx, uint32_t timeout_ms) {
   if (!ctx) return OB_ERR_INVALID_ARG;
+  const uint32_t wait_ms = (timeout_ms > 0u) ? timeout_ms : ctx->cfg.timeout_ms;
+  const uint64_t deadline_ns =
+      add_ns_saturated(device_now_ns(ctx), static_cast<uint64_t>(wait_ms) * 1000000ULL);
+
   ob_status_t first_err = OB_OK;
+  std::vector<ob_exec_handle_t> skipped_handles;
   while (true) {
     ob_exec_handle_t next_handle = 0;
     {
       std::lock_guard<std::mutex> lk(ctx->vii_mu);
-      for (uint32_t i = 0; i < ctx->credit_size; ++i) {
-        if (ctx->credits[i].state != CreditSlot::FREE) {
-          next_handle = ctx->credits[i].handle;
+      // Prefer already-finished slots before blocking on IN_FLIGHT slots.
+      for (int pass = 0; pass < 2 && next_handle == 0u; ++pass) {
+        for (uint32_t i = 0; i < ctx->credit_size; ++i) {
+          const CreditSlot& s = ctx->credits[i];
+          if (s.state == CreditSlot::FREE) continue;
+          const bool finished = (s.state == CreditSlot::COMPLETED || s.state == CreditSlot::FAILED);
+          if ((pass == 0) != finished) continue;
+          if (std::find(skipped_handles.begin(), skipped_handles.end(), s.handle) !=
+              skipped_handles.end()) {
+            continue;
+          }
+          next_handle = s.handle;
           break;
         }
       }
     }
     if (next_handle == 0u) break;
-    ob_status_t st = device_wait_handle(ctx, next_handle, timeout_ms, nullptr);
-    if (st != OB_OK && first_err == OB_OK) first_err = st;
+    if (ctx->test_hooks && ctx->test_hooks->on_wait_all_before_wait) {
+      ctx->test_hooks->on_wait_all_before_wait(ctx, next_handle, ctx->test_hooks->user_data);
+    }
+    ob_status_t st = device_wait_handle_until(ctx, next_handle, deadline_ns, nullptr);
+    if (st == OB_ERR_NOT_FOUND) {
+      // Another waiter concurrently harvested this handle; not an error.
+      continue;
+    }
+    if (st != OB_OK) {
+      if (first_err == OB_OK) first_err = st;
+      // Do not re-select stalled/failed IN_FLIGHT handles; preserve DMA ownership intact.
+      skipped_handles.push_back(next_handle);
+    }
   }
   return first_err;
 }
