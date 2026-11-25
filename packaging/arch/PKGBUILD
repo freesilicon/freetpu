@@ -1,0 +1,68 @@
+# SPDX-License-Identifier: Apache-2.0
+# Maintainer: OmaMobile Contributors
+#
+# Clean-room userspace stack for Tensor G5 (laguna) EdgeTPU (/dev/edgetpu-soc):
+#   - libopenbuenos static library (built -fPIC, wired with FreeTile BUENOS_A0) + CMake package + headers
+#   - tpu_soc_probe, openbuenos_selftest, and tpu_baremetal_runner CLI utilities
+#   - udev rules for non-root access to /dev/edgetpu-soc and /dev/dma_heap/system
+#
+# Runtime emitter selection:
+#   - OPENBUENOS_FREETILE=1 enables the zero-dep C++17 FreeTile BUENOS_A0 VLIW/DGC0
+#     emitter with automatic fallback to legacy ob_gemm_emitter for unsupported shapes/epilogues.
+#   - Set -DOPENBUENOS_FREETILE_DEFAULT_ON=ON at build time to make FreeTile default-on.
+#
+# Proprietary firmware (google/edgetpu-buenos.fw) and the RV64 interpreter binary
+# (dive_interp_rv64.bin) are NOT packaged here; extract them from the device
+# owner's vendor/factory image via tools/extract-vendor-firmware.
+
+pkgname=omamobile-freetpu
+pkgver=0.1.0
+pkgrel=2
+pkgdesc='Clean-room userspace runtime, FreeTile BUENOS_A0 emitter, and bare-metal runner for Google Tensor G5 (laguna) EdgeTPU'
+arch=(aarch64)
+url='https://github.com/saariuslystoned/freetpu'
+license=(Apache-2.0)
+depends=(glibc gcc-libs)
+makedepends=(cmake ninja gcc)
+optdepends=(
+  'linux-omamobile: mainline Tensor G5 EdgeTPU kernel driver (/dev/edgetpu-soc)'
+)
+provides=(libopenbuenos freetpu freetile)
+source=(
+  "freetpu-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz"
+  99-edgetpu.rules
+)
+sha256sums=('SKIP' 'SKIP')
+
+build() {
+  cmake -S "freetpu-$pkgver/libopenbuenos" -B build-lib -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+    -DOPENBUENOS_ENABLE_FREETILE=ON \
+    -DOPENBUENOS_FREETILE_DEFAULT_ON=OFF \
+    -DOPENBUENOS_BUILD_TESTS=ON \
+    -DOPENBUENOS_INSTALL_SELFTEST=ON \
+    -DOPENBUENOS_WERROR=OFF
+  cmake --build build-lib
+
+  cmake -S "freetpu-$pkgver/runtime" -B build-runtime -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DFREETPU_RUNTIME_WERROR=OFF
+  cmake --build build-runtime
+}
+
+check() {
+  ctest --test-dir build-lib --output-on-failure
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build-lib
+  DESTDIR="$pkgdir" cmake --install build-runtime
+
+  install -Dm644 "$srcdir/99-edgetpu.rules" \
+    "$pkgdir/usr/lib/udev/rules.d/99-edgetpu.rules"
+  install -Dm644 "freetpu-$pkgver/LICENSE" \
+    "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

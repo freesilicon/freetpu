@@ -403,11 +403,11 @@ uint64_t hash_tile_key(uint32_t m, uint32_t k, uint32_t n,
 }
 
 // Weight-agnostic graph cache key for Probe-A dynamic param_slice swapping:
-// depends ONLY on (hw_m, hw_k, hw_n, zp_a, zp_b, scale_d, slot_bucket).
+// depends ONLY on (hw_m, hw_k, hw_n, zp_a, zp_b, scale_d, slot_bucket, freetile).
 uint64_t hash_shape_key(uint32_t hw_m, uint32_t hw_k, uint32_t hw_n,
                         int32_t zp_a, int32_t zp_b, uint32_t scale_d,
-                        uint32_t slot_bucket) {
-  uint64_t h = 0x50524F4245415F31ULL; // "PROBEA_1"
+                        uint32_t slot_bucket, bool freetile = false) {
+  uint64_t h = freetile ? 0x4652454554494C45ULL : 0x50524F4245415F31ULL;
   uint32_t hdr[7] = {
       hw_m, hw_k, hw_n,
       static_cast<uint32_t>(zp_a),
@@ -493,7 +493,7 @@ void ensure_weight_cache_budget(ob_context* ctx, bool refresh_meminfo = false) {
       if (lim > 16384ul) lim = 16384ul;
       ctx->weight_cache_max_entries = static_cast<size_t>(lim);
     } else {
-      ctx->weight_cache_max_entries = kDefaultWeightCacheMaxEntries;
+      ctx->weight_cache_max_entries = ctx->weight_cache_default_max_entries;
     }
   }
 }
@@ -955,6 +955,11 @@ ob_status_t acquire_swiglu_entry(ob_context* ctx,
   }
   std::vector<uint8_t> dgc0;
   std::string err;
+  if (ctx->freetile_enabled) {
+    // 11-chunk chained SwiGLU is not yet lowered by freetile::buenos_emitter;
+    // automatically fall back to legacy ob_gemm_emitter.
+    ctx->freetile_fallbacks.fetch_add(1u, std::memory_order_relaxed);
+  }
   ob_status_t st = build_swiglu_dgc0(
       desc, ctx->builtin_dive_interp.data(), ctx->builtin_dive_interp.size(),
       &dgc0, nullptr, &err);
@@ -966,11 +971,13 @@ ob_status_t acquire_swiglu_entry(ob_context* ctx,
       ctx, dgc0.data(), dgc0.size(), cache_key, true, out_entry, out_cache_hit);
 }
 
-uint64_t hash_w8a16_shape_key(uint32_t hw_k, uint32_t hw_n, float pt_scale, uint32_t slot_id) {
+uint64_t hash_w8a16_shape_key(uint32_t hw_k, uint32_t hw_n, float pt_scale,
+                              uint32_t slot_id, bool freetile = false) {
   uint32_t sc_bits = 0u;
   std::memcpy(&sc_bits, &pt_scale, sizeof(sc_bits));
   uint32_t hdr[5] = {0x57384136u, hw_k, hw_n, sc_bits, slot_id};
-  uint64_t h = fast_hash64_update(0x57384131365F5054ULL, hdr, sizeof(hdr));
+  const uint64_t seed = freetile ? 0x46545F5738413136ULL : 0x57384131365F5054ULL;
+  uint64_t h = fast_hash64_update(seed, hdr, sizeof(hdr));
   return h ? h : 1ULL;
 }
 
@@ -986,23 +993,46 @@ ob_status_t acquire_w8a16_pt_1x_entry(ob_context* ctx,
   if (!ctx->builtin_emitter_active || ctx->builtin_dive_interp.empty()) {
     return OB_ERR_UNSUPPORTED;
   }
-  const uint64_t cache_key = hash_w8a16_shape_key(hw_k, hw_n, pt_scale, slot_id);
+  const uint64_t cache_key =
+      hash_w8a16_shape_key(hw_k, hw_n, pt_scale, slot_id, ctx->freetile_enabled);
   if (graph_cache_lookup_entry_u64(ctx, cache_key, out_entry)) {
     *out_cache_hit = true;
     return OB_OK;
   }
   std::vector<uint8_t> dgc0;
   std::string err;
-  ob_status_t st = build_dgc0_w8a16_pt_1x(
-      hw_k, hw_n, pt_scale, nullptr,
-      ctx->builtin_dive_interp.data(), ctx->builtin_dive_interp.size(),
-      &dgc0, &err);
+  bool emitted_by_freetile = false;
+  ob_status_t st = OB_ERR_UNSUPPORTED;
+  if (ctx->freetile_enabled) {
+    std::string ft_err;
+    st = freetile_try_emit_w8a16_dgc0(
+        hw_k, hw_n, pt_scale, nullptr,
+        ctx->builtin_dive_interp.data(), ctx->builtin_dive_interp.size(),
+        &dgc0, &ft_err);
+    if (st == OB_OK && !dgc0.empty()) {
+      ctx->freetile_emits.fetch_add(1u, std::memory_order_relaxed);
+      emitted_by_freetile = true;
+    } else {
+      ctx->freetile_fallbacks.fetch_add(1u, std::memory_order_relaxed);
+      dgc0.clear();
+    }
+  }
+  if (!emitted_by_freetile) {
+    st = build_dgc0_w8a16_pt_1x(
+        hw_k, hw_n, pt_scale, nullptr,
+        ctx->builtin_dive_interp.data(), ctx->builtin_dive_interp.size(),
+        &dgc0, &err);
+  }
   if (st != OB_OK) {
     if (!err.empty()) set_last_error(ctx, err);
     return st;
   }
-  return graph_register_dgc0_internal(
+  st = graph_register_dgc0_internal(
       ctx, dgc0.data(), dgc0.size(), cache_key, true, out_entry, out_cache_hit);
+  if (st == OB_OK && *out_entry && !(*out_cache_hit) && emitted_by_freetile) {
+    (*out_entry)->emitted_by_freetile = true;
+  }
+  return st;
 }
 
 // Prepare FP32 input row for native W8A16(FP16) with power-of-2 prescale guard
@@ -1073,20 +1103,27 @@ ob_status_t acquire_tile_entry(ob_context* ctx,
   if (ctx->emitter_scratch.size() < 1024u * 1024u) {
     ctx->emitter_scratch.resize(1024u * 1024u);
   }
+  ctx->last_emit_was_freetile = false;
   size_t dgc0_size = 0u;
   ob_status_t st = emitter(&desc, ctx->emitter_scratch.data(),
                            ctx->emitter_scratch.size(), &dgc0_size, user_data);
   if (st == OB_ERR_OVERFLOW && dgc0_size > ctx->emitter_scratch.size()) {
     ctx->emitter_scratch.resize(dgc0_size);
+    ctx->last_emit_was_freetile = false;
     st = emitter(&desc, ctx->emitter_scratch.data(),
                  ctx->emitter_scratch.size(), &dgc0_size, user_data);
   }
   if (st != OB_OK) return st;
+  const bool emitted_by_freetile = ctx->last_emit_was_freetile;
 
   const bool share_zero = (desc.weights_nk == nullptr && desc.packed_params == nullptr);
-  return graph_register_dgc0_internal(
+  st = graph_register_dgc0_internal(
       ctx, ctx->emitter_scratch.data(), dgc0_size, desc.cache_key,
       share_zero, out_entry, out_cache_hit);
+  if (st == OB_OK && *out_entry && !(*out_cache_hit) && emitted_by_freetile) {
+    (*out_entry)->emitted_by_freetile = true;
+  }
+  return st;
 }
 
 inline void release_tile_entry(ob_context* ctx, CachedGraph* entry) {
@@ -2920,6 +2957,7 @@ ob_status_t ob_gemm_matmul_int8(ob_context_t* ctx,
   uint32_t cache_hits = 0u;
   uint64_t total_hw_us = 0u;
   bool used_emitter = false;
+  bool used_freetile = false;
   bool used_cpu_fallback = false;
 
   struct PendingInt8Tile {
@@ -3208,7 +3246,8 @@ ob_status_t ob_gemm_matmul_int8(ob_context_t* ctx,
           if (builtin_active) {
             desc.weights_nk = nullptr;
             desc.cache_key = ob::hash_shape_key(
-                hw_m, hw_k, hw_n, zp_a, zp_b, scale_d, slot % param_swap_slots);
+                hw_m, hw_k, hw_n, zp_a, zp_b, scale_d, slot % param_swap_slots,
+                ctx->freetile_enabled);
           } else {
             desc.weights_nk = b_tile.data();
             const size_t packed_sz = ob_gemm_packed_weight_bytes(hw_k, hw_n);
@@ -3233,6 +3272,7 @@ ob_status_t ob_gemm_matmul_int8(ob_context_t* ctx,
               ctx, emitter, emitter_ud, desc, &entry, &was_hit);
           if (gst == OB_OK) {
             used_emitter = true;
+            if (entry && entry->emitted_by_freetile) used_freetile = true;
             if (was_hit) cache_hits += 1u;
 
             size_t in_alloc = std::max<size_t>(
@@ -3362,6 +3402,7 @@ ob_status_t ob_gemm_matmul_int8(ob_context_t* ctx,
     out_stats->cache_hits = cache_hits;
     if (ctx->mock_mode) out_stats->flags |= OB_STAT_FLAG_MOCK;
     if (used_emitter) out_stats->flags |= OB_STAT_FLAG_EMITTER_USED;
+    if (used_freetile) out_stats->flags |= OB_STAT_FLAG_FREETILE;
     if (used_cpu_fallback) out_stats->flags |= OB_STAT_FLAG_CPU_FALLBACK;
     if (cache_hits > 0u) out_stats->flags |= OB_STAT_FLAG_CACHE_HIT;
   }
@@ -3421,6 +3462,7 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
   uint32_t cache_hits = 0u;
   uint64_t total_hw_us = 0u;
   bool used_emitter = false;
+  bool used_freetile = false;
   bool used_cpu_fallback = false;
 
   struct InputSlotMeta {
@@ -3732,13 +3774,15 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
               rdesc.s_out = static_cast<float>(eff_d);
               rdesc.activation = OB_ACT_NONE;
               rdesc.cache_key = ob::hash_shape_key(
-                  p.hw_m, p.hw_k, p.hw_n, 0, 0, eff_d, p.slot % param_swap_slots);
+                  p.hw_m, p.hw_k, p.hw_n, 0, 0, eff_d, p.slot % param_swap_slots,
+                  ctx->freetile_enabled);
 
               const uint64_t trs0 = prof_on ? ob::monotonic_now_ns() : 0u;
               ob::CachedGraph* rentry = nullptr;
               bool rhit = false;
               rst = ob::acquire_tile_entry(ctx, emitter, emitter_ud, rdesc, &rentry, &rhit);
               if (rst != OB_OK) break;
+              if (rentry && rentry->emitted_by_freetile) used_freetile = true;
               if (rhit) cache_hits += 1u;
               ob_exec_handle_t rh = 0u;
               rst = ob::device_submit_execute_async(
@@ -4503,7 +4547,8 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
           if (builtin_active) {
             desc.weights_nk = nullptr;
             desc.cache_key = ob::hash_shape_key(
-                hw_m, hw_k, hw_n, 0, 0, scale_d, slot % param_swap_slots);
+                hw_m, hw_k, hw_n, 0, 0, scale_d, slot % param_swap_slots,
+                ctx->freetile_enabled);
           } else {
             desc.weights_nk = b_q_tile.data();
             const size_t packed_sz = ob_gemm_packed_weight_bytes(hw_k, hw_n);
@@ -4525,6 +4570,7 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
 
         if (gst == OB_OK) {
           used_emitter = true;
+          if (entry && entry->emitted_by_freetile) used_freetile = true;
           if (was_hit) cache_hits += 1u;
           if (num_subs >= 2u) {
             ctx->prof.horiz_fusions += 1u;
@@ -4733,6 +4779,7 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
     out_stats->cache_hits = cache_hits;
     if (ctx->mock_mode) out_stats->flags |= OB_STAT_FLAG_MOCK;
     if (used_emitter) out_stats->flags |= OB_STAT_FLAG_EMITTER_USED;
+    if (used_freetile) out_stats->flags |= OB_STAT_FLAG_FREETILE;
     if (used_cpu_fallback) out_stats->flags |= OB_STAT_FLAG_CPU_FALLBACK;
     if (cache_hits > 0u) out_stats->flags |= OB_STAT_FLAG_CACHE_HIT;
   }
@@ -6452,6 +6499,7 @@ ob_status_t ob_gemm_matmul_f32_w8a16_tile(ob_context_t* ctx,
   bool was_hit = false;
   ob_status_t st = ob::acquire_w8a16_pt_1x_entry(ctx, k_dim, n_dim, 1.0f, 0u, &entry, &was_hit);
   if (st != OB_OK) return st;
+  const bool entry_freetile = (entry && entry->emitted_by_freetile);
 
   // Pack [N/32, K/2, 32, 2] w_i8 ^ 0x80 weights into a DMA-BUF (cached by 128-bit content hash!)
   ob::WeightHash128 wh_st{};
@@ -6553,6 +6601,7 @@ ob_status_t ob_gemm_matmul_f32_w8a16_tile(ob_context_t* ctx,
     out_stats->tiles_dispatched = 1u;
     out_stats->cache_hits = was_hit ? 1u : 0u;
     out_stats->flags |= OB_STAT_FLAG_EMITTER_USED;
+    if (entry_freetile) out_stats->flags |= OB_STAT_FLAG_FREETILE;
     if (was_hit) out_stats->flags |= OB_STAT_FLAG_CACHE_HIT;
   }
   return st;

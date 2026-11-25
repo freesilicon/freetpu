@@ -75,7 +75,8 @@ enum ob_stat_flags {
   OB_STAT_FLAG_MOCK         = (1u << 0),
   OB_STAT_FLAG_CACHE_HIT    = (1u << 1),
   OB_STAT_FLAG_CPU_FALLBACK = (1u << 2),
-  OB_STAT_FLAG_EMITTER_USED = (1u << 3)
+  OB_STAT_FLAG_EMITTER_USED = (1u << 3),
+  OB_STAT_FLAG_FREETILE     = (1u << 4)
 };
 
 /* =========================================================================
@@ -247,6 +248,20 @@ ob_status_t ob_context_set_profile(ob_context_t* ctx, int enable);
 ob_status_t ob_context_get_profile(const ob_context_t* ctx, ob_profile_stats_t* out_profile);
 ob_status_t ob_context_reset_profile(ob_context_t* ctx);
 
+/*
+ * Opt-in / defaultable FreeTile BUENOS_A0 VLIW/DGC0 emitter switch.
+ *
+ * When enabled (via OPENBUENOS_FREETILE=1, compile-time OPENBUENOS_FREETILE_DEFAULT_ON,
+ * or ob_context_set_freetile(ctx, 1)), supported W8A8/W8A16/fused-activation kernels
+ * are emitted through freetile::buenos_emitter with automatic fallback to the legacy
+ * builtin ob_gemm_emitter for unsupported shapes or epilogues (e.g. chained SwiGLU).
+ */
+int         ob_context_get_freetile(const ob_context_t* ctx);
+ob_status_t ob_context_set_freetile(ob_context_t* ctx, int enable);
+ob_status_t ob_context_freetile_stats(const ob_context_t* ctx,
+                                      uint64_t*           out_emitted,
+                                      uint64_t*           out_fallbacks);
+
 /* =========================================================================
  * DMA-BUF Slab / Pool Buffer API (/dev/dma_heap/system + EDGETPU_MAP_DMABUF)
  * ========================================================================= */
@@ -383,8 +398,15 @@ ob_status_t ob_gemm_register_emitter(ob_context_t*      ctx,
  *
  * `dive_interp_path` loads the external RV64 DIVE interpreter binary (ext[1],
  * 638,977 B raw image, or extracts ext[1] automatically if a .dgc0 file is
- * passed). If NULL or empty, checks env `OPENBUENOS_DIVE_INTERP_PATH` and
- * falls back to "/data/local/tmp/tpu_open_stack/dive_interp_rv64.bin".
+ * passed). If NULL or empty, checks `OPENBUENOS_DIVE_INTERP_PATH` and then
+ * probes XDG/FHS/Android locations (`$XDG_DATA_HOME/freetpu/dive_interp_rv64.bin`,
+ * `$HOME/.local/share/freetpu/dive_interp_rv64.bin`,
+ * `/usr/local/share/freetpu/dive_interp_rv64.bin`,
+ * `/usr/share/freetpu/dive_interp_rv64.bin`,
+ * `/usr/lib/firmware/google/dive_interp_rv64.bin`,
+ * `/lib/firmware/google/dive_interp_rv64.bin`,
+ * `/usr/share/omamobile/tpu/dive_interp_rv64.bin`,
+ * `/data/local/tmp/tpu_open_stack/dive_interp_rv64.bin`).
  */
 ob_status_t ob_gemm_register_builtin_emitter(ob_context_t* ctx,
                                              const char*   dive_interp_path);

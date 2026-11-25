@@ -12,6 +12,7 @@
 #include <dirent.h>
 #include <random>
 #include <string>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <unordered_set>
 #include <vector>
@@ -5367,6 +5368,311 @@ void test_phase8b_spsc_async_dequant_and_w8a16_pt() {
               oracle_verified ? "12880/12880_EXACT" : "skipped");
 }
 
+void test_dive_interp_xdg_probe() {
+  char dir_tmpl[] = "/tmp/ob_xdg_XXXXXX";
+  char* tmp_root = ::mkdtemp(dir_tmpl);
+  CHECK(tmp_root != nullptr);
+  if (!tmp_root) return;
+
+  std::string freetpu_dir = std::string(tmp_root) + "/freetpu";
+  CHECK(::mkdir(freetpu_dir.c_str(), 0700) == 0);
+  std::string bin_path = freetpu_dir + "/dive_interp_rv64.bin";
+
+  std::vector<uint8_t> img = make_synthetic_dive_interp(0x3Cu);
+  FILE* fp = std::fopen(bin_path.c_str(), "wb");
+  CHECK(fp != nullptr);
+  if (fp) {
+    CHECK(std::fwrite(img.data(), 1, img.size(), fp) == img.size());
+    std::fclose(fp);
+  }
+
+  const char* prev_xdg = std::getenv("XDG_DATA_HOME");
+  std::string saved_xdg = prev_xdg ? prev_xdg : "";
+  const char* prev_override = std::getenv("OPENBUENOS_DIVE_INTERP_PATH");
+  std::string saved_override = prev_override ? prev_override : "";
+
+  ::unsetenv("OPENBUENOS_DIVE_INTERP_PATH");
+  ::setenv("XDG_DATA_HOME", tmp_root, 1);
+
+  ob_config_t cfg = ob_config_default();
+  cfg.mock_mode = 1;
+  ob_context_t* ctx = nullptr;
+  CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+  CHECK(ob_gemm_register_builtin_emitter(ctx, nullptr) == OB_OK);
+  ob_context_destroy(ctx);
+
+  // Restore environment and remove temp artifacts.
+  if (prev_xdg) {
+    ::setenv("XDG_DATA_HOME", saved_xdg.c_str(), 1);
+  } else {
+    ::unsetenv("XDG_DATA_HOME");
+  }
+  if (prev_override) {
+    ::setenv("OPENBUENOS_DIVE_INTERP_PATH", saved_override.c_str(), 1);
+  } else {
+    ::unsetenv("OPENBUENOS_DIVE_INTERP_PATH");
+  }
+  ::unlink(bin_path.c_str());
+  ::rmdir(freetpu_dir.c_str());
+  ::rmdir(tmp_root);
+
+  std::printf("[PASS] test_dive_interp_xdg_probe\n");
+}
+
+void test_freetile_buenos_wire_parity_and_fallback() {
+  CHECK(ob::freetile_is_compiled_in());
+
+  std::vector<uint8_t> interp = make_synthetic_dive_interp(0x73u);
+  TempBinaryFile interp_file;
+  CHECK(interp_file.write(interp.data(), interp.size()));
+
+  // 1. Runtime switch check: unset -> default (0), OPENBUENOS_FREETILE=1 -> 1, OPENBUENOS_FREETILE=0 -> 0.
+  {
+    ::unsetenv("OPENBUENOS_FREETILE");
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+    CHECK(ob_context_get_freetile(ctx) == 0);
+    CHECK(ob_context_set_freetile(ctx, 1) == OB_OK);
+    CHECK(ob_context_get_freetile(ctx) == 1);
+    CHECK(ob_context_set_freetile(ctx, 0) == OB_OK);
+    CHECK(ob_context_get_freetile(ctx) == 0);
+    ob_context_destroy(ctx);
+  }
+  {
+    ::setenv("OPENBUENOS_FREETILE", "1", 1);
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+    CHECK(ob_context_get_freetile(ctx) == 1);
+    ob_context_destroy(ctx);
+    ::unsetenv("OPENBUENOS_FREETILE");
+  }
+
+  // 2. Byte-exact .dgc0 parity across W8A8 multi-tile, lt_1x*, lt_64x*, fused activations,
+  //    W8A16_PT_1X, and W8A8_DYN_WEIGHTS via builtin_gemm_emitter_cb & bridge.
+  ob_config_t cfg = ob_config_default();
+  cfg.mock_mode = 1;
+  ob_context_t* ctx_leg = nullptr;
+  ob_context_t* ctx_ft = nullptr;
+  CHECK(ob_context_create(&cfg, &ctx_leg) == OB_OK);
+  CHECK(ob_context_create(&cfg, &ctx_ft) == OB_OK);
+  CHECK(ob_context_set_freetile(ctx_leg, 0) == OB_OK);
+  CHECK(ob_context_set_freetile(ctx_ft, 1) == OB_OK);
+  CHECK(ob_gemm_register_builtin_emitter(ctx_leg, interp_file.path()) == OB_OK);
+  CHECK(ob_gemm_register_builtin_emitter(ctx_ft, interp_file.path()) == OB_OK);
+
+  struct ParityCase {
+    uint32_t m;
+    uint32_t k;
+    uint32_t n;
+    uint32_t act;
+    int32_t zp_in;
+    int32_t zp_out;
+    bool with_bias;
+  };
+  const ParityCase cases[] = {
+      {1u, 64u, 64u, OB_ACT_NONE, 0, 0, true},
+      {4u, 64u, 32u, OB_ACT_RELU, -12, 7, true},
+      {16u, 128u, 64u, OB_ACT_RELU6, 0, 0, false},
+      {1u, 64u, 64u, OB_ACT_SILU, 0, 0, true},
+      {1u, 64u, 64u, OB_ACT_GELU, -5, 3, false},
+      {1u, 512u, 512u, OB_ACT_NONE, 0, 0, true},
+      {1u, 576u, 1536u, OB_ACT_SILU, 0, 0, false},
+      {1u, 1536u, 1536u, OB_ACT_GELU, 0, 0, false},
+      {64u, 512u, 512u, OB_ACT_NONE, 0, 0, true},
+      {64u, 576u, 1536u, OB_ACT_SILU, 0, 0, false},
+  };
+
+  size_t w8a8_checked = 0u;
+  for (const ParityCase& tc : cases) {
+    std::vector<int8_t> w(static_cast<size_t>(tc.n) * tc.k);
+    std::vector<int32_t> bias(tc.n, 0);
+    for (uint32_t ni = 0u; ni < tc.n; ++ni) {
+      bias[ni] = tc.with_bias ? static_cast<int32_t>((ni * 13u) % 41u) - 20 : 0;
+      for (uint32_t ki = 0u; ki < tc.k; ++ki) {
+        w[static_cast<size_t>(ni) * tc.k + ki] =
+            static_cast<int8_t>(static_cast<int32_t>((ni * 7u + ki * 11u) % 63u) - 31);
+      }
+    }
+    ob_gemm_desc_t desc{};
+    desc.m_dim = tc.m;
+    desc.k_dim = tc.k;
+    desc.n_dim = tc.n;
+    desc.s_in = 0.03125f;
+    desc.zp_in = tc.zp_in;
+    desc.s_w = 0.015625f;
+    desc.zp_w = 0;
+    desc.s_out = 0.0625f;
+    desc.zp_out = tc.zp_out;
+    desc.activation = tc.act;
+    desc.weights_nk = w.data();
+    desc.bias_n = tc.with_bias ? bias.data() : nullptr;
+
+    size_t sz_leg = 0u, sz_ft = 0u;
+    CHECK(ob::builtin_gemm_emitter_cb(&desc, nullptr, 0u, &sz_leg, ctx_leg) == OB_ERR_OVERFLOW);
+    CHECK(ob::builtin_gemm_emitter_cb(&desc, nullptr, 0u, &sz_ft, ctx_ft) == OB_ERR_OVERFLOW);
+    CHECK(sz_leg == sz_ft && sz_leg > 0u);
+
+    std::vector<uint8_t> dgc_leg(sz_leg);
+    std::vector<uint8_t> dgc_ft(sz_ft);
+    CHECK(ob::builtin_gemm_emitter_cb(&desc, dgc_leg.data(), dgc_leg.size(), &sz_leg, ctx_leg) == OB_OK);
+    CHECK(ob::builtin_gemm_emitter_cb(&desc, dgc_ft.data(), dgc_ft.size(), &sz_ft, ctx_ft) == OB_OK);
+    CHECK(sz_leg == sz_ft);
+    CHECK(dgc_leg == dgc_ft);
+    ++w8a8_checked;
+  }
+
+  uint64_t ft_emits = 0u, ft_fallbacks = 0u;
+  CHECK(ob_context_freetile_stats(ctx_ft, &ft_emits, &ft_fallbacks) == OB_OK);
+  CHECK(ft_emits == w8a8_checked);
+  CHECK(ft_fallbacks == 0u);
+
+  // 3. W8A16_PT_1X byte-exact parity (both pt_scale=1.0 and 0.015625).
+  const uint32_t w8a16_shapes[][2] = {{512u, 512u}, {1024u, 1024u}, {1536u, 1536u}};
+  const float w8a16_scales[] = {1.0f, 0.015625f};
+  for (const auto& sh : w8a16_shapes) {
+    for (float sc : w8a16_scales) {
+      std::vector<uint8_t> dgc_leg, dgc_ft;
+      std::string err_leg, err_ft;
+      CHECK(ob::build_dgc0_w8a16_pt_1x(
+                sh[0], sh[1], sc, nullptr, interp.data(), interp.size(), &dgc_leg, &err_leg) == OB_OK);
+      CHECK(ob::freetile_try_emit_w8a16_dgc0(
+                sh[0], sh[1], sc, nullptr, interp.data(), interp.size(), &dgc_ft, &err_ft) == OB_OK);
+      CHECK(dgc_leg == dgc_ft);
+    }
+  }
+
+  // 4. W8A8_DYN_WEIGHTS byte-exact parity.
+  {
+    ob_gemm_desc_t dyn_desc{};
+    dyn_desc.m_dim = 1u;
+    dyn_desc.k_dim = 512u;
+    dyn_desc.n_dim = 512u;
+    dyn_desc.s_in = 0.03125f;
+    dyn_desc.s_w = 0.015625f;
+    dyn_desc.s_out = 0.0625f;
+    std::vector<uint8_t> dgc_leg, dgc_ft;
+    uint32_t ext2_leg = 0u, ext2_ft = 0u;
+    std::string err_leg, err_ft;
+    CHECK(ob::build_dgc0_dyn_weights(
+              dyn_desc, interp.data(), interp.size(), &dgc_leg, &ext2_leg, &err_leg) == OB_OK);
+    CHECK(ob::freetile_try_emit_dyn_weights_dgc0(
+              dyn_desc, interp.data(), interp.size(), &dgc_ft, &ext2_ft, &err_ft) == OB_OK);
+    CHECK(ext2_leg == ext2_ft);
+    CHECK(dgc_leg == dgc_ft);
+  }
+
+  // 5. End-to-end ob_gemm_matmul_int8 & ob_gemm_matmul_f32_q8_0 with OPENBUENOS_FREETILE=1
+  //    sets OB_STAT_FLAG_FREETILE and hits graph cache cleanly on second call.
+  {
+    constexpr uint32_t M = 1u, K = 64u, N = 64u;
+    std::vector<int8_t> a(M * K, 2);
+    std::vector<int8_t> b(N * K, 1);
+    std::vector<int32_t> c_ft(M * N, 0);
+    std::vector<int32_t> c_leg(M * N, 0);
+    ob_invoke_stats_t s1{}, s2{}, sl{};
+    CHECK(ob_gemm_matmul_int8(ctx_ft, a.data(), b.data(), nullptr, c_ft.data(), M, K, N, 0, 0, &s1) == OB_OK);
+    CHECK(ob_gemm_matmul_int8(ctx_ft, a.data(), b.data(), nullptr, c_ft.data(), M, K, N, 0, 0, &s2) == OB_OK);
+    CHECK(ob_gemm_matmul_int8(ctx_leg, a.data(), b.data(), nullptr, c_leg.data(), M, K, N, 0, 0, &sl) == OB_OK);
+    CHECK(c_ft == c_leg);
+    CHECK((s1.flags & OB_STAT_FLAG_EMITTER_USED) != 0u);
+    CHECK((s1.flags & OB_STAT_FLAG_FREETILE) != 0u);
+    CHECK((s2.flags & OB_STAT_FLAG_FREETILE) != 0u);
+    CHECK((s2.flags & OB_STAT_FLAG_CACHE_HIT) != 0u);
+    CHECK((sl.flags & OB_STAT_FLAG_FREETILE) == 0u);
+  }
+
+  // Q8_0 matmul through FreeTile wire matches legacy numerically and sets OB_STAT_FLAG_FREETILE.
+  {
+    constexpr uint32_t M = 1u, K = 512u, N = 512u;
+    std::vector<float> a(M * K);
+    for (uint32_t ki = 0u; ki < K; ++ki) {
+      a[ki] = static_cast<float>(static_cast<int32_t>(ki % 17u) - 8) * 0.125f;
+    }
+    const uint32_t nblk = K / OB_QK8_0;
+    std::vector<ob_block_q8_0_t> b(static_cast<size_t>(N) * nblk);
+    for (uint32_t ni = 0u; ni < N; ++ni) {
+      for (uint32_t bi = 0u; bi < nblk; ++bi) {
+        b[static_cast<size_t>(ni) * nblk + bi].d = fp32_to_fp16(0.0625f);
+        for (uint32_t j = 0u; j < OB_QK8_0; ++j) {
+          b[static_cast<size_t>(ni) * nblk + bi].qs[j] =
+              static_cast<int8_t>(static_cast<int32_t>((ni + bi * 5u + j * 3u) % 31u) - 15);
+        }
+      }
+    }
+    std::vector<float> c_ft(M * N, 0.0f);
+    std::vector<float> c_leg(M * N, 0.0f);
+    ob_invoke_stats_t sf{}, sl{};
+    CHECK(ob_gemm_matmul_f32_q8_0(ctx_ft, a.data(), b.data(), c_ft.data(), M, K, N, &sf) == OB_OK);
+    CHECK(ob_gemm_matmul_f32_q8_0(ctx_leg, a.data(), b.data(), c_leg.data(), M, K, N, &sl) == OB_OK);
+    CHECK(c_ft == c_leg);
+    CHECK((sf.flags & OB_STAT_FLAG_EMITTER_USED) != 0u);
+    CHECK((sf.flags & OB_STAT_FLAG_FREETILE) != 0u);
+    CHECK((sl.flags & OB_STAT_FLAG_FREETILE) == 0u);
+  }
+
+  // 6. Automatic fallback to ob_gemm_emitter on unsupported shape/epilogue (chained SwiGLU +
+  //    unsupported activation code) without erroring out.
+  {
+    uint64_t emits_before = 0u, fb_before = 0u;
+    CHECK(ob_context_freetile_stats(ctx_ft, &emits_before, &fb_before) == OB_OK);
+
+    // Unsupported activation code -> FreeTile rejects, falls back to legacy emitter (also rejects).
+    ob_gemm_desc_t bad_act{};
+    bad_act.m_dim = 1u;
+    bad_act.k_dim = 64u;
+    bad_act.n_dim = 64u;
+    bad_act.s_in = 0.03125f;
+    bad_act.s_w = 0.015625f;
+    bad_act.s_out = 0.0625f;
+    bad_act.activation = 99u;
+    size_t sz = 0u;
+    CHECK(ob::builtin_gemm_emitter_cb(&bad_act, nullptr, 0u, &sz, ctx_ft) == OB_ERR_UNSUPPORTED);
+
+    // 11-chunk chained SwiGLU -> not in freetile::buenos_emitter, falls back seamlessly to ob_gemm_emitter.
+    constexpr uint32_t M = 1u, K = 576u, H = 512u, N = 576u;
+    std::vector<int8_t> x(M * K, 1);
+    std::vector<int8_t> wg(H * K, 1);
+    std::vector<int8_t> wu(H * K, 1);
+    std::vector<int8_t> wd(N * H, 1);
+    std::vector<int8_t> y(M * N, 0);
+    ob_swiglu_int8_desc_t sdesc{};
+    sdesc.m_dim = M;
+    sdesc.k_dim = K;
+    sdesc.h_dim = H;
+    sdesc.n_dim = N;
+    sdesc.wg_hk = wg.data();
+    sdesc.wu_hk = wu.data();
+    sdesc.wd_nh = wd.data();
+    sdesc.s_in = 0.03125f;
+    sdesc.s_wg = 0.015625f;
+    sdesc.s_gate = 0.0625f;
+    sdesc.s_wu = 0.015625f;
+    sdesc.s_up = 0.0625f;
+    sdesc.s_silu = 0.0625f;
+    sdesc.s_prod = 0.0625f;
+    sdesc.s_wd = 0.015625f;
+    sdesc.s_out = 0.0625f;
+    ob_invoke_stats_t sw_st{};
+    CHECK(ob_gemm_swiglu_int8(ctx_ft, x.data(), &sdesc, y.data(), &sw_st) == OB_OK);
+    CHECK((sw_st.flags & OB_STAT_FLAG_EMITTER_USED) != 0u);
+    CHECK((sw_st.flags & OB_STAT_FLAG_FREETILE) == 0u);
+
+    uint64_t emits_after = 0u, fb_after = 0u;
+    CHECK(ob_context_freetile_stats(ctx_ft, &emits_after, &fb_after) == OB_OK);
+    CHECK(fb_after >= fb_before + 2u);
+  }
+
+  ob_context_destroy(ctx_leg);
+  ob_context_destroy(ctx_ft);
+
+  std::printf("[PASS] test_freetile_buenos_wire_parity_and_fallback (%zu W8A8/lt_1x/lt_64x/Mode-A + 6 W8A16 + dyn-weights bit-exact + fallback OK)\n",
+              w8a8_checked);
+}
+
 }  // namespace
 
 int main() {
@@ -5387,6 +5693,7 @@ int main() {
       "OPENBUENOS_THREADS",
       "OPENBUENOS_ASYNC_DEQUANT",
       "OPENBUENOS_W8A16",
+      "OPENBUENOS_FREETILE",
       "OPENBUENOS_MAX_OUTLIER_COLS",
       "OPENBUENOS_PROFILE",
       "OPENBUENOS_VERBOSE",
@@ -5416,9 +5723,11 @@ int main() {
   test_phase7_cycle3_regressions();
   test_phase8a_overlapped_neon_worker_pool_and_swiglu_m64();
   test_phase8b_spsc_async_dequant_and_w8a16_pt();
+  test_dive_interp_xdg_probe();
+  test_freetile_buenos_wire_parity_and_fallback();
 
   if (g_failures == 0) {
-    std::printf("ALL LIBOPENBUENOS HOST TESTS PASSED (22/22 suites)\n");
+    std::printf("ALL LIBOPENBUENOS HOST TESTS PASSED (24/24 suites)\n");
     return 0;
   }
   std::fprintf(stderr, "LIBOPENBUENOS HOST TESTS FAILED (%d failures)\n", g_failures);

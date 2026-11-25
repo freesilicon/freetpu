@@ -19,7 +19,6 @@
 #include <mutex>
 #include <unordered_map>
 #include <vector>
-
 #if defined(__linux__) || defined(__ANDROID__)
 #include <unistd.h>
 #endif
@@ -32,11 +31,10 @@
 
 namespace {
 
-constexpr size_t       EDGETPU_BUFFER_ALIGNMENT         = 64;
-constexpr uint32_t     EDGETPU_DEFAULT_CACHE_CAP        = 2048u;
-constexpr uint32_t     EDGETPU_DEFAULT_POOL_MAX_BYTES   = 128u * 1024u * 1024u;
-constexpr int64_t      EDGETPU_DEFAULT_GLU_MAX_M        = 64;
-constexpr const char * EDGETPU_DEFAULT_DIVE_INTERP_PATH = "/data/local/tmp/tpu_open_stack/dive_interp_rv64.bin";
+constexpr size_t   EDGETPU_BUFFER_ALIGNMENT       = 64;
+constexpr uint32_t EDGETPU_DEFAULT_CACHE_CAP      = 2048u;
+constexpr uint32_t EDGETPU_DEFAULT_POOL_MAX_BYTES = 128u * 1024u * 1024u;
+constexpr int64_t  EDGETPU_DEFAULT_GLU_MAX_M      = 64;
 
 struct edgetpu_env_config {
     bool         mock_mode             = false;
@@ -61,7 +59,9 @@ struct edgetpu_env_config {
     bool         has_priority          = false;
     uint8_t      perf_mode             = 0; // 0 -> libopenbuenos default, 1..5 = DVFS perf tier
     bool         has_perf_mode         = false;
-    const char * dive_interp_path      = EDGETPU_DEFAULT_DIVE_INTERP_PATH;
+    bool         has_freetile          = false;
+    bool         freetile              = false; // OPENBUENOS_FREETILE=1 enables FreeTile BUENOS_A0 emitter
+    const char * dive_interp_path      = nullptr;
 };
 
 static bool parse_env_u8(const char * name, uint8_t * out) {
@@ -82,6 +82,10 @@ static edgetpu_env_config load_env_config() {
     edgetpu_env_config cfg;
 #if defined(__ANDROID__)
     cfg.mock_mode = false;
+#elif defined(__linux__) && (defined(__aarch64__) || defined(__arm__))
+    // Native ARM/ARM64 Linux (e.g. OmaMobile / Arch Linux ARM): run hardware
+    // mode when /dev/edgetpu-soc exists, otherwise fall back to mock mode.
+    cfg.mock_mode = (::access("/dev/edgetpu-soc", F_OK) != 0);
 #else
     cfg.mock_mode = true;
 #endif
@@ -153,6 +157,12 @@ static edgetpu_env_config load_env_config() {
     parse_env_u8("OPENBUENOS_CLUSTER_ID",       &cfg.cluster_id);
     cfg.has_priority  = parse_env_u8("OPENBUENOS_PRIORITY",  &cfg.priority);
     cfg.has_perf_mode = parse_env_u8("OPENBUENOS_PERF_MODE", &cfg.perf_mode);
+    if (const char * v = std::getenv("OPENBUENOS_FREETILE")) {
+        if (v[0] != '\0') {
+            cfg.has_freetile = true;
+            cfg.freetile = (std::atoi(v) != 0);
+        }
+    }
     if (const char * v = std::getenv("OPENBUENOS_DIVE_INTERP_PATH")) {
         if (v[0] != '\0') {
             cfg.dive_interp_path = v;
@@ -608,17 +618,25 @@ struct ggml_backend_edgetpu_context {
                 uint64_t pool_misses = 0;
                 ob_context_buffer_pool_stats(ob_ctx, &pool_bytes, &pool_count, &pool_hits, &pool_misses);
 
+                uint64_t freetile_emits     = 0;
+                uint64_t freetile_fallbacks = 0;
+                ob_context_freetile_stats(ob_ctx, &freetile_emits, &freetile_fallbacks);
+
                 const uint64_t cache_total = cache_hits + cache_misses;
                 const double   hit_pct     = (cache_total > 0)
                                                  ? (100.0 * static_cast<double>(cache_hits) / static_cast<double>(cache_total))
                                                  : 0.0;
                 GGML_LOG_INFO(
-                    "ggml-edgetpu: summary mock=%d evals=%llu calls=%llu mmid_calls=%llu slices=%llu emitter_slices=%llu cpu_fallback_slices=%llu "
+                    "ggml-edgetpu: summary mock=%d freetile=%d freetile_emits=%llu freetile_fallbacks=%llu "
+                    "evals=%llu calls=%llu mmid_calls=%llu slices=%llu emitter_slices=%llu cpu_fallback_slices=%llu "
                     "batched_groups=%llu batched_ops=%llu batched_3=%llu batched_2=%llu swiglu_fused=%llu bias_adds=%llu rope_ops=%llu glu_ops=%llu "
                     "tiles=%llu tile_hits=%llu hw_us=%llu wall_us=%llu "
                     "cache_entries=%zu cache_hits=%llu cache_misses=%llu cache_evictions=%llu cache_hit_rate=%.2f%% "
                     "pool_bytes=%zu pool_count=%zu pool_hits=%llu pool_misses=%llu\n",
                     ob_context_is_mock(ob_ctx),
+                    ob_context_get_freetile(ob_ctx),
+                    static_cast<unsigned long long>(freetile_emits),
+                    static_cast<unsigned long long>(freetile_fallbacks),
                     static_cast<unsigned long long>(total_graph_evals),
                     static_cast<unsigned long long>(total_mul_mat_calls),
                     static_cast<unsigned long long>(total_mul_mat_id_calls),
@@ -757,8 +775,8 @@ static ggml_status ggml_edgetpu_compute_forward_mul_mat(ggml_backend_edgetpu_con
                     job.is_q4_0    = 1u;
                     st = ob_gemm_matmul_f32_quant_batch(ctx->ob_ctx, a_f32, M, K, &job, 1u, &stats);
                     if (st != OB_OK) {
-                        GGML_LOG_ERROR("ggml-edgetpu: ob_gemm_matmul_f32_quant_batch (Q4_0 M=%u,K=%u,N=%u) failed: %s\n",
-                                       M, K, N, ob_status_string(st));
+                        GGML_LOG_ERROR("ggml-edgetpu: ob_gemm_matmul_f32_quant_batch (Q4_0 M=%u,K=%u,N=%u) failed: %s (%s)\n",
+                                       M, K, N, ob_status_string(st), ob_context_last_error(ctx->ob_ctx));
                         return GGML_STATUS_FAILED;
                     }
                 } else if (ctx->env.packed_q8) {
@@ -782,7 +800,8 @@ static ggml_status ggml_edgetpu_compute_forward_mul_mat(ggml_backend_edgetpu_con
                         0, 0,
                         &stats);
                     if (st != OB_OK) {
-                        GGML_LOG_ERROR("ggml-edgetpu: ob_gemm_matmul_int8 (packed Q8_0) failed: %s\n", ob_status_string(st));
+                        GGML_LOG_ERROR("ggml-edgetpu: ob_gemm_matmul_int8 (packed Q8_0) failed: %s (%s)\n",
+                                       ob_status_string(st), ob_context_last_error(ctx->ob_ctx));
                         return GGML_STATUS_FAILED;
                     }
                     for (uint32_t m = 0; m < M; ++m) {
@@ -803,8 +822,8 @@ static ggml_status ggml_edgetpu_compute_forward_mul_mat(ggml_backend_edgetpu_con
                         M, K, N,
                         &stats);
                     if (st != OB_OK) {
-                        GGML_LOG_ERROR("ggml-edgetpu: ob_gemm_matmul_f32_q8_0(M=%u,K=%u,N=%u) failed: %s\n",
-                                       M, K, N, ob_status_string(st));
+                        GGML_LOG_ERROR("ggml-edgetpu: ob_gemm_matmul_f32_q8_0(M=%u,K=%u,N=%u) failed: %s (%s)\n",
+                                       M, K, N, ob_status_string(st), ob_context_last_error(ctx->ob_ctx));
                         return GGML_STATUS_FAILED;
                     }
                 }
@@ -829,8 +848,8 @@ static ggml_status ggml_edgetpu_compute_forward_mul_mat(ggml_backend_edgetpu_con
                     0, 0,
                     &stats);
                 if (st != OB_OK) {
-                    GGML_LOG_ERROR("ggml-edgetpu: ob_gemm_matmul_int8(M=%u,K=%u,N=%u) failed: %s\n",
-                                   M, K, N, ob_status_string(st));
+                    GGML_LOG_ERROR("ggml-edgetpu: ob_gemm_matmul_int8(M=%u,K=%u,N=%u) failed: %s (%s)\n",
+                                   M, K, N, ob_status_string(st), ob_context_last_error(ctx->ob_ctx));
                     return GGML_STATUS_FAILED;
                 }
 
@@ -2254,8 +2273,8 @@ static ggml_status ggml_backend_edgetpu_graph_compute(ggml_backend_t backend, st
                             static_cast<uint32_t>(n_mm),
                             &bstats);
                         if (bst != OB_OK) {
-                            GGML_LOG_ERROR("ggml-edgetpu: ob_gemm_matmul_f32_quant_batch(n=%d,M=%u,K=%u) failed: %s\n",
-                                           n_mm, M, K, ob_status_string(bst));
+                            GGML_LOG_ERROR("ggml-edgetpu: ob_gemm_matmul_f32_quant_batch(n=%d,M=%u,K=%u) failed: %s (%s)\n",
+                                           n_mm, M, K, ob_status_string(bst), ob_context_last_error(ctx->ob_ctx));
                             return GGML_STATUS_FAILED;
                         }
 
@@ -2941,15 +2960,24 @@ ggml_backend_t ggml_backend_edgetpu_init(void) {
         return nullptr;
     }
 
+    if (env.has_freetile) {
+        st = ob_context_set_freetile(ob_ctx, env.freetile ? 1 : 0);
+        if (st != OB_OK) {
+            GGML_LOG_WARN("ggml-edgetpu: ob_context_set_freetile(%d) failed (%s): %s; using legacy emitter\n",
+                          env.freetile ? 1 : 0, ob_status_string(st), ob_context_last_error(ob_ctx));
+        }
+    }
+
     const char * interp_path = (env.dive_interp_path && env.dive_interp_path[0] != '\0')
                                    ? env.dive_interp_path
-                                   : EDGETPU_DEFAULT_DIVE_INTERP_PATH;
+                                   : nullptr;
     bool emitter_ok = false;
     if (!env.mock_mode) {
         st = ob_gemm_register_builtin_emitter(ob_ctx, interp_path);
         if (st != OB_OK) {
             GGML_LOG_ERROR("ggml-edgetpu: ob_gemm_register_builtin_emitter('%s') failed (%s): %s\n",
-                           interp_path, ob_status_string(st), ob_context_last_error(ob_ctx));
+                           interp_path ? interp_path : "<auto>",
+                           ob_status_string(st), ob_context_last_error(ob_ctx));
             GGML_LOG_ERROR("ggml-edgetpu: refusing silent CPU fallback in hardware mode (mock_mode=0); "
                            "ensure dive_interp_rv64.bin exists or set OPENBUENOS_DIVE_INTERP_PATH / OPENBUENOS_MOCK=1\n");
             ob_context_destroy(ob_ctx);
@@ -2978,12 +3006,13 @@ ggml_backend_t ggml_backend_edgetpu_init(void) {
     if (env.verbose > 0) {
         GGML_LOG_INFO(
             "ggml-edgetpu: initialized Pixel Tensor G5 (buenos_a0) "
-            "[mock=%d, emitter=%d, interp=%s, credits=%u, cache_cap=%u, pool_mb=%u, "
+            "[mock=%d, emitter=%d, freetile=%d, interp=%s, credits=%u, cache_cap=%u, pool_mb=%u, "
             "tile_limits=(%u,%u,%u), pwr=(perf=%u,core=0x%02x,mem=0x%02x,qos=0x%02x,prio=%u), "
             "batch_siblings=%d, min_elements=%llu, packed_q8=%d, libopenbuenos=%d]\n",
             ob_context_is_mock(ob_ctx),
             emitter_ok ? 1 : 0,
-            env.mock_mode ? "(mock)" : interp_path,
+            ob_context_get_freetile(ob_ctx),
+            env.mock_mode ? "(mock)" : (interp_path ? interp_path : "<auto>"),
             ob_context_credit_size(ob_ctx),
             env.cache_cap,
             env.pool_max_bytes / (1024u * 1024u),

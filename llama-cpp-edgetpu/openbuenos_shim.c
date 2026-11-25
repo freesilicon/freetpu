@@ -146,6 +146,29 @@ ob_status_t ob_context_reset_profile(ob_context_t * ctx) {
     return ctx ? OB_OK : OB_ERR_INVALID_ARG;
 }
 
+int ob_context_get_freetile(const ob_context_t * ctx) {
+    (void)ctx;
+    return 0;
+}
+
+ob_status_t ob_context_set_freetile(ob_context_t * ctx, int enable) {
+    if (!ctx) return OB_ERR_INVALID_ARG;
+    if (enable != 0) {
+        snprintf(ctx->last_error, sizeof(ctx->last_error), "shim build has no FreeTile BUENOS_A0 emitter");
+        return OB_ERR_UNSUPPORTED;
+    }
+    return OB_OK;
+}
+
+ob_status_t ob_context_freetile_stats(const ob_context_t * ctx,
+                                      uint64_t *           out_emitted,
+                                      uint64_t *           out_fallbacks) {
+    if (!ctx) return OB_ERR_INVALID_ARG;
+    if (out_emitted)   *out_emitted   = 0u;
+    if (out_fallbacks) *out_fallbacks = 0u;
+    return OB_OK;
+}
+
 ob_status_t ob_context_buffer_pool_stats(const ob_context_t * ctx,
                                          size_t *             out_pooled_bytes,
                                          size_t *             out_pooled_count,

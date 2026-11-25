@@ -11,6 +11,7 @@
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #include "edgetpu_buenos_uapi.h"
 #endif
@@ -1169,6 +1170,13 @@ ob_status_t ob_context_create(const ob_config_t* config, ob_context_t** out_ctx)
   ctx->worker_pool.init(ctx->num_threads);
   ctx->async_dequant_enabled = read_env_flag("OPENBUENOS_ASYNC_DEQUANT", true);
   ctx->w8a16_mode = read_env_flag("OPENBUENOS_W8A16", false) ? 1u : 0u;
+#if defined(OPENBUENOS_FREETILE_DEFAULT_ON_VAL) && OPENBUENOS_FREETILE_DEFAULT_ON_VAL
+  const bool freetile_default = ob::freetile_is_compiled_in();
+#else
+  const bool freetile_default = false;
+#endif
+  ctx->freetile_enabled =
+      ob::freetile_is_compiled_in() && read_env_flag("OPENBUENOS_FREETILE", freetile_default);
   uint32_t env_max_out = ob::kDefaultMaxCachedOutlierCols;
   if (read_env_u32("OPENBUENOS_MAX_OUTLIER_COLS", &env_max_out)) {
     if (env_max_out > 1024u) env_max_out = 1024u;
@@ -1179,6 +1187,31 @@ ob_status_t ob_context_create(const ob_config_t* config, ob_context_t** out_ctx)
   ctx->mock_mode = (eff.mock_mode != 0);
   ctx->cache_capacity = eff.graph_cache_capacity;
   ctx->pool_max_bytes = static_cast<size_t>(eff.buffer_pool_max_bytes);
+#if defined(__linux__)
+  if (!ctx->mock_mode) {
+    struct rlimit rl {};
+    if (::getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+      constexpr rlim_t kDesiredNofile = 8192u;
+      if (rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < kDesiredNofile) {
+        rlim_t target = (rl.rlim_max == RLIM_INFINITY)
+                            ? kDesiredNofile
+                            : std::min<rlim_t>(rl.rlim_max, kDesiredNofile);
+        if (target > rl.rlim_cur) {
+          struct rlimit raised = rl;
+          raised.rlim_cur = target;
+          if (::setrlimit(RLIMIT_NOFILE, &raised) == 0) {
+            ::getrlimit(RLIMIT_NOFILE, &rl);
+          }
+        }
+      }
+      if (rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur <= 2048u) {
+        ctx->cache_capacity = std::min<uint32_t>(ctx->cache_capacity, 96u);
+        ctx->pool_max_count = 48u;
+        ctx->weight_cache_default_max_entries = 256u;
+      }
+    }
+  }
+#endif
 
   ob_status_t st = ob::device_open(ctx);
   if (st != OB_OK) {
@@ -1343,6 +1376,35 @@ ob_status_t ob_context_reset_profile(ob_context_t* ctx) {
   std::lock_guard<std::mutex> glk(ctx->gemm_mu);
   std::lock_guard<std::mutex> vlk(ctx->vii_mu);
   ctx->prof = ob::ProfileCounters{};
+  return OB_OK;
+}
+
+int ob_context_get_freetile(const ob_context_t* ctx) {
+  if (!ctx) return 0;
+  return ctx->freetile_enabled ? 1 : 0;
+}
+
+ob_status_t ob_context_set_freetile(ob_context_t* ctx, int enable) {
+  if (!ctx) return OB_ERR_INVALID_ARG;
+  if (enable != 0 && !ob::freetile_is_compiled_in()) {
+    ob::set_last_error(ctx, "FreeTile BUENOS_A0 emitter is not compiled into libopenbuenos");
+    return OB_ERR_UNSUPPORTED;
+  }
+  std::lock_guard<std::mutex> lk(ctx->gemm_mu);
+  ctx->freetile_enabled = (enable != 0);
+  return OB_OK;
+}
+
+ob_status_t ob_context_freetile_stats(const ob_context_t* ctx,
+                                      uint64_t* out_emitted,
+                                      uint64_t* out_fallbacks) {
+  if (!ctx) return OB_ERR_INVALID_ARG;
+  if (out_emitted) {
+    *out_emitted = ctx->freetile_emits.load(std::memory_order_relaxed);
+  }
+  if (out_fallbacks) {
+    *out_fallbacks = ctx->freetile_fallbacks.load(std::memory_order_relaxed);
+  }
   return OB_OK;
 }
 

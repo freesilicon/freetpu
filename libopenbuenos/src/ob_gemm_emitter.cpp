@@ -37,8 +37,46 @@ constexpr uint32_t kActRelu6 = OB_ACT_RELU6;
 constexpr uint32_t kActSilu = OB_ACT_SILU;
 constexpr uint32_t kActGelu = OB_ACT_GELU;
 constexpr uint64_t kCompilerCl = 925724637ULL;
-constexpr const char* kDefaultDiveInterpPath =
+constexpr const char* kAndroidDiveInterpPath =
     "/data/local/tmp/tpu_open_stack/dive_interp_rv64.bin";
+
+std::string resolve_dive_interp_path(const char* explicit_path) {
+  if (explicit_path && explicit_path[0]) {
+    return std::string(explicit_path);
+  }
+  const char* env_p = std::getenv("OPENBUENOS_DIVE_INTERP_PATH");
+  if (env_p && env_p[0]) {
+    return std::string(env_p);
+  }
+
+  std::vector<std::string> candidates;
+  const char* xdg = std::getenv("XDG_DATA_HOME");
+  if (xdg && xdg[0]) {
+    candidates.push_back(std::string(xdg) + "/freetpu/dive_interp_rv64.bin");
+  } else {
+    const char* home = std::getenv("HOME");
+    if (home && home[0]) {
+      candidates.push_back(std::string(home) + "/.local/share/freetpu/dive_interp_rv64.bin");
+    }
+  }
+  candidates.emplace_back("/usr/local/share/freetpu/dive_interp_rv64.bin");
+  candidates.emplace_back("/usr/share/freetpu/dive_interp_rv64.bin");
+  candidates.emplace_back("/usr/lib/firmware/google/dive_interp_rv64.bin");
+  candidates.emplace_back("/lib/firmware/google/dive_interp_rv64.bin");
+  candidates.emplace_back("/usr/share/omamobile/tpu/dive_interp_rv64.bin");
+  candidates.emplace_back(kAndroidDiveInterpPath);
+
+  for (const auto& cand : candidates) {
+    if (::access(cand.c_str(), R_OK) == 0) {
+      return cand;
+    }
+  }
+#if defined(__ANDROID__)
+  return std::string(kAndroidDiveInterpPath);
+#else
+  return std::string("/usr/lib/firmware/google/dive_interp_rv64.bin");
+#endif
+}
 
 // 4x4 physical tile grid in serpentine (snake) traversal order
 constexpr uint32_t kSnake16[16] = {
@@ -5548,15 +5586,39 @@ ob_status_t builtin_gemm_emitter_cb(const ob_gemm_desc_t* desc,
     return OB_ERR_INVALID_ARG;
   }
 
-  GemmSynthResult parts{};
+  ctx->last_emit_was_freetile = false;
+  std::vector<uint8_t> dgc0;
   std::string err;
+
+  if (ctx->freetile_enabled) {
+    std::string ft_err;
+    ob_status_t ft_st = freetile_try_emit_w8a8_dgc0(
+        *desc,
+        ctx->builtin_dive_interp.data(),
+        ctx->builtin_dive_interp.size(),
+        &dgc0,
+        &ft_err);
+    if (ft_st == OB_OK && !dgc0.empty()) {
+      ctx->last_emit_was_freetile = true;
+      *out_size = dgc0.size();
+      if (!out_buf || out_cap < dgc0.size()) {
+        return OB_ERR_OVERFLOW;
+      }
+      ctx->freetile_emits.fetch_add(1u, std::memory_order_relaxed);
+      std::memcpy(out_buf, dgc0.data(), dgc0.size());
+      return OB_OK;
+    }
+    ctx->freetile_fallbacks.fetch_add(1u, std::memory_order_relaxed);
+    dgc0.clear();
+  }
+
+  GemmSynthResult parts{};
   ob_status_t st = synthesize_gemm_parts(*desc, &parts, &err);
   if (st != OB_OK) {
     if (!err.empty()) set_last_error(ctx, err);
     return st;
   }
 
-  std::vector<uint8_t> dgc0;
   st = build_dgc0_from_parts(*desc, parts,
                              ctx->builtin_dive_interp.data(),
                              ctx->builtin_dive_interp.size(),
@@ -8243,11 +8305,8 @@ ob_status_t ob_gemm_register_builtin_emitter(ob_context_t* ctx,
                                              const char* dive_interp_path) {
   if (!ctx) return OB_ERR_INVALID_ARG;
 
-  const char* path = dive_interp_path;
-  if (!path || !path[0]) {
-    const char* env_p = std::getenv("OPENBUENOS_DIVE_INTERP_PATH");
-    path = (env_p && env_p[0]) ? env_p : ob::kDefaultDiveInterpPath;
-  }
+  std::string resolved_path = ob::resolve_dive_interp_path(dive_interp_path);
+  const char* path = resolved_path.c_str();
 
   std::vector<uint8_t> raw;
   std::string err;

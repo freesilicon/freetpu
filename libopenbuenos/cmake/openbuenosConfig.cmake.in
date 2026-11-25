@@ -1,0 +1,9 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+if(UNIX AND NOT APPLE AND NOT ANDROID)
+  find_dependency(Threads)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/openbuenosTargets.cmake")
+check_required_components(openbuenos)
