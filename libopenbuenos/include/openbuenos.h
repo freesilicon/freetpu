@@ -389,6 +389,7 @@ ob_status_t ob_gemm_register_emitter(ob_context_t*      ctx,
  * `/usr/local/share/freetpu/dive_interp_rv64.bin`,
  * `/usr/share/freetpu/dive_interp_rv64.bin`,
  * `/usr/lib/firmware/google/dive_interp_rv64.bin`,
+ * `/lib/firmware/google/dive_interp_rv64.bin`,
  * `/usr/share/omamobile/tpu/dive_interp_rv64.bin`,
  * `/data/local/tmp/tpu_open_stack/dive_interp_rv64.bin`).
  */

@@ -96,37 +96,59 @@ build_android() {
 }
 
 build_linux_arm64() {
-    echo "=== Building libopenbuenos (build/linux-arm64) ==="
-    "$CMAKE" -S "$OB" -B "$OB/build/linux-arm64" -G Ninja \
+    local is_static="${STATIC_LINUX:-0}"
+    local ob_build="$OB/build/linux-arm64"
+    local llama_build="$ROOT/build-linux-arm64"
+    local openmp_opt="ON"
+    local -a static_flags=()
+    if [[ "$is_static" == "1" ]]; then
+        ob_build="$OB/build/linux-arm64-static"
+        llama_build="$ROOT/build-linux-arm64-static"
+        openmp_opt="OFF"
+        static_flags=(-DCMAKE_EXE_LINKER_FLAGS="-static")
+        mkdir -p "$OB/build/linux-arm64"
+    fi
+
+    echo "=== Building libopenbuenos (${ob_build#$OB/}) ==="
+    "$CMAKE" -S "$OB" -B "$ob_build" -G Ninja \
         -DCMAKE_MAKE_PROGRAM="$NINJA" \
         -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_POSITION_INDEPENDENT_CODE=ON
-    "$CMAKE" --build "$OB/build/linux-arm64" -j"$JOBS"
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+        ${static_flags[@]+"${static_flags[@]}"}
+    "$CMAKE" --build "$ob_build" -j"$JOBS"
+    if [[ "$is_static" == "1" ]]; then
+        cp "$ob_build/libopenbuenos.a" "$OB/build/linux-arm64/libopenbuenos.a"
+    fi
 
     overlay_backend
-    echo "=== Building Linux ARM64 llama.cpp + ggml-edgetpu (build-linux-arm64) ==="
-    "$CMAKE" -S "$SRC" -B "$ROOT/build-linux-arm64" -G Ninja \
+    echo "=== Building Linux ARM64 llama.cpp + ggml-edgetpu (${llama_build#$ROOT/}) ==="
+    "$CMAKE" -S "$SRC" -B "$llama_build" -G Ninja \
         -DCMAKE_MAKE_PROGRAM="$NINJA" \
         -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_SHARED_LIBS=OFF \
+        ${static_flags[@]+"${static_flags[@]}"} \
         -DGGML_EDGETPU=ON \
         -DGGML_RPC=ON \
         -DGGML_RPC_RDMA=OFF \
-        -DGGML_OPENMP=ON \
+        -DGGML_OPENMP="$openmp_opt" \
         -DGGML_CPU_ARM_ARCH="armv8.2-a+dotprod+fp16+i8mm" \
         -DLLAMA_BUILD_TESTS=ON \
         -DLLAMA_BUILD_TOOLS=ON \
         -DLLAMA_OPENSSL=OFF \
         -DOPENBUENOS_DIR="$OB"
-    "$CMAKE" --build "$ROOT/build-linux-arm64" --target test-backend-ops llama-cli llama-bench llama-completion ggml-rpc-server -j"$JOBS"
+    "$CMAKE" --build "$llama_build" --target test-backend-ops llama-cli llama-bench llama-completion ggml-rpc-server -j"$JOBS"
 
     if command -v readelf >/dev/null 2>&1; then
         echo "=== Verifying zero-Google-.so Linux ARM64 binaries ==="
         for b in llama-cli llama-bench llama-completion test-backend-ops ggml-rpc-server; do
             local needed
-            needed="$(readelf -d "$ROOT/build-linux-arm64/bin/$b" | grep 'NEEDED' || true)"
+            needed="$(readelf -d "$llama_build/bin/$b" | grep 'NEEDED' || true)"
             if echo "$needed" | grep -Eqi 'libedgetpu|libdarwinn|libgxp|liblitert'; then
                 echo "ERROR: Forbidden Google TPU library found in $b!" >&2
+                exit 1
+            fi
+            if [[ "$is_static" == "1" ]] && readelf -l "$llama_build/bin/$b" | grep -qE 'INTERP|DYNAMIC'; then
+                echo "ERROR: Expected static ELF without PT_INTERP/PT_DYNAMIC for $b!" >&2
                 exit 1
             fi
         done
@@ -134,10 +156,11 @@ build_linux_arm64() {
 }
 
 case "$mode" in
-    overlay)     overlay_backend ;;
-    host)        build_host ;;
-    linux-arm64) build_linux_arm64 ;;
-    android)     build_android ;;
-    all)         build_host; build_android ;;
-    *)           echo "Usage: $0 [overlay|host|linux-arm64|android|all]" >&2; exit 2 ;;
+    overlay)          overlay_backend ;;
+    host)             build_host ;;
+    linux-arm64)      build_linux_arm64 ;;
+    linux-arm64-static) STATIC_LINUX=1; build_linux_arm64 ;;
+    android)          build_android ;;
+    all)              build_host; build_android ;;
+    *)                echo "Usage: $0 [overlay|host|linux-arm64|linux-arm64-static|android|all]" >&2; exit 2 ;;
 esac

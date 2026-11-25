@@ -62,6 +62,7 @@ std::string resolve_dive_interp_path(const char* explicit_path) {
   candidates.emplace_back("/usr/local/share/freetpu/dive_interp_rv64.bin");
   candidates.emplace_back("/usr/share/freetpu/dive_interp_rv64.bin");
   candidates.emplace_back("/usr/lib/firmware/google/dive_interp_rv64.bin");
+  candidates.emplace_back("/lib/firmware/google/dive_interp_rv64.bin");
   candidates.emplace_back("/usr/share/omamobile/tpu/dive_interp_rv64.bin");
   candidates.emplace_back(kAndroidDiveInterpPath);
 

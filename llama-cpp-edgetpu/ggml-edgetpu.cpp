@@ -2986,7 +2986,7 @@ ggml_backend_t ggml_backend_edgetpu_init(void) {
             "batch_siblings=%d, min_elements=%llu, packed_q8=%d, libopenbuenos=%d]\n",
             ob_context_is_mock(ob_ctx),
             emitter_ok ? 1 : 0,
-            env.mock_mode ? "(mock)" : interp_path,
+            env.mock_mode ? "(mock)" : (interp_path ? interp_path : "<auto>"),
             ob_context_credit_size(ob_ctx),
             env.cache_cap,
             env.pool_max_bytes / (1024u * 1024u),
