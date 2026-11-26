@@ -86,6 +86,16 @@ class TestColabFleet(unittest.TestCase):
         self.assertEqual(u["usage_rate_hr"], 11.42)
         self.assertEqual(u["active_assignments"], 2)
 
+    def test_classify_assign_error_ignores_rich_traceback_source_lines(self) -> None:
+        rich_503 = (
+            "│ 170 │ except TooManyAssignmentsError:\n"
+            "╰────────────────────────╯\n"
+            "ColabRequestError: Failed to issue request POST /tun/m/assign: Service Unavailable\n"
+        )
+        self.assertEqual(cf.classify_assign_error(rich_503), "503_UNAVAILABLE")
+        rich_412 = "[colab] Allocation refused (precondition failed). This can mean too many active sessions."
+        self.assertEqual(cf.classify_assign_error(rich_412), "412_TOO_MANY_ACTIVE")
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Unit tests for tools/colab_fleet.py")

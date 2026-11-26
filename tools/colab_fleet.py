@@ -602,15 +602,22 @@ def parse_usage_output(text: str) -> Dict[str, Any]:
 
 
 def classify_assign_error(text: str) -> str:
-    low = text.lower()
-    if "precondition failed" in low or "too many active" in low or "toomanyassignmentserror" in low or " 412" in low:
-        return "412_TOO_MANY_ACTIVE"
+    """Classify Colab CLI assign failures using only the final exception tail (ignoring Rich traceback source context)."""
+    tail = text
+    if "╰" in text:
+        after_box = text.rsplit("╰", 1)[-1]
+        lines = [ln.strip() for ln in after_box.splitlines()[1:] if ln.strip()]
+        if lines:
+            tail = " ".join(lines)
+    low = tail.lower()
     if "service unavailable" in low or " 503" in low:
         return "503_UNAVAILABLE"
-    if "too many requests" in low or " 429" in low:
-        return "429_RATE_LIMITED"
     if "readtimeout" in low or "read timed out" in low:
         return "READ_TIMEOUT"
+    if "too many requests" in low or " 429" in low:
+        return "429_RATE_LIMITED"
+    if "precondition failed" in low or "too many active" in low or "toomanyassignmentserror" in low or " 412" in low:
+        return "412_TOO_MANY_ACTIVE"
     return "OTHER_ERROR"
 
 
