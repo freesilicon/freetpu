@@ -843,7 +843,6 @@ class FastRolloutEngine:
             if hasattr(self.vllm_engine, "sleep"):
                 self.vllm_engine.sleep(level=sleep_level)
 
-    @torch.no_grad()
     def generate_tokens(
         self,
         input_ids: Any,
@@ -856,6 +855,7 @@ class FastRolloutEngine:
         use_static_cache: bool = True,
     ) -> tuple[Any, dict[str, Any]]:
         """Generate continuations via compiled decode or eager fallback, returning `(output_ids, telemetry)`."""
+        _require_torch()
         if self.model is None:
             raise RuntimeError("model is None")
         t0 = time.perf_counter()
@@ -872,50 +872,51 @@ class FastRolloutEngine:
             gen_kwargs["eos_token_id"] = int(eos_token_id)
 
         out_ids = None
-        if active_backend == "torch_compile_cudagraphs" and hasattr(self.model, "generate"):
-            try:
-                if use_static_cache:
-                    # HF static cache + torch.compile enables CUDA-graph-captured decode steps
-                    try:
-                        out_ids = self.model.generate(
-                            input_ids=input_ids,
-                            cache_implementation="static",
-                            **gen_kwargs,
-                        )
-                    except TypeError:
-                        out_ids = self.model.generate(input_ids=input_ids, **gen_kwargs)
-                else:
-                    out_ids = self.model.generate(input_ids=input_ids, **gen_kwargs)
-            except Exception as exc:
-                self.fallback_reason = f"compiled_generate_fallback: {type(exc).__name__}: {exc}"
-                active_backend = "eager_fallback"
-                out_ids = self.model.generate(input_ids=input_ids, **gen_kwargs)
-        elif hasattr(self.model, "generate"):
-            out_ids = self.model.generate(input_ids=input_ids, **gen_kwargs)
-        else:
-            # Lightweight autoregressive decode loop for nn.Module blocks without HF GenerationMixin
-            fwd = self._get_compiled_forward() if active_backend == "torch_compile_cudagraphs" else self.model.forward
-            cur = input_ids
-            for _ in range(max_new_tokens):
+        with torch.no_grad():
+            if active_backend == "torch_compile_cudagraphs" and hasattr(self.model, "generate"):
                 try:
-                    logits = fwd(cur)
+                    if use_static_cache:
+                        # HF static cache + torch.compile enables CUDA-graph-captured decode steps
+                        try:
+                            out_ids = self.model.generate(
+                                input_ids=input_ids,
+                                cache_implementation="static",
+                                **gen_kwargs,
+                            )
+                        except TypeError:
+                            out_ids = self.model.generate(input_ids=input_ids, **gen_kwargs)
+                    else:
+                        out_ids = self.model.generate(input_ids=input_ids, **gen_kwargs)
                 except Exception as exc:
-                    self.fallback_reason = f"compiled_fwd_fallback: {type(exc).__name__}: {exc}"
+                    self.fallback_reason = f"compiled_generate_fallback: {type(exc).__name__}: {exc}"
                     active_backend = "eager_fallback"
-                    fwd = self.model.forward
-                    logits = fwd(cur)
-                if hasattr(logits, "logits"):
-                    logits = logits.logits
-                next_logits = logits[:, -1, :]
-                if do_sample and temperature > 0:
-                    probs = torch.softmax(next_logits.float() / temperature, dim=-1)
-                    next_tok = torch.multinomial(probs, num_samples=1)
-                else:
-                    next_tok = torch.argmax(next_logits, dim=-1, keepdim=True)
-                cur = torch.cat([cur, next_tok], dim=-1)
-                if eos_token_id is not None and bool((next_tok == eos_token_id).all()):
-                    break
-            out_ids = cur
+                    out_ids = self.model.generate(input_ids=input_ids, **gen_kwargs)
+            elif hasattr(self.model, "generate"):
+                out_ids = self.model.generate(input_ids=input_ids, **gen_kwargs)
+            else:
+                # Lightweight autoregressive decode loop for nn.Module blocks without HF GenerationMixin
+                fwd = self._get_compiled_forward() if active_backend == "torch_compile_cudagraphs" else self.model.forward
+                cur = input_ids
+                for _ in range(max_new_tokens):
+                    try:
+                        logits = fwd(cur)
+                    except Exception as exc:
+                        self.fallback_reason = f"compiled_fwd_fallback: {type(exc).__name__}: {exc}"
+                        active_backend = "eager_fallback"
+                        fwd = self.model.forward
+                        logits = fwd(cur)
+                    if hasattr(logits, "logits"):
+                        logits = logits.logits
+                    next_logits = logits[:, -1, :]
+                    if do_sample and temperature > 0:
+                        probs = torch.softmax(next_logits.float() / temperature, dim=-1)
+                        next_tok = torch.multinomial(probs, num_samples=1)
+                    else:
+                        next_tok = torch.argmax(next_logits, dim=-1, keepdim=True)
+                    cur = torch.cat([cur, next_tok], dim=-1)
+                    if eos_token_id is not None and bool((next_tok == eos_token_id).all()):
+                        break
+                out_ids = cur
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
