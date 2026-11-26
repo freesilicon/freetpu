@@ -96,6 +96,10 @@ jobs:
           python3 tools/verify_chained_fusion.py
           python3 tools/verify_patch_proof.py
           python3 tools/colab_tpu_bench.py --self-test
+          python3 tools/h100_fast_kernels.py --self-test
+          python3 tools/test_h100_fast_kernels.py -v
+          python3 tools/colab_fleet.py --self-test
+          python3 tools/test_colab_fleet.py -v
 
       - name: Run Cloud TPU ops exporter & CDI self-tests
         run: |
