@@ -40,7 +40,7 @@ size_t clamp_bar_mmap_len(uint64_t bar_size, size_t max_len) {
 
 bool parse_pcie_rebar_cap(const uint8_t* cfg_bytes, size_t cfg_len, RebarCapabilityInfo* out) {
   if (!out) return false;
-  std::memset(out, 0, sizeof(*out));
+  *out = RebarCapabilityInfo{};
   if (!cfg_bytes || cfg_len < 0x108u) return false;
 
   auto read_u32_le = [&](size_t off) -> uint32_t {
@@ -658,7 +658,8 @@ bool VfioTransport::open_device(const ot_config_t& cfg, ot_device_info_t* info, 
     info->subsys_vendor_id = 0x1ae0u;
     info->subsys_device_id = 0x00afu;
     info->iommu_group = 0;
-    info->chip_gen = geom.chip_gen != OT_CHIP_UNKNOWN ? geom.chip_gen : OT_CHIP_V5E;
+    info->chip_gen =
+        geom.chip_gen != OT_CHIP_UNKNOWN ? geom.chip_gen : static_cast<uint32_t>(OT_CHIP_V5E);
     info->bar0_size = 0x100000000ULL;
     info->bar4_size = 0x1000000ULL;
     info->msix_vectors = 128u;
