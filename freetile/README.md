@@ -20,17 +20,33 @@
 
 ## Build & Test
 
+With `make` (zero external dependencies; builds `libfreetile.a`, `libfreetile_twin.a`, `build/freetile-twin`, and all unit/parity/twin tests):
+
+```bash
+make -C freetile test
+```
+
+With CMake:
+
 ```bash
 cmake -S freetile -B freetile/build -DCMAKE_BUILD_TYPE=Release
 cmake --build freetile/build
 ctest --test-dir freetile/build --output-on-failure
 ```
 
-To build `freetile` standalone without the optional `libopenbuenos` parity test:
+To build `freetile` standalone without the optional `libopenbuenos` parity test or digital twin:
 
 ```bash
-cmake -S freetile -B freetile/build -DCMAKE_BUILD_TYPE=Release -DFREETILE_BUILD_BUENOS_PARITY_TEST=OFF
+cmake -S freetile -B freetile/build -DCMAKE_BUILD_TYPE=Release -DFREETILE_BUILD_BUENOS_PARITY_TEST=OFF -DFREETILE_BUILD_DIGITAL_TWIN=OFF
 ```
+
+## Digital Twin (`freetile-twin`)
+
+- **C11-compatible API:** `include/freetile/twin.h` (`extern "C"`, `-std=c11` and `-std=c++17` clean) backed by `src/twin.cpp` and `libopenbuenos` `mock_mode=1`.
+- **CLI binary:** `build/freetile-twin` (built from `tools/freetile_twin_cli.cpp`).
+- **Supported workloads:** `gemm` (BF16/FP32/FP16/W8A8 + Mode-A SiLU/GELU), `swiglu` (11-chunk in-SRAM chained INT8 & quantized Q4_K/Q6_K/IQ4_NL/IQ4_XS/Q8_0/Q4_0), `flash_attn` (tile SRAM planner, KV DMA-BUF page policy, 0x640 online softmax), `w8a16`, `q4_k`, `q6_k`, `iq4_nl`, `iq4_xs`, `q8_0`, `q4_0`, `spline` (`0x640`), and raw `.dgc0` payloads (`--dgc0 <path>`).
+- **Target profiles:** Pixel 10 `buenos-a0` and Pixel 11 `malibu` (`malibu_profile.cpp` hybrid routing + 768 KiB narrow SRAM floor).
+- **Verdict format:** Deterministic `freesilicon.twin.v1` JSON (single evaluation, `--batch-jsonl` stdin streaming, and `--bench [N]` throughput mode).
 
 ## Live `v5e-1` Silicon Verification (`MAPS_LIBPYTHON=0`, `LDD_LIBPYTHON=0`)
 
