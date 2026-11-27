@@ -41,6 +41,7 @@ import hashlib
 import hmac
 import json
 import os
+import random
 import re
 import shutil
 import signal
@@ -497,10 +498,15 @@ class S3CompatibleSyncBackend(SyncBackend):
         return recs
 
     def describe(self) -> Dict[str, Any]:
-        # Strictly never emit access_key_id or secret_access_key!
+        # Strictly never emit access_key_id, secret_access_key, or raw R2 account-ID subdomains!
+        safe_endpoint = re.sub(
+            r"https://[a-f0-9]{16,}\.r2\.cloudflarestorage\.com",
+            "https://<redacted>.r2.cloudflarestorage.com",
+            self.cfg.endpoint,
+        )
         return {
             "mode": "s3",
-            "endpoint": self.cfg.endpoint,
+            "endpoint": safe_endpoint,
             "bucket": self.cfg.bucket,
             "region": self.cfg.region,
             "prefix": self.cfg.prefix,
@@ -621,8 +627,25 @@ def classify_assign_error(text: str) -> str:
     return "OTHER_ERROR"
 
 
+def compute_backoff_s(
+    attempt: int,
+    *,
+    base_s: float = 30.0,
+    cap_s: float = 300.0,
+    jitter_frac: float = 0.15,
+    rng: Optional[random.Random] = None,
+) -> float:
+    """Exponential backoff with bounded symmetric jitter (30s -> 60s -> 120s -> ... cap 300s)."""
+    n = max(1, int(attempt))
+    raw = min(cap_s, base_s * (2.0 ** (n - 1)))
+    if jitter_frac > 0.0:
+        r = rng or random
+        raw = raw * (1.0 + r.uniform(-jitter_frac, jitter_frac))
+    return round(max(1.0, min(cap_s, raw)), 2)
+
+
 class ColabFleetDispatcher:
-    """Thread-safe 7-slot Colab Fleet dispatcher with durable telemetry and isolated teardown."""
+    """Thread-safe 7-slot Colab Fleet dispatcher with persistent VM reuse, polite pacing & isolated teardown."""
 
     def __init__(
         self,
@@ -633,8 +656,18 @@ class ColabFleetDispatcher:
         governor_cfg: CuGovernorConfig,
         sync_mode: str = "local",
         s3_cfg: Optional[S3Config] = None,
-        sku_cooldown_s: float = 90.0,
+        sku_cooldown_s: Optional[float] = None,
+        backoff_base_s: float = 30.0,
+        backoff_cap_s: float = 300.0,
+        backoff_jitter_frac: float = 0.15,
+        spawn_spacing_s: Optional[float] = None,
+        reuse_sessions: bool = True,
+        max_jobs_per_session: int = 16,
+        wait_on_cooldown: bool = False,
+        max_cooldown_wait_s: float = 600.0,
         command_runner: Optional[Callable[[Sequence[str], int], subprocess.CompletedProcess[str]]] = None,
+        sleep_fn: Optional[Callable[[float], None]] = None,
+        rng: Optional[random.Random] = None,
     ) -> None:
         self.colab_bin = colab_bin
         self.auth = auth
@@ -645,10 +678,30 @@ class ColabFleetDispatcher:
         self.cfg_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.list_cfg = self.cfg_dir / "list-sessions.json"
         self.governor = CuGovernor(governor_cfg)
-        self.sku_cooldown_s = sku_cooldown_s
+        self.backoff_base_s = float(sku_cooldown_s if sku_cooldown_s is not None else backoff_base_s)
+        self.backoff_cap_s = max(self.backoff_base_s, float(backoff_cap_s))
+        self.backoff_jitter_frac = max(0.0, min(0.5, float(backoff_jitter_frac)))
+        # Default 18s polite spacing on live Colab; 0s in offline mock unit tests unless explicitly set
+        self.spawn_spacing_s = (
+            float(spawn_spacing_s)
+            if spawn_spacing_s is not None
+            else (0.0 if command_runner is not None else 18.0)
+        )
+        self.reuse_sessions = bool(reuse_sessions)
+        self.max_jobs_per_session = max(1, int(max_jobs_per_session))
+        self.wait_on_cooldown = bool(wait_on_cooldown)
+        self.max_cooldown_wait_s = max(0.0, float(max_cooldown_wait_s))
+        self._sleep = sleep_fn or time.sleep
+        self._rng = rng or random.Random()
         self._lock = threading.Lock()
         self._owned_sessions: Dict[str, Dict[str, Any]] = {}
+        self._idle_sessions: List[Dict[str, Any]] = []
+        self._pending_snapshot: List[FleetJob] = []
         self._sku_cooldown_until: Dict[str, float] = {}
+        self._sku_refusal_count: Dict[str, int] = {}
+        self._last_spawn_monotonic: Optional[float] = None
+        self._sessions_created_count: int = 0
+        self._sessions_reused_count: int = 0
         self._job_states: Dict[str, Dict[str, Any]] = {}
         self._spent_today_cu: float = 0.0
         self._stop_requested = threading.Event()
@@ -745,6 +798,78 @@ class ColabFleetDispatcher:
             return False, f"cpu_cap_reached ({cpu_cnt}/{self.governor.cfg.max_cpu_slots})"
         return True, "ok"
 
+    def _pace_spawn(self, job_id: str, sku: str) -> None:
+        """Enforce >= spawn_spacing_s gap between distinct `colab new` calls to avoid burst 503s."""
+        if self.spawn_spacing_s <= 0.0:
+            self._last_spawn_monotonic = time.monotonic()
+            return
+        if self._last_spawn_monotonic is not None:
+            elapsed = time.monotonic() - self._last_spawn_monotonic
+            wait_s = self.spawn_spacing_s - elapsed
+            if wait_s > 0.0 and not self._stop_requested.is_set():
+                self.log_event("spawn_pacing_wait", {"job_id": job_id, "sku": sku, "wait_s": round(wait_s, 2)})
+                self._sleep(wait_s)
+        self._last_spawn_monotonic = time.monotonic()
+
+    def _acquire_idle_session(self, job: FleetJob) -> Optional[Dict[str, Any]]:
+        """Reuse an already-provisioned compatible live session if available (cuts VM creates ~10x)."""
+        if not self.reuse_sessions:
+            return None
+        with self._lock:
+            for idx, entry in enumerate(self._idle_sessions):
+                if (
+                    entry["class"] == job.accelerator_class
+                    and entry["sku"] in job.sku_preference
+                    and entry["jobs_run"] < self.max_jobs_per_session
+                    and entry["session"] in self._owned_sessions
+                ):
+                    picked = self._idle_sessions.pop(idx)
+                    self._sessions_reused_count += 1
+                    self._owned_sessions[picked["session"]]["job_id"] = job.job_id
+                    break
+            else:
+                return None
+        self.log_event("session_reused", {
+            "job_id": job.job_id,
+            "session": picked["session"],
+            "sku": picked["sku"],
+            "zone": picked["assignment"].get("zone"),
+            "jobs_run_so_far": picked["jobs_run"],
+        })
+        return picked
+
+    def _has_compatible_pending(self, acc_class: str, sku: str) -> bool:
+        with self._lock:
+            return any(j.accelerator_class == acc_class and sku in j.sku_preference for j in self._pending_snapshot)
+
+    def _drain_unneeded_idle_sessions(self, pending: Sequence[FleetJob]) -> None:
+        """Immediately stop any idle parked session that has no remaining compatible pending jobs."""
+        to_stop: List[str] = []
+        with self._lock:
+            keep: List[Dict[str, Any]] = []
+            for entry in self._idle_sessions:
+                compatible = any(
+                    j.accelerator_class == entry["class"] and entry["sku"] in j.sku_preference
+                    for j in pending
+                )
+                if compatible and entry["jobs_run"] < self.max_jobs_per_session and not self._stop_requested.is_set():
+                    keep.append(entry)
+                else:
+                    to_stop.append(entry["session"])
+            self._idle_sessions = keep
+        for sname in to_stop:
+            self.stop_owned_session(sname)
+
+    def _earliest_cooldown_wait_s(self, pending: Sequence[FleetJob]) -> Optional[float]:
+        now = time.monotonic()
+        waits: List[float] = []
+        for j in pending:
+            for sku in j.sku_preference:
+                until = self._sku_cooldown_until.get(sku, 0.0)
+                if until > now:
+                    waits.append(until - now)
+        return min(waits) if waits else None
+
     def _provision_job_session(self, job: FleetJob) -> Tuple[Optional[str], Optional[str], Optional[Dict[str, Any]], str]:
         now = time.monotonic()
         for sku in job.sku_preference:
@@ -752,6 +877,9 @@ class ColabFleetDispatcher:
                 continue
             if self._sku_cooldown_until.get(sku, 0.0) > now:
                 continue
+            if self._stop_requested.is_set():
+                return None, None, None, "stop_requested"
+            self._pace_spawn(job.job_id, sku)
             sess_name = f"fleet-{job.job_id[:18]}-{sku.lower()}-{uuid.uuid4().hex[:6]}"
             cfg_path = self.cfg_dir / f"{sess_name}.json"
             flags = list(SKU_CLI_FLAGS[sku])
@@ -771,20 +899,39 @@ class ColabFleetDispatcher:
                     matched = new_eps[:1]
                 assign = matched[0] if matched else {"name": sess_name, "endpoint": "unknown", "zone": None}
                 with self._lock:
+                    self._sku_refusal_count[sku] = 0
+                    self._sessions_created_count += 1
                     self._owned_sessions[sess_name] = {
                         "job_id": job.job_id,
                         "sku": sku,
+                        "class": job.accelerator_class,
                         "cfg_path": str(cfg_path),
                         "assignment": assign,
+                        "jobs_run": 0,
                         "started_utc": utc_now_iso(),
                     }
                 self.log_event("session_allocated", {"job_id": job.job_id, "session": sess_name, "sku": sku, "zone": assign.get("zone")})
                 return sess_name, sku, assign, "ok"
 
             err_code = classify_assign_error(p.stdout + "\n" + p.stderr)
-            self.log_event("sku_refused", {"job_id": job.job_id, "sku": sku, "error_code": err_code})
             if err_code in ("503_UNAVAILABLE", "429_RATE_LIMITED", "READ_TIMEOUT"):
-                self._sku_cooldown_until[sku] = time.monotonic() + self.sku_cooldown_s
+                attempt_n = self._sku_refusal_count.get(sku, 0) + 1
+                self._sku_refusal_count[sku] = attempt_n
+                backoff_s = compute_backoff_s(
+                    attempt_n,
+                    base_s=self.backoff_base_s,
+                    cap_s=self.backoff_cap_s,
+                    jitter_frac=self.backoff_jitter_frac,
+                    rng=self._rng,
+                )
+                self._sku_cooldown_until[sku] = time.monotonic() + backoff_s
+                self.log_event("sku_refused", {
+                    "job_id": job.job_id,
+                    "sku": sku,
+                    "error_code": err_code,
+                    "attempt": attempt_n,
+                    "backoff_s": backoff_s,
+                })
                 # On ReadTimeout, reconcile before moving to next SKU so we never double-allocate!
                 if err_code == "READ_TIMEOUT":
                     after = self.list_sessions()
@@ -792,6 +939,7 @@ class ColabFleetDispatcher:
                     if leaked:
                         self.stop_owned_session(sess_name)
                 continue
+            self.log_event("sku_refused", {"job_id": job.job_id, "sku": sku, "error_code": err_code})
             if err_code == "412_TOO_MANY_ACTIVE":
                 return None, None, None, err_code
         return None, None, None, "no_sku_available"
@@ -825,12 +973,23 @@ class ColabFleetDispatcher:
             "external_sessions_preserved": [s["endpoint"] for s in after if not s["name"].startswith("fleet-")],
         }
 
-    def _execute_one_job(self, job: FleetJob, sess_name: str, sku: str, assign: Dict[str, Any]) -> Dict[str, Any]:
+    def _execute_one_job(
+        self,
+        job: FleetJob,
+        sess_name: str,
+        sku: str,
+        assign: Dict[str, Any],
+        *,
+        reused: bool = False,
+        jobs_run_before: int = 0,
+    ) -> Dict[str, Any]:
         t0 = time.perf_counter()
         cfg_path = self.cfg_dir / f"{sess_name}.json"
         log_path = self.run_dir / f"{job.job_id}.log"
         rc = 1
         note = ""
+        jobs_run_after = jobs_run_before + 1
+        parked = False
         try:
             if job.uploads:
                 self.sync.stage_inputs(sess_name, job.uploads)
@@ -848,7 +1007,29 @@ class ColabFleetDispatcher:
             note = redact_secrets(f"{type(exc).__name__}: {exc}")[:200]
             rc = 1
         finally:
-            self.stop_owned_session(sess_name)
+            can_reuse = (
+                rc == 0
+                and self.reuse_sessions
+                and not self._stop_requested.is_set()
+                and jobs_run_after < self.max_jobs_per_session
+                and self._has_compatible_pending(job.accelerator_class, sku)
+            )
+            if can_reuse:
+                with self._lock:
+                    if sess_name in self._owned_sessions:
+                        self._owned_sessions[sess_name]["jobs_run"] = jobs_run_after
+                        self._idle_sessions.append({
+                            "session": sess_name,
+                            "sku": sku,
+                            "class": job.accelerator_class,
+                            "assignment": assign,
+                            "jobs_run": jobs_run_after,
+                        })
+                        parked = True
+            if parked:
+                self.log_event("session_parked_for_reuse", {"session": sess_name, "sku": sku, "jobs_run": jobs_run_after})
+            else:
+                self.stop_owned_session(sess_name)
         elapsed_s = round(time.perf_counter() - t0, 2)
         est_cu = round((elapsed_s / 3600.0) * SKU_EST_CU_HR.get(sku, 1.0), 4)
         with self._lock:
@@ -859,13 +1040,23 @@ class ColabFleetDispatcher:
                 "status": "done" if rc == 0 else "failed",
                 "sku": sku,
                 "zone": assign.get("zone"),
+                "session": sess_name,
+                "reused_session": reused,
                 "elapsed_s": elapsed_s,
                 "est_cu": est_cu,
                 "rc": rc,
                 "log": str(log_path),
                 "note": note,
             }
-        self.log_event("job_finished", {"job_id": job.job_id, "rc": rc, "sku": sku, "elapsed_s": elapsed_s, "est_cu": est_cu})
+        self.log_event("job_finished", {
+            "job_id": job.job_id,
+            "rc": rc,
+            "sku": sku,
+            "session": sess_name,
+            "reused_session": reused,
+            "elapsed_s": elapsed_s,
+            "est_cu": est_cu,
+        })
         return self._job_states[job.job_id]
 
     def plan_dry_run(self, jobs: Sequence[FleetJob]) -> Dict[str, Any]:
@@ -914,7 +1105,10 @@ class ColabFleetDispatcher:
             }
 
         pending = sorted(jobs, key=lambda x: (x.wave, x.job_id))
+        with self._lock:
+            self._pending_snapshot = list(pending)
         running: Dict[concurrent.futures.Future[Dict[str, Any]], FleetJob] = {}
+        cooldown_waited_s = 0.0
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=self.governor.cfg.max_total_slots) as pool:
                 while (pending or running) and not self._stop_requested.is_set():
@@ -922,6 +1116,11 @@ class ColabFleetDispatcher:
                     done_futs = [f for f in list(running.keys()) if f.done()]
                     for f in done_futs:
                         running.pop(f, None)
+
+                    with self._lock:
+                        self._pending_snapshot = list(pending)
+                    # Immediately tear down any parked idle session that no longer matches a pending job
+                    self._drain_unneeded_idle_sessions(pending)
 
                     usage = self.get_usage()
                     dec = self.governor.evaluate(
@@ -936,11 +1135,36 @@ class ColabFleetDispatcher:
                         break
 
                     if dec.admitted and pending:
-                        # Admit jobs from the lowest active wave (or concurrent TPU/CPU lanes)
                         active_sessions = self.list_sessions()
                         launched_any = False
                         next_pending: List[FleetJob] = []
-                        for job in pending:
+                        for idx_j, job in enumerate(pending):
+                            # 1. Prefer reusing a live compatible parked session (zero VM spawn!)
+                            reused_entry = self._acquire_idle_session(job)
+                            if reused_entry is not None:
+                                sess_name = reused_entry["session"]
+                                sku = reused_entry["sku"]
+                                assign = reused_entry["assignment"]
+                                jobs_run_before = reused_entry["jobs_run"]
+                                with self._lock:
+                                    self._job_states[job.job_id]["status"] = "running"
+                                    self._job_states[job.job_id]["sku"] = sku
+                                    self._job_states[job.job_id]["zone"] = assign.get("zone")
+                                    self._pending_snapshot = list(next_pending) + list(pending[idx_j + 1 :])
+                                fut = pool.submit(
+                                    self._execute_one_job,
+                                    job,
+                                    sess_name,
+                                    sku,
+                                    assign,
+                                    reused=True,
+                                    jobs_run_before=jobs_run_before,
+                                )
+                                running[fut] = job
+                                launched_any = True
+                                continue
+
+                            # 2. Otherwise check slot caps and spawn a new session politely
                             ok_slot, _reason = self._can_admit_slot(
                                 job.accelerator_class,
                                 active_sessions,
@@ -955,12 +1179,21 @@ class ColabFleetDispatcher:
                                     self._job_states[job.job_id]["status"] = "running"
                                     self._job_states[job.job_id]["sku"] = sku
                                     self._job_states[job.job_id]["zone"] = assign.get("zone")
+                                    self._pending_snapshot = list(next_pending) + list(pending[idx_j + 1 :])
                                 active_sessions.append({
                                     "name": sess_name,
                                     "endpoint": assign.get("endpoint", ""),
                                     "kind": job.accelerator_class,
                                 })
-                                fut = pool.submit(self._execute_one_job, job, sess_name, sku, assign)
+                                fut = pool.submit(
+                                    self._execute_one_job,
+                                    job,
+                                    sess_name,
+                                    sku,
+                                    assign,
+                                    reused=False,
+                                    jobs_run_before=0,
+                                )
                                 running[fut] = job
                                 launched_any = True
                             else:
@@ -968,11 +1201,22 @@ class ColabFleetDispatcher:
                                     self._job_states[job.job_id]["note"] = f"deferred:{status}"
                                 next_pending.append(job)
                                 if status == "412_TOO_MANY_ACTIVE":
-                                    # Stop admitting more slots right now
-                                    next_pending.extend(pending[pending.index(job) + 1 :])
+                                    next_pending.extend(pending[idx_j + 1 :])
                                     break
                         pending = next_pending
+                        with self._lock:
+                            self._pending_snapshot = list(pending)
                         if not launched_any and not running:
+                            wait_s = self._earliest_cooldown_wait_s(pending) if self.wait_on_cooldown else None
+                            if (
+                                wait_s is not None
+                                and not self._stop_requested.is_set()
+                                and (cooldown_waited_s + wait_s) <= self.max_cooldown_wait_s
+                            ):
+                                self.log_event("cooldown_wait", {"wait_s": round(wait_s, 2), "pending": len(pending)})
+                                self._sleep(wait_s)
+                                cooldown_waited_s += wait_s
+                                continue
                             # All SKUs on cooldown or refused; stop cleanly instead of spinning
                             break
 
@@ -981,6 +1225,9 @@ class ColabFleetDispatcher:
         finally:
             signal.signal(signal.SIGINT, old_int)
             signal.signal(signal.SIGTERM, old_term)
+            with self._lock:
+                self._idle_sessions.clear()
+                self._pending_snapshot = []
             teardown = self.teardown_all_owned()
             usage_end = self.get_usage()
             cu_delta = (
@@ -995,6 +1242,15 @@ class ColabFleetDispatcher:
                 "usage_after": usage_end,
                 "cu_delta": cu_delta,
                 "sync_backend": self.sync.describe(),
+                "session_efficiency": {
+                    "reuse_sessions": self.reuse_sessions,
+                    "max_jobs_per_session": self.max_jobs_per_session,
+                    "sessions_created": self._sessions_created_count,
+                    "sessions_reused": self._sessions_reused_count,
+                    "spawn_spacing_s": self.spawn_spacing_s,
+                    "backoff_base_s": self.backoff_base_s,
+                    "backoff_cap_s": self.backoff_cap_s,
+                },
                 "jobs": self._job_states,
                 "teardown": teardown,
             }
@@ -1153,6 +1409,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--max-gpu-slots", type=int, default=3, help="Max concurrent GPU slots (default: 3).")
     parser.add_argument("--max-tpu-slots", type=int, default=2, help="Max concurrent TPU slots (default: 2).")
     parser.add_argument("--max-cpu-slots", type=int, default=4, help="Max concurrent CPU slots (default: 4).")
+    parser.add_argument("--reuse-sessions", dest="reuse_sessions", action="store_true", default=True, help="Reuse live sessions across compatible shards (default: enabled).")
+    parser.add_argument("--no-reuse-sessions", dest="reuse_sessions", action="store_false", help="Stop each session after 1 job instead of reusing across shards.")
+    parser.add_argument("--max-jobs-per-session", type=int, default=16, help="Max sequential jobs/shards per reused session (default: 16).")
+    parser.add_argument("--spawn-spacing-s", type=float, default=18.0, help="Minimum seconds between distinct VM spawns (default: 18.0).")
+    parser.add_argument("--backoff-base-s", type=float, default=30.0, help="Initial 503/429 exponential backoff seconds (default: 30.0).")
+    parser.add_argument("--backoff-cap-s", type=float, default=300.0, help="Maximum 503/429 exponential backoff seconds (default: 300.0).")
+    parser.add_argument("--wait-on-cooldown", action="store_true", help="Wait out active SKU backoffs up to --max-cooldown-wait-s instead of exiting early.")
+    parser.add_argument("--max-cooldown-wait-s", type=float, default=600.0, help="Max cumulative seconds to wait on SKU cooldowns when --wait-on-cooldown is set (default: 600.0).")
     parser.add_argument("--dry-run", action="store_true", help="Print planned fleet dispatch without provisioning VMs.")
     parser.add_argument("--self-test", action="store_true", help="Run offline self-test with mocked Colab & S3 (0 CUs).")
     args = parser.parse_args(argv)
@@ -1184,6 +1448,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         run_dir=run_dir,
         governor_cfg=gov_cfg,
         sync_mode=args.sync,
+        reuse_sessions=args.reuse_sessions,
+        max_jobs_per_session=args.max_jobs_per_session,
+        spawn_spacing_s=args.spawn_spacing_s,
+        backoff_base_s=args.backoff_base_s,
+        backoff_cap_s=args.backoff_cap_s,
+        wait_on_cooldown=args.wait_on_cooldown,
+        max_cooldown_wait_s=args.max_cooldown_wait_s,
     )
     if args.dry_run:
         print(json.dumps(disp.plan_dry_run(jobs), indent=2))

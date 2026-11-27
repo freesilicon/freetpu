@@ -37,16 +37,19 @@ python3 tools/test_h100_fast_kernels.py -v
 
 Extends [`tools/colab_tpu_bench.py`](../../tools/colab_tpu_bench.py) isolation and zero-idle-burn patterns to concurrent multi-lane GPU + TPU + High-RAM CPU sweeps:
 
-### Concurrency & Slot Isolation
+### Concurrency, Persistent VM Reuse & Polite Pacing
 - **Total Cap (`--max-total-slots 7`):** Queries live `colab sessions` and counts all active assignments (including pre-existing external sessions). Never stops, execs on, or touches any session not prefixed `fleet-`.
-- **Accelerator Caps & Ordered Fallback (`COLAB_CLI_ASSIGN_RETRIES=0`):**
-  - GPU (`--max-gpu-slots 3`): `H100 -> A100_HM -> A100 -> L4 -> T4_HM -> T4` with per-SKU cooldown backoff on `503`/`429` and immediate stop on `412`.
+- **Persistent VM Session Reuse (`--reuse-sessions`, default ON; `--max-jobs-per-session 16`):** Reuses live compatible sessions across sequential jobs/shards of the same accelerator class instead of creating/stopping a fresh VM per shard (~10× fewer VM spawns and zero cold-start overhead). Immediately drains and stops any idle session once no compatible pending jobs remain, guaranteeing `zero_fleet_leaked=true`.
+- **Polite Spawn Pacing & Exponential Backoff (`COLAB_CLI_ASSIGN_RETRIES=0`):**
+  - Enforces `--spawn-spacing-s 18` between distinct `colab new` calls to avoid Colab rapid-spawn burst throttles.
+  - Applies per-SKU exponential backoff with ±15% jitter (`--backoff-base-s 30` → `60` → `120` → `240` → `--backoff-cap-s 300`) on `503`/`429`/`ReadTimeout`, plus optional `--wait-on-cooldown` (`--max-cooldown-wait-s 600`), and immediate stop on `412`.
+  - GPU (`--max-gpu-slots 3`): `H100 -> A100_HM -> A100 -> L4 -> T4_HM -> T4`.
   - TPU (`--max-tpu-slots 2`): `V6E1 -> V5E1` with verified-zero-leak reconciliation on `ReadTimeout`.
   - CPU (`--max-cpu-slots 4`): `CPU_HM` (`8` vCPU / `51 GiB` RAM) and `CPU` workers for verifiers and DiLoCo/merge coordination.
 
 ### Dual Pluggable Sync Backends
 - **`--sync local` (Default):** Zero cloud credentials on Colab. Stages inputs via `colab upload` and retrieves artifacts via `colab download` to a private `0700` local directory.
-- **`--sync s3`:** Generic S3-compatible object store (Cloudflare R2, GCS HMAC, MinIO, AWS S3) using pure-stdlib AWS Signature V4 configured via environment variables (`FREETPU_S3_ENDPOINT`, `FREETPU_S3_BUCKET`, `FREETPU_S3_ACCESS_KEY_ID`, `FREETPU_S3_SECRET_ACCESS_KEY`, optional `FREETPU_S3_REGION=auto`, `FREETPU_S3_PREFIX`). Credentials are never logged or written to `STATE.md`, `events.jsonl`, or `PROOF.md`.
+- **`--sync s3`:** Generic S3-compatible object store (Cloudflare R2, GCS HMAC, MinIO, AWS S3) using pure-stdlib AWS Signature V4 configured via environment variables (`FREETPU_S3_ENDPOINT`, `FREETPU_S3_BUCKET`, `FREETPU_S3_ACCESS_KEY_ID`, `FREETPU_S3_SECRET_ACCESS_KEY`, optional `FREETPU_S3_REGION=auto`, `FREETPU_S3_PREFIX`). Credentials and R2 account-ID subdomains are never logged or written to `STATE.md`, `events.jsonl`, or `PROOF.md`.
 
 ### Two-Stage CU Governor
 - **Sprint Mode (`balance_cu > --floor-cu`, default `500` CUs):** Runs up to 7 slots concurrently across queued waves until balance reaches `--floor-cu`.
