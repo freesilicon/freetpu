@@ -1509,7 +1509,8 @@ void ob_context_destroy(ob_context_t* ctx) {
           "hw_us=%llu wall_us=%llu quant_us=%llu hash_us=%llu pack_us=%llu dma_sync_us=%llu "
           "submit_us=%llu wait_us=%llu dequant_us=%llu sat_retries=%llu spin_hits=%llu "
           "poll_waits=%llu pool_hits=%llu pool_misses=%llu w_hits=%llu w_misses=%llu "
-          "w_evict=%llu w_bytes=%llu w_peak_bytes=%llu w_budget_bytes=%llu\n",
+          "w_evict=%llu w_bytes=%llu w_peak_bytes=%llu w_budget_bytes=%llu "
+          "w_entries=%llu w_peak_entries=%llu\n",
           static_cast<unsigned long long>(ps.calls),
           static_cast<unsigned long long>(ps.tiles_dispatched),
           static_cast<unsigned long long>(ps.horiz_fusions),
@@ -1536,7 +1537,9 @@ void ob_context_destroy(ob_context_t* ctx) {
           static_cast<unsigned long long>(ps.weight_cache_evictions),
           static_cast<unsigned long long>(ps.weight_cache_bytes),
           static_cast<unsigned long long>(ps.weight_cache_peak_bytes),
-          static_cast<unsigned long long>(ps.weight_cache_budget_bytes));
+          static_cast<unsigned long long>(ps.weight_cache_budget_bytes),
+          static_cast<unsigned long long>(ctx->weight_cache_map.size()),
+          static_cast<unsigned long long>(ctx->weight_cache_peak_entries));
     }
   }
   ctx->async_dequant.shutdown();

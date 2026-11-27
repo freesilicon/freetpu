@@ -6436,31 +6436,53 @@ void test_zero_repack_weight_cache_and_prepack() {
     ob_context_destroy(ctx);
   }
 
-  // 3. Simulated MemAvailable = 2200 MiB: auto uses MemAvailable/3 (~733 MiB), explicit 1200 MiB is honored,
-  //    and oversized explicit 2048 MiB respects 384 MiB headroom reserve (1816 MiB).
+  // 3. Budget guard & FD-entry cap:
+  //    - auto uses LMKD-safe MemAvailable/3 (2200 MiB -> ~733 MiB)
+  //    - explicit OPENBUENOS_WEIGHT_CACHE_MB=1200 is honored
+  //    - oversized explicit OPENBUENOS_WEIGHT_CACHE_MB=2048 honors 512 MiB headroom reserve (2200 -> 1688 MiB)
+  //    - default kDefaultWeightCacheMaxEntries = 16384 and OPENBUENOS_WEIGHT_CACHE_ENTRIES honors up to 32768
   {
+    CHECK(ob::kDefaultWeightCacheMaxEntries == 16384u);
+
     ob_config_t cfg = ob_config_default();
     cfg.mock_mode = 1;
     ob_context_t* ctx = nullptr;
     CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
     ctx->simulated_mem_available_set = true;
-    ctx->simulated_mem_available_bytes = 2200ULL * 1024u * 1024u;
     ctx->mock_mode = false;
 
     ::unsetenv("OPENBUENOS_WEIGHT_CACHE_MB");
-    const size_t auto_cap = ob::compute_weight_cache_budget_bytes(ctx);
-    CHECK(auto_cap == (2200ULL * 1024u * 1024u) / 3u);
+    ctx->simulated_mem_available_bytes = 2200ULL * 1024u * 1024u;
+    CHECK(ob::compute_weight_cache_budget_bytes(ctx) == (2200ULL * 1024u * 1024u) / 3u);
 
     ::setenv("OPENBUENOS_WEIGHT_CACHE_MB", "1200", 1);
-    const size_t explicit_ok = ob::compute_weight_cache_budget_bytes(ctx);
-    CHECK(explicit_ok == 1200ULL * 1024u * 1024u);
+    CHECK(ob::compute_weight_cache_budget_bytes(ctx) == 1200ULL * 1024u * 1024u);
 
     ::setenv("OPENBUENOS_WEIGHT_CACHE_MB", "2048", 1);
-    const size_t explicit_reserve = ob::compute_weight_cache_budget_bytes(ctx);
-    CHECK(explicit_reserve == (2200ULL - 384ULL) * 1024u * 1024u);
+    CHECK(ob::compute_weight_cache_budget_bytes(ctx) == (2200ULL - 512ULL) * 1024u * 1024u);
 
     ::unsetenv("OPENBUENOS_WEIGHT_CACHE_MB");
+    ctx->simulated_mem_available_set = false;
+    ctx->simulated_mem_available_bytes = 0u;
     ctx->mock_mode = true;
+    CHECK(ob_gemm_register_builtin_emitter(ctx, interp_file.path()) == OB_OK);
+    uint8_t dummy_q4[18]{};
+    ob_gemm_f32_quant_job_t ejob{};
+    ejob.b_nk = dummy_q4;
+    ejob.n_dim = 1u;
+    ob_gemm_f32_quant_job_set_type(&ejob, OB_QUANT_Q4_0);
+    ob_prepack_stats_t epst{};
+    ::unsetenv("OPENBUENOS_WEIGHT_CACHE_ENTRIES");
+    ctx->weight_cache_max_entries = 0u;
+    CHECK(ob_gemm_prepack_quant_batch(ctx, 1u, 32u, &ejob, 1u, &epst) == OB_OK);
+    CHECK(ctx->weight_cache_max_entries == ctx->weight_cache_default_max_entries);
+
+    ::setenv("OPENBUENOS_WEIGHT_CACHE_ENTRIES", "32768", 1);
+    ctx->weight_cache_max_entries = 0u;
+    CHECK(ob_gemm_prepack_quant_batch(ctx, 1u, 32u, &ejob, 1u, &epst) == OB_OK);
+    CHECK(ctx->weight_cache_max_entries == 32768u);
+
+    ::unsetenv("OPENBUENOS_WEIGHT_CACHE_ENTRIES");
     ob_context_destroy(ctx);
   }
 

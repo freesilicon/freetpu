@@ -23,7 +23,7 @@ namespace ob {
 constexpr uint32_t kDefaultGraphCacheCapacity     = 512u;
 constexpr size_t   kDefaultBufferPoolMaxBytes     = 64u * 1024u * 1024u;
 constexpr size_t   kDefaultBufferPoolMaxCount     = 256u;
-constexpr size_t   kDefaultWeightCacheMaxEntries  = 4096u;
+constexpr size_t   kDefaultWeightCacheMaxEntries  = 16384u;
 constexpr uint32_t kDefaultTimeoutMs              = 5000u;
 constexpr uint32_t kDefaultTileMaxM           = 64u;
 constexpr uint32_t kDefaultTileMaxK           = 2048u;
@@ -796,9 +796,10 @@ struct ob_context {
   std::list<ob::CachedWeightTile*> weight_cache_lru;
   size_t weight_cache_bytes = 0;
   size_t weight_cache_peak_bytes = 0;
-  size_t weight_cache_max_bytes = 0;   // lazily initialized (min(2048 MiB, MemAvailable/3) on Android)
+  size_t weight_cache_peak_entries = 0;
+  size_t weight_cache_max_bytes = 0;   // lazily initialized (auto up to 1536 MiB with 512 MiB reserve)
   size_t weight_cache_default_max_entries = ob::kDefaultWeightCacheMaxEntries;
-  size_t weight_cache_max_entries = 0; // FD-safe cap (default 4096, env OPENBUENOS_WEIGHT_CACHE_ENTRIES)
+  size_t weight_cache_max_entries = 0; // FD-safe cap (default 16384, env OPENBUENOS_WEIGHT_CACHE_ENTRIES)
   size_t outlier_cache_bytes = 0;      // Separate tracked total of cached FP32 outlier columns
   std::vector<ob::ImmutableWeightRegion> immutable_weight_regions;
   uint64_t next_immutable_region_gen = 1u;

@@ -475,12 +475,12 @@ size_t compute_weight_cache_budget_bytes_impl(ob_context* ctx) {
   }
   if (have_mem_avail) {
     // Auto mode uses LMKD-safe MemAvailable / 3 ceiling; explicit OPENBUENOS_WEIGHT_CACHE_MB
-    // honors higher budgets on Linux hosts while reserving >= 384 MiB OS/KV headroom.
+    // honors higher budgets on Linux hosts while reserving >= 512 MiB OS/KV headroom (>= 450 MiB).
     const size_t lmkd_cap = mem_avail / 3u;
     size_t safe_cap = lmkd_cap;
     if (explicit_cap) {
-      constexpr size_t kReserveBytes = 384u * 1024u * 1024u;
-      const size_t headroom_cap = (mem_avail > 512u * 1024u * 1024u)
+      constexpr size_t kReserveBytes = 512u * 1024u * 1024u;
+      const size_t headroom_cap = (mem_avail > 640u * 1024u * 1024u)
           ? (mem_avail - kReserveBytes)
           : (mem_avail / 2u);
       safe_cap = std::max<size_t>(lmkd_cap, headroom_cap);
@@ -502,7 +502,7 @@ void ensure_weight_cache_budget(ob_context* ctx, bool refresh_meminfo = false) {
     if (env_e && env_e[0]) {
       unsigned long lim = std::strtoul(env_e, nullptr, 10);
       if (lim < 64ul) lim = 64ul;
-      if (lim > 16384ul) lim = 16384ul;
+      if (lim > 32768ul) lim = 32768ul;
       ctx->weight_cache_max_entries = static_cast<size_t>(lim);
     } else {
       ctx->weight_cache_max_entries = ctx->weight_cache_default_max_entries;
@@ -583,6 +583,9 @@ bool weight_cache_insert_locked(ob_context* ctx, CachedWeightTile* tile) {
   ctx->weight_cache_bytes += tile->ext2_bytes;
   if (ctx->weight_cache_bytes > ctx->weight_cache_peak_bytes) {
     ctx->weight_cache_peak_bytes = ctx->weight_cache_bytes;
+  }
+  if (ctx->weight_cache_map.size() > ctx->weight_cache_peak_entries) {
+    ctx->weight_cache_peak_entries = ctx->weight_cache_map.size();
   }
   return true;
 }
