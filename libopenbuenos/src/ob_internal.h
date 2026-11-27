@@ -195,6 +195,15 @@ struct PooledSlab {
   bool iova_mapped = false;
 };
 
+struct ExternalDmabufMap {
+  int dmabuf_fd = -1;
+  uint64_t offset = 0;
+  uint64_t size = 0;
+  uint64_t iova = 0;
+  uint32_t map_flags = 0;
+  uint32_t die_index = 0xffffffffu;
+};
+
 struct CachedGraph {
   CacheKey key{};
   ob_context* ctx = nullptr;
@@ -306,11 +315,12 @@ bool        device_attach_inflight_buffers(ob_context* ctx,
                                            ob_exec_handle_t handle,
                                            std::initializer_list<ob_buffer*> bufs);
 
-// Buffer pool helpers (implemented in ob_buffer_pool.cpp)
+// Buffer pool & external DMA-BUF helpers (implemented in ob_buffer_pool.cpp)
 size_t buffer_slab_size(size_t requested);
 void buffer_retain(ob_buffer* buf);
 void buffer_destroy_slab(ob_context* ctx, PooledSlab* slab);
 void buffer_pool_clear(ob_context* ctx);
+void ext_dmabuf_clear(ob_context* ctx);
 ob_status_t buffer_sync_begin_read(ob_buffer* buf);
 ob_status_t buffer_sync_end_read(ob_buffer* buf);
 ob_status_t buffer_sync_begin_write(ob_buffer* buf);
@@ -752,6 +762,8 @@ struct ob_context {
   // Ordered LRU of free slabs + bucket index by alloc_size
   std::list<ob::PooledSlab> pool_lru;
   std::unordered_map<size_t, std::vector<std::list<ob::PooledSlab>::iterator>> pool_buckets;
+  // External DMA-BUFs mapped into ctx->tpu_fd's grouped IOMMU domain via ob_dmabuf_map
+  std::unordered_map<uint64_t, ob::ExternalDmabufMap> ext_dmabuf_maps;
 
   // Persistent graph LRU cache
   std::mutex cache_mu;

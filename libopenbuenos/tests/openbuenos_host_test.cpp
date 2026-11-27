@@ -6489,6 +6489,45 @@ void test_zero_repack_weight_cache_and_prepack() {
   std::printf("[PASS] test_zero_repack_weight_cache_and_prepack (Q4_0/Q8_0 load prepack -> 0 runtime misses/pack/evict, strict budget stop without eviction)\n");
 }
 
+void test_external_dmabuf_map_unmap() {
+  ob_config_t cfg = ob_config_default();
+  cfg.mock_mode = 1;
+  ob_context_t* ctx = nullptr;
+  CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+
+  uint64_t sentinel_iova = 123u;
+  CHECK(ob_dmabuf_map(nullptr, 3, 0u, 4096u, OB_BUF_BIDIRECTIONAL, &sentinel_iova) ==
+        OB_ERR_INVALID_ARG);
+  CHECK(sentinel_iova == 0u);
+  CHECK(ob_dmabuf_map(ctx, -1, 0u, 4096u, OB_BUF_BIDIRECTIONAL, &sentinel_iova) ==
+        OB_ERR_INVALID_ARG);
+  CHECK(ob_dmabuf_map(ctx, 3, 0u, 0u, OB_BUF_BIDIRECTIONAL, &sentinel_iova) == OB_ERR_INVALID_ARG);
+  CHECK(ob_dmabuf_map(ctx, 3, 0u, 4096u, OB_BUF_BIDIRECTIONAL, nullptr) == OB_ERR_INVALID_ARG);
+  CHECK(ob_dmabuf_map(ctx, 3, UINT64_MAX - 100u, 4096u, OB_BUF_BIDIRECTIONAL, &sentinel_iova) ==
+        OB_ERR_INVALID_ARG);
+  CHECK(ob_dmabuf_unmap(nullptr, 0x100000000ULL) == OB_ERR_INVALID_ARG);
+  CHECK(ob_dmabuf_unmap(ctx, 0u) == OB_ERR_INVALID_ARG);
+  CHECK(ob_dmabuf_unmap(ctx, 0xdeadbeefULL) == OB_ERR_NOT_FOUND);
+
+  uint64_t iova1 = 0u;
+  uint64_t iova2 = 0u;
+  CHECK(ob_dmabuf_map(ctx, 11, 0u, 4096u, OB_BUF_TO_DEVICE, &iova1) == OB_OK);
+  CHECK(iova1 != 0u);
+  CHECK((iova1 & 4095ULL) == 0u);
+  CHECK(ob_dmabuf_map(ctx, 12, 128u, 8192u, OB_BUF_FROM_DEVICE, &iova2) == OB_OK);
+  CHECK(iova2 != 0u && iova2 > iova1);
+  CHECK((iova2 & 4095ULL) == 0u);
+
+  CHECK(ctx->ext_dmabuf_maps.size() == 2u);
+  CHECK(ob_dmabuf_unmap(ctx, iova1) == OB_OK);
+  CHECK(ob_dmabuf_unmap(ctx, iova1) == OB_ERR_NOT_FOUND);
+  CHECK(ctx->ext_dmabuf_maps.size() == 1u);
+
+  // Leave iova2 active to verify ob_context_destroy clears ext_dmabuf_maps cleanly.
+  ob_context_destroy(ctx);
+  std::printf("[PASS] test_external_dmabuf_map_unmap\n");
+}
+
 }  // namespace
 
 int main() {
@@ -6544,9 +6583,10 @@ int main() {
   test_freetile_buenos_wire_parity_and_fallback();
   test_roundtable_s1_state_machine_hardening();
   test_zero_repack_weight_cache_and_prepack();
+  test_external_dmabuf_map_unmap();
 
   if (g_failures == 0) {
-    std::printf("ALL LIBOPENBUENOS HOST TESTS PASSED (26/26 suites)\n");
+    std::printf("ALL LIBOPENBUENOS HOST TESTS PASSED (27/27 suites)\n");
     return 0;
   }
   std::fprintf(stderr, "LIBOPENBUENOS HOST TESTS FAILED (%d failures)\n", g_failures);

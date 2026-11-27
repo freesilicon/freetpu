@@ -1547,6 +1547,7 @@ void ob_context_destroy(ob_context_t* ctx) {
   ctx->worker_pool.shutdown();
   ob::graph_cache_clear(ctx);
   ob::shared_image_clear(ctx);
+  ob::ext_dmabuf_clear(ctx);
   ob::device_close(ctx);
   ob::buffer_pool_clear(ctx);
   delete ctx;

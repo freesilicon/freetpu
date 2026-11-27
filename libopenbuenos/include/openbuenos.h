@@ -349,6 +349,23 @@ ob_status_t ob_context_buffer_pool_stats(const ob_context_t* ctx,
                                          uint64_t*           out_pool_hits,
                                          uint64_t*           out_pool_misses);
 
+/*
+ * Maps an external Linux DMA-BUF file descriptor into ctx's grouped EdgeTPU
+ * IOMMU domain (shared PASID with ctx->tpu_fd) via EDGETPU_MAP_DMABUF.
+ *
+ * `flags` accepts OB_BUF_TO_DEVICE / OB_BUF_FROM_DEVICE / OB_BUF_BIDIRECTIONAL
+ * (defaulting to bidirectional 36-bit IOVA). In mock_mode, validates arguments
+ * and returns a deterministic non-zero 36-bit synthetic IOVA.
+ */
+ob_status_t ob_dmabuf_map(ob_context_t* ctx,
+                          int           dmabuf_fd,
+                          uint64_t      offset,
+                          uint64_t      size,
+                          uint32_t      flags,
+                          uint64_t*     out_iova);
+
+ob_status_t ob_dmabuf_unmap(ob_context_t* ctx, uint64_t iova);
+
 /* =========================================================================
  * Graph Registration (Persistent LRU Handle Cache) & Sync/Async Execution
  * ========================================================================= */
