@@ -37,6 +37,7 @@ constexpr uint32_t EDGETPU_DEFAULT_CACHE_CAP         = 2048u;
 constexpr uint32_t EDGETPU_DEFAULT_POOL_MAX_BYTES    = 128u * 1024u * 1024u;
 constexpr int64_t  EDGETPU_DEFAULT_GLU_MAX_M         = 64;
 constexpr uint64_t EDGETPU_DEFAULT_MAX_N             = 65536ULL;
+constexpr uint64_t EDGETPU_DEFAULT_MIN_TILE_DIM      = 128ULL;
 constexpr uint64_t EDGETPU_DEFAULT_MUL_MAT_ID_MAX_MB = 64ULL;
 
 struct edgetpu_env_config {
@@ -50,7 +51,9 @@ struct edgetpu_env_config {
     bool         prepack_at_load       = true;
     int64_t      glu_max_m             = EDGETPU_DEFAULT_GLU_MAX_M;
     uint64_t     min_elements          = 0;
+    uint64_t     max_m                 = 0;
     uint64_t     max_n                 = EDGETPU_DEFAULT_MAX_N;
+    uint64_t     min_tile_dim          = EDGETPU_DEFAULT_MIN_TILE_DIM;
     int          mul_mat_id_mode       = -1; // -1=auto (<= mul_mat_id_max_bytes), 0=off, 1=force on
     uint64_t     mul_mat_id_max_bytes  = EDGETPU_DEFAULT_MUL_MAT_ID_MAX_MB * 1024ULL * 1024ULL;
     uint32_t     cache_cap             = EDGETPU_DEFAULT_CACHE_CAP;
@@ -141,6 +144,22 @@ static edgetpu_env_config load_env_config() {
             }
         }
     }
+    if (const char * v = std::getenv("OPENBUENOS_EDGETPU_MAX_M")) {
+        if (v[0] != '\0') {
+            const long long parsed = std::atoll(v);
+            if (parsed >= 0) {
+                cfg.max_m = static_cast<uint64_t>(parsed);
+            }
+        }
+    }
+    if (const char * v = std::getenv("OPENBUENOS_MIN_TILE_DIM")) {
+        if (v[0] != '\0') {
+            const long long parsed = std::atoll(v);
+            if (parsed >= 0) {
+                cfg.min_tile_dim = static_cast<uint64_t>(parsed);
+            }
+        }
+    }
     if (const char * v = std::getenv("OPENBUENOS_EDGETPU_MUL_MAT_ID")) {
         if (v[0] != '\0') {
             if (std::strcmp(v, "auto") == 0 || std::strcmp(v, "AUTO") == 0) {
@@ -213,7 +232,9 @@ static edgetpu_env_config load_env_config() {
 struct edgetpu_hot_env_cache {
     std::atomic<bool>     initialized{false};
     std::atomic<uint64_t> min_elements{0};
+    std::atomic<uint64_t> max_m{0};
     std::atomic<uint64_t> max_n{EDGETPU_DEFAULT_MAX_N};
+    std::atomic<uint64_t> min_tile_dim{EDGETPU_DEFAULT_MIN_TILE_DIM};
     std::atomic<int>      mul_mat_id_mode{-1};
     std::atomic<uint64_t> mul_mat_id_max_bytes{EDGETPU_DEFAULT_MUL_MAT_ID_MAX_MB * 1024ULL * 1024ULL};
     std::atomic<bool>     prepack_at_load{true};
@@ -226,7 +247,9 @@ struct edgetpu_hot_env_cache {
 
     void store(const edgetpu_env_config & cfg) {
         min_elements.store(cfg.min_elements, std::memory_order_relaxed);
+        max_m.store(cfg.max_m, std::memory_order_relaxed);
         max_n.store(cfg.max_n, std::memory_order_relaxed);
+        min_tile_dim.store(cfg.min_tile_dim, std::memory_order_relaxed);
         mul_mat_id_mode.store(cfg.mul_mat_id_mode, std::memory_order_relaxed);
         mul_mat_id_max_bytes.store(cfg.mul_mat_id_max_bytes, std::memory_order_relaxed);
         prepack_at_load.store(cfg.prepack_at_load, std::memory_order_relaxed);
@@ -2978,7 +3001,17 @@ static bool ggml_backend_edgetpu_device_supports_op(ggml_backend_dev_t dev, cons
             if (max_n > 0 && static_cast<uint64_t>(N) > max_n) {
                 return false;
             }
+            const uint64_t max_m = g_hot_env.max_m.load(std::memory_order_relaxed);
+            if (max_m > 0 && static_cast<uint64_t>(M) > max_m) {
+                return false;
+            }
             const uint64_t min_elements = g_hot_env.min_elements.load(std::memory_order_relaxed);
+            const uint64_t min_tile_dim = g_hot_env.min_tile_dim.load(std::memory_order_relaxed);
+            if (min_tile_dim > 0 &&
+                static_cast<uint64_t>(std::min(K, N)) < min_tile_dim &&
+                (static_cast<uint64_t>(std::max(K, N)) >= 512ULL || min_elements > 0)) {
+                return false;
+            }
             if (min_elements > 0) {
                 const uint64_t work =
                     static_cast<uint64_t>(M) *
@@ -3068,7 +3101,17 @@ static bool ggml_backend_edgetpu_device_supports_op(ggml_backend_dev_t dev, cons
                     return false;
                 }
             }
+            const uint64_t max_m = g_hot_env.max_m.load(std::memory_order_relaxed);
+            if (max_m > 0 && static_cast<uint64_t>(n_tokens) > max_m) {
+                return false;
+            }
             const uint64_t min_elements = g_hot_env.min_elements.load(std::memory_order_relaxed);
+            const uint64_t min_tile_dim = g_hot_env.min_tile_dim.load(std::memory_order_relaxed);
+            if (min_tile_dim > 0 &&
+                static_cast<uint64_t>(std::min(K, N)) < min_tile_dim &&
+                (static_cast<uint64_t>(std::max(K, N)) >= 512ULL || min_elements > 0)) {
+                return false;
+            }
             if (min_elements > 0) {
                 const uint64_t work =
                     static_cast<uint64_t>(n_tokens) *
@@ -3429,7 +3472,7 @@ ggml_backend_t ggml_backend_edgetpu_init(void) {
             "ggml-edgetpu: initialized Pixel Tensor G5 (buenos_a0) "
             "[mock=%d, emitter=%d, freetile=%d, interp=%s, credits=%u, cache_cap=%u, pool_mb=%u, "
             "tile_limits=(%u,%u,%u), pwr=(perf=%u,core=0x%02x,mem=0x%02x,qos=0x%02x,prio=%u), "
-            "batch_siblings=%d, prepack=%d, mmid=%d, mmid_max_mb=%llu, max_n=%llu, min_elements=%llu, packed_q8=%d, libopenbuenos=%d]\n",
+            "batch_siblings=%d, prepack=%d, mmid=%d, mmid_max_mb=%llu, max_m=%llu, max_n=%llu, min_tile_dim=%llu, min_elements=%llu, packed_q8=%d, libopenbuenos=%d]\n",
             ob_context_is_mock(ob_ctx),
             emitter_ok ? 1 : 0,
             ob_context_get_freetile(ob_ctx),
@@ -3447,7 +3490,9 @@ ggml_backend_t ggml_backend_edgetpu_init(void) {
             env.prepack_at_load ? 1 : 0,
             env.mul_mat_id_mode,
             static_cast<unsigned long long>(env.mul_mat_id_max_bytes / (1024ULL * 1024ULL)),
+            static_cast<unsigned long long>(env.max_m),
             static_cast<unsigned long long>(env.max_n),
+            static_cast<unsigned long long>(env.min_tile_dim),
             static_cast<unsigned long long>(env.min_elements),
             env.packed_q8 ? 1 : 0,
             GGML_EDGETPU_LINKED_LIBOPENBUENOS);

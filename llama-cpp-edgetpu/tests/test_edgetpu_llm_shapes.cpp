@@ -229,10 +229,9 @@ static bool test_zero_repack_and_auto_routing(ggml_backend_t b_tpu, ggml_backend
     std::printf("\n[Zero-Repack Prepack, Weight Mutation Invalidation, & Auto-Routing Gates]\n");
     bool ok = true;
 
-    // 1. Verify MAX_N=65536 gate keeps 200k vocab head on CPU and allows <= 65536 on EDGETPU;
-    //    and MUL_MAT_ID auto (>64 MiB) keeps huge MoE on CPU while allowing small MoE.
+    // 1. Verify MAX_N=65536, MIN_TILE_DIM=128 micro-tile bloat guard, and MUL_MAT_ID auto (>64 MiB).
     {
-        const size_t ctx_size = ggml_tensor_overhead() * 16 + ggml_graph_overhead();
+        const size_t ctx_size = ggml_tensor_overhead() * 48 + ggml_graph_overhead();
         ggml_init_params params { ctx_size, nullptr, true };
         ggml_context * ctx = ggml_init(params);
         if (!ctx) return false;
@@ -243,6 +242,46 @@ static bool test_zero_repack_and_auto_routing(ggml_backend_t b_tpu, ggml_backend
 
         if (ggml_backend_supports_op(b_tpu, mm_big)) {
             std::fprintf(stderr, "FAIL: EDGETPU should reject N=70000 (> default MAX_N=65536)\n");
+            ok = false;
+        }
+
+        // Skinny micro-tile shapes (min(K,N) < 128 && max(K,N) >= 512) must stay on CPU
+        // to avoid thousands of 4 KiB (64,64) DMA-BUF FDs and cache entry thrashing.
+        ggml_tensor * x_64       = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  64, 1);
+        ggml_tensor * w_ctrl_f   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  64, 2304);
+        ggml_tensor * mm_ctrl_f  = ggml_mul_mat(ctx, w_ctrl_f, x_64);
+        if (ggml_backend_supports_op(b_tpu, mm_ctrl_f)) {
+            std::fprintf(stderr, "FAIL: EDGETPU should reject F32 skinny (64, 2304)\n");
+            ok = false;
+        }
+
+        ggml_tensor * x_4608     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  4608, 1);
+        ggml_tensor * w_ctrl_d   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  4608, 64);
+        ggml_tensor * mm_ctrl_d  = ggml_mul_mat(ctx, w_ctrl_d, x_4608);
+        if (ggml_backend_supports_op(b_tpu, mm_ctrl_d)) {
+            std::fprintf(stderr, "FAIL: EDGETPU should reject F32 skinny (4608, 64)\n");
+            ok = false;
+        }
+
+        ggml_tensor * x_2304_pp  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  2304, 28);
+        ggml_tensor * w_sink     = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 2304, 24);
+        ggml_tensor * mm_sink    = ggml_mul_mat(ctx, w_sink, x_2304_pp);
+        if (ggml_backend_supports_op(b_tpu, mm_sink)) {
+            std::fprintf(stderr, "FAIL: EDGETPU should reject Q4_0 prefill skinny (2304, 24)\n");
+            ok = false;
+        }
+
+        ggml_tensor * w_conv     = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 2304, 32);
+        ggml_tensor * mm_conv    = ggml_mul_mat(ctx, w_conv, x_2304_pp);
+        if (ggml_backend_supports_op(b_tpu, mm_conv)) {
+            std::fprintf(stderr, "FAIL: EDGETPU should reject Q4_0 prefill skinny (2304, 32)\n");
+            ok = false;
+        }
+
+        ggml_tensor * w_rel      = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 2304, 384);
+        ggml_tensor * mm_rel     = ggml_mul_mat(ctx, w_rel, x_2304_pp);
+        if (!ggml_backend_supports_op(b_tpu, mm_rel)) {
+            std::fprintf(stderr, "FAIL: EDGETPU should allow Q4_0 (2304, 384)\n");
             ok = false;
         }
 
