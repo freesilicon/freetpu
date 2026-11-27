@@ -621,6 +621,32 @@ ob_status_t ob_gemm_unregister_immutable_weights(ob_context_t * ctx,
     return OB_OK;
 }
 
+ob_status_t ob_gemm_prepack_quant_batch(ob_context_t *                  ctx,
+                                        uint32_t                        m_hint,
+                                        uint32_t                        k_dim,
+                                        const ob_gemm_f32_quant_job_t * jobs,
+                                        uint32_t                        num_jobs,
+                                        ob_prepack_stats_t *            out_stats) {
+    uint32_t j = 0u;
+    if (!ctx || !jobs || m_hint == 0u || k_dim == 0u || num_jobs == 0u) {
+        return OB_ERR_INVALID_ARG;
+    }
+    for (j = 0u; j < num_jobs; ++j) {
+        uint32_t qk = 0u;
+        if (!jobs[j].b_nk || jobs[j].n_dim == 0u || jobs[j].is_q4_0 > (uint8_t)OB_QUANT_IQ4_XS) {
+            return OB_ERR_INVALID_ARG;
+        }
+        qk = ob_quant_block_elements((ob_quant_type_t)jobs[j].is_q4_0);
+        if (qk == 0u || (k_dim % qk) != 0u) {
+            return OB_ERR_INVALID_ARG;
+        }
+    }
+    if (out_stats) {
+        memset(out_stats, 0, sizeof(*out_stats));
+    }
+    return OB_OK;
+}
+
 ob_status_t ob_gemm_swiglu_f32_quant(ob_context_t *                      ctx,
                                      const float *                       a_mk,
                                      const ob_gemm_swiglu_quant_desc_t * desc,
