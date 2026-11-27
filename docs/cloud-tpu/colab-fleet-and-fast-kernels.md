@@ -37,15 +37,12 @@ python3 tools/test_h100_fast_kernels.py -v
 
 Extends [`tools/colab_tpu_bench.py`](../../tools/colab_tpu_bench.py) isolation and zero-idle-burn patterns to concurrent multi-lane GPU + TPU + High-RAM CPU sweeps:
 
-### Concurrency, Persistent VM Reuse & Polite Pacing
+### Concurrency, Warm VM Reuse Pool, Tiered Backfill & Off-Peak Bursting
 - **Total Cap (`--max-total-slots 7`):** Queries live `colab sessions` and counts all active assignments (including pre-existing external sessions). Never stops, execs on, or touches any session not prefixed `fleet-`.
-- **Persistent VM Session Reuse (`--reuse-sessions`, default ON; `--max-jobs-per-session 16`):** Reuses live compatible sessions across sequential jobs/shards of the same accelerator class instead of creating/stopping a fresh VM per shard (~10× fewer VM spawns and zero cold-start overhead). Immediately drains and stops any idle session once no compatible pending jobs remain, guaranteeing `zero_fleet_leaked=true`.
-- **Polite Spawn Pacing & Exponential Backoff (`COLAB_CLI_ASSIGN_RETRIES=0`):**
-  - Enforces `--spawn-spacing-s 18` between distinct `colab new` calls to avoid Colab rapid-spawn burst throttles.
-  - Applies per-SKU exponential backoff with ±15% jitter (`--backoff-base-s 30` → `60` → `120` → `240` → `--backoff-cap-s 300`) on `503`/`429`/`ReadTimeout`, plus optional `--wait-on-cooldown` (`--max-cooldown-wait-s 600`), and immediate stop on `412`.
-  - GPU (`--max-gpu-slots 3`): `H100 -> A100_HM -> A100 -> L4 -> T4_HM -> T4`.
-  - TPU (`--max-tpu-slots 2`): `V6E1 -> V5E1` with verified-zero-leak reconciliation on `ReadTimeout`.
-  - CPU (`--max-cpu-slots 4`): `CPU_HM` (`8` vCPU / `51 GiB` RAM) and `CPU` workers for verifiers and DiLoCo/merge coordination.
+- **Warm VM Reuse Pool (`--reuse-sessions`, `--reset-between-jobs`, `--max-jobs-per-session 16`):** Keeps scarce GPUs (`H100`/`A100_HM`/`A100`/`L4`), TPUs, and CPUs alive across compatible queued jobs via `colab exec` (with clean `/tmp/fleet_job_*` + CUDA cache workspace reset between jobs) instead of releasing and re-entering the `503` lottery. Immediately drains and stops idle sessions when no compatible jobs remain or when `--floor-cu` / `SIGINT` / `SIGTERM` triggers (`zero_fleet_leaked=true`).
+- **3 Independent Tiered Queues (`heavy-gpu`, `light-gpu`, `tpu-cpu`):** Prevents a `503`-blocked `A100`/`H100` head-of-queue job from starving the remaining 6 slots. Each job declares `"tier"` (or auto-infers from `accelerator_class` + `sku_preference`).
+- **Automatic Peak-`503` Backfill & Opportunistic Promotion (`--peak-backfill`, `--max-light-gpu-slots 2`):** When `heavy-gpu` SKUs return `503` during peak hours, immediately backfills open slots up to `<= 7` with `light-gpu` (`T4_HM`/`T4` for 4-bit rollouts/evals/QLoRA) + `tpu-cpu` (`V5E1` + `CPU_HM` verifiers). As `light-gpu` jobs finish and `heavy-gpu` SKUs become ready, releases the `light-gpu` slot (`promotion_release_for_heavy_gpu`) to promote back to `A100`/`H100`.
+- **Off-Peak Burst Window (`00:00–07:00 EST`, `--offpeak-max-heavy-gpu-slots 3` vs `--peak-max-heavy-gpu-slots 2`):** Concentrates `2–3× H100/A100` stacking probes in off-peak windows with polite `--spawn-spacing-s 18` pacing, per-SKU exponential backoff with ±15% jitter (`30s → 60s → 120s → 240s → 300s`), and immediate ToS-clean stop on `412`/`429` (`COLAB_CLI_ASSIGN_RETRIES=0`, zero retry hammering).
 
 ### Dual Pluggable Sync Backends
 - **`--sync local` (Default):** Zero cloud credentials on Colab. Stages inputs via `colab upload` and retrieves artifacts via `colab download` to a private `0700` local directory.
