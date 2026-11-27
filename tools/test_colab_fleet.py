@@ -275,7 +275,7 @@ class TestColabFleet(unittest.TestCase):
                         sessions.pop(args[args.index("-s") + 1], None)
                         return subprocess.CompletedProcess(args, 0, "stopped\n", "")
                     if cmd == "exec":
-                        if "-c" in args and "fleet_workspace_reset_ok" in args[args.index("-c") + 1]:
+                        if "-f" in args and Path(args[args.index("-f") + 1]).name == "_reset_workspace.py":
                             reset_calls += 1
                         return subprocess.CompletedProcess(args, 0, "ok\n", "")
                 return subprocess.CompletedProcess(args, 0, "", "")
@@ -408,6 +408,119 @@ class TestColabFleet(unittest.TestCase):
             )
             self.assertEqual(disp_off._heavy_gpu_slot_cap(), 3)
             self.assertEqual(disp_peak._heavy_gpu_slot_cap(), 2)
+
+    def test_read_timeout_reaps_newly_appeared_orphan_preserving_external(self) -> None:
+        """If `colab new --tpu V5E1` hits READ_TIMEOUT after Google allocates `[?] tpu-v5e1-...`, reap ONLY the new orphan."""
+        import subprocess
+        import threading
+
+        with tempfile.TemporaryDirectory(prefix="freetpu_orphan_") as td:
+            td_p = Path(td)
+            worker = td_p / "w.py"
+            worker.write_text("print('ok')\n", encoding="utf-8")
+            live_eps: dict[str, str] = {
+                "gpu-a100-s-usc1f0-ext": "[?] gpu-a100-s-usc1f0-ext | Hardware: A100 | Shape: Standard | Variant: GPU",
+            }
+            unassigned: list[str] = []
+            lock = threading.Lock()
+
+            def runner(args, _to):
+                cmd = args[0]
+                with lock:
+                    if cmd == "usage":
+                        return subprocess.CompletedProcess(
+                            args, 0, f"Current balance: 7000.00 compute units\nUsage rate: 3.26/hr\nActive assignments: {len(live_eps)}\n", ""
+                        )
+                    if cmd == "sessions":
+                        return subprocess.CompletedProcess(args, 0, "\n".join(live_eps.values()) + "\n", "")
+                    if cmd == "new":
+                        # Simulate server creating runtime right as client read times out (unnamed `[?]`)
+                        live_eps["tpu-v5e1-s-r-usw4a0-orphan1"] = (
+                            "[?] tpu-v5e1-s-r-usw4a0-orphan1 | Hardware: V5E1 | Shape: Standard | Variant: TPU"
+                        )
+                        return subprocess.CompletedProcess(args, 1, "", "ReadTimeout: The read operation timed out")
+                    if cmd == "unassign-endpoint":
+                        ep = args[1]
+                        unassigned.append(ep)
+                        live_eps.pop(ep, None)
+                        return subprocess.CompletedProcess(args, 0, "ok\n", "")
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            disp = cf.ColabFleetDispatcher(
+                colab_bin="colab",
+                auth="adc",
+                run_dir=td_p / "run",
+                governor_cfg=cf.CuGovernorConfig(max_tpu_slots=1, max_total_slots=4),
+                spawn_spacing_s=0.0,
+                command_runner=runner,
+            )
+            jobs = [cf.FleetJob("tpu_orphan_test", 1, "TPU", worker, sku_preference=("V5E1",))]
+            proof = disp.run_queue(jobs)
+            self.assertEqual(unassigned, ["tpu-v5e1-s-r-usw4a0-orphan1"])
+            self.assertEqual(proof["teardown"]["external_sessions_preserved"], ["gpu-a100-s-usc1f0-ext"])
+            self.assertTrue(proof["teardown"]["zero_fleet_leaked"])
+
+    def test_ipython_traceback_with_missing_download_marks_failed(self) -> None:
+        """If IPython raises FileNotFoundError yet `colab exec` exits 0 and expected downloads fail, mark job failed."""
+        import subprocess
+        import threading
+
+        with tempfile.TemporaryDirectory(prefix="freetpu_tb_") as td:
+            td_p = Path(td)
+            worker = td_p / "w.py"
+            worker.write_text("raise FileNotFoundError('missing')\n", encoding="utf-8")
+            out_json = td_p / "out.json"
+            sessions: dict[str, str] = {}
+            lock = threading.Lock()
+
+            def runner(args, _to):
+                cmd = args[0]
+                with lock:
+                    if cmd == "usage":
+                        return subprocess.CompletedProcess(
+                            args, 0, f"Current balance: 7000.00 compute units\nUsage rate: 0.26/hr\nActive assignments: {len(sessions)}\n", ""
+                        )
+                    if cmd == "sessions":
+                        return subprocess.CompletedProcess(args, 0, "\n".join(sessions.values()) + "\n", "")
+                    if cmd == "new":
+                        sname = args[args.index("-s") + 1]
+                        sessions[sname] = f"[{sname}] m-hm-usc1c0-tb1 | Hardware: CPU | Shape: High-RAM | Variant: DEFAULT"
+                        return subprocess.CompletedProcess(args, 0, "ok\n", "")
+                    if cmd == "stop":
+                        sessions.pop(args[args.index("-s") + 1], None)
+                        return subprocess.CompletedProcess(args, 0, "stopped\n", "")
+                    if cmd == "exec":
+                        return subprocess.CompletedProcess(
+                            args, 0,
+                            "---------------------------------------------------------------------------\nFileNotFoundError: missing\n",
+                            "",
+                        )
+                    if cmd == "download":
+                        return subprocess.CompletedProcess(args, 1, "", "404 Not Found")
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            disp = cf.ColabFleetDispatcher(
+                colab_bin="colab",
+                auth="adc",
+                run_dir=td_p / "run",
+                governor_cfg=cf.CuGovernorConfig(max_cpu_slots=1, max_total_slots=2),
+                spawn_spacing_s=0.0,
+                command_runner=runner,
+            )
+            jobs = [
+                cf.FleetJob(
+                    "crash_job",
+                    1,
+                    "CPU",
+                    worker,
+                    sku_preference=("CPU_HM",),
+                    downloads=(("/content/out.json", out_json),),
+                )
+            ]
+            proof = disp.run_queue(jobs)
+            self.assertEqual(proof["jobs"]["crash_job"]["status"], "failed")
+            self.assertEqual(proof["jobs"]["crash_job"]["note"], "ipython_exception_missing_outputs")
+            self.assertTrue(proof["teardown"]["zero_fleet_leaked"])
 
 
 def main() -> int:
