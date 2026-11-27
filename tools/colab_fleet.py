@@ -55,13 +55,29 @@ import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 DEFAULT_GPU_FALLBACK: Tuple[str, ...] = ("H100", "A100_HM", "A100", "L4", "T4_HM", "T4")
+DEFAULT_LIGHT_GPU_FALLBACK: Tuple[str, ...] = ("T4_HM", "T4")
 DEFAULT_TPU_FALLBACK: Tuple[str, ...] = ("V6E1", "V5E1")
 DEFAULT_CPU_FALLBACK: Tuple[str, ...] = ("CPU_HM", "CPU")
+
+HEAVY_GPU_SKUS = frozenset({"H100", "A100_HM", "A100", "G4", "L4"})
+LIGHT_GPU_SKUS = frozenset({"T4_HM", "T4"})
+TIER_NAMES: Tuple[str, ...] = ("heavy-gpu", "light-gpu", "tpu-cpu")
+_TIER_ALIASES: Dict[str, str] = {
+    "heavy-gpu": "heavy-gpu",
+    "heavy_gpu": "heavy-gpu",
+    "light-gpu": "light-gpu",
+    "light_gpu": "light-gpu",
+    "light-gpu/rollout": "light-gpu",
+    "tpu-cpu": "tpu-cpu",
+    "tpu_cpu": "tpu-cpu",
+    "tpu+cpu-verifier": "tpu-cpu",
+    "tpu+cpu": "tpu-cpu",
+}
 
 SKU_CLI_FLAGS: Dict[str, Tuple[str, ...]] = {
     "H100": ("--gpu", "H100"),
@@ -128,6 +144,48 @@ def utc_now_iso() -> str:
 
 def utc_day_key() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def infer_job_tier(
+    accelerator_class: str,
+    sku_preference: Sequence[str],
+    explicit_tier: Optional[str] = None,
+) -> str:
+    """Resolve a job into one of the 3 independent queues: heavy-gpu, light-gpu, or tpu-cpu."""
+    if explicit_tier:
+        norm = _TIER_ALIASES.get(str(explicit_tier).strip().lower())
+        if norm is None:
+            raise ValueError(f"Unsupported tier={explicit_tier!r}; expected one of {TIER_NAMES}")
+        return norm
+    acc = accelerator_class.upper()
+    if acc in ("TPU", "CPU"):
+        return "tpu-cpu"
+    skus = [str(s).upper() for s in sku_preference]
+    if skus and all(s in LIGHT_GPU_SKUS for s in skus):
+        return "light-gpu"
+    return "heavy-gpu"
+
+
+def is_offpeak_window(
+    now_utc: Optional[datetime] = None,
+    *,
+    tz_offset_hours: int = -5,
+    start_hour: int = 0,
+    end_hour: int = 7,
+) -> bool:
+    """Return True when local clock (default EST = UTC-5) is inside the off-peak burst window [start_hour, end_hour)."""
+    dt = now_utc or datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    local_dt = dt.astimezone(timezone(timedelta(hours=tz_offset_hours)))
+    h = local_dt.hour
+    s = start_hour % 24
+    e = end_hour % 24
+    if s == e:
+        return True
+    if s < e:
+        return s <= h < e
+    return h >= s or h < e
 
 
 def redact_secrets(text: str) -> str:
@@ -531,6 +589,16 @@ class FleetJob:
     timeout_s: int = 1800
     max_cu: float = 40.0
     description: str = ""
+    tier: str = ""
+
+    def __post_init__(self) -> None:
+        self.accelerator_class = self.accelerator_class.upper()
+        if not self.sku_preference:
+            self.sku_preference = (
+                DEFAULT_GPU_FALLBACK if self.accelerator_class == "GPU"
+                else (DEFAULT_TPU_FALLBACK if self.accelerator_class == "TPU" else DEFAULT_CPU_FALLBACK)
+            )
+        self.tier = infer_job_tier(self.accelerator_class, self.sku_preference, self.tier or None)
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any], base_dir: Path) -> "FleetJob":
@@ -554,9 +622,14 @@ class FleetJob:
             if not lp.is_absolute():
                 lp = (base_dir / lp).resolve()
             downloads.append((str(d["remote"]), lp))
+        explicit_tier = raw.get("tier")
         default_pref = (
-            DEFAULT_GPU_FALLBACK if acc == "GPU"
-            else (DEFAULT_TPU_FALLBACK if acc == "TPU" else DEFAULT_CPU_FALLBACK)
+            DEFAULT_LIGHT_GPU_FALLBACK
+            if (acc == "GPU" and explicit_tier and _TIER_ALIASES.get(str(explicit_tier).strip().lower()) == "light-gpu")
+            else (
+                DEFAULT_GPU_FALLBACK if acc == "GPU"
+                else (DEFAULT_TPU_FALLBACK if acc == "TPU" else DEFAULT_CPU_FALLBACK)
+            )
         )
         pref = tuple(str(x).upper() for x in raw.get("sku_preference", default_pref))
         return cls(
@@ -571,6 +644,7 @@ class FleetJob:
             timeout_s=int(raw.get("timeout_s", 1800)),
             max_cu=float(raw.get("max_cu", 40.0)),
             description=str(raw.get("description", "")),
+            tier=str(explicit_tier) if explicit_tier else "",
         )
 
 
@@ -662,12 +736,21 @@ class ColabFleetDispatcher:
         backoff_jitter_frac: float = 0.15,
         spawn_spacing_s: Optional[float] = None,
         reuse_sessions: bool = True,
+        reset_between_jobs: bool = True,
         max_jobs_per_session: int = 16,
+        enable_peak_backfill: bool = True,
+        peak_max_heavy_gpu_slots: int = 2,
+        offpeak_max_heavy_gpu_slots: int = 3,
+        max_light_gpu_slots: int = 2,
+        offpeak_tz_offset_hours: int = -5,
+        offpeak_start_hour: int = 0,
+        offpeak_end_hour: int = 7,
         wait_on_cooldown: bool = False,
         max_cooldown_wait_s: float = 600.0,
         command_runner: Optional[Callable[[Sequence[str], int], subprocess.CompletedProcess[str]]] = None,
         sleep_fn: Optional[Callable[[float], None]] = None,
         rng: Optional[random.Random] = None,
+        now_fn: Optional[Callable[[], datetime]] = None,
     ) -> None:
         self.colab_bin = colab_bin
         self.auth = auth
@@ -688,11 +771,20 @@ class ColabFleetDispatcher:
             else (0.0 if command_runner is not None else 18.0)
         )
         self.reuse_sessions = bool(reuse_sessions)
+        self.reset_between_jobs = bool(reset_between_jobs)
         self.max_jobs_per_session = max(1, int(max_jobs_per_session))
+        self.enable_peak_backfill = bool(enable_peak_backfill)
+        self.peak_max_heavy_gpu_slots = max(1, int(peak_max_heavy_gpu_slots))
+        self.offpeak_max_heavy_gpu_slots = max(1, int(offpeak_max_heavy_gpu_slots))
+        self.max_light_gpu_slots = max(0, int(max_light_gpu_slots))
+        self.offpeak_tz_offset_hours = int(offpeak_tz_offset_hours)
+        self.offpeak_start_hour = int(offpeak_start_hour)
+        self.offpeak_end_hour = int(offpeak_end_hour)
         self.wait_on_cooldown = bool(wait_on_cooldown)
         self.max_cooldown_wait_s = max(0.0, float(max_cooldown_wait_s))
         self._sleep = sleep_fn or time.sleep
         self._rng = rng or random.Random()
+        self._now = now_fn or (lambda: datetime.now(timezone.utc))
         self._lock = threading.Lock()
         self._owned_sessions: Dict[str, Dict[str, Any]] = {}
         self._idle_sessions: List[Dict[str, Any]] = []
@@ -702,6 +794,9 @@ class ColabFleetDispatcher:
         self._last_spawn_monotonic: Optional[float] = None
         self._sessions_created_count: int = 0
         self._sessions_reused_count: int = 0
+        self._workspace_resets_count: int = 0
+        self._backfill_launches_count: int = 0
+        self._promotions_count: int = 0
         self._job_states: Dict[str, Dict[str, Any]] = {}
         self._spent_today_cu: float = 0.0
         self._stop_requested = threading.Event()
@@ -783,15 +878,76 @@ class ColabFleetDispatcher:
                 )
             (self.run_dir / "STATE.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    def _can_admit_slot(self, acc_class: str, active_sessions: List[Dict[str, Any]], max_slots: int) -> Tuple[bool, str]:
+    def _is_offpeak_now(self) -> bool:
+        return is_offpeak_window(
+            self._now(),
+            tz_offset_hours=self.offpeak_tz_offset_hours,
+            start_hour=self.offpeak_start_hour,
+            end_hour=self.offpeak_end_hour,
+        )
+
+    def _heavy_gpu_slot_cap(self) -> int:
+        cap = self.offpeak_max_heavy_gpu_slots if self._is_offpeak_now() else self.peak_max_heavy_gpu_slots
+        return min(cap, self.governor.cfg.max_gpu_slots)
+
+    def _has_ready_heavy_gpu_pending(self) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            heavy_jobs = [j for j in self._pending_snapshot if j.tier == "heavy-gpu"]
+        for j in heavy_jobs:
+            for sku in j.sku_preference:
+                if sku in SKU_CLI_FLAGS and self._sku_cooldown_until.get(sku, 0.0) <= now:
+                    return True
+        return False
+
+    def _reset_session_workspace(self, sess_name: str, cfg_path: Path, acc_class: str) -> None:
+        """Reset transient workspace & GPU cache before dispatching the next job onto a warm reused VM."""
+        if not self.reset_between_jobs:
+            return
+        code = (
+            "import gc, glob, os, shutil\n"
+            "for p in glob.glob('/tmp/fleet_job_*'): shutil.rmtree(p, ignore_errors=True)\n"
+            "os.makedirs('/content/fleet_work', exist_ok=True)\n"
+            "gc.collect()\n"
+            "try:\n"
+            "    import torch\n"
+            "    if torch.cuda.is_available(): torch.cuda.empty_cache()\n"
+            "except Exception:\n"
+            "    pass\n"
+            "print('fleet_workspace_reset_ok')\n"
+        )
+        p = self._run_colab_with_cfg(cfg_path, ["exec", "-s", sess_name, "--timeout", "30", "-c", code], timeout_s=45, request_timeout_s=30)
+        with self._lock:
+            self._workspace_resets_count += 1
+        self.log_event("session_workspace_reset", {"session": sess_name, "class": acc_class, "rc": p.returncode})
+
+    def _can_admit_slot(
+        self,
+        acc_class: str,
+        active_sessions: List[Dict[str, Any]],
+        max_slots: int,
+        *,
+        tier: str = "",
+        heavy_gpu_cap: Optional[int] = None,
+    ) -> Tuple[bool, str]:
         total_active = len(active_sessions)
         if total_active >= max_slots:
             return False, f"total_cap_reached ({total_active}/{max_slots})"
         gpu_cnt = sum(1 for s in active_sessions if s["kind"] == "GPU")
         tpu_cnt = sum(1 for s in active_sessions if s["kind"] == "TPU")
         cpu_cnt = sum(1 for s in active_sessions if s["kind"] == "CPU")
-        if acc_class == "GPU" and gpu_cnt >= self.governor.cfg.max_gpu_slots:
-            return False, f"gpu_cap_reached ({gpu_cnt}/{self.governor.cfg.max_gpu_slots})"
+        if acc_class == "GPU":
+            if gpu_cnt >= self.governor.cfg.max_gpu_slots:
+                return False, f"gpu_cap_reached ({gpu_cnt}/{self.governor.cfg.max_gpu_slots})"
+            if tier == "heavy-gpu":
+                eff_heavy_cap = heavy_gpu_cap if heavy_gpu_cap is not None else self._heavy_gpu_slot_cap()
+                heavy_cnt = sum(1 for s in active_sessions if s["kind"] == "GPU" and s.get("tier", "heavy-gpu") == "heavy-gpu")
+                if heavy_cnt >= eff_heavy_cap:
+                    return False, f"heavy_gpu_cap_reached ({heavy_cnt}/{eff_heavy_cap})"
+            elif tier == "light-gpu":
+                light_cnt = sum(1 for s in active_sessions if s["kind"] == "GPU" and s.get("tier") == "light-gpu")
+                if light_cnt >= self.max_light_gpu_slots:
+                    return False, f"light_gpu_cap_reached ({light_cnt}/{self.max_light_gpu_slots})"
         if acc_class == "TPU" and tpu_cnt >= self.governor.cfg.max_tpu_slots:
             return False, f"tpu_cap_reached ({tpu_cnt}/{self.governor.cfg.max_tpu_slots})"
         if acc_class == "CPU" and cpu_cnt >= self.governor.cfg.max_cpu_slots:
@@ -905,12 +1061,19 @@ class ColabFleetDispatcher:
                         "job_id": job.job_id,
                         "sku": sku,
                         "class": job.accelerator_class,
+                        "tier": job.tier,
                         "cfg_path": str(cfg_path),
                         "assignment": assign,
                         "jobs_run": 0,
                         "started_utc": utc_now_iso(),
                     }
-                self.log_event("session_allocated", {"job_id": job.job_id, "session": sess_name, "sku": sku, "zone": assign.get("zone")})
+                self.log_event("session_allocated", {
+                    "job_id": job.job_id,
+                    "tier": job.tier,
+                    "session": sess_name,
+                    "sku": sku,
+                    "zone": assign.get("zone"),
+                })
                 return sess_name, sku, assign, "ok"
 
             err_code = classify_assign_error(p.stdout + "\n" + p.stderr)
@@ -927,19 +1090,22 @@ class ColabFleetDispatcher:
                 self._sku_cooldown_until[sku] = time.monotonic() + backoff_s
                 self.log_event("sku_refused", {
                     "job_id": job.job_id,
+                    "tier": job.tier,
                     "sku": sku,
                     "error_code": err_code,
                     "attempt": attempt_n,
                     "backoff_s": backoff_s,
                 })
-                # On ReadTimeout, reconcile before moving to next SKU so we never double-allocate!
                 if err_code == "READ_TIMEOUT":
                     after = self.list_sessions()
                     leaked = [s for s in after if s["name"] == sess_name]
                     if leaked:
                         self.stop_owned_session(sess_name)
+                if err_code == "429_RATE_LIMITED":
+                    # Strictly ToS-clean: stop immediately on 429, zero retry hammering
+                    return None, None, None, err_code
                 continue
-            self.log_event("sku_refused", {"job_id": job.job_id, "sku": sku, "error_code": err_code})
+            self.log_event("sku_refused", {"job_id": job.job_id, "tier": job.tier, "sku": sku, "error_code": err_code})
             if err_code == "412_TOO_MANY_ACTIVE":
                 return None, None, None, err_code
         return None, None, None, "no_sku_available"
@@ -991,6 +1157,8 @@ class ColabFleetDispatcher:
         jobs_run_after = jobs_run_before + 1
         parked = False
         try:
+            if reused:
+                self._reset_session_workspace(sess_name, cfg_path, job.accelerator_class)
             if job.uploads:
                 self.sync.stage_inputs(sess_name, job.uploads)
             exec_args = ["exec", "-s", sess_name, "--timeout", str(job.timeout_s)]
@@ -1007,9 +1175,14 @@ class ColabFleetDispatcher:
             note = redact_secrets(f"{type(exc).__name__}: {exc}")[:200]
             rc = 1
         finally:
+            promote_release = (
+                job.tier == "light-gpu"
+                and self._has_ready_heavy_gpu_pending()
+            )
             can_reuse = (
                 rc == 0
                 and self.reuse_sessions
+                and not promote_release
                 and not self._stop_requested.is_set()
                 and jobs_run_after < self.max_jobs_per_session
                 and self._has_compatible_pending(job.accelerator_class, sku)
@@ -1022,13 +1195,18 @@ class ColabFleetDispatcher:
                             "session": sess_name,
                             "sku": sku,
                             "class": job.accelerator_class,
+                            "tier": job.tier,
                             "assignment": assign,
                             "jobs_run": jobs_run_after,
                         })
                         parked = True
             if parked:
-                self.log_event("session_parked_for_reuse", {"session": sess_name, "sku": sku, "jobs_run": jobs_run_after})
+                self.log_event("session_parked_for_reuse", {"session": sess_name, "sku": sku, "tier": job.tier, "jobs_run": jobs_run_after})
             else:
+                if promote_release:
+                    with self._lock:
+                        self._promotions_count += 1
+                    self.log_event("promotion_release_for_heavy_gpu", {"session": sess_name, "sku": sku, "job_id": job.job_id})
                 self.stop_owned_session(sess_name)
         elapsed_s = round(time.perf_counter() - t0, 2)
         est_cu = round((elapsed_s / 3600.0) * SKU_EST_CU_HR.get(sku, 1.0), 4)
@@ -1099,34 +1277,44 @@ class ColabFleetDispatcher:
             self._job_states[j.job_id] = {
                 "wave": j.wave,
                 "class": j.accelerator_class,
+                "tier": j.tier,
                 "status": "pending",
                 "sku": None,
                 "zone": None,
             }
 
-        pending = sorted(jobs, key=lambda x: (x.wave, x.job_id))
+        # 3 independent tiered queues so a blocked heavy-GPU head never starves light-GPU or TPU/CPU slots
+        tier_queues: Dict[str, List[FleetJob]] = {
+            "heavy-gpu": sorted([j for j in jobs if j.tier == "heavy-gpu"], key=lambda x: (x.wave, x.job_id)),
+            "light-gpu": sorted([j for j in jobs if j.tier == "light-gpu"], key=lambda x: (x.wave, x.job_id)),
+            "tpu-cpu": sorted([j for j in jobs if j.tier == "tpu-cpu"], key=lambda x: (x.wave, x.job_id)),
+        }
+        def _all_pending() -> List[FleetJob]:
+            return tier_queues["heavy-gpu"] + tier_queues["light-gpu"] + tier_queues["tpu-cpu"]
+
         with self._lock:
-            self._pending_snapshot = list(pending)
+            self._pending_snapshot = _all_pending()
         running: Dict[concurrent.futures.Future[Dict[str, Any]], FleetJob] = {}
         cooldown_waited_s = 0.0
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=self.governor.cfg.max_total_slots) as pool:
-                while (pending or running) and not self._stop_requested.is_set():
+                while (_all_pending() or running) and not self._stop_requested.is_set():
                     # Reap completed futures
                     done_futs = [f for f in list(running.keys()) if f.done()]
                     for f in done_futs:
                         running.pop(f, None)
 
+                    pending_all = _all_pending()
                     with self._lock:
-                        self._pending_snapshot = list(pending)
+                        self._pending_snapshot = list(pending_all)
                     # Immediately tear down any parked idle session that no longer matches a pending job
-                    self._drain_unneeded_idle_sessions(pending)
+                    self._drain_unneeded_idle_sessions(pending_all)
 
                     usage = self.get_usage()
                     dec = self.governor.evaluate(
                         balance_cu=usage.get("balance_cu"),
                         spent_today_cu=self._spent_today_cu,
-                        pending_jobs=len(pending),
+                        pending_jobs=len(pending_all),
                     )
                     self.write_state_md(usage, dec)
 
@@ -1134,86 +1322,144 @@ class ColabFleetDispatcher:
                         self.log_event("governor_halt", dataclasses.asdict(dec))
                         break
 
-                    if dec.admitted and pending:
+                    if dec.admitted and pending_all:
                         active_sessions = self.list_sessions()
-                        launched_any = False
-                        next_pending: List[FleetJob] = []
-                        for idx_j, job in enumerate(pending):
-                            # 1. Prefer reusing a live compatible parked session (zero VM spawn!)
-                            reused_entry = self._acquire_idle_session(job)
-                            if reused_entry is not None:
-                                sess_name = reused_entry["session"]
-                                sku = reused_entry["sku"]
-                                assign = reused_entry["assignment"]
-                                jobs_run_before = reused_entry["jobs_run"]
-                                with self._lock:
-                                    self._job_states[job.job_id]["status"] = "running"
-                                    self._job_states[job.job_id]["sku"] = sku
-                                    self._job_states[job.job_id]["zone"] = assign.get("zone")
-                                    self._pending_snapshot = list(next_pending) + list(pending[idx_j + 1 :])
-                                fut = pool.submit(
-                                    self._execute_one_job,
-                                    job,
-                                    sess_name,
-                                    sku,
-                                    assign,
-                                    reused=True,
-                                    jobs_run_before=jobs_run_before,
-                                )
-                                running[fut] = job
-                                launched_any = True
-                                continue
-
-                            # 2. Otherwise check slot caps and spawn a new session politely
-                            ok_slot, _reason = self._can_admit_slot(
-                                job.accelerator_class,
-                                active_sessions,
-                                dec.max_concurrent_slots,
-                            )
-                            if not ok_slot:
-                                next_pending.append(job)
-                                continue
-                            sess_name, sku, assign, status = self._provision_job_session(job)
-                            if sess_name and sku and assign:
-                                with self._lock:
-                                    self._job_states[job.job_id]["status"] = "running"
-                                    self._job_states[job.job_id]["sku"] = sku
-                                    self._job_states[job.job_id]["zone"] = assign.get("zone")
-                                    self._pending_snapshot = list(next_pending) + list(pending[idx_j + 1 :])
-                                active_sessions.append({
-                                    "name": sess_name,
-                                    "endpoint": assign.get("endpoint", ""),
-                                    "kind": job.accelerator_class,
-                                })
-                                fut = pool.submit(
-                                    self._execute_one_job,
-                                    job,
-                                    sess_name,
-                                    sku,
-                                    assign,
-                                    reused=False,
-                                    jobs_run_before=0,
-                                )
-                                running[fut] = job
-                                launched_any = True
-                            else:
-                                with self._lock:
-                                    self._job_states[job.job_id]["note"] = f"deferred:{status}"
-                                next_pending.append(job)
-                                if status == "412_TOO_MANY_ACTIVE":
-                                    next_pending.extend(pending[idx_j + 1 :])
-                                    break
-                        pending = next_pending
+                        # Tag active sessions with tier metadata from _owned_sessions when known
                         with self._lock:
-                            self._pending_snapshot = list(pending)
+                            for s in active_sessions:
+                                owned_meta = self._owned_sessions.get(s["name"])
+                                if owned_meta and "tier" in owned_meta:
+                                    s["tier"] = owned_meta["tier"]
+                                elif s["kind"] == "GPU":
+                                    hw_u = s.get("hardware", "").upper()
+                                    s["tier"] = "light-gpu" if "T4" in hw_u else "heavy-gpu"
+                                else:
+                                    s["tier"] = "tpu-cpu"
+
+                        offpeak_now = self._is_offpeak_now()
+                        heavy_cap = self._heavy_gpu_slot_cap()
+                        launched_any = False
+                        heavy_blocked_503 = False
+                        hard_throttle = False
+
+                        # Dispatch each independent tier in priority order: heavy-gpu -> light-gpu (backfill) -> tpu-cpu
+                        for tier_name in TIER_NAMES:
+                            if hard_throttle:
+                                break
+                            q = tier_queues[tier_name]
+                            if not q:
+                                continue
+                            # Skip light-gpu backfill only if peak-backfill is disabled AND heavy-gpu is waiting on peak 503
+                            if tier_name == "light-gpu" and not self.enable_peak_backfill and heavy_blocked_503:
+                                continue
+                            next_tier_q: List[FleetJob] = []
+                            for idx_j, job in enumerate(q):
+                                if hard_throttle:
+                                    next_tier_q.append(job)
+                                    continue
+                                # 1. Prefer reusing a live compatible parked session (zero VM spawn!)
+                                reused_entry = self._acquire_idle_session(job)
+                                if reused_entry is not None:
+                                    sess_name = reused_entry["session"]
+                                    sku = reused_entry["sku"]
+                                    assign = reused_entry["assignment"]
+                                    jobs_run_before = reused_entry["jobs_run"]
+                                    with self._lock:
+                                        self._job_states[job.job_id]["status"] = "running"
+                                        self._job_states[job.job_id]["sku"] = sku
+                                        self._job_states[job.job_id]["zone"] = assign.get("zone")
+                                        other_pend = [
+                                            pj for tn in TIER_NAMES if tn != tier_name for pj in tier_queues[tn]
+                                        ]
+                                        self._pending_snapshot = next_tier_q + q[idx_j + 1 :] + other_pend
+                                    fut = pool.submit(
+                                        self._execute_one_job,
+                                        job,
+                                        sess_name,
+                                        sku,
+                                        assign,
+                                        reused=True,
+                                        jobs_run_before=jobs_run_before,
+                                    )
+                                    running[fut] = job
+                                    launched_any = True
+                                    continue
+
+                                # 2. Otherwise check slot caps and spawn a new session politely
+                                ok_slot, _reason = self._can_admit_slot(
+                                    job.accelerator_class,
+                                    active_sessions,
+                                    dec.max_concurrent_slots,
+                                    tier=tier_name,
+                                    heavy_gpu_cap=heavy_cap,
+                                )
+                                if not ok_slot:
+                                    next_tier_q.append(job)
+                                    continue
+                                sess_name, sku, assign, status = self._provision_job_session(job)
+                                if sess_name and sku and assign:
+                                    is_backfill = (tier_name in ("light-gpu", "tpu-cpu")) and heavy_blocked_503
+                                    with self._lock:
+                                        self._job_states[job.job_id]["status"] = "running"
+                                        self._job_states[job.job_id]["sku"] = sku
+                                        self._job_states[job.job_id]["zone"] = assign.get("zone")
+                                        if is_backfill:
+                                            self._backfill_launches_count += 1
+                                            self._job_states[job.job_id]["note"] = "peak_503_backfill"
+                                        other_pend = [
+                                            pj for tn in TIER_NAMES if tn != tier_name for pj in tier_queues[tn]
+                                        ]
+                                        self._pending_snapshot = next_tier_q + q[idx_j + 1 :] + other_pend
+                                    if is_backfill:
+                                        self.log_event("peak_503_backfill_launched", {
+                                            "job_id": job.job_id,
+                                            "tier": tier_name,
+                                            "sku": sku,
+                                            "offpeak_window": offpeak_now,
+                                        })
+                                    active_sessions.append({
+                                        "name": sess_name,
+                                        "endpoint": assign.get("endpoint", ""),
+                                        "kind": job.accelerator_class,
+                                        "tier": tier_name,
+                                    })
+                                    fut = pool.submit(
+                                        self._execute_one_job,
+                                        job,
+                                        sess_name,
+                                        sku,
+                                        assign,
+                                        reused=False,
+                                        jobs_run_before=0,
+                                    )
+                                    running[fut] = job
+                                    launched_any = True
+                                else:
+                                    with self._lock:
+                                        self._job_states[job.job_id]["note"] = f"deferred:{status}"
+                                    next_tier_q.append(job)
+                                    if tier_name == "heavy-gpu" and status == "no_sku_available":
+                                        heavy_blocked_503 = True
+                                    if status in ("412_TOO_MANY_ACTIVE", "429_RATE_LIMITED"):
+                                        # Strictly ToS-clean: immediately stop admitting more slots on 412/429
+                                        hard_throttle = True
+                            tier_queues[tier_name] = next_tier_q
+
+                        pending_all = _all_pending()
+                        with self._lock:
+                            self._pending_snapshot = list(pending_all)
                         if not launched_any and not running:
-                            wait_s = self._earliest_cooldown_wait_s(pending) if self.wait_on_cooldown else None
+                            wait_s = self._earliest_cooldown_wait_s(pending_all) if self.wait_on_cooldown else None
                             if (
                                 wait_s is not None
                                 and not self._stop_requested.is_set()
                                 and (cooldown_waited_s + wait_s) <= self.max_cooldown_wait_s
                             ):
-                                self.log_event("cooldown_wait", {"wait_s": round(wait_s, 2), "pending": len(pending)})
+                                self.log_event("cooldown_wait", {
+                                    "wait_s": round(wait_s, 2),
+                                    "pending": len(pending_all),
+                                    "offpeak_window": offpeak_now,
+                                })
                                 self._sleep(wait_s)
                                 cooldown_waited_s += wait_s
                                 continue
@@ -1244,9 +1490,14 @@ class ColabFleetDispatcher:
                 "sync_backend": self.sync.describe(),
                 "session_efficiency": {
                     "reuse_sessions": self.reuse_sessions,
+                    "reset_between_jobs": self.reset_between_jobs,
                     "max_jobs_per_session": self.max_jobs_per_session,
                     "sessions_created": self._sessions_created_count,
                     "sessions_reused": self._sessions_reused_count,
+                    "workspace_resets": self._workspace_resets_count,
+                    "backfill_launches": self._backfill_launches_count,
+                    "heavy_gpu_promotions": self._promotions_count,
+                    "offpeak_window_end": self._is_offpeak_now(),
                     "spawn_spacing_s": self.spawn_spacing_s,
                     "backoff_base_s": self.backoff_base_s,
                     "backoff_cap_s": self.backoff_cap_s,
@@ -1409,9 +1660,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--max-gpu-slots", type=int, default=3, help="Max concurrent GPU slots (default: 3).")
     parser.add_argument("--max-tpu-slots", type=int, default=2, help="Max concurrent TPU slots (default: 2).")
     parser.add_argument("--max-cpu-slots", type=int, default=4, help="Max concurrent CPU slots (default: 4).")
-    parser.add_argument("--reuse-sessions", dest="reuse_sessions", action="store_true", default=True, help="Reuse live sessions across compatible shards (default: enabled).")
-    parser.add_argument("--no-reuse-sessions", dest="reuse_sessions", action="store_false", help="Stop each session after 1 job instead of reusing across shards.")
+    parser.add_argument("--reuse-sessions", dest="reuse_sessions", action="store_true", default=True, help="Reuse live sessions across compatible jobs/shards (default: enabled).")
+    parser.add_argument("--no-reuse-sessions", dest="reuse_sessions", action="store_false", help="Stop each session after 1 job instead of reusing.")
+    parser.add_argument("--reset-between-jobs", dest="reset_between_jobs", action="store_true", default=True, help="Run clean workspace & GPU cache reset between jobs on a reused VM (default: enabled).")
+    parser.add_argument("--no-reset-between-jobs", dest="reset_between_jobs", action="store_false", help="Skip workspace reset between reused jobs.")
     parser.add_argument("--max-jobs-per-session", type=int, default=16, help="Max sequential jobs/shards per reused session (default: 16).")
+    parser.add_argument("--peak-backfill", dest="enable_peak_backfill", action="store_true", default=True, help="Backfill open slots with light-GPU (T4_HM) + TPU + CPU when heavy GPUs return 503 (default: enabled).")
+    parser.add_argument("--no-peak-backfill", dest="enable_peak_backfill", action="store_false", help="Disable automatic peak-503 backfill.")
+    parser.add_argument("--peak-max-heavy-gpu-slots", type=int, default=2, help="Max heavy-GPU slots during peak hours (default: 2).")
+    parser.add_argument("--offpeak-max-heavy-gpu-slots", type=int, default=3, help="Max heavy-GPU slots during off-peak burst window 00:00-07:00 EST (default: 3).")
+    parser.add_argument("--max-light-gpu-slots", type=int, default=2, help="Max concurrent light-GPU backfill slots such as T4_HM (default: 2).")
+    parser.add_argument("--offpeak-tz-offset-hours", type=int, default=-5, help="Timezone UTC offset for off-peak window (default: -5 for EST).")
+    parser.add_argument("--offpeak-start-hour", type=int, default=0, help="Off-peak burst start hour in local time (default: 0).")
+    parser.add_argument("--offpeak-end-hour", type=int, default=7, help="Off-peak burst end hour in local time (default: 7).")
     parser.add_argument("--spawn-spacing-s", type=float, default=18.0, help="Minimum seconds between distinct VM spawns (default: 18.0).")
     parser.add_argument("--backoff-base-s", type=float, default=30.0, help="Initial 503/429 exponential backoff seconds (default: 30.0).")
     parser.add_argument("--backoff-cap-s", type=float, default=300.0, help="Maximum 503/429 exponential backoff seconds (default: 300.0).")
@@ -1449,7 +1710,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         governor_cfg=gov_cfg,
         sync_mode=args.sync,
         reuse_sessions=args.reuse_sessions,
+        reset_between_jobs=args.reset_between_jobs,
         max_jobs_per_session=args.max_jobs_per_session,
+        enable_peak_backfill=args.enable_peak_backfill,
+        peak_max_heavy_gpu_slots=args.peak_max_heavy_gpu_slots,
+        offpeak_max_heavy_gpu_slots=args.offpeak_max_heavy_gpu_slots,
+        max_light_gpu_slots=args.max_light_gpu_slots,
+        offpeak_tz_offset_hours=args.offpeak_tz_offset_hours,
+        offpeak_start_hour=args.offpeak_start_hour,
+        offpeak_end_hour=args.offpeak_end_hour,
         spawn_spacing_s=args.spawn_spacing_s,
         backoff_base_s=args.backoff_base_s,
         backoff_cap_s=args.backoff_cap_s,

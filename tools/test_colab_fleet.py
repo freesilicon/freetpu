@@ -242,6 +242,173 @@ class TestColabFleet(unittest.TestCase):
         desc = cf.S3CompatibleSyncBackend(cfg).describe()
         self.assertEqual(desc["endpoint"], "https://<redacted>.r2.cloudflarestorage.com")
 
+    def test_warm_gpu_reuse_runs_workspace_reset_between_jobs(self) -> None:
+        """Scarce A100 won once should stay alive across 2 heavy-GPU jobs with a clean workspace reset in between."""
+        import subprocess
+        import threading
+
+        with tempfile.TemporaryDirectory(prefix="freetpu_warm_gpu_") as td:
+            td_p = Path(td)
+            worker = td_p / "w.py"
+            worker.write_text("print('ok')\n", encoding="utf-8")
+            sessions: dict[str, str] = {}
+            new_calls: list[str] = []
+            reset_calls: int = 0
+            lock = threading.Lock()
+
+            def runner(args, _to):
+                nonlocal reset_calls
+                cmd = args[0]
+                with lock:
+                    if cmd == "usage":
+                        return subprocess.CompletedProcess(
+                            args, 0, f"Current balance: 7000.00 compute units\nUsage rate: 8.16/hr\nActive assignments: {len(sessions)}\n", ""
+                        )
+                    if cmd == "sessions":
+                        return subprocess.CompletedProcess(args, 0, "\n".join(sessions.values()) + "\n", "")
+                    if cmd == "new":
+                        sname = args[args.index("-s") + 1]
+                        new_calls.append(sname)
+                        sessions[sname] = f"[{sname}] gpu-a100-s-ass1c0-w1 | Hardware: A100 | Shape: Standard | Variant: GPU"
+                        return subprocess.CompletedProcess(args, 0, "ok\n", "")
+                    if cmd == "stop":
+                        sessions.pop(args[args.index("-s") + 1], None)
+                        return subprocess.CompletedProcess(args, 0, "stopped\n", "")
+                    if cmd == "exec":
+                        if "-c" in args and "fleet_workspace_reset_ok" in args[args.index("-c") + 1]:
+                            reset_calls += 1
+                        return subprocess.CompletedProcess(args, 0, "ok\n", "")
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            disp = cf.ColabFleetDispatcher(
+                colab_bin="colab",
+                auth="adc",
+                run_dir=td_p / "run",
+                governor_cfg=cf.CuGovernorConfig(max_gpu_slots=1, max_total_slots=2),
+                peak_max_heavy_gpu_slots=1,
+                offpeak_max_heavy_gpu_slots=1,
+                reuse_sessions=True,
+                reset_between_jobs=True,
+                spawn_spacing_s=0.0,
+                command_runner=runner,
+            )
+            jobs = [
+                cf.FleetJob("a100_job_1", 1, "GPU", worker, sku_preference=("A100",), tier="heavy-gpu"),
+                cf.FleetJob("a100_job_2", 1, "GPU", worker, sku_preference=("A100",), tier="heavy-gpu"),
+            ]
+            proof = disp.run_queue(jobs)
+            self.assertEqual(len(new_calls), 1)
+            self.assertEqual(proof["session_efficiency"]["sessions_created"], 1)
+            self.assertEqual(proof["session_efficiency"]["sessions_reused"], 1)
+            self.assertEqual(proof["session_efficiency"]["workspace_resets"], 1)
+            self.assertEqual(reset_calls, 1)
+            self.assertTrue(proof["teardown"]["zero_fleet_leaked"])
+
+    def test_peak_503_backfill_and_three_independent_tiered_queues(self) -> None:
+        """When heavy-gpu (H100/A100) returns 503 at peak, light-gpu (T4_HM) + TPU + CPU backfill immediately without starvation."""
+        import subprocess
+        import threading
+        from datetime import datetime, timezone
+
+        with tempfile.TemporaryDirectory(prefix="freetpu_backfill_") as td:
+            td_p = Path(td)
+            worker = td_p / "w.py"
+            worker.write_text("print('ok')\n", encoding="utf-8")
+            sessions: dict[str, str] = {}
+            lock = threading.Lock()
+
+            def runner(args, _to):
+                cmd = args[0]
+                with lock:
+                    if cmd == "usage":
+                        return subprocess.CompletedProcess(
+                            args, 0, f"Current balance: 7000.00 compute units\nUsage rate: 6.00/hr\nActive assignments: {len(sessions)}\n", ""
+                        )
+                    if cmd == "sessions":
+                        return subprocess.CompletedProcess(args, 0, "\n".join(sessions.values()) + "\n", "")
+                    if cmd == "new":
+                        sname = args[args.index("-s") + 1]
+                        if "--gpu" in args and args[args.index("--gpu") + 1] in ("H100", "A100", "L4"):
+                            return subprocess.CompletedProcess(args, 1, "", "503 Service Unavailable")
+                        if "--gpu" in args:
+                            hw = args[args.index("--gpu") + 1]
+                            sessions[sname] = f"[{sname}] gpu-{hw.lower()}-hm-usc1a0-b1 | Hardware: {hw} | Shape: High-RAM | Variant: GPU"
+                        elif "--tpu" in args:
+                            hw = args[args.index("--tpu") + 1]
+                            sessions[sname] = f"[{sname}] tpu-{hw.lower()}-s-usw4a0-b1 | Hardware: {hw} | Shape: Standard | Variant: TPU"
+                        else:
+                            sessions[sname] = f"[{sname}] m-hm-ase1a0-b1 | Hardware: CPU | Shape: High-RAM | Variant: DEFAULT"
+                        return subprocess.CompletedProcess(args, 0, "ok\n", "")
+                    if cmd == "stop":
+                        sessions.pop(args[args.index("-s") + 1], None)
+                        return subprocess.CompletedProcess(args, 0, "stopped\n", "")
+                    if cmd == "exec":
+                        return subprocess.CompletedProcess(args, 0, "ok\n", "")
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            # 18:00 EST (23:00 UTC) = peak window
+            peak_clock = lambda: datetime(2026, 11, 26, 23, 0, 0, tzinfo=timezone.utc)
+            disp = cf.ColabFleetDispatcher(
+                colab_bin="colab",
+                auth="adc",
+                run_dir=td_p / "run",
+                governor_cfg=cf.CuGovernorConfig(max_total_slots=7, max_gpu_slots=3, max_tpu_slots=2, max_cpu_slots=4),
+                enable_peak_backfill=True,
+                max_light_gpu_slots=2,
+                spawn_spacing_s=0.0,
+                command_runner=runner,
+                now_fn=peak_clock,
+            )
+            jobs = [
+                cf.FleetJob("heavy_1", 1, "GPU", worker, sku_preference=("H100", "A100"), tier="heavy-gpu"),
+                cf.FleetJob("light_1", 1, "GPU", worker, sku_preference=("T4_HM",), tier="light-gpu/rollout"),
+                cf.FleetJob("light_2", 1, "GPU", worker, sku_preference=("T4_HM",), tier="light-gpu"),
+                cf.FleetJob("tpu_1", 1, "TPU", worker, sku_preference=("V5E1",), tier="tpu+cpu-verifier"),
+                cf.FleetJob("cpu_1", 1, "CPU", worker, sku_preference=("CPU_HM",)),
+            ]
+            proof = disp.run_queue(jobs)
+            self.assertEqual(proof["jobs"]["heavy_1"]["status"], "pending")
+            self.assertEqual(proof["jobs"]["light_1"]["status"], "done")
+            self.assertEqual(proof["jobs"]["light_2"]["status"], "done")
+            self.assertEqual(proof["jobs"]["tpu_1"]["status"], "done")
+            self.assertEqual(proof["jobs"]["cpu_1"]["status"], "done")
+            self.assertGreaterEqual(proof["session_efficiency"]["backfill_launches"], 3)
+            self.assertFalse(proof["session_efficiency"]["offpeak_window_end"])
+            self.assertTrue(proof["teardown"]["zero_fleet_leaked"])
+
+    def test_offpeak_window_and_heavy_gpu_stacking_cap(self) -> None:
+        from datetime import datetime, timezone
+
+        # 02:30 EST = 07:30 UTC -> off-peak; 15:00 EST = 20:00 UTC -> peak
+        self.assertTrue(cf.is_offpeak_window(datetime(2026, 11, 27, 7, 30, tzinfo=timezone.utc)))
+        self.assertFalse(cf.is_offpeak_window(datetime(2026, 11, 26, 20, 0, tzinfo=timezone.utc)))
+        self.assertEqual(cf.infer_job_tier("GPU", ("H100", "A100")), "heavy-gpu")
+        self.assertEqual(cf.infer_job_tier("GPU", ("T4_HM",)), "light-gpu")
+        self.assertEqual(cf.infer_job_tier("TPU", ("V5E1",)), "tpu-cpu")
+        self.assertEqual(cf.infer_job_tier("CPU", ("CPU_HM",)), "tpu-cpu")
+
+        with tempfile.TemporaryDirectory(prefix="freetpu_offpeak_") as td:
+            disp_off = cf.ColabFleetDispatcher(
+                colab_bin="colab",
+                auth="adc",
+                run_dir=Path(td) / "off",
+                governor_cfg=cf.CuGovernorConfig(max_gpu_slots=3),
+                peak_max_heavy_gpu_slots=2,
+                offpeak_max_heavy_gpu_slots=3,
+                now_fn=lambda: datetime(2026, 11, 27, 8, 0, tzinfo=timezone.utc),  # 03:00 EST
+            )
+            disp_peak = cf.ColabFleetDispatcher(
+                colab_bin="colab",
+                auth="adc",
+                run_dir=Path(td) / "peak",
+                governor_cfg=cf.CuGovernorConfig(max_gpu_slots=3),
+                peak_max_heavy_gpu_slots=2,
+                offpeak_max_heavy_gpu_slots=3,
+                now_fn=lambda: datetime(2026, 11, 26, 20, 0, tzinfo=timezone.utc),  # 15:00 EST
+            )
+            self.assertEqual(disp_off._heavy_gpu_slot_cap(), 3)
+            self.assertEqual(disp_peak._heavy_gpu_slot_cap(), 2)
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Unit tests for tools/colab_fleet.py")
