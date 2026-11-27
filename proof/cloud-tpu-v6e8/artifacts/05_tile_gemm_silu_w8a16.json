@@ -1,0 +1,158 @@
+{
+  "op_kind": "fused_matmul_silu",
+  "dtype": "w8a16",
+  "shapes": {
+    "a": [
+      64,
+      512
+    ],
+    "b": [
+      512,
+      512
+    ]
+  },
+  "reference_target": "cpu_ref",
+  "passed": true,
+  "targets": {
+    "cpu_ref": {
+      "target": "cpu_ref",
+      "op_kind": "fused_matmul_silu",
+      "dtype": "w8a16",
+      "silicon": "host-cpu",
+      "stack": "numpy-2.2.6",
+      "mock": false,
+      "hw_us": null,
+      "min_hw_us": null,
+      "wall_us": 1140.25,
+      "gflops": 29.427,
+      "tflops": 0.02943,
+      "metadata": {}
+    },
+    "cloud_tpu_pallas": {
+      "target": "cloud_tpu_pallas",
+      "op_kind": "fused_matmul_silu",
+      "dtype": "w8a16",
+      "silicon": "TPU v6 lite",
+      "stack": "jax-0.6.2 (pallas/tpu_custom_call=True)",
+      "mock": false,
+      "hw_us": 136.83,
+      "min_hw_us": 130.29,
+      "wall_us": 136.83,
+      "gflops": 245.227,
+      "tflops": 0.24523,
+      "metadata": {
+        "backend": "cloud_tpu_pallas",
+        "op_kind": "fused_matmul_silu",
+        "dtype": "w8a16",
+        "m_orig": 64,
+        "m_pad": 64,
+        "k": 512,
+        "n": 512,
+        "block_m": 64,
+        "block_n": 512,
+        "block_k": 512,
+        "grid": [
+          1,
+          1,
+          1
+        ],
+        "grid_down": null,
+        "rhs_transposed": false,
+        "tpu_custom_call_expected": true,
+        "ast_verified": true,
+        "tpu_custom_call": true
+      }
+    }
+  },
+  "parity": {
+    "cloud_tpu_pallas": {
+      "status": "checked",
+      "ok": true,
+      "max_abs_err": 0.010306477546691895,
+      "mean_abs_err": 0.0005684279538629711,
+      "nmse": 1.0450207530616898e-05
+    }
+  },
+  "ir": {
+    "name": "fused_gemm_silu",
+    "op_kind": "fused_matmul_silu",
+    "dtype": "w8a16",
+    "block_spec": {
+      "block_m": 64,
+      "block_n": 512,
+      "block_k": 512
+    },
+    "rhs_transposed": false,
+    "input_names": [
+      "a",
+      "b"
+    ],
+    "output_name": "out",
+    "has_down_proj": false,
+    "gemm_roles": [
+      "a",
+      "b"
+    ],
+    "swiglu_roles": {},
+    "ops": [
+      {
+        "op": "load",
+        "inputs": [
+          "a"
+        ],
+        "output": "ld_0",
+        "attrs": {
+          "param": "a",
+          "tile_shape": [
+            64,
+            512
+          ],
+          "index": "(PidExpr(axis=0), None)"
+        }
+      },
+      {
+        "op": "load",
+        "inputs": [
+          "b"
+        ],
+        "output": "ld_1",
+        "attrs": {
+          "param": "b",
+          "tile_shape": [
+            512,
+            512
+          ],
+          "index": "(None, PidExpr(axis=1))"
+        }
+      },
+      {
+        "op": "dot",
+        "inputs": [
+          "ld_0",
+          "ld_1"
+        ],
+        "output": "v2",
+        "attrs": {}
+      },
+      {
+        "op": "silu",
+        "inputs": [
+          "v2"
+        ],
+        "output": "v3",
+        "attrs": {}
+      },
+      {
+        "op": "store",
+        "inputs": [
+          "v3"
+        ],
+        "output": "out",
+        "attrs": {
+          "param": "out",
+          "index": "(PidExpr(axis=0), PidExpr(axis=1))"
+        }
+      }
+    ]
+  }
+}

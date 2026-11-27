@@ -1,0 +1,377 @@
+{
+  "cdiVersion": "0.6.0",
+  "kind": "freetpu.dev/tpu",
+  "annotations": {
+    "freetpu.dev/generated-by": "freetpu-cdi",
+    "freetpu.dev/required-cap-add": "IPC_LOCK",
+    "freetpu.dev/required-ulimit-memlock": "-1"
+  },
+  "containerEdits": {
+    "deviceNodes": [
+      {
+        "path": "/dev/vfio/vfio",
+        "hostPath": "/dev/vfio/vfio",
+        "type": "c",
+        "permissions": "rw",
+        "major": 10,
+        "minor": 196
+      }
+    ],
+    "env": [
+      "FREETPU_CDI_VERSION=0.6.0",
+      "FREETPU_VFIO_CONTAINER=/dev/vfio/vfio"
+    ]
+  },
+  "devices": [
+    {
+      "name": "0",
+      "annotations": {
+        "freetpu.dev/allocation-unit": "single-chip",
+        "freetpu.dev/pci-bdf": "0000:00:0b.0",
+        "freetpu.dev/vendor-id": "0x1ae0",
+        "freetpu.dev/device-id": "0x006f",
+        "freetpu.dev/generation": "v6e",
+        "freetpu.dev/model": "TPU v6e (Trillium)",
+        "freetpu.dev/driver": "vfio-pci",
+        "freetpu.dev/iommu-group": "3",
+        "freetpu.dev/required-cap-add": "IPC_LOCK",
+        "freetpu.dev/required-ulimit-memlock": "-1"
+      },
+      "containerEdits": {
+        "deviceNodes": [
+          {
+            "path": "/dev/vfio/3",
+            "hostPath": "/dev/vfio/3",
+            "type": "c",
+            "permissions": "rw",
+            "major": 239,
+            "minor": 5
+          }
+        ],
+        "env": [
+          "FREETPU_VISIBLE_DEVICES=0",
+          "FREETPU_PCI_BDFS=0000:00:0b.0",
+          "FREETPU_TPU_GENERATION=v6e",
+          "FREETPU_VFIO_DEVICES=/dev/vfio/3"
+        ]
+      }
+    },
+    {
+      "name": "1",
+      "annotations": {
+        "freetpu.dev/allocation-unit": "single-chip",
+        "freetpu.dev/pci-bdf": "0000:00:0c.0",
+        "freetpu.dev/vendor-id": "0x1ae0",
+        "freetpu.dev/device-id": "0x006f",
+        "freetpu.dev/generation": "v6e",
+        "freetpu.dev/model": "TPU v6e (Trillium)",
+        "freetpu.dev/driver": "vfio-pci",
+        "freetpu.dev/iommu-group": "2",
+        "freetpu.dev/required-cap-add": "IPC_LOCK",
+        "freetpu.dev/required-ulimit-memlock": "-1"
+      },
+      "containerEdits": {
+        "deviceNodes": [
+          {
+            "path": "/dev/vfio/2",
+            "hostPath": "/dev/vfio/2",
+            "type": "c",
+            "permissions": "rw",
+            "major": 239,
+            "minor": 7
+          }
+        ],
+        "env": [
+          "FREETPU_VISIBLE_DEVICES=1",
+          "FREETPU_PCI_BDFS=0000:00:0c.0",
+          "FREETPU_TPU_GENERATION=v6e",
+          "FREETPU_VFIO_DEVICES=/dev/vfio/2"
+        ]
+      }
+    },
+    {
+      "name": "2",
+      "annotations": {
+        "freetpu.dev/allocation-unit": "single-chip",
+        "freetpu.dev/pci-bdf": "0000:00:0d.0",
+        "freetpu.dev/vendor-id": "0x1ae0",
+        "freetpu.dev/device-id": "0x006f",
+        "freetpu.dev/generation": "v6e",
+        "freetpu.dev/model": "TPU v6e (Trillium)",
+        "freetpu.dev/driver": "vfio-pci",
+        "freetpu.dev/iommu-group": "4",
+        "freetpu.dev/required-cap-add": "IPC_LOCK",
+        "freetpu.dev/required-ulimit-memlock": "-1"
+      },
+      "containerEdits": {
+        "deviceNodes": [
+          {
+            "path": "/dev/vfio/4",
+            "hostPath": "/dev/vfio/4",
+            "type": "c",
+            "permissions": "rw",
+            "major": 239,
+            "minor": 0
+          }
+        ],
+        "env": [
+          "FREETPU_VISIBLE_DEVICES=2",
+          "FREETPU_PCI_BDFS=0000:00:0d.0",
+          "FREETPU_TPU_GENERATION=v6e",
+          "FREETPU_VFIO_DEVICES=/dev/vfio/4"
+        ]
+      }
+    },
+    {
+      "name": "3",
+      "annotations": {
+        "freetpu.dev/allocation-unit": "single-chip",
+        "freetpu.dev/pci-bdf": "0000:00:0e.0",
+        "freetpu.dev/vendor-id": "0x1ae0",
+        "freetpu.dev/device-id": "0x006f",
+        "freetpu.dev/generation": "v6e",
+        "freetpu.dev/model": "TPU v6e (Trillium)",
+        "freetpu.dev/driver": "vfio-pci",
+        "freetpu.dev/iommu-group": "7",
+        "freetpu.dev/required-cap-add": "IPC_LOCK",
+        "freetpu.dev/required-ulimit-memlock": "-1"
+      },
+      "containerEdits": {
+        "deviceNodes": [
+          {
+            "path": "/dev/vfio/7",
+            "hostPath": "/dev/vfio/7",
+            "type": "c",
+            "permissions": "rw",
+            "major": 239,
+            "minor": 3
+          }
+        ],
+        "env": [
+          "FREETPU_VISIBLE_DEVICES=3",
+          "FREETPU_PCI_BDFS=0000:00:0e.0",
+          "FREETPU_TPU_GENERATION=v6e",
+          "FREETPU_VFIO_DEVICES=/dev/vfio/7"
+        ]
+      }
+    },
+    {
+      "name": "4",
+      "annotations": {
+        "freetpu.dev/allocation-unit": "single-chip",
+        "freetpu.dev/pci-bdf": "0000:80:00.0",
+        "freetpu.dev/vendor-id": "0x1ae0",
+        "freetpu.dev/device-id": "0x006f",
+        "freetpu.dev/generation": "v6e",
+        "freetpu.dev/model": "TPU v6e (Trillium)",
+        "freetpu.dev/driver": "vfio-pci",
+        "freetpu.dev/iommu-group": "5",
+        "freetpu.dev/required-cap-add": "IPC_LOCK",
+        "freetpu.dev/required-ulimit-memlock": "-1"
+      },
+      "containerEdits": {
+        "deviceNodes": [
+          {
+            "path": "/dev/vfio/5",
+            "hostPath": "/dev/vfio/5",
+            "type": "c",
+            "permissions": "rw",
+            "major": 239,
+            "minor": 4
+          }
+        ],
+        "env": [
+          "FREETPU_VISIBLE_DEVICES=4",
+          "FREETPU_PCI_BDFS=0000:80:00.0",
+          "FREETPU_TPU_GENERATION=v6e",
+          "FREETPU_VFIO_DEVICES=/dev/vfio/5"
+        ]
+      }
+    },
+    {
+      "name": "5",
+      "annotations": {
+        "freetpu.dev/allocation-unit": "single-chip",
+        "freetpu.dev/pci-bdf": "0000:80:01.0",
+        "freetpu.dev/vendor-id": "0x1ae0",
+        "freetpu.dev/device-id": "0x006f",
+        "freetpu.dev/generation": "v6e",
+        "freetpu.dev/model": "TPU v6e (Trillium)",
+        "freetpu.dev/driver": "vfio-pci",
+        "freetpu.dev/iommu-group": "6",
+        "freetpu.dev/required-cap-add": "IPC_LOCK",
+        "freetpu.dev/required-ulimit-memlock": "-1"
+      },
+      "containerEdits": {
+        "deviceNodes": [
+          {
+            "path": "/dev/vfio/6",
+            "hostPath": "/dev/vfio/6",
+            "type": "c",
+            "permissions": "rw",
+            "major": 239,
+            "minor": 2
+          }
+        ],
+        "env": [
+          "FREETPU_VISIBLE_DEVICES=5",
+          "FREETPU_PCI_BDFS=0000:80:01.0",
+          "FREETPU_TPU_GENERATION=v6e",
+          "FREETPU_VFIO_DEVICES=/dev/vfio/6"
+        ]
+      }
+    },
+    {
+      "name": "6",
+      "annotations": {
+        "freetpu.dev/allocation-unit": "single-chip",
+        "freetpu.dev/pci-bdf": "0000:80:02.0",
+        "freetpu.dev/vendor-id": "0x1ae0",
+        "freetpu.dev/device-id": "0x006f",
+        "freetpu.dev/generation": "v6e",
+        "freetpu.dev/model": "TPU v6e (Trillium)",
+        "freetpu.dev/driver": "vfio-pci",
+        "freetpu.dev/iommu-group": "1",
+        "freetpu.dev/required-cap-add": "IPC_LOCK",
+        "freetpu.dev/required-ulimit-memlock": "-1"
+      },
+      "containerEdits": {
+        "deviceNodes": [
+          {
+            "path": "/dev/vfio/1",
+            "hostPath": "/dev/vfio/1",
+            "type": "c",
+            "permissions": "rw",
+            "major": 239,
+            "minor": 1
+          }
+        ],
+        "env": [
+          "FREETPU_VISIBLE_DEVICES=6",
+          "FREETPU_PCI_BDFS=0000:80:02.0",
+          "FREETPU_TPU_GENERATION=v6e",
+          "FREETPU_VFIO_DEVICES=/dev/vfio/1"
+        ]
+      }
+    },
+    {
+      "name": "7",
+      "annotations": {
+        "freetpu.dev/allocation-unit": "single-chip",
+        "freetpu.dev/pci-bdf": "0000:80:03.0",
+        "freetpu.dev/vendor-id": "0x1ae0",
+        "freetpu.dev/device-id": "0x006f",
+        "freetpu.dev/generation": "v6e",
+        "freetpu.dev/model": "TPU v6e (Trillium)",
+        "freetpu.dev/driver": "vfio-pci",
+        "freetpu.dev/iommu-group": "0",
+        "freetpu.dev/required-cap-add": "IPC_LOCK",
+        "freetpu.dev/required-ulimit-memlock": "-1"
+      },
+      "containerEdits": {
+        "deviceNodes": [
+          {
+            "path": "/dev/vfio/0",
+            "hostPath": "/dev/vfio/0",
+            "type": "c",
+            "permissions": "rw",
+            "major": 239,
+            "minor": 6
+          }
+        ],
+        "env": [
+          "FREETPU_VISIBLE_DEVICES=7",
+          "FREETPU_PCI_BDFS=0000:80:03.0",
+          "FREETPU_TPU_GENERATION=v6e",
+          "FREETPU_VFIO_DEVICES=/dev/vfio/0"
+        ]
+      }
+    },
+    {
+      "name": "all",
+      "annotations": {
+        "freetpu.dev/allocation-unit": "all-devices",
+        "freetpu.dev/chip-count": "8",
+        "freetpu.dev/pci-bdfs": "0000:00:0b.0,0000:00:0c.0,0000:00:0d.0,0000:00:0e.0,0000:80:00.0,0000:80:01.0,0000:80:02.0,0000:80:03.0",
+        "freetpu.dev/generations": "v6e",
+        "freetpu.dev/required-cap-add": "IPC_LOCK",
+        "freetpu.dev/required-ulimit-memlock": "-1"
+      },
+      "containerEdits": {
+        "deviceNodes": [
+          {
+            "path": "/dev/vfio/3",
+            "hostPath": "/dev/vfio/3",
+            "type": "c",
+            "permissions": "rw",
+            "major": 239,
+            "minor": 5
+          },
+          {
+            "path": "/dev/vfio/2",
+            "hostPath": "/dev/vfio/2",
+            "type": "c",
+            "permissions": "rw",
+            "major": 239,
+            "minor": 7
+          },
+          {
+            "path": "/dev/vfio/4",
+            "hostPath": "/dev/vfio/4",
+            "type": "c",
+            "permissions": "rw",
+            "major": 239,
+            "minor": 0
+          },
+          {
+            "path": "/dev/vfio/7",
+            "hostPath": "/dev/vfio/7",
+            "type": "c",
+            "permissions": "rw",
+            "major": 239,
+            "minor": 3
+          },
+          {
+            "path": "/dev/vfio/5",
+            "hostPath": "/dev/vfio/5",
+            "type": "c",
+            "permissions": "rw",
+            "major": 239,
+            "minor": 4
+          },
+          {
+            "path": "/dev/vfio/6",
+            "hostPath": "/dev/vfio/6",
+            "type": "c",
+            "permissions": "rw",
+            "major": 239,
+            "minor": 2
+          },
+          {
+            "path": "/dev/vfio/1",
+            "hostPath": "/dev/vfio/1",
+            "type": "c",
+            "permissions": "rw",
+            "major": 239,
+            "minor": 1
+          },
+          {
+            "path": "/dev/vfio/0",
+            "hostPath": "/dev/vfio/0",
+            "type": "c",
+            "permissions": "rw",
+            "major": 239,
+            "minor": 6
+          }
+        ],
+        "env": [
+          "FREETPU_VISIBLE_DEVICES=0,1,2,3,4,5,6,7",
+          "FREETPU_CHIP_COUNT=8",
+          "FREETPU_PCI_BDFS=0000:00:0b.0,0000:00:0c.0,0000:00:0d.0,0000:00:0e.0,0000:80:00.0,0000:80:01.0,0000:80:02.0,0000:80:03.0",
+          "FREETPU_TPU_GENERATION=v6e",
+          "FREETPU_VFIO_DEVICES=/dev/vfio/3,/dev/vfio/2,/dev/vfio/4,/dev/vfio/7,/dev/vfio/5,/dev/vfio/6,/dev/vfio/1,/dev/vfio/0"
+        ]
+      }
+    }
+  ]
+}

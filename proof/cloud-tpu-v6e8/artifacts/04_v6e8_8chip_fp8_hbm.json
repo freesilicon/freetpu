@@ -1,0 +1,70 @@
+{
+  "jax_version": "0.6.2",
+  "device_count": 8,
+  "device_kind": "TPU v6 lite",
+  "compute": [
+    {
+      "name": "8chip_gemm_bf16",
+      "shape": [
+        8,
+        4096,
+        4096,
+        4096
+      ],
+      "dtype": "bf16",
+      "unit": "TFLOP/s",
+      "median_perf": 2163.758,
+      "peak_perf": 2413.062,
+      "min_us": 455.65,
+      "median_us": 508.149,
+      "p95_us": 584.04,
+      "max_us": 673.59
+    },
+    {
+      "name": "8chip_gemm_fp8_e4m3",
+      "shape": [
+        8,
+        4096,
+        4096,
+        4096
+      ],
+      "dtype": "float8_e4m3fn->bf16",
+      "unit": "TFLOP/s",
+      "median_perf": 1857.613,
+      "peak_perf": 1946.9,
+      "min_us": 564.75,
+      "median_us": 591.895,
+      "p95_us": 632.78,
+      "max_us": 717.109
+    },
+    {
+      "name": "8chip_gemm_int8",
+      "shape": [
+        8,
+        4096,
+        4096,
+        4096
+      ],
+      "dtype": "int8",
+      "unit": "TOPS",
+      "median_perf": 2731.842,
+      "peak_perf": 2934.457,
+      "min_us": 374.69,
+      "median_us": 402.48,
+      "p95_us": 458.01,
+      "max_us": 468.46
+    }
+  ],
+  "bandwidth": [
+    {
+      "name": "8chip_triad_bf16",
+      "total_traffic_bytes": 12884901888,
+      "median_gbps": 4591.764,
+      "peak_gbps": 4667.682,
+      "min_us": 2760.45,
+      "median_us": 2806.09,
+      "p95_us": 2911.16,
+      "max_us": 2992.62
+    }
+  ]
+}

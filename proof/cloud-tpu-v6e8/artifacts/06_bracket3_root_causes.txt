@@ -1,0 +1,37 @@
+=== Bracket 3 Root-Cause Excerpts (vllm/vllm-tpu:latest v0.33.0rc1.dev430+g7b77ed581 on Cloud TPU v6e-8) ===
+
+--- 1. openai/gpt-oss-120b (60.77 GiB MXFP4) ---
+[Without --enable-expert-parallel (TP=8)]
+jax._src.sharding.IndivisibleError: One of pjit outputs with pytree key path result was given the sharding NamedSharding(mesh=Mesh('data': 1, 'model': 8, axis_types=(Auto, Auto)), spec=P(None, 'model'), memory_kind=device) implies that array axis 1 is partitioned 8 times, but the dimension size is 6 (full shape: (128, 6, 1, 3072), per-dimension tiling factors: (1, 8, 1, 1) should evenly divide the shape).
+
+[With --enable-expert-parallel (default GMM EP, before SparseCore bypass)]
+(EngineCore pid=553) INFO 11-22 14:07:40 [tpu_worker.py:558] Memory statistics | total_hbm_limit_gb=124.97GiB | total_hbm_limit_cap_gb=112.47GiB | total_hbm_used_gb=66.02GiB | total_hbm_avail_gb=46.45GiB
+NotImplementedError: The indexer shape in scatter/gather via `pltpu.async_copy` does not match the expected shape. Want: (8, -9223372036854775808), got: (8, <jaxlib.mlir._mlir_libs._mlir.ir.BlockArgument object>).
+
+[With --tensor-parallel-size 8 --enable-expert-parallel + MODEL_IMPL_TYPE=vllm + MOE_TC_PERMUTE=1]
+(EngineCore pid=590) INFO 11-22 14:41:22 [tpu_runner.py:1348] Init model | hbm=[(8.28, 31.24), (8.28, 31.24), (8.28, 31.24), (8.28, 31.24), (8.28, 31.24), (8.28, 31.24), (8.28, 31.24), (8.28, 31.24)]GiB
+(EngineCore pid=590) INFO 11-22 14:41:22 [tpu_worker.py:558] Memory statistics | total_hbm_limit_gb=249.94GiB | total_hbm_limit_cap_gb=224.94GiB | total_hbm_used_gb=66.26GiB | total_hbm_avail_gb=158.69GiB
+(EngineCore pid=590) INFO 11-22 14:41:22 [kv_cache_utils.py:1147] TPU KV cache size: 1,120,442 tokens, Maximum concurrency for 4,096 tokens per request: 273.55x
+(EngineCore pid=590) INFO 11-22 14:42:20 [fused_moe_gmm.py:969] MOE_TC_PERMUTE: EP permute and combine on the TensorCore, compact buffer of 64 rows (of 64) per shard
+jax.errors.JaxRuntimeError: INTERNAL: Mosaic failed to compile TPU kernel with MLIR module name `<no name>` HLO name `gmm_v2-g_16-m_64-k_3072-act_swigluoai-n_6144-tm_64-tk_3072-tn_3072.1.lhs_ref_value`: Unsupported type 'vector<8x128x8xf4E2M1FN>'
+The MLIR operation involved:
+  %29990 = "tpu.unpack_subelements"(%2395) <{index = 0 : i32, integer_extended = true, pack_format = #tpu.pack_format<compressed>, unsigned_integers = false}> : (vector<8x128x8xf4E2M1FN>) -> vector<8x128xf32>
+
+[With --tensor-parallel-size 8 --enable-expert-parallel + MODEL_IMPL_TYPE=vllm + ONEHOT_MOE_PERMUTE_THRESHOLD=32768]
+(same sharding + same gmm_v2 Unsupported type 'vector<8x128x8xf4E2M1FN>' failure)
+
+[With --tensor-parallel-size 8 --enable-expert-parallel + MODEL_IMPL_TYPE=vllm + USE_MOE_EP_KERNEL=1]
+(EngineCore pid=552) INFO 11-22 14:50:56 [moe.py:67] [MoE]: Using fused MoE EP kernel
+jax.errors.JaxRuntimeError: INTERNAL: Mosaic failed to compile TPU kernel with MLIR module name `<no name>` HLO name `fused-moe-k_4-renorm_k-bt_2_2-bf_1024_512-bd1_1024_1024-bd2_1536_1536.38`: Bad lhs/rhs type: 'vector<16x256xbf16>' 'vector<256x256xf4E2M1FN>'
+The MLIR operation involved:
+  %16218 = "tpu.matmul"(%16211, %16215, %16217) <{dimension_numbers = #tpu.dot_dimension_numbers<[1], [0], [0], [1], [0, 0, 1, 1], [], []>, transpose_lhs = false, transpose_lhs_hint = false, transpose_rhs = false}> : (vector<16x256xbf16>, vector<256x256xf4E2M1FN>, vector<16x256xf32>) -> vector<16x256xf32>
+
+--- 2. Qwen/Qwen3-235B-A22B-Instruct-2507-FP8 (220.19 GiB) ---
+(EngineCore pid=537) INFO 11-22 06:03:51 [weight_utils.py:1124] Filesystem type for checkpoints: TMPFS. Checkpoint size: 220.19 GiB. Available RAM: 927.46 GiB.
+(EngineCore pid=537) INFO 11-22 06:04:44 [default_loader.py:506] Loading weights took 53.03 seconds
+ValueError: RESOURCE_EXHAUSTED: E0101: RuntimeProgramAllocationFailure:
+Error loading program 'jit__process_quantized_moe_weights_impl': Attempting to reserve 864.12M at the bottom of memory. That was not possible. There are 592.05M free, 0B reserved, and 592.05M reservable.
+
+--- 3. Qwen/Qwen3-235B-A22B-GPTQ-Int4 ---
+pydantic_core._pydantic_core.ValidationError: 1 validation error for ModelConfig
+  Value error, auto_gptq quantization is currently not supported in tpu.

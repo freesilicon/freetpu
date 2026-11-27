@@ -1,0 +1,505 @@
+{
+  "backend": "jax_tpu",
+  "bandwidth": {
+    "backend": "jax_tpu",
+    "host_device_floor_us": 141.035,
+    "peak_triad_gbps": 1335.245,
+    "status": "measured",
+    "transfer_cases": [
+      {
+        "bytes": 4096,
+        "max_us": 641.76,
+        "median_gbps": 0.029,
+        "median_us": 141.035,
+        "min_us": 134.82,
+        "name": "h2d_device_put",
+        "p95_us": 171.43
+      },
+      {
+        "bytes": 4096,
+        "max_us": 204.46,
+        "median_gbps": 0.043,
+        "median_us": 95.32,
+        "min_us": 90.39,
+        "name": "d2h_to_host",
+        "p95_us": 111.94
+      },
+      {
+        "bytes": 65536,
+        "max_us": 317.97,
+        "median_gbps": 0.454,
+        "median_us": 144.399,
+        "min_us": 133.9,
+        "name": "h2d_device_put",
+        "p95_us": 185.03
+      },
+      {
+        "bytes": 65536,
+        "max_us": 120.48,
+        "median_gbps": 0.677,
+        "median_us": 96.78,
+        "min_us": 93.4,
+        "name": "d2h_to_host",
+        "p95_us": 109.12
+      },
+      {
+        "bytes": 4194304,
+        "max_us": 582.04,
+        "median_gbps": 10.484,
+        "median_us": 400.05,
+        "min_us": 387.01,
+        "name": "h2d_device_put",
+        "p95_us": 419.39
+      },
+      {
+        "bytes": 4194304,
+        "max_us": 486.94,
+        "median_gbps": 10.231,
+        "median_us": 409.965,
+        "min_us": 399.36,
+        "name": "d2h_to_host",
+        "p95_us": 427.72
+      }
+    ],
+    "triad_cases": [
+      {
+        "max_us": 1323.16,
+        "median_gbps": 699.926,
+        "median_us": 287.64,
+        "min_us": 279.18,
+        "name": "triad_bf16",
+        "p95_us": 326.63,
+        "peak_gbps": 721.135,
+        "tensor_bytes": 67108864,
+        "total_traffic_bytes": 201326592
+      },
+      {
+        "max_us": 735.72,
+        "median_gbps": 1135.578,
+        "median_us": 709.16,
+        "min_us": 702.78,
+        "name": "triad_bf16",
+        "p95_us": 724.13,
+        "peak_gbps": 1145.887,
+        "tensor_bytes": 268435456,
+        "total_traffic_bytes": 805306368
+      },
+      {
+        "max_us": 3880.519,
+        "median_gbps": 1272.385,
+        "median_us": 2531.644,
+        "min_us": 2412.46,
+        "name": "triad_bf16",
+        "p95_us": 3692.149,
+        "peak_gbps": 1335.245,
+        "tensor_bytes": 1073741824,
+        "total_traffic_bytes": 3221225472
+      }
+    ]
+  },
+  "comms": {
+    "cases": [
+      {
+        "median_gbps": 0.796,
+        "one_way_median_us": 20.595,
+        "payload_bytes": 16384,
+        "payload_label": "16 KB",
+        "peak_gbps": 1.015,
+        "rtt_median_us": 41.19,
+        "rtt_min_us": 32.28,
+        "rtt_p95_us": 51.15
+      },
+      {
+        "median_gbps": 1.763,
+        "one_way_median_us": 37.178,
+        "payload_bytes": 65536,
+        "payload_label": "64 KB",
+        "peak_gbps": 1.788,
+        "rtt_median_us": 74.355,
+        "rtt_min_us": 73.29,
+        "rtt_p95_us": 95.45
+      },
+      {
+        "median_gbps": 2.53,
+        "one_way_median_us": 103.635,
+        "payload_bytes": 262144,
+        "payload_label": "256 KB",
+        "peak_gbps": 2.744,
+        "rtt_median_us": 207.269,
+        "rtt_min_us": 191.04,
+        "rtt_p95_us": 235.98
+      },
+      {
+        "median_gbps": 3.416,
+        "one_way_median_us": 306.945,
+        "payload_bytes": 1048576,
+        "payload_label": "1 MB",
+        "peak_gbps": 3.542,
+        "rtt_median_us": 613.89,
+        "rtt_min_us": 592.15,
+        "rtt_p95_us": 663.1
+      },
+      {
+        "median_gbps": 3.763,
+        "one_way_median_us": 1114.625,
+        "payload_bytes": 4194304,
+        "payload_label": "4 MB",
+        "peak_gbps": 3.9,
+        "rtt_median_us": 2229.25,
+        "rtt_min_us": 2151.199,
+        "rtt_p95_us": 2424.71
+      }
+    ],
+    "hop_floor_us": 20.595,
+    "peak_gbps": 3.9,
+    "status": "measured",
+    "target": "127.0.0.1:37821",
+    "transport": "tcp_loopback"
+  },
+  "compute": {
+    "backend": "jax_tpu",
+    "cases": [
+      {
+        "dtype": "bf16",
+        "max_us": 165.59,
+        "median_perf": 0.0,
+        "median_us": 145.88,
+        "min_us": 139.56,
+        "name": "gemm_bf16",
+        "p95_us": 160.69,
+        "peak_perf": 0.0,
+        "shape": [
+          1,
+          64,
+          32
+        ],
+        "unit": "TFLOP/s"
+      },
+      {
+        "dtype": "bf16",
+        "max_us": 197.211,
+        "median_perf": 0.004,
+        "median_us": 145.55,
+        "min_us": 137.181,
+        "name": "gemm_bf16",
+        "p95_us": 160.16,
+        "peak_perf": 0.004,
+        "shape": [
+          16,
+          128,
+          128
+        ],
+        "unit": "TFLOP/s"
+      },
+      {
+        "dtype": "bf16",
+        "max_us": 162.91,
+        "median_perf": 0.012,
+        "median_us": 148.28,
+        "min_us": 139.28,
+        "name": "gemm_bf16",
+        "p95_us": 161.49,
+        "peak_perf": 0.013,
+        "shape": [
+          1,
+          576,
+          1536
+        ],
+        "unit": "TFLOP/s"
+      },
+      {
+        "dtype": "bf16",
+        "max_us": 163.83,
+        "median_perf": 14.367,
+        "median_us": 149.47,
+        "min_us": 143.19,
+        "name": "gemm_bf16",
+        "p95_us": 161.531,
+        "peak_perf": 14.997,
+        "shape": [
+          1024,
+          1024,
+          1024
+        ],
+        "unit": "TFLOP/s"
+      },
+      {
+        "dtype": "bf16",
+        "max_us": 255.741,
+        "median_perf": 101.494,
+        "median_us": 169.27,
+        "min_us": 161.74,
+        "name": "gemm_bf16",
+        "p95_us": 198.55,
+        "peak_perf": 106.219,
+        "shape": [
+          2048,
+          2048,
+          2048
+        ],
+        "unit": "TFLOP/s"
+      },
+      {
+        "dtype": "bf16",
+        "max_us": 357.501,
+        "median_perf": 437.495,
+        "median_us": 314.15,
+        "min_us": 305.86,
+        "name": "gemm_bf16",
+        "p95_us": 343.0,
+        "peak_perf": 449.352,
+        "shape": [
+          4096,
+          4096,
+          4096
+        ],
+        "unit": "TFLOP/s"
+      },
+      {
+        "dtype": "bf16",
+        "max_us": 1718.281,
+        "median_perf": 647.072,
+        "median_us": 1699.211,
+        "min_us": 1688.871,
+        "name": "gemm_bf16",
+        "p95_us": 1714.961,
+        "peak_perf": 651.034,
+        "shape": [
+          8192,
+          8192,
+          8192
+        ],
+        "unit": "TFLOP/s"
+      },
+      {
+        "dtype": "int8",
+        "max_us": 254.32,
+        "median_perf": 566.082,
+        "median_us": 242.79,
+        "min_us": 236.63,
+        "name": "gemm_int8",
+        "p95_us": 251.62,
+        "peak_perf": 580.818,
+        "shape": [
+          4096,
+          4096,
+          4096
+        ],
+        "unit": "TOPS"
+      },
+      {
+        "dtype": "int8",
+        "max_us": 989.83,
+        "median_perf": 1135.144,
+        "median_us": 968.61,
+        "min_us": 958.95,
+        "name": "gemm_int8",
+        "p95_us": 980.82,
+        "peak_perf": 1146.579,
+        "shape": [
+          8192,
+          8192,
+          8192
+        ],
+        "unit": "TOPS"
+      },
+      {
+        "dtype": "bf16+silu",
+        "max_us": 334.88,
+        "median_perf": 435.678,
+        "median_us": 315.46,
+        "min_us": 312.51,
+        "name": "fused_gemm_silu",
+        "p95_us": 334.04,
+        "peak_perf": 439.791,
+        "shape": [
+          4096,
+          4096,
+          4096
+        ],
+        "unit": "TFLOP/s"
+      },
+      {
+        "dtype": "w8a16_bf16",
+        "max_us": 400.56,
+        "median_perf": 366.036,
+        "median_us": 375.479,
+        "min_us": 369.019,
+        "name": "gemm_w8a16",
+        "p95_us": 389.88,
+        "peak_perf": 372.444,
+        "shape": [
+          4096,
+          4096,
+          4096
+        ],
+        "unit": "TFLOP/s"
+      }
+    ],
+    "dispatch_floor_us": 145.88,
+    "peak_bf16_tflops": 651.034,
+    "peak_int8_tops": 1146.579,
+    "status": "measured"
+  },
+  "device_info": {
+    "default_backend": "tpu",
+    "device_count": 8,
+    "device_kind": "TPU v6 lite",
+    "hbm_bytes_limit": 33550233600,
+    "jax_version": "0.6.2"
+  },
+  "economics_assumptions": {
+    "batch_size": 1,
+    "bw_efficiency": 0.7,
+    "model_gb": 8.0
+  },
+  "host_platform": "Linux-x86_64",
+  "schema": "freetpu.bench.v1",
+  "scorecard": [
+    {
+      "bf16_is_fp32_ref": false,
+      "bf16_tflops": 651.034,
+      "bw_gbps": 1335.245,
+      "dispatch_floor_us": "145.88 us",
+      "est_decode_tok_s": null,
+      "gbps_per_dollar_hr": null,
+      "hop_latency_us": "20.595 us",
+      "hourly_cost_usd": null,
+      "int8_tops": 1146.579,
+      "int8_tops_per_dollar_hr": null,
+      "memory": "31.25 GiB HBM",
+      "pricing_basis": "local/unspecified",
+      "row_type": "measured",
+      "target": "LIVE RUN: TPU v6 lite (jax_tpu)",
+      "tflops_per_dollar_hr": null,
+      "usd_per_1m_tokens_model": null,
+      "usd_per_1m_tokens_verified": null
+    },
+    {
+      "bf16_is_measured": false,
+      "bf16_tflops": null,
+      "bw_basis": "measured weight DMA (1x2048x2048 @ 150 us)",
+      "bw_gbps": 27.96,
+      "dispatch_floor_us": "60.8-150 us hw (395 us wall)",
+      "est_decode_tok_s": 2.45,
+      "gbps_per_dollar_hr": 559.2,
+      "hop_latency_us": "60-512 us (local/USB-C)",
+      "hourly_cost_usd": 0.05,
+      "int8_is_measured": true,
+      "int8_tops": 0.993,
+      "int8_tops_per_dollar_hr": 19.86,
+      "memory": "15.6 GiB LPDDR (unified)",
+      "pricing_basis": "$1,299 Pixel 10 Pro amortized 3yr 24/7 ($0.049/hr) + $0.001/hr power (~5W); $0 cloud bill",
+      "row_type": "published-reference",
+      "source_citation": "FreeTPU Phase 6 Report & buenos_a0 silicon probes (W8A16 BF16 1x64x32 = 411-426 us hw)",
+      "target": "Pixel Tensor G5 (buenos_a0)",
+      "tflops_per_dollar_hr": null,
+      "usd_per_1m_tokens_model": 5.669,
+      "usd_per_1m_tokens_verified": 2.374,
+      "verified_decode_label": "Qwen2.5-1.5B-Q8_0 (tg64)",
+      "verified_decode_tok_s": 5.85
+    },
+    {
+      "bf16_is_measured": true,
+      "bf16_tflops": 179.36,
+      "bw_basis": "measured triad BW (80.0% of 819 GB/s peak)",
+      "bw_gbps": 655.55,
+      "dispatch_floor_us": "117.6-135.0 us sync (32 us pipelined)",
+      "est_decode_tok_s": 57.36,
+      "gbps_per_dollar_hr": 546.29,
+      "hop_latency_us": "ICI / NVLink / PCIe",
+      "hourly_cost_usd": 1.2,
+      "int8_is_measured": true,
+      "int8_tops": 350.69,
+      "int8_tops_per_dollar_hr": 292.24,
+      "memory": "16 GB HBM2e",
+      "pricing_basis": "Google Cloud TPU v5e public on-demand (us-central1/us-east5/us-west1: $1.20/chip-hr)",
+      "row_type": "published-reference",
+      "source_citation": "Google Cloud TPU v5e spec + FreeTPU Track B live v5e-1 silicon run",
+      "target": "Cloud TPU v5e-1",
+      "tflops_per_dollar_hr": 149.47,
+      "usd_per_1m_tokens_model": 5.811,
+      "usd_per_1m_tokens_verified": 3.418,
+      "verified_decode_label": "Llama-3-8B W8A16 (B=1)",
+      "verified_decode_tok_s": 97.53
+    },
+    {
+      "bf16_is_measured": false,
+      "bf16_tflops": 918.0,
+      "bw_basis": "published peak HBM bandwidth (1,638 GB/s)",
+      "bw_gbps": 1638.0,
+      "dispatch_floor_us": "~100 us PJRT est.",
+      "est_decode_tok_s": 143.32,
+      "gbps_per_dollar_hr": 606.67,
+      "hop_latency_us": "ICI / NVLink / PCIe",
+      "hourly_cost_usd": 2.7,
+      "int8_is_measured": false,
+      "int8_tops": 1836.0,
+      "int8_tops_per_dollar_hr": 680.0,
+      "memory": "32 GB HBM2e",
+      "pricing_basis": "Google Cloud TPU v6e public on-demand (us-east1/us-east5: $2.70/chip-hr)",
+      "row_type": "published-reference",
+      "source_citation": "Google Cloud TPU v6e (Trillium) public architecture & pricing docs",
+      "target": "Cloud TPU v6e-1 (Trillium)",
+      "tflops_per_dollar_hr": 340.0,
+      "usd_per_1m_tokens_model": 5.233,
+      "usd_per_1m_tokens_verified": null,
+      "verified_decode_label": null,
+      "verified_decode_tok_s": null
+    },
+    {
+      "bf16_is_measured": false,
+      "bf16_tflops": 989.0,
+      "bw_basis": "published peak HBM3 bandwidth (3,350 GB/s)",
+      "bw_gbps": 3350.0,
+      "dispatch_floor_us": "~5-15 us CUDA/Graph",
+      "est_decode_tok_s": 293.12,
+      "gbps_per_dollar_hr": 959.89,
+      "hop_latency_us": "ICI / NVLink / PCIe",
+      "hourly_cost_usd": 3.49,
+      "int8_is_measured": false,
+      "int8_tops": 1979.0,
+      "int8_tops_per_dollar_hr": 567.05,
+      "memory": "80 GB HBM3",
+      "pricing_basis": "Specialized GPU cloud on-demand ($3.49/GPU-hr reference; hyperscaler 8-GPU VMs ~$7-11/GPU-hr)",
+      "row_type": "published-reference",
+      "source_citation": "NVIDIA H100 SXM datasheet (dense Tensor Core, non-sparse) & public cloud rates",
+      "target": "NVIDIA H100 SXM",
+      "tflops_per_dollar_hr": 283.38,
+      "usd_per_1m_tokens_model": 3.307,
+      "usd_per_1m_tokens_verified": null,
+      "verified_decode_label": null,
+      "verified_decode_tok_s": null
+    },
+    {
+      "bf16_is_measured": false,
+      "bf16_tflops": 209.5,
+      "bw_basis": "published peak GDDR7 bandwidth (1,792 GB/s)",
+      "bw_gbps": 1792.0,
+      "dispatch_floor_us": "~5-15 us CUDA/Graph",
+      "est_decode_tok_s": 156.8,
+      "gbps_per_dollar_hr": 3584.0,
+      "hop_latency_us": "ICI / NVLink / PCIe",
+      "hourly_cost_usd": 0.5,
+      "int8_is_measured": false,
+      "int8_tops": 419.0,
+      "int8_tops_per_dollar_hr": 838.0,
+      "memory": "32 GB GDDR7",
+      "pricing_basis": "Specialized community GPU cloud ($0.50/GPU-hr midpoint of $0.32-$0.80/hr; $1,999 FE MSRP ~$0.20/hr self-hosted)",
+      "row_type": "published-reference",
+      "source_citation": "NVIDIA Blackwell RTX 5090 spec (dense non-sparse Tensor Core) & public community cloud pricing",
+      "target": "NVIDIA RTX 5090",
+      "tflops_per_dollar_hr": 419.0,
+      "usd_per_1m_tokens_model": 0.886,
+      "usd_per_1m_tokens_verified": null,
+      "verified_decode_label": null,
+      "verified_decode_tok_s": null
+    }
+  ],
+  "suites": [
+    "compute",
+    "bandwidth",
+    "comms"
+  ],
+  "timestamp_utc": "2026-11-22T05:27:56Z"
+}

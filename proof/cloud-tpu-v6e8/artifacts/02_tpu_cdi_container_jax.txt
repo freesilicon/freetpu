@@ -1,0 +1,3 @@
+vfio_nodes= ['/dev/vfio/0', '/dev/vfio/1', '/dev/vfio/2', '/dev/vfio/3', '/dev/vfio/4', '/dev/vfio/5', '/dev/vfio/6', '/dev/vfio/7', '/dev/vfio/vfio']
+jax= 0.11.2 backend= tpu count= 8 kind= TPU v6 lite
+cdi_matmul_sum= 512.0

@@ -1,0 +1,10 @@
+# HELP freetpu_tpu_info_available Whether the tpu-info CLI returned telemetry cleanly (1 = yes, 0 = fallback).
+# TYPE freetpu_tpu_info_available gauge
+freetpu_tpu_info_available 1
+# HELP freetpu_tpu_pid_telemetry_available Whether active PID telemetry could be read cleanly for this chip (1 = available, 0 = unavailable).
+# TYPE freetpu_tpu_pid_telemetry_available gauge
+freetpu_tpu_pid_telemetry_available{chip="0",pci_bdf="0000:00:0b.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/3"} 1
+freetpu_tpu_pid_telemetry_available{chip="1",pci_bdf="0000:00:0c.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/2"} 1
+freetpu_tpu_pid_telemetry_available{chip="2",pci_bdf="0000:00:0d.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/4"} 1
+freetpu_tpu_pid_telemetry_available{chip="3",pci_bdf="0000:00:0e.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/1"} 1
+freetpu_tpu_pid_telemetry_available{chip="4",pci_bdf="0000:80:00.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/5"} 1

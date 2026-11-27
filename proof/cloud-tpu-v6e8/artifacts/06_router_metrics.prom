@@ -1,0 +1,93 @@
+# HELP freetpu_router_up Whether the FreeTPU Router process is up (1 = up).
+# TYPE freetpu_router_up gauge
+freetpu_router_up 1
+# HELP freetpu_router_requests_total Total OpenAI API inference requests handled by FreeTPU Router.
+# TYPE freetpu_router_requests_total counter
+freetpu_router_requests_total{model="Qwen/Qwen3-32B",backend_id="cloud-tpu-v6e-8-spot",status="200"} 28
+freetpu_router_requests_total{model="unsloth/Llama-3.3-70B-Instruct",backend_id="cloud-tpu-v6e-8-spot",status="200"} 28
+# HELP freetpu_router_active_inflight Current active in-flight inference requests per backend.
+# TYPE freetpu_router_active_inflight gauge
+freetpu_router_active_inflight{backend_id="cloud-tpu-v6e-8-spot"} 0
+# HELP freetpu_router_failovers_total Total automatic failovers across heterogeneous backends (e.g. Spot TPU preemption).
+# TYPE freetpu_router_failovers_total counter
+# HELP freetpu_router_prompt_tokens_total Total prompt tokens processed per model and backend.
+# TYPE freetpu_router_prompt_tokens_total counter
+freetpu_router_prompt_tokens_total{model="Qwen/Qwen3-32B",backend_id="cloud-tpu-v6e-8-spot"} 689
+freetpu_router_prompt_tokens_total{model="unsloth/Llama-3.3-70B-Instruct",backend_id="cloud-tpu-v6e-8-spot"} 1438
+# HELP freetpu_router_completion_tokens_total Total completion tokens generated per model and backend.
+# TYPE freetpu_router_completion_tokens_total counter
+freetpu_router_completion_tokens_total{model="Qwen/Qwen3-32B",backend_id="cloud-tpu-v6e-8-spot"} 3488
+freetpu_router_completion_tokens_total{model="unsloth/Llama-3.3-70B-Instruct",backend_id="cloud-tpu-v6e-8-spot"} 3488
+# HELP freetpu_router_estimated_cost_usd_total Estimated cumulative inference cost in USD per model and backend.
+# TYPE freetpu_router_estimated_cost_usd_total counter
+# HELP freetpu_router_ttft_seconds Time to first token (TTFT) in seconds per model and backend.
+# TYPE freetpu_router_ttft_seconds histogram
+freetpu_router_ttft_seconds_bucket{model="Qwen/Qwen3-32B",backend_id="cloud-tpu-v6e-8-spot",le="0.01"} 0
+freetpu_router_ttft_seconds_bucket{model="Qwen/Qwen3-32B",backend_id="cloud-tpu-v6e-8-spot",le="0.025"} 3
+freetpu_router_ttft_seconds_bucket{model="Qwen/Qwen3-32B",backend_id="cloud-tpu-v6e-8-spot",le="0.05"} 5
+freetpu_router_ttft_seconds_bucket{model="Qwen/Qwen3-32B",backend_id="cloud-tpu-v6e-8-spot",le="0.1"} 14
+freetpu_router_ttft_seconds_bucket{model="Qwen/Qwen3-32B",backend_id="cloud-tpu-v6e-8-spot",le="0.25"} 28
+freetpu_router_ttft_seconds_bucket{model="Qwen/Qwen3-32B",backend_id="cloud-tpu-v6e-8-spot",le="0.5"} 28
+freetpu_router_ttft_seconds_bucket{model="Qwen/Qwen3-32B",backend_id="cloud-tpu-v6e-8-spot",le="1"} 28
+freetpu_router_ttft_seconds_bucket{model="Qwen/Qwen3-32B",backend_id="cloud-tpu-v6e-8-spot",le="2.5"} 28
+freetpu_router_ttft_seconds_bucket{model="Qwen/Qwen3-32B",backend_id="cloud-tpu-v6e-8-spot",le="5"} 28
+freetpu_router_ttft_seconds_bucket{model="Qwen/Qwen3-32B",backend_id="cloud-tpu-v6e-8-spot",le="10"} 28
+freetpu_router_ttft_seconds_bucket{model="Qwen/Qwen3-32B",backend_id="cloud-tpu-v6e-8-spot",le="30"} 28
+freetpu_router_ttft_seconds_bucket{model="Qwen/Qwen3-32B",backend_id="cloud-tpu-v6e-8-spot",le="+Inf"} 28
+freetpu_router_ttft_seconds_sum{model="Qwen/Qwen3-32B",backend_id="cloud-tpu-v6e-8-spot"} 3.06030499
+freetpu_router_ttft_seconds_count{model="Qwen/Qwen3-32B",backend_id="cloud-tpu-v6e-8-spot"} 28
+freetpu_router_ttft_seconds_bucket{model="unsloth/Llama-3.3-70B-Instruct",backend_id="cloud-tpu-v6e-8-spot",le="0.01"} 0
+freetpu_router_ttft_seconds_bucket{model="unsloth/Llama-3.3-70B-Instruct",backend_id="cloud-tpu-v6e-8-spot",le="0.025"} 0
+freetpu_router_ttft_seconds_bucket{model="unsloth/Llama-3.3-70B-Instruct",backend_id="cloud-tpu-v6e-8-spot",le="0.05"} 2
+freetpu_router_ttft_seconds_bucket{model="unsloth/Llama-3.3-70B-Instruct",backend_id="cloud-tpu-v6e-8-spot",le="0.1"} 12
+freetpu_router_ttft_seconds_bucket{model="unsloth/Llama-3.3-70B-Instruct",backend_id="cloud-tpu-v6e-8-spot",le="0.25"} 28
+freetpu_router_ttft_seconds_bucket{model="unsloth/Llama-3.3-70B-Instruct",backend_id="cloud-tpu-v6e-8-spot",le="0.5"} 28
+freetpu_router_ttft_seconds_bucket{model="unsloth/Llama-3.3-70B-Instruct",backend_id="cloud-tpu-v6e-8-spot",le="1"} 28
+freetpu_router_ttft_seconds_bucket{model="unsloth/Llama-3.3-70B-Instruct",backend_id="cloud-tpu-v6e-8-spot",le="2.5"} 28
+freetpu_router_ttft_seconds_bucket{model="unsloth/Llama-3.3-70B-Instruct",backend_id="cloud-tpu-v6e-8-spot",le="5"} 28
+freetpu_router_ttft_seconds_bucket{model="unsloth/Llama-3.3-70B-Instruct",backend_id="cloud-tpu-v6e-8-spot",le="10"} 28
+freetpu_router_ttft_seconds_bucket{model="unsloth/Llama-3.3-70B-Instruct",backend_id="cloud-tpu-v6e-8-spot",le="30"} 28
+freetpu_router_ttft_seconds_bucket{model="unsloth/Llama-3.3-70B-Instruct",backend_id="cloud-tpu-v6e-8-spot",le="+Inf"} 28
+freetpu_router_ttft_seconds_sum{model="unsloth/Llama-3.3-70B-Instruct",backend_id="cloud-tpu-v6e-8-spot"} 3.68574241
+freetpu_router_ttft_seconds_count{model="unsloth/Llama-3.3-70B-Instruct",backend_id="cloud-tpu-v6e-8-spot"} 28
+# HELP freetpu_router_request_duration_seconds End-to-end request latency in seconds per model and backend.
+# TYPE freetpu_router_request_duration_seconds histogram
+freetpu_router_request_duration_seconds_bucket{model="Qwen/Qwen3-32B",backend_id="cloud-tpu-v6e-8-spot",le="0.025"} 0
+freetpu_router_request_duration_seconds_bucket{model="Qwen/Qwen3-32B",backend_id="cloud-tpu-v6e-8-spot",le="0.05"} 0
+freetpu_router_request_duration_seconds_bucket{model="Qwen/Qwen3-32B",backend_id="cloud-tpu-v6e-8-spot",le="0.1"} 0
+freetpu_router_request_duration_seconds_bucket{model="Qwen/Qwen3-32B",backend_id="cloud-tpu-v6e-8-spot",le="0.25"} 0
+freetpu_router_request_duration_seconds_bucket{model="Qwen/Qwen3-32B",backend_id="cloud-tpu-v6e-8-spot",le="0.5"} 0
+freetpu_router_request_duration_seconds_bucket{model="Qwen/Qwen3-32B",backend_id="cloud-tpu-v6e-8-spot",le="1"} 0
+freetpu_router_request_duration_seconds_bucket{model="Qwen/Qwen3-32B",backend_id="cloud-tpu-v6e-8-spot",le="2.5"} 2
+freetpu_router_request_duration_seconds_bucket{model="Qwen/Qwen3-32B",backend_id="cloud-tpu-v6e-8-spot",le="5"} 25
+freetpu_router_request_duration_seconds_bucket{model="Qwen/Qwen3-32B",backend_id="cloud-tpu-v6e-8-spot",le="10"} 28
+freetpu_router_request_duration_seconds_bucket{model="Qwen/Qwen3-32B",backend_id="cloud-tpu-v6e-8-spot",le="30"} 28
+freetpu_router_request_duration_seconds_bucket{model="Qwen/Qwen3-32B",backend_id="cloud-tpu-v6e-8-spot",le="60"} 28
+freetpu_router_request_duration_seconds_bucket{model="Qwen/Qwen3-32B",backend_id="cloud-tpu-v6e-8-spot",le="120"} 28
+freetpu_router_request_duration_seconds_bucket{model="Qwen/Qwen3-32B",backend_id="cloud-tpu-v6e-8-spot",le="+Inf"} 28
+freetpu_router_request_duration_seconds_sum{model="Qwen/Qwen3-32B",backend_id="cloud-tpu-v6e-8-spot"} 90.10895126
+freetpu_router_request_duration_seconds_count{model="Qwen/Qwen3-32B",backend_id="cloud-tpu-v6e-8-spot"} 28
+freetpu_router_request_duration_seconds_bucket{model="unsloth/Llama-3.3-70B-Instruct",backend_id="cloud-tpu-v6e-8-spot",le="0.025"} 0
+freetpu_router_request_duration_seconds_bucket{model="unsloth/Llama-3.3-70B-Instruct",backend_id="cloud-tpu-v6e-8-spot",le="0.05"} 0
+freetpu_router_request_duration_seconds_bucket{model="unsloth/Llama-3.3-70B-Instruct",backend_id="cloud-tpu-v6e-8-spot",le="0.1"} 0
+freetpu_router_request_duration_seconds_bucket{model="unsloth/Llama-3.3-70B-Instruct",backend_id="cloud-tpu-v6e-8-spot",le="0.25"} 0
+freetpu_router_request_duration_seconds_bucket{model="unsloth/Llama-3.3-70B-Instruct",backend_id="cloud-tpu-v6e-8-spot",le="0.5"} 0
+freetpu_router_request_duration_seconds_bucket{model="unsloth/Llama-3.3-70B-Instruct",backend_id="cloud-tpu-v6e-8-spot",le="1"} 0
+freetpu_router_request_duration_seconds_bucket{model="unsloth/Llama-3.3-70B-Instruct",backend_id="cloud-tpu-v6e-8-spot",le="2.5"} 1
+freetpu_router_request_duration_seconds_bucket{model="unsloth/Llama-3.3-70B-Instruct",backend_id="cloud-tpu-v6e-8-spot",le="5"} 16
+freetpu_router_request_duration_seconds_bucket{model="unsloth/Llama-3.3-70B-Instruct",backend_id="cloud-tpu-v6e-8-spot",le="10"} 28
+freetpu_router_request_duration_seconds_bucket{model="unsloth/Llama-3.3-70B-Instruct",backend_id="cloud-tpu-v6e-8-spot",le="30"} 28
+freetpu_router_request_duration_seconds_bucket{model="unsloth/Llama-3.3-70B-Instruct",backend_id="cloud-tpu-v6e-8-spot",le="60"} 28
+freetpu_router_request_duration_seconds_bucket{model="unsloth/Llama-3.3-70B-Instruct",backend_id="cloud-tpu-v6e-8-spot",le="120"} 28
+freetpu_router_request_duration_seconds_bucket{model="unsloth/Llama-3.3-70B-Instruct",backend_id="cloud-tpu-v6e-8-spot",le="+Inf"} 28
+freetpu_router_request_duration_seconds_sum{model="unsloth/Llama-3.3-70B-Instruct",backend_id="cloud-tpu-v6e-8-spot"} 127.0278875
+freetpu_router_request_duration_seconds_count{model="unsloth/Llama-3.3-70B-Instruct",backend_id="cloud-tpu-v6e-8-spot"} 28
+# HELP freetpu_router_backend_healthy Backend health status as observed by FreeTPU Router (1 = healthy, 0 = unhealthy/overloaded).
+# TYPE freetpu_router_backend_healthy gauge
+freetpu_router_backend_healthy{backend_id="cloud-tpu-v6e-8-spot",type="cloud-tpu-v6e",local="false",spot="true"} 0
+# HELP freetpu_router_backend_latency_seconds Observed EWMA latency per backend in seconds.
+# TYPE freetpu_router_backend_latency_seconds gauge
+freetpu_router_backend_latency_seconds{backend_id="cloud-tpu-v6e-8-spot"} 4.451671
+# HELP freetpu_router_backend_tpu_healthy_chips Number of healthy TPU chips reported by tpu-exporter for each backend.
+# TYPE freetpu_router_backend_tpu_healthy_chips gauge
+freetpu_router_backend_tpu_healthy_chips{backend_id="cloud-tpu-v6e-8-spot"} 8

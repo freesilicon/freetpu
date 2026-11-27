@@ -1,0 +1,82 @@
+# HELP freetpu_exporter_up Whether the FreeTPU exporter scrape succeeded (1 = up).
+# TYPE freetpu_exporter_up gauge
+freetpu_exporter_up 1
+# HELP freetpu_tpu_devices_discovered Total Google TPU PCI devices (vendor 0x1ae0) discovered in sysfs.
+# TYPE freetpu_tpu_devices_discovered gauge
+freetpu_tpu_devices_discovered 8
+# HELP freetpu_tpu_scrape_duration_seconds Time taken to scrape TPU PCI/VFIO and telemetry sources in seconds.
+# TYPE freetpu_tpu_scrape_duration_seconds gauge
+freetpu_tpu_scrape_duration_seconds 0.093452
+# HELP freetpu_tpu_info_available Whether the tpu-info CLI returned telemetry cleanly (1 = yes, 0 = fallback).
+# TYPE freetpu_tpu_info_available gauge
+freetpu_tpu_info_available 0
+# HELP freetpu_tpu_info Static inventory metadata for each discovered TPU device.
+# TYPE freetpu_tpu_info gauge
+freetpu_tpu_info{chip="0",pci_bdf="0000:00:0b.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/3",vendor="0x1ae0",model="TPU v6e (Trillium)",driver="vfio-pci",iommu_group="3",telemetry_source="sysfs-fallback"} 1
+freetpu_tpu_info{chip="1",pci_bdf="0000:00:0c.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/2",vendor="0x1ae0",model="TPU v6e (Trillium)",driver="vfio-pci",iommu_group="2",telemetry_source="sysfs-fallback"} 1
+freetpu_tpu_info{chip="2",pci_bdf="0000:00:0d.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/4",vendor="0x1ae0",model="TPU v6e (Trillium)",driver="vfio-pci",iommu_group="4",telemetry_source="sysfs-fallback"} 1
+freetpu_tpu_info{chip="3",pci_bdf="0000:00:0e.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/7",vendor="0x1ae0",model="TPU v6e (Trillium)",driver="vfio-pci",iommu_group="7",telemetry_source="sysfs-fallback"} 1
+freetpu_tpu_info{chip="4",pci_bdf="0000:80:00.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/5",vendor="0x1ae0",model="TPU v6e (Trillium)",driver="vfio-pci",iommu_group="5",telemetry_source="sysfs-fallback"} 1
+freetpu_tpu_info{chip="5",pci_bdf="0000:80:01.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/6",vendor="0x1ae0",model="TPU v6e (Trillium)",driver="vfio-pci",iommu_group="6",telemetry_source="sysfs-fallback"} 1
+freetpu_tpu_info{chip="6",pci_bdf="0000:80:02.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/1",vendor="0x1ae0",model="TPU v6e (Trillium)",driver="vfio-pci",iommu_group="1",telemetry_source="sysfs-fallback"} 1
+freetpu_tpu_info{chip="7",pci_bdf="0000:80:03.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/0",vendor="0x1ae0",model="TPU v6e (Trillium)",driver="vfio-pci",iommu_group="0",telemetry_source="sysfs-fallback"} 1
+# HELP freetpu_tpu_health_status TPU chip readiness (1 = vfio-pci bound and VFIO nodes present; idle chips stay ready).
+# TYPE freetpu_tpu_health_status gauge
+freetpu_tpu_health_status{chip="0",pci_bdf="0000:00:0b.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/3"} 1
+freetpu_tpu_health_status{chip="1",pci_bdf="0000:00:0c.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/2"} 1
+freetpu_tpu_health_status{chip="2",pci_bdf="0000:00:0d.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/4"} 1
+freetpu_tpu_health_status{chip="3",pci_bdf="0000:00:0e.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/7"} 1
+freetpu_tpu_health_status{chip="4",pci_bdf="0000:80:00.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/5"} 1
+freetpu_tpu_health_status{chip="5",pci_bdf="0000:80:01.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/6"} 1
+freetpu_tpu_health_status{chip="6",pci_bdf="0000:80:02.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/1"} 1
+freetpu_tpu_health_status{chip="7",pci_bdf="0000:80:03.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/0"} 1
+# HELP freetpu_tpu_pci_enabled PCI sysfs enable reference state (1 = actively enabled by open VFIO handle, 0 = idle).
+# TYPE freetpu_tpu_pci_enabled gauge
+freetpu_tpu_pci_enabled{chip="0",pci_bdf="0000:00:0b.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/3"} 1
+freetpu_tpu_pci_enabled{chip="1",pci_bdf="0000:00:0c.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/2"} 1
+freetpu_tpu_pci_enabled{chip="2",pci_bdf="0000:00:0d.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/4"} 1
+freetpu_tpu_pci_enabled{chip="3",pci_bdf="0000:00:0e.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/7"} 1
+freetpu_tpu_pci_enabled{chip="4",pci_bdf="0000:80:00.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/5"} 1
+freetpu_tpu_pci_enabled{chip="5",pci_bdf="0000:80:01.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/6"} 1
+freetpu_tpu_pci_enabled{chip="6",pci_bdf="0000:80:02.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/1"} 1
+freetpu_tpu_pci_enabled{chip="7",pci_bdf="0000:80:03.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/0"} 1
+# HELP freetpu_tpu_pid_telemetry_available Whether active PID telemetry could be read cleanly for this chip (1 = available, 0 = unavailable).
+# TYPE freetpu_tpu_pid_telemetry_available gauge
+freetpu_tpu_pid_telemetry_available{chip="0",pci_bdf="0000:00:0b.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/3"} 1
+freetpu_tpu_pid_telemetry_available{chip="1",pci_bdf="0000:00:0c.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/2"} 1
+freetpu_tpu_pid_telemetry_available{chip="2",pci_bdf="0000:00:0d.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/4"} 1
+freetpu_tpu_pid_telemetry_available{chip="3",pci_bdf="0000:00:0e.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/7"} 1
+freetpu_tpu_pid_telemetry_available{chip="4",pci_bdf="0000:80:00.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/5"} 1
+freetpu_tpu_pid_telemetry_available{chip="5",pci_bdf="0000:80:01.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/6"} 1
+freetpu_tpu_pid_telemetry_available{chip="6",pci_bdf="0000:80:02.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/1"} 1
+freetpu_tpu_pid_telemetry_available{chip="7",pci_bdf="0000:80:03.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/0"} 1
+# HELP freetpu_tpu_hbm_total_bytes Total TPU High Bandwidth Memory (HBM) capacity in bytes.
+# TYPE freetpu_tpu_hbm_total_bytes gauge
+freetpu_tpu_hbm_total_bytes{chip="0",pci_bdf="0000:00:0b.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/3"} 34359738368
+freetpu_tpu_hbm_total_bytes{chip="1",pci_bdf="0000:00:0c.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/2"} 34359738368
+freetpu_tpu_hbm_total_bytes{chip="2",pci_bdf="0000:00:0d.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/4"} 34359738368
+freetpu_tpu_hbm_total_bytes{chip="3",pci_bdf="0000:00:0e.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/7"} 34359738368
+freetpu_tpu_hbm_total_bytes{chip="4",pci_bdf="0000:80:00.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/5"} 34359738368
+freetpu_tpu_hbm_total_bytes{chip="5",pci_bdf="0000:80:01.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/6"} 34359738368
+freetpu_tpu_hbm_total_bytes{chip="6",pci_bdf="0000:80:02.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/1"} 34359738368
+freetpu_tpu_hbm_total_bytes{chip="7",pci_bdf="0000:80:03.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/0"} 34359738368
+# HELP freetpu_tpu_active_pids Number of active OS PIDs holding or utilizing this TPU chip (omitted when unreadable).
+# TYPE freetpu_tpu_active_pids gauge
+freetpu_tpu_active_pids{chip="0",pci_bdf="0000:00:0b.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/3"} 1
+freetpu_tpu_active_pids{chip="1",pci_bdf="0000:00:0c.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/2"} 1
+freetpu_tpu_active_pids{chip="2",pci_bdf="0000:00:0d.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/4"} 1
+freetpu_tpu_active_pids{chip="3",pci_bdf="0000:00:0e.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/7"} 1
+freetpu_tpu_active_pids{chip="4",pci_bdf="0000:80:00.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/5"} 1
+freetpu_tpu_active_pids{chip="5",pci_bdf="0000:80:01.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/6"} 1
+freetpu_tpu_active_pids{chip="6",pci_bdf="0000:80:02.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/1"} 1
+freetpu_tpu_active_pids{chip="7",pci_bdf="0000:80:03.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/0"} 1
+# HELP freetpu_tpu_process_active Active process indicator per TPU chip and PID (1 = active).
+# TYPE freetpu_tpu_process_active gauge
+freetpu_tpu_process_active{chip="0",pci_bdf="0000:00:0b.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/3",pid="49352"} 1
+freetpu_tpu_process_active{chip="1",pci_bdf="0000:00:0c.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/2",pid="49352"} 1
+freetpu_tpu_process_active{chip="2",pci_bdf="0000:00:0d.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/4",pid="49352"} 1
+freetpu_tpu_process_active{chip="3",pci_bdf="0000:00:0e.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/7",pid="49352"} 1
+freetpu_tpu_process_active{chip="4",pci_bdf="0000:80:00.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/5",pid="49352"} 1
+freetpu_tpu_process_active{chip="5",pci_bdf="0000:80:01.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/6",pid="49352"} 1
+freetpu_tpu_process_active{chip="6",pci_bdf="0000:80:02.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/1",pid="49352"} 1
+freetpu_tpu_process_active{chip="7",pci_bdf="0000:80:03.0",device_id="0x006f",generation="v6e",vfio_device="/dev/vfio/0",pid="49352"} 1
