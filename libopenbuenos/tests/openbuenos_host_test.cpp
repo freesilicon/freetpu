@@ -6251,6 +6251,222 @@ void test_roundtable_s1_state_machine_hardening() {
   std::printf("[PASS] test_roundtable_s1_state_machine_hardening (1-credit mock reclaim, try_wait retired_bufs, wait_all timeout/fatal/concurrent-harvest, EAGAIN bound, EINTR+frac-ms poll, seq wrap, wakelock concurrency)\n");
 }
 
+void test_zero_repack_weight_cache_and_prepack() {
+  std::vector<uint8_t> synth_interp = make_synthetic_dive_interp(0x63u);
+  TempBinaryFile interp_file;
+  CHECK(interp_file.write(synth_interp.data(), synth_interp.size()));
+
+  ::unsetenv("OPENBUENOS_WEIGHT_CACHE_MB");
+  ::unsetenv("OPENBUENOS_WEIGHT_CACHE_ENTRIES");
+  ::unsetenv("OPENBUENOS_PROFILE");
+
+  // 1. Prepack Q/K/V horizontally-fused Q4_0 batch + Q8_0 batch, then verify ZERO runtime misses/packing/evictions.
+  {
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    cfg.max_inflight = 16u;
+    cfg.graph_cache_capacity = 256u;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+    CHECK(ob_gemm_register_builtin_emitter(ctx, interp_file.path()) == OB_OK);
+    CHECK(ob_gemm_set_tile_limits(ctx, 16u, 512u, 128u) == OB_OK);
+    CHECK(ctx->num_threads == 1u);
+
+    constexpr uint32_t M = 1u, K = 512u;
+    constexpr uint32_t Nq = 256u, Nk = 128u, Nv = 128u;
+    const uint32_t nb_k4 = K / ob_quant_block_elements(OB_QUANT_Q4_0);
+    const uint32_t nb_k8 = K / OB_QK8_0;
+    const size_t q4_row_bytes = static_cast<size_t>(nb_k4) * sizeof(ob_block_q4_0_t);
+    const size_t q8_row_bytes = static_cast<size_t>(nb_k8) * sizeof(ob_block_q8_0_t);
+    const size_t total_w_bytes =
+        static_cast<size_t>(Nq + Nk + Nv) * q4_row_bytes +
+        static_cast<size_t>(Nk) * q8_row_bytes;
+
+    std::vector<uint8_t> w_arena(total_w_bytes, 0u);
+    auto* wq = reinterpret_cast<ob_block_q4_0_t*>(w_arena.data());
+    auto* wk = reinterpret_cast<ob_block_q4_0_t*>(w_arena.data() + static_cast<size_t>(Nq) * q4_row_bytes);
+    auto* wv = reinterpret_cast<ob_block_q4_0_t*>(w_arena.data() + static_cast<size_t>(Nq + Nk) * q4_row_bytes);
+    auto* w8 = reinterpret_cast<ob_block_q8_0_t*>(w_arena.data() + static_cast<size_t>(Nq + Nk + Nv) * q4_row_bytes);
+
+    auto fill_q4 = [&](ob_block_q4_0_t* dst, uint32_t n_rows, uint32_t seed) {
+      for (uint32_t n = 0; n < n_rows; ++n) {
+        for (uint32_t bi = 0; bi < nb_k4; ++bi) {
+          ob_block_q4_0_t& blk = dst[static_cast<size_t>(n) * nb_k4 + bi];
+          blk.d = fp32_to_fp16(0.02f + 0.003f * static_cast<float>((n + bi + seed) & 7u));
+          for (uint32_t j = 0; j < 16u; ++j) {
+            const uint8_t lo = static_cast<uint8_t>((n + bi + j + seed) & 0xFu);
+            const uint8_t hi = static_cast<uint8_t>((n * 3u + bi + j + seed) & 0xFu);
+            blk.qs[j] = static_cast<uint8_t>(lo | (hi << 4u));
+          }
+        }
+      }
+    };
+    fill_q4(wq, Nq, 1u);
+    fill_q4(wk, Nk, 5u);
+    fill_q4(wv, Nv, 9u);
+    for (uint32_t n = 0; n < Nk; ++n) {
+      for (uint32_t bi = 0; bi < nb_k8; ++bi) {
+        ob_block_q8_0_t& blk = w8[static_cast<size_t>(n) * nb_k8 + bi];
+        blk.d = fp32_to_fp16(0.015f + 0.002f * static_cast<float>((n + bi) & 3u));
+        for (uint32_t j = 0; j < OB_QK8_0; ++j) {
+          blk.qs[j] = static_cast<int8_t>(static_cast<int32_t>((n * 5u + bi + j) % 61u) - 30);
+        }
+      }
+    }
+
+    CHECK(ob_gemm_register_immutable_weights(ctx, w_arena.data(), w_arena.size(), 1u) == OB_OK);
+
+    std::vector<float> a_f32(M * K);
+    for (uint32_t k = 0; k < K; ++k) {
+      a_f32[k] = static_cast<float>(static_cast<int32_t>((k * 13u + 7u) % 31u) - 15) * 0.04f;
+    }
+    std::vector<float> cq(M * Nq, 0.0f), ck(M * Nk, 0.0f), cv(M * Nv, 0.0f), c8(M * Nk, 0.0f);
+
+    ob_gemm_f32_quant_job_t jobs[3]{};
+    jobs[0].b_nk = wq;
+    jobs[0].c_mn = cq.data();
+    jobs[0].n_dim = Nq;
+    ob_gemm_f32_quant_job_set_type(&jobs[0], OB_QUANT_Q4_0);
+    jobs[1].b_nk = wk;
+    jobs[1].c_mn = ck.data();
+    jobs[1].n_dim = Nk;
+    ob_gemm_f32_quant_job_set_type(&jobs[1], OB_QUANT_Q4_0);
+    jobs[2].b_nk = wv;
+    jobs[2].c_mn = cv.data();
+    jobs[2].n_dim = Nv;
+    ob_gemm_f32_quant_job_set_type(&jobs[2], OB_QUANT_Q4_0);
+
+    ob_prepack_stats_t pst1{};
+    CHECK(ob_gemm_prepack_quant_batch(ctx, M, K, jobs, 3u, &pst1) == OB_OK);
+    CHECK(pst1.tiles_checked > 0u);
+    CHECK(pst1.tiles_prepacked == pst1.tiles_checked);
+    CHECK(pst1.tiles_already_cached == 0u);
+    CHECK(pst1.tiles_skipped_budget == 0u);
+    CHECK(pst1.graphs_precompiled > 0u);
+    CHECK(pst1.bytes_resident > 0u);
+
+    ob_gemm_f32_quant_job_t j8{};
+    j8.b_nk = w8;
+    j8.c_mn = c8.data();
+    j8.n_dim = Nk;
+    ob_gemm_f32_quant_job_set_type(&j8, OB_QUANT_Q8_0);
+    ob_prepack_stats_t pst_q8{};
+    CHECK(ob_gemm_prepack_quant_batch(ctx, M, K, &j8, 1u, &pst_q8) == OB_OK);
+    CHECK(pst_q8.tiles_prepacked > 0u);
+    CHECK(pst_q8.tiles_skipped_budget == 0u);
+
+    // Repeat prepack -> idempotent cache hit, 0 new tiles, 0 new graphs.
+    ob_prepack_stats_t pst2{};
+    CHECK(ob_gemm_prepack_quant_batch(ctx, M, K, jobs, 3u, &pst2) == OB_OK);
+    CHECK(pst2.tiles_prepacked == 0u);
+    CHECK(pst2.tiles_already_cached == pst1.tiles_checked);
+    CHECK(pst2.graphs_precompiled == 0u);
+
+    // Inference MUST have 0 weight misses, 0 evictions, and 0 us weight packing!
+    CHECK(ob_context_set_profile(ctx, 1) == OB_OK);
+    ob_profile_stats_t prof_before{};
+    CHECK(ob_context_get_profile(ctx, &prof_before) == OB_OK);
+
+    ob_invoke_stats_t ist1{};
+    CHECK(ob_gemm_matmul_f32_quant_batch(ctx, a_f32.data(), M, K, jobs, 3u, &ist1) == OB_OK);
+    ob_invoke_stats_t ist2{};
+    CHECK(ob_gemm_matmul_f32_quant_batch(ctx, a_f32.data(), M, K, &j8, 1u, &ist2) == OB_OK);
+
+    ob_profile_stats_t prof_after{};
+    CHECK(ob_context_get_profile(ctx, &prof_after) == OB_OK);
+    CHECK(prof_after.weight_cache_misses == prof_before.weight_cache_misses);
+    CHECK(prof_after.weight_cache_evictions == prof_before.weight_cache_evictions);
+    CHECK(prof_after.weight_pack_us == prof_before.weight_pack_us);
+    CHECK(prof_after.weight_cache_hits > prof_before.weight_cache_hits);
+
+    // Numerical sanity vs CPU dequant reference for Q job.
+    std::vector<float> ref_row(K);
+    for (uint32_t n = 0; n < 8u; ++n) {
+      CHECK(ob_quant_dequantize_row_f32(OB_QUANT_Q4_0,
+                                        reinterpret_cast<const uint8_t*>(wq) + n * q4_row_bytes,
+                                        K, ref_row.data()) == OB_OK);
+      double acc = 0.0;
+      for (uint32_t k = 0; k < K; ++k) acc += static_cast<double>(a_f32[k]) * ref_row[k];
+      CHECK(std::fabs(static_cast<double>(cq[n]) - acc) < 1e-2);
+    }
+
+    CHECK(ob_gemm_unregister_immutable_weights(ctx, w_arena.data(), w_arena.size()) == OB_OK);
+    ob_context_destroy(ctx);
+  }
+
+  // 2. Budget cap stops without evicting already-resident prepacked tiles, and honors simulated MemAvailable/3.
+  {
+    ::unsetenv("OPENBUENOS_WEIGHT_CACHE_MB");
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+    CHECK(ob_gemm_register_builtin_emitter(ctx, interp_file.path()) == OB_OK);
+    CHECK(ob_gemm_set_tile_limits(ctx, 16u, 512u, 128u) == OB_OK);
+    ctx->simulated_mem_available_set = true;
+    ctx->simulated_mem_available_bytes = 3ULL * 1024u * 1024u; // auto cap = MemAvailable/3 = 1 MiB
+
+    constexpr uint32_t K = 1024u, N = 2048u; // 32 unique 64 KiB tiles = 2 MiB > 1 MiB cap
+    const uint32_t nb_k = K / ob_quant_block_elements(OB_QUANT_Q4_0);
+    const size_t n_blocks = static_cast<size_t>(N) * nb_k;
+    std::vector<ob_block_q4_0_t> big_w(n_blocks);
+    for (uint32_t n = 0; n < N; ++n) {
+      for (uint32_t bi = 0; bi < nb_k; ++bi) {
+        ob_block_q4_0_t& blk = big_w[static_cast<size_t>(n) * nb_k + bi];
+        const uint32_t h = (n * nb_k + bi) * 2654435761u;
+        blk.d = fp32_to_fp16(0.01f + 0.001f * static_cast<float>((h >> 4) & 31u));
+        for (uint32_t j = 0; j < 16u; ++j) {
+          blk.qs[j] = static_cast<uint8_t>((h >> (j & 15u)) ^ (j * 29u + bi * 17u + n));
+        }
+      }
+    }
+    ob_gemm_f32_quant_job_t bjob{};
+    bjob.b_nk = big_w.data();
+    bjob.n_dim = N;
+    ob_gemm_f32_quant_job_set_type(&bjob, OB_QUANT_Q4_0);
+
+    ob_prepack_stats_t bpst{};
+    CHECK(ob_gemm_prepack_quant_batch(ctx, 1u, K, &bjob, 1u, &bpst) == OB_OK);
+    CHECK(bpst.tiles_prepacked > 0u);
+    CHECK(bpst.tiles_skipped_budget > 0u);
+    CHECK(ctx->weight_cache_evictions == 0u);
+    CHECK(ctx->weight_cache_bytes <= ctx->weight_cache_max_bytes);
+    CHECK(ctx->weight_cache_max_bytes == 1u * 1024u * 1024u);
+
+    ob_context_destroy(ctx);
+  }
+
+  // 3. Simulated MemAvailable = 2200 MiB: auto uses MemAvailable/3 (~733 MiB), explicit 1200 MiB is honored,
+  //    and oversized explicit 2048 MiB respects 384 MiB headroom reserve (1816 MiB).
+  {
+    ob_config_t cfg = ob_config_default();
+    cfg.mock_mode = 1;
+    ob_context_t* ctx = nullptr;
+    CHECK(ob_context_create(&cfg, &ctx) == OB_OK);
+    ctx->simulated_mem_available_set = true;
+    ctx->simulated_mem_available_bytes = 2200ULL * 1024u * 1024u;
+    ctx->mock_mode = false;
+
+    ::unsetenv("OPENBUENOS_WEIGHT_CACHE_MB");
+    const size_t auto_cap = ob::compute_weight_cache_budget_bytes(ctx);
+    CHECK(auto_cap == (2200ULL * 1024u * 1024u) / 3u);
+
+    ::setenv("OPENBUENOS_WEIGHT_CACHE_MB", "1200", 1);
+    const size_t explicit_ok = ob::compute_weight_cache_budget_bytes(ctx);
+    CHECK(explicit_ok == 1200ULL * 1024u * 1024u);
+
+    ::setenv("OPENBUENOS_WEIGHT_CACHE_MB", "2048", 1);
+    const size_t explicit_reserve = ob::compute_weight_cache_budget_bytes(ctx);
+    CHECK(explicit_reserve == (2200ULL - 384ULL) * 1024u * 1024u);
+
+    ::unsetenv("OPENBUENOS_WEIGHT_CACHE_MB");
+    ctx->mock_mode = true;
+    ob_context_destroy(ctx);
+  }
+
+  std::printf("[PASS] test_zero_repack_weight_cache_and_prepack (Q4_0/Q8_0 load prepack -> 0 runtime misses/pack/evict, strict budget stop without eviction)\n");
+}
+
 }  // namespace
 
 int main() {
@@ -6266,6 +6482,7 @@ int main() {
       "OPENBUENOS_SWIGLU_MAX_CREST",
       "OPENBUENOS_STRICT_WEIGHT_HASH",
       "OPENBUENOS_WEIGHT_CACHE_MB",
+      "OPENBUENOS_WEIGHT_CACHE_ENTRIES",
       "OPENBUENOS_PARAM_SWAP_SLOTS",
       "OPENBUENOS_SPIN_US",
       "OPENBUENOS_THREADS",
@@ -6304,9 +6521,10 @@ int main() {
   test_dive_interp_xdg_probe();
   test_freetile_buenos_wire_parity_and_fallback();
   test_roundtable_s1_state_machine_hardening();
+  test_zero_repack_weight_cache_and_prepack();
 
   if (g_failures == 0) {
-    std::printf("ALL LIBOPENBUENOS HOST TESTS PASSED (25/25 suites)\n");
+    std::printf("ALL LIBOPENBUENOS HOST TESTS PASSED (26/26 suites)\n");
     return 0;
   }
   std::fprintf(stderr, "LIBOPENBUENOS HOST TESTS FAILED (%d failures)\n", g_failures);

@@ -694,6 +694,29 @@ ob_status_t ob_gemm_unregister_immutable_weights(ob_context_t* ctx,
                                                  const void*   base,
                                                  size_t        size);
 
+typedef struct ob_prepack_stats {
+  uint32_t tiles_checked;
+  uint32_t tiles_prepacked;
+  uint32_t tiles_already_cached;
+  uint32_t tiles_skipped_budget;
+  uint32_t graphs_precompiled;
+  uint64_t bytes_resident;
+} ob_prepack_stats_t;
+
+/*
+ * Pre-packs a batched group of static quantized weights (e.g. Q+K+V or single projection)
+ * into ext[2] DMA-BUFs and pre-compiles their DIVE shape executables ONCE at model load
+ * time, eliminating runtime cache misses, weight packing, and first-token graph compile
+ * stalls. Stops cleanly without evicting resident entries if the weight-cache budget is full.
+ * Note: jobs[j].c_mn may be NULL during prepack.
+ */
+ob_status_t ob_gemm_prepack_quant_batch(ob_context_t*                  ctx,
+                                        uint32_t                       m_hint,
+                                        uint32_t                       k_dim,
+                                        const ob_gemm_f32_quant_job_t* jobs,
+                                        uint32_t                       num_jobs,
+                                        ob_prepack_stats_t*            out_stats);
+
 ob_status_t ob_gemm_swiglu_int8(ob_context_t*                ctx,
                                 const int8_t*                x_mk,
                                 const ob_swiglu_int8_desc_t* desc,
